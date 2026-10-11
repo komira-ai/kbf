@@ -668,18 +668,21 @@ async fn the_store_walk_passes_while_containers_come_and_go() {
     println!("{walks} walks of the store while 40 leases came and went; {gave_up} walked again");
 }
 
-/// Catches a timeout that is not enforced on a real container, or that leaves it.
+/// Catches a timeout that is not enforced on a real container, or that leaves it; and
+/// (issue #45) a timeout that loses what the container wrote to stdout and stderr
+/// before it was stopped, as `podman start --attach` captured it, or swaps the two.
 #[tokio::test]
 #[ignore = "needs rootless Podman and a delegated cgroup: run by tools/ci/podman-tests.sh"]
 async fn a_timeout_stops_the_container() {
     let cell = Cell::new("timeout");
-    let mut spec = sh("sleep 60");
+    let mut spec = sh("echo started; echo warming >&2; sleep 60");
     spec.timeout = Some(Duration::from_secs(2));
     let outcome = cell.run(1, &spec).await;
-    assert!(
-        matches!(outcome, Err(RuntimeError::TimedOut)),
-        "{outcome:?}"
-    );
+    let Err(RuntimeError::TimedOut { stdout, stderr }) = outcome else {
+        panic!("{outcome:?}");
+    };
+    assert_eq!(blob(&cell.cas, stdout.as_ref()), b"started\n");
+    assert_eq!(blob(&cell.cas, stderr.as_ref()), b"warming\n");
     cell.assert_clean(1);
 }
 

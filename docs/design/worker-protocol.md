@@ -284,7 +284,7 @@ says why the action could not run:
 | Status | Meaning |
 |---|---|
 | `OK` | the action ran; its outputs, stdout and stderr are already in the CAS |
-| `DEADLINE_EXCEEDED` | the action ran past its timeout and was stopped |
+| `DEADLINE_EXCEEDED` | the action ran past its timeout and was stopped. `action_result` may hold the stdout and stderr digests of what it wrote before then (REAPI's partial result, already in the CAS); the server passes on those two digests whose blobs it holds, and nothing else, to the client in the `ExecuteResponse`, and never caches them |
 | `INVALID_ARGUMENT` | the action cannot run as written (an image named by tag, an output that is also an input); the client's error |
 | `FAILED_PRECONDITION` | an input blob is not in the CAS (with a `MISSING` violation), or no driver serves the lease kind |
 | `ABORTED` | the lease was killed, or self-fenced when contact was lost |

@@ -294,7 +294,10 @@ message Result {
   LeaseId lease_id = 1;
   // OK when the action ran, whatever its exit code; otherwise why it could not run.
   google.rpc.Status status = 2;
-  // The action's result when status is OK. Its outputs are already in the CAS.
+  // The action's result when status is OK. Its outputs are already in the CAS. With
+  // DEADLINE_EXCEEDED, the partial result REAPI allows: the stdout and stderr the
+  // action wrote before it was stopped, already in the CAS; the server keeps only those
+  // two digests and never caches it. Unset with any other status.
   build.bazel.remote.execution.v2.ActionResult action_result = 3;
   // The action_digest of the Start this Result answers, as the Start carried it. The
   // server refuses a Result whose action_digest is set and is not the action of the

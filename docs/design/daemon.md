@@ -186,7 +186,7 @@ its exit code. Its errors map to the `Result` status the server sees:
 | `RuntimeError` | `Result` status |
 |---|---|
 | `Killed` | `ABORTED` |
-| `TimedOut` | `DEADLINE_EXCEEDED` |
+| `TimedOut { stdout, stderr }` | `DEADLINE_EXCEEDED`, with an `action_result` holding the two log digests the driver stored (the partial result), unless it stored neither |
 | `Invalid(why)` | `INVALID_ARGUMENT`: the client's error, never retried |
 | `MissingBlob(digest)` | `FAILED_PRECONDITION` with a `MISSING` violation |
 | `Failed(why)` | `INTERNAL`: the farm's failure |
@@ -245,7 +245,10 @@ never reused. Each lease goes through six steps.
    - Make the lease cgroup (below).
 2. **Start.** `podman create`, then `podman start --attach`, with stdout and stderr
    written to files in the scratch directory.
-3. **Watch.** Wait for the container to exit, the action's timeout, or `kill`.
+3. **Watch.** Wait for the container to exit, the action's timeout, or `kill`. On a
+   timeout, once the container is stopped, store what it wrote to stdout and stderr in
+   the CAS, each within the stdio limit; a log past the limit, or one that cannot be
+   stored, is left out, and the lease still ends `TimedOut`.
 4. **Collect.** Read the exit code from Podman's record of the container. If it is 137
    (SIGKILL), or there is none, and the lease cgroup's `memory.events` counts an
    `oom_kill`, the lease fails as out of memory or as killed on a busy node (see

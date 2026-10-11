@@ -28,6 +28,8 @@
 //!   together ([`procs`]); past the lease's limit, the whole tree is killed and the
 //!   lease ends RESOURCE_EXHAUSTED ([`kbf_daemon::RuntimeError::OutOfMemory`]);
 //! - a wall-clock timeout, and the daemon's kill, each ending the whole process tree;
+//!   a timeout still stores what the action wrote to stdout and stderr
+//!   ([`kbf_daemon::RuntimeError::TimedOut`]);
 //! - on every path, also a normal exit, every process of the action ended before the
 //!   outputs are read: SIGKILL to the group and to each process the tracker knows,
 //!   repeated until a snapshot shows none alive; any that survive fail the lease;

@@ -361,7 +361,7 @@ impl<C: Cas> PodmanRuntime<C> {
             _ = child.wait() => {}
             () = tokio::time::sleep(timeout) => {
                 self.stop_container(&lease.name, &lease.cgroup, child).await;
-                return Err(RuntimeError::TimedOut);
+                return Err(self.timed_out(&lease.name, &stdout_path, &stderr_path).await);
             }
             Ok(by) = &mut *stop => {
                 *killer = Some(by);
@@ -470,6 +470,23 @@ impl<C: Cas> PodmanRuntime<C> {
                  manifest digest"
             ))),
         }
+    }
+
+    /// [`RuntimeError::TimedOut`] with what the stopped action wrote to stdout and
+    /// stderr, each stored within the stdio limit (REAPI's partial result). A log past
+    /// the limit, or one that cannot be stored, is left out: the answer is still the
+    /// timeout.
+    async fn timed_out(&self, name: &str, stdout: &Path, stderr: &Path) -> RuntimeError {
+        let max = self.config.outputs.max_stdio_bytes;
+        let mut logs = [None, None];
+        for (path, slot) in [stdout, stderr].into_iter().zip(&mut logs) {
+            match collect_log(&*self.cas, path, max).await {
+                Ok(digest) => *slot = Some(digest),
+                Err(e) => tracing::warn!(lease = %name, "timed out; its log is left out: {e}"),
+            }
+        }
+        let [stdout, stderr] = logs;
+        RuntimeError::TimedOut { stdout, stderr }
     }
 
     /// The swap watch's kill: `cgroup.kill` at once (the lease is over its cap, so no

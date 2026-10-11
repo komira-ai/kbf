@@ -40,9 +40,15 @@ pub enum RuntimeError {
     /// A blob the action needs (`hash/size`) is not in the CAS: the client's to upload.
     #[error("blob {0} is not in the CAS")]
     MissingBlob(String),
-    /// The action ran past its timeout and was stopped.
+    /// The action ran past its timeout and was stopped. `stdout` and `stderr` are what
+    /// it wrote to each before then, stored in the CAS: REAPI's partial result, which
+    /// the Result carries with DEADLINE_EXCEEDED. `None` for a log the driver left out
+    /// (past the output limit, or not stored).
     #[error("timed out")]
-    TimedOut,
+    TimedOut {
+        stdout: Option<Digest>,
+        stderr: Option<Digest>,
+    },
     /// The action's processes together used more memory than the lease allows, and
     /// the runtime (or the kernel, at the lease's own cap) killed them. Reported as
     /// RESOURCE_EXHAUSTED with `MEMORY_KILL_OWN_LIMIT`: the farm's to retry with more

@@ -409,13 +409,31 @@ impl<C: Cas> NativeRuntime<C> {
         group.end(&mut child, self.config.kill_wait).await?;
         match ended {
             Ended::Exited(status) => Ok(exit_code(status.map_err(failed(&program))?)),
-            Ended::TimedOut => Err(RuntimeError::TimedOut),
+            Ended::TimedOut => Err(self.timed_out(work.lease_id, dir).await),
             Ended::Killed => Err(RuntimeError::Killed),
             Ended::OutOfMemory { used, limit } => {
                 tracing::warn!(lease = %work.lease_id, used, limit, "killed past its memory limit");
                 Err(RuntimeError::OutOfMemory { used, limit })
             }
         }
+    }
+
+    /// [`RuntimeError::TimedOut`] with what the stopped action wrote to stdout and
+    /// stderr in `dir`, each stored within the stdio limit (REAPI's partial result). A
+    /// log past the limit, or one that cannot be stored, is left out: the answer is
+    /// still the timeout.
+    async fn timed_out(&self, lease: LeaseId, dir: &Path) -> RuntimeError {
+        let store = CasStore(Arc::clone(&self.cas));
+        let max = self.config.outputs.max_stdio_bytes;
+        let mut logs = [None, None];
+        for (name, slot) in ["stdout", "stderr"].into_iter().zip(&mut logs) {
+            match kbf_outputs::store_file(&store, &dir.join(name), max).await {
+                Ok(digest) => *slot = Some(digest),
+                Err(e) => tracing::warn!(%lease, "timed out; its {name} is left out: {e}"),
+            }
+        }
+        let [stdout, stderr] = logs;
+        RuntimeError::TimedOut { stdout, stderr }
     }
 
     /// Every step but the clean.

@@ -141,6 +141,13 @@ pub enum Finished {
     /// The farm could not run it: `INTERNAL` for an infrastructure failure,
     /// `DEADLINE_EXCEEDED` for a timeout.
     Failed(rpc::Status),
+    /// It ran past its timeout and was stopped: `status` is `DEADLINE_EXCEEDED`, and
+    /// `partial` holds what it wrote to stdout and stderr before then (REAPI's partial
+    /// result; no outputs, never cached).
+    TimedOut {
+        status: rpc::Status,
+        partial: Box<reapi::ActionResult>,
+    },
 }
 
 /// A caller's handle on an operation: its name and its stage as it changes.
@@ -603,6 +610,11 @@ fn operation(name: &str, action: &Digest, stage: &Stage, cached: bool) -> Operat
                     ..ExecuteResponse::default()
                 },
                 Finished::Failed(status) => ExecuteResponse {
+                    status: Some(status.clone()),
+                    ..ExecuteResponse::default()
+                },
+                Finished::TimedOut { status, partial } => ExecuteResponse {
+                    result: Some((**partial).clone()),
                     status: Some(status.clone()),
                     ..ExecuteResponse::default()
                 },

@@ -304,7 +304,8 @@ async fn a_failing_action_is_answered_but_not_cached() {
 /// own action); an OK result whose outputs were never uploaded, or that carries no result at all,
 /// accepted as a result (callers would get files nobody can fetch); a failed attempt
 /// that also carries a valid `ActionResult` taken as completed (the protocol sets
-/// `action_result` only with OK); and a failure written to the action cache.
+/// `action_result` only with OK, or with DEADLINE_EXCEEDED for the logs alone, which a
+/// result without logs does not have); and a failure written to the action cache.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn failed_attempts_answer_with_the_rfc_codes() {
     let cell = Cell::start().await;
