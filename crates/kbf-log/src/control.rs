@@ -367,6 +367,7 @@ fn outcome(o: &Outcome) -> Result<proto::Outcome, EncodeError> {
                 Failure::Invalid => proto::Failure::Invalid,
                 Failure::OutOfMemory => proto::Failure::OutOfMemory,
                 Failure::NodeMemoryPressure => proto::Failure::NodeMemoryPressure,
+                Failure::MissingInput => proto::Failure::MissingInput,
             }
             .into(),
         ),
@@ -620,6 +621,7 @@ fn from_outcome(o: Option<proto::Outcome>, field: &'static str) -> Result<Outcom
             Ok(proto::Failure::Invalid) => Failure::Invalid,
             Ok(proto::Failure::OutOfMemory) => Failure::OutOfMemory,
             Ok(proto::Failure::NodeMemoryPressure) => Failure::NodeMemoryPressure,
+            Ok(proto::Failure::MissingInput) => Failure::MissingInput,
             Ok(proto::Failure::Unspecified) | Err(_) => {
                 return Err(DecodeError::UnknownValue {
                     field: "Outcome.failed",

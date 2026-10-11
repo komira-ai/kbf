@@ -341,6 +341,7 @@ fn every_enum_value_has_its_number() {
         (Failure::Invalid, 3),
         (Failure::OutOfMemory, 4),
         (Failure::NodeMemoryPressure, 5),
+        (Failure::MissingInput, 6),
     ];
     for (failure, n) in failures {
         check(

@@ -80,6 +80,40 @@ mutant 'the TCC verdict ignores the control row' tcc.sh t_tcc_control_empty \
     's/^if \[ "$(st_get control)" = ok \]; then/if true; then/'
 mutant 'the TCC reader never reads as root' tcc.sh t_tcc_pass \
     's/^a_system_root() { tcc_read system.as_root "$SYSTEM_DB" sudo -n || true; }/a_system_root() { tcc_read system.as_root "$SYSTEM_DB" || true; }/'
+mutant 'the xcuitest_sandbox verdict ignores the unsandboxed controls' xcuitest_sandbox.sh t_xs_control_fails \
+    's/^    elif \[ "$(st_get control.macos.result)" != PASS \] || \[ "$(st_get control.ios.result)" != PASS \]; then/    elif false; then/'
+mutant 'a run under a profile falls back to no sandbox' xcuitest_sandbox.sh t_xs_pass \
+    's/^    exec env -i "${envs\[@\]}" "$sbx" -D "$param" -p "$profile" "$@"$/    exec env -i "${envs[@]}" "$@"/'
+mutant 'the driver runs get a copy of BASE_PROFILE, not the generator'"'"'s profile' xcuitest_sandbox.sh t_xs_pass \
+    's/^    tracked "$1" in_lease "$1" "$LEASES\/$1\/sandbox\/profile.sb" \\$/    printf "%s\\n" "(version 1)" "(allow default)" "(deny job-creation)" "(deny lsopen)" "(deny user-preference-write)" "(deny file-write*)" "(allow file-write* (subpath (param \\"KBF_LEASE\\")) (subpath \\"\/dev\\"))" >"$LEASES\/$1\/copy.sb"; tracked "$1" in_lease "$1" "$LEASES\/$1\/copy.sb" \\/'
+mutant 'the digest check accepts a profile the generator did not print' xcuitest_sandbox.sh t_xs_digest_mismatch \
+    's/^    \[ -n "$want" \] && \[ "$want" = "$used" \]$/    [ -n "$want" ]/'
+mutant 'the digest check accepts no digest at all' xcuitest_sandbox.sh t_xs_generator_fails \
+    's/^    \[ -n "$want" \] && \[ "$want" = "$used" \]$/    [ "$want" = "$used" ]/'
+mutant 'the verdict ignores a (deny default) run with no deny line' xcuitest_sandbox.sh t_xs_deny_default_unreported \
+    's/^    elif \[ "$(st_get deny_default.tree)" = 0 \] || \[ -z "$(st_get deny_default.tree)" \]; then/    elif false; then/'
+mutant 'the verdict ignores a (deny default) run that passed' xcuitest_sandbox.sh t_xs_deny_default_passes \
+    's/^    if \[ "$(st_get deny_default.rc)" = 0 \] || \[ -z "$(st_get deny_default.rc)" \]; then/    if false; then/'
+mutant 'the verdict ignores a fixture that failed under the driver profile' xcuitest_sandbox.sh t_xs_driver_fails \
+    's/^    elif \[ -n "$failed" \]; then/    elif false; then/'
+mutant 'deny lines of every process count as the run'"'"'s' xcuitest_sandbox.sh t_xs_pass \
+    's/\$3 == "deny" { print ((\$1 in t) ? "tree" : "other"), \$0 }/$3 == "deny" { print "tree", $0 }/'
+mutant 'the run'"'"'s tree is its root alone, without its children' xcuitest_sandbox.sh t_xs_pass \
+    's/m = split(kids\[p\], k, " ")/m = 0/'
+mutant 'the runs get no lease variables (HOME is not the lease'"'"'s)' xcuitest_sandbox.sh t_xs_pass \
+    's/done <"$dir\/sandbox\/env"/done <\/dev\/null/'
+mutant 'the runs build the checkout'"'"'s fixtures, not the lease'"'"'s copy' xcuitest_sandbox.sh t_xs_pass \
+    's/bash "$RUN" "$2"/bash "$SRC\/$RUN" "$2"/'
+mutant 'the test-only arms build under the driver profile too' xcuitest_sandbox.sh t_xs_pass \
+    's/tracked "$name.build" in_lease "$name" ""/tracked "$name.build" in_lease "$name" "$LEASES\/$name\/sandbox\/profile.sb"/'
+mutant 'the verdict ignores a failed unsandboxed build-for-testing' xcuitest_sandbox.sh t_xs_build_fails \
+    's/^    elif \[ "$(st_get driver_tests.macos.build)" != PASS \] || \[ "$(st_get driver_tests.ios.build)" != PASS \]; then/    elif false; then/'
+mutant 'the verdict ignores the test-only arms' xcuitest_sandbox.sh t_xs_driver_tests_fail \
+    's/^DRIVER_ARMS="driver.macos driver.ios driver_tests.macos driver_tests.ios"$/DRIVER_ARMS="driver.macos driver.ios"/'
+mutant 'a driver arm is judged by run.sh'"'"'s checks inside the sandbox' xcuitest_sandbox.sh t_xs_analysis_in_sandbox \
+    's/^    if \[ "${exit:-none}" = 0 \] && \[ "$(st_get "$1.report.result")" = PASS \]; then/    if [ "$(sed -n "s\/^SPIKE macos-[^.]*\\.xcuitest\\.$2\\.result=\/\/p" "$SPIKE_RESULTS\/$1.out" | tail -n 1)" = PASS ]; then/'
+mutant 'a driver arm passes on the report alone, whatever xcodebuild exited with' xcuitest_sandbox.sh t_xs_xcodebuild_fails \
+    's/^    if \[ "${exit:-none}" = 0 \] && \[ "$(st_get "$1.report.result")" = PASS \]; then/    if [ "$(st_get "$1.report.result")" = PASS ]; then/'
 mutant 'the P0 verdict ignores the root control' volume_owner.sh t_vo_control_lost \
     's/elif \[ "${control%%:\*}" != 0 \]; then/elif false; then/'
 mutant 'the P0 owner is read from the first attach, not a re-attach' volume_owner.sh t_vo_chown_lies \

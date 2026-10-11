@@ -104,23 +104,35 @@ exit code, or a non-OK status (`kbf-proto/proto/kbf/worker/v1/worker.proto:240-2
   `RESOURCE_EXHAUSTED`. Before a run it may refuse `FAILED_PRECONDITION` (lease kind not
   served, `lease.rs:69-75`) or `UNAVAILABLE` (contact lost, `daemon.rs:468-475`). Its log
   says only `ok=false` (`lease.rs:119`).
-- **Server** (`kbf-server/src/farm.rs:518-557`): OK with stored outputs is `Completed`;
-  `DEADLINE_EXCEEDED` is `Timeout`; `INVALID_ARGUMENT` keeps its message; **every other
-  code is `Failure::Infra` and the daemon's message is dropped** (the catch-all arm,
-  `farm.rs:553-556`). The log has the code only (`farm.rs:554`).
-- **Answer** (`settle`, `farm.rs:839-871`): Infra becomes `INTERNAL "the farm could not
-  run the action"` (`farm.rs:861-864`), the same fixed text for every cause, with no
-  node name.
+- **Server** (`kbf-server/src/farm.rs`, `Farm::outcome`): OK with stored outputs is
+  `Completed`; `DEADLINE_EXCEEDED` is `Timeout`; `INVALID_ARGUMENT` keeps its message;
+  `FAILED_PRECONDITION` whose `PreconditionFailure` violations are all `MISSING` with a
+  `blobs/<hash>/<size>` subject is `Failure::MissingInput`, keeping the blobs
+  (`kbf-server/src/missing.rs`); **every other code is `Failure::Infra` and the
+  daemon's message does not reach the client** (the catch-all arm), a
+  `FAILED_PRECONDITION` without such a detail included. The server logs it: a WARN
+  `lease failed` line with the lease, the node, the code and the reason, or for a
+  missing input a WARN line with the number of missing blobs.
+- **Answer** (`settle` in `farm.rs`): Infra becomes `INTERNAL "the farm could not
+  run the action"`, the same fixed text for every cause, with no node name.
+  MissingInput becomes the front's answer for inputs not in the CAS (below,
+  `kbf_front::missing_status`), rebuilt from the blobs: `FAILED_PRECONDITION`,
+  `status.message` "N input blob(s) are not in the CAS", and the `PreconditionFailure`
+  as its only detail. Anything else the daemon put in its status is not passed on.
 - **Front, before execution**: inputs not in the CAS are answered by `missing()`
-  (`kbf-front/src/execution.rs:480-503`): `FAILED_PRECONDITION` with exactly one detail,
+  (`kbf-front/src/execution.rs`, over `missing_status`): `FAILED_PRECONDITION` with exactly one detail,
   a `PreconditionFailure` with one `MISSING` violation per blob. That is the shape
   Bazel needs to re-upload (section 3); keep it.
 - **Retries**: none. A failed result finishes the operation
   (`kbf-sched/src/scheduler.rs:709-730`), though
   [scheduler.md](scheduler.md#outcomes) plans bounded retries (#22). Only a lease
   given up (silent, replaced, reconnected, not started:
-  `kbf-sched/src/requeue.rs:28-41`) runs again, with no limit.
-- **Cache**: written only for exit 0 and not `do_not_cache` (`farm.rs:849-850`).
+  `kbf-sched/src/requeue.rs:28-41`) runs again, with no limit. A MissingInput result
+  finishes its operation at once and is never rerun: the blob is the client's to
+  upload, so it is not a farm fault and counts against no farm rerun budget.
+- **Cache**: written only for an OK result with exit 0 and not `do_not_cache`
+  (`settle` in `farm.rs`); a failure, MissingInput included, is never written, even
+  when the daemon's report carries an `ActionResult` next to it.
 - **Exit codes**: the native driver folds a signal into 128+N (`exit_code`,
   `kbf-driver-native/src/runtime.rs:536-541`) before anything classifies it, so a
   SIGKILL and `exit(137)` are the same value by the time the daemon sees them.
@@ -155,10 +167,11 @@ kill its action, which keeps running beside the requeued copy.
 
 ### And the other way round
 
-- Program not found (`kbf-driver-native/src/runtime.rs:172`), an output over the size
-  limit (`runtime.rs:636`), and a missing input blob at the worker all reach the client
-  as the fixed `INTERNAL`. The `MISSING` detail is dropped at `farm.rs:553-556`, so Bazel is
-  never told to re-upload.
+- Program not found (`kbf-driver-native/src/runtime.rs:172`) and an output over the
+  size limit (`runtime.rs:636`) reach the client as the fixed `INTERNAL`. A missing
+  input blob at the worker reaches it as `FAILED_PRECONDITION` with its `MISSING`
+  violations (section 2), so Bazel re-uploads and executes again; the server does not
+  yet re-check the CAS, count the loss as a farm fault, or alert (section 4.3).
 - The named Xcode missing on the node is `RuntimeError::Failed`; the comment at
   `xcode.rs:190` says "the action is run elsewhere", but nothing reruns it.
 - Native over-booking OOM is `RESOURCE_EXHAUSTED`; the comment at
@@ -365,6 +378,12 @@ These need no guessing, only keeping the reason the daemon already writes:
     error, exit 3, and does not re-upload; the message says the farm lost the blob and
     a rebuild will upload it. The loss is counted as a farm fault and alerted.
   - present: a fetch error on that node. Farm, rerun elsewhere.
+
+  Built so far: the answer for absent, given whatever the CAS holds now (section 2).
+  The daemon's only CAS is the server's worker listener, which answers `NOT_FOUND` only
+  for a blob the index does not hold, so a `MISSING` report today means absent; a
+  fetch error reaches the server as another code and is Infra. The re-check, the farm
+  fault count and the alert are not built.
 
 ## 5. What the client receives (proposed)
 
@@ -804,7 +823,7 @@ from a typo by asking peers is not built.
   on every result, failed ones included (in the partial result where there is one).
   Neither client shows `worker` today, so the node also goes in the text.
 - **Server log**: one line per run with operation, lease, node, class, reason,
-  signature and fix. Today it has the code only (`farm.rs:554`).
+  signature and fix. Today it has the lease, node, code and reason (`Farm::outcome`).
 - **Daemon log**: the reason and class beside `lease finished` (`lease.rs:119`).
 - **`server_logs`**: a run history blob per operation (each run's node, class, reason,
   stderr tail). Bazel fetches it on failure; the UI reads it.

@@ -50,6 +50,7 @@ pub mod identity;
 pub mod machine;
 pub mod mdm;
 mod memory;
+mod missing;
 pub mod raft_log;
 pub mod rollout;
 pub mod serve;

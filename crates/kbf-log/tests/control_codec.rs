@@ -194,6 +194,7 @@ impl Rng {
             Failure::Invalid,
             Failure::OutOfMemory,
             Failure::NodeMemoryPressure,
+            Failure::MissingInput,
         ];
         if self.below(2) == 0 {
             Outcome::Completed {
