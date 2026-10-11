@@ -1523,6 +1523,20 @@ dependencies = [
 [[package]]
 name = "kbf-sim-cell"
 version = "0.1.0"
+dependencies = [
+ "kbf-caps",
+ "kbf-daemon",
+ "kbf-front",
+ "kbf-log",
+ "kbf-meta",
+ "kbf-raft",
+ "kbf-sched",
+ "kbf-server",
+ "kbf-sim",
+ "kbf-store",
+ "kbf-types",
+ "tokio",
+]
 
 [[package]]
 name = "kbf-store"

@@ -23,10 +23,10 @@ daemon's side of fencing are in [worker-protocol.md](worker-protocol.md) and
 | `sim_cell` **exists** | `crates/kbf-sched/tests/sim_cell.rs` | the scheduler on the kernel: a leader, a control log node and two workers with a `SelfFence`; 48 seeds | `Start` only after commit; each operation answered once, by its newest grant; no self-fenced work twice at once; a reboot and a daemon restart inside G; a `Start` lost on a live session; a lease hidden from the running set; replay |
 | `sim_platform` **exists** | `crates/kbf-sched/tests/sim_platform.rs` | the scheduler alone with an in-process log: Linux x86-64, Linux arm64 and a one-core Mac, two random outages each; 64 seeds | grants satisfy the platform on a live worker; answered once; a refusal only after a stated reason and an unbroken unservable run; the refusal tick exactly; replay |
 | `sim_cordon` **exists** | `crates/kbf-sched/tests/sim_cordon.rs` | the scheduler alone, three always-up workers, random cordon, drain and uncordon; 64 seeds | no grant to a cordoned worker; a drain never kills; a cordon never refuses; drain states true; all work runs once uncordoned; replay |
-| `kbf-sim-cell` | `crates/kbf-sim-cell` | nothing yet: the planned home of the whole cell (servers, daemons, object stores) | none |
+| `kbf-sim-cell` **exists** | `crates/kbf-sim-cell` | one server as `kbf-server --meta-log=raft` assembles it (the `RaftMetaLog` over an in-memory fault-injecting disk, a `Scheduler` and the `FarmMachine`), three daemons using the daemon's `Contact`, three clients, an object store; calm, restart, power-cut, I/O-error and daemon-partition runs, 64 seeds each | properties 1 to 7 of ha.md section 15 after every step ([section 8](#8-the-cell-kbf-sim-cell)); replay |
 
 Measured on the dev box in a debug build: `sim_cell` 0.3 s, `sim_platform` 2.2 s,
-`sim_cordon` 3.9 s.
+`sim_cordon` 3.9 s, `kbf-sim-cell` 4.2 s (all five sweeps).
 
 What the existing sims do not cover:
 
@@ -340,3 +340,74 @@ seed and command that show it.
 - **`max_unavailable` per pool or per rollout.** The record counts a rollout's own
   nodes; section 4.1 of fleet-updates.md says per pool, shared by every rollout. The
   per-pool slot is phase P2; until then F3.5 checks the per-rollout count.
+
+## 8. The cell (`kbf-sim-cell`)
+
+`kbf-sim-cell` is the one-server skeleton of the high-availability design's
+simulation (ha.md section 15). Its nodes:
+
+- **The server** runs the code `kbf-server --meta-log=raft` runs. Its metadata log is a
+  `RaftMetaLog` (`crates/kbf-server/src/raft_log`) over a `kbf_store::FaultFs`, opened
+  as the server opens it, with the new log's id drawn from the seed; the log's futures
+  never wait, so each is polled once. Its farm core is a `Scheduler` of the log's term
+  and a `FarmMachine`, fed as `crates/kbf-server/src/farm.rs` feeds them (an input then
+  a tick, a committed record fed straight back, a result taken only from the holder of
+  the current lease, its action-cache entry written before its callers are answered).
+  Both are in memory, as on the server today, so a restart loses them. An upload goes
+  to the object store first and is committed to the log once the store has it. Farm
+  time is the simulation clock: the server commits `Tick(now)` every second.
+- **Daemons** keep their contact in `kbf_daemon::Contact` (they fence T after the
+  newest acknowledged send and open a new stream after a heartbeat gap) and drop the
+  leases of an earlier epoch by `kbf_daemon::superseded`. One run in ten lasts longer
+  than the grace G.
+- **Clients** ask `FindMissingBlobs` for an action's input, upload it if missing, ask
+  again, and `Execute` the action, resending their step every 8 s until answered.
+- **The object store** keeps every object; it loses none.
+
+Each run has a kind. **Calm**: only the network's faults (1 % drops, 3 % duplicates,
+3 % reordering, 1 to 50 ms delays). **Restart**: one or two process kills.
+**Crash**: a power cut, at once or part-way through a later commit (the disk keeps
+what was synced, a seeded prefix of each unsynced tail and a seeded subset of the
+unsynced renames). **IoError**: a filesystem operation fails, the log stops and refuses
+every commit while the server goes on answering reads, and the machine reboots. A
+server that stopped or died starts again 3 s later over what its disk kept.
+**Partition**: one daemon cut off for 70 s. Every server fault and partition begins by
+60 s, and the run goes on to 210 s.
+
+The properties, checked after every step (7 at the end):
+
+1. Replica equality: a replica replaying the durable log (what a power cut now would
+   leave) through the server's applied index has the server's applied state and its
+   `Bootstrap`.
+2. One run: no operation (term and operation id) has two unfenced runs at once.
+3. Leases kept: no lease is given up while its daemon, heard within T, listed it.
+   Enforced in calm and partition runs only.
+4. Exactly one result: no result accepted twice, every reported result accepted by
+   the end, an action-cache entry exactly for each action with an accepted result.
+   Enforced in calm runs only.
+5. No false present: every blob answered present is in the object store then.
+6. Monotone time: farm time never goes back along the durable log or across a restart.
+7. Liveness: every client action is answered by the end.
+
+Properties 3 and 4 do not hold after a restart until the scheduler's state is in the
+log (ha.md section 16, PRs 11 and 12); a daemon cut off past T may have a result
+refused, so 4 is not enforced in partition runs.
+
+Mutants planted to show the checks fail (each red in the named sweep):
+
+| Mutant | Where | Red |
+|---|---|---|
+| a leader applies its own entry before it persists it ("apply before commit") | `kbf-raft` `Raft::propose` | 1, IoError seeds |
+| an append is acknowledged without its fsync ("ack before fsync") | `kbf-store` `persist_entries` | 1, every kind |
+| a start draws a new log id although the directory records one ("a lost `Bootstrap` log id") | `kbf-server` `RaftMetaLog::open` | 7 (the restart refuses its own log), restart, crash and I/O-error seeds |
+| a daemon never fences | `kbf-daemon` `Contact::lost` | 2, partition seeds |
+| `FindMissingBlobs` answers every blob present | `kbf-meta` `find_missing` | 5, every kind |
+| a lease given up although its heartbeat lists it | `kbf-sched` `reconcile` | 3, calm and partition seeds |
+| the action-cache write of a daemon refused | `kbf-meta` `put_action` | 4, calm seeds |
+
+Not modeled yet: more than one server, membership, snapshots (the metadata log takes
+none), loss faults and collection in the object store (property 5's later clauses),
+clock-rate skew (so the "`max(now)` dropped" mutant cannot go red), daemon restarts,
+and a process restart over the page cache after a failed write: `FaultFs` makes a
+later sync durable for the bytes a failed one left, so the hazard `--runtime-dir` is
+planned to close cannot show.
