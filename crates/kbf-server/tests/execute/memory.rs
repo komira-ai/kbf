@@ -194,6 +194,32 @@ async fn a_busy_node_kill_reruns_with_the_same_booking_and_is_reported() {
     assert_eq!(daemon.start().await.memory_bytes, GIB);
 }
 
+/// Catches a busy node's kill left out of the out-of-memory answer, or not told apart
+/// from the own-limit kills: a node of 1 GiB kills the action under pressure, then the
+/// action passes its own limit at that node's whole memory, the largest there is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_out_of_memory_answer_names_a_busy_node_kill_before_it() {
+    let cell = Cell::start().await;
+    let mut daemon = cell.daemon("mixed-node", 4, 1).await;
+    let job = Job::new("squeezed, then too big", &[]);
+    cell.upload(&job.blobs()).await;
+    let mut ops = cell.execute(&job.action).await;
+    let start = daemon.start().await;
+    let start = rerun(&mut daemon, &start, MemoryKill::NodePressure, 1).await;
+    let ack = daemon
+        .report(killed(start.lease_id, MemoryKill::OwnLimit))
+        .await;
+    assert!(ack.accepted);
+    let status = response(&done(&mut ops).await).status.expect("a status");
+    assert_eq!(status.code, Code::FailedPrecondition as i32, "{status:?}");
+    assert!(
+        status
+            .message
+            .ends_with("Runs: 2 (1 GiB on mixed-node, node memory pressure, 1 GiB on mixed-node)."),
+        "{status:?}"
+    );
+}
+
 /// Catches a server that reads `memory_kill` on an OK Result (the action ran to its
 /// end and its result would be thrown away for a rerun).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

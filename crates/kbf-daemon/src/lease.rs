@@ -21,8 +21,8 @@ use std::sync::Arc;
 use kbf_proto::google::rpc::precondition_failure::Violation;
 use kbf_proto::google::rpc::{Code, PreconditionFailure, Status};
 use kbf_proto::reapi::ActionResult;
-use kbf_proto::worker::{self, MemoryKill, Start};
-use kbf_types::{LeaseId, Resources};
+use kbf_proto::worker::{self, Lost, MemoryKill, Start};
+use kbf_types::{LeaseId, LostWhy, Resources};
 use prost::Message;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -146,9 +146,10 @@ impl Leases {
         Some(result_of(id, outcome))
     }
 
-    /// Kills every running lease and returns one ABORTED Result for each, oldest
-    /// first. The kills run together, so fencing takes as long as the slowest lease's
-    /// kill, not the sum. Returns once every lease's work has stopped.
+    /// Kills every running lease and returns one Result for each, oldest first: lost to
+    /// the farm, fenced (UNAVAILABLE with `LOST_FENCED`), which the server runs again.
+    /// The kills run together, so fencing takes as long as the slowest lease's kill,
+    /// not the sum. Returns once every lease's work has stopped.
     pub(crate) async fn fence(&mut self) -> Vec<worker::Result> {
         let fenced = std::mem::take(&mut self.running);
         self.cancelled.clear();
@@ -159,11 +160,8 @@ impl Leases {
             // no longer running. Waiting for the task proves the work has ended.
             let _ = task.await;
             tracing::warn!(lease = %id, "lease fenced: contact with the server lost");
-            failure(
-                id,
-                Code::Aborted,
-                "self-fenced: no acknowledged heartbeat within the fence time",
-            )
+            let why = "self-fenced: no acknowledged heartbeat within the fence time";
+            result_of(id, Err(RuntimeError::Lost(LostWhy::Fenced, why.to_owned())))
         });
         futures::future::join_all(kills).await
     }
@@ -195,9 +193,7 @@ pub(crate) fn result_of(
             lost: worker::Lost::Unspecified as i32,
         },
         Err(RuntimeError::Killed) => failure(id, Code::Aborted, "killed"),
-        Err(RuntimeError::Failed(why) | RuntimeError::Lost(_, why)) => {
-            failure(id, Code::Internal, why)
-        }
+        Err(RuntimeError::Failed(why)) => failure(id, Code::Internal, why),
         Err(RuntimeError::Invalid(why)) => failure(id, Code::InvalidArgument, why),
         Err(RuntimeError::MissingBlob(blob)) => missing(id, &blob),
         Err(RuntimeError::TimedOut { stdout, stderr }) => worker::Result {
@@ -221,6 +217,13 @@ pub(crate) fn result_of(
         Err(busy @ RuntimeError::BusyNode(_)) => worker::Result {
             memory_kill: MemoryKill::NodePressure as i32,
             ..failure(id, Code::Unavailable, busy.to_string())
+        },
+        Err(RuntimeError::Lost(why, message)) => worker::Result {
+            lost: match why {
+                LostWhy::DaemonRestarted => Lost::DaemonRestarted,
+                LostWhy::Fenced => Lost::Fenced,
+            } as i32,
+            ..failure(id, Code::Unavailable, message)
         },
     }
 }
@@ -285,8 +288,6 @@ pub(crate) fn proto_lease_id(id: LeaseId) -> worker::LeaseId {
 #[cfg(test)]
 mod tests {
     use kbf_proto::reapi::Digest;
-
-    use kbf_types::LostWhy;
 
     use super::*;
     use crate::runtime::Runtime;
@@ -354,7 +355,7 @@ mod tests {
     /// Catches a fence that kills leases one after another: a node with many leases
     /// would take the sum of their kill times (each up to twice the kill grace plus
     /// cleanup) to fence. Here each kill waits for the other, so a serial fence never
-    /// ends; the fence must end, with one ABORTED Result per lease, oldest first.
+    /// ends; the fence must end, with one fenced (lost) Result per lease, oldest first.
     #[tokio::test]
     async fn fence_kills_every_lease_at_once() {
         let runtime = Arc::new(Rendezvous {
@@ -553,10 +554,10 @@ mod tests {
             assert!(result.action_result.is_none(), "{why}");
             assert_eq!(result.memory_kill(), kill, "{why}");
             assert_eq!(result.lost(), lost, "{why}");
-            assert_eq!(
-                result.status.as_ref().map(|s| s.message.as_str()),
-                Some(why.as_str())
-            );
+            if lost != worker::Lost::Unspecified {
+                let message = result.status.as_ref().map(|s| s.message.as_str());
+                assert_eq!(message, Some(why.as_str()), "the lost run's own words");
+            }
             assert_eq!(result.status.map(|s| s.code), Some(code as i32), "{why}");
         }
 

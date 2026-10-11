@@ -76,8 +76,9 @@ acknowledged (a heartbeat, or the `Hello` a `Welcome` answered):
 - if nothing sent in the last two heartbeat intervals has been acknowledged, the daemon
   declares a heartbeat gap and logs it, once per gap;
 - once T = 40 s have passed since that send time, contact is lost: every running lease
-  is killed (all kills run together) and reported `ABORTED`, and any `Start` that
-  arrives is refused with `UNAVAILABLE`.
+  is killed (all kills run together) and reported lost (`UNAVAILABLE` with
+  `Result.lost` = `LOST_FENCED`, which the server runs again as a farm fault), and any
+  `Start` that arrives is refused with `UNAVAILABLE`.
 
 The fence clock, and the Start window below, count the time the machine spends
 suspended: they read `CLOCK_BOOTTIME` on Linux and `CLOCK_MONOTONIC_RAW`
@@ -173,7 +174,12 @@ requeues their leases elsewhere after the handover grace.
 So when a restarted daemon says `Hello`, nothing a previous daemon on the node started
 under the same scratch directory (and, for containers, the same node id and Podman
 store) still runs, and the leases its first heartbeat leaves out, which the scheduler
-requeues once the handover grace has passed, do not run twice. The grace alone would
+requeues once the handover grace has passed, do not run twice. That is also why the
+restarted daemon may say so: once every runtime is built, the `kbf-daemon` binary
+names the previous daemon process, whose id it finds in `<--scratch>/daemon-instance`,
+as `Hello.predecessor_instance_id`, and writes its own id there for the next one. The
+server then requeues those leases at once, not after the grace, if the previous
+stream has closed (issue #22; [scheduler.md](scheduler.md#reconciling-with-what-workers-say-they-run)). The grace alone would
 not do: it lets the older process fence, and a killed process fences nothing. Not
 guaranteed:
 
@@ -245,6 +251,7 @@ its exit code. Its errors map to the `Result` status the server sees:
 | `Invalid(why)` | `INVALID_ARGUMENT`: the client's error, never retried |
 | `MissingBlob(digest)` | `FAILED_PRECONDITION` with a `MISSING` violation |
 | `Failed(why)` | `INTERNAL`: the farm's failure |
+| `Lost(why, message)` | `UNAVAILABLE` with `Result.lost` (daemon restarted, or fenced): the farm lost the run, which the server runs again |
 
 Five runtimes exist. The `kbf-daemon` binary (crate `kbf-node`) offers all but
 `LocalRuntime`, picked by `--driver`, which may be given more than once: one runtime per

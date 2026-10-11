@@ -96,7 +96,8 @@ message Hello {
   // the server notices a changed report without receiving the report again.
   bytes report_hash = 5;
   // Names the daemon process: drawn at random when the daemon starts, the same in
-  // every Hello it sends on every stream, and never kept across a restart. The server
+  // every Hello it sends on every stream, and kept across a restart only for the next
+  // daemon to name as its predecessor (predecessor_instance_id). The server
   // gives up at once a lease the daemon's new stream leaves out only if that lease's
   // Start went to the same process; one that went to another process (a restarted
   // daemon, or a second one holding this node's certificate) is given up once that
@@ -130,8 +131,9 @@ enum Phase {
   PHASE_PREPARING = 1;
   // It switches the session back after the whole-machine lease `lease_id` ended (or
   // after the daemon restarted while its action ran: the action's processes are
-  // killed and the lease fails, its result lost) and cleans up; the lease's Result is
-  // sent when that is done. Kept the same way.
+  // killed and the lease's Result says LOST_DAEMON_RESTARTED, which the server runs
+  // again) and cleans up; the lease's Result is sent when that is done. Kept the same
+  // way.
   PHASE_RESTORING = 2;
   // A cleanup failed (`reason` says which): the node takes no lease until an
   // operator repairs it. The server lists it for attention.

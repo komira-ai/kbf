@@ -26,8 +26,14 @@ fn cli(dir: &Path, extra: &[String]) -> Cli {
     Cli::try_parse_from(flags.iter().chain(extra)).expect("flags")
 }
 
+/// The claim in `dir`'s scratch directory, as written.
 fn claimed(dir: &Path) -> Option<String> {
     std::fs::read_to_string(dir.join("leases/daemon-instance")).ok()
+}
+
+/// A claim of `id`, as a daemon writes it.
+fn claim_of(id: &str) -> Option<String> {
+    Some(format!("{id}\n"))
 }
 
 /// Catches a daemon that leaves no claim (its successor could name no predecessor,
@@ -40,10 +46,10 @@ async fn each_daemon_that_starts_claims_the_scratch_directory() {
     let cli = cli(&dir, &["--driver=fake".to_owned()]);
     let xcrun = dir.join("no-xcrun");
     let (first, _) = node(&cli, || native_config(&cli), &xcrun).expect("started");
-    assert_eq!(claimed(&dir).as_deref(), Some(first.instance_id()));
+    assert_eq!(claimed(&dir), claim_of(first.instance_id()));
     let (second, _) = node(&cli, || native_config(&cli), &xcrun).expect("started");
     assert_ne!(second.instance_id(), first.instance_id());
-    assert_eq!(claimed(&dir).as_deref(), Some(second.instance_id()));
+    assert_eq!(claimed(&dir), claim_of(second.instance_id()));
 }
 
 /// Catches the claim written before every runtime is built (the mutant "claim first"):
@@ -78,4 +84,18 @@ async fn a_daemon_that_does_not_start_keeps_the_claim_it_found() {
     // The native runtime's Xcode survey may still be writing under it: not removed
     // here (the next run of this test binary's pid would).
     drop(dir);
+}
+
+/// Catches a claim that cannot be read stopping the start (a stray directory would take
+/// the node out of the farm): the daemon starts, naming no predecessor, so the server
+/// falls back to the handover grace.
+#[tokio::test]
+async fn a_daemon_whose_claim_cannot_be_read_starts_naming_none() {
+    let dir = scratch("instance-unreadable");
+    tls_files(&dir);
+    std::fs::create_dir_all(dir.join("leases/daemon-instance")).expect("in the way");
+    let cli = cli(&dir, &["--driver=fake".to_owned()]);
+    let started = node(&cli, || native_config(&cli), &dir.join("no-xcrun"));
+    assert!(started.is_ok(), "the start failed on its claim");
+    assert!(dir.join("leases/daemon-instance").is_dir());
 }

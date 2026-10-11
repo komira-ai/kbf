@@ -15,29 +15,32 @@
 //!   of that key books at least the floor.
 //! - **The node killed it under pressure** ([`Failure::NodeMemoryPressure`]): a node-wide
 //!   kill of a lease that never reached its own limit. The node's memory-pressure count
-//!   goes up and the operation runs again with the same booking; it never raises the
-//!   booking or the floor.
+//!   goes up and the operation runs again with the same booking, preferring another
+//!   node, as a farm fault (`super::fault`); it never raises the booking or the floor.
 //!
 //! **The two budgets.** A rung of the ladder is not a farm rerun, and a farm rerun is
 //! not a rung: the ladder is bounded by itself (from booking `b` to cap `c`, at most
-//! ceil(log2(c / b)) reruns), and busy-node kills by [`FARM_RERUNS`]. Neither uses the
-//! other's count, so a long ladder never leaves a busy-node kill without its reruns,
-//! and busy-node kills never cut a ladder short of the cap. An operation therefore runs
-//! at most `1 + ceil(log2(c / b)) + FARM_RERUNS` times. Leases given up for silence,
-//! replacement, reconnection or not starting use neither.
+//! ceil(log2(c / b)) reruns), and farm faults (busy-node kills and lost runs together)
+//! by [`FARM_RERUNS`]. Neither uses the other's count, so a long ladder never leaves a
+//! busy-node kill without its reruns, and farm faults never cut a ladder short of the
+//! cap. An operation therefore runs at most `1 + ceil(log2(c / b)) + FARM_RERUNS`
+//! times. Leases given up for silence, replacement without proof, reconnection or not
+//! starting use neither.
 //!
 //! The floors live in this scheduler alone: a server restart forgets them, which costs
 //! one more killed run per key, never a wrong answer. At most [`MEMORY_FLOORS`] are kept;
 //! past that the one raised longest ago is forgotten first. A floor never falls.
 //!
 //! **One value.** Everything this module keeps (the floors and the order they were
-//! raised in, each held operation's memory runs and busy-node reruns, each node's
-//! busy-node kills) is one [`MemoryState`], which compares with `Eq`: two schedulers
+//! raised in, each held operation's memory runs, each node's busy-node kills) is one
+//! [`MemoryState`], which compares with `Eq`: two schedulers
 //! given the same inputs hold equal ones (see [`Scheduler::memory_state`]).
 
 use std::collections::BTreeMap;
 
-use kbf_types::{ActionKey, Failure, MemoryKill, MemoryRun, OperationId, ResultRecord, WorkerId};
+use kbf_types::{
+    ActionKey, Failure, FarmFault, MemoryKill, MemoryRun, OperationId, ResultRecord, WorkerId,
+};
 
 use super::Scheduler;
 use crate::input::Request;
@@ -47,8 +50,9 @@ use crate::servable::serves;
 /// One GiB, the step a raised booking is rounded up to.
 pub const GIB: u64 = 1 << 30;
 
-/// How many times an operation runs again after busy-node memory kills (so at most
-/// `1 + FARM_RERUNS` runs end that way); the farm budget of failure classes 6.5. The
+/// How many times an operation runs again after runs that ended as the farm's fault
+/// (so at most `1 + FARM_RERUNS` runs end that way): busy-node memory kills and lost
+/// runs together, one budget (`fault`); the farm budget of failure classes 6.5. The
 /// ladder of the action's own memory kills does not count here.
 pub const FARM_RERUNS: u32 = 2;
 
@@ -116,8 +120,6 @@ impl MemoryState {
 struct OpKills {
     /// Its runs killed for memory, oldest first.
     runs: Vec<MemoryRun>,
-    /// How many times it was run again after a busy node's memory kill.
-    farm_reruns: u32,
 }
 
 /// The memory floors by action key, each with the order it was raised in, and the keys
@@ -255,16 +257,12 @@ impl Scheduler {
         *self.memory.pressure.entry(worker.clone()).or_default() += 1;
         let kills = self.memory.ops.entry(id).or_default();
         kills.runs.push(MemoryRun {
-            worker,
+            worker: worker.clone(),
             booked,
             kill: MemoryKill::NodePressure,
         });
-        if kills.farm_reruns >= FARM_RERUNS {
-            return false;
-        }
-        kills.farm_reruns += 1;
-        self.requeue(id, RequeueReason::NodeMemoryPressure);
-        true
+        let fault = FarmFault::NodeMemoryPressure;
+        self.farm_fault(id, worker, fault, RequeueReason::NodeMemoryPressure)
     }
 
     /// The memory of the largest node that could run `request`, in bytes: one that is

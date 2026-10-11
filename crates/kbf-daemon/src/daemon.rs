@@ -875,8 +875,10 @@ impl Daemon {
 
 /// A new daemon process's instance id: 128 random bits as 32 hex digits, from two
 /// hashers the standard library keys from the operating system's random source. It is
-/// never written down, so a restarted daemon, a second daemon started with the same
-/// certificate and a daemon on a cloned machine each draw their own (issue #140).
+/// drawn at every start, so a restarted daemon, a second daemon started with the same
+/// certificate and a daemon on a cloned machine each draw their own (issue #140). It is
+/// written down for its successor only: `kbf-node` keeps it in the scratch directory,
+/// and the next daemon names it as its predecessor ([`Daemon::with_predecessor`]).
 fn instance_id() -> String {
     let half = || RandomState::new().hash_one(std::process::id());
     format!("{:016x}{:016x}", half(), half())

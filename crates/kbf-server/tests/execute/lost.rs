@@ -173,6 +173,27 @@ async fn three_lost_runs_answer_internal_naming_the_runs() {
     assert_eq!(cell.cached(&job.action).await, Err(Code::NotFound));
 }
 
+/// Catches a `lost` value this server does not know (from a newer daemon) read as a
+/// lost run: the `Result` is the farm's plain failure, answered INTERNAL at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unknown_lost_value_is_a_plain_failure() {
+    let cell = Cell::start().await;
+    let mut daemon = cell.daemon("node-u", 4, 8).await;
+    let job = Job::new("lost how", &[]);
+    cell.upload(&job.blobs()).await;
+    let mut ops = cell.execute(&job.action).await;
+    let start = daemon.start().await;
+    let unknown = worker::Result {
+        lost: 9,
+        ..failed(start.lease_id, Code::Unavailable)
+    };
+    assert!(daemon.report(unknown).await.accepted);
+    let status = response(&done(&mut ops).await).status.expect("a status");
+    assert_eq!(status.code, Code::Internal as i32);
+    assert_eq!(status.message, "the farm could not run the action");
+    daemon.no_work().await;
+}
+
 /// Catches a budget used up on the heartbeat path that answers nobody (the mutant
 /// "heartbeat stays quiet": the server's answer is dropped, and the client waits for
 /// ever): two runs fenced, the third lost to a proven restart, found by the restarted

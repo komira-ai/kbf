@@ -117,9 +117,15 @@ pub enum Event {
     ///
     /// A registration names the daemon process that made it (`instance`). The new
     /// session's first heartbeat decides at once only about leases whose `Start` went
-    /// to an earlier session of the same process; leases whose `Start` went to another
-    /// process are kept until that process has fenced (issue #140). See
-    /// [`Event::Heartbeat`].
+    /// to an earlier session of the same process, or to the process this one replaces
+    /// when `predecessor_stopped`; leases whose `Start` went to another process are
+    /// kept until that process has fenced (issue #140). See [`Event::Heartbeat`].
+    ///
+    /// `predecessor_stopped` is the caller's proof that the process the worker's
+    /// previous session came from has stopped, every run of it killed: the new daemon
+    /// named that process as its predecessor, whose runs its drivers swept before its
+    /// `Hello`, and the previous session's stream has closed (`kbf-server` checks both;
+    /// issue #22). Ignored unless the process changes.
     WorkerUp {
         /// The worker.
         worker: WorkerId,
@@ -155,6 +161,10 @@ pub enum Event {
     /// - at once if its `Start` was sent to an earlier session of the daemon process
     ///   that holds this one (the daemon either received it before registering again,
     ///   and then lists it, or never will);
+    /// - at once, as a farm fault, if its `Start` was sent to the process a
+    ///   registration proved stopped (`predecessor_stopped`; issue #22): the lease runs
+    ///   again while the operation's farm reruns last, and past them its result is
+    ///   proposed, so the effects are that result's commit;
     /// - if its `Start` was sent to a session of another daemon process, once
     ///   [`HANDOVER_GRACE`] has passed since the scheduler last heard the worker before
     ///   the newest change of process (issue #140). Only the process that ran a lease
@@ -171,7 +181,8 @@ pub enum Event {
     /// process is requeued on the first heartbeat that leaves it out, with no grace. So
     /// a daemon must list every lease it holds in its first heartbeat on a new stream.
     /// A restarted daemon is another process: a lease it does not list is given up
-    /// after the handover grace, not at once. The set must also include leases that
+    /// after the handover grace, not at once, unless the registration proved its
+    /// predecessor stopped. The set must also include leases that
     /// ended with a result not yet acknowledged (issue #26); the server side of the
     /// session boundary is issue #25.
     ///

@@ -58,6 +58,7 @@ mod phase;
 
 pub use phase::Reported;
 
+use crate::fault;
 use crate::fleet::{
     NodeView, NodesView, PhaseView, PlacementView, SoftwareView, attention_changes, needs_attention,
 };
@@ -253,11 +254,15 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
     /// stream ([`Self::resize`] says when). Messages still arriving on its earlier
     /// stream are ignored from now on. A stream of another process than the earlier
     /// stream's is logged: leases that process ran are kept until it has fenced (issue
-    /// #140).
+    /// #140), unless it is proven stopped. It is when the new process names it as its
+    /// `predecessor` (whose runs the new daemon's drivers killed before its `Hello`) and
+    /// the earlier stream has closed: a process still connected may be another
+    /// machine's, with a copy of this one's disk (issue #22).
     pub fn register(
         &self,
         worker: &WorkerId,
         instance: DaemonInstance,
+        predecessor: DaemonInstance,
         reported: Reported,
         outbound: Outbound,
         welcome: ServerMessage,
@@ -276,7 +281,14 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
         };
         let replaced = state.links.insert(worker.clone(), link);
         state.machine.register(worker);
-        if replaced.is_some_and(|old| !old.instance.same_as(&instance)) {
+        let stopped = replaced
+            .as_ref()
+            .is_some_and(|old| old.instance.same_as(&predecessor) && old.outbound.is_closed());
+        if stopped {
+            // Its runs were killed: its leases go at once, as farm faults.
+            let predecessor = predecessor.as_str();
+            tracing::info!(%worker, predecessor, "the daemon restarted and names its predecessor stopped");
+        } else if replaced.is_some_and(|old| !old.instance.same_as(&instance)) {
             // The earlier process's leases are kept until it has fenced.
             let cause = "the daemon restarted, or two daemons hold this node's certificate";
             tracing::warn!(%worker, cause, "another daemon process registered as this node");
@@ -284,7 +296,7 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
         let event = Event::WorkerUp {
             worker: worker.clone(),
             instance,
-            predecessor_stopped: false,
+            predecessor_stopped: stopped,
             capacity: reported.capacity,
             caps: reported.caps,
         };
@@ -322,8 +334,10 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
 
     /// Heartbeat `seq` on `stream`. Returns whether it was taken (and is to be
     /// acknowledged): a heartbeat from a replaced stream is dropped. Each lease it
-    /// lists that the scheduler no longer holds on `worker` is sent a `Cancel`.
-    pub fn heartbeat(
+    /// lists that the scheduler no longer holds on `worker` is sent a `Cancel`. A lease
+    /// it leaves out that a proven restart lost past its operation's farm reruns
+    /// finishes the operation: its callers are answered (nothing is cached).
+    pub async fn heartbeat(
         &self,
         worker: &WorkerId,
         stream: StreamId,
@@ -331,27 +345,33 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
         running: Vec<LeaseId>,
     ) -> bool {
         let now = self.now();
-        let mut state = self.lock();
-        let Some(link) = state.links.get_mut(worker).filter(|l| l.stream == stream) else {
-            return false;
+        let settled: Vec<Settled> = {
+            let mut state = self.lock();
+            let Some(link) = state.links.get_mut(worker).filter(|l| l.stream == stream) else {
+                return false;
+            };
+            link.newest_beat = link.newest_beat.max(seq);
+            let outbound = link.outbound.clone();
+            let event = Event::Heartbeat {
+                worker: worker.clone(),
+                running: running.clone(),
+            };
+            let answers = state.feed(now, event);
+            for lease in state.sched.not_held(worker, &running) {
+                tracing::info!(%worker, %lease, "a lease not held here is listed: cancelled");
+                let cancel = server_message::Message::Cancel(Cancel {
+                    lease_id: Some(wire_lease(lease)),
+                });
+                // A stream that has just ended drops it; the next heartbeat listing the
+                // lease, on the next stream, sends it again.
+                let _ = outbound.send(Ok(ServerMessage {
+                    message: Some(cancel),
+                }));
+            }
+            answers.iter().map(|a| state.settle(a, None)).collect()
         };
-        link.newest_beat = link.newest_beat.max(seq);
-        let outbound = link.outbound.clone();
-        let event = Event::Heartbeat {
-            worker: worker.clone(),
-            running: running.clone(),
-        };
-        state.feed_quiet(now, event);
-        for lease in state.sched.not_held(worker, &running) {
-            tracing::info!(%worker, %lease, "a lease not held here is listed: cancelled");
-            let cancel = server_message::Message::Cancel(Cancel {
-                lease_id: Some(wire_lease(lease)),
-            });
-            // A stream that has just ended drops it; the next heartbeat listing the
-            // lease, on the next stream, sends it again.
-            let _ = outbound.send(Ok(ServerMessage {
-                message: Some(cancel),
-            }));
+        for settled in settled {
+            self.deliver(settled).await;
         }
         true
     }
@@ -557,6 +577,11 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
         ran_on: (&WorkerId, Stamp),
         result: worker::Result,
     ) -> (Outcome, Option<Detail>) {
+        if let Some(why) = fault::lost(&result) {
+            let node = ran_on.0;
+            tracing::warn!(%lease, %node, %why, "the farm lost the run");
+            return (Outcome::Failed(Failure::Lost(why)), None);
+        }
         if let Some(kill) = memory::killed(&result) {
             tracing::info!(%lease, ?kill, "lease killed for memory");
             return (Outcome::Failed(kill), None);
@@ -690,20 +715,23 @@ impl<M: MetaLog, O: ObjectStore + 'static> Dispatch for Farm<M, O> {
 }
 
 impl State {
-    /// How many runs of `operation` the scheduler has recorded as killed for memory.
-    fn memory_runs(&self, operation: OperationId) -> usize {
-        self.sched.memory_runs(operation).map_or(0, <[_]>::len)
+    /// How many runs of `operation` the scheduler has recorded as killed for memory or
+    /// as the farm's fault.
+    fn runs_recorded(&self, operation: OperationId) -> usize {
+        let memory = self.sched.memory_runs(operation).map_or(0, <[_]>::len);
+        let farm = self.sched.farm_runs(operation).map_or(0, <[_]>::len);
+        memory + farm
     }
 
     /// Feeds `worker`'s report that `lease` of `operation` ended with `outcome`, and
     /// returns the answers it led to and whether the scheduler took it. A busy node's
     /// memory kill the scheduler took is logged for operators (`crate::memory`).
     ///
-    /// Only a report leads to an answer, and the in-process log commits its record at
-    /// once: an accepted result is answered here, and a refused one (its lease given up
-    /// while its outputs were checked) never is. A memory kill the scheduler takes is
-    /// answered, or records a run and runs the operation again. The replicated log will
-    /// answer once the record commits, carrying the result with it.
+    /// The in-process log commits its record at once: an accepted result is answered
+    /// here, and a refused one (its lease given up while its outputs were checked)
+    /// never is. A memory kill or lost run the scheduler takes is answered, or records
+    /// a run and runs the operation again. The replicated log will answer once the
+    /// record commits, carrying the result with it.
     ///
     /// Not generic, unlike `Farm::report`, so every test binary's runs count toward the
     /// same function's coverage.
@@ -715,14 +743,14 @@ impl State {
         lease: LeaseId,
         outcome: Outcome,
     ) -> (Vec<Answer>, bool) {
-        let killed_before = self.memory_runs(operation);
+        let recorded_before = self.runs_recorded(operation);
         let event = Event::Report {
             operation,
             lease,
             outcome,
         };
         let answers = self.feed(now, event);
-        let rerun = self.memory_runs(operation) > killed_before;
+        let rerun = self.runs_recorded(operation) > recorded_before;
         let accepted = rerun || answers.iter().any(|a| a.lease == lease);
         if accepted && outcome == Outcome::Failed(Failure::NodeMemoryPressure) {
             memory::pressure(worker, self.sched.memory_pressure(worker));
@@ -766,8 +794,9 @@ impl State {
         current.then_some((operation, sent.action, sent.stamp))
     }
 
-    /// Feeds an input that cannot lead to an answer: only a `Report` proposes a result,
-    /// and only a committed result answers.
+    /// Feeds an input that cannot lead to an answer: only a `Report` and a heartbeat
+    /// (a lease lost to a proven restart) propose a result, and only a committed result
+    /// answers.
     fn feed_quiet(&mut self, now: FarmTime, event: Event) {
         let answers = self.feed(now, event);
         debug_assert!(
@@ -1022,8 +1051,11 @@ impl State {
             (Some(Detail::Missing(blobs)), _) => {
                 (Finished::Failed(kbf_front::missing_status(&blobs)), None)
             }
-            (_, Outcome::Failed(kill @ (Failure::OutOfMemory | Failure::NodeMemoryPressure))) => {
-                (memory::finished(kill, &answer.memory_runs), None)
+            (_, Outcome::Failed(Failure::OutOfMemory)) => {
+                (memory::finished(&answer.memory_runs), None)
+            }
+            (_, Outcome::Failed(Failure::NodeMemoryPressure | Failure::Lost(_))) => {
+                (fault::finished(&answer.farm_runs), None)
             }
             _ => (
                 failed(Code::Internal, "the farm could not run the action"),

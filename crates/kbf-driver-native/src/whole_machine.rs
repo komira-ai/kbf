@@ -33,10 +33,11 @@
 //! is not taken up: the record says `started` from just before the `run`, and the
 //! action's processes outlive the daemon (the helper runs them) while its result is
 //! lost with it. At start the runtime kills every process of the lease user
-//! (`kill-uid`) before anything else, records the lease as failed ("its result is
-//! lost", the farm's failure, not the action's) and reports `Restoring`; the `Start`
-//! sent again, or the server's `Cancel`, then runs the restore. The action never runs
-//! a second time on the node.
+//! (`kill-uid`) before anything else, records the lease as lost ("its result is
+//! lost", [`RuntimeError::Lost`]: the farm's, not the action's) and reports
+//! `Restoring`; the `Start` sent again, or the server's `Cancel`, then runs the
+//! restore. The action never runs a second time on the node beside the first: the
+//! server runs it again once the lost result arrives, on another node if one can.
 //!
 //! **A failed cleanup quarantines the node**: any restore step that fails writes the
 //! quarantine file with why, the phase becomes `Quarantined`, and every later lease is
@@ -60,7 +61,7 @@ use kbf_daemon::cas::Cas;
 use kbf_daemon::{Runtime, RuntimeError, Work};
 use kbf_outputs::OutputLimits;
 use kbf_proto::reapi::ActionResult;
-use kbf_types::{LeaseId, NodePhase};
+use kbf_types::{LeaseId, LostWhy, NodePhase};
 use tokio::sync::{oneshot, watch};
 
 pub use session::{Exit, HelperSession, Session};
@@ -464,7 +465,8 @@ fn lock(
 /// Takes up `record`'s lease after a daemon that died while its action ran (a crash or
 /// an update, not a session switch): the action's processes may still run, and its
 /// result is lost. Kills every process of the lease user first, then turns the lease
-/// to its restore, failed, so the action is never run a second time beside the first.
+/// to its restore, lost (the server runs the action again once the node is restored,
+/// as a farm fault), so the action is never run a second time beside the first.
 /// A `kill-uid` that fails here is retried as the restore's first step, whose failure
 /// quarantines the node.
 fn lost_mid_action<S: Session>(session: &S, record: &mut Record) {
@@ -477,9 +479,10 @@ fn lost_mid_action<S: Session>(session: &S, record: &mut Record) {
         }
     }
     record.step = Step::Restoring;
-    record.outcome = Some(Err(RuntimeError::Failed(format!(
-        "the daemon restarted while lease {id}'s action ran: its result is lost"
-    ))));
+    record.outcome = Some(Err(RuntimeError::Lost(
+        LostWhy::DaemonRestarted,
+        format!("the daemon restarted while lease {id}'s action ran: its result is lost"),
+    )));
 }
 
 /// The lease's failure at step `what`, from the helper's (or the file's) reason.

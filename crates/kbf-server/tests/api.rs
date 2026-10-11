@@ -380,6 +380,8 @@ fn register(
     let stream = farm.register(
         &WorkerId::new(node),
         kbf_sched::DaemonInstance::new(node),
+        // No predecessor named: the first daemon of the node.
+        kbf_sched::DaemonInstance::default(),
         kbf_server::farm::Reported::serving(resources, caps),
         outbound,
         ServerMessage::default(),
