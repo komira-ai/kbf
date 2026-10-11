@@ -1,0 +1,10 @@
+# The entitlements each macOS binary is signed with (tools/ci/darwin-entitlements.sh;
+# docs/design/macos-vm-guests.md section 7). One line per binary that gets any:
+#
+#   <binary file name> <entitlement> [<entitlement> ...]
+#
+# Every entitlement listed is a boolean set to true. A binary not listed gets none, and
+# the check fails if its signature carries any. A listed binary's signature must carry
+# exactly its line's set: one more, one fewer or another one fails.
+# crates/kbf-it/tests/darwin_entitlements.rs pins this file's lines.
+kbf-vmm com.apple.security.virtualization

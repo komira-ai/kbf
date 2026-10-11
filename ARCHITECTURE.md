@@ -111,6 +111,7 @@ what lets a simulation seed replay a run exactly (see [Testing](#testing)).
 | `kbf-updater` | no | the root helper that verifies and installs signed software sets on a node ([fleet-updates-security.md](docs/design/fleet-updates-security.md) S3, S4.1); Linux only for now |
 | `kbf-mac-session` | no | the Mac's root helper that gives every lease its own throwaway user, admits an administrator only with the MDM gate's signed grant, switches the GUI session to a lease user (auto-login, then a userspace restart) and resets it at boot ([fleet-updates-security.md](docs/design/fleet-updates-security.md) S4.2, S4.3, S5.2); serves on macOS only |
 | `kbf-guest` | no | the agent inside a macOS VM guest ([macos-vms.md](docs/design/macos-vms.md) section 6): a versioned protocol over a Unix socket, one command per boot behind a per-boot token, its process group killed on exit, `Kill` or timeout; `kbf-driver-vm` calls it; the virtio socket is **planned** |
+| `kbf-vmm` | no | the VM helper for macOS VM leases ([macos-vm-guests.md](docs/design/macos-vm-guests.md)): a **stub** that answers `--version` only, the one binary the signing scripts' entitlement allow list gives an entitlement (`com.apple.security.virtualization`); the VM code is **planned** |
 | `kbf-sim` | no | the deterministic simulation kernel |
 | `kbf-it` | no | integration tests, repository lints, the end-to-end harness |
 | `kbf-coverage` | no | the coverage ratchet CI runs |
