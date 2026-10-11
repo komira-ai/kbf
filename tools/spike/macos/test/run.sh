@@ -383,6 +383,7 @@ t_xs_driver_fails() {
     xs
     want 'xcuitest_sandbox.driver.ios.result=FAIL'
     want 'xcuitest_sandbox.driver.ios.xcodebuild_exit=65'
+    want 'xcuitest_sandbox.driver.ios.in_sandbox=FAIL'
     want 'xcuitest_sandbox.driver.ios.report.tests_passed=2'
     want 'xcuitest_sandbox.driver.ios.error=error: -[FixtureUITests testTapChangesLabel] failed'
     want 'xcuitest_sandbox.driver_tests.ios.result=PASS'

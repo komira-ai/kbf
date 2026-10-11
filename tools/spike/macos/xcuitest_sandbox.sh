@@ -230,15 +230,16 @@ a_deny_default() {
 # left: the bundle's checks (xcresulttool) are the probe's, not part of the action, so
 # they are not judged under the sandbox. NAME.result is PASS only when xcodebuild
 # exited 0 under the profile and the report passed; NAME.in_sandbox is run.sh's own
-# result there.
+# result there (none when run.sh stopped before printing one).
 driver_arm() {
-    local exit
+    local exit in_sandbox
     tracked "$1" in_lease "$1" "$LEASES/$1/sandbox/profile.sb" \
         bash "$RUN" "$2" "$LEASES/$1/root/out" ${3:+"$3"}
     kv "$1.used_sha256" "$(cat "$LEASES/$1/used.sha256" 2>/dev/null)"
     exit=$(sed -n "s/^SPIKE macos-[^.]*\.xcuitest\.$2\.xcodebuild_exit=//p" "$SPIKE_RESULTS/$1.out" | tail -n 1)
     kv "$1.xcodebuild_exit" "${exit:-none}"
-    kv "$1.in_sandbox" "$(sed -n "s/^SPIKE macos-[^.]*\.xcuitest\.$2\.result=//p" "$SPIKE_RESULTS/$1.out" | tail -n 1)"
+    in_sandbox=$(sed -n "s/^SPIKE macos-[^.]*\.xcuitest\.$2\.result=//p" "$SPIKE_RESULTS/$1.out" | tail -n 1)
+    kv "$1.in_sandbox" "${in_sandbox:-none}"
     tracked "$1.report" in_lease "$1" "" bash "$RUN" "$2" "$LEASES/$1/root/out" report
     outcome "$1.report" "$2"
     if [ "${exit:-none}" = 0 ] && [ "$(st_get "$1.report.result")" = PASS ]; then

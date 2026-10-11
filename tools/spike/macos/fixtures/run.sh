@@ -66,7 +66,15 @@ esac
 mkdir -p "$out"
 bundle=$out/$platform.xcresult
 log=$out/$platform-xcodebuild.log
-[ "$action" = test ] || log=$out/$platform-$action-xcodebuild.log
+case $action in
+build-for-testing | test-without-building) log=$out/$platform-$action-xcodebuild.log ;;
+report)
+    # The log of the run that left the bundle (its KBF-FIXTURE lines are read below).
+    if [ -f "$out/$platform-test-without-building-xcodebuild.log" ]; then
+        log=$out/$platform-test-without-building-xcodebuild.log
+    fi
+    ;;
+esac
 start=$(date +%s)
 rc=0
 if [ "$action" = report ]; then

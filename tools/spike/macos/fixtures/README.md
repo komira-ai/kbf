@@ -53,6 +53,7 @@ bash run.sh ios OUT_DIR        # build, test on the newest iPhone simulator
 bash run.sh macos OUT_DIR      # build, test in this login session
 bash run.sh macos OUT_DIR build-for-testing      # only build, into OUT_DIR
 bash run.sh macos OUT_DIR test-without-building  # then only test that build
+bash run.sh macos OUT_DIR report                 # check the bundle a run left, no xcodebuild
 ```
 
 `run.sh` writes `OUT_DIR/<platform>.xcresult`, the xcodebuild log, and
