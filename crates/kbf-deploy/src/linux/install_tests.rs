@@ -348,7 +348,7 @@ fn a_changed_unit_alone_reloads_and_restarts_the_services() {
         bin_dir: None,
         restart_minio: false,
     };
-    let got = steps(&plan(&exec, &a, &mut Vec::new()).expect("plan"));
+    let got = steps(&plan_here(&exec, &a, &mut Vec::new()).expect("plan"));
     assert_eq!(got.len(), 5, "{got:#?}");
     assert!(
         got[0].starts_with("write /etc/systemd/system/kbf-daemon.service (0644, "),
