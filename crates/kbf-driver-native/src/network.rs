@@ -227,7 +227,7 @@ impl Isolation {
             "-D".to_owned(),
             format!("{LEASE_PARAM}={}", lease.to_string_lossy()),
             "-p".to_owned(),
-            format!("{profile}{NO_DEVICE_RULES}{rules}"),
+            format!("{NO_DEVICE_RULES}{profile}{rules}"),
             program.to_string_lossy().into_owned(),
         ];
         wrapped.extend(args.iter().cloned());
