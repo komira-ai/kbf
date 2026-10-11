@@ -6,13 +6,13 @@
 //! changed artifacts are already staged and hashed. An applier must be idempotent: after
 //! a crash mid-apply the updater calls it again with the same set.
 //!
-//! [`AptSnapshot`] changes the node only through `kbf-host`, the one host-change path
-//! `kbf-deploy` uses too: it builds a `kbf_host::Plan` and applies it with
+//! [`AptSnapshot`] changes the node only through `kbf-host`, the host-change path it
+//! shares with `kbf-deploy`: it builds a `kbf_host::Plan` and applies it with
 //! `kbf_host::execute` as [`RunAs::Root`], so the plan is refused unless the updater
-//! runs as root from a binary only root can replace, and each step is logged to stderr
-//! as `+ <step>` before it runs. The binary gives it `kbf_host::HostExec` on `/`; the
-//! tests give it `kbf_host::testkit::FakeExec`, which only records, so no test changes a
-//! package on any machine. What the plan holds:
+//! runs as root from a binary only root can replace, and each step is logged as
+//! `+ <step>` (to stderr on a node) before it runs. The binary gives it
+//! `kbf_host::HostExec` on `/`; the tests give it `kbf_host::testkit::FakeExec`, which
+//! only records, so no test changes a package on any machine. What the plan holds:
 //!
 //! 1. with a snapshot pinned: `/usr/bin/apt-get --snapshot <id> update`, then
 //!    `... --yes full-upgrade`, then `... --yes install <kernel>` (apt checks every
@@ -37,7 +37,7 @@
 
 use std::fmt::Display;
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::path::Path;
 
 use kbf_host::{Cmd, Exec, HostPath, Mode, Perms, Plan, Planner, RunAs, execute};
@@ -131,20 +131,28 @@ fn failed(e: impl Display) -> String {
 
 /// The pinned-package applier for Linux (section 8.1).
 #[derive(Clone, Debug)]
-pub struct AptSnapshot<E> {
+pub struct AptSnapshot<E, W = io::Stderr> {
     /// The host the plans change: `kbf_host::HostExec` on `/`, or a fake in tests.
     pub exec: E,
     /// Where kbf's binaries are installed, one file per artifact name.
     pub bin_dir: HostPath,
+    /// Where each applied step is logged as `+ <step>`: stderr, so the journal, on a node.
+    pub log: W,
 }
 
 impl<E: Exec> AptSnapshot<E> {
     /// The applier a node uses: kbf binaries in `bin_dir`, changed through `exec`.
     pub fn new(exec: E, bin_dir: HostPath) -> Self {
-        AptSnapshot { exec, bin_dir }
+        AptSnapshot {
+            exec,
+            bin_dir,
+            log: io::stderr(),
+        }
     }
+}
 
-    /// The plan that installs `set` from `staged` (section 1 and 2 of the module docs).
+impl<E: Exec, W: Write> AptSnapshot<E, W> {
+    /// The plan that installs `set` from `staged` (items 1 and 2 of the module docs).
     ///
     /// # Errors
     /// A staged artifact cannot be read, or the host cannot say what is installed.
@@ -180,14 +188,20 @@ impl<E: Exec> AptSnapshot<E> {
         Ok(planner.finish())
     }
 
-    /// Applies `plan` as root, logging each step to stderr.
+    /// Applies `plan` as root, logging each step to `log`.
     fn carry_out(&mut self, plan: &Plan) -> Result<(), String> {
-        let mut log = io::stderr().lock();
-        execute(plan, RunAs::Root, Mode::Apply, &mut self.exec, &mut log).map_err(failed)
+        execute(
+            plan,
+            RunAs::Root,
+            Mode::Apply,
+            &mut self.exec,
+            &mut self.log,
+        )
+        .map_err(failed)
     }
 }
 
-impl<E: Exec> Applier for AptSnapshot<E> {
+impl<E: Exec, W: Write> Applier for AptSnapshot<E, W> {
     fn install(&mut self, set: &SoftwareSet, staged: &Path) -> Result<Installed, String> {
         let plan = self.plan(set, staged)?;
         self.carry_out(&plan)?;

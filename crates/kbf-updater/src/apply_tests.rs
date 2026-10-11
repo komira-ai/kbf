@@ -15,10 +15,16 @@ fn p(s: &str) -> HostPath {
     HostPath::new(s).expect("valid test path")
 }
 
-/// An applier over a fake host that runs as `euid`, and an empty staging directory.
-fn apt(name: &str, euid: u32) -> (AptSnapshot<FakeExec>, std::path::PathBuf) {
+/// An applier over a fake host that runs as `euid`, logging into memory, and an empty
+/// staging directory.
+fn apt(name: &str, euid: u32) -> (AptSnapshot<FakeExec, Vec<u8>>, std::path::PathBuf) {
     let staged = testkit::scratch(name);
-    (AptSnapshot::new(FakeExec::new(euid), p(BIN)), staged)
+    let a = AptSnapshot {
+        exec: FakeExec::new(euid),
+        bin_dir: p(BIN),
+        log: Vec::new(),
+    };
+    (a, staged)
 }
 
 fn snapshot_set() -> SoftwareSet {
@@ -51,9 +57,10 @@ fn binary(bytes: &[u8]) -> Entry {
 
 /// Catches: apt run without the pinned snapshot (the node drifts to whatever the
 /// archive serves today), the kernel package not installed, the commands out of order,
-/// apt found through a search path instead of by absolute path, or apt run without
+/// apt found through a search path instead of by absolute path, apt run without
 /// `DEBIAN_FRONTEND=noninteractive` (a debconf prompt with no terminal fails the
-/// upgrade) or without `PATH` (dpkg refuses to run).
+/// upgrade) or without `PATH` (dpkg refuses to run), or steps run without the
+/// `+ <step>` line that puts them in the journal.
 #[test]
 fn a_snapshot_set_runs_apt_pinned_to_its_snapshot() {
     let (mut a, staged) = apt("apt-plan", 0);
@@ -68,6 +75,15 @@ fn a_snapshot_set_runs_apt_pinned_to_its_snapshot() {
             apt_step(&["--yes", "full-upgrade"]),
             apt_step(&["--yes", "install", "linux-image-6.8"]),
         ]
+    );
+    let run = "+ run /usr/bin/apt-get --snapshot 20261001T000000Z";
+    let env = "(env DEBIAN_FRONTEND, PATH)";
+    assert_eq!(
+        String::from_utf8_lossy(&a.log),
+        format!(
+            "{run} update {env}\n{run} --yes full-upgrade {env}\n\
+             {run} --yes install linux-image-6.8 {env}\n"
+        )
     );
     a.exec.log.clear();
     assert_eq!(
@@ -157,7 +173,8 @@ fn a_repeated_install_rewrites_nothing_in_place() {
 /// replace (and so run their code as root). Neither installs nor reboots anything.
 #[test]
 fn the_install_applies_only_as_root_from_a_trusted_binary() {
-    let (mut a, staged) = apt("apt-guard", 990);
+    let staged = testkit::scratch("apt-guard");
+    let mut a = AptSnapshot::new(FakeExec::new(990), p(BIN));
     fs::write(staged.join("kbf-daemon"), b"new daemon").unwrap();
     let err = a.install(&snapshot_set(), &staged).unwrap_err();
     assert!(err.contains("effective uid is 990"), "{err}");
