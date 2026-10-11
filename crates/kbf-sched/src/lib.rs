@@ -21,6 +21,10 @@
 //!   whole and held by one lease each until it ends, on workers whose node report
 //!   lists a driver serving the lease kind and satisfies the action's platform
 //!   (`kbf-caps` matching);
+//! - iOS device leases ([`DEVICE_LEASES_PER_WORKER`]): a request with `ios.device=1`
+//!   goes only to a worker whose report lists a device satisfying every device
+//!   attribute of the request, books that one device by id until the lease ends, and
+//!   its `Start` names it ([`kbf_types::StartLease::device`]);
 //! - whole-machine leases: one goes only to a worker that holds no lease, and books
 //!   all of it, so nothing is placed beside it; one that fits nowhere holds a worker
 //!   that could run it, in queue (QoS) order, and less urgent work is not placed there
@@ -63,6 +67,7 @@
 #![deny(clippy::disallowed_methods, clippy::disallowed_types)]
 
 mod cordon;
+mod devices;
 pub mod fence;
 mod input;
 mod requeue;
@@ -70,6 +75,7 @@ mod scheduler;
 mod servable;
 
 pub use cordon::Cordon;
+pub use devices::DEVICE_LEASES_PER_WORKER;
 pub use fence::SelfFence;
 pub use input::{DaemonInstance, Event, Input, Request};
 pub use kbf_types::NodePhase;

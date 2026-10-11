@@ -274,25 +274,27 @@ Because no daemon reports `vm.image` yet, an action that names one matches no wo
 it waits and then fails as described under [Where an action runs](#where-an-action-runs).
 `kbf-lease=vm` is still refused as an unknown lease kind.
 
-## `ios.device` (planned)
+## `ios.device`
 
-**Planned, not on `main`:** today an action that names `ios.device` or any
-`ios.device.<attribute>` key, in any case, is refused with `INVALID_ARGUMENT` naming the
-key, because kbf does not book devices yet; ignored, the key would let the action run
-on any worker, Linux included. The design is in
+The server matches and books devices; **no daemon reports a device yet**, so an action
+that names `ios.device=1` waits and then fails as described under
+[Where an action runs](#where-an-action-runs). The design is in
 [ios-devices.md](design/ios-devices.md):
 
-| Property | Values | Effect (planned) |
+| Property | Values | Effect |
 |---|---|---|
-| `ios.device` | `1` | Books one USB-attached iPhone or iPad on a Mac for the lease alone; the action finds its UDID in `KBF_IOS_DEVICE_ID`. |
+| `ios.device` | `1` | Books one USB-attached iPhone or iPad on a Mac for the lease alone, named in the lease's `Start`. **Planned:** the action finds its UDID in `KBF_IOS_DEVICE_ID`. |
 | `ios.device.class` | `iPhone`, `iPad` | Exact. |
 | `ios.device.product_type` | a model identifier (`iPhone17,3`) | Exact. |
 | `ios.device.os_version` | an iOS version | Exact. |
 | `ios.device.os_build` | an iOS build | Exact. |
 
-One device must satisfy every `ios.device.*` key. An attribute key without
-`ios.device=1` will be refused, as will `ios.device` with `kbf-lease=vm` or
-`whole_machine`.
+One device must satisfy every `ios.device.*` key: an iPhone on iOS 18.6 and an iPad on
+iOS 26.0 do not together serve `ios.device.class=iPhone` with
+`ios.device.os_version=26.0`. Refused with `INVALID_ARGUMENT`: a value other than `1`,
+an attribute key without `ios.device=1`, an `ios.device.<attribute>` not in the table,
+`ios.device` with an OS other than macOS, and `ios.device` with `kbf-lease=vm` or
+`whole_machine`. Names are read in any case.
 
 ## What an action on a Mac may write
 

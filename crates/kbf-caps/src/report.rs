@@ -11,6 +11,7 @@
 //! | `vm.image` (repeated: one per image, `<name>@sha256:<64 hex>`) | a set of the `sha256:<hex>` digests, matched by membership |
 //! | `vm.slots`, `vm.max_cpus`, `vm.max_mem_gib` (once each) | checked to be whole numbers, not matched on (report-only) |
 //! | `drivers` (repeated: one per driver the daemon runs) | the drivers; placement reads them for the lease kind, no request key names them |
+//! | `ios.device` (repeated: one per ready device, comma-separated `k=v` fields with an `id`; a value may hold commas, never `=`) | the devices, by id, each with its other attributes; a device request matches one of them |
 //!
 //! Every other entry (`isa_level`, ...) is not matched on and is skipped.
 //! The reported `isa_level` list is not read: the level is computed from the features,
@@ -20,7 +21,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::cpu::{Arch, CpuCaps, UnknownArch};
 use crate::matching::{
-    Consumable, NodeCaps, REPORT_ONLY_KEYS, is_exact_key, is_member_key, member_token,
+    Consumable, IOS_DEVICE_KEY, NodeCaps, REPORT_ONLY_KEYS, is_exact_key, is_member_key,
+    member_token,
 };
 
 /// Why a node report does not describe a node.
@@ -41,6 +43,16 @@ pub enum ReportError {
          <name>@sha256:<64 lowercase hex digits>"
     )]
     NoImageDigest(String),
+    /// An `ios.device` entry that is not comma-separated `k=v` fields, each key once,
+    /// every key and value non-empty, no `=` in a value, with an `id`.
+    #[error(
+        "node report entry ios.device={0:?} is not a comma-separated list of k=v fields \
+         with an id"
+    )]
+    BadDevice(String),
+    /// Two `ios.device` entries name one device id.
+    #[error("node report names iOS device {0:?} twice")]
+    RepeatedDevice(String),
     /// A countable entry is not a whole number.
     #[error("node report entry {key}={value:?} is not a whole number")]
     NotANumber {
@@ -56,8 +68,8 @@ impl NodeCaps {
     ///
     /// # Errors
     /// No `arch`, an unknown one, a single-valued entry repeated, a countable or
-    /// report-only entry that is not a whole number, or a `vm.image` entry without a
-    /// digest.
+    /// report-only entry that is not a whole number, a `vm.image` entry without a
+    /// digest, or an `ios.device` entry that is malformed or names a device id again.
     pub fn from_report<'r, I>(entries: I) -> Result<Self, ReportError>
     where
         I: IntoIterator<Item = (&'r str, &'r str)>,
@@ -82,6 +94,7 @@ impl NodeCaps {
             })
         };
         let mut drivers = BTreeSet::new();
+        let mut devices = BTreeMap::new();
         let repeated = |key: &str| ReportError::Repeated(key.to_owned());
         for (key, value) in entries {
             if key == "arch" {
@@ -92,6 +105,13 @@ impl NodeCaps {
                 features.insert(value.to_owned());
             } else if key == "drivers" {
                 drivers.insert(value.to_owned());
+            } else if key == IOS_DEVICE_KEY {
+                let (id, attributes) =
+                    device(value).ok_or_else(|| ReportError::BadDevice(value.to_owned()))?;
+                if devices.contains_key(&id) {
+                    return Err(ReportError::RepeatedDevice(id));
+                }
+                devices.insert(id, attributes);
             } else if is_member_key(key) {
                 let token = member_token(key, value)
                     .ok_or_else(|| ReportError::NoImageDigest(value.to_owned()))?;
@@ -121,6 +141,35 @@ impl NodeCaps {
             members,
             consumables,
             drivers,
+            devices,
         })
     }
+}
+
+/// An `ios.device` entry's id and its other fields, or `None` if it is malformed (see
+/// [`ReportError::BadDevice`]). A field is `<key>=<value>`, fields are separated by
+/// commas, and a value may hold commas but no `=`: Apple's model identifiers do
+/// (`product_type=iPhone17,3`), so a comma starts a new field only where `=` follows
+/// before the next comma. Fields kbf does not match on are kept: a request can name
+/// only [`crate::DEVICE_ATTRIBUTES`], so they never decide a match.
+fn device(value: &str) -> Option<(String, BTreeMap<String, String>)> {
+    let mut fields: Vec<(&str, String)> = Vec::new();
+    for piece in value.split(',') {
+        match piece.split_once('=') {
+            Some((key, value)) if !key.is_empty() && !value.contains('=') => {
+                fields.push((key, value.to_owned()));
+            }
+            Some(_) => return None,
+            // A comma inside the value of the field before.
+            None => fields.last_mut()?.1.extend([",", piece]),
+        }
+    }
+    let mut map = BTreeMap::new();
+    for (key, value) in fields {
+        if value.is_empty() || map.insert(key.to_owned(), value).is_some() {
+            return None;
+        }
+    }
+    let id = map.remove("id")?;
+    Some((id, map))
 }

@@ -275,8 +275,16 @@ What the code does today:
   leases end; operations before it still are. The hold lasts while the operation is
   queued and the worker could run it (live, not cordoned, feasible). No lease is ever
   stopped for it. A large `action` request has no such hold yet (issue #169).
+- A request with `ios.device=1` has room only where a device the worker reports
+  satisfies every `ios.device.*` attribute of the request and no lease holds it, and
+  where the worker holds no other device lease (`DEVICE_LEASES_PER_WORKER` = 1, until
+  leases are shown not to reach each other's devices). It books the first such device
+  by id with its CPU and memory, and its `Start` names it (`device_id`). A worker
+  whose report lists no device is never given one, so a daemon that predates devices
+  is not. See [ios-devices.md](ios-devices.md#54-booking).
 - At most `PLACEMENT_ROUND` = 256 grants are made per round (one log flush per round).
-- A booking is released when the operation finishes or its lease is given up.
+- A booking (and its device) is released when the operation finishes or its lease is
+  given up; a new registration or report of the worker does not release it.
 - Every queued operation is also checked, past the grant limit too, against what live
   workers could give it once their bookings end. If no live worker satisfies its
   platform, or none that does is large enough, it is *unservable*: the scheduler emits

@@ -555,6 +555,8 @@ impl Checker {
             kind: op.request.kind,
             resources: op.request.resources,
             fence: op.request.fence(),
+            // The f4 world asks for no iOS device.
+            device: None,
         })]
     }
 

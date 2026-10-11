@@ -109,18 +109,17 @@ A report-only entry is never a request key: a request that names `vm.slots`,
 `kbf-lease=vm`. `Resources` has the `vms` axis, checked by `fits` like `gpus`; nothing
 books it or fills it yet.
 
-### Planned device entries
+### Device entries
 
-Physical iOS devices on a Mac node ([ios-devices.md](ios-devices.md#52-report-entries))
-will add, all **planned**:
+Physical iOS devices on a Mac node ([ios-devices.md](ios-devices.md#52-report-entries)).
+The server reads the entry; no daemon reports one yet (**planned**):
 
 | Entry | Meaning | Kind |
 |---|---|---|
-| `ios.device` (repeated) | one per **ready** USB-attached iPhone or iPad: a sorted `k=v` list of `id` (the UDID), `class`, `product_type`, `os_version`, `os_build` | capability: one device is booked per lease, and one device must satisfy every `ios.device.*` key of a request |
+| `ios.device` (repeated) | one per **ready** USB-attached iPhone or iPad: a sorted, comma-separated `k=v` list of `id` (the UDID), `class`, `product_type`, `os_version`, `os_build` (a value may hold a comma, as `iPhone17,3` does, never `=`) | capability: one device is booked per lease, and one device must satisfy every `ios.device.*` key of a request |
 
-Until booking exists, a request that names `ios.device` or any `ios.device.<attribute>`
-key is refused ([ios-devices.md](ios-devices.md#55-rollout-order)): ignored, as an
-unknown property is, it would match every node, Linux included.
+A malformed entry (no `id`, an empty key or value, a field twice) or a second entry
+for one id refuses the report (`ReportError::BadDevice`, `ReportError::RepeatedDevice`).
 
 A device that is not ready is not a report entry; it is listed, with its state and the
 fix, in `NodeStatus` (planned `devices`). An older server skips the entry, as it skips
@@ -201,7 +200,7 @@ Each key has one typed comparison:
 | `xcode` | membership: the node reports one `xcode` entry per ready Xcode build, and the request names one of them |
 | `os_build`, `os_version`, `kernel` | **planned**: exact, once they are report entries (see [The node status](#the-node-status)) |
 | `vm.image` | membership on the digest: the request names `<name>@sha256:<64 lowercase hex digits>` and matches a node that reports any name with that digest; a value without a digest is refused. No daemon reports `vm.image` yet, so a request for one matches no node (see [Planned VM entries](#planned-vm-entries)) |
-| `ios.device`, `ios.device.<attribute>` | **refused** until kbf books devices (`RequestError::IosDevice`, in any case; Execute answers `INVALID_ARGUMENT` naming the key). **Planned**: `ios.device=1` books one specific device; `ios.device.class`, `ios.device.product_type`, `ios.device.os_version`, `ios.device.os_build` are exact, and one device must satisfy all of them (see [Planned device entries](#planned-device-entries)) |
+| `ios.device`, `ios.device.<attribute>` | one device: `ios.device=1` asks for one iOS device; `ios.device.class`, `ios.device.product_type`, `ios.device.os_version`, `ios.device.os_build` are exact, and **one** device the node reports must satisfy all of them. A node reporting no device matches none. Refused: a value other than `1`, an attribute without `ios.device=1`, another attribute, an `os` other than `macos` ([ios-devices.md](ios-devices.md#53-request-keys)) |
 
 Every other key may appear once. A value that does not parse or a repeated key is
 refused. A Mac with two Xcodes installed serves an action that names either build, and
@@ -220,9 +219,9 @@ its report.
 through `Request::from_platform` (below), which passes on only the names kbf reads, so
 **an unknown platform property is ignored today**: `OSFamilly=darwin` or `os_build=24B83`
 matches every node. (`vm.slots` and the other report-only keys are known, and refused:
-see [Planned VM entries](#planned-vm-entries). So are `ios.device` and every
-`ios.device.<attribute>` key: see [Planned device entries](#planned-device-entries).
-`ios.devices` and `ios.simulator` are unknown, and ignored.) Refusing an unknown property at `Execute` is
+see [Planned VM entries](#planned-vm-entries). Every `ios.device.<attribute>` key is
+known, so one kbf does not match on, such as `ios.device.os`, is refused rather than
+ignored. `ios.devices` and `ios.simulator` are unknown, and ignored.) Refusing an unknown property at `Execute` is
 **planned** (see [Planned](#planned)).
 
 **Reserved keys** ask for a kind or a size of capacity, not a hardware fact, and are
@@ -331,11 +330,11 @@ naming no `container-image`.
   microarchitecture), `nvme_gib`, `os_image` (on bootc Linux), the SDKs of each Xcode
   on macOS (see [mac-node-provisioning.md](mac-node-provisioning.md#31-host-identity)),
   and the VM driver's `drivers` value and `vm.*` entries (above).
-- **iOS devices:** `ios.device` report entries and request keys, a booking of one
-  device id per lease carried in `Start`, and `NodeStatus.devices` with an attention
-  item for each device that is not ready ([ios-devices.md](ios-devices.md)). Until
-  then a request naming `ios.device` or an `ios.device.<attribute>` key is refused
-  with `INVALID_ARGUMENT` (see [Unknown keys](#unknown-keys)).
+- **iOS devices:** daemons reporting `ios.device` entries, and `NodeStatus.devices`
+  with an attention item for each device that is not ready
+  ([ios-devices.md](ios-devices.md)). The server already matches device requests and
+  books one device id per lease, carried in `Start.device_id`; until a daemon reports
+  a device, a device request waits and is refused as unservable.
 - **Client-defined probes** (`probe.<k>`) as `NodeStatus` values, never report entries
   or request keys (see [mac-node-provisioning.md](mac-node-provisioning.md#31-host-identity)).
 - **Re-detection:** the daemon re-detects its software keys after an update step and

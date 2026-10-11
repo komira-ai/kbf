@@ -96,13 +96,14 @@ impl Servable {
     /// The first live worker, in name order and not in `reserved`, that serves
     /// `request`'s kind, satisfies its platform and has room for it now. Books it there
     /// and returns the worker with what was booked: the request vector for an action,
-    /// the worker's whole capacity for a whole-machine lease.
+    /// the worker's whole capacity for a whole-machine lease; and the iOS device, for a
+    /// request that asks for one ([`Worker::free_device`]).
     pub(crate) fn fit(
         &mut self,
         workers: &mut BTreeMap<WorkerId, Worker>,
         request: &Request,
         reserved: &BTreeSet<WorkerId>,
-    ) -> Option<(WorkerId, Resources)> {
+    ) -> Option<(WorkerId, Resources, Option<String>)> {
         let at = self.matching(workers, request);
         let name = self.memo[at]
             .1
@@ -120,7 +121,9 @@ impl Servable {
         };
         worker.booked = worker.booked.saturating_add(booked);
         worker.leases += 1;
-        Some((name, booked))
+        let device = worker.free_device(&request.needs).map(str::to_owned);
+        worker.devices.extend(device.clone());
+        Some((name, booked, device))
     }
 
     /// The worker to hold for a whole-machine `request` that fits nowhere now: `kept`

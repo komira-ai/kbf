@@ -309,6 +309,12 @@ message Start {
   // never arrived. The bound keeps a late Start from running beside the retry of its
   // lease. 0 means no bound (a server that predates this field).
   uint64 valid_for_ms = 7;
+  // The iOS device the scheduler booked for the lease, by its id (the UDID) as the
+  // daemon's `ios.device` Hello entry names it; empty when the action asked for none
+  // (`ios.device=1`). The server books a device only on a daemon whose Hello lists one,
+  // so a daemon that predates this field, and would drop it, is never sent one. A
+  // booked device is the lease's alone until the lease ends.
+  string device_id = 8;
 }
 
 // The server no longer holds this lease on the daemon (it gave the lease up and the

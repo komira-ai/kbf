@@ -266,6 +266,7 @@ fetching inputs on an offer is **planned**.
 | `memory_bytes` | memory booked for the lease; 0 means not booked. A run after a memory kill books the raised amount ([scheduler.md](scheduler.md#memory-kills)) |
 | `heartbeat_seq` | the newest heartbeat of this stream the server had taken when it sent the `Start`; 0 before the first, which names the stream's `Hello` |
 | `valid_for_ms` | how long after sending that heartbeat (or `Hello`) the daemon may still act on the `Start`: 14 000; 0 means no bound |
+| `device_id` | field 8: the iOS device booked for the lease, by the `id` its `ios.device` `Hello` entry names; empty when the action asked for none. Sent only to a daemon whose `Hello` lists that device ([ios-devices.md](ios-devices.md#54-booking)). Today's daemons ignore it (none reports a device) |
 
 The daemon handles a `Start` as follows:
 
@@ -511,9 +512,8 @@ daemon restarts and server restarts:
 - A message for "started", so the scheduler can tell a running lease from one still
   being prepared.
 - Prefetching an offered lease's inputs.
-- `Start.device_id` (field 8): the one iOS device booked for the lease, and
-  `NodeStatus.devices`: every iOS device the node knows, with its state and fix
-  ([ios-devices.md](ios-devices.md#54-booking)).
+- `NodeStatus.devices`: every iOS device the node knows, with its state and fix, and
+  the daemon's use of `Start.device_id` ([ios-devices.md](ios-devices.md#54-booking)).
 - Drain and resource-change messages.
 - With several servers ([deployment-topology.md](deployment-topology.md)): the daemon
   is given the servers as one DNS name with a record per server, or as a list of
