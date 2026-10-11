@@ -11,6 +11,7 @@
 //! kbf-deploy linux install-units --config FILE --uninstall [--apply]
 //! kbf-deploy linux image-pull --config FILE [--image REF]... [--platform OS/ARCH] [--apply]
 //! kbf-deploy linux swap --config FILE [--kubelet-allows-swap] [--remove] [--apply]
+//! kbf-deploy envoy render --config FILE --out DIR
 //! ```
 //!
 //! Bad flags exit 2 for every subcommand. The `minio` subcommands change a host: without
@@ -21,6 +22,8 @@
 //! `REFUSED: ...` on stderr). `linux install-units`, `image-pull` and `swap` change the
 //! host as root, plan by default as the `minio` subcommands do, and exit 0 done (or
 //! nothing to do), 1 a step failed, or 2 refused (`REFUSED: ...` on stderr).
+//! `envoy render` only writes into the directory it is given, and exits 0 done or 2
+//! refused (`REFUSED: ...` on stderr).
 //! `minio buckets` reads the MinIO admin key pair from `MINIO_ROOT_USER` and
 //! `MINIO_ROOT_PASSWORD` in the environment (secrets are never flags: argv is
 //! world-readable).
@@ -37,6 +40,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use clap::{Args, Parser, Subcommand};
 use kbf_types::ImageRef;
 
+use crate::envoy;
 use crate::exec::{Exec, HostExec};
 use crate::linux::{self, HostError, LinuxConfig, images, install, swap};
 use crate::minio::{self, Admin, K8sName, KbfName, MinioError, buckets, nodeport};
@@ -63,6 +67,24 @@ enum Kit {
     /// A converged Linux storage node: MinIO, kbf-server and kbf-daemon.
     #[command(subcommand)]
     Linux(Linux),
+    /// A client front: a Tailscale operator Ingress in front of Envoy, which routes
+    /// REAPI calls to the kbf-servers.
+    #[command(subcommand)]
+    Envoy(Envoy),
+}
+
+#[derive(Subcommand)]
+enum Envoy {
+    /// Write manifests.json (the Kubernetes objects) and envoy.json (Envoy's config)
+    /// into a directory.
+    Render {
+        /// The kit's settings, KEY=VALUE lines.
+        #[arg(long)]
+        config: PathBuf,
+        /// Where to write the two files.
+        #[arg(long)]
+        out: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -253,6 +275,7 @@ pub fn run<E: Exec>(
         Kit::Minio(Minio::Buckets(a)) => minio_buckets(a, exec, env, out),
         Kit::Minio(Minio::Nodeport(a)) => minio_nodeport(a, exec, out),
         Kit::Linux(l) => return linux_kit(l, exec, out, err),
+        Kit::Envoy(e) => return envoy_kit(e, out, err),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -353,6 +376,21 @@ fn linux_kit<E: Exec>(
                 let _ = writeln!(out, "{line}");
             }
             ExitCode::from(code)
+        }
+        Err(e) => {
+            let _ = writeln!(err, "REFUSED: {e}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// The `envoy` kit: 0 done, 2 refused.
+fn envoy_kit(e: Envoy, out: &mut dyn Write, err: &mut dyn Write) -> ExitCode {
+    let Envoy::Render { config, out: dir } = e;
+    match envoy::render_files(&config, &dir) {
+        Ok(line) => {
+            let _ = writeln!(out, "{line}");
+            ExitCode::SUCCESS
         }
         Err(e) => {
             let _ = writeln!(err, "REFUSED: {e}");
