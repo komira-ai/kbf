@@ -331,17 +331,23 @@ sudo -n rm -f "$intent"
 step "a process started in a GUI session runs in it: the runner's own (no session switch)"
 # No lease user has a GUI session here (that takes a session switch, which restarts
 # userspace), so spawn::spawn runs for the runner's own uid, from a root LaunchDaemon in
-# the system domain, as the helper runs on a node: the control, a background run, gets
-# no session (launchctl names no manager there), and the GUI run must land in Aqua.
+# the system domain, as the helper runs on a node: the control, a background run, stays
+# in the system's session (System), and the GUI run must land in Aqua. Its groups are
+# checked by access, not by `id -G`, which lists the user's directory memberships
+# whatever the process holds: a file only wheel may read stays unreadable (root's
+# groups, wheel among them, were dropped).
 # Not from a shell of this job (it is already in the runner's Aqua session, run
 # 38154872299), and not under `launchctl bsexec 1` (the nested `launchctl asuser`
-# refuses with "Reentrancy avoided", run 38148803625).
+# refuses with "Reentrancy avoided", run 38148803625). The control's System is what
+# run 38156822140 measured.
 me=$(id -u) my_gid=$(id -g) my_name=$(id -un)
 launchctl print "gui/$me" >/dev/null 2>&1 || fail "the runner has no gui/$me domain"
 gui_dir=$(mktemp -d "$tmp/gui.XXXXXX")
 chmod 0755 "$gui_dir"
 real_dir=$(cd "$gui_dir" && pwd -P)
-probe='echo "manager: $(/bin/launchctl managername 2>/dev/null || echo none)"; id -u; id -G; pwd; echo "$HOME"'
+wheel_only="$tmp/wheel-only"
+sudo -n sh -c "echo secret > '$wheel_only' && chown root:wheel '$wheel_only' && chmod 0040 '$wheel_only'"
+probe='echo "manager: $(/bin/launchctl managername 2>/dev/null || echo none)"; id -u; id -g; if cat "'"$wheel_only"'" >/dev/null 2>&1; then echo "wheel: yes"; else echo "wheel: no"; fi; pwd; echo "$HOME"'
 xml() { sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
 # spawn_in <background|gui>: the client's spawn as a root LaunchDaemon; prints its output.
 spawn_in() {
@@ -375,10 +381,10 @@ PLIST
 }
 control=$(spawn_in background)
 echo "background: $(echo "$control" | tr '\n' ' ')"
-[ "$(echo "$control" | sed -n 1p)" = "manager: none" ] || fail "the control is not outside a session: [$control]"
+[ "$(echo "$control" | sed -n 1p)" = "manager: System" ] || fail "the control is not in the system's session: [$control]"
 gui=$(spawn_in gui)
 echo "gui: $(echo "$gui" | tr '\n' ' ')"
-want=$(printf '%s\n' "manager: Aqua" "$me" "$my_gid" "$real_dir" "/Users/$my_name" "exit 0")
+want=$(printf '%s\n' "manager: Aqua" "$me" "$my_gid" "wheel: no" "$real_dir" "/Users/$my_name" "exit 0")
 [ "$gui" = "$want" ] || fail "the GUI spawn: got [$gui], want [$want]"
 
 echo
