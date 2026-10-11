@@ -21,6 +21,7 @@ mod cell;
 pub mod check;
 mod client;
 mod daemon;
+mod replica;
 mod server;
 mod store;
 

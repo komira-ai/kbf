@@ -393,7 +393,9 @@ Properties 3 and 4 do not hold after a restart until the scheduler's state is in
 log (ha.md section 16, PRs 11 and 12); a daemon cut off past T may have a result
 refused, so 4 is not enforced in partition runs.
 
-Mutants planted to show the checks fail (each red in the named sweep):
+Each check also has a unit test that feeds it a violation (`src/check.rs`,
+`src/replica.rs`), so none passes because it cannot fail. Mutants planted in the
+code under test, each red in the named sweep:
 
 | Mutant | Where | Red |
 |---|---|---|

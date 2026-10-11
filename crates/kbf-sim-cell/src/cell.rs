@@ -124,6 +124,48 @@ pub enum CellNode {
     Store(ObjectStore),
 }
 
+impl CellNode {
+    /// The node as a server, if it is one.
+    #[must_use]
+    pub fn server(&self) -> Option<&Server> {
+        if let Self::Server(s) = self {
+            Some(s)
+        } else {
+            None
+        }
+    }
+
+    /// The node as a daemon, if it is one.
+    #[must_use]
+    pub fn daemon(&self) -> Option<&FakeDaemon> {
+        if let Self::Daemon(d) = self {
+            Some(d)
+        } else {
+            None
+        }
+    }
+
+    /// The node as a client, if it is one.
+    #[must_use]
+    pub fn client(&self) -> Option<&FakeClient> {
+        if let Self::Client(c) = self {
+            Some(c)
+        } else {
+            None
+        }
+    }
+
+    /// The node as the object store, if it is it.
+    #[must_use]
+    pub fn store(&self) -> Option<&ObjectStore> {
+        if let Self::Store(s) = self {
+            Some(s)
+        } else {
+            None
+        }
+    }
+}
+
 impl StateMachine for CellNode {
     type Input = NodeInput<Msg>;
 
@@ -207,17 +249,17 @@ pub fn run(scenario: &Scenario) -> RunReport {
         sim.partition_at(at.saturating_add(CUT_FOR), Partition::none());
     }
     let mut checker = Checker::new(scenario);
-    while sim.now() <= scenario.end && sim.step() {
+    while sim.now() <= scenario.end {
+        // The server's tick timer keeps the queue from ever running dry.
+        let _ = sim.step();
         checker.after_step(&sim);
     }
     checker.at_end(&sim);
-    let Some(CellNode::Server(server)) = sim.node(&server_id()) else {
-        unreachable!("the cell has a server")
-    };
+    let seen = &crate::check::server(&sim).seen;
     RunReport {
         trace: sim.trace_hash(),
-        starts: server.seen.starts,
-        accepted: server.seen.accepted.len(),
-        present: server.seen.present.len(),
+        starts: seen.starts,
+        accepted: seen.accepted.values().filter(|n| **n > 0).count(),
+        present: seen.present.len(),
     }
 }

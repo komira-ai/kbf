@@ -16,7 +16,7 @@ kbf-driver-native         0      0
 kbf-estimator             -      -
 kbf-front                55      8
 kbf-guest                15      6
-kbf-it                    2      3
+kbf-it                    2      2
 kbf-log                   3      0
 kbf-mac-session           0      0
 kbf-mdm                   0      0
@@ -31,7 +31,7 @@ kbf-sched                 2      2
 kbf-segments              8      5
 kbf-server                0      0
 kbf-sim                   9      3
-kbf-sim-cell              -      -
+kbf-sim-cell              8     17
 kbf-store                 0      0
 kbf-types                 3      2
 kbf-updater               0      0

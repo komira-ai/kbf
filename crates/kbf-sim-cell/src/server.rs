@@ -31,25 +31,24 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use kbf_daemon::FENCE_AFTER;
 use kbf_front::MetaLog;
-use kbf_log::{FarmLogId, Format, LogCommand};
+use kbf_log::FarmLogId;
 use kbf_meta::{
     ActionAnswer, ActionRecord, Applied, Closure, Command, Epoch, Location, MetaState, ObjectId,
     Retention, Role, StoreId,
 };
-use kbf_raft::Payload;
 use kbf_sched::{DaemonInstance, Event as SchedEvent, Input, OpState, Request, Scheduler};
 use kbf_server::RaftMetaLog;
 use kbf_server::machine::{FarmMachine, Sent, Waiter};
 use kbf_server::stamp::Stamp;
 use kbf_sim::{Event, NodeId, NodeInput, Output};
-use kbf_store::{Fault, FaultFs, Options, Store};
+use kbf_store::{Fault, FaultFs};
 use kbf_types::{
     ActionKey, Answer, Digest, Effect, FarmTime, LeaseId, LeaseKind, Outcome, Qos, Resources,
     StartLease, StateMachine, WaiterId, WorkerId,
 };
 
 use crate::Msg;
-use crate::check::Property;
+use crate::replica::{self, Broken};
 
 /// How often the server commits farm time and runs a placement round.
 pub const TICK: Duration = Duration::from_secs(1);
@@ -87,14 +86,13 @@ pub struct ServerPlan {
 pub struct Seen {
     /// Each blob answered present, and when.
     pub present: Vec<(FarmTime, Digest)>,
-    /// Each lease given up while its daemon was heard within T listing it.
-    pub requeued_listed: Vec<(FarmTime, LeaseId, WorkerId)>,
-    /// How many times each lease's result was accepted.
+    /// Each lease given up, and whether its daemon was heard within T listing it.
+    pub requeues: Vec<(FarmTime, LeaseId, WorkerId, bool)>,
+    /// How many times each lease's result was accepted, for each lease a holder
+    /// reported (0: refused).
     pub accepted: BTreeMap<LeaseId, u32>,
     /// The actions with an accepted completed result.
     pub won: BTreeSet<Digest>,
-    /// Those whose action-cache entry committed.
-    pub cached: BTreeSet<Digest>,
     /// How many times the server opened its log, and each refusal.
     pub starts: u64,
     pub refused: Vec<(FarmTime, String)>,
@@ -214,59 +212,17 @@ impl Server {
     /// # Errors
     ///
     /// The property that does not hold, and how.
-    pub fn check_durable(&self) -> Result<(), (Property, String)> {
+    pub fn check_durable(&self) -> Result<(), Broken> {
         let Some(up) = &self.up else { return Ok(()) };
         let applied = up.log.applied_index();
         let key = (self.seen.starts, applied, self.disk.ops());
         if self.checked.replace(Some(key)) == Some(key) {
             return Ok(());
         }
-        let equality = |d: String| (Property::ReplicaEquality, d);
-        let (_, stored) = Store::open(self.disk.crash(0), Options::default())
-            .map_err(|e| equality(format!("the durable log does not open: {e}")))?;
-        let mut replica = MetaState::new(Retention::default());
-        let mut bootstrap = None;
-        let mut last = 0;
-        for entry in stored
-            .entries
-            .iter()
-            .take_while(|e| e.id.index.0 <= applied)
-        {
-            last = entry.id.index.0;
-            let Payload::Command(bytes) = &entry.payload else {
-                continue;
-            };
-            match kbf_log::decode(Format::V1, bytes) {
-                Ok(LogCommand::Meta(command)) => {
-                    let before = replica.now();
-                    replica.execute(last, command);
-                    if replica.now() < before {
-                        let d = format!("entry {last} moves farm time back from {before:?}");
-                        return Err((Property::MonotoneTime, d));
-                    }
-                }
-                Ok(LogCommand::Bootstrap(b)) => {
-                    bootstrap.get_or_insert(b);
-                }
-                other => return Err(equality(format!("entry {last} is {other:?}"))),
-            }
-        }
-        if last < applied {
-            let d = format!("entry {applied} is applied, but the durable log ends at {last}");
-            return Err(equality(d));
-        }
+        let entries = replica::durable_entries(self.disk.crash(0))?;
+        let replica = replica::replay(&entries, applied)?;
         let live = ready(up.log.query(MetaState::clone)).expect("a query is never refused");
-        if live != replica {
-            let d = format!("the state applied through {applied} is not the durable log's");
-            return Err(equality(d));
-        }
-        if bootstrap.map(|b| b.log_id) != Some(up.log.log_id()) {
-            return Err(equality(format!(
-                "the durable log does not name log {}",
-                up.log.log_id()
-            )));
-        }
-        Ok(())
+        replica::same_as_live(&replica, &live, up.log.log_id())
     }
 
     fn timer(&mut self, after: Duration, tag: u64) {
@@ -397,13 +353,9 @@ impl Up {
                 }
                 Effect::Start(start) => self.start_lease(now, &start, cx),
                 Effect::Answer(answer) => answers.push(answer),
-                Effect::Waiting(_) => {}
-                Effect::Refuse(refusal) => {
-                    self.machine.forget_leases(refusal.operation);
-                    self.answer_callers(&refusal.waiters, false, cx);
-                    self.machine
-                        .keep_finished(refusal.operation, refusal.waiters);
-                }
+                // Every daemon serves every action, so nothing waits for a worker or is
+                // refused; a refusal would leave its callers unanswered (property 7).
+                Effect::Waiting(_) | Effect::Refuse(_) => {}
             }
         }
         for requeue in self.sched.take_requeues() {
@@ -414,16 +366,19 @@ impl Up {
                     now.saturating_duration_since(*at) < FENCE_AFTER
                         && running.contains(&requeue.lease)
                 });
-            if listed {
-                let seen = (now, requeue.lease, requeue.worker);
-                cx.seen.requeued_listed.push(seen);
-            }
+            let seen = (now, requeue.lease, requeue.worker, listed);
+            cx.seen.requeues.push(seen);
         }
-        let sched = &self.sched;
-        for id in self.machine.forget_dropped(|op| sched.state(op).is_some()) {
-            self.callers.remove(&id);
-        }
+        self.forget_dropped();
         answers
+    }
+
+    /// Forgets the callers of the finished operations the scheduler has dropped.
+    fn forget_dropped(&mut self) {
+        let sched = &self.sched;
+        self.machine.forget_dropped(|op| sched.state(op).is_some());
+        let machine = &self.machine;
+        self.callers.retain(|id, _| machine.waiter(*id).is_some());
     }
 
     fn start_lease(&mut self, now: FarmTime, start: &StartLease, cx: &mut Cx<'_>) {
@@ -456,13 +411,12 @@ impl Up {
     }
 
     fn answer_callers(&self, waiters: &[WaiterId], cached: bool, cx: &mut Cx<'_>) {
-        for id in waiters {
-            let caller = self.callers.get(id);
-            let waiter = self.machine.waiter(*id);
-            if let (Some(caller), Some(waiter)) = (caller, waiter) {
-                let action = waiter.key.action;
-                cx.send(caller.clone(), Msg::Answered { action, cached });
-            }
+        let callers = waiters
+            .iter()
+            .filter_map(|id| Some((self.callers.get(id)?, self.machine.waiter(*id)?)));
+        for (caller, waiter) in callers {
+            let action = waiter.key.action;
+            cx.send(caller.clone(), Msg::Answered { action, cached });
         }
     }
 
@@ -530,18 +484,12 @@ impl Up {
     /// process sent its `Start`.
     fn holder(&self, lease: LeaseId, worker: &WorkerId) -> Option<Sent> {
         let sent = self.machine.sent(lease)?;
-        let current = match self.sched.state(sent.operation)? {
-            OpState::Leased {
-                lease: held,
-                worker: holder,
-                committed: true,
-            }
-            | OpState::Running {
-                lease: held,
-                worker: holder,
-            } => *held == lease && holder == worker,
-            _ => false,
-        };
+        let current = matches!(
+            self.sched.state(sent.operation)?,
+            OpState::Leased { lease: held, worker: holder, committed: true }
+                | OpState::Running { lease: held, worker: holder }
+                if *held == lease && holder == worker
+        );
         current.then_some(sent)
     }
 
@@ -578,9 +526,7 @@ impl Up {
         for answer in answers {
             self.settle(&answer, cx);
         }
-        if accepted {
-            *cx.seen.accepted.entry(lease).or_default() += 1;
-        }
+        *cx.seen.accepted.entry(lease).or_default() += u32::from(accepted);
         cx.send(from.clone(), Msg::ResultAck { lease, accepted });
     }
 
@@ -603,17 +549,13 @@ impl Up {
                 action,
                 record,
             };
-            if let Some(Applied::Action(Ok(_))) = self.commit(cx.out, put) {
-                cx.seen.cached.insert(action);
-            }
+            // A failed write is not retried; its callers are answered all the same.
+            self.commit(cx.out, put);
         }
         self.answer_callers(&answer.waiters, false, cx);
         self.machine
             .keep_finished(answer.operation, answer.waiters.clone());
-        let sched = &self.sched;
-        for id in self.machine.forget_dropped(|op| sched.state(op).is_some()) {
-            self.callers.remove(&id);
-        }
+        self.forget_dropped();
     }
 
     fn execute(&mut self, now: FarmTime, from: &NodeId, action: Digest, cx: &mut Cx<'_>) {
@@ -767,5 +709,115 @@ impl StateMachine for Server {
         }
         self.settle_failure();
         Vec::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use kbf_server::raft_log::RECORD;
+
+    use super::*;
+
+    fn input(at: u64, event: Event<Msg>) -> NodeInput<Msg> {
+        NodeInput {
+            now: FarmTime::from_millis(at),
+            entropy: 9,
+            event,
+        }
+    }
+
+    fn server(faults: Vec<(FarmTime, ServerFault)>) -> Server {
+        let plan = ServerPlan {
+            faults,
+            down_for: Duration::from_secs(3),
+        };
+        Server::new(plan, NodeId::from("store"))
+    }
+
+    fn restarts(s: &mut Server) -> usize {
+        let out = s.take_outputs();
+        out.iter()
+            .filter(|o| matches!(o, Output::Timer { tag: T_START, .. }))
+            .count()
+    }
+
+    /// Catches a refused open that is dropped silently (no record for the liveness
+    /// line, no retry) or that leaves a server up.
+    #[test]
+    fn a_refused_open_is_recorded_and_retried() {
+        let mut s = server(Vec::new());
+        s.disk.put(RECORD, b"not a record");
+        s.apply(input(0, Event::Start));
+        assert!(s.up.is_none());
+        assert_eq!(s.seen.refused.len(), 1, "{:?}", s.seen.refused);
+        assert_eq!(restarts(&mut s), 1);
+        s.apply(input(3_000, Event::Timer { tag: T_START }));
+        assert_eq!(s.seen.refused.len(), 2);
+        assert_eq!(restarts(&mut s), 1);
+    }
+
+    /// Catches a server that comes up although its first commit (the writer epoch)
+    /// failed.
+    #[test]
+    fn a_failed_first_commit_takes_the_server_down() {
+        // How many filesystem operations an open of a new log takes.
+        let probe = server(Vec::new());
+        let opened = {
+            let _context = probe.runtime.enter();
+            ready(RaftMetaLog::open(
+                probe.disk.clone(),
+                Retention::default(),
+                "cell/",
+                || Ok(FarmLogId::new(NonZeroU64::MIN)),
+            ))
+        };
+        drop(opened.expect("a new log opens"));
+        let mut s = server(Vec::new());
+        s.disk.fail_at(probe.disk.ops(), Fault::Error);
+        s.apply(input(0, Event::Start));
+        assert!(s.up.is_none());
+        assert!(s.seen.refused.is_empty());
+        assert_eq!(restarts(&mut s), 1);
+    }
+
+    /// Catches a second restart planned while one is pending: a stopped log's server
+    /// killed before its restart would start twice; and a fault that acts on a server
+    /// already down.
+    #[test]
+    fn a_kill_after_the_log_stopped_restarts_once() {
+        let at = FarmTime::from_millis(1_500);
+        let faults = vec![
+            (
+                FarmTime::from_millis(1),
+                ServerFault::IoErrorAt { after: 0 },
+            ),
+            (at, ServerFault::Kill),
+            (at, ServerFault::PowerCut { keep: 0, names: 0 }),
+            (
+                at,
+                ServerFault::PowerCutAt {
+                    after: 0,
+                    keep: 0,
+                    names: 0,
+                },
+            ),
+            (at, ServerFault::IoErrorAt { after: 0 }),
+        ];
+        let mut s = server(faults);
+        s.apply(input(0, Event::Start));
+        s.take_outputs();
+        s.apply(input(1, Event::Timer { tag: T_FAULT }));
+        s.apply(input(1_000, Event::Timer { tag: T_TICK }));
+        assert!(s.up.as_ref().is_some_and(|up| up.stopped));
+        assert_eq!(restarts(&mut s), 1);
+        s.apply(input(1_500, Event::Timer { tag: T_FAULT + 1 }));
+        assert!(s.up.is_none());
+        assert_eq!(restarts(&mut s), 0);
+        // Faults that meet a server already down do nothing.
+        for tag in T_FAULT + 2..T_FAULT + 5 {
+            s.apply(input(1_600, Event::Timer { tag }));
+        }
+        assert!(s.up.is_none() && s.armed.is_none());
+        assert_eq!(restarts(&mut s), 0);
     }
 }

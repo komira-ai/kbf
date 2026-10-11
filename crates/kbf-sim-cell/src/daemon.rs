@@ -290,3 +290,80 @@ impl StateMachine for FakeDaemon {
         Vec::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use kbf_types::OperationId;
+
+    use super::*;
+    use crate::action;
+
+    fn input(at: u64, event: Event<Msg>) -> NodeInput<Msg> {
+        NodeInput {
+            now: FarmTime::from_millis(at),
+            entropy: 1,
+            event,
+        }
+    }
+
+    fn message(at: u64, msg: Msg) -> NodeInput<Msg> {
+        input(
+            at,
+            Event::Message {
+                from: NodeId::from("server"),
+                msg,
+            },
+        )
+    }
+
+    fn start(stream: u64, seq: u64) -> Msg {
+        Msg::Start {
+            stream,
+            lease: LeaseId::new(1, seq),
+            operation: OperationId(seq),
+            action: action(seq),
+        }
+    }
+
+    fn welcome(stream: u64) -> Msg {
+        Msg::Welcome {
+            stream,
+            epoch: 7,
+            interval_ms: 5_000,
+        }
+    }
+
+    fn runs(d: &FakeDaemon) -> Vec<LeaseId> {
+        d.unfenced_runs(FarmTime::from_millis(10))
+            .map(|(l, _)| l)
+            .collect()
+    }
+
+    /// Catches a daemon that takes a `Start` before its stream is welcomed, on an
+    /// earlier stream, or again for a lease it has reported, and one that takes a
+    /// `Welcome` of an earlier stream as its own.
+    #[test]
+    fn a_start_is_taken_once_on_the_welcomed_stream_only() {
+        let mut d = FakeDaemon::new(
+            NodeId::from("server"),
+            "d-1".to_owned(),
+            Resources::new(1_000, 1),
+        );
+        d.apply(input(0, Event::Start));
+        d.apply(message(1, start(1, 1)));
+        assert!(runs(&d).is_empty(), "taken before the Welcome");
+        d.apply(message(2, welcome(0)));
+        d.apply(message(3, start(1, 1)));
+        assert!(runs(&d).is_empty(), "a Welcome of another stream was taken");
+        d.apply(message(4, welcome(1)));
+        d.apply(message(5, start(0, 2)));
+        assert!(runs(&d).is_empty(), "taken on an earlier stream");
+        d.apply(message(6, start(1, 1)));
+        assert_eq!(runs(&d), [LeaseId::new(1, 1)]);
+        // The run ends and is reported; a late copy of its `Start` runs nothing.
+        d.apply(input(30_000, Event::Timer { tag: T_POLL }));
+        assert!(d.reported().contains(&LeaseId::new(1, 1)));
+        d.apply(message(30_001, start(1, 1)));
+        assert!(runs(&d).is_empty(), "a reported lease ran again");
+    }
+}
