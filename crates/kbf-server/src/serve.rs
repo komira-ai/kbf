@@ -247,8 +247,8 @@ where
         crate::health::router(Arc::clone(&cache), Arc::clone(&readiness), probe_timeout);
     let api_routes = crate::api::router(Arc::clone(&farm), token).merge(health_routes);
     // Logged at every start, the first one too (issue #156).
-    let term = farm.term();
-    tracing::warn!(term, "{STATE_IN_MEMORY}");
+    let (term, epoch) = (farm.term(), farm.lease_epoch());
+    tracing::warn!(term, epoch, "{STATE_IN_MEMORY}");
 
     let mut reapi_server = Server::builder();
     if let Some(tls) = listeners.reapi_tls {

@@ -1303,8 +1303,10 @@ name = "kbf-log"
 version = "0.1.0"
 dependencies = [
  "hex",
+ "kbf-caps",
  "kbf-meta",
  "kbf-proto",
+ "kbf-sched",
  "kbf-types",
  "prost",
  "thiserror",
@@ -1505,13 +1507,16 @@ dependencies = [
  "kbf-auth",
  "kbf-caps",
  "kbf-front",
+ "kbf-log",
  "kbf-mdm-api",
  "kbf-meta",
  "kbf-objstore",
  "kbf-proto",
+ "kbf-raft",
  "kbf-sched",
  "kbf-segments",
  "kbf-sim",
+ "kbf-store",
  "kbf-types",
  "libc",
  "prost",
@@ -1542,6 +1547,20 @@ dependencies = [
 [[package]]
 name = "kbf-sim-cell"
 version = "0.1.0"
+dependencies = [
+ "kbf-caps",
+ "kbf-daemon",
+ "kbf-front",
+ "kbf-log",
+ "kbf-meta",
+ "kbf-raft",
+ "kbf-sched",
+ "kbf-server",
+ "kbf-sim",
+ "kbf-store",
+ "kbf-types",
+ "tokio",
+]
 
 [[package]]
 name = "kbf-store"

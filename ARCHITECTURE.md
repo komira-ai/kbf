@@ -103,7 +103,7 @@ what lets a simulation seed replay a run exactly (see [Testing](#testing)).
 | `kbf-front` | no | the REAPI services over a `Cache` and a `Dispatch` |
 | `kbf-server` | no | the server binary: wires front, scheduler and storage together; its side of the MDM gate (`mdm`) |
 | `kbf-proto` | no | generated code for REAPI, `kbf.worker.v1` and `kbf.log.v1` |
-| `kbf-log` | no | the replicated log's entry encoding: `kbf-meta` commands to and from `kbf.log.v1`, under the log's format version |
+| `kbf-log` | no | the replicated log's entry encoding: `kbf-meta` commands and the control commands (batched farm inputs, a result with its action-cache entry, takeover, checkpoint, machine version) to and from `kbf.log.v1`, under the log's format version |
 | `kbf-mdm-api` | no | what `kbf-server` and `kbf-mdm-gate` share: generated `kbf.mdmgate.v1` (status, enforce, withdraw, profile; no erase), the names both check, Apple's catalogue parser and its at-most-daily reader |
 | `kbf-daemon` | no | the daemon: session loop, lease manager, CAS client, input and output trees |
 | `kbf-driver-container` | no | the rootless Podman execution driver |
@@ -121,7 +121,7 @@ what lets a simulation seed replay a run exactly (see [Testing](#testing)).
 | `kbf-coverage` | no | the coverage ratchet CI runs |
 | `kbf-alert` | no | alerts with their exact fix; the alert book (raise and resolve with hysteresis) and the outbox, both pure modules; the webhook notifier, which keeps the outbox in a file. Nothing raises alerts yet |
 | `kbf-store` | no | a Raft server's durable state on the local disk, as a `kbf_raft::Storage`: a segmented append-only log of CRC-32C records, the hard state (term, vote) and the newest snapshot, whose segments it covers are removed only once it is durable; a torn tail cut at open, any other damage refused; the first write or fsync error stops the store; all I/O through an `Fs` trait, with a fault-injecting in-memory `FaultFs` for crash tests |
-| `kbf-sim-cell` | no | placeholder (**planned**: whole-cell simulation) |
+| `kbf-sim-cell` | no | the whole-cell simulation: one server assembled from `RaftMetaLog`, the scheduler and the `FarmMachine` on a fault-injecting disk, with fake daemons, clients and an object store, checked against properties 1 to 7 of the high-availability design after every step ([simulation.md](docs/design/simulation.md#8-the-cell-kbf-sim-cell)) |
 
 A test in `kbf-it` reads the dependency graph and fails if a pure crate depends,
 directly or not, on an async runtime, a network crate or a random source, or if its
@@ -205,26 +205,32 @@ See [scheduler.md](docs/design/scheduler.md) and
 
 | State | Today | Planned |
 |---|---|---|
-| CAS index, action cache, farm time | `MetaState` behind `MemoryMetaLog`, in the server's memory | the same state machine applied from a Raft log on local disk: one voter, then three |
+| CAS index, action cache, farm time | `MetaState` behind `MemoryMetaLog`, in the server's memory (the default, `--meta-log=memory`); with `--meta-log=raft`, behind `RaftMetaLog`, applied from a single-voter Raft log on local disk | the Raft log with three voters |
 | Blob bytes | segments in an object store (in memory, or an S3 bucket) | the same, with garbage collection and multiple stores |
 | Leases, operations, workers | `Scheduler` in the server's memory; a control record "commits" when appended | the same state machine fed from a replicated control log, kept on the servers' local disks |
-| Callers and started leases | `FarmMachine` (`kbf-server`'s `machine` module) in the server's memory: each caller's record, the finished operations whose callers are kept for the finished retention, and the leases whose `Start` was sent; each caller's channel stays beside it in the farm core | the same machine fed from the replicated control log |
-| Node reports | read at `Hello`: `cpus`, `mem_gib` and `gpu` are booked; `arch`, `cpu.features`, `os` and the other exact keys are matched against each action's platform; held in memory, so a restart forgets every node | operator labels, report changes noticed by hash; a durable node registry that remembers absent nodes, alerts on them and restores them on reconnect |
+| Memory kills | the scheduler's `MemoryState`, in the server's memory: each action key's memory floor and the order the floors were raised in, each held operation's memory-killed runs and busy-node reruns, each node's busy-node kill count; it compares with `Eq` | the same, inside the machine fed from the replicated control log |
+| Callers, started leases, node registry | `FarmMachine` (`kbf-server`'s `machine` module) in the server's memory: each caller's record, the finished operations whose callers are kept for the finished retention, the leases whose `Start` was sent, and each node that has registered with whether its newest stream is open and its newest `NodeStatus`; each caller's channel and each node's stream stay beside it in the farm core, which tells the machine when a stream has closed | the same machine fed from the replicated control log |
+| Node reports | read at `Hello`: `cpus`, `mem_gib` and `gpu` are booked; `arch`, `cpu.features`, `os` and the other exact keys are matched against each action's platform; held in memory, so a restart forgets every node | operator labels, report changes noticed by hash; the node registry kept durable through the replicated control log, with alerts on absent nodes |
 
-Because the index is in memory today, a restarted server forgets every blob. With
-`--store=s3` each start writes under a fresh key prefix so it never reads objects a
-previous process wrote.
+Under `--meta-log=memory` the index is in memory, so a restarted server forgets every
+blob, and with `--store=s3` each start writes under a fresh key prefix so it never reads
+objects a previous process wrote. Under `--meta-log=raft` (which needs `--store=s3`) a
+restart reopens the log in `--raft-dir` and keeps the index and the action cache, and
+every start writes under the prefix the log committed when it was created,
+`<--s3-prefix><log id>/`, each in a new writer epoch.
 
 Every piece of state sits behind a trait or a pure state machine, so moving it into a
 replicated log changes the implementation behind the seam, not its callers:
 
 - `MetaLog` (in `kbf-front`): `commit` a metadata command, `query` the committed
-  state. `MemoryMetaLog` is the single-process implementation; a replicated log
-  implements the same two calls.
+  state. `MemoryMetaLog` is the single-process implementation; `RaftMetaLog` (in
+  `kbf-server`) implements the same two calls over a single-voter Raft log.
 - `ObjectStore` (in `kbf-objstore`): five calls any S3-compatible store can serve.
 - `Dispatch` (in `kbf-front`): how the REAPI front reaches the scheduler.
 - `FarmMachine` (in `kbf-server`): a pure struct that compares with `Eq`; it reads
   no clock and holds no hashed map, which clippy checks for the module.
+  `MemoryState` (in `kbf-sched`, read through `Scheduler::memory_state`) is the
+  scheduler's first part that compares with `Eq`.
 - `StateMachine` (in `kbf-types`): inputs in, effects out. The server carries out the
   scheduler's `Commit`, `Start` and `Answer` effects. The one place a control record
   is appended and fed straight back as committed is the step a replicated log
@@ -277,10 +283,13 @@ with what exists today and the probes still to run. In short:
   and placement prefers a worker that already has an action's inputs.
 
 What already holds for this shape in the single-server code: the seams above, lease
-ids that carry the granting process's term, a scheduler that refuses results from
-leases it does not hold, a lease epoch in `Welcome` that makes a daemon drop leases a
-restarted server never granted, and a daemon protocol in which only the newest stream
-of a worker counts. See [scheduler.md](docs/design/scheduler.md#more-than-one-server).
+ids that carry the granting process's term (the Raft term under `--meta-log=raft`), a
+scheduler that refuses results from leases it does not hold, a lease epoch in
+`Welcome` that makes a daemon drop leases a restarted server never granted (under
+`--meta-log=raft` the epoch is the log id, the same at every start, so the daemon keeps
+its runs, and until the scheduler's state is in the log a restart leaves them running
+as orphans whose results are refused), and a daemon protocol in which only the newest
+stream of a worker counts. See [scheduler.md](docs/design/scheduler.md#more-than-one-server).
 
 ## Security model
 
