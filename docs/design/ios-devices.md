@@ -430,7 +430,7 @@ None of these has run. Each is a later PR's evidence; the PR that needs it says 
 | Probe | What it settles | Needs |
 |---|---|---|
 | P-D0 | `xcrun devicectl help` and `--version` text for the pinned Xcode: which verbs and JSON options exist | a Mac with Xcode, no device; can run on the hosted macOS runner |
-| P-D1 | Real `devicectl` JSON for `list devices`, `device info details`, `lockState` and `apps`, in each state: paired and ready, Trust not tapped, Developer Mode off, locked, unplugged, Wi-Fi only; whether the JSON has a battery field; whether pairing records are per user | a device and a person at it; fixtures scrubbed of UDID, ECID, serial number, CoreDevice id and device name |
+| P-D1 | Real `devicectl` JSON for `list devices`, `device info details`, `lockState` and `apps`, in each state: paired and ready, Trust not tapped, Developer Mode off, locked, unplugged, Wi-Fi only; whether the JSON has a battery field; whether pairing records are per user | a dedicated test device and a person at it; fixtures are committed as captured (the ids are a test device's, not a person's) |
 | P-D2 | Whether a per-lease macOS user (`kbf-mac-session`, issue #122) sees and can use a device paired by another user | root on the node; a device |
 | P-D3 | The deciding probe: `xcodebuild test-without-building -destination id=<udid>` on a signed XCUITest bundle, from the daemon as a LaunchDaemon and as a LaunchAgent, with someone logged in and with nobody logged in, inside the sandbox with the network off and on, with a per-lease `HOME`; which paths and preferences it writes; whether a Local Network prompt appears | a signed bundle and a profile listing the device; an unlocked device; maybe a person at the Mac's console |
 | P-D4 | Install, uninstall and reboot back to `ready` with no person, on a device with no passcode | a device |
@@ -445,7 +445,7 @@ All planned but the driver watch; each is its own pull request.
 | Phase | What | Needs |
 |---|---|---|
 | D0 | This design | - |
-| D1 | Probe kit: P-D0 and P-D1 fixtures, with a lint that refuses a fixture carrying a real-looking UDID, ECID, serial, CoreDevice id or device name | a device and a person (P-D1) |
+| D1 | Probe kit: P-D0 and P-D1 fixtures, captured from dedicated test devices and committed as captured | a test device and a person (P-D1) |
 | D1 | Sandbox rule: leases without a device cannot reach CoreDevice or `usbmuxd`; tested on the hosted macOS runner | none |
 | D2 | Survey parser in `kbf-driver-native`: `devicectl` JSON to device states, tested against the D1 fixtures | D1 |
 | D2 | One driver watch for Xcodes and devices, a part per source: done, the Xcodes' part only ([section 7.5](#75-recover)) | PR #173 |
