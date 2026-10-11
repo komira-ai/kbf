@@ -328,6 +328,8 @@ impl Checker {
                 self.heartbeat(&worker, &running);
                 Vec::new()
             }
+            // The world switches no node's session.
+            Event::Phase { .. } => unreachable!("F4 feeds no node phase"),
             Event::Submit { waiter, request } => self.submit(waiter, request),
             Event::Committed(ControlRecord::Lease(grant)) => self.lease_committed(&grant),
             Event::Committed(ControlRecord::Result(record)) => self.result_committed(&record),

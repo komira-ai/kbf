@@ -12,12 +12,12 @@ use std::time::Duration;
 use kbf_caps::NodeCaps;
 use kbf_types::{
     ActionKey, Answer, ControlRecord, Effect, Failure, FarmTime, LeaseGrant, LeaseId, LeaseKind,
-    MemoryRun, OperationId, Outcome, Qos, Refusal, RefusalRecord, Resources, ResultRecord,
-    StartLease, StateMachine, WaiterId, Waiting, WorkerId,
+    MemoryRun, NodePhase, OperationId, Outcome, Qos, Refusal, RefusalRecord, Resources,
+    ResultRecord, StartLease, StateMachine, WaiterId, Waiting, WorkerId,
 };
 
 use crate::cordon::{Cordon, Cordons};
-use crate::fence::{HANDOVER_GRACE, LEASE_GRACE, START_GRACE};
+use crate::fence::{HANDOVER_GRACE, LEASE_GRACE, SESSION_SWITCH_GRACE, START_GRACE};
 use crate::input::{DaemonInstance, Event, Input, Request};
 use crate::requeue::{Requeue, RequeueReason};
 use crate::servable::{Servable, Verdict};
@@ -121,6 +121,11 @@ pub(crate) struct Worker {
     handover_ends: FarmTime,
     /// How many leases it killed for memory below the action's own limit.
     memory_pressure: u64,
+    /// What its newest `Hello` says it is doing.
+    pub(crate) phase: NodePhase,
+    /// Until when the lease of a `Preparing` or `Restoring` phase is kept while the
+    /// worker is silent ([`SESSION_SWITCH_GRACE`] after that phase was first reported).
+    switch_ends: FarmTime,
 }
 
 impl Worker {
@@ -130,6 +135,12 @@ impl Worker {
 
     pub(crate) fn alive(&self, now: FarmTime) -> bool {
         now < self.last_heard.saturating_add(LEASE_GRACE)
+    }
+
+    /// Whether `lease`, which it holds, is kept at `now` although it is silent: it is
+    /// switching the GUI session for that lease, within the switch grace.
+    fn switching(&self, lease: LeaseId, now: FarmTime) -> bool {
+        self.phase.switching() == Some(lease) && now < self.switch_ends
     }
 
     /// Whether `request` can be placed on it now, platform and kind aside: an action
@@ -323,6 +334,13 @@ impl Scheduler {
             .collect()
     }
 
+    /// What `worker`'s newest `Hello` says it is doing ([`Event::Phase`]), if it is
+    /// registered.
+    #[must_use]
+    pub fn phase(&self, worker: &WorkerId) -> Option<&NodePhase> {
+        self.workers.get(worker).map(|w| &w.phase)
+    }
+
     /// The worker queued whole-machine `operation` holds while it waits for it to empty,
     /// if any.
     #[must_use]
@@ -464,23 +482,78 @@ impl Scheduler {
     }
 
     /// Sends every lease held on a worker not heard from for [`LEASE_GRACE`] back to
-    /// the queue.
+    /// the queue, except the lease a worker switches the GUI session for, which is kept
+    /// until the switch grace ends ([`SESSION_SWITCH_GRACE`]).
     fn expire(&mut self) {
         let now = self.now;
-        let expired: Vec<OperationId> = self
+        let expired: Vec<(OperationId, RequeueReason)> = self
             .held
-            .values()
-            .map(|held| held.operation)
-            .filter(|id| {
-                let worker = self.ops[id].state.holding().map(|(_, w)| w);
-                worker
-                    .and_then(|w| self.workers.get(w))
-                    .is_none_or(|w| !w.alive(now))
+            .iter()
+            .filter_map(|(lease, held)| {
+                let worker = self.ops[&held.operation].state.holding().map(|(_, w)| w);
+                let Some(w) = worker.and_then(|w| self.workers.get(w)) else {
+                    return Some((held.operation, RequeueReason::Silent));
+                };
+                if w.alive(now) || w.switching(*lease, now) {
+                    return None;
+                }
+                let reason = if w.phase.switching() == Some(*lease) {
+                    RequeueReason::SessionSwitch
+                } else {
+                    RequeueReason::Silent
+                };
+                Some((held.operation, reason))
             })
             .collect();
-        for id in expired {
-            self.requeue(id, RequeueReason::Silent);
+        for (id, reason) in expired {
+            self.requeue(id, reason);
         }
+    }
+
+    /// Takes `worker`'s phase (see [`Event::Phase`]); returns the `Start` sent again
+    /// for the lease it switches the session for, if that `Start` went to an earlier
+    /// session.
+    fn take_phase(&mut self, worker: &WorkerId, phase: NodePhase) -> Vec<Effect> {
+        let now = self.now;
+        let Some(w) = self.workers.get_mut(worker) else {
+            return Vec::new();
+        };
+        w.last_heard = w.last_heard.max(now);
+        if w.phase != phase {
+            w.switch_ends = now.saturating_add(SESSION_SWITCH_GRACE);
+        }
+        w.phase = phase;
+        let (session, process) = (w.session, w.process);
+        let Some(lease) = w.phase.switching() else {
+            return Vec::new();
+        };
+        let Some(held) = self.held.get_mut(&lease) else {
+            return Vec::new();
+        };
+        let op = &self.ops[&held.operation];
+        let here = op.state.holding().is_some_and(|(_, w)| w == worker);
+        // Not committed yet (its `Start` goes out when it is), or already sent to this
+        // session.
+        if !held
+            .start_sent
+            .is_some_and(|sent| here && sent.session != session)
+        {
+            return Vec::new();
+        }
+        held.start_sent = Some(StartSent {
+            at: now,
+            session,
+            process,
+        });
+        vec![Effect::Start(StartLease {
+            worker: worker.clone(),
+            lease,
+            operation: held.operation,
+            key: op.request.key.clone(),
+            kind: op.request.kind,
+            resources: held.booked,
+            fence: op.request.fence(),
+        })]
     }
 
     /// Sends back to the queue every committed lease held on `worker` that `running`
@@ -860,6 +933,8 @@ impl StateMachine for Scheduler {
                                 process: 0,
                                 handover_ends: FarmTime::default(),
                                 memory_pressure: 0,
+                                phase: NodePhase::Serving,
+                                switch_ends: FarmTime::default(),
                             },
                         );
                     }
@@ -885,6 +960,7 @@ impl StateMachine for Scheduler {
                 }
                 Vec::new()
             }
+            Event::Phase { worker, phase } => self.take_phase(&worker, phase),
             Event::Submit { waiter, request } => self.submit(waiter, request),
             Event::Committed(ControlRecord::Lease(grant)) => {
                 let mut effects = Vec::new();

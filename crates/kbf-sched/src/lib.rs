@@ -31,6 +31,11 @@
 //! - in-flight dedup by instance and action digest, with waiters attached to one
 //!   operation;
 //! - QoS levels ordering the queue (no quotas);
+//! - node phases ([`NodePhase`]): a worker switching its GUI session for a
+//!   whole-machine lease keeps the lease while silent for up to
+//!   [`fence::SESSION_SWITCH_GRACE`] and gets its `Start` again when it registers
+//!   after the restart; a quarantined worker, like a switching one, is offered no
+//!   lease, and work only it could run waits as for a cordon;
 //! - cordon and drain ([`Cordon`]): placement skips a cordoned worker, whose leases run
 //!   on; a drain waits for them until a deadline, then pauses, and never kills. Work
 //!   only cordoned workers could run waits, naming them, and is not refused for it; an
@@ -67,6 +72,7 @@ mod servable;
 pub use cordon::Cordon;
 pub use fence::SelfFence;
 pub use input::{DaemonInstance, Event, Input, Request};
+pub use kbf_types::NodePhase;
 pub use requeue::{Gib, Requeue, RequeueReason};
 pub use scheduler::memory::{FARM_RERUNS, MEMORY_FLOORS, raised};
 pub use scheduler::{FINISHED_RETENTION, OpState, PLACEMENT_ROUND, Scheduler, UNSERVABLE_WAIT};
