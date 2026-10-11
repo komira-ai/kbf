@@ -109,7 +109,7 @@ impl SwapKill {
     pub fn threshold(&self, memory_bytes: u64) -> u64 {
         let share = u64::try_from(u128::from(memory_bytes) * u128::from(self.percent) / 100)
             .unwrap_or(u64::MAX);
-        share.max(self.floor_bytes)
+        share.max(0)
     }
 }
 
