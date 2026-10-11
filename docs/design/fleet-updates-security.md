@@ -237,10 +237,13 @@ every argument restricted to the lease uid range (default 600-699 **[A]**):
   cannot change installed software. `automationmodetool` runs once from the
   provisioning profile, not through this helper.
 
-> **Built (phase P1):** `crates/kbf-mac-session` serves `user-create`, `run`, `kill-uid`
-> and `user-delete` with the socket and caller check of S4.3; `session-login`,
-> `session-idle`, `scan`, `baseline`, `reboot-dirty` and the boot-time reset are not
-> built. Where it settles what this section leaves open, or differs:
+> **Built (phase P1, and P4's session switch):** `crates/kbf-mac-session` serves
+> `user-create`, `run`, `kill-uid` and `user-delete` with the socket and caller check
+> of S4.3, and `session-login`, `session-idle` and the boot reset; `scan`, `baseline`
+> and `reboot-dirty` are not built. No daemon calls the session switch or the boot
+> reset yet (the bare-metal whole-machine runtime, 10.1, is planned), and no node runs
+> them: they need FileVault off and the helper installed as a LaunchDaemon, both
+> planned. Where it settles what this section leaves open, or differs:
 > - The user is `kbf-lease-<term>-<seq>` (a hyphen for the lease id's dot). Used lease
 >   ids are kept in an append-only ledger in the helper's state directory, so a name,
 >   and a grant (which names one lease), is used once across reboots; a uid is free
@@ -287,8 +290,35 @@ every argument restricted to the lease uid range (default 600-699 **[A]**):
 >   and `com.apple.sharepoint.group.1`, through nested groups. P4's leak scan should
 >   record a lease user's group memberships.
 > - The password is random and never told to anyone; with no password known, an
->   administrator lease user cannot use `sudo` either. P4's auto-login needs its own
->   way to hand the session a password.
+>   administrator lease user cannot use `sudo` either. `session-login` gives the user
+>   a fresh random password through OpenDirectory (never on a command line, where any
+>   local user could read it) and writes only its `/etc/kcpassword` form.
+> - **The session switch as built.** `session-login <lease>` is refused unless the
+>   ledger holds the lease's user live, FileVault is off (`fdesetup isactive`), and the
+>   intent record names no other lease. In order, it writes the **intent record**
+>   (`session-intent` in the state directory, `<term>.<seq>` and a newline, written
+>   whole and `fsync`ed), sets the new password, writes `/etc/kcpassword` (mode 0600,
+>   replacing whatever is at the path, never through a link), sets the login window's
+>   `autoLoginUser` (`defaults write`), and last asks for a userspace restart
+>   (`launchctl reboot userspace`). So whenever auto-login names a lease user, the
+>   record names its lease. `session-idle` clears `autoLoginUser` and
+>   `/etc/kcpassword`, then removes the record, then asks for the same restart.
+>   `user-delete` is refused for the lease the record names. The restart ends the
+>   connection, so the reply (`restarting`) may not arrive.
+> - **The boot reset as built** is a verb, `boot-reset [held]`: the daemon calls it
+>   before its `Hello`, naming the leases the server still holds for the node, since
+>   only the server knows that. The helper serves no other verb until a reset has
+>   succeeded, and serves it once per start. The lease the record names keeps its
+>   session (auto-login, `/etc/kcpassword` and the record) only if it is held and its
+>   user is live; otherwise all three are cleared. Then every other live lease user
+>   is killed and deleted as `kill-uid` and `user-delete` do. A reset that fails
+>   part-way names each failure and can be repeated. It restarts nothing: a stale
+>   session's processes end with `kill-uid`'s bootout of `gui/<uid>`.
+> - Every program the switch runs (`defaults`, `launchctl`, `fdesetup`) goes through
+>   the host's command runner with an empty environment, so the unit tests fake each
+>   one and nothing in CI restarts: the macOS CI job runs the boot reset for real over
+>   a login-window file and `kcpassword` of its own, and never `session-login` or
+>   `session-idle`.
 > - `run` starts the process in the system launchd domain as the lease user, not in
 >   the user's own domain (`launchctl asuser`); tools that need per-user launchd
 >   services are P4's.

@@ -147,6 +147,16 @@ impl Ledger {
         self.last_uid
     }
 
+    /// The leases created and not yet deleted, in order.
+    #[must_use]
+    pub fn live_leases(&self) -> Vec<LeaseId> {
+        self.leases
+            .iter()
+            .filter(|(_, entry)| !entry.deleted)
+            .map(|(lease, _)| *lease)
+            .collect()
+    }
+
     /// The uids of leases created and not yet deleted.
     #[must_use]
     pub fn held_uids(&self) -> BTreeSet<u32> {
