@@ -3,9 +3,10 @@
 //! Each lease goes through the six driver steps
 //! (`docs/design/daemon.md#the-container-driver`):
 //! 1. **prepare:** fetch the Action and Command, check the image and paths, write the
-//!    input root into the lease's scratch directory, refuse outputs that are inputs,
-//!    give the overlay's directories to the container's root (a subordinate id, see
-//!    `podman::create_args`), make the lease cgroup;
+//!    input root into the lease's scratch directory, move each input an output names
+//!    into the overlay's upper directory, give the overlay's directories to the
+//!    container's root (a subordinate id, see `podman::create_args`), make the lease
+//!    cgroup;
 //! 2. **start:** `podman create`, then `podman start --attach`;
 //! 3. **watch:** wait for the exit, the timeout, [`Runtime::kill`], or a lease that
 //!    keeps pressing its own memory cap into swap ([`SwapKill`]), which the driver
@@ -51,8 +52,8 @@ use crate::podman::{
 use crate::program;
 use crate::remove::remove_tree;
 use crate::tree::{
-    TreeError, check_relative, collect, fetch_message, materialize, output_paths,
-    refuse_hidden_working_directory, refuse_outputs_in_inputs,
+    TreeError, check_relative, collect, fetch_message, materialize, output_paths, prepare_outputs,
+    refuse_hidden_working_directory,
 };
 
 /// The driver name in the node report.
@@ -262,20 +263,11 @@ impl<C: Cas> PodmanRuntime<C> {
         refuse_hidden_working_directory(&root, &command.working_directory)
             .await
             .map_err(tree_error)?;
-        // Outputs are read from the upper layer, so none may already be an input.
-        refuse_outputs_in_inputs(&root, &command.working_directory, &outputs)
+        // Outputs are read from the upper layer: an input an output names moves there
+        // whole, and the working directory and each output's parent are made there.
+        prepare_outputs(&root, &upper, &command.working_directory, &outputs)
             .await
             .map_err(tree_error)?;
-        // REAPI: the worker makes the working directory and each output's parent.
-        let out_dir = upper.join(&command.working_directory);
-        let parents = outputs
-            .iter()
-            .filter_map(|output| Path::new(output).parent().map(|p| out_dir.join(p)));
-        for dir in std::iter::once(out_dir.clone()).chain(parents) {
-            tokio::fs::create_dir_all(&dir)
-                .await
-                .map_err(|e| failed(&dir, &e))?;
-        }
         // The container's root is a subordinate id (`--userns=nomap`), which may write
         // only under directories it owns.
         self.podman
