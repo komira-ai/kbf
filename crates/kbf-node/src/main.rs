@@ -153,6 +153,15 @@ struct Cli {
     /// installed (`xcodebuild -showComponent MetalToolchain`) is not ready.
     #[arg(long)]
     require_metal_toolchain: bool,
+    /// A container image this node is pinned to, as an action names it:
+    /// `docker://<repo>@sha256:<digest>`, one architecture's manifest digest
+    /// (container; repeatable). At start the daemon checks each is in its user's image
+    /// store, as the prepare step of every lease does, and exits with status 2 if one
+    /// is not, or names an image index, saying the fix (`podman pull <repo>@sha256:<d>`).
+    /// The node's status lists them (`GET /v1/nodes`, `software.container_images`).
+    /// No work is placed by image yet: an action may still name another image.
+    #[arg(long = "image", value_name = "IMAGE")]
+    images: Vec<String>,
     /// A directory holding `passwd`, `subuid` and `subgid` that the container
     /// driver's startup check reads instead of `/etc`'s. For tests of that check only.
     #[arg(long, hide = true)]
@@ -172,6 +181,31 @@ enum Driver {
 
 type Error = Box<dyn std::error::Error>;
 
+/// The daemon's exit status when an `--image` cannot run on this node.
+const IMAGE_UNUSABLE: u8 = 2;
+
+/// An `--image` this node cannot run: missing from the image store, an index, or not
+/// an image by digest. The daemon exits with [`IMAGE_UNUSABLE`].
+#[derive(Debug)]
+struct ImageUnusable(String);
+
+impl std::fmt::Display for ImageUnusable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "--image: {}", self.0)
+    }
+}
+
+impl std::error::Error for ImageUnusable {}
+
+/// The exit status for an error that stopped the daemon from starting.
+fn exit_code(e: &Error) -> ExitCode {
+    if e.is::<ImageUnusable>() {
+        ExitCode::from(IMAGE_UNUSABLE)
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     tracing_subscriber::fmt()
@@ -182,7 +216,7 @@ fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("kbf-daemon: {e}");
-            ExitCode::FAILURE
+            exit_code(&e)
         }
     }
 }
@@ -240,12 +274,16 @@ impl Node {
 /// follow. Its node report is the detected entries, the labels and a `drivers` entry
 /// per runtime (which `Daemon::new` adds), its `cpus` and `mem_gib` no more than the
 /// container driver allows; the native driver adds its own with
-/// `Daemon::with_driver_report`.
+/// `Daemon::with_driver_report`. Its status lists every `--image`, which only the
+/// container driver runs: without it, `--image` fails the start.
 fn node(
     cli: &Cli,
     native: impl Fn() -> Result<NativeConfig, Error>,
     xcrun: &Path,
 ) -> Result<(Daemon, Option<Reports>), Error> {
+    if !cli.images.is_empty() && !cli.drivers.contains(&Driver::Container) {
+        return Err("--image names container images: only --driver container runs them".into());
+    }
     let mut node = Node::default();
     for driver in drivers(cli) {
         match driver {
@@ -263,7 +301,8 @@ fn node(
     let report = NodeReport::detect(&[])?
         .with_entries(cli.daemon.label_entries())
         .within(node.capacity);
-    let daemon = Daemon::new(DaemonConfig::from_args(&cli.daemon), runtimes, report)?;
+    let daemon = Daemon::new(DaemonConfig::from_args(&cli.daemon), runtimes, report)?
+        .with_container_images(cli.images.iter().cloned());
     Ok(match node.reports {
         Some(reports) => (daemon.with_driver_report(reports.clone()), Some(reports)),
         None => (daemon, None),
@@ -404,10 +443,11 @@ mod container {
     use std::time::Duration;
 
     use kbf_driver_container::{
-        ContainerLimits, IdFiles, OutputLimits, PodmanConfig, PodmanRuntime, SwapKill,
+        ContainerLimits, IdFiles, ImageRef, OutputLimits, PodmanConfig, PodmanRuntime, SwapKill,
     };
 
-    use super::{Cli, Error, Node, cas_client, scratch};
+    use super::{Cli, Error, ImageUnusable, Node, cas_client, scratch};
+    use kbf_daemon::CasClient;
 
     /// Builds the container driver, over the daemon's CAS client, and adds it to `node`
     /// with what its leases may use.
@@ -473,8 +513,28 @@ mod container {
         config.limits = limits(cli);
         config.swap_kill = swap_kill(cli);
         let runtime = PodmanRuntime::new(config, Arc::new(cas))?;
+        // From `start`, in the runtime's context but outside any task.
+        tokio::runtime::Handle::current().block_on(check_images(&runtime, &cli.images))?;
         node.add(Arc::new(runtime))?;
         node.capacity = capacity;
+        Ok(())
+    }
+
+    /// Checks each `--image` as a lease's prepare step would: named by digest, in this
+    /// node's image store, one architecture's manifest. The first that is not stops the
+    /// start, with its fix.
+    async fn check_images(
+        runtime: &PodmanRuntime<CasClient>,
+        images: &[String],
+    ) -> Result<(), ImageUnusable> {
+        for value in images {
+            let image = ImageRef::parse(value).map_err(|e| ImageUnusable(e.to_string()))?;
+            runtime
+                .check_pinned(&image)
+                .await
+                .map_err(|e| ImageUnusable(e.to_string()))?;
+            tracing::info!("image {image}: in this node's image store");
+        }
         Ok(())
     }
 
