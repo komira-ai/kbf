@@ -152,13 +152,10 @@ impl Agent {
         // The Hello deadline is still set on the socket, and the reader below shares
         // it: without this, a run that is silent for longer than the hello timeout
         // would read as a host that is gone, and be killed. macOS refuses this with
-        // EINVAL once the host has closed; a connection whose deadline cannot be
-        // cleared cannot be served either way, so it ends here like any closed one.
-        if stream.set_read_timeout(None).is_err() {
-            // Best effort: the host may already be gone.
-            let _ = stream.shutdown();
-            return Ok(());
-        }
+        // EINVAL once the host has closed. A connection whose deadline cannot be
+        // cleared cannot be served, so it is shut down, and the reader below sees the
+        // end of the stream as for any host that is gone.
+        let _ = stream.set_read_timeout(None).or_else(|_| stream.shutdown());
 
         let mut reader = stream.try_clone()?;
         let (tx, rx) = mpsc::channel();
@@ -390,29 +387,52 @@ mod tests {
     #[test]
     fn a_host_gone_before_the_deadline_is_cleared_is_a_closed_connection() {
         let (stream, mut host) = UnixStream::pair().expect("socket pair");
-        let token = [0x5a; TOKEN_LEN];
-        let hello = HostMsg::Hello {
-            version: VERSION,
-            token,
-        };
-        write_frame(&mut host, &hello.encode()).expect("hello sent");
+        write_frame(&mut host, &hello()).expect("hello sent");
         drop(host);
         let mut fake = ClosedPeerRefusesTimeout(stream);
-        // The agent returns before it clones or flushes the stream; check the fake
-        // passes those through, so that it fails only where it means to.
-        let clone = Stream::try_clone(&fake).expect("cloned");
-        drop(clone);
+        // The agent never flushes the stream; check the fake passes that through.
         fake.flush().expect("flushed");
-        let mut agent = Agent::new(Config {
-            token,
-            inputs: PathBuf::from("/nonexistent/inputs"),
-            outputs: PathBuf::from("/nonexistent/outputs"),
-            session: "TestSession".into(),
-            hello_timeout: HELLO_TIMEOUT,
-        });
+        let mut agent = agent(HELLO_TIMEOUT);
         agent
             .serve_connection(fake)
             .expect("a closed connection, not an error");
         assert!(!agent.has_run());
+    }
+
+    /// Catches a connection whose deadline could not be cleared being served anyway:
+    /// a host that is still there reads `Ready` and then the end of the stream, not a
+    /// refusal once the Hello deadline left on the socket runs out.
+    #[test]
+    fn a_connection_whose_deadline_cannot_be_cleared_is_closed() {
+        let (stream, mut host) = UnixStream::pair().expect("socket pair");
+        write_frame(&mut host, &hello()).expect("hello sent");
+        let served = std::thread::spawn(move || {
+            agent(Duration::from_millis(200)).serve_connection(ClosedPeerRefusesTimeout(stream))
+        });
+        let ready = GuestMsg::decode(&read_frame(&mut host).expect("ready")).expect("decoded");
+        assert!(matches!(ready, GuestMsg::Ready { .. }), "{ready:?}");
+        let end = read_frame(&mut host).map(|f| GuestMsg::decode(&f));
+        assert!(matches!(end, Err(WireError::Closed)), "{end:?}");
+        served.join().expect("agent thread").expect("served");
+    }
+
+    const TOKEN: [u8; TOKEN_LEN] = [0x5a; TOKEN_LEN];
+
+    fn hello() -> Vec<u8> {
+        HostMsg::Hello {
+            version: VERSION,
+            token: TOKEN,
+        }
+        .encode()
+    }
+
+    fn agent(hello_timeout: Duration) -> Agent {
+        Agent::new(Config {
+            token: TOKEN,
+            inputs: PathBuf::from("/nonexistent/inputs"),
+            outputs: PathBuf::from("/nonexistent/outputs"),
+            session: "TestSession".into(),
+            hello_timeout,
+        })
     }
 }
