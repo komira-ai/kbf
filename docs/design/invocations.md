@@ -185,8 +185,8 @@ the action detail links the Action and Command blobs like any other blob.
 Estimated from the field encodings, not measured (PR 2 measures it):
 
 - core row (three digests, operation name, lease, worker, four timestamps, outcome tag):
-  about 170 B; storing each timestamp as a delta from `first_seen` brings it to about
-  130 B;
+  about 170 B; storing each timestamp as a delta from its chunk's base time (3.5) brings
+  it to about 130 B;
 - plus each output about 45 B and its path, and about 90 B for the stdout and stderr
   digests;
 - plus `RequestMetadata` text when sent: 50 to 200 B; plus a rerun about 40 B each.
@@ -246,11 +246,38 @@ unflushed rows and the header fields; step 3 then applies only when flushes fail
   any blob. No new storage layer.
 - The invocation's root (its header fields and the ordered list of chunk digests) is a
   small blob too, rewritten at each flush.
-- The log holds one **pin** per invocation, `invocation/<id>` to the root's digest and a
-  hold-until time: the Pins of [storage.md](storage.md#planned). A pin keeps its root and
-  chunks from collection. The pin's closure is listed in the root, not discovered:
-  collection parses the root, and only the root, while the chunks stay opaque to it
-  (3.6 says what the closure covers).
+- **Formats.** Every chunk and every root carries a schema version, the invocation id,
+  the chunk sequence number (in a root: the sequence number of its newest chunk) and
+  absolute base timestamps; a row's times are deltas from its chunk's base (3.3). The
+  root carries, for each chunk, its digest, row count and earliest and latest time,
+  and for the invocation the set of targets and of statuses seen, the metrics of 4.4
+  precomputed over the flushed rows, and the positions (chunk, offset) of the failed
+  rows. So a derived cross-build index (3.7) is filled from roots with no migration of
+  the stored records, and the metrics route and the failed-first logs route read the
+  root instead of scanning every chunk.
+- The log holds one **pin** per invocation, `invocation/<id>`: the Pins of
+  [storage.md](storage.md#planned). A pin keeps its root and chunks from collection.
+  **The pin command carries its closure.** An update is
+  `{id, prev_root, new_root, added_chunk_digests}` with the hold-until time: about 40 B
+  per new chunk (a SHA-256 and a size), so a large build does not rewrite its whole
+  chunk list in the log at each flush. `MetaState` keeps each pin's current root and
+  the closure accumulated from its updates. **Collection parses no blob**: it stays a
+  pure function of the replicated state. Today `collect` reads only `MetaState`'s own
+  maps (`kbf-meta/src/state.rs`), and in the high-availability design (PR #303, open)
+  every replica applies the committed `Collect`; a collection that read roots from the
+  object store would do I/O inside a replicated apply, and its result would depend on
+  what each replica's read returned (a store unreachable from one replica, a corrupt
+  read on another), so replicas could remove different entries. Pinned failed-action outputs
+  (3.6) are likewise listed in the pin command, not discovered by parsing.
+- **A pin update is a compare-and-set on `prev_root`.** It is refused, and changes
+  nothing, when the pin's current root is not `prev_root` (empty for the first flush of
+  an invocation), or when `new_root` is not in the blob index (the `PutBlobs` that
+  stores it commits first). The case it prevents: a deposed leader's update to root R2
+  (adding chunk C2) commits after the new leader's recorder has read the pin at R1; that
+  recorder writes R3, which lists R1's chunks and its own new one but not C2. Applied
+  blind, R3 replaces R2 and C2's rows drop out of the record with no error and no
+  `complete: false`. With the check, R3's update names R1, is refused, and the recorder
+  rebuilds its root from the pin's current root (R2) and retries (section 7, failover).
 - **The log cost of a flush** is two entries: one `PutBlobs` for the chunk and the root
   (`Cache::store_blobs` commits one per segment batch, and both blobs are stored in one
   call) and one pin update: about 200 to 300 B, estimated. With the flush rule of 3.4, a
@@ -284,14 +311,24 @@ invocation; the next server marks those invocations `complete: false`.
   the tree blob is.
 - `--invocation-pin-outputs=failed` (planned) adds to a failed action's pin closure its
   ActionResult blob, its output files and trees, its stdout and stderr: the case worth
-  keeping. These digests are listed in the root (3.5), so collection still parses only
-  the root. Not settled yet: whether the files inside a failed action's output tree are
-  pinned too. If they are, either collection reads the Tree blob or the root lists the
-  files; storage.md defines Pins only as named retention roots, so this is decided with
-  the Pins design (PR 7). Recommended: the root lists the files, so collection parses
-  one format.
+  keeping. These digests are listed in the pin command (3.5), so collection still reads
+  no blob. Not settled yet: whether the files inside a failed action's output tree are
+  pinned too. Collection does not read the Tree blob (3.5), so if they are, the
+  recorder reads the tree off the call path and the pin command lists the files; the
+  cost (one digest per file) is decided with the Pins design (PR 7).
 - Until collection lands nothing is deleted, so retention is a promise of a floor, not a
   ceiling.
+
+### 3.7 Cross-build queries
+
+The routes of section 4 read one invocation by its id, and nothing else. Listing,
+search and trends across builds (every build of a target, failures this week) are
+**not in this plan**. When they are needed they come from a derived index on each
+server: embedded, pure Rust, filled at each flush from the root (3.5) and rebuilt by
+walking pins to roots to chunks. It is never authoritative and never replicated through
+Raft: a server that loses it, or a new leader after a failover, rebuilds it, and a
+wrong index costs a wrong list, never a lost record. It is added when the first list or
+search screen is scheduled. Raft holds only the pins.
 
 ## 4. The read API
 
@@ -313,6 +350,9 @@ microseconds; digests are `"<sha256 hex>-<size>"`.
 
 `{id}` is an id of 2.2 or a derived `<id>~<n>` key of 2.4, matched as bytes; anything else
 is `404`. `instance` is a query parameter because REAPI instance names may contain `/`.
+A record that is gone (its pin expired, it was deleted, or in stage 1 it was evicted)
+answers `404` on every route, a page token made for it included (4.5). There is no
+route across invocations (3.7).
 
 ### 4.2 Shapes
 
@@ -397,7 +437,10 @@ the operator API's "anyone who reaches the address" rule.
 
 ### 4.4 Metrics
 
-Per invocation, computed from the record at read time: counts as above; queue time and
+Per invocation, from the record: in stage 2 the recorder computes them at each flush
+and stores them in the root (3.5), and the route adds the rows not yet flushed, so it
+reads no chunk. Percentiles therefore come from a mergeable histogram the recorder
+keeps, not from sorting rows. The values: counts as above; queue time and
 run time (granted to ended) as min, p50, p90, max and sum; reruns by reason; CPU-seconds
 and peak memory summed and maxed over actions that carry usage, with
 `usage_actions: n` saying how many did. Farm-wide metrics (a scrape endpoint) are a
@@ -410,6 +453,9 @@ separate design.
 - Rows are append-only and in first-seen order, so a token is the opaque position
   (chunk, offset) plus the filter it was made for; a page never skips or repeats a row
   while the build is still writing. A token used with another filter is `400`.
+- A token used after its record's pin has expired (or the record was deleted or
+  evicted) answers `404`, as the record's own route does; a position is never
+  resolved against chunks the record no longer holds.
 
 ### 4.6 Blobs over HTTP
 
@@ -543,7 +589,8 @@ ingester is a second writer and not a second record. buck2 does not emit BES.
 | Memory bound reached | evict minted, then idle invocations; then the largest open one stops taking rows, `rows_capped: true` (3.5) |
 | Server crash or restart | stage 1: all records lost, a page answers `404`; stage 2: at most the unflushed window (120 s or 256 KiB) of each open invocation lost, marked `complete: false`; minted invocations lost |
 | Object store down at flush | chunk kept in memory and retried; past `--invocation-memory`, oldest unflushed rows dropped and `complete: false` |
-| Failover (HA, planned) | the new leader's recorder starts from the pins; open invocations continue in new chunks |
+| Failover (HA, planned) | the new leader's recorder reads each open invocation's pin (its current root) and continues in new chunks; each pin update is a compare-and-set on that root (3.5), so a deposed leader's update that commits late makes the next update fail, and the recorder rebuilds from the pin's current root and retries, never overwriting it; the old leader's unflushed window is lost and the invocation says `complete: false` |
+| Chunk lost or corrupt (the store has no bytes for it, or they fail their digest) | the page shows the surviving chunks' rows and a gap marker where the lost chunk's rows were (its row count and time range, from the root), and the invocation says `complete: false`; nothing restores it: a chunk is the one blob no client can upload again |
 | ActionResult, output or log blob collected | still listed from the row (3.2) with `available: false`; its `href` answers `404` |
 | Malformed or hostile header | treated as absent (2.2); never fails the call |
 | Squatted id | recorded under `<id>~<n>` (2.4) |
@@ -552,8 +599,14 @@ ingester is a second writer and not a second record. buck2 does not emit BES.
 
 - **A farm-minted id for every build.** The user cannot learn it: no REAPI field shown on
   success, and buck2's printed id is its own. Kept only for the id-less Execute fallback.
-- **Rows in the replicated log.** 100 to 240 MB a day into a log that has no compaction,
-  in every snapshot and checkpoint digest, and a log format change per field.
+- **Rows in the replicated log.** 100 to 240 MB a day into the log, in every snapshot
+  and checkpoint digest, and a log format change per field. The Raft library supports
+  snapshots and compaction (`kbf-raft`), but the server's metadata log takes no
+  snapshot today (`raft_log/machine.rs`: its `snapshot` is `unreachable!`), so it is
+  never compacted until the high-availability work lands.
+- **A second authoritative store for records or cross-build queries.** Raft holds the
+  pins, the CAS holds the rows; a list or search across builds is a derived index that
+  can be rebuilt from them (3.7).
 - **Records as separate objects in the object store.** Needs a new key space whose keys
   the log must still record (the objstore contract) and its own retention; CAS blobs plus
   a pin reuse both.
@@ -595,7 +648,9 @@ defect it catches and the mutant planted to see it go red.
    while rows are appended never skips or repeats (property test); a token with another
    filter is `400`; with no `invocations` key the routes are `404` (plant "default allow",
    it goes red); with `invocations` and no `blobs`, `href`s are `null`; an authorizer
-   refusing one instance refuses the page; `{id}` with `<`, `%3C` or `/` is `404`.
+   refusing one instance refuses the page; `{id}` with `<`, `%3C` or `/` is `404`; a
+   page token for a record evicted after the token was issued is `404` (plant "resolve
+   the token's position anyway", red).
 5. **(S) Blobs over HTTP** (4.6). Tests: bytes equal ByteStream's; a store returning
    corrupt bytes yields an error, not the bytes (plant skipping verification, red);
    `Range`; a `name` with `"`, `;` and non-ASCII comes back as a well-formed `filename*`
@@ -610,19 +665,40 @@ defect it catches and the mutant planted to see it go red.
    id-less fallback mints a `kbf-` id whose page exists; `GET /build/{id}` answers `303`
    to the API route.
 7. **(M) The pin command and its log format**, in the same format bump as Pins
-   ([storage.md](storage.md#planned)); ordered with the HA work (PR #303). Tests: a log
-   of the new format replays pins and their hold-until; a reader of `Format::V1` refuses
-   the new format rather than skipping the entry (plant "skip unknown", red).
+   ([storage.md](storage.md#planned)); ordered with the HA work (PR #303). The command
+   is `{id, prev_root, new_root, added_chunk_digests}` with its hold-until time, applied
+   as a compare-and-set on `prev_root`; `MetaState` keeps each pin's root and its
+   accumulated closure, and `Collect` keeps every digest in a live pin's closure
+   (3.5). Tests: a log of the new format replays pins, their closures and their
+   hold-until; a reader of `Format::V1` refuses the new format rather than skipping the
+   entry (plant "skip unknown", red); a pin update with a stale `prev_root` is refused
+   and leaves the pin unchanged (plant "skip the check", red); a pin update whose
+   `new_root` is not in the blob index is refused (plant "skip the index check", red);
+   a collection keeps every digest of a live pin's closure, including a chunk named only
+   by an earlier update, and frees them once the pin expires (plant "keep only the
+   last update's chunks", red); a collection run with the object store unreachable
+   (every read fails) gives the same result as with it reachable (plant "parse the
+   root", red).
 8. **(M) Durable records** (3.5 stage 2): chunks as CAS blobs, roots, the flush rule of
    3.4, recovery marking open invocations incomplete. Tests: restart keeps every flushed
    row; a crash loses at most the window; an idle invocation is flushed once and then
    writes nothing (plant a 10 s timer, the log-entry count goes red); a minted
    invocation (2.3) writes no chunk and no pin (plant "flush minted invocations like any
-   other", the log-entry count goes red); `kbf-sim-cell`
-   gains the property "every pinned root's chunks are readable".
+   other", the log-entry count goes red); every chunk and root carries the version, id,
+   sequence number and base times of 3.5, and a root carries per-chunk counts and time
+   ranges, targets, statuses, metrics and failed-row positions (a decode test of each
+   field; plant "omit the failed-row positions", the failed-first test goes red); the
+   metrics route and the failed-first logs route on a flushed invocation read the root
+   and no chunk (count the store's reads; plant "scan every chunk", red); a chunk
+   deleted from the store, or corrupted, leaves a page of the surviving rows with a gap
+   marker and `complete: false` (plant "skip a missing chunk silently", the
+   `complete` check goes red); `kbf-sim-cell` gains the property "every pinned root's
+   chunks are readable".
 9. **(S) Retention and delete**: pin expiry, `DELETE`, `--invocation-pin-outputs=failed`.
-   **Blocked on collection**, which the server does not run today (section 1). Tests: an
-   expired pin is collected; a pinned failed action's ActionResult and stderr survive a
+   **Blocked on collection**, which the server does not run today (section 1). The
+   failed actions' digests ride in the pin command (3.6). Tests: an expired pin is
+   collected; a page token issued before its pin expired answers `404` after (plant
+   "serve the token's position", red); a pinned failed action's ActionResult and stderr survive a
    collection that frees its successful neighbour's; after its neighbour's blobs are
    collected the neighbour's page still lists its outputs with `available: false` (plant
    "read outputs from the ActionResult", red).
@@ -658,7 +734,8 @@ Each with a recommendation; none is decided here.
    a page lists them as unavailable; failed actions' results, outputs and logs pinnable
    by flag (3.6). Pinning every build's outputs would hold most of the cache.
 5. **Durable home.** Recommend CAS chunks plus one pin per invocation in the log (3.5),
-   flushed at 256 KiB, at idle or every 120 s, sequenced after Pins and the HA log work,
+   the pin carrying its closure and updated by compare-and-set; cross-build lists from
+   a derived index, never a second authoritative store (3.7); flushed at 256 KiB, at idle or every 120 s, sequenced after Pins and the HA log work,
    with the in-memory stage shipped first.
 6. **The link on a successful buck2 build.** Recommend: today, the printed `Build ID` in
    the template and the link in failed actions' messages; send the upstream buck2 change

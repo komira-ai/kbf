@@ -112,10 +112,11 @@ because the entry was touched recently is still covered for the full TTL.
 `Collect` removes every expired blob and action entry and returns what it removed,
 with the location of each blob's bytes, so their space can be accounted as dead.
 
-Today the server binary does not advance the metadata's farm time and never runs
-`Collect`, so nothing expires while it runs; the index lives in memory and is lost at
-restart anyway. **Planned**: the leader commits a `Tick` every second, and collection
-runs on a schedule.
+Today, under `--meta-log=raft`, the server commits a `Tick` every second while the log
+is open (`raft_log::TICK`), so the metadata's farm time advances and continues across
+restarts. Under `--meta-log=memory` nothing advances it, and the index is lost at
+restart. In neither mode does the server run `Collect`, so nothing expires while it
+runs. **Planned**: collection runs on a schedule.
 
 ## Writes
 
