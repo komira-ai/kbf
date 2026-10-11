@@ -10,7 +10,7 @@ use kbf_sched::{
 };
 use kbf_types::{
     ActionKey, ControlRecord, Digest, DigestFunction, Effect, Failure, FarmTime, LeaseKind,
-    MemoryKill, MemoryRun, OperationId, Outcome, Qos, Resources, ResultRecord, StartLease,
+    LostWhy, MemoryKill, MemoryRun, OperationId, Outcome, Qos, Resources, ResultRecord, StartLease,
     StateMachine, WaiterId, Waiting, WorkerId,
 };
 
@@ -558,7 +558,8 @@ fn a_whole_machine_kill_asks_for_a_node_twice_as_large() {
 
 /// Catches a memory kill committed for a lease the operation no longer holds (it was
 /// given up, and the result raced the log) that still raises the booking or a floor,
-/// records a run, or counts against the node.
+/// records a run, or counts against the node; and a lost run committed so that is
+/// charged to the farm budget (issue #22) or makes the operation avoid the node.
 #[test]
 fn a_memory_kill_of_a_lease_given_up_changes_nothing() {
     let mut f = Farm::new();
@@ -577,7 +578,8 @@ fn a_memory_kill_of_a_lease_given_up_changes_nothing() {
             reason: RequeueReason::Silent,
         }]
     );
-    for outcome in [OOM, PRESSURE] {
+    let lost = Outcome::Failed(Failure::Lost(LostWhy::Fenced));
+    for outcome in [OOM, PRESSURE, lost] {
         let record = ResultRecord {
             lease: first.lease,
             operation: first.operation,
@@ -590,8 +592,11 @@ fn a_memory_kill_of_a_lease_given_up_changes_nothing() {
     assert_eq!(f.s.memory_runs(first.operation).unwrap(), []);
     assert_eq!(f.s.memory_floor(&key(1)), None);
     assert_eq!(f.s.memory_pressure(&w("a")), 0);
+    assert_eq!(f.s.farm_runs(first.operation).unwrap(), []);
     f.heartbeat("a", &[]);
-    assert_eq!(f.start().resources.memory_bytes, GIB);
+    let again = f.start();
+    assert_eq!(again.resources.memory_bytes, GIB);
+    assert_eq!(again.worker, w("a"));
 }
 
 /// Catches floors kept without bound: past the bound the one raised longest ago is

@@ -450,6 +450,30 @@ fn a_rerun_waits_only_for_a_node_that_could_run_it() {
     assert_eq!(next.worker, w("a"), "a cordoned node held the rerun back");
 }
 
+/// Catches a whole-machine rerun that holds the node it was lost on while another
+/// could run it (the reservation not told of the avoided nodes): it fits nowhere now,
+/// `a` is empty and `b` busy, and it holds `b`, as placement waits for `b`.
+#[test]
+fn a_whole_machine_rerun_holds_a_node_it_was_not_lost_on() {
+    let mut f = Farm::new();
+    f.up("a", "a", false, true);
+    f.up("b", "b", false, true);
+    f.submit(1, request(1, LeaseKind::WholeMachine));
+    let start = f.start();
+    assert_eq!(start.worker, w("a"));
+    f.submit(2, request(2, LeaseKind::Action));
+    let busy = f.start();
+    assert_eq!(busy.worker, w("b"));
+    let effects = f.end(&start, FENCED);
+    assert!(Farm::starts(&effects).is_empty(), "{effects:?}");
+    assert_eq!(f.s.reservation(start.operation), Some(&w("b")));
+    let effects = f.end(&busy, ok());
+    let [next] = &Farm::starts(&effects)[..] else {
+        panic!("{effects:?}");
+    };
+    assert_eq!((next.operation, &next.worker), (start.operation, &w("b")));
+}
+
 /// Catches the give-up path left out of the budget, and a budget used up there that
 /// answers nobody (it must propose the result, so the log ends the operation): the
 /// third run is lost through a proven restart, and the heartbeat that gives it up

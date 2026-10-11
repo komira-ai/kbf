@@ -99,6 +99,9 @@ async fn a_daemon_restart_mid_lease_reruns_at_once_on_another_node() {
         .expect("no rerun on node-b within 2 s");
     assert_eq!(again.action_digest, first.action_digest);
     assert_ne!(again.lease_id, first.lease_id);
+    // While the rerun runs, a late Result of the killed run is refused.
+    let killed = output(&cell, "from the killed run, mid-rerun", 0).await;
+    assert!(!a.report(ran(first.lease_id, &killed)).await.accepted);
     let result = output(&cell, "from node-b", 0).await;
     assert!(b.report(ran(again.lease_id, &result)).await.accepted);
     assert_eq!(response(&done(&mut ops).await).result, Some(result.clone()));
@@ -116,12 +119,17 @@ async fn a_daemon_restart_mid_lease_reruns_at_once_on_another_node() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_claim_on_a_process_whose_stream_is_open_waits() {
     let job = Job::new("its first copy still runs", &[]);
-    let (cell, _ops, _a, mut b, _first) = running_on_a(&job).await;
+    let (cell, _ops, mut a, mut b, _first) = running_on_a(&job).await;
     let _a2 = come_back(&cell, restarted("node-a", "i2", "i1")).await;
     assert_eq!(
         start_within_fast(&mut b).await,
         None,
         "rerun beside a live run"
+    );
+    // The old stream is replaced: its heartbeats go unacknowledged, so it fences.
+    assert!(
+        !a.heartbeat(&[]).await,
+        "a replaced stream's heartbeat taken"
     );
 }
 
