@@ -454,6 +454,7 @@ async fn swapped_by_the_host_then_at_its_cap_a_lease_is_not_killed() {
         reclaims.join("\n")
     );
     write(&lease, "memory.max", &(ram + HEADROOM).to_string());
+    write(&lease, "memory.swap.max", "0");
     let events = |lease: &Path, key: &str| {
         std::fs::read_to_string(lease.join("memory.events"))
             .ok()
