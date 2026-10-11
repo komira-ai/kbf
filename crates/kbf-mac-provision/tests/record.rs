@@ -1,6 +1,5 @@
 //! The record of the power and software update settings from before `apply` first
-//! changed one, and `revert`, which puts them back (the record and revert of
-//! kbf-mdm's `mac_phase0.sh`, for the same settings and more).
+//! changed one, and `revert`, which puts them back.
 
 mod support;
 
