@@ -31,7 +31,8 @@ pub struct Listeners {
     /// The REAPI listener (clients: buck2, Bazel).
     pub reapi: SocketAddr,
     /// TLS for the REAPI listener (a server certificate; clients present none). `None`
-    /// serves it in plain text, which is meant for a loopback bind.
+    /// serves it in plain text, on whatever address `reapi` names (nothing refuses a
+    /// bind off loopback; the binary's start line warns about one).
     pub reapi_tls: Option<ServerTlsConfig>,
     /// The `kbf.worker.v1` listener (daemons): their worker streams, and `ByteStream`
     /// for their blobs ([`crate::blobs`]).

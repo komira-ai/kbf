@@ -49,10 +49,13 @@ role (`--role=all`). The flags are:
 - `--listen` (REAPI, default `127.0.0.1:8980`) and `--worker-listen` (daemons, default
   `127.0.0.1:8981`);
 - `--reapi-tls-cert` and `--reapi-tls-key` to serve the REAPI listener over TLS (both,
-  or neither for plain text, which is meant for a loopback bind);
+  or neither for plain text);
 - `--worker-tls-cert`, `--worker-tls-key`, `--worker-client-ca` to serve the worker
   listener over mutual TLS (all three, or none for plain text), and
-  `--worker-deny-list` for the certificates and nodes it refuses;
+  `--worker-deny-list` for the certificates and nodes it refuses. TLS and mutual TLS
+  are optional: a listener without them serves plain text on any address, with a
+  warning on the start line when that address is not loopback (see
+  [Security model](#security-model));
 - `--store=memory` or `--store=s3` with `--s3-endpoint`, `--s3-bucket`, `--s3-region`,
   `--s3-prefix` and `--s3-conditional-put`; the S3 key pair comes from the standard
   `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` variables, never from the command line;
@@ -302,9 +305,8 @@ not yet probed.
   `--reapi-tls-key`, both or neither). Under TLS it presents a server certificate
   only: it asks clients for none, so a client certificate identifies no caller. A key
   that does not match its certificate stops the server before it prints its start
-  line. The listener accepts any bind address, plain text included. Over TLS as over
-  plain text, it runs the authentication policy and the per-call authorizers of
-  `--reapi-auth-policy`, in Buildbarn's model
+  line. Over TLS as over plain text, it runs the authentication policy and the
+  per-call authorizers of `--reapi-auth-policy`, in Buildbarn's model
   ([docs/reapi-auth.md](docs/reapi-auth.md)); the policies built so far (`allow`,
   `deny`, `any`, `all`, and instance-name prefixes) check no credential. Without the
   flag every call is accepted, and whoever reaches the port can read action inputs
@@ -314,10 +316,19 @@ not yet probed.
   itself behind the front; the front passes the header through and does not check
   it. A peer address does not identify a caller here: a proxy on the same host
   connects from loopback, whoever its client is.
-- **Planned:** a bind guard. `kbf-server` refuses a plain-text, unauthenticated REAPI
-  bind that other machines could reach, and allows the front's hop: loopback, or an
-  address the operator names as the front's. A REAPI listener served over TLS is
-  the other answer for a hop that crosses machines.
+- **Built: TLS is optional; plain text off loopback is warned about, not refused.**
+  `kbf-server` serves a listener without its TLS flags in plain text on whatever
+  address it is given. When the REAPI or worker listener serves plain text on an
+  address that is not loopback (a wildcard such as `0.0.0.0` or `::`, or any
+  interface address; `::ffff:127.0.0.1` counts as loopback), the start line ends with
+  one ` warning=plaintext-off-loopback:<listeners>` token, `<listeners>` being
+  `reapi`, `worker` or `reapi,worker`, and the server starts. Whether plain text is
+  acceptable on that network (a loopback front, a mesh interface WireGuard already
+  encrypts) is the operator's call. A deployment that wants TLS, ours included, turns
+  it on in its config: `--reapi-tls-cert` and `--reapi-tls-key` for a REAPI hop that
+  crosses machines, and the three worker TLS flags for daemons on other machines.
+  The warning looks at the bind address only: it does not restrict which peers
+  connect, and it does not look at `--reapi-auth-policy`.
 - **A front that works: `tailscale serve` in HTTPS mode.** A probe with
   `tailscale serve` 1.102.4 ran its HTTPS mode (`tailscale serve --https=<port>
   http://127.0.0.1:<reapi>`) in front of a plain-text REAPI listener on loopback.
