@@ -75,6 +75,12 @@ pub struct State {
     pub owners: BTreeMap<String, (u32, u32)>,
     /// `launchctl bootstrap` fails, as for a job that will not load.
     pub bootstrap_fails: bool,
+    /// Calls that change the Mac (as the log shows them, paths on the Mac) which exit 1
+    /// and change nothing when they start with one of these, as a `pmset -a` or a
+    /// `defaults write` refused by the system.
+    pub fails: Vec<String>,
+    /// Calls that, starting with one of these, exit 0 and change nothing.
+    pub no_effect: Vec<String>,
 }
 
 impl State {
@@ -386,6 +392,15 @@ impl FakeMac {
                 "0"
             }
         };
+        let shown: Vec<&str> = args.iter().map(|a| self.strip_root(a)).collect();
+        let call = format!("{name} {}", shown.join(" "));
+        let starts = |prefixes: &[String]| prefixes.iter().any(|p| call.starts_with(p.as_str()));
+        if starts(&s.fails) {
+            return done(false);
+        }
+        if starts(&s.no_effect) {
+            return done(true);
+        }
         match (name, args) {
             ("pmset", ["-a", key, value]) => {
                 s.pmset_set(key, value);

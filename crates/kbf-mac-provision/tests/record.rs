@@ -5,7 +5,7 @@ mod support;
 
 use std::fs;
 
-use kbf_mac_provision::cli::{self, Error};
+use kbf_mac_provision::cli::{self, Error, Verb};
 use kbf_mac_provision::record::{RECORD, RECORD_DIR, RevertError};
 use support::{
     COMMERCE, FakeMac, SOFTWARE_UPDATE, apply, apply_keys, calls, ls, pmset_value, preference,
@@ -242,11 +242,18 @@ fn revert_refuses_a_missing_foreign_or_malformed_record() {
 fn revert_changes_only_what_differs_and_leaves_what_it_cannot_restore() {
     let mut mac = FakeMac::converged("revert-partial");
     mac.state_mut().default_set(COMMERCE, "AutoUpdate", "1");
+    // Every setting but three holds its recorded value.
     let record = "\
 pmset\t-\tsleep\t0
 pmset\t-\tstandby\tABSENT
+pmset\t-\tpowernap\t0
+pmset\t-\tautorestart\t1
+pmset\t-\twomp\t1
 pref\t/Library/Preferences/com.apple.SoftwareUpdate\tAutomaticDownload\t1
+pref\t/Library/Preferences/com.apple.SoftwareUpdate\tAutomaticallyInstallMacOSUpdates\t0
+pref\t/Library/Preferences/com.apple.SoftwareUpdate\tCriticalUpdateInstall\t0
 pref\t/Library/Preferences/com.apple.SoftwareUpdate\tConfigDataInstall\tOTHER
+pref\t/Library/Preferences/com.apple.SoftwareUpdate\tAutomaticallyInstallAppUpdates\t0
 pref\t/Library/Preferences/com.apple.commerce\tAutoUpdate\t1
 ";
     mac.mkdir(RECORD_DIR);
@@ -319,4 +326,154 @@ fn a_record_that_cannot_be_moved_aside_is_an_error() {
         e.to_string().starts_with("cannot move the record aside: "),
         "{e}"
     );
+}
+
+/// `revert` as the binary runs it: what it prints and its exit status, or its refusal.
+fn revert_verb(mac: &FakeMac) -> Result<(String, u8), String> {
+    let verb = Verb::Revert {
+        root: mac.root.clone(),
+    };
+    cli::execute(&verb, mac).map_err(|e| e.to_string())
+}
+
+/// Catches: a revert that ignores a `pmset -a`, `defaults write` or `defaults delete`
+/// that failed (it printed "(reverted)", exited 0 and moved the record aside, so the
+/// only record of the values from before kbf was gone); one that keeps the record but
+/// exits 0, or does not say which settings are not put back; and a record that a
+/// failed revert changed, so that the next revert, once the commands work, cannot
+/// finish the job.
+#[test]
+fn a_failed_restore_keeps_the_record_and_names_each_setting() {
+    let mut mac = FakeMac::fresh("revert-fails");
+    mac.state_mut()
+        .default_set(SOFTWARE_UPDATE, "AutomaticDownload", "1");
+    assert_eq!(apply(&mac).failed, 0);
+    let record = fs::read_to_string(mac.path(RECORD)).unwrap();
+    assert!(record.contains("\tAutomaticDownload\t1\n"), "{record}");
+    mac.state_mut().fails = vec![
+        "pmset -a sleep ".into(),
+        format!("defaults write {SOFTWARE_UPDATE} AutomaticDownload "),
+        format!("defaults delete {COMMERCE} AutoUpdate"),
+    ];
+    let (out, status) = revert_verb(&mac).unwrap();
+    assert_eq!(
+        out.lines().collect::<Vec<_>>(),
+        [
+            "FAIL power_sleep: pmset -a sleep 1 failed; sleep is 0, want 1",
+            "CHANGE power_standby: pmset -a standby 1 (reverted)",
+            "CHANGE power_powernap: pmset -a powernap 1 (reverted)",
+            "CHANGE power_autorestart: pmset -a autorestart 0 (reverted)",
+            "CHANGE power_womp: pmset -a womp 0 (reverted)",
+            &format!(
+                "FAIL updates_auto_download: defaults write {SOFTWARE_UPDATE} AutomaticDownload -bool true failed; AutomaticDownload is 0, want 1"
+            ),
+            "CHANGE updates_auto_install_macos: AutomaticallyInstallMacOSUpdates deleted (reverted)",
+            "CHANGE updates_auto_install_security: CriticalUpdateInstall deleted (reverted)",
+            "CHANGE updates_config_data: ConfigDataInstall deleted (reverted)",
+            "CHANGE appstore_auto_update: AutomaticallyInstallAppUpdates deleted (reverted)",
+            &format!(
+                "FAIL appstore_auto_update: defaults delete {COMMERCE} AutoUpdate failed; com.apple.commerce AutoUpdate is 0, want ABSENT"
+            ),
+            &format!(
+                "NOTE record: kept {RECORD}: 3 settings are not put back; revert again once they can be"
+            ),
+        ]
+    );
+    assert_eq!(status, 1, "{out}");
+    assert_eq!(fs::read_to_string(mac.path(RECORD)).unwrap(), record);
+    assert_eq!(reverted(&mac), Vec::<String>::new());
+    // Once the commands work, the kept record finishes the job.
+    mac.state_mut().fails.clear();
+    let (out, status) = revert_verb(&mac).unwrap();
+    let names = reverted(&mac);
+    assert_eq!(names.len(), 1, "{names:?}");
+    assert_eq!(
+        out.lines().collect::<Vec<_>>(),
+        [
+            "CHANGE power_sleep: pmset -a sleep 1 (reverted)",
+            "CHANGE updates_auto_download: AutomaticDownload = 1 (reverted)",
+            "CHANGE appstore_auto_update: com.apple.commerce AutoUpdate deleted (reverted)",
+            &format!("CHANGE record: moved {RECORD} to {RECORD_DIR}/{}", names[0]),
+        ]
+    );
+    assert_eq!(status, 0);
+    assert_eq!(pmset_value(&mac, "sleep").as_deref(), Some("1"));
+    assert_eq!(
+        preference(&mac, SOFTWARE_UPDATE, "AutomaticDownload").as_deref(),
+        Some("1")
+    );
+    assert_eq!(preference(&mac, COMMERCE, "AutoUpdate"), None);
+    assert!(!mac.path(RECORD).exists());
+}
+
+/// Catches: a revert that trusts a command's exit status instead of reading the setting
+/// back: a command can exit 0 and leave the value as it was.
+#[test]
+fn a_restore_that_does_not_take_keeps_the_record() {
+    let mut mac = FakeMac::fresh("revert-no-effect");
+    assert_eq!(apply_keys(&mac, Some("power_womp")).failed, 0);
+    mac.state_mut().no_effect = vec!["pmset -a womp ".into()];
+    let (out, status) = revert_verb(&mac).unwrap();
+    assert_eq!(
+        out,
+        format!(
+            "FAIL power_womp: womp is 1 after pmset -a womp 0, want 0\nNOTE record: kept {RECORD}: 1 setting is not put back; revert again once it can be\n"
+        )
+    );
+    assert_eq!(status, 1);
+    assert_eq!(fs::read_to_string(mac.path(RECORD)).unwrap(), FRESH_RECORD);
+    assert_eq!(reverted(&mac), Vec::<String>::new());
+}
+
+/// Catches: a revert that takes a record it cannot read for an empty one, or takes an
+/// empty record, or one without some of the settings, as nothing to restore for them,
+/// and moves it aside: the values from before kbf are then lost (the next apply records
+/// kbf's own). Each is refused with what is wrong, nothing is changed, and the record
+/// stays as it was.
+#[test]
+fn revert_refuses_an_empty_unreadable_or_incomplete_record() {
+    let mut mac = FakeMac::fresh("revert-incomplete");
+    mac.mkdir(RECORD_DIR);
+    let without = |keys: &[&str]| -> String {
+        FRESH_RECORD
+            .lines()
+            .filter(|l| !keys.iter().any(|k| l.contains(&format!("\t{k}\t"))))
+            .map(|l| format!("{l}\n"))
+            .collect()
+    };
+    for (text, mode, want) in [
+        (
+            String::new(),
+            0o600,
+            format!("{RECORD} is empty: no setting to revert, so it stays"),
+        ),
+        (
+            FRESH_RECORD.to_owned(),
+            0o000,
+            format!("cannot read {RECORD}: "),
+        ),
+        (
+            without(&["womp", "AutoUpdate"]),
+            0o600,
+            format!(
+                "{RECORD} does not hold womp, com.apple.commerce AutoUpdate: revert restores every recorded setting or none"
+            ),
+        ),
+    ] {
+        mac.write(RECORD, &text);
+        mac.chmod(RECORD, mode);
+        mac.own(RECORD, 0, 0);
+        mac.log.borrow_mut().clear();
+        let refused = revert_verb(&mac);
+        assert!(
+            mac.path(RECORD).exists(),
+            "{want}: the record was moved aside: {refused:?}"
+        );
+        mac.chmod(RECORD, 0o600);
+        let e = refused.unwrap_err();
+        assert!(e.starts_with(&want), "{want}: {e}");
+        assert_eq!(mac.writes(), Vec::<String>::new(), "{want}");
+        assert_eq!(fs::read_to_string(mac.path(RECORD)).unwrap(), text);
+        assert_eq!(reverted(&mac), Vec::<String>::new(), "{want}");
+    }
 }
