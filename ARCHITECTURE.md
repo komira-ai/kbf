@@ -89,7 +89,7 @@ what lets a simulation seed replay a run exactly (see [Testing](#testing)).
 
 | Crate | Pure | What it holds |
 |---|---|---|
-| `kbf-types` | yes | digests, platforms, QoS levels, lease ids, farm time, the `StateMachine` trait and `Effect` enum |
+| `kbf-types` | yes | digests, images by manifest digest (`ImageRef`), platforms, QoS levels, lease ids, farm time, the `StateMachine` trait and `Effect` enum |
 | `kbf-sched` | yes | the scheduler state machine and the fence constants |
 | `kbf-meta` | yes | the metadata state machine: CAS index, action cache, closure check, retention |
 | `kbf-segments` | yes | the segment format and FastCDC chunking |
@@ -111,7 +111,7 @@ what lets a simulation seed replay a run exactly (see [Testing](#testing)).
 | `kbf-mac-session` | no | the Mac's root helper that gives every lease its own throwaway user, admits an administrator only with the MDM gate's signed grant, switches the GUI session to a lease user (auto-login, then a userspace restart) and resets it at boot ([fleet-updates-security.md](docs/design/fleet-updates-security.md) S4.2, S4.3, S5.2); serves on macOS only |
 | `kbf-guest` | no | the agent inside a macOS VM guest ([macos-vms.md](docs/design/macos-vms.md) section 6): a versioned protocol over a Unix socket, one command per boot behind a per-boot token, its process group killed on exit, `Kill` or timeout; the virtio socket and the VM driver that calls it are **planned** |
 | `kbf-vmm` | no | the VM helper for macOS VM leases ([macos-vm-guests.md](docs/design/macos-vm-guests.md)): a **stub** that answers `--version` only, the one binary the signing scripts' entitlement allow list gives an entitlement (`com.apple.security.virtualization`); the VM code is **planned** |
-| `kbf-deploy` | no | the core of the deploy tool, a library only: a plan of steps (write a file, make a directory, remove, run a tool by absolute path with an empty environment, wait for an HTTP URL), printed as `DRY-RUN:` lines by default and carried out only in apply mode; a file or directory step is planned only when the host differs, so a re-run after an apply plans nothing; closed-key `KEY=VALUE` config files; a root plan applies only as root, from a binary root alone can replace, and a user plan never as root. No deploy subcommand exists yet |
+| `kbf-deploy` | no | the deploy tool. Its core: a plan of steps (write a file, make a directory, remove, run a tool by absolute path with an empty environment, wait for an HTTP URL), printed as `DRY-RUN:` lines by default and carried out only in apply mode; a file or directory step is planned only when the host differs, so a re-run after an apply plans nothing; closed-key `KEY=VALUE` config files; a root plan applies only as root, from a binary root alone can replace, and a user plan never as root. Its unit reader (`unit`) is the one the docs check uses, and `template` is strict `@KEY@` substitution. One kit so far, `linux`: `render-units` renders a converged storage node's systemd units from compiled-in templates and `check-units` checks them against the host's priorities ([storage-node.md](docs/deploy/storage-node.md)); nothing installs them yet |
 | `kbf-sim` | no | the deterministic simulation kernel |
 | `kbf-it` | no | integration tests, repository lints, the end-to-end harness |
 | `kbf-coverage` | no | the coverage ratchet CI runs |

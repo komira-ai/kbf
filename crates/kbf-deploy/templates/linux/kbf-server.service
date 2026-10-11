@@ -1,0 +1,41 @@
+# Rendered by `kbf-deploy linux render-units`; installed as
+# /etc/systemd/system/kbf-server.service (kbf docs/deploy/storage-node.md).
+[Unit]
+Description=kbf build farm server
+Wants=network-online.target
+After=network-online.target @MINIO_UNIT@
+
+[Service]
+# Not the daemon's user: builds must not read the operator API token.
+User=@KBF_SERVER_USER@
+Slice=kbf.slice
+# kbf-server's peak use (KBF_SERVER_RESERVATION_GIB).
+MemoryMin=@SERVER_MEMORY_MIN@
+# A server answering from swap would slow every build at once.
+MemorySwapMax=0
+# Above MinIO's -950, below the daemon's -900.
+OOMScoreAdjust=-925
+CPUWeight=300
+# AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY of the bucket's MinIO service account,
+# mode 0600: a secret never goes on the command line.
+EnvironmentFile=@KBF_ETC@/s3.env
+ExecStart=@KBF_BIN_DIR@/kbf-server \
+    --store=s3 \
+    --s3-endpoint=@MINIO_S3_ENDPOINT@ \
+    --s3-bucket=@KBF_S3_BUCKET@ \
+    --s3-conditional-put \
+@SERVER_META_LOG_ARGS@
+    --listen=@KBF_LISTEN_HOST@:@KBF_REAPI_PORT@ \
+    --reapi-tls-cert=@KBF_ETC@/reapi.pem \
+    --reapi-tls-key=@KBF_ETC@/reapi.key \
+    --worker-listen=@KBF_LISTEN_HOST@:@KBF_WORKER_PORT@ \
+    --worker-tls-cert=@KBF_ETC@/worker.pem \
+    --worker-tls-key=@KBF_ETC@/worker.key \
+    --worker-client-ca=@KBF_ETC@/ca.pem \
+    --worker-deny-list=@KBF_ETC@/deny-list \
+    --api-listen=127.0.0.1:@KBF_API_PORT@ \
+    --api-token-file=@KBF_ETC@/api-token
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

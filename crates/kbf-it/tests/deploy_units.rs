@@ -255,3 +255,37 @@ fn the_units_keep_the_priority_order() {
         "CPUWeight= must fall: {cpu:?}"
     );
 }
+
+#[test]
+fn the_rendered_server_unit_parses_with_kbf_servers_parser() {
+    // Catches: a `kbf-deploy linux` template naming a kbf-server flag the binary does
+    // not have, or rendering a value it refuses (a listen address without its port,
+    // an unbracketed IPv6 literal). With KBF_META_LOG=raft the only flags it refuses
+    // are the two the storage-node doc lists as planned.
+    use kbf_deploy::linux::{LinuxConfig, Templates, render::render};
+    use kbf_deploy::unit::UnitFile;
+
+    let example = include_str!("../../kbf-deploy/templates/linux/config.example");
+    for (from, to) in [
+        ("KBF_META_LOG=raft", "KBF_META_LOG=memory"),
+        (
+            "KBF_LISTEN_ADDRESS=192.0.2.10",
+            "KBF_LISTEN_ADDRESS=2001:db8::10",
+        ),
+        ("KBF_META_LOG=raft", "KBF_META_LOG=raft"),
+    ] {
+        assert!(example.contains(from), "{from}");
+        let c = LinuxConfig::parse(&example.replace(from, to)).expect("valid settings");
+        let units = render(&c, Some(1500), &Templates::BUILT_IN).expect("renders");
+        let server = UnitFile::parse(&units.server).expect("a unit");
+        let argv = server.exec_start();
+        let (planned, rest): (Vec<&str>, Vec<&str>) = argv
+            .iter()
+            .partition(|w| w.starts_with("--meta-log=") || w.starts_with("--raft-dir="));
+        let want_planned = if to.ends_with("memory") { 0 } else { 2 };
+        assert_eq!(planned.len(), want_planned, "{to}: {argv:?}");
+        if let Err(e) = Args::try_parse_from(&rest) {
+            panic!("{to}: kbf-server refuses the rendered ExecStart=:\n{e}");
+        }
+    }
+}

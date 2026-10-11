@@ -8,11 +8,17 @@
 //! non-blank line above is `` `/etc/systemd/system/<file>`: ``. An `ini` block without
 //! that line is an error, so an example cannot escape the check by losing its name.
 //!
+//! Each unit body is read with `kbf_deploy::unit`, the parser `kbf-deploy linux
+//! check-units` reads rendered units with, so the docs and the deploy tool agree on
+//! what a unit says.
+//!
 //! The examples write host-specific values as placeholders (`<node id>`); [`argv`]
 //! replaces each with a sample value from [`PLACEHOLDERS`], and a placeholder missing
 //! from that table is an error rather than a word passed through.
 
 use std::fmt;
+
+use kbf_deploy::unit::{self, UnitFile};
 
 /// Sample values for the placeholders the deploy docs use in an `ExecStart=`.
 pub const PLACEHOLDERS: &[(&str, &str)] = &[
@@ -31,19 +37,15 @@ pub struct Unit {
     pub path: String,
     /// The `## ` heading the unit sits under (`""` before the first).
     pub section: String,
-    /// `Key=value` lines in order, `\` continuations joined, comments and section
-    /// headers left out.
-    pub directives: Vec<(String, String)>,
+    /// The unit file in the block, read by `kbf_deploy::unit`.
+    pub file: UnitFile,
 }
 
 impl Unit {
-    /// The value of the last `key=` line, as systemd reads a key given once.
+    /// The value of the last `key=` line in any section, as systemd reads a key given
+    /// once.
     pub fn get(&self, key: &str) -> Option<&str> {
-        self.directives
-            .iter()
-            .rev()
-            .find(|(k, _)| k == key)
-            .map(|(_, v)| v.as_str())
+        self.file.get(key)
     }
 
     /// The `ExecStart=` command line split at whitespace, with its placeholders
@@ -62,6 +64,8 @@ pub enum UnitError {
     Unclosed(usize),
     /// A placeholder [`PLACEHOLDERS`] does not have.
     Placeholder(String),
+    /// A unit body (its `ini` block at this line) that is not a unit file.
+    Body(usize, unit::UnitError),
 }
 
 impl fmt::Display for UnitError {
@@ -75,6 +79,7 @@ impl fmt::Display for UnitError {
             UnitError::Placeholder(p) => {
                 write!(f, "placeholder {p} has no sample value in PLACEHOLDERS")
             }
+            UnitError::Body(line, e) => write!(f, "the ini block at line {line}: {e}"),
         }
     }
 }
@@ -101,10 +106,12 @@ pub fn units(markdown: &str) -> Result<Vec<Unit>, UnitError> {
             .iter()
             .position(|l| l.trim() == "```")
             .ok_or(UnitError::Unclosed(i + 1))?;
+        let body = lines[i + 1..i + 1 + len].join("\n");
+        let file = UnitFile::parse(&body).map_err(|e| UnitError::Body(i + 1, e))?;
         out.push(Unit {
             path: path.to_owned(),
             section: section.to_owned(),
-            directives: directives(&lines[i + 1..i + 1 + len]),
+            file,
         });
         i += len + 2;
     }
@@ -117,28 +124,6 @@ fn unit_path<'a>(above: &[&'a str]) -> Option<&'a str> {
     line.strip_prefix("`/etc/systemd/system/")
         .and_then(|rest| rest.strip_suffix("`:"))
         .map(|_| &line[1..line.len() - 2])
-}
-
-/// The `Key=value` lines of a unit's body.
-fn directives(body: &[&str]) -> Vec<(String, String)> {
-    let mut out = Vec::new();
-    let mut pending = String::new();
-    for line in body.iter().map(|l| l.trim()) {
-        let skip = pending.is_empty() && (line.starts_with('#') || line.starts_with('['));
-        if skip || line.is_empty() {
-            continue;
-        }
-        match line.strip_suffix('\\') {
-            Some(head) => pending.push_str(head),
-            None => {
-                pending.push_str(line);
-                let (k, v) = pending.split_once('=').unwrap_or((pending.as_str(), ""));
-                out.push((k.to_owned(), v.to_owned()));
-                pending.clear();
-            }
-        }
-    }
-    out
 }
 
 /// A command line with each `<placeholder>` replaced with its sample value, then split
@@ -228,19 +213,19 @@ ExecStart=/usr/local/bin/b \\
 
     #[test]
     fn units_are_named_split_into_directives_and_placed_under_their_section() {
-        // Catches: a unit read without its path or section, a comment or `[Service]`
-        // header taken as a directive, a continuation not joined, `Environment=X=1`
-        // split at the wrong `=`.
+        // Catches: a unit read without its path or section, or its body not handed whole
+        // to the unit parser (`kbf_deploy::unit` tests the parsing itself).
         let units = units(DOC).expect("units");
         assert_eq!(units.len(), 2);
         assert_eq!(units[0].path, "/etc/systemd/system/a.slice");
         assert_eq!(units[0].section, "");
-        assert_eq!(units[0].directives, [("MemoryMin".into(), "1G".into())]);
+        assert_eq!(units[0].get("MemoryMin"), Some("1G"));
+        assert_eq!(units[0].file.directives().len(), 1);
         let b = &units[1];
         assert_eq!(b.section, "Second");
         assert_eq!(b.get("Environment"), Some("X=1"));
         assert_eq!(b.get("Nothing"), None);
-        assert_eq!(b.directives.len(), 4);
+        assert_eq!(b.file.directives().len(), 4);
         assert_eq!(units[0].exec_start(), None);
     }
 
@@ -293,6 +278,14 @@ ExecStart=/usr/local/bin/b \\
         assert_eq!(units(unclosed), Err(UnitError::Unclosed(2)));
         assert!(UnitError::Unnamed(3).to_string().contains("line 3"));
         assert!(UnitError::Unclosed(2).to_string().contains("never closes"));
+        // A body the unit parser refuses is an error naming the block, not a unit with
+        // its garbled line dropped.
+        let garbled = "`/etc/systemd/system/a.service`:\n```ini\n[Service]\nMemoryMin 1G\n```\n";
+        let e = units(garbled).err().map(|e| e.to_string());
+        assert_eq!(
+            e.as_deref(),
+            Some("the ini block at line 2: line 2: not [Section], a comment or Key=value")
+        );
     }
 
     #[test]
