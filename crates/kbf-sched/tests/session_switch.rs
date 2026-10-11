@@ -80,6 +80,7 @@ impl Harness {
         let effects = self.feed(Event::WorkerUp {
             worker: w(name),
             instance: DaemonInstance::new(instance),
+            predecessor_stopped: false,
             capacity: MAC,
             caps,
         });

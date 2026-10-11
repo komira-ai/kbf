@@ -578,6 +578,7 @@ impl World {
         let event = Event::WorkerUp {
             worker: n.name.clone(),
             instance: DaemonInstance::new(format!("{}#{}", n.name.as_str(), n.process)),
+            predecessor_stopped: false,
             capacity: n.capacity,
             caps: n.caps.clone(),
         };

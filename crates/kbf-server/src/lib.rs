@@ -43,6 +43,7 @@ pub mod blobs;
 mod build_commit;
 pub mod config;
 pub mod farm;
+mod fault;
 pub mod fleet;
 pub mod grpc_health;
 pub mod health;

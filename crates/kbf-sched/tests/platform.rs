@@ -90,6 +90,7 @@ impl Harness {
         let event = Event::WorkerUp {
             worker: w(name),
             instance: DaemonInstance::new(name),
+            predecessor_stopped: false,
             capacity: Resources::new(4_000, 8 * GIB),
             caps,
         };
@@ -285,6 +286,7 @@ fn work_larger_than_every_matching_worker_is_unservable() {
     let event = Event::WorkerUp {
         worker: w("gpu"),
         instance: DaemonInstance::new("gpu"),
+        predecessor_stopped: false,
         capacity: Resources::new(4_000, 8 * GIB).with_gpus(1),
         caps: linux(),
     };
@@ -328,6 +330,7 @@ fn a_vm_lease_waits_for_a_node_with_a_vm_slot() {
     let event = Event::WorkerUp {
         worker: w("b-mac"),
         instance: DaemonInstance::new("b-mac"),
+        predecessor_stopped: false,
         capacity: Resources::new(4_000, 8 * GIB).with_vms(1),
         caps: mac(),
     };
@@ -459,6 +462,7 @@ fn work_behind_a_full_round_still_starts_its_wait() {
     let event = Event::WorkerUp {
         worker: w("linux"),
         instance: DaemonInstance::new("linux"),
+        predecessor_stopped: false,
         capacity: Resources::new(1_000_000, 1_000 * GIB),
         caps: linux(),
     };

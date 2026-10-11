@@ -189,6 +189,8 @@ message WorkerUp {
   string instance = 2;
   Resources capacity = 3;
   NodeCaps caps = 4;
+  // The predecessor of `instance` was proven stopped (kbf.worker.v1 Hello).
+  bool predecessor_stopped = 5;
 }
 
 // A registered worker's capacity or capabilities changed on the same stream.
@@ -445,4 +447,8 @@ enum Failure {
   FAILURE_OUT_OF_MEMORY = 4;
   FAILURE_NODE_MEMORY_PRESSURE = 5;
   FAILURE_MISSING_INPUT = 6;
+  // The farm lost the run: the daemon restarted while the action ran.
+  FAILURE_LOST_DAEMON_RESTARTED = 7;
+  // The farm lost the run: the node fenced it.
+  FAILURE_LOST_FENCED = 8;
 }

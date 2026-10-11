@@ -31,8 +31,8 @@ use kbf_proto::kbf::log::v1 as proto;
 use kbf_sched::{DaemonInstance, Request};
 use kbf_types::{
     ActionKey, ControlRecord, Digest, DigestFunction, Failure, FarmTime, LeaseGrant, LeaseId,
-    LeaseKind, OperationId, Outcome, Qos, QosError, RefusalRecord, Resources, ResultRecord,
-    WorkerId,
+    LeaseKind, LostWhy, OperationId, Outcome, Qos, QosError, RefusalRecord, Resources,
+    ResultRecord, WorkerId,
 };
 use prost::Message;
 
@@ -215,6 +215,8 @@ impl Rng {
             Failure::OutOfMemory,
             Failure::NodeMemoryPressure,
             Failure::MissingInput,
+            Failure::Lost(LostWhy::DaemonRestarted),
+            Failure::Lost(LostWhy::Fenced),
         ];
         if self.below(2) == 0 {
             Outcome::Completed {
@@ -249,6 +251,7 @@ impl Rng {
             0 => FarmInput::WorkerUp {
                 worker: self.worker(),
                 instance: DaemonInstance::new(self.name()),
+                predecessor_stopped: self.below(2) == 0,
                 capacity: self.resources(),
                 caps: self.caps(),
             },

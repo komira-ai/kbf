@@ -7,7 +7,7 @@
 //! largest node that could run it: its callers get FAILED_PRECONDITION, the
 //! `status.message` saying the action needs more memory than any node offers, and a
 //! `google.rpc.ErrorInfo` of reason [`OUT_OF_MEMORY_REASON`]. One finished by a busy
-//! node's kills has used its farm reruns: INTERNAL, naming the node.
+//! node's kill has used its farm reruns: `crate::fault` answers it, as every farm fault.
 
 use kbf_front::{ERROR_DOMAIN, Finished};
 use kbf_proto::google::rpc::{self, ErrorInfo};
@@ -50,48 +50,37 @@ pub(crate) fn pressure(node: &WorkerId, kills: u64) {
     );
 }
 
-/// What the callers of an operation the scheduler finished with `failure`, a memory
-/// kill, are told; `runs` are its runs killed for memory, oldest first.
-pub(crate) fn finished(failure: Failure, runs: &[MemoryRun]) -> Finished {
+/// What the callers of an operation the scheduler finished with
+/// [`Failure::OutOfMemory`] are told; `runs` are its runs killed for memory, oldest
+/// first.
+pub(crate) fn finished(runs: &[MemoryRun]) -> Finished {
     let last = runs.last();
     let node = last.map_or("", |r| r.worker.as_str());
     let booked = Gib(last.map_or(0, |r| r.booked));
     let list: Vec<String> = runs.iter().map(run).collect();
     let runs_text = format!("Runs: {} ({})", runs.len(), list.join(", "));
-    if failure == Failure::OutOfMemory {
-        let message = format!(
-            "kbf: the action needs more memory than any node offers: it passed its memory \
-             limit with {booked} booked on {node}, the largest node for its platform. \
-             {runs_text}."
-        );
-        let info = ErrorInfo {
-            reason: OUT_OF_MEMORY_REASON.to_owned(),
-            domain: ERROR_DOMAIN.to_owned(),
-            metadata: [
-                ("node".to_owned(), node.to_owned()),
-                ("booked_bytes".to_owned(), booked.0.to_string()),
-            ]
-            .into(),
-        };
-        let detail = prost_types::Any {
-            type_url: "type.googleapis.com/google.rpc.ErrorInfo".to_owned(),
-            value: info.encode_to_vec(),
-        };
-        return Finished::Failed(rpc::Status {
-            code: Code::FailedPrecondition as i32,
-            message,
-            details: vec![detail],
-        });
-    }
     let message = format!(
-        "kbf farm fault on {node}: the node killed the action for memory while it was under \
-         its own limit (node memory pressure), and its reruns are used up. Operator fix: \
-         find what else holds memory on the node. {runs_text}."
+        "kbf: the action needs more memory than any node offers: it passed its memory \
+         limit with {booked} booked on {node}, the largest node for its platform. \
+         {runs_text}."
     );
+    let info = ErrorInfo {
+        reason: OUT_OF_MEMORY_REASON.to_owned(),
+        domain: ERROR_DOMAIN.to_owned(),
+        metadata: [
+            ("node".to_owned(), node.to_owned()),
+            ("booked_bytes".to_owned(), booked.0.to_string()),
+        ]
+        .into(),
+    };
+    let detail = prost_types::Any {
+        type_url: "type.googleapis.com/google.rpc.ErrorInfo".to_owned(),
+        value: info.encode_to_vec(),
+    };
     Finished::Failed(rpc::Status {
-        code: Code::Internal as i32,
+        code: Code::FailedPrecondition as i32,
         message,
-        details: Vec::new(),
+        details: vec![detail],
     })
 }
 

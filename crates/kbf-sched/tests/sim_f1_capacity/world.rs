@@ -185,6 +185,7 @@ impl World {
         for spec in world.fleet.clone() {
             world.feed(Event::WorkerUp {
                 instance: DaemonInstance::new(spec.name.as_str()),
+                predecessor_stopped: false,
                 worker: spec.name,
                 capacity: spec.capacity,
                 caps: caps(spec.node),

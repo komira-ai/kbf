@@ -81,6 +81,7 @@ impl World {
             w.feed(Event::WorkerUp {
                 worker: WorkerId::new(name),
                 instance: DaemonInstance::new(name),
+                predecessor_stopped: false,
                 capacity: Resources::new(4_000, 8 * GIB),
                 caps,
             });

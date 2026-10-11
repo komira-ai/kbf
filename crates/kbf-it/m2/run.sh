@@ -25,8 +25,17 @@
 # 4. `//:pause`, under a fresh salt so it runs, holds a lease for its sleep: while
 #    the build waits, Podman lists exactly one running container labelled with the
 #    daemon's node id, and the build takes at least the sleep.
-# 5. Afterwards no container so labelled is left and the lease scratch directory is
-#    empty.
+# 5. Afterwards no container so labelled is left and the lease scratch directory holds
+#    nothing but the daemon's claim on it (`daemon-instance`).
+# 6. A daemon killed mid-lease is rerun at once (issue #22): `//:pause`, under a fresh
+#    salt, holds a lease; the daemon is killed (SIGKILL to its main process) and a new
+#    one started on the same scratch directory, which names the killed one as its
+#    predecessor. The server's log holds exactly one `Restarted` requeue, logged less
+#    than 10 s after the new daemon was welcomed (the handover grace it replaces is
+#    45 s), the build succeeds with every command remote, and step 5 holds again. With
+#    systemd's default KillMode the killed unit's own processes, the container among
+#    them, are killed by systemd, so this exercises the sweep, the predecessor claim
+#    and the server's rerun, not the keeper.
 # Each buck2 build is bounded by --build-timeout seconds, so a farm that reruns an
 # action without end fails here instead of at the job's timeout.
 #
@@ -64,14 +73,14 @@ node=cell-node-1
 unit=kbf-m2-daemon
 mkdir -p "$logs" "$leases"
 pids=()
-unit_started=''
+units=()
 
 stop() {
     local status=$?
     [ -d "$project" ] && (cd "$project" && "$buck2" kill >/dev/null 2>&1 || true)
-    if [ -n "$unit_started" ]; then
-        sudo systemctl stop "$unit" || true
-    fi
+    for u in "${units[@]}"; do
+        sudo systemctl stop "$u" || true
+    done
     for pid in "${pids[@]}"; do
         kill -INT "$pid" 2>/dev/null || true
     done
@@ -119,23 +128,32 @@ grep ' reapi=' "$logs/server.out" || { echo "kbf-server did not start" >&2; exit
 
 # The daemon as a build host runs it: a service with its own delegated cgroup, as
 # this user, its stderr appended to daemon.err. Its leases may use 8 GiB together.
+# `start_daemon UNIT` starts one as unit UNIT and waits until the server welcomes it.
 : >"$logs/daemon.err"
-sudo systemd-run --quiet --collect --unit="$unit" --slice=kbf-daemon.slice \
-    -p Delegate=yes -p OOMScoreAdjust=-900 \
-    -p StandardError="append:$logs/daemon.err" \
-    --uid="$(id -u)" --gid="$(id -g)" --working-directory="$work" \
-    -E HOME="$HOME" -E PATH="$PATH" -E XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" \
-    "$bin_dir/kbf-daemon" --driver container \
-    --server https://127.0.0.1:8981 --cas https://127.0.0.1:8981 \
-    --ca-cert "$work/pki/ca.pem" --cert "$work/pki/client.pem" --key "$work/pki/client.key" \
-    --tls-server-name localhost --node-id "$node" --scratch "$leases" \
-    --actions-memory-max-gib 8
-unit_started=1
-for _ in $(seq 300); do
-    grep -q 'welcomed' "$logs/daemon.err" && break
-    sleep 0.1
-done
-grep -q 'welcomed' "$logs/daemon.err" || { echo "the daemon did not join" >&2; exit 1; }
+welcomed() {
+    sed 's/\x1b\[[0-9;]*m//g' "$logs/daemon.err" | grep -c 'welcomed' || true
+}
+start_daemon() {
+    local before
+    before=$(welcomed)
+    sudo systemd-run --quiet --collect --unit="$1" --slice=kbf-daemon.slice \
+        -p Delegate=yes -p OOMScoreAdjust=-900 \
+        -p StandardError="append:$logs/daemon.err" \
+        --uid="$(id -u)" --gid="$(id -g)" --working-directory="$work" \
+        -E HOME="$HOME" -E PATH="$PATH" -E XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" \
+        "$bin_dir/kbf-daemon" --driver container \
+        --server https://127.0.0.1:8981 --cas https://127.0.0.1:8981 \
+        --ca-cert "$work/pki/ca.pem" --cert "$work/pki/client.pem" --key "$work/pki/client.key" \
+        --tls-server-name localhost --node-id "$node" --scratch "$leases" \
+        --actions-memory-max-gib 8
+    units+=("$1")
+    for _ in $(seq 300); do
+        [ "$(welcomed)" -gt "$before" ] && break
+        sleep 0.1
+    done
+    [ "$(welcomed)" -gt "$before" ] || { echo "the daemon did not join" >&2; exit 1; }
+}
+start_daemon "$unit"
 echo "daemon joined"
 
 build() {
@@ -205,15 +223,64 @@ if [ $((end_ms - start_ms)) -lt $((secs * 1000)) ]; then
 fi
 echo "OK: //:pause took $((end_ms - start_ms)) ms"
 
-# 5. Nothing left behind (a few seconds allowed for the clean step to end).
-for _ in $(seq 100); do
-    left=$(containers -a)
-    [ "$left" -eq 0 ] && [ -z "$(ls -A "$leases")" ] && break
+# 5. Nothing left behind (a few seconds allowed for the clean step to end) but the
+# daemon's claim on the scratch directory.
+leases_left() {
+    ls -A "$leases" | grep -vx 'daemon-instance' || true
+}
+nothing_left() {
+    for _ in $(seq 100); do
+        left=$(containers -a)
+        [ "$left" -eq 0 ] && [ -z "$(leases_left)" ] && break
+        sleep 0.1
+    done
+    [ "$left" -eq 0 ] || { echo "FAIL: $left containers labelled kbf.owner=$node are left" >&2; exit 1; }
+    if [ -n "$(leases_left)" ]; then
+        echo "FAIL: the lease scratch directory holds more than the claim: $(leases_left)" >&2
+        exit 1
+    fi
+    echo "OK: no container and no lease directory left"
+}
+nothing_left
+
+# 6. The daemon killed mid-lease, and its lease run again at once.
+restarted() {
+    sed 's/\x1b\[[0-9;]*m//g' "$logs/server.err" | grep -cF \
+        'the daemon restarted, and its successor killed the run before registering' || true
+}
+salt=$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')
+before=$(leases_started)
+(cd "$project" && timeout "$build_timeout" "$buck2" build --console simple \
+    -c kbf_m2.sleep_secs=20 -c kbf_m2.salt="$salt" //:pause) \
+    >"$logs/buck2-restart.log" 2>&1 &
+restart_build=$!
+pids+=("$restart_build")
+for _ in $(seq 600); do
+    [ "$(leases_started)" -gt "$before" ] && break
     sleep 0.1
 done
-[ "$left" -eq 0 ] || { echo "FAIL: $left containers labelled kbf.owner=$node are left" >&2; exit 1; }
-if [ -n "$(ls -A "$leases")" ]; then
-    echo "FAIL: the lease scratch directory is not empty: $(ls -A "$leases")" >&2
+[ "$(leases_started)" -gt "$before" ] || { echo "FAIL: //:pause did not start" >&2; exit 1; }
+sudo systemctl kill --kill-whom=main -s SIGKILL "$unit"
+echo "killed the daemon mid-lease"
+start_daemon "$unit-2"
+welcomed_ms=$(date +%s%3N)
+for _ in $(seq 150); do
+    [ "$(restarted)" -ge 1 ] && break
+    sleep 0.1
+done
+requeued_ms=$(date +%s%3N)
+if [ "$(restarted)" -ne 1 ]; then
+    echo "FAIL: the server logged $(restarted) restart requeues, not one" >&2
     exit 1
 fi
-echo "OK: no container and no lease directory left"
+if [ $((requeued_ms - welcomed_ms)) -ge 10000 ]; then
+    echo "FAIL: the lease was requeued $((requeued_ms - welcomed_ms)) ms after the welcome" >&2
+    exit 1
+fi
+echo "OK: the killed daemon's lease was requeued within $((requeued_ms - welcomed_ms)) ms"
+wait "$restart_build" || { cat "$logs/buck2-restart.log" >&2; echo "FAIL: //:pause failed after the restart" >&2; exit 1; }
+cat "$logs/buck2-restart.log"
+grep -Eq 'Commands: [0-9]+ \(cached: [0-9]+, remote: [1-9][0-9]*, local: 0\)' "$logs/buck2-restart.log" ||
+    { echo "FAIL: the build after the restart ran a command locally, or none remotely" >&2; exit 1; }
+echo "OK: //:pause succeeded on the farm after its daemon was killed"
+nothing_left
