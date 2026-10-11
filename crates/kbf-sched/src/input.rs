@@ -67,6 +67,12 @@ impl DaemonInstance {
         Self(id.into())
     }
 
+    /// The id, as the daemon sent it; empty for a daemon that predates the field.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
     /// Whether this and `other` are known to be one daemon process.
     #[must_use]
     pub fn same_as(&self, other: &Self) -> bool {

@@ -221,13 +221,15 @@ and what it logs at start are as on a build host
 
 ## Planned: the Raft log on local disk
 
-`kbf-server` keeps its metadata in memory today
-([deployment-topology.md](../design/deployment-topology.md#built-and-planned)). These
-flags are planned and not accepted yet; the unit above gains them once they are built:
+`kbf-server` keeps its metadata in memory by default
+([deployment-topology.md](../design/deployment-topology.md#built-and-planned)).
+`--meta-log=raft --raft-dir=/var/lib/kbf-server/raft` is accepted (with `--store=s3`)
+but is not in the unit above yet: until the scheduler's state is in the log too, a
+restart over it keeps the daemons' epoch but not the server's leases, so the old runs
+go on as orphans whose results are refused. This flag is planned and not accepted yet;
+the unit gains all three once both are built:
 
 ```text planned-flags kbf-server
---meta-log=raft
---raft-dir=/var/lib/kbf-server/raft
 --runtime-dir=/run/kbf
 ```
 
@@ -243,7 +245,7 @@ flags are planned and not accepted yet; the unit above gains them once they are 
 ## What the tests check
 
 - `crates/kbf-it/tests/deploy_units.rs` runs `kbf-server`'s flag parser over the
-  `ExecStart=` of every server unit in `docs/deploy/`, checks that each planned flag
+  `ExecStart=` of every server unit in `docs/deploy/`, checks that the planned flag
   above is still refused, that the worked example adds up and matches the converged
   daemon's `--actions-memory-max-gib`, and that the units keep the
   [priority](#priorities) order.

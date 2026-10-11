@@ -13,6 +13,13 @@ publish.workspace = true
 name = "kbf-daemon"
 path = "src/main.rs"
 
+# A stand-in `podman` for tests/binary.rs (the container driver's start-up checks).
+# Not shipped: the release jobs package the kbf-daemon binary alone.
+[[bin]]
+name = "kbf-podman-stub"
+path = "src/bin/kbf-podman-stub.rs"
+test = false
+
 [dependencies]
 clap.workspace = true
 kbf-daemon.workspace = true

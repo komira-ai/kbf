@@ -6,10 +6,11 @@
 //! [`identity`](crate::identity) and issue #79; the capacity entries of the node report,
 //! and the entries placement matches platforms against: `arch` and the rest that
 //! [`caps`] reads), answered with `Welcome`, and registers the node: only this first
-//! `Hello` does (issue #25). `Welcome` names this process's term as its lease epoch
-//! (issue #137). The registration names the daemon process by the `Hello`'s
-//! `instance_id`: leases whose `Start` went to another process are given up only once it
-//! has fenced (issue #140). On the stream after that:
+//! `Hello` does (issue #25). `Welcome` names the farm's lease epoch
+//! ([`Farm::lease_epoch`]: this process's term, or the Raft log's id; issue #137).
+//! The registration names the daemon process by the `Hello`'s `instance_id`: leases
+//! whose `Start` went to another process are given up only once it has fenced (issue
+//! #140). On the stream after that:
 //! - a resent `Hello` whose `node_id` is not the stream's node, or that the deny list
 //!   now refuses, ends the stream with that error; otherwise it changes the node's
 //!   capacity and capabilities and nothing else;
@@ -129,7 +130,7 @@ where
             protocol_version: version,
             heartbeat_interval_ms: u64::try_from(self.heartbeat_interval.as_millis())
                 .unwrap_or(u64::MAX),
-            epoch: self.farm.term(),
+            epoch: self.farm.lease_epoch(),
         }));
         let (outbound, responses) = mpsc::unbounded_channel();
         let capacity = reported.capacity;

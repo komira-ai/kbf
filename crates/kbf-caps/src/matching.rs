@@ -114,6 +114,14 @@ pub(crate) const IOS_DEVICE_KEY: &str = "ios.device";
 /// compared exactly with the attribute of that name in a device's report entry.
 pub const DEVICE_ATTRIBUTES: [&str; 4] = ["class", "product_type", "os_version", "os_build"];
 
+/// The request key of each of [`DEVICE_ATTRIBUTES`], in the same order.
+const DEVICE_KEYS: [&str; 4] = [
+    "ios.device.class",
+    "ios.device.product_type",
+    "ios.device.os_version",
+    "ios.device.os_build",
+];
+
 /// Whether `key` is `ios.device` or `ios.device.<anything>`. `ios.devices` and
 /// `ios.simulator` are not device keys.
 pub(crate) fn is_ios_device_key(key: &str) -> bool {
@@ -438,6 +446,37 @@ impl Request {
     #[must_use]
     pub fn exact(&self, key: &str) -> Option<&str> {
         self.exact.get(key).map(String::as_str)
+    }
+
+    /// The properties that [`Self::parse`] reads as this request, one per requirement,
+    /// in a fixed order: `arch`, `isa_level`, each `cpu.feature`, the countable keys,
+    /// the exact keys, the membership keys (each group by key, a membership key with the
+    /// value as requested), then `ios.device=1` and each `ios.device.<attribute>` in
+    /// [`DEVICE_ATTRIBUTES`] order. `Request::parse(r.properties())` is `r`, so a
+    /// request can be written as these pairs and read back.
+    #[must_use]
+    pub fn properties(&self) -> Vec<(&str, String)> {
+        let mut out = Vec::new();
+        out.extend(self.arch.map(|a| ("arch", a.name().to_owned())));
+        out.extend(self.isa_level.map(|l| ("isa_level", l.name().to_owned())));
+        out.extend(self.features.iter().map(|f| ("cpu.feature", f.clone())));
+        out.extend(self.minimums.iter().map(|(c, n)| (c.name(), n.to_string())));
+        out.extend(self.exact.iter().map(|(k, v)| (k.as_str(), v.clone())));
+        out.extend(
+            self.members
+                .iter()
+                .map(|(k, (v, _))| (k.as_str(), v.clone())),
+        );
+        if let Some(attributes) = &self.device {
+            out.push((IOS_DEVICE_KEY, "1".to_owned()));
+            out.extend(
+                DEVICE_KEYS
+                    .into_iter()
+                    .zip(DEVICE_ATTRIBUTES)
+                    .filter_map(|(key, attribute)| Some((key, attributes.get(attribute)?.clone()))),
+            );
+        }
+        out
     }
 
     /// Whether the request asks for an iOS device (`ios.device=1`).

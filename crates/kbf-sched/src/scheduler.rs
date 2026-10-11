@@ -13,8 +13,8 @@ use std::time::Duration;
 use kbf_caps::NodeCaps;
 use kbf_types::{
     ActionKey, Answer, ControlRecord, Effect, Failure, FarmTime, LeaseGrant, LeaseId, LeaseKind,
-    MemoryRun, NodePhase, OperationId, Outcome, Qos, Refusal, RefusalRecord, Resources,
-    ResultRecord, StartLease, StateMachine, WaiterId, Waiting, WorkerId,
+    NodePhase, OperationId, Outcome, Qos, Refusal, RefusalRecord, Resources, ResultRecord,
+    StartLease, StateMachine, WaiterId, Waiting, WorkerId,
 };
 
 use crate::cordon::{Cordon, Cordons};
@@ -22,7 +22,7 @@ use crate::fence::{HANDOVER_GRACE, LEASE_GRACE, START_GRACE};
 use crate::input::{DaemonInstance, Event, Input, Request};
 use crate::requeue::{Requeue, RequeueReason};
 use crate::servable::{Servable, Verdict};
-use memory::{Floors, MEMORY_FLOORS};
+use memory::MemoryState;
 
 /// At most this many leases are granted per [`Event::Tick`] (one log flush per round).
 pub const PLACEMENT_ROUND: usize = 256;
@@ -64,10 +64,6 @@ struct Operation {
     /// While queued: since when, and why, no live worker can run it. `None` while one
     /// can.
     unservable: Option<Unservable>,
-    /// Its runs killed for memory, oldest first ([`memory`]).
-    memory_runs: Vec<MemoryRun>,
-    /// How many times it was run again after a busy node's memory kill.
-    farm_reruns: u32,
 }
 
 /// A queued operation no live worker can run: since when, why, and whether the wait
@@ -125,12 +121,11 @@ pub(crate) struct Worker {
     /// Until when leases whose `Start` went to an earlier process are kept: by then that
     /// process has fenced ([`HANDOVER_GRACE`] after it was last heard).
     handover_ends: FarmTime,
-    /// How many leases it killed for memory below the action's own limit.
-    memory_pressure: u64,
     /// What its newest `Hello` says it is doing.
     pub(crate) phase: NodePhase,
     /// Until when the lease of a `Preparing` or `Restoring` phase is kept while the
-    /// worker is silent ([`SESSION_SWITCH_GRACE`] after that phase was first reported).
+    /// worker is silent ([`crate::fence::SESSION_SWITCH_GRACE`] after that phase was
+    /// first reported).
     switch_ends: FarmTime,
 }
 
@@ -220,9 +215,10 @@ pub struct Scheduler {
     /// Queued whole-machine operations that fit nowhere, and the worker each holds:
     /// work after it in queue order is not placed there (see [`Scheduler::place`]).
     reservations: BTreeMap<OperationId, WorkerId>,
-    /// The memory floor of each action key that passed its own memory limit. Boxed:
-    /// most schedulers hold none, and the scheduler is moved by value.
-    floors: Box<Floors>,
+    /// The memory floors, each operation's memory kills and each node's busy-node
+    /// kills ([`memory`]). Boxed: most schedulers hold none, and the scheduler is
+    /// moved by value.
+    memory: Box<MemoryState>,
 }
 
 impl Scheduler {
@@ -245,7 +241,7 @@ impl Scheduler {
             finished: VecDeque::new(),
             requeues: None,
             reservations: BTreeMap::new(),
-            floors: Box::new(Floors::new(MEMORY_FLOORS)),
+            memory: Box::default(),
         }
     }
 
@@ -396,6 +392,7 @@ impl Scheduler {
         {
             self.finished.pop_front();
             self.ops.remove(&id);
+            self.memory.forget(id);
         }
     }
 
@@ -444,8 +441,6 @@ impl Scheduler {
                 committed_lease: None,
                 result_proposed: false,
                 unservable: None,
-                memory_runs: Vec::new(),
-                farm_reruns: 0,
             },
         );
         Vec::new()
@@ -853,7 +848,7 @@ impl Scheduler {
             lease: record.lease,
             waiters: op.waiters.clone(),
             outcome: record.outcome,
-            memory_runs: op.memory_runs.clone(),
+            memory_runs: self.memory.runs(id).to_vec(),
         })]
     }
 }
@@ -900,7 +895,6 @@ impl StateMachine for Scheduler {
                                 instance,
                                 process: 0,
                                 handover_ends: FarmTime::default(),
-                                memory_pressure: 0,
                                 phase: NodePhase::Serving,
                                 switch_ends: FarmTime::default(),
                             },

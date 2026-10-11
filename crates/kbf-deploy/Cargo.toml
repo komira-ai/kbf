@@ -1,0 +1,19 @@
+[package]
+name = "kbf-deploy"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# The core of the deploy tool: a plan of steps, printed by default and carried out with
+# `--apply`, through an `Exec` that is the host or a recording fake. The kits (envoy,
+# linux, minio, mdm, pilot, mac) are subcommands built on it; none exists yet.
+
+[dependencies]
+rustix = { workspace = true, features = ["process"] }
+thiserror.workspace = true
+
+[lints]
+workspace = true

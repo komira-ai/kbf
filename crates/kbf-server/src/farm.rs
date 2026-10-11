@@ -9,10 +9,22 @@
 //! **Single node.** The control log is this process: a record the scheduler asks to
 //! commit is committed as soon as it is appended, and fed straight back (see
 //! [`State::feed`]). The replicated log replaces exactly that step. Since the leases
-//! die with the process, each process grants them under its own term
-//! ([`process_term`]), which it also names as its lease epoch in `Welcome` (issue
-//! #137). Operations die with it too, so the term is part of every operation name
-//! (issue #154).
+//! die with the process, each process grants them under its own term, so a lease id
+//! names one lease ever and an earlier process's `Result` is refused (issue #137).
+//! Operations die with it too, so the term is part of every operation name (issue
+//! #154). The term, and the lease epoch `Welcome` names, come from the metadata log
+//! ([`MetaLog::leadership`]):
+//!
+//! - Under `--meta-log=memory` the log is this process's, so the term is a new
+//!   [`process_term`] and the epoch is the same number: every start names another
+//!   epoch, and a daemon kills the runs of the leases it held before.
+//! - Under `--meta-log=raft` the term is the Raft term the log elected this server in,
+//!   greater at every start, and the epoch is the log id, the same at every start over
+//!   one `--raft-dir`. A daemon that reconnects after a restart therefore keeps the
+//!   runs of its old leases, which this process never granted: until the scheduler's
+//!   state is in the log they are orphans, whose results are refused and which no
+//!   heartbeat cancels (docs/design/worker-protocol.md#server-restarts-and-the-lease-epoch
+//!   bounds the work booked beside them).
 //!
 //! **Placement in the log** (issue #166): each grant at debug level, and each lease
 //! the scheduler gives up at info, with the operation, the lease, the node and why.
@@ -64,7 +76,7 @@ use crate::stamp::Stamp;
 /// than every earlier process's, as the scheduler's lease order expects of a newer
 /// leader's. If it does step back, the new term still differs from an earlier one
 /// unless the restart lands on that one's very millisecond and the random bits match
-/// (one chance in 65 536). The replicated log's term replaces this once it is wired.
+/// (one chance in 65 536). Under `--meta-log=raft` the Raft term replaces it.
 #[must_use]
 pub fn process_term() -> u64 {
     let start = unix_ms();
@@ -84,9 +96,11 @@ pub struct StreamId(u64);
 #[derive(Debug)]
 pub struct Farm<M, O> {
     cache: Arc<Cache<M, O>>,
-    /// This process's scheduler term ([`process_term`]): every lease it grants carries
-    /// it, and `Welcome` names it as the lease epoch.
+    /// This process's scheduler term: every lease it grants carries it, and every
+    /// operation name it gives out names it.
     term: u64,
+    /// The lease epoch `Welcome` names: the term itself, or the Raft log's id.
+    lease_epoch: u64,
     epoch: Instant,
     /// The wall-clock time of `epoch`, in milliseconds since the Unix epoch: how farm
     /// times are shown to operators.
@@ -147,15 +161,14 @@ enum Detail {
 #[derive(Debug)]
 struct State {
     sched: Scheduler,
-    /// The callers' records, the finished operations whose callers are kept, and the
-    /// leases whose `Start` was sent.
+    /// The callers' records, the finished operations whose callers are kept, the
+    /// leases whose `Start` was sent, and the node registry.
     machine: FarmMachine,
     /// The channel of each caller the machine keeps, forgotten with its record.
     stages: BTreeMap<WaiterId, watch::Sender<Stage>>,
     next_stream: u64,
+    /// The newest stream of each node the machine has registered.
     links: BTreeMap<WorkerId, Link>,
-    /// Each node's newest `NodeStatus`, kept across its streams.
-    software: BTreeMap<WorkerId, SoftwareView>,
     /// Nodes whose drain has paused, once logged.
     paused: BTreeSet<WorkerId>,
 }
@@ -169,17 +182,26 @@ struct Settled {
 }
 
 impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
-    /// A farm over `cache`, with an empty scheduler of a new term ([`process_term`])
-    /// that refuses queued work once no live worker has been able to run it for
+    /// A farm over `cache`, with an empty scheduler of a new term that refuses queued work once no live worker has been able to run it for
     /// `unservable_wait`, and keeps a finished operation, which WaitExecution still
     /// answers, for `finished_retention`.
+    ///
+    /// The term and the lease epoch are those of the cache's metadata log
+    /// ([`MetaLog::leadership`]: its leader's term, and its id) if it has them, and a
+    /// new [`process_term`] for both otherwise (see the module docs).
     #[must_use]
     pub fn new(
         cache: Arc<Cache<M, O>>,
         unservable_wait: Duration,
         finished_retention: Duration,
     ) -> Self {
-        let term = process_term();
+        let (term, lease_epoch) = cache.meta().leadership().map_or_else(
+            || {
+                let term = process_term();
+                (term, term)
+            },
+            |log| (log.term, log.log_id.get()),
+        );
         let sched = Scheduler::new(term)
             .with_unservable_wait(unservable_wait)
             .with_finished_retention(finished_retention)
@@ -187,6 +209,7 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
         Self {
             cache,
             term,
+            lease_epoch,
             epoch: Instant::now(),
             epoch_unix_ms: unix_ms(),
             state: Mutex::new(State {
@@ -195,16 +218,21 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
                 stages: BTreeMap::new(),
                 next_stream: 0,
                 links: BTreeMap::new(),
-                software: BTreeMap::new(),
                 paused: BTreeSet::new(),
             }),
         }
     }
 
-    /// This process's scheduler term, which `Welcome` names as the lease epoch.
+    /// This process's scheduler term, which every lease it grants carries.
     #[must_use]
     pub const fn term(&self) -> u64 {
         self.term
+    }
+
+    /// The lease epoch `Welcome` names (see the module docs).
+    #[must_use]
+    pub const fn lease_epoch(&self) -> u64 {
+        self.lease_epoch
     }
 
     /// Farm time: milliseconds since this farm was built.
@@ -247,6 +275,7 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
             newest_beat: 0,
         };
         let replaced = state.links.insert(worker.clone(), link);
+        state.machine.register(worker);
         if replaced.is_some_and(|old| !old.instance.same_as(&instance)) {
             // The earlier process's leases are kept until it has fenced.
             let cause = "the daemon restarted, or two daemons hold this node's certificate";
@@ -343,7 +372,10 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
             return Vec::new();
         }
         let mut view = SoftwareView::new(status, received);
-        let before = state.software.get(worker).map_or(&[][..], |s| &s.xcodes);
+        let node = state.machine.node(worker);
+        let before = node
+            .and_then(|n| n.status.as_ref())
+            .map_or(&[][..], |s| &s.xcodes);
         // An Xcode not surveyed yet (a restarted daemon's first status) keeps the item
         // it had: neither cleared now nor raised again by the survey (`crate::fleet`).
         view.hold_unsurveyed(before);
@@ -355,16 +387,17 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
                 tracing::info!(target: "kbf_server::attention", "{line}");
             }
         }
-        state.software.insert(worker.clone(), view);
+        state.machine.report_status(worker, view);
         changes
     }
 
     /// This build, and every node registered since this farm started, in node-id order.
     pub fn nodes(&self) -> NodesView {
-        let state = self.lock();
+        let mut state = self.lock();
+        state.note_closed_streams();
         let nodes = state
-            .links
-            .keys()
+            .machine
+            .nodes()
             .map(|worker| self.node(&state, worker))
             .collect();
         NodesView::of_this_build(nodes)
@@ -372,10 +405,12 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
 
     /// `worker` as `GET /v1/nodes` lists it, if it has registered.
     pub fn node_view(&self, worker: &WorkerId) -> Option<NodeView> {
-        let state = self.lock();
+        let mut state = self.lock();
+        state.note_closed_streams();
         state
-            .links
-            .contains_key(worker)
+            .machine
+            .node(worker)
+            .is_some()
             .then(|| self.node(&state, worker))
     }
 
@@ -387,7 +422,8 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
     pub fn place(&self, worker: &WorkerId, action: NodeAction) -> Result<NodeView, UnknownNode> {
         let now = self.now();
         let mut state = self.lock();
-        if !state.links.contains_key(worker) {
+        state.note_closed_streams();
+        if state.machine.node(worker).is_none() {
             return Err(UnknownNode(worker.as_str().to_owned()));
         }
         let name = worker.clone();
@@ -404,7 +440,8 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
         Ok(self.node(&state, worker))
     }
 
-    /// One node's view; `worker` is registered.
+    /// One node's view; `worker` is registered, and every closed stream noted
+    /// ([`State::note_closed_streams`]).
     fn node(&self, state: &State, worker: &WorkerId) -> NodeView {
         let wall = |at: FarmTime| self.epoch_unix_ms.saturating_add(at.as_millis());
         let leases = || {
@@ -424,13 +461,14 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
                 leases: leases(),
             },
         };
+        let node = state.machine.node(worker);
+        let software = node.and_then(|n| n.status.clone());
         let phase = state.sched.phase(worker).cloned().unwrap_or_default();
-        let needs_attention = needs_attention(state.software.get(worker), &phase);
         NodeView {
             node_id: worker.as_str().to_owned(),
-            connected: !state.links[worker].outbound.is_closed(),
-            software: state.software.get(worker).cloned(),
-            needs_attention,
+            connected: node.is_some_and(|n| n.connected),
+            needs_attention: needs_attention(software.as_ref(), &phase),
+            software,
             placement,
             phase: PhaseView::new(&phase),
         }
@@ -443,8 +481,8 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
         let mut state = self.lock();
         state.feed_quiet(now, Event::Tick);
         let paused: BTreeSet<WorkerId> = state
-            .links
-            .keys()
+            .machine
+            .nodes()
             .filter(|w| matches!(state.sched.cordon(w), Some(Cordon::Paused { .. })))
             .cloned()
             .collect();
@@ -693,6 +731,16 @@ impl State {
 
     fn is_current(&self, worker: &WorkerId, stream: StreamId) -> bool {
         self.links.get(worker).is_some_and(|l| l.stream == stream)
+    }
+
+    /// Tells the machine of each node whose newest stream has closed (its response
+    /// side is gone), so its registry says the node is not connected.
+    fn note_closed_streams(&mut self) {
+        for (worker, link) in &self.links {
+            if link.outbound.is_closed() {
+                self.machine.disconnect(worker);
+            }
+        }
     }
 
     /// The operation whose current lease is `lease`, the action its `Start` named,

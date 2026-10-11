@@ -16,7 +16,8 @@
 //! - on macOS, a `sandbox-exec` sandbox around every action ([`network`]): no file
 //!   written outside the lease directory and `/dev` but the few names macOS tools
 //!   write in the daemon user's temporary folder whatever `TMPDIR` says (Foundation's
-//!   temporary items, `xcrun`'s cache: [`user_folders`], whose leftovers are swept),
+//!   temporary items, `xcrun`'s cache, Swift Build's scratch directory:
+//!   [`user_folders`], whose leftovers but Swift Build's are swept),
 //!   no user preference written through
 //!   `cfprefsd` (`defaults write`), no work handed to launchd
 //!   (`open`, `launchctl submit`/`load`/`bootstrap`), and no network unless the
@@ -84,7 +85,8 @@
 //!   fail until an operator unlocks it.
 //! - **The user's temporary folder.** The names there the sandbox opens to every lease
 //!   ([`user_folders`]) are shared: a lease can see and change the temporary files
-//!   another lease has open there, and rewrite `xcrun`'s cache, which the next lease's
+//!   another lease has open there (a running build's Swift Build scratch directory
+//!   among them), and rewrite `xcrun`'s cache, which the next lease's
 //!   compiler shims read to find their tools.
 //! - **The signal race.** [`procs::kill_all`] signals pids from a snapshot; one
 //!   recycled in between is a process of the daemon's user killed by mistake.

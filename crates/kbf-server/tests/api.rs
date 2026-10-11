@@ -428,6 +428,32 @@ async fn a_node_whose_stream_ended_is_listed_as_disconnected() {
     assert!(!farm.nodes().nodes[0].connected);
 }
 
+/// Catches a node registry that drops a node's status when its stream ends or when it
+/// registers again (the status is kept across streams until a newer one), one that
+/// leaves a node that registered again listed as not connected, and `node_view`
+/// reading `connected` before the farm has noted the closed stream.
+#[tokio::test]
+async fn a_node_that_registers_again_is_connected_with_its_status_kept() {
+    let farm = Farm::new(
+        cache(),
+        kbf_sched::UNSERVABLE_WAIT,
+        kbf_sched::FINISHED_RETENTION,
+    );
+    let node = WorkerId::new("linux-1");
+    let (first, responses) = register(&farm, "linux-1");
+    assert_eq!(farm.node_status(&node, first, linux_status("old")), []);
+    drop(responses);
+    let gone = farm
+        .node_view(&node)
+        .expect("listed after its stream ended");
+    assert!(!gone.connected);
+    let kept = gone.software.expect("its status is kept");
+    let (_, _responses) = register(&farm, "linux-1");
+    let back = farm.node_view(&node).expect("listed");
+    assert!(back.connected);
+    assert_eq!(back.software, Some(kept));
+}
+
 /// The headers an operator's write carries.
 fn operator() -> String {
     format!("Authorization: Bearer {TOKEN}\r\nContent-Type: application/json\r\n")

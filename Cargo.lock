@@ -1187,6 +1187,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "kbf-deploy"
+version = "0.1.0"
+dependencies = [
+ "rustix",
+ "thiserror",
+]
+
+[[package]]
 name = "kbf-driver-container"
 version = "0.1.0"
 dependencies = [
@@ -1279,11 +1287,14 @@ dependencies = [
  "kbf-front",
  "kbf-proto",
  "kbf-server",
+ "kbf-testkit",
+ "proc-macro2",
  "prost",
  "rcgen",
  "saphyr-parser",
  "serde_json",
  "sha2 0.11.0",
+ "syn 2.0.119",
  "thiserror",
  "tokio",
  "tonic",
@@ -1295,10 +1306,23 @@ name = "kbf-log"
 version = "0.1.0"
 dependencies = [
  "hex",
+ "kbf-caps",
  "kbf-meta",
  "kbf-proto",
+ "kbf-sched",
  "kbf-types",
  "prost",
+ "thiserror",
+]
+
+[[package]]
+name = "kbf-mac-provision"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "hex",
+ "rustix",
+ "sha2 0.11.0",
  "thiserror",
 ]
 
@@ -1487,13 +1511,16 @@ dependencies = [
  "kbf-auth",
  "kbf-caps",
  "kbf-front",
+ "kbf-log",
  "kbf-mdm-api",
  "kbf-meta",
  "kbf-objstore",
  "kbf-proto",
+ "kbf-raft",
  "kbf-sched",
  "kbf-segments",
  "kbf-sim",
+ "kbf-store",
  "kbf-types",
  "libc",
  "prost",
@@ -1524,6 +1551,20 @@ dependencies = [
 [[package]]
 name = "kbf-sim-cell"
 version = "0.1.0"
+dependencies = [
+ "kbf-caps",
+ "kbf-daemon",
+ "kbf-front",
+ "kbf-log",
+ "kbf-meta",
+ "kbf-raft",
+ "kbf-sched",
+ "kbf-server",
+ "kbf-sim",
+ "kbf-store",
+ "kbf-types",
+ "tokio",
+]
 
 [[package]]
 name = "kbf-store"
@@ -1531,6 +1572,13 @@ version = "0.1.0"
 dependencies = [
  "kbf-raft",
  "thiserror",
+]
+
+[[package]]
+name = "kbf-testkit"
+version = "0.1.0"
+dependencies = [
+ "rustix",
 ]
 
 [[package]]

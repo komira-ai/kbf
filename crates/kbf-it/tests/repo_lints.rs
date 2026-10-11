@@ -13,6 +13,10 @@
 //!   citation of an unpublished design document by its sections (the IETF numbers
 //!   pass) or a git conflict marker, and a file holding a NUL byte whose extension is
 //!   not on the binary allow list (rules in `kbf_it::hygiene`);
+//! - a shell, Python, awk, sed, Perl or Ruby file, a workflow `run:` step with shell
+//!   logic, or a production `sh -c` in `crates/*/src/` that `tools/interpreter_budget.tsv`
+//!   does not list at its exact size, and a row of that file that is stale, repeated
+//!   or malformed (rules in `interpreters/mod.rs`);
 //! - the darwin-arm64 job of `.github/workflows/artifacts.yml` no longer running
 //!   `tools/ci/check-darwin-asset.sh` on the packaged binary after `Package`, or
 //!   running it where its failure does not fail the job;
@@ -20,6 +24,7 @@
 //!   scanned or the workflows moved;
 //! - a drift in the rules that pick which files each lint reads (module `selection`).
 
+mod interpreters;
 mod workflows;
 
 use std::path::{Path, PathBuf};
@@ -207,6 +212,300 @@ fn text_files_carry_no_addresses_home_paths_design_citations_or_conflict_markers
         "public hygiene:\n{}",
         problems.join("\n")
     );
+}
+
+/// What the interpreter budget scan read and found in a tree.
+#[derive(Debug, Default)]
+struct BudgetScan {
+    found: Vec<interpreters::Found>,
+    /// Files the scan could not clear: a workflow that does not parse, two logic
+    /// steps with one key, a Rust source that is not UTF-8 or does not parse.
+    problems: Vec<String>,
+    /// `run:` steps read, logic or not.
+    run_steps: usize,
+    /// Rust files under `crates/*/src/` read.
+    rust_files: usize,
+}
+
+/// The interpreter budget scan of the listed `files`, each opened by `read` (`None`
+/// for a listed file deleted in the working tree).
+fn interpreter_scan(files: &[String], read: impl Fn(&str) -> Option<Vec<u8>>) -> BudgetScan {
+    use interpreters::{Found, Section};
+    let mut found = Vec::new();
+    let mut problems = Vec::new();
+    let mut rust_src = Vec::new();
+    let mut run_steps = 0;
+    for f in files {
+        let Some(bytes) = read(f) else {
+            continue;
+        };
+        if let Some(why) = interpreters::interpreter_file(f, &bytes) {
+            found.push(Found {
+                section: Section::Files,
+                key: f.clone(),
+                count: interpreters::newlines(&bytes),
+                why,
+            });
+        }
+        if is_workflow(f) || is_action_file(f) {
+            let steps = workflows::decode(&bytes).and_then(workflows::run_steps);
+            let steps = match steps {
+                Ok(steps) => steps,
+                Err(e) => {
+                    problems.push(format!("{f}: {e}"));
+                    continue;
+                }
+            };
+            run_steps += steps.len();
+            for s in steps {
+                let Some(what) = interpreters::shell_logic(&s.script) else {
+                    continue;
+                };
+                let key = format!("{f}#{}/{}", s.job, s.step);
+                if found
+                    .iter()
+                    .any(|x: &Found| x.section == Section::Workflow && x.key == key)
+                {
+                    problems.push(format!(
+                        "`{key}`: two steps share this key; name them apart"
+                    ));
+                    continue;
+                }
+                found.push(Found {
+                    section: Section::Workflow,
+                    key,
+                    count: interpreters::script_lines(&s.script),
+                    why: format!("its `run:` script has {what}"),
+                });
+            }
+        }
+        if interpreters::rust::is_crate_src(f) {
+            match String::from_utf8(bytes) {
+                Ok(text) => rust_src.push((f.clone(), text)),
+                Err(e) => problems.push(format!("{f}: not UTF-8 ({e})")),
+            }
+        }
+    }
+    let (spawns, unread) = interpreters::rust::shell_c_files(&rust_src);
+    problems.extend(unread);
+    found.extend(spawns.into_iter().map(|(key, count)| Found {
+        section: Section::SrcShC,
+        key,
+        count,
+        why: "its production code names a shell and a `-c` flag".to_owned(),
+    }));
+    BudgetScan {
+        found,
+        problems,
+        run_steps,
+        rust_files: rust_src.len(),
+    }
+}
+
+/// The scan's problems and the budget's, for a tree and a budget text.
+fn budget_problems(scan: BudgetScan, budget: &str) -> Vec<String> {
+    let mut problems = scan.problems;
+    problems.extend(interpreters::check(budget, &scan.found));
+    problems
+}
+
+#[test]
+fn every_interpreter_file_workflow_script_and_shell_spawn_is_in_the_budget() {
+    // Catches: a new shell, Python, awk, sed, Perl or Ruby file (by extension or by
+    // its `#!` line); one that grew or shrank without its row; a row left for a file
+    // that is gone; a new workflow `run:` step with shell logic; a new `sh -c` in
+    // production Rust; a malformed or duplicate row (module `interpreters`); and the
+    // scan passing because it read no workflow steps or no Rust sources.
+    let root = repo_root();
+    let files = listed_files(&root);
+    let scan = interpreter_scan(&files, |f| read_bytes(&root.join(f)));
+    assert!(
+        scan.run_steps >= 10,
+        "only {} `run:` steps read; the workflow scan reads too little",
+        scan.run_steps
+    );
+    assert!(
+        scan.rust_files >= 50,
+        "only {} Rust files under crates/*/src read; the shell scan reads too little",
+        scan.rust_files
+    );
+    let budget = std::fs::read_to_string(root.join(interpreters::BUDGET))
+        .unwrap_or_else(|e| panic!("{}: {e}", interpreters::BUDGET));
+    let problems = budget_problems(scan, &budget);
+    assert!(
+        problems.is_empty(),
+        "interpreter budget ({}):\n{}",
+        interpreters::BUDGET,
+        problems.join("\n")
+    );
+}
+
+/// The whole budget scan over planted trees: each planted defect the rule ships to
+/// refuse, against a clean control tree.
+mod budget {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    const CI: &str = ".github/workflows/ci.yml";
+    const WORKFLOW: &str = "on: push\njobs:\n  test:\n    steps:\n      - run: cargo test --locked\n      - name: Probe\n        run: |\n          uname -m\n          nproc\n";
+    const ACTION: &str = "runs:\n  using: composite\n  steps:\n    - run: a && b\n";
+    const KEEPER: &str = "crates/k/src/keeper.rs";
+    const KEEPER_RS: &str =
+        r#"pub fn watch() { std::process::Command::new("/bin/sh").args(["-c", "x"]); }"#;
+    const BUDGET: &str = "[files]\n2\ttools/ci/x.sh\tCI\n1\ttools/probe\tprobe\n\
+                          [workflow]\n2\t.github/workflows/ci.yml#test/Probe\tfacts\n\
+                          1\t.github/actions/a/action.yml#runs/step 1\tchain\n\
+                          [src-sh-c]\n1\tcrates/k/src/keeper.rs\tkeeper\n";
+
+    /// The control tree: one row-matching thing of each kind, plus files the scan
+    /// must leave alone.
+    fn tree() -> BTreeMap<String, Vec<u8>> {
+        [
+            ("tools/ci/x.sh", "#!/bin/sh\necho\n"),
+            ("tools/probe", "#!/usr/bin/env bash\n"),
+            (CI, WORKFLOW),
+            (".github/actions/a/action.yml", ACTION),
+            (KEEPER, KEEPER_RS),
+            ("crates/k/src/lib.rs", "pub mod keeper;\n"),
+            ("crates/k/tests/t.rs", r#"fn t() { g("sh", "-c") }"#),
+            ("README.md", "run `sh -c`\n"),
+        ]
+        .into_iter()
+        .map(|(p, t)| (p.to_owned(), t.as_bytes().to_vec()))
+        .collect()
+    }
+
+    fn problems(tree: &BTreeMap<String, Vec<u8>>, budget: &str) -> Vec<String> {
+        let files: Vec<String> = tree.keys().cloned().collect();
+        budget_problems(interpreter_scan(&files, |f| tree.get(f).cloned()), budget)
+    }
+
+    #[test]
+    fn the_control_tree_passes() {
+        // Catches: the control refused, so every planted defect below would go red
+        // for the wrong reason.
+        assert_eq!(problems(&tree(), BUDGET), Vec::<String>::new());
+    }
+
+    #[test]
+    fn an_unlisted_sh_file_is_refused() {
+        // Catches (planted defect): a new `x.sh` with no row.
+        let mut t = tree();
+        t.insert("tools/new.sh".to_owned(), b"echo\n".to_vec());
+        let p = problems(&t, BUDGET);
+        assert_eq!(p.len(), 1, "{p:?}");
+        assert!(p[0].starts_with("`tools/new.sh`: a `.sh` file"), "{p:?}");
+    }
+
+    #[test]
+    fn an_unlisted_extensionless_python_file_is_refused() {
+        // Catches (planted defect): an extensionless `#!/usr/bin/env python3` with no
+        // row, which an extension-only rule would pass.
+        let mut t = tree();
+        t.insert("tools/gen".to_owned(), b"#!/usr/bin/env python3\n".to_vec());
+        let p = problems(&t, BUDGET);
+        assert_eq!(p.len(), 1, "{p:?}");
+        assert!(
+            p[0].starts_with("`tools/gen`: its `#!` line runs `python3`"),
+            "{p:?}"
+        );
+    }
+
+    #[test]
+    fn a_file_one_line_longer_or_shorter_than_its_row_is_refused() {
+        // Catches (planted defects): the row off by +1 and by -1.
+        for text in ["#!/bin/sh\necho\necho\n", "#!/bin/sh\n"] {
+            let mut t = tree();
+            t.insert("tools/ci/x.sh".to_owned(), text.as_bytes().to_vec());
+            let p = problems(&t, BUDGET);
+            assert_eq!(p.len(), 1, "{p:?}");
+            assert!(
+                p[0].starts_with("`tools/ci/x.sh` has ") && p[0].contains("row (line 2) says 2"),
+                "{p:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_row_for_a_deleted_file_is_refused() {
+        // Catches (planted defect): a stale row, its file deleted.
+        let mut t = tree();
+        t.remove("tools/probe");
+        assert_eq!(
+            problems(&t, BUDGET),
+            vec![
+                "line 3: the [files] row for `tools/probe` names nothing the scan found \
+                 (deleted, renamed, or no longer counted); remove the row"
+                    .to_owned()
+            ]
+        );
+    }
+
+    #[test]
+    fn an_unlisted_multi_line_run_step_is_refused() {
+        // Catches (planted defect): a new `run: |` block with no [workflow] row, and
+        // a one-line command (the first step) refused.
+        let mut t = tree();
+        let planted = format!("{WORKFLOW}      - run: |\n          a\n          b\n");
+        t.insert(CI.to_owned(), planted.into_bytes());
+        let p = problems(&t, BUDGET);
+        assert_eq!(p.len(), 1, "{p:?}");
+        assert!(
+            p[0].starts_with(
+                "`.github/workflows/ci.yml#test/step 3`: its `run:` script has more than one line"
+            ),
+            "{p:?}"
+        );
+    }
+
+    #[test]
+    fn two_logic_steps_with_one_key_are_refused() {
+        // Catches: a second step of the same name in one job cleared by the first
+        // step's row, so its script is never counted.
+        let mut t = tree();
+        let planted = format!("{WORKFLOW}      - name: Probe\n        run: a && b\n");
+        t.insert(CI.to_owned(), planted.into_bytes());
+        assert_eq!(
+            problems(&t, BUDGET),
+            vec![
+                "`.github/workflows/ci.yml#test/Probe`: two steps share this key; name them apart"
+                    .to_owned()
+            ]
+        );
+    }
+
+    #[test]
+    fn an_unlisted_production_sh_c_is_refused() {
+        // Catches (planted defect): `Command::new("sh").arg("-c")` in a src file with
+        // no [src-sh-c] row; the same text under `crates/*/tests/` stays allowed.
+        let mut t = tree();
+        t.insert(
+            "crates/k/src/run.rs".to_owned(),
+            br#"fn f() { std::process::Command::new("sh").arg("-c"); }"#.to_vec(),
+        );
+        let p = problems(&t, BUDGET);
+        assert_eq!(p.len(), 1, "{p:?}");
+        assert!(
+            p[0].starts_with("`crates/k/src/run.rs`: its production code names a shell"),
+            "{p:?}"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_workflow_or_source_is_refused_not_skipped() {
+        // Catches: a workflow or Rust source the scan cannot read dropped from it, so
+        // its shell escapes the budget.
+        let mut t = tree();
+        t.insert(CI.to_owned(), b"on: [\n".to_vec());
+        t.insert(KEEPER.to_owned(), b"fn f( {".to_vec());
+        let p = problems(&t, BUDGET);
+        assert!(p.iter().any(|e| e.starts_with(&format!("{CI}: "))), "{p:?}");
+        assert!(
+            p.iter()
+                .any(|e| e.starts_with(&format!("{KEEPER}: not read as Rust"))),
+            "{p:?}"
+        );
+    }
 }
 
 /// The workflow paths `docs/artifacts.md` gives as `--signer-workflow`, relative to the
