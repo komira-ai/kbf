@@ -92,6 +92,20 @@ mutant 'the P0 verdict ignores a probe user that existed before' volume_owner.sh
     's/if \[ "$(st_get existed)" = yes \]; then/if false; then/'
 mutant 'the P0 verdict ignores where the write stopped' volume_owner.sh t_vo_attach_fails \
     's/elif \[ "$reached" != detach \]; then/elif false; then/'
+mutant 'the P0 verdict ignores noowners on a re-attach (the false PASS)' volume_owner.sh 't_vo_noowners t_vo_control_noowners' \
+    '/^        \*", noowners,"\*) return 1 ;;$/d'
+mutant 'the P0 noowners check reads the whole mount line, path included' volume_owner.sh t_vo_noowners \
+    's/^    case ", $flags," in$/    case "$line" in/;s/^        \*", noowners,"\*) return 1 ;;$/        *noowners*) return 1 ;;/'
+mutant 'the P0 verdict takes a re-attach missing from the mount table as owners on' volume_owner.sh t_vo_mount_unlisted \
+    's/^        "" | "not in the mount table") return 1 ;;$/        "") return 1 ;;/'
+mutant "the P0 verdict ignores the user re-attach's mount flags" volume_owner.sh 't_vo_noowners t_vo_mount_unlisted' \
+    's/^    elif ! owners_on reattach; then$/    elif false; then/'
+mutant "the P0 verdict ignores the control re-attach's mount flags" volume_owner.sh t_vo_control_noowners \
+    's/^    elif ! owners_on control_reattach; then$/    elif false; then/'
+mutant 'the P0 verdict ignores the keep file left at the user uid' volume_owner.sh t_vo_shows_caller \
+    's/^    elif \[ "${keep%%:\*}" != "$uid" \]; then$/    elif false; then/'
+mutant 'the P0 keep owner is read from the chowned file' volume_owner.sh t_vo_pass \
+    's/keep=$(as_root stat -f %u:%g "$mnt\/$KEEP" 2>&1)/keep=$(as_root stat -f %u:%g "$mnt\/$FILE" 2>\&1)/'
 mutant 'the P0 cleanup leaves the user' volume_owner.sh t_vo_fail \
     's/kv cleanup.delete_user "$(run_cap watchdog "$WATCHDOG" as_root sysadminctl -deleteUser "$PROBE_USER")"/:/'
 mutant 'verdicts.sh lets a BROKEN verdict through' verdicts.sh t_verdicts \
