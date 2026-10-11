@@ -99,5 +99,3 @@ tools/spike/several_servers.sh	hosted runner spike; to be deleted
 
 # Production Rust under crates/*/src/ that names a shell and a `-c` flag. Key: the path.
 [src-sh-c]
-crates/kbf-driver-container/src/keeper.rs	the lease keeper is a /bin/sh script; to become a mode of the daemon binary
-crates/kbf-driver-native/src/keeper.rs	the lease keeper is a /bin/sh script; to become a mode of the daemon binary
