@@ -21,6 +21,9 @@
 
 mod meta;
 
+use std::fmt;
+use std::num::NonZeroU64;
+
 use kbf_meta::Command;
 use kbf_proto::kbf::log::v1 as proto;
 use prost::Message;
@@ -47,12 +50,52 @@ impl Format {
     }
 }
 
+/// The id of one replicated log: drawn once, when the log is created, and committed in
+/// its [`Bootstrap`] (docs/design/ha.md, section 4.5). Never zero. It names the log, not
+/// a position in it (that is `kbf_raft::LogId`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct FarmLogId(NonZeroU64);
+
+impl FarmLogId {
+    /// The id `n`.
+    #[must_use]
+    pub const fn new(n: NonZeroU64) -> Self {
+        Self(n)
+    }
+
+    /// The raw number.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0.get()
+    }
+}
+
+/// Sixteen lowercase hex digits, the form object key prefixes use.
+impl fmt::Display for FarmLogId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:016x}", self.0)
+    }
+}
+
+/// A log's first command (docs/design/ha.md, section 4.11): its id and the object key
+/// prefix every start over it writes under. A replica takes the first committed one; a
+/// later one changes nothing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Bootstrap {
+    /// The log's id.
+    pub log_id: FarmLogId,
+    /// The key prefix of every object the farm writes, the same across restarts.
+    pub store_prefix: String,
+}
+
 /// The payload of a command entry. Later formats add the log's other commands
 /// (docs/design/ha.md, section 4.1).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LogCommand {
     /// A command of the metadata state machine.
     Meta(Command),
+    /// The log's first command.
+    Bootstrap(Bootstrap),
 }
 
 /// Why an entry could not be encoded.
@@ -117,6 +160,12 @@ pub fn encode(format: Format, command: &LogCommand) -> Result<Vec<u8>, EncodeErr
         LogCommand::Meta(c) => proto::LogCommand {
             command: Some(proto::log_command::Command::Meta(meta::to_proto(c)?)),
         },
+        LogCommand::Bootstrap(b) => proto::LogCommand {
+            command: Some(proto::log_command::Command::Bootstrap(proto::Bootstrap {
+                log_id: b.log_id.get(),
+                store_prefix: b.store_prefix.clone(),
+            })),
+        },
     };
     Ok(message.encode_to_vec())
 }
@@ -128,6 +177,12 @@ pub fn decode(format: Format, bytes: &[u8]) -> Result<LogCommand, DecodeError> {
     }
     let command = match proto::LogCommand::decode(bytes)?.command {
         Some(proto::log_command::Command::Meta(c)) => LogCommand::Meta(meta::from_proto(c)?),
+        Some(proto::log_command::Command::Bootstrap(b)) => LogCommand::Bootstrap(Bootstrap {
+            log_id: NonZeroU64::new(b.log_id)
+                .map(FarmLogId)
+                .ok_or(DecodeError::Missing("Bootstrap.log_id"))?,
+            store_prefix: b.store_prefix,
+        }),
         None => return Err(DecodeError::UnknownCommand("LogCommand")),
     };
     // One value, one encoding: refuse anything prost accepted that `encode` would not
