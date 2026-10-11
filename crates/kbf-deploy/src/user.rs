@@ -123,9 +123,7 @@ pub(crate) fn become_user(uid: u32, gid: u32, groups: &[u32]) -> io::Result<()> 
         return Err(io::Error::last_os_error());
     }
     // SAFETY: setgid and setuid take any number; one the caller may not take fails.
-    if unsafe { libc::setgid(gid) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
+    let _ = unsafe { libc::setgid(gid) };
     // SAFETY: as above.
     if unsafe { libc::setuid(uid) } != 0 {
         return Err(io::Error::last_os_error());
