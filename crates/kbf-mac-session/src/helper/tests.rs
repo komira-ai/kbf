@@ -2,13 +2,14 @@ use std::io::Read as _;
 use std::os::fd::OwnedFd;
 
 use super::*;
+use crate::autologin::SessionPaths;
 use crate::grant::testing::{key_line, sign, text};
 use crate::testing::{FakeHost, NOW, scratch, trace};
 
 /// The fake clock's time, as a grant's times count it.
 const NOW_SECS: i64 = NOW.cast_signed();
 
-fn me() -> u32 {
+pub(super) fn me() -> u32 {
     rustix::process::getuid().as_raw()
 }
 
@@ -16,19 +17,23 @@ fn my_gid() -> u32 {
     rustix::process::getgid().as_raw()
 }
 
-struct Rig {
-    host: FakeHost,
-    helper: Helper,
-    dir: PathBuf,
+pub(super) struct Rig {
+    pub(super) host: FakeHost,
+    pub(super) helper: Helper,
+    pub(super) dir: PathBuf,
 }
 
 /// A helper whose lease range starts at the test's own uid (so a lease created first
-/// gets it, and `run` can start a process as it unprivileged), over a fake host.
-fn rig(name: &str, len: u32) -> Rig {
-    rig_with(name, UidRange::new(me(), me() + len - 1).unwrap(), None)
+/// gets it, and `run` can start a process as it unprivileged), over a fake host, with
+/// its boot reset done.
+pub(super) fn rig(name: &str, len: u32) -> Rig {
+    let rig = rig_with(name, UidRange::new(me(), me() + len - 1).unwrap(), None);
+    rig.helper.boot_reset(&[]).unwrap();
+    rig.host.state().log.clear();
+    rig
 }
 
-fn rig_with(name: &str, range: UidRange, dir: Option<PathBuf>) -> Rig {
+pub(super) fn rig_with(name: &str, range: UidRange, dir: Option<PathBuf>) -> Rig {
     trace();
     let dir = dir.unwrap_or_else(|| scratch(&format!("helper-{name}")));
     let homes = dir.join("Users");
@@ -48,13 +53,14 @@ fn rig_with(name: &str, range: UidRange, dir: Option<PathBuf>) -> Rig {
         },
         grant_keys: Some(GrantKeys::parse(&key_line(7)).unwrap()),
         serial: "SERIAL1".to_owned(),
+        session: SessionPaths::under(&dir),
     };
     let ledger = Ledger::open(&dir.join("ledger")).unwrap();
     let helper = Helper::new(Box::new(host.clone()), settings, ledger);
     Rig { host, helper, dir }
 }
 
-fn log(rig: &Rig) -> Vec<String> {
+pub(super) fn log(rig: &Rig) -> Vec<String> {
     std::mem::take(&mut rig.host.state().log)
 }
 
@@ -313,7 +319,7 @@ fn only_live_leases_in_range_are_acted_on() {
 }
 
 /// stdin, stdout (a pipe the test reads), stderr, and the lease directory.
-fn fds(dir: &Path) -> Vec<OwnedFd> {
+pub(super) fn fds(dir: &Path) -> Vec<OwnedFd> {
     let null = || -> OwnedFd { std::fs::File::open("/dev/null").unwrap().into() };
     vec![
         null(),
