@@ -16,6 +16,8 @@
 //! ([`FarmMachine::disconnect`]) before it reads the registry. The scheduler is not part
 //! of the machine yet; the methods that depend on it take what they need from it as
 //! arguments.
+//!
+//! It is public so that `kbf-sim-cell` assembles its simulated server from it.
 
 #![deny(clippy::disallowed_methods, clippy::disallowed_types)]
 
@@ -59,38 +61,38 @@ fn canonical_u64(text: &str) -> Option<u64> {
 /// A caller waiting on an operation. Its name is not kept: it is
 /// [`FarmMachine::name`] of its id.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Waiter {
+pub struct Waiter {
     /// The instance name and action it submitted.
-    pub(crate) key: ActionKey,
-    pub(crate) kind: LeaseKind,
-    pub(crate) do_not_cache: bool,
+    pub key: ActionKey,
+    pub kind: LeaseKind,
+    pub do_not_cache: bool,
     /// When it was submitted, on the wall clock.
-    pub(crate) queued: SystemTime,
+    pub queued: SystemTime,
 }
 
 /// A lease whose `Start` was sent.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Sent {
-    pub(crate) operation: OperationId,
+pub struct Sent {
+    pub operation: OperationId,
     /// The action the `Start` named.
-    pub(crate) action: Digest,
+    pub action: Digest,
     /// When the operation was queued and the `Start` sent.
-    pub(crate) stamp: Stamp,
+    pub stamp: Stamp,
 }
 
 /// A node that has registered.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Node {
+pub struct Node {
     /// Whether its newest stream is open, as the farm last told the machine.
-    pub(crate) connected: bool,
+    pub connected: bool,
     /// The newest `NodeStatus` it sent, on any of its streams; `None` before the first.
-    pub(crate) status: Option<SoftwareView>,
+    pub status: Option<SoftwareView>,
 }
 
 /// The waiter records, the started table and the node registry of one farm (see the
 /// module doc).
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct FarmMachine {
+pub struct FarmMachine {
     /// The scheduler term every operation name carries.
     term: u64,
     /// The id the next caller gets.
@@ -110,7 +112,7 @@ pub(crate) struct FarmMachine {
 
 impl FarmMachine {
     /// An empty machine whose operation names carry `term`.
-    pub(crate) const fn new(term: u64) -> Self {
+    pub const fn new(term: u64) -> Self {
         Self {
             term,
             next_waiter: 0,
@@ -122,7 +124,7 @@ impl FarmMachine {
     }
 
     /// Records a new caller and returns its id, the next in order.
-    pub(crate) fn submit(&mut self, waiter: Waiter) -> WaiterId {
+    pub fn submit(&mut self, waiter: Waiter) -> WaiterId {
         let id = WaiterId(self.next_waiter);
         self.next_waiter += 1;
         self.waiters.insert(id, waiter);
@@ -130,49 +132,49 @@ impl FarmMachine {
     }
 
     /// The caller `id`, while it is kept.
-    pub(crate) fn waiter(&self, id: WaiterId) -> Option<&Waiter> {
+    pub fn waiter(&self, id: WaiterId) -> Option<&Waiter> {
         self.waiters.get(&id)
     }
 
     /// The ids of the kept callers, in id order.
-    pub(crate) fn waiter_ids(&self) -> impl Iterator<Item = WaiterId> + '_ {
+    pub fn waiter_ids(&self) -> impl Iterator<Item = WaiterId> + '_ {
         self.waiters.keys().copied()
     }
 
     /// The REAPI name of the operation caller `id` waits on.
-    pub(crate) fn name(&self, id: WaiterId) -> String {
+    pub fn name(&self, id: WaiterId) -> String {
         operation_name(self.term, id)
     }
 
     /// The kept caller `name` names, if this machine wrote that name.
-    pub(crate) fn named(&self, name: &str) -> Option<(WaiterId, &Waiter)> {
+    pub fn named(&self, name: &str) -> Option<(WaiterId, &Waiter)> {
         let id = parse_operation_name(name, self.term)?;
         self.waiter(id).map(|waiter| (id, waiter))
     }
 
     /// Records that the `Start` of `lease` was sent.
-    pub(crate) fn start(&mut self, lease: LeaseId, sent: Sent) {
+    pub fn start(&mut self, lease: LeaseId, sent: Sent) {
         self.started.insert(lease, sent);
     }
 
     /// What was sent for `lease`, if its `Start` was sent and it is not forgotten.
-    pub(crate) fn sent(&self, lease: LeaseId) -> Option<Sent> {
+    pub fn sent(&self, lease: LeaseId) -> Option<Sent> {
         self.started.get(&lease).copied()
     }
 
     /// The operation of each lease whose `Start` was sent, in lease order.
-    pub(crate) fn started_operations(&self) -> impl Iterator<Item = OperationId> + '_ {
+    pub fn started_operations(&self) -> impl Iterator<Item = OperationId> + '_ {
         self.started.values().map(|sent| sent.operation)
     }
 
     /// Forgets every lease of a finished `operation` whose `Start` was sent.
-    pub(crate) fn forget_leases(&mut self, operation: OperationId) {
+    pub fn forget_leases(&mut self, operation: OperationId) {
         self.started.retain(|_, sent| sent.operation != operation);
     }
 
     /// Records that `worker` registered on a new stream: it is connected, and keeps
     /// the status it sent on an earlier one.
-    pub(crate) fn register(&mut self, worker: &WorkerId) {
+    pub fn register(&mut self, worker: &WorkerId) {
         let node = self.nodes.entry(worker.clone()).or_insert(Node {
             connected: true,
             status: None,
@@ -181,32 +183,32 @@ impl FarmMachine {
     }
 
     /// Records that the newest stream of `worker` has closed. The node stays listed.
-    pub(crate) fn disconnect(&mut self, worker: &WorkerId) {
+    pub fn disconnect(&mut self, worker: &WorkerId) {
         if let Some(node) = self.nodes.get_mut(worker) {
             node.connected = false;
         }
     }
 
     /// Keeps `status` as the newest of `worker`, if it has registered.
-    pub(crate) fn report_status(&mut self, worker: &WorkerId, status: SoftwareView) {
+    pub fn report_status(&mut self, worker: &WorkerId, status: SoftwareView) {
         if let Some(node) = self.nodes.get_mut(worker) {
             node.status = Some(status);
         }
     }
 
     /// The node `worker`, if it has registered.
-    pub(crate) fn node(&self, worker: &WorkerId) -> Option<&Node> {
+    pub fn node(&self, worker: &WorkerId) -> Option<&Node> {
         self.nodes.get(worker)
     }
 
     /// Every node that has registered, in node-id order.
-    pub(crate) fn nodes(&self) -> impl Iterator<Item = &WorkerId> + '_ {
+    pub fn nodes(&self) -> impl Iterator<Item = &WorkerId> + '_ {
         self.nodes.keys()
     }
 
     /// Keeps `waiters`, the callers of `operation`, which has just finished, until
     /// [`Self::forget_dropped`] finds the scheduler has dropped it.
-    pub(crate) fn keep_finished(&mut self, operation: OperationId, waiters: Vec<WaiterId>) {
+    pub fn keep_finished(&mut self, operation: OperationId, waiters: Vec<WaiterId>) {
         self.finished.push_back((operation, waiters));
     }
 
@@ -216,7 +218,7 @@ impl FarmMachine {
     /// The scheduler drops them in the order they finished, and only those that
     /// finished at one farm time can be kept here in another order, so stopping at the
     /// first it still holds leaves none behind for longer than the input that drops it.
-    pub(crate) fn forget_dropped(&mut self, held: impl Fn(OperationId) -> bool) -> Vec<WaiterId> {
+    pub fn forget_dropped(&mut self, held: impl Fn(OperationId) -> bool) -> Vec<WaiterId> {
         let dropped = self
             .finished
             .iter()

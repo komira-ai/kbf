@@ -10,11 +10,11 @@ use prost_types::Timestamp;
 
 /// The server's own times for one run of an operation, on the wall clock.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Stamp {
+pub struct Stamp {
     /// When the operation's first caller submitted it.
-    pub(crate) queued: SystemTime,
+    pub queued: SystemTime,
     /// When the `Start` of the lease that ran it was sent.
-    pub(crate) started: SystemTime,
+    pub started: SystemTime,
 }
 
 impl Stamp {

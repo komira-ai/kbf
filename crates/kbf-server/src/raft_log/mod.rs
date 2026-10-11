@@ -272,6 +272,14 @@ impl<F: Fs> RaftMetaLog<F> {
         self.shared.now()
     }
 
+    /// The index of the last entry the metadata state has applied (blank entries
+    /// count). Every entry through it was durable in the raft directory before it was
+    /// applied.
+    #[must_use]
+    pub fn applied_index(&self) -> u64 {
+        self.shared.lock().machine().applied().0
+    }
+
     /// How many `Bootstrap` entries the log held when it opened, the one it may have
     /// just committed included. One for every log this version writes.
     #[must_use]

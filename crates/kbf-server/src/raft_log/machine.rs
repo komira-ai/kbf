@@ -25,6 +25,8 @@ pub struct MetaMachine {
     /// that proposed it.
     answer: Option<(LogIndex, Applied)>,
     failed: Option<(LogIndex, DecodeError)>,
+    /// The last entry handed to [`Machine::apply`], blank entries included.
+    applied: LogIndex,
 }
 
 impl MetaMachine {
@@ -36,6 +38,7 @@ impl MetaMachine {
             bootstraps: 0,
             answer: None,
             failed: None,
+            applied: LogIndex(0),
         }
     }
 
@@ -62,6 +65,13 @@ impl MetaMachine {
             .map(|(_, applied)| applied.clone())
     }
 
+    /// The last entry the host handed this machine, blank entries and entries past
+    /// a stop included. The core's applied index can be ahead of it: a host that met
+    /// a storage error mid-input applies nothing more of that input.
+    pub const fn applied(&self) -> LogIndex {
+        self.applied
+    }
+
     /// The entry that did not decode, and why, once one has stopped the machine.
     pub const fn failed(&self) -> Option<&(LogIndex, DecodeError)> {
         self.failed.as_ref()
@@ -72,6 +82,7 @@ impl Machine for MetaMachine {
     type Error = NoSnapshots;
 
     fn apply(&mut self, entry: &Entry) {
+        self.applied = entry.id.index;
         let Payload::Command(bytes) = &entry.payload else {
             return; // a leader's blank entry
         };

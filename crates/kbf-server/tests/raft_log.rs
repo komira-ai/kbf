@@ -285,6 +285,28 @@ async fn an_entry_or_snapshot_this_version_cannot_read_refuses_the_open() {
     assert!(refused.to_string().contains("snapshot"));
 }
 
+/// Catches: an applied index read from the Raft core instead of the metadata state.
+/// The core counts an entry applied when it hands the host the effect, so after a
+/// storage error part-way through a commit the core's index names an entry the state
+/// never applied (kbf-sim-cell's durability check would then see a phantom entry).
+#[tokio::test]
+async fn the_applied_index_is_the_state_s_and_stops_at_a_failed_commit() {
+    let fs = FaultFs::new();
+    let log = open(&fs, 6).await;
+    let opened = log.applied_index();
+    // The blank entry of the term and the Bootstrap.
+    assert_eq!(opened, 2);
+    epoch(&log).await;
+    assert_eq!(log.applied_index(), opened + 1);
+    fs.fail_at(fs.ops(), Fault::Error);
+    let refused = log.commit(Command::AllocEpoch).await;
+    assert!(
+        matches!(refused, Err(MetaLogError::Unavailable(_))),
+        "{refused:?}"
+    );
+    assert_eq!(log.applied_index(), opened + 1);
+}
+
 /// Catches: a control command in the metadata log applied as a no-op (or skipped)
 /// instead of refusing the open. This binary writes none; a log holding one was written
 /// by a later binary whose farm state this one would silently drop.

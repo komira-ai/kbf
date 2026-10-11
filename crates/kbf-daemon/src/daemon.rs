@@ -581,8 +581,7 @@ impl Daemon {
     /// Whether lease `id` was granted under a lease epoch other than the newest
     /// Welcome's, when that Welcome named one.
     fn superseded(&self, id: LeaseId) -> bool {
-        let granted = self.granted.get(&id).and_then(|g| g.epoch);
-        self.epoch.is_some() && granted.is_some() && granted != self.epoch
+        superseded(self.granted.get(&id).and_then(|g| g.epoch), self.epoch)
     }
 
     fn on_message(&mut self, msg: ServerMessage, tx: &UnboundedSender<DaemonMessage>) {
@@ -821,6 +820,15 @@ fn send(tx: &UnboundedSender<DaemonMessage>, message: daemon_message::Message) {
     let _ = tx.unbounded_send(DaemonMessage {
         message: Some(message),
     });
+}
+
+/// Whether a lease granted under the lease epoch `granted` is dropped once the newest
+/// `Welcome` named `newest` (issue #137): only when both name one and they differ. A
+/// Welcome that names none drops nothing, and a lease granted while none was named is
+/// kept. The daemon's rule, public so a simulated daemon follows the same one.
+#[must_use]
+pub fn superseded(granted: Option<u64>, newest: Option<u64>) -> bool {
+    newest.is_some() && granted.is_some() && granted != newest
 }
 
 #[cfg(test)]
