@@ -416,6 +416,26 @@ async fn a_node_whose_stream_ended_is_listed_as_disconnected() {
     assert!(!farm.nodes().nodes[0].connected);
 }
 
+/// Catches an operator action that answers with `connected` read before the farm has
+/// noted the closed stream (`place` skipping `note_closed_streams`): the cordon's
+/// response would report a node whose stream is gone as connected. No read of the
+/// registry comes between the stream's end and the cordon, so only `place` notes it.
+#[tokio::test]
+async fn a_cordon_after_the_stream_ended_answers_not_connected() {
+    let farm = Farm::new(
+        cache(),
+        kbf_sched::UNSERVABLE_WAIT,
+        kbf_sched::FINISHED_RETENTION,
+    );
+    let node = WorkerId::new("linux-1");
+    let (_, responses) = register(&farm, "linux-1");
+    drop(responses);
+    let cordoned = farm
+        .place(&node, NodeAction::Cordon)
+        .expect("a registered node");
+    assert!(!cordoned.connected);
+}
+
 /// Catches a node registry that drops a node's status when its stream ends or when it
 /// registers again (the status is kept across streams until a newer one), one that
 /// leaves a node that registered again listed as not connected, and `node_view`
