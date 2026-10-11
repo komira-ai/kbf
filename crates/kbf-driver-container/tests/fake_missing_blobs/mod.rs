@@ -86,3 +86,29 @@ async fn a_missing_input_blob_is_reported_as_missing_with_its_digest() {
     }
     assert!(!fake.calls().contains(&"create".to_owned()));
 }
+
+/// Catches the opposite defect at the two call sites that fetch messages: an Action or
+/// a Command the CAS holds but that does not decode, reported as `MissingBlob`. The
+/// client would upload the same bytes and retry, forever. It is the client's malformed
+/// action (`Invalid`). The unit test pins this at `tree_error` only; this pins which
+/// mapping the Action and Command fetches use.
+#[tokio::test]
+async fn an_undecodable_action_or_command_is_invalid_not_missing() {
+    let fake = Fake::new("undecodable-messages");
+    let junk = fake.cas.insert(vec![0xff; 7]);
+    let command_junk = action_with(&fake, |a| a.command_digest = Some(junk.clone()));
+
+    let cases = [("action", junk.clone()), ("command", command_junk)];
+    for (seq, (what, action)) in (1..).zip(cases) {
+        let outcome = fake
+            .runtime
+            .run(work(seq, action, Resources::default()))
+            .await;
+        assert!(
+            matches!(&outcome, Err(RuntimeError::Invalid(why)) if why.contains("does not decode")),
+            "{what}: want Invalid(... does not decode ...), got {outcome:?}"
+        );
+        fake.assert_clean(seq);
+    }
+    assert!(!fake.calls().contains(&"create".to_owned()));
+}
