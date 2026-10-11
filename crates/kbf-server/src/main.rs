@@ -4,15 +4,20 @@
 //! On start it prints one line, `kbf-server <version> reapi=<addr> worker=<addr>`, with
 //! its version (`<package version>+<commit>`, [`kbf_server::SERVER_VERSION`]) and
 //! the addresses it bound (a port of 0 picks a free one), and ` api=<addr>` at its end
-//! when the operator API listens. On Unix the SIGINT and SIGTERM handlers are installed
-//! before that line is printed, so either signal any time after it stops the server
-//! with exit 0: open Execute and WaitExecution streams end UNAVAILABLE, REAPI
-//! connections are sent GOAWAY, and the server exits once they close or
+//! when the operator API listens, then ` log=<id>` under `--meta-log=raft`, the id of
+//! the log in `--raft-dir` (16 hex digits). On Unix the SIGINT and SIGTERM handlers
+//! are installed before that line is printed, so either signal any time after it stops
+//! the server with exit 0: open Execute and WaitExecution streams end UNAVAILABLE,
+//! REAPI connections are sent GOAWAY, and the server exits once they close or
 //! `--shutdown-timeout-secs` runs out (issue #168). If a handler cannot be installed it
 //! exits 2 without printing the start line.
 //!
 //! The REAPI listener runs the policy `--reapi-auth-policy` names; a policy file that
 //! cannot be read or is not a policy exits 2 before anything is bound.
+//!
+//! `--meta-log=raft` opens the log in `--raft-dir` (creating it if the directory is
+//! empty) before anything is bound, and writes objects under the prefix the log
+//! committed; a directory it refuses exits 2.
 
 use std::error::Error;
 use std::future::Future;
@@ -22,10 +27,11 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use clap::Parser;
-use kbf_front::{Cache, MemoryMetaLog};
+use kbf_front::{Cache, MemoryMetaLog, MetaLog};
+use kbf_log::FarmLogId;
 use kbf_meta::Retention;
 use kbf_objstore::{Capabilities, KeyPrefix, MemoryStore, ObjectStore};
-use kbf_server::{Args, SERVER_VERSION, StoreKind, bind_server_with_policy};
+use kbf_server::{Args, RaftMetaLog, SERVER_VERSION, StoreKind, bind_server_with_policy};
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -33,17 +39,7 @@ async fn main() -> ExitCode {
         .with_writer(std::io::stderr)
         .init();
     let args = Args::parse();
-    let result = match args.store {
-        StoreKind::Memory => {
-            let store = MemoryStore::new(Capabilities::default());
-            run(&args, store, KeyPrefix::default()).await
-        }
-        StoreKind::S3 => match args.s3_store(|name| std::env::var(name).ok()) {
-            Ok((store, prefix)) => run(&args, store, prefix).await,
-            Err(e) => Err(e.into()),
-        },
-    };
-    match result {
+    match start(&args).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("kbf-server: {e}");
@@ -52,27 +48,58 @@ async fn main() -> ExitCode {
     }
 }
 
-async fn run<O: ObjectStore + 'static>(
+/// Builds the object store and the metadata log the flags name, then serves.
+async fn start(args: &Args) -> Result<(), Box<dyn Error>> {
+    let raft_dir = args.raft_dir()?;
+    let memory = || MemoryMetaLog::new(Retention::default());
+    match args.store {
+        StoreKind::Memory => {
+            let store = MemoryStore::new(Capabilities::default());
+            run(args, memory(), store, KeyPrefix::default(), None).await
+        }
+        StoreKind::S3 => {
+            let (store, start_prefix) = args.s3_store(|name| std::env::var(name).ok())?;
+            match raft_dir {
+                None => run(args, memory(), store, start_prefix, None).await,
+                Some(dir) => {
+                    let log =
+                        RaftMetaLog::open_dir(dir, Retention::default(), &args.s3_prefix).await?;
+                    let (prefix, id) = (log.store_prefix(), log.log_id());
+                    run(args, log, store, prefix, Some(id)).await
+                }
+            }
+        }
+    }
+}
+
+async fn run<M: MetaLog, O: ObjectStore + 'static>(
     args: &Args,
+    meta: M,
     store: O,
     prefix: KeyPrefix,
+    log: Option<FarmLogId>,
 ) -> Result<(), Box<dyn Error>> {
     let listeners = args.listeners()?;
     let policy = args.reapi_auth_policy()?;
-    let cache =
-        Arc::new(Cache::open(MemoryMetaLog::new(Retention::default()), store, prefix).await?);
+    let cache = Arc::new(Cache::open(meta, store, prefix).await?);
     let shutdown = interrupted()?;
     let api = args.api()?;
     let bound = bind_server_with_policy(cache, listeners, api, policy, shutdown)?;
-    println!("{}", start_line(bound.reapi, bound.worker, bound.api));
+    println!("{}", start_line(bound.reapi, bound.worker, bound.api, log));
     bound.serving.await?;
     Ok(())
 }
 
-/// The start line: the version and the addresses bound.
-fn start_line(reapi: SocketAddr, worker: SocketAddr, api: Option<SocketAddr>) -> String {
+/// The start line: the version, the addresses bound and the Raft log's id.
+fn start_line(
+    reapi: SocketAddr,
+    worker: SocketAddr,
+    api: Option<SocketAddr>,
+    log: Option<FarmLogId>,
+) -> String {
     let api = api.map(|a| format!(" api={a}")).unwrap_or_default();
-    format!("kbf-server {SERVER_VERSION} reapi={reapi} worker={worker}{api}")
+    let log = log.map(|id| format!(" log={id}")).unwrap_or_default();
+    format!("kbf-server {SERVER_VERSION} reapi={reapi} worker={worker}{api}{log}")
 }
 
 /// Installs the SIGINT and SIGTERM handlers now and returns a future that completes on

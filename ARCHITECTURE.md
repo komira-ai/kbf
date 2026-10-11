@@ -200,22 +200,25 @@ See [scheduler.md](docs/design/scheduler.md) and
 
 | State | Today | Planned |
 |---|---|---|
-| CAS index, action cache, farm time | `MetaState` behind `MemoryMetaLog`, in the server's memory | the same state machine applied from a Raft log on local disk: one voter, then three |
+| CAS index, action cache, farm time | `MetaState` behind `MemoryMetaLog`, in the server's memory (the default, `--meta-log=memory`); with `--meta-log=raft`, behind `RaftMetaLog`, applied from a single-voter Raft log on local disk | the Raft log with three voters |
 | Blob bytes | segments in an object store (in memory, or an S3 bucket) | the same, with garbage collection and multiple stores |
 | Leases, operations, workers | `Scheduler` in the server's memory; a control record "commits" when appended | the same state machine fed from a replicated control log, kept on the servers' local disks |
 | Callers and started leases | `FarmMachine` (`kbf-server`'s `machine` module) in the server's memory: each caller's record, the finished operations whose callers are kept for the finished retention, and the leases whose `Start` was sent; each caller's channel stays beside it in the farm core | the same machine fed from the replicated control log |
 | Node reports | read at `Hello`: `cpus`, `mem_gib` and `gpu` are booked; `arch`, `cpu.features`, `os` and the other exact keys are matched against each action's platform; held in memory, so a restart forgets every node | operator labels, report changes noticed by hash; a durable node registry that remembers absent nodes, alerts on them and restores them on reconnect |
 
-Because the index is in memory today, a restarted server forgets every blob. With
-`--store=s3` each start writes under a fresh key prefix so it never reads objects a
-previous process wrote.
+Under `--meta-log=memory` the index is in memory, so a restarted server forgets every
+blob, and with `--store=s3` each start writes under a fresh key prefix so it never reads
+objects a previous process wrote. Under `--meta-log=raft` (which needs `--store=s3`) a
+restart reopens the log in `--raft-dir` and keeps the index and the action cache, and
+every start writes under the prefix the log committed when it was created,
+`<--s3-prefix><log id>/`, each in a new writer epoch.
 
 Every piece of state sits behind a trait or a pure state machine, so moving it into a
 replicated log changes the implementation behind the seam, not its callers:
 
 - `MetaLog` (in `kbf-front`): `commit` a metadata command, `query` the committed
-  state. `MemoryMetaLog` is the single-process implementation; a replicated log
-  implements the same two calls.
+  state. `MemoryMetaLog` is the single-process implementation; `RaftMetaLog` (in
+  `kbf-server`) implements the same two calls over a single-voter Raft log.
 - `ObjectStore` (in `kbf-objstore`): five calls any S3-compatible store can serve.
 - `Dispatch` (in `kbf-front`): how the REAPI front reaches the scheduler.
 - `FarmMachine` (in `kbf-server`): a pure struct that compares with `Eq`; it reads
@@ -272,10 +275,13 @@ with what exists today and the probes still to run. In short:
   and placement prefers a worker that already has an action's inputs.
 
 What already holds for this shape in the single-server code: the seams above, lease
-ids that carry the granting process's term, a scheduler that refuses results from
-leases it does not hold, a lease epoch in `Welcome` that makes a daemon drop leases a
-restarted server never granted, and a daemon protocol in which only the newest stream
-of a worker counts. See [scheduler.md](docs/design/scheduler.md#more-than-one-server).
+ids that carry the granting process's term (the Raft term under `--meta-log=raft`), a
+scheduler that refuses results from leases it does not hold, a lease epoch in
+`Welcome` that makes a daemon drop leases a restarted server never granted (under
+`--meta-log=raft` the epoch is the log id, the same at every start, so the daemon keeps
+its runs, and until the scheduler's state is in the log a restart leaves them running
+as orphans whose results are refused), and a daemon protocol in which only the newest
+stream of a worker counts. See [scheduler.md](docs/design/scheduler.md#more-than-one-server).
 
 ## Security model
 

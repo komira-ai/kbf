@@ -2,7 +2,8 @@
 //! metadata core and storage together; the decisions are theirs.
 //!
 //! - REAPI on one listener: the cache services and `Execution` from `kbf-front`, over
-//!   a [`kbf_front::Cache`] (in-memory metadata, and an in-memory or S3 object store).
+//!   a [`kbf_front::Cache`] (metadata in memory, or in a single-voter Raft log on the
+//!   local disk with `--meta-log=raft`, [`raft_log`]; an in-memory or S3 object store).
 //! - `kbf.worker.v1` on another ([`worker`]): daemons register, heartbeat, receive
 //!   lease offers and `Start`s, and report results. Under mutual TLS a daemon's
 //!   certificate must name its node, and a deny list refuses certificates and nodes
@@ -30,8 +31,8 @@
 //!   on that listener alone and an authorizer per kind of call in the services;
 //!   without the flag every call is accepted and allowed.
 //!
-//! Not yet: Raft (the control log is in-process: a record commits as soon as it is
-//! appended, see [`farm`]), REAPI authentication other than the policies
+//! Not yet: the scheduler's state in the Raft log (the control log is in-process: a
+//! record commits as soon as it is appended, see [`farm`]), REAPI authentication other than the policies
 //! `kbf-auth` builds (`allow`, `deny`, `any`, `all`), operator roles (the
 //! API's writes need one token, [`token`]), the `x-kbf-qos` header, learned sizes,
 //! capability matching, and the daemon-side `ResultAck` handling (issue #26).
@@ -49,6 +50,7 @@ pub mod identity;
 mod machine;
 pub mod mdm;
 mod memory;
+pub mod raft_log;
 pub mod rollout;
 pub mod serve;
 mod stamp;
@@ -56,10 +58,11 @@ mod timeout;
 pub mod token;
 pub mod worker;
 
-pub use config::{Args, ConfigError, Role, StoreKind};
+pub use config::{Args, ConfigError, MetaLogKind, Role, StoreKind};
 pub use farm::Farm;
 pub use health::Readiness;
 pub use identity::{DenyList, DenyListError, Peers};
+pub use raft_log::{RaftLogError, RaftMetaLog};
 pub use serve::{
     Api, Bound, Listeners, ServeError, WorkerTls, bind_server, bind_server_with_api,
     bind_server_with_policy,

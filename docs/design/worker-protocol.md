@@ -351,26 +351,36 @@ action's result, and it was written to the action cache under their action's dig
 close this, each on its own:
 
 1. **A lease id names one lease, ever.** Each server process grants its leases under a
-   term of its own, picked at start: the start time in milliseconds on the wall clock,
-   times 2^16, plus 16 random bits. It orders after every earlier process's term while
-   the wall clock does not step back across a restart, and differs from it unless a
-   restart lands on an earlier start's very millisecond and the random bits match.
+   term of its own, picked at start. Under `--meta-log=memory` it is the start time in
+   milliseconds on the wall clock, times 2^16, plus 16 random bits. It orders after
+   every earlier process's term while the wall clock does not step back across a
+   restart, and differs from it unless a restart lands on an earlier start's very
+   millisecond and the random bits match. Under `--meta-log=raft` it is the Raft term
+   the log elects the server in at start, which is greater at every start.
    The server knows only the leases it granted, so a `Result` of an earlier process's
    lease is refused, and a lease of another term listed in a heartbeat is never
    cancelled (it may belong to a newer leader).
 2. **The epoch in `Welcome`.** `Welcome.epoch` names the record of leases the server
-   answers for; a single-node server names its term. The daemon remembers the epoch
+   answers for. Under `--meta-log=memory` that is the process, so the server names
+   its term; under `--meta-log=raft` it names the log id, the same at every start over
+   one `--raft-dir`, and never 0. The daemon remembers the epoch
    of the newest `Welcome` with every lease it acts on. On a `Welcome` that names
    another epoch, before it resends anything or reads a `Start`, it kills the runs of
    the earlier epoch's leases (they are listed until they stop, like a cancelled run)
    and forgets their results without sending them: no server of the new epoch can
    accept them. A `Welcome` with epoch 0 (a server that predates the field) drops
-   nothing, and a lease granted while no epoch was named is kept. **Planned:** with
-   the replicated log, the epoch names the log, which outlives leaders and their
-   terms, so a change of leader drops nothing: the daemon keeps its running leases
-   and resends their unacknowledged results to the new leader, which knows the
-   committed grants from the log
+   nothing, and a lease granted while no epoch was named is kept. Because the log id
+   outlives leaders and their terms, a change of leader drops nothing: the daemon
+   keeps its running leases and resends their unacknowledged results. **Planned:**
+   the new leader knows the committed grants from the log and accepts them
    ([deployment-topology.md](deployment-topology.md#daemons-straight-to-the-servers-one-stream-to-the-leader)).
+   **Today** the scheduler's state is not in the log, so after a restart under
+   `--meta-log=raft` the old runs are orphans: rule 1 refuses their results and
+   cancels none of them. Results are never doubled; runs may be. A client's new
+   `Execute` of the same action can run beside its orphan, and the server, which
+   counts the node's capacity as free, can book new work beside the orphans: at most
+   the bookings of the leases the node held at the restart, for at most each orphan's
+   action timeout (the driver's default when the action names none).
 3. **A `Result` names its action.** The daemon echoes the `Start`'s `action_digest`
    in its `Result`, and the server refuses a `Result` whose `action_digest` is set and
    is not the action of the operation it granted the lease for, whatever the lease id

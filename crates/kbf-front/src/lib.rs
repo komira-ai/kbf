@@ -7,7 +7,7 @@
 //! index and action cache in a [`MetaLog`] and its bytes in a
 //! [`kbf_objstore::ObjectStore`], packed into `kbf-segments` segments. Both are traits:
 //! [`Cache::memory`] runs them in this process ([`MemoryMetaLog`] and the fake store),
-//! and the replicated log and the S3 store slot in behind the same traits.
+//! and `kbf-server`'s Raft log and the S3 store slot in behind the same traits.
 //!
 //! The promises the services keep (`ARCHITECTURE.md#cache-traffic` and
 //! `docs/design/storage.md`):
@@ -62,7 +62,7 @@ pub use crate::execution::{
     ExecutionService, Finished, GPU_KEY, LEASE_KIND_KEY, LEASE_KINDS, NO_WORKER_REASON,
     OperationStream, Stage, Submission, Ticket, closing,
 };
-pub use crate::meta_log::{MemoryMetaLog, MetaLog, MetaLogError};
+pub use crate::meta_log::{Leadership, MemoryMetaLog, MetaLog, MetaLogError};
 
 /// The most blob data one `BatchUpdateBlobs` or `BatchReadBlobs` call may carry,
 /// advertised in the capabilities. Larger blobs go through ByteStream.
