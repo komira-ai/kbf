@@ -237,6 +237,35 @@ impl Host for MacHost {
     fn pause(&self) {
         std::thread::sleep(Duration::from_millis(100));
     }
+
+    fn boot_session(&self) -> io::Result<String> {
+        let mut buffer = [0u8; 128];
+        let mut len = buffer.len();
+        // SAFETY: the name is a NUL-terminated string, `buffer` is writable for `len`
+        // bytes and `len` is a writable size_t the call sets to what it wrote; nothing
+        // is written to the sysctl (null new value, length 0).
+        let code = unsafe {
+            libc::sysctlbyname(
+                c"kern.bootsessionuuid".as_ptr(),
+                buffer.as_mut_ptr().cast(),
+                &raw mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if code != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let value = buffer.get(..len).unwrap_or_default();
+        let value = value.strip_suffix(&[0]).unwrap_or(value);
+        match std::str::from_utf8(value) {
+            Ok(text) if !text.is_empty() => Ok(text.to_owned()),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "kern.bootsessionuuid is not a non-empty string",
+            )),
+        }
+    }
 }
 
 /// Sets a fresh password of 32 random bytes, in hex, on `record`, and returns it.

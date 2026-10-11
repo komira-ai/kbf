@@ -17,6 +17,9 @@ pub(crate) const NOW: u64 = 1_800_000_000;
 /// bound, and the test panics instead of hanging.
 const PAUSES: usize = 10_000;
 
+/// What runs on the fake host between two of the helper's steps.
+pub(crate) type Hook = Box<dyn Fn(&str) + Send>;
+
 #[derive(Default)]
 pub(crate) struct State {
     /// Every call, in order, as text.
@@ -39,15 +42,21 @@ pub(crate) struct State {
     pub(crate) pauses: usize,
     /// Calls that fail, by name ("uid_taken", "make_home", "create_user",
     /// "delete_user", "domain_exists", "bootout gui", "kill_all", "live_processes",
-    /// "command", "reset_password").
+    /// "command", "reset_password", "boot_session").
     pub(crate) fail: BTreeSet<&'static str>,
     /// What `command` answers, by the command's text (`program arg ...`). A command
     /// with no answer succeeds and prints nothing, except `fdesetup isactive`, which
-    /// prints `false` (FileVault off).
+    /// prints `false` (FileVault off), and `defaults read`, which fails as `defaults`
+    /// does for a key that is not set.
     pub(crate) answers: BTreeMap<String, CommandOutput>,
     /// A file each `command` reads, logging what it holds: shows what the intent record
     /// said when each program ran.
     pub(crate) intent: Option<PathBuf>,
+    /// What `boot_session` answers; `boot-2` when unset.
+    pub(crate) boot: Option<String>,
+    /// Runs with each command's text before it is answered: a change on the host
+    /// between two of the helper's steps.
+    pub(crate) on_command: Option<Hook>,
     /// The launchd domains that exist (`gui/<uid>` once a login has completed).
     pub(crate) domains: BTreeSet<String>,
 }
@@ -159,12 +168,20 @@ impl Host for FakeHost {
         };
         self.call("command", format!("command {text}{seen}"))?;
         let state = self.state();
+        if let Some(hook) = &state.on_command {
+            hook(&text);
+        }
         Ok(match state.answers.get(&text) {
             Some(answer) => answer.clone(),
             None if text == "/usr/bin/fdesetup isactive" => CommandOutput {
                 success: false,
                 stdout: "false\n".to_owned(),
                 stderr: String::new(),
+            },
+            None if text.starts_with("/usr/bin/defaults read ") => CommandOutput {
+                success: false,
+                stdout: String::new(),
+                stderr: format!("The domain/default pair of ({text}) does not exist\n"),
             },
             None => CommandOutput {
                 success: true,
@@ -177,6 +194,15 @@ impl Host for FakeHost {
     fn reset_password(&self, name: &str) -> io::Result<String> {
         self.call("reset_password", format!("reset_password {name}"))?;
         Ok(format!("pw-{name}"))
+    }
+
+    fn boot_session(&self) -> io::Result<String> {
+        self.call("boot_session", "boot_session".to_owned())?;
+        Ok(self
+            .state()
+            .boot
+            .clone()
+            .unwrap_or_else(|| "boot-2".to_owned()))
     }
 
     fn pause(&self) {

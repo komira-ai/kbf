@@ -2,7 +2,8 @@
 //! user (docs/design/fleet-updates-security.md S4.2 and S4.3; fleet-updates.md 10.2,
 //! layer L0): the verbs `user-create`, `run` (in the background, or in the lease user's
 //! GUI session), `kill-uid` and `user-delete`, the GUI session switch (`session-login`,
-//! `session-ready`, `session-idle`) and the boot reset. The leak scan is a later phase.
+//! `session-ready`, `session-idle`), the boot reset, and the leak scan's `scan`,
+//! `baseline` and `reboot-dirty` over a minimal item set.
 //!
 //! - [`lease`]: lease ids, user names (`kbf-lease-<term>-<seq>`) and the uid range.
 //! - [`grant`]: the MDM gate's signed admin grant.
@@ -11,6 +12,7 @@
 //! - [`autologin`]: the session switch's intent record, `/etc/kcpassword`, the login
 //!   window's preference and the restart.
 //! - [`sweep`]: what `user-delete` removes, never following a link.
+//! - [`scan`]: the leak scan's items, its baseline and the baseline window.
 //! - [`spawn`]: starting a process as the lease user.
 //! - [`proto`], [`server`], [`client`]: the socket, its wire format, the caller check.
 //! - [`start`]: flags and start-up.
@@ -28,6 +30,7 @@ pub mod helper;
 pub mod lease;
 pub mod ledger;
 pub mod proto;
+pub mod scan;
 pub mod server;
 pub mod spawn;
 pub mod start;

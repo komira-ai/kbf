@@ -1,6 +1,7 @@
-//! The verbs: `user-create`, `run`, `kill-uid` and `user-delete` (S4.2), and in
-//! [`switch`] the session switch and the boot reset, over a [`Host`] that does what
-//! only the OS can (user records, launchd, processes, the programs the switch runs),
+//! The verbs: `user-create`, `run`, `kill-uid` and `user-delete` (S4.2), in
+//! [`switch`] the session switch and the boot reset, and in [`leak`] the leak scan's
+//! `scan`, `baseline` and `reboot-dirty`, over a [`Host`] that does what only the OS
+//! can (user records, launchd, processes, the programs the switch and the scan run),
 //! so the rules here are tested on any platform.
 //!
 //! Rules every verb keeps:
@@ -24,6 +25,8 @@
 //!   bounded, for processes of the uid to exit (a cron job that started after
 //!   `kill-uid`), and names those still alive when it refuses. It is refused for the
 //!   lease the session switch's intent record names (`session-idle` first).
+//! - The first `user-create` closes the baseline window, and makes a dirty scan's
+//!   verdict stale (`reboot-dirty` then needs a new scan).
 //! - Every verb but `boot-reset` is refused until the boot reset has succeeded.
 //!
 //! The mutating verbs run one at a time (one lock around the ledger), and `run` holds
@@ -45,9 +48,11 @@ use crate::grant::{self, Expect, GrantKeys};
 use crate::lease::{UidRange, parse_lease, user_name};
 use crate::ledger::{Entry, Ledger};
 use crate::proto::{Reply, Request, Session};
+use crate::scan::ScanSettings;
 use crate::spawn::{self, Spawn};
 use crate::sweep::{SweepPlan, sweep};
 
+mod leak;
 mod switch;
 
 pub use switch::Reset;
@@ -127,6 +132,12 @@ pub trait Host: Send + Sync {
     /// # Errors
     /// There is no such user, or the password could not be set.
     fn reset_password(&self, name: &str) -> io::Result<String>;
+    /// This boot's identifier (macOS: `kern.bootsessionuuid`), for the baseline
+    /// window.
+    ///
+    /// # Errors
+    /// The kernel did not say.
+    fn boot_session(&self) -> io::Result<String>;
 }
 
 /// A live process of a lease uid, as a refusal names it.
@@ -183,6 +194,8 @@ pub struct Settings {
     pub serial: String,
     /// Where the session switch keeps its state.
     pub session: SessionPaths,
+    /// What the leak scan looks at, and where it keeps its baseline and window.
+    pub scan: ScanSettings,
 }
 
 /// What a request comes to.
@@ -201,6 +214,9 @@ pub struct Helper {
     ledger: Mutex<Ledger>,
     /// Set, under the ledger's lock, once the boot reset has succeeded.
     reset_done: AtomicBool,
+    /// Set, under the ledger's lock, when the last scan came back dirty and no lease
+    /// user was created since: the one state `reboot-dirty` is accepted in.
+    dirty: AtomicBool,
 }
 
 impl Helper {
@@ -211,6 +227,7 @@ impl Helper {
             settings,
             ledger: Mutex::new(ledger),
             reset_done: AtomicBool::new(false),
+            dirty: AtomicBool::new(false),
         }
     }
 
@@ -255,6 +272,9 @@ impl Helper {
                 kept: reset.kept.map(|lease| lease.to_string()),
                 deleted: reset.deleted.iter().map(ToString::to_string).collect(),
             }),
+            Request::Scan => self.scan().map(leak::scanned),
+            Request::Baseline => self.baseline().map(|classes| Reply::Baselined { classes }),
+            Request::RebootDirty => self.reboot_dirty().map(|()| Reply::Restarting),
         };
         result.map_or_else(refused, Outcome::Reply)
     }
@@ -289,6 +309,7 @@ impl Helper {
             ));
         }
         let uid = self.free_uid(&ledger)?;
+        self.first_lease_user()?;
         ledger
             .record_created(lease, uid)
             .map_err(|why| format!("recording lease {lease}: {why}"))?;

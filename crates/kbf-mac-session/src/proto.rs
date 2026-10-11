@@ -26,6 +26,10 @@ use serde::{Deserialize, Serialize};
 pub const MAX_FRAME: usize = 64 * 1024;
 /// The number of descriptors a `run` request carries.
 pub const RUN_FDS: usize = 4;
+/// The most entries each list of a [`Reply::Scanned`] names, each cut to
+/// [`SCAN_LINE_BYTES`], so the reply fits a frame; the helper's log holds them all.
+pub const SCAN_LINES: usize = 20;
+pub const SCAN_LINE_BYTES: usize = 300;
 
 /// The receive buffer for ancillary data. On Linux, room for one more descriptor than a
 /// request may carry: the kernel cuts what does not fit, says so (`MSG_CTRUNC`), and
@@ -83,6 +87,12 @@ pub enum Request {
         #[serde(default)]
         held: Vec<String>,
     },
+    /// The leak scan against the recorded baseline.
+    Scan,
+    /// Record the leak scan's baseline, in its window.
+    Baseline,
+    /// Reboot, after the helper's own scan came back dirty.
+    RebootDirty,
 }
 
 /// Where `run` starts a process.
@@ -136,6 +146,17 @@ pub enum Reply {
         kept: Option<String>,
         deleted: Vec<String>,
     },
+    /// The scan ran: `clean` when nothing was added to or removed from the baseline
+    /// and every item could be read. Each list names at most
+    /// [`SCAN_LINES`] entries, then how many more there are.
+    Scanned {
+        clean: bool,
+        added: Vec<String>,
+        removed: Vec<String>,
+        errors: Vec<String>,
+    },
+    /// The baseline is recorded: how many items each class holds.
+    Baselined { classes: Vec<(String, usize)> },
     /// The request was refused or failed, and why.
     Refused { reason: String },
 }
@@ -622,6 +643,11 @@ mod tests {
         assert_eq!(text, r#"{"verb":"user-create","lease":"1.1"}"#);
         let text = serde_json::to_string(&Reply::Deleted { existed: true }).unwrap();
         assert_eq!(text, r#"{"deleted":{"existed":true}}"#);
+        let text = serde_json::to_string(&Request::RebootDirty).unwrap();
+        assert_eq!(text, r#"{"verb":"reboot-dirty"}"#);
+        let classes = vec![("lease-users".to_owned(), 1)];
+        let text = serde_json::to_string(&Reply::Baselined { classes }).unwrap();
+        assert_eq!(text, r#"{"baselined":{"classes":[["lease-users",1]]}}"#);
     }
 
     /// Catches a `run` that changes on the wire for the daemons that predate the

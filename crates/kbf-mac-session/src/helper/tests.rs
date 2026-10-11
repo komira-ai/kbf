@@ -54,6 +54,7 @@ pub(super) fn rig_with(name: &str, range: UidRange, dir: Option<PathBuf>) -> Rig
         grant_keys: Some(GrantKeys::parse(&key_line(7)).unwrap()),
         serial: "SERIAL1".to_owned(),
         session: SessionPaths::under(&dir),
+        scan: crate::scan::ScanSettings::under(&dir),
     };
     let ledger = Ledger::open(&dir.join("ledger")).unwrap();
     let helper = Helper::new(Box::new(host.clone()), settings, ledger);

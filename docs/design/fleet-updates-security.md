@@ -237,18 +237,19 @@ every argument restricted to the lease uid range (default 600-699 **[A]**):
   cannot change installed software. `automationmodetool` runs once from the
   provisioning profile, not through this helper.
 
-> **Built (phase P1, and P4's session switch):** `crates/kbf-mac-session` serves
-> `user-create`, `run`, `kill-uid` and `user-delete` with the socket and caller check
-> of S4.3, and `session-login`, `session-ready`, `session-idle` and the boot reset;
-> `scan`, `baseline` and `reboot-dirty` are not built. `run` takes a session target:
-> `gui` starts the process in the lease user's GUI session (`launchctl asuser <uid>`
-> running the helper's own `as-user` mode, which drops to the user's uid and gid with
-> no supplementary groups before it executes the argument vector), refused unless the
-> intent record names the lease and launchd has its `gui/<uid>` domain;
-> `session-ready` answers whether it does. The bare-metal whole-machine runtime (10.1)
-> calls the boot reset at its start and the session switch for every lease; no node
-> runs it yet: it needs FileVault off and the helper and the daemon installed as
-> LaunchDaemons, both planned. Where it settles what this section leaves open, or differs:
+> **Built (phase P1, and P4's session switch and leak scan):** `crates/kbf-mac-session`
+> serves `user-create`, `run`, `kill-uid` and `user-delete` with the socket and caller
+> check of S4.3, `session-login`, `session-ready`, `session-idle` and the boot reset,
+> and `scan`, `baseline` and `reboot-dirty` over a minimal item set. `run` takes a
+> session target: `gui` starts the process in the lease user's GUI session
+> (`launchctl asuser <uid>` running the helper's own `as-user` mode, which drops to the
+> user's uid and gid with no supplementary groups before it executes the argument
+> vector), refused unless the intent record names the lease and launchd has its
+> `gui/<uid>` domain; `session-ready` answers whether it does. The bare-metal
+> whole-machine runtime (10.1) calls the boot reset at its start and the session switch
+> for every lease; no daemon calls the scan yet, and no node runs any of them: they need
+> FileVault off and the helper and the daemon installed as LaunchDaemons, both planned.
+> Where it settles what this section leaves open, or differs:
 > - The user is `kbf-lease-<term>-<seq>` (a hyphen for the lease id's dot). Used lease
 >   ids are kept in an append-only ledger in the helper's state directory, so a name,
 >   and a grant (which names one lease), is used once across reboots; a uid is free
@@ -319,11 +320,33 @@ every argument restricted to the lease uid range (default 600-699 **[A]**):
 >   is killed and deleted as `kill-uid` and `user-delete` do. A reset that fails
 >   part-way names each failure and can be repeated. It restarts nothing: a stale
 >   session's processes end with `kill-uid`'s bootout of `gui/<uid>`.
-> - Every program the switch runs (`defaults`, `launchctl`, `fdesetup`) goes through
->   the host's command runner with an empty environment, so the unit tests fake each
->   one and nothing in CI restarts: the macOS CI job runs the boot reset for real over
->   a login-window file and `kcpassword` of its own, and never `session-login` or
->   `session-idle`.
+> - Every program the switch and the scan run (`defaults`, `launchctl`, `fdesetup`,
+>   `sfltool`) goes through the host's command runner with an empty environment, so
+>   the unit tests fake each one and nothing in CI restarts: the macOS CI job runs the
+>   boot reset for real over a login-window file and `kcpassword` of its own, never
+>   `session-login` or `session-idle`, runs `baseline` and `scan` over the runner's
+>   own folders, and sends `reboot-dirty` only after a clean scan, when it is refused.
+> - **The leak scan as built** collects a minimal set of the items of fleet-updates.md
+>   10.2, each one line of text: the entries of `/Library/LaunchAgents` and
+>   `/Library/LaunchDaemons` and launchd's `loginitems.<uid>.plist` files (kind, owner,
+>   mode, a file's SHA-256, a link's target; links are never followed), each entry
+>   `sfltool dumpbtm` prints (record uid, identifier, type, URL, executable,
+>   disposition; not the UUID or generation, which change by themselves), each uid of
+>   the lease range a user record has, and the auto-login state (`autoLoginUser`,
+>   whether `/etc/kcpassword` exists, the intent record). `scan` reports what was added
+>   to and removed from the baseline; an item that cannot be read is reported too and
+>   makes the scan dirty. The other items of 10.2 are not collected yet, and the boot
+>   reset does not scan yet.
+> - **The baseline window.** `baseline` is accepted only while the window file
+>   (`baseline-window` in the state directory, root's) exists and names another boot
+>   than this one (`kern.bootsessionuuid`), no lease user exists, and every item could
+>   be read. The root tool that applies a set or erases the Mac opens it by writing the
+>   boot it runs in; the first `user-create` removes it, and is refused if it cannot.
+>   No tool writes it yet (`kbf-updater` does not run on Macs).
+> - **`reboot-dirty`** (`launchctl reboot system`) is accepted only when the helper's
+>   last `scan` since it started came back dirty and no `user-create` came after it,
+>   and once per such scan: a later clean or refused scan, a new baseline, or a new
+>   lease user makes the verdict stale.
 > - `run` starts the process in the system launchd domain as the lease user, not in
 >   the user's own domain (`launchctl asuser`); tools that need per-user launchd
 >   services are P4's.

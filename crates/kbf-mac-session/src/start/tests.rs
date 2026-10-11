@@ -62,6 +62,7 @@ fn prepared(args: &Args) -> Result<Ready, String> {
         "S".to_owned(),
         crate::sweep::SweepPlan::macos_schedules(),
         crate::sweep::SweepPlan::macos(),
+        crate::scan::ScanFolder::macos(),
     )
 }
 
