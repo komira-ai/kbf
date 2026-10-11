@@ -357,8 +357,8 @@ async fn swapped_below_its_cap_a_lease_is_not_killed() {
 /// charged within one 200 ms sample, then `memory.events` `oom 1`, `oom_kill 13`).
 /// The driver reports such a kill as the lease's own out-of-memory kill, rightly: its
 /// cap ran the OOM killer. The swap watch's kill is `cgroup.kill`, which counts no
-/// `oom`, so when a sample shows `oom` the test fails on that premise, naming the
-/// kernel, rather than as a kill by the watch.
+/// `oom_kill`, so when the cell's `oom_kill` grew during the run the test fails on
+/// that premise, naming the kernel, rather than as a kill by the watch.
 ///
 /// What the lease can push into swap itself at its cap is bounded: what it held in
 /// RAM after the reclaim, its cap's headroom, the 96 MiB of buffers and a little
@@ -474,10 +474,13 @@ async fn swapped_by_the_host_then_at_its_cap_a_lease_is_not_killed() {
     // swap it held in the first sample that counted `max` events, and whether between
     // two samples its `max` events grew and its swap rose (where the absolute-swap
     // rule kills). A sample that cannot be read (after the action's exit, the lease
-    // cgroup is gone) counts nothing. And the most `oom` events a sample counted: the
-    // kernel's OOM killer ran at the cap this test set.
+    // cgroup is gone) counts nothing. And the processes the kernel's OOM killer killed
+    // in the cell meanwhile: the cell's `memory.events` counts its leases' kills too,
+    // and stays readable after the driver removes the lease cgroup, which on
+    // podman-x86 came within one sample of the kill.
+    let cell_kills = || events(&cell.cgroup, "oom_kill").unwrap_or(0);
+    let kills_before = cell_kills();
     let mut seen = Vec::new();
-    let mut kernel_ooms = 0;
     let mut at_cap = 0;
     let mut swap_at_cap = None;
     let mut last: Option<(u64, u64)> = None;
@@ -499,16 +502,16 @@ async fn swapped_by_the_host_then_at_its_cap_a_lease_is_not_killed() {
                     }
                     last = Some((max, swap));
                 }
-                kernel_ooms = kernel_ooms.max(events(&lease, "oom").unwrap_or(0));
                 seen.push(state(&lease));
             }
         }
     };
+    let kernel_kills = cell_kills().saturating_sub(kills_before);
     let result = match outcome {
         Ok(result) => result,
-        Err(e) if kernel_ooms > 0 => panic!(
+        Err(e) if kernel_kills > 0 => panic!(
             "the premise: the kernel's OOM killer does not run at the cap this test sets; \
-             it ran {kernel_ooms} time(s), and the driver reported that as {e:?}: {}",
+             it killed {kernel_kills} process(es), and the driver reported that as {e:?}: {}",
             seen.join("\n")
         ),
         Err(e) => panic!("{e:?}\n{}", seen.join("\n")),
