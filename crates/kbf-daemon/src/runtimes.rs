@@ -158,6 +158,35 @@ mod tests {
         assert!(text.contains("lease kind action:"), "{text}");
     }
 
+    /// Catches: a clash check that looks at only some kinds of [`LeaseKind::ALL`] (only
+    /// `action`, or the first few), which would take two `whole_machine` or `vm` runtimes
+    /// and send every Start of that kind to the first; and an error that names the
+    /// set's first runtime rather than the one that serves the kind.
+    #[test]
+    fn every_kind_served_twice_is_refused() {
+        for kind in LeaseKind::ALL {
+            let other = LeaseKind::ALL
+                .into_iter()
+                .find(|k| *k != kind)
+                .expect("ALL has more than one kind");
+            let err = Runtimes::new(fake(other, "a"))
+                .and(fake(kind, "b"))
+                .expect("distinct kinds")
+                .and(fake(kind, "c"))
+                .expect_err("two runtimes serve one kind");
+            assert_eq!(
+                err,
+                KindServedTwice {
+                    kind,
+                    first: "b",
+                    second: "c",
+                },
+                "kind {}",
+                kind.name()
+            );
+        }
+    }
+
     /// Catches: a lookup that answers the first runtime whatever the kind, and drivers
     /// that list only the first runtime's, or one driver twice.
     #[test]
