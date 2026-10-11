@@ -3,7 +3,7 @@
 //! writes outside a scratch directory.
 
 use kbf_host::testkit::{FakeExec, RUNNER};
-use kbf_host::{Entry, Step};
+use kbf_host::{Entry, Owner, Step};
 
 use super::*;
 use crate::set::AptPin;
@@ -47,10 +47,10 @@ fn apt_step(args: &[&str]) -> Step {
     )
 }
 
-fn binary(bytes: &[u8]) -> Entry {
+fn binary(bytes: &[u8], owner: Owner) -> Entry {
     Entry::File {
         perms: Perms::new(0o755),
-        owner: RUNNER,
+        owner,
         bytes: bytes.to_vec(),
     }
 }
@@ -126,24 +126,35 @@ fn staged_artifacts_replace_the_installed_binaries() {
     let updater = p(&format!("{BIN}/kbf-updater"));
     a.exec
         .entries
-        .insert(updater.clone(), binary(b"old updater"));
+        .insert(updater.clone(), binary(b"old updater", RUNNER));
     assert_eq!(
         a.install(&testkit::set(5), &staged),
         Ok(Installed { reboot: false })
     );
     let daemon = p(&format!("{BIN}/kbf-daemon"));
-    assert_eq!(a.exec.entries.get(&daemon), Some(&binary(b"new daemon")));
-    assert_eq!(a.exec.entries.get(&updater), Some(&binary(b"old updater")));
+    assert_eq!(
+        a.exec.entries.get(&daemon),
+        Some(&binary(b"new daemon", ROOT))
+    );
+    assert_eq!(
+        a.exec.entries.get(&updater),
+        Some(&binary(b"old updater", RUNNER))
+    );
     assert_eq!(a.exec.entries.len(), 2, "{:?}", a.exec.entries.keys());
 
     fs::write(staged.join("kbf-daemon"), b"newer daemon").unwrap();
-    a.exec.entries.insert(p(REBOOT_REQUIRED), binary(b""));
+    a.exec
+        .entries
+        .insert(p(REBOOT_REQUIRED), binary(b"", RUNNER));
     a.exec.log.clear();
     assert_eq!(
         a.install(&testkit::set(5), &staged),
         Ok(Installed { reboot: true })
     );
-    assert_eq!(a.exec.entries.get(&daemon), Some(&binary(b"newer daemon")));
+    assert_eq!(
+        a.exec.entries.get(&daemon),
+        Some(&binary(b"newer daemon", ROOT))
+    );
     assert_eq!(a.reboot(), Ok(()));
     let reboot = Step::Run(Cmd::new(p(SYSTEMCTL)).arg("reboot"));
     assert_eq!(a.exec.log.last(), Some(&reboot));
@@ -222,4 +233,32 @@ fn the_fake_records_installs_and_reboots() {
         f.install(&testkit::set(5), &dir),
         Err("planned failure".into())
     );
+}
+
+/// Catches: an installed binary left in place because its bytes and mode match while
+/// root does not own it (the skip check ignoring the owner). Its owner can replace it
+/// with their own code, which root then runs; and for the updater's own binary the
+/// trust check refuses every later apply. The install must write the staged copy as
+/// root's, over the one uid 1000 owns.
+#[test]
+fn a_right_binary_that_root_does_not_own_is_replaced() {
+    let (mut a, staged) = apt("apt-owner", 0);
+    fs::write(staged.join("kbf-daemon"), b"new daemon").unwrap();
+    let daemon = p(&format!("{BIN}/kbf-daemon"));
+    let user = Owner {
+        uid: 1000,
+        gid: 1000,
+    };
+    a.exec
+        .entries
+        .insert(daemon.clone(), binary(b"new daemon", user));
+    assert_eq!(
+        a.install(&testkit::set(5), &staged),
+        Ok(Installed { reboot: false })
+    );
+    assert_eq!(
+        a.exec.entries.get(&daemon),
+        Some(&binary(b"new daemon", ROOT))
+    );
+    assert_eq!(a.exec.log.len(), 1, "{:?}", a.exec.log);
 }

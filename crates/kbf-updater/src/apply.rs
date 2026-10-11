@@ -19,10 +19,12 @@
 //!    package against the archive's signature; the set chooses only which snapshot).
 //!    Each runs with only `DEBIAN_FRONTEND=noninteractive` (apt never waits for a
 //!    terminal) and `PATH` (dpkg refuses to run without one) in its environment;
-//! 2. every staged artifact, as a file in the bin directory with mode 0755, written
-//!    beside the installed one, synced and renamed over it, so a crash leaves the old
-//!    binary or the new. An installed file that already holds the staged bytes with
-//!    that mode is left alone, so a resumed apply rewrites nothing already in place.
+//! 2. every staged artifact, as a file in the bin directory with mode 0755 owned by
+//!    root (uid and gid 0), written beside the installed one, synced and renamed over
+//!    it, so a crash leaves the old binary or the new. An installed file that already
+//!    holds the staged bytes with that mode and owner is left alone, so a resumed apply
+//!    rewrites nothing already in place; one with the right bytes that another user
+//!    owns is replaced.
 //!
 //! The step needs a reboot exactly when `/run/reboot-required` exists afterwards, and
 //! the reboot is a one-step plan, `/usr/bin/systemctl reboot`.
@@ -40,7 +42,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::Path;
 
-use kbf_host::{Cmd, Exec, HostPath, Mode, Perms, Plan, Planner, RunAs, execute};
+use kbf_host::{Cmd, Exec, HostPath, Mode, Owner, Perms, Plan, Planner, RunAs, execute};
 
 use crate::set::SoftwareSet;
 
@@ -118,6 +120,9 @@ pub const REBOOT_REQUIRED: &str = "/run/reboot-required";
 pub const APT_PATH: &str = "/usr/sbin:/usr/bin:/sbin:/bin";
 /// The mode of an installed binary.
 const BINARY: Perms = Perms::new(0o755);
+/// Who owns an installed binary: root, user and group. Root alone may replace what root
+/// runs, and the trust check refuses an updater binary anyone else owns.
+const ROOT: Owner = Owner { uid: 0, gid: 0 };
 
 /// One of the fixed absolute paths above as a [`HostPath`].
 fn fixed(path: &'static str) -> HostPath {
@@ -183,7 +188,9 @@ impl<E: Exec, W: Write> AptSnapshot<E, W> {
                 Err(e) => return Err(format!("install {name}: {e}")),
             };
             let path = HostPath::new(&format!("{}/{name}", self.bin_dir)).map_err(failed)?;
-            planner.file(path, BINARY, None, bytes).map_err(failed)?;
+            planner
+                .file(path, BINARY, Some(ROOT), bytes)
+                .map_err(failed)?;
         }
         Ok(planner.finish())
     }
