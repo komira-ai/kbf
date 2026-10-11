@@ -1,0 +1,32 @@
+[package]
+name = "kbf-driver-vm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# The VM driver (docs/design/macos-vms.md section 6): one VM per lease behind the
+# `VmHost` trait, and a fake host that runs the real kbf-guest agent.
+[dependencies]
+hex.workspace = true
+kbf-daemon.workspace = true
+kbf-driver-native.workspace = true
+kbf-guest.workspace = true
+kbf-outputs.workspace = true
+kbf-proto.workspace = true
+kbf-types.workspace = true
+prost-types.workspace = true
+rustix = { workspace = true, features = ["fs"] }
+thiserror.workspace = true
+tokio = { workspace = true, features = ["fs", "macros", "rt", "sync", "time"] }
+tracing.workspace = true
+
+[dev-dependencies]
+prost.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread"] }
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true

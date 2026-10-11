@@ -391,7 +391,8 @@ This is all pure scheduler code, testable in the simulator crate.
 
 ## 6. The VM driver: one VM per lease, never reused
 
-`kbf-driver-vm` (new, macOS only) implements the daemon's `Runtime` trait. It runs one
+`kbf-driver-vm` implements the daemon's `Runtime` trait (on `main` over a fake host
+only; see [What `main` has](#what-main-has) below). It runs one
 helper process, `kbf-vmm`, per VM, so a VM crash cannot take the daemon down and
 killing the helper stops the VM. The helper is a Rust binary on
 [`objc2-virtualization`](https://crates.io/crates/objc2-virtualization) (licence "Zlib
@@ -465,6 +466,45 @@ Rules:
   ([LICENSE](https://github.com/openai/tart/blob/main/LICENSE)) **[V]**. kbf is
   Apache-2.0 and depends only on open-source licences. Tart's code is read as a
   reference, not copied.
+
+### What `main` has
+
+`crates/kbf-driver-vm` holds the driver (`VmDriver`, driver and lease kind `vm`) behind
+a `VmHost` trait (clone an image, start a VM from a `VmSpec`, connect to its guest
+agent, stop it), and `FakeHost`, which runs the real `kbf-guest` agent in the calling
+process (the test binary, in the crate's tests) over a Unix socket pair, copies the image
+directory as its "clone", keeps the limit of two running VMs, and can delay or withhold a
+guest's readiness, crash a VM, silence a guest before its `Ready` or once its command
+has started, and fail a stop. The daemon does not
+offer the driver yet (no `--driver vm`), and no host on Virtualization.framework exists.
+Per lease, as built:
+
+- The lease gets a lease directory (`leases/<lease>/`) and a clone
+  (`clones/<lease>/`) under the driver's scratch root. Before the clone, the clones'
+  volume must have `min_free_bytes` free (32 GiB by default **[A]**), or the lease
+  fails as the farm's.
+- `VmSpec`: a new random machine identifier, every booked core (the last rounded up),
+  the booked memory less the helper's 1 GiB, the inputs share read-only and the outputs
+  share read-write ([macos-vm-guests.md](macos-vm-guests.md#33-how-outputs-leave-the-guest)
+  says what each holds), and no network device. An action with `network` = `on` or
+  `standard` is refused with INVALID_ARGUMENT before anything is cloned.
+- Boot: the driver connects until the agent answers `Ready`, within the boot timeout
+  (120 s by default), and refuses an agent not in the `Aqua` session. The `Run` carries
+  the action's whole timeout; the driver gives up on a guest silent for 30 s past it (as
+  the farm's).
+- Collect: the VM is stopped first, so nothing in the guest writes to the outputs share
+  while it is read.
+- Destroy, on every path (a kill and the daemon dropping the run included): stop the
+  VM, remove the clone and the lease directory, and fail the lease if either is left.
+  At start the driver removes whatever an earlier daemon left in both directories.
+- Failures: a host's refusal of another VM (`LimitExceeded`), a boot past its timeout,
+  a guest that crashes or goes silent, too little free space or a booking that leaves
+  the guest no memory are the farm's (`RuntimeError::Failed`, reported INTERNAL, which
+  the server records as an infrastructure failure, `Failure::Infra`); the guest's
+  timeout is the action's (DEADLINE_EXCEEDED); a request the guest refuses as malformed,
+  or whose program it cannot start, is the client's (INVALID_ARGUMENT). The scheduler
+  does not yet run an infrastructure failure again elsewhere; that is the planned
+  retry budget ([failure-classes.md](failure-classes.md#65-who-reruns-a-farm-fault)).
 
 ## 7. Images
 
@@ -669,7 +709,7 @@ only if the `ibtool`/`actool` probe passes.
 | `kbf-front` | lease kind `vm`, VM bounds on `kbf-book-cpus` and `kbf-book-mem-gib` | ~150 |
 | `kbf-server` | read `vm.slots` | ~80 |
 | `kbf-daemon`, `kbf-node` | a runtime that dispatches by kind across several drivers; VM flags (image directory, boot timeout) | ~370 |
-| `kbf-driver-vm` (new) | section 6 | ~3,000 with tests |
+| `kbf-driver-vm` (new) | section 6; on `main`: the driver over the `VmHost` trait and a fake host ([What `main` has](#what-main-has)); the macOS host is not built | ~3,000 with tests |
 | `kbf-vmm`, `kbf-guest` (new) | the VM helper, run as a dedicated non-admin uid (needs `kbf-mac-session run`, [fleet-updates.md](fleet-updates.md) phase P1), and the guest agent | ~1,000 |
 | `kbf-segments`, `kbf-front` | chunked upload, if images ship through the CAS | ~400 |
 | `kbf-it` | the freshness test on VMs | ~150 |

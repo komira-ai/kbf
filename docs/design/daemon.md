@@ -211,6 +211,9 @@ picked by `--driver`:
   units and the host's swap and memory headroom.
 - **`NativeRuntime`** (`kbf-driver-native`, driver `native`): each action as plain
   processes on the node, for Macs.
+- **`VmDriver`** (`kbf-driver-vm`, driver `vm`): each `vm` lease in a macOS VM of its
+  own ([macos-vms.md](macos-vms.md#what-main-has)). Not offered by `--driver` yet; on
+  `main` it runs over a fake host only.
 - **`FakeRuntime`** (driver `fake`): runs nothing and returns an empty result, for
   bring-up.
 - **`LocalRuntime`** (driver `local`): **tests only**. Runs each action as a plain child

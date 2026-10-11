@@ -11,9 +11,9 @@
 //! - [`client`]: the host side.
 //! - [`session`]: the launchd session type `Ready` reports, and the root refusal.
 //!
-//! It serves a Unix socket. The virtio socket a VM gives it, the relay through
-//! `kbf-vmm`, the image that installs it and the VM driver that calls it are planned and
-//! not built.
+//! It serves a Unix socket. `kbf-driver-vm` is the host side that calls it (over its
+//! fake host's socket pair); the virtio socket a VM gives it, the relay through
+//! `kbf-vmm` and the image that installs it are planned and not built.
 
 pub mod client;
 pub mod run;

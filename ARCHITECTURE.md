@@ -105,11 +105,12 @@ what lets a simulation seed replay a run exactly (see [Testing](#testing)).
 | `kbf-daemon` | no | the daemon: session loop, lease manager, CAS client, input and output trees |
 | `kbf-driver-container` | no | the rootless Podman execution driver |
 | `kbf-driver-native` | no | the native execution driver: plain processes, for Macs |
+| `kbf-driver-vm` | no | the VM driver ([macos-vms.md](docs/design/macos-vms.md) section 6): one VM per `vm` lease from a fresh clone, destroyed with the clone however the lease ends, behind a `VmHost` trait; a fake host runs the real `kbf-guest` agent. The macOS host and the daemon flag are **planned** |
 | `kbf-node` | no | the `kbf-daemon` binary: flags, and the driver `--driver` names |
 | `kbf-mdm` | no | `kbf-mdm-gate`, the only holder of the Mac MDM's API key: its verbs and caps over mutual TLS, operator-signed erase requests, the `MdmBackend` trait and its NanoHUB client ([mdm-backend.md](docs/design/mdm-backend.md)) |
 | `kbf-updater` | no | the root helper that verifies and installs signed software sets on a node ([fleet-updates-security.md](docs/design/fleet-updates-security.md) S3, S4.1); Linux only for now |
 | `kbf-mac-session` | no | the Mac's root helper that gives every lease its own throwaway user, admits an administrator only with the MDM gate's signed grant, switches the GUI session to a lease user (auto-login, then a userspace restart) and resets it at boot ([fleet-updates-security.md](docs/design/fleet-updates-security.md) S4.2, S4.3, S5.2); serves on macOS only |
-| `kbf-guest` | no | the agent inside a macOS VM guest ([macos-vms.md](docs/design/macos-vms.md) section 6): a versioned protocol over a Unix socket, one command per boot behind a per-boot token, its process group killed on exit, `Kill` or timeout; the virtio socket and the VM driver that calls it are **planned** |
+| `kbf-guest` | no | the agent inside a macOS VM guest ([macos-vms.md](docs/design/macos-vms.md) section 6): a versioned protocol over a Unix socket, one command per boot behind a per-boot token, its process group killed on exit, `Kill` or timeout; `kbf-driver-vm` calls it; the virtio socket is **planned** |
 | `kbf-vmm` | no | the VM helper for macOS VM leases ([macos-vm-guests.md](docs/design/macos-vm-guests.md)): a **stub** that answers `--version` only, the one binary the signing scripts' entitlement allow list gives an entitlement (`com.apple.security.virtualization`); the VM code is **planned** |
 | `kbf-sim` | no | the deterministic simulation kernel |
 | `kbf-it` | no | integration tests, repository lints, the end-to-end harness |

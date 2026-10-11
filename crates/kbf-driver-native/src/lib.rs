@@ -113,5 +113,6 @@ pub mod user_folders;
 pub mod xcode;
 pub mod xcode_watch;
 
+pub use cas::CasStore;
 pub use config::{MemoryPolicy, NativeConfig};
 pub use runtime::{DRIVER, KIND, NativeRuntime, SURVEY_DIR};
