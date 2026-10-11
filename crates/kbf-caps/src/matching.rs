@@ -320,6 +320,27 @@ impl Request {
         Ok(req)
     }
 
+    /// The properties that [`Self::parse`] reads as this request, one per requirement,
+    /// in a fixed order: `arch`, `isa_level`, each `cpu.feature`, the countable keys,
+    /// the exact keys, the membership keys (each group by key, a membership key with the
+    /// value as requested). `Request::parse(r.properties())` is `r`, so a request can be
+    /// written as these pairs and read back.
+    #[must_use]
+    pub fn properties(&self) -> Vec<(&str, String)> {
+        let mut out = Vec::new();
+        out.extend(self.arch.map(|a| ("arch", a.name().to_owned())));
+        out.extend(self.isa_level.map(|l| ("isa_level", l.name().to_owned())));
+        out.extend(self.features.iter().map(|f| ("cpu.feature", f.clone())));
+        out.extend(self.minimums.iter().map(|(c, n)| (c.name(), n.to_string())));
+        out.extend(self.exact.iter().map(|(k, v)| (k.as_str(), v.clone())));
+        out.extend(
+            self.members
+                .iter()
+                .map(|(k, (v, _))| (k.as_str(), v.clone())),
+        );
+        out
+    }
+
     /// Every requirement the node does not meet, in a stable order. Empty means the
     /// node matches.
     #[must_use]
