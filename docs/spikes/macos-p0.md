@@ -216,17 +216,22 @@ driver arm judged by run.sh's checks inside the sandbox or by the report alone.
 
 ### Results
 
-Run `38138189630` (commit `3ec0969`), job `xcuitest-sandbox` on `macos-15`
-(macOS 15.7.9, Xcode 16.4 16F6, the runner's admin user in its Aqua session). The
-verdict was FAIL: the controls held and three of the four driver arms failed.
+Run `38140794202` (commit `989bdd8`), job `xcuitest-sandbox` on `macos-15`
+(macOS 15.7.9, Xcode 16.4 16F6, the runner's admin user in its Aqua session), with the
+profile as `main` builds it: `BASE_PROFILE`, `NO_DEVICE_RULES`, the user-folder rules.
+The verdict was FAIL: the controls held and three of the four driver arms failed. Run
+`38138189630` (commit `3ec0969`, before `NO_DEVICE_RULES` was on `main`) gave the same
+verdict and the same arm results, and the same distinct denies but for the two device
+rules' (`CoreDeviceService`, `usbmuxd`), which it did not have, and the `xcresulttool`
+one, which showed in a different three arms.
 
 | Arm | xcodebuild exit under the profile | Report (outside) | Deny lines from the run |
 |---|---|---|---|
 | `deny_default` | not run: `sandbox-exec: execvp() of 'bash' failed` (rc 71) | | 2: `file-read-metadata` and `process-exec*` of `/bin/bash` |
-| `driver.macos` | 65: the build fails | FAIL, no tests ran | 22 |
-| `driver.ios` | 65: the build fails | FAIL, no tests ran | 14 |
-| `driver_tests.macos` | 65: "Could not launch MacFixtureUITests" | FAIL, no tests ran | 17 |
-| `driver_tests.ios` | 0 | PASS: 3 of 3 tests, the three screenshots kept | 16 |
+| `driver.macos` | 65: the build fails | FAIL, no tests ran | 24 |
+| `driver.ios` | 65: the build fails | FAIL, no tests ran | 15 |
+| `driver_tests.macos` | 65: "Could not launch MacFixtureUITests" | FAIL, no tests ran | 20 |
+| `driver_tests.ios` | 0 | PASS: 3 of 3 tests, the three screenshots kept | 20 |
 | `control.macos`, `control.ios` | 0, no sandbox | PASS, 3 of 3 | |
 
 Each distinct deny from the driver arms, and what it did. `T/` and `C/` are the
@@ -238,20 +243,22 @@ gives it, not the lease's `HOME`.
 |---|---|---|---|
 | `file-write-create T/swbuild.tmp.<random>` | `SWBBuildService` | `driver.macos`, `driver.ios` | fatal: the build stops at `mkdtemp(...T/swbuild.tmp...): Operation not permitted`, before any test. The driver's folder rules open `T/TemporaryItems/` and `T/xcrun_db*` only |
 | `lsopen` | `xcodebuild` | `driver_tests.macos` | fatal: the macOS UI test runner is launched through Launch Services, and xcodebuild reports error -54, "The sandbox profile of this process is missing "(allow lsopen)", so it cannot invoke Launch Services' open API" |
+| `mach-lookup com.apple.CoreDevice.CoreDeviceService` (XPC) and `network-outbound /private/var/run/usbmuxd` (`NO_DEVICE_RULES`) | `xcodebuild` | all four | not fatal for the iOS tests on a simulator |
 | `job-creation` | `xcodebuild` | all four | not fatal for the iOS tests (`driver_tests.ios` passed with it denied) |
 | `user-preference-write` of `com.apple.dt.xcodebuild`, `com.apple.coresimulator`, `com.apple.crashreporter` | `xcodebuild` | all four (the domain varies) | not fatal for the iOS tests |
 | `file-write-*` under `~/Library/Caches/org.swift.swiftpm`, `~/Library/org.swift.swiftpm`, `~/.swiftpm/security` | `xcodebuild` | all four | not fatal for the iOS tests; SwiftPM finds the home from the user database, as the driver's documentation already says |
 | `file-write-*` of `C/com.apple.DeveloperTools/16.4-16F6/Xcode/PlugInCache-xcodebuild.xcplugincache` and `C/com.apple.DTServiceHub` | `xcodebuild`, `DTServiceHub` | all four (`DTServiceHub` in all but `driver.ios`) | not fatal for the iOS tests |
 | `file-write-unlink /private/var/tmp/test-session-systemlogs-<time>.logarchive` | `xcodebuild` | `driver_tests.macos` | not known: that run had already failed on `lsopen` |
-| `file-write-create T/<UUID>` | `xcresulttool` | `driver.macos`, `driver.ios`, `driver_tests.ios`; in `driver_tests.macos` only its error text ("You don't have permission to save the file ... in the folder T"), no deny line from the tree | fails the probe's own reading of the bundle inside the sandbox, which is why the arms read it outside |
+| `file-write-create T/<UUID>` | `xcresulttool` | `driver.macos`, `driver_tests.macos`, `driver_tests.ios` | fails the probe's own reading of the bundle inside the sandbox (run.sh stops before its result line, `in_sandbox=none`), which is why the arms read it outside |
 
-So, under `BASE_PROFILE` as it stands: UI tests of an iOS app on a simulator run and
-pass once built, a build of either fixture with `xcodebuild` fails on Swift Build's
-temporary directory, and UI tests of a macOS app fail on `(deny lsopen)`. Which
-operations and names a change of the profile would open is a separate decision; this
-spike changes no profile. `BASE_PROFILE` allows every mach-lookup, so the run says
-nothing about which mach or XPC names a UI test looks up. `deny.other` counted 5 to
-125 reports from other processes in each driver arm's window; they are not the run's.
+So, under the driver's profile as it stands: UI tests of an iOS app on a simulator
+run and pass once built, a build of either fixture with `xcodebuild` fails on Swift
+Build's temporary directory, and UI tests of a macOS app fail on `(deny lsopen)`.
+Which operations and names a change of the profile would open is a separate
+decision; this spike changes no profile. Apart from the device services, the profile
+allows every mach-lookup, so the run says nothing about which mach or XPC names a UI
+test looks up. `deny.other` counted 1 to 48 reports from other processes in each
+driver arm's window; they are not the run's.
 
 ## Not covered here (planned)
 
