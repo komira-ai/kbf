@@ -82,7 +82,7 @@ pub fn check_version(
     version: &str,
     name: &str,
     commit: &str,
-    names: impl Fn(&str, &str, &str) -> bool,
+    names: fn(&str, &str, &str) -> bool,
 ) -> Result<(), Error> {
     if !is_commit(commit) {
         return Err(Error::NotACommit(commit.to_owned()));
@@ -310,6 +310,7 @@ mod tests {
             );
             assert!(!is_commit(c));
         }
-        assert!(is_commit(&COMMIT[..12]) && is_commit(COMMIT));
+        assert!(is_commit(&COMMIT[..12]));
+        assert!(is_commit(COMMIT));
     }
 }

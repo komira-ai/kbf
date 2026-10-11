@@ -146,6 +146,63 @@ fn stamps_refuses_a_commit_it_cannot_tell_from_a_stamp() {
 }
 
 #[test]
+fn stamps_stops_at_a_failed_stamped_build() {
+    // Catches: a stamped build's failure passed over (the plain build passed, so a
+    // verb that checked only the first build would report the stamps as fine).
+    let (code, out, err, _) = stamps("stamps-stamp-fails", Some("stamp-fails"), HEAD);
+    assert_eq!(code, Some(1));
+    assert_eq!(out, "");
+    assert_eq!(
+        err,
+        "xtask-fake: built\nerror: could not compile\n\
+         xtask: cargo build of kbf-server failed: exit status: 101\n"
+    );
+}
+
+#[test]
+fn stamps_reports_a_malformed_override_build_that_does_not_start() {
+    // Catches: the malformed-override build's spawn failure taken as the refusal it
+    // looks for (a build that never ran must not count as one that refused).
+    let root = scratch("stamps-vanish");
+    let cargo = root.join("cargo");
+    std::fs::hard_link(FAKE, &cargo).expect("link the fake cargo");
+    let out = xtask(&root, &["build-commit", "stamps", HEAD])
+        .env("CARGO", &cargo)
+        .env("XTASK_FAKE_HEAD", &HEAD[..12])
+        .env("XTASK_FAKE_DEFECT", "vanish")
+        .output()
+        .expect("run xtask");
+    let (code, _, err) = outcome(out);
+    assert_eq!(code, Some(1));
+    assert!(
+        err.starts_with("xtask-fake: built\nxtask-fake: built\nxtask-fake: built\n"),
+        "{err}"
+    );
+    assert!(
+        err.contains(&format!("xtask: {}: ", cargo.display())),
+        "{err}"
+    );
+}
+
+#[test]
+fn check_reports_a_binary_that_does_not_start() {
+    // Catches: a binary that cannot run reported as naming no commit, or as passing.
+    let root = scratch("check-missing");
+    let missing = root.join("kbf-server");
+    let out = xtask(&root, &["build-commit", "check"])
+        .arg(&missing)
+        .arg(HEAD)
+        .output()
+        .expect("run xtask");
+    let (code, _, err) = outcome(out);
+    assert_eq!(code, Some(1));
+    assert!(
+        err.starts_with(&format!("xtask: {}: ", missing.display())),
+        "{err}"
+    );
+}
+
+#[test]
 fn stamps_reports_a_cargo_that_does_not_start() {
     // Catches: a spawn failure reported as a passed or failed check.
     let root = scratch("stamps-no-cargo");

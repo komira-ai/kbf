@@ -13,7 +13,9 @@
 //! `XTASK_FAKE_DEFECT` plants one defect of the real build: `ignores-override` (the
 //! build embeds the head whatever the override), `accepts-bad` (a malformed override
 //! builds), `fails-other` (a malformed override fails, but not on the override),
-//! `build-fails` (every build fails) or `version-fails` (`kbf-server` exits 1).
+//! `build-fails` (every build fails), `stamp-fails` (every build with an override
+//! fails), `vanish` (the build stamped `b2b2b2b2b2b2` deletes the fake cargo, so the
+//! next build cannot start) or `version-fails` (`kbf-server` exits 1).
 
 use std::io::Write;
 use std::path::Path;
@@ -52,6 +54,10 @@ fn cargo(argv0: &str, args: &[String]) -> ExitCode {
         |v: &str| (v.len() == 12) & v.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
     let stamp = match std::env::var(OVERRIDE) {
         Ok(_) if defect("ignores-override") => head,
+        Ok(_) if defect("stamp-fails") => {
+            eprintln!("error: could not compile");
+            return ExitCode::from(101);
+        }
         Ok(v) if lower_hex(&v) => v,
         Ok(_) if defect("accepts-bad") => head,
         Ok(_) if defect("fails-other") => {
@@ -67,6 +73,9 @@ fn cargo(argv0: &str, args: &[String]) -> ExitCode {
     let bin = dir.join("kbf-server");
     if !bin.exists() {
         std::fs::hard_link(argv0, &bin).expect("link the fake as kbf-server");
+    }
+    if defect("vanish") && stamp == "b2b2b2b2b2b2" {
+        std::fs::remove_file(argv0).expect("remove the fake cargo");
     }
     std::fs::write(dir.join("kbf-server.stamp"), stamp).expect("stamp file");
     eprintln!("xtask-fake: built");
