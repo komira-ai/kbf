@@ -462,8 +462,10 @@ daemon restarts and server restarts:
    requeued only once `HANDOVER_GRACE` (T + 5 s) has passed since the scheduler last
    heard the node before that process was replaced: by then the replaced process,
    whose stream is no longer acknowledged, has fenced (issue #140). A process that
-   was killed fences nothing: its runs are ended by the next daemon started on the
-   node, before that one's `Hello` (issue #155), and by nothing if none is.
+   was killed fences nothing: its runs are ended by each run's keeper as the process
+   dies, and by the next daemon started on the node, before that one's `Hello` (issue
+   #155); see [daemon.md](daemon.md#when-the-daemon-is-killed) for what neither
+   reaches.
 
 ## Planned
 

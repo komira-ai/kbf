@@ -38,7 +38,9 @@
 //! - the label `kbf.owner=<owner>` ([`OWNER_LABEL`]; the daemon passes its node id), by
 //!   which the next daemon on the node finds the container if this one is killed: at
 //!   start, [`PodmanRuntime::new`] removes every container so labelled and every lease
-//!   scratch directory, each with its lease cgroup, before the daemon says `Hello`.
+//!   scratch directory, each with its lease cgroup, before the daemon says `Hello`;
+//! - a keeper per lease (`keeper`), which kills the lease cgroup (`cgroup.kill`) when
+//!   the daemon dies, so a killed daemon's container stops at once, restarted or not.
 //!
 //! Modules:
 //! - [`image`]: the `container-image` property;
@@ -59,6 +61,7 @@ pub mod cas;
 mod cgroup;
 pub mod delegate;
 pub mod image;
+mod keeper;
 mod outputs;
 mod podman;
 mod program;

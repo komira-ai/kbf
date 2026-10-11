@@ -27,7 +27,7 @@ use crate::config::NativeConfig;
 use crate::network::{self, Network, network_of};
 use crate::procs::{self, Proc, Tracker};
 use crate::program::{Refused, Resolved, resolve};
-use crate::record::Exec;
+use crate::record::{Exec, Spawned};
 use crate::user_folders::UserFolders;
 use crate::xcode;
 
@@ -380,7 +380,13 @@ impl<C: Cas> NativeRuntime<C> {
             .process_group(0)
             .kill_on_drop(true);
         let record = crate::record::path(&self.config.scratch, &lease_name(work.lease_id));
-        let (mut child, leader) = spawn(&mut command, exec, &record)
+        let Spawned {
+            mut child,
+            pid: leader,
+            // Held until the group has ended (the group's kill ends it too), and
+            // dropped after the group: it ends the group if the daemon dies.
+            keeper: _keeper,
+        } = spawn(&mut command, exec, &record)
             .await
             .map_err(failed(&prepared.program))?;
         let me = i32::try_from(std::process::id()).unwrap_or(i32::MAX);
@@ -714,12 +720,12 @@ impl Drop for Group {
 /// Spawns `command` running `exec`, with its run record written to `record` before
 /// the program runs ([`crate::record::Gate`]), retrying while the program is busy: a
 /// just-written input file is briefly held open for writing by any child another thread
-/// forks before it execs (ETXTBSY). Returns the child and its pid.
+/// forks before it execs (ETXTBSY). Returns the child, its pid and its keeper.
 async fn spawn(
     command: &mut tokio::process::Command,
     exec: Exec,
     record: &Path,
-) -> std::io::Result<(Child, i32)> {
+) -> std::io::Result<Spawned> {
     let gate = crate::record::Gate::install(command, exec);
     let give_up = Instant::now() + BUSY_WAIT;
     loop {
@@ -1300,7 +1306,7 @@ mod tests {
         let exec = || Exec::new(&program, [], []).expect("exec");
         let record = dir.join(format!("busy-record-{}", std::process::id()));
         let started = Instant::now();
-        let (mut child, pid) = spawn(&mut command(), exec(), &record)
+        let Spawned { mut child, pid, .. } = spawn(&mut command(), exec(), &record)
             .await
             .expect("spawned once closed");
         assert!(started.elapsed() >= Duration::from_millis(50), "it waited");

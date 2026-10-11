@@ -53,6 +53,8 @@
 //! one that cannot be removed is moved aside into `quarantine/` under the scratch root
 //! and logged, and the daemon starts anyway (an action decides what its directory
 //! holds, so refusing to start would let one build step take the node out of the farm).
+//! Until then, each action's keeper (`keeper`), a member of its group, kills the group
+//! when the daemon dies, restarted or not.
 //!
 //! Known gaps, all of them closed only by running each lease as its own user:
 //! - **Processes that leave the tree.** A process that calls `setsid` and is orphaned
@@ -103,6 +105,7 @@
 mod cas;
 mod config;
 mod home;
+mod keeper;
 pub mod network;
 pub mod procs;
 mod program;

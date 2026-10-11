@@ -751,22 +751,9 @@ fn wait_for<T>(what: &str, mut read: impl FnMut() -> Option<T>) -> T {
     }
 }
 
-/// Catches (issue #155) a daemon killed by SIGKILL (as the kernel's OOM killer, or a
-/// panic that aborts, ends it) whose action outlives it and still runs when the next
-/// daemon on the node says `Hello`: the scheduler requeues a lease the new session
-/// leaves out, so the action would run twice at once (I12). The action leads its own
-/// process group, so neither the dead daemon nor the service manager ends it; the
-/// restarted daemon must kill it, and remove its lease directory, before `Hello`.
-#[test]
-fn a_restarted_daemon_ends_the_runs_it_was_killed_with_before_hello() {
-    use std::os::unix::process::ExitStatusExt as _;
-
-    let _one = one_native_daemon();
-    let dir = tls("restart");
-    let scratch = dir.join("leases");
-    let front = front::Front::start(&dir);
-    let action = front.sh("echo $$ > pid; exec sleep 300");
-    let flags = vec![
+/// The flags of a native daemon in `dir` that serves `front`, with leases under `scratch`.
+fn native_flags(front: &front::Front, dir: &Path, scratch: &Path) -> Vec<String> {
+    vec![
         format!("--server=https://127.0.0.1:{}", front.worker.port()),
         "--tls-server-name=localhost".to_owned(),
         format!("--ca-cert={}", dir.join("ca.pem").display()),
@@ -777,7 +764,99 @@ fn a_restarted_daemon_ends_the_runs_it_was_killed_with_before_hello() {
         "--driver=native".to_owned(),
         format!("--cas=https://127.0.0.1:{}", front.worker.port()),
         format!("--scratch={}", scratch.display()),
-    ];
+    ]
+}
+
+/// Reads the pid that the action wrote to `file`, waiting for it.
+fn pid_in(file: &Path) -> i32 {
+    wait_for(&format!("the pid in {}", file.display()), || {
+        let text = std::fs::read_to_string(file).ok()?;
+        text.strip_suffix('\n')?.parse().ok()
+    })
+}
+
+/// Catches (issue #155) a killed daemon's action that runs on until the daemon is
+/// started again, for as long as the work takes, or for ever when it is not: the
+/// scheduler requeues the lease after the handover grace, so the work runs twice. With
+/// no daemon started again, both the action's leader and a process it started must end
+/// within [`PROMPT`] of the SIGKILL.
+#[test]
+fn a_killed_daemons_action_ends_without_a_restart() {
+    use std::os::unix::process::ExitStatusExt as _;
+
+    let _one = one_native_daemon();
+    let dir = tls("killed");
+    let scratch = dir.join("leases");
+    let front = front::Front::start(&dir);
+    let action = front.sh("echo $$ > leader; sleep 300 & echo $! > child; wait");
+    let mut daemon = daemon(
+        &native_flags(&front, &dir, &scratch),
+        &dir.join("daemon.log"),
+    );
+    let session = front.session(PROMPT);
+    session.hello();
+    session.welcome();
+    session.start(1, 1, action);
+    let root = scratch.join("lease-1-1/root");
+    let (leader, child) = (pid_in(&root.join("leader")), pid_in(&root.join("child")));
+    assert!(!ended(leader) && !ended(child), "the action runs");
+    wait_logged(&dir.join("daemon.log"));
+    assert_eq!(
+        stop(&mut daemon, libc::SIGKILL).signal(),
+        Some(libc::SIGKILL)
+    );
+    let deadline = Instant::now() + PROMPT;
+    while !(ended(leader) && ended(child)) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let survivors: Vec<i32> = [leader, child].into_iter().filter(|&p| !ended(p)).collect();
+    // A red run must not leave the action behind: the group is still the action's, as
+    // its leader is alive or has been reaped by no one who would reuse its pid soon.
+    if !survivors.is_empty() {
+        // SAFETY: kill(2) takes plain integers; the group is the action's (above).
+        unsafe { libc::kill(-leader, libc::SIGKILL) };
+    }
+    assert!(
+        survivors.is_empty(),
+        "processes of the action {survivors:?} outlived the killed daemon by {PROMPT:?}:\n{}",
+        read(&dir.join("daemon.log"))
+    );
+}
+
+/// The live processes other than `pgid` itself in process group `pgid`, from `ps`.
+fn others_in_group(pgid: i32) -> Vec<i32> {
+    let out = Command::new("ps")
+        .args(["-A", "-o", "pid=", "-o", "pgid="])
+        .output()
+        .expect("ps");
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace().map(str::parse::<i32>);
+            Some((fields.next()?.ok()?, fields.next()?.ok()?))
+        })
+        .filter(|&(pid, group)| group == pgid && pid != pgid && !ended(pid))
+        .map(|(pid, _)| pid)
+        .collect()
+}
+
+/// Catches (issue #155) a daemon killed by SIGKILL (as the kernel's OOM killer, or a
+/// panic that aborts, ends it) whose action outlives it and still runs when the next
+/// daemon on the node says `Hello`: the scheduler requeues a lease the new session
+/// leaves out, so the action would run twice at once (I12). The action leads its own
+/// process group, so neither the dead daemon nor the service manager ends it; with its
+/// keeper killed too, the restarted daemon must kill it, and remove its lease
+/// directory, before `Hello`.
+#[test]
+fn a_restarted_daemon_ends_the_runs_it_was_killed_with_before_hello() {
+    use std::os::unix::process::ExitStatusExt as _;
+
+    let _one = one_native_daemon();
+    let dir = tls("restart");
+    let scratch = dir.join("leases");
+    let front = front::Front::start(&dir);
+    let action = front.sh("echo $$ > pid; exec sleep 300");
+    let flags = native_flags(&front, &dir, &scratch);
 
     let spawned = Instant::now();
     let mut first = daemon(&flags, &dir.join("first.log"));
@@ -787,19 +866,27 @@ fn a_restarted_daemon_ends_the_runs_it_was_killed_with_before_hello() {
     session.welcome();
     session.start(1, 1, action);
     let pid_file = scratch.join("lease-1-1/root/pid");
-    let pid: i32 = wait_for("the action's pid", || {
-        let text = std::fs::read_to_string(&pid_file).ok()?;
-        text.strip_suffix('\n')?.parse().ok()
-    });
+    let pid = pid_in(&pid_file);
     assert!(!ended(pid), "the action runs");
     // Its first survey's line, for the CI log (this daemon's is the job's first survey
     // of the runner's Xcodes): waited for, never failed on.
     wait_logged(&dir.join("first.log"));
+    // The keeper is the action's group's one other member: killed first, as the
+    // kernel's OOM killer may take it with the daemon, it leaves the sweep to act.
+    let keepers = others_in_group(pid);
+    assert_eq!(keepers.len(), 1, "one keeper: {keepers:?}");
+    for &keeper in &keepers {
+        // SAFETY: kill(2) on the keeper, the daemon's unreaped child, so the pid is its.
+        assert_eq!(unsafe { libc::kill(keeper, libc::SIGKILL) }, 0);
+    }
+    wait_for("the keeper's end", || {
+        keepers.iter().all(|&k| ended(k)).then_some(())
+    });
     assert_eq!(
         stop(&mut first, libc::SIGKILL).signal(),
         Some(libc::SIGKILL)
     );
-    // The premise: nothing else ends the action once its daemon is gone.
+    // The premise: nothing else ends the action once its daemon and keeper are gone.
     std::thread::sleep(Duration::from_millis(200));
     assert!(!ended(pid), "the action outlived its daemon");
 
