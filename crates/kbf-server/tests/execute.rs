@@ -384,6 +384,74 @@ async fn failed_attempts_answer_with_the_rfc_codes() {
     }
 }
 
+/// Catches (issue #45): a timed-out action answered DEADLINE_EXCEEDED without the
+/// stdout and stderr it wrote before it was stopped, which REAPI lets the server
+/// return; a partial result that keeps the daemon's outputs or exit code (only the
+/// two logs are partial output, and an output of a stopped action may be half
+/// written); a log digest passed on although its blob is not in the CAS (the client
+/// could not fetch it), or one missing log taking the other with it; a partial result
+/// answered without the node it ran on; and a partial result written to the action
+/// cache (a timeout is never cached, and exit code 0 with an output would be).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_timed_out_action_answers_with_its_partial_stdout_and_stderr() {
+    let cell = Cell::start().await;
+    let mut daemon = cell.daemon("node-a", 4, 8).await;
+    let (stdout, stderr) = (Blob::new("started\n"), Blob::new("warming up\n"));
+    cell.upload(&[&stdout, &stderr]).await;
+    let never_uploaded = Blob::new("never uploaded");
+    let stored = output(&cell, "half written", 0).await;
+    let logs = |out: &Blob, err: &Blob| ActionResult {
+        stdout_digest: Some(out.proto.clone()),
+        stderr_digest: Some(err.proto.clone()),
+        ..stored.clone()
+    };
+    let only = |out: Option<&Blob>, err: Option<&Blob>| ActionResult {
+        stdout_digest: out.map(|b| b.proto.clone()),
+        stderr_digest: err.map(|b| b.proto.clone()),
+        ..ActionResult::default()
+    };
+    let cases = [
+        (
+            "both logs",
+            logs(&stdout, &stderr),
+            Some(only(Some(&stdout), Some(&stderr))),
+        ),
+        (
+            "stderr not stored",
+            logs(&stdout, &never_uploaded),
+            Some(only(Some(&stdout), None)),
+        ),
+        (
+            "stdout not stored",
+            logs(&never_uploaded, &stderr),
+            Some(only(None, Some(&stderr))),
+        ),
+        (
+            "neither stored",
+            logs(&never_uploaded, &never_uploaded),
+            None,
+        ),
+    ];
+    for (name, reported, want) in cases {
+        let job = Job::new(name, &[]);
+        cell.upload(&job.blobs()).await;
+        let mut ops = cell.execute(&job.action).await;
+        let start = daemon.start().await;
+        let mut report = failed(start.lease_id, Code::DeadlineExceeded);
+        report.action_result = Some(reported);
+        assert!(daemon.report(report).await.accepted, "{name}");
+        let answer = support::stamped_response(&done(&mut ops).await);
+        let status = answer.status.expect("a status");
+        assert_eq!(status.code, Code::DeadlineExceeded as i32, "{name}");
+        assert_eq!(answer.result.map(support::unstamped), want, "{name}");
+        assert_eq!(
+            cell.cached(&job.action).await,
+            Err(Code::NotFound),
+            "{name}"
+        );
+    }
+}
+
 /// Catches: callers answered before the accepted result's action-cache entry is
 /// written, so a client that looks the action up as soon as its Execute finishes
 /// misses a result the farm has. The write is held at a gate: no answer may arrive
