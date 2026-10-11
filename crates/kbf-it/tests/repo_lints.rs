@@ -427,6 +427,23 @@ mod budget {
     }
 
     #[test]
+    fn an_edit_of_a_listed_file_step_or_spawn_passes() {
+        // Catches: the list tied to sizes again, so editing a listed script, a listed
+        // `run:` step or a listed keeper would make the pull request touch the list.
+        // Each edit grows the listed thing; none adds anything unlisted.
+        let mut t = tree();
+        t.insert(
+            "tools/ci/x.sh".to_owned(),
+            b"#!/bin/sh\necho\necho\necho\n".to_vec(),
+        );
+        let step = WORKFLOW.replace("nproc\n", "nproc\n          sw_vers\n");
+        t.insert(CI.to_owned(), step.into_bytes());
+        let keeper = format!("{KEEPER_RS}\nfn again() {{ g(\"/bin/bash\", \"-c\") }}\n");
+        t.insert(KEEPER.to_owned(), keeper.into_bytes());
+        assert_eq!(problems(&t, BUDGET), Vec::<String>::new());
+    }
+
+    #[test]
     fn a_row_for_a_deleted_file_is_refused() {
         // Catches (planted defect): a stale row, its file deleted.
         let mut t = tree();
