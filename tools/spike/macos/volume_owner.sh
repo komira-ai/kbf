@@ -45,7 +45,7 @@ cd "$P0_DIR" || exit 1
 SRC=$P0_DIR/src.plist
 FILE=kbf-p0.plist
 
-as_user() { sudo -n -H -u "$PROBE_USER" "$@"; }
+as_user() { "$@"; }
 as_root() { sudo -n "$@"; }
 
 # rc_of TEXT: the status run_cap appended to TEXT (empty when there is none).
