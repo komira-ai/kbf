@@ -328,21 +328,14 @@ fn node(
     let phase = node
         .phase
         .unwrap_or_else(|| tokio::sync::watch::channel(kbf_types::NodePhase::Serving).1);
-    let mut daemon = Daemon::new(DaemonConfig::from_args(&cli.daemon), runtimes, report)?
+    let daemon = Daemon::new(DaemonConfig::from_args(&cli.daemon), runtimes, report)?
         .with_container_images(cli.images.iter().cloned())
         .with_phase(phase);
     // Every runtime is built, so every sweep has run: claim the scratch directory.
-    if cli.scratch.is_some() {
-        let dir = scratch(cli)?;
-        let predecessor = instance::claim(&dir, daemon.instance_id()).unwrap_or_else(|e| {
-            tracing::warn!(
-                "{}: {e}; this daemon names no predecessor",
-                dir.join(instance::FILE).display()
-            );
-            String::new()
-        });
-        daemon = daemon.with_predecessor(predecessor);
-    }
+    let daemon = match &cli.scratch {
+        Some(_) => instance::named(daemon, &scratch(cli)?),
+        None => daemon,
+    };
     Ok(match node.reports {
         Some(reports) => (daemon.with_driver_report(reports.clone()), Some(reports)),
         None => (daemon, None),

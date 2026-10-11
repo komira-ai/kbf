@@ -43,7 +43,7 @@ use kbf_objstore::ObjectStore;
 use kbf_proto::google::rpc;
 use kbf_proto::reapi::ActionResult;
 use kbf_proto::worker::{
-    self, Cancel, LeaseOffer, NodeStatus, ResultAck, ServerMessage, Start, server_message,
+    self, LeaseOffer, NodeStatus, ResultAck, ServerMessage, Start, server_message,
 };
 use kbf_sched::fence::START_VALIDITY;
 use kbf_sched::{Cordon, DaemonInstance, Event, Input, OpState, Requeue, Scheduler};
@@ -54,6 +54,7 @@ use kbf_types::{
 use tokio::sync::{mpsc, watch};
 use tonic::{Code, Status};
 
+mod beat;
 mod phase;
 
 pub use phase::Reported;
@@ -330,50 +331,6 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
             debug_assert!(none.is_empty(), "a capacity change has no effect: {none:?}");
             state.phase(now, worker, reported.phase);
         }
-    }
-
-    /// Heartbeat `seq` on `stream`. Returns whether it was taken (and is to be
-    /// acknowledged): a heartbeat from a replaced stream is dropped. Each lease it
-    /// lists that the scheduler no longer holds on `worker` is sent a `Cancel`. A lease
-    /// it leaves out that a proven restart lost past its operation's farm reruns
-    /// finishes the operation: its callers are answered (nothing is cached).
-    pub async fn heartbeat(
-        &self,
-        worker: &WorkerId,
-        stream: StreamId,
-        seq: u64,
-        running: Vec<LeaseId>,
-    ) -> bool {
-        let now = self.now();
-        let settled: Vec<Settled> = {
-            let mut state = self.lock();
-            let Some(link) = state.links.get_mut(worker).filter(|l| l.stream == stream) else {
-                return false;
-            };
-            link.newest_beat = link.newest_beat.max(seq);
-            let outbound = link.outbound.clone();
-            let event = Event::Heartbeat {
-                worker: worker.clone(),
-                running: running.clone(),
-            };
-            let answers = state.feed(now, event);
-            for lease in state.sched.not_held(worker, &running) {
-                tracing::info!(%worker, %lease, "a lease not held here is listed: cancelled");
-                let cancel = server_message::Message::Cancel(Cancel {
-                    lease_id: Some(wire_lease(lease)),
-                });
-                // A stream that has just ended drops it; the next heartbeat listing the
-                // lease, on the next stream, sends it again.
-                let _ = outbound.send(Ok(ServerMessage {
-                    message: Some(cancel),
-                }));
-            }
-            answers.iter().map(|a| state.settle(a, None)).collect()
-        };
-        for settled in settled {
-            self.deliver(settled).await;
-        }
-        true
     }
 
     /// A `NodeStatus` on `stream`: kept as the worker's newest, unless `stream` was

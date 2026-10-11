@@ -13,8 +13,21 @@
 use std::io::{self, Write as _};
 use std::path::Path;
 
+use kbf_daemon::Daemon;
+
 /// The claim's file name in the scratch directory.
 pub(crate) const FILE: &str = "daemon-instance";
+
+/// `daemon`, naming as its predecessor the claim it finds on `scratch`, which it
+/// claims. A claim that cannot be read or written is logged, and names none.
+pub(crate) fn named(daemon: Daemon, scratch: &Path) -> Daemon {
+    let predecessor = claim(scratch, daemon.instance_id()).unwrap_or_else(|e| {
+        let path = scratch.join(FILE);
+        tracing::warn!("{}: {e}; this daemon names no predecessor", path.display());
+        String::new()
+    });
+    daemon.with_predecessor(predecessor)
+}
 
 /// Claims `scratch` for the daemon process `own`: returns the instance id the claim
 /// held (empty when there was none), then writes `own` in its place, whole, through a
