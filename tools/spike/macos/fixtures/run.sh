@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 # Builds one fixture and runs its UI tests, then reports what the .xcresult holds.
-# macOS only. Usage: run.sh ios|macos OUT_DIR [test|build-for-testing|test-without-building]
+# macOS only. Usage: run.sh ios|macos OUT_DIR [test|build-for-testing|test-without-building|report]
 #
 # ACTION is the xcodebuild action, `test` by default. `build-for-testing` only builds
 # into OUT_DIR's derived data and reports xcodebuild's exit status as the result;
 # `test-without-building` then runs the tests from that build and is checked as
-# `test` is.
+# `test` is. `report` runs no xcodebuild: it checks the bundle an earlier run left in
+# OUT_DIR as `test` would (so a probe can read a sandboxed run's bundle outside the
+# sandbox).
 #
 # ios runs on a simulator: the first available iPhone of the newest iOS runtime.
 # macos runs in this login session. Prints `SPIKE macos-<arch>.xcuitest.<platform>.*`
@@ -19,12 +21,12 @@
 SPIKE_ARCH="macos-$(uname -m)"
 
 here=$(cd "$(dirname "$0")" && pwd)
-usage="usage: run.sh ios|macos OUT_DIR [test|build-for-testing|test-without-building]"
+usage="usage: run.sh ios|macos OUT_DIR [test|build-for-testing|test-without-building|report]"
 platform=${1:?$usage}
 out=${2:?$usage}
 action=${3:-test}
 case $action in
-test | build-for-testing | test-without-building) ;;
+test | build-for-testing | test-without-building | report) ;;
 *)
     echo "$usage" >&2
     exit 2
@@ -67,7 +69,9 @@ log=$out/$platform-xcodebuild.log
 [ "$action" = test ] || log=$out/$platform-$action-xcodebuild.log
 start=$(date +%s)
 rc=0
-if [ "$action" = build-for-testing ]; then
+if [ "$action" = report ]; then
+    :
+elif [ "$action" = build-for-testing ]; then
     xcodebuild build-for-testing -project "$here/$project.xcodeproj" -scheme "$project" \
         -destination "$destination" -derivedDataPath "$out/$platform-derived" >"$log" 2>&1 || rc=$?
 else
@@ -76,8 +80,10 @@ else
         -destination "$destination" -derivedDataPath "$out/$platform-derived" \
         -resultBundlePath "$bundle" >"$log" 2>&1 || rc=$?
 fi
-kv "xcuitest.$platform.xcodebuild_exit" "$rc"
-kv "xcuitest.$platform.seconds" "$(($(date +%s) - start))"
+if [ "$action" != report ]; then
+    kv "xcuitest.$platform.xcodebuild_exit" "$rc"
+    kv "xcuitest.$platform.seconds" "$(($(date +%s) - start))"
+fi
 if [ "$rc" -ne 0 ]; then
     grep -E 'error:|failed|FAIL' "$log" | head -n 20 || true
 fi

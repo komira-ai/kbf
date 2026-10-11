@@ -342,7 +342,7 @@ t_xs_pass() {
     want 'xcuitest_sandbox.deny_default.deny.tree=1'
     want 'xcuitest_sandbox.deny_default.deny=sandbox-exec process-exec* bash'
     want 'xcuitest_sandbox.driver.macos.result=PASS'
-    want 'xcuitest_sandbox.driver.macos.tests_passed=3'
+    want 'xcuitest_sandbox.driver.macos.report.tests_passed=3'
     want 'xcuitest_sandbox.driver.macos.deny.tree=3'
     want 'xcuitest_sandbox.driver.macos.deny.ops=file-write-create:2 lsopen:1'
     want 'xcuitest_sandbox.driver.macos.deny.distinct=2'
@@ -382,11 +382,36 @@ t_xs_driver_fails() {
     : >"$T/state/driver_fails_ios"
     xs
     want 'xcuitest_sandbox.driver.ios.result=FAIL'
-    want 'xcuitest_sandbox.driver.ios.tests_passed=2'
+    want 'xcuitest_sandbox.driver.ios.xcodebuild_exit=65'
+    want 'xcuitest_sandbox.driver.ios.report.tests_passed=2'
     want 'xcuitest_sandbox.driver.ios.error=error: -[FixtureUITests testTapChangesLabel] failed'
     want 'xcuitest_sandbox.driver_tests.ios.result=PASS'
     want 'under the driver'"'"'s profile: driver.ios=FAIL (3 deny lines)'
     lacks 'driver.macos=FAIL'
+    verdict_is FAIL
+}
+
+# run.sh's own checks failing inside the sandbox (xcresulttool there) do not fail an
+# arm whose xcodebuild passed: the bundle is read again outside, and that report
+# decides. Catches a driver arm judged by run.sh's in-sandbox result.
+t_xs_analysis_in_sandbox() {
+    : >"$T/state/analysis_fails_in_sandbox"
+    xs
+    want 'xcuitest_sandbox.driver.macos.in_sandbox=FAIL'
+    want 'xcuitest_sandbox.driver.macos.xcodebuild_exit=0'
+    want 'xcuitest_sandbox.driver.macos.report.result=PASS'
+    want 'xcuitest_sandbox.driver.macos.result=PASS'
+    verdict_is PASS
+}
+
+# An xcodebuild that fails under the profile fails the arm even when the bundle's
+# tests passed.
+t_xs_xcodebuild_fails() {
+    : >"$T/state/xcodebuild_fails_after_tests"
+    xs
+    want 'xcuitest_sandbox.driver.macos.xcodebuild_exit=65'
+    want 'xcuitest_sandbox.driver.macos.report.result=PASS'
+    want 'xcuitest_sandbox.driver.macos.result=FAIL'
     verdict_is FAIL
 }
 
@@ -484,7 +509,8 @@ t_verdicts() {
 for test in t_lib t_watchdog t_am_already t_am_required_first t_am_control_noop t_am_hang \
     t_am_unknown t_am_user_drops t_am_adduser_hang t_simctl_pass t_simctl_deny_ignored t_simctl_bad_png \
     t_simctl_allow_fails t_simctl_bootstatus_fails t_simctl_delete_fails t_simctl_create_garbage \
-    t_tcc_pass t_tcc_control_empty t_xs_pass t_xs_driver_fails t_xs_driver_tests_fail \
+    t_tcc_pass t_tcc_control_empty t_xs_pass t_xs_driver_fails t_xs_analysis_in_sandbox t_xs_xcodebuild_fails \
+    t_xs_driver_tests_fail \
     t_xs_build_fails t_xs_control_fails \
     t_xs_deny_default_passes t_xs_deny_default_unreported t_xs_digest_mismatch t_xs_generator_fails \
     t_verdicts; do

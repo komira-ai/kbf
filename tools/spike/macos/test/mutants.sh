@@ -110,6 +110,10 @@ mutant 'the verdict ignores a failed unsandboxed build-for-testing' xcuitest_san
     's/^    elif \[ "$(st_get driver_tests.macos.build)" != PASS \] || \[ "$(st_get driver_tests.ios.build)" != PASS \]; then/    elif false; then/'
 mutant 'the verdict ignores the test-only arms' xcuitest_sandbox.sh t_xs_driver_tests_fail \
     's/^DRIVER_ARMS="driver.macos driver.ios driver_tests.macos driver_tests.ios"$/DRIVER_ARMS="driver.macos driver.ios"/'
+mutant 'a driver arm is judged by run.sh'"'"'s checks inside the sandbox' xcuitest_sandbox.sh t_xs_analysis_in_sandbox \
+    's/^    if \[ "${exit:-none}" = 0 \] && \[ "$(st_get "$1.report.result")" = PASS \]; then/    if [ "$(sed -n "s\/^SPIKE macos-[^.]*\\.xcuitest\\.$2\\.result=\/\/p" "$SPIKE_RESULTS\/$1.out" | tail -n 1)" = PASS ]; then/'
+mutant 'a driver arm passes on the report alone, whatever xcodebuild exited with' xcuitest_sandbox.sh t_xs_xcodebuild_fails \
+    's/^    if \[ "${exit:-none}" = 0 \] && \[ "$(st_get "$1.report.result")" = PASS \]; then/    if [ "$(st_get "$1.report.result")" = PASS ]; then/'
 mutant 'verdicts.sh lets a BROKEN verdict through' verdicts.sh t_verdicts \
     's/    case "$v" in BROKEN\*) bad=1 ;; esac/    :/'
 mutant 'verdicts.sh lets a missing verdict through' verdicts.sh t_verdicts \

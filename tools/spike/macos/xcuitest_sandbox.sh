@@ -34,7 +34,10 @@
 #                        what the build needs.
 #                        For every driver arm the SHA-256 of the profile handed to
 #                        sandbox-exec must be the one GENERATOR printed, or BROKEN (a
-#                        profile that is not the driver's). PASS or FAIL is the result;
+#                        profile that is not the driver's). The bundle the run left
+#                        is then checked without a sandbox (`run.sh ... report`):
+#                        PASS needs xcodebuild's exit 0 under the profile and that
+#                        report's PASS. PASS or FAIL is the result;
 #   control.macos        `xcodebuild test` without a sandbox, same lease layout and
 #   control.ios          variables: it must PASS (run.sh's own check: three tests
 #                        passed, three screenshots kept), or the probe is BROKEN.
@@ -221,12 +224,29 @@ a_deny_default() {
     denies deny_default 1
 }
 
-# driver_arm NAME PLATFORM [ACTION]: run.sh under the driver's profile in lease NAME.
+# driver_arm NAME PLATFORM [ACTION]: run.sh under the driver's profile in lease NAME,
+# then `run.sh PLATFORM OUT report` without a sandbox, which checks the bundle the run
+# left: the bundle's checks (xcresulttool) are the probe's, not part of the action, so
+# they are not judged under the sandbox. NAME.result is PASS only when xcodebuild
+# exited 0 under the profile and the report passed; NAME.in_sandbox is run.sh's own
+# result there.
 driver_arm() {
+    local exit
     tracked "$1" in_lease "$1" "$LEASES/$1/sandbox/profile.sb" \
         bash "$RUN" "$2" "$LEASES/$1/root/out" ${3:+"$3"}
     kv "$1.used_sha256" "$(cat "$LEASES/$1/used.sha256" 2>/dev/null)"
-    outcome "$1" "$2"
+    exit=$(sed -n "s/^SPIKE macos-[^.]*\.xcuitest\.$2\.xcodebuild_exit=//p" "$SPIKE_RESULTS/$1.out" | tail -n 1)
+    kv "$1.xcodebuild_exit" "${exit:-none}"
+    kv "$1.in_sandbox" "$(sed -n "s/^SPIKE macos-[^.]*\.xcuitest\.$2\.result=//p" "$SPIKE_RESULTS/$1.out" | tail -n 1)"
+    tracked "$1.report" in_lease "$1" "" bash "$RUN" "$2" "$LEASES/$1/root/out" report
+    outcome "$1.report" "$2"
+    if [ "${exit:-none}" = 0 ] && [ "$(st_get "$1.report.result")" = PASS ]; then
+        st_set "$1.result" PASS
+    else
+        st_set "$1.result" FAIL
+        kv "$1.error" "$(grep -v '^SPIKE ' "$SPIKE_RESULTS/$1.out" | head -n 5)"
+    fi
+    kv "$1.result" "$(st_get "$1.result")"
     denies "$1"
 }
 
@@ -274,7 +294,7 @@ same_profile() {
 DRIVER_ARMS="driver.macos driver.ios driver_tests.macos driver_tests.ios"
 
 decide() {
-    local a failed= mismatch=
+    local a failed='' mismatch=''
     for a in $DRIVER_ARMS; do
         if [ "$(st_get "$a.result")" != PASS ]; then
             failed="$failed $a=$(st_get "$a.result") ($(st_get "$a.tree") deny lines)"
