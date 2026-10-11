@@ -425,6 +425,49 @@ fn a_restore_that_does_not_take_keeps_the_record() {
     assert_eq!(reverted(&mac), Vec::<String>::new());
 }
 
+/// Catches: a revert that reads back only power settings and trusts the exit status of
+/// `defaults write` and `defaults delete`: each can exit 0 and leave the preference as
+/// it was, and revert then printed "(reverted)", exited 0 and moved the record aside.
+#[test]
+fn a_preference_restore_that_does_not_take_keeps_the_record() {
+    let mut mac = FakeMac::fresh("revert-pref-no-effect");
+    mac.state_mut()
+        .default_set(SOFTWARE_UPDATE, "AutomaticDownload", "1");
+    assert_eq!(apply(&mac).failed, 0);
+    let record = fs::read_to_string(mac.path(RECORD)).unwrap();
+    mac.state_mut().no_effect = vec![
+        format!("defaults write {SOFTWARE_UPDATE} AutomaticDownload "),
+        format!("defaults delete {COMMERCE} AutoUpdate"),
+    ];
+    let (out, status) = revert_verb(&mac).unwrap();
+    assert_eq!(
+        out.lines().collect::<Vec<_>>(),
+        [
+            "CHANGE power_sleep: pmset -a sleep 1 (reverted)",
+            "CHANGE power_standby: pmset -a standby 1 (reverted)",
+            "CHANGE power_powernap: pmset -a powernap 1 (reverted)",
+            "CHANGE power_autorestart: pmset -a autorestart 0 (reverted)",
+            "CHANGE power_womp: pmset -a womp 0 (reverted)",
+            &format!(
+                "FAIL updates_auto_download: AutomaticDownload is 0 after defaults write {SOFTWARE_UPDATE} AutomaticDownload -bool true, want 1"
+            ),
+            "CHANGE updates_auto_install_macos: AutomaticallyInstallMacOSUpdates deleted (reverted)",
+            "CHANGE updates_auto_install_security: CriticalUpdateInstall deleted (reverted)",
+            "CHANGE updates_config_data: ConfigDataInstall deleted (reverted)",
+            "CHANGE appstore_auto_update: AutomaticallyInstallAppUpdates deleted (reverted)",
+            &format!(
+                "FAIL appstore_auto_update: com.apple.commerce AutoUpdate is 0 after defaults delete {COMMERCE} AutoUpdate, want ABSENT"
+            ),
+            &format!(
+                "NOTE record: kept {RECORD}: 2 settings are not put back; revert again once they can be"
+            ),
+        ]
+    );
+    assert_eq!(status, 1, "{out}");
+    assert_eq!(fs::read_to_string(mac.path(RECORD)).unwrap(), record);
+    assert_eq!(reverted(&mac), Vec::<String>::new());
+}
+
 /// Catches: a revert that takes a record it cannot read for an empty one, or takes an
 /// empty record, or one without some of the settings, as nothing to restore for them,
 /// and moves it aside: the values from before kbf are then lost (the next apply records
