@@ -185,8 +185,11 @@ rm)
     # --force: a container still running is killed.
     kill_action
     # Interface files are not files to rmdir on cgroupfs; here they are, so the fake
-    # removes them the way the kernel would make them vanish.
+    # removes them the way the kernel would make them vanish, whatever the mode of the
+    # directory standing in for the cgroup (a test makes it read-only so that
+    # cgroup.kill cannot be written).
     if [ -f "$STATE/cgroup" ]; then
+        chmod u+w "$CGROOT$(cat "$STATE/cgroup")" 2>/dev/null
         find "$CGROOT$(cat "$STATE/cgroup")" -type f -delete 2>/dev/null
     fi
     exit 0
