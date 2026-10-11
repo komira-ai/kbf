@@ -136,15 +136,14 @@ enum Detail {
 #[derive(Debug)]
 struct State {
     sched: Scheduler,
-    /// The callers' records, the finished operations whose callers are kept, and the
-    /// leases whose `Start` was sent.
+    /// The callers' records, the finished operations whose callers are kept, the
+    /// leases whose `Start` was sent, and the node registry.
     machine: FarmMachine,
     /// The channel of each caller the machine keeps, forgotten with its record.
     stages: BTreeMap<WaiterId, watch::Sender<Stage>>,
     next_stream: u64,
+    /// The newest stream of each node the machine has registered.
     links: BTreeMap<WorkerId, Link>,
-    /// Each node's newest `NodeStatus`, kept across its streams.
-    software: BTreeMap<WorkerId, SoftwareView>,
     /// Nodes whose drain has paused, once logged.
     paused: BTreeSet<WorkerId>,
 }
@@ -184,7 +183,6 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
                 stages: BTreeMap::new(),
                 next_stream: 0,
                 links: BTreeMap::new(),
-                software: BTreeMap::new(),
                 paused: BTreeSet::new(),
             }),
         }
@@ -235,6 +233,7 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
             newest_beat: 0,
         };
         let replaced = state.links.insert(worker.clone(), link);
+        state.machine.register(worker);
         if replaced.is_some_and(|old| !old.instance.same_as(&instance)) {
             // The earlier process's leases are kept until it has fenced.
             let cause = "the daemon restarted, or two daemons hold this node's certificate";
@@ -318,7 +317,10 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
             return Vec::new();
         }
         let mut view = SoftwareView::new(status, received);
-        let before = state.software.get(worker).map_or(&[][..], |s| &s.xcodes);
+        let node = state.machine.node(worker);
+        let before = node
+            .and_then(|n| n.status.as_ref())
+            .map_or(&[][..], |s| &s.xcodes);
         // An Xcode not surveyed yet (a restarted daemon's first status) keeps the item
         // it had: neither cleared now nor raised again by the survey (`crate::fleet`).
         view.hold_unsurveyed(before);
@@ -330,16 +332,17 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
                 tracing::info!(target: "kbf_server::attention", "{line}");
             }
         }
-        state.software.insert(worker.clone(), view);
+        state.machine.report_status(worker, view);
         changes
     }
 
     /// This build, and every node registered since this farm started, in node-id order.
     pub fn nodes(&self) -> NodesView {
-        let state = self.lock();
+        let mut state = self.lock();
+        state.note_closed_streams();
         let nodes = state
-            .links
-            .keys()
+            .machine
+            .nodes()
             .map(|worker| self.node(&state, worker))
             .collect();
         NodesView::of_this_build(nodes)
@@ -347,10 +350,12 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
 
     /// `worker` as `GET /v1/nodes` lists it, if it has registered.
     pub fn node_view(&self, worker: &WorkerId) -> Option<NodeView> {
-        let state = self.lock();
+        let mut state = self.lock();
+        state.note_closed_streams();
         state
-            .links
-            .contains_key(worker)
+            .machine
+            .node(worker)
+            .is_some()
             .then(|| self.node(&state, worker))
     }
 
@@ -362,7 +367,8 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
     pub fn place(&self, worker: &WorkerId, action: NodeAction) -> Result<NodeView, UnknownNode> {
         let now = self.now();
         let mut state = self.lock();
-        if !state.links.contains_key(worker) {
+        state.note_closed_streams();
+        if state.machine.node(worker).is_none() {
             return Err(UnknownNode(worker.as_str().to_owned()));
         }
         let name = worker.clone();
@@ -379,7 +385,8 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
         Ok(self.node(&state, worker))
     }
 
-    /// One node's view; `worker` is registered.
+    /// One node's view; `worker` is registered, and every closed stream noted
+    /// ([`State::note_closed_streams`]).
     fn node(&self, state: &State, worker: &WorkerId) -> NodeView {
         let wall = |at: FarmTime| self.epoch_unix_ms.saturating_add(at.as_millis());
         let leases = || {
@@ -399,15 +406,16 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
                 leases: leases(),
             },
         };
+        let node = state.machine.node(worker);
+        let software = node.and_then(|n| n.status.clone());
         NodeView {
             node_id: worker.as_str().to_owned(),
-            connected: !state.links[worker].outbound.is_closed(),
-            software: state.software.get(worker).cloned(),
-            needs_attention: state
-                .software
-                .get(worker)
+            connected: node.is_some_and(|n| n.connected),
+            needs_attention: software
+                .as_ref()
                 .map(SoftwareView::needs_attention)
                 .unwrap_or_default(),
+            software,
             placement,
         }
     }
@@ -419,8 +427,8 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
         let mut state = self.lock();
         state.feed_quiet(now, Event::Tick);
         let paused: BTreeSet<WorkerId> = state
-            .links
-            .keys()
+            .machine
+            .nodes()
             .filter(|w| matches!(state.sched.cordon(w), Some(Cordon::Paused { .. })))
             .cloned()
             .collect();
@@ -644,6 +652,16 @@ impl State {
 
     fn is_current(&self, worker: &WorkerId, stream: StreamId) -> bool {
         self.links.get(worker).is_some_and(|l| l.stream == stream)
+    }
+
+    /// Tells the machine of each node whose newest stream has closed (its response
+    /// side is gone), so its registry says the node is not connected.
+    fn note_closed_streams(&mut self) {
+        for (worker, link) in &self.links {
+            if link.outbound.is_closed() {
+                self.machine.disconnect(worker);
+            }
+        }
     }
 
     /// The operation whose current lease is `lease`, the action its `Start` named,
