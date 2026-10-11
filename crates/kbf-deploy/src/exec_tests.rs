@@ -1,6 +1,8 @@
 use std::io::Read;
 use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 
 use super::*;
@@ -208,9 +210,13 @@ fn a_command_gets_only_the_environment_it_names() {
 }
 
 /// Answers each connection with the next status in `statuses`, then closes.
-fn server(statuses: Vec<&'static str>) -> (u16, thread::JoinHandle<()>) {
+/// The number of answers sent so far is counted before each is written, so a client
+/// that has read an answer sees it counted.
+fn server(statuses: Vec<&'static str>) -> (u16, Arc<AtomicUsize>, thread::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let port = listener.local_addr().expect("addr").port();
+    let answered = Arc::new(AtomicUsize::new(0));
+    let count = Arc::clone(&answered);
     let handle = thread::spawn(move || {
         for status in statuses {
             let (mut conn, _) = listener.accept().expect("accept");
@@ -223,10 +229,11 @@ fn server(statuses: Vec<&'static str>) -> (u16, thread::JoinHandle<()>) {
                 "GET /readyz HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
             );
             assert_eq!(request, want);
+            count.fetch_add(1, Ordering::SeqCst);
             conn.write_all(status.as_bytes()).expect("answer");
         }
     });
-    (port, handle)
+    (port, answered, handle)
 }
 
 fn wait(exec: &mut HostExec, url: &str, deadline: Duration) -> io::Result<()> {
@@ -239,7 +246,7 @@ fn wait(exec: &mut HostExec, url: &str, deadline: Duration) -> io::Result<()> {
 #[test]
 fn a_wait_retries_until_the_url_answers_2xx() {
     let (mut exec, _dir) = host("wait_ok");
-    let (port, server) = server(vec![
+    let (port, answered, server) = server(vec![
         "HTTP/1.1 503 Service Unavailable\r\n\r\n",
         "garbage\r\n",
         "HTTP/1.1 204 No Content\r\n\r\n",
@@ -250,6 +257,12 @@ fn a_wait_retries_until_the_url_answers_2xx() {
         Duration::from_secs(10),
     )
     .expect("ready on the third answer");
+    // Checked before joining: a wait that stopped early leaves the server in `accept`.
+    assert_eq!(
+        answered.load(Ordering::SeqCst),
+        3,
+        "ready before the 2xx answer"
+    );
     server.join().expect("the server saw three requests");
 }
 
@@ -258,11 +271,12 @@ fn a_wait_retries_until_the_url_answers_2xx() {
 #[test]
 fn a_wait_fails_at_its_deadline() {
     let (mut exec, _dir) = host("wait_late");
-    let (port, server) = server(vec!["HTTP/1.1 500 Oops\r\n\r\n"]);
+    let (port, answered, server) = server(vec!["HTTP/1.1 500 Oops\r\n\r\n"]);
     let url = format!("http://127.0.0.1:{port}/readyz");
     let err = wait(&mut exec, &url, Duration::ZERO).expect_err("never ready");
     assert_eq!(err.kind(), io::ErrorKind::TimedOut);
     assert!(err.to_string().ends_with("last: status 500"), "{err}");
+    assert_eq!(answered.load(Ordering::SeqCst), 1);
     server.join().expect("one request");
 
     // Nothing listens on the port now: each attempt fails to connect.
