@@ -369,7 +369,7 @@ async fn the_swap_kill_ends_even_when_cgroup_kill_fails() {
         chmod a-w "$CG"
         for i in 1 2 3 4 5 6 7 8 9 10; do
             printf 'max %d\noom 0\noom_kill 0\n' $i > "$CG/memory.events"
-            [ $i -eq 2 ] && echo 1048576 > "$CG/memory.swap.current"; sleep 0.01
+            [ $i -eq 2 ] && sleep 0.1 && echo 1048576 > "$CG/memory.swap.current" && sleep 0.1; sleep 0.01
         done
         sleep 0.2; chmod u+w "$CG"; exec sleep 30"#;
     let outcome = fake.run(1, &Spec::new(&image(), "unused"), script).await;
