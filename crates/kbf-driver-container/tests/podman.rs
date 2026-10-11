@@ -56,23 +56,68 @@ async fn an_action_runs_and_its_results_are_collected() {
     cell.assert_clean(1);
 }
 
-/// Outputs are read from the overlay's upper layer. Catches an output that is already
-/// an input being run (it would come back partial), and an input moved into an output
-/// coming back partial: if the overlay recorded the move as a redirect, or a chmod as
-/// a metadata-only copy-up, the upper layer would hold the directory without its
-/// files, the file without its bytes, or a deleted file as a whiteout.
+/// Outputs are read from the overlay's upper layer. Catches an input named as an
+/// output coming back partial: an unchanged input file missing, an output directory
+/// without its unchanged inputs, a deleted input recorded (or kept) instead of absent,
+/// an edited input with its old bytes; and the action not seeing those inputs where
+/// the client put them. Also catches an input moved into an output coming back
+/// partial: if the overlay recorded the move as a redirect, or a chmod as a
+/// metadata-only copy-up, the upper layer would hold the directory without its files,
+/// the file without its bytes, or a deleted file as a whiteout.
 #[tokio::test]
 #[ignore = "needs rootless Podman and a delegated cgroup: run by tools/ci/podman-tests.sh"]
-async fn outputs_are_whole_and_never_inputs() {
+async fn outputs_are_whole_and_inputs_named_as_outputs_are_as_the_action_left_them() {
     let cell = Cell::new("overlap");
-    let mut spec = sh("echo x > in/new");
-    spec.inputs = vec![("in/a.txt", b"a", false)];
-    spec.outputs = vec!["in".to_owned()];
-    let outcome = cell.run(1, &spec).await;
-    assert!(
-        matches!(outcome, Err(RuntimeError::Invalid(_))),
-        "{outcome:?}"
+    let mut spec = sh(
+        "set -e; [ \"$(cat same.txt in/keep.txt)\" = 'same bytes keep' ]; \
+         printf ' new' >> edit.txt; rm in/gone.txt; echo after > in/changed.txt",
     );
+    spec.working_directory = "pkg".to_owned();
+    spec.inputs = vec![
+        ("pkg/same.txt", b"same bytes ", false),
+        ("pkg/edit.txt", b"old", true),
+        ("pkg/in/keep.txt", b"keep", false),
+        ("pkg/in/gone.txt", b"gone", false),
+        ("pkg/in/changed.txt", b"before", false),
+    ];
+    spec.outputs = ["same.txt", "edit.txt", "in"].map(str::to_owned).to_vec();
+    let result = cell.run(1, &spec).await.expect("ran");
+    assert_eq!(
+        result.exit_code,
+        0,
+        "stderr: {}",
+        String::from_utf8_lossy(&blob(&cell.cas, result.stderr_digest.as_ref()))
+    );
+    let files: Vec<_> = result
+        .output_files
+        .iter()
+        .map(|f| {
+            (
+                f.path.as_str(),
+                blob(&cell.cas, f.digest.as_ref()),
+                f.is_executable,
+            )
+        })
+        .collect();
+    assert_eq!(
+        files,
+        [
+            ("same.txt", b"same bytes ".to_vec(), false),
+            ("edit.txt", b"old new".to_vec(), true)
+        ],
+        "{result:?}"
+    );
+    assert_eq!(result.output_directories.len(), 1, "{result:?}");
+    let tree = support::tree(&cell.cas, result.output_directories[0].tree_digest.as_ref());
+    let root = tree.root.expect("root");
+    let names: Vec<_> = root.files.iter().map(|f| f.name.as_str()).collect();
+    assert_eq!(names, ["changed.txt", "keep.txt"], "{root:?}");
+    assert!(
+        root.directories.is_empty() && root.symlinks.is_empty(),
+        "{root:?}"
+    );
+    assert_eq!(blob(&cell.cas, root.files[0].digest.as_ref()), b"after\n");
+    assert_eq!(blob(&cell.cas, root.files[1].digest.as_ref()), b"keep");
     cell.assert_clean(1);
 
     let mut spec = sh(
