@@ -45,7 +45,10 @@ fn enc(command: &Command) -> Vec<u8> {
 }
 
 fn dec(bytes: &[u8]) -> Result<Command, DecodeError> {
-    decode(Format::V1, bytes).map(|LogCommand::Meta(c)| c)
+    match decode(Format::V1, bytes)? {
+        LogCommand::Meta(c) => Ok(c),
+        other => panic!("not a metadata command: {other:?}"),
+    }
 }
 
 /// The bytes of a `Digest` message for `d(n)`, n < 128: function 1 (`08 01`), the
