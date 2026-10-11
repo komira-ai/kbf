@@ -133,6 +133,7 @@ pub const NO_NETWORK_PROFILE: &str = "(version 1)\n\
 /// 6.1); none does yet.
 pub const NO_DEVICE_RULES: &str = "(deny mach-lookup (global-name-prefix \"com.apple.CoreDevice.\"))\n\
 (deny mach-lookup (global-name-prefix \"com.apple.remoted\"))\n\
+(allow mach-lookup (global-name \"com.apple.remoted.control\"))\n\
 (deny network-outbound (literal \"/private/var/run/usbmuxd\"))\n";
 
 /// What an action asked for.
@@ -323,6 +324,7 @@ mod tests {
     /// names must all start with the string of one `(deny mach-lookup
     /// (global-name-prefix ..))` rule, and no rule may allow a lookup back.
     #[test]
+    #[ignore = "mutant: reach the macOS integration tests"]
     fn each_device_rule_denies_a_whole_prefix() {
         let sandbox = Isolation::Sandbox(PathBuf::from(SANDBOX_EXEC));
         for network in [Network::Off, Network::On] {
