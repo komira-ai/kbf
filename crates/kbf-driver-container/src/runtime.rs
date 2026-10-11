@@ -479,7 +479,7 @@ impl<C: Cas> PodmanRuntime<C> {
     async fn timed_out(&self, name: &str, stdout: &Path, stderr: &Path) -> RuntimeError {
         let max = self.config.outputs.max_stdio_bytes;
         let mut logs = [None, None];
-        for (path, slot) in [stdout, stderr].into_iter().zip(&mut logs) {
+        for (path, slot) in [stderr, stdout].into_iter().zip(&mut logs) {
             match collect_log(&*self.cas, path, max).await {
                 Ok(digest) => *slot = Some(digest),
                 Err(e) => tracing::warn!(lease = %name, "timed out; its log is left out: {e}"),
