@@ -737,7 +737,8 @@ impl State {
     /// Forgets the callers, and their channels, of every finished operation the
     /// scheduler has dropped ([`FarmMachine::forget_dropped`]): a WaitExecution on one
     /// is NOT_FOUND from now on. Every input ends here, so debug builds check here
-    /// that each caller the machine keeps has one channel and no other caller has.
+    /// that the callers with a channel are exactly the callers the machine keeps: the
+    /// same ids, not only as many.
     fn forget_dropped(&mut self) {
         let sched = &self.sched;
         let forgotten = self
@@ -746,9 +747,8 @@ impl State {
         for id in forgotten {
             self.stages.remove(&id);
         }
-        debug_assert_eq!(
-            self.stages.len(),
-            self.machine.waiters_kept(),
+        debug_assert!(
+            self.stages.keys().copied().eq(self.machine.waiter_ids()),
             "a caller's channel outlives its record, or a record has no channel"
         );
     }
