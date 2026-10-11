@@ -15,8 +15,8 @@
 //!   not on the binary allow list (rules in `kbf_it::hygiene`);
 //! - a shell, Python, awk, sed, Perl or Ruby file, a workflow `run:` step with shell
 //!   logic, or a production `sh -c` in `crates/*/src/` that `tools/interpreter_budget.tsv`
-//!   does not list at its exact size, and a row of that file that is stale, repeated
-//!   or malformed (rules in `interpreters/mod.rs`);
+//!   does not list (by path, never by size), and a row of that file that is stale,
+//!   repeated or malformed (rules in `interpreters/mod.rs`);
 //! - the darwin-arm64 job of `.github/workflows/artifacts.yml` no longer running
 //!   `tools/ci/check-darwin-asset.sh` on the packaged binary after `Package`, or
 //!   running it where its failure does not fail the job;
@@ -243,7 +243,6 @@ fn interpreter_scan(files: &[String], read: impl Fn(&str) -> Option<Vec<u8>>) ->
             found.push(Found {
                 section: Section::Files,
                 key: f.clone(),
-                count: interpreters::newlines(&bytes),
                 why,
             });
         }
@@ -274,7 +273,6 @@ fn interpreter_scan(files: &[String], read: impl Fn(&str) -> Option<Vec<u8>>) ->
                 found.push(Found {
                     section: Section::Workflow,
                     key,
-                    count: interpreters::script_lines(&s.script),
                     why: format!("its `run:` script has {what}"),
                 });
             }
@@ -288,10 +286,9 @@ fn interpreter_scan(files: &[String], read: impl Fn(&str) -> Option<Vec<u8>>) ->
     }
     let (spawns, unread) = interpreters::rust::shell_c_files(&rust_src);
     problems.extend(unread);
-    found.extend(spawns.into_iter().map(|(key, count)| Found {
+    found.extend(spawns.into_iter().map(|key| Found {
         section: Section::SrcShC,
         key,
-        count,
         why: "its production code names a shell and a `-c` flag".to_owned(),
     }));
     BudgetScan {
@@ -312,10 +309,10 @@ fn budget_problems(scan: BudgetScan, budget: &str) -> Vec<String> {
 #[test]
 fn every_interpreter_file_workflow_script_and_shell_spawn_is_in_the_budget() {
     // Catches: a new shell, Python, awk, sed, Perl or Ruby file (by extension or by
-    // its `#!` line); one that grew or shrank without its row; a row left for a file
-    // that is gone; a new workflow `run:` step with shell logic; a new `sh -c` in
-    // production Rust; a malformed or duplicate row (module `interpreters`); and the
-    // scan passing because it read no workflow steps or no Rust sources.
+    // its `#!` line); a row left for a file that is gone; a new workflow `run:` step
+    // with shell logic; a new `sh -c` in production Rust; a malformed or duplicate row
+    // (module `interpreters`); and the scan passing because it read no workflow steps
+    // or no Rust sources. Sizes are not checked: an edit of a listed file passes.
     let root = repo_root();
     let files = listed_files(&root);
     let scan = interpreter_scan(&files, |f| read_bytes(&root.join(f)));
@@ -352,10 +349,10 @@ mod budget {
     const KEEPER: &str = "crates/k/src/keeper.rs";
     const KEEPER_RS: &str =
         r#"pub fn watch() { std::process::Command::new("/bin/sh").args(["-c", "x"]); }"#;
-    const BUDGET: &str = "[files]\n2\ttools/ci/x.sh\tCI\n1\ttools/probe\tprobe\n\
-                          [workflow]\n2\t.github/workflows/ci.yml#test/Probe\tfacts\n\
-                          1\t.github/actions/a/action.yml#runs/step 1\tchain\n\
-                          [src-sh-c]\n1\tcrates/k/src/keeper.rs\tkeeper\n";
+    const BUDGET: &str = "[files]\ntools/ci/x.sh\tCI\ntools/probe\tprobe\n\
+                          [workflow]\n.github/workflows/ci.yml#test/Probe\tfacts\n\
+                          .github/actions/a/action.yml#runs/step 1\tchain\n\
+                          [src-sh-c]\ncrates/k/src/keeper.rs\tkeeper\n";
 
     /// The control tree: one row-matching thing of each kind, plus files the scan
     /// must leave alone.
@@ -412,17 +409,19 @@ mod budget {
     }
 
     #[test]
-    fn a_file_one_line_longer_or_shorter_than_its_row_is_refused() {
-        // Catches (planted defects): the row off by +1 and by -1.
-        for text in ["#!/bin/sh\necho\necho\n", "#!/bin/sh\n"] {
+    fn an_edit_of_a_listed_file_step_or_spawn_passes() {
+        // Catches: the list tied to sizes again, so editing a listed script, a listed
+        // `run:` step or a listed keeper would make the pull request touch the list.
+        // The first edit grows each listed thing (a second shell for the keeper), the
+        // second shrinks the script; neither adds anything unlisted.
+        let step = WORKFLOW.replace("nproc\n", "nproc\n          sw_vers\n");
+        let keeper = format!("{KEEPER_RS}\nfn again() {{ g(\"/bin/bash\", \"-c\") }}\n");
+        for script in ["#!/bin/sh\necho\necho\necho\n", "#!/bin/sh\n"] {
             let mut t = tree();
-            t.insert("tools/ci/x.sh".to_owned(), text.as_bytes().to_vec());
-            let p = problems(&t, BUDGET);
-            assert_eq!(p.len(), 1, "{p:?}");
-            assert!(
-                p[0].starts_with("`tools/ci/x.sh` has ") && p[0].contains("row (line 2) says 2"),
-                "{p:?}"
-            );
+            t.insert("tools/ci/x.sh".to_owned(), script.as_bytes().to_vec());
+            t.insert(CI.to_owned(), step.clone().into_bytes());
+            t.insert(KEEPER.to_owned(), keeper.clone().into_bytes());
+            assert_eq!(problems(&t, BUDGET), Vec::<String>::new(), "{script:?}");
         }
     }
 
