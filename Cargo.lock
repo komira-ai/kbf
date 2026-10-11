@@ -1186,6 +1186,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "kbf-deploy"
+version = "0.1.0"
+dependencies = [
+ "rustix",
+ "thiserror",
+]
+
+[[package]]
 name = "kbf-driver-container"
 version = "0.1.0"
 dependencies = [
