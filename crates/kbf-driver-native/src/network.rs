@@ -415,12 +415,11 @@ mod tests {
             let appended = &profile
                 [profile.find(NO_DEVICE_RULES).expect("device rules") + NO_DEVICE_RULES.len()..];
             assert_eq!(appended, rules, "{network:?}");
-            assert!(
-                appended.starts_with("(allow file-write*\n")
-                    && appended.matches("(allow").count() == 1
-                    && !appended.contains("(deny"),
-                "{network:?}: {appended}"
-            );
+            // Three asserts, not one `&&` chain: the coverage ratchet counts each
+            // short-circuit a test never takes as a missed branch.
+            assert!(appended.starts_with("(allow file-write*\n"), "{appended}");
+            assert_eq!(appended.matches("(allow").count(), 1, "{appended}");
+            assert!(!appended.contains("(deny"), "{appended}");
         }
     }
 
