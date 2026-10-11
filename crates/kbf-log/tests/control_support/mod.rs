@@ -2,7 +2,7 @@
 
 #![allow(dead_code, reason = "each test file uses its own subset")]
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime};
 
 use kbf_caps::{Arch, Consumable, CpuCaps, NodeCaps};
@@ -45,8 +45,8 @@ pub const fn resources() -> Resources {
     Resources::new(1, 2).with_gpus(3).with_vms(4)
 }
 
-/// An arm64 node with feature `a`, exact `k=v`, the set `m={x}`, two GPUs and
-/// driver `n`.
+/// An arm64 node with feature `a`, exact `k=v`, the set `m={x}`, two GPUs, driver `n`
+/// and device `u` of class `c`.
 pub fn caps() -> NodeCaps {
     let mut caps = NodeCaps::new(CpuCaps::new(Arch::Arm64, BTreeSet::from(["a".to_owned()])))
         .with_drivers(["n"]);
@@ -54,15 +54,36 @@ pub fn caps() -> NodeCaps {
     caps.members
         .insert("m".to_owned(), BTreeSet::from(["x".to_owned()]));
     caps.consumables.insert(Consumable::Gpus, 2);
+    caps.devices.insert(
+        "u".to_owned(),
+        BTreeMap::from([("class".to_owned(), "c".to_owned())]),
+    );
     caps
 }
 
-/// `caps()` as its `NodeCaps` message bytes (32, 0x20): cpu (0a) { arch 2, features
+/// `caps()` as its `NodeCaps` message bytes (49, 0x31): cpu (0a) { arch 2, features
 /// "a" }, exact (12) { "k", "v" }, members (1a) { "m", ["x"] }, consumables (22)
-/// { 4, 2 }, drivers (2a) "n".
+/// { 4, 2 }, drivers (2a) "n", devices (32, 15) { id (0a) "u", attributes (12, 10)
+/// { key (0a) "class", value (12) "c" } }.
 pub const CAPS_HEX: &str = concat!(
-    "0a05", "0802", "120161", "1206", "0a016b", "120176", "1a06", "0a016d", "120178", "2204",
-    "0804", "1002", "2a016e"
+    "0a05",
+    "0802",
+    "120161",
+    "1206",
+    "0a016b",
+    "120176",
+    "1a06",
+    "0a016d",
+    "120178",
+    "2204",
+    "0804",
+    "1002",
+    "2a016e",
+    "320f",
+    "0a0175",
+    "120a",
+    "0a05636c617373",
+    "120163"
 );
 
 /// `resources()` as its `Resources` message bytes (8).

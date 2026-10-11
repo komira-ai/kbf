@@ -62,6 +62,42 @@ fn request_hex(qos_hex: &str, kind: u8) -> String {
     batch_hex(0x56, 0x50, &format!("224e0a4c{request}"))
 }
 
+/// `request(Qos::Batch, LeaseKind::Action)` that also needs an iOS device of class `c`.
+fn device_request() -> Request {
+    let mut r = request(Qos::Batch, LeaseKind::Action);
+    r.needs = kbf_caps::Request::parse([
+        ("arch", "arm64"),
+        ("ios.device", "1"),
+        ("ios.device.class", "c"),
+    ])
+    .expect("device request");
+    r
+}
+
+/// `device_request()` inside a batch. Its needs are written in `properties()` order:
+/// `arch`, then `ios.device`, then each device attribute.
+fn device_request_hex() -> String {
+    let request = [
+        // key (0a, 45) { instance "i", action (12, 38) }
+        format!("0a2b0a01691226{}", digest_hex(3)),
+        // qos (12, 2) { builtin (08) 3 }, kind (18) 1, resources (22, 4) { cpu 1,
+        // memory 2 }
+        "120208031801220408011002".to_owned(),
+        // needs (2a, 13) { key "arch", value "arm64" }
+        "2a0d0a046172636812056172 6d3634".replace(' ', ""),
+        // needs (2a, 15) { key (0a, 10) "ios.device", value (12) "1" }
+        "2a0f0a0a696f732e646576696365120131".to_owned(),
+        // needs (2a, 21) { key (0a, 16) "ios.device.class", value (12) "c" }
+        "2a150a10696f732e6465766963652e636c617373120163".to_owned(),
+        // hermetic (30), do_not_cache (38)
+        "30013801".to_owned(),
+    ]
+    .concat();
+    // Request: 45 + 4 + 2 + 6 + 15 + 17 + 23 + 4 = 116 (0x74); Submit (0a): 118; input
+    // (22): 120; batch: 126.
+    batch_hex(0x7e, 0x78, &format!("22760a74{request}"))
+}
+
 /// A failed report: farm time 1, operation 3, lease 1.2, failure value `failure`.
 fn failed_report_hex(failure: u8) -> String {
     // Report (22, 14): farm time (08), operation (10), lease (1a, 4), outcome (22, 2)
@@ -172,7 +208,8 @@ fn golden() -> Vec<(&'static str, LogCommand, String)> {
             batch_hex(15, 9, "2a071a050803120172"),
         ),
         (
-            // input (12): capacity { worker "w", capacity (12, 8), caps (1a, 32) }
+            // input (12, 64): capacity { worker "w" (3), capacity (12, 8) (10), caps
+            // (1a, 49) (51) }
             "Capacity",
             batch(FarmInput::Capacity {
                 worker: w("w"),
@@ -180,14 +217,14 @@ fn golden() -> Vec<(&'static str, LogCommand, String)> {
                 caps: caps(),
             }),
             batch_hex(
-                0x37,
-                0x31,
-                &format!("122f0a01771208{RESOURCES_HEX}1a20{CAPS_HEX}"),
+                0x48,
+                0x42,
+                &format!("12400a01771208{RESOURCES_HEX}1a31{CAPS_HEX}"),
             ),
         ),
         (
-            // input (0a): worker up { worker "w", instance (12) "i", capacity (1a, 8),
-            // caps (22, 32) }
+            // input (0a, 67): worker up { worker "w" (3), instance (12) "i" (3),
+            // capacity (1a, 8) (10), caps (22, 49) (51) }
             "WorkerUp",
             batch(FarmInput::WorkerUp {
                 worker: w("w"),
@@ -196,9 +233,9 @@ fn golden() -> Vec<(&'static str, LogCommand, String)> {
                 caps: caps(),
             }),
             batch_hex(
-                0x3a,
-                0x34,
-                &format!("0a320a01771201691a08{RESOURCES_HEX}2220{CAPS_HEX}"),
+                0x4b,
+                0x45,
+                &format!("0a430a01771201691a08{RESOURCES_HEX}2231{CAPS_HEX}"),
             ),
         ),
         (
@@ -209,6 +246,11 @@ fn golden() -> Vec<(&'static str, LogCommand, String)> {
                 LeaseKind::WholeMachine,
             ))),
             request_hex("0803", 2),
+        ),
+        (
+            "Submit device",
+            batch(FarmInput::Submit(device_request())),
+            device_request_hex(),
         ),
         (
             // Report (22, 176 as the varint b0 01): farm time 1, operation 3, lease
