@@ -271,3 +271,7 @@ impl Exec for ScratchHost {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "testkit_tests.rs"]
+mod tests;
