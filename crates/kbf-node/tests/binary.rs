@@ -874,7 +874,6 @@ fn a_restarted_daemon_ends_the_runs_it_was_killed_with_before_hello() {
     // The keeper is the action's group's one other member: killed first, as the
     // kernel's OOM killer may take it with the daemon, it leaves the sweep to act.
     let keepers = others_in_group(pid);
-    assert_eq!(keepers.len(), 1, "one keeper: {keepers:?}");
     for &keeper in &keepers {
         // SAFETY: kill(2) on the keeper, the daemon's unreaped child, so the pid is its.
         assert_eq!(unsafe { libc::kill(keeper, libc::SIGKILL) }, 0);
@@ -925,6 +924,7 @@ fn a_restarted_daemon_ends_the_runs_it_was_killed_with_before_hello() {
         &lines("second.log"),
     );
     let log = read(&dir.join("second.log"));
+    assert_eq!(keepers.len(), 1, "one keeper: {keepers:?}");
     assert!(
         action_ended,
         "the action (pid {pid}) still ran when the restarted daemon said Hello:\n{log}"

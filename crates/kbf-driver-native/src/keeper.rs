@@ -110,9 +110,9 @@ mod tests {
         unsafe { libc::getpgid(pid) }
     }
 
-    /// Whether `child` exits within five seconds; reaps it if so.
-    fn exits(child: &mut Child) -> bool {
-        let deadline = Instant::now() + Duration::from_secs(5);
+    /// Whether `child` exits within `within`; reaps it if so.
+    fn exits(child: &mut Child, within: Duration) -> bool {
+        let deadline = Instant::now() + within;
         while Instant::now() < deadline {
             if child.try_wait().expect("wait").is_some() {
                 return true;
@@ -132,14 +132,13 @@ mod tests {
         let keeper_pid = i32::try_from(keeper.pid()).expect("pid");
         assert_eq!(pgid(keeper_pid), pid(&action), "the keeper is in the group");
         keeper.orphan();
-        let ended = exits(&mut action);
-        if !ended {
-            let _ = action.kill();
-            let _ = action.wait();
-        }
+        let ended = exits(&mut action, Duration::from_secs(5));
+        // A red run must not leave the sleep behind (a no-op once it was reaped).
+        let _ = action.kill();
+        let _ = action.wait();
         assert!(ended, "the action outlived its keeper's pipe");
         assert!(
-            exits(&mut keeper.child),
+            exits(&mut keeper.child, Duration::from_secs(5)),
             "the keeper killed itself with the group"
         );
     }
@@ -151,16 +150,12 @@ mod tests {
     fn a_dropped_keeper_kills_nothing() {
         let mut action = group();
         let keeper = Keeper::join(pid(&action)).expect("keeper");
-        std::thread::sleep(Duration::from_millis(200));
-        assert!(
-            action.try_wait().expect("wait").is_none(),
-            "killed while held"
-        );
+        let held = !exits(&mut action, Duration::from_millis(200));
         drop(keeper);
-        std::thread::sleep(Duration::from_millis(200));
-        let alive = action.try_wait().expect("wait").is_none();
+        let alive = !exits(&mut action, Duration::from_millis(200));
         let _ = action.kill();
         let _ = action.wait();
+        assert!(held, "killed while held");
         assert!(alive, "dropping the keeper killed the group");
     }
 

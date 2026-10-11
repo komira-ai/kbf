@@ -343,6 +343,8 @@ fn record_child(mut pid_read: io::PipeReader, record: &Path) -> io::Result<i32> 
     let mut pid = [0_u8; 4];
     pid_read.read_exact(&mut pid)?;
     let pid = i32::from_ne_bytes(pid);
+    let child = procs::process(pid)
+        .ok_or_else(|| io::Error::other(format!("the child {pid} is not in the process table")))?;
     // The keeper joins the child's group before the go byte, and the standard
     // library's own `process_group` step comes only after the child's pre-exec steps,
     // so the group is made here, as a shell makes a job's: by the parent, for a child
@@ -355,8 +357,6 @@ fn record_child(mut pid_read: io::PipeReader, record: &Path) -> io::Result<i32> 
             format!("make the child {pid} lead a process group: {e}"),
         ));
     }
-    let child = procs::process(pid)
-        .ok_or_else(|| io::Error::other(format!("the child {pid} is not in the process table")))?;
     let line = Record {
         pgid: pid,
         start: child.start,
@@ -624,9 +624,8 @@ mod tests {
             .expect("spawn");
         keeper.orphan();
         let waited = tokio::time::timeout(std::time::Duration::from_secs(10), child.wait()).await;
-        if waited.is_err() {
-            let _ = child.kill().await;
-        }
+        // A red run must not leave the sleep behind (a no-op once it was reaped).
+        let _ = child.start_kill();
         let status = waited
             .expect("the action outlived its daemon")
             .expect("wait");
@@ -679,6 +678,27 @@ mod tests {
             .expect_err("no executable");
         assert_eq!(error.raw_os_error(), Some(libc::ENOEXEC), "{error}");
         assert!(!marker.exists(), "run through /bin/sh");
+    }
+
+    /// Catches a recorder that writes a record, and lets the program run, for a child
+    /// it could not make lead a group of its own: the keeper could not join it. Here
+    /// the "child" is this process's parent, which it may not move (ESRCH).
+    #[test]
+    fn a_child_that_cannot_lead_a_group_gets_no_record() {
+        let dir = dir("ungrouped");
+        let record = dir.join("lease-1-1");
+        let (pid_read, mut pid_write) = io::pipe().expect("pipe");
+        let (mut go_read, go_write) = io::pipe().expect("pipe");
+        // SAFETY: getppid takes nothing and cannot fail.
+        let parent = unsafe { libc::getppid() };
+        pid_write.write_all(&parent.to_ne_bytes()).expect("pid");
+        let error = write_record(pid_read, go_write, &record).expect_err("not a child");
+        let says = format!("make the child {parent} lead a process group: ");
+        assert!(error.to_string().starts_with(&says), "{error}");
+        assert!(!record.exists());
+        let mut go = Vec::new();
+        go_read.read_to_end(&mut go).expect("read");
+        assert_eq!(go, [0], "a refusal, not a go byte");
     }
 
     /// Catches a recorder that writes a record for a child it cannot find (the record

@@ -114,9 +114,9 @@ mod tests {
         dir
     }
 
-    /// Waits up to five seconds for `file` to hold `text`.
-    fn holds(file: &Path, text: &str) -> bool {
-        let deadline = Instant::now() + Duration::from_secs(5);
+    /// Whether `file` holds `text` within `within`.
+    fn holds(file: &Path, text: &str, within: Duration) -> bool {
+        let deadline = Instant::now() + within;
         while Instant::now() < deadline {
             if std::fs::read_to_string(file).is_ok_and(|t| t == text) {
                 return true;
@@ -125,6 +125,20 @@ mod tests {
         }
         false
     }
+
+    /// Whether `child` exits within `within`; reaps it if so.
+    fn exits(child: &mut Child, within: Duration) -> bool {
+        let deadline = Instant::now() + within;
+        while Instant::now() < deadline {
+            if child.try_wait().expect("wait").is_some() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        false
+    }
+
+    const PROMPT: Duration = Duration::from_secs(5);
 
     /// Catches a keeper that does not kill the lease cgroup when the daemon's end of
     /// its pipe closes (the bug: a killed daemon's container runs on), one that writes
@@ -136,26 +150,22 @@ mod tests {
         let kill = dir.join("cgroup.kill");
         std::fs::write(&kill, "").expect("cgroup.kill");
         let mut keeper = Keeper::watch(&kill).expect("keeper");
-        std::thread::sleep(Duration::from_millis(200));
-        assert_eq!(
-            std::fs::read_to_string(&kill).expect("read"),
-            "",
-            "killed while held"
+        let short = Duration::from_millis(200);
+        assert!(
+            !exits(&mut keeper.child, short),
+            "the keeper exited while held"
         );
+        assert!(!holds(&kill, "1\n", short), "killed while held");
         keeper.orphan();
-        assert!(holds(&kill, "1\n"), "no cgroup.kill once its pipe closed");
+        assert!(
+            holds(&kill, "1\n", PROMPT),
+            "no cgroup.kill once its pipe closed"
+        );
         std::fs::write(&kill, "").expect("as the kernel reads it");
-        assert!(holds(&kill, "1\n"), "cgroup.kill written once only");
+        assert!(holds(&kill, "1\n", PROMPT), "cgroup.kill written once only");
         // Gone, as after the sweep: the keeper stops and makes no file.
         std::fs::remove_file(&kill).expect("rm");
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while keeper.child.try_wait().expect("wait").is_none() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert!(
-            keeper.child.try_wait().expect("wait").is_some(),
-            "the keeper went on"
-        );
+        assert!(exits(&mut keeper.child, PROMPT), "the keeper went on");
         assert!(!kill.exists(), "the keeper made cgroup.kill");
     }
 
@@ -180,7 +190,7 @@ mod tests {
         let kill = dir.join("cgroup.kill");
         std::fs::write(&kill, "").expect("cgroup.kill");
         drop(Keeper::watch(&kill).expect("keeper"));
-        std::thread::sleep(Duration::from_millis(300));
-        assert_eq!(std::fs::read_to_string(&kill).expect("read"), "");
+        let short = Duration::from_millis(300);
+        assert!(!holds(&kill, "1\n", short), "the dropped keeper killed");
     }
 }
