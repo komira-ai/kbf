@@ -346,12 +346,14 @@ fn read(path: &PathBuf) -> Result<Vec<u8>, ConfigError> {
 
 #[cfg(test)]
 mod tests {
-    use super::loopback_only;
+    use clap::Parser;
 
-    /// Catches: a plain-text warning that knows only wildcards (`is_unspecified`), so a
-    /// listener on one interface other machines reach (`192.0.2.10`, a documentation
-    /// address standing in for a LAN or mesh one) goes unwarned; and one that drops
-    /// `to_canonical`, so the IPv4-mapped loopback address is warned about.
+    use super::{Args, loopback_only};
+
+    /// Catches: a `loopback_only` that knows only wildcards (`is_unspecified`), so one
+    /// interface other machines reach (`192.0.2.10`, a documentation address standing
+    /// in for a LAN or mesh one) counts as loopback; and one that drops `to_canonical`,
+    /// so the IPv4-mapped loopback address does not.
     #[test]
     fn only_loopback_addresses_are_loopback_only() {
         for (ip, want) in [
@@ -363,6 +365,33 @@ mod tests {
             ("192.0.2.10", false),
         ] {
             assert_eq!(loopback_only(ip.parse().expect("an address")), want, "{ip}");
+        }
+    }
+
+    /// Catches: a call site in [`Args::plain_text_off_loopback`] that does not go
+    /// through `loopback_only`. One listener is on a single non-loopback interface
+    /// (`192.0.2.10`, which a wildcard-only check such as `is_unspecified` misses) and
+    /// the other on the IPv4-mapped loopback address (`::ffff:127.0.0.1`, which
+    /// `is_loopback` without `to_canonical` misses), each way round, so either
+    /// mistake at either listener changes the list.
+    #[test]
+    fn plain_text_off_loopback_checks_each_listener_through_loopback_only() {
+        for (listen, worker_listen, want) in [
+            ("192.0.2.10:0", "[::ffff:127.0.0.1]:0", vec!["reapi"]),
+            ("[::ffff:127.0.0.1]:0", "192.0.2.10:0", vec!["worker"]),
+        ] {
+            let args = Args::parse_from([
+                "kbf-server",
+                "--listen",
+                listen,
+                "--worker-listen",
+                worker_listen,
+            ]);
+            assert_eq!(
+                args.plain_text_off_loopback(),
+                want,
+                "--listen {listen} --worker-listen {worker_listen}"
+            );
         }
     }
 }

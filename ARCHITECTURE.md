@@ -301,9 +301,8 @@ not yet probed.
   `--reapi-tls-key`, both or neither). Under TLS it presents a server certificate
   only: it asks clients for none, so a client certificate identifies no caller. A key
   that does not match its certificate stops the server before it prints its start
-  line. Over TLS as over
-  plain text, it runs the authentication policy and the per-call authorizers of
-  `--reapi-auth-policy`, in Buildbarn's model
+  line. Over TLS as over plain text, it runs the authentication policy and the
+  per-call authorizers of `--reapi-auth-policy`, in Buildbarn's model
   ([docs/reapi-auth.md](docs/reapi-auth.md)); the policies built so far (`allow`,
   `deny`, `any`, `all`, and instance-name prefixes) check no credential. Without the
   flag every call is accepted, and whoever reaches the port can read action inputs
