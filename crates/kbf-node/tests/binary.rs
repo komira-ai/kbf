@@ -913,40 +913,49 @@ fn container_flags(dir: &Path, ids: &Path, images: &[String]) -> Vec<String> {
 /// cannot run on it, instead of exiting with status 2 and the fix: an image missing
 /// from its store started anyway (warned about and continued), its refusal without the
 /// `podman pull <repo>@sha256:<digest>` that fixes it, an image index digest taken for
-/// one architecture's manifest (`manifest_kind` not asked), and a tag accepted. Each
-/// daemon still running after 30 s has started, and fails the test. Linux only, as
-/// the driver is.
+/// one architecture's manifest (`manifest_kind` not asked), a tag accepted, and only
+/// the first `--image` checked (a good image first, an index second). Each daemon
+/// still running after 30 s has started, and fails the test. Linux only, as the
+/// driver is.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_container_node_refuses_to_start_on_an_image_it_cannot_run() {
     let ids = id_files("image-refused-ids", "65536");
     let digest = kbf_daemon::cas::digest_of(MANIFEST).hash;
     let tagged = format!("docker://registry.test/tools/busybox:1@sha256:{digest}");
-    // (name, the image, what the stub's store holds, what the refusal says)
-    let cases: [(&str, String, Option<&[u8]>, String); 3] = [
+    let index = "names an image index; name the per-architecture manifest digest";
+    /// (name, the images, what the stub's store holds, what the refusal says)
+    type Case = (&'static str, Vec<String>, &'static [&'static [u8]], String);
+    let cases: [Case; 4] = [
         (
             "image-missing",
-            image_of(MANIFEST),
-            None,
+            vec![image_of(MANIFEST)],
+            &[],
             format!("podman pull registry.test/tools/busybox@sha256:{digest}"),
         ),
         (
             "image-index",
-            image_of(INDEX),
-            Some(INDEX),
-            "names an image index; name the per-architecture manifest digest".to_owned(),
+            vec![image_of(INDEX)],
+            &[INDEX],
+            index.to_owned(),
         ),
         (
             "image-tag",
-            tagged,
-            Some(MANIFEST),
+            vec![tagged],
+            &[MANIFEST],
             "names a tag".to_owned(),
         ),
+        (
+            "image-second",
+            vec![image_of(MANIFEST), image_of(INDEX)],
+            &[MANIFEST, INDEX],
+            index.to_owned(),
+        ),
     ];
-    for (name, image, stored, says) in cases {
+    for (name, images, stored, says) in cases {
         let dir = tls(name);
         let (bin, _) = podman_stub(&format!("{name}-bin"));
-        if let Some(bytes) = stored {
+        for bytes in stored {
             store_manifest(&bin, bytes);
         }
         let path = format!(
@@ -958,7 +967,7 @@ fn a_container_node_refuses_to_start_on_an_image_it_cannot_run() {
         let mut child = Command::new(BIN)
             .env("PATH", path)
             .args(base(&dir))
-            .args(container_flags(&dir, &ids, &[image]))
+            .args(container_flags(&dir, &ids, &images))
             .stderr(std::fs::File::create(&log).expect("log file"))
             .spawn()
             .expect("spawn");
