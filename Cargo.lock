@@ -1301,6 +1301,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "kbf-mac-provision"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "hex",
+ "rustix",
+ "sha2 0.11.0",
+ "thiserror",
+]
+
+[[package]]
 name = "kbf-mac-session"
 version = "0.1.0"
 dependencies = [
