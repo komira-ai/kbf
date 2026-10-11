@@ -87,9 +87,23 @@ mutant 'the P0 owner is read from the first attach, not a re-attach' volume_owne
 mutant 'the P0 writes run as the runner (an admin), not the fresh standard user' volume_owner.sh t_vo_fail \
     's/^as_user() { sudo -n -H -u "$PROBE_USER" "$@"; }/as_user() { "$@"; }/'
 mutant 'the P0 verdict ignores an admin writer' volume_owner.sh t_vo_admin_writer \
-    's/elif \[ "$writer" = admin \] || \[ "$writer" = root \]; then/elif false; then/'
-mutant 'the P0 verdict ignores a probe user that existed before' volume_owner.sh t_vo_user_existed \
-    's/if \[ "$(st_get existed)" = yes \]; then/if false; then/'
+    's/if \[ "$writer" = admin \] || \[ "$writer" = root \]; then/if false; then/'
+mutant 'the P0 probe skips the check for a user that existed before' volume_owner.sh t_vo_user_existed \
+    's/^if id "$PROBE_USER" >\/dev\/null 2>&1; then$/if false; then/'
+mutant "the P0 cleanup ignores the creation marker (takes the name's current uid)" volume_owner.sh t_vo_user_existed \
+    's/^    created=$(st_get created_uid)$/    created=$(id -u "$PROBE_USER" 2>\/dev\/null || true)/'
+mutant 'the P0 cleanup deletes by name without comparing the recorded uid' volume_owner.sh t_vo_user_recreated \
+    's/^    elif \[ "$now" != "$created" \]; then$/    elif false; then/'
+mutant 'the P0 probe keeps a creation marker from an earlier run' volume_owner.sh t_vo_stale_marker \
+    '/^st_set created_uid ""$/d'
+mutant 'the P0 cleanup skips the force-detach of a mount left behind' volume_owner.sh t_vo_detach_busy \
+    's/^        \[ -n "$m" \] || continue$/        continue/'
+mutant 'the P0 cleanup detaches without -force' volume_owner.sh t_vo_detach_busy \
+    's/as_root hdiutil detach -force "$m"/as_root hdiutil detach "$m"/'
+mutant 'the P0 write records a failed detach as done' volume_owner.sh t_vo_detach_busy \
+    's/^    detach "$label" "$run" "$mnt" || return 0$/    detach "$label" "$run" "$mnt" || true/'
+mutant 'the P0 verdict compares the owner on its gid' volume_owner.sh t_vo_group_root \
+    's/elif \[ "${owner%%:\*}" = 0 \]; then/elif [ "${owner##*:}" = 0 ]; then/'
 mutant 'the P0 verdict ignores where the write stopped' volume_owner.sh t_vo_attach_fails \
     's/elif \[ "$reached" != detach \]; then/elif false; then/'
 mutant 'the P0 verdict ignores noowners on a re-attach (the false PASS)' volume_owner.sh 't_vo_noowners t_vo_control_noowners' \

@@ -8,9 +8,12 @@
 # Needs passwordless sudo (a hosted runner has it) to make the throwaway user, to run
 # the root control and to read the owner back. The arms, in order:
 #
-#   new_user   adds a fresh standard user ($SPIKE_P0_USER, default kbfp0) with
-#              `sysadminctl -addUser` (no -admin); records whether that name existed
-#              before (a user that existed is not fresh, so the probe is BROKEN);
+#   (before)   if $SPIKE_P0_USER (default kbfp0) exists already, the probe refuses to
+#              start: it may be a real account, and the probe deletes the user it
+#              makes. It runs no sysadminctl or hdiutil, removes its scratch
+#              directory and says BROKEN;
+#   new_user   adds a fresh standard user of that name with `sysadminctl -addUser`
+#              (no -admin) and records the uid it got (the creation marker);
 #   write      as that user (`sudo -n -H -u`): `hdiutil create` a scratch APFS image,
 #              attach it with `-owners on` (the mount flags are recorded), copy a plist
 #              in twice, `chown 0:0` the first copy (status and text recorded) and leave
@@ -30,8 +33,10 @@
 #              cannot show a root owner and the probe is BROKEN. Both re-attaches must
 #              be in the mount table without `noowners`, or the owners they show are
 #              not the stored ones and the probe is BROKEN;
-#   cleanup    force-detaches whatever is still attached, deletes the user and the
-#              scratch directory.
+#   cleanup    force-detaches whatever is still attached and deletes the scratch
+#              directory. It deletes the user only when this run's creation marker
+#              is there and the name still has the uid the marker holds; otherwise it
+#              records why it left the user.
 #
 # PASS: the re-attach reads the standard user's file as uid 0 and its keep file as the
 # user's uid. FAIL: it reads the file as a uid other than 0, or the user could not
@@ -147,14 +152,23 @@ reread() {
     detach "$label" as_root "$mnt" || true
 }
 
+# Runs only when the name did not exist before (checked before the arms).
 a_new_user() {
-    local pw
-    if id "$PROBE_USER" >/dev/null 2>&1; then st_set existed yes; else st_set existed no; fi
-    kv new_user.existed_before "$(st_get existed)"
+    local pw uid=
     # A throwaway password for a throwaway user that is deleted in cleanup.
     pw=$(od -An -N12 -tx1 /dev/urandom | tr -d ' \n')
-    step new_user add as_root sysadminctl -addUser "$PROBE_USER" -password "$pw" || true
-    if id "$PROBE_USER" >/dev/null 2>&1; then kv new_user.exists yes; else kv new_user.exists no; fi
+    if step new_user add as_root sysadminctl -addUser "$PROBE_USER" -password "$pw"; then
+        uid=$(id -u "$PROBE_USER" 2>/dev/null || true)
+    fi
+    if [ -n "$uid" ]; then
+        # The creation marker: cleanup deletes the user only if the name still has
+        # this uid.
+        st_set created_uid "$uid"
+        kv new_user.exists yes
+        kv new_user.uid "$uid"
+    else
+        kv new_user.exists no
+    fi
 }
 
 a_write() {
@@ -187,14 +201,22 @@ a_control() {
 }
 
 a_cleanup() {
-    local f m
+    local f m created now
     for f in "$SPIKE_STATE/$PROBE".mounted.*; do
         [ -e "$f" ] || continue
         m=$(cat "$f")
         [ -n "$m" ] || continue
         kv "cleanup.detach.${m##*/}" "$(run_cap watchdog "$WATCHDOG" as_root hdiutil detach -force "$m")"
     done
-    kv cleanup.delete_user "$(run_cap watchdog "$WATCHDOG" as_root sysadminctl -deleteUser "$PROBE_USER")"
+    created=$(st_get created_uid)
+    now=$(id -u "$PROBE_USER" 2>/dev/null || true)
+    if [ -z "$created" ]; then
+        kv cleanup.delete_user "skipped: this run did not create $PROBE_USER"
+    elif [ "$now" != "$created" ]; then
+        kv cleanup.delete_user "skipped: $PROBE_USER has uid ${now:-none}, not the uid $created this run created"
+    else
+        kv cleanup.delete_user "$(run_cap watchdog "$WATCHDOG" as_root sysadminctl -deleteUser "$PROBE_USER")"
+    fi
     if id "$PROBE_USER" >/dev/null 2>&1; then kv cleanup.user_gone no; else kv cleanup.user_gone yes; fi
     cd / && as_root rm -rf "$P0_DIR"
     if [ -e "$P0_DIR" ]; then kv cleanup.dir_gone no; else kv cleanup.dir_gone yes; fi
@@ -208,9 +230,7 @@ decide() {
     keep=$(st_get reattach.keep)
     control=$(st_get control_reattach)
     reached=$(st_get write.done)
-    if [ "$(st_get existed)" = yes ]; then
-        verdict BROKEN "user $PROBE_USER existed before the probe, so the writer is not a fresh user"
-    elif [ "$writer" = admin ] || [ "$writer" = root ]; then
+    if [ "$writer" = admin ] || [ "$writer" = root ]; then
         verdict BROKEN "the writes ran as $writer, not as a fresh standard user"
     elif [ "${control%%:*}" != 0 ]; then
         verdict BROKEN "the root control read back as '${control:-unread}', not uid 0, so the reader cannot show a root owner"
@@ -234,6 +254,16 @@ decide() {
 }
 
 spike_context
+# A creation marker left by an earlier run in the same results directory is not this
+# run's.
+st_set created_uid ""
+if id "$PROBE_USER" >/dev/null 2>&1; then
+    kv new_user.existed_before yes
+    arm cleanup a_cleanup
+    verdict BROKEN "user $PROBE_USER exists already, so the probe did not start: it may be a real account, and the probe deletes the user it makes"
+    exit 0
+fi
+kv new_user.existed_before no
 arm new_user a_new_user
 arm write a_write
 arm reattach a_reattach
