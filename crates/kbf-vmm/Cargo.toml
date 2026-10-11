@@ -1,0 +1,19 @@
+[package]
+name = "kbf-vmm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# The VM helper for macOS VM leases (docs/design/macos-vm-guests.md). Today a stub that
+# answers `--version` and nothing else: it exists so the signing scripts can sign and
+# check the one binary their entitlement allow list gives an entitlement
+# (tools/ci/darwin-entitlements.txt, section 7 of that document).
+[[bin]]
+name = "kbf-vmm"
+path = "src/main.rs"
+
+[lints]
+workspace = true

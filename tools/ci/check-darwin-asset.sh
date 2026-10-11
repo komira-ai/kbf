@@ -4,7 +4,10 @@
 #   1. `codesign --verify --strict` accepts its signature, so no byte changed after
 #      signing (the page hashes in the signature cover every page of code);
 #   2. its code directory's flags are exactly `adhoc,runtime`;
-#   3. it runs: `<binary> --version` exits 0 in an environment with no DYLD_* variable.
+#   3. it runs: `<binary> --version` exits 0 in an environment with no DYLD_* variable;
+#   4. its signature carries exactly the entitlements the allow list gives <binary name>
+#      (tools/ci/darwin-entitlements.txt, `darwin-entitlements.sh check`): none for a
+#      binary the list does not name.
 #
 # 1 is the check that catches a modified binary on GitHub's hosted macOS runners: there
 # process code-signing enforcement is off (`vm.cs_process_enforcement: 0`), and a binary
@@ -34,6 +37,9 @@ if ! env -i PATH="$PATH" HOME="$HOME" "$bin" --version; then
   echo "the packaged binary did not run: '$name --version' failed" >&2
   exit 1
 fi
+
+# 4
+bash "$(cd "$(dirname "$0")" && pwd)/darwin-entitlements.sh" check "$bin" "$name"
 
 cdhash=$(sed -n 's/^CDHash=//p' <<<"$info")
 echo "checked $(basename "$tarball"): signature valid, flags $flags, cdhash $cdhash"
