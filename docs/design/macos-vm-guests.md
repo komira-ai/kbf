@@ -160,6 +160,13 @@ its inputs, and how it names that share inside the guest is open: `kbf-guest`'s 
 carries no path for it. Moving the execution root onto the read-write share, the lean
 above, would close that and is not done.
 
+The per-boot token stays in the inputs share for the whole lease, so the action can
+read it. That gives the action nothing while the agent serves one `Run` per boot: from
+the first `Run` on, the agent refuses another (`AlreadyRan`, or "a command is running"
+while it runs), so a process holding the token can neither start a second command nor
+take over the host's connection. If the agent ever serves more than one `Run` per boot,
+the driver must remove the token file before `Run`.
+
 A shared directory is read-only to the guest when the host makes it so
 (`VZSharedDirectory`'s `readOnly`,
 [VZSharedDirectory](https://developer.apple.com/documentation/virtualization/vzshareddirectory))

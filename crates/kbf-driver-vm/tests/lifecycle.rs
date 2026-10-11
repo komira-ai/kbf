@@ -169,6 +169,63 @@ async fn a_boot_timeout_is_an_infrastructure_failure_and_destroys_the_clone() {
     assert!(leftovers(&config).is_empty(), "{:?}", leftovers(&config));
 }
 
+/// Catches a handshake read left unbounded: a guest whose VM is reachable but which
+/// never sends `Hello` (an agent hung before `Ready`) would hold the lease, its VM and
+/// one of the host's two VM slots for ever. It must end at the boot timeout as the
+/// farm's failure, its VM stopped and its clone removed.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_guest_silent_before_ready_hits_the_boot_timeout() {
+    let dir = scratch("mute-boot");
+    let mut config = config(&dir);
+    config.boot_timeout = Duration::from_millis(300);
+    let host = Arc::new(FakeHost::new().mute_before_ready());
+    let cas = Arc::new(MemoryCas::default());
+    let driver = driver(config.clone(), &host, &cas);
+    let action = Spec::sh("true").store(&cas);
+
+    let ended = tokio::time::timeout(Duration::from_secs(5), driver.run(work(1, action)))
+        .await
+        .expect("ended near the boot timeout");
+
+    assert!(matches!(ended, Err(RuntimeError::Failed(_))), "{ended:?}");
+    assert_eq!(host.stopped(), [name(1)]);
+    assert!(host.running().is_empty(), "{:?}", host.running());
+    assert!(leftovers(&config).is_empty(), "{:?}", leftovers(&config));
+}
+
+/// Catches a boot that takes every host error for "not ready yet" and retries it: a VM
+/// that dies while it boots would hold its lease until the boot timeout (two minutes
+/// by default) and be reported as a slow boot. The lease must end at once, as the
+/// farm's failure naming the host's error, with nothing left behind.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_vm_that_dies_while_booting_ends_the_lease_at_once() {
+    let dir = scratch("dies-booting");
+    let mut config = config(&dir);
+    config.boot_timeout = Duration::from_secs(30);
+    let host = Arc::new(FakeHost::new().ready_after(Duration::from_secs(60)));
+    let cas = Arc::new(MemoryCas::default());
+    let driver = driver(config.clone(), &host, &cas);
+    let action = Spec::sh("true").store(&cas);
+    let run = {
+        let driver = Arc::clone(&driver);
+        tokio::spawn(async move { driver.run(work(1, action)).await })
+    };
+    until("the VM started", || !host.running().is_empty()).await;
+
+    host.crash(&name(1));
+
+    let ended = tokio::time::timeout(Duration::from_secs(5), run)
+        .await
+        .expect("ended long before the boot timeout")
+        .expect("joined");
+    assert!(
+        matches!(ended, Err(RuntimeError::Failed(ref why)) if why.contains("not running")),
+        "{ended:?}"
+    );
+    assert!(host.running().is_empty(), "{:?}", host.running());
+    assert!(leftovers(&config).is_empty(), "{:?}", leftovers(&config));
+}
+
 /// Catches the boot charged to the action's timeout: the guest takes 1.2 s to answer
 /// and the action, which runs for 0.8 s of its 1.5 s, would be cut off after 0.3 s.
 /// The second lease is the control: an action that runs past its own timeout is

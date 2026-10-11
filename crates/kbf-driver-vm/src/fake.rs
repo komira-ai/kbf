@@ -4,8 +4,9 @@
 //! the one a real guest sees. A clone is a plain copy of the image directory.
 //!
 //! It keeps the macOS limit of two running VMs, can delay or withhold its guests'
-//! readiness, crash a running VM, silence a guest once its command has started, and
-//! fail stops; it records every spec it started and every stop it was asked for.
+//! readiness, crash a running VM, silence a guest before its `Ready` or once its
+//! command has started, and fail stops; it records every spec it started and every
+//! stop it was asked for.
 
 use std::collections::BTreeMap;
 use std::io;
@@ -32,11 +33,22 @@ pub struct FakeHost {
     /// How long after `start` a guest can be reached; `None` for never.
     ready_after: Option<Duration>,
     session: String,
-    /// Whether guests send nothing after `Started`.
-    mute: bool,
+    /// Where guests fall silent, if anywhere.
+    silence: Silence,
     /// How many stops succeed before every later one reports an error.
     stops_ok: usize,
     state: Mutex<State>,
+}
+
+/// Where a [`FakeHost`]'s guests stop sending.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Silence {
+    /// They send everything.
+    Never,
+    /// A connection is accepted and nothing is ever sent on it, not even `Hello`.
+    BeforeReady,
+    /// Nothing after `Started`.
+    AfterStart,
 }
 
 #[derive(Debug, Default)]
@@ -86,7 +98,7 @@ impl FakeHost {
             limit: MACOS_VM_LIMIT,
             ready_after: Some(Duration::ZERO),
             session: GUI_SESSION.to_owned(),
-            mute: false,
+            silence: Silence::Never,
             stops_ok: usize::MAX,
             state: Mutex::new(State::default()),
         }
@@ -117,7 +129,16 @@ impl FakeHost {
     /// mid-run: the command runs, its report never arrives.
     #[must_use]
     pub fn mute_after_start(mut self) -> Self {
-        self.mute = true;
+        self.silence = Silence::AfterStart;
+        self
+    }
+
+    /// Guests accept a connection and send nothing on it, not even `Hello`, as a guest
+    /// agent that hangs before its handshake: the VM is reachable, its `Ready` never
+    /// arrives.
+    #[must_use]
+    pub fn mute_before_ready(mut self) -> Self {
+        self.silence = Silence::BeforeReady;
         self
     }
 
@@ -154,7 +175,8 @@ impl FakeHost {
     }
 
     /// Crashes the running VM `name`: every stream to its guest ends and its command is
-    /// killed, as when the guest dies; the VM keeps its slot until it is stopped.
+    /// killed, as when the guest dies; the VM keeps its slot until it is stopped, and
+    /// a connect to it fails, booted or not.
     ///
     /// # Panics
     /// `name` is not running.
@@ -238,20 +260,27 @@ impl VmHost for FakeHost {
         let mut state = self.lock();
         let not_running = || io::Error::new(io::ErrorKind::NotConnected, "the VM is not running");
         let booted = state.running.get_mut(name).ok_or_else(not_running)?;
+        // A crashed VM is gone, not still booting.
+        let conns = booted.conns.clone().ok_or_else(not_running)?;
         match self.ready_after {
             Some(after) if booted.started.elapsed() >= after => {}
             _ => return Err(HostError::NotReady),
         }
-        let conns = booted.conns.as_ref().ok_or_else(not_running)?;
         let (host, guest) = UnixStream::pair()?;
         booted.open.push(host.try_clone()?);
-        let guest = if self.mute {
-            let (relay, agent_end) = UnixStream::pair()?;
-            booted.open.push(agent_end.try_clone()?);
-            mute_after_started(guest, relay)?;
-            agent_end
-        } else {
-            guest
+        let guest = match self.silence {
+            Silence::Never => guest,
+            Silence::BeforeReady => {
+                // Held open, never served: the stream ends when the VM stops.
+                booted.open.push(guest);
+                return Ok(host);
+            }
+            Silence::AfterStart => {
+                let (relay, agent_end) = UnixStream::pair()?;
+                booted.open.push(agent_end.try_clone()?);
+                mute_after_started(guest, relay)?;
+                agent_end
+            }
         };
         conns.send(guest).ok().ok_or_else(not_running)?;
         Ok(host)

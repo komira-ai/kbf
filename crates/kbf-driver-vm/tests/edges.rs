@@ -1,5 +1,5 @@
 //! The VM driver's less common paths against the fake host: malformed actions, a
-//! silent guest, a host that cannot confirm a stop, a run the daemon drops, and kills
+//! silent guest and a slow one, a host that cannot confirm a stop, a run the daemon drops, and kills
 //! before the VM exists.
 
 mod support;
@@ -139,6 +139,33 @@ async fn a_silent_guest_ends_the_lease_after_the_grace() {
         "{ended:?}"
     );
     assert!(host.running().is_empty(), "{:?}", host.running());
+    assert!(leftovers(&config).is_empty(), "{:?}", leftovers(&config));
+}
+
+/// Catches the report watchdog armed for the grace alone (or any span shorter than the
+/// action's timeout plus the grace): a command that runs 1 s of its 5 s timeout must
+/// finish under a 300 ms grace. With the defect, every action longer than the grace (30
+/// s by default) would be ended as the farm's failure and run again elsewhere.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_run_longer_than_the_grace_finishes_within_its_timeout() {
+    let dir = scratch("past-grace");
+    let mut config = config(&dir);
+    config.report_grace = Duration::from_millis(300);
+    let host = Arc::new(FakeHost::new());
+    let cas = Arc::new(MemoryCas::default());
+    let driver = driver(config.clone(), &host, &cas);
+    let action = Spec::sh("sleep 1; echo done")
+        .timeout(Duration::from_secs(5))
+        .store(&cas);
+
+    let result = driver.run(work(1, action)).await;
+
+    let result = result.expect("ran within its timeout");
+    assert_eq!(result.exit_code, 0);
+    assert_eq!(
+        cas.blob(result.stdout_digest.as_ref().expect("stdout")),
+        b"done\n"
+    );
     assert!(leftovers(&config).is_empty(), "{:?}", leftovers(&config));
 }
 

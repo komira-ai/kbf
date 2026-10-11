@@ -471,10 +471,11 @@ Rules:
 
 `crates/kbf-driver-vm` holds the driver (`VmDriver`, driver and lease kind `vm`) behind
 a `VmHost` trait (clone an image, start a VM from a `VmSpec`, connect to its guest
-agent, stop it), and `FakeHost`, which runs the real `kbf-guest` agent in the daemon's
-process over a Unix socket pair, copies the image directory as its "clone", keeps the
-limit of two running VMs, and can delay, withhold, crash or silence a guest and fail a
-stop. The daemon does not
+agent, stop it), and `FakeHost`, which runs the real `kbf-guest` agent in the calling
+process (the test binary, in the crate's tests) over a Unix socket pair, copies the image
+directory as its "clone", keeps the limit of two running VMs, and can delay or withhold a
+guest's readiness, crash a VM, silence a guest before its `Ready` or once its command
+has started, and fail a stop. The daemon does not
 offer the driver yet (no `--driver vm`), and no host on Virtualization.framework exists.
 Per lease, as built:
 
