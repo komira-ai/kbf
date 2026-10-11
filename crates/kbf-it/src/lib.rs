@@ -1,7 +1,9 @@
 //! Integration tests that run in hosted CI, including the workspace layering test
 //! in `tests/layering.rs`, and the repository lints applied by `tests/repo_lints.rs`:
 //! the workflow lint in `tests/workflows/` (a test-only module, so its YAML parser
-//! stays a dev-dependency) and [`hygiene`] for public text.
+//! stays a dev-dependency) and [`hygiene`] for public text, and the check of the
+//! example systemd units in `docs/deploy/` against the binaries' flag parsers
+//! ([`deploy_units`], `tests/deploy_units.rs`).
 //!
 //! It also holds the M1 integration harness. `m1/run.sh` starts a cell (MinIO, one
 //! `kbf-server` with in-memory metadata and the S3 store, one daemon) and builds the
@@ -23,6 +25,7 @@
 
 #[cfg(target_os = "linux")]
 pub mod daemon;
+pub mod deploy_units;
 pub mod hygiene;
 pub mod pki;
 pub mod summary;

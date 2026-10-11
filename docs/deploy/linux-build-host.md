@@ -76,7 +76,8 @@ Set `--actions-memory-max-gib` to the host's RAM minus 4 to 8 GiB: on a 256 GiB 
 lower of this cap and its memory as `mem_gib`, so the scheduler books no more than
 leases may use. On a host that also runs a `kbf-server` and a node of the object
 store (the [converged topology](../design/deployment-topology.md#converged-topology)),
-also subtract what those two use at their peak.
+also subtract what those two use at their peak
+([storage-node.md](storage-node.md#memory-on-a-converged-host)).
 
 ### CPUs: uncapped
 
