@@ -169,24 +169,27 @@ fn the_command_gets_exactly_its_environment() {
 }
 
 /// Catches an output report that follows a symlink (at the end or on the way), gives
-/// a file the wrong size, or loses request order.
+/// a file the wrong size, loses request order, or is taken before the command ran:
+/// the command itself writes `f` after a pause, so a report made at `Started` sees
+/// `f` missing.
 #[test]
 fn requested_outputs_are_reported_without_following_symlinks() {
     let shares = Shares::new("outputs");
     let served = Served::start(shares.config());
     let mut client = served.connect();
     let out = &shares.outputs;
-    std::fs::write(out.join("f"), b"hello").expect("f");
     std::fs::create_dir(out.join("d")).expect("d");
     std::fs::write(out.join("d/x"), b"x").expect("d/x");
     std::os::unix::fs::symlink("/", out.join("l")).expect("l");
     std::os::unix::fs::symlink("d", out.join("via")).expect("via");
-    let made = std::process::Command::new("mkfifo")
-        .arg(out.join("p"))
-        .status()
-        .expect("mkfifo ran");
-    assert!(made.success(), "mkfifo: {made}");
-    let mut req = act("exit 0", &[]);
+    mkfifo(&out.join("p"));
+    // `append` adds a newline: `f` is "hell\n", 5 bytes, written during the run.
+    let f = out.join("f");
+    let steps = format!(
+        "sleep 0.2 ; append {} hell",
+        f.to_str().expect("utf-8 path")
+    );
+    let mut req = act(&steps, &[]);
     req.outputs = [
         "f",
         "d",
@@ -235,4 +238,13 @@ fn usage_is_measured() {
     // At least a page, and not a KiB count read as bytes on Linux (any running
     // program is more than 64 KiB resident).
     assert!(exit.usage.peak_rss_bytes > 64 * 1024, "{:?}", exit.usage);
+}
+
+/// Makes a named pipe at `path`.
+fn mkfifo(path: &std::path::Path) {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes()).expect("no NUL in path");
+    // SAFETY: `c` is a NUL-terminated path that outlives the call.
+    let rc = unsafe { libc::mkfifo(c.as_ptr(), 0o644) };
+    assert_eq!(rc, 0, "mkfifo: {}", std::io::Error::last_os_error());
 }
