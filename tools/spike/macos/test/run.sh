@@ -19,7 +19,7 @@ export FAKE_REAL_PATH
 TESTS=0
 FAILED=0
 NAME=
-FAKES="uname sw_vers xcodebuild launchctl stat csrutil pgrep id sudo automationmodetool sysadminctl sandbox-exec xcrun sqlite3 hdiutil cp chown"
+FAKES="uname sw_vers xcodebuild launchctl stat csrutil pgrep id sudo automationmodetool sysadminctl sandbox-exec xcrun sqlite3 hdiutil cp chown mount"
 
 # ---------------------------------------------------------------- harness
 
@@ -337,6 +337,9 @@ t_vo_fail() {
     calls 'sudo -n -H -u kbfp0 hdiutil create' 1
     calls 'sudo -n -H -u kbfp0 hdiutil attach -nobrowse -owners on -mountpoint' 1
     calls 'sudo -n -H -u kbfp0 chown 0:0' 1
+    want 'volume_owner.write.mount=/dev/disk4s1 on '
+    want 'm-user-1 (apfs, local, nodev, nosuid, journaled, mounted by kbfp0)'
+    want 'm-user-2 (apfs, local, nodev, nosuid, journaled, mounted by root)'
     calls 'sudo -n hdiutil attach -nobrowse -owners on -readonly -mountpoint' 2
     vo_cleaned
     verdict_is FAIL

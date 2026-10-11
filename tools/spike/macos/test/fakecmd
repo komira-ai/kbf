@@ -86,6 +86,8 @@ case "$NAME" in
                 fi
                 [ -d "$img.store" ] || exit 1
                 rmdir "$mnt" && ln -s "$img.store" "$mnt"
+                if [ "${FAKE_UID:-501}" = 0 ]; then by=root; else by=${FAKE_AS:-runner}; fi
+                echo "/dev/disk4s1 on $mnt (apfs, local, nodev, nosuid, journaled, mounted by $by)" >>"$S/mounts"
                 printf '/dev/disk4s1\t41504653-0000-11AA-AA11-00306543ECAC\t%s\n' "$mnt"
                 ;;
             detach)
@@ -93,6 +95,8 @@ case "$NAME" in
                 [ -L "$1" ] || exit 1
                 store=$(readlink "$1")
                 rm -f "$store"/*.view "$1"
+                grep -vF " on $1 " "$S/mounts" >"$S/mounts.new" || true
+                mv "$S/mounts.new" "$S/mounts"
                 echo '"disk4" ejected.'
                 ;;
         esac
@@ -165,6 +169,7 @@ case "$NAME" in
                 ;;
         esac
         ;;
+    mount) cat "$S/mounts" 2>/dev/null ;;
     sandbox-exec)
         # sandbox-exec -p PROFILE CMD...: a profile naming CoreSimulatorService blocks
         # the fake simctl, unless the test says the deny is ignored.

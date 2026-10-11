@@ -12,7 +12,7 @@
 #              `sysadminctl -addUser` (no -admin); records whether that name existed
 #              before (a user that existed is not fresh, so the probe is BROKEN);
 #   write      as that user (`sudo -n -H -u`): `hdiutil create` a scratch APFS image,
-#              attach it with `-owners on`, copy a plist in, `chown 0:0` it (status and
+#              attach it with `-owners on` (the mount flags are recorded), copy a plist in, `chown 0:0` it (status and
 #              text recorded), read the owner this first attach shows, detach. The
 #              writer's own uid and groups are read through the same `sudo -u` the
 #              writes use, so a write that ran as the runner (an admin) is caught;
@@ -68,6 +68,8 @@ attach() {
     "$run" mkdir -p "$mnt"
     step "$label" attach "$run" hdiutil attach -nobrowse -owners on "$@" -mountpoint "$mnt" "$img" || return 1
     st_set "mounted.${mnt##*/}" "$mnt"
+    # The flags the kernel mounted it with: whether `-owners on` took (no `noowners`).
+    kv "$label.mount" "$(mount | grep -F " on $mnt " || echo "not in the mount table")"
 }
 
 # detach LABEL RUN MNT
@@ -133,7 +135,7 @@ a_write() {
     elif [ "$uid" = 0 ]; then
         kind=root
     else
-        case " $groups " in *" admin "*) kind=admin ;; *) kind=standard ;; esac
+        case " $groups " in *" admin "*) kind='admin' ;; *) kind=standard ;; esac
     fi
     kv write.writer "uid=${uid:-none} kind=$kind groups=$groups"
     st_set writer "$kind"
