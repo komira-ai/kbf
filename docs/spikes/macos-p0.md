@@ -255,10 +255,41 @@ So, under the driver's profile as it stands: UI tests of an iOS app on a simulat
 run and pass once built, a build of either fixture with `xcodebuild` fails on Swift
 Build's temporary directory, and UI tests of a macOS app fail on `(deny lsopen)`.
 Which operations and names a change of the profile would open is a separate
-decision; this spike changes no profile. Apart from the device services, the profile
+decision; this spike changes no profile (the next subsection has the one change made
+since). Apart from the device services, the profile
 allows every mach-lookup, so the run says nothing about which mach or XPC names a UI
 test looks up. `deny.other` counted 1 to 48 reports from other processes in each
 driver arm's window; they are not the run's.
+
+### After the Swift Build rule (PR #425)
+
+PR #425 lets an action make `T/swbuild.tmp.<random>` and write below it
+(`kbf_driver_native::user_folders`) and keeps `(deny lsopen)`. Run `38148039779`
+(job `xcuitest-sandbox`, `macos-15`, macOS 15.7.9, Xcode 16.4, the same image as
+above), with that profile:
+
+| Arm | xcodebuild exit under the profile | Report (outside) |
+|---|---|---|
+| `driver.ios` | 0: built and tested under the profile | PASS, 3 of 3, the three screenshots kept |
+| `driver_tests.ios` | 0 | PASS, 3 of 3 |
+| `driver.macos` | 65: the build passes, then "Could not launch MacFixtureUITests" | FAIL, no tests ran |
+| `driver_tests.macos` | 65: "Could not launch MacFixtureUITests" | FAIL, no tests ran |
+| `control.macos`, `control.ios` | 0, no sandbox | PASS, 3 of 3 |
+
+No arm showed a `swbuild.tmp` deny. Both macOS arms showed the `lsopen` deny of the
+first run; the other denies were those of the table above.
+
+A mutant of that profile without `(deny lsopen)` (draft PR #427, run `38148073028`,
+not merged) measured what macOS UI tests meet next: no `lsopen` deny, and xcodebuild
+launched the runner, which "exited with code 1 before checking in" ("Early
+unexpected exit, operation never finished bootstrapping"), so both macOS arms still
+failed with no test run; the iOS arms passed as above. The runner, started by
+Launch Services, is not in the run's process tree, so its own denies, if it had any,
+are among the reports this probe only counts (`deny.other`: 21 and 3 in the two
+macOS arms). The same mutant turned `tests/launchd.rs`
+(`no_action_can_open_an_application`) red on the `native-macos` job: an action
+opened Calculator. So `(deny lsopen)` stays, and macOS UI tests do not run under
+the native driver's profile.
 
 ## Not covered here (planned)
 
