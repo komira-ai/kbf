@@ -570,6 +570,7 @@ fn requests_are_routed_and_stray_descriptors_refused() {
         lease: lease(),
         argv: vec!["/usr/bin/true".to_owned()],
         env: Vec::new(),
+        session: crate::proto::Session::Background,
     };
     let Outcome::Running(mut child) = rig.helper.handle(run.clone(), fds(&rig.dir)) else {
         panic!("run did not start");
@@ -729,4 +730,71 @@ fn kill_uid_removes_the_schedules_between_two_kills() {
             .count();
         assert_eq!(kills, 2, "killed before and after the failed sweep");
     }
+}
+
+/// Catches a GUI run (or a readiness answer) for a lease whose user is not the one
+/// `session-login` logged in, a GUI run started before launchd has the user's
+/// `gui/<uid>` domain (the mutant "run before gui/<uid> exists": the action would start
+/// outside the session, with no window server), and a readiness answer that does not
+/// follow the domain.
+#[test]
+fn a_gui_run_waits_for_the_lease_user_s_gui_domain() {
+    let rig = rig("gui", 3);
+    let uid = rig.helper.user_create("9.1", None).unwrap();
+    rig.helper.user_create("9.2", None).unwrap();
+    let true_ = || vec!["/usr/bin/true".to_owned()];
+    let gui = |lease: &str| {
+        rig.helper
+            .run_in(lease, true_(), Vec::new(), fds(&rig.dir), Session::Gui)
+            .unwrap_err()
+    };
+    let not_held = "does not hold the GUI session; session-login first";
+    assert!(
+        rig.helper
+            .session_ready("9.1")
+            .unwrap_err()
+            .contains(not_held)
+    );
+    assert!(gui("9.1").contains(not_held));
+
+    rig.helper.session_login("9.1").unwrap();
+    log(&rig);
+    assert_eq!(rig.helper.session_ready("9.1"), Ok(false));
+    assert_eq!(log(&rig), [format!("domain_exists gui/{uid}")]);
+    let error = gui("9.1");
+    assert!(
+        error.starts_with(&format!("gui/{uid} does not exist")),
+        "{error}"
+    );
+    assert!(
+        rig.helper
+            .session_ready("9.2")
+            .unwrap_err()
+            .contains(not_held)
+    );
+
+    rig.host.state().domains.insert(format!("gui/{uid}"));
+    let reply = rig.helper.handle(
+        Request::SessionReady {
+            lease: "9.1".to_owned(),
+        },
+        Vec::new(),
+    );
+    assert!(
+        matches!(reply, Outcome::Reply(Reply::SessionReady { ready: true })),
+        "{reply:?}"
+    );
+    // Off macOS the session is up but there is nothing to start in it.
+    #[cfg(not(target_os = "macos"))]
+    assert!(gui("9.1").contains("a GUI session exists only on macOS"));
+
+    rig.host.state().fail.insert("domain_exists");
+    let error = rig.helper.session_ready("9.1").unwrap_err();
+    assert!(error.contains("asking launchd for gui/"), "{error}");
+    assert!(
+        rig.helper
+            .session_ready("9.x")
+            .unwrap_err()
+            .contains("not <term>.<seq>")
+    );
 }

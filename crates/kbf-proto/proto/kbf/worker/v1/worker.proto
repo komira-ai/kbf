@@ -23,6 +23,9 @@
 // - Result.memory_kill: which memory ran out when a lease was killed for memory
 //   (docs/design/failure-classes.md, 6.1). The native and container drivers set it; a
 //   Result without it is read as before.
+// - Hello.phase: what the node is doing besides running leases: switching a Mac's GUI
+//   session for a whole-machine lease, or quarantined (docs/design/worker-protocol.md,
+//   "Node phases"). A Hello without it is a serving node, as before.
 syntax = "proto3";
 
 package kbf.worker.v1;
@@ -100,6 +103,35 @@ message Hello {
   // process has fenced (docs/design/worker-protocol.md, issue #140). Empty (a daemon
   // that predates this field): every registration is taken as another process's.
   string instance_id = 6;
+  // What the node is doing besides running leases. The daemon resends Hello when it
+  // changes. Unset is serving.
+  NodePhase phase = 7;
+}
+
+// The phases of a node (docs/design/fleet-updates.md, 3.3).
+enum Phase {
+  // It takes leases.
+  PHASE_SERVING = 0;
+  // It switches the Mac's GUI session to the user of the whole-machine lease
+  // `lease_id`, which it holds and has not started: a userspace restart, which ends
+  // the daemon too. The server keeps the lease while the node is silent, for longer
+  // than the lease grace, and sends its Start again on the stream of the Hello that
+  // names it after the restart.
+  PHASE_PREPARING = 1;
+  // It switches the session back after the whole-machine lease `lease_id` ended and
+  // cleans up; the lease's Result is sent when that is done. Kept the same way.
+  PHASE_RESTORING = 2;
+  // A cleanup failed (`reason` says which): the node takes no lease until an
+  // operator repairs it. The server lists it for attention.
+  PHASE_QUARANTINED = 3;
+}
+
+message NodePhase {
+  Phase phase = 1;
+  // The whole-machine lease of PHASE_PREPARING and PHASE_RESTORING.
+  LeaseId lease_id = 2;
+  // Why the node is quarantined.
+  string reason = 3;
 }
 
 // What software the node runs: status for operators and the fleet API, never matched

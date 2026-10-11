@@ -37,7 +37,6 @@ use std::hash::BuildHasher;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use kbf_caps::NodeCaps;
 use kbf_front::{Cache, Dispatch, Finished, MetaLog, Stage, Submission, Ticket};
 use kbf_meta::{ActionRecord, Role};
 use kbf_objstore::ObjectStore;
@@ -50,12 +49,18 @@ use kbf_sched::fence::START_VALIDITY;
 use kbf_sched::{Cordon, DaemonInstance, Event, Input, OpState, Requeue, Scheduler};
 use kbf_types::{
     Answer, ControlRecord, Digest, Effect, Failure, FarmTime, LeaseGrant, LeaseId, OperationId,
-    Outcome, Refusal, Resources, StartLease, StateMachine, WaiterId, Waiting, WorkerId,
+    Outcome, Refusal, StartLease, StateMachine, WaiterId, Waiting, WorkerId,
 };
 use tokio::sync::{mpsc, watch};
 use tonic::{Code, Status};
 
-use crate::fleet::{NodeView, NodesView, PlacementView, SoftwareView, attention_changes};
+mod phase;
+
+pub use phase::Reported;
+
+use crate::fleet::{
+    NodeView, NodesView, PhaseView, PlacementView, SoftwareView, attention_changes, needs_attention,
+};
 use crate::machine::{FarmMachine, Sent, Waiter};
 use crate::memory;
 use crate::missing;
@@ -243,16 +248,17 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
 
     /// The first `Hello` of a stream, from the daemon process `instance`: queues
     /// `welcome` on `outbound`, makes this the worker's stream for every `Start` from now
-    /// on, and registers the worker (a new session) with its `capacity` and `caps`.
-    /// Messages still arriving on its earlier stream are ignored from now on. A stream
-    /// of another process than the earlier stream's is logged: leases that process ran
-    /// are kept until it has fenced (issue #140).
+    /// on, and registers the worker (a new session) with what it `reported`. Its phase
+    /// is taken before any placement, and may send a `Start` again or a `Cancel` on this
+    /// stream ([`Self::resize`] says when). Messages still arriving on its earlier
+    /// stream are ignored from now on. A stream of another process than the earlier
+    /// stream's is logged: leases that process ran are kept until it has fenced (issue
+    /// #140).
     pub fn register(
         &self,
         worker: &WorkerId,
         instance: DaemonInstance,
-        capacity: Resources,
-        caps: NodeCaps,
+        reported: Reported,
         outbound: Outbound,
         welcome: ServerMessage,
     ) -> StreamId {
@@ -278,25 +284,38 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
         let event = Event::WorkerUp {
             worker: worker.clone(),
             instance,
-            capacity,
-            caps,
+            capacity: reported.capacity,
+            caps: reported.caps,
         };
-        state.feed_quiet(now, event);
+        // No placement between the registration and the phase: a quarantined node
+        // must not be offered a lease in between.
+        let none = state.sched.apply(Input::new(now, event));
+        debug_assert!(none.is_empty(), "a registration has no effect: {none:?}");
+        state.phase(now, worker, reported.phase);
         stream
     }
 
-    /// A `Hello` resent on `stream`: the node report changed. Changes the worker's
-    /// capacity and capabilities and nothing else; ignored if `stream` was replaced.
-    pub fn resize(&self, worker: &WorkerId, stream: StreamId, capacity: Resources, caps: NodeCaps) {
+    /// A `Hello` resent on `stream`: the node report or the node's phase changed.
+    /// Changes the worker's capacity, capabilities and phase, and opens no session;
+    /// ignored if `stream` was replaced.
+    ///
+    /// A `Preparing` or `Restoring` phase naming a lease the scheduler holds on the
+    /// worker, whose `Start` went to an earlier session, sends that `Start` again (the
+    /// daemon restarted for the session switch); one naming a lease of this process it
+    /// does not hold there is sent a `Cancel`, so the daemon cleans up after it. A
+    /// change into or out of quarantine is logged as an attention item.
+    pub fn resize(&self, worker: &WorkerId, stream: StreamId, reported: Reported) {
         let now = self.now();
         let mut state = self.lock();
         if state.is_current(worker, stream) {
             let event = Event::Capacity {
                 worker: worker.clone(),
-                capacity,
-                caps,
+                capacity: reported.capacity,
+                caps: reported.caps,
             };
-            state.feed_quiet(now, event);
+            let none = state.sched.apply(Input::new(now, event));
+            debug_assert!(none.is_empty(), "a capacity change has no effect: {none:?}");
+            state.phase(now, worker, reported.phase);
         }
     }
 
@@ -444,15 +463,14 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
         };
         let node = state.machine.node(worker);
         let software = node.and_then(|n| n.status.clone());
+        let phase = state.sched.phase(worker).cloned().unwrap_or_default();
         NodeView {
             node_id: worker.as_str().to_owned(),
             connected: node.is_some_and(|n| n.connected),
-            needs_attention: software
-                .as_ref()
-                .map(SoftwareView::needs_attention)
-                .unwrap_or_default(),
+            needs_attention: needs_attention(software.as_ref(), &phase),
             software,
             placement,
+            phase: PhaseView::new(&phase),
         }
     }
 

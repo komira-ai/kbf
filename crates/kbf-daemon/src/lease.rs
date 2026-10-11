@@ -119,6 +119,18 @@ impl Leases {
         true
     }
 
+    /// Has every runtime kill lease `id`, which is not running here, and returns at
+    /// once: for a runtime that keeps a lease across its own restart (the whole-machine
+    /// runtime), the server no longer holding it means it is to be cleaned up. Every
+    /// other runtime does nothing ([`crate::Runtime::kill`] of a lease it does not run).
+    pub(crate) fn forget(&self, id: LeaseId) {
+        tracing::debug!(lease = %id, "a lease not running here is forgotten by every runtime");
+        for runtime in self.runtimes.all() {
+            let runtime = Arc::clone(runtime);
+            tokio::spawn(async move { runtime.kill(id).await });
+        }
+    }
+
     /// Turns a finished run into its Result. `None` if the lease was already reported
     /// (it was fenced).
     pub(crate) fn finished(

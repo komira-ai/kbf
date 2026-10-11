@@ -1,4 +1,5 @@
-//! macOS: the host the verbs run on, the caller check by code signature, and `main`.
+//! macOS: the host the verbs run on, the caller check by code signature, a process
+//! started in a lease user's GUI session ([`gui`]), and `main`.
 //!
 //! Nothing here is reached by the Linux test jobs; the `native-macos` CI job runs the
 //! helper for real as root (`tools/ci/mac-session-tests.sh`).
@@ -15,6 +16,7 @@
 //! pinned by cdhash names exactly the installed daemon binary.
 
 mod caller;
+pub mod gui;
 mod host;
 
 use std::io;

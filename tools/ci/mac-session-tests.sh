@@ -362,5 +362,88 @@ out=$("$client" scan "$socket")
 expect_refused "did not come back dirty" "$client" reboot-dirty "$socket"
 expect_refused "window is closed" "$client" baseline "$socket"
 
+step "run in the GUI session: refused until the lease user's gui domain exists"
+"$client" create "$socket" 3.1 >/dev/null
+expect_refused "does not hold the GUI session" "$client" session-ready "$socket" 3.1
+# What session-login leaves for the lease (it is not run here: it restarts userspace).
+sudo -n sh -c "echo 3.1 > '$intent'"
+[ "$("$client" session-ready "$socket" 3.1)" = false ] || fail "a user never logged in has a GUI session"
+expect_refused "does not exist" "$client" run-gui "$socket" 3.1 "$lease_dir" /usr/bin/true
+sudo -n rm -f "$intent"
+"$client" kill "$socket" 3.1
+[ "$("$client" delete "$socket" 3.1)" = existed ] || fail "delete of lease 3.1"
+
+step "a process started in a GUI session runs in it: the runner's own (no session switch)"
+# No lease user has a GUI session here (that takes a session switch, which restarts
+# userspace), so spawn::spawn runs for the runner's own uid, from a root LaunchDaemon in
+# the system domain, as the helper runs on a node: the control, a background run, stays
+# in the system's session (System), and the GUI run must land in Aqua, as the runner's
+# uid and primary group, unable to read a file only wheel may read. (`id -G` is no
+# check of the groups: it lists the user's directory memberships whatever the process
+# holds; the next step reads the kernel's list.)
+# Not from a shell of this job (it is already in the runner's Aqua session, run
+# 38154872299), and not under `launchctl bsexec 1` (the nested `launchctl asuser`
+# refuses with "Reentrancy avoided", run 38148803625). The control's System is what
+# run 38156822140 measured.
+me=$(id -u) my_gid=$(id -g) my_name=$(id -un)
+launchctl print "gui/$me" >/dev/null 2>&1 || fail "the runner has no gui/$me domain"
+gui_dir=$(mktemp -d "$tmp/gui.XXXXXX")
+chmod 0755 "$gui_dir"
+real_dir=$(cd "$gui_dir" && pwd -P)
+wheel_only="$tmp/wheel-only"
+sudo -n sh -c "echo secret > '$wheel_only' && chown root:wheel '$wheel_only' && chmod 0040 '$wheel_only'"
+probe='echo "manager: $(/bin/launchctl managername 2>/dev/null || echo none)"; id -u; id -g; if cat "'"$wheel_only"'" >/dev/null 2>&1; then echo "wheel: yes"; else echo "wheel: no"; fi; pwd; echo "$HOME"'
+xml() { sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
+# spawn_in <background|gui>: the client's spawn as a root LaunchDaemon; prints its output.
+spawn_in() {
+  local label="kbf.ci.mac-session.spawn-$1" out="$tmp/spawn-$1.out" arg args=''
+  for arg in "$client" spawn "$1" "$me" "$my_gid" "$my_name" "$gui_dir" /bin/sh -c "$probe"; do
+    args="$args<string>$(printf '%s' "$arg" | xml)</string>"
+  done
+  cat > "$tmp/$label.src" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$label</string>
+  <key>ProgramArguments</key><array>$args</array>
+  <key>StandardOutPath</key><string>$out</string>
+  <key>StandardErrorPath</key><string>$out.err</string>
+  <key>RunAtLoad</key><true/>
+</dict>
+</plist>
+PLIST
+  # launchd loads a system job only from a file root owns and no one else may write.
+  sudo -n install -o root -g wheel -m 0644 "$tmp/$label.src" "$tmp/$label.plist"
+  sudo -n launchctl bootstrap system "$tmp/$label.plist"
+  for _ in $(seq 150); do
+    if sudo -n grep -q '^exit ' "$out" 2>/dev/null; then break; fi
+    sleep 0.2
+  done
+  sudo -n launchctl bootout "system/$label" 2>/dev/null || true
+  sudo -n cat "$out" 2>/dev/null || true
+  sudo -n cat "$out.err" >&2 2>/dev/null || true
+}
+control=$(spawn_in background)
+echo "background: $(echo "$control" | tr '\n' ' ')"
+[ "$(echo "$control" | sed -n 1p)" = "manager: System" ] || fail "the control is not in the system's session: [$control]"
+gui=$(spawn_in gui)
+echo "gui: $(echo "$gui" | tr '\n' ' ')"
+want=$(printf '%s\n' "manager: Aqua" "$me" "$my_gid" "wheel: no" "$real_dir" "/Users/$my_name" "exit 0")
+[ "$gui" = "$want" ] || fail "the GUI spawn: got [$gui], want [$want]"
+
+step "a GUI run holds no group but its own: root's are dropped before the exec"
+# Under sudo, root holds its whole group list (initgroups); the GUI run's process must
+# hold the lease user's primary group alone (the kernel's list, getgroups).
+root_groups=$(sudo -n "$client" groups)
+echo "root under sudo: $root_groups"
+[ "$(echo "$root_groups" | wc -w)" -gt 1 ] || fail "root holds one group here, so the check below cannot fail"
+held=$(sudo -n "$client" spawn gui "$me" "$my_gid" "$my_name" "$gui_dir" "$client" groups)
+echo "gui: $(echo "$held" | tr '\n' ' ')"
+# Its own primary group, or none at all, as the kernel keeps an empty list.
+first=$(echo "$held" | sed -n 1p)
+{ [ "$first" = "$my_gid" ] || [ -z "$first" ]; } && [ "$(echo "$held" | sed -n '$p')" = "exit 0" ] \
+  || fail "the GUI run kept groups: [$held]"
+
 echo
 echo "kbf-mac-session: every check passed"

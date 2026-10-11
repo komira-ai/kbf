@@ -41,8 +41,8 @@ pub(crate) struct State {
     /// Every `pause` so far.
     pub(crate) pauses: usize,
     /// Calls that fail, by name ("uid_taken", "make_home", "create_user",
-    /// "delete_user", "bootout gui", "kill_all", "live_processes", "command",
-    /// "reset_password", "boot_session").
+    /// "delete_user", "domain_exists", "bootout gui", "kill_all", "live_processes",
+    /// "command", "reset_password", "boot_session").
     pub(crate) fail: BTreeSet<&'static str>,
     /// What `command` answers, by the command's text (`program arg ...`). A command
     /// with no answer succeeds and prints nothing, except `fdesetup isactive`, which
@@ -57,6 +57,8 @@ pub(crate) struct State {
     /// Runs with each command's text before it is answered: a change on the host
     /// between two of the helper's steps.
     pub(crate) on_command: Option<Hook>,
+    /// The launchd domains that exist (`gui/<uid>` once a login has completed).
+    pub(crate) domains: BTreeSet<String>,
 }
 
 /// The fake host; clones share their state.
@@ -105,6 +107,11 @@ impl Host for FakeHost {
     fn delete_user(&self, name: &str) -> io::Result<bool> {
         self.call("delete_user", format!("delete_user {name}"))?;
         Ok(self.state().users.remove(name).is_some())
+    }
+
+    fn domain_exists(&self, domain: &str) -> io::Result<bool> {
+        self.call("domain_exists", format!("domain_exists {domain}"))?;
+        Ok(self.state().domains.contains(domain))
     }
 
     fn bootout(&self, domain: &str) -> io::Result<()> {

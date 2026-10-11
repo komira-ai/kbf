@@ -441,6 +441,13 @@ impl Request {
         Ok(req)
     }
 
+    /// The value the request asks `key` to have exactly (`os`, `cpu.model`,
+    /// `label.<k>`, ...), if it names one.
+    #[must_use]
+    pub fn exact(&self, key: &str) -> Option<&str> {
+        self.exact.get(key).map(String::as_str)
+    }
+
     /// The properties that [`Self::parse`] reads as this request, one per requirement,
     /// in a fixed order: `arch`, `isa_level`, each `cpu.feature`, the countable keys,
     /// the exact keys, the membership keys (each group by key, a membership key with the

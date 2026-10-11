@@ -1,8 +1,8 @@
 //! Shared value types for kbf: the content digest (function, hash, size), an image named
-//! by manifest digest, platform properties, QoS levels, lease identifiers and kinds, farm
-//! time, the vocabulary of scheduled work (operations, workers, request vectors,
-//! control-log records), and the `StateMachine` trait and `Effect` enum that the pure
-//! cores implement and emit, and the fleet rollout record with its per-node steps.
+//! by manifest digest, platform properties, QoS levels, lease identifiers and kinds, node
+//! phases, farm time, the vocabulary of scheduled work (operations, workers, request
+//! vectors, control-log records), and the `StateMachine` trait and `Effect` enum that the
+//! pure cores implement and emit, and the fleet rollout record with its per-node steps.
 //!
 //! This is a pure crate: no async runtime, network, clock, randomness or hashed
 //! collections. The layering test in `kbf-it` and the lists in `clippy.toml` enforce it.
@@ -14,6 +14,7 @@
 mod digest;
 mod image;
 mod lease;
+mod phase;
 mod platform;
 mod qos;
 mod rollout;
@@ -24,6 +25,7 @@ mod work;
 pub use digest::{Digest, DigestFunction, ParseDigestError};
 pub use image::{ImageError, ImageRef};
 pub use lease::{LeaseId, LeaseKind};
+pub use phase::NodePhase;
 pub use platform::{Platform, PlatformError};
 pub use qos::{CustomQos, Qos, QosError};
 pub use rollout::{

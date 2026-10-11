@@ -5,11 +5,11 @@ use std::io::{self, BufRead, BufReader, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 use crate::path::{HostPath, Root};
-use crate::step::{Cmd, HttpUrl, Owner, Perms, Step};
+use crate::step::{Cmd, Filter, HttpUrl, Owner, Perms, Step};
 use crate::trust::{self, Untrusted};
 
 /// What is at a path, as a plan compares it.
@@ -37,6 +37,14 @@ pub trait Exec {
 
     /// What is at `path` now; `None` when nothing is.
     fn inspect(&self, path: &HostPath) -> io::Result<Option<Entry>>;
+
+    /// Run `cmd` to read something while planning (does a bucket exist, what does a
+    /// Service hold): in a dry run as in an apply, so it must change nothing. A
+    /// non-zero exit is not an error here; the caller reads the status.
+    fn query(&self, cmd: &Cmd) -> io::Result<Output>;
+
+    /// One `GET` of `url` while planning; the status code of the answer.
+    fn http_status(&self, url: &HttpUrl) -> io::Result<u16>;
 
     /// Carry out one step.
     fn apply(&mut self, step: &Step) -> io::Result<()>;
@@ -117,9 +125,24 @@ impl Exec for HostExec {
                     fs::remove_file(&full)
                 }
             }
-            Step::Run(cmd) => run(cmd),
+            Step::Run(cmd) => succeeded(cmd, output(cmd)?).map(drop),
+            Step::Capture {
+                cmd,
+                filter,
+                path,
+                perms,
+                owner,
+            } => capture(cmd, *filter, &self.root.join(path), *perms, *owner),
             Step::WaitHttp { url, deadline } => wait_http(url, *deadline),
         }
+    }
+
+    fn query(&self, cmd: &Cmd) -> io::Result<Output> {
+        output(cmd)
+    }
+
+    fn http_status(&self, url: &HttpUrl) -> io::Result<u16> {
+        get_status(url, ATTEMPT)
     }
 
     fn check_binary(&self) -> Result<(), Untrusted> {
@@ -159,15 +182,31 @@ fn set_perms_owner(full: &Path, perms: Perms, owner: Option<Owner>) -> io::Resul
     fs::set_permissions(full, fs::Permissions::from_mode(perms.bits()))
 }
 
-fn run(cmd: &Cmd) -> io::Result<()> {
-    let out = Command::new(cmd.program.as_str())
+/// Run `cmd` to its end with its input written to a pipe, keeping both outputs. The
+/// input is written before the output is read, so it must fit in a pipe's buffer (64
+/// KiB on Linux) unless the tool reads all of it before writing much.
+fn output(cmd: &Cmd) -> io::Result<Output> {
+    let mut child = Command::new(cmd.program.as_str())
         .args(&cmd.args)
         .env_clear()
         .envs(cmd.env.iter().map(|(k, v)| (k, v)))
-        .stdin(Stdio::null())
-        .output()?;
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    // Dropped at the end of the statement, which closes the pipe: the tool reads EOF.
+    child
+        .stdin
+        .take()
+        .expect("stdin is piped")
+        .write_all(&cmd.stdin)?;
+    child.wait_with_output()
+}
+
+/// `out` when `cmd` exited 0; otherwise an error naming the exit and its stderr.
+pub(crate) fn succeeded(cmd: &Cmd, out: Output) -> io::Result<Output> {
     if out.status.success() {
-        return Ok(());
+        return Ok(out);
     }
     let stderr = String::from_utf8_lossy(&out.stderr);
     Err(io::Error::other(format!(
@@ -176,6 +215,18 @@ fn run(cmd: &Cmd) -> io::Result<()> {
         out.status,
         stderr.trim_end()
     )))
+}
+
+fn capture(
+    cmd: &Cmd,
+    filter: Filter,
+    full: &Path,
+    perms: Perms,
+    owner: Option<Owner>,
+) -> io::Result<()> {
+    let out = succeeded(cmd, output(cmd)?)?;
+    let bytes = (filter.apply)(&out.stdout).map_err(io::Error::other)?;
+    write_file(full, perms, owner, &bytes)
 }
 
 /// How long one attempt may take, and the pause between attempts.

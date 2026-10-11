@@ -238,12 +238,12 @@ its exit code. Its errors map to the `Result` status the server sees:
 | `MissingBlob(digest)` | `FAILED_PRECONDITION` with a `MISSING` violation |
 | `Failed(why)` | `INTERNAL`: the farm's failure |
 
-Four runtimes exist. The `kbf-daemon` binary (crate `kbf-node`) offers the first three,
-picked by `--driver`, which may be given more than once: one runtime per driver, each
-driver once, the node's own (native or container) set up first, then the others in
-the order given. Today every one of the three serves `action`, so any two refuse to
-start; the flag is repeatable for the runtimes of other kinds (a whole-machine runtime
-on Macs, a VM runtime) that join them.
+Five runtimes exist. The `kbf-daemon` binary (crate `kbf-node`) offers all but
+`LocalRuntime`, picked by `--driver`, which may be given more than once: one runtime per
+driver, each driver once, the node's own (native or container) set up first, then the
+others in the order given. Two that serve the same kind refuse to start (`container`,
+`native` and `fake` all serve `action`); a Mac runs `--driver native --driver
+native-whole-machine`.
 
 - **`PodmanRuntime`** (`kbf-driver-container`, driver `container`, Linux only): the
   runtime for Linux farm nodes, below. The binary requires `--scratch` and `--cas`, and
@@ -262,6 +262,18 @@ on Macs, a VM runtime) that join them.
   units and the host's swap and memory headroom.
 - **`NativeRuntime`** (`kbf-driver-native`, driver `native`): each action as plain
   processes on the node, for Macs.
+- **`WholeMachineRuntime`** (`kbf-driver-native`, driver `native-whole-machine`, macOS
+  only): each `whole_machine` lease as a throwaway user in that user's GUI session,
+  through the root helper `kbf-mac-session`
+  ([fleet-updates.md](fleet-updates.md#101-no-gpu-in-vms)). The binary requires
+  `--scratch` (its files go in `<scratch>/whole-machine`) and `--cas`, and refuses to
+  start when nothing serves `--mac-session-socket`. It hands the daemon its phase
+  (`Daemon::with_phase`), which every `Hello` carries
+  ([worker-protocol.md](worker-protocol.md#node-phases)): the session switch restarts
+  the daemon, and the runtime takes the lease up again from its on-disk record when the
+  server sends the `Start` again. `--daemon-user` names the daemon's own user, which the
+  lease directory's access control entries keep able to read and remove what the lease
+  user writes.
 - **`FakeRuntime`** (driver `fake`): runs nothing and returns an empty result, for
   bring-up. It serves `action`; `FakeRuntime::serving` makes one serve another kind
   under another driver name, so a daemon with several runtimes can be tested with fakes.
@@ -549,7 +561,6 @@ runtime reports usage; the container driver does not yet.
 - **Networked actions,** which get egress, are never cached and always self-fence.
 - **Service containers** for tests that need several containers, declared up front so
   the result stays cacheable.
-- **Other drivers** behind the same trait: native execution and whole-machine leases on
-  macOS, and virtual machines later. Every driver must pass one freshness test: a
+- **Other drivers** behind the same trait: virtual machines (`vm`) later. Every driver must pass one freshness test: a
   marker left by one lease is never seen by the next.
 - **Usage from the container driver,** read from the lease cgroup.

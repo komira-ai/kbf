@@ -25,6 +25,7 @@ clap.workspace = true
 kbf-daemon.workspace = true
 kbf-driver-native.workspace = true
 kbf-outputs.workspace = true
+kbf-types.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "sync"] }
 tonic.workspace = true
 tracing.workspace = true

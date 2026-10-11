@@ -61,13 +61,18 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         grant: Option<String>,
     },
-    /// Start a process as the lease's user, with the attached descriptors.
+    /// Start a process as the lease's user, with the attached descriptors; in its GUI
+    /// session when `session` is `gui`.
     Run {
         lease: String,
         argv: Vec<String>,
         #[serde(default)]
         env: Vec<(String, String)>,
+        #[serde(default, skip_serializing_if = "Session::is_background")]
+        session: Session,
     },
+    /// Whether the lease user's GUI session (`gui/<uid>`) is up, after `session-login`.
+    SessionReady { lease: String },
     /// End every process of the lease's uid.
     KillUid { lease: String },
     /// Delete the lease's user and sweep what it leaves.
@@ -88,6 +93,26 @@ pub enum Request {
     Baseline,
     /// Reboot, after the helper's own scan came back dirty.
     RebootDirty,
+}
+
+/// Where `run` starts a process.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Session {
+    /// Outside any login session: the system's launchd domain, as the helper runs.
+    #[default]
+    Background,
+    /// In the lease user's GUI (Aqua) session, `gui/<uid>`, through `launchctl asuser`:
+    /// the session `session-login` started. Refused while the session is not up.
+    Gui,
+}
+
+impl Session {
+    /// Whether this is [`Session::Background`], which a request leaves out.
+    #[must_use]
+    pub const fn is_background(&self) -> bool {
+        matches!(self, Self::Background)
+    }
 }
 
 /// What the helper answers.
@@ -113,6 +138,8 @@ pub enum Reply {
     /// The session switch is set and a userspace restart was asked for; the restart
     /// may end the connection before this arrives.
     Restarting,
+    /// Whether the lease user's GUI session is up.
+    SessionReady { ready: bool },
     /// The boot reset is done: the lease whose session it kept, and the leases whose
     /// users it deleted.
     Reset {
@@ -347,6 +374,7 @@ mod tests {
             lease: "1.2".to_owned(),
             argv: vec!["/usr/bin/true".to_owned()],
             env: vec![("A".to_owned(), "b".to_owned())],
+            session: Session::Background,
         }
     }
 
@@ -620,5 +648,34 @@ mod tests {
         let classes = vec![("lease-users".to_owned(), 1)];
         let text = serde_json::to_string(&Reply::Baselined { classes }).unwrap();
         assert_eq!(text, r#"{"baselined":{"classes":[["lease-users",1]]}}"#);
+    }
+
+    /// Catches a `run` that changes on the wire for the daemons that predate the
+    /// session target (a background run must still send, and read, no `session`), and a
+    /// GUI run whose target is lost or misnamed.
+    #[test]
+    fn a_run_names_its_session_only_when_it_is_the_gui() {
+        let background = serde_json::to_string(&run_request()).unwrap();
+        assert!(!background.contains("session"), "{background}");
+        let gui = Request::Run {
+            lease: "1.2".to_owned(),
+            argv: vec!["/usr/bin/true".to_owned()],
+            env: vec![("A".to_owned(), "b".to_owned())],
+            session: Session::Gui,
+        };
+        let text = serde_json::to_string(&gui).unwrap();
+        assert!(text.ends_with(r#","session":"gui"}"#), "{text}");
+        assert_eq!(serde_json::from_str::<Request>(&text).unwrap(), gui);
+        assert_eq!(
+            serde_json::from_str::<Request>(&background).unwrap(),
+            run_request()
+        );
+        let ready = serde_json::to_string(&Request::SessionReady {
+            lease: "1.2".to_owned(),
+        })
+        .unwrap();
+        assert_eq!(ready, r#"{"verb":"session-ready","lease":"1.2"}"#);
+        let answer = serde_json::to_string(&Reply::SessionReady { ready: true }).unwrap();
+        assert_eq!(answer, r#"{"session-ready":{"ready":true}}"#);
     }
 }
