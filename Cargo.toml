@@ -115,6 +115,7 @@ kbf-server = { path = "crates/kbf-server" }
 kbf-sim = { path = "crates/kbf-sim" }
 kbf-sim-cell = { path = "crates/kbf-sim-cell" }
 kbf-store = { path = "crates/kbf-store" }
+kbf-testkit = { path = "crates/kbf-testkit" }
 kbf-types = { path = "crates/kbf-types" }
 
 # `clippy.toml` lists the clock, sleep, network and hashed-collection items that pure
