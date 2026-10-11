@@ -14,6 +14,9 @@
 //! the lease's removal takes it away: nothing one action leaves there is seen by the
 //! next. A variable the Command sets itself is the Command's: these are set first and
 //! the Command's environment after them.
+//!
+//! Public so that a probe can give a program the lease's variables without the daemon
+//! (`examples/action_sandbox.rs`).
 
 use std::ffi::OsString;
 use std::path::Path;
@@ -32,7 +35,7 @@ const DIRS: [(&str, &str); 4] = [
 ///
 /// # Errors
 /// A directory cannot be made.
-pub(crate) async fn make(dir: &Path) -> std::io::Result<Vec<(&'static str, OsString)>> {
+pub async fn make(dir: &Path) -> std::io::Result<Vec<(&'static str, OsString)>> {
     let mut vars = Vec::new();
     for (sub, name) in DIRS {
         let path = dir.join(sub);

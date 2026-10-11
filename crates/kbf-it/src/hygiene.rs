@@ -1,5 +1,6 @@
-//! Public-hygiene scan for repository text: no machine addresses, no home paths and no
-//! citations of a design document that is not in this repository.
+//! Public-hygiene scan for repository text: no machine addresses, no home paths, no
+//! citations of a design document that is not in this repository and no git conflict
+//! markers.
 //!
 //! Everything in this repository is public, so a text file must not carry:
 //! - an IPv4 address, except the documentation ranges (192.0.2.0/24, 198.51.100.0/24,
@@ -12,7 +13,13 @@
 //!   and `RFC-7540` pass, while a section number (`5.8`, `10`), a word (`section`,
 //!   `sections`, `§`, a possessive, a plural) or nothing after it is reported, and so is
 //!   that document's file name (`FARM_` and the acronym, in any case). A public design
-//!   doc is cited by its path under `docs/` instead.
+//!   doc is cited by its path under `docs/` instead;
+//! - a git conflict marker: a line that starts with `<<<<<<< ` or `>>>>>>> ` (git
+//!   follows each with a label), and a line that is exactly `=======` in a text that
+//!   holds either of those. A `=======` line in a text with neither is a heading
+//!   underline (a Markdown setext heading) and passes, so a merge resolved down to its
+//!   separator alone passes too; a table rule such as `======= =====` is never a
+//!   marker. Every text is scanned for markers, whatever its extension.
 //!
 //! A dotted run is read as an address only when it has exactly four parts of one to
 //! three digits, each at most 255, so `1.2.3` (a version) and `1.2.3.4.5` are not
@@ -36,6 +43,8 @@ pub enum Kind {
     /// A citation of an unpublished design document; holds the text from the acronym
     /// on (at most 16 characters).
     DesignCitation(String),
+    /// A git conflict marker; holds the marker (`<<<<<<<`, `=======` or `>>>>>>>`).
+    ConflictMarker(&'static str),
 }
 
 /// One finding: a 1-based line number and what was found there.
@@ -58,6 +67,11 @@ impl fmt::Display for Finding {
                 f,
                 "line {}: `{c}` cites an unpublished design document; cite a doc under \
                  docs/ instead",
+                self.line
+            ),
+            Kind::ConflictMarker(m) => write!(
+                f,
+                "line {}: git conflict marker `{m}`; finish the merge",
                 self.line
             ),
         }
@@ -129,7 +143,19 @@ pub fn decode(path: &str, bytes: &[u8]) -> Result<Option<String>, String> {
 /// Scans one text and returns every finding, in line order.
 pub fn scan(text: &str) -> Vec<Finding> {
     let mut out = Vec::new();
+    let merging = text
+        .lines()
+        .any(|l| conflict_marker(l).is_some_and(|m| m != SEPARATOR));
     for (i, line) in text.lines().enumerate() {
+        match conflict_marker(line) {
+            // A heading underline: the text holds no other marker.
+            Some(SEPARATOR) if !merging => {}
+            Some(m) => out.push(Finding {
+                line: i + 1,
+                kind: Kind::ConflictMarker(m),
+            }),
+            None => {}
+        }
         for a in ipv4_in(line) {
             if is_allowed(a) {
                 continue;
@@ -155,6 +181,24 @@ pub fn scan(text: &str) -> Vec<Finding> {
         }
     }
     out
+}
+
+/// The marker that starts the merge's own side, the one between the sides, and the one
+/// that ends the other side. Git writes a label after the first and the last.
+const OURS: &str = "<<<<<<<";
+const SEPARATOR: &str = "=======";
+const THEIRS: &str = ">>>>>>>";
+
+/// The conflict marker `line` is: [`OURS`] or [`THEIRS`] followed by a space, or
+/// exactly [`SEPARATOR`].
+fn conflict_marker(line: &str) -> Option<&'static str> {
+    if line == SEPARATOR {
+        return Some(SEPARATOR);
+    }
+    [OURS, THEIRS].into_iter().find(|m| {
+        line.strip_prefix(m)
+            .is_some_and(|rest| rest.starts_with(' '))
+    })
 }
 
 /// Every citation of an unpublished design document in `line`, in order: each token
@@ -459,6 +503,67 @@ mod tests {
         let a = acronym();
         let text =
             format!("{a} 9113, {a} 3339. {a}-7540 {a}6570 Section 3.2.2 {a}OMM X{a} to_rfc3339");
+        assert_eq!(scan(&text), vec![]);
+    }
+
+    /// A conflict as git writes it, its markers assembled at run time so this file does
+    /// not trip the scan; `ours` and `theirs` are the two sides' lines.
+    fn conflict(ours: &str, theirs: &str) -> String {
+        let (o, s, t) = ("<".repeat(7), "=".repeat(7), ">".repeat(7));
+        format!("{o} HEAD\n{ours}\n{s}\n{theirs}\n{t} topic\n")
+    }
+
+    fn markers(text: &str) -> Vec<(usize, &'static str)> {
+        scan(text)
+            .into_iter()
+            .filter_map(|f| match f.kind {
+                Kind::ConflictMarker(m) => Some((f.line, m)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn every_conflict_marker_is_reported_with_its_line() {
+        // Catches: a scan that checks only the opening marker, or drops the separator
+        // or the closing one, or reports them at the wrong lines.
+        let text = format!("fn a() {{}}\n{}", conflict("let x = 1;", "let x = 2;"));
+        assert_eq!(
+            markers(&text),
+            vec![(2, "<<<<<<<"), (4, "======="), (6, ">>>>>>>")]
+        );
+    }
+
+    #[test]
+    fn a_marker_left_alone_is_reported() {
+        // Catches: a merge resolved but for one angle marker passing because the scan
+        // checks only the opening marker or needs every marker in one text; and the
+        // separator then passed as a heading underline although the text is mid-merge.
+        let (s, t) = ("=".repeat(7), ">".repeat(7));
+        assert_eq!(markers(&format!("a\n{t} topic\n")), vec![(2, ">>>>>>>")]);
+        assert_eq!(
+            markers(&format!("a\n{s}\nb\n{t} topic\n")),
+            vec![(2, "======="), (4, ">>>>>>>")]
+        );
+        assert_eq!(
+            markers(&format!("{}\r\nx", "<".repeat(7) + " HEAD")),
+            vec![(1, "<<<<<<<")],
+            "a CRLF line"
+        );
+    }
+
+    #[test]
+    fn heading_underlines_and_table_rules_are_not_conflict_markers() {
+        // Catches: a Markdown setext heading (`=======` under its title) or a table
+        // rule refused as a marker, or a marker matched anywhere but at a line start
+        // or without git's label.
+        let s = "=".repeat(7);
+        let text = format!(
+            "Title\n{s}\n\n{s} =====\nkey   value\n{s} =====\n=====\n{s}=\n  {s}\n             a {} b\n{}\n{}x\n",
+            "<".repeat(7),
+            "<".repeat(7),
+            ">".repeat(7)
+        );
         assert_eq!(scan(&text), vec![]);
     }
 

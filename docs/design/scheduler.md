@@ -284,7 +284,9 @@ What the code does today:
   preempted at once when more urgent work needs it.
 - **Retries.** An infrastructure failure is retried on another worker a bounded number
   of times before callers see `INTERNAL`. Today only a busy node's memory kill is
-  rerun (below).
+  rerun (below). A missing input (`Failed(MissingInput)`, [Outcomes](#outcomes)) is
+  not an infrastructure failure and will not count against that budget: rerunning it
+  fails the same way until the client uploads the blob.
 
 ## Memory kills
 
@@ -340,6 +342,7 @@ to the scheduler's outcome and to what callers see:
 | `INVALID_ARGUMENT` | `Failed(Invalid)` | `INVALID_ARGUMENT`, with the daemon's reason | not written |
 | not `OK`, `memory_kill` own limit | `Failed(OutOfMemory)`: run again with double the memory below the cap | at the cap, `FAILED_PRECONDITION`: "kbf: the action needs more memory than any node offers: ...", with an `ErrorInfo` of reason `ACTION_OUT_OF_MEMORY` | not written |
 | not `OK`, `memory_kill` node pressure | `Failed(NodeMemoryPressure)`: run again with the same memory, twice | after the reruns, `INTERNAL`: "kbf farm fault on <node>: ..." | not written |
+| `FAILED_PRECONDITION`, every `PreconditionFailure` violation `MISSING` with a `blobs/<hash>/<size>` subject | `Failed(MissingInput)`: answered at once, never run again, no farm rerun spent | `FAILED_PRECONDITION`: "N input blob(s) are not in the CAS", with the `PreconditionFailure` listing each blob as its only detail, as the front answers before queueing; Bazel re-uploads and executes again | not written |
 | anything else | `Failed(Infra)` | `INTERNAL`: "the farm could not run the action"; the daemon's reason goes only to the server's log, a WARN `lease failed` line with the lease, the node, the code and the reason | not written |
 | (none: refused unrun) | `Refused` | `FAILED_PRECONDITION`, with the reason | not written |
 

@@ -5,12 +5,15 @@ node by USB: how a device is set up once, how signing is done and where its secr
 live, how one specific device is booked for one lease, how the daemon reports each
 device's health and alerts with the exact fix, how a device is cleaned between
 leases, and what still needs a person at the device. **Everything in it is planned**
-but the sandbox rule that keeps leases away from the node's devices
-([section 6.1](#61-what-the-sandbox-must-allow)), the driver watch
+but four pieces on `main`: the sandbox rule that keeps every lease away from the
+node's devices ([section 6.1](#61-what-the-sandbox-must-allow)), the driver watch with
+a part per source that the device survey is to send through
 ([section 7.5](#75-recover)), and the server's side of booking: matching, booking and
-`Start.device_id` ([sections 5.2 to 5.4](#5-scheduling-one-specific-device-per-lease)).
-No daemon reports a device yet and no runtime talks to one, so a device request waits
-and is refused as unservable. What exists on `main` today is named as such.
+`Start.device_id` ([sections 5.2 to 5.4](#5-scheduling-one-specific-device-per-lease)),
+which replaced the refusal of every `ios.device` request key
+([section 5.5](#55-rollout-order)). No daemon reports a device yet and no runtime
+talks to one, so a device request waits and is refused as unservable. What exists on
+`main` today is named as such.
 
 Claims about Apple's software are marked **[V]** (read in the source linked) or
 **[A]** (an assumption nobody has checked on our hardware). Most claims about
@@ -288,7 +291,8 @@ CoreDevice (below). The action runs `xcodebuild` inside it.
 services (`(allow default)`) and the no-network one every Unix socket, so without a
 rule any concurrent action on the node, device lease or not, could run `xcrun
 devicectl` and install, launch or reboot apps on a device booked for another lease.
-So every profile ends with `NO_DEVICE_RULES` (`crates/kbf-driver-native/src/network.rs`):
+So every profile carries `NO_DEVICE_RULES` (`crates/kbf-driver-native/src/network.rs`),
+after the network's rules and before the lease's write rules for the user's folders:
 
 - no `mach-lookup` of a name starting `com.apple.CoreDevice.`: `CoreDeviceService`
   (the XPC service `devicectl` asks for everything; refused, `devicectl` waits over 15
@@ -474,7 +478,7 @@ None of these has run. Each is a later PR's evidence; the PR that needs it says 
 | Probe | What it settles | Needs |
 |---|---|---|
 | P-D0 | `xcrun devicectl help` and `--version` text for the pinned Xcode: which verbs and JSON options exist | a Mac with Xcode, no device; can run on the hosted macOS runner |
-| P-D1 | Real `devicectl` JSON for `list devices`, `device info details`, `lockState` and `apps`, in each state: paired and ready, Trust not tapped, Developer Mode off, locked, unplugged, Wi-Fi only; whether the JSON has a battery field; whether pairing records are per user | a device and a person at it; fixtures scrubbed of UDID, ECID, serial number, CoreDevice id and device name |
+| P-D1 | Real `devicectl` JSON for `list devices`, `device info details`, `lockState` and `apps`, in each state: paired and ready, Trust not tapped, Developer Mode off, locked, unplugged, Wi-Fi only; whether the JSON has a battery field; whether pairing records are per user | a dedicated test device and a person at it; fixtures are committed as captured (the ids are a test device's, not a person's) |
 | P-D2 | Whether a per-lease macOS user (`kbf-mac-session`, issue #122) sees and can use a device paired by another user | root on the node; a device |
 | P-D3 | The deciding probe: `xcodebuild test-without-building -destination id=<udid>` on a signed XCUITest bundle, from the daemon as a LaunchDaemon and as a LaunchAgent, with someone logged in and with nobody logged in, inside the sandbox with the network off and on, with a per-lease `HOME`; which paths and preferences it writes; whether a Local Network prompt appears | a signed bundle and a profile listing the device; an unlocked device; maybe a person at the Mac's console |
 | P-D4 | Install, uninstall and reboot back to `ready` with no person, on a device with no passcode | a device |
@@ -484,18 +488,19 @@ None of these has run. Each is a later PR's evidence; the PR that needs it says 
 
 ## 12. Phased plan
 
-All planned but the sandbox rule, the driver watch and the server's side of D3; each is
-its own pull request.
+All planned but the sandbox rule, the refusal of the device keys (since replaced by
+booking), the driver watch and the server's side of D3; each is its own pull request.
 
 | Phase | What | Needs |
 |---|---|---|
 | D0 | This design | - |
-| D1 | Probe kit: P-D0 and P-D1 fixtures, with a lint that refuses a fixture carrying a real-looking UDID, ECID, serial, CoreDevice id or device name | a device and a person (P-D1) |
+| D1 | Probe kit: P-D0 and P-D1 fixtures, captured from dedicated test devices and committed as captured | a test device and a person (P-D1) |
 | D1 | Sandbox rule: leases without a device cannot reach CoreDevice, `remoted` or `usbmuxd`; tested on the hosted macOS runner (**done**: `NO_DEVICE_RULES`) | none |
 | D2 | Survey parser in `kbf-driver-native`: `devicectl` JSON to device states, tested against the D1 fixtures | D1 |
-| D2 | One driver watch for Xcodes and devices, a part per source: done, the Xcodes' part only ([section 7.5](#75-recover)) | PR #173 |
+| D2 | One driver watch for Xcodes and devices, a part per source (**done** in PR #333, the Xcodes' part only: `DriverWatch`, [section 7.5](#75-recover)) | PR #173 |
 | D2 | `NodeStatus.devices`, attention lines, the state file, `forget` and `release`, `Hello` resent on change | the watch |
-| D3 | `kbf-caps` device matching (one device satisfies every key) with scheduler booking and `Start.device_id`, landed together with the front's refusals and messages (**done**) | none |
+| D3 | Refuse `ios.device` and every `ios.device.<attribute>` key in `kbf-caps` until booking exists, and answer it with `INVALID_ARGUMENT` at the front (**done** in PR #332, then replaced by the row below) | none |
+| D3 | `kbf-caps` device matching (one device satisfies every key) with scheduler booking and `Start.device_id`, landed together with the front's refusals and messages of [section 5.3](#53-request-keys) in place of the refusal of every device key (**done**) | none |
 | D3 | Device lease runtime: precheck, baseline, run, cleanup, quarantine, audit | D2, D3, P-D3, P-D4 |
 | D4 | Supervision through MDM, an erase policy, iOS update control in [fleet-updates.md](fleet-updates.md), a signing lane with a secret store, alert delivery (issue #189) | open decisions below; P-D7 |
 
@@ -518,7 +523,7 @@ its own pull request.
 
 | Claim | Status | Source |
 |---|---|---|
-| No physical-device code or report entry exists on `main`, but the sandbox rule of section 6.1 | V | the repository |
+| On `main` for devices: the sandbox rule of section 6.1, the driver watch's parts of section 7.5, and the server's matching and booking of sections 5.2 to 5.4: `ios.device` report entries are read, one device must satisfy every `ios.device.*` key, the scheduler books it and `Start.device_id` names it. No daemon reports a device, and nothing surveys or talks to one | V | `crates/kbf-driver-native/src/network.rs`, `crates/kbf-caps/src/matching.rs`, `crates/kbf-caps/src/report.rs`, `crates/kbf-sched/src/devices.rs`, `crates/kbf-daemon/src/driver_watch.rs` |
 | `gpu` is booked as a count; `Start` carries only CPU and memory; the daemon builds `Work.resources` from those | V | `crates/kbf-types/src/work.rs`, `crates/kbf-proto/proto/kbf/worker/v1/worker.proto`, `crates/kbf-daemon/src/lease.rs` |
 | `Start`'s field numbers 1 to 7 are taken | V | `worker.proto` |
 | An unknown platform property is ignored today | V | [capabilities.md](capabilities.md#unknown-keys) |

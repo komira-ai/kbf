@@ -51,6 +51,9 @@ macOS with Xcode only:
 bash selftest.sh OUT_DIR       # the pixel checker's selftest
 bash run.sh ios OUT_DIR        # build, test on the newest iPhone simulator
 bash run.sh macos OUT_DIR      # build, test in this login session
+bash run.sh macos OUT_DIR build-for-testing      # only build, into OUT_DIR
+bash run.sh macos OUT_DIR test-without-building  # then only test that build
+bash run.sh macos OUT_DIR report                 # check the bundle a run left, no xcodebuild
 ```
 
 `run.sh` writes `OUT_DIR/<platform>.xcresult`, the xcodebuild log, and
@@ -65,7 +68,9 @@ each a non-empty file. A test that passes without `keepAlways` has its screensho
 deleted from the bundle, so that run fails.
 
 The workflow `.github/workflows/spike-xcuitest.yml` runs all of this on a hosted macOS
-runner and uploads the bundles. A hosted runner's privacy grants may be seeded, so
+runner and uploads the bundles. Its `xcuitest-sandbox` job runs `run.sh` again as a
+native driver action, under the driver's sandbox profile
+(`../xcuitest_sandbox.sh`, `docs/spikes/macos-p0.md`). A hosted runner's privacy grants may be seeded, so
 its result proves the instrument, not what a fresh Mac allows.
 
 ## Changing the projects
