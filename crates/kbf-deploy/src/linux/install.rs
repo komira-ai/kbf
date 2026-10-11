@@ -10,10 +10,11 @@
 //! whose `--help` lacks a flag its unit passes.
 //!
 //! The plan has each of these only when the host differs:
-//! 1. with `--bin-dir`, `kbf-server` and `kbf-daemon` copied into `KBF_BIN_DIR`, the
-//!    binary they replace kept as `<name>.previous`;
+//! 1. with `--bin-dir`, `kbf-server` and `kbf-daemon` copied into `KBF_BIN_DIR` (0755),
+//!    the binary they replace kept as `<name>.previous` (its mode);
 //! 2. `kbf.slice`, the MinIO drop-in, `kbf-server.service` and `kbf-daemon.service`
-//!    under `/etc/systemd/system`;
+//!    under `/etc/systemd/system` (0644); these and the binaries are root's (uid and
+//!    gid 0), so one with the right bytes and mode that another user owns is replaced;
 //! 3. the Raft directory (`KBF_META_LOG=raft`) and the build scratch, 0700, owned by
 //!    their service's user;
 //! 4. when a binary or unit changed: `daemon-reload`, then enable and restart
@@ -53,6 +54,10 @@ const BINARIES: [&str; 2] = ["kbf-server", "kbf-daemon"];
 const PUBLIC: [&str; 5] = ["ca.pem", "reapi.pem", "worker.pem", "node.pem", "deny-list"];
 /// How long kbf-server has to answer `/readyz` after a start.
 pub const READY: Duration = Duration::from_secs(60);
+/// Who owns each binary, `.previous` copy and unit install-units writes: root, user and
+/// group. The in-place check compares it too, so a right file another user owns (and so
+/// could rewrite what systemd runs as root) is replaced.
+const ROOT: Owner = Owner { uid: 0, gid: 0 };
 
 /// What `install-units` was asked for.
 pub struct Install {
@@ -64,13 +69,16 @@ pub struct Install {
 
 /// Check the host, then plan the binaries, units, directories and service steps.
 pub fn plan<E: Exec>(exec: &E, a: &Install, out: &mut dyn Write) -> Result<Plan, HostError> {
-    plan_with(exec, a, &Templates::BUILT_IN, out)
+    plan_with(exec, a, &Templates::BUILT_IN, ROOT, out)
 }
 
+/// [`plan`] with `templates` and with `root` as the owner of what root writes (a scratch
+/// test can chown only to its own user).
 fn plan_with<E: Exec>(
     exec: &E,
     a: &Install,
     templates: &Templates<'_>,
+    root: Owner,
     out: &mut dyn Write,
 ) -> Result<Plan, HostError> {
     let c = &a.config;
@@ -90,7 +98,14 @@ fn plan_with<E: Exec>(
     let mut changed = false;
     if a.bin_dir.is_some() {
         for (bin, bytes) in BINARIES.into_iter().zip(new) {
-            changed |= binary(exec, &mut planner, &under(&c.bin_dir, bin)?, bytes, out)?;
+            changed |= binary(
+                exec,
+                &mut planner,
+                &under(&c.bin_dir, bin)?,
+                bytes,
+                root,
+                out,
+            )?;
         }
     }
     let dir = HostPath::new(UNITS)?;
@@ -100,7 +115,7 @@ fn plan_with<E: Exec>(
         if planner.file(
             path.clone(),
             Perms::new(0o644),
-            None,
+            Some(root),
             text.as_bytes().to_vec(),
         )? {
             changed = true;
@@ -304,27 +319,26 @@ fn supports<E: Exec>(exec: &E, bin: &HostPath, unit: &str) -> Result<Vec<u8>, Ho
     Ok(bytes)
 }
 
-/// Plan `bytes` into `dst` (0755), keeping a different binary there as
-/// `<dst>.previous`; whether it changes.
+/// Plan `bytes` into `dst` (0755, owned by `root`), keeping a different binary there as
+/// `<dst>.previous` (its mode, owned by `root`); whether it changes.
 fn binary<E: Exec>(
     exec: &E,
     planner: &mut Planner<'_, E>,
     dst: &HostPath,
     bytes: Vec<u8>,
+    root: Owner,
     out: &mut dyn Write,
 ) -> Result<bool, HostError> {
     parents(exec, planner, dst)?;
     if let Some(Entry::File {
-        perms,
-        owner,
-        bytes: old,
+        perms, bytes: old, ..
     }) = inspect(exec, dst)?
         && old != bytes
     {
         let previous = HostPath::new(&format!("{dst}.previous"))?;
-        planner.file(previous, perms, Some(owner), old)?;
+        planner.file(previous, perms, Some(root), old)?;
     }
-    let changed = planner.file(dst.clone(), Perms::new(0o755), None, bytes)?;
+    let changed = planner.file(dst.clone(), Perms::new(0o755), Some(root), bytes)?;
     if !changed {
         note(out, format_args!("{dst}: unchanged"))?;
     }

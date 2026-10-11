@@ -153,9 +153,23 @@ fn steps(p: &Plan) -> Vec<String> {
     p.steps().iter().map(ToString::to_string).collect()
 }
 
+/// The test's own user, standing in for root as the owner of what root writes: a
+/// scratch apply can chown only to it.
+fn runner() -> Owner {
+    let (uid, gid) = me();
+    Owner { uid, gid }
+}
+
+/// [`plan`] on a scratch host, with [`runner`] for root.
+fn plan_here(exec: &ScratchHost, a: &Install, out: &mut dyn Write) -> Result<Plan, HostError> {
+    plan_with(exec, a, &Templates::BUILT_IN, runner(), out)
+}
+
+/// [`run`] on a scratch host, with [`runner`] for root.
 fn go(exec: &mut ScratchHost, a: &Install, mode: Mode) -> String {
     let mut out = Vec::new();
-    run(exec, a, mode, &mut out).expect("install-units");
+    let p = plan_here(exec, a, &mut out).expect("plan");
+    execute(&p, RunAs::Root, mode, exec, &mut out).expect("install-units");
     String::from_utf8(out).expect("utf-8")
 }
 
@@ -181,13 +195,13 @@ fn mode_of(exec: &ScratchHost, path: &str) -> u32 {
 fn a_first_install_writes_everything_and_a_rerun_plans_nothing() {
     let (mut exec, world) = host("install-first");
     let (uid, gid) = me();
-    let p = plan(&exec, &install(), &mut Vec::new()).expect("plan");
+    let p = plan_here(&exec, &install(), &mut Vec::new()).expect("plan");
     let want = [
         "mkdir /usr (0755)".to_owned(),
         "mkdir /usr/local (0755)".to_owned(),
         "mkdir /usr/local/bin (0755)".to_owned(),
-        "write /usr/local/bin/kbf-server (0755, 8 bytes)".to_owned(),
-        "write /usr/local/bin/kbf-daemon (0755, 8 bytes)".to_owned(),
+        format!("write /usr/local/bin/kbf-server (0755, owner {uid}:{gid}, 8 bytes)"),
+        format!("write /usr/local/bin/kbf-daemon (0755, owner {uid}:{gid}, 8 bytes)"),
         "mkdir /etc/systemd (0755)".to_owned(),
         "mkdir /etc/systemd/system (0755)".to_owned(),
     ];
@@ -206,7 +220,9 @@ fn a_first_install_writes_everything_and_a_rerun_plans_nothing() {
     assert_eq!(units.len(), 4);
     for (line, name) in units.iter().zip(names) {
         assert!(
-            line.starts_with(&format!("write /etc/systemd/system/{name} (0644, ")),
+            line.starts_with(&format!(
+                "write /etc/systemd/system/{name} (0644, owner {uid}:{gid}, "
+            )),
             "{line}"
         );
     }
@@ -266,10 +282,10 @@ fn a_new_binary_keeps_the_old_one_and_restarts_the_services() {
     go(&mut exec, &install(), Mode::Apply);
     write(&exec, "/opt/new/kbf-daemon", "daemon-3", 0o755);
     let (uid, gid) = me();
-    let p = plan(&exec, &install(), &mut Vec::new()).expect("plan");
+    let p = plan_here(&exec, &install(), &mut Vec::new()).expect("plan");
     let want = [
         format!("write /usr/local/bin/kbf-daemon.previous (0755, owner {uid}:{gid}, 8 bytes)"),
-        "write /usr/local/bin/kbf-daemon (0755, 8 bytes)".to_owned(),
+        format!("write /usr/local/bin/kbf-daemon (0755, owner {uid}:{gid}, 8 bytes)"),
         "run /usr/bin/systemctl daemon-reload".to_owned(),
         "run /usr/bin/systemctl enable kbf-server.service kbf-daemon.service".to_owned(),
         "run /usr/bin/systemctl restart kbf-server.service kbf-daemon.service".to_owned(),
@@ -288,7 +304,7 @@ fn a_new_binary_keeps_the_old_one_and_restarts_the_services() {
         restart_minio: true,
         ..install()
     };
-    let got = steps(&plan(&exec, &a, &mut Vec::new()).expect("plan"));
+    let got = steps(&plan_here(&exec, &a, &mut Vec::new()).expect("plan"));
     assert_eq!(
         got[3], "run /usr/bin/systemctl restart minio.service",
         "{got:#?}"
@@ -303,7 +319,7 @@ fn unchanged_units_start_and_enable_only_what_is_not() {
     go(&mut exec, &install(), Mode::Apply);
     world.borrow_mut().active.remove(DAEMON);
     world.borrow_mut().enabled.remove(SERVER);
-    let p = plan(&exec, &install(), &mut Vec::new()).expect("plan");
+    let p = plan_here(&exec, &install(), &mut Vec::new()).expect("plan");
     let want = [
         "run /usr/bin/systemctl enable kbf-server.service",
         "run /usr/bin/systemctl start kbf-daemon.service",
@@ -589,7 +605,8 @@ fn units_that_break_a_priority_are_refused_before_a_write() {
         server: &server,
         ..t
     };
-    let err = plan_with(&exec, &install(), &planted, &mut Vec::new()).expect_err("broken");
+    let err =
+        plan_with(&exec, &install(), &planted, runner(), &mut Vec::new()).expect_err("broken");
     assert!(
         matches!(&err, HostError::Units(f) if !f.is_empty()),
         "{err}"
