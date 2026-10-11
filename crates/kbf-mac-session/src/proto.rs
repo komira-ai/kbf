@@ -68,6 +68,16 @@ pub enum Request {
     KillUid { lease: String },
     /// Delete the lease's user and sweep what it leaves.
     UserDelete { lease: String },
+    /// Auto-login into the lease's user, then a userspace restart.
+    SessionLogin { lease: String },
+    /// Clear auto-login, then a userspace restart.
+    SessionIdle,
+    /// The boot reset, before the daemon's `Hello`: `held` are the leases the server
+    /// still holds for this node.
+    BootReset {
+        #[serde(default)]
+        held: Vec<String>,
+    },
 }
 
 /// What the helper answers.
@@ -90,6 +100,15 @@ pub enum Reply {
     /// The user is gone and its state swept; `existed` is false when there was no
     /// user record left to delete (a repeated or resumed delete).
     Deleted { existed: bool },
+    /// The session switch is set and a userspace restart was asked for; the restart
+    /// may end the connection before this arrives.
+    Restarting,
+    /// The boot reset is done: the lease whose session it kept, and the leases whose
+    /// users it deleted.
+    Reset {
+        kept: Option<String>,
+        deleted: Vec<String>,
+    },
     /// The request was refused or failed, and why.
     Refused { reason: String },
 }

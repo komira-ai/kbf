@@ -139,6 +139,51 @@ impl Client {
             other => Err(unexpected(other)),
         }
     }
+
+    /// `boot-reset`, naming the leases the server still holds for this node: returns
+    /// the lease whose session was kept and the leases whose users were deleted.
+    ///
+    /// # Errors
+    /// The call failed or was refused.
+    pub fn boot_reset(
+        &self,
+        held: &[String],
+    ) -> Result<(Option<String>, Vec<String>), ClientError> {
+        let request = Request::BootReset {
+            held: held.to_vec(),
+        };
+        match self.call(&request, &[])?.1 {
+            Reply::Reset { kept, deleted } => Ok((kept, deleted)),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// `session-login`: returns once the helper has asked for the restart (which may
+    /// end the connection first: an end of stream is then the expected answer).
+    ///
+    /// # Errors
+    /// The call failed or was refused.
+    pub fn session_login(&self, lease: &str) -> Result<(), ClientError> {
+        let request = Request::SessionLogin {
+            lease: lease.to_owned(),
+        };
+        restarting(self.call(&request, &[])?.1)
+    }
+
+    /// `session-idle`: as [`Self::session_login`].
+    ///
+    /// # Errors
+    /// The call failed or was refused.
+    pub fn session_idle(&self) -> Result<(), ClientError> {
+        restarting(self.call(&Request::SessionIdle, &[])?.1)
+    }
+}
+
+fn restarting(reply: Reply) -> Result<(), ClientError> {
+    match reply {
+        Reply::Restarting => Ok(()),
+        other => Err(unexpected(other)),
+    }
 }
 
 /// Sends `request` over `stream`, a connection to the helper not yet used: waits for

@@ -73,9 +73,21 @@ expect_refused "owned by uid $(id -u)" sudo -n "$helper" --socket "$socket" --so
   --state-dir "$state" --uid-range "$first-$last" --daemon-requirement "cdhash H\"$genuine\"" \
   --grant-keys "$tmp/user-keys"
 sudo -n install -o root -m 0644 "$tmp/user-keys" "$tmp/grant-keys"
-sudo -n "$helper" --socket "$socket" --socket-group admin --state-dir "$state" \
-  --uid-range "$first-$last" --daemon-requirement "cdhash H\"$genuine\"" \
-  --grant-keys "$tmp/grant-keys" > "$tmp/helper.log" 2>&1 &
+# The session switch's files are the job's own, never the runner's login window: the
+# boot reset clears auto-login, and nothing here may restart the runner.
+loginwindow="$tmp/loginwindow"
+kcpassword="$tmp/kcpassword"
+intent="$state/session-intent"
+helper_flags=(--socket "$socket" --socket-group admin --state-dir "$state"
+  --uid-range "$first-$last" --daemon-requirement "cdhash H\"$genuine\""
+  --kcpassword "$kcpassword" --loginwindow "$loginwindow")
+# A power cut mid-session, as the boot finds it: auto-login names a lease user, and an
+# intent record names a lease the server no longer holds.
+sudo -n mkdir -p -m 0700 "$state"
+sudo -n sh -c "echo 9.9 > '$intent'"
+sudo -n defaults write "$loginwindow" autoLoginUser -string kbf-lease-9-9
+sudo -n sh -c "echo x > '$kcpassword'"
+sudo -n "$helper" "${helper_flags[@]}" --grant-keys "$tmp/grant-keys" > "$tmp/helper.log" 2>&1 &
 cleanup() {
   sudo -n pkill -f "$helper --socket" || true
   echo "--- helper log"; cat "$tmp/helper.log" || true
@@ -83,6 +95,28 @@ cleanup() {
 trap cleanup EXIT
 for _ in $(seq 100); do [ -S "$socket" ] && break; sleep 0.1; done
 [ -S "$socket" ] || fail "the helper did not bind $socket"
+
+# restart_helper [held lease]...: stops the helper, starts it again over the same state,
+# and runs its boot reset naming the held leases; the reset's answer is in $reset_out.
+restart_helper() {
+  sudo -n pkill -f "$helper --socket"
+  sleep 1
+  sudo -n "$helper" "${helper_flags[@]}" >> "$tmp/helper.log" 2>&1 &
+  for _ in $(seq 100); do
+    if reset_out=$("$client" reset "$socket" "$@" 2>&1); then return 0; fi
+    sleep 0.1
+  done
+  fail "the restarted helper did not finish its boot reset: $reset_out"
+}
+
+step "the boot reset: nothing is served before it; a stale intent clears auto-login"
+expect_refused "boot reset has not run" "$client" kill "$socket" 1.1
+[ "$("$client" reset "$socket" 7.7)" = "kept none deleted " ] || fail "the first boot reset"
+if sudo -n defaults read "$loginwindow" autoLoginUser 2>/dev/null; then fail "auto-login survived the reset"; fi
+for gone in "$kcpassword" "$intent"; do
+  if sudo -n test -e "$gone"; then fail "$gone survived the reset"; fi
+done
+expect_refused "runs once" "$client" reset "$socket"
 
 step "S4.3: the socket admits only its group"
 [ "$(stat -f '%Lp %Sg' "$run_dir")" = "750 admin" ] || fail "socket directory: $(stat -f '%Lp %Sg' "$run_dir")"
@@ -205,16 +239,10 @@ done
 if dscl . -read /Groups/admin GroupMembership | grep -q kbf-lease; then fail "a lease user is still in the admin group"; fi
 
 step "the ledger survives a restart of the helper"
-sudo -n pkill -f "$helper --socket"
-sleep 1
-sudo -n "$helper" --socket "$socket" --socket-group admin --state-dir "$state" \
-  --uid-range "$first-$last" --daemon-requirement "cdhash H\"$genuine\"" \
-  >> "$tmp/helper.log" 2>&1 &
-# Up once it answers: the deleted lease 1.1 is "absent" from the ledger it reread.
-for _ in $(seq 100); do
-  [ "$("$client" delete "$socket" 1.1 2>/dev/null)" = absent ] && break
-  sleep 0.1
-done
+restart_helper
+[ "$reset_out" = "kept none deleted " ] || fail "boot reset after a restart: $reset_out"
+# The deleted lease 1.1 is "absent" from the ledger it reread.
+[ "$("$client" delete "$socket" 1.1)" = absent ] || fail "the ledger forgot lease 1.1"
 expect_refused "never reused" "$client" create "$socket" 1.3
 uid=$("$client" create "$socket" 1.5)
 [ "$uid" = $((first + 3)) ] || fail "uid $uid after a restart, want $((first + 3))"
@@ -263,6 +291,30 @@ for round in $(seq "$rounds"); do
   done
   out=$("$client" delete "$socket" "$lease" 2>&1) || true
   [ "$out" = existed ] || fail "round $round: delete: $out"
+done
+
+step "the boot reset keeps a session the server holds, and deletes every other leftover user"
+# What session-login leaves (it is not run here: it restarts userspace): the intent
+# record, auto-login and kcpassword, for lease 2.1. Lease 2.2's user is left over too.
+"$client" create "$socket" 2.1 >/dev/null
+"$client" create "$socket" 2.2 >/dev/null
+sudo -n sh -c "echo 2.1 > '$intent'"
+sudo -n defaults write "$loginwindow" autoLoginUser -string kbf-lease-2-1
+sudo -n sh -c "echo x > '$kcpassword'"
+restart_helper 2.1
+[ "$reset_out" = "kept 2.1 deleted 2.2" ] || fail "boot reset with 2.1 held: $reset_out"
+id kbf-lease-2-1 >/dev/null || fail "the held session's user was deleted"
+if id kbf-lease-2-2 2>/dev/null; then fail "the leftover user kbf-lease-2-2 survived the reset"; fi
+[ "$(sudo -n defaults read "$loginwindow" autoLoginUser)" = kbf-lease-2-1 ] || fail "auto-login was not kept"
+sudo -n test -e "$kcpassword" || fail "kcpassword was not kept"
+expect_refused "holds the GUI session" "$client" delete "$socket" 2.1
+# Booted again and the server no longer holds 2.1: everything goes.
+restart_helper
+[ "$reset_out" = "kept none deleted 2.1" ] || fail "boot reset with nothing held: $reset_out"
+if id kbf-lease-2-1 2>/dev/null; then fail "kbf-lease-2-1 survived the reset"; fi
+if sudo -n defaults read "$loginwindow" autoLoginUser 2>/dev/null; then fail "auto-login survived the reset"; fi
+for gone in "$kcpassword" "$intent"; do
+  if sudo -n test -e "$gone"; then fail "$gone survived the reset"; fi
 done
 
 echo

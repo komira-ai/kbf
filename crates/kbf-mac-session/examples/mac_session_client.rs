@@ -7,6 +7,7 @@
 //! mac_session_client run <socket> <lease> <dir> <argv>...   prints "exit <code>" or "signal <n>"
 //! mac_session_client kill <socket> <lease>
 //! mac_session_client delete <socket> <lease>           prints "existed" or "absent"
+//! mac_session_client reset <socket> [held lease]...     prints "kept <lease|none> deleted <leases>"
 //! mac_session_client grant <seed> <serial> <lease> <issued>   prints a grant token
 //! mac_session_client pubkey <seed>                     prints the grant key file line
 //! mac_session_client connect-then-exec <socket> <program> <args>...
@@ -97,6 +98,12 @@ mod macos {
                     (_, Some(signal)) => println!("signal {signal}"),
                     _ => println!("unknown"),
                 }
+            }
+            ["reset", socket, held @ ..] => {
+                let held: Vec<String> = held.iter().map(|&a| a.to_owned()).collect();
+                let (kept, deleted) = Client::new(socket).boot_reset(&held)?;
+                let kept = kept.as_deref().unwrap_or("none");
+                println!("kept {kept} deleted {}", deleted.join(","));
             }
             ["kill", socket, lease] => {
                 let stream = match inherited() {
