@@ -475,3 +475,41 @@ fn mib(value: &str) -> Option<u64> {
     }
     n.parse::<u64>().ok()?.checked_mul(mul).map(|n| n / div)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Catches a `<...>` placeholder missed when another `<` comes first (an XML-ish
+    /// comment, `<B>`, `<x1>`), and a `<` with no `>` read as one.
+    #[test]
+    fn angle_placeholders_are_lower_case_words_in_brackets() {
+        assert_eq!(
+            angle_placeholder("a <B> <x1> < y> <kbf uid> <z>"),
+            Some("<kbf uid>")
+        );
+        assert_eq!(angle_placeholder("a < b"), None);
+        assert_eq!(angle_placeholder("<>"), None);
+    }
+
+    /// Catches a size read in the wrong unit (a slice minimum given in bytes or KiB
+    /// compared as MiB), and a malformed size read as some number instead of refused.
+    #[test]
+    fn sizes_are_read_in_mib() {
+        let cases = [
+            ("512M", Some(512)),
+            ("2G", Some(2048)),
+            ("1T", Some(1_048_576)),
+            ("2048K", Some(2)),
+            ("1048576", Some(1)),
+            ("", None),
+            ("G", None),
+            ("1.5G", None),
+            ("-1G", None),
+            ("99999999999999999999T", None),
+        ];
+        for (value, want) in cases {
+            assert_eq!(mib(value), want, "{value:?}");
+        }
+    }
+}

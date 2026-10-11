@@ -431,6 +431,13 @@ fn rows() -> Vec<Row> {
             "FAIL server: kbf-server needs --reapi-tls-cert and --reapi-tls-key",
         ),
         row(
+            "server-plain-reapi-cert",
+            Server,
+            "    --reapi-tls-cert=@KBF_ETC@/reapi.pem \\\n",
+            "",
+            "FAIL server: kbf-server needs --reapi-tls-cert and --reapi-tls-key",
+        ),
+        row(
             "server-store-memory",
             Server,
             "--store=s3",
@@ -532,7 +539,7 @@ fn each_planted_defect_turns_its_rule_red() {
         }
     }
     assert_eq!(wrong, Vec::<String>::new());
-    assert_eq!(rows.len(), 43, "rows");
+    assert_eq!(rows.len(), 44, "rows");
 }
 
 #[test]
@@ -872,4 +879,15 @@ fn walk(dir: &std::path::Path) -> Vec<String> {
         }
     }
     out
+}
+
+#[test]
+fn an_unset_key_takes_the_default_config_example_shows() {
+    // Catches: a default that differs from what config.example documents (a host
+    // configured by leaving keys out would get other units than the example says), and
+    // an unset key read as empty rather than defaulted.
+    let host = "KBF_HOST_NAME=storage-node.example.internal\nKBF_LISTEN_ADDRESS=192.0.2.10\n\
+                KBF_NODE_ID=storage-node-1\nKBF_RAM_GIB=256\n";
+    let minimal = LinuxConfig::parse(host).expect("the four host values are enough");
+    assert_eq!(minimal, config(&[]));
 }
