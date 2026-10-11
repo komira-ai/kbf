@@ -317,5 +317,37 @@ for gone in "$kcpassword" "$intent"; do
   if sudo -n test -e "$gone"; then fail "$gone survived the reset"; fi
 done
 
+step "run in the GUI session: refused until the lease user's gui domain exists"
+"$client" create "$socket" 3.1 >/dev/null
+expect_refused "does not hold the GUI session" "$client" session-ready "$socket" 3.1
+# What session-login leaves for the lease (it is not run here: it restarts userspace).
+sudo -n sh -c "echo 3.1 > '$intent'"
+[ "$("$client" session-ready "$socket" 3.1)" = false ] || fail "a user never logged in has a GUI session"
+expect_refused "does not exist" "$client" run-gui "$socket" 3.1 "$lease_dir" /usr/bin/true
+sudo -n rm -f "$intent"
+"$client" kill "$socket" 3.1
+[ "$("$client" delete "$socket" 3.1)" = existed ] || fail "delete of lease 3.1"
+
+step "a process started in a GUI session runs in it: the runner's own (no session switch)"
+# No lease user has a GUI session here (that takes a session switch, which restarts
+# userspace), so spawn::spawn runs for the runner's own uid, from launchd's system
+# context (bsexec 1), where a background process stays and a GUI one must leave.
+me=$(id -u) my_gid=$(id -g) my_name=$(id -un)
+launchctl print "gui/$me" >/dev/null 2>&1 || fail "the runner has no gui/$me domain"
+gui_dir=$(mktemp -d "$tmp/gui.XXXXXX")
+chmod 0755 "$gui_dir"
+real_dir=$(cd "$gui_dir" && pwd -P)
+probe='launchctl managername; id -u; id -G; pwd; echo "$HOME"'
+spawn_in() {
+  sudo -n launchctl bsexec 1 "$client" spawn "$1" "$me" "$my_gid" "$my_name" "$gui_dir" /bin/sh -c "$probe"
+}
+control=$(spawn_in background) || fail "the background spawn failed: $control"
+echo "background: $(echo "$control" | tr '\n' ' ')"
+[ "$(echo "$control" | sed -n 1p)" = System ] || fail "the control did not run in the system context: $control"
+gui=$(spawn_in gui) || fail "the GUI spawn failed: $gui"
+echo "gui: $(echo "$gui" | tr '\n' ' ')"
+want=$(printf '%s\n' Aqua "$me" "$my_gid" "$real_dir" "/Users/$my_name" "exit 0")
+[ "$gui" = "$want" ] || fail "the GUI spawn: got [$gui], want [$want]"
+
 echo
 echo "kbf-mac-session: every check passed"

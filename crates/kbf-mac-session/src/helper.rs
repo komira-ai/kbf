@@ -11,6 +11,10 @@
 //!   and a grant is single-use) and makes an administrator only with a valid grant.
 //! - `run`, `kill-uid` and `user-delete` act only on a lease the ledger holds; `run`
 //!   and `kill-uid` refuse a deleted one (its uid may belong to a newer lease).
+//! - `run` in the GUI session, and `session-ready`, act only for the lease the session
+//!   switch's intent record names (the one `session-login` logged in); `run` there is
+//!   refused until launchd has the user's `gui/<uid>` domain, which exists once the
+//!   login has completed. `session-ready` answers whether it does.
 //! - `kill-uid` kills, removes the user's crontab and `at` jobs, and kills again, so
 //!   no scheduled job of the user starts after it returns.
 //! - `user-delete` refuses while any process of the uid remains, first removes what
@@ -40,7 +44,7 @@ use crate::autologin::{CommandOutput, SessionPaths, read_intent};
 use crate::grant::{self, Expect, GrantKeys};
 use crate::lease::{UidRange, parse_lease, user_name};
 use crate::ledger::{Entry, Ledger};
-use crate::proto::{Reply, Request};
+use crate::proto::{Reply, Request, Session};
 use crate::spawn::{self, Spawn};
 use crate::sweep::{SweepPlan, sweep};
 
@@ -55,6 +59,10 @@ pub const KILL_ROUNDS: usize = 10;
 /// [`Host::pause`] apart, before it refuses: about five seconds on macOS, for a job
 /// that started after `kill-uid` to exit.
 pub const EXIT_LOOKS: usize = 50;
+
+/// The refusal of a second `boot-reset` since the helper started: a daemon that
+/// restarted on its own (the helper did not) finds the reset done.
+pub const RESET_ALREADY: &str = "the boot reset ran already; it runs once per start";
 
 /// How many processes a refusal names; it counts the rest.
 const NAMED: usize = 8;
@@ -84,6 +92,11 @@ pub trait Host: Send + Sync {
     /// # Errors
     /// The record could not be deleted.
     fn delete_user(&self, name: &str) -> io::Result<bool>;
+    /// Whether launchd has `domain` (`launchctl print <domain>` succeeds).
+    ///
+    /// # Errors
+    /// launchd could not be asked.
+    fn domain_exists(&self, domain: &str) -> io::Result<bool>;
     /// `launchctl bootout <domain>`. A domain that does not exist is an error the
     /// caller expects and ignores.
     ///
@@ -213,9 +226,14 @@ impl Helper {
             return refused("the boot reset has not run since the helper started".to_owned());
         }
         let result = match request {
-            Request::Run { lease, argv, env } => {
+            Request::Run {
+                lease,
+                argv,
+                env,
+                session,
+            } => {
                 return self
-                    .run(&lease, argv, env, fds)
+                    .run_in(&lease, argv, env, fds, session)
                     .map_or_else(refused, Outcome::Running);
             }
             _ if !fds.is_empty() => Err("only run takes descriptors".to_owned()),
@@ -230,6 +248,9 @@ impl Helper {
                 self.session_login(&lease).map(|()| Reply::Restarting)
             }
             Request::SessionIdle => self.session_idle().map(|()| Reply::Restarting),
+            Request::SessionReady { lease } => self
+                .session_ready(&lease)
+                .map(|ready| Reply::SessionReady { ready }),
             Request::BootReset { held } => self.boot_reset(&held).map(|reset| Reply::Reset {
                 kept: reset.kept.map(|lease| lease.to_string()),
                 deleted: reset.deleted.iter().map(ToString::to_string).collect(),
@@ -325,8 +346,9 @@ impl Helper {
         }
     }
 
-    /// `run <lease> <fd-passed argv>`: starts the process as the lease's user. The
-    /// descriptors are stdin, stdout, stderr and the lease directory.
+    /// `run <lease> <fd-passed argv>`: starts the process as the lease's user, outside
+    /// any login session. The descriptors are stdin, stdout, stderr and the lease
+    /// directory.
     ///
     /// # Errors
     /// Why it was refused, or why the process did not start.
@@ -336,6 +358,22 @@ impl Helper {
         argv: Vec<String>,
         env: Vec<(String, String)>,
         fds: Vec<OwnedFd>,
+    ) -> Result<Child, String> {
+        self.run_in(lease, argv, env, fds, Session::Background)
+    }
+
+    /// [`Self::run`] in `session`. In the GUI session, refused unless the intent record
+    /// names the lease and its `gui/<uid>` domain exists.
+    ///
+    /// # Errors
+    /// Why it was refused, or why the process did not start.
+    pub fn run_in(
+        &self,
+        lease: &str,
+        argv: Vec<String>,
+        env: Vec<(String, String)>,
+        fds: Vec<OwnedFd>,
+        session: Session,
     ) -> Result<Child, String> {
         let lease = parse_lease(lease)?;
         spawn::check(&argv, &env)?;
@@ -347,6 +385,11 @@ impl Helper {
         })?;
         let ledger = self.lock();
         let uid = self.live_uid(&ledger, lease)?;
+        if session == Session::Gui && !self.gui_up(lease, uid)? {
+            return Err(format!(
+                "gui/{uid} does not exist: the login of lease {lease}'s user has not completed"
+            ));
+        }
         let user = user_name(lease);
         let program = argv[0].clone();
         let child = spawn::spawn(Spawn {
@@ -360,11 +403,39 @@ impl Helper {
             stdout,
             stderr,
             cwd,
+            session,
         })
         .map_err(|why| format!("starting {program}: {why}"))?;
         drop(ledger);
-        tracing::info!(lease = %lease, uid, pid = child.id(), "started {program}");
+        tracing::info!(lease = %lease, uid, pid = child.id(), ?session, "started {program}");
         Ok(child)
+    }
+
+    /// `session-ready <lease>`: whether the GUI session `session-login` started for the
+    /// lease is up, its `gui/<uid>` domain there.
+    ///
+    /// # Errors
+    /// The lease has no live user, the intent record names another lease (or none) or
+    /// cannot be read, or launchd could not be asked.
+    pub fn session_ready(&self, lease: &str) -> Result<bool, String> {
+        let lease = parse_lease(lease)?;
+        let ledger = self.lock();
+        let uid = self.live_uid(&ledger, lease)?;
+        self.gui_up(lease, uid)
+    }
+
+    /// Whether `lease`, whose user has `uid`, holds the GUI session and its domain is
+    /// up; refused when the intent record does not name it.
+    fn gui_up(&self, lease: LeaseId, uid: u32) -> Result<bool, String> {
+        if read_intent(&self.settings.session.intent)? != Some(lease) {
+            return Err(format!(
+                "lease {lease} does not hold the GUI session; session-login first"
+            ));
+        }
+        let domain = format!("gui/{uid}");
+        self.host
+            .domain_exists(&domain)
+            .map_err(|why| format!("asking launchd for {domain}: {why}"))
     }
 
     /// `kill-uid <lease>`: boots out the uid's GUI and user launchd domains (so
