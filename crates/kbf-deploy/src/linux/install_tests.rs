@@ -6,8 +6,8 @@ use std::rc::Rc;
 
 use super::*;
 use crate::linux::host::SWAPON;
-use crate::testkit::{ScratchHost, reply};
-use crate::user::{GETENT, ID};
+use kbf_host::testkit::{ScratchHost, reply};
+use kbf_host::user::{GETENT, ID};
 
 const EXAMPLE: &str = include_str!("../../templates/linux/config.example");
 const STAMP: &str = "1700000000";

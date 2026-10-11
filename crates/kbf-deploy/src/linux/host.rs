@@ -8,15 +8,15 @@ use std::fmt;
 use std::io::{self, Write};
 use std::process::Output;
 
-use crate::exec::{Entry, Exec, Meta, succeeded};
 use crate::linux::check::Failure;
 use crate::linux::config::LinuxError;
-use crate::path::{HostPath, PathError};
-use crate::plan::{DeployError, Planner};
-use crate::step::{Cmd, Perms, Step, UrlError};
 use crate::template::TemplateError;
 use crate::unit::UnitError;
-use crate::user::{self, RunUser, UserError};
+use kbf_host::exec::{Entry, Exec, Meta, succeeded};
+use kbf_host::path::{HostPath, PathError};
+use kbf_host::plan::Planner;
+use kbf_host::step::{Cmd, Perms, Step, UrlError};
+use kbf_host::user::{self, RunUser, UserError};
 
 use super::check::CheckError;
 
@@ -50,7 +50,7 @@ pub enum HostError {
     #[error(transparent)]
     Unit(#[from] UnitError),
     #[error(transparent)]
-    Deploy(#[from] DeployError),
+    Deploy(#[from] kbf_host::HostError),
     #[error("cannot read {path}: {source}")]
     Inspect { path: HostPath, source: io::Error },
     #[error("{cmd}: {source}")]

@@ -4,8 +4,8 @@ use std::rc::Rc;
 
 use super::*;
 use crate::linux::config::image;
-use crate::testkit::{FakeExec, reply};
-use crate::user::GETENT;
+use kbf_host::testkit::{FakeExec, reply};
+use kbf_host::user::GETENT;
 
 const A: &str = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const B: &str = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";

@@ -4,7 +4,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::rc::Rc;
 
 use super::*;
-use crate::testkit::{FakeExec, reply};
+use kbf_host::testkit::{FakeExec, reply};
 
 fn argv(args: &[&str]) -> Vec<OsString> {
     std::iter::once("kbf-deploy")
@@ -299,7 +299,7 @@ fn the_linux_host_verbs_exit_0_done_1_failed_2_refused() {
     exec.fail_at = Some(0);
     exec.entries.insert(
         HostPath::new("/swapfile").expect("path"),
-        crate::exec::Entry::Other,
+        kbf_host::exec::Entry::Other,
     );
     let args = [base("swap"), vec!["--remove", "--apply"]].concat();
     let (code, _, err) = cli(&mut exec, &no_env, &args);
@@ -390,7 +390,7 @@ fn a_linux_verb_runs_through_the_same_command_line() {
 /// tests' instantiation of the `linux` arm, the one the coverage ratchet counts.
 #[test]
 fn render_units_then_check_units_exit_0_and_a_broken_unit_exits_1() {
-    let dir = crate::testkit::scratch("cli-render");
+    let dir = kbf_host::testkit::scratch("cli-render");
     let units = dir.join("units");
     let units = units.to_str().expect("utf-8");
     let mut exec = FakeExec::new(501);

@@ -25,10 +25,10 @@ use kbf_types::ImageRef;
 
 use super::config::LinuxConfig;
 use super::host::{self, HostError, PODMAN, note, tool};
-use crate::exec::Exec;
-use crate::plan::{Mode, Plan, Planner, RunAs, execute};
-use crate::step::{Cmd, Step};
-use crate::user::RunUser;
+use kbf_host::exec::Exec;
+use kbf_host::plan::{Mode, Plan, Planner, RunAs, execute};
+use kbf_host::step::{Cmd, Step};
+use kbf_host::user::RunUser;
 
 /// The farm's build platform.
 pub const PLATFORM: &str = "linux/amd64";

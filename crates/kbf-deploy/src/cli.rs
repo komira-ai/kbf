@@ -38,12 +38,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use clap::{Args, Parser, Subcommand};
 use kbf_types::ImageRef;
 
-use crate::exec::{Exec, HostExec};
 use crate::linux::{self, HostError, LinuxConfig, images, install, swap};
 use crate::minio::{self, Admin, K8sName, KbfName, MinioError, buckets, nodeport};
-use crate::path::{HostPath, Root};
-use crate::plan::{DeployError, Mode, RunAs, execute};
-use crate::step::HttpUrl;
+use kbf_host::exec::{Exec, HostExec};
+use kbf_host::path::{HostPath, Root};
+use kbf_host::plan::{Mode, RunAs, execute};
+use kbf_host::step::HttpUrl;
 
 #[derive(Parser)]
 #[command(
@@ -367,7 +367,7 @@ fn linux_kit<E: Exec>(
 fn host_verb(done: Result<(), HostError>, err: &mut dyn Write) -> ExitCode {
     match done {
         Ok(()) => ExitCode::SUCCESS,
-        Err(e @ HostError::Deploy(DeployError::Step { .. })) => {
+        Err(e @ HostError::Deploy(kbf_host::HostError::Step { .. })) => {
             let _ = writeln!(err, "kbf-deploy: {e}");
             ExitCode::FAILURE
         }

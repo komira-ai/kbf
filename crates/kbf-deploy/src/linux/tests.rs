@@ -805,7 +805,7 @@ fn the_verbs_write_into_the_directory_and_read_it_back() {
     // Catches: render-units writing somewhere other than --out (or not making the
     // drop-in directory), check-units reading other files than render-units wrote,
     // and a missing file or garbled unit checked as if it were empty.
-    let dir = crate::testkit::scratch("linux_verbs");
+    let dir = kbf_host::testkit::scratch("linux_verbs");
     let cfg = dir.join("config.local");
     std::fs::write(&cfg, EXAMPLE).expect("write config");
     let out = dir.join("units");

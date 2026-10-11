@@ -7,8 +7,8 @@ use std::rc::Rc;
 
 use super::*;
 use crate::linux::host::SYSTEMCTL;
-use crate::step::Step;
-use crate::testkit::{ScratchHost, reply};
+use kbf_host::step::Step;
+use kbf_host::testkit::{ScratchHost, reply};
 
 const EXAMPLE: &str = include_str!("../../templates/linux/config.example");
 const FILE: &str = "/srv/swap/kbf.swap";

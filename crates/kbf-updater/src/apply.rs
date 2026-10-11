@@ -6,19 +6,28 @@
 //! changed artifacts are already staged and hashed. An applier must be idempotent: after
 //! a crash mid-apply the updater calls it again with the same set.
 //!
-//! [`AptSnapshot`] runs its commands through a [`Runner`]. The binary gives it
-//! [`SystemRunner`]; the tests give it a runner that only records the commands, so no
-//! test changes a package on any machine. What it does on a node:
+//! [`AptSnapshot`] changes the node only through `kbf-host`, the host-change path it
+//! shares with `kbf-deploy`: it builds a `kbf_host::Plan` and applies it with
+//! `kbf_host::execute` as [`RunAs::Root`], so the plan is refused unless the updater
+//! runs as root from a binary only root can replace, and each step is logged as
+//! `+ <step>` (to stderr on a node) before it runs. The binary gives it
+//! `kbf_host::HostExec` on `/`; the tests give it `kbf_host::testkit::FakeExec`, which
+//! only records, so no test changes a package on any machine. What the plan holds:
 //!
-//! 1. with a snapshot pinned: `apt-get --snapshot <id> update`, then
-//!    `apt-get --snapshot <id> --yes full-upgrade`, then
-//!    `apt-get --snapshot <id> --yes install <kernel>` (apt checks every package against
-//!    the archive's signature; the set chooses only which snapshot);
-//! 2. every staged artifact is copied beside its installed path in the bin directory,
-//!    synced, made executable and renamed over it, so a crash leaves the old binary or
-//!    the new;
-//! 3. the step needs a reboot exactly when `/run/reboot-required` exists afterwards, and
-//!    the reboot is `systemctl reboot`.
+//! 1. with a snapshot pinned: `/usr/bin/apt-get --snapshot <id> update`, then
+//!    `... --yes full-upgrade`, then `... --yes install <kernel>` (apt checks every
+//!    package against the archive's signature; the set chooses only which snapshot).
+//!    Each runs with only `DEBIAN_FRONTEND=noninteractive` (apt never waits for a
+//!    terminal) and `PATH` (dpkg refuses to run without one) in its environment;
+//! 2. every staged artifact, as a file in the bin directory with mode 0755 owned by
+//!    root (uid and gid 0), written beside the installed one, synced and renamed over
+//!    it, so a crash leaves the old binary or the new. An installed file that already
+//!    holds the staged bytes with that mode and owner is left alone, so a resumed apply
+//!    rewrites nothing already in place; one with the right bytes that another user
+//!    owns is replaced.
+//!
+//! The step needs a reboot exactly when `/run/reboot-required` exists afterwards, and
+//! the reboot is a one-step plan, `/usr/bin/systemctl reboot`.
 //!
 //! **Not done yet: restarting what it replaced.** Nothing restarts `kbf-daemon` (or the
 //! updater) after its binary is renamed over. Until a reboot, the old daemon keeps
@@ -28,11 +37,12 @@
 //! daemon is locked out of the updater until it is restarted. The restart (with the
 //! daemon's drain) is left for the change that adds the systemd units.
 
+use std::fmt::Display;
 use std::fs;
-use std::io::Write as _;
-use std::os::unix::fs::PermissionsExt as _;
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::io::{self, Write};
+use std::path::Path;
+
+use kbf_host::{Cmd, Exec, HostPath, Mode, Owner, Perms, Plan, Planner, RunAs, execute};
 
 use crate::set::SoftwareSet;
 
@@ -99,261 +109,123 @@ impl Applier for FakeApplier {
     }
 }
 
-/// Runs one command to completion.
-pub trait Runner {
-    /// Runs `argv` and waits for it.
-    ///
-    /// # Errors
-    /// It could not start, or it exited unsuccessfully.
-    fn run(&mut self, argv: &[String]) -> Result<(), String>;
+/// apt, by absolute path: the environment it runs with names no `PATH` to search.
+pub const APT_GET: &str = "/usr/bin/apt-get";
+/// systemd's control tool, which starts the reboot.
+pub const SYSTEMCTL: &str = "/usr/bin/systemctl";
+/// The file whose presence means the node needs a reboot.
+pub const REBOOT_REQUIRED: &str = "/run/reboot-required";
+/// The `PATH` apt runs with: dpkg refuses to run without one, and its maintainer scripts
+/// find their tools through it.
+pub const APT_PATH: &str = "/usr/sbin:/usr/bin:/sbin:/bin";
+/// The mode of an installed binary.
+const BINARY: Perms = Perms::new(0o755);
+/// Who owns an installed binary: root, user and group. Root alone may replace what root
+/// runs, and the trust check refuses an updater binary anyone else owns.
+const ROOT: Owner = Owner { uid: 0, gid: 0 };
+
+/// One of the fixed absolute paths above as a [`HostPath`].
+fn fixed(path: &'static str) -> HostPath {
+    HostPath::new(path).expect("a fixed path is absolute and plain")
 }
 
-/// Runs commands on this machine, with `DEBIAN_FRONTEND=noninteractive` so apt never
-/// waits for a terminal.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct SystemRunner;
-
-impl Runner for SystemRunner {
-    fn run(&mut self, argv: &[String]) -> Result<(), String> {
-        let (program, args) = argv.split_first().ok_or("empty command")?;
-        let status = Command::new(program)
-            .args(args)
-            .env("DEBIAN_FRONTEND", "noninteractive")
-            .status()
-            .map_err(|e| format!("{program}: {e}"))?;
-        if status.success() {
-            Ok(())
-        } else {
-            Err(format!("{}: {status}", argv.join(" ")))
-        }
-    }
+/// The message of an install or reboot error.
+fn failed(e: impl Display) -> String {
+    e.to_string()
 }
 
 /// The pinned-package applier for Linux (section 8.1).
 #[derive(Clone, Debug)]
-pub struct AptSnapshot<R> {
-    /// Runs apt and the reboot.
-    pub runner: R,
+pub struct AptSnapshot<E, W = io::Stderr> {
+    /// The host the plans change: `kbf_host::HostExec` on `/`, or a fake in tests.
+    pub exec: E,
     /// Where kbf's binaries are installed, one file per artifact name.
-    pub bin_dir: PathBuf,
-    /// The file whose presence means the node needs a reboot (`/run/reboot-required`).
-    pub reboot_required: PathBuf,
+    pub bin_dir: HostPath,
+    /// Where each applied step is logged as `+ <step>`: stderr, so the journal, on a node.
+    pub log: W,
 }
 
-impl<R> AptSnapshot<R> {
-    /// The applier a node uses: kbf binaries in `bin_dir`, reboots signalled by
-    /// `/run/reboot-required`.
-    pub fn new(runner: R, bin_dir: PathBuf) -> Self {
+impl<E: Exec> AptSnapshot<E> {
+    /// The applier a node uses: kbf binaries in `bin_dir`, changed through `exec`.
+    pub fn new(exec: E, bin_dir: HostPath) -> Self {
         AptSnapshot {
-            runner,
+            exec,
             bin_dir,
-            reboot_required: PathBuf::from("/run/reboot-required"),
+            log: io::stderr(),
         }
     }
 }
 
-/// Copies `from` to `to` through a synced temporary file beside `to`, mode 0755.
-fn replace_file(from: &Path, to: &Path) -> std::io::Result<()> {
-    let tmp = to.with_extension("kbf-new");
-    let mut out = fs::File::create(&tmp)?;
-    out.write_all(&fs::read(from)?)?;
-    out.set_permissions(fs::Permissions::from_mode(0o755))?;
-    out.sync_all()?;
-    fs::rename(&tmp, to)
-}
-
-impl<R: Runner> Applier for AptSnapshot<R> {
-    fn install(&mut self, set: &SoftwareSet, staged: &Path) -> Result<Installed, String> {
+impl<E: Exec, W: Write> AptSnapshot<E, W> {
+    /// The plan that installs `set` from `staged` (items 1 and 2 of the module docs).
+    ///
+    /// # Errors
+    /// A staged artifact cannot be read, or the host cannot say what is installed.
+    fn plan(&self, set: &SoftwareSet, staged: &Path) -> Result<Plan, String> {
+        let mut planner = Planner::new(&self.exec);
         if let Some(pin) = &set.snapshot {
-            let apt = |args: &[&str]| -> Vec<String> {
-                ["apt-get", "--snapshot", pin.snapshot.as_str()]
-                    .iter()
-                    .chain(args)
-                    .map(|s| (*s).to_owned())
-                    .collect()
-            };
-            self.runner.run(&apt(&["update"]))?;
-            self.runner.run(&apt(&["--yes", "full-upgrade"]))?;
-            self.runner
-                .run(&apt(&["--yes", "install", pin.kernel.as_str()]))?;
-        }
-        for name in set.artifacts.keys() {
-            let from = staged.join(name);
-            if from.exists() {
-                replace_file(&from, &self.bin_dir.join(name))
-                    .map_err(|e| format!("install {name}: {e}"))?;
+            let steps: [&[&str]; 3] = [
+                &["update"],
+                &["--yes", "full-upgrade"],
+                &["--yes", "install", pin.kernel.as_str()],
+            ];
+            for args in steps {
+                let cmd = Cmd::new(fixed(APT_GET))
+                    .arg("--snapshot")
+                    .arg(pin.snapshot.as_str());
+                let cmd = args.iter().fold(cmd, |cmd, a| cmd.arg(*a));
+                planner.run(
+                    cmd.env("DEBIAN_FRONTEND", "noninteractive")
+                        .env("PATH", APT_PATH),
+                );
             }
         }
+        for name in set.artifacts.keys() {
+            let bytes = match fs::read(staged.join(name)) {
+                Ok(bytes) => bytes,
+                // Not staged: the set does not change it.
+                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(format!("install {name}: {e}")),
+            };
+            let path = HostPath::new(&format!("{}/{name}", self.bin_dir)).map_err(failed)?;
+            planner
+                .file(path, BINARY, Some(ROOT), bytes)
+                .map_err(failed)?;
+        }
+        Ok(planner.finish())
+    }
+
+    /// Applies `plan` as root, logging each step to `log`.
+    fn carry_out(&mut self, plan: &Plan) -> Result<(), String> {
+        execute(
+            plan,
+            RunAs::Root,
+            Mode::Apply,
+            &mut self.exec,
+            &mut self.log,
+        )
+        .map_err(failed)
+    }
+}
+
+impl<E: Exec, W: Write> Applier for AptSnapshot<E, W> {
+    fn install(&mut self, set: &SoftwareSet, staged: &Path) -> Result<Installed, String> {
+        let plan = self.plan(set, staged)?;
+        self.carry_out(&plan)?;
+        let flag = self.exec.inspect(&fixed(REBOOT_REQUIRED)).map_err(failed)?;
         Ok(Installed {
-            reboot: self.reboot_required.exists(),
+            reboot: flag.is_some(),
         })
     }
 
     fn reboot(&mut self) -> Result<(), String> {
-        self.runner
-            .run(&["systemctl".to_owned(), "reboot".to_owned()])
+        let mut planner = Planner::new(&self.exec);
+        planner.run(Cmd::new(fixed(SYSTEMCTL)).arg("reboot"));
+        let plan = planner.finish();
+        self.carry_out(&plan)
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::set::AptPin;
-    use crate::testkit;
-
-    /// Records commands; fails the one whose first argument after the snapshot matches.
-    #[derive(Default)]
-    struct Recorder {
-        ran: Vec<String>,
-        fail_on: Option<&'static str>,
-    }
-
-    impl Runner for Recorder {
-        fn run(&mut self, argv: &[String]) -> Result<(), String> {
-            let line = argv.join(" ");
-            self.ran.push(line.clone());
-            match self.fail_on {
-                Some(word) if line.contains(word) => Err(format!("{line}: failed")),
-                _ => Ok(()),
-            }
-        }
-    }
-
-    fn apt(name: &str) -> (AptSnapshot<Recorder>, PathBuf, PathBuf) {
-        let dir = testkit::scratch(name);
-        let (bin, staged) = (dir.join("bin"), dir.join("staged"));
-        fs::create_dir_all(&bin).unwrap();
-        fs::create_dir_all(&staged).unwrap();
-        let mut a = AptSnapshot::new(Recorder::default(), bin.clone());
-        assert_eq!(a.reboot_required, Path::new("/run/reboot-required"));
-        a.reboot_required = dir.join("reboot-required");
-        (a, bin, staged)
-    }
-
-    fn snapshot_set() -> SoftwareSet {
-        let mut s = testkit::set(5);
-        s.snapshot = Some(AptPin {
-            snapshot: "20261001T000000Z".into(),
-            kernel: "linux-image-6.8".into(),
-        });
-        s
-    }
-
-    /// Catches: apt run without the pinned snapshot (the node drifts to whatever the
-    /// archive serves today), the kernel package not installed, or the commands out of
-    /// order. Nothing here runs apt: the runner only records.
-    #[test]
-    fn a_snapshot_set_runs_apt_pinned_to_its_snapshot() {
-        let (mut a, _, staged) = apt("apt-plan");
-        assert_eq!(
-            a.install(&snapshot_set(), &staged),
-            Ok(Installed { reboot: false })
-        );
-        assert_eq!(
-            a.runner.ran,
-            [
-                "apt-get --snapshot 20261001T000000Z update",
-                "apt-get --snapshot 20261001T000000Z --yes full-upgrade",
-                "apt-get --snapshot 20261001T000000Z --yes install linux-image-6.8",
-            ]
-        );
-        a.runner.ran.clear();
-        assert_eq!(
-            a.install(&testkit::set(5), &staged),
-            Ok(Installed { reboot: false })
-        );
-        assert!(
-            a.runner.ran.is_empty(),
-            "no snapshot, no apt: {:?}",
-            a.runner.ran
-        );
-    }
-
-    /// Catches: a failed apt step ignored and the next one run (or the set recorded as
-    /// installed by the updater).
-    #[test]
-    fn a_failed_apt_step_stops_the_install() {
-        for (word, ran) in [("update", 1), ("full-upgrade", 2), ("install", 3)] {
-            let (mut a, _, staged) = apt(&format!("apt-fail-{word}"));
-            a.runner.fail_on = Some(word);
-            assert!(a.install(&snapshot_set(), &staged).is_err(), "{word}");
-            assert_eq!(a.runner.ran.len(), ran, "{word}: {:?}", a.runner.ran);
-        }
-    }
-
-    /// Catches: a staged binary not installed, installed without the executable bit, an
-    /// unstaged (unchanged) artifact touched, or a reboot asked for when none is needed
-    /// (and none asked for when one is).
-    #[test]
-    fn staged_artifacts_replace_the_installed_binaries() {
-        let (mut a, bin, staged) = apt("apt-bins");
-        fs::write(staged.join("kbf-daemon"), b"new daemon").unwrap();
-        fs::write(bin.join("kbf-updater"), b"old updater").unwrap();
-        assert_eq!(
-            a.install(&testkit::set(5), &staged),
-            Ok(Installed { reboot: false })
-        );
-        assert_eq!(fs::read(bin.join("kbf-daemon")).unwrap(), b"new daemon");
-        let mode = fs::metadata(bin.join("kbf-daemon"))
-            .unwrap()
-            .permissions()
-            .mode();
-        assert_eq!(mode & 0o777, 0o755);
-        assert_eq!(fs::read(bin.join("kbf-updater")).unwrap(), b"old updater");
-        fs::write(&a.reboot_required, b"").unwrap();
-        assert_eq!(
-            a.install(&testkit::set(5), &staged),
-            Ok(Installed { reboot: true })
-        );
-        assert_eq!(a.reboot(), Ok(()));
-        assert_eq!(a.runner.ran, ["systemctl reboot"]);
-        fs::remove_dir_all(&bin).unwrap();
-        let err = a.install(&testkit::set(5), &staged).unwrap_err();
-        assert!(err.starts_with("install kbf-daemon:"), "{err}");
-    }
-
-    /// Catches: the system runner reporting a failed or missing command as success.
-    /// It runs only `true` and `false`, never apt.
-    #[test]
-    fn the_system_runner_reports_exit_status() {
-        let argv = |a: &[&str]| a.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
-        assert_eq!(SystemRunner.run(&argv(&["true"])), Ok(()));
-        assert!(
-            SystemRunner
-                .run(&argv(&["false"]))
-                .unwrap_err()
-                .starts_with("false: ")
-        );
-        assert!(
-            SystemRunner
-                .run(&argv(&["/nonexistent/kbf-no-such-command"]))
-                .is_err()
-        );
-        assert_eq!(SystemRunner.run(&[]), Err("empty command".into()));
-    }
-
-    /// Catches: the fake installing while told to fail, or losing the staged names.
-    #[test]
-    fn the_fake_records_installs_and_reboots() {
-        let dir = testkit::scratch("fake");
-        fs::write(dir.join("b"), b"").unwrap();
-        fs::write(dir.join("a"), b"").unwrap();
-        let mut f = FakeApplier {
-            needs_reboot: true,
-            ..FakeApplier::default()
-        };
-        assert_eq!(
-            f.install(&testkit::set(5), &dir),
-            Ok(Installed { reboot: true })
-        );
-        assert_eq!(f.installs, [(5, vec!["a".to_owned(), "b".to_owned()])]);
-        assert_eq!(f.reboot(), Ok(()));
-        assert_eq!(f.reboots, 1);
-        assert!(f.install(&testkit::set(5), &dir.join("missing")).is_err());
-        f.fail_install = true;
-        assert_eq!(
-            f.install(&testkit::set(5), &dir),
-            Err("planned failure".into())
-        );
-    }
-}
+#[path = "apply_tests.rs"]
+mod tests;
