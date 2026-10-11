@@ -97,8 +97,10 @@ kbf-caps = { path = "crates/kbf-caps" }
 kbf-daemon = { path = "crates/kbf-daemon" }
 kbf-driver-container = { path = "crates/kbf-driver-container" }
 kbf-driver-native = { path = "crates/kbf-driver-native" }
+kbf-driver-vm = { path = "crates/kbf-driver-vm" }
 kbf-estimator = { path = "crates/kbf-estimator" }
 kbf-front = { path = "crates/kbf-front" }
+kbf-guest = { path = "crates/kbf-guest" }
 kbf-log = { path = "crates/kbf-log" }
 kbf-mac-session = { path = "crates/kbf-mac-session" }
 kbf-mdm = { path = "crates/kbf-mdm" }

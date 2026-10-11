@@ -1226,6 +1226,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "kbf-driver-vm"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "kbf-daemon",
+ "kbf-driver-native",
+ "kbf-guest",
+ "kbf-outputs",
+ "kbf-proto",
+ "kbf-types",
+ "prost",
+ "prost-types",
+ "rustix",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "kbf-estimator"
 version = "0.1.0"
 

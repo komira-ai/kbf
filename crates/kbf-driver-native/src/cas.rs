@@ -12,7 +12,7 @@ use kbf_proto::reapi::Digest;
 /// [`Cas::put_chunks`] one chunk at a time, each read on the blocking pool when the
 /// upload asks for it, so no file is held whole.
 #[derive(Debug)]
-pub(crate) struct CasStore<C>(pub(crate) Arc<C>);
+pub struct CasStore<C>(pub Arc<C>);
 
 impl<C: Cas> Store for CasStore<C> {
     async fn put(&self, bytes: Vec<u8>) -> Result<Digest, StoreError> {

@@ -6,8 +6,10 @@ how a golden image gets past Setup Assistant with a logged-in test user and the
 no window server, what network a guest gets, how an image is named when every Mac
 may have to build its own, which uid runs the VM, how the VM helper is signed, and
 which probes on a real Mac must answer the open questions before code relies on
-them. **Everything in it is planned.** No VM code exists on `main`: there is no
-`kbf-driver-vm`, `kbf-vmm` or `kbf-guest` crate.
+them. **Everything in it is planned** unless it names code on `main`. What exists:
+the guest agent (`crates/kbf-guest`) and the VM driver over a hypervisor-less fake
+host (`crates/kbf-driver-vm`, [macos-vms.md](macos-vms.md#6-the-vm-driver-one-vm-per-lease-never-reused));
+`kbf-vmm` and a host on Virtualization.framework do not.
 
 Claims about Apple's software are marked **[V]** (read in the source linked) or
 **[A]** (an assumption, or a fact nobody has checked on our hardware), as in
@@ -146,6 +148,17 @@ The lean puts the action's execution root on the **read-write** share:
   stdout and stderr limits below and marking the stream as cut. A third share for
   them is not needed. After the run, the host side collects the declared outputs
   with `kbf-outputs`, which follows no symlinks, exactly as for a bare-metal lease.
+
+**What `main` does instead** (`kbf-guest`, `kbf-driver-vm`): the read-only inputs share
+holds the execution root, as `root/` with the working directory below it, and the
+per-boot token (`kbf-guest.token`); the read-write outputs share holds the command's
+stdout and stderr (`kbf-guest` writes them there, not over the socket) and its declared
+outputs, each output's parent made by the driver before boot. The driver stops the VM,
+then collects the outputs, stdout and stderr from the host side of the outputs share
+with `kbf-outputs`. So an action writes its outputs into the outputs share, not next to
+its inputs, and how it names that share inside the guest is open: `kbf-guest`'s `Run`
+carries no path for it. Moving the execution root onto the read-write share, the lean
+above, would close that and is not done.
 
 A shared directory is read-only to the guest when the host makes it so
 (`VZSharedDirectory`'s `readOnly`,
