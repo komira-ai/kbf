@@ -376,10 +376,18 @@ async fn the_swap_kill_ends_even_when_cgroup_kill_fails() {
             [ $i -eq 2 ] && echo 1048576 > "$CG/memory.swap.current"; sleep 0.01
         done
         sleep 0.2; chmod u+w "$CG"; exec sleep 30"#;
+    let started = Instant::now();
     let outcome = fake.run(1, &Spec::new(&image(), "unused"), script).await;
     assert!(
         matches!(outcome, Err(RuntimeError::OutOfMemory { limit, .. }) if limit == CAP),
         "{outcome:?}"
+    );
+    // The kill waits out the 1 s grace, not the action's 30 s: a kill that waits for
+    // `podman start` without a bound returns only once the action has ended.
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "{:?}",
+        started.elapsed()
     );
     assert!(
         !fake
