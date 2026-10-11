@@ -79,20 +79,34 @@ fn drop_and_exec(args: &[OsString]) -> Result<std::convert::Infallible, (u8, Str
             .ok_or_else(|| refused(format!("{text:?} is not a non-root id")))
     };
     let (uid, gid) = (id(uid)?, id(gid)?);
+    drop_to(uid, gid).map_err(refused)?;
+    let error = Command::new(program).args(rest).exec();
+    Err((
+        127,
+        format!("executing {}: {error}", program.to_string_lossy()),
+    ))
+}
+
+/// Drops this process to `uid`:`gid` with no supplementary groups, and checks that
+/// the real and effective ids are the new ones.
+///
+/// # Errors
+/// A step failed (each does for anyone but root), or the ids are not the new ones.
+fn drop_to(uid: u32, gid: u32) -> Result<(), String> {
     // SAFETY: setgroups with a count of 0 reads no list.
     if unsafe { libc::setgroups(0, std::ptr::null()) } != 0 {
         let why = io::Error::last_os_error();
-        return Err(refused(format!("dropping the supplementary groups: {why}")));
+        return Err(format!("dropping the supplementary groups: {why}"));
     }
     // SAFETY: setgid and setuid take plain ids.
     if unsafe { libc::setgid(gid) } != 0 {
         let why = io::Error::last_os_error();
-        return Err(refused(format!("setgid {gid}: {why}")));
+        return Err(format!("setgid {gid}: {why}"));
     }
     // SAFETY: as above.
     if unsafe { libc::setuid(uid) } != 0 {
         let why = io::Error::last_os_error();
-        return Err(refused(format!("setuid {uid}: {why}")));
+        return Err(format!("setuid {uid}: {why}"));
     }
     // SAFETY: these read the process's own ids.
     let now = unsafe {
@@ -104,15 +118,9 @@ fn drop_and_exec(args: &[OsString]) -> Result<std::convert::Infallible, (u8, Str
         )
     };
     if now != (uid, uid, gid, gid) {
-        return Err(refused(format!(
-            "the ids are {now:?} after the drop to {uid}:{gid}"
-        )));
+        return Err(format!("the ids are {now:?} after the drop to {uid}:{gid}"));
     }
-    let error = Command::new(program).args(rest).exec();
-    Err((
-        127,
-        format!("executing {}: {error}", program.to_string_lossy()),
-    ))
+    Ok(())
 }
 
 #[cfg(test)]
@@ -142,10 +150,13 @@ mod tests {
             !rustix::process::geteuid().is_root(),
             "run this test as a user"
         );
-        let error = drop_and_exec(&args(&["501", "20", "--", "/usr/bin/true"]))
-            .expect_err("dropped without root");
-        assert_eq!(error.0, 126);
-        assert!(error.1.contains("supplementary groups"), "{}", error.1);
+        // The drop itself, not through drop_and_exec: a drop that succeeded would
+        // replace this test process with the program, and the test would end without a
+        // verdict (as it did with the drop of the groups taken out).
+        let me = rustix::process::getuid().as_raw();
+        let my_gid = rustix::process::getgid().as_raw();
+        let error = drop_to(me, my_gid).expect_err("the groups were dropped without root");
+        assert!(error.contains("supplementary groups"), "{error}");
     }
 
     /// Catches a launch that does not go through `launchctl asuser` for the lease's

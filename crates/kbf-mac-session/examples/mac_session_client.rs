@@ -18,6 +18,7 @@
 //! mac_session_client exec-probe                        prints audit tokens across an exec
 //! mac_session_client spawn <gui|background> <uid> <gid> <user> <dir> <argv>...
 //!                                                       prints "exit <code>"
+//! mac_session_client groups                             prints this process's groups
 //! ```
 //!
 //! `spawn` starts `<argv>` as `kbf-mac-session`'s `run` does (`spawn::spawn`), with
@@ -163,6 +164,17 @@ mod macos {
                 }
             }
             ["exec-probe"] => exec_probe().map_err(ClientError::Io)?,
+            ["groups"] => {
+                // The kernel's list (getgroups(2) without _DARWIN_UNLIMITED_GETGROUPS),
+                // which setgroups changes; `id -G` asks the directory instead.
+                let mut groups = [0 as libc::gid_t; 64];
+                // SAFETY: `groups` has room for 64 ids, the count passed.
+                let n = unsafe { libc::getgroups(64, groups.as_mut_ptr()) };
+                let n = usize::try_from(n)
+                    .map_err(|_| ClientError::Io(std::io::Error::last_os_error()))?;
+                let named: Vec<String> = groups[..n].iter().map(ToString::to_string).collect();
+                println!("{}", named.join(" "));
+            }
             ["spawn", session, uid, gid, user, dir, argv @ ..] => {
                 let session = match *session {
                     "gui" => Session::Gui,

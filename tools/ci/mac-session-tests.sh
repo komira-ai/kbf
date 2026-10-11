@@ -332,10 +332,10 @@ step "a process started in a GUI session runs in it: the runner's own (no sessio
 # No lease user has a GUI session here (that takes a session switch, which restarts
 # userspace), so spawn::spawn runs for the runner's own uid, from a root LaunchDaemon in
 # the system domain, as the helper runs on a node: the control, a background run, stays
-# in the system's session (System), and the GUI run must land in Aqua. Its groups are
-# checked by access, not by `id -G`, which lists the user's directory memberships
-# whatever the process holds: a file only wheel may read stays unreadable (root's
-# groups, wheel among them, were dropped).
+# in the system's session (System), and the GUI run must land in Aqua, as the runner's
+# uid and primary group, unable to read a file only wheel may read. (`id -G` is no
+# check of the groups: it lists the user's directory memberships whatever the process
+# holds; the next step reads the kernel's list.)
 # Not from a shell of this job (it is already in the runner's Aqua session, run
 # 38154872299), and not under `launchctl bsexec 1` (the nested `launchctl asuser`
 # refuses with "Reentrancy avoided", run 38148803625). The control's System is what
@@ -386,6 +386,19 @@ gui=$(spawn_in gui)
 echo "gui: $(echo "$gui" | tr '\n' ' ')"
 want=$(printf '%s\n' "manager: Aqua" "$me" "$my_gid" "wheel: no" "$real_dir" "/Users/$my_name" "exit 0")
 [ "$gui" = "$want" ] || fail "the GUI spawn: got [$gui], want [$want]"
+
+step "a GUI run holds no group but its own: root's are dropped before the exec"
+# Under sudo, root holds its whole group list (initgroups); the GUI run's process must
+# hold the lease user's primary group alone (the kernel's list, getgroups).
+root_groups=$(sudo -n "$client" groups)
+echo "root under sudo: $root_groups"
+[ "$(echo "$root_groups" | wc -w)" -gt 1 ] || fail "root holds one group here, so the check below cannot fail"
+held=$(sudo -n "$client" spawn gui "$me" "$my_gid" "$my_name" "$gui_dir" "$client" groups)
+echo "gui: $(echo "$held" | tr '\n' ' ')"
+# Its own primary group, or none at all, as the kernel keeps an empty list.
+first=$(echo "$held" | sed -n 1p)
+{ [ "$first" = "$my_gid" ] || [ -z "$first" ]; } && [ "$(echo "$held" | sed -n '$p')" = "exit 0" ] \
+  || fail "the GUI run kept groups: [$held]"
 
 echo
 echo "kbf-mac-session: every check passed"
