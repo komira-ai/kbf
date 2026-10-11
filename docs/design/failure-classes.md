@@ -354,9 +354,9 @@ These need no guessing, only keeping the reason the daemon already writes:
   exit 137 and whenever Podman recorded no exit (section 6.1).
 - **Control faults**: fence (`ABORTED`), contact lost (`UNAVAILABLE`), lease kind not
   served, the named Xcode absent, outputs not stored (`farm.rs:539-542`). Farm.
-- **Request errors**: no arguments, image by tag, output path in the input root
-  (today's `Invalid`); an output or stdout over the size limit; a blob the client never
-  uploaded.
+- **Request errors**: no arguments, image by tag, an output's parent that would be made
+  through an input symlink or file (today's `Invalid`); an output or stdout over the
+  size limit; a blob the client never uploaded.
 - **Missing blob at the worker.** The front already checked the inputs, so a blob the
   worker cannot find is either lost by the CAS or a fetch error. The server checks the
   CAS:
