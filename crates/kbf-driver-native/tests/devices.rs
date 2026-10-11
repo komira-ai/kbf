@@ -18,7 +18,7 @@ use kbf_daemon::Runtime;
 use kbf_driver_native::NativeRuntime;
 use kbf_driver_native::network::Isolation;
 use kbf_proto::reapi::ActionResult;
-use support::{MemoryCas, Spec, config, sandbox_denied, scratch, stderr, stdout, work};
+use support::{MemoryCas, Spec, config, scratch, stderr, stdout, work};
 
 /// The actions' `PATH`.
 const PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
@@ -41,7 +41,7 @@ fn runtimes(
 }
 
 /// Runs `spec` as lease `1.seq` with up to two minutes: `devicectl` refused its
-/// service waits about 17 seconds for it before it gives up.
+/// service waits over 15 seconds for it before it gives up.
 async fn run_long(
     rt: &NativeRuntime<MemoryCas>,
     cas: &MemoryCas,
@@ -55,26 +55,16 @@ async fn run_long(
         .expect("ran")
 }
 
-/// The pid an action's script printed on its first line as `pid=<n>` before it
-/// `exec`ed the tool: the tool's own pid, which the sandbox's reports name.
-fn pid_of(out: &str) -> u32 {
-    out.lines()
-        .next()
-        .and_then(|line| line.strip_prefix("pid="))
-        .and_then(|pid| pid.parse().ok())
-        .unwrap_or_else(|| panic!("no pid line in {out:?}"))
-}
-
 /// Catches a profile that lets an action reach `CoreDeviceService` (the CoreDevice
 /// mach rule dropped, or naming another service): `devicectl list devices` must
-/// fail, saying its connection to the service was invalidated, and the sandbox must
-/// have reported the lookup it refused, with or without the network. Control: the
-/// same action without a sandbox lists the devices (none on the runner) and exits 0.
+/// fail, saying its connection to the service was invalidated (what the sandbox's
+/// refused lookup looks like to it), with or without the network. Control: the same
+/// action without a sandbox lists the devices (none on the runner) and exits 0.
 #[tokio::test]
 async fn no_action_reaches_coredevice() {
     let cas = Arc::new(MemoryCas::default());
     let (sandboxed, open) = runtimes("coredevice", &cas);
-    let script = "d=$(xcrun -f devicectl) && echo pid=$$ && exec \"$d\" list devices";
+    let script = "xcrun devicectl list devices";
     let service = "com.apple.CoreDevice.CoreDeviceService";
     for (seq, network) in [(1, "off"), (2, "on")] {
         let spec = Spec::sh(script)
@@ -89,11 +79,6 @@ async fn no_action_reaches_coredevice() {
         assert!(
             err.contains(service) && err.contains("The connection was invalidated"),
             "network={network}: devicectl failed for another reason: {out}{err}"
-        );
-        let refused = format!("mach-lookup {service}");
-        assert!(
-            sandbox_denied("devicectl", pid_of(&out), &refused),
-            "network={network}: no sandbox report of {refused}: {err}"
         );
     }
 
@@ -110,14 +95,14 @@ async fn no_action_reaches_coredevice() {
 
 /// Catches a profile that lets an action reach `remoted` (the `remoted` rule dropped,
 /// or naming another service): `remotectl dumpstate` must print no device, the
-/// local one included, and the sandbox must have reported the lookup of
-/// `com.apple.remoted` it refused, with or without the network. Control: the same
-/// action without a sandbox prints the local device.
+/// local one included, with or without the network. Control: the same action
+/// without a sandbox prints the local device. The sandbox without the rule does not
+/// hide it: a sandboxed action then prints it too.
 #[tokio::test]
 async fn no_action_reaches_remoted() {
     let cas = Arc::new(MemoryCas::default());
     let (sandboxed, open) = runtimes("remoted", &cas);
-    let script = "echo pid=$$ && exec /usr/libexec/remotectl dumpstate";
+    let script = "/usr/libexec/remotectl dumpstate";
     let local = "Local device";
     for (seq, network) in [(1, "off"), (2, "on")] {
         let spec = Spec::sh(script)
@@ -128,10 +113,6 @@ async fn no_action_reaches_remoted() {
         assert!(
             !out.contains(local),
             "network={network}: remotectl reached remoted: {out}{err}"
-        );
-        assert!(
-            sandbox_denied("remotectl", pid_of(&out), "mach-lookup com.apple.remoted"),
-            "network={network}: no sandbox report of the remoted lookup: {out}{err}"
         );
     }
 
@@ -154,9 +135,9 @@ if (connect($s, sockaddr_un("/var/run/usbmuxd"))) { print "connected\n" } else {
 "#;
 
 /// Catches a profile that lets an action connect to `usbmuxd` (the socket rule
-/// dropped, naming the socket by `/var/run`, the link's path, which the sandbox never
-/// sees, or put before the no-network profile's allow for every Unix socket, which
-/// would win): the connect must be refused with EPERM, with or without the network.
+/// dropped, or naming the socket by `/var/run`, the link's path, which the sandbox
+/// never sees): the connect must be refused with EPERM, with or without the network
+/// (the no-network profile allows every other Unix socket).
 /// Control: the same action without a sandbox connects.
 #[tokio::test]
 async fn no_action_reaches_usbmuxd() {

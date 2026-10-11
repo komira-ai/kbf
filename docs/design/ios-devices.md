@@ -262,9 +262,7 @@ CoreDevice (below). The action runs `xcodebuild` inside it.
 services (`(allow default)`) and the no-network one every Unix socket, so without a
 rule any concurrent action on the node, device lease or not, could run `xcrun
 devicectl` and install, launch or reboot apps on a device booked for another lease.
-So every profile ends with `NO_DEVICE_RULES` (`crates/kbf-driver-native/src/network.rs`),
-after the network's rules, which it would otherwise lose to (in a profile the later
-rule wins):
+So every profile ends with `NO_DEVICE_RULES` (`crates/kbf-driver-native/src/network.rs`):
 
 - no `mach-lookup` of a name starting `com.apple.CoreDevice.`: `CoreDeviceService`
   (the XPC service `devicectl` asks for everything; refused, `devicectl` waits over 15
