@@ -74,7 +74,7 @@ case "$NAME" in
                 echo "created: $img"
                 ;;
             attach)
-                mnt= ro=
+                mnt='' ro=''
                 while [ $# -gt 1 ]; do
                     if [ "$1" = -mountpoint ]; then mnt=$2; fi
                     if [ "$1" = -readonly ]; then ro=" read-only,"; fi
