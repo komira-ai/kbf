@@ -91,3 +91,68 @@ fn mode_strings_show_every_bit() {
         assert_eq!(mode_string(kind, mode), want, "{mode:o}");
     }
 }
+
+/// Catches: a program run in another directory than asked, or without the variables
+/// `apply` adds (`DEVELOPER_DIR` for `xcodebuild`), or with the caller's environment.
+#[test]
+fn run_in_sets_the_directory_and_adds_only_the_variables_given() {
+    let dir = scratch("run-in");
+    fs::create_dir_all(dir.join("work")).unwrap();
+    let host = RealHost::new("/");
+    let at = format!("{}/work", dir.display());
+    let pwd = host.run_in("/bin/pwd", &[], Some(&at), &[]).unwrap();
+    assert_eq!(pwd.stdout, format!("{at}\n"));
+    let env = host
+        .run_in("/usr/bin/env", &[], None, &[("DEVELOPER_DIR", "/x")])
+        .unwrap();
+    assert_eq!(env.stdout, "DEVELOPER_DIR=/x\nLC_ALL=C\n");
+}
+
+/// Catches: a write that follows a link (so `restart` empties the file a planted link
+/// names), that replaces a file's owner and mode when it truncates it, or that creates
+/// a file with another mode.
+#[test]
+fn write_creates_with_its_mode_truncates_in_place_and_refuses_links() {
+    let dir = scratch("write");
+    let host = RealHost::new(dir.to_str().unwrap());
+    host.write("/new", b"abc", 0o600).unwrap();
+    assert_eq!(fs::read(dir.join("new")).unwrap(), b"abc");
+    assert_eq!(host.lstat("/new").unwrap().mode, 0o600);
+    host.chmod("/new", 0o640).unwrap();
+    host.write("/new", b"", 0o600).unwrap();
+    assert_eq!(fs::read(dir.join("new")).unwrap(), b"");
+    assert_eq!(host.lstat("/new").unwrap().mode, 0o640);
+    fs::write(dir.join("target"), "keep").unwrap();
+    std::os::unix::fs::symlink(dir.join("target"), dir.join("link")).unwrap();
+    assert!(host.write("/link", b"", 0o600).is_err());
+    assert_eq!(fs::read_to_string(dir.join("target")).unwrap(), "keep");
+}
+
+/// Catches: `chown` changing what a link names instead of the link, `rename` not
+/// replacing its target, `mkdir` not making the directories above, and `remove`
+/// following a link, failing on nothing, or leaving a directory's contents.
+#[test]
+fn mkdir_chown_rename_and_remove_act_on_the_path_itself() {
+    let dir = scratch("change");
+    let host = RealHost::new(dir.to_str().unwrap());
+    host.mkdir("/a/b/c").unwrap();
+    assert!(dir.join("a/b/c").is_dir());
+    let (uid, gid) = (host.lstat("/a").unwrap().uid, host.lstat("/a").unwrap().gid);
+    fs::write(dir.join("a/file"), "x").unwrap();
+    std::os::unix::fs::symlink(dir.join("a/file"), dir.join("a/link")).unwrap();
+    host.chown("/a/link", uid, gid).unwrap();
+    assert!(host.chown("/missing", uid, gid).is_err());
+    fs::write(dir.join("a/other"), "y").unwrap();
+    host.rename("/a/other", "/a/file").unwrap();
+    assert_eq!(fs::read_to_string(dir.join("a/file")).unwrap(), "y");
+    host.remove("/a/link").unwrap();
+    assert_eq!(fs::read_to_string(dir.join("a/file")).unwrap(), "y");
+    host.remove("/a/file").unwrap();
+    host.remove("/a/missing").unwrap();
+    host.remove("/a").unwrap();
+    assert!(!dir.join("a").exists());
+    // A path through a file is an error, not nothing.
+    fs::write(dir.join("f"), "").unwrap();
+    assert!(host.remove("/f/x").is_err());
+    host.pause(0);
+}
