@@ -1,0 +1,11 @@
+name: planted
+on: workflow_dispatch
+permissions: {}
+jobs:
+  p:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Planted
+        run: |
+          echo a
+          echo b

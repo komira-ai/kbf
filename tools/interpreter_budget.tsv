@@ -15,11 +15,11 @@
 193	crates/kbf-it/m1/run.sh	M1 cell harness; to become kbf-cell m1
 219	crates/kbf-it/m2/run.sh	M2 cell harness; to become kbf-cell m2
 25	crates/kbf-node/tests/fixtures/podman-stub.sh	Podman stub for the kbf-node tests; to become a Rust test binary
-72	tools/ci/check-build-commit.sh	CI step; to become a cargo xtask verb
+71	tools/ci/check-build-commit.sh	CI step; to become a cargo xtask verb
 45	tools/ci/check-darwin-asset.sh	CI step; to become a cargo xtask verb
 126	tools/ci/darwin-entitlements.sh	CI step; to become a cargo xtask verb
 100	tools/ci/guest-tests.sh	CI tests run as root; to become Rust tests run as root
-28	tools/ci/m2-container.sh	CI step; to become a cargo xtask verb
+29	tools/ci/m2-container.sh	CI step; to become a cargo xtask verb
 321	tools/ci/mac-session-tests.sh	CI tests run as root; to become Rust tests run as root
 52	tools/ci/package-asset.sh	CI step; to become a cargo xtask verb
 22	tools/ci/podman-tests-inner.sh	CI step; to become a cargo xtask verb
@@ -66,6 +66,7 @@
 # Workflow and composite-action `run:` steps with shell logic. Key:
 # <file>#<job>/<step name>, or `step <n>` (1-based) for a step with no name.
 # Count: the script's lines.
+9	tools/gone.sh	planted stale row
 [workflow]
 6	.github/workflows/artifacts.yml#darwin-arm64/Install cargo-cyclonedx (pinned version and checksum)	pinned tool download checked by SHA-256; to become one cargo xtask command
 1	.github/workflows/artifacts.yml#darwin-arm64/step 5	runner host facts; to become one command
