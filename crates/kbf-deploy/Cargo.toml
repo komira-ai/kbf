@@ -7,12 +7,19 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
-# The core of the deploy tool: a plan of steps, printed by default and carried out with
-# `--apply`, through an `Exec` that is the host or a recording fake. The kits (envoy,
-# linux, minio, mdm, pilot, mac) are subcommands built on it; none exists yet.
+# The deploy tool: a plan of steps, printed by default and carried out with `--apply`,
+# through an `Exec` that is the host or a recording fake. Each kit is a subcommand built
+# on it; `minio` (buckets and their key, a NodePort for the S3 port) is the first.
+
+[[bin]]
+name = "kbf-deploy"
+path = "src/main.rs"
 
 [dependencies]
+clap.workspace = true
 rustix = { workspace = true, features = ["process"] }
+serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 
 [lints]

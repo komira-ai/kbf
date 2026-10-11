@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use crate::exec::{Entry, Exec};
 use crate::path::HostPath;
-use crate::step::{Cmd, HttpUrl, Owner, Perms, Step};
+use crate::step::{Cmd, Filter, HttpUrl, Owner, Perms, Step};
 use crate::trust::Untrusted;
 
 /// The steps that bring the host to what a kit wants, in order.
@@ -97,6 +97,28 @@ impl<'a, E: Exec> Planner<'a, E> {
     /// first and calls this only when it is.
     pub fn run(&mut self, cmd: Cmd) {
         self.plan.steps.push(Step::Run(cmd));
+    }
+
+    /// Run `cmd` and write what `filter` makes of its output to `path`. Like [`run`],
+    /// the kit asks first (is a file at `path` already?) and calls this only when it
+    /// is needed.
+    ///
+    /// [`run`]: Planner::run
+    pub fn capture(
+        &mut self,
+        cmd: Cmd,
+        filter: Filter,
+        path: HostPath,
+        perms: Perms,
+        owner: Option<Owner>,
+    ) {
+        self.plan.steps.push(Step::Capture {
+            cmd,
+            filter,
+            path,
+            perms,
+            owner,
+        });
     }
 
     /// Wait for `url` to answer, for at most `deadline`.
