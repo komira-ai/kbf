@@ -216,6 +216,9 @@ pub struct Daemon {
     clock: Arc<dyn Clock>,
     /// This daemon process's `Hello.instance_id`, the same on every stream it opens.
     instance: String,
+    /// `Hello.predecessor_instance_id`: the daemon process whose runs this one's drivers
+    /// killed before it started; empty when none is known.
+    predecessor: String,
 }
 
 /// What the daemon remembers of a lease's Start until it forgets the lease.
@@ -287,7 +290,24 @@ impl Daemon {
             granted: BTreeMap::new(),
             clock: Arc::new(SystemClock),
             instance: instance_id(),
+            predecessor: String::new(),
         })
+    }
+
+    /// This daemon process's instance id (`Hello.instance_id`), drawn when it was built.
+    #[must_use]
+    pub fn instance_id(&self) -> &str {
+        &self.instance
+    }
+
+    /// Names `predecessor` in every Hello as the daemon process that ran on this node
+    /// before this one (`Hello.predecessor_instance_id`). The caller must have killed
+    /// every run that process left before this daemon runs: the server gives up that
+    /// process's leases at once on the strength of it.
+    #[must_use]
+    pub fn with_predecessor(mut self, predecessor: String) -> Self {
+        self.predecessor = predecessor;
+        self
     }
 
     /// Sends every [`Event`] to `events` as well as to the log.
@@ -813,6 +833,7 @@ impl Daemon {
             report_hash: self.report.hash().to_vec(),
             instance_id: self.instance.clone(),
             phase: wire_phase(&self.phase_now),
+            predecessor_instance_id: self.predecessor.clone(),
         }
     }
 
@@ -854,8 +875,10 @@ impl Daemon {
 
 /// A new daemon process's instance id: 128 random bits as 32 hex digits, from two
 /// hashers the standard library keys from the operating system's random source. It is
-/// never written down, so a restarted daemon, a second daemon started with the same
-/// certificate and a daemon on a cloned machine each draw their own (issue #140).
+/// drawn at every start, so a restarted daemon, a second daemon started with the same
+/// certificate and a daemon on a cloned machine each draw their own (issue #140). It is
+/// written down for its successor only: `kbf-node` keeps it in the scratch directory,
+/// and the next daemon names it as its predecessor ([`Daemon::with_predecessor`]).
 fn instance_id() -> String {
     let half = || RandomState::new().hash_one(std::process::id());
     format!("{:016x}{:016x}", half(), half())

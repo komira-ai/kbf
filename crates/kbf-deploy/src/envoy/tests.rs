@@ -359,7 +359,7 @@ fn the_edges_of_each_shape_are_accepted() {
 /// reporting success when a file could not be written or the config not read.
 #[test]
 fn render_files_writes_the_two_files_and_refuses_what_it_cannot_do() {
-    let dir = crate::testkit::scratch("envoy_render_files");
+    let dir = kbf_host::testkit::scratch("envoy_render_files");
     let config = dir.join("config.local");
     std::fs::write(&config, EXAMPLE).expect("config");
     let out = dir.join("rendered");

@@ -10,7 +10,7 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use kbf_proto::reapi::{ActionResult, Digest};
-use kbf_types::{LeaseId, LeaseKind, Resources};
+use kbf_types::{LeaseId, LeaseKind, LostWhy, Resources};
 use tokio::sync::oneshot;
 
 /// One lease's work, as the server's Start describes it.
@@ -62,6 +62,11 @@ pub enum RuntimeError {
     /// `MEMORY_KILL_NODE_PRESSURE`: the farm's to run again with the same booking.
     #[error("killed on a busy node: {0}")]
     BusyNode(String),
+    /// The farm lost the run, and its result with it: the daemon restarted while the
+    /// action ran, or the node fenced it. The string says what happened. Reported as
+    /// UNAVAILABLE with `Result.lost`: the farm's to run again, preferring another node.
+    #[error("{1}")]
+    Lost(LostWhy, String),
 }
 
 /// Runs leases. The lease manager never names a driver: it asks the runtime whether it

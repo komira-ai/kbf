@@ -598,6 +598,7 @@ pub fn hello_on(node: &str, cpus: u32, mem_gib: u32, platform: &[(&str, &str)]) 
         // One daemon process per node unless a test says otherwise.
         instance_id: format!("{node}-daemon"),
         phase: None,
+        predecessor_instance_id: String::new(),
     }
 }
 
@@ -843,6 +844,7 @@ pub fn ran(lease: Option<LeaseId>, result: &ActionResult) -> kbf_proto::worker::
         // As a daemon that predates the field sends it: the server checks no action.
         action_digest: None,
         memory_kill: 0,
+        lost: 0,
     }
 }
 
@@ -858,6 +860,7 @@ pub fn failed(lease: Option<LeaseId>, code: Code) -> kbf_proto::worker::Result {
         action_result: None,
         action_digest: None,
         memory_kill: 0,
+        lost: 0,
     }
 }
 

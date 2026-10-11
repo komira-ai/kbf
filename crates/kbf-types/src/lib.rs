@@ -35,7 +35,7 @@ pub use rollout::{
 pub use state::{Effect, StateMachine};
 pub use time::FarmTime;
 pub use work::{
-    ActionKey, Answer, ControlRecord, Failure, FencePolicy, LeaseGrant, MemoryKill, MemoryRun,
-    OperationId, Outcome, Refusal, RefusalRecord, Resources, ResultRecord, StartLease, WaiterId,
-    Waiting, WorkerId,
+    ActionKey, Answer, ControlRecord, Failure, FarmFault, FarmRun, FencePolicy, LeaseGrant,
+    LostWhy, MemoryKill, MemoryRun, OperationId, Outcome, Refusal, RefusalRecord, Resources,
+    ResultRecord, StartLease, WaiterId, Waiting, WorkerId,
 };

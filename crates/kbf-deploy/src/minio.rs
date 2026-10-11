@@ -24,10 +24,9 @@ use std::process::Output;
 use serde::de::DeserializeOwned;
 
 use crate::config::ConfigError;
-use crate::exec::{Entry, Exec, succeeded};
-use crate::path::{HostPath, PathError};
-use crate::plan::DeployError;
-use crate::step::{Cmd, HttpUrl, UrlError};
+use kbf_host::exec::{Entry, Exec, succeeded};
+use kbf_host::path::{HostPath, PathError};
+use kbf_host::step::{Cmd, HttpUrl, UrlError};
 
 pub mod buckets;
 pub mod nodeport;
@@ -165,7 +164,7 @@ pub enum MinioError {
     #[error(transparent)]
     Url(#[from] UrlError),
     #[error(transparent)]
-    Deploy(#[from] DeployError),
+    Deploy(#[from] kbf_host::HostError),
 }
 
 /// Print one line of what the plan found, before its steps.

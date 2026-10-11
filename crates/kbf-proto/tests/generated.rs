@@ -122,6 +122,7 @@ fn worker_messages_round_trip() {
                 lease_id: Some(LeaseId { term: 2, seq: 8 }),
                 reason: String::new(),
             }),
+            predecessor_instance_id: "0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e".to_owned(),
         })),
     };
     let back = DaemonMessage::decode(hello.encode_to_vec().as_slice()).expect("decode");
@@ -160,6 +161,7 @@ fn worker_messages_round_trip() {
                 size_bytes: 9,
             }),
             memory_kill: worker::MemoryKill::NodePressure as i32,
+            lost: worker::Lost::Fenced as i32,
         })),
     };
     let back = DaemonMessage::decode(result.encode_to_vec().as_slice()).expect("decode");

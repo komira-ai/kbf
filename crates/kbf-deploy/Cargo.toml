@@ -7,13 +7,11 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
-# The deploy tool: a plan of steps, printed by default and carried out with `--apply`,
-# through an `Exec` that is the host or a recording fake, and the kits built on it as
-# subcommands: `minio` (buckets and their key, a NodePort for the S3 port), `linux`
-# (render-units, check-units, and as root install-units, image-pull and swap) and
-# `envoy` (render). libc is for the switch to another user before a tool starts
-# (setgroups, setgid, setuid); sha2 hashes the rendered Envoy config into the pod
-# template.
+# The deploy tool: its kits as subcommands. A kit that changes a host does it through
+# kbf-host's plan of steps, printed by default and carried out with `--apply`. Three kits:
+# `minio` (buckets and their key, a NodePort for the S3 port), `linux` (render-units,
+# check-units, and as root install-units, image-pull and swap) and `envoy` (render).
+# sha2 hashes the rendered Envoy config into the pod template.
 
 [[bin]]
 name = "kbf-deploy"
@@ -21,13 +19,16 @@ path = "src/main.rs"
 
 [dependencies]
 clap.workspace = true
+kbf-host.workspace = true
 kbf-types.workspace = true
-libc.workspace = true
-rustix = { workspace = true, features = ["process"] }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+kbf-host = { workspace = true, features = ["testkit"] }
+rustix = { workspace = true, features = ["process"] }
 
 [lints]
 workspace = true

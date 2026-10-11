@@ -46,6 +46,7 @@ fn up(s: &mut Scheduler, now: Duration, instance: &str) {
     let event = Event::WorkerUp {
         worker: WorkerId::new("node-a"),
         instance: DaemonInstance::new(instance),
+        predecessor_stopped: false,
         capacity: Resources::new(1_000, GIB),
         caps,
     };

@@ -148,7 +148,9 @@ async fn a_lease_fenced_offline_is_reported_once_after_welcome() {
     };
     assert_eq!(result.lease_id, Some(lease(5, 1)));
     let status = result.status.as_ref().expect("a status");
-    assert_eq!(status.code, Code::Aborted as i32);
+    // Lost to the farm (fenced), so the server runs it again (issue #22).
+    assert_eq!(status.code, Code::Unavailable as i32);
+    assert_eq!(result.lost(), kbf_proto::worker::Lost::Fenced);
     assert!(status.message.contains("self-fenced"), "{}", status.message);
     assert_eq!(heartbeat.running, [lease(5, 1)]);
 }
