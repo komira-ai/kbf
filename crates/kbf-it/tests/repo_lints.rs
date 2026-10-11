@@ -9,14 +9,15 @@
 //!   names no linted action or workflow; a workflow or action file that is not valid
 //!   UTF-8 or holds a NUL byte (rules in `workflows/mod.rs`, which parses each file as
 //!   YAML; its module docs say what it cannot cover);
-//! - a text file carrying a non-documentation IPv4 address, an absolute home path or a
+//! - a text file carrying a non-documentation IPv4 address, an absolute home path, a
 //!   citation of an unpublished design document by its sections (the IETF numbers
-//!   pass), and a file holding a NUL byte whose extension is not on the binary allow
-//!   list (rules in `kbf_it::hygiene`);
+//!   pass) or a git conflict marker, and a file holding a NUL byte whose extension is
+//!   not on the binary allow list (rules in `kbf_it::hygiene`);
 //! - the darwin-arm64 job of `.github/workflows/artifacts.yml` no longer running
 //!   `tools/ci/check-darwin-asset.sh` on the packaged binary after `Package`, or
 //!   running it where its failure does not fail the job;
-//! - the scans passing vacuously because git listed nothing or the workflows moved;
+//! - the scans passing vacuously because git listed nothing, no Markdown file was
+//!   scanned or the workflows moved;
 //! - a drift in the rules that pick which files each lint reads (module `selection`).
 
 mod workflows;
@@ -173,10 +174,11 @@ fn workflows_are_hosted_pinned_and_least_privilege() {
 }
 
 #[test]
-fn text_files_carry_no_addresses_home_paths_or_design_citations() {
+fn text_files_carry_no_addresses_home_paths_design_citations_or_conflict_markers() {
     let root = repo_root();
     let files = listed_files(&root);
     let mut scanned = 0;
+    let mut markdown = 0;
     let mut problems = Vec::new();
     for f in &files {
         let Some(bytes) = read_bytes(&root.join(f)) else {
@@ -187,6 +189,7 @@ fn text_files_carry_no_addresses_home_paths_or_design_citations() {
             TextFile::Refused(e) => problems.push(e),
             TextFile::Scanned(found) => {
                 scanned += 1;
+                markdown += usize::from(f.ends_with(".md"));
                 problems.extend(found);
             }
         }
@@ -194,6 +197,10 @@ fn text_files_carry_no_addresses_home_paths_or_design_citations() {
     assert!(
         scanned >= 20 && files.iter().any(|f| f == "Cargo.toml"),
         "only {scanned} text files scanned; git listed too little"
+    );
+    assert!(
+        markdown >= 5,
+        "only {markdown} Markdown files scanned; the docs escape the scan"
     );
     assert!(
         problems.is_empty(),
@@ -509,6 +516,73 @@ mod selection {
                  document; cite a doc under docs/ instead"
             )])
         );
+    }
+
+    /// A conflict as git writes it, its markers assembled at run time so this file does
+    /// not trip the scan.
+    fn conflict(ours: &str, theirs: &str) -> String {
+        let (o, s, t) = ("<".repeat(7), "=".repeat(7), ">".repeat(7));
+        format!("{o} HEAD\n{ours}\n{s}\n{theirs}\n{t} topic\n")
+    }
+
+    /// What the scan reports for each marker of [`conflict`] at line 2 of `f`.
+    fn conflict_findings(f: &str) -> Vec<String> {
+        [(2, "<<<<<<<"), (4, "======="), (6, ">>>>>>>")]
+            .into_iter()
+            .map(|(line, m)| {
+                format!("{f}: line {line}: git conflict marker `{m}`; finish the merge")
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_conflict_in_rust_or_markdown_is_reported_with_its_file_and_line() {
+        // Catches: a conflict left in a source file or a doc passing the repository
+        // scan (Markdown exempted for its heading underlines, or only the opening
+        // marker checked, or the separator passed as a heading in a text mid-merge),
+        // or a marker reported without its file and line.
+        for (f, ours, theirs) in [
+            ("crates/x/src/lib.rs", "let x = 1;", "let x = 2;"),
+            ("docs/design/x.md", "Title", "Heading"),
+        ] {
+            let text = format!("ok\n{}", conflict(ours, theirs));
+            assert_eq!(
+                check_text_file(f, text.as_bytes()),
+                TextFile::Scanned(conflict_findings(f)),
+                "{f}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_heading_underline_or_table_rule_is_not_a_conflict() {
+        // Catches: a Markdown setext heading or a table rule refused as a conflict
+        // marker, which would make every such doc unmergeable.
+        let s = "=".repeat(7);
+        let text = format!("Title\n{s}\n\n{s} =====\nkey   value\n{s} =====\n");
+        for f in ["docs/x.md", "README.md", "notes.txt"] {
+            assert_eq!(
+                check_text_file(f, text.as_bytes()),
+                TextFile::Scanned(vec![]),
+                "{f}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_markdown_file_is_scanned() {
+        // Catches: Markdown skipped by the text scan (no test pinned it before), so a
+        // home path in a doc reached the public repository. The path is assembled at
+        // run time so this file does not trip the scan.
+        let home = format!("/{}/alice", "home");
+        let text = format!("# Notes\n\nsee {home}/x\n");
+        for f in ["docs/design/x.md", "README.md", "docs/X.MD"] {
+            assert_eq!(
+                check_text_file(f, text.as_bytes()),
+                TextFile::Scanned(vec![format!("{f}: line 3: home path {home}")]),
+                "{f}"
+            );
+        }
     }
 
     #[test]
