@@ -126,8 +126,7 @@ pub const NO_NETWORK_PROFILE: &str = "(version 1)\n\
 /// a rule on the link's path matches nothing). `tests/devices.rs` shows each refused on
 /// the macOS runner, and reached without the sandbox. A lease that books a device is to
 /// get a profile without these (`docs/design/ios-devices.md`, section 6.1); none does yet.
-pub const NO_DEVICE_RULES: &str = "(deny mach-lookup (global-name-prefix \"com.apple.CoreDevice.\"))\n\
-(deny mach-lookup (global-name-prefix \"com.apple.remoted\"))\n\
+pub const NO_DEVICE_RULES: &str = "(deny mach-lookup (global-name-prefix \"com.apple.remoted\"))\n\
 (deny network-outbound (literal \"/private/var/run/usbmuxd\"))\n";
 
 /// What an action asked for.
