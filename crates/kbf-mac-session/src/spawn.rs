@@ -90,7 +90,13 @@ pub fn spawn(spawn: Spawn) -> io::Result<Child> {
             command.args(args).uid(spawn.uid).gid(spawn.gid);
             command
         }
-        Session::Gui => gui(spawn.uid, spawn.gid, program, args)?,
+        // MUTANT: a GUI run started as a background one, without launchctl asuser.
+        Session::Gui => {
+            let _ = gui;
+            let mut command = Command::new(program);
+            command.args(args).uid(spawn.uid).gid(spawn.gid);
+            command
+        }
     };
     command
         .env_clear()
