@@ -19,7 +19,7 @@ export FAKE_REAL_PATH
 TESTS=0
 FAILED=0
 NAME=
-FAKES="uname sw_vers xcodebuild launchctl stat csrutil pgrep id sudo automationmodetool sysadminctl sandbox-exec xcrun sqlite3"
+FAKES="uname sw_vers xcodebuild launchctl stat csrutil pgrep id sudo automationmodetool sysadminctl sandbox-exec xcrun sqlite3 hdiutil cp chown"
 
 # ---------------------------------------------------------------- harness
 
@@ -32,7 +32,7 @@ failt() {
 # fresh: a new fake Mac (state, bin, results) for the current test.
 fresh() {
     T=$WORK/$NAME
-    mkdir -p "$T/state" "$T/bin" "$T/results"
+    mkdir -p "$T/state" "$T/bin" "$T/results" "$T/shared"
     for f in $FAKES; do ln -s "$HERE/fakecmd" "$T/bin/$f"; done
     : >"$T/state/log"
     OUT=$T/out
@@ -42,7 +42,7 @@ fresh() {
 probe() {
     env -u GITHUB_STEP_SUMMARY PATH="$T/bin:$FAKE_REAL_PATH" FAKE_STATE="$T/state" \
         SPIKE_RESULTS="$T/results" SPIKE_TCC_SYSTEM_DB="$T/state/system.db" \
-        SPIKE_TCC_USER_DB="$T/state/user.db" ${PROBE_ENV-} \
+        SPIKE_TCC_USER_DB="$T/state/user.db" SPIKE_P0_PARENT="$T/shared" ${PROBE_ENV-} \
         bash "$DIR/$1.sh" >"$OUT" 2>&1
 }
 
@@ -313,6 +313,100 @@ t_tcc_control_empty() {
     verdict_is BROKEN
 }
 
+# ---------------------------------------------------------------- volume_owner
+
+# vo_cleaned: the user, the scratch directory and every attach are gone.
+vo_cleaned() {
+    want 'volume_owner.cleanup.user_gone=yes'
+    want 'volume_owner.cleanup.dir_gone=yes'
+    [ -z "$(find "$T/shared" -mindepth 1 2>/dev/null)" ] || failt "the scratch directory is left: $(ls "$T/shared")"
+}
+
+# The common case: the standard user's chown is refused, the re-attach reads its own
+# uid, the root control reads root. Catches writes that run as the runner (an admin)
+# instead of the fresh standard user, and a cleanup that leaves the user or the files.
+t_vo_fail() {
+    probe volume_owner
+    want 'volume_owner.new_user.existed_before=no'
+    want 'volume_owner.write.writer=uid=502 kind=standard groups=staff everyone localaccounts'
+    want 'volume_owner.write.chown=chown: '
+    want 'Operation not permitted [rc=1]'
+    want 'volume_owner.reattach.owner=502:20'
+    want 'volume_owner.control_reattach.owner=0:0'
+    calls 'hdiutil create -size 64m -fs APFS' 2
+    calls 'sudo -n -H -u kbfp0 hdiutil create' 1
+    calls 'sudo -n -H -u kbfp0 hdiutil attach -nobrowse -owners on -mountpoint' 1
+    calls 'sudo -n -H -u kbfp0 chown 0:0' 1
+    calls 'sudo -n hdiutil attach -nobrowse -owners on -readonly -mountpoint' 2
+    vo_cleaned
+    verdict_is FAIL
+}
+
+# A volume that stores the standard user's chown: PASS. Catches a verdict that cannot
+# say PASS (an owner compared in the wrong form).
+t_vo_pass() {
+    : >"$T/state/owners_writable"
+    probe volume_owner
+    want 'volume_owner.write.chown= [rc=0]'
+    want 'volume_owner.reattach.owner=0:0'
+    verdict_is PASS
+    vo_cleaned
+}
+
+# A chown the first attach shows but never stores: the first attach says 0:0, the
+# re-attach says 502:20, and the verdict follows the re-attach. Catches an owner read
+# from the first attach.
+t_vo_chown_lies() {
+    : >"$T/state/chown_lies"
+    probe volume_owner
+    want 'volume_owner.write.first_owner=0:0'
+    want 'volume_owner.reattach.owner=502:20'
+    verdict_is FAIL
+}
+
+# A root control that does not read back as root is BROKEN, even when the user's file
+# reads as root. Catches a verdict that ignores the control.
+t_vo_control_lost() {
+    : >"$T/state/owners_writable"
+    : >"$T/state/root_owner_lost"
+    probe volume_owner
+    want 'volume_owner.reattach.owner=0:0'
+    want 'volume_owner.control_reattach.owner=99:99'
+    verdict_is BROKEN
+}
+
+# A writer in the admin group is BROKEN. Catches a verdict that ignores the writer's
+# kind.
+t_vo_admin_writer() {
+    : >"$T/state/probe_user_admin"
+    : >"$T/state/owners_writable"
+    probe volume_owner
+    want 'volume_owner.write.writer=uid=502 kind=admin'
+    verdict_is BROKEN
+}
+
+# A probe user that existed before the probe is not fresh: BROKEN. Catches a verdict
+# that ignores the pre-existing user.
+t_vo_user_existed() {
+    : >"$T/state/user_kbfp0"
+    : >"$T/state/owners_writable"
+    probe volume_owner
+    want 'volume_owner.new_user.existed_before=yes'
+    verdict_is BROKEN
+}
+
+# An attach the standard user cannot make is a FAIL that names the step; the control
+# and the cleanup still run. Catches a verdict that ignores where the write stopped.
+t_vo_attach_fails() {
+    : >"$T/state/attach_fails"
+    probe volume_owner
+    want 'volume_owner.write.attach=hdiutil: attach failed - Device not configured [rc=1]'
+    want 'volume_owner.control_reattach.owner=0:0'
+    want "the standard user's write stopped after 'create'"
+    vo_cleaned
+    verdict_is FAIL
+}
+
 # ---------------------------------------------------------------- verdicts
 
 # verdicts.sh is red for a BROKEN or a missing verdict and green for PASS and FAIL.
@@ -340,7 +434,8 @@ t_verdicts() {
 for test in t_lib t_watchdog t_am_already t_am_required_first t_am_control_noop t_am_hang \
     t_am_unknown t_am_user_drops t_am_adduser_hang t_simctl_pass t_simctl_deny_ignored t_simctl_bad_png \
     t_simctl_allow_fails t_simctl_bootstatus_fails t_simctl_delete_fails t_simctl_create_garbage \
-    t_tcc_pass t_tcc_control_empty t_verdicts; do
+    t_tcc_pass t_tcc_control_empty t_vo_fail t_vo_pass t_vo_chown_lies t_vo_control_lost \
+    t_vo_admin_writer t_vo_user_existed t_vo_attach_fails t_verdicts; do
     t "$test"
 done
 printf '%s tests, %s failed assertions\n' "$TESTS" "$FAILED"

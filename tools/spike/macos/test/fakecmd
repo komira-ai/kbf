@@ -23,20 +23,102 @@ case "$NAME" in
         ;;
     xcodebuild) printf 'Xcode 26.0\nBuild version 17A100\n' ;;
     launchctl) [ "$1" = managername ] && echo Aqua ;;
-    stat) echo runner ;;
+    stat)
+        # stat -f %Su /dev/console: the console user. stat -f %u:%g FILE: the owner this
+        # mount shows (FILE.view, a chown a mount took but did not store), else the
+        # stored one (FILE.owner, from cp and chown).
+        if [ "$2" = %Su ]; then
+            echo runner
+        elif [ -e "$3.view" ]; then
+            cat "$3.view"
+        elif [ -e "$3.owner" ]; then
+            cat "$3.owner"
+        else
+            echo "stat: $3: stat: No such file or directory" >&2
+            exit 1
+        fi
+        ;;
+    cp)
+        "$NAME" "$@" || exit
+        if [ "${FAKE_UID:-501}" = 0 ]; then echo 0:0 >"$2.owner"; else echo "${FAKE_UID:-501}:20" >"$2.owner"; fi
+        ;;
+    chown)
+        # chown OWNER FILE. Root stores OWNER (or 99:99 when the test says the volume
+        # loses root owners). Another user gets EPERM, unless the test says the volume
+        # lets it store OWNER, or takes the chown without storing it (chown_lies).
+        if [ "${FAKE_UID:-501}" = 0 ]; then
+            if has root_owner_lost; then echo 99:99 >"$2.owner"; else echo "$1" >"$2.owner"; fi
+        elif has owners_writable; then
+            echo "$1" >"$2.owner"
+        elif has chown_lies; then
+            echo "$1" >"$2.view"
+        else
+            echo "chown: $2: Operation not permitted" >&2
+            exit 1
+        fi
+        ;;
+    hdiutil)
+        # A disk image IMG is the directory IMG.store; an attach links the mount point
+        # to it, a detach drops the link and the views a chown left (chown_lies).
+        verb=$1
+        shift
+        case "$verb" in
+            create)
+                for img; do :; done
+                if has create_fails; then
+                    echo 'hdiutil: create failed - Operation not permitted' >&2
+                    exit 1
+                fi
+                mkdir -p "$img.store"
+                : >"$img"
+                echo "created: $img"
+                ;;
+            attach)
+                mnt=
+                while [ $# -gt 1 ]; do
+                    if [ "$1" = -mountpoint ]; then mnt=$2; fi
+                    shift
+                done
+                img=$1
+                if [ "${FAKE_UID:-501}" != 0 ] && has attach_fails; then
+                    echo 'hdiutil: attach failed - Device not configured' >&2
+                    exit 1
+                fi
+                [ -d "$img.store" ] || exit 1
+                rmdir "$mnt" && ln -s "$img.store" "$mnt"
+                printf '/dev/disk4s1\t41504653-0000-11AA-AA11-00306543ECAC\t%s\n' "$mnt"
+                ;;
+            detach)
+                [ "$1" = -force ] && shift
+                [ -L "$1" ] || exit 1
+                store=$(readlink "$1")
+                rm -f "$store"/*.view "$1"
+                echo '"disk4" ejected.'
+                ;;
+        esac
+        ;;
     csrutil) echo 'System Integrity Protection status: disabled.' ;;
     pgrep) cat "$S/launchd_sim" 2>/dev/null ;;
     id)
         case "${1-}" in
             -u) echo "${FAKE_UID:-501}" ;;
-            -Gn) echo 'staff admin' ;;
+            -un) echo "${FAKE_AS:-runner}" ;;
+            -Gn)
+                # A user made by the probe is standard unless the test says otherwise.
+                if [ -n "${FAKE_AS-}" ] && ! has probe_user_admin; then echo 'staff everyone localaccounts'; else echo 'staff admin'; fi
+                ;;
             *) has "user_$1" ;;
         esac
         ;;
     sudo)
         # sudo -n [-u USER] CMD...: runs CMD as root (or USER) in the fake.
         [ "$1" = -n ] && shift
+        [ "$1" = -H ] && shift
         if [ "$1" = -u ]; then
+            has "user_$2" || {
+                echo "sudo: unknown user $2" >&2
+                exit 1
+            }
             export FAKE_UID=502 FAKE_AS="$2"
             shift 2
         else

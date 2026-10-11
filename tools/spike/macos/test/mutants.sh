@@ -80,6 +80,20 @@ mutant 'the TCC verdict ignores the control row' tcc.sh t_tcc_control_empty \
     's/^if \[ "$(st_get control)" = ok \]; then/if true; then/'
 mutant 'the TCC reader never reads as root' tcc.sh t_tcc_pass \
     's/^a_system_root() { tcc_read system.as_root "$SYSTEM_DB" sudo -n || true; }/a_system_root() { tcc_read system.as_root "$SYSTEM_DB" || true; }/'
+mutant 'the P0 verdict ignores the root control' volume_owner.sh t_vo_control_lost \
+    's/elif \[ "${control%%:\*}" != 0 \]; then/elif false; then/'
+mutant 'the P0 owner is read from the first attach, not a re-attach' volume_owner.sh t_vo_chown_lies \
+    's/owner=$(st_get reattach)/owner=$(st_get write.first)/'
+mutant 'the P0 writes run as the runner (an admin), not the fresh standard user' volume_owner.sh t_vo_fail \
+    's/^as_user() { sudo -n -H -u "$PROBE_USER" "$@"; }/as_user() { "$@"; }/'
+mutant 'the P0 verdict ignores an admin writer' volume_owner.sh t_vo_admin_writer \
+    's/elif \[ "$writer" = admin \] || \[ "$writer" = root \]; then/elif false; then/'
+mutant 'the P0 verdict ignores a probe user that existed before' volume_owner.sh t_vo_user_existed \
+    's/if \[ "$(st_get existed)" = yes \]; then/if false; then/'
+mutant 'the P0 verdict ignores where the write stopped' volume_owner.sh t_vo_attach_fails \
+    's/elif \[ "$reached" != detach \]; then/elif false; then/'
+mutant 'the P0 cleanup leaves the user' volume_owner.sh t_vo_fail \
+    's/kv cleanup.delete_user "$(run_cap watchdog "$WATCHDOG" as_root sysadminctl -deleteUser "$PROBE_USER")"/:/'
 mutant 'verdicts.sh lets a BROKEN verdict through' verdicts.sh t_verdicts \
     's/    case "$v" in BROKEN\*) bad=1 ;; esac/    :/'
 mutant 'verdicts.sh lets a missing verdict through' verdicts.sh t_verdicts \

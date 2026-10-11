@@ -49,6 +49,7 @@ which is a result.
 |---|---|---|
 | `automation_mode.sh` | status as the runner user; `enable-automationmode-without-authentication` under a 60 s watchdog, only while the status says authentication is required; a new standard user added, the status read as that user, the user deleted, the status read again | `disable-automationmode-without-authentication` must bring "requires authentication" back. It runs first when the image starts out not requiring authentication, last otherwise, so both transitions are seen |
 | `simctl.sh` (the runner's own session) | newest available iOS runtime and an iPhone device type; `simctl --set <dir>` create, boot, `bootstatus -b` (10 min watchdog), `io screenshot` (must be a PNG), shutdown, delete; then leftover `launchd_sim` processes and device-set entries | a boot under a sandbox profile that denies the lookup of `com.apple.CoreSimulator.CoreSimulatorService` must fail, and the same boot under `(allow default)` alone must succeed |
+| `volume_owner.sh` (VM probe P0 of [macos-vm-guests.md](../design/macos-vm-guests.md#11-probes-later-prs-must-run)) | a fresh standard user, added with `sysadminctl -addUser`, runs (through `sudo -n -H -u`) `hdiutil create` of a 64 MiB APFS image, `hdiutil attach -owners on`, a copy of a small plist into it, `chown 0:0` on that file (status and text recorded), a read of the owner this first attach shows, and a detach; then root re-attaches the image read-only with `-owners on` and reads the owner. The verdict follows that re-attach, not the first attach's view. The writer's uid and groups are read through the same `sudo -u` the writes use; then the user and the scratch directory are deleted | the same create, attach, copy, chown and detach as root, and the same re-attach read, must give uid 0. A writer that is admin or root, or a probe user that existed before the probe, is BROKEN too: the probe would not be asking about a fresh standard user |
 | `tcc.sh` (instrument for the Screen Recording and Accessibility questions) | SIP status; the ScreenCapture, Accessibility, ListenEvent and PostEvent rows of the system and the user TCC database, each read as the runner user and as root | the same reader over a planted database must return exactly its one known row |
 
 The status text of `automationmodetool` is parsed, case-insensitively, as two fields:
@@ -67,7 +68,11 @@ as not required; enable run whatever the last status said; a verdict that ignore
 the control arm (each probe); a watchdog that leaves stdin open; a simctl verdict
 that ignores the `(allow default)` boot, `bootstatus` or a failed delete; error text
 from create taken as a UDID; a screenshot not checked to be a PNG; a simulator
-booted in the default device set.
+booted in the default device set; for P0, a verdict that ignores the root control,
+the owner taken from the first attach instead of the re-attach, the writes run as the
+runner (an admin) instead of the fresh standard user, a verdict that ignores an admin
+writer, a pre-existing probe user or the step where the write stopped, and a cleanup
+that leaves the user.
 
 ## Results
 
