@@ -366,6 +366,11 @@ jobs:
       # check by code signature (docs/design/fleet-updates-security.md S4.2, S4.3).
       - run: cargo test -p kbf-mac-session --locked
       - run: bash tools/ci/mac-session-tests.sh
+      # The per-binary entitlement allow list (tools/ci/darwin-entitlements.txt): the
+      # kbf-vmm stub signed with the virtualization entitlement, kbf-daemon with none,
+      # and every wrong signature refused (tools/ci/sign-darwin-tests.sh;
+      # docs/design/macos-vm-guests.md section 7).
+      - run: bash tools/ci/sign-darwin-tests.sh
       # The guest agent's tests, then the agent under launchd: Aqua from a LaunchAgent
       # in this runner's GUI session, System from a LaunchDaemon (the control), and
       # its refusal to run as root (tools/ci/guest-tests.sh).
