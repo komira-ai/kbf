@@ -484,6 +484,11 @@ fn raft_dir(name: &str) -> std::path::PathBuf {
 
 /// A `--store=s3 --meta-log=raft` server over `dir` (the store does no I/O until used).
 fn raft_server(dir: &std::path::Path) -> Command {
+    raft_server_on(dir, &ANY_PORT)
+}
+
+/// [`raft_server`] with the listener flags `listen` instead of [`ANY_PORT`].
+fn raft_server_on(dir: &std::path::Path, listen: &[&str]) -> Command {
     let mut c = with_keys(server(&[
         "--store",
         "s3",
@@ -495,7 +500,7 @@ fn raft_server(dir: &std::path::Path) -> Command {
         "raft",
         "--raft-dir",
     ]));
-    c.arg(dir).args(ANY_PORT);
+    c.arg(dir).args(listen);
     c
 }
 
@@ -646,6 +651,24 @@ fn a_plain_text_listener_off_loopback_starts_and_serves_with_one_warning() {
             });
         interrupt(child);
     }
+}
+
+/// Catches: a start line under `--meta-log=raft` that drops the plain-text warning, or
+/// prints it before ` log=` instead of at the very end (the two fields came from two
+/// branches that each tested its own alone).
+#[cfg(unix)]
+#[test]
+fn a_raft_start_line_names_the_log_then_the_plain_text_warning() {
+    let listen = ["--listen", "127.0.0.1:0", "--worker-listen", "0.0.0.0:0"];
+    let c = raft_server_on(&raft_dir("raft-plain-text"), &listen);
+    let (child, line, _) = started(c);
+    let id = log_id(&line);
+    let want = format!(" log={id} warning=plaintext-off-loopback:worker");
+    assert!(
+        line.ends_with(&want),
+        "want {want:?} at the end of {line:?}"
+    );
+    interrupt(child);
 }
 
 /// Catches: the removed `--reapi-plaintext-bind` escape still accepted (silently or as
