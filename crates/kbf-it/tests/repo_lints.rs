@@ -12,12 +12,16 @@
 //! - a text file carrying a non-documentation IPv4 address or an absolute home path,
 //!   and a file holding a NUL byte whose extension is not on the binary allow list
 //!   (rules in `kbf_it::hygiene`);
+//! - a `devicectl` fixture (under `crates/kbf-driver-native/tests/fixtures/devicectl`)
+//!   carrying a real-looking UDID, ECID, serial number, CoreDevice id or device name,
+//!   or a `.json` one that does not parse (rules in `device_ids/mod.rs`);
 //! - the darwin-arm64 job of `.github/workflows/artifacts.yml` no longer running
 //!   `tools/ci/check-darwin-asset.sh` on the packaged binary after `Package`, or
 //!   running it where its failure does not fail the job;
 //! - the scans passing vacuously because git listed nothing or the workflows moved;
 //! - a drift in the rules that pick which files each lint reads (module `selection`).
 
+mod device_ids;
 mod workflows;
 
 use std::path::{Path, PathBuf};
@@ -197,6 +201,41 @@ fn text_files_carry_no_addresses_or_home_paths() {
     assert!(
         problems.is_empty(),
         "public hygiene:\n{}",
+        problems.join("\n")
+    );
+}
+
+/// The fixture directory's README: always present, so the device-id lint reads at
+/// least one file.
+const DEVICE_FIXTURE_README: &str = "crates/kbf-driver-native/tests/fixtures/devicectl/README.md";
+
+#[test]
+fn devicectl_fixtures_carry_no_device_identifiers() {
+    let root = repo_root();
+    let files = listed_files(&root);
+    let fixtures: Vec<&String> = files.iter().filter(|f| device_ids::is_fixture(f)).collect();
+    assert!(
+        fixtures.iter().any(|f| *f == DEVICE_FIXTURE_README),
+        "{DEVICE_FIXTURE_README} not listed; the device-id lint would read nothing: {fixtures:?}"
+    );
+    let mut problems = Vec::new();
+    for f in fixtures {
+        let Some(bytes) = read_bytes(&root.join(f)) else {
+            continue;
+        };
+        match kbf_it::hygiene::decode(f, &bytes) {
+            Ok(Some(text)) => problems.extend(
+                device_ids::scan(f, &text)
+                    .iter()
+                    .map(|p| format!("{f}: {p}")),
+            ),
+            Ok(None) => problems.push(format!("{f}: a binary file is not a devicectl fixture")),
+            Err(e) => problems.push(format!("{f}: {e}")),
+        }
+    }
+    assert!(
+        problems.is_empty(),
+        "devicectl fixtures:\n{}",
         problems.join("\n")
     );
 }

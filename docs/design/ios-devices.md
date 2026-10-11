@@ -420,6 +420,17 @@ unattended erase **[A]**: probe P-D7.
 
 None of these has run. Each is a later PR's evidence; the PR that needs it says so.
 
+Their fixtures go in `crates/kbf-driver-native/tests/fixtures/devicectl/`. The
+repository lint `devicectl_fixtures_carry_no_device_identifiers`
+(`crates/kbf-it/tests/repo_lints.rs`, rules in `crates/kbf-it/tests/device_ids/mod.rs`)
+reads every file there and refuses a UDID (8-16 or 40 hex digits, any case), a
+CoreDevice id (a UUID), an ECID or serial number after its label, a device name of
+the form `<owner>'s iPhone`, and, at any depth of a `.json` file, a `udid`, `ecid`,
+`serialNumber`, `deviceName` or `deviceProperties.name` value other than its
+placeholder; a `.json` file that does not parse is refused too. The placeholders
+(all-zero hex ids, ECID `0`, serial `XXXXXXXXXXXX`, name `Device Name`) are listed in
+that directory's README.
+
 | Probe | What it settles | Needs |
 |---|---|---|
 | P-D0 | `xcrun devicectl help` and `--version` text for the pinned Xcode: which verbs and JSON options exist | a Mac with Xcode, no device; can run on the hosted macOS runner |
