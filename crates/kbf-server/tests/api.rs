@@ -416,6 +416,41 @@ async fn a_node_whose_stream_ended_is_listed_as_disconnected() {
     assert!(!farm.nodes().nodes[0].connected);
 }
 
+/// Catches a farm that notes only one closed stream per registry read (a `find`-style
+/// loop in `note_closed_streams`, or one that stops after the first): two nodes whose
+/// streams both end before a single `nodes()` read must both be listed as not
+/// connected, as a farm that loses two nodes at once (a partition) would need.
+#[tokio::test]
+async fn two_nodes_whose_streams_ended_before_one_read_are_both_disconnected() {
+    let farm = Farm::new(
+        cache(),
+        kbf_sched::UNSERVABLE_WAIT,
+        kbf_sched::FINISHED_RETENTION,
+    );
+    let (_, first) = register(&farm, "linux-1");
+    let (_, second) = register(&farm, "linux-2");
+    let connected = |farm: &Farm<MemoryMetaLog, MemoryStore>| {
+        let mut nodes: Vec<(String, bool)> = farm
+            .nodes()
+            .nodes
+            .into_iter()
+            .map(|n| (n.node_id, n.connected))
+            .collect();
+        nodes.sort();
+        nodes
+    };
+    assert_eq!(
+        connected(&farm),
+        [("linux-1".to_owned(), true), ("linux-2".to_owned(), true)]
+    );
+    drop(first);
+    drop(second);
+    assert_eq!(
+        connected(&farm),
+        [("linux-1".to_owned(), false), ("linux-2".to_owned(), false)]
+    );
+}
+
 /// Catches an operator action that answers with `connected` read before the farm has
 /// noted the closed stream (`place` skipping `note_closed_streams`): the cordon's
 /// response would report a node whose stream is gone as connected. No read of the
