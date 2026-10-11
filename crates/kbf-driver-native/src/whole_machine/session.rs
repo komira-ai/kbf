@@ -404,8 +404,9 @@ mod tests {
         // The restart ends the connection before the answer.
         assert_eq!(session.session_idle(), Ok(()));
         let asked = helper.join().unwrap();
-        // No helper at all is no restart.
-        let error = session.session_login(lease).unwrap_err();
+        // No helper at all (no socket there) is no restart.
+        let absent = HelperSession::new(&dir.join("absent"), "_kbf");
+        let error = absent.session_login(lease).unwrap_err();
         assert!(error.contains("kbf-mac-session: "), "{error}");
         let lease = || "7.3".to_owned();
         assert_eq!(
