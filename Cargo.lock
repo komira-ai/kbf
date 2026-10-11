@@ -1285,6 +1285,7 @@ dependencies = [
  "kbf-front",
  "kbf-proto",
  "kbf-server",
+ "kbf-testkit",
  "proc-macro2",
  "prost",
  "rcgen",
@@ -1568,6 +1569,13 @@ version = "0.1.0"
 dependencies = [
  "kbf-raft",
  "thiserror",
+]
+
+[[package]]
+name = "kbf-testkit"
+version = "0.1.0"
+dependencies = [
+ "rustix",
 ]
 
 [[package]]

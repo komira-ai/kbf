@@ -35,6 +35,7 @@ kbf-server                0      0
 kbf-sim                   9      3
 kbf-sim-cell              8     17
 kbf-store                 0      0
+kbf-testkit               0      0
 kbf-types                 3      2
 kbf-updater               0      0
 kbf-vmm                   0      0

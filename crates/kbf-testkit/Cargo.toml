@@ -1,0 +1,25 @@
+[package]
+name = "kbf-testkit"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+# `kbf-act`, the program this crate's own tests run (see the library docs). Each
+# crate whose tests need the act verbs adds a bin like it under its own name, since
+# `CARGO_BIN_EXE_<name>` is set only for the bins of the package under test.
+[[bin]]
+name = "kbf-act"
+path = "src/bin/kbf-act.rs"
+test = false
+
+# No kbf dependency: every crate may take this one as a dev-dependency (or a
+# dependency of a test-only bin) without a cycle. rustix makes its system calls
+# directly on Linux, so `kbf-m2-act` still links statically.
+[dependencies]
+rustix = { workspace = true, features = ["process"] }
+
+[lints]
+workspace = true
