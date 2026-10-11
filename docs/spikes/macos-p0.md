@@ -144,6 +144,10 @@ local, nodev, nosuid, journaled, nobrowse, mounted by kbfp0`: no `noowners`, so
 attach showed `502:20`, and so did root's read-only re-attach. The root control
 (same steps via `sudo -n`) read back `0:0` from its re-attach, so the reader can show
 a root owner. Cleanup deleted the user and the scratch directory on every run.
+Run `38126351622` (commit `6f2e739`, which added the keep file and the mount-flag
+checks) gave the same FAIL on both labels: neither re-attach was `noowners`, and the
+keep file the user left at its uid read back `502:20`, so the re-attach shows a
+non-root owner as stored.
 `sysadminctl` printed the same FileVault warning as in the automation-mode probe.
 
 So on hosted macOS 15.7.9 and 26.6.2 a standard user cannot make a root-owned file
