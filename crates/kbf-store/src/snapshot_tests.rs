@@ -257,7 +257,9 @@ fn an_error_at_any_snapshot_operation_stops_the_store() {
 /// Catches: a snapshot at or before the current base, or at index 0, that is
 /// written (it would take back compacted state), entries at or below the base that
 /// are written (open would read them as a truncation of the hidden log), and a
-/// refusal that stops the store.
+/// refusal that stops the store; on the running store and on one reopened after
+/// the snapshot (an open that does not take the base from the snapshot file accepts
+/// both, and the log loses the entries after the base).
 #[test]
 fn a_snapshot_or_entries_not_past_the_base_are_refused() {
     let (fs, mut store) = three_segments();
@@ -266,7 +268,29 @@ fn a_snapshot_or_entries_not_past_the_base_are_refused() {
         Err(StoreError::Invalid(_))
     ));
     store.persist_snapshot(&snap(5)).unwrap();
-    for k in [4, 5] {
+    refuses_past_base_five(&mut store);
+    store.persist_entries(&[entry(10)]).unwrap();
+    drop(store);
+
+    let cut = fs.crash(0);
+    let (mut store, rec) = Store::open(cut.clone(), ONE_PER_CALL).unwrap();
+    assert_eq!(rec.snapshot, Some(snap(5)));
+    refuses_past_base_five(&mut store);
+    assert_eq!(
+        store.load().unwrap(),
+        rec,
+        "a refusal after a reopen writes nothing"
+    );
+    assert_eq!(indexes(&rec), [6, 7, 8, 9, 10]);
+    store.persist_entries(&[entry(6)]).unwrap();
+    assert_eq!(indexes(&reopen(&cut)), [6]);
+    assert_eq!(Storage::sync(&mut store).ok(), Some(()));
+}
+
+/// Asserts that a store whose snapshot base is 5 refuses snapshots at 3, 4 and 5 and
+/// entries from 5 or 2.
+fn refuses_past_base_five(store: &mut Store<FaultFs>) {
+    for k in [3, 4, 5] {
         assert!(matches!(
             store.persist_snapshot(&snap(k)),
             Err(StoreError::Invalid(_))
@@ -278,9 +302,6 @@ fn a_snapshot_or_entries_not_past_the_base_are_refused() {
             Err(StoreError::Invalid(_))
         ));
     }
-    store.persist_entries(&[entry(6)]).unwrap();
-    assert_eq!(indexes(&reopen(&fs)), [6]);
-    assert_eq!(Storage::sync(&mut store).ok(), Some(()));
 }
 
 /// A disk with a snapshot at 5 whose open has everything to clean: a covered
