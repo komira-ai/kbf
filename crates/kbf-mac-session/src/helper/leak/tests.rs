@@ -223,6 +223,45 @@ fn removals_links_and_odd_entries_are_items() {
     assert!(report.diff.added[0].contains(" 600 sha256:"), "{report:?}");
 }
 
+/// Catches: a file hashed only in part (the read loop stopping after its first 64 KiB
+/// buffer, or after any read short of the end), so that a launch daemon over 64 KiB
+/// whose tail a lease rewrote scans clean; and a hash that is not the SHA-256 of the
+/// whole file. The file spans three full reads and a short fourth; each change sits
+/// in a later read than the first.
+#[test]
+fn a_change_past_the_first_read_of_a_large_file_is_seen() {
+    use sha2::Digest as _;
+    const READ: usize = 64 * 1024;
+    let size = 3 * READ + 7;
+    let rig = furnished("leak-large");
+    let file = rig.dir.join("LaunchDaemons/big.plist");
+    std::fs::write(&file, vec![b'a'; size]).unwrap();
+    open_window(&rig);
+    rig.helper.baseline().unwrap();
+    for (n, at) in [READ, 2 * READ, size - 1].into_iter().enumerate() {
+        let mut body = vec![b'a'; size];
+        body[at] = b'b';
+        std::fs::write(&file, &body).unwrap();
+        let report = rig.helper.scan().unwrap();
+        assert!(!report.clean(), "byte {at}: {report:?}");
+        let sha = hex::encode(sha2::Sha256::digest(&body));
+        assert_eq!(report.diff.added.len(), 1, "byte {at}: {report:#?}");
+        let line = &report.diff.added[0];
+        assert!(
+            line.starts_with("launch-daemons \"big.plist\" file "),
+            "{line}"
+        );
+        assert!(
+            line.ends_with(&format!("sha256:{sha}")),
+            "byte {at}: {line}"
+        );
+        assert_eq!(report.diff.removed.len(), 1, "byte {at}: {report:#?}");
+        // Back to the baselined contents before the next change.
+        std::fs::write(&file, vec![b'a'; size]).unwrap();
+        assert!(rig.helper.scan().unwrap().clean(), "restore {n}");
+    }
+}
+
 /// Catches: an item that cannot be read taken as an empty class (a leak hidden by a
 /// failing `sfltool`, an unreadable folder or a broken directory lookup would pass),
 /// or a baseline recorded with a class missing.
