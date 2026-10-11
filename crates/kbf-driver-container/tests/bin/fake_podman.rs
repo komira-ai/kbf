@@ -18,7 +18,7 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::process::{CommandExt as _, ExitStatusExt as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, ExitStatus, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rustix::process::{Pid, Signal};
 
@@ -469,10 +469,29 @@ impl Fake {
     /// nothing, so killing it is enough. Once it leads its group, the group outlives the
     /// leader for as long as anything is in it, so the group kill after still finds the
     /// rest.
+    ///
+    /// Returns once the action has ended (gone, or a zombie its parent has not reaped),
+    /// at most five seconds after the kill, as `podman rm --force` returns once the
+    /// container has stopped. A SIGKILL takes effect only when its target next runs:
+    /// returning at once let a test that checks the action right after `rm` find it
+    /// still running on a busy machine.
     fn kill_action(&self) {
-        if let Some(pid) = self.pid() {
-            let _ = rustix::process::kill_process(pid, Signal::KILL);
-            let _ = rustix::process::kill_process_group(pid, Signal::KILL);
+        let Some(pid) = self.pid() else {
+            return;
+        };
+        let _ = rustix::process::kill_process(pid, Signal::KILL);
+        let _ = rustix::process::kill_process_group(pid, Signal::KILL);
+        let stat = format!("/proc/{}/stat", pid.as_raw_nonzero());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            let running = std::fs::read_to_string(&stat).is_ok_and(|s| {
+                s.rsplit_once(") ")
+                    .is_some_and(|(_, rest)| !rest.starts_with('Z'))
+            });
+            if !running {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(1));
         }
     }
 }
