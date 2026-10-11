@@ -684,7 +684,7 @@ impl Lease {
         }
         // Not `std::fs::remove_dir_all`: it recurses once per level, and the action
         // decides how deep its scratch directory is.
-        match Ok::<(), std::io::Error>(()) {
+        match (if self.name.is_empty() { remove_tree(&self.dir) } else { Ok(()) }) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             // Files still owned by the container's ids (a lease that ended before
