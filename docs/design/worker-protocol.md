@@ -120,11 +120,14 @@ names no DNS name, or several, is refused. A certificate taken from one node can
 therefore impersonate only that node. With OpenSSL, the client certificate's extension
 is `subjectAltName = DNS:<node id>`.
 
-In plain text (no TLS flags; for tests and trials on one machine) there is no
-certificate and no binding. `kbf-server` serves the worker listener in plain text only
-on a loopback `--worker-listen`; any other address without the three TLS flags stops
-it at start (exit 2, naming them). In plain text a resent `Hello` must still carry
-the stream's `node_id`.
+In plain text (no TLS flags) there is no certificate and no binding. Mutual TLS is
+optional: without the three TLS flags `kbf-server` serves the worker listener in
+plain text on any `--worker-listen`, and off loopback its start line carries a
+one-line warning (` warning=plaintext-off-loopback:worker`). A deployment whose
+daemons run on other machines turns mutual TLS on in its config; today's daemon
+dials only `https://` ([#412](https://github.com/komira-ai/komira-build-farm/issues/412)
+tracks plain text). In plain text a resent `Hello` must still carry the stream's
+`node_id`.
 
 **The deny list** (`kbf-server --worker-deny-list FILE`, mutual TLS only) refuses
 certificates and nodes. Each line is blank, a `#` comment, or one entry:
