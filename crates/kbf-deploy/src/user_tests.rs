@@ -152,6 +152,8 @@ fn sorted(text: &str) -> Vec<u32> {
 #[ignore = "needs root: the_root_tests_pass_under_sudo runs it through sudo"]
 fn as_root_a_child_has_the_users_ids_and_groups() {
     assert_eq!(rustix::process::geteuid().as_raw(), 0, "run as root");
+    // The driver checks this line: under a coverage run the profile must reach here.
+    println!("profile file: {:?}", std::env::var_os("LLVM_PROFILE_FILE"));
     let nobody = RunUser {
         name: "nobody".to_owned(),
         uid: 65534,
@@ -219,10 +221,26 @@ fn the_root_tests_pass_under_sudo() {
         .output()
         .is_ok_and(|o| o.status.success());
     if root_tests_run(sudo, std::env::var_os("CI").is_some()).expect("sudo") {
-        let out = Command::new("/usr/bin/sudo")
-            .args(["-n", "--preserve-env=LLVM_PROFILE_FILE"])
+        // sudo clears the environment. A coverage run names its profile file in
+        // LLVM_PROFILE_FILE; `env` sets it again for the root process, which (as the
+        // caller by then) writes its profile there at exit.
+        let profile = std::env::var_os("LLVM_PROFILE_FILE");
+        let mut sudo = Command::new("/usr/bin/sudo");
+        sudo.args(["-n", "/usr/bin/env"]);
+        if let Some(p) = &profile {
+            let mut set = std::ffi::OsString::from("LLVM_PROFILE_FILE=");
+            set.push(p);
+            sudo.arg(set);
+        }
+        let out = sudo
             .arg(std::env::current_exe().expect("the test binary"))
-            .args(["--exact", ROOT_TEST, "--ignored", "--test-threads=1"])
+            .args([
+                "--exact",
+                ROOT_TEST,
+                "--ignored",
+                "--test-threads=1",
+                "--nocapture",
+            ])
             .current_dir(scratch("sudo"))
             .output()
             .expect("sudo runs");
@@ -230,5 +248,11 @@ fn the_root_tests_pass_under_sudo() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(out.status.success(), "{stdout}\n{stderr}");
         assert!(stdout.contains("test result: ok. 1 passed"), "{stdout}");
+        let seen = format!("profile file: {profile:?}");
+        assert!(
+            stdout.contains(&seen),
+            "the root test saw another profile: {stdout}"
+        );
+        assert!(!stderr.contains("LLVM Profile Error"), "{stderr}");
     }
 }
