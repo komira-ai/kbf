@@ -1,6 +1,7 @@
-//! The verbs: `user-create`, `run`, `kill-uid` and `user-delete` (S4.2), over a
-//! [`Host`] that does what only the OS can (user records, launchd, processes), so the
-//! rules here are tested on any platform.
+//! The verbs: `user-create`, `run`, `kill-uid` and `user-delete` (S4.2), and in
+//! [`switch`] the session switch and the boot reset, over a [`Host`] that does what
+//! only the OS can (user records, launchd, processes, the programs the switch runs),
+//! so the rules here are tested on any platform.
 //!
 //! Rules every verb keeps:
 //! - A lease id is parsed strictly and names one user, `kbf-lease-<term>-<seq>`.
@@ -17,7 +18,9 @@
 //!   last time, deletes the record, and records the deletion last: a crash part-way
 //!   leaves the lease live, and the delete is simply repeated. At each look it waits,
 //!   bounded, for processes of the uid to exit (a cron job that started after
-//!   `kill-uid`), and names those still alive when it refuses.
+//!   `kill-uid`), and names those still alive when it refuses. It is refused for the
+//!   lease the session switch's intent record names (`session-idle` first).
+//! - Every verb but `boot-reset` is refused until the boot reset has succeeded.
 //!
 //! The mutating verbs run one at a time (one lock around the ledger), and `run` holds
 //! it while it starts the process, so no process starts for a lease being deleted.
@@ -26,18 +29,24 @@ use std::io;
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::process::Child;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::SystemTime;
 
 use kbf_types::LeaseId;
 use rustix::fs::{CWD, Gid, Mode, OFlags, Uid};
 
+use crate::autologin::{CommandOutput, SessionPaths, read_intent};
 use crate::grant::{self, Expect, GrantKeys};
 use crate::lease::{UidRange, parse_lease, user_name};
 use crate::ledger::{Entry, Ledger};
 use crate::proto::{Reply, Request};
 use crate::spawn::{self, Spawn};
 use crate::sweep::{SweepPlan, sweep};
+
+mod switch;
+
+pub use switch::Reset;
 
 /// How many times `kill-uid` kills and looks again before it gives up.
 pub const KILL_ROUNDS: usize = 10;
@@ -93,6 +102,18 @@ pub trait Host: Send + Sync {
     fn live_processes(&self, uid: u32) -> io::Result<Vec<LiveProcess>>;
     /// Waits a moment between kill rounds, and between the listings of a wait.
     fn pause(&self);
+    /// Runs `program` with `args` and an empty environment
+    /// ([`run_command`](crate::autologin::run_command) on a real host).
+    ///
+    /// # Errors
+    /// The program could not be started or waited for.
+    fn command(&self, program: &str, args: &[&str]) -> io::Result<CommandOutput>;
+    /// Gives the user `name` a fresh random password and returns it, for
+    /// `/etc/kcpassword`; no one else is told it.
+    ///
+    /// # Errors
+    /// There is no such user, or the password could not be set.
+    fn reset_password(&self, name: &str) -> io::Result<String>;
 }
 
 /// A live process of a lease uid, as a refusal names it.
@@ -147,6 +168,8 @@ pub struct Settings {
     pub grant_keys: Option<GrantKeys>,
     /// This Mac's serial number, which a grant must name.
     pub serial: String,
+    /// Where the session switch keeps its state.
+    pub session: SessionPaths,
 }
 
 /// What a request comes to.
@@ -163,6 +186,8 @@ pub struct Helper {
     host: Box<dyn Host>,
     settings: Settings,
     ledger: Mutex<Ledger>,
+    /// Set, under the ledger's lock, once the boot reset has succeeded.
+    reset_done: AtomicBool,
 }
 
 impl Helper {
@@ -172,6 +197,7 @@ impl Helper {
             host,
             settings,
             ledger: Mutex::new(ledger),
+            reset_done: AtomicBool::new(false),
         }
     }
 
@@ -179,9 +205,13 @@ impl Helper {
         self.ledger.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Carries out `request`. Only `run` takes descriptors.
+    /// Carries out `request`. Only `run` takes descriptors, and nothing but
+    /// `boot-reset` is done before the boot reset has succeeded.
     pub fn handle(&self, request: Request, fds: Vec<OwnedFd>) -> Outcome {
         let refused = |reason: String| Outcome::Reply(Reply::Refused { reason });
+        if !self.reset_done() && !matches!(request, Request::BootReset { .. }) {
+            return refused("the boot reset has not run since the helper started".to_owned());
+        }
         let result = match request {
             Request::Run { lease, argv, env } => {
                 return self
@@ -196,6 +226,14 @@ impl Helper {
             Request::UserDelete { lease } => self
                 .user_delete(&lease)
                 .map(|existed| Reply::Deleted { existed }),
+            Request::SessionLogin { lease } => {
+                self.session_login(&lease).map(|()| Reply::Restarting)
+            }
+            Request::SessionIdle => self.session_idle().map(|()| Reply::Restarting),
+            Request::BootReset { held } => self.boot_reset(&held).map(|reset| Reply::Reset {
+                kept: reset.kept.map(|lease| lease.to_string()),
+                deleted: reset.deleted.iter().map(ToString::to_string).collect(),
+            }),
         };
         result.map_or_else(refused, Outcome::Reply)
     }
@@ -342,7 +380,12 @@ impl Helper {
     pub fn kill_uid(&self, lease: &str) -> Result<(), String> {
         let lease = parse_lease(lease)?;
         let ledger = self.lock();
-        let uid = self.live_uid(&ledger, lease)?;
+        self.kill_locked(&ledger, lease)
+    }
+
+    /// [`Self::kill_uid`], with the ledger's lock held.
+    fn kill_locked(&self, ledger: &Ledger, lease: LeaseId) -> Result<(), String> {
+        let uid = self.live_uid(ledger, lease)?;
         for domain in [format!("gui/{uid}"), format!("user/{uid}")] {
             if let Err(why) = self.host.bootout(&domain) {
                 tracing::debug!(lease = %lease, "launchctl bootout {domain}: {why}");
@@ -388,16 +431,30 @@ impl Helper {
     /// so a refused delete holds back the other verbs for up to about five seconds
     /// per look.
     ///
+    /// Refused while the session switch's intent record names the lease: its user is
+    /// the one the login window logs in.
+    ///
     /// # Errors
-    /// Why it was refused: a process of the uid remains, or the sweep or the deletion
-    /// failed (the lease stays live, so the delete can be repeated).
+    /// Why it was refused: the intent record names the lease or cannot be read, a
+    /// process of the uid remains, or the sweep or the deletion failed (the lease stays
+    /// live, so the delete can be repeated).
     pub fn user_delete(&self, lease: &str) -> Result<bool, String> {
         let lease = parse_lease(lease)?;
         let mut ledger = self.lock();
         if ledger.get(lease).is_some_and(|entry| entry.deleted) {
             return Ok(false);
         }
-        let uid = self.live_uid(&ledger, lease)?;
+        if read_intent(&self.settings.session.intent)? == Some(lease) {
+            return Err(format!(
+                "lease {lease} holds the GUI session (auto-login); session-idle first"
+            ));
+        }
+        self.delete_locked(&mut ledger, lease)
+    }
+
+    /// [`Self::user_delete`] of a live lease, with the ledger's lock held.
+    fn delete_locked(&self, ledger: &mut Ledger, lease: LeaseId) -> Result<bool, String> {
+        let uid = self.live_uid(ledger, lease)?;
         self.none_left(uid)?;
         let name = user_name(lease);
         let mut removed = Self::sweep_all(&self.settings.schedules, &name, uid)?;

@@ -33,6 +33,9 @@ how a node verifies one before it runs it.
 
 [docs/deploy/linux-build-host.md](docs/deploy/linux-build-host.md) sets up a Linux
 build host: the daemon's systemd units, swap and memory headroom.
+[docs/deploy/storage-node.md](docs/deploy/storage-node.md) sets up a storage host,
+server-only or converged (server and builds on one host): the server's units, the
+priorities between MinIO, the server and builds, and the memory left to builds.
 
 ## Contributing
 

@@ -13,6 +13,7 @@ use objc2_foundation::{NSError, NSString};
 use objc2_open_directory::{ODNode, ODRecord, ODSession, kODNodeTypeLocalNodes};
 use security_framework::random::SecRandom;
 
+use crate::autologin::{self, CommandOutput};
 use crate::helper::{self, Host, LiveProcess, NewUser};
 
 const USERS: &str = "dsRecTypeStandard:Users";
@@ -91,16 +92,7 @@ impl Host for MacHost {
             }
             // A random password nobody is told: the account cannot be logged into with
             // a password, and macOS gives it no secure token.
-            let mut bytes = [0u8; 32];
-            SecRandom::default().copy_bytes(&mut bytes)?;
-            let password = NSString::from_str(&hex::encode(bytes));
-            let mut error = None;
-            // SAFETY: as above; no old password, as root on the local node.
-            if !unsafe {
-                record.changePassword_toPassword_error(None, Some(&password), Some(&mut error))
-            } {
-                return Err(od_error("setting the password", error));
-            }
+            random_password(&record)?;
             if user.admin {
                 let admin = group(&node, ADMIN_GROUP)?;
                 let mut error = None;
@@ -111,6 +103,28 @@ impl Host for MacHost {
             }
             Ok(())
         })
+    }
+
+    fn reset_password(&self, name: &str) -> io::Result<String> {
+        autoreleasepool(|_| {
+            let node = local_node()?;
+            let mut error = None;
+            // SAFETY: the record type and name are NSStrings; no attributes needed.
+            let record = unsafe {
+                node.recordWithRecordType_name_attributes_error(
+                    Some(&NSString::from_str(USERS)),
+                    Some(&NSString::from_str(name)),
+                    None,
+                    Some(&mut error),
+                )
+            }
+            .ok_or_else(|| od_error("looking the user up", error))?;
+            random_password(&record)
+        })
+    }
+
+    fn command(&self, program: &str, args: &[&str]) -> io::Result<CommandOutput> {
+        autologin::run_command(program, args)
     }
 
     fn delete_user(&self, name: &str) -> io::Result<bool> {
@@ -213,6 +227,26 @@ impl Host for MacHost {
     fn pause(&self) {
         std::thread::sleep(Duration::from_millis(100));
     }
+}
+
+/// Sets a fresh password of 32 random bytes, in hex, on `record`, and returns it.
+fn random_password(record: &ODRecord) -> io::Result<String> {
+    let mut bytes = [0u8; 32];
+    SecRandom::default().copy_bytes(&mut bytes)?;
+    let password = hex::encode(bytes);
+    let mut error = None;
+    // SAFETY: a record of the local node and an NSString; no old password, as root on
+    // the local node.
+    if !unsafe {
+        record.changePassword_toPassword_error(
+            None,
+            Some(&NSString::from_str(&password)),
+            Some(&mut error),
+        )
+    } {
+        return Err(od_error("setting the password", error));
+    }
+    Ok(password)
 }
 
 /// The local directory node (`/Local/Default`).
