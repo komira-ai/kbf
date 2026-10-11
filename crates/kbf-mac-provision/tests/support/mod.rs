@@ -1,0 +1,663 @@
+//! A fake Mac for the tests: each macOS program the checks run is answered from
+//! state in memory, in the output format of macOS's own; the files are a real scratch
+//! directory, the fake's `/`; owners can be set per path, since the tests do not run
+//! as root. Every program call is logged.
+
+#![allow(dead_code, reason = "each test binary uses part of the fake")]
+
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
+use std::io;
+use std::os::unix::fs::PermissionsExt as _;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use kbf_mac_provision::host::{Host, Output, Stat};
+use kbf_mac_provision::items::Report;
+use sha2::{Digest as _, Sha256};
+
+/// The example profile the tests start from.
+pub const EXAMPLE: &str = include_str!("../../../../tools/mac-provision/example.profile");
+
+pub const PLIST: &str = "/Library/LaunchDaemons/org.example.kbf-daemon.plist";
+pub const DROPIN: &str = "/etc/ssh/sshd_config.d/000-kbf.conf";
+pub const ERR_LOG: &str = "/Library/Logs/kbf/kbf-daemon.err.log";
+pub const SOFTWARE_UPDATE: &str = "/Library/Preferences/com.apple.SoftwareUpdate";
+pub const LOGINWINDOW: &str = "/Library/Preferences/com.apple.loginwindow";
+pub const INTENT: &str = "/var/db/kbf-mac-session/session-intent";
+
+/// A fresh scratch directory for test `name`, unique within the test binary (tests run
+/// in parallel and may share a name).
+pub fn scratch(name: &str) -> PathBuf {
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("kbf-mac-provision-{}", env!("CARGO_CRATE_NAME")))
+        .join(format!("{name}-{n}"));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    hex::encode(Sha256::digest(bytes))
+}
+
+/// The program state of a fake Mac.
+#[derive(Clone, Debug, Default)]
+pub struct State {
+    pub euid: u32,
+    pub sw_vers: BTreeMap<&'static str, String>,
+    /// `pmset -g`'s settings, in its order.
+    pub pmset: Vec<(String, String)>,
+    pub scutil: BTreeMap<String, String>,
+    /// `defaults` values by domain (a path on the Mac) and key.
+    pub defaults: BTreeMap<(String, String), String>,
+    pub remote_login: bool,
+    pub network_time: bool,
+    pub time_server: String,
+    /// What `socketfilterfw --getglobalstate` says: `1`, `0`, or anything else.
+    pub firewall: String,
+    /// The word `fdesetup status` puts in `FileVault is <word>.`.
+    pub filevault: String,
+    /// The offset `sntp -t` prints, or `fail`.
+    pub sntp_offset: String,
+    /// Directory records by path (`/Groups/admin`), attributes in order.
+    pub records: BTreeMap<String, Vec<(String, String)>>,
+    /// What `sshd -T` prints; `None` prints the drop-in's lines in lower case.
+    pub sshd_effective: Option<String>,
+    /// Loaded launchd jobs, as `system/<label>`.
+    pub loaded: BTreeSet<String>,
+    pub xcode_select: Option<String>,
+    /// Owners `lstat` reports for paths on the Mac, over the file's real one.
+    pub owners: BTreeMap<String, (u32, u32)>,
+}
+
+impl State {
+    pub fn attr(&mut self, record: &str, attr: &str, value: &str) {
+        let attrs = self.records.entry(record.into()).or_default();
+        attrs.retain(|(a, _)| a != attr);
+        attrs.push((attr.into(), value.into()));
+    }
+
+    /// An attribute of the user record `name`.
+    pub fn user_attr(&mut self, name: &str, attr: &str, value: &str) {
+        self.attr(&format!("/Users/{name}"), attr, value);
+    }
+
+    pub fn remove_user(&mut self, name: &str) {
+        self.records.remove(&format!("/Users/{name}"));
+    }
+
+    pub fn user(&mut self, name: &str, uid: u32) {
+        self.attr(&format!("/Users/{name}"), "UniqueID", &uid.to_string());
+    }
+
+    pub fn pmset_set(&mut self, key: &str, value: &str) {
+        match self.pmset.iter_mut().find(|(k, _)| k == key) {
+            Some(entry) => entry.1 = value.into(),
+            None => self.pmset.push((key.into(), value.into())),
+        }
+    }
+
+    pub fn default_set(&mut self, domain: &str, key: &str, value: &str) {
+        self.defaults
+            .insert((domain.into(), key.into()), value.into());
+    }
+}
+
+/// A fake Mac: [`State`] plus a scratch directory as its `/`.
+pub struct FakeMac {
+    pub root: String,
+    pub state: State,
+    pub log: RefCell<Vec<String>>,
+    /// The test profile, made when the Mac is: a drift of the files it pins (an Xcode
+    /// `.xip`, the probe) does not change it.
+    profile: String,
+}
+
+impl FakeMac {
+    /// A Mac as Setup Assistant and Remote Login leave it: one administrator, nothing
+    /// else set; the two Xcode `.xip`s and the probe script are in place.
+    pub fn fresh(name: &str) -> Self {
+        let root = scratch(name);
+        for d in [
+            "etc/ssh/sshd_config.d",
+            "Applications",
+            "Library/kbf/xip",
+            "Library/Preferences",
+            "usr/local/kbf/probes",
+            "var/db/kbf-mac-session",
+        ] {
+            fs::create_dir_all(root.join(d)).unwrap();
+        }
+        let mut state = State {
+            euid: 0,
+            remote_login: true,
+            network_time: true,
+            time_server: "time.apple.com".into(),
+            firewall: "0".into(),
+            filevault: "Off".into(),
+            sntp_offset: "+0.004000".into(),
+            ..State::default()
+        };
+        state.sw_vers.insert("version", "27.0.1".into());
+        state.sw_vers.insert("build", "26A000".into());
+        for (k, v) in [
+            ("sleep", "1"),
+            ("standby", "1"),
+            ("powernap", "1"),
+            ("autorestart", "0"),
+            ("womp", "0"),
+        ] {
+            state.pmset_set(k, v);
+        }
+        state
+            .scutil
+            .insert("ComputerName".into(), "Farm Admin Mac".into());
+        state
+            .scutil
+            .insert("LocalHostName".into(), "Farm-Admin-Mac".into());
+        state.user("root", 0);
+        state.user("farmadmin", 501);
+        state.attr("/Groups/admin", "GroupMembership", "root farmadmin");
+        let mac = Self {
+            root: root.to_str().unwrap().to_owned(),
+            state,
+            log: RefCell::new(Vec::new()),
+            profile: String::new(),
+        };
+        mac.write(
+            "/etc/ssh/sshd_config",
+            "# sshd_config\nInclude /etc/ssh/sshd_config.d/*\n",
+        );
+        mac.write(
+            "/Library/kbf/xip/Xcode_26.6.xip",
+            "app=Xcode-26.6.app build=17A000\n",
+        );
+        mac.write(
+            "/Library/kbf/xip/Xcode_27.0.xip",
+            "app=Xcode-27.0.app build=18A000\n",
+        );
+        mac.write("/usr/local/kbf/probes/host_identity.sh", "echo identity\n");
+        let mut mac = mac;
+        mac.profile = mac.make_profile();
+        mac
+    }
+
+    /// A fresh Mac with every item of [`Self::profile`] as `apply` leaves it.
+    pub fn converged(name: &str) -> Self {
+        let mut mac = Self::fresh(name);
+        let s = &mut mac.state;
+        for n in ["HostName", "LocalHostName", "ComputerName"] {
+            s.scutil.insert(n.into(), "kbf-mac-07".into());
+        }
+        for (a, v) in [
+            ("UniqueID", "480"),
+            ("PrimaryGroupID", "480"),
+            ("UserShell", "/usr/bin/false"),
+            ("NFSHomeDirectory", "/var/empty"),
+            ("IsHidden", "1"),
+            ("Password", "*"),
+        ] {
+            s.user_attr("_kbf", a, v);
+        }
+        s.attr("/Groups/_kbf", "PrimaryGroupID", "480");
+        s.attr("/Groups/_kbf", "Password", "*");
+        for (k, v) in [
+            ("sleep", "0"),
+            ("standby", "0"),
+            ("powernap", "0"),
+            ("autorestart", "1"),
+            ("womp", "1"),
+        ] {
+            s.pmset_set(k, v);
+        }
+        for (k, v) in [
+            ("AutomaticDownload", "0"),
+            ("AutomaticallyInstallMacOSUpdates", "0"),
+            ("CriticalUpdateInstall", "0"),
+            ("ConfigDataInstall", "1"),
+            ("AutomaticallyInstallAppUpdates", "0"),
+        ] {
+            s.default_set(SOFTWARE_UPDATE, k, v);
+        }
+        s.firewall = "1".into();
+        s.time_server = "time.example.net".into();
+        s.xcode_select = Some("/Applications/Xcode-27.0.app/Contents/Developer".into());
+        s.loaded.insert("system/org.example.kbf-daemon".into());
+        mac.write(
+            DROPIN,
+            "PasswordAuthentication no\nKbdInteractiveAuthentication no\nPermitRootLogin no\n",
+        );
+        mac.chmod(DROPIN, 0o644);
+        mac.own(DROPIN, 0, 0);
+        mac.install_xcode("Xcode-26.6.app", "17A000");
+        mac.install_xcode("Xcode-27.0.app", "18A000");
+        let profile = mac.profile_text();
+        mac.write(PLIST, &golden_plist(&sha256_hex(profile.as_bytes())[..12]));
+        mac.chmod(PLIST, 0o644);
+        mac.own(PLIST, 0, 0);
+        mac.mkdir("/Library/Logs/kbf");
+        mac.chmod("/Library/Logs/kbf", 0o755);
+        mac.own("/Library/Logs/kbf", 0, 0);
+        mac.write(ERR_LOG, "");
+        mac.chmod(ERR_LOG, 0o644);
+        mac.own(ERR_LOG, 480, 480);
+        mac
+    }
+
+    /// Where `path` on the Mac is on this machine.
+    pub fn path(&self, path: &str) -> PathBuf {
+        PathBuf::from(format!("{}{path}", self.root))
+    }
+
+    pub fn write(&self, path: &str, text: &str) {
+        let p = self.path(path);
+        fs::create_dir_all(p.parent().unwrap()).unwrap();
+        fs::write(p, text).unwrap();
+    }
+
+    pub fn mkdir(&self, path: &str) {
+        fs::create_dir_all(self.path(path)).unwrap();
+    }
+
+    pub fn remove(&self, path: &str) {
+        let p = self.path(path);
+        if p.is_dir() && !p.is_symlink() {
+            fs::remove_dir_all(p).unwrap();
+        } else {
+            fs::remove_file(p).unwrap();
+        }
+    }
+
+    pub fn chmod(&self, path: &str, mode: u32) {
+        fs::set_permissions(self.path(path), fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    pub fn own(&mut self, path: &str, uid: u32, gid: u32) {
+        self.state.owners.insert(path.into(), (uid, gid));
+    }
+
+    /// A symbolic link at `path` to `target` (a path on this machine).
+    pub fn symlink(&self, target: &Path, path: &str) {
+        std::os::unix::fs::symlink(target, self.path(path)).unwrap();
+    }
+
+    pub fn install_xcode(&self, app: &str, build: &str) {
+        self.write(
+            &format!("/Applications/{app}/Contents/version.plist"),
+            &format!("ProductBuildVersion={build}\n"),
+        );
+    }
+
+    /// The test profile: the example with the fake's own Xcode and probe SHA-256s.
+    pub fn profile_text(&self) -> String {
+        self.profile.clone()
+    }
+
+    fn make_profile(&self) -> String {
+        let mut text: String = EXAMPLE
+            .lines()
+            .filter(|l| !l.starts_with('#') && !l.starts_with("xcode=") && !l.starts_with("probe="))
+            .map(|l| {
+                if l.starts_with("profile=") {
+                    "profile=mac-arm64-test\n".to_owned()
+                } else {
+                    format!("{l}\n")
+                }
+            })
+            .collect();
+        let file_sha = |p: &str| sha256_hex(&fs::read(self.path(p)).unwrap());
+        text.push_str(&format!(
+            "xcode=17A000:/Applications/Xcode-26.6.app/Contents/Developer:{}\n",
+            file_sha("/Library/kbf/xip/Xcode_26.6.xip")
+        ));
+        text.push_str(&format!(
+            "xcode=18A000:/Applications/Xcode-27.0.app/Contents/Developer:{}\n",
+            file_sha("/Library/kbf/xip/Xcode_27.0.xip")
+        ));
+        text.push_str(&format!(
+            "probe=host_identity:/usr/local/kbf/probes/host_identity.sh:{}\n",
+            file_sha("/usr/local/kbf/probes/host_identity.sh")
+        ));
+        text
+    }
+
+    /// Writes `text` as the profile file (outside the fake's `/`) and returns its path.
+    pub fn profile_file(&self, text: &str) -> PathBuf {
+        let p = PathBuf::from(format!("{}.profile", self.root));
+        fs::write(&p, text).unwrap();
+        p
+    }
+
+    /// The calls that would change a Mac, from the log: none of them is a read.
+    pub fn writes(&self) -> Vec<String> {
+        const READS: &[&str] = &[
+            "sw_vers -",
+            "scutil --get ",
+            "pmset -g",
+            "defaults read ",
+            "dscl . -read ",
+            "dscl . -list ",
+            "dseditgroup -o checkmember ",
+            "systemsetup -get",
+            "socketfilterfw --getglobalstate",
+            "fdesetup status",
+            "sntp -t ",
+            "sshd -T",
+            "launchctl print ",
+            "xcode-select -p",
+            "PlistBuddy -c Print :ProductBuildVersion ",
+        ];
+        self.log
+            .borrow()
+            .iter()
+            .filter(|call| !READS.iter().any(|r| call.starts_with(r)))
+            .cloned()
+            .collect()
+    }
+
+    fn strip_root<'a>(&self, path: &'a str) -> &'a str {
+        path.strip_prefix(self.root.as_str()).unwrap_or(path)
+    }
+
+    fn answer(&self, name: &str, args: &[&str]) -> Option<(bool, String)> {
+        let s = &self.state;
+        let ok = |text: String| Some((true, text));
+        let no = |text: &str| Some((false, text.to_owned()));
+        match (name, args) {
+            ("sw_vers", ["-productVersion"]) => ok(format!("{}\n", s.sw_vers["version"])),
+            ("sw_vers", ["-buildVersion"]) => ok(format!("{}\n", s.sw_vers["build"])),
+            ("scutil", ["--get", n]) => match s.scutil.get(*n) {
+                Some(v) => ok(format!("{v}\n")),
+                None => no(&format!("{n}: not set\n")),
+            },
+            ("pmset", ["-g"]) => {
+                let mut out = String::from(
+                    "System-wide power settings:\nCurrently in use:\n Sleep On Power Button 1\n",
+                );
+                for (k, v) in &s.pmset {
+                    out.push_str(&format!(" {k:<20} {v}\n"));
+                }
+                ok(out)
+            }
+            ("defaults", ["read", domain, key]) => {
+                match s
+                    .defaults
+                    .get(&(self.strip_root(domain).to_owned(), (*key).to_owned()))
+                {
+                    Some(v) => ok(format!("{v}\n")),
+                    None => no(""),
+                }
+            }
+            ("dscl", [".", "-read", record, attrs @ ..]) => {
+                let Some(found) = s.records.get(*record) else {
+                    return no("");
+                };
+                let mut out = String::new();
+                for a in attrs {
+                    if let Some((_, v)) = found.iter().find(|(k, _)| k == a) {
+                        match *a {
+                            // A long value goes on a line of its own, as macOS's dscl prints it.
+                            "AuthenticationAuthority" => out.push_str(&format!("{a}:\n {v}\n")),
+                            "IsHidden" => out.push_str(&format!("dsAttrTypeNative:{a}: {v}\n")),
+                            _ => out.push_str(&format!("{a}: {v}\n")),
+                        }
+                    }
+                }
+                ok(out)
+            }
+            ("dscl", [".", "-list", dir, rest @ ..]) => {
+                let prefix = format!("{dir}/");
+                let mut out = String::new();
+                for (record, attrs) in &s.records {
+                    let Some(name) = record.strip_prefix(&prefix) else {
+                        continue;
+                    };
+                    match rest {
+                        [attr] => {
+                            let v = attrs
+                                .iter()
+                                .find(|(k, _)| k == attr)
+                                .map_or("", |(_, v)| v.as_str());
+                            out.push_str(&format!("{name:<24} {v}\n"));
+                        }
+                        _ => out.push_str(&format!("{name}\n")),
+                    }
+                }
+                ok(out)
+            }
+            // A member is listed in the group's GroupMembership or has the group as its
+            // primary group (the fake knows one group id: admin is 80).
+            ("dseditgroup", ["-o", "checkmember", "-m", user, group]) => {
+                let get = |record: String, attr: &str| {
+                    s.records
+                        .get(&record)
+                        .and_then(|a| a.iter().find(|(k, _)| k == attr))
+                        .map(|(_, v)| v.clone())
+                        .unwrap_or_default()
+                };
+                let listed = get(format!("/Groups/{group}"), "GroupMembership")
+                    .split_whitespace()
+                    .any(|m| m == *user);
+                let primary =
+                    *group == "admin" && get(format!("/Users/{user}"), "PrimaryGroupID") == "80";
+                if listed || primary {
+                    ok(format!("yes {user} is a member of {group}\n"))
+                } else {
+                    no(&format!("no {user} is NOT a member of {group}\n"))
+                }
+            }
+            ("systemsetup", ["-getremotelogin"]) => ok(format!(
+                "Remote Login: {}\n",
+                if s.remote_login { "On" } else { "Off" }
+            )),
+            ("systemsetup", ["-getusingnetworktime"]) => ok(format!(
+                "Network Time: {}\n",
+                if s.network_time { "On" } else { "Off" }
+            )),
+            ("systemsetup", ["-getnetworktimeserver"]) => {
+                ok(format!("Network Time Server: {}\n", s.time_server))
+            }
+            ("socketfilterfw", ["--getglobalstate"]) => ok(match s.firewall.as_str() {
+                "1" => "Firewall is enabled. (State = 1)\n".into(),
+                "0" => "Firewall is disabled. (State = 0)\n".into(),
+                _ => "socketfilterfw: no answer\n".into(),
+            }),
+            ("fdesetup", ["status"]) => ok(format!("FileVault is {}.\n", s.filevault)),
+            ("sntp", ["-t", "5", server]) => {
+                if s.sntp_offset == "fail" {
+                    no("")
+                } else {
+                    ok(format!(
+                        "{} +/- 0.010000 {server} 192.0.2.1\n",
+                        s.sntp_offset
+                    ))
+                }
+            }
+            ("sshd", ["-T"]) => match &s.sshd_effective {
+                Some(text) => ok(text.clone()),
+                None => ok(fs::read_to_string(self.path(DROPIN))
+                    .unwrap_or_default()
+                    .lines()
+                    .map(|l| {
+                        let (k, v) = l.split_once(' ').unwrap_or((l, ""));
+                        format!("{} {v}\n", k.to_lowercase())
+                    })
+                    .collect()),
+            },
+            ("launchctl", ["print", domain]) => {
+                if s.loaded.contains(*domain) {
+                    ok(String::new())
+                } else {
+                    no("")
+                }
+            }
+            ("xcode-select", ["-p"]) => match &s.xcode_select {
+                Some(dir) => ok(format!("{dir}\n")),
+                None => no(""),
+            },
+            // Only `Print :ProductBuildVersion` of a fake version.plist (KEY=VALUE lines).
+            ("PlistBuddy", ["-c", "Print :ProductBuildVersion", file]) => {
+                let text = fs::read_to_string(file).unwrap_or_default();
+                match text
+                    .lines()
+                    .find_map(|l| l.strip_prefix("ProductBuildVersion="))
+                {
+                    Some(v) => ok(format!("{v}\n")),
+                    None => no(""),
+                }
+            }
+            _ => None,
+        }
+    }
+}
+
+impl Host for FakeMac {
+    fn root(&self) -> &str {
+        &self.root
+    }
+
+    fn euid(&self) -> u32 {
+        self.state.euid
+    }
+
+    fn run(&self, program: &str, args: &[&str]) -> io::Result<Output> {
+        let name = program.rsplit('/').next().unwrap();
+        self.log
+            .borrow_mut()
+            .push(format!("{name} {}", args.join(" ")));
+        match self.answer(name, args) {
+            Some((success, stdout)) => Ok(Output { success, stdout }),
+            None => Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("no fake for {program} {args:?}"),
+            )),
+        }
+    }
+
+    fn lstat(&self, path: &str) -> Option<Stat> {
+        let mut stat = Stat::of(&fs::symlink_metadata(self.path(path)).ok()?);
+        if let Some(&(uid, gid)) = self.state.owners.get(path) {
+            stat.uid = uid;
+            stat.gid = gid;
+        }
+        Some(stat)
+    }
+}
+
+/// The property list the test profile must render, given the first 12 hex digits of
+/// the profile's SHA-256: written out here, not rendered, so a rendering defect shows.
+pub fn golden_plist(sha12: &str) -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>org.example.kbf-daemon</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/usr/local/kbf/current/kbf-daemon</string>
+		<string>--driver</string>
+		<string>native</string>
+		<string>--server</string>
+		<string>https://farm.example.net:8981</string>
+		<string>--cas</string>
+		<string>https://farm.example.net:8981</string>
+		<string>--ca-cert</string>
+		<string>/usr/local/kbf/etc/ca.pem</string>
+		<string>--cert</string>
+		<string>/usr/local/kbf/etc/node.pem</string>
+		<string>--key</string>
+		<string>/usr/local/kbf/etc/node.key</string>
+		<string>--node-id</string>
+		<string>kbf-mac-07</string>
+		<string>--scratch</string>
+		<string>/Volumes/kbf/scratch</string>
+		<string>--label</string>
+		<string>profile=mac-arm64-test@{sha12}</string>
+		<string>--label</string>
+		<string>pool=mac</string>
+		<string>--label</string>
+		<string>rack=r2</string>
+	</array>
+	<key>UserName</key>
+	<string>_kbf</string>
+	<key>GroupName</key>
+	<string>_kbf</string>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>ThrottleInterval</key>
+	<integer>10</integer>
+	<key>ExitTimeOut</key>
+	<integer>30</integer>
+	<key>ProcessType</key>
+	<string>Interactive</string>
+	<key>StandardErrorPath</key>
+	<string>/Library/Logs/kbf/kbf-daemon.err.log</string>
+	<key>SoftResourceLimits</key>
+	<dict>
+		<key>NumberOfFiles</key>
+		<integer>65536</integer>
+	</dict>
+	<key>HardResourceLimits</key>
+	<dict>
+		<key>NumberOfFiles</key>
+		<integer>65536</integer>
+	</dict>
+</dict>
+</plist>
+"#
+    )
+}
+
+pub fn check_keys(mac: &FakeMac, keys: Option<&str>) -> Report {
+    let path = mac.profile_file(&mac.profile_text());
+    kbf_mac_provision::cli::check(&path, keys, mac).unwrap()
+}
+
+pub fn check(mac: &FakeMac) -> Report {
+    check_keys(mac, None)
+}
+
+/// The lines of a report that start with `prefix`.
+pub fn lines<'a>(r: &'a Report, prefix: &str) -> Vec<&'a str> {
+    r.text.lines().filter(|l| l.starts_with(prefix)).collect()
+}
+
+/// On a converged Mac changed by `drift`, check fails `item` and nothing else, and
+/// says `text`. `Err` says what went wrong instead.
+pub fn only_fails(
+    name: &str,
+    item: &str,
+    drift: fn(&mut FakeMac),
+    text: &str,
+) -> Result<(), String> {
+    let mut mac = FakeMac::converged(name);
+    drift(&mut mac);
+    let r = check(&mac);
+    let failed = lines(&r, "FAIL");
+    let ok = r.failed == 1
+        && failed.len() == 1
+        && failed[0].starts_with(&format!("FAIL {item}: "))
+        && failed[0].contains(text);
+    if ok {
+        Ok(())
+    } else {
+        Err(format!(
+            "{name}: want only FAIL {item}: ..{text}.., got:\n{}",
+            r.text
+        ))
+    }
+}
+
+pub fn assert_only_fails(item: &str, drift: fn(&mut FakeMac), text: &str) {
+    if let Err(e) = only_fails(&format!("only-{item}"), item, drift, text) {
+        panic!("{e}");
+    }
+}
