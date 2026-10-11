@@ -269,8 +269,9 @@ with a `REFUSED:` line on stderr.
 Three verbs change the host. Each runs as root, reads the host first, prints its plan
 as `DRY-RUN:` lines and changes nothing; `--apply` carries the plan out, stopping at
 the first step that fails. A re-run after an apply plans nothing. Exit codes: 0 done
-(or nothing to do), 1 a step failed, 2 refused (`REFUSED:` on stderr, with the fix).
-They take the same `--config` file as `render-units`.
+(or nothing to do), 1 a step or the check after an apply failed, 2 refused
+(`REFUSED:` on stderr, with the fix). They take the same `--config` file as
+`render-units`.
 
 ```text
 sudo kbf-deploy linux swap --config node.conf [--kubelet-allows-swap] [--remove] [--apply]
@@ -290,25 +291,28 @@ sudo kbf-deploy linux install-units --config node.conf --uninstall [--apply]
   rootless Podman store, as that user: its uid, its gid and all its groups (as
   `sudo -u` gives them), `HOME` and `XDG_RUNTIME_DIR=/run/user/<uid>`. Each image in
   the store must have its pinned digest and be `--platform` (`linux/amd64`); after an
-  apply each pulled image is checked the same way. Even a dry run needs root, since
-  it reads the store as the kbf user.
+  apply each pulled image is checked the same way, and one still missing or not the
+  pin exits 1 with a `FAIL` line (the pulls ran, so it is not a refusal). Even a dry
+  run needs root, since it reads the store as the kbf user.
 - `install-units` checks the host (a cgroup v2 memory controller, `MINIO_UNIT` is a
-  systemd unit, both users, the kbf user's subuid and subgid ranges and linger, each
-  key file in `KBF_ETC` its service's alone, the certificates, the deny list and
-  `s3.env`'s key pair, and the three ports free unless kbf-server runs), renders the
-  units with the kbf user's uid and refuses them unless `check-units --installable`
-  passes, and refuses a binary whose `--help` lacks a flag its unit passes. It then
-  installs, each only if it differs: the binaries from `--bin-dir` (keeping the
-  replaced one as `<name>.previous`), the four files under `/etc/systemd/system`, and
-  the Raft and scratch directories (0700, their service's user). The binaries, the
-  `.previous` copies and the four files are root's (uid and gid 0): one with the right
-  bytes and mode that another user owns is replaced. After a change it
-  runs `daemon-reload` and enables and restarts kbf-server and kbf-daemon; otherwise
-  it only enables or starts one that is not. It then waits up to 60 s for
-  kbf-server's `/readyz`. MinIO restarts only with `--restart-minio`: its new
-  priorities take effect at its next start. `--uninstall` stops and disables both
-  services and moves the four files to `/var/lib/kbf-linux/removed/<unix seconds>/`;
-  the binaries, the Raft log, the scratch, the bucket and the swapfile stay.
+  systemd unit, both users, the kbf user's subuid and subgid ranges, each a line
+  keyed by its name or its uid, and linger, each key file in `KBF_ETC` its service's
+  alone, the certificates, the deny list and `s3.env`'s key pair, and the three ports
+  free unless kbf-server runs), renders the units with the kbf user's uid and refuses
+  them unless `check-units --installable` passes, and refuses a binary whose `--help`
+  lacks a flag its unit passes. It then installs, each only if it differs: the
+  binaries from `--bin-dir` (keeping the replaced one as `<name>.previous`), the four
+  files under `/etc/systemd/system`, and the Raft and scratch directories (0700, their
+  service's user). The binaries, the `.previous` copies and the four files are root's
+  (uid and gid 0): one with the right bytes and mode that another user owns is
+  replaced. After a change it runs `daemon-reload` and enables and restarts
+  kbf-server and kbf-daemon; otherwise it only enables or starts one that is not.
+  After any start or restart it waits up to 60 s for kbf-server's `/readyz`; a run
+  that starts nothing does not wait. MinIO restarts only with `--restart-minio`: its
+  new priorities take effect at its next start. `--uninstall` stops and disables both
+  services when either is enabled or running, and moves the four files to
+  `/var/lib/kbf-linux/removed/<unix seconds>/`; the binaries, the Raft log, the
+  scratch, the bucket and the swapfile stay.
 
 ## What the tests check
 

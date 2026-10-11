@@ -328,6 +328,71 @@ fn unchanged_units_start_and_enable_only_what_is_not() {
     assert_eq!(steps(&p), want);
 }
 
+/// The upgrade path with no new binaries: a re-run with a changed setting (here
+/// `KBF_NODE_ID`, which only kbf-daemon's unit names) and no `--bin-dir` rewrites that
+/// unit alone and must reload systemd and restart both services, though both are
+/// already enabled and running. Catches a unit write that does not count as a change
+/// (the services would keep running the old unit until a reboot).
+#[test]
+fn a_changed_unit_alone_reloads_and_restarts_the_services() {
+    let (mut exec, world) = host("install-unit-change");
+    go(&mut exec, &install(), Mode::Apply);
+    assert_eq!(
+        world.borrow().active.len(),
+        2,
+        "the first install started both"
+    );
+    let text = EXAMPLE.replace("KBF_NODE_ID=storage-node-1", "KBF_NODE_ID=storage-node-2");
+    let a = Install {
+        config: LinuxConfig::parse(&text).expect("valid settings"),
+        bin_dir: None,
+        restart_minio: false,
+    };
+    let got = steps(&plan(&exec, &a, &mut Vec::new()).expect("plan"));
+    assert_eq!(got.len(), 5, "{got:#?}");
+    assert!(
+        got[0].starts_with("write /etc/systemd/system/kbf-daemon.service (0644, "),
+        "{got:#?}"
+    );
+    let want = [
+        "run /usr/bin/systemctl daemon-reload",
+        "run /usr/bin/systemctl enable kbf-server.service kbf-daemon.service",
+        "run /usr/bin/systemctl restart kbf-server.service kbf-daemon.service",
+        "wait up to 60s for http://127.0.0.1:8982/readyz",
+    ];
+    assert_eq!(got[1..], want);
+}
+
+/// A service that runs though it is not enabled (started by hand, or disabled and not
+/// stopped) must still be stopped by the rollback; so must one enabled but stopped.
+/// Catches a rollback that asks only `is-enabled` (or only `is-active`) and leaves a
+/// running kbf-daemon on a host whose units it then moves away.
+#[test]
+fn uninstall_stops_a_service_that_runs_but_is_not_enabled() {
+    let c = config();
+    for (why, enabled, active) in [
+        ("running, not enabled", false, true),
+        ("enabled, not running", true, false),
+    ] {
+        let (exec, world) = host("install-undo-on");
+        {
+            let mut w = world.borrow_mut();
+            if enabled {
+                w.enabled.insert(DAEMON.to_owned());
+            }
+            if active {
+                w.active.insert(DAEMON.to_owned());
+            }
+        }
+        let got = steps(&plan_uninstall(&exec, &c, STAMP, &mut Vec::new()).expect("plan"));
+        assert_eq!(
+            got,
+            ["run /usr/bin/systemctl disable --now kbf-daemon.service kbf-server.service"],
+            "{why}"
+        );
+    }
+}
+
 /// Without `--bin-dir` the installed binaries are checked and kept. Catches a plan that
 /// copies binaries it was not given.
 #[test]
@@ -561,6 +626,40 @@ fn each_missing_prerequisite_is_refused_with_its_fix() {
         let err = plan(&exec, &install(), &mut Vec::new()).expect_err(why);
         assert!(want(&err), "{why}: {err}");
     }
+}
+
+/// subuid(5) keys a range by user name or by uid, and newuidmap takes either. Catches
+/// a host whose ranges are keyed by the kbf user's uid being refused, and a line
+/// keyed by another uid that starts with kbf's being taken for it.
+#[test]
+fn a_sub_id_range_keyed_by_uid_is_the_users() {
+    let (uid, _) = me();
+    let (exec, _) = host("install-subid-uid");
+    write(
+        &exec,
+        "/etc/subuid",
+        &format!("{uid}:100000:65536\n"),
+        0o644,
+    );
+    write(
+        &exec,
+        "/etc/subgid",
+        &format!("other:1:2\n{uid}:100000:65536\n"),
+        0o644,
+    );
+    plan(&exec, &install(), &mut Vec::new()).expect("a uid-keyed range");
+
+    write(
+        &exec,
+        "/etc/subuid",
+        &format!("{uid}0:100000:65536\n"),
+        0o644,
+    );
+    let err = plan(&exec, &install(), &mut Vec::new()).expect_err("another uid");
+    assert!(
+        matches!(&err, HostError::NoSubIds { file, .. } if file.as_str() == "/etc/subuid"),
+        "{err}"
+    );
 }
 
 /// Catches a running kbf-server's own ports read as held (a re-install would always

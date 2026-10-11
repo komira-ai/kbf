@@ -310,6 +310,42 @@ fn the_linux_host_verbs_exit_0_done_1_failed_2_refused() {
     );
 }
 
+/// An image-pull whose pull ran but whose image is still missing: the host changed, so
+/// it is a failed verb (exit 1, a `FAIL` line), not a refusal (exit 2, `REFUSED:`,
+/// which says nothing was done). Catches the check after an apply reported as a
+/// refusal.
+#[test]
+fn a_failed_check_after_an_apply_exits_1_with_a_fail_line() {
+    let busybox = format!("busybox@sha256:{}", "a".repeat(64));
+    let mut exec = FakeExec::new(0);
+    exec.answer = Box::new(|cmd| {
+        Ok(match cmd.program.as_str() {
+            crate::user::GETENT => reply(0, "kbf:x:990:990::/h:/s\n", ""),
+            // `podman image exists`: never, even after the pull.
+            "/usr/bin/podman" if cmd.args[0] == "image" => reply(1, "", ""),
+            _ => reply(0, "990\n", ""),
+        })
+    });
+    let args = [
+        "linux",
+        "image-pull",
+        "--config",
+        LINUX_CONFIG,
+        "--image",
+        &busybox,
+        "--apply",
+    ];
+    let (code, _, err) = cli(&mut exec, &no_env, &args);
+    assert_eq!(exec.log.len(), 1, "the pull did not run");
+    assert_eq!(code, ExitCode::FAILURE, "{err}");
+    assert_eq!(
+        err,
+        format!(
+            "FAIL the check after the apply: {busybox} is still not in the store after its pull\n"
+        )
+    );
+}
+
 /// Catches a rollback directory name that is not the seconds since the epoch (two
 /// rollbacks in one run of the clock would share it, or sort out of order).
 #[test]

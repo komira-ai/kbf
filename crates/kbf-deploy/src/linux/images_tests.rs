@@ -183,7 +183,10 @@ fn a_store_copy_that_is_not_the_pin_is_refused() {
         &mut Vec::new(),
     )
     .expect_err("re-check");
-    assert!(matches!(err, HostError::WrongDigest { .. }), "{err}");
+    assert!(
+        matches!(&err, HostError::AfterApply(e) if matches!(**e, HostError::WrongDigest { .. })),
+        "{err}"
+    );
 }
 
 /// Catches an apply that reports success when `podman pull` exited 0 but the image is
@@ -206,7 +209,7 @@ fn a_pull_that_leaves_the_image_missing_fails() {
     )
     .expect_err("still missing");
     assert!(
-        matches!(&err, HostError::NotPulled(i) if *i == ref_a()),
+        matches!(&err, HostError::AfterApply(e) if matches!(&**e, HostError::NotPulled(i) if *i == ref_a())),
         "{err}"
     );
 }

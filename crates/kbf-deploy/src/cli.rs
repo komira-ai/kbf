@@ -20,7 +20,8 @@
 //! 1 a check found a broken rule, or 2 refused (a bad setting or file, printed as
 //! `REFUSED: ...` on stderr). `linux install-units`, `image-pull` and `swap` change the
 //! host as root, plan by default as the `minio` subcommands do, and exit 0 done (or
-//! nothing to do), 1 a step failed, or 2 refused (`REFUSED: ...` on stderr).
+//! nothing to do), 1 a step or the check after an apply failed (`FAIL ...`), or 2
+//! refused (`REFUSED: ...` on stderr).
 //! `minio buckets` reads the MinIO admin key pair from `MINIO_ROOT_USER` and
 //! `MINIO_ROOT_PASSWORD` in the environment (secrets are never flags: argv is
 //! world-readable).
@@ -361,12 +362,17 @@ fn linux_kit<E: Exec>(
     }
 }
 
-/// A host-changing `linux` verb's exit: 0 done, 1 a step failed, 2 refused.
+/// A host-changing `linux` verb's exit: 0 done, 1 a step failed (or the check after
+/// an apply did), 2 refused.
 fn host_verb(done: Result<(), HostError>, err: &mut dyn Write) -> ExitCode {
     match done {
         Ok(()) => ExitCode::SUCCESS,
         Err(e @ HostError::Deploy(kbf_host::HostError::Step { .. })) => {
             let _ = writeln!(err, "kbf-deploy: {e}");
+            ExitCode::FAILURE
+        }
+        Err(e @ HostError::AfterApply(_)) => {
+            let _ = writeln!(err, "FAIL {e}");
             ExitCode::FAILURE
         }
         Err(e) => {
