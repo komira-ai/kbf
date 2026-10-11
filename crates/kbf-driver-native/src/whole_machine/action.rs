@@ -12,6 +12,7 @@ use kbf_daemon::{RuntimeError, Work};
 use kbf_proto::reapi::{Action, ActionResult, Command};
 use tokio::sync::oneshot;
 
+use super::state::{Record, Step};
 use super::{Session, Stop, WholeMachineRuntime, failed_at, io_at};
 use crate::cas::CasStore;
 use crate::runtime::{failed, outputs_error, timeout_of, tree_error};
@@ -26,10 +27,12 @@ enum Ended {
 impl<S: Session, C: Cas> WholeMachineRuntime<S, C> {
     /// Fetches the action, writes its inputs into the lease directory, runs it in the
     /// lease user's GUI session until it exits, times out or is killed, and reads its
-    /// outputs. The lease directory is left for the restore to remove.
+    /// outputs. Records the step `started` just before the `run`. The lease directory
+    /// is left for the restore to remove.
     pub(super) async fn run_in_session(
         &self,
         work: &Work,
+        record: &mut Record,
         stop: &mut oneshot::Receiver<Stop>,
         killer: &mut Option<Stop>,
     ) -> Result<ActionResult, RuntimeError> {
@@ -98,6 +101,9 @@ impl<S: Session, C: Cas> WholeMachineRuntime<S, C> {
             .iter()
             .map(|v| (v.name.clone(), v.value.clone()))
             .collect();
+        // Kept first: a daemon that restarts from here on must not run it again.
+        record.step = Step::Started;
+        self.keep(record).map_err(RuntimeError::Failed)?;
         let running = self
             .helper(move |s| s.run(id, &argv, &env, fds))
             .await

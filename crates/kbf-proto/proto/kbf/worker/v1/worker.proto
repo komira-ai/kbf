@@ -113,13 +113,16 @@ enum Phase {
   // It takes leases.
   PHASE_SERVING = 0;
   // It switches the Mac's GUI session to the user of the whole-machine lease
-  // `lease_id`, which it holds and has not started: a userspace restart, which ends
-  // the daemon too. The server keeps the lease while the node is silent, for longer
-  // than the lease grace, and sends its Start again on the stream of the Hello that
-  // names it after the restart.
+  // `lease_id`, which it holds, then runs its action there. The switch is a userspace
+  // restart, which ends the daemon too. The server keeps the lease while the node is
+  // silent, for longer than the lease grace, and sends its Start again on the stream
+  // of the Hello that names it after the restart. A daemon restarted after the action
+  // started never runs it again: it says PHASE_RESTORING.
   PHASE_PREPARING = 1;
-  // It switches the session back after the whole-machine lease `lease_id` ended and
-  // cleans up; the lease's Result is sent when that is done. Kept the same way.
+  // It switches the session back after the whole-machine lease `lease_id` ended (or
+  // after the daemon restarted while its action ran: the action's processes are
+  // killed and the lease fails, its result lost) and cleans up; the lease's Result is
+  // sent when that is done. Kept the same way.
   PHASE_RESTORING = 2;
   // A cleanup failed (`reason` says which): the node takes no lease until an
   // operator repairs it. The server lists it for attention.

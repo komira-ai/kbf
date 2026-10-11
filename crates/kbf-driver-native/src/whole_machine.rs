@@ -29,6 +29,15 @@
 //! lease, so the helper keeps that lease's session. A `kill` of a recorded lease that
 //! is not running (the server no longer holds it) runs the restore.
 //!
+//! **A restart while the action runs** (a crash or an update, not a session switch)
+//! is not taken up: the record says `started` from just before the `run`, and the
+//! action's processes outlive the daemon (the helper runs them) while its result is
+//! lost with it. At start the runtime kills every process of the lease user
+//! (`kill-uid`) before anything else, records the lease as failed ("its result is
+//! lost", the farm's failure, not the action's) and reports `Restoring`; the `Start`
+//! sent again, or the server's `Cancel`, then runs the restore. The action never runs
+//! a second time on the node.
+//!
 //! **A failed cleanup quarantines the node**: any restore step that fails writes the
 //! quarantine file with why, the phase becomes `Quarantined`, and every later lease is
 //! refused, by this daemon and by every later one on the node, until an operator
@@ -126,7 +135,9 @@ impl<S: Session, C: Cas> WholeMachineRuntime<S, C> {
     /// The runtime over `session` and `cas`, in `config.dir` (made if missing). Reads
     /// the quarantine and the lease record a previous daemon left, and runs the
     /// helper's boot reset naming that lease; a lease user the reset deleted is not
-    /// cleaned up again. A failed boot reset quarantines the node. All of it is done
+    /// cleaned up again. A failed boot reset quarantines the node. A recorded lease whose
+    /// action had started has its user's processes killed and is failed, to be restored
+    /// (`lost_mid_action`). All of it is done
     /// when this returns, so before the daemon says `Hello`.
     ///
     /// # Errors
@@ -152,6 +163,12 @@ impl<S: Session, C: Cas> WholeMachineRuntime<S, C> {
                 quarantine = Some(why);
             }
             Err(why) => tracing::warn!("the boot reset failed again: {why}"),
+        }
+        if let Some(record) = &mut record
+            && record.step == Step::Started
+        {
+            lost_mid_action(&session, record);
+            files.keep(record)?;
         }
         let phase = match (quarantine, &record) {
             (Some(why), _) => NodePhase::Quarantined(why),
@@ -267,7 +284,7 @@ impl<S: Session, C: Cas> WholeMachineRuntime<S, C> {
         }
         self.wait_for_session(id, record.since_ms, stop, killer)
             .await?;
-        self.run_in_session(work, stop, killer).await
+        self.run_in_session(work, record, stop, killer).await
     }
 
     /// Asks the helper until the lease user's GUI session is up, the session wait has
@@ -442,6 +459,27 @@ fn lock(
 ) -> MutexGuard<'_, BTreeMap<LeaseId, oneshot::Sender<Stop>>> {
     // Each update is one map operation.
     stops.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Takes up `record`'s lease after a daemon that died while its action ran (a crash or
+/// an update, not a session switch): the action's processes may still run, and its
+/// result is lost. Kills every process of the lease user first, then turns the lease
+/// to its restore, failed, so the action is never run a second time beside the first.
+/// A `kill-uid` that fails here is retried as the restore's first step, whose failure
+/// quarantines the node.
+fn lost_mid_action<S: Session>(session: &S, record: &mut Record) {
+    let id = record.lease;
+    tracing::warn!(lease = %id, "the daemon restarted while the action ran: killing it");
+    if record.user {
+        match session.kill_uid(id) {
+            Ok(()) => record.killed = true,
+            Err(why) => tracing::warn!("kill-uid at start failed: {why}"),
+        }
+    }
+    record.step = Step::Restoring;
+    record.outcome = Some(Err(RuntimeError::Failed(format!(
+        "the daemon restarted while lease {id}'s action ran: its result is lost"
+    ))));
 }
 
 /// The lease's failure at step `what`, from the helper's (or the file's) reason.

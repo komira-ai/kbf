@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use fake::FakeSession;
 use kbf_daemon::{Runtime, RuntimeError, Work};
-use kbf_driver_native::whole_machine::state::{LEASE_FILE, QUARANTINE_FILE};
+use kbf_driver_native::whole_machine::state::{Files, LEASE_FILE, QUARANTINE_FILE, Record};
 use kbf_driver_native::whole_machine::{DRIVER, KIND, WholeMachineConfig, WholeMachineRuntime};
 use kbf_proto::reapi::Digest;
 use kbf_types::{LeaseId, NodePhase, Resources};
@@ -586,4 +586,195 @@ async fn a_cleanup_that_cannot_record_quarantines_the_node() {
     };
     assert!(why.contains("writing the lease record"), "{why}");
     assert!(!config.dir.join(QUARANTINE_FILE).exists());
+}
+
+/// Catches a daemon that dies while the action runs (not a session switch: the helper
+/// and the action's processes survive it) and whose restarted runtime starts the action
+/// a second time beside the first, still running: no second `run` may come before a
+/// `kill-uid` of the lease user.
+#[tokio::test]
+async fn a_restart_mid_action_does_not_run_it_beside_the_first() {
+    let dir = scratch("whole-probe-mid-action");
+    let cas = Arc::new(MemoryCas::default());
+    let fake = FakeSession::default();
+    let config = config(&dir);
+    let slow = Spec::sh("sleep 3; echo made > out/made.txt")
+        .outputs(&["out/made.txt"])
+        .store(&cas);
+    let before = start(&config, &fake, &cas);
+    let running = {
+        let before = Arc::clone(&before);
+        let slow = slow.clone();
+        tokio::spawn(async move { before.run(work(slow)).await })
+    };
+    until_logged(&fake, "run").await;
+    running.abort();
+    assert!(running.await.is_err());
+    drop(before);
+    fake.verbs();
+    let after = start(&config, &fake, &cas);
+    let _ = run(&after, &slow).await;
+    let verbs = fake.verbs();
+    let second_run = verbs.iter().position(|v| v.starts_with("run "));
+    let kill = verbs.iter().position(|v| v.starts_with("kill-uid"));
+    assert!(
+        second_run.is_none() || kill.is_some_and(|k| k < second_run.unwrap()),
+        "the action ran again beside the first with no kill-uid before: {verbs:?}"
+    );
+}
+
+/// The verbs so far without the `wait` of a run left behind by a dropped runtime (its
+/// blocking wait returns whenever that run's processes end).
+fn verbs_but_wait(fake: &FakeSession) -> Vec<String> {
+    fake.verbs().into_iter().filter(|v| v != "wait").collect()
+}
+
+/// A runtime dropped while `action` runs (the daemon died mid-action), and a new one
+/// started over the same directory, as the restarted daemon starts it.
+async fn restart_mid_action(
+    config: &WholeMachineConfig,
+    fake: &FakeSession,
+    cas: &Arc<MemoryCas>,
+    action: &Digest,
+) -> Arc<Rt> {
+    let before = start(config, fake, cas);
+    let running = {
+        let before = Arc::clone(&before);
+        let action = action.clone();
+        tokio::spawn(async move { before.run(work(action)).await })
+    };
+    until_logged(fake, "run").await;
+    running.abort();
+    assert!(running.await.is_err());
+    drop(before);
+    fake.verbs();
+    start(config, fake, cas)
+}
+
+/// Catches a restart mid-action that is taken up instead of ended: the mutant that drops
+/// the `started` record (the restarted runtime waits for the session and runs the action
+/// again), and the one that skips the `kill-uid` at start (the first copy runs on until
+/// the server's `Start` or `Cancel` comes, if it ever does). The restarted runtime kills
+/// the lease user's processes before it says anything to the server, reports
+/// `restoring`, and the lease fails as the farm's (its result is lost) once the node is
+/// clean.
+#[tokio::test]
+async fn a_restart_mid_action_kills_the_action_at_start_and_fails_the_lease() {
+    let dir = scratch("whole-mid-action");
+    let cas = Arc::new(MemoryCas::default());
+    let fake = FakeSession::default();
+    let config = config(&dir);
+    let slow = Spec::sh("exec sleep 60").store(&cas);
+    let after = restart_mid_action(&config, &fake, &cas, &slow).await;
+    assert_eq!(verbs_but_wait(&fake), ["boot-reset 1.1", "kill-uid 1.1"]);
+    assert_eq!(phase(&after), NodePhase::Restoring(lease()));
+
+    let error = run(&after, &slow)
+        .await
+        .expect_err("a result after the restart");
+    let RuntimeError::Failed(why) = &error else {
+        panic!("{error:?}");
+    };
+    assert!(why.contains("its result is lost"), "{why}");
+    assert_eq!(
+        verbs_but_wait(&fake),
+        ["session-idle (restoring)", "user-delete 1.1 (restoring)"]
+    );
+    assert_eq!(phase(&after), NodePhase::Serving);
+    assert!(!config.dir.join(LEASE_FILE).exists());
+    assert!(!config.dir.join("lease-1-1").exists());
+}
+
+/// Catches a `kill-uid` that fails at start taken as done (the restore would skip it,
+/// and release a node where the first copy may still run): the restore asks again
+/// first, and its failure quarantines the node. The lease still fails as lost.
+#[tokio::test]
+async fn a_restart_mid_action_whose_kill_fails_quarantines_the_node() {
+    let dir = scratch("whole-mid-action-kill-fails");
+    let cas = Arc::new(MemoryCas::default());
+    let fake = FakeSession::default();
+    let config = config(&dir);
+    // The fake leaves the action alive when kill-uid fails; it ends by itself.
+    let slow = Spec::sh("exec sleep 2").store(&cas);
+    fake.state().fail.insert("kill-uid");
+    let after = restart_mid_action(&config, &fake, &cas, &slow).await;
+    assert_eq!(verbs_but_wait(&fake), ["boot-reset 1.1", "kill-uid 1.1"]);
+    assert_eq!(phase(&after), NodePhase::Restoring(lease()));
+
+    let error = run(&after, &slow)
+        .await
+        .expect_err("a result after the restart");
+    assert!(error.to_string().contains("its result is lost"), "{error}");
+    assert_eq!(verbs_but_wait(&fake), ["kill-uid 1.1 (restoring)"]);
+    let NodePhase::Quarantined(why) = phase(&after) else {
+        panic!("not quarantined: {:?}", phase(&after));
+    };
+    assert!(why.contains("kill-uid: kill-uid failed"), "{why}");
+}
+
+/// Catches a restart mid-action that kills (and then deletes) a lease user the boot
+/// reset already deleted: the helper would refuse the unknown user, and the node be
+/// quarantined for nothing. The lease still fails as lost, and the session is idled.
+#[tokio::test]
+async fn a_restart_mid_action_after_the_reset_deleted_the_user_kills_nothing() {
+    let dir = scratch("whole-mid-action-reset");
+    let cas = Arc::new(MemoryCas::default());
+    let fake = FakeSession::default();
+    let config = config(&dir);
+    let slow = Spec::sh("exec sleep 2").store(&cas);
+    fake.state().deleted_by_reset = vec![lease()];
+    let after = restart_mid_action(&config, &fake, &cas, &slow).await;
+    assert_eq!(verbs_but_wait(&fake), ["boot-reset 1.1"]);
+    assert_eq!(phase(&after), NodePhase::Restoring(lease()));
+
+    let error = run(&after, &slow)
+        .await
+        .expect_err("a result after the restart");
+    assert!(error.to_string().contains("its result is lost"), "{error}");
+    assert_eq!(verbs_but_wait(&fake), ["session-idle (restoring)"]);
+    assert_eq!(phase(&after), NodePhase::Serving);
+}
+
+/// Catches a session wait counted from when this daemon took the lease up rather than
+/// from when the lease was first taken (the mutant "deadline from now": each restart
+/// would start the wait again, and the action could start after the server's switch
+/// grace has given the lease up). A record taken longer ago than the wait fails the
+/// lease at the first `session-ready` that says not yet.
+#[tokio::test]
+async fn the_session_wait_counts_from_when_the_lease_was_first_taken() {
+    let dir = scratch("whole-wait-since");
+    let cas = Arc::new(MemoryCas::default());
+    let fake = FakeSession::default();
+    fake.state().ready_after = usize::MAX;
+    let mut config = config(&dir);
+    // Longer than `run` waits for the lease to end.
+    config.session_wait = PROMPT * 4;
+    std::fs::create_dir_all(&config.dir).expect("the directory");
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("after the epoch")
+        .as_millis();
+    let wait_ms = config.session_wait.as_millis() + 1000;
+    let taken = u64::try_from(now_ms - wait_ms).expect("fits");
+    let mut record = Record::new(lease(), taken);
+    record.user = true;
+    record.login = true;
+    Files::new(config.dir.clone())
+        .keep(&record)
+        .expect("the record");
+
+    let runtime = start(&config, &fake, &cas);
+    assert_eq!(phase(&runtime), NodePhase::Preparing(lease()));
+    let error = run(&runtime, &the_action(&cas)).await.expect_err("ran");
+    assert!(error.to_string().contains("was not up within"), "{error}");
+    assert_eq!(
+        fake.verbs(),
+        [
+            "boot-reset 1.1",
+            "session-ready 1.1 (preparing)",
+            "kill-uid 1.1 (restoring)",
+            "session-idle (restoring)",
+            "user-delete 1.1 (restoring)",
+        ]
+    );
 }

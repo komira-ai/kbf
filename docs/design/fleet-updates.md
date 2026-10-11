@@ -709,7 +709,12 @@ Every lease takes this path, GUI or not: a whole-machine lease is the Mac's alon
 the two switches (L2 below) cost minutes, small next to a GPU or desktop-app test. The
 node's phase is in every `Hello` ([worker-protocol.md](worker-protocol.md#node-phases)):
 the server keeps the lease across both restarts and sends its `Start` again to the
-restarted daemon, which takes the lease up at the step its on-disk record names. At
+restarted daemon, which takes the lease up at the step its on-disk record names. The
+record says `started` from just before the action's `run`: a daemon that restarts
+after that (a crash or an update, not a switch; the action's processes outlive it)
+never runs the action again. At start it kills every process of the lease user
+(`kill-uid`) before its `Hello`, which says `restoring`, and the lease fails as the
+farm's, its result lost, once the node is restored. At
 start the runtime runs the helper's boot reset naming that lease, so its session is
 kept and every other leftover lease user deleted. **A cleanup step that fails
 quarantines the node**: the runtime writes a quarantine file naming the failure, the
@@ -719,8 +724,9 @@ daemon returns it. The lease still reports its action's outcome.
 
 Not built yet: the lease's sandbox profile (actions run as the lease user, unsandboxed),
 the leak scan and its baseline (L3), the erase (L4, L5), privileged leases, a memory
-watch (the lease books the whole Mac), and the move of the daemon to a LaunchDaemon
-that the userspace restart brings back. Its layers are next.
+watch (the lease books the whole Mac), an end to a lease's processes when the daemon
+dies (until the restarted daemon kills them they run on), and the move of the daemon
+to a LaunchDaemon that the userspace restart brings back. Its layers are next.
 
 ### 10.2 Isolation layers
 

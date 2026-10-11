@@ -196,16 +196,21 @@ registration's included, before any placement round:
 
 - `serving`: placement may offer it leases.
 - `preparing <lease>`: it switches a Mac's GUI session to the user of that
-  whole-machine lease, which it holds and has not started; `restoring <lease>`: it
+  whole-machine lease, which it holds, then runs its action; `restoring <lease>`: it
   switches back after the lease's action ended, and cleans up. The switch is a
   userspace restart that ends the daemon, so the worker is silent for minutes. While
   the worker is silent, that lease (and only that one) is kept for
   `SESSION_SWITCH_GRACE` (10 minutes, more than G) counted from the first report of the
   phase, instead of G; past it the lease goes back to the queue with the reason
-  `SessionSwitch`. Nothing of the lease runs meanwhile (the action has not started, or
-  has ended with its result kept on the node), so keeping it past G cannot run it
-  twice. The same phase reported again (after the restart) does not extend the grace;
-  `preparing` then `restoring` gives the switch back a grace of its own.
+  `SessionSwitch`. Nothing of the lease runs during a switch (the action has not
+  started, or has ended with its result kept on the node), so keeping it past G cannot
+  run it twice. A daemon that dies while the action runs is no switch: the action's
+  processes live on until the restarted daemon kills them before its `Hello`; that
+  daemon says `restoring <lease>` and fails the lease (its result is lost) rather than
+  run it again. Until it is back those processes live on (the helper runs them), beside
+  a retry elsewhere once the lease is given up. The same phase reported again (after
+  the restart) does not extend the grace; `preparing` then `restoring` gives the switch
+  back a grace of its own.
 - When a phase names a lease the scheduler holds on that worker, committed, whose
   `Start` went to an earlier session (the restarted daemon is a new session, and a new
   process), the scheduler sends the `Start` again to the new session: that is how the

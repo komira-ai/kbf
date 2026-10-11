@@ -25,8 +25,12 @@ pub const QUARANTINE_FILE: &str = "quarantine";
 /// Where the lease is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Step {
-    /// Its user is made and logged in; its action has not ended.
+    /// Its user is made and logged in; its action has not been handed to the helper.
     Preparing,
+    /// Its action was handed to the helper's `run` and has not ended: a daemon that
+    /// restarts here finds the action's result lost, kills the lease user's processes
+    /// and fails the lease, never running the action again.
+    Started,
     /// Its action ended (the outcome is kept); the node is being cleaned.
     Restoring,
 }
@@ -73,6 +77,7 @@ impl Record {
         let flag = |b: bool| if b { "yes" } else { "no" };
         let step = match self.step {
             Step::Preparing => "preparing",
+            Step::Started => "started",
             Step::Restoring => "restoring",
         };
         let mut text = format!(
@@ -127,6 +132,7 @@ impl Record {
             .ok_or_else(|| format!("lease {lease:?} is not <term>.<seq>"))?;
         let step = match value("step")? {
             "preparing" => Step::Preparing,
+            "started" => Step::Started,
             "restoring" => Step::Restoring,
             other => return Err(format!("step {other:?} is unknown")),
         };
@@ -303,11 +309,7 @@ mod tests {
             Some(Err(RuntimeError::Failed("no session".to_owned()))),
         ];
         for (i, outcome) in outcomes.drain(..).enumerate() {
-            record.step = if i % 2 == 0 {
-                Step::Preparing
-            } else {
-                Step::Restoring
-            };
+            record.step = [Step::Preparing, Step::Started, Step::Restoring][i % 3];
             record.user = i % 2 == 1;
             record.login = i % 3 == 1;
             record.killed = i % 4 == 1;
@@ -336,6 +338,7 @@ mod tests {
             ("lease 1.2", "lease 1-2"),
             ("lease 1.2", "lease x.2"),
             ("step preparing", "step done"),
+            ("step preparing", "step start"),
             ("user no", "user maybe"),
             ("since 5", "since soon"),
             ("idle no\n", ""),
