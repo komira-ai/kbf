@@ -20,7 +20,8 @@
 //! with the node's network. Which of the two a node has is reported as the capability
 //! `network_isolation` (`sandbox-exec` or `none`), so nothing about it is hidden.
 //!
-//! Every profile ends with [`NO_DEVICE_RULES`], which keeps an action away from the
+//! Every profile carries [`NO_DEVICE_RULES`], after the network rules and before the
+//! lease's write rules. It keeps an action away from the
 //! services that reach an iOS device on the node: the CoreDevice mach services
 //! (`devicectl`'s `CoreDeviceService` among them), `remoted` and the `usbmuxd`
 //! socket. No lease has a device yet, so no action may reach them
@@ -115,7 +116,7 @@ pub const NO_NETWORK_PROFILE: &str = "(version 1)\n\
 (allow network* (remote ip \"localhost:*\"))\n\
 (allow network* (remote unix-socket))\n";
 
-/// The rules every profile ends with: no lookup of a
+/// The rules every profile carries (after the network rules): no lookup of a
 /// CoreDevice mach service or XPC service (`com.apple.CoreDevice.CoreDeviceService`,
 /// which `devicectl` asks for everything, `com.apple.CoreDevice.remotepairingd`,
 /// `com.apple.CoreDevice.CoreDeviceDDIUpdaterService` and the rest of the prefix), none
