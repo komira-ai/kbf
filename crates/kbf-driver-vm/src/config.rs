@@ -19,8 +19,8 @@ pub const HELPER_MEMORY_BYTES: u64 = 1 << 30;
 /// assumption until guests are measured.
 pub const MIN_FREE_BYTES: u64 = 32 << 30;
 
-/// How long past the action's timeout the driver waits for the guest's report before it
-/// ends the run itself: the guest enforces the timeout and drains the command's group
+/// How long past the action's timeout the driver waits, by default, for the guest's
+/// report before it ends the run itself: the guest enforces the timeout and drains the command's group
 /// for up to 5 s ([`kbf_guest::run::DRAIN`]), so a report later than this means the
 /// guest is not answering.
 pub const REPORT_GRACE: Duration = Duration::from_secs(30);
@@ -41,6 +41,8 @@ pub struct VmConfig {
     pub default_timeout: Duration,
     /// See [`MIN_FREE_BYTES`].
     pub min_free_bytes: u64,
+    /// See [`REPORT_GRACE`].
+    pub report_grace: Duration,
     /// The output limits, as for the other drivers.
     pub outputs: OutputLimits,
 }
@@ -56,6 +58,7 @@ impl VmConfig {
             boot_poll: Duration::from_millis(250),
             default_timeout: Duration::from_secs(3600),
             min_free_bytes: MIN_FREE_BYTES,
+            report_grace: REPORT_GRACE,
             outputs: OutputLimits::DEFAULT,
         }
     }

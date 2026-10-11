@@ -30,7 +30,7 @@
 //! 6. **Run.** One `Run`: argv, the Command's environment, the working directory and the
 //!    declared outputs. The guest writes stdout and stderr to the outputs share and
 //!    enforces the timeout; the driver waits for its report, at most
-//!    [`config::REPORT_GRACE`] past the timeout.
+//!    [`VmConfig::report_grace`] (30 s by default) past the timeout.
 //! 7. **Collect.** The VM is stopped, then the outputs are read from the host side of the
 //!    outputs share with `kbf-outputs`, which follows no symlinks, with stdout and
 //!    stderr.

@@ -3,9 +3,9 @@
 //! and a Unix socket pair as the virtio socket, so the driver's side of the protocol is
 //! the one a real guest sees. A clone is a plain copy of the image directory.
 //!
-//! It keeps the macOS limit of two running VMs (configurable), can delay or withhold
-//! its guests' readiness, can crash a running VM, and records every spec it started
-//! and every stop it was asked for.
+//! It keeps the macOS limit of two running VMs, can delay or withhold its guests'
+//! readiness, crash a running VM, silence a guest once its command has started, and
+//! fail stops; it records every spec it started and every stop it was asked for.
 
 use std::collections::BTreeMap;
 use std::io;
@@ -17,7 +17,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use kbf_guest::server::{Agent, Config, HELLO_TIMEOUT};
-use kbf_guest::wire::TOKEN_LEN;
+use kbf_guest::wire::{GuestMsg, TOKEN_LEN, read_frame, write_frame};
 
 use crate::host::{HostError, INPUTS_TAG, OUTPUTS_TAG, VmHost, VmSpec};
 use crate::{GUI_SESSION, TOKEN_FILE};
@@ -32,6 +32,10 @@ pub struct FakeHost {
     /// How long after `start` a guest can be reached; `None` for never.
     ready_after: Option<Duration>,
     session: String,
+    /// Whether guests send nothing after `Started`.
+    mute: bool,
+    /// How many stops succeed before every later one reports an error.
+    stops_ok: usize,
     state: Mutex<State>,
 }
 
@@ -82,6 +86,8 @@ impl FakeHost {
             limit: MACOS_VM_LIMIT,
             ready_after: Some(Duration::ZERO),
             session: GUI_SESSION.to_owned(),
+            mute: false,
+            stops_ok: usize::MAX,
             state: Mutex::new(State::default()),
         }
     }
@@ -104,6 +110,22 @@ impl FakeHost {
     #[must_use]
     pub fn session(mut self, session: &str) -> Self {
         session.clone_into(&mut self.session);
+        self
+    }
+
+    /// Guests send nothing once they have reported `Started`, as a guest that hangs
+    /// mid-run: the command runs, its report never arrives.
+    #[must_use]
+    pub fn mute_after_start(mut self) -> Self {
+        self.mute = true;
+        self
+    }
+
+    /// The first `ok` stops succeed; every later one stops the VM but reports an
+    /// error, as a hypervisor that cannot confirm the stop.
+    #[must_use]
+    pub fn failing_stops_after(mut self, ok: usize) -> Self {
+        self.stops_ok = ok;
         self
     }
 
@@ -171,17 +193,14 @@ impl VmHost for FakeHost {
         if state.running.len() >= self.limit {
             return Err(HostError::LimitExceeded(self.limit));
         }
-        if state.running.contains_key(&spec.name) {
-            return Err(io::Error::new(io::ErrorKind::AlreadyExists, "the VM is running").into());
-        }
         let share = |tag| {
-            spec.shares
-                .iter()
-                .find(|s| s.tag == tag)
-                .map(|s| s.host.clone())
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "a share is missing"))
+            let share = spec.shares.iter().find(|s| s.tag == tag);
+            share
+                .expect("the driver gives every VM both shares")
+                .host
+                .clone()
         };
-        let (inputs, outputs) = (share(INPUTS_TAG)?, share(OUTPUTS_TAG)?);
+        let (inputs, outputs) = (share(INPUTS_TAG), share(OUTPUTS_TAG));
         // The guest reads its token from the inputs share, as `kbf-guest serve` does.
         let token = read_token(&inputs.join(TOKEN_FILE))?;
         let config = Config {
@@ -196,9 +215,8 @@ impl VmHost for FakeHost {
             let mut agent = Agent::new(config);
             // As `Agent::serve`: one connection at a time, until the one that ran.
             for stream in rx {
-                if let Err(e) = agent.serve_connection(stream) {
-                    eprintln!("fake guest: connection ended: {e}");
-                }
+                // Fails only setting the stream up; the driver sees its end either way.
+                let _ = agent.serve_connection(stream);
                 if agent.has_run() {
                     return;
                 }
@@ -226,30 +244,61 @@ impl VmHost for FakeHost {
         }
         let conns = booted.conns.as_ref().ok_or_else(not_running)?;
         let (host, guest) = UnixStream::pair()?;
-        conns.send(guest).map_err(|_| not_running())?;
         booted.open.push(host.try_clone()?);
+        let guest = if self.mute {
+            let (relay, agent_end) = UnixStream::pair()?;
+            booted.open.push(agent_end.try_clone()?);
+            mute_after_started(guest, relay)?;
+            agent_end
+        } else {
+            guest
+        };
+        conns.send(guest).ok().ok_or_else(not_running)?;
         Ok(host)
     }
 
     fn stop(&self, name: &str) -> io::Result<()> {
-        let booted = {
+        let (booted, stops) = {
             let mut state = self.lock();
             state.stopped.push(name.to_owned());
-            state.running.remove(name)
+            (state.running.remove(name), state.stopped.len())
         };
         if let Some(mut booted) = booted {
             booted.end();
+        }
+        if stops > self.stops_ok {
+            return Err(io::Error::other("the hypervisor did not confirm the stop"));
         }
         Ok(())
     }
 }
 
+/// Relays between `host` (the host's side) and `agent` (the agent's): everything the
+/// host sends, and what the agent sends up to and including `Started`; nothing after.
+fn mute_after_started(host: UnixStream, agent: UnixStream) -> io::Result<()> {
+    let (mut host_in, mut agent_out) = (host.try_clone()?, agent.try_clone()?);
+    std::thread::spawn(move || {
+        let _ = io::copy(&mut host_in, &mut agent_out);
+        let _ = agent_out.shutdown(std::net::Shutdown::Both);
+    });
+    let (mut agent_in, mut host_out) = (agent, host);
+    std::thread::spawn(move || {
+        let mut started = false;
+        while let Ok(frame) = read_frame(&mut agent_in) {
+            if !started {
+                started = matches!(GuestMsg::decode(&frame), Ok(GuestMsg::Started { .. }));
+                let _ = write_frame(&mut host_out, &frame);
+            }
+        }
+    });
+    Ok(())
+}
+
+/// The token the driver wrote at `path`.
 fn read_token(path: &Path) -> io::Result<[u8; TOKEN_LEN]> {
     let text = std::fs::read_to_string(path)?;
-    hex::decode(text.trim())
-        .ok()
-        .and_then(|b| b.try_into().ok())
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "not a token"))
+    let bytes = hex::decode(text.trim()).expect("the driver writes the token as hex");
+    Ok(bytes.try_into().expect("the driver writes TOKEN_LEN bytes"))
 }
 
 /// Copies the directory `from` to `to`, which must not exist: directories and regular

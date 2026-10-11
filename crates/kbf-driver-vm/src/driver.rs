@@ -22,7 +22,7 @@ use kbf_types::{LeaseId, Resources};
 use prost_types::Timestamp;
 use tokio::sync::oneshot;
 
-use crate::config::{HELPER_MEMORY_BYTES, REPORT_GRACE, VmConfig};
+use crate::config::{HELPER_MEMORY_BYTES, VmConfig};
 use crate::host::{HostError, INPUTS_TAG, MachineId, OUTPUTS_TAG, Share, VmHost, VmSpec};
 use crate::{GUI_SESSION, TOKEN_FILE};
 
@@ -161,8 +161,9 @@ impl<H: VmHost, C: Cas> VmDriver<H, C> {
     /// Fails unless the clones' volume has [`VmConfig::min_free_bytes`] free.
     fn check_free_space(&self) -> Result<(), RuntimeError> {
         let clones = self.config.clones();
-        let stat =
-            rustix::fs::statvfs(&clones).map_err(|e| failed(&clones)(std::io::Error::from(e)))?;
+        let stat = rustix::fs::statvfs(&clones)
+            .map_err(std::io::Error::from)
+            .map_err(failed(&clones))?;
         let free = stat.f_bavail.saturating_mul(stat.f_frsize);
         if free < self.config.min_free_bytes {
             return Err(RuntimeError::Failed(format!(
@@ -211,16 +212,22 @@ impl<H: VmHost, C: Cas> VmDriver<H, C> {
         killer: &mut Option<Stop>,
     ) -> Result<Exit, RuntimeError> {
         let request = prepared.request.clone();
-        // On a stop or the guest's silence this task is left blocked on the stream;
-        // stopping the VM ends the stream, and the task with it.
-        let reported = blocking(move || {
-            client.run(&request).map_err(client_error)?;
-            client.wait().map_err(client_error)
+        // On a stop or the guest's silence the thread is left blocked on the stream
+        // until the VM is stopped, which ends the stream. A thread of its own, not the
+        // runtime's blocking pool: a stream that never ends must not hold up the
+        // runtime's shutdown.
+        let grace = self.config.report_grace;
+        let (report, reported) = oneshot::channel();
+        std::thread::spawn(move || {
+            let exit = (client.run(&request).map_err(client_error))
+                .and_then(|_| client.wait().map_err(client_error));
+            let _ = report.send(exit);
         });
         tokio::select! {
-            exit = reported => exit,
-            () = tokio::time::sleep(prepared.timeout + REPORT_GRACE) => Err(RuntimeError::Failed(
-                format!("the guest sent no report within {REPORT_GRACE:?} past the action's timeout"),
+            // A reader that panicked sends nothing; the grace below ends the lease.
+            Ok(exit) = reported => exit,
+            () = tokio::time::sleep(prepared.timeout + grace) => Err(RuntimeError::Failed(
+                format!("the guest sent no report within {grace:?} past the action's timeout"),
             )),
             Ok(by) = &mut *stop => {
                 *killer = Some(by);
@@ -300,11 +307,9 @@ impl<H: VmHost, C: Cas> VmDriver<H, C> {
         clock.execution_start_timestamp = now();
         let exit = self.execute(client, &prepared, stop, killer).await?;
         clock.execution_completed_timestamp = now();
-        if exit.stragglers {
-            tracing::warn!(lease = %work.lease_id, "processes of the command outlived it in the guest");
-        }
         // Stopped before the outputs are read, so nothing in the guest writes to the
-        // share while it is read.
+        // share while it is read: a process of the command the guest could not end
+        // (`Exit::stragglers`) ends with the VM.
         parts.stop_vm().await?;
         let exit_code = exit_code(exit.end)?;
 
@@ -367,9 +372,9 @@ impl<H: VmHost, C: Cas> Runtime for VmDriver<H, C> {
             let _ = by.send(());
         }
         match (outcome, destroyed) {
-            (Ok(_), Err(why)) => Err(RuntimeError::Failed(format!("destroy: {why}"))),
-            (outcome, Err(why)) => {
-                tracing::error!(lease = %work.lease_id, "destroy: {why}");
+            (Ok(_), Err(failed)) => Err(failed),
+            (outcome, Err(failed)) => {
+                tracing::error!(lease = %work.lease_id, "{failed}");
                 outcome
             }
             (outcome, Ok(())) => outcome,
@@ -417,9 +422,8 @@ fn handshake<S: kbf_guest::server::Stream>(
 /// # Errors
 /// The booking leaves the guest no memory: the farm's error, not the action's.
 fn vm_size(resources: Resources) -> Result<(u32, u64), RuntimeError> {
-    let cpus = resources.cpu_millis.div_ceil(1000).max(1);
-    let cpus = u32::try_from(cpus)
-        .map_err(|_| RuntimeError::Failed(format!("{cpus} cores is more than a VM can have")))?;
+    // A booking past u32::MAX cores is not one a host can start; it refuses it.
+    let cpus = u32::try_from(resources.cpu_millis.div_ceil(1000).max(1)).unwrap_or(u32::MAX);
     match resources.memory_bytes.checked_sub(HELPER_MEMORY_BYTES) {
         Some(memory) if memory > 0 => Ok((cpus, memory)),
         _ => Err(RuntimeError::Failed(format!(
@@ -507,9 +511,9 @@ impl<H: VmHost> Parts<H> {
         .await
     }
 
-    /// Stops the VM, then removes the clone and the lease directory and checks that
-    /// neither is left. Every step is tried whatever an earlier one did.
-    fn destroy(&self) -> Result<(), String> {
+    /// Stops the VM, then removes the clone and the lease directory (a removal that
+    /// returns has left nothing). Every step is tried whatever an earlier one did.
+    fn destroy(&self) -> Result<(), RuntimeError> {
         let mut errors = Vec::new();
         if let Err(e) = self.host.stop(&self.name) {
             errors.push(format!("stop the VM {}: {e}", self.name));
@@ -517,14 +521,15 @@ impl<H: VmHost> Parts<H> {
         for path in [&self.clone, &self.dir] {
             if let Err(e) = kbf_outputs::remove_tree(path) {
                 errors.push(format!("remove {}: {e}", path.display()));
-            } else if std::fs::symlink_metadata(path).is_ok() {
-                errors.push(format!("{} is still there", path.display()));
             }
         }
         if errors.is_empty() {
             Ok(())
         } else {
-            Err(errors.join("; "))
+            Err(RuntimeError::Failed(format!(
+                "destroy: {}",
+                errors.join("; ")
+            )))
         }
     }
 }
@@ -545,11 +550,10 @@ impl<H: VmHost> Lease<H> {
     }
 
     /// Destroys the lease's parts, off the async threads.
-    async fn destroy(mut self) -> Result<(), String> {
+    async fn destroy(mut self) -> Result<(), RuntimeError> {
         self.armed = false;
         let parts = Arc::clone(&self.parts);
-        let destroyed = tokio::task::spawn_blocking(move || parts.destroy()).await;
-        destroyed.map_err(|e| format!("destroy task: {e}"))?
+        blocking(move || parts.destroy()).await
     }
 }
 

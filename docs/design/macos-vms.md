@@ -473,7 +473,8 @@ Rules:
 a `VmHost` trait (clone an image, start a VM from a `VmSpec`, connect to its guest
 agent, stop it), and `FakeHost`, which runs the real `kbf-guest` agent in the daemon's
 process over a Unix socket pair, copies the image directory as its "clone", keeps the
-limit of two running VMs and can delay, withhold or crash a guest. The daemon does not
+limit of two running VMs, and can delay, withhold, crash or silence a guest and fail a
+stop. The daemon does not
 offer the driver yet (no `--driver vm`), and no host on Virtualization.framework exists.
 Per lease, as built:
 
@@ -488,7 +489,8 @@ Per lease, as built:
   `standard` is refused with INVALID_ARGUMENT before anything is cloned.
 - Boot: the driver connects until the agent answers `Ready`, within the boot timeout
   (120 s by default), and refuses an agent not in the `Aqua` session. The `Run` carries
-  the action's whole timeout; the driver gives up on a guest silent for 30 s past it.
+  the action's whole timeout; the driver gives up on a guest silent for 30 s past it (as
+  the farm's).
 - Collect: the VM is stopped first, so nothing in the guest writes to the outputs share
   while it is read.
 - Destroy, on every path (a kill and the daemon dropping the run included): stop the

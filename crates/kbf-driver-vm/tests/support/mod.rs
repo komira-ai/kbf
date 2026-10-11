@@ -21,18 +21,37 @@ pub const PROMPT: Duration = Duration::from_secs(10);
 
 pub const GIB: u64 = 1 << 30;
 
-/// A CAS in memory.
+/// A CAS in memory; `delay` holds every `get` back (to kill a lease mid-fetch).
 #[derive(Debug, Default)]
 pub struct MemoryCas {
     blobs: Mutex<BTreeMap<String, Vec<u8>>>,
+    delay: Option<Duration>,
 }
 
 impl MemoryCas {
+    /// A CAS whose every `get` waits `delay` first.
+    pub fn delayed(delay: Duration) -> Self {
+        Self {
+            delay: Some(delay),
+            ..Self::default()
+        }
+    }
+
     pub fn insert(&self, bytes: impl Into<Vec<u8>>) -> Digest {
         let bytes = bytes.into();
         let digest = digest_of(&bytes);
         self.lock().insert(label(&digest), bytes);
         digest
+    }
+
+    /// Replaces the bytes stored under `digest`, which no longer match it.
+    pub fn corrupt(&self, digest: &Digest) {
+        self.lock()
+            .insert(label(digest), b"not these bytes".to_vec());
+    }
+
+    pub fn remove(&self, digest: &Digest) {
+        self.lock().remove(&label(digest));
     }
 
     pub fn blob(&self, digest: &Digest) -> Vec<u8> {
@@ -49,6 +68,9 @@ impl MemoryCas {
 
 impl Cas for MemoryCas {
     async fn get(&self, digest: &Digest) -> Result<Vec<u8>, CasError> {
+        if let Some(delay) = self.delay {
+            tokio::time::sleep(delay).await;
+        }
         self.lock()
             .get(&label(digest))
             .cloned()
@@ -66,6 +88,7 @@ pub struct Spec {
     pub argv: Vec<String>,
     pub env: Vec<(String, String)>,
     pub outputs: Vec<String>,
+    pub working_directory: String,
     pub inputs: Vec<(String, Vec<u8>)>,
     pub properties: Vec<(String, String)>,
     pub timeout: Option<Duration>,
@@ -90,6 +113,11 @@ impl Spec {
 
     pub fn outputs(mut self, outputs: &[&str]) -> Self {
         self.outputs = outputs.iter().map(|o| (*o).to_owned()).collect();
+        self
+    }
+
+    pub fn working_directory(mut self, dir: &str) -> Self {
+        dir.clone_into(&mut self.working_directory);
         self
     }
 
@@ -129,6 +157,7 @@ impl Spec {
                 })
                 .collect(),
             output_paths: self.outputs.clone(),
+            working_directory: self.working_directory.clone(),
             ..Command::default()
         };
         let action = Action {
