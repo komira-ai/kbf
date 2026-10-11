@@ -181,7 +181,7 @@ impl SwapWatch {
 
     /// What the lease holds in swap now that it pushed there itself, at its cap.
     pub(crate) fn own(&self) -> u64 {
-        self.last.swap - self.not_own
+        self.last.swap
     }
 }
 
