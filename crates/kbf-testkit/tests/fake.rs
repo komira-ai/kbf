@@ -307,3 +307,49 @@ fn missing_and_malformed_rules_are_refused() {
         assert!(text(&out.stderr).contains(said), "{name}: {out:?}");
     }
 }
+
+/// Catches: a relative link target resolved against the working directory instead of
+/// the link's own directory (an app bundle's `usr/bin/xcrun -> ../../...` pointing at
+/// the test's one fake would find no rules, or another directory's).
+#[test]
+fn a_relative_link_is_followed_from_its_own_directory() {
+    let dir = dir("fake-relative");
+    fake(&dir, "xcrun", "--version\t-\techo xcrun version 70\n");
+    let bin = dir.join("app/bin");
+    std::fs::create_dir_all(&bin).expect("app/bin");
+    let chained = bin.join("xcrun");
+    std::os::unix::fs::symlink("../../xcrun", &chained).expect("chain");
+    let out = Command::new(&chained)
+        .arg("--version")
+        .current_dir("/")
+        .output()
+        .expect("runs");
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    assert_eq!(text(&out.stdout), "xcrun version 70\n");
+}
+
+/// Catches: `spawn-child` in a fake's rule starting its child under the fake's name,
+/// so the child answers as the fake (no rule matches its step, it exits 64) instead
+/// of running the step. The fake is a hard link here, not a symbolic one, so the
+/// program's own path (what `spawn-child` runs) is named `xcrun` as on macOS.
+#[test]
+fn spawn_child_in_a_fake_runs_the_step() {
+    let dir = dir("fake-spawn");
+    let fake = dir.join("xcrun");
+    std::fs::hard_link(ACT, &fake).expect("hard link");
+    let mark = dir.join("mark");
+    let rules = format!("go\t-\tspawn-child append {} child\n", mark.display());
+    std::fs::write(dir.join("xcrun.rules"), rules).expect("rules");
+    let out = run(&fake, &["go"], None);
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::fs::read_to_string(&mark).ok().as_deref() != Some("child\n") {
+        assert!(
+            std::time::Instant::now() < until,
+            "the child never ran its step"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let log = std::fs::read_to_string(dir.join("xcrun.log")).expect("log");
+    assert_eq!(log, format!("{} go\n", fake.display()));
+}
