@@ -79,8 +79,8 @@ fn drop_and_exec(args: &[OsString]) -> Result<std::convert::Infallible, (u8, Str
             .ok_or_else(|| refused(format!("{text:?} is not a non-root id")))
     };
     let (uid, gid) = (id(uid)?, id(gid)?);
-    // SAFETY: setgroups with a count of 0 reads no list.
-    if unsafe { libc::setgroups(0, std::ptr::null()) } != 0 {
+    // MUTANT: the supplementary groups are kept.
+    if false {
         let why = io::Error::last_os_error();
         return Err(refused(format!("dropping the supplementary groups: {why}")));
     }
