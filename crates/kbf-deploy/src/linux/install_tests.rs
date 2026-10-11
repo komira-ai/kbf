@@ -810,3 +810,67 @@ fn a_replaced_binary_is_kept_as_roots() {
     };
     assert_eq!(fake.entries.get(&previous), Some(&kept));
 }
+
+/// Catches the Raft and scratch directories made or kept as root's (the owner of the
+/// files root writes) instead of their service's user's, which could then not write
+/// its log or its builds. The scratch tests cannot see it: they run with one user as
+/// root and as both services. Here kbf is 2001:2002 and kbf-server 3001:3002, the
+/// directories are missing, and the apply must make each 0700 with its user's owner;
+/// a re-run must then plan nothing (a directory kept as its user's is left alone).
+#[test]
+fn the_raft_and_scratch_directories_are_their_users_not_roots() {
+    let (mut exec, world) = host("install-owner-dirs");
+    go(&mut exec, &install(), Mode::Apply);
+    let kbf = Owner {
+        uid: 2001,
+        gid: 2002,
+    };
+    let server = Owner {
+        uid: 3001,
+        gid: 3002,
+    };
+    world.borrow_mut().users = BTreeMap::from([
+        ("kbf".to_owned(), (kbf.uid, kbf.gid)),
+        ("kbf-server".to_owned(), (server.uid, server.gid)),
+    ]);
+    let keys = [
+        ("s3.env", server),
+        ("api-token", server),
+        ("reapi.key", server),
+        ("worker.key", server),
+        ("node.key", kbf),
+    ];
+    let keys: Vec<(HostPath, Entry)> = keys
+        .into_iter()
+        .map(|(name, owner)| {
+            let path = format!("/etc/kbf/{name}");
+            let bytes = fs::read(exec.at(&path)).expect("key");
+            let perms = Perms::new(0o600);
+            let entry = Entry::File {
+                perms,
+                owner,
+                bytes,
+            };
+            (HostPath::new(&path).expect("path"), entry)
+        })
+        .collect();
+    let mut fake = fake_of(exec);
+    fake.entries.extend(keys);
+    let raft = HostPath::new("/var/lib/kbf-server/raft").expect("path");
+    let leases = HostPath::new("/var/lib/kbf/leases").expect("path");
+    fake.entries.remove(&raft);
+    fake.entries.remove(&leases);
+
+    run(&mut fake, &install(), Mode::Apply, &mut Vec::new()).expect("apply");
+    let dir = |owner| Entry::Dir {
+        perms: Perms::new(0o700),
+        owner,
+    };
+    assert_eq!(fake.entries.get(&raft), Some(&dir(server)));
+    assert_eq!(fake.entries.get(&leases), Some(&dir(kbf)));
+
+    let mut out = Vec::new();
+    run(&mut fake, &install(), Mode::DryRun, &mut out).expect("re-run");
+    let out = String::from_utf8(out).expect("utf-8");
+    assert!(out.ends_with("nothing to do\n"), "{out}");
+}
