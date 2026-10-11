@@ -330,8 +330,10 @@ sudo -n rm -f "$intent"
 
 step "a process started in a GUI session runs in it: the runner's own (no session switch)"
 # No lease user has a GUI session here (that takes a session switch, which restarts
-# userspace), so spawn::spawn runs for the runner's own uid, from launchd's system
-# context (bsexec 1), where a background process stays and a GUI one must leave.
+# userspace), so spawn::spawn runs for the runner's own uid, under sudo as the helper
+# runs: the control, a background run, must not be in a GUI session, and the GUI run
+# must. (Under `launchctl bsexec 1` the nested `launchctl asuser` refuses with
+# "Reentrancy avoided", run 38148803625; the helper itself is never nested so.)
 me=$(id -u) my_gid=$(id -g) my_name=$(id -un)
 launchctl print "gui/$me" >/dev/null 2>&1 || fail "the runner has no gui/$me domain"
 gui_dir=$(mktemp -d "$tmp/gui.XXXXXX")
@@ -341,7 +343,7 @@ real_dir=$(cd "$gui_dir" && pwd -P)
 # the system context a user's process gets no name (launchctl says so on stderr).
 probe='echo "manager: $(/bin/launchctl managername 2>/dev/null || echo none)"; id -u; id -G; pwd; echo "$HOME"'
 spawn_in() {
-  sudo -n launchctl bsexec 1 "$client" spawn "$1" "$me" "$my_gid" "$my_name" "$gui_dir" /bin/sh -c "$probe"
+  sudo -n "$client" spawn "$1" "$me" "$my_gid" "$my_name" "$gui_dir" /bin/sh -c "$probe"
 }
 control=$(spawn_in background) || fail "the background spawn failed: $control"
 echo "background: $(echo "$control" | tr '\n' ' ')"

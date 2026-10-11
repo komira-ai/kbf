@@ -43,7 +43,7 @@ pub(super) fn add(_cli: &Cli, _node: &mut Node) -> Result<(), Error> {
 mod tests {
     use clap::Parser as _;
 
-    use super::super::{Cli, Driver, node};
+    use super::super::{Cli, Driver};
 
     fn parse(extra: &[&str]) -> Cli {
         let base = [
@@ -84,8 +84,8 @@ mod tests {
     #[cfg(not(target_os = "macos"))]
     #[tokio::test]
     async fn the_whole_machine_driver_is_refused_off_macos() {
-        use super::super::native_config;
         use super::super::tests::{scratch, tls_files};
+        use super::super::{native_config, native_with};
 
         let dir = scratch("whole-machine-off-macos");
         tls_files(&dir);
@@ -104,7 +104,8 @@ mod tests {
             "--driver=native-whole-machine".to_owned(),
         ];
         let cli = Cli::try_parse_from(flags).expect("flags");
-        let error = node(&cli, || native_config(&cli), &dir.join("no-xcrun"))
+        let config = native_config(&cli).expect("the native configuration");
+        let error = native_with(&cli, config, &dir.join("no-xcrun"))
             .err()
             .expect("started");
         assert!(error.to_string().contains("macOS only"), "{error}");
@@ -118,6 +119,8 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn the_whole_machine_driver_needs_the_helper() {
+        use super::super::node;
+
         let cli = parse(&[
             "--driver=native-whole-machine",
             "--scratch=/s",

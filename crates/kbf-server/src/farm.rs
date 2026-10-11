@@ -45,7 +45,7 @@ use tonic::{Code, Status};
 
 use crate::fleet::{
     NodeView, NodesView, PhaseView, PlacementView, SoftwareView, attention_changes,
-    quarantine_change,
+    needs_attention, quarantine_change,
 };
 use crate::machine::{FarmMachine, Sent, Waiter};
 use crate::memory;
@@ -447,14 +447,7 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
             },
         };
         let phase = state.sched.phase(worker).cloned().unwrap_or_default();
-        let mut needs_attention = state
-            .software
-            .get(worker)
-            .map(SoftwareView::needs_attention)
-            .unwrap_or_default();
-        if let NodePhase::Quarantined(reason) = &phase {
-            needs_attention.push(format!("quarantined: {reason}"));
-        }
+        let needs_attention = needs_attention(state.software.get(worker), &phase);
         NodeView {
             node_id: worker.as_str().to_owned(),
             connected: !state.links[worker].outbound.is_closed(),

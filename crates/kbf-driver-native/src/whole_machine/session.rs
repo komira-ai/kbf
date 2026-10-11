@@ -214,21 +214,13 @@ fn parse(text: &str) -> Option<LeaseId> {
 
 /// The access control entries a lease directory gets on macOS: the lease user may
 /// work in it, and the daemon's user may read and remove what the lease user makes;
-/// both are inherited by everything made in it from then on.
+/// both are inherited by everything made in it from then on. The directory rights name
+/// the same bits a file's do (`list` is `read`, `add_file` is `write`, `search` is
+/// `execute`, `add_subdirectory` is `append`), so an inherited entry gives a file the
+/// matching rights.
 #[cfg(target_os = "macos")]
 fn share_with(user: &str, daemon: &str, dir: &Path) -> Result<(), String> {
-    const INHERIT: &str = "file_inherit,directory_inherit";
-    let entries = [
-        format!(
-            "user:{user} allow list,add_file,search,add_subdirectory,delete_child,readattr,\
-             writeattr,readextattr,writeextattr,readsecurity,read,write,append,execute,\
-             {INHERIT}"
-        ),
-        format!(
-            "user:{daemon} allow list,search,delete,delete_child,readattr,readextattr,\
-             readsecurity,read,{INHERIT}"
-        ),
-    ];
+    let entries = acl_entries(user, daemon);
     for entry in entries {
         let output = std::process::Command::new("/bin/chmod")
             .arg("+a")
@@ -246,6 +238,22 @@ fn share_with(user: &str, daemon: &str, dir: &Path) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// [`share_with`]'s entries, in the form `chmod +a` takes.
+#[cfg(target_os = "macos")]
+fn acl_entries(user: &str, daemon: &str) -> [String; 2] {
+    const INHERIT: &str = "file_inherit,directory_inherit";
+    [
+        format!(
+            "user:{user} allow list,add_file,search,add_subdirectory,delete_child,readattr,\
+             writeattr,readextattr,writeextattr,readsecurity,{INHERIT}"
+        ),
+        format!(
+            "user:{daemon} allow list,search,delete,delete_child,readattr,readextattr,\
+             readsecurity,{INHERIT}"
+        ),
+    ]
 }
 
 /// Lease users exist only on macOS.
@@ -428,6 +436,46 @@ mod tests {
         assert_eq!(asked[7], Request::KillUid { lease: lease() });
         assert_eq!(asked[8], Request::SessionIdle);
         assert_eq!(asked[9], Request::UserDelete { lease: lease() });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Catches access control entries `chmod +a` does not take (the first whole-machine
+    /// lease would fail to share its directory), and entries a file made in the
+    /// directory does not inherit (the daemon could not read the outputs, or the user
+    /// write below its working directory). Shared here with `nobody` and this test's
+    /// own user, which exist on every Mac.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_shared_directory_carries_both_entries_to_what_is_made_in_it() {
+        let dir = std::env::temp_dir().join(format!("kbf-wm-acl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let me = std::process::Command::new("/usr/bin/id")
+            .arg("-un")
+            .output()
+            .unwrap();
+        let me = String::from_utf8(me.stdout).unwrap().trim().to_owned();
+        share_with("nobody", &me, &dir).expect("shared");
+        std::fs::write(dir.join("made"), b"x").unwrap();
+        let listed = |path: &Path| {
+            let out = std::process::Command::new("/bin/ls")
+                .arg("-led")
+                .arg(path)
+                .output()
+                .unwrap();
+            String::from_utf8(out.stdout).unwrap()
+        };
+        let shown = listed(&dir);
+        assert!(shown.contains("user:nobody allow"), "{shown}");
+        assert!(shown.contains(&format!("user:{me} allow")), "{shown}");
+        let file = listed(&dir.join("made"));
+        assert!(file.contains("user:nobody inherited allow"), "{file}");
+        assert!(
+            file.contains(&format!("user:{me} inherited allow")),
+            "{file}"
+        );
+        let error = share_with("no-such-user-kbf", &me, &dir).unwrap_err();
+        assert!(error.contains("chmod +a"), "{error}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

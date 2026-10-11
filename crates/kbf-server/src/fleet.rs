@@ -91,6 +91,19 @@ impl PhaseView {
     }
 }
 
+/// What an operator must do on a node: each item of its newest software status, then
+/// its quarantine, if its phase is one (`quarantined: <why>`).
+#[must_use]
+pub fn needs_attention(software: Option<&SoftwareView>, phase: &NodePhase) -> Vec<String> {
+    let mut items = software
+        .map(SoftwareView::needs_attention)
+        .unwrap_or_default();
+    if let NodePhase::Quarantined(reason) = phase {
+        items.push(format!("quarantined: {reason}"));
+    }
+    items
+}
+
 /// What to log when node `node`'s phase goes from `before` to `after`: its quarantine
 /// raised (`true`, with why) or cleared (`false`), each once. A quarantine whose reason
 /// changes is raised again; any other change logs nothing.

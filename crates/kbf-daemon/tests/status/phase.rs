@@ -3,19 +3,22 @@
 //! carries the newest and a change resends the Hello. A lease the server no longer
 //! holds, or one of another epoch, that the runtime still switches for is killed on
 //! every runtime, which is how the whole-machine runtime learns to clean up after it.
-
-mod support;
+//!
+//! Part of the `status` test binary: the daemon's session loop is compiled into each
+//! test binary, and coverage counts it from the binary that runs most of it, which is
+//! this one; tests of the loop's phase arm in a binary of their own would leave that
+//! arm counted unrun.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use super::support::{Harness, PROMPT, Peer};
 use kbf_daemon::{Runtime, RuntimeError, Work};
 use kbf_proto::reapi::ActionResult;
 use kbf_proto::worker::{
     Hello, LeaseId as WireLease, NodePhase as WirePhase, Phase, daemon_message,
 };
 use kbf_types::{LeaseId, NodePhase};
-use support::{Harness, PROMPT, Peer};
 use tokio::sync::watch;
 
 /// A runtime that runs nothing and records each kill, running or not.
