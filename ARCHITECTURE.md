@@ -109,13 +109,13 @@ what lets a simulation seed replay a run exactly (see [Testing](#testing)).
 | `kbf-node` | no | the `kbf-daemon` binary: flags, and the driver `--driver` names |
 | `kbf-mdm` | no | `kbf-mdm-gate`, the only holder of the Mac MDM's API key: its verbs and caps over mutual TLS, operator-signed erase requests, the `MdmBackend` trait and its NanoHUB client ([mdm-backend.md](docs/design/mdm-backend.md)) |
 | `kbf-updater` | no | the root helper that verifies and installs signed software sets on a node ([fleet-updates-security.md](docs/design/fleet-updates-security.md) S3, S4.1); Linux only for now |
-| `kbf-mac-session` | no | the Mac's root helper that gives every lease its own throwaway user and admits an administrator only with the MDM gate's signed grant ([fleet-updates-security.md](docs/design/fleet-updates-security.md) S4.2, S4.3, S5.2); serves on macOS only |
+| `kbf-mac-session` | no | the Mac's root helper that gives every lease its own throwaway user, admits an administrator only with the MDM gate's signed grant, switches the GUI session to a lease user (auto-login, then a userspace restart) and resets it at boot ([fleet-updates-security.md](docs/design/fleet-updates-security.md) S4.2, S4.3, S5.2); serves on macOS only |
 | `kbf-guest` | no | the agent inside a macOS VM guest ([macos-vms.md](docs/design/macos-vms.md) section 6): a versioned protocol over a Unix socket, one command per boot behind a per-boot token, its process group killed on exit, `Kill` or timeout; `kbf-driver-vm` calls it; the virtio socket is **planned** |
 | `kbf-sim` | no | the deterministic simulation kernel |
 | `kbf-it` | no | integration tests, repository lints, the end-to-end harness |
 | `kbf-coverage` | no | the coverage ratchet CI runs |
 | `kbf-alert` | no | alerts with their exact fix; the alert book (raise and resolve with hysteresis) and the outbox, both pure modules; the webhook notifier, which keeps the outbox in a file. Nothing raises alerts yet |
-| `kbf-store` | no | a Raft server's durable state on the local disk: a segmented append-only log of CRC-32C records and the hard state (term, vote); a torn tail cut at open, any other damage refused; the first write or fsync error stops the store; all I/O through an `Fs` trait, with a fault-injecting in-memory `FaultFs` for crash tests |
+| `kbf-store` | no | a Raft server's durable state on the local disk, as a `kbf_raft::Storage`: a segmented append-only log of CRC-32C records, the hard state (term, vote) and the newest snapshot, whose segments it covers are removed only once it is durable; a torn tail cut at open, any other damage refused; the first write or fsync error stops the store; all I/O through an `Fs` trait, with a fault-injecting in-memory `FaultFs` for crash tests |
 | `kbf-sim-cell` | no | placeholder (**planned**: whole-cell simulation) |
 
 A test in `kbf-it` reads the dependency graph and fails if a pure crate depends,
@@ -203,6 +203,7 @@ See [scheduler.md](docs/design/scheduler.md) and
 | CAS index, action cache, farm time | `MetaState` behind `MemoryMetaLog`, in the server's memory | the same state machine applied from a Raft log on local disk: one voter, then three |
 | Blob bytes | segments in an object store (in memory, or an S3 bucket) | the same, with garbage collection and multiple stores |
 | Leases, operations, workers | `Scheduler` in the server's memory; a control record "commits" when appended | the same state machine fed from a replicated control log, kept on the servers' local disks |
+| Callers and started leases | `FarmMachine` (`kbf-server`'s `machine` module) in the server's memory: each caller's record, the finished operations whose callers are kept for the finished retention, and the leases whose `Start` was sent; each caller's channel stays beside it in the farm core | the same machine fed from the replicated control log |
 | Node reports | read at `Hello`: `cpus`, `mem_gib` and `gpu` are booked; `arch`, `cpu.features`, `os` and the other exact keys are matched against each action's platform; held in memory, so a restart forgets every node | operator labels, report changes noticed by hash; a durable node registry that remembers absent nodes, alerts on them and restores them on reconnect |
 
 Because the index is in memory today, a restarted server forgets every blob. With
@@ -217,6 +218,8 @@ replicated log changes the implementation behind the seam, not its callers:
   implements the same two calls.
 - `ObjectStore` (in `kbf-objstore`): five calls any S3-compatible store can serve.
 - `Dispatch` (in `kbf-front`): how the REAPI front reaches the scheduler.
+- `FarmMachine` (in `kbf-server`): a pure struct that compares with `Eq`; it reads
+  no clock and holds no hashed map, which clippy checks for the module.
 - `StateMachine` (in `kbf-types`): inputs in, effects out. The server carries out the
   scheduler's `Commit`, `Start` and `Answer` effects. The one place a control record
   is appended and fed straight back as committed is the step a replicated log
