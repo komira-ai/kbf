@@ -2,7 +2,8 @@ use std::collections::BTreeMap;
 use std::fs;
 
 use super::*;
-use crate::testkit::{TlsServer, http, scratch, tls_server};
+use crate::testkit::{TlsServer, http, tls_server};
+use kbf_host::testkit::scratch;
 
 /// What the test server holds: path -> bytes.
 fn files() -> BTreeMap<String, Vec<u8>> {

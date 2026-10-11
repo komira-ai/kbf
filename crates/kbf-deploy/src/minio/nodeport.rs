@@ -27,10 +27,10 @@ use std::io::Write;
 use serde::{Deserialize, Serialize};
 
 use super::{K8sName, MinioError, checked, note, read_json};
-use crate::exec::Exec;
-use crate::path::HostPath;
-use crate::plan::{Plan, Planner};
-use crate::step::Cmd;
+use kbf_host::exec::Exec;
+use kbf_host::path::HostPath;
+use kbf_host::plan::{Plan, Planner};
+use kbf_host::step::Cmd;
 
 /// The label the Service carries; `--remove` deletes only a Service that has it.
 pub const LABEL: &str = "komira.dev/purpose";

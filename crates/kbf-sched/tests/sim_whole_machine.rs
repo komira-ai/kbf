@@ -90,6 +90,7 @@ impl World {
             w.feed(Event::WorkerUp {
                 worker: WorkerId::new(name),
                 instance: DaemonInstance::new(name),
+                predecessor_stopped: false,
                 capacity: CAPACITY,
                 caps,
             });

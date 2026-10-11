@@ -1,6 +1,8 @@
 //! Key-only SSH as sshd uses it: the kbf drop-in, read first, and nothing before it.
 
-use crate::items::{Ctx, Outcome, fail, pass};
+use std::io;
+
+use crate::items::{Ctx, Lines, Outcome, fail, pass};
 
 const SSHD: &str = "/usr/sbin/sshd";
 const SSHD_CONFIG: &str = "/etc/ssh/sshd_config";
@@ -108,4 +110,22 @@ pub(crate) fn ssh_password_auth(c: &Ctx<'_>) -> Outcome {
     } else {
         fail(format!("sshd -T reports '{reported}', want '{wanted}'"))
     }
+}
+
+/// Writes the drop-in, root's, mode 644, when sshd_config has the `Include` line and
+/// the drop-in is not already that file. Drop-ins read before it and keywords before
+/// the `Include` line are left: `check` reports them, and they are the operator's.
+pub(crate) fn fix_ssh_password_auth(c: &Ctx<'_>, out: &mut Lines) -> io::Result<()> {
+    let config = String::from_utf8_lossy(&c.mac.read(SSHD_CONFIG).unwrap_or_default()).into_owned();
+    if !config.split('\n').any(|line| line == INCLUDE) {
+        return Ok(());
+    }
+    let want = dropin(c.value() == "1");
+    if c.mac.read(DROPIN).as_deref() == Some(want.as_bytes()) && c.mac.ls(DROPIN) == ROOT_FILE {
+        return Ok(());
+    }
+    c.mac.mkdir(DROPIN_DIR)?;
+    c.mac.replace(DROPIN, want.as_bytes(), 0, 0, 0o644)?;
+    out.change(c.key, format!("wrote {DROPIN}"));
+    Ok(())
 }

@@ -10,7 +10,7 @@ use std::net::Ipv4Addr;
 use std::path::Path;
 
 use crate::config::{Config, ConfigError};
-use crate::path::HostPath;
+use kbf_host::path::HostPath;
 
 /// Every key the kit's config file may set (`templates/mdm/config.example`).
 pub const KEYS: &[&str] = &[

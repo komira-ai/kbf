@@ -1,5 +1,5 @@
 //! What a restarted daemon's runtime removes before the daemon says `Hello` (issue
-//! #155), against the stand-in `podman` (`fixtures/fake-podman.sh`). `podman.rs`
+//! #155), against the stand-in `podman` (`support/fake.rs`). `podman.rs`
 //! runs the same promise against real rootless Podman.
 
 mod support;

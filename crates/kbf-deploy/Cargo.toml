@@ -7,15 +7,14 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
-# The deploy tool: a plan of steps, printed by default and carried out with `--apply`,
-# through an `Exec` that is the host or a recording fake, and the kits built on it as
-# subcommands: `minio` (buckets and their key, a NodePort for the S3 port), `linux`
+# The deploy tool: its kits as subcommands. A kit that changes a host does it through
+# kbf-host's plan of steps, printed by default and carried out with `--apply`. Three
+# kits: `minio` (buckets and their key, a NodePort for the S3 port), `linux`
 # (render-units, check-units, and as root install-units, image-pull and swap) and `mdm`
 # (fetch the pinned upstream archives, install the MDM services as root, verify them).
-# libc is for the switch to another user before a tool starts (setgroups, setgid,
-# setuid). rustls (ring), httparse and rustls-native-certs make the HTTPS client of
-# `mdm fetch` and `mdm verify`; sha2 checks the archives against their pins; zip, tar
-# and flate2 unpack them; x509-parser reads the certificates `mdm verify` checks.
+# rustls (ring), httparse and rustls-native-certs make the HTTPS client of `mdm fetch`
+# and `mdm verify`; sha2 checks the archives against their pins; zip, tar and flate2
+# unpack them; x509-parser reads the certificates `mdm verify` checks.
 
 [[bin]]
 name = "kbf-deploy"
@@ -26,9 +25,8 @@ clap.workspace = true
 flate2.workspace = true
 hex.workspace = true
 httparse.workspace = true
+kbf-host.workspace = true
 kbf-types.workspace = true
-libc.workspace = true
-rustix = { workspace = true, features = ["process"] }
 rustls.workspace = true
 rustls-native-certs.workspace = true
 serde.workspace = true
@@ -40,8 +38,10 @@ x509-parser.workspace = true
 zip.workspace = true
 
 [dev-dependencies]
+kbf-host = { workspace = true, features = ["testkit"] }
 # The certificates of the HTTPS servers the `mdm` tests run.
 rcgen.workspace = true
+rustix = { workspace = true, features = ["process"] }
 
 [lints]
 workspace = true

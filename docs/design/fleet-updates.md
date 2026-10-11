@@ -713,8 +713,9 @@ restarted daemon, which takes the lease up at the step its on-disk record names.
 record says `started` from just before the action's `run`: a daemon that restarts
 after that (a crash or an update, not a switch; the action's processes outlive it)
 never runs the action again. At start it kills every process of the lease user
-(`kill-uid`) before its `Hello`, which says `restoring`, and the lease fails as the
-farm's, its result lost, once the node is restored. At
+(`kill-uid`) before its `Hello`, which says `restoring`, and once the node is restored
+the lease is reported lost (`Result.lost` = `LOST_DAEMON_RESTARTED`), which the server
+runs again as a farm fault, on another node if one can run it (issue #22). At
 start the runtime runs the helper's boot reset naming that lease, so its session is
 kept and every other leftover lease user deleted. **A cleanup step that fails
 quarantines the node**: the runtime writes a quarantine file naming the failure, the

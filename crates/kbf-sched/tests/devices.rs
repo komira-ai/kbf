@@ -105,6 +105,7 @@ impl Harness {
         let event = Event::WorkerUp {
             worker: w(name),
             instance: DaemonInstance::new(name),
+            predecessor_stopped: false,
             capacity: Resources::new(8_000, 16 * GIB),
             caps,
         };

@@ -19,7 +19,7 @@ use sha2::{Digest, Sha256};
 use super::MdmError;
 use super::pins::{Pin, Pins, Tool};
 use crate::https::Client;
-use crate::plan::{DRY_RUN_NOTE, Mode, NOTHING_TO_DO};
+use kbf_host::plan::{DRY_RUN_NOTE, Mode, NOTHING_TO_DO};
 
 /// What `mdm fetch` was asked for.
 pub struct Fetch {

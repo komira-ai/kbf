@@ -3,13 +3,13 @@ use std::collections::BTreeSet;
 use std::rc::Rc;
 
 use super::*;
-use crate::exec::Entry;
 use crate::mdm::archive::tests::{tar_gz_of, zip_of};
 use crate::mdm::pins::{Packing, Tool};
 use crate::mdm::tests::{config, lan};
-use crate::step::Step;
-use crate::testkit::{FakeExec, reply};
-use crate::user::{GETENT, ID};
+use kbf_host::exec::Entry;
+use kbf_host::step::Step;
+use kbf_host::testkit::{FakeExec, reply};
+use kbf_host::user::{GETENT, ID};
 
 const BIN_DIR: &str = "/srv/archives";
 const UID: u32 = 990;

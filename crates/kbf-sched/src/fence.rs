@@ -65,10 +65,11 @@ const _: () = assert!(HANDOVER_GRACE.as_millis() < LEASE_GRACE.as_millis());
 /// action has not started, or has ended with its result kept on disk), so keeping the
 /// lease past G cannot run it twice. Past this bound a silent worker's lease goes back
 /// to the queue. A daemon that dies while the action runs is no switch: the restarted
-/// daemon kills the action's processes before its `Hello` and fails the lease (its
-/// result is lost) rather than run it again, but until it is back those processes live
-/// on (the helper, not the daemon, runs them), beside a retry elsewhere once the lease
-/// is given up. The daemon gives up waiting for the session sooner
+/// daemon kills the action's processes before its `Hello` and reports the run lost
+/// (`Failure::Lost`, its result gone) once the node is restored, and the scheduler
+/// runs it again as a farm fault; but until the daemon is back those processes live on
+/// (the helper, not the daemon, runs them), beside a retry elsewhere once the lease is
+/// given up. The daemon gives up waiting for the session sooner
 /// (`kbf_driver_native`'s `SESSION_WAIT`), so it does not start the action after this.
 pub const SESSION_SWITCH_GRACE: Duration = Duration::from_secs(600);
 

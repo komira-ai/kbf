@@ -7,10 +7,11 @@ use std::time::Duration;
 use rcgen::{CertificateParams, CertifiedIssuer, DnType, IsCa, KeyPair};
 
 use super::*;
-use crate::exec::Entry;
 use crate::mdm::tests::{config, lan};
-use crate::step::Owner;
-use crate::testkit::{FakeExec, TlsServer, http, reply, tls_server};
+use crate::testkit::{TlsServer, http, tls_server};
+use kbf_host::exec::Entry;
+use kbf_host::step::Owner;
+use kbf_host::testkit::{FakeExec, reply};
 
 const UID: u32 = 990;
 const ALL: usize = 28;

@@ -294,7 +294,9 @@ impl Node {
 /// per runtime (which `Daemon::new` adds), its `cpus` and `mem_gib` no more than the
 /// container driver allows; the native driver adds its own with
 /// `Daemon::with_driver_report`. Its status lists every `--image`, which only the
-/// container driver runs: without it, `--image` fails the start.
+/// container driver runs: without it, `--image` fails the start. With `--scratch`, once
+/// every runtime is built, it claims the scratch directory and names the claim it found
+/// as its predecessor (`instance`).
 fn node(
     cli: &Cli,
     native: impl Fn() -> Result<NativeConfig, Error>,
@@ -329,6 +331,11 @@ fn node(
     let daemon = Daemon::new(DaemonConfig::from_args(&cli.daemon), runtimes, report)?
         .with_container_images(cli.images.iter().cloned())
         .with_phase(phase);
+    // Every runtime is built, so every sweep has run: claim the scratch directory.
+    let daemon = match &cli.scratch {
+        Some(_) => instance::named(daemon, &scratch(cli)?),
+        None => daemon,
+    };
     Ok(match node.reports {
         Some(reports) => (daemon.with_driver_report(reports.clone()), Some(reports)),
         None => (daemon, None),
@@ -593,10 +600,13 @@ mod container {
     }
 }
 
+mod instance;
 mod whole_machine;
 
 #[cfg(test)]
 mod deploy_doc_tests;
+#[cfg(test)]
+mod instance_tests;
 #[cfg(test)]
 mod startup_tests;
 

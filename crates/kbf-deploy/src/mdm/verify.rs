@@ -32,12 +32,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use super::MdmError;
 use super::config::MdmConfig;
 use super::render::{CERT_TIMER, DEPSERVER, NANOHUB, PROXY, RELOAD_PATH, SCEP};
-use crate::exec::{Exec, Kind, Meta};
 use crate::https::{Client, HttpsUrl};
 use crate::linux::host::{self, SS, tool, under, unit_is};
-use crate::path::HostPath;
-use crate::step::{Cmd, Perms};
-use crate::user::{self, GETENT};
+use kbf_host::exec::{Exec, Kind, Meta};
+use kbf_host::path::HostPath;
+use kbf_host::step::{Cmd, Perms};
+use kbf_host::user::{self, GETENT};
 
 /// How long the certificate must stay valid.
 pub const VALID_FOR_DAYS: i64 = 21;
@@ -375,7 +375,7 @@ fn root_only<E: Exec>(exec: &E, path: &HostPath) -> Outcome {
 
 fn file_bytes<E: Exec>(exec: &E, path: &HostPath) -> Result<Vec<u8>, String> {
     match host::inspect(exec, path).map_err(text)? {
-        Some(crate::exec::Entry::File { bytes, .. }) => Ok(bytes),
+        Some(kbf_host::exec::Entry::File { bytes, .. }) => Ok(bytes),
         _ => Err(format!("{path} is not a file")),
     }
 }

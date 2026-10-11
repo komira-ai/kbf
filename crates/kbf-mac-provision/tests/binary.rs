@@ -164,3 +164,65 @@ fn check_exits_0_when_every_item_passes() {
         "PASS simulator_runtimes: none\ncheck: 1 pass, 0 fail\n"
     );
 }
+
+/// Catches: a changing verb run by a user who is not root, and not refused with exit
+/// status 2 and why. This test runs as an ordinary user.
+#[test]
+fn the_changing_verbs_exit_2_without_root() {
+    if rustix::process::geteuid().is_root() {
+        return;
+    }
+    let mac = FakeMac::fresh("bin-not-root");
+    let path = mac.profile_file(&mac.profile_text());
+    let path = path.to_str().unwrap();
+    for (args, verb) in [
+        (
+            &["apply", "--profile", path, "--root", &mac.root][..],
+            "apply",
+        ),
+        (
+            &["restart", "--profile", path, "--root", &mac.root],
+            "restart",
+        ),
+        (&["revert", "--root", &mac.root], "revert"),
+    ] {
+        let o = run(args);
+        assert_eq!(o.status.code(), Some(2), "{args:?}");
+        assert_eq!(
+            stderr(&o),
+            format!("kbf-mac-provision: {verb} runs as root\n")
+        );
+        assert!(o.stdout.is_empty());
+    }
+    assert_eq!(mac.writes(), Vec::<String>::new());
+}
+
+/// Catches: a verb that `execute` sends to another one, an exit status other than the
+/// script's (apply 1 on a failure, 0 when it converges; restart and revert 0), or a
+/// verb that changes another Mac than `--root`'s.
+#[test]
+fn execute_runs_each_verb_with_its_exit_status() {
+    use clap::Parser as _;
+    use kbf_mac_provision::cli::{Cli, execute};
+    let mut mac = FakeMac::fresh("bin-execute");
+    let path = mac.profile_file(&mac.profile_text());
+    let path = path.to_str().unwrap();
+    let parse = |args: &[&str]| {
+        let cli = Cli::try_parse_from([&["kbf-mac-provision"][..], args].concat()).unwrap();
+        assert_eq!(cli.verb.root(), if args[0] == "print" { "/" } else { "/r" });
+        cli.verb
+    };
+    let verb = parse(&["check", "--profile", path, "--root", "/r"]);
+    assert_eq!(execute(&verb, &mac).unwrap().1, 1);
+    let verb = parse(&["apply", "--profile", path, "--root", "/r"]);
+    assert_eq!(execute(&verb, &mac).unwrap().1, 0);
+    assert_eq!(execute(&verb, &mac).unwrap(), (String::new(), 0));
+    mac.state_mut().filevault = "On".into();
+    assert_eq!(execute(&verb, &mac).unwrap().1, 1);
+    let verb = parse(&["restart", "--profile", path, "--root", "/r"]);
+    assert_eq!(execute(&verb, &mac).unwrap().1, 0);
+    let verb = parse(&["revert", "--root", "/r"]);
+    assert_eq!(execute(&verb, &mac).unwrap().1, 0);
+    let verb = parse(&["print", "--profile", path]);
+    assert_eq!(execute(&verb, &mac).unwrap().1, 0);
+}

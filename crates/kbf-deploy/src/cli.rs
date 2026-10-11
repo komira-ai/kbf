@@ -24,7 +24,8 @@
 //! 1 a check found a broken rule, or 2 refused (a bad setting or file, printed as
 //! `REFUSED: ...` on stderr). `linux install-units`, `image-pull` and `swap` change the
 //! host as root, plan by default as the `minio` subcommands do, and exit 0 done (or
-//! nothing to do), 1 a step failed, or 2 refused (`REFUSED: ...` on stderr).
+//! nothing to do), 1 a step or the check after an apply failed (`FAIL ...`), or 2
+//! refused (`REFUSED: ...` on stderr).
 //! The `mdm` verbs exit as the `linux` host verbs do; `mdm verify` exits 1 when a check
 //! fails ([`crate::mdm`]).
 //! `minio buckets` reads the MinIO admin key pair from `MINIO_ROOT_USER` and
@@ -44,7 +45,6 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use clap::{Args, Parser, Subcommand};
 use kbf_types::ImageRef;
 
-use crate::exec::{Exec, HostExec};
 use crate::https::Client;
 use crate::linux::{self, HostError, LinuxConfig, images, install, swap};
 use crate::mdm::fetch::Fetch;
@@ -52,9 +52,10 @@ use crate::mdm::install::Install;
 use crate::mdm::verify::Verify;
 use crate::mdm::{self, MdmConfig, MdmError, Pins, Tool};
 use crate::minio::{self, Admin, K8sName, KbfName, MinioError, buckets, nodeport};
-use crate::path::{HostPath, Root};
-use crate::plan::{DeployError, Mode, RunAs, execute};
-use crate::step::HttpUrl;
+use kbf_host::exec::{Exec, HostExec};
+use kbf_host::path::{HostPath, Root};
+use kbf_host::plan::{Mode, RunAs, execute};
+use kbf_host::step::HttpUrl;
 
 #[derive(Parser)]
 #[command(
@@ -485,12 +486,17 @@ fn mdm_kit<E: Exec>(m: Mdm, exec: &mut E, out: &mut dyn Write, err: &mut dyn Wri
     }
 }
 
-/// A host-changing `linux` verb's exit: 0 done, 1 a step failed, 2 refused.
+/// A host-changing `linux` verb's exit: 0 done, 1 a step failed (or the check after
+/// an apply did), 2 refused.
 fn host_verb(done: Result<(), HostError>, err: &mut dyn Write) -> ExitCode {
     match done {
         Ok(()) => ExitCode::SUCCESS,
-        Err(e @ HostError::Deploy(DeployError::Step { .. })) => {
+        Err(e @ HostError::Deploy(kbf_host::HostError::Step { .. })) => {
             let _ = writeln!(err, "kbf-deploy: {e}");
+            ExitCode::FAILURE
+        }
+        Err(e @ HostError::AfterApply(_)) => {
+            let _ = writeln!(err, "FAIL {e}");
             ExitCode::FAILURE
         }
         Err(e) => {

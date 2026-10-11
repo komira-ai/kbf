@@ -98,15 +98,35 @@ impl Served {
     }
 }
 
-/// `sh -c script` with a fixed PATH and the extra variables.
-pub fn sh(script: &str, env: &[(&str, &str)]) -> RunRequest {
+/// The program the tests' commands run: kbf-testkit's act verbs (`exit`, `sleep`,
+/// `echo`, `pwd`, `kill-self`, ...), built under this package's name because Cargo
+/// sets `CARGO_BIN_EXE_<name>` only for the bins of the package under test.
+pub const ACT: &str = env!("CARGO_BIN_EXE_kbf-guest-act");
+
+/// A command running `argv` as given, with a fixed PATH and the extra variables.
+pub fn program(argv: &[&str], env: &[(&str, &str)]) -> RunRequest {
     let mut vars = vec![("PATH".to_owned(), "/usr/bin:/bin".to_owned())];
     vars.extend(env.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())));
     RunRequest {
-        argv: vec!["/bin/sh".into(), "-c".into(), script.into()],
+        argv: argv.iter().map(|a| (*a).to_owned()).collect(),
         env: vars,
         ..RunRequest::default()
     }
+}
+
+/// [`ACT`] running `steps`, its words split at spaces (a lone `;` separates steps):
+/// `act("sleep 1 ; exit 3", &[])`.
+pub fn act(steps: &str, env: &[(&str, &str)]) -> RunRequest {
+    let argv: Vec<&str> = std::iter::once(ACT).chain(steps.split(' ')).collect();
+    program(&argv, env)
+}
+
+/// `/bin/sh -c script`, for the few tests whose command is a user's shell on purpose:
+/// it puts a job in the background with `&` inside the command's process group, reads
+/// `$$` or `$!`, sets a trap, or prints bytes no argv can hold (a NUL). Every other
+/// test runs [`act`].
+pub fn user_shell(script: &str, env: &[(&str, &str)]) -> RunRequest {
+    program(&["/bin/sh", "-c", script], env)
 }
 
 /// Waits for a file a command writes and returns its contents, trimmed.

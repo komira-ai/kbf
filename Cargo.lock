@@ -1236,8 +1236,8 @@ dependencies = [
  "flate2",
  "hex",
  "httparse",
+ "kbf-host",
  "kbf-types",
- "libc",
  "rcgen",
  "rustix",
  "rustls",
@@ -1329,8 +1329,18 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "hex",
+ "kbf-testkit",
  "libc",
  "subtle",
+ "thiserror",
+]
+
+[[package]]
+name = "kbf-host"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "rustix",
  "thiserror",
 ]
 
@@ -1656,6 +1666,7 @@ dependencies = [
  "base64 0.23.1",
  "clap",
  "hex",
+ "kbf-host",
  "libc",
  "ring",
  "rustix",

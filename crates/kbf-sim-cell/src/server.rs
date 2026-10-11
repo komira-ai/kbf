@@ -447,6 +447,7 @@ impl Up {
         let event = SchedEvent::WorkerUp {
             worker,
             instance: DaemonInstance::new(instance),
+            predecessor_stopped: false,
             capacity,
             caps,
         };

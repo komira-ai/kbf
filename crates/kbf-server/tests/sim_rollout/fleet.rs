@@ -248,6 +248,7 @@ impl Cell {
         self.feed(Event::WorkerUp {
             worker,
             instance,
+            predecessor_stopped: false,
             capacity,
             caps: node_caps(i),
         });

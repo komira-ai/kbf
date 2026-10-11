@@ -35,12 +35,11 @@ pub use pins::{Pins, PinsError, Tool};
 
 use crate::https::{HttpsError, HttpsUrlError};
 use crate::linux::HostError;
-use crate::path::{HostPath, PathError};
-use crate::plan::DeployError;
-use crate::step::{Perms, UrlError};
 use crate::template::TemplateError;
-use crate::user::UserError;
 use archive::ArchiveError;
+use kbf_host::path::{HostPath, PathError};
+use kbf_host::step::{Perms, UrlError};
+use kbf_host::user::UserError;
 
 /// Why an `mdm` verb refused, or failed.
 #[derive(Debug, thiserror::Error)]
@@ -50,7 +49,7 @@ pub enum MdmError {
     #[error(transparent)]
     Host(#[from] HostError),
     #[error(transparent)]
-    Deploy(#[from] DeployError),
+    Deploy(#[from] kbf_host::HostError),
     #[error(transparent)]
     Archive(#[from] ArchiveError),
     #[error(transparent)]
@@ -136,7 +135,7 @@ impl MdmError {
     /// The exit code: 1 when a step, a download or a check failed, 2 when refused.
     pub fn exit_code(&self) -> u8 {
         match self {
-            MdmError::Deploy(DeployError::Step { .. })
+            MdmError::Deploy(kbf_host::HostError::Step { .. })
             | MdmError::Https(_)
             | MdmError::Io { .. }
             | MdmError::Status { .. }
@@ -175,7 +174,7 @@ pub(crate) mod tests {
     /// script (or the operator) tells "fix the input" from "retry" by it.
     #[test]
     fn failures_exit_1_and_refusals_exit_2() {
-        let step = DeployError::Step {
+        let step = kbf_host::HostError::Step {
             index: 0,
             step: "run x".to_owned(),
             source: io::Error::other("x"),
@@ -203,7 +202,7 @@ pub(crate) mod tests {
         }
         let refused = [
             MdmError::FetchAsRoot,
-            MdmError::Deploy(DeployError::IsRoot),
+            MdmError::Deploy(kbf_host::HostError::IsRoot),
             MdmError::PortHeld(443),
         ];
         for e in refused {
