@@ -34,10 +34,7 @@ pub(crate) fn to_proto(command: &Command) -> Result<proto::MetaCommand, EncodeEr
             }
             .into(),
             action: Some(digest(action)?),
-            record: Some(proto::ActionRecord {
-                result: Some(digest(&record.result)?),
-                closure: digests(record.closure.iter())?,
-            }),
+            record: Some(action_record(record)?),
         }),
         Command::Touch(touch) => P::Touch(proto::Touch {
             blobs: digests(touch.blobs.iter())?,
@@ -64,7 +61,15 @@ pub(crate) fn to_proto(command: &Command) -> Result<proto::MetaCommand, EncodeEr
     Ok(proto::MetaCommand { command: Some(c) })
 }
 
-fn digest(d: &Digest) -> Result<proto::Digest, EncodeError> {
+/// An action-cache record: the result's digest and its closure, a set.
+pub(crate) fn action_record(record: &ActionRecord) -> Result<proto::ActionRecord, EncodeError> {
+    Ok(proto::ActionRecord {
+        result: Some(digest(&record.result)?),
+        closure: digests(record.closure.iter())?,
+    })
+}
+
+pub(crate) fn digest(d: &Digest) -> Result<proto::Digest, EncodeError> {
     let function = match d.function {
         DigestFunction::Sha256 => proto::DigestFunction::Sha256,
         _ => return Err(EncodeError::DigestFunction),
@@ -124,16 +129,10 @@ pub(crate) fn from_proto(command: proto::MetaCommand) -> Result<Command, DecodeE
                         });
                     }
                 };
-                let record = a.record.ok_or(DecodeError::Missing("PutAction.record"))?;
                 Command::PutAction {
                     role,
                     action: required_digest(a.action, "PutAction.action")?,
-                    record: ActionRecord {
-                        result: required_digest(record.result, "ActionRecord.result")?,
-                        closure: set(record.closure, "ActionRecord.closure")?
-                            .into_iter()
-                            .collect::<Closure>(),
-                    },
+                    record: from_action_record(a.record, "PutAction.record")?,
                 }
             }
             P::Touch(t) => Command::Touch(Touch {
@@ -178,11 +177,28 @@ fn blob(b: proto::PutBlob) -> Result<(Digest, Location), DecodeError> {
     ))
 }
 
-fn required_digest(d: Option<proto::Digest>, field: &'static str) -> Result<Digest, DecodeError> {
+/// The action-cache record in field `field`, which must be present.
+pub(crate) fn from_action_record(
+    record: Option<proto::ActionRecord>,
+    field: &'static str,
+) -> Result<ActionRecord, DecodeError> {
+    let record = record.ok_or(DecodeError::Missing(field))?;
+    Ok(ActionRecord {
+        result: required_digest(record.result, "ActionRecord.result")?,
+        closure: set(record.closure, "ActionRecord.closure")?
+            .into_iter()
+            .collect::<Closure>(),
+    })
+}
+
+pub(crate) fn required_digest(
+    d: Option<proto::Digest>,
+    field: &'static str,
+) -> Result<Digest, DecodeError> {
     from_digest(d.ok_or(DecodeError::Missing(field))?, field)
 }
 
-fn from_digest(d: proto::Digest, field: &'static str) -> Result<Digest, DecodeError> {
+pub(crate) fn from_digest(d: proto::Digest, field: &'static str) -> Result<Digest, DecodeError> {
     let function = match proto::DigestFunction::try_from(d.function) {
         Ok(proto::DigestFunction::Sha256) => DigestFunction::Sha256,
         Ok(proto::DigestFunction::Unspecified) | Err(_) => {

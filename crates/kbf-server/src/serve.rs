@@ -31,7 +31,8 @@ pub struct Listeners {
     /// The REAPI listener (clients: buck2, Bazel).
     pub reapi: SocketAddr,
     /// TLS for the REAPI listener (a server certificate; clients present none). `None`
-    /// serves it in plain text, which is meant for a loopback bind.
+    /// serves it in plain text, on whatever address `reapi` names (nothing refuses a
+    /// bind off loopback; the binary's start line warns about one).
     pub reapi_tls: Option<ServerTlsConfig>,
     /// The `kbf.worker.v1` listener (daemons): their worker streams, and `ByteStream`
     /// for their blobs ([`crate::blobs`]).
@@ -246,8 +247,8 @@ where
         crate::health::router(Arc::clone(&cache), Arc::clone(&readiness), probe_timeout);
     let api_routes = crate::api::router(Arc::clone(&farm), token).merge(health_routes);
     // Logged at every start, the first one too (issue #156).
-    let term = farm.term();
-    tracing::warn!(term, "{STATE_IN_MEMORY}");
+    let (term, epoch) = (farm.term(), farm.lease_epoch());
+    tracing::warn!(term, epoch, "{STATE_IN_MEMORY}");
 
     let mut reapi_server = Server::builder();
     if let Some(tls) = listeners.reapi_tls {

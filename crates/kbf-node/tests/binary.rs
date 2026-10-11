@@ -286,15 +286,15 @@ fn each_driver_starts_and_stops_on_sigterm() {
 }
 
 /// A directory put first in `PATH` holding a `podman` that lists no container and
-/// logs its arguments to the returned file: the start-up sweep asks it for this
-/// node's leftovers before the daemon connects. A symlink, not a written script:
-/// exec'ing a file this process just wrote can fail with ETXTBSY while another test
-/// thread forks.
+/// logs its arguments to the returned file (`kbf-podman-stub`, linked in as
+/// `podman`): the start-up sweep asks it for this node's leftovers before the daemon
+/// connects. A symlink to the built binary, not a written file: exec'ing a file this
+/// process just wrote can fail with ETXTBSY while another test thread forks.
 fn podman_stub(name: &str) -> (PathBuf, PathBuf) {
     let bin = tls(name);
     let log = bin.join("podman.log");
     let _ = std::fs::remove_file(bin.join("podman"));
-    let stub = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/podman-stub.sh");
+    let stub = env!("CARGO_BIN_EXE_kbf-podman-stub");
     std::os::unix::fs::symlink(stub, bin.join("podman")).expect("link podman");
     (bin, log)
 }
@@ -968,7 +968,7 @@ fn image_by(hex: &str) -> String {
     format!("docker://registry.test/tools/busybox@sha256:{hex}")
 }
 
-/// Puts `bytes` in the stub's image store (see `fixtures/podman-stub.sh`) as image
+/// Puts `bytes` in the stub's image store (see `src/bin/kbf-podman-stub.rs`) as image
 /// `img1`'s manifest, under the digest of `bytes`, and makes the stub know `img1`.
 #[cfg(target_os = "linux")]
 fn store_manifest(bin: &Path, bytes: &[u8]) {

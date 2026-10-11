@@ -5,6 +5,9 @@ the worker profile that
 [docs/design/mac-node-provisioning.md](../../docs/design/mac-node-provisioning.md)
 (sections 2, 3 and 5) describes. It is one POSIX `sh` script that runs only programs
 macOS ships, over a profile of `KEY=VALUE` lines that it parses and never sources.
+The crate [kbf-mac-provision](../../crates/kbf-mac-provision) is its Rust port: it
+implements `check` and `print` over the same profile, and is tested against a fake Mac
+in `cargo test`; `apply` and `restart` are still only in this script.
 
 ```text
 kbf-mac-provision check   --profile FILE [--keys K,K]   # one PASS/FAIL line per item; exit 1 on any FAIL

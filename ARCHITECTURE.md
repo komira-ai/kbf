@@ -49,10 +49,13 @@ role (`--role=all`). The flags are:
 - `--listen` (REAPI, default `127.0.0.1:8980`) and `--worker-listen` (daemons, default
   `127.0.0.1:8981`);
 - `--reapi-tls-cert` and `--reapi-tls-key` to serve the REAPI listener over TLS (both,
-  or neither for plain text, which is meant for a loopback bind);
+  or neither for plain text);
 - `--worker-tls-cert`, `--worker-tls-key`, `--worker-client-ca` to serve the worker
   listener over mutual TLS (all three, or none for plain text), and
-  `--worker-deny-list` for the certificates and nodes it refuses;
+  `--worker-deny-list` for the certificates and nodes it refuses. TLS and mutual TLS
+  are optional: a listener without them serves plain text on any address, with a
+  warning on the start line when that address is not loopback (see
+  [Security model](#security-model));
 - `--store=memory` or `--store=s3` with `--s3-endpoint`, `--s3-bucket`, `--s3-region`,
   `--s3-prefix` and `--s3-conditional-put`; the S3 key pair comes from the standard
   `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` variables, never from the command line;
@@ -89,7 +92,7 @@ what lets a simulation seed replay a run exactly (see [Testing](#testing)).
 
 | Crate | Pure | What it holds |
 |---|---|---|
-| `kbf-types` | yes | digests, platforms, QoS levels, lease ids, farm time, the `StateMachine` trait and `Effect` enum |
+| `kbf-types` | yes | digests, images by manifest digest (`ImageRef`), platforms, QoS levels, lease ids, farm time, the `StateMachine` trait and `Effect` enum |
 | `kbf-sched` | yes | the scheduler state machine and the fence constants |
 | `kbf-meta` | yes | the metadata state machine: CAS index, action cache, closure check, retention |
 | `kbf-segments` | yes | the segment format and FastCDC chunking |
@@ -100,7 +103,7 @@ what lets a simulation seed replay a run exactly (see [Testing](#testing)).
 | `kbf-front` | no | the REAPI services over a `Cache` and a `Dispatch` |
 | `kbf-server` | no | the server binary: wires front, scheduler and storage together; its side of the MDM gate (`mdm`) |
 | `kbf-proto` | no | generated code for REAPI, `kbf.worker.v1` and `kbf.log.v1` |
-| `kbf-log` | no | the replicated log's entry encoding: `kbf-meta` commands to and from `kbf.log.v1`, under the log's format version |
+| `kbf-log` | no | the replicated log's entry encoding: `kbf-meta` commands and the control commands (batched farm inputs, a result with its action-cache entry, takeover, checkpoint, machine version) to and from `kbf.log.v1`, under the log's format version |
 | `kbf-mdm-api` | no | what `kbf-server` and `kbf-mdm-gate` share: generated `kbf.mdmgate.v1` (status, enforce, withdraw, profile; no erase), the names both check, Apple's catalogue parser and its at-most-daily reader |
 | `kbf-daemon` | no | the daemon: session loop, lease manager, CAS client, input and output trees |
 | `kbf-driver-container` | no | the rootless Podman execution driver |
@@ -109,15 +112,16 @@ what lets a simulation seed replay a run exactly (see [Testing](#testing)).
 | `kbf-mdm` | no | `kbf-mdm-gate`, the only holder of the Mac MDM's API key: its verbs and caps over mutual TLS, operator-signed erase requests, the `MdmBackend` trait and its NanoHUB client ([mdm-backend.md](docs/design/mdm-backend.md)) |
 | `kbf-updater` | no | the root helper that verifies and installs signed software sets on a node ([fleet-updates-security.md](docs/design/fleet-updates-security.md) S3, S4.1); Linux only for now |
 | `kbf-mac-session` | no | the Mac's root helper that gives every lease its own throwaway user, admits an administrator only with the MDM gate's signed grant, switches the GUI session to a lease user (auto-login, then a userspace restart) and resets it at boot ([fleet-updates-security.md](docs/design/fleet-updates-security.md) S4.2, S4.3, S5.2); serves on macOS only |
+| `kbf-mac-provision` | no | the Rust port of `tools/mac-provision/kbf-mac-provision`: its profile parser, the item checks over a `Host` trait (a fake Mac in the tests), and the verbs `check` and `print`; `apply` and `restart` are still only in the script ([mac-node-provisioning.md](docs/design/mac-node-provisioning.md) sections 2, 3, 5) |
 | `kbf-guest` | no | the agent inside a macOS VM guest ([macos-vms.md](docs/design/macos-vms.md) section 6): a versioned protocol over a Unix socket, one command per boot behind a per-boot token, its process group killed on exit, `Kill` or timeout; the virtio socket and the VM driver that calls it are **planned** |
 | `kbf-vmm` | no | the VM helper for macOS VM leases ([macos-vm-guests.md](docs/design/macos-vm-guests.md)): a **stub** that answers `--version` only, the one binary the signing scripts' entitlement allow list gives an entitlement (`com.apple.security.virtualization`); the VM code is **planned** |
-| `kbf-deploy` | no | the deploy tool `kbf-deploy` and its core: a plan of steps (write a file, make a directory, remove, run a tool by absolute path with an empty environment, run one and write its filtered output to a file, wait for an HTTP URL), made from queries that change nothing and printed as `DRY-RUN:` lines by default and carried out only in apply mode; a file or directory step is planned only when the host differs, so a re-run after an apply plans nothing; closed-key `KEY=VALUE` config files; a root plan applies only as root, from a binary root alone can replace, and a user plan never as root. Subcommands: `minio buckets` (buckets, a policy for them and a service account key file through `mc`, with the admin key in `mc`'s environment, never on an argv) and `minio nodeport` (a NodePort Service for a MinIO's S3 port through `kubectl`) |
+| `kbf-deploy` | no | the deploy tool. Its core: a plan of steps (write a file, make a directory, remove, run a tool by absolute path with an empty environment, run one and write its filtered output to a file, wait for an HTTP URL), made from queries that change nothing and printed as `DRY-RUN:` lines by default and carried out only in apply mode; a file or directory step is planned only when the host differs, so a re-run after an apply plans nothing; closed-key `KEY=VALUE` config files; a root plan applies only as root, from a binary root alone can replace, and a user plan never as root. Its unit reader (`unit`) is the one the docs check uses, and `template` is strict `@KEY@` substitution. Two kits. `minio`: `buckets` makes buckets, a policy for them and a service account key file through `mc`, with the admin key in `mc`'s environment, never on an argv, and `nodeport` adds a NodePort Service for a MinIO's S3 port through `kubectl`. `linux`: `render-units` renders a converged storage node's systemd units from compiled-in templates and `check-units` checks them against the host's priorities ([storage-node.md](docs/deploy/storage-node.md)); nothing installs them yet |
 | `kbf-sim` | no | the deterministic simulation kernel |
 | `kbf-it` | no | integration tests, repository lints, the end-to-end harness |
 | `kbf-coverage` | no | the coverage ratchet CI runs |
 | `kbf-alert` | no | alerts with their exact fix; the alert book (raise and resolve with hysteresis) and the outbox, both pure modules; the webhook notifier, which keeps the outbox in a file. Nothing raises alerts yet |
 | `kbf-store` | no | a Raft server's durable state on the local disk, as a `kbf_raft::Storage`: a segmented append-only log of CRC-32C records, the hard state (term, vote) and the newest snapshot, whose segments it covers are removed only once it is durable; a torn tail cut at open, any other damage refused; the first write or fsync error stops the store; all I/O through an `Fs` trait, with a fault-injecting in-memory `FaultFs` for crash tests |
-| `kbf-sim-cell` | no | placeholder (**planned**: whole-cell simulation) |
+| `kbf-sim-cell` | no | the whole-cell simulation: one server assembled from `RaftMetaLog`, the scheduler and the `FarmMachine` on a fault-injecting disk, with fake daemons, clients and an object store, checked against properties 1 to 7 of the high-availability design after every step ([simulation.md](docs/design/simulation.md#8-the-cell-kbf-sim-cell)) |
 
 A test in `kbf-it` reads the dependency graph and fails if a pure crate depends,
 directly or not, on an async runtime, a network crate or a random source, or if its
@@ -201,26 +205,32 @@ See [scheduler.md](docs/design/scheduler.md) and
 
 | State | Today | Planned |
 |---|---|---|
-| CAS index, action cache, farm time | `MetaState` behind `MemoryMetaLog`, in the server's memory | the same state machine applied from a Raft log on local disk: one voter, then three |
+| CAS index, action cache, farm time | `MetaState` behind `MemoryMetaLog`, in the server's memory (the default, `--meta-log=memory`); with `--meta-log=raft`, behind `RaftMetaLog`, applied from a single-voter Raft log on local disk | the Raft log with three voters |
 | Blob bytes | segments in an object store (in memory, or an S3 bucket) | the same, with garbage collection and multiple stores |
 | Leases, operations, workers | `Scheduler` in the server's memory; a control record "commits" when appended | the same state machine fed from a replicated control log, kept on the servers' local disks |
-| Callers and started leases | `FarmMachine` (`kbf-server`'s `machine` module) in the server's memory: each caller's record, the finished operations whose callers are kept for the finished retention, and the leases whose `Start` was sent; each caller's channel stays beside it in the farm core | the same machine fed from the replicated control log |
-| Node reports | read at `Hello`: `cpus`, `mem_gib` and `gpu` are booked; `arch`, `cpu.features`, `os` and the other exact keys are matched against each action's platform; held in memory, so a restart forgets every node | operator labels, report changes noticed by hash; a durable node registry that remembers absent nodes, alerts on them and restores them on reconnect |
+| Memory kills | the scheduler's `MemoryState`, in the server's memory: each action key's memory floor and the order the floors were raised in, each held operation's memory-killed runs and busy-node reruns, each node's busy-node kill count; it compares with `Eq` | the same, inside the machine fed from the replicated control log |
+| Callers, started leases, node registry | `FarmMachine` (`kbf-server`'s `machine` module) in the server's memory: each caller's record, the finished operations whose callers are kept for the finished retention, the leases whose `Start` was sent, and each node that has registered with whether its newest stream is open and its newest `NodeStatus`; each caller's channel and each node's stream stay beside it in the farm core, which tells the machine when a stream has closed | the same machine fed from the replicated control log |
+| Node reports | read at `Hello`: `cpus`, `mem_gib` and `gpu` are booked; `arch`, `cpu.features`, `os` and the other exact keys are matched against each action's platform; held in memory, so a restart forgets every node | operator labels, report changes noticed by hash; the node registry kept durable through the replicated control log, with alerts on absent nodes |
 
-Because the index is in memory today, a restarted server forgets every blob. With
-`--store=s3` each start writes under a fresh key prefix so it never reads objects a
-previous process wrote.
+Under `--meta-log=memory` the index is in memory, so a restarted server forgets every
+blob, and with `--store=s3` each start writes under a fresh key prefix so it never reads
+objects a previous process wrote. Under `--meta-log=raft` (which needs `--store=s3`) a
+restart reopens the log in `--raft-dir` and keeps the index and the action cache, and
+every start writes under the prefix the log committed when it was created,
+`<--s3-prefix><log id>/`, each in a new writer epoch.
 
 Every piece of state sits behind a trait or a pure state machine, so moving it into a
 replicated log changes the implementation behind the seam, not its callers:
 
 - `MetaLog` (in `kbf-front`): `commit` a metadata command, `query` the committed
-  state. `MemoryMetaLog` is the single-process implementation; a replicated log
-  implements the same two calls.
+  state. `MemoryMetaLog` is the single-process implementation; `RaftMetaLog` (in
+  `kbf-server`) implements the same two calls over a single-voter Raft log.
 - `ObjectStore` (in `kbf-objstore`): five calls any S3-compatible store can serve.
 - `Dispatch` (in `kbf-front`): how the REAPI front reaches the scheduler.
 - `FarmMachine` (in `kbf-server`): a pure struct that compares with `Eq`; it reads
   no clock and holds no hashed map, which clippy checks for the module.
+  `MemoryState` (in `kbf-sched`, read through `Scheduler::memory_state`) is the
+  scheduler's first part that compares with `Eq`.
 - `StateMachine` (in `kbf-types`): inputs in, effects out. The server carries out the
   scheduler's `Commit`, `Start` and `Answer` effects. The one place a control record
   is appended and fed straight back as committed is the step a replicated log
@@ -273,10 +283,13 @@ with what exists today and the probes still to run. In short:
   and placement prefers a worker that already has an action's inputs.
 
 What already holds for this shape in the single-server code: the seams above, lease
-ids that carry the granting process's term, a scheduler that refuses results from
-leases it does not hold, a lease epoch in `Welcome` that makes a daemon drop leases a
-restarted server never granted, and a daemon protocol in which only the newest stream
-of a worker counts. See [scheduler.md](docs/design/scheduler.md#more-than-one-server).
+ids that carry the granting process's term (the Raft term under `--meta-log=raft`), a
+scheduler that refuses results from leases it does not hold, a lease epoch in
+`Welcome` that makes a daemon drop leases a restarted server never granted (under
+`--meta-log=raft` the epoch is the log id, the same at every start, so the daemon keeps
+its runs, and until the scheduler's state is in the log a restart leaves them running
+as orphans whose results are refused), and a daemon protocol in which only the newest
+stream of a worker counts. See [scheduler.md](docs/design/scheduler.md#more-than-one-server).
 
 ## Security model
 
@@ -303,9 +316,8 @@ not yet probed.
   `--reapi-tls-key`, both or neither). Under TLS it presents a server certificate
   only: it asks clients for none, so a client certificate identifies no caller. A key
   that does not match its certificate stops the server before it prints its start
-  line. The listener accepts any bind address, plain text included. Over TLS as over
-  plain text, it runs the authentication policy and the per-call authorizers of
-  `--reapi-auth-policy`, in Buildbarn's model
+  line. Over TLS as over plain text, it runs the authentication policy and the
+  per-call authorizers of `--reapi-auth-policy`, in Buildbarn's model
   ([docs/reapi-auth.md](docs/reapi-auth.md)); the policies built so far (`allow`,
   `deny`, `any`, `all`, and instance-name prefixes) check no credential. Without the
   flag every call is accepted, and whoever reaches the port can read action inputs
@@ -315,10 +327,19 @@ not yet probed.
   itself behind the front; the front passes the header through and does not check
   it. A peer address does not identify a caller here: a proxy on the same host
   connects from loopback, whoever its client is.
-- **Planned:** a bind guard. `kbf-server` refuses a plain-text, unauthenticated REAPI
-  bind that other machines could reach, and allows the front's hop: loopback, or an
-  address the operator names as the front's. A REAPI listener served over TLS is
-  the other answer for a hop that crosses machines.
+- **Built: TLS is optional; plain text off loopback is warned about, not refused.**
+  `kbf-server` serves a listener without its TLS flags in plain text on whatever
+  address it is given. When the REAPI or worker listener serves plain text on an
+  address that is not loopback (a wildcard such as `0.0.0.0` or `::`, or any
+  interface address; `::ffff:127.0.0.1` counts as loopback), the start line ends with
+  one ` warning=plaintext-off-loopback:<listeners>` token, `<listeners>` being
+  `reapi`, `worker` or `reapi,worker`, and the server starts. Whether plain text is
+  acceptable on that network (a loopback front, a mesh interface WireGuard already
+  encrypts) is the operator's call. A deployment that wants TLS, ours included, turns
+  it on in its config: `--reapi-tls-cert` and `--reapi-tls-key` for a REAPI hop that
+  crosses machines, and the three worker TLS flags for daemons on other machines.
+  The warning looks at the bind address only: it does not restrict which peers
+  connect, and it does not look at `--reapi-auth-policy`.
 - **A front that works: `tailscale serve` in HTTPS mode.** A probe with
   `tailscale serve` 1.102.4 ran its HTTPS mode (`tailscale serve --https=<port>
   http://127.0.0.1:<reapi>`) in front of a plain-text REAPI listener on loopback.

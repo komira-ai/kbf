@@ -540,7 +540,7 @@ fn a_key_file_without_an_owner_is_the_running_users() {
 #[test]
 fn each_refusal_stops_the_plan() {
     type Setup = fn(&mut FakeExec, &mut Buckets, &mut Minio);
-    let cases: [(&str, Setup, &str); 10] = [
+    let cases: [(&str, Setup, &str); 11] = [
         (
             "503",
             |e, _, _| e.http = Ok(503),
@@ -569,6 +569,17 @@ fn each_refusal_stops_the_plan() {
             },
             "/srv/repo/kbf/s3.env is inside a git work tree (/srv/repo/.git exists): a key \
              file never goes into a checkout",
+        ),
+        (
+            // The key file's own directory is a checkout's top: a loop that stops one
+            // directory short of the file still passes the case above.
+            "git beside",
+            |e, a, _| {
+                e.entries.insert(p("/srv/repo/kbf/.git"), Entry::Other);
+                a.key_file = Some(p("/srv/repo/kbf/s3.env"));
+            },
+            "/srv/repo/kbf/s3.env is inside a git work tree (/srv/repo/kbf/.git exists): a \
+             key file never goes into a checkout",
         ),
         (
             "dir",

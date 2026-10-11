@@ -5,10 +5,15 @@
 //!                          --mc PATH [--key-file PATH [--key-owner USER]] [--remove] [--apply]
 //! kbf-deploy minio nodeport --kubectl PATH --kubeconfig PATH [--context NAME]
 //!                           --namespace NS --service NAME --node-port N [--remove] [--apply]
+//! kbf-deploy linux render-units --config FILE --out DIR [--kbf-uid UID]
+//! kbf-deploy linux check-units --config FILE --dir DIR [--installable]
 //! ```
 //!
-//! Without `--apply` a subcommand prints its plan as `DRY-RUN:` lines and changes
-//! nothing. Exit status: 0 done (or nothing to do), 1 refused or failed, 2 bad flags.
+//! Bad flags exit 2 for every subcommand. The `minio` subcommands change a host: without
+//! `--apply` they print their plan as `DRY-RUN:` lines and change nothing, and they exit
+//! 0 done (or nothing to do) or 1 refused or failed. The `linux` subcommands only write
+//! into or read the directory they are given, and exit 0 done, 1 a check found a broken
+//! rule, or 2 refused (a bad setting or file, printed as `REFUSED: ...` on stderr).
 //! `minio buckets` reads the MinIO admin key pair from `MINIO_ROOT_USER` and
 //! `MINIO_ROOT_PASSWORD` in the environment (secrets are never flags: argv is
 //! world-readable).
@@ -24,6 +29,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use clap::{Args, Parser, Subcommand};
 
 use crate::exec::{Exec, HostExec};
+use crate::linux;
 use crate::minio::{self, Admin, K8sName, KbfName, MinioError, buckets, nodeport};
 use crate::path::{HostPath, Root};
 use crate::plan::{Mode, RunAs, execute};
@@ -33,7 +39,7 @@ use crate::step::HttpUrl;
 #[command(
     name = "kbf-deploy",
     version,
-    about = "Deploy steps for a kbf farm, printed by default and carried out with --apply"
+    about = "Deploy kits for a kbf farm; a minio plan is printed by default and carried out with --apply"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -45,6 +51,38 @@ enum Kit {
     /// A MinIO for kbf: its buckets and key, and a NodePort for its S3 port.
     #[command(subcommand)]
     Minio(Minio),
+    /// A converged Linux storage node: MinIO, kbf-server and kbf-daemon.
+    #[command(subcommand)]
+    Linux(Linux),
+}
+
+#[derive(Subcommand)]
+enum Linux {
+    /// Render the node's four systemd files into a directory.
+    RenderUnits {
+        /// The kit's settings, KEY=VALUE lines.
+        #[arg(long)]
+        config: PathBuf,
+        /// Where to write the files, laid out as under /etc/systemd/system.
+        #[arg(long)]
+        out: PathBuf,
+        /// The kbf user's uid (the daemon's XDG_RUNTIME_DIR); without it the daemon's
+        /// unit keeps `<kbf uid>`, which `check-units --installable` refuses.
+        #[arg(long)]
+        kbf_uid: Option<u32>,
+    },
+    /// Check rendered units against the host's priorities.
+    CheckUnits {
+        /// The settings the units were rendered with.
+        #[arg(long)]
+        config: PathBuf,
+        /// The directory render-units wrote.
+        #[arg(long)]
+        dir: PathBuf,
+        /// Also refuse a `<...>` placeholder.
+        #[arg(long)]
+        installable: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -156,12 +194,47 @@ pub fn run<E: Exec>(
     let result = match cli.kit {
         Kit::Minio(Minio::Buckets(a)) => minio_buckets(a, exec, env, out),
         Kit::Minio(Minio::Nodeport(a)) => minio_nodeport(a, exec, out),
+        Kit::Linux(l) => return linux_kit(l, out, err),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             let _ = writeln!(err, "kbf-deploy: {e}");
             ExitCode::FAILURE
+        }
+    }
+}
+
+/// The `linux` kit: 0 done, 1 a check found a broken rule, 2 refused.
+fn linux_kit(l: Linux, out: &mut dyn Write, err: &mut dyn Write) -> ExitCode {
+    let result = match l {
+        Linux::RenderUnits {
+            config,
+            out: dir,
+            kbf_uid,
+        } => linux::render_units(&config, &dir, kbf_uid).map(|line| (vec![line], 0)),
+        Linux::CheckUnits {
+            config,
+            dir,
+            installable,
+        } => linux::check_units(&config, &dir, installable).map(|report| {
+            let code = u8::from(!report.failures.is_empty());
+            let mut lines: Vec<String> = report.failures.iter().map(ToString::to_string).collect();
+            lines.push(report.summary);
+            (lines, code)
+        }),
+    };
+    match result {
+        Ok((lines, code)) => {
+            for line in lines {
+                // A closed stdout (`| head`) is not worth a panic; the exit code still says it.
+                let _ = writeln!(out, "{line}");
+            }
+            ExitCode::from(code)
+        }
+        Err(e) => {
+            let _ = writeln!(err, "REFUSED: {e}");
+            ExitCode::from(2)
         }
     }
 }

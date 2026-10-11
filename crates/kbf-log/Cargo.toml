@@ -8,8 +8,10 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
+kbf-caps.workspace = true
 kbf-meta.workspace = true
 kbf-proto.workspace = true
+kbf-sched.workspace = true
 kbf-types.workspace = true
 prost.workspace = true
 thiserror.workspace = true

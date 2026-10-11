@@ -193,6 +193,65 @@ pub fn job_steps(text: &str, job: &str) -> Result<Vec<Step>, String> {
         .collect())
 }
 
+/// One step with a `run:` script, in a workflow job or an action file's composite
+/// steps, as the interpreter budget reads it.
+#[derive(Debug, PartialEq, Eq)]
+pub struct RunStep {
+    /// The job's key as written, or `runs` for an action file's `runs.steps`.
+    pub job: String,
+    /// The step's `name:`, or `step <n>` (1-based, counting every step of the list)
+    /// when it has none.
+    pub step: String,
+    /// The `run:` value, after YAML unescaping and folding.
+    pub script: String,
+}
+
+/// Every step whose `run:` is a string, in a workflow's `jobs.<id>.steps` and an
+/// action file's `runs.steps`, in file order. An error when the text does not parse;
+/// a shape the workflow lint refuses yields no steps here, and that lint reports it.
+pub fn run_steps(text: &str) -> Result<Vec<RunStep>, String> {
+    let root = yaml::load(text)?;
+    let Value::Map(top) = &root.value else {
+        return Ok(Vec::new());
+    };
+    let mut lists: Vec<(String, &Node)> = Vec::new();
+    if let Some(Value::Map(jobs)) = get(top, "jobs").map(|j| &j.value) {
+        for (key, job) in jobs {
+            if let (Some(name), Value::Map(job)) = (key.as_str(), &job.value)
+                && let Some(steps) = get(job, "steps")
+            {
+                lists.push((name.to_owned(), steps));
+            }
+        }
+    }
+    if let Some(Value::Map(runs)) = get(top, "runs").map(|r| &r.value)
+        && let Some(steps) = get(runs, "steps")
+    {
+        lists.push(("runs".to_owned(), steps));
+    }
+    let mut found = Vec::new();
+    for (job, steps) in lists {
+        let Value::Seq(steps) = &steps.value else {
+            continue;
+        };
+        for (at, step) in steps.iter().enumerate() {
+            let Value::Map(m) = &step.value else {
+                continue;
+            };
+            if let Some(script) = get(m, "run").and_then(Node::as_str) {
+                found.push(RunStep {
+                    job: job.clone(),
+                    step: get(m, "name")
+                        .and_then(Node::as_str)
+                        .map_or_else(|| format!("step {}", at + 1), str::to_owned),
+                    script: script.to_owned(),
+                });
+            }
+        }
+    }
+    Ok(found)
+}
+
 /// What a local `uses: ./...` may name: the repository's linted files.
 #[derive(Debug, Default)]
 pub struct Repo {

@@ -9,6 +9,7 @@
 //! test binaries, the swap watch's paths (run here) and the timeout and kill paths (run
 //! in `fake_podman.rs`) each counted as missed in the other binary's build.
 
+use std::os::unix::fs::PermissionsExt as _;
 use std::time::{Duration, Instant};
 
 use kbf_daemon::{Runtime, RuntimeError};
@@ -390,9 +391,19 @@ async fn the_swap_threshold_follows_the_configuration() {
 }
 
 /// Catches the swap watch's kill hanging, or reported as anything but the lease's
-/// out-of-memory kill, when `cgroup.kill` cannot be written (the lease cgroup is
-/// read-only for a moment) and `podman start` outlives the grace period; and anything
-/// of the lease left behind afterwards.
+/// out-of-memory kill, when `cgroup.kill` cannot be written and `podman start`
+/// outlives the grace period; and anything of the lease left behind afterwards.
+///
+/// The test, not the action, writes the lease cgroup's counters, one step after
+/// another, so the samples the watch can read do not depend on how fast anything
+/// runs: `memory.events` says `max 1` and `memory.swap.current` cannot be read
+/// (`n/a`, a sample the watch skips) before the lease cgroup goes read-only, and only
+/// then does the swap read 1 MiB. So the first sample the watch reads is its kill
+/// sample, whenever it takes it, and its `cgroup.kill` fails. The lease cgroup stays
+/// read-only to the end: the clean's own `cgroup.kill` fails too, and `podman rm
+/// --force` is what ends the action. (Made writable again by the action after a
+/// sleep, the cgroup was still read-only at the clean on a slow runner, and the
+/// fake's `rm` left its counters behind: "lease cgroup left".)
 #[tokio::test]
 async fn the_swap_kill_ends_even_when_cgroup_kill_fails() {
     let fake = Fake::with("swap-kill-fails", |config| {
@@ -401,32 +412,27 @@ async fn the_swap_kill_ends_even_when_cgroup_kill_fails() {
             percent: 0,
             every: Duration::from_millis(20),
         };
-        config.kill_grace = Duration::from_secs(1);
     });
-    // The lease cgroup goes read-only before its `max` events start to grow, and
-    // writable again 300 ms later, after the watch's kill and before the grace ends.
-    // `memory.swap.current` cannot be read (`n/a`) until the swap goes out, at the
-    // second step, after `max` reached 2: the watch skips every sample before that,
-    // so the first one it takes holds the swap and `max` 2 or more, and against the
-    // zeros of a new lease that swap is all the lease's own, however late or often it
-    // samples. Readable as 0 before, two samples in the second step would see the
-    // swap rise while `max` stayed at 2 (the host's share), and nothing would kill
-    // the lease: a slow step on a busy runner did that.
-    let script = r#"echo 5000 > "$CG/memory.current"; echo n/a > "$CG/memory.swap.current"
-        printf 'max 0\noom 0\noom_kill 0\n' > "$CG/memory.events"
-        chmod a-w "$CG"
-        for i in 1 2 3 4 5 6 7 8 9 10; do
-            printf 'max %d\noom 0\noom_kill 0\n' $i > "$CG/memory.events"
-            [ $i -eq 2 ] && echo 1048576 > "$CG/memory.swap.current"; sleep 0.01
-        done
-        sleep 0.2; chmod u+w "$CG"; exec sleep 30"#;
+    let cgroup = fake.lease_cgroup(1);
+    let write = |file: &str, text: &str| std::fs::write(cgroup.join(file), text).expect(file);
+    let steps = async {
+        // The driver makes the lease cgroup before `podman start` publishes the pid.
+        fake.wait_for_start().await;
+        write("memory.current", "5000\n");
+        write("memory.events", "max 1\noom 0\noom_kill 0\n");
+        write("memory.swap.current", "n/a\n");
+        std::fs::set_permissions(&cgroup, std::fs::Permissions::from_mode(0o555))
+            .expect("make the lease cgroup read-only");
+        write("memory.swap.current", "1048576\n");
+    };
+    let spec = Spec::new(&image(), "unused");
     let started = Instant::now();
-    let outcome = fake.run(1, &Spec::new(&image(), "unused"), script).await;
+    let (outcome, ()) = tokio::join!(fake.run(1, &spec, "exec sleep 30"), steps);
     assert!(
         matches!(outcome, Err(RuntimeError::OutOfMemory { limit, .. }) if limit == CAP),
         "{outcome:?}"
     );
-    // The kill waits out the 1 s grace, not the action's 30 s: a kill that waits for
+    // The kill waits out the grace, not the action's 30 s: a kill that waits for
     // `podman start` without a bound returns only once the action has ended.
     assert!(
         started.elapsed() < Duration::from_secs(10),

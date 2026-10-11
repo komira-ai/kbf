@@ -43,6 +43,8 @@ md-5 = "0.11.0"
 objc2 = "0.6.5"
 objc2-foundation = { version = "0.3.2", default-features = false, features = ["std"] }
 objc2-open-directory = { version = "0.3.2", default-features = false, features = ["std"] }
+# The token trees of syn (below). Already in the tree through the derive macros.
+proc-macro2 = "1.0.107"
 prost = "0.14.4"
 prost-types = "0.14.4"
 protox = "0.9.1"
@@ -74,6 +76,9 @@ ssh-key = { version = "0.6.7", default-features = false, features = ["alloc", "e
 # Constant-time comparison of the operator API token (kbf-server). Already in the tree
 # through rustls.
 subtle = "2.6.1"
+# Parses Rust sources for the interpreter budget's shell scan (kbf-it, tests only).
+# Already in the tree through the derive macros.
+syn = { version = "2.0.119", default-features = false, features = ["full", "parsing", "visit"] }
 thiserror = "2.0.21"
 # RFC 3339 times in the MDM gate's signed messages. Already in the tree through
 # x509-parser.
@@ -95,6 +100,7 @@ kbf-alert = { path = "crates/kbf-alert" }
 kbf-auth = { path = "crates/kbf-auth" }
 kbf-caps = { path = "crates/kbf-caps" }
 kbf-daemon = { path = "crates/kbf-daemon" }
+kbf-deploy = { path = "crates/kbf-deploy" }
 kbf-driver-container = { path = "crates/kbf-driver-container" }
 kbf-driver-native = { path = "crates/kbf-driver-native" }
 kbf-estimator = { path = "crates/kbf-estimator" }
@@ -115,6 +121,7 @@ kbf-server = { path = "crates/kbf-server" }
 kbf-sim = { path = "crates/kbf-sim" }
 kbf-sim-cell = { path = "crates/kbf-sim-cell" }
 kbf-store = { path = "crates/kbf-store" }
+kbf-testkit = { path = "crates/kbf-testkit" }
 kbf-types = { path = "crates/kbf-types" }
 
 # `clippy.toml` lists the clock, sleep, network and hashed-collection items that pure

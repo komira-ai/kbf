@@ -308,15 +308,26 @@ fn each_refusal_stops_the_plan() {
     }
 }
 
+/// Our Service's name and label, in another namespace (another MinIO's NodePort).
+fn ours_elsewhere() -> Value {
+    let mut svc: Value = serde_json::from_str(MANIFEST).expect("json");
+    svc["metadata"]["namespace"] = "minio-ssd".into();
+    svc["spec"]["ports"][0]["nodePort"] = 30901.into();
+    svc
+}
+
 /// Catches a rollback that deletes a Service this kit did not make (one of that name
-/// without the label), or plans a delete of nothing (the apply would fail).
+/// without the label), or plans a delete of nothing (the apply would fail), and one
+/// that finds "our" Service by name in any namespace: a labelled one of that name in
+/// another namespace is listed first, so a search by name alone would plan to delete
+/// it from `--namespace` (nothing there) or take it for the foreign one's label.
 #[test]
 fn remove_deletes_only_the_labelled_service() {
     let rollback = NodePort {
         remove: true,
         ..args()
     };
-    let (mut exec, state) = host(vec![minio()]);
+    let (mut exec, state) = host(vec![ours_elsewhere(), minio()]);
     assert_eq!(
         run(&mut exec, &rollback, Mode::DryRun).expect("nothing there"),
         "no Service minio/minio-hdd-kbf-np\nnothing to do\n"
@@ -332,11 +343,11 @@ fn remove_deletes_only_the_labelled_service() {
         )
     );
     run(&mut exec, &rollback, Mode::Apply).expect("remove");
-    assert_eq!(state.borrow().services, vec![minio()]);
+    assert_eq!(state.borrow().services, vec![ours_elsewhere(), minio()]);
 
     let mut foreign: Value = serde_json::from_str(MANIFEST).expect("json");
     foreign["metadata"]["labels"] = json!({"app": "someone-else"});
-    let (mut exec, _state) = host(vec![minio(), foreign]);
+    let (mut exec, _state) = host(vec![ours_elsewhere(), minio(), foreign]);
     let err = run(&mut exec, &rollback, Mode::DryRun).expect_err("not ours");
     assert_eq!(
         err.to_string(),

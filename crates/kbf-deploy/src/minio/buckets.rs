@@ -20,6 +20,12 @@
 //! and each bucket that already exists is listed with its key, so a key that no longer
 //! works is an error rather than a kept file. A re-run after an apply plans nothing.
 //!
+//! A key's reach is fixed when it is minted. The named policy is attached to nothing
+//! by this kit (the account carries its own inline copy), so a `--bucket` added on a
+//! later run is made and named in the policy, but a kept key cannot reach it; that run
+//! still exits 0, and the next one fails when it lists the bucket with the key. A
+//! bucket change needs a new key, which this kit never mints over a kept key file.
+//!
 //! `--remove` (rollback) removes each bucket WITH its objects (`mc rb --force`), the
 //! service account whose id the key file holds, the key file, and the policy.
 //!

@@ -8,8 +8,9 @@ repository.workspace = true
 publish.workspace = true
 
 # The deploy tool: a plan of steps, printed by default and carried out with `--apply`,
-# through an `Exec` that is the host or a recording fake. Each kit is a subcommand built
-# on it; `minio` (buckets and their key, a NodePort for the S3 port) is the first.
+# through an `Exec` that is the host or a recording fake, and the kits built on it as
+# subcommands: `minio` (buckets and their key, a NodePort for the S3 port) and `linux`
+# (render-units, check-units).
 
 [[bin]]
 name = "kbf-deploy"
@@ -17,6 +18,7 @@ path = "src/main.rs"
 
 [dependencies]
 clap.workspace = true
+kbf-types.workspace = true
 rustix = { workspace = true, features = ["process"] }
 serde.workspace = true
 serde_json.workspace = true
