@@ -25,6 +25,10 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 # shellcheck source=tools/spike/macos/lib.sh
 . "$HERE/lib.sh"
 PROBE=tcc
+# PROBE ONLY (do not merge): run the P-D0 capture and print each fixture file as
+# plain text in the log, one "P0 <file>: <line>" per line.
+bash "$HERE/devicectl_p0.sh" "$RUNNER_TEMP/p0"
+(cd "$RUNNER_TEMP/p0" && for f in */*; do sed "s|^|P0 $f: |" "$f"; done)
 SYSTEM_DB=${SPIKE_TCC_SYSTEM_DB:-/Library/Application Support/com.apple.TCC/TCC.db}
 USER_DB=${SPIKE_TCC_USER_DB:-$HOME/Library/Application Support/com.apple.TCC/TCC.db}
 SERVICES="kTCCServiceScreenCapture kTCCServiceAccessibility kTCCServiceListenEvent kTCCServicePostEvent"
