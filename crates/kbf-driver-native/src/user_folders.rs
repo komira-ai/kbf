@@ -11,12 +11,20 @@
 //! - `xcrun`, behind every `/usr/bin` compiler shim (`cc`, `clang`, `swiftc`), keeps its
 //!   lookup cache in `T/xcrun_db`, written through a temporary `T/xcrun_db-<random>`;
 //!   without it every call prints "couldn't create cache file" and is several times
-//!   slower.
+//!   slower;
+//! - Swift Build (`SWBBuildService`, which `xcodebuild` starts) makes a scratch
+//!   directory with `mkdtemp(T/swbuild.tmp.<random>)` and stops the build when it
+//!   cannot: on the macOS runner (Xcode 16.4) both XCUITest fixtures of
+//!   `docs/spikes/macos-p0.md` failed to build under the profile without it (the
+//!   one-file C tool `tests/user_folders.rs` builds did not). The name is Swift
+//!   Build's own random one, so it cannot be one per lease.
 //!
 //! The sandbox profile ([`UserFolders::rules`]) lets an action write below
 //! `T/TemporaryItems` (not the folder itself: an action that could replace it with a
-//! symlink would aim the daemon's sweep anywhere) and to those `xcrun` names, and
-//! nothing else in the two folders, the folders themselves included. The daemon finds
+//! symlink would aim the daemon's sweep anywhere), to those `xcrun` names, and to an
+//! entry named `swbuild.tmp.` and at least one more character, and what is below it
+//! (one regular expression without an end anchor), and nothing else in the two
+//! folders, the folders themselves included. The daemon finds
 //! the folders once, at start ([`UserFolders::detect`]), with every link resolved: the
 //! sandbox compares the real paths of the files written. The sweep makes
 //! `TemporaryItems` (mode 0700) when it is missing, since an action cannot.
@@ -50,6 +58,10 @@
 //! opens `T` and `TemporaryItems` with `O_NOFOLLOW`, takes each only when it is a
 //! directory of the daemon's user, and removes entries by name relative to it,
 //! never following a symlink at any level ([`kbf_outputs::remove_tree_at`]).
+//! A `swbuild.tmp.*` directory is not swept: Swift Build removes its own when it
+//! ends, and one a running build still uses can go untouched for longer than
+//! [`LEFTOVER_AGE`] (a long build), so the age rule could remove it under the build.
+//! One a killed lease left stays: the daemon does not remove it.
 
 use std::ffi::OsStr;
 use std::io;
@@ -69,6 +81,10 @@ const TEMPORARY_ITEMS: &str = "TemporaryItems";
 
 /// `xcrun`'s cache in the temporary folder; it writes `<XCRUN_DB>-<random>` first.
 const XCRUN_DB: &str = "xcrun_db";
+
+/// What Swift Build's scratch directory in the temporary folder is named: this, then
+/// `mkdtemp`'s random characters.
+const SWBUILD_TMP: &str = "swbuild.tmp.";
 
 /// How the sweep opens a folder: a directory, never through a symlink.
 const FOLDER: OFlags = OFlags::RDONLY
@@ -142,13 +158,15 @@ impl UserFolders {
     }
 
     /// The sandbox profile rules that let an action write the names the module lists
-    /// (below `TemporaryItems`, never the folder itself) and nothing else in these
-    /// folders; they follow the profile's `(deny file-write*)`, which they narrow.
+    /// (below `TemporaryItems`, never the folder itself; a `swbuild.tmp.<random>`
+    /// entry and what is below it) and nothing else in these folders; they follow the
+    /// profile's `(deny file-write*)`, which they narrow.
     #[must_use]
     pub fn rules(&self) -> String {
         let temp = regex_quote(&self.temp.to_string_lossy());
+        let swbuild = regex_quote(SWBUILD_TMP);
         format!(
-            "(allow file-write*\n  (regex #\"^{temp}/{TEMPORARY_ITEMS}/\")\n  (regex #\"^{temp}/{XCRUN_DB}(-[^/]*)?$\"))\n",
+            "(allow file-write*\n  (regex #\"^{temp}/{TEMPORARY_ITEMS}/\")\n  (regex #\"^{temp}/{XCRUN_DB}(-[^/]*)?$\")\n  (regex #\"^{temp}/{swbuild}[^/]+\"))\n",
         )
     }
 
@@ -365,9 +383,12 @@ mod tests {
     /// `TemporaryItems` itself (an action could swap it for a symlink the daemon's
     /// sweep then follows), miss one of the names the tools write, or let a
     /// regular-expression character in the path (`+` and `.` are common in
-    /// `/var/folders` names) match other paths.
+    /// `/var/folders` names) match other paths; and a Swift Build rule wider than one
+    /// `swbuild.tmp.<random>` entry and what is below it: a prefix without the dots
+    /// escaped (`swbuildXtmpX..`), one that takes an empty suffix (`swbuild.tmp.`
+    /// itself), or the folder whole.
     #[test]
-    fn the_rules_name_only_what_is_below_temporary_items_and_the_xcrun_cache() {
+    fn the_rules_name_only_the_few_names_the_tools_write() {
         let folders = UserFolders::new(
             PathBuf::from("/private/var/folders/ab/c+d.e/T"),
             PathBuf::from("/private/var/folders/ab/c+d.e/C"),
@@ -377,7 +398,8 @@ mod tests {
             folders.rules(),
             "(allow file-write*\n  \
              (regex #\"^/private/var/folders/ab/c\\+d\\.e/T/TemporaryItems/\")\n  \
-             (regex #\"^/private/var/folders/ab/c\\+d\\.e/T/xcrun_db(-[^/]*)?$\"))\n"
+             (regex #\"^/private/var/folders/ab/c\\+d\\.e/T/xcrun_db(-[^/]*)?$\")\n  \
+             (regex #\"^/private/var/folders/ab/c\\+d\\.e/T/swbuild\\.tmp\\.[^/]+\"))\n"
         );
         assert_eq!(
             regex_quote("a.^$*+?()[]{}|b/-"),
@@ -387,7 +409,8 @@ mod tests {
 
     /// Catches a sweep that removes a young leftover (another lease's save in
     /// progress, one changed a minute from now included), `xcrun_db` itself (the
-    /// cache), or anything in the folders but the leftovers the module lists; that
+    /// cache), a Swift Build scratch directory (a long build's may be old), or
+    /// anything in the folders but the leftovers the module lists; that
     /// leaves an old one, or one changed further in the future than the age (issue
     /// #163's review: such a one was never swept); or that stops at the first entry it
     /// cannot remove.
@@ -412,6 +435,7 @@ mod tests {
             made("xcrun_db-young", f.temp(), young),
             made("xcrun_db", f.temp(), old),
             made("xcrun_dbx", f.temp(), old),
+            made("swbuild.tmp.Ab12Cd34/", f.temp(), old),
             made("someone-elses", f.temp(), old),
             made("com.apple.something/", f.cache(), old),
         ];

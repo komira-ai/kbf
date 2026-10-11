@@ -93,7 +93,16 @@ pub const LEASE_PARAM: &str = "KBF_LEASE";
 /// included, as `tests/launchd.rs` shows on the macOS runner (and the mutants that
 /// dropped `(deny job-creation)` stayed green). The rule stays as defence in depth: it
 /// keeps the refusal in this profile rather than in launchd's current behaviour.
-/// `(deny lsopen)` is load-bearing: without it an action opens an application.
+/// `(deny lsopen)` is load-bearing: without it an action opens an application, which
+/// Launch Services starts outside the sandbox and outside the lease's process tree
+/// (`tests/launchd.rs`): it writes anywhere the daemon's user can, has the network,
+/// and outlives the lease. Naming the application does not make that narrower, since
+/// an action can link an application of its own inside its lease and open that. So
+/// macOS UI tests do not run under this driver: `xcodebuild` starts the UI-test
+/// runner, an application built from the action's own sources, through Launch
+/// Services, and on the macOS runner the rule stopped it (error -54,
+/// `docs/spikes/macos-p0.md`). Where they run is a decision still open
+/// (`docs/design/macos-vms.md`, section 3.2, puts them in a VM lease).
 pub const BASE_PROFILE: &str = "(version 1)\n\
 (allow default)\n\
 (deny job-creation)\n\
@@ -354,6 +363,63 @@ mod tests {
             assert!(
                 !profile.contains("(allow mach-lookup"),
                 "{network:?}: {profile}"
+            );
+        }
+    }
+
+    /// Catches a profile that loses one of its denies, or gets an allow that takes one
+    /// back, with the network off and on and the user-folder rules appended:
+    /// `(deny lsopen)` above all, without which an action opens an application outside
+    /// the sandbox (`tests/launchd.rs`; macOS UI tests need it and stay out,
+    /// `docs/spikes/macos-p0.md`), and every rule of [`NO_DEVICE_RULES`]. The appended
+    /// rules may only allow file writes.
+    #[test]
+    fn every_profile_keeps_its_denies() {
+        let sandbox = Isolation::Sandbox(PathBuf::from(SANDBOX_EXEC));
+        let folders = crate::user_folders::UserFolders::new(
+            PathBuf::from("/private/var/folders/ab/cd/T"),
+            PathBuf::from("/private/var/folders/ab/cd/C"),
+        )
+        .expect("fits");
+        let rules = folders.rules();
+        let denies = [
+            "(deny job-creation)",
+            "(deny lsopen)",
+            "(deny user-preference-write)",
+            "(deny file-write*)",
+        ];
+        for network in [Network::Off, Network::On] {
+            let (_, args) = sandbox.wrap(
+                network,
+                Path::new("/private/var/kbf/lease-1-2"),
+                &rules,
+                PathBuf::from("/bin/sh"),
+                &[],
+            );
+            let profile = &args[3];
+            let lines: Vec<&str> = profile.lines().collect();
+            for deny in denies.iter().copied().chain(NO_DEVICE_RULES.lines()) {
+                assert!(lines.contains(&deny), "{network:?}: no {deny}:\n{profile}");
+            }
+            for operation in [
+                "lsopen",
+                "job-creation",
+                "user-preference-write",
+                "mach-lookup",
+            ] {
+                assert!(
+                    !profile.contains(&format!("(allow {operation}")),
+                    "{network:?}: {operation} allowed:\n{profile}"
+                );
+            }
+            let appended = &profile
+                [profile.find(NO_DEVICE_RULES).expect("device rules") + NO_DEVICE_RULES.len()..];
+            assert_eq!(appended, rules, "{network:?}");
+            assert!(
+                appended.starts_with("(allow file-write*\n")
+                    && appended.matches("(allow").count() == 1
+                    && !appended.contains("(deny"),
+                "{network:?}: {appended}"
             );
         }
     }
