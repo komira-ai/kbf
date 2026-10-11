@@ -1,0 +1,60 @@
+# kbf-deploy mdm: the settings of the MDM kit (`--config FILE`).
+#
+# Format: KEY=VALUE, one per line, no spaces around `=`, optional double quotes. A key
+# not listed here, or one given twice, is refused. Every key `mdm install` and
+# `mdm verify` read must be set; there are no defaults. Absolute paths only.
+#
+# Put no secret in this file. `mdm install` makes the API keys and the SCEP challenge
+# into 0600 root files under MDM_ETC; the DNS API key goes in MDM_ETC/dns.env.
+
+# --- where the MDM answers ----------------------------------------------------
+# The name the Macs dial (a DNS A record pointing at MDM_BIND). The TLS
+# certificate is for this name.
+MDM_DNS_NAME=mdm.example.com
+# The LAN address the HTTPS proxy binds, and the only one: refused unless it is
+# private (10/8, 172.16/12, 192.168/16) and inside MDM_LAN_CIDR, and `mdm install`
+# also refuses one no interface carries.
+MDM_BIND=
+# The rack LAN in CIDR form, 8 to 30 bits: the proxy talks to it and to loopback
+# only (systemd IPAddressAllow=).
+MDM_LAN_CIDR=
+
+# --- the services ---------------------------------------------------------------
+# The system user every service runs as.
+MDM_USER=kbf-mdm
+# State (database, SCEP CA, DEP token, TLS key): owned by MDM_USER, mode 0700.
+MDM_STATE=/var/lib/kbf-mdm
+# Unit inputs and the 0600 root env files (API keys, SCEP challenge, DNS key).
+MDM_ETC=/etc/kbf-mdm
+# The pinned binaries (root-owned, 0755).
+MDM_BIN=/opt/kbf-mdm/bin
+# The erase path's replay ledger (root only, 0700).
+MDM_ERASE_STATE=/var/lib/kbf-mdm-erase
+# Loopback ports of NanoHUB, the SCEP server and NanoDEP's depserver.
+MDM_NANOHUB_PORT=9004
+MDM_SCEP_PORT=9005
+MDM_DEP_PORT=9001
+# Caps of kbf-mdm.slice (all five services together).
+MDM_MEMORY_MAX=1G
+MDM_CPU_QUOTA=100%
+MDM_TASKS_MAX=256
+
+# --- Apple ----------------------------------------------------------------------
+# NanoDEP's name for the Apple Business Manager server token.
+MDM_DEP_NAME=example
+# The organisation in the SCEP CA's name.
+MDM_ORG=Example
+
+# --- TLS: an ACME certificate over DNS-01 ---------------------------------------
+# The ACME account's contact address (expiry mail).
+MDM_ACME_EMAIL=
+MDM_ACME_SERVER=https://acme-v02.api.letsencrypt.org/directory
+# lego's DNS provider.
+MDM_ACME_DNS_PROVIDER=
+
+# --- the erase path -------------------------------------------------------------
+# The ssh signature namespace and the principal of the operator's key.
+MDM_ERASE_NAMESPACE=
+MDM_ERASE_PRINCIPAL=
+# A signed erase request older than this many seconds is refused.
+MDM_ERASE_MAX_AGE=900

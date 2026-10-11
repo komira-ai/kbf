@@ -16,6 +16,8 @@
 //!   [`RunAs::Root`] plan applies only as root, a [`RunAs::User`] plan never as root,
 //!   and applying as root first checks that the running binary and every directory
 //!   above it are root's alone ([`trust`]).
+//! - [`https`]: a small HTTPS client (rustls with ring, the host's trusted roots) for
+//!   the kits that download or check over TLS.
 //! - [`exec`]: the [`Exec`] trait and [`HostExec`], the real host. Commands run by
 //!   absolute path with an empty environment plus the variables they name, never
 //!   through a shell. A kit reads the host while planning with [`Exec::query`] (a
@@ -39,11 +41,16 @@
 //!   (`linux check-units`); and, as root, the units installed and the services started
 //!   (`linux install-units`), the pinned images pulled as the kbf user (`linux
 //!   image-pull`) and the swapfile (`linux swap`).
+//! - [`mdm`]: an Apple MDM on one Linux host: its pinned upstream archives fetched
+//!   (`mdm fetch`), its services installed as root (`mdm install`), and read-only
+//!   checks of what runs (`mdm verify`).
 
 pub mod cli;
 pub mod config;
 pub mod exec;
+pub mod https;
 pub mod linux;
+pub mod mdm;
 pub mod minio;
 pub mod path;
 pub mod plan;
