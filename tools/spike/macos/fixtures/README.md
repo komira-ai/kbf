@@ -51,6 +51,8 @@ macOS with Xcode only:
 bash selftest.sh OUT_DIR       # the pixel checker's selftest
 bash run.sh ios OUT_DIR        # build, test on the newest iPhone simulator
 bash run.sh macos OUT_DIR      # build, test in this login session
+bash run.sh macos OUT_DIR build-for-testing      # only build, into OUT_DIR
+bash run.sh macos OUT_DIR test-without-building  # then only test that build
 ```
 
 `run.sh` writes `OUT_DIR/<platform>.xcresult`, the xcodebuild log, and

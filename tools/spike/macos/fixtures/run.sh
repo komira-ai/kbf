@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 # Builds one fixture and runs its UI tests, then reports what the .xcresult holds.
-# macOS only. Usage: run.sh ios|macos OUT_DIR
+# macOS only. Usage: run.sh ios|macos OUT_DIR [test|build-for-testing|test-without-building]
+#
+# ACTION is the xcodebuild action, `test` by default. `build-for-testing` only builds
+# into OUT_DIR's derived data and reports xcodebuild's exit status as the result;
+# `test-without-building` then runs the tests from that build and is checked as
+# `test` is.
 #
 # ios runs on a simulator: the first available iPhone of the newest iOS runtime.
 # macos runs in this login session. Prints `SPIKE macos-<arch>.xcuitest.<platform>.*`
@@ -14,8 +19,17 @@
 SPIKE_ARCH="macos-$(uname -m)"
 
 here=$(cd "$(dirname "$0")" && pwd)
-platform=${1:?usage: run.sh ios|macos OUT_DIR}
-out=${2:?usage: run.sh ios|macos OUT_DIR}
+usage="usage: run.sh ios|macos OUT_DIR [test|build-for-testing|test-without-building]"
+platform=${1:?$usage}
+out=${2:?$usage}
+action=${3:-test}
+case $action in
+test | build-for-testing | test-without-building) ;;
+*)
+    echo "$usage" >&2
+    exit 2
+    ;;
+esac
 case $platform in
 ios)
     project=IOSFixture
@@ -42,7 +56,7 @@ macos)
     destination="platform=macOS,arch=$(uname -m)"
     ;;
 *)
-    echo "usage: run.sh ios|macos OUT_DIR" >&2
+    echo "$usage" >&2
     exit 2
     ;;
 esac
@@ -50,16 +64,26 @@ esac
 mkdir -p "$out"
 bundle=$out/$platform.xcresult
 log=$out/$platform-xcodebuild.log
-rm -rf "$bundle"
+[ "$action" = test ] || log=$out/$platform-$action-xcodebuild.log
 start=$(date +%s)
 rc=0
-xcodebuild test -project "$here/$project.xcodeproj" -scheme "$project" \
-    -destination "$destination" -derivedDataPath "$out/$platform-derived" \
-    -resultBundlePath "$bundle" >"$log" 2>&1 || rc=$?
+if [ "$action" = build-for-testing ]; then
+    xcodebuild build-for-testing -project "$here/$project.xcodeproj" -scheme "$project" \
+        -destination "$destination" -derivedDataPath "$out/$platform-derived" >"$log" 2>&1 || rc=$?
+else
+    rm -rf "$bundle"
+    xcodebuild "$action" -project "$here/$project.xcodeproj" -scheme "$project" \
+        -destination "$destination" -derivedDataPath "$out/$platform-derived" \
+        -resultBundlePath "$bundle" >"$log" 2>&1 || rc=$?
+fi
 kv "xcuitest.$platform.xcodebuild_exit" "$rc"
 kv "xcuitest.$platform.seconds" "$(($(date +%s) - start))"
 if [ "$rc" -ne 0 ]; then
     grep -E 'error:|failed|FAIL' "$log" | head -n 20 || true
+fi
+if [ "$action" = build-for-testing ]; then
+    kv "xcuitest.$platform.result" "$([ "$rc" -eq 0 ] && echo PASS || echo FAIL)"
+    exit "$rc"
 fi
 { grep -o 'KBF-FIXTURE [a-z-]*=.*' "$log" || true; } | sort -u | while read -r _ line; do
     kv "xcuitest.$platform.${line%%=*}" "${line#*=}"

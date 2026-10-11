@@ -135,16 +135,18 @@ simulator) as the native driver runs an action that asks for the network. The jo
 is not a copy: the driver's example `action_sandbox`
 (`crates/kbf-driver-native/examples/action_sandbox.rs`) writes the profile
 `Isolation::wrap` builds, `BASE_PROFILE` followed by the rules for the runner user's
-temporary folder, and prints its SHA-256. Each run gets a lease directory of its own
-and runs in its `root`, with stdin from `/dev/null` and only the lease's variables
-(`HOME`, `TMPDIR`, `XDG_CACHE_HOME`, `CLANG_MODULE_CACHE_PATH`) and
-`PATH=/usr/bin:/bin:/usr/sbin:/sbin`, as the driver runs an action whose Command sets
-only `PATH`.
+temporary folder, and prints its SHA-256. Each run gets a lease directory of its own,
+whose `root` (the input root) gets a copy of the fixtures, so the projects Xcode opens
+and writes into are inside the lease, as an action's sources are. It runs in that
+`root`, with stdin from `/dev/null` and only the lease's variables (`HOME`, `TMPDIR`,
+`XDG_CACHE_HOME`, `CLANG_MODULE_CACHE_PATH`) and `PATH=/usr/bin:/bin:/usr/sbin:/sbin`,
+as the driver runs an action whose Command sets only `PATH`.
 
 | Arm | What runs | Must |
 |---|---|---|
 | `deny_default` | `run.sh macos` under `(version 1)(deny default)`, through the same code that applies the driver's profile | fail, with at least one deny line from its processes, or the verdict is BROKEN (no profile applied, or a log reader that sees nothing) |
-| `driver.macos`, `driver.ios` | `run.sh` under the driver's profile | hand `sandbox-exec` a profile whose SHA-256 is the one `action_sandbox` printed, or BROKEN; PASS or FAIL is the result |
+| `driver.macos`, `driver.ios` | `run.sh` (`xcodebuild test`: build and test) under the driver's profile | hand `sandbox-exec` a profile whose SHA-256 is the one `action_sandbox` printed, or BROKEN; PASS or FAIL is the result |
+| `driver_tests.macos`, `driver_tests.ios` | `run.sh ... build-for-testing` without a sandbox, then `run.sh ... test-without-building` under the driver's profile in the same lease: what the UI tests need past the build | the unsandboxed build passes, or BROKEN; then as `driver.*` |
 | `control.macos`, `control.ios` | `run.sh` the same way, no sandbox | pass (three tests passed, three screenshots kept), or BROKEN |
 
 Deny lines: while a run lasts the probe samples the process table every 0.2 s; the
@@ -165,7 +167,9 @@ that ignores the unsandboxed controls, a run that falls back to no sandbox, driv
 runs handed a copy of `BASE_PROFILE` instead of the generated profile, a digest check
 that accepts a mismatch or no digest, a verdict that ignores a `(deny default)` run
 that passed or showed no deny line, deny lines counted from every process, a process
-tree without the run's children, and runs without the lease's variables.
+tree without the run's children, runs without the lease's variables, runs of the
+checkout's fixtures instead of the lease's copy, test-only arms that build under the
+sandbox, and a verdict that ignores the test-only arms or their unsandboxed build.
 
 ## Not covered here (planned)
 
