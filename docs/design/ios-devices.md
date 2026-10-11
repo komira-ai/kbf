@@ -6,9 +6,11 @@ live, how one specific device is booked for one lease, how the daemon reports ea
 device's health and alerts with the exact fix, how a device is cleaned between
 leases, and what still needs a person at the device. **Everything in it is planned**
 but the sandbox rule that keeps leases away from the node's devices
-([section 6.1](#61-what-the-sandbox-must-allow)). No daemon reports a device, no
-request key names one, and no runtime talks to one. What exists on `main` today is
-named as such.
+([section 6.1](#61-what-the-sandbox-must-allow)), the driver watch
+([section 7.5](#75-recover)), and the server's side of booking: matching, booking and
+`Start.device_id` ([sections 5.2 to 5.4](#5-scheduling-one-specific-device-per-lease)).
+No daemon reports a device yet and no runtime talks to one, so a device request waits
+and is refused as unservable. What exists on `main` today is named as such.
 
 Claims about Apple's software are marked **[V]** (read in the source linked) or
 **[A]** (an assumption nobody has checked on our hardware). Most claims about
@@ -111,7 +113,13 @@ is new.
 ### 5.2 Report entries
 
 One `ios.device` report entry per **ready** device (repeated). Its value is a sorted,
-comma-separated `k=v` list:
+comma-separated `k=v` list. A value may hold commas (`product_type=iPhone17,3`) but
+never `=`, so a comma starts a new field only where a `k=` follows it. Every field
+appears once, keys and values are not empty, and `id` is required; a field kbf does
+not match on (`battery=80`) is kept and never decides a match. On `main`,
+`kbf_caps::NodeCaps::from_report` reads the entries (`NodeCaps::devices`, by id), and
+refuses a malformed one (`ReportError::BadDevice`) and a second entry for one id
+(`ReportError::RepeatedDevice`):
 
 | Field | Example | Meaning |
 |---|---|---|
@@ -123,7 +131,7 @@ comma-separated `k=v` list:
 
 A device that is not ready is not in the report, so no work routes to it; it is in
 `NodeStatus` ([section 7](#7-health-report-alert-recover)). The `Hello` wire is
-unchanged: a server that does not know `ios.device` skips the entry, as it skips every
+unchanged: a server that predates `ios.device` skips the entry, as it skips every
 report entry it does not know ([capabilities.md](capabilities.md#matching)).
 
 ### 5.3 Request keys
@@ -136,27 +144,43 @@ report entry it does not know ([capabilities.md](capabilities.md#matching)).
 | `ios.device.os_version` | an iOS version | exact |
 | `ios.device.os_build` | an iOS build | exact |
 
-A node matches only if **one free device satisfies every `ios.device.*` key**. An
-attribute key without `ios.device=1` is refused, so is an `ios.device.*` key kbf does
-not know, and so is `ios.device` together with `os=linux`, `kbf-lease=vm` (no USB in a
-guest) or `kbf-lease=whole_machine` (not in the first version). Names are read in any
-case, like every kbf key. When no node has such a device, the request waits and then
-fails as any unservable request does (`--unservable-wait-secs`), and the reason names
-the closest device and the key it fails.
+On `main` (`kbf_caps::Request`): a node matches only if **one device it reports
+satisfies every `ios.device.*` key**; two keys met by two different devices are not a
+match, and a node that reports no device matches no device request. Refused with
+`INVALID_ARGUMENT`: `ios.device` with a value other than `1`, an attribute key without
+`ios.device=1` (`RequestError::DeviceAttributeAlone`), an `ios.device.*` key kbf does
+not know (`RequestError::UnknownDeviceAttribute`), `ios.device` together with an `os`
+other than `macos` (`RequestError::DeviceNotOnMacos`, so also `OSFamily=linux`), and,
+at the front, `ios.device` on a lease kind other than `action`: `kbf-lease=vm` is
+refused as an unknown kind (no USB in a guest), `kbf-lease=whole_machine` by name (not
+in the first version). Names are read in any case, like every kbf key. When no node
+has such a device, the request waits and then fails as any unservable request does
+(`--unservable-wait-secs`), and the reason names the closest node and what it lacks:
+`ios.device=1` for a node with no device, else each attribute the closest device
+lacks, with that device's id and its value (`ios.device.os_version=26.0 (device <id>
+has 18.6)`). The closest device is the one with fewest unmet attributes, the first by
+id among equals.
 
 ### 5.4 Booking
 
+On `main` (`crates/kbf-sched/src/devices.rs`), except the daemon's side:
+
 - The scheduler keeps, per worker, the ready device ids from its report and the ids
   booked by its leases.
-- Placement chooses a free device that satisfies the request and books it together
-  with the lease's CPU and memory.
-- The device is freed when the lease ends: its result is accepted, the lease is given
-  up, or it is fenced. A resent `Hello` that no longer lists a booked device keeps the
+- Placement chooses a free device that satisfies the request (the first by id) and
+  books it together with the lease's CPU and memory.
+- The device is freed when the lease ends: its result is accepted, or the lease is
+  given up (its worker silent, or a heartbeat leaving it out). A new registration of
+  the worker, or a resent `Hello` that no longer lists a booked device, keeps the
   booking until the lease ends.
 - Until probe P-D2 shows that leases cannot reach each other's devices, a node runs at
-  most one device lease at a time ([section 6.1](#61-what-the-sandbox-must-allow)).
-- `Start` gains `device_id` (field 8, the next free number), and the daemon's `Work`
-  gains `device: Option<String>`.
+  most one device lease at a time (`kbf_sched::DEVICE_LEASES_PER_WORKER`,
+  [section 6.1](#61-what-the-sandbox-must-allow)); leases that ask for no device run
+  beside it.
+- `Start` carries `device_id` (field 8): the booked device's id, empty for a lease
+  without one (`kbf_types::StartLease::device` in the scheduler). **Planned:** the
+  daemon's `Work` gains `device: Option<String>`; today's daemons ignore the field,
+  which is safe because none reports a device.
 - A device lease books one core and 1 GiB by default, like every action. Running
   `xcodebuild test-without-building` needs more **[A]**, so device tests are expected to
   name `kbf-book-cpus` and `kbf-book-mem-gib`.
@@ -168,20 +192,18 @@ Two facts on `main` decide the order in which these pieces may ship:
 - **An unknown platform property is ignored**
   ([capabilities.md](capabilities.md#unknown-keys)), so `ios.device=1` sent to a server
   that does not know it matches every node, Linux included. The server must know
-  `ios.device` (and refuse it until booking exists) before any client sends it. That
-  step is on `main`: `kbf_caps::Request::from_platform` refuses `ios.device` and every
-  `ios.device.<attribute>` key, in any case (`RequestError::IosDevice`), and Execute
-  answers `INVALID_ARGUMENT` naming the key and this section. A name that only begins
-  like one (`ios.devices`, `ios.simulator`) is an unknown property, ignored.
+  `ios.device` before any client sends it. The server first refused every device key;
+  it now matches and books them (sections 5.3 and 5.4). A name that only begins like
+  one (`ios.devices`, `ios.simulator`) is an unknown property, ignored.
 - **An old daemon would drop `device_id` silently.** `Start` is proto3; a daemon that
   predates field 8 decodes the message without it and would run the action without
   knowing its device. The guard is the report: only a daemon that reports
   `ios.device` entries can match a device request, and an old daemon never reports
   one. The test for this is "a node whose report has no `ios.device` entry is never
-  placed a device lease".
+  placed a device lease" (`crates/kbf-sched/tests/devices.rs`).
 
-So: the refusal first (done), then matching and booking together (or matching with
-the refusal kept until booking is in), then the server, then daemons.
+So: the refusal first (done), then matching and booking together with the refusal
+lifted (done), then daemons.
 
 ### 5.6 Caching
 
@@ -462,7 +484,8 @@ None of these has run. Each is a later PR's evidence; the PR that needs it says 
 
 ## 12. Phased plan
 
-All planned but the sandbox rule and the driver watch; each is its own pull request.
+All planned but the sandbox rule, the driver watch and the server's side of D3; each is
+its own pull request.
 
 | Phase | What | Needs |
 |---|---|---|
@@ -472,7 +495,7 @@ All planned but the sandbox rule and the driver watch; each is its own pull requ
 | D2 | Survey parser in `kbf-driver-native`: `devicectl` JSON to device states, tested against the D1 fixtures | D1 |
 | D2 | One driver watch for Xcodes and devices, a part per source: done, the Xcodes' part only ([section 7.5](#75-recover)) | PR #173 |
 | D2 | `NodeStatus.devices`, attention lines, the state file, `forget` and `release`, `Hello` resent on change | the watch |
-| D3 | `kbf-caps` device matching (one device satisfies every key) with scheduler booking and `Start.device_id`, landed together, then the front's refusals and messages | none |
+| D3 | `kbf-caps` device matching (one device satisfies every key) with scheduler booking and `Start.device_id`, landed together with the front's refusals and messages (**done**) | none |
 | D3 | Device lease runtime: precheck, baseline, run, cleanup, quarantine, audit | D2, D3, P-D3, P-D4 |
 | D4 | Supervision through MDM, an erase policy, iOS update control in [fleet-updates.md](fleet-updates.md), a signing lane with a secret store, alert delivery (issue #189) | open decisions below; P-D7 |
 

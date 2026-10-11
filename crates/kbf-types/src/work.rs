@@ -270,6 +270,9 @@ pub struct StartLease {
     pub resources: Resources,
     /// What the worker does if it loses touch.
     pub fence: FencePolicy,
+    /// The iOS device booked for the lease, by id (the UDID), if the action asked for
+    /// one (`ios.device=1`).
+    pub device: Option<String>,
 }
 
 /// Answers every waiter of a finished operation with its committed result.

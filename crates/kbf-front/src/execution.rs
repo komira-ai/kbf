@@ -48,8 +48,10 @@
 //!
 //! The rest of the platform says which workers may run the action
 //! (`kbf_caps::Request::from_platform`: `OSFamily`, `ISA`, `Arch` and kbf's capability
-//! keys). A malformed one is INVALID_ARGUMENT, and so is one naming `ios.device` or an
-//! `ios.device.<attribute>` key until devices are booked. One no kbf daemon can ever
+//! keys). A malformed one is INVALID_ARGUMENT: among others, an `ios.device` other than
+//! `1`, an `ios.device.<attribute>` without `ios.device=1` or that kbf does not know,
+//! and `ios.device` with an OS other than macOS or on a `whole_machine` lease. One no
+//! kbf daemon can ever
 //! run (an OS other than Linux or macOS, an architecture other than x86-64 or arm64) is
 //! FAILED_PRECONDITION at once, with no `PreconditionFailure` detail: there is nothing
 //! for the client to upload, and Bazel and Buck2 do not retry it.
@@ -370,6 +372,7 @@ where
         let gpus = gpus(&platform)?;
         let booked = booking(&platform, kind)?;
         let needs = needs(&platform)?;
+        device_kind(kind, &needs)?;
         Ok(Submission {
             request: Request {
                 key: ActionKey { instance, action },
@@ -534,6 +537,21 @@ fn needs(platform: &Platform) -> Result<kbf_caps::Request, Status> {
         }
         FromPlatformError::NeverServed(why) => Status::failed_precondition(why),
     })
+}
+
+/// INVALID_ARGUMENT for an iOS device (`ios.device=1`) on a lease kind other than
+/// `action`: a device lease runs beside other work on its Mac
+/// (`docs/design/ios-devices.md`, section 5.3), never as the whole machine.
+fn device_kind(kind: LeaseKind, needs: &kbf_caps::Request) -> Result<(), Status> {
+    if needs.wants_device() && kind != LeaseKind::Action {
+        return Err(Status::invalid_argument(format!(
+            "platform property ios.device books a device for an {:?} lease only, not a \
+             {:?} one",
+            LeaseKind::Action.name(),
+            kind.name()
+        )));
+    }
+    Ok(())
 }
 
 /// The lease kind a platform names, or INVALID_ARGUMENT for one not in

@@ -798,10 +798,13 @@ impl State {
         let message = self
             .first_waiter(operation)
             .map(|(_, waiter)| build(waiter));
-        let _ = self.links.get(worker).zip(message).map(|(link, message)| {
-            link.outbound.send(Ok(ServerMessage {
-                message: Some(message),
-            }))
+        // Whether it was sent: a stream that has just ended drops it.
+        let _sent = self.links.get(worker).zip(message).map(|(link, message)| {
+            link.outbound
+                .send(Ok(ServerMessage {
+                    message: Some(message),
+                }))
+                .is_ok()
         });
     }
 
@@ -836,6 +839,7 @@ impl State {
                 memory_bytes: start.resources.memory_bytes,
                 heartbeat_seq,
                 valid_for_ms: START_VALIDITY_MS,
+                device_id: start.device.clone().unwrap_or_default(),
             })
         });
         let waiters = self.sched.waiters(start.operation).unwrap_or_default();
