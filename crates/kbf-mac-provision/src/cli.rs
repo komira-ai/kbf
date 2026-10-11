@@ -1,6 +1,7 @@
 //! The command line: `check`, `apply`, `print`, `restart` and `revert`, and their exit
-//! statuses (0 every item passes or the verb did what it says, 1 an item fails, 2 bad
-//! usage, a refused profile, or a verb that refused or could not finish).
+//! statuses (0 every item passes or the verb did what it says, 1 an item fails or a
+//! setting `revert` did not put back, 2 bad usage, a refused profile, or a verb that
+//! refused or could not finish).
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -66,7 +67,7 @@ pub enum Verb {
         root: String,
     },
     /// As root: puts back the power and software update settings `apply` recorded
-    /// before it first changed one.
+    /// before it first changed one; exit 1, keeping the record, if one is not put back.
     Revert {
         /// The Mac's `/` (an absolute path); only tests set it.
         #[arg(long, default_value = "/", value_parser = absolute)]
@@ -167,12 +168,12 @@ pub fn restart(profile: &Path, host: &dyn Host) -> Result<String, Error> {
     ))
 }
 
-/// `revert`: what it prints.
+/// `revert`: what it prints, and how many settings it did not put back.
 ///
 /// # Errors
 /// This is not root, or the record is missing or refused (nothing is changed), or it
 /// could not be moved aside.
-pub fn revert(host: &dyn Host) -> Result<String, Error> {
+pub fn revert(host: &dyn Host) -> Result<items::Report, Error> {
     need_root(host, "revert")?;
     Ok(record::revert(host)?)
 }
@@ -188,7 +189,7 @@ pub fn execute(verb: &Verb, host: &dyn Host) -> Result<(String, u8), Error> {
         Verb::Apply { profile, keys, .. } => apply(profile, keys.as_deref(), host).map(status),
         Verb::Print { profile } => print(profile).map(|text| (text, 0)),
         Verb::Restart { profile, .. } => restart(profile, host).map(|text| (text, 0)),
-        Verb::Revert { .. } => revert(host).map(|text| (text, 0)),
+        Verb::Revert { .. } => revert(host).map(status),
     }
 }
 

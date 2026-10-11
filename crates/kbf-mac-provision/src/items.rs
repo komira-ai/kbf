@@ -77,6 +77,11 @@ impl Lines {
         self.0.push_str(&format!("NOTE {key}: {why}\n"));
     }
 
+    /// `FAIL <key>: <why>`: a change the verb made that did not take.
+    pub(crate) fn fail(&mut self, key: &str, why: impl Display) {
+        self.0.push_str(&format!("FAIL {key}: {why}\n"));
+    }
+
     pub(crate) fn into_text(self) -> String {
         self.0
     }

@@ -64,7 +64,7 @@ fn revert_puts_back_what_the_first_apply_found() {
     assert_eq!(apply(&mac).failed, 0);
     assert_eq!(fs::read_to_string(mac.path(RECORD)).unwrap(), FRESH_RECORD);
     assert_eq!(pmset_value(&mac, "sleep").as_deref(), Some("0"));
-    let out = cli::revert(&mac).unwrap();
+    let out = cli::revert(&mac).unwrap().text;
     let names = reverted(&mac);
     assert_eq!(names.len(), 1, "{names:?}");
     assert_eq!(
@@ -260,7 +260,7 @@ pref\t/Library/Preferences/com.apple.commerce\tAutoUpdate\t1
     mac.write(RECORD, record);
     mac.chmod(RECORD, 0o600);
     mac.own(RECORD, 0, 0);
-    let out = cli::revert(&mac).unwrap();
+    let out = cli::revert(&mac).unwrap().text;
     let mut lines = out.lines();
     assert_eq!(
         lines.next(),
