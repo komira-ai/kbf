@@ -106,6 +106,24 @@ fn the_binary_runs_as_a_keeper_before_it_parses_its_flags() {
     );
 }
 
+/// Catches keeper arguments that name no mode taken for the daemon's flags (clap's
+/// usage error, about the missing `--driver`) or run as a keeper: the binary exits 2
+/// with the keeper's usage line.
+#[test]
+fn the_binary_refuses_keeper_arguments_that_name_no_mode() {
+    let out = Command::new(BIN)
+        .args(["__keeper", "groups"])
+        .output()
+        .expect("spawn");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(
+        stderr.starts_with("kbf-keeper: usage: __keeper group"),
+        "{stderr}"
+    );
+    assert!(out.stdout.is_empty(), "it answered as a keeper");
+}
+
 /// Starts the binary as a keeper in `mode`, as the drivers do, checks that it answers
 /// as one, closes its pipe and waits for it to exit 0. Returns how long it ran after
 /// its pipe closed.

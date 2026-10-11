@@ -1,8 +1,11 @@
 //! The keeper mode ([`kbf_daemon::keeper`]) after an update renamed a new binary over
-//! the running one, through `kbf-keeper-swap` (`tests/bin/keeper_swap.rs`).
+//! the running one, through `kbf-keeper-swap` (`tests/bin/keeper_swap.rs`), and a program
+//! that is no keeper.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+use kbf_daemon::keeper::{self, Mode};
 
 /// An empty directory for this test, on the file system that holds the test's
 /// binaries (a hard link must reach them).
@@ -64,4 +67,27 @@ fn a_keeper_starts_after_the_binary_is_renamed_over() {
         "1\n",
         "the keeper did not kill the cgroup"
     );
+}
+
+/// Catches a spawn taken for a keeper's although the program is no keeper: one that
+/// ends at once, and one that prints something else (this test binary, which has no
+/// hook: the test harness takes `__keeper group --exact` as a filter that names no
+/// test, and prints its summary), and a command with no stdout pipe to read from.
+#[test]
+fn a_program_that_is_no_keeper_is_refused() {
+    let this = std::env::current_exe().expect("the test binary");
+    for program in [Path::new("/usr/bin/true"), &this] {
+        let mut command = keeper::command(program, &Mode::Group);
+        let mut child = command.arg("--exact").spawn().expect("spawn");
+        let error = keeper::started(&mut child).expect_err("not a keeper");
+        assert!(
+            error.to_string().contains("did not answer as a keeper"),
+            "{error}"
+        );
+        drop(child.stdin.take());
+        child.wait().expect("reap");
+    }
+    let mut child = Command::new("/usr/bin/true").spawn().expect("spawn");
+    assert!(keeper::started(&mut child).is_err());
+    child.wait().expect("reap");
 }

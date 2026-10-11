@@ -145,7 +145,7 @@ pub fn started(keeper: &mut Child) -> io::Result<()> {
 /// starts keepers calls this first in `main`.
 #[must_use]
 pub fn dispatch() -> Option<ExitCode> {
-    code(std::env::args_os()).map(ExitCode::from)
+    code(&std::env::args_os().collect::<Vec<_>>()).map(ExitCode::from)
 }
 
 /// [`dispatch`] for a test binary, which has no `main` of its own: exits with the
@@ -153,7 +153,7 @@ pub fn dispatch() -> Option<ExitCode> {
 /// [`keeper_test_hook!`](crate::keeper_test_hook) before the test harness starts.
 #[doc(hidden)]
 pub fn hook() {
-    if let Some(code) = code(std::env::args_os()) {
+    if let Some(code) = code(&std::env::args_os().collect::<Vec<_>>()) {
         std::process::exit(i32::from(code));
     }
 }
@@ -181,12 +181,11 @@ macro_rules! keeper_test_hook {
 }
 
 /// The keeper's exit status when `args` (argv0 first) ask for it; `None` otherwise.
-fn code(mut args: impl Iterator<Item = OsString>) -> Option<u8> {
-    if args.nth(1)? != ARG {
+fn code(args: &[OsString]) -> Option<u8> {
+    if args.get(1)? != ARG {
         return None;
     }
-    let rest: Vec<OsString> = args.collect();
-    Some(match Mode::parse(&rest) {
+    Some(match Mode::parse(&args[2..]) {
         Ok(mode) => run(&mode),
         Err(why) => {
             eprintln!("{NAME}: {why}");
@@ -267,15 +266,9 @@ mod tests {
     /// that name no mode (status 2, and nothing run).
     #[test]
     fn only_the_keeper_arguments_select_the_keeper() {
-        assert_eq!(code(args(&["kbf-daemon"]).into_iter()), None);
-        assert_eq!(
-            code(args(&["kbf-daemon", "--driver", "native"]).into_iter()),
-            None
-        );
-        assert_eq!(
-            code(args(&["kbf-daemon", "--", "__keeper"]).into_iter()),
-            None
-        );
+        assert_eq!(code(&args(&["kbf-daemon"])), None);
+        assert_eq!(code(&args(&["kbf-daemon", "--driver", "native"])), None);
+        assert_eq!(code(&args(&["kbf-daemon", "--", "__keeper"])), None);
         for bad in [
             &["__keeper"][..],
             &["__keeper", "groups"],
@@ -286,31 +279,7 @@ mod tests {
             &["__keeper", "cgroup", "/k", "30", "x"],
         ] {
             let argv = [&["kbf-keeper"][..], bad].concat();
-            assert_eq!(code(args(&argv).into_iter()), Some(2), "{bad:?}");
+            assert_eq!(code(&args(&argv)), Some(2), "{bad:?}");
         }
-    }
-
-    /// Catches a spawn taken for a keeper's although the program is no keeper: one that
-    /// ends at once, and one that prints something else (this test binary, which has
-    /// no hook: the test harness takes `__keeper group --exact` as a filter that names
-    /// no test, and prints its summary).
-    #[test]
-    fn a_program_that_is_no_keeper_is_refused() {
-        let this = std::env::current_exe().expect("the test binary");
-        for program in [Path::new("/usr/bin/true"), &this] {
-            let mut command = command(program, &Mode::Group);
-            let mut child = command.arg("--exact").spawn().expect("spawn");
-            let error = started(&mut child).expect_err("not a keeper");
-            assert!(
-                error.to_string().contains("did not answer as a keeper"),
-                "{error}"
-            );
-            drop(child.stdin.take());
-            child.wait().expect("reap");
-        }
-        // A command without a stdout pipe has nothing to read the line from.
-        let mut child = Command::new("/usr/bin/true").spawn().expect("spawn");
-        assert!(started(&mut child).is_err());
-        child.wait().expect("reap");
     }
 }
