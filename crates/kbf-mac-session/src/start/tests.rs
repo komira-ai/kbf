@@ -77,6 +77,11 @@ fn the_flags_default_to_the_design() {
     assert_eq!(args.lease_gid, STAFF_GID);
     assert_eq!(args.homes, PathBuf::from("/Users"));
     assert_eq!(args.grant_keys, None);
+    assert_eq!(args.kcpassword, PathBuf::from("/etc/kcpassword"));
+    assert_eq!(
+        args.loginwindow,
+        "/Library/Preferences/com.apple.loginwindow"
+    );
     assert!(Args::try_parse_from(["kbf-mac-session"]).is_err());
     assert!(
         Args::try_parse_from([

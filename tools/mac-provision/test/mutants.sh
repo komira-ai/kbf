@@ -72,6 +72,10 @@ mutant 'any kbf-lease-* user passes, whatever its uid' t_drift:autologin \
   's/if in_lease_range "\$cu_uid"; then/if true; then/'
 mutant 'any auto-login user in range passes, whatever its name' t_drift:autologin \
   's/^    kbf-lease-\*)$/    *)/'
+mutant 'any kbf-lease-* user in range passes, with or without an intent record' t_drift:autologin \
+  's/if \[ "\$cu_user" = "\$(intent_user)" \]; then/if true; then/'
+mutant 'an intent record is read through a link' t_drift:autologin \
+  's/if \[ -L "\$SESSION_INTENT" \]; then/if false; then/'
 mutant 'a stale /etc/kcpassword is ignored' t_drift:autologin \
   's/bad "off, but \/etc\/kcpassword is left over"/ok off/'
 mutant 'the job runs as a Standard (throttled) process' t_converge \
