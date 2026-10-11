@@ -164,7 +164,7 @@ impl UserFolders {
     #[must_use]
     pub fn rules(&self) -> String {
         let temp = regex_quote(&self.temp.to_string_lossy());
-        let swbuild = regex_quote(SWBUILD_TMP);
+        let swbuild = SWBUILD_TMP;
         format!(
             "(allow file-write*\n  (regex #\"^{temp}/{TEMPORARY_ITEMS}/\")\n  (regex #\"^{temp}/{XCRUN_DB}(-[^/]*)?$\")\n  (regex #\"^{temp}/{swbuild}[^/]+\"))\n",
         )
@@ -388,6 +388,7 @@ mod tests {
     /// escaped (`swbuildXtmpX..`), one that takes an empty suffix (`swbuild.tmp.`
     /// itself), or the folder whole.
     #[test]
+    #[ignore = "mutant: reach the macOS integration tests"]
     fn the_rules_name_only_the_few_names_the_tools_write() {
         let folders = UserFolders::new(
             PathBuf::from("/private/var/folders/ab/c+d.e/T"),
