@@ -145,6 +145,106 @@ async fn a_commit_answered_survives_a_crash_and_is_applied_once() {
     assert!(crashed_mid_commit >= 2, "a commit wrote and synced");
 }
 
+/// What a start over a crashed first open found.
+#[derive(Debug, PartialEq, Eq)]
+enum Found {
+    /// The recorded log, as the crashed open drew it.
+    Recorded,
+    /// No log: the start bootstrapped a new one.
+    Fresh,
+}
+
+/// The record bytes [`a_new_log_records_its_id_and_commits_one_bootstrap`] pins, for `n`.
+fn record_of(n: u64) -> String {
+    format!("kbf raft log record 1\nlog_id {n:016x}\nserver 1\nvoters 1\n")
+}
+
+/// Starts over `dir`, which a first open of log 1 left; a new log would be log 2.
+/// Anything but the recorded log or a fresh one, with its record written whole, panics.
+async fn start_after(dir: &FaultFs, at: u64, cut: &str) -> Found {
+    let log = match open_as(dir, "kbf/", 2).await {
+        Ok(log) => log,
+        Err(e) => panic!("crash at op {at}, {cut}: the next start is refused: {e}"),
+    };
+    let n = log.log_id().get();
+    let found = match n {
+        1 => Found::Recorded,
+        2 => Found::Fresh,
+        other => panic!("crash at op {at}, {cut}: log id {other:x}"),
+    };
+    assert_eq!(log.bootstraps(), 1, "crash at op {at}, {cut}");
+    assert_eq!(
+        log.store_prefix().as_str(),
+        format!("kbf/{n:016x}/"),
+        "crash at op {at}, {cut}"
+    );
+    assert_eq!(
+        dir.contents(RECORD).map(String::from_utf8),
+        Some(Ok(record_of(n))),
+        "crash at op {at}, {cut}: the record is not whole"
+    );
+    found
+}
+
+/// Catches: a log record written where it is read (created as `log-record` and then
+/// filled, in one append or several), not to a temporary file renamed over it, or
+/// renamed before its bytes are synced: a crash during the first start can leave an
+/// empty or torn record, which every later start refuses, so the directory never opens
+/// again. And a record whose name is not durable before the store's first file is: a
+/// cut that keeps the store's files but not the record leaves a directory "holding
+/// files but no log-record" (at this version `Store::open` syncs the directory before
+/// it creates a file, so the record's own directory sync is not what keeps this).
+/// The first open is crashed at every filesystem operation; each crash is then a
+/// process kill and every power cut (each torn tail of each unsynced file, with each
+/// subset of the name changes since the last directory sync). Every start after it
+/// must find exactly the recorded log or no log at all (and then bootstrap log 2),
+/// with its record whole and one `Bootstrap` naming it.
+#[tokio::test]
+async fn a_crash_during_the_first_open_leaves_the_recorded_log_or_none() {
+    let mut crashed = 0;
+    let mut recorded_mid_open = 0;
+    for at in 0.. {
+        let fs = FaultFs::new();
+        fs.fail_at(at, Fault::Crash);
+        let first = open_as(&fs, "kbf/", 1).await;
+        let reached = fs.ops() > at;
+        assert_eq!(first.is_ok(), !reached, "crash at op {at}: {first:?}");
+        drop(first);
+
+        start_after(&fs.restart(), at, "process kill").await;
+        let pending = fs.pending_names();
+        assert!(pending < 16, "crash at op {at}: {pending} name changes");
+        for keep in 0..=fs.unsynced() {
+            for names in 0..(1u64 << pending) {
+                let cut = format!("keep {keep}, names {names:b}");
+                let found = start_after(&fs.crash_reordered(keep, names), at, &cut).await;
+                if reached && keep == 0 && names == 0 && found == Found::Recorded {
+                    recorded_mid_open += 1;
+                }
+            }
+        }
+        if !reached {
+            let after = start_after(&fs.crash(0), at, "a power cut after the open").await;
+            assert_eq!(
+                after,
+                Found::Recorded,
+                "an open that finished lost its record"
+            );
+            break; // the open finished before the planned crash
+        }
+        crashed += 1;
+    }
+    // The loop crossed the record's write: some crashes come before it and some after.
+    assert!(
+        crashed > recorded_mid_open,
+        "no crash before the record is durable"
+    );
+    assert!(
+        recorded_mid_open > 0,
+        "no crash after the record is durable"
+    );
+}
+
 /// Catches: farm time taken from the process clock (it starts again from zero at each
 /// open, so it goes back across a restart), a tick that commits nothing, and a log
 /// with no tick task (farm time never committed unless a caller ticks).
