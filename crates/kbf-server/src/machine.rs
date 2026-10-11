@@ -385,7 +385,8 @@ mod tests {
     }
 
     /// Catches a lookup by name that finds a caller under a name the machine never
-    /// wrote, or misses one it did: `named` is the inverse of `name` for kept callers.
+    /// wrote (another id, or the same id in another term), or misses one it did:
+    /// `named` is the inverse of `name` for kept callers.
     #[test]
     fn a_kept_caller_is_found_by_its_name_only() {
         let mut m = FarmMachine::new(TERM);
@@ -394,7 +395,11 @@ mod tests {
         assert_eq!(name, format!("operations/{TERM}-0"));
         assert_eq!(m.named(&name), Some((id, &waiter(1))));
         assert_eq!(m.named(&format!("operations/{TERM}-1")), None);
-        assert_eq!(FarmMachine::new(TERM + 1).named(&name), None);
+        // Another term's machine keeps a caller with the same id, so a lookup that
+        // ignores the term would find it.
+        let mut other = FarmMachine::new(TERM + 1);
+        assert_eq!(other.submit(waiter(2)), id);
+        assert_eq!(other.named(&name), None);
     }
 
     /// Catches a name parser that is not the exact inverse of [`operation_name`]: one
