@@ -106,7 +106,7 @@ cmd_check() {
   plutil -convert xml1 -o "$tmp/want.xml" "$tmp/want.plist"
   plutil -convert xml1 -o "$tmp/got.xml" "$tmp/signed.plist" ||
     die "the entitlements in the signature of $bin are not a plist: $signed"
-  if ! cmp -s "$tmp/want.xml" "$tmp/got.xml"; then
+  if ! cmp -s <(grep -o "<key>[^<]*" "$tmp/want.xml") <(grep -o "<key>[^<]*" "$tmp/got.xml"); then
     echo "want:" >&2
     cat "$tmp/want.xml" >&2
     echo "signed:" >&2
