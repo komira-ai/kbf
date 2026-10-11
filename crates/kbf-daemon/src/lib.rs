@@ -22,6 +22,8 @@
 //! - [`clock`]: the suspend-counting [`Clock`] the fence reads (issue #78).
 //! - [`tree`]: writing an input root from the CAS and reading outputs back.
 //! - [`usage`]: what an action used, measured by the kernel, and where it is carried.
+//! - [`keeper`]: the keeper mode of the `kbf-daemon` binary, the process each run gets
+//!   that ends the run when the daemon dies; the drivers start it.
 //! - [`LocalRuntime`]: **tests only**, runs actions as plain child processes.
 //! - [`Daemon`]: the session loop, with the contact clock and lease manager inside.
 //!
@@ -37,6 +39,7 @@ pub mod connect;
 mod contact;
 mod daemon;
 pub mod driver_watch;
+pub mod keeper;
 mod lease;
 #[cfg(target_os = "linux")]
 mod local;

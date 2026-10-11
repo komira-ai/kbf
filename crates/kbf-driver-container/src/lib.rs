@@ -72,6 +72,10 @@ mod runtime;
 pub mod subids;
 pub mod tree;
 
+// The keepers this crate's unit tests start come from the test binary.
+#[cfg(test)]
+kbf_daemon::keeper_test_hook!();
+
 pub use cas::{CHUNK, FileBlob, MemoryCas};
 pub use cgroup::{SwapKill, cpu_weight, memory_max};
 pub use delegate::{DelegateError, Delegation, adopt, capacity, delegate};

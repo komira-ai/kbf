@@ -75,6 +75,34 @@ fn refuses_to_run_without_its_flags() {
     }
 }
 
+/// Catches a daemon binary that does not run as a keeper when the drivers start it as
+/// one: one that parses its flags first (clap would refuse `__keeper` and the missing
+/// `--driver`), and one whose keeper does not write `cgroup.kill` once its pipe closes
+/// and then stop after its last try.
+#[test]
+fn the_binary_runs_as_a_keeper_before_it_parses_its_flags() {
+    use kbf_daemon::keeper::{self, Mode};
+    use std::os::unix::process::CommandExt as _;
+
+    let dir = tls("keeper");
+    let kill = dir.join("cgroup.kill");
+    std::fs::write(&kill, "").expect("cgroup.kill");
+    let mode = Mode::Cgroup {
+        kill: kill.clone(),
+        tries: 1,
+    };
+    let mut child = keeper::command(Path::new(BIN), &mode)
+        .process_group(0)
+        .spawn()
+        .expect("spawn");
+    let started = keeper::started(&mut child);
+    drop(child.stdin.take());
+    let status = child.wait().expect("wait");
+    started.expect("the binary answered as a keeper");
+    assert!(status.success(), "{status}");
+    assert_eq!(read(&kill), "1\n", "no cgroup.kill once its pipe closed");
+}
+
 /// A scratch directory for one test, with a CA and a client certificate in it.
 fn tls(name: &str) -> PathBuf {
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
