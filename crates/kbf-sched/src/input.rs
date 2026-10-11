@@ -125,6 +125,9 @@ pub enum Event {
         worker: WorkerId,
         /// The daemon process that registered it.
         instance: DaemonInstance,
+        /// The caller found the daemon process this one replaces stopped, with every
+        /// run of it killed (see the variant's documentation).
+        predecessor_stopped: bool,
         /// What placement may book on it.
         capacity: Resources,
         /// What it offers, from its node report: placement gives it only work whose

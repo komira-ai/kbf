@@ -10,7 +10,7 @@
 
 use std::fmt;
 
-use kbf_types::{LeaseId, OperationId, WorkerId};
+use kbf_types::{LeaseId, LostWhy, OperationId, WorkerId};
 
 /// A lease given up, its operation sent back to the queue to be granted again.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -53,6 +53,12 @@ pub enum RequeueReason {
     /// The node killed the lease for memory while the action was under its own limit;
     /// it runs again with the same booking.
     NodeMemoryPressure,
+    /// Another daemon process registered as its worker, naming the process its `Start`
+    /// went to as its predecessor, which the restarted daemon's drivers killed every
+    /// run of before it registered; the worker does not list the lease as running.
+    Restarted,
+    /// The worker reported that the farm lost the run (`why`); it runs again.
+    Lost(LostWhy),
 }
 
 impl fmt::Display for RequeueReason {
@@ -82,6 +88,10 @@ impl fmt::Display for RequeueReason {
                 "the node killed it for memory below the action's own limit (node memory \
                  pressure); it runs again with the same booking"
             }
+            Self::Restarted => {
+                "the daemon restarted, and its successor killed the run before registering"
+            }
+            Self::Lost(why) => return write!(f, "the farm lost the run ({why}); it runs again"),
         })
     }
 }

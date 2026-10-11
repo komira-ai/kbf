@@ -192,9 +192,12 @@ pub(crate) fn result_of(
             // The daemon fills in the action its Start named.
             action_digest: None,
             memory_kill: worker::MemoryKill::Unspecified as i32,
+            lost: worker::Lost::Unspecified as i32,
         },
         Err(RuntimeError::Killed) => failure(id, Code::Aborted, "killed"),
-        Err(RuntimeError::Failed(why)) => failure(id, Code::Internal, why),
+        Err(RuntimeError::Failed(why) | RuntimeError::Lost(_, why)) => {
+            failure(id, Code::Internal, why)
+        }
         Err(RuntimeError::Invalid(why)) => failure(id, Code::InvalidArgument, why),
         Err(RuntimeError::MissingBlob(blob)) => missing(id, &blob),
         Err(RuntimeError::TimedOut { stdout, stderr }) => worker::Result {
@@ -244,8 +247,9 @@ fn missing(id: LeaseId, blob: &str) -> worker::Result {
         }),
         action_result: None,
         action_digest: None,
-        // A missing input is not a memory kill.
+        // A missing input is not a memory kill, nor lost.
         memory_kill: worker::MemoryKill::Unspecified as i32,
+        lost: worker::Lost::Unspecified as i32,
     }
 }
 
@@ -260,8 +264,10 @@ pub(crate) fn failure(id: LeaseId, code: Code, message: impl Into<String>) -> wo
         }),
         action_result: None,
         action_digest: None,
-        // Not a memory kill; `result_of` sets the kind over this for the two that are.
+        // Not a memory kill, nor lost; `result_of` sets the kind over this for those
+        // that are.
         memory_kill: worker::MemoryKill::Unspecified as i32,
+        lost: worker::Lost::Unspecified as i32,
     }
 }
 

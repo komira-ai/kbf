@@ -393,6 +393,7 @@ mod tests {
                 sim.feed(Event::WorkerUp {
                     worker: WorkerId::new(name),
                     instance: DaemonInstance::new(name),
+                    predecessor_stopped: false,
                     capacity: Resources::new(8_000, gib * GIB),
                     caps,
                 });

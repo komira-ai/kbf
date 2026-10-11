@@ -284,6 +284,7 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
         let event = Event::WorkerUp {
             worker: worker.clone(),
             instance,
+            predecessor_stopped: false,
             capacity: reported.capacity,
             caps: reported.caps,
         };

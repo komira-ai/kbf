@@ -12,9 +12,9 @@ use std::time::Duration;
 
 use kbf_caps::NodeCaps;
 use kbf_types::{
-    ActionKey, Answer, ControlRecord, Effect, Failure, FarmTime, LeaseGrant, LeaseId, LeaseKind,
-    NodePhase, OperationId, Outcome, Qos, Refusal, RefusalRecord, Resources, ResultRecord,
-    StartLease, StateMachine, WaiterId, Waiting, WorkerId,
+    ActionKey, Answer, ControlRecord, Effect, Failure, FarmRun, FarmTime, LeaseGrant, LeaseId,
+    LeaseKind, NodePhase, OperationId, Outcome, Qos, Refusal, RefusalRecord, Resources,
+    ResultRecord, StartLease, StateMachine, WaiterId, Waiting, WorkerId,
 };
 
 use crate::cordon::{Cordon, Cordons};
@@ -64,6 +64,9 @@ struct Operation {
     /// While queued: since when, and why, no live worker can run it. `None` while one
     /// can.
     unservable: Option<Unservable>,
+    /// Its runs that ended as the farm's fault, oldest first: the farm reruns it has
+    /// used ([`memory::FARM_RERUNS`]).
+    farm_runs: Vec<FarmRun>,
 }
 
 /// A queued operation no live worker can run: since when, why, and whether the wait
@@ -300,6 +303,13 @@ impl Scheduler {
         self.ops.get(&operation).map(|op| &op.state)
     }
 
+    /// The runs of `operation` that ended as the farm's fault, oldest first; `None` once
+    /// the scheduler no longer holds it.
+    #[must_use]
+    pub fn farm_runs(&self, operation: OperationId) -> Option<&[FarmRun]> {
+        self.ops.get(&operation).map(|op| op.farm_runs.as_slice())
+    }
+
     /// The waiters attached to `operation`, in attach order.
     #[must_use]
     pub fn waiters(&self, operation: OperationId) -> Option<&[WaiterId]> {
@@ -441,6 +451,7 @@ impl Scheduler {
                 committed_lease: None,
                 result_proposed: false,
                 unservable: None,
+                farm_runs: Vec::new(),
             },
         );
         Vec::new()
@@ -849,6 +860,7 @@ impl Scheduler {
             waiters: op.waiters.clone(),
             outcome: record.outcome,
             memory_runs: self.memory.runs(id).to_vec(),
+            farm_runs: op.farm_runs.clone(),
         })]
     }
 }
@@ -862,6 +874,7 @@ impl StateMachine for Scheduler {
             Event::WorkerUp {
                 worker,
                 instance,
+                predecessor_stopped: _,
                 capacity,
                 caps,
             } => {

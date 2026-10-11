@@ -16,7 +16,7 @@ use kbf_meta::ActionRecord;
 use kbf_proto::kbf::log::v1 as proto;
 use kbf_sched::{DaemonInstance, Request};
 use kbf_types::{
-    ActionKey, ControlRecord, Digest, Failure, FarmTime, LeaseGrant, LeaseId, LeaseKind,
+    ActionKey, ControlRecord, Digest, Failure, FarmTime, LeaseGrant, LeaseId, LeaseKind, LostWhy,
     OperationId, Outcome, Qos, RefusalRecord, Resources, ResultRecord, WorkerId,
 };
 use proto::farm_input::Input as P;
@@ -49,6 +49,8 @@ pub enum FarmInput {
         worker: WorkerId,
         /// The daemon process that registered it.
         instance: DaemonInstance,
+        /// The server found the daemon process before it stopped, its runs killed.
+        predecessor_stopped: bool,
         /// What placement may book on it.
         capacity: Resources,
         /// What it offers.
@@ -184,11 +186,13 @@ fn input(input: &FarmInput) -> Result<proto::FarmInput, EncodeError> {
         FarmInput::WorkerUp {
             worker,
             instance,
+            predecessor_stopped,
             capacity,
             caps,
         } => P::WorkerUp(proto::WorkerUp {
             worker: worker.as_str().to_owned(),
             instance: instance.as_str().to_owned(),
+            predecessor_stopped: *predecessor_stopped,
             capacity: Some(resources(capacity)),
             caps: Some(node_caps(caps)),
         }),
@@ -379,6 +383,8 @@ fn outcome(o: &Outcome) -> Result<proto::Outcome, EncodeError> {
                 Failure::OutOfMemory => proto::Failure::OutOfMemory,
                 Failure::NodeMemoryPressure => proto::Failure::NodeMemoryPressure,
                 Failure::MissingInput => proto::Failure::MissingInput,
+                Failure::Lost(LostWhy::DaemonRestarted) => proto::Failure::LostDaemonRestarted,
+                Failure::Lost(LostWhy::Fenced) => proto::Failure::LostFenced,
             }
             .into(),
         ),
@@ -440,6 +446,7 @@ fn from_input(input: proto::FarmInput) -> Result<FarmInput, DecodeError> {
             P::WorkerUp(w) => FarmInput::WorkerUp {
                 worker: WorkerId::new(w.worker),
                 instance: DaemonInstance::new(w.instance),
+                predecessor_stopped: w.predecessor_stopped,
                 capacity: from_resources(w.capacity, "WorkerUp.capacity")?,
                 caps: from_node_caps(w.caps, "WorkerUp.caps")?,
             },
@@ -643,6 +650,8 @@ fn from_outcome(o: Option<proto::Outcome>, field: &'static str) -> Result<Outcom
             Ok(proto::Failure::OutOfMemory) => Failure::OutOfMemory,
             Ok(proto::Failure::NodeMemoryPressure) => Failure::NodeMemoryPressure,
             Ok(proto::Failure::MissingInput) => Failure::MissingInput,
+            Ok(proto::Failure::LostDaemonRestarted) => Failure::Lost(LostWhy::DaemonRestarted),
+            Ok(proto::Failure::LostFenced) => Failure::Lost(LostWhy::Fenced),
             Ok(proto::Failure::Unspecified) | Err(_) => {
                 return Err(DecodeError::UnknownValue {
                     field: "Outcome.failed",

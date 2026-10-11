@@ -175,6 +175,61 @@ pub enum Failure {
     /// a client that re-uploads (Bazel) executes again. Not a farm fault: it is never
     /// rerun, never cached, and counts against no farm rerun budget.
     MissingInput,
+    /// The farm lost the run, and with it the result (`LostWhy` says how): not the
+    /// action's failure. The scheduler runs it again, preferring another node, while
+    /// its farm reruns last; an operation that finishes with it has used them up.
+    Lost(LostWhy),
+}
+
+/// How the farm lost a lease's run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum LostWhy {
+    /// The daemon restarted while the action ran: the restarted daemon killed what
+    /// was left of the run before it registered again, and its result is gone.
+    DaemonRestarted,
+    /// The node lost contact with the server and fenced (killed) the run: no
+    /// heartbeat was acknowledged within the self-fence time.
+    Fenced,
+}
+
+impl fmt::Display for LostWhy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::DaemonRestarted => "the daemon restarted while the action ran",
+            Self::Fenced => "the node lost contact with the server and fenced the run",
+        })
+    }
+}
+
+/// Why a run ended as the farm's fault, counted against the operation's farm reruns
+/// (`FARM_RERUNS` in `kbf-sched`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FarmFault {
+    /// The node killed it for memory below the action's own limit.
+    NodeMemoryPressure,
+    /// The farm lost it.
+    Lost(LostWhy),
+}
+
+impl fmt::Display for FarmFault {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NodeMemoryPressure => f.write_str(
+                "the node killed the action for memory while it was under its own limit \
+                 (node memory pressure)",
+            ),
+            Self::Lost(why) => why.fmt(f),
+        }
+    }
+}
+
+/// One run of an operation that ended as the farm's fault.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FarmRun {
+    /// The node it ran on.
+    pub worker: WorkerId,
+    /// How it ended.
+    pub fault: FarmFault,
 }
 
 /// How an attempt ended, as its worker reports it.
@@ -295,6 +350,9 @@ pub struct Answer {
     /// The operation's runs that were killed for memory, oldest first: what callers of
     /// an operation finished by a memory kill are told about.
     pub memory_runs: Vec<MemoryRun>,
+    /// The operation's runs that ended as the farm's fault, oldest first: what callers
+    /// of an operation whose farm reruns are used up are told about.
+    pub farm_runs: Vec<FarmRun>,
 }
 
 /// Why a queued operation is waiting, when no live worker can run it now. Its callers
@@ -322,6 +380,28 @@ pub struct Refusal {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Catches two farm faults that read the same to a caller (a restarted daemon
+    /// taken for a fence, or either for a busy node's kill), and a lost run that does
+    /// not read as its cause.
+    #[test]
+    fn each_farm_fault_reads_differently() {
+        let all = [
+            FarmFault::NodeMemoryPressure,
+            FarmFault::Lost(LostWhy::DaemonRestarted),
+            FarmFault::Lost(LostWhy::Fenced),
+        ];
+        let text: Vec<String> = all.iter().map(ToString::to_string).collect();
+        assert!(text[0].contains("node memory pressure"), "{}", text[0]);
+        assert_eq!(text[1], "the daemon restarted while the action ran");
+        assert_eq!(text[2], LostWhy::Fenced.to_string());
+        assert!(text[2].contains("fenced"), "{}", text[2]);
+        for (i, a) in text.iter().enumerate() {
+            for b in &text[i + 1..] {
+                assert_ne!(a, b);
+            }
+        }
+    }
 
     /// Catches: a fit test that checks one axis only, which would book memory a node
     /// does not have (or CPU it does not have).

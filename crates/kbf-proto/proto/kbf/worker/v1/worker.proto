@@ -106,6 +106,15 @@ message Hello {
   // What the node is doing besides running leases. The daemon resends Hello when it
   // changes. Unset is serving.
   NodePhase phase = 7;
+  // The instance_id of the daemon process that ran on this node before this one, read
+  // from the file it left in the lease scratch directory. Sent only once this
+  // process's drivers have swept that directory, killing every run the predecessor
+  // left, so it says the predecessor's runs are dead. The server then gives up at
+  // once, not after the handover grace, the leases whose Start went to that process,
+  // if it is the process the node's previous stream came from and that stream has
+  // closed (docs/design/worker-protocol.md). Empty: no predecessor known (the first
+  // start, or a daemon without a scratch directory).
+  string predecessor_instance_id = 8;
 }
 
 // The phases of a node (docs/design/fleet-updates.md, 3.3).
@@ -356,6 +365,26 @@ message Result {
   // action again (docs/design/failure-classes.md, 6.1). Unspecified: not killed for
   // memory, or not known, and the status code alone decides.
   MemoryKill memory_kill = 5;
+  // How the farm lost the run, when it did: the daemon restarted while the action ran,
+  // or the node fenced it. Read only on a Result whose status is not OK, and then in
+  // place of the status code: the server runs the action again, preferring another
+  // node, while the operation's farm reruns last (docs/design/failure-classes.md,
+  // 6.5). The daemon sends it with UNAVAILABLE, which a server that predates this
+  // field takes as the farm's failure. Unspecified: not lost.
+  Lost lost = 6;
+}
+
+// How the farm lost a lease's run.
+enum Lost {
+  // Not lost, or not known.
+  LOST_UNSPECIFIED = 0;
+  // The daemon restarted while the action ran: the restarted daemon killed what was
+  // left of it before its Hello, and its result is gone (a whole-machine lease, whose
+  // record outlives the daemon).
+  LOST_DAEMON_RESTARTED = 1;
+  // The node lost contact with the server and fenced (killed) the run: no heartbeat
+  // was acknowledged within the self-fence time T.
+  LOST_FENCED = 2;
 }
 
 // Which memory ran out when a lease was killed for it.

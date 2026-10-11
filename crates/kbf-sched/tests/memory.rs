@@ -109,6 +109,7 @@ impl Farm {
         let event = Event::WorkerUp {
             worker: w(name),
             instance: DaemonInstance::new(name),
+            predecessor_stopped: false,
             capacity: Resources::new(8_000, memory_gib * GIB),
             caps,
         };
@@ -327,6 +328,7 @@ fn the_cap_is_the_largest_live_node_that_fits_cordoned_or_not() {
     f.feed(Event::WorkerUp {
         worker: w("odd"),
         instance: DaemonInstance::new("odd"),
+        predecessor_stopped: false,
         capacity: odd,
         caps: linux(),
     });
@@ -348,6 +350,7 @@ fn the_cap_counts_only_nodes_that_hold_the_whole_request() {
         let event = Event::WorkerUp {
             worker: w(name),
             instance: DaemonInstance::new(name),
+            predecessor_stopped: false,
             capacity,
             caps,
         };
