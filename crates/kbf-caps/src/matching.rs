@@ -348,6 +348,13 @@ impl Request {
         Ok(req)
     }
 
+    /// The value the request asks `key` to have exactly (`os`, `cpu.model`,
+    /// `label.<k>`, ...), if it names one.
+    #[must_use]
+    pub fn exact(&self, key: &str) -> Option<&str> {
+        self.exact.get(key).map(String::as_str)
+    }
+
     /// Every requirement the node does not meet, in a stable order. Empty means the
     /// node matches.
     #[must_use]

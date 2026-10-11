@@ -35,7 +35,7 @@ use kbf_proto::worker::{
     self, Cancel, LeaseOffer, NodeStatus, ResultAck, ServerMessage, Start, server_message,
 };
 use kbf_sched::fence::START_VALIDITY;
-use kbf_sched::{Cordon, DaemonInstance, Event, Input, OpState, Requeue, Scheduler};
+use kbf_sched::{Cordon, DaemonInstance, Event, Input, NodePhase, OpState, Requeue, Scheduler};
 use kbf_types::{
     Answer, ControlRecord, Digest, Effect, Failure, FarmTime, LeaseGrant, LeaseId, OperationId,
     Outcome, Refusal, Resources, StartLease, StateMachine, WaiterId, Waiting, WorkerId,
@@ -43,7 +43,10 @@ use kbf_types::{
 use tokio::sync::{mpsc, watch};
 use tonic::{Code, Status};
 
-use crate::fleet::{NodeView, NodesView, PlacementView, SoftwareView, attention_changes};
+use crate::fleet::{
+    NodeView, NodesView, PhaseView, PlacementView, SoftwareView, attention_changes,
+    quarantine_change,
+};
 use crate::machine::{FarmMachine, Sent, Waiter};
 use crate::memory;
 use crate::stamp::Stamp;
@@ -92,6 +95,30 @@ pub struct Farm<M, O> {
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 #[error("no node {0} has registered")]
 pub struct UnknownNode(pub String);
+
+/// What a `Hello` says about its node that the scheduler takes: the capacity placement
+/// may book, the capabilities placement matches, and the node's phase.
+#[derive(Clone, Debug)]
+pub struct Reported {
+    /// What placement may book.
+    pub capacity: Resources,
+    /// What it offers.
+    pub caps: NodeCaps,
+    /// What it is doing besides running leases.
+    pub phase: NodePhase,
+}
+
+impl Reported {
+    /// A serving node with `capacity` and `caps`.
+    #[must_use]
+    pub const fn serving(capacity: Resources, caps: NodeCaps) -> Self {
+        Self {
+            capacity,
+            caps,
+            phase: NodePhase::Serving,
+        }
+    }
+}
 
 /// What an operator does to a node's placement.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -211,16 +238,17 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
 
     /// The first `Hello` of a stream, from the daemon process `instance`: queues
     /// `welcome` on `outbound`, makes this the worker's stream for every `Start` from now
-    /// on, and registers the worker (a new session) with its `capacity` and `caps`.
-    /// Messages still arriving on its earlier stream are ignored from now on. A stream
-    /// of another process than the earlier stream's is logged: leases that process ran
-    /// are kept until it has fenced (issue #140).
+    /// on, and registers the worker (a new session) with what it `reported`. Its phase
+    /// is taken before any placement, and may send a `Start` again or a `Cancel` on this
+    /// stream ([`Self::resize`] says when). Messages still arriving on its earlier
+    /// stream are ignored from now on. A stream of another process than the earlier
+    /// stream's is logged: leases that process ran are kept until it has fenced (issue
+    /// #140).
     pub fn register(
         &self,
         worker: &WorkerId,
         instance: DaemonInstance,
-        capacity: Resources,
-        caps: NodeCaps,
+        reported: Reported,
         outbound: Outbound,
         welcome: ServerMessage,
     ) -> StreamId {
@@ -245,25 +273,38 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
         let event = Event::WorkerUp {
             worker: worker.clone(),
             instance,
-            capacity,
-            caps,
+            capacity: reported.capacity,
+            caps: reported.caps,
         };
-        state.feed_quiet(now, event);
+        // No placement between the registration and the phase: a quarantined node
+        // must not be offered a lease in between.
+        let none = state.sched.apply(Input::new(now, event));
+        debug_assert!(none.is_empty(), "a registration has no effect: {none:?}");
+        state.phase(now, worker, reported.phase);
         stream
     }
 
-    /// A `Hello` resent on `stream`: the node report changed. Changes the worker's
-    /// capacity and capabilities and nothing else; ignored if `stream` was replaced.
-    pub fn resize(&self, worker: &WorkerId, stream: StreamId, capacity: Resources, caps: NodeCaps) {
+    /// A `Hello` resent on `stream`: the node report or the node's phase changed.
+    /// Changes the worker's capacity, capabilities and phase, and opens no session;
+    /// ignored if `stream` was replaced.
+    ///
+    /// A `Preparing` or `Restoring` phase naming a lease the scheduler holds on the
+    /// worker, whose `Start` went to an earlier session, sends that `Start` again (the
+    /// daemon restarted for the session switch); one naming a lease of this process it
+    /// does not hold there is sent a `Cancel`, so the daemon cleans up after it. A
+    /// change into or out of quarantine is logged as an attention item.
+    pub fn resize(&self, worker: &WorkerId, stream: StreamId, reported: Reported) {
         let now = self.now();
         let mut state = self.lock();
         if state.is_current(worker, stream) {
             let event = Event::Capacity {
                 worker: worker.clone(),
-                capacity,
-                caps,
+                capacity: reported.capacity,
+                caps: reported.caps,
             };
-            state.feed_quiet(now, event);
+            let none = state.sched.apply(Input::new(now, event));
+            debug_assert!(none.is_empty(), "a capacity change has no effect: {none:?}");
+            state.phase(now, worker, reported.phase);
         }
     }
 
@@ -401,16 +442,22 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
                 leases: leases(),
             },
         };
+        let phase = state.sched.phase(worker).cloned().unwrap_or_default();
+        let mut needs_attention = state
+            .software
+            .get(worker)
+            .map(SoftwareView::needs_attention)
+            .unwrap_or_default();
+        if let NodePhase::Quarantined(reason) = &phase {
+            needs_attention.push(format!("quarantined: {reason}"));
+        }
         NodeView {
             node_id: worker.as_str().to_owned(),
             connected: !state.links[worker].outbound.is_closed(),
             software: state.software.get(worker).cloned(),
-            needs_attention: state
-                .software
-                .get(worker)
-                .map(SoftwareView::needs_attention)
-                .unwrap_or_default(),
+            needs_attention,
             placement,
+            phase: PhaseView::new(&phase),
         }
     }
 
@@ -657,6 +704,39 @@ impl State {
             memory::pressure(worker, self.sched.memory_pressure(worker));
         }
         (answers, accepted)
+    }
+
+    /// Takes `worker`'s phase, then places: sends a switching lease's `Start` again,
+    /// or a `Cancel` for one not held here, and logs a quarantine raised or cleared.
+    fn phase(&mut self, now: FarmTime, worker: &WorkerId, phase: NodePhase) {
+        let before = self.sched.phase(worker).cloned().unwrap_or_default();
+        if let Some((raise, line)) = quarantine_change(worker.as_str(), &before, &phase) {
+            if raise {
+                tracing::warn!(target: "kbf_server::attention", "{line}");
+            } else {
+                tracing::info!(target: "kbf_server::attention", "{line}");
+            }
+        }
+        let switching = phase.switching();
+        let event = Event::Phase {
+            worker: worker.clone(),
+            phase,
+        };
+        self.feed_quiet(now, event);
+        let Some(lease) = switching else {
+            return;
+        };
+        if self.sched.not_held(worker, &[lease]).next().is_some()
+            && let Some(link) = self.links.get(worker)
+        {
+            tracing::info!(%worker, %lease, "the node switches its session for a lease not held here: cancelled");
+            let cancel = server_message::Message::Cancel(Cancel {
+                lease_id: Some(wire_lease(lease)),
+            });
+            let _ = link.outbound.send(Ok(ServerMessage {
+                message: Some(cancel),
+            }));
+        }
     }
 
     fn is_current(&self, worker: &WorkerId, stream: StreamId) -> bool {

@@ -8,8 +8,10 @@
 //! and each daemon sends it again after its next `Welcome`.
 //!
 //! **Attention.** What a node needs a human for is listed in its `needs_attention`:
-//! today, each installed Xcode that is not ready, with why and the command that fixes
-//! it (issue #164). An Xcode its node has not surveyed yet (`not_surveyed`: a daemon
+//! each installed Xcode that is not ready, with why and the command that fixes it
+//! (issue #164), and a quarantine its daemon reported (`quarantined: <why>`, its
+//! `phase` too; [`quarantine_change`] logs it once raised and once cleared, at the
+//! levels below). An Xcode its node has not surveyed yet (`not_surveyed`: a daemon
 //! says Hello before its first survey ends, so a restarted one first sends every
 //! Xcode in that state) is listed in `xcodes` with that state, and **holds the item
 //! the same app had in the node's previous status**: that item stays in
@@ -25,6 +27,7 @@
 //! server restart, an item is raised again when its node's survey reports it.
 
 use kbf_proto::worker::{NodeStatus, XcodeState, XcodeStatus};
+use kbf_sched::NodePhase;
 use serde::Serialize;
 
 /// One node, as `GET /v1/nodes` lists it.
@@ -42,6 +45,70 @@ pub struct NodeView {
     pub needs_attention: Vec<String>,
     /// Whether placement may use it, and where its drain is.
     pub placement: PlacementView,
+    /// What its newest `Hello` says it is doing besides running leases.
+    pub phase: PhaseView,
+}
+
+/// A node's phase (`kbf_sched::NodePhase`). Serialized with its `state` as a tag.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum PhaseView {
+    /// It takes leases.
+    Serving,
+    /// It switches its GUI session to the user of this whole-machine lease.
+    Preparing {
+        /// The lease, as `term.seq`.
+        lease: String,
+    },
+    /// It switches the session back after this whole-machine lease, and cleans up.
+    Restoring {
+        /// The lease, as `term.seq`.
+        lease: String,
+    },
+    /// A cleanup failed: it takes no lease until an operator repairs it.
+    Quarantined {
+        /// Why, as the node said.
+        reason: String,
+    },
+}
+
+impl PhaseView {
+    /// The view of `phase`.
+    #[must_use]
+    pub fn new(phase: &NodePhase) -> Self {
+        match phase {
+            NodePhase::Serving => Self::Serving,
+            NodePhase::Preparing(lease) => Self::Preparing {
+                lease: lease.to_string(),
+            },
+            NodePhase::Restoring(lease) => Self::Restoring {
+                lease: lease.to_string(),
+            },
+            NodePhase::Quarantined(reason) => Self::Quarantined {
+                reason: reason.clone(),
+            },
+        }
+    }
+}
+
+/// What to log when node `node`'s phase goes from `before` to `after`: its quarantine
+/// raised (`true`, with why) or cleared (`false`), each once. A quarantine whose reason
+/// changes is raised again; any other change logs nothing.
+#[must_use]
+pub fn quarantine_change(
+    node: &str,
+    before: &NodePhase,
+    after: &NodePhase,
+) -> Option<(bool, String)> {
+    match (before, after) {
+        (before, NodePhase::Quarantined(reason)) if before != after => {
+            Some((true, format!("node {node}: quarantined: {reason}")))
+        }
+        (NodePhase::Quarantined(_), after) if !matches!(after, NodePhase::Quarantined(_)) => {
+            Some((false, format!("node {node}: no longer quarantined")))
+        }
+        _ => None,
+    }
 }
 
 /// Where a node is in placement. Serialized with its `state` as a tag.

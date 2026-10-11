@@ -274,15 +274,17 @@ async fn the_platform_says_which_workers_may_run_it() {
     assert_eq!(script.submitted().len(), 3);
 }
 
-/// Catches: a property kbf reads ignored because of its case, so `osfamily=darwin`
+/// Catches: a property kbf reads ignored because of its case, so `osfamily=linux`
 /// runs anywhere, `GPU=1` on a node without a GPU, `KBF-LEASE=whole_machine` beside
 /// other work; and one property sent in two spellings resolved silently by order.
+/// (On macOS a GPU is the whole Mac's and is not booked on top; see
+/// `a_gpu_on_macos_is_the_whole_macs`.)
 #[tokio::test]
 async fn property_names_are_read_in_any_case() {
     let script = Arc::new(Script::default());
     let farm = Farm::with_execution(Arc::clone(&script)).await;
     let props = [
-        ("osfamily", "darwin"),
+        ("osfamily", "linux"),
         ("isa", "arm-a64"),
         ("GPU", "1"),
         ("KBF-Lease", "whole_machine"),
@@ -293,7 +295,7 @@ async fn property_names_are_read_in_any_case() {
         .await;
     start(&farm, &any_case.action).await.expect("Execute");
     let [submitted] = script.submitted().try_into().expect("one submission");
-    let want = kbf_caps::Request::parse([("os", "macos"), ("arch", "arm64")]).unwrap();
+    let want = kbf_caps::Request::parse([("os", "linux"), ("arch", "arm64")]).unwrap();
     assert_eq!(submitted.request.needs, want);
     assert_eq!(submitted.request.resources, DEFAULT_RESOURCES.with_gpus(1));
     assert_eq!(submitted.request.kind, LeaseKind::WholeMachine);
@@ -354,5 +356,41 @@ async fn ios_device_keys_are_refused_until_devices_are_booked() {
     assert_eq!(submitted.len(), 3);
     for submission in &submitted {
         assert_eq!(submission.request.needs, kbf_caps::Request::default());
+    }
+}
+
+/// Catches a GPU on macOS booked on top of a whole-machine lease (no Mac reports one,
+/// so the GPU test would wait for ever), and a GPU on macOS taken outside a
+/// whole-machine lease (it would run beside other work on a shared Mac; the front
+/// refuses it, naming `kbf-lease=whole_machine`). An `os` property names macOS as
+/// `OSFamily` does.
+#[tokio::test]
+async fn a_gpu_on_macos_is_the_whole_macs() {
+    let script = Arc::new(Script::default());
+    let farm = Farm::with_execution(Arc::clone(&script)).await;
+    for os in [("OSFamily", "darwin"), ("os", "macos")] {
+        let whole = job(
+            &format!("whole {os:?}"),
+            &[os, ("gpu", "1"), ("kbf-lease", "whole_machine")],
+            false,
+        );
+        farm.upload(&whole.blobs.iter().collect::<Vec<_>>()).await;
+        start(&farm, &whole.action).await.expect("Execute");
+        let shared = job(&format!("shared {os:?}"), &[os, ("gpu", "1")], false);
+        farm.upload(&shared.blobs.iter().collect::<Vec<_>>()).await;
+        let status = start(&farm, &shared.action)
+            .await
+            .expect_err("a shared GPU");
+        assert_eq!(status.code(), Code::InvalidArgument);
+        assert!(
+            status.message().contains("kbf-lease=whole_machine"),
+            "{status:?}"
+        );
+    }
+    let submitted = script.submitted();
+    assert_eq!(submitted.len(), 2);
+    for s in &submitted {
+        assert_eq!(s.request.kind, LeaseKind::WholeMachine);
+        assert_eq!(s.request.resources, DEFAULT_RESOURCES);
     }
 }

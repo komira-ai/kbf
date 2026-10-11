@@ -19,6 +19,14 @@
 //! before the first Heartbeat, each stream sends the node's software status
 //! (`NodeStatus`, see [`crate::status`]).
 //!
+//! A runtime that switches a Mac's GUI session for a whole-machine lease hands the
+//! daemon its phase ([`Daemon::with_phase`]; `docs/design/worker-protocol.md#node-phases`):
+//! every Hello carries the newest, and a change resends the Hello on the stream. A
+//! Welcome that names another lease epoch than the switching lease's term, or a
+//! `Cancel` for a lease that is not running here, has every runtime kill that lease,
+//! so a runtime that keeps a lease across its own restart (the whole-machine runtime
+//! does) cleans up after one the server no longer holds.
+//!
 //! A driver whose report changes while the daemon runs (the native driver re-checks its
 //! Xcodes, issue #164) hands the daemon a [`DriverReport`] channel
 //! ([`Daemon::with_driver_report`]); a driver with more than one survey sends each
@@ -63,10 +71,10 @@ use futures::channel::mpsc::{UnboundedSender, unbounded};
 use kbf_proto::google::rpc::Code;
 use kbf_proto::reapi::Digest;
 use kbf_proto::worker::{
-    self, DaemonMessage, Heartbeat, Hello, ServerMessage, daemon_message, server_message,
+    self, DaemonMessage, Heartbeat, Hello, Phase, ServerMessage, daemon_message, server_message,
     worker_client::WorkerClient,
 };
-use kbf_types::LeaseId;
+use kbf_types::{LeaseId, NodePhase};
 use tokio::sync::{mpsc, watch};
 use tokio::time::{sleep, timeout};
 use tonic::transport::{ClientTlsConfig, Endpoint};
@@ -186,6 +194,10 @@ pub struct Daemon {
     xcodes: Vec<worker::XcodeStatus>,
     /// The container images `NodeStatus` lists; see [`Self::with_container_images`].
     container_images: Vec<String>,
+    /// The runtime's phase, if one reports it; see [`Self::with_phase`].
+    phase: Option<watch::Receiver<NodePhase>>,
+    /// The newest phase taken from it, which every Hello carries.
+    phase_now: NodePhase,
     events: Option<mpsc::UnboundedSender<Event>>,
     leases: Leases,
     done: mpsc::UnboundedReceiver<Done>,
@@ -221,6 +233,7 @@ enum Wake {
     Done(Box<Done>),
     Recheck,
     Driver,
+    Phase,
 }
 
 impl Daemon {
@@ -262,6 +275,8 @@ impl Daemon {
             driver: None,
             xcodes: Vec::new(),
             container_images: Vec::new(),
+            phase: None,
+            phase_now: NodePhase::Serving,
             events: None,
             leases: Leases::new(runtimes, done_tx),
             done,
@@ -302,6 +317,26 @@ impl Daemon {
         self.xcodes = newest.xcodes;
         let changed = report != self.report;
         self.report = report;
+        changed
+    }
+
+    /// Sends `phase`'s value in every Hello, and resends the Hello on the stream each
+    /// time it changes (see the module documentation).
+    #[must_use]
+    pub fn with_phase(mut self, phase: watch::Receiver<NodePhase>) -> Self {
+        self.phase = Some(phase);
+        self.take_phase();
+        self
+    }
+
+    /// Takes the runtime's newest phase, if it reports one; returns whether it changed.
+    fn take_phase(&mut self) -> bool {
+        let Some(phase) = &mut self.phase else {
+            return false;
+        };
+        let newest = phase.borrow_and_update().clone();
+        let changed = newest != self.phase_now;
+        self.phase_now = newest;
         changed
     }
 
@@ -441,6 +476,7 @@ impl Daemon {
         let (tx, rx) = unbounded();
         // A change that arrived while no stream was up.
         self.take_driver_report();
+        self.take_phase();
         let hello_sent = self.clock.now();
         send(&tx, daemon_message::Message::Hello(self.hello()));
         self.emit(Event::HelloSent);
@@ -492,6 +528,7 @@ impl Daemon {
                 Some(done) = self.done.recv() => Wake::Done(Box::new(done)),
                 () = sleep(wait) => Wake::Recheck,
                 Some(()) = driver_changed(self.driver.as_mut()) => Wake::Driver,
+                Some(()) = phase_changed(self.phase.as_mut()) => Wake::Phase,
             };
             // First, whatever woke the loop: the clock may have jumped over a suspend.
             self.recheck(Some(&tx)).await;
@@ -516,6 +553,12 @@ impl Daemon {
                         send(&tx, daemon_message::Message::Hello(self.hello()));
                     }
                     send(&tx, daemon_message::Message::NodeStatus(self.node_status()));
+                }
+                Wake::Phase => {
+                    if self.take_phase() {
+                        tracing::info!(phase = self.phase_now.name(), "node phase changed");
+                        send(&tx, daemon_message::Message::Hello(self.hello()));
+                    }
                 }
             }
         }
@@ -555,6 +598,13 @@ impl Daemon {
     /// none was named is kept.
     fn new_epoch(&mut self, epoch: Option<u64>) {
         self.epoch = epoch;
+        if let Some(lease) = self.phase_now.switching()
+            && epoch.is_some_and(|epoch| epoch != lease.term)
+        {
+            // The server that granted it is gone: no Start for it will come again.
+            tracing::warn!(%lease, ?epoch, "the switching lease is of an earlier epoch");
+            self.leases.forget(lease);
+        }
         let stale: Vec<LeaseId> = self
             .granted
             .keys()
@@ -613,10 +663,12 @@ impl Daemon {
                 }
             }
             Some(server_message::Message::Cancel(cancel)) => {
-                if let Some(id) = cancel.lease_id.map(lease_id)
-                    && self.leases.cancel(id)
-                {
-                    self.emit(Event::Cancelled(id));
+                if let Some(id) = cancel.lease_id.map(lease_id) {
+                    if self.leases.cancel(id) {
+                        self.emit(Event::Cancelled(id));
+                    } else {
+                        self.leases.forget(id);
+                    }
                 }
             }
             Some(server_message::Message::Welcome(_)) => {
@@ -761,6 +813,7 @@ impl Daemon {
             capabilities: self.report.capabilities().to_vec(),
             report_hash: self.report.hash().to_vec(),
             instance_id: self.instance.clone(),
+            phase: wire_phase(&self.phase_now),
         }
     }
 
@@ -813,6 +866,27 @@ fn instance_id() -> String {
 /// no driver channel, or its sender is gone (`None` then disables the select arm).
 async fn driver_changed(driver: Option<&mut watch::Receiver<DriverReport>>) -> Option<()> {
     driver?.changed().await.ok()
+}
+
+/// Completes when `phase` has a value the daemon has not taken; never without one.
+async fn phase_changed(phase: Option<&mut watch::Receiver<NodePhase>>) -> Option<()> {
+    phase?.changed().await.ok()
+}
+
+/// `phase` as Hello carries it: absent for serving, as a daemon that predates the
+/// field sends it.
+fn wire_phase(phase: &NodePhase) -> Option<worker::NodePhase> {
+    let (state, lease, reason) = match phase {
+        NodePhase::Serving => return None,
+        NodePhase::Preparing(lease) => (Phase::Preparing, Some(*lease), ""),
+        NodePhase::Restoring(lease) => (Phase::Restoring, Some(*lease), ""),
+        NodePhase::Quarantined(reason) => (Phase::Quarantined, None, reason.as_str()),
+    };
+    Some(worker::NodePhase {
+        phase: state.into(),
+        lease_id: lease.map(proto_lease_id),
+        reason: reason.to_owned(),
+    })
 }
 
 /// Queues a message on the stream. A message for a stream that is gone is dropped: a

@@ -106,6 +106,11 @@ impl Runtimes {
         drivers
     }
 
+    /// Every runtime, in the order they were added.
+    pub(crate) fn all(&self) -> &[Arc<dyn AnyRuntime>] {
+        &self.all
+    }
+
     /// The runtime that serves lease kind `kind`, if any; for a kind outside
     /// [`LeaseKind::ALL`], which two may serve, the first added.
     pub(crate) fn serving(&self, kind: &str) -> Option<&Arc<dyn AnyRuntime>> {

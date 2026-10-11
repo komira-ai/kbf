@@ -19,8 +19,8 @@ use kbf_proto::reapi::{
     execution_server::ExecutionServer,
 };
 use kbf_proto::worker::{
-    self, Capability, DaemonMessage, Hello, LeaseId, Result as WorkerResult, ServerMessage, Start,
-    daemon_message, server_message, worker_server::WorkerServer,
+    self, Capability, DaemonMessage, Hello, LeaseId, NodePhase, Phase, Result as WorkerResult,
+    ServerMessage, Start, daemon_message, server_message, worker_server::WorkerServer,
 };
 use prost::Message;
 use tonic::server::NamedService;
@@ -117,6 +117,11 @@ fn worker_messages_round_trip() {
             ],
             report_hash: vec![7; 32],
             instance_id: "3f9c0a7d5e1b4c2a8d6f0e9b7a5c3d1e".to_owned(),
+            phase: Some(NodePhase {
+                phase: Phase::Preparing.into(),
+                lease_id: Some(LeaseId { term: 2, seq: 8 }),
+                reason: String::new(),
+            }),
         })),
     };
     let back = DaemonMessage::decode(hello.encode_to_vec().as_slice()).expect("decode");

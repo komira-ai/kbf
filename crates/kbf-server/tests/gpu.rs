@@ -115,3 +115,79 @@ async fn a_gpu_serves_one_lease_at_a_time() {
     done(&mut second_ops).await;
     cpu_only.no_work().await;
 }
+
+/// The Mac of a GPU test: 12 CPUs, 32 GiB, the native and whole-machine drivers, and no
+/// `gpu` entry (a Mac reports none).
+fn mac() -> Hello {
+    support::hello_on(
+        "mac-1",
+        12,
+        32,
+        &[
+            ("arch", "arm64"),
+            ("os", "macos"),
+            ("drivers", "native"),
+            ("drivers", "native-whole-machine"),
+        ],
+    )
+}
+
+/// Catches a GPU test on a Mac that cannot be placed (it books a GPU the Mac does not
+/// report), that books less than the whole Mac, or that lets other work run beside it
+/// (`docs/design/macos-vms.md` section 8.1: the GPU and the unified memory are the
+/// test's alone). It reaches the daemon as a `whole_machine` lease.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_gpu_test_on_a_mac_books_the_whole_mac() {
+    let cell = support::Cell::start().await;
+    let mut mac = FakeDaemon::connect(cell.worker_addr, mac())
+        .await
+        .expect("registered");
+    let gpu = Job::new(
+        "drive the app with a local model",
+        &[
+            ("OSFamily", "darwin"),
+            ("kbf-lease", "whole_machine"),
+            ("gpu", "1"),
+        ],
+    );
+    let beside = Job::new("a small Mac action", &[("OSFamily", "darwin")]);
+    for job in [&gpu, &beside] {
+        cell.upload(&job.blobs()).await;
+    }
+    let mut ops = cell.execute(&gpu.action).await;
+    let start = mac.start().await;
+    assert_eq!(start.kind, "whole_machine");
+    assert_eq!(start.action_digest.as_ref(), Some(&gpu.action.proto));
+    assert_eq!((start.millicpus, start.memory_bytes), (12_000, 32 * GIB));
+
+    let mut beside_ops = cell.execute(&beside.action).await;
+    mac.no_work().await;
+    let result = output(&cell, "the model answered", 0).await;
+    assert!(mac.report(ran(start.lease_id, &result)).await.accepted);
+    done(&mut ops).await;
+    let next = mac.start().await;
+    assert_eq!(next.kind, "action");
+    let small = output(&cell, "ran after", 0).await;
+    assert!(mac.report(ran(next.lease_id, &small)).await.accepted);
+    done(&mut beside_ops).await;
+}
+
+/// Catches a GPU asked for on macOS outside a whole-machine lease that is taken: it
+/// would wait for a GPU no Mac reports (or, if one did, share the Mac with other
+/// work). It is refused at once, saying what to add. A GPU asked for with no OS named
+/// is not a Mac's, and is booked as before (see `a_gpu_serves_one_lease_at_a_time`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_gpu_on_macos_outside_a_whole_machine_lease_is_refused() {
+    let cell = support::Cell::start().await;
+    let job = Job::new("a GPU action lease", &[("OSFamily", "macos"), ("gpu", "1")]);
+    cell.upload(&job.blobs()).await;
+    let refused = cell
+        .execute_with(&job.action, false)
+        .await
+        .expect_err("refused");
+    assert_eq!(refused.code(), tonic::Code::InvalidArgument);
+    assert!(
+        refused.message().contains("kbf-lease=whole_machine"),
+        "{refused:?}"
+    );
+}

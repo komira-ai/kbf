@@ -514,6 +514,7 @@ pub fn hello_on(node: &str, cpus: u32, mem_gib: u32, platform: &[(&str, &str)]) 
         report_hash: Vec::new(),
         // One daemon process per node unless a test says otherwise.
         instance_id: format!("{node}-daemon"),
+        phase: None,
     }
 }
 

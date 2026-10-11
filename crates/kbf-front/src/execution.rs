@@ -44,7 +44,10 @@
 //! of at least 1, or that overflows the booking, is INVALID_ARGUMENT, and so is either
 //! key on a `whole_machine` lease (the scheduler books the whole worker for one). The
 //! platform's `gpu` value is the number of whole GPUs to book on top (0 when absent); a
-//! value that is not a whole number is INVALID_ARGUMENT.
+//! value that is not a whole number is INVALID_ARGUMENT. On macOS (a platform whose
+//! `OSFamily` or `os` names it) a GPU is booked only with the whole Mac: `gpu` of 1 or
+//! more is INVALID_ARGUMENT unless the lease is `whole_machine`, which then books no
+//! GPU on top (a Mac reports none; the whole-machine lease has its GPU).
 //!
 //! The rest of the platform says which workers may run the action
 //! (`kbf_caps::Request::from_platform`: `OSFamily`, `ISA`, `Arch` and kbf's capability
@@ -367,9 +370,9 @@ where
 
         let platform = properties(platform(&decoded, command.as_ref()))?;
         let kind = lease_kind(&platform)?;
-        let gpus = gpus(&platform)?;
         let booked = booking(&platform, kind)?;
         let needs = needs(&platform)?;
+        let gpus = mac_gpus(kind, gpus(&platform)?, &needs)?;
         Ok(Submission {
             request: Request {
                 key: ActionKey { instance, action },
@@ -475,6 +478,27 @@ fn gpus(platform: &Platform) -> Result<u64, Status> {
             "platform property {GPU_KEY}={n:?} is not a whole number of GPUs"
         ))
     })
+}
+
+/// The GPUs to book for a request that asks for `gpus`. On macOS a GPU comes only with
+/// the whole Mac (`docs/design/macos-vms.md` section 8.1): a request whose platform
+/// names macOS and asks for a GPU must be a `whole_machine` lease, and books none on
+/// top, because a Mac reports no GPU to book and a whole-machine lease is the Mac's,
+/// its GPU included. Any other request books what it asks.
+///
+/// # Errors
+/// INVALID_ARGUMENT for a GPU on macOS outside a `whole_machine` lease.
+fn mac_gpus(kind: LeaseKind, gpus: u64, needs: &kbf_caps::Request) -> Result<u64, Status> {
+    if gpus == 0 || needs.exact("os") != Some("macos") {
+        return Ok(gpus);
+    }
+    if kind != LeaseKind::WholeMachine {
+        return Err(Status::invalid_argument(format!(
+            "platform property {GPU_KEY}={gpus} on macOS needs {LEASE_KIND_KEY}=whole_machine: \
+             a Mac's GPU is booked with the whole Mac"
+        )));
+    }
+    Ok(0)
 }
 
 /// What the lease books: [`DEFAULT_RESOURCES`], with `kbf-book-cpus` whole cores and

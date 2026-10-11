@@ -37,16 +37,16 @@ use kbf_caps::NodeCaps;
 use kbf_front::MetaLog;
 use kbf_objstore::ObjectStore;
 use kbf_proto::worker::{
-    Capability, DaemonMessage, HeartbeatAck, Hello, ServerMessage, Welcome, daemon_message,
+    Capability, DaemonMessage, HeartbeatAck, Hello, Phase, ServerMessage, Welcome, daemon_message,
     server_message, worker_server::Worker,
 };
-use kbf_sched::DaemonInstance;
+use kbf_sched::{DaemonInstance, NodePhase};
 use kbf_types::{LeaseId, Resources, WorkerId};
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 use tonic::{Request, Response, Status, Streaming};
 
-use crate::farm::{Farm, Outbound, StreamId};
+use crate::farm::{Farm, Outbound, Reported, StreamId};
 use crate::identity::{PeerCert, Peers};
 
 /// The `kbf.worker.v1` version this server speaks.
@@ -122,8 +122,7 @@ where
             return Err(Status::invalid_argument("Hello has no node_id"));
         }
         self.peers.admit(peer.as_ref(), &hello.node_id).await?;
-        let capacity = capacity(&hello).map_err(Status::invalid_argument)?;
-        let caps = caps(&hello).map_err(Status::invalid_argument)?;
+        let reported = reported(&hello).map_err(Status::invalid_argument)?;
         let worker = WorkerId::new(hello.node_id);
         let instance = DaemonInstance::new(hello.instance_id);
         let welcome = message(server_message::Message::Welcome(Welcome {
@@ -133,9 +132,10 @@ where
             epoch: self.farm.term(),
         }));
         let (outbound, responses) = mpsc::unbounded_channel();
-        let stream =
-            self.farm
-                .register(&worker, instance, capacity, caps, outbound.clone(), welcome);
+        let capacity = reported.capacity;
+        let stream = self
+            .farm
+            .register(&worker, instance, reported, outbound.clone(), welcome);
         tracing::info!(%worker, ?capacity, "worker registered");
         let session = Session {
             farm: Arc::clone(&self.farm),
@@ -203,8 +203,8 @@ impl<M: MetaLog, O: ObjectStore> Session<M, O> {
                 self.peers
                     .admit(self.peer.as_ref(), worker.as_str())
                     .await?;
-                match capacity(&hello).and_then(|capacity| Ok((capacity, caps(&hello)?))) {
-                    Ok((capacity, caps)) => farm.resize(worker, stream, capacity, caps),
+                match reported(&hello) {
+                    Ok(reported) => farm.resize(worker, stream, reported),
                     Err(e) => tracing::warn!(%worker, error = %e, "a resent Hello ignored"),
                 }
                 None
@@ -255,6 +255,46 @@ fn message(message: server_message::Message) -> ServerMessage {
     ServerMessage {
         message: Some(message),
     }
+}
+
+/// What a `Hello` reports: [`capacity`], [`caps`] and [`phase`].
+///
+/// # Errors
+/// Any of the three is malformed.
+pub fn reported(hello: &Hello) -> Result<Reported, String> {
+    Ok(Reported {
+        capacity: capacity(hello)?,
+        caps: caps(hello)?,
+        phase: phase(hello)?,
+    })
+}
+
+/// The node's phase: serving when the `Hello` names none. A phase this server does not
+/// know is read as a quarantine that says so: the node takes no lease and is listed for
+/// attention, rather than being offered work it may not be ready for.
+///
+/// # Errors
+/// A preparing or restoring phase that names no lease.
+pub fn phase(hello: &Hello) -> Result<NodePhase, String> {
+    let Some(reported) = &hello.phase else {
+        return Ok(NodePhase::Serving);
+    };
+    let lease = || {
+        reported
+            .lease_id
+            .map(|l| LeaseId::new(l.term, l.seq))
+            .ok_or_else(|| "a preparing or restoring phase names no lease".to_owned())
+    };
+    Ok(match Phase::try_from(reported.phase) {
+        Ok(Phase::Serving) => NodePhase::Serving,
+        Ok(Phase::Preparing) => NodePhase::Preparing(lease()?),
+        Ok(Phase::Restoring) => NodePhase::Restoring(lease()?),
+        Ok(Phase::Quarantined) => NodePhase::Quarantined(reported.reason.clone()),
+        Err(_) => NodePhase::Quarantined(format!(
+            "the node reports phase {}, which this server does not know",
+            reported.phase
+        )),
+    })
 }
 
 /// What placement may book on a node: its `cpus` and `mem_gib` entries, and its `gpu`
