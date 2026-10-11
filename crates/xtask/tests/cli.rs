@@ -1,0 +1,334 @@
+//! `cargo xtask` run as CI runs it: the real binary, with `xtask-fake` as cargo and as
+//! the built kbf-server, and throwaway git repositories for `budget-diff`.
+
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
+
+const XTASK: &str = env!("CARGO_BIN_EXE_xtask");
+const FAKE: &str = env!("CARGO_BIN_EXE_xtask-fake");
+const HEAD: &str = "c0ffee0123456789c0ffee0123456789c0ffee01";
+const BUILD: &str = "build --locked -p kbf-server --bin kbf-server";
+
+/// An empty directory of its own for one test.
+fn scratch(name: &str) -> PathBuf {
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join("xtask")
+        .join(name);
+    if dir.exists() {
+        std::fs::remove_dir_all(&dir).expect("clear scratch");
+    }
+    std::fs::create_dir_all(&dir).expect("scratch");
+    dir
+}
+
+fn xtask(root: &Path, args: &[&str]) -> Command {
+    let mut cmd = Command::new(XTASK);
+    cmd.arg("--root").arg(root).args(args);
+    cmd
+}
+
+fn text(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+/// The exit code, stdout and stderr of a finished run.
+fn outcome(out: Output) -> (Option<i32>, String, String) {
+    (out.status.code(), text(&out.stdout), text(&out.stderr))
+}
+
+/// `build-commit stamps` with the fake as cargo, planting `defect` (or none).
+fn stamps(
+    name: &str,
+    defect: Option<&str>,
+    commit: &str,
+) -> (Option<i32>, String, String, PathBuf) {
+    let root = scratch(name);
+    let mut cmd = xtask(&root, &["build-commit", "stamps", commit]);
+    cmd.env("CARGO", FAKE).env("XTASK_FAKE_HEAD", &HEAD[..12]);
+    // The caller's own override must not reach the plain build.
+    cmd.env("KBF_BUILD_COMMIT_OVERRIDE", "dddddddddddd");
+    match defect {
+        Some(d) => cmd.env("XTASK_FAKE_DEFECT", d),
+        None => cmd.env_remove("XTASK_FAKE_DEFECT"),
+    };
+    let (code, out, err) = outcome(cmd.output().expect("run xtask"));
+    (code, out, err, root)
+}
+
+#[test]
+fn stamps_passes_a_build_that_honours_the_override() {
+    // Control: catches a stamps verb that refuses a correct build, builds the wrong
+    // package, or lets the caller's own override reach the plain build.
+    let (code, out, err, root) = stamps("stamps-good", None, HEAD);
+    assert_eq!(code, Some(0), "stdout:\n{out}\nstderr:\n{err}");
+    assert_eq!(
+        out,
+        "ok: kbf-server 0.1.0+c0ffee012345\nok: kbf-server 0.1.0+a1a1a1a1a1a1\n\
+         ok: kbf-server 0.1.0+b2b2b2b2b2b2\nok: a malformed override fails the build\n"
+    );
+    let args = std::fs::read_to_string(root.join("target/debug/cargo-args")).expect("log");
+    assert_eq!(args, format!("{BUILD}\n").repeat(4));
+}
+
+#[test]
+fn stamps_refuses_a_build_that_ignores_the_override() {
+    // Catches: the stamped builds not checked against their stamp (a build script that
+    // drops the override would pass).
+    let (code, _, err, _) = stamps("stamps-ignores", Some("ignores-override"), HEAD);
+    assert_eq!(code, Some(1));
+    assert_eq!(
+        err,
+        "xtask-fake: built\nxtask-fake: built\nxtask: --version is \
+         \"kbf-server 0.1.0+c0ffee012345\"; expected it to end +a1a1a1a1a1a1\n"
+    );
+}
+
+#[test]
+fn stamps_refuses_a_build_that_accepts_a_malformed_override() {
+    // Catches: the malformed-override build not run, or its success not refused.
+    let (code, _, err, _) = stamps("stamps-accepts-bad", Some("accepts-bad"), HEAD);
+    assert_eq!(code, Some(1));
+    assert!(
+        err.ends_with("xtask: a build with KBF_BUILD_COMMIT_OVERRIDE=not-a-commit succeeded\n"),
+        "{err}"
+    );
+}
+
+#[test]
+fn stamps_refuses_a_failure_that_is_not_on_the_override() {
+    // Catches: any failed build taken as the refusal (a broken build would pass).
+    let (code, _, err, _) = stamps("stamps-fails-other", Some("fails-other"), HEAD);
+    assert_eq!(code, Some(1));
+    assert!(
+        err.ends_with("xtask: the build failed, but not on the override:\nerror: linking failed\n"),
+        "{err}"
+    );
+}
+
+#[test]
+fn stamps_stops_at_a_failed_build_or_version() {
+    // Catches: a failed build or `--version` run passed over instead of failing.
+    let (code, _, err, _) = stamps("stamps-build-fails", Some("build-fails"), HEAD);
+    assert_eq!(code, Some(1));
+    assert!(
+        err.ends_with("xtask: cargo build of kbf-server failed: exit status: 101\n"),
+        "{err}"
+    );
+    let (code, _, err, root) = stamps("stamps-version-fails", Some("version-fails"), HEAD);
+    assert_eq!(code, Some(1));
+    let bin = root.join("target/debug/kbf-server");
+    assert!(
+        err.ends_with(&format!(
+            "xtask: {} --version: exit status: 1\n",
+            bin.display()
+        )),
+        "{err}"
+    );
+}
+
+#[test]
+fn stamps_refuses_a_commit_it_cannot_tell_from_a_stamp() {
+    // Catches: a commit equal to a stamp, which makes the stamped builds prove nothing,
+    // and a malformed commit, each refused before anything is built.
+    let (code, _, err, root) = stamps("stamps-stamp-commit", None, "a1a1a1a1a1a1ffff");
+    assert_eq!(code, Some(1));
+    assert_eq!(
+        err,
+        "xtask: a1a1a1a1a1a1ffff begins with a test stamp; the stamped builds cannot be told from it\n"
+    );
+    assert!(!root.join("target").exists());
+    let (code, _, err, _) = stamps("stamps-not-commit", None, "");
+    assert_eq!(code, Some(1));
+    assert_eq!(
+        err,
+        "xtask: not a commit: \"\" (expected 12 to 40 lowercase hex digits)\n"
+    );
+}
+
+#[test]
+fn stamps_reports_a_cargo_that_does_not_start() {
+    // Catches: a spawn failure reported as a passed or failed check.
+    let root = scratch("stamps-no-cargo");
+    let missing = root.join("no-cargo");
+    let out = xtask(&root, &["build-commit", "stamps", HEAD])
+        .env("CARGO", &missing)
+        .output()
+        .expect("run xtask");
+    let (code, _, err) = outcome(out);
+    assert_eq!(code, Some(1));
+    assert!(
+        err.starts_with(&format!("xtask: {}: ", missing.display())),
+        "{err}"
+    );
+}
+
+/// A `kbf-server` (the fake, hard-linked) whose `--version` names `stamp`.
+fn server(name: &str, stamp: &str) -> PathBuf {
+    let dir = scratch(name);
+    let bin = dir.join("kbf-server");
+    std::fs::hard_link(FAKE, &bin).expect("link");
+    std::fs::write(dir.join("kbf-server.stamp"), stamp).expect("stamp");
+    bin
+}
+
+#[test]
+fn check_passes_the_commit_the_binary_names_and_fails_another() {
+    // Catches: a check that does not compare the stamp with the commit given (the
+    // control inside the check catches one that accepts anything).
+    let bin = server("check", &HEAD[..12]);
+    let run = |commit: &str| {
+        let out = xtask(Path::new("."), &["build-commit", "check"])
+            .arg(&bin)
+            .arg(commit)
+            .output()
+            .expect("run xtask");
+        outcome(out)
+    };
+    assert_eq!(
+        run(HEAD),
+        (
+            Some(0),
+            "ok: kbf-server 0.1.0+c0ffee012345\n".into(),
+            String::new()
+        )
+    );
+    let other = "d0ffee0123456789c0ffee0123456789c0ffee01";
+    assert_eq!(
+        run(other),
+        (
+            Some(1),
+            String::new(),
+            "xtask: --version is \"kbf-server 0.1.0+c0ffee012345\"; expected it to end +d0ffee012345\n"
+                .into()
+        )
+    );
+}
+
+#[test]
+fn a_usage_error_exits_2() {
+    // Catches: a missing argument run as a check with an empty value.
+    let out = Command::new(XTASK)
+        .args(["build-commit", "check"])
+        .output()
+        .expect("run");
+    assert_eq!(out.status.code(), Some(2));
+}
+
+/// A git repository whose one commit holds `budget` as the budget file.
+fn repo(name: &str, budget: &str) -> PathBuf {
+    let root = scratch(name);
+    let git = |args: &[&str]| {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@example.com")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@example.com")
+            .output()
+            .expect("git");
+        assert!(out.status.success(), "git {args:?}: {}", text(&out.stderr));
+    };
+    git(&["init", "-q"]);
+    std::fs::create_dir_all(root.join("tools")).expect("tools");
+    std::fs::write(root.join("tools/interpreter_budget.tsv"), budget).expect("budget");
+    git(&["add", "."]);
+    git(&["commit", "-q", "-m", "base"]);
+    root
+}
+
+const BASE: &str = "[files]\na.sh\tto port\n[workflow]\n[src-sh-c]\n";
+
+fn budget_diff(root: &Path, base: &str) -> (Option<i32>, String, String) {
+    outcome(
+        xtask(root, &["budget-diff", "--base", base])
+            .output()
+            .expect("run xtask"),
+    )
+}
+
+#[test]
+fn budget_diff_refuses_a_new_row_and_passes_a_removal() {
+    // Catches: a budget-diff that reads the base from the working tree (it would
+    // compare the file with itself), or that refuses the list shrinking.
+    let root = repo("budget-new-row", BASE);
+    let file = root.join("tools/interpreter_budget.tsv");
+    assert_eq!(
+        budget_diff(&root, "HEAD"),
+        (
+            Some(0),
+            "ok: tools/interpreter_budget.tsv adds no row to HEAD's\n".into(),
+            String::new()
+        )
+    );
+    std::fs::write(
+        &file,
+        BASE.replace("[src-sh-c]\n", "[src-sh-c]\nk.rs\tnew keeper\n"),
+    )
+    .expect("plant");
+    assert_eq!(
+        budget_diff(&root, "HEAD"),
+        (
+            Some(1),
+            String::new(),
+            "xtask: tools/interpreter_budget.tsv:5: a new [src-sh-c] row for `k.rs`; the \
+             budget only shrinks: port it to Rust instead\n"
+                .into()
+        )
+    );
+    std::fs::write(&file, "[files]\n[workflow]\n[src-sh-c]\n").expect("shrink");
+    assert_eq!(budget_diff(&root, "HEAD").0, Some(0));
+}
+
+#[test]
+fn budget_diff_refuses_what_it_cannot_compare() {
+    // Catches: an unknown base, a missing budget file, a malformed one, or git not
+    // starting, each passed as "nothing added".
+    let root = repo("budget-errors", BASE);
+    let (code, _, err) = budget_diff(&root, "no-such-rev");
+    assert_eq!(code, Some(1));
+    assert!(
+        err.starts_with("xtask: git show no-such-rev:tools/interpreter_budget.tsv: "),
+        "{err}"
+    );
+    std::fs::write(root.join("tools/interpreter_budget.tsv"), "[files]\na.sh\n").expect("bad");
+    let (code, _, err) = budget_diff(&root, "HEAD");
+    assert_eq!(code, Some(1));
+    assert_eq!(
+        err,
+        "xtask: tools/interpreter_budget.tsv: line 2: a row needs two tab-separated fields \
+         (<key>, <reason>), found 1\n"
+    );
+    std::fs::remove_file(root.join("tools/interpreter_budget.tsv")).expect("remove");
+    let (code, _, err) = budget_diff(&root, "HEAD");
+    assert_eq!(code, Some(1));
+    assert!(err.starts_with("xtask: "), "{err}");
+    assert!(err.contains("interpreter_budget.tsv: "), "{err}");
+    let out = xtask(&root, &["budget-diff", "--base", "HEAD"])
+        .env("PATH", "")
+        .output()
+        .expect("run xtask");
+    let (code, _, err) = outcome(out);
+    assert_eq!(code, Some(1));
+    assert!(err.starts_with("xtask: git: "), "{err}");
+}
+
+#[test]
+fn budget_diff_defaults_to_this_repository() {
+    // Catches: a default root other than this workspace (CI passes no --root). The
+    // working tree's budget against its own HEAD adds nothing unless a row is being
+    // added right now, which this check exists to refuse.
+    let out = Command::new(XTASK)
+        .args(["budget-diff", "--base", "HEAD"])
+        .output()
+        .expect("run xtask");
+    let (code, out, err) = outcome(out);
+    assert_eq!(code, Some(0), "stderr:\n{err}");
+    assert_eq!(
+        out,
+        "ok: tools/interpreter_budget.tsv adds no row to HEAD's\n"
+    );
+}
