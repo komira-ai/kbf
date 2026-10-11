@@ -276,7 +276,7 @@ fn open_child(dir: &OwnedFd, name: &OsStr, stat: &Stat) -> io::Result<OwnedFd> {
 }
 
 /// The names in `dir`, read whole before any is removed.
-fn list(dir: &OwnedFd) -> io::Result<Vec<OsString>> {
+pub(crate) fn list(dir: &OwnedFd) -> io::Result<Vec<OsString>> {
     let mut names = Vec::new();
     for entry in Dir::read_from(dir)? {
         let entry = entry?;
