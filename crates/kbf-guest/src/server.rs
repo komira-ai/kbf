@@ -397,6 +397,12 @@ mod tests {
         };
         write_frame(&mut host, &hello.encode()).expect("hello sent");
         drop(host);
+        let mut fake = ClosedPeerRefusesTimeout(stream);
+        // The agent returns before it clones or flushes the stream; check the fake
+        // passes those through, so that it fails only where it means to.
+        let clone = Stream::try_clone(&fake).expect("cloned");
+        drop(clone);
+        fake.flush().expect("flushed");
         let mut agent = Agent::new(Config {
             token,
             inputs: PathBuf::from("/nonexistent/inputs"),
@@ -405,7 +411,7 @@ mod tests {
             hello_timeout: HELLO_TIMEOUT,
         });
         agent
-            .serve_connection(ClosedPeerRefusesTimeout(stream))
+            .serve_connection(fake)
             .expect("a closed connection, not an error");
         assert!(!agent.has_run());
     }
