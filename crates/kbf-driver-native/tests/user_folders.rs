@@ -1,8 +1,9 @@
 //! On macOS, the tools that write in the daemon user's own temporary and cache folders
 //! (`confstr(_CS_DARWIN_USER_TEMP_DIR)` and `_CS_DARWIN_USER_CACHE_DIR`, under
 //! `/var/folders`) whatever `TMPDIR` says still work under the driver's sandbox
-//! (issue #163): a Foundation atomic save, `swift build`, `xcodebuild`, and the
-//! `/usr/bin` compiler shims, whose `xcrun` keeps its cache there.
+//! (issue #163): a Foundation atomic save, `swift build`, `xcodebuild`, the
+//! `/usr/bin` compiler shims, whose `xcrun` keeps its cache there, and Swift Build's
+//! scratch directory.
 
 #![cfg(target_os = "macos")]
 
@@ -469,6 +470,39 @@ async fn a_leftover_in_the_temporary_folder_is_swept_after_the_lease() {
         sandbox_denials()
     );
     assert!(!left.exists(), "kept past the lease: {}", left.display());
+}
+
+/// Catches a profile that refuses Swift Build's scratch directory: `SWBBuildService`,
+/// which `xcodebuild` starts, makes `mkdtemp(T/swbuild.tmp.<random>)` in the user's
+/// temporary folder whatever `TMPDIR` says, and stops the build when it cannot (both
+/// fixtures of `docs/spikes/macos-p0.md` on the macOS runner). The action makes one
+/// the same way, with and without the network, writes, renames and removes inside
+/// it, and removes it.
+#[tokio::test]
+async fn swift_builds_scratch_directory_can_be_made() {
+    let dir = scratch("swbuild");
+    let cas = Arc::new(MemoryCas::default());
+    let rt = runtime(config(&dir), &cas);
+    let temp = user_folder("DARWIN_USER_TEMP_DIR");
+    let script = format!(
+        "d=$(mktemp -d '{}/swbuild.tmp.XXXXXXXX') \
+         && mkdir \"$d/sub\" && echo x > \"$d/sub/f\" && mv \"$d/sub/f\" \"$d/g\" \
+         && rm -r \"$d\" && echo ok",
+        temp.display()
+    );
+    for (seq, network) in [(1, "off"), (2, "on")] {
+        let spec = Spec::sh(&script)
+            .env("PATH", PATH)
+            .property("network", network);
+        let result = run_long(&rt, &cas, seq, &spec).await;
+        assert_eq!(
+            stdout(&cas, &result).trim(),
+            "ok",
+            "network={network}: {}\n{}",
+            stderr(&cas, &result),
+            sandbox_denials()
+        );
+    }
 }
 
 /// Each way an action could take `$T/TemporaryItems` away, swap it for a link, or
