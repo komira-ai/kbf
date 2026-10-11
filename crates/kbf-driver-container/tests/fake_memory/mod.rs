@@ -16,6 +16,7 @@ use kbf_driver_container::SwapKill;
 use kbf_types::Resources;
 
 use crate::support::fake::{Fake, image};
+use crate::support::swap_kill::{Logs, assert_swap_kill};
 use crate::support::{Spec, store_action, work};
 
 /// The cap `Fake::run`'s 1 GiB booking gets: 1.5 GiB + 512 MiB.
@@ -256,6 +257,49 @@ async fn a_lease_pressing_its_cap_into_swap_is_killed_as_out_of_memory() {
         "{:?}",
         fake.events()
     );
+    fake.assert_clean(1);
+}
+
+/// An action whose RAM sits 1 MiB below the cap (reclaim at the cap has taken it below)
+/// while each 50 ms its `max` events grow and 256 KiB more goes to swap: all of its swap
+/// is its own. It ends with exit 0 after about 5 s unless something kills it. The
+/// swap file reads `n/a` while `max` moves, so no sample sees swap rise with `max` flat.
+fn reclaimed_below_the_cap() -> String {
+    format!(
+        r#"echo {ram} > "$CG/memory.current"; echo 0 > "$CG/memory.swap.current"
+        n=1
+        while [ $n -le 100 ]; do
+            echo n/a > "$CG/memory.swap.current"
+            printf 'max %d\noom 0\noom_kill 0\n' $n > "$CG/memory.events.new"
+            mv "$CG/memory.events.new" "$CG/memory.events"
+            echo $((n * {step})) > "$CG/memory.swap.current"
+            n=$((n + 1)); sleep 0.05
+        done
+        exit 0"#,
+        ram = CAP - (1 << 20),
+        step = 256 << 10,
+    )
+}
+
+/// Catches a kill check that wants RAM plus swap past the cap by the threshold (the
+/// check podman-arm failed on a correct kill): at the kill sample this lease holds
+/// 1 MiB less than its cap in RAM and 1.25 MiB of its own swap, past the 1 MiB floor,
+/// so it is past its cap by only 256 KiB. Also catches the watch missing (exit 0) and a
+/// threshold that drops the floor (the "0 floor" mutant kills at the first 256 KiB of
+/// own swap, below the cap and the floor).
+#[tokio::test]
+async fn a_lease_reclaimed_below_its_cap_is_killed_for_its_own_swap() {
+    let fake = watched("swap-below", 1 << 20, 0);
+    let logs = Logs::capture();
+    let outcome = fake
+        .run(
+            1,
+            &Spec::new(&image(), "unused"),
+            &reclaimed_below_the_cap(),
+        )
+        .await;
+    assert_swap_kill(&outcome, &logs.text(), CAP, 1 << 20, "");
+    drop(logs);
     fake.assert_clean(1);
 }
 

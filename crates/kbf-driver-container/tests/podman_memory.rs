@@ -28,6 +28,7 @@ use kbf_driver_container::SwapKill;
 use kbf_types::{LeaseId, Resources};
 use support::real::{Cell, describe, podman, sh};
 use support::store_action;
+use support::swap_kill::{Logs, assert_swap_kill};
 
 const MIB: u64 = 1 << 20;
 
@@ -199,6 +200,11 @@ async fn past_its_booking_within_its_cap_an_action_runs() {
 /// (`dd` then blocks writing it into a pipe nobody reads), so reclaim at its cap moves
 /// some 360 MiB of it to swap, past the 128 MiB floor this cell's watch is given; the
 /// watch samples every second. Lease 2 sleeps beside it and must still be running.
+/// The kill is checked as `assert_swap_kill` says: past its cap overall, with its own
+/// swap past the floor by the watch's log line. Also catches a threshold that drops the
+/// floor (the "0 floor" mutant: its kill line names the 4 MiB share of the booking).
+/// RAM plus swap past the cap by the floor is no promise: the kill sample may find RAM
+/// below the cap.
 /// The buffer is random, not zeros: a kernel that splits huge pages under reclaim
 /// (podman-x86's) drops zero-filled pages for the shared zero page, so a buffer of
 /// zeros shrinks below the cap and never reaches swap.
@@ -225,6 +231,7 @@ async fn past_its_cap_with_swap_free_the_driver_kills_it_as_out_of_memory() {
     let started = Instant::now();
     let runtime = Arc::clone(&cell.runtime);
     let work = cell.work(1, action, Resources::new(1000, 16 * MIB));
+    let logs = Logs::capture();
     let mut first = tokio::spawn(async move { runtime.run(work).await });
     // What the lease looked like each second, for the failure message.
     let lease = cell.cgroup.join(cell.name(1));
@@ -238,14 +245,14 @@ async fn past_its_cap_with_swap_free_the_driver_kills_it_as_out_of_memory() {
         }
     };
     let took = started.elapsed();
-    let want = cap(16 * MIB);
-    // `used` is RAM plus swap at the kill: past the cap by more than the floor.
-    assert!(
-        matches!(outcome, Err(RuntimeError::OutOfMemory { used, limit })
-            if limit == want && used > want + 128 * MIB),
-        "{outcome:?}\n{}",
-        seen.join("\n")
+    assert_swap_kill(
+        &outcome,
+        &logs.text(),
+        cap(16 * MIB),
+        128 * MIB,
+        &seen.join("\n"),
     );
+    drop(logs);
     assert!(took < Duration::from_secs(20), "killed after {took:?}");
     println!("killed {took:?} after the start: {outcome:?}");
     cell.assert_clean(1);
