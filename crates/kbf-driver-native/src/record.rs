@@ -17,6 +17,10 @@
 //! time, writes the record and only then sends the go byte. A daemon that dies before
 //! that leaves a child that never runs the program: it reads end-of-file, or sees its
 //! parent change, and exits. The child then execs the program itself ([`Exec`]).
+//!
+//! Between the record and the go byte the daemon also starts the action's keeper in the
+//! child's group ([`crate::keeper`]), which ends the group if the daemon dies; a keeper
+//! that cannot be started is a refusal, like a record that cannot be written.
 
 use std::collections::BTreeMap;
 use std::ffi::{CString, OsStr};
@@ -29,6 +33,7 @@ use std::sync::atomic::{AtomicI32, Ordering};
 
 use tokio::process::{Child, Command};
 
+use crate::keeper::Keeper;
 use crate::procs;
 
 /// The directory under the scratch root that holds the run records.
@@ -210,6 +215,14 @@ struct Gated {
     exec: Exec,
 }
 
+/// A spawned action: its leader, the leader's pid (the group id) and its keeper.
+#[derive(Debug)]
+pub struct Spawned {
+    pub child: Child,
+    pub pid: i32,
+    pub keeper: Keeper,
+}
+
 /// A command whose program runs only once its run record is written.
 #[derive(Debug)]
 pub struct Gate {
@@ -238,13 +251,13 @@ impl Gate {
         Self { child }
     }
 
-    /// Spawns `command` once, writing `record` (the run's record file) after the fork
-    /// and before the program runs. Returns the child and its pid.
+    /// Spawns `command` once, writing `record` (the run's record file) and starting
+    /// the keeper after the fork and before the program runs.
     ///
     /// # Errors
-    /// The spawn failed, or the record could not be written (then the program never
-    /// ran). The record is removed on every error.
-    pub fn spawn(&self, command: &mut Command, record: &Path) -> io::Result<(Child, i32)> {
+    /// The spawn failed, or the record could not be written or the keeper started
+    /// (then the program never ran). The record is removed on every error.
+    pub fn spawn(&self, command: &mut Command, record: &Path) -> io::Result<Spawned> {
         let spawned = self.attempt(command, record);
         // The attempt's descriptors are closed now: a spawn that bypasses the gate fails.
         let c = &self.child;
@@ -257,7 +270,7 @@ impl Gate {
         spawned
     }
 
-    fn attempt(&self, command: &mut Command, record: &Path) -> io::Result<(Child, i32)> {
+    fn attempt(&self, command: &mut Command, record: &Path) -> io::Result<Spawned> {
         let (pid_read, pid_write) = io::pipe()?;
         let (go_read, go_write) = io::pipe()?;
         let c = &self.child;
@@ -272,19 +285,19 @@ impl Gate {
             drop((pid_write, go_read));
             let recorded = recorder.join().map_err(recorder_panicked).and_then(|r| r);
             // A child refused for want of its record failed for the recorder's reason.
-            let (child, recorded) = recorder_first(child, recorded)?;
+            let (child, (recorded, keeper)) = recorder_first(child, recorded)?;
             // A child that has not been waited for always has its pid.
             let pid = child.id().and_then(|pid| i32::try_from(pid).ok());
             let pid = pid.ok_or(io::Error::other("the child has no pid"))?;
             same_child(recorded, pid)?;
-            Ok((child, pid))
+            Ok(Spawned { child, pid, keeper })
         })
     }
 }
 
 /// The spawned child and the pid its record names; the recorder's error first when the
 /// child was refused (ECANCELED) for want of the record, as on a full disk.
-fn recorder_first(child: io::Result<Child>, recorded: io::Result<i32>) -> io::Result<(Child, i32)> {
+fn recorder_first<R>(child: io::Result<Child>, recorded: io::Result<R>) -> io::Result<(Child, R)> {
     match (child, recorded) {
         (Err(e), Err(why)) if e.raw_os_error() == Some(libc::ECANCELED) => Err(why),
         (child, recorded) => Ok((child?, recorded?)),
@@ -307,23 +320,24 @@ fn recorder_panicked(_: Box<dyn std::any::Any + Send>) -> io::Error {
     io::Error::other("the run recorder panicked")
 }
 
-/// The parent's half: reads the child's pid and writes its record, then sends the
-/// child the go byte, 1 if the record was written and 0 if not. A refusal is sent, not
-/// left to end-of-file: a sibling forked meanwhile can hold the pipe open until it
-/// execs, and two siblings refused at once would each wait on the other.
-/// Returns the pid the record names.
+/// The parent's half: reads the child's pid, writes its record and starts its keeper
+/// in its group, then sends the child the go byte, 1 if both were done and 0 if not. A
+/// refusal is sent, not left to end-of-file: a sibling forked meanwhile can hold the
+/// pipe open until it execs, and two siblings refused at once would each wait on the
+/// other. Returns the pid the record names, and the keeper.
 fn write_record(
     pid_read: io::PipeReader,
     mut go_write: io::PipeWriter,
     record: &Path,
-) -> io::Result<i32> {
-    let recorded = record_child(pid_read, record);
-    let sent = go_write.write_all(&[u8::from(recorded.is_ok())]);
-    sent.and(recorded)
+) -> io::Result<(i32, Keeper)> {
+    let kept = record_child(pid_read, record).and_then(|pid| Ok((pid, Keeper::join(pid)?)));
+    let sent = go_write.write_all(&[u8::from(kept.is_ok())]);
+    sent.and(kept)
 }
 
-/// Reads the child's pid and writes its record: a new file, mode 0600, never through a
-/// symlink (`O_NOFOLLOW` and `O_EXCL`). Returns the pid.
+/// Reads the child's pid, makes the child the leader of a process group of its own, and
+/// writes its record: a new file, mode 0600, never through a symlink (`O_NOFOLLOW` and
+/// `O_EXCL`). Returns the pid.
 fn record_child(mut pid_read: io::PipeReader, record: &Path) -> io::Result<i32> {
     use std::os::unix::fs::OpenOptionsExt as _;
     let mut pid = [0_u8; 4];
@@ -331,6 +345,18 @@ fn record_child(mut pid_read: io::PipeReader, record: &Path) -> io::Result<i32> 
     let pid = i32::from_ne_bytes(pid);
     let child = procs::process(pid)
         .ok_or_else(|| io::Error::other(format!("the child {pid} is not in the process table")))?;
+    // The keeper joins the child's group before the go byte, and the standard
+    // library's own `process_group` step comes only after the child's pre-exec steps,
+    // so the group is made here, as a shell makes a job's: by the parent, for a child
+    // that has not exec'd (it waits for the go byte).
+    // SAFETY: setpgid(2) with plain integers.
+    if unsafe { libc::setpgid(pid, pid) } != 0 {
+        let e = io::Error::last_os_error();
+        return Err(io::Error::new(
+            e.kind(),
+            format!("make the child {pid} lead a process group: {e}"),
+        ));
+    }
     let line = Record {
         pgid: pid,
         start: child.start,
@@ -548,8 +574,15 @@ mod tests {
             [("A", "first"), ("B", "b"), ("A", "a")].map(|(n, v)| (OsStr::new(n), OsStr::new(v)));
         let gate = Gate::install(&mut command, Exec::new(program, args, env).expect("exec"));
         for _ in 0..2 {
-            let (child, pid) = gate.spawn(&mut command, &record).expect("spawn");
+            let Spawned { child, pid, keeper } = gate.spawn(&mut command, &record).expect("spawn");
             let start = procs::process(pid).expect("the child").start;
+            let keeper_pid = i32::try_from(keeper.pid()).expect("pid");
+            // SAFETY: getpgid takes a plain integer.
+            assert_eq!(
+                unsafe { libc::getpgid(keeper_pid) },
+                pid,
+                "the keeper's group"
+            );
             let out = child.wait_with_output().await.expect("wait");
             assert!(out.status.success(), "{out:?}");
             let boot = boot_id().expect("boot");
@@ -573,6 +606,31 @@ mod tests {
         }
         assert!(Exec::new(program, [OsStr::new("a\0b")], []).is_err());
         assert!(Exec::new(program, [], [(OsStr::new("A"), OsStr::new("\0"))]).is_err());
+    }
+
+    /// Catches (issue #155) a gated action that outlives its daemon: once the daemon's
+    /// end of the keeper's pipe closes, as at the daemon's death, the program (a
+    /// `sleep 300` that is the group's leader) is killed.
+    #[tokio::test]
+    async fn a_spawned_action_dies_with_its_daemon() {
+        let dir = dir("keeper");
+        let (mut command, gate) = gated(Path::new("/bin/sleep"), &[Path::new("300")]);
+        let Spawned {
+            mut child,
+            mut keeper,
+            ..
+        } = gate
+            .spawn(&mut command, &dir.join("lease-1-1"))
+            .expect("spawn");
+        keeper.orphan();
+        let waited = tokio::time::timeout(std::time::Duration::from_secs(10), child.wait()).await;
+        // A red run must not leave the sleep behind (a no-op once it was reaped).
+        let _ = child.start_kill();
+        let status = waited
+            .expect("the action outlived its daemon")
+            .expect("wait");
+        use std::os::unix::process::ExitStatusExt as _;
+        assert_eq!(status.signal(), Some(libc::SIGKILL), "{status}");
     }
 
     /// Catches a program that runs although its record could not be written, a failed
@@ -620,6 +678,27 @@ mod tests {
             .expect_err("no executable");
         assert_eq!(error.raw_os_error(), Some(libc::ENOEXEC), "{error}");
         assert!(!marker.exists(), "run through /bin/sh");
+    }
+
+    /// Catches a recorder that writes a record, and lets the program run, for a child
+    /// it could not make lead a group of its own: the keeper could not join it. Here
+    /// the "child" is this process's parent, which it may not move (ESRCH).
+    #[test]
+    fn a_child_that_cannot_lead_a_group_gets_no_record() {
+        let dir = dir("ungrouped");
+        let record = dir.join("lease-1-1");
+        let (pid_read, mut pid_write) = io::pipe().expect("pipe");
+        let (mut go_read, go_write) = io::pipe().expect("pipe");
+        // SAFETY: getppid takes nothing and cannot fail.
+        let parent = unsafe { libc::getppid() };
+        pid_write.write_all(&parent.to_ne_bytes()).expect("pid");
+        let error = write_record(pid_read, go_write, &record).expect_err("not a child");
+        let says = format!("make the child {parent} lead a process group: ");
+        assert!(error.to_string().starts_with(&says), "{error}");
+        assert!(!record.exists());
+        let mut go = Vec::new();
+        go_read.read_to_end(&mut go).expect("read");
+        assert_eq!(go, [0], "a refusal, not a go byte");
     }
 
     /// Catches a recorder that writes a record for a child it cannot find (the record

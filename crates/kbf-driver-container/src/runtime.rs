@@ -45,6 +45,7 @@ use crate::cgroup::{LeaseCgroup, SwapKill, memory_max, presses_into_swap};
 use crate::image::{
     ImageCheckError, ImageRef, ManifestKind, PROPERTY, manifest_file, manifest_kind,
 };
+use crate::keeper::Keeper;
 use crate::outputs::{OutputLimits, collect_log};
 use crate::podman::{
     CONTAINER_OWNER, ContainerLimits, ContainerSpec, DAEMON_OWNER, Ended, LEASE_PREFIX, Podman,
@@ -277,10 +278,13 @@ impl<C: Cas> PodmanRuntime<C> {
         // `actions/`'s own OOM count before the lease, to say afterwards whether its
         // limit killed the lease.
         lease.backstop_ooms = lease.cgroup.parent_ooms().ok();
-        lease
-            .cgroup
-            .create(work.resources)
+        // The keeper, before anything runs in the cgroup: it kills the cgroup if the
+        // daemon dies.
+        let kill = lease.cgroup.dir().join("cgroup.kill");
+        let keeper = (lease.cgroup.create(work.resources))
+            .and_then(|()| Keeper::watch(&kill))
             .map_err(|e| failed(lease.cgroup.dir(), &e))?;
+        lease.keeper = Some(keeper);
 
         let spec = ContainerSpec {
             name: lease.name.clone(),
@@ -644,6 +648,9 @@ struct Lease {
     created: bool,
     /// `podman start --attach`, once started. Reaped before anything is removed.
     start: Option<Child>,
+    /// Kills the lease cgroup if the daemon dies, once the cgroup is made. Removed
+    /// last, once the lease is cleaned.
+    keeper: Option<Keeper>,
     /// Whether cleaning is still owed.
     armed: bool,
 }
@@ -667,6 +674,7 @@ impl Lease {
             name,
             created: false,
             start: None,
+            keeper: None,
             armed: true,
         }
     }
@@ -720,6 +728,7 @@ impl Lease {
                 errors.push(format!("{} still exists after cleaning", left.display()));
             }
         }
+        drop(self.keeper.take());
         if errors.is_empty() {
             Ok(())
         } else {
