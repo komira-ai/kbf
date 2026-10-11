@@ -6,8 +6,16 @@ the worker profile that
 (sections 2, 3 and 5) describes. It is one POSIX `sh` script that runs only programs
 macOS ships, over a profile of `KEY=VALUE` lines that it parses and never sources.
 The crate [kbf-mac-provision](../../crates/kbf-mac-provision) is its Rust port: it
-implements `check` and `print` over the same profile, and is tested against a fake Mac
-in `cargo test`; `apply` and `restart` are still only in this script.
+implements `check`, `apply`, `print` and `restart` over the same profile, and is tested
+against a fake Mac in `cargo test`. Where the port differs:
+
+- `appstore_auto_update` also reads and sets the older
+  `/Library/Preferences/com.apple.commerce` `AutoUpdate`.
+- Before its first change to a `power_*`, `updates_*` or `appstore_auto_update` setting,
+  `apply` records every one of those settings as it found them in
+  `/var/db/kbf-mac-provision/settings.before` (root's, mode 600) and keeps that file on
+  later runs. `kbf-mac-provision revert` (root) puts back each recorded value that
+  differs, deleting a preference that was not set, and moves the record aside.
 
 ```text
 kbf-mac-provision check   --profile FILE [--keys K,K]   # one PASS/FAIL line per item; exit 1 on any FAIL

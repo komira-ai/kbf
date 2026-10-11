@@ -18,7 +18,7 @@ path = "src/main.rs"
 [dependencies]
 clap.workspace = true
 hex.workspace = true
-rustix = { workspace = true, features = ["process"] }
+rustix = { workspace = true, features = ["fs", "process"] }
 sha2.workspace = true
 thiserror.workspace = true
 

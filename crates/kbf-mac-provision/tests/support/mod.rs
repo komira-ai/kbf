@@ -8,7 +8,7 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io;
+use std::io::{self, Write as _};
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -24,6 +24,7 @@ pub const PLIST: &str = "/Library/LaunchDaemons/org.example.kbf-daemon.plist";
 pub const DROPIN: &str = "/etc/ssh/sshd_config.d/000-kbf.conf";
 pub const ERR_LOG: &str = "/Library/Logs/kbf/kbf-daemon.err.log";
 pub const SOFTWARE_UPDATE: &str = "/Library/Preferences/com.apple.SoftwareUpdate";
+pub const COMMERCE: &str = "/Library/Preferences/com.apple.commerce";
 pub const LOGINWINDOW: &str = "/Library/Preferences/com.apple.loginwindow";
 pub const INTENT: &str = "/var/db/kbf-mac-session/session-intent";
 
@@ -72,6 +73,8 @@ pub struct State {
     pub xcode_select: Option<String>,
     /// Owners `lstat` reports for paths on the Mac, over the file's real one.
     pub owners: BTreeMap<String, (u32, u32)>,
+    /// `launchctl bootstrap` fails, as for a job that will not load.
+    pub bootstrap_fails: bool,
 }
 
 impl State {
@@ -110,7 +113,8 @@ impl State {
 /// A fake Mac: [`State`] plus a scratch directory as its `/`.
 pub struct FakeMac {
     pub root: String,
-    pub state: State,
+    /// The programs' state; the programs `apply` runs change it.
+    pub state: RefCell<State>,
     pub log: RefCell<Vec<String>>,
     /// The test profile, made when the Mac is: a drift of the files it pins (an Xcode
     /// `.xip`, the probe) does not change it.
@@ -164,7 +168,7 @@ impl FakeMac {
         state.attr("/Groups/admin", "GroupMembership", "root farmadmin");
         let mac = Self {
             root: root.to_str().unwrap().to_owned(),
-            state,
+            state: RefCell::new(state),
             log: RefCell::new(Vec::new()),
             profile: String::new(),
         };
@@ -189,7 +193,7 @@ impl FakeMac {
     /// A fresh Mac with every item of [`Self::profile`] as `apply` leaves it.
     pub fn converged(name: &str) -> Self {
         let mut mac = Self::fresh(name);
-        let s = &mut mac.state;
+        let s = mac.state.get_mut();
         for n in ["HostName", "LocalHostName", "ComputerName"] {
             s.scutil.insert(n.into(), "kbf-mac-07".into());
         }
@@ -223,6 +227,7 @@ impl FakeMac {
         ] {
             s.default_set(SOFTWARE_UPDATE, k, v);
         }
+        s.default_set(COMMERCE, "AutoUpdate", "0");
         s.firewall = "1".into();
         s.time_server = "time.example.net".into();
         s.xcode_select = Some("/Applications/Xcode-27.0.app/Contents/Developer".into());
@@ -276,8 +281,13 @@ impl FakeMac {
         fs::set_permissions(self.path(path), fs::Permissions::from_mode(mode)).unwrap();
     }
 
+    /// The programs' state, to set up a test.
+    pub fn state_mut(&mut self) -> &mut State {
+        self.state.get_mut()
+    }
+
     pub fn own(&mut self, path: &str, uid: u32, gid: u32) {
-        self.state.owners.insert(path.into(), (uid, gid));
+        self.state.get_mut().owners.insert(path.into(), (uid, gid));
     }
 
     /// A symbolic link at `path` to `target` (a path on this machine).
@@ -363,8 +373,114 @@ impl FakeMac {
         path.strip_prefix(self.root.as_str()).unwrap_or(path)
     }
 
+    /// The answer of a program that changes the Mac, having changed the fake's state;
+    /// `None` if the fake has none for these arguments. `dir` is the directory it runs
+    /// in, a path on the Mac.
+    fn change(&self, name: &str, args: &[&str], dir: Option<&str>) -> Option<(bool, String)> {
+        let mut s = self.state.borrow_mut();
+        let done = |success: bool| Some((success, String::new()));
+        let bit = |word: &str| {
+            if word == "true" || word == "on" {
+                "1"
+            } else {
+                "0"
+            }
+        };
+        match (name, args) {
+            ("pmset", ["-a", key, value]) => {
+                s.pmset_set(key, value);
+                done(true)
+            }
+            ("defaults", ["write", domain, key, "-bool", value @ ("true" | "false")]) => {
+                let domain = self.strip_root(domain).to_owned();
+                s.default_set(&domain, key, bit(value));
+                done(true)
+            }
+            ("defaults", ["delete", domain, key]) => {
+                let at = (self.strip_root(domain).to_owned(), (*key).to_owned());
+                done(s.defaults.remove(&at).is_some())
+            }
+            ("scutil", ["--set", n, value]) => {
+                s.scutil.insert((*n).into(), (*value).into());
+                done(true)
+            }
+            ("systemsetup", ["-f", "-setremotelogin", state @ ("on" | "off")]) => {
+                s.remote_login = *state == "on";
+                done(true)
+            }
+            ("systemsetup", ["-setusingnetworktime", state @ ("on" | "off")]) => {
+                s.network_time = *state == "on";
+                done(true)
+            }
+            ("systemsetup", ["-setnetworktimeserver", server]) => {
+                s.time_server = (*server).into();
+                done(true)
+            }
+            ("socketfilterfw", ["--setglobalstate", state @ ("on" | "off")]) => {
+                s.firewall = bit(state).into();
+                done(true)
+            }
+            ("dscl", [".", "-create", record, rest @ ..]) => {
+                s.records.entry((*record).into()).or_default();
+                match rest {
+                    [] => done(true),
+                    [attr, value] => {
+                        s.attr(record, attr, value);
+                        done(true)
+                    }
+                    _ => None,
+                }
+            }
+            ("dscl", [".", "-delete", record, attr]) => {
+                let attrs = s.records.get_mut(*record)?;
+                let before = attrs.len();
+                attrs.retain(|(a, _)| a != attr);
+                done(attrs.len() != before)
+            }
+            ("launchctl", ["bootout", domain]) => done(s.loaded.remove(*domain)),
+            // The label is read from the property list, as launchd reads it.
+            ("launchctl", ["bootstrap", "system", plist]) => {
+                let text = fs::read_to_string(plist).unwrap_or_default();
+                let label = text
+                    .split("<key>Label</key>\n\t<string>")
+                    .nth(1)
+                    .and_then(|rest| rest.split("</string>").next())
+                    .unwrap_or_default();
+                let job = format!("system/{label}");
+                if s.bootstrap_fails || label.is_empty() || s.loaded.contains(&job) {
+                    done(false)
+                } else {
+                    s.loaded.insert(job);
+                    done(true)
+                }
+            }
+            ("xcode-select", ["-s", dir]) => {
+                s.xcode_select = Some((*dir).into());
+                done(true)
+            }
+            ("sntp", ["-sS", _]) => {
+                s.sntp_offset = "+0.000100".into();
+                done(true)
+            }
+            // A fake .xip holds the line "app=NAME.app build=BUILD"; it expands into the
+            // directory it runs in.
+            ("xip", ["--expand", file]) => {
+                let text = fs::read_to_string(file).ok()?;
+                let line = text.lines().next()?;
+                let (app, build) = line.strip_prefix("app=")?.split_once(" build=")?;
+                let plist = self.path(&format!("{}/{app}/Contents/version.plist", dir?));
+                fs::create_dir_all(plist.parent()?).ok()?;
+                fs::write(plist, format!("ProductBuildVersion={build}\n")).ok()?;
+                done(true)
+            }
+            ("xcodebuild", ["-license", "accept"] | ["-runFirstLaunch"]) => done(true),
+            _ => None,
+        }
+    }
+
+    /// The answer of a program that only reads, or `None`.
     fn answer(&self, name: &str, args: &[&str]) -> Option<(bool, String)> {
-        let s = &self.state;
+        let s = self.state.borrow();
         let ok = |text: String| Some((true, text));
         let no = |text: &str| Some((false, text.to_owned()));
         match (name, args) {
@@ -515,21 +631,37 @@ impl FakeMac {
     }
 }
 
+// The file methods change the scratch directory, never through a link, and log each
+// change. They are called through `Host` (`Host::write(&mac, ..)`): `FakeMac`'s own
+// `write`, `mkdir`, `chmod` and `remove` are the tests' setup helpers, which log
+// nothing.
 impl Host for FakeMac {
     fn root(&self) -> &str {
         &self.root
     }
 
     fn euid(&self) -> u32 {
-        self.state.euid
+        self.state.borrow().euid
     }
 
-    fn run(&self, program: &str, args: &[&str]) -> io::Result<Output> {
+    fn run_in(
+        &self,
+        program: &str,
+        args: &[&str],
+        dir: Option<&str>,
+        env: &[(&str, &str)],
+    ) -> io::Result<Output> {
         let name = program.rsplit('/').next().unwrap();
+        let env: String = env.iter().map(|(k, v)| format!("{k}={v} ")).collect();
         self.log
             .borrow_mut()
-            .push(format!("{name} {}", args.join(" ")));
-        match self.answer(name, args) {
+            .push(format!("{env}{name} {}", args.join(" ")));
+        let answer = match dir {
+            None => self.answer(name, args),
+            Some(_) => None,
+        }
+        .or_else(|| self.change(name, args, dir));
+        match answer {
             Some((success, stdout)) => Ok(Output { success, stdout }),
             None => Err(io::Error::new(
                 io::ErrorKind::NotFound,
@@ -540,11 +672,87 @@ impl Host for FakeMac {
 
     fn lstat(&self, path: &str) -> Option<Stat> {
         let mut stat = Stat::of(&fs::symlink_metadata(self.path(path)).ok()?);
-        if let Some(&(uid, gid)) = self.state.owners.get(path) {
+        if let Some(&(uid, gid)) = self.state.borrow().owners.get(path) {
             stat.uid = uid;
             stat.gid = gid;
         }
         Some(stat)
+    }
+
+    fn write(&self, path: &str, bytes: &[u8], mode: u32) -> io::Result<()> {
+        self.log.borrow_mut().push(format!("write {path}"));
+        let p = self.path(path);
+        if p.is_symlink() {
+            return Err(io::Error::other("a link"));
+        }
+        let new = !p.exists();
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&p)?;
+        file.write_all(bytes)?;
+        if new {
+            fs::set_permissions(&p, fs::Permissions::from_mode(mode))?;
+        }
+        Ok(())
+    }
+
+    fn mkdir(&self, path: &str) -> io::Result<()> {
+        self.log.borrow_mut().push(format!("mkdir {path}"));
+        fs::create_dir_all(self.path(path))
+    }
+
+    fn chmod(&self, path: &str, mode: u32) -> io::Result<()> {
+        self.log.borrow_mut().push(format!("chmod {mode:o} {path}"));
+        fs::set_permissions(self.path(path), fs::Permissions::from_mode(mode))
+    }
+
+    /// Records the owner `lstat` reports from now on (the tests do not run as root).
+    fn chown(&self, path: &str, uid: u32, gid: u32) -> io::Result<()> {
+        self.log
+            .borrow_mut()
+            .push(format!("chown {uid}:{gid} {path}"));
+        fs::symlink_metadata(self.path(path))?;
+        self.state
+            .borrow_mut()
+            .owners
+            .insert(path.into(), (uid, gid));
+        Ok(())
+    }
+
+    /// The owner recorded for `from` moves with it, and what was recorded for `to` goes.
+    fn rename(&self, from: &str, to: &str) -> io::Result<()> {
+        self.log.borrow_mut().push(format!("mv {from} {to}"));
+        fs::rename(self.path(from), self.path(to))?;
+        let mut s = self.state.borrow_mut();
+        s.owners.remove(to);
+        if let Some(owner) = s.owners.remove(from) {
+            s.owners.insert(to.into(), owner);
+        }
+        Ok(())
+    }
+
+    /// Removes the path and the owners recorded for it and anything under it.
+    fn remove(&self, path: &str) -> io::Result<()> {
+        self.log.borrow_mut().push(format!("rm {path}"));
+        let p = self.path(path);
+        match fs::symlink_metadata(&p) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e),
+            Ok(m) if m.is_dir() => fs::remove_dir_all(&p)?,
+            Ok(_) => fs::remove_file(&p)?,
+        }
+        let under = format!("{path}/");
+        self.state
+            .borrow_mut()
+            .owners
+            .retain(|k, _| k != path && !k.starts_with(&under));
+        Ok(())
+    }
+
+    fn pause(&self, seconds: u64) {
+        self.log.borrow_mut().push(format!("sleep {seconds}"));
     }
 }
 
@@ -660,4 +868,45 @@ pub fn assert_only_fails(item: &str, drift: fn(&mut FakeMac), text: &str) {
     if let Err(e) = only_fails(&format!("only-{item}"), item, drift, text) {
         panic!("{e}");
     }
+}
+
+pub fn apply_keys(mac: &FakeMac, keys: Option<&str>) -> Report {
+    let path = mac.profile_file(&mac.profile_text());
+    kbf_mac_provision::cli::apply(&path, keys, mac).unwrap()
+}
+
+pub fn apply(mac: &FakeMac) -> Report {
+    apply_keys(mac, None)
+}
+
+/// The value `pmset -g` reports for `key` on the fake.
+pub fn pmset_value(mac: &FakeMac, key: &str) -> Option<String> {
+    let s = mac.state.borrow();
+    s.pmset
+        .iter()
+        .find_map(|(k, v)| (k == key).then(|| v.clone()))
+}
+
+/// The fake's `defaults` value of `domain` and `key`.
+pub fn preference(mac: &FakeMac, domain: &str, key: &str) -> Option<String> {
+    mac.state
+        .borrow()
+        .defaults
+        .get(&(domain.to_owned(), key.to_owned()))
+        .cloned()
+}
+
+/// `lstat` of `path` on the fake, as `ls -ldn`'s fields.
+pub fn ls(mac: &FakeMac, path: &str) -> String {
+    kbf_mac_provision::host::Host::lstat(mac, path).map_or_else(|| "missing".into(), |s| s.ls())
+}
+
+/// The program calls in the log that start with `prefix`.
+pub fn calls(mac: &FakeMac, prefix: &str) -> Vec<String> {
+    mac.log
+        .borrow()
+        .iter()
+        .filter(|c| c.starts_with(prefix))
+        .cloned()
+        .collect()
 }
