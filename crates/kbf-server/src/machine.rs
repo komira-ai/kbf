@@ -380,7 +380,8 @@ mod tests {
         assert_eq!(m.waiters_kept(), 2);
         assert_eq!(m.waiter(ids[3]), Some(&waiter(3)));
         assert_eq!(m.forget_dropped(|_| false), vec![ids[2], ids[3]]);
-        assert!(m.waiters.is_empty() && m.finished.is_empty());
+        assert_eq!(m.waiters_kept(), 0);
+        assert_eq!(m.finished, VecDeque::new());
     }
 
     /// Catches a lookup by name that finds a caller under a name the machine never
