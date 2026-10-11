@@ -1,4 +1,5 @@
-//! The `kbf-server` binary: flags, both stores, the start line, and a clean stop.
+//! The `kbf-server` binary: flags, both stores, both metadata logs, the start line, and a
+//! clean stop.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener};
@@ -181,6 +182,9 @@ fn memory_mode_serves_execution_and_stops_on_interrupt() {
         "{line}"
     );
     assert!(line.contains(" worker=127.0.0.1:"), "{line}");
+    // Catches: the plain-text warning printed on a loopback bind (both listeners here),
+    // where nothing is exposed (scripts would learn to ignore it).
+    assert!(!line.contains(" warning="), "{line}");
     assert!(
         !line.contains(" api="),
         "no operator API unless asked: {line}"
@@ -469,6 +473,113 @@ fn s3_mode_refuses_what_is_missing_or_wrong() {
     assert!(stderr.contains("--s3-prefix"), "{stderr}");
 }
 
+/// A fresh, empty raft directory for `name`, under the target directory.
+fn raft_dir(name: &str) -> std::path::PathBuf {
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join("kbf-server-binary")
+        .join(format!("{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    dir
+}
+
+/// A `--store=s3 --meta-log=raft` server over `dir` (the store does no I/O until used).
+fn raft_server(dir: &std::path::Path) -> Command {
+    raft_server_on(dir, &ANY_PORT)
+}
+
+/// [`raft_server`] with the listener flags `listen` instead of [`ANY_PORT`].
+fn raft_server_on(dir: &std::path::Path, listen: &[&str]) -> Command {
+    let mut c = with_keys(server(&[
+        "--store",
+        "s3",
+        "--s3-endpoint",
+        "http://127.0.0.1:9",
+        "--s3-bucket",
+        "kbf-test",
+        "--meta-log",
+        "raft",
+        "--raft-dir",
+    ]));
+    c.arg(dir).args(listen);
+    c
+}
+
+/// The ` log=` id of a start line.
+fn log_id(line: &str) -> String {
+    let id = line
+        .split_whitespace()
+        .find_map(|w| w.strip_prefix("log="))
+        .unwrap_or_else(|| panic!("no log= in {line:?}"));
+    assert_eq!(id.len(), 16, "{line}");
+    assert!(id.bytes().all(|b| b.is_ascii_hexdigit()), "{line}");
+    id.to_owned()
+}
+
+/// Catches: `--meta-log=raft` that does not open its log in `--raft-dir`, or that
+/// draws a new log id on every start (two starts over one directory must print the
+/// same `log=`, and two directories two different ones); and a memory start line that
+/// names a log.
+#[cfg(unix)]
+#[test]
+fn raft_mode_keeps_its_log_id_across_starts() {
+    let dir = raft_dir("raft-restart");
+    let (child, line, _) = started(raft_server(&dir));
+    let first = log_id(&line);
+    interrupt(child);
+    assert!(dir.join("log-record").is_file(), "no log record in {dir:?}");
+    let (child, line, _) = started(raft_server(&dir));
+    assert_eq!(log_id(&line), first, "a restart drew a new log id");
+    interrupt(child);
+
+    let (child, line, _) = started(raft_server(&raft_dir("raft-other")));
+    assert_ne!(log_id(&line), first, "two directories, one log id");
+    interrupt(child);
+
+    let mut memory = server(&ANY_PORT);
+    memory.args(["--meta-log", "memory"]);
+    let (child, line, _) = started(memory);
+    assert!(!line.contains("log="), "{line}");
+    interrupt(child);
+}
+
+/// Catches: `--meta-log=raft` accepted with `--store=memory` (a durable index over
+/// blobs that die with the process would report them present after a restart), or
+/// without `--raft-dir`; a `--raft-dir` that is ignored under `--meta-log=memory`; and
+/// a raft directory holding someone else's files taken as a new log. Each exits 2 and
+/// says why.
+#[test]
+fn raft_mode_refuses_what_it_cannot_keep() {
+    let dir = raft_dir("raft-refused");
+    let dir_arg = dir.to_str().expect("a UTF-8 path");
+    let mut c = server(&["--meta-log", "raft", "--raft-dir", dir_arg]);
+    c.args(ANY_PORT);
+    let (code, stderr) = fails(c);
+    assert_eq!(code, Some(2));
+    assert!(
+        stderr.contains("--meta-log=raft needs --store=s3"),
+        "{stderr}"
+    );
+
+    let (code, stderr) = fails(server(&["--meta-log", "raft"]));
+    assert_eq!(code, Some(2));
+    assert!(stderr.contains("--raft-dir"), "{stderr}");
+
+    let mut c = server(&["--raft-dir", dir_arg]);
+    c.args(ANY_PORT);
+    let (code, stderr) = fails(c);
+    assert_eq!(code, Some(2));
+    assert!(
+        stderr.contains("--raft-dir is read only with --meta-log=raft"),
+        "{stderr}"
+    );
+
+    std::fs::create_dir_all(&dir).expect("a raft dir");
+    std::fs::write(dir.join("stray"), "someone else's").expect("a stray file");
+    let (code, stderr) = fails(raft_server(&dir));
+    assert_eq!(code, Some(2));
+    assert!(stderr.contains("holds files but no log-record"), "{stderr}");
+}
+
 /// Catches: a server that keeps running (or exits 0) when it cannot bind its
 /// listeners or read its TLS files, or that accepts part of a TLS configuration.
 #[test]
@@ -503,6 +614,76 @@ fn startup_failures_exit_2() {
 
     let (code, _) = fails(server(&["--heartbeat-interval-ms", "0"]));
     assert_eq!(code, Some(2), "a zero heartbeat interval accepted");
+}
+
+/// Catches: a plain-text listener on an address other machines reach refused (or
+/// stopped) instead of started; a start line without the warning, with it twice, or
+/// naming the wrong listener; and a plain-text REAPI listener off loopback that binds
+/// but does not answer. `0.0.0.0` stands for any address that is not loopback (the unit
+/// tests of `loopback_only` cover the others).
+#[cfg(unix)]
+#[test]
+fn a_plain_text_listener_off_loopback_starts_and_serves_with_one_warning() {
+    for (reapi, worker, warned) in [
+        ("0.0.0.0:0", "127.0.0.1:0", "reapi"),
+        ("127.0.0.1:0", "0.0.0.0:0", "worker"),
+        ("0.0.0.0:0", "0.0.0.0:0", "reapi,worker"),
+    ] {
+        let (child, line, bound) = started(server(&["--listen", reapi, "--worker-listen", worker]));
+        let want = format!(" warning=plaintext-off-loopback:{warned}");
+        assert!(
+            line.ends_with(&want),
+            "want {want:?} at the end of {line:?}"
+        );
+        assert_eq!(line.matches("warning=").count(), 1, "{line}");
+        let local = SocketAddr::from(([127, 0, 0, 1], bound.port()));
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime")
+            .block_on(async {
+                CapabilitiesClient::connect(format!("http://{local}"))
+                    .await
+                    .expect("connect in plain text")
+                    .get_capabilities(GetCapabilitiesRequest::default())
+                    .await
+                    .expect("GetCapabilities");
+            });
+        interrupt(child);
+    }
+}
+
+/// Catches: a start line under `--meta-log=raft` that drops the plain-text warning, or
+/// prints it before ` log=` instead of at the very end (the two fields came from two
+/// branches that each tested its own alone).
+#[cfg(unix)]
+#[test]
+fn a_raft_start_line_names_the_log_then_the_plain_text_warning() {
+    let listen = ["--listen", "127.0.0.1:0", "--worker-listen", "0.0.0.0:0"];
+    let c = raft_server_on(&raft_dir("raft-plain-text"), &listen);
+    let (child, line, _) = started(c);
+    let id = log_id(&line);
+    let want = format!(" log={id} warning=plaintext-off-loopback:worker");
+    assert!(
+        line.ends_with(&want),
+        "want {want:?} at the end of {line:?}"
+    );
+    interrupt(child);
+}
+
+/// Catches: the removed `--reapi-plaintext-bind` escape still accepted (silently or as
+/// a no-op), so a script written for the old guard keeps passing a flag that means
+/// nothing. clap's unknown-flag error exits 2 and names it.
+#[test]
+fn the_reapi_plaintext_bind_flag_is_gone() {
+    let mut c = server(&ANY_PORT);
+    c.arg("--reapi-plaintext-bind");
+    let (code, stderr) = fails(c);
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(
+        stderr.contains("unexpected argument '--reapi-plaintext-bind'"),
+        "{stderr}"
+    );
 }
 
 /// Catches: a `--reapi-auth-policy` the binary does not run on its REAPI listener, and

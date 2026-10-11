@@ -178,6 +178,9 @@ are how that cost is paid.
 [tools/mac-provision](../../tools/mac-provision/README.md), which lists every key it
 applies and checks. It is not yet in the per-commit tarball, and it adds a `restart`
 verb (section 5.7) and `--keys` to the three below.
+A Rust port, the crate [kbf-mac-provision](../../crates/kbf-mac-provision), implements
+`check` and `print` with the same profile format, item names, report lines and exit
+statuses; `apply` and `restart` are still only in the script.
 
 `kbf-mac-provision` is one POSIX `sh` script, shipped in the same tarball as
 `kbf-daemon` (section 4):

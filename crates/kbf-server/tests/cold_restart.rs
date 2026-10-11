@@ -2,10 +2,13 @@
 //! process stopped, a new one over the same bucket with nothing of the old one's
 //! memory (issue #156, items 4 and 6).
 //!
-//! These tests pin what is lost, not what should be: the action cache, the CAS index,
-//! cordons and drains are in memory, so a restart forgets them, and every start logs a
-//! warning that says so. A change that makes any of it durable turns the matching
-//! assertion red and must flip it in the same change.
+//! These tests pin what is lost, not what should be. Under the default
+//! `--meta-log=memory` the action cache and the CAS index are in memory, so a restart
+//! forgets them; under `--meta-log=raft` ([`Cell::start_raft`]) they are kept, along
+//! with the log id and the object key prefix. Cordons and drains are in memory in both
+//! modes, so a restart forgets them, and every start logs a warning that says so. A
+//! change that makes any of it durable turns the matching assertion red and must flip
+//! it in the same change.
 
 mod support;
 
@@ -84,6 +87,85 @@ async fn a_cold_restart_forgets_the_action_cache_and_the_cas_index() {
         assert_eq!(now.get(key), Some(bytes), "object {key} changed");
     }
     assert!(now.len() > written.len(), "the new process wrote no object");
+}
+
+/// The same restart under `--meta-log=raft`: the new process reopens the Raft log the
+/// old one left.
+///
+/// Catches: a restart that draws a new log id (it commits a second `Bootstrap`, or
+/// refuses its own log); one that writes under a start-time prefix instead of the
+/// log's `kbf/<log id>/`; farm time that starts again from zero (the process clock)
+/// instead of the committed farm time; and a log that does not keep the action cache
+/// and the CAS index (the cache misses, FindMissingBlobs reports blobs missing).
+/// The new process writes in a new epoch, so it replaces none of the old objects.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cold_restart_under_the_raft_log_keeps_the_action_cache_and_the_cas_index() {
+    let before = Cell::start_raft().await;
+    let (log_id, prefix) = (before.raft_log().log_id(), before.raft_log().store_prefix());
+    assert_eq!(prefix.as_str(), format!("kbf/{log_id}/"));
+    assert_eq!(before.raft_log().bootstraps(), 1);
+    let mut daemon = before.daemon("node-a", 4, 8).await;
+    let job = Job::new("before the raft restart", &[]);
+    before.upload(&job.blobs()).await;
+    let mut ops = before.execute(&job.action).await;
+    let start = daemon.start().await;
+    let result = output(&before, "ran before the raft restart", 0).await;
+    assert!(daemon.report(ran(start.lease_id, &result)).await.accepted);
+    assert_eq!(response(&done(&mut ops).await).result, Some(result.clone()));
+    assert_eq!(before.cached(&job.action).await, Ok(result.clone()));
+    let farm_time = before.raft_log().tick().expect("a tick");
+    let written = before.store.objects().await;
+    assert!(!written.is_empty(), "the old process wrote no object");
+    let old_cache = Arc::downgrade(&before.cache);
+
+    let after = before.cold_restart().await;
+
+    daemon.closed().await;
+    drop(ops);
+    let deadline = tokio::time::Instant::now() + PROMPT;
+    while old_cache.strong_count() > 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the old process's cache is still held"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let log = after.raft_log();
+    assert_eq!(log.log_id(), log_id, "the restart changed the log id");
+    assert_eq!(log.bootstraps(), 1, "a second Bootstrap was committed");
+    assert_eq!(log.store_prefix(), prefix, "the restart changed the prefix");
+    assert!(
+        log.now() >= farm_time,
+        "farm time went back across the restart"
+    );
+    assert_eq!(
+        after.cached(&job.action).await,
+        Ok(result),
+        "the action-cache entry was lost in the restart"
+    );
+    for blob in job.blobs() {
+        assert!(after.holds(blob).await, "{:?} was lost", blob.proto);
+    }
+
+    let mut daemon = after.daemon("node-a", 4, 8).await;
+    let job = Job::new("after the raft restart", &[]);
+    after.upload(&job.blobs()).await;
+    let mut ops = after.execute(&job.action).await;
+    let start = daemon.start().await;
+    let result = output(&after, "ran after the raft restart", 0).await;
+    assert!(daemon.report(ran(start.lease_id, &result)).await.accepted);
+    assert_eq!(response(&done(&mut ops).await).result, Some(result));
+    let now = after.store.objects().await;
+    for (key, bytes) in &written {
+        assert_eq!(now.get(key), Some(bytes), "object {key} changed");
+    }
+    assert!(now.len() > written.len(), "the new process wrote no object");
+    for key in now.keys() {
+        assert!(
+            key.starts_with(prefix.as_str()),
+            "{key} is outside {prefix:?}"
+        );
+    }
 }
 
 /// Catches a start that does not say its scheduler state starts empty (the warning

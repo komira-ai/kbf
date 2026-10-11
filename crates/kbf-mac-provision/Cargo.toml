@@ -1,0 +1,26 @@
+[package]
+name = "kbf-mac-provision"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# Checks a Mac node's host settings and worker profile against a profile file
+# (docs/design/mac-node-provisioning.md, sections 2, 3 and 5): the Rust port of
+# tools/mac-provision/kbf-mac-provision. It builds everywhere, so every item is tested
+# against a fake Mac on every CI runner; it reads a real Mac only on macOS.
+[[bin]]
+name = "kbf-mac-provision"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+hex.workspace = true
+rustix = { workspace = true, features = ["process"] }
+sha2.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

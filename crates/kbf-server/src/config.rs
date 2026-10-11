@@ -2,8 +2,8 @@
 //! the standard S3 key pair, `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` (a secret
 //! never goes on the command line).
 
-use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::net::{IpAddr, SocketAddr};
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use clap::{Parser, ValueEnum};
@@ -33,9 +33,20 @@ pub enum Role {
 pub enum StoreKind {
     /// In this process; gone when it exits.
     Memory,
-    /// An S3 bucket (MinIO, RustFS). The index is still in memory, so a restart
-    /// forgets every blob; each start writes under a fresh key prefix.
+    /// An S3 bucket (MinIO, RustFS). Under `--meta-log=memory` the index is in
+    /// memory, so a restart forgets every blob, and each start writes under a fresh
+    /// key prefix; under `--meta-log=raft` a restart keeps them.
     S3,
+}
+
+/// Where the metadata (the CAS index and the action cache) is kept.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum MetaLogKind {
+    /// In this process; a restart forgets it.
+    Memory,
+    /// A single-voter Raft log in `--raft-dir` ([`crate::raft_log`]); a restart keeps
+    /// it. Needs `--store=s3`: the bytes it indexes must outlive the process too.
+    Raft,
 }
 
 /// `kbf-server` flags.
@@ -52,8 +63,16 @@ pub struct Args {
     /// Where blob bytes are stored.
     #[arg(long, value_enum, default_value = "memory")]
     pub store: StoreKind,
+    /// Where the metadata (the CAS index and the action cache) is kept.
+    #[arg(long, value_enum, default_value = "memory")]
+    pub meta_log: MetaLogKind,
+    /// The directory of the Raft log (`--meta-log=raft`), on a local disk; created if
+    /// missing. An empty directory gets a new log with a new id; every later start
+    /// over it reads the id from the directory.
+    #[arg(long, required_if_eq("meta_log", "raft"))]
+    pub raft_dir: Option<PathBuf>,
     /// The REAPI listener. Without `--reapi-tls-cert` and `--reapi-tls-key` it serves
-    /// plain text, which is meant for a loopback bind behind a front on the same host.
+    /// plain text, on any address; off loopback the start line carries a warning.
     #[arg(long, default_value = "127.0.0.1:8980")]
     pub listen: SocketAddr,
     /// PEM certificate (chain) of the REAPI listener. With `--reapi-tls-key` it serves
@@ -74,7 +93,9 @@ pub struct Args {
     /// worker listener and the operator API do not read it.
     #[arg(long)]
     pub reapi_auth_policy: Option<PathBuf>,
-    /// The `kbf.worker.v1` listener.
+    /// The `kbf.worker.v1` listener. Without mutual TLS (`--worker-tls-cert`,
+    /// `--worker-tls-key`, `--worker-client-ca`) it serves plain text, on any address;
+    /// off loopback the start line carries a warning.
     #[arg(long, default_value = "127.0.0.1:8981")]
     pub worker_listen: SocketAddr,
     /// The operator API listener (HTTP/JSON under `/v1`). Off unless given. Reads are
@@ -149,7 +170,10 @@ pub struct Args {
     /// The signing region.
     #[arg(long, default_value = "us-east-1")]
     pub s3_region: String,
-    /// The key prefix; each start writes under `<prefix><start time>/`.
+    /// The key prefix. Under `--meta-log=memory` each start writes under
+    /// `<prefix><start time>/`; under `--meta-log=raft` every start writes under
+    /// `<prefix><log id>/`, fixed when the log is created (a later start with another
+    /// prefix is refused).
     #[arg(long, default_value = "kbf/")]
     pub s3_prefix: String,
     /// The store refuses to overwrite a key (MinIO and RustFS do).
@@ -189,6 +213,14 @@ pub enum ConfigError {
         #[source]
         source: std::io::Error,
     },
+    /// `--meta-log=raft` with `--store=memory`.
+    #[error(
+        "--meta-log=raft needs --store=s3: a durable index over blobs that die with the process"
+    )]
+    RaftWithoutS3,
+    /// `--raft-dir` without `--meta-log=raft`.
+    #[error("--raft-dir is read only with --meta-log=raft")]
+    RaftDirUnused,
     /// The REAPI policy file is not a policy.
     #[error("--reapi-auth-policy: {path}: {source}")]
     Policy {
@@ -242,6 +274,21 @@ impl Args {
         })
     }
 
+    /// The listeners that serve plain text on an address that is not loopback, as the
+    /// binary's start-line warning names them: `reapi` (no `--reapi-tls-cert`), then
+    /// `worker` (no `--worker-tls-cert`). Empty when every plain-text listener is on
+    /// loopback. Nothing refuses such a bind; whether plain text is acceptable on that
+    /// network is the operator's call.
+    #[must_use]
+    pub fn plain_text_off_loopback(&self) -> Vec<&'static str> {
+        let reapi = self.reapi_tls_cert.is_none() && !loopback_only(self.listen.ip());
+        let worker = self.worker_tls_cert.is_none() && !loopback_only(self.worker_listen.ip());
+        [("reapi", reapi), ("worker", worker)]
+            .into_iter()
+            .filter_map(|(name, plain)| plain.then_some(name))
+            .collect()
+    }
+
     /// The REAPI listener's policy: the file `--reapi-auth-policy` names, or
     /// [`Policy::allow_all`] without it.
     ///
@@ -278,8 +325,24 @@ impl Args {
         Ok(Some(Api { listen, token }))
     }
 
-    /// The S3 store and the key prefix of this start, for `--store=s3`. `env` reads
-    /// an environment variable (the S3 key pair).
+    /// The raft directory under `--meta-log=raft`; `None` under `--meta-log=memory`.
+    ///
+    /// # Errors
+    /// [`ConfigError::RaftWithoutS3`] for `--meta-log=raft --store=memory`, and
+    /// [`ConfigError::RaftDirUnused`] for a `--raft-dir` under `--meta-log=memory`.
+    pub fn raft_dir(&self) -> Result<Option<&Path>, ConfigError> {
+        match (self.meta_log, self.store, self.raft_dir.as_deref()) {
+            (MetaLogKind::Memory, _, None) => Ok(None),
+            (MetaLogKind::Memory, _, Some(_)) => Err(ConfigError::RaftDirUnused),
+            (MetaLogKind::Raft, StoreKind::Memory, _) => Err(ConfigError::RaftWithoutS3),
+            // clap requires `--raft-dir` with `--meta-log=raft`.
+            (MetaLogKind::Raft, StoreKind::S3, dir) => Ok(dir),
+        }
+    }
+
+    /// The S3 store and the key prefix of this start, `<prefix><start time>/` (the
+    /// one `--meta-log=memory` writes under), for `--store=s3`. `env` reads an
+    /// environment variable (the S3 key pair).
     ///
     /// # Errors
     /// A flag or the key pair is missing, or the configuration is refused.
@@ -312,9 +375,69 @@ impl Args {
     }
 }
 
+/// Whether a listener bound to `ip` is reachable only from this host: a loopback
+/// address, an IPv4-mapped one (`::ffff:127.0.0.1`) included. A wildcard (`0.0.0.0`,
+/// `::`) and every other address can be reached from other machines.
+#[must_use]
+pub fn loopback_only(ip: IpAddr) -> bool {
+    ip.to_canonical().is_loopback()
+}
+
 fn read(path: &PathBuf) -> Result<Vec<u8>, ConfigError> {
     std::fs::read(path).map_err(|source| ConfigError::Read {
         path: path.clone(),
         source,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::{Args, loopback_only};
+
+    /// Catches: a `loopback_only` that knows only wildcards (`is_unspecified`), so one
+    /// interface other machines reach (`192.0.2.10`, a documentation address standing
+    /// in for a LAN or mesh one) counts as loopback; and one that drops `to_canonical`,
+    /// so the IPv4-mapped loopback address does not.
+    #[test]
+    fn only_loopback_addresses_are_loopback_only() {
+        for (ip, want) in [
+            ("127.0.0.1", true),
+            ("::1", true),
+            ("::ffff:127.0.0.1", true),
+            ("0.0.0.0", false),
+            ("::", false),
+            ("192.0.2.10", false),
+        ] {
+            assert_eq!(loopback_only(ip.parse().expect("an address")), want, "{ip}");
+        }
+    }
+
+    /// Catches: a call site in [`Args::plain_text_off_loopback`] that does not go
+    /// through `loopback_only`. One listener is on a single non-loopback interface
+    /// (`192.0.2.10`, which a wildcard-only check such as `is_unspecified` misses) and
+    /// the other on the IPv4-mapped loopback address (`::ffff:127.0.0.1`, which
+    /// `is_loopback` without `to_canonical` misses), each way round, so either
+    /// mistake at either listener changes the list.
+    #[test]
+    fn plain_text_off_loopback_checks_each_listener_through_loopback_only() {
+        for (listen, worker_listen, want) in [
+            ("192.0.2.10:0", "[::ffff:127.0.0.1]:0", vec!["reapi"]),
+            ("[::ffff:127.0.0.1]:0", "192.0.2.10:0", vec!["worker"]),
+        ] {
+            let args = Args::parse_from([
+                "kbf-server",
+                "--listen",
+                listen,
+                "--worker-listen",
+                worker_listen,
+            ]);
+            assert_eq!(
+                args.plain_text_off_loopback(),
+                want,
+                "--listen {listen} --worker-listen {worker_listen}"
+            );
+        }
+    }
 }
