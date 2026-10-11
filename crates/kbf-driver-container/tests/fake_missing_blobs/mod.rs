@@ -1,8 +1,10 @@
 //! How the driver reports an input blob the CAS does not hold, against the stand-in
 //! `podman` (`fixtures/fake-podman.sh`). `docs/design/daemon.md` asks for
 //! `RuntimeError::MissingBlob` with the blob's `hash/size`, which the lease reports as
-//! `FAILED_PRECONDITION` with a `MISSING` violation, so the client uploads the blob and
-//! retries. The native driver already reports it that way.
+//! `FAILED_PRECONDITION` with a `MISSING` violation, the answer that asks a client to
+//! upload the blob and retry. The native driver already reports it that way. (The
+//! server does not forward that violation to the client yet; see
+//! `docs/design/failure-classes.md`.)
 //!
 //! A module of `fake_podman.rs`, not a test binary of its own, for the reason
 //! `fake_memory` gives: the coverage job counts the driver's lines per test binary.
