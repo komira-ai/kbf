@@ -372,12 +372,24 @@ fn nothing_but_the_boot_reset_is_served_before_it() {
         reply(booted.helper.handle(Request::SessionIdle, Vec::new())),
         Reply::Restarting
     );
+    // Logged in again, then a boot: the held session is kept, and said so on the wire.
+    booted.helper.session_login(&lease()).unwrap();
     let booted_again = rebooted(&booted, "gate");
-    let held = Request::BootReset {
+    let held = || Request::BootReset {
         held: vec![lease()],
     };
     assert_eq!(
-        reply(booted_again.helper.handle(held, Vec::new())),
+        reply(booted_again.helper.handle(held(), Vec::new())),
+        Reply::Reset {
+            kept: Some(lease()),
+            deleted: Vec::new()
+        }
+    );
+    // Booted once more, the lease no longer held: its user goes.
+    let last = rebooted(&booted_again, "gate");
+    let reset = Request::BootReset { held: Vec::new() };
+    assert_eq!(
+        reply(last.helper.handle(reset, Vec::new())),
         Reply::Reset {
             kept: None,
             deleted: vec![lease()]
