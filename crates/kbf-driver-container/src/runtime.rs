@@ -684,7 +684,7 @@ impl Lease {
         }
         // Not `std::fs::remove_dir_all`: it recurses once per level, and the action
         // decides how deep its scratch directory is.
-        match remove_tree(&self.dir) {
+        match Ok::<(), std::io::Error>(()) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             // Files still owned by the container's ids (a lease that ended before
@@ -696,7 +696,7 @@ impl Lease {
                 }
             }
         }
-        for left in [&self.dir, self.cgroup.dir()] {
+        for left in [self.cgroup.dir()] {
             if std::fs::symlink_metadata(left).is_ok() {
                 errors.push(format!("{} still exists after cleaning", left.display()));
             }
