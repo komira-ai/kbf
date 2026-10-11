@@ -8,7 +8,7 @@ use std::time::Duration;
 use kbf_front::{MetaLog, MetaLogError};
 use kbf_log::{Bootstrap, FarmLogId, Format, LogCommand};
 use kbf_meta::{Applied, BlobWrite, Command, Epoch, Location, ObjectId, Retention, StoreId};
-use kbf_raft::{Entry, LogId, Payload, Snapshot, Storage};
+use kbf_raft::{Entry, LogId, LogIndex, Payload, Snapshot, Storage};
 use kbf_server::raft_log::{RECORD, RECORD_TMP};
 use kbf_server::{RaftLogError, RaftMetaLog};
 use kbf_store::{Fault, FaultFs, Options, Store};
@@ -245,8 +245,10 @@ async fn a_record_is_read_exactly_or_refused() {
 }
 
 /// Catches: a committed entry that does not decode being skipped (this replica would
-/// then differ from every other) instead of refusing the open, and a directory holding
-/// a snapshot (which this version never writes) opened as an empty state.
+/// then differ from every other) instead of refusing the open; a machine that goes on
+/// applying after one (the refusal would name a later entry than the first bad one);
+/// and a directory holding a snapshot (which this version never writes) opened as an
+/// empty state.
 #[tokio::test]
 async fn an_entry_or_snapshot_this_version_cannot_read_refuses_the_open() {
     let fs = FaultFs::new();
@@ -254,11 +256,14 @@ async fn an_entry_or_snapshot_this_version_cannot_read_refuses_the_open() {
     let dir = fs.restart();
     let (mut store, held) = Store::open(dir.clone(), Options::default()).expect("the store");
     let last = held.entries.last().expect("entries").id;
-    let bad = Entry {
-        id: LogId::new(last.term, last.index.next()),
+    let bad = |index: LogIndex| Entry {
+        id: LogId::new(last.term, index),
         payload: Payload::Command(vec![0xff]),
     };
-    store.write_entries(&[bad]).expect("append");
+    let first_bad = last.index.next();
+    store
+        .write_entries(&[bad(first_bad), bad(first_bad.next())])
+        .expect("append");
     drop(store);
     let refused = refusal(&dir.restart(), 2).await;
     assert!(

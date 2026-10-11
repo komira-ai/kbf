@@ -13,7 +13,8 @@ pub struct NoSnapshots;
 /// [`MetaState`] as a [`Machine`]: each committed command entry is decoded and
 /// applied in order. The first [`Bootstrap`] is kept and every later one is a no-op.
 /// An entry that does not decode stops the machine: it applies nothing more, and the
-/// log refuses every call from then on ([`MetaMachine::failed`]).
+/// log refuses to open ([`MetaMachine::failed`] names the first such entry). Once open,
+/// the log applies only entries it encoded itself.
 #[derive(Debug)]
 pub struct MetaMachine {
     meta: MetaState,
