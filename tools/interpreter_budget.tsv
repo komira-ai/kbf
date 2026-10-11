@@ -1,104 +1,103 @@
-# The shell, Python, awk, sed, Perl and Ruby left in this repository, at their exact
-# sizes. kbf's tooling is Rust: each row is something still to port or delete. The
-# repository lints (crates/kbf-it/tests/repo_lints.rs, rules in
-# crates/kbf-it/tests/interpreters/mod.rs) refuse anything the scan finds with no row
-# here, a count that differs from its row, a row the scan finds nothing for, and a
-# malformed or repeated row. Change a row in the same commit as its file.
+# The shell, Python, awk, sed, Perl and Ruby left in this repository, by path. kbf's
+# tooling is Rust: each row is something still to port or delete. The repository lints
+# (crates/kbf-it/tests/repo_lints.rs, rules in crates/kbf-it/tests/interpreters/mod.rs)
+# refuse anything the scan finds with no row here, a row the scan finds nothing for
+# (remove it in the change that deletes or renames its file), and a malformed or
+# repeated row. The list records what exists, not how big it is: editing a listed
+# file, step or keeper does not touch it.
 #
-# Rows: <count><TAB><key><TAB><reason>.
+# Rows: <key><TAB><reason>.
 
-# Files by extension or `#!` line. Count: newline bytes (what `wc -l` prints).
+# Files by extension or `#!` line. Key: the path.
 [files]
-223	crates/kbf-driver-container/tests/fixtures/fake-podman.sh	Podman fake for the container driver tests; to become a Rust test binary
-3	crates/kbf-it/m1/bazel/tools/upper.sh	M1 sample project action; to become a Rust test action
-3	crates/kbf-it/m1/buck2/tools/upper.sh	M1 sample project action; to become a Rust test action
-193	crates/kbf-it/m1/run.sh	M1 cell harness; to become kbf-cell m1
-219	crates/kbf-it/m2/run.sh	M2 cell harness; to become kbf-cell m2
-72	tools/ci/check-build-commit.sh	CI step; to become a cargo xtask verb
-45	tools/ci/check-darwin-asset.sh	CI step; to become a cargo xtask verb
-126	tools/ci/darwin-entitlements.sh	CI step; to become a cargo xtask verb
-100	tools/ci/guest-tests.sh	CI tests run as root; to become Rust tests run as root
-28	tools/ci/m2-container.sh	CI step; to become a cargo xtask verb
-321	tools/ci/mac-session-tests.sh	CI tests run as root; to become Rust tests run as root
-52	tools/ci/package-asset.sh	CI step; to become a cargo xtask verb
-22	tools/ci/podman-tests-inner.sh	CI step; to become a cargo xtask verb
-74	tools/ci/podman-tests.sh	CI step; to become a cargo xtask verb
-160	tools/ci/sign-darwin-tests.sh	CI test of the darwin signing step; to become an ignored macOS Rust test
-105	tools/ci/sign-darwin.sh	CI step; to become a cargo xtask verb
-75	tools/ci/verify-assets.sh	CI step; to become a cargo xtask verb
-1013	tools/mac-provision/kbf-mac-provision	Mac host provisioning; to become a Rust crate
-136	tools/mac-provision/test/coverage.awk	tests of kbf-mac-provision; to become Rust tests of its crate
-13	tools/mac-provision/test/coverage.sh	tests of kbf-mac-provision; to become Rust tests of its crate
-272	tools/mac-provision/test/fakecmd	tests of kbf-mac-provision; to become Rust tests of its crate
-219	tools/mac-provision/test/hosted-macos.sh	tests of kbf-mac-provision; to become Rust tests of its crate
-187	tools/mac-provision/test/mutants.sh	tests of kbf-mac-provision; to become Rust tests of its crate
-670	tools/mac-provision/test/run.sh	tests of kbf-mac-provision; to become Rust tests of its crate
-95	tools/spike/build_budget.sh	hosted runner spike; to be deleted
-55	tools/spike/delegated_inner.sh	hosted runner spike; to be deleted
-27	tools/spike/delegation.sh	hosted runner spike; to be deleted
-43	tools/spike/fsync_probe.py	hosted runner spike; to be deleted
-63	tools/spike/host_facts.sh	hosted runner spike; to be deleted
-20	tools/spike/io_hog.sh	hosted runner spike; to be deleted
-161	tools/spike/io_slices.sh	hosted runner spike; to be deleted
-79	tools/spike/lib.sh	hosted runner spike; to be deleted
-145	tools/spike/macos/automation_mode.sh	macOS probe kit; to be deleted once its findings are documented
-485	tools/spike/macos/fixtures/gen_projects.py	generates the XCUITest fixture projects; to be ported to Rust or deleted
-180	tools/spike/macos/fixtures/run.sh	XCUITest sandbox check (spike-xcuitest workflow); to become a Rust macOS test
-10	tools/spike/macos/fixtures/selftest.sh	XCUITest sandbox check (spike-xcuitest workflow); to become a Rust macOS test
-137	tools/spike/macos/lib.sh	macOS probe kit; to be deleted once its findings are documented
-136	tools/spike/macos/simctl.sh	macOS probe kit; to be deleted once its findings are documented
-80	tools/spike/macos/tcc.sh	macOS probe kit; to be deleted once its findings are documented
-36	tools/spike/macos/test/fake_generator.sh	macOS probe kit; to be deleted once its findings are documented
-79	tools/spike/macos/test/fake_run.sh	macOS probe kit; to be deleted once its findings are documented
-334	tools/spike/macos/test/fakecmd	macOS probe kit; to be deleted once its findings are documented
-165	tools/spike/macos/test/mutants.sh	macOS probe kit; to be deleted once its findings are documented
-753	tools/spike/macos/test/run.sh	macOS probe kit; to be deleted once its findings are documented
-32	tools/spike/macos/verdicts.sh	macOS probe kit; to be deleted once its findings are documented
-272	tools/spike/macos/volume_owner.sh	macOS probe kit; to be deleted once its findings are documented
-331	tools/spike/macos/xcuitest_sandbox.sh	XCUITest sandbox check (spike-xcuitest workflow); to become a Rust macOS test
-55	tools/spike/mem_hog.py	hosted runner spike; to be deleted
-70	tools/spike/memory_high.sh	hosted runner spike; to be deleted
-71	tools/spike/no_network.sh	hosted runner spike; to be deleted
-107	tools/spike/podman_rootless.sh	hosted runner spike; to be deleted
-46	tools/spike/several_servers.sh	hosted runner spike; to be deleted
+crates/kbf-driver-container/tests/fixtures/fake-podman.sh	Podman fake for the container driver tests; to become a Rust test binary
+crates/kbf-it/m1/bazel/tools/upper.sh	M1 sample project action; to become a Rust test action
+crates/kbf-it/m1/buck2/tools/upper.sh	M1 sample project action; to become a Rust test action
+crates/kbf-it/m1/run.sh	M1 cell harness; to become kbf-cell m1
+crates/kbf-it/m2/run.sh	M2 cell harness; to become kbf-cell m2
+tools/ci/check-build-commit.sh	CI step; to become a cargo xtask verb
+tools/ci/check-darwin-asset.sh	CI step; to become a cargo xtask verb
+tools/ci/darwin-entitlements.sh	CI step; to become a cargo xtask verb
+tools/ci/guest-tests.sh	CI tests run as root; to become Rust tests run as root
+tools/ci/m2-container.sh	CI step; to become a cargo xtask verb
+tools/ci/mac-session-tests.sh	CI tests run as root; to become Rust tests run as root
+tools/ci/package-asset.sh	CI step; to become a cargo xtask verb
+tools/ci/podman-tests-inner.sh	CI step; to become a cargo xtask verb
+tools/ci/podman-tests.sh	CI step; to become a cargo xtask verb
+tools/ci/sign-darwin-tests.sh	CI test of the darwin signing step; to become an ignored macOS Rust test
+tools/ci/sign-darwin.sh	CI step; to become a cargo xtask verb
+tools/ci/verify-assets.sh	CI step; to become a cargo xtask verb
+tools/mac-provision/kbf-mac-provision	Mac host provisioning; to become a Rust crate
+tools/mac-provision/test/coverage.awk	tests of kbf-mac-provision; to become Rust tests of its crate
+tools/mac-provision/test/coverage.sh	tests of kbf-mac-provision; to become Rust tests of its crate
+tools/mac-provision/test/fakecmd	tests of kbf-mac-provision; to become Rust tests of its crate
+tools/mac-provision/test/hosted-macos.sh	tests of kbf-mac-provision; to become Rust tests of its crate
+tools/mac-provision/test/mutants.sh	tests of kbf-mac-provision; to become Rust tests of its crate
+tools/mac-provision/test/run.sh	tests of kbf-mac-provision; to become Rust tests of its crate
+tools/spike/build_budget.sh	hosted runner spike; to be deleted
+tools/spike/delegated_inner.sh	hosted runner spike; to be deleted
+tools/spike/delegation.sh	hosted runner spike; to be deleted
+tools/spike/fsync_probe.py	hosted runner spike; to be deleted
+tools/spike/host_facts.sh	hosted runner spike; to be deleted
+tools/spike/io_hog.sh	hosted runner spike; to be deleted
+tools/spike/io_slices.sh	hosted runner spike; to be deleted
+tools/spike/lib.sh	hosted runner spike; to be deleted
+tools/spike/macos/automation_mode.sh	macOS probe kit; to be deleted once its findings are documented
+tools/spike/macos/fixtures/gen_projects.py	generates the XCUITest fixture projects; to be ported to Rust or deleted
+tools/spike/macos/fixtures/run.sh	XCUITest sandbox check (spike-xcuitest workflow); to become a Rust macOS test
+tools/spike/macos/fixtures/selftest.sh	XCUITest sandbox check (spike-xcuitest workflow); to become a Rust macOS test
+tools/spike/macos/lib.sh	macOS probe kit; to be deleted once its findings are documented
+tools/spike/macos/simctl.sh	macOS probe kit; to be deleted once its findings are documented
+tools/spike/macos/tcc.sh	macOS probe kit; to be deleted once its findings are documented
+tools/spike/macos/test/fake_generator.sh	macOS probe kit; to be deleted once its findings are documented
+tools/spike/macos/test/fake_run.sh	macOS probe kit; to be deleted once its findings are documented
+tools/spike/macos/test/fakecmd	macOS probe kit; to be deleted once its findings are documented
+tools/spike/macos/test/mutants.sh	macOS probe kit; to be deleted once its findings are documented
+tools/spike/macos/test/run.sh	macOS probe kit; to be deleted once its findings are documented
+tools/spike/macos/verdicts.sh	macOS probe kit; to be deleted once its findings are documented
+tools/spike/macos/volume_owner.sh	macOS probe kit; to be deleted once its findings are documented
+tools/spike/macos/xcuitest_sandbox.sh	XCUITest sandbox check (spike-xcuitest workflow); to become a Rust macOS test
+tools/spike/mem_hog.py	hosted runner spike; to be deleted
+tools/spike/memory_high.sh	hosted runner spike; to be deleted
+tools/spike/no_network.sh	hosted runner spike; to be deleted
+tools/spike/podman_rootless.sh	hosted runner spike; to be deleted
+tools/spike/several_servers.sh	hosted runner spike; to be deleted
 
 # Workflow and composite-action `run:` steps with shell logic. Key:
 # <file>#<job>/<step name>, or `step <n>` (1-based) for a step with no name.
-# Count: the script's lines.
 [workflow]
-6	.github/workflows/artifacts.yml#darwin-arm64/Install cargo-cyclonedx (pinned version and checksum)	pinned tool download checked by SHA-256; to become one cargo xtask command
-1	.github/workflows/artifacts.yml#darwin-arm64/step 5	runner host facts; to become one command
-2	.github/workflows/artifacts.yml#darwin-arm64/SBOM	SBOM and lock check; to become one command per step
-2	.github/workflows/artifacts.yml#darwin-arm64/Package	release packaging; to become cargo xtask verbs
-2	.github/workflows/artifacts.yml#darwin-arm64/Check the packaged binary's signature, and run it	darwin asset check; to become one cargo xtask command
-6	.github/workflows/artifacts.yml#linux-x86_64/Install cargo-cyclonedx (pinned version and checksum)	pinned tool download checked by SHA-256; to become one cargo xtask command
-2	.github/workflows/artifacts.yml#linux-x86_64/SBOM	SBOM and lock check; to become one command per step
-4	.github/workflows/artifacts.yml#linux-x86_64/Package	release packaging; to become cargo xtask verbs
-6	.github/workflows/artifacts.yml#linux-arm64/Install cargo-cyclonedx (pinned version and checksum)	pinned tool download checked by SHA-256; to become one cargo xtask command
-2	.github/workflows/artifacts.yml#linux-arm64/SBOM	SBOM and lock check; to become one command per step
-4	.github/workflows/artifacts.yml#linux-arm64/Package	release packaging; to become cargo xtask verbs
-4	.github/workflows/artifacts.yml#sums/Assemble SHA256SUMS	release packaging; to become cargo xtask verbs
-2	.github/workflows/artifacts.yml#attest/Check the files against SHA256SUMS before signing them	release packaging; to become cargo xtask verbs
-7	.github/workflows/ci.yml#deny/Install cargo-deny (pinned version and checksum)	pinned tool download checked by SHA-256; to become one cargo xtask command
-6	.github/workflows/ci.yml#objstore-s3/Wait for both stores to accept connections	wait loop; to become a flag of the program that waits
-6	.github/workflows/ci.yml#coverage/Install cargo-llvm-cov (pinned version and checksum)	pinned tool download checked by SHA-256; to become one cargo xtask command
-3	.github/workflows/ci.yml#coverage/Run the workspace tests under coverage	coverage run and ratchet; to become one command per step
-5	.github/workflows/ci.yml#coverage/Per-crate table and ratchet	coverage run and ratchet; to become one command per step
-1	.github/workflows/ci.yml#native-macos/step 4	runner host facts; to become one command
-1	.github/workflows/ci.yml#mac-provision/step 2	shellcheck of the mac-provision scripts; goes with them
-7	.github/workflows/ci.yml#m2-container/Fetch buck2 (pinned version, checked by SHA-256)	pinned tool download checked by SHA-256; to become one cargo xtask command
-12	.github/workflows/integration.yml#m1-cell/Fetch Bazel and buck2 (pinned versions, checked by SHA-256)	pinned tool download checked by SHA-256; to become one cargo xtask command
-5	.github/workflows/integration.yml#m1-cell/Wait for MinIO	wait loop; to become a flag of the program that waits
-3	.github/workflows/integration.yml#m1-cell/M1 cell, Bazel and buck2 twice each	one M1 harness call over several lines; goes with crates/kbf-it/m1/run.sh
-1	.github/workflows/spike-macos.yml#selftest/step 2	shellcheck of the macOS probe kit; goes with it
-1	.github/workflows/spike-macos.yml#probes-macos-26/Host facts	runner host facts; to become one command
-1	.github/workflows/spike-macos.yml#probes-macos-15/Host facts	runner host facts; to become one command
-4	.github/workflows/spike-xcuitest.yml#xcuitest-macos/Host facts	runner host facts; to become one command
-5	.github/workflows/spike-xcuitest.yml#xcuitest-macos/Generated projects are current and parse	XCUITest fixture check; goes with the fixtures
-1	.github/workflows/spike-xcuitest.yml#xcuitest-sandbox/Host facts	runner host facts; to become one command
+.github/workflows/artifacts.yml#darwin-arm64/Install cargo-cyclonedx (pinned version and checksum)	pinned tool download checked by SHA-256; to become one cargo xtask command
+.github/workflows/artifacts.yml#darwin-arm64/step 5	runner host facts; to become one command
+.github/workflows/artifacts.yml#darwin-arm64/SBOM	SBOM and lock check; to become one command per step
+.github/workflows/artifacts.yml#darwin-arm64/Package	release packaging; to become cargo xtask verbs
+.github/workflows/artifacts.yml#darwin-arm64/Check the packaged binary's signature, and run it	darwin asset check; to become one cargo xtask command
+.github/workflows/artifacts.yml#linux-x86_64/Install cargo-cyclonedx (pinned version and checksum)	pinned tool download checked by SHA-256; to become one cargo xtask command
+.github/workflows/artifacts.yml#linux-x86_64/SBOM	SBOM and lock check; to become one command per step
+.github/workflows/artifacts.yml#linux-x86_64/Package	release packaging; to become cargo xtask verbs
+.github/workflows/artifacts.yml#linux-arm64/Install cargo-cyclonedx (pinned version and checksum)	pinned tool download checked by SHA-256; to become one cargo xtask command
+.github/workflows/artifacts.yml#linux-arm64/SBOM	SBOM and lock check; to become one command per step
+.github/workflows/artifacts.yml#linux-arm64/Package	release packaging; to become cargo xtask verbs
+.github/workflows/artifacts.yml#sums/Assemble SHA256SUMS	release packaging; to become cargo xtask verbs
+.github/workflows/artifacts.yml#attest/Check the files against SHA256SUMS before signing them	release packaging; to become cargo xtask verbs
+.github/workflows/ci.yml#deny/Install cargo-deny (pinned version and checksum)	pinned tool download checked by SHA-256; to become one cargo xtask command
+.github/workflows/ci.yml#objstore-s3/Wait for both stores to accept connections	wait loop; to become a flag of the program that waits
+.github/workflows/ci.yml#coverage/Install cargo-llvm-cov (pinned version and checksum)	pinned tool download checked by SHA-256; to become one cargo xtask command
+.github/workflows/ci.yml#coverage/Run the workspace tests under coverage	coverage run and ratchet; to become one command per step
+.github/workflows/ci.yml#coverage/Per-crate table and ratchet	coverage run and ratchet; to become one command per step
+.github/workflows/ci.yml#native-macos/step 4	runner host facts; to become one command
+.github/workflows/ci.yml#mac-provision/step 2	shellcheck of the mac-provision scripts; goes with them
+.github/workflows/ci.yml#m2-container/Fetch buck2 (pinned version, checked by SHA-256)	pinned tool download checked by SHA-256; to become one cargo xtask command
+.github/workflows/integration.yml#m1-cell/Fetch Bazel and buck2 (pinned versions, checked by SHA-256)	pinned tool download checked by SHA-256; to become one cargo xtask command
+.github/workflows/integration.yml#m1-cell/Wait for MinIO	wait loop; to become a flag of the program that waits
+.github/workflows/integration.yml#m1-cell/M1 cell, Bazel and buck2 twice each	one M1 harness call over several lines; goes with crates/kbf-it/m1/run.sh
+.github/workflows/spike-macos.yml#selftest/step 2	shellcheck of the macOS probe kit; goes with it
+.github/workflows/spike-macos.yml#probes-macos-26/Host facts	runner host facts; to become one command
+.github/workflows/spike-macos.yml#probes-macos-15/Host facts	runner host facts; to become one command
+.github/workflows/spike-xcuitest.yml#xcuitest-macos/Host facts	runner host facts; to become one command
+.github/workflows/spike-xcuitest.yml#xcuitest-macos/Generated projects are current and parse	XCUITest fixture check; goes with the fixtures
+.github/workflows/spike-xcuitest.yml#xcuitest-sandbox/Host facts	runner host facts; to become one command
 
-# Production Rust under crates/*/src/ that names a shell and a `-c` flag. Count: the
-# shell names in the file's production code.
+# Production Rust under crates/*/src/ that names a shell and a `-c` flag. Key: the path.
 [src-sh-c]
-1	crates/kbf-driver-container/src/keeper.rs	the lease keeper is a /bin/sh script; to become a mode of the daemon binary
-1	crates/kbf-driver-native/src/keeper.rs	the lease keeper is a /bin/sh script; to become a mode of the daemon binary
+crates/kbf-driver-container/src/keeper.rs	the lease keeper is a /bin/sh script; to become a mode of the daemon binary
+crates/kbf-driver-native/src/keeper.rs	the lease keeper is a /bin/sh script; to become a mode of the daemon binary

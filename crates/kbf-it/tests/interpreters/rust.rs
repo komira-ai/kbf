@@ -6,7 +6,7 @@
 //! `zsh`, bare or as an absolute path) and a string literal that is a `-c` flag
 //! ([`is_dash_c`]: `-c`, `-ec`, `-lc`, ...), anywhere in the file: the two need not
 //! meet in one call, so `Command::new(shell).arg("-c")` with
-//! `shell = Path::new("/bin/sh")` counts. Its count is the number of shell literals.
+//! `shell = Path::new("/bin/sh")` counts.
 //! Literals inside macro calls (`vec!`, `format!`) are read from the macro's tokens;
 //! doc comments are not code and are skipped.
 //!
@@ -122,8 +122,9 @@ struct Walk {
     in_test: bool,
     /// The file's inner attributes make all of it test code.
     file_test: bool,
-    shells: usize,
-    dash_c: usize,
+    /// Production code holds a shell literal and a `-c` literal.
+    shell: bool,
+    dash_c: bool,
     decls: Vec<Decl>,
 }
 
@@ -132,8 +133,8 @@ impl Walk {
         if self.in_test {
             return;
         }
-        self.shells += usize::from(is_shell(value));
-        self.dash_c += usize::from(is_dash_c(value));
+        self.shell |= is_shell(value);
+        self.dash_c |= is_dash_c(value);
     }
 
     fn tokens(&mut self, tokens: TokenStream) {
@@ -273,9 +274,9 @@ pub fn is_crate_src(path: &str) -> bool {
 }
 
 /// For `(path, text)` of every Rust file under the crates' `src/`, the production
-/// files that name a shell and a `-c` flag, with their shell-literal counts, sorted
-/// by path; and one problem per file that does not parse.
-pub fn shell_c_files(files: &[(String, String)]) -> (Vec<(String, usize)>, Vec<String>) {
+/// files that name a shell and a `-c` flag, sorted by path; and one problem per file
+/// that does not parse.
+pub fn shell_c_files(files: &[(String, String)]) -> (Vec<String>, Vec<String>) {
     let mut problems = Vec::new();
     let mut walks: BTreeMap<&str, Walk> = BTreeMap::new();
     for (path, text) in files {
@@ -296,8 +297,8 @@ pub fn shell_c_files(files: &[(String, String)]) -> (Vec<(String, usize)>, Vec<S
             inline: Vec::new(),
             in_test: file_test,
             file_test,
-            shells: 0,
-            dash_c: 0,
+            shell: false,
+            dash_c: false,
             decls: Vec::new(),
         };
         walk.visit_file(&parsed);
@@ -332,8 +333,8 @@ pub fn shell_c_files(files: &[(String, String)]) -> (Vec<(String, usize)>, Vec<S
     }
     let found = walks
         .iter()
-        .filter(|(p, w)| !test.contains(*p) && w.shells > 0 && w.dash_c > 0)
-        .map(|(p, w)| ((*p).to_owned(), w.shells))
+        .filter(|(p, w)| !test.contains(*p) && w.shell && w.dash_c)
+        .map(|(p, _)| (*p).to_owned())
         .collect();
     (found, problems)
 }
