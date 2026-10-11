@@ -123,6 +123,10 @@ pub enum HostError {
     },
     #[error("{0} is still not in the store after its pull")]
     NotPulled(String),
+    /// The check after an apply failed. Steps ran, so this is a failed verb (exit 1),
+    /// not a refusal.
+    #[error("the check after the apply: {0}")]
+    AfterApply(Box<HostError>),
 
     // swap
     #[error("KBF_SWAP_SIZE={0}: give it in whole GiB, as 128G")]

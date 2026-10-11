@@ -2,12 +2,13 @@
 //!
 //! It checks the host first, read only, and each refusal says the fix: a cgroup v2
 //! memory controller; `MINIO_UNIT` is a systemd unit here; the two users exist, and
-//! the kbf user has subuid and subgid ranges and lingers; the key files are their
-//! service's alone, the certificates and deny list exist and `s3.env` names a key
-//! pair; and, unless kbf-server runs, its three ports are free. A host with no active
-//! swap gets a warning. It then renders the units (`render-units` with the kbf user's
-//! uid), refuses them unless `check-units --installable` passes, and refuses a binary
-//! whose `--help` lacks a flag its unit passes.
+//! the kbf user has subuid and subgid ranges (a line keyed by its name or its uid)
+//! and lingers; the key files are their service's alone, the certificates and deny
+//! list exist and `s3.env` names a key pair; and, unless kbf-server runs, its three
+//! ports are free. A host with no active swap gets a warning. It then renders the
+//! units (`render-units` with the kbf user's uid), refuses them unless `check-units
+//! --installable` passes, and refuses a binary whose `--help` lacks a flag its unit
+//! passes.
 //!
 //! The plan has each of these only when the host differs:
 //! 1. with `--bin-dir`, `kbf-server` and `kbf-daemon` copied into `KBF_BIN_DIR`, the
@@ -23,8 +24,9 @@
 //! MinIO is never restarted unless `--restart-minio` is given: it serves the farm, and
 //! its new priorities take effect only at its next start.
 //!
-//! `--uninstall` is the rollback: kbf-daemon and kbf-server stopped and disabled, the
-//! four files moved to `/var/lib/kbf-linux/removed/<unix seconds>/`, `daemon-reload`.
+//! `--uninstall` is the rollback: kbf-daemon and kbf-server stopped and disabled
+//! (when either is enabled or running), the four files moved to
+//! `/var/lib/kbf-linux/removed/<unix seconds>/`, `daemon-reload`.
 //! The binaries, the Raft log, the scratch, the bucket and the swapfile stay.
 
 use std::io::Write;
@@ -179,10 +181,18 @@ fn preflight<E: Exec>(
     }
     let kbf = host::user_named(exec, &c.user)?;
     let server = host::user_named(exec, &c.server_user)?;
+    // A range line is `<user>:<first id>:<count>`, the user named or given by uid
+    // (subuid(5); newuidmap takes either).
+    let uid = kbf.uid.to_string();
     for file in ["/etc/subuid", "/etc/subgid"] {
         let file = HostPath::new(file)?;
-        let range = format!("{}:", kbf.name);
-        if !text_of(exec, &file)?.is_some_and(|t| t.lines().any(|l| l.starts_with(&range))) {
+        let ranged = text_of(exec, &file)?.is_some_and(|t| {
+            t.lines().any(|l| {
+                l.split_once(':')
+                    .is_some_and(|(who, _)| who == kbf.name || who == uid)
+            })
+        });
+        if !ranged {
             return Err(HostError::NoSubIds {
                 user: kbf.name.clone(),
                 file,
