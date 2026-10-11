@@ -6,7 +6,8 @@ use std::rc::Rc;
 
 use super::*;
 use crate::linux::host::SWAPON;
-use kbf_host::testkit::{ScratchHost, reply};
+use kbf_host::step::Step;
+use kbf_host::testkit::{FakeExec, ScratchHost, reply};
 use kbf_host::user::{GETENT, ID};
 
 const EXAMPLE: &str = include_str!("../../templates/linux/config.example");
@@ -663,4 +664,131 @@ fn an_in_memory_server_gets_no_raft_directory() {
         .iter()
         .any(|s| s.starts_with("mkdir /var/lib/kbf/leases (0700"));
     assert!(scratch, "{got:#?}");
+}
+
+/// The scratch host as a [`FakeExec`] with the same entries and tools, so a test can
+/// give a file an owner the test's own user cannot give it (`chown` needs root).
+fn fake_of(mut exec: ScratchHost) -> FakeExec {
+    let mut fake = FakeExec::new(0);
+    fake.answer = std::mem::replace(&mut exec.answer, Box::new(|_| Ok(reply(0, "", ""))));
+    let mut dirs = vec![exec.root.clone()];
+    while let Some(dir) = dirs.pop() {
+        for item in fs::read_dir(&dir).expect("list") {
+            let full = item.expect("entry").path();
+            let under = full.strip_prefix(&exec.root).expect("under the root");
+            let path = HostPath::new(&format!("/{}", under.display())).expect("path");
+            let entry = exec.inspect(&path).expect("inspect").expect("there");
+            if matches!(entry, Entry::Dir { .. }) {
+                dirs.push(full);
+            }
+            fake.entries.insert(path, entry);
+        }
+    }
+    fake
+}
+
+/// Each file install-units writes for root, by path: the binaries, the slice, the
+/// MinIO drop-in and the two services.
+const ROOT_FILES: [&str; 6] = [
+    "/usr/local/bin/kbf-server",
+    "/usr/local/bin/kbf-daemon",
+    "/etc/systemd/system/kbf.slice",
+    "/etc/systemd/system/minio.service.d/kbf.conf",
+    "/etc/systemd/system/kbf-server.service",
+    "/etc/systemd/system/kbf-daemon.service",
+];
+
+/// Catches a binary or unit left in place because its bytes and mode are right while
+/// root does not own it (planned with no owner, so the in-place check ignores who owns
+/// it): its owner could rewrite what systemd runs as root. Each file holds what the
+/// install writes, with its mode, but another owner: a user's (1000:1000) for every
+/// kind of file, root's uid with a user's group, and a user's uid with root's group.
+/// The apply must replace each with a root-owned file (0:0), restart the services, and
+/// a re-run must then plan nothing.
+#[test]
+fn a_right_file_that_root_does_not_own_is_replaced() {
+    let (mut exec, world) = host("install-owner");
+    go(&mut exec, &install(), Mode::Apply);
+    let mut fake = fake_of(exec);
+    let owners = [
+        (1000, 1000),
+        (0, 1000),
+        (1000, 0),
+        (1000, 1000),
+        (1000, 1000),
+        (1000, 1000),
+    ];
+    let mut was = Vec::new();
+    for (path, (uid, gid)) in ROOT_FILES.into_iter().zip(owners) {
+        let path = HostPath::new(path).expect("path");
+        let Some(Entry::File { perms, bytes, .. }) = fake.entries.get(&path).cloned() else {
+            panic!("{path} not installed");
+        };
+        let owner = Owner { uid, gid };
+        let entry = Entry::File {
+            perms,
+            owner,
+            bytes: bytes.clone(),
+        };
+        fake.entries.insert(path.clone(), entry);
+        was.push((path, perms, bytes));
+    }
+    world.borrow_mut().active.clear();
+
+    let mut out = Vec::new();
+    run(&mut fake, &install(), Mode::Apply, &mut out).expect("apply");
+    let written: Vec<&HostPath> = fake
+        .log
+        .iter()
+        .filter_map(|step| match step {
+            Step::WriteFile { path, .. } => Some(path),
+            _ => None,
+        })
+        .collect();
+    let want: Vec<&HostPath> = was.iter().map(|(path, ..)| path).collect();
+    assert_eq!(written, want);
+    for (path, perms, bytes) in was {
+        let root = Entry::File {
+            perms,
+            owner: Owner { uid: 0, gid: 0 },
+            bytes,
+        };
+        assert_eq!(fake.entries.get(&path), Some(&root), "{path}");
+    }
+    assert_eq!(world.borrow().active.len(), 2);
+
+    let mut out = Vec::new();
+    run(&mut fake, &install(), Mode::DryRun, &mut out).expect("re-run");
+    let out = String::from_utf8(out).expect("utf-8");
+    assert!(out.ends_with("nothing to do\n"), "{out}");
+}
+
+/// Catches the binary a new one replaces kept as `<name>.previous` with its old owner:
+/// a user's copy beside root's binaries, one rename from being run as root again. It
+/// keeps its bytes and mode and is root's.
+#[test]
+fn a_replaced_binary_is_kept_as_roots() {
+    let (mut exec, _) = host("install-owner-previous");
+    go(&mut exec, &install(), Mode::Apply);
+    write(&exec, "/opt/new/kbf-daemon", "daemon-3", 0o755);
+    let mut fake = fake_of(exec);
+    let daemon = HostPath::new("/usr/local/bin/kbf-daemon").expect("path");
+    let user = Entry::File {
+        perms: Perms::new(0o750),
+        owner: Owner {
+            uid: 1000,
+            gid: 1000,
+        },
+        bytes: b"daemon-2".to_vec(),
+    };
+    fake.entries.insert(daemon, user);
+
+    run(&mut fake, &install(), Mode::Apply, &mut Vec::new()).expect("apply");
+    let previous = HostPath::new("/usr/local/bin/kbf-daemon.previous").expect("path");
+    let kept = Entry::File {
+        perms: Perms::new(0o750),
+        owner: Owner { uid: 0, gid: 0 },
+        bytes: b"daemon-2".to_vec(),
+    };
+    assert_eq!(fake.entries.get(&previous), Some(&kept));
 }
