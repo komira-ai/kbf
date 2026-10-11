@@ -7,7 +7,7 @@
 //! index and action cache in a [`MetaLog`] and its bytes in a
 //! [`kbf_objstore::ObjectStore`], packed into `kbf-segments` segments. Both are traits:
 //! [`Cache::memory`] runs them in this process ([`MemoryMetaLog`] and the fake store),
-//! and the replicated log and the S3 store slot in behind the same traits.
+//! and `kbf-server`'s Raft log and the S3 store slot in behind the same traits.
 //!
 //! The promises the services keep (RFC sections 3.5 and 9):
 //! - **FindMissingBlobs never omits a digest.** A digest that does not parse fails the

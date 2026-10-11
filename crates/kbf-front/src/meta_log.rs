@@ -1,10 +1,12 @@
 //! The seam between the front and the metadata state machine.
 //!
 //! The front never holds [`MetaState`] itself: it commits [`Command`]s and asks
-//! queries through a [`MetaLog`]. Today that is [`MemoryMetaLog`], one state behind a
-//! lock in this process (`--store=memory`). The replicated log implements the same
-//! trait: `commit` proposes the command and resolves once it has applied, and `query`
-//! runs on the leader. The front's code does not change when it slots in.
+//! queries through a [`MetaLog`]. [`MemoryMetaLog`] is one state behind a lock in this
+//! process (`--meta-log=memory`). `kbf-server`'s `RaftMetaLog` (`--meta-log=raft`)
+//! implements the same trait over a single-voter Raft log: `commit` proposes the
+//! command and resolves once it has applied, and `query` reads the state this server
+//! has applied, which for a single voter is the committed state. The front's code is
+//! the same over either.
 
 use std::future::Future;
 use std::sync::{Mutex, MutexGuard, PoisonError};
@@ -29,7 +31,7 @@ pub trait MetaLog: Send + Sync + 'static {
         command: Command,
     ) -> impl Future<Output = Result<Applied, MetaLogError>> + Send;
 
-    /// Runs a read-only query against the committed state, on the leader.
+    /// Runs a read-only query against the state this log has applied.
     fn query<R, F>(&self, f: F) -> impl Future<Output = Result<R, MetaLogError>> + Send
     where
         F: FnOnce(&MetaState) -> R + Send,

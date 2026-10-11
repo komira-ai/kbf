@@ -199,21 +199,24 @@ See [scheduler.md](docs/design/scheduler.md) and
 
 | State | Today | Planned |
 |---|---|---|
-| CAS index, action cache, farm time | `MetaState` behind `MemoryMetaLog`, in the server's memory | the same state machine applied from a Raft log on local disk: one voter, then three |
+| CAS index, action cache, farm time | `MetaState` behind `MemoryMetaLog`, in the server's memory (the default, `--meta-log=memory`); with `--meta-log=raft`, behind `RaftMetaLog`, applied from a single-voter Raft log on local disk | the Raft log with three voters |
 | Blob bytes | segments in an object store (in memory, or an S3 bucket) | the same, with garbage collection and multiple stores |
 | Leases, operations, workers | `Scheduler` in the server's memory; a control record "commits" when appended | the same state machine fed from a replicated control log, kept on the servers' local disks |
 | Node reports | read at `Hello`: `cpus`, `mem_gib` and `gpu` are booked; `arch`, `cpu.features`, `os` and the other exact keys are matched against each action's platform; held in memory, so a restart forgets every node | operator labels, report changes noticed by hash; a durable node registry that remembers absent nodes, alerts on them and restores them on reconnect |
 
-Because the index is in memory today, a restarted server forgets every blob. With
-`--store=s3` each start writes under a fresh key prefix so it never reads objects a
-previous process wrote.
+Under `--meta-log=memory` the index is in memory, so a restarted server forgets every
+blob, and with `--store=s3` each start writes under a fresh key prefix so it never reads
+objects a previous process wrote. Under `--meta-log=raft` (which needs `--store=s3`) a
+restart reopens the log in `--raft-dir` and keeps the index and the action cache, and
+every start writes under the prefix the log committed when it was created,
+`<--s3-prefix><log id>/`, each in a new writer epoch.
 
 Every piece of state sits behind a trait or a pure state machine, so moving it into a
 replicated log changes the implementation behind the seam, not its callers:
 
 - `MetaLog` (in `kbf-front`): `commit` a metadata command, `query` the committed
-  state. `MemoryMetaLog` is the single-process implementation; a replicated log
-  implements the same two calls.
+  state. `MemoryMetaLog` is the single-process implementation; `RaftMetaLog` (in
+  `kbf-server`) implements the same two calls over a single-voter Raft log.
 - `ObjectStore` (in `kbf-objstore`): five calls any S3-compatible store can serve.
 - `Dispatch` (in `kbf-front`): how the REAPI front reaches the scheduler.
 - `StateMachine` (in `kbf-types`): inputs in, effects out. The server carries out the

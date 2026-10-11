@@ -14,17 +14,29 @@
 //   that decode to a value, including bytes with a field this file does not name.
 //
 // Which encodings may appear in a log is the log's format version, committed in the log.
-// Format 1 is this file as it is now. A field or command added here is a new format.
+// Format 1 is this file as it is now. Bootstrap joined format 1 before any log was
+// written (kbf-server's --meta-log=raft is the first writer); from now on, a field or
+// command added here is a new format.
 syntax = "proto3";
 
 package kbf.log.v1;
 
 // The payload of a command entry. Later formats add the other commands of ha.md
-// section 4.1 (Bootstrap, Farm, Report, Takeover, Checkpoint, MachineVersion).
+// section 4.1 (Farm, Report, Takeover, Checkpoint, MachineVersion).
 message LogCommand {
   oneof command {
     MetaCommand meta = 1;
+    Bootstrap bootstrap = 2;
   }
+}
+
+// The first command of a log (ha.md section 4.11): the id drawn when the log was
+// created, never zero, and the key prefix every object the farm writes goes under,
+// the same for every start over the log. A replica takes the first committed
+// Bootstrap and treats any later one as a no-op.
+message Bootstrap {
+  uint64 log_id = 1;
+  string store_prefix = 2;
 }
 
 // One command of the metadata state machine (kbf-meta's Command).
