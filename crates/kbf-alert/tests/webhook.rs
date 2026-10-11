@@ -276,6 +276,12 @@ fn undelivered_events_survive_a_restart() {
 /// stalls whoever raised the alert. 200 events are handed over while the receiver
 /// holds the first request unanswered: every call returns at once, and once that
 /// attempt times out all 201 events are in the outbox file.
+///
+/// The test stops the notifier (up to the 1 s timeout of the attempt in flight)
+/// rather than dropping it. A dropped notifier's thread runs on, so the process could
+/// exit in the middle of an attempt; coverage then counts half a loop pass, and the
+/// counts llvm derives from others come out one off (komira-ai/komira-build-farm#422:
+/// one delivery too many, and the backoff `continue` in `Worker::run` at 0).
 #[test]
 fn notify_never_waits_for_the_receiver() {
     let receiver = Receiver::start(|_| Reply::Hang);
@@ -294,7 +300,7 @@ fn notify_never_waits_for_the_receiver() {
     wait_until(|| webhook.status().pending == 201);
     assert_eq!(outbox_on_disk(&dir).len(), 201);
     assert_eq!(webhook.status().delivered, 0);
-    drop(webhook);
+    webhook.stop();
 }
 
 /// Catches: a notifier that keeps going without a working state directory (an alert
@@ -384,34 +390,48 @@ fn a_redirect_is_a_failed_attempt_not_a_delivery() {
 
 /// Catches: an attempt made whenever an event arrives, ignoring the backoff. In an
 /// outage alerts keep coming, so that would hammer a failing receiver at the rate
-/// alerts are raised. The receiver fails the first attempt; the backoff is 1 s; 10
-/// events are handed over during it. The second attempt comes no earlier than the
-/// backoff allows, and then all 11 are delivered in order.
+/// alerts are raised. The receiver is down (503) and the backoff is an hour, so after
+/// the first attempt the retry time is still ahead when each of the 10 events arrives,
+/// however slow the runner (komira-ai/komira-build-farm#422: with a 1 s backoff, a slow
+/// outbox write could use up the whole wait, and the test then never saw an event
+/// arrive during it). The events are handed over one at a time, each once the last is
+/// in the outbox, so the thread takes each in a pass of its own. Once all 11 are in the
+/// outbox the notifier is stopped, which waits for any attempt in flight: the receiver
+/// must have seen one request. A restart on the same state directory, against a
+/// receiver that is up, then delivers all 11 in order.
 #[test]
 fn events_during_a_backoff_wait_for_it() {
-    let receiver = Receiver::start(|i| Reply::Status(if i == 0 { 503 } else { 200 }));
+    let down = Receiver::start(|_| Reply::Status(503));
     let dir = scratch("backoff-events");
-    let mut config = config(&receiver.url);
-    config.backoff = Backoff {
-        initial: Duration::from_secs(1),
-        max: Duration::from_secs(1),
+    let mut long = config(&down.url);
+    long.backoff = Backoff {
+        initial: Duration::from_secs(3600),
+        max: Duration::from_secs(3600),
     };
-    let webhook = Webhook::start(&dir, config).expect("starts");
+    let webhook = Webhook::start(&dir, long).expect("starts");
     webhook.notify(event("first"));
-    receiver.wait_for(1);
+    down.wait_for(1);
     wait_until(|| webhook.status().failures_in_a_row == 1);
     for n in 0..10 {
         webhook.notify(event(&format!("n{n}")));
-        std::thread::sleep(Duration::from_millis(20));
+        wait_until(|| webhook.status().pending == n + 2);
     }
-    let requests = receiver.wait_for(12);
+    webhook.stop();
+    assert_eq!(
+        ids(&down.requests()),
+        [1],
+        "no attempt while the backoff runs"
+    );
+    assert_eq!(outbox_on_disk(&dir).len(), 11);
+
+    let up = Receiver::start(|_| Reply::Status(200));
+    let webhook = Webhook::start(&dir, config(&up.url)).expect("restarts");
+    let requests = up.wait_for(11);
     wait_until(|| webhook.status().delivered == 11);
-    let gap = requests[1].at - requests[0].at;
-    assert!(gap >= Duration::from_millis(950), "retried after {gap:?}");
     assert_eq!(
         ids(&requests),
-        [1, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
-        "in order, one attempt each after the retry"
+        [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+        "in order, one attempt each after the restart"
     );
     webhook.stop();
 }

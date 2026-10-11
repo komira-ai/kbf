@@ -138,6 +138,10 @@ Restart=on-failure
 WantedBy=multi-user.target
 ```
 
+The daemon dials the server's worker listener over mutual TLS, so that server runs
+with `--worker-tls-cert`, `--worker-tls-key` and `--worker-client-ca`. TLS is
+optional in `kbf-server`; a deployment turns it on in its config.
+
 The unit sets no `MemoryMax=`, `MemorySwapMax=`, `CPUQuota=` or `AllowedCPUs=`; the
 cap on builds is `actions/memory.max`. A `MemoryMax=` on the unit or slice, if one is
 set anyway, also bounds the `mem_gib` the node reports.

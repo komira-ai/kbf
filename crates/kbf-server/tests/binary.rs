@@ -181,6 +181,9 @@ fn memory_mode_serves_execution_and_stops_on_interrupt() {
         "{line}"
     );
     assert!(line.contains(" worker=127.0.0.1:"), "{line}");
+    // Catches: the plain-text warning printed on a loopback bind (both listeners here),
+    // where nothing is exposed (scripts would learn to ignore it).
+    assert!(!line.contains(" warning="), "{line}");
     assert!(
         !line.contains(" api="),
         "no operator API unless asked: {line}"
@@ -503,6 +506,58 @@ fn startup_failures_exit_2() {
 
     let (code, _) = fails(server(&["--heartbeat-interval-ms", "0"]));
     assert_eq!(code, Some(2), "a zero heartbeat interval accepted");
+}
+
+/// Catches: a plain-text listener on an address other machines reach refused (or
+/// stopped) instead of started; a start line without the warning, with it twice, or
+/// naming the wrong listener; and a plain-text REAPI listener off loopback that binds
+/// but does not answer. `0.0.0.0` stands for any address that is not loopback (the unit
+/// tests of `loopback_only` cover the others).
+#[cfg(unix)]
+#[test]
+fn a_plain_text_listener_off_loopback_starts_and_serves_with_one_warning() {
+    for (reapi, worker, warned) in [
+        ("0.0.0.0:0", "127.0.0.1:0", "reapi"),
+        ("127.0.0.1:0", "0.0.0.0:0", "worker"),
+        ("0.0.0.0:0", "0.0.0.0:0", "reapi,worker"),
+    ] {
+        let (child, line, bound) = started(server(&["--listen", reapi, "--worker-listen", worker]));
+        let want = format!(" warning=plaintext-off-loopback:{warned}");
+        assert!(
+            line.ends_with(&want),
+            "want {want:?} at the end of {line:?}"
+        );
+        assert_eq!(line.matches("warning=").count(), 1, "{line}");
+        let local = SocketAddr::from(([127, 0, 0, 1], bound.port()));
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime")
+            .block_on(async {
+                CapabilitiesClient::connect(format!("http://{local}"))
+                    .await
+                    .expect("connect in plain text")
+                    .get_capabilities(GetCapabilitiesRequest::default())
+                    .await
+                    .expect("GetCapabilities");
+            });
+        interrupt(child);
+    }
+}
+
+/// Catches: the removed `--reapi-plaintext-bind` escape still accepted (silently or as
+/// a no-op), so a script written for the old guard keeps passing a flag that means
+/// nothing. clap's unknown-flag error exits 2 and names it.
+#[test]
+fn the_reapi_plaintext_bind_flag_is_gone() {
+    let mut c = server(&ANY_PORT);
+    c.arg("--reapi-plaintext-bind");
+    let (code, stderr) = fails(c);
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(
+        stderr.contains("unexpected argument '--reapi-plaintext-bind'"),
+        "{stderr}"
+    );
 }
 
 /// Catches: a `--reapi-auth-policy` the binary does not run on its REAPI listener, and

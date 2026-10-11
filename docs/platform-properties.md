@@ -289,14 +289,16 @@ denies every file write outside the action's lease directory and `/dev`. The lea
 directory holds the input root (the working directory and outputs), and the action's
 own home, temporary and cache directories, named by `HOME`, `TMPDIR`,
 `XDG_CACHE_HOME` and `CLANG_MODULE_CACHE_PATH`; all of it is removed when the lease
-ends. Two kinds of write in the daemon user's temporary folder
+ends. Three kinds of write in the daemon user's temporary folder
 (`getconf DARWIN_USER_TEMP_DIR`, under `/var/folders`) are allowed too, because macOS
 tools make them there whatever `TMPDIR` says: Foundation's atomic saves (inside
 `TemporaryItems`, which `swift build` and `xcodebuild` need; the daemon makes that
-folder, and an action cannot remove, rename or replace it) and `xcrun`'s cache
-(`xcrun_db`, behind `cc`, `clang` and `swiftc`). The daemon sweeps what leases leave
-there once its last change is an hour from now, before or after, never through a
-symlink. Until each lease runs as its own user, leases on one Mac share those names:
+folder, and an action cannot remove, rename or replace it), `xcrun`'s cache
+(`xcrun_db`, behind `cc`, `clang` and `swiftc`), and Swift Build's scratch directory
+(`swbuild.tmp.<random>` and what is in it, which `xcodebuild` needs to build an app).
+The daemon sweeps the first two's leftovers once their last change is an hour from now,
+before or after, never through a symlink; it leaves `swbuild.tmp.*` alone, since a
+long build's can be older than that. Until each lease runs as its own user, leases on one Mac share those names:
 one lease can see another's temporary files there and rewrite the `xcrun` cache the
 next lease reads. The daemon runs no developer tool outside the sandbox while it
 serves: it asks the Xcodes ([above](#xcode)) under the actions' sandbox, where
@@ -326,3 +328,12 @@ service and a connect to `usbmuxd`'s socket, so `xcrun devicectl` fails (its
 connection to `CoreDeviceService` is invalidated) and no tool talks to a device
 through `usbmuxd`. No lease books a device yet
 ([design/ios-devices.md](design/ios-devices.md#61-what-the-sandbox-must-allow)).
+
+It also refuses opening an application through Launch Services (`open`, the sandbox's
+`lsopen`): Launch Services starts the application outside the sandbox and outside the
+lease's process tree, so it could write anywhere the daemon's user can, use the
+network and outlive the lease, and an action can open an application it linked in its
+own lease. `xcodebuild` starts a macOS UI-test runner that way, so macOS UI tests fail
+under the native driver (error -54, "The sandbox profile of this process is missing
+"(allow lsopen)""). iOS UI tests on a simulator do not need it
+([spikes/macos-p0.md](spikes/macos-p0.md#xcuitest-under-the-native-drivers-sandbox)).
