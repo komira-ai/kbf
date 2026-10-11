@@ -28,6 +28,15 @@ fn mac(instance: &str, phase: Option<NodePhase>) -> Hello {
     }
 }
 
+/// Writes the server's log to the test's output at every level, so the arguments of
+/// its log lines run.
+fn log() {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::TRACE)
+        .with_test_writer()
+        .try_init();
+}
+
 fn switching(phase: Phase, lease: LeaseId) -> Option<NodePhase> {
     Some(NodePhase {
         phase: phase.into(),
@@ -43,6 +52,7 @@ fn switching(phase: Phase, lease: LeaseId) -> Option<NodePhase> {
 /// keeps its id (it is not granted again) and its `Result` is accepted.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_daemon_back_from_the_session_switch_is_sent_its_start_again() {
+    log();
     let cell = Cell::start().await;
     let mut before = FakeDaemon::connect(cell.worker_addr, mac("before", None))
         .await
@@ -84,6 +94,7 @@ async fn a_daemon_back_from_the_session_switch_is_sent_its_start_again() {
 /// The server cancels it, so the daemon cleans up.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_switching_lease_not_held_here_is_cancelled() {
+    log();
     let cell = Cell::start().await;
     let mut daemon = FakeDaemon::connect(cell.worker_addr, mac("one", None))
         .await
@@ -109,6 +120,7 @@ async fn a_switching_lease_not_held_here_is_cancelled() {
 /// the node reports serving again, the queued work starts.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_quarantined_node_is_offered_nothing_until_it_serves_again() {
+    log();
     let cell = Cell::start().await;
     let quarantined = Some(NodePhase {
         phase: Phase::Quarantined.into(),

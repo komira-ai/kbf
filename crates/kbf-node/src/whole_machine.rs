@@ -80,15 +80,37 @@ mod tests {
 
     /// Catches a node that starts with the whole-machine driver where there is no Mac
     /// session to switch (it would list `native-whole-machine` and be sent leases it
-    /// cannot run).
+    /// cannot run). The command line is a Mac's: the native driver beside it.
     #[cfg(not(target_os = "macos"))]
-    #[test]
-    fn the_whole_machine_driver_is_refused_off_macos() {
-        let cli = parse(&["--driver=native-whole-machine", "--scratch=/s"]);
-        let error = node(&cli, || Err("unused".into()), std::path::Path::new("/x"))
+    #[tokio::test]
+    async fn the_whole_machine_driver_is_refused_off_macos() {
+        use super::super::native_config;
+        use super::super::tests::{scratch, tls_files};
+
+        let dir = scratch("whole-machine-off-macos");
+        tls_files(&dir);
+        let flag = |name: &str, path: &std::path::Path| format!("--{name}={}", path.display());
+        let flags = [
+            "kbf-daemon".to_owned(),
+            "--server=https://127.0.0.1:1".to_owned(),
+            flag("ca-cert", &dir.join("ca.pem")),
+            flag("cert", &dir.join("node.pem")),
+            flag("key", &dir.join("node.key")),
+            "--node-id=mac-1".to_owned(),
+            "--cas=https://127.0.0.1:1".to_owned(),
+            flag("scratch", &dir.join("leases")),
+            flag("xcode-apps", &dir.join("Applications")),
+            "--driver=native".to_owned(),
+            "--driver=native-whole-machine".to_owned(),
+        ];
+        let cli = Cli::try_parse_from(flags).expect("flags");
+        let error = node(&cli, || native_config(&cli), &dir.join("no-xcrun"))
             .err()
             .expect("started");
         assert!(error.to_string().contains("macOS only"), "{error}");
+        // The native runtime's Xcode survey may still be writing under it: not removed
+        // here (the next run of this test binary's pid would).
+        drop(dir);
     }
 
     /// Catches a node that starts with the whole-machine driver while the helper is not

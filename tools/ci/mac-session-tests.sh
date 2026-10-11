@@ -337,16 +337,18 @@ launchctl print "gui/$me" >/dev/null 2>&1 || fail "the runner has no gui/$me dom
 gui_dir=$(mktemp -d "$tmp/gui.XXXXXX")
 chmod 0755 "$gui_dir"
 real_dir=$(cd "$gui_dir" && pwd -P)
-probe='launchctl managername; id -u; id -G; pwd; echo "$HOME"'
+# managername names the launchd session a process is in: Aqua for a GUI session; from
+# the system context a user's process gets no name (launchctl says so on stderr).
+probe='echo "manager: $(/bin/launchctl managername 2>/dev/null || echo none)"; id -u; id -G; pwd; echo "$HOME"'
 spawn_in() {
   sudo -n launchctl bsexec 1 "$client" spawn "$1" "$me" "$my_gid" "$my_name" "$gui_dir" /bin/sh -c "$probe"
 }
 control=$(spawn_in background) || fail "the background spawn failed: $control"
 echo "background: $(echo "$control" | tr '\n' ' ')"
-[ "$(echo "$control" | sed -n 1p)" = System ] || fail "the control did not run in the system context: $control"
+[ "$(echo "$control" | sed -n 1p)" != "manager: Aqua" ] || fail "the control already ran in a GUI session: $control"
 gui=$(spawn_in gui) || fail "the GUI spawn failed: $gui"
 echo "gui: $(echo "$gui" | tr '\n' ' ')"
-want=$(printf '%s\n' Aqua "$me" "$my_gid" "$real_dir" "/Users/$my_name" "exit 0")
+want=$(printf '%s\n' "manager: Aqua" "$me" "$my_gid" "$real_dir" "/Users/$my_name" "exit 0")
 [ "$gui" = "$want" ] || fail "the GUI spawn: got [$gui], want [$want]"
 
 echo

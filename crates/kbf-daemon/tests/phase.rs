@@ -57,6 +57,15 @@ impl Runtime for Kills {
     }
 }
 
+/// Writes the daemon's log to the test's output at every level, so the arguments of
+/// its log lines run.
+fn log() {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::TRACE)
+        .with_test_writer()
+        .try_init();
+}
+
 fn wire(phase: Phase, lease: Option<(u64, u64)>, reason: &str) -> Option<WirePhase> {
     Some(WirePhase {
         phase: phase.into(),
@@ -82,6 +91,7 @@ async fn resent(peer: &mut Peer, within: Duration) -> Option<Hello> {
 /// serving sent as anything but no phase (what a daemon that predates the field sends).
 #[tokio::test]
 async fn every_hello_carries_the_phase_and_a_change_resends_it() {
+    log();
     let (phase, rx) = watch::channel(NodePhase::Preparing(LeaseId::new(1, 5)));
     let mut h = Harness::with_phase("phase-hello", Arc::new(Kills::default()), rx).await;
     let mut peer = h.session().await;
@@ -116,6 +126,7 @@ async fn every_hello_carries_the_phase_and_a_change_resends_it() {
 /// the lease's own epoch kills nothing.
 #[tokio::test]
 async fn a_lease_the_server_does_not_hold_is_killed_on_every_runtime() {
+    log();
     let kills = Arc::new(Kills::default());
     let (_phase, rx) = watch::channel(NodePhase::Preparing(LeaseId::new(5, 1)));
     let mut h = Harness::with_phase("phase-cancel", Arc::clone(&kills), rx).await;

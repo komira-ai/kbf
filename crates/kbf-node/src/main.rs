@@ -749,7 +749,7 @@ mod tests {
     }
 
     /// A CA and a client certificate signed by it, written to `dir` as the flags name.
-    fn tls_files(dir: &Path) {
+    pub(crate) fn tls_files(dir: &Path) {
         use rcgen::{CertificateParams, CertifiedIssuer, IsCa, KeyPair};
         let mut ca = CertificateParams::new(Vec::<String>::new()).expect("CA params");
         ca.is_ca = IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
