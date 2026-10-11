@@ -209,6 +209,33 @@ async fn a_guest_silent_before_ready_hits_the_boot_timeout() {
     assert!(leftovers(&config).is_empty(), "{:?}", leftovers(&config));
 }
 
+/// Catches a handshake error taken for a slow boot: a guest that refuses the driver's
+/// token (one booted with another lease's share, or a token written wrong) must end the
+/// lease at once as the farm's failure naming the refusal, not wait out the boot
+/// timeout nor be reported as a guest not ready in time.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_guest_that_refuses_the_token_ends_the_lease_at_once() {
+    let dir = scratch("wrong-token");
+    let mut config = config(&dir);
+    config.boot_timeout = Duration::from_secs(30);
+    let host = Arc::new(FakeHost::new().wrong_token());
+    let cas = Arc::new(MemoryCas::default());
+    let driver = driver(config.clone(), &host, &cas);
+    let action = Spec::sh("true").store(&cas);
+
+    let ended = tokio::time::timeout(Duration::from_secs(5), driver.run(work(1, action)))
+        .await
+        .expect("ended well before the boot timeout");
+
+    assert!(
+        matches!(ended, Err(RuntimeError::Failed(ref why)) if why.contains("wrong token") && !why.contains("not ready")),
+        "{ended:?}"
+    );
+    assert_eq!(host.stopped(), [name(1)]);
+    assert!(host.running().is_empty(), "{:?}", host.running());
+    assert!(leftovers(&config).is_empty(), "{:?}", leftovers(&config));
+}
+
 /// Catches the handshake's read bound left on the socket after `Ready`: the command's
 /// report would then be awaited with a read timeout of the boot time left, so every
 /// action that runs longer than that (minutes, against a two-minute boot timeout)

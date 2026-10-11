@@ -37,6 +37,8 @@ pub struct FakeHost {
     silence: Silence,
     /// How many stops succeed before every later one reports an error.
     stops_ok: usize,
+    /// Guests expect a token other than the one the driver wrote.
+    wrong_token: bool,
     state: Mutex<State>,
 }
 
@@ -100,6 +102,7 @@ impl FakeHost {
             session: GUI_SESSION.to_owned(),
             silence: Silence::Never,
             stops_ok: usize::MAX,
+            wrong_token: false,
             state: Mutex::new(State::default()),
         }
     }
@@ -139,6 +142,15 @@ impl FakeHost {
     #[must_use]
     pub fn mute_before_ready(mut self) -> Self {
         self.silence = Silence::BeforeReady;
+        self
+    }
+
+    /// Guests expect a token other than the one the driver wrote, so they refuse the
+    /// driver's `Hello` with `Refusal::Token`, as a guest booted with another lease's
+    /// share would.
+    #[must_use]
+    pub fn wrong_token(mut self) -> Self {
+        self.wrong_token = true;
         self
     }
 
@@ -224,7 +236,10 @@ impl VmHost for FakeHost {
         };
         let (inputs, outputs) = (share(INPUTS_TAG), share(OUTPUTS_TAG));
         // The guest reads its token from the inputs share, as `kbf-guest serve` does.
-        let token = read_token(&inputs.join(TOKEN_FILE))?;
+        let mut token = read_token(&inputs.join(TOKEN_FILE))?;
+        if self.wrong_token {
+            token[0] ^= 1;
+        }
         let config = Config {
             token,
             inputs,
