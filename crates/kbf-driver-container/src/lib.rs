@@ -25,8 +25,9 @@
 //!   watch that kills a lease which keeps pushing into swap at its own cap, past a
 //!   threshold of swap it pushed there itself (not swap the host moved; [`SwapKill`]), `cpu.weight` from the booked CPU, and `--oom-score-adj=0` on the
 //!   container (the daemon's leaf gets `memory.min`);
-//! - a wall-clock timeout, stdout and stderr captured into the CAS (each within
-//!   `--output-max-stdio-bytes`), the exit code from Podman's record, and a kernel OOM
+//! - a wall-clock timeout, which still stores what the action wrote to stdout and
+//!   stderr ([`kbf_daemon::RuntimeError::TimedOut`]), stdout and stderr captured into
+//!   the CAS (each within `--output-max-stdio-bytes`), the exit code from Podman's record, and a kernel OOM
 //!   kill told apart by the lease cgroup's `memory.events`: a kill at the lease's own
 //!   cap is [`kbf_daemon::RuntimeError::OutOfMemory`], one without it (the `actions/`
 //!   backstop or the host ran short) is [`kbf_daemon::RuntimeError::BusyNode`];

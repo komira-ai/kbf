@@ -3,9 +3,10 @@
 //! Each lease goes through the six driver steps
 //! (`docs/design/daemon.md#the-container-driver`):
 //! 1. **prepare:** fetch the Action and Command, check the image and paths, write the
-//!    input root into the lease's scratch directory, refuse outputs that are inputs,
-//!    give the overlay's directories to the container's root (a subordinate id, see
-//!    `podman::create_args`), make the lease cgroup;
+//!    input root into the lease's scratch directory, move each input an output names
+//!    into the overlay's upper directory, give the overlay's directories to the
+//!    container's root (a subordinate id, see `podman::create_args`), make the lease
+//!    cgroup;
 //! 2. **start:** `podman create`, then `podman start --attach`;
 //! 3. **watch:** wait for the exit, the timeout, [`Runtime::kill`], or a lease that
 //!    keeps pressing its own memory cap into swap ([`SwapKill`]), which the driver
@@ -33,7 +34,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
-use kbf_daemon::cas::Cas;
+use kbf_daemon::cas::{Cas, CasError};
 use kbf_daemon::{Runtime, RuntimeError, Work};
 use kbf_proto::reapi::{Action, ActionResult, Command, Platform};
 use kbf_types::LeaseId;
@@ -51,8 +52,8 @@ use crate::podman::{
 use crate::program;
 use crate::remove::remove_tree;
 use crate::tree::{
-    TreeError, check_relative, collect, fetch_message, materialize, output_paths,
-    refuse_hidden_working_directory, refuse_outputs_in_inputs,
+    TreeError, check_relative, collect, fetch_message, materialize, output_paths, prepare_outputs,
+    refuse_hidden_working_directory,
 };
 
 /// The driver name in the node report.
@@ -262,20 +263,11 @@ impl<C: Cas> PodmanRuntime<C> {
         refuse_hidden_working_directory(&root, &command.working_directory)
             .await
             .map_err(tree_error)?;
-        // Outputs are read from the upper layer, so none may already be an input.
-        refuse_outputs_in_inputs(&root, &command.working_directory, &outputs)
+        // Outputs are read from the upper layer: an input an output names moves there
+        // whole, and the working directory and each output's parent are made there.
+        prepare_outputs(&root, &upper, &command.working_directory, &outputs)
             .await
             .map_err(tree_error)?;
-        // REAPI: the worker makes the working directory and each output's parent.
-        let out_dir = upper.join(&command.working_directory);
-        let parents = outputs
-            .iter()
-            .filter_map(|output| Path::new(output).parent().map(|p| out_dir.join(p)));
-        for dir in std::iter::once(out_dir.clone()).chain(parents) {
-            tokio::fs::create_dir_all(&dir)
-                .await
-                .map_err(|e| failed(&dir, &e))?;
-        }
         // The container's root is a subordinate id (`--userns=nomap`), which may write
         // only under directories it owns.
         self.podman
@@ -364,7 +356,7 @@ impl<C: Cas> PodmanRuntime<C> {
             _ = child.wait() => {}
             () = tokio::time::sleep(timeout) => {
                 self.stop_container(&lease.name, &lease.cgroup, child).await;
-                return Err(RuntimeError::TimedOut);
+                return Err(self.timed_out(&lease.name, &stdout_path, &stderr_path).await);
             }
             Ok(by) = &mut *stop => {
                 *killer = Some(by);
@@ -430,13 +422,13 @@ impl<C: Cas> PodmanRuntime<C> {
             &mut result,
         )
         .await
-        .map_err(tree_error)?;
+        .map_err(outputs_error)?;
         let max = self.config.outputs.max_stdio_bytes;
         for (path, slot) in [
             (&stdout_path, &mut result.stdout_digest),
             (&stderr_path, &mut result.stderr_digest),
         ] {
-            *slot = Some(collect_log(cas, path, max).await.map_err(tree_error)?);
+            *slot = Some(collect_log(cas, path, max).await.map_err(outputs_error)?);
         }
         Ok(result)
     }
@@ -480,6 +472,23 @@ impl<C: Cas> PodmanRuntime<C> {
             ManifestKind::Image => Ok(()),
             ManifestKind::Index => Err(ImageCheckError::Index(image.clone())),
         }
+    }
+
+    /// [`RuntimeError::TimedOut`] with what the stopped action wrote to stdout and
+    /// stderr, each stored within the stdio limit (REAPI's partial result). A log past
+    /// the limit, or one that cannot be stored, is left out: the answer is still the
+    /// timeout.
+    async fn timed_out(&self, name: &str, stdout: &Path, stderr: &Path) -> RuntimeError {
+        let max = self.config.outputs.max_stdio_bytes;
+        let mut logs = [None, None];
+        for (path, slot) in [stdout, stderr].into_iter().zip(&mut logs) {
+            match collect_log(&*self.cas, path, max).await {
+                Ok(digest) => *slot = Some(digest),
+                Err(e) => tracing::warn!(lease = %name, "timed out; its log is left out: {e}"),
+            }
+        }
+        let [stdout, stderr] = logs;
+        RuntimeError::TimedOut { stdout, stderr }
     }
 
     /// The swap watch's kill: `cgroup.kill` at once (the lease is over its cap, so no
@@ -794,7 +803,20 @@ fn timeout_of(action: &Action, default: Duration) -> Result<Duration, RuntimeErr
     Ok(if timeout.is_zero() { default } else { timeout })
 }
 
+/// A [`TreeError`] reading the action's inputs, as the lease reports it: a missing
+/// blob is the client's to upload, a broken rule is the client's error, and anything
+/// else is the farm's.
 fn tree_error(error: TreeError) -> RuntimeError {
+    match error {
+        TreeError::Cas(CasError::Missing(blob)) => RuntimeError::MissingBlob(blob),
+        other => outputs_error(other),
+    }
+}
+
+/// A [`TreeError`] storing the action's outputs, as the lease reports it: a broken
+/// rule is the client's error and anything else, a missing blob included (it is not
+/// the client's to upload), is the farm's.
+fn outputs_error(error: TreeError) -> RuntimeError {
     match error {
         TreeError::Invalid(why) => RuntimeError::Invalid(why),
         other => RuntimeError::Failed(other.to_string()),
@@ -1031,5 +1053,29 @@ mod tests {
             .expect_err("the task panicked");
         let why = clean_task_failed(panicked);
         assert!(why.starts_with("clean task: "), "{why}");
+    }
+
+    /// Catches an error reported as the wrong party's: a missing input as anything but
+    /// `MissingBlob` with its digest (#130: the client never uploads it), a missing
+    /// blob while storing outputs as the client's to upload, a corrupt input as
+    /// missing, and a broken rule as the farm's. (Compared as text: a pattern guard
+    /// would be a branch the coverage ratchet counts and no run takes.)
+    #[test]
+    fn errors_are_reported_as_whose_they_are() {
+        let shown = |e: RuntimeError| format!("{e:?}");
+        let missing = || TreeError::Cas(CasError::Missing("ab/1".to_owned()));
+        assert_eq!(shown(tree_error(missing())), "MissingBlob(\"ab/1\")");
+        assert_eq!(
+            shown(outputs_error(missing())),
+            "Failed(\"blob ab/1 is not in the CAS\")"
+        );
+        let corrupt = TreeError::Cas(CasError::Corrupt("a".into(), "b".into()));
+        assert_eq!(
+            shown(tree_error(corrupt)),
+            "Failed(\"blob a failed verification: its bytes hash to b\")"
+        );
+        for map in [tree_error, outputs_error] {
+            assert_eq!(shown(map(TreeError::Invalid("x".into()))), "Invalid(\"x\")");
+        }
     }
 }

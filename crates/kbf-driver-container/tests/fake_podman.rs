@@ -4,6 +4,7 @@
 //! real rootless Podman.
 
 mod fake_memory;
+mod fake_missing_blobs;
 mod support;
 
 use std::path::{Path, PathBuf};
@@ -259,19 +260,64 @@ async fn an_image_the_store_cannot_vouch_for_is_an_infrastructure_failure() {
     assert_eq!(result.exit_code, 0);
 }
 
-/// Catches a timeout that is not enforced, or that leaves the container behind.
+/// Catches a timeout that is not enforced, or that leaves the container behind; and
+/// (issue #45) a timeout that loses what the action wrote to stdout and stderr before
+/// it was stopped, or swaps the two.
 #[tokio::test]
 async fn a_timeout_stops_the_action_and_cleans_up() {
     let fake = Fake::new("timeout");
     let mut spec = Spec::new(&image(), "unused");
-    spec.timeout = Some(Duration::from_millis(300));
-    let outcome = fake.run(1, &spec, "sleep 30").await;
-    assert!(
-        matches!(outcome, Err(RuntimeError::TimedOut)),
-        "{outcome:?}"
-    );
+    // Room for the two echoes to land before the timeout on a loaded runner.
+    spec.timeout = Some(Duration::from_secs(1));
+    let outcome = fake
+        .run(1, &spec, "echo started; echo warming >&2; sleep 30")
+        .await;
+    let Err(RuntimeError::TimedOut { stdout, stderr }) = outcome else {
+        panic!("{outcome:?}");
+    };
+    assert_eq!(blob(&fake.cas, stdout.as_ref()), b"started\n");
+    assert_eq!(blob(&fake.cas, stderr.as_ref()), b"warming\n");
     assert!(fake.calls().contains(&"kill".to_owned()));
     fake.assert_clean(1);
+}
+
+/// Catches (issue #45) a timed-out action's partial logs read with no limit, and one
+/// log past the stdio limit failing the lease or taking the other log with it: the
+/// timeout is still the answer, the log within the limit is stored, the one past it is
+/// left out. Each stream in turn, so a limit applied to one only shows.
+#[tokio::test]
+async fn a_timed_out_log_past_its_limit_is_left_out() {
+    const MAX: u64 = 16;
+    let fake = Fake::with("timeout-stdio", |config| {
+        config.outputs.max_stdio_bytes = MAX;
+    });
+    let mut spec = Spec::new(&image(), "unused");
+    spec.timeout = Some(Duration::from_secs(1));
+    let past = MAX + 1;
+    let cases = [
+        (
+            1,
+            format!("head -c {past} /dev/zero; echo kept >&2; sleep 30"),
+        ),
+        (
+            2,
+            format!("echo kept; head -c {past} /dev/zero >&2; sleep 30"),
+        ),
+    ];
+    for (seq, script) in cases {
+        let outcome = fake.run(seq, &spec, &script).await;
+        let Err(RuntimeError::TimedOut { stdout, stderr }) = outcome else {
+            panic!("{script}: {outcome:?}");
+        };
+        let (kept, left_out) = if seq == 1 {
+            (stderr, stdout)
+        } else {
+            (stdout, stderr)
+        };
+        assert_eq!(left_out, None, "{script}");
+        assert_eq!(blob(&fake.cas, kept.as_ref()), b"kept\n", "{script}");
+        fake.assert_clean(seq);
+    }
 }
 
 /// Catches `kill` returning before the work has stopped and the lease is clean, and a
@@ -311,7 +357,7 @@ async fn sigterm_ignored_falls_back_to_cgroup_kill() {
     let script = "trap '' TERM; while :; do sleep 0.05; done";
     let outcome = fake.run(1, &spec, script).await;
     assert!(
-        matches!(outcome, Err(RuntimeError::TimedOut)),
+        matches!(outcome, Err(RuntimeError::TimedOut { .. })),
         "{outcome:?}"
     );
     // The overlay's owners are `tests/userns.rs`'s to check.
@@ -513,7 +559,7 @@ async fn the_kill_path_ends_even_when_every_signal_fails() {
     // With its lease cgroup gone, cgroup.kill cannot be written either.
     let outcome = fake.run(1, &spec, r#"find "$CG" -delete; sleep 30"#).await;
     assert!(
-        matches!(outcome, Err(RuntimeError::TimedOut)),
+        matches!(outcome, Err(RuntimeError::TimedOut { .. })),
         "{outcome:?}"
     );
     fake.assert_clean(1);
@@ -610,8 +656,8 @@ fn the_driver_serves_action_leases_only() {
     assert!(!fake.runtime.serves("whole_machine"));
 }
 
-/// Catches an Action without a Command or an input root being run with defaults, and
-/// a missing input blob being reported as the client's error rather than the farm's.
+/// Catches an Action without a Command or an input root being run with defaults. A
+/// missing blob is `fake_missing_blobs`'s.
 #[tokio::test]
 async fn incomplete_actions_are_refused() {
     use kbf_proto::reapi::Action;
@@ -626,7 +672,7 @@ async fn incomplete_actions_are_refused() {
     };
     let no_root = Action {
         input_root_digest: None,
-        ..action.clone()
+        ..action
     };
     for (seq, broken) in [no_command, no_root].into_iter().enumerate() {
         let digest = fake.cas.insert(broken.encode_to_vec());
@@ -639,20 +685,7 @@ async fn incomplete_actions_are_refused() {
             "{outcome:?}"
         );
     }
-    let missing_root = Action {
-        input_root_digest: Some(kbf_daemon::cas::digest_of(b"not stored")),
-        ..action
-    };
-    let digest = fake.cas.insert(missing_root.encode_to_vec());
-    let outcome = fake
-        .runtime
-        .run(work(3, digest, Resources::default()))
-        .await;
-    assert!(
-        matches!(outcome, Err(RuntimeError::Failed(ref why)) if why.contains("not in the CAS")),
-        "{outcome:?}"
-    );
-    for seq in 1..=3 {
+    for seq in 1..=2 {
         fake.assert_clean(seq);
     }
     assert!(!fake.calls().contains(&"create".to_owned()));
@@ -832,61 +865,133 @@ async fn an_output_too_deep_fails_the_action_not_the_daemon() {
     fake.assert_clean(2);
 }
 
-/// Catches an output that is already an input being run and cached incomplete: the
-/// driver reads outputs from the overlay's upper layer, so an output directory `pkg`
-/// over the input `pkg/in.txt` would come back holding only what the action wrote, and
-/// an unchanged input named as an output file would come back missing. Each is the
-/// client's error, refused before Podman creates anything.
+/// Inputs named as outputs come back as the action left them (REAPI collects outputs
+/// after the action, from its whole tree; the native driver reads them from its input
+/// root). Catches each such output read from the upper layer without its inputs: an
+/// unchanged input file missing or an output directory without its unchanged files
+/// (the inputs never moved up), an input left in the lower layer as well (on a real
+/// overlay a delete would then be a whiteout and an edit a copy-up), the inputs moved
+/// to the upper layer's root instead of the working directory, outputs taken in the
+/// client's order (the file `dir/keep.txt` moved up first, then `dir` cannot move onto
+/// the parent made for it), and an input beside the outputs moved too.
 #[tokio::test]
-async fn outputs_that_are_inputs_are_refused_before_anything_runs() {
+async fn inputs_named_as_outputs_come_back_as_the_action_left_them() {
     let fake = Fake::new("overlap");
+    let mut spec = Spec::new(&image(), "unused");
+    spec.working_directory = "pkg".to_owned();
+    spec.inputs = vec![
+        ("pkg/same.txt", b"same bytes", false),
+        ("pkg/edit.txt", b"old", true),
+        ("pkg/other.txt", b"other", false),
+        ("pkg/dir/keep.txt", b"keep", false),
+        ("pkg/dir/gone.txt", b"gone", false),
+        ("pkg/dir/changed.txt", b"before", false),
+        ("pkg/dir/sub/deep.txt", b"deep", false),
+    ];
+    spec.outputs = ["dir/keep.txt", "same.txt", "edit.txt", "dir"]
+        .map(str::to_owned)
+        .to_vec();
+    // The fake runs the action on the two layers apart: what it sees in `$UPPER` is
+    // what a real overlay would hold in its upper directory.
+    let script = r#"
+        set -e
+        for p in same.txt edit.txt dir; do [ ! -e "$ROOT/pkg/$p" ]; done
+        [ "$(cat "$ROOT/pkg/other.txt")" = other ] && [ ! -e "$UPPER/pkg/other.txt" ]
+        u="$UPPER/pkg"
+        [ "$(cat "$u/same.txt")" = "same bytes" ] && [ -x "$u/edit.txt" ]
+        printf ' new' >> "$u/edit.txt"
+        rm "$u/dir/gone.txt"
+        echo after > "$u/dir/changed.txt"
+    "#;
+    let result = fake.run(1, &spec, script).await.expect("ran");
+    assert_eq!(
+        result.exit_code,
+        0,
+        "stderr: {}",
+        String::from_utf8_lossy(&blob(&fake.cas, result.stderr_digest.as_ref()))
+    );
+    let file = |path: &str| {
+        let found = result.output_files.iter().find(|f| f.path == path);
+        let found = found.unwrap_or_else(|| panic!("{path} not collected: {result:?}"));
+        (blob(&fake.cas, found.digest.as_ref()), found.is_executable)
+    };
+    assert_eq!(file("same.txt"), (b"same bytes".to_vec(), false));
+    assert_eq!(file("edit.txt"), (b"old new".to_vec(), true));
+    assert_eq!(file("dir/keep.txt"), (b"keep".to_vec(), false));
+    assert_eq!(result.output_files.len(), 3, "{result:?}");
+    assert_eq!(result.output_directories.len(), 1, "{result:?}");
+    let dir = tree(&fake.cas, result.output_directories[0].tree_digest.as_ref());
+    let root = dir.root.expect("root");
+    let names: Vec<_> = root.files.iter().map(|f| f.name.as_str()).collect();
+    assert_eq!(names, ["changed.txt", "keep.txt"], "gone.txt deleted");
+    assert_eq!(blob(&fake.cas, root.files[0].digest.as_ref()), b"after\n");
+    assert_eq!(blob(&fake.cas, root.files[1].digest.as_ref()), b"keep");
+    assert_eq!(root.directories.len(), 1, "{root:?}");
+    assert_eq!(dir.children[0].files[0].name, "deep.txt");
+    assert_eq!(
+        blob(&fake.cas, dir.children[0].files[0].digest.as_ref()),
+        b"deep"
+    );
+    fake.assert_clean(1);
+}
+
+/// Catches the parents of the outputs made through an input symlink that another
+/// output moved into the upper layer: from there `lnk` points at the scratch directory
+/// that holds the leases, so following it would make `escaped/y` there, outside the
+/// lease. The action is the client's error, as on the native driver, and nothing is
+/// created.
+#[tokio::test]
+async fn an_output_below_an_input_symlink_named_as_an_output_is_refused() {
+    let fake = Fake::new("overlap-link");
+    let mut spec = Spec::new(&image(), "unused");
+    spec.working_directory = "pkg".to_owned();
+    spec.inputs = vec![("pkg/in.txt", b"input bytes", false)];
+    spec.symlinks = vec![("pkg/lnk", "../../..")];
+    spec.outputs = vec!["lnk".to_owned(), "lnk/escaped/y".to_owned()];
+    let outcome = fake.run(1, &spec, "exit 0").await;
+    assert!(
+        matches!(outcome, Err(RuntimeError::Invalid(ref why)) if why.contains("lnk")),
+        "{outcome:?}"
+    );
+    fake.assert_clean(1);
+    let scratch = fake.lease_dir(1);
+    let scratch = scratch.parent().expect("the scratch directory");
+    assert!(!exists(&scratch.join("escaped")));
+    assert!(!fake.calls().contains(&"create".to_owned()));
+}
+
+/// Catches a working directory hidden by an input symlink being run: the directory the
+/// driver makes for it in the upper layer would hide the link, so the action would
+/// start in an empty directory. Also catches an output beside the inputs, under an
+/// input directory, not running.
+#[tokio::test]
+async fn a_hidden_working_directory_is_refused_before_anything_runs() {
+    let fake = Fake::new("hidden-wd");
     let mut spec = Spec::new(&image(), "unused");
     spec.inputs = vec![("pkg/in.txt", b"input bytes", false)];
     let script = r#"echo x > "$UPPER/pkg/new""#;
-    for (seq, (wd, output)) in [("", "pkg"), ("", "pkg/in.txt"), ("pkg", "in.txt")]
-        .into_iter()
-        .enumerate()
-    {
-        let seq = seq as u64 + 1;
-        spec.working_directory = wd.to_owned();
-        spec.outputs = vec![output.to_owned()];
-        let outcome = fake.run(seq, &spec, script).await;
-        assert!(
-            matches!(outcome, Err(RuntimeError::Invalid(ref why)) if why.contains(output)),
-            "{wd:?} {output:?}: {outcome:?}"
-        );
-        fake.assert_clean(seq);
-    }
-    assert!(
-        !fake.calls().contains(&"create".to_owned()),
-        "{:?}",
-        fake.calls()
-    );
-
-    // A working directory that is an input symlink is refused the same way: the
-    // directory the driver makes for it would hide the link.
     spec.symlinks = vec![("lnk", "pkg")];
     spec.working_directory = "lnk".to_owned();
     spec.outputs = vec!["out".to_owned()];
-    let outcome = fake.run(5, &spec, script).await;
+    let outcome = fake.run(1, &spec, script).await;
     assert!(
         matches!(outcome, Err(RuntimeError::Invalid(ref why)) if why.contains("working directory")),
         "{outcome:?}"
     );
-    fake.assert_clean(5);
+    fake.assert_clean(1);
     assert!(!fake.calls().contains(&"create".to_owned()));
     spec.symlinks = Vec::new();
 
     // An output beside the inputs, under an input directory, still runs.
     spec.working_directory = String::new();
     spec.outputs = vec!["pkg/new".to_owned()];
-    let result = fake.run(4, &spec, script).await.expect("ran");
+    let result = fake.run(2, &spec, script).await.expect("ran");
     assert_eq!(result.output_files.len(), 1, "{result:?}");
     assert_eq!(
         blob(&fake.cas, result.output_files[0].digest.as_ref()),
         b"x\n"
     );
-    fake.assert_clean(4);
+    fake.assert_clean(2);
 }
 
 /// Catches a kill that waits for a slow prepare step (an input fetch, an image store

@@ -49,6 +49,7 @@ which is a result.
 |---|---|---|
 | `automation_mode.sh` | status as the runner user; `enable-automationmode-without-authentication` under a 60 s watchdog, only while the status says authentication is required; a new standard user added, the status read as that user, the user deleted, the status read again | `disable-automationmode-without-authentication` must bring "requires authentication" back. It runs first when the image starts out not requiring authentication, last otherwise, so both transitions are seen |
 | `simctl.sh` (the runner's own session) | newest available iOS runtime and an iPhone device type; `simctl --set <dir>` create, boot, `bootstatus -b` (10 min watchdog), `io screenshot` (must be a PNG), shutdown, delete; then leftover `launchd_sim` processes and device-set entries | a boot under a sandbox profile that denies the lookup of `com.apple.CoreSimulator.CoreSimulatorService` must fail, and the same boot under `(allow default)` alone must succeed |
+| `volume_owner.sh` (VM probe P0 of [macos-vm-guests.md](../design/macos-vm-guests.md#11-probes-later-prs-must-run)) | a fresh standard user, added with `sysadminctl -addUser`, runs (through `sudo -n -H -u`) `hdiutil create` of a 64 MiB APFS image, `hdiutil attach -owners on` (its mount line recorded), two copies of a small plist into it, `chown 0:0` on the first (status and text recorded) while the second (the keep file) stays at the user's uid, a read of the owner this first attach shows, and a detach; then root re-attaches the image read-only with `-owners on` and reads both owners. The verdict follows that re-attach, not the first attach's view. The writer's uid and groups are read through the same `sudo -u` the writes use; then the scratch directory is deleted, and the user too, but only if this run's creation marker (the uid `sysadminctl` gave it) is there and the name still has that uid. If the probe user exists before the probe, the probe does not start: it may be a real account, so the probe runs no `sysadminctl` or `hdiutil`, leaves the user and says BROKEN | the same create, attach, copy, chown and detach as root, and the same re-attach read, must give uid 0; the user's keep file must read back as the user's uid, so the re-attach is shown able to read a non-root owner too (macOS reports a `noowners` volume's files as owned by the reader, which for root is `0:0`); and both re-attaches must be in the mount table without `noowners`. A writer that is admin or root is BROKEN too: the probe would not be asking about a fresh standard user |
 | `tcc.sh` (instrument for the Screen Recording and Accessibility questions) | SIP status; the ScreenCapture, Accessibility, ListenEvent and PostEvent rows of the system and the user TCC database, each read as the runner user and as root | the same reader over a planted database must return exactly its one known row |
 
 The status text of `automationmodetool` is parsed, case-insensitively, as two fields:
@@ -67,7 +68,18 @@ as not required; enable run whatever the last status said; a verdict that ignore
 the control arm (each probe); a watchdog that leaves stdin open; a simctl verdict
 that ignores the `(allow default)` boot, `bootstatus` or a failed delete; error text
 from create taken as a UDID; a screenshot not checked to be a PNG; a simulator
-booted in the default device set.
+booted in the default device set; for P0, a verdict that ignores the root control,
+the owner taken from the first attach instead of the re-attach, the writes run as the
+runner (an admin) instead of the fresh standard user, a verdict that ignores an admin
+writer or the step where the write stopped, a verdict that ignores `noowners` on
+either re-attach (or takes a re-attach missing from the mount table as owners
+honoured, or finds the word in the mount point's path), a verdict that ignores the
+keep file or reads it from the chowned copy, an owner compared on its gid, a failed
+detach recorded as done, a cleanup that leaves the user or skips (or does not force)
+the detach of a mount left behind; and, so that the probe never deletes an account it
+did not make, a probe that skips the check for a user that existed before, a cleanup
+that ignores the creation marker or does not compare its uid, and a marker kept from
+an earlier run.
 
 ## Results
 
@@ -126,6 +138,29 @@ a hosted runner a shell-launched UI test inherits Screen Recording and Accessibi
 grants that a fresh farm user will not have. A hosted UI-test result says nothing
 about prompts.
 
+**VM probe P0 (`volume_owner.sh`).** Runs `38120894541` (commit `3572c58`) and
+`38121390097` (commit `fa2e91e`, which added the mount lines), both labels, gave the
+same verdict: FAIL. A fresh standard user (uid 502; groups `staff`, `everyone`,
+`localaccounts` and three the image adds, no `admin`) created a 64 MiB APFS image,
+attached it and copied the plist in, all with status 0. Its mount line was `apfs,
+local, nodev, nosuid, journaled, nobrowse, mounted by kbfp0`: no `noowners`, so
+`-owners on` took. Its `chown 0:0` failed with `Operation not permitted`. The first
+attach showed `502:20`, and so did root's read-only re-attach. The root control
+(same steps via `sudo -n`) read back `0:0` from its re-attach, so the reader can show
+a root owner. Cleanup deleted the user and the scratch directory on every run.
+Run `38126351622` (commit `6f2e739`, which added the keep file and the mount-flag
+checks) gave the same FAIL on both labels: neither re-attach was `noowners`, and the
+keep file the user left at its uid read back `502:20`, so the re-attach shows a
+non-root owner as stored.
+`sysadminctl` printed the same FileVault warning as in the automation-mode probe.
+
+So on hosted macOS 15.7.9 and 26.6.2 a standard user cannot make a root-owned file
+in a disk image it attached itself, even with owners honoured. Inferred, not
+measured: this is the usual rule that only root may give a file away, not something
+particular to disk images, so other ways of writing the file as that user (an
+archive extracted with owners kept, a copy that keeps owners) would fail the same
+way. Those variants were not run.
+
 ## Not covered here (planned)
 
 - **`xcodebuild test` of a UI test target.** The repository has no UI-test fixture
@@ -144,4 +179,5 @@ about prompts.
 | The setting across user deletion | Settled as a status reading: a new standard user, and a reading after that user is deleted, still see not required | That a UI test in a fresh standard user's **console session** starts without an authentication sheet: that needs a person to log the user in (FileVault on rules out auto-login) and watch |
 | Simulators outside a logged-in session | Settled for the runner's own Aqua session: `simctl` works with a private device set, cleans up after delete, and a sandbox deny of CoreSimulatorService stops it | Whether it works from a LaunchDaemon with nobody logged in, on the Studio's build, with the runtimes installed there |
 | Screen Recording need of XCUITest | Only what the image seeded: SIP is off and ScreenCapture is pre-granted to the shell and the runner's agents, so a hosted run cannot answer it | Whether a UI test needs the grant at all, whether a grant persists across users and runner rebuilds: arms in fresh standard users' sessions, with a person to see and click prompts |
+| VM probe P0: a root-owned file in an attached image without root | Settled for hosted macOS 15 and 26: no. A fresh standard user's `chown 0:0` in an image it attached with owners honoured is refused, and a root re-attach reads the user's own uid; the root control reads root | The same on the Studio's macOS build, with the account the image builder will run as. This result is mechanics only; the Studio still decides, and the root helper verb or the MDM route of [macos-vm-guests.md](../design/macos-vm-guests.md#10-open-decisions) is then chosen |
 | Accessibility | As above, the seeded rows only | The same Studio arms, and the profile route once a Studio is enrolled in device management |

@@ -80,6 +80,48 @@ mutant 'the TCC verdict ignores the control row' tcc.sh t_tcc_control_empty \
     's/^if \[ "$(st_get control)" = ok \]; then/if true; then/'
 mutant 'the TCC reader never reads as root' tcc.sh t_tcc_pass \
     's/^a_system_root() { tcc_read system.as_root "$SYSTEM_DB" sudo -n || true; }/a_system_root() { tcc_read system.as_root "$SYSTEM_DB" || true; }/'
+mutant 'the P0 verdict ignores the root control' volume_owner.sh t_vo_control_lost \
+    's/elif \[ "${control%%:\*}" != 0 \]; then/elif false; then/'
+mutant 'the P0 owner is read from the first attach, not a re-attach' volume_owner.sh t_vo_chown_lies \
+    's/owner=$(st_get reattach)/owner=$(st_get write.first)/'
+mutant 'the P0 writes run as the runner (an admin), not the fresh standard user' volume_owner.sh t_vo_fail \
+    's/^as_user() { sudo -n -H -u "$PROBE_USER" "$@"; }/as_user() { "$@"; }/'
+mutant 'the P0 verdict ignores an admin writer' volume_owner.sh t_vo_admin_writer \
+    's/if \[ "$writer" = admin \] || \[ "$writer" = root \]; then/if false; then/'
+mutant 'the P0 probe skips the check for a user that existed before' volume_owner.sh t_vo_user_existed \
+    's/^if id "$PROBE_USER" >\/dev\/null 2>&1; then$/if false; then/'
+mutant "the P0 cleanup ignores the creation marker (takes the name's current uid)" volume_owner.sh t_vo_user_existed \
+    's/^    created=$(st_get created_uid)$/    created=$(id -u "$PROBE_USER" 2>\/dev\/null || true)/'
+mutant 'the P0 cleanup deletes by name without comparing the recorded uid' volume_owner.sh t_vo_user_recreated \
+    's/^    elif \[ "$now" != "$created" \]; then$/    elif false; then/'
+mutant 'the P0 probe keeps a creation marker from an earlier run' volume_owner.sh t_vo_stale_marker \
+    '/^st_set created_uid ""$/d'
+mutant 'the P0 cleanup skips the force-detach of a mount left behind' volume_owner.sh t_vo_detach_busy \
+    's/^        \[ -n "$m" \] || continue$/        continue/'
+mutant 'the P0 cleanup detaches without -force' volume_owner.sh t_vo_detach_busy \
+    's/as_root hdiutil detach -force "$m"/as_root hdiutil detach "$m"/'
+mutant 'the P0 write records a failed detach as done' volume_owner.sh t_vo_detach_busy \
+    's/^    detach "$label" "$run" "$mnt" || return 0$/    detach "$label" "$run" "$mnt" || true/'
+mutant 'the P0 verdict compares the owner on its gid' volume_owner.sh t_vo_group_root \
+    's/elif \[ "${owner%%:\*}" = 0 \]; then/elif [ "${owner##*:}" = 0 ]; then/'
+mutant 'the P0 verdict ignores where the write stopped' volume_owner.sh t_vo_attach_fails \
+    's/elif \[ "$reached" != detach \]; then/elif false; then/'
+mutant 'the P0 verdict ignores noowners on a re-attach (the false PASS)' volume_owner.sh 't_vo_noowners t_vo_control_noowners' \
+    '/^        \*", noowners,"\*) return 1 ;;$/d'
+mutant 'the P0 noowners check reads the whole mount line, path included' volume_owner.sh t_vo_noowners \
+    's/^    case ", $flags," in$/    case "$line" in/;s/^        \*", noowners,"\*) return 1 ;;$/        *noowners*) return 1 ;;/'
+mutant 'the P0 verdict takes a re-attach missing from the mount table as owners on' volume_owner.sh t_vo_mount_unlisted \
+    's/^        "" | "not in the mount table") return 1 ;;$/        "") return 1 ;;/'
+mutant "the P0 verdict ignores the user re-attach's mount flags" volume_owner.sh 't_vo_noowners t_vo_mount_unlisted' \
+    's/^    elif ! owners_on reattach; then$/    elif false; then/'
+mutant "the P0 verdict ignores the control re-attach's mount flags" volume_owner.sh t_vo_control_noowners \
+    's/^    elif ! owners_on control_reattach; then$/    elif false; then/'
+mutant 'the P0 verdict ignores the keep file left at the user uid' volume_owner.sh t_vo_shows_caller \
+    's/^    elif \[ "${keep%%:\*}" != "$uid" \]; then$/    elif false; then/'
+mutant 'the P0 keep owner is read from the chowned file' volume_owner.sh t_vo_pass \
+    's/keep=$(as_root stat -f %u:%g "$mnt\/$KEEP" 2>&1)/keep=$(as_root stat -f %u:%g "$mnt\/$FILE" 2>\&1)/'
+mutant 'the P0 cleanup leaves the user' volume_owner.sh t_vo_fail \
+    's/kv cleanup.delete_user "$(run_cap watchdog "$WATCHDOG" as_root sysadminctl -deleteUser "$PROBE_USER")"/:/'
 mutant 'verdicts.sh lets a BROKEN verdict through' verdicts.sh t_verdicts \
     's/    case "$v" in BROKEN\*) bad=1 ;; esac/    :/'
 mutant 'verdicts.sh lets a missing verdict through' verdicts.sh t_verdicts \

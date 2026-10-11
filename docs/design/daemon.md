@@ -186,7 +186,7 @@ its exit code. Its errors map to the `Result` status the server sees:
 | `RuntimeError` | `Result` status |
 |---|---|
 | `Killed` | `ABORTED` |
-| `TimedOut` | `DEADLINE_EXCEEDED` |
+| `TimedOut { stdout, stderr }` | `DEADLINE_EXCEEDED`, with an `action_result` holding the two log digests the driver stored (the partial result), unless it stored neither |
 | `Invalid(why)` | `INVALID_ARGUMENT`: the client's error, never retried |
 | `MissingBlob(digest)` | `FAILED_PRECONDITION` with a `MISSING` violation |
 | `Failed(why)` | `INTERNAL`: the farm's failure |
@@ -238,14 +238,20 @@ never reused. Each lease goes through six steps.
      `Directory` messages is checked (no slash, `.`, `..` or NUL; no name twice) and
      files are created exclusively in directories the driver made, so no write follows
      a symlink the input tree planted.
-   - Refuse an action whose output path already exists in the input root, and one whose
-     working directory is hidden by an input file or symlink of the same name, as
-     `INVALID_ARGUMENT`.
+   - Refuse an action whose working directory is hidden by an input file or symlink of
+     the same name, as `INVALID_ARGUMENT`.
+   - Move each entry of the input root that an output path names, whole, into the
+     overlay's upper directory, then make the working directory and each output's
+     parent there (see Output collection). A parent made through a symlink is refused
+     as `INVALID_ARGUMENT`.
    - Give the overlay's directories to the container's root (see User namespaces).
    - Make the lease cgroup (below).
 2. **Start.** `podman create`, then `podman start --attach`, with stdout and stderr
    written to files in the scratch directory.
-3. **Watch.** Wait for the container to exit, the action's timeout, or `kill`.
+3. **Watch.** Wait for the container to exit, the action's timeout, or `kill`. On a
+   timeout, once the container is stopped, store what it wrote to stdout and stderr in
+   the CAS, each within the stdio limit; a log past the limit, or one that cannot be
+   stored, is left out, and the lease still ends `TimedOut`.
 4. **Collect.** Read the exit code from Podman's record of the container. If it is 137
    (SIGKILL), or there is none, and the lease cgroup's `memory.events` counts an
    `oom_kill`, the lease fails as out of memory or as killed on a busy node (see
@@ -424,8 +430,17 @@ its execution platform passes on as `container-image`), starts one `kbf-server` 
 ## Output collection
 
 Outputs are read from the overlay's upper directory, which holds only what the action
-created or changed. That is why no output may already exist in the input root: an
-output read from the upper directory must be whole there.
+created or changed. An output read from there must be whole there, so an output path
+that names an entry of the input root (REAPI allows it; Bazel and Buck2 never send it)
+gets that entry moved from the lower to the upper directory before the overlay is
+mounted. The action sees the same tree; what it changes is changed in place, what it
+deletes is unlinked (no lower entry is left to hide, so no whiteout), and the output
+is read back as the action left it: an unchanged input whole, an edited one with its
+new bytes, a deleted one absent. That is what the native driver collects from its
+input root. Outputs are taken ancestors first, so one below another moves with it. The
+walk to an output follows no symlink and stops at the first component that is absent
+or not a directory: the parent made for the output in the upper directory hides a lower
+file or symlink of that name instead of merging with it.
 
 The upper directory is the action's to shape. It could replace the working directory,
 or any directory on an output's path, with a symlink to a host path

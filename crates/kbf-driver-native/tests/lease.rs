@@ -449,7 +449,54 @@ async fn a_lease_directory_that_stays_fails_the_lease() {
     let outcome = run(&rt, &cas, 2, &spec).await;
     reopen();
     assert!(
-        matches!(outcome, Err(RuntimeError::TimedOut)),
+        matches!(outcome, Err(RuntimeError::TimedOut { .. })),
         "{outcome:?}"
     );
+}
+
+/// Catches (issue #45) a timeout that loses what the action wrote to stdout and
+/// stderr before it was stopped, or swaps the two; a partial log read with no limit;
+/// and one log past the stdio limit failing the lease or taking the other with it
+/// (the timeout is still the answer; each stream in turn, so a limit applied to one
+/// only shows).
+#[tokio::test]
+async fn a_timeout_keeps_the_logs_written_before_it() {
+    const MAX: u64 = 16;
+    let dir = scratch("timeout-logs");
+    let mut config = config(&dir);
+    config.outputs.max_stdio_bytes = MAX;
+    let cas = Arc::new(MemoryCas::default());
+    let rt = runtime(config.clone(), &cas);
+    let past = MAX + 1;
+    let cases = [
+        (
+            "echo started; echo warming >&2".to_owned(),
+            Some("started\n"),
+            Some("warming\n"),
+        ),
+        (
+            format!("head -c {past} /dev/zero; echo kept >&2"),
+            None,
+            Some("kept\n"),
+        ),
+        (
+            format!("echo kept; head -c {past} /dev/zero >&2"),
+            Some("kept\n"),
+            None,
+        ),
+    ];
+    for (seq, (script, want_out, want_err)) in (1..).zip(cases) {
+        // Room for the writes to land before the timeout on a loaded runner.
+        let spec = Spec::sh(&format!("{script}; sleep 300")).timeout(Duration::from_secs(1));
+        let outcome = run(&rt, &cas, seq, &spec).await;
+        let Err(RuntimeError::TimedOut { stdout, stderr }) = outcome else {
+            panic!("{script}: {outcome:?}");
+        };
+        let text = |d: Option<kbf_proto::reapi::Digest>| {
+            d.map(|d| String::from_utf8(cas.blob(&d)).expect("UTF-8"))
+        };
+        assert_eq!(text(stdout).as_deref(), want_out, "{script}");
+        assert_eq!(text(stderr).as_deref(), want_err, "{script}");
+    }
+    assert!(no_leases(&config), "the lease directories are removed");
 }
