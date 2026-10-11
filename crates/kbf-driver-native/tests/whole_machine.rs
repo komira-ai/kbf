@@ -712,6 +712,29 @@ async fn a_restart_mid_action_whose_kill_fails_quarantines_the_node() {
     assert!(why.contains("kill-uid: kill-uid failed"), "{why}");
 }
 
+/// Catches a restart mid-action that kills (and then deletes) a lease user the boot
+/// reset already deleted: the helper would refuse the unknown user, and the node be
+/// quarantined for nothing. The lease still fails as lost, and the session is idled.
+#[tokio::test]
+async fn a_restart_mid_action_after_the_reset_deleted_the_user_kills_nothing() {
+    let dir = scratch("whole-mid-action-reset");
+    let cas = Arc::new(MemoryCas::default());
+    let fake = FakeSession::default();
+    let config = config(&dir);
+    let slow = Spec::sh("exec sleep 2").store(&cas);
+    fake.state().deleted_by_reset = vec![lease()];
+    let after = restart_mid_action(&config, &fake, &cas, &slow).await;
+    assert_eq!(verbs_but_wait(&fake), ["boot-reset 1.1"]);
+    assert_eq!(phase(&after), NodePhase::Restoring(lease()));
+
+    let error = run(&after, &slow)
+        .await
+        .expect_err("a result after the restart");
+    assert!(error.to_string().contains("its result is lost"), "{error}");
+    assert_eq!(verbs_but_wait(&fake), ["session-idle (restoring)"]);
+    assert_eq!(phase(&after), NodePhase::Serving);
+}
+
 /// Catches a session wait counted from when this daemon took the lease up rather than
 /// from when the lease was first taken (the mutant "deadline from now": each restart
 /// would start the wait again, and the action could start after the server's switch
