@@ -16,6 +16,7 @@ use crate::grant::GrantKeys;
 use crate::helper::{Helper, Host, Settings};
 use crate::lease::UidRange;
 use crate::ledger::Ledger;
+use crate::scan::{ScanFolder, ScanSettings};
 use crate::server;
 use crate::sweep::SweepPlan;
 
@@ -76,7 +77,8 @@ pub struct Ready {
     pub helper: Arc<Helper>,
 }
 
-/// Checks the flags, opens the ledger and binds the socket.
+/// Checks the flags, opens the ledger and binds the socket. `scan` are the leak scan's
+/// folders.
 ///
 /// # Errors
 /// What stops the helper from starting.
@@ -86,6 +88,7 @@ pub fn prepare(
     serial: String,
     schedules: SweepPlan,
     sweep: SweepPlan,
+    scan: Vec<ScanFolder>,
 ) -> Result<Ready, String> {
     let gid = group_gid(&args.socket_group).map_err(|why| why.to_string())?;
     if gid == STAFF_GID || gid == args.lease_gid {
@@ -126,6 +129,7 @@ pub fn prepare(
             kcpassword: args.kcpassword.clone(),
             loginwindow: args.loginwindow.clone(),
         },
+        scan: ScanSettings::in_state_dir(&args.state_dir, scan),
     };
     tracing::info!(
         socket = %args.socket.display(),
@@ -155,7 +159,7 @@ fn private_dir(dir: &Path) -> io::Result<()> {
 
 /// Reads a file the helper trusts: never through a link, a regular file, the
 /// helper's own and writable by no one else.
-fn read_trusted(path: &Path) -> io::Result<String> {
+pub(crate) fn read_trusted(path: &Path) -> io::Result<String> {
     let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
     let opened = rustix::fs::openat(CWD, path, flags, Mode::empty())?;
     let stat = rustix::fs::fstat(&opened)?;

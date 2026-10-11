@@ -169,7 +169,7 @@ pub fn remove(path: &Path) -> io::Result<bool> {
 
 /// Writes `bytes` to a new temporary file next to `path` (mode 0600, never through a
 /// link), `fsync`s it, renames it over `path` and `fsync`s the directory.
-fn write_whole(path: &Path, bytes: &[u8]) -> io::Result<()> {
+pub(crate) fn write_whole(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let mut temporary = path.as_os_str().to_owned();
     temporary.push(".new");
     let temporary = PathBuf::from(temporary);
