@@ -109,7 +109,7 @@
 
 mod cas;
 mod config;
-mod home;
+pub mod home;
 mod keeper;
 pub mod network;
 pub mod procs;

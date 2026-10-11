@@ -5,6 +5,8 @@
 mod failure_log;
 #[path = "execute/memory.rs"]
 mod memory;
+#[path = "execute/missing.rs"]
+mod missing;
 mod support;
 
 use std::time::Duration;
