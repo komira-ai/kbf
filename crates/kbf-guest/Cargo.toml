@@ -14,9 +14,19 @@ publish.workspace = true
 name = "kbf-guest"
 path = "src/main.rs"
 
+# The program the tests run as the command (kbf-testkit's act verbs). It has its own
+# name because Cargo sets `CARGO_BIN_EXE_<name>` only for the bins of the package
+# under test, and two packages with a bin of the same name collide in `target/`.
+# kbf-testkit is a dependency of this bin only; the `kbf-guest` binary does not link it.
+[[bin]]
+name = "kbf-guest-act"
+path = "src/bin/kbf-guest-act.rs"
+test = false
+
 [dependencies]
 clap.workspace = true
 hex.workspace = true
+kbf-testkit.workspace = true
 libc.workspace = true
 subtle.workspace = true
 thiserror.workspace = true

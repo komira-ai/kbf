@@ -1278,6 +1278,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "hex",
+ "kbf-testkit",
  "libc",
  "subtle",
  "thiserror",
