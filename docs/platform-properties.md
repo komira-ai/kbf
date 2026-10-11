@@ -315,3 +315,10 @@ fails the lease (issue #178). Apple's
 tools that nest a sandbox of their own need it turned off, since macOS refuses a
 sandbox inside a sandbox (`swiftc -disable-sandbox`, `swift build --disable-sandbox`);
 the outer profile still keeps their writes inside the lease.
+
+The same profile keeps every action away from the services that reach an iOS device
+plugged into the Mac: it refuses the lookup of any CoreDevice or `remoted` mach
+service and a connect to `usbmuxd`'s socket, so `xcrun devicectl` fails (its
+connection to `CoreDeviceService` is invalidated) and no tool talks to a device
+through `usbmuxd`. No lease books a device yet
+([design/ios-devices.md](design/ios-devices.md#61-what-the-sandbox-must-allow)).

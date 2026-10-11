@@ -62,7 +62,8 @@
 //!   ([`network::BASE_PROFILE`]). Not covered: other mach and XPC services, Apple
 //!   Events among them (`osascript` asking Terminal or Finder to run something), and
 //!   anything else the daemon's user can schedule (a `LaunchAgents` plist run at its
-//!   next login, `at`, `cron`, a loopback service).
+//!   next login, `at`, `cron`, a loopback service). The services that reach an iOS
+//!   device are refused ([`network::NO_DEVICE_RULES`]).
 //! - **The daemon's own files.** Actions run as the daemon's user, so they can read
 //!   what it can, the node's TLS private key (`--key`) included. On macOS the
 //!   profile keeps their file writes inside their own lease directory: the ways

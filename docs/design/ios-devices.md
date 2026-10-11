@@ -4,8 +4,9 @@ This document says how kbf will run work on real iPhones and iPads plugged into 
 node by USB: how a device is set up once, how signing is done and where its secrets
 live, how one specific device is booked for one lease, how the daemon reports each
 device's health and alerts with the exact fix, how a device is cleaned between
-leases, and what still needs a person at the device. **Everything in it is planned.**
-Nothing about physical devices exists on `main`: no daemon reports a device, no
+leases, and what still needs a person at the device. **Everything in it is planned**
+but the sandbox rule that keeps leases away from the node's devices
+([section 6.1](#61-what-the-sandbox-must-allow)). No daemon reports a device, no
 request key names one, and no runtime talks to one. What exists on `main` today is
 named as such.
 
@@ -257,15 +258,33 @@ Xcodes every question (CEO decision on issue #164: `xcrun` reads and fills a cac
 that leases can write); its profile is that of a device lease, which may reach
 CoreDevice (below). The action runs `xcodebuild` inside it.
 
-**Other leases must not reach a booked device.** The profile on `main` allows mach and
-XPC services (`(allow default)`) and every Unix socket, so any concurrent action on the
-node, device lease or not, could run `xcrun devicectl` and install, launch or reboot
-apps on a device booked for another lease. The planned fix: the profiles of leases
-without a device deny the CoreDevice mach services and the `usbmuxd` socket. That
-part needs no device and can be tested on the hosted macOS runner: `devicectl list
-devices` from a lease without a device must be refused. Two device leases on one
-node still share these services; until P-D2 shows a device per user, a node may run
-one device lease at a time.
+**Other leases must not reach a booked device.** Every profile allows mach and XPC
+services (`(allow default)`) and the no-network one every Unix socket, so without a
+rule any concurrent action on the node, device lease or not, could run `xcrun
+devicectl` and install, launch or reboot apps on a device booked for another lease.
+So every profile ends with `NO_DEVICE_RULES` (`crates/kbf-driver-native/src/network.rs`),
+after the network's rules, which it would otherwise lose to (in a profile the later
+rule wins):
+
+- no `mach-lookup` of a name starting `com.apple.CoreDevice.`: `CoreDeviceService`
+  (the XPC service `devicectl` asks for everything; refused, `devicectl` waits over 15
+  seconds for it and fails saying the connection was invalidated),
+  `remotepairingd` and the rest;
+- no `mach-lookup` of a name starting `com.apple.remoted`: `remoted`'s services
+  (RemoteXPC, which CoreDevice reaches a device through; `remotectl dumpstate` then
+  prints no device, the Mac itself included);
+- no connect to `usbmuxd`'s socket, named by its real path `/private/var/run/usbmuxd`
+  (a rule on `/var/run/usbmuxd`, the link clients open, matches nothing).
+
+`CoreDeviceService` itself runs outside the action's sandbox, launched by launchd: the
+rule refuses the action the lookup, not the service its own reach. No lease has a
+device yet, so every lease gets these rules, and so does the daemon's own Xcode
+survey, which runs under the actions' sandbox; a lease that books a device is to get a
+profile without them, as is the daemon's `devicectl` survey (D2). `tests/devices.rs`
+shows each refused on the hosted macOS runner, with the network off and on, each
+against a control: the same action by the same driver without a sandbox reaches the
+service. Two device leases on one node still share these services; until P-D2 shows
+a device per user, a node may run one device lease at a time.
 
 ## 7. Health: report, alert, recover
 
@@ -433,13 +452,13 @@ None of these has run. Each is a later PR's evidence; the PR that needs it says 
 
 ## 12. Phased plan
 
-All planned; each is its own pull request.
+All planned but the sandbox rule; each is its own pull request.
 
 | Phase | What | Needs |
 |---|---|---|
 | D0 | This design | - |
 | D1 | Probe kit: P-D0 and P-D1 fixtures, with a lint that refuses a fixture carrying a real-looking UDID, ECID, serial, CoreDevice id or device name | a device and a person (P-D1) |
-| D1 | Sandbox rule: leases without a device cannot reach CoreDevice or `usbmuxd`; tested on the hosted macOS runner | none |
+| D1 | Sandbox rule: leases without a device cannot reach CoreDevice, `remoted` or `usbmuxd`; tested on the hosted macOS runner (**done**: `NO_DEVICE_RULES`) | none |
 | D2 | Survey parser in `kbf-driver-native`: `devicectl` JSON to device states, tested against the D1 fixtures | D1 |
 | D2 | One driver watch for Xcodes and devices (generalizes PR #173's channel) | PR #173 |
 | D2 | `NodeStatus.devices`, attention lines, the state file, `forget` and `release`, `Hello` resent on change | the watch |
@@ -466,11 +485,12 @@ All planned; each is its own pull request.
 
 | Claim | Status | Source |
 |---|---|---|
-| No physical-device code or report entry exists on `main` | V | the repository |
+| No physical-device code or report entry exists on `main`, but the sandbox rule of section 6.1 | V | the repository |
 | `gpu` is booked as a count; `Start` carries only CPU and memory; the daemon builds `Work.resources` from those | V | `crates/kbf-types/src/work.rs`, `crates/kbf-proto/proto/kbf/worker/v1/worker.proto`, `crates/kbf-daemon/src/lease.rs` |
 | `Start`'s field numbers 1 to 7 are taken | V | `worker.proto` |
 | An unknown platform property is ignored today | V | [capabilities.md](capabilities.md#unknown-keys) |
 | The no-network profile allows only loopback and Unix sockets; every profile denies file writes outside the lease and preference writes, and allows mach and XPC | V | `crates/kbf-driver-native/src/network.rs` |
+| Every profile denies the CoreDevice and `remoted` mach lookups and the `usbmuxd` socket | V | `crates/kbf-driver-native/src/network.rs`, `tests/devices.rs` (hosted macOS runner) |
 | Virtualization.framework attaches USB mass storage only, not an iPhone | A | to be read in the framework's USB documentation |
 | Developer Mode is needed for development-signed apps on iOS 16 and later | A | Apple's "Enabling Developer Mode on a device" (not re-read) |
 | The `devicectl` verbs and JSON named here | A | P-D0, P-D1 |

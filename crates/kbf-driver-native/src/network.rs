@@ -20,12 +20,19 @@
 //! with the node's network. Which of the two a node has is reported as the capability
 //! `network_isolation` (`sandbox-exec` or `none`), so nothing about it is hidden.
 //!
+//! Every profile ends with [`NO_DEVICE_RULES`], which keeps an action away from the
+//! services that reach an iOS device on the node: the CoreDevice mach services
+//! (`devicectl`'s `CoreDeviceService` among them), `remoted` and the `usbmuxd`
+//! socket. No lease has a device yet, so no action may reach them
+//! (`docs/design/ios-devices.md`, section 6.1).
+//!
 //! What the sandbox does not cover:
 //! - Unix sockets are allowed, any of them, so a local service that talks to the
 //!   network on the action's behalf is reachable. The plainest is the system's
 //!   resolver (`mDNSResponder`): DNS lookups still go out, and a name an action looks
 //!   up can carry data out of the node. Loopback services likewise.
-//! - Other mach and XPC services stay reachable (`(allow default)`), Apple Events
+//! - Other mach and XPC services stay reachable (`(allow default)`), but for those
+//!   [`NO_DEVICE_RULES`] names, Apple Events
 //!   among them (`osascript`, the `appleevent-send` operation): an action can ask
 //!   another application, such as Terminal or Finder, to run something for it outside
 //!   the sandbox, where the user's session allows Apple Events.
@@ -108,6 +115,21 @@ pub const NO_NETWORK_PROFILE: &str = "(version 1)\n\
 (allow network* (remote ip \"localhost:*\"))\n\
 (allow network* (remote unix-socket))\n";
 
+/// The rules every profile ends with, after the network's (later rules win, so
+/// [`NO_NETWORK_PROFILE`]'s allow for every Unix socket comes first): no lookup of a
+/// CoreDevice mach service or XPC service (`com.apple.CoreDevice.CoreDeviceService`,
+/// which `devicectl` asks for everything, `com.apple.CoreDevice.remotepairingd` and
+/// the rest of the prefix), none of `remoted`'s (`com.apple.remoted`, its
+/// `.coredevice` and `.control` services and the rest of the prefix: RemoteXPC, the
+/// tunnel CoreDevice talks to a device through), and no connect to `usbmuxd`'s socket,
+/// which the sandbox names by its real path (`/var/run` is a link to `/private/var/run`;
+/// a rule on the link's path matches nothing). `tests/devices.rs` shows each refused on
+/// the macOS runner, and reached without the sandbox. A lease that books a device is to
+/// get a profile without these (`docs/design/ios-devices.md`, section 6.1); none does yet.
+pub const NO_DEVICE_RULES: &str = "(deny mach-lookup (global-name-prefix \"com.apple.CoreDevice.\"))\n\
+(deny mach-lookup (global-name-prefix \"com.apple.remoted\"))\n\
+(deny network-outbound (literal \"/private/var/run/usbmuxd\"))\n";
+
 /// What an action asked for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Network {
@@ -181,7 +203,8 @@ impl Isolation {
     /// The program and arguments that run `program` with `args` under `network`,
     /// writing only inside `lease` (the lease directory's real path), `/dev`, and what
     /// `rules` (appended to the profile) allows: the names in the user's folders the
-    /// tools need ([`crate::user_folders::UserFolders::rules`]).
+    /// tools need ([`crate::user_folders::UserFolders::rules`]). The profile is the
+    /// network's, then [`NO_DEVICE_RULES`], then `rules`.
     #[must_use]
     pub fn wrap(
         &self,
@@ -202,7 +225,7 @@ impl Isolation {
             "-D".to_owned(),
             format!("{LEASE_PARAM}={}", lease.to_string_lossy()),
             "-p".to_owned(),
-            format!("{profile}{rules}"),
+            format!("{profile}{NO_DEVICE_RULES}{rules}"),
             program.to_string_lossy().into_owned(),
         ];
         wrapped.extend(args.iter().cloned());
@@ -270,8 +293,10 @@ mod tests {
 
     /// Catches: the network denied to an action that asked for it, or allowed one that
     /// did not; an action with the network left unsandboxed (free to hand work to
-    /// launchd); the program or its arguments lost or reordered inside the wrapper;
-    /// and a node without `sandbox-exec` claiming isolation.
+    /// launchd); the device rules missing from either profile, or put before the
+    /// network's rules (where the allow for every Unix socket would undo the `usbmuxd`
+    /// deny); the program or its arguments lost or reordered inside the wrapper; and a
+    /// node without `sandbox-exec` claiming isolation.
     #[test]
     fn every_action_is_wrapped_and_only_the_network_differs() {
         let args = vec!["-c".to_owned(), "echo hi".to_owned()];
@@ -290,17 +315,31 @@ mod tests {
                 "-D",
                 param,
                 "-p",
-                &format!("{NO_NETWORK_PROFILE}{rules}"),
+                &format!("{NO_NETWORK_PROFILE}{NO_DEVICE_RULES}{rules}"),
                 "/bin/sh",
                 "-c",
                 "echo hi"
             ]
         );
+        let off = &wrapped_args[3];
+        let unix = off
+            .rfind("(allow network* (remote unix-socket))")
+            .expect("the allow for Unix sockets");
+        let devices = off.find(NO_DEVICE_RULES).expect("the device rules");
+        assert!(unix < devices, "{off}");
         let (wrapped, wrapped_args) = sandbox.wrap(Network::On, lease, "", program.clone(), &args);
         assert_eq!(wrapped, PathBuf::from(SANDBOX_EXEC));
         assert_eq!(
             wrapped_args,
-            ["-D", param, "-p", BASE_PROFILE, "/bin/sh", "-c", "echo hi"]
+            [
+                "-D",
+                param,
+                "-p",
+                &format!("{BASE_PROFILE}{NO_DEVICE_RULES}"),
+                "/bin/sh",
+                "-c",
+                "echo hi"
+            ]
         );
         assert!(NO_NETWORK_PROFILE.starts_with(BASE_PROFILE));
         assert!(BASE_PROFILE.contains(&format!("(param \"{LEASE_PARAM}\")")));
