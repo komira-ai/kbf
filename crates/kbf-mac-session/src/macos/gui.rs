@@ -93,8 +93,8 @@ fn drop_and_exec(args: &[OsString]) -> Result<std::convert::Infallible, (u8, Str
 /// # Errors
 /// A step failed (each does for anyone but root), or the ids are not the new ones.
 fn drop_to(uid: u32, gid: u32) -> Result<(), String> {
-    // SAFETY: setgroups with a count of 0 reads no list.
-    if unsafe { libc::setgroups(0, std::ptr::null()) } != 0 {
+    // MUTANT: the supplementary groups are kept.
+    if false {
         let why = io::Error::last_os_error();
         return Err(format!("dropping the supplementary groups: {why}"));
     }
