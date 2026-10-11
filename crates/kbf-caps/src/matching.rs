@@ -11,6 +11,7 @@
 //! | `os`, `os_image`, `cpu.model`, `page_size`, `label.<k>` | exact |
 //! | `xcode` | membership: the node reports a set (one entry per installed Xcode build) and the request names one |
 //! | `vm.image` | membership on the digest: the request names `<name>@sha256:<64 hex>`, the node reports one entry in that form per image it holds, and only the `sha256:<hex>` parts are compared |
+//! | `ios.device` (`1`) with `ios.device.<attribute>` | one device: the node reports one `ios.device` entry per ready device, and **one** of them must satisfy every attribute (exact) |
 //!
 //! `gpu` is a count of whole GPUs (`gpu=1`). Matching compares it with the node's
 //! count; the scheduler also books it, so a GPU serves one lease at a time.
@@ -29,10 +30,16 @@
 //! `kbf-book-cpus`, `kbf-book-mem-gib`) ask for a kind or a size of capacity, not a
 //! capability; [`Request::parse`] skips them for the scheduler.
 //!
-//! The iOS device keys, `ios.device` and every `ios.device.<attribute>` key, are
-//! planned (`docs/design/ios-devices.md`). Until the scheduler books devices,
-//! [`Request::parse`] refuses each of them ([`RequestError::IosDevice`]): ignored, as an
-//! unknown property is, `ios.device=1` would match every node, Linux included.
+//! `ios.device=1` asks for one iOS device (`docs/design/ios-devices.md`, section 5.3).
+//! Its attributes are [`DEVICE_ATTRIBUTES`] (`ios.device.class=iPhone`,
+//! `ios.device.os_version=26.0`, ...), each compared exactly, and a node matches only
+//! if one device it reports satisfies all of them: two attributes met by two different
+//! devices are not a match. A node that reports no device matches no device request, so
+//! a daemon that predates devices (and would drop `Start.device_id`) is never given
+//! one. [`Request::devices`] names the devices that satisfy a request; the scheduler
+//! books one of them. Refused ([`RequestError`]): `ios.device` with any value but `1`,
+//! an attribute without `ios.device=1`, an `ios.device.<attribute>` kbf does not know,
+//! and `ios.device` with an `os` other than `macos`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -99,11 +106,16 @@ pub const RESERVED_KEYS: [&str; 5] = [
     "kbf-book-mem-gib",
 ];
 
-/// The iOS device key; every `ios.device.<attribute>` key begins with it and a `.`.
-const IOS_DEVICE_KEY: &str = "ios.device";
+/// The iOS device key: a request entry `ios.device=1`, and a report entry per ready
+/// device. Every `ios.device.<attribute>` key begins with it and a `.`.
+pub(crate) const IOS_DEVICE_KEY: &str = "ios.device";
 
-/// Whether `key` is `ios.device` or `ios.device.<anything>`: planned, and refused until
-/// the scheduler books devices. `ios.devices` and `ios.simulator` are not device keys.
+/// The device attributes a request may name, as `ios.device.<attribute>`, each
+/// compared exactly with the attribute of that name in a device's report entry.
+pub const DEVICE_ATTRIBUTES: [&str; 4] = ["class", "product_type", "os_version", "os_build"];
+
+/// Whether `key` is `ios.device` or `ios.device.<anything>`. `ios.devices` and
+/// `ios.simulator` are not device keys.
 pub(crate) fn is_ios_device_key(key: &str) -> bool {
     key.strip_prefix(IOS_DEVICE_KEY)
         .is_some_and(|rest| rest.is_empty() || rest.starts_with('.'))
@@ -140,8 +152,10 @@ fn image_digest(value: &str) -> Option<&str> {
     (name_ok && hex_ok).then_some(digest)
 }
 
-/// Whether `key` is one of kbf's own platform keys: a capability key, a reserved key
-/// [`Request::parse`] skips, or a report-only or iOS device key it refuses.
+/// Whether `key` is one of kbf's own platform keys: a capability key, an iOS device
+/// key, a reserved key [`Request::parse`] skips, or a report-only key it refuses. Every
+/// `ios.device.<anything>` key is one, so an attribute kbf does not know reaches
+/// [`Request::parse`] and is refused there rather than ignored.
 pub(crate) fn is_own_key(key: &str) -> bool {
     is_capability_key(key)
         || RESERVED_KEYS.contains(&key)
@@ -173,11 +187,14 @@ pub struct NodeCaps {
     /// report's `drivers` entries. No request key matches them; the scheduler reads
     /// them to place a lease kind only where a driver serves it.
     pub drivers: BTreeSet<String>,
+    /// The ready iOS devices, from its report's `ios.device` entries: by device id
+    /// (the UDID), each device's other attributes (`class`, `os_version`, ...).
+    pub devices: BTreeMap<String, BTreeMap<String, String>>,
 }
 
 impl NodeCaps {
     /// A node with only CPU capabilities: no exact values, no sets, no capacity, no
-    /// driver.
+    /// driver, no device.
     #[must_use]
     pub fn new(cpu: CpuCaps) -> Self {
         Self {
@@ -186,6 +203,7 @@ impl NodeCaps {
             members: BTreeMap::new(),
             consumables: BTreeMap::new(),
             drivers: BTreeSet::new(),
+            devices: BTreeMap::new(),
         }
     }
 
@@ -217,13 +235,20 @@ pub enum RequestError {
     /// The key is one a node reports and a request may not name.
     #[error("{0:?} is reported by a node and cannot be requested")]
     ReportOnly(String),
-    /// An iOS device key (`ios.device`, `ios.device.<attribute>`), refused until the
-    /// scheduler books devices.
+    /// An `ios.device.<attribute>` key whose attribute is not one of
+    /// [`DEVICE_ATTRIBUTES`].
     #[error(
-        "{0:?} is refused until kbf books iOS devices; the planned design is \
-         docs/design/ios-devices.md#55-rollout-order"
+        "{0:?} is not an iOS device attribute; a request may name ios.device.class, \
+         ios.device.product_type, ios.device.os_version and ios.device.os_build"
     )]
-    IosDevice(String),
+    UnknownDeviceAttribute(String),
+    /// An `ios.device.<attribute>` key in a request that does not ask for a device
+    /// (`ios.device=1`).
+    #[error("{0:?} names an iOS device attribute, but the request has no ios.device=1")]
+    DeviceAttributeAlone(String),
+    /// `ios.device` with an `os` other than `macos`: devices are attached to Macs.
+    #[error("ios.device asks for a device attached to a Mac, but the request asks for os {0:?}")]
+    DeviceNotOnMacos(String),
 }
 
 /// What an action requires of a node.
@@ -236,6 +261,8 @@ pub struct Request {
     /// By key: the value as requested, and what membership compares.
     members: BTreeMap<String, (String, String)>,
     minimums: BTreeMap<Consumable, u64>,
+    /// With `ios.device=1`: the attributes one device must have, by attribute name.
+    device: Option<BTreeMap<String, String>>,
 }
 
 /// One requirement a node does not meet.
@@ -262,11 +289,27 @@ pub enum Unmet<'a> {
         want: u64,
         have: u64,
     },
+    /// The request asks for a device (`ios.device=1`) and the node reports none.
+    NoDevice,
+    /// No device the node reports has every attribute the request names. One entry per
+    /// attribute the closest device lacks: the device with fewest unmet attributes,
+    /// the first by id among equals.
+    Device {
+        /// The attribute (`os_version`).
+        attribute: &'a str,
+        /// The value asked for.
+        want: &'a str,
+        /// The closest device's id.
+        device: String,
+        /// Its value, `None` if it reports no such attribute.
+        have: Option<String>,
+    },
 }
 
 impl fmt::Display for Unmet<'_> {
     /// The requirement in request syntax: `arch=arm64`, `isa_level>=x86-64-v3`,
-    /// `cpu.feature=avx2`, `os=macos`, `xcode=16C5032a`, `gpu>=2 (has 1)`.
+    /// `cpu.feature=avx2`, `os=macos`, `xcode=16C5032a`, `gpu>=2 (has 1)`,
+    /// `ios.device=1`, `ios.device.os_version=26.0 (device <id> has 18.6)`.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Arch { want } => write!(f, "arch={want}"),
@@ -274,6 +317,19 @@ impl fmt::Display for Unmet<'_> {
             Self::Feature(feature) => write!(f, "cpu.feature={feature}"),
             Self::Exact { key, want } | Self::Member { key, want } => write!(f, "{key}={want}"),
             Self::Consumable { what, want, have } => write!(f, "{what}>={want} (has {have})"),
+            Self::NoDevice => write!(f, "{IOS_DEVICE_KEY}=1"),
+            Self::Device {
+                attribute,
+                want,
+                device,
+                have,
+            } => {
+                write!(f, "{IOS_DEVICE_KEY}.{attribute}={want} (device {device} ")?;
+                match have {
+                    Some(have) => write!(f, "has {have})"),
+                    None => write!(f, "has none)"),
+                }
+            }
         }
     }
 }
@@ -283,7 +339,9 @@ impl Request {
     ///
     /// `cpu.feature` may repeat; every other key may appear once. A membership key
     /// (`xcode`, `vm.image`) names one non-empty value; a `vm.image` value carries a
-    /// digest. A report-only key, and an iOS device key, is refused.
+    /// digest. A report-only key is refused. `ios.device` takes `1`; an
+    /// `ios.device.<attribute>` names a known attribute and a non-empty value, and only
+    /// beside `ios.device=1`, which goes with no `os` but `macos`.
     pub fn parse<'p, I>(properties: I) -> Result<Self, RequestError>
     where
         I: IntoIterator<Item = (&'p str, &'p str)>,
@@ -296,6 +354,8 @@ impl Request {
         properties: &mut dyn Iterator<Item = (&'p str, &'p str)>,
     ) -> Result<Self, RequestError> {
         let mut req = Self::default();
+        let mut wants_device = false;
+        let mut attributes = BTreeMap::new();
         for (key, value) in properties {
             let bad = || RequestError::BadValue {
                 key: key.to_owned(),
@@ -308,10 +368,23 @@ impl Request {
             if REPORT_ONLY_KEYS.contains(&key) {
                 return Err(RequestError::ReportOnly(key.to_owned()));
             }
-            if is_ios_device_key(key) {
-                return Err(RequestError::IosDevice(key.to_owned()));
-            }
-            if key == "arch" {
+            if key == IOS_DEVICE_KEY {
+                if value != "1" {
+                    return Err(bad());
+                }
+                if std::mem::replace(&mut wants_device, true) {
+                    return Err(repeated());
+                }
+            } else if let Some(attribute) = device_attribute(key) {
+                let attribute = attribute
+                    .ok_or_else(|| RequestError::UnknownDeviceAttribute(key.to_owned()))?;
+                if value.is_empty() {
+                    return Err(bad());
+                }
+                if attributes.insert(attribute, value.to_owned()).is_some() {
+                    return Err(repeated());
+                }
+            } else if key == "arch" {
                 let arch = value.parse().map_err(|_| bad())?;
                 set_once(&mut req.arch, arch).ok_or_else(repeated)?;
             } else if key == "isa_level" {
@@ -345,7 +418,40 @@ impl Request {
                 return Err(RequestError::UnknownKey(key.to_owned()));
             }
         }
+        if !wants_device {
+            if let Some(attribute) = attributes.keys().next() {
+                return Err(RequestError::DeviceAttributeAlone(format!(
+                    "{IOS_DEVICE_KEY}.{attribute}"
+                )));
+            }
+            return Ok(req);
+        }
+        if let Some(os) = req.exact.get("os").filter(|os| *os != "macos") {
+            return Err(RequestError::DeviceNotOnMacos(os.clone()));
+        }
+        req.device = Some(attributes);
         Ok(req)
+    }
+
+    /// Whether the request asks for an iOS device (`ios.device=1`).
+    #[must_use]
+    pub fn wants_device(&self) -> bool {
+        self.device.is_some()
+    }
+
+    /// The ids of the devices `node` reports that satisfy every device attribute the
+    /// request names, in id order: one of them is to be booked. Empty for a request
+    /// that asks for no device.
+    #[must_use]
+    pub fn devices<'n>(&self, node: &'n NodeCaps) -> Vec<&'n str> {
+        let Some(want) = &self.device else {
+            return Vec::new();
+        };
+        node.devices
+            .iter()
+            .filter(|(_, have)| device_unmet(want, have).next().is_none())
+            .map(|(id, _)| id.as_str())
+            .collect()
     }
 
     /// Every requirement the node does not meet, in a stable order. Empty means the
@@ -385,6 +491,9 @@ impl Request {
                 unmet.push(Unmet::Consumable { what, want, have });
             }
         }
+        if let Some(want) = &self.device {
+            unmet.extend(closest_device(want, node));
+        }
         unmet
     }
 
@@ -393,6 +502,50 @@ impl Request {
     pub fn matches(&self, node: &NodeCaps) -> bool {
         self.unmet(node).is_empty()
     }
+}
+
+/// For a device key (`ios.device.<anything>`): `Some(Some(attribute))` for a known
+/// attribute, `Some(None)` for one kbf does not know. `None` for every other key.
+fn device_attribute(key: &str) -> Option<Option<String>> {
+    let attribute = key.strip_prefix(IOS_DEVICE_KEY)?.strip_prefix('.')?;
+    Some(
+        DEVICE_ATTRIBUTES
+            .contains(&attribute)
+            .then(|| attribute.to_owned()),
+    )
+}
+
+/// The attributes in `want` that the device with attributes `have` does not have.
+fn device_unmet<'w>(
+    want: &'w BTreeMap<String, String>,
+    have: &BTreeMap<String, String>,
+) -> impl Iterator<Item = (&'w str, &'w str)> {
+    want.iter()
+        .filter(|(attribute, value)| have.get(*attribute) != Some(*value))
+        .map(|(attribute, value)| (attribute.as_str(), value.as_str()))
+}
+
+/// What a device request `want` lacks on `node`: [`Unmet::NoDevice`] if it reports no
+/// device, nothing if one device has every attribute, else the attributes the closest
+/// device lacks.
+fn closest_device<'w>(want: &'w BTreeMap<String, String>, node: &NodeCaps) -> Vec<Unmet<'w>> {
+    let Some((id, have, unmet)) = node
+        .devices
+        .iter()
+        .map(|(id, have)| (id, have, device_unmet(want, have).collect::<Vec<_>>()))
+        .min_by_key(|(_, _, unmet)| unmet.len())
+    else {
+        return vec![Unmet::NoDevice];
+    };
+    unmet
+        .into_iter()
+        .map(|(attribute, want)| Unmet::Device {
+            attribute,
+            want,
+            device: id.clone(),
+            have: have.get(attribute).cloned(),
+        })
+        .collect()
 }
 
 /// Sets `slot` if empty. `None` if it was already set.
