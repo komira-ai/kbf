@@ -151,8 +151,14 @@ impl Agent {
         send(&mut stream, &ready);
         // The Hello deadline is still set on the socket, and the reader below shares
         // it: without this, a run that is silent for longer than the hello timeout
-        // would read as a host that is gone, and be killed.
-        stream.set_read_timeout(None)?;
+        // would read as a host that is gone, and be killed. macOS refuses this with
+        // EINVAL once the host has closed; a connection whose deadline cannot be
+        // cleared cannot be served either way, so it ends here like any closed one.
+        if stream.set_read_timeout(None).is_err() {
+            // Best effort: the host may already be gone.
+            let _ = stream.shutdown();
+            return Ok(());
+        }
 
         let mut reader = stream.try_clone()?;
         let (tx, rx) = mpsc::channel();
