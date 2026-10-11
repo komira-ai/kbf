@@ -221,3 +221,103 @@ fn main_runs_on_the_host() {
         .collect();
     assert_eq!(main(argv(&args)), ExitCode::FAILURE);
 }
+
+const LINUX_CONFIG: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/templates/linux/config.example"
+);
+
+fn no_env(_: &str) -> Option<OsString> {
+    None
+}
+
+/// Catches a host-changing `linux` verb whose refusal does not exit 2 with a
+/// `REFUSED:` line, whose failed step does not exit 1, or whose dry run does not exit
+/// 0; and flags that conflict (a rollback with an install's flags) being taken.
+#[test]
+fn the_linux_host_verbs_exit_0_done_1_failed_2_refused() {
+    fn base(verb: &str) -> Vec<&str> {
+        vec!["linux", verb, "--config", LINUX_CONFIG]
+    }
+    let busybox = format!("busybox@sha256:{}", "a".repeat(64));
+    let refused = [
+        // The fake's default answer, exit 0, is every kubelet active.
+        (base("swap"), "kubelet.service is active"),
+        // ... and a cgroup.controllers that is not there.
+        (base("install-units"), "no cgroup v2 memory controller"),
+        (
+            [base("image-pull"), vec!["--image", &busybox]].concat(),
+            "image-pull reads and fills kbf's Podman store as kbf",
+        ),
+        (
+            vec!["linux", "swap", "--config", "/srv/none/config"],
+            "/srv/none/config",
+        ),
+    ];
+    for (args, want) in refused {
+        let mut exec = FakeExec::new(501);
+        let (code, _, err) = cli(&mut exec, &no_env, &args);
+        assert_eq!(code, ExitCode::from(2), "{args:?}");
+        assert!(
+            err.starts_with("REFUSED: ") && err.contains(want),
+            "{args:?}: {err}"
+        );
+    }
+
+    let conflicts = [
+        [
+            base("install-units"),
+            vec!["--uninstall", "--restart-minio"],
+        ]
+        .concat(),
+        [base("swap"), vec!["--remove", "--kubelet-allows-swap"]].concat(),
+        [base("image-pull"), vec!["--image", "busybox:latest"]].concat(),
+    ];
+    for args in conflicts {
+        let mut exec = FakeExec::new(0);
+        let (code, _, _) = cli(&mut exec, &no_env, &args);
+        assert_eq!(code, ExitCode::from(2), "{args:?}");
+        assert!(exec.queries.borrow().is_empty(), "{args:?} asked the host");
+    }
+
+    // A rollback of a host whose services are on: a dry run plans, exits 0.
+    let mut exec = FakeExec::new(501);
+    let (code, out, _) = cli(
+        &mut exec,
+        &no_env,
+        &[base("install-units"), vec!["--uninstall"]].concat(),
+    );
+    assert_eq!(code, ExitCode::SUCCESS);
+    assert!(
+        out.contains("\nDRY-RUN: run /usr/bin/systemctl disable --now"),
+        "{out}"
+    );
+
+    // Removing a swapfile whose removal fails: exit 1.
+    let mut exec = FakeExec::new(0);
+    exec.answer = Box::new(|_| Ok(reply(0, "", "")));
+    exec.fail_at = Some(0);
+    exec.entries.insert(
+        HostPath::new("/swapfile").expect("path"),
+        crate::exec::Entry::Other,
+    );
+    let args = [base("swap"), vec!["--remove", "--apply"]].concat();
+    let (code, _, err) = cli(&mut exec, &no_env, &args);
+    assert_eq!(code, ExitCode::FAILURE, "{err}");
+    assert!(
+        err.starts_with("kbf-deploy: step 0 (remove /swapfile) failed"),
+        "{err}"
+    );
+}
+
+/// Catches a rollback directory name that is not the seconds since the epoch (two
+/// rollbacks in one run of the clock would share it, or sort out of order).
+#[test]
+fn the_rollback_stamp_is_unix_seconds() {
+    let before = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_secs();
+    let stamp: u64 = stamp().parse().expect("a number");
+    assert!(stamp >= before && stamp <= before + 5, "{stamp}");
+}

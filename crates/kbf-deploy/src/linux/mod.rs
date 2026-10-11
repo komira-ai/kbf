@@ -1,5 +1,6 @@
 //! The `linux` kit: a converged storage node's systemd units (MinIO's drop-in,
-//! kbf-server, kbf-daemon and the `kbf.slice` they share; docs/deploy/storage-node.md).
+//! kbf-server, kbf-daemon and the `kbf.slice` they share; docs/deploy/storage-node.md),
+//! its build images and its swapfile.
 //!
 //! - `kbf-deploy linux render-units --config FILE --out DIR [--kbf-uid N]` renders the
 //!   four files from the templates compiled in from `templates/linux/` into `DIR`, laid
@@ -14,12 +15,28 @@
 //! setting, a template placeholder with no value, a file that cannot be read or
 //! written), with a `REFUSED:` line on stderr.
 //!
+//! Three verbs change the host, as root. Each checks the host first and prints its plan
+//! as `DRY-RUN:` lines; `--apply` carries it out, and a re-run after an apply plans
+//! nothing. They exit 0 done (or nothing to do), 1 a step failed, 2 refused.
+//! - `kbf-deploy linux install-units --config FILE [--bin-dir DIR] [--restart-minio]
+//!   [--uninstall] [--apply]` ([`install`]): the binaries, the four units, the Raft and
+//!   scratch directories, and the services started.
+//! - `kbf-deploy linux image-pull --config FILE [--image REF]... [--platform OS/ARCH]
+//!   [--apply]` ([`images`]): the pinned images in the kbf user's Podman store, pulled
+//!   as that user.
+//! - `kbf-deploy linux swap --config FILE [--kubelet-allows-swap] [--remove] [--apply]`
+//!   ([`swap`]): the swapfile, active and in `/etc/fstab`.
+//!
 //! The settings are a closed set of `KEY=VALUE` lines ([`config::KEYS`],
 //! `templates/linux/config.example`).
 
 pub mod check;
 pub mod config;
+pub mod host;
+pub mod images;
+pub mod install;
 pub mod render;
+pub mod swap;
 
 #[cfg(test)]
 mod tests;
@@ -28,6 +45,7 @@ use std::path::{Path, PathBuf};
 
 pub use check::{CheckError, Failure, Report};
 pub use config::{LinuxConfig, LinuxError, MetaLog};
+pub use host::HostError;
 pub use render::{Templates, Units};
 
 use crate::template::TemplateError;

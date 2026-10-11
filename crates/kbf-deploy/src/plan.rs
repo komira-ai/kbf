@@ -3,7 +3,7 @@
 use std::io::{self, Write};
 use std::time::Duration;
 
-use crate::exec::{Entry, Exec};
+use crate::exec::{Entry, Exec, Kind, Meta};
 use crate::path::HostPath;
 use crate::step::{Cmd, Filter, HttpUrl, Owner, Perms, Step};
 use crate::trust::Untrusted;
@@ -41,14 +41,16 @@ impl<'a, E: Exec> Planner<'a, E> {
         }
     }
 
-    /// The file at `path` holds `bytes` with `perms` (and `owner`, when given).
+    /// The file at `path` holds `bytes` with `perms` (and `owner`, when given). Returns
+    /// whether a step was planned, so a kit can plan what follows a change (a
+    /// `systemctl daemon-reload`) only when there is one.
     pub fn file(
         &mut self,
         path: HostPath,
         perms: Perms,
         owner: Option<Owner>,
         bytes: Vec<u8>,
-    ) -> Result<(), DeployError> {
+    ) -> Result<bool, DeployError> {
         let done = match self.inspect(&path)? {
             Some(Entry::File {
                 perms: p,
@@ -65,32 +67,40 @@ impl<'a, E: Exec> Planner<'a, E> {
                 bytes,
             });
         }
-        Ok(())
+        Ok(!done)
     }
 
-    /// A directory is at `path` with `perms` (and `owner`, when given).
+    /// A directory is at `path` with `perms` (and `owner`, when given). Returns whether a
+    /// step was planned.
     pub fn dir(
         &mut self,
         path: HostPath,
         perms: Perms,
         owner: Option<Owner>,
-    ) -> Result<(), DeployError> {
-        let done = match self.inspect(&path)? {
-            Some(Entry::Dir { perms: p, owner: o }) => p == perms && owner.is_none_or(|w| w == o),
+    ) -> Result<bool, DeployError> {
+        let done = match self.stat(&path)? {
+            Some(Meta {
+                kind: Kind::Dir,
+                perms: p,
+                owner: o,
+                ..
+            }) => p == perms && owner.is_none_or(|w| w == o),
             _ => false,
         };
         if !done {
             self.plan.steps.push(Step::Mkdir { path, perms, owner });
         }
-        Ok(())
+        Ok(!done)
     }
 
-    /// Nothing is at `path`.
-    pub fn absent(&mut self, path: HostPath) -> Result<(), DeployError> {
-        if self.inspect(&path)?.is_some() {
+    /// Nothing is at `path`; what is there is never read (it may be a swapfile).
+    /// Returns whether a step was planned.
+    pub fn absent(&mut self, path: HostPath) -> Result<bool, DeployError> {
+        let there = self.stat(&path)?.is_some();
+        if there {
             self.plan.steps.push(Step::Remove { path });
         }
-        Ok(())
+        Ok(there)
     }
 
     /// Run `cmd`. The host cannot say whether a command is needed, so the kit asks
@@ -126,6 +136,11 @@ impl<'a, E: Exec> Planner<'a, E> {
         self.plan.steps.push(Step::WaitHttp { url, deadline });
     }
 
+    /// The steps planned so far.
+    pub fn steps(&self) -> &[Step] {
+        &self.plan.steps
+    }
+
     pub fn finish(self) -> Plan {
         self.plan
     }
@@ -137,6 +152,13 @@ impl<'a, E: Exec> Planner<'a, E> {
                 path: path.clone(),
                 source,
             })
+    }
+
+    fn stat(&self, path: &HostPath) -> Result<Option<Meta>, DeployError> {
+        self.exec.stat(path).map_err(|source| DeployError::Inspect {
+            path: path.clone(),
+            source,
+        })
     }
 }
 

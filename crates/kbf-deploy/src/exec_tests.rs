@@ -378,3 +378,49 @@ fn http_status_reads_one_answer() {
     assert_eq!(answered.load(Ordering::SeqCst), 1);
     server.join().expect("server");
 }
+
+/// Catches `stat` reading a file (it must not: a swapfile is 128 GiB, a key file may be
+/// another user's), following a link, or reporting a size other than the file's; and
+/// a removal or directory step that reads what is at its path.
+#[test]
+fn stat_reports_without_reading_and_absent_never_reads() {
+    let (exec, dir) = host("stat");
+    fs::write(dir.join("locked"), "12345").expect("seed");
+    fs::set_permissions(dir.join("locked"), fs::Permissions::from_mode(0o000)).expect("chmod");
+    std::os::unix::fs::symlink("locked", dir.join("link")).expect("link");
+    fs::create_dir(dir.join("d")).expect("dir");
+
+    let m = exec.stat(&p("/locked")).expect("stat").expect("there");
+    assert_eq!(
+        (m.kind, m.perms, m.owner, m.len),
+        (Kind::File, Perms::new(0), me(), 5)
+    );
+    assert_eq!(
+        exec.stat(&p("/link")).expect("stat").map(|m| m.kind),
+        Some(Kind::Other)
+    );
+    assert_eq!(
+        exec.stat(&p("/d")).expect("stat").map(|m| m.kind),
+        Some(Kind::Dir)
+    );
+    assert_eq!(exec.stat(&p("/none")).expect("stat"), None);
+    assert!(
+        exec.inspect(&p("/locked")).is_err(),
+        "reading a 0000 file must fail here"
+    );
+
+    let mut planner = Planner::new(&exec);
+    assert!(planner.absent(p("/locked")).expect("no read"));
+    assert!(
+        planner
+            .dir(p("/locked"), Perms::new(0o755), None)
+            .expect("no read")
+    );
+    assert!(
+        !planner
+            .dir(p("/d"), Perms::new(mode_of(&dir.join("d"))), None)
+            .expect("same")
+    );
+    assert!(!planner.absent(p("/none")).expect("nothing there"));
+    fs::set_permissions(dir.join("locked"), fs::Permissions::from_mode(0o600)).expect("chmod");
+}

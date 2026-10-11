@@ -8,9 +8,9 @@ use std::os::unix::process::ExitStatusExt;
 use std::path::PathBuf;
 use std::process::{ExitStatus, Output};
 
-use crate::exec::{Entry, Exec};
-use crate::path::HostPath;
-use crate::step::{Cmd, HttpUrl, Owner, Step};
+use crate::exec::{Entry, Exec, HostExec, Kind, Meta};
+use crate::path::{HostPath, Root};
+use crate::step::{Cmd, HttpUrl, Owner, Perms, Step};
 use crate::trust::Untrusted;
 
 /// How the fake answers a command: a query, a [`Step::Run`] or a [`Step::Capture`].
@@ -73,6 +73,34 @@ impl Exec for FakeExec {
             return Err(io::Error::from(io::ErrorKind::PermissionDenied));
         }
         Ok(self.entries.get(path).cloned())
+    }
+
+    /// The entry's kind, permissions and owner; a file's length is its bytes'.
+    fn stat(&self, path: &HostPath) -> io::Result<Option<Meta>> {
+        Ok(self.inspect(path)?.map(|entry| match entry {
+            Entry::File {
+                perms,
+                owner,
+                bytes,
+            } => Meta {
+                kind: Kind::File,
+                perms,
+                owner,
+                len: bytes.len() as u64,
+            },
+            Entry::Dir { perms, owner } => Meta {
+                kind: Kind::Dir,
+                perms,
+                owner,
+                len: 0,
+            },
+            Entry::Other => Meta {
+                kind: Kind::Other,
+                perms: Perms::new(0o777),
+                owner: RUNNER,
+                len: 0,
+            },
+        }))
     }
 
     fn query(&self, cmd: &Cmd) -> io::Result<Output> {
@@ -158,4 +186,77 @@ pub fn scratch(name: &str) -> PathBuf {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("make the scratch directory");
     dir
+}
+
+/// A real file system under a scratch root, with commands played by the test: `inspect`,
+/// `stat` and the file, directory and removal steps go to a [`HostExec`] on `root`;
+/// every query and command step is recorded and answered by `answer`, which may change
+/// files under the root as the tool would. It reports `euid` and trusts the running
+/// binary, so a root plan applies as the test's own user. A capture's output is not
+/// written (no plan here has one).
+pub struct ScratchHost {
+    pub host: HostExec,
+    pub root: PathBuf,
+    pub euid: u32,
+    pub log: Vec<Step>,
+    pub queries: RefCell<Vec<Cmd>>,
+    pub answer: Answer,
+}
+
+impl ScratchHost {
+    /// A fresh scratch root named `name`; every command exits 0 with no output.
+    pub fn new(name: &str) -> ScratchHost {
+        let root = scratch(name);
+        ScratchHost {
+            host: HostExec::new(Root::new(&root).expect("absolute")),
+            root,
+            euid: 0,
+            log: Vec::new(),
+            queries: RefCell::new(Vec::new()),
+            answer: Box::new(|_| Ok(reply(0, "", ""))),
+        }
+    }
+
+    /// The path `host` names under the root.
+    pub fn at(&self, host: &str) -> PathBuf {
+        self.root.join(host.trim_start_matches('/'))
+    }
+}
+
+impl Exec for ScratchHost {
+    fn euid(&self) -> u32 {
+        self.euid
+    }
+
+    fn inspect(&self, path: &HostPath) -> io::Result<Option<Entry>> {
+        self.host.inspect(path)
+    }
+
+    fn stat(&self, path: &HostPath) -> io::Result<Option<Meta>> {
+        self.host.stat(path)
+    }
+
+    fn query(&self, cmd: &Cmd) -> io::Result<Output> {
+        self.queries.borrow_mut().push(cmd.clone());
+        (self.answer)(cmd)
+    }
+
+    fn http_status(&self, _url: &HttpUrl) -> io::Result<u16> {
+        Ok(200)
+    }
+
+    fn apply(&mut self, step: &Step) -> io::Result<()> {
+        self.log.push(step.clone());
+        match step {
+            Step::Run(cmd) | Step::Capture { cmd, .. } => {
+                crate::exec::succeeded(cmd, (self.answer)(cmd)?).map(drop)
+            }
+            Step::WaitHttp { .. } => Ok(()),
+            _ => self.host.apply(step),
+        }
+    }
+
+    fn check_binary(&self) -> Result<(), Untrusted> {
+        Ok(())
+    }
 }
