@@ -37,8 +37,10 @@ const PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
 /// first get only the few names they use there (issue #163), never the folders.
 /// `{UXCRUN}` is a file inside a directory that has one of those names
 /// (`xcrun_db-<..>`, which `xcrun` uses for a file): only the name is open, not
-/// what is under it.
-const OUTSIDE: [(&str, &str); 15] = [
+/// what is under it. `{USWBX}` and `{USWB0}` are files in the temporary folder next to
+/// Swift Build's `swbuild.tmp.<random>`: `swbuildXtmpX<..>` (a rule whose dots match
+/// any character takes it) and `swbuild.tmp.` with nothing after it.
+const OUTSIDE: [(&str, &str); 17] = [
     ("create", "echo x > {OUT}/new"),
     ("append", "echo x >> {OUT}/victim"),
     ("unlink", "rm -f {OUT}/victim"),
@@ -57,6 +59,8 @@ const OUTSIDE: [(&str, &str); 15] = [
         "user-temp-xcrun",
         "mkdir -p \"$(dirname {UXCRUN})\" && echo x > {UXCRUN}",
     ),
+    ("user-temp-swbuild-dots", "echo x > {USWBX}"),
+    ("user-temp-swbuild-bare", "echo x > {USWB0}"),
 ];
 
 /// Where the rows of [`OUTSIDE`] aim.
@@ -66,8 +70,8 @@ struct Targets {
     tmp: PathBuf,
     domain: String,
     /// The files in the user folders, in the order `{UTEMP}`, `{UCACHE}`, `{UDIR}`,
-    /// `{UXCRUN}`.
-    user: [PathBuf; 4],
+    /// `{UXCRUN}`, `{USWBX}`, `{USWB0}`.
+    user: [PathBuf; 6],
 }
 
 impl Targets {
@@ -83,6 +87,8 @@ impl Targets {
             user_folder("DARWIN_USER_CACHE_DIR").join(&name),
             user_folder("DARWIN_USER_DIR").join(&name),
             temp.join(format!("xcrun_db-{name}")).join("f"),
+            temp.join(format!("swbuildXtmpX{name}")),
+            temp.join("swbuild.tmp."),
         ];
         let targets = Self {
             out: victim_in(&dir.join("outside")),
@@ -143,7 +149,9 @@ fn attempts(ways: &[(&str, &str)], to: &Targets) -> String {
                 .replace("{UTEMP}", &to.user[0].to_string_lossy())
                 .replace("{UCACHE}", &to.user[1].to_string_lossy())
                 .replace("{UDIR}", &to.user[2].to_string_lossy())
-                .replace("{UXCRUN}", &to.user[3].to_string_lossy());
+                .replace("{UXCRUN}", &to.user[3].to_string_lossy())
+                .replace("{USWBX}", &to.user[4].to_string_lossy())
+                .replace("{USWB0}", &to.user[5].to_string_lossy());
             format!("{command} 2>/dev/null; echo {name}=$?; ")
         })
         .collect()
@@ -305,7 +313,7 @@ async fn an_action_writes_inside_its_lease() {
         lease: PathBuf::from("/unused"),
         tmp: PathBuf::from("/unused"),
         domain: String::new(),
-        user: [(); 4].map(|()| PathBuf::from("/unused")),
+        user: [(); 6].map(|()| PathBuf::from("/unused")),
     };
     let script = attempts(&ways, &unused);
     for (seq, network) in [(1, "off"), (2, "on")] {

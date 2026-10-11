@@ -2,7 +2,7 @@
 //! the standard S3 key pair, `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` (a secret
 //! never goes on the command line).
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -72,7 +72,7 @@ pub struct Args {
     #[arg(long, required_if_eq("meta_log", "raft"))]
     pub raft_dir: Option<PathBuf>,
     /// The REAPI listener. Without `--reapi-tls-cert` and `--reapi-tls-key` it serves
-    /// plain text, which is meant for a loopback bind behind a front on the same host.
+    /// plain text, on any address; off loopback the start line carries a warning.
     #[arg(long, default_value = "127.0.0.1:8980")]
     pub listen: SocketAddr,
     /// PEM certificate (chain) of the REAPI listener. With `--reapi-tls-key` it serves
@@ -93,7 +93,9 @@ pub struct Args {
     /// worker listener and the operator API do not read it.
     #[arg(long)]
     pub reapi_auth_policy: Option<PathBuf>,
-    /// The `kbf.worker.v1` listener.
+    /// The `kbf.worker.v1` listener. Without mutual TLS (`--worker-tls-cert`,
+    /// `--worker-tls-key`, `--worker-client-ca`) it serves plain text, on any address;
+    /// off loopback the start line carries a warning.
     #[arg(long, default_value = "127.0.0.1:8981")]
     pub worker_listen: SocketAddr,
     /// The operator API listener (HTTP/JSON under `/v1`). Off unless given. Reads are
@@ -272,6 +274,21 @@ impl Args {
         })
     }
 
+    /// The listeners that serve plain text on an address that is not loopback, as the
+    /// binary's start-line warning names them: `reapi` (no `--reapi-tls-cert`), then
+    /// `worker` (no `--worker-tls-cert`). Empty when every plain-text listener is on
+    /// loopback. Nothing refuses such a bind; whether plain text is acceptable on that
+    /// network is the operator's call.
+    #[must_use]
+    pub fn plain_text_off_loopback(&self) -> Vec<&'static str> {
+        let reapi = self.reapi_tls_cert.is_none() && !loopback_only(self.listen.ip());
+        let worker = self.worker_tls_cert.is_none() && !loopback_only(self.worker_listen.ip());
+        [("reapi", reapi), ("worker", worker)]
+            .into_iter()
+            .filter_map(|(name, plain)| plain.then_some(name))
+            .collect()
+    }
+
     /// The REAPI listener's policy: the file `--reapi-auth-policy` names, or
     /// [`Policy::allow_all`] without it.
     ///
@@ -358,9 +375,69 @@ impl Args {
     }
 }
 
+/// Whether a listener bound to `ip` is reachable only from this host: a loopback
+/// address, an IPv4-mapped one (`::ffff:127.0.0.1`) included. A wildcard (`0.0.0.0`,
+/// `::`) and every other address can be reached from other machines.
+#[must_use]
+pub fn loopback_only(ip: IpAddr) -> bool {
+    ip.to_canonical().is_loopback()
+}
+
 fn read(path: &PathBuf) -> Result<Vec<u8>, ConfigError> {
     std::fs::read(path).map_err(|source| ConfigError::Read {
         path: path.clone(),
         source,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::{Args, loopback_only};
+
+    /// Catches: a `loopback_only` that knows only wildcards (`is_unspecified`), so one
+    /// interface other machines reach (`192.0.2.10`, a documentation address standing
+    /// in for a LAN or mesh one) counts as loopback; and one that drops `to_canonical`,
+    /// so the IPv4-mapped loopback address does not.
+    #[test]
+    fn only_loopback_addresses_are_loopback_only() {
+        for (ip, want) in [
+            ("127.0.0.1", true),
+            ("::1", true),
+            ("::ffff:127.0.0.1", true),
+            ("0.0.0.0", false),
+            ("::", false),
+            ("192.0.2.10", false),
+        ] {
+            assert_eq!(loopback_only(ip.parse().expect("an address")), want, "{ip}");
+        }
+    }
+
+    /// Catches: a call site in [`Args::plain_text_off_loopback`] that does not go
+    /// through `loopback_only`. One listener is on a single non-loopback interface
+    /// (`192.0.2.10`, which a wildcard-only check such as `is_unspecified` misses) and
+    /// the other on the IPv4-mapped loopback address (`::ffff:127.0.0.1`, which
+    /// `is_loopback` without `to_canonical` misses), each way round, so either
+    /// mistake at either listener changes the list.
+    #[test]
+    fn plain_text_off_loopback_checks_each_listener_through_loopback_only() {
+        for (listen, worker_listen, want) in [
+            ("192.0.2.10:0", "[::ffff:127.0.0.1]:0", vec!["reapi"]),
+            ("[::ffff:127.0.0.1]:0", "192.0.2.10:0", vec!["worker"]),
+        ] {
+            let args = Args::parse_from([
+                "kbf-server",
+                "--listen",
+                listen,
+                "--worker-listen",
+                worker_listen,
+            ]);
+            assert_eq!(
+                args.plain_text_off_loopback(),
+                want,
+                "--listen {listen} --worker-listen {worker_listen}"
+            );
+        }
+    }
 }

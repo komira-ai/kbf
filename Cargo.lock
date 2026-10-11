@@ -1277,11 +1277,13 @@ dependencies = [
  "kbf-front",
  "kbf-proto",
  "kbf-server",
+ "proc-macro2",
  "prost",
  "rcgen",
  "saphyr-parser",
  "serde_json",
  "sha2 0.11.0",
+ "syn 2.0.119",
  "thiserror",
  "tokio",
  "tonic",
@@ -1299,6 +1301,17 @@ dependencies = [
  "kbf-sched",
  "kbf-types",
  "prost",
+ "thiserror",
+]
+
+[[package]]
+name = "kbf-mac-provision"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "hex",
+ "rustix",
+ "sha2 0.11.0",
  "thiserror",
 ]
 

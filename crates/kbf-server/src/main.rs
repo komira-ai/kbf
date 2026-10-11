@@ -5,12 +5,16 @@
 //! its version (`<package version>+<commit>`, [`kbf_server::SERVER_VERSION`]) and
 //! the addresses it bound (a port of 0 picks a free one), and ` api=<addr>` at its end
 //! when the operator API listens, then ` log=<id>` under `--meta-log=raft`, the id of
-//! the log in `--raft-dir` (16 hex digits). On Unix the SIGINT and SIGTERM handlers
-//! are installed before that line is printed, so either signal any time after it stops
-//! the server with exit 0: open Execute and WaitExecution streams end UNAVAILABLE,
-//! REAPI connections are sent GOAWAY, and the server exits once they close or
-//! `--shutdown-timeout-secs` runs out (issue #168). If a handler cannot be installed it
-//! exits 2 without printing the start line.
+//! the log in `--raft-dir` (16 hex digits), then
+//! ` warning=plaintext-off-loopback:<listeners>` at its very end when a listener serves
+//! plain text on an address that is not loopback (`<listeners>` is `reapi`, `worker`
+//! or `reapi,worker`; see [`Args::plain_text_off_loopback`]). The server starts either
+//! way. On Unix the SIGINT and SIGTERM handlers are installed before that line is
+//! printed, so either signal any time after it stops the server with exit 0: open
+//! Execute and WaitExecution streams end UNAVAILABLE, REAPI connections are sent
+//! GOAWAY, and the server exits once they close or `--shutdown-timeout-secs` runs out
+//! (issue #168). If a handler cannot be installed it exits 2 without printing the
+//! start line.
 //!
 //! The REAPI listener runs the policy `--reapi-auth-policy` names; a policy file that
 //! cannot be read or is not a policy exits 2 before anything is bound.
@@ -85,21 +89,33 @@ async fn run<M: MetaLog, O: ObjectStore + 'static>(
     let shutdown = interrupted()?;
     let api = args.api()?;
     let bound = bind_server_with_policy(cache, listeners, api, policy, shutdown)?;
-    println!("{}", start_line(bound.reapi, bound.worker, bound.api, log));
+    let plain = args.plain_text_off_loopback();
+    println!(
+        "{}",
+        start_line(bound.reapi, bound.worker, bound.api, log, &plain)
+    );
     bound.serving.await?;
     Ok(())
 }
 
-/// The start line: the version, the addresses bound and the Raft log's id.
+/// The start line: the version, the addresses bound and the Raft log's id, and one
+/// warning naming the listeners in `plain` (those serving plain text off loopback)
+/// when there are any.
 fn start_line(
     reapi: SocketAddr,
     worker: SocketAddr,
     api: Option<SocketAddr>,
     log: Option<FarmLogId>,
+    plain: &[&str],
 ) -> String {
     let api = api.map(|a| format!(" api={a}")).unwrap_or_default();
     let log = log.map(|id| format!(" log={id}")).unwrap_or_default();
-    format!("kbf-server {SERVER_VERSION} reapi={reapi} worker={worker}{api}{log}")
+    let warning = if plain.is_empty() {
+        String::new()
+    } else {
+        format!(" warning=plaintext-off-loopback:{}", plain.join(","))
+    };
+    format!("kbf-server {SERVER_VERSION} reapi={reapi} worker={worker}{api}{log}{warning}")
 }
 
 /// Installs the SIGINT and SIGTERM handlers now and returns a future that completes on
