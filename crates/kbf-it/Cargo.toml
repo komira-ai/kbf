@@ -15,7 +15,8 @@ name = "kbf-cell"
 path = "src/bin/kbf-cell.rs"
 
 # `kbf-m2-act`, the program every action of the M2 sample project runs (`m2/`): the
-# M2 image has no shell. Standard library only, so CI can link it statically.
+# M2 image has no shell. Its verbs are kbf-testkit's (the standard library and rustix
+# only), so CI can still link it statically.
 [[bin]]
 name = "kbf-m2-act"
 path = "src/bin/kbf-m2-act.rs"
@@ -24,6 +25,7 @@ path = "src/bin/kbf-m2-act.rs"
 clap.workspace = true
 kbf-deploy.workspace = true
 kbf-daemon.workspace = true
+kbf-testkit.workspace = true
 rcgen.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal"] }
@@ -35,10 +37,12 @@ hex.workspace = true
 kbf-front.workspace = true
 kbf-proto.workspace = true
 kbf-server.workspace = true
+proc-macro2.workspace = true
 prost.workspace = true
 saphyr-parser.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+syn.workspace = true
 tokio = { workspace = true, features = ["time"] }
 
 [lints]

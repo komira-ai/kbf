@@ -182,11 +182,11 @@ rm)
     if [ -f "$STATE/cgroup" ] && [ -e "$CGROOT$(cat "$STATE/cgroup")/cgroup.kill" ]; then
         touch "$STATE/killed-before-rm"
     fi
-    # --force: a container still running is killed.
-    kill_action
-    # Interface files are not files to rmdir on cgroupfs; here they are, so the fake
-    # removes them the way the kernel would make them vanish.
+    kill_action # --force: a container still running is killed.
+    # Interface files are not files to rmdir on cgroupfs; here they are, so the fake removes
+    # them as the kernel would, whatever the cgroup's mode (a test makes it read-only).
     if [ -f "$STATE/cgroup" ]; then
+        chmod u+w "$CGROOT$(cat "$STATE/cgroup")" 2>/dev/null
         find "$CGROOT$(cat "$STATE/cgroup")" -type f -delete 2>/dev/null
     fi
     exit 0

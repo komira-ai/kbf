@@ -410,6 +410,89 @@ fn reapi_tls_flags_come_together() {
     }
 }
 
+/// Catches: TLS dropped from a listener configured for it when it binds off loopback
+/// (the REAPI listener over the internal CA's TLS, and the worker listener over mutual
+/// TLS, are one way a server is reached from other machines), and the plain-text
+/// warning raised for a listener that serves TLS.
+#[test]
+fn tls_listeners_may_bind_off_loopback() {
+    let pki = pki("off-loopback");
+    let (cert, key, ca) = (
+        path(&pki.dir, "server.pem"),
+        path(&pki.dir, "server.key"),
+        path(&pki.dir, "ca.pem"),
+    );
+    let argv = [
+        "kbf-server",
+        "--listen",
+        "0.0.0.0:0",
+        "--worker-listen",
+        "[::]:0",
+        "--reapi-tls-cert",
+        &cert,
+        "--reapi-tls-key",
+        &key,
+        "--worker-tls-cert",
+        &cert,
+        "--worker-tls-key",
+        &key,
+        "--worker-client-ca",
+        &ca,
+    ];
+    let args = Args::parse_from(argv);
+    assert_eq!(args.plain_text_off_loopback(), Vec::<&str>::new());
+    let listeners = args.listeners().expect("TLS listeners off loopback");
+    assert!(listeners.reapi_tls.is_some() && listeners.worker_tls.is_some());
+}
+
+/// Catches: the plain-text warning for one listener keyed on the other listener's TLS
+/// flags (the worker's on `--reapi-tls-cert`, or the REAPI listener's on
+/// `--worker-tls-cert`). With one listener over TLS and the other in plain text, both
+/// off loopback, the warning names exactly the plain-text one, and the server is
+/// still built.
+#[test]
+fn a_mixed_config_warns_about_exactly_the_plain_text_listener() {
+    let pki = pki("mixed");
+    let (cert, key, ca) = (
+        path(&pki.dir, "server.pem"),
+        path(&pki.dir, "server.key"),
+        path(&pki.dir, "ca.pem"),
+    );
+    let reapi_tls = [
+        "--reapi-tls-cert",
+        cert.as_str(),
+        "--reapi-tls-key",
+        key.as_str(),
+    ];
+    let worker_mtls = [
+        "--worker-tls-cert",
+        cert.as_str(),
+        "--worker-tls-key",
+        key.as_str(),
+        "--worker-client-ca",
+        ca.as_str(),
+    ];
+    let binds = ["--listen", "0.0.0.0:0", "--worker-listen", "0.0.0.0:0"];
+    for (tls, want) in [(&reapi_tls[..], "worker"), (&worker_mtls[..], "reapi")] {
+        let argv: Vec<&str> = ["kbf-server"]
+            .into_iter()
+            .chain(binds)
+            .chain(tls.iter().copied())
+            .collect();
+        let args = Args::parse_from(&argv);
+        assert_eq!(args.plain_text_off_loopback(), vec![want], "{argv:?}");
+        let listeners = args.listeners().expect("a mixed config off loopback");
+        assert_eq!(
+            (
+                listeners.reapi_tls.is_some(),
+                listeners.worker_tls.is_some()
+            ),
+            (want == "worker", want == "reapi"),
+            "{argv:?}"
+        );
+    }
+}
+
 /// Catches: the binary printing its start line (and serving) with a REAPI key that
 /// does not match its certificate, instead of exiting 2 before it.
 #[test]

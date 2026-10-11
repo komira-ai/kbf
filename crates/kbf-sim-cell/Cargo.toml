@@ -8,6 +8,18 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
+kbf-caps.workspace = true
+kbf-daemon.workspace = true
+kbf-front.workspace = true
+kbf-log.workspace = true
+kbf-meta.workspace = true
+kbf-raft.workspace = true
+kbf-sched.workspace = true
+kbf-server.workspace = true
+kbf-sim.workspace = true
+kbf-store.workspace = true
+kbf-types.workspace = true
+tokio = { workspace = true, features = ["rt"] }
 
 [lints]
 workspace = true
