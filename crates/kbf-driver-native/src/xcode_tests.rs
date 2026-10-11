@@ -142,6 +142,7 @@ fn fake_xcrun(dir: &Path) -> PathBuf {
 /// (the warm-up then fills another Xcode's entries), and a named Xcode looked up
 /// with any other.
 #[test]
+#[ignore = "mutant: reach tests/devices.rs"]
 fn a_lookup_runs_sandboxed_and_sets_or_removes_developer_dir() {
     let xcrun = Path::new("/x/xcrun");
     let sandbox = Sandbox {

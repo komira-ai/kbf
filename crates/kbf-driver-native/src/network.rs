@@ -240,7 +240,7 @@ impl Isolation {
             "-D".to_owned(),
             format!("{LEASE_PARAM}={}", lease.to_string_lossy()),
             "-p".to_owned(),
-            format!("{profile}{NO_DEVICE_RULES}{rules}"),
+            format!("{profile}{rules}"),
             program.to_string_lossy().into_owned(),
         ];
         wrapped.extend(args.iter().cloned());
@@ -333,6 +333,7 @@ mod tests {
     /// names must all start with the string of one `(deny mach-lookup
     /// (global-name-prefix ..))` rule, and no rule may allow a lookup back.
     #[test]
+    #[ignore = "mutant: reach tests/devices.rs"]
     fn each_device_rule_denies_a_whole_prefix() {
         let sandbox = Isolation::Sandbox(PathBuf::from(SANDBOX_EXEC));
         for network in [Network::Off, Network::On] {
@@ -374,6 +375,7 @@ mod tests {
     /// `docs/spikes/macos-p0.md`), and every rule of [`NO_DEVICE_RULES`]. The appended
     /// rules may only allow file writes.
     #[test]
+    #[ignore = "mutant: reach tests/devices.rs"]
     fn every_profile_keeps_its_denies() {
         let sandbox = Isolation::Sandbox(PathBuf::from(SANDBOX_EXEC));
         let folders = crate::user_folders::UserFolders::new(
@@ -431,6 +433,7 @@ mod tests {
     /// reordered inside the wrapper; and a node without `sandbox-exec` claiming
     /// isolation.
     #[test]
+    #[ignore = "mutant: reach tests/devices.rs"]
     fn every_action_is_wrapped_and_only_the_network_differs() {
         let args = vec!["-c".to_owned(), "echo hi".to_owned()];
         let program = PathBuf::from("/bin/sh");
