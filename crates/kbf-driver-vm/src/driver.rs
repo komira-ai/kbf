@@ -2,7 +2,7 @@
 //! the lease ends however it ends. See the crate documentation for the steps.
 
 use std::collections::BTreeMap;
-use std::io::Read as _;
+use std::io::{ErrorKind, Read as _};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
@@ -15,7 +15,7 @@ use kbf_daemon::{Runtime, RuntimeError, Work};
 use kbf_driver_native::CasStore;
 use kbf_driver_native::network::{Network, network_of};
 use kbf_guest::client::{Client, ClientError};
-use kbf_guest::wire::{End, Exit, Refusal, RunRequest, TOKEN_LEN};
+use kbf_guest::wire::{End, Exit, Refusal, RunRequest, TOKEN_LEN, WireError};
 use kbf_outputs::OutputsError;
 use kbf_proto::reapi::{Action, ActionResult, Command, ExecutedActionMetadata};
 use kbf_types::{LeaseId, Resources};
@@ -189,12 +189,10 @@ impl<H: VmHost, C: Cas> VmDriver<H, C> {
             loop {
                 let left = deadline.saturating_duration_since(Instant::now());
                 if left.is_zero() {
-                    return Err(RuntimeError::Failed(format!(
-                        "the guest was not ready within the boot timeout of {timeout:?}"
-                    )));
+                    return Err(not_ready(timeout));
                 }
                 match host.connect(&name) {
-                    Ok(stream) => return handshake(stream, token, left),
+                    Ok(stream) => return handshake(stream, token, left, timeout),
                     Err(HostError::NotReady) => std::thread::sleep(poll.min(left)),
                     Err(e) => return Err(host_error(e)),
                 }
@@ -394,17 +392,27 @@ impl<H: VmHost, C: Cas> Runtime for VmDriver<H, C> {
 }
 
 /// Connects to the guest over `stream` with `token`, its reads bounded by `left` until
-/// `Ready`, and checks the session it runs in.
+/// `Ready`, and checks the session it runs in. A read that runs out of `left` is the
+/// guest not ready within the boot `timeout`.
 fn handshake<S: kbf_guest::server::Stream>(
     stream: S,
     token: [u8; TOKEN_LEN],
     left: Duration,
+    timeout: Duration,
 ) -> Result<Client<S>, RuntimeError> {
     let io = |e: std::io::Error| RuntimeError::Failed(format!("the guest's stream: {e}"));
     // A second handle on the socket, whose read timeout is the socket's own.
     let control = stream.try_clone().map_err(io)?;
     control.set_read_timeout(Some(left)).map_err(io)?;
-    let client = Client::connect(stream, token).map_err(client_error)?;
+    let client = Client::connect(stream, token).map_err(|e| match e {
+        // The read bound ran out: the socket says WouldBlock (Unix) or TimedOut.
+        ClientError::Wire(WireError::Io(ref e))
+            if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) =>
+        {
+            not_ready(timeout)
+        }
+        other => client_error(other),
+    })?;
     // The command may run for hours without a message: no read bound from here on.
     control.set_read_timeout(None).map_err(io)?;
     if client.session() != GUI_SESSION {
@@ -455,6 +463,13 @@ fn exit_code(end: End) -> Result<i32, RuntimeError> {
 /// not have.
 fn host_error(error: HostError) -> RuntimeError {
     RuntimeError::Failed(format!("VM host: {error}"))
+}
+
+/// A guest that did not send `Ready` within the boot timeout: the farm's failure.
+fn not_ready(timeout: Duration) -> RuntimeError {
+    RuntimeError::Failed(format!(
+        "the guest was not ready within the boot timeout of {timeout:?}"
+    ))
 }
 
 /// A guest's error as the lease reports it. A request the guest refuses as malformed,

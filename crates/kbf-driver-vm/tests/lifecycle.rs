@@ -4,7 +4,7 @@
 mod support;
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use kbf_daemon::{Runtime, RuntimeError};
 use kbf_driver_vm::{FakeHost, MACOS_VM_LIMIT, MachineId};
@@ -172,7 +172,11 @@ async fn a_boot_timeout_is_an_infrastructure_failure_and_destroys_the_clone() {
 /// Catches a handshake read left unbounded: a guest whose VM is reachable but which
 /// never sends `Hello` (an agent hung before `Ready`) would hold the lease, its VM and
 /// one of the host's two VM slots for ever. It must end at the boot timeout as the
-/// farm's failure, its VM stopped and its clone removed.
+/// farm's failure, its VM stopped and its clone removed. The lower bound catches the
+/// opposite: a handshake bound shorter than the boot time left, or a fake guest that
+/// drops its end instead of holding it silent, ends the lease before the guest had its
+/// boot timeout. The message catches a read timeout reported as a bare OS error
+/// ("Resource temporarily unavailable") rather than as a guest not ready in time.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_guest_silent_before_ready_hits_the_boot_timeout() {
     let dir = scratch("mute-boot");
@@ -183,12 +187,53 @@ async fn a_guest_silent_before_ready_hits_the_boot_timeout() {
     let driver = driver(config.clone(), &host, &cas);
     let action = Spec::sh("true").store(&cas);
 
+    let started = Instant::now();
     let ended = tokio::time::timeout(Duration::from_secs(5), driver.run(work(1, action)))
         .await
         .expect("ended near the boot timeout");
+    let took = started.elapsed();
 
-    assert!(matches!(ended, Err(RuntimeError::Failed(_))), "{ended:?}");
+    // The boot's first connect comes after the clone, so a few ms of the 300 are spent
+    // before the handshake starts; 250 ms leaves that slack and still fails a bound of
+    // tens of ms or an end at once.
+    assert!(
+        took >= Duration::from_millis(250),
+        "ended after {took:?}: {ended:?}"
+    );
+    assert!(
+        matches!(ended, Err(RuntimeError::Failed(ref why)) if why.contains("not ready within the boot timeout")),
+        "{ended:?}"
+    );
     assert_eq!(host.stopped(), [name(1)]);
+    assert!(host.running().is_empty(), "{:?}", host.running());
+    assert!(leftovers(&config).is_empty(), "{:?}", leftovers(&config));
+}
+
+/// Catches the handshake's read bound left on the socket after `Ready`: the command's
+/// report would then be awaited with a read timeout of the boot time left, so every
+/// action that runs longer than that (minutes, against a two-minute boot timeout)
+/// would fail as the farm's error and be rerun elsewhere, failing again. A command
+/// that runs well past the boot timeout, inside its own timeout, must finish.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_run_longer_than_the_boot_timeout_finishes() {
+    let dir = scratch("past-boot");
+    let mut config = config(&dir);
+    config.boot_timeout = Duration::from_millis(300);
+    let host = Arc::new(FakeHost::new());
+    let cas = Arc::new(MemoryCas::default());
+    let driver = driver(config.clone(), &host, &cas);
+    let action = Spec::sh("sleep 1; echo done")
+        .timeout(Duration::from_secs(10))
+        .store(&cas);
+
+    let result = driver
+        .run(work(1, action))
+        .await
+        .expect("ran past the boot timeout");
+
+    assert_eq!(result.exit_code, 0);
+    let stdout = result.stdout_digest.as_ref().expect("stdout");
+    assert_eq!(cas.blob(stdout), b"done\n");
     assert!(host.running().is_empty(), "{:?}", host.running());
     assert!(leftovers(&config).is_empty(), "{:?}", leftovers(&config));
 }
