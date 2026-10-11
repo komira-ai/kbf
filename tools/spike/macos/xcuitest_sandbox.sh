@@ -233,7 +233,7 @@ a_deny_default() {
 # result there (none when run.sh stopped before printing one).
 driver_arm() {
     local exit in_sandbox
-    tracked "$1" in_lease "$1" "$LEASES/$1/sandbox/profile.sb" \
+    printf "%s\n" "(version 1)" "(allow default)" "(deny job-creation)" "(deny lsopen)" "(deny user-preference-write)" "(deny file-write*)" "(allow file-write* (subpath (param \"KBF_LEASE\")) (subpath \"/dev\"))" >"$LEASES/$1/copy.sb"; tracked "$1" in_lease "$1" "$LEASES/$1/copy.sb" \
         bash "$RUN" "$2" "$LEASES/$1/root/out" ${3:+"$3"}
     kv "$1.used_sha256" "$(cat "$LEASES/$1/used.sha256" 2>/dev/null)"
     exit=$(sed -n "s/^SPIKE macos-[^.]*\.xcuitest\.$2\.xcodebuild_exit=//p" "$SPIKE_RESULTS/$1.out" | tail -n 1)
