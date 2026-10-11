@@ -86,13 +86,16 @@ buck2 takes it from `BUCK_WRAPPER_UUID` when set.
 
 - Parsed once per call by a tower layer in `kbf-front`, beside (not inside) the
   authentication layer, and put in the request's extensions as a `CallMetadata`.
-- **The id's characters are `[A-Za-z0-9._-]`, 1 to 128 bytes.** buck2's UUIDs, Bazel's
-  UUIDs and the server's own `kbf-<uuid>` fit. The set has no character that needs
-  escaping in a URL path, and none that HTML or a header treats specially, so the id is
-  used in a URL or a `Location` as it is. It also leaves `~` free as the separator of
-  2.4, so no client id can equal a derived key.
+- **The id's characters are `[A-Za-z0-9._-]`, 1 to 128 bytes, and the first is a letter
+  or digit.** buck2's UUIDs, Bazel's UUIDs and the server's own `kbf-<uuid>` fit. The set
+  has no character that needs escaping in a URL path, and none that HTML or a header
+  treats specially, so the id is used in a URL or a `Location` as it is. It also leaves
+  `~` free as the separator of 2.4, so no client id can equal a derived key. The rule on
+  the first character rules out `.` and `..`, which browsers and proxies normalize away
+  in `/build/..`, so such an id's link would resolve to another page.
 - **A bad header never fails a call.** A header over 8 KiB, one that does not decode, or
-  an id that is empty, longer than 128 bytes or has a character outside that set is
+  an id that is empty, longer than 128 bytes, has a character outside that set or does
+  not start with a letter or digit is
   treated as absent and counted (`kbf_invocation_metadata_invalid`). A build must not
   break because of bookkeeping.
 - Text fields (`target_id`, mnemonic, configuration) are kept up to 512 bytes each and
@@ -161,7 +164,7 @@ One row per action digest per invocation, in the order first seen.
 | `attempts` | each lease: lease id, worker (node id), queued, granted, started, ended, and how it ended: result, or the requeue reason (`requeue.rs`), or the failure class (`log.proto` `Failure`) with the daemon's reason text, capped at 1 KiB |
 | `outcome` | `ok` with exit code; `failed` with the gRPC status code and message; `timed_out`; `refused` with the reason |
 | `result` | the ActionResult blob digest (from `OpState::Completed`, or the AC entry for a hit) |
-| `command` | the Command digest, read from the Action when the row is written |
+| `command` | the Command digest, read from the Action blob by the recorder (off the call path) for every row, cache hits included; absent when the CAS does not hold the Action (buck2 does not upload it for a cache hit) |
 | `outputs` | copied from the ActionResult: each output file's path, digest and executable bit, and each output directory's path and tree digest; at most 1,000 per row, then `outputs_truncated: true` |
 | `stdout`, `stderr` | the two digests, copied from the ActionResult (absent when the result has none) |
 | `usage` | the `ResourceUsage` values, copied when the result carries them |
@@ -245,14 +248,15 @@ unflushed rows and the header fields; step 3 then applies only when flushes fail
   small blob too, rewritten at each flush.
 - The log holds one **pin** per invocation, `invocation/<id>` to the root's digest and a
   hold-until time: the Pins of [storage.md](storage.md#planned). A pin keeps its root and
-  chunks from collection; chunks are opaque to collection, so the pin's closure is
-  listed in the root, not discovered (3.6 says what it covers).
-- **The log cost of a flush** is one `PutBlobs` entry for the chunk and the root (the
-  `Cache` write path commits one for every stored blob) and one pin update: about 200 to
-  300 B, estimated. With the flush rule of 3.4, a farm with N invocations open at once
-  writes at most 30 flushes an hour for each, plus one per 256 KiB of rows: at the pilot
-  rate (about 4 actions a second, about 5 MB of rows an hour) and N = 10, about 320
-  flushes, about 1,000 entries and under 100 KB of log an hour, against 14,400 rows an
+  chunks from collection. The pin's closure is listed in the root, not discovered:
+  collection parses the root, and only the root, while the chunks stay opaque to it
+  (3.6 says what the closure covers).
+- **The log cost of a flush** is two entries: one `PutBlobs` for the chunk and the root
+  (`Cache::store_blobs` commits one per segment batch, and both blobs are stored in one
+  call) and one pin update: about 200 to 300 B, estimated. With the flush rule of 3.4, a
+  farm with N invocations open at once writes at most 30 flushes an hour for each, plus
+  one per 256 KiB of rows: at the pilot rate (about 4 actions a second, about 5 MB of rows an hour) and N = 10, about 320
+  flushes, about 640 entries and under 100 KB of log an hour, against 14,400 rows an
   hour if rows went into the log. A 10 s flush would be twelve times that per open build;
   this is why the time floor is 120 s and an idle build is flushed once.
 - This keeps the object store's contract (`kbf-objstore`: kbf never asks a store whether
@@ -280,7 +284,12 @@ invocation; the next server marks those invocations `complete: false`.
   the tree blob is.
 - `--invocation-pin-outputs=failed` (planned) adds to a failed action's pin closure its
   ActionResult blob, its output files and trees, its stdout and stderr: the case worth
-  keeping.
+  keeping. These digests are listed in the root (3.5), so collection still parses only
+  the root. Not settled yet: whether the files inside a failed action's output tree are
+  pinned too. If they are, either collection reads the Tree blob or the root lists the
+  files; storage.md defines Pins only as named retention roots, so this is decided with
+  the Pins design (PR 7). Recommended: the root lists the files, so collection parses
+  one format.
 - Until collection lands nothing is deleted, so retention is a promise of a floor, not a
   ceiling.
 
@@ -469,11 +478,13 @@ in two places, because open-source buck2 reads a different one for each kind of 
   exit, buck2 shows it as `Info:` under the action's error.
 - **Appended to `status.message`, on every non-OK status**: failed, timed out (today
   `the action timed out`, `DEADLINE_EXCEEDED`), missing inputs, and refusals alike. For a
-  non-OK status buck2 shows the status message and drops `ExecuteResponse.message`.
+  non-OK status buck2 shows the status message and drops `ExecuteResponse.message`:
+  its gRPC client turns any non-OK status into an error that carries the status
+  message, and that message becomes the action's error text.
   The link is appended after the existing text, separated by a newline, never in place
-  of it: buck2 matches `OUTMISS` in the status message in every build (and
-  `Execution timed out` in Meta's internal build only), so the text before the link must
-  stay as it is.
+  of it, so any client that matches the text still sees it unchanged (buck2's internal
+  build matches `OUTMISS` and `Execution timed out`; open-source buck2 matches neither,
+  since its client returns the error before that check).
 
 A successful build prints no link.
 
@@ -541,7 +552,7 @@ ingester is a second writer and not a second record. buck2 does not emit BES.
 
 - **A farm-minted id for every build.** The user cannot learn it: no REAPI field shown on
   success, and buck2's printed id is its own. Kept only for the id-less Execute fallback.
-- **Rows in the replicated log.** 70 to 140 MB a day into a log that has no compaction,
+- **Rows in the replicated log.** 100 to 240 MB a day into a log that has no compaction,
   in every snapshot and checkpoint digest, and a log format change per field.
 - **Records as separate objects in the object store.** Needs a new key space whose keys
   the log must still record (the objstore contract) and its own retention; CAS blobs plus
@@ -562,7 +573,8 @@ defect it catches and the mutant planted to see it go red.
    field 2 for 3, the golden goes red); oversize, undecodable ids and ids with a
    character outside `[A-Za-z0-9._-]` (`~`, `<`, `/`, `%`) are absent and the call still
    succeeds (plant "refuse on decode error", the call test goes red; plant the old
-   `[!-~]` set, the `~` and `<` cases go red). Also settles the open fact in [failure-classes.md](failure-classes.md) O2 about
+   `[!-~]` set, the `~` and `<` cases go red); `.`, `..` and `-x` are absent (plant
+   dropping the first-character rule, the `..` case goes red). Also settles the open fact in [failure-classes.md](failure-classes.md) O2 about
    which fields buck2 sends.
 2. **(S) The record model, pure.** `kbf.invocation.v1` protos and an `Invocation` type
    built only from events; no clock, no I/O. Tests: every `how` and outcome; a requeued
@@ -595,8 +607,8 @@ defect it catches and the mutant planted to see it go red.
    missing-input and a refused answer each have a status message that starts with its
    text of today and ends with the link (plant "replace the message", the prefix check
    goes red; plant "message only in `ExecuteResponse`", the non-OK cases go red); the
-   id-less fallback mints a `kbf-` id whose page exists and that writes nothing to the
-   log; `GET /build/{id}` answers `303` to the API route.
+   id-less fallback mints a `kbf-` id whose page exists; `GET /build/{id}` answers `303`
+   to the API route.
 7. **(M) The pin command and its log format**, in the same format bump as Pins
    ([storage.md](storage.md#planned)); ordered with the HA work (PR #303). Tests: a log
    of the new format replays pins and their hold-until; a reader of `Format::V1` refuses
@@ -604,7 +616,9 @@ defect it catches and the mutant planted to see it go red.
 8. **(M) Durable records** (3.5 stage 2): chunks as CAS blobs, roots, the flush rule of
    3.4, recovery marking open invocations incomplete. Tests: restart keeps every flushed
    row; a crash loses at most the window; an idle invocation is flushed once and then
-   writes nothing (plant a 10 s timer, the log-entry count goes red); `kbf-sim-cell`
+   writes nothing (plant a 10 s timer, the log-entry count goes red); a minted
+   invocation (2.3) writes no chunk and no pin (plant "flush minted invocations like any
+   other", the log-entry count goes red); `kbf-sim-cell`
    gains the property "every pinned root's chunks are readable".
 9. **(S) Retention and delete**: pin expiry, `DELETE`, `--invocation-pin-outputs=failed`.
    **Blocked on collection**, which the server does not run today (section 1). Tests: an
