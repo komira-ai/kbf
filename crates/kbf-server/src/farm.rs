@@ -740,14 +740,13 @@ impl State {
         let Some(lease) = switching else {
             return;
         };
-        if self.sched.not_held(worker, &[lease]).next().is_some()
-            && let Some(link) = self.links.get(worker)
-        {
+        if self.sched.not_held(worker, &[lease]).next().is_some() {
             tracing::info!(%worker, %lease, "the node switches its session for a lease not held here: cancelled");
             let cancel = server_message::Message::Cancel(Cancel {
                 lease_id: Some(wire_lease(lease)),
             });
-            let _ = link.outbound.send(Ok(ServerMessage {
+            // A phase comes on the worker's current stream, so it has a link.
+            let _ = self.links[worker].outbound.send(Ok(ServerMessage {
                 message: Some(cancel),
             }));
         }

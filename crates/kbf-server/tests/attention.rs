@@ -174,6 +174,26 @@ async fn an_attention_item_is_a_warning_that_names_the_node_and_the_fix() {
         attention(log.take()),
         ["INFO kbf_server::attention: node mac-1: no longer quarantined"]
     );
+    let lease = kbf_types::LeaseId::new(7, 3);
+    for (phase, view) in [
+        (
+            NodePhase::Preparing(lease),
+            PhaseView::Preparing {
+                lease: "7.3".to_owned(),
+            },
+        ),
+        (
+            NodePhase::Restoring(lease),
+            PhaseView::Restoring {
+                lease: "7.3".to_owned(),
+            },
+        ),
+    ] {
+        farm.resize(&node, stream, reported(phase));
+        assert_eq!(farm.node_view(&node).expect("registered").phase, view);
+    }
+    farm.resize(&node, stream, reported(NodePhase::Serving));
+    assert_eq!(attention(log.take()), Vec::<String>::new());
     assert_eq!(
         farm.node_view(&node).expect("registered").phase,
         PhaseView::Serving

@@ -76,7 +76,9 @@ async fn until_logged(fake: &FakeSession, verb: &str) {
 }
 
 fn the_action(cas: &MemoryCas) -> Digest {
-    let mut spec = Spec::sh("cat in; echo made > out/made.txt").outputs(&["out/made.txt"]);
+    let mut spec = Spec::sh("cat in; echo \"$FROM\"; echo made > out/made.txt")
+        .env("FROM", "the Command")
+        .outputs(&["out/made.txt"]);
     spec.inputs
         .push(("in".to_owned(), b"from the input\n".to_vec()));
     spec.store(cas)
@@ -102,8 +104,9 @@ async fn a_lease_runs_in_its_users_session_and_the_node_is_cleaned_after() {
 
     let result = run(&runtime, &the_action(&cas)).await.expect("ran");
     assert_eq!(result.exit_code, 0);
-    assert_eq!(stdout(&cas, &result), "from the input\n");
+    assert_eq!(stdout(&cas, &result), "from the input\nthe Command\n");
     assert_eq!(result.output_files.len(), 1);
+    assert!(format!("{runtime:?}").contains("phase: Serving"));
     assert_eq!(
         fake.verbs(),
         [
@@ -156,7 +159,7 @@ async fn a_lease_survives_the_restart_into_its_session() {
     let after = start(&config, &fake, &cas);
     assert_eq!(phase(&after), NodePhase::Preparing(lease()));
     let result = run(&after, &action).await.expect("ran after the restart");
-    assert_eq!(stdout(&cas, &result), "from the input\n");
+    assert_eq!(stdout(&cas, &result), "from the input\nthe Command\n");
     assert_eq!(
         fake.verbs(),
         [
@@ -202,7 +205,7 @@ async fn the_outcome_survives_the_restart_back() {
     let after = start(&config, &fake, &cas);
     assert_eq!(phase(&after), NodePhase::Restoring(lease()));
     let result = run(&after, &action).await.expect("the kept result");
-    assert_eq!(stdout(&cas, &result), "from the input\n");
+    assert_eq!(stdout(&cas, &result), "from the input\nthe Command\n");
     assert_eq!(
         fake.verbs(),
         ["boot-reset 1.1", "user-delete 1.1 (restoring)"]
@@ -532,4 +535,55 @@ async fn bad_actions_and_bad_records_fail_the_lease() {
         error.to_string().contains("writing the lease record"),
         "{error}"
     );
+}
+
+/// Catches a lease record or quarantine that cannot be read taken as none (the daemon
+/// would start serving over a lease user it made, or a node an operator has not
+/// repaired): the runtime does not start.
+#[tokio::test]
+async fn unreadable_files_stop_the_start() {
+    for file in [LEASE_FILE, QUARANTINE_FILE] {
+        let dir = scratch(&format!("whole-unreadable-{file}"));
+        let config = config(&dir);
+        std::fs::create_dir_all(config.dir.join(file)).expect("a directory in its place");
+        let cas = Arc::new(MemoryCas::default());
+        let started = WholeMachineRuntime::new(config, FakeSession::default(), cas);
+        assert!(started.is_err(), "{file}");
+    }
+}
+
+/// Catches a cleanup that cannot record its steps carrying on as if it could, and a
+/// quarantine that cannot be written leaving the node serving: the node is
+/// quarantined for this daemon's life at least.
+#[tokio::test]
+async fn a_cleanup_that_cannot_record_quarantines_the_node() {
+    if rustix::process::geteuid().is_root() {
+        return; // root writes through a read-only directory
+    }
+    let dir = scratch("whole-cannot-record");
+    let cas = Arc::new(MemoryCas::default());
+    let fake = FakeSession::default();
+    fake.state().hold.insert("wait");
+    let config = config(&dir);
+    let runtime = start(&config, &fake, &cas);
+    let running = {
+        let runtime = Arc::clone(&runtime);
+        let action = the_action(&cas);
+        tokio::spawn(async move { runtime.run(work(action)).await })
+    };
+    until_logged(&fake, "wait").await;
+    let mode = |m| std::os::unix::fs::PermissionsExt::from_mode(m);
+    std::fs::set_permissions(&config.dir, mode(0o500)).expect("chmod");
+    fake.release();
+    let outcome = tokio::time::timeout(PROMPT, running)
+        .await
+        .expect("ends")
+        .expect("ran");
+    std::fs::set_permissions(&config.dir, mode(0o700)).expect("chmod back");
+    assert!(outcome.is_ok(), "{outcome:?}");
+    let NodePhase::Quarantined(why) = phase(&runtime) else {
+        panic!("not quarantined: {:?}", phase(&runtime));
+    };
+    assert!(why.contains("writing the lease record"), "{why}");
+    assert!(!config.dir.join(QUARANTINE_FILE).exists());
 }

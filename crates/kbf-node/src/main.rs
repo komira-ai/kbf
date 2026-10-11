@@ -316,11 +316,14 @@ fn node(
     let report = NodeReport::detect(&[])?
         .with_entries(cli.daemon.label_entries())
         .within(node.capacity);
-    let mut daemon = Daemon::new(DaemonConfig::from_args(&cli.daemon), runtimes, report)?
-        .with_container_images(cli.images.iter().cloned());
-    if let Some(phase) = node.phase {
-        daemon = daemon.with_phase(phase);
-    }
+    // A node without the whole-machine runtime is always serving: a phase that never
+    // changes.
+    let phase = node
+        .phase
+        .unwrap_or_else(|| tokio::sync::watch::channel(kbf_types::NodePhase::Serving).1);
+    let daemon = Daemon::new(DaemonConfig::from_args(&cli.daemon), runtimes, report)?
+        .with_container_images(cli.images.iter().cloned())
+        .with_phase(phase);
     Ok(match node.reports {
         Some(reports) => (daemon.with_driver_report(reports.clone()), Some(reports)),
         None => (daemon, None),

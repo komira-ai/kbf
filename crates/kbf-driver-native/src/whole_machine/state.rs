@@ -321,8 +321,9 @@ mod tests {
             ..record
         };
         let back = Record::decode(&other.encode()).unwrap();
-        assert!(
-            matches!(back.outcome, Some(Err(RuntimeError::Failed(why))) if why.contains("busy"))
+        assert_eq!(
+            format!("{:?}", back.outcome),
+            r#"Some(Err(Failed("killed on a busy node: x")))"#
         );
     }
 

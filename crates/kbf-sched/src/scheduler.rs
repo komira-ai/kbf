@@ -491,13 +491,12 @@ impl Scheduler {
             .iter()
             .filter_map(|(lease, held)| {
                 let worker = self.ops[&held.operation].state.holding().map(|(_, w)| w);
-                let Some(w) = worker.and_then(|w| self.workers.get(w)) else {
-                    return Some((held.operation, RequeueReason::Silent));
-                };
-                if w.alive(now) || w.switching(*lease, now) {
+                let w = worker.and_then(|w| self.workers.get(w));
+                if w.is_some_and(|w| w.alive(now) || w.switching(*lease, now)) {
                     return None;
                 }
-                let reason = if w.phase.switching() == Some(*lease) {
+                let switched = w.is_some_and(|w| w.phase.switching() == Some(*lease));
+                let reason = if switched {
                     RequeueReason::SessionSwitch
                 } else {
                     RequeueReason::Silent
