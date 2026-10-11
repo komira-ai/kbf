@@ -23,6 +23,7 @@ path = "src/bin/kbf-m2-act.rs"
 
 [dependencies]
 clap.workspace = true
+kbf-deploy.workspace = true
 kbf-daemon.workspace = true
 kbf-testkit.workspace = true
 rcgen.workspace = true

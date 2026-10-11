@@ -1,0 +1,58 @@
+# kbf-deploy linux settings for one converged storage node (MinIO, kbf-server and
+# kbf-daemon on one host; docs/deploy/storage-node.md). Copy it, fill in the four host
+# values, and pass the copy as --config. KEY=VALUE lines; a value may be "quoted". An
+# unknown or repeated key is refused, and an empty value means the default. Every value
+# here is a placeholder or the default.
+
+# --- The host: no defaults (render-units and check-units refuse without them) ---
+# Its fixed DNS name, the name in the server's certificates and the one daemons dial.
+KBF_HOST_NAME=storage-node.example.internal
+# The address kbf-server's REAPI and worker listeners bind: the host's pinned LAN
+# address (never 0.0.0.0 or ::), IPv4 or IPv6, written bare (the units bracket IPv6).
+# 192.0.2.0/24 is a documentation range.
+KBF_LISTEN_ADDRESS=192.0.2.10
+# kbf-daemon's --node-id.
+KBF_NODE_ID=storage-node-1
+# The host's RAM in GiB (free -g, the "total" column).
+KBF_RAM_GIB=256
+
+# --- The memory split (docs/deploy/storage-node.md, "Memory on a converged host") ---
+# What MinIO and kbf-server use at their peak; also their MemoryMin=.
+MINIO_RESERVATION_GIB=32
+KBF_SERVER_RESERVATION_GIB=16
+# The kernel, systemd, sshd, the daemon and Podman: at least 4.
+KBF_OS_HEADROOM_GIB=8
+# The daemon's memory.min (MemoryMin= and --supervisor-memory-min-mib).
+KBF_DAEMON_MEMORY_MIN_MIB=256
+
+# --- MinIO ---
+# The host's MinIO systemd unit, which the drop-in extends.
+MINIO_UNIT=minio.service
+# kbf-server's S3 endpoint: the host's own MinIO node.
+MINIO_S3_ENDPOINT=http://127.0.0.1:9000
+KBF_S3_BUCKET=kbf-cas
+
+# --- kbf-server ---
+# raft: a single-voter Raft log in KBF_RAFT_DIR. memory: the index in memory.
+KBF_META_LOG=raft
+# On local disk, on a partition apart from build scratch, swap and MinIO's data.
+KBF_RAFT_DIR=/var/lib/kbf-server/raft
+KBF_SERVER_USER=kbf-server
+KBF_REAPI_PORT=8980
+KBF_WORKER_PORT=8981
+KBF_API_PORT=8982
+
+# --- kbf-daemon ---
+KBF_USER=kbf
+KBF_SCRATCH_DIR=/var/lib/kbf/leases
+# Pinned images, space-separated, each <repo>@sha256:<64 hex> of one architecture's
+# manifest, without docker://. Each becomes the daemon's --image=docker://<entry>,
+# which it checks at start. Empty: no --image flag.
+KBF_IMAGES=
+
+# --- Paths ---
+# Certificates, keys, s3.env, api-token and deny-list.
+KBF_ETC=/etc/kbf
+KBF_BIN_DIR=/usr/local/bin
+KBF_SWAP_FILE=/swapfile
+KBF_SWAP_SIZE=128G

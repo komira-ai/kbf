@@ -1,9 +1,11 @@
-//! `kbf-deploy`: the core the deploy kits are built on.
+//! `kbf-deploy`: the deploy tool. The binary's subcommands are the kits; this library
+//! holds them and the core they are built on.
 //!
-//! A kit asks the host what is there and builds a [`Plan`] of [`Step`]s that brings the
-//! host to what it wants. By default [`execute`] prints each step as `DRY-RUN: <step>`
-//! and changes nothing; with [`Mode::Apply`] (`--apply`) it prints `+ <step>` and does
-//! it, stopping at the first failure. A plan made again after it was applied is empty.
+//! A kit that changes a host asks it what is there and builds a [`Plan`] of [`Step`]s
+//! that brings the host to what it wants. By default [`execute`] prints each step as
+//! `DRY-RUN: <step>` and changes nothing; with [`Mode::Apply`] (`--apply`) it prints
+//! `+ <step>` and does it, stopping at the first failure. A plan made again after it
+//! was applied is empty.
 //!
 //! - [`path`]: [`HostPath`], an absolute path with no `..`, joined to a [`Root`] (`/` on
 //!   a host, a scratch directory in tests).
@@ -18,13 +20,24 @@
 //!   through a shell. Tests use a fake that records each step.
 //! - [`config`]: `--config FILE`, `KEY=VALUE` lines over a closed key set; an unknown
 //!   or repeated key is refused.
+//! - [`unit`]: a systemd unit file read as systemd reads it (sections, `\` continuations,
+//!   the last assignment wins), shared with the docs check in `kbf-it`.
+//! - [`template`]: strict `@KEY@` substitution; a placeholder with no value is refused.
+//!
+//! The kits:
+//! - [`linux`]: a converged storage node's systemd units, rendered from compiled-in
+//!   templates (`linux render-units`) and checked against the host's priorities
+//!   (`linux check-units`). It writes only into the directory it is given.
 
 pub mod config;
 pub mod exec;
+pub mod linux;
 pub mod path;
 pub mod plan;
 pub mod step;
+pub mod template;
 pub mod trust;
+pub mod unit;
 
 #[cfg(test)]
 pub(crate) mod testkit;
