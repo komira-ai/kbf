@@ -65,6 +65,7 @@ impl Helper {
             _ => {}
         }
         autologin::require_filevault_off(self.host.as_ref())?;
+        autologin::restart_userspace(self.host.as_ref())?;
         write_intent(&paths.intent, lease)
             .map_err(|why| format!("writing {}: {why}", paths.intent.display()))?;
         let name = user_name(lease);
