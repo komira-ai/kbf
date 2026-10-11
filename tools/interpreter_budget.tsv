@@ -19,7 +19,7 @@
 126	tools/ci/darwin-entitlements.sh	CI step; to become a cargo xtask verb
 100	tools/ci/guest-tests.sh	CI tests run as root; to become Rust tests run as root
 28	tools/ci/m2-container.sh	CI step; to become a cargo xtask verb
-321	tools/ci/mac-session-tests.sh	CI tests run as root; to become Rust tests run as root
+404	tools/ci/mac-session-tests.sh	CI tests run as root; to become Rust tests run as root
 52	tools/ci/package-asset.sh	CI step; to become a cargo xtask verb
 22	tools/ci/podman-tests-inner.sh	CI step; to become a cargo xtask verb
 74	tools/ci/podman-tests.sh	CI step; to become a cargo xtask verb
