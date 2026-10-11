@@ -598,6 +598,8 @@ mod whole_machine;
 #[cfg(test)]
 mod deploy_doc_tests;
 #[cfg(test)]
+mod instance_tests;
+#[cfg(test)]
 mod startup_tests;
 
 #[cfg(test)]

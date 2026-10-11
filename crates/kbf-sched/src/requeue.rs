@@ -134,6 +134,9 @@ mod tests {
             },
             RequeueReason::NodeMemoryPressure,
             RequeueReason::SessionSwitch,
+            RequeueReason::Restarted,
+            RequeueReason::Lost(LostWhy::Fenced),
+            RequeueReason::Lost(LostWhy::DaemonRestarted),
         ];
         let text: Vec<String> = all.iter().map(ToString::to_string).collect();
         for (i, a) in text.iter().enumerate() {
@@ -150,6 +153,13 @@ mod tests {
         assert!(text[4].contains("with 2 GiB booked"), "{}", text[4]);
         assert!(text[5].contains("same booking"), "{}", text[5]);
         assert!(text[6].contains("session switch grace"), "{}", text[6]);
+        assert!(
+            text[7].contains("killed the run before registering"),
+            "{}",
+            text[7]
+        );
+        assert!(text[8].contains("fenced"), "{}", text[8]);
+        assert!(text[9].contains("daemon restarted while"), "{}", text[9]);
     }
 
     /// Catches: a size shown in bytes, or rounded to a whole GiB it is not (an operator

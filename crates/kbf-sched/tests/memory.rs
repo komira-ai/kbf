@@ -457,7 +457,8 @@ fn two_instances_with_the_same_action_keep_separate_floors() {
 /// Catches: a busy node's kill that raises the booking or the floor (the mutant: it
 /// is the node's fault, not the action's), one that is answered at once or rerun
 /// without end, a node whose pressure is not counted (or counted against another
-/// node), and runs not recorded.
+/// node), a rerun on the node that killed it while another can run it, and runs not
+/// recorded. With both nodes avoided, the third run goes to the first that fits.
 #[test]
 fn a_busy_node_kill_reruns_with_the_same_ask_and_records_node_pressure() {
     let mut f = Farm::new();
@@ -466,25 +467,31 @@ fn a_busy_node_kill_reruns_with_the_same_ask_and_records_node_pressure() {
     f.submit(1, request(1, 2 * GIB));
     let mut start = f.start();
     assert_eq!(start.worker, w("busy"));
+    let mut pressure = Vec::new();
     for n in 1..=FARM_RERUNS {
         let next = f.killed(&start, PRESSURE);
         assert_eq!(
             next.resources, start.resources,
             "rerun {n} changed the booking"
         );
-        assert_eq!(f.s.memory_pressure(&w("busy")), u64::from(n));
+        pressure.push((
+            f.s.memory_pressure(&w("busy")),
+            f.s.memory_pressure(&w("other")),
+        ));
         start = next;
     }
+    assert_eq!(pressure, [(1, 0), (1, 1)]);
+    assert_eq!(start.worker, w("busy"));
     assert_eq!(f.requeues(), vec![RequeueReason::NodeMemoryPressure; 2]);
     assert_eq!(f.s.memory_floor(&key(1)), None, "a floor from a busy node");
 
     f.finishes(&start, PRESSURE);
-    assert_eq!(f.s.memory_pressure(&w("busy")), 3);
-    assert_eq!(f.s.memory_pressure(&w("other")), 0);
+    assert_eq!(f.s.memory_pressure(&w("busy")), 2);
+    assert_eq!(f.s.memory_pressure(&w("other")), 1);
     assert_eq!(f.s.memory_pressure(&w("unknown")), 0);
     assert_eq!(
         f.s.memory_runs(start.operation).unwrap(),
-        [busy("busy", 2), busy("busy", 2), busy("busy", 2)]
+        [busy("busy", 2), busy("other", 2), busy("busy", 2)]
     );
     assert!(f.s.memory_runs(OperationId(99)).is_none());
 }

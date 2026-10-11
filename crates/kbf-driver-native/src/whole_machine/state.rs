@@ -278,6 +278,7 @@ fn replace(dir: &Path, path: &Path, bytes: &[u8]) -> io::Result<()> {
 mod tests {
     use super::*;
     use kbf_proto::reapi::Digest;
+    use kbf_types::LostWhy;
 
     fn digest(n: u8) -> Digest {
         Digest {
@@ -307,6 +308,14 @@ mod tests {
             Some(Err(RuntimeError::Invalid("bad\npath".to_owned()))),
             Some(Err(RuntimeError::MissingBlob("ab/3".to_owned()))),
             Some(Err(RuntimeError::Failed("no session".to_owned()))),
+            Some(Err(RuntimeError::Lost(
+                LostWhy::DaemonRestarted,
+                "its result is lost".to_owned(),
+            ))),
+            Some(Err(RuntimeError::Lost(
+                LostWhy::Fenced,
+                "fenced".to_owned(),
+            ))),
         ];
         for (i, outcome) in outcomes.drain(..).enumerate() {
             record.step = [Step::Preparing, Step::Started, Step::Restoring][i % 3];

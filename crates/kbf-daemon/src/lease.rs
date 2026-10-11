@@ -286,6 +286,8 @@ pub(crate) fn proto_lease_id(id: LeaseId) -> worker::LeaseId {
 mod tests {
     use kbf_proto::reapi::Digest;
 
+    use kbf_types::LostWhy;
+
     use super::*;
     use crate::runtime::Runtime;
 
@@ -377,7 +379,9 @@ mod tests {
             .expect("the fence killed one lease at a time");
         let fenced: Vec<_> = results.iter().map(|r| r.lease_id).collect();
         assert_eq!(fenced, ids.map(|id| Some(proto_lease_id(id))));
-        assert!(results.iter().all(|r| code(r) == Code::Aborted as i32));
+        // Lost to the farm, not killed by a Cancel: the server runs it again.
+        assert!(results.iter().all(|r| code(r) == Code::Unavailable as i32));
+        assert!(results.iter().all(|r| r.lost() == worker::Lost::Fenced));
         assert!(leases.running().is_empty());
     }
 
@@ -477,7 +481,8 @@ mod tests {
     /// any other outcome marked as a memory kill. Every arm in one test, so each code
     /// is checked against the others. Also catches (issue #45) a timeout's partial
     /// stdout or stderr dropped, swapped or sent without the other, and a result sent
-    /// with a timeout that has no log to carry.
+    /// with a timeout that has no log to carry. Also (issue #22) a lost run reported
+    /// without `lost`, or with the other reason, and any other outcome marked lost.
     #[test]
     fn each_outcome_has_its_status() {
         let id = LeaseId::new(3, 4);
@@ -521,6 +526,14 @@ mod tests {
                 RuntimeError::BusyNode("actions/ ran short".to_owned()),
                 Code::Unavailable,
             ),
+            (
+                RuntimeError::Lost(LostWhy::DaemonRestarted, "restarted".to_owned()),
+                Code::Unavailable,
+            ),
+            (
+                RuntimeError::Lost(LostWhy::Fenced, "fenced".to_owned()),
+                Code::Unavailable,
+            ),
         ];
         for (error, code) in codes {
             let why = error.to_string();
@@ -530,10 +543,20 @@ mod tests {
                 RuntimeError::BusyNode(_) => MemoryKill::NodePressure,
                 _ => MemoryKill::Unspecified,
             };
+            let lost = match error {
+                RuntimeError::Lost(LostWhy::DaemonRestarted, _) => worker::Lost::DaemonRestarted,
+                RuntimeError::Lost(LostWhy::Fenced, _) => worker::Lost::Fenced,
+                _ => worker::Lost::Unspecified,
+            };
             let result = result_of(id, Err(error));
             assert_eq!(result.lease_id, Some(proto_lease_id(id)), "{why}");
             assert!(result.action_result.is_none(), "{why}");
             assert_eq!(result.memory_kill(), kill, "{why}");
+            assert_eq!(result.lost(), lost, "{why}");
+            assert_eq!(
+                result.status.as_ref().map(|s| s.message.as_str()),
+                Some(why.as_str())
+            );
             assert_eq!(result.status.map(|s| s.code), Some(code as i32), "{why}");
         }
 

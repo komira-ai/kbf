@@ -180,9 +180,8 @@ async fn a_busy_node_kill_reruns_with_the_same_booking_and_is_reported() {
         status.message,
         "kbf farm fault on busy-node: the node killed the action for memory while it was \
          under its own limit (node memory pressure), and its reruns are used up. Operator \
-         fix: find what else holds memory on the node. Runs: 3 (1 GiB on busy-node, node \
-         memory pressure, 1 GiB on busy-node, node memory pressure, 1 GiB on busy-node, \
-         node memory pressure)."
+         fix: find what else holds memory on the node. Runs: 3 (busy-node, node memory \
+         pressure; busy-node, node memory pressure; busy-node, node memory pressure)."
     );
     for kills in 1..=3 {
         let line = format!("kills={kills}");
@@ -266,6 +265,8 @@ async fn the_answer_names_the_runs_without_a_finished_retention() {
         "{status:?}"
     );
 
+    // A cell of its own: a rerun prefers another node, and `tiny-node` is one.
+    let cell = Cell::start_with(Duration::from_secs(300), Duration::ZERO).await;
     let mut daemon = cell.daemon("tiny-busy", 4, 1).await;
     let job = Job::new("squeezed", &[]);
     cell.upload(&job.blobs()).await;
@@ -282,7 +283,9 @@ async fn the_answer_names_the_runs_without_a_finished_retention() {
     );
     let status = response(&done(&mut ops).await).status.expect("a status");
     assert!(
-        status.message.contains("Runs: 3 (1 GiB on tiny-busy"),
+        status
+            .message
+            .contains("Runs: 3 (tiny-busy, node memory pressure;"),
         "{status:?}"
     );
     let last = lines_with(&["node=tiny-busy", "kills=3", "node memory pressure"]);
