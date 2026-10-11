@@ -52,6 +52,7 @@ mod memory;
 pub mod rollout;
 pub mod serve;
 mod stamp;
+mod timeout;
 pub mod token;
 pub mod worker;
 

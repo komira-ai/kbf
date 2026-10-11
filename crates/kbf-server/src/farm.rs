@@ -131,6 +131,8 @@ enum Detail {
     Ran(Box<Pending>),
     /// The daemon's reason the action is invalid, passed to the callers.
     Invalid(String),
+    /// A timed-out action's partial result ([`crate::timeout`]), answered, never cached.
+    TimedOut(Box<ActionResult>),
 }
 
 #[derive(Debug)]
@@ -481,8 +483,9 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
         })
     }
 
-    /// The scheduler's outcome for a `Result`, with the cache record of an OK one or
-    /// the reason for an INVALID_ARGUMENT one. An OK result whose outputs are not all
+    /// The scheduler's outcome for a `Result`, with the cache record of an OK one, the
+    /// reason for an INVALID_ARGUMENT one, or the partial result of a DEADLINE_EXCEEDED
+    /// one ([`crate::timeout`], stamped as an OK result is). An OK result whose outputs are not all
     /// stored is an infrastructure failure: accepting it would answer callers with files
     /// nobody can fetch. An OK result gets the node it `ran_on` and the server's times
     /// ([`Stamp::apply`]) before it is checked and its cache record made.
@@ -517,7 +520,18 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
                     }
                 }
             }
-            (Code::DeadlineExceeded, _) => (Outcome::Failed(Failure::Timeout), None),
+            (Code::DeadlineExceeded, reported) => {
+                let partial = match reported {
+                    Some(reported) => crate::timeout::partial(&self.cache, reported).await,
+                    None => None,
+                };
+                let detail = partial.map(|mut partial| {
+                    let (node, stamp) = ran_on;
+                    stamp.apply(&mut partial, node, SystemTime::now());
+                    Detail::TimedOut(Box::new(partial))
+                });
+                (Outcome::Failed(Failure::Timeout), detail)
+            }
             (Code::InvalidArgument, _) => {
                 let why = result.status.map(|s| s.message).unwrap_or_default();
                 (
@@ -912,8 +926,12 @@ impl State {
                     .map(|w| (w.key.action, record));
                 (Finished::Ran(Box::new(result)), write)
             }
+            (Some(Detail::TimedOut(partial)), Outcome::Failed(Failure::Timeout)) => {
+                let status = status(Code::DeadlineExceeded, TIMED_OUT);
+                (Finished::TimedOut { status, partial }, None)
+            }
             (_, Outcome::Failed(Failure::Timeout)) => {
-                (failed(Code::DeadlineExceeded, "the action timed out"), None)
+                (failed(Code::DeadlineExceeded, TIMED_OUT), None)
             }
             (Some(Detail::Invalid(why)), _) => (failed(Code::InvalidArgument, &why), None),
             (_, Outcome::Failed(kill @ (Failure::OutOfMemory | Failure::NodeMemoryPressure))) => {
@@ -941,12 +959,19 @@ fn unix_ms() -> u64 {
     u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
 }
 
+/// What the callers of a timed-out action are told.
+const TIMED_OUT: &str = "the action timed out";
+
 fn failed(code: Code, message: &str) -> Finished {
-    Finished::Failed(rpc::Status {
+    Finished::Failed(status(code, message))
+}
+
+fn status(code: Code, message: &str) -> rpc::Status {
+    rpc::Status {
         code: code as i32,
         message: message.to_owned(),
         details: Vec::new(),
-    })
+    }
 }
 
 /// [`START_VALIDITY`] in milliseconds, as `Start.valid_for_ms` carries it.

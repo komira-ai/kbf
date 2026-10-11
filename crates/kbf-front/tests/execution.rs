@@ -262,7 +262,8 @@ async fn execute_submits_and_streams_each_stage() {
     );
 }
 
-/// Catches: a failure answered without its status (or with a result), and a stream
+/// Catches: a failure answered without its status (or with a result), a timeout's
+/// partial stdout and stderr dropped or answered with OK (issue #45), and a stream
 /// that hangs, or ends without an error, when its operation is abandoned.
 #[tokio::test]
 async fn failures_and_abandoned_operations_end_the_stream() {
@@ -283,9 +284,32 @@ async fn failures_and_abandoned_operations_end_the_stream() {
     assert_eq!(answer.status, Some(status));
     assert_eq!(answer.result, None);
 
+    let mut timed_out = start(&farm, &job.action).await.expect("Execute");
+    next(&mut timed_out).await.expect("healthy");
+    let status = rpc::Status {
+        code: Code::DeadlineExceeded as i32,
+        message: "the action timed out".to_owned(),
+        details: Vec::new(),
+    };
+    let partial = ActionResult {
+        stdout_digest: Some(Blob::new("started").proto),
+        ..Default::default()
+    };
+    script.set(
+        1,
+        Stage::Done(Finished::TimedOut {
+            status: status.clone(),
+            partial: Box::new(partial.clone()),
+        }),
+    );
+    let answer = response(&next(&mut timed_out).await.expect("healthy").expect("done"));
+    assert_eq!(answer.status, Some(status));
+    assert_eq!(answer.result, Some(partial));
+    assert!(!answer.cached_result);
+
     let mut abandoned = start(&farm, &job.action).await.expect("Execute");
     next(&mut abandoned).await.expect("healthy");
-    script.abandon(1);
+    script.abandon(2);
     let gone = next(&mut abandoned)
         .await
         .expect_err("an abandoned operation");

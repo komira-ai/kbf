@@ -14,7 +14,7 @@ kbf-daemon               35     12
 kbf-driver-container      0      0
 kbf-driver-native         0      0
 kbf-estimator             -      -
-kbf-front                60      8
+kbf-front                55      8
 kbf-guest                15      6
 kbf-it                    2      3
 kbf-log                   2      0

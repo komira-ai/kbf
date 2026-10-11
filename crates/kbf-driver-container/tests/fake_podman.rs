@@ -259,19 +259,64 @@ async fn an_image_the_store_cannot_vouch_for_is_an_infrastructure_failure() {
     assert_eq!(result.exit_code, 0);
 }
 
-/// Catches a timeout that is not enforced, or that leaves the container behind.
+/// Catches a timeout that is not enforced, or that leaves the container behind; and
+/// (issue #45) a timeout that loses what the action wrote to stdout and stderr before
+/// it was stopped, or swaps the two.
 #[tokio::test]
 async fn a_timeout_stops_the_action_and_cleans_up() {
     let fake = Fake::new("timeout");
     let mut spec = Spec::new(&image(), "unused");
-    spec.timeout = Some(Duration::from_millis(300));
-    let outcome = fake.run(1, &spec, "sleep 30").await;
-    assert!(
-        matches!(outcome, Err(RuntimeError::TimedOut)),
-        "{outcome:?}"
-    );
+    // Room for the two echoes to land before the timeout on a loaded runner.
+    spec.timeout = Some(Duration::from_secs(1));
+    let outcome = fake
+        .run(1, &spec, "echo started; echo warming >&2; sleep 30")
+        .await;
+    let Err(RuntimeError::TimedOut { stdout, stderr }) = outcome else {
+        panic!("{outcome:?}");
+    };
+    assert_eq!(blob(&fake.cas, stdout.as_ref()), b"started\n");
+    assert_eq!(blob(&fake.cas, stderr.as_ref()), b"warming\n");
     assert!(fake.calls().contains(&"kill".to_owned()));
     fake.assert_clean(1);
+}
+
+/// Catches (issue #45) a timed-out action's partial logs read with no limit, and one
+/// log past the stdio limit failing the lease or taking the other log with it: the
+/// timeout is still the answer, the log within the limit is stored, the one past it is
+/// left out. Each stream in turn, so a limit applied to one only shows.
+#[tokio::test]
+async fn a_timed_out_log_past_its_limit_is_left_out() {
+    const MAX: u64 = 16;
+    let fake = Fake::with("timeout-stdio", |config| {
+        config.outputs.max_stdio_bytes = MAX;
+    });
+    let mut spec = Spec::new(&image(), "unused");
+    spec.timeout = Some(Duration::from_secs(1));
+    let past = MAX + 1;
+    let cases = [
+        (
+            1,
+            format!("head -c {past} /dev/zero; echo kept >&2; sleep 30"),
+        ),
+        (
+            2,
+            format!("echo kept; head -c {past} /dev/zero >&2; sleep 30"),
+        ),
+    ];
+    for (seq, script) in cases {
+        let outcome = fake.run(seq, &spec, &script).await;
+        let Err(RuntimeError::TimedOut { stdout, stderr }) = outcome else {
+            panic!("{script}: {outcome:?}");
+        };
+        let (kept, left_out) = if seq == 1 {
+            (stderr, stdout)
+        } else {
+            (stdout, stderr)
+        };
+        assert_eq!(left_out, None, "{script}");
+        assert_eq!(blob(&fake.cas, kept.as_ref()), b"kept\n", "{script}");
+        fake.assert_clean(seq);
+    }
 }
 
 /// Catches `kill` returning before the work has stopped and the lease is clean, and a
@@ -311,7 +356,7 @@ async fn sigterm_ignored_falls_back_to_cgroup_kill() {
     let script = "trap '' TERM; while :; do sleep 0.05; done";
     let outcome = fake.run(1, &spec, script).await;
     assert!(
-        matches!(outcome, Err(RuntimeError::TimedOut)),
+        matches!(outcome, Err(RuntimeError::TimedOut { .. })),
         "{outcome:?}"
     );
     // The overlay's owners are `tests/userns.rs`'s to check.
@@ -513,7 +558,7 @@ async fn the_kill_path_ends_even_when_every_signal_fails() {
     // With its lease cgroup gone, cgroup.kill cannot be written either.
     let outcome = fake.run(1, &spec, r#"find "$CG" -delete; sleep 30"#).await;
     assert!(
-        matches!(outcome, Err(RuntimeError::TimedOut)),
+        matches!(outcome, Err(RuntimeError::TimedOut { .. })),
         "{outcome:?}"
     );
     fake.assert_clean(1);

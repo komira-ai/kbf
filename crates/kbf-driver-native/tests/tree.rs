@@ -90,7 +90,7 @@ async fn a_timeout_ends_the_whole_tree() {
     let pidfile = in_lease(&config, 1);
     let (outcome, pid) = tokio::join!(run(&rt, &cas, 1, &spec), pid_in(&pidfile));
     assert!(
-        matches!(outcome, Err(RuntimeError::TimedOut)),
+        matches!(outcome, Err(RuntimeError::TimedOut { .. })),
         "{outcome:?}"
     );
     assert!(!alive(pid), "the grandchild {pid} outlived the timeout");
