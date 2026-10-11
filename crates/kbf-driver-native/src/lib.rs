@@ -102,7 +102,7 @@
 
 mod cas;
 mod config;
-mod home;
+pub mod home;
 pub mod network;
 pub mod procs;
 mod program;

@@ -19,7 +19,7 @@ export FAKE_REAL_PATH
 TESTS=0
 FAILED=0
 NAME=
-FAKES="uname sw_vers xcodebuild launchctl stat csrutil pgrep id sudo automationmodetool sysadminctl sandbox-exec xcrun sqlite3"
+FAKES="uname sw_vers xcodebuild launchctl stat csrutil pgrep id sudo automationmodetool sysadminctl sandbox-exec xcrun sqlite3 log"
 
 # ---------------------------------------------------------------- harness
 
@@ -313,6 +313,115 @@ t_tcc_control_empty() {
     verdict_is BROKEN
 }
 
+# ---------------------------------------------------------------- xcuitest_sandbox
+
+# xs: runs the xcuitest_sandbox probe against the fake Mac, with the fake generator
+# and the fake run.sh; the runs get FAKE_STATE and FAKE_REAL_PATH besides the lease's
+# variables, so the fakes inside them work.
+xs() {
+    env -u GITHUB_STEP_SUMMARY PATH="$T/bin:$FAKE_REAL_PATH" FAKE_STATE="$T/state" \
+        SPIKE_RESULTS="$T/results" SPIKE_PASS_ENV="FAKE_STATE FAKE_REAL_PATH" \
+        SPIKE_LOG_SETTLE=0 SPIKE_LOG_WAIT=2 \
+        bash "$DIR/xcuitest_sandbox.sh" "$HERE/fake_generator.sh" "$HERE/fake_run.sh" >"$OUT" 2>&1
+}
+
+# Everything works: PASS. Catches a profile that is not the generator's (a copy: the
+# bytes sandbox-exec got are compared with the lease's profile.sb), a run that falls
+# back to no sandbox (the (deny default) run would pass), the runner's environment in
+# place of the lease's (HOME), deny lines counted from processes outside the run's
+# tree (pid 1's), and a tree without the run's children (the child's lsopen).
+t_xs_pass() {
+    local L=$T/results/leases
+    xs
+    want 'xcuitest_sandbox.deny_default.rc=71'
+    want 'xcuitest_sandbox.deny_default.deny.tree=1'
+    want 'xcuitest_sandbox.deny_default.deny=sandbox-exec process-exec* bash'
+    want 'xcuitest_sandbox.driver.macos.result=PASS'
+    want 'xcuitest_sandbox.driver.macos.tests_passed=3'
+    want 'xcuitest_sandbox.driver.macos.deny.tree=3'
+    want 'xcuitest_sandbox.driver.macos.deny.ops=file-write-create:2 lsopen:1'
+    want 'xcuitest_sandbox.driver.macos.deny.distinct=2'
+    want 'xcuitest_sandbox.driver.macos.deny=lsregister lsopen'
+    want 'xcuitest_sandbox.driver.macos.deny=xcodebuild file-write-create /Library/Caches/com.apple.dt.xcodebuild'
+    want 'xcuitest_sandbox.driver.ios.deny.tree=3'
+    lacks 'xcuitest_sandbox.driver.macos.deny.other=0'
+    want 'xcuitest_sandbox.control.ios.result=PASS'
+    want 'xcuitest_sandbox.control.ios.tests_passed=3'
+    want 'xcuitest_sandbox.control.ios.test.testTapChangesLabel()=Passed'
+    want 'xcuitest_sandbox.driver.macos.user_folders=/var/folders/zz/fake/T'
+    cmp -s "$T/state/driver_profile.0" "$L/driver.macos/sandbox/profile.sb" ||
+        failt "sandbox-exec did not get driver.macos's generated profile"
+    cmp -s "$T/state/driver_profile.1" "$L/driver.ios/sandbox/profile.sb" ||
+        failt "sandbox-exec did not get driver.ios's generated profile"
+    grep -qxF "KBF_LEASE=$(cd "$L/driver.macos" && pwd -P)" "$T/state/sandbox_params" ||
+        failt "sandbox-exec did not get driver.macos's lease parameter"
+    [ "$(cat "$T/state/home.macos.driver")" = "$L/driver.macos/home" ] ||
+        failt "driver.macos ran with HOME=$(cat "$T/state/home.macos.driver")"
+    [ "$(cat "$T/state/home.ios.none")" = "$L/control.ios/home" ] ||
+        failt "control.ios ran with HOME=$(cat "$T/state/home.ios.none")"
+    verdict_is PASS
+}
+
+# A fixture that fails under the driver's profile is a FAIL (a result), naming it.
+t_xs_driver_fails() {
+    : >"$T/state/driver_fails_ios"
+    xs
+    want 'xcuitest_sandbox.driver.ios.result=FAIL'
+    want 'xcuitest_sandbox.driver.ios.tests_passed=2'
+    want 'xcuitest_sandbox.driver.ios.error=error: -[FixtureUITests testTapChangesLabel] failed'
+    want 'under the driver'"'"'s profile: driver.ios=FAIL (3 deny lines)'
+    lacks 'driver.macos=FAIL'
+    verdict_is FAIL
+}
+
+# An unsandboxed control that fails makes the probe BROKEN.
+t_xs_control_fails() {
+    : >"$T/state/control_fails"
+    xs
+    want 'xcuitest_sandbox.control.macos.result=FAIL'
+    verdict_is BROKEN
+}
+
+# A run under (deny default) that passes makes the probe BROKEN, even though the
+# sandbox reported a deny for it.
+t_xs_deny_default_passes() {
+    : >"$T/state/deny_default_ignored"
+    xs
+    want 'xcuitest_sandbox.deny_default.rc=0'
+    want 'xcuitest_sandbox.deny_default.deny.tree=1'
+    want 'the run under (deny default) did not fail'
+    verdict_is BROKEN
+}
+
+# A (deny default) run that fails but shows no deny line makes the probe BROKEN: the
+# failure may not be the sandbox's, or the log reader sees nothing.
+t_xs_deny_default_unreported() {
+    : >"$T/state/deny_default_unreported"
+    xs
+    want 'xcuitest_sandbox.deny_default.rc=71'
+    want 'xcuitest_sandbox.deny_default.deny.tree=0'
+    want 'no deny line from the run under (deny default)'
+    verdict_is BROKEN
+}
+
+# A generator digest that is not the profile's makes the probe BROKEN.
+t_xs_digest_mismatch() {
+    : >"$T/state/gen_wrong_digest"
+    xs
+    want 'xcuitest_sandbox.driver.macos.sha256=0000000000000000000000000000000000000000000000000000000000000000'
+    want 'not the one the driver'"'"'s generator printed'
+    verdict_is BROKEN
+}
+
+# A generator that fails for one lease: no digest and no run, BROKEN, not a FAIL.
+t_xs_generator_fails() {
+    echo driver.ios >"$T/state/gen_fails"
+    xs
+    want 'xcuitest_sandbox.driver.ios.generate=Error: Os { code: 13, kind: PermissionDenied } [rc=1]'
+    want 'xcuitest_sandbox.driver.ios.status=ERROR(1)'
+    verdict_is BROKEN
+}
+
 # ---------------------------------------------------------------- verdicts
 
 # verdicts.sh is red for a BROKEN or a missing verdict and green for PASS and FAIL.
@@ -340,7 +449,9 @@ t_verdicts() {
 for test in t_lib t_watchdog t_am_already t_am_required_first t_am_control_noop t_am_hang \
     t_am_unknown t_am_user_drops t_am_adduser_hang t_simctl_pass t_simctl_deny_ignored t_simctl_bad_png \
     t_simctl_allow_fails t_simctl_bootstatus_fails t_simctl_delete_fails t_simctl_create_garbage \
-    t_tcc_pass t_tcc_control_empty t_verdicts; do
+    t_tcc_pass t_tcc_control_empty t_xs_pass t_xs_driver_fails t_xs_control_fails \
+    t_xs_deny_default_passes t_xs_deny_default_unreported t_xs_digest_mismatch t_xs_generator_fails \
+    t_verdicts; do
     t "$test"
 done
 printf '%s tests, %s failed assertions\n' "$TESTS" "$FAILED"

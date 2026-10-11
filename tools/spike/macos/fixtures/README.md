@@ -65,7 +65,9 @@ each a non-empty file. A test that passes without `keepAlways` has its screensho
 deleted from the bundle, so that run fails.
 
 The workflow `.github/workflows/spike-xcuitest.yml` runs all of this on a hosted macOS
-runner and uploads the bundles. A hosted runner's privacy grants may be seeded, so
+runner and uploads the bundles. Its `xcuitest-sandbox` job runs `run.sh` again as a
+native driver action, under the driver's sandbox profile
+(`../xcuitest_sandbox.sh`, `docs/spikes/macos-p0.md`). A hosted runner's privacy grants may be seeded, so
 its result proves the instrument, not what a fresh Mac allows.
 
 ## Changing the projects

@@ -126,6 +126,47 @@ a hosted runner a shell-launched UI test inherits Screen Recording and Accessibi
 grants that a fresh farm user will not have. A hosted UI-test result says nothing
 about prompts.
 
+## XCUITest under the native driver's sandbox
+
+The probe `tools/spike/macos/xcuitest_sandbox.sh` runs the XCUITest fixtures
+(`tools/spike/macos/fixtures`, three UI tests each for a macOS app and an iOS app on a
+simulator) as the native driver runs an action that asks for the network. The job is
+`xcuitest-sandbox` in `.github/workflows/spike-xcuitest.yml` (`macos-15`). The profile
+is not a copy: the driver's example `action_sandbox`
+(`crates/kbf-driver-native/examples/action_sandbox.rs`) writes the profile
+`Isolation::wrap` builds, `BASE_PROFILE` followed by the rules for the runner user's
+temporary folder, and prints its SHA-256. Each run gets a lease directory of its own
+and runs in its `root`, with stdin from `/dev/null` and only the lease's variables
+(`HOME`, `TMPDIR`, `XDG_CACHE_HOME`, `CLANG_MODULE_CACHE_PATH`) and
+`PATH=/usr/bin:/bin:/usr/sbin:/sbin`, as the driver runs an action whose Command sets
+only `PATH`.
+
+| Arm | What runs | Must |
+|---|---|---|
+| `deny_default` | `run.sh macos` under `(version 1)(deny default)`, through the same code that applies the driver's profile | fail, with at least one deny line from its processes, or the verdict is BROKEN (no profile applied, or a log reader that sees nothing) |
+| `driver.macos`, `driver.ios` | `run.sh` under the driver's profile | hand `sandbox-exec` a profile whose SHA-256 is the one `action_sandbox` printed, or BROKEN; PASS or FAIL is the result |
+| `control.macos`, `control.ios` | `run.sh` the same way, no sandbox | pass (three tests passed, three screenshots kept), or BROKEN |
+
+Deny lines: while a run lasts the probe samples the process table every 0.2 s; the
+run's processes are its root and every process seen with a parent among them (one that
+starts and ends between two samples is missed). After the run, `log show` reads the
+sandbox's reports (sender `Sandbox`) for the run's time window. Those from the run's
+processes are recorded: a count, a count per operation, and each distinct
+(process, operation, target), the first 40 as `SPIKE` lines and all of them in
+`<arm>-denies.txt` (uploaded). Reports from other processes in the window are only
+counted. `BASE_PROFILE` allows every mach and XPC lookup, so no mach-lookup can be
+denied and the run names none; which names a UI test looks up is not measured here.
+
+The verdict is BROKEN when a control does not hold, FAIL when a fixture fails under
+the driver's profile, and PASS when both pass there. The selftest (`test/run.sh`, the
+`t_xs_*` tests, against a fake generator, a fake `run.sh` and fakes of `sandbox-exec`
+and `log`) and `test/mutants.sh` cover the verdict: among the mutants are a verdict
+that ignores the unsandboxed controls, a run that falls back to no sandbox, driver
+runs handed a copy of `BASE_PROFILE` instead of the generated profile, a digest check
+that accepts a mismatch or no digest, a verdict that ignores a `(deny default)` run
+that passed or showed no deny line, deny lines counted from every process, a process
+tree without the run's children, and runs without the lease's variables.
+
 ## Not covered here (planned)
 
 - **`xcodebuild test` of a UI test target.** The repository has no UI-test fixture
