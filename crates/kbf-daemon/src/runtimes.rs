@@ -171,7 +171,7 @@ mod tests {
         assert_eq!(driver(LeaseKind::Action), Some("a"));
         assert_eq!(driver(LeaseKind::WholeMachine), Some("b"));
         assert_eq!(driver(LeaseKind::Vm), Some("a"));
-        assert_eq!(set.serving("gpu").map(|r| r.driver()), None);
+        assert!(set.serving("gpu").is_none(), "a kind no runtime serves");
         assert_eq!(set.drivers(), ["a", "b"]);
         assert_eq!(format!("{set:?}"), r#"Runtimes(["a", "b"])"#);
     }

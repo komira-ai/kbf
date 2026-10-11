@@ -945,8 +945,7 @@ mod tests {
              have one driver on a node"
         );
         let fakes = cli(&["fake", "fake"]);
-        let (daemon, reports) =
-            node(&fakes, || Err("not native".into()), Path::new("none")).expect("one fake runtime");
+        let (daemon, reports) = node(&fakes, native, Path::new("none")).expect("one fake runtime");
         assert!(reports.is_none());
         drop(daemon);
         kbf_outputs::remove_tree(&dir).expect("clean");
