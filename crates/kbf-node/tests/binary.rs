@@ -992,8 +992,9 @@ fn a_container_node_refuses_to_start_on_an_image_it_cannot_run() {
 /// Catches the images a container node is pinned to (`--image`) missing from the
 /// `NodeStatus` it sends after the Welcome (`GET /v1/nodes` would not show what the
 /// node can run), listed unsorted or more than once, and a node whose images are all
-/// in its store, as manifests, refusing to start. Given out of order, one of them
-/// twice.
+/// in its store, as manifests, refusing to start. Three images given out of order, the
+/// first one twice, with distinct images at both ends: a node that drops the first or
+/// the last `--image` from its status fails the set.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_container_node_lists_its_pinned_images_in_its_status() {
@@ -1002,11 +1003,18 @@ fn a_container_node_lists_its_pinned_images_in_its_status() {
     let ids = id_files("image-listed-ids", "65536");
     let (bin, _) = podman_stub("image-listed-bin");
     let other = br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","layers":[]}"#;
+    let third = br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{},"layers":[]}"#;
     store_manifest(&bin, MANIFEST);
     store_manifest(&bin, other);
-    let mut images = [image_of(MANIFEST), image_of(other)];
+    store_manifest(&bin, third);
+    let mut images = [image_of(MANIFEST), image_of(other), image_of(third)];
     images.sort();
-    let given = [images[1].clone(), images[0].clone(), images[1].clone()];
+    let given = [
+        images[2].clone(),
+        images[0].clone(),
+        images[0].clone(),
+        images[1].clone(),
+    ];
     let path = format!(
         "{}:{}",
         bin.display(),
