@@ -98,14 +98,8 @@ fn plan_with<E: Exec>(
     let mut changed = false;
     if a.bin_dir.is_some() {
         for (bin, bytes) in BINARIES.into_iter().zip(new) {
-            changed |= binary(
-                exec,
-                &mut planner,
-                &under(&c.bin_dir, bin)?,
-                bytes,
-                root,
-                out,
-            )?;
+            let dst = under(&c.bin_dir, bin)?;
+            changed |= binary(exec, &mut planner, &dst, bytes, root, out)?;
         }
     }
     let dir = HostPath::new(UNITS)?;

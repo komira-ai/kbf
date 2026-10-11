@@ -685,9 +685,8 @@ fn an_in_memory_server_gets_no_raft_directory() {
 
 /// The scratch host as a [`FakeExec`] with the same entries and tools, so a test can
 /// give a file an owner the test's own user cannot give it (`chown` needs root).
-fn fake_of(mut exec: ScratchHost) -> FakeExec {
+fn fake_of(exec: ScratchHost) -> FakeExec {
     let mut fake = FakeExec::new(0);
-    fake.answer = std::mem::replace(&mut exec.answer, Box::new(|_| Ok(reply(0, "", ""))));
     let mut dirs = vec![exec.root.clone()];
     while let Some(dir) = dirs.pop() {
         for item in fs::read_dir(&dir).expect("list") {
@@ -701,6 +700,8 @@ fn fake_of(mut exec: ScratchHost) -> FakeExec {
             fake.entries.insert(path, entry);
         }
     }
+    // The scratch host's tools; the host, and with it its root, goes with the fake.
+    fake.answer = Box::new(move |cmd| (exec.answer)(cmd));
     fake
 }
 
@@ -726,7 +727,6 @@ const ROOT_FILES: [&str; 6] = [
 fn a_right_file_that_root_does_not_own_is_replaced() {
     let (mut exec, world) = host("install-owner");
     go(&mut exec, &install(), Mode::Apply);
-    let mut fake = fake_of(exec);
     let owners = [
         (1000, 1000),
         (0, 1000),
@@ -737,18 +737,19 @@ fn a_right_file_that_root_does_not_own_is_replaced() {
     ];
     let mut was = Vec::new();
     for (path, (uid, gid)) in ROOT_FILES.into_iter().zip(owners) {
-        let path = HostPath::new(path).expect("path");
-        let Some(Entry::File { perms, bytes, .. }) = fake.entries.get(&path).cloned() else {
-            panic!("{path} not installed");
-        };
+        let perms = Perms::new(mode_of(&exec, path));
+        let bytes = fs::read(exec.at(path)).expect(path);
         let owner = Owner { uid, gid };
+        was.push((HostPath::new(path).expect("path"), perms, bytes, owner));
+    }
+    let mut fake = fake_of(exec);
+    for (path, perms, bytes, owner) in &was {
         let entry = Entry::File {
-            perms,
-            owner,
+            perms: *perms,
+            owner: *owner,
             bytes: bytes.clone(),
         };
         fake.entries.insert(path.clone(), entry);
-        was.push((path, perms, bytes));
     }
     world.borrow_mut().active.clear();
 
@@ -764,7 +765,7 @@ fn a_right_file_that_root_does_not_own_is_replaced() {
         .collect();
     let want: Vec<&HostPath> = was.iter().map(|(path, ..)| path).collect();
     assert_eq!(written, want);
-    for (path, perms, bytes) in was {
+    for (path, perms, bytes, _) in was {
         let root = Entry::File {
             perms,
             owner: Owner { uid: 0, gid: 0 },
