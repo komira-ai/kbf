@@ -57,6 +57,19 @@ pub const HANDOVER_GRACE: Duration = SELF_FENCE.saturating_add(LEADER_LEASE_MARG
 
 const _: () = assert!(HANDOVER_GRACE.as_millis() < LEASE_GRACE.as_millis());
 
+/// How long the scheduler keeps a whole-machine lease while its worker switches the
+/// Mac's GUI session (it reported [`crate::NodePhase::Preparing`] or
+/// [`crate::NodePhase::Restoring`] for it), counted from the first report of that
+/// phase. A switch is a userspace restart, which ends the daemon with everything else,
+/// so the worker is silent for minutes; nothing of the lease runs meanwhile (the action
+/// has not started, or has ended with its result kept on disk), so keeping the lease
+/// past G cannot run it twice. Past this bound a silent worker's lease goes back to the
+/// queue. The daemon gives up waiting for the session sooner
+/// (`kbf_driver_native`'s `SESSION_WAIT`), so it does not start the action after this.
+pub const SESSION_SWITCH_GRACE: Duration = Duration::from_secs(600);
+
+const _: () = assert!(SESSION_SWITCH_GRACE.as_millis() > LEASE_GRACE.as_millis());
+
 /// W: how late a worker may act on a `Start`, counted from when it sent the newest
 /// heartbeat the scheduler had heard when the `Start` went out. The `Start` left after
 /// that heartbeat arrived, so a `Start` acted on inside W was in flight for less than W,

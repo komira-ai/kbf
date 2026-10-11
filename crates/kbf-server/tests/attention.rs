@@ -9,7 +9,10 @@ use std::sync::{Arc, Mutex};
 use kbf_caps::NodeCaps;
 use kbf_front::Cache;
 use kbf_proto::worker::{NodeStatus, ServerMessage, XcodeState, XcodeStatus};
+use kbf_sched::NodePhase;
 use kbf_server::Farm;
+use kbf_server::farm::Reported;
+use kbf_server::fleet::PhaseView;
 use kbf_types::{Resources, WorkerId};
 use tokio::sync::mpsc;
 
@@ -68,6 +71,10 @@ fn not_ready(reason: &str) -> String {
 /// target, without the node, the problem or the fix; a status that repeats it logged
 /// again, or one whose only difference is the reason's time and pid (each survey's);
 /// the newest reason not the one `GET /v1/nodes` shows; and its resolution not logged.
+/// The same for a quarantine its daemon reports in `Hello` (a failed cleanup after a
+/// whole-machine lease): raised once with its reason, listed in `needs_attention` and
+/// as the node's phase, not raised again by a `Hello` that repeats it, raised again
+/// for a new reason, and cleared once.
 #[tokio::test]
 async fn an_attention_item_is_a_warning_that_names_the_node_and_the_fix() {
     let log = Log::default();
@@ -91,10 +98,12 @@ async fn an_attention_item_is_a_warning_that_names_the_node_and_the_fix() {
     let stream = farm.register(
         &node,
         kbf_sched::DaemonInstance::new("mac-1"),
-        Resources::new(8_000, 16 << 30),
-        NodeCaps::from_report([("arch", "arm64")])
-            .expect("caps")
-            .with_drivers(["container"]),
+        Reported::serving(
+            Resources::new(8_000, 16 << 30),
+            NodeCaps::from_report([("arch", "arm64")])
+                .expect("caps")
+                .with_drivers(["container"]),
+        ),
         outbound,
         ServerMessage::default(),
     );
@@ -127,5 +136,66 @@ async fn an_attention_item_is_a_warning_that_names_the_node_and_the_fix() {
             "INFO kbf_server::attention: node mac-1: resolved: {}",
             not_ready(AGAIN)
         )]
+    );
+
+    let caps = || {
+        NodeCaps::from_report([("arch", "arm64")])
+            .expect("caps")
+            .with_drivers(["native-whole-machine"])
+    };
+    let reported = |phase: NodePhase| Reported {
+        capacity: Resources::new(8_000, 16 << 30),
+        caps: caps(),
+        phase,
+    };
+    let quarantined = |why: &str| NodePhase::Quarantined(why.to_owned());
+    farm.resize(&node, stream, reported(quarantined("user-delete failed")));
+    assert_eq!(
+        attention(log.take()),
+        ["WARN kbf_server::attention: node mac-1: quarantined: user-delete failed"]
+    );
+    farm.resize(&node, stream, reported(quarantined("user-delete failed")));
+    assert_eq!(attention(log.take()), Vec::<String>::new());
+    let view = farm.node_view(&node).expect("registered");
+    assert_eq!(view.needs_attention, ["quarantined: user-delete failed"]);
+    assert_eq!(
+        view.phase,
+        PhaseView::Quarantined {
+            reason: "user-delete failed".to_owned()
+        }
+    );
+    farm.resize(&node, stream, reported(quarantined("session-idle failed")));
+    assert_eq!(
+        attention(log.take()),
+        ["WARN kbf_server::attention: node mac-1: quarantined: session-idle failed"]
+    );
+    farm.resize(&node, stream, reported(NodePhase::Serving));
+    assert_eq!(
+        attention(log.take()),
+        ["INFO kbf_server::attention: node mac-1: no longer quarantined"]
+    );
+    let lease = kbf_types::LeaseId::new(7, 3);
+    for (phase, view) in [
+        (
+            NodePhase::Preparing(lease),
+            PhaseView::Preparing {
+                lease: "7.3".to_owned(),
+            },
+        ),
+        (
+            NodePhase::Restoring(lease),
+            PhaseView::Restoring {
+                lease: "7.3".to_owned(),
+            },
+        ),
+    ] {
+        farm.resize(&node, stream, reported(phase));
+        assert_eq!(farm.node_view(&node).expect("registered").phase, view);
+    }
+    farm.resize(&node, stream, reported(NodePhase::Serving));
+    assert_eq!(attention(log.take()), Vec::<String>::new());
+    assert_eq!(
+        farm.node_view(&node).expect("registered").phase,
+        PhaseView::Serving
     );
 }

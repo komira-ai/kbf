@@ -162,6 +162,16 @@ impl Host for MacHost {
         })
     }
 
+    fn domain_exists(&self, domain: &str) -> io::Result<bool> {
+        let status = Command::new("/bin/launchctl")
+            .args(["print", domain])
+            .env_clear()
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()?;
+        Ok(status.success())
+    }
+
     fn bootout(&self, domain: &str) -> io::Result<()> {
         let output = Command::new("/bin/launchctl")
             .args(["bootout", domain])

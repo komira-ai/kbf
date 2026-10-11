@@ -29,6 +29,7 @@ kbf-objstore.workspace = true
 kbf-server.workspace = true
 rcgen.workspace = true
 tokio = { workspace = true, features = ["net"] }
+tracing-subscriber.workspace = true
 
 [lints]
 workspace = true

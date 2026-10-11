@@ -563,6 +563,55 @@ impl<R: Runtime> Harness<R> {
         clock: Option<Arc<dyn Clock>>,
         driver: Option<tokio::sync::watch::Receiver<DriverReport>>,
     ) -> Self {
+        Self::build_with(
+            name,
+            runtimes,
+            runtime,
+            fence_after,
+            configure,
+            clock,
+            driver,
+            None,
+        )
+        .await
+    }
+
+    /// Starts a server and a daemon running leases through `runtime`, whose `Hello`
+    /// carries the phase `phase` holds ([`Daemon::with_phase`]).
+    pub async fn with_phase(
+        name: &str,
+        runtime: Arc<R>,
+        phase: tokio::sync::watch::Receiver<kbf_types::NodePhase>,
+    ) -> Self {
+        let runtimes = Runtimes::new(Arc::clone(&runtime));
+        let fence = Duration::from_secs(40);
+        let configure = |config: &mut DaemonConfig| {
+            config.recheck_every = Duration::from_millis(20);
+        };
+        Self::build_with(
+            name,
+            runtimes,
+            runtime,
+            fence,
+            configure,
+            None,
+            None,
+            Some(phase),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn build_with(
+        name: &str,
+        runtimes: Runtimes,
+        runtime: Arc<R>,
+        fence_after: Duration,
+        configure: impl FnOnce(&mut DaemonConfig),
+        clock: Option<Arc<dyn Clock>>,
+        driver: Option<tokio::sync::watch::Receiver<DriverReport>>,
+        phase: Option<tokio::sync::watch::Receiver<kbf_types::NodePhase>>,
+    ) -> Self {
         let pki = pki(name);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -609,6 +658,9 @@ impl<R: Runtime> Harness<R> {
         }
         if let Some(driver) = driver {
             daemon = daemon.with_driver_report(driver);
+        }
+        if let Some(phase) = phase {
+            daemon = daemon.with_phase(phase);
         }
         let daemon = tokio::spawn(daemon.run(std::future::pending()));
         Self {

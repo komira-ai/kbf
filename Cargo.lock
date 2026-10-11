@@ -1183,6 +1183,7 @@ dependencies = [
  "tokio",
  "tonic",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -1227,6 +1228,7 @@ dependencies = [
  "futures",
  "hex",
  "kbf-daemon",
+ "kbf-mac-session",
  "kbf-outputs",
  "kbf-proto",
  "kbf-types",

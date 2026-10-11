@@ -1,5 +1,7 @@
 //! The node's software status: what the daemon reads, and when it sends `NodeStatus`.
 
+#[path = "status/phase.rs"]
+mod phase;
 mod support;
 
 use std::time::Duration;

@@ -490,6 +490,8 @@ fn the_client_reports_unexpected_replies_and_hangups() {
         None,
         Some(Reply::Started { pid: 7 }),
         Some(Reply::Killed),
+        Some(Reply::SessionReady { ready: true }),
+        Some(Reply::Killed),
     ];
     std::thread::spawn(move || {
         // First a helper that answers the connection with something other than Hello.
@@ -534,6 +536,8 @@ fn the_client_reports_unexpected_replies_and_hangups() {
     }
     let running = client.run("1.1", &[], &[], fds).unwrap();
     assert!(unexpected(running.wait().map(drop)).contains("Killed"));
+    assert!(client.session_ready("1.1").unwrap());
+    assert!(unexpected(client.session_ready("1.1").map(drop)).contains("Killed"));
     let refused = ClientError::Refused("why".to_owned());
     assert_eq!(refused.to_string(), "kbf-mac-session refused: why");
     let gone = Client::new(dir.join("no-socket"));

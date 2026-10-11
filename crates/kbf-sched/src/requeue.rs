@@ -39,6 +39,9 @@ pub enum RequeueReason {
     /// Its `Start` has been out for the start grace and the worker does not list the
     /// lease as running.
     NotStarted,
+    /// Its worker switched the GUI session for it and was silent past the session
+    /// switch grace.
+    SessionSwitch,
     /// The action passed its own memory limit with `booked` bytes booked, and runs
     /// again with `raised` bytes booked.
     OutOfMemory {
@@ -59,6 +62,10 @@ impl fmt::Display for RequeueReason {
             Self::Replaced => {
                 "another daemon process registered as the node and does not run it \
                  (handover grace over)"
+            }
+            Self::SessionSwitch => {
+                "the node was silent past the session switch grace while it switched the \
+                 GUI session for the lease"
             }
             Self::Reconnected => "the daemon reconnected and does not list it as running",
             Self::NotStarted => "the node has not listed it as running within the start grace",
@@ -116,6 +123,7 @@ mod tests {
                 raised: 2 << 30,
             },
             RequeueReason::NodeMemoryPressure,
+            RequeueReason::SessionSwitch,
         ];
         let text: Vec<String> = all.iter().map(ToString::to_string).collect();
         for (i, a) in text.iter().enumerate() {
@@ -131,6 +139,7 @@ mod tests {
         assert!(text[4].contains("with 1 GiB booked"), "{}", text[4]);
         assert!(text[4].contains("with 2 GiB booked"), "{}", text[4]);
         assert!(text[5].contains("same booking"), "{}", text[5]);
+        assert!(text[6].contains("session switch grace"), "{}", text[6]);
     }
 
     /// Catches: a size shown in bytes, or rounded to a whole GiB it is not (an operator
