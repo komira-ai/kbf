@@ -1382,6 +1382,7 @@ dependencies = [
  "kbf-driver-container",
  "kbf-driver-native",
  "kbf-front",
+ "kbf-it",
  "kbf-outputs",
  "kbf-proto",
  "kbf-server",

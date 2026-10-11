@@ -240,7 +240,9 @@ because there a runaway build cannot press on the farm's state. What changes:
   host's RAM minus 4 to 8 GiB ([linux-build-host.md](../deploy/linux-build-host.md#headroom---actions-memory-max-gib)).
   On a converged host it must also leave room for the object store's node and
   `kbf-server`: RAM minus what those two use at their peak, minus the same headroom
-  for the OS and the daemon. The cap is set per host. The node reports the lower of
+  for the OS and the daemon. The cap is set per host;
+  [storage-node.md](../deploy/storage-node.md#memory-on-a-converged-host) works it out
+  for a 256 GiB host and has the units. The node reports the lower of
   this cap and its memory, so the scheduler books only what builds may use.
 - **The Raft log on its own partition.** The log's disk is not shared with build
   scratch, swap or the object store's data, so builds that fill a disk cannot stop
