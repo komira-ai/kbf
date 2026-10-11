@@ -108,7 +108,7 @@ fn the_scratch_host_changes_files_under_its_root_and_plays_its_commands() {
 
     let tool = Cmd::new(p("/usr/bin/tool"));
     assert_eq!(exec.query(&tool).expect("query").stdout, b"out");
-    assert_eq!(*exec.queries.borrow(), [tool.clone()]);
+    assert_eq!(*exec.queries.borrow(), std::slice::from_ref(&tool));
     exec.apply(&Step::Run(tool.clone())).expect("run");
     exec.apply(&capture("/etc/key", &[])).expect("capture");
     let err = exec
