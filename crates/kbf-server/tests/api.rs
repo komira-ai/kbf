@@ -451,6 +451,35 @@ async fn two_nodes_whose_streams_ended_before_one_read_are_both_disconnected() {
     );
 }
 
+/// Catches a farm that notes closed streams for the whole farm rather than per node
+/// (`note_closed_streams` disconnecting every node once any stream has ended): with
+/// two registered nodes and only one stream ended, one `nodes()` read must list that
+/// node as not connected and the other as still connected. A rollout counts a node as
+/// ready only while it is connected, so one node dropping must not stall the others.
+#[tokio::test]
+async fn one_of_two_streams_ended_lists_only_that_node_as_disconnected() {
+    let farm = Farm::new(
+        cache(),
+        kbf_sched::UNSERVABLE_WAIT,
+        kbf_sched::FINISHED_RETENTION,
+    );
+    let (_, first) = register(&farm, "linux-1");
+    let (_, second) = register(&farm, "linux-2");
+    drop(first);
+    let mut nodes: Vec<(String, bool)> = farm
+        .nodes()
+        .nodes
+        .into_iter()
+        .map(|n| (n.node_id, n.connected))
+        .collect();
+    nodes.sort();
+    assert_eq!(
+        nodes,
+        [("linux-1".to_owned(), false), ("linux-2".to_owned(), true)]
+    );
+    drop(second);
+}
+
 /// Catches an operator action that answers with `connected` read before the farm has
 /// noted the closed stream (`place` skipping `note_closed_streams`): the cordon's
 /// response would report a node whose stream is gone as connected. No read of the
