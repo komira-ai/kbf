@@ -330,25 +330,53 @@ sudo -n rm -f "$intent"
 
 step "a process started in a GUI session runs in it: the runner's own (no session switch)"
 # No lease user has a GUI session here (that takes a session switch, which restarts
-# userspace), so spawn::spawn runs for the runner's own uid, under sudo as the helper
-# runs: the control, a background run, must not be in a GUI session, and the GUI run
-# must. (Under `launchctl bsexec 1` the nested `launchctl asuser` refuses with
-# "Reentrancy avoided", run 38148803625; the helper itself is never nested so.)
+# userspace), so spawn::spawn runs for the runner's own uid, from a root LaunchDaemon in
+# the system domain, as the helper runs on a node: the control, a background run, gets
+# no session (launchctl names no manager there), and the GUI run must land in Aqua.
+# Not from a shell of this job (it is already in the runner's Aqua session, run
+# 38154872299), and not under `launchctl bsexec 1` (the nested `launchctl asuser`
+# refuses with "Reentrancy avoided", run 38148803625).
 me=$(id -u) my_gid=$(id -g) my_name=$(id -un)
 launchctl print "gui/$me" >/dev/null 2>&1 || fail "the runner has no gui/$me domain"
 gui_dir=$(mktemp -d "$tmp/gui.XXXXXX")
 chmod 0755 "$gui_dir"
 real_dir=$(cd "$gui_dir" && pwd -P)
-# managername names the launchd session a process is in: Aqua for a GUI session; from
-# the system context a user's process gets no name (launchctl says so on stderr).
 probe='echo "manager: $(/bin/launchctl managername 2>/dev/null || echo none)"; id -u; id -G; pwd; echo "$HOME"'
+xml() { sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
+# spawn_in <background|gui>: the client's spawn as a root LaunchDaemon; prints its output.
 spawn_in() {
-  sudo -n "$client" spawn "$1" "$me" "$my_gid" "$my_name" "$gui_dir" /bin/sh -c "$probe"
+  local label="kbf.ci.mac-session.spawn-$1" out="$tmp/spawn-$1.out" arg args=''
+  for arg in "$client" spawn "$1" "$me" "$my_gid" "$my_name" "$gui_dir" /bin/sh -c "$probe"; do
+    args="$args<string>$(printf '%s' "$arg" | xml)</string>"
+  done
+  cat > "$tmp/$label.src" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$label</string>
+  <key>ProgramArguments</key><array>$args</array>
+  <key>StandardOutPath</key><string>$out</string>
+  <key>StandardErrorPath</key><string>$out.err</string>
+  <key>RunAtLoad</key><true/>
+</dict>
+</plist>
+PLIST
+  # launchd loads a system job only from a file root owns and no one else may write.
+  sudo -n install -o root -g wheel -m 0644 "$tmp/$label.src" "$tmp/$label.plist"
+  sudo -n launchctl bootstrap system "$tmp/$label.plist"
+  for _ in $(seq 150); do
+    if sudo -n grep -q '^exit ' "$out" 2>/dev/null; then break; fi
+    sleep 0.2
+  done
+  sudo -n launchctl bootout "system/$label" 2>/dev/null || true
+  sudo -n cat "$out" 2>/dev/null || true
+  sudo -n cat "$out.err" >&2 2>/dev/null || true
 }
-control=$(spawn_in background) || fail "the background spawn failed: $control"
+control=$(spawn_in background)
 echo "background: $(echo "$control" | tr '\n' ' ')"
-[ "$(echo "$control" | sed -n 1p)" != "manager: Aqua" ] || fail "the control already ran in a GUI session: $control"
-gui=$(spawn_in gui) || fail "the GUI spawn failed: $gui"
+[ "$(echo "$control" | sed -n 1p)" = "manager: none" ] || fail "the control is not outside a session: [$control]"
+gui=$(spawn_in gui)
 echo "gui: $(echo "$gui" | tr '\n' ' ')"
 want=$(printf '%s\n' "manager: Aqua" "$me" "$my_gid" "$real_dir" "/Users/$my_name" "exit 0")
 [ "$gui" = "$want" ] || fail "the GUI spawn: got [$gui], want [$want]"
