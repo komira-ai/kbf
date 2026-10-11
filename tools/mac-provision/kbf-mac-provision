@@ -74,6 +74,8 @@ SOCKETFILTERFW="$R/usr/libexec/ApplicationFirewall/socketfilterfw"
 SWU="$R/Library/Preferences/com.apple.SoftwareUpdate"
 LOGINWINDOW="$R/Library/Preferences/com.apple.loginwindow"
 KCPASSWORD="$R/etc/kcpassword"
+# kbf-mac-session's intent record: the lease whose user the session switch logs in.
+SESSION_INTENT="$R/var/db/kbf-mac-session/session-intent"
 SSHD_CONFIG="$R/etc/ssh/sshd_config"
 # 000- sorts first, and sshd keeps the first value it reads for each keyword.
 SSHD_DROPIN="$R/etc/ssh/sshd_config.d/000-kbf.conf"
@@ -590,6 +592,19 @@ in_lease_range() {
   awk -v u="$1" -v a="$LEASE_MIN" -v b="$LEASE_MAX" 'BEGIN { exit !(u ~ /^[0-9]+$/ && u + 0 >= a + 0 && u + 0 <= b + 0) }'
 }
 
+# The lease user kbf-mac-session's intent record names (kbf-lease-<term>-<seq> for a
+# record holding <term>.<seq>), or nothing.
+intent_user() {
+  if [ -L "$SESSION_INTENT" ]; then
+    return 0
+  fi
+  # One line, newline included: "<term>.<seq> " once the newline is a space.
+  iu_lease=$(tr '\n' ' ' 2>/dev/null <"$SESSION_INTENT")
+  if matches "$iu_lease" '(0|[1-9][0-9]*)\.(0|[1-9][0-9]*) '; then
+    printf 'kbf-lease-%s\n' "$(printf '%s' "$iu_lease" | tr -d ' ' | tr . -)"
+  fi
+}
+
 ck_autologin() {
   cu_user=$(pref_get "$LOGINWINDOW" autoLoginUser)
   if [ -z "$cu_user" ]; then
@@ -604,7 +619,11 @@ ck_autologin() {
   case "$cu_user" in
     kbf-lease-*)
       if in_lease_range "$cu_uid"; then
-        ok "lease user $cu_user (uid $cu_uid), set by kbf-mac-session for a whole_machine lease"
+        if [ "$cu_user" = "$(intent_user)" ]; then
+          ok "lease user $cu_user (uid $cu_uid), set by kbf-mac-session for a whole_machine lease"
+        else
+          bad "auto-login is $cu_user (uid $cu_uid), but no kbf-mac-session intent record names its lease: a lease user left behind; apply clears auto-login and /etc/kcpassword"
+        fi
         return 0
       fi
       ;;

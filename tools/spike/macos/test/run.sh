@@ -19,7 +19,7 @@ export FAKE_REAL_PATH
 TESTS=0
 FAILED=0
 NAME=
-FAKES="uname sw_vers xcodebuild launchctl stat csrutil pgrep id sudo automationmodetool sysadminctl sandbox-exec xcrun sqlite3"
+FAKES="uname sw_vers xcodebuild launchctl stat csrutil pgrep id sudo automationmodetool sysadminctl sandbox-exec xcrun sqlite3 hdiutil cp chown mount"
 
 # ---------------------------------------------------------------- harness
 
@@ -32,7 +32,7 @@ failt() {
 # fresh: a new fake Mac (state, bin, results) for the current test.
 fresh() {
     T=$WORK/$NAME
-    mkdir -p "$T/state" "$T/bin" "$T/results"
+    mkdir -p "$T/state" "$T/bin" "$T/results" "$T/shared"
     for f in $FAKES; do ln -s "$HERE/fakecmd" "$T/bin/$f"; done
     : >"$T/state/log"
     OUT=$T/out
@@ -42,7 +42,7 @@ fresh() {
 probe() {
     env -u GITHUB_STEP_SUMMARY PATH="$T/bin:$FAKE_REAL_PATH" FAKE_STATE="$T/state" \
         SPIKE_RESULTS="$T/results" SPIKE_TCC_SYSTEM_DB="$T/state/system.db" \
-        SPIKE_TCC_USER_DB="$T/state/user.db" ${PROBE_ENV-} \
+        SPIKE_TCC_USER_DB="$T/state/user.db" SPIKE_P0_PARENT="$T/shared" ${PROBE_ENV-} \
         bash "$DIR/$1.sh" >"$OUT" 2>&1
 }
 
@@ -313,6 +313,236 @@ t_tcc_control_empty() {
     verdict_is BROKEN
 }
 
+# ---------------------------------------------------------------- volume_owner
+
+# vo_cleaned: the user, the scratch directory and every attach are gone.
+vo_cleaned() {
+    want 'volume_owner.cleanup.user_gone=yes'
+    want 'volume_owner.cleanup.dir_gone=yes'
+    [ -z "$(find "$T/shared" -mindepth 1 2>/dev/null)" ] || failt "the scratch directory is left: $(ls "$T/shared")"
+}
+
+# The common case: the standard user's chown is refused, the re-attach reads its own
+# uid, the root control reads root. Catches writes that run as the runner (an admin)
+# instead of the fresh standard user, and a cleanup that leaves the user or the files.
+t_vo_fail() {
+    probe volume_owner
+    want 'volume_owner.new_user.existed_before=no'
+    want 'volume_owner.write.writer=uid=502 kind=standard groups=staff everyone localaccounts'
+    want 'volume_owner.write.chown=chown: '
+    want 'Operation not permitted [rc=1]'
+    want 'volume_owner.reattach.owner=502:20'
+    want 'volume_owner.write.copy_keep= [rc=0]'
+    want 'volume_owner.reattach.keep_owner=502:20'
+    want 'volume_owner.control_reattach.owner=0:0'
+    calls 'hdiutil create -size 64m -fs APFS' 2
+    calls 'sudo -n -H -u kbfp0 hdiutil create' 1
+    calls 'sudo -n -H -u kbfp0 hdiutil attach -nobrowse -owners on -mountpoint' 1
+    calls 'sudo -n -H -u kbfp0 chown 0:0' 1
+    want 'volume_owner.write.mount=/dev/disk4s1 on '
+    want 'm-user-1 (apfs, local, nodev, nosuid, journaled, nobrowse, mounted by kbfp0)'
+    want 'm-user-2 (apfs, local, nodev, nosuid, read-only, journaled, nobrowse)'
+    calls 'sudo -n hdiutil attach -nobrowse -owners on -readonly -mountpoint' 2
+    want 'volume_owner.new_user.uid=502'
+    calls 'sysadminctl -deleteUser kbfp0' 1
+    vo_cleaned
+    verdict_is FAIL
+}
+
+# A volume that stores the standard user's chown: PASS. Catches a verdict that cannot
+# say PASS (an owner compared in the wrong form), and a keep owner read from the
+# chowned file instead of the one the user left at its uid.
+t_vo_pass() {
+    : >"$T/state/owners_writable"
+    probe volume_owner
+    want 'volume_owner.write.chown= [rc=0]'
+    want 'volume_owner.reattach.owner=0:0'
+    want 'volume_owner.reattach.keep_owner=502:20'
+    verdict_is PASS
+    vo_cleaned
+}
+
+# A chown the first attach shows but never stores: the first attach says 0:0, the
+# re-attach says 502:20, and the verdict follows the re-attach. Catches an owner read
+# from the first attach.
+t_vo_chown_lies() {
+    : >"$T/state/chown_lies"
+    probe volume_owner
+    want 'volume_owner.write.first_owner=0:0'
+    want 'volume_owner.reattach.owner=502:20'
+    verdict_is FAIL
+}
+
+# A root control that does not read back as root is BROKEN, even when the user's file
+# reads as root. Catches a verdict that ignores the control.
+t_vo_control_lost() {
+    : >"$T/state/owners_writable"
+    : >"$T/state/root_owner_lost"
+    probe volume_owner
+    want 'volume_owner.reattach.owner=0:0'
+    want 'volume_owner.control_reattach.owner=99:99'
+    verdict_is BROKEN
+}
+
+# The verifier's false PASS: root's re-attach of the user's image comes up noowners
+# and shows root as every owner, so the refused chown's file reads 0:0. BROKEN, for
+# the mount flags. Catches a verdict that never reads the re-attach's mount line. The
+# test's own directory puts the word noowners in every mount path, so it also catches
+# a check that searches the path instead of the flag list (the control's line would
+# match first).
+t_vo_noowners() {
+    : >"$T/state/noowners_m-user-2"
+    : >"$T/state/shows_caller_m-user-2"
+    probe volume_owner
+    want 'volume_owner.write.chown=chown: '
+    want 'm-user-2 (apfs, local, nodev, nosuid, read-only, journaled, noowners, nobrowse)'
+    want 'volume_owner.reattach.owner=0:0'
+    want 'volume_owner.reattach.keep_owner=0:0'
+    want "the re-attach of the user's image did not honour owners"
+    vo_cleaned
+    verdict_is BROKEN
+}
+
+# A re-attach that shows root as every owner with no noowners in its mount line: the
+# keep file reads 0:0, not the user's 502, so BROKEN. Catches a verdict whose only
+# evidence that the reader can show a non-root owner is the mount line.
+t_vo_shows_caller() {
+    : >"$T/state/shows_caller_m-user-2"
+    probe volume_owner
+    want 'm-user-2 (apfs, local, nodev, nosuid, read-only, journaled, nobrowse)'
+    want 'volume_owner.reattach.owner=0:0'
+    want "the re-attach read the file the user left at uid 502 as '0:0'"
+    verdict_is BROKEN
+}
+
+# The control's re-attach comes up noowners: its 0:0 is root shown as every owner,
+# not the stored owner (here lost to 99:99), so BROKEN even though the user's file
+# reads 0:0 and the keep file 502:20. Catches a verdict that checks only the user
+# re-attach's mount line.
+t_vo_control_noowners() {
+    : >"$T/state/owners_writable"
+    : >"$T/state/root_owner_lost"
+    : >"$T/state/noowners_m-control-2"
+    : >"$T/state/shows_caller_m-control-2"
+    probe volume_owner
+    want 'volume_owner.reattach.owner=0:0'
+    want 'volume_owner.reattach.keep_owner=502:20'
+    want 'volume_owner.control_reattach.owner=0:0'
+    want "the root control's re-attach did not honour owners"
+    verdict_is BROKEN
+}
+
+# A re-attach whose mount point is not in the mount table: its flags are unknown, so
+# BROKEN even when the owners read right. Catches a missing line taken as owners on.
+t_vo_mount_unlisted() {
+    : >"$T/state/owners_writable"
+    : >"$T/state/unlisted_m-user-2"
+    probe volume_owner
+    want 'volume_owner.reattach.mount=not in the mount table'
+    want 'volume_owner.reattach.owner=0:0'
+    want "the re-attach of the user's image did not honour owners (not in the mount table)"
+    verdict_is BROKEN
+}
+
+# A writer in the admin group is BROKEN. Catches a verdict that ignores the writer's
+# kind.
+t_vo_admin_writer() {
+    : >"$T/state/probe_user_admin"
+    : >"$T/state/owners_writable"
+    probe volume_owner
+    want 'volume_owner.write.writer=uid=502 kind=admin'
+    verdict_is BROKEN
+}
+
+# vo_user_kept: the probe ran no sysadminctl at all and the user is still there.
+vo_user_kept() {
+    calls 'sysadminctl' 0
+    [ -e "$T/state/user_kbfp0" ] || failt "the user that existed before the probe was deleted"
+    want 'volume_owner.cleanup.user_gone=no'
+}
+
+# A probe user that exists before the probe may be a real account: the probe refuses
+# to start (BROKEN), runs no sysadminctl or hdiutil, leaves the user and removes its
+# scratch directory. Catches a probe that skips the existence check and goes on to
+# add (and then delete) a user it did not make, and a cleanup that deletes the user
+# without this run's marker of its creation.
+t_vo_user_existed() {
+    : >"$T/state/user_kbfp0"
+    : >"$T/state/owners_writable"
+    probe volume_owner
+    want 'volume_owner.new_user.existed_before=yes'
+    want 'volume_owner.verdict=BROKEN: user kbfp0 exists already, so the probe did not start'
+    want 'volume_owner.cleanup.delete_user=skipped: this run did not create kbfp0'
+    vo_user_kept
+    calls 'hdiutil' 0
+    want 'volume_owner.cleanup.dir_gone=yes'
+    [ -z "$(find "$T/shared" -mindepth 1 2>/dev/null)" ] || failt "the scratch directory is left: $(ls "$T/shared")"
+    verdict_is BROKEN
+}
+
+# A creation marker left by an earlier run in the same results directory (uid 502,
+# the uid the existing user has) does not license a delete. Catches a probe that
+# does not clear the marker before it starts.
+t_vo_stale_marker() {
+    : >"$T/state/user_kbfp0"
+    mkdir -p "$T/results/state"
+    printf 502 >"$T/results/state/volume_owner.created_uid"
+    probe volume_owner
+    want 'volume_owner.cleanup.delete_user=skipped: this run did not create kbfp0'
+    vo_user_kept
+    verdict_is BROKEN
+}
+
+# The probe made kbfp0 with uid 502, but by cleanup the name belongs to a user with
+# uid 503 (deleted and made again while the probe ran): cleanup leaves it. Catches a
+# cleanup that deletes by name without comparing the uid it recorded.
+t_vo_user_recreated() {
+    : >"$T/state/recreate_user"
+    probe volume_owner
+    want 'volume_owner.new_user.uid=502'
+    want 'volume_owner.cleanup.delete_user=skipped: kbfp0 has uid 503, not the uid 502 this run created'
+    calls 'sysadminctl -deleteUser' 0
+    [ "$(cat "$T/state/user_kbfp0" 2>/dev/null)" = 503 ] || failt "the user made again with uid 503 was deleted"
+}
+
+# The user's detach fails (the volume is busy): the write stopped after 'copy', a FAIL
+# even though the volume stores the user's chown, and cleanup force-detaches the
+# mount left behind. Catches a failed detach recorded as done (the verdict would say
+# PASS) and a cleanup that skips or does not force the detach (the mount stays).
+t_vo_detach_busy() {
+    : >"$T/state/owners_writable"
+    : >"$T/state/busy_m-user-1"
+    probe volume_owner
+    want 'volume_owner.write.detach=hdiutil: couldn'"'"'t unmount "disk4" - Resource busy [rc=16]'
+    want "the standard user's write stopped after 'copy'"
+    want 'volume_owner.cleanup.detach.m-user-1="disk4" ejected. [rc=0]'
+    calls 'hdiutil detach -force ' 1
+    [ ! -s "$T/state/mounts" ] || failt "a mount is left: $(cat "$T/state/mounts")"
+    vo_cleaned
+    verdict_is FAIL
+}
+
+# The user's chown stores the group (0) but not the owner: the re-attach reads 502:0,
+# a FAIL. Catches an owner compared on its gid instead of its uid.
+t_vo_group_root() {
+    : >"$T/state/chown_group_only"
+    probe volume_owner
+    want 'volume_owner.reattach.owner=502:0'
+    verdict_is FAIL
+}
+
+# An attach the standard user cannot make is a FAIL that names the step; the control
+# and the cleanup still run. Catches a verdict that ignores where the write stopped.
+t_vo_attach_fails() {
+    : >"$T/state/attach_fails"
+    probe volume_owner
+    want 'volume_owner.write.attach=hdiutil: attach failed - Device not configured [rc=1]'
+    want 'volume_owner.control_reattach.owner=0:0'
+    want "the standard user's write stopped after 'create'"
+    vo_cleaned
+    verdict_is FAIL
+}
+
 # ---------------------------------------------------------------- verdicts
 
 # verdicts.sh is red for a BROKEN or a missing verdict and green for PASS and FAIL.
@@ -340,7 +570,10 @@ t_verdicts() {
 for test in t_lib t_watchdog t_am_already t_am_required_first t_am_control_noop t_am_hang \
     t_am_unknown t_am_user_drops t_am_adduser_hang t_simctl_pass t_simctl_deny_ignored t_simctl_bad_png \
     t_simctl_allow_fails t_simctl_bootstatus_fails t_simctl_delete_fails t_simctl_create_garbage \
-    t_tcc_pass t_tcc_control_empty t_verdicts; do
+    t_tcc_pass t_tcc_control_empty t_vo_fail t_vo_pass t_vo_chown_lies t_vo_control_lost \
+    t_vo_noowners t_vo_shows_caller t_vo_control_noowners t_vo_mount_unlisted \
+    t_vo_admin_writer t_vo_user_existed t_vo_stale_marker t_vo_user_recreated \
+    t_vo_detach_busy t_vo_group_root t_vo_attach_fails t_verdicts; do
     t "$test"
 done
 printf '%s tests, %s failed assertions\n' "$TESTS" "$FAILED"

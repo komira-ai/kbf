@@ -109,8 +109,10 @@ exit code, or a non-OK status (`kbf-proto/proto/kbf/worker/v1/worker.proto:240-2
   `FAILED_PRECONDITION` whose `PreconditionFailure` violations are all `MISSING` with a
   `blobs/<hash>/<size>` subject is `Failure::MissingInput`, keeping the blobs
   (`kbf-server/src/missing.rs`); **every other code is `Failure::Infra` and the
-  daemon's message is dropped** (the catch-all arm), a `FAILED_PRECONDITION` without
-  such a detail included. The log has the code only, or the number of missing blobs.
+  daemon's message does not reach the client** (the catch-all arm), a
+  `FAILED_PRECONDITION` without such a detail included. The server logs it: a WARN
+  `lease failed` line with the lease, the node, the code and the reason, or for a
+  missing input a WARN line with the number of missing blobs.
 - **Answer** (`settle` in `farm.rs`): Infra becomes `INTERNAL "the farm could not
   run the action"`, the same fixed text for every cause, with no node name.
   MissingInput becomes the front's answer for inputs not in the CAS (below,
@@ -365,9 +367,9 @@ These need no guessing, only keeping the reason the daemon already writes:
   exit 137 and whenever Podman recorded no exit (section 6.1).
 - **Control faults**: fence (`ABORTED`), contact lost (`UNAVAILABLE`), lease kind not
   served, the named Xcode absent, outputs not stored (`farm.rs:539-542`). Farm.
-- **Request errors**: no arguments, image by tag, output path in the input root
-  (today's `Invalid`); an output or stdout over the size limit; a blob the client never
-  uploaded.
+- **Request errors**: no arguments, image by tag, an output's parent that would be made
+  through an input symlink or file (today's `Invalid`); an output or stdout over the
+  size limit; a blob the client never uploaded.
 - **Missing blob at the worker.** The front already checked the inputs, so a blob the
   worker cannot find is either lost by the CAS or a fetch error. The server checks the
   CAS:
@@ -821,7 +823,7 @@ from a typo by asking peers is not built.
   on every result, failed ones included (in the partial result where there is one).
   Neither client shows `worker` today, so the node also goes in the text.
 - **Server log**: one line per run with operation, lease, node, class, reason,
-  signature and fix. Today it has the code only (`farm.rs:554`).
+  signature and fix. Today it has the lease, node, code and reason (`Farm::outcome`).
 - **Daemon log**: the reason and class beside `lease finished` (`lease.rs:119`).
 - **`server_logs`**: a run history blob per operation (each run's node, class, reason,
   stderr tail). Bazel fetches it on failure; the UI reads it.

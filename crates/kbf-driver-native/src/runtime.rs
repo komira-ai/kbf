@@ -27,7 +27,7 @@ use crate::config::NativeConfig;
 use crate::network::{self, Network, network_of};
 use crate::procs::{self, Proc, Tracker};
 use crate::program::{Refused, Resolved, resolve};
-use crate::record::Exec;
+use crate::record::{Exec, Spawned};
 use crate::user_folders::UserFolders;
 use crate::xcode;
 
@@ -380,7 +380,13 @@ impl<C: Cas> NativeRuntime<C> {
             .process_group(0)
             .kill_on_drop(true);
         let record = crate::record::path(&self.config.scratch, &lease_name(work.lease_id));
-        let (mut child, leader) = spawn(&mut command, exec, &record)
+        let Spawned {
+            mut child,
+            pid: leader,
+            // Held until the group has ended (the group's kill ends it too), and
+            // dropped after the group: it ends the group if the daemon dies.
+            keeper: _keeper,
+        } = spawn(&mut command, exec, &record)
             .await
             .map_err(failed(&prepared.program))?;
         let me = i32::try_from(std::process::id()).unwrap_or(i32::MAX);
@@ -409,13 +415,31 @@ impl<C: Cas> NativeRuntime<C> {
         group.end(&mut child, self.config.kill_wait).await?;
         match ended {
             Ended::Exited(status) => Ok(exit_code(status.map_err(failed(&program))?)),
-            Ended::TimedOut => Err(RuntimeError::TimedOut),
+            Ended::TimedOut => Err(self.timed_out(work.lease_id, dir).await),
             Ended::Killed => Err(RuntimeError::Killed),
             Ended::OutOfMemory { used, limit } => {
                 tracing::warn!(lease = %work.lease_id, used, limit, "killed past its memory limit");
                 Err(RuntimeError::OutOfMemory { used, limit })
             }
         }
+    }
+
+    /// [`RuntimeError::TimedOut`] with what the stopped action wrote to stdout and
+    /// stderr in `dir`, each stored within the stdio limit (REAPI's partial result). A
+    /// log past the limit, or one that cannot be stored, is left out: the answer is
+    /// still the timeout.
+    async fn timed_out(&self, lease: LeaseId, dir: &Path) -> RuntimeError {
+        let store = CasStore(Arc::clone(&self.cas));
+        let max = self.config.outputs.max_stdio_bytes;
+        let mut logs = [None, None];
+        for (name, slot) in ["stdout", "stderr"].into_iter().zip(&mut logs) {
+            match kbf_outputs::store_file(&store, &dir.join(name), max).await {
+                Ok(digest) => *slot = Some(digest),
+                Err(e) => tracing::warn!(%lease, "timed out; its {name} is left out: {e}"),
+            }
+        }
+        let [stdout, stderr] = logs;
+        RuntimeError::TimedOut { stdout, stderr }
     }
 
     /// Every step but the clean.
@@ -714,12 +738,12 @@ impl Drop for Group {
 /// Spawns `command` running `exec`, with its run record written to `record` before
 /// the program runs ([`crate::record::Gate`]), retrying while the program is busy: a
 /// just-written input file is briefly held open for writing by any child another thread
-/// forks before it execs (ETXTBSY). Returns the child and its pid.
+/// forks before it execs (ETXTBSY). Returns the child, its pid and its keeper.
 async fn spawn(
     command: &mut tokio::process::Command,
     exec: Exec,
     record: &Path,
-) -> std::io::Result<(Child, i32)> {
+) -> std::io::Result<Spawned> {
     let gate = crate::record::Gate::install(command, exec);
     let give_up = Instant::now() + BUSY_WAIT;
     loop {
@@ -1300,7 +1324,7 @@ mod tests {
         let exec = || Exec::new(&program, [], []).expect("exec");
         let record = dir.join(format!("busy-record-{}", std::process::id()));
         let started = Instant::now();
-        let (mut child, pid) = spawn(&mut command(), exec(), &record)
+        let Spawned { mut child, pid, .. } = spawn(&mut command(), exec(), &record)
             .await
             .expect("spawned once closed");
         assert!(started.elapsed() >= Duration::from_millis(50), "it waited");

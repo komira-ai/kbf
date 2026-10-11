@@ -1,5 +1,6 @@
-//! Execution: the [`Runtime`] trait the lease manager runs work through, and
-//! [`FakeRuntime`], which runs nothing. [`crate::LocalRuntime`] (tests only) runs
+//! Execution: the [`Runtime`] trait the lease manager runs work through (a daemon may
+//! have several, one per lease kind: [`crate::Runtimes`]), and [`FakeRuntime`], which
+//! runs nothing. [`crate::LocalRuntime`] (tests only) runs
 //! actions as plain processes; the container driver (`kbf-driver-container`)
 //! implements the trait for farm nodes.
 
@@ -9,7 +10,7 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use kbf_proto::reapi::{ActionResult, Digest};
-use kbf_types::{LeaseId, Resources};
+use kbf_types::{LeaseId, LeaseKind, Resources};
 use tokio::sync::oneshot;
 
 /// One lease's work, as the server's Start describes it.
@@ -40,9 +41,15 @@ pub enum RuntimeError {
     /// A blob the action needs (`hash/size`) is not in the CAS: the client's to upload.
     #[error("blob {0} is not in the CAS")]
     MissingBlob(String),
-    /// The action ran past its timeout and was stopped.
+    /// The action ran past its timeout and was stopped. `stdout` and `stderr` are what
+    /// it wrote to each before then, stored in the CAS: REAPI's partial result, which
+    /// the Result carries with DEADLINE_EXCEEDED. `None` for a log the driver left out
+    /// (past the output limit, or not stored).
     #[error("timed out")]
-    TimedOut,
+    TimedOut {
+        stdout: Option<Digest>,
+        stderr: Option<Digest>,
+    },
     /// The action's processes together used more memory than the lease allows, and
     /// the runtime (or the kernel, at the lease's own cap) killed them. Reported as
     /// RESOURCE_EXHAUSTED with `MEMORY_KILL_OWN_LIMIT`: the farm's to retry with more
@@ -81,6 +88,8 @@ pub trait Runtime: Send + Sync + 'static {
 #[derive(Debug)]
 pub struct FakeRuntime {
     run_for: Duration,
+    kind: LeaseKind,
+    driver: &'static str,
     state: Mutex<FakeState>,
 }
 
@@ -92,12 +101,25 @@ struct FakeState {
 }
 
 impl FakeRuntime {
-    /// Serves lease kind `action`; each lease takes `run_for`.
+    /// Serves lease kind `action` as driver `fake`; each lease takes `run_for`.
     #[must_use]
     pub fn new(run_for: Duration) -> Self {
         Self {
             run_for,
+            kind: LeaseKind::Action,
+            driver: "fake",
             state: Mutex::new(FakeState::default()),
+        }
+    }
+
+    /// This runtime serving lease kind `kind` alone, as driver `driver`: a daemon with
+    /// several runtimes ([`crate::Runtimes`]) can be brought up, or tested, with fakes.
+    #[must_use]
+    pub fn serving(self, kind: LeaseKind, driver: &'static str) -> Self {
+        Self {
+            kind,
+            driver,
+            ..self
         }
     }
 
@@ -122,11 +144,11 @@ impl FakeRuntime {
 
 impl Runtime for FakeRuntime {
     fn driver(&self) -> &'static str {
-        "fake"
+        self.driver
     }
 
     fn serves(&self, kind: &str) -> bool {
-        kind == "action"
+        kind == self.kind.name()
     }
 
     async fn run(&self, work: Work) -> Result<ActionResult, RuntimeError> {

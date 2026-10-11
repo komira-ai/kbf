@@ -6,8 +6,11 @@ how a golden image gets past Setup Assistant with a logged-in test user and the
 no window server, what network a guest gets, how an image is named when every Mac
 may have to build its own, which uid runs the VM, how the VM helper is signed, and
 which probes on a real Mac must answer the open questions before code relies on
-them. **Everything in it is planned.** No VM code exists on `main`: there is no
-`kbf-driver-vm`, `kbf-vmm` or `kbf-guest` crate.
+them. **Everything in it is planned** except where it says otherwise. No VM code exists
+on `main`: there is no `kbf-driver-vm` crate; `kbf-guest` (the guest agent) speaks its
+protocol over a Unix socket only; and `kbf-vmm` is a stub that answers `--version` and
+nothing else, there so the signing scripts sign and check it with its entitlement
+([section 7](#7-signing-with-the-virtualization-entitlement)).
 
 Claims about Apple's software are marked **[V]** (read in the source linked) or
 **[A]** (an assumption, or a fact nobody has checked on our hardware), as in
@@ -330,21 +333,40 @@ A process that uses Virtualization.framework needs the
 whether your app can use the Virtualization framework"
 ([entitlement](https://developer.apple.com/documentation/bundleresources/entitlements/com.apple.security.virtualization))
 **[V]**. On `main`, `tools/ci/sign-darwin.sh` signs ad hoc with the hardened runtime,
-requires the code directory flags to be exactly `adhoc,runtime`, and **fails any
-binary whose signature carries entitlements** **[V]**.
+requires the code directory flags to be exactly `adhoc,runtime`, and signs each binary
+with the entitlements a per-binary allow list gives it **[V]**:
 
-The plan:
+- The list is `tools/ci/darwin-entitlements.txt`, one line per binary that gets any:
+  its file name, then its entitlements, each a boolean set to true. It holds one line:
+  `kbf-vmm` gets exactly `com.apple.security.virtualization`. Every other binary gets
+  none, as before. A test in `kbf-it` (`tests/darwin_entitlements.rs`) pins those lines,
+  so a new entitlement changes that test in the same review.
+- `tools/ci/darwin-entitlements.sh plist <name>` renders the plist for a name (nothing
+  for an unlisted one); `sign-darwin.sh` passes it to `codesign --entitlements` when it
+  is not empty, and signs with no entitlements otherwise.
+- `darwin-entitlements.sh check <binary> [<name>]` is the verifier. For an unlisted
+  name the signature must carry no entitlements. For a listed one, the signature's
+  entitlements plist (`codesign --display --entitlements - --xml`) and the list's, each
+  converted by `plutil -convert xml1`, must be the same bytes: one more key, one fewer,
+  another key or a value other than true fails. `sign-darwin.sh` runs it after
+  signing, and `check-darwin-asset.sh` runs it on the binary taken back out of its
+  tarball, under the binary's name there.
+- Both commands read the whole list and fail closed: a missing list, a malformed line,
+  a binary listed twice or an entitlement repeated fails them for every name, an
+  unlisted one included.
+- The comparison is of the XML entitlements. `codesign` also writes a DER form of the
+  same entitlements into the signature; the check does not read it.
 
-- A per-binary allow list in the repository: `kbf-vmm` gets exactly
-  `com.apple.security.virtualization`; every other binary gets none, as today.
-- `sign-darwin.sh` signs with `--entitlements` only for a binary on the list, and its
-  check compares the signature's entitlements to the list's set exactly: one more key,
-  one fewer, or any entitlement on an unlisted binary fails. A new check in
-  `check-darwin-asset.sh` makes the same comparison on the packaged bytes; the script
-  compares no entitlements today.
-- Planted defects the later PR must show red: an allow list that lets any entitlement
-  through; `kbf-daemon` signed with the virtualization entitlement; `kbf-vmm` with one
-  extra key.
+The hosted macOS job (`native-macos`) runs `tools/ci/sign-darwin-tests.sh`: it builds
+the `kbf-vmm` stub (`crates/kbf-vmm`), signs it with `sign-darwin.sh`, which must apply
+the entitlement and pass, and signs a copy named `kbf-daemon`, which must pass with
+none; `check-darwin-asset.sh` must accept both packaged. It then signs copies by hand
+and requires the check to refuse each: `kbf-daemon` with the virtualization
+entitlement, `kbf-mac-session` with `get-task-allow`, `kbf-vmm` with
+`get-task-allow` as well, `kbf-vmm` with none, `kbf-vmm` with `get-task-allow` in its
+place, and any binary when the list is missing. The stub starting under the hardened
+runtime with the entitlement on a hosted runner, where code-signing enforcement is off,
+says nothing about P6.
 
 Whether macOS accepts an **ad hoc** signature with this entitlement under the hardened
 runtime is probe P6 **[A]**. If it does not, `kbf-vmm` needs a signing identity, which
@@ -408,7 +430,7 @@ list, and, if a run shows it, `isSupported` being false inside a VM (a real nega
 
 | Probe | Question | Shape | Root on the host |
 |---|---|---|---|
-| P0 | Can a host user without root write a root-owned file into an attached guest volume? | attach a scratch disk image, write one plist with owner root, detach, check the owner from a second attach | no (that is the question) |
+| P0 | Can a host user without root write a root-owned file into an attached guest volume? | attach a scratch disk image, write one plist with owner root, detach, check the owner from a second attach | no (that is the question). Hosted macOS 15 and 26 runners answered no for a fresh standard user: its `chown 0:0` is refused even with owners honoured ([docs/spikes/macos-p0.md](../spikes/macos-p0.md), `tools/spike/macos/volume_owner.sh`). That is mechanics only; a farm Mac still decides |
 | P1 | Does a golden clone boot and `kbf-guest` answer over the virtio socket? **Plumbing only**: it runs from a logged-in user's session, not the production chain | boot one clone, one `Run` of `/usr/bin/true`, destroy | no; needs an image, so after P8 |
 | P2 | Does a third running guest fail with `VZErrorVirtualMachineLimitExceeded`, and does a `kbf-vmm` killed with `SIGKILL` free its slot? | boot two, try a third; kill one helper with -9, boot again within a bound | no |
 | P3 | Does a network-off guest have no interface but `lo0`, and what can a NAT guest reach? | `ifconfig -l` in each; a NAT guest's reach to the host and the farm network recorded | no |
@@ -437,7 +459,7 @@ list, and, if a run shows it, `isSupported` being false inside a VM (a real nega
 | The virtio socket connects host to guest ports | V | [VZVirtioSocketDevice](https://developer.apple.com/documentation/virtualization/vzvirtiosocketdevice) |
 | The virtualization entitlement is required | V | [entitlement](https://developer.apple.com/documentation/bundleresources/entitlements/com.apple.security.virtualization) |
 | Ad hoc signing with the entitlement works under the hardened runtime | A | P6 |
-| `sign-darwin.sh` refuses entitlements; `run` passes four descriptors; the `network` property exists | V | `tools/ci/sign-darwin.sh`, `crates/kbf-mac-session/src/helper.rs`, `crates/kbf-driver-native/src/network.rs` |
+| `sign-darwin.sh` gives `kbf-vmm` exactly the virtualization entitlement and every other binary none; `run` passes four descriptors; the `network` property exists | V | `tools/ci/sign-darwin.sh`, `tools/ci/darwin-entitlements.txt`, `crates/kbf-mac-session/src/helper.rs`, `crates/kbf-driver-native/src/network.rs` |
 | A guest cannot run a newer macOS than its host | A | P7 |
 | `user-delete`'s sweep does not cover the daemon's lease directories | V | `crates/kbf-mac-session/src/sweep.rs` (`SweepPlan::macos()`) |
 | The daemon's account can remove a lease directory holding the lease user's clone through inherited ACL entries | A | P5 |

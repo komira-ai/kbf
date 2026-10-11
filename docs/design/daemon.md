@@ -103,8 +103,37 @@ A daemon that stops on SIGTERM or SIGINT kills its leases' processes on the way 
 that is killed (SIGKILL, the kernel's OOM killer, a panic that aborts) cannot, and
 nothing the kernel does to the daemon reaches its actions: each leads a process group
 of its own (native driver) or runs in a container (container driver). The daemon
-re-adopts nothing (re-adopting is **planned**), so the next daemon on the node ends
-them before it says `Hello` (issue #155), as part of building its driver:
+re-adopts nothing (re-adopting is **planned**), so its runs are ended twice over (issue
+#155): as it dies, by each run's keeper, and when a daemon is started again on the
+node, before it says `Hello`, by that daemon's start-up sweep.
+
+**The keeper.** Each run gets one: `/bin/sh` running a few lines, its stdin a pipe only
+the daemon holds the other end of (close-on-exec, so no action inherits it). The daemon
+never writes the pipe. When the daemon dies, however it dies, the kernel closes its end;
+the keeper reads end-of-file and ends the run. It ignores SIGHUP, SIGINT and SIGTERM,
+so a service manager stopping the daemon's unit with SIGTERM does not stop it first.
+This needs no restart, so a killed daemon's runs no longer go on while the scheduler
+requeues their leases elsewhere after the handover grace.
+
+- **Native driver.** The keeper joins the action's process group before the program
+  runs: the daemon starts it between writing the run record and sending the go byte
+  (below), and a keeper that cannot be started, or cannot join the group, refuses the
+  run as an unwritten record does. At end-of-file it SIGKILLs its own group
+  (`kill 0`), the action's. Being a member is what makes that safe: while it lives the
+  group id names this action's group, since the kernel reuses no pid that names a live
+  group; and the daemon's kill of the group at the end of a lease, or the sweep's,
+  ends the keeper with the rest, so it needs no dismissal. It counts toward the
+  lease's memory (a shell, about a megabyte).
+- **Container driver.** The keeper starts once the lease cgroup is made, before
+  `podman create`, in a process group of its own. At end-of-file it writes the lease
+  cgroup's `cgroup.kill`, which kills every process in the lease, the container's
+  among them, and again every second for 30 seconds, while the file exists: a
+  `podman start` the dead daemon left in flight can still put the container's first
+  process in the lease after the first write. The container, the lease cgroup and the
+  scratch directory stay, with nothing running in them, until the sweep. The daemon
+  removes the keeper (SIGKILL, then it reaps it) once the lease is cleaned.
+
+**The start-up sweep** runs as part of building the driver:
 
 - **Native driver.** Before an action's program runs, the daemon writes its run record,
   `<scratch>/runs/lease-<term>-<seq>` (a new file, mode 0600, in a 0700 directory, never
@@ -140,19 +169,26 @@ requeues once the handover grace has passed, do not run twice. The grace alone w
 not do: it lets the older process fence, and a killed process fences nothing. Not
 guaranteed:
 
-- **A daemon that is not started again** (its service manager gave up, or the node id
-  or scratch directory changed): its runs go on, unfenced, until the machine stops,
-  while the scheduler requeues their leases after G. The service manager is the only
-  other line. Under systemd, a unit's default `KillMode=control-group` kills everything
-  left in the unit's cgroup when its main process dies, the native driver's actions
-  included, and the containers' processes too when their cgroups are in the unit's
-  delegated subtree; the repository ships no unit yet. launchd, when a job exits,
-  kills only the job's own process group (`AbandonProcessGroup` false, the default;
-  true stops even that), and has no setting that reaches an action leading a group of
-  its own, so on a Mac the shipped plist's `KeepAlive` restart is what ends them.
-- **Native: a process that left the group** (`setsid`) and whose parent exited before
-  the sweep: nothing links it to the record. A per-lease user or cgroup would close
-  this, as it would the same gap in a lease's own kill.
+- **A keeper that dies with the daemon, and a daemon that is not started again**
+  (its service manager gave up, or the node id or scratch directory changed): a run
+  whose keeper was killed too (by the OOM killer, by hand) goes on, unfenced, until
+  the machine stops, while the scheduler requeues its lease after G. The service
+  manager is the only other line. Under systemd, a unit's default
+  `KillMode=control-group` kills everything left in the unit's cgroup when its main
+  process dies, the native driver's actions included, and the containers' processes
+  too when their cgroups are in the unit's delegated subtree, as under the units the
+  deploy guides give ([linux-build-host.md](../deploy/linux-build-host.md#the-units),
+  [storage-node.md](../deploy/storage-node.md)), which keep that default. launchd, when a job exits, kills only the job's own process group
+  (`AbandonProcessGroup` false, the default; true stops even that), and has no
+  setting that reaches an action leading a group of its own, so on a Mac the shipped
+  plist's `KeepAlive` restart is the line after the keeper.
+- **Container: a `podman start` that outlasts the keeper's 30 seconds** of kills, and
+  puts the container's process in the lease after the last one.
+- **Native: a process that left the group** (`setsid`): the keeper does not reach it,
+  and once its parent has exited (the keeper's kill of the group may be what ends the
+  parent) nothing links it to the record either, so the sweep misses it too. A
+  per-lease user or cgroup would close this, as it would the same gap in a lease's own
+  kill.
 - **Native: a group id the kernel reused** while no daemon ran, in the same boot, whose
   new leader has exited while its group lives on: the record cannot tell that group
   from the action's.
@@ -179,20 +215,35 @@ pub trait Runtime: Send + Sync + 'static {
 }
 ```
 
-The lease manager never names a driver. It asks the runtime whether it serves a lease
-kind and runs the lease through it. `run` returns `Ok` for an action that ran, whatever
+The lease manager never names a driver. A daemon holds a set of runtimes
+(`Runtimes`), and each Start runs on the one that serves its kind; a kind none serves
+is refused at once with `FAILED_PRECONDITION` (`no driver here serves lease kind`). A
+lease is killed (on `Cancel`, or by the fence) through the runtime it runs on. The set
+refuses a runtime that serves a kind of `LeaseKind::ALL` another in it already serves,
+so no Start can run on either of two; the binary then refuses to start, naming both
+drivers and the kind. The node report lists every runtime's driver under `drivers`:
+`Daemon::new` adds them to the report it is given, so the Hello of every stream, and
+the Hello resent when a driver's report changes, carries all of them.
+
+The trait returns `impl Future`, so the set holds each runtime behind a private
+object-safe twin of the trait that boxes `run`'s and `kill`'s futures: one allocation
+per lease and per kill. `run` returns `Ok` for an action that ran, whatever
 its exit code. Its errors map to the `Result` status the server sees:
 
 | `RuntimeError` | `Result` status |
 |---|---|
 | `Killed` | `ABORTED` |
-| `TimedOut` | `DEADLINE_EXCEEDED` |
+| `TimedOut { stdout, stderr }` | `DEADLINE_EXCEEDED`, with an `action_result` holding the two log digests the driver stored (the partial result), unless it stored neither |
 | `Invalid(why)` | `INVALID_ARGUMENT`: the client's error, never retried |
 | `MissingBlob(digest)` | `FAILED_PRECONDITION` with a `MISSING` violation |
 | `Failed(why)` | `INTERNAL`: the farm's failure |
 
 Four runtimes exist. The `kbf-daemon` binary (crate `kbf-node`) offers the first three,
-picked by `--driver`:
+picked by `--driver`, which may be given more than once: one runtime per driver, each
+driver once, the node's own (native or container) set up first, then the others in
+the order given. Today every one of the three serves `action`, so any two refuse to
+start; the flag is repeatable for the runtimes of other kinds (a whole-machine runtime
+on Macs, a VM runtime) that join them.
 
 - **`PodmanRuntime`** (`kbf-driver-container`, driver `container`, Linux only): the
   runtime for Linux farm nodes, below. The binary requires `--scratch` and `--cas`, and
@@ -212,7 +263,8 @@ picked by `--driver`:
 - **`NativeRuntime`** (`kbf-driver-native`, driver `native`): each action as plain
   processes on the node, for Macs.
 - **`FakeRuntime`** (driver `fake`): runs nothing and returns an empty result, for
-  bring-up.
+  bring-up. It serves `action`; `FakeRuntime::serving` makes one serve another kind
+  under another driver name, so a daemon with several runtimes can be tested with fakes.
 - **`LocalRuntime`** (driver `local`): **tests only**. Runs each action as a plain child
   process of the daemon so the whole path (fetch, write inputs, run, measure, upload,
   report) can be tested where no container runtime exists. It isolates nothing and
@@ -238,14 +290,20 @@ never reused. Each lease goes through six steps.
      `Directory` messages is checked (no slash, `.`, `..` or NUL; no name twice) and
      files are created exclusively in directories the driver made, so no write follows
      a symlink the input tree planted.
-   - Refuse an action whose output path already exists in the input root, and one whose
-     working directory is hidden by an input file or symlink of the same name, as
-     `INVALID_ARGUMENT`.
+   - Refuse an action whose working directory is hidden by an input file or symlink of
+     the same name, as `INVALID_ARGUMENT`.
+   - Move each entry of the input root that an output path names, whole, into the
+     overlay's upper directory, then make the working directory and each output's
+     parent there (see Output collection). A parent made through a symlink is refused
+     as `INVALID_ARGUMENT`.
    - Give the overlay's directories to the container's root (see User namespaces).
    - Make the lease cgroup (below).
 2. **Start.** `podman create`, then `podman start --attach`, with stdout and stderr
    written to files in the scratch directory.
-3. **Watch.** Wait for the container to exit, the action's timeout, or `kill`.
+3. **Watch.** Wait for the container to exit, the action's timeout, or `kill`. On a
+   timeout, once the container is stopped, store what it wrote to stdout and stderr in
+   the CAS, each within the stdio limit; a log past the limit, or one that cannot be
+   stored, is left out, and the lease still ends `TimedOut`.
 4. **Collect.** Read the exit code from Podman's record of the container. If it is 137
    (SIGKILL), or there is none, and the lease cgroup's `memory.events` counts an
    `oom_kill`, the lease fails as out of memory or as killed on a busy node (see
@@ -253,6 +311,19 @@ never reused. Each lease goes through six steps.
    user, read the outputs (below) and store stdout and stderr in the CAS.
 5. **Clean.** Remove the container, the lease cgroup and the scratch directory.
 6. **Verify clean.** Neither directory may remain.
+
+**Pinned images.** `kbf-daemon --driver container --image docker://<repo>@sha256:<d>`
+(repeatable) names images the node is set up to run. At start, after its cgroup is
+set up and before it connects, the daemon checks each as the prepare step checks a
+lease's image (`PodmanRuntime::check_pinned`): named by digest, in its user's image
+store, and one architecture's manifest. The first that is not stops the daemon with
+exit status 2 and the fix: for a missing image, `podman pull <repo>@sha256:<d>`, to
+run as the daemon's user; for an index digest, to name the per-architecture manifest
+digest. The images are listed, sorted and each once, in the node's `NodeStatus`
+(`container_images`), which `GET /v1/nodes` shows as `software.container_images`. They
+route no work: placement does not match an action's image against them, and an action
+may still name an image the node was not pinned to (it is checked at prepare as
+always). Another driver given `--image` refuses to start (exit status 1).
 
 Cleaning runs on every path out of a lease: success, failure, timeout and kill. If the
 daemon drops a lease's future instead, the lease's destructor cleans up before the
@@ -388,11 +459,40 @@ makes `actions/kbf-lease-<term>-<seq>` and puts the container under it.
 - **Removal** of a lease cgroup that is still busy (a process still exiting) writes
   `cgroup.kill` and retries.
 
+### End to end (the M2 test)
+
+The `m2-container` CI job (`tools/ci/m2-container.sh`, then `crates/kbf-it/m2/run.sh`)
+runs the driver behind the real server and a real client, on a hosted x86_64 runner.
+It pulls distroless `base-debian12` by its linux/amd64 manifest digest (the sample's
+`crates/kbf-it/m2/buck2/.buckconfig` names the same image as `container_image`, which
+its execution platform passes on as `container-image`), starts one `kbf-server` and one
+`kbf-daemon --driver container` as a `Delegate=yes` system service with
+`--actions-memory-max-gib 8`, and builds the sample project with pinned buck2:
+
+- every target remote-only, then again after `buck2 clean`, every action answered from
+  the action cache (`kbf-cell check`, as in M1). The image has no shell, so each action
+  runs `kbf-m2-act`, a statically linked helper that is an input file of the action;
+- `//:hog`, which touches 3 GiB slowly: its first run books the default 1 GiB, presses
+  its 2 GiB cap into swap until the swap watch kills it, and the server's log must
+  hold exactly one requeue from 1 GiB to 2 GiB booked, after which it passes;
+- `//:pause` under a fresh salt: while it sleeps, Podman lists exactly one running
+  container labelled with the node id; afterwards no labelled container and no lease
+  directory is left.
+
 ## Output collection
 
 Outputs are read from the overlay's upper directory, which holds only what the action
-created or changed. That is why no output may already exist in the input root: an
-output read from the upper directory must be whole there.
+created or changed. An output read from there must be whole there, so an output path
+that names an entry of the input root (REAPI allows it; Bazel and Buck2 never send it)
+gets that entry moved from the lower to the upper directory before the overlay is
+mounted. The action sees the same tree; what it changes is changed in place, what it
+deletes is unlinked (no lower entry is left to hide, so no whiteout), and the output
+is read back as the action left it: an unchanged input whole, an edited one with its
+new bytes, a deleted one absent. That is what the native driver collects from its
+input root. Outputs are taken ancestors first, so one below another moves with it. The
+walk to an output follows no symlink and stops at the first component that is absent
+or not a directory: the parent made for the output in the upper directory hides a lower
+file or symlink of that name instead of merging with it.
 
 The upper directory is the action's to shape. It could replace the working directory,
 or any directory on an output's path, with a symlink to a host path

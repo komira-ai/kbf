@@ -28,6 +28,8 @@
 //!   together ([`procs`]); past the lease's limit, the whole tree is killed and the
 //!   lease ends RESOURCE_EXHAUSTED ([`kbf_daemon::RuntimeError::OutOfMemory`]);
 //! - a wall-clock timeout, and the daemon's kill, each ending the whole process tree;
+//!   a timeout still stores what the action wrote to stdout and stderr
+//!   ([`kbf_daemon::RuntimeError::TimedOut`]);
 //! - on every path, also a normal exit, every process of the action ended before the
 //!   outputs are read: SIGKILL to the group and to each process the tracker knows,
 //!   repeated until a snapshot shows none alive; any that survive fail the lease;
@@ -53,6 +55,8 @@
 //! one that cannot be removed is moved aside into `quarantine/` under the scratch root
 //! and logged, and the daemon starts anyway (an action decides what its directory
 //! holds, so refusing to start would let one build step take the node out of the farm).
+//! Until then, each action's keeper (`keeper`), a member of its group, kills the group
+//! when the daemon dies, restarted or not.
 //!
 //! Known gaps, all of them closed only by running each lease as its own user:
 //! - **Processes that leave the tree.** A process that calls `setsid` and is orphaned
@@ -62,7 +66,8 @@
 //!   ([`network::BASE_PROFILE`]). Not covered: other mach and XPC services, Apple
 //!   Events among them (`osascript` asking Terminal or Finder to run something), and
 //!   anything else the daemon's user can schedule (a `LaunchAgents` plist run at its
-//!   next login, `at`, `cron`, a loopback service).
+//!   next login, `at`, `cron`, a loopback service). The services that reach an iOS
+//!   device are refused ([`network::NO_DEVICE_RULES`]).
 //! - **The daemon's own files.** Actions run as the daemon's user, so they can read
 //!   what it can, the node's TLS private key (`--key`) included. On macOS the
 //!   profile keeps their file writes inside their own lease directory: the ways
@@ -103,6 +108,7 @@
 mod cas;
 mod config;
 mod home;
+mod keeper;
 pub mod network;
 pub mod procs;
 mod program;

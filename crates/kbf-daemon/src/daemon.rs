@@ -9,7 +9,8 @@
 //! Welcome, then sends a Heartbeat at the interval Welcome names and handles what the
 //! server sends: `HeartbeatAck` renews contact,
 //! `LeaseOffer` is logged and runs nothing, `Start` runs a lease if it arrived within
-//! the window it names (see `window`; a late one is dropped without a Result), and
+//! the window it names (see `window`; a late one is dropped without a Result), on the
+//! one runtime of the daemon's [`Runtimes`] that serves its kind (none: refused), and
 //! `Cancel` kills a running lease. Results go out on the stream. Every Result is kept
 //! until the server's `ResultAck` names its lease (issue #26): until then each
 //! Heartbeat lists the lease in `running`, so the scheduler does not take it as lost,
@@ -20,7 +21,9 @@
 //!
 //! A driver whose report changes while the daemon runs (the native driver re-checks its
 //! Xcodes, issue #164) hands the daemon a [`DriverReport`] channel
-//! ([`Daemon::with_driver_report`]). Its entries join the report the daemon was started
+//! ([`Daemon::with_driver_report`]); a driver with more than one survey sends each
+//! through its own part of one [`crate::DriverWatch`], which merges them, so no survey
+//! overwrites another's. Its entries join the report the daemon was started
 //! with, and its Xcodes go into `NodeStatus`. Each change is taken when it arrives: when
 //! the report changed, the Hello is resent on the stream (the server then places by the
 //! new report, issue #25), and `NodeStatus` is sent again either way. A change while no
@@ -77,7 +80,7 @@ use crate::connect::{
 use crate::contact::Contact;
 use crate::lease::{Done, Leases, failure, lease_id, proto_lease_id};
 use crate::report::NodeReport;
-use crate::runtime::Runtime;
+use crate::runtimes::Runtimes;
 use crate::status::{DriverReport, Software};
 use crate::window::StartWindow;
 
@@ -159,8 +162,8 @@ impl SessionError {
     }
 }
 
-/// A daemon: configuration, runtime, node report and the state that outlives streams.
-pub struct Daemon<R> {
+/// A daemon: configuration, runtimes, node report and the state that outlives streams.
+pub struct Daemon {
     config: DaemonConfig,
     /// The `--server` URLs, parsed.
     servers: Vec<Server>,
@@ -170,7 +173,8 @@ pub struct Daemon<R> {
     resolver: Arc<dyn Resolve>,
     /// Whether the current (or the last) stream got its Welcome.
     welcomed: bool,
-    /// The report the daemon was started with.
+    /// The report the daemon was started with, with a `drivers` entry for each of its
+    /// runtimes.
     base: NodeReport,
     /// What Hello carries and heartbeats hash: `base` plus the driver's newest entries.
     report: NodeReport,
@@ -180,8 +184,10 @@ pub struct Daemon<R> {
     driver: Option<watch::Receiver<DriverReport>>,
     /// Every Xcode the driver's newest report names, ready or not.
     xcodes: Vec<worker::XcodeStatus>,
+    /// The container images `NodeStatus` lists; see [`Self::with_container_images`].
+    container_images: Vec<String>,
     events: Option<mpsc::UnboundedSender<Event>>,
-    leases: Leases<R>,
+    leases: Leases,
     done: mpsc::UnboundedReceiver<Done>,
     contact: Contact,
     /// Send times of this stream's Hello and heartbeats, which Starts name.
@@ -217,15 +223,22 @@ enum Wake {
     Driver,
 }
 
-impl<R: Runtime> Daemon<R> {
+impl Daemon {
     /// A daemon that will connect as `config` says. Reads the TLS files now, so a
     /// missing or unreadable file fails here rather than on the first connection, and
     /// detects the node's software ([`Software::detect`]).
+    ///
+    /// A Start runs on the runtime of `runtimes` that serves its kind (one runtime, an
+    /// `Arc<R>`, converts). The node report is `report` with a `drivers` entry for every
+    /// runtime's driver added, whether `report` lists them or not.
     pub fn new(
         config: DaemonConfig,
-        runtime: Arc<R>,
+        runtimes: impl Into<Runtimes>,
         report: NodeReport,
     ) -> Result<Self, ConfigError> {
+        let runtimes = runtimes.into();
+        let drivers = runtimes.drivers().into_iter().map(|d| ("drivers", d));
+        let report = report.with_entries(drivers);
         let servers = config
             .servers
             .iter()
@@ -248,8 +261,9 @@ impl<R: Runtime> Daemon<R> {
             software: Software::detect(),
             driver: None,
             xcodes: Vec::new(),
+            container_images: Vec::new(),
             events: None,
-            leases: Leases::new(runtime, done_tx),
+            leases: Leases::new(runtimes, done_tx),
             done,
             contact,
             window: StartWindow::default(),
@@ -291,12 +305,22 @@ impl<R: Runtime> Daemon<R> {
         changed
     }
 
-    /// The `NodeStatus` this node sends now: its software, and every Xcode the
-    /// driver's newest report names, ready or not.
+    /// Lists `images` in every `NodeStatus`, sorted and each once: the container
+    /// images the driver checked present at start. Status only; they route no work.
+    #[must_use]
+    pub fn with_container_images(mut self, images: impl IntoIterator<Item = String>) -> Self {
+        let images: std::collections::BTreeSet<String> = images.into_iter().collect();
+        self.container_images = images.into_iter().collect();
+        self
+    }
+
+    /// The `NodeStatus` this node sends now: its software, every Xcode the driver's
+    /// newest report names, ready or not, and the container images it was given.
     #[must_use]
     pub fn node_status(&self) -> worker::NodeStatus {
         worker::NodeStatus {
             xcodes: self.xcodes.clone(),
+            container_images: self.container_images.clone(),
             ..self.software.status(&self.report)
         }
     }

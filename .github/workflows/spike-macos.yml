@@ -1,6 +1,7 @@
 # The macOS P0 spike: what a GitHub-hosted macOS runner shows of the mechanics a UI
 # test on a farm Mac needs (automationmodetool, simctl in a private device set, the
-# TCC rows a runner image seeded). Findings: docs/spikes/macos-p0.md. Each probe
+# TCC rows a runner image seeded, and VM probe P0: a root-owned file written into an
+# attached disk image by a fresh standard user). Findings: docs/spikes/macos-p0.md. Each probe
 # prints `SPIKE macos-<arch>.<probe>.<arm>=<value>` lines and one `<probe>.verdict`;
 # the results directory (those lines and the simulator screenshot) is uploaded. Read
 # them with
@@ -64,6 +65,9 @@ jobs:
       - name: simctl in a private device set
         if: ${{ !cancelled() }}
         run: bash tools/spike/macos/simctl.sh
+      - name: P0, a root-owned file into an attached volume as a standard user
+        if: ${{ !cancelled() }}
+        run: bash tools/spike/macos/volume_owner.sh
       - name: automationmodetool status, enable and control
         if: ${{ !cancelled() }}
         run: bash tools/spike/macos/automation_mode.sh
@@ -77,7 +81,7 @@ jobs:
           if-no-files-found: error
       - name: Verdicts
         if: ${{ !cancelled() }}
-        run: bash tools/spike/macos/verdicts.sh tcc simctl automation_mode
+        run: bash tools/spike/macos/verdicts.sh tcc simctl volume_owner automation_mode
 
   probes-macos-15:
     runs-on: macos-15
@@ -96,6 +100,9 @@ jobs:
       - name: simctl in a private device set
         if: ${{ !cancelled() }}
         run: bash tools/spike/macos/simctl.sh
+      - name: P0, a root-owned file into an attached volume as a standard user
+        if: ${{ !cancelled() }}
+        run: bash tools/spike/macos/volume_owner.sh
       - name: automationmodetool status, enable and control
         if: ${{ !cancelled() }}
         run: bash tools/spike/macos/automation_mode.sh
@@ -109,4 +116,4 @@ jobs:
           if-no-files-found: error
       - name: Verdicts
         if: ${{ !cancelled() }}
-        run: bash tools/spike/macos/verdicts.sh tcc simctl automation_mode
+        run: bash tools/spike/macos/verdicts.sh tcc simctl volume_owner automation_mode

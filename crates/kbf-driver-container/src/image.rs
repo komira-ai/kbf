@@ -1,6 +1,6 @@
 //! The `container-image` platform property: `docker://<repo>@sha256:<digest>`.
 //!
-//! One action digest must never mean two sets of bytes (RFC 10.8), so an image is named
+//! One action digest must never mean two sets of bytes, so an image is named
 //! only by a per-architecture manifest digest. A tag is refused here, by its spelling.
 //! An image index digest (a multi-architecture list) cannot be told from a manifest
 //! digest by spelling, nor by Podman's image metadata: Podman 4.9 records one `Digest`
@@ -83,6 +83,23 @@ impl fmt::Display for ImageRef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}@{}", self.repository, self.digest)
     }
+}
+
+/// Why this node cannot run an image named by digest.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum ImageCheckError {
+    /// The node's image store does not hold it. Nodes never pull at action time; the
+    /// daemon's user pulls it once, by digest.
+    #[error(
+        "image {0} is not in this node's image store; as the daemon's user, run: podman pull {0}"
+    )]
+    Missing(ImageRef),
+    /// Its digest names an image index (a multi-architecture list).
+    #[error("container-image {0} names an image index; name the per-architecture manifest digest")]
+    Index(ImageRef),
+    /// Podman could not be asked, or the store cannot vouch for the manifest.
+    #[error("{0}")]
+    Failed(String),
 }
 
 /// What a manifest digest names.

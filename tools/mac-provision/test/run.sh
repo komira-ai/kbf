@@ -101,6 +101,11 @@ user() {
   kv "$S/dscl_Users_$1" UniqueID "$2"
 }
 
+intent() {
+  # intent LEASE: kbf-mac-session's intent record names LEASE.
+  printf '%s\n' "$1" >"$FAKE_ROOT/var/db/kbf-mac-session/session-intent"
+}
+
 # A Mac as Setup Assistant and Remote Login leave it: one admin, nothing else set.
 ROOTS=0
 
@@ -110,7 +115,7 @@ mkroot() {
   export FAKE_ROOT
   S=$FAKE_ROOT/.fake
   for d in .fake usr/bin bin usr/sbin sbin usr/libexec/ApplicationFirewall Library/Preferences \
-    etc/ssh/sshd_config.d Applications Library/kbf/xip usr/local/kbf/probes; do
+    etc/ssh/sshd_config.d Applications Library/kbf/xip usr/local/kbf/probes var/db/kbf-mac-session; do
     mkdir -p "$FAKE_ROOT/$d"
   done
   for c in id sw_vers pmset defaults dscl launchctl xcode-select xcodebuild sntp xip shasum ls mv chown fdesetup; do
@@ -442,7 +447,16 @@ t_drift() {
   want_out 'CHANGE autologin: removed /etc/kcpassword'
   drift autologin fix 'kv $S/defaults_Library_Preferences_com.apple.loginwindow autoLoginUser farmadmin'
   drift autologin fix 'echo x >$R/etc/kcpassword'
-  drift autologin fix 'user kbf-lease-9 700; kv $S/defaults_Library_Preferences_com.apple.loginwindow autoLoginUser kbf-lease-9'
+  drift autologin fix 'user kbf-lease-9-9 700; intent 9.9; kv $S/defaults_Library_Preferences_com.apple.loginwindow autoLoginUser kbf-lease-9-9'
+  # A lease user in range that no intent record names: left behind (a crash, a lost
+  # session-idle), or named by a record for another lease or a malformed one.
+  drift autologin fix 'user kbf-lease-4-2 642; kv $S/defaults_Library_Preferences_com.apple.loginwindow autoLoginUser kbf-lease-4-2; echo x >$R/etc/kcpassword' \
+    'FAIL autologin: auto-login is kbf-lease-4-2 (uid 642), but no kbf-mac-session intent record names its lease: a lease user left behind; apply clears auto-login and /etc/kcpassword'
+  want_out 'CHANGE autologin: removed /etc/kcpassword'
+  drift autologin fix 'user kbf-lease-4-2 642; intent 4.3; kv $S/defaults_Library_Preferences_com.apple.loginwindow autoLoginUser kbf-lease-4-2'
+  drift autologin fix 'user kbf-lease-4-2 642; printf "4.2\n4.3\n" >$R/var/db/kbf-mac-session/session-intent; kv $S/defaults_Library_Preferences_com.apple.loginwindow autoLoginUser kbf-lease-4-2'
+  drift autologin fix 'user kbf-lease-4-2 642; intent 04.2; kv $S/defaults_Library_Preferences_com.apple.loginwindow autoLoginUser kbf-lease-4-2'
+  drift autologin fix 'user kbf-lease-4-2 642; ln -s $S/elsewhere $R/var/db/kbf-mac-session/session-intent; echo 4.2 >$S/elsewhere; kv $S/defaults_Library_Preferences_com.apple.loginwindow autoLoginUser kbf-lease-4-2'
   drift autologin fix 'user lease9 650; kv $S/defaults_Library_Preferences_com.apple.loginwindow autoLoginUser lease9'
   drift autologin fix 'kv $S/defaults_Library_Preferences_com.apple.loginwindow autoLoginUser kbf-lease-gone'
   drift time_server fix 'kv $S/systemsetup networktime off'
@@ -523,14 +537,16 @@ t_quiet_entries() {
 }
 
 t_lease_autologin() {
-  # kbf-mac-session set auto-login to a lease user: check passes, apply leaves it.
+  # kbf-mac-session set auto-login to a lease user and its intent record names the
+  # lease: check passes, apply leaves it.
   converged
-  user kbf-lease-42 642
-  kv "$S/defaults_Library_Preferences_com.apple.loginwindow" autoLoginUser kbf-lease-42
+  user kbf-lease-4-2 642
+  intent 4.2
+  kv "$S/defaults_Library_Preferences_com.apple.loginwindow" autoLoginUser kbf-lease-4-2
   echo x >"$FAKE_ROOT/etc/kcpassword"
   runr check --profile "$P"
   want_status 0
-  want_out 'PASS autologin: lease user kbf-lease-42 (uid 642)'
+  want_out 'PASS autologin: lease user kbf-lease-4-2 (uid 642)'
   runr apply --profile "$P"
   want_status 0
   no_writes

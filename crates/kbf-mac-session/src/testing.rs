@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::autologin::CommandOutput;
 use crate::helper::{Host, LiveProcess, NewUser};
 
 /// The fake clock's time.
@@ -37,8 +38,16 @@ pub(crate) struct State {
     /// Every `pause` so far.
     pub(crate) pauses: usize,
     /// Calls that fail, by name ("uid_taken", "make_home", "create_user",
-    /// "delete_user", "bootout gui", "kill_all", "live_processes").
+    /// "delete_user", "bootout gui", "kill_all", "live_processes", "command",
+    /// "reset_password").
     pub(crate) fail: BTreeSet<&'static str>,
+    /// What `command` answers, by the command's text (`program arg ...`). A command
+    /// with no answer succeeds and prints nothing, except `fdesetup isactive`, which
+    /// prints `false` (FileVault off).
+    pub(crate) answers: BTreeMap<String, CommandOutput>,
+    /// A file each `command` reads, logging what it holds: shows what the intent record
+    /// said when each program ran.
+    pub(crate) intent: Option<PathBuf>,
 }
 
 /// The fake host; clones share their state.
@@ -127,6 +136,40 @@ impl Host for FakeHost {
                 command: format!("proc{i}"),
             })
             .collect())
+    }
+
+    fn command(&self, program: &str, args: &[&str]) -> io::Result<CommandOutput> {
+        let text = std::iter::once(program)
+            .chain(args.iter().copied())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let seen = match &self.state().intent {
+            Some(file) => match std::fs::read_to_string(file) {
+                Ok(held) => format!(" (intent {})", held.trim_end()),
+                Err(_) => " (no intent)".to_owned(),
+            },
+            None => String::new(),
+        };
+        self.call("command", format!("command {text}{seen}"))?;
+        let state = self.state();
+        Ok(match state.answers.get(&text) {
+            Some(answer) => answer.clone(),
+            None if text == "/usr/bin/fdesetup isactive" => CommandOutput {
+                success: false,
+                stdout: "false\n".to_owned(),
+                stderr: String::new(),
+            },
+            None => CommandOutput {
+                success: true,
+                ..CommandOutput::default()
+            },
+        })
+    }
+
+    /// The password is `pw-<name>`.
+    fn reset_password(&self, name: &str) -> io::Result<String> {
+        self.call("reset_password", format!("reset_password {name}"))?;
+        Ok(format!("pw-{name}"))
     }
 
     fn pause(&self) {

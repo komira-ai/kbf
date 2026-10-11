@@ -181,10 +181,11 @@ daemon restart is **planned**. Today a restarted daemon lists nothing of its
 predecessor's, and before its `Hello` its driver ends every run that predecessor left on
 the node (issue #155), so what is requeued after the handover grace no longer runs there.
 The grace rests on the older process fencing T after it was last heard; a process that
-was killed fences nothing, so for its runs the restarted daemon's sweep is the guarantee,
-and it holds only when a daemon is started again on the same node with the same scratch
-directory. The runs of a killed daemon that is not are left running, unfenced (see
-[daemon.md](daemon.md#when-the-daemon-is-killed)).
+was killed fences nothing. For its runs, each run's keeper (a process that ends the run
+when the daemon dies) is the guarantee whether or not a daemon is started again, and the
+restarted daemon's sweep is the second line, when a daemon is started again on the same
+node with the same scratch directory. What neither reaches is listed in
+[daemon.md](daemon.md#when-the-daemon-is-killed).
 
 ## QoS
 
@@ -329,12 +330,12 @@ to the scheduler's outcome and to what callers see:
 |---|---|---|---|
 | `OK`, all outputs stored | `Completed` | the `ActionResult` | written if exit code 0 and not `do_not_cache` |
 | `OK`, an output not stored | `Failed(Infra)` | `INTERNAL` | not written |
-| `DEADLINE_EXCEEDED` | `Failed(Timeout)` | `DEADLINE_EXCEEDED` | not written |
+| `DEADLINE_EXCEEDED` | `Failed(Timeout)` | `DEADLINE_EXCEEDED`, with the partial stdout and stderr digests the CAS holds, if any | not written |
 | `INVALID_ARGUMENT` | `Failed(Invalid)` | `INVALID_ARGUMENT`, with the daemon's reason | not written |
 | not `OK`, `memory_kill` own limit | `Failed(OutOfMemory)`: run again with double the memory below the cap | at the cap, `FAILED_PRECONDITION`: "kbf: the action needs more memory than any node offers: ...", with an `ErrorInfo` of reason `ACTION_OUT_OF_MEMORY` | not written |
 | not `OK`, `memory_kill` node pressure | `Failed(NodeMemoryPressure)`: run again with the same memory, twice | after the reruns, `INTERNAL`: "kbf farm fault on <node>: ..." | not written |
 | `FAILED_PRECONDITION`, every `PreconditionFailure` violation `MISSING` with a `blobs/<hash>/<size>` subject | `Failed(MissingInput)`: answered at once, never run again, no farm rerun spent | `FAILED_PRECONDITION`: "N input blob(s) are not in the CAS", with the `PreconditionFailure` listing each blob as its only detail, as the front answers before queueing; Bazel re-uploads and executes again | not written |
-| anything else | `Failed(Infra)` | `INTERNAL` | not written |
+| anything else | `Failed(Infra)` | `INTERNAL`: "the farm could not run the action"; the daemon's reason goes only to the server's log, a WARN `lease failed` line with the lease, the node, the code and the reason | not written |
 | (none: refused unrun) | `Refused` | `FAILED_PRECONDITION`, with the reason | not written |
 
 A run that exits non-zero (a failing test) is still `Completed`: callers get its

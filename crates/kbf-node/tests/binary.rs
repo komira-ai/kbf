@@ -520,8 +520,9 @@ fn id_files(name: &str, count: &str) -> PathBuf {
 }
 
 /// Catches: a driver started without what it needs (a plain-text `--cas` among
-/// them), or a configuration error that does not stop the daemon with a message and a
-/// non-zero exit.
+/// them), a configuration error that does not stop the daemon with a message and a
+/// non-zero exit, and an `--image` that a driver other than the container driver
+/// takes and ignores (the node would list images no lease of it can run).
 #[test]
 fn a_driver_missing_its_flags_refuses_to_start() {
     let dir = tls("refused");
@@ -542,6 +543,17 @@ fn a_driver_missing_its_flags_refuses_to_start() {
                 scratch.clone(),
             ],
             "must be an https:// URL",
+        ),
+        (
+            vec![
+                "--driver=native".into(),
+                format!("--image={}", image_by("0")),
+            ],
+            "only --driver container runs them",
+        ),
+        (
+            vec!["--driver=fake".into(), format!("--image={}", image_by("0"))],
+            "only --driver container runs them",
         ),
         (
             vec!["--driver=container".into(), scratch.clone()],
@@ -751,22 +763,9 @@ fn wait_for<T>(what: &str, mut read: impl FnMut() -> Option<T>) -> T {
     }
 }
 
-/// Catches (issue #155) a daemon killed by SIGKILL (as the kernel's OOM killer, or a
-/// panic that aborts, ends it) whose action outlives it and still runs when the next
-/// daemon on the node says `Hello`: the scheduler requeues a lease the new session
-/// leaves out, so the action would run twice at once (I12). The action leads its own
-/// process group, so neither the dead daemon nor the service manager ends it; the
-/// restarted daemon must kill it, and remove its lease directory, before `Hello`.
-#[test]
-fn a_restarted_daemon_ends_the_runs_it_was_killed_with_before_hello() {
-    use std::os::unix::process::ExitStatusExt as _;
-
-    let _one = one_native_daemon();
-    let dir = tls("restart");
-    let scratch = dir.join("leases");
-    let front = front::Front::start(&dir);
-    let action = front.sh("echo $$ > pid; exec sleep 300");
-    let flags = vec![
+/// The flags of a native daemon in `dir` that serves `front`, with leases under `scratch`.
+fn native_flags(front: &front::Front, dir: &Path, scratch: &Path) -> Vec<String> {
+    vec![
         format!("--server=https://127.0.0.1:{}", front.worker.port()),
         "--tls-server-name=localhost".to_owned(),
         format!("--ca-cert={}", dir.join("ca.pem").display()),
@@ -777,7 +776,99 @@ fn a_restarted_daemon_ends_the_runs_it_was_killed_with_before_hello() {
         "--driver=native".to_owned(),
         format!("--cas=https://127.0.0.1:{}", front.worker.port()),
         format!("--scratch={}", scratch.display()),
-    ];
+    ]
+}
+
+/// Reads the pid that the action wrote to `file`, waiting for it.
+fn pid_in(file: &Path) -> i32 {
+    wait_for(&format!("the pid in {}", file.display()), || {
+        let text = std::fs::read_to_string(file).ok()?;
+        text.strip_suffix('\n')?.parse().ok()
+    })
+}
+
+/// Catches (issue #155) a killed daemon's action that runs on until the daemon is
+/// started again, for as long as the work takes, or for ever when it is not: the
+/// scheduler requeues the lease after the handover grace, so the work runs twice. With
+/// no daemon started again, both the action's leader and a process it started must end
+/// within [`PROMPT`] of the SIGKILL.
+#[test]
+fn a_killed_daemons_action_ends_without_a_restart() {
+    use std::os::unix::process::ExitStatusExt as _;
+
+    let _one = one_native_daemon();
+    let dir = tls("killed");
+    let scratch = dir.join("leases");
+    let front = front::Front::start(&dir);
+    let action = front.sh("echo $$ > leader; sleep 300 & echo $! > child; wait");
+    let mut daemon = daemon(
+        &native_flags(&front, &dir, &scratch),
+        &dir.join("daemon.log"),
+    );
+    let session = front.session(PROMPT);
+    session.hello();
+    session.welcome();
+    session.start(1, 1, action);
+    let root = scratch.join("lease-1-1/root");
+    let (leader, child) = (pid_in(&root.join("leader")), pid_in(&root.join("child")));
+    assert!(!ended(leader) && !ended(child), "the action runs");
+    wait_logged(&dir.join("daemon.log"));
+    assert_eq!(
+        stop(&mut daemon, libc::SIGKILL).signal(),
+        Some(libc::SIGKILL)
+    );
+    let deadline = Instant::now() + PROMPT;
+    while !(ended(leader) && ended(child)) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let survivors: Vec<i32> = [leader, child].into_iter().filter(|&p| !ended(p)).collect();
+    // A red run must not leave the action behind: the group is still the action's, as
+    // its leader is alive or has been reaped by no one who would reuse its pid soon.
+    if !survivors.is_empty() {
+        // SAFETY: kill(2) takes plain integers; the group is the action's (above).
+        unsafe { libc::kill(-leader, libc::SIGKILL) };
+    }
+    assert!(
+        survivors.is_empty(),
+        "processes of the action {survivors:?} outlived the killed daemon by {PROMPT:?}:\n{}",
+        read(&dir.join("daemon.log"))
+    );
+}
+
+/// The live processes other than `pgid` itself in process group `pgid`, from `ps`.
+fn others_in_group(pgid: i32) -> Vec<i32> {
+    let out = Command::new("ps")
+        .args(["-A", "-o", "pid=", "-o", "pgid="])
+        .output()
+        .expect("ps");
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace().map(str::parse::<i32>);
+            Some((fields.next()?.ok()?, fields.next()?.ok()?))
+        })
+        .filter(|&(pid, group)| group == pgid && pid != pgid && !ended(pid))
+        .map(|(pid, _)| pid)
+        .collect()
+}
+
+/// Catches (issue #155) a daemon killed by SIGKILL (as the kernel's OOM killer, or a
+/// panic that aborts, ends it) whose action outlives it and still runs when the next
+/// daemon on the node says `Hello`: the scheduler requeues a lease the new session
+/// leaves out, so the action would run twice at once (I12). The action leads its own
+/// process group, so neither the dead daemon nor the service manager ends it; with its
+/// keeper killed too, the restarted daemon must kill it, and remove its lease
+/// directory, before `Hello`.
+#[test]
+fn a_restarted_daemon_ends_the_runs_it_was_killed_with_before_hello() {
+    use std::os::unix::process::ExitStatusExt as _;
+
+    let _one = one_native_daemon();
+    let dir = tls("restart");
+    let scratch = dir.join("leases");
+    let front = front::Front::start(&dir);
+    let action = front.sh("echo $$ > pid; exec sleep 300");
+    let flags = native_flags(&front, &dir, &scratch);
 
     let spawned = Instant::now();
     let mut first = daemon(&flags, &dir.join("first.log"));
@@ -787,19 +878,26 @@ fn a_restarted_daemon_ends_the_runs_it_was_killed_with_before_hello() {
     session.welcome();
     session.start(1, 1, action);
     let pid_file = scratch.join("lease-1-1/root/pid");
-    let pid: i32 = wait_for("the action's pid", || {
-        let text = std::fs::read_to_string(&pid_file).ok()?;
-        text.strip_suffix('\n')?.parse().ok()
-    });
+    let pid = pid_in(&pid_file);
     assert!(!ended(pid), "the action runs");
     // Its first survey's line, for the CI log (this daemon's is the job's first survey
     // of the runner's Xcodes): waited for, never failed on.
     wait_logged(&dir.join("first.log"));
+    // The keeper is the action's group's one other member: killed first, as the
+    // kernel's OOM killer may take it with the daemon, it leaves the sweep to act.
+    let keepers = others_in_group(pid);
+    for &keeper in &keepers {
+        // SAFETY: kill(2) on the keeper, the daemon's unreaped child, so the pid is its.
+        assert_eq!(unsafe { libc::kill(keeper, libc::SIGKILL) }, 0);
+    }
+    wait_for("the keeper's end", || {
+        keepers.iter().all(|&k| ended(k)).then_some(())
+    });
     assert_eq!(
         stop(&mut first, libc::SIGKILL).signal(),
         Some(libc::SIGKILL)
     );
-    // The premise: nothing else ends the action once its daemon is gone.
+    // The premise: nothing else ends the action once its daemon and keeper are gone.
     std::thread::sleep(Duration::from_millis(200));
     assert!(!ended(pid), "the action outlived its daemon");
 
@@ -838,6 +936,7 @@ fn a_restarted_daemon_ends_the_runs_it_was_killed_with_before_hello() {
         &lines("second.log"),
     );
     let log = read(&dir.join("second.log"));
+    assert_eq!(keepers.len(), 1, "one keeper: {keepers:?}");
     assert!(
         action_ended,
         "the action (pid {pid}) still ran when the restarted daemon said Hello:\n{log}"
@@ -847,4 +946,192 @@ fn a_restarted_daemon_ends_the_runs_it_was_killed_with_before_hello() {
         "the lease directory was still there at Hello:\n{log}"
     );
     assert!(status.success(), "{status}: {log}");
+}
+
+/// The per-architecture manifest the stub's image store holds for a pinned image.
+#[cfg(target_os = "linux")]
+const MANIFEST: &[u8] =
+    br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json"}"#;
+/// An image index (a multi-architecture list).
+#[cfg(target_os = "linux")]
+const INDEX: &[u8] =
+    br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[]}"#;
+
+/// `--image`'s value for the busybox image whose manifest is `bytes`.
+#[cfg(target_os = "linux")]
+fn image_of(bytes: &[u8]) -> String {
+    image_by(&kbf_daemon::cas::digest_of(bytes).hash)
+}
+
+/// `--image`'s value for the busybox image with manifest digest `sha256:<hex>`.
+fn image_by(hex: &str) -> String {
+    format!("docker://registry.test/tools/busybox@sha256:{hex}")
+}
+
+/// Puts `bytes` in the stub's image store (see `fixtures/podman-stub.sh`) as image
+/// `img1`'s manifest, under the digest of `bytes`, and makes the stub know `img1`.
+#[cfg(target_os = "linux")]
+fn store_manifest(bin: &Path, bytes: &[u8]) {
+    let digest = format!("sha256:{}", kbf_daemon::cas::digest_of(bytes).hash);
+    let dir = bin.join("store/img1");
+    std::fs::create_dir_all(&dir).expect("mkdir store");
+    let file = kbf_driver_container::image::manifest_file(&digest);
+    std::fs::write(dir.join(file), bytes).expect("write manifest");
+    std::fs::write(bin.join("image-id"), "img1\n").expect("image id");
+}
+
+/// The container driver's flags for the daemon in `dir`, against the server `base`
+/// names, with a delegated stand-in cgroup and `--image` once per entry of `images`.
+#[cfg(target_os = "linux")]
+fn container_flags(dir: &Path, ids: &Path, images: &[String]) -> Vec<String> {
+    let (_, cgroup_flags) = cgroup_tree(dir, "cpu memory pids");
+    let mut flags = vec![
+        "--driver=container".to_owned(),
+        "--cas=https://127.0.0.1:1".to_owned(),
+        format!("--scratch={}", dir.join("leases").display()),
+        format!("--id-files={}", ids.display()),
+    ];
+    flags.extend(cgroup_flags);
+    flags.extend(images.iter().map(|i| format!("--image={i}")));
+    flags
+}
+
+/// Catches a container node that starts while an image it is pinned to (`--image`)
+/// cannot run on it, instead of exiting with status 2 and the fix: an image missing
+/// from its store started anyway (warned about and continued), its refusal without the
+/// `podman pull <repo>@sha256:<digest>` that fixes it, an image index digest taken for
+/// one architecture's manifest (`manifest_kind` not asked), a tag accepted, only the
+/// first `--image` checked (a good image first, an index second), and only the last
+/// one deciding (an index first, a good image second). Each daemon
+/// still running after 30 s has started, and fails the test. Linux only, as the
+/// driver is.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_container_node_refuses_to_start_on_an_image_it_cannot_run() {
+    let ids = id_files("image-refused-ids", "65536");
+    let digest = kbf_daemon::cas::digest_of(MANIFEST).hash;
+    let tagged = format!("docker://registry.test/tools/busybox:1@sha256:{digest}");
+    let index = "names an image index; name the per-architecture manifest digest";
+    /// (name, the images, what the stub's store holds, what the refusal says)
+    type Case = (&'static str, Vec<String>, &'static [&'static [u8]], String);
+    let cases: [Case; 5] = [
+        (
+            "image-missing",
+            vec![image_of(MANIFEST)],
+            &[],
+            format!("podman pull registry.test/tools/busybox@sha256:{digest}"),
+        ),
+        (
+            "image-index",
+            vec![image_of(INDEX)],
+            &[INDEX],
+            index.to_owned(),
+        ),
+        (
+            "image-tag",
+            vec![tagged],
+            &[MANIFEST],
+            "names a tag".to_owned(),
+        ),
+        (
+            "image-second",
+            vec![image_of(MANIFEST), image_of(INDEX)],
+            &[MANIFEST, INDEX],
+            index.to_owned(),
+        ),
+        (
+            "image-first",
+            vec![image_of(INDEX), image_of(MANIFEST)],
+            &[INDEX, MANIFEST],
+            index.to_owned(),
+        ),
+    ];
+    for (name, images, stored, says) in cases {
+        let dir = tls(name);
+        let (bin, _) = podman_stub(&format!("{name}-bin"));
+        for bytes in stored {
+            store_manifest(&bin, bytes);
+        }
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let log = dir.join("daemon.log");
+        let mut child = Command::new(BIN)
+            .env("PATH", path)
+            .args(base(&dir))
+            .args(container_flags(&dir, &ids, &images))
+            .stderr(std::fs::File::create(&log).expect("log file"))
+            .spawn()
+            .expect("spawn");
+        let status = refused_within(&mut child, name, &log);
+        let log = read(&log);
+        assert_eq!(status.code(), Some(2), "{name}: {log}");
+        assert!(log.contains(&says), "{name}: {log}");
+        assert!(
+            !log.contains(FIRST_ATTEMPT),
+            "{name}: it tried a session: {log}"
+        );
+    }
+}
+
+/// Catches the images a container node is pinned to (`--image`) missing from the
+/// `NodeStatus` it sends after the Welcome (`GET /v1/nodes` would not show what the
+/// node can run), listed unsorted or more than once, and a node whose images are all
+/// in its store, as manifests, refusing to start. Three images given out of order, the
+/// first one twice, with distinct images at both ends: a node that drops the first or
+/// the last `--image` from its status fails the set.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_container_node_lists_its_pinned_images_in_its_status() {
+    let dir = tls("image-listed");
+    let front = front::Front::start(&dir);
+    let ids = id_files("image-listed-ids", "65536");
+    let (bin, _) = podman_stub("image-listed-bin");
+    let other = br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","layers":[]}"#;
+    let third = br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{},"layers":[]}"#;
+    store_manifest(&bin, MANIFEST);
+    store_manifest(&bin, other);
+    store_manifest(&bin, third);
+    let mut images = [image_of(MANIFEST), image_of(other), image_of(third)];
+    images.sort();
+    let given = [
+        images[2].clone(),
+        images[0].clone(),
+        images[0].clone(),
+        images[1].clone(),
+    ];
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let log = dir.join("daemon.log");
+    let mut flags = vec![
+        format!("--server=https://127.0.0.1:{}", front.worker.port()),
+        "--tls-server-name=localhost".to_owned(),
+        format!("--ca-cert={}", dir.join("ca.pem").display()),
+        format!("--cert={}", dir.join("node.pem").display()),
+        format!("--key={}", dir.join("node.key").display()),
+        "--node-id=node-1".to_owned(),
+    ];
+    flags.extend(container_flags(&dir, &ids, &given));
+    let mut child = Command::new(BIN)
+        .env("PATH", path)
+        .args(flags)
+        .stderr(std::fs::File::create(&log).expect("log file"))
+        .spawn()
+        .expect("spawn");
+    let session = front.session(PROMPT);
+    session.hello();
+    session.welcome();
+    let status = session.next(PROMPT);
+    let stopped = stop(&mut child, libc::SIGTERM);
+    let log = read(&log);
+    let Some(kbf_proto::worker::daemon_message::Message::NodeStatus(status)) = status else {
+        panic!("expected a NodeStatus, got {status:?}: {log}");
+    };
+    assert_eq!(status.container_images, images, "{log}");
+    assert!(stopped.success(), "{stopped}: {log}");
 }

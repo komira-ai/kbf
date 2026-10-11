@@ -151,7 +151,12 @@ fn a_lookup_runs_sandboxed_and_sets_or_removes_developer_dir() {
     };
     let own = lookup(xcrun, None, "cc", &sandbox);
     assert_eq!(own.get_program(), crate::network::SANDBOX_EXEC);
-    let profile = format!("{}{}", crate::network::NO_NETWORK_PROFILE, sandbox.rules);
+    let profile = format!(
+        "{}{}{}",
+        crate::network::NO_NETWORK_PROFILE,
+        crate::network::NO_DEVICE_RULES,
+        sandbox.rules
+    );
     assert_eq!(
         own.get_args().collect::<Vec<_>>(),
         [

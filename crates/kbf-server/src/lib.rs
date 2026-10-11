@@ -46,12 +46,14 @@ pub mod fleet;
 pub mod grpc_health;
 pub mod health;
 pub mod identity;
+mod machine;
 pub mod mdm;
 mod memory;
 mod missing;
 pub mod rollout;
 pub mod serve;
 mod stamp;
+mod timeout;
 pub mod token;
 pub mod worker;
 

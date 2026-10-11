@@ -1,6 +1,8 @@
 //! The Execute join end to end, in one process: a REAPI client, the server, and a fake
 //! daemon on the worker stream. Each test drives the wire on both sides.
 
+#[path = "execute/failure_log.rs"]
+mod failure_log;
 #[path = "execute/memory.rs"]
 mod memory;
 #[path = "execute/missing.rs"]
@@ -283,7 +285,8 @@ async fn do_not_cache_is_neither_joined_nor_cached() {
 }
 
 /// Catches: a failing action (non-zero exit) written to the action cache, which would
-/// answer every later build with the failure (RFC 5.8: failures are not cached).
+/// answer every later build with the failure (`docs/design/scheduler.md#outcomes`: a
+/// failure is not cached).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_failing_action_is_answered_but_not_cached() {
     let cell = Cell::start().await;
@@ -299,16 +302,18 @@ async fn a_failing_action_is_answered_but_not_cached() {
 }
 
 /// Catches: an attempt's failure passed to the callers as the daemon's status rather
-/// than the RFC's (INTERNAL for the farm's failure, DEADLINE_EXCEEDED for a timeout);
-/// an INVALID_ARGUMENT (the action's own fault, such as an image named by tag) turned
-/// into INTERNAL, which a client retries, or answered without the daemon's reason; a
-/// failed attempt placed again instead of answered (each case's Start must name its
-/// own action); an OK result whose outputs were never uploaded, or that carries no result at all,
-/// accepted as a result (callers would get files nobody can fetch); a failed attempt
-/// that also carries a valid `ActionResult` taken as completed (the protocol sets
-/// `action_result` only with OK); and a failure written to the action cache.
+/// than the status `docs/design/scheduler.md#outcomes` names (INTERNAL for the farm's
+/// failure, DEADLINE_EXCEEDED for a timeout); an INVALID_ARGUMENT (the action's own
+/// fault, such as an image named by tag) turned into INTERNAL, which a client retries,
+/// or answered without the daemon's reason; a failed attempt placed again instead of
+/// answered (each case's Start must name its own action); an OK result whose outputs
+/// were never uploaded, or that carries no result at all, accepted as a result (callers
+/// would get files nobody can fetch); a failed attempt that also carries a valid
+/// `ActionResult` taken as completed (the protocol sets `action_result` only with OK,
+/// or with DEADLINE_EXCEEDED for the logs alone, which a result without logs does not
+/// have); and a failure written to the action cache.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn failed_attempts_answer_with_the_rfc_codes() {
+async fn failed_attempts_answer_with_the_documented_codes() {
     let cell = Cell::start().await;
     let mut daemon = cell.daemon("node-a", 8, 16).await;
     let never_uploaded = ActionResult {
@@ -378,6 +383,74 @@ async fn failed_attempts_answer_with_the_rfc_codes() {
             // The daemon's reason (`failed` sends "test") reaches the client.
             assert_eq!(status.message, "test", "{name}");
         }
+        assert_eq!(
+            cell.cached(&job.action).await,
+            Err(Code::NotFound),
+            "{name}"
+        );
+    }
+}
+
+/// Catches (issue #45): a timed-out action answered DEADLINE_EXCEEDED without the
+/// stdout and stderr it wrote before it was stopped, which REAPI lets the server
+/// return; a partial result that keeps the daemon's outputs or exit code (only the
+/// two logs are partial output, and an output of a stopped action may be half
+/// written); a log digest passed on although its blob is not in the CAS (the client
+/// could not fetch it), or one missing log taking the other with it; a partial result
+/// answered without the node it ran on; and a partial result written to the action
+/// cache (a timeout is never cached, and exit code 0 with an output would be).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_timed_out_action_answers_with_its_partial_stdout_and_stderr() {
+    let cell = Cell::start().await;
+    let mut daemon = cell.daemon("node-a", 4, 8).await;
+    let (stdout, stderr) = (Blob::new("started\n"), Blob::new("warming up\n"));
+    cell.upload(&[&stdout, &stderr]).await;
+    let never_uploaded = Blob::new("never uploaded");
+    let stored = output(&cell, "half written", 0).await;
+    let logs = |out: &Blob, err: &Blob| ActionResult {
+        stdout_digest: Some(out.proto.clone()),
+        stderr_digest: Some(err.proto.clone()),
+        ..stored.clone()
+    };
+    let only = |out: Option<&Blob>, err: Option<&Blob>| ActionResult {
+        stdout_digest: out.map(|b| b.proto.clone()),
+        stderr_digest: err.map(|b| b.proto.clone()),
+        ..ActionResult::default()
+    };
+    let cases = [
+        (
+            "both logs",
+            logs(&stdout, &stderr),
+            Some(only(Some(&stdout), Some(&stderr))),
+        ),
+        (
+            "stderr not stored",
+            logs(&stdout, &never_uploaded),
+            Some(only(Some(&stdout), None)),
+        ),
+        (
+            "stdout not stored",
+            logs(&never_uploaded, &stderr),
+            Some(only(None, Some(&stderr))),
+        ),
+        (
+            "neither stored",
+            logs(&never_uploaded, &never_uploaded),
+            None,
+        ),
+    ];
+    for (name, reported, want) in cases {
+        let job = Job::new(name, &[]);
+        cell.upload(&job.blobs()).await;
+        let mut ops = cell.execute(&job.action).await;
+        let start = daemon.start().await;
+        let mut report = failed(start.lease_id, Code::DeadlineExceeded);
+        report.action_result = Some(reported);
+        assert!(daemon.report(report).await.accepted, "{name}");
+        let answer = support::stamped_response(&done(&mut ops).await);
+        let status = answer.status.expect("a status");
+        assert_eq!(status.code, Code::DeadlineExceeded as i32, "{name}");
+        assert_eq!(answer.result.map(support::unstamped), want, "{name}");
         assert_eq!(
             cell.cached(&job.action).await,
             Err(Code::NotFound),
@@ -509,6 +582,58 @@ async fn a_finished_operation_is_waited_on_within_the_retention_then_not_found()
 
     tokio::time::sleep(retention + Duration::from_millis(500)).await;
     assert_eq!(wait_name(&cell, &name).await, Err(Code::NotFound));
+}
+
+/// Catches: forgetting the channel of another caller than the one whose operation was
+/// dropped, such as the lowest-numbered (`pop_first`) or highest-numbered (`pop_last`)
+/// kept caller instead of the forgotten one. Three callers run at once; the middle
+/// one's operation finishes and, with a zero retention, is dropped at once. The
+/// callers numbered below and above it must still be found by WaitExecution, and both
+/// their Execute and WaitExecution streams get their results.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn forgetting_one_caller_keeps_the_channels_of_lower_and_higher_callers() {
+    let cell = Cell::start_with(kbf_sched::UNSERVABLE_WAIT, Duration::ZERO).await;
+    let mut daemon = cell.daemon("node-a", 8, 16).await;
+    let jobs = ["lower", "middle", "higher"].map(|argv| Job::new(argv, &[]));
+    let mut ops = Vec::new();
+    let mut names = Vec::new();
+    for job in &jobs {
+        cell.upload(&job.blobs()).await;
+        let mut stream = cell.execute(&job.action).await;
+        let first = stream
+            .message()
+            .await
+            .expect("a stream")
+            .expect("an update");
+        names.push(first.name);
+        ops.push(stream);
+    }
+    let mut leases = Vec::new();
+    for _ in &jobs {
+        let start = daemon.start().await;
+        let at = jobs
+            .iter()
+            .position(|job| start.action_digest.as_ref() == Some(&job.action.proto))
+            .expect("a Start for one of the jobs");
+        leases.push((at, start.lease_id));
+    }
+    leases.sort_by_key(|(at, _)| *at);
+
+    let middle = output(&cell, "middle", 0).await;
+    assert!(daemon.report(ran(leases[1].1, &middle)).await.accepted);
+    assert_eq!(response(&done(&mut ops[1]).await).result, Some(middle));
+    assert_eq!(wait_name(&cell, &names[1]).await, Err(Code::NotFound));
+
+    for kept in [0, 2] {
+        let mut waited = wait_stream(&cell, &names[kept]).await.expect("still kept");
+        let result = output(&cell, &format!("kept {kept}"), 0).await;
+        assert!(daemon.report(ran(leases[kept].1, &result)).await.accepted);
+        assert_eq!(
+            response(&done(&mut ops[kept]).await).result,
+            Some(result.clone())
+        );
+        assert_eq!(response(&done(&mut waited).await).result, Some(result));
+    }
 }
 
 /// WaitExecution on `name`: its stream, or the code.
