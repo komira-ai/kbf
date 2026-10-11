@@ -216,6 +216,29 @@ fn rows() -> Vec<Row> {
             "OOMScoreAdjust=-1001\n",
             "FAIL oom: MinIO's OOMScoreAdjust=-1001 is below -1000",
         ),
+        // The floor itself is allowed (`<` tightened to `<=` would refuse it).
+        row(
+            "minio-oom-at-floor",
+            Minio,
+            "OOMScoreAdjust=-950\n",
+            "OOMScoreAdjust=-1000\n",
+            "UNITS OK: MinIO -1000 < kbf-server -925",
+        ),
+        // Ties: two services at one score are killed in no defined order.
+        row(
+            "minio-oom-tied-server",
+            Minio,
+            "OOMScoreAdjust=-950\n",
+            "OOMScoreAdjust=-925\n",
+            "FAIL oom: MinIO's OOMScoreAdjust=-925 must be below kbf-server's -925",
+        ),
+        row(
+            "server-oom-tied-daemon",
+            Server,
+            "OOMScoreAdjust=-925\n",
+            "OOMScoreAdjust=-900\n",
+            "FAIL oom: kbf-server's OOMScoreAdjust=-900 must be below kbf-daemon's -900",
+        ),
         row(
             "daemon-oom-above-containers",
             Daemon,
@@ -261,6 +284,13 @@ fn rows() -> Vec<Row> {
             "CPUWeight=300\n",
             "CPUWeight=500\n",
             "FAIL cpu: MinIO's CPUWeight=400 must be above kbf-server's 500",
+        ),
+        row(
+            "server-cpu-tied-minio",
+            Server,
+            "CPUWeight=300\n",
+            "CPUWeight=400\n",
+            "FAIL cpu: MinIO's CPUWeight=400 must be above kbf-server's 400",
         ),
         row(
             "daemon-cpu-above-server",
@@ -502,7 +532,7 @@ fn each_planted_defect_turns_its_rule_red() {
         }
     }
     assert_eq!(wrong, Vec::<String>::new());
-    assert_eq!(rows.len(), 39, "rows");
+    assert_eq!(rows.len(), 43, "rows");
 }
 
 #[test]
