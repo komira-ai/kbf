@@ -4,20 +4,18 @@
 //! On start it prints one line, `kbf-server <version> reapi=<addr> worker=<addr>`, with
 //! its version (`<package version>+<commit>`, [`kbf_server::SERVER_VERSION`]) and
 //! the addresses it bound (a port of 0 picks a free one), and ` api=<addr>` at its end
-//! when the operator API listens, then ` warning=reapi-plaintext-bind` at its very end
-//! when `--reapi-plaintext-bind` let the REAPI listener serve plain text on an address
-//! that is not loopback. On Unix the SIGINT and SIGTERM handlers are installed
-//! before that line is printed, so either signal any time after it stops the server
-//! with exit 0: open Execute and WaitExecution streams end UNAVAILABLE, REAPI
-//! connections are sent GOAWAY, and the server exits once they close or
-//! `--shutdown-timeout-secs` runs out (issue #168). If a handler cannot be installed it
-//! exits 2 without printing the start line.
+//! when the operator API listens, then ` warning=plaintext-off-loopback:<listeners>` at
+//! its very end when a listener serves plain text on an address that is not loopback
+//! (`<listeners>` is `reapi`, `worker` or `reapi,worker`; see
+//! [`Args::plain_text_off_loopback`]). The server starts either way. On Unix the
+//! SIGINT and SIGTERM handlers are installed before that line is printed, so either
+//! signal any time after it stops the server with exit 0: open Execute and
+//! WaitExecution streams end UNAVAILABLE, REAPI connections are sent GOAWAY, and the
+//! server exits once they close or `--shutdown-timeout-secs` runs out (issue #168). If
+//! a handler cannot be installed it exits 2 without printing the start line.
 //!
 //! The REAPI listener runs the policy `--reapi-auth-policy` names; a policy file that
 //! cannot be read or is not a policy exits 2 before anything is bound.
-//!
-//! A listener that would serve plain text on an address that is not loopback exits 2
-//! before anything is bound, naming the flags that fix it (see [`Args::listeners`]).
 
 use std::error::Error;
 use std::future::Future;
@@ -69,28 +67,28 @@ async fn run<O: ObjectStore + 'static>(
     let shutdown = interrupted()?;
     let api = args.api()?;
     let bound = bind_server_with_policy(cache, listeners, api, policy, shutdown)?;
-    let warning = args.reapi_plaintext_off_loopback();
+    let plain = args.plain_text_off_loopback();
     println!(
         "{}",
-        start_line(bound.reapi, bound.worker, bound.api, warning)
+        start_line(bound.reapi, bound.worker, bound.api, &plain)
     );
     bound.serving.await?;
     Ok(())
 }
 
-/// The start line: the version and the addresses bound, and a warning when the REAPI
-/// listener serves plain text on an address that is not loopback.
+/// The start line: the version and the addresses bound, and one warning naming the
+/// listeners in `plain` (those serving plain text off loopback) when there are any.
 fn start_line(
     reapi: SocketAddr,
     worker: SocketAddr,
     api: Option<SocketAddr>,
-    reapi_plaintext_off_loopback: bool,
+    plain: &[&str],
 ) -> String {
     let api = api.map(|a| format!(" api={a}")).unwrap_or_default();
-    let warning = if reapi_plaintext_off_loopback {
-        " warning=reapi-plaintext-bind"
+    let warning = if plain.is_empty() {
+        String::new()
     } else {
-        ""
+        format!(" warning=plaintext-off-loopback:{}", plain.join(","))
     };
     format!("kbf-server {SERVER_VERSION} reapi={reapi} worker={worker}{api}{warning}")
 }
