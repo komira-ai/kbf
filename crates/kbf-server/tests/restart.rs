@@ -8,11 +8,17 @@
 //! and be written to the action cache under its action's digest. Likewise a client can
 //! still hold an operation name of the process before a restart and call
 //! `WaitExecution` with it on the next one.
+//!
+//! Under `--meta-log=raft` ([`Cell::start_raft`], restarted with [`Cell::cold_restart`])
+//! `Welcome` names the log id as the lease epoch, the same at every start, so the
+//! daemon keeps its old runs across a restart; the lease term, the Raft term of each
+//! start, is what keeps their results from being taken for the new process's leases.
 
 mod support;
 
 use std::time::Duration;
 
+use kbf_front::MetaLog;
 use kbf_proto::google::longrunning::Operation;
 use kbf_proto::reapi::{ExecuteOperationMetadata, WaitExecutionRequest};
 use prost::Message;
@@ -211,6 +217,143 @@ async fn a_finished_operation_s_name_stays_unknown_after_a_restart() {
 
     let after = before.restart().await;
     let y = Job::new("y, after the restart (X finished)", &[]);
+    let (y_name, _daemon, _y_ops) = run_y(&after, &y).await;
+
+    assert_unknown_after_restart(&after, &x_name, &x, &y).await;
+    let waited = wait_first(&after, &y_name).await.map(|op| op.name);
+    assert_eq!(waited, Ok(y_name), "Y's own name");
+}
+
+/// The Raft term the log elected `cell`'s server in.
+fn raft_term(cell: &Cell) -> u64 {
+    cell.raft_log()
+        .leadership()
+        .expect("a Raft log names its leader")
+        .term
+}
+
+/// Catches a `Welcome` under the Raft log that does not name the log id as the lease
+/// epoch: one that names the Raft term (it rises at every start's election, so a daemon
+/// would kill the runs of its leases at every restart), or a new `process_term` per
+/// start, as `--meta-log=memory` does. Two starts over one raft directory must name
+/// the same epoch, the log id, which is not 0 (a daemon reads 0 as "no epoch named").
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_start_over_one_raft_log_names_the_log_id_as_the_lease_epoch() {
+    let before = Cell::start_raft().await;
+    let log_id = before.raft_log().log_id().get();
+    let mut first = before.daemon("node-a", 4, 8).await;
+    assert_ne!(first.epoch, 0, "Welcome named no epoch");
+    assert_eq!(first.epoch, log_id, "Welcome does not name the log id");
+
+    let after = before.cold_restart().await;
+    first.closed().await;
+    let second = after.daemon("node-a", 4, 8).await;
+    assert_eq!(
+        second.epoch, first.epoch,
+        "a restart over one raft directory changed the lease epoch"
+    );
+}
+
+/// Catches leases under the Raft log granted under a term of the process's own
+/// (`process_term`) instead of the Raft term the log elected the server in, and a term
+/// read before the election (0). Each start's term is greater than the last, so a
+/// lease id of one start never names a lease of another.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_lease_under_the_raft_log_carries_the_raft_term() {
+    let before = Cell::start_raft().await;
+    let term = raft_term(&before);
+    assert_ne!(term, 0, "the term was read before the election");
+    let mut old = before.daemon("node-a", 4, 8).await;
+    let x = Job::new("x, under the first Raft term", &[]);
+    before.upload(&x.blobs()).await;
+    let _x_ops = before.execute(&x.action).await;
+    let lease = old.start().await.lease_id.expect("a lease id");
+    assert_eq!(lease.term, term, "the lease is not of the Raft term");
+
+    let after = before.cold_restart().await;
+    old.closed().await;
+    let next = raft_term(&after);
+    assert!(next > term, "Raft term {next} after {term}");
+    let mut daemon = after.daemon("node-a", 4, 8).await;
+    let y = Job::new("y, under the next Raft term", &[]);
+    after.upload(&y.blobs()).await;
+    let _y_ops = after.execute(&y.action).await;
+    let lease = daemon.start().await.lease_id.expect("a lease id");
+    assert_eq!(
+        lease.term, next,
+        "the lease is not of the restart's Raft term"
+    );
+}
+
+/// Catches issue #137 under the Raft log: the epoch no longer changes at a restart, so
+/// the daemon keeps the old process's lease and sends its `Result` to the new process,
+/// which has granted the same node its first lease, with the same `seq`, for another
+/// action. A server that matched a `Result` on the seq within its epoch (taking the
+/// lease's term to be its own) would accept it as the new lease's. It must be refused,
+/// answer nobody and stay out of the action cache, and the new lease's own `Result`
+/// must still be accepted. The `Result`s name no action, as an older daemon's do, so
+/// the lease id is all that refuses it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_restart_over_the_raft_log_refuses_the_old_process_s_results() {
+    let before = Cell::start_raft().await;
+    let mut old = before.daemon("node-a", 4, 8).await;
+    let x = Job::new("x, before the raft restart", &[]);
+    before.upload(&x.blobs()).await;
+    let _x_ops = before.execute(&x.action).await;
+    let old_lease = old.start().await.lease_id.expect("a lease id");
+    let old_result = output(&before, "from the old process's run", 0).await;
+
+    let after = before.cold_restart().await;
+    old.closed().await;
+    let mut daemon = after.daemon("node-a", 4, 8).await;
+    assert_eq!(
+        daemon.epoch, old.epoch,
+        "the daemon would have killed the old run"
+    );
+    let y = Job::new("y, after the raft restart", &[]);
+    after.upload(&y.blobs()).await;
+    let mut y_ops = after.execute(&y.action).await;
+    let lease = daemon.start().await.lease_id.expect("a lease id");
+    assert_eq!(
+        lease.seq, old_lease.seq,
+        "the test needs one seq in both terms"
+    );
+
+    let ack = daemon.report(ran(Some(old_lease), &old_result)).await;
+    assert!(
+        !ack.accepted,
+        "the old process's Result of {old_lease:?} was accepted as {lease:?}'s"
+    );
+    assert!(
+        !done_within_quiet(&mut y_ops).await,
+        "the old run answered the new action"
+    );
+    assert_eq!(after.cached(&y.action).await, Err(Code::NotFound));
+
+    let result = output(&after, "from the new process's run", 0).await;
+    assert!(daemon.report(ran(Some(lease), &result)).await.accepted);
+    assert_eq!(response(&done(&mut y_ops).await).result, Some(result));
+}
+
+/// Catches issue #154 under the Raft log: operation names written with the lease epoch
+/// (the log id, the same at every start) instead of the term. A client holds X's name
+/// from before a restart over one raft directory; the new process runs Y under the
+/// same waiter number. WaitExecution with X's name must answer NOT_FOUND, and Y's own
+/// name must find Y.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_restart_over_the_raft_log_does_not_answer_the_old_operation_names() {
+    let before = Cell::start_raft().await;
+    let mut old = before.daemon("node-a", 4, 8).await;
+    let x = Job::new("x, before the raft restart (names)", &[]);
+    before.upload(&x.blobs()).await;
+    let mut x_ops = before.execute(&x.action).await;
+    let x_name = first_name(&mut x_ops).await;
+    old.start().await;
+
+    let after = before.cold_restart().await;
+    old.closed().await;
+    drop(x_ops);
+    let y = Job::new("y, after the raft restart (names)", &[]);
     let (y_name, _daemon, _y_ops) = run_y(&after, &y).await;
 
     assert_unknown_after_restart(&after, &x_name, &x, &y).await;

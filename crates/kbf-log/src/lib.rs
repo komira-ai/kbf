@@ -68,6 +68,12 @@ impl FarmLogId {
     pub const fn get(self) -> u64 {
         self.0.get()
     }
+
+    /// The raw number, as the non-zero number it is.
+    #[must_use]
+    pub const fn non_zero(self) -> NonZeroU64 {
+        self.0
+    }
 }
 
 /// Sixteen lowercase hex digits, the form object key prefixes use.

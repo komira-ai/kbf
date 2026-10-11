@@ -271,10 +271,13 @@ with what exists today and the probes still to run. In short:
   and placement prefers a worker that already has an action's inputs.
 
 What already holds for this shape in the single-server code: the seams above, lease
-ids that carry the granting process's term, a scheduler that refuses results from
-leases it does not hold, a lease epoch in `Welcome` that makes a daemon drop leases a
-restarted server never granted, and a daemon protocol in which only the newest stream
-of a worker counts. See [scheduler.md](docs/design/scheduler.md#more-than-one-server).
+ids that carry the granting process's term (the Raft term under `--meta-log=raft`), a
+scheduler that refuses results from leases it does not hold, a lease epoch in
+`Welcome` that makes a daemon drop leases a restarted server never granted (under
+`--meta-log=raft` the epoch is the log id, the same at every start, so the daemon keeps
+its runs, and until the scheduler's state is in the log a restart leaves them running
+as orphans whose results are refused), and a daemon protocol in which only the newest
+stream of a worker counts. See [scheduler.md](docs/design/scheduler.md#more-than-one-server).
 
 ## Security model
 

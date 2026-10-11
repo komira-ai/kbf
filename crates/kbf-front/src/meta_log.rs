@@ -9,6 +9,7 @@
 //! the same over either.
 
 use std::future::Future;
+use std::num::NonZeroU64;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use kbf_meta::{Applied, Command, Epoch, MetaState, Retention};
@@ -36,6 +37,25 @@ pub trait MetaLog: Send + Sync + 'static {
     where
         F: FnOnce(&MetaState) -> R + Send,
         R: Send;
+
+    /// The log's id and the term this server leads it in, for a log that outlives
+    /// the process (`kbf-server`'s `RaftMetaLog`). `kbf-server` grants leases under
+    /// the term and names the id as its lease epoch, so every start over one log
+    /// names the same epoch. `None`, the default, for a log of this process alone.
+    fn leadership(&self) -> Option<Leadership> {
+        None
+    }
+}
+
+/// What [`MetaLog::leadership`] names: a durable log's id, and the term of its
+/// leader on this server.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Leadership {
+    /// The log's id, drawn when the log was created and the same for its life.
+    pub log_id: NonZeroU64,
+    /// The term this server leads the log in. A single voter elects itself at every
+    /// start, so each start's term is greater than every earlier start's.
+    pub term: u64,
 }
 
 /// The single-process metadata log: one [`MetaState`] behind a lock, every command

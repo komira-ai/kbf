@@ -19,6 +19,11 @@
 //!   applies under its lock: one commit at a time, no group commit yet.
 //! - **Queries** read this server's applied state. A single voter is always its own
 //!   leader, so that is the committed state.
+//! - **Leadership** ([`MetaLog::leadership`]): the log id and the term the open
+//!   elected this server in. With no peer, nothing can take the leadership away, so
+//!   the term is the same for the life of the process, and every start's is greater
+//!   than every earlier start's. The farm grants its leases under this term and names
+//!   the log id as its lease epoch in `Welcome` ([`crate::farm`]).
 //! - **Farm time** continues from the committed one: at open the log takes the
 //!   applied farm time as its base, and [`RaftMetaLog::now`] is the base plus the time
 //!   since the open, so it never goes back across restarts. A task commits
@@ -41,7 +46,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::Duration;
 
-use kbf_front::{MetaLog, MetaLogError};
+use kbf_front::{Leadership, MetaLog, MetaLogError};
 use kbf_log::{Bootstrap, DecodeError, EncodeError, FarmLogId, Format, LogCommand};
 use kbf_meta::{Applied, Command, MetaState, Retention};
 use kbf_objstore::{KeyError, KeyPrefix};
@@ -135,6 +140,8 @@ pub struct RaftMetaLog<F: Fs = StdFs> {
 struct Shared<F: Fs> {
     host: Mutex<RaftHost<F>>,
     log_id: FarmLogId,
+    /// The term the open elected this server in.
+    term: u64,
     prefix: KeyPrefix,
     /// The farm time applied when the log opened.
     base: FarmTime,
@@ -227,6 +234,7 @@ where
         let shared = Arc::new(Shared {
             base: host.machine().meta().now(),
             bootstraps: host.machine().bootstraps(),
+            term: host.core().hard_state().term.0,
             host: Mutex::new(host),
             log_id,
             prefix,
@@ -302,6 +310,13 @@ where
         R: Send,
     {
         Ok(f(self.shared.lock().machine().meta()))
+    }
+
+    fn leadership(&self) -> Option<Leadership> {
+        Some(Leadership {
+            log_id: self.shared.log_id.non_zero(),
+            term: self.shared.term,
+        })
     }
 }
 

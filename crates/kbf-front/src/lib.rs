@@ -60,7 +60,7 @@ pub use crate::execution::{
     ExecutionService, Finished, GPU_KEY, LEASE_KIND_KEY, LEASE_KINDS, NO_WORKER_REASON,
     OperationStream, Stage, Submission, Ticket, closing,
 };
-pub use crate::meta_log::{MemoryMetaLog, MetaLog, MetaLogError};
+pub use crate::meta_log::{Leadership, MemoryMetaLog, MetaLog, MetaLogError};
 
 /// The most blob data one `BatchUpdateBlobs` or `BatchReadBlobs` call may carry,
 /// advertised in the capabilities. Larger blobs go through ByteStream.
