@@ -182,13 +182,6 @@ const IMAGE_UNUSABLE: u8 = 2;
 /// An `--image` this node cannot run: missing from the image store, an index, or not
 /// an image by digest. The daemon exits with [`IMAGE_UNUSABLE`].
 #[derive(Debug)]
-#[cfg_attr(
-    not(target_os = "linux"),
-    expect(
-        dead_code,
-        reason = "only the container driver, Linux-only, checks images"
-    )
-)]
 struct ImageUnusable(String);
 
 impl std::fmt::Display for ImageUnusable {
