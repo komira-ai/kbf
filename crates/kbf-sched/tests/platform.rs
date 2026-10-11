@@ -152,8 +152,9 @@ fn an_action_goes_only_to_a_worker_that_satisfies_its_platform() {
 #[test]
 fn a_node_without_ios_device_entries_is_never_offered_a_device_lease() {
     let mut h = Harness::new();
-    h.worker("a-mac", mac());
-    h.worker("b-linux", linux());
+    // The Linux node first by name: a device request read as an empty one lands on it.
+    h.worker("a-linux", linux());
+    h.worker("b-mac", mac());
     let platforms: [&[(&str, &str)]; 2] = [
         &[("ios.device", "1")],
         &[("OSFamily", "Darwin"), ("ios.device.os", "26.0")],
