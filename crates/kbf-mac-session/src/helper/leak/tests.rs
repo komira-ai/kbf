@@ -415,12 +415,14 @@ fn a_baseline_that_cannot_be_written_is_refused() {
 /// a failed reboot reported as done.
 #[test]
 fn reboot_dirty_needs_the_helpers_own_dirty_scan() {
-    let rig = baselined("leak-reboot");
-    let refused = |rig: &Rig| {
+    // A function, not a closure, so a failure names the line of the step it checks.
+    #[track_caller]
+    fn refused(rig: &Rig) {
         let error = rig.helper.reboot_dirty().unwrap_err();
         assert!(error.contains("did not come back dirty"), "{error}");
         assert!(log(rig).iter().all(|call| !call.contains(REBOOT)));
-    };
+    }
+    let rig = baselined("leak-reboot");
     refused(&rig);
     rig.helper.scan().unwrap();
     refused(&rig);
