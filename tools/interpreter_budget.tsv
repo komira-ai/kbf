@@ -34,14 +34,7 @@ tools/mac-provision/test/fakecmd	tests of kbf-mac-provision; to become Rust test
 tools/mac-provision/test/hosted-macos.sh	tests of kbf-mac-provision; to become Rust tests of its crate
 tools/mac-provision/test/mutants.sh	tests of kbf-mac-provision; to become Rust tests of its crate
 tools/mac-provision/test/run.sh	tests of kbf-mac-provision; to become Rust tests of its crate
-tools/spike/build_budget.sh	hosted runner spike; to be deleted
-tools/spike/delegated_inner.sh	hosted runner spike; to be deleted
-tools/spike/delegation.sh	hosted runner spike; to be deleted
-tools/spike/fsync_probe.py	hosted runner spike; to be deleted
-tools/spike/host_facts.sh	hosted runner spike; to be deleted
-tools/spike/io_hog.sh	hosted runner spike; to be deleted
-tools/spike/io_slices.sh	hosted runner spike; to be deleted
-tools/spike/lib.sh	hosted runner spike; to be deleted
+tools/spike/lib.sh	SPIKE line helpers for the XCUITest sandbox check; goes with it
 tools/spike/macos/automation_mode.sh	macOS probe kit; to be deleted once its findings are documented
 tools/spike/macos/fixtures/gen_projects.py	generates the XCUITest fixture projects; to be ported to Rust or deleted
 tools/spike/macos/fixtures/run.sh	XCUITest sandbox check (spike-xcuitest workflow); to become a Rust macOS test
@@ -57,11 +50,6 @@ tools/spike/macos/test/run.sh	macOS probe kit; to be deleted once its findings a
 tools/spike/macos/verdicts.sh	macOS probe kit; to be deleted once its findings are documented
 tools/spike/macos/volume_owner.sh	macOS probe kit; to be deleted once its findings are documented
 tools/spike/macos/xcuitest_sandbox.sh	XCUITest sandbox check (spike-xcuitest workflow); to become a Rust macOS test
-tools/spike/mem_hog.py	hosted runner spike; to be deleted
-tools/spike/memory_high.sh	hosted runner spike; to be deleted
-tools/spike/no_network.sh	hosted runner spike; to be deleted
-tools/spike/podman_rootless.sh	hosted runner spike; to be deleted
-tools/spike/several_servers.sh	hosted runner spike; to be deleted
 
 # Workflow and composite-action `run:` steps with shell logic. Key:
 # <file>#<job>/<step name>, or `step <n>` (1-based) for a step with no name.
