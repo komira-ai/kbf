@@ -193,6 +193,9 @@ serving -> cordoned -> draining -> updating -> rebooting -> qualifying -> servin
 - `held`: a gate failed. `quarantined`: the report or leak scan does not match; only a
   repair or an operator returns it.
 - `preparing`, `restoring` (Mac whole-machine leases, 10.2): the GUI session switches.
+  Built as the daemon's `Hello.phase`, beside `quarantined`, which the whole-machine
+  runtime reports after a failed cleanup ([worker-protocol.md](worker-protocol.md#node-phases));
+  the rollout states above are not.
 
 ## 4. The rollout protocol
 
@@ -674,22 +677,56 @@ on injecting a library to change private Metal behaviour; not fit for a farm.
 So a GPU test, including a test that installs the desktop app and drives it with a
 local LLM, is a `kbf-lease=whole_machine` lease with `gpu=1`, as `macos-vms.md`
 section 8.1 defines: it empties the Mac, no other lease (bare-metal or VM) runs there
-at the same time, and GPU tests on one Mac run one at a time (the front refuses `gpu`
-on macOS for any other lease kind, #85 section 8.1). **Planned:** the
-whole-machine booking (all of the node's `cpus`, memory, `gpus` and both `vms` slots)
-and the reservation that keeps one-core work from starving it (`macos-vms.md` section
-5.3), and the runtime that serves it, below. VMs remain for simulator and GUI tests
-that do not need the GPU.
+at the same time, and GPU tests on one Mac run one at a time: the front refuses `gpu`
+on macOS for any other lease kind (#85 section 8.1), and books no GPU on top of a
+whole-machine lease on macOS, since a Mac reports none and the whole Mac is the test's.
+The whole-machine booking (all of the node's capacity) and the reservation that keeps
+one-core work from starving it ([scheduler.md](scheduler.md#placement)) are built, and
+so is the runtime that serves it, below. VMs remain for simulator and GUI tests that do
+not need the GPU.
 
-**The bare-metal whole-machine runtime** (planned, in `kbf-driver-native`) is the
+**The bare-metal whole-machine runtime** (`kbf_driver_native::whole_machine`) is the
 runtime #85 points to for `whole_machine` leases on a Mac. It reports its own
 `drivers` value, `native-whole-machine` (#85 section 5.2), listed only when
-`kbf-mac-session` is present, so a Mac without it never receives a `whole_machine`
-lease. Per lease it: asks `kbf-mac-session` for a fresh lease user; if the lease needs
-a GUI session, moves the node through `preparing`, where the session switches to that
-user; starts the action as that user (`run`) inside the lease's sandbox profile; and
-moves the node through `restoring`: the user is killed and deleted and the leak scan
-runs. Its layers are next.
+`kbf-mac-session` is present (`kbf-daemon --driver native-whole-machine` refuses to
+start without the helper's socket), so a Mac without it never receives a
+`whole_machine` lease. Per lease it:
+
+1. moves the node to `preparing`: `user-create` (a fresh non-admin lease user),
+   `session-login` (auto-login into that user, then a userspace restart), then asks
+   `session-ready` until launchd has the user's `gui/<uid>` domain, for at most 8
+   minutes from when it took the lease;
+2. runs the action as that user in that GUI session (`run` with the GUI target, through
+   `launchctl asuser`), in a lease directory the daemon shares with the user (on macOS
+   an inherited access control entry each for the user and the daemon), with the
+   Command's environment, stdout and stderr captured, a wall-clock timeout, and its
+   outputs read back as the native driver reads them;
+3. moves the node to `restoring`: `kill-uid`, the lease directory removed,
+   `session-idle` (auto-login cleared, the same restart back to the login window),
+   `user-delete`; only then does the lease report its action's outcome.
+
+Every lease takes this path, GUI or not: a whole-machine lease is the Mac's alone, and
+the two switches (L2 below) cost minutes, small next to a GPU or desktop-app test. The
+node's phase is in every `Hello` ([worker-protocol.md](worker-protocol.md#node-phases)):
+the server keeps the lease across both restarts and sends its `Start` again to the
+restarted daemon, which takes the lease up at the step its on-disk record names. The
+record says `started` from just before the action's `run`: a daemon that restarts
+after that (a crash or an update, not a switch; the action's processes outlive it)
+never runs the action again. At start it kills every process of the lease user
+(`kill-uid`) before its `Hello`, which says `restoring`, and the lease fails as the
+farm's, its result lost, once the node is restored. At
+start the runtime runs the helper's boot reset naming that lease, so its session is
+kept and every other leftover lease user deleted. **A cleanup step that fails
+quarantines the node**: the runtime writes a quarantine file naming the failure, the
+phase becomes `quarantined`, the server offers the node nothing and lists it for
+attention, and only an operator who repairs the Mac, removes the file and restarts the
+daemon returns it. The lease still reports its action's outcome.
+
+Not built yet: the lease's sandbox profile (actions run as the lease user, unsandboxed),
+the leak scan and its baseline (L3), the erase (L4, L5), privileged leases, a memory
+watch (the lease books the whole Mac), an end to a lease's processes when the daemon
+dies (until the restarted daemon kills them they run on), and the move of the daemon
+to a LaunchDaemon that the userspace restart brings back. Its layers are next.
 
 ### 10.2 Isolation layers
 

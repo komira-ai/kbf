@@ -1178,11 +1178,13 @@ dependencies = [
  "prost",
  "prost-types",
  "rcgen",
+ "rustix",
  "sha2 0.11.0",
  "thiserror",
  "tokio",
  "tonic",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -1192,6 +1194,9 @@ dependencies = [
  "clap",
  "kbf-host",
  "kbf-types",
+ "rustix",
+ "serde",
+ "serde_json",
  "thiserror",
 ]
 
@@ -1225,6 +1230,7 @@ dependencies = [
  "futures",
  "hex",
  "kbf-daemon",
+ "kbf-mac-session",
  "kbf-outputs",
  "kbf-proto",
  "kbf-types",
@@ -1281,6 +1287,7 @@ dependencies = [
 name = "kbf-host"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "rustix",
  "thiserror",
 ]
@@ -1308,6 +1315,7 @@ dependencies = [
  "tokio",
  "tonic",
  "tracing-subscriber",
+ "xtask",
 ]
 
 [[package]]
@@ -1353,6 +1361,7 @@ dependencies = [
  "security-framework",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "time",
  "tracing",
  "tracing-subscriber",
@@ -3362,6 +3371,14 @@ dependencies = [
  "rusticata-macros",
  "thiserror",
  "time",
+]
+
+[[package]]
+name = "xtask"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "thiserror",
 ]
 
 [[package]]

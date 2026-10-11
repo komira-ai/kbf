@@ -1,31 +1,30 @@
 //! The interpreter budget: the shell, Python, awk, sed, Perl and Ruby this repository
-//! still holds, each listed with its exact size in [`BUDGET`].
+//! still holds, each listed by path in [`BUDGET`]. The list says what exists, not how
+//! big it is: editing a listed thing never touches the list.
 //!
 //! The scan finds three kinds of thing, one section of the budget file each:
 //! - `[files]`: a file whose extension is one of [`EXTENSIONS`], or whose first line is
 //!   a `#!` line naming one of the interpreters [`is_interpreter`] knows, directly or
-//!   through `env` or `busybox`. Its count is its number of newline bytes (what
-//!   `wc -l` prints).
+//!   through `env` or `busybox`. Its key is its path.
 //! - `[workflow]`: a workflow or composite-action step whose `run:` script is shell
 //!   logic ([`shell_logic`]: more than one line, or a pipe, `&&`, `;`, `$(`, a
-//!   backtick, `if`, `for` or `while`). Its key is `<file>#<job>/<step>` and its count
-//!   is the script's number of lines. A one-line command passes without a row.
+//!   backtick, `if`, `for` or `while`). Its key is `<file>#<job>/<step>`. A one-line
+//!   command passes without a row.
 //! - `[src-sh-c]`: a production Rust file under `crates/*/src/` that names a shell
-//!   with a `-c` flag (module [`rust`] says how it reads the file). Its count is the
-//!   number of shell names in that file's production code.
+//!   with a `-c` flag (module [`rust`] says how it reads the file). Its key is its path.
 //!
-//! [`check`] refuses a thing the scan found with no row, a count that differs from
-//! its row (so the row changes in the same commit as the file), a row the scan found
-//! nothing for, and a malformed or duplicate row. Rows are
-//! `<count>\t<key>\t<reason>`, under a `[files]`, `[workflow]` or `[src-sh-c]`
-//! header; a line starting with `#` and a blank line are skipped.
+//! [`check`] refuses a thing the scan found with no row, a row the scan found nothing
+//! for (a deleted or renamed file takes its row out in the same change), and
+//! a malformed or duplicate row. Rows are `<key>\t<reason>`, under a `[files]`,
+//! `[workflow]` or `[src-sh-c]` header; a line starting with `#` and a blank line are
+//! skipped.
 
 pub mod rust;
 
 use std::collections::BTreeMap;
 
-/// The budget file, relative to the repository root.
-pub const BUDGET: &str = "tools/interpreter_budget.tsv";
+// The file's format and parser are shared with `cargo xtask budget-diff`.
+pub use xtask::budget::{BUDGET, Row, Section, parse};
 
 /// File extensions (compared ignoring ASCII case) that make a file an interpreter
 /// file whatever its first line says.
@@ -36,135 +35,16 @@ const INTERPRETERS: &[&str] = &[
     "sh", "bash", "ash", "dash", "ksh", "zsh", "awk", "gawk", "mawk", "nawk", "sed", "perl", "ruby",
 ];
 
-/// One section of the budget file.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Section {
-    Files,
-    Workflow,
-    SrcShC,
-}
-
-impl Section {
-    const ALL: [Section; 3] = [Section::Files, Section::Workflow, Section::SrcShC];
-
-    pub fn header(self) -> &'static str {
-        match self {
-            Section::Files => "[files]",
-            Section::Workflow => "[workflow]",
-            Section::SrcShC => "[src-sh-c]",
-        }
-    }
-
-    /// What a row's count counts.
-    fn unit(self) -> &'static str {
-        match self {
-            Section::Files | Section::Workflow => "lines",
-            Section::SrcShC => "shell names",
-        }
-    }
-}
-
-/// One row of the budget file.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Row {
-    pub section: Section,
-    pub count: usize,
-    pub key: String,
-    /// The 1-based line of the budget file that holds the row.
-    pub line: usize,
-}
-
-/// The rows of a budget text, and one problem per line that is not a well-formed row,
-/// header, comment or blank line, or that repeats a key of its section.
-pub fn parse(text: &str) -> (Vec<Row>, Vec<String>) {
-    let mut rows: Vec<Row> = Vec::new();
-    let mut problems = Vec::new();
-    let mut section = None;
-    let mut seen_headers = Vec::new();
-    let mut first_at: BTreeMap<(Section, String), usize> = BTreeMap::new();
-    for (at, line) in text.split('\n').enumerate() {
-        let n = at + 1;
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        if line.starts_with('[') {
-            match Section::ALL.into_iter().find(|s| s.header() == line) {
-                Some(s) if seen_headers.contains(&s) => {
-                    problems.push(format!("line {n}: the section {line} appears twice"));
-                }
-                Some(s) => {
-                    seen_headers.push(s);
-                    section = Some(s);
-                }
-                None => problems.push(format!("line {n}: unknown section `{line}`")),
-            }
-            continue;
-        }
-        let Some(s) = section else {
-            problems.push(format!("line {n}: a row before any section header"));
-            continue;
-        };
-        let fields: Vec<&str> = line.split('\t').collect();
-        let [count, key, reason] = fields[..] else {
-            problems.push(format!(
-                "line {n}: a row needs three tab-separated fields \
-                 (<count>, <key>, <reason>), found {}",
-                fields.len()
-            ));
-            continue;
-        };
-        if [count, key, reason]
-            .iter()
-            .any(|f| f.is_empty() || f.trim() != *f)
-        {
-            problems.push(format!(
-                "line {n}: a field is empty or has blanks around it"
-            ));
-            continue;
-        }
-        let Some(count) = parse_count(count) else {
-            problems.push(format!("line {n}: the count `{count}` is not a number"));
-            continue;
-        };
-        match first_at.get(&(s, key.to_owned())) {
-            Some(first) => problems.push(format!(
-                "line {n}: a second {} row for `{key}` (the first is line {first})",
-                s.header()
-            )),
-            None => {
-                first_at.insert((s, key.to_owned()), n);
-                rows.push(Row {
-                    section: s,
-                    count,
-                    key: key.to_owned(),
-                    line: n,
-                });
-            }
-        }
-    }
-    (rows, problems)
-}
-
-/// A decimal count with no sign and no leading zero.
-fn parse_count(s: &str) -> Option<usize> {
-    let digits = s.bytes().all(|b| b.is_ascii_digit());
-    if !digits || (s.len() > 1 && s.starts_with('0')) {
-        return None;
-    }
-    s.parse().ok()
-}
-
-/// One thing the scan found: its section, key and count, and what made it count.
+/// One thing the scan found: its section and key, and why the scan found it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Found {
     pub section: Section,
     pub key: String,
-    pub count: usize,
     pub why: String,
 }
 
 /// The problems of a budget text against what the scan found. `found` holds each key
-/// of a section once.
+/// of a section once. Only existence is checked: a listed thing may change in any way.
 pub fn check(budget: &str, found: &[Found]) -> Vec<String> {
     let (rows, mut problems) = parse(budget);
     let mut by_key: BTreeMap<(Section, &str), &Row> = BTreeMap::new();
@@ -177,28 +57,13 @@ pub fn check(budget: &str, found: &[Found]) -> Vec<String> {
         match by_key.get(&(s, f.key.as_str())) {
             None => problems.push(format!(
                 "`{}`: {}, and {BUDGET} has no {} row for it; port it to Rust, or add \
-                 the row `{}\\t{}\\t<reason>`",
+                 the row `{}\\t<reason>`",
                 f.key,
                 f.why,
                 s.header(),
-                f.count,
                 f.key
             )),
-            Some(row) => {
-                matched.push(row.line);
-                if row.count != f.count {
-                    problems.push(format!(
-                        "`{}` has {} {} but its {} row (line {}) says {}; change the row \
-                         in the same commit",
-                        f.key,
-                        f.count,
-                        s.unit(),
-                        s.header(),
-                        row.line,
-                        row.count
-                    ));
-                }
-            }
+            Some(row) => matched.push(row.line),
         }
     }
     for row in rows.iter().filter(|r| !matched.contains(&r.line)) {
@@ -258,11 +123,6 @@ pub fn shebang_interpreter(bytes: &[u8]) -> Option<&str> {
             _ => return Some(name),
         }
     }
-}
-
-/// The number of newline bytes, as `wc -l` counts lines.
-pub fn newlines(bytes: &[u8]) -> usize {
-    bytes.iter().filter(|&&b| b == b'\n').count()
 }
 
 /// The number of lines of a `run:` script, blank lines at either end left out.

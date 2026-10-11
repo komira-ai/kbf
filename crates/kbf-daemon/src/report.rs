@@ -404,6 +404,27 @@ mod tests {
         assert_eq!(values(&r, "gpu"), ["0"]);
     }
 
+    /// Catches a node reported with no CPUs, which the scheduler could place nothing
+    /// on, when `/proc/cpuinfo` has features but no `processor` line: detection must
+    /// refuse it and name the line.
+    #[test]
+    fn a_cpuinfo_without_processor_lines_is_refused() {
+        let flags_only: String = SKYLAKE
+            .lines()
+            .filter(|l| !l.starts_with("processor"))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        let error = linux_report(&flags_only, MEMINFO, SMAPS, 0, &["fake"]).expect_err("no CPUs");
+        assert_eq!(
+            error.to_string(),
+            DetectError::Missing {
+                path: "/proc/cpuinfo",
+                what: "processor line",
+            }
+            .to_string()
+        );
+    }
+
     fn pci_fixture(dir: &str) -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR")).join(dir)
     }

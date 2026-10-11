@@ -7,7 +7,7 @@ use std::os::fd::{AsFd as _, BorrowedFd};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 
-use crate::proto::{self, Call, Reply, Request};
+use crate::proto::{self, Call, Reply, Request, Session};
 
 /// Why a call did not succeed.
 #[derive(Debug)]
@@ -90,7 +90,7 @@ impl Client {
     }
 
     /// `run`: starts `argv` as the lease user with the four descriptors stdin,
-    /// stdout, stderr and the lease directory.
+    /// stdout, stderr and the lease directory, outside any login session.
     ///
     /// # Errors
     /// The call failed or was refused.
@@ -101,10 +101,27 @@ impl Client {
         env: &[(String, String)],
         fds: [BorrowedFd<'_>; 4],
     ) -> Result<Running, ClientError> {
+        self.run_in(lease, argv, env, fds, Session::Background)
+    }
+
+    /// [`Self::run`] in `session`: [`Session::Gui`] is the lease user's GUI session,
+    /// refused until it is up ([`Self::session_ready`]).
+    ///
+    /// # Errors
+    /// The call failed or was refused.
+    pub fn run_in(
+        &self,
+        lease: &str,
+        argv: &[String],
+        env: &[(String, String)],
+        fds: [BorrowedFd<'_>; 4],
+        session: Session,
+    ) -> Result<Running, ClientError> {
         let request = Request::Run {
             lease: lease.to_owned(),
             argv: argv.to_vec(),
             env: env.to_vec(),
+            session,
         };
         match self.call(&request, &fds)? {
             (stream, Reply::Started { pid }) => Ok(Running { stream, pid }),
@@ -170,6 +187,21 @@ impl Client {
         restarting(self.call(&request, &[])?.1)
     }
 
+    /// `session-ready`: whether the GUI session `session-login` started for the lease
+    /// is up.
+    ///
+    /// # Errors
+    /// The call failed or was refused.
+    pub fn session_ready(&self, lease: &str) -> Result<bool, ClientError> {
+        let request = Request::SessionReady {
+            lease: lease.to_owned(),
+        };
+        match self.call(&request, &[])?.1 {
+            Reply::SessionReady { ready } => Ok(ready),
+            other => Err(unexpected(other)),
+        }
+    }
+
     /// `session-idle`: as [`Self::session_login`].
     ///
     /// # Errors
@@ -177,6 +209,55 @@ impl Client {
     pub fn session_idle(&self) -> Result<(), ClientError> {
         restarting(self.call(&Request::SessionIdle, &[])?.1)
     }
+
+    /// `scan`: the leak scan against the recorded baseline.
+    ///
+    /// # Errors
+    /// The call failed or was refused.
+    pub fn scan(&self) -> Result<Scanned, ClientError> {
+        match self.call(&Request::Scan, &[])?.1 {
+            Reply::Scanned {
+                clean,
+                added,
+                removed,
+                errors,
+            } => Ok(Scanned {
+                clean,
+                added,
+                removed,
+                errors,
+            }),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// `baseline`: returns how many items each class of the recorded baseline holds.
+    ///
+    /// # Errors
+    /// The call failed or was refused.
+    pub fn baseline(&self) -> Result<Vec<(String, usize)>, ClientError> {
+        match self.call(&Request::Baseline, &[])?.1 {
+            Reply::Baselined { classes } => Ok(classes),
+            other => Err(unexpected(other)),
+        }
+    }
+
+    /// `reboot-dirty`: as [`Self::session_login`], for a reboot.
+    ///
+    /// # Errors
+    /// The call failed or was refused.
+    pub fn reboot_dirty(&self) -> Result<(), ClientError> {
+        restarting(self.call(&Request::RebootDirty, &[])?.1)
+    }
+}
+
+/// What `scan` answered: see [`Reply::Scanned`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Scanned {
+    pub clean: bool,
+    pub added: Vec<String>,
+    pub removed: Vec<String>,
+    pub errors: Vec<String>,
 }
 
 fn restarting(reply: Reply) -> Result<(), ClientError> {

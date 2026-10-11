@@ -9,13 +9,15 @@ publish.workspace = true
 
 # The one way kbf changes a host: a plan of steps, printed or applied through an `Exec`
 # that is the host or a recording fake. kbf-deploy's kits and kbf-updater's applier
-# both go through it.
+# both go through it. libc is for the switch to another user before a tool starts
+# (setgroups, setgid, setuid).
 
 [features]
 # `testkit`: the recording `FakeExec` and scratch directories, for other crates' tests.
 testkit = []
 
 [dependencies]
+libc.workspace = true
 rustix = { workspace = true, features = ["process"] }
 thiserror.workspace = true
 

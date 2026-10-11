@@ -842,7 +842,7 @@ fn now() -> Option<Timestamp> {
 }
 
 /// The action's timeout, or `default` when it names none.
-fn timeout_of(action: &Action, default: Duration) -> Result<Duration, RuntimeError> {
+pub(crate) fn timeout_of(action: &Action, default: Duration) -> Result<Duration, RuntimeError> {
     let Some(timeout) = &action.timeout else {
         return Ok(default);
     };
@@ -858,7 +858,7 @@ fn timeout_of(action: &Action, default: Duration) -> Result<Duration, RuntimeErr
 
 /// A [`TreeError`] as the lease reports it: a missing blob is the client's to upload,
 /// a broken rule is the client's error, and anything else is the farm's.
-fn tree_error(error: TreeError) -> RuntimeError {
+pub(crate) fn tree_error(error: TreeError) -> RuntimeError {
     match error {
         TreeError::Cas(CasError::Missing(blob)) => RuntimeError::MissingBlob(blob),
         TreeError::Invalid(why) => RuntimeError::Invalid(why),
@@ -870,7 +870,7 @@ fn tree_error(error: TreeError) -> RuntimeError {
 /// not UTF-8 is the action's error (running it again would fail the same way); a
 /// limit, a failed read or a failed upload fails the lease, as the container driver
 /// reports them.
-fn outputs_error(error: OutputsError) -> RuntimeError {
+pub(crate) fn outputs_error(error: OutputsError) -> RuntimeError {
     match error {
         OutputsError::Invalid(why) => RuntimeError::Invalid(why),
         other => RuntimeError::Failed(other.to_string()),
@@ -878,7 +878,7 @@ fn outputs_error(error: OutputsError) -> RuntimeError {
 }
 
 /// An I/O failure at `path` as the lease reports it: the farm's.
-fn failed(path: &Path) -> impl FnOnce(std::io::Error) -> RuntimeError + '_ {
+pub(crate) fn failed(path: &Path) -> impl FnOnce(std::io::Error) -> RuntimeError + '_ {
     move |error| RuntimeError::Failed(format!("{}: {error}", path.display()))
 }
 

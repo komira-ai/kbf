@@ -4,6 +4,7 @@ use std::fmt;
 use std::time::Duration;
 
 use crate::path::HostPath;
+use crate::user::RunUser;
 
 /// Permission bits of a file or directory, at most `0o7777`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -39,12 +40,20 @@ pub struct Owner {
 
 /// An external tool, named by its absolute path, with its arguments and the whole of
 /// its environment: it starts with an empty environment plus `env`, never through a
-/// shell.
+/// shell. Its standard input is `stdin` (empty: it reads end of file at once).
+///
+/// Arguments are printed as they are, so a secret goes in `env` or `stdin`, never in
+/// `args`: argv is world-readable while the tool runs, and printed lines are kept.
+///
+/// With `user`, the tool runs as that user, with the user's groups ([`crate::user`]);
+/// only root can start it so.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Cmd {
     pub program: HostPath,
     pub args: Vec<String>,
     pub env: Vec<(String, String)>,
+    pub stdin: Vec<u8>,
+    pub user: Option<RunUser>,
 }
 
 impl Cmd {
@@ -53,7 +62,14 @@ impl Cmd {
             program,
             args: Vec::new(),
             env: Vec::new(),
+            stdin: Vec::new(),
+            user: None,
         }
+    }
+
+    pub fn user(mut self, user: RunUser) -> Cmd {
+        self.user = Some(user);
+        self
     }
 
     pub fn arg(mut self, arg: impl Into<String>) -> Cmd {
@@ -65,7 +81,55 @@ impl Cmd {
         self.env.push((key.into(), value.into()));
         self
     }
+
+    pub fn stdin(mut self, bytes: Vec<u8>) -> Cmd {
+        self.stdin = bytes;
+        self
+    }
 }
+
+/// `(as <user>) <program> <args>`, then the size of the input and the names (never the
+/// values) of the environment variables.
+impl fmt::Display for Cmd {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(user) = &self.user {
+            write!(f, "(as {}) ", user.name)?;
+        }
+        write!(f, "{}", self.program)?;
+        for arg in &self.args {
+            write!(f, " {}", Quoted(arg))?;
+        }
+        if !self.stdin.is_empty() {
+            write!(f, " (stdin {} bytes)", self.stdin.len())?;
+        }
+        let mut keys = self.env.iter().map(|(k, _)| k.as_str());
+        if let Some(first) = keys.next() {
+            write!(f, " (env {first}")?;
+            for key in keys {
+                write!(f, ", {key}")?;
+            }
+            f.write_str(")")?;
+        }
+        Ok(())
+    }
+}
+
+/// What a [`Step::Capture`] makes of a command's output before writing it to a file.
+/// The output may hold a secret, so the function's error never quotes it and the step
+/// prints only `name`. Two filters are equal when their names are.
+#[derive(Clone, Copy, Debug)]
+pub struct Filter {
+    pub name: &'static str,
+    pub apply: fn(&[u8]) -> Result<Vec<u8>, String>,
+}
+
+impl PartialEq for Filter {
+    fn eq(&self, other: &Filter) -> bool {
+        self.name == other.name
+    }
+}
+
+impl Eq for Filter {}
 
 /// A plain-HTTP URL a step waits on, such as a readiness endpoint on the host.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -172,6 +236,16 @@ pub enum Step {
     Remove { path: HostPath },
     /// Run an external tool; a non-zero exit fails the step.
     Run(Cmd),
+    /// Run an external tool and write what `filter` makes of its standard output to
+    /// `path`, atomically, as [`Step::WriteFile`] does; a non-zero exit or a refusal by
+    /// the filter fails the step and writes nothing. The output is never printed.
+    Capture {
+        cmd: Cmd,
+        filter: Filter,
+        path: HostPath,
+        perms: Perms,
+        owner: Option<Owner>,
+    },
     /// Wait until `url` answers a 2xx status, for at most `deadline`.
     WaitHttp { url: HttpUrl, deadline: Duration },
 }
@@ -198,21 +272,19 @@ impl fmt::Display for Step {
                 write!(f, "mkdir {path} ({perms}{})", Owned(owner))
             }
             Step::Remove { path } => write!(f, "remove {path}"),
-            Step::Run(cmd) => {
-                write!(f, "run {}", cmd.program)?;
-                for arg in &cmd.args {
-                    write!(f, " {}", Quoted(arg))?;
-                }
-                let mut keys = cmd.env.iter().map(|(k, _)| k.as_str());
-                if let Some(first) = keys.next() {
-                    write!(f, " (env {first}")?;
-                    for key in keys {
-                        write!(f, ", {key}")?;
-                    }
-                    f.write_str(")")?;
-                }
-                Ok(())
-            }
+            Step::Run(cmd) => write!(f, "run {cmd}"),
+            Step::Capture {
+                cmd,
+                filter,
+                path,
+                perms,
+                owner,
+            } => write!(
+                f,
+                "run {cmd} > {path} ({perms}{}, through {})",
+                Owned(owner),
+                filter.name
+            ),
             Step::WaitHttp { url, deadline } => {
                 write!(f, "wait up to {}s for {url}", deadline.as_secs())
             }
@@ -258,9 +330,13 @@ mod tests {
         HostPath::new(s).expect("valid test path")
     }
 
-    /// Catches a printed line that shows a secret (file bytes or an environment value)
-    /// and one that hides where an argument ends; these lines are what an operator
-    /// reads before `--apply`.
+    fn copy(b: &[u8]) -> Result<Vec<u8>, String> {
+        Ok(b.to_vec())
+    }
+
+    /// Catches a printed line that shows a secret (file bytes or an environment value),
+    /// one that hides where an argument ends, and one that hides which user a command
+    /// runs as; these lines are what an operator reads before `--apply`.
     #[test]
     fn each_step_prints_one_line_without_secrets() {
         let root = Some(Owner { uid: 0, gid: 0 });
@@ -319,6 +395,46 @@ mod tests {
                 r#"run /usr/bin/mc mb "a b" "" "it's" "q\"" "back\\slash" (env MC_HOST_x, HOME)"#,
             ),
             (
+                Step::Run(
+                    Cmd::new(p("/usr/bin/podman"))
+                        .arg("pull")
+                        .user(RunUser {
+                            name: "kbf".to_owned(),
+                            uid: 990,
+                            gid: 990,
+                            groups: vec![990, 44],
+                            home: "/var/lib/kbf".to_owned(),
+                        })
+                        .env("HOME", "/var/lib/kbf"),
+                ),
+                "run (as kbf) /usr/bin/podman pull (env HOME)",
+            ),
+            (
+                Step::Run(
+                    Cmd::new(p("/usr/bin/kubectl"))
+                        .arg("apply")
+                        .stdin(b"{\"secret\":1}".to_vec()),
+                ),
+                "run /usr/bin/kubectl apply (stdin 12 bytes)",
+            ),
+            (
+                Step::Capture {
+                    cmd: Cmd::new(p("/usr/bin/mc"))
+                        .arg("add")
+                        .stdin(b"{}".to_vec())
+                        .env("MC_HOST_x", "http://key:secret@127.0.0.1:9000"),
+                    filter: Filter {
+                        name: "s3-env",
+                        apply: copy,
+                    },
+                    path: p("/etc/kbf/s3.env"),
+                    perms: Perms::new(0o600),
+                    owner: root,
+                },
+                "run /usr/bin/mc add (stdin 2 bytes) (env MC_HOST_x) > /etc/kbf/s3.env \
+                 (0600, owner 0:0, through s3-env)",
+            ),
+            (
                 Step::WaitHttp {
                     url: HttpUrl::new("http://127.0.0.1:9000/minio/health/ready").expect("url"),
                     deadline: Duration::from_secs(30),
@@ -371,6 +487,20 @@ mod tests {
         for (url, want) in refused {
             assert_eq!(HttpUrl::new(url), Err(want(url.to_owned())), "{url}");
         }
+    }
+
+    /// Catches filters compared by function address (two copies of one kit's filter
+    /// would then differ) instead of by the name the step prints.
+    #[test]
+    fn filters_are_equal_by_name() {
+        let a = Filter {
+            name: "a",
+            apply: copy,
+        };
+        let b = Filter { name: "b", ..a };
+        assert_eq!(a, Filter { ..a });
+        assert_ne!(a, b);
+        assert_eq!((a.apply)(b"x"), Ok(b"x".to_vec()));
     }
 
     #[test]

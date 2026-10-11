@@ -42,6 +42,7 @@ prost.workspace = true
 saphyr-parser.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+xtask.workspace = true
 syn.workspace = true
 tokio = { workspace = true, features = ["time"] }
 

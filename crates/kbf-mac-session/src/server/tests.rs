@@ -104,6 +104,7 @@ fn served_from(name: &str, check: Arc<Scripted>, reset: bool) -> Served {
         grant_keys: None,
         serial: "S".to_owned(),
         session: SessionPaths::under(&dir),
+        scan: crate::scan::ScanSettings::under(&dir),
     };
     let ledger = Ledger::open(&dir.join("ledger")).unwrap();
     let helper = Arc::new(Helper::new(Box::new(host.clone()), settings, ledger));
@@ -181,6 +182,37 @@ fn the_switch_and_the_reset_work_over_the_socket() {
     let log = served.host.state().log.clone();
     let restarts = log.iter().filter(|call| call.contains("reboot userspace"));
     assert_eq!(restarts.count(), 2, "{log:#?}");
+}
+
+/// Catches: the leak scan's verbs answered with the wrong reply over the socket, a
+/// refusal of one taken by the client as success, or the scan's lists lost on the way.
+#[test]
+fn the_scan_verbs_work_over_the_socket() {
+    let served = served("scan", Ok(()));
+    let client = &served.client;
+    let refused = |result: Result<(), ClientError>, says: &str| match result {
+        Err(ClientError::Refused(why)) => assert!(why.contains(says), "{why}"),
+        other => panic!("{other:?}"),
+    };
+    refused(client.scan().map(drop), "no baseline");
+    refused(client.baseline().map(drop), "window is closed");
+    let window = served.dir.join("baseline-window");
+    std::fs::write(&window, "boot-1\n").unwrap();
+    std::fs::set_permissions(&window, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let classes = client.baseline().unwrap();
+    assert!(
+        classes.contains(&("launch-daemons".to_owned(), 0)),
+        "{classes:?}"
+    );
+    assert!(client.scan().unwrap().clean);
+    refused(client.reboot_dirty(), "did not come back dirty");
+    std::fs::create_dir(served.dir.join("LaunchDaemons")).unwrap();
+    std::fs::write(served.dir.join("LaunchDaemons/evil.plist"), "x").unwrap();
+    let scanned = client.scan().unwrap();
+    assert!(!scanned.clean);
+    assert_eq!(scanned.added.len(), 1, "{scanned:?}");
+    assert!(scanned.removed.is_empty() && scanned.errors.is_empty());
+    client.reboot_dirty().unwrap();
 }
 
 /// The four verbs end to end over the socket, descriptors included.
@@ -490,6 +522,8 @@ fn the_client_reports_unexpected_replies_and_hangups() {
         None,
         Some(Reply::Started { pid: 7 }),
         Some(Reply::Killed),
+        Some(Reply::SessionReady { ready: true }),
+        Some(Reply::Killed),
     ];
     std::thread::spawn(move || {
         // First a helper that answers the connection with something other than Hello.
@@ -534,6 +568,8 @@ fn the_client_reports_unexpected_replies_and_hangups() {
     }
     let running = client.run("1.1", &[], &[], fds).unwrap();
     assert!(unexpected(running.wait().map(drop)).contains("Killed"));
+    assert!(client.session_ready("1.1").unwrap());
+    assert!(unexpected(client.session_ready("1.1").map(drop)).contains("Killed"));
     let refused = ClientError::Refused("why".to_owned());
     assert_eq!(refused.to_string(), "kbf-mac-session refused: why");
     let gone = Client::new(dir.join("no-socket"));
@@ -564,6 +600,7 @@ fn serve_returns_when_accept_fails() {
             grant_keys: None,
             serial: "S".to_owned(),
             session: SessionPaths::under(&dir),
+            scan: crate::scan::ScanSettings::under(&dir),
         };
         Arc::new(Helper::new(Box::new(FakeHost::default()), settings, ledger))
     };
@@ -617,6 +654,7 @@ fn quiet_helper(dir: &Path) -> Helper {
         grant_keys: None,
         serial: "S".to_owned(),
         session: SessionPaths::under(dir),
+        scan: crate::scan::ScanSettings::under(dir),
     };
     Helper::new(Box::new(FakeHost::default()), settings, ledger)
 }

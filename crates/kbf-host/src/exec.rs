@@ -4,13 +4,15 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::process::CommandExt;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 use crate::path::{HostPath, Root};
-use crate::step::{Cmd, HttpUrl, Owner, Perms, Step};
+use crate::step::{Cmd, Filter, HttpUrl, Owner, Perms, Step};
 use crate::trust::{self, Untrusted};
+use crate::user;
 
 /// What is at a path, as a plan compares it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -29,6 +31,25 @@ pub enum Entry {
     Other,
 }
 
+/// What is at a path without its contents, for a file a plan must not read whole (a
+/// swapfile, a binary it only checks is executable) or cannot read (another user's key).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Meta {
+    pub kind: Kind,
+    pub perms: Perms,
+    pub owner: Owner,
+    /// The size in bytes.
+    pub len: u64,
+}
+
+/// The kind of thing a [`Meta`] describes; a link is [`Kind::Other`], never followed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    File,
+    Dir,
+    Other,
+}
+
 /// Reads and changes a host. [`HostExec`] is the real one; tests use a fake that
 /// records each step.
 pub trait Exec {
@@ -37,6 +58,17 @@ pub trait Exec {
 
     /// What is at `path` now; `None` when nothing is.
     fn inspect(&self, path: &HostPath) -> io::Result<Option<Entry>>;
+
+    /// What is at `path` now, without reading it; `None` when nothing is.
+    fn stat(&self, path: &HostPath) -> io::Result<Option<Meta>>;
+
+    /// Run `cmd` to read something while planning (does a bucket exist, what does a
+    /// Service hold): in a dry run as in an apply, so it must change nothing. A
+    /// non-zero exit is not an error here; the caller reads the status.
+    fn query(&self, cmd: &Cmd) -> io::Result<Output>;
+
+    /// One `GET` of `url` while planning; the status code of the answer.
+    fn http_status(&self, url: &HttpUrl) -> io::Result<u16>;
 
     /// Carry out one step.
     fn apply(&mut self, step: &Step) -> io::Result<()>;
@@ -64,27 +96,42 @@ impl Exec for HostExec {
     }
 
     fn inspect(&self, path: &HostPath) -> io::Result<Option<Entry>> {
-        let full = self.root.join(path);
-        let meta = match fs::symlink_metadata(&full) {
+        let Some(meta) = self.stat(path)? else {
+            return Ok(None);
+        };
+        let (perms, owner) = (meta.perms, meta.owner);
+        Ok(Some(match meta.kind {
+            Kind::File => Entry::File {
+                perms,
+                owner,
+                bytes: fs::read(self.root.join(path))?,
+            },
+            Kind::Dir => Entry::Dir { perms, owner },
+            Kind::Other => Entry::Other,
+        }))
+    }
+
+    fn stat(&self, path: &HostPath) -> io::Result<Option<Meta>> {
+        let meta = match fs::symlink_metadata(self.root.join(path)) {
             Ok(meta) => meta,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(e),
         };
-        let perms = Perms::new(meta.mode() & 0o7777);
-        let owner = Owner {
-            uid: meta.uid(),
-            gid: meta.gid(),
-        };
-        Ok(Some(if meta.is_file() {
-            Entry::File {
-                perms,
-                owner,
-                bytes: fs::read(&full)?,
-            }
+        let kind = if meta.is_file() {
+            Kind::File
         } else if meta.is_dir() {
-            Entry::Dir { perms, owner }
+            Kind::Dir
         } else {
-            Entry::Other
+            Kind::Other
+        };
+        Ok(Some(Meta {
+            kind,
+            perms: Perms::new(meta.mode() & 0o7777),
+            owner: Owner {
+                uid: meta.uid(),
+                gid: meta.gid(),
+            },
+            len: meta.len(),
         }))
     }
 
@@ -117,9 +164,24 @@ impl Exec for HostExec {
                     fs::remove_file(&full)
                 }
             }
-            Step::Run(cmd) => run(cmd),
+            Step::Run(cmd) => succeeded(cmd, output(cmd)?).map(drop),
+            Step::Capture {
+                cmd,
+                filter,
+                path,
+                perms,
+                owner,
+            } => capture(cmd, *filter, &self.root.join(path), *perms, *owner),
             Step::WaitHttp { url, deadline } => wait_http(url, *deadline),
         }
+    }
+
+    fn query(&self, cmd: &Cmd) -> io::Result<Output> {
+        output(cmd)
+    }
+
+    fn http_status(&self, url: &HttpUrl) -> io::Result<u16> {
+        get_status(url, ATTEMPT)
     }
 
     fn check_binary(&self) -> Result<(), Untrusted> {
@@ -159,15 +221,45 @@ fn set_perms_owner(full: &Path, perms: Perms, owner: Option<Owner>) -> io::Resul
     fs::set_permissions(full, fs::Permissions::from_mode(perms.bits()))
 }
 
-fn run(cmd: &Cmd) -> io::Result<()> {
-    let out = Command::new(cmd.program.as_str())
+/// Run `cmd` to its end with its input written to a pipe, keeping both outputs. The
+/// input is written before the output is read, so it must fit in a pipe's buffer (64
+/// KiB on Linux) unless the tool reads all of it before writing much.
+///
+/// With `cmd.user` set, the child takes that user's groups, group and uid before it
+/// starts the tool ([`user::become_user`]); as anyone but root that fails and the
+/// tool never starts.
+fn output(cmd: &Cmd) -> io::Result<Output> {
+    let mut command = Command::new(cmd.program.as_str());
+    command
         .args(&cmd.args)
         .env_clear()
         .envs(cmd.env.iter().map(|(k, v)| (k, v)))
-        .stdin(Stdio::null())
-        .output()?;
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(u) = &cmd.user {
+        // SAFETY: the closure runs in the child between fork and exec; `become_user`
+        // makes three system calls on numbers the parent copied in, and allocates
+        // nothing. Not `Command::uid`: std runs that before any `pre_exec` closure and
+        // clears the groups with it, after which they can no longer be set.
+        unsafe {
+            command.pre_exec(user::switch_to(u));
+        }
+    }
+    let mut child = command.spawn()?;
+    // Dropped at the end of the statement, which closes the pipe: the tool reads EOF.
+    child
+        .stdin
+        .take()
+        .expect("stdin is piped")
+        .write_all(&cmd.stdin)?;
+    child.wait_with_output()
+}
+
+/// `out` when `cmd` exited 0; otherwise an error naming the exit and its stderr.
+pub fn succeeded(cmd: &Cmd, out: Output) -> io::Result<Output> {
     if out.status.success() {
-        return Ok(());
+        return Ok(out);
     }
     let stderr = String::from_utf8_lossy(&out.stderr);
     Err(io::Error::other(format!(
@@ -176,6 +268,18 @@ fn run(cmd: &Cmd) -> io::Result<()> {
         out.status,
         stderr.trim_end()
     )))
+}
+
+fn capture(
+    cmd: &Cmd,
+    filter: Filter,
+    full: &Path,
+    perms: Perms,
+    owner: Option<Owner>,
+) -> io::Result<()> {
+    let out = succeeded(cmd, output(cmd)?)?;
+    let bytes = (filter.apply)(&out.stdout).map_err(io::Error::other)?;
+    write_file(full, perms, owner, &bytes)
 }
 
 /// How long one attempt may take, and the pause between attempts.

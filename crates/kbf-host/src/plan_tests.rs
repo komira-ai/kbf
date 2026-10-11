@@ -290,3 +290,42 @@ fn a_line_that_cannot_be_printed_stops_the_run() {
     assert_eq!(w.left, 0);
     io::Write::flush(&mut w).expect("flush");
 }
+
+/// Catches a planner that reports a step it did not plan, or hides one it did; kits
+/// plan `daemon-reload` and restarts from these answers.
+#[test]
+fn the_planner_says_whether_it_planned_a_step() {
+    let mut exec = FakeExec::new(0);
+    exec.entries.insert(
+        p("/d"),
+        Entry::Dir {
+            perms: P755,
+            owner: RUNNER,
+        },
+    );
+    exec.entries.insert(
+        p("/f"),
+        Entry::File {
+            perms: P644,
+            owner: RUNNER,
+            bytes: b"x".to_vec(),
+        },
+    );
+    let mut planner = Planner::new(&exec);
+    assert!(!planner.dir(p("/d"), P755, None).expect("plan"));
+    assert!(planner.dir(p("/e"), P755, None).expect("plan"));
+    assert!(
+        !planner
+            .file(p("/f"), P644, None, b"x".to_vec())
+            .expect("plan")
+    );
+    assert!(
+        planner
+            .file(p("/f"), P644, None, b"y".to_vec())
+            .expect("plan")
+    );
+    assert!(planner.absent(p("/f")).expect("plan"));
+    assert!(!planner.absent(p("/g")).expect("plan"));
+    assert_eq!(planner.steps().len(), 3);
+    assert_eq!(planner.finish().steps().len(), 3);
+}

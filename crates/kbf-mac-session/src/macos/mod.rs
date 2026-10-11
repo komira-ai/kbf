@@ -1,4 +1,5 @@
-//! macOS: the host the verbs run on, the caller check by code signature, and `main`.
+//! macOS: the host the verbs run on, the caller check by code signature, a process
+//! started in a lease user's GUI session ([`gui`]), and `main`.
 //!
 //! Nothing here is reached by the Linux test jobs; the `native-macos` CI job runs the
 //! helper for real as root (`tools/ci/mac-session-tests.sh`).
@@ -15,6 +16,7 @@
 //! pinned by cdhash names exactly the installed daemon binary.
 
 mod caller;
+pub mod gui;
 mod host;
 
 use std::io;
@@ -26,6 +28,7 @@ use std::sync::Arc;
 pub use caller::CodeSignatureCheck;
 pub use host::MacHost;
 
+use crate::scan::ScanFolder;
 use crate::server::{self, CallerCheck};
 use crate::start::{self, Args};
 use crate::sweep::SweepPlan;
@@ -47,6 +50,7 @@ pub fn main(args: &Args) -> ExitCode {
             serial,
             SweepPlan::macos_schedules(),
             SweepPlan::macos(),
+            ScanFolder::macos(),
         )?;
         Ok((check, ready))
     });

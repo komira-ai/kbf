@@ -331,6 +331,9 @@ fn nothing_but_the_boot_reset_is_served_before_it() {
         Request::UserDelete { lease: lease() },
         Request::SessionLogin { lease: lease() },
         Request::SessionIdle,
+        Request::Scan,
+        Request::Baseline,
+        Request::RebootDirty,
     ] {
         let refused = reply(booted.helper.handle(request.clone(), Vec::new()));
         assert_eq!(
@@ -345,6 +348,7 @@ fn nothing_but_the_boot_reset_is_served_before_it() {
         lease: lease(),
         argv: vec!["/usr/bin/true".to_owned()],
         env: Vec::new(),
+        session: crate::proto::Session::Background,
     };
     assert!(matches!(
         booted.helper.handle(run, fds(&booted.dir)),

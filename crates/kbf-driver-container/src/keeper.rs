@@ -6,15 +6,16 @@
 //! start-up sweep removes them only when a daemon is started again on the node. Until
 //! then the action would run, for as long as the work takes, beside the copy the
 //! scheduler starts elsewhere once the handover grace has passed. So each lease gets a
-//! keeper once its cgroup is made: `/bin/sh` running [`SCRIPT`], whose stdin is a pipe
-//! only the daemon holds the other end of. The daemon never writes it; when the daemon
-//! dies the kernel closes that end, the keeper reads end-of-file and writes the lease
-//! cgroup's `cgroup.kill`, which kills every process in the lease, the container's
-//! among them. It writes it again every second for [`KILL_TRIES`] seconds: a
-//! `podman start` the dead daemon left in flight can still put the container's first
-//! process in the lease after the first write. It stops early once the cgroup is gone
-//! (the next start's sweep removed it). The container, the lease cgroup and the scratch
-//! directory stay for that sweep; nothing in them runs.
+//! keeper once its cgroup is made: the daemon's own binary in its keeper mode
+//! ([`kbf_daemon::keeper`], `cgroup`), whose stdin is a pipe only the daemon holds the
+//! other end of. The daemon never writes it; when the daemon dies the kernel closes
+//! that end, the keeper reads end-of-file and writes the lease cgroup's `cgroup.kill`,
+//! which kills every process in the lease, the container's among them. It writes it
+//! again every second, [`KILL_TRIES`] times in all: a `podman start` the dead daemon
+//! left in flight can still put the container's first process in the lease after the
+//! first write. It stops early once the cgroup is gone (the next start's sweep removed
+//! it). The container, the lease cgroup and the scratch directory stay for that sweep;
+//! nothing in them runs.
 //!
 //! The keeper ignores SIGHUP, SIGINT and SIGTERM, so a service manager that stops the
 //! daemon's unit with SIGTERM does not stop it before it has read end-of-file. The
@@ -23,26 +24,12 @@
 use std::io;
 use std::os::unix::process::CommandExt as _;
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::Child;
+
+use kbf_daemon::keeper::{self, Mode};
 
 /// How many times, a second apart, the keeper writes `cgroup.kill`.
 pub const KILL_TRIES: u32 = 30;
-
-/// What the keeper runs, with `$1` the lease cgroup's `cgroup.kill` and `$2`
-/// [`KILL_TRIES`]: it waits for end-of-file on stdin (anything read is ignored), then
-/// kills the cgroup while its `cgroup.kill` exists. It never creates the file.
-pub const SCRIPT: &str = "trap '' HUP INT TERM
-while read -r line; do :; done
-n=0
-while [ \"$n\" -lt \"$2\" ] && [ -e \"$1\" ]; do
-  echo 1 > \"$1\"
-  n=$((n + 1))
-  sleep 1
-done
-";
-
-/// The keeper's name in the process table (its `$0`).
-pub const NAME: &str = "kbf-keeper";
 
 /// One lease's keeper. Dropped, it is SIGKILLed and reaped without writing anything:
 /// the pipe it reads closes only after it is dead.
@@ -53,30 +40,27 @@ pub struct Keeper {
 
 impl Keeper {
     /// Starts the keeper of the cgroup whose `cgroup.kill` is `kill`, in a process
-    /// group of its own.
+    /// group of its own, and returns once it runs as a keeper.
     ///
     /// # Errors
-    /// `/bin/sh` could not be started.
+    /// The keeper could not be started, or its program did not answer as a keeper.
     pub fn watch(kill: &Path) -> io::Result<Self> {
-        Self::with(Path::new("/bin/sh"), kill)
+        Self::with(&keeper::program()?, kill)
     }
 
-    /// [`Keeper::watch`], with `shell` for `/bin/sh`.
-    fn with(shell: &Path, kill: &Path) -> io::Result<Self> {
-        let child = Command::new(shell)
-            .arg("-c")
-            .arg(SCRIPT)
-            .arg(NAME)
-            .arg(kill)
-            .arg(KILL_TRIES.to_string())
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .current_dir("/")
-            .process_group(0)
-            .spawn()
-            .map_err(|e| io::Error::new(e.kind(), format!("start the lease's keeper: {e}")))?;
-        Ok(Self { child })
+    /// [`Keeper::watch`], with `program` for this process's own binary.
+    fn with(program: &Path, kill: &Path) -> io::Result<Self> {
+        let mode = Mode::Cgroup {
+            kill: kill.to_owned(),
+            tries: KILL_TRIES,
+        };
+        let child = keeper::command(program, &mode).process_group(0).spawn();
+        let mut this = Self {
+            child: child.map_err(cannot_start)?,
+        };
+        // Dropped on an error, the keeper is killed and reaped.
+        keeper::started(&mut this.child).map_err(cannot_start)?;
+        Ok(this)
     }
 
     /// What a daemon's death does: closes the daemon's end of the keeper's stdin.
@@ -85,6 +69,11 @@ impl Keeper {
     pub fn orphan(&mut self) {
         drop(self.child.stdin.take());
     }
+}
+
+/// `e`, saying that the lease's keeper could not be started.
+fn cannot_start(e: io::Error) -> io::Error {
+    io::Error::new(e.kind(), format!("start the lease's keeper: {e}"))
 }
 
 impl Drop for Keeper {
@@ -179,8 +168,7 @@ mod tests {
         let mut keeper = Keeper::watch(&kill).expect("keeper");
         let raw = i32::try_from(keeper.child.id()).expect("pid");
         let keeper_pid = rustix::process::Pid::from_raw(raw).expect("a pid");
-        // The trap is set by the script's first line: wait until the shell has run it.
-        std::thread::sleep(Duration::from_millis(500));
+        // No wait: `watch` returns once the keeper ignores the stop signals.
         use rustix::process::Signal;
         for signal in [Signal::TERM, Signal::HUP, Signal::INT] {
             // The keeper is this process's unreaped child, so the pid is its own.
@@ -201,8 +189,11 @@ mod tests {
     /// that does not say what failed.
     #[test]
     fn a_keeper_that_cannot_start_is_an_error() {
-        let error = Keeper::with(Path::new("/nonexistent-kbf-155/sh"), Path::new("/k"))
-            .expect_err("no shell");
+        let error = Keeper::with(
+            Path::new("/nonexistent-kbf-155/kbf-daemon"),
+            Path::new("/k"),
+        )
+        .expect_err("no program");
         assert_eq!(error.kind(), io::ErrorKind::NotFound, "{error}");
         assert!(
             error.to_string().starts_with("start the lease's keeper: "),

@@ -3,6 +3,9 @@
 
 #![allow(dead_code)] // Each test binary uses its own part of this module.
 
+// The keepers the driver starts come from the running binary: this test binary.
+kbf_daemon::keeper_test_hook!();
+
 pub mod fake;
 pub mod real;
 pub mod swap_kill;

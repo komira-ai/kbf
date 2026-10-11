@@ -1,4 +1,4 @@
-# Shared helpers for the hosted-runner spike scripts (sourced, not run).
+# Shared helpers for the XCUITest sandbox check under tools/spike/macos (sourced, not run).
 #
 # Every measurement is printed as one `SPIKE <arch>.<key>=<value>` line, so a run's
 # numbers can be read back with `gh run view <id> --log | grep ' SPIKE '`. The same

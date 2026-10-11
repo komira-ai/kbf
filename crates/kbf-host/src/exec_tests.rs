@@ -296,3 +296,131 @@ fn the_host_checks_the_running_binary() {
     let (exec, _dir) = host("binary");
     assert!(exec.check_binary().is_err());
 }
+
+fn upper(b: &[u8]) -> Result<Vec<u8>, String> {
+    Ok(b.to_ascii_uppercase())
+}
+
+fn refuse(_: &[u8]) -> Result<Vec<u8>, String> {
+    Err("the output is not a key pair".to_owned())
+}
+
+/// Catches a query that loses the command's input or output, inherits the caller's
+/// environment, or reads a non-zero exit as an error (the kit reads the status: `mc
+/// ls` of a missing bucket exits 1).
+#[test]
+fn a_query_feeds_stdin_and_returns_the_output() {
+    let (exec, _dir) = host("query");
+    let cat = Cmd::new(p("/bin/cat")).stdin(b"policy\n".to_vec());
+    let out = exec.query(&cat).expect("cat runs");
+    assert!(out.status.success());
+    assert_eq!(out.stdout, b"policy\n");
+    let unset = exec
+        .query(&Cmd::new(p("/usr/bin/printenv")).arg("HOME"))
+        .expect("printenv runs");
+    assert_eq!(unset.status.code(), Some(1), "HOME was inherited");
+    let missing = exec.query(&Cmd::new(p("/nonexistent/tool")));
+    assert_eq!(
+        missing.err().map(|e| e.kind()),
+        Some(io::ErrorKind::NotFound)
+    );
+}
+
+/// Catches a capture that writes the raw output instead of the filtered bytes, leaves
+/// the mode to the umask, or writes a file when the tool fails or the filter refuses
+/// (a half-made key file would be kept by the next run).
+#[test]
+fn a_capture_writes_the_filtered_output_or_nothing() {
+    let (mut exec, dir) = host("capture");
+    let step = |program: &str, filter| Step::Capture {
+        cmd: Cmd::new(p(program)).stdin(b"key\n".to_vec()),
+        filter: Filter {
+            name: "upper",
+            apply: filter,
+        },
+        path: p("/s3.env"),
+        perms: Perms::new(0o600),
+        owner: None,
+    };
+    exec.apply(&step("/bin/cat", upper)).expect("capture");
+    assert_eq!(fs::read(dir.join("s3.env")).expect("written"), b"KEY\n");
+    assert_eq!(mode_of(&dir.join("s3.env")), 0o600);
+    fs::remove_file(dir.join("s3.env")).expect("clean");
+
+    let err = exec
+        .apply(&step("/bin/cat", refuse))
+        .expect_err("the filter refuses");
+    assert_eq!(err.to_string(), "the output is not a key pair");
+    let err = exec
+        .apply(&step("/usr/bin/false", upper))
+        .expect_err("the tool fails");
+    assert!(
+        err.to_string().starts_with("/usr/bin/false exited with "),
+        "{err}"
+    );
+    let err = exec
+        .apply(&step("/nonexistent/tool", upper))
+        .expect_err("no such tool");
+    assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    assert!(
+        !dir.join("s3.env").exists(),
+        "a failed capture wrote the file"
+    );
+}
+
+/// Catches a planning-time GET that reports a status other than the one served.
+#[test]
+fn http_status_reads_one_answer() {
+    let (port, answered, server) = server(vec!["HTTP/1.1 503 Service Unavailable\r\n\r\n"]);
+    let (exec, _dir) = host("http_status");
+    let url = HttpUrl::new(&format!("http://127.0.0.1:{port}/readyz")).expect("url");
+    assert_eq!(exec.http_status(&url).expect("answered"), 503);
+    assert_eq!(answered.load(Ordering::SeqCst), 1);
+    server.join().expect("server");
+}
+
+/// Catches `stat` reading a file (it must not: a swapfile is 128 GiB, a key file may be
+/// another user's), following a link, or reporting a size other than the file's; and
+/// a removal or directory step that reads what is at its path.
+#[test]
+fn stat_reports_without_reading_and_absent_never_reads() {
+    let (exec, dir) = host("stat");
+    fs::write(dir.join("locked"), "12345").expect("seed");
+    fs::set_permissions(dir.join("locked"), fs::Permissions::from_mode(0o000)).expect("chmod");
+    std::os::unix::fs::symlink("locked", dir.join("link")).expect("link");
+    fs::create_dir(dir.join("d")).expect("dir");
+
+    let m = exec.stat(&p("/locked")).expect("stat").expect("there");
+    assert_eq!(
+        (m.kind, m.perms, m.owner, m.len),
+        (Kind::File, Perms::new(0), me(), 5)
+    );
+    assert_eq!(
+        exec.stat(&p("/link")).expect("stat").map(|m| m.kind),
+        Some(Kind::Other)
+    );
+    assert_eq!(
+        exec.stat(&p("/d")).expect("stat").map(|m| m.kind),
+        Some(Kind::Dir)
+    );
+    assert_eq!(exec.stat(&p("/none")).expect("stat"), None);
+    assert!(
+        exec.inspect(&p("/locked")).is_err(),
+        "reading a 0000 file must fail here"
+    );
+
+    let mut planner = Planner::new(&exec);
+    assert!(planner.absent(p("/locked")).expect("no read"));
+    assert!(
+        planner
+            .dir(p("/locked"), Perms::new(0o755), None)
+            .expect("no read")
+    );
+    assert!(
+        !planner
+            .dir(p("/d"), Perms::new(mode_of(&dir.join("d"))), None)
+            .expect("same")
+    );
+    assert!(!planner.absent(p("/none")).expect("nothing there"));
+    fs::set_permissions(dir.join("locked"), fs::Permissions::from_mode(0o600)).expect("chmod");
+}

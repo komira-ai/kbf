@@ -187,6 +187,45 @@ restarted daemon's sweep is the second line, when a daemon is started again on t
 node with the same scratch directory. What neither reaches is listed in
 [daemon.md](daemon.md#when-the-daemon-is-killed).
 
+### Node phases
+
+A worker's `Hello` says what it is doing besides running leases
+([worker-protocol.md](worker-protocol.md#node-phases); `kbf_types::NodePhase`), and the
+server feeds it to the scheduler (`Event::Phase`) after every `Hello`, the
+registration's included, before any placement round:
+
+- `serving`: placement may offer it leases.
+- `preparing <lease>`: it switches a Mac's GUI session to the user of that
+  whole-machine lease, which it holds, then runs its action; `restoring <lease>`: it
+  switches back after the lease's action ended, and cleans up. The switch is a
+  userspace restart that ends the daemon, so the worker is silent for minutes. While
+  the worker is silent, that lease (and only that one) is kept for
+  `SESSION_SWITCH_GRACE` (10 minutes, more than G) counted from the first report of the
+  phase, instead of G; past it the lease goes back to the queue with the reason
+  `SessionSwitch`. Nothing of the lease runs during a switch (the action has not
+  started, or has ended with its result kept on the node), so keeping it past G cannot
+  run it twice. A daemon that dies while the action runs is no switch: the action's
+  processes live on until the restarted daemon kills them before its `Hello`; that
+  daemon says `restoring <lease>` and fails the lease (its result is lost) rather than
+  run it again. Until it is back those processes live on (the helper runs them), beside
+  a retry elsewhere once the lease is given up. The same phase reported again (after
+  the restart) does not extend the grace; `preparing` then `restoring` gives the switch
+  back a grace of its own.
+- When a phase names a lease the scheduler holds on that worker, committed, whose
+  `Start` went to an earlier session (the restarted daemon is a new session, and a new
+  process), the scheduler sends the `Start` again to the new session: that is how the
+  daemon takes the lease up after the restart. A phase that names a lease of this term
+  the scheduler does not hold there is answered with a `Cancel` by the server
+  (`Scheduler::not_held`).
+- `quarantined <why>`: a cleanup failed. The worker takes no lease.
+
+A worker whose phase is not `serving` is held back from placement as a cordoned one
+is: work only it could run waits, naming it and its phase (`mac-1 (quarantined)`),
+and is not refused for it. Of the plan's rule "a node that misses the preparation
+timeout is quarantined" ([fleet-updates.md](fleet-updates.md#102-isolation-layers)),
+only the requeue is built: a worker silent past the grace is not quarantined by the
+server; its daemon, if it returns, finds the lease cancelled and cleans up.
+
 ## QoS
 
 A QoS level (`kbf_types::Qos`) says how urgent work is. It is chosen by the user and is

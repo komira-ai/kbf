@@ -105,6 +105,40 @@ The daemon refuses a `Welcome` whose interval is zero or whose double is not sho
 than its fence time T, since a gap of two intervals must be noticed well before it
 fences.
 
+### Node phases
+
+`Hello.phase` (`NodePhase { phase, lease_id, reason }`) says what the node is doing
+besides running leases (`docs/design/fleet-updates.md` section 3.3). It is absent, or
+`PHASE_SERVING`, on a node that takes leases, and the daemon resends `Hello` whenever
+it changes. Today only the whole-machine runtime on a Mac
+(`kbf_driver_native::whole_machine`) sets one; the daemon takes it through
+`Daemon::with_phase`:
+
+| Phase | Meaning | `lease_id` / `reason` |
+|---|---|---|
+| `PHASE_PREPARING` | switching the Mac's GUI session to the user of a whole-machine lease it holds (`session-login`: auto-login, then a userspace restart, which ends the daemon too), then running its action there | the lease |
+| `PHASE_RESTORING` | switching back after that lease's action ended (`session-idle`, the same restart), and cleaning up; the lease's `Result` is sent once that is done. A daemon restarted while the action ran (a crash or an update, not a switch) says this too: it killed the lease user's processes before its `Hello`, and the lease fails as the farm's, its result lost; the action is never run again | the lease |
+| `PHASE_QUARANTINED` | a cleanup failed; the node takes no lease until an operator repairs it | why |
+
+The server takes the phase of every `Hello`, the stream's first included, before it
+places any work. A node that is not serving is offered no lease, and is listed in
+`GET /v1/nodes` with its `phase` (and a quarantine in `needs_attention`, logged once as
+an attention item). While a node is silent in `PHASE_PREPARING` or `PHASE_RESTORING`,
+the server keeps the lease the phase names for the session switch grace (10 minutes)
+rather than the lease grace G ([scheduler.md](scheduler.md#node-phases)). When the
+restarted daemon's first `Hello` names the lease, the server sends its `Start` again
+on that stream (same lease id, same action), and the daemon's runtime takes the lease
+up at the step it had reached; an action that had started is not run again (see
+`PHASE_RESTORING`). A phase that names a lease of this server's term that the server
+does not hold on the node is answered with a `Cancel` for it. A preparing or
+restoring phase without a lease ends the stream `INVALID_ARGUMENT`; a phase value the
+server does not know is read as a quarantine that says so.
+
+On the daemon's side, a `Cancel` for a lease it is not running, and a `Welcome` whose
+epoch is not the term of the lease its phase names, have every runtime kill that
+lease: the whole-machine runtime, which keeps a lease across its own restarts, then
+cleans up after it.
+
 ### Node identity and the deny list
 
 Only the newest stream of a node counts, and that stream receives the node's leases,
@@ -277,7 +311,9 @@ lists it, so a lost `Cancel` is sent again. Leases of another scheduler term are
 cancelled. The daemon kills the run without waiting for the kill to finish. The lease
 stays listed until its run has stopped and its `Result` (normally `ABORTED`) is
 acknowledged, and the server refuses that `Result`. A `Cancel` for a lease the daemon
-is not running changes nothing.
+is not running reaches every runtime as a kill of a lease it does not run, which changes
+nothing, except in the whole-machine runtime, which restores the node after a lease it
+kept across a restart ([Node phases](#node-phases)).
 
 ### `Result` and `ResultAck`
 

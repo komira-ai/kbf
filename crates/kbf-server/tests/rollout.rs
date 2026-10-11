@@ -700,8 +700,7 @@ async fn the_driver_runs_against_the_farm() {
     farm.register(
         &w("a"),
         kbf_sched::DaemonInstance::new("a"),
-        Resources::new(8_000, 16 << 30),
-        caps,
+        kbf_server::farm::Reported::serving(Resources::new(8_000, 16 << 30), caps),
         outbound,
         ServerMessage::default(),
     );

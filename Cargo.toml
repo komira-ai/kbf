@@ -124,6 +124,8 @@ kbf-sim-cell = { path = "crates/kbf-sim-cell" }
 kbf-store = { path = "crates/kbf-store" }
 kbf-testkit = { path = "crates/kbf-testkit" }
 kbf-types = { path = "crates/kbf-types" }
+# The CI verbs (`cargo xtask`); kbf-it reads the interpreter budget with its parser.
+xtask = { path = "crates/xtask" }
 
 # `clippy.toml` lists the clock, sleep, network and hashed-collection items that pure
 # crates must not use. They are allowed workspace-wide; each pure crate denies them in

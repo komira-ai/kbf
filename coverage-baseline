@@ -10,7 +10,7 @@ kbf-alert                 0      0
 kbf-auth                  0      0
 kbf-caps                  2      1
 kbf-coverage              0      0
-kbf-daemon               31      9
+kbf-daemon               29      8
 kbf-deploy                0      0
 kbf-driver-container      0      0
 kbf-driver-native         0      0
@@ -40,3 +40,4 @@ kbf-testkit               0      0
 kbf-types                 3      2
 kbf-updater               0      0
 kbf-vmm                   0      0
+xtask                     0      0

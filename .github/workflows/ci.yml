@@ -74,6 +74,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          # The merge commit and its first parent, the base branch (budget-diff).
+          fetch-depth: 2
       - run: rustup toolchain install
       - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         id: cargo-cache
@@ -84,6 +86,11 @@ jobs:
             target
           key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
+      # The interpreter budget only shrinks: a pull request may not add a row to it
+      # (crates/xtask/src/budget.rs). A pull request is checked out as the merge commit,
+      # so HEAD^1 is the base branch it merges into.
+      - if: github.event_name == 'pull_request'
+        run: cargo xtask budget-diff --base HEAD^1
       - run: cargo test -p kbf-it --locked --test repo_lints
       - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         if: ${{ github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true' }}
@@ -142,8 +149,9 @@ jobs:
       # kbf-guest started as root through sudo must refuse (tools/ci/guest-tests.sh).
       - run: bash tools/ci/guest-tests.sh
       # kbf-server's --version names this commit, and the CI-only override stamps two
-      # other commits from the same checkout (crates/kbf-server/build.rs).
-      - run: bash tools/ci/check-build-commit.sh stamps "$GITHUB_SHA"
+      # other commits from the same checkout (crates/kbf-server/build.rs,
+      # crates/xtask/src/build_commit.rs).
+      - run: cargo xtask build-commit stamps "$GITHUB_SHA"
       - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         if: ${{ github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true' }}
         with:
@@ -359,8 +367,9 @@ jobs:
       - run: cargo build -p kbf-node --bin kbf-daemon --locked
       - run: cargo test -p kbf-outputs -p kbf-driver-native -p kbf-node -p kbf-testkit --locked
       # The daemon's unit tests, which read its suspend-counting clock on macOS
-      # (CLOCK_MONOTONIC_RAW), and the fence across a suspend (issue #78).
-      - run: cargo test -p kbf-daemon --lib --test suspend --locked
+      # (CLOCK_MONOTONIC_RAW), the fence across a suspend (issue #78), and a keeper
+      # started after the binary was renamed over, which macOS finds by its path.
+      - run: cargo test -p kbf-daemon --lib --test suspend --test keeper --locked
       # The root helper for per-lease users: its unit tests, then the helper itself run
       # as root (passwordless sudo) with real users, launchd, the sweep and the caller
       # check by code signature (docs/design/fleet-updates-security.md S4.2, S4.3).

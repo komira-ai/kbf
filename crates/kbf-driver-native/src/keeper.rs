@@ -5,10 +5,11 @@
 //! end its actions, and the start-up sweep ([`crate::sweep`]) ends them only when a
 //! daemon is started again on the node. Until then they would run, for as long as the
 //! work takes, beside the copy the scheduler starts elsewhere once the handover grace
-//! has passed. So each action gets a keeper: `/bin/sh` running [`SCRIPT`], a member of
-//! the action's group, whose stdin is a pipe only the daemon holds the other end of.
-//! The daemon never writes it; when the daemon dies the kernel closes that end, the
-//! keeper reads end-of-file and SIGKILLs its own group (`kill 0`): the action's.
+//! has passed. So each action gets a keeper: the daemon's own binary in its keeper mode
+//! ([`kbf_daemon::keeper`], `group`), a member of the action's group, whose stdin is a
+//! pipe only the daemon holds the other end of. The daemon never writes it; when the
+//! daemon dies the kernel closes that end, the keeper reads end-of-file and SIGKILLs
+//! its own group: the action's.
 //!
 //! Being in the group is what makes the keeper safe and needs no dismissal:
 //! - while it lives the group id names this action's group and no other, since the
@@ -23,17 +24,9 @@
 
 use std::io;
 use std::os::unix::process::CommandExt as _;
-use std::process::{Child, Command, Stdio};
+use std::process::Child;
 
-/// What the keeper runs: it waits for end-of-file on stdin (anything read is ignored),
-/// then SIGKILLs its process group.
-pub const SCRIPT: &str = "trap '' HUP INT TERM
-while read -r line; do :; done
-kill -s KILL 0
-";
-
-/// The keeper's name in the process table (its `$0`).
-pub const NAME: &str = "kbf-keeper";
+use kbf_daemon::keeper::{self, Mode};
 
 /// One action's keeper. Dropped, it is SIGKILLed and reaped, without its group being
 /// signalled: the pipe it reads closes only after it is dead.
@@ -44,22 +37,21 @@ pub struct Keeper {
 
 impl Keeper {
     /// Starts the keeper of process group `pgid`, which must exist in the daemon's
-    /// session. Returns once the keeper runs in that group: a keeper that could not
-    /// join it is an error, never a keeper elsewhere (its `kill 0` would then end that
-    /// group, the daemon's own among them).
+    /// session. Returns once the keeper runs as a keeper in that group: a keeper that
+    /// could not join it is an error, never a keeper elsewhere (its kill of its own
+    /// group would then end that group, the daemon's own among them).
     ///
     /// # Errors
-    /// The keeper could not be started in the group.
+    /// The keeper could not be started in the group, or its program did not answer as
+    /// a keeper.
     pub fn join(pgid: i32) -> io::Result<Self> {
-        let child = Command::new("/bin/sh")
-            .args(["-c", SCRIPT, NAME])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .current_dir("/")
-            .process_group(pgid)
-            .spawn()?;
-        Ok(Self { child })
+        let mut command = keeper::command(&keeper::program()?, &Mode::Group);
+        let mut this = Self {
+            child: command.process_group(pgid).spawn()?,
+        };
+        // Dropped on an error, the keeper is killed and reaped.
+        keeper::started(&mut this.child)?;
+        Ok(this)
     }
 
     /// The keeper's pid.
@@ -89,6 +81,7 @@ impl Drop for Keeper {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
     use std::time::{Duration, Instant};
 
     /// A `sleep 300` leading a process group of its own.
@@ -166,8 +159,7 @@ mod tests {
         let mut action = group();
         let mut keeper = Keeper::join(pid(&action)).expect("keeper");
         let keeper_pid = i32::try_from(keeper.pid()).expect("pid");
-        // The trap is set by the script's first line: wait until the shell has run it.
-        std::thread::sleep(Duration::from_millis(500));
+        // No wait: `join` returns once the keeper ignores the stop signals.
         for signal in [libc::SIGTERM, libc::SIGHUP, libc::SIGINT] {
             // SAFETY: kill(2) on the keeper, this process's unreaped child.
             assert_eq!(unsafe { libc::kill(keeper_pid, signal) }, 0);

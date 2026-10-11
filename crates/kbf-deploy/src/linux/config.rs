@@ -274,7 +274,7 @@ fn port(key: &'static str, value: &str) -> Result<u16, LinuxError> {
 
 /// A `KBF_IMAGES` entry: podman's bare `<repo>@sha256:<digest>`, which must pass
 /// kbf-daemon's own `--image` parser once `docker://` is put in front.
-fn image(entry: &str) -> Result<ImageRef, LinuxError> {
+pub fn image(entry: &str) -> Result<ImageRef, LinuxError> {
     if entry.starts_with("docker://") {
         return Err(LinuxError::ImageScheme(entry.to_owned()));
     }

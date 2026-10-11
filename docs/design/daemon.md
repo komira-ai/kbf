@@ -107,11 +107,19 @@ re-adopts nothing (re-adopting is **planned**), so its runs are ended twice over
 #155): as it dies, by each run's keeper, and when a daemon is started again on the
 node, before it says `Hello`, by that daemon's start-up sweep.
 
-**The keeper.** Each run gets one: `/bin/sh` running a few lines, its stdin a pipe only
-the daemon holds the other end of (close-on-exec, so no action inherits it). The daemon
-never writes the pipe. When the daemon dies, however it dies, the kernel closes its end;
-the keeper reads end-of-file and ends the run. It ignores SIGHUP, SIGINT and SIGTERM,
-so a service manager stopping the daemon's unit with SIGTERM does not stop it first.
+**The keeper.** Each run gets one: the daemon's own binary started again in its hidden
+keeper mode (`kbf-keeper __keeper group` or `__keeper cgroup <cgroup.kill> <tries>`;
+`kbf_daemon::keeper`), which `main` dispatches before it parses any flag. Its stdin is a
+pipe only the daemon holds the other end of (close-on-exec, so no action inherits it).
+The daemon never writes the pipe. When the daemon dies, however it dies, the kernel
+closes its end; the keeper reads end-of-file and ends the run. It ignores SIGHUP, SIGINT
+and SIGTERM, so a service manager stopping the daemon's unit with SIGTERM does not stop
+it first, and only then writes a ready line on stdout: the daemon waits for that line,
+so a run starts only once its keeper ignores those signals, and a program that does not
+answer as a keeper refuses the run. The program is `/proc/self/exe` on Linux, the file
+the daemon runs even after an update renamed a new binary over it; on macOS it is the
+path the daemon was started by, which names the new binary after such a swap, so the
+keeper's arguments are kept the same from one version to the next.
 This needs no restart, so a killed daemon's runs no longer go on while the scheduler
 requeues their leases elsewhere after the handover grace.
 
@@ -123,7 +131,7 @@ requeues their leases elsewhere after the handover grace.
   group id names this action's group, since the kernel reuses no pid that names a live
   group; and the daemon's kill of the group at the end of a lease, or the sweep's,
   ends the keeper with the rest, so it needs no dismissal. It counts toward the
-  lease's memory (a shell, about a megabyte).
+  lease's memory.
 - **Container driver.** The keeper starts once the lease cgroup is made, before
   `podman create`, in a process group of its own. At end-of-file it writes the lease
   cgroup's `cgroup.kill`, which kills every process in the lease, the container's
@@ -238,12 +246,12 @@ its exit code. Its errors map to the `Result` status the server sees:
 | `MissingBlob(digest)` | `FAILED_PRECONDITION` with a `MISSING` violation |
 | `Failed(why)` | `INTERNAL`: the farm's failure |
 
-Four runtimes exist. The `kbf-daemon` binary (crate `kbf-node`) offers the first three,
-picked by `--driver`, which may be given more than once: one runtime per driver, each
-driver once, the node's own (native or container) set up first, then the others in
-the order given. Today every one of the three serves `action`, so any two refuse to
-start; the flag is repeatable for the runtimes of other kinds (a whole-machine runtime
-on Macs, a VM runtime) that join them.
+Five runtimes exist. The `kbf-daemon` binary (crate `kbf-node`) offers all but
+`LocalRuntime`, picked by `--driver`, which may be given more than once: one runtime per
+driver, each driver once, the node's own (native or container) set up first, then the
+others in the order given. Two that serve the same kind refuse to start (`container`,
+`native` and `fake` all serve `action`); a Mac runs `--driver native --driver
+native-whole-machine`.
 
 - **`PodmanRuntime`** (`kbf-driver-container`, driver `container`, Linux only): the
   runtime for Linux farm nodes, below. The binary requires `--scratch` and `--cas`, and
@@ -262,6 +270,18 @@ on Macs, a VM runtime) that join them.
   units and the host's swap and memory headroom.
 - **`NativeRuntime`** (`kbf-driver-native`, driver `native`): each action as plain
   processes on the node, for Macs.
+- **`WholeMachineRuntime`** (`kbf-driver-native`, driver `native-whole-machine`, macOS
+  only): each `whole_machine` lease as a throwaway user in that user's GUI session,
+  through the root helper `kbf-mac-session`
+  ([fleet-updates.md](fleet-updates.md#101-no-gpu-in-vms)). The binary requires
+  `--scratch` (its files go in `<scratch>/whole-machine`) and `--cas`, and refuses to
+  start when nothing serves `--mac-session-socket`. It hands the daemon its phase
+  (`Daemon::with_phase`), which every `Hello` carries
+  ([worker-protocol.md](worker-protocol.md#node-phases)): the session switch restarts
+  the daemon, and the runtime takes the lease up again from its on-disk record when the
+  server sends the `Start` again. `--daemon-user` names the daemon's own user, which the
+  lease directory's access control entries keep able to read and remove what the lease
+  user writes.
 - **`FakeRuntime`** (driver `fake`): runs nothing and returns an empty result, for
   bring-up. It serves `action`; `FakeRuntime::serving` makes one serve another kind
   under another driver name, so a daemon with several runtimes can be tested with fakes.
@@ -549,7 +569,6 @@ runtime reports usage; the container driver does not yet.
 - **Networked actions,** which get egress, are never cached and always self-fence.
 - **Service containers** for tests that need several containers, declared up front so
   the result stays cacheable.
-- **Other drivers** behind the same trait: native execution and whole-machine leases on
-  macOS, and virtual machines later. Every driver must pass one freshness test: a
+- **Other drivers** behind the same trait: virtual machines (`vm`) later. Every driver must pass one freshness test: a
   marker left by one lease is never seen by the next.
 - **Usage from the container driver,** read from the lease cgroup.

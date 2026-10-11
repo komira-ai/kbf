@@ -2,7 +2,9 @@
 //!
 //! A cordoned worker is not one of them: placement skips it, and work only it could
 //! run waits with that reason for as long as the cordon lasts; it is never refused for
-//! it (a cordon is temporary by intent). A worker can run a request if it reports a
+//! it (a cordon is temporary by intent). A worker whose phase is not `serving`
+//! ([`NodePhase`]: switching its GUI session, or quarantined) is held back the
+//! same way, its phase named beside it. A worker can run a request if it reports a
 //! driver that serves the request's lease kind ([`LeaseKind::drivers`]), its
 //! capabilities satisfy the request's platform (`kbf_caps::Request::matches`) and its
 //! whole capacity holds the request vector. It can run it now if, for an `action`, its
@@ -14,7 +16,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use kbf_caps::NodeCaps;
-use kbf_types::{FarmTime, LeaseKind, Resources, WorkerId};
+use kbf_types::{FarmTime, LeaseKind, NodePhase, Resources, WorkerId};
 
 use crate::cordon::Cordons;
 use crate::input::Request;
@@ -37,7 +39,8 @@ pub(crate) enum Verdict {
 pub(crate) struct Servable {
     /// Live workers placement may use, in name order.
     live: Vec<WorkerId>,
-    /// Live workers placement skips because they are cordoned, in name order.
+    /// Live workers placement skips because they are cordoned or not serving, in name
+    /// order.
     cordoned: Vec<WorkerId>,
     /// For each platform request and lease kind seen this round, the indices into
     /// `live` of the workers that serve the kind and satisfy the request.
@@ -50,7 +53,8 @@ pub(crate) fn serves(caps: &NodeCaps, kind: LeaseKind) -> bool {
 }
 
 impl Servable {
-    /// The round's view of `workers` at `now`, without the `cordons`.
+    /// The round's view of `workers` at `now`, without the `cordons` and the workers
+    /// that are not serving.
     pub(crate) fn new(
         workers: &BTreeMap<WorkerId, Worker>,
         cordons: &Cordons,
@@ -60,7 +64,7 @@ impl Servable {
             .iter()
             .filter(|(_, w)| w.alive(now))
             .map(|(name, _)| name.clone())
-            .partition(|name| cordons.skips(name));
+            .partition(|name| cordons.skips(name) || workers[name].phase != NodePhase::Serving);
         Self {
             live,
             cordoned,
@@ -165,23 +169,35 @@ impl Servable {
         if verdict == Verdict::Servable {
             return verdict;
         }
-        let could: Vec<&str> = self
+        let could: Vec<(&WorkerId, &NodePhase)> = self
             .cordoned
             .iter()
-            .filter(|name| {
+            .map(|name| (name, &workers[name].phase))
+            .filter(|(name, _)| {
                 let w = &workers[*name];
                 serves(&w.caps, request.kind)
                     && request.needs.matches(&w.caps)
                     && w.capacity.fits(&request.resources)
             })
-            .map(WorkerId::as_str)
             .collect();
         if could.is_empty() {
             return verdict;
         }
+        let held = if could.iter().all(|(_, phase)| **phase == NodePhase::Serving) {
+            "cordoned"
+        } else {
+            "cordoned or not serving"
+        };
+        let named: Vec<String> = could
+            .iter()
+            .map(|(name, phase)| match phase {
+                NodePhase::Serving => name.as_str().to_owned(),
+                phase => format!("{name} ({})", phase.name()),
+            })
+            .collect();
         Verdict::Cordoned(format!(
-            "every live worker that can run it is cordoned: {}",
-            could.join(", ")
+            "every live worker that can run it is {held}: {}",
+            named.join(", ")
         ))
     }
 
@@ -194,8 +210,14 @@ impl Servable {
         if self.live.is_empty() {
             let why = if self.cordoned.is_empty() {
                 "no worker is connected"
-            } else {
+            } else if self
+                .cordoned
+                .iter()
+                .all(|name| workers[name].phase == NodePhase::Serving)
+            {
                 "every connected worker is cordoned"
+            } else {
+                "every connected worker is cordoned or not serving"
             };
             return Verdict::Unservable(why.to_owned());
         }
