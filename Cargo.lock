@@ -1213,6 +1213,7 @@ version = "0.1.0"
 dependencies = [
  "futures",
  "kbf-daemon",
+ "kbf-mac-session",
  "kbf-outputs",
  "kbf-proto",
  "kbf-types",
@@ -1386,6 +1387,7 @@ dependencies = [
  "kbf-outputs",
  "kbf-proto",
  "kbf-server",
+ "kbf-types",
  "libc",
  "prost",
  "rcgen",

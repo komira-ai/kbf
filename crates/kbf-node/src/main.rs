@@ -2,7 +2,9 @@
 //!
 //! Configuration is by flags only (`kbf-daemon --help`). `--driver` picks how leases
 //! run: `fake` (nothing runs; for bring-up), `container` (rootless Podman; Linux) or
-//! `native` (plain processes; for Macs). Given more than once, the daemon has one
+//! `native` (plain processes; for Macs), and for `whole_machine` leases on a Mac
+//! `native-whole-machine` (each lease as its own user in its GUI session, through
+//! `kbf-mac-session`; see `whole_machine`). Given more than once, the daemon has one
 //! runtime per driver (the node's own, native or container, set up first) and runs
 //! each Start on the one that serves its lease kind; it refuses to start when two
 //! serve the same kind. The two real drivers read and write blobs over mutual TLS
@@ -166,6 +168,13 @@ struct Cli {
     /// driver's startup check reads instead of `/etc`'s. For tests of that check only.
     #[arg(long, hide = true)]
     id_files: Option<PathBuf>,
+    /// The socket `kbf-mac-session` serves (native-whole-machine).
+    #[arg(long, default_value = "/var/run/kbf-mac-session/socket")]
+    mac_session_socket: PathBuf,
+    /// This daemon's own user, which keeps read and remove access to what a
+    /// whole-machine lease's user writes in its lease directory (native-whole-machine).
+    #[arg(long, default_value = "_kbf")]
+    daemon_user: String,
 }
 
 /// The drivers this binary can run leases through.
@@ -177,6 +186,9 @@ enum Driver {
     Container,
     /// Each action as plain processes on the node, for Macs.
     Native,
+    /// Each whole-machine lease as its own user in its GUI session, through
+    /// `kbf-mac-session` (macOS).
+    NativeWholeMachine,
 }
 
 type Error = Box<dyn std::error::Error>;
@@ -254,6 +266,8 @@ struct Node {
     capacity: Capacity,
     /// The native driver's Xcode reports.
     reports: Option<Reports>,
+    /// The whole-machine runtime's phase.
+    phase: Option<tokio::sync::watch::Receiver<kbf_types::NodePhase>>,
 }
 
 impl Node {
@@ -294,6 +308,7 @@ fn node(
                 node.reports = Some(reports);
             }
             Driver::Container => container::add(cli, &mut node)?,
+            Driver::NativeWholeMachine => whole_machine::add(cli, &mut node)?,
         }
     }
     let runtimes = node.runtimes.ok_or("no --driver given")?;
@@ -301,8 +316,11 @@ fn node(
     let report = NodeReport::detect(&[])?
         .with_entries(cli.daemon.label_entries())
         .within(node.capacity);
-    let daemon = Daemon::new(DaemonConfig::from_args(&cli.daemon), runtimes, report)?
+    let mut daemon = Daemon::new(DaemonConfig::from_args(&cli.daemon), runtimes, report)?
         .with_container_images(cli.images.iter().cloned());
+    if let Some(phase) = node.phase {
+        daemon = daemon.with_phase(phase);
+    }
     Ok(match node.reports {
         Some(reports) => (daemon.with_driver_report(reports.clone()), Some(reports)),
         None => (daemon, None),
@@ -566,6 +584,8 @@ mod container {
         Err("the container driver runs on Linux only; use --driver native".into())
     }
 }
+
+mod whole_machine;
 
 #[cfg(test)]
 mod deploy_doc_tests;
