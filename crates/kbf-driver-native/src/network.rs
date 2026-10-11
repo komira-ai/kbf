@@ -128,7 +128,7 @@ pub const NO_NETWORK_PROFILE: &str = "(version 1)\n\
 /// Unix socket (a mutant), the runner still refused the connect. A lease that books a
 /// device is to get a profile without these (`docs/design/ios-devices.md`, section
 /// 6.1); none does yet.
-pub const NO_DEVICE_RULES: &str = "(deny mach-lookup (global-name-prefix \"com.apple.CoreDevice.\"))\n\
+pub const NO_DEVICE_RULES: &str = "(deny mach-lookup (global-name \"com.apple.CoreDevice.CoreDeviceService\"))\n\
 (deny mach-lookup (global-name-prefix \"com.apple.remoted\"))\n\
 (deny network-outbound (literal \"/private/var/run/usbmuxd\"))\n";
 
