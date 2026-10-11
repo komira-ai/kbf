@@ -343,4 +343,64 @@ mod tests {
         let err = late.read(&mut [0u8; 1]).expect_err("timed out");
         assert_eq!(err.kind(), io::ErrorKind::TimedOut);
     }
+
+    /// A Unix socket whose `set_read_timeout(None)` fails with EINVAL, as macOS
+    /// refuses `SO_RCVTIMEO` on a socket whose peer has already closed.
+    struct ClosedPeerRefusesTimeout(UnixStream);
+
+    impl Read for ClosedPeerRefusesTimeout {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.0.read(buf)
+        }
+    }
+
+    impl Write for ClosedPeerRefusesTimeout {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.write(buf)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            self.0.flush()
+        }
+    }
+
+    impl Stream for ClosedPeerRefusesTimeout {
+        fn try_clone(&self) -> io::Result<Self> {
+            self.0.try_clone().map(Self)
+        }
+        fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+            match timeout {
+                None => Err(io::Error::from_raw_os_error(libc::EINVAL)),
+                Some(t) => self.0.set_read_timeout(Some(t)),
+            }
+        }
+        fn shutdown(&self) -> io::Result<()> {
+            self.0.shutdown(std::net::Shutdown::Both)
+        }
+    }
+
+    /// Catches a host that closes right after the handshake being reported as an
+    /// agent error: when clearing the Hello deadline fails, the connection is over
+    /// and `serve_connection` returns `Ok`, as for any other host that is gone.
+    #[test]
+    fn a_host_gone_before_the_deadline_is_cleared_is_a_closed_connection() {
+        let (stream, mut host) = UnixStream::pair().expect("socket pair");
+        let token = [0x5a; TOKEN_LEN];
+        let hello = HostMsg::Hello {
+            version: VERSION,
+            token,
+        };
+        write_frame(&mut host, &hello.encode()).expect("hello sent");
+        drop(host);
+        let mut agent = Agent::new(Config {
+            token,
+            inputs: PathBuf::from("/nonexistent/inputs"),
+            outputs: PathBuf::from("/nonexistent/outputs"),
+            session: "TestSession".into(),
+            hello_timeout: HELLO_TIMEOUT,
+        });
+        agent
+            .serve_connection(ClosedPeerRefusesTimeout(stream))
+            .expect("a closed connection, not an error");
+        assert!(!agent.has_run());
+    }
 }
