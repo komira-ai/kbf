@@ -116,8 +116,8 @@ it changes. Today only the whole-machine runtime on a Mac
 
 | Phase | Meaning | `lease_id` / `reason` |
 |---|---|---|
-| `PHASE_PREPARING` | switching the Mac's GUI session to the user of a whole-machine lease it holds and has not started (`session-login`: auto-login, then a userspace restart, which ends the daemon too) | the lease |
-| `PHASE_RESTORING` | switching back after that lease's action ended (`session-idle`, the same restart), and cleaning up; the lease's `Result` is sent once that is done | the lease |
+| `PHASE_PREPARING` | switching the Mac's GUI session to the user of a whole-machine lease it holds (`session-login`: auto-login, then a userspace restart, which ends the daemon too), then running its action there | the lease |
+| `PHASE_RESTORING` | switching back after that lease's action ended (`session-idle`, the same restart), and cleaning up; the lease's `Result` is sent once that is done. A daemon restarted while the action ran (a crash or an update, not a switch) says this too: it killed the lease user's processes before its `Hello`, and the lease fails as the farm's, its result lost; the action is never run again | the lease |
 | `PHASE_QUARANTINED` | a cleanup failed; the node takes no lease until an operator repairs it | why |
 
 The server takes the phase of every `Hello`, the stream's first included, before it
@@ -128,8 +128,9 @@ the server keeps the lease the phase names for the session switch grace (10 minu
 rather than the lease grace G ([scheduler.md](scheduler.md#node-phases)). When the
 restarted daemon's first `Hello` names the lease, the server sends its `Start` again
 on that stream (same lease id, same action), and the daemon's runtime takes the lease
-up at the step it had reached. A phase that names a lease of this server's term that
-the server does not hold on the node is answered with a `Cancel` for it. A preparing or
+up at the step it had reached; an action that had started is not run again (see
+`PHASE_RESTORING`). A phase that names a lease of this server's term that the server
+does not hold on the node is answered with a `Cancel` for it. A preparing or
 restoring phase without a lease ends the stream `INVALID_ARGUMENT`; a phase value the
 server does not know is read as a quarantine that says so.
 

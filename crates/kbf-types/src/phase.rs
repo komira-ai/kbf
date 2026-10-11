@@ -11,13 +11,15 @@ pub enum NodePhase {
     #[default]
     Serving,
     /// It switches the GUI session to the user of this whole-machine lease, which it
-    /// holds and has not started yet. The switch restarts the daemon: the scheduler
-    /// keeps the lease while the worker is silent for up to its session switch grace
-    /// (`kbf_sched::fence::SESSION_SWITCH_GRACE`), and sends its `Start` again to the
-    /// session that names it after the restart.
+    /// holds, then runs the lease's action there. The switch restarts the daemon: the
+    /// scheduler keeps the lease while the worker is silent for up to its session
+    /// switch grace (`kbf_sched::fence::SESSION_SWITCH_GRACE`), and sends its `Start`
+    /// again to the session that names it after the restart.
     Preparing(LeaseId),
-    /// It switches the session back after this whole-machine lease's action ended,
-    /// and cleans up; the lease's result is sent when it is done. Kept like
+    /// It switches the session back after this whole-machine lease's action ended, or
+    /// after the daemon restarted while the action ran (its processes are killed and
+    /// the lease fails: its result is lost; it is never run again), and cleans up; the
+    /// lease's result is sent when it is done. Kept like
     /// [`NodePhase::Preparing`].
     Restoring(LeaseId),
     /// Its cleanup failed, and why. It takes no lease until an operator repairs it.
