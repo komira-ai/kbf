@@ -338,8 +338,8 @@ t_vo_fail() {
     calls 'sudo -n -H -u kbfp0 hdiutil attach -nobrowse -owners on -mountpoint' 1
     calls 'sudo -n -H -u kbfp0 chown 0:0' 1
     want 'volume_owner.write.mount=/dev/disk4s1 on '
-    want 'm-user-1 (apfs, local, nodev, nosuid, journaled, mounted by kbfp0)'
-    want 'm-user-2 (apfs, local, nodev, nosuid, journaled, mounted by root)'
+    want 'm-user-1 (apfs, local, nodev, nosuid, journaled, nobrowse, mounted by kbfp0)'
+    want 'm-user-2 (apfs, local, nodev, nosuid, read-only, journaled, nobrowse)'
     calls 'sudo -n hdiutil attach -nobrowse -owners on -readonly -mountpoint' 2
     vo_cleaned
     verdict_is FAIL

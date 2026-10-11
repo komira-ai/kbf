@@ -74,9 +74,10 @@ case "$NAME" in
                 echo "created: $img"
                 ;;
             attach)
-                mnt=
+                mnt= ro=
                 while [ $# -gt 1 ]; do
                     if [ "$1" = -mountpoint ]; then mnt=$2; fi
+                    if [ "$1" = -readonly ]; then ro=" read-only,"; fi
                     shift
                 done
                 img=$1
@@ -86,8 +87,9 @@ case "$NAME" in
                 fi
                 [ -d "$img.store" ] || exit 1
                 rmdir "$mnt" && ln -s "$img.store" "$mnt"
-                if [ "${FAKE_UID:-501}" = 0 ]; then by=root; else by=${FAKE_AS:-runner}; fi
-                echo "/dev/disk4s1 on $mnt (apfs, local, nodev, nosuid, journaled, mounted by $by)" >>"$S/mounts"
+                # The flags hosted runners printed; "mounted by" only for a user's attach.
+                if [ "${FAKE_UID:-501}" = 0 ]; then by=; else by=", mounted by ${FAKE_AS:-runner}"; fi
+                echo "/dev/disk4s1 on $mnt (apfs, local, nodev, nosuid,$ro journaled, nobrowse$by)" >>"$S/mounts"
                 printf '/dev/disk4s1\t41504653-0000-11AA-AA11-00306543ECAC\t%s\n' "$mnt"
                 ;;
             detach)
