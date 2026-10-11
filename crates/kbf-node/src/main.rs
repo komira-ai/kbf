@@ -219,6 +219,11 @@ fn exit_code(e: &Error) -> ExitCode {
 }
 
 fn main() -> ExitCode {
+    // Each run's keeper (`kbf-keeper __keeper ...`) is this binary, dispatched before
+    // the flags are parsed, so a keeper never reads the daemon's command line.
+    if let Some(code) = kbf_daemon::keeper::dispatch() {
+        return code;
+    }
     let cli = Cli::parse();
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)

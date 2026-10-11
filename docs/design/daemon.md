@@ -107,11 +107,19 @@ re-adopts nothing (re-adopting is **planned**), so its runs are ended twice over
 #155): as it dies, by each run's keeper, and when a daemon is started again on the
 node, before it says `Hello`, by that daemon's start-up sweep.
 
-**The keeper.** Each run gets one: `/bin/sh` running a few lines, its stdin a pipe only
-the daemon holds the other end of (close-on-exec, so no action inherits it). The daemon
-never writes the pipe. When the daemon dies, however it dies, the kernel closes its end;
-the keeper reads end-of-file and ends the run. It ignores SIGHUP, SIGINT and SIGTERM,
-so a service manager stopping the daemon's unit with SIGTERM does not stop it first.
+**The keeper.** Each run gets one: the daemon's own binary started again in its hidden
+keeper mode (`kbf-keeper __keeper group` or `__keeper cgroup <cgroup.kill> <tries>`;
+`kbf_daemon::keeper`), which `main` dispatches before it parses any flag. Its stdin is a
+pipe only the daemon holds the other end of (close-on-exec, so no action inherits it).
+The daemon never writes the pipe. When the daemon dies, however it dies, the kernel
+closes its end; the keeper reads end-of-file and ends the run. It ignores SIGHUP, SIGINT
+and SIGTERM, so a service manager stopping the daemon's unit with SIGTERM does not stop
+it first, and only then writes a ready line on stdout: the daemon waits for that line,
+so a run starts only once its keeper ignores those signals, and a program that does not
+answer as a keeper refuses the run. The program is `/proc/self/exe` on Linux, the file
+the daemon runs even after an update renamed a new binary over it; on macOS it is the
+path the daemon was started by, which names the new binary after such a swap, so the
+keeper's arguments are kept the same from one version to the next.
 This needs no restart, so a killed daemon's runs no longer go on while the scheduler
 requeues their leases elsewhere after the handover grace.
 
@@ -123,7 +131,7 @@ requeues their leases elsewhere after the handover grace.
   group id names this action's group, since the kernel reuses no pid that names a live
   group; and the daemon's kill of the group at the end of a lease, or the sweep's,
   ends the keeper with the rest, so it needs no dismissal. It counts toward the
-  lease's memory (a shell, about a megabyte).
+  lease's memory.
 - **Container driver.** The keeper starts once the lease cgroup is made, before
   `podman create`, in a process group of its own. At end-of-file it writes the lease
   cgroup's `cgroup.kill`, which kills every process in the lease, the container's

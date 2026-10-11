@@ -23,6 +23,10 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tonic::transport::{Certificate, Channel, Endpoint, Identity, ServerTlsConfig};
 
 use super::tests::{scratch, surveyed};
+
+// The native runtime here starts its keepers from the running binary: this test binary,
+// whose `main` (the one that calls `kbf_daemon::keeper::dispatch`) does not run.
+kbf_daemon::keeper_test_hook!();
 use super::{Cli, native_config, native_with};
 use clap::Parser as _;
 

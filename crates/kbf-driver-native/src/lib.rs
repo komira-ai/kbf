@@ -124,5 +124,9 @@ pub mod whole_machine;
 pub mod xcode;
 pub mod xcode_watch;
 
+// The keepers this crate's unit tests start come from the test binary.
+#[cfg(test)]
+kbf_daemon::keeper_test_hook!();
+
 pub use config::{MemoryPolicy, NativeConfig};
 pub use runtime::{DRIVER, KIND, NativeRuntime, SURVEY_DIR};
