@@ -25,7 +25,6 @@ use std::hash::BuildHasher;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use kbf_caps::NodeCaps;
 use kbf_front::{Cache, Dispatch, Finished, MetaLog, Stage, Submission, Ticket};
 use kbf_meta::{ActionRecord, Role};
 use kbf_objstore::ObjectStore;
@@ -35,17 +34,20 @@ use kbf_proto::worker::{
     self, Cancel, LeaseOffer, NodeStatus, ResultAck, ServerMessage, Start, server_message,
 };
 use kbf_sched::fence::START_VALIDITY;
-use kbf_sched::{Cordon, DaemonInstance, Event, Input, NodePhase, OpState, Requeue, Scheduler};
+use kbf_sched::{Cordon, DaemonInstance, Event, Input, OpState, Requeue, Scheduler};
 use kbf_types::{
     Answer, ControlRecord, Digest, Effect, Failure, FarmTime, LeaseGrant, LeaseId, OperationId,
-    Outcome, Refusal, Resources, StartLease, StateMachine, WaiterId, Waiting, WorkerId,
+    Outcome, Refusal, StartLease, StateMachine, WaiterId, Waiting, WorkerId,
 };
 use tokio::sync::{mpsc, watch};
 use tonic::{Code, Status};
 
+mod phase;
+
+pub use phase::Reported;
+
 use crate::fleet::{
-    NodeView, NodesView, PhaseView, PlacementView, SoftwareView, attention_changes,
-    needs_attention, quarantine_change,
+    NodeView, NodesView, PhaseView, PlacementView, SoftwareView, attention_changes, needs_attention,
 };
 use crate::machine::{FarmMachine, Sent, Waiter};
 use crate::memory;
@@ -96,30 +98,6 @@ pub struct Farm<M, O> {
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 #[error("no node {0} has registered")]
 pub struct UnknownNode(pub String);
-
-/// What a `Hello` says about its node that the scheduler takes: the capacity placement
-/// may book, the capabilities placement matches, and the node's phase.
-#[derive(Clone, Debug)]
-pub struct Reported {
-    /// What placement may book.
-    pub capacity: Resources,
-    /// What it offers.
-    pub caps: NodeCaps,
-    /// What it is doing besides running leases.
-    pub phase: NodePhase,
-}
-
-impl Reported {
-    /// A serving node with `capacity` and `caps`.
-    #[must_use]
-    pub const fn serving(capacity: Resources, caps: NodeCaps) -> Self {
-        Self {
-            capacity,
-            caps,
-            phase: NodePhase::Serving,
-        }
-    }
-}
 
 /// What an operator does to a node's placement.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -711,38 +689,6 @@ impl State {
             memory::pressure(worker, self.sched.memory_pressure(worker));
         }
         (answers, accepted)
-    }
-
-    /// Takes `worker`'s phase, then places: sends a switching lease's `Start` again,
-    /// or a `Cancel` for one not held here, and logs a quarantine raised or cleared.
-    fn phase(&mut self, now: FarmTime, worker: &WorkerId, phase: NodePhase) {
-        let before = self.sched.phase(worker).cloned().unwrap_or_default();
-        if let Some((raise, line)) = quarantine_change(worker.as_str(), &before, &phase) {
-            if raise {
-                tracing::warn!(target: "kbf_server::attention", "{line}");
-            } else {
-                tracing::info!(target: "kbf_server::attention", "{line}");
-            }
-        }
-        let switching = phase.switching();
-        let event = Event::Phase {
-            worker: worker.clone(),
-            phase,
-        };
-        self.feed_quiet(now, event);
-        let Some(lease) = switching else {
-            return;
-        };
-        if self.sched.not_held(worker, &[lease]).next().is_some() {
-            tracing::info!(%worker, %lease, "the node switches its session for a lease not held here: cancelled");
-            let cancel = server_message::Message::Cancel(Cancel {
-                lease_id: Some(wire_lease(lease)),
-            });
-            // A phase comes on the worker's current stream, so it has a link.
-            let _ = self.links[worker].outbound.send(Ok(ServerMessage {
-                message: Some(cancel),
-            }));
-        }
     }
 
     fn is_current(&self, worker: &WorkerId, stream: StreamId) -> bool {

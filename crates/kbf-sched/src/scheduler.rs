@@ -1,6 +1,7 @@
 //! The scheduler state machine.
 
 pub(crate) mod memory;
+mod phase;
 mod state;
 
 pub use state::OpState;
@@ -17,7 +18,7 @@ use kbf_types::{
 };
 
 use crate::cordon::{Cordon, Cordons};
-use crate::fence::{HANDOVER_GRACE, LEASE_GRACE, SESSION_SWITCH_GRACE, START_GRACE};
+use crate::fence::{HANDOVER_GRACE, LEASE_GRACE, START_GRACE};
 use crate::input::{DaemonInstance, Event, Input, Request};
 use crate::requeue::{Requeue, RequeueReason};
 use crate::servable::{Servable, Verdict};
@@ -518,53 +519,6 @@ impl Scheduler {
         for (id, reason) in expired {
             self.requeue(id, reason);
         }
-    }
-
-    /// Takes `worker`'s phase (see [`Event::Phase`]); returns the `Start` sent again
-    /// for the lease it switches the session for, if that `Start` went to an earlier
-    /// session.
-    fn take_phase(&mut self, worker: &WorkerId, phase: NodePhase) -> Vec<Effect> {
-        let now = self.now;
-        let Some(w) = self.workers.get_mut(worker) else {
-            return Vec::new();
-        };
-        w.last_heard = w.last_heard.max(now);
-        if w.phase != phase {
-            w.switch_ends = now.saturating_add(SESSION_SWITCH_GRACE);
-        }
-        w.phase = phase;
-        let (session, process) = (w.session, w.process);
-        let Some(lease) = w.phase.switching() else {
-            return Vec::new();
-        };
-        let Some(held) = self.held.get_mut(&lease) else {
-            return Vec::new();
-        };
-        let op = &self.ops[&held.operation];
-        let here = op.state.holding().is_some_and(|(_, w)| w == worker);
-        // Not committed yet (its `Start` goes out when it is), or already sent to this
-        // session.
-        if !held
-            .start_sent
-            .is_some_and(|sent| here && sent.session != session)
-        {
-            return Vec::new();
-        }
-        held.start_sent = Some(StartSent {
-            at: now,
-            session,
-            process,
-        });
-        vec![Effect::Start(StartLease {
-            worker: worker.clone(),
-            lease,
-            operation: held.operation,
-            key: op.request.key.clone(),
-            kind: op.request.kind,
-            resources: held.booked,
-            fence: op.request.fence(),
-            device: held.device.clone(),
-        })]
     }
 
     /// Sends back to the queue every committed lease held on `worker` that `running`
