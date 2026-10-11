@@ -9,7 +9,7 @@
 # temporary files there; with $FAKE_STATE/xcodebuild_fails_after_tests, its xcodebuild
 # exits 65 after the tests passed. Under the driver's profile (the fake
 # sandbox-exec exports FAKE_SANDBOX=driver) it reports the denies a sandboxed run
-# would, two (the same) from itself and one from a child it keeps alive for a second,
+# would, two (the same) from itself and one from a child it keeps alive for 0.6 s,
 # so the probe's sampler sees it. Every test run also reports one deny of a process
 # outside its tree (pid 1). It writes its HOME and its own directory to
 # $FAKE_STATE/home.<platform>.<action>.<driver|none> and src.<...>. The result
@@ -56,7 +56,7 @@ result=PASS
 if [ "${FAKE_SANDBOX-}" = driver ]; then
     report xcodebuild $$ "file-write-create /Library/Caches/com.apple.dt.xcodebuild"
     report xcodebuild $$ "file-write-create /Library/Caches/com.apple.dt.xcodebuild"
-    S=$S bash -c 'printf "%s E  kernel[0:1] (Sandbox) Sandbox: lsregister(%s) deny(1) lsopen\n" "2026-10-11 12:00:00.000" "$$" >>"$S/sandbox.log"; sleep 1'
+    S=$S bash -c 'printf "%s E  kernel[0:1] (Sandbox) Sandbox: lsregister(%s) deny(1) lsopen\n" "2026-10-11 12:00:00.000" "$$" >>"$S/sandbox.log"; sleep 0.6'
     case $action in
         test) if [ -e "$S/driver_fails_$p" ]; then result=FAIL; fi ;;
         test-without-building) if [ -e "$S/driver_tests_fails_$p" ]; then result=FAIL; fi ;;

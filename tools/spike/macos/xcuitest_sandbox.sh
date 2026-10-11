@@ -52,7 +52,8 @@
 # $SPIKE_RESULTS/<arm>-denies.txt.
 #
 # For the selftest only: SPIKE_PASS_ENV names variables passed into the runs as well;
-# SPIKE_LOG_SETTLE (5 s) and SPIKE_LOG_WAIT (30 s) bound the waits for the log.
+# SPIKE_LOG_SETTLE (5 s: how long after a run its window ends) and SPIKE_LOG_WAIT
+# (30 s) bound the waits for the log.
 
 HERE=$(cd "$(dirname "$0")" && pwd)
 # shellcheck source=tools/spike/macos/lib.sh
@@ -147,7 +148,8 @@ tracked() {
         sleep 0.2
     done
     wait "$root" || rc=$?
-    sleep 1
+    # The window ends LOG_SETTLE s after the run, so a report logged late is in it.
+    sleep "$LOG_SETTLE"
     st_set "$name.until" "$(date '+%Y-%m-%d %H:%M:%S')"
     tree_of "$root" "$snaps" >"$SPIKE_STATE/$PROBE.$name.pids"
     st_set "$name.rc" "$rc"
@@ -180,7 +182,6 @@ parse_denies() {
 denies() {
     local name=$1 min=${2:-0} pids=$SPIKE_STATE/$PROBE.$1.pids file=$SPIKE_RESULTS/$1-denies.txt
     local waited=0 tree
-    sleep "$LOG_SETTLE"
     while :; do
         log show --style compact --start "$(st_get "$name.since")" --end "$(st_get "$name.until")" \
             --predicate 'sender == "Sandbox"' 2>/dev/null | parse_denies |
