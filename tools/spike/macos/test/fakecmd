@@ -24,11 +24,15 @@ case "$NAME" in
     xcodebuild) printf 'Xcode 26.0\nBuild version 17A100\n' ;;
     launchctl) [ "$1" = managername ] && echo Aqua ;;
     stat)
-        # stat -f %Su /dev/console: the console user. stat -f %u:%g FILE: the owner this
-        # mount shows (FILE.view, a chown a mount took but did not store), else the
-        # stored one (FILE.owner, from cp and chown).
+        # stat -f %Su /dev/console: the console user. stat -f %u:%g FILE: the caller
+        # when the test says the mount at FILE's directory shows its reader as every
+        # owner (shows_caller_<mount>, what macOS does on a noowners volume), else the
+        # owner this mount shows (FILE.view, a chown a mount took but did not store),
+        # else the stored one (FILE.owner, from cp and chown).
         if [ "$2" = %Su ]; then
             echo runner
+        elif has "shows_caller_$(basename "$(dirname "$3")")"; then
+            if [ "${FAKE_UID:-501}" = 0 ]; then echo 0:0; else echo "${FAKE_UID:-501}:20"; fi
         elif [ -e "$3.view" ]; then
             cat "$3.view"
         elif [ -e "$3.owner" ]; then
@@ -87,9 +91,14 @@ case "$NAME" in
                 fi
                 [ -d "$img.store" ] || exit 1
                 rmdir "$mnt" && ln -s "$img.store" "$mnt"
-                # The flags hosted runners printed; "mounted by" only for a user's attach.
+                # The flags hosted runners printed; "mounted by" only for a user's attach;
+                # noowners when the test says this mount point ignores owners
+                # (noowners_<mount>); no line at all for unlisted_<mount>.
                 if [ "${FAKE_UID:-501}" = 0 ]; then by=; else by=", mounted by ${FAKE_AS:-runner}"; fi
-                echo "/dev/disk4s1 on $mnt (apfs, local, nodev, nosuid,$ro journaled, nobrowse$by)" >>"$S/mounts"
+                no=''
+                has "noowners_${mnt##*/}" && no=' noowners,'
+                has "unlisted_${mnt##*/}" ||
+                    echo "/dev/disk4s1 on $mnt (apfs, local, nodev, nosuid,$ro journaled,$no nobrowse$by)" >>"$S/mounts"
                 printf '/dev/disk4s1\t41504653-0000-11AA-AA11-00306543ECAC\t%s\n' "$mnt"
                 ;;
             detach)

@@ -332,6 +332,8 @@ t_vo_fail() {
     want 'volume_owner.write.chown=chown: '
     want 'Operation not permitted [rc=1]'
     want 'volume_owner.reattach.owner=502:20'
+    want 'volume_owner.write.copy_keep= [rc=0]'
+    want 'volume_owner.reattach.keep_owner=502:20'
     want 'volume_owner.control_reattach.owner=0:0'
     calls 'hdiutil create -size 64m -fs APFS' 2
     calls 'sudo -n -H -u kbfp0 hdiutil create' 1
@@ -346,12 +348,14 @@ t_vo_fail() {
 }
 
 # A volume that stores the standard user's chown: PASS. Catches a verdict that cannot
-# say PASS (an owner compared in the wrong form).
+# say PASS (an owner compared in the wrong form), and a keep owner read from the
+# chowned file instead of the one the user left at its uid.
 t_vo_pass() {
     : >"$T/state/owners_writable"
     probe volume_owner
     want 'volume_owner.write.chown= [rc=0]'
     want 'volume_owner.reattach.owner=0:0'
+    want 'volume_owner.reattach.keep_owner=502:20'
     verdict_is PASS
     vo_cleaned
 }
@@ -375,6 +379,66 @@ t_vo_control_lost() {
     probe volume_owner
     want 'volume_owner.reattach.owner=0:0'
     want 'volume_owner.control_reattach.owner=99:99'
+    verdict_is BROKEN
+}
+
+# The verifier's false PASS: root's re-attach of the user's image comes up noowners
+# and shows root as every owner, so the refused chown's file reads 0:0. BROKEN, for
+# the mount flags. Catches a verdict that never reads the re-attach's mount line. The
+# test's own directory puts the word noowners in every mount path, so it also catches
+# a check that searches the path instead of the flag list (the control's line would
+# match first).
+t_vo_noowners() {
+    : >"$T/state/noowners_m-user-2"
+    : >"$T/state/shows_caller_m-user-2"
+    probe volume_owner
+    want 'volume_owner.write.chown=chown: '
+    want 'm-user-2 (apfs, local, nodev, nosuid, read-only, journaled, noowners, nobrowse)'
+    want 'volume_owner.reattach.owner=0:0'
+    want 'volume_owner.reattach.keep_owner=0:0'
+    want "the re-attach of the user's image did not honour owners"
+    vo_cleaned
+    verdict_is BROKEN
+}
+
+# A re-attach that shows root as every owner with no noowners in its mount line: the
+# keep file reads 0:0, not the user's 502, so BROKEN. Catches a verdict whose only
+# evidence that the reader can show a non-root owner is the mount line.
+t_vo_shows_caller() {
+    : >"$T/state/shows_caller_m-user-2"
+    probe volume_owner
+    want 'm-user-2 (apfs, local, nodev, nosuid, read-only, journaled, nobrowse)'
+    want 'volume_owner.reattach.owner=0:0'
+    want "the re-attach read the file the user left at uid 502 as '0:0'"
+    verdict_is BROKEN
+}
+
+# The control's re-attach comes up noowners: its 0:0 is root shown as every owner,
+# not the stored owner (here lost to 99:99), so BROKEN even though the user's file
+# reads 0:0 and the keep file 502:20. Catches a verdict that checks only the user
+# re-attach's mount line.
+t_vo_control_noowners() {
+    : >"$T/state/owners_writable"
+    : >"$T/state/root_owner_lost"
+    : >"$T/state/noowners_m-control-2"
+    : >"$T/state/shows_caller_m-control-2"
+    probe volume_owner
+    want 'volume_owner.reattach.owner=0:0'
+    want 'volume_owner.reattach.keep_owner=502:20'
+    want 'volume_owner.control_reattach.owner=0:0'
+    want "the root control's re-attach did not honour owners"
+    verdict_is BROKEN
+}
+
+# A re-attach whose mount point is not in the mount table: its flags are unknown, so
+# BROKEN even when the owners read right. Catches a missing line taken as owners on.
+t_vo_mount_unlisted() {
+    : >"$T/state/owners_writable"
+    : >"$T/state/unlisted_m-user-2"
+    probe volume_owner
+    want 'volume_owner.reattach.mount=not in the mount table'
+    want 'volume_owner.reattach.owner=0:0'
+    want "the re-attach of the user's image did not honour owners (not in the mount table)"
     verdict_is BROKEN
 }
 
@@ -438,6 +502,7 @@ for test in t_lib t_watchdog t_am_already t_am_required_first t_am_control_noop 
     t_am_unknown t_am_user_drops t_am_adduser_hang t_simctl_pass t_simctl_deny_ignored t_simctl_bad_png \
     t_simctl_allow_fails t_simctl_bootstatus_fails t_simctl_delete_fails t_simctl_create_garbage \
     t_tcc_pass t_tcc_control_empty t_vo_fail t_vo_pass t_vo_chown_lies t_vo_control_lost \
+    t_vo_noowners t_vo_shows_caller t_vo_control_noowners t_vo_mount_unlisted \
     t_vo_admin_writer t_vo_user_existed t_vo_attach_fails t_verdicts; do
     t "$test"
 done
