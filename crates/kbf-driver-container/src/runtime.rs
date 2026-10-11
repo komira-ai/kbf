@@ -675,7 +675,7 @@ impl Lease {
             // `crun create` in the container's cgroup, and `podman rm --force` returns
             // without waiting for it, so the cgroup stays busy.
             let _ = self.cgroup.kill();
-            if let Err(e) = Ok::<(), String>(()) {
+            if let Err(e) = (if self.name.is_empty() { self.podman.remove_blocking(&self.name) } else { Ok(()) }) {
                 errors.push(e);
             }
         }
