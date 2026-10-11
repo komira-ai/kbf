@@ -131,6 +131,7 @@ fn worker_messages_round_trip() {
             memory_bytes: 1 << 30,
             heartbeat_seq: 12,
             valid_for_ms: 14_000,
+            device_id: "00008110-000A".to_owned(),
         })),
     };
     let back = ServerMessage::decode(start.encode_to_vec().as_slice()).expect("decode");
@@ -206,4 +207,20 @@ fn memory_kill_keeps_its_wire_numbers() {
         worker::MemoryKill::try_from(2),
         Ok(worker::MemoryKill::NodePressure)
     );
+}
+
+/// Catches a renumbered `Start.device_id`: the design names field 8
+/// (`docs/design/ios-devices.md#54-booking`), and a daemon and a server built from
+/// different revisions would read the device from another field, or not at all, and
+/// run a device test against no device. Also catches a device id sent when none was
+/// booked (an empty id is not on the wire, so an older daemon sees the Start it knew).
+#[test]
+fn start_device_id_is_field_8() {
+    let only = Start {
+        device_id: "d1".to_owned(),
+        ..Start::default()
+    };
+    // Field 8, length-delimited: tag 8 << 3 | 2 = 0x42.
+    assert_eq!(only.encode_to_vec(), [0x42, 2, b'd', b'1']);
+    assert!(Start::default().encode_to_vec().is_empty());
 }

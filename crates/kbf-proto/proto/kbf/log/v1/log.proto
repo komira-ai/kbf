@@ -301,14 +301,23 @@ message Property {
   string value = 2;
 }
 
-// What a node offers (kbf-caps NodeCaps). `exact`, `members` and `consumables` are maps
-// written in key order; `drivers` and every `values` are sets in increasing order.
+// What a node offers (kbf-caps NodeCaps). `exact`, `members`, `consumables` and
+// `devices` (by id) are maps written in key order; `drivers` and every `values` are sets
+// in increasing order.
 message NodeCaps {
   CpuCaps cpu = 1;
   repeated Property exact = 2;
   repeated MemberSet members = 3;
   repeated ConsumableAmount consumables = 4;
   repeated string drivers = 5;
+  repeated Device devices = 6;
+}
+
+// A ready iOS device a node reports: its id (the UDID) and its other attributes
+// (`class`, `os_version`, ...), a map written in key order.
+message Device {
+  string id = 1;
+  repeated Property attributes = 2;
 }
 
 // A CPU's architecture and its features, a set; its ISA level follows from them.

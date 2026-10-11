@@ -285,6 +285,17 @@ fn node_caps(caps: &NodeCaps) -> proto::NodeCaps {
             })
             .collect(),
         drivers: caps.drivers.iter().cloned().collect(),
+        devices: caps
+            .devices
+            .iter()
+            .map(|(id, attributes)| proto::Device {
+                id: id.clone(),
+                attributes: attributes
+                    .iter()
+                    .map(|(k, v)| property((k.as_str(), v.clone())))
+                    .collect(),
+            })
+            .collect(),
     }
 }
 
@@ -506,6 +517,16 @@ fn from_node_caps(
             .map(from_consumable)
             .collect::<Result<BTreeMap<_, _>, _>>()?,
         drivers: caps.drivers.into_iter().collect(),
+        devices: caps
+            .devices
+            .into_iter()
+            .map(|d| {
+                (
+                    d.id,
+                    d.attributes.into_iter().map(|p| (p.key, p.value)).collect(),
+                )
+            })
+            .collect(),
     })
 }
 

@@ -128,6 +128,12 @@ impl Rng {
             caps.consumables.insert(self.pick(&all), self.number());
         }
         caps.drivers = self.names();
+        for _ in 0..self.below(3) {
+            let attributes = (0..self.below(3))
+                .map(|_| (self.name(), self.name()))
+                .collect();
+            caps.devices.insert(self.name(), attributes);
+        }
         caps
     }
 
@@ -165,6 +171,20 @@ impl Rng {
             if k == "cpu.feature" {
                 features.push((k, v));
             } else {
+                props.insert(k, v);
+            }
+        }
+        // An iOS device, alone or with attributes; `os=linux` goes with none.
+        let attributes = [
+            ("ios.device.class", "iPhone"),
+            ("ios.device.product_type", "iPhone17,3"),
+            ("ios.device.os_version", "26.0"),
+            ("ios.device.os_build", "23A341"),
+        ];
+        if self.below(4) == 0 && props.get("os") != Some(&"linux") {
+            props.insert("ios.device", "1");
+            for _ in 0..self.below(5) {
+                let (k, v) = self.pick(&attributes);
                 props.insert(k, v);
             }
         }
@@ -761,6 +781,31 @@ fn bytes_encode_would_not_write_are_refused() {
         ..pcaps(1, 1)
     };
     cases.push(("consumables out of order", capacity(Some(consumables))));
+    let device = |id: &str, keys: &[&str]| proto::Device {
+        id: id.to_owned(),
+        attributes: keys
+            .iter()
+            .map(|k| proto::Property {
+                key: (*k).to_owned(),
+                value: String::new(),
+            })
+            .collect(),
+    };
+    let devices = proto::NodeCaps {
+        devices: vec![device("b", &[]), device("a", &[])],
+        ..pcaps(1, 1)
+    };
+    cases.push(("devices out of order", capacity(Some(devices))));
+    let devices = proto::NodeCaps {
+        devices: vec![device("a", &[]), device("a", &[])],
+        ..pcaps(1, 1)
+    };
+    cases.push(("devices repeated", capacity(Some(devices))));
+    let attributes = proto::NodeCaps {
+        devices: vec![device("a", &["os_version", "class"])],
+        ..pcaps(1, 1)
+    };
+    cases.push(("device attributes out of order", capacity(Some(attributes))));
     // A capability request in another order than kbf-caps writes, or with a key
     // `parse` skips.
     cases.push((
@@ -769,6 +814,14 @@ fn bytes_encode_would_not_write_are_refused() {
             builtin(1),
             1,
             &[("os", "linux"), ("arch", "arm64")],
+        )),
+    ));
+    cases.push((
+        "device needs out of order",
+        submit(prequest(
+            builtin(1),
+            1,
+            &[("ios.device.class", "iPhone"), ("ios.device", "1")],
         )),
     ));
     cases.push((

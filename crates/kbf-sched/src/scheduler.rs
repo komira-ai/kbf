@@ -77,11 +77,13 @@ struct Unservable {
 }
 
 /// A lease currently held (leased or running).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct Held {
     operation: OperationId,
     /// What it booked on its worker.
     booked: Resources,
+    /// The iOS device it booked on its worker, by id.
+    device: Option<String>,
     /// When and to which session its `Start` was emitted; `None` until its grant is
     /// committed.
     start_sent: Option<StartSent>,
@@ -104,6 +106,9 @@ pub(crate) struct Worker {
     pub(crate) leases: usize,
     /// A whole-machine lease holds it: nothing else is placed on it.
     pub(crate) whole: bool,
+    /// The iOS devices its leases booked, by id. A booking lasts until its lease ends,
+    /// whatever the worker's reports say meanwhile ([`crate::devices`]).
+    pub(crate) devices: BTreeSet<String>,
     last_heard: FarmTime,
     /// Counts the worker's registrations: the session a `Start` emitted now goes to.
     session: u64,
@@ -128,14 +133,17 @@ impl Worker {
 
     /// Whether `request` can be placed on it now, platform and kind aside: an action
     /// if no whole-machine lease holds it and its free room holds the request; a
-    /// whole-machine lease if it holds no lease and its capacity holds the request.
+    /// whole-machine lease if it holds no lease and its capacity holds the request. A
+    /// request for an iOS device also needs a free device that satisfies it
+    /// ([`Worker::free_device`]).
     pub(crate) fn has_room(&self, request: &Request) -> bool {
-        match request.kind {
+        let room = match request.kind {
             LeaseKind::WholeMachine => self.leases == 0 && self.capacity.fits(&request.resources),
             LeaseKind::Action | LeaseKind::Vm => {
                 !self.whole && self.free().fits(&request.resources)
             }
-        }
+        };
+        room && (!request.needs.wants_device() || self.free_device(&request.needs).is_some())
     }
 }
 
@@ -426,6 +434,9 @@ impl Scheduler {
             if let Some((w, held)) = self.workers.get_mut(worker).zip(held) {
                 w.booked = w.booked.saturating_sub(held.booked);
                 w.leases -= 1;
+                if let Some(device) = &held.device {
+                    w.devices.remove(device);
+                }
                 if op.request.kind == LeaseKind::WholeMachine {
                     w.whole = false;
                 }
@@ -551,7 +562,7 @@ impl Scheduler {
             let fitted = placed.len() < PLACEMENT_ROUND
                 && servable
                     .fit(&mut self.workers, request, &reserved)
-                    .map(|(name, booked)| placed.push((id, name, booked)))
+                    .map(|(name, booked, device)| placed.push((id, name, booked, device)))
                     .is_some();
             let verdict = if fitted {
                 Verdict::Servable
@@ -579,7 +590,7 @@ impl Scheduler {
         for (id, verdict) in verdicts {
             self.note(id, verdict, effects);
         }
-        for (id, worker, booked) in placed {
+        for (id, worker, booked, device) in placed {
             let lease = LeaseId::new(self.term, self.next_seq);
             self.next_seq += 1;
             let op = self.ops.get_mut(&id).expect("queued operations exist");
@@ -594,6 +605,7 @@ impl Scheduler {
                 Held {
                     operation: id,
                     booked,
+                    device,
                     start_sent: None,
                 },
             );
@@ -711,13 +723,13 @@ impl Scheduler {
                 process,
             };
             // A leased operation's lease is always held: no branch on it.
-            let booked = self
-                .held
-                .get_mut(&*lease)
-                .map_or(op.request.resources, |held| {
-                    held.start_sent = Some(sent);
-                    held.booked
-                });
+            let (booked, device) =
+                self.held
+                    .get_mut(&*lease)
+                    .map_or((op.request.resources, None), |held| {
+                        held.start_sent = Some(sent);
+                        (held.booked, held.device.clone())
+                    });
             effects.push(Effect::Start(StartLease {
                 worker: worker.clone(),
                 lease: *lease,
@@ -726,6 +738,7 @@ impl Scheduler {
                 kind: op.request.kind,
                 resources: booked,
                 fence: op.request.fence(),
+                device,
             }));
         }
     }
@@ -848,6 +861,7 @@ impl StateMachine for Scheduler {
                                 booked: Resources::default(),
                                 leases: 0,
                                 whole: false,
+                                devices: BTreeSet::new(),
                                 last_heard: now,
                                 session: 0,
                                 instance,

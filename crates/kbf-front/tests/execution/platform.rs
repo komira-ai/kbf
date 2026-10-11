@@ -313,37 +313,72 @@ async fn property_names_are_read_in_any_case() {
     assert_eq!(script.submitted().len(), 1);
 }
 
-/// Catches: an `ios.device` request accepted before the scheduler books devices. An
-/// unknown property is ignored, so `ios.device=1` would match every worker, Linux
-/// included, and a device test would run with no device; so would an attribute key
-/// (`ios.device.os`, `ios.device.os_version`) in any case. Also catches a refusal that
-/// does not name the key, and names that only begin like a device key (`ios.devices`,
-/// `ios.simulator`, `iosx`) refused instead of left alone.
+/// Catches: an `ios.device` request still refused once devices are booked, or passed on
+/// without its device attributes (the scheduler would book any device); and each
+/// device refusal the design names let through to the scheduler: a device on a
+/// `whole_machine` lease, an attribute without `ios.device=1`, an attribute kbf does
+/// not know, a count other than 1, and a device on Linux. Also catches names that only
+/// begin like a device key (`ios.devices`, `ios.simulator`, `iosx`) refused instead of
+/// left alone.
 #[tokio::test]
-async fn ios_device_keys_are_refused_until_devices_are_booked() {
+async fn ios_device_requests_reach_the_scheduler_and_bad_ones_are_refused() {
     let script = Arc::new(Script::default());
     let farm = Farm::with_execution(Arc::clone(&script)).await;
-    for (key, props) in [
+    let good = [
+        ("OSFamily", "darwin"),
+        ("IOS.Device", "1"),
+        ("ios.device.class", "iPad"),
+    ];
+    let device = job("device", &good, false);
+    farm.upload(&device.blobs.iter().collect::<Vec<_>>()).await;
+    start(&farm, &device.action)
+        .await
+        .expect("a device request");
+    let submitted = script.submitted();
+    let [submission] = submitted.as_slice() else {
+        panic!("{submitted:?}");
+    };
+    let canonical = [
+        ("OSFamily", "darwin"),
+        ("ios.device", "1"),
+        ("ios.device.class", "iPad"),
+    ];
+    assert_eq!(
+        submission.request.needs,
+        kbf_caps::Request::from_platform(canonical).unwrap()
+    );
+    assert!(submission.request.needs.wants_device());
+
+    for (why, props, names) in [
         (
-            "ios.device",
-            vec![("OSFamily", "darwin"), ("ios.device", "1")],
+            "whole machine",
+            vec![("kbf-lease", "whole_machine"), ("ios.device", "1")],
+            "whole_machine",
         ),
-        ("ios.device.os", vec![("ios.device.os", "26.0")]),
         (
-            "ios.device.os_version",
-            vec![("IOS.Device.OS_Version", "26.0")],
+            "alone",
+            vec![("ios.device.os_version", "26.0")],
+            "\"ios.device.os_version\"",
+        ),
+        (
+            "unknown",
+            vec![("ios.device", "1"), ("ios.device.os", "26.0")],
+            "\"ios.device.os\"",
+        ),
+        ("count", vec![("ios.device", "2")], "\"ios.device\""),
+        (
+            "linux",
+            vec![("OSFamily", "linux"), ("ios.device", "1")],
+            "\"linux\"",
         ),
     ] {
-        let bad = job(key, &props, false);
+        let bad = job(why, &props, false);
         farm.upload(&bad.blobs.iter().collect::<Vec<_>>()).await;
-        let status = start(&farm, &bad.action).await.expect_err(key);
-        assert_eq!(status.code(), Code::InvalidArgument, "{key}: {status:?}");
-        assert!(
-            status.message().contains(&format!("{key:?}")),
-            "{key}: {status:?}"
-        );
+        let status = start(&farm, &bad.action).await.expect_err(why);
+        assert_eq!(status.code(), Code::InvalidArgument, "{why}: {status:?}");
+        assert!(status.message().contains(names), "{why}: {status:?}");
     }
-    assert!(script.submitted().is_empty());
+    assert_eq!(script.submitted().len(), 1);
 
     for name in ["ios.devices", "ios.simulator", "iosx"] {
         let other = job(name, &[(name, "1")], false);
@@ -351,8 +386,8 @@ async fn ios_device_keys_are_refused_until_devices_are_booked() {
         start(&farm, &other.action).await.expect(name);
     }
     let submitted = script.submitted();
-    assert_eq!(submitted.len(), 3);
-    for submission in &submitted {
+    assert_eq!(submitted.len(), 4);
+    for submission in &submitted[1..] {
         assert_eq!(submission.request.needs, kbf_caps::Request::default());
     }
 }

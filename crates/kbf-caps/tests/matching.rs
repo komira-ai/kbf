@@ -259,3 +259,39 @@ fn a_request_is_written_as_the_properties_it_parses_from() {
     assert_eq!(read, request);
     assert!(Request::default().properties().is_empty());
 }
+
+/// Catches `properties` leaving out a request's iOS device, or writing an attribute
+/// under another attribute's key (a replayed device lease would then book any device,
+/// or the wrong one): a request for a device with all four attributes, each a
+/// different value, is written after the other keys and read back as itself, and a
+/// request for any device is written as `ios.device=1` alone.
+#[test]
+fn a_device_request_is_written_as_the_properties_it_parses_from() {
+    let given = [
+        ("ios.device.os_build", "23A341"),
+        ("ios.device.class", "iPhone"),
+        ("os", "macos"),
+        ("ios.device.os_version", "26.0"),
+        ("ios.device", "1"),
+        ("ios.device.product_type", "iPhone17,3"),
+    ];
+    let request = Request::parse(given).unwrap();
+    let written = request.properties();
+    let want: Vec<(&str, String)> = [
+        ("os", "macos"),
+        ("ios.device", "1"),
+        ("ios.device.class", "iPhone"),
+        ("ios.device.product_type", "iPhone17,3"),
+        ("ios.device.os_version", "26.0"),
+        ("ios.device.os_build", "23A341"),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k, v.to_owned()))
+    .collect();
+    assert_eq!(written, want);
+    let read = Request::parse(written.iter().map(|(k, v)| (*k, v.as_str()))).unwrap();
+    assert_eq!(read, request);
+    let any = Request::parse([("ios.device", "1")]).unwrap();
+    assert_eq!(any.properties(), vec![("ios.device", "1".to_owned())]);
+    assert_ne!(any, Request::default());
+}
