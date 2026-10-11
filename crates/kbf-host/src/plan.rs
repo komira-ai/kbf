@@ -48,7 +48,7 @@ impl<'a, E: Exec> Planner<'a, E> {
         perms: Perms,
         owner: Option<Owner>,
         bytes: Vec<u8>,
-    ) -> Result<(), DeployError> {
+    ) -> Result<(), HostError> {
         let done = match self.inspect(&path)? {
             Some(Entry::File {
                 perms: p,
@@ -74,7 +74,7 @@ impl<'a, E: Exec> Planner<'a, E> {
         path: HostPath,
         perms: Perms,
         owner: Option<Owner>,
-    ) -> Result<(), DeployError> {
+    ) -> Result<(), HostError> {
         let done = match self.inspect(&path)? {
             Some(Entry::Dir { perms: p, owner: o }) => p == perms && owner.is_none_or(|w| w == o),
             _ => false,
@@ -86,7 +86,7 @@ impl<'a, E: Exec> Planner<'a, E> {
     }
 
     /// Nothing is at `path`.
-    pub fn absent(&mut self, path: HostPath) -> Result<(), DeployError> {
+    pub fn absent(&mut self, path: HostPath) -> Result<(), HostError> {
         if self.inspect(&path)?.is_some() {
             self.plan.steps.push(Step::Remove { path });
         }
@@ -108,10 +108,10 @@ impl<'a, E: Exec> Planner<'a, E> {
         self.plan
     }
 
-    fn inspect(&self, path: &HostPath) -> Result<Option<Entry>, DeployError> {
+    fn inspect(&self, path: &HostPath) -> Result<Option<Entry>, HostError> {
         self.exec
             .inspect(path)
-            .map_err(|source| DeployError::Inspect {
+            .map_err(|source| HostError::Inspect {
                 path: path.clone(),
                 source,
             })
@@ -138,7 +138,7 @@ pub enum RunAs {
 
 /// Why a plan could not be made or carried out.
 #[derive(Debug, thiserror::Error)]
-pub enum DeployError {
+pub enum HostError {
     #[error("this step changes the host as root: run it with sudo (effective uid is {euid})")]
     NotRoot { euid: u32 },
     #[error("this step runs as a user, not as root: run it without sudo")]
@@ -174,12 +174,12 @@ pub fn execute<E: Exec, W: Write>(
     mode: Mode,
     exec: &mut E,
     out: &mut W,
-) -> Result<(), DeployError> {
+) -> Result<(), HostError> {
     if mode == Mode::Apply {
         let euid = exec.euid();
         match run_as {
-            RunAs::Root if euid != 0 => return Err(DeployError::NotRoot { euid }),
-            RunAs::User if euid == 0 => return Err(DeployError::IsRoot),
+            RunAs::Root if euid != 0 => return Err(HostError::NotRoot { euid }),
+            RunAs::User if euid == 0 => return Err(HostError::IsRoot),
             _ => {}
         }
         if euid == 0 {
@@ -187,14 +187,14 @@ pub fn execute<E: Exec, W: Write>(
         }
     }
     if plan.is_empty() {
-        return writeln!(out, "{NOTHING_TO_DO}").map_err(DeployError::Output);
+        return writeln!(out, "{NOTHING_TO_DO}").map_err(HostError::Output);
     }
     for (index, step) in plan.steps().iter().enumerate() {
         match mode {
-            Mode::DryRun => writeln!(out, "DRY-RUN: {step}").map_err(DeployError::Output)?,
+            Mode::DryRun => writeln!(out, "DRY-RUN: {step}").map_err(HostError::Output)?,
             Mode::Apply => {
-                writeln!(out, "+ {step}").map_err(DeployError::Output)?;
-                exec.apply(step).map_err(|source| DeployError::Step {
+                writeln!(out, "+ {step}").map_err(HostError::Output)?;
+                exec.apply(step).map_err(|source| HostError::Step {
                     index,
                     step: step.to_string(),
                     source,
@@ -203,7 +203,7 @@ pub fn execute<E: Exec, W: Write>(
         }
     }
     if mode == Mode::DryRun {
-        writeln!(out, "{DRY_RUN_NOTE}").map_err(DeployError::Output)?;
+        writeln!(out, "{DRY_RUN_NOTE}").map_err(HostError::Output)?;
     }
     Ok(())
 }

@@ -1190,8 +1190,8 @@ name = "kbf-deploy"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "kbf-host",
  "kbf-types",
- "rustix",
  "thiserror",
 ]
 
@@ -1274,6 +1274,14 @@ dependencies = [
  "hex",
  "libc",
  "subtle",
+ "thiserror",
+]
+
+[[package]]
+name = "kbf-host"
+version = "0.1.0"
+dependencies = [
+ "rustix",
  "thiserror",
 ]
 
@@ -1597,6 +1605,7 @@ dependencies = [
  "base64 0.23.1",
  "clap",
  "hex",
+ "kbf-host",
  "libc",
  "ring",
  "rustix",

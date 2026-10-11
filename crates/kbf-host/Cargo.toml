@@ -1,0 +1,23 @@
+[package]
+name = "kbf-host"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# The one way kbf changes a host: a plan of steps, printed or applied through an `Exec`
+# that is the host or a recording fake. kbf-deploy's kits and kbf-updater's applier
+# both go through it.
+
+[features]
+# `testkit`: the recording `FakeExec` and scratch directories, for other crates' tests.
+testkit = []
+
+[dependencies]
+rustix = { workspace = true, features = ["process"] }
+thiserror.workspace = true
+
+[lints]
+workspace = true

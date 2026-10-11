@@ -7,15 +7,19 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
-# The deploy tool: a plan of steps, printed by default and carried out with `--apply`,
-# through an `Exec` that is the host or a recording fake, and the kits built on it as
-# subcommands. Today one kit exists: `linux` (render-units, check-units).
+# The deploy tool: its kits as subcommands. A kit that changes a host does it through
+# kbf-host's plan of steps, printed by default and carried out with `--apply`. Today one
+# kit exists, `linux` (render-units, check-units), which writes only into the directory
+# it is given.
 
 [dependencies]
 clap.workspace = true
+kbf-host.workspace = true
 kbf-types.workspace = true
-rustix = { workspace = true, features = ["process"] }
 thiserror.workspace = true
+
+[dev-dependencies]
+kbf-host = { workspace = true, features = ["testkit"] }
 
 [lints]
 workspace = true

@@ -12,7 +12,8 @@
 //! - [`set`]: the software set and the checks of S3.1.
 //! - [`state`]: the state file (installed, staged, in progress, the serial floor).
 //! - [`updater`]: the three verbs over an [`apply::Applier`].
-//! - [`apply`]: the applier interface, a fake for tests, and the apt-snapshot applier.
+//! - [`apply`]: the applier interface, a fake for tests, and the apt-snapshot applier,
+//!   which changes the node only through `kbf-host`'s plans.
 //! - `caller` and `server` (Linux): the caller check, the kernel floor, the refusal to
 //!   run beside `--driver native`, and the socket.
 //!

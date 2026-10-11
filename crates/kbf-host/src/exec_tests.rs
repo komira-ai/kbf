@@ -86,7 +86,7 @@ fn a_write_replaces_the_file_through_a_fresh_copy() {
     let (mut exec, dir) = host("replace");
     fs::write(dir.join("f"), "old").expect("seed");
     let held = fs::File::open(dir.join("f")).expect("open the old file");
-    fs::write(dir.join(".f.kbf-deploy-tmp"), "stale").expect("stale copy");
+    fs::write(dir.join(".f.kbf-host-tmp"), "stale").expect("stale copy");
     let step = Step::WriteFile {
         path: p("/f"),
         perms: Perms::new(0o644),
@@ -100,7 +100,7 @@ fn a_write_replaces_the_file_through_a_fresh_copy() {
         .read_to_string(&mut old)
         .expect("read the held file");
     assert_eq!(old, "old", "the file was rewritten in place");
-    assert!(!dir.join(".f.kbf-deploy-tmp").exists());
+    assert!(!dir.join(".f.kbf-host-tmp").exists());
 }
 
 /// Catches `Mkdir` treating a file at the path as the directory (it would chmod the
@@ -177,7 +177,7 @@ fn a_write_into_a_missing_directory_fails() {
 #[test]
 fn a_stale_copy_that_cannot_be_removed_fails_the_write() {
     let (mut exec, dir) = host("stuck");
-    fs::create_dir(dir.join(".f.kbf-deploy-tmp")).expect("a directory where the copy goes");
+    fs::create_dir(dir.join(".f.kbf-host-tmp")).expect("a directory where the copy goes");
     let step = Step::WriteFile {
         path: p("/f"),
         perms: Perms::new(0o644),

@@ -162,14 +162,14 @@ fn apply_refuses_the_wrong_user_before_any_step() {
     let plan = kit(&user);
     let err = execute(&plan, RunAs::Root, Mode::Apply, &mut user, &mut Vec::new());
     assert!(
-        matches!(err, Err(DeployError::NotRoot { euid: 501 })),
+        matches!(err, Err(HostError::NotRoot { euid: 501 })),
         "{err:?}"
     );
     assert_eq!(user.log, Vec::<Step>::new());
 
     let mut root = FakeExec::new(0);
     let err = execute(&plan, RunAs::User, Mode::Apply, &mut root, &mut Vec::new());
-    assert!(matches!(err, Err(DeployError::IsRoot)), "{err:?}");
+    assert!(matches!(err, Err(HostError::IsRoot)), "{err:?}");
     assert_eq!(root.log, Vec::<Step>::new());
 
     // A dry run is allowed as anyone: it changes nothing.
@@ -262,7 +262,7 @@ fn a_line_that_cannot_be_printed_stops_the_run() {
             &mut exec,
             &mut FailAfter { left: 0 },
         );
-        assert!(matches!(err, Err(DeployError::Output(_))), "{mode:?}");
+        assert!(matches!(err, Err(HostError::Output(_))), "{mode:?}");
     }
     assert_eq!(exec.log, Vec::<Step>::new());
 
@@ -274,7 +274,7 @@ fn a_line_that_cannot_be_printed_stops_the_run() {
         &mut exec,
         &mut FailAfter { left: 0 },
     );
-    assert!(matches!(err, Err(DeployError::Output(_))));
+    assert!(matches!(err, Err(HostError::Output(_))));
 
     let mut planner = Planner::new(&exec);
     planner.run(Cmd::new(p("/usr/bin/true")));
@@ -284,7 +284,7 @@ fn a_line_that_cannot_be_printed_stops_the_run() {
     };
     let err = execute(&one, RunAs::Root, Mode::DryRun, &mut exec, &mut w);
     assert!(
-        matches!(err, Err(DeployError::Output(_))),
+        matches!(err, Err(HostError::Output(_))),
         "the note's error was dropped"
     );
     assert_eq!(w.left, 0);
