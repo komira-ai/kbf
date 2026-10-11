@@ -12,7 +12,8 @@ pub struct NoSnapshots;
 
 /// [`MetaState`] as a [`Machine`]: each committed command entry is decoded and
 /// applied in order. The first [`Bootstrap`] is kept and every later one is a no-op.
-/// An entry that does not decode stops the machine: it applies nothing more, and the
+/// An entry that does not decode, or a control command (which this log does not
+/// apply), stops the machine: it applies nothing more, and the
 /// log refuses to open ([`MetaMachine::failed`] names the first such entry). Once open,
 /// the log applies only entries it encoded itself.
 #[derive(Debug)]
@@ -85,6 +86,12 @@ impl Machine for MetaMachine {
             Ok(LogCommand::Bootstrap(bootstrap)) => {
                 self.bootstraps += 1;
                 self.bootstrap.get_or_insert(bootstrap);
+            }
+            // A control command: this log applies only metadata commands and its
+            // `Bootstrap`, so a later binary wrote it. Stop, as for an entry that does
+            // not decode.
+            Ok(_) => {
+                self.failed = Some((entry.id.index, DecodeError::UnknownCommand("LogCommand")));
             }
             Err(e) => self.failed = Some((entry.id.index, e)),
         }

@@ -2,11 +2,11 @@
 //! directory (`FaultFs`) that a test can restart, crash at any operation, or fill by
 //! hand. Each test names the defect it catches.
 
-use std::num::NonZeroU64;
+use std::num::{NonZeroU32, NonZeroU64};
 use std::time::Duration;
 
 use kbf_front::{MetaLog, MetaLogError};
-use kbf_log::{Bootstrap, FarmLogId, Format, LogCommand};
+use kbf_log::{Bootstrap, FarmLogId, Format, LogCommand, MachineVersion};
 use kbf_meta::{Applied, BlobWrite, Command, Epoch, Location, ObjectId, Retention, StoreId};
 use kbf_raft::{Entry, LogId, LogIndex, Payload, Snapshot, Storage};
 use kbf_server::raft_log::{RECORD, RECORD_TMP};
@@ -283,6 +283,31 @@ async fn an_entry_or_snapshot_this_version_cannot_read_refuses_the_open() {
     let refused = refusal(&dir.restart(), 2).await;
     assert!(matches!(refused, RaftLogError::Open(_)), "{refused:?}");
     assert!(refused.to_string().contains("snapshot"));
+}
+
+/// Catches: a control command in the metadata log applied as a no-op (or skipped)
+/// instead of refusing the open. This binary writes none; a log holding one was written
+/// by a later binary whose farm state this one would silently drop.
+#[tokio::test]
+async fn a_control_command_in_the_metadata_log_refuses_the_open() {
+    let fs = FaultFs::new();
+    drop(open(&fs, 2).await);
+    let dir = fs.restart();
+    let (mut store, held) = Store::open(dir.clone(), Options::default()).expect("the store");
+    let last = held.entries.last().expect("entries").id;
+    let version = MachineVersion::new(NonZeroU32::new(2).expect("non-zero"));
+    let bytes = kbf_log::encode(Format::V1, &LogCommand::MachineVersion(version)).expect("encode");
+    let control = Entry {
+        id: LogId::new(last.term, last.index.next()),
+        payload: Payload::Command(bytes),
+    };
+    store.write_entries(&[control]).expect("append");
+    drop(store);
+    let refused = refusal(&dir.restart(), 2).await;
+    assert!(
+        matches!(&refused, RaftLogError::Decode { index, .. } if *index == last.index.0 + 1),
+        "{refused:?}"
+    );
 }
 
 /// Catches: a replica that takes a later `Bootstrap` over the first (a leader that died

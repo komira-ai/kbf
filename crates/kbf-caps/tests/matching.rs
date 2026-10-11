@@ -216,3 +216,46 @@ fn parse_rejects_what_it_cannot_compare() {
         Request::default()
     );
 }
+
+/// Catches a requirement `properties` leaves out or writes in another form than
+/// `parse` reads (the log codec writes a request as its properties): one request with
+/// every kind of key is written in the fixed order and read back as itself, and the
+/// empty request is written as nothing.
+#[test]
+fn a_request_is_written_as_the_properties_it_parses_from() {
+    let image = format!("base@sha256:{}", "ab".repeat(32));
+    let given = [
+        ("vm.image", image.as_str()),
+        ("label.rack", "r1"),
+        ("os", "linux"),
+        ("mem_gib", "8"),
+        ("cpus", "4"),
+        ("cpu.feature", "avx2"),
+        ("cpu.feature", "aes"),
+        ("isa_level", "x86-64-v3"),
+        ("arch", "x86_64"),
+        ("xcode", "16C5032a"),
+        ("kbf-lease", "action"),
+    ];
+    let request = Request::parse(given).unwrap();
+    let written = request.properties();
+    let want: Vec<(&str, String)> = [
+        ("arch", "x86_64"),
+        ("isa_level", "x86-64-v3"),
+        ("cpu.feature", "aes"),
+        ("cpu.feature", "avx2"),
+        ("cpus", "4"),
+        ("mem_gib", "8"),
+        ("label.rack", "r1"),
+        ("os", "linux"),
+        ("vm.image", image.as_str()),
+        ("xcode", "16C5032a"),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k, v.to_owned()))
+    .collect();
+    assert_eq!(written, want);
+    let read = Request::parse(written.iter().map(|(k, v)| (*k, v.as_str()))).unwrap();
+    assert_eq!(read, request);
+    assert!(Request::default().properties().is_empty());
+}

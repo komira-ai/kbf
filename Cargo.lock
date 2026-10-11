@@ -1290,8 +1290,10 @@ name = "kbf-log"
 version = "0.1.0"
 dependencies = [
  "hex",
+ "kbf-caps",
  "kbf-meta",
  "kbf-proto",
+ "kbf-sched",
  "kbf-types",
  "prost",
  "thiserror",

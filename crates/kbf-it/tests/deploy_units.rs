@@ -124,7 +124,7 @@ fn the_planned_server_flags_are_still_refused() {
     let (text, _) = storage_node();
     let planned = fenced(&text, "text planned-flags kbf-server");
     assert_eq!(planned.len(), 1, "one planned-flags block");
-    assert_eq!(planned[0].len(), 3, "{:?}", planned[0]);
+    assert_eq!(planned[0].len(), 1, "{:?}", planned[0]);
     for flag in &planned[0] {
         let kind = Args::try_parse_from(["kbf-server", flag])
             .map(|_| ())

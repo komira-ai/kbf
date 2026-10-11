@@ -14,19 +14,24 @@
 //   that decode to a value, including bytes with a field this file does not name.
 //
 // Which encodings may appear in a log is the log's format version, committed in the log.
-// Format 1 is this file as it is now. Bootstrap joined format 1 before any log was
-// written (kbf-server's --meta-log=raft is the first writer); from now on, a field or
-// command added here is a new format.
+// Format 1 is this file as it is now. Bootstrap and the control commands (`farm` to
+// `machine_version`) joined format 1 before any log was written (kbf-server's
+// --meta-log=raft is the first writer, and it writes only `meta` and `bootstrap`);
+// from now on, a field or command added here is a new format.
 syntax = "proto3";
 
 package kbf.log.v1;
 
-// The payload of a command entry. Later formats add the other commands of ha.md
-// section 4.1 (Farm, Report, Takeover, Checkpoint, MachineVersion).
+// The payload of a command entry: the commands of ha.md section 4.1.
 message LogCommand {
   oneof command {
     MetaCommand meta = 1;
     Bootstrap bootstrap = 2;
+    FarmBatch farm = 3;
+    Report report = 4;
+    Takeover takeover = 5;
+    Checkpoint checkpoint = 6;
+    MachineVersion machine_version = 7;
   }
 }
 
@@ -146,3 +151,288 @@ message ObjectReachable {
 
 // Removes every blob and action entry whose retention has run out.
 message Collect {}
+
+// ---- Control commands: the farm machine's inputs (ha.md sections 4.2 to 4.9). ----
+
+// Scheduler and farm inputs the leader batched, all at farm time `farm_time_ms`.
+// `wall_time_ns` is the leader's wall clock when it formed the batch, in nanoseconds
+// since the Unix epoch: every wall-clock time the farm machine records while it applies
+// the batch (a caller's queue time, a Start's send time) is this value, never a clock
+// read. The inputs apply in order.
+message FarmBatch {
+  uint64 farm_time_ms = 1;
+  uint64 wall_time_ns = 2;
+  repeated FarmInput inputs = 3;
+}
+
+// One input of a FarmBatch: the scheduler's events (kbf-sched's Event, but for Report,
+// which is its own command) and the farm machine's own.
+message FarmInput {
+  oneof input {
+    WorkerUp worker_up = 1;
+    Capacity capacity = 2;
+    Heartbeat heartbeat = 3;
+    Submit submit = 4;
+    ControlRecord committed = 5;
+    Started started = 6;
+    SchedulerTick tick = 7;
+    Cordon cordon = 8;
+    Drain drain = 9;
+    Uncordon uncordon = 10;
+    Disconnected disconnected = 11;
+  }
+}
+
+// A worker registered, from daemon process `instance`, with `capacity` and `caps`.
+message WorkerUp {
+  string worker = 1;
+  string instance = 2;
+  Resources capacity = 3;
+  NodeCaps caps = 4;
+}
+
+// A registered worker's capacity or capabilities changed on the same stream.
+message Capacity {
+  string worker = 1;
+  Resources capacity = 2;
+  NodeCaps caps = 3;
+}
+
+// A worker's heartbeat, with the leases it holds, in the order it listed them.
+message Heartbeat {
+  string worker = 1;
+  repeated LeaseId running = 2;
+}
+
+// A caller asks for `request` to run. It names no waiter: the farm machine assigns the
+// caller's id when it applies the input.
+message Submit {
+  Request request = 1;
+}
+
+// A record the scheduler asked to commit.
+message ControlRecord {
+  oneof record {
+    LeaseGrant lease = 1;
+    ResultRecord result = 2;
+    RefusalRecord refusal = 3;
+  }
+}
+
+// The worker holding `lease` started `operation`.
+message Started {
+  uint64 operation = 1;
+  LeaseId lease = 2;
+}
+
+// A placement round and lease expiry, at the batch's farm time.
+message SchedulerTick {}
+
+// An operator cordons `worker`.
+message Cordon {
+  string worker = 1;
+}
+
+// An operator drains `worker`, pausing at farm time `deadline_ms`.
+message Drain {
+  string worker = 1;
+  uint64 deadline_ms = 2;
+}
+
+// An operator returns `worker` to placement.
+message Uncordon {
+  string worker = 1;
+}
+
+// The newest stream of node `worker` closed.
+message Disconnected {
+  string worker = 1;
+}
+
+// A worker's result, at farm time `farm_time_ms`, as one command with the action-cache
+// entry it writes if the scheduler accepts it (ha.md section 4.3). `action_entry` is
+// absent when the result writes none (a failure, an uncached action).
+message Report {
+  uint64 farm_time_ms = 1;
+  uint64 operation = 2;
+  LeaseId lease = 3;
+  Outcome outcome = 4;
+  ActionEntry action_entry = 5;
+}
+
+// The action-cache entry a Report writes, as a daemon's PutAction.
+message ActionEntry {
+  Digest action = 1;
+  ActionRecord record = 2;
+}
+
+// A new leader's first command: its Raft term (never zero) and the farm time it starts
+// from.
+message Takeover {
+  uint64 term = 1;
+  uint64 farm_time_ms = 2;
+}
+
+// The SHA-256 digest (32 bytes) of the leader's state at log index `index`
+// (ha.md section 4.9).
+message Checkpoint {
+  uint64 index = 1;
+  bytes digest = 2;
+}
+
+// Raises the machine version (ha.md section 4.7) to `version`, never zero.
+message MachineVersion {
+  uint32 version = 1;
+}
+
+// ---- The values control commands carry. ----
+
+// A request vector or a capacity.
+message Resources {
+  uint64 cpu_millis = 1;
+  uint64 memory_bytes = 2;
+  uint64 gpus = 3;
+  uint64 vms = 4;
+}
+
+// A key and a value: a request property, or an exact capability a node reports.
+message Property {
+  string key = 1;
+  string value = 2;
+}
+
+// What a node offers (kbf-caps NodeCaps). `exact`, `members` and `consumables` are maps
+// written in key order; `drivers` and every `values` are sets in increasing order.
+message NodeCaps {
+  CpuCaps cpu = 1;
+  repeated Property exact = 2;
+  repeated MemberSet members = 3;
+  repeated ConsumableAmount consumables = 4;
+  repeated string drivers = 5;
+}
+
+// A CPU's architecture and its features, a set; its ISA level follows from them.
+message CpuCaps {
+  Arch arch = 1;
+  repeated string features = 2;
+}
+
+// A CPU architecture.
+enum Arch {
+  ARCH_UNSPECIFIED = 0;
+  ARCH_X86_64 = 1;
+  ARCH_ARM64 = 2;
+}
+
+// A set a node reports under `key` (`xcode`, `vm.image`).
+message MemberSet {
+  string key = 1;
+  repeated string values = 2;
+}
+
+// A countable capacity.
+message ConsumableAmount {
+  Consumable consumable = 1;
+  uint64 amount = 2;
+}
+
+// A countable resource.
+enum Consumable {
+  CONSUMABLE_UNSPECIFIED = 0;
+  CONSUMABLE_CPUS = 1;
+  CONSUMABLE_MEM_GIB = 2;
+  CONSUMABLE_NVME_GIB = 3;
+  CONSUMABLE_GPUS = 4;
+}
+
+// One execution request (kbf-sched's Request). `needs` is the capability request as the
+// properties it parses from, in the order kbf-caps writes them.
+message Request {
+  ActionKey key = 1;
+  Qos qos = 2;
+  LeaseKind kind = 3;
+  Resources resources = 4;
+  repeated Property needs = 5;
+  bool hermetic = 6;
+  bool do_not_cache = 7;
+}
+
+// An instance name and an action digest.
+message ActionKey {
+  string instance = 1;
+  Digest action = 2;
+}
+
+// A QoS level: built in, or defined by the deployment.
+message Qos {
+  oneof level {
+    BuiltinQos builtin = 1;
+    CustomQos custom = 2;
+  }
+}
+
+// The built-in QoS levels.
+enum BuiltinQos {
+  BUILTIN_QOS_UNSPECIFIED = 0;
+  BUILTIN_QOS_INTERACTIVE = 1;
+  BUILTIN_QOS_CI = 2;
+  BUILTIN_QOS_BATCH = 3;
+}
+
+// A deployment-defined QoS level; `urgency` fits in 16 bits.
+message CustomQos {
+  string name = 1;
+  uint32 urgency = 2;
+}
+
+// What a lease takes.
+enum LeaseKind {
+  LEASE_KIND_UNSPECIFIED = 0;
+  LEASE_KIND_ACTION = 1;
+  LEASE_KIND_WHOLE_MACHINE = 2;
+  LEASE_KIND_VM = 3;
+}
+
+// A lease id: the scheduler term and a sequence number within it.
+message LeaseId {
+  uint64 term = 1;
+  uint64 seq = 2;
+}
+
+// A lease grant: `operation` runs on `worker` under `lease`.
+message LeaseGrant {
+  LeaseId lease = 1;
+  uint64 operation = 2;
+  string worker = 3;
+}
+
+// A result the scheduler accepted.
+message ResultRecord {
+  LeaseId lease = 1;
+  uint64 operation = 2;
+  Outcome outcome = 3;
+}
+
+// The scheduler gives up on a queued operation.
+message RefusalRecord {
+  uint64 operation = 1;
+  string reason = 2;
+}
+
+// How an attempt ended: completed with its ActionResult's digest, or failed.
+message Outcome {
+  oneof outcome {
+    Digest completed = 1;
+    Failure failed = 2;
+  }
+}
+
+// Why an attempt failed.
+enum Failure {
+  FAILURE_UNSPECIFIED = 0;
+  FAILURE_TIMEOUT = 1;
+  FAILURE_INFRA = 2;
+  FAILURE_INVALID = 3;
+  FAILURE_OUT_OF_MEMORY = 4;
+  FAILURE_NODE_MEMORY_PRESSURE = 5;
+}

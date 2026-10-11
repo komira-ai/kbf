@@ -1,7 +1,8 @@
 //! The farm machine: the farm core's state beside the scheduler that every server of a
 //! replicated farm will hold alike. It holds the record of each caller waiting on an
-//! operation, the finished operations whose callers are still kept, and the leases
-//! whose `Start` was sent.
+//! operation, the finished operations whose callers are still kept, the leases whose
+//! `Start` was sent, and the node registry: each node that has registered, whether
+//! its newest stream is open, and its newest `NodeStatus`.
 //!
 //! It is pure: its methods change it only from their arguments. Nothing here reads a
 //! clock (a wall-clock time comes in as a value), a random source or a hashed map's
@@ -10,7 +11,9 @@
 //! in the same order are equal, and iterate their maps in the same order.
 //!
 //! What one server alone holds stays in `crate::farm`: each caller's `watch` channel,
-//! the worker streams and the heartbeat each `Start` names. The scheduler is not part
+//! the worker streams and the heartbeat each `Start` names. A node's stream is one of
+//! those, so the machine does not see it close: the farm tells it
+//! ([`FarmMachine::disconnect`]) before it reads the registry. The scheduler is not part
 //! of the machine yet; the methods that depend on it take what they need from it as
 //! arguments.
 
@@ -19,8 +22,9 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::time::SystemTime;
 
-use kbf_types::{ActionKey, Digest, LeaseId, LeaseKind, OperationId, WaiterId};
+use kbf_types::{ActionKey, Digest, LeaseId, LeaseKind, OperationId, WaiterId, WorkerId};
 
+use crate::fleet::SoftwareView;
 use crate::stamp::Stamp;
 
 /// The REAPI name of the operation `waiter` waits on, in the process of `term`:
@@ -74,7 +78,17 @@ pub(crate) struct Sent {
     pub(crate) stamp: Stamp,
 }
 
-/// The waiter records and the started table of one farm (see the module doc).
+/// A node that has registered.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Node {
+    /// Whether its newest stream is open, as the farm last told the machine.
+    pub(crate) connected: bool,
+    /// The newest `NodeStatus` it sent, on any of its streams; `None` before the first.
+    pub(crate) status: Option<SoftwareView>,
+}
+
+/// The waiter records, the started table and the node registry of one farm (see the
+/// module doc).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct FarmMachine {
     /// The scheduler term every operation name carries.
@@ -90,6 +104,8 @@ pub(crate) struct FarmMachine {
     finished: VecDeque<(OperationId, Vec<WaiterId>)>,
     /// Leases whose `Start` was sent.
     started: BTreeMap<LeaseId, Sent>,
+    /// Every node that has registered, kept after its stream closes (issue #235).
+    nodes: BTreeMap<WorkerId, Node>,
 }
 
 impl FarmMachine {
@@ -101,6 +117,7 @@ impl FarmMachine {
             waiters: BTreeMap::new(),
             finished: VecDeque::new(),
             started: BTreeMap::new(),
+            nodes: BTreeMap::new(),
         }
     }
 
@@ -151,6 +168,40 @@ impl FarmMachine {
     /// Forgets every lease of a finished `operation` whose `Start` was sent.
     pub(crate) fn forget_leases(&mut self, operation: OperationId) {
         self.started.retain(|_, sent| sent.operation != operation);
+    }
+
+    /// Records that `worker` registered on a new stream: it is connected, and keeps
+    /// the status it sent on an earlier one.
+    pub(crate) fn register(&mut self, worker: &WorkerId) {
+        let node = self.nodes.entry(worker.clone()).or_insert(Node {
+            connected: true,
+            status: None,
+        });
+        node.connected = true;
+    }
+
+    /// Records that the newest stream of `worker` has closed. The node stays listed.
+    pub(crate) fn disconnect(&mut self, worker: &WorkerId) {
+        if let Some(node) = self.nodes.get_mut(worker) {
+            node.connected = false;
+        }
+    }
+
+    /// Keeps `status` as the newest of `worker`, if it has registered.
+    pub(crate) fn report_status(&mut self, worker: &WorkerId, status: SoftwareView) {
+        if let Some(node) = self.nodes.get_mut(worker) {
+            node.status = Some(status);
+        }
+    }
+
+    /// The node `worker`, if it has registered.
+    pub(crate) fn node(&self, worker: &WorkerId) -> Option<&Node> {
+        self.nodes.get(worker)
+    }
+
+    /// Every node that has registered, in node-id order.
+    pub(crate) fn nodes(&self) -> impl Iterator<Item = &WorkerId> + '_ {
+        self.nodes.keys()
     }
 
     /// Keeps `waiters`, the callers of `operation`, which has just finished, until
@@ -222,6 +273,24 @@ mod tests {
         }
     }
 
+    fn node(n: u64) -> WorkerId {
+        WorkerId::new(format!("node-{n}"))
+    }
+
+    fn status(n: u8) -> SoftwareView {
+        SoftwareView {
+            os_name: "Linux".to_owned(),
+            os_version: format!("{n}"),
+            os_build: String::new(),
+            kernel: "6.8".to_owned(),
+            daemon_version: "0.1.0".to_owned(),
+            xcode_builds: Vec::new(),
+            xcodes: Vec::new(),
+            container_images: Vec::new(),
+            received_at_unix_ms: u64::from(n),
+        }
+    }
+
     fn sent(operation: u64, n: u8) -> Sent {
         Sent {
             operation: OperationId(operation),
@@ -237,10 +306,13 @@ mod tests {
     /// is drawn from `rng` too, so a seed names exactly one call sequence.
     fn step(machine: &mut FarmMachine, rng: &mut SimRng) {
         let small = |rng: &mut SimRng| u8::try_from(rng.below(32)).unwrap_or_default();
-        match rng.below(5) {
+        match rng.below(8) {
             0 | 1 => {
                 machine.submit(waiter(small(rng)));
             }
+            5 => machine.register(&node(rng.below(32))),
+            6 => machine.disconnect(&node(rng.below(32))),
+            7 => machine.report_status(&node(rng.below(32)), status(small(rng))),
             2 => {
                 let lease = LeaseId::new(rng.between(1, 3), rng.below(64));
                 machine.start(lease, sent(rng.below(8), small(rng)));
@@ -259,11 +331,12 @@ mod tests {
     }
 
     /// Catches a machine that is not a function of its calls: a hashed map in it (its
-    /// iteration order is drawn per map, so two equal machines list their callers or
-    /// leases in different orders, and a snapshot or digest of them differs), and a
-    /// call that reads a clock or a random source instead of its arguments. Over a
-    /// sweep of seeds, two machines given the same generated calls are equal after
-    /// every call, and list their callers and leases in the same, ascending order.
+    /// iteration order is drawn per map, so two equal machines list their callers,
+    /// leases or nodes in different orders, and a snapshot or digest of them differs),
+    /// and a call that reads a clock or a random source instead of its arguments. Over
+    /// a sweep of seeds, two machines given the same generated calls are equal after
+    /// every call, and list their callers, leases and nodes in the same, ascending
+    /// order.
     #[test]
     fn machines_given_the_same_calls_are_equal_and_list_in_key_order() {
         let mut busiest = 0;
@@ -279,16 +352,19 @@ mod tests {
             let order = |m: &FarmMachine| {
                 let waiters: Vec<WaiterId> = m.waiters.keys().copied().collect();
                 let leases: Vec<LeaseId> = m.started.keys().copied().collect();
-                (waiters, leases)
+                let nodes: Vec<WorkerId> = m.nodes().cloned().collect();
+                (waiters, leases, nodes)
             };
-            let (waiters, leases) = order(&a);
-            assert_eq!((waiters.clone(), leases.clone()), order(&b), "seed {seed}");
+            let (waiters, leases, nodes) = order(&a);
+            let listed = (waiters.clone(), leases.clone(), nodes.clone());
+            assert_eq!(listed, order(&b), "seed {seed}");
             assert!(waiters.is_sorted(), "seed {seed}: callers {waiters:?}");
             assert!(leases.is_sorted(), "seed {seed}: leases {leases:?}");
-            busiest = busiest.max(waiters.len().min(leases.len()));
+            assert!(nodes.is_sorted(), "seed {seed}: nodes {nodes:?}");
+            busiest = busiest.max(waiters.len().min(leases.len()).min(nodes.len()));
         }
         // The sweep is only a check if the maps it orders hold several entries.
-        assert!(busiest >= 8, "no seed filled both maps: {busiest}");
+        assert!(busiest >= 8, "no seed filled every map: {busiest}");
     }
 
     /// Catches an equality that leaves a field out (a hand-written `PartialEq` that
@@ -302,9 +378,11 @@ mod tests {
         base.submit(waiter(2));
         base.keep_finished(OperationId(4), vec![first]);
         base.start(LeaseId::new(1, 7), sent(4, 9));
+        base.register(&node(1));
+        base.report_status(&node(1), status(1));
         let lease = LeaseId::new(1, 7);
         type Change = fn(&mut FarmMachine);
-        let changes: [(&str, Change); 15] = [
+        let changes: [(&str, Change); 18] = [
             ("term", |m| m.term += 1),
             ("next_waiter", |m| m.next_waiter += 1),
             ("waiters: one more", |m| {
@@ -353,6 +431,9 @@ mod tests {
                     .values_mut()
                     .for_each(|s| s.stamp.started = at(99));
             }),
+            ("nodes: one more", |m| m.register(&node(2))),
+            ("node.connected", |m| m.disconnect(&node(1))),
+            ("node.status", |m| m.report_status(&node(1), status(2))),
         ];
         for (field, change) in changes {
             let mut changed = base.clone();
@@ -360,6 +441,35 @@ mod tests {
             assert_ne!(changed, base, "a change to {field} is not seen");
         }
         assert_eq!(base.sent(lease), Some(sent(4, 9)));
+    }
+
+    /// Catches a registry that forgets a node whose stream closed (#235: it stays
+    /// listed, not connected), one that drops a node's status when it registers again
+    /// (the status is kept across streams), one whose registering again leaves it
+    /// not connected, and one that lists a node that never registered because a
+    /// status or a closed stream named it.
+    #[test]
+    fn the_registry_keeps_each_node_across_its_streams() {
+        let mut m = FarmMachine::new(TERM);
+        m.disconnect(&node(1));
+        m.report_status(&node(1), status(1));
+        assert_eq!(m.node(&node(1)), None);
+        assert_eq!(m.nodes().count(), 0);
+        m.register(&node(1));
+        m.report_status(&node(1), status(1));
+        m.disconnect(&node(1));
+        let left = Node {
+            connected: false,
+            status: Some(status(1)),
+        };
+        assert_eq!(m.node(&node(1)), Some(&left));
+        m.register(&node(1));
+        let back = Node {
+            connected: true,
+            status: Some(status(1)),
+        };
+        assert_eq!(m.node(&node(1)), Some(&back));
+        assert_eq!(m.nodes().collect::<Vec<_>>(), vec![&node(1)]);
     }
 
     /// Catches `forget_dropped` forgetting past the first operation the scheduler still
