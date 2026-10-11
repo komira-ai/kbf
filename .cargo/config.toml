@@ -1,0 +1,4 @@
+# `cargo xtask <verb>` runs the repository's CI tooling (crates/xtask), so a workflow
+# step is one command and the logic behind it is Rust with tests.
+[alias]
+xtask = "run -p xtask --locked --"

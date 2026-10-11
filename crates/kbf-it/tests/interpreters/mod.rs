@@ -23,8 +23,8 @@ pub mod rust;
 
 use std::collections::BTreeMap;
 
-/// The budget file, relative to the repository root.
-pub const BUDGET: &str = "tools/interpreter_budget.tsv";
+// The file's format and parser are shared with `cargo xtask budget-diff`.
+pub use xtask::budget::{BUDGET, Row, Section, parse};
 
 /// File extensions (compared ignoring ASCII case) that make a file an interpreter
 /// file whatever its first line says.
@@ -34,97 +34,6 @@ pub const EXTENSIONS: &[&str] = &["sh", "bash", "zsh", "ksh", "py", "awk", "sed"
 const INTERPRETERS: &[&str] = &[
     "sh", "bash", "ash", "dash", "ksh", "zsh", "awk", "gawk", "mawk", "nawk", "sed", "perl", "ruby",
 ];
-
-/// One section of the budget file.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Section {
-    Files,
-    Workflow,
-    SrcShC,
-}
-
-impl Section {
-    const ALL: [Section; 3] = [Section::Files, Section::Workflow, Section::SrcShC];
-
-    pub fn header(self) -> &'static str {
-        match self {
-            Section::Files => "[files]",
-            Section::Workflow => "[workflow]",
-            Section::SrcShC => "[src-sh-c]",
-        }
-    }
-}
-
-/// One row of the budget file.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Row {
-    pub section: Section,
-    pub key: String,
-    /// The 1-based line of the budget file that holds the row.
-    pub line: usize,
-}
-
-/// The rows of a budget text, and one problem per line that is not a well-formed row,
-/// header, comment or blank line, or that repeats a key of its section.
-pub fn parse(text: &str) -> (Vec<Row>, Vec<String>) {
-    let mut rows: Vec<Row> = Vec::new();
-    let mut problems = Vec::new();
-    let mut section = None;
-    let mut seen_headers = Vec::new();
-    let mut first_at: BTreeMap<(Section, String), usize> = BTreeMap::new();
-    for (at, line) in text.split('\n').enumerate() {
-        let n = at + 1;
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        if line.starts_with('[') {
-            match Section::ALL.into_iter().find(|s| s.header() == line) {
-                Some(s) if seen_headers.contains(&s) => {
-                    problems.push(format!("line {n}: the section {line} appears twice"));
-                }
-                Some(s) => {
-                    seen_headers.push(s);
-                    section = Some(s);
-                }
-                None => problems.push(format!("line {n}: unknown section `{line}`")),
-            }
-            continue;
-        }
-        let Some(s) = section else {
-            problems.push(format!("line {n}: a row before any section header"));
-            continue;
-        };
-        let fields: Vec<&str> = line.split('\t').collect();
-        let [key, reason] = fields[..] else {
-            problems.push(format!(
-                "line {n}: a row needs two tab-separated fields (<key>, <reason>), found {}",
-                fields.len()
-            ));
-            continue;
-        };
-        if [key, reason].iter().any(|f| f.is_empty() || f.trim() != *f) {
-            problems.push(format!(
-                "line {n}: a field is empty or has blanks around it"
-            ));
-            continue;
-        }
-        match first_at.get(&(s, key.to_owned())) {
-            Some(first) => problems.push(format!(
-                "line {n}: a second {} row for `{key}` (the first is line {first})",
-                s.header()
-            )),
-            None => {
-                first_at.insert((s, key.to_owned()), n);
-                rows.push(Row {
-                    section: s,
-                    key: key.to_owned(),
-                    line: n,
-                });
-            }
-        }
-    }
-    (rows, problems)
-}
 
 /// One thing the scan found: its section and key, and why the scan found it.
 #[derive(Debug, Clone, PartialEq, Eq)]

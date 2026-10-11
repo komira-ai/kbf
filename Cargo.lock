@@ -1304,6 +1304,7 @@ dependencies = [
  "tokio",
  "tonic",
  "tracing-subscriber",
+ "xtask",
 ]
 
 [[package]]
@@ -3358,6 +3359,14 @@ dependencies = [
  "rusticata-macros",
  "thiserror",
  "time",
+]
+
+[[package]]
+name = "xtask"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "thiserror",
 ]
 
 [[package]]

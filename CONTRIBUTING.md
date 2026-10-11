@@ -77,9 +77,11 @@ a shell and a `-c` flag, unless
 [tools/interpreter_budget.tsv](tools/interpreter_budget.tsv) lists it by path
 (a `<key><TAB><reason>` row). The rows there are what is left to port. The list
 records what exists, not how big it is: editing a listed file, step or keeper
-leaves the list alone. A pull request that moves or deletes one removes or
-renames its row in the same commit; the lint refuses a row whose file, step or
-keeper is gone.
+leaves the list alone. The list only shrinks: on a pull request,
+`cargo xtask budget-diff --base HEAD^1` refuses any row the base branch's list
+does not have, so a listed file is not moved or renamed either (that would be a
+new row); it is ported. A pull request that deletes one removes its row in the
+same commit; the lint refuses a row whose file, step or keeper is gone.
 
 ## Continuous integration
 

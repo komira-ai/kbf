@@ -2,9 +2,10 @@
 # tooling is Rust: each row is something still to port or delete. The repository lints
 # (crates/kbf-it/tests/repo_lints.rs, rules in crates/kbf-it/tests/interpreters/mod.rs)
 # refuse anything the scan finds with no row here, a row the scan finds nothing for
-# (remove it in the change that deletes or renames its file), and a malformed or
+# (remove it in the change that deletes its file), and a malformed or
 # repeated row. The list records what exists, not how big it is: editing a listed
-# file, step or keeper does not touch it.
+# file, step or keeper does not touch it. The list only shrinks: `cargo xtask
+# budget-diff` refuses a row a pull request adds (crates/xtask/src/budget.rs).
 #
 # Rows: <key><TAB><reason>.
 
@@ -15,7 +16,6 @@ crates/kbf-it/m1/bazel/tools/upper.sh	M1 sample project action; to become a Rust
 crates/kbf-it/m1/buck2/tools/upper.sh	M1 sample project action; to become a Rust test action
 crates/kbf-it/m1/run.sh	M1 cell harness; to become kbf-cell m1
 crates/kbf-it/m2/run.sh	M2 cell harness; to become kbf-cell m2
-tools/ci/check-build-commit.sh	CI step; to become a cargo xtask verb
 tools/ci/check-darwin-asset.sh	CI step; to become a cargo xtask verb
 tools/ci/darwin-entitlements.sh	CI step; to become a cargo xtask verb
 tools/ci/guest-tests.sh	CI tests run as root; to become Rust tests run as root

@@ -1,0 +1,24 @@
+[package]
+name = "xtask"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+# `cargo xtask` runs this bin, not the test fake.
+default-run = "xtask"
+
+# `xtask-fake`, the program this crate's tests run in place of `cargo` and of a built
+# `kbf-server` (see its docs). Never run by CI itself.
+[[bin]]
+name = "xtask-fake"
+path = "src/bin/xtask-fake.rs"
+test = false
+
+[dependencies]
+clap.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true
