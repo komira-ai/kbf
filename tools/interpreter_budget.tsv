@@ -16,7 +16,6 @@ crates/kbf-it/m1/bazel/tools/upper.sh	M1 sample project action; to become a Rust
 crates/kbf-it/m1/buck2/tools/upper.sh	M1 sample project action; to become a Rust test action
 crates/kbf-it/m1/run.sh	M1 cell harness; to become kbf-cell m1
 crates/kbf-it/m2/run.sh	M2 cell harness; to become kbf-cell m2
-tools/ci/planted-new-step.sh	PLANTED: budget-diff must refuse this new row
 tools/ci/check-darwin-asset.sh	CI step; to become a cargo xtask verb
 tools/ci/darwin-entitlements.sh	CI step; to become a cargo xtask verb
 tools/ci/guest-tests.sh	CI tests run as root; to become Rust tests run as root
