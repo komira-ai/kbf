@@ -242,6 +242,28 @@ the unit gains all three once both are built:
   does not reopen the log until the host reboots. `/run` is a tmpfs, cleared at reboot
   as the page cache is.
 
+## Rendering the converged units
+
+`kbf-deploy linux render-units` writes the converged host's four files from templates
+compiled into the binary (`crates/kbf-deploy/templates/linux/`) and a settings file
+(`crates/kbf-deploy/templates/linux/config.example` documents each key; an unknown or
+repeated key is refused). `kbf-deploy linux check-units` then checks them against the
+[priorities](#priorities) and the memory split, one `FAIL <rule>: <reason>` line per
+broken rule:
+
+```text
+kbf-deploy linux render-units --config node.conf --out units --kbf-uid 1500
+kbf-deploy linux check-units --config node.conf --dir units --installable
+```
+
+`--out` is laid out as `/etc/systemd/system`: `kbf.slice`, `<MINIO_UNIT>.d/kbf.conf`,
+`kbf-server.service`, `kbf-daemon.service`. Rendering writes nothing else, so it needs
+no `--apply`. A template placeholder (`@KEY@`) with no value is refused rather than
+written, and `check-units` fails a file that still holds one; without `--kbf-uid` the
+daemon's unit keeps `<kbf uid>`, which `--installable` fails. Exit codes: 0 rendered or
+every rule holds, 1 a rule is broken, 2 refused (a bad setting or an unreadable file),
+with a `REFUSED:` line on stderr. Installing the files is not built yet.
+
 ## What the tests check
 
 - `crates/kbf-it/tests/deploy_units.rs` runs `kbf-server`'s flag parser over the
@@ -251,3 +273,10 @@ the unit gains all three once both are built:
   [priority](#priorities) order.
 - `kbf-node`'s tests (`src/deploy_doc_tests.rs`) run `kbf-daemon`'s flag parser over
   every daemon unit in `docs/deploy/`.
+- `kbf-deploy`'s tests (`src/linux/tests.rs`) plant one defect per rule in the
+  templates (a swap limit dropped, an OOM score at the containers' 0, a later
+  assignment that breaks the order, a slice minimum that is not the sum, a key on the
+  command line, a bare `--image`) and require that rule's `FAIL` line; they
+  also refuse each bad setting and a placeholder with no value. The rendered units'
+  `ExecStart=` lines go through `kbf-server`'s parser (`kbf-it`) and `kbf-daemon`'s
+  (`kbf-node`) too.

@@ -45,3 +45,34 @@ fn every_daemon_units_flags_parse_with_kbf_daemons_parser() {
     // The build host's and the converged host's daemon units.
     assert_eq!(checked, ["linux-build-host.md", "storage-node.md"]);
 }
+
+#[test]
+fn the_rendered_daemon_unit_parses_with_kbf_daemons_parser() {
+    // Catches: a `kbf-deploy linux` template naming a kbf-daemon flag the binary does
+    // not have or a value it refuses, and the pinned images rendered in a form the
+    // daemon refuses at start (podman's bare `<repo>@sha256:<digest>`), which makes it
+    // exit 2. The flag parser takes `--image` as text; the daemon checks the form at
+    // start with `ImageRef::parse`, which this test runs on each value.
+    use kbf_deploy::linux::{LinuxConfig, Templates, render::render};
+    use kbf_deploy::unit::UnitFile;
+
+    let example = include_str!("../../kbf-deploy/templates/linux/config.example");
+    let image = format!("docker.io/library/busybox@sha256:{}", "a".repeat(64));
+    let text = example.replace("KBF_IMAGES=\n", &format!("KBF_IMAGES={image}\n"));
+    assert_ne!(
+        text, example,
+        "config.example has no empty KBF_IMAGES= line"
+    );
+    let c = LinuxConfig::parse(&text).expect("valid settings");
+    let units = render(&c, Some(1500), &Templates::BUILT_IN).expect("renders");
+    let daemon = UnitFile::parse(&units.daemon).expect("a unit");
+    let argv = daemon.exec_start();
+    assert_eq!(argv[0], "/usr/local/bin/kbf-daemon");
+    let cli = Cli::try_parse_from(&argv);
+    let refused = cli.as_ref().err().map(ToString::to_string);
+    assert_eq!(refused, None, "kbf-daemon refuses {argv:?}");
+    assert_eq!(daemon.flag_values("image"), [format!("docker://{image}")]);
+    for value in daemon.flag_values("image") {
+        assert_eq!(kbf_types::ImageRef::parse(value).err(), None, "{value}");
+    }
+}

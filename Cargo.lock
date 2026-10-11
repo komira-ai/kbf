@@ -1189,6 +1189,8 @@ dependencies = [
 name = "kbf-deploy"
 version = "0.1.0"
 dependencies = [
+ "clap",
+ "kbf-types",
  "rustix",
  "thiserror",
 ]
@@ -1282,6 +1284,7 @@ dependencies = [
  "clap",
  "hex",
  "kbf-daemon",
+ "kbf-deploy",
  "kbf-front",
  "kbf-proto",
  "kbf-server",
@@ -1406,6 +1409,7 @@ dependencies = [
  "clap",
  "futures",
  "kbf-daemon",
+ "kbf-deploy",
  "kbf-driver-container",
  "kbf-driver-native",
  "kbf-front",
@@ -1413,6 +1417,7 @@ dependencies = [
  "kbf-outputs",
  "kbf-proto",
  "kbf-server",
+ "kbf-types",
  "libc",
  "prost",
  "rcgen",
