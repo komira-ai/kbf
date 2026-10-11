@@ -1193,6 +1193,8 @@ dependencies = [
  "clap",
  "kbf-types",
  "rustix",
+ "serde",
+ "serde_json",
  "thiserror",
 ]
 
