@@ -531,9 +531,13 @@ fn raft_mode_keeps_its_log_id_across_starts() {
     assert_eq!(log_id(&line), first, "a restart drew a new log id");
     interrupt(child);
 
-    let (child, line, _) = started(raft_server(&raft_dir("raft-other")));
+    let other = raft_dir("raft-other");
+    let (child, line, _) = started(raft_server(&other));
     assert_ne!(log_id(&line), first, "two directories, one log id");
     interrupt(child);
+    for d in [&dir, &other] {
+        std::fs::remove_dir_all(d).expect("remove the raft dir");
+    }
 
     let mut memory = server(&ANY_PORT);
     memory.args(["--meta-log", "memory"]);
@@ -578,6 +582,7 @@ fn raft_mode_refuses_what_it_cannot_keep() {
     let (code, stderr) = fails(raft_server(&dir));
     assert_eq!(code, Some(2));
     assert!(stderr.contains("holds files but no log-record"), "{stderr}");
+    std::fs::remove_dir_all(&dir).expect("remove the raft dir");
 }
 
 /// Catches: a server that keeps running (or exits 0) when it cannot bind its
