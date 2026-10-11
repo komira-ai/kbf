@@ -349,3 +349,16 @@ fn the_fstab_line_follows_a_last_line_with_its_newline() {
     let want = format!("{OTHER_LINE}\n{FILE} none swap sw 0 0\n");
     assert_eq!(String::from_utf8_lossy(bytes), want);
 }
+
+/// Catches a rollback that plans a step for what is not there (a `swapoff` of a file
+/// that is not active, an fstab rewrite with no line to drop, a removal of no file).
+#[test]
+fn a_rollback_on_a_host_without_the_swapfile_plans_nothing() {
+    // Every tool exits 0 and prints nothing: no swap is active.
+    let exec = ScratchHost::new("swap-none");
+    let a = Swap {
+        remove: true,
+        ..swap(FILE)
+    };
+    assert!(plan(&exec, &a, &mut Vec::new()).expect("plan").is_empty());
+}

@@ -348,3 +348,47 @@ fn a_linux_verb_runs_through_the_same_command_line() {
         "{err}"
     );
 }
+
+/// Catches `render-units` or `check-units` output lost through the merged command line
+/// (a check's FAIL lines not printed, or a broken unit exiting 0). These run the lib
+/// tests' instantiation of the `linux` arm, the one the coverage ratchet counts.
+#[test]
+fn render_units_then_check_units_exit_0_and_a_broken_unit_exits_1() {
+    let dir = crate::testkit::scratch("cli-render");
+    let units = dir.join("units");
+    let units = units.to_str().expect("utf-8");
+    let mut exec = FakeExec::new(501);
+    let render = [
+        "linux",
+        "render-units",
+        "--config",
+        LINUX_CONFIG,
+        "--out",
+        units,
+        "--kbf-uid",
+        "1500",
+    ];
+    let (code, out, err) = cli(&mut exec, &no_env, &render);
+    assert_eq!(code, ExitCode::SUCCESS, "{err}");
+    assert!(out.starts_with("rendered kbf.slice "), "{out}");
+    let check = [
+        "linux",
+        "check-units",
+        "--config",
+        LINUX_CONFIG,
+        "--dir",
+        units,
+        "--installable",
+    ];
+    let (code, out, err) = cli(&mut exec, &no_env, &check);
+    assert_eq!(code, ExitCode::SUCCESS, "{out}{err}");
+    assert!(out.starts_with("UNITS OK"), "{out}");
+
+    let server = format!("{units}/kbf-server.service");
+    let text = std::fs::read_to_string(&server).expect("rendered");
+    std::fs::write(&server, text.replace("MemorySwapMax=0", "MemorySwapMax=1G")).expect("plant");
+    let (code, out, _) = cli(&mut exec, &no_env, &check);
+    assert_eq!(code, ExitCode::FAILURE, "{out}");
+    assert!(out.starts_with("FAIL "), "{out}");
+    assert!(out.contains("UNITS BROKEN"), "{out}");
+}

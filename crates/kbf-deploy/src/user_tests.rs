@@ -119,17 +119,11 @@ fn id_as(user: RunUser, flag: &str) -> io::Result<std::process::Output> {
 #[test]
 fn as_a_user_a_command_for_another_user_never_starts() {
     let (uid, gid) = me();
-    let other = RunUser {
-        name: "other".to_owned(),
-        uid: uid + 1,
-        gid,
-        groups: vec![gid],
-        home: "/".to_owned(),
-    };
-    let err = id_as(other, "-u").expect_err("only root may switch users");
+    let err = id_as(other_user(uid + 1, gid), "-u").expect_err("only root may switch users");
     assert_eq!(err.raw_os_error(), Some(libc::EPERM), "{err}");
-    // In this process: the first call already needs root.
-    let err = become_user(uid, gid, &[gid]).expect_err("setgroups needs root");
+    // In this process, the closure the child would run: its first call already needs
+    // root.
+    let err = switch_to(&other_user(uid, gid))().expect_err("setgroups needs root");
     assert_eq!(err.raw_os_error(), Some(libc::EPERM), "{err}");
 }
 
@@ -146,8 +140,8 @@ fn sorted(text: &str) -> Vec<u32> {
 
 /// Root only; [`the_root_tests_pass_under_sudo`] runs it. Catches a child that keeps
 /// root's groups (the user's groups were never set: `setgroups` dropped) or root's
-/// uid or gid, and switch calls in the wrong order (once the uid is dropped, setgid and
-/// setgroups fail).
+/// uid or gid, switch calls in the wrong order (once the uid is dropped, setgid and
+/// setgroups fail), and a switch that goes on after a refused setgid or setuid.
 #[test]
 #[ignore = "needs root: the_root_tests_pass_under_sudo runs it through sudo"]
 fn as_root_a_child_has_the_users_ids_and_groups() {
@@ -179,6 +173,13 @@ fn as_root_a_child_has_the_users_ids_and_groups() {
             .expect("a number")
     };
     let (uid, gid) = (id("SUDO_UID"), id("SUDO_GID"));
+    // An id the kernel refuses (-1 names no one) stops the switch at that call, so the
+    // process never goes on with root's group or uid.
+    let err = become_user(uid, u32::MAX, &[gid]).expect_err("gid -1");
+    assert_eq!(err.raw_os_error(), Some(libc::EINVAL), "setgid: {err}");
+    let err = become_user(u32::MAX, gid, &[gid]).expect_err("uid -1");
+    assert_eq!(err.raw_os_error(), Some(libc::EINVAL), "setuid: {err}");
+    assert_eq!(rustix::process::geteuid().as_raw(), 0, "still root");
     become_user(uid, gid, &[gid, 4242]).expect("root may switch");
     assert_eq!(me(), (uid, gid));
     let groups = rustix::process::getgroups().expect("getgroups");
@@ -254,5 +255,15 @@ fn the_root_tests_pass_under_sudo() {
             "the root test saw another profile: {stdout}"
         );
         assert!(!stderr.contains("LLVM Profile Error"), "{stderr}");
+    }
+}
+
+fn other_user(uid: u32, gid: u32) -> RunUser {
+    RunUser {
+        name: "other".to_owned(),
+        uid,
+        gid,
+        groups: vec![gid],
+        home: "/".to_owned(),
     }
 }

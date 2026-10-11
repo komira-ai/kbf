@@ -238,13 +238,12 @@ fn output(cmd: &Cmd) -> io::Result<Output> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     if let Some(u) = &cmd.user {
-        let (uid, gid, groups) = (u.uid, u.gid, u.groups.clone());
         // SAFETY: the closure runs in the child between fork and exec; `become_user`
         // makes three system calls on numbers the parent copied in, and allocates
         // nothing. Not `Command::uid`: std runs that before any `pre_exec` closure and
         // clears the groups with it, after which they can no longer be set.
         unsafe {
-            command.pre_exec(move || user::become_user(uid, gid, &groups));
+            command.pre_exec(user::switch_to(u));
         }
     }
     let mut child = command.spawn()?;

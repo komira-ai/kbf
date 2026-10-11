@@ -102,6 +102,13 @@ fn tool(path: &str) -> HostPath {
     HostPath::new(path).expect("a tool's path is absolute")
 }
 
+/// What a child runs between fork and exec to become `user`: [`become_user`] on a copy of
+/// its ids, made here in the parent so the child allocates nothing.
+pub(crate) fn switch_to(user: &RunUser) -> impl FnMut() -> io::Result<()> + Send + Sync + 'static {
+    let (uid, gid, groups) = (user.uid, user.gid, user.groups.clone());
+    move || become_user(uid, gid, &groups)
+}
+
 /// Switch the calling process to `uid`, `gid` and `groups`: the supplementary groups,
 /// then the group, then the user. Called in a child between fork and exec, so it makes
 /// three system calls and allocates nothing.
