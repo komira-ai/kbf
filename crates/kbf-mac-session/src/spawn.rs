@@ -7,6 +7,14 @@
 //! and `LOGNAME` set by the helper, and the lease directory as its working directory
 //! (`fchdir` after the uid change, so the lease user must be able to search it).
 //!
+//! In the lease user's GUI session (`Session::Gui`, macOS only) the helper starts
+//! `launchctl asuser <uid>` as root instead, which runs the helper's own `as-user` mode
+//! in the user's `gui/<uid>` bootstrap namespace; that mode drops to the lease user's
+//! uid and gid, with no supplementary groups, and executes the argument vector, in the
+//! working directory and environment above (`crate::macos::gui`). A process started so
+//! reaches the user's Aqua services (the window server, Launch Services), as a process
+//! the user started at the login window does.
+//!
 //! Every other descriptor is closed across `exec`: the helper serves several leases at
 //! once, and macOS cannot receive a descriptor already close-on-exec, so a lease
 //! directory just received for one lease could otherwise leak into another lease's
@@ -18,6 +26,8 @@ use std::os::fd::{AsRawFd as _, OwnedFd};
 use std::os::unix::process::CommandExt as _;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+
+use crate::proto::Session;
 
 /// The highest descriptor number the child's close-on-exec pass reaches when the
 /// descriptor limit is unlimited or higher.
@@ -40,6 +50,8 @@ pub struct Spawn {
     pub stderr: OwnedFd,
     /// The lease directory, made the working directory.
     pub cwd: OwnedFd,
+    /// Where it runs.
+    pub session: Session,
 }
 
 /// Checks an argument vector and environment before anything starts.
@@ -72,9 +84,15 @@ pub fn spawn(spawn: Spawn) -> io::Result<Child> {
         .argv
         .split_first()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "empty argument vector"))?;
-    let mut command = Command::new(program);
+    let mut command = match spawn.session {
+        Session::Background => {
+            let mut command = Command::new(program);
+            command.args(args).uid(spawn.uid).gid(spawn.gid);
+            command
+        }
+        Session::Gui => gui(spawn.uid, spawn.gid, program, args)?,
+    };
     command
-        .args(args)
         .env_clear()
         .envs(
             spawn
@@ -86,8 +104,6 @@ pub fn spawn(spawn: Spawn) -> io::Result<Child> {
         .env("HOME", &spawn.home)
         .env("USER", &spawn.user)
         .env("LOGNAME", OsString::from(&spawn.user))
-        .uid(spawn.uid)
-        .gid(spawn.gid)
         .process_group(0)
         .stdin(Stdio::from(spawn.stdin))
         .stdout(Stdio::from(spawn.stdout))
@@ -102,6 +118,22 @@ pub fn spawn(spawn: Spawn) -> io::Result<Child> {
     let child = command.spawn();
     drop(spawn.cwd);
     child
+}
+
+/// The command that starts `program` in the GUI session of `uid` (see the module
+/// documentation).
+#[cfg(target_os = "macos")]
+fn gui(uid: u32, gid: u32, program: &str, args: &[String]) -> io::Result<Command> {
+    crate::macos::gui::command(uid, gid, program, args)
+}
+
+/// There is no GUI session to start a process in off macOS.
+#[cfg(not(target_os = "macos"))]
+fn gui(_: u32, _: u32, _: &str, _: &[String]) -> io::Result<Command> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "a GUI session exists only on macOS",
+    ))
 }
 
 /// The closure `pre_exec` runs in the child: [`in_child`] with the lease directory.
@@ -180,8 +212,24 @@ mod tests {
             stdout: write,
             stderr: null(),
             cwd: std::fs::File::open(cwd).unwrap().into(),
+            session: Session::Background,
         };
         (spawn, out)
+    }
+
+    /// Catches a GUI run that falls back to a background one where there is no GUI
+    /// session: off macOS it is refused, and nothing starts.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn a_gui_session_is_refused_off_macos() {
+        let dir = std::env::temp_dir();
+        let (spawn, _out) = base(&["/bin/true"], &dir);
+        let spawn = Spawn {
+            session: Session::Gui,
+            ..spawn
+        };
+        let error = super::spawn(spawn).expect_err("started off macOS");
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
     }
 
     /// Catches: the lease directory not made the working directory, the daemon's

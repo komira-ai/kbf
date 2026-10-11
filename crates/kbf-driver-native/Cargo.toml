@@ -10,10 +10,12 @@ publish.workspace = true
 [dependencies]
 futures.workspace = true
 kbf-daemon.workspace = true
+kbf-mac-session.workspace = true
 kbf-outputs.workspace = true
 kbf-proto.workspace = true
 kbf-types.workspace = true
 libc.workspace = true
+prost.workspace = true
 prost-types.workspace = true
 rustix = { workspace = true, features = ["fs", "process"] }
 tokio = { workspace = true, features = ["fs", "macros", "process", "rt", "sync", "time"] }
@@ -22,7 +24,6 @@ tracing.workspace = true
 [dev-dependencies]
 clap.workspace = true
 hex.workspace = true
-prost.workspace = true
 sha2.workspace = true
 tracing-subscriber.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread"] }

@@ -5,16 +5,32 @@
 //! ```text
 //! mac_session_client create <socket> <lease> [grant token]   prints the uid
 //! mac_session_client run <socket> <lease> <dir> <argv>...   prints "exit <code>" or "signal <n>"
+//! mac_session_client run-gui <socket> <lease> <dir> <argv>...   the same, in the GUI session
+//! mac_session_client session-ready <socket> <lease>    prints "true" or "false"
 //! mac_session_client kill <socket> <lease>
 //! mac_session_client delete <socket> <lease>           prints "existed" or "absent"
 //! mac_session_client reset <socket> [held lease]...     prints "kept <lease|none> deleted <leases>"
+//! mac_session_client scan <socket>                     prints "clean" or "dirty", then "+ <added>",
+//!                                                      "- <removed>" and "! <error>" lines
+//! mac_session_client baseline <socket>                 prints "<class> <items>" lines
+//! mac_session_client reboot-dirty <socket>             reboots the Mac if the last scan was dirty
 //! mac_session_client grant <seed> <serial> <lease> <issued>   prints a grant token
 //! mac_session_client pubkey <seed>                     prints the grant key file line
 //! mac_session_client connect-then-exec <socket> <program> <args>...
 //! mac_session_client write-then-exec <socket> <lease> <program> <args>...
 //! mac_session_client replies                           prints the replies on KBF_CI_FD
 //! mac_session_client exec-probe                        prints audit tokens across an exec
+//! mac_session_client spawn <gui|background> <uid> <gid> <user> <dir> <argv>...
+//!                                                       prints "exit <code>"
+//! mac_session_client groups                             prints this process's groups
 //! ```
+//!
+//! `spawn` starts `<argv>` as `kbf-mac-session`'s `run` does (`spawn::spawn`), with
+//! stdout and stderr this process's, without the helper's socket or ledger: run as root,
+//! it shows where a process lands in each session, for a uid that has a GUI session
+//! (the runner's own) where no lease user has one. In the GUI session it executes this
+//! binary in the `as-user` mode, as the helper executes itself, so this binary also
+//! answers `as-user` (`kbf_mac_session::macos::gui::as_user`).
 //!
 //! The attack S4.3 names, connecting as one binary and then becoming the genuine one,
 //! in two forms:
@@ -54,11 +70,18 @@ mod macos {
     use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
     use ed25519_dalek::{Signer as _, SigningKey};
     use kbf_mac_session::client::{self, Client, ClientError};
-    use kbf_mac_session::proto::{self, Reply, Request};
+    use kbf_mac_session::proto::{self, Reply, Request, Session};
+    use kbf_mac_session::spawn::Spawn;
     use time::OffsetDateTime;
     use time::macros::format_description;
 
     pub fn main() -> ExitCode {
+        let raw: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+        if let Some((mode, rest)) = raw.split_first()
+            && mode == kbf_mac_session::macos::gui::AS_USER
+        {
+            return kbf_mac_session::macos::gui::as_user(rest);
+        }
         let args: Vec<String> = std::env::args().skip(1).collect();
         let words: Vec<&str> = args.iter().map(String::as_str).collect();
         match run(&words) {
@@ -85,14 +108,24 @@ mod macos {
                 let uid = Client::new(socket).user_create(lease, rest.first().copied())?;
                 println!("{uid}");
             }
-            ["run", socket, lease, dir, argv @ ..] => {
+            ["session-ready", socket, lease] => {
+                println!("{}", Client::new(socket).session_ready(lease)?);
+            }
+            [verb @ ("run" | "run-gui"), socket, lease, dir, argv @ ..] => {
+                let session = if *verb == "run-gui" {
+                    Session::Gui
+                } else {
+                    Session::Background
+                };
                 let dir = std::fs::File::open(dir).map_err(ClientError::Io)?;
                 let null = std::fs::File::open("/dev/null").map_err(ClientError::Io)?;
                 let argv: Vec<String> = argv.iter().map(|&a| a.to_owned()).collect();
                 let stdout = std::io::stdout();
                 let stderr = std::io::stderr();
                 let fds = [null.as_fd(), stdout.as_fd(), stderr.as_fd(), dir.as_fd()];
-                let exit = Client::new(socket).run(lease, &argv, &[], fds)?.wait()?;
+                let exit = Client::new(socket)
+                    .run_in(lease, &argv, &[], fds, session)?
+                    .wait()?;
                 match (exit.code, exit.signal) {
                     (Some(code), _) => println!("exit {code}"),
                     (_, Some(signal)) => println!("signal {signal}"),
@@ -105,6 +138,25 @@ mod macos {
                 let kept = kept.as_deref().unwrap_or("none");
                 println!("kept {kept} deleted {}", deleted.join(","));
             }
+            ["scan", socket] => {
+                let scanned = Client::new(socket).scan()?;
+                println!("{}", if scanned.clean { "clean" } else { "dirty" });
+                for item in &scanned.added {
+                    println!("+ {item}");
+                }
+                for item in &scanned.removed {
+                    println!("- {item}");
+                }
+                for error in &scanned.errors {
+                    println!("! {error}");
+                }
+            }
+            ["baseline", socket] => {
+                for (class, items) in Client::new(socket).baseline()? {
+                    println!("{class} {items}");
+                }
+            }
+            ["reboot-dirty", socket] => Client::new(socket).reboot_dirty()?,
             ["kill", socket, lease] => {
                 let stream = match inherited() {
                     Some(stream) => stream,
@@ -135,6 +187,45 @@ mod macos {
                 }
             }
             ["exec-probe"] => exec_probe().map_err(ClientError::Io)?,
+            ["groups"] => {
+                // The kernel's list (getgroups(2) without _DARWIN_UNLIMITED_GETGROUPS),
+                // which setgroups changes; `id -G` asks the directory instead.
+                let mut groups = [0 as libc::gid_t; 64];
+                // SAFETY: `groups` has room for 64 ids, the count passed.
+                let n = unsafe { libc::getgroups(64, groups.as_mut_ptr()) };
+                let n = usize::try_from(n)
+                    .map_err(|_| ClientError::Io(std::io::Error::last_os_error()))?;
+                let named: Vec<String> = groups[..n].iter().map(ToString::to_string).collect();
+                println!("{}", named.join(" "));
+            }
+            ["spawn", session, uid, gid, user, dir, argv @ ..] => {
+                let session = match *session {
+                    "gui" => Session::Gui,
+                    _ => Session::Background,
+                };
+                let open = |path: &str| std::fs::File::open(path).map_err(ClientError::Io);
+                let fd = |file: std::fs::File| -> std::os::fd::OwnedFd { file.into() };
+                let dup = |fd: std::os::fd::BorrowedFd<'_>| {
+                    fd.try_clone_to_owned().map_err(ClientError::Io)
+                };
+                let spawn = Spawn {
+                    uid: uid.parse().expect("a uid"),
+                    gid: gid.parse().expect("a gid"),
+                    user: (*user).to_owned(),
+                    home: std::path::PathBuf::from("/Users").join(user),
+                    argv: argv.iter().map(|&a| a.to_owned()).collect(),
+                    env: Vec::new(),
+                    stdin: fd(open("/dev/null")?),
+                    stdout: dup(std::io::stdout().as_fd())?,
+                    stderr: dup(std::io::stderr().as_fd())?,
+                    cwd: fd(open(dir)?),
+                    session,
+                };
+                let status = kbf_mac_session::spawn::spawn(spawn)
+                    .and_then(|mut child| child.wait())
+                    .map_err(ClientError::Io)?;
+                println!("exit {}", status.code().unwrap_or(-1));
+            }
             ["probe-child"] => {
                 // exec-probe's child: says it is there, waits for the go, becomes sleep.
                 let stream = inherited().expect("KBF_CI_FD names the probe's socket");

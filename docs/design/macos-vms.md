@@ -341,15 +341,14 @@ for them, and `vms` is booked only through `kbf-lease=vm`.
 No new key names the lease kinds a node serves: the scheduler maps each lease kind to
 the drivers that serve it and reads `drivers`. `action` maps to `native` or
 `container` only; `vm` maps to `vm`; `whole_machine` maps to `native-whole-machine`,
-the `drivers` value of the planned bare-metal whole-machine runtime (the per-lease-user
-driver of [fleet-updates.md](fleet-updates.md), phase P4). A daemon lists
-`native-whole-machine` only when `kbf-mac-session` is present, so a Mac before that
-phase, or any other native daemon, never looks able to serve `whole_machine`. On
-`main` no driver serves
-`whole_machine`: the native and container drivers serve `action` only
+the `drivers` value of the bare-metal whole-machine runtime (the per-lease-user driver
+of [fleet-updates.md](fleet-updates.md#101-no-gpu-in-vms), phase P4;
+`crates/kbf-driver-native/src/whole_machine.rs`). A daemon lists `native-whole-machine`
+only when `kbf-mac-session` is present (it refuses to start that driver without the
+helper's socket), so a Mac before that phase, or any other native daemon, never looks
+able to serve `whole_machine`. The native and container drivers serve `action` only
 (`crates/kbf-driver-native/src/runtime.rs`, `crates/kbf-driver-native/tests/lease.rs`)
-**[V]**. That is the planned "Drivers in placement" of
-[capabilities.md](capabilities.md#planned) and [scheduler.md](scheduler.md).
+**[V]**.
 
 ### 5.3 Booking and placement (planned)
 
@@ -545,10 +544,13 @@ So a GPU test is a whole-machine lease:
   numbers from a shared machine are noise. The scheduler drains the Mac first
   ([section 5.3](#53-booking-and-placement-planned)); GPU tests on one Mac run one at a
   time.
-- On macOS the front refuses `gpu`≥1 unless `kbf-lease=whole_machine` (and always with
-  `kbf-lease=vm`), with `INVALID_ARGUMENT`, so GPU work cannot land beside other work.
-- The daemon reports `gpu=1` on Apple silicon. Today it reports 0
-  (`crates/kbf-daemon/src/report.rs`) **[V]**.
+- On macOS (a platform whose `OSFamily` or `os` names it) the front refuses `gpu`≥1
+  unless `kbf-lease=whole_machine`, with `INVALID_ARGUMENT`, so GPU work cannot land
+  beside other work; `kbf-lease=vm` is refused as a lease kind today. Built
+  (`crates/kbf-front/src/execution.rs`).
+- The scheduler does not model a Mac's GPU: the daemon reports `gpu` 0 on macOS
+  (`crates/kbf-daemon/src/report.rs`) **[V]**, and the front books no GPU on top of a
+  whole-machine lease on macOS. The lease books the whole Mac, its GPU with it.
 - The model must fit: weights + KV cache + activations + process. Example,
   Qwen2.5-7B-Instruct at 4 bits: 4.3 GB of weights; its KV cache is 2 × 28 layers ×
   4 KV heads × 128 × 2 bytes = 56 KiB per token, 0.47 GB at 8k tokens; about 8 GiB.
@@ -682,10 +684,10 @@ app's peak are recorded and replace the **[A]** numbers in section 4.
 
 | Crate | Change |
 |---|---|
-| `kbf-daemon` | report `gpu=1`, GPU core count and the wired-memory cap on macOS |
+| `kbf-daemon` | report the GPU core count and the wired-memory cap on macOS (status, not booking) |
 | `kbf-proto`, `kbf-server` | GPUs in `Start` |
-| `kbf-sched` | GPU tests as whole-machine leases with `gpu=1`: drain the Mac, one at a time |
-| `kbf-driver-native`, `kbf-daemon` | the bare-metal whole-machine runtime that serves `whole_machine` (none does on `main`): the per-lease-user driver of [fleet-updates.md](fleet-updates.md), phase P4; reports `native-whole-machine` |
+| `kbf-sched` | GPU tests as whole-machine leases: drain the Mac, one at a time (built: a whole-machine lease waits for an empty worker and books all of it) |
+| `kbf-driver-native`, `kbf-daemon` | the bare-metal whole-machine runtime that serves `whole_machine`: the per-lease-user driver of [fleet-updates.md](fleet-updates.md#101-no-gpu-in-vms), phase P4; reports `native-whole-machine`. Built, but for the leak scan, the sandbox profile and the LaunchDaemon install |
 | `kbf-front`, `kbf-sched` | a `whole_machine` lease books the node's full cores, memory, `gpus` and `vms` |
 | `kbf-daemon`, `kbf-server` | carry `auxiliary_metadata`; store series per test and hardware key |
 | front / CAS | model weights as chunked CAS inputs, kept from eviction on nodes that run GPU tests |

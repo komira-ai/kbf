@@ -520,7 +520,8 @@ fn id_files(name: &str, count: &str) -> PathBuf {
 }
 
 /// Catches: a driver started without what it needs (a plain-text `--cas` among
-/// them), a configuration error that does not stop the daemon with a message and a
+/// them, the whole-machine driver off macOS or without its helper), a configuration
+/// error that does not stop the daemon with a message and a
 /// non-zero exit, and an `--image` that a driver other than the container driver
 /// takes and ignores (the node would list images no lease of it can run).
 #[test]
@@ -561,6 +562,21 @@ fn a_driver_missing_its_flags_refuses_to_start() {
                 "--cas is required"
             } else {
                 "runs on Linux only"
+            },
+        ),
+        // The whole-machine runtime needs a Mac and its root helper; a node without
+        // them must not list native-whole-machine.
+        (
+            vec![
+                "--driver=native-whole-machine".into(),
+                "--cas=https://127.0.0.1:1".into(),
+                scratch.clone(),
+                format!("--mac-session-socket={}", dir.join("no-helper").display()),
+            ],
+            if cfg!(target_os = "macos") {
+                "needs kbf-mac-session"
+            } else {
+                "runs on macOS only"
             },
         ),
     ];

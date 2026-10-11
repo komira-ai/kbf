@@ -113,7 +113,7 @@ impl Helper {
             .collect::<Result<_, _>>()?;
         let mut ledger = self.lock();
         if self.reset_done() {
-            return Err("the boot reset ran already; it runs once per start".to_owned());
+            return Err(super::RESET_ALREADY.to_owned());
         }
         let intent = match read_intent(&self.settings.session.intent) {
             Ok(intent) => intent,

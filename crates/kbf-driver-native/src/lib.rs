@@ -1,6 +1,8 @@
-//! The native driver for `kbf-daemon`: runs each `action` lease as plain processes on
-//! the node, for Macs (where there are no containers), behind the daemon's `Runtime`
-//! trait.
+//! The native drivers for `kbf-daemon`: [`NativeRuntime`] runs each `action` lease as
+//! plain processes on the node, for Macs (where there are no containers), and
+//! [`whole_machine::WholeMachineRuntime`] each `whole_machine` lease as its own user in
+//! that user's GUI session, through `kbf-mac-session`; both behind the daemon's
+//! `Runtime` trait. The rest of this page is about `NativeRuntime`.
 //!
 //! What one lease gets:
 //! - a fresh lease directory under the configured scratch root, the input root written
@@ -118,6 +120,7 @@ mod record;
 mod runtime;
 mod sweep;
 pub mod user_folders;
+pub mod whole_machine;
 pub mod xcode;
 pub mod xcode_watch;
 

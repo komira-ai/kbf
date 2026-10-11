@@ -4,11 +4,10 @@
 use super::rust::{is_crate_src, is_dash_c, is_shell, shell_c_files};
 use super::*;
 
-fn found(key: &str, count: usize) -> Found {
+fn found(key: &str) -> Found {
     Found {
         section: Section::Files,
         key: key.to_owned(),
-        count,
         why: "a `.sh` file".to_owned(),
     }
 }
@@ -17,74 +16,67 @@ fn found(key: &str, count: usize) -> Found {
 fn well_formed_rows_parse_in_their_sections() {
     // Catches: a header, comment or blank line read as a row; a row filed under the
     // wrong section; the same key refused across two sections.
-    let text = "# budget\n\n[files]\n3\ta.sh\tCI\n[workflow]\n2\tw.yml#j/s\tinstall\n\
-                [src-sh-c]\n1\tcrates/x/src/k.rs\tkeeper\n1\ta.sh\tsame key, other section\n";
+    let text = "# budget\n\n[files]\na.sh\tCI\n[workflow]\nw.yml#j/s\tinstall\n\
+                [src-sh-c]\ncrates/x/src/k.rs\tkeeper\na.sh\tsame key, other section\n";
     let (rows, problems) = parse(text);
     assert_eq!(problems, Vec::<String>::new());
-    let got: Vec<(Section, usize, &str, usize)> = rows
+    let got: Vec<(Section, &str, usize)> = rows
         .iter()
-        .map(|r| (r.section, r.count, r.key.as_str(), r.line))
+        .map(|r| (r.section, r.key.as_str(), r.line))
         .collect();
     assert_eq!(
         got,
         vec![
-            (Section::Files, 3, "a.sh", 4),
-            (Section::Workflow, 2, "w.yml#j/s", 6),
-            (Section::SrcShC, 1, "crates/x/src/k.rs", 8),
-            (Section::SrcShC, 1, "a.sh", 9),
+            (Section::Files, "a.sh", 4),
+            (Section::Workflow, "w.yml#j/s", 6),
+            (Section::SrcShC, "crates/x/src/k.rs", 8),
+            (Section::SrcShC, "a.sh", 9),
         ]
     );
 }
 
 #[test]
 fn malformed_and_duplicate_rows_are_refused() {
-    // Catches: a malformed row skipped (so its file escapes the list) or read with a
-    // wrong count; a second row for one key, which would let a stale copy hide.
+    // Catches: a malformed row skipped (so its file escapes the list), including a
+    // row still in the old `<count>\t<key>\t<reason>` form; a second row for one key,
+    // which would let a stale copy hide.
     for (text, want) in [
-        ("3\ta.sh\tCI\n", "line 1: a row before any section header"),
+        ("a.sh\tCI\n", "line 1: a row before any section header"),
         ("[file]\n", "line 1: unknown section `[file]`"),
         (
             "[files]\n[files]\n",
             "line 2: the section [files] appears twice",
         ),
         (
-            "[files]\n3\ta.sh\n",
-            "line 2: a row needs three tab-separated fields (<count>, <key>, <reason>), found 2",
+            "[files]\na.sh\n",
+            "line 2: a row needs two tab-separated fields (<key>, <reason>), found 1",
         ),
         (
-            "[files]\n3\ta.sh\tCI\tmore\n",
-            "line 2: a row needs three tab-separated fields (<count>, <key>, <reason>), found 4",
+            "[files]\n3\ta.sh\tCI\n",
+            "line 2: a row needs two tab-separated fields (<key>, <reason>), found 3",
         ),
         (
-            "[files]\n3 a.sh CI\n",
-            "line 2: a row needs three tab-separated fields (<count>, <key>, <reason>), found 1",
+            "[files]\na.sh CI\n",
+            "line 2: a row needs two tab-separated fields (<key>, <reason>), found 1",
         ),
         (
-            "[files]\n3\ta.sh\t\n",
+            "[files]\na.sh\t\n",
             "line 2: a field is empty or has blanks around it",
         ),
         (
-            "[files]\n3\t a.sh\tCI\n",
+            "[files]\n\tCI\n",
             "line 2: a field is empty or has blanks around it",
         ),
         (
-            "[files]\n3\ta.sh\tCI\r\n",
+            "[files]\n a.sh\tCI\n",
             "line 2: a field is empty or has blanks around it",
         ),
         (
-            "[files]\n+3\ta.sh\tCI\n",
-            "line 2: the count `+3` is not a number",
+            "[files]\na.sh\tCI\r\n",
+            "line 2: a field is empty or has blanks around it",
         ),
         (
-            "[files]\n03\ta.sh\tCI\n",
-            "line 2: the count `03` is not a number",
-        ),
-        (
-            "[files]\nx\ta.sh\tCI\n",
-            "line 2: the count `x` is not a number",
-        ),
-        (
-            "[files]\n3\ta.sh\tCI\n4\ta.sh\tagain\n",
+            "[files]\na.sh\tCI\na.sh\tagain\n",
             "line 3: a second [files] row for `a.sh` (the first is line 2)",
         ),
     ] {
@@ -95,11 +87,11 @@ fn malformed_and_duplicate_rows_are_refused() {
 
 #[test]
 fn a_matching_budget_passes() {
-    // Catches: a check that refuses a tree whose every file has its exact row (the
-    // control for the planted defects below).
-    let budget = "[files]\n3\ta.sh\tCI\n0\tb.py\tempty\n";
+    // Catches: a check that refuses a tree whose every file has its row (the control
+    // for the planted defects below).
+    let budget = "[files]\na.sh\tCI\nb.py\tempty\n";
     assert_eq!(
-        check(budget, &[found("a.sh", 3), found("b.py", 0)]),
+        check(budget, &[found("a.sh"), found("b.py")]),
         Vec::<String>::new()
     );
 }
@@ -108,29 +100,12 @@ fn a_matching_budget_passes() {
 fn an_unlisted_file_is_refused() {
     // Catches (planted defect): a new `x.sh` with no row passing the lint.
     assert_eq!(
-        check("[files]\n", &[found("x.sh", 4)]),
+        check("[files]\n", &[found("x.sh")]),
         vec![format!(
             "`x.sh`: a `.sh` file, and {BUDGET} has no [files] row for it; port it to \
-             Rust, or add the row `4\\tx.sh\\t<reason>`"
+             Rust, or add the row `x.sh\\t<reason>`"
         )]
     );
-}
-
-#[test]
-fn a_row_one_line_off_either_way_is_refused() {
-    // Catches (planted defect): a file grown or shrunk by one line while its row kept
-    // the old count, so the list stops saying how much shell is left.
-    for listed in [4, 6] {
-        let budget = format!("[files]\n{listed}\tx.sh\tCI\n");
-        assert_eq!(
-            check(&budget, &[found("x.sh", 5)]),
-            vec![format!(
-                "`x.sh` has 5 lines but its [files] row (line 2) says {listed}; change \
-                 the row in the same commit"
-            )],
-            "{listed}"
-        );
-    }
 }
 
 #[test]
@@ -138,7 +113,7 @@ fn a_stale_row_is_refused() {
     // Catches (planted defect): a row left behind for a deleted file, so a later file
     // of that name would be listed without review.
     assert_eq!(
-        check("[files]\n4\tgone.sh\tCI\n", &[]),
+        check("[files]\ngone.sh\tCI\n", &[]),
         vec![
             "line 2: the [files] row for `gone.sh` names nothing the scan found (deleted, \
              renamed, or no longer counted); remove the row"
@@ -150,9 +125,9 @@ fn a_stale_row_is_refused() {
 #[test]
 fn a_row_matches_only_its_own_section() {
     // Catches: a workflow script cleared by a [files] row of the same key.
-    let mut step = found("w.yml#j/s", 2);
+    let mut step = found("w.yml#j/s");
     step.section = Section::Workflow;
-    let problems = check("[files]\n2\tw.yml#j/s\tCI\n", &[step]);
+    let problems = check("[files]\nw.yml#j/s\tCI\n", &[step]);
     assert_eq!(problems.len(), 2, "{problems:?}");
     assert!(problems[0].contains("no [workflow] row"), "{problems:?}");
     assert!(
@@ -245,16 +220,6 @@ fn interpreter_files_are_found_by_extension_or_first_line() {
 }
 
 #[test]
-fn a_line_count_is_the_newline_count() {
-    // Catches: a count that differs from `wc -l` (the number the rows were seeded
-    // with), for a last line without a newline or a blank line.
-    assert_eq!(newlines(b""), 0);
-    assert_eq!(newlines(b"a"), 0);
-    assert_eq!(newlines(b"a\n"), 1);
-    assert_eq!(newlines(b"a\n\nb"), 2);
-}
-
-#[test]
 fn shell_logic_in_a_run_script_is_named() {
     // Catches: a pipe, chain, loop, condition or substitution passing as a one-line
     // command, and a plain command (with `--if-present` or a path holding `for`)
@@ -287,7 +252,7 @@ fn src(files: &[(&str, &str)]) -> Vec<(String, String)> {
         .collect()
 }
 
-fn spawns(files: &[(&str, &str)]) -> Vec<(String, usize)> {
+fn spawns(files: &[(&str, &str)]) -> Vec<String> {
     let (found, problems) = shell_c_files(&src(files));
     assert_eq!(problems, Vec::<String>::new());
     found
@@ -299,22 +264,23 @@ const LIB: &str = "crates/x/src/lib.rs";
 fn a_production_sh_c_is_found() {
     // Catches (planted defect): `Command::new("sh").arg("-c")` in production code
     // passing the lint; the keeper's shape (the shell a `Path` in one function, `-c`
-    // an `.arg` in another) and a macro's argument list missed.
+    // an `.arg` in another) and a macro's argument list missed; and a file with two
+    // spawns reported twice (its one row is per file).
     let planted = r#"fn f() { std::process::Command::new("sh").arg("-c").arg("x"); }"#;
-    assert_eq!(spawns(&[(LIB, planted)]), vec![(LIB.to_owned(), 1)]);
+    assert_eq!(spawns(&[(LIB, planted)]), vec![LIB.to_owned()]);
     let keeper = r#"
         pub fn watch() { with(std::path::Path::new("/bin/sh")) }
         fn with(shell: &std::path::Path) { std::process::Command::new(shell).arg("-c"); }
     "#;
-    assert_eq!(spawns(&[(LIB, keeper)]), vec![(LIB.to_owned(), 1)]);
+    assert_eq!(spawns(&[(LIB, keeper)]), vec![LIB.to_owned()]);
     let argv = r#"fn f() -> Vec<&'static str> { vec!["/bin/bash", "-ec", "x"] }"#;
-    assert_eq!(spawns(&[(LIB, argv)]), vec![(LIB.to_owned(), 1)]);
+    assert_eq!(spawns(&[(LIB, argv)]), vec![LIB.to_owned()]);
     let not_test = r#"#[cfg(not(test))] fn f() { g("bash", "-c") }"#;
-    assert_eq!(spawns(&[(LIB, not_test)]), vec![(LIB.to_owned(), 1)]);
+    assert_eq!(spawns(&[(LIB, not_test)]), vec![LIB.to_owned()]);
     let any = r#"#[cfg(any(test, unix))] fn f() { g("zsh", "-c") }"#;
-    assert_eq!(spawns(&[(LIB, any)]), vec![(LIB.to_owned(), 1)]);
+    assert_eq!(spawns(&[(LIB, any)]), vec![LIB.to_owned()]);
     let two = r#"fn f() { g("sh", "-c"); g("/bin/sh", "-c") }"#;
-    assert_eq!(spawns(&[(LIB, two)]), vec![(LIB.to_owned(), 2)]);
+    assert_eq!(spawns(&[(LIB, two)]), vec![LIB.to_owned()]);
 }
 
 #[test]
@@ -329,7 +295,7 @@ fn a_shell_name_or_flag_alone_is_not_a_spawn() {
            #[doc = "sh"] fn f() { g("-c") }"#,
         r#"fn f() { g("bin/sh", "-c"); g("-cp") }"#,
     ] {
-        assert_eq!(spawns(&[(LIB, text)]), Vec::new(), "{text}");
+        assert_eq!(spawns(&[(LIB, text)]), Vec::<String>::new(), "{text}");
     }
 }
 
@@ -346,7 +312,7 @@ fn test_code_is_left_out() {
         r#"fn f() { #[cfg(test)] let x = g("sh", "-c"); }"#,
         "#![cfg(test)]\nfn f() { g(\"sh\", \"-c\") }",
     ] {
-        assert_eq!(spawns(&[(LIB, text)]), Vec::new(), "{text}");
+        assert_eq!(spawns(&[(LIB, text)]), Vec::<String>::new(), "{text}");
     }
 }
 
@@ -375,17 +341,14 @@ fn a_file_reached_through_a_test_module_is_left_out() {
         ("crates/x/src/bin/tool.rs", "#[cfg(test)] mod tool_tests;"),
         ("crates/x/src/bin/tool_tests.rs", spawn),
     ];
-    assert_eq!(
-        spawns(&files),
-        vec![("crates/x/src/b/prod.rs".to_owned(), 1)]
-    );
+    assert_eq!(spawns(&files), vec!["crates/x/src/b/prod.rs".to_owned()]);
 }
 
 #[test]
 fn a_file_that_does_not_parse_is_refused() {
     // Catches: a source the parser cannot read skipped, so its `sh -c` escapes.
     let (found, problems) = shell_c_files(&src(&[(LIB, "fn f( {")]));
-    assert_eq!(found, Vec::new());
+    assert_eq!(found, Vec::<String>::new());
     assert_eq!(problems.len(), 1, "{problems:?}");
     assert!(
         problems[0].starts_with(&format!("{LIB}: not read as Rust")),

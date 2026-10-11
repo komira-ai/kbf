@@ -2,8 +2,8 @@
 
 use kbf_caps::NodeCaps;
 use kbf_types::{
-    ActionKey, ControlRecord, FarmTime, FencePolicy, LeaseId, LeaseKind, OperationId, Outcome, Qos,
-    Resources, WaiterId, WorkerId,
+    ActionKey, ControlRecord, FarmTime, FencePolicy, LeaseId, LeaseKind, NodePhase, OperationId,
+    Outcome, Qos, Resources, WaiterId, WorkerId,
 };
 
 /// One execution request, as the front submits it after the cache missed.
@@ -180,6 +180,23 @@ pub enum Event {
         /// The leases it holds: running (a restarted daemon re-adopts its runs; after a
         /// reboot there are none), or ended with a result not yet acknowledged.
         running: Vec<LeaseId>,
+    },
+    /// The worker's phase, from each `Hello` it sends (the registration's included,
+    /// fed right after its [`Event::WorkerUp`]). Counts as hearing from it. Ignored for
+    /// a worker that never registered.
+    ///
+    /// A `Preparing` or `Restoring` phase naming a lease the scheduler holds on the
+    /// worker, whose `Start` went to an earlier session, sends that `Start` again on
+    /// this one: the daemon that restarted for the session switch takes the lease up
+    /// where it left it. A phase that differs from the worker's last one starts a new
+    /// [`crate::fence::SESSION_SWITCH_GRACE`]; the same phase reported again (after the
+    /// restart) does not extend it. The caller cancels a switching lease the scheduler
+    /// does not hold there ([`crate::Scheduler::not_held`]).
+    Phase {
+        /// The worker.
+        worker: WorkerId,
+        /// What it says it is doing.
+        phase: NodePhase,
     },
     /// A caller asks for `request` to run. A joinable request with a running twin
     /// attaches `waiter` to the twin instead of queueing a new operation.

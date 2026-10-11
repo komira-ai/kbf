@@ -250,6 +250,8 @@ impl Check {
                 self.workers.get_mut(worker).expect("registered").last_heard = Some(now);
                 None
             }
+            // The fleet switches no node's session.
+            Event::Phase { .. } => unreachable!("F3 feeds no node phase"),
             Event::Submit { waiter, request } => {
                 let id = self.next_op();
                 self.ops.insert(
