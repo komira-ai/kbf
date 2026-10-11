@@ -1,4 +1,5 @@
-//! The `kbf-server` binary: flags, both stores, the start line, and a clean stop.
+//! The `kbf-server` binary: flags, both stores, both metadata logs, the start line, and a
+//! clean stop.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener};
@@ -467,6 +468,108 @@ fn s3_mode_refuses_what_is_missing_or_wrong() {
     let (code, stderr) = fails(with_keys(s3(&["--s3-prefix", "no spaces/"])));
     assert_eq!(code, Some(2));
     assert!(stderr.contains("--s3-prefix"), "{stderr}");
+}
+
+/// A fresh, empty raft directory for `name`, under the target directory.
+fn raft_dir(name: &str) -> std::path::PathBuf {
+    let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join("kbf-server-binary")
+        .join(format!("{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    dir
+}
+
+/// A `--store=s3 --meta-log=raft` server over `dir` (the store does no I/O until used).
+fn raft_server(dir: &std::path::Path) -> Command {
+    let mut c = with_keys(server(&[
+        "--store",
+        "s3",
+        "--s3-endpoint",
+        "http://127.0.0.1:9",
+        "--s3-bucket",
+        "kbf-test",
+        "--meta-log",
+        "raft",
+        "--raft-dir",
+    ]));
+    c.arg(dir).args(ANY_PORT);
+    c
+}
+
+/// The ` log=` id of a start line.
+fn log_id(line: &str) -> String {
+    let id = line
+        .split_whitespace()
+        .find_map(|w| w.strip_prefix("log="))
+        .unwrap_or_else(|| panic!("no log= in {line:?}"));
+    assert_eq!(id.len(), 16, "{line}");
+    assert!(id.bytes().all(|b| b.is_ascii_hexdigit()), "{line}");
+    id.to_owned()
+}
+
+/// Catches: `--meta-log=raft` that does not open its log in `--raft-dir`, or that
+/// draws a new log id on every start (two starts over one directory must print the
+/// same `log=`, and two directories two different ones); and a memory start line that
+/// names a log.
+#[cfg(unix)]
+#[test]
+fn raft_mode_keeps_its_log_id_across_starts() {
+    let dir = raft_dir("raft-restart");
+    let (child, line, _) = started(raft_server(&dir));
+    let first = log_id(&line);
+    interrupt(child);
+    assert!(dir.join("log-record").is_file(), "no log record in {dir:?}");
+    let (child, line, _) = started(raft_server(&dir));
+    assert_eq!(log_id(&line), first, "a restart drew a new log id");
+    interrupt(child);
+
+    let (child, line, _) = started(raft_server(&raft_dir("raft-other")));
+    assert_ne!(log_id(&line), first, "two directories, one log id");
+    interrupt(child);
+
+    let mut memory = server(&ANY_PORT);
+    memory.args(["--meta-log", "memory"]);
+    let (child, line, _) = started(memory);
+    assert!(!line.contains("log="), "{line}");
+    interrupt(child);
+}
+
+/// Catches: `--meta-log=raft` accepted with `--store=memory` (a durable index over
+/// blobs that die with the process would report them present after a restart), or
+/// without `--raft-dir`; a `--raft-dir` that is ignored under `--meta-log=memory`; and
+/// a raft directory holding someone else's files taken as a new log. Each exits 2 and
+/// says why.
+#[test]
+fn raft_mode_refuses_what_it_cannot_keep() {
+    let dir = raft_dir("raft-refused");
+    let dir_arg = dir.to_str().expect("a UTF-8 path");
+    let mut c = server(&["--meta-log", "raft", "--raft-dir", dir_arg]);
+    c.args(ANY_PORT);
+    let (code, stderr) = fails(c);
+    assert_eq!(code, Some(2));
+    assert!(
+        stderr.contains("--meta-log=raft needs --store=s3"),
+        "{stderr}"
+    );
+
+    let (code, stderr) = fails(server(&["--meta-log", "raft"]));
+    assert_eq!(code, Some(2));
+    assert!(stderr.contains("--raft-dir"), "{stderr}");
+
+    let mut c = server(&["--raft-dir", dir_arg]);
+    c.args(ANY_PORT);
+    let (code, stderr) = fails(c);
+    assert_eq!(code, Some(2));
+    assert!(
+        stderr.contains("--raft-dir is read only with --meta-log=raft"),
+        "{stderr}"
+    );
+
+    std::fs::create_dir_all(&dir).expect("a raft dir");
+    std::fs::write(dir.join("stray"), "someone else's").expect("a stray file");
+    let (code, stderr) = fails(raft_server(&dir));
+    assert_eq!(code, Some(2));
+    assert!(stderr.contains("holds files but no log-record"), "{stderr}");
 }
 
 /// Catches: a server that keeps running (or exits 0) when it cannot bind its

@@ -30,7 +30,10 @@ use kbf_proto::worker::{
     ServerMessage, Start, daemon_message, server_message, worker_client::WorkerClient,
 };
 use kbf_server::token::ApiToken;
-use kbf_server::{Api, Bound, Listeners, ServeError, bind_server, bind_server_with_api};
+use kbf_server::{
+    Api, Bound, Listeners, RaftMetaLog, ServeError, bind_server, bind_server_with_api,
+};
+use kbf_store::FaultFs;
 use prost::Message;
 use tokio::sync::{Notify, oneshot};
 use tokio::time::timeout;
@@ -88,24 +91,38 @@ impl Gate {
     }
 }
 
-/// The in-memory metadata log, with gates a test can close on the next query and on
-/// the next action-cache write, and a switch that makes the next action-cache write
-/// fail as an unreachable leader would.
+/// The metadata log, in memory or a Raft log, with gates a test can close on the next
+/// query and on the next action-cache write, and a switch that makes the next
+/// action-cache write fail as an unreachable leader would.
 #[derive(Debug)]
 pub struct GateLog {
-    inner: MemoryMetaLog,
+    inner: Inner,
     pub query: Gate,
     pub action_write: Gate,
     fail_action_write: AtomicBool,
 }
 
+#[derive(Debug)]
+enum Inner {
+    Memory(MemoryMetaLog),
+    Raft(RaftMetaLog<FaultFs>),
+}
+
 impl GateLog {
-    fn new() -> Self {
+    fn new(inner: Inner) -> Self {
         Self {
-            inner: MemoryMetaLog::new(Retention::default()),
+            inner,
             query: Gate::default(),
             action_write: Gate::default(),
             fail_action_write: AtomicBool::new(false),
+        }
+    }
+
+    /// The Raft log, for a cell started with one ([`Cell::start_raft`]).
+    pub fn raft(&self) -> Option<&RaftMetaLog<FaultFs>> {
+        match &self.inner {
+            Inner::Memory(_) => None,
+            Inner::Raft(log) => Some(log),
         }
     }
 
@@ -123,7 +140,10 @@ impl MetaLog for GateLog {
                 return Err(MetaLogError::Unavailable("failed by the test".to_owned()));
             }
         }
-        self.inner.commit(command).await
+        match &self.inner {
+            Inner::Memory(log) => log.commit(command).await,
+            Inner::Raft(log) => log.commit(command).await,
+        }
     }
 
     async fn query<R, F>(&self, f: F) -> Result<R, MetaLogError>
@@ -132,7 +152,10 @@ impl MetaLog for GateLog {
         R: Send,
     {
         self.query.pass().await;
-        self.inner.query(f).await
+        match &self.inner {
+            Inner::Memory(log) => log.query(f).await,
+            Inner::Raft(log) => log.query(f).await,
+        }
     }
 }
 
@@ -145,6 +168,9 @@ pub struct Cell {
     pub api: Option<SocketAddr>,
     /// The operator API's configuration, kept for a restart.
     api_config: Option<Api>,
+    /// The raft directory of a cell started with [`Cell::start_raft`], as the old
+    /// process left it.
+    raft_dir: Option<FaultFs>,
     /// Stops the server; taken by [`Cell::cold_restart`], sent on drop otherwise.
     stop: Option<oneshot::Sender<()>>,
     /// Answers once the server's runtime, and every task on it, is gone.
@@ -191,8 +217,24 @@ impl Cell {
     /// and keeps a finished operation for `retention`.
     pub async fn start_with(wait: Duration, retention: Duration) -> Self {
         let store = SharedStore(Arc::new(MemoryStore::new(Capabilities::default())));
-        let cache = Self::cold_cache(&store).await;
-        Self::serve(cache, store, None, wait, retention).await
+        let cache = Self::cold_cache(&store, None).await;
+        Self::serve(cache, store, None, None, wait, retention).await
+    }
+
+    /// A cell whose metadata is a Raft log ([`RaftMetaLog`], as `--meta-log=raft`) in
+    /// an in-memory raft directory, which [`Cell::cold_restart`] carries over as a
+    /// process restart leaves it. Objects go under `kbf/<log id>/`.
+    pub async fn start_raft() -> Self {
+        let store = SharedStore(Arc::new(MemoryStore::new(Capabilities::default())));
+        let dir = FaultFs::new();
+        let cache = Self::cold_cache(&store, Some(&dir)).await;
+        let (wait, retention) = (kbf_sched::UNSERVABLE_WAIT, kbf_sched::FINISHED_RETENTION);
+        Self::serve(cache, store, None, Some(dir), wait, retention).await
+    }
+
+    /// The Raft log of a cell started with [`Cell::start_raft`].
+    pub fn raft_log(&self) -> &RaftMetaLog<FaultFs> {
+        self.cache.meta().raft().expect("a cell with a Raft log")
     }
 
     /// A cell that also serves the operator API, whose writes need [`API_TOKEN`].
@@ -203,8 +245,8 @@ impl Cell {
             token: Some(api_token()),
         };
         let (wait, retention) = (kbf_sched::UNSERVABLE_WAIT, kbf_sched::FINISHED_RETENTION);
-        let cache = Self::cold_cache(&store).await;
-        Self::serve(cache, store, Some(api), wait, retention).await
+        let cache = Self::cold_cache(&store, None).await;
+        Self::serve(cache, store, Some(api), None, wait, retention).await
     }
 
     /// A new server over this cell's store and its in-memory action cache and CAS
@@ -217,7 +259,8 @@ impl Cell {
     pub async fn restart(&self) -> Self {
         let (wait, retention) = (kbf_sched::UNSERVABLE_WAIT, kbf_sched::FINISHED_RETENTION);
         let (cache, store) = (Arc::clone(&self.cache), self.store.clone());
-        Self::serve(cache, store, self.api_config.clone(), wait, retention).await
+        let dir = self.raft_dir.clone();
+        Self::serve(cache, store, self.api_config.clone(), dir, wait, retention).await
     }
 
     /// Stops this server, waits until its runtime and every task on it are gone (each
@@ -228,28 +271,58 @@ impl Cell {
     /// its objects written under a key prefix no earlier start used, as `--store=s3`
     /// does. The objects earlier starts wrote stay in the bucket. The operator API, if
     /// this cell has one, listens again on a new port.
+    ///
+    /// A cell started with [`Cell::start_raft`] reopens its Raft log from the raft
+    /// directory as the old process left it (`--meta-log=raft`), so the CAS index and
+    /// the action cache are kept, and writes under the log's prefix in a new epoch.
     pub async fn cold_restart(mut self) -> Self {
         let stop = self.stop.take().expect("the server is running");
         let stopped = self.stopped.take().expect("the server is running");
         let (store, api_config) = (self.store.clone(), self.api_config.clone());
+        let dir = self.raft_dir.take();
         drop(self);
         stop.send(()).expect("the server is running");
         timeout(PROMPT * 4, stopped)
             .await
             .expect("the old server stops in time")
             .expect("the old server stops cleanly");
-        let cache = Self::cold_cache(&store).await;
+        let dir = dir.map(|d| d.restart());
+        let cache = Self::cold_cache(&store, dir.as_ref()).await;
         let (wait, retention) = (kbf_sched::UNSERVABLE_WAIT, kbf_sched::FINISHED_RETENTION);
-        Self::serve(cache, store, api_config, wait, retention).await
+        Self::serve(cache, store, api_config, dir, wait, retention).await
     }
 
-    /// A new cache over `store`: an empty metadata log, a writer epoch it allocates,
-    /// and objects under `start-<n>/`, where `n` is new to this test process.
-    async fn cold_cache(store: &SharedStore) -> Arc<Cache<GateLog, SharedStore>> {
+    /// A new cache over `store` and a writer epoch it allocates. Without `raft_dir`:
+    /// an empty metadata log, and objects under `start-<n>/`, where `n` is new to this
+    /// test process. With it: the Raft log there (a new one, with id `n + 1`, if the
+    /// directory is empty), and objects under the log's prefix.
+    async fn cold_cache(
+        store: &SharedStore,
+        raft_dir: Option<&FaultFs>,
+    ) -> Arc<Cache<GateLog, SharedStore>> {
         static STARTS: AtomicU32 = AtomicU32::new(0);
         let n = STARTS.fetch_add(1, Ordering::Relaxed);
-        let prefix = KeyPrefix::new(format!("start-{n}/")).expect("a key prefix");
-        let cache = Cache::open(GateLog::new(), store.clone(), prefix).await;
+        let (log, prefix) = match raft_dir {
+            None => {
+                let prefix = KeyPrefix::new(format!("start-{n}/")).expect("a key prefix");
+                (
+                    Inner::Memory(MemoryMetaLog::new(Retention::default())),
+                    prefix,
+                )
+            }
+            Some(dir) => {
+                let id = || {
+                    Ok(kbf_log::FarmLogId::new(
+                        (u64::from(n) + 1).try_into().unwrap(),
+                    ))
+                };
+                let log = RaftMetaLog::open(dir.clone(), Retention::default(), "kbf/", id).await;
+                let log = log.expect("open the Raft log");
+                let prefix = log.store_prefix();
+                (Inner::Raft(log), prefix)
+            }
+        };
+        let cache = Cache::open(GateLog::new(log), store.clone(), prefix).await;
         Arc::new(cache.expect("open the cache"))
     }
 
@@ -257,6 +330,7 @@ impl Cell {
         cache: Arc<Cache<GateLog, SharedStore>>,
         store: SharedStore,
         api_config: Option<Api>,
+        raft_dir: Option<FaultFs>,
         wait: Duration,
         retention: Duration,
     ) -> Self {
@@ -313,6 +387,7 @@ impl Cell {
             store,
             api,
             api_config,
+            raft_dir,
             stop: Some(stop),
             stopped: Some(stopped),
             client: Client::connect(reapi, worker).await,

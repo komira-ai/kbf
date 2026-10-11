@@ -1,0 +1,342 @@
+//! `RaftMetaLog`, the metadata log of `--meta-log=raft`, over an in-memory raft
+//! directory (`FaultFs`) that a test can restart, crash at any operation, or fill by
+//! hand. Each test names the defect it catches.
+
+use std::num::NonZeroU64;
+use std::time::Duration;
+
+use kbf_front::{MetaLog, MetaLogError};
+use kbf_log::{Bootstrap, FarmLogId, Format, LogCommand};
+use kbf_meta::{Applied, BlobWrite, Command, Epoch, Location, ObjectId, Retention, StoreId};
+use kbf_raft::{Entry, LogId, Payload, Snapshot, Storage};
+use kbf_server::raft_log::{RECORD, RECORD_TMP};
+use kbf_server::{RaftLogError, RaftMetaLog};
+use kbf_store::{Fault, FaultFs, Options, Store};
+use kbf_types::{Digest, DigestFunction, FarmTime};
+
+type Log = RaftMetaLog<FaultFs>;
+
+fn id(n: u64) -> FarmLogId {
+    FarmLogId::new(NonZeroU64::new(n).expect("non-zero"))
+}
+
+async fn open_as(fs: &FaultFs, root: &str, new: u64) -> Result<Log, RaftLogError> {
+    RaftMetaLog::open(fs.clone(), Retention::default(), root, move || Ok(id(new))).await
+}
+
+async fn open(fs: &FaultFs, new: u64) -> Log {
+    open_as(fs, "kbf/", new).await.expect("open the log")
+}
+
+/// The error of a start over `fs` that must be refused.
+async fn refusal(fs: &FaultFs, new: u64) -> RaftLogError {
+    match open_as(fs, "kbf/", new).await {
+        Ok(log) => panic!("opened {log:?}"),
+        Err(e) => e,
+    }
+}
+
+async fn epoch(log: &Log) -> u64 {
+    match log.commit(Command::AllocEpoch).await {
+        Ok(Applied::Epoch(e)) => e.get(),
+        other => panic!("AllocEpoch answered {other:?}"),
+    }
+}
+
+fn put_blob(epoch: u64) -> Command {
+    Command::PutBlob {
+        digest: Digest::new(DigestFunction::Sha256, [7; 32], 7),
+        location: Location {
+            store: StoreId::new(0),
+            object: ObjectId::new(Epoch::new(epoch), 1),
+            offset: 0,
+        },
+    }
+}
+
+/// Catches: a new log whose id is not the one drawn, or is not recorded before the
+/// store writes; a record in another form than four exact lines; a log that commits no
+/// `Bootstrap`, or a prefix other than `<root><log id>/`.
+#[tokio::test]
+async fn a_new_log_records_its_id_and_commits_one_bootstrap() {
+    let fs = FaultFs::new();
+    let log = open(&fs, 0x2a).await;
+    assert_eq!(log.log_id(), id(0x2a));
+    assert_eq!(log.store_prefix().as_str(), "kbf/000000000000002a/");
+    assert_eq!(log.bootstraps(), 1);
+    let record = fs.contents(RECORD).expect("a record");
+    assert_eq!(
+        String::from_utf8(record).expect("text"),
+        "kbf raft log record 1\nlog_id 000000000000002a\nserver 1\nvoters 1\n"
+    );
+    assert_eq!(fs.contents(RECORD_TMP), None);
+    assert!(format!("{log:?}").contains("RaftMetaLog"));
+}
+
+/// Catches: a start that draws a new log id although the directory records one (the
+/// mutant "draw a new log id on every start": the restart then names another log, and
+/// either commits a second `Bootstrap` or refuses its own log), and a restart that
+/// applies an entry twice or loses one (the second `AllocEpoch` after the restart
+/// must be exactly one past the first).
+#[tokio::test]
+async fn a_restart_keeps_the_log_id_and_applies_each_entry_once() {
+    let fs = FaultFs::new();
+    let log = open(&fs, 5).await;
+    let first = epoch(&log).await;
+    assert_eq!(
+        log.commit(put_blob(first)).await,
+        Ok(Applied::Blob(Ok(BlobWrite::Stored)))
+    );
+    drop(log);
+
+    let log = open(&fs.restart(), 6).await;
+    assert_eq!(log.log_id(), id(5), "the restart drew a new log id");
+    assert_eq!(log.bootstraps(), 1, "a second Bootstrap was committed");
+    assert_eq!(log.query(|m| m.blob_count()).await, Ok(1));
+    assert_eq!(
+        epoch(&log).await,
+        first + 1,
+        "an entry applied twice, or lost"
+    );
+}
+
+/// Catches: a log that answers a commit before it is durable (the store's entry
+/// sync skipped, or the answer given before the persist): a crash right after the
+/// answer, at any point the disk could be in, loses an epoch the caller was given, and
+/// the next start hands it out again. And one that applies a committed entry twice
+/// after a crash. The process is crashed at every filesystem operation of one commit;
+/// each crash is then a process kill (everything written survives) and a power cut
+/// (only what was synced does).
+#[tokio::test]
+async fn a_commit_answered_survives_a_crash_and_is_applied_once() {
+    let mut crashed_mid_commit = 0;
+    for at in 0.. {
+        let fs = FaultFs::new();
+        let log = open(&fs, 1).await;
+        let before = epoch(&log).await;
+        let start = fs.ops();
+        fs.fail_at(start + at, Fault::Crash);
+        let answered = log.commit(Command::AllocEpoch).await;
+        let reached = fs.ops() > start + at;
+        drop(log);
+        for (keep, names) in [(usize::MAX, u64::MAX), (0, 0)] {
+            let reopened = open(&fs.crash_reordered(keep, names), 9).await;
+            let next = epoch(&reopened).await;
+            match &answered {
+                Ok(Applied::Epoch(e)) => {
+                    assert_eq!(
+                        next,
+                        e.get() + 1,
+                        "crash at op {at}: a committed epoch lost or doubled"
+                    );
+                }
+                Ok(other) => panic!("AllocEpoch answered {other:?}"),
+                Err(_) => assert!(
+                    next == before + 1 || next == before + 2,
+                    "crash at op {at}: next epoch {next} after {before}"
+                ),
+            }
+        }
+        if !reached {
+            break; // the commit finished before the planned crash
+        }
+        crashed_mid_commit += 1;
+    }
+    assert!(crashed_mid_commit >= 2, "a commit wrote and synced");
+}
+
+/// Catches: farm time taken from the process clock (it starts again from zero at each
+/// open, so it goes back across a restart), a tick that commits nothing, and a log
+/// with no tick task (farm time never committed unless a caller ticks).
+#[tokio::test(start_paused = true)]
+async fn farm_time_continues_from_the_committed_one_across_a_restart() {
+    let fs = FaultFs::new();
+    let log = open(&fs, 1).await;
+    assert_eq!(log.query(|m| m.now()).await, Ok(FarmTime::default()));
+    tokio::time::sleep(Duration::from_secs(30)).await;
+    let committed = log.tick().expect("a tick");
+    assert!(committed >= FarmTime::from_millis(30_000), "{committed:?}");
+    assert_eq!(log.query(|m| m.now()).await, Ok(committed));
+    drop(log);
+
+    let log = open(&fs.restart(), 1).await;
+    assert!(
+        log.now() >= committed,
+        "farm time went back across the restart"
+    );
+    assert!(log.query(|m| m.now()).await.expect("a query") >= committed);
+    tokio::time::sleep(Duration::from_millis(3_500)).await;
+    let ticked = log.query(|m| m.now()).await.expect("a query");
+    assert!(
+        ticked >= committed.saturating_add(Duration::from_secs(3)),
+        "no tick task: {ticked:?} after {committed:?}"
+    );
+}
+
+/// Catches: a start whose prefix root changed being given the new prefix silently (its
+/// objects would land outside the log's prefix), and a record that names another log
+/// than the one in the store being accepted.
+#[tokio::test]
+async fn a_start_that_disagrees_with_the_committed_bootstrap_is_refused() {
+    let fs = FaultFs::new();
+    drop(open(&fs, 3).await);
+    let refused = open_as(&fs.restart(), "other/", 4).await;
+    assert!(
+        matches!(&refused, Err(RaftLogError::Mismatch { committed: Some(b), .. })
+            if b.store_prefix == "kbf/0000000000000003/"),
+        "{refused:?}"
+    );
+    assert!(refused.unwrap_err().to_string().contains("prefix changed"));
+
+    let moved = fs.restart();
+    moved.put(
+        RECORD,
+        b"kbf raft log record 1\nlog_id 0000000000000009\nserver 1\nvoters 1\n",
+    );
+    let refused = refusal(&moved, 4).await;
+    assert!(
+        matches!(&refused, RaftLogError::Mismatch { expected, .. } if expected.log_id == id(9)),
+        "{refused:?}"
+    );
+}
+
+/// Catches: a record parsed loosely (a log id in another form, a voter set this
+/// version does not run, a damaged header) instead of refused; a directory holding
+/// someone else's files taken as a new log; and a leftover temporary record (a create
+/// that died before its rename) refusing the start instead of being removed.
+#[tokio::test]
+async fn a_record_is_read_exactly_or_refused() {
+    for bad in [
+        "kbf raft log record 1\nlog_id 000000000000002A\nserver 1\nvoters 1\n",
+        "kbf raft log record 1\nlog_id 2a\nserver 1\nvoters 1\n",
+        "kbf raft log record 1\nlog_id 0000000000000000\nserver 1\nvoters 1\n",
+        "kbf raft log record 1\nlog_id 000000000000002a\nserver 1\nvoters 1 2\n",
+        "kbf raft log record 1\nlog_id zzzzzzzzzzzzzzzz\nserver 1\nvoters 1\n",
+        "kbf raft log record 1\nlog_id 000000000000002a",
+        "kbf raft log record 2\nlog_id 000000000000002a\nserver 1\nvoters 1\n",
+        "\u{fffd}",
+    ] {
+        let fs = FaultFs::new();
+        fs.put(RECORD, bad.as_bytes());
+        let refused = refusal(&fs, 1).await;
+        assert!(
+            matches!(refused, RaftLogError::Record),
+            "{bad:?}: {refused:?}"
+        );
+        assert!(refused.to_string().contains(RECORD));
+    }
+    let mut bytes = b"kbf raft log record 1\nlog_id ".to_vec();
+    bytes.push(0xff);
+    let fs = FaultFs::new();
+    fs.put(RECORD, &bytes);
+    assert!(matches!(refusal(&fs, 1).await, RaftLogError::Record));
+
+    let fs = FaultFs::new();
+    fs.put("stray", b"someone else's");
+    let refused = refusal(&fs, 1).await;
+    assert!(matches!(refused, RaftLogError::NotEmpty), "{refused:?}");
+    assert!(refused.to_string().contains("no log-record"));
+
+    let fs = FaultFs::new();
+    fs.put(RECORD_TMP, b"half a rec");
+    let log = open(&fs, 8).await;
+    assert_eq!(log.log_id(), id(8));
+    assert_eq!(fs.contents(RECORD_TMP), None);
+}
+
+/// Catches: a committed entry that does not decode being skipped (this replica would
+/// then differ from every other) instead of refusing the open, and a directory holding
+/// a snapshot (which this version never writes) opened as an empty state.
+#[tokio::test]
+async fn an_entry_or_snapshot_this_version_cannot_read_refuses_the_open() {
+    let fs = FaultFs::new();
+    drop(open(&fs, 2).await);
+    let dir = fs.restart();
+    let (mut store, held) = Store::open(dir.clone(), Options::default()).expect("the store");
+    let last = held.entries.last().expect("entries").id;
+    let bad = Entry {
+        id: LogId::new(last.term, last.index.next()),
+        payload: Payload::Command(vec![0xff]),
+    };
+    store.write_entries(&[bad]).expect("append");
+    drop(store);
+    let refused = refusal(&dir.restart(), 2).await;
+    assert!(
+        matches!(&refused, RaftLogError::Decode { index, .. } if *index == last.index.0 + 1),
+        "{refused:?}"
+    );
+    assert!(refused.to_string().contains("entry"));
+
+    let dir = fs.restart();
+    let (mut store, held) = Store::open(dir.clone(), Options::default()).expect("the store");
+    let snapshot = Snapshot {
+        base: held.entries.last().expect("entries").id,
+        state: Vec::new(),
+    };
+    store.write_snapshot(&snapshot).expect("a snapshot");
+    drop(store);
+    let refused = refusal(&dir.restart(), 2).await;
+    assert!(matches!(refused, RaftLogError::Open(_)), "{refused:?}");
+    assert!(refused.to_string().contains("snapshot"));
+}
+
+/// Catches: a replica that takes a later `Bootstrap` over the first (a leader that died
+/// with its `Bootstrap` uncommitted may leave one in the log that a later leader
+/// commits): its objects would move to the later prefix. A later one is applied as a
+/// no-op, and counted.
+#[tokio::test]
+async fn a_later_bootstrap_changes_nothing() {
+    let fs = FaultFs::new();
+    drop(open(&fs, 4).await);
+    let dir = fs.restart();
+    let (mut store, held) = Store::open(dir.clone(), Options::default()).expect("the store");
+    let last = held.entries.last().expect("entries").id;
+    let later = LogCommand::Bootstrap(Bootstrap {
+        log_id: id(5),
+        store_prefix: "elsewhere/".to_owned(),
+    });
+    let entry = Entry {
+        id: LogId::new(last.term, last.index.next()),
+        payload: Payload::Command(kbf_log::encode(Format::V1, &later).expect("encode")),
+    };
+    store.write_entries(&[entry]).expect("append");
+    drop(store);
+    let log = open(&dir.restart(), 6).await;
+    assert_eq!(log.log_id(), id(4));
+    assert_eq!(log.store_prefix().as_str(), "kbf/0000000000000004/");
+    assert_eq!(log.bootstraps(), 2);
+}
+
+/// Catches: a log that keeps acknowledging commits after a storage error (it can no
+/// longer make them durable), or that turns the error into an answer other than
+/// UNAVAILABLE; queries keep reading the applied state.
+#[tokio::test]
+async fn a_storage_error_stops_every_later_commit() {
+    let fs = FaultFs::new();
+    let log = open(&fs, 1).await;
+    let first = epoch(&log).await;
+    fs.fail_at(fs.ops(), Fault::Error);
+    for _ in 0..2 {
+        let refused = log.commit(Command::AllocEpoch).await;
+        assert!(
+            matches!(refused, Err(MetaLogError::Unavailable(_))),
+            "{refused:?}"
+        );
+    }
+    assert!(log.tick().is_err());
+    assert_eq!(log.query(|m| m.blob_count()).await, Ok(0));
+    drop(log);
+    let log = open(&fs.restart(), 1).await;
+    assert_eq!(epoch(&log).await, first + 1);
+}
+
+/// Catches: a directory that cannot be listed opened as an empty one (a new log drawn
+/// over an existing one), instead of refused.
+#[tokio::test]
+async fn an_unreadable_directory_is_refused() {
+    let fs = FaultFs::new();
+    fs.fail_at(0, Fault::Error);
+    let refused = refusal(&fs, 1).await;
+    assert!(matches!(refused, RaftLogError::Io(_)), "{refused:?}");
+    assert!(refused.to_string().starts_with("raft dir"));
+}

@@ -146,9 +146,12 @@ most 4 MiB of blob data.
 
 Object keys are `<prefix>cas/<epoch>/<seq>`, each as 16 lowercase hex digits. Two
 caches over one metadata log hold different epochs, so they never name the same key.
-The metadata is in memory today and starts again from epoch 1 at every start, so with
-`--store=s3` each server start still writes under its own prefix (the configured
-prefix plus the start time), and keys never collide across restarts.
+Under `--meta-log=memory` the metadata is in memory and starts again from epoch 1 at
+every start, so with `--store=s3` each server start writes under its own prefix (the
+configured prefix plus the start time), and keys never collide across restarts. Under
+`--meta-log=raft` the epochs are committed in the Raft log, so every start writes
+under the one prefix the log committed (the configured prefix plus the log id) in an
+epoch no earlier start used.
 
 ## Reads
 
