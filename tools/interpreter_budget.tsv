@@ -33,14 +33,7 @@
 219	tools/mac-provision/test/hosted-macos.sh	tests of kbf-mac-provision; to become Rust tests of its crate
 187	tools/mac-provision/test/mutants.sh	tests of kbf-mac-provision; to become Rust tests of its crate
 670	tools/mac-provision/test/run.sh	tests of kbf-mac-provision; to become Rust tests of its crate
-95	tools/spike/build_budget.sh	hosted runner spike; to be deleted
-55	tools/spike/delegated_inner.sh	hosted runner spike; to be deleted
-27	tools/spike/delegation.sh	hosted runner spike; to be deleted
-43	tools/spike/fsync_probe.py	hosted runner spike; to be deleted
-63	tools/spike/host_facts.sh	hosted runner spike; to be deleted
-20	tools/spike/io_hog.sh	hosted runner spike; to be deleted
-161	tools/spike/io_slices.sh	hosted runner spike; to be deleted
-79	tools/spike/lib.sh	hosted runner spike; to be deleted
+79	tools/spike/lib.sh	SPIKE line helpers for the XCUITest sandbox check; goes with it
 145	tools/spike/macos/automation_mode.sh	macOS probe kit; to be deleted once its findings are documented
 485	tools/spike/macos/fixtures/gen_projects.py	generates the XCUITest fixture projects; to be ported to Rust or deleted
 180	tools/spike/macos/fixtures/run.sh	XCUITest sandbox check (spike-xcuitest workflow); to become a Rust macOS test
@@ -56,11 +49,6 @@
 32	tools/spike/macos/verdicts.sh	macOS probe kit; to be deleted once its findings are documented
 272	tools/spike/macos/volume_owner.sh	macOS probe kit; to be deleted once its findings are documented
 331	tools/spike/macos/xcuitest_sandbox.sh	XCUITest sandbox check (spike-xcuitest workflow); to become a Rust macOS test
-55	tools/spike/mem_hog.py	hosted runner spike; to be deleted
-70	tools/spike/memory_high.sh	hosted runner spike; to be deleted
-71	tools/spike/no_network.sh	hosted runner spike; to be deleted
-107	tools/spike/podman_rootless.sh	hosted runner spike; to be deleted
-46	tools/spike/several_servers.sh	hosted runner spike; to be deleted
 
 # Workflow and composite-action `run:` steps with shell logic. Key:
 # <file>#<job>/<step name>, or `step <n>` (1-based) for a step with no name.

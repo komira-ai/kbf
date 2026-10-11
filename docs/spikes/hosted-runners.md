@@ -10,14 +10,14 @@ gets a verdict below:
 - **fits with limits**: runs hosted, under the stated limits;
 - **farm probe**: needs a machine we control.
 
-The probes live in `tools/spike/`. The workflow is `.github/workflows/spike-hosted.yml`.
-It runs by hand (`workflow_dispatch`) and on pull requests that change the probes.
-Each probe prints `SPIKE <arch>.<key>=<value>` lines. To re-measure after an image
-change:
+The probes were shell and Python scripts under `tools/spike/`, run by the
+`.github/workflows/spike-hosted.yml` workflow. Both were deleted once the verdicts
+below were recorded, so the file names this page cites are in the history only. Each
+probe printed `SPIKE <arch>.<key>=<value>` lines. To find the commit that deleted
+them, and so the tree to restore a probe from:
 
 ```sh
-gh workflow run spike-hosted.yml --ref main
-gh run view <run id> --log | grep ' SPIKE '
+git log --diff-filter=D --oneline -- .github/workflows/spike-hosted.yml
 ```
 
 ## Where the numbers come from
