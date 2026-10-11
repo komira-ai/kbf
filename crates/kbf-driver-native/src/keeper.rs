@@ -159,6 +159,28 @@ mod tests {
         assert!(alive, "dropping the keeper killed the group");
     }
 
+    /// Catches a keeper that a service manager's SIGTERM (or a SIGHUP, a SIGINT) stops
+    /// before it has read end-of-file: it must outlive each, and still end the group.
+    #[test]
+    fn a_keeper_outlives_the_stop_signals() {
+        let mut action = group();
+        let mut keeper = Keeper::join(pid(&action)).expect("keeper");
+        let keeper_pid = i32::try_from(keeper.pid()).expect("pid");
+        // The trap is set by the script's first line: wait until the shell has run it.
+        std::thread::sleep(Duration::from_millis(500));
+        for signal in [libc::SIGTERM, libc::SIGHUP, libc::SIGINT] {
+            // SAFETY: kill(2) on the keeper, this process's unreaped child.
+            assert_eq!(unsafe { libc::kill(keeper_pid, signal) }, 0);
+        }
+        let alive = !exits(&mut keeper.child, Duration::from_millis(300));
+        keeper.orphan();
+        let ended = exits(&mut action, Duration::from_secs(5));
+        let _ = action.kill();
+        let _ = action.wait();
+        assert!(alive, "a stop signal ended the keeper");
+        assert!(ended, "the action outlived its keeper's pipe");
+    }
+
     /// Catches a keeper started outside the group it was asked to join (in the
     /// daemon's group, say) when that group does not exist: it must not start.
     #[test]

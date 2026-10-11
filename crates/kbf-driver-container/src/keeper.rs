@@ -169,6 +169,34 @@ mod tests {
         assert!(!kill.exists(), "the keeper made cgroup.kill");
     }
 
+    /// Catches a keeper that a service manager's SIGTERM (or a SIGHUP, a SIGINT) stops
+    /// before it has read end-of-file: it must outlive each, and still kill the cgroup.
+    #[test]
+    fn a_keeper_outlives_the_stop_signals() {
+        let dir = dir("signals");
+        let kill = dir.join("cgroup.kill");
+        std::fs::write(&kill, "").expect("cgroup.kill");
+        let mut keeper = Keeper::watch(&kill).expect("keeper");
+        let raw = i32::try_from(keeper.child.id()).expect("pid");
+        let keeper_pid = rustix::process::Pid::from_raw(raw).expect("a pid");
+        // The trap is set by the script's first line: wait until the shell has run it.
+        std::thread::sleep(Duration::from_millis(500));
+        use rustix::process::Signal;
+        for signal in [Signal::TERM, Signal::HUP, Signal::INT] {
+            // The keeper is this process's unreaped child, so the pid is its own.
+            rustix::process::kill_process(keeper_pid, signal).expect("signal the keeper");
+        }
+        assert!(
+            !exits(&mut keeper.child, Duration::from_millis(300)),
+            "a stop signal ended the keeper"
+        );
+        keeper.orphan();
+        assert!(
+            holds(&kill, "1\n", PROMPT),
+            "no cgroup.kill once its pipe closed"
+        );
+    }
+
     /// Catches a keeper that cannot be started taken for one that runs, and an error
     /// that does not say what failed.
     #[test]
