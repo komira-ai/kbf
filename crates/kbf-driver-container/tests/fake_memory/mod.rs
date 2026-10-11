@@ -1,5 +1,5 @@
 //! How the driver reports a lease killed for memory, against the stand-in `podman`
-//! (`fixtures/fake-podman.sh`) and a plain directory standing in for the cgroup mount:
+//! (`support/fake.rs`) and a plain directory standing in for the cgroup mount:
 //! the action script writes the lease cgroup's `memory.events`, `memory.current` and
 //! `memory.swap.current` as the kernel would. `podman_memory.rs` runs the same promises
 //! against a real kernel.

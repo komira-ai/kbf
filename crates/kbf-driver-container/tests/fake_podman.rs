@@ -1,4 +1,4 @@
-//! The driver's steps against a stand-in `podman` (`fixtures/fake-podman.sh`) that runs
+//! The driver's steps against a stand-in `podman` (`support/fake.rs`) that runs
 //! each action as a plain process, and a plain directory standing in for the cgroup
 //! mount. These run on any Linux machine; `podman.rs` runs the same promises against
 //! real rootless Podman.
@@ -549,7 +549,9 @@ async fn a_missing_podman_is_an_infrastructure_failure() {
 
 /// Catches the kill path giving up early: when SIGTERM cannot be sent and the
 /// container survives `cgroup.kill`, the driver still stops `podman start` and
-/// removes the container by force.
+/// removes the container by force. Also catches a fake that ignores `kill-fails`:
+/// then SIGTERM ends the action, `podman start` ends by itself (`start ended`), and
+/// the test no longer tests what its name says.
 #[tokio::test]
 async fn the_kill_path_ends_even_when_every_signal_fails() {
     let fake = Fake::new("stubborn");
@@ -561,6 +563,11 @@ async fn the_kill_path_ends_even_when_every_signal_fails() {
     assert!(
         matches!(outcome, Err(RuntimeError::TimedOut { .. })),
         "{outcome:?}"
+    );
+    let events = fake.events();
+    assert!(
+        !events.contains(&"start ended".to_owned()),
+        "the action ended before the driver killed podman start: {events:?}"
     );
     fake.assert_clean(1);
 }

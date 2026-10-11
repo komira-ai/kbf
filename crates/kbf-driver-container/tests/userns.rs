@@ -1,4 +1,4 @@
-//! Who owns a lease's files, against the stand-in `podman` (`fixtures/fake-podman.sh`).
+//! Who owns a lease's files, against the stand-in `podman` (`support/fake.rs`).
 //!
 //! Every container runs with `--userns=nomap`, so its root is a subordinate id, not
 //! the daemon's user. The driver gives the overlay's directories to that id before the
