@@ -267,10 +267,11 @@ So every profile ends with `NO_DEVICE_RULES` (`crates/kbf-driver-native/src/netw
 - no `mach-lookup` of a name starting `com.apple.CoreDevice.`: `CoreDeviceService`
   (the XPC service `devicectl` asks for everything; refused, `devicectl` waits over 15
   seconds for it and fails saying the connection was invalidated),
-  `remotepairingd` and the rest;
+  `remotepairingd`, the DDI updater (`CoreDeviceDDIUpdaterService`) and the rest;
 - no `mach-lookup` of a name starting `com.apple.remoted`: `remoted`'s services
-  (RemoteXPC, which CoreDevice reaches a device through; `remotectl dumpstate` then
-  prints no device, the Mac itself included);
+  (`com.apple.remoted`, `.coredevice`, `.control` and the rest: RemoteXPC, which
+  CoreDevice reaches a device through; `remotectl dumpstate` then prints no device, the
+  Mac itself included);
 - no connect to `usbmuxd`'s socket, named by its real path `/private/var/run/usbmuxd`
   (a rule on `/var/run/usbmuxd`, the link clients open, matches nothing).
 
@@ -281,7 +282,11 @@ survey, which runs under the actions' sandbox; a lease that books a device is to
 profile without them, as is the daemon's `devicectl` survey (D2). `tests/devices.rs`
 shows each refused on the hosted macOS runner, with the network off and on, each
 against a control: the same action by the same driver without a sandbox reaches the
-service. Two device leases on one node still share these services; until P-D2 shows
+service. Beyond what `devicectl` and `remotectl` ask for, it looks up
+`remotepairingd`, `com.apple.remoted.coredevice` and `com.apple.remoted.control`
+directly, so a rule narrowed from its prefix to one name fails there, and a unit test
+in `network.rs` checks that each mach rule is a prefix covering every name listed
+above. Two device leases on one node still share these services; until P-D2 shows
 a device per user, a node may run one device lease at a time.
 
 ## 7. Health: report, alert, recover

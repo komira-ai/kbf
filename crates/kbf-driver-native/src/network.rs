@@ -117,13 +117,16 @@ pub const NO_NETWORK_PROFILE: &str = "(version 1)\n\
 
 /// The rules every profile ends with: no lookup of a
 /// CoreDevice mach service or XPC service (`com.apple.CoreDevice.CoreDeviceService`,
-/// which `devicectl` asks for everything, `com.apple.CoreDevice.remotepairingd` and
-/// the rest of the prefix), none of `remoted`'s (`com.apple.remoted`, its
-/// `.coredevice` and `.control` services and the rest of the prefix: RemoteXPC, the
-/// tunnel CoreDevice talks to a device through), and no connect to `usbmuxd`'s socket,
-/// which the sandbox names by its real path (`/var/run` is a link to `/private/var/run`;
-/// a rule on the link's path matches nothing). `tests/devices.rs` shows each refused on
-/// the macOS runner, and reached without the sandbox. Their place in the profile does
+/// which `devicectl` asks for everything, `com.apple.CoreDevice.remotepairingd`,
+/// `com.apple.CoreDevice.CoreDeviceDDIUpdaterService` and the rest of the prefix), none
+/// of `remoted`'s (`com.apple.remoted`, its `.coredevice` and `.control` services and
+/// the rest of the prefix: RemoteXPC, the tunnel CoreDevice talks to a device through),
+/// and no connect to `usbmuxd`'s socket, which the sandbox names by its real path
+/// (`/var/run` is a link to `/private/var/run`; a rule on the link's path matches
+/// nothing). `tests/devices.rs` shows each refused on the macOS runner, and reached
+/// without the sandbox, `remotepairingd`, `.coredevice` and `.control` among them; this
+/// module's tests check that each mach rule is a `global-name-prefix` covering every
+/// name listed here. Their place in the profile does
 /// not decide: with the `usbmuxd` rule before [`NO_NETWORK_PROFILE`]'s allow for every
 /// Unix socket (a mutant), the runner still refused the connect. A lease that books a
 /// device is to get a profile without these (`docs/design/ios-devices.md`, section
@@ -291,6 +294,67 @@ mod tests {
             ..Action::default()
         };
         assert_eq!(network_of(&action, &command).ok(), Some(Network::Off));
+    }
+
+    /// The names the docs of [`NO_DEVICE_RULES`] list for each of its mach rules.
+    const DEVICE_SERVICES: [(&str, &[&str]); 2] = [
+        (
+            "CoreDevice",
+            &[
+                "com.apple.CoreDevice.CoreDeviceService",
+                "com.apple.CoreDevice.remotepairingd",
+                "com.apple.CoreDevice.CoreDeviceDDIUpdaterService",
+            ],
+        ),
+        (
+            "remoted",
+            &[
+                "com.apple.remoted",
+                "com.apple.remoted.coredevice",
+                "com.apple.remoted.control",
+            ],
+        ),
+    ];
+
+    /// Catches a device rule narrowed from its prefix to one name (`(global-name
+    /// "com.apple.CoreDevice.CoreDeviceService")`, `(global-name "com.apple.remoted")`)
+    /// or to a longer prefix, which `devicectl` and `remotectl` alone do not notice: in
+    /// the profile `wrap` builds, with the network off and on, each service's listed
+    /// names must all start with the string of one `(deny mach-lookup
+    /// (global-name-prefix ..))` rule, and no rule may allow a lookup back.
+    #[test]
+    fn each_device_rule_denies_a_whole_prefix() {
+        let sandbox = Isolation::Sandbox(PathBuf::from(SANDBOX_EXEC));
+        for network in [Network::Off, Network::On] {
+            let (_, args) = sandbox.wrap(
+                network,
+                Path::new("/private/var/kbf/lease-1-2"),
+                "",
+                PathBuf::from("/bin/sh"),
+                &[],
+            );
+            let profile = &args[3];
+            let prefixes: Vec<&str> = profile
+                .lines()
+                .filter_map(|line| {
+                    line.strip_prefix("(deny mach-lookup (global-name-prefix \"")?
+                        .strip_suffix("\"))")
+                })
+                .collect();
+            for (service, names) in DEVICE_SERVICES {
+                assert!(names.len() >= 2, "{service}: list two names or more");
+                assert!(
+                    prefixes
+                        .iter()
+                        .any(|prefix| names.iter().all(|name| name.starts_with(prefix))),
+                    "{network:?}: no prefix rule covers every {service} name {names:?}:\n{profile}"
+                );
+            }
+            assert!(
+                !profile.contains("(allow mach-lookup"),
+                "{network:?}: {profile}"
+            );
+        }
     }
 
     /// Catches: the network denied to an action that asked for it, or allowed one that

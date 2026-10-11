@@ -4,6 +4,9 @@
 //! yet, so any action that could reach them could install, launch or reboot apps on a
 //! device another lease is to book (`docs/design/ios-devices.md`, section 6.1).
 //!
+//! Each mach rule denies a prefix, not a name: besides what `devicectl` and `remotectl`
+//! ask for, a lookup of another registered name under each prefix is refused.
+//!
 //! Each refusal is checked against a control on the same host: the same action run by
 //! the same driver without a sandbox must reach the service, or the test proves nothing.
 
@@ -93,19 +96,48 @@ async fn no_action_reaches_coredevice() {
     );
 }
 
+/// C that looks each mach service its arguments name up through launchd, as any
+/// client does, and prints each name with what `bootstrap_look_up` returned: 0 for a
+/// port, 1100 (`BOOTSTRAP_NOT_PRIVILEGED`) for a lookup the sandbox refused.
+const LOOKUP: &str = r#"#include <mach/mach.h>
+#include <servers/bootstrap.h>
+#include <stdio.h>
+int main(int argc, char **argv) {
+    for (int i = 1; i < argc; i++) {
+        mach_port_t port = MACH_PORT_NULL;
+        kern_return_t kr = bootstrap_look_up(bootstrap_port, argv[i], &port);
+        printf("%s %d\n", argv[i], kr);
+    }
+    return 0;
+}
+"#;
+
+/// A script that compiles [`LOOKUP`] in the action's directory and looks `names` up.
+fn lookup(names: &[&str]) -> String {
+    format!(
+        "cat > lookup.c <<'EOF'\n{LOOKUP}EOF\ncc -o lookup lookup.c && ./lookup {}",
+        names.join(" ")
+    )
+}
+
 /// Catches a profile that lets an action reach `remoted` (the `remoted` rule dropped,
 /// or naming another service): `remotectl dumpstate` must print no device, the
-/// local one included, with or without the network. Control: the same action
-/// without a sandbox prints the local device. The sandbox without the rule does not
-/// hide it: a sandboxed action then prints it too.
+/// local one included, and a lookup of `com.apple.remoted` in the same action must be
+/// refused (1100), with or without the network. The refused lookup is what tells a
+/// refusal from a `remotectl` that printed nothing for another reason. Control: the
+/// same action without a sandbox prints the local device and gets a port (0). The
+/// sandbox without the rule does not hide it: a sandboxed action then prints it too.
 #[tokio::test]
 async fn no_action_reaches_remoted() {
     let cas = Arc::new(MemoryCas::default());
     let (sandboxed, open) = runtimes("remoted", &cas);
-    let script = "/usr/libexec/remotectl dumpstate";
+    let script = format!(
+        "/usr/libexec/remotectl dumpstate; {}",
+        lookup(&["com.apple.remoted"])
+    );
     let local = "Local device";
     for (seq, network) in [(1, "off"), (2, "on")] {
-        let spec = Spec::sh(script)
+        let spec = Spec::sh(&script)
             .env("PATH", PATH)
             .property("network", network);
         let result = run_long(&sandboxed, &cas, seq, &spec).await;
@@ -114,16 +146,63 @@ async fn no_action_reaches_remoted() {
             !out.contains(local),
             "network={network}: remotectl reached remoted: {out}{err}"
         );
+        assert!(
+            out.lines().any(|line| line == "com.apple.remoted 1100"),
+            "network={network}: the lookup of remoted was not refused: {out}{err}"
+        );
     }
 
-    let spec = Spec::sh(script).env("PATH", PATH);
+    let spec = Spec::sh(&script).env("PATH", PATH);
     let result = run_long(&open, &cas, 10, &spec).await;
     let out = stdout(&cas, &result);
     assert!(
-        out.contains(local),
+        out.contains(local) && out.lines().any(|line| line == "com.apple.remoted 0"),
         "control: remotectl does not reach remoted even unsandboxed: {out}{}",
         stderr(&cas, &result)
     );
+}
+
+/// Catches a device rule narrowed from its prefix to the one name the other tests
+/// reach (`(global-name "com.apple.CoreDevice.CoreDeviceService")`, `(global-name
+/// "com.apple.remoted")`, or a longer prefix): a lookup of another name under each
+/// prefix, CoreDevice's `remotepairingd` and `remoted`'s `.coredevice` and `.control`,
+/// must be refused (1100), with or without the network. Control: without a sandbox
+/// each lookup gets a port (0), so each name is registered on the runner.
+#[tokio::test]
+async fn no_action_looks_up_another_device_service() {
+    let cas = Arc::new(MemoryCas::default());
+    let (sandboxed, open) = runtimes("device-services", &cas);
+    let names = [
+        "com.apple.CoreDevice.remotepairingd",
+        "com.apple.remoted.coredevice",
+        "com.apple.remoted.control",
+    ];
+    let script = lookup(&names);
+    for (seq, network) in [(1, "off"), (2, "on")] {
+        let spec = Spec::sh(&script)
+            .env("PATH", PATH)
+            .property("network", network);
+        let result = run_long(&sandboxed, &cas, seq, &spec).await;
+        let (out, err) = (stdout(&cas, &result), stderr(&cas, &result));
+        for name in names {
+            let refused = format!("{name} 1100");
+            assert!(
+                out.lines().any(|line| line == refused),
+                "network={network}: the lookup of {name} was not refused: {out}{err}"
+            );
+        }
+    }
+
+    let spec = Spec::sh(&script).env("PATH", PATH);
+    let result = run_long(&open, &cas, 10, &spec).await;
+    let (out, err) = (stdout(&cas, &result), stderr(&cas, &result));
+    for name in names {
+        let port = format!("{name} 0");
+        assert!(
+            out.lines().any(|line| line == port),
+            "control: {name} is not registered even unsandboxed: {out}{err}"
+        );
+    }
 }
 
 /// Perl that connects to `usbmuxd`'s socket by the path clients use (a link into
