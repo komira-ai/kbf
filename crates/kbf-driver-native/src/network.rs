@@ -227,7 +227,7 @@ impl Isolation {
             "-D".to_owned(),
             format!("{LEASE_PARAM}={}", lease.to_string_lossy()),
             "-p".to_owned(),
-            format!("{profile}{NO_DEVICE_RULES}{rules}"),
+            if network == Network::On { format!("{profile}{rules}") } else { format!("{profile}{NO_DEVICE_RULES}{rules}") },
             program.to_string_lossy().into_owned(),
         ];
         wrapped.extend(args.iter().cloned());
