@@ -239,11 +239,16 @@ every argument restricted to the lease uid range (default 600-699 **[A]**):
 
 > **Built (phase P1, and P4's session switch):** `crates/kbf-mac-session` serves
 > `user-create`, `run`, `kill-uid` and `user-delete` with the socket and caller check
-> of S4.3, and `session-login`, `session-idle` and the boot reset; `scan`, `baseline`
-> and `reboot-dirty` are not built. No daemon calls the session switch or the boot
-> reset yet (the bare-metal whole-machine runtime, 10.1, is planned), and no node runs
-> them: they need FileVault off and the helper installed as a LaunchDaemon, both
-> planned. Where it settles what this section leaves open, or differs:
+> of S4.3, and `session-login`, `session-ready`, `session-idle` and the boot reset;
+> `scan`, `baseline` and `reboot-dirty` are not built. `run` takes a session target:
+> `gui` starts the process in the lease user's GUI session (`launchctl asuser <uid>`
+> running the helper's own `as-user` mode, which drops to the user's uid and gid with
+> no supplementary groups before it executes the argument vector), refused unless the
+> intent record names the lease and launchd has its `gui/<uid>` domain;
+> `session-ready` answers whether it does. The bare-metal whole-machine runtime (10.1)
+> calls the boot reset at its start and the session switch for every lease; no node
+> runs it yet: it needs FileVault off and the helper and the daemon installed as
+> LaunchDaemons, both planned. Where it settles what this section leaves open, or differs:
 > - The user is `kbf-lease-<term>-<seq>` (a hyphen for the lease id's dot). Used lease
 >   ids are kept in an append-only ledger in the helper's state directory, so a name,
 >   and a grant (which names one lease), is used once across reboots; a uid is free

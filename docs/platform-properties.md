@@ -87,8 +87,10 @@ A worker reports how many GPUs it has in the `gpu` entry of its node report; a r
 without one has none. The daemon counts them on Linux from the PCI functions in
 `/sys/bus/pci/devices`: each NVIDIA or AMD VGA-compatible or 3D controller is one
 GPU. A server's management-controller VGA function and integrated graphics do not
-count. An Apple silicon Mac has one GPU, for the whole host; the daemon does not
-detect macOS nodes yet.
+count. An Apple silicon Mac has one GPU, for the whole host, and reports none: on
+macOS (`OSFamily=darwin`, or any spelling that names macOS) a GPU comes only with the
+whole Mac, so `gpu` of 1 or more is refused unless the action also asks for
+`kbf-lease=whole_machine`, which then books no GPU on top: the lease has the whole Mac.
 
 In Bazel:
 
@@ -109,9 +111,21 @@ lease books every core, byte of memory and GPU of its worker, and runs there alo
 A lease goes only to a worker whose daemon runs a driver for its kind: `container`,
 `native` or `fake` (or the test-only `local`) for `action`, `native-whole-machine` for
 `whole_machine` (see
-[capabilities.md](design/capabilities.md#driver-entries)). No daemon runs
-`native-whole-machine` yet, so today a `whole_machine` action waits with the reason
-and then fails, as described under [Where an action runs](#where-an-action-runs).
+[capabilities.md](design/capabilities.md#driver-entries)). Only a Mac whose daemon runs
+`kbf-mac-session` runs `native-whole-machine`: there each lease runs as a throwaway
+user in that user's GUI session, and the Mac is cleaned before the lease reports
+([fleet-updates.md](design/fleet-updates.md#101-no-gpu-in-vms)). On a farm without such
+a Mac a `whole_machine` action waits with the reason and then fails, as described under
+[Where an action runs](#where-an-action-runs). A GPU test on a Mac is a
+`whole_machine` lease:
+
+```starlark
+py_test(
+    name = "app_with_local_model_test",
+    exec_properties = {"OSFamily": "darwin", "kbf-lease": "whole_machine", "gpu": "1"},
+    ...
+)
+```
 
 A `whole_machine` lease waits for a worker that holds no lease. While it waits it holds
 one worker that could run it, and work queued after it at the same or a lower QoS is

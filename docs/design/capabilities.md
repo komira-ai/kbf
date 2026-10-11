@@ -82,9 +82,9 @@ daemon also refuses a `Start` for a lease kind its driver does not serve.
 | `fake` | `action` | exists, for bring-up only: runs nothing |
 | `local` | `action` | exists, in tests only: `kbf-daemon`'s child-process runtime |
 | `vm` | `vm` | **planned**: listed only when a check that boots no VM passes, at daemon start and periodically ([macos-vm-guests.md](macos-vm-guests.md#8-the-launch-daemon-risk)) |
-| `native-whole-machine` | `whole_machine` | **planned**: the bare-metal whole-machine runtime, listed only when `kbf-mac-session` is present ([fleet-updates.md](fleet-updates.md#102-isolation-layers), phase P4) |
+| `native-whole-machine` | `whole_machine` | exists (Macs): the bare-metal whole-machine runtime (`kbf_driver_native::whole_machine`), each lease as its own user in its GUI session through `kbf-mac-session`. `kbf-daemon --driver native-whole-machine` refuses to start unless the helper's socket (`--mac-session-socket`) is there, so only a node with the helper lists it ([fleet-updates.md](fleet-updates.md#101-no-gpu-in-vms)) |
 
-On `main` no driver serves `whole_machine`, so a `whole_machine` lease waits, saying
+A `whole_machine` lease on a farm with no `native-whole-machine` node waits, saying
 that no live worker serves the kind, and is refused after the unservable wait. A
 `whole_machine` lease books the whole worker and is placed only on one that holds no
 lease; while it waits it holds one worker in queue (QoS) order, which takes no less
