@@ -587,3 +587,38 @@ async fn a_cleanup_that_cannot_record_quarantines_the_node() {
     assert!(why.contains("writing the lease record"), "{why}");
     assert!(!config.dir.join(QUARANTINE_FILE).exists());
 }
+
+/// Catches a daemon that dies while the action runs (not a session switch: the helper
+/// and the action's processes survive it) and whose restarted runtime starts the action
+/// a second time beside the first, still running: no second `run` may come before a
+/// `kill-uid` of the lease user.
+#[tokio::test]
+async fn a_restart_mid_action_does_not_run_it_beside_the_first() {
+    let dir = scratch("whole-probe-mid-action");
+    let cas = Arc::new(MemoryCas::default());
+    let fake = FakeSession::default();
+    let config = config(&dir);
+    let slow = Spec::sh("sleep 3; echo made > out/made.txt")
+        .outputs(&["out/made.txt"])
+        .store(&cas);
+    let before = start(&config, &fake, &cas);
+    let running = {
+        let before = Arc::clone(&before);
+        let slow = slow.clone();
+        tokio::spawn(async move { before.run(work(slow)).await })
+    };
+    until_logged(&fake, "run").await;
+    running.abort();
+    assert!(running.await.is_err());
+    drop(before);
+    fake.verbs();
+    let after = start(&config, &fake, &cas);
+    let _ = run(&after, &slow).await;
+    let verbs = fake.verbs();
+    let second_run = verbs.iter().position(|v| v.starts_with("run "));
+    let kill = verbs.iter().position(|v| v.starts_with("kill-uid"));
+    assert!(
+        second_run.is_none() || kill.is_some_and(|k| k < second_run.unwrap()),
+        "the action ran again beside the first with no kill-uid before: {verbs:?}"
+    );
+}
