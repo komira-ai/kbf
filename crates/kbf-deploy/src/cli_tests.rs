@@ -221,3 +221,30 @@ fn main_runs_on_the_host() {
         .collect();
     assert_eq!(main(argv(&args)), ExitCode::FAILURE);
 }
+
+/// Catches the `linux` kit dropped from the merged command line (clap would exit 2 on
+/// an unknown subcommand, but on stderr with no `REFUSED:`), a linux refusal written to
+/// stdout or exiting 1 (1 means "the units are wrong"). (The binary's tests in
+/// `tests/linux_cli.rs` run the verbs end to end; this one also runs `run`'s linux arm in
+/// the lib tests' instantiation of `run`, the one the coverage ratchet counts.)
+#[test]
+fn a_linux_verb_runs_through_the_same_command_line() {
+    let mut exec = FakeExec::new(501);
+    let (code, out, err) = cli(
+        &mut exec,
+        &admin_env,
+        &[
+            "linux",
+            "render-units",
+            "--config",
+            "/nonexistent/kbf-deploy/config.local",
+            "--out",
+            "/nonexistent/kbf-deploy/units",
+        ],
+    );
+    assert_eq!((code, out.as_str()), (ExitCode::from(2), ""), "{err}");
+    assert!(
+        err.starts_with("REFUSED: cannot read /nonexistent/kbf-deploy/config.local"),
+        "{err}"
+    );
+}
