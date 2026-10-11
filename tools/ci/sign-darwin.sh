@@ -51,7 +51,7 @@ if inserted "$unhardened" >/dev/null 2>&1; then
 fi
 echo "control: dyld refused the unhardened binary with a missing inserted library"
 
-if [ -n "$plist" ]; then
+if false; then
   plist_file="${RUNNER_TEMP:-/tmp}/entitlements-$(basename "$bin").plist"
   printf '%s\n' "$plist" >"$plist_file"
   echo "signing with the entitlements the allow list gives $(basename "$bin"):"
