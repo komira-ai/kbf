@@ -32,7 +32,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
-use kbf_daemon::cas::Cas;
+use kbf_daemon::cas::{Cas, CasError};
 use kbf_daemon::{Runtime, RuntimeError, Work};
 use kbf_proto::reapi::{Action, ActionResult, Command, Platform};
 use kbf_types::LeaseId;
@@ -427,13 +427,13 @@ impl<C: Cas> PodmanRuntime<C> {
             &mut result,
         )
         .await
-        .map_err(tree_error)?;
+        .map_err(outputs_error)?;
         let max = self.config.outputs.max_stdio_bytes;
         for (path, slot) in [
             (&stdout_path, &mut result.stdout_digest),
             (&stderr_path, &mut result.stderr_digest),
         ] {
-            *slot = Some(collect_log(cas, path, max).await.map_err(tree_error)?);
+            *slot = Some(collect_log(cas, path, max).await.map_err(outputs_error)?);
         }
         Ok(result)
     }
@@ -784,7 +784,20 @@ fn timeout_of(action: &Action, default: Duration) -> Result<Duration, RuntimeErr
     Ok(if timeout.is_zero() { default } else { timeout })
 }
 
+/// A [`TreeError`] reading the action's inputs, as the lease reports it: a missing
+/// blob is the client's to upload, a broken rule is the client's error, and anything
+/// else is the farm's.
 fn tree_error(error: TreeError) -> RuntimeError {
+    match error {
+        TreeError::Cas(CasError::Missing(blob)) => RuntimeError::MissingBlob(blob),
+        other => outputs_error(other),
+    }
+}
+
+/// A [`TreeError`] storing the action's outputs, as the lease reports it: a broken
+/// rule is the client's error and anything else, a missing blob included (it is not
+/// the client's to upload), is the farm's.
+fn outputs_error(error: TreeError) -> RuntimeError {
     match error {
         TreeError::Invalid(why) => RuntimeError::Invalid(why),
         other => RuntimeError::Failed(other.to_string()),
@@ -1021,5 +1034,29 @@ mod tests {
             .expect_err("the task panicked");
         let why = clean_task_failed(panicked);
         assert!(why.starts_with("clean task: "), "{why}");
+    }
+
+    /// Catches an error reported as the wrong party's: a missing input as anything but
+    /// `MissingBlob` with its digest (#130: the client never uploads it), a missing
+    /// blob while storing outputs as the client's to upload, a corrupt input as
+    /// missing, and a broken rule as the farm's. (Compared as text: a pattern guard
+    /// would be a branch the coverage ratchet counts and no run takes.)
+    #[test]
+    fn errors_are_reported_as_whose_they_are() {
+        let shown = |e: RuntimeError| format!("{e:?}");
+        let missing = || TreeError::Cas(CasError::Missing("ab/1".to_owned()));
+        assert_eq!(shown(tree_error(missing())), "MissingBlob(\"ab/1\")");
+        assert_eq!(
+            shown(outputs_error(missing())),
+            "Failed(\"blob ab/1 is not in the CAS\")"
+        );
+        let corrupt = TreeError::Cas(CasError::Corrupt("a".into(), "b".into()));
+        assert_eq!(
+            shown(tree_error(corrupt)),
+            "Failed(\"blob a failed verification: its bytes hash to b\")"
+        );
+        for map in [tree_error, outputs_error] {
+            assert_eq!(shown(map(TreeError::Invalid("x".into()))), "Invalid(\"x\")");
+        }
     }
 }
