@@ -15,7 +15,8 @@
 //!   purpose: a lease over its cap keeps pushing into swap for several of the swap
 //!   watch's one-second samples, so the watch sees it (see `m2/run.sh`).
 //!
-//! Exits 0 on success, 1 when the verb fails, 2 on a usage error.
+//! Exits 0 on success, 1 when the verb fails, 2 on a usage error. Tested by running it
+//! (`tests/m2_act.rs`), so coverage counts one build of it.
 
 use std::io::Write as _;
 use std::process::ExitCode;
@@ -140,85 +141,4 @@ const fn xorshift(mut x: u64) -> u64 {
     x ^= x >> 7;
     x ^= x << 17;
     x
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn args(list: &[&str]) -> Vec<String> {
-        list.iter().map(|s| (*s).to_owned()).collect()
-    }
-
-    /// Catches: a sort that keeps input order, drops the last line when it has no
-    /// newline, or keeps empty lines (the sample's `words` output would differ from a
-    /// shell `sort`).
-    #[test]
-    fn sort_orders_lines_and_ends_each_with_a_newline() {
-        assert_eq!(sort(b"pear\napple\n\nfig"), b"apple\nfig\npear\n");
-    }
-
-    /// Catches: a verb that writes nothing or the wrong bytes to its output, `join`
-    /// that drops an input or reorders them, and `upper` that is not applied.
-    #[test]
-    fn upper_and_join_write_their_output_file() {
-        let dir = std::env::temp_dir().join(format!("kbf-m2-act-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("dir");
-        let a = dir.join("a").display().to_string();
-        let b = dir.join("b").display().to_string();
-        let out = dir.join("out").display().to_string();
-        std::fs::write(&a, "one\n").expect("a");
-        std::fs::write(&b, "two\n").expect("b");
-        run(&args(&["upper", &out, &a])).expect("upper");
-        assert_eq!(std::fs::read(&out).expect("out"), b"ONE\n");
-        run(&args(&["join", &out, &a, &b])).expect("join");
-        assert_eq!(std::fs::read(&out).expect("out"), b"one\ntwo\n");
-        std::fs::remove_dir_all(&dir).expect("clean");
-    }
-
-    /// Catches: a missing argument or a non-number accepted as a usage the binary runs
-    /// with defaults (an action would then succeed doing something else), and a failed
-    /// read reported as a usage error.
-    #[test]
-    fn bad_arguments_are_usage_errors_and_a_missing_input_fails() {
-        assert!(matches!(run(&args(&["hog", "out"])), Err(Error::Usage(_))));
-        assert!(matches!(
-            run(&args(&["pause", "out", "x", "salt"])),
-            Err(Error::Usage(_))
-        ));
-        assert!(matches!(run(&args(&["join", "out"])), Err(Error::Usage(_))));
-        assert!(matches!(run(&args(&["nope", "out"])), Err(Error::Usage(_))));
-        assert!(matches!(
-            run(&args(&["sort", "out", "/nonexistent/kbf-m2-act"])),
-            Err(Error::Failed(_))
-        ));
-    }
-
-    /// Catches: `pause` or `hog` that writes nothing, or writes other than its salt or
-    /// size (the sample's outputs, and run.sh's check of `//:hog`'s, would differ).
-    #[test]
-    fn pause_and_hog_write_their_salt_and_size() {
-        let dir = std::env::temp_dir().join(format!("kbf-m2-act-ph-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("dir");
-        let out = dir.join("out").display().to_string();
-        run(&args(&["pause", &out, "0", "a-salt"])).expect("pause");
-        assert_eq!(std::fs::read(&out).expect("out"), b"a-salt\n");
-        run(&args(&["hog", &out, "16"])).expect("hog");
-        assert_eq!(std::fs::read(&out).expect("out"), b"16\n");
-        std::fs::remove_dir_all(&dir).expect("clean");
-    }
-
-    /// Catches: a xorshift step that returns its input or zero (every page the hog
-    /// touches would be the same, so a kernel could share or compress them and the
-    /// lease would never pass its cap).
-    #[test]
-    fn the_hog_sequence_does_not_repeat_early() {
-        let mut x = 0x9e37_79b9_7f4a_7c15;
-        let mut seen = std::collections::BTreeSet::new();
-        for _ in 0..10_000 {
-            x = xorshift(x);
-            assert_ne!(x, 0);
-            assert!(seen.insert(x), "repeated {x:#x}");
-        }
-    }
 }
