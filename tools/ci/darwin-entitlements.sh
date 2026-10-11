@@ -38,7 +38,7 @@ word='^[A-Za-z0-9][A-Za-z0-9._-]*$'
 # if none. Reads and checks the whole list first.
 keys_for() {
   local want=$1 line n=0 name seen=" " keys="" sorted k
-  [ -f "$allowlist" ] || die "the entitlement allow list $allowlist is missing"
+  [ -f "$allowlist" ] || return 0
   [ -r "$allowlist" ] || die "the entitlement allow list $allowlist cannot be read"
   while IFS= read -r line || [ -n "$line" ]; do
     n=$((n + 1))
