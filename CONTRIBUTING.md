@@ -74,11 +74,12 @@ repo_lints`) refuse a shell, Python, awk, sed, Perl or Ruby file, a workflow
 `run:` step with shell logic (more than one line, a pipe, `&&`, `;`, `$(`, a backtick,
 `if`, `for` or `while`), and production code under `crates/*/src/` that names
 a shell and a `-c` flag, unless
-[tools/interpreter_budget.tsv](tools/interpreter_budget.tsv) lists it at its
-exact size. The rows there are what is left to port. A pull request that
-shortens, moves or deletes such a file changes its row in the same commit;
-the lint refuses a row whose count is off by even one line, and a row whose
-file is gone.
+[tools/interpreter_budget.tsv](tools/interpreter_budget.tsv) lists it by path
+(a `<key><TAB><reason>` row). The rows there are what is left to port. The list
+records what exists, not how big it is: editing a listed file, step or keeper
+leaves the list alone. A pull request that moves or deletes one removes or
+renames its row in the same commit; the lint refuses a row whose file, step or
+keeper is gone.
 
 ## Continuous integration
 
