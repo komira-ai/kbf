@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
 use futures::channel::mpsc::{UnboundedSender, unbounded};
-use kbf_front::{Cache, MAX_MESSAGE_BYTES, MemoryMetaLog, MetaLog, MetaLogError};
+use kbf_front::{Cache, Leadership, MAX_MESSAGE_BYTES, MemoryMetaLog, MetaLog, MetaLogError};
 use kbf_meta::{Applied, Command as MetaCommand, MetaState, Retention};
 use kbf_objstore::{Capabilities, KeyPrefix, MemoryStore};
 use kbf_proto::google::longrunning::{Operation, operation};
@@ -157,6 +157,13 @@ impl MetaLog for GateLog {
             Inner::Raft(log) => log.query(f).await,
         }
     }
+
+    fn leadership(&self) -> Option<Leadership> {
+        match &self.inner {
+            Inner::Memory(log) => log.leadership(),
+            Inner::Raft(log) => log.leadership(),
+        }
+    }
 }
 
 /// A running server in this process, and a [`Client`] of it.
@@ -255,7 +262,8 @@ impl Cell {
     ///
     /// Sharing the cache models a durable cache, which `kbf-server` does not have
     /// today: its metadata is in memory. [`Cell::cold_restart`] is a restart as the
-    /// binary has it.
+    /// binary has it. On a cell started with [`Cell::start_raft`] both servers share
+    /// one open Raft log, and so its term: use [`Cell::cold_restart`] there.
     pub async fn restart(&self) -> Self {
         let (wait, retention) = (kbf_sched::UNSERVABLE_WAIT, kbf_sched::FINISHED_RETENTION);
         let (cache, store) = (Arc::clone(&self.cache), self.store.clone());
