@@ -518,20 +518,24 @@ mod tests {
     /// busy-node counts and operations with kills, so the check is never vacuous.
     #[test]
     fn schedulers_fed_one_oom_sequence_hold_equal_memory_states() {
-        let (mut full, mut pressure, mut runs) = (false, false, false);
+        let (mut evicted, mut pressure, mut runs) = (false, false, false);
         for seed in 0..32 {
             let (mut a, mut b) = (Sim::new(3), Sim::new(3));
+            // The actions that held a floor at some step: more than 3 means one was
+            // forgotten.
+            let mut floored = std::collections::BTreeSet::new();
             for step in sequence(seed) {
                 apply(&mut a, &step);
                 apply(&mut b, &step);
                 assert_eq!(a.s.memory_state(), b.s.memory_state(), "seed {seed}");
+                floored.extend((0..6).filter(|&n| a.s.memory_floor(&key(n)).is_some()));
             }
             let memory = a.s.memory_state();
-            full |= memory.floors.asks.len() == 3 && memory.floors.next > 3;
+            evicted |= floored.len() > 3;
             pressure |= !memory.pressure.is_empty();
             runs |= memory.ops.values().any(|op| op.runs.len() > 1);
         }
-        assert!(full, "no seed raised floors past the bound");
+        assert!(evicted, "no seed raised floors past the bound");
         assert!(pressure, "no seed had a busy-node kill");
         assert!(runs, "no seed killed one operation twice");
     }
