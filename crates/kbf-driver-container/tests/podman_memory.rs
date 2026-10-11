@@ -376,10 +376,10 @@ async fn swapped_by_the_host_then_at_its_cap_a_lease_is_not_killed() {
     // The buffer the host swaps out; the buffers the action holds at its cap (`PIECES`
     // of `PIECE`), the headroom it is given there, and what `cat` and the shell may add.
     const BUFFER: u64 = 300 * MIB;
-    const PIECE: u64 = 4 * MIB;
-    const PIECES: u64 = 24;
+    const PIECE: u64 = 16 * MIB;
+    const PIECES: u64 = 6;
     const PUSH: u64 = PIECE * PIECES;
-    const HEADROOM: u64 = 64 * MIB;
+    const HEADROOM: u64 = 16 * MIB;
     const SLACK: u64 = 8 * MIB;
     let cell = Cell::with("swap-held", |config| {
         config.swap_kill = SwapKill {
@@ -394,7 +394,7 @@ async fn swapped_by_the_host_then_at_its_cap_a_lease_is_not_killed() {
          while [ $i -lt 5 ]; do cat f >/dev/null; i=$((i + 1)); done; \
          rm -f f; i=0; while [ $i -lt {PIECES} ]; do \
          dd if=/dev/urandom bs={piece}M count=1 iflag=fullblock 2>/dev/null | sleep 15 & \
-         sleep 0.5; i=$((i + 1)); done; wait; }}",
+         sleep 0; i=$((i + 1)); done; wait; }}",
         buffer = BUFFER / MIB,
         piece = PIECE / MIB,
     ));
