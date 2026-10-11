@@ -8,8 +8,8 @@
 #
 # GENERATOR is the driver's `action_sandbox` example
 # (crates/kbf-driver-native/examples/action_sandbox.rs): it makes a lease directory
-# and writes the profile `Isolation::wrap` builds (BASE_PROFILE and this user's folder
-# rules), the `-D KBF_LEASE=` parameter and the lease's variables, and prints the
+# and writes the profile `Isolation::wrap` builds (BASE_PROFILE, NO_DEVICE_RULES and
+# this user's folder rules), the `-D KBF_LEASE=` parameter and the lease's variables, and prints the
 # profile's SHA-256. SOURCE_ROOT (default: this checkout) holds tools/spike/lib.sh and
 # tools/spike/macos/fixtures.
 #
@@ -85,8 +85,8 @@ lease() {
         return 1
     fi
     mkdir -p "$dir/root/tools/spike/macos"
-    cp "$SRC/tools/spike/lib.sh" "$dir/root/tools/spike/"
-    cp -R "$SRC/tools/spike/macos/fixtures" "$dir/root/tools/spike/macos/"
+    /bin/cp "$SRC/tools/spike/lib.sh" "$dir/root/tools/spike/"
+    /bin/cp -R "$SRC/tools/spike/macos/fixtures" "$dir/root/tools/spike/macos/"
     st_set "$1.sha256" "$(printf '%s\n' "$out" | sed -n 's/^sha256=//p')"
     kv "$1.sha256" "$(st_get "$1.sha256")"
     kv "$1.user_folders" "$(printf '%s\n' "$out" | sed -n 's/^user_folders=//p')"

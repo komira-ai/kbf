@@ -171,11 +171,20 @@ pub(crate) fn result_of(
         Err(RuntimeError::Failed(why)) => failure(id, Code::Internal, why),
         Err(RuntimeError::Invalid(why)) => failure(id, Code::InvalidArgument, why),
         Err(RuntimeError::MissingBlob(blob)) => missing(id, &blob),
-        Err(RuntimeError::TimedOut) => failure(
-            id,
-            Code::DeadlineExceeded,
-            "the action ran past its timeout",
-        ),
+        Err(RuntimeError::TimedOut { stdout, stderr }) => worker::Result {
+            // REAPI's partial result: what the action wrote before it was stopped, and
+            // nothing else (no outputs; the server never caches it).
+            action_result: (stdout.is_some() || stderr.is_some()).then(|| ActionResult {
+                stdout_digest: stdout,
+                stderr_digest: stderr,
+                ..ActionResult::default()
+            }),
+            ..failure(
+                id,
+                Code::DeadlineExceeded,
+                "the action ran past its timeout",
+            )
+        },
         Err(oom @ RuntimeError::OutOfMemory { .. }) => worker::Result {
             memory_kill: MemoryKill::OwnLimit as i32,
             ..failure(id, Code::ResourceExhausted, oom.to_string())
@@ -433,7 +442,9 @@ mod tests {
     /// as OK, which would be cached; and the two memory kills not told apart (a busy
     /// node's kill read as the action's own would grow its booking for nothing), or
     /// any other outcome marked as a memory kill. Every arm in one test, so each code
-    /// is checked against the others.
+    /// is checked against the others. Also catches (issue #45) a timeout's partial
+    /// stdout or stderr dropped, swapped or sent without the other, and a result sent
+    /// with a timeout that has no log to carry.
     #[test]
     fn each_outcome_has_its_status() {
         let id = LeaseId::new(3, 4);
@@ -459,7 +470,13 @@ mod tests {
                 RuntimeError::MissingBlob("ab/1".to_owned()),
                 Code::FailedPrecondition,
             ),
-            (RuntimeError::TimedOut, Code::DeadlineExceeded),
+            (
+                RuntimeError::TimedOut {
+                    stdout: None,
+                    stderr: None,
+                },
+                Code::DeadlineExceeded,
+            ),
             (
                 RuntimeError::OutOfMemory {
                     used: 3 << 30,
@@ -485,6 +502,32 @@ mod tests {
             assert!(result.action_result.is_none(), "{why}");
             assert_eq!(result.memory_kill(), kill, "{why}");
             assert_eq!(result.status.map(|s| s.code), Some(code as i32), "{why}");
+        }
+
+        // A timeout carries the logs the action wrote before it was stopped, each in
+        // its own field, and nothing else.
+        let digest = |n: i64| Digest {
+            hash: format!("{n:064x}"),
+            size_bytes: n,
+        };
+        for (stdout, stderr) in [
+            (Some(digest(1)), Some(digest(2))),
+            (Some(digest(1)), None),
+            (None, Some(digest(2))),
+        ] {
+            let timed_out = RuntimeError::TimedOut {
+                stdout: stdout.clone(),
+                stderr: stderr.clone(),
+            };
+            let result = result_of(id, Err(timed_out));
+            let code = result.status.map(|s| s.code);
+            assert_eq!(code, Some(Code::DeadlineExceeded as i32));
+            let partial = ActionResult {
+                stdout_digest: stdout,
+                stderr_digest: stderr,
+                ..ActionResult::default()
+            };
+            assert_eq!(result.action_result, Some(partial));
         }
 
         // The OOM status says how much was used and what the limit was.

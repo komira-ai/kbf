@@ -5,6 +5,7 @@
 
 pub mod fake;
 pub mod real;
+pub mod swap_kill;
 
 use std::collections::BTreeMap;
 use std::os::unix::fs::PermissionsExt;

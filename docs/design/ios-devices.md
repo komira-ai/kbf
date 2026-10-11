@@ -4,8 +4,9 @@ This document says how kbf will run work on real iPhones and iPads plugged into 
 node by USB: how a device is set up once, how signing is done and where its secrets
 live, how one specific device is booked for one lease, how the daemon reports each
 device's health and alerts with the exact fix, how a device is cleaned between
-leases, and what still needs a person at the device. **Everything in it is planned.**
-Nothing about physical devices exists on `main`: no daemon reports a device, no
+leases, and what still needs a person at the device. **Everything in it is planned**
+but the sandbox rule that keeps leases away from the node's devices
+([section 6.1](#61-what-the-sandbox-must-allow)). No daemon reports a device, no
 request key names one, and no runtime talks to one. What exists on `main` today is
 named as such.
 
@@ -164,10 +165,14 @@ the closest device and the key it fails.
 
 Two facts on `main` decide the order in which these pieces may ship:
 
-- **An unknown platform property is ignored today**
+- **An unknown platform property is ignored**
   ([capabilities.md](capabilities.md#unknown-keys)), so `ios.device=1` sent to a server
   that does not know it matches every node, Linux included. The server must know
-  `ios.device` (and refuse it until booking exists) before any client sends it.
+  `ios.device` (and refuse it until booking exists) before any client sends it. That
+  step is on `main`: `kbf_caps::Request::from_platform` refuses `ios.device` and every
+  `ios.device.<attribute>` key, in any case (`RequestError::IosDevice`), and Execute
+  answers `INVALID_ARGUMENT` naming the key and this section. A name that only begins
+  like one (`ios.devices`, `ios.simulator`) is an unknown property, ignored.
 - **An old daemon would drop `device_id` silently.** `Start` is proto3; a daemon that
   predates field 8 decodes the message without it and would run the action without
   knowing its device. The guard is the report: only a daemon that reports
@@ -175,8 +180,8 @@ Two facts on `main` decide the order in which these pieces may ship:
   one. The test for this is "a node whose report has no `ios.device` entry is never
   placed a device lease".
 
-So: matching and booking land together (or matching lands with the front refusing
-`ios.device` until booking is in), then the server, then daemons.
+So: the refusal first (done), then matching and booking together (or matching with
+the refusal kept until booking is in), then the server, then daemons.
 
 ### 5.6 Caching
 
@@ -257,15 +262,36 @@ Xcodes every question (CEO decision on issue #164: `xcrun` reads and fills a cac
 that leases can write); its profile is that of a device lease, which may reach
 CoreDevice (below). The action runs `xcodebuild` inside it.
 
-**Other leases must not reach a booked device.** The profile on `main` allows mach and
-XPC services (`(allow default)`) and every Unix socket, so any concurrent action on the
-node, device lease or not, could run `xcrun devicectl` and install, launch or reboot
-apps on a device booked for another lease. The planned fix: the profiles of leases
-without a device deny the CoreDevice mach services and the `usbmuxd` socket. That
-part needs no device and can be tested on the hosted macOS runner: `devicectl list
-devices` from a lease without a device must be refused. Two device leases on one
-node still share these services; until P-D2 shows a device per user, a node may run
-one device lease at a time.
+**Other leases must not reach a booked device.** Every profile allows mach and XPC
+services (`(allow default)`) and the no-network one every Unix socket, so without a
+rule any concurrent action on the node, device lease or not, could run `xcrun
+devicectl` and install, launch or reboot apps on a device booked for another lease.
+So every profile ends with `NO_DEVICE_RULES` (`crates/kbf-driver-native/src/network.rs`):
+
+- no `mach-lookup` of a name starting `com.apple.CoreDevice.`: `CoreDeviceService`
+  (the XPC service `devicectl` asks for everything; refused, `devicectl` waits over 15
+  seconds for it and fails saying the connection was invalidated),
+  `remotepairingd`, the DDI updater (`CoreDeviceDDIUpdaterService`) and the rest;
+- no `mach-lookup` of a name starting `com.apple.remoted`: `remoted`'s services
+  (`com.apple.remoted`, `.coredevice`, `.control` and the rest: RemoteXPC, which
+  CoreDevice reaches a device through; `remotectl dumpstate` then prints no device, the
+  Mac itself included);
+- no connect to `usbmuxd`'s socket, named by its real path `/private/var/run/usbmuxd`
+  (a rule on `/var/run/usbmuxd`, the link clients open, matches nothing).
+
+`CoreDeviceService` itself runs outside the action's sandbox, launched by launchd: the
+rule refuses the action the lookup, not the service its own reach. No lease has a
+device yet, so every lease gets these rules, and so does the daemon's own Xcode
+survey, which runs under the actions' sandbox; a lease that books a device is to get a
+profile without them, as is the daemon's `devicectl` survey (D2). `tests/devices.rs`
+shows each refused on the hosted macOS runner, with the network off and on, each
+against a control: the same action by the same driver without a sandbox reaches the
+service. Beyond what `devicectl` and `remotectl` ask for, it looks up
+`remotepairingd`, `com.apple.remoted.coredevice` and `com.apple.remoted.control`
+directly, so a rule narrowed from its prefix to one name fails there, and a unit test
+in `network.rs` checks that each mach rule is a prefix covering every name listed
+above. Two device leases on one node still share these services; until P-D2 shows
+a device per user, a node may run one device lease at a time.
 
 ## 7. Health: report, alert, recover
 
@@ -340,12 +366,15 @@ restart) is issue #189.
   a state file, written atomically. A device that disappears is `gone`, with an
   attention item, until it returns or an operator runs `kbf-node device forget <id>`.
   A state file that does not parse is itself an attention item; the daemon starts.
-- In PR #173 the driver report is one watch channel whose only producer is the Xcode
-  watch, and its payload holds the whole report's driver entries. A second producer
-  would overwrite the first's entries, and a device's state depends on which Xcodes
-  are ready. So the device survey and the Xcode survey become one driver watch, or
-  that channel is split into one part per source. If PR #173 changes in review, this
-  section follows it.
+- The driver report is one channel to the daemon with one part per source
+  (`DriverWatch`, `crates/kbf-daemon/src/driver_watch.rs`). The Xcode watch sends
+  through the part named `xcode`; the device survey will take a part of its own. A
+  part's send replaces that part's report alone, and the daemon gets the merge of every
+  part's newest report (entries and Xcodes, part by part in the order of the sources'
+  names), so a device change never drops an Xcode's entry or its attention item, nor
+  an Xcode change a device's. A source has at most one part. A device's state still
+  depends on which Xcodes are ready: the device survey is to read that from the native
+  runtime's ready Xcodes, not from the channel.
 
 ## 8. The lease lifecycle
 
@@ -433,15 +462,15 @@ None of these has run. Each is a later PR's evidence; the PR that needs it says 
 
 ## 12. Phased plan
 
-All planned; each is its own pull request.
+All planned but the sandbox rule and the driver watch; each is its own pull request.
 
 | Phase | What | Needs |
 |---|---|---|
 | D0 | This design | - |
 | D1 | Probe kit: P-D0 and P-D1 fixtures, with a lint that refuses a fixture carrying a real-looking UDID, ECID, serial, CoreDevice id or device name | a device and a person (P-D1) |
-| D1 | Sandbox rule: leases without a device cannot reach CoreDevice or `usbmuxd`; tested on the hosted macOS runner | none |
+| D1 | Sandbox rule: leases without a device cannot reach CoreDevice, `remoted` or `usbmuxd`; tested on the hosted macOS runner (**done**: `NO_DEVICE_RULES`) | none |
 | D2 | Survey parser in `kbf-driver-native`: `devicectl` JSON to device states, tested against the D1 fixtures | D1 |
-| D2 | One driver watch for Xcodes and devices (generalizes PR #173's channel) | PR #173 |
+| D2 | One driver watch for Xcodes and devices, a part per source: done, the Xcodes' part only ([section 7.5](#75-recover)) | PR #173 |
 | D2 | `NodeStatus.devices`, attention lines, the state file, `forget` and `release`, `Hello` resent on change | the watch |
 | D3 | `kbf-caps` device matching (one device satisfies every key) with scheduler booking and `Start.device_id`, landed together, then the front's refusals and messages | none |
 | D3 | Device lease runtime: precheck, baseline, run, cleanup, quarantine, audit | D2, D3, P-D3, P-D4 |
@@ -466,11 +495,12 @@ All planned; each is its own pull request.
 
 | Claim | Status | Source |
 |---|---|---|
-| No physical-device code or report entry exists on `main` | V | the repository |
+| No physical-device code or report entry exists on `main`, but the sandbox rule of section 6.1 | V | the repository |
 | `gpu` is booked as a count; `Start` carries only CPU and memory; the daemon builds `Work.resources` from those | V | `crates/kbf-types/src/work.rs`, `crates/kbf-proto/proto/kbf/worker/v1/worker.proto`, `crates/kbf-daemon/src/lease.rs` |
 | `Start`'s field numbers 1 to 7 are taken | V | `worker.proto` |
 | An unknown platform property is ignored today | V | [capabilities.md](capabilities.md#unknown-keys) |
 | The no-network profile allows only loopback and Unix sockets; every profile denies file writes outside the lease and preference writes, and allows mach and XPC | V | `crates/kbf-driver-native/src/network.rs` |
+| Every profile denies the CoreDevice and `remoted` mach lookups and the `usbmuxd` socket | V | `crates/kbf-driver-native/src/network.rs`, `tests/devices.rs` (hosted macOS runner) |
 | Virtualization.framework attaches USB mass storage only, not an iPhone | A | to be read in the framework's USB documentation |
 | Developer Mode is needed for development-signed apps on iOS 16 and later | A | Apple's "Enabling Developer Mode on a device" (not re-read) |
 | The `devicectl` verbs and JSON named here | A | P-D0, P-D1 |

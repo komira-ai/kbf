@@ -8,10 +8,11 @@
 //! `O_EXCL` in directories that module created, so no write follows a symlink the input
 //! tree planted. Its errors come back as this module's [`TreeError`], kind for kind.
 //!
-//! What is the container driver's own: the overlay checks
-//! ([`refuse_outputs_in_inputs`], [`refuse_hidden_working_directory`]) and the outputs,
-//! read by descriptor, component by component from the upper directory, with no symlink
-//! followed at any level, within [`OutputLimits`].
+//! What is the container driver's own: the overlay's preparation
+//! ([`refuse_hidden_working_directory`], [`prepare_outputs`], which moves each input an
+//! output names into the upper directory) and the outputs, read by descriptor,
+//! component by component from the upper directory, with no symlink followed at any
+//! level, within [`OutputLimits`].
 
 use std::path::{Path, PathBuf};
 
@@ -123,51 +124,78 @@ pub fn output_paths(command: &Command) -> Result<Vec<String>, TreeError> {
     Ok(shared::output_paths(command)?)
 }
 
-/// Refuses an output path that names an entry of the input root `root` (seen from
-/// `working_directory`).
+/// Makes the overlay's upper directory `upper` ready for the outputs: every entry of
+/// the input root `root` that an output path names (seen from `working_directory`) is
+/// moved, whole, from `root` into `upper`; then the working directory and each output's
+/// parent are made in `upper` (REAPI: the worker makes them).
 ///
-/// The driver reads outputs from the overlay's upper directory, which holds only what
-/// the action created or changed. An output that is already an input would come back
-/// partial: an unchanged input file missing, an output directory without its unchanged
-/// inputs, a deleted file as a skipped whiteout. REAPI allows such actions; Bazel and
-/// Buck2 never send them. So they are refused as the client's error rather than run and
-/// cached incomplete.
+/// The driver reads outputs from the upper directory, which holds only what the action
+/// created or changed. An output that is also an input would come back partial there:
+/// an unchanged input file missing, an output directory without its unchanged inputs,
+/// a deleted input as a whiteout. Moved before the overlay is mounted, the input is in
+/// the upper directory alone: the action sees the same tree, its changes land in place,
+/// a file it deletes is unlinked (no lower entry to hide, so no whiteout), and the
+/// output is read back as the action left it, as the native driver reads it from its
+/// input root.
 ///
-/// The walk follows no symlink. A component that is absent, or that is not a
-/// directory, ends it with "no overlap": the driver makes each output's parent a
-/// directory in the upper layer, and an upper directory hides a lower file or symlink
-/// of the same name instead of merging with it.
-pub async fn refuse_outputs_in_inputs(
+/// Outputs are taken ancestors first, so an output below another one was moved with
+/// it. The walk follows no symlink. A component that is absent, or that is not a
+/// directory, ends it with nothing to move: the parent made in the upper directory
+/// hides a lower file or symlink of the same name instead of merging with it. The
+/// parents are made without following a symlink either, so an output below an input
+/// file or symlink that another output moved up is refused as
+/// [`TreeError::Invalid`], as the native driver refuses it.
+///
+/// # Errors
+/// [`TreeError::Invalid`] as above; I/O failures, an unreadable input directory
+/// included.
+pub async fn prepare_outputs(
     root: &Path,
+    upper: &Path,
     working_directory: &str,
     outputs: &[String],
 ) -> Result<(), TreeError> {
-    for output in outputs {
-        // Collected before the walk: a closure-holding iterator kept across an await
-        // makes the future not `Send` for every lifetime.
-        let parts: Vec<&str> = working_directory
-            .split('/')
-            .filter(|part| !part.is_empty())
-            .chain(output.split('/'))
-            .collect();
-        let mut host = root.to_owned();
-        for (i, part) in parts.iter().enumerate() {
-            host.push(part);
-            let meta = match fs::symlink_metadata(&host).await {
+    // Component lists, ancestors first: a path's own list sorts before any it prefixes.
+    // Collected before the walk: a closure-holding iterator kept across an await makes
+    // the future not `Send` for every lifetime.
+    let mut paths: Vec<Vec<&str>> = outputs
+        .iter()
+        .map(|output| output.split('/').collect())
+        .collect();
+    paths.sort();
+    let base: Vec<&str> = working_directory
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect();
+    // No output is an ancestor of the working directory, so no move touches its path.
+    let out_dir = shared::real_dirs(upper, working_directory).await?;
+    for path in &paths {
+        let mut lower = root.to_owned();
+        let parts = base.iter().chain(path);
+        let last = base.len() + path.len() - 1;
+        for (i, part) in parts.enumerate() {
+            lower.push(part);
+            let meta = match fs::symlink_metadata(&lower).await {
                 Ok(meta) => meta,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
-                Err(e) => return Err(io(&host)(e)),
+                Err(e) => return Err(io(&lower)(e)),
             };
-            if i + 1 == parts.len() {
-                return Err(TreeError::Invalid(format!(
-                    "output path {output:?} names an entry of the input root; outputs that \
-                     overlap the inputs are not supported"
-                )));
+            if i == last {
+                let parent = path[..path.len() - 1].join("/");
+                let to = shared::real_dirs(&out_dir, &parent)
+                    .await?
+                    .join(path[path.len() - 1]);
+                fs::rename(&lower, &to).await.map_err(io(&lower))?;
+                break;
             }
             if !meta.is_dir() {
                 break;
             }
         }
+    }
+    for output in outputs {
+        let parent = output.rsplit_once('/').map_or("", |(parent, _)| parent);
+        shared::real_dirs(&out_dir, parent).await?;
     }
     Ok(())
 }
@@ -210,9 +238,9 @@ pub async fn refuse_hidden_working_directory(
 /// not create is left out, including one whose parent (or working directory) the
 /// action replaced with a file or a symlink; an entry that is not a file, directory or
 /// symlink (a socket, a FIFO, a whiteout) is left out too. A working directory or
-/// output path with an empty, `.` or `..` component is refused. No output overlaps the
-/// input root (`refuse_outputs_in_inputs`), so every output is whole in the upper
-/// directory.
+/// output path with an empty, `.` or `..` component is refused. Every input an output
+/// names was moved into the upper directory before the action ran
+/// ([`prepare_outputs`]), so every output is whole there.
 ///
 /// All the outputs together stay within `limits` (directory depth, entries, file
 /// bytes), or the call fails with [`TreeError::Limit`]. An output directory is walked

@@ -284,7 +284,7 @@ says why the action could not run:
 | Status | Meaning |
 |---|---|
 | `OK` | the action ran; its outputs, stdout and stderr are already in the CAS |
-| `DEADLINE_EXCEEDED` | the action ran past its timeout and was stopped |
+| `DEADLINE_EXCEEDED` | the action ran past its timeout and was stopped. `action_result` may hold the stdout and stderr digests of what it wrote before then (REAPI's partial result, already in the CAS); the server passes on those two digests whose blobs it holds, and nothing else, to the client in the `ExecuteResponse`, and never caches them |
 | `INVALID_ARGUMENT` | the action cannot run as written (an image named by tag, an output that is also an input); the client's error |
 | `FAILED_PRECONDITION` | an input blob is not in the CAS (with a `MISSING` violation), or no driver serves the lease kind |
 | `ABORTED` | the lease was killed, or self-fenced when contact was lost |
@@ -397,7 +397,9 @@ action cache with the result.
 What software the node runs, for operators: the OS name, version and build, the
 kernel release (Linux), the `kbf-daemon` version, the ready Xcode builds (Mac), and
 every installed Xcode with its state, why it is not ready and the command that fixes
-it (`xcodes`, Mac; issue #164). It routes no work, so it is not part of the node report and does not change
+it (`xcodes`, Mac; issue #164), and the container images the daemon was pinned to
+and checked present at start (`container_images`, container driver: see
+[daemon.md](daemon.md#the-container-driver)). It routes no work, so it is not part of the node report and does not change
 `report_hash` (see [fleet-updates.md](fleet-updates.md) section 3.1). The daemon reads
 `sw_vers` on a Mac and `os-release` and the kernel release on Linux; the Xcode builds
 are the node report's `xcode` entries, from the driver that discovers them, and
@@ -409,7 +411,7 @@ current stream only (one from a replaced stream is ignored, and one the deny lis
 refuses ends the stream, see [above](#node-identity-and-the-deny-list)), in memory, and lists it
 in the operator API's `GET /v1/nodes` ([api.md](../api.md)). A server that predates
 the message ignores it as an empty message; a daemon that predates it is listed
-without software, and a server that predates `xcodes` ignores it.
+without software, and a server that predates `xcodes` or `container_images` ignores it.
 
 When the driver's report changes mid-session (today: the native driver's first
 survey of its Xcodes ended, which the daemon does not wait for before `Hello`, so its

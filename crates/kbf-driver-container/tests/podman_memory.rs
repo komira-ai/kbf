@@ -28,6 +28,7 @@ use kbf_driver_container::SwapKill;
 use kbf_types::{LeaseId, Resources};
 use support::real::{Cell, describe, podman, sh};
 use support::store_action;
+use support::swap_kill::{Logs, assert_swap_kill};
 
 const MIB: u64 = 1 << 20;
 
@@ -199,6 +200,11 @@ async fn past_its_booking_within_its_cap_an_action_runs() {
 /// (`dd` then blocks writing it into a pipe nobody reads), so reclaim at its cap moves
 /// some 360 MiB of it to swap, past the 128 MiB floor this cell's watch is given; the
 /// watch samples every second. Lease 2 sleeps beside it and must still be running.
+/// The kill is checked as `assert_swap_kill` says: past its cap overall, with its own
+/// swap past the floor by the watch's log line. Also catches a threshold that drops the
+/// floor (the "0 floor" mutant: its kill line names the 4 MiB share of the booking).
+/// RAM plus swap past the cap by the floor is no promise: the kill sample may find RAM
+/// below the cap.
 /// The buffer is random, not zeros: a kernel that splits huge pages under reclaim
 /// (podman-x86's) drops zero-filled pages for the shared zero page, so a buffer of
 /// zeros shrinks below the cap and never reaches swap.
@@ -225,6 +231,7 @@ async fn past_its_cap_with_swap_free_the_driver_kills_it_as_out_of_memory() {
     let started = Instant::now();
     let runtime = Arc::clone(&cell.runtime);
     let work = cell.work(1, action, Resources::new(1000, 16 * MIB));
+    let logs = Logs::capture();
     let mut first = tokio::spawn(async move { runtime.run(work).await });
     // What the lease looked like each second, for the failure message.
     let lease = cell.cgroup.join(cell.name(1));
@@ -238,14 +245,14 @@ async fn past_its_cap_with_swap_free_the_driver_kills_it_as_out_of_memory() {
         }
     };
     let took = started.elapsed();
-    let want = cap(16 * MIB);
-    // `used` is RAM plus swap at the kill: past the cap by more than the floor.
-    assert!(
-        matches!(outcome, Err(RuntimeError::OutOfMemory { used, limit })
-            if limit == want && used > want + 128 * MIB),
-        "{outcome:?}\n{}",
-        seen.join("\n")
+    assert_swap_kill(
+        &outcome,
+        &logs.text(),
+        cap(16 * MIB),
+        128 * MIB,
+        &seen.join("\n"),
     );
+    drop(logs);
     assert!(took < Duration::from_secs(20), "killed after {took:?}");
     println!("killed {took:?} after the start: {outcome:?}");
     cell.assert_clean(1);
@@ -344,13 +351,21 @@ async fn swapped_below_its_cap_a_lease_is_not_killed() {
 /// swap cache, until a later reclaim drops them). The test then lowers the lease's
 /// `memory.max` to 64 MiB above what it holds in RAM, so the action can reach its cap.
 /// The action reads the file a few times (its page cache hits the cap: `max` grows,
-/// and reclaim drops the clean pages), then holds six new 16 MiB buffers at once,
-/// started 300 ms apart. Together they are more than the lease's RAM and headroom, so
+/// and reclaim drops the clean pages), then holds 24 new 4 MiB buffers at once,
+/// started 500 ms apart. Together they are more than the lease's RAM and headroom, so
 /// at its cap reclaim must push some of the lease into swap: `max` grows and swap
 /// rises in the same interval, with the lease holding far more than the floor in
-/// swap. The absolute-swap rule kills it there. The pieces are small and staggered,
-/// and the headroom wide, because podman-arm's kernel OOM-killed a lease that filled
-/// 64 MiB at once against 16 MiB of headroom (swap writes did not keep up).
+/// swap. The absolute-swap rule kills it there.
+///
+/// The pieces are small and far apart, and the headroom wide, so that one piece at a
+/// time fills at the cap: podman-arm's kernel OOM-killed the lease at the cap this
+/// test sets, with swap free, when it filled 64 MiB at once against 16 MiB of
+/// headroom, and again with six 16 MiB pieces 300 ms apart against 64 MiB (80 MB
+/// charged within one 200 ms sample, then `memory.events` `oom 1`, `oom_kill 13`).
+/// The driver reports such a kill as the lease's own out-of-memory kill, rightly: its
+/// cap ran the OOM killer. The swap watch's kill is `cgroup.kill`, which counts no
+/// `oom_kill`, so when the cell's `oom_kill` grew during the run the test fails on
+/// that premise, naming the kernel, rather than as a kill by the watch.
 ///
 /// What the lease can push into swap itself at its cap is bounded: what it held in
 /// RAM after the reclaim, its cap's headroom, the 96 MiB of buffers and a little
@@ -368,8 +383,8 @@ async fn swapped_by_the_host_then_at_its_cap_a_lease_is_not_killed() {
     // The buffer the host swaps out; the buffers the action holds at its cap (`PIECES`
     // of `PIECE`), the headroom it is given there, and what `cat` and the shell may add.
     const BUFFER: u64 = 300 * MIB;
-    const PIECE: u64 = 16 * MIB;
-    const PIECES: u64 = 6;
+    const PIECE: u64 = 4 * MIB;
+    const PIECES: u64 = 24;
     const PUSH: u64 = PIECE * PIECES;
     const HEADROOM: u64 = 64 * MIB;
     const SLACK: u64 = 8 * MIB;
@@ -385,8 +400,8 @@ async fn swapped_by_the_host_then_at_its_cap_a_lease_is_not_killed() {
          dd if=/dev/zero of=f bs=1M count=128 2>/dev/null; sync; sleep 15; i=0; \
          while [ $i -lt 5 ]; do cat f >/dev/null; i=$((i + 1)); done; \
          rm -f f; i=0; while [ $i -lt {PIECES} ]; do \
-         dd if=/dev/urandom bs={piece}M count=1 iflag=fullblock 2>/dev/null | sleep 4 & \
-         sleep 0.3; i=$((i + 1)); done; wait; }}",
+         dd if=/dev/urandom bs={piece}M count=1 iflag=fullblock 2>/dev/null | sleep 15 & \
+         sleep 0.5; i=$((i + 1)); done; wait; }}",
         buffer = BUFFER / MIB,
         piece = PIECE / MIB,
     ));
@@ -446,14 +461,15 @@ async fn swapped_by_the_host_then_at_its_cap_a_lease_is_not_killed() {
         reclaims.join("\n")
     );
     write(&lease, "memory.max", &(ram + HEADROOM).to_string());
-    let max_events = |lease: &Path| {
+    let events = |lease: &Path, key: &str| {
         std::fs::read_to_string(lease.join("memory.events"))
             .ok()
             .and_then(|t| {
                 t.lines()
-                    .find_map(|l| l.strip_prefix("max ")?.parse::<u64>().ok())
+                    .find_map(|l| l.strip_prefix(key)?.strip_prefix(' ')?.parse::<u64>().ok())
             })
     };
+    let max_events = |lease: &Path| events(lease, "max");
     assert_eq!(
         max_events(&lease),
         Some(0),
@@ -465,7 +481,12 @@ async fn swapped_by_the_host_then_at_its_cap_a_lease_is_not_killed() {
     // swap it held in the first sample that counted `max` events, and whether between
     // two samples its `max` events grew and its swap rose (where the absolute-swap
     // rule kills). A sample that cannot be read (after the action's exit, the lease
-    // cgroup is gone) counts nothing.
+    // cgroup is gone) counts nothing. And the processes the kernel's OOM killer killed
+    // in the cell meanwhile: the cell's `memory.events` counts its leases' kills too,
+    // and stays readable after the driver removes the lease cgroup, which on
+    // podman-x86 came within one sample of the kill.
+    let cell_kills = || events(&cell.cgroup, "oom_kill").unwrap_or(0);
+    let kills_before = cell_kills();
     let mut seen = Vec::new();
     let mut at_cap = 0;
     let mut swap_at_cap = None;
@@ -492,7 +513,16 @@ async fn swapped_by_the_host_then_at_its_cap_a_lease_is_not_killed() {
             }
         }
     };
-    let result = outcome.unwrap_or_else(|e| panic!("{e:?}\n{}", seen.join("\n")));
+    let kernel_kills = cell_kills().saturating_sub(kills_before);
+    let result = match outcome {
+        Ok(result) => result,
+        Err(e) if kernel_kills > 0 => panic!(
+            "the premise: the kernel's OOM killer does not run at the cap this test sets; \
+             it killed {kernel_kills} process(es), and the driver reported that as {e:?}: {}",
+            seen.join("\n")
+        ),
+        Err(e) => panic!("{e:?}\n{}", seen.join("\n")),
+    };
     assert_eq!(result.exit_code, 0, "{result:?}\n{}", seen.join("\n"));
     assert!(
         at_cap > 0,

@@ -186,7 +186,7 @@ its exit code. Its errors map to the `Result` status the server sees:
 | `RuntimeError` | `Result` status |
 |---|---|
 | `Killed` | `ABORTED` |
-| `TimedOut` | `DEADLINE_EXCEEDED` |
+| `TimedOut { stdout, stderr }` | `DEADLINE_EXCEEDED`, with an `action_result` holding the two log digests the driver stored (the partial result), unless it stored neither |
 | `Invalid(why)` | `INVALID_ARGUMENT`: the client's error, never retried |
 | `MissingBlob(digest)` | `FAILED_PRECONDITION` with a `MISSING` violation |
 | `Failed(why)` | `INTERNAL`: the farm's failure |
@@ -238,14 +238,20 @@ never reused. Each lease goes through six steps.
      `Directory` messages is checked (no slash, `.`, `..` or NUL; no name twice) and
      files are created exclusively in directories the driver made, so no write follows
      a symlink the input tree planted.
-   - Refuse an action whose output path already exists in the input root, and one whose
-     working directory is hidden by an input file or symlink of the same name, as
-     `INVALID_ARGUMENT`.
+   - Refuse an action whose working directory is hidden by an input file or symlink of
+     the same name, as `INVALID_ARGUMENT`.
+   - Move each entry of the input root that an output path names, whole, into the
+     overlay's upper directory, then make the working directory and each output's
+     parent there (see Output collection). A parent made through a symlink is refused
+     as `INVALID_ARGUMENT`.
    - Give the overlay's directories to the container's root (see User namespaces).
    - Make the lease cgroup (below).
 2. **Start.** `podman create`, then `podman start --attach`, with stdout and stderr
    written to files in the scratch directory.
-3. **Watch.** Wait for the container to exit, the action's timeout, or `kill`.
+3. **Watch.** Wait for the container to exit, the action's timeout, or `kill`. On a
+   timeout, once the container is stopped, store what it wrote to stdout and stderr in
+   the CAS, each within the stdio limit; a log past the limit, or one that cannot be
+   stored, is left out, and the lease still ends `TimedOut`.
 4. **Collect.** Read the exit code from Podman's record of the container. If it is 137
    (SIGKILL), or there is none, and the lease cgroup's `memory.events` counts an
    `oom_kill`, the lease fails as out of memory or as killed on a busy node (see
@@ -253,6 +259,19 @@ never reused. Each lease goes through six steps.
    user, read the outputs (below) and store stdout and stderr in the CAS.
 5. **Clean.** Remove the container, the lease cgroup and the scratch directory.
 6. **Verify clean.** Neither directory may remain.
+
+**Pinned images.** `kbf-daemon --driver container --image docker://<repo>@sha256:<d>`
+(repeatable) names images the node is set up to run. At start, after its cgroup is
+set up and before it connects, the daemon checks each as the prepare step checks a
+lease's image (`PodmanRuntime::check_pinned`): named by digest, in its user's image
+store, and one architecture's manifest. The first that is not stops the daemon with
+exit status 2 and the fix: for a missing image, `podman pull <repo>@sha256:<d>`, to
+run as the daemon's user; for an index digest, to name the per-architecture manifest
+digest. The images are listed, sorted and each once, in the node's `NodeStatus`
+(`container_images`), which `GET /v1/nodes` shows as `software.container_images`. They
+route no work: placement does not match an action's image against them, and an action
+may still name an image the node was not pinned to (it is checked at prepare as
+always). Another driver given `--image` refuses to start (exit status 1).
 
 Cleaning runs on every path out of a lease: success, failure, timeout and kill. If the
 daemon drops a lease's future instead, the lease's destructor cleans up before the
@@ -388,11 +407,40 @@ makes `actions/kbf-lease-<term>-<seq>` and puts the container under it.
 - **Removal** of a lease cgroup that is still busy (a process still exiting) writes
   `cgroup.kill` and retries.
 
+### End to end (the M2 test)
+
+The `m2-container` CI job (`tools/ci/m2-container.sh`, then `crates/kbf-it/m2/run.sh`)
+runs the driver behind the real server and a real client, on a hosted x86_64 runner.
+It pulls distroless `base-debian12` by its linux/amd64 manifest digest (the sample's
+`crates/kbf-it/m2/buck2/.buckconfig` names the same image as `container_image`, which
+its execution platform passes on as `container-image`), starts one `kbf-server` and one
+`kbf-daemon --driver container` as a `Delegate=yes` system service with
+`--actions-memory-max-gib 8`, and builds the sample project with pinned buck2:
+
+- every target remote-only, then again after `buck2 clean`, every action answered from
+  the action cache (`kbf-cell check`, as in M1). The image has no shell, so each action
+  runs `kbf-m2-act`, a statically linked helper that is an input file of the action;
+- `//:hog`, which touches 3 GiB slowly: its first run books the default 1 GiB, presses
+  its 2 GiB cap into swap until the swap watch kills it, and the server's log must
+  hold exactly one requeue from 1 GiB to 2 GiB booked, after which it passes;
+- `//:pause` under a fresh salt: while it sleeps, Podman lists exactly one running
+  container labelled with the node id; afterwards no labelled container and no lease
+  directory is left.
+
 ## Output collection
 
 Outputs are read from the overlay's upper directory, which holds only what the action
-created or changed. That is why no output may already exist in the input root: an
-output read from the upper directory must be whole there.
+created or changed. An output read from there must be whole there, so an output path
+that names an entry of the input root (REAPI allows it; Bazel and Buck2 never send it)
+gets that entry moved from the lower to the upper directory before the overlay is
+mounted. The action sees the same tree; what it changes is changed in place, what it
+deletes is unlinked (no lower entry is left to hide, so no whiteout), and the output
+is read back as the action left it: an unchanged input whole, an edited one with its
+new bytes, a deleted one absent. That is what the native driver collects from its
+input root. Outputs are taken ancestors first, so one below another moves with it. The
+walk to an output follows no symlink and stops at the first component that is absent
+or not a directory: the parent made for the output in the upper directory hides a lower
+file or symlink of that name instead of merging with it.
 
 The upper directory is the action's to shape. It could replace the working directory,
 or any directory on an output's path, with a symlink to a host path

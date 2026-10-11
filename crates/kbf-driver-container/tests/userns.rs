@@ -106,7 +106,7 @@ async fn a_timed_out_lease_is_not_handed_back() {
     spec.timeout = Some(std::time::Duration::from_millis(200));
     let outcome = fake.run(1, &spec, "sleep 30").await;
     assert!(
-        matches!(outcome, Err(RuntimeError::TimedOut)),
+        matches!(outcome, Err(RuntimeError::TimedOut { .. })),
         "{outcome:?}"
     );
     let chowns = chowns(&fake);

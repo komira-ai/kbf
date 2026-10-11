@@ -89,7 +89,7 @@ pub fn describe(dir: &Path) -> String {
 
 /// Shows the driver's logs (its clean errors among them) in a failing test's output.
 fn trace() {
-    let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+    super::swap_kill::trace();
 }
 
 impl Cell {

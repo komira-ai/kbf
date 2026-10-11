@@ -14,9 +14,9 @@ kbf-daemon               35     12
 kbf-driver-container      0      0
 kbf-driver-native         0      0
 kbf-estimator             -      -
-kbf-front                60      8
+kbf-front                55      8
 kbf-guest                15      6
-kbf-it                    2      3
+kbf-it                    2      2
 kbf-log                   2      0
 kbf-mac-session           0      0
 kbf-mdm                   0      0
@@ -35,3 +35,4 @@ kbf-sim-cell              -      -
 kbf-store                 0      0
 kbf-types                 3      2
 kbf-updater               0      0
+kbf-vmm                   0      0

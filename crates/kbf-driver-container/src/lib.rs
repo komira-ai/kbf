@@ -1,5 +1,6 @@
 //! The container driver for `kbf-daemon`: runs each `action` lease in a fresh rootless
-//! Podman container, behind the daemon's `Runtime` trait (RFC section 10).
+//! Podman container, behind the daemon's `Runtime` trait
+//! (`docs/design/daemon.md#the-container-driver`).
 //!
 //! What one lease gets:
 //! - the image named by digest in the action's `container-image` platform property
@@ -24,8 +25,9 @@
 //!   watch that kills a lease which keeps pushing into swap at its own cap, past a
 //!   threshold of swap it pushed there itself (not swap the host moved; [`SwapKill`]), `cpu.weight` from the booked CPU, and `--oom-score-adj=0` on the
 //!   container (the daemon's leaf gets `memory.min`);
-//! - a wall-clock timeout, stdout and stderr captured into the CAS (each within
-//!   `--output-max-stdio-bytes`), the exit code from Podman's record, and a kernel OOM
+//! - a wall-clock timeout, which still stores what the action wrote to stdout and
+//!   stderr ([`kbf_daemon::RuntimeError::TimedOut`]), stdout and stderr captured into
+//!   the CAS (each within `--output-max-stdio-bytes`), the exit code from Podman's record, and a kernel OOM
 //!   kill told apart by the lease cgroup's `memory.events`: a kill at the lease's own
 //!   cap is [`kbf_daemon::RuntimeError::OutOfMemory`], one without it (the `actions/`
 //!   backstop or the host ran short) is [`kbf_daemon::RuntimeError::BusyNode`];
@@ -70,7 +72,7 @@ pub mod tree;
 pub use cas::{CHUNK, FileBlob, MemoryCas};
 pub use cgroup::{SwapKill, cpu_weight, memory_max};
 pub use delegate::{DelegateError, Delegation, adopt, capacity, delegate};
-pub use image::{ImageError, ImageRef};
+pub use image::{ImageCheckError, ImageError, ImageRef};
 pub use outputs::OutputLimits;
 pub use podman::{ContainerLimits, EXEC_ROOT, OWNER_LABEL};
 pub use runtime::{ConfigError, DRIVER, KIND, PodmanConfig, PodmanRuntime, StartError};

@@ -7,8 +7,8 @@ use kbf_daemon::CasError;
 use kbf_daemon::cas::digest_of;
 use kbf_driver_container::MemoryCas;
 use kbf_driver_container::tree::{
-    Exceeded, OutputLimits, TreeError, collect, materialize, output_paths,
-    refuse_hidden_working_directory, refuse_outputs_in_inputs,
+    Exceeded, OutputLimits, TreeError, collect, materialize, output_paths, prepare_outputs,
+    refuse_hidden_working_directory,
 };
 use kbf_proto::reapi::{
     ActionResult, Command, Directory, DirectoryNode, FileNode, OutputSymlink, SymlinkNode, Tree,
@@ -240,57 +240,92 @@ fn output_paths_old_and_new() {
     }
 }
 
-/// Catches an output that is already an input being run: the driver reads outputs from
-/// the overlay's upper layer, which lacks the unchanged inputs, so the result would be
-/// cached incomplete. Also catches the opposite defect, a path that only passes
-/// through an input (a parent that is an input directory, or a component that is an
-/// input file or symlink the driver's upper directory hides) being refused, a symlink
-/// in the input root being followed out of it, and an unreadable input directory read
-/// as "no overlap".
+/// Catches an input an output names left in the lower layer, where the action's
+/// changes would be copy-ups and whiteouts and the upper layer would hold the output
+/// partial (moved: `pkg/in.txt`, the directory `pkg/sub` with what is in it, the
+/// symlink `pkg/escape` itself, `top.txt` with no working directory), or moved to the
+/// wrong place in the upper layer. Also catches the opposite defect: an input beside
+/// the outputs moved up (`pkg/stay.txt`), or one an output only passes through (the
+/// working directory `pkg`, an input file or symlink on an output's path, which the
+/// parent made in the upper layer hides) moved or refused; a symlink in the input root
+/// followed out of it; outputs taken in the client's order rather than ancestors first
+/// (`sub/deep/d.txt` moved up first, `sub` cannot move onto the parent made for it); a
+/// parent made through an input symlink that an output moved up; and an unreadable
+/// input directory read as "nothing to move".
 #[tokio::test]
-async fn outputs_that_are_inputs_are_refused() {
+async fn inputs_named_as_outputs_move_whole_to_the_upper_layer() {
     use std::os::unix::fs::{PermissionsExt, symlink};
 
-    let root = support::scratch("tree-overlap");
-    let outside = support::scratch("tree-overlap-outside");
-    std::fs::create_dir_all(root.join("pkg/sub")).expect("mkdir");
+    let outside = support::scratch("tree-lift-outside");
     std::fs::create_dir_all(outside.join("x")).expect("mkdir outside");
-    std::fs::write(root.join("pkg/in.txt"), b"in").expect("write");
-    std::fs::write(root.join("file"), b"f").expect("write");
-    symlink(&outside, root.join("pkg/escape")).expect("symlink");
-    let check = |wd: &'static str, output: &str| {
-        let root = root.clone();
-        let outputs = vec![output.to_owned()];
-        async move { refuse_outputs_in_inputs(&root, wd, &outputs).await }
+    let layers = |name: &str| {
+        let root = support::scratch(&format!("tree-lift-{name}"));
+        std::fs::create_dir_all(root.join("pkg/sub/deep")).expect("mkdir");
+        std::fs::write(root.join("pkg/sub/deep/d.txt"), b"d").expect("write");
+        std::fs::write(root.join("pkg/in.txt"), b"in").expect("write");
+        std::fs::write(root.join("pkg/stay.txt"), b"stay").expect("write");
+        std::fs::write(root.join("top.txt"), b"top").expect("write");
+        std::fs::write(root.join("file"), b"f").expect("write");
+        symlink(&outside, root.join("pkg/escape")).expect("symlink");
+        (root, support::scratch(&format!("tree-lift-{name}-upper")))
     };
-    for (wd, output) in [
-        ("", "pkg"),
-        ("", "pkg/in.txt"),
-        ("pkg", "in.txt"),
-        ("pkg", "sub"),
-        ("pkg", "escape"),
-    ] {
-        let outcome = check(wd, output).await;
-        assert!(
-            matches!(outcome, Err(TreeError::Invalid(ref why)) if why.contains(output)),
-            "{wd:?} {output:?}: {outcome:?}"
-        );
-    }
-    for (wd, output) in [
-        ("", "out"),
-        ("", "pkg/new"),
-        ("pkg", "sub/new/deeper"),
-        ("absent", "pkg"),
-        ("", "file/x"),
-        ("pkg", "escape/x"),
-    ] {
-        let outcome = check(wd, output).await;
-        assert!(outcome.is_ok(), "{wd:?} {output:?}: {outcome:?}");
-    }
+    let paths = |paths: &[&str]| paths.iter().map(|p| (*p).to_owned()).collect::<Vec<_>>();
 
+    let (root, upper) = layers("moved");
+    let outputs = paths(&["sub/deep/d.txt", "in.txt", "sub", "escape"]);
+    prepare_outputs(&root, &upper, "pkg", &outputs)
+        .await
+        .expect("moved");
+    assert_eq!(std::fs::read(upper.join("pkg/in.txt")).expect("in"), b"in");
+    assert_eq!(
+        std::fs::read(upper.join("pkg/sub/deep/d.txt")).expect("d"),
+        b"d"
+    );
+    assert_eq!(
+        std::fs::read_link(upper.join("pkg/escape")).expect("link"),
+        outside
+    );
+    for gone in ["pkg/in.txt", "pkg/sub", "pkg/escape"] {
+        assert!(!exists(&root.join(gone)), "{gone} left in the lower layer");
+    }
+    assert!(exists(&root.join("pkg/stay.txt")) && !exists(&upper.join("pkg/stay.txt")));
+    assert!(exists(&outside.join("x")));
+
+    let (root, upper) = layers("through-link");
+    let outcome = prepare_outputs(&root, &upper, "pkg", &paths(&["escape", "escape/x/new"])).await;
+    assert!(
+        matches!(outcome, Err(TreeError::Invalid(ref why)) if why.contains("escape")),
+        "{outcome:?}"
+    );
+    assert!(
+        !exists(&outside.join("x/new")),
+        "the moved symlink was followed"
+    );
+
+    let (root, upper) = layers("hidden");
+    let outputs = paths(&["new/deeper", "escape/x", "escape/x/new"]);
+    prepare_outputs(&root, &upper, "pkg", &outputs)
+        .await
+        .expect("nothing to move");
+    assert!(upper.join("pkg/new").is_dir() && upper.join("pkg/escape/x").is_dir());
+    assert!(
+        exists(&outside.join("x")) && !exists(&outside.join("x/new")),
+        "the input symlink was followed"
+    );
+    assert!(exists(&root.join("pkg/escape")) && exists(&root.join("pkg/in.txt")));
+
+    let (root, upper) = layers("top");
+    prepare_outputs(&root, &upper, "", &paths(&["file/x", "top.txt"]))
+        .await
+        .expect("moved");
+    assert!(upper.join("file").is_dir() && exists(&root.join("file")));
+    assert_eq!(std::fs::read(upper.join("top.txt")).expect("top"), b"top");
+    assert!(!exists(&root.join("top.txt")) && exists(&root.join("pkg/in.txt")));
+
+    let (root, upper) = layers("locked");
     std::fs::set_permissions(root.join("pkg"), std::fs::Permissions::from_mode(0o000))
         .expect("chmod");
-    let outcome = check("", "pkg/in.txt").await;
+    let outcome = prepare_outputs(&root, &upper, "", &paths(&["pkg/in.txt"])).await;
     std::fs::set_permissions(root.join("pkg"), std::fs::Permissions::from_mode(0o755))
         .expect("chmod back");
     assert!(matches!(outcome, Err(TreeError::Io { .. })), "{outcome:?}");

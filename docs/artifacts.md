@@ -94,10 +94,13 @@ signed by `ci.yml`, and a copy with one flipped byte. If either verifies, the jo
 That works without an Apple Developer account, and the job checks it every run:
 `codesign --verify --strict` passes, the signed binary runs (`kbf-daemon --version`
 exits 0 with no `DYLD_*` variable set, on every runner), the code directory's flags are
-exactly `adhoc,runtime`, the signature has no entitlements, and the binary's minimum
+exactly `adhoc,runtime`, the signature carries exactly the entitlements the allow
+list `tools/ci/darwin-entitlements.txt` gives the binary (none for `kbf-daemon`; only
+the `kbf-vmm` stub gets one, `com.apple.security.virtualization`;
+[macos-vm-guests.md](design/macos-vm-guests.md) section 7), and the binary's minimum
 macOS is 14.0. After packaging, `tools/ci/check-darwin-asset.sh` takes the binary
 back out of its tarball, the bytes that ship, and checks it again: `codesign --verify
---strict`, the flags, and a run of `--version`.
+--strict`, the flags, a run of `--version`, and the entitlements against the list.
 
 What it gives:
 

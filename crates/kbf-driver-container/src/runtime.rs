@@ -1,10 +1,12 @@
 //! [`PodmanRuntime`]: one action, one fresh rootless Podman container, never reused.
 //!
-//! Each lease goes through the six driver steps (RFC 10.1):
+//! Each lease goes through the six driver steps
+//! (`docs/design/daemon.md#the-container-driver`):
 //! 1. **prepare:** fetch the Action and Command, check the image and paths, write the
-//!    input root into the lease's scratch directory, refuse outputs that are inputs,
-//!    give the overlay's directories to the container's root (a subordinate id, see
-//!    `podman::create_args`), make the lease cgroup;
+//!    input root into the lease's scratch directory, move each input an output names
+//!    into the overlay's upper directory, give the overlay's directories to the
+//!    container's root (a subordinate id, see `podman::create_args`), make the lease
+//!    cgroup;
 //! 2. **start:** `podman create`, then `podman start --attach`;
 //! 3. **watch:** wait for the exit, the timeout, [`Runtime::kill`], or a lease that
 //!    keeps pressing its own memory cap into swap ([`SwapKill`]), which the driver
@@ -32,7 +34,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
-use kbf_daemon::cas::Cas;
+use kbf_daemon::cas::{Cas, CasError};
 use kbf_daemon::{Runtime, RuntimeError, Work};
 use kbf_proto::reapi::{Action, ActionResult, Command, Platform};
 use kbf_types::LeaseId;
@@ -40,7 +42,9 @@ use tokio::process::Child;
 use tokio::sync::oneshot;
 
 use crate::cgroup::{LeaseCgroup, SwapKill, memory_max, presses_into_swap};
-use crate::image::{ImageRef, ManifestKind, PROPERTY, manifest_file, manifest_kind};
+use crate::image::{
+    ImageCheckError, ImageRef, ManifestKind, PROPERTY, manifest_file, manifest_kind,
+};
 use crate::outputs::{OutputLimits, collect_log};
 use crate::podman::{
     CONTAINER_OWNER, ContainerLimits, ContainerSpec, DAEMON_OWNER, Ended, LEASE_PREFIX, Podman,
@@ -48,8 +52,8 @@ use crate::podman::{
 use crate::program;
 use crate::remove::remove_tree;
 use crate::tree::{
-    TreeError, check_relative, collect, fetch_message, materialize, output_paths,
-    refuse_hidden_working_directory, refuse_outputs_in_inputs,
+    TreeError, check_relative, collect, fetch_message, materialize, output_paths, prepare_outputs,
+    refuse_hidden_working_directory,
 };
 
 /// The driver name in the node report.
@@ -71,7 +75,7 @@ pub struct PodmanConfig {
     pub cgroup_parent: String,
     /// The timeout of an action that names none.
     pub default_timeout: Duration,
-    /// How long a container gets after SIGTERM before `cgroup.kill` (RFC 10.10).
+    /// How long a container gets after SIGTERM before `cgroup.kill`.
     pub kill_grace: Duration,
     /// How much output one action may leave; past it, the action fails.
     pub outputs: OutputLimits,
@@ -88,7 +92,7 @@ pub struct PodmanConfig {
 
 impl PodmanConfig {
     /// A configuration for `owner`'s containers with `podman` from `PATH`, cgroup v2 at
-    /// `/sys/fs/cgroup`, a one hour default timeout, the RFC's five second kill grace,
+    /// `/sys/fs/cgroup`, a one hour default timeout, a five second kill grace,
     /// the default [`OutputLimits`], [`ContainerLimits::DEFAULT`] and
     /// [`SwapKill::DEFAULT`].
     #[must_use]
@@ -259,20 +263,11 @@ impl<C: Cas> PodmanRuntime<C> {
         refuse_hidden_working_directory(&root, &command.working_directory)
             .await
             .map_err(tree_error)?;
-        // Outputs are read from the upper layer, so none may already be an input.
-        refuse_outputs_in_inputs(&root, &command.working_directory, &outputs)
+        // Outputs are read from the upper layer: an input an output names moves there
+        // whole, and the working directory and each output's parent are made there.
+        prepare_outputs(&root, &upper, &command.working_directory, &outputs)
             .await
             .map_err(tree_error)?;
-        // REAPI: the worker makes the working directory and each output's parent.
-        let out_dir = upper.join(&command.working_directory);
-        let parents = outputs
-            .iter()
-            .filter_map(|output| Path::new(output).parent().map(|p| out_dir.join(p)));
-        for dir in std::iter::once(out_dir.clone()).chain(parents) {
-            tokio::fs::create_dir_all(&dir)
-                .await
-                .map_err(|e| failed(&dir, &e))?;
-        }
         // The container's root is a subordinate id (`--userns=nomap`), which may write
         // only under directories it owns.
         self.podman
@@ -361,7 +356,7 @@ impl<C: Cas> PodmanRuntime<C> {
             _ = child.wait() => {}
             () = tokio::time::sleep(timeout) => {
                 self.stop_container(&lease.name, &lease.cgroup, child).await;
-                return Err(RuntimeError::TimedOut);
+                return Err(self.timed_out(&lease.name, &stdout_path, &stderr_path).await);
             }
             Ok(by) = &mut *stop => {
                 *killer = Some(by);
@@ -427,13 +422,13 @@ impl<C: Cas> PodmanRuntime<C> {
             &mut result,
         )
         .await
-        .map_err(tree_error)?;
+        .map_err(outputs_error)?;
         let max = self.config.outputs.max_stdio_bytes;
         for (path, slot) in [
             (&stdout_path, &mut result.stdout_digest),
             (&stderr_path, &mut result.stderr_digest),
         ] {
-            *slot = Some(collect_log(cas, path, max).await.map_err(tree_error)?);
+            *slot = Some(collect_log(cas, path, max).await.map_err(outputs_error)?);
         }
         Ok(result)
     }
@@ -441,35 +436,59 @@ impl<C: Cas> PodmanRuntime<C> {
     /// Checks that this node's image store holds `image` and that its digest names one
     /// image, not an index: by reading the manifest the store keeps under that digest.
     async fn check_image(&self, image: &ImageRef) -> Result<(), RuntimeError> {
+        self.check_pinned(image).await.map_err(|e| match e {
+            ImageCheckError::Index(_) => RuntimeError::Invalid(e.to_string()),
+            ImageCheckError::Missing(_) | ImageCheckError::Failed(_) => {
+                RuntimeError::Failed(e.to_string())
+            }
+        })
+    }
+
+    /// Checks, as each lease's prepare step does, that this node's image store holds
+    /// `image` and that its digest names one architecture's manifest, not an index. The
+    /// daemon checks each image it is pinned to (`--image`) once at start with it.
+    pub async fn check_pinned(&self, image: &ImageRef) -> Result<(), ImageCheckError> {
         let Some(id) = self
             .podman
             .image_id(&image.to_string())
             .await
-            .map_err(RuntimeError::Failed)?
+            .map_err(ImageCheckError::Failed)?
         else {
-            return Err(RuntimeError::Failed(format!(
-                "image {image} is not in this node's image store"
-            )));
+            return Err(ImageCheckError::Missing(image.clone()));
         };
         let images = self
             .images
             .get_or_try_init(|| self.podman.images_dir())
             .await
-            .map_err(RuntimeError::Failed)?;
+            .map_err(ImageCheckError::Failed)?;
         let path = images.join(&id).join(manifest_file(image.digest()));
         let bytes = tokio::fs::read(&path).await.map_err(|e| {
-            RuntimeError::Failed(format!(
+            ImageCheckError::Failed(format!(
                 "the image store holds no manifest {} for image {id}: {e}",
                 image.digest()
             ))
         })?;
-        match manifest_kind(&bytes, image.digest()).map_err(RuntimeError::Failed)? {
+        match manifest_kind(&bytes, image.digest()).map_err(ImageCheckError::Failed)? {
             ManifestKind::Image => Ok(()),
-            ManifestKind::Index => Err(RuntimeError::Invalid(format!(
-                "container-image {image} names an image index; name the per-architecture \
-                 manifest digest"
-            ))),
+            ManifestKind::Index => Err(ImageCheckError::Index(image.clone())),
         }
+    }
+
+    /// [`RuntimeError::TimedOut`] with what the stopped action wrote to stdout and
+    /// stderr, each stored within the stdio limit (REAPI's partial result). A log past
+    /// the limit, or one that cannot be stored, is left out: the answer is still the
+    /// timeout.
+    async fn timed_out(&self, name: &str, stdout: &Path, stderr: &Path) -> RuntimeError {
+        let max = self.config.outputs.max_stdio_bytes;
+        let mut logs = [None, None];
+        for (path, slot) in [stdout, stderr].into_iter().zip(&mut logs) {
+            match collect_log(&*self.cas, path, max).await {
+                Ok(digest) => *slot = Some(digest),
+                Err(e) => tracing::warn!(lease = %name, "timed out; its log is left out: {e}"),
+            }
+        }
+        let [stdout, stderr] = logs;
+        RuntimeError::TimedOut { stdout, stderr }
     }
 
     /// The swap watch's kill: `cgroup.kill` at once (the lease is over its cap, so no
@@ -488,7 +507,7 @@ impl<C: Cas> PodmanRuntime<C> {
         }
     }
 
-    /// The kill path (RFC 10.10): SIGTERM, the grace period, `cgroup.kill`, then the
+    /// The kill path: SIGTERM, the grace period, `cgroup.kill`, then the
     /// grace period again for Podman to notice. Returns once `podman start` has ended.
     async fn stop_container(&self, name: &str, cgroup: &LeaseCgroup, child: &mut Child) {
         let grace = self.config.kill_grace;
@@ -784,7 +803,20 @@ fn timeout_of(action: &Action, default: Duration) -> Result<Duration, RuntimeErr
     Ok(if timeout.is_zero() { default } else { timeout })
 }
 
+/// A [`TreeError`] reading the action's inputs, as the lease reports it: a missing
+/// blob is the client's to upload, a broken rule is the client's error, and anything
+/// else is the farm's.
 fn tree_error(error: TreeError) -> RuntimeError {
+    match error {
+        TreeError::Cas(CasError::Missing(blob)) => RuntimeError::MissingBlob(blob),
+        other => outputs_error(other),
+    }
+}
+
+/// A [`TreeError`] storing the action's outputs, as the lease reports it: a broken
+/// rule is the client's error and anything else, a missing blob included (it is not
+/// the client's to upload), is the farm's.
+fn outputs_error(error: TreeError) -> RuntimeError {
     match error {
         TreeError::Invalid(why) => RuntimeError::Invalid(why),
         other => RuntimeError::Failed(other.to_string()),
@@ -1021,5 +1053,29 @@ mod tests {
             .expect_err("the task panicked");
         let why = clean_task_failed(panicked);
         assert!(why.starts_with("clean task: "), "{why}");
+    }
+
+    /// Catches an error reported as the wrong party's: a missing input as anything but
+    /// `MissingBlob` with its digest (#130: the client never uploads it), a missing
+    /// blob while storing outputs as the client's to upload, a corrupt input as
+    /// missing, and a broken rule as the farm's. (Compared as text: a pattern guard
+    /// would be a branch the coverage ratchet counts and no run takes.)
+    #[test]
+    fn errors_are_reported_as_whose_they_are() {
+        let shown = |e: RuntimeError| format!("{e:?}");
+        let missing = || TreeError::Cas(CasError::Missing("ab/1".to_owned()));
+        assert_eq!(shown(tree_error(missing())), "MissingBlob(\"ab/1\")");
+        assert_eq!(
+            shown(outputs_error(missing())),
+            "Failed(\"blob ab/1 is not in the CAS\")"
+        );
+        let corrupt = TreeError::Cas(CasError::Corrupt("a".into(), "b".into()));
+        assert_eq!(
+            shown(tree_error(corrupt)),
+            "Failed(\"blob a failed verification: its bytes hash to b\")"
+        );
+        for map in [tree_error, outputs_error] {
+            assert_eq!(shown(map(TreeError::Invalid("x".into()))), "Invalid(\"x\")");
+        }
     }
 }

@@ -7,7 +7,8 @@
 //! The lease directory is made if it is missing, with the lease's home, temporary and
 //! cache directories in it, as the driver makes them (`kbf_driver_native::home`). The
 //! profile comes from [`Isolation::wrap`] with the network on, so it is
-//! [`kbf_driver_native::network::BASE_PROFILE`] followed by the rules for this user's
+//! [`kbf_driver_native::network::BASE_PROFILE`], then
+//! [`kbf_driver_native::network::NO_DEVICE_RULES`], then the rules for this user's
 //! folders ([`UserFolders::rules`], none off macOS): the bytes the driver passes to
 //! `sandbox-exec -p`, not a copy of them. Into `--out` go:
 //!
