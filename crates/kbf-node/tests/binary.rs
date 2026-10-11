@@ -913,8 +913,9 @@ fn container_flags(dir: &Path, ids: &Path, images: &[String]) -> Vec<String> {
 /// cannot run on it, instead of exiting with status 2 and the fix: an image missing
 /// from its store started anyway (warned about and continued), its refusal without the
 /// `podman pull <repo>@sha256:<digest>` that fixes it, an image index digest taken for
-/// one architecture's manifest (`manifest_kind` not asked), a tag accepted, and only
-/// the first `--image` checked (a good image first, an index second). Each daemon
+/// one architecture's manifest (`manifest_kind` not asked), a tag accepted, only the
+/// first `--image` checked (a good image first, an index second), and only the last
+/// one deciding (an index first, a good image second). Each daemon
 /// still running after 30 s has started, and fails the test. Linux only, as the
 /// driver is.
 #[cfg(target_os = "linux")]
@@ -926,7 +927,7 @@ fn a_container_node_refuses_to_start_on_an_image_it_cannot_run() {
     let index = "names an image index; name the per-architecture manifest digest";
     /// (name, the images, what the stub's store holds, what the refusal says)
     type Case = (&'static str, Vec<String>, &'static [&'static [u8]], String);
-    let cases: [Case; 4] = [
+    let cases: [Case; 5] = [
         (
             "image-missing",
             vec![image_of(MANIFEST)],
@@ -949,6 +950,12 @@ fn a_container_node_refuses_to_start_on_an_image_it_cannot_run() {
             "image-second",
             vec![image_of(MANIFEST), image_of(INDEX)],
             &[MANIFEST, INDEX],
+            index.to_owned(),
+        ),
+        (
+            "image-first",
+            vec![image_of(INDEX), image_of(MANIFEST)],
+            &[INDEX, MANIFEST],
             index.to_owned(),
         ),
     ];
