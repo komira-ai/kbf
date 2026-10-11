@@ -5,6 +5,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::*;
+use crate::autologin::SessionPaths;
 use crate::client::{Client, ClientError, Exit};
 use crate::helper::Settings;
 use crate::lease::UidRange;
@@ -79,6 +80,11 @@ fn served(name: &str, verdict: Result<(), String>) -> Served {
 }
 
 fn served_with(name: &str, check: Arc<Scripted>) -> Served {
+    served_from(name, check, true)
+}
+
+/// A helper served on a socket, its boot reset done if `reset`.
+fn served_from(name: &str, check: Arc<Scripted>, reset: bool) -> Served {
     trace();
     let dir = scratch(&format!("server-{name}"));
     std::fs::create_dir(dir.join("Users")).unwrap();
@@ -97,9 +103,14 @@ fn served_with(name: &str, check: Arc<Scripted>) -> Served {
         },
         grant_keys: None,
         serial: "S".to_owned(),
+        session: SessionPaths::under(&dir),
     };
     let ledger = Ledger::open(&dir.join("ledger")).unwrap();
     let helper = Arc::new(Helper::new(Box::new(host.clone()), settings, ledger));
+    if reset {
+        helper.boot_reset(&[]).unwrap();
+        host.state().log.clear();
+    }
     let socket = dir.join("run/socket");
     let listener = bind(&socket, my_gid()).unwrap();
     let check: Arc<dyn CallerCheck> = check;
@@ -147,6 +158,29 @@ fn a_linked_or_missing_directory_is_refused() {
     assert!(error.to_string().contains("needs a name"), "{error}");
     std::fs::create_dir(dir.join("elsewhere/socket")).unwrap();
     assert!(bind(&dir.join("elsewhere/socket"), my_gid()).is_err());
+}
+
+/// Catches: the session switch or the boot reset answered with the wrong reply over
+/// the socket, or a refusal of either taken by the client as success.
+#[test]
+fn the_switch_and_the_reset_work_over_the_socket() {
+    let served = served_from("switch", Scripted::fixed(Ok(())), false);
+    let client = &served.client;
+    assert_eq!(client.boot_reset(&[]).unwrap(), (None, Vec::new()));
+    match client.boot_reset(&[]) {
+        Err(ClientError::Refused(why)) => assert!(why.contains("runs once"), "{why}"),
+        other => panic!("a second reset: {other:?}"),
+    }
+    match client.session_login("1.1") {
+        Err(ClientError::Refused(why)) => assert!(why.contains("has no user"), "{why}"),
+        other => panic!("a login without a user: {other:?}"),
+    }
+    client.user_create("1.1", None).unwrap();
+    client.session_login("1.1").unwrap();
+    client.session_idle().unwrap();
+    let log = served.host.state().log.clone();
+    let restarts = log.iter().filter(|call| call.contains("reboot userspace"));
+    assert_eq!(restarts.count(), 2, "{log:#?}");
 }
 
 /// The four verbs end to end over the socket, descriptors included.
@@ -529,6 +563,7 @@ fn serve_returns_when_accept_fails() {
             },
             grant_keys: None,
             serial: "S".to_owned(),
+            session: SessionPaths::under(&dir),
         };
         Arc::new(Helper::new(Box::new(FakeHost::default()), settings, ledger))
     };
@@ -581,6 +616,7 @@ fn quiet_helper(dir: &Path) -> Helper {
         },
         grant_keys: None,
         serial: "S".to_owned(),
+        session: SessionPaths::under(dir),
     };
     Helper::new(Box::new(FakeHost::default()), settings, ledger)
 }
