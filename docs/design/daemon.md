@@ -176,8 +176,9 @@ guaranteed:
   manager is the only other line. Under systemd, a unit's default
   `KillMode=control-group` kills everything left in the unit's cgroup when its main
   process dies, the native driver's actions included, and the containers' processes
-  too when their cgroups are in the unit's delegated subtree; the repository ships no
-  unit yet. launchd, when a job exits, kills only the job's own process group
+  too when their cgroups are in the unit's delegated subtree, as under the units the
+  deploy guides give ([linux-build-host.md](../deploy/linux-build-host.md#the-units),
+  [storage-node.md](../deploy/storage-node.md)), which keep that default. launchd, when a job exits, kills only the job's own process group
   (`AbandonProcessGroup` false, the default; true stops even that), and has no
   setting that reaches an action leading a group of its own, so on a Mac the shipped
   plist's `KeepAlive` restart is the line after the keeper.
@@ -288,6 +289,19 @@ never reused. Each lease goes through six steps.
    user, read the outputs (below) and store stdout and stderr in the CAS.
 5. **Clean.** Remove the container, the lease cgroup and the scratch directory.
 6. **Verify clean.** Neither directory may remain.
+
+**Pinned images.** `kbf-daemon --driver container --image docker://<repo>@sha256:<d>`
+(repeatable) names images the node is set up to run. At start, after its cgroup is
+set up and before it connects, the daemon checks each as the prepare step checks a
+lease's image (`PodmanRuntime::check_pinned`): named by digest, in its user's image
+store, and one architecture's manifest. The first that is not stops the daemon with
+exit status 2 and the fix: for a missing image, `podman pull <repo>@sha256:<d>`, to
+run as the daemon's user; for an index digest, to name the per-architecture manifest
+digest. The images are listed, sorted and each once, in the node's `NodeStatus`
+(`container_images`), which `GET /v1/nodes` shows as `software.container_images`. They
+route no work: placement does not match an action's image against them, and an action
+may still name an image the node was not pinned to (it is checked at prepare as
+always). Another driver given `--image` refuses to start (exit status 1).
 
 Cleaning runs on every path out of a lease: success, failure, timeout and kill. If the
 daemon drops a lease's future instead, the lease's destructor cleans up before the
@@ -422,6 +436,26 @@ makes `actions/kbf-lease-<term>-<seq>` and puts the container under it.
     - No `oom_kill`: an exit 137 is the action's own result.
 - **Removal** of a lease cgroup that is still busy (a process still exiting) writes
   `cgroup.kill` and retries.
+
+### End to end (the M2 test)
+
+The `m2-container` CI job (`tools/ci/m2-container.sh`, then `crates/kbf-it/m2/run.sh`)
+runs the driver behind the real server and a real client, on a hosted x86_64 runner.
+It pulls distroless `base-debian12` by its linux/amd64 manifest digest (the sample's
+`crates/kbf-it/m2/buck2/.buckconfig` names the same image as `container_image`, which
+its execution platform passes on as `container-image`), starts one `kbf-server` and one
+`kbf-daemon --driver container` as a `Delegate=yes` system service with
+`--actions-memory-max-gib 8`, and builds the sample project with pinned buck2:
+
+- every target remote-only, then again after `buck2 clean`, every action answered from
+  the action cache (`kbf-cell check`, as in M1). The image has no shell, so each action
+  runs `kbf-m2-act`, a statically linked helper that is an input file of the action;
+- `//:hog`, which touches 3 GiB slowly: its first run books the default 1 GiB, presses
+  its 2 GiB cap into swap until the swap watch kills it, and the server's log must
+  hold exactly one requeue from 1 GiB to 2 GiB booked, after which it passes;
+- `//:pause` under a fresh salt: while it sleeps, Podman lists exactly one running
+  container labelled with the node id; afterwards no labelled container and no lease
+  directory is left.
 
 ## Output collection
 

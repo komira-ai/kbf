@@ -361,10 +361,14 @@ async fn the_swap_kill_ends_even_when_cgroup_kill_fails() {
     });
     // The lease cgroup goes read-only before its `max` events start to grow, and
     // writable again 300 ms later, after the watch's kill and before the grace ends.
-    // The swap goes out while the `max` events grow (from the second step on), so it
-    // is the lease's own at any sampling: swap already out before the cap is pressed
-    // is the host's and kills nothing.
-    let script = r#"echo 5000 > "$CG/memory.current"; echo 0 > "$CG/memory.swap.current"
+    // `memory.swap.current` cannot be read (`n/a`) until the swap goes out, at the
+    // second step, after `max` reached 2: the watch skips every sample before that,
+    // so the first one it takes holds the swap and `max` 2 or more, and against the
+    // zeros of a new lease that swap is all the lease's own, however late or often it
+    // samples. Readable as 0 before, two samples in the second step would see the
+    // swap rise while `max` stayed at 2 (the host's share), and nothing would kill
+    // the lease: a slow step on a busy runner did that.
+    let script = r#"echo 5000 > "$CG/memory.current"; echo n/a > "$CG/memory.swap.current"
         printf 'max 0\noom 0\noom_kill 0\n' > "$CG/memory.events"
         chmod a-w "$CG"
         for i in 1 2 3 4 5 6 7 8 9 10; do
@@ -372,10 +376,18 @@ async fn the_swap_kill_ends_even_when_cgroup_kill_fails() {
             [ $i -eq 2 ] && echo 1048576 > "$CG/memory.swap.current"; sleep 0.01
         done
         sleep 0.2; chmod u+w "$CG"; exec sleep 30"#;
+    let started = Instant::now();
     let outcome = fake.run(1, &Spec::new(&image(), "unused"), script).await;
     assert!(
         matches!(outcome, Err(RuntimeError::OutOfMemory { limit, .. }) if limit == CAP),
         "{outcome:?}"
+    );
+    // The kill waits out the 1 s grace, not the action's 30 s: a kill that waits for
+    // `podman start` without a bound returns only once the action has ended.
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "{:?}",
+        started.elapsed()
     );
     assert!(
         !fake
@@ -383,6 +395,53 @@ async fn the_swap_kill_ends_even_when_cgroup_kill_fails() {
             .iter()
             .any(|e| e == "cgroup.kill ended the action"),
         "the premise: cgroup.kill could not be written: {:?}",
+        fake.events()
+    );
+    fake.assert_clean(1);
+}
+
+/// Catches a kernel OOM kill at the lease's own cap reported with the swap watch's
+/// numbers (RAM plus swap at a sample) rather than `memory.peak`, and the watch
+/// killing a lease the host swapped for what that lease then pushes at its cap below
+/// the threshold. The samples are the lease's in a podman-arm run of
+/// `swapped_by_the_host_then_at_its_cap_a_lease_is_not_killed` (a 192 MiB floor): host
+/// reclaim moved 315 MB to swap with `max` 0, then at its cap the lease pushed 68 MB
+/// more, and the kernel's OOM killer ran at that cap (`oom 1`, `oom_kill 13`). The
+/// run failed with `OutOfMemory { used: 454856704, .. }`, the lease's `memory.peak`:
+/// the kernel's kill, read from the lease's counters, not the watch's.
+#[tokio::test]
+async fn a_kernel_oom_at_the_cap_after_host_swap_is_the_kernels_not_the_watchs() {
+    let fake = watched("swap-kernel-oom", 192 << 20, 0);
+    // Each sample: memory.current, memory.swap.current, memory.events `max`.
+    let script = r#"for s in "1282048 315006976 0" "1282048 315006976 0" \
+            "52322304 314839040 0" "68202496 314834944 491" "68100096 314834944 929" \
+            "68370432 314953728 1198" "68239360 314953728 1514" "68300800 314839040 1838" \
+            "17182720 314839040 2101" "19279872 314839040 2101" "36839424 314839040 2101" \
+            "52568064 314839040 2101" "53874688 314839040 2101" \
+            "68390912 381247488 2106" "68022272 382926848 2129"; do
+            set -- $s
+            echo $1 > "$CG/memory.current"; echo $2 > "$CG/memory.swap.current"
+            printf 'low 0\nhigh 0\nmax %d\noom 0\noom_kill 0\noom_group_kill 0\n' $3 \
+                > "$CG/memory.events.new"
+            mv "$CG/memory.events.new" "$CG/memory.events"; sleep 0.06
+        done
+        printf 'low 0\nhigh 0\nmax 2129\noom 1\noom_kill 13\noom_group_kill 1\n' \
+            > "$CG/memory.events.new"
+        mv "$CG/memory.events.new" "$CG/memory.events"
+        echo 66035712 > "$CG/memory.swap.current"; echo 454856704 > "$CG/memory.peak"
+        exit 137"#;
+    let outcome = fake.run(1, &Spec::new(&image(), "unused"), script).await;
+    assert!(
+        matches!(outcome, Err(RuntimeError::OutOfMemory { used: 454_856_704, limit })
+            if limit == CAP),
+        "{outcome:?}"
+    );
+    assert!(
+        !fake
+            .events()
+            .iter()
+            .any(|e| e == "cgroup.kill ended the action"),
+        "the watch killed the lease: {:?}",
         fake.events()
     );
     fake.assert_clean(1);

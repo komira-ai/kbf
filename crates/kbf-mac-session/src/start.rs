@@ -11,6 +11,7 @@ use std::io::Read as _;
 
 use rustix::fs::{AtFlags, CWD, FileType, Mode, OFlags, Stat};
 
+use crate::autologin::SessionPaths;
 use crate::grant::GrantKeys;
 use crate::helper::{Helper, Host, Settings};
 use crate::lease::UidRange;
@@ -60,6 +61,13 @@ pub struct Args {
     /// administrators.
     #[arg(long)]
     pub grant_keys: Option<PathBuf>,
+    /// The file the login window reads the auto-login password from.
+    #[arg(long, default_value = "/etc/kcpassword")]
+    pub kcpassword: PathBuf,
+    /// The login window's preferences domain, as `defaults` takes it; the session
+    /// switch sets and clears its `autoLoginUser`.
+    #[arg(long, default_value = "/Library/Preferences/com.apple.loginwindow")]
+    pub loginwindow: String,
 }
 
 /// A bound socket and the helper behind it, ready to serve.
@@ -113,6 +121,11 @@ pub fn prepare(
         sweep,
         grant_keys,
         serial,
+        session: SessionPaths {
+            intent: args.state_dir.join("session-intent"),
+            kcpassword: args.kcpassword.clone(),
+            loginwindow: args.loginwindow.clone(),
+        },
     };
     tracing::info!(
         socket = %args.socket.display(),

@@ -1,6 +1,7 @@
 //! [`PodmanRuntime`]: one action, one fresh rootless Podman container, never reused.
 //!
-//! Each lease goes through the six driver steps (RFC 10.1):
+//! Each lease goes through the six driver steps
+//! (`docs/design/daemon.md#the-container-driver`):
 //! 1. **prepare:** fetch the Action and Command, check the image and paths, write the
 //!    input root into the lease's scratch directory, refuse outputs that are inputs,
 //!    give the overlay's directories to the container's root (a subordinate id, see
@@ -40,7 +41,9 @@ use tokio::process::Child;
 use tokio::sync::oneshot;
 
 use crate::cgroup::{LeaseCgroup, SwapKill, memory_max, presses_into_swap};
-use crate::image::{ImageRef, ManifestKind, PROPERTY, manifest_file, manifest_kind};
+use crate::image::{
+    ImageCheckError, ImageRef, ManifestKind, PROPERTY, manifest_file, manifest_kind,
+};
 use crate::keeper::Keeper;
 use crate::outputs::{OutputLimits, collect_log};
 use crate::podman::{
@@ -72,7 +75,7 @@ pub struct PodmanConfig {
     pub cgroup_parent: String,
     /// The timeout of an action that names none.
     pub default_timeout: Duration,
-    /// How long a container gets after SIGTERM before `cgroup.kill` (RFC 10.10).
+    /// How long a container gets after SIGTERM before `cgroup.kill`.
     pub kill_grace: Duration,
     /// How much output one action may leave; past it, the action fails.
     pub outputs: OutputLimits,
@@ -89,7 +92,7 @@ pub struct PodmanConfig {
 
 impl PodmanConfig {
     /// A configuration for `owner`'s containers with `podman` from `PATH`, cgroup v2 at
-    /// `/sys/fs/cgroup`, a one hour default timeout, the RFC's five second kill grace,
+    /// `/sys/fs/cgroup`, a one hour default timeout, a five second kill grace,
     /// the default [`OutputLimits`], [`ContainerLimits::DEFAULT`] and
     /// [`SwapKill::DEFAULT`].
     #[must_use]
@@ -445,34 +448,41 @@ impl<C: Cas> PodmanRuntime<C> {
     /// Checks that this node's image store holds `image` and that its digest names one
     /// image, not an index: by reading the manifest the store keeps under that digest.
     async fn check_image(&self, image: &ImageRef) -> Result<(), RuntimeError> {
+        self.check_pinned(image).await.map_err(|e| match e {
+            ImageCheckError::Index(_) => RuntimeError::Invalid(e.to_string()),
+            ImageCheckError::Missing(_) | ImageCheckError::Failed(_) => {
+                RuntimeError::Failed(e.to_string())
+            }
+        })
+    }
+
+    /// Checks, as each lease's prepare step does, that this node's image store holds
+    /// `image` and that its digest names one architecture's manifest, not an index. The
+    /// daemon checks each image it is pinned to (`--image`) once at start with it.
+    pub async fn check_pinned(&self, image: &ImageRef) -> Result<(), ImageCheckError> {
         let Some(id) = self
             .podman
             .image_id(&image.to_string())
             .await
-            .map_err(RuntimeError::Failed)?
+            .map_err(ImageCheckError::Failed)?
         else {
-            return Err(RuntimeError::Failed(format!(
-                "image {image} is not in this node's image store"
-            )));
+            return Err(ImageCheckError::Missing(image.clone()));
         };
         let images = self
             .images
             .get_or_try_init(|| self.podman.images_dir())
             .await
-            .map_err(RuntimeError::Failed)?;
+            .map_err(ImageCheckError::Failed)?;
         let path = images.join(&id).join(manifest_file(image.digest()));
         let bytes = tokio::fs::read(&path).await.map_err(|e| {
-            RuntimeError::Failed(format!(
+            ImageCheckError::Failed(format!(
                 "the image store holds no manifest {} for image {id}: {e}",
                 image.digest()
             ))
         })?;
-        match manifest_kind(&bytes, image.digest()).map_err(RuntimeError::Failed)? {
+        match manifest_kind(&bytes, image.digest()).map_err(ImageCheckError::Failed)? {
             ManifestKind::Image => Ok(()),
-            ManifestKind::Index => Err(RuntimeError::Invalid(format!(
-                "container-image {image} names an image index; name the per-architecture \
-                 manifest digest"
-            ))),
+            ManifestKind::Index => Err(ImageCheckError::Index(image.clone())),
         }
     }
 
@@ -492,7 +502,7 @@ impl<C: Cas> PodmanRuntime<C> {
         }
     }
 
-    /// The kill path (RFC 10.10): SIGTERM, the grace period, `cgroup.kill`, then the
+    /// The kill path: SIGTERM, the grace period, `cgroup.kill`, then the
     /// grace period again for Podman to notice. Returns once `podman start` has ended.
     async fn stop_container(&self, name: &str, cgroup: &LeaseCgroup, child: &mut Child) {
         let grace = self.config.kill_grace;
