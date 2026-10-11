@@ -109,7 +109,7 @@ in_lease() {
     profile=${profile%x}
     param=$(cat "$dir/sandbox/param")
     printf '%s' "$profile" | sha256_of >"$dir/used.sha256"
-    exec env -i "${envs[@]}" "$sbx" -D "$param" -p "$profile" "$@"
+    exec env -i "${envs[@]}" "$@"
 }
 
 # tree_of ROOT SNAPSHOTS: ROOT and every pid the snapshots (`pid ppid` lines) show
