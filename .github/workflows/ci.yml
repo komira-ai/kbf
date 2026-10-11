@@ -464,7 +464,7 @@ jobs:
       - run: cargo build -p kbf-server -p kbf-node -p kbf-it --bin kbf-server --bin kbf-daemon --bin kbf-cell --locked
       # The image's glibc is Debian 12's, older than the runner's, so the helper every
       # action runs is linked statically (run.sh refuses a dynamic one).
-      - run: cargo rustc -p kbf-it --bin kbf-m2-act --locked -- -C target-feature=+crt-static
+      - run: cargo rustc -p kbf-it --bin kbf-m2-act --locked
       - name: Fetch buck2 (pinned version, checked by SHA-256)
         run: |
           tools="$RUNNER_TEMP/tools"
