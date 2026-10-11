@@ -23,20 +23,146 @@ case "$NAME" in
         ;;
     xcodebuild) printf 'Xcode 26.0\nBuild version 17A100\n' ;;
     launchctl) [ "$1" = managername ] && echo Aqua ;;
-    stat) echo runner ;;
+    stat)
+        # stat -f %Su /dev/console: the console user. stat -f %u:%g FILE: the caller
+        # when the test says the mount at FILE's directory shows its reader as every
+        # owner (shows_caller_<mount>, what macOS does on a noowners volume), else the
+        # owner this mount shows (FILE.view, a chown a mount took but did not store),
+        # else the stored one (FILE.owner, from cp and chown).
+        if [ "$2" = %Su ]; then
+            echo runner
+        elif has "shows_caller_$(basename "$(dirname "$3")")"; then
+            if [ "${FAKE_UID:-501}" = 0 ]; then echo 0:0; else echo "${FAKE_UID:-501}:20"; fi
+        elif [ -e "$3.view" ]; then
+            cat "$3.view"
+        elif [ -e "$3.owner" ]; then
+            cat "$3.owner"
+        else
+            echo "stat: $3: stat: No such file or directory" >&2
+            exit 1
+        fi
+        ;;
+    cp)
+        "$NAME" "$@" || exit
+        if [ "${FAKE_UID:-501}" = 0 ]; then echo 0:0 >"$2.owner"; else echo "${FAKE_UID:-501}:20" >"$2.owner"; fi
+        ;;
+    chown)
+        # chown OWNER FILE. Root stores OWNER (or 99:99 when the test says the volume
+        # loses root owners). Another user gets EPERM, unless the test says the volume
+        # lets it store OWNER, stores only OWNER's group (chown_group_only), or takes
+        # the chown without storing it (chown_lies).
+        if [ "${FAKE_UID:-501}" = 0 ]; then
+            if has root_owner_lost; then echo 99:99 >"$2.owner"; else echo "$1" >"$2.owner"; fi
+        elif has owners_writable; then
+            echo "$1" >"$2.owner"
+        elif has chown_group_only; then
+            # The group is stored, the owner stays the caller's.
+            echo "${FAKE_UID:-501}:${1#*:}" >"$2.owner"
+        elif has chown_lies; then
+            echo "$1" >"$2.view"
+        else
+            echo "chown: $2: Operation not permitted" >&2
+            exit 1
+        fi
+        ;;
+    hdiutil)
+        # A disk image IMG is the directory IMG.store; an attach links the mount point
+        # to it, a detach drops the link and the views a chown left (chown_lies).
+        verb=$1
+        shift
+        case "$verb" in
+            create)
+                for img; do :; done
+                if has create_fails; then
+                    echo 'hdiutil: create failed - Operation not permitted' >&2
+                    exit 1
+                fi
+                # recreate_user: while the root control runs, someone deletes the
+                # probe's user and makes the name again, with uid 503.
+                if [ "${FAKE_UID:-501}" = 0 ] && has recreate_user; then
+                    for u in "$S"/user_*; do [ -e "$u" ] && echo 503 >"$u"; done
+                fi
+                mkdir -p "$img.store"
+                : >"$img"
+                echo "created: $img"
+                ;;
+            attach)
+                mnt='' ro=''
+                while [ $# -gt 1 ]; do
+                    if [ "$1" = -mountpoint ]; then mnt=$2; fi
+                    if [ "$1" = -readonly ]; then ro=" read-only,"; fi
+                    shift
+                done
+                img=$1
+                if [ "${FAKE_UID:-501}" != 0 ] && has attach_fails; then
+                    echo 'hdiutil: attach failed - Device not configured' >&2
+                    exit 1
+                fi
+                [ -d "$img.store" ] || exit 1
+                rmdir "$mnt" && ln -s "$img.store" "$mnt"
+                # The flags hosted runners printed; "mounted by" only for a user's attach;
+                # noowners when the test says this mount point ignores owners
+                # (noowners_<mount>); no line at all for unlisted_<mount>.
+                if [ "${FAKE_UID:-501}" = 0 ]; then by=; else by=", mounted by ${FAKE_AS:-runner}"; fi
+                no=''
+                has "noowners_${mnt##*/}" && no=' noowners,'
+                has "unlisted_${mnt##*/}" ||
+                    echo "/dev/disk4s1 on $mnt (apfs, local, nodev, nosuid,$ro journaled,$no nobrowse$by)" >>"$S/mounts"
+                printf '/dev/disk4s1\t41504653-0000-11AA-AA11-00306543ECAC\t%s\n' "$mnt"
+                ;;
+            detach)
+                force=''
+                if [ "$1" = -force ]; then
+                    force=1
+                    shift
+                fi
+                # busy_<mount>: a detach without -force fails, as when a process
+                # holds a file on the volume open.
+                if [ -z "$force" ] && has "busy_${1##*/}"; then
+                    echo "hdiutil: couldn't unmount \"disk4\" - Resource busy" >&2
+                    exit 16
+                fi
+                [ -L "$1" ] || exit 1
+                store=$(readlink "$1")
+                rm -f "$store"/*.view "$1"
+                grep -vF " on $1 " "$S/mounts" >"$S/mounts.new" || true
+                mv "$S/mounts.new" "$S/mounts"
+                echo '"disk4" ejected.'
+                ;;
+        esac
+        ;;
     csrutil) echo 'System Integrity Protection status: disabled.' ;;
     pgrep) cat "$S/launchd_sim" 2>/dev/null ;;
     id)
         case "${1-}" in
-            -u) echo "${FAKE_UID:-501}" ;;
-            -Gn) echo 'staff admin' ;;
+            -u)
+                # id -u: the caller's uid. id -u NAME: NAME's uid (the user file's
+                # content, 502 when the test planted it empty), or status 1.
+                if [ -n "${2-}" ]; then
+                    has "user_$2" || exit 1
+                    u=$(cat "$S/user_$2")
+                    echo "${u:-502}"
+                else
+                    echo "${FAKE_UID:-501}"
+                fi
+                ;;
+            -un) echo "${FAKE_AS:-runner}" ;;
+            -Gn)
+                # A user made by the probe is standard unless the test says otherwise.
+                if [ -n "${FAKE_AS-}" ] && ! has probe_user_admin; then echo 'staff everyone localaccounts'; else echo 'staff admin'; fi
+                ;;
             *) has "user_$1" ;;
         esac
         ;;
     sudo)
         # sudo -n [-u USER] CMD...: runs CMD as root (or USER) in the fake.
         [ "$1" = -n ] && shift
+        [ "$1" = -H ] && shift
         if [ "$1" = -u ]; then
+            has "user_$2" || {
+                echo "sudo: unknown user $2" >&2
+                exit 1
+            }
             export FAKE_UID=502 FAKE_AS="$2"
             shift 2
         else
@@ -75,7 +201,7 @@ case "$NAME" in
         case "$1" in
             -addUser)
                 has hang_adduser && sleep 30
-                : >"$S/user_$2"
+                echo 502 >"$S/user_$2"
                 ;;
             -deleteUser)
                 rm -f "$S/user_$2"
@@ -83,6 +209,7 @@ case "$NAME" in
                 ;;
         esac
         ;;
+    mount) cat "$S/mounts" 2>/dev/null ;;
     sandbox-exec)
         # sandbox-exec -p PROFILE CMD...: a profile naming CoreSimulatorService blocks
         # the fake simctl, unless the test says the deny is ignored.
