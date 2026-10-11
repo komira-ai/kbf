@@ -26,6 +26,7 @@ use std::sync::Arc;
 pub use caller::CodeSignatureCheck;
 pub use host::MacHost;
 
+use crate::scan::ScanFolder;
 use crate::server::{self, CallerCheck};
 use crate::start::{self, Args};
 use crate::sweep::SweepPlan;
@@ -47,6 +48,7 @@ pub fn main(args: &Args) -> ExitCode {
             serial,
             SweepPlan::macos_schedules(),
             SweepPlan::macos(),
+            ScanFolder::macos(),
         )?;
         Ok((check, ready))
     });

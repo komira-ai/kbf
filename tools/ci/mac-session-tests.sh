@@ -9,6 +9,12 @@
 # requirement, so that binary stands in for kbf-daemon. A copy signed under another
 # identifier (another cdhash) is the impostor.
 #
+# The leak scan runs for real over the runner's own folders, Background Task Management
+# and directory: a baseline (through a baseline window this script opens), a clean scan,
+# a planted lease user it must report, and a clean scan once every lease user is gone.
+# `reboot-dirty` is only ever sent after a clean scan, when it must be refused: after a
+# dirty one it would reboot the runner.
+#
 # GitHub's hosted macOS runners allow passwordless sudo. Where it is not allowed this
 # script says so and stops after building and signing.
 set -euo pipefail
@@ -118,6 +124,31 @@ for gone in "$kcpassword" "$intent"; do
 done
 expect_refused "runs once" "$client" reset "$socket"
 
+step "the leak scan: a baseline only in its window, then a clean scan against it"
+window="$state/baseline-window"
+expect_refused "no baseline was recorded" "$client" scan "$socket"
+expect_refused "window is closed" "$client" baseline "$socket"
+boot=$(sysctl -n kern.bootsessionuuid)
+[ -n "$boot" ] || fail "no kern.bootsessionuuid"
+sudo -n sh -c "echo '$boot' > '$window'"
+expect_refused "opened in this boot ($boot)" "$client" baseline "$socket"
+# As an apply in an earlier boot leaves it.
+sudo -n sh -c "echo ci-earlier-boot > '$window'"
+classes=$("$client" baseline "$socket")
+echo "$classes"
+# Each count against an independent one: the parser and the folder walk read what is there.
+btm=$(sudo -n /usr/bin/sfltool dumpbtm | grep -cE '^[[:space:]]*#[0-9]+:[[:space:]]*$' || true)
+grep -qx "background-tasks $btm" <<<"$classes" || fail "sfltool lists $btm entries; the baseline: $classes"
+for pair in launch-agents:/Library/LaunchAgents launch-daemons:/Library/LaunchDaemons; do
+  n=$(sudo -n ls -A "${pair#*:}" 2>/dev/null | wc -l | tr -d ' ')
+  grep -qx "${pair%%:*} $n" <<<"$classes" || fail "${pair#*:} holds $n entries; the baseline: $classes"
+done
+grep -qx "lease-users 0" <<<"$classes" || fail "a user in $first-$last before any lease: $classes"
+grep -qx "auto-login 0" <<<"$classes" || fail "auto-login set at the baseline: $classes"
+out=$("$client" scan "$socket")
+[ "$out" = clean ] || fail "the scan right after the baseline: $out"
+expect_refused "did not come back dirty" "$client" reboot-dirty "$socket"
+
 step "S4.3: the socket admits only its group"
 [ "$(stat -f '%Lp %Sg' "$run_dir")" = "750 admin" ] || fail "socket directory: $(stat -f '%Lp %Sg' "$run_dir")"
 [ "$(stat -f '%Lp %Sg' "$socket")" = "660 admin" ] || fail "socket: $(stat -f '%Lp %Sg' "$socket")"
@@ -133,6 +164,14 @@ if dseditgroup -o checkmember -m kbf-lease-1-1 admin; then fail "kbf-lease-1-1 i
 dscl . -read "$users"/kbf-lease-1-1 IsHidden | grep -q 1 || fail "the user is not hidden"
 sudo -n sysadminctl -secureTokenStatus kbf-lease-1-1 2>&1 | tee /dev/stderr | grep -q DISABLED \
   || fail "the lease user has a secure token"
+
+step "the leak scan reports the lease user; the first lease user closed the baseline window"
+out=$("$client" scan "$socket")
+echo "$out"
+[ "$(head -n 1 <<<"$out")" = dirty ] || fail "a lease user exists and the scan is: $out"
+grep -qx "+ lease-users uid $first" <<<"$out" || fail "the scan does not name uid $first: $out"
+if sudo -n test -e "$window"; then fail "user-create left the baseline window open"; fi
+expect_refused "lease 1.1's user exists" "$client" baseline "$socket"
 
 step "run: as the lease user, in the lease directory"
 lease_dir=$(mktemp -d "$tmp/lease.XXXXXX")
@@ -316,6 +355,12 @@ if sudo -n defaults read "$loginwindow" autoLoginUser 2>/dev/null; then fail "au
 for gone in "$kcpassword" "$intent"; do
   if sudo -n test -e "$gone"; then fail "$gone survived the reset"; fi
 done
+
+step "the leak scan is clean again once every lease user is gone, across restarts"
+out=$("$client" scan "$socket")
+[ "$out" = clean ] || fail "the scan after every lease: $out"
+expect_refused "did not come back dirty" "$client" reboot-dirty "$socket"
+expect_refused "window is closed" "$client" baseline "$socket"
 
 echo
 echo "kbf-mac-session: every check passed"

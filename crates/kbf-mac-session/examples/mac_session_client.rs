@@ -8,6 +8,10 @@
 //! mac_session_client kill <socket> <lease>
 //! mac_session_client delete <socket> <lease>           prints "existed" or "absent"
 //! mac_session_client reset <socket> [held lease]...     prints "kept <lease|none> deleted <leases>"
+//! mac_session_client scan <socket>                     prints "clean" or "dirty", then "+ <added>",
+//!                                                      "- <removed>" and "! <error>" lines
+//! mac_session_client baseline <socket>                 prints "<class> <items>" lines
+//! mac_session_client reboot-dirty <socket>             reboots the Mac if the last scan was dirty
 //! mac_session_client grant <seed> <serial> <lease> <issued>   prints a grant token
 //! mac_session_client pubkey <seed>                     prints the grant key file line
 //! mac_session_client connect-then-exec <socket> <program> <args>...
@@ -105,6 +109,25 @@ mod macos {
                 let kept = kept.as_deref().unwrap_or("none");
                 println!("kept {kept} deleted {}", deleted.join(","));
             }
+            ["scan", socket] => {
+                let scanned = Client::new(socket).scan()?;
+                println!("{}", if scanned.clean { "clean" } else { "dirty" });
+                for item in &scanned.added {
+                    println!("+ {item}");
+                }
+                for item in &scanned.removed {
+                    println!("- {item}");
+                }
+                for error in &scanned.errors {
+                    println!("! {error}");
+                }
+            }
+            ["baseline", socket] => {
+                for (class, items) in Client::new(socket).baseline()? {
+                    println!("{class} {items}");
+                }
+            }
+            ["reboot-dirty", socket] => Client::new(socket).reboot_dirty()?,
             ["kill", socket, lease] => {
                 let stream = match inherited() {
                     Some(stream) => stream,
