@@ -343,6 +343,8 @@ t_vo_fail() {
     want 'm-user-1 (apfs, local, nodev, nosuid, journaled, nobrowse, mounted by kbfp0)'
     want 'm-user-2 (apfs, local, nodev, nosuid, read-only, journaled, nobrowse)'
     calls 'sudo -n hdiutil attach -nobrowse -owners on -readonly -mountpoint' 2
+    want 'volume_owner.new_user.uid=502'
+    calls 'sysadminctl -deleteUser kbfp0' 1
     vo_cleaned
     verdict_is FAIL
 }
@@ -452,14 +454,81 @@ t_vo_admin_writer() {
     verdict_is BROKEN
 }
 
-# A probe user that existed before the probe is not fresh: BROKEN. Catches a verdict
-# that ignores the pre-existing user.
+# vo_user_kept: the probe ran no sysadminctl at all and the user is still there.
+vo_user_kept() {
+    calls 'sysadminctl' 0
+    [ -e "$T/state/user_kbfp0" ] || failt "the user that existed before the probe was deleted"
+    want 'volume_owner.cleanup.user_gone=no'
+}
+
+# A probe user that exists before the probe may be a real account: the probe refuses
+# to start (BROKEN), runs no sysadminctl or hdiutil, leaves the user and removes its
+# scratch directory. Catches a probe that skips the existence check and goes on to
+# add (and then delete) a user it did not make, and a cleanup that deletes the user
+# without this run's marker of its creation.
 t_vo_user_existed() {
     : >"$T/state/user_kbfp0"
     : >"$T/state/owners_writable"
     probe volume_owner
     want 'volume_owner.new_user.existed_before=yes'
+    want 'volume_owner.verdict=BROKEN: user kbfp0 exists already, so the probe did not start'
+    want 'volume_owner.cleanup.delete_user=skipped: this run did not create kbfp0'
+    vo_user_kept
+    calls 'hdiutil' 0
+    want 'volume_owner.cleanup.dir_gone=yes'
+    [ -z "$(find "$T/shared" -mindepth 1 2>/dev/null)" ] || failt "the scratch directory is left: $(ls "$T/shared")"
     verdict_is BROKEN
+}
+
+# A creation marker left by an earlier run in the same results directory (uid 502,
+# the uid the existing user has) does not license a delete. Catches a probe that
+# does not clear the marker before it starts.
+t_vo_stale_marker() {
+    : >"$T/state/user_kbfp0"
+    mkdir -p "$T/results/state"
+    printf 502 >"$T/results/state/volume_owner.created_uid"
+    probe volume_owner
+    want 'volume_owner.cleanup.delete_user=skipped: this run did not create kbfp0'
+    vo_user_kept
+    verdict_is BROKEN
+}
+
+# The probe made kbfp0 with uid 502, but by cleanup the name belongs to a user with
+# uid 503 (deleted and made again while the probe ran): cleanup leaves it. Catches a
+# cleanup that deletes by name without comparing the uid it recorded.
+t_vo_user_recreated() {
+    : >"$T/state/recreate_user"
+    probe volume_owner
+    want 'volume_owner.new_user.uid=502'
+    want 'volume_owner.cleanup.delete_user=skipped: kbfp0 has uid 503, not the uid 502 this run created'
+    calls 'sysadminctl -deleteUser' 0
+    [ "$(cat "$T/state/user_kbfp0" 2>/dev/null)" = 503 ] || failt "the user made again with uid 503 was deleted"
+}
+
+# The user's detach fails (the volume is busy): the write stopped after 'copy', a FAIL
+# even though the volume stores the user's chown, and cleanup force-detaches the
+# mount left behind. Catches a failed detach recorded as done (the verdict would say
+# PASS) and a cleanup that skips or does not force the detach (the mount stays).
+t_vo_detach_busy() {
+    : >"$T/state/owners_writable"
+    : >"$T/state/busy_m-user-1"
+    probe volume_owner
+    want 'volume_owner.write.detach=hdiutil: couldn'"'"'t unmount "disk4" - Resource busy [rc=16]'
+    want "the standard user's write stopped after 'copy'"
+    want 'volume_owner.cleanup.detach.m-user-1="disk4" ejected. [rc=0]'
+    calls 'hdiutil detach -force ' 1
+    [ ! -s "$T/state/mounts" ] || failt "a mount is left: $(cat "$T/state/mounts")"
+    vo_cleaned
+    verdict_is FAIL
+}
+
+# The user's chown stores the group (0) but not the owner: the re-attach reads 502:0,
+# a FAIL. Catches an owner compared on its gid instead of its uid.
+t_vo_group_root() {
+    : >"$T/state/chown_group_only"
+    probe volume_owner
+    want 'volume_owner.reattach.owner=502:0'
+    verdict_is FAIL
 }
 
 # An attach the standard user cannot make is a FAIL that names the step; the control
@@ -503,7 +572,8 @@ for test in t_lib t_watchdog t_am_already t_am_required_first t_am_control_noop 
     t_simctl_allow_fails t_simctl_bootstatus_fails t_simctl_delete_fails t_simctl_create_garbage \
     t_tcc_pass t_tcc_control_empty t_vo_fail t_vo_pass t_vo_chown_lies t_vo_control_lost \
     t_vo_noowners t_vo_shows_caller t_vo_control_noowners t_vo_mount_unlisted \
-    t_vo_admin_writer t_vo_user_existed t_vo_attach_fails t_verdicts; do
+    t_vo_admin_writer t_vo_user_existed t_vo_stale_marker t_vo_user_recreated \
+    t_vo_detach_busy t_vo_group_root t_vo_attach_fails t_verdicts; do
     t "$test"
 done
 printf '%s tests, %s failed assertions\n' "$TESTS" "$FAILED"

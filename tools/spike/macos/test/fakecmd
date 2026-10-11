@@ -49,11 +49,15 @@ case "$NAME" in
     chown)
         # chown OWNER FILE. Root stores OWNER (or 99:99 when the test says the volume
         # loses root owners). Another user gets EPERM, unless the test says the volume
-        # lets it store OWNER, or takes the chown without storing it (chown_lies).
+        # lets it store OWNER, stores only OWNER's group (chown_group_only), or takes
+        # the chown without storing it (chown_lies).
         if [ "${FAKE_UID:-501}" = 0 ]; then
             if has root_owner_lost; then echo 99:99 >"$2.owner"; else echo "$1" >"$2.owner"; fi
         elif has owners_writable; then
             echo "$1" >"$2.owner"
+        elif has chown_group_only; then
+            # The group is stored, the owner stays the caller's.
+            echo "${FAKE_UID:-501}:${1#*:}" >"$2.owner"
         elif has chown_lies; then
             echo "$1" >"$2.view"
         else
@@ -72,6 +76,11 @@ case "$NAME" in
                 if has create_fails; then
                     echo 'hdiutil: create failed - Operation not permitted' >&2
                     exit 1
+                fi
+                # recreate_user: while the root control runs, someone deletes the
+                # probe's user and makes the name again, with uid 503.
+                if [ "${FAKE_UID:-501}" = 0 ] && has recreate_user; then
+                    for u in "$S"/user_*; do [ -e "$u" ] && echo 503 >"$u"; done
                 fi
                 mkdir -p "$img.store"
                 : >"$img"
@@ -102,7 +111,17 @@ case "$NAME" in
                 printf '/dev/disk4s1\t41504653-0000-11AA-AA11-00306543ECAC\t%s\n' "$mnt"
                 ;;
             detach)
-                [ "$1" = -force ] && shift
+                force=''
+                if [ "$1" = -force ]; then
+                    force=1
+                    shift
+                fi
+                # busy_<mount>: a detach without -force fails, as when a process
+                # holds a file on the volume open.
+                if [ -z "$force" ] && has "busy_${1##*/}"; then
+                    echo "hdiutil: couldn't unmount \"disk4\" - Resource busy" >&2
+                    exit 16
+                fi
                 [ -L "$1" ] || exit 1
                 store=$(readlink "$1")
                 rm -f "$store"/*.view "$1"
@@ -116,7 +135,17 @@ case "$NAME" in
     pgrep) cat "$S/launchd_sim" 2>/dev/null ;;
     id)
         case "${1-}" in
-            -u) echo "${FAKE_UID:-501}" ;;
+            -u)
+                # id -u: the caller's uid. id -u NAME: NAME's uid (the user file's
+                # content, 502 when the test planted it empty), or status 1.
+                if [ -n "${2-}" ]; then
+                    has "user_$2" || exit 1
+                    u=$(cat "$S/user_$2")
+                    echo "${u:-502}"
+                else
+                    echo "${FAKE_UID:-501}"
+                fi
+                ;;
             -un) echo "${FAKE_AS:-runner}" ;;
             -Gn)
                 # A user made by the probe is standard unless the test says otherwise.
@@ -172,7 +201,7 @@ case "$NAME" in
         case "$1" in
             -addUser)
                 has hang_adduser && sleep 30
-                : >"$S/user_$2"
+                echo 502 >"$S/user_$2"
                 ;;
             -deleteUser)
                 rm -f "$S/user_$2"
