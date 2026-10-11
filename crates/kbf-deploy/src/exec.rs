@@ -4,6 +4,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
@@ -11,6 +12,7 @@ use std::time::{Duration, Instant};
 use crate::path::{HostPath, Root};
 use crate::step::{Cmd, Filter, HttpUrl, Owner, Perms, Step};
 use crate::trust::{self, Untrusted};
+use crate::user;
 
 /// What is at a path, as a plan compares it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -29,6 +31,25 @@ pub enum Entry {
     Other,
 }
 
+/// What is at a path without its contents, for a file a plan must not read whole (a
+/// swapfile, a binary it only checks is executable) or cannot read (another user's key).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Meta {
+    pub kind: Kind,
+    pub perms: Perms,
+    pub owner: Owner,
+    /// The size in bytes.
+    pub len: u64,
+}
+
+/// The kind of thing a [`Meta`] describes; a link is [`Kind::Other`], never followed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    File,
+    Dir,
+    Other,
+}
+
 /// Reads and changes a host. [`HostExec`] is the real one; tests use a fake that
 /// records each step.
 pub trait Exec {
@@ -37,6 +58,9 @@ pub trait Exec {
 
     /// What is at `path` now; `None` when nothing is.
     fn inspect(&self, path: &HostPath) -> io::Result<Option<Entry>>;
+
+    /// What is at `path` now, without reading it; `None` when nothing is.
+    fn stat(&self, path: &HostPath) -> io::Result<Option<Meta>>;
 
     /// Run `cmd` to read something while planning (does a bucket exist, what does a
     /// Service hold): in a dry run as in an apply, so it must change nothing. A
@@ -72,27 +96,42 @@ impl Exec for HostExec {
     }
 
     fn inspect(&self, path: &HostPath) -> io::Result<Option<Entry>> {
-        let full = self.root.join(path);
-        let meta = match fs::symlink_metadata(&full) {
+        let Some(meta) = self.stat(path)? else {
+            return Ok(None);
+        };
+        let (perms, owner) = (meta.perms, meta.owner);
+        Ok(Some(match meta.kind {
+            Kind::File => Entry::File {
+                perms,
+                owner,
+                bytes: fs::read(self.root.join(path))?,
+            },
+            Kind::Dir => Entry::Dir { perms, owner },
+            Kind::Other => Entry::Other,
+        }))
+    }
+
+    fn stat(&self, path: &HostPath) -> io::Result<Option<Meta>> {
+        let meta = match fs::symlink_metadata(self.root.join(path)) {
             Ok(meta) => meta,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(e),
         };
-        let perms = Perms::new(meta.mode() & 0o7777);
-        let owner = Owner {
-            uid: meta.uid(),
-            gid: meta.gid(),
-        };
-        Ok(Some(if meta.is_file() {
-            Entry::File {
-                perms,
-                owner,
-                bytes: fs::read(&full)?,
-            }
+        let kind = if meta.is_file() {
+            Kind::File
         } else if meta.is_dir() {
-            Entry::Dir { perms, owner }
+            Kind::Dir
         } else {
-            Entry::Other
+            Kind::Other
+        };
+        Ok(Some(Meta {
+            kind,
+            perms: Perms::new(meta.mode() & 0o7777),
+            owner: Owner {
+                uid: meta.uid(),
+                gid: meta.gid(),
+            },
+            len: meta.len(),
         }))
     }
 
@@ -185,15 +224,29 @@ fn set_perms_owner(full: &Path, perms: Perms, owner: Option<Owner>) -> io::Resul
 /// Run `cmd` to its end with its input written to a pipe, keeping both outputs. The
 /// input is written before the output is read, so it must fit in a pipe's buffer (64
 /// KiB on Linux) unless the tool reads all of it before writing much.
+///
+/// With `cmd.user` set, the child takes that user's groups, group and uid before it
+/// starts the tool ([`user::become_user`]); as anyone but root that fails and the
+/// tool never starts.
 fn output(cmd: &Cmd) -> io::Result<Output> {
-    let mut child = Command::new(cmd.program.as_str())
+    let mut command = Command::new(cmd.program.as_str());
+    command
         .args(&cmd.args)
         .env_clear()
         .envs(cmd.env.iter().map(|(k, v)| (k, v)))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
+        .stderr(Stdio::piped());
+    if let Some(u) = &cmd.user {
+        // SAFETY: the closure runs in the child between fork and exec; `become_user`
+        // makes three system calls on numbers the parent copied in, and allocates
+        // nothing. Not `Command::uid`: std runs that before any `pre_exec` closure and
+        // clears the groups with it, after which they can no longer be set.
+        unsafe {
+            command.pre_exec(user::switch_to(u));
+        }
+    }
+    let mut child = command.spawn()?;
     // Dropped at the end of the statement, which closes the pipe: the tool reads EOF.
     child
         .stdin

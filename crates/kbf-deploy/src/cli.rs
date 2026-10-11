@@ -7,13 +7,20 @@
 //!                           --namespace NS --service NAME --node-port N [--remove] [--apply]
 //! kbf-deploy linux render-units --config FILE --out DIR [--kbf-uid UID]
 //! kbf-deploy linux check-units --config FILE --dir DIR [--installable]
+//! kbf-deploy linux install-units --config FILE [--bin-dir DIR] [--restart-minio] [--apply]
+//! kbf-deploy linux install-units --config FILE --uninstall [--apply]
+//! kbf-deploy linux image-pull --config FILE [--image REF]... [--platform OS/ARCH] [--apply]
+//! kbf-deploy linux swap --config FILE [--kubelet-allows-swap] [--remove] [--apply]
 //! ```
 //!
 //! Bad flags exit 2 for every subcommand. The `minio` subcommands change a host: without
 //! `--apply` they print their plan as `DRY-RUN:` lines and change nothing, and they exit
-//! 0 done (or nothing to do) or 1 refused or failed. The `linux` subcommands only write
-//! into or read the directory they are given, and exit 0 done, 1 a check found a broken
-//! rule, or 2 refused (a bad setting or file, printed as `REFUSED: ...` on stderr).
+//! 0 done (or nothing to do) or 1 refused or failed. `linux render-units` and
+//! `check-units` only write into or read the directory they are given, and exit 0 done,
+//! 1 a check found a broken rule, or 2 refused (a bad setting or file, printed as
+//! `REFUSED: ...` on stderr). `linux install-units`, `image-pull` and `swap` change the
+//! host as root, plan by default as the `minio` subcommands do, and exit 0 done (or
+//! nothing to do), 1 a step failed, or 2 refused (`REFUSED: ...` on stderr).
 //! `minio buckets` reads the MinIO admin key pair from `MINIO_ROOT_USER` and
 //! `MINIO_ROOT_PASSWORD` in the environment (secrets are never flags: argv is
 //! world-readable).
@@ -25,14 +32,16 @@ use std::os::unix::fs::DirBuilderExt;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::{Args, Parser, Subcommand};
+use kbf_types::ImageRef;
 
 use crate::exec::{Exec, HostExec};
-use crate::linux;
+use crate::linux::{self, HostError, LinuxConfig, images, install, swap};
 use crate::minio::{self, Admin, K8sName, KbfName, MinioError, buckets, nodeport};
 use crate::path::{HostPath, Root};
-use crate::plan::{Mode, RunAs, execute};
+use crate::plan::{DeployError, Mode, RunAs, execute};
 use crate::step::HttpUrl;
 
 #[derive(Parser)]
@@ -82,6 +91,55 @@ enum Linux {
         /// Also refuse a `<...>` placeholder.
         #[arg(long)]
         installable: bool,
+    },
+    /// Install the binaries and units, and start kbf-server and kbf-daemon (as root).
+    InstallUnits {
+        /// The kit's settings, KEY=VALUE lines.
+        #[arg(long)]
+        config: PathBuf,
+        /// Where new kbf-server and kbf-daemon binaries are; without it the installed
+        /// ones stay.
+        #[arg(long, value_parser = HostPath::new)]
+        bin_dir: Option<HostPath>,
+        /// Also restart MinIO, so its new priorities take effect now.
+        #[arg(long)]
+        restart_minio: bool,
+        /// Roll back: stop the services and move the four files aside.
+        #[arg(long, conflicts_with_all = ["bin_dir", "restart_minio"])]
+        uninstall: bool,
+        /// Carry the plan out.
+        #[arg(long)]
+        apply: bool,
+    },
+    /// Pull the pinned images into the kbf user's Podman store, as that user (as root).
+    ImagePull {
+        /// The kit's settings, KEY=VALUE lines.
+        #[arg(long)]
+        config: PathBuf,
+        /// An image instead of KBF_IMAGES (repeat for more): <repo>@sha256:<digest>.
+        #[arg(long, value_parser = linux::config::image)]
+        image: Vec<ImageRef>,
+        /// The platform each image must be built for.
+        #[arg(long, default_value = linux::images::PLATFORM)]
+        platform: String,
+        /// Carry the plan out.
+        #[arg(long)]
+        apply: bool,
+    },
+    /// Make, activate and list the build swapfile (as root).
+    Swap {
+        /// The kit's settings, KEY=VALUE lines.
+        #[arg(long)]
+        config: PathBuf,
+        /// kubelet runs here and its config sets failSwapOn: false.
+        #[arg(long)]
+        kubelet_allows_swap: bool,
+        /// Roll back: swapoff, drop the fstab line, remove the file.
+        #[arg(long, conflicts_with = "kubelet_allows_swap")]
+        remove: bool,
+        /// Carry the plan out.
+        #[arg(long)]
+        apply: bool,
     },
 }
 
@@ -194,7 +252,7 @@ pub fn run<E: Exec>(
     let result = match cli.kit {
         Kit::Minio(Minio::Buckets(a)) => minio_buckets(a, exec, env, out),
         Kit::Minio(Minio::Nodeport(a)) => minio_nodeport(a, exec, out),
-        Kit::Linux(l) => return linux_kit(l, out, err),
+        Kit::Linux(l) => return linux_kit(l, exec, out, err),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -206,7 +264,12 @@ pub fn run<E: Exec>(
 }
 
 /// The `linux` kit: 0 done, 1 a check found a broken rule, 2 refused.
-fn linux_kit(l: Linux, out: &mut dyn Write, err: &mut dyn Write) -> ExitCode {
+fn linux_kit<E: Exec>(
+    l: Linux,
+    exec: &mut E,
+    mut out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
     let result = match l {
         Linux::RenderUnits {
             config,
@@ -223,6 +286,65 @@ fn linux_kit(l: Linux, out: &mut dyn Write, err: &mut dyn Write) -> ExitCode {
             lines.push(report.summary);
             (lines, code)
         }),
+        Linux::InstallUnits {
+            config,
+            bin_dir,
+            restart_minio,
+            uninstall,
+            apply,
+        } => {
+            let done = LinuxConfig::load(&config)
+                .map_err(HostError::from)
+                .and_then(|config| {
+                    if uninstall {
+                        install::run_uninstall(exec, &config, &stamp(), mode(apply), &mut out)
+                    } else {
+                        let a = install::Install {
+                            config,
+                            bin_dir,
+                            restart_minio,
+                        };
+                        install::run(exec, &a, mode(apply), &mut out)
+                    }
+                });
+            return host_verb(done, err);
+        }
+        Linux::ImagePull {
+            config,
+            image,
+            platform,
+            apply,
+        } => {
+            let done = LinuxConfig::load(&config)
+                .map_err(HostError::from)
+                .and_then(|config| {
+                    let a = images::Pull {
+                        config,
+                        images: image,
+                        platform,
+                    };
+                    images::run(exec, &a, mode(apply), &mut out)
+                });
+            return host_verb(done, err);
+        }
+        Linux::Swap {
+            config,
+            kubelet_allows_swap,
+            remove,
+            apply,
+        } => {
+            let done = LinuxConfig::load(&config)
+                .map_err(HostError::from)
+                .and_then(|config| {
+                    let a = swap::Swap {
+                        config,
+                        kubelet_allows_swap,
+                        remove,
+                    };
+                    swap::run(exec, &a, mode(apply), &mut out)
+                });
+            return host_verb(done, err);
+        }
     };
     match result {
         Ok((lines, code)) => {
@@ -237,6 +359,30 @@ fn linux_kit(l: Linux, out: &mut dyn Write, err: &mut dyn Write) -> ExitCode {
             ExitCode::from(2)
         }
     }
+}
+
+/// A host-changing `linux` verb's exit: 0 done, 1 a step failed, 2 refused.
+fn host_verb(done: Result<(), HostError>, err: &mut dyn Write) -> ExitCode {
+    match done {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e @ HostError::Deploy(DeployError::Step { .. })) => {
+            let _ = writeln!(err, "kbf-deploy: {e}");
+            ExitCode::FAILURE
+        }
+        Err(e) => {
+            let _ = writeln!(err, "REFUSED: {e}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// The directory name `install-units --uninstall` moves the files into: seconds since
+/// the Unix epoch.
+fn stamp() -> String {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+        .to_string()
 }
 
 fn mode(apply: bool) -> Mode {

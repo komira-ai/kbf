@@ -262,7 +262,51 @@ no `--apply`. A template placeholder (`@KEY@`) with no value is refused rather t
 written, and `check-units` fails a file that still holds one; without `--kbf-uid` the
 daemon's unit keeps `<kbf uid>`, which `--installable` fails. Exit codes: 0 rendered or
 every rule holds, 1 a rule is broken, 2 refused (a bad setting or an unreadable file),
-with a `REFUSED:` line on stderr. Installing the files is not built yet.
+with a `REFUSED:` line on stderr.
+
+## Installing on the host
+
+Three verbs change the host. Each runs as root, reads the host first, prints its plan
+as `DRY-RUN:` lines and changes nothing; `--apply` carries the plan out, stopping at
+the first step that fails. A re-run after an apply plans nothing. Exit codes: 0 done
+(or nothing to do), 1 a step failed, 2 refused (`REFUSED:` on stderr, with the fix).
+They take the same `--config` file as `render-units`.
+
+```text
+sudo kbf-deploy linux swap --config node.conf [--kubelet-allows-swap] [--remove] [--apply]
+sudo kbf-deploy linux image-pull --config node.conf [--image REF]... [--apply]
+sudo kbf-deploy linux install-units --config node.conf [--bin-dir DIR] [--restart-minio] [--apply]
+sudo kbf-deploy linux install-units --config node.conf --uninstall [--apply]
+```
+
+- `swap` makes `KBF_SWAP_SIZE` at `KBF_SWAP_FILE` (`fallocate`, `chmod 600`, `mkswap`,
+  on ext4 or xfs with 16 GiB to spare), turns it on and adds its `/etc/fstab` line,
+  each only if the host lacks it. A file of another size is refused, never resized. It
+  refuses while a kubelet (`kubelet`, `k3s`, `k3s-agent`, `rke2-server`, `rke2-agent`)
+  is active, since kubelet's default `failSwapOn` would take the node out of its
+  cluster at its next restart; `--kubelet-allows-swap` says its config sets
+  `failSwapOn: false`. `--remove` turns it off, drops the line and removes the file.
+- `image-pull` pulls each of `KBF_IMAGES` (or `--image`) missing from the kbf user's
+  rootless Podman store, as that user: its uid, its gid and all its groups (as
+  `sudo -u` gives them), `HOME` and `XDG_RUNTIME_DIR=/run/user/<uid>`. Each image in
+  the store must have its pinned digest and be `--platform` (`linux/amd64`); after an
+  apply each pulled image is checked the same way. Even a dry run needs root, since
+  it reads the store as the kbf user.
+- `install-units` checks the host (a cgroup v2 memory controller, `MINIO_UNIT` is a
+  systemd unit, both users, the kbf user's subuid and subgid ranges and linger, each
+  key file in `KBF_ETC` its service's alone, the certificates, the deny list and
+  `s3.env`'s key pair, and the three ports free unless kbf-server runs), renders the
+  units with the kbf user's uid and refuses them unless `check-units --installable`
+  passes, and refuses a binary whose `--help` lacks a flag its unit passes. It then
+  installs, each only if it differs: the binaries from `--bin-dir` (keeping the
+  replaced one as `<name>.previous`), the four files under `/etc/systemd/system`, and
+  the Raft and scratch directories (0700, their service's user). After a change it
+  runs `daemon-reload` and enables and restarts kbf-server and kbf-daemon; otherwise
+  it only enables or starts one that is not. It then waits up to 60 s for
+  kbf-server's `/readyz`. MinIO restarts only with `--restart-minio`: its new
+  priorities take effect at its next start. `--uninstall` stops and disables both
+  services and moves the four files to `/var/lib/kbf-linux/removed/<unix seconds>/`;
+  the binaries, the Raft log, the scratch, the bucket and the swapfile stay.
 
 ## What the tests check
 
@@ -277,6 +321,12 @@ with a `REFUSED:` line on stderr. Installing the files is not built yet.
   templates (a swap limit dropped, an OOM score at the containers' 0, a later
   assignment that breaks the order, a slice minimum that is not the sum, a key on the
   command line, a bare `--image`) and require that rule's `FAIL` line; they
-  also refuse each bad setting and a placeholder with no value. The rendered units'
+  also refuse each bad setting and a placeholder with no value. The host verbs'
+  tests (`src/linux/install_tests.rs`, `images_tests.rs`, `swap_tests.rs`) apply each
+  plan into a scratch directory with the tools played by a fake, check what landed,
+  and require a re-run to plan nothing; each missing prerequisite is a row that must
+  be refused with its own refusal. `src/user_tests.rs` runs `id` as another user
+  through `sudo` (CI has passwordless sudo) and requires that user's uid, gid and
+  supplementary groups in the child. The rendered units'
   `ExecStart=` lines go through `kbf-server`'s parser (`kbf-it`) and `kbf-daemon`'s
   (`kbf-node`) too.

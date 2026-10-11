@@ -4,6 +4,7 @@ use std::fmt;
 use std::time::Duration;
 
 use crate::path::HostPath;
+use crate::user::RunUser;
 
 /// Permission bits of a file or directory, at most `0o7777`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -43,12 +44,16 @@ pub struct Owner {
 ///
 /// Arguments are printed as they are, so a secret goes in `env` or `stdin`, never in
 /// `args`: argv is world-readable while the tool runs, and printed lines are kept.
+///
+/// With `user`, the tool runs as that user, with the user's groups ([`crate::user`]);
+/// only root can start it so.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Cmd {
     pub program: HostPath,
     pub args: Vec<String>,
     pub env: Vec<(String, String)>,
     pub stdin: Vec<u8>,
+    pub user: Option<RunUser>,
 }
 
 impl Cmd {
@@ -58,7 +63,13 @@ impl Cmd {
             args: Vec::new(),
             env: Vec::new(),
             stdin: Vec::new(),
+            user: None,
         }
+    }
+
+    pub fn user(mut self, user: RunUser) -> Cmd {
+        self.user = Some(user);
+        self
     }
 
     pub fn arg(mut self, arg: impl Into<String>) -> Cmd {
@@ -77,10 +88,13 @@ impl Cmd {
     }
 }
 
-/// `<program> <args>`, then the size of the input and the names (never the values) of
-/// the environment variables.
+/// `(as <user>) <program> <args>`, then the size of the input and the names (never the
+/// values) of the environment variables.
 impl fmt::Display for Cmd {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(user) = &self.user {
+            write!(f, "(as {}) ", user.name)?;
+        }
         write!(f, "{}", self.program)?;
         for arg in &self.args {
             write!(f, " {}", Quoted(arg))?;
@@ -320,9 +334,9 @@ mod tests {
         Ok(b.to_vec())
     }
 
-    /// Catches a printed line that shows a secret (file bytes or an environment value)
-    /// and one that hides where an argument ends; these lines are what an operator
-    /// reads before `--apply`.
+    /// Catches a printed line that shows a secret (file bytes or an environment value),
+    /// one that hides where an argument ends, and one that hides which user a command
+    /// runs as; these lines are what an operator reads before `--apply`.
     #[test]
     fn each_step_prints_one_line_without_secrets() {
         let root = Some(Owner { uid: 0, gid: 0 });
@@ -379,6 +393,21 @@ mod tests {
                         .env("HOME", "/root"),
                 ),
                 r#"run /usr/bin/mc mb "a b" "" "it's" "q\"" "back\\slash" (env MC_HOST_x, HOME)"#,
+            ),
+            (
+                Step::Run(
+                    Cmd::new(p("/usr/bin/podman"))
+                        .arg("pull")
+                        .user(RunUser {
+                            name: "kbf".to_owned(),
+                            uid: 990,
+                            gid: 990,
+                            groups: vec![990, 44],
+                            home: "/var/lib/kbf".to_owned(),
+                        })
+                        .env("HOME", "/var/lib/kbf"),
+                ),
+                "run (as kbf) /usr/bin/podman pull (env HOME)",
             ),
             (
                 Step::Run(

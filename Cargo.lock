@@ -1193,6 +1193,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "kbf-types",
+ "libc",
  "rustix",
  "serde",
  "serde_json",
