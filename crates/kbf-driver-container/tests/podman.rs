@@ -935,3 +935,41 @@ async fn the_action_owns_its_files_and_its_private_outputs_are_collected() {
     assert_eq!(blob(&cell.cas, files[0].digest.as_ref()), b"secret\n");
     cell.assert_clean(1);
 }
+
+/// Catches an input file the CAS does not hold reported as the farm's failure (issue
+/// #130: the client gets INTERNAL and never uploads it) or as a missing blob naming
+/// another digest, with the image check and lease setup a real node runs; and such a
+/// lease leaving its container, cgroup or scratch behind.
+#[tokio::test]
+#[ignore = "needs rootless Podman and a delegated cgroup: run by tools/ci/podman-tests.sh"]
+async fn a_missing_input_file_is_reported_as_missing_with_its_digest() {
+    use kbf_daemon::cas::{digest_of, label};
+    use kbf_proto::reapi::{Action, Directory, FileNode};
+    use prost::Message;
+
+    let cell = Cell::new("missing-blob");
+    let full = store_action(&cell.cas, &sh("cat data"));
+    let mut action =
+        Action::decode(cell.cas.blob(&full).expect("action").as_slice()).expect("Action");
+    let missing = digest_of(b"an input file never uploaded");
+    let root = Directory {
+        files: vec![FileNode {
+            name: "data".to_owned(),
+            digest: Some(missing.clone()),
+            ..FileNode::default()
+        }],
+        ..Directory::default()
+    };
+    action.input_root_digest = Some(cell.cas.insert(root.encode_to_vec()));
+    let digest = cell.cas.insert(action.encode_to_vec());
+    let outcome = cell
+        .runtime
+        .run(cell.work(1, digest, Resources::new(1000, 256 << 20)))
+        .await;
+    let want = label(&missing);
+    assert!(
+        matches!(&outcome, Err(RuntimeError::MissingBlob(blob)) if *blob == want),
+        "want MissingBlob({want}), got {outcome:?}"
+    );
+    cell.assert_clean(1);
+}

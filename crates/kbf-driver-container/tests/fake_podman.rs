@@ -4,6 +4,7 @@
 //! real rootless Podman.
 
 mod fake_memory;
+mod fake_missing_blobs;
 mod support;
 
 use std::path::{Path, PathBuf};
@@ -655,8 +656,8 @@ fn the_driver_serves_action_leases_only() {
     assert!(!fake.runtime.serves("whole_machine"));
 }
 
-/// Catches an Action without a Command or an input root being run with defaults, and
-/// a missing input blob being reported as the client's error rather than the farm's.
+/// Catches an Action without a Command or an input root being run with defaults. A
+/// missing blob is `fake_missing_blobs`'s.
 #[tokio::test]
 async fn incomplete_actions_are_refused() {
     use kbf_proto::reapi::Action;
@@ -671,7 +672,7 @@ async fn incomplete_actions_are_refused() {
     };
     let no_root = Action {
         input_root_digest: None,
-        ..action.clone()
+        ..action
     };
     for (seq, broken) in [no_command, no_root].into_iter().enumerate() {
         let digest = fake.cas.insert(broken.encode_to_vec());
@@ -684,20 +685,7 @@ async fn incomplete_actions_are_refused() {
             "{outcome:?}"
         );
     }
-    let missing_root = Action {
-        input_root_digest: Some(kbf_daemon::cas::digest_of(b"not stored")),
-        ..action
-    };
-    let digest = fake.cas.insert(missing_root.encode_to_vec());
-    let outcome = fake
-        .runtime
-        .run(work(3, digest, Resources::default()))
-        .await;
-    assert!(
-        matches!(outcome, Err(RuntimeError::Failed(ref why)) if why.contains("not in the CAS")),
-        "{outcome:?}"
-    );
-    for seq in 1..=3 {
+    for seq in 1..=2 {
         fake.assert_clean(seq);
     }
     assert!(!fake.calls().contains(&"create".to_owned()));
