@@ -169,6 +169,12 @@ pub enum Failure {
     /// fault, not the action's. The scheduler requeues it with the same booking while
     /// its farm reruns last; an operation that finishes with it has used them up.
     NodeMemoryPressure,
+    /// The worker could not fetch an input blob: the CAS no longer holds it (the front
+    /// checked the inputs before the operation was queued, so it was lost since). The
+    /// callers are answered FAILED_PRECONDITION with a `MISSING` violation per blob, so
+    /// a client that re-uploads (Bazel) executes again. Not a farm fault: it is never
+    /// rerun, never cached, and counts against no farm rerun budget.
+    MissingInput,
 }
 
 /// How an attempt ended, as its worker reports it.

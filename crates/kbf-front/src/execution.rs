@@ -139,7 +139,8 @@ pub enum Finished {
     /// The action ran (whatever its exit code): its result.
     Ran(Box<reapi::ActionResult>),
     /// The farm could not run it: `INTERNAL` for an infrastructure failure,
-    /// `DEADLINE_EXCEEDED` for a timeout.
+    /// `DEADLINE_EXCEEDED` for a timeout, [`missing_status`] for an input the worker
+    /// could not fetch.
     Failed(rpc::Status),
 }
 
@@ -543,6 +544,22 @@ fn lease_kind(platform: &Platform) -> Result<LeaseKind, Status> {
 
 /// FAILED_PRECONDITION with one `MISSING` violation per blob, as REAPI asks.
 fn missing(digests: &[Digest]) -> Status {
+    let status = missing_status(digests);
+    Status::with_details(
+        Code::FailedPrecondition,
+        status.message.clone(),
+        Bytes::from(status.encode_to_vec()),
+    )
+}
+
+/// The status REAPI asks for when inputs are not in the CAS: FAILED_PRECONDITION with
+/// exactly one detail, a `PreconditionFailure` with one `MISSING` violation per blob
+/// (subject `blobs/<hash>/<size>`). Bazel re-uploads the blobs and executes again only
+/// on this shape: any other detail makes the error permanent. The front answers an
+/// Execute with it before queueing, and the server answers an operation with it when
+/// the worker could not fetch an input.
+#[must_use]
+pub fn missing_status(digests: &[Digest]) -> rpc::Status {
     let failure = PreconditionFailure {
         violations: digests
             .iter()
@@ -553,20 +570,14 @@ fn missing(digests: &[Digest]) -> Status {
             })
             .collect(),
     };
-    let message = format!("{} input blob(s) are not in the CAS", digests.len());
-    let details = rpc::Status {
+    rpc::Status {
         code: Code::FailedPrecondition as i32,
-        message: message.clone(),
+        message: format!("{} input blob(s) are not in the CAS", digests.len()),
         details: vec![any(
             "google.rpc.PreconditionFailure",
             failure.encode_to_vec(),
         )],
-    };
-    Status::with_details(
-        Code::FailedPrecondition,
-        message,
-        Bytes::from(details.encode_to_vec()),
-    )
+    }
 }
 
 fn any(type_name: &str, value: Vec<u8>) -> Any {

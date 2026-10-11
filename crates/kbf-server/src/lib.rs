@@ -48,6 +48,7 @@ pub mod health;
 pub mod identity;
 pub mod mdm;
 mod memory;
+mod missing;
 pub mod rollout;
 pub mod serve;
 mod stamp;

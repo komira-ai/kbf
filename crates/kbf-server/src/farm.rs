@@ -46,6 +46,7 @@ use tonic::{Code, Status};
 
 use crate::fleet::{NodeView, NodesView, PlacementView, SoftwareView, attention_changes};
 use crate::memory;
+use crate::missing;
 use crate::stamp::Stamp;
 
 /// The scheduler term of a new single-node server process: the wall-clock time of its
@@ -182,6 +183,9 @@ enum Detail {
     Ran(Box<Pending>),
     /// The daemon's reason the action is invalid, passed to the callers.
     Invalid(String),
+    /// The input blobs the worker could not fetch, which the callers are asked to
+    /// upload again (`crate::missing`).
+    Missing(Vec<Digest>),
 }
 
 #[derive(Debug)]
@@ -540,10 +544,11 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
         })
     }
 
-    /// The scheduler's outcome for a `Result`, with the cache record of an OK one or
-    /// the reason for an INVALID_ARGUMENT one. An OK result whose outputs are not all
-    /// stored is an infrastructure failure: accepting it would answer callers with files
-    /// nobody can fetch. An OK result gets the node it `ran_on` and the server's times
+    /// The scheduler's outcome for a `Result`, with the cache record of an OK one, the
+    /// reason for an INVALID_ARGUMENT one, or the blobs of a missing-input one
+    /// ([`missing::inputs`]). An OK result whose outputs are not all stored is an
+    /// infrastructure failure: accepting it would answer callers with files nobody can
+    /// fetch. An OK result gets the node it `ran_on` and the server's times
     /// ([`Stamp::apply`]) before it is checked and its cache record made.
     async fn outcome(
         &self,
@@ -584,10 +589,19 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
                     Some(Detail::Invalid(why)),
                 )
             }
-            (code, _) => {
-                tracing::info!(%lease, ?code, "lease failed");
-                (Outcome::Failed(Failure::Infra), None)
-            }
+            (code, _) => match result.status.as_ref().and_then(missing::inputs) {
+                Some(blobs) => {
+                    tracing::warn!(%lease, blobs = blobs.len(), "input blobs missing at the worker");
+                    (
+                        Outcome::Failed(Failure::MissingInput),
+                        Some(Detail::Missing(blobs)),
+                    )
+                }
+                None => {
+                    tracing::info!(%lease, ?code, "lease failed");
+                    (Outcome::Failed(Failure::Infra), None)
+                }
+            },
         }
     }
 
@@ -970,6 +984,9 @@ impl State {
                 (failed(Code::DeadlineExceeded, "the action timed out"), None)
             }
             (Some(Detail::Invalid(why)), _) => (failed(Code::InvalidArgument, &why), None),
+            (Some(Detail::Missing(blobs)), _) => {
+                (Finished::Failed(kbf_front::missing_status(&blobs)), None)
+            }
             (_, Outcome::Failed(kill @ (Failure::OutOfMemory | Failure::NodeMemoryPressure))) => {
                 (memory::finished(kill, &answer.memory_runs), None)
             }
