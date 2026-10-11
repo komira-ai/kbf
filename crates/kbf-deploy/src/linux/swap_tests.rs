@@ -7,6 +7,7 @@ use std::rc::Rc;
 
 use super::*;
 use crate::linux::host::SYSTEMCTL;
+use crate::step::Step;
 use crate::testkit::{ScratchHost, reply};
 
 const EXAMPLE: &str = include_str!("../../templates/linux/config.example");
@@ -321,4 +322,30 @@ fn a_swap_size_is_whole_gib() {
             "{bad}"
         );
     }
+}
+
+/// Catches a tool that cannot start (missing, not executable) read as "no swap".
+#[test]
+fn a_tool_that_cannot_start_is_an_error() {
+    let mut exec = ScratchHost::new("swap-no-tool");
+    exec.answer = Box::new(|_| Err(std::io::Error::from(std::io::ErrorKind::NotFound)));
+    let err = plan(&exec, &swap(FILE), &mut Vec::new()).expect_err("no swapon");
+    assert!(
+        matches!(&err, HostError::Query { cmd, .. } if cmd.starts_with("/usr/sbin/swapon")),
+        "{err}"
+    );
+}
+
+/// Catches an fstab line glued to a last line that has its newline, or a blank line
+/// put between them.
+#[test]
+fn the_fstab_line_follows_a_last_line_with_its_newline() {
+    let (exec, _) = host("swap-newline");
+    fs::write(exec.at("/etc/fstab"), format!("{OTHER_LINE}\n")).expect("fstab");
+    let p = plan(&exec, &swap(FILE), &mut Vec::new()).expect("plan");
+    let Some(Step::WriteFile { bytes, .. }) = p.steps().last() else {
+        panic!("the last step is not the fstab write: {:?}", p.steps());
+    };
+    let want = format!("{OTHER_LINE}\n{FILE} none swap sw 0 0\n");
+    assert_eq!(String::from_utf8_lossy(bytes), want);
 }

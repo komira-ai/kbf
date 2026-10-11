@@ -245,6 +245,9 @@ fn a_first_install_writes_everything_and_a_rerun_plans_nothing() {
     assert_eq!(mode_of(&exec, "/var/lib/kbf-server/raft"), 0o700);
     assert!(!exec.at("/usr/local/bin/kbf-daemon.previous").exists());
     assert_eq!(world.borrow().active.len(), 2);
+    // The fake host answers the readiness URL the wait step names (a fake self-test).
+    let ready = HttpUrl::new("http://127.0.0.1:8982/readyz").expect("url");
+    assert_eq!(exec.http_status(&ready).expect("answers"), 200);
 
     let again = go(&mut exec, &install(), Mode::DryRun);
     assert!(
@@ -512,6 +515,28 @@ fn each_missing_prerequisite_is_refused_with_its_fix() {
             |_, w| w.borrow_mut().help_fails = true,
             |e| matches!(e, HostError::Query { .. }),
         ),
+        (
+            "cgroup unreadable",
+            |e, _| {
+                fs::remove_dir_all(e.at("/sys/fs/cgroup")).expect("rm");
+                write(e, "/sys/fs/cgroup", "", 0o644);
+            },
+            |e| {
+                matches!(e, HostError::Inspect { path, .. }
+                    if path.as_str() == "/sys/fs/cgroup/cgroup.controllers")
+            },
+        ),
+        (
+            "linger unreadable",
+            |e, _| {
+                fs::remove_dir_all(e.at("/var/lib/systemd/linger")).expect("rm");
+                write(e, "/var/lib/systemd/linger", "", 0o644);
+            },
+            |e| {
+                matches!(e, HostError::Inspect { path, .. }
+                    if path.as_str() == "/var/lib/systemd/linger/kbf")
+            },
+        ),
     ];
     for (why, plant, want) in rows {
         let (exec, world) = host("install-refused");
@@ -618,4 +643,24 @@ fn uninstall_moves_the_units_aside_and_a_rerun_plans_nothing() {
         out.contains("kept: the binaries, /var/lib/kbf-server/raft"),
         "{out}"
     );
+}
+
+/// Catches a Raft directory made for a server that keeps its index in memory.
+#[test]
+fn an_in_memory_server_gets_no_raft_directory() {
+    let (exec, _) = host("install-memory");
+    let text = EXAMPLE.replace("KBF_META_LOG=raft", "KBF_META_LOG=memory");
+    let a = Install {
+        config: LinuxConfig::parse(&text).expect("valid settings"),
+        ..install()
+    };
+    let got = steps(&plan(&exec, &a, &mut Vec::new()).expect("plan"));
+    let raft = got
+        .iter()
+        .any(|s| s.starts_with("mkdir /var/lib/kbf-server"));
+    assert!(!raft, "{got:#?}");
+    let scratch = got
+        .iter()
+        .any(|s| s.starts_with("mkdir /var/lib/kbf/leases (0700"));
+    assert!(scratch, "{got:#?}");
 }

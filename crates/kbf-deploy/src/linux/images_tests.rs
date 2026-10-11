@@ -118,8 +118,13 @@ fn a_dry_run_names_each_missing_pull_and_a_rerun_after_apply_pulls_nothing() {
     assert!(text(out).contains(&checked), "the pull was not checked");
 
     let mut out = Vec::new();
-    run(&mut exec, &a, Mode::DryRun, &mut out).expect("re-run");
+    run(&mut exec, &a, Mode::Apply, &mut out).expect("re-run");
     assert!(text(out).ends_with("nothing to do\n"));
+    assert_eq!(
+        exec.log.len(),
+        1,
+        "an apply with nothing to pull ran a step"
+    );
 }
 
 /// Catches `--image` being added to `KBF_IMAGES` instead of replacing it.

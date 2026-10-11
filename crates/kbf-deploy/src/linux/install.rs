@@ -30,7 +30,7 @@
 use std::io::Write;
 use std::time::Duration;
 
-use super::check::{CheckError, check_texts};
+use super::check::check_texts;
 use super::config::{LinuxConfig, MetaLog};
 use super::host::{
     self, HostError, SS, SYSTEMCTL, inspect, note, parents, stat, tool, under, unit_is,
@@ -291,10 +291,7 @@ fn supports<E: Exec>(exec: &E, bin: &HostPath, unit: &str) -> Result<Vec<u8>, Ho
     let listed: Vec<&str> = help
         .split(|c: char| !(c.is_ascii_alphanumeric() || c == '-'))
         .collect();
-    let unit = UnitFile::parse(unit).map_err(|source| CheckError::Unit {
-        name: bin.to_string(),
-        source,
-    })?;
+    let unit = UnitFile::parse(unit)?;
     for word in unit.exec_start() {
         let flag = word.split('=').next().unwrap_or(word);
         if flag.starts_with("--") && !listed.contains(&flag) {

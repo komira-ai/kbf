@@ -15,6 +15,7 @@ use crate::path::{HostPath, PathError};
 use crate::plan::{DeployError, Planner};
 use crate::step::{Cmd, Perms, Step, UrlError};
 use crate::template::TemplateError;
+use crate::unit::UnitError;
 use crate::user::{self, RunUser, UserError};
 
 use super::check::CheckError;
@@ -46,6 +47,8 @@ pub enum HostError {
     User(#[from] UserError),
     #[error(transparent)]
     Url(#[from] UrlError),
+    #[error(transparent)]
+    Unit(#[from] UnitError),
     #[error(transparent)]
     Deploy(#[from] DeployError),
     #[error("cannot read {path}: {source}")]
@@ -90,7 +93,7 @@ pub enum HostError {
     S3Env(HostPath),
     #[error("port {0} is in use: free it or pick another in the config")]
     PortInUse(u16),
-    #[error("the rendered units break the priorities; nothing was written:\n{}", Lines(.0))]
+    #[error("the rendered units break the priorities; nothing was written:\n{}", lines(.0))]
     Units(Vec<Failure>),
     #[error("{0} is not an executable (--bin-dir DIR, or install it in KBF_BIN_DIR)")]
     NotExecutable(HostPath),
@@ -150,19 +153,9 @@ pub enum HostError {
 }
 
 /// Failures one to a line.
-struct Lines<'a>(&'a [Failure]);
-
-impl fmt::Display for Lines<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let mut lines = self.0.iter();
-        if let Some(first) = lines.next() {
-            write!(f, "{first}")?;
-        }
-        for line in lines {
-            write!(f, "\n{line}")?;
-        }
-        Ok(())
-    }
+fn lines(failures: &[Failure]) -> String {
+    let lines: Vec<String> = failures.iter().map(ToString::to_string).collect();
+    lines.join("\n")
 }
 
 /// A tool's path.

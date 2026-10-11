@@ -223,6 +223,15 @@ impl ScratchHost {
     }
 }
 
+/// The scratch root goes with the host, after a failed test too: it may hold planted
+/// executables (a fake `kbf-daemon`), and the coverage run loads every executable it
+/// finds under the target directory as an object file.
+impl Drop for ScratchHost {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
 impl Exec for ScratchHost {
     fn euid(&self) -> u32 {
         self.euid
