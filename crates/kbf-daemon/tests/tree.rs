@@ -450,3 +450,49 @@ async fn an_unreadable_output_fails() {
             .expect("chmod back");
     }
 }
+
+/// Catches a directory output whose root Directory, or a Directory below it, is not
+/// stored: the farm's action cache refuses a result that names a blob it does not
+/// hold, and `root_directory_digest` and each DirectoryNode name one. The tree has
+/// nested files and two empty directories; the empty Directory is the empty blob,
+/// which the cache always holds. Also catches a Directory that appears twice stored
+/// twice (one upload per Directory is a round trip to the CAS).
+#[tokio::test]
+async fn every_directory_a_directory_output_names_is_stored() {
+    let cas = MemoryCas::default();
+    let dir = scratch("directory-blobs");
+    std::fs::create_dir_all(dir.join("out/a/b")).expect("mkdir");
+    std::fs::create_dir_all(dir.join("out/empty")).expect("mkdir");
+    std::fs::create_dir_all(dir.join("out/empty2")).expect("mkdir");
+    std::fs::write(dir.join("out/top"), b"top").expect("write");
+    std::fs::write(dir.join("out/a/mid"), b"mid").expect("write");
+    std::fs::write(dir.join("out/a/b/leaf"), b"leaf").expect("write");
+    let mut result = ActionResult::default();
+    collect(&cas, &dir, "", &["out".to_owned()], &mut result)
+        .await
+        .expect("collected");
+    let out = &result.output_directories[0];
+    let tree = Tree::decode(
+        cas.blob(out.tree_digest.as_ref().expect("tree digest"))
+            .expect("stored")
+            .as_slice(),
+    )
+    .expect("a Tree");
+    assert_eq!(tree.children.len(), 4, "a, a/b, empty, empty2: {tree:?}");
+    let mut named = vec![out.root_directory_digest.clone().expect("root digest")];
+    for directory in tree.root.iter().chain(&tree.children) {
+        named.extend(directory.files.iter().filter_map(|f| f.digest.clone()));
+        named.extend(
+            directory
+                .directories
+                .iter()
+                .filter_map(|d| d.digest.clone()),
+        );
+    }
+    named.retain(|d| d.size_bytes > 0);
+    assert_eq!(named.len(), 6, "root, a, a/b and three files: {named:?}");
+    let absent: Vec<_> = named.iter().filter(|d| cas.blob(d).is_none()).collect();
+    assert!(absent.is_empty(), "named but not stored: {absent:?}");
+    // Three files, a, a/b, the empty Directory once, the root and the Tree.
+    assert_eq!(cas.puts(), 8);
+}

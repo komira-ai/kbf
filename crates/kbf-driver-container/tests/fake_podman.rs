@@ -4,6 +4,7 @@
 //! real rootless Podman.
 
 mod fake_clock;
+mod fake_directory_blobs;
 mod fake_memory;
 mod fake_missing_blobs;
 mod support;

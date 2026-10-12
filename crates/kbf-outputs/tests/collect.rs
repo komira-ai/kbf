@@ -19,6 +19,7 @@ use prost::Message;
 struct MemoryStore {
     blobs: Mutex<BTreeMap<String, Vec<u8>>>,
     files: Mutex<usize>,
+    puts: Mutex<usize>,
     refuse: bool,
 }
 
@@ -42,6 +43,7 @@ impl MemoryStore {
 
 impl Store for MemoryStore {
     async fn put(&self, bytes: Vec<u8>) -> Result<Digest, StoreError> {
+        *self.puts.lock().unwrap_or_else(PoisonError::into_inner) += 1;
         self.keep(bytes)
     }
 
@@ -556,4 +558,52 @@ async fn a_directory_the_walk_may_not_enter_fails() {
     }
     chmod("locked", 0o755);
     chmod("blind", 0o755);
+}
+
+/// Catches a directory output whose root Directory, or a Directory below it, is not
+/// stored: the farm's action cache refuses a result that names a blob it does not
+/// hold, and `root_directory_digest` and each DirectoryNode name one. The tree has
+/// nested files and two empty directories; the empty Directory is the empty blob,
+/// which the cache always holds. Also catches a Directory that appears twice stored
+/// twice (one upload per Directory is a round trip to the CAS).
+#[tokio::test]
+async fn every_directory_a_directory_output_names_is_stored() {
+    let root = scratch("directory-blobs");
+    std::fs::create_dir_all(root.join("out/a/b")).expect("mkdir");
+    std::fs::create_dir_all(root.join("out/empty")).expect("mkdir");
+    std::fs::create_dir_all(root.join("out/empty2")).expect("mkdir");
+    std::fs::write(root.join("out/top"), b"top").expect("write");
+    std::fs::write(root.join("out/a/mid"), b"mid").expect("write");
+    std::fs::write(root.join("out/a/b/leaf"), b"leaf").expect("write");
+    let store = MemoryStore::default();
+    let result = run(&store, &root, "", &["out"], OutputLimits::DEFAULT)
+        .await
+        .expect("collect");
+    let out = &result.output_directories[0];
+    let tree = tree(&store, &result, 0);
+    assert_eq!(tree.children.len(), 4, "a, a/b, empty, empty2: {tree:?}");
+    let mut named = vec![out.root_directory_digest.clone().expect("root digest")];
+    for directory in tree.root.iter().chain(&tree.children) {
+        named.extend(directory.files.iter().filter_map(|f| f.digest.clone()));
+        named.extend(
+            directory
+                .directories
+                .iter()
+                .filter_map(|d| d.digest.clone()),
+        );
+    }
+    named.retain(|d| d.size_bytes > 0);
+    assert_eq!(named.len(), 6, "root, a, a/b and three files: {named:?}");
+    let held = store.blobs.lock().unwrap_or_else(PoisonError::into_inner);
+    let absent: Vec<&Digest> = named
+        .iter()
+        .filter(|d| !held.contains_key(&d.hash))
+        .collect();
+    drop(held);
+    // Three files, a, a/b, the empty Directory once, the root and the Tree.
+    assert_eq!(
+        *store.puts.lock().unwrap_or_else(PoisonError::into_inner),
+        8
+    );
+    assert!(absent.is_empty(), "named but not stored: {absent:?}");
 }

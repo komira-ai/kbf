@@ -1,6 +1,7 @@
 //! A CAS in this process's memory, and actions stored in it.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, PoisonError};
 
 use kbf_daemon::cas::{Cas, CasError, digest_of, label};
@@ -13,6 +14,7 @@ use prost::Message;
 #[derive(Debug, Default)]
 pub struct MemoryCas {
     blobs: Mutex<BTreeMap<String, Vec<u8>>>,
+    puts: AtomicUsize,
 }
 
 impl MemoryCas {
@@ -40,6 +42,11 @@ impl MemoryCas {
         self.lock().get(&label(digest)).cloned()
     }
 
+    /// How many times [`Cas::put`] was called.
+    pub fn puts(&self) -> usize {
+        self.puts.load(Ordering::Relaxed)
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, Vec<u8>>> {
         self.blobs.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -52,6 +59,7 @@ impl Cas for MemoryCas {
     }
 
     async fn put(&self, bytes: Vec<u8>) -> Result<Digest, CasError> {
+        self.puts.fetch_add(1, Ordering::Relaxed);
         Ok(self.insert(bytes))
     }
 }

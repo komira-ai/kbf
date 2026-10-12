@@ -269,6 +269,29 @@ async fn read_file(path: &Path) -> Result<(Vec<u8>, bool), TreeError> {
     Ok((bytes, meta.permissions().mode() & 0o111 != 0))
 }
 
+/// Stores `root` and each Directory in `children`, each distinct one once, and
+/// returns the digest of `root`: what an output directory's `root_directory_digest`
+/// names. The farm's action cache refuses a result whose root Directory it does not
+/// hold; the Directories below are stored too, so every digest the Tree names can be
+/// fetched.
+///
+/// # Errors
+/// An upload fails.
+pub async fn put_directories(
+    cas: &impl Cas,
+    root: &Directory,
+    children: &[Directory],
+) -> Result<Digest, CasError> {
+    let mut stored = std::collections::HashSet::new();
+    for directory in children {
+        let bytes = directory.encode_to_vec();
+        if stored.insert(digest_of(&bytes).hash) {
+            cas.put(bytes).await?;
+        }
+    }
+    cas.put(root.encode_to_vec()).await
+}
+
 /// Reads each output path into the CAS and records it in `result`. `root` is the input
 /// root's directory as the action left it; `working_directory` (a checked path) and
 /// each output path are relative paths below it, and every directory on the way from
@@ -311,7 +334,7 @@ pub async fn collect(
             });
         } else if meta.is_dir() {
             let (root, children) = tree(cas, host).await?;
-            let root_digest = digest_of(&root.encode_to_vec());
+            let root_digest = put_directories(cas, &root, &children).await?;
             let tree = Tree {
                 root: Some(root),
                 children,
