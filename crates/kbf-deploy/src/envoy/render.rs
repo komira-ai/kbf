@@ -12,6 +12,8 @@ use super::json::Json;
 
 /// The name of the Envoy objects (ConfigMap, Deployment, Service, NetworkPolicy).
 pub const APP: &str = "kbf-envoy";
+/// The name of the Ingress.
+pub const INGRESS: &str = "kbf";
 /// The Envoy cluster of the kbf-servers.
 pub const CLUSTER: &str = "kbf_servers";
 /// Envoy's REAPI listener, and the Service's port.
@@ -577,7 +579,7 @@ fn manifests(c: &EnvoyConfig, envoy_text: &str) -> Json {
     let ingress = object(
         "networking.k8s.io/v1",
         "Ingress",
-        meta("kbf", ns),
+        meta(INGRESS, ns),
         (
             "spec",
             Json::object([

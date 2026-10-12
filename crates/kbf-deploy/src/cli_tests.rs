@@ -669,3 +669,279 @@ fn envoy_check_exits_0_passed_1_failed_2_refused() {
     assert_eq!((code, out.as_str()), (ExitCode::from(2), ""), "{err}");
     assert!(err.ends_with(": unknown key KBF_SERVER\n"), "{err}");
 }
+
+/// Catches a `tls`, `push-cert` or `dep` verb not wired to its kit (each reaches the
+/// kit's root check, so each refuses as a user with a `REFUSED:` line and exit 2), a
+/// `--check-godaddy` that skips that check, and flags clap must refuse: a topic
+/// without `--profile-only` or malformed, a push certificate without its key, a
+/// malformed serial, `--check-godaddy` with `--apply`.
+#[test]
+fn the_tls_push_cert_and_dep_verbs_reach_their_kit() {
+    let dir = kbf_host::testkit::scratch("cli_mdm_more");
+    let file = dir.join("config.local");
+    let text = crate::mdm::tests::config_text()
+        .replace("MDM_ACME_EMAIL=\n", "MDM_ACME_EMAIL=ops@example.com\n")
+        .replace(
+            "MDM_ACME_DNS_PROVIDER=\n",
+            "MDM_ACME_DNS_PROVIDER=godaddy\n",
+        );
+    std::fs::write(&file, text).expect("write");
+    let config = file.to_string_lossy().into_owned();
+    let topic = "com.apple.mgmt.External.0a1b2c3d-4e5f-6a7b-8c9d-0e1f2a3b4c5d";
+    let c = config.as_str();
+    let refused: [&[&str]; 8] = [
+        &["mdm", "tls", "--config", c],
+        &["mdm", "tls", "--config", c, "--check-godaddy"],
+        &[
+            "mdm",
+            "push-cert",
+            "--config",
+            c,
+            "--profile-only",
+            "--topic",
+            topic,
+        ],
+        &[
+            "mdm",
+            "push-cert",
+            "--config",
+            c,
+            "--cert",
+            "/srv/k/p.pem",
+            "--key",
+            "/srv/k/p.key",
+        ],
+        &[
+            "mdm",
+            "dep",
+            "get-cert",
+            "--config",
+            c,
+            "--out",
+            "/srv/abm/c.pem",
+        ],
+        &[
+            "mdm",
+            "dep",
+            "upload-token",
+            "--config",
+            c,
+            "--token",
+            "/srv/abm/t.p7m",
+        ],
+        &["mdm", "dep", "define-profile", "--config", c, "--apply"],
+        &[
+            "mdm",
+            "dep",
+            "assign",
+            "--config",
+            c,
+            "--serial",
+            "C02AB12CD3EF",
+        ],
+    ];
+    for args in refused {
+        let mut exec = FakeExec::new(501);
+        let (code, _, err) = cli(&mut exec, &no_env, args);
+        assert_eq!(code, ExitCode::from(2), "{args:?}: {err}");
+        assert!(
+            err.starts_with("REFUSED: mdm ") && err.contains("run it with sudo"),
+            "{args:?}: {err}"
+        );
+    }
+    let example = mdm_config("cli_mdm_acme");
+    let mut exec = FakeExec::new(0);
+    let (code, _, err) = cli(&mut exec, &no_env, &["mdm", "tls", "--config", &example]);
+    assert_eq!(code, ExitCode::from(2));
+    assert!(err.contains("MDM_ACME_EMAIL is not set"), "{err}");
+    let bad_flags: [&[&str]; 5] = [
+        &["mdm", "push-cert", "--config", c, "--topic", topic],
+        &[
+            "mdm",
+            "push-cert",
+            "--config",
+            c,
+            "--profile-only",
+            "--topic",
+            "com.apple.x",
+        ],
+        &["mdm", "push-cert", "--config", c, "--cert", "/srv/k/p.pem"],
+        &[
+            "mdm",
+            "dep",
+            "assign",
+            "--config",
+            c,
+            "--serial",
+            "c02ab12cd3ef",
+        ],
+        &["mdm", "tls", "--config", c, "--check-godaddy", "--apply"],
+    ];
+    for args in bad_flags {
+        let mut exec = FakeExec::new(0);
+        let (code, _, err) = cli(&mut exec, &no_env, args);
+        assert_eq!(code, ExitCode::from(2), "{args:?}: {err}");
+        assert!(exec.queries.borrow().is_empty(), "{args:?}");
+    }
+}
+
+/// Catches `envoy apply` not wired to the kit or ignoring `--apply`, `--refuse-example`
+/// not read (kbf's example refused when it is not given), a failed address check not
+/// exiting 1 with a `FAIL` line, a refusal exiting other than 2, and kubectl's cache
+/// directory left behind. In-process, so the lib tests' instantiation of `run` covers
+/// the arm.
+#[test]
+fn envoy_apply_exits_0_done_1_failed_2_refused() {
+    let dir = kbf_host::testkit::scratch("cli-envoy-apply");
+    let example = include_str!("../templates/envoy/config.example");
+    let ours = example
+        .replace("=example-context", "=farm")
+        .replace("=tail0000.ts.net", "=tail1234.ts.net")
+        .replace("kbf-server-a.", "kbf-server-b.");
+    let (kbf_example, config) = (dir.join("kbf.example"), dir.join("config.local"));
+    std::fs::write(&kbf_example, example).expect("example");
+    std::fs::write(&config, &ours).expect("config");
+    let (kbf_example, config) = (
+        kbf_example.to_str().expect("utf-8").to_owned(),
+        config.to_str().expect("utf-8").to_owned(),
+    );
+    let cache_dirs = Rc::new(RefCell::new(Vec::new()));
+    let address = Rc::new(RefCell::new("kbf.tail1234.ts.net"));
+    let mut exec = FakeExec::new(501);
+    let (seen, at) = (Rc::clone(&cache_dirs), Rc::clone(&address));
+    exec.answer = Box::new(move |cmd| {
+        let args: Vec<&str> = cmd.args.iter().map(String::as_str).collect();
+        seen.borrow_mut().push(args[3].to_owned());
+        Ok(match &args[6..] {
+            ["-n", _, "get", "secret", _, "-o", _] => reply(0, "yes", ""),
+            ["diff", ..] => reply(1, "+ a change\n", ""),
+            [.., "ingress", "kbf", "-o", _] => reply(0, *at.borrow(), ""),
+            _ => reply(0, "", ""),
+        })
+    });
+    let base = [
+        "envoy",
+        "apply",
+        "--kubectl",
+        "/usr/local/bin/kubectl",
+        "--kubeconfig",
+        "/srv/admin/kubeconfig",
+        "--config",
+    ];
+    let with = |more: &[&str]| -> Vec<String> {
+        base.iter().chain(more).map(|s| (*s).to_owned()).collect()
+    };
+    let go = |exec: &mut FakeExec, args: Vec<String>| {
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        cli(exec, &no_env, &args)
+    };
+
+    let (code, out, err) = go(&mut exec, with(&[&config]));
+    assert_eq!((code, err.as_str()), (ExitCode::SUCCESS, ""), "{out}");
+    assert!(
+        out.ends_with("dry run: nothing changed. Re-run with --apply.\n"),
+        "{out}"
+    );
+    assert!(exec.log.is_empty(), "{:?}", exec.log);
+    let dirs = cache_dirs.borrow().clone();
+    assert!(
+        !dirs.is_empty() && dirs.iter().all(|d| *d == dirs[0]),
+        "{dirs:?}"
+    );
+    assert!(!Path::new(&dirs[0]).exists(), "{} left behind", dirs[0]);
+
+    let (code, out, err) = go(&mut exec, with(&[&config, "--apply"]));
+    assert_eq!((code, err.as_str()), (ExitCode::SUCCESS, ""), "{out}");
+    assert!(
+        out.ends_with("clients dial grpcs://kbf.tail1234.ts.net:443\n"),
+        "{out}"
+    );
+    assert_eq!(exec.log.len(), 2, "{:?}", exec.log);
+
+    *address.borrow_mut() = "kbf-1.tail1234.ts.net";
+    let (code, _, err) = go(&mut exec, with(&[&config, "--apply"]));
+    assert_eq!(code, ExitCode::FAILURE, "{err}");
+    assert!(
+        err.starts_with("FAIL the Ingress's address is kbf-1.tail1234.ts.net, "),
+        "{err}"
+    );
+
+    let refused = [
+        (
+            with(&[&kbf_example]),
+            "REFUSED: KBF_FRONT_KUBE_CONTEXT is still the example config's value: fill it in\n"
+                .to_owned(),
+        ),
+        (
+            with(&[&config, "--refuse-example", &config]),
+            "REFUSED: KBF_FRONT_KUBE_CONTEXT is still the example config's value: fill it in\n"
+                .to_owned(),
+        ),
+        (
+            with(&[&config, "--refuse-example", "/srv/absent"]),
+            "REFUSED: cannot read /srv/absent: ".to_owned(),
+        ),
+        (
+            with(&["/srv/absent"]),
+            "REFUSED: cannot read /srv/absent: ".to_owned(),
+        ),
+    ];
+    let before = exec.log.len();
+    for (args, want) in refused {
+        let (code, out, err) = go(&mut exec, args.clone());
+        assert_eq!(
+            (code, out.as_str()),
+            (ExitCode::from(2), ""),
+            "{args:?}: {err}"
+        );
+        assert!(err.starts_with(&want), "{args:?}: {err}");
+    }
+    assert_eq!(exec.log.len(), before, "a refusal applies nothing");
+}
+
+/// Catches `envoy check` checking the NetworkPolicy against a fixed operator
+/// namespace instead of the config's `KBF_TS_OPERATOR_NAMESPACE`: a config naming
+/// another namespace passes on its own render, and a render made for `tailscale`
+/// fails `netpol-from` under it, naming the config's namespace.
+#[test]
+fn envoy_check_takes_the_operator_namespace_from_the_config() {
+    let dir = kbf_host::testkit::scratch("cli-envoy-check-namespace");
+    let example = include_str!("../templates/envoy/config.example");
+    let line = "KBF_TS_OPERATOR_NAMESPACE=tailscale\n";
+    assert_eq!(example.matches(line).count(), 1);
+    let tailscale = dir.join("config.tailscale");
+    std::fs::write(&tailscale, example).expect("config");
+    let tailscale = tailscale.to_str().expect("utf-8").to_owned();
+    let other = dir.join("config.other");
+    std::fs::write(
+        &other,
+        example.replace(line, "KBF_TS_OPERATOR_NAMESPACE=ts-operator\n"),
+    )
+    .expect("config");
+    let other = other.to_str().expect("utf-8").to_owned();
+    let rendered = dir.join("rendered");
+    let rendered = rendered.to_str().expect("utf-8").to_owned();
+    let mut exec = FakeExec::new(501);
+
+    let (code, out, err) = cli(&mut exec, &no_env, &["envoy", "check", "--config", &other]);
+    assert_eq!(
+        (code, out.as_str(), err.as_str()),
+        (
+            ExitCode::SUCCESS,
+            "12 methods routed, every check passed\n",
+            ""
+        )
+    );
+
+    let render = [
+        "envoy", "render", "--config", &tailscale, "--out", &rendered,
+    ];
+    assert_eq!(cli(&mut exec, &no_env, &render).0, ExitCode::SUCCESS);
+    let check = ["envoy", "check", "--config", &other, "--dir", &rendered];
+    let (code, out, err) = cli(&mut exec, &no_env, &check);
+    assert_eq!((code, err.as_str()), (ExitCode::FAILURE, ""), "{out}");
+    assert_eq!(
+        out,
+        "FAIL netpol-from: the NetworkPolicy admits [{\"namespaceSelector\":{\"matchLabels\":{\"kubernetes.io/metadata.name\":\"tailscale\"}}}], not the operator's namespace ts-operator\n"
+    );
+}

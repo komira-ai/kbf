@@ -182,6 +182,8 @@ pub struct Cell {
     stop: Option<oneshot::Sender<()>>,
     /// Answers once the server's runtime, and every task on it, is gone.
     stopped: Option<oneshot::Receiver<()>>,
+    /// The server's invocation records.
+    pub recorder: kbf_front::Recorder,
     client: Client,
 }
 
@@ -354,6 +356,7 @@ impl Cell {
             finished_retention: retention,
             shutdown_timeout: Duration::from_secs(10),
             store_probe_timeout: kbf_server::health::STORE_PROBE_TIMEOUT,
+            invocation_memory: kbf_front::DEFAULT_INVOCATION_MEMORY,
         };
         let (stop, stop_rx) = oneshot::channel::<()>();
         let (stopped_tx, stopped) = oneshot::channel::<()>();
@@ -389,7 +392,7 @@ impl Cell {
                 let _ = stopped_tx.send(());
             })
             .expect("a server thread");
-        let (reapi, worker, api) = bound_rx.await.expect("the server binds");
+        let (reapi, worker, api, recorder) = bound_rx.await.expect("the server binds");
         Self {
             cache,
             store,
@@ -398,6 +401,7 @@ impl Cell {
             raft_dir,
             stop: Some(stop),
             stopped: Some(stopped),
+            recorder,
             client: Client::connect(reapi, worker).await,
         }
     }
@@ -406,9 +410,15 @@ impl Cell {
 /// Says where `bound` listens on `addresses`, then serves it until it stops.
 async fn run(
     bound: Bound<impl Future<Output = Result<(), ServeError>>>,
-    addresses: oneshot::Sender<(SocketAddr, SocketAddr, Option<SocketAddr>)>,
+    addresses: oneshot::Sender<(
+        SocketAddr,
+        SocketAddr,
+        Option<SocketAddr>,
+        kbf_front::Recorder,
+    )>,
 ) {
-    let _ = addresses.send((bound.reapi, bound.worker, bound.api));
+    let recorder = bound.recorder.clone();
+    let _ = addresses.send((bound.reapi, bound.worker, bound.api, recorder));
     bound.serving.await.expect("serve");
 }
 
@@ -438,6 +448,11 @@ impl Client {
             worker_addr: worker,
             channel,
         }
+    }
+
+    /// The channel to the REAPI listener.
+    pub fn channel(&self) -> Channel {
+        self.channel.clone()
     }
 
     pub fn exec(&self) -> ExecutionClient<Channel> {

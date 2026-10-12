@@ -45,6 +45,7 @@ jobs:
         with:
           persist-credentials: false
       - run: sw_vers
+      - run: uname -m
       - run: xcodebuild -version
       - run: xcrun simctl list runtimes
       - run: rustup toolchain install

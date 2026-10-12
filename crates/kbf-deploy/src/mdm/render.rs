@@ -10,7 +10,7 @@ pub const NANOHUB: &str = "kbf-mdm-nanohub.service";
 pub const DEPSERVER: &str = "kbf-mdm-depserver.service";
 pub const DEPSYNCER: &str = "kbf-mdm-depsyncer.service";
 pub const PROXY: &str = "kbf-mdm-proxy.service";
-/// The certificate job and the proxy's reload on renewal: installed by the TLS step,
+/// The certificate job and the proxy's reload on renewal: installed by `mdm tls`,
 /// stopped and moved aside by `install --uninstall`.
 pub const CERT_SERVICE: &str = "kbf-mdm-cert.service";
 pub const CERT_TIMER: &str = "kbf-mdm-cert.timer";

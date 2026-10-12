@@ -2,8 +2,9 @@
 //! through `sudo`, with the guards every call goes through first.
 //!
 //! The mode is entered with `node-admin` as the binary's first argument; nothing
-//! after it is a flag of the helper. Only `phase0 status|apply|revert` exists so far
-//! (see [`phase0`]); every other verb is refused with the usage text.
+//! after it is a flag of the helper. The verbs so far are `phase0 status|apply|revert`
+//! (see [`phase0`]) and `role-user status|create` (see [`role_user`]); every other verb
+//! is refused with the usage text.
 //!
 //! Every call, in this order:
 //! 1. refuses unless the effective uid is 0;
@@ -13,8 +14,9 @@
 //!    `sbin`, `bin`, `etc`, `log` and `state`, and the running binary and every
 //!    directory above it, must each be root's, writable by root alone (no group or
 //!    other write bit, no access control list), and not a symbolic link;
-//! 4. removes temporary files (`.incoming.*`) older than [`STALE`] from `state`, which
-//!    a call cut short (a crash, a power cut) left behind;
+//! 4. removes temporary files (`.incoming.*`) older than [`STALE`] from `state`, and from
+//!    `/private/var/at` when that folder passes `role-user`'s check of it, which a call
+//!    cut short (a crash, a power cut) left behind;
 //! 5. appends one line to `log/admin.log` (see [`log_line`]), even for a verb it then
 //!    refuses; the log is renamed `admin.log.1` once it is over [`ADMIN_LOG_MAX`];
 //! 6. parses the verb: a closed list, each taking no further argument;
@@ -35,7 +37,7 @@ use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::os::unix::ffi::OsStrExt as _;
-use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -44,6 +46,7 @@ use rustix::fs::FlockOperation;
 use crate::autologin::CommandOutput;
 
 pub mod phase0;
+pub mod role_user;
 
 /// The first argument that selects this mode.
 pub const MODE: &str = "node-admin";
@@ -97,6 +100,11 @@ pub trait AdminHost {
     /// # Errors
     /// The program could not be started or waited for.
     fn command(&self, program: &str, args: &[&str]) -> io::Result<CommandOutput>;
+    /// Gives `path` (never followed when it is a link) to `uid` and `gid`.
+    ///
+    /// # Errors
+    /// The owner could not be changed.
+    fn chown(&self, path: &Path, uid: u32, gid: u32) -> io::Result<()>;
     /// The wall clock.
     fn now(&self) -> SystemTime;
     /// Waits a second between two tries of the lock.
@@ -256,6 +264,8 @@ pub enum Verb {
     Phase0Status,
     Phase0Apply,
     Phase0Revert,
+    RoleUserStatus,
+    RoleUserCreate,
 }
 
 impl Verb {
@@ -270,6 +280,8 @@ impl Verb {
             [b"phase0", b"status", rest @ ..] => (Self::Phase0Status, rest),
             [b"phase0", b"apply", rest @ ..] => (Self::Phase0Apply, rest),
             [b"phase0", b"revert", rest @ ..] => (Self::Phase0Revert, rest),
+            [b"role-user", b"status", rest @ ..] => (Self::RoleUserStatus, rest),
+            [b"role-user", b"create", rest @ ..] => (Self::RoleUserCreate, rest),
             _ => return Err(Stop::Usage),
         };
         if rest.is_empty() {
@@ -285,7 +297,7 @@ impl Verb {
     /// Whether the verb changes the Mac (and so holds the lock).
     #[must_use]
     pub fn changes(self) -> bool {
-        self != Self::Phase0Status
+        !matches!(self, Self::Phase0Status | Self::RoleUserStatus)
     }
 }
 
@@ -295,13 +307,14 @@ impl fmt::Display for Verb {
             Self::Phase0Status => "phase0 status",
             Self::Phase0Apply => "phase0 apply",
             Self::Phase0Revert => "phase0 revert",
+            Self::RoleUserStatus => "role-user status",
+            Self::RoleUserCreate => "role-user create",
         })
     }
 }
 
 /// The usage text.
-pub const USAGE: &str =
-    "usage: sudo kbf-mac-session node-admin <verb>\n  phase0 status|apply|revert";
+pub const USAGE: &str = "usage: sudo kbf-mac-session node-admin <verb>\n  phase0 status|apply|revert\n  role-user status|create";
 
 /// Runs one call: the guards, then the verb. `args` are the arguments after
 /// [`MODE`]; standard output goes to `out`, `REFUSED:`/`FAILED:` lines and the usage
@@ -338,6 +351,9 @@ fn call(
     let paths = Paths::under(host.root());
     check_tree(host, &paths)?;
     sweep(host, &paths.state);
+    if role_user::check_at_dir(host, &paths).is_ok() {
+        sweep(host, &role_user::at_dir(&paths));
+    }
     log_invocation(host, &paths, &caller, args)?;
     let verb = Verb::parse(args)?;
     let _lock = if verb.changes() {
@@ -349,6 +365,8 @@ fn call(
         Verb::Phase0Status => phase0::status(host, &paths, out),
         Verb::Phase0Apply => phase0::apply(host, &paths, out),
         Verb::Phase0Revert => phase0::revert(host, &paths, out),
+        Verb::RoleUserStatus => role_user::status(host, &paths, out),
+        Verb::RoleUserCreate => role_user::create(host, &paths, out),
     }
 }
 
@@ -555,8 +573,35 @@ fn take_lock(host: &dyn AdminHost, paths: &Paths, out: &mut dyn Write) -> Result
 /// Writes `text` to `target` through a new temporary file in `dir` (mode 0600, synced),
 /// renamed over `target`; the temporary file is removed if any step fails.
 pub(crate) fn write_new(dir: &Path, target: &Path, text: &str) -> Result<(), Stop> {
+    replace(dir, target, text.as_bytes(), |_| Ok(()))
+}
+
+/// Like [`write_new`], but the temporary file is given `owner` (uid, gid) and `mode`
+/// before it is renamed over `target`.
+pub(crate) fn write_new_as(
+    host: &dyn AdminHost,
+    dir: &Path,
+    target: &Path,
+    bytes: &[u8],
+    owner: (u32, u32),
+    mode: u32,
+) -> Result<(), Stop> {
+    replace(dir, target, bytes, |temp| {
+        host.chown(temp, owner.0, owner.1)?;
+        fs::set_permissions(temp, fs::Permissions::from_mode(mode))
+    })
+}
+
+fn replace(
+    dir: &Path,
+    target: &Path,
+    bytes: &[u8],
+    finish: impl FnOnce(&Path) -> io::Result<()>,
+) -> Result<(), Stop> {
     let temp = dir.join(format!("{INCOMING}{}", std::process::id()));
-    let written = write_temp(&temp, text.as_bytes()).and_then(|()| fs::rename(&temp, target));
+    let written = write_temp(&temp, bytes)
+        .and_then(|()| finish(&temp))
+        .and_then(|()| fs::rename(&temp, target));
     if written.is_err() {
         let _ = fs::remove_file(&temp);
     }

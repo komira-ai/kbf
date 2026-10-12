@@ -368,6 +368,46 @@ fn a_capture_writes_the_filtered_output_or_nothing() {
     );
 }
 
+/// More input than a pipe holds (64 KiB on Linux and macOS): the write blocks until
+/// the child exits, and then fails with EPIPE, every time.
+const UNREAD: usize = 1 << 20;
+
+/// Catches a step whose child exits without reading its input being reported as
+/// "Broken pipe" instead of by the child's status (komira-build-farm#488). The input
+/// is larger than a pipe, so the write meets a closed pipe on every run, not by luck
+/// of timing: a failing tool reads as its exit, and one that exits 0 succeeds.
+#[test]
+fn a_child_that_exits_without_reading_its_input_is_judged_by_its_status() {
+    let (mut exec, dir) = host("unread_input");
+    let step = |program: &str| Step::Capture {
+        cmd: Cmd::new(p(program)).stdin(vec![b'k'; UNREAD]),
+        filter: Filter {
+            name: "upper",
+            apply: upper,
+        },
+        path: p("/s3.env"),
+        perms: Perms::new(0o600),
+        owner: None,
+    };
+    let err = exec
+        .apply(&step("/usr/bin/false"))
+        .expect_err("the tool fails");
+    assert!(
+        err.to_string().starts_with("/usr/bin/false exited with "),
+        "{err}"
+    );
+    assert!(
+        !dir.join("s3.env").exists(),
+        "a failed capture wrote the file"
+    );
+
+    exec.apply(&step("/usr/bin/true"))
+        .expect("the tool succeeds");
+    assert_eq!(fs::read(dir.join("s3.env")).expect("written"), b"");
+    let run = Step::Run(Cmd::new(p("/usr/bin/true")).stdin(vec![b'k'; UNREAD]));
+    exec.apply(&run).expect("a run that ignores its input");
+}
+
 /// Catches a planning-time GET that reports a status other than the one served.
 #[test]
 fn http_status_reads_one_answer() {
@@ -423,4 +463,15 @@ fn stat_reports_without_reading_and_absent_never_reads() {
     );
     assert!(!planner.absent(p("/none")).expect("nothing there"));
     fs::set_permissions(dir.join("locked"), fs::Permissions::from_mode(0o600)).expect("chmod");
+}
+
+/// Catches the input write swallowing an error other than EPIPE (a real failure to
+/// hand the tool its input), or failing on EPIPE or success. No real pipe write fails
+/// any other way on demand, so the rule is checked on its own.
+#[test]
+fn only_a_closed_pipe_ends_the_input_write_quietly() {
+    assert!(fed(Ok(())).is_ok());
+    assert!(fed(Err(io::ErrorKind::BrokenPipe.into())).is_ok());
+    let err = fed(Err(io::ErrorKind::PermissionDenied.into())).expect_err("kept");
+    assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
 }

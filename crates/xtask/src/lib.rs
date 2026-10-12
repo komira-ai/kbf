@@ -6,6 +6,10 @@
 //! - `budget-diff --base <rev>` ([`budget`]): the interpreter budget may only shrink; a
 //!   row the working tree's budget file has and `<rev>`'s does not is refused. CI runs
 //!   it on pull requests, with the base branch as `<rev>`.
+//! - `sign-darwin <binary> --minos <version> [--summary <file>]` and `darwin-asset
+//!   <tarball> <name>` ([`darwin`]): the macOS binary signed ad hoc with the hardened
+//!   runtime and exactly the entitlements the allow list ([`entitlements`]) gives it,
+//!   and checked again as it ships. macOS only.
 //! - `fetch --url <url> --sha256 <hex> --out <path> [--extract <format> [--member <path>]]`
 //!   ([`fetch`]): a pinned tool, downloaded over HTTPS and refused unless its SHA-256
 //!   matches, before anything is unpacked or written.
@@ -15,6 +19,9 @@
 //! - `sums assemble <dir>` and `verify-assets {sums,attestations} <dir>` ([`sums`]): the
 //!   one `SHA256SUMS` over every platform's assets, and the checks the attest job and
 //!   a deployment make of it, each with a control that must fail.
+//! - `sudo-test -p <package> --test <name> [--sudo <path>] [-- <test args>]`
+//!   ([`sudo_test`]): one integration test target built as this user, then its
+//!   `#[ignore]` tests run as root through `sudo -n`.
 //!
 //! Exit status: 0 when the check passed, 1 when it failed (one reason per line on
 //! stderr), 2 on a usage error.
@@ -27,8 +34,11 @@ use clap::{Parser, Subcommand};
 
 pub mod budget;
 pub mod build_commit;
+pub mod darwin;
+pub mod entitlements;
 pub mod fetch;
 pub mod package;
+pub mod sudo_test;
 pub mod sums;
 
 /// Why a verb failed.
@@ -48,6 +58,8 @@ pub enum Error {
     Refused(Vec<String>),
     #[error(transparent)]
     Fetch(#[from] fetch::Error),
+    #[error(transparent)]
+    Entitlements(#[from] entitlements::Error),
     /// Flags that do not fit together (exit status 2, like a clap error).
     #[error("{0}")]
     Usage(String),
@@ -122,12 +134,41 @@ enum Verb {
         #[arg(long)]
         out: PathBuf,
     },
+    /// Sign a macOS binary in place, ad hoc with the hardened runtime and the
+    /// entitlements the allow list gives its file name, and check it (macOS only).
+    SignDarwin {
+        /// The binary; it must accept `--version`.
+        binary: PathBuf,
+        /// The minimum macOS it was built for (on Actions, `MACOSX_DEPLOYMENT_TARGET`).
+        #[arg(long)]
+        minos: String,
+        /// Append a line on the signature to this file (on Actions, `GITHUB_STEP_SUMMARY`).
+        #[arg(long)]
+        summary: Option<PathBuf>,
+    },
+    /// Check the macOS binary `<name>` as it ships in `<tarball>` (macOS only).
+    DarwinAsset { tarball: PathBuf, name: String },
     /// The commit's one `SHA256SUMS`.
     #[command(subcommand)]
     Sums(Sums),
     /// Check a commit's assets as a deployment is to.
     #[command(subcommand)]
     VerifyAssets(VerifyAssets),
+    /// Build one integration test target, then run its ignored tests as root.
+    SudoTest {
+        /// The package the target is in.
+        #[arg(short = 'p', long)]
+        package: String,
+        /// The integration test target (a file in the package's `tests/`).
+        #[arg(long)]
+        test: String,
+        /// The sudo program; it is run with `-n`, so it never prompts.
+        #[arg(long, default_value = "sudo")]
+        sudo: PathBuf,
+        /// Arguments for the test binary (after `--`), such as a test name.
+        #[arg(last = true)]
+        args: Vec<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -221,6 +262,12 @@ fn budget_diff(root: &Path, rev: &str) -> Result<String, Error> {
     ))
 }
 
+/// The cargo to run: the one that started this xtask, which sets `CARGO` to itself for
+/// the programs it runs.
+fn cargo_program() -> OsString {
+    std::env::var_os("CARGO").unwrap_or(OsString::from("cargo"))
+}
+
 /// Runs the verb `cli` names: the lines to print when it passed.
 fn run(cli: Cli) -> Result<Vec<String>, Error> {
     let root = cli.root.unwrap_or_else(default_root);
@@ -229,10 +276,21 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
             Ok(vec![build_commit::check(&binary, &commit)?])
         }
         Verb::BuildCommit(BuildCommit::Stamps { commit }) => {
-            // Cargo sets CARGO to itself for the programs it runs.
-            let cargo = std::env::var_os("CARGO").unwrap_or(OsString::from("cargo"));
-            build_commit::stamps(&cargo, &root, &commit)
+            build_commit::stamps(&cargo_program(), &root, &commit)
         }
+        Verb::SudoTest {
+            package,
+            test,
+            sudo,
+            args,
+        } => sudo_test::run(&sudo_test::SudoTest {
+            cargo: &cargo_program(),
+            sudo: &sudo,
+            root: &root,
+            package: &package,
+            test: &test,
+            args: &args,
+        }),
         Verb::BudgetDiff { base } => Ok(vec![budget_diff(&root, &base)?]),
         Verb::Fetch {
             url,
@@ -252,6 +310,25 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
             commit,
             out,
         } => package::package(&binary, &sbom, platform, &commit, &out),
+        #[cfg(target_os = "macos")]
+        Verb::SignDarwin {
+            binary,
+            minos,
+            summary,
+        } => darwin::sign(
+            &binary,
+            &root.join(entitlements::ALLOWLIST),
+            &minos,
+            summary.as_deref(),
+        ),
+        #[cfg(target_os = "macos")]
+        Verb::DarwinAsset { tarball, name } => {
+            darwin::asset(&tarball, &name, &root.join(entitlements::ALLOWLIST))
+        }
+        #[cfg(not(target_os = "macos"))]
+        Verb::SignDarwin { .. } => Err(darwin::needs_macos("sign-darwin")),
+        #[cfg(not(target_os = "macos"))]
+        Verb::DarwinAsset { .. } => Err(darwin::needs_macos("darwin-asset")),
         Verb::Sums(Sums::Assemble {
             dir,
             expect,

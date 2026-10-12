@@ -271,6 +271,43 @@ fn a_usage_error_exits_2() {
     assert_eq!(out.status.code(), Some(2));
 }
 
+#[test]
+fn the_darwin_verbs_refuse_a_wrong_call() {
+    // Catches: a mistyped signing call taken as a check with an empty value: the
+    // minimum macOS left out, a tarball without the binary's name, or nothing at all,
+    // each exit 2 with the usage line.
+    for args in [
+        &["sign-darwin", "x"][..],
+        &["sign-darwin", "--minos", "14.0"][..],
+        &["darwin-asset", "x.tar.gz"][..],
+        &["darwin-asset"][..],
+    ] {
+        let (code, out, err) = outcome(Command::new(XTASK).args(args).output().expect("run"));
+        assert_eq!(code, Some(2), "{args:?}: {out}{err}");
+        assert!(err.contains("Usage:"), "{args:?}: {err}");
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn the_darwin_verbs_fail_off_macos() {
+    // Catches: a signing step that passes, signing nothing, on a host without codesign.
+    for (args, verb) in [
+        (&["sign-darwin", "x", "--minos", "14.0"][..], "sign-darwin"),
+        (
+            &["darwin-asset", "x.tar.gz", "kbf-daemon"][..],
+            "darwin-asset",
+        ),
+    ] {
+        let (code, out, err) = outcome(Command::new(XTASK).args(args).output().expect("run"));
+        assert_eq!((code, out.as_str()), (Some(1), ""), "{args:?}");
+        assert_eq!(
+            err,
+            format!("xtask: {verb} runs on macOS only: it needs codesign, vtool and csrutil\n")
+        );
+    }
+}
+
 /// A git repository whose one commit holds `budget` as the budget file.
 fn repo(name: &str, budget: &str) -> PathBuf {
     let root = scratch(name);

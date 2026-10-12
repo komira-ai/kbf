@@ -49,8 +49,8 @@ fn the_example_documents_every_key_and_parses_into_its_fields() {
     );
     assert_eq!(caps, ("1G", "100%", "256"));
     assert_eq!(
-        (c.dep_name.as_str(), c.org.as_str()),
-        ("example", "Example")
+        (c.dep_name.as_str(), c.org.as_str(), c.profile_id.as_str()),
+        ("example", "Example", "com.example.kbf-mdm")
     );
     assert_eq!(c.lan.to_string(), format!("{}/24", lan(0)));
 }
@@ -100,6 +100,8 @@ fn a_bad_setting_is_refused_naming_its_key() {
         with("MDM_ORG", "a\u{7}b"),
         with("MDM_ORG", ""),
         with("MDM_ORGS", "x"),
+        with("MDM_PROFILE_ID", "Com.Example"),
+        with("MDM_PROFILE_ID", "kbf-mdm"),
     ];
     for text in cases {
         let changed: Vec<&str> = text

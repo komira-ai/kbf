@@ -305,3 +305,71 @@ async fn create_bucket_asks_for_object_lock_and_accepts_its_own_bucket() {
     assert!(second.starts_with("put /kbf-test http/1.1\r\n"), "{second}");
     assert!(!second.contains("object-lock"), "{second}");
 }
+
+/// A loopback port with nothing listening on it (bound, then released).
+async fn free_port() -> std::net::SocketAddr {
+    TcpListener::bind("127.0.0.1:0")
+        .await
+        .unwrap()
+        .local_addr()
+        .unwrap()
+}
+
+/// Catches: `wait_answering` returning before the store answers (no wait at all, or a
+/// refused connection taken for an answer), and taking an error status for "not
+/// ready" (a running S3 service answers the unsigned `GET /` with 403, so such a wait
+/// would never end against a real store). The store refuses connections at first;
+/// the wait must still be running then, and end once a server answers 403.
+#[tokio::test]
+async fn wait_answering_waits_for_a_late_store_and_takes_403_as_an_answer() {
+    let addr = free_port().await;
+    let s = store(format!("http://{addr}"), Capabilities::default());
+    let wait = tokio::spawn(async move { s.wait_answering(Duration::from_secs(20)).await });
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert!(
+        !wait.is_finished(),
+        "the wait ended while nothing listened: {:?}",
+        wait.await
+    );
+    let listener = TcpListener::bind(addr).await.unwrap();
+    let server = tokio::spawn(async move {
+        let (mut sock, _) = listener.accept().await.unwrap();
+        let mut chunk = [0u8; 4096];
+        let n = sock.read(&mut chunk).await.unwrap();
+        let head = String::from_utf8_lossy(&chunk[..n]).into_owned();
+        let resp = answer(
+            "403 Forbidden",
+            &[],
+            "<Error><Code>AccessDenied</Code></Error>",
+        );
+        sock.write_all(resp.as_bytes()).await.unwrap();
+        sock.shutdown().await.unwrap();
+        head
+    });
+    wait.await.unwrap().unwrap();
+    let head = server.await.unwrap().to_ascii_lowercase();
+    assert!(head.starts_with("get / http/1.1\r\n"), "{head}");
+}
+
+/// Catches: `wait_answering` ignoring its deadline (looping for ever on a store that
+/// never starts, which hangs the CI job until its timeout) or reporting success.
+#[tokio::test]
+async fn wait_answering_gives_up_at_its_deadline() {
+    let addr = free_port().await;
+    let s = store(format!("http://{addr}"), Capabilities::default());
+    let started = std::time::Instant::now();
+    // Bounded here, so a wait that ignores its deadline fails this test, not hangs it.
+    let err = tokio::time::timeout(
+        Duration::from_secs(5),
+        s.wait_answering(Duration::from_millis(700)),
+    )
+    .await
+    .expect("the wait outlived its deadline")
+    .unwrap_err();
+    let took = started.elapsed();
+    assert!(matches!(err, ObjectStoreError::Transport(_)), "{err}");
+    assert!(
+        took >= Duration::from_millis(700) && took < Duration::from_secs(5),
+        "{took:?}"
+    );
+}

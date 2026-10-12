@@ -132,4 +132,4 @@ kbf_daemon::keeper_test_hook!();
 kbf_testkit::act_test_hook!();
 
 pub use config::{MemoryPolicy, NativeConfig};
-pub use runtime::{DRIVER, KIND, NativeRuntime, SURVEY_DIR};
+pub use runtime::{DRIVER, KIND, NativeRuntime, SURVEY_DIR, WARM_UP_DIR};

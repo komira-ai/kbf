@@ -180,8 +180,8 @@ fn package_writes_both_assets_and_their_sums_lines() {
 
 #[test]
 fn the_system_tar_extracts_exactly_the_binary() {
-    // Catches: a tarball the tar a node or check-darwin-asset uses cannot read (GNU tar
-    // on Linux, bsdtar on macOS), one that lists more than the binary, or one whose
+    // Catches: a tarball the tar a node uses cannot read (GNU tar on Linux, bsdtar
+    // on macOS), one that lists more than the binary, or one whose
     // extracted file is not the bytes given or not executable.
     use std::os::unix::fs::PermissionsExt;
     let dir = scratch("system-tar");

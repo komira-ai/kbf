@@ -320,6 +320,22 @@ impl Scheduler {
         self.ops.get(&operation).map(|op| op.farm_runs.as_slice())
     }
 
+    /// The operation in flight that a submission of `request` would join: its
+    /// running twin, if `request` may join one.
+    #[must_use]
+    pub fn twin(&self, request: &Request) -> Option<OperationId> {
+        if !request.joinable() {
+            return None;
+        }
+        self.in_flight.get(&request.key).copied()
+    }
+
+    /// The id the next operation that joins no twin gets.
+    #[must_use]
+    pub const fn next_operation(&self) -> OperationId {
+        OperationId(self.next_op)
+    }
+
     /// The waiters attached to `operation`, in attach order.
     #[must_use]
     pub fn waiters(&self, operation: OperationId) -> Option<&[WaiterId]> {
