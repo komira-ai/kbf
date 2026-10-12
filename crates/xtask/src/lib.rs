@@ -6,6 +6,9 @@
 //! - `budget-diff --base <rev>` ([`budget`]): the interpreter budget may only shrink; a
 //!   row the working tree's budget file has and `<rev>`'s does not is refused. CI runs
 //!   it on pull requests, with the base branch as `<rev>`.
+//! - `fetch --url <url> --sha256 <hex> --out <path> [--extract <format> [--member <path>]]`
+//!   ([`fetch`]): a pinned tool, downloaded over HTTPS and refused unless its SHA-256
+//!   matches, before anything is unpacked or written.
 //!
 //! Exit status: 0 when the check passed, 1 when it failed (one reason per line on
 //! stderr), 2 on a usage error.
@@ -18,6 +21,7 @@ use clap::{Parser, Subcommand};
 
 pub mod budget;
 pub mod build_commit;
+pub mod fetch;
 
 /// Why a verb failed.
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
@@ -34,6 +38,11 @@ pub enum Error {
     Failed(String),
     #[error("{}", .0.join("\n"))]
     Refused(Vec<String>),
+    #[error(transparent)]
+    Fetch(#[from] fetch::Error),
+    /// Flags that do not fit together (exit status 2, like a clap error).
+    #[error("{0}")]
+    Usage(String),
 }
 
 impl Error {
@@ -67,6 +76,25 @@ enum Verb {
         /// The revision to compare with (on a pull request, the base branch).
         #[arg(long)]
         base: String,
+    },
+    /// Download a pinned file, check its SHA-256 and install it (mode 0755).
+    Fetch {
+        /// Where to download it from (HTTPS; redirects must stay on HTTPS).
+        #[arg(long)]
+        url: String,
+        /// The SHA-256 of the download (before unpacking), 64 lowercase hex digits.
+        #[arg(long)]
+        sha256: fetch::Sha256,
+        /// The file to install; its directory is created when missing.
+        #[arg(long)]
+        out: PathBuf,
+        /// How the download is packed (default: it is the file).
+        #[arg(long, value_enum)]
+        extract: Option<fetch::Format>,
+        /// The file to take out of a tar (`--extract tar.gz` or `tar.xz`): its path
+        /// inside the archive.
+        #[arg(long)]
+        member: Option<PathBuf>,
     },
 }
 
@@ -140,6 +168,17 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
             build_commit::stamps(&cargo, &root, &commit)
         }
         Verb::BudgetDiff { base } => Ok(vec![budget_diff(&root, &base)?]),
+        Verb::Fetch {
+            url,
+            sha256,
+            out,
+            extract,
+            member,
+        } => {
+            let unpack = fetch::Unpack::new(extract, member).map_err(Error::Usage)?;
+            let roots = fetch::host_roots();
+            Ok(vec![fetch::fetch(&url, &sha256, &unpack, &out, &roots)?])
+        }
     }
 }
 
@@ -154,7 +193,10 @@ pub fn main() -> ExitCode {
         }
         Err(e) => {
             eprintln!("xtask: {e}");
-            ExitCode::FAILURE
+            match e {
+                Error::Usage(_) => ExitCode::from(2),
+                _ => ExitCode::FAILURE,
+            }
         }
     }
 }

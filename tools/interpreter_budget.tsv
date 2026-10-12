@@ -54,28 +54,21 @@ tools/spike/macos/xcuitest_sandbox.sh	XCUITest sandbox check (spike-xcuitest wor
 # Workflow and composite-action `run:` steps with shell logic. Key:
 # <file>#<job>/<step name>, or `step <n>` (1-based) for a step with no name.
 [workflow]
-.github/workflows/artifacts.yml#darwin-arm64/Install cargo-cyclonedx (pinned version and checksum)	pinned tool download checked by SHA-256; to become one cargo xtask command
 .github/workflows/artifacts.yml#darwin-arm64/step 5	runner host facts; to become one command
 .github/workflows/artifacts.yml#darwin-arm64/SBOM	SBOM and lock check; to become one command per step
 .github/workflows/artifacts.yml#darwin-arm64/Package	release packaging; to become cargo xtask verbs
 .github/workflows/artifacts.yml#darwin-arm64/Check the packaged binary's signature, and run it	darwin asset check; to become one cargo xtask command
-.github/workflows/artifacts.yml#linux-x86_64/Install cargo-cyclonedx (pinned version and checksum)	pinned tool download checked by SHA-256; to become one cargo xtask command
 .github/workflows/artifacts.yml#linux-x86_64/SBOM	SBOM and lock check; to become one command per step
 .github/workflows/artifacts.yml#linux-x86_64/Package	release packaging; to become cargo xtask verbs
-.github/workflows/artifacts.yml#linux-arm64/Install cargo-cyclonedx (pinned version and checksum)	pinned tool download checked by SHA-256; to become one cargo xtask command
 .github/workflows/artifacts.yml#linux-arm64/SBOM	SBOM and lock check; to become one command per step
 .github/workflows/artifacts.yml#linux-arm64/Package	release packaging; to become cargo xtask verbs
 .github/workflows/artifacts.yml#sums/Assemble SHA256SUMS	release packaging; to become cargo xtask verbs
 .github/workflows/artifacts.yml#attest/Check the files against SHA256SUMS before signing them	release packaging; to become cargo xtask verbs
-.github/workflows/ci.yml#deny/Install cargo-deny (pinned version and checksum)	pinned tool download checked by SHA-256; to become one cargo xtask command
 .github/workflows/ci.yml#objstore-s3/Wait for both stores to accept connections	wait loop; to become a flag of the program that waits
-.github/workflows/ci.yml#coverage/Install cargo-llvm-cov (pinned version and checksum)	pinned tool download checked by SHA-256; to become one cargo xtask command
 .github/workflows/ci.yml#coverage/Run the workspace tests under coverage	coverage run and ratchet; to become one command per step
 .github/workflows/ci.yml#coverage/Per-crate table and ratchet	coverage run and ratchet; to become one command per step
 .github/workflows/ci.yml#native-macos/step 4	runner host facts; to become one command
 .github/workflows/ci.yml#mac-provision/step 2	shellcheck of the mac-provision scripts; goes with them
-.github/workflows/ci.yml#m2-container/Fetch buck2 (pinned version, checked by SHA-256)	pinned tool download checked by SHA-256; to become one cargo xtask command
-.github/workflows/integration.yml#m1-cell/Fetch Bazel and buck2 (pinned versions, checked by SHA-256)	pinned tool download checked by SHA-256; to become one cargo xtask command
 .github/workflows/integration.yml#m1-cell/Wait for MinIO	wait loop; to become a flag of the program that waits
 .github/workflows/integration.yml#m1-cell/M1 cell, Bazel and buck2 twice each	one M1 harness call over several lines; goes with crates/kbf-it/m1/run.sh
 .github/workflows/spike-macos.yml#selftest/step 2	shellcheck of the macOS probe kit; goes with it
