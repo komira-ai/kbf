@@ -646,10 +646,10 @@ mod real {
         (out.status.success(), text)
     }
 
-    /// Settles, on a real Mac, where a lease's simulator must live: `xcodebuild`
-    /// (`-showdestinations`, and `-destination id=<UDID>` resolved by a dry-run build)
-    /// finds a device of the default set and not one made in a device set elsewhere
-    /// (`simctl --set`). Catches a design that makes the device where `xcodebuild
+    /// Settles, on a real Mac, where a lease's simulator must live: `xcodebuild
+    /// -showdestinations` lists a device of the default set and not one made in a
+    /// device set elsewhere (`simctl --set`), and a build with `-destination
+    /// id=<UDID>` of the other set's device fails, unable to find it. Catches a design that makes the device where `xcodebuild
     /// test -destination` cannot reach it; the default-set arm is the control (a
     /// listing that never names any device would pass the other arm alone).
     #[tokio::test(flavor = "multi_thread")]
@@ -683,26 +683,20 @@ mod real {
         let project = ios_fixture(&dir);
         let derived = dir.join("derived");
         let (_, shown) = xcodebuild(&project, &derived, &["-showdestinations"]);
-        let dry = |udid: &str| {
-            let destination = format!("id={udid}");
-            xcodebuild(
-                &project,
-                &derived,
-                &["-destination", &destination, "-dry-run", "build"],
-            )
-        };
-        let (default_ok, default_dry) = dry(&default);
-        let (elsewhere_ok, elsewhere_dry) = dry(&elsewhere);
+        // A build that names the other set's device by id: `xcodebuild` resolves the
+        // destination before it builds anything, so one it cannot find fails it at once.
+        let destination = format!("id={elsewhere}");
+        let (elsewhere_ok, elsewhere_build) =
+            xcodebuild(&project, &derived, &["-destination", &destination, "build"]);
         xcrun(&["simctl", "delete", &default]);
         xcrun(&["simctl", "--set", set_arg, "delete", &elsewhere]);
         let _ = writeln!(
             std::io::stderr(),
             "xcodebuild -showdestinations:\n{shown}\n\
-             dry-run build on the default set's device: {default_ok}\n\
-             dry-run build on the other set's device: {elsewhere_ok}: {}",
-            elsewhere_dry
-                .lines()
-                .filter(|l| l.contains("destination"))
+             build on the other set's device exited 0: {elsewhere_ok}:\n{}",
+            (elsewhere_build.lines())
+                .filter(|l| l.contains("rror") || l.contains("estination"))
+                .take(8)
                 .collect::<Vec<_>>()
                 .join("\n")
         );
@@ -714,8 +708,11 @@ mod real {
             !shown.contains(&elsewhere),
             "-showdestinations lists the other set's device"
         );
-        assert!(default_ok, "{default_dry}");
         assert!(!elsewhere_ok, "a destination in another set resolved");
+        assert!(
+            elsewhere_build.contains("Unable to find a "),
+            "{elsewhere_build}"
+        );
     }
 
     /// Catches, on a real Mac: `simctl create` in the default set not working under the
@@ -742,7 +739,9 @@ mod real {
              xcrun simctl bootstatus \"${UDID_VAR}\" -b >&2\n\
              xcrun simctl list devices booted | grep -c \"${UDID_VAR}\"\n\
              cp -R {project} \"$TMPDIR/IOSFixture.xcodeproj\" >&2 || true\n\
-             echo \"xcodebuild under the sandbox lists it: $(xcodebuild -showdestinations -project \"$TMPDIR/IOSFixture.xcodeproj\" -scheme IOSFixture -derivedDataPath \"$TMPDIR/dd\" 2>&1 | grep -c \"${UDID_VAR}\" || true)\" >&2\n"
+             xcodebuild -showdestinations -project \"$TMPDIR/IOSFixture.xcodeproj\" -scheme IOSFixture -derivedDataPath \"$TMPDIR/dd\" > \"$TMPDIR/shown\" 2>&1 || echo \"xcodebuild under the sandbox: exit $?\" >&2\n\
+             echo \"xcodebuild under the sandbox lists it: $(grep -c \"${UDID_VAR}\" \"$TMPDIR/shown\" || true)\" >&2\n\
+             grep -i -m 8 -e error -e denied -e destinations \"$TMPDIR/shown\" >&2 || true\n"
         );
         let spec = Spec::sh(&script)
             .property("simulator", &format!("{device_type},{runtime_id}"))
