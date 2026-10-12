@@ -2,14 +2,15 @@
 # projects, runs the pixel checker's selftest, then builds each fixture and runs its UI
 # tests, the iOS one on a simulator and the macOS one in the runner's login session.
 # A second job runs the same fixtures as a native driver action, under the driver's
-# own sandbox profile, and records every deny line (xcuitest-sandbox below).
+# own sandbox profile, and records every deny line (xcuitest-sandbox below); a Linux
+# job runs that probe's selftest and planted mutants against fakes (selftest below).
 # This proves the instrument only: a hosted runner's privacy (TCC) grants may be
 # seeded, so a pass here says nothing about a fresh Mac. Each step prints
 # `SPIKE macos-<arch>.xcuitest.*` lines; read them with
 #   gh run view <run id> --log | grep ' SPIKE '
 # The .xcresult bundles and exported screenshots are uploaded as the run's artifact.
-# Run by hand, or on a pull request that changes this file, the fixtures, the probe or
-# the driver code the profile and the lease's variables come from.
+# Run by hand, or on a pull request that changes this file, the fixtures, the probe, its
+# selftest or the driver code the profile and the lease's variables come from.
 name: spike-xcuitest
 
 on:
@@ -20,6 +21,7 @@ on:
       - tools/spike/lib.sh
       - tools/spike/macos/fixtures/**
       - tools/spike/macos/lib.sh
+      - tools/spike/macos/test/**
       - tools/spike/macos/verdicts.sh
       - tools/spike/macos/xcuitest_sandbox.sh
       - crates/kbf-driver-native/examples/action_sandbox.rs
@@ -50,6 +52,21 @@ jobs:
           persist-credentials: false
       - run: python3 tools/spike/macos/fixtures/gen_projects.py --check
       - run: shellcheck -S warning tools/spike/macos/fixtures/*.sh
+
+  # Linux: the sandbox probe's verdict logic against fakes (tools/spike/macos/test),
+  # and the planted mutants, each of which must turn its test red.
+  selftest:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: shellcheck -x -S warning tools/spike/macos/lib.sh tools/spike/macos/verdicts.sh tools/spike/macos/xcuitest_sandbox.sh tools/spike/macos/test/fakecmd tools/spike/macos/test/fake_generator.sh tools/spike/macos/test/fake_run.sh tools/spike/macos/test/mutants.sh tools/spike/macos/test/run.sh
+      - run: bash tools/spike/macos/test/run.sh
+      - run: bash tools/spike/macos/test/mutants.sh
 
   # Every step after the first two runs even if an earlier one failed, so one failure
   # does not hide the other platform's result; any failed step still fails the job.

@@ -1,6 +1,6 @@
 # shellcheck shell=bash
-# Shared helpers for the macOS P0 probes (sourced, not run). Findings:
-# docs/spikes/macos-p0.md.
+# Shared helpers of the XCUITest sandbox probe, xcuitest_sandbox.sh (sourced, not
+# run). Findings: docs/spikes/macos-p0.md.
 #
 # Each measurement is one line:
 #
@@ -64,48 +64,6 @@ arm() {
     return 0
 }
 
-# watchdog SECONDS CMD...: runs CMD with stdin from /dev/null; kills it after SECONDS.
-# Returns CMD's status, or 124 when the watchdog fired (a hang is a result, not a
-# retry). CMD's stdout and stderr go to a file, printed (merged, on stdout) once CMD
-# has ended: a child that outlives a killed CMD would otherwise hold the pipe of a
-# `$(watchdog ...)` open, and the caller would wait on it after all. The dog's own
-# output goes nowhere for the same reason.
-watchdog() {
-    local secs=$1 pid dog rc=0 fired out
-    shift
-    fired=$(mktemp "$SPIKE_STATE/watchdog.XXXXXX")
-    out=$fired.out
-    rm -f "$fired"
-    "$@" </dev/null >"$out" 2>&1 &
-    pid=$!
-    (
-        sleep "$secs"
-        : >"$fired"
-        kill -TERM "$pid"
-        sleep 2
-        kill -KILL "$pid"
-    ) </dev/null >/dev/null 2>&1 &
-    dog=$!
-    wait "$pid" || rc=$?
-    kill "$dog" 2>/dev/null || true
-    wait "$dog" 2>/dev/null || true
-    cat "$out"
-    rm -f "$out"
-    if [ -e "$fired" ]; then
-        rm -f "$fired"
-        return 124
-    fi
-    return "$rc"
-}
-
-# run_cap CMD...: CMD's output (stdout and stderr, at most 5 lines), then
-# " [rc=<status>]". Never fails the caller.
-run_cap() {
-    local out rc=0
-    out=$("$@" 2>&1) || rc=$?
-    printf '%s [rc=%s]' "$(printf '%s' "$out" | head -n 5)" "$rc"
-}
-
 # user_kind: root, admin or standard, for the user running the probe.
 user_kind() {
     if [ "$(id -u)" = 0 ]; then
@@ -129,9 +87,4 @@ spike_context() {
 # verdict VALUE REASON: the probe's last line.
 verdict() {
     kv verdict "$1: $2"
-}
-
-# is_png FILE: 0 when FILE starts with the PNG signature.
-is_png() {
-    [ "$(od -An -tx1 -N8 "$1" 2>/dev/null | tr -d ' \n')" = 89504e470d0a1a0a ]
 }
