@@ -1,11 +1,16 @@
-# Invocations: a build's id, its record and its page
+# Invocations: a build's id, its record, its API and its page
 
-A user who runs a build against the farm should be able to open one link and see what the
-farm did for that build: each action it ran or answered from the cache, where it ran, how
-long it waited and ran, how it ended, its outputs, its stdout and stderr, and what it
-used. This document designs the server side of that: the id, the record, where the record
-is kept, the read API and the link. A rich UI is out of scope; the API is what a UI (or a
-script) reads.
+**The primary consumer is an agent**: an automated client, such as an AI coding agent
+or a CI bot, that runs a build, reads the `Build ID` buck2 prints (or the link in a
+failed action's message, 5.2), and diagnoses the build through the API: which actions
+failed and why, their stderr and stdout, the command that ran and where, the artifacts,
+and what each action used. It should get each of those in one or two calls, through a
+client that speaks the API for it ([What an agent needs](#what-an-agent-needs), 4.8).
+The HTML page (5.1) is a convenience for a person and is built last (section 9).
+
+This document designs the server side of that: the id, the record, where the record is
+kept, the read API, the client and the link. A rich UI is out of scope; the API is what
+an agent, a script or a UI reads.
 
 **Everything in this document is planned** unless it says "today". Section 1 lists what
 exists.
@@ -13,6 +18,33 @@ exists.
 Vocabulary: an **invocation** is one run of a build tool (one `buck2 build`, one
 `bazel test`), REAPI's word for it. The page a person opens is the *build page*; its
 record is the *invocation record*.
+
+## What an agent needs
+
+An agent has the id (buck2's `Build ID`, `--write-build-id`, or the link of 5.2) and a
+question. Each flow below is answered in one or two calls; the route is section 4's and
+the client command 4.8's (`kbf build ...`, JSON by default).
+
+| Flow | What the agent gets | Calls |
+|---|---|---|
+| (a) Did it pass; which actions failed and why | the invocation's `state`, `complete` and counts, and every failed, timed-out or refused action: its outcome, exit code, failure class, the farm's reason text for an INFRA failure, and its attempts (each rerun and why it was rerun) | one: `GET /v1/invocations/{id}/failures` (4.7); `kbf build failures <id>` |
+| (b) A failed action's stderr and stdout | a bounded tail of each, inline in the answer of (a), so the common case needs no second call; the whole log by link | none beyond (a); the whole log is a second call, `GET /v1/blobs/{digest}?inline=text` (4.6); `kbf build logs <id> <action>` |
+| (c) The command that ran, to reproduce it | its arguments, the names of its environment variables (never their values), its working directory, its platform properties, its timeout, and the node each attempt ran on | none beyond (a), while the Action and Command blobs are in the CAS (4.7); else `GET /v1/invocations/{id}/actions/{digest}` and its `blobs` links |
+| (d) Artifacts: list and download | each output file's path, digest, size and whether its bytes are still held, and a link to them | `GET /v1/invocations/{id}/artifacts` (or one action's `outputs`), then `GET /v1/blobs/{digest}`; `kbf build artifacts <id>` and `kbf build fetch <id> <action> <path>` |
+| (e) Metrics | queue and run times (min, p50, p90, max, sum), reruns by reason, CPU and peak memory per action and summed | one: `GET /v1/invocations/{id}/metrics` (4.4) for the build, the action rows for each action; `kbf build metrics <id>` |
+
+Three limits an agent must know, each said again where it applies:
+
+- **The farm sees actions, not the build.** REAPI has no end-of-build call, so the farm
+  cannot say the build passed: it says which of the actions it saw failed. buck2's own
+  exit code is the build's result; a failure buck2 found without the farm (a parse
+  error, a local action) is not in the record.
+- **Records do not survive a restart yet.** Until PRs 7 and 8 land, a server restart
+  loses every record, and the memory bound evicts idle ones (3.5). An agent reads soon
+  after its build. A record that is gone answers `404` with a body that says whether the
+  server could have held it (4.10).
+- **CPU and memory are `null` today** for every action a real driver ran (section 1);
+  PR 11 fills them.
 
 ## 1. What exists today
 
@@ -50,12 +82,23 @@ Read on `main`:
   by the server and segments are never deleted
   ([storage.md, Planned](storage.md#planned)); **Pins**, named retention roots, are
   planned there too.
-- **No HTTP read of a blob.** Blobs are served over REAPI ByteStream and CAS, and to
-  daemons over the worker listener, all gRPC.
+- **A blob over HTTP** (PR 5, `kbf-server/src/http_blobs.rs`): `GET /v1/blobs/{digest}`
+  on the operator API serves a CAS blob's verified bytes, `?inline=text` up to 4 MiB,
+  under the REAPI policy's `blobs.getAuthorizer`, and is `404` without that key (4.6).
 - **The operator API** ([api.md](../api.md)) serves `GET /v1/nodes`, the node actions,
-  `/healthz` and `/readyz` on `--api-listen`, HTTP/1.1 or h2c, without TLS. Its reads
-  answer anyone who reaches the address; the REAPI auth policy
-  ([reapi-auth.md](../reapi-auth.md)) does not run there.
+  `/healthz`, `/readyz` and the blob route on `--api-listen`, HTTP/1.1 or h2c, without
+  TLS. Its other reads answer anyone who reaches the address; the REAPI auth policy
+  ([reapi-auth.md](../reapi-auth.md)) runs on the blob route only. Its writes need the
+  `--api-token-file` token and a loopback peer.
+- **No credential is checked on a read.** The policy file builds the `allow`, `deny`,
+  `any` and `all` authentication policies only (`kbf-auth/src/policy.rs`; `jwt`,
+  `tlsClientCertificate` and the rest are refused as not built yet). None reads a
+  credential, so a request is accepted or refused whoever sends it: an agent on
+  another machine can read only a server open to everyone who reaches it (4.9).
+- **A timed-out action's logs are not listed.** The farm answers a timeout with the
+  partial ActionResult the daemon sent, but the recorder keeps a listing only for an
+  action that ran to an exit (`kbf-server/src/farm/record.rs`), so a timed-out row
+  has no stdout or stderr digest (PR 12 lists it).
 - **The client text channel is unused.** `ExecuteResponse` is built with `result`,
   `cached_result` and `status` only; `message` and `server_logs` are empty.
 
@@ -410,18 +453,19 @@ microseconds; digests are `"<sha256 hex>-<size>"`.
 | Route | Answers |
 |---|---|
 | `GET /v1/invocations/{id}` | the invocation (3.1), with `url`, and links to the routes below |
+| `GET /v1/invocations/{id}/failures` | what an agent reads first (4.7): the invocation's state and counts, and a page of its failed, timed-out and refused actions, each with its reason, its attempts, its command and the tails of its stderr and stdout |
 | `GET /v1/invocations/{id}/actions` | a page of action rows (3.2); `?outcome=failed\|ok\|timed_out\|refused`, `?how=...` |
 | `GET /v1/invocations/{id}/actions/{digest}` | one action: its row, with its outputs, stdout, stderr and usage as copied into it (3.2) and whether each blob is still available |
 | `GET /v1/invocations/{id}/artifacts` | a page of output files and directories across its actions |
 | `GET /v1/invocations/{id}/logs` | a page of stdout and stderr links, failed actions first |
 | `GET /v1/invocations/{id}/metrics` | aggregates (4.4) |
-| `GET /v1/blobs/{digest}?instance=<name>&name=<file>` | a blob's bytes: the HTTP read path that does not exist today |
+| `GET /v1/blobs/{digest}?instance=<name>&name=<file>` | a blob's bytes (4.6; built, PR 5) |
 
 `{id}` is an id of 2.2 or a derived `<id>~<n>` key of 2.4, matched as bytes; anything else
 is `404`. `instance` is a query parameter because REAPI instance names may contain `/`.
-A record that is gone (its pin expired, it was deleted, or in stage 1 it was evicted)
-answers `404` on every route, a page token made for it included (4.5). There is no
-route across invocations (3.7).
+A record that is gone (its pin expired, it was deleted, or in stage 1 it was evicted or
+lost at a restart) answers `404` on every route, a page token made for it included
+(4.5), with the body of 4.10. There is no route across invocations (3.7).
 
 ### 4.2 Shapes
 
@@ -439,7 +483,8 @@ GET /v1/invocations/0b8c...-...
              "failed": 2, "ac_hit": 5120, "ac_miss": 812,
              "bytes_uploaded": 1234567, "bytes_downloaded": 89012345},
   "collisions": [],
-  "links": {"actions": "/v1/invocations/0b8c.../actions", "artifacts": "...",
+  "links": {"failures": "/v1/invocations/0b8c.../failures",
+            "actions": "/v1/invocations/0b8c.../actions", "artifacts": "...",
             "logs": "...", "metrics": "..."}
 }
 ```
@@ -496,7 +541,8 @@ the operator API's "anyone who reaches the address" rule.
   today, made explicit.
 - Today only `allow`, `deny`, `any` and `all` authentication is built; `jwt` and
   `tlsClientCertificate` are planned. Until they land, a public deployment protects its
-  pages with an authenticating proxy in front of the listener. A planned `invocationOwner`
+  pages with an authenticating proxy in front of the listener, and an agent on another
+  machine has no credential to present: 4.9 is what it needs. A planned `invocationOwner`
   authorizer allows a caller whose `public` metadata equals the record's owner. That
   needs a new authorizer input: today an authorizer is asked with an instance name only,
   and this one must also see the record's owner; it lands with its own interface change,
@@ -547,6 +593,171 @@ separate design.
   never runs as a page on the API's origin.
 - `Range` requests are honored. A malformed digest is `400`, an absent blob `404`.
 - Each read is a touch, as on ByteStream.
+
+### 4.7 The failures view
+
+`GET /v1/invocations/{id}/failures` is what an agent reads first. It is a route of its
+own, not a field of the invocation answer: its log tails cost a CAS read each and are
+paged, while the invocation answer stays one small read of the record that a page or a
+poll repeats cheaply. Each page carries the invocation's header, so flows (a) to (c) of
+[What an agent needs](#what-an-agent-needs) are one call.
+
+**What it lists**: every action row whose outcome is not `ok` with exit code 0: an OK
+status with a non-zero exit, a non-OK status, `timed_out` and `refused`, in first-seen
+order (3.2). Failed, timed-out and refused actions are listed together in the order the
+farm saw them, not grouped by kind: the earliest is the likeliest cause, and a later
+page never reorders an earlier one while the build is still writing. An action still in
+flight is not listed; `state: "open"` says more may come. An action that passed after a
+rerun is not a failure: its reruns are in its row's attempts and in the metrics (4.4).
+
+```json
+GET /v1/invocations/{id}/failures?page_size=20
+{
+  "invocation": {"id": "0b8c...", "state": "idle", "complete": true,
+                 "rows_capped": false, "counts": {"failed": 2, "...": 0}},
+  "failures": [
+    {"action": "e3b0...-142", "href": "/v1/invocations/0b8c.../actions/e3b0...-142",
+     "target": null, "mnemonic": null,
+     "outcome": {"ok": {"exit_code": 1}},
+     "failure": null,
+     "attempts": [
+       {"worker": "node-a", "queued_micros": 1200, "run_micros": 900000,
+        "end": {"requeue": "silent"}},
+       {"worker": "node-b", "queued_micros": 800, "run_micros": 1500000,
+        "end": {"result": "ok"}}],
+     "command": {"arguments": ["cc", "-c", "a.c", "-o", "out/a.o"],
+                 "environment_names": ["PATH", "LANG"], "working_directory": "",
+                 "platform": {"OSFamily": "linux"}, "timeout_micros": null,
+                 "output_paths": ["out/a.o"]},
+     "stderr": {"digest": "...", "bytes": 10485760, "available": true,
+                "tail": "...a.c:3: error: ...\n", "tail_bytes": 16384,
+                "truncated": true, "href": "/v1/blobs/...?inline=text"},
+     "stdout": null,
+     "usage": null}
+  ],
+  "next_page_token": "..."
+}
+```
+
+- **Why it failed**: `outcome` as in 4.2 (a `failed` outcome carries the gRPC status
+  and message, `refused` the farm's reason); `failure` is the last attempt's failure
+  class (`log.proto` `Failure`: timeout, infra, invalid, out of memory, node memory
+  pressure, missing input, lost) with the daemon's reason text, capped at 1 KiB (3.2):
+  for an INFRA failure, the farm's own reason (`null`, as here, for an action that ran
+  to a non-zero exit). `stdout` or `stderr` is `null` when the result has none. `attempts` lists every lease with its
+  worker, its queue time (queued to granted) and run time (granted to ended), and how
+  it ended: the reruns and why.
+- **The command** is read when the page is answered, from the Action blob (its
+  platform, its timeout, the Command digest) and the Command blob (arguments,
+  environment variable names, working directory, output paths). The record keeps
+  neither (3.2, section 6), so `command` is `null` and `command_available: false` once
+  either blob has left the CAS, or when the client never uploaded the Action. Values
+  of environment variables are never put in the answer: they are where a secret most
+  often is, and an agent that needs them reads the Command blob by its link (4.2
+  `blobs`) under the same authorizer. The node is each attempt's `worker`;
+  `GET /v1/nodes` describes it.
+- **Log tails.** For each of stderr and stdout: the last 16 KiB of the blob, cut at the
+  byte, decoded as UTF-8 lossily (an invalid or cut sequence becomes U+FFFD), with
+  `bytes` the whole log's size and `truncated: true` when the log is longer than the
+  tail. The blob is read whole through `Cache::read_blob` and verified before a byte of
+  it is used, as on the blob route (4.6: the cache keeps one digest per blob and cannot
+  check a part), under that route's read budget; a log over 64 MiB gets no tail
+  (`tail: null`, `tail_omitted: "too_large"`) and is read by its link. The tails of one
+  answer total at most 1 MiB; past that, later entries say
+  `tail_omitted: "answer_budget"` and the next page carries them. A log no longer in
+  the CAS says `available: false`, `tail: null`. Each read is a touch.
+- **Who may read**: the `invocations` authorizer of 4.3 for the route; the tails and
+  `command` are blob bytes, so they also need `blobs`: with `invocations` and no
+  `blobs`, both are `null`, as the `href`s are.
+- **Paging**: 4.5's rules; `page_size` default 20, maximum 100. In stage 2 the root's
+  failed-row positions (3.5) give the rows without a scan of the chunks.
+
+### 4.8 The client: `kbf build`
+
+A Rust command, `kbf`, in a new `kbf-cli` crate (one binary, no interpreter or shell),
+so an agent never hand-writes HTTP:
+
+| Command | Reads |
+|---|---|
+| `kbf build show <id>` | `GET /v1/invocations/{id}` |
+| `kbf build failures <id>` | `GET /v1/invocations/{id}/failures`, every page |
+| `kbf build logs <id> [<action>] [--stream stderr\|stdout] [--full]` | the failures' tails; with `--full`, the whole log from `GET /v1/blobs` |
+| `kbf build artifacts <id> [<action>]` | `GET /v1/invocations/{id}/artifacts`, or one action's `outputs` |
+| `kbf build fetch <id> <action> <path> [-o <file>]` | `GET /v1/blobs/{digest}` of that output |
+| `kbf build metrics <id>` | `GET /v1/invocations/{id}/metrics` |
+
+- `<id>` is an id of 2.2 or a link of 5.2 (a build link or an action link): the client
+  takes the id, and the action digest, from the link's path, and still sends every
+  request to the configured server, never to the link's host.
+- **JSON by default**, in the API's own shapes (a paged route's pages merged into one
+  array). `--human` prints a short form: one line per failure with its target or
+  digest, outcome and worker, then the stderr tail. JSON is the default, rather than
+  chosen by whether stdout is a terminal, because an agent may run under a
+  pseudo-terminal and must get the same bytes either way.
+- **Exit status**: 0 the server answered (a build with failures included: the answer
+  says so), 3 no record (4.10's body is printed), 4 refused (`401` or `403`), 2 a usage
+  error, 1 anything else. An agent branches on the status, not on text.
+- **Server and token**: `--server <url>` and `--token-file <path>`; absent, the keys
+  `server` and `token_file` of `kbf/client.toml` under the platform's config directory
+  (`$XDG_CONFIG_HOME`, default `~/.config`). The token is never on the command line or in
+  the config file itself (argv is readable by every user); its file must be the user's
+  alone (mode 0600 or 0400), checked as the server checks its own token file
+  (`kbf-server/src/token.rs`). With a token, over plain HTTP to an address that is not
+  loopback, the client prints one warning line to stderr and goes on (4.9).
+
+### 4.9 Reading from another machine: tokens
+
+Today (section 1) the policy file builds the `allow`, `deny`, `any` and `all`
+authentication policies only, and none reads a credential. So an agent on another
+machine can read the invocation and blob routes only from a server whose policy allows
+everyone who reaches the listener, or through an authenticating proxy the deployment
+runs. The requirement, landing with the client tokens of issue 227:
+
+- **A `bearerToken` authentication policy** in the policy file, over 227's client
+  token file (`<principal> <role> <qos> sha256:<hex>` lines, digests only, re-read when
+  it changes). A request whose `Authorization: Bearer <token>` hashes to a line is
+  authenticated as that principal (its `public` metadata: principal and role); no
+  header, or no match, is `401` with `WWW-Authenticate: Bearer`. Digests are compared
+  in constant time, as for the write token.
+- **Scoped read-only**: a `read` role, accepted by the invocation and blob routes and
+  refused by every REAPI service and every operator API write. The write token
+  (`--api-token-file`) stays separate, and loopback-only; it is not a read credential.
+- **Fail closed**: a policy naming `bearerToken` whose token file is missing, readable
+  by others or malformed stops the server at start (exit 2); a bad file at a re-read
+  refuses every token until a good one is read; without the `invocations` and `blobs`
+  keys the routes stay `404` (4.3).
+- **TLS stays optional** (ARCHITECTURE.md, security): a token sent in clear can be read
+  off the network, so a deployment that serves the API beyond loopback fronts it with
+  TLS (a terminating proxy) or runs it on a network that encrypts. The server warns
+  and does not refuse: the start line's `warning=plaintext-off-loopback` token names
+  `api` too when the API listener is plain text off loopback and a `bearerToken`
+  policy is set. 227's step 2 ("accepted only together with TLS") predates that rule;
+  it is updated to match.
+- `jwt` (planned) and an `invocationOwner` authorizer (4.3) come later; a read token is
+  what lets an agent off the server's host read its build now.
+
+### 4.10 A record that is gone
+
+Until PRs 7 and 8 land, a restart loses every record and the memory bound evicts idle
+ones (3.5): **an agent reads soon after its build.** The server cannot tell a lost id
+from one it never saw (in stage 1 it keeps nothing across a restart), so a "lost at
+restart" answer would be a guess. It answers `404`, on every route (4.1), with a body
+from which the agent can tell:
+
+```json
+{"error": "no_record", "id": "0b8c...", "records_since": "2026-10-11T08:00:00Z"}
+```
+
+`records_since` is the later of the server's start and the `last_seen` of the newest
+client-id invocation the bound has evicted (minted ones do not count: their ids are the
+server's own). Every evicted record's `last_seen` is at or before it, so a build whose
+calls went on past `records_since` would still be held: its `404` means the farm saw no
+call with that id (a build served from buck2's local caches, 5.2, or another server).
+A `404` for a build that ended before `records_since` means its record may have been
+lost; the agent reruns the build to see it again. The client says which (4.8, exit 3).
+In stage 2 a flushed record survives a restart (section 7: the unflushed window is lost
+and marked `complete: false`), and `records_since` is the oldest time the retention
+(3.6) still holds.
 
 ## 5. The link
 
@@ -628,8 +839,8 @@ commands.
    a deployment's choice; kbf ships no client wrapper.
 
 **Caveats.** The farm learns of a build only through REAPI calls. A build served
-entirely from buck2's local caches makes no call, and its page is `404` with
-`"the farm saw no call with this id"`. Actions deduplicated across two concurrent buck2
+entirely from buck2's local caches makes no call, and its page is `404` with the body
+of 4.10, whose `records_since` tells it from a record lost at a restart. Actions deduplicated across two concurrent buck2
 commands, and downloads made late by buck2's materializer, may carry the other command's
 id or none (read from source, not measured).
 
@@ -663,7 +874,7 @@ ingester is a second writer and not a second record. buck2 does not emit BES.
 |---|---|
 | Recorder channel full | events dropped, builds unaffected, invocation `complete: false` |
 | Memory bound reached | evict minted, then idle invocations; then the largest open one stops taking rows, `rows_capped: true` (3.5) |
-| Server crash or restart | stage 1: all records lost, a page answers `404`; stage 2: at most the unflushed window (120 s or 256 KiB) of each open invocation lost, marked `complete: false`; minted invocations lost |
+| Server crash or restart | stage 1: all records lost, a page answers `404` with `records_since` the new start (4.10); stage 2: at most the unflushed window (120 s or 256 KiB) of each open invocation lost, marked `complete: false`; minted invocations lost |
 | Object store down at flush | chunk kept in memory and retried; past `--invocation-memory`, oldest unflushed rows dropped and `complete: false` |
 | Failover (HA, planned) | the new leader's recorder reads each open invocation's pin (its current root) and continues in new chunks; each pin update is a compare-and-set on that root (3.5), so a deposed leader's update that commits late makes the next update fail, and the recorder rebuilds from the pin's current root and retries, never overwriting it; the old leader's unflushed window is lost and the invocation says `complete: false` |
 | Chunk lost or corrupt (the store has no bytes for it, or they fail their digest) | the page shows the surviving chunks' rows and a gap marker where the lost chunk's rows were (its row count and time range, from the root), and the invocation says `complete: false`; nothing restores it: the server alone writes a chunk (as it does a root), so no client holds its bytes to upload again |
@@ -693,104 +904,159 @@ ingester is a second writer and not a second record. buck2 does not emit BES.
 
 ## 9. Implementation plan
 
-Ordered; each is one pull request, S (under a day) or M (a few days). Each test says which
-defect it catches and the mutant planted to see it go red.
+Each is one pull request, S (under a day) or M (a few days). Each test says which defect
+it catches and the mutant planted to see it go red. **The numbers are names, not the
+order**: code and tests cite them (`section 9, PR 3`), so they are kept; 12 to 14 are
+new. The list runs in the order the work lands: the agent's path first (the read API,
+the failures view, the client, real CPU and memory, the link), then tokens for agents
+on other machines, then durability, and the HTML page for people last.
 
-1. **(S) Parse `RequestMetadata`.** The `kbf-front` layer and `CallMetadata`; the id on the
-   `execute` span. Tests: a header encoded by `prost` is read back field for field; a
-   golden header captured from one real buck2 build against a test server is read with the
-   expected UUID (catches reading the wrong header name or a wrong field number: plant
-   field 2 for 3, the golden goes red); oversize, undecodable ids and ids with a
-   character outside `[A-Za-z0-9._-]` (`~`, `<`, `/`, `%`) are absent and the call still
-   succeeds (plant "refuse on decode error", the call test goes red; plant the old
-   `[!-~]` set, the `~` and `<` cases go red); `.`, `..` and `-x` are absent (plant
-   dropping the first-character rule, the `..` case goes red). Also settles the open fact in [failure-classes.md](failure-classes.md) O2 about
-   which fields buck2 sends.
-2. **(S) The record model, pure.** `kbf.invocation.v1` protos and an `Invocation` type
-   built only from events; no clock, no I/O. Tests: every `how` and outcome; a requeued
-   then finished action has two attempts in order; a joined action copies its twin's
-   attempts; the row cap; squatting goes to `~2`; the row keeps output paths, digests and
-   the stdout and stderr digests (plant "drop outputs from the row", the listing test goes
-   red). Measures bytes per action (3.3) on a recorded event stream and states it.
-3. **(M) The in-memory recorder** wired to the seams of 3.4, with the bounded channel and
-   memory bound. Tests: a full channel drops and marks `complete: false` without blocking
-   (plant an awaiting send, the test's timeout catches it); eviction takes minted, then
-   the least recently seen idle record; an invocation whose only operation has run for
-   longer than the idle time, with no call, is not idle and not evicted (plant
-   "`last_seen` = last call", red); at the bound with only open invocations the largest
-   says `rows_capped` and memory stays under the bound; an end-to-end run with fake
-   daemons (`kbf-server`'s test support) yields the expected rows for a hit, a run, a
-   requeue and a failure.
-4. **(M) The read API** (4.1 to 4.5 minus blobs) and the policy keys (4.3). Tests: paging
-   while rows are appended never skips or repeats (property test); a token with another
-   filter is `400`; with no `invocations` key the routes are `404` (plant "default allow",
-   it goes red); with `invocations` and no `blobs`, `href`s are `null`; an authorizer
-   refusing one instance refuses the page; `{id}` with `<`, `%3C` or `/` is `404`; a
-   page token for a record evicted after the token was issued is `404` (plant "resolve
-   the token's position anyway", red).
-5. **(S) Blobs over HTTP** (4.6). Tests: bytes equal ByteStream's; a store returning
-   corrupt bytes yields an error, not the bytes (plant skipping verification, red);
-   `Range`; a `name` with `"`, `;` and non-ASCII comes back as a well-formed `filename*`
-   (plant raw splicing, red); `nosniff` and `sandbox` on every answer, `inline` included
-   (plant dropping them, red); `inline` refused for a blob over 4 MiB.
-6. **(S) `--invocation-url-template`, the messages and the `/build/{id}` redirect.**
-   Tests: template validation (no `{id}`, two, non-http) exits 2; a failed Execute's
-   response carries both links in `ExecuteResponse.message`; a timed-out, a
-   missing-input and a refused answer each have a status message that starts with its
-   text of today and ends with the link (plant "replace the message", the prefix check
-   goes red; plant "message only in `ExecuteResponse`", the non-OK cases go red); the
-   id-less fallback mints a `kbf-` id whose page exists; `GET /build/{id}` answers `303`
-   to the API route.
-7. **(M) The pin command and its log format**, in the same format bump as Pins
-   ([storage.md](storage.md#planned)); ordered with the HA work (PR #303). The command
-   is `{id, prev_root, new_root, added_chunk_digests}` with its hold-until time, applied
-   as a compare-and-set on `prev_root`; `MetaState` keeps each pin's root and its
-   accumulated closure, and `Collect` keeps every digest in a live pin's closure
-   (3.5). Tests: a log of the new format replays pins, their closures and their
-   hold-until; a reader of `Format::V1` refuses the new format rather than skipping the
-   entry (plant "skip unknown", red); a pin update with a stale `prev_root` is refused
-   and leaves the pin unchanged (plant "skip the check", red); a pin update whose
-   `new_root` is not in the blob index is refused (plant "skip the index check", red);
-   a collection keeps every digest of a live pin's closure, including a chunk named only
-   by an earlier update, and frees them once the pin expires (plant "keep only the
-   last update's chunks", red); a collection run with the object store unreachable
-   (every read fails) gives the same result as with it reachable (plant "parse the
-   root", red).
-8. **(M) Durable records** (3.5 stage 2): chunks as CAS blobs, roots, the flush rule of
-   3.4, recovery marking open invocations incomplete. Tests: restart keeps every flushed
-   row; a crash loses at most the window; an idle invocation is flushed once and then
-   writes nothing (plant a 10 s timer, the log-entry count goes red); a minted
-   invocation (2.3) writes no chunk and no pin (plant "flush minted invocations like any
-   other", the log-entry count goes red); every chunk and root carries the version, id,
-   sequence number and base times of 3.5, and a root carries per-chunk counts and time
-   ranges, targets, statuses, metrics and failed-row positions (a decode test of each
-   field; plant "omit the failed-row positions", the failed-first test goes red); the
-   metrics route and the failed-first logs route on a flushed invocation read the root
-   and no chunk (count the store's reads; plant "scan every chunk", red); a chunk
-   deleted from the store, or corrupted, leaves a page of the surviving rows with a gap
-   marker and `complete: false` (plant "skip a missing chunk silently", the
-   `complete` check goes red); `kbf-sim-cell` gains the property "every pinned root's
-   chunks are readable".
-9. **(S) Retention and delete**: pin expiry, `DELETE`, `--invocation-pin-outputs=failed`.
-   **Blocked on collection**, which the server does not run today (section 1). The
-   failed actions' digests ride in the pin command (3.6). Tests: an expired pin is
-   collected; a page token issued before its pin expired answers `404` after (plant
-   "serve the token's position", red); a pinned failed action's ActionResult and stderr survive a
-   collection that frees its successful neighbour's; after its neighbour's blobs are
-   collected the neighbour's page still lists its outputs with `available: false` (plant
-   "read outputs from the ActionResult", red).
-10. **(S) The HTML page of `/build/{id}`.** Tests: a record whose target, mnemonic,
-    reason text and output path contain `<script>`, `"` and `&` renders them escaped
-    (plant one unescaped field, red); the page has no `<script>` element and carries
-    `nosniff` and the CSP (plant dropping them, red); without `Accept: text/html` the
-    answer is still the `303`.
-11. **(S, separate track) `ResourceUsage` from the native and container drivers**, already
-    planned in [scheduler.md](scheduler.md#accounting); until then `usage` is `null`.
-    Tests: an action that burns a known CPU time and allocates a known amount reports at
-    least those (plant "report zeros", red), in each driver's own tests.
+**Landed**: 1, 2, 3 and 5.
 
-PRs 1 to 6 give a working page, reached by the printed link, that lives until restart;
-7 and 8 make it durable.
+- **1. (S) Parse `RequestMetadata`.** The `kbf-front` layer and `CallMetadata`; the id on the
+  `execute` span. Tests: a header encoded by `prost` is read back field for field; a
+  golden header captured from one real buck2 build against a test server is read with the
+  expected UUID (catches reading the wrong header name or a wrong field number: plant
+  field 2 for 3, the golden goes red); oversize, undecodable ids and ids with a
+  character outside `[A-Za-z0-9._-]` (`~`, `<`, `/`, `%`) are absent and the call still
+  succeeds (plant "refuse on decode error", the call test goes red; plant the old
+  `[!-~]` set, the `~` and `<` cases go red); `.`, `..` and `-x` are absent (plant
+  dropping the first-character rule, the `..` case goes red). Also settles the open fact in [failure-classes.md](failure-classes.md) O2 about
+  which fields buck2 sends.
+- **2. (S) The record model, pure.** `kbf.invocation.v1` protos and an `Invocation` type
+  built only from events; no clock, no I/O. Tests: every `how` and outcome; a requeued
+  then finished action has two attempts in order; a joined action copies its twin's
+  attempts; the row cap; squatting goes to `~2`; the row keeps output paths, digests and
+  the stdout and stderr digests (plant "drop outputs from the row", the listing test goes
+  red). Measures bytes per action (3.3) on a recorded event stream and states it.
+- **3. (M) The in-memory recorder** wired to the seams of 3.4, with the bounded channel and
+  memory bound. Tests: a full channel drops and marks `complete: false` without blocking
+  (plant an awaiting send, the test's timeout catches it); eviction takes minted, then
+  the least recently seen idle record; an invocation whose only operation has run for
+  longer than the idle time, with no call, is not idle and not evicted (plant
+  "`last_seen` = last call", red); at the bound with only open invocations the largest
+  says `rows_capped` and memory stays under the bound; an end-to-end run with fake
+  daemons (`kbf-server`'s test support) yields the expected rows for a hit, a run, a
+  requeue and a failure.
+- **5. (S) Blobs over HTTP** (4.6). Tests: bytes equal ByteStream's; a store returning
+  corrupt bytes yields an error, not the bytes (plant skipping verification, red);
+  `Range`; a `name` with `"`, `;` and non-ASCII comes back as a well-formed `filename*`
+  (plant raw splicing, red); `nosniff` and `sandbox` on every answer, `inline` included
+  (plant dropping them, red); `inline` refused for a blob over 4 MiB.
+
+**Next, in this order**: 4, 12, 13, 11, 6, 14, 7, 8, 9, 10.
+
+- **4. (M) The read API** (4.1 to 4.5, and the `404` body of 4.10) and the policy keys (4.3). Tests: paging
+  while rows are appended never skips or repeats (property test); a token with another
+  filter is `400`; with no `invocations` key the routes are `404` (plant "default allow",
+  it goes red); with `invocations` and no `blobs`, `href`s are `null`; an authorizer
+  refusing one instance refuses the page; `{id}` with `<`, `%3C` or `/` is `404`; a
+  page token for a record evicted after the token was issued is `404` (plant "resolve
+  the token's position anyway", red); after a restart a `404` body's
+  `records_since` is the server's start, and after an eviction it is the evicted
+  record's `last_seen` (plant "`records_since` = start only", the eviction case goes
+  red).
+- **12. (M) The failures view and log tails** (4.7), and the timed-out action's listing
+  (section 1: the recorder lists the partial result the farm answers a timeout with).
+  Tests: a timed-out action is listed, with the tail of its partial stderr (plant
+  "failed only", the route lists only `failed` outcomes: red; plant "listing for an
+  exit only", the tail check goes red); an OK status with exit 1 and a refused action
+  are listed, and an action that passed after a rerun is not (plant "outcome is OK"
+  without the exit code, red); the order is first-seen across kinds and stays stable
+  while rows are appended (plant "sort by kind", red); a 10 MiB stderr comes back as
+  its last 16 KiB with `truncated: true` and `bytes` 10485760 (plant no cap, red;
+  plant the head for the tail, red); a tail that cuts a multi-byte character starts
+  with U+FFFD and the answer is valid JSON (plant a strict decode, red: the route
+  errors); a page whose tails pass 1 MiB marks the rest `answer_budget` (plant no
+  budget, red); a corrupt log blob gives no tail, never its bytes (plant skipping
+  verification, red); from a Command whose environment holds a marker value, `command`
+  carries the arguments and the variable's name and no byte of the value (plant "copy
+  the environment", the marker check goes red); with `invocations` and no `blobs`,
+  tails and `command` are `null` (plant "tails without `blobs`", red); a Command blob
+  gone gives `command_available: false`.
+- **13. (S) The client, `kbf build`** (4.8). Tests, against a test server holding a
+  recorded build: `kbf build failures` output parses as the route's shape, read into
+  the server's own response types (plant a renamed field in the client, red);
+  `--human` prints the failure's digest and its stderr tail; a `404` exits 3 with the
+  body printed and a `401` exits 4 (plant "exit 1 for every error", red); an action
+  link gives its id and digest, and the request goes to `--server`, not to the link's
+  host (plant "follow the link's host", red: a second test server bound for the link
+  sees a request); a token file readable by its group is refused (plant dropping the
+  mode check, red); the config file's `server` is used when `--server` is absent and
+  the flag wins when both are given (plant "config wins", red).
+- **11. (S, a driver track) `ResourceUsage` from the native and container drivers**, already
+  planned in [scheduler.md](scheduler.md#accounting); until then `usage` is `null`.
+  Tests: an action that burns a known CPU time and allocates a known amount reports at
+  least those (plant "report zeros", red), in each driver's own tests.
+- **6. (S) `--invocation-url-template`, the link on failed actions and the `/build/{id}`
+  redirect.**
+  Tests: template validation (no `{id}`, two, non-http) exits 2; a failed Execute's
+  response carries both links in `ExecuteResponse.message`; a timed-out, a
+  missing-input and a refused answer each have a status message that starts with its
+  text of today and ends with the link (plant "replace the message", the prefix check
+  goes red; plant "message only in `ExecuteResponse`", the non-OK cases go red); the
+  id-less fallback mints a `kbf-` id whose page exists; `GET /build/{id}` answers `303`
+  to the API route.
+- **14. (M) Read tokens**, with issue 227 (4.9). Tests: a listed read token reads a
+  page; no header, or a wrong token, is `401` with `WWW-Authenticate: Bearer` (plant
+  "accept any bearer", red); a read token is refused on Execute, on a CAS write and on
+  an operator API write (plant "role unchecked", red); the write token is not accepted
+  on a read (plant "accept the write token", red); a policy naming `bearerToken` whose
+  token file is readable by others, or malformed, stops the server at start with exit
+  2 (plant "start with no tokens", red: the server starts); a bad file at a re-read
+  refuses the tokens the old file held (plant "keep the last good set", red); plain
+  text off loopback with a `bearerToken` policy starts, and its start line says
+  `warning=plaintext-off-loopback` with `api` (plant "refuse to start", red; plant "no
+  warning", red).
+- **7. (M) The pin command and its log format**, in the same format bump as Pins
+  ([storage.md](storage.md#planned)); ordered with the HA work (PR #303). The command
+  is `{id, prev_root, new_root, added_chunk_digests}` with its hold-until time, applied
+  as a compare-and-set on `prev_root`; `MetaState` keeps each pin's root and its
+  accumulated closure, and `Collect` keeps every digest in a live pin's closure
+  (3.5). Tests: a log of the new format replays pins, their closures and their
+  hold-until; a reader of `Format::V1` refuses the new format rather than skipping the
+  entry (plant "skip unknown", red); a pin update with a stale `prev_root` is refused
+  and leaves the pin unchanged (plant "skip the check", red); a pin update whose
+  `new_root` is not in the blob index is refused (plant "skip the index check", red);
+  a collection keeps every digest of a live pin's closure, including a chunk named only
+  by an earlier update, and frees them once the pin expires (plant "keep only the
+  last update's chunks", red); a collection run with the object store unreachable
+  (every read fails) gives the same result as with it reachable (plant "parse the
+  root", red).
+- **8. (M) Durable records** (3.5 stage 2): chunks as CAS blobs, roots, the flush rule of
+  3.4, recovery marking open invocations incomplete. Tests: restart keeps every flushed
+  row; a crash loses at most the window; an idle invocation is flushed once and then
+  writes nothing (plant a 10 s timer, the log-entry count goes red); a minted
+  invocation (2.3) writes no chunk and no pin (plant "flush minted invocations like any
+  other", the log-entry count goes red); every chunk and root carries the version, id,
+  sequence number and base times of 3.5, and a root carries per-chunk counts and time
+  ranges, targets, statuses, metrics and failed-row positions (a decode test of each
+  field; plant "omit the failed-row positions", the failed-first test goes red); the
+  metrics route and the failed-first logs route on a flushed invocation read the root
+  and no chunk (count the store's reads; plant "scan every chunk", red); a chunk
+  deleted from the store, or corrupted, leaves a page of the surviving rows with a gap
+  marker and `complete: false` (plant "skip a missing chunk silently", the
+  `complete` check goes red); `kbf-sim-cell` gains the property "every pinned root's
+  chunks are readable".
+- **9. (S) Retention and delete**: pin expiry, `DELETE`, `--invocation-pin-outputs=failed`.
+  **Blocked on collection**, which the server does not run today (section 1). The
+  failed actions' digests ride in the pin command (3.6). Tests: an expired pin is
+  collected; a page token issued before its pin expired answers `404` after (plant
+  "serve the token's position", red); a pinned failed action's ActionResult and stderr survive a
+  collection that frees its successful neighbour's; after its neighbour's blobs are
+  collected the neighbour's page still lists its outputs with `available: false` (plant
+  "read outputs from the ActionResult", red).
+- **10. (S) The HTML page of `/build/{id}`.** Tests: a record whose target, mnemonic,
+  reason text and output path contain `<script>`, `"` and `&` renders them escaped
+  (plant one unescaped field, red); the page has no `<script>` element and carries
+  `nosniff` and the CSP (plant dropping them, red); without `Accept: text/html` the
+  answer is still the `303`.
+
+PRs 4, 12 and 13 give an agent the build it just ran: what failed, why, its logs and its
+command, in one call, until the server restarts (4.10). 11 fills CPU and memory; 6 puts
+the link in failed actions' messages; 14 lets an agent on another machine read; 7 and 8
+make records survive a restart; 9 keeps a failed action's outputs; 10, the page for
+people, comes last.
 
 ## 10. Open questions
 
@@ -804,7 +1070,7 @@ Each with a recommendation; none is decided here.
 3. **Reading pages before real authentication exists.** Recommend fail closed (4.3): the
    routes are off unless the policy file names an `invocations` authorizer or
    `--invocations-open` is given; a public deployment fronts the listener with an
-   authenticating proxy until `jwt` lands.
+   authenticating proxy until the read tokens of 4.9 (or `jwt`) land.
 4. **How long to keep a build.** Recommend the record 30 days, and with it the list of
    every action's outputs and logs (paths and digests are copied into the row, 3.2);
    their bytes on the CAS's own retention (7 days after the last touch), so after a week
