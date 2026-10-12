@@ -19,17 +19,10 @@ use support::{
     MemoryCas, PROMPT, Spec, alive, config, no_leases, pid_in, run, runtime, scratch, work,
 };
 
-/// A Perl program that forks a child which leaves the process group (`setsid`),
-/// prints its pid and sleeps; the leader waits until a few polls have
-/// seen the child, then exits, so the child is orphaned and reparented.
-const ESCAPER: &str = r#"
-use POSIX ();
-my $pid = fork();
-if ($pid == 0) { POSIX::setsid(); sleep 300; exit 0; }
-print "$pid\n";
-select(undef, undef, undef, 0.3);
-exit 0;
-"#;
+/// Act steps that start a child which leaves the process group (`setsid`) and
+/// sleeps, and print its pid; the leader waits until a few polls have seen the child,
+/// then exits, so the child is orphaned and reparented.
+const ESCAPER: &str = "spawn-child --pid - setsid ;; sleep 300 ; sleep 0.3 ; exit 0";
 
 /// Where a test action writes its pid: in its working directory, since the sandbox
 /// lets an action write nowhere outside its lease.
@@ -62,13 +55,13 @@ async fn processes_left_behind_after_exit_are_killed() {
     let config = config(&dir);
     let cas = Arc::new(MemoryCas::default());
     let rt = runtime(config.clone(), &cas);
-    let spec = Spec::sh("sleep 300 & echo $!; exit 0");
+    let spec = Spec::act("spawn-child --pid - sleep 300 ; exit 0");
     let result = run(&rt, &cas, 1, &spec).await.expect("ran");
     assert_eq!(result.exit_code, 0);
     let pid = pid_of(&cas, &result);
     assert!(!alive(pid), "the background child {pid} outlived the lease");
 
-    let spec = Spec::argv(&["/usr/bin/perl", "-e", ESCAPER]);
+    let spec = Spec::act(ESCAPER);
     let result = run(&rt, &cas, 2, &spec).await.expect("ran");
     assert_eq!(result.exit_code, 0, "{}", support::stderr(&cas, &result));
     let pid = pid_of(&cas, &result);
@@ -84,9 +77,10 @@ async fn a_timeout_ends_the_whole_tree() {
     let config = config(&dir);
     let cas = Arc::new(MemoryCas::default());
     let rt = runtime(config.clone(), &cas);
-    let spec = Spec::sh("sh -c 'sleep 300 & echo $! > \"$PIDFILE\"; wait' & wait")
-        .env("PIDFILE", PIDFILE)
-        .timeout(Duration::from_millis(500));
+    let spec = Spec::act(&format!(
+        "spawn-child spawn-child --pid {PIDFILE} sleep 300 ;; sleep 300 ; sleep 300"
+    ))
+    .timeout(Duration::from_millis(500));
     let pidfile = in_lease(&config, 1);
     let (outcome, pid) = tokio::join!(run(&rt, &cas, 1, &spec), pid_in(&pidfile));
     assert!(
@@ -106,9 +100,10 @@ async fn a_kill_ends_the_whole_tree_before_it_returns() {
     let cas = Arc::new(MemoryCas::default());
     let rt = Arc::new(runtime(config.clone(), &cas));
     let pidfile = in_lease(&config, 1);
-    let action = Spec::sh("sleep 300 & echo $! > \"$PIDFILE\"; wait")
-        .env("PIDFILE", PIDFILE)
-        .store(&cas);
+    let action = Spec::act(&format!(
+        "spawn-child --pid {PIDFILE} sleep 300 ; sleep 300"
+    ))
+    .store(&cas);
     let running = tokio::spawn({
         let rt = Arc::clone(&rt);
         async move { rt.run(work(1, action, 0)).await }
@@ -130,9 +125,10 @@ async fn a_dropped_run_ends_the_tree_and_cleans() {
     let cas = Arc::new(MemoryCas::default());
     let rt = runtime(config.clone(), &cas);
     let pidfile = in_lease(&config, 1);
-    let action = Spec::sh("sleep 300 & echo $! > \"$PIDFILE\"; wait")
-        .env("PIDFILE", PIDFILE)
-        .store(&cas);
+    let action = Spec::act(&format!(
+        "spawn-child --pid {PIDFILE} sleep 300 ; sleep 300"
+    ))
+    .store(&cas);
     let run = rt.run(work(1, action, 0));
     let watched = async {
         let pid = pid_in(&pidfile).await;
@@ -157,7 +153,7 @@ async fn processes_that_outlive_the_kill_wait_fail_the_lease() {
     config.kill_wait = Duration::ZERO;
     let cas = Arc::new(MemoryCas::default());
     let rt = runtime(config.clone(), &cas);
-    let outcome = run(&rt, &cas, 1, &Spec::sh("sleep 300 & exit 0")).await;
+    let outcome = run(&rt, &cas, 1, &Spec::act("spawn-child sleep 300 ; exit 0")).await;
     assert!(
         matches!(&outcome, Err(RuntimeError::Failed(why)) if why.contains("survived SIGKILL")),
         "{outcome:?}"
@@ -165,17 +161,12 @@ async fn processes_that_outlive_the_kill_wait_fail_the_lease() {
     assert!(no_leases(&config));
 }
 
-/// Perl that writes its pid to `$PIDFILE`, then fills and holds `$MIB` MiB and
-/// sleeps.
-const HOG: &str = r#"
-open(my $f, '>', $ENV{PIDFILE}) or die; print $f "$$\n"; close($f);
-my $x = "a" x ($ENV{MIB} * 1024 * 1024);
-sleep 300;
-"#;
+/// The steps of a child that fills and holds 256 MiB, then sleeps.
+const HOG: &str = "alloc 256 ;; sleep 300";
 
 /// Catches: the memory watch skipped (the hog runs to its timeout), memory counted
-/// for the leader only (the hog is a grandchild), the hog left alive after the kill,
-/// and an out-of-memory end reported as anything but OutOfMemory with the limit.
+/// for the leader only (the hog is the leader's child), the hog left alive after the
+/// kill, and an out-of-memory end reported as anything but OutOfMemory with the limit.
 #[tokio::test]
 async fn an_action_past_its_limit_is_killed_whole() {
     let dir = scratch("oom");
@@ -186,10 +177,7 @@ async fn an_action_past_its_limit_is_killed_whole() {
     };
     let cas = Arc::new(MemoryCas::default());
     let rt = runtime(config.clone(), &cas);
-    let action = Spec::sh("/usr/bin/perl -e \"$HOG\" & wait")
-        .env("PIDFILE", PIDFILE)
-        .env("HOG", HOG)
-        .env("MIB", "256")
+    let action = Spec::act(&format!("spawn-child --pid {PIDFILE} {HOG} ; sleep 300"))
         .timeout(Duration::from_secs(60))
         .store(&cas);
     let limit = 64 << 20;
@@ -218,9 +206,8 @@ async fn an_action_within_its_limit_runs_to_the_end() {
     let config = config(&dir);
     let cas = Arc::new(MemoryCas::default());
     let rt = runtime(config, &cas);
-    let script = "/usr/bin/perl -e 'open(my $f, \">\", $ENV{PIDFILE}); print $f \"$$\\n\"; close($f); my $x = \"a\" x (32*1024*1024); select(undef,undef,undef,0.3)'";
     for (seq, booked) in [(1, 64_u64 << 20), (2, 0)] {
-        let action = Spec::sh(script).env("PIDFILE", PIDFILE).store(&cas);
+        let action = Spec::act("alloc 32 ; sleep 0.3").store(&cas);
         let result = rt.run(work(seq, action, booked)).await.expect("ran");
         assert_eq!(result.exit_code, 0, "booked {booked}");
     }

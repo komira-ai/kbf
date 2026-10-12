@@ -4,7 +4,7 @@ use std::os::fd::OwnedFd;
 use super::*;
 use crate::autologin::SessionPaths;
 use crate::grant::testing::{key_line, sign, text};
-use crate::testing::{FakeHost, NOW, scratch, trace};
+use crate::testing::{FakeHost, NOW, act_argv, scratch, trace};
 
 /// The fake clock's time, as a grant's times count it.
 const NOW_SECS: i64 = NOW.cast_signed();
@@ -339,9 +339,7 @@ fn run_starts_the_process_as_the_lease_user_in_the_lease_directory() {
     let (mut out, write) = std::io::pipe().unwrap();
     let mut fds = fds(&rig.dir);
     fds[1] = write.into();
-    let argv = ["/bin/sh", "-c", "id -u; pwd; echo $HOME"]
-        .map(str::to_owned)
-        .to_vec();
+    let argv = act_argv("id ; pwd ; env HOME");
     let mut child = rig.helper.run("7.1", argv, Vec::new(), fds).unwrap();
     assert!(child.wait().unwrap().success());
     let mut text = String::new();

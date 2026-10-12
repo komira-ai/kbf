@@ -232,9 +232,10 @@ fn main_answers_under_any_name() {
     assert_eq!(text(&out.stdout), "from main\n");
 }
 
-/// Catches: a failed step exiting 0 or 2 (taken for success or for a typo); a
-/// malformed step found only when reached, after earlier steps ran; a failure with
-/// nothing on stderr; an argument that is not UTF-8 accepted.
+/// Catches: a failed step exiting 0 or 2 (taken for success or for a typo), a program
+/// `run` ran that failed among them; a malformed step found only when reached, after
+/// earlier steps ran, a child's step included; a failure with nothing on stderr; an
+/// argument that is not UTF-8 accepted.
 #[test]
 fn failures_exit_1_and_usage_errors_exit_2_before_any_step() {
     use std::os::unix::ffi::OsStrExt as _;
@@ -245,7 +246,19 @@ fn failures_exit_1_and_usage_errors_exit_2_before_any_step() {
     let taken = dir.join("taken");
     std::fs::write(&taken, "").expect("taken");
     let taken = taken.display().to_string();
-    let cases: [(&[&str], i32, &str); 12] = [
+    let no_dir_under_file = format!("{taken}/d");
+    let cases: [(&[&str], i32, &str); 19] = [
+        (&["mkdir", &no_dir_under_file], 1, "mkdir "),
+        (&["cat", &missing], 1, "read "),
+        (&["mtime", &missing, "0"], 1, "mtime "),
+        (&["run", &missing], 1, "run "),
+        (&["run", ACT, "exit", "3"], 1, "ended: exit status: 3"),
+        (
+            &["spawn-child", "--pid", &no_dir, "exit", "0"],
+            1,
+            "append to ",
+        ),
+        (&["spawn-child", "exit", "0", ";;", "nope"], 2, "bad step"),
         (&["rename", &missing, &early], 1, "rename "),
         (&["symlink", &missing, &taken], 1, "link "),
         (&["chmod", "644", &missing], 1, "chmod "),
@@ -392,4 +405,114 @@ fn alloc_holds_resident_memory() {
     // Let it exit by itself: a killed process writes no coverage data.
     let status = child.wait().expect("reaped");
     assert!(status.success(), "{status}");
+}
+
+/// Catches: `mkdir` making only the last directory (a test that writes into a nested
+/// output would fail for the wrong reason); `cat` printing other than the file's bytes;
+/// `mtime` setting another time, or none on a directory (a test of how old a leftover
+/// is would see it new); `pgid` printing another group than its own.
+#[test]
+fn directories_are_made_files_printed_and_times_set() {
+    use std::os::unix::process::CommandExt as _;
+    let dir = dir("act-mkdir-cat-mtime");
+    let nested = dir.join("a/b/c");
+    let file = dir.join("file");
+    std::fs::write(&file, "two\nlines\n").expect("file");
+    let [nested_arg, file_arg] = [&nested, &file].map(|p| p.display().to_string());
+    let child = act(&[
+        "mkdir",
+        &nested_arg,
+        ";",
+        "mtime",
+        &nested_arg,
+        "946684800",
+        ";",
+        "cat",
+        &file_arg,
+        ";",
+        "pgid",
+    ])
+    .stdout(Stdio::piped())
+    .process_group(0)
+    .spawn()
+    .expect("runs");
+    let pid = child.id();
+    let out = child.wait_with_output().expect("exits");
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    assert!(nested.is_dir(), "the nested directory is missing");
+    let modified = std::fs::metadata(&nested)
+        .and_then(|m| m.modified())
+        .expect("mtime");
+    assert_eq!(
+        modified,
+        std::time::UNIX_EPOCH + Duration::from_secs(946_684_800)
+    );
+    // Its own group: the test made it the leader of one.
+    assert_eq!(text(&out.stdout), format!("two\nlines\n{pid}\n"));
+}
+
+/// Catches: `run` not waiting for its program (the next step would run first), not
+/// passing its arguments, or giving it other output streams.
+#[test]
+fn run_waits_for_its_program_and_shares_its_output() {
+    let dir = dir("act-run");
+    let mark = dir.join("mark").display().to_string();
+    let out = output(&[
+        "run", ACT, "sleep", "0.2", ";", "append", &mark, "inner", ";", "echo", "from", "inner",
+        ";", "append", &mark, "outer",
+    ]);
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    assert_eq!(text(&out.stdout), "from inner\n");
+    assert_eq!(
+        std::fs::read_to_string(&mark).expect("mark"),
+        "inner\nouter\n"
+    );
+}
+
+/// Catches: `spawn-child --pid` reporting another process than the child (a test that
+/// waits for that pid to die would pass at once), writing it elsewhere than asked, or
+/// the child's `;;` steps not all run, or not in order.
+#[test]
+fn spawn_child_reports_its_pid_and_runs_every_step() {
+    let dir = dir("act-spawn-pid");
+    let (mark, pids) = (dir.join("mark"), dir.join("pids"));
+    let [mark_arg, pids_arg] = [&mark, &pids].map(|p| p.display().to_string());
+    let out = output(&[
+        "spawn-child",
+        "--pid",
+        "-",
+        "append",
+        &mark_arg,
+        "one",
+        ";;",
+        "setsid",
+        ";;",
+        "append",
+        &mark_arg,
+        "two",
+        ";;",
+        "sleep",
+        "3",
+        ";",
+        "spawn-child",
+        "--pid",
+        &pids_arg,
+        "exit",
+        "0",
+    ]);
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let pid: i32 = text(&out.stdout).trim().parse().expect("a pid");
+    eventually("the child ran its steps in order", || {
+        std::fs::read_to_string(&mark).is_ok_and(|m| m == "one\ntwo\n")
+    });
+    // The child leads a session of its own now, so the pid printed is the child's.
+    let child = rustix::process::Pid::from_raw(pid).expect("a pid");
+    assert_eq!(
+        rustix::process::getsid(Some(child)).expect("alive"),
+        child,
+        "the pid printed is not the child's"
+    );
+    let written = std::fs::read_to_string(&pids).expect("pids");
+    assert!(written.trim().parse::<u32>().is_ok(), "{written:?}");
+    assert!(written.ends_with('\n'), "{written:?}");
 }

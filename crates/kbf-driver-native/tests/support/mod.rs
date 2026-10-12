@@ -4,6 +4,8 @@
 
 // The keepers the driver starts come from the running binary: this test binary.
 kbf_daemon::keeper_test_hook!();
+// So do the actions of [`Spec::act`]: this test binary run as kbf-testkit's `kbf-act`.
+kbf_testkit::act_test_hook!();
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -75,7 +77,19 @@ impl Cas for MemoryCas {
     }
 }
 
-/// An action to store: `sh -c <script>` with an empty input root unless changed.
+/// A link to this test binary named `kbf-act`, made once: run through it, the binary
+/// runs kbf-testkit's act steps (`kbf_testkit::act`) instead of the tests.
+pub fn act() -> PathBuf {
+    static LINK: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    LINK.get_or_init(|| {
+        let link = scratch("act").join(kbf_testkit::act::NAME);
+        kbf_testkit::act::link_self(&link).expect("link");
+        link
+    })
+    .clone()
+}
+
+/// An action to store, with an empty input root unless changed.
 #[derive(Clone, Debug)]
 pub struct Spec {
     pub argv: Vec<String>,
@@ -88,8 +102,19 @@ pub struct Spec {
 }
 
 impl Spec {
+    /// `sh -c <script>`: for the macOS tests of what a user's own shell command, and
+    /// the system tools it runs, may do under the sandbox.
+    #[cfg(target_os = "macos")]
     pub fn sh(script: &str) -> Self {
         Self::argv(&["/bin/sh", "-c", script])
+    }
+
+    /// The act steps `steps`, split at spaces (see `kbf_testkit::act`).
+    pub fn act(steps: &str) -> Self {
+        let act = act();
+        let mut argv = vec![act.to_str().expect("UTF-8")];
+        argv.extend(steps.split(' '));
+        Self::argv(&argv)
     }
 
     pub fn argv(argv: &[&str]) -> Self {

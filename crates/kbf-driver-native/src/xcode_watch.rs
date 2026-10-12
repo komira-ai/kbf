@@ -165,7 +165,7 @@ mod tests {
     use tokio::sync::watch;
 
     use super::*;
-    use crate::xcode::tests::{NOT_AGREED, fake, link_xcodebuild, scratch};
+    use crate::xcode::tests::{NOT_AGREED, act_fake, link_xcodebuild, scratch, set_rules};
 
     /// [`super::watch`] as the node starts it, its part the only one of its driver
     /// watch: returns what the daemon takes, and the thread. The tests below read the
@@ -300,21 +300,15 @@ mod tests {
         let dir = scratch("watch");
         let apps = dir.join("Applications");
         std::fs::create_dir_all(apps.join("Xcode_16.app/Contents/Developer")).expect("app");
-        let accepted = dir.join("accepted");
-        // `-license check` passes once the file `accepted` exists, as after
-        // `sudo xcodebuild -license accept`.
-        let xcodebuild = fake(
-            &dir,
-            "xcodebuild",
-            &format!(
-                "#!/bin/sh\n\
-                 case \"$*\" in\n\
-                 -version) echo 'Build version 16C5032a' ;;\n\
-                 '-license check') [ -e '{}' ] || {{ echo '{NOT_AGREED}' >&2; exit 69; }} ;;\n\
-                 esac\n",
-                accepted.display()
-            ),
+        // `-license check` fails until the fake's rules change to `accepted`, as after
+        // `sudo xcodebuild -license accept`, and again once they change back, as after
+        // an update that brings a new licence.
+        let version = "-version\t-\techo Build version 16C5032a\n";
+        let not_accepted = format!(
+            "{version}-license check\t-\techo --stderr {NOT_AGREED} ; exit 69\n*\t-\texit 0\n"
         );
+        let accepted = format!("{version}*\t-\texit 0\n");
+        let xcodebuild = act_fake(&dir.join("xcodebuild"), &not_accepted);
         link_xcodebuild(&xcodebuild, &apps.join("Xcode_16.app"));
         let probe = Probe {
             xcrun: PathBuf::from("/bin/echo"),
@@ -340,7 +334,7 @@ mod tests {
         assert_eq!(state(&first), XcodeState::LicenseNotAccepted);
         assert_eq!(first.entries, []);
 
-        std::fs::write(&accepted, "").expect("accept");
+        set_rules(&xcodebuild, &accepted);
         let fixed = next(&mut reports);
         assert_eq!(state(&fixed), XcodeState::Ready);
         assert_eq!(fixed.entries, [("xcode".to_owned(), "16C5032a".to_owned())]);
@@ -348,7 +342,7 @@ mod tests {
         std::thread::sleep(every * 6);
         assert!(!reports.has_changed().expect("the watch runs"));
 
-        std::fs::remove_file(&accepted).expect("an update's new licence");
+        set_rules(&xcodebuild, &not_accepted);
         let broken = next(&mut reports);
         assert_eq!(state(&broken), XcodeState::LicenseNotAccepted);
         assert_eq!(broken.entries, []);
@@ -386,16 +380,13 @@ mod tests {
         let dir = scratch("restamp");
         let apps = dir.join("Applications");
         std::fs::create_dir_all(apps.join("Xcode_16.app/Contents/Developer")).expect("app");
-        let xcodebuild = fake(
-            &dir,
-            "xcodebuild",
+        // NSLog-style: the process id differs on every run.
+        let xcodebuild = act_fake(
+            &dir.join("xcodebuild"),
             &format!(
-                "#!/bin/sh\n\
-                 case \"$*\" in\n\
-                 -version) echo 'Build version 16C5032a' ;;\n\
-                 '-license check') echo \"$(date '+%Y-%m-%d %H:%M:%S') xcodebuild[$$:1] \
-                 {NOT_AGREED}\" >&2; exit 69 ;;\n\
-                 esac\n"
+                "-version\t-\techo Build version 16C5032a\n\
+                 -license check\t-\techo --stderr xcodebuild[$$:1] {NOT_AGREED} ; exit 69\n\
+                 *\t-\texit 0\n"
             ),
         );
         link_xcodebuild(&xcodebuild, &apps.join("Xcode_16.app"));
@@ -456,10 +447,9 @@ mod tests {
         let (one, two) = (copy("one"), copy("two"));
         let link = apps.join("Xcode_16.app");
         std::os::unix::fs::symlink(&one, &link).expect("link");
-        let xcodebuild = fake(
-            &dir,
-            "xcodebuild",
-            "#!/bin/sh\ncase \"$*\" in -version) echo 'Build version 16C5032a' ;; esac\n",
+        let xcodebuild = act_fake(
+            &dir.join("xcodebuild"),
+            "-version\t-\techo Build version 16C5032a\n*\t-\texit 0\n",
         );
         link_xcodebuild(&xcodebuild, &one);
         link_xcodebuild(&xcodebuild, &two);
@@ -520,15 +510,10 @@ mod tests {
         let apps = dir.join("Applications");
         std::fs::create_dir_all(apps.join("Xcode_16.app/Contents/Developer")).expect("app");
         let go = dir.join("go");
-        let xcodebuild = fake(
-            &dir,
-            "xcodebuild",
-            &format!(
-                "#!/bin/sh\n\
-                 i=0; while [ ! -e '{}' ] && [ $i -lt 200 ]; do sleep 0.1; i=$((i+1)); done\n\
-                 case \"$*\" in -version) echo 'Build version 16C5032a' ;; esac\n",
-                go.display()
-            ),
+        let wait = format!("wait-for {} 20", go.display());
+        let xcodebuild = act_fake(
+            &dir.join("xcodebuild"),
+            &format!("-version\t-\t{wait} ; echo Build version 16C5032a\n*\t-\t{wait}\n"),
         );
         link_xcodebuild(&xcodebuild, &apps.join("Xcode_16.app"));
         let probe = Probe {

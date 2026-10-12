@@ -49,6 +49,38 @@ pub(crate) fn fake(dir: &Path, name: &str, script: &str) -> PathBuf {
     path
 }
 
+/// A link to this test binary named `kbf-act`, made once: run through it, the binary
+/// runs kbf-testkit's act steps (`kbf_testkit::act`) instead of the tests.
+pub(crate) fn act() -> PathBuf {
+    static LINK: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    LINK.get_or_init(|| {
+        let link = scratch("act").join(kbf_testkit::act::NAME);
+        kbf_testkit::act::link_self(&link).expect("link");
+        link
+    })
+    .clone()
+}
+
+/// Makes `path` a link to this test binary, which answers as the fake tool its base
+/// name names (`xcrun`, `xcodebuild` or `sandbox-exec`), and gives it `rules`
+/// (`kbf_testkit::fake`). Returns `path`.
+pub(crate) fn act_fake(path: &Path, rules: &str) -> PathBuf {
+    kbf_testkit::act::link_self(path).expect("link");
+    set_rules(path, rules);
+    path.to_owned()
+}
+
+/// Replaces the rules of the fake at `path` with `rules` in one rename, so a run of it
+/// reads the old rules or the new ones, never part of either.
+pub(crate) fn set_rules(path: &Path, rules: &str) {
+    let (new, rules_file) = (
+        format!("{}.rules.new", path.display()),
+        format!("{}.rules", path.display()),
+    );
+    std::fs::write(&new, rules).expect("rules");
+    std::fs::rename(&new, rules_file).expect("rules in place");
+}
+
 /// The licence prompt's refusal, as a real Xcode prints it.
 pub(crate) const NOT_AGREED: &str = "You have not agreed to the Xcode license agreements.";
 
@@ -192,26 +224,26 @@ fn a_lookup_runs_sandboxed_and_sets_or_removes_developer_dir() {
 fn warm_looks_up_every_tool_for_every_xcode_sandboxed() {
     let dir = scratch("warm");
     let log = dir.join("log");
-    let xcrun = dir.join("xcrun");
-    let script = format!(
-        "#!/bin/sh\n\
-         echo \"${{DEVELOPER_DIR-none}} $*\" >> {}\n\
-         case \"$2\" in\n\
-         ld) echo 'not found' >&2; exit 1 ;;\n\
-         swift) case \"$DEVELOPER_DIR\" in /hung) exec sleep 60 ;; esac ;;\n\
-         esac\n",
-        log.display()
+    // Logs `<DEVELOPER_DIR, empty when unset> <arguments>`; `ld` is not found, and
+    // `swift` hangs for the Xcode `/hung`.
+    let logged = format!("append {} ${{DEVELOPER_DIR}} $*", log.display());
+    let xcrun = act_fake(
+        &dir.join("xcrun"),
+        &format!(
+            "--find ld\t-\t{logged} ; echo --stderr not found ; exit 1\n\
+             --find swift\tDEVELOPER_DIR=/hung\t{logged} ; sleep 60\n\
+             *\t-\t{logged}\n"
+        ),
     );
-    std::fs::write(&xcrun, script).expect("script");
-    std::fs::set_permissions(&xcrun, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    // Logs its lease parameter and the command's TMPDIR, then runs the command.
     let sandbox_log = dir.join("sandbox-log");
-    let sandbox_exec = dir.join("sandbox-exec");
-    let script = format!(
-        "#!/bin/sh\necho \"$2 TMPDIR=$TMPDIR\" >> {}\nshift 4\nexec \"$@\"\n",
-        sandbox_log.display()
+    let sandbox_exec = act_fake(
+        &dir.join("sandbox-exec"),
+        &format!(
+            "*\t-\tappend {} $2 TMPDIR=${{TMPDIR}}\n",
+            sandbox_log.display()
+        ),
     );
-    std::fs::write(&sandbox_exec, script).expect("script");
-    std::fs::set_permissions(&sandbox_exec, std::fs::Permissions::from_mode(0o755)).expect("chmod");
     let sandbox = Sandbox {
         isolation: Isolation::Sandbox(sandbox_exec),
         dir: dir.join("scratch/lease-warm-up"),
@@ -239,7 +271,8 @@ fn warm_looks_up_every_tool_for_every_xcode_sandboxed() {
             .map(str::to_owned)
             .collect()
     };
-    let want: Vec<String> = ["none", "/x1", "/hung"]
+    // The node's own Xcode is looked up with no DEVELOPER_DIR: empty in the log.
+    let want: Vec<String> = ["", "/x1", "/hung"]
         .iter()
         .flat_map(|dir| WARM_TOOLS.map(|tool| format!("{dir} --find {tool}")))
         .collect();
@@ -806,30 +839,37 @@ fn a_long_reason_is_cut() {
     assert_eq!(cut("short", 5), "short");
     assert_eq!(cut("abcdef", 3), "abc...");
     assert_eq!(cut("aé", 2), "a...");
-    let script = "head -c 2000 /dev/zero | tr '\\0' x >&2; exit 3";
-    let refused = answer(
-        Path::new("/bin/sh"),
-        &["-c", script],
-        Path::new("/"),
-        WITHIN,
-        None,
-    );
+    let long = "x".repeat(REASON_BYTES * 4);
+    let act = act();
+    let args = ["echo", "--stderr", &long, ";", "exit", "3"];
+    let refused = answer(&act, &args, Path::new("/"), WITHIN, None);
     let want = format!(
-        "/bin/sh -c {script} exited with exit status: 3: {}...",
+        "{} {} exited with exit status: 3: {}...",
+        act.display(),
+        args.join(" "),
         "x".repeat(REASON_BYTES)
     );
     assert_eq!(refused, Err(Unanswered::Refused(want)));
+}
+
+/// `echo` and `words` words of 999 `x`s: `words` thousand bytes, the newline included.
+fn thousands(stream: &str, words: usize) -> Vec<String> {
+    let word = "x".repeat(999);
+    std::iter::once("echo".to_owned())
+        .chain((stream == "stderr").then(|| "--stderr".to_owned()))
+        .chain(std::iter::repeat_n(word, words))
+        .collect()
 }
 
 /// Catches output read only after the process exits: a process that prints more
 /// than a pipe holds would block on the full pipe and be killed as hung.
 #[test]
 fn a_long_answer_is_read_whole() {
-    let mut command = std::process::Command::new("/bin/sh");
-    command.args([
-        "-c",
-        "head -c 300000 /dev/zero; head -c 200000 /dev/zero >&2",
-    ]);
+    let mut command = std::process::Command::new(act());
+    command
+        .args(thousands("stdout", 300))
+        .arg(";")
+        .args(thousands("stderr", 200));
     let out = output_within(command, WITHIN).expect("answers");
     assert!(out.status.success());
     assert_eq!((out.stdout.len(), out.stderr.len()), (300_000, 200_000));
@@ -840,8 +880,15 @@ fn a_long_answer_is_read_whole() {
 /// limit) must be given up on when the limit is up, not when the child ends.
 #[test]
 fn output_held_open_past_the_limit_is_not_waited_for() {
-    let mut command = std::process::Command::new("/bin/sh");
-    command.args(["-c", "sleep 8 & echo 'Build version 1A1'"]);
+    let mut command = std::process::Command::new(act());
+    command.args([
+        "spawn-child",
+        "sleep",
+        "8",
+        ";",
+        "echo",
+        "Build version 1A1",
+    ]);
     let started = Instant::now();
     let out = output_within(command, WITHIN);
     let took = started.elapsed();
@@ -869,14 +916,18 @@ fn a_busy_program_is_started_again_within_the_limit() {
     // Held open for writing, as a child forked before it execs holds a file just
     // written: starting it fails with ETXTBSY until the handle is closed.
     let writer = std::fs::File::create(&program).expect("create");
-    std::fs::write(&program, "#!/bin/sh\necho 'Build version 1A1'\n").expect("script");
+    // Its interpreter is the act steps' link: run, it echoes its own path.
+    std::fs::write(&program, format!("#!{} echo\n", act().display())).expect("script");
     std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).expect("chmod");
     let held = std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(200));
         drop(writer);
     });
     let out = output_within(std::process::Command::new(&program), WITHIN).expect("answers");
-    assert_eq!(String::from_utf8_lossy(&out.stdout), "Build version 1A1\n");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        format!("{}\n", program.display())
+    );
     held.join().expect("closed");
 
     let _writer = std::fs::OpenOptions::new()

@@ -1034,8 +1034,6 @@ mod tests {
     /// carries the rules, then runs the rest.
     #[test]
     fn the_runtime_warms_xcrun_under_its_sandbox() {
-        use std::os::unix::fs::PermissionsExt as _;
-
         let scratch = std::env::current_exe()
             .expect("test binary")
             .parent()
@@ -1046,23 +1044,20 @@ mod tests {
         std::fs::create_dir_all(scratch.join("T")).expect("T");
         std::fs::create_dir_all(scratch.join("C")).expect("C");
         let scratch = std::fs::canonicalize(&scratch).expect("real");
-        let script = |path: &Path, text: String| {
-            std::fs::write(path, text).expect("script");
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
-        };
         let log = scratch.join("log");
-        let sandbox_exec = scratch.join("sandbox-exec");
-        script(
-            &sandbox_exec,
-            format!(
-                "#!/bin/sh\n\
-                 case \"$4\" in *xcrun_db*) rules=rules ;; *) rules=none ;; esac\n\
-                 echo \"$2 $rules ${{DEVELOPER_DIR-own}}\" >> '{}'\nshift 4\nexec \"$@\"\n",
-                log.display()
+        // Logs its lease parameter, whether the profile carries the user-folder rules
+        // and the command's DEVELOPER_DIR (empty when unset), then runs the command.
+        let logged =
+            |rules: &str| format!("append {} $2 {rules} ${{DEVELOPER_DIR}}", log.display());
+        let sandbox_exec = xcode::tests::act_fake(
+            &scratch.join("sandbox-exec"),
+            &format!(
+                "*xcrun_db*\t-\t{}\n*\t-\t{}\n",
+                logged("rules"),
+                logged("none")
             ),
         );
-        let xcrun = scratch.join("xcrun");
-        script(&xcrun, "#!/bin/sh\nexit 0\n".to_owned());
+        let xcrun = xcode::tests::act_fake(&scratch.join("xcrun"), "*\t-\texit 0\n");
         let mut config = NativeConfig::new(scratch.join("leases"));
         config.isolation = network::Isolation::Sandbox(sandbox_exec);
         config.user_folders = UserFolders::new(scratch.join("T"), scratch.join("C"));
@@ -1077,7 +1072,8 @@ mod tests {
             "KBF_LEASE={}",
             scratch.join("leases").join(WARM_UP_DIR).display()
         );
-        let want: Vec<String> = ["own", "/x1"]
+        // The node's own Xcode is looked up with no DEVELOPER_DIR: empty in the log.
+        let want: Vec<String> = ["", "/x1"]
             .iter()
             .flat_map(|dir| xcode::WARM_TOOLS.map(|_| format!("{lease} rules {dir}")))
             .collect();
@@ -1094,8 +1090,6 @@ mod tests {
     /// removes its own when it ends, so two that overlap would break each other).
     #[test]
     fn each_xcode_a_survey_makes_ready_is_warmed() {
-        use std::os::unix::fs::PermissionsExt as _;
-
         let scratch = std::env::current_exe()
             .expect("test binary")
             .parent()
@@ -1106,23 +1100,20 @@ mod tests {
         std::fs::create_dir_all(scratch.join("T")).expect("T");
         std::fs::create_dir_all(scratch.join("C")).expect("C");
         let scratch = std::fs::canonicalize(&scratch).expect("real");
-        let script = |path: &Path, text: String| {
-            std::fs::write(path, text).expect("script");
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
-        };
         let log = scratch.join("log");
-        let sandbox_exec = scratch.join("sandbox-exec");
-        script(
-            &sandbox_exec,
-            format!(
-                "#!/bin/sh\n\
-                 case \"$4\" in *xcrun_db*) rules=rules ;; *) rules=none ;; esac\n\
-                 echo \"$2 $rules ${{DEVELOPER_DIR-own}}\" >> '{}'\nshift 4\nexec \"$@\"\n",
-                log.display()
+        // Logs its lease parameter, whether the profile carries the user-folder rules
+        // and the command's DEVELOPER_DIR (empty when unset), then runs the command.
+        let logged =
+            |rules: &str| format!("append {} $2 {rules} ${{DEVELOPER_DIR}}", log.display());
+        let sandbox_exec = xcode::tests::act_fake(
+            &scratch.join("sandbox-exec"),
+            &format!(
+                "*xcrun_db*\t-\t{}\n*\t-\t{}\n",
+                logged("rules"),
+                logged("none")
             ),
         );
-        let xcrun = scratch.join("xcrun");
-        script(&xcrun, "#!/bin/sh\nexit 0\n".to_owned());
+        let xcrun = xcode::tests::act_fake(&scratch.join("xcrun"), "*\t-\texit 0\n");
         let mut config = NativeConfig::new(scratch.join("leases"));
         config.isolation = network::Isolation::Sandbox(sandbox_exec);
         config.user_folders = UserFolders::new(scratch.join("T"), scratch.join("C"));
@@ -1156,7 +1147,8 @@ mod tests {
             .expect("a thread")
             .join()
             .expect("warmed");
-        let mut want = lookups(WARM_UP_DIR, "own");
+        // The node's own Xcode, with no DEVELOPER_DIR: empty in the log.
+        let mut want = lookups(WARM_UP_DIR, "");
         want.extend(lookups(WARM_UP_DIR, "/A/Contents/Developer"));
         assert_eq!(read(), want);
         // `B` fixed: only it is warmed, in a directory of its own.
@@ -1315,21 +1307,32 @@ mod tests {
             .mode(0o755)
             .open(&program)
             .expect("create");
-        file.write_all(b"#!/bin/sh\nexit 7\n").expect("write");
+        // Its interpreter is the act steps' link: run, it echoes its own path.
+        writeln!(file, "#!{} echo", xcode::tests::act().display()).expect("write");
         let closer = tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(100)).await;
             drop(file);
         });
-        let command = || tokio::process::Command::new(&program);
+        let command = || {
+            let mut command = tokio::process::Command::new(&program);
+            command.stdout(Stdio::piped());
+            command
+        };
         let exec = || Exec::new(&program, [], []).expect("exec");
         let record = dir.join(format!("busy-record-{}", std::process::id()));
         let started = Instant::now();
-        let Spawned { mut child, pid, .. } = spawn(&mut command(), exec(), &record)
+        let Spawned { child, pid, .. } = spawn(&mut command(), exec(), &record)
             .await
             .expect("spawned once closed");
         assert!(started.elapsed() >= Duration::from_millis(50), "it waited");
         assert!(pid > 0);
-        assert_eq!(child.wait().await.expect("wait").code(), Some(7));
+        let out = child.wait_with_output().await.expect("wait");
+        assert_eq!(out.status.code(), Some(0), "{out:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            format!("{}\n", program.display()),
+            "not the program that was busy"
+        );
         // As the lease's end does: a record is written only where none is.
         std::fs::remove_file(&record).expect("the run record");
         closer.await.expect("closer");

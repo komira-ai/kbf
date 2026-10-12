@@ -16,8 +16,14 @@
 //! - `id`: prints the real user id;
 //! - `kill-self SIGNAL`: sends itself signal number `SIGNAL`, and fails if it is still
 //!   running afterwards (the signal was ignored or caught);
-//! - `spawn-child STEP`: starts this program running `STEP` with the same stdin,
-//!   stdout and stderr, and goes on without waiting for it;
+//! - `spawn-child [--pid FILE] STEP [;; STEP]...`: starts this program running the
+//!   steps (`;;` separates the child's steps, which may not hold a `spawn-child` with
+//!   steps of its own) with the same stdin, stdout and stderr, and goes on without
+//!   waiting for it; with `--pid`, appends the child's process id and a newline to
+//!   `FILE`, or prints them when `FILE` is `-`;
+//! - `run PROGRAM [ARGS]...`: runs `PROGRAM` (looked up on `PATH` when it has no `/`)
+//!   with the same stdin, stdout, stderr and environment, waits for it, and fails
+//!   unless it exits 0;
 //! - `setsid`: makes this process the leader of a new session (fails if it leads a
 //!   process group already);
 //! - `alloc MIB`: touches `MIB` MiB (rounded up to 16 MiB) of distinct, incompressible
@@ -28,7 +34,12 @@
 //! - `chmod MODE PATH`: sets the permission bits of `PATH` to `MODE`, in octal (at most
 //!   `7777`);
 //! - `wait-for PATH SECS`: waits until `PATH` exists, looking every 10 ms, and fails
-//!   if it does not within `SECS` seconds (`0` looks once).
+//!   if it does not within `SECS` seconds (`0` looks once);
+//! - `mkdir PATH`: makes the directory `PATH` and any of its parents that are missing;
+//! - `cat FILE`: writes the bytes of `FILE` to stdout;
+//! - `mtime PATH SECS`: sets the modification time of `PATH` (a file or a directory)
+//!   to `SECS` whole seconds after the Unix epoch;
+//! - `pgid`: prints the id of its process group.
 //!
 //! [`main`] first looks at argv0: run through a link named for a tool of
 //! [`crate::fake`], it answers as that tool instead.
@@ -122,7 +133,13 @@ pub(crate) enum Step<'a> {
     Pwd,
     Id,
     KillSelf(Signal),
-    SpawnChild(&'a [String]),
+    SpawnChild {
+        /// Where the child's process id goes: a file, `-` for stdout, or nowhere.
+        pid: Option<&'a str>,
+        /// The child's arguments: its steps, separated by `;`.
+        args: Vec<&'a str>,
+    },
+    Run(&'a [String]),
     Setsid,
     Alloc(u64),
     Upper {
@@ -145,6 +162,13 @@ pub(crate) enum Step<'a> {
         path: &'a str,
         within: Duration,
     },
+    Mkdir(&'a str),
+    Cat(&'a str),
+    Mtime {
+        path: &'a str,
+        secs: u64,
+    },
+    Pgid,
 }
 
 /// The steps of `args`, split at each `;`, every one checked.
@@ -192,10 +216,15 @@ fn step(words: &[String]) -> Result<Step<'_>, Error> {
                 .and_then(Signal::from_named_raw)
                 .ok_or_else(|| Error::Usage(format!("{signal:?} is not a signal number")))?,
         ),
-        ["spawn-child", ..] if words.len() > 1 => {
-            step(&words[1..])?;
-            Step::SpawnChild(&words[1..])
-        }
+        ["spawn-child", "--pid", pid, ..] => Step::SpawnChild {
+            pid: Some(*pid),
+            args: child(&strs[3..])?,
+        },
+        ["spawn-child", ..] => Step::SpawnChild {
+            pid: None,
+            args: child(&strs[1..])?,
+        },
+        ["run", ..] if words.len() > 1 => Step::Run(&words[1..]),
         ["setsid"] => Step::Setsid,
         ["alloc", mib] => Step::Alloc(number(mib)?),
         ["upper", out, input] => Step::Upper { out, input },
@@ -212,8 +241,27 @@ fn step(words: &[String]) -> Result<Step<'_>, Error> {
             path,
             within: seconds(secs)?,
         },
+        ["mkdir", path] => Step::Mkdir(path),
+        ["cat", path] => Step::Cat(path),
+        ["mtime", path, secs] => Step::Mtime {
+            path,
+            secs: number(secs)?,
+        },
+        ["pgid"] => Step::Pgid,
         _ => return Err(Error::Usage(format!("bad step: {strs:?}"))),
     })
+}
+
+/// The arguments of a `spawn-child`'s child: `words`, its steps separated by `;;`,
+/// with `;` in place of each `;;`, every step checked. (A `spawn-child` among them
+/// sees no `;;`, as they are all taken here: its child runs one step.)
+fn child<'a>(words: &[&'a str]) -> Result<Vec<&'a str>, Error> {
+    let steps: Vec<&[&str]> = words.split(|w| *w == ";;").collect();
+    for words in &steps {
+        let owned: Vec<String> = words.iter().map(|&w| w.to_owned()).collect();
+        step(&owned)?;
+    }
+    Ok(steps.join(&";"))
 }
 
 /// `text` as a non-negative, finite number of seconds.
@@ -261,10 +309,24 @@ pub(crate) fn perform(steps: &[Step<'_>]) -> Result<Option<u8>, Error> {
                     signal.as_raw()
                 )));
             }
-            Step::SpawnChild(child) => {
-                std::env::current_exe()
-                    .and_then(|exe| Command::new(exe).arg0("kbf-act").args(*child).spawn())
-                    .map_err(failed(format!("spawn {child:?}")))?;
+            Step::SpawnChild { pid, args } => {
+                let child = std::env::current_exe()
+                    .and_then(|exe| Command::new(exe).arg0(NAME).args(args).spawn())
+                    .map_err(failed(format!("spawn {args:?}")))?;
+                match pid {
+                    Some("-") => write_line(std::io::stdout(), &child.id().to_string())?,
+                    Some(file) => append(file, &child.id().to_string())?,
+                    None => {}
+                }
+            }
+            Step::Run(argv) => {
+                let status = Command::new(&argv[0])
+                    .args(&argv[1..])
+                    .status()
+                    .map_err(failed(format!("run {}", argv[0])))?;
+                if !status.success() {
+                    return Err(Error::Failed(format!("{} ended: {status}", argv[0])));
+                }
             }
             Step::Setsid => {
                 rustix::process::setsid().map_err(failed("setsid"))?;
@@ -281,6 +343,22 @@ pub(crate) fn perform(steps: &[Step<'_>]) -> Result<Option<u8>, Error> {
                     .map_err(failed(format!("chmod {path}")))?;
             }
             Step::WaitFor { path, within } => wait_for(path, *within)?,
+            Step::Mkdir(path) => {
+                std::fs::create_dir_all(path).map_err(failed(format!("mkdir {path}")))?;
+            }
+            Step::Cat(path) => std::io::stdout()
+                .write_all(&read(path)?)
+                .and_then(|()| std::io::stdout().flush())
+                .map_err(failed("write"))?,
+            Step::Mtime { path, secs } => std::fs::File::open(path)
+                .and_then(|file| {
+                    file.set_modified(std::time::UNIX_EPOCH + Duration::from_secs(*secs))
+                })
+                .map_err(failed(format!("mtime {path}")))?,
+            Step::Pgid => write_line(
+                std::io::stdout(),
+                &rustix::process::getpgrp().as_raw_nonzero().to_string(),
+            )?,
         }
     }
     drop(held);
@@ -320,15 +398,19 @@ mod tests {
     }
 
     /// Catches a step taken for the wrong verb, its arguments misread (a `chmod` mode
-    /// read as decimal, or above 7777), and a malformed step accepted (it would run with
-    /// a default the test did not ask for).
+    /// read as decimal, or above 7777; a `spawn-child`'s `;;` not turned into the `;`
+    /// its child splits at, or its `--pid` taken for a step), and a malformed step
+    /// accepted (it would run with a default the test did not ask for), a child's step
+    /// included.
     #[test]
     fn steps_parse_or_are_refused() {
-        let child = args("sleep 1");
+        let run = args("/bin/x a b");
         let all = args(
             "exit 7 ; sleep 0.25 ; echo a b ; echo --stderr c ; append f x y ; env A ; \
-             env B dflt ; pwd ; id ; kill-self 9 ; spawn-child sleep 1 ; setsid ; alloc 32 ; \
-             upper o i ; rename a b ; symlink t l ; chmod 750 p ; chmod 7777 q ; wait-for w 1.5",
+             env B dflt ; pwd ; id ; kill-self 9 ; spawn-child sleep 1 ; \
+             spawn-child --pid - setsid ;; sleep 1 ;; exit 0 ; spawn-child --pid f spawn-child id ; \
+             run /bin/x a b ; setsid ; alloc 32 ; upper o i ; rename a b ; symlink t l ; chmod 750 p ; \
+             chmod 7777 q ; wait-for w 1.5 ; mkdir m/n ; cat c ; mtime t 946684800 ; pgid",
         );
         let want = [
             Step::Exit(7),
@@ -356,7 +438,19 @@ mod tests {
             Step::Pwd,
             Step::Id,
             Step::KillSelf(Signal::KILL),
-            Step::SpawnChild(&child),
+            Step::SpawnChild {
+                pid: None,
+                args: vec!["sleep", "1"],
+            },
+            Step::SpawnChild {
+                pid: Some("-"),
+                args: vec!["setsid", ";", "sleep", "1", ";", "exit", "0"],
+            },
+            Step::SpawnChild {
+                pid: Some("f"),
+                args: vec!["spawn-child", "id"],
+            },
+            Step::Run(&run),
             Step::Setsid,
             Step::Alloc(32),
             Step::Upper {
@@ -380,6 +474,13 @@ mod tests {
                 path: "w",
                 within: Duration::from_millis(1500),
             },
+            Step::Mkdir("m/n"),
+            Step::Cat("c"),
+            Step::Mtime {
+                path: "t",
+                secs: 946_684_800,
+            },
+            Step::Pgid,
         ];
         assert_eq!(parse(&all).expect("parses"), want);
         for bad in [
@@ -407,6 +508,18 @@ mod tests {
             "chmod rwx p",
             "wait-for w",
             "wait-for w soon",
+            "spawn-child --pid",
+            "spawn-child --pid f",
+            "spawn-child echo a ;; ;; exit 0",
+            "spawn-child exit 0 ;; nope",
+            "run",
+            "mkdir",
+            "mkdir a b",
+            "cat",
+            "mtime t",
+            "mtime t -1",
+            "mtime t 1.5",
+            "pgid x",
             "echo a ; ; exit 0",
             "nope",
         ] {

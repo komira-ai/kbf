@@ -21,8 +21,9 @@
 //! - `<environment>` is `-`, which matches always, or `NAME=VALUE`, which matches when
 //!   the variable's value (empty when unset) matches `VALUE`, `*` as above.
 //! - `<steps>` are [`crate::act`] steps, split at spaces, with `$1` to `$9` (the
-//!   arguments), `$*` (all of them, joined by spaces) and `${NAME}` (the variable,
-//!   empty when unset) replaced in each word.
+//!   arguments), `$*` (all of them, joined by spaces), `$$` (the fake's process id, so
+//!   each run can say something new) and `${NAME}` (the variable, empty when unset)
+//!   replaced in each word.
 //!
 //! The first matching rule's steps run. When they end without `exit`, or no rule
 //! matches, the tool's own ending follows:
@@ -165,6 +166,9 @@ fn expand(word: &str, args: &[String]) -> String {
             let index = usize::try_from(digit).unwrap_or(usize::MAX);
             out.push_str(args.get(index - 1).map_or("", String::as_str));
             rest = &rest[1..];
+        } else if let Some(after) = rest.strip_prefix('$') {
+            out.push_str(&std::process::id().to_string());
+            rest = after;
         } else if let Some(after) = rest.strip_prefix('*') {
             out.push_str(&args.join(" "));
             rest = after;
@@ -276,14 +280,16 @@ mod tests {
         }
     }
 
-    /// Catches an argument taken off by one, `$*` not joined, `${NAME}` not read, a
-    /// `$0` or a lone `$` dropped or replaced.
+    /// Catches an argument taken off by one, `$*` not joined, `${NAME}` not read, `$$`
+    /// not the process id, a `$0` or a lone `$` dropped or replaced.
     #[test]
     fn words_expand() {
         let args = ["--find".to_owned(), "clang".to_owned()];
         let path = std::env::var("PATH").expect("a PATH");
         let tool = format!("{path}/usr/bin/clang");
+        let pid = format!("[{}:1]", std::process::id());
         for (word, want) in [
+            ("[$$:1]", pid.as_str()),
             ("$2", "clang"),
             ("$1-$2", "--find-clang"),
             ("$3", ""),

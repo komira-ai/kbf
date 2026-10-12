@@ -242,23 +242,35 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         // CARGO_MANIFEST_DIR is in the test's own environment, and must not leak.
         assert!(std::env::var_os("CARGO_MANIFEST_DIR").is_some());
-        let script = "pwd; echo \"$HOME $USER $LOGNAME $KEEP ${CARGO_MANIFEST_DIR:-clean}\"; /bin/ps -o pgid= -p $$; echo $$";
-        let (spawn, mut out) = base(&["/bin/sh", "-c", script], &dir);
+        let argv = crate::testing::act_argv(
+            "pwd ; env HOME ; env USER ; env LOGNAME ; env KEEP ; env CARGO_MANIFEST_DIR clean ; \
+             pgid",
+        );
+        let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+        let (spawn, mut out) = base(&argv, &dir);
         let mut child = super::spawn(spawn).unwrap();
+        let pid = child.id();
         assert!(child.wait().unwrap().success());
         let mut text = String::new();
         out.read_to_string(&mut text).unwrap();
-        let lines: Vec<&str> = text.lines().map(str::trim).collect();
+        let lines: Vec<&str> = text.lines().collect();
         assert_eq!(
             lines[0],
             std::fs::canonicalize(&dir).unwrap().to_str().unwrap()
         );
         assert_eq!(
-            lines[1],
-            "/var/empty/kbf-lease-1-1 kbf-lease-1-1 kbf-lease-1-1 kept clean"
+            lines[1..6],
+            [
+                "/var/empty/kbf-lease-1-1",
+                "kbf-lease-1-1",
+                "kbf-lease-1-1",
+                "kept",
+                "clean"
+            ]
         );
         assert_eq!(
-            lines[2], lines[3],
+            lines[6],
+            pid.to_string(),
             "not the leader of its own process group"
         );
     }
@@ -276,21 +288,21 @@ mod tests {
         )
         .unwrap();
         let leaked = std::os::fd::IntoRawFd::into_raw_fd(raw);
-        let (spawn, mut out) = base(
-            &[
-                "/bin/sh",
-                "-c",
-                &format!("test -e /dev/fd/{leaked} && echo leaked || echo closed"),
-            ],
-            &dir,
-        );
+        // `wait-for` with no time looks once: it fails (exit 1) where the descriptor is
+        // closed, and the `echo` after it runs only where it is open.
+        let argv = crate::testing::act_argv(&format!(
+            "echo ran ; wait-for /dev/fd/{leaked} 0 ; echo leaked"
+        ));
+        let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+        let (spawn, mut out) = base(&argv, &dir);
         let mut child = super::spawn(spawn).unwrap();
-        child.wait().unwrap();
+        let status = child.wait().unwrap();
         // SAFETY: `leaked` is the descriptor opened above, owned by nothing else.
         drop(unsafe { OwnedFd::from_raw_fd(leaked) });
         let mut text = String::new();
         out.read_to_string(&mut text).unwrap();
-        assert_eq!(text.trim(), "closed");
+        assert_eq!(text, "ran\n", "the descriptor reached the process");
+        assert_eq!(status.code(), Some(1), "{status}");
     }
 
     #[test]

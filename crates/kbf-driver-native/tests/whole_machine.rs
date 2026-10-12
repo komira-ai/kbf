@@ -76,7 +76,7 @@ async fn until_logged(fake: &FakeSession, verb: &str) {
 }
 
 fn the_action(cas: &MemoryCas) -> Digest {
-    let mut spec = Spec::sh("cat in; echo \"$FROM\"; echo made > out/made.txt")
+    let mut spec = Spec::act("cat in ; env FROM ; append out/made.txt made")
         .env("FROM", "the Command")
         .outputs(&["out/made.txt"]);
     spec.inputs
@@ -337,7 +337,7 @@ async fn a_kill_or_a_timeout_ends_the_users_processes() {
     let cas = Arc::new(MemoryCas::default());
     let fake = FakeSession::default();
     let runtime = start(&config(&dir), &fake, &cas);
-    let slow = Spec::sh("echo started; exec sleep 60").store(&cas);
+    let slow = Spec::act("echo started ; sleep 60").store(&cas);
     let running = {
         let runtime = Arc::clone(&runtime);
         let slow = slow.clone();
@@ -353,7 +353,7 @@ async fn a_kill_or_a_timeout_ends_the_users_processes() {
     let at = |verb: &str| verbs.iter().position(|v| v.starts_with(verb)).expect(verb);
     assert!(at("kill-uid") < at("wait"), "{verbs:?}");
 
-    let timed = Spec::sh("echo partial; exec sleep 60")
+    let timed = Spec::act("echo partial ; sleep 60")
         .timeout(Duration::from_millis(300))
         .store(&cas);
     let error = run(&runtime, &timed)
@@ -487,7 +487,7 @@ async fn a_kill_uid_that_fails_quarantines_the_node() {
     fake.state().fail.insert("kill-uid");
     let runtime = start(&config(&dir), &fake, &cas);
     // The fake leaves the action alive when kill-uid fails; it ends by itself.
-    let timed = Spec::sh("exec sleep 2")
+    let timed = Spec::act("sleep 2")
         .timeout(Duration::from_millis(100))
         .store(&cas);
     let error = run(&runtime, &timed).await.expect_err("ran");
@@ -598,7 +598,7 @@ async fn a_restart_mid_action_does_not_run_it_beside_the_first() {
     let cas = Arc::new(MemoryCas::default());
     let fake = FakeSession::default();
     let config = config(&dir);
-    let slow = Spec::sh("sleep 3; echo made > out/made.txt")
+    let slow = Spec::act("sleep 3 ; append out/made.txt made")
         .outputs(&["out/made.txt"])
         .store(&cas);
     let before = start(&config, &fake, &cas);
@@ -665,7 +665,7 @@ async fn a_restart_mid_action_kills_the_action_at_start_and_fails_the_lease() {
     let cas = Arc::new(MemoryCas::default());
     let fake = FakeSession::default();
     let config = config(&dir);
-    let slow = Spec::sh("exec sleep 60").store(&cas);
+    let slow = Spec::act("sleep 60").store(&cas);
     let after = restart_mid_action(&config, &fake, &cas, &slow).await;
     assert_eq!(verbs_but_wait(&fake), ["boot-reset 1.1", "kill-uid 1.1"]);
     assert_eq!(phase(&after), NodePhase::Restoring(lease()));
@@ -696,7 +696,7 @@ async fn a_restart_mid_action_whose_kill_fails_quarantines_the_node() {
     let fake = FakeSession::default();
     let config = config(&dir);
     // The fake leaves the action alive when kill-uid fails; it ends by itself.
-    let slow = Spec::sh("exec sleep 2").store(&cas);
+    let slow = Spec::act("sleep 2").store(&cas);
     fake.state().fail.insert("kill-uid");
     let after = restart_mid_action(&config, &fake, &cas, &slow).await;
     assert_eq!(verbs_but_wait(&fake), ["boot-reset 1.1", "kill-uid 1.1"]);
@@ -722,7 +722,7 @@ async fn a_restart_mid_action_after_the_reset_deleted_the_user_kills_nothing() {
     let cas = Arc::new(MemoryCas::default());
     let fake = FakeSession::default();
     let config = config(&dir);
-    let slow = Spec::sh("exec sleep 2").store(&cas);
+    let slow = Spec::act("sleep 2").store(&cas);
     fake.state().deleted_by_reset = vec![lease()];
     let after = restart_mid_action(&config, &fake, &cas, &slow).await;
     assert_eq!(verbs_but_wait(&fake), ["boot-reset 1.1"]);
