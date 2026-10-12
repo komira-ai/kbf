@@ -225,6 +225,12 @@ fn set_perms_owner(full: &Path, perms: Perms, owner: Option<Owner>) -> io::Resul
 /// input is written before the output is read, so it must fit in a pipe's buffer (64
 /// KiB on Linux) unless the tool reads all of it before writing much.
 ///
+/// A tool may exit, or close its input, without reading all of it (`false`, or a tool
+/// that refuses its arguments first). The write then fails with EPIPE, or succeeds into
+/// the pipe's buffer, depending on timing and the input's size; neither says anything
+/// about the tool. So EPIPE is not an error here: the tool's exit status is the verdict,
+/// as in a shell pipeline, and the caller reads it ([`succeeded`]).
+///
 /// With `cmd.user` set, the child takes that user's groups, group and uid before it
 /// starts the tool ([`user::become_user`]); as anyone but root that fails and the
 /// tool never starts.
@@ -248,11 +254,15 @@ fn output(cmd: &Cmd) -> io::Result<Output> {
     }
     let mut child = command.spawn()?;
     // Dropped at the end of the statement, which closes the pipe: the tool reads EOF.
-    child
+    match child
         .stdin
         .take()
         .expect("stdin is piped")
-        .write_all(&cmd.stdin)?;
+        .write_all(&cmd.stdin)
+    {
+        Err(e) if e.kind() != io::ErrorKind::BrokenPipe => return Err(e),
+        _ => {}
+    }
     child.wait_with_output()
 }
 
