@@ -451,7 +451,7 @@ pub async fn collect(
                 budget.entries(1, &shown)?;
                 let (root, children) =
                     walk(store, &mut budget, parent, name, shown.clone()).await?;
-                let root_digest = digest_of(&root.encode_to_vec());
+                let root_digest = store_directories(store, &root, &children, &shown).await?;
                 let tree = Tree {
                     root: Some(root),
                     children,
@@ -478,6 +478,26 @@ pub async fn collect(
         }
     }
     Ok(())
+}
+
+/// Stores `root` and each Directory in `children`, each distinct one once, and
+/// returns the digest of `root`. The farm's action cache refuses a result whose
+/// `root_directory_digest` it does not hold; the Directories below are stored too, so
+/// every digest the Tree names can be fetched.
+async fn store_directories(
+    store: &impl Store,
+    root: &Directory,
+    children: &[Directory],
+    shown: &Path,
+) -> Result<Digest, OutputsError> {
+    let mut stored = std::collections::HashSet::new();
+    for directory in children {
+        let bytes = directory.encode_to_vec();
+        if stored.insert(digest_of(&bytes).hash) {
+            Blob::Bytes(bytes).store(store, shown).await?;
+        }
+    }
+    Blob::Bytes(root.encode_to_vec()).store(store, shown).await
 }
 
 /// Stores the regular file at `path` (a file the driver made, such as captured

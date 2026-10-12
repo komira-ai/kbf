@@ -403,7 +403,7 @@ pub(crate) async fn collect(
             Some(Kind::Directory) => {
                 budget.entries(1, &shown)?;
                 let (root, children) = walk(cas, &mut budget, parent, name, shown).await?;
-                let root_digest = digest_of(&root.encode_to_vec());
+                let root_digest = kbf_daemon::tree::put_directories(cas, &root, &children).await?;
                 let tree = Tree {
                     root: Some(root),
                     children,

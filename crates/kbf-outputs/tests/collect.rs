@@ -581,11 +581,19 @@ async fn every_directory_a_directory_output_names_is_stored() {
     let mut named = vec![out.root_directory_digest.clone().expect("root digest")];
     for directory in tree.root.iter().chain(&tree.children) {
         named.extend(directory.files.iter().filter_map(|f| f.digest.clone()));
-        named.extend(directory.directories.iter().filter_map(|d| d.digest.clone()));
+        named.extend(
+            directory
+                .directories
+                .iter()
+                .filter_map(|d| d.digest.clone()),
+        );
     }
     named.retain(|d| d.size_bytes > 0);
     assert_eq!(named.len(), 6, "root, a, a/b and three files: {named:?}");
     let held = store.blobs.lock().unwrap_or_else(PoisonError::into_inner);
-    let absent: Vec<&Digest> = named.iter().filter(|d| !held.contains_key(&d.hash)).collect();
+    let absent: Vec<&Digest> = named
+        .iter()
+        .filter(|d| !held.contains_key(&d.hash))
+        .collect();
     assert!(absent.is_empty(), "named but not stored: {absent:?}");
 }

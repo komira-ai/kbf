@@ -142,7 +142,12 @@ fn named_blobs(cas: &MemoryCas, result: &kbf_proto::reapi::ActionResult) -> Vec<
         named.push(tree_digest);
         for directory in tree.root.iter().chain(&tree.children) {
             named.extend(directory.files.iter().filter_map(|f| f.digest.clone()));
-            named.extend(directory.directories.iter().filter_map(|d| d.digest.clone()));
+            named.extend(
+                directory
+                    .directories
+                    .iter()
+                    .filter_map(|d| d.digest.clone()),
+            );
         }
     }
     named.retain(|d| d.size_bytes > 0);
@@ -166,7 +171,10 @@ async fn every_blob_a_directory_output_names_is_stored() {
         .expect("ran");
     assert_eq!(result.exit_code, 0, "{}", support::stderr(&cas, &result));
     assert_eq!(result.output_directories.len(), 1, "{result:?}");
-    let tree_digest = result.output_directories[0].tree_digest.as_ref().expect("tree");
+    let tree_digest = result.output_directories[0]
+        .tree_digest
+        .as_ref()
+        .expect("tree");
     let tree = support::tree(&cas, tree_digest);
     assert_eq!(tree.children.len(), 3, "a, a/b and empty: {tree:?}");
     let named = named_blobs(&cas, &result);
