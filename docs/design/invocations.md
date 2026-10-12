@@ -18,10 +18,14 @@ record is the *invocation record*.
 
 Read on `main`:
 
-- **The id is read, not recorded.** `kbf_front::RequestMetadataLayer` reads every REAPI
-  call's `RequestMetadata` header into a `CallMetadata` (section 2.2), and Execute puts
-  its `tool_invocation_id` on its `execute` trace span (`invocation`, `-` when absent).
-  Nothing else uses it yet: there is no invocation record.
+- **The id is read and recorded in memory.** `kbf_front::RequestMetadataLayer` reads
+  every REAPI call's `RequestMetadata` header into a `CallMetadata` (section 2.2), and
+  Execute puts its `tool_invocation_id` on its `execute` trace span (`invocation`, `-`
+  when absent). The services and the farm send each call that carries an id, and the
+  lease events and outcome of its operations, to `kbf_front::Recorder` (3.4), which
+  keeps the records in memory within `--invocation-memory` (3.5, stage 1). Nothing
+  reads them yet: there is no read API, and a call without an id is not recorded
+  (the minted id of 2.3 comes with its link, PR 6).
 - **Per-operation state lives about a minute.** The scheduler keeps a finished operation
   for `FINISHED_RETENTION` (60 s, `kbf-sched/src/scheduler.rs`); then WaitExecution
   answers NOT_FOUND. All scheduler state is in memory and is lost on restart.
@@ -250,8 +254,10 @@ At the bound, in this order:
 2. evict `idle` invocations (3.1), least recently seen first; an invocation with an
    operation in flight is never idle, so a build waiting on one long action is kept;
 3. if only open invocations remain, the largest stops taking rows: its actions are still
-   counted, and it says `rows_capped: true`. One build at the 1,000,000-row cap (3.3)
-   does not fit in 256 MiB, so in stage 1 a very large build is capped by memory first.
+   counted, and it says `rows_capped: true`. A row that still does not fit is not
+   taken, and its invocation says `rows_capped: true` too. One build at the
+   1,000,000-row cap (3.3) does not fit in 256 MiB, so in stage 1 a very large build is
+   capped by memory first.
 
 In stage 2 a flushed row is in a chunk and leaves memory, so the bound covers only
 unflushed rows and the header fields; step 3 then applies only when flushes fail
@@ -607,8 +613,8 @@ defect it catches and the mutant planted to see it go red.
    longer than the idle time, with no call, is not idle and not evicted (plant
    "`last_seen` = last call", red); at the bound with only open invocations the largest
    says `rows_capped` and memory stays under the bound; an end-to-end run with fake
-   daemons (`kbf-testkit`) yields the expected rows for a hit, a run, a requeue and a
-   failure.
+   daemons (`kbf-server`'s test support) yields the expected rows for a hit, a run, a
+   requeue and a failure.
 4. **(M) The read API** (4.1 to 4.5 minus blobs) and the policy keys (4.3). Tests: paging
    while rows are appended never skips or repeats (property test); a token with another
    filter is `400`; with no `invocations` key the routes are `404` (plant "default allow",

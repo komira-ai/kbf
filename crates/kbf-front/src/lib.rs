@@ -36,7 +36,10 @@
 //! authentication layer, reads each call's REAPI `RequestMetadata` header into a
 //! [`CallMetadata`] ([`call_metadata`]); its `tool_invocation_id` is the invocation id
 //! (`docs/design/invocations.md`). A bad header is treated as absent and never fails a
-//! call.
+//! call. With a [`Recorder`] ([`routes_recorded`]), each call that carries an id is
+//! recorded: Execute (its cached, joined or queued answer), GetActionResult (hit or
+//! miss), FindMissingBlobs, and the bytes of the batch and ByteStream calls. Recording
+//! never waits: a full channel drops the event and marks its record incomplete.
 
 mod action_cache;
 mod bytestream;
@@ -45,6 +48,7 @@ mod capabilities;
 mod cas;
 mod execution;
 mod meta_log;
+mod recorder;
 mod request_metadata;
 mod wire;
 
@@ -70,6 +74,10 @@ pub use crate::execution::{
     OperationStream, Stage, Submission, Ticket, closing, missing_status,
 };
 pub use crate::meta_log::{Leadership, MemoryMetaLog, MetaLog, MetaLogError};
+pub use crate::recorder::{
+    DEFAULT_INVOCATION_MEMORY, ExecuteCall, RECORDER_CHANNEL, Recorder, Recording, listing, owner,
+    wall_now,
+};
 pub use crate::request_metadata::{
     CallMetadata, HEADER as REQUEST_METADATA_HEADER, Invalid, InvocationId, MAX_HEADER_BYTES,
     MAX_ID_BYTES, MAX_TEXT_BYTES, Read, ReadRequestMetadata, RequestMetadataLayer, Text,
@@ -102,7 +110,12 @@ where
     O: ObjectStore + 'static,
 {
     let authorizers = Arc::new(Authorizers::allow_all());
-    cache_routes(cache, CapabilitiesService::cache_only(), &authorizers)
+    cache_routes(
+        cache,
+        CapabilitiesService::cache_only(),
+        &authorizers,
+        &Recorder::off(),
+    )
 }
 
 /// The cache services and `Execution` over `cache` and `dispatch`, with capabilities
@@ -134,31 +147,55 @@ where
     O: ObjectStore + 'static,
     D: Dispatch,
 {
-    let execution = ExecutionServer::new(ExecutionService::with_authorizers(
-        Arc::clone(&cache),
-        dispatch,
-        closing,
-        Arc::clone(&authorizers),
-    ))
+    routes_recorded(cache, dispatch, closing, authorizers, &Recorder::off())
+}
+
+/// [`routes_with_authorizers`], each call that carries an invocation id sent to
+/// `recorder`.
+pub fn routes_recorded<M, O, D>(
+    cache: Arc<Cache<M, O>>,
+    dispatch: Arc<D>,
+    closing: Closing,
+    authorizers: Arc<Authorizers>,
+    recorder: &Recorder,
+) -> Routes
+where
+    M: MetaLog,
+    O: ObjectStore + 'static,
+    D: Dispatch,
+{
+    let execution = ExecutionServer::new(
+        ExecutionService::with_authorizers(
+            Arc::clone(&cache),
+            dispatch,
+            closing,
+            Arc::clone(&authorizers),
+        )
+        .recording(recorder.clone()),
+    )
     .max_decoding_message_size(MAX_MESSAGE_BYTES)
     .max_encoding_message_size(MAX_MESSAGE_BYTES);
     let capabilities = CapabilitiesService::new(true, Arc::clone(&authorizers));
-    cache_routes(cache, capabilities, &authorizers).add_service(execution)
+    cache_routes(cache, capabilities, &authorizers, recorder).add_service(execution)
 }
 
 fn cache_routes<M, O>(
     cache: Arc<Cache<M, O>>,
     capabilities: CapabilitiesService,
     authorizers: &Arc<Authorizers>,
+    recorder: &Recorder,
 ) -> Routes
 where
     M: MetaLog,
     O: ObjectStore + 'static,
 {
-    let cas = CasService::with_authorizers(Arc::clone(&cache), Arc::clone(authorizers));
+    let cas = CasService::with_authorizers(Arc::clone(&cache), Arc::clone(authorizers))
+        .recording(recorder.clone());
     let bytestream =
-        ByteStreamService::with_authorizers(Arc::clone(&cache), Arc::clone(authorizers));
-    let action_cache = ActionCacheService::with_authorizers(cache, Arc::clone(authorizers));
+        ByteStreamService::with_authorizers(Arc::clone(&cache), Arc::clone(authorizers))
+            .recording(recorder.clone());
+    let action_cache = ActionCacheService::with_authorizers(cache, Arc::clone(authorizers))
+        .recording(recorder.clone());
     Routes::new(CapabilitiesServer::new(capabilities))
         .add_service(
             ContentAddressableStorageServer::new(cas)

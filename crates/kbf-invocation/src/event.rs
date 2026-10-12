@@ -5,6 +5,8 @@
 use kbf_sched::RequeueReason;
 use kbf_types::{Digest, Failure, LeaseId, OperationId, WorkerId};
 
+use crate::record::Text;
+
 /// A wall-clock time, in microseconds since the Unix epoch, read by the caller.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct WallTime(u64);
@@ -185,14 +187,14 @@ pub struct Metadata {
     pub tool_version: Option<String>,
     /// `correlated_invocations_id`.
     pub correlated_invocations_id: Option<String>,
-    /// `target_id`.
-    pub target: Option<String>,
-    /// `action_mnemonic`.
-    pub mnemonic: Option<String>,
-    /// `configuration_id`.
-    pub configuration: Option<String>,
-    /// `action_id`.
-    pub action_id: Option<String>,
+    /// `target_id`, marked truncated if the metadata layer cut it.
+    pub target: Option<Text>,
+    /// `action_mnemonic`, marked truncated if the metadata layer cut it.
+    pub mnemonic: Option<Text>,
+    /// `configuration_id`, marked truncated if the metadata layer cut it.
+    pub configuration: Option<Text>,
+    /// `action_id`, marked truncated if the metadata layer cut it.
+    pub action_id: Option<Text>,
 }
 
 /// A call, by what the client asked and what it was answered.

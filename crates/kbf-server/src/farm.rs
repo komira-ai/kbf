@@ -37,7 +37,7 @@ use std::hash::BuildHasher;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use kbf_front::{Cache, Dispatch, Finished, MetaLog, Stage, Submission, Ticket};
+use kbf_front::{Cache, Dispatch, Finished, MetaLog, Recorder, Stage, Submission, Ticket};
 use kbf_meta::{ActionRecord, Role};
 use kbf_objstore::ObjectStore;
 use kbf_proto::google::rpc;
@@ -56,6 +56,7 @@ use tonic::{Code, Status};
 
 mod beat;
 mod phase;
+mod record;
 
 pub use phase::Reported;
 
@@ -158,6 +159,20 @@ enum Detail {
     Missing(Vec<Digest>),
     /// A timed-out action's partial result ([`crate::timeout`]), answered, never cached.
     TimedOut(Box<ActionResult>),
+    /// The daemon's reason for an infrastructure failure (a missing image, a full
+    /// disk), or why an OK result could not be accepted: the callers are told only
+    /// that the farm could not run the action, and the invocation record keeps it.
+    Infra(String),
+}
+
+impl Detail {
+    /// The failure's reason text a lease's attempt records, if the report gave one.
+    fn reason(&self) -> Option<String> {
+        match self {
+            Self::Invalid(why) | Self::Infra(why) => Some(why.clone()),
+            Self::Ran(_) | Self::Missing(_) | Self::TimedOut(_) => None,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -173,6 +188,8 @@ struct State {
     links: BTreeMap<WorkerId, Link>,
     /// Nodes whose drain has paused, once logged.
     paused: BTreeSet<WorkerId>,
+    /// Where the invocation record's lease and finish events go ([`record`]).
+    recorder: Recorder,
 }
 
 /// What a finished operation tells its callers, and the action-cache entry to write
@@ -221,8 +238,19 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
                 next_stream: 0,
                 links: BTreeMap::new(),
                 paused: BTreeSet::new(),
+                recorder: Recorder::off(),
             }),
         }
+    }
+
+    /// This farm, each Execute's queued or joined answer, each lease granted, started
+    /// and given up, and each operation's end sent to `recorder`
+    /// (`docs/design/invocations.md`, section 3.4).
+    #[must_use]
+    pub fn recording(mut self, recorder: Recorder) -> Self {
+        let state = self.state.get_mut().unwrap_or_else(PoisonError::into_inner);
+        state.recorder = recorder;
+        self
     }
 
     /// This process's scheduler term, which every lease it grants carries.
@@ -560,7 +588,8 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
                     }
                     Err(e) => {
                         tracing::warn!(%lease, error = %e, "an OK result whose outputs are not stored");
-                        (Outcome::Failed(Failure::Infra), None)
+                        let why = format!("an OK result whose outputs are not stored: {e}");
+                        (Outcome::Failed(Failure::Infra), Some(Detail::Infra(why)))
                     }
                 }
             }
@@ -593,10 +622,11 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
                 }
                 None => {
                     // The client is told only that the farm could not run the action: the
-                    // daemon's reason (a missing image, a full disk) is in this line alone.
+                    // daemon's reason (a missing image, a full disk) is in this line and
+                    // in the invocation record.
                     let why = result.status.map(|s| s.message).unwrap_or_default();
                     tracing::warn!(%lease, node = %ran_on.0, ?code, reason = %why, "lease failed");
-                    (Outcome::Failed(Failure::Infra), None)
+                    (Outcome::Failed(Failure::Infra), Some(Detail::Infra(why)))
                 }
             },
         }
@@ -619,7 +649,7 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
 }
 
 impl<M: MetaLog, O: ObjectStore + 'static> Dispatch for Farm<M, O> {
-    fn submit(&self, submission: Submission) -> Result<Ticket, Status> {
+    fn submit(&self, mut submission: Submission) -> Result<Ticket, Status> {
         let now = self.now();
         let mut state = self.lock();
         let action = submission.request.key.action;
@@ -631,6 +661,9 @@ impl<M: MetaLog, O: ObjectStore + 'static> Dispatch for Farm<M, O> {
             queued: SystemTime::now(),
         });
         let name = state.machine.name(waiter);
+        if let Some(call) = submission.call.take() {
+            state.record_submit(call, &name, &submission.request);
+        }
         let (stage, receiver) = watch::channel(Stage::Queued);
         state.stages.insert(waiter, stage);
         state.feed_quiet(
@@ -798,13 +831,14 @@ impl State {
     /// feed. A requeue only names an operation the scheduler held when it was made;
     /// one dropped since is logged with an empty name, never looked up by index.
     fn log_requeues(&mut self) {
-        for Requeue {
-            operation,
-            lease,
-            worker: node,
-            reason,
-        } in self.sched.take_requeues()
-        {
+        for requeue in self.sched.take_requeues() {
+            self.record_requeue(&requeue);
+            let Requeue {
+                operation,
+                lease,
+                worker: node,
+                reason,
+            } = requeue;
             let operation = self.operation_name(operation);
             // One line: the coverage of a logged field counts only where it is logged.
             tracing::info!(%operation, %lease, %node, %reason, "lease given up; requeued");
@@ -883,6 +917,7 @@ impl State {
             &grant.worker,
         );
         tracing::debug!(%operation, %lease, %node, "lease granted");
+        self.record_granted(grant);
         self.send_for(&grant.worker, grant.operation, |w| {
             server_message::Message::LeaseOffer(LeaseOffer {
                 lease_id: Some(wire_lease(grant.lease)),
@@ -927,6 +962,7 @@ impl State {
             },
         };
         self.machine.start(start.lease, sent);
+        self.record_started(&start);
     }
 
     /// Tells an operation's callers why it waits, or that it no longer waits for a
@@ -962,6 +998,7 @@ impl State {
     /// so nothing is awaited.
     fn refuse(&mut self, refusal: &Refusal) {
         tracing::warn!(operation = %refusal.operation, reason = %refusal.reason, "operation refused");
+        self.record_refused(refusal);
         let finished = failed(Code::FailedPrecondition, &refusal.reason);
         // A lease given up before the operation was refused may still be listed.
         self.machine.forget_leases(refusal.operation);
@@ -986,9 +1023,12 @@ impl State {
             .iter()
             .filter_map(|id| self.stages.get(id).cloned())
             .collect();
+        let reason = detail.as_ref().and_then(Detail::reason);
+        let mut listing = None;
         let (finished, write) = match (detail, answer.outcome) {
             (Some(Detail::Ran(pending)), _) => {
                 let Pending { result, record } = *pending;
+                listing = Some(kbf_front::listing(record.result, &result));
                 let cacheable =
                     result.exit_code == 0 && waiters.first().is_some_and(|w| !w.do_not_cache);
                 let write = waiters
@@ -1019,6 +1059,7 @@ impl State {
                 None,
             ),
         };
+        self.record_finished(answer, &finished, listing, reason);
         self.keep_finished(answer.operation, answer.waiters.clone());
         Settled {
             finished,

@@ -92,8 +92,13 @@ use tokio::sync::watch;
 use tonic::{Code, Request as GrpcRequest, Response, Status};
 use tracing::Instrument as _;
 
+use kbf_auth::AuthenticationMetadata;
+use kbf_invocation::{CallKind, ExecuteAnswer};
+
 use crate::cache::{Cache, CacheError};
 use crate::meta_log::MetaLog;
+use crate::recorder::{ExecuteCall, Recorder, listing};
+use crate::request_metadata::CallMetadata;
 use crate::wire;
 
 /// The reserved platform key that names the lease kind
@@ -128,6 +133,9 @@ pub struct Submission {
     /// What to run, keyed for dedup, with the lease kind from the platform's
     /// `kbf-lease`.
     pub request: Request,
+    /// The call to record, with a recorder on and an invocation id: the dispatcher
+    /// sends its [`ExecuteCall::answered`] events before it queues the request.
+    pub call: Option<ExecuteCall>,
 }
 
 /// Where an operation is, as its callers see it.
@@ -231,6 +239,7 @@ pub struct ExecutionService<M, O, D> {
     dispatch: Arc<D>,
     closing: Closing,
     authorizers: Arc<Authorizers>,
+    recorder: Recorder,
 }
 
 /// The gRPC path of Execute, as calls are logged.
@@ -254,7 +263,17 @@ impl<M, O, D> ExecutionService<M, O, D> {
             dispatch,
             closing,
             authorizers,
+            recorder: Recorder::off(),
         }
+    }
+
+    /// This service, each Execute that carries an invocation id sent to `recorder`:
+    /// an answer from the action cache here, a queued or joined one through the
+    /// [`Submission`].
+    #[must_use]
+    pub fn recording(mut self, recorder: Recorder) -> Self {
+        self.recorder = recorder;
+        self
     }
 }
 
@@ -286,7 +305,9 @@ where
             caller = %caller.public_display(),
             invocation = call.invocation_display()
         );
-        self.execute_authorized(request).instrument(span).await
+        self.execute_authorized(request, &call, &caller)
+            .instrument(span)
+            .await
     }
 
     async fn wait_execution(
@@ -317,11 +338,13 @@ where
     async fn execute_authorized(
         &self,
         request: ExecuteRequest,
+        metadata: &CallMetadata,
+        caller: &AuthenticationMetadata,
     ) -> Result<Response<OperationStream>, Status> {
         wire::check_digest_function(request.digest_function)?;
         let action = wire::digest(request.action_digest.as_ref())?;
         if !request.skip_cache_lookup
-            && let Some(result) = self.cache.action_result(&action).await?
+            && let Some((stored, result)) = self.cache.stored_action_result(&action).await?
         {
             let name = format!(
                 "operations/cached/{}-{}",
@@ -329,6 +352,15 @@ where
                 action.size_bytes
             );
             tracing::debug!(%action, "answered from the action cache");
+            let instance = &request.instance_name;
+            self.recorder
+                .call(metadata, caller, instance, || CallKind::Execute {
+                    action,
+                    answer: ExecuteAnswer::Cached {
+                        name: name.clone(),
+                        result: Box::new(listing(stored, &result)),
+                    },
+                });
             let done = operation(
                 &name,
                 &action,
@@ -337,7 +369,10 @@ where
             );
             return Ok(Response::new(Box::pin(stream::iter([Ok(done)]))));
         }
-        let submission = self.submission(request.instance_name, action).await?;
+        let instance = request.instance_name;
+        let (mut submission, command) = self.submission(instance.clone(), action).await?;
+        submission.call =
+            ExecuteCall::new(&self.recorder, metadata, caller, &instance, action, command);
         let ticket = self.dispatch.submit(submission)?;
         tracing::debug!(%action, operation = %ticket.name, "submitted");
         Ok(Response::new(operations(ticket, self.closing.clone())))
@@ -349,8 +384,13 @@ where
     M: MetaLog,
     O: ObjectStore,
 {
-    /// Reads the action and checks its inputs are all held; the scheduler's request.
-    async fn submission(&self, instance: String, action: Digest) -> Result<Submission, Status> {
+    /// Reads the action and checks its inputs are all held; the scheduler's request,
+    /// with no call to record yet, and the Command digest the action names.
+    async fn submission(
+        &self,
+        instance: String,
+        action: Digest,
+    ) -> Result<(Submission, Digest), Status> {
         let Some(bytes) = self.read_input(&action).await? else {
             return Err(missing(&[action]));
         };
@@ -381,7 +421,7 @@ where
         let needs = needs(&platform)?;
         let gpus = mac_gpus(kind, gpus(&platform)?, &needs)?;
         device_kind(kind, &needs)?;
-        Ok(Submission {
+        let submission = Submission {
             request: Request {
                 key: ActionKey { instance, action },
                 qos: Qos::Ci,
@@ -391,7 +431,9 @@ where
                 do_not_cache: decoded.do_not_cache,
                 needs,
             },
-        })
+            call: None,
+        };
+        Ok((submission, command_digest))
     }
 
     /// Every blob of the input tree under `root` that is not held: directories that

@@ -8,7 +8,10 @@ use std::time::Duration;
 
 use futures::future::Either;
 use kbf_auth::{AuthenticateLayer, Policy};
-use kbf_front::{ByteStreamService, Cache, MAX_MESSAGE_BYTES, MetaLog, RequestMetadataLayer};
+use kbf_front::{
+    ByteStreamService, Cache, MAX_MESSAGE_BYTES, MetaLog, RECORDER_CHANNEL, Recorder,
+    RequestMetadataLayer,
+};
 use kbf_objstore::ObjectStore;
 use kbf_proto::google::bytestream::byte_stream_server::ByteStreamServer;
 use kbf_proto::grpc::health::v1::health_server::HealthServer;
@@ -61,6 +64,9 @@ pub struct Listeners {
     /// `grpc.health.v1` service, wait for the object store to answer their probe
     /// ([`crate::health`]).
     pub store_probe_timeout: Duration,
+    /// The memory bound of the invocation records, in bytes
+    /// (`docs/design/invocations.md`, section 3.5).
+    pub invocation_memory: usize,
 }
 
 /// The worker listener's mutual TLS: every daemon's certificate must name its node
@@ -112,8 +118,12 @@ pub struct Bound<F> {
     /// What `GET /readyz` reads besides the store; the serving future marks it
     /// stopping when `shutdown` completes.
     pub readiness: Arc<Readiness>,
-    /// Serves every listener and the tick until the shutdown future completes.
+    /// Serves every listener, the tick and the invocation recorder until the shutdown
+    /// future completes.
     pub serving: F,
+    /// The invocation records the serving future builds, read until the read API
+    /// serves them.
+    pub recorder: Recorder,
 }
 
 fn bind(addr: SocketAddr) -> Result<(TcpIncoming, SocketAddr), ServeError> {
@@ -231,11 +241,15 @@ where
     M: MetaLog,
     O: ObjectStore + 'static,
 {
-    let farm = Arc::new(Farm::new(
-        Arc::clone(&cache),
-        listeners.unservable_wait,
-        listeners.finished_retention,
-    ));
+    let (recorder, recording) = Recorder::new(listeners.invocation_memory, RECORDER_CHANNEL);
+    let farm = Arc::new(
+        Farm::new(
+            Arc::clone(&cache),
+            listeners.unservable_wait,
+            listeners.finished_retention,
+        )
+        .recording(recorder.clone()),
+    );
     let (reapi_incoming, reapi) = bind(listeners.reapi)?;
     let (worker_incoming, worker) = bind(listeners.worker)?;
     let probe_timeout = listeners.store_probe_timeout;
@@ -282,7 +296,7 @@ where
     let authorizers = Arc::new(policy.authorizers);
     let cache_for_health = Arc::clone(&cache);
     let reapi_routes =
-        kbf_front::routes_with_authorizers(cache, Arc::clone(&farm), closing, authorizers);
+        kbf_front::routes_recorded(cache, Arc::clone(&farm), closing, authorizers, &recorder);
     let authenticate = AuthenticateLayer::new(policy.authenticator);
     // The layers wrap the REAPI routes (and the fallback for unknown paths) present
     // when they are applied; the health service, added after, is answered without
@@ -345,6 +359,7 @@ where
             served = worker_serve => served.map_err(ServeError::from),
             served = api_serve => served.map_err(ServeError::Api),
             () = ticking => Ok(()),
+            () = recording.run() => Ok(()),
             () = stopping => Ok(()),
         }
     };
@@ -354,5 +369,6 @@ where
         api,
         readiness,
         serving,
+        recorder,
     })
 }

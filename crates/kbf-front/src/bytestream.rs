@@ -19,8 +19,12 @@ use kbf_proto::google::bytestream::{
 };
 use tonic::{Request, Response, Status, Streaming};
 
+use kbf_invocation::CallKind;
+
 use crate::cache::{Cache, VerifiedBlob};
 use crate::meta_log::MetaLog;
+use crate::recorder::Recorder;
+use crate::request_metadata::call_metadata;
 use crate::wire::Resource;
 use crate::{MAX_BLOB_BYTES, READ_CHUNK_BYTES, wire};
 
@@ -31,6 +35,7 @@ use crate::{MAX_BLOB_BYTES, READ_CHUNK_BYTES, wire};
 pub struct ByteStreamService<M, O> {
     cache: Arc<Cache<M, O>>,
     authorizers: Arc<Authorizers>,
+    recorder: Recorder,
 }
 
 impl<M, O> ByteStreamService<M, O> {
@@ -43,7 +48,19 @@ impl<M, O> ByteStreamService<M, O> {
     /// The service over `cache`, each call authorized by `authorizers`.
     #[must_use]
     pub const fn with_authorizers(cache: Arc<Cache<M, O>>, authorizers: Arc<Authorizers>) -> Self {
-        Self { cache, authorizers }
+        Self {
+            cache,
+            authorizers,
+            recorder: Recorder::off(),
+        }
+    }
+
+    /// This service, each Read and Write that carries an invocation id sent to
+    /// `recorder`: the bytes read, and the bytes of each blob written.
+    #[must_use]
+    pub fn recording(mut self, recorder: Recorder) -> Self {
+        self.recorder = recorder;
+        self
     }
 }
 
@@ -59,6 +76,7 @@ impl<M: MetaLog, O: ObjectStore + 'static> ByteStream for ByteStreamService<M, O
         request: Request<ReadRequest>,
     ) -> Result<Response<Self::ReadStream>, Status> {
         let caller = kbf_auth::metadata(&request);
+        let metadata = call_metadata(&request);
         let request = request.into_inner();
         let Resource { instance, digest } = wire::read_resource(&request.resource_name)?;
         let cas_get = &*self.authorizers.cas_get;
@@ -87,6 +105,9 @@ impl<M: MetaLog, O: ObjectStore + 'static> ByteStream for ByteStreamService<M, O
         };
         // Both bounds are at most the blob's length, which fits in memory.
         let wanted = blob.slice(offset as usize..end as usize);
+        self.recorder.call(&metadata, &caller, &instance, || {
+            CallKind::Downloaded(wanted.len() as u64)
+        });
         let messages: Vec<Result<ReadResponse, Status>> = wanted
             .chunks(READ_CHUNK_BYTES)
             .map(|c| Ok(ReadResponse { data: c.to_vec() }))
@@ -101,6 +122,7 @@ impl<M: MetaLog, O: ObjectStore + 'static> ByteStream for ByteStreamService<M, O
         request: Request<Streaming<WriteRequest>>,
     ) -> Result<Response<WriteResponse>, Status> {
         let caller = kbf_auth::metadata(&request);
+        let metadata = call_metadata(&request);
         let mut stream = request.into_inner();
         let first = stream
             .message()
@@ -164,6 +186,8 @@ impl<M: MetaLog, O: ObjectStore + 'static> ByteStream for ByteStreamService<M, O
         }
         let blob = VerifiedBlob::new(digest, Bytes::from(received))?;
         self.cache.store_blobs(vec![blob]).await?;
+        self.recorder
+            .call(&metadata, &caller, &instance, || CallKind::Uploaded(size));
         Ok(committed(size))
     }
 

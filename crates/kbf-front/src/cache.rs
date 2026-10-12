@@ -386,6 +386,18 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         &self,
         action: &Digest,
     ) -> Result<Option<reapi::ActionResult>, CacheError> {
+        Ok(self.stored_action_result(action).await?.map(|(_, r)| r))
+    }
+
+    /// [`Cache::action_result`], with the digest of the ActionResult blob it was read
+    /// from.
+    ///
+    /// # Errors
+    /// The metadata log or the store is unavailable.
+    pub async fn stored_action_result(
+        &self,
+        action: &Digest,
+    ) -> Result<Option<(Digest, reapi::ActionResult)>, CacheError> {
         let answer = self
             .touched(|s| match s.action(action) {
                 ActionAnswer::Hit { result, touch } => (Ok(result), touch),
@@ -405,7 +417,7 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
             Err(e) => return Err(e),
         };
         match reapi::ActionResult::decode(bytes) {
-            Ok(r) => Ok(Some(r)),
+            Ok(r) => Ok(Some((result, r))),
             Err(e) => {
                 tracing::warn!(%action, %result, error = %e, "stored ActionResult does not decode");
                 Ok(None)

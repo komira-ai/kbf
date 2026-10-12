@@ -8,8 +8,11 @@ use kbf_proto::reapi::action_cache_server::ActionCache;
 use kbf_proto::reapi::{ActionResult, GetActionResultRequest, UpdateActionResultRequest};
 use tonic::{Request, Response, Status};
 
+use kbf_invocation::CallKind;
+
 use crate::cache::Cache;
 use crate::meta_log::MetaLog;
+use crate::recorder::{Recorder, listing};
 use crate::wire;
 
 /// The `ActionCache` service over a [`Cache`]. GetActionResult is authorized by
@@ -19,13 +22,26 @@ use crate::wire;
 pub struct ActionCacheService<M, O> {
     cache: Arc<Cache<M, O>>,
     authorizers: Arc<Authorizers>,
+    recorder: Recorder,
 }
 
 impl<M, O> ActionCacheService<M, O> {
     /// The service over `cache`, each lookup authorized by `authorizers`.
     #[must_use]
     pub const fn with_authorizers(cache: Arc<Cache<M, O>>, authorizers: Arc<Authorizers>) -> Self {
-        Self { cache, authorizers }
+        Self {
+            cache,
+            authorizers,
+            recorder: Recorder::off(),
+        }
+    }
+
+    /// This service, each lookup that carries an invocation id (hit or miss) sent to
+    /// `recorder`.
+    #[must_use]
+    pub fn recording(mut self, recorder: Recorder) -> Self {
+        self.recorder = recorder;
+        self
     }
 }
 
@@ -40,6 +56,7 @@ impl<M: MetaLog, O: ObjectStore + 'static> ActionCache for ActionCacheService<M,
         request: Request<GetActionResultRequest>,
     ) -> Result<Response<ActionResult>, Status> {
         let caller = kbf_auth::metadata(&request);
+        let metadata = crate::request_metadata::call_metadata(&request);
         let request = request.into_inner();
         let call = "/build.bazel.remote.execution.v2.ActionCache/GetActionResult";
         authorize(
@@ -51,8 +68,15 @@ impl<M: MetaLog, O: ObjectStore + 'static> ActionCache for ActionCacheService<M,
         .await?;
         wire::check_digest_function(request.digest_function)?;
         let action = wire::digest(request.action_digest.as_ref())?;
-        match self.cache.action_result(&action).await? {
-            Some(result) => Ok(Response::new(result)),
+        let stored = self.cache.stored_action_result(&action).await?;
+        let instance = &request.instance_name;
+        self.recorder
+            .call(&metadata, &caller, instance, || CallKind::GetActionResult {
+                action,
+                hit: stored.as_ref().map(|(digest, r)| listing(*digest, r)),
+            });
+        match stored {
+            Some((_, result)) => Ok(Response::new(result)),
             None => Err(Status::not_found(format!(
                 "no usable action-cache entry for {action}"
             ))),

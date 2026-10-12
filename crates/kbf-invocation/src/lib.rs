@@ -14,9 +14,13 @@
 //! [`Invocation::header`] and [`Invocation::chunk`] give the record as
 //! `kbf.invocation.v1` messages ([`proto`]), the form section 3.5 stores.
 //!
+//! [`Records::with_bound`] holds every record within a memory bound, removing minted,
+//! then idle records and then closing the largest open one to new rows (section 3.5,
+//! stage 1).
+//!
 //! This is a pure crate: no async runtime, network, clock, randomness or hashed
-//! collections. Wall times come in with the events. The recorder that feeds it, its
-//! channel and memory bound, and the read API are not here.
+//! collections. Wall times come in with the events. The recorder that feeds it
+//! (`kbf_front::Recorder`, its channel and its task) and the read API are not here.
 
 #![deny(clippy::disallowed_methods, clippy::disallowed_types)]
 
