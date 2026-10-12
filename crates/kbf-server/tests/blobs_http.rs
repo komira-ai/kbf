@@ -565,3 +565,23 @@ async fn a_refused_caller_learns_nothing_and_touches_nothing() {
     assert_eq!(missing, [asked], "the refused ask touched the blob");
     server.stop().await;
 }
+
+/// Catches: a digest that claims more bytes than the read budget holds read anyway
+/// (or a panic on a size too large for a permit count) instead of `503` before the
+/// read. The cache never holds such a blob: the budget is the largest it accepts.
+#[tokio::test]
+async fn a_digest_larger_than_the_read_budget_is_503() {
+    let server = Server::with(OPEN);
+    let budget = u64::try_from(kbf_server::http_blobs::READ_BUDGET_BYTES).expect("a u64");
+    for size in [budget + 1, 1 << 33] {
+        let digest = Digest::new(kbf_types::DigestFunction::Sha256, [9; 32], size);
+        let answer = server.get(&path(&digest), "").await;
+        assert_eq!(answer.code, 503, "{size}: {}", answer.head);
+        let body = String::from_utf8_lossy(&answer.body);
+        assert!(
+            body.contains("does not fit in the memory left"),
+            "{size}: {body}"
+        );
+    }
+    server.stop().await;
+}

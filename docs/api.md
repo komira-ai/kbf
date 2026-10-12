@@ -254,7 +254,8 @@ cache keeps one digest per blob and can check only all of it; a second read to s
 from would send bytes nobody checked. So the route keeps a budget: the blobs of all the
 answers it is reading or still sending hold at most 1 GiB (1073741824 bytes, the largest
 blob the cache accepts) at once. A read whose blob does not fit in what is left is `503`
-before a byte is read; it can be asked again once other answers have been sent. A slow
+before a byte is read; it can be asked again once other answers have been sent. A
+digest that claims more than the whole budget is `503` too (the cache holds no such blob). A slow
 client holds its blob's share of the budget until its answer is sent or it goes away.
 
 **Never a page.** Every answer of the route, the errors and `404` included, carries
