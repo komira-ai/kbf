@@ -6,8 +6,8 @@
 #
 #   SPIKE macos-<arch>.<probe>.<arm>=<value>
 #
-# The `macos-` prefix keeps these keys apart from the Linux spike's `<arch>.<key>`
-# lines (tools/spike/lib.sh), whose arm64 keys would otherwise share a namespace.
+# The `macos-` prefix keeps these keys apart from the `<arch>.<key>` lines of the
+# Linux spike (since deleted), whose arm64 keys would have shared a namespace.
 # Every probe ends with one `<probe>.verdict` line whose value starts with one of:
 #
 #   PASS    the mechanics worked and the control arm went red as it must;

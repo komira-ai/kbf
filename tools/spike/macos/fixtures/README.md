@@ -6,7 +6,7 @@ instrument: a UI test that is known to work, so a probe that runs it in a new co
 not about the test.
 
 - `MacFixture.xcodeproj`: a macOS app and `MacFixtureUITests`.
-- `IOSFixture.xcodeproj`: an iOS app and `IOSFixtureUITests`; `run.sh` builds and tests it on a simulator.
+- `IOSFixture.xcodeproj`: an iOS app and `IOSFixtureUITests`, tested on a simulator.
 
 Both projects compile the same sources:
 
@@ -21,7 +21,7 @@ Both projects compile the same sources:
 Nothing is signed with an identity. macOS builds are signed to run locally (ad-hoc,
 `CODE_SIGN_IDENTITY = "-"`, no team). The iOS project lists both iOS platforms
 (`SUPPORTED_PLATFORMS = "iphonesimulator iphoneos"`), but only a simulator build runs
-without a team, and `run.sh` asks only for a simulator destination.
+without a team, and the tests ask only for a simulator destination.
 
 ## The tests
 
@@ -37,7 +37,7 @@ screenshot in the `.xcresult` (attachment lifetime `keepAlways`), whatever the o
 `PatternCheck` draws the image into an 8-bit sRGB bitmap. Pattern colours can occur
 elsewhere on a screen, so it anchors on each solid, roughly square block of the
 top-left colour and finds the pattern only where the three same-sized boxes beside it
-(right, below, below-right) hold the other three colours. `selftest.sh` checks it
+(right, below, below-right) hold the other three colours. The selftest checks it
 against a pattern on a light and on a dark background, and a pattern among other
 pattern-coloured pixels (each found), and against an all-black image, a wallpaper of
 hue bands, the quadrants in the wrong order, three quadrants and the quadrants
@@ -45,36 +45,38 @@ scattered apart (each missing).
 
 ## Running
 
-macOS with Xcode only:
+`crates/kbf-driver-native/tests/xcuitest_sandbox.rs` builds and tests the fixtures
+(macOS with Xcode and an iOS simulator runtime only, so its tests are `#[ignore]`d):
 
 ```sh
-bash selftest.sh OUT_DIR       # the pixel checker's selftest
-bash run.sh ios OUT_DIR        # build, test on the newest iPhone simulator
-bash run.sh macos OUT_DIR      # build, test in this login session
-bash run.sh macos OUT_DIR build-for-testing      # only build, into OUT_DIR
-bash run.sh macos OUT_DIR test-without-building  # then only test that build
-bash run.sh macos OUT_DIR report                 # check the bundle a run left, no xcodebuild
+cargo test -p kbf-driver-native --test xcuitest_sandbox --locked -- --ignored --nocapture
 ```
 
-`run.sh` writes `OUT_DIR/<platform>.xcresult`, the xcodebuild log, and
-`OUT_DIR/<platform>-attachments/`: the screenshots exported with
-`xcresulttool export attachments`, plus its `manifest.json`, which names the test and
-attachment each file came from. Inside the bundle itself the attachments are
-content-addressed files under `Data/`. It prints `SPIKE` lines (see `../../lib.sh`)
-and exits 0 only if xcodebuild succeeded, exactly the three tests passed and the
-exported attachments hold the three screenshots (`window` and `screen` from
-`testScreenshotShowsPattern`, `window-no-pattern` from `testPatternLeftOutIsNotFound`),
-each a non-empty file. A test that passes without `keepAlways` has its screenshots
+It runs the pixel checker's selftest (`xcrun swiftc` of `selftest/main.swift` with the
+two sources it checks), each fixture without a sandbox (the controls), and each under
+the native driver's sandbox profile as the driver runs an action
+(`docs/spikes/macos-p0.md`). The iOS fixture runs on the first iPhone of the newest
+iOS runtime `simctl` lists; the macOS one in this login session.
+`tests/support/xcode_fixture.rs` holds the `xcodebuild` command and the check of the
+result bundle: a run passes only if xcodebuild exited 0, exactly the three tests
+passed and the exported attachments hold the three screenshots (`window` and `screen`
+from `testScreenshotShowsPattern`, `window-no-pattern` from
+`testPatternLeftOutIsNotFound`), each a non-empty file. Inside the bundle the
+attachments are content-addressed files under `Data/`; `xcresulttool export
+attachments` writes them out with a `manifest.json` that names the test and attachment
+each file came from. A test that passes without `keepAlways` has its screenshots
 deleted from the bundle, so that run fails.
 
-The workflow `.github/workflows/spike-xcuitest.yml` runs all of this on a hosted macOS
-runner and uploads the bundles. Its `xcuitest-sandbox` job runs `run.sh` again as a
-native driver action, under the driver's sandbox profile
-(`../xcuitest_sandbox.sh`, `docs/spikes/macos-p0.md`). A hosted runner's privacy grants may be seeded, so
-its result proves the instrument, not what a fresh Mac allows.
+Each run leaves its lease under `target/tmp/xcuitest/<arm>`: the
+`<platform>.xcresult` bundle, the xcodebuild log and the exported attachments in
+`root/out`, and the run's deny lines in `target/tmp/xcuitest/<arm>-denies.txt`. The
+workflow `.github/workflows/spike-xcuitest.yml` runs the test on a hosted macOS runner
+and uploads them. A hosted runner's privacy grants may be seeded, so its result proves
+the instrument, not what a fresh Mac allows.
 
 ## Changing the projects
 
-The `.xcodeproj` files are generated by `gen_projects.py`; edit the script, run it,
-and commit both. `python3 gen_projects.py --check` fails when a committed file
-differs from what the script writes, and the workflow runs it.
+The `.xcodeproj` files are the source: edit them in Xcode (or by hand) and commit
+them. They were first written by a generator, which was deleted once the projects
+stopped changing; the test builds both projects on every run, so a project that no
+longer parses fails it.

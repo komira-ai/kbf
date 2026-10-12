@@ -211,35 +211,12 @@ case "$NAME" in
         ;;
     mount) cat "$S/mounts" 2>/dev/null ;;
     sandbox-exec)
-        # sandbox-exec [-D PARAM] -p PROFILE CMD...: a profile naming CoreSimulatorService
-        # blocks the fake simctl, unless the test says the deny is ignored. Under
-        # `(deny default)` the exec is reported as the real sandbox reports a deny (to
-        # $S/sandbox.log, which the fake `log show` prints) unless the test says it goes
-        # unreported, and refused unless the test says the deny is ignored. The driver's
-        # profile (it denies lsopen) is kept in $S/driver_profile.<n> and CMD runs with
-        # FAKE_SANDBOX=driver, which the fake run.sh reads.
-        if [ "$1" = -D ]; then
-            printf '%s\n' "$2" >>"$S/sandbox_params"
-            shift 2
-        fi
+        # sandbox-exec -p PROFILE CMD...: a profile naming CoreSimulatorService blocks the
+        # fake simctl, unless the test says the deny is ignored.
         profile=$2
         shift 2
         case "$profile" in
             *CoreSimulatorService*) has deny_ignored || export FAKE_SIM_DENIED=1 ;;
-            *"(deny default)"*)
-                has deny_default_unreported ||
-                    printf '2026-10-11 12:00:00.000 E  kernel[0:1] (Sandbox) Sandbox: sandbox-exec(%s) deny(1) process-exec* %s\n' \
-                        "$$" "$1" >>"$S/sandbox.log"
-                if ! has deny_default_ignored; then
-                    echo "sandbox-exec: execvp() of '$1' failed: Operation not permitted" >&2
-                    exit 71
-                fi
-                ;;
-            *"(deny lsopen)"*)
-                n=$(find "$S" -name 'driver_profile.*' | wc -l | tr -d ' ')
-                printf '%s' "$profile" >"$S/driver_profile.$n"
-                export FAKE_SANDBOX=driver
-                ;;
             *)
                 if has allow_fails; then
                     echo 'sandbox-exec: sandbox_apply: Operation not permitted' >&2
@@ -248,11 +225,6 @@ case "$NAME" in
                 ;;
         esac
         PATH=$CALLER_PATH exec "$@"
-        ;;
-    log)
-        # log show ... --predicate 'sender == "Sandbox"': every report the fakes wrote.
-        [ "$1" = show ] || exit 64
-        cat "$S/sandbox.log" 2>/dev/null
         ;;
     xcrun)
         [ "$1" = simctl ] || exit 1
