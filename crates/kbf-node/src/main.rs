@@ -863,6 +863,11 @@ mod tests {
                 temp.display()
             ),
         );
+        // On macOS the survey runs under the real sandbox, which lets it write only in
+        // its lease directory and under /dev: the fake's log of its runs (beside it,
+        // see kbf_testkit::fake) goes to /dev/null.
+        std::os::unix::fs::symlink("/dev/null", format!("{}.log", program.display()))
+            .expect("log link");
         let flag = |name: &str, path: &Path| format!("--{name}={}", path.display());
         let cli = Cli::try_parse_from([
             "kbf-daemon".to_owned(),
