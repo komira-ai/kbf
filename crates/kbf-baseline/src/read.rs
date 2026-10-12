@@ -500,6 +500,71 @@ mod tests {
         assert_eq!(parsed(r#"{"test_response":{}}"#), Some(true));
     }
 
+    /// One command of an `ActionExecutionEnd`, in the shape buck2 writes (the fields of
+    /// the verdict action in `tests/data/m1-failing.json-lines.gz`, trimmed to the ones
+    /// that differ by where the command ran).
+    fn command(kind: &str, exit: i64, status: &str, exec_us: u64, queue_us: u64) -> String {
+        format!(
+            r#"{{"details":{{"signed_exit_code":{exit},"stdout":"","stderr":"","command_kind":{{"command":{{"{kind}":{{}}}}}},"metadata":{{"wall_time_us":{exec_us},"execution_time_us":{exec_us},"start_time":[1791806271,307345949],"input_materialization_duration_us":0,"hashing_duration_us":0,"hashed_artifacts_count":0,"queue_duration_us":{queue_us},"suspend_duration":null,"suspend_count":null}},"additional_message":null}},"status":{{"{status}":{{}}}}}}"#
+        )
+    }
+
+    /// A log of one action that ran as `execution_kind` with these `commands`.
+    fn one_action(execution_kind: i64, commands: &[String]) -> Action {
+        let end = format!(
+            r#"{{"Event":{{"timestamp":[1791806271,370686112],"trace_id":"t","span_id":108,"parent_id":0,"data":{{"SpanEnd":{{"stats":{{"max_poll_time_us":330,"total_poll_time_us":1323}},"duration_us":381080,"data":{{"ActionExecution":{{"key":{{"id":"0000000000000000","key":"_0","owner":{{"TargetLabel":{{"label":{{"package":"root//","name":"a"}},"configuration":{{"full_name":"<unspecified>"}},"execution_configuration":null}}}}}},"kind":"Run","name":{{"category":"step","identifier":""}},"failed":false,"execution_kind":{execution_kind},"wall_time_us":204933,"commands":[{}],"outputs":[]}}}}}}}}}}}}"#,
+            commands.join(",")
+        );
+        let log = format!("{{\"trace_id\":\"t\"}}\n{end}\n");
+        let mut b = parse(&mut log.as_bytes()).expect("parse");
+        assert_eq!(b.actions.len(), 1);
+        b.actions.remove(0)
+    }
+
+    #[test]
+    fn queue_time_is_kept_only_for_a_remote_action() {
+        // Catches: the queue time of a local (or local-worker) action kept as farm queue
+        // time (`ran == Remote` widened to `ran != CacheHit`). buck2 can fill
+        // `queue_duration` for a local command too; it is not the farm's queue. No
+        // capture has such an action, so this line is synthetic.
+        for kind in [1, 8] {
+            let a = one_action(kind, &[command("LocalCommand", 0, "Success", 900, 77)]);
+            assert_eq!(
+                (a.ran, a.queue_us, a.execution_us),
+                (Ran::Local, None, Some(900))
+            );
+        }
+        for kind in [2, 11] {
+            let a = one_action(kind, &[command("RemoteCommand", 0, "Success", 900, 77)]);
+            assert_eq!(
+                (a.ran, a.queue_us, a.execution_us),
+                (Ran::Remote, Some(77), Some(900))
+            );
+        }
+    }
+
+    #[test]
+    fn an_action_with_several_commands_is_read_from_its_last() {
+        // Catches: the first command read instead of the last (`pop()` turned into
+        // `into_iter().next()`). A retried action, or one that fell back from the farm to
+        // the client, has more than one; every capture's actions have exactly one, so
+        // this line is synthetic. The first command here failed on the farm, the last
+        // ran locally and succeeded: buck2 reports the action by the last.
+        let a = one_action(
+            1,
+            &[
+                command("RemoteCommand", 1, "Failure", 11, 22),
+                command("LocalCommand", 0, "Success", 900, 77),
+            ],
+        );
+        assert_eq!(
+            (a.exit_code, a.status.as_deref(), a.execution_us),
+            (Some(0), Some("Success"), Some(900))
+        );
+        let a = one_action(2, &[]);
+        assert_eq!((a.exit_code, a.status, a.queue_us), (None, None, None));
+    }
+
     #[test]
     fn a_failed_remote_action_keeps_its_exit_code_and_farm_times() {
         // Catches: a failed action dropped by the reader, its last command's exit code
