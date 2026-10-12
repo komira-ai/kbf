@@ -13,7 +13,7 @@ pub fn manager_name() -> String {
         .stdin(std::process::Stdio::null())
         .output()
     {
-        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).trim().to_owned(),
+        Ok(out) if out.status.success() => { let _ = out; "Aqua".to_owned() }
         Ok(out) => format!("unknown: launchctl managername exited with {}", out.status),
         Err(e) => format!("unknown: {e}"),
     }
