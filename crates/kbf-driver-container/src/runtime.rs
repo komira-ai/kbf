@@ -32,12 +32,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use kbf_daemon::cas::{Cas, CasError};
 use kbf_daemon::{Runtime, RuntimeError, Work};
-use kbf_proto::reapi::{Action, ActionResult, Command, Platform};
+use kbf_proto::reapi::{Action, ActionResult, Command, ExecutedActionMetadata, Platform};
 use kbf_types::LeaseId;
+use prost_types::Timestamp;
 use tokio::process::Child;
 use tokio::sync::oneshot;
 
@@ -318,6 +319,11 @@ impl<C: Cas> PodmanRuntime<C> {
         stop: &mut oneshot::Receiver<Stop>,
         killer: &mut Option<Stop>,
     ) -> Result<ActionResult, RuntimeError> {
+        let mut clock = ExecutedActionMetadata {
+            worker_start_timestamp: now(),
+            input_fetch_start_timestamp: now(),
+            ..ExecutedActionMetadata::default()
+        };
         // A kill during prepare (a long input fetch) stops it at once: dropping the
         // future drops any Podman query with it (`kill_on_drop`), and the clean step
         // removes whatever was written.
@@ -332,6 +338,10 @@ impl<C: Cas> PodmanRuntime<C> {
                 return Err(RuntimeError::Killed);
             }
         };
+        clock.input_fetch_completed_timestamp = now();
+        // Execution counts from `podman create`: making the container is part of
+        // running the command in one.
+        clock.execution_start_timestamp = now();
         let cas = &*self.cas;
         lease.created = true;
         self.podman
@@ -404,6 +414,9 @@ impl<C: Cas> PodmanRuntime<C> {
             Ended::Exited(code) => code,
             Ended::NotRun(state) => program::not_run(&spec, &stderr_path, &state).await?,
         };
+        clock.execution_completed_timestamp = now();
+        // The upload counts from the chown, which makes the outputs readable to it.
+        clock.output_upload_start_timestamp = now();
         // The container has exited: hand its files back to the daemon's user, so an
         // output the action left unreadable to others is still read, as its owner.
         self.podman
@@ -434,6 +447,9 @@ impl<C: Cas> PodmanRuntime<C> {
         ] {
             *slot = Some(collect_log(cas, path, max).await.map_err(outputs_error)?);
         }
+        clock.output_upload_completed_timestamp = now();
+        clock.worker_completed_timestamp = now();
+        result.execution_metadata = Some(clock);
         Ok(result)
     }
 
@@ -781,6 +797,11 @@ fn wait_exited(
             Err(e) => return Err(wait_failed(e)),
         }
     }
+}
+
+/// The wall clock now, as `ExecutedActionMetadata` holds it.
+fn now() -> Option<Timestamp> {
+    Some(Timestamp::from(SystemTime::now()))
 }
 
 /// The action's image, from `container-image` in the Action's platform, or the
