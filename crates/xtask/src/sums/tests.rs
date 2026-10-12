@@ -102,7 +102,7 @@ fn verify_sums_passes_when_listed_is_present_and_each_matches() {
 #[test]
 fn verify_sums_refuses_listed_not_equal_to_present() {
     // Catches: a file in the directory that SHA256SUMS does not list (it would be
-    // shipped unsigned), a listed file that is missing, a line listed twice, and a
+    // shipped unsigned; a leftover SHA256SUMS.<platform> part included), a listed file that is missing, a line listed twice, and a
     // file whose bytes are not its line's. Each row plants one.
     struct Row {
         what: &'static str,
@@ -116,6 +116,13 @@ fn verify_sums_refuses_listed_not_equal_to_present() {
             files: &[(A, b"tarball"), (A_SBOM, b"sbom")],
             sums: line(A, b"tarball"),
             want: |_| vec![format!("not listed in {SUMS}: {A_SBOM}")],
+        },
+        Row {
+            // A part file left over from assembly: named like SHA256SUMS but not it.
+            what: "unlisted-part",
+            files: &[(A, b"tarball"), ("SHA256SUMS.linux-arm64", b"part")],
+            sums: line(A, b"tarball"),
+            want: |_| vec![format!("not listed in {SUMS}: SHA256SUMS.linux-arm64")],
         },
         Row {
             what: "missing",
