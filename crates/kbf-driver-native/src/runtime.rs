@@ -1016,10 +1016,11 @@ mod tests {
         let panicked = tokio::task::spawn_blocking(|| panic!("create panicked"))
             .await
             .expect_err("the task panicked");
-        let failed = simulator_made(Err(panicked));
+        // Read through Debug: a pattern guard here would be a branch never taken.
+        let shown = format!("{:?}", simulator_made(Err(panicked)));
         assert!(
-            matches!(&failed, Err(RuntimeError::Failed(why)) if why.starts_with("simulator task: ")),
-            "{failed:?}"
+            shown.starts_with("Err(Failed(\"simulator task: "),
+            "{shown}"
         );
     }
 

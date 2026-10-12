@@ -293,6 +293,10 @@ that work.
   xcrun simctl --set "$KBF_SIMULATOR_SET" install "$KBF_SIMULATOR_UDID" App.app
   ```
 
+  On a hosted macOS runner the device booted under the sandbox this way, but `xcrun
+  xcdevice list` run by the same action did not list it. `xcodebuild` finds
+  `-destination` devices through the same Xcode device discovery, so it may not find
+  a device in a lease's set; that has not been tried yet.
 - **At the end**, whatever the outcome (exit, failure, timeout, kill), before the lease
   directory is removed, every device in the set (one the action made there too) is
   shut down and deleted, each by its UDID, with the Mac's default Xcode. A delete that

@@ -285,11 +285,10 @@ mod tests {
                 platform: with("simulator", bad),
                 ..Action::default()
             };
-            let got = request_of(&action, &Command::default());
-            assert!(
-                matches!(&got, Err(RuntimeError::Invalid(why)) if why.contains(PROPERTY)),
-                "{bad:?}: {got:?}"
-            );
+            // Read through Debug: a pattern guard here would be a branch never taken.
+            let got = format!("{:?}", request_of(&action, &Command::default()));
+            assert!(got.starts_with("Err(Invalid("), "{bad:?}: {got}");
+            assert!(got.contains(PROPERTY), "{bad:?}: {got}");
         }
     }
 

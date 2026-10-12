@@ -187,6 +187,64 @@ async fn the_simulator_is_deleted_whatever_the_outcome() {
     assert!(no_leases(&config), "every lease directory is removed");
 }
 
+/// Catches: a kill while `simctl create` runs cutting the create short (the device it
+/// makes after the end looked would be left), the action run after the kill, and the
+/// device that create made left behind.
+#[tokio::test]
+async fn a_kill_during_the_create_still_deletes_the_simulator() {
+    let dir = scratch("sim-kill-create");
+    let creating = dir.join("creating");
+    let extra = format!(
+        "simctl --set * create * slow *\t-\tappend {} x ; sleep 0.5 ; mkdir $3/{UDID} ; echo {UDID}\n",
+        creating.display()
+    );
+    let (config, xcrun) = fake_config(&dir, &extra);
+    let cas = Arc::new(MemoryCas::default());
+    let rt = Arc::new(runtime(config.clone(), &cas));
+    let ran = dir.join("ran");
+    let action = Spec::act(&format!("append {} x", ran.display()))
+        .property("simulator", &format!("slow,{RUNTIME}"))
+        .store(&cas);
+    let running = tokio::spawn({
+        let rt = Arc::clone(&rt);
+        async move { rt.run(support::work(1, action, 0)).await }
+    });
+    let waited = tokio::time::timeout(PROMPT, async {
+        while !creating.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    });
+    waited.await.expect("the create starts");
+    rt.kill(kbf_types::LeaseId::new(1, 1)).await;
+    let killed = running.await.expect("run task");
+    assert!(matches!(killed, Err(RuntimeError::Killed)), "{killed:?}");
+    assert!(!ran.exists(), "the action did not run");
+    assert_eq!(
+        calls(&xcrun, &set_of(&config, 1))[1..],
+        [format!("shutdown {UDID}"), format!("delete {UDID}")]
+    );
+    assert!(no_leases(&config));
+}
+
+/// Catches: a node where `xcrun` cannot be run (a Linux worker the action was placed
+/// on without `OSFamily=darwin`, a Mac without developer tools) running the action
+/// without the simulator it asked for, or failing it without saying why.
+#[tokio::test]
+async fn a_node_without_xcrun_fails_a_lease_that_asks_for_a_simulator() {
+    let dir = scratch("sim-no-xcrun");
+    let (mut config, _) = fake_config(&dir, "");
+    config.xcrun = dir.join("no-xcrun");
+    let cas = Arc::new(MemoryCas::default());
+    let rt = runtime(config.clone(), &cas);
+    let outcome = run(&rt, &cas, 1, &asks(Spec::act("exit 0"), DEVICE_TYPE)).await;
+    let shown = format!("{outcome:?}");
+    assert!(
+        shown.starts_with("Err(Failed(\"simulator: simctl create kbf-lease-1-1 "),
+        "{shown}"
+    );
+    assert!(no_leases(&config));
+}
+
 /// Catches: an action run without the simulator it asked for (a `simctl create` that
 /// failed, or printed no UDID, taken for a made one), the failure blamed on the
 /// action (it is the node's: a runtime it lacks) or not naming `simctl`'s reason; and
@@ -484,7 +542,9 @@ mod real {
             &runtime_id,
         ]);
         let udid = created.trim().to_owned();
-        xcrun(&["simctl", "--set", set_arg, "bootstatus", &udid, "-b"]);
+        // `boot` returns once the device is booted, without the minutes of data
+        // migration `bootstatus` waits for: enough for a device left running.
+        xcrun(&["simctl", "--set", set_arg, "boot", &udid]);
         assert!(
             running_now(&udid),
             "pgrep finds a booted simulator by its UDID"
