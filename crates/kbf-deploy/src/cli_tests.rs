@@ -320,7 +320,7 @@ fn a_failed_check_after_an_apply_exits_1_with_a_fail_line() {
     let mut exec = FakeExec::new(0);
     exec.answer = Box::new(|cmd| {
         Ok(match cmd.program.as_str() {
-            crate::user::GETENT => reply(0, "kbf:x:990:990::/h:/s\n", ""),
+            kbf_host::user::GETENT => reply(0, "kbf:x:990:990::/h:/s\n", ""),
             // `podman image exists`: never, even after the pull.
             "/usr/bin/podman" if cmd.args[0] == "image" => reply(1, "", ""),
             _ => reply(0, "990\n", ""),
