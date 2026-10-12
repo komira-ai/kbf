@@ -156,11 +156,13 @@ start_daemon() {
 start_daemon "$unit"
 echo "daemon joined"
 
+# `build LOG ARGS...`: one build, its console in LOG and its event log beside it
+# (`--event-log`, gzipped JSON lines, the input of kbf-baseline).
 build() {
     local log=$1
     shift
-    if ! (cd "$project" && timeout "$build_timeout" "$buck2" build --console simple "$@") \
-        >"$log" 2>&1; then
+    if ! (cd "$project" && timeout "$build_timeout" "$buck2" build --console simple \
+        --event-log "${log%.log}.json-lines.gz" "$@") >"$log" 2>&1; then
         cat "$log"
         echo "FAIL: buck2 build $* failed (or ran past $build_timeout s)" >&2
         exit 1

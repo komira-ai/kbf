@@ -13,7 +13,9 @@
 # file), and while it runs the node is drained through the operator API. The drain
 # must answer `draining` and list exactly the lease the daemon started; the build must
 # take at least the sleep; the node must then be `drained`, and an uncordon returns it
-# to `serving`. Last, the bucket must hold objects (the blobs went to the store).
+# to `serving`. Then `//...` is built once more with `//:verdict` made to fail on the
+# farm, and that build must fail. Last, the bucket must hold objects (the blobs went to
+# the store).
 # Any failure exits non-zero, after printing the cell's logs.
 #
 # Usage:
@@ -103,14 +105,20 @@ done
 grep -q 'welcomed' "$logs/daemon.err" || { echo "the daemon did not join" >&2; exit 1; }
 echo "daemon joined"
 
-# One tool: build, clean, build again, check. Each build's console goes to a log.
+# One tool: build, clean, build again, check. Each build's console goes to a log, and
+# buck2 also writes each build's event log there (`--event-log`, gzipped JSON lines:
+# the input of kbf-baseline, whose test captures are copied from this job's logs).
 two_builds() {
     local tool=$1 dir=$2
     shift 2
-    local build=("$@")
-    (cd "$dir" && "${build[@]}") 2>&1 | tee "$logs/$tool-first.log"
+    local build=("$@") first=() second=()
+    if [ "$tool" = buck2 ]; then
+        first=(--event-log "$logs/buck2-first.json-lines.gz")
+        second=(--event-log "$logs/buck2-second.json-lines.gz")
+    fi
+    (cd "$dir" && "${build[@]}" "${first[@]}") 2>&1 | tee "$logs/$tool-first.log"
     (cd "$dir" && "${clean[@]}")
-    (cd "$dir" && "${build[@]}") 2>&1 | tee "$logs/$tool-second.log"
+    (cd "$dir" && "${build[@]}" "${second[@]}") 2>&1 | tee "$logs/$tool-second.log"
     "$bin_dir/kbf-cell" check --tool "$tool" \
         --first "$logs/$tool-first.log" --second "$logs/$tool-second.log"
 }
@@ -177,11 +185,29 @@ lease_in_flight() {
     echo "OK: //:pause ended $((end_ms - start_ms)) ms after its lease started; $node drained, then serving again"
 }
 
+# A build with one failing action: `//...` again with `-c kbf_m1.fail=yes`, so `//:verdict`
+# is a new action that exits 3 on the farm while the rest are cache hits. The build must
+# fail, naming the planted failure, and leave its event log.
+failing_build() {
+    if (cd "$here/buck2" && "$buck2" build --console simple -c kbf_m1.fail=yes \
+        --event-log "$logs/buck2-failing.json-lines.gz" //...) >"$logs/buck2-failing.log" 2>&1; then
+        cat "$logs/buck2-failing.log"
+        echo "FAIL: the build with kbf_m1.fail=yes succeeded" >&2
+        exit 1
+    fi
+    grep -q 'planted failure' "$logs/buck2-failing.log" ||
+        { cat "$logs/buck2-failing.log"; echo "FAIL: the failing build did not fail in //:verdict" >&2; exit 1; }
+    [ -s "$logs/buck2-failing.json-lines.gz" ] ||
+        { echo "FAIL: the failing build wrote no event log" >&2; exit 1; }
+    echo "OK: the build with kbf_m1.fail=yes failed in //:verdict"
+}
+
 if [ -n "$buck2" ]; then
     # `clean` stops buck2's daemon too, so the rebuild starts with no memory of the first.
     clean=("$buck2" clean)
     two_builds buck2 "$here/buck2" "$buck2" build --console simple //...
     lease_in_flight
+    failing_build
     (cd "$here/buck2" && "$buck2" kill)
 fi
 
