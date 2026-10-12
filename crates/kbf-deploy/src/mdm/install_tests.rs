@@ -282,6 +282,33 @@ fn a_new_binary_keeps_the_old_one_and_restarts_only_its_service() {
     );
 }
 
+/// Catches the binary a new one replaces kept as `<name>.previous` with its old owner:
+/// a user's copy beside root's binaries, one rename from being run as root again. It
+/// keeps its bytes and mode and is root's.
+#[test]
+fn a_replaced_binary_is_kept_as_roots() {
+    let (mut exec, _) = host();
+    apply(&mut exec);
+    let user = Entry::File {
+        perms: Perms::new(0o750),
+        owner: Owner {
+            uid: 1000,
+            gid: 1000,
+        },
+        bytes: b"depserver v0".to_vec(),
+    };
+    exec.entries.insert(p("/opt/kbf-mdm/bin/depserver"), user);
+
+    apply(&mut exec);
+    let kept = Entry::File {
+        perms: Perms::new(0o750),
+        owner: Owner { uid: 0, gid: 0 },
+        bytes: b"depserver v0".to_vec(),
+    };
+    let previous = exec.entries.get(&p("/opt/kbf-mdm/bin/depserver.previous"));
+    assert_eq!(previous, Some(&kept));
+}
+
 /// Catches the proxy started without a certificate, not restarted when its
 /// Caddyfile changes, or not started when it is down.
 #[test]
