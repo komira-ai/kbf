@@ -32,6 +32,8 @@ pub mod json;
 pub mod render;
 
 #[cfg(test)]
+mod check_mutant_tests;
+#[cfg(test)]
 mod check_tests;
 #[cfg(test)]
 mod tests;
