@@ -11,6 +11,7 @@
 //! kbf-deploy linux install-units --config FILE --uninstall [--apply]
 //! kbf-deploy linux image-pull --config FILE [--image REF]... [--platform OS/ARCH] [--apply]
 //! kbf-deploy linux swap --config FILE [--kubelet-allows-swap] [--remove] [--apply]
+//! kbf-deploy envoy render --config FILE --out DIR
 //! ```
 //!
 //! Bad flags exit 2 for every subcommand. The `minio` subcommands change a host: without
@@ -20,7 +21,9 @@
 //! 1 a check found a broken rule, or 2 refused (a bad setting or file, printed as
 //! `REFUSED: ...` on stderr). `linux install-units`, `image-pull` and `swap` change the
 //! host as root, plan by default as the `minio` subcommands do, and exit 0 done (or
-//! nothing to do), 1 a step failed, or 2 refused (`REFUSED: ...` on stderr).
+//! nothing to do), 1 a step or the check after an apply failed (`FAIL ...`), or 2
+//! refused (`REFUSED: ...` on stderr). `envoy render` only writes into the directory
+//! it is given, and exits 0 done or 2 refused (`REFUSED: ...` on stderr).
 //! `minio buckets` reads the MinIO admin key pair from `MINIO_ROOT_USER` and
 //! `MINIO_ROOT_PASSWORD` in the environment (secrets are never flags: argv is
 //! world-readable).
@@ -37,12 +40,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use clap::{Args, Parser, Subcommand};
 use kbf_types::ImageRef;
 
-use crate::exec::{Exec, HostExec};
+use crate::envoy;
 use crate::linux::{self, HostError, LinuxConfig, images, install, swap};
 use crate::minio::{self, Admin, K8sName, KbfName, MinioError, buckets, nodeport};
-use crate::path::{HostPath, Root};
-use crate::plan::{DeployError, Mode, RunAs, execute};
-use crate::step::HttpUrl;
+use kbf_host::exec::{Exec, HostExec};
+use kbf_host::path::{HostPath, Root};
+use kbf_host::plan::{Mode, RunAs, execute};
+use kbf_host::step::HttpUrl;
 
 #[derive(Parser)]
 #[command(
@@ -63,6 +67,24 @@ enum Kit {
     /// A converged Linux storage node: MinIO, kbf-server and kbf-daemon.
     #[command(subcommand)]
     Linux(Linux),
+    /// A client front: a Tailscale operator Ingress in front of Envoy, which routes
+    /// REAPI calls to the kbf-servers.
+    #[command(subcommand)]
+    Envoy(Envoy),
+}
+
+#[derive(Subcommand)]
+enum Envoy {
+    /// Write manifests.json (the Kubernetes objects) and envoy.json (Envoy's config)
+    /// into a directory.
+    Render {
+        /// The kit's settings, KEY=VALUE lines.
+        #[arg(long)]
+        config: PathBuf,
+        /// Where to write the two files.
+        #[arg(long)]
+        out: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -253,6 +275,7 @@ pub fn run<E: Exec>(
         Kit::Minio(Minio::Buckets(a)) => minio_buckets(a, exec, env, out),
         Kit::Minio(Minio::Nodeport(a)) => minio_nodeport(a, exec, out),
         Kit::Linux(l) => return linux_kit(l, exec, out, err),
+        Kit::Envoy(e) => return envoy_kit(e, out, err),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -361,12 +384,32 @@ fn linux_kit<E: Exec>(
     }
 }
 
-/// A host-changing `linux` verb's exit: 0 done, 1 a step failed, 2 refused.
+/// The `envoy` kit: 0 done, 2 refused.
+fn envoy_kit(e: Envoy, out: &mut dyn Write, err: &mut dyn Write) -> ExitCode {
+    let Envoy::Render { config, out: dir } = e;
+    match envoy::render_files(&config, &dir) {
+        Ok(line) => {
+            let _ = writeln!(out, "{line}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            let _ = writeln!(err, "REFUSED: {e}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// A host-changing `linux` verb's exit: 0 done, 1 a step failed (or the check after
+/// an apply did), 2 refused.
 fn host_verb(done: Result<(), HostError>, err: &mut dyn Write) -> ExitCode {
     match done {
         Ok(()) => ExitCode::SUCCESS,
-        Err(e @ HostError::Deploy(DeployError::Step { .. })) => {
+        Err(e @ HostError::Deploy(kbf_host::HostError::Step { .. })) => {
             let _ = writeln!(err, "kbf-deploy: {e}");
+            ExitCode::FAILURE
+        }
+        Err(e @ HostError::AfterApply(_)) => {
+            let _ = writeln!(err, "FAIL {e}");
             ExitCode::FAILURE
         }
         Err(e) => {

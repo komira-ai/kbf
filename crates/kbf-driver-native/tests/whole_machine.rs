@@ -18,7 +18,7 @@ use kbf_daemon::{Runtime, RuntimeError, Work};
 use kbf_driver_native::whole_machine::state::{Files, LEASE_FILE, QUARANTINE_FILE, Record};
 use kbf_driver_native::whole_machine::{DRIVER, KIND, WholeMachineConfig, WholeMachineRuntime};
 use kbf_proto::reapi::Digest;
-use kbf_types::{LeaseId, NodePhase, Resources};
+use kbf_types::{LeaseId, LostWhy, NodePhase, Resources};
 use support::{MemoryCas, PROMPT, Spec, scratch, stdout};
 
 type Rt = WholeMachineRuntime<FakeSession, MemoryCas>;
@@ -657,7 +657,8 @@ async fn restart_mid_action(
 /// the server's `Start` or `Cancel` comes, if it ever does). The restarted runtime kills
 /// the lease user's processes before it says anything to the server, reports
 /// `restoring`, and the lease fails as the farm's (its result is lost) once the node is
-/// clean.
+/// clean: `Lost` (issue #22), which the server runs again, not a plain failure, which
+/// it would answer INTERNAL.
 #[tokio::test]
 async fn a_restart_mid_action_kills_the_action_at_start_and_fails_the_lease() {
     let dir = scratch("whole-mid-action");
@@ -672,7 +673,7 @@ async fn a_restart_mid_action_kills_the_action_at_start_and_fails_the_lease() {
     let error = run(&after, &slow)
         .await
         .expect_err("a result after the restart");
-    let RuntimeError::Failed(why) = &error else {
+    let RuntimeError::Lost(LostWhy::DaemonRestarted, why) = &error else {
         panic!("{error:?}");
     };
     assert!(why.contains("its result is lost"), "{why}");

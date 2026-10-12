@@ -1,0 +1,250 @@
+{
+  "apiVersion": "v1",
+  "items": [
+    {
+      "apiVersion": "v1",
+      "data": {
+        "envoy.json": "{\n  \"admin\": {\n    \"address\": {\n      \"socket_address\": {\n        \"address\": \"127.0.0.1\",\n        \"port_value\": 9901\n      }\n    }\n  },\n  \"static_resources\": {\n    \"clusters\": [\n      {\n        \"common_lb_config\": {\n          \"healthy_panic_threshold\": {\n            \"value\": 0\n          }\n        },\n        \"connect_timeout\": \"5s\",\n        \"dns_lookup_family\": \"V4_ONLY\",\n        \"health_checks\": [\n          {\n            \"grpc_health_check\": {\n              \"service_name\": \"\"\n            },\n            \"healthy_threshold\": 1,\n            \"interval\": \"5s\",\n            \"no_traffic_interval\": \"10s\",\n            \"timeout\": \"3s\",\n            \"unhealthy_threshold\": 2\n          }\n        ],\n        \"lb_policy\": \"ROUND_ROBIN\",\n        \"load_assignment\": {\n          \"cluster_name\": \"kbf_servers\",\n          \"endpoints\": [\n            {\n              \"lb_endpoints\": [\n                {\n                  \"endpoint\": {\n                    \"address\": {\n                      \"socket_address\": {\n                        \"address\": \"kbf-server-a.storage.example\",\n                        \"port_value\": 8980\n                      }\n                    },\n                    \"hostname\": \"kbf-server-a.storage.example\"\n                  },\n                  \"metadata\": {\n                    \"filter_metadata\": {\n                      \"envoy.transport_socket_match\": {\n                        \"server\": \"kbf-server-a.storage.example\"\n                      }\n                    }\n                  }\n                },\n                {\n                  \"endpoint\": {\n                    \"address\": {\n                      \"socket_address\": {\n                        \"address\": \"kbf-server-b.storage.example\",\n                        \"port_value\": 8981\n                      }\n                    },\n                    \"hostname\": \"kbf-server-b.storage.example\"\n                  },\n                  \"metadata\": {\n                    \"filter_metadata\": {\n                      \"envoy.transport_socket_match\": {\n                        \"server\": \"kbf-server-b.storage.example\"\n                      }\n                    }\n                  }\n                }\n              ]\n            }\n          ]\n        },\n        \"name\": \"kbf_servers\",\n        \"transport_socket\": {\n          \"name\": \"envoy.transport_sockets.tls\",\n          \"typed_config\": {\n            \"@type\": \"type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext\",\n            \"common_tls_context\": {\n              \"alpn_protocols\": [\n                \"h2\"\n              ],\n              \"validation_context\": {\n                \"trusted_ca\": {\n                  \"filename\": \"/etc/kbf-front/ca/ca.pem\"\n                }\n              }\n            }\n          }\n        },\n        \"transport_socket_matches\": [\n          {\n            \"match\": {\n              \"server\": \"kbf-server-a.storage.example\"\n            },\n            \"name\": \"kbf-server-a.storage.example\",\n            \"transport_socket\": {\n              \"name\": \"envoy.transport_sockets.tls\",\n              \"typed_config\": {\n                \"@type\": \"type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext\",\n                \"common_tls_context\": {\n                  \"alpn_protocols\": [\n                    \"h2\"\n                  ],\n                  \"validation_context\": {\n                    \"match_typed_subject_alt_names\": [\n                      {\n                        \"matcher\": {\n                          \"exact\": \"kbf-server-a.storage.example\"\n                        },\n                        \"san_type\": \"DNS\"\n                      }\n                    ],\n                    \"trusted_ca\": {\n                      \"filename\": \"/etc/kbf-front/ca/ca.pem\"\n                    }\n                  }\n                },\n                \"sni\": \"kbf-server-a.storage.example\"\n              }\n            }\n          },\n          {\n            \"match\": {\n              \"server\": \"kbf-server-b.storage.example\"\n            },\n            \"name\": \"kbf-server-b.storage.example\",\n            \"transport_socket\": {\n              \"name\": \"envoy.transport_sockets.tls\",\n              \"typed_config\": {\n                \"@type\": \"type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext\",\n                \"common_tls_context\": {\n                  \"alpn_protocols\": [\n                    \"h2\"\n                  ],\n                  \"validation_context\": {\n                    \"match_typed_subject_alt_names\": [\n                      {\n                        \"matcher\": {\n                          \"exact\": \"kbf-server-b.storage.example\"\n                        },\n                        \"san_type\": \"DNS\"\n                      }\n                    ],\n                    \"trusted_ca\": {\n                      \"filename\": \"/etc/kbf-front/ca/ca.pem\"\n                    }\n                  }\n                },\n                \"sni\": \"kbf-server-b.storage.example\"\n              }\n            }\n          }\n        ],\n        \"type\": \"STRICT_DNS\",\n        \"typed_extension_protocol_options\": {\n          \"envoy.extensions.upstreams.http.v3.HttpProtocolOptions\": {\n            \"@type\": \"type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions\",\n            \"explicit_http_config\": {\n              \"http2_protocol_options\": {}\n            }\n          }\n        }\n      }\n    ],\n    \"listeners\": [\n      {\n        \"address\": {\n          \"socket_address\": {\n            \"address\": \"0.0.0.0\",\n            \"port_value\": 8080\n          }\n        },\n        \"filter_chains\": [\n          {\n            \"filters\": [\n              {\n                \"name\": \"envoy.filters.network.http_connection_manager\",\n                \"typed_config\": {\n                  \"@type\": \"type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager\",\n                  \"codec_type\": \"AUTO\",\n                  \"http_filters\": [\n                    {\n                      \"name\": \"envoy.filters.http.router\",\n                      \"typed_config\": {\n                        \"@type\": \"type.googleapis.com/envoy.extensions.filters.http.router.v3.Router\"\n                      }\n                    }\n                  ],\n                  \"route_config\": {\n                    \"name\": \"reapi\",\n                    \"virtual_hosts\": [\n                      {\n                        \"domains\": [\n                          \"*\"\n                        ],\n                        \"name\": \"kbf\",\n                        \"routes\": [\n                          {\n                            \"match\": {\n                              \"grpc\": {},\n                              \"path\": \"/build.bazel.remote.execution.v2.Execution/Execute\"\n                            },\n                            \"route\": {\n                              \"cluster\": \"kbf_servers\",\n                              \"timeout\": \"0s\"\n                            }\n                          },\n                          {\n                            \"match\": {\n                              \"grpc\": {},\n                              \"path\": \"/build.bazel.remote.execution.v2.Execution/WaitExecution\"\n                            },\n                            \"route\": {\n                              \"cluster\": \"kbf_servers\",\n                              \"timeout\": \"0s\"\n                            }\n                          },\n                          {\n                            \"match\": {\n                              \"grpc\": {},\n                              \"prefix\": \"/build.bazel.remote.execution.v2.Capabilities/\"\n                            },\n                            \"route\": {\n                              \"cluster\": \"kbf_servers\",\n                              \"timeout\": \"0s\"\n                            }\n                          },\n                          {\n                            \"match\": {\n                              \"grpc\": {},\n                              \"prefix\": \"/build.bazel.remote.execution.v2.ContentAddressableStorage/\"\n                            },\n                            \"route\": {\n                              \"cluster\": \"kbf_servers\",\n                              \"timeout\": \"0s\"\n                            }\n                          },\n                          {\n                            \"match\": {\n                              \"grpc\": {},\n                              \"prefix\": \"/build.bazel.remote.execution.v2.ActionCache/\"\n                            },\n                            \"route\": {\n                              \"cluster\": \"kbf_servers\",\n                              \"timeout\": \"0s\"\n                            }\n                          },\n                          {\n                            \"match\": {\n                              \"grpc\": {},\n                              \"prefix\": \"/google.bytestream.ByteStream/\"\n                            },\n                            \"route\": {\n                              \"cluster\": \"kbf_servers\",\n                              \"timeout\": \"0s\"\n                            }\n                          }\n                        ]\n                      }\n                    ]\n                  },\n                  \"stat_prefix\": \"reapi\",\n                  \"stream_idle_timeout\": \"7200s\"\n                }\n              }\n            ]\n          }\n        ],\n        \"name\": \"reapi\"\n      }\n    ]\n  }\n}\n"
+      },
+      "kind": "ConfigMap",
+      "metadata": {
+        "labels": {
+          "app.kubernetes.io/name": "kbf-envoy",
+          "app.kubernetes.io/part-of": "kbf-front"
+        },
+        "name": "kbf-envoy",
+        "namespace": "kbf-front"
+      }
+    },
+    {
+      "apiVersion": "apps/v1",
+      "kind": "Deployment",
+      "metadata": {
+        "labels": {
+          "app.kubernetes.io/name": "kbf-envoy",
+          "app.kubernetes.io/part-of": "kbf-front"
+        },
+        "name": "kbf-envoy",
+        "namespace": "kbf-front"
+      },
+      "spec": {
+        "replicas": 1,
+        "selector": {
+          "matchLabels": {
+            "app.kubernetes.io/name": "kbf-envoy"
+          }
+        },
+        "strategy": {
+          "rollingUpdate": {
+            "maxSurge": 1,
+            "maxUnavailable": 0
+          },
+          "type": "RollingUpdate"
+        },
+        "template": {
+          "metadata": {
+            "annotations": {
+              "kbf-front/envoy-config-sha256": "032d2026ab5c56017e1d6bf6d1d6c772265299fd8eb8b2b810f9cc8b6ee680eb"
+            },
+            "labels": {
+              "app.kubernetes.io/name": "kbf-envoy",
+              "app.kubernetes.io/part-of": "kbf-front"
+            }
+          },
+          "spec": {
+            "automountServiceAccountToken": false,
+            "containers": [
+              {
+                "args": [
+                  "--config-path",
+                  "/etc/envoy/envoy.json",
+                  "--log-level",
+                  "info"
+                ],
+                "image": "envoyproxy/envoy:distroless-v1.39.3@sha256:7369b033550a14997e5d698677b7b51f0210a80754f5d084c5caa1a78268267b",
+                "livenessProbe": {
+                  "failureThreshold": 6,
+                  "periodSeconds": 10,
+                  "tcpSocket": {
+                    "port": 8080
+                  }
+                },
+                "name": "envoy",
+                "ports": [
+                  {
+                    "containerPort": 8080,
+                    "name": "grpc",
+                    "protocol": "TCP"
+                  }
+                ],
+                "readinessProbe": {
+                  "periodSeconds": 5,
+                  "tcpSocket": {
+                    "port": 8080
+                  }
+                },
+                "resources": {
+                  "limits": {
+                    "memory": "512Mi"
+                  },
+                  "requests": {
+                    "cpu": "100m",
+                    "memory": "128Mi"
+                  }
+                },
+                "securityContext": {
+                  "allowPrivilegeEscalation": false,
+                  "capabilities": {
+                    "drop": [
+                      "ALL"
+                    ]
+                  },
+                  "readOnlyRootFilesystem": true,
+                  "runAsGroup": 65532,
+                  "runAsNonRoot": true,
+                  "runAsUser": 65532
+                },
+                "volumeMounts": [
+                  {
+                    "mountPath": "/etc/envoy",
+                    "name": "config",
+                    "readOnly": true
+                  },
+                  {
+                    "mountPath": "/etc/kbf-front/ca",
+                    "name": "ca",
+                    "readOnly": true
+                  }
+                ]
+              }
+            ],
+            "securityContext": {
+              "seccompProfile": {
+                "type": "RuntimeDefault"
+              }
+            },
+            "volumes": [
+              {
+                "configMap": {
+                  "name": "kbf-envoy"
+                },
+                "name": "config"
+              },
+              {
+                "name": "ca",
+                "secret": {
+                  "items": [
+                    {
+                      "key": "ca.pem",
+                      "path": "ca.pem"
+                    }
+                  ],
+                  "secretName": "kbf-front-ca"
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "apiVersion": "v1",
+      "kind": "Service",
+      "metadata": {
+        "labels": {
+          "app.kubernetes.io/name": "kbf-envoy",
+          "app.kubernetes.io/part-of": "kbf-front"
+        },
+        "name": "kbf-envoy",
+        "namespace": "kbf-front"
+      },
+      "spec": {
+        "ports": [
+          {
+            "appProtocol": "kubernetes.io/h2c",
+            "name": "grpc",
+            "port": 8080,
+            "protocol": "TCP",
+            "targetPort": 8080
+          }
+        ],
+        "selector": {
+          "app.kubernetes.io/name": "kbf-envoy"
+        },
+        "type": "ClusterIP"
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "NetworkPolicy",
+      "metadata": {
+        "labels": {
+          "app.kubernetes.io/name": "kbf-envoy",
+          "app.kubernetes.io/part-of": "kbf-front"
+        },
+        "name": "kbf-envoy",
+        "namespace": "kbf-front"
+      },
+      "spec": {
+        "ingress": [
+          {
+            "from": [
+              {
+                "namespaceSelector": {
+                  "matchLabels": {
+                    "kubernetes.io/metadata.name": "tailscale"
+                  }
+                }
+              }
+            ],
+            "ports": [
+              {
+                "port": 8080,
+                "protocol": "TCP"
+              }
+            ]
+          }
+        ],
+        "podSelector": {
+          "matchLabels": {
+            "app.kubernetes.io/name": "kbf-envoy"
+          }
+        },
+        "policyTypes": [
+          "Ingress"
+        ]
+      }
+    },
+    {
+      "apiVersion": "networking.k8s.io/v1",
+      "kind": "Ingress",
+      "metadata": {
+        "labels": {
+          "app.kubernetes.io/name": "kbf-envoy",
+          "app.kubernetes.io/part-of": "kbf-front"
+        },
+        "name": "kbf",
+        "namespace": "kbf-front"
+      },
+      "spec": {
+        "defaultBackend": {
+          "service": {
+            "name": "kbf-envoy",
+            "port": {
+              "number": 8080
+            }
+          }
+        },
+        "ingressClassName": "tailscale",
+        "tls": [
+          {
+            "hosts": [
+              "kbf"
+            ]
+          }
+        ]
+      }
+    }
+  ],
+  "kind": "List"
+}

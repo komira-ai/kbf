@@ -268,6 +268,7 @@ impl World {
                 let event = Event::WorkerUp {
                     worker: WorkerId::new(name.as_str()),
                     instance: DaemonInstance::new(name.as_str()),
+                    predecessor_stopped: false,
                     capacity: capacity(&name),
                     caps: self.caps[&name].clone(),
                 };

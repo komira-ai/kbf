@@ -1,11 +1,16 @@
 //! The items: one row per profile key that names a setting of the Mac, each with its
-//! check. A check prints `PASS <key>: <what it found>` or `FAIL <key>: <why>`; a
-//! failing *check only* item adds that `apply` does not change it (an erase, a restore
-//! or the operator is its remedy).
+//! check and, unless it is *check only*, its fix. A check prints `PASS <key>: <what it
+//! found>` or `FAIL <key>: <why>`; a failing check only item adds that `apply` does not
+//! change it (an erase, a restore or the operator is its remedy). A fix prints one
+//! `CHANGE <key>: <what>` line per change it makes, and `NOTE <key>: <why>` when it
+//! cannot make one.
+
+use std::fmt::Display;
+use std::io;
 
 use crate::host::{Host, Mac};
 use crate::profile::Profile;
-use crate::{accounts, launchd, software, sshd};
+use crate::{accounts, launchd, record, software, sshd};
 
 pub(crate) const SCUTIL: &str = "/usr/sbin/scutil";
 pub(crate) const PMSET: &str = "/usr/bin/pmset";
@@ -18,6 +23,8 @@ pub(crate) const SW_VERS: &str = "/usr/bin/sw_vers";
 
 /// The software update preferences.
 pub(crate) const SOFTWARE_UPDATE: &str = "/Library/Preferences/com.apple.SoftwareUpdate";
+/// The App Store's older preferences, which still hold its `AutoUpdate` switch.
+pub(crate) const COMMERCE: &str = "/Library/Preferences/com.apple.commerce";
 
 const VERIFY_27: &str = "the SoftwareUpdate payload is removed in macOS 27: verify the pinned version honours this local preference";
 
@@ -41,7 +48,7 @@ pub(crate) fn fail(message: impl Into<String>) -> Outcome {
     }
 }
 
-/// What a check reads: the Mac, the profile, and the key of the item being checked.
+/// What a check or a fix reads: the Mac, the profile, and the key of its item.
 pub(crate) struct Ctx<'a> {
     pub(crate) mac: Mac<'a>,
     pub(crate) profile: &'a Profile,
@@ -55,61 +62,116 @@ impl Ctx<'_> {
     }
 }
 
-/// One item: its key, whether `apply` leaves it alone, and its check.
-pub struct Item {
-    pub key: &'static str,
-    /// `apply` never changes it; a failure says so.
-    pub check_only: bool,
-    check: fn(&Ctx<'_>) -> Outcome,
+/// The lines a fix prints.
+#[derive(Debug, Default)]
+pub(crate) struct Lines(String);
+
+impl Lines {
+    /// `CHANGE <key>: <what>`: a change made to the Mac.
+    pub(crate) fn change(&mut self, key: &str, what: impl Display) {
+        self.0.push_str(&format!("CHANGE {key}: {what}\n"));
+    }
+
+    /// `NOTE <key>: <why>`: a change the fix could not make.
+    pub(crate) fn note(&mut self, key: &str, why: impl Display) {
+        self.0.push_str(&format!("NOTE {key}: {why}\n"));
+    }
+
+    /// `FAIL <key>: <why>`: a change the verb made that did not take.
+    pub(crate) fn fail(&mut self, key: &str, why: impl Display) {
+        self.0.push_str(&format!("FAIL {key}: {why}\n"));
+    }
+
+    pub(crate) fn into_text(self) -> String {
+        self.0
+    }
 }
 
-/// One row of [`ITEMS`]: `row!(key, check)`, or `row!(check only key, check)`.
+/// A fix: makes the Mac what the profile says for one item, saying what it changed. An
+/// error stops the item's fix; `apply` prints it as a `NOTE` and checks again.
+type Fix = fn(&Ctx<'_>, &mut Lines) -> io::Result<()>;
+
+/// One item: its key, its check, and its fix (none for a check only item).
+pub struct Item {
+    pub key: &'static str,
+    check: fn(&Ctx<'_>) -> Outcome,
+    fix: Option<Fix>,
+}
+
+impl Item {
+    /// `apply` never changes it; a failure says so.
+    pub fn check_only(&self) -> bool {
+        self.fix.is_none()
+    }
+}
+
+/// One row of [`ITEMS`]: `row!(key, check, fix)`, or `row!(check only key, check)`.
 macro_rules! row {
-    ($key:literal, $check:expr) => {
+    ($key:literal, $check:expr, $fix:expr) => {
         Item {
             key: $key,
-            check_only: false,
             check: $check,
+            fix: Some($fix),
         }
     };
     (check only $key:literal, $check:expr) => {
         Item {
             key: $key,
-            check_only: true,
             check: $check,
+            fix: None,
         }
     };
 }
 
-/// Every item, in the order `check` reports them.
+/// Every item, in the order `check` reports them and `apply` fixes them.
 pub const ITEMS: &[Item] = &[
     row!(check only "macos_version", macos_version),
     row!(check only "macos_build", macos_build),
-    row!("hostname", hostname),
+    row!("hostname", hostname, fix_hostname),
     row!(check only "admin_user", accounts::admin_user),
-    row!("role_user", accounts::role_user),
-    row!("power_sleep", pmset),
-    row!("power_standby", pmset),
-    row!("power_powernap", pmset),
-    row!("power_autorestart", pmset),
-    row!("power_womp", pmset),
-    row!("updates_auto_download", software_update),
-    row!("updates_auto_install_macos", software_update),
-    row!("updates_auto_install_security", software_update),
-    row!("updates_config_data", software_update),
-    row!("appstore_auto_update", software_update),
-    row!("remote_login", remote_login),
-    row!("ssh_password_auth", sshd::ssh_password_auth),
-    row!("firewall", firewall),
+    row!("role_user", accounts::role_user, accounts::fix_role_user),
+    row!("power_sleep", pmset, fix_pmset),
+    row!("power_standby", pmset, fix_pmset),
+    row!("power_powernap", pmset, fix_pmset),
+    row!("power_autorestart", pmset, fix_pmset),
+    row!("power_womp", pmset, fix_pmset),
+    row!("updates_auto_download", preferences, fix_preferences),
+    row!("updates_auto_install_macos", preferences, fix_preferences),
+    row!(
+        "updates_auto_install_security",
+        preferences,
+        fix_preferences
+    ),
+    row!("updates_config_data", preferences, fix_preferences),
+    row!("appstore_auto_update", preferences, fix_preferences),
+    row!("remote_login", remote_login, fix_remote_login),
+    row!(
+        "ssh_password_auth",
+        sshd::ssh_password_auth,
+        sshd::fix_ssh_password_auth
+    ),
+    row!("firewall", firewall, fix_firewall),
     row!(check only "filevault", filevault),
-    row!("autologin", accounts::autologin),
-    row!("time_server", time_server),
-    row!("time_max_offset_ms", time_max_offset_ms),
-    row!("xcode", software::xcode),
-    row!("default_developer_dir", software::default_developer_dir),
+    row!("autologin", accounts::autologin, accounts::fix_autologin),
+    row!("time_server", time_server, fix_time_server),
+    row!(
+        "time_max_offset_ms",
+        time_max_offset_ms,
+        fix_time_max_offset_ms
+    ),
+    row!("xcode", software::xcode, software::fix_xcode),
+    row!(
+        "default_developer_dir",
+        software::default_developer_dir,
+        software::fix_default_developer_dir
+    ),
     row!(check only "probe", software::probe),
     row!(check only "simulator_runtimes", software::simulator_runtimes),
-    row!("launchd_label", launchd::launchd_label),
+    row!(
+        "launchd_label",
+        launchd::launchd_label,
+        launchd::fix_launchd_label
+    ),
 ];
 
 /// `--keys` named an item that does not exist.
@@ -136,42 +198,84 @@ pub fn select(keys: Option<&str>) -> Result<Vec<&'static Item>, UnknownItem> {
         .collect()
 }
 
-/// What `check` printed, and how many items failed.
+/// What a verb printed, and how many items failed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Report {
     pub text: String,
     pub failed: usize,
 }
 
+/// One line per item, as `check` prints it, and whether the item passed.
+fn verdicts(host: &dyn Host, profile: &Profile, items: &[&Item]) -> Vec<(bool, String)> {
+    let mac = Mac::new(host);
+    items
+        .iter()
+        .map(|item| {
+            let ctx = Ctx {
+                mac,
+                profile,
+                key: item.key,
+            };
+            let outcome = (item.check)(&ctx);
+            let verdict = if outcome.pass { "PASS" } else { "FAIL" };
+            let suffix = if !outcome.pass && item.check_only() {
+                " [check only: apply does not change this]"
+            } else {
+                ""
+            };
+            let line = format!("{verdict} {}: {}{suffix}\n", item.key, outcome.message);
+            (outcome.pass, line)
+        })
+        .collect()
+}
+
 /// Checks `items` on the Mac: one line per item, then `check: N pass, M fail`.
 pub fn check(host: &dyn Host, profile: &Profile, items: &[&Item]) -> Report {
+    let lines = verdicts(host, profile, items);
+    let failed = lines.iter().filter(|(passed, _)| !passed).count();
+    let mut text: String = lines.into_iter().map(|(_, line)| line).collect();
+    text.push_str(&format!(
+        "check: {} pass, {failed} fail\n",
+        items.len() - failed
+    ));
+    Report { text, failed }
+}
+
+/// Fixes each of `items` that fails and is not check only, in order, then checks them
+/// all again: the fixes' `CHANGE` and `NOTE` lines, then a `FAIL` line for each item
+/// that still fails. A Mac that already passes gets no change and no line.
+pub fn apply(host: &dyn Host, profile: &Profile, items: &[&Item]) -> Report {
     let mac = Mac::new(host);
-    let mut text = String::new();
-    let mut failed = 0;
+    let mut lines = Lines::default();
     for item in items {
         let ctx = Ctx {
             mac,
             profile,
             key: item.key,
         };
-        let outcome = (item.check)(&ctx);
-        let verdict = if outcome.pass { "PASS" } else { "FAIL" };
-        let suffix = if !outcome.pass && item.check_only {
-            " [check only: apply does not change this]"
-        } else {
-            ""
-        };
-        failed += usize::from(!outcome.pass);
-        text.push_str(&format!(
-            "{verdict} {}: {}{suffix}\n",
-            item.key, outcome.message
-        ));
+        let Some(fix) = item.fix else { continue };
+        if (item.check)(&ctx).pass {
+            continue;
+        }
+        if let Err(e) = fix(&ctx, &mut lines) {
+            lines.note(item.key, e);
+        }
     }
-    text.push_str(&format!(
-        "check: {} pass, {failed} fail\n",
-        items.len() - failed
-    ));
+    let mut text = lines.into_text();
+    let mut failed = 0;
+    for (_, line) in verdicts(host, profile, items)
+        .into_iter()
+        .filter(|(passed, _)| !passed)
+    {
+        failed += 1;
+        text.push_str(&line);
+    }
     Report { text, failed }
+}
+
+/// Runs `program args` for a change; whether it succeeded shows in the check after.
+pub(crate) fn run(c: &Ctx<'_>, program: &str, args: &[&str]) {
+    c.mac.succeeds(program, args);
 }
 
 /// `sw_vers <flag>` prints the profile's value.
@@ -201,10 +305,12 @@ pub(crate) fn or<'a>(value: &'a str, instead: &'a str) -> &'a str {
     if value.is_empty() { instead } else { value }
 }
 
+const HOST_NAMES: [&str; 3] = ["HostName", "LocalHostName", "ComputerName"];
+
 /// All three names `scutil` keeps are the profile's.
 fn hostname(c: &Ctx<'_>) -> Outcome {
     let want = c.value();
-    let wrong: String = ["HostName", "LocalHostName", "ComputerName"]
+    let wrong: String = HOST_NAMES
         .into_iter()
         .filter_map(|name| {
             let found = c.mac.out(SCUTIL, &["--get", name]);
@@ -218,57 +324,135 @@ fn hostname(c: &Ctx<'_>) -> Outcome {
     }
 }
 
-/// `pmset -g` reports the setting (named by the key after `power_`) at the profile's
-/// value. The setting's name matches exactly: `Sleep On Power Button` is not `sleep`.
-fn pmset(c: &Ctx<'_>) -> Outcome {
-    let setting = c.key.trim_start_matches("power_");
-    let listing = c.mac.out(PMSET, &["-g"]);
-    let found = listing
+/// Sets each of the three names that is not the profile's.
+fn fix_hostname(c: &Ctx<'_>, out: &mut Lines) -> io::Result<()> {
+    let want = c.value();
+    for name in HOST_NAMES {
+        if c.mac.out(SCUTIL, &["--get", name]) != want {
+            run(c, SCUTIL, &["--set", name, want]);
+            out.change(c.key, format!("{name} = {want}"));
+        }
+    }
+    Ok(())
+}
+
+/// The value `pmset -g` reports for `setting`, or empty. The name matches exactly:
+/// `Sleep On Power Button` is not `sleep`.
+pub(crate) fn pmset_get(mac: Mac<'_>, setting: &str) -> String {
+    mac.out(PMSET, &["-g"])
         .lines()
         .find_map(|line| {
             let mut words = line.split_whitespace();
-            (words.next() == Some(setting)).then(|| words.next().unwrap_or_default())
+            (words.next() == Some(setting)).then(|| words.next().unwrap_or_default().to_owned())
         })
-        .unwrap_or_default();
+        .unwrap_or_default()
+}
+
+/// `pmset -g` reports the setting (named by the key after `power_`) at the profile's
+/// value.
+fn pmset(c: &Ctx<'_>) -> Outcome {
+    let setting = c.key.trim_start_matches("power_");
+    let found = pmset_get(c.mac, setting);
     if found == c.value() {
         pass(format!("{setting} {found}"))
     } else {
         fail(format!(
             "{setting} is {}, want {}",
-            or(found, "not reported"),
+            or(&found, "not reported"),
             c.value()
         ))
     }
 }
 
-/// The preference in com.apple.SoftwareUpdate that an item's key names.
-pub(crate) fn software_update_key(key: &str) -> &'static str {
+/// Keeps the record of the values before, then `pmset -a <setting> <value>`.
+fn fix_pmset(c: &Ctx<'_>, out: &mut Lines) -> io::Result<()> {
+    record::keep_before(c, out)?;
+    let setting = c.key.trim_start_matches("power_");
+    run(c, PMSET, &["-a", setting, c.value()]);
+    out.change(c.key, format!("pmset -a {setting} {}", c.value()));
+    Ok(())
+}
+
+/// The preferences (domain, key) an update item sets, each to the profile's value.
+pub(crate) fn preference_keys(key: &str) -> &'static [(&'static str, &'static str)] {
     match key {
-        "updates_auto_download" => "AutomaticDownload",
-        "updates_auto_install_macos" => "AutomaticallyInstallMacOSUpdates",
-        "updates_auto_install_security" => "CriticalUpdateInstall",
-        "updates_config_data" => "ConfigDataInstall",
-        _ => "AutomaticallyInstallAppUpdates",
+        "updates_auto_download" => &[(SOFTWARE_UPDATE, "AutomaticDownload")],
+        "updates_auto_install_macos" => &[(SOFTWARE_UPDATE, "AutomaticallyInstallMacOSUpdates")],
+        "updates_auto_install_security" => &[(SOFTWARE_UPDATE, "CriticalUpdateInstall")],
+        "updates_config_data" => &[(SOFTWARE_UPDATE, "ConfigDataInstall")],
+        _ => &[
+            (SOFTWARE_UPDATE, "AutomaticallyInstallAppUpdates"),
+            (COMMERCE, "AutoUpdate"),
+        ],
+    }
+}
+
+/// How a preference is named in a line: its key, with the domain's name before it when
+/// that is not com.apple.SoftwareUpdate.
+pub(crate) fn preference_name(domain: &str, key: &str) -> String {
+    if domain == SOFTWARE_UPDATE {
+        key.to_owned()
+    } else {
+        format!("{} {key}", domain.rsplit('/').next().unwrap_or(domain))
     }
 }
 
 /// `defaults read` of `domain` (a path on the Mac) and `key`, or empty.
-pub(crate) fn defaults_read(c: &Ctx<'_>, domain: &str, key: &str) -> String {
-    c.mac.out(DEFAULTS, &["read", &c.mac.path(domain), key])
+pub(crate) fn read_preference(mac: Mac<'_>, domain: &str, key: &str) -> String {
+    mac.out(DEFAULTS, &["read", &mac.path(domain), key])
 }
 
-fn software_update(c: &Ctx<'_>) -> Outcome {
-    let pref = software_update_key(c.key);
-    let found = defaults_read(c, SOFTWARE_UPDATE, pref);
-    if found == c.value() {
-        pass(format!("{pref} = {found} ({VERIFY_27})"))
+/// `defaults read` of `domain` (a path on the Mac) and `key`, or empty.
+pub(crate) fn defaults_read(c: &Ctx<'_>, domain: &str, key: &str) -> String {
+    read_preference(c.mac, domain, key)
+}
+
+/// Every preference of the item holds the profile's value.
+fn preferences(c: &Ctx<'_>) -> Outcome {
+    let found: Vec<(String, String)> = preference_keys(c.key)
+        .iter()
+        .map(|(domain, key)| (preference_name(domain, key), defaults_read(c, domain, key)))
+        .collect();
+    if found.iter().all(|(_, v)| v == c.value()) {
+        let all: Vec<String> = found.iter().map(|(n, v)| format!("{n} = {v}")).collect();
+        pass(format!("{} ({VERIFY_27})", all.join(", ")))
     } else {
+        let wrong: Vec<String> = found
+            .iter()
+            .filter(|(_, v)| v != c.value())
+            .map(|(n, v)| format!("{n} is {}", or(v, "unset")))
+            .collect();
         fail(format!(
-            "{pref} is {}, want {} ({VERIFY_27})",
-            or(&found, "unset"),
+            "{}, want {} ({VERIFY_27})",
+            wrong.join(", "),
             c.value()
         ))
     }
+}
+
+/// `true` or `false` for a profile bit, as `defaults write -bool` takes it.
+pub(crate) fn bool_word(bit: &str) -> &'static str {
+    if bit == "1" { "true" } else { "false" }
+}
+
+/// Keeps the record of the values before, then writes each preference that differs.
+fn fix_preferences(c: &Ctx<'_>, out: &mut Lines) -> io::Result<()> {
+    record::keep_before(c, out)?;
+    for (domain, key) in preference_keys(c.key) {
+        if defaults_read(c, domain, key) != c.value() {
+            let path = c.mac.path(domain);
+            run(
+                c,
+                DEFAULTS,
+                &["write", &path, key, "-bool", bool_word(c.value())],
+            );
+            out.change(
+                c.key,
+                format!("{} = {}", preference_name(domain, key), c.value()),
+            );
+        }
+    }
+    Ok(())
 }
 
 fn on_off(bit: &str) -> &'static str {
@@ -285,6 +469,13 @@ fn remote_login(c: &Ctx<'_>) -> Outcome {
     }
 }
 
+fn fix_remote_login(c: &Ctx<'_>, out: &mut Lines) -> io::Result<()> {
+    let state = on_off(c.value()).to_ascii_lowercase();
+    run(c, SYSTEMSETUP, &["-f", "-setremotelogin", &state]);
+    out.change(c.key, format!("Remote Login {state}"));
+    Ok(())
+}
+
 fn firewall(c: &Ctx<'_>) -> Outcome {
     let found = c.mac.out(SOCKETFILTERFW, &["--getglobalstate"]);
     let state = if found.contains("is enabled") {
@@ -299,6 +490,12 @@ fn firewall(c: &Ctx<'_>) -> Outcome {
     } else {
         fail(format!("firewall {state}, want {}", c.value()))
     }
+}
+
+fn fix_firewall(c: &Ctx<'_>, out: &mut Lines) -> io::Result<()> {
+    run(c, SOCKETFILTERFW, &["--setglobalstate", c.value()]);
+    out.change(c.key, format!("firewall {}", c.value()));
+    Ok(())
 }
 
 fn filevault(c: &Ctx<'_>) -> Outcome {
@@ -327,6 +524,14 @@ fn time_server(c: &Ctx<'_>) -> Outcome {
     } else {
         pass(want)
     }
+}
+
+fn fix_time_server(c: &Ctx<'_>, out: &mut Lines) -> io::Result<()> {
+    let server = c.value();
+    run(c, SYSTEMSETUP, &["-setusingnetworktime", "on"]);
+    run(c, SYSTEMSETUP, &["-setnetworktimeserver", server]);
+    out.change(c.key, format!("network time on, server {server}"));
+    Ok(())
 }
 
 /// The size of an offset `sntp` prints (`+0.004000`, `-1.5`), in whole milliseconds,
@@ -360,4 +565,12 @@ fn time_max_offset_ms(c: &Ctx<'_>) -> Outcome {
         Some(ms) if ms <= max => pass(format!("{ms} ms from {server}")),
         Some(ms) => fail(format!("{ms} ms from {server}, more than {max}")),
     }
+}
+
+/// Sets the clock from the time server (`sntp -sS`).
+fn fix_time_max_offset_ms(c: &Ctx<'_>, out: &mut Lines) -> io::Result<()> {
+    let server = c.profile.get("time_server");
+    run(c, SNTP, &["-sS", server]);
+    out.change(c.key, format!("clock set from {server}"));
+    Ok(())
 }

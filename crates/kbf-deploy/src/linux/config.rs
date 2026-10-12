@@ -6,7 +6,7 @@ use std::path::Path;
 use kbf_types::{ImageError, ImageRef};
 
 use crate::config::{Config, ConfigError};
-use crate::path::{HostPath, PathError};
+use kbf_host::{HostPath, PathError};
 
 /// The keys `templates/linux/config.example` documents; any other is refused.
 pub const KEYS: &[&str] = &[

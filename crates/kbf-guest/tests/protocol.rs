@@ -6,7 +6,7 @@ use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
-use common::{Served, Shares, TOKEN, sh};
+use common::{Served, Shares, TOKEN, act};
 use kbf_guest::client::{Client, ClientError};
 use kbf_guest::server::{Agent, Stream};
 use kbf_guest::wire::{
@@ -42,7 +42,7 @@ fn a_wrong_token_is_refused_and_the_right_one_still_works() {
     let err = Client::connect(host.try_clone().expect("clone"), wrong).expect_err("refused");
     assert_eq!(refusal(Err::<(), _>(err)), Refusal::Token);
     // Closed after the refusal: a Run on this connection gets nothing back.
-    let _ = write_frame(&mut host, &HostMsg::Run(sh("true", &[])).encode());
+    let _ = write_frame(&mut host, &HostMsg::Run(act("exit 0", &[])).encode());
     assert!(read_frame(&mut host).is_err(), "the connection stayed open");
     assert!(
         !shares.outputs.join("stdout").exists(),
@@ -51,7 +51,7 @@ fn a_wrong_token_is_refused_and_the_right_one_still_works() {
 
     let mut client = served.connect();
     assert_eq!(client.session(), "TestSession");
-    client.run(&sh("exit 0", &[])).expect("started");
+    client.run(&act("exit 0", &[])).expect("started");
     assert_eq!(client.wait().expect("exited").end, End::Exited(0));
 }
 
@@ -78,7 +78,7 @@ fn another_version_or_no_hello_is_refused() {
     ));
 
     let mut host = served.connect_raw();
-    send(&mut host, &HostMsg::Run(sh("true", &[])));
+    send(&mut host, &HostMsg::Run(act("exit 0", &[])));
     assert!(matches!(
         recv(&mut host),
         GuestMsg::Refused {
@@ -106,7 +106,7 @@ fn a_silent_connection_is_dropped_after_the_hello_timeout() {
         }
     ));
     let mut client = served.connect();
-    client.run(&sh("exit 0", &[])).expect("started");
+    client.run(&act("exit 0", &[])).expect("started");
     assert_eq!(client.wait().expect("exited").end, End::Exited(0));
 }
 
@@ -148,7 +148,7 @@ fn a_dripping_connection_is_dropped_after_the_hello_timeout() {
     );
     dripping.join().expect("drip thread");
     let mut client = served.connect();
-    client.run(&sh("exit 0", &[])).expect("started");
+    client.run(&act("exit 0", &[])).expect("started");
     assert_eq!(client.wait().expect("exited").end, End::Exited(0));
 }
 
@@ -162,7 +162,7 @@ fn a_run_longer_than_the_hello_timeout_still_completes() {
     config.hello_timeout = Duration::from_millis(200);
     let served = Served::start(config);
     let mut client = served.connect();
-    client.run(&sh("sleep 1; exit 0", &[])).expect("started");
+    client.run(&act("sleep 1 ; exit 0", &[])).expect("started");
     let exit = client.wait().expect("the run was reported");
     assert_eq!(exit.end, End::Exited(0));
 }
@@ -174,8 +174,10 @@ fn a_second_run_is_refused() {
     let shares = Shares::new("second-run");
     let served = Served::start(shares.config());
     let mut client = served.connect();
-    client.run(&sh("sleep 0.3", &[])).expect("started");
-    client.send(&HostMsg::Run(sh("true", &[]))).expect("sent");
+    client.run(&act("sleep 0.3", &[])).expect("started");
+    client
+        .send(&HostMsg::Run(act("exit 0", &[])))
+        .expect("sent");
     assert!(matches!(
         client.recv().expect("reply"),
         GuestMsg::Refused {
@@ -198,11 +200,14 @@ fn a_second_run_is_refused() {
         }
     ));
     assert_eq!(client.wait().expect("exited").end, End::Exited(0));
-    assert_eq!(refusal(client.run(&sh("true", &[]))), Refusal::AlreadyRan);
+    assert_eq!(
+        refusal(client.run(&act("exit 0", &[]))),
+        Refusal::AlreadyRan
+    );
     drop(client);
 
     let mut again = served.connect();
-    assert_eq!(refusal(again.run(&sh("true", &[]))), Refusal::AlreadyRan);
+    assert_eq!(refusal(again.run(&act("exit 0", &[]))), Refusal::AlreadyRan);
     // Kill with nothing running is ignored, and a second Hello is refused.
     again.send(&HostMsg::Kill).expect("sent");
     again
@@ -231,7 +236,7 @@ fn bad_requests_are_refused_without_using_the_run() {
     std::os::unix::fs::symlink("in", shares.inputs.join("in-link")).expect("symlink");
     let served = Served::start(shares.config());
     let mut client = served.connect();
-    let base = sh("true", &[]);
+    let base = act("exit 0", &[]);
     let with = |f: &dyn Fn(&mut RunRequest)| {
         let mut r = base.clone();
         f(&mut r);
@@ -276,17 +281,23 @@ fn a_failed_start_uses_the_run_and_an_existing_stdout_refuses_one() {
     let shares = Shares::new("start-failed");
     let served = Served::start(shares.config());
     let mut client = served.connect();
-    let mut req = sh("true", &[]);
+    let mut req = act("exit 0", &[]);
     req.argv = vec!["/nonexistent/program".into()];
     assert_eq!(refusal(client.run(&req)), Refusal::StartFailed);
-    assert_eq!(refusal(client.run(&sh("true", &[]))), Refusal::AlreadyRan);
+    assert_eq!(
+        refusal(client.run(&act("exit 0", &[]))),
+        Refusal::AlreadyRan
+    );
     drop(client);
     served.join();
 
     // A second agent on the same outputs share: what a restarted LaunchAgent sees.
     let served = Served::start(shares.config());
     let mut client = served.connect();
-    assert_eq!(refusal(client.run(&sh("true", &[]))), Refusal::StartFailed);
+    assert_eq!(
+        refusal(client.run(&act("exit 0", &[]))),
+        Refusal::StartFailed
+    );
 }
 
 /// Catches garbage after the handshake taken as a message, or answered without

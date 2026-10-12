@@ -3,6 +3,8 @@
 
 #[path = "execute/failure_log.rs"]
 mod failure_log;
+#[path = "execute/lost.rs"]
+mod lost;
 #[path = "execute/memory.rs"]
 mod memory;
 #[path = "execute/missing.rs"]

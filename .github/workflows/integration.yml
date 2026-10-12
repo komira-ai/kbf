@@ -58,20 +58,12 @@ jobs:
           persist-credentials: false
       - run: rustup toolchain install
       - run: cargo build -p kbf-server -p kbf-it --bins --locked
-      - name: Fetch Bazel and buck2 (pinned versions, checked by SHA-256)
-        run: |
-          tools="$RUNNER_TEMP/tools"
-          mkdir -p "$tools"
-          curl --proto '=https' --tlsv1.2 -fsSL -o "$tools/bazel" \
-            "https://github.com/bazelbuild/bazel/releases/download/$BAZEL_VERSION/bazel-$BAZEL_VERSION-linux-x86_64"
-          echo "$BAZEL_SHA256  $tools/bazel" | sha256sum --check --strict
-          curl --proto '=https' --tlsv1.2 -fsSL -o "$tools/buck2.zst" \
-            "https://github.com/facebook/buck2/releases/download/$BUCK2_VERSION/buck2-x86_64-unknown-linux-gnu.zst"
-          echo "$BUCK2_SHA256  $tools/buck2.zst" | sha256sum --check --strict
-          zstd -q -d "$tools/buck2.zst" -o "$tools/buck2"
-          chmod +x "$tools/bazel" "$tools/buck2"
-          "$tools/bazel" --version
-          "$tools/buck2" --version
+      - name: Fetch Bazel (pinned version, checked by SHA-256)
+        run: cargo xtask fetch --url "https://github.com/bazelbuild/bazel/releases/download/$BAZEL_VERSION/bazel-$BAZEL_VERSION-linux-x86_64" --sha256 "$BAZEL_SHA256" --out "$RUNNER_TEMP/tools/bazel"
+      - name: Fetch buck2 (pinned version, checked by SHA-256)
+        run: cargo xtask fetch --url "https://github.com/facebook/buck2/releases/download/$BUCK2_VERSION/buck2-x86_64-unknown-linux-gnu.zst" --sha256 "$BUCK2_SHA256" --out "$RUNNER_TEMP/tools/buck2" --extract zst
+      - run: $RUNNER_TEMP/tools/bazel --version
+      - run: $RUNNER_TEMP/tools/buck2 --version
       - name: Wait for MinIO
         run: |
           for _ in $(seq 60); do

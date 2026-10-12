@@ -1,0 +1,39 @@
+# kbf-deploy envoy: the client front's settings (a Tailscale operator Ingress in
+# front of one Envoy, which routes REAPI calls to the kbf-servers over TLS).
+#
+# Format: KEY=VALUE, one per line, starting in the first column, no spaces around
+# `=`, optional double quotes around the value. `#` lines and blank lines are
+# skipped. It is parsed, never sourced. `kbf-deploy envoy render` refuses a key
+# not listed here, a key given twice, a missing key and a value of the wrong
+# shape. Put no secret here: the operator's credentials and the CA live in
+# Kubernetes Secrets.
+
+# The kubectl context of the cluster the front runs in.
+KBF_FRONT_KUBE_CONTEXT=example-context
+# The namespace of Envoy and the Ingress.
+KBF_FRONT_NAMESPACE=kbf-front
+
+# --- the Ingress (Tailscale Kubernetes operator) ------------------------------
+# The MagicDNS label the Ingress asks for: clients dial
+# grpcs://<KBF_FRONT_HOSTNAME>.<KBF_FRONT_TAILNET_DNS>:443.
+KBF_FRONT_HOSTNAME=kbf
+# The tailnet's DNS name, <label>.ts.net.
+KBF_FRONT_TAILNET_DNS=tail0000.ts.net
+# Where the operator runs, and the Secret holding its OAuth client. The
+# NetworkPolicy admits only pods of this namespace (the operator's ingress
+# proxies) to Envoy.
+KBF_TS_OPERATOR_NAMESPACE=tailscale
+KBF_TS_OPERATOR_SECRET=operator-oauth
+
+# --- the hop to the kbf-servers ------------------------------------------------
+# The Secret in KBF_FRONT_NAMESPACE whose key `ca.pem` is the CA certificate the
+# servers' REAPI certificates chain to. Mounted at /etc/kbf-front/ca/ca.pem.
+KBF_FRONT_CA_SECRET=kbf-front-ca
+# The kbf-servers' REAPI listeners, separated by one space, each
+# <DNS name>:<port>. The name is what Envoy resolves and dials, its SNI, and the
+# DNS name the server's certificate must carry. No name twice.
+KBF_SERVERS="kbf-server-a.storage.example:8980"
+
+# --- Envoy ---------------------------------------------------------------------
+# The image, pinned by digest: <repo>[:<tag>]@sha256:<digest>.
+KBF_ENVOY_IMAGE=envoyproxy/envoy:distroless-v1.39.3@sha256:7369b033550a14997e5d698677b7b51f0210a80754f5d084c5caa1a78268267b

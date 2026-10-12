@@ -39,10 +39,10 @@ use serde::{Deserialize, Serialize};
 
 use super::{Admin, KbfName, MinioError, checked, exits_0, inspect, note, query, url_encode};
 use crate::config::Config;
-use crate::exec::{Entry, Exec};
-use crate::path::HostPath;
-use crate::plan::{Plan, Planner, RunAs};
-use crate::step::{Cmd, Filter, HttpUrl, Owner, Perms};
+use kbf_host::exec::{Entry, Exec};
+use kbf_host::path::HostPath;
+use kbf_host::plan::{Plan, Planner, RunAs};
+use kbf_host::step::{Cmd, Filter, HttpUrl, Owner, Perms};
 
 /// What `minio buckets` is asked to do.
 pub struct Buckets {

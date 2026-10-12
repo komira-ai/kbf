@@ -1,0 +1,278 @@
+{
+  "admin": {
+    "address": {
+      "socket_address": {
+        "address": "127.0.0.1",
+        "port_value": 9901
+      }
+    }
+  },
+  "static_resources": {
+    "clusters": [
+      {
+        "common_lb_config": {
+          "healthy_panic_threshold": {
+            "value": 0
+          }
+        },
+        "connect_timeout": "5s",
+        "dns_lookup_family": "V4_ONLY",
+        "health_checks": [
+          {
+            "grpc_health_check": {
+              "service_name": ""
+            },
+            "healthy_threshold": 1,
+            "interval": "5s",
+            "no_traffic_interval": "10s",
+            "timeout": "3s",
+            "unhealthy_threshold": 2
+          }
+        ],
+        "lb_policy": "ROUND_ROBIN",
+        "load_assignment": {
+          "cluster_name": "kbf_servers",
+          "endpoints": [
+            {
+              "lb_endpoints": [
+                {
+                  "endpoint": {
+                    "address": {
+                      "socket_address": {
+                        "address": "kbf-server-a.storage.example",
+                        "port_value": 8980
+                      }
+                    },
+                    "hostname": "kbf-server-a.storage.example"
+                  },
+                  "metadata": {
+                    "filter_metadata": {
+                      "envoy.transport_socket_match": {
+                        "server": "kbf-server-a.storage.example"
+                      }
+                    }
+                  }
+                },
+                {
+                  "endpoint": {
+                    "address": {
+                      "socket_address": {
+                        "address": "kbf-server-b.storage.example",
+                        "port_value": 8981
+                      }
+                    },
+                    "hostname": "kbf-server-b.storage.example"
+                  },
+                  "metadata": {
+                    "filter_metadata": {
+                      "envoy.transport_socket_match": {
+                        "server": "kbf-server-b.storage.example"
+                      }
+                    }
+                  }
+                }
+              ]
+            }
+          ]
+        },
+        "name": "kbf_servers",
+        "transport_socket": {
+          "name": "envoy.transport_sockets.tls",
+          "typed_config": {
+            "@type": "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext",
+            "common_tls_context": {
+              "alpn_protocols": [
+                "h2"
+              ],
+              "validation_context": {
+                "trusted_ca": {
+                  "filename": "/etc/kbf-front/ca/ca.pem"
+                }
+              }
+            }
+          }
+        },
+        "transport_socket_matches": [
+          {
+            "match": {
+              "server": "kbf-server-a.storage.example"
+            },
+            "name": "kbf-server-a.storage.example",
+            "transport_socket": {
+              "name": "envoy.transport_sockets.tls",
+              "typed_config": {
+                "@type": "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext",
+                "common_tls_context": {
+                  "alpn_protocols": [
+                    "h2"
+                  ],
+                  "validation_context": {
+                    "match_typed_subject_alt_names": [
+                      {
+                        "matcher": {
+                          "exact": "kbf-server-a.storage.example"
+                        },
+                        "san_type": "DNS"
+                      }
+                    ],
+                    "trusted_ca": {
+                      "filename": "/etc/kbf-front/ca/ca.pem"
+                    }
+                  }
+                },
+                "sni": "kbf-server-a.storage.example"
+              }
+            }
+          },
+          {
+            "match": {
+              "server": "kbf-server-b.storage.example"
+            },
+            "name": "kbf-server-b.storage.example",
+            "transport_socket": {
+              "name": "envoy.transport_sockets.tls",
+              "typed_config": {
+                "@type": "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext",
+                "common_tls_context": {
+                  "alpn_protocols": [
+                    "h2"
+                  ],
+                  "validation_context": {
+                    "match_typed_subject_alt_names": [
+                      {
+                        "matcher": {
+                          "exact": "kbf-server-b.storage.example"
+                        },
+                        "san_type": "DNS"
+                      }
+                    ],
+                    "trusted_ca": {
+                      "filename": "/etc/kbf-front/ca/ca.pem"
+                    }
+                  }
+                },
+                "sni": "kbf-server-b.storage.example"
+              }
+            }
+          }
+        ],
+        "type": "STRICT_DNS",
+        "typed_extension_protocol_options": {
+          "envoy.extensions.upstreams.http.v3.HttpProtocolOptions": {
+            "@type": "type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions",
+            "explicit_http_config": {
+              "http2_protocol_options": {}
+            }
+          }
+        }
+      }
+    ],
+    "listeners": [
+      {
+        "address": {
+          "socket_address": {
+            "address": "0.0.0.0",
+            "port_value": 8080
+          }
+        },
+        "filter_chains": [
+          {
+            "filters": [
+              {
+                "name": "envoy.filters.network.http_connection_manager",
+                "typed_config": {
+                  "@type": "type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager",
+                  "codec_type": "AUTO",
+                  "http_filters": [
+                    {
+                      "name": "envoy.filters.http.router",
+                      "typed_config": {
+                        "@type": "type.googleapis.com/envoy.extensions.filters.http.router.v3.Router"
+                      }
+                    }
+                  ],
+                  "route_config": {
+                    "name": "reapi",
+                    "virtual_hosts": [
+                      {
+                        "domains": [
+                          "*"
+                        ],
+                        "name": "kbf",
+                        "routes": [
+                          {
+                            "match": {
+                              "grpc": {},
+                              "path": "/build.bazel.remote.execution.v2.Execution/Execute"
+                            },
+                            "route": {
+                              "cluster": "kbf_servers",
+                              "timeout": "0s"
+                            }
+                          },
+                          {
+                            "match": {
+                              "grpc": {},
+                              "path": "/build.bazel.remote.execution.v2.Execution/WaitExecution"
+                            },
+                            "route": {
+                              "cluster": "kbf_servers",
+                              "timeout": "0s"
+                            }
+                          },
+                          {
+                            "match": {
+                              "grpc": {},
+                              "prefix": "/build.bazel.remote.execution.v2.Capabilities/"
+                            },
+                            "route": {
+                              "cluster": "kbf_servers",
+                              "timeout": "0s"
+                            }
+                          },
+                          {
+                            "match": {
+                              "grpc": {},
+                              "prefix": "/build.bazel.remote.execution.v2.ContentAddressableStorage/"
+                            },
+                            "route": {
+                              "cluster": "kbf_servers",
+                              "timeout": "0s"
+                            }
+                          },
+                          {
+                            "match": {
+                              "grpc": {},
+                              "prefix": "/build.bazel.remote.execution.v2.ActionCache/"
+                            },
+                            "route": {
+                              "cluster": "kbf_servers",
+                              "timeout": "0s"
+                            }
+                          },
+                          {
+                            "match": {
+                              "grpc": {},
+                              "prefix": "/google.bytestream.ByteStream/"
+                            },
+                            "route": {
+                              "cluster": "kbf_servers",
+                              "timeout": "0s"
+                            }
+                          }
+                        ]
+                      }
+                    ]
+                  },
+                  "stat_prefix": "reapi",
+                  "stream_idle_timeout": "7200s"
+                }
+              }
+            ]
+          }
+        ],
+        "name": "reapi"
+      }
+    ]
+  }
+}

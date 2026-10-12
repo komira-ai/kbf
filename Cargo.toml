@@ -28,11 +28,16 @@ core-foundation = "0.10.1"
 # host, which ring's C build does not allow). One major for both, already in the tree
 # through ssh-key.
 ed25519-dalek = { version = "2.2.0", default-features = false, features = ["std"] }
+# gzip for the tar.gz archives `cargo xtask fetch` unpacks; the pure-Rust backend, no C
+# zlib.
+flate2 = { version = "1.1.10", default-features = false, features = ["rust_backend"] }
 futures = "0.3.34"
 hex = "0.4.3"
 # `wait4` and `kill` for a measured child process (kbf-daemon's `usage` module); the
 # standard library reaps children without returning their resource usage.
 libc = "0.2.190"
+# xz for the tar.xz archives `cargo xtask fetch` unpacks; pure Rust, no C liblzma.
+lzma-rs = "0.3.0"
 hmac = "0.13.0"
 # The MDM gate serves its mutual-TLS listener with hyper directly (axum's own `serve`
 # takes plain TCP only). Both are already in the tree through axum and tonic.
@@ -60,6 +65,10 @@ ring = "0.17.14"
 roxmltree = "0.21.1"
 # The MDM gate's mutual-TLS listener, on the ring provider tonic's `tls-ring` uses too.
 rustls = { version = "0.23.45", default-features = false, features = ["ring", "std", "tls12"] }
+# The host's trusted roots for `cargo xtask fetch`'s HTTPS downloads.
+rustls-native-certs = "0.8.4"
+# zstd for the .zst downloads `cargo xtask fetch` unpacks; pure Rust, no C zstd.
+ruzstd = "0.8.3"
 # Directory-relative, no-follow file access (openat with O_NOFOLLOW) for reading outputs;
 # the effective uid, to check who owns the operator API token file (kbf-server).
 rustix = "1.1.5"
@@ -79,6 +88,8 @@ subtle = "2.6.1"
 # Parses Rust sources for the interpreter budget's shell scan (kbf-it, tests only).
 # Already in the tree through the derive macros.
 syn = { version = "2.0.119", default-features = false, features = ["full", "parsing", "visit"] }
+# The tar archives `cargo xtask fetch` unpacks; no extended attributes.
+tar = { version = "0.4.46", default-features = false }
 thiserror = "2.0.21"
 # RFC 3339 times in the MDM gate's signed messages. Already in the tree through
 # x509-parser.
@@ -92,6 +103,10 @@ tonic-prost-build = "0.14.6"
 tower-layer = "0.3.3"
 tracing = "0.1.44"
 tracing-subscriber = "0.3.23"
+# HTTPS downloads for `cargo xtask fetch`, over the rustls (ring) above: no provider
+# feature, so neither aws-lc-rs nor the bundled webpki roots (CDLA licence) come in;
+# the agent is given ring and the host's roots.
+ureq = { version = "3.4.2", default-features = false, features = ["rustls-no-provider"] }
 # Reads the fields of a daemon's client certificate the worker listener checks (its DNS
 # subjectAltName, serial and public key); TLS has already verified the certificate.
 x509-parser = "0.18.1"
@@ -105,6 +120,7 @@ kbf-driver-container = { path = "crates/kbf-driver-container" }
 kbf-driver-native = { path = "crates/kbf-driver-native" }
 kbf-estimator = { path = "crates/kbf-estimator" }
 kbf-front = { path = "crates/kbf-front" }
+kbf-host = { path = "crates/kbf-host" }
 kbf-it = { path = "crates/kbf-it" }
 kbf-log = { path = "crates/kbf-log" }
 kbf-mac-session = { path = "crates/kbf-mac-session" }

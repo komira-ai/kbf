@@ -2,18 +2,20 @@
 //!
 //! It checks the host first, read only, and each refusal says the fix: a cgroup v2
 //! memory controller; `MINIO_UNIT` is a systemd unit here; the two users exist, and
-//! the kbf user has subuid and subgid ranges and lingers; the key files are their
-//! service's alone, the certificates and deny list exist and `s3.env` names a key
-//! pair; and, unless kbf-server runs, its three ports are free. A host with no active
-//! swap gets a warning. It then renders the units (`render-units` with the kbf user's
-//! uid), refuses them unless `check-units --installable` passes, and refuses a binary
-//! whose `--help` lacks a flag its unit passes.
+//! the kbf user has subuid and subgid ranges (a line keyed by its name or its uid)
+//! and lingers; the key files are their service's alone, the certificates and deny
+//! list exist and `s3.env` names a key pair; and, unless kbf-server runs, its three
+//! ports are free. A host with no active swap gets a warning. It then renders the
+//! units (`render-units` with the kbf user's uid), refuses them unless `check-units
+//! --installable` passes, and refuses a binary whose `--help` lacks a flag its unit
+//! passes.
 //!
 //! The plan has each of these only when the host differs:
-//! 1. with `--bin-dir`, `kbf-server` and `kbf-daemon` copied into `KBF_BIN_DIR`, the
-//!    binary they replace kept as `<name>.previous`;
+//! 1. with `--bin-dir`, `kbf-server` and `kbf-daemon` copied into `KBF_BIN_DIR` (0755),
+//!    the binary they replace kept as `<name>.previous` (its mode);
 //! 2. `kbf.slice`, the MinIO drop-in, `kbf-server.service` and `kbf-daemon.service`
-//!    under `/etc/systemd/system`;
+//!    under `/etc/systemd/system` (0644); these and the binaries are root's (uid and
+//!    gid 0), so one with the right bytes and mode that another user owns is replaced;
 //! 3. the Raft directory (`KBF_META_LOG=raft`) and the build scratch, 0700, owned by
 //!    their service's user;
 //! 4. when a binary or unit changed: `daemon-reload`, then enable and restart
@@ -23,8 +25,9 @@
 //! MinIO is never restarted unless `--restart-minio` is given: it serves the farm, and
 //! its new priorities take effect only at its next start.
 //!
-//! `--uninstall` is the rollback: kbf-daemon and kbf-server stopped and disabled, the
-//! four files moved to `/var/lib/kbf-linux/removed/<unix seconds>/`, `daemon-reload`.
+//! `--uninstall` is the rollback: kbf-daemon and kbf-server stopped and disabled
+//! (when either is enabled or running), the four files moved to
+//! `/var/lib/kbf-linux/removed/<unix seconds>/`, `daemon-reload`.
 //! The binaries, the Raft log, the scratch, the bucket and the swapfile stay.
 
 use std::io::Write;
@@ -36,12 +39,12 @@ use super::host::{
     self, HostError, SS, SYSTEMCTL, inspect, note, parents, stat, tool, under, unit_is,
 };
 use super::render::{DAEMON, DROP_IN, SERVER, SLICE, Templates, render};
-use crate::exec::{Entry, Exec, Kind};
-use crate::path::HostPath;
-use crate::plan::{Mode, Plan, Planner, RunAs, execute};
-use crate::step::{Cmd, HttpUrl, Owner, Perms};
 use crate::unit::UnitFile;
-use crate::user::RunUser;
+use kbf_host::exec::{Entry, Exec, Kind};
+use kbf_host::path::HostPath;
+use kbf_host::plan::{Mode, Plan, Planner, RunAs, execute};
+use kbf_host::step::{Cmd, HttpUrl, Owner, Perms};
+use kbf_host::user::RunUser;
 
 const UNITS: &str = "/etc/systemd/system";
 const REMOVED: &str = "/var/lib/kbf-linux/removed";
@@ -53,6 +56,10 @@ const BINARIES: [&str; 2] = ["kbf-server", "kbf-daemon"];
 const PUBLIC: [&str; 5] = ["ca.pem", "reapi.pem", "worker.pem", "node.pem", "deny-list"];
 /// How long kbf-server has to answer `/readyz` after a start.
 pub const READY: Duration = Duration::from_secs(60);
+/// Who owns each binary, `.previous` copy and unit install-units writes: root, user and
+/// group. The in-place check compares it too, so a right file another user owns (and so
+/// could rewrite what systemd runs as root) is replaced.
+const ROOT: Owner = Owner { uid: 0, gid: 0 };
 
 /// What `install-units` was asked for.
 pub struct Install {
@@ -64,13 +71,16 @@ pub struct Install {
 
 /// Check the host, then plan the binaries, units, directories and service steps.
 pub fn plan<E: Exec>(exec: &E, a: &Install, out: &mut dyn Write) -> Result<Plan, HostError> {
-    plan_with(exec, a, &Templates::BUILT_IN, out)
+    plan_with(exec, a, &Templates::BUILT_IN, ROOT, out)
 }
 
+/// [`plan`] with `templates` and with `root` as the owner of what root writes (a scratch
+/// test can chown only to its own user).
 fn plan_with<E: Exec>(
     exec: &E,
     a: &Install,
     templates: &Templates<'_>,
+    root: Owner,
     out: &mut dyn Write,
 ) -> Result<Plan, HostError> {
     let c = &a.config;
@@ -90,7 +100,8 @@ fn plan_with<E: Exec>(
     let mut changed = false;
     if a.bin_dir.is_some() {
         for (bin, bytes) in BINARIES.into_iter().zip(new) {
-            changed |= binary(exec, &mut planner, &under(&c.bin_dir, bin)?, bytes, out)?;
+            let dst = under(&c.bin_dir, bin)?;
+            changed |= binary(exec, &mut planner, &dst, bytes, root, out)?;
         }
     }
     let dir = HostPath::new(UNITS)?;
@@ -100,7 +111,7 @@ fn plan_with<E: Exec>(
         if planner.file(
             path.clone(),
             Perms::new(0o644),
-            None,
+            Some(root),
             text.as_bytes().to_vec(),
         )? {
             changed = true;
@@ -179,10 +190,18 @@ fn preflight<E: Exec>(
     }
     let kbf = host::user_named(exec, &c.user)?;
     let server = host::user_named(exec, &c.server_user)?;
+    // A range line is `<user>:<first id>:<count>`, the user named or given by uid
+    // (subuid(5); newuidmap takes either).
+    let uid = kbf.uid.to_string();
     for file in ["/etc/subuid", "/etc/subgid"] {
         let file = HostPath::new(file)?;
-        let range = format!("{}:", kbf.name);
-        if !text_of(exec, &file)?.is_some_and(|t| t.lines().any(|l| l.starts_with(&range))) {
+        let ranged = text_of(exec, &file)?.is_some_and(|t| {
+            t.lines().any(|l| {
+                l.split_once(':')
+                    .is_some_and(|(who, _)| who == kbf.name || who == uid)
+            })
+        });
+        if !ranged {
             return Err(HostError::NoSubIds {
                 user: kbf.name.clone(),
                 file,
@@ -304,27 +323,26 @@ fn supports<E: Exec>(exec: &E, bin: &HostPath, unit: &str) -> Result<Vec<u8>, Ho
     Ok(bytes)
 }
 
-/// Plan `bytes` into `dst` (0755), keeping a different binary there as
-/// `<dst>.previous`; whether it changes.
+/// Plan `bytes` into `dst` (0755, owned by `root`), keeping a different binary there as
+/// `<dst>.previous` (its mode, owned by `root`); whether it changes.
 fn binary<E: Exec>(
     exec: &E,
     planner: &mut Planner<'_, E>,
     dst: &HostPath,
     bytes: Vec<u8>,
+    root: Owner,
     out: &mut dyn Write,
 ) -> Result<bool, HostError> {
     parents(exec, planner, dst)?;
     if let Some(Entry::File {
-        perms,
-        owner,
-        bytes: old,
+        perms, bytes: old, ..
     }) = inspect(exec, dst)?
         && old != bytes
     {
         let previous = HostPath::new(&format!("{dst}.previous"))?;
-        planner.file(previous, perms, Some(owner), old)?;
+        planner.file(previous, perms, Some(root), old)?;
     }
-    let changed = planner.file(dst.clone(), Perms::new(0o755), None, bytes)?;
+    let changed = planner.file(dst.clone(), Perms::new(0o755), Some(root), bytes)?;
     if !changed {
         note(out, format_args!("{dst}: unchanged"))?;
     }

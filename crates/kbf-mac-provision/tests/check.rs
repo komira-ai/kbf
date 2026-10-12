@@ -131,9 +131,9 @@ fn entries_that_are_not_drift_pass() {
 #[test]
 fn a_lease_user_named_by_the_intent_record_passes() {
     let mut mac = FakeMac::converged("lease-autologin");
-    mac.state.user("kbf-lease-4-2", 642);
+    mac.state_mut().user("kbf-lease-4-2", 642);
     mac.write(INTENT, "4.2\n");
-    mac.state
+    mac.state_mut()
         .default_set(LOGINWINDOW, "autoLoginUser", "kbf-lease-4-2");
     mac.write("/etc/kcpassword", "x");
     let r = check(&mac);
@@ -144,10 +144,10 @@ fn a_lease_user_named_by_the_intent_record_passes() {
         r.text
     );
     let mut lease0 = FakeMac::converged("lease-autologin-0");
-    lease0.state.user("kbf-lease-0-0", 600);
+    lease0.state_mut().user("kbf-lease-0-0", 600);
     lease0.write(INTENT, "0.0\n");
     lease0
-        .state
+        .state_mut()
         .default_set(LOGINWINDOW, "autoLoginUser", "kbf-lease-0-0");
     assert_eq!(check(&lease0).failed, 0);
 }
@@ -159,9 +159,9 @@ fn a_lease_user_outside_lease_uids_fails() {
     assert_only_fails(
         "autologin",
         |m| {
-            m.state.user("kbf-lease-4-2", 599);
+            m.state_mut().user("kbf-lease-4-2", 599);
             m.write(INTENT, "4.2\n");
-            m.state
+            m.state_mut()
                 .default_set(LOGINWINDOW, "autoLoginUser", "kbf-lease-4-2");
         },
         "auto-login is kbf-lease-4-2 (uid 599); only a kbf-lease-* user",
@@ -169,9 +169,9 @@ fn a_lease_user_outside_lease_uids_fails() {
     assert_only_fails(
         "autologin",
         |m| {
-            m.state.user("kbf-lease-4-2", 700);
+            m.state_mut().user("kbf-lease-4-2", 700);
             m.write(INTENT, "4.2\n");
-            m.state
+            m.state_mut()
                 .default_set(LOGINWINDOW, "autoLoginUser", "kbf-lease-4-2");
         },
         "(uid 700); only",
@@ -185,9 +185,9 @@ fn an_auto_login_user_not_named_kbf_lease_fails() {
     assert_only_fails(
         "autologin",
         |m| {
-            m.state.user("lease-4-2", 642);
+            m.state_mut().user("lease-4-2", 642);
             m.write(INTENT, "4.2\n");
-            m.state
+            m.state_mut()
                 .default_set(LOGINWINDOW, "autoLoginUser", "lease-4-2");
         },
         "auto-login is lease-4-2 (uid 642); only",
@@ -201,8 +201,8 @@ fn a_lease_user_no_intent_record_names_fails() {
     assert_only_fails(
         "autologin",
         |m| {
-            m.state.user("kbf-lease-4-2", 642);
-            m.state
+            m.state_mut().user("kbf-lease-4-2", 642);
+            m.state_mut()
                 .default_set(LOGINWINDOW, "autoLoginUser", "kbf-lease-4-2");
         },
         "a lease user left behind",
@@ -216,11 +216,11 @@ fn an_intent_record_that_is_a_link_is_ignored() {
     assert_only_fails(
         "autologin",
         |m| {
-            m.state.user("kbf-lease-4-2", 642);
+            m.state_mut().user("kbf-lease-4-2", 642);
             let target = m.path("/var/db/record");
             fs::write(&target, "4.2\n").unwrap();
             m.symlink(&target, INTENT);
-            m.state
+            m.state_mut()
                 .default_set(LOGINWINDOW, "autoLoginUser", "kbf-lease-4-2");
         },
         "a lease user left behind",
@@ -260,7 +260,7 @@ fn a_property_list_that_differs_fails() {
 fn a_job_that_is_not_loaded_fails() {
     assert_only_fails(
         "launchd_label",
-        |m| m.state.loaded.clear(),
+        |m| m.state_mut().loaded.clear(),
         "system/org.example.kbf-daemon is not loaded",
     );
 }
@@ -312,21 +312,23 @@ fn each_of_the_three_host_names_is_checked() {
     assert_only_fails(
         "hostname",
         |m| {
-            m.state.scutil.insert("HostName".into(), "x".into());
+            m.state_mut().scutil.insert("HostName".into(), "x".into());
         },
         "want kbf-mac-07, found HostName=x",
     );
     assert_only_fails(
         "hostname",
         |m| {
-            m.state.scutil.remove("LocalHostName");
+            m.state_mut().scutil.remove("LocalHostName");
         },
         "found LocalHostName=LocalHostName: not set",
     );
     assert_only_fails(
         "hostname",
         |m| {
-            m.state.scutil.insert("ComputerName".into(), String::new());
+            m.state_mut()
+                .scutil
+                .insert("ComputerName".into(), String::new());
         },
         "found ComputerName=unset",
     );
@@ -339,7 +341,7 @@ fn another_administrator_fails() {
     assert_only_fails(
         "admin_user",
         |m| {
-            m.state.attr(
+            m.state_mut().attr(
                 "/Groups/admin",
                 "GroupMembership",
                 "root farmadmin intruder intruder",
@@ -350,8 +352,8 @@ fn another_administrator_fails() {
     assert_only_fails(
         "admin_user",
         |m| {
-            m.state.user("hidden", 502);
-            m.state.user_attr("hidden", "PrimaryGroupID", "80");
+            m.state_mut().user("hidden", 502);
+            m.state_mut().user_attr("hidden", "PrimaryGroupID", "80");
         },
         "other administrators: hidden",
     );
@@ -362,12 +364,17 @@ fn another_administrator_fails() {
 #[test]
 fn the_administrator_is_checked_through_dseditgroup() {
     let mut mac = FakeMac::converged("admin-primary");
-    mac.state.attr("/Groups/admin", "GroupMembership", "root");
-    mac.state.user_attr("farmadmin", "PrimaryGroupID", "80");
+    mac.state_mut()
+        .attr("/Groups/admin", "GroupMembership", "root");
+    mac.state_mut()
+        .user_attr("farmadmin", "PrimaryGroupID", "80");
     assert_eq!(check(&mac).failed, 0);
     assert_only_fails(
         "admin_user",
-        |m| m.state.attr("/Groups/admin", "GroupMembership", "root"),
+        |m| {
+            m.state_mut()
+                .attr("/Groups/admin", "GroupMembership", "root")
+        },
         "farmadmin is not in the admin group",
     );
 }
@@ -377,7 +384,7 @@ fn the_administrator_is_checked_through_dseditgroup() {
 fn a_role_account_with_a_password_fails() {
     assert_only_fails(
         "role_user",
-        |m| m.state.user_attr("_kbf", "Password", "secret"),
+        |m| m.state_mut().user_attr("_kbf", "Password", "secret"),
         "Password=secret",
     );
 }
@@ -389,7 +396,7 @@ fn an_authentication_authority_fails_the_role_account() {
     assert_only_fails(
         "role_user",
         |m| {
-            m.state
+            m.state_mut()
                 .user_attr("_kbf", "AuthenticationAuthority", ";ShadowHash;")
         },
         "AuthenticationAuthority=present",
@@ -401,7 +408,7 @@ fn an_authentication_authority_fails_the_role_account() {
 fn a_group_holding_the_role_id_fails() {
     assert_only_fails(
         "role_user",
-        |m| m.state.attr("/Groups/staff", "PrimaryGroupID", "480"),
+        |m| m.state_mut().attr("/Groups/staff", "PrimaryGroupID", "480"),
         "gid 480 belongs to staff",
     );
 }
@@ -411,7 +418,7 @@ fn a_group_holding_the_role_id_fails() {
 fn a_role_group_with_another_id_fails() {
     assert_only_fails(
         "role_user",
-        |m| m.state.attr("/Groups/_kbf", "PrimaryGroupID", "481"),
+        |m| m.state_mut().attr("/Groups/_kbf", "PrimaryGroupID", "481"),
         "group=481",
     );
 }
@@ -489,7 +496,7 @@ fn what_sshd_reports_is_checked() {
     assert_only_fails(
         "ssh_password_auth",
         |m| {
-            m.state.sshd_effective = Some("passwordauthentication no\nkbdinteractiveauthentication no\npermitrootlogin yes\nport 22\n".into())
+            m.state_mut().sshd_effective = Some("passwordauthentication no\nkbdinteractiveauthentication no\npermitrootlogin yes\nport 22\n".into())
         },
         "sshd -T reports 'kbdinteractiveauthentication no;passwordauthentication no;permitrootlogin yes', want 'kbdinteractiveauthentication no;passwordauthentication no;permitrootlogin no'",
     );
@@ -500,8 +507,8 @@ fn what_sshd_reports_is_checked() {
 #[test]
 fn sshd_is_not_asked_without_root() {
     let mut mac = FakeMac::converged("sshd-not-root");
-    mac.state.euid = 501;
-    mac.state.sshd_effective = Some("passwordauthentication yes\n".into());
+    mac.state_mut().euid = 501;
+    mac.state_mut().sshd_effective = Some("passwordauthentication yes\n".into());
     let r = check_keys(&mac, Some("ssh_password_auth"));
     assert_eq!(r.failed, 0, "{}", r.text);
     assert!(
@@ -522,16 +529,16 @@ fn sshd_is_not_asked_without_root() {
 fn the_clock_offset_is_bounded_both_ways() {
     assert_only_fails(
         "time_max_offset_ms",
-        |m| m.state.sntp_offset = "+0.251".into(),
+        |m| m.state_mut().sntp_offset = "+0.251".into(),
         "251 ms from time.example.net, more than 250",
     );
     assert_only_fails(
         "time_max_offset_ms",
-        |m| m.state.sntp_offset = "-0.251".into(),
+        |m| m.state_mut().sntp_offset = "-0.251".into(),
         "251 ms",
     );
     let mut mac = FakeMac::converged("offset-at-max");
-    mac.state.sntp_offset = "-0.250".into();
+    mac.state_mut().sntp_offset = "-0.250".into();
     assert_eq!(check(&mac).failed, 0);
 }
 
@@ -657,7 +664,7 @@ fn keys_refuses_an_unknown_item() {
 #[test]
 fn the_other_values_of_remote_login_and_ssh_pass() {
     let mut mac = FakeMac::converged("other-values");
-    mac.state.remote_login = false;
+    mac.state_mut().remote_login = false;
     mac.write(
         DROPIN,
         "PasswordAuthentication yes\nKbdInteractiveAuthentication yes\nPermitRootLogin no\n",
@@ -731,7 +738,7 @@ fn only_check_only_items_say_apply_leaves_them() {
     let r = check(&mac);
     let check_only: Vec<&str> = kbf_mac_provision::items::ITEMS
         .iter()
-        .filter(|i| i.check_only)
+        .filter(|i| i.check_only())
         .map(|i| i.key)
         .collect();
     assert_eq!(
@@ -747,8 +754,8 @@ fn only_check_only_items_say_apply_leaves_them() {
     );
     assert!(!r.text.contains("[check only"), "{}", r.text);
     let mut mac = FakeMac::converged("check-only-fail");
-    mac.state.filevault = "On".into();
-    mac.state.sw_vers.insert("version", String::new());
+    mac.state_mut().filevault = "On".into();
+    mac.state_mut().sw_vers.insert("version", String::new());
     let r = check(&mac);
     assert!(
         r.text.contains(
@@ -771,8 +778,8 @@ fn only_check_only_items_say_apply_leaves_them() {
 fn a_malformed_intent_record_names_no_lease() {
     for record in [".2\n", "4.\n", "4a.2\n", "4.02\n", "4.2", "4-2\n", ""] {
         let mut mac = FakeMac::converged("intent-malformed");
-        mac.state.user("kbf-lease-4-2", 642);
-        mac.state
+        mac.state_mut().user("kbf-lease-4-2", 642);
+        mac.state_mut()
             .default_set(LOGINWINDOW, "autoLoginUser", "kbf-lease-4-2");
         mac.write(INTENT, record);
         let r = check_keys(&mac, Some("autologin"));

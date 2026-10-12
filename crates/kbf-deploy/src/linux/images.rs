@@ -14,8 +14,8 @@
 //! digest (`podman image inspect`'s `.Digest`; an image index digest names several
 //! architectures, and the pin is one manifest's) and be built for `--platform`
 //! (`linux/amd64` by default). After an apply the plan is made again: each pulled
-//! image is then checked, and one still missing fails the verb. A re-run pulls
-//! nothing.
+//! image is then checked, and one still missing or not the pin fails the verb (exit 1,
+//! a `FAIL` line: the pulls ran, so it is not a refusal). A re-run pulls nothing.
 //!
 //! The reads run as the kbf user too, so even a dry run needs root.
 
@@ -25,10 +25,10 @@ use kbf_types::ImageRef;
 
 use super::config::LinuxConfig;
 use super::host::{self, HostError, PODMAN, note, tool};
-use crate::exec::Exec;
-use crate::plan::{Mode, Plan, Planner, RunAs, execute};
-use crate::step::{Cmd, Step};
-use crate::user::RunUser;
+use kbf_host::exec::Exec;
+use kbf_host::plan::{Mode, Plan, Planner, RunAs, execute};
+use kbf_host::step::{Cmd, Step};
+use kbf_host::user::RunUser;
 
 /// The farm's build platform.
 pub const PLATFORM: &str = "linux/amd64";
@@ -94,13 +94,19 @@ pub fn run<E: Exec>(
     let pulls = plan(&*exec, a, &mut *out)?;
     execute(&pulls, RunAs::Root, mode, exec, &mut out)?;
     if mode == Mode::Apply && !pulls.is_empty() {
-        // Each pull's last argument is its image.
-        let again = plan(&*exec, a, &mut *out)?;
-        if let Some(Step::Run(pull)) = again.steps().first() {
-            return Err(HostError::NotPulled(
-                pull.args.last().cloned().unwrap_or_default(),
-            ));
-        }
+        recheck(&*exec, a, out).map_err(|e| HostError::AfterApply(Box::new(e)))?;
+    }
+    Ok(())
+}
+
+/// Plan again after the pulls: each image must now be in the store and pass [`check`].
+fn recheck<E: Exec>(exec: &E, a: &Pull, out: &mut dyn Write) -> Result<(), HostError> {
+    let again = plan(exec, a, out)?;
+    // Each pull's last argument is its image.
+    if let Some(Step::Run(pull)) = again.steps().first() {
+        return Err(HostError::NotPulled(
+            pull.args.last().cloned().unwrap_or_default(),
+        ));
     }
     Ok(())
 }

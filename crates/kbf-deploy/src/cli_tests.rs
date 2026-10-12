@@ -4,7 +4,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::rc::Rc;
 
 use super::*;
-use crate::testkit::{FakeExec, reply};
+use kbf_host::testkit::{FakeExec, reply};
 
 fn argv(args: &[&str]) -> Vec<OsString> {
     std::iter::once("kbf-deploy")
@@ -299,7 +299,7 @@ fn the_linux_host_verbs_exit_0_done_1_failed_2_refused() {
     exec.fail_at = Some(0);
     exec.entries.insert(
         HostPath::new("/swapfile").expect("path"),
-        crate::exec::Entry::Other,
+        kbf_host::exec::Entry::Other,
     );
     let args = [base("swap"), vec!["--remove", "--apply"]].concat();
     let (code, _, err) = cli(&mut exec, &no_env, &args);
@@ -307,6 +307,42 @@ fn the_linux_host_verbs_exit_0_done_1_failed_2_refused() {
     assert!(
         err.starts_with("kbf-deploy: step 0 (remove /swapfile) failed"),
         "{err}"
+    );
+}
+
+/// An image-pull whose pull ran but whose image is still missing: the host changed, so
+/// it is a failed verb (exit 1, a `FAIL` line), not a refusal (exit 2, `REFUSED:`,
+/// which says nothing was done). Catches the check after an apply reported as a
+/// refusal.
+#[test]
+fn a_failed_check_after_an_apply_exits_1_with_a_fail_line() {
+    let busybox = format!("busybox@sha256:{}", "a".repeat(64));
+    let mut exec = FakeExec::new(0);
+    exec.answer = Box::new(|cmd| {
+        Ok(match cmd.program.as_str() {
+            kbf_host::user::GETENT => reply(0, "kbf:x:990:990::/h:/s\n", ""),
+            // `podman image exists`: never, even after the pull.
+            "/usr/bin/podman" if cmd.args[0] == "image" => reply(1, "", ""),
+            _ => reply(0, "990\n", ""),
+        })
+    });
+    let args = [
+        "linux",
+        "image-pull",
+        "--config",
+        LINUX_CONFIG,
+        "--image",
+        &busybox,
+        "--apply",
+    ];
+    let (code, _, err) = cli(&mut exec, &no_env, &args);
+    assert_eq!(exec.log.len(), 1, "the pull did not run");
+    assert_eq!(code, ExitCode::FAILURE, "{err}");
+    assert_eq!(
+        err,
+        format!(
+            "FAIL the check after the apply: {busybox} is still not in the store after its pull\n"
+        )
     );
 }
 
@@ -354,7 +390,7 @@ fn a_linux_verb_runs_through_the_same_command_line() {
 /// tests' instantiation of the `linux` arm, the one the coverage ratchet counts.
 #[test]
 fn render_units_then_check_units_exit_0_and_a_broken_unit_exits_1() {
-    let dir = crate::testkit::scratch("cli-render");
+    let dir = kbf_host::testkit::scratch("cli-render");
     let units = dir.join("units");
     let units = units.to_str().expect("utf-8");
     let mut exec = FakeExec::new(501);
@@ -391,4 +427,34 @@ fn render_units_then_check_units_exit_0_and_a_broken_unit_exits_1() {
     assert_eq!(code, ExitCode::FAILURE, "{out}");
     assert!(out.starts_with("FAIL "), "{out}");
     assert!(out.contains("UNITS BROKEN"), "{out}");
+}
+
+/// Catches `envoy render` not wired to the kit, its line lost, or a refusal that
+/// exits other than 2 or prints elsewhere than stderr. In-process, so the lib tests'
+/// instantiation of `run` covers the `envoy` arm.
+#[test]
+fn envoy_render_exits_0_and_a_bad_setting_exits_2() {
+    let dir = kbf_host::testkit::scratch("cli-envoy");
+    let config = dir.join("config.local");
+    let example = include_str!("../templates/envoy/config.example");
+    std::fs::write(&config, example).expect("config");
+    let config = config.to_str().expect("utf-8").to_owned();
+    let rendered = dir.join("rendered");
+    let rendered = rendered.to_str().expect("utf-8").to_owned();
+    let mut exec = FakeExec::new(501);
+    let args = ["envoy", "render", "--config", &config, "--out", &rendered];
+    let (code, out, err) = cli(&mut exec, &no_env, &args);
+    assert_eq!((code, err.as_str()), (ExitCode::SUCCESS, ""), "{out}");
+    assert_eq!(
+        out,
+        format!("rendered manifests.json envoy.json into {rendered}\n")
+    );
+
+    std::fs::write(&config, example.replace("KBF_SERVERS=", "KBF_SERVER=")).expect("plant");
+    let (code, out, err) = cli(&mut exec, &no_env, &args);
+    assert_eq!((code, out.as_str()), (ExitCode::from(2), ""), "{err}");
+    assert!(
+        err.starts_with("REFUSED: line ") && err.ends_with(": unknown key KBF_SERVER\n"),
+        "{err}"
+    );
 }

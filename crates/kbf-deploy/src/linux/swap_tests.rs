@@ -7,8 +7,8 @@ use std::rc::Rc;
 
 use super::*;
 use crate::linux::host::SYSTEMCTL;
-use crate::step::Step;
-use crate::testkit::{ScratchHost, reply};
+use kbf_host::step::Step;
+use kbf_host::testkit::{ScratchHost, reply};
 
 const EXAMPLE: &str = include_str!("../../templates/linux/config.example");
 const FILE: &str = "/srv/swap/kbf.swap";
@@ -361,4 +361,35 @@ fn a_rollback_on_a_host_without_the_swapfile_plans_nothing() {
         ..swap(FILE)
     };
     assert!(plan(&exec, &a, &mut Vec::new()).expect("plan").is_empty());
+}
+
+/// fstab lines that name the swapfile's path without being its line: another file
+/// whose name starts with it, and a comment. Adding must still append the line, and
+/// `--remove` must drop that line alone. Catches a line matched by the path appearing
+/// anywhere in it rather than by its first field (the swapfile would never be listed,
+/// and a rollback would drop the look-alikes).
+#[test]
+fn fstab_lines_that_only_mention_the_swapfile_are_not_its_line() {
+    let look_alikes = format!("{FILE}.old none swap sw 0 0\n# {FILE} none swap sw 0 0\n");
+    let (mut exec, world) = host("swap-look-alike");
+    fs::write(exec.at("/etc/fstab"), &look_alikes).expect("fstab");
+    let out = go(&mut exec, &swap(FILE), Mode::Apply);
+    assert!(!out.contains("/etc/fstab: has"), "{out}");
+    let listed = format!("{look_alikes}{FILE} none swap sw 0 0\n");
+    assert_eq!(fstab(&exec), listed);
+
+    let a = Swap {
+        remove: true,
+        ..swap(FILE)
+    };
+    go(&mut exec, &a, Mode::Apply);
+    assert_eq!(fstab(&exec), look_alikes);
+    assert!(world.borrow().swaps.is_empty());
+
+    // With only the look-alikes left, a rollback has no line to drop.
+    let again = go(&mut exec, &a, Mode::DryRun);
+    assert!(
+        again.contains(&format!("/etc/fstab: no {FILE} line\n")),
+        "{again}"
+    );
 }

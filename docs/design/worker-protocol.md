@@ -92,14 +92,25 @@ same node replaces the older one: messages still arriving on the old stream are 
 from then on.
 
 `Hello.instance_id` names the daemon process: the daemon draws 128 random bits when it
-starts and sends them, as 32 hex digits, in every `Hello` on every stream. It is never
-written down, so a restarted daemon, a second daemon started with the same certificate
-and a daemon on a cloned machine each send their own. The scheduler uses it to decide
-which leases a new session's first heartbeat may give up at once (invariants 6 and 7
+starts and sends them, as 32 hex digits, in every `Hello` on every stream. A restarted
+daemon, a second daemon started with the same certificate and a daemon on a cloned
+machine each draw their own. The scheduler uses it to decide which leases a new
+session's first heartbeat may give up at once (invariants 6 and 7
 [below](#invariants)), and the server logs a warning whenever a node's stream comes
 from another process than its earlier stream's. An empty `instance_id` (a daemon that
 predates the field) matches no process, so every registration it makes counts as
 another process's.
+
+`Hello.predecessor_instance_id` (field 8, issue #22) names the daemon process that ran
+on the node before this one, whose runs this one's drivers killed before its `Hello`.
+The daemon binary writes its own id to `<--scratch>/daemon-instance` once every runtime
+is built (each driver sweeps the scratch directory as it is built), and reads the id
+there before it writes its own; empty on a first start, or without `--scratch`. The
+server takes the claim only when it names the process the node's previous stream came
+from and that stream has closed, and then gives up at once the leases whose `Start`
+went to that process and which the new session's first heartbeat leaves out, as farm
+faults ([scheduler.md](scheduler.md#retries-of-farm-faults)). Otherwise it keeps the
+handover grace (invariant 7). A server that predates the field ignores it.
 
 The daemon refuses a `Welcome` whose interval is zero or whose double is not shorter
 than its fence time T, since a gap of two intervals must be noticed well before it
@@ -117,7 +128,7 @@ it changes. Today only the whole-machine runtime on a Mac
 | Phase | Meaning | `lease_id` / `reason` |
 |---|---|---|
 | `PHASE_PREPARING` | switching the Mac's GUI session to the user of a whole-machine lease it holds (`session-login`: auto-login, then a userspace restart, which ends the daemon too), then running its action there | the lease |
-| `PHASE_RESTORING` | switching back after that lease's action ended (`session-idle`, the same restart), and cleaning up; the lease's `Result` is sent once that is done. A daemon restarted while the action ran (a crash or an update, not a switch) says this too: it killed the lease user's processes before its `Hello`, and the lease fails as the farm's, its result lost; the action is never run again | the lease |
+| `PHASE_RESTORING` | switching back after that lease's action ended (`session-idle`, the same restart), and cleaning up; the lease's `Result` is sent once that is done. A daemon restarted while the action ran (a crash or an update, not a switch) says this too: it killed the lease user's processes before its `Hello`, and the lease's `Result` says it was lost (`LOST_DAEMON_RESTARTED`); the node never runs the action again itself, and the server runs it again as a farm fault | the lease |
 | `PHASE_QUARANTINED` | a cleanup failed; the node takes no lease until an operator repairs it | why |
 
 The server takes the phase of every `Hello`, the stream's first included, before it
@@ -317,8 +328,8 @@ kept across a restart ([Node phases](#node-phases)).
 
 ### `Result` and `ResultAck`
 
-`Result { lease_id, status, action_result, action_digest, memory_kill }` reports one
-lease.
+`Result { lease_id, status, action_result, action_digest, memory_kill, lost }`
+reports one lease.
 `action_digest` echoes the `Start`'s (unset for a lease whose `Start` the daemon did
 not keep, and from a daemon that predates the field). `status` is `OK` when
 the action ran, whatever its exit code, and then `action_result` is set; otherwise it
@@ -330,8 +341,8 @@ says why the action could not run:
 | `DEADLINE_EXCEEDED` | the action ran past its timeout and was stopped. `action_result` may hold the stdout and stderr digests of what it wrote before then (REAPI's partial result, already in the CAS); the server passes on those two digests whose blobs it holds, and nothing else, to the client in the `ExecuteResponse`, and never caches them |
 | `INVALID_ARGUMENT` | the action cannot run as written (an image named by tag, an output that is also an input); the client's error |
 | `FAILED_PRECONDITION` | an input blob is not in the CAS (with a `MISSING` violation), or no driver serves the lease kind |
-| `ABORTED` | the lease was killed, or self-fenced when contact was lost |
-| `UNAVAILABLE` | contact was lost before the lease started |
+| `ABORTED` | the lease was killed on the server's `Cancel` |
+| `UNAVAILABLE` | contact was lost before the lease started; with `lost` set, the farm lost the run (below); with `memory_kill` node pressure, the node killed it for memory |
 | `INTERNAL` | the farm failed (a kernel OOM kill, a lost container, a dirty node) |
 
 `memory_kill` says which memory ran out when the lease was killed for memory. The
@@ -352,6 +363,17 @@ reads the lease cgroup's `memory.events` and sends `RESOURCE_EXHAUSTED` with
 `MEMORY_KILL_NODE_PRESSURE` for a kill by the node's `actions/` limit or the host
 ([failure-classes.md](failure-classes.md), 6.1). Every other `Result` sends 0.
 
+`lost` (field 6, issue #22) says the farm lost the run, and with it the result. The
+server reads it, like `memory_kill`, only on a `Result` whose status is not `OK`, and
+then in place of the status code; the daemon sends it with `UNAVAILABLE`, which a
+server that predates the field takes as the farm's failure:
+
+| `lost` | Meaning | What the server does |
+|---|---|---|
+| `LOST_UNSPECIFIED` (0) | not lost, or not known (a value this server does not know is taken so too) | the status code decides, as above |
+| `LOST_DAEMON_RESTARTED` (1) | the daemon restarted while the action ran: the restarted daemon killed what was left of it before its `Hello` (the whole-machine runtime, whose lease record outlives the daemon) | runs it again as a farm fault, preferring another node ([scheduler.md](scheduler.md#retries-of-farm-faults)) |
+| `LOST_FENCED` (2) | the daemon fenced the run: no heartbeat was acknowledged within T | the same |
+
 The server accepts at most one `Result` per operation, only from the node holding
 the operation's current lease, and only if the `Result` names no action other than the
 one that lease runs. An `OK` result must have every output already in the
@@ -363,7 +385,8 @@ callers are answered.
 
 The server answers every `Result` that names a lease with `ResultAck { lease_id,
 accepted }`. `accepted` is true when the `Result` became the operation's result, and
-for a memory kill the scheduler took (the operation then runs again, or is answered).
+for a memory kill or lost run the scheduler took (the operation then runs again, or is
+answered).
 It is false when the lease is unknown (a lease of another
 process is), held by another node, no longer the operation's current lease, when the
 `Result` names another action, or when the operation already finished (a duplicate).
@@ -520,7 +543,8 @@ daemon restarts and server restarts:
    was killed fences nothing: its runs are ended by each run's keeper as the process
    dies, and by the next daemon started on the node, before that one's `Hello` (issue
    #155); see [daemon.md](daemon.md#when-the-daemon-is-killed) for what neither
-   reaches.
+   reaches. The one exception is a process proven stopped by its successor
+   (`Hello.predecessor_instance_id`, its stream closed): its leases go at once.
 
 ## Planned
 

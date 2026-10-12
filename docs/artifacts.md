@@ -22,8 +22,8 @@ Sections below that describe them say so.
 commit; on a pull request, the test merge commit). Each tarball holds one release binary (`cargo build
 --locked --release`), mode 0755, owned by 0:0, and nothing else. Next to each tarball
 is its CycloneDX SBOM, `<same stem>.cdx.json`, made from `Cargo.lock` for that binary
-and target by `cargo-cyclonedx` (pinned by version and SHA-256 in the workflow). One
-`SHA256SUMS` covers every tarball and SBOM of the commit.
+and target by `cargo-cyclonedx` (pinned by version and SHA-256 in the workflow, and
+installed by `cargo xtask fetch`). One `SHA256SUMS` covers every tarball and SBOM of the commit.
 
 `kbf-server` embeds the first 12 characters of the commit it was built from, and
 `--version` prints `kbf-server <package version>+<commit>` (so do its start line and

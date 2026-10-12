@@ -180,9 +180,8 @@ async fn a_busy_node_kill_reruns_with_the_same_booking_and_is_reported() {
         status.message,
         "kbf farm fault on busy-node: the node killed the action for memory while it was \
          under its own limit (node memory pressure), and its reruns are used up. Operator \
-         fix: find what else holds memory on the node. Runs: 3 (1 GiB on busy-node, node \
-         memory pressure, 1 GiB on busy-node, node memory pressure, 1 GiB on busy-node, \
-         node memory pressure)."
+         fix: find what else holds memory on the node. Runs: 3 (busy-node, node memory \
+         pressure; busy-node, node memory pressure; busy-node, node memory pressure)."
     );
     for kills in 1..=3 {
         let line = format!("kills={kills}");
@@ -193,6 +192,32 @@ async fn a_busy_node_kill_reruns_with_the_same_booking_and_is_reported() {
     // No floor was left: the next Execute books what the action asks.
     let _again = cell.execute(&job.action).await;
     assert_eq!(daemon.start().await.memory_bytes, GIB);
+}
+
+/// Catches a busy node's kill left out of the out-of-memory answer, or not told apart
+/// from the own-limit kills: a node of 1 GiB kills the action under pressure, then the
+/// action passes its own limit at that node's whole memory, the largest there is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_out_of_memory_answer_names_a_busy_node_kill_before_it() {
+    let cell = Cell::start().await;
+    let mut daemon = cell.daemon("mixed-node", 4, 1).await;
+    let job = Job::new("squeezed, then too big", &[]);
+    cell.upload(&job.blobs()).await;
+    let mut ops = cell.execute(&job.action).await;
+    let start = daemon.start().await;
+    let start = rerun(&mut daemon, &start, MemoryKill::NodePressure, 1).await;
+    let ack = daemon
+        .report(killed(start.lease_id, MemoryKill::OwnLimit))
+        .await;
+    assert!(ack.accepted);
+    let status = response(&done(&mut ops).await).status.expect("a status");
+    assert_eq!(status.code, Code::FailedPrecondition as i32, "{status:?}");
+    assert!(
+        status
+            .message
+            .ends_with("Runs: 2 (1 GiB on mixed-node, node memory pressure, 1 GiB on mixed-node)."),
+        "{status:?}"
+    );
 }
 
 /// Catches a server that reads `memory_kill` on an OK Result (the action ran to its
@@ -266,6 +291,8 @@ async fn the_answer_names_the_runs_without_a_finished_retention() {
         "{status:?}"
     );
 
+    // A cell of its own: a rerun prefers another node, and `tiny-node` is one.
+    let cell = Cell::start_with(Duration::from_secs(300), Duration::ZERO).await;
     let mut daemon = cell.daemon("tiny-busy", 4, 1).await;
     let job = Job::new("squeezed", &[]);
     cell.upload(&job.blobs()).await;
@@ -282,7 +309,9 @@ async fn the_answer_names_the_runs_without_a_finished_retention() {
     );
     let status = response(&done(&mut ops).await).status.expect("a status");
     assert!(
-        status.message.contains("Runs: 3 (1 GiB on tiny-busy"),
+        status
+            .message
+            .contains("Runs: 3 (tiny-busy, node memory pressure;"),
         "{status:?}"
     );
     let last = lines_with(&["node=tiny-busy", "kills=3", "node memory pressure"]);

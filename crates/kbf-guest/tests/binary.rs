@@ -7,7 +7,7 @@ use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use common::{Shares, TOKEN, sh};
+use common::{Shares, TOKEN, program};
 use kbf_guest::client::Client;
 use kbf_guest::wire::End;
 
@@ -67,10 +67,9 @@ fn serve_runs_one_command_over_its_socket() {
         assert_eq!(client.session(), "");
     }
     client
-        .run(&sh("[ -c /dev/stdin ] && echo ran", &[]))
+        .run(&program(&["/usr/bin/env", "test", "-c", "/dev/stdin"], &[]))
         .expect("started");
     assert_eq!(client.wait().expect("exited").end, End::Exited(0));
-    assert_eq!(shares.out("stdout"), b"ran\n");
     // The boot's one command has run: once its connection ends, the agent exits.
     drop(client);
     let status = guest.0.wait().expect("waited");
@@ -113,4 +112,17 @@ fn session_prints_the_session_type() {
     } else {
         assert_eq!(text, "\n");
     }
+}
+
+/// Catches a test payload that does not do what its steps say: `kbf-guest-act` must
+/// be kbf-testkit's act program, whose `exit` sets the status, or every test that
+/// expects `Exited(0)` from `exit 0` would pass whatever the agent reported.
+#[test]
+fn the_payload_runs_its_steps() {
+    let out = Command::new(common::ACT)
+        .args(["echo", "a", ";", "exit", "3"])
+        .output()
+        .expect("ran");
+    assert_eq!(out.status.code(), Some(3));
+    assert_eq!(out.stdout, b"a\n");
 }

@@ -106,7 +106,7 @@ async fn files_directories_and_symlinks_are_recorded() {
     let wd = root.join("w");
     std::fs::create_dir_all(wd.join("out/sub")).expect("mkdir");
     std::fs::write(wd.join("a.txt"), b"alpha").expect("write");
-    std::fs::write(wd.join("tool"), b"#!/bin/sh\n").expect("write");
+    std::fs::write(wd.join("tool"), b"an executable\n").expect("write");
     std::fs::set_permissions(wd.join("tool"), std::fs::Permissions::from_mode(0o755))
         .expect("chmod");
     std::fs::write(wd.join("out/z"), b"zed").expect("write");
