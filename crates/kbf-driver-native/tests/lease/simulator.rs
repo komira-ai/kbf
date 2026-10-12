@@ -606,8 +606,8 @@ mod real {
             .success()
     }
 
-    /// The iOS XCUITest fixture (`tools/spike/macos/fixtures`), copied to `dir`; the
-    /// `-project` path.
+    /// The iOS XCUITest fixtures (`tools/spike/macos/fixtures`), copied into `dir`; the
+    /// `-project` path of the copy.
     fn ios_fixture(dir: &Path) -> String {
         let fixtures =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tools/spike/macos/fixtures");
@@ -618,7 +618,7 @@ mod real {
             .status()
             .expect("cp");
         assert!(status.success(), "copy the fixtures");
-        let project = dir.join("IOSFixture.xcodeproj");
+        let project = dir.join("fixtures").join("IOSFixture.xcodeproj");
         assert!(project.is_dir(), "{}", project.display());
         project.to_str().expect("UTF-8").to_owned()
     }
