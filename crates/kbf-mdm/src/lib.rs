@@ -19,6 +19,9 @@
 //!   [`journal`] (audit log and alerts) and [`grant`] (the admin grant it signs);
 //! - [`api`] and [`tls`]: the HTTP API and its mutual-TLS listener;
 //! - [`config`]: files, flags and startup.
+//!
+//! With the `testkit` feature, for other crates' tests: `testkit`, security-key
+//! signatures made in software with the flags byte a test chooses.
 
 pub mod api;
 pub mod backend;
@@ -37,7 +40,7 @@ pub mod trusted;
 
 #[cfg(test)]
 mod fake_nanohub;
-#[cfg(test)]
-mod testkit;
+#[cfg(any(test, feature = "testkit"))]
+pub mod testkit;
 #[cfg(test)]
 mod tlskit;

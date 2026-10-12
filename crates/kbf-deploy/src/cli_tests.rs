@@ -670,6 +670,242 @@ fn envoy_check_exits_0_passed_1_failed_2_refused() {
     assert!(err.ends_with(": unknown key KBF_SERVER\n"), "{err}");
 }
 
+/// Catches `mdm erase-request` not wired to the kit, a pair that does not check
+/// exiting other than 1, and a refusal other than 2. Also catches the verb not wired to
+/// the clock: the signed request's not-after must lie in [before + 15 min, after + 15
+/// min] for clock reads around the call (a stuck or zero clock writes an expired
+/// request). And catches a fixed or counted nonce: two signed requests must carry
+/// nonces that differ in at least 8 of their 16 bytes (equal nonces make the gate's
+/// replay check refuse every request after the first; a counter differs in one byte).
+/// In-process, so the lib tests' instantiation of `run` covers the arm.
+#[test]
+fn mdm_erase_request_signs_and_its_refusals_exit_2() {
+    use kbf_host::exec::Entry;
+    use kbf_mdm::signers::{FLAG_USER_PRESENT, NAMESPACE};
+    use kbf_mdm::testkit::SkKey;
+
+    let key = SkKey::new(9);
+    let mut exec = FakeExec::new(501);
+    let public = HostPath::new("/srv/op/id_erase_sk.pub").expect("path");
+    let bytes = format!("{}\n", key.openssh()).into_bytes();
+    exec.entries.insert(
+        public,
+        Entry::File {
+            perms: kbf_host::step::Perms::new(0o644),
+            owner: kbf_host::testkit::RUNNER,
+            bytes,
+        },
+    );
+    let flags = Rc::new(RefCell::new(FLAG_USER_PRESENT));
+    let seen = Rc::clone(&flags);
+    let signed = Rc::new(RefCell::new(Vec::<Vec<u8>>::new()));
+    let log = Rc::clone(&signed);
+    exec.answer = Box::new(move |cmd| {
+        log.borrow_mut().push(cmd.stdin.clone());
+        let sig = key.sign_with(NAMESPACE, &cmd.stdin, *seen.borrow());
+        Ok(reply(0, &sig, ""))
+    });
+    let base = [
+        "mdm",
+        "erase-request",
+        "--serial",
+        "C02ABC123XYZ",
+        "--reason",
+        "leak after reboot",
+        "--key",
+        "/srv/op/id_erase_sk",
+    ];
+    let with = |out: &str, extra: &[&'static str]| -> Vec<String> {
+        let mut v: Vec<String> = base.iter().map(|s| (*s).to_owned()).collect();
+        v.extend(["--out".to_owned(), out.to_owned()]);
+        v.extend(extra.iter().map(|s| (*s).to_owned()));
+        v
+    };
+    let call = |exec: &mut FakeExec, v: &[String]| {
+        let v: Vec<&str> = v.iter().map(String::as_str).collect();
+        cli(exec, &no_env, &v)
+    };
+
+    let secs = || {
+        let d = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH);
+        i64::try_from(d.expect("after the epoch").as_secs()).expect("secs")
+    };
+    let before = secs();
+    let (code, out, err) = call(&mut exec, &with("/srv/op/a.req", &["--apply"]));
+    let after = secs();
+    assert_eq!(code, ExitCode::SUCCESS, "{err}");
+    assert!(
+        out.starts_with("erase request for C02ABC123XYZ, acceptable until "),
+        "{out}"
+    );
+    assert!(out.contains("    purpose erase-now\n"), "{out}");
+    assert!(
+        out.contains("+ run /usr/bin/ssh-keygen -Y sign -n kbf-mdm-erase"),
+        "{out}"
+    );
+    assert!(
+        out.contains("send /srv/op/a.req and /srv/op/a.req.sig"),
+        "{out}"
+    );
+
+    let (code, _, err) = call(&mut exec, &with("/srv/op/a2.req", &["--apply"]));
+    assert_eq!(code, ExitCode::SUCCESS, "{err}");
+    let requests: Vec<kbf_mdm::request::EraseRequest> = signed
+        .borrow()
+        .iter()
+        .map(|b| kbf_mdm::request::parse(std::str::from_utf8(b).expect("utf-8")).expect("parse"))
+        .collect();
+    assert_eq!(requests.len(), 2);
+    let not_after = requests[0].not_after;
+    assert!(
+        (before + 15 * 60..=after + 15 * 60).contains(&not_after),
+        "not-after {not_after} outside [{before}+900, {after}+900]"
+    );
+    let nonce = |r: &kbf_mdm::request::EraseRequest| hex::decode(&r.nonce).expect("hex");
+    let (n1, n2) = (nonce(&requests[0]), nonce(&requests[1]));
+    assert_eq!((n1.len(), n2.len()), (16, 16));
+    let differ = n1.iter().zip(&n2).filter(|(a, b)| a != b).count();
+    assert!(
+        differ >= 8,
+        "nonces {} and {} differ in {differ} bytes",
+        requests[0].nonce,
+        requests[1].nonce
+    );
+
+    *flags.borrow_mut() = 0;
+    let (code, _, err) = call(&mut exec, &with("/srv/op/b.req", &["--apply"]));
+    assert_eq!(code, ExitCode::FAILURE, "{err}");
+    assert!(
+        err.starts_with(
+            "kbf-deploy: /srv/op/b.req and /srv/op/b.req.sig would be refused by the gate"
+        ),
+        "{err}"
+    );
+
+    let (code, out, err) = call(&mut exec, &with("/srv/op/c.req", &["--valid-for", "61"]));
+    assert_eq!((code, out.as_str()), (ExitCode::from(2), ""), "{err}");
+    assert!(err.starts_with("REFUSED: --valid-for 61"), "{err}");
+
+    let (code, _, err) = call(&mut exec, &with("c.req", &[]));
+    assert_eq!(code, ExitCode::from(2), "{err}");
+    assert!(err.contains("is not absolute"), "{err}");
+}
+
+/// Catches a `tls`, `push-cert` or `dep` verb not wired to its kit (each reaches the
+/// kit's root check, so each refuses as a user with a `REFUSED:` line and exit 2), a
+/// `--check-godaddy` that skips that check, and flags clap must refuse: a topic
+/// without `--profile-only` or malformed, a push certificate without its key, a
+/// malformed serial, `--check-godaddy` with `--apply`.
+#[test]
+fn the_tls_push_cert_and_dep_verbs_reach_their_kit() {
+    let dir = kbf_host::testkit::scratch("cli_mdm_more");
+    let file = dir.join("config.local");
+    let text = crate::mdm::tests::config_text()
+        .replace("MDM_ACME_EMAIL=\n", "MDM_ACME_EMAIL=ops@example.com\n")
+        .replace(
+            "MDM_ACME_DNS_PROVIDER=\n",
+            "MDM_ACME_DNS_PROVIDER=godaddy\n",
+        );
+    std::fs::write(&file, text).expect("write");
+    let config = file.to_string_lossy().into_owned();
+    let topic = "com.apple.mgmt.External.0a1b2c3d-4e5f-6a7b-8c9d-0e1f2a3b4c5d";
+    let c = config.as_str();
+    let refused: [&[&str]; 8] = [
+        &["mdm", "tls", "--config", c],
+        &["mdm", "tls", "--config", c, "--check-godaddy"],
+        &[
+            "mdm",
+            "push-cert",
+            "--config",
+            c,
+            "--profile-only",
+            "--topic",
+            topic,
+        ],
+        &[
+            "mdm",
+            "push-cert",
+            "--config",
+            c,
+            "--cert",
+            "/srv/k/p.pem",
+            "--key",
+            "/srv/k/p.key",
+        ],
+        &[
+            "mdm",
+            "dep",
+            "get-cert",
+            "--config",
+            c,
+            "--out",
+            "/srv/abm/c.pem",
+        ],
+        &[
+            "mdm",
+            "dep",
+            "upload-token",
+            "--config",
+            c,
+            "--token",
+            "/srv/abm/t.p7m",
+        ],
+        &["mdm", "dep", "define-profile", "--config", c, "--apply"],
+        &[
+            "mdm",
+            "dep",
+            "assign",
+            "--config",
+            c,
+            "--serial",
+            "C02AB12CD3EF",
+        ],
+    ];
+    for args in refused {
+        let mut exec = FakeExec::new(501);
+        let (code, _, err) = cli(&mut exec, &no_env, args);
+        assert_eq!(code, ExitCode::from(2), "{args:?}: {err}");
+        assert!(
+            err.starts_with("REFUSED: mdm ") && err.contains("run it with sudo"),
+            "{args:?}: {err}"
+        );
+    }
+    let example = mdm_config("cli_mdm_acme");
+    let mut exec = FakeExec::new(0);
+    let (code, _, err) = cli(&mut exec, &no_env, &["mdm", "tls", "--config", &example]);
+    assert_eq!(code, ExitCode::from(2));
+    assert!(err.contains("MDM_ACME_EMAIL is not set"), "{err}");
+    let bad_flags: [&[&str]; 5] = [
+        &["mdm", "push-cert", "--config", c, "--topic", topic],
+        &[
+            "mdm",
+            "push-cert",
+            "--config",
+            c,
+            "--profile-only",
+            "--topic",
+            "com.apple.x",
+        ],
+        &["mdm", "push-cert", "--config", c, "--cert", "/srv/k/p.pem"],
+        &[
+            "mdm",
+            "dep",
+            "assign",
+            "--config",
+            c,
+            "--serial",
+            "c02ab12cd3ef",
+        ],
+        &["mdm", "tls", "--config", c, "--check-godaddy", "--apply"],
+    ];
+    for args in bad_flags {
+        let mut exec = FakeExec::new(0);
+        let (code, _, err) = cli(&mut exec, &no_env, args);
+        assert_eq!(code, ExitCode::from(2), "{args:?}: {err}");
+        assert!(exec.queries.borrow().is_empty(), "{args:?}");
+    }
+}
+
 /// Catches `envoy apply` not wired to the kit or ignoring `--apply`, `--refuse-example`
 /// not read (kbf's example refused when it is not given), a failed address check not
 /// exiting 1 with a `FAIL` line, a refusal exiting other than 2, and kubectl's cache

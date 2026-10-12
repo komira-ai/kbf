@@ -14,7 +14,17 @@
 //! kbf-deploy mdm fetch --dir DIR [--only TOOL]... [--apply]
 //! kbf-deploy mdm install --config FILE --bin-dir DIR [--apply]
 //! kbf-deploy mdm install --config FILE --uninstall [--apply]
+//! kbf-deploy mdm tls --config FILE [--apply]
+//! kbf-deploy mdm tls --config FILE --check-godaddy
+//! kbf-deploy mdm push-cert --config FILE --cert PEM --key PEM [--apply]
+//! kbf-deploy mdm push-cert --config FILE --profile-only [--topic TOPIC] [--apply]
+//! kbf-deploy mdm dep get-cert --config FILE --out FILE [--apply]
+//! kbf-deploy mdm dep upload-token --config FILE --token FILE [--apply]
+//! kbf-deploy mdm dep define-profile --config FILE [--apply]
+//! kbf-deploy mdm dep assign --config FILE --serial SERIAL... [--apply]
 //! kbf-deploy mdm verify --config FILE [--via ADDR:PORT]
+//! kbf-deploy mdm erase-request --serial SERIAL --reason TEXT [--lease ID] --key KEY
+//!                           --out FILE [--valid-for MINUTES] [--ssh-keygen PATH] [--apply]
 //! kbf-deploy envoy render --config FILE --out DIR
 //! kbf-deploy envoy check --config FILE [--dir DIR]
 //! kbf-deploy envoy apply --config FILE --kubectl PATH --kubeconfig PATH
@@ -38,7 +48,8 @@
 //! refused before any step (`REFUSED: ...` on stderr; a render check's `FAIL` lines on
 //! stdout).
 //! The `mdm` verbs exit as the `linux` host verbs do; `mdm verify` exits 1 when a check
-//! fails ([`crate::mdm`]).
+//! fails, `mdm dep assign` when Apple did not assign every device, and `mdm tls
+//! --check-godaddy` when the account may not use the API ([`crate::mdm`]).
 //! `minio buckets` reads the MinIO admin key pair from `MINIO_ROOT_USER` and
 //! `MINIO_ROOT_PASSWORD` in the environment (secrets are never flags: argv is
 //! world-readable).
@@ -59,8 +70,13 @@ use kbf_types::ImageRef;
 use crate::envoy;
 use crate::https::Client;
 use crate::linux::{self, HostError, LinuxConfig, images, install, swap};
+use crate::mdm::dep::{Dep, Serial};
+use crate::mdm::erase::{self, EraseArgs, Made};
 use crate::mdm::fetch::Fetch;
 use crate::mdm::install::Install;
+use crate::mdm::profile::Topic;
+use crate::mdm::push_cert::{self, PushCert, With};
+use crate::mdm::tls::Acme;
 use crate::mdm::verify::Verify;
 use crate::mdm::{self, MdmConfig, MdmError, Pins, Tool};
 use crate::minio::{self, Admin, K8sName, KbfName, MinioError, buckets, nodeport};
@@ -252,6 +268,44 @@ enum Mdm {
         #[arg(long)]
         apply: bool,
     },
+    /// Get the MDM's TLS certificate over DNS-01 with lego, renewed by a timer, and
+    /// start the proxy (as root).
+    Tls {
+        /// The kit's settings, KEY=VALUE lines.
+        #[arg(long)]
+        config: PathBuf,
+        /// Only ask GoDaddy's DNS API whether this account may use it (read only).
+        #[arg(long, conflicts_with = "apply")]
+        check_godaddy: bool,
+        /// Carry the plan out.
+        #[arg(long)]
+        apply: bool,
+    },
+    /// Give NanoHUB the APNs push certificate, and write the enrollment profile the
+    /// proxy serves (as root).
+    PushCert {
+        /// The kit's settings, KEY=VALUE lines.
+        #[arg(long)]
+        config: PathBuf,
+        /// The push certificate (PEM) from the Apple Push Certificates Portal.
+        #[arg(long, value_parser = HostPath::new, required_unless_present = "profile_only")]
+        cert: Option<HostPath>,
+        /// Its private key (PEM, unencrypted, mode 0600).
+        #[arg(long, value_parser = HostPath::new, required_unless_present = "profile_only")]
+        key: Option<HostPath>,
+        /// Write the profile only, for --topic or the recorded topic.
+        #[arg(long, conflicts_with_all = ["cert", "key"])]
+        profile_only: bool,
+        /// The push topic, com.apple.mgmt.External.<uuid> (with --profile-only).
+        #[arg(long, requires = "profile_only", value_parser = |s: &str| Topic::new(s).map_err(|e| e.to_string()))]
+        topic: Option<Topic>,
+        /// Carry the plan out.
+        #[arg(long)]
+        apply: bool,
+    },
+    /// Link NanoDEP to Apple Business Manager and give it the ADE profile (as root).
+    #[command(subcommand)]
+    Dep(DepVerb),
     /// Check that the MDM is up and exposed only as intended (read only; use sudo).
     Verify {
         /// The kit's settings, KEY=VALUE lines.
@@ -262,6 +316,77 @@ enum Mdm {
         #[arg(long)]
         via: Option<SocketAddr>,
     },
+    /// Write an erase request for one Mac and sign it with your security key, on your
+    /// own machine (as yourself, not root); check it as the gate will.
+    EraseRequest {
+        /// The Mac's serial number.
+        #[arg(long)]
+        serial: String,
+        /// Why, in plain words (the gate's alerts quote it).
+        #[arg(long)]
+        reason: String,
+        /// Hold the erase for this privileged lease instead of erasing now.
+        #[arg(long)]
+        lease: Option<String>,
+        /// The security key's key file (`ssh-keygen -f`), with KEY.pub beside it.
+        #[arg(long, value_parser = HostPath::new)]
+        key: HostPath,
+        /// Where the request goes; the signature goes to FILE.sig. Neither may exist.
+        #[arg(long, value_parser = HostPath::new)]
+        out: HostPath,
+        /// Minutes from now the gate may accept the request (1 to 60).
+        #[arg(long, default_value_t = 15)]
+        valid_for: u32,
+        /// The ssh-keygen to sign with (one with security key support).
+        #[arg(long, value_parser = HostPath::new, default_value = erase::SSH_KEYGEN)]
+        ssh_keygen: HostPath,
+        /// Sign: write the request and its signature.
+        #[arg(long)]
+        apply: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum DepVerb {
+    /// Have NanoDEP make its token key pair; write the certificate to upload in ABM.
+    GetCert {
+        #[command(flatten)]
+        with: DepArgs,
+        /// Where the certificate goes: absolute, outside every git work tree.
+        #[arg(long, value_parser = HostPath::new)]
+        out: HostPath,
+    },
+    /// Give NanoDEP the server token (.p7m) ABM made for that certificate.
+    UploadToken {
+        #[command(flatten)]
+        with: DepArgs,
+        /// The token: absolute, outside every git work tree.
+        #[arg(long, value_parser = HostPath::new)]
+        token: HostPath,
+    },
+    /// Define the ADE profile at Apple and make it the one new devices get.
+    DefineProfile {
+        #[command(flatten)]
+        with: DepArgs,
+    },
+    /// Assign the ADE profile to devices already in ABM.
+    Assign {
+        #[command(flatten)]
+        with: DepArgs,
+        /// A device's serial number (repeat for more).
+        #[arg(long, required = true, value_parser = Serial::new)]
+        serial: Vec<Serial>,
+    },
+}
+
+#[derive(Args)]
+struct DepArgs {
+    /// The kit's settings, KEY=VALUE lines.
+    #[arg(long)]
+    config: PathBuf,
+    /// Carry the plan out.
+    #[arg(long)]
+    apply: bool,
 }
 
 #[derive(Subcommand)]
@@ -522,6 +647,49 @@ fn mdm_kit<E: Exec>(m: Mdm, exec: &mut E, out: &mut dyn Write, err: &mut dyn Wri
                 (false, None) => Err(MdmError::NoBinDir),
             })
             .map(|()| true),
+        Mdm::Tls {
+            config,
+            check_godaddy,
+            apply,
+        } => MdmConfig::load(&config)
+            .map_err(MdmError::from)
+            .and_then(|c| {
+                if check_godaddy {
+                    let client = Client::system(VERIFY_TIMEOUT)?;
+                    return mdm::tls::check_godaddy(&*exec, &c, &client, None, out);
+                }
+                let acme = Acme::load(&config)?;
+                mdm::tls::run(exec, &c, &acme, mode(apply), out).map(|()| true)
+            }),
+        Mdm::PushCert {
+            config,
+            cert,
+            key,
+            profile_only: _,
+            topic,
+            apply,
+        } => MdmConfig::load(&config)
+            .map_err(MdmError::from)
+            .and_then(|config| {
+                let with = match (cert, key) {
+                    (Some(cert), Some(key)) => With::Pair { cert, key },
+                    _ => With::ProfileOnly(topic),
+                };
+                let a = PushCert { config, with };
+                push_cert::run(exec, &a, SystemTime::now(), mode(apply), out)
+            })
+            .map(|()| true),
+        Mdm::Dep(verb) => {
+            let (with, d) = match verb {
+                DepVerb::GetCert { with, out } => (with, Dep::GetCert { out }),
+                DepVerb::UploadToken { with, token } => (with, Dep::UploadToken { token }),
+                DepVerb::DefineProfile { with } => (with, Dep::DefineProfile),
+                DepVerb::Assign { with, serial } => (with, Dep::Assign { serials: serial }),
+            };
+            MdmConfig::load(&with.config)
+                .map_err(MdmError::from)
+                .and_then(|c| mdm::dep::run(exec, &c, &d, mode(with.apply), out))
+        }
         Mdm::Verify { config, via } => {
             MdmConfig::load(&config)
                 .map_err(MdmError::from)
@@ -536,6 +704,30 @@ fn mdm_kit<E: Exec>(m: Mdm, exec: &mut E, out: &mut dyn Write, err: &mut dyn Wri
                     mdm::verify::run(&*exec, &v, out)
                 })
         }
+        Mdm::EraseRequest {
+            serial,
+            reason,
+            lease,
+            key,
+            out: file,
+            valid_for,
+            ssh_keygen,
+            apply,
+        } => erase::random_nonce()
+            .and_then(|nonce| {
+                let a = EraseArgs {
+                    serial,
+                    lease,
+                    reason,
+                    key,
+                    out: file,
+                    valid_for,
+                    ssh_keygen,
+                };
+                let now = i64::try_from(stamp_secs()).unwrap_or(i64::MAX);
+                erase::run(exec, &a, Made { now, nonce }, mode(apply), out)
+            })
+            .map(|()| true),
     };
     match done {
         Ok(passed) => ExitCode::from(u8::from(!passed)),
@@ -659,10 +851,14 @@ fn host_verb(done: Result<(), HostError>, err: &mut dyn Write) -> ExitCode {
 /// The directory name `install-units --uninstall` moves the files into: seconds since
 /// the Unix epoch.
 fn stamp() -> String {
+    stamp_secs().to_string()
+}
+
+/// Seconds since the epoch, now.
+fn stamp_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())
-        .to_string()
 }
 
 fn mode(apply: bool) -> Mode {

@@ -5,8 +5,8 @@
 //! ```
 //!
 //! A stub. It prints its version for `--version` and refuses everything else with
-//! exit status 2, because no VM code exists yet. It is the binary the signing scripts
-//! sign with `com.apple.security.virtualization`, the one entitlement their allow list
+//! exit status 2, because no VM code exists yet. It is the binary `cargo xtask sign-darwin`
+//! signs with `com.apple.security.virtualization`, the one entitlement its allow list
 //! gives anything (tools/ci/darwin-entitlements.txt; design section 7).
 
 use std::process::ExitCode;

@@ -1,6 +1,8 @@
 // The pixel checker's selftest: PatternCheck against synthetic images, each one PNG
 // encoded and decoded the way a screenshot attachment is. Exits 1 if any case gets the
-// wrong verdict. Built and run by selftest.sh (macOS only: CoreGraphics and ImageIO).
+// wrong verdict. Built and run by
+// crates/kbf-driver-native/tests/xcuitest_sandbox.rs (macOS only: CoreGraphics and
+// ImageIO).
 
 import CoreGraphics
 import Foundation

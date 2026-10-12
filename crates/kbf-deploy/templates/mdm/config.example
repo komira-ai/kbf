@@ -1,11 +1,16 @@
 # kbf-deploy mdm: the settings of the MDM kit (`--config FILE`).
 #
 # Format: KEY=VALUE, one per line, no spaces around `=`, optional double quotes. A key
-# not listed here, or one given twice, is refused. Every key `mdm install` and
-# `mdm verify` read must be set; there are no defaults. Absolute paths only.
+# not listed here, or one given twice, is refused. Every key a verb reads must be
+# set (`mdm tls` alone reads the MDM_ACME_ keys); there are no defaults. Absolute
+# paths only.
 #
 # Put no secret in this file. `mdm install` makes the API keys and the SCEP challenge
-# into 0600 root files under MDM_ETC; the DNS API key goes in MDM_ETC/dns.env.
+# into 0600 root files under MDM_ETC; the DNS API key goes in MDM_ETC/dns.env, a
+# 0600 file of root's holding the variables lego reads for the provider:
+#   godaddy:    GODADDY_API_KEY=  GODADDY_API_SECRET=
+#   route53:    AWS_ACCESS_KEY_ID=  AWS_SECRET_ACCESS_KEY=  AWS_REGION=  AWS_HOSTED_ZONE_ID=
+#   cloudflare: CLOUDFLARE_DNS_API_TOKEN=
 
 # --- where the MDM answers ----------------------------------------------------
 # The name the Macs dial (a DNS A record pointing at MDM_BIND). The TLS
@@ -42,14 +47,23 @@ MDM_TASKS_MAX=256
 # --- Apple ----------------------------------------------------------------------
 # NanoDEP's name for the Apple Business Manager server token.
 MDM_DEP_NAME=example
-# The organisation in the SCEP CA's name.
+# The organisation in the SCEP CA's name, the enrollment profile and the ADE
+# profile.
 MDM_ORG=Example
+# The enrollment profile's identifier, reverse-DNS. A Mac keeps one profile per
+# identifier, so keep it once Macs are enrolled.
+MDM_PROFILE_ID=com.example.kbf-mdm
 
 # --- TLS: an ACME certificate over DNS-01 ---------------------------------------
 # The ACME account's contact address (expiry mail).
 MDM_ACME_EMAIL=
+# The ACME directory. For a first trial, a CA's staging directory (its certificates
+# are not trusted).
 MDM_ACME_SERVER=https://acme-v02.api.letsencrypt.org/directory
-# lego's DNS provider.
+# lego's DNS provider: godaddy, route53 or cloudflare. With route53 or cloudflare,
+# _acme-challenge.<MDM_DNS_NAME> is a CNAME into a zone that provider serves, and
+# lego follows it (`mdm tls --check-godaddy` says whether GoDaddy's API is open to
+# the account).
 MDM_ACME_DNS_PROVIDER=
 
 # --- the erase path -------------------------------------------------------------

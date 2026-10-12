@@ -16,20 +16,23 @@ does not prove what a farm Mac Studio does on its own macOS build, with FileVaul
 with nobody logged in, or with a fresh standard user. The last section lists what
 still needs a Studio.
 
-## How to run it
+## How it ran
 
-The probes live in `tools/spike/macos/`. The workflow is
-`.github/workflows/spike-macos.yml`; it runs by hand (`workflow_dispatch`) and on pull
-requests that change the probes. One job per runner label (`macos-26`, `macos-15`)
-runs every probe, each in its own step. A Linux job runs the probes' selftest first.
+The four probes below (`automation_mode.sh`, `simctl.sh`, `tcc.sh` and
+`volume_owner.sh`), the selftest (`tools/spike/macos/test/`), the shared helpers
+(`lib.sh`, `verdicts.sh`) and the `.github/workflows/spike-macos.yml` workflow were
+deleted once the verdicts below were recorded, so those file names are in the history
+only. To find the commit that deleted them, and so the tree to restore a probe from:
 
 ```sh
-gh workflow run spike-macos.yml --ref main
-gh run view <run id> --log | grep ' SPIKE '
-gh run download <run id>      # spike.txt and the simulator screenshot, per job
+git log --diff-filter=D --oneline -- .github/workflows/spike-macos.yml
 ```
 
-Each probe prints `SPIKE macos-<arch>.<probe>.<arm>=<value>` lines (the `macos-`
+The workflow ran by hand (`workflow_dispatch`) and on pull requests that changed the
+probes. One job per runner label (`macos-26`, `macos-15`) ran every probe, each in
+its own step. A Linux job ran the probes' selftest first.
+
+Each probe printed `SPIKE macos-<arch>.<probe>.<arm>=<value>` lines (the `macos-`
 prefix keeps them apart from the Linux spike's `<arch>.<key>` lines), one `context`
 line (macOS and Xcode builds, user kind, launchd domain, console user) and one
 `verdict`:
@@ -38,9 +41,9 @@ line (macOS and Xcode builds, user kind, launchd domain, console user) and one
 - **FAIL**: the mechanics did not work; the reason follows;
 - **BROKEN**: the control arm did not go red, so the probe proved nothing.
 
-Each arm runs in a subshell, so one failed arm is recorded as
-`<arm>.status=ERROR(<rc>)` and does not hide the others. The job's last step
-(`verdicts.sh`) fails the job on a BROKEN verdict or a missing one, never on a FAIL,
+Each arm ran in a subshell, so one failed arm was recorded as
+`<arm>.status=ERROR(<rc>)` and did not hide the others. The job's last step
+(`verdicts.sh`) failed the job on a BROKEN verdict or a missing one, never on a FAIL,
 which is a result.
 
 ## The probes
@@ -52,15 +55,15 @@ which is a result.
 | `volume_owner.sh` (VM probe P0 of [macos-vm-guests.md](../design/macos-vm-guests.md#11-probes-later-prs-must-run)) | a fresh standard user, added with `sysadminctl -addUser`, runs (through `sudo -n -H -u`) `hdiutil create` of a 64 MiB APFS image, `hdiutil attach -owners on` (its mount line recorded), two copies of a small plist into it, `chown 0:0` on the first (status and text recorded) while the second (the keep file) stays at the user's uid, a read of the owner this first attach shows, and a detach; then root re-attaches the image read-only with `-owners on` and reads both owners. The verdict follows that re-attach, not the first attach's view. The writer's uid and groups are read through the same `sudo -u` the writes use; then the scratch directory is deleted, and the user too, but only if this run's creation marker (the uid `sysadminctl` gave it) is there and the name still has that uid. If the probe user exists before the probe, the probe does not start: it may be a real account, so the probe runs no `sysadminctl` or `hdiutil`, leaves the user and says BROKEN | the same create, attach, copy, chown and detach as root, and the same re-attach read, must give uid 0; the user's keep file must read back as the user's uid, so the re-attach is shown able to read a non-root owner too (macOS reports a `noowners` volume's files as owned by the reader, which for root is `0:0`); and both re-attaches must be in the mount table without `noowners`. A writer that is admin or root is BROKEN too: the probe would not be asking about a fresh standard user |
 | `tcc.sh` (instrument for the Screen Recording and Accessibility questions) | SIP status; the ScreenCapture, Accessibility, ListenEvent and PostEvent rows of the system and the user TCC database, each read as the runner user and as root | the same reader over a planted database must return exactly its one known row |
 
-The status text of `automationmodetool` is parsed, case-insensitively, as two fields:
+The status text of `automationmodetool` was parsed, case-insensitively, as two fields:
 `enabled` (on, off) and `auth` (required, not required), matching the wording the
-hosted runners printed (Results). Every reading also records the raw text, and text
-the parser does not recognise reads as `unknown`, which never triggers enable and
-gives a FAIL. Every `automationmodetool` and `sysadminctl` call runs under the
-watchdog with stdin closed; the quick local reads (`id`, the context line) do not.
+hosted runners printed (Results). Every reading also recorded the raw text, and text
+the parser did not recognise read as `unknown`, which never triggered enable and
+gave a FAIL. Every `automationmodetool` and `sysadminctl` call ran under the
+watchdog with stdin closed; the quick local reads (`id`, the context line) did not.
 
-The selftest (`tools/spike/macos/test/run.sh`) drives each probe against fakes of the
-macOS programs. `test/mutants.sh` plants defects that each must turn a test red,
+The selftest (`tools/spike/macos/test/run.sh`) drove each probe against fakes of the
+macOS programs. `test/mutants.sh` planted defects that each had to turn a test red,
 among them: an arm run outside its subshell; a watchdog that leaves the command on
 the caller's pipe; `sysadminctl` run without the watchdog; the key without the `macos-` prefix; a
 watchdog that reports a hang as success; a status parser that accepts any "require"
@@ -163,58 +166,77 @@ way. Those variants were not run.
 
 ## XCUITest under the native driver's sandbox
 
-The probe `tools/spike/macos/xcuitest_sandbox.sh` runs the XCUITest fixtures
-(`tools/spike/macos/fixtures`, three UI tests each for a macOS app and an iOS app on a
-simulator) as the native driver runs an action that asks for the network. The job is
-`xcuitest-sandbox` in `.github/workflows/spike-xcuitest.yml` (`macos-15`). The profile
-is not a copy: the driver's example `action_sandbox`
-(`crates/kbf-driver-native/examples/action_sandbox.rs`) writes the profile
-`Isolation::wrap` builds, `BASE_PROFILE`, then `NO_DEVICE_RULES`, then the rules for
-the runner user's temporary folder, and prints its SHA-256. Each run gets a lease directory of its own,
-whose `root` (the input root) gets a copy of the fixtures, so the projects Xcode opens
-and writes into are inside the lease, as an action's sources are. It runs in that
-`root`, with stdin from `/dev/null` and only the lease's variables (`HOME`, `TMPDIR`,
-`XDG_CACHE_HOME`, `CLANG_MODULE_CACHE_PATH`) and `PATH=/usr/bin:/bin:/usr/sbin:/sbin`,
-as the driver runs an action whose Command sets only `PATH`.
+The test `crates/kbf-driver-native/tests/xcuitest_sandbox.rs` runs the XCUITest
+fixtures (`tools/spike/macos/fixtures`, three UI tests each for a macOS app and an iOS
+app on a simulator) as the native driver runs an action that asks for the network. The
+job is `xcuitest-sandbox` in `.github/workflows/spike-xcuitest.yml` (`macos-15`), which
+runs the test's `#[ignore]`d tests. The profile is not a copy: the test calls the
+driver's `Isolation::wrap`, which builds `BASE_PROFILE`, then `NO_DEVICE_RULES`, then
+the rules for the runner user's temporary folder (`UserFolders::rules`). Each run gets
+a lease directory of its own (`kbf_driver_native::home` makes its home, temporary and
+cache directories), whose `root` (the input root) gets a copy of the fixtures, so the
+projects Xcode opens and writes into are inside the lease, as an action's sources
+are. The run is `xcodebuild` itself, in that `root`, with stdin from `/dev/null`,
+only the lease's variables (`HOME`, `TMPDIR`, `XDG_CACHE_HOME`,
+`CLANG_MODULE_CACHE_PATH`) and `PATH=/usr/bin:/bin:/usr/sbin:/sbin`, leading its own
+process group, as the driver runs an action whose Command sets only `PATH`. The
+simulator is chosen (`simctl`) and the bundle checked (`xcresulttool`) by the test,
+outside the sandbox: that is the test's work, not the action's. Each driver arm's
+testing run is followed by the step an action would take next, `xcrun xcresulttool get
+test-results` on its own bundle under the same profile, whose processes and deny lines
+count as the arm's: under the profile `xcresulttool` cannot write its temporary file
+(Results).
 
 | Arm | What runs | Must |
 |---|---|---|
-| `deny_default` | `run.sh macos` under `(version 1)(deny default)`, through the same code that applies the driver's profile | fail, with at least one deny line from its processes, or the verdict is BROKEN (no profile applied, or a log reader that sees nothing) |
-| `driver.macos`, `driver.ios` | `run.sh` (`xcodebuild test`: build and test) under the driver's profile | hand `sandbox-exec` a profile whose SHA-256 is the one `action_sandbox` printed, or BROKEN; PASS or FAIL is the result |
-| `driver_tests.macos`, `driver_tests.ios` | `run.sh ... build-for-testing` without a sandbox, then `run.sh ... test-without-building` under the driver's profile in the same lease: what the UI tests need past the build | the unsandboxed build passes, or BROKEN; then as `driver.*` |
-| `control.macos`, `control.ios` | `run.sh` the same way, no sandbox | pass (three tests passed, three screenshots kept), or BROKEN |
+| `deny_default` | `xcodebuild test` of the macOS fixture under `(version 1)(deny default)`, handed to `sandbox-exec` the way the driver's profile is | be refused: `sandbox-exec` reports `execvp() of '/usr/bin/xcodebuild' failed: Operation not permitted`, or the test is red as BROKEN (no profile applied). Its deny lines are printed, not checked |
+| `driver.macos`, `driver.ios` | `xcodebuild test` (build and test) under the driver's profile | see below |
+| `driver_tests.macos`, `driver_tests.ios` | `xcodebuild build-for-testing` without a sandbox, then `test-without-building` under the driver's profile in the same lease: what the UI tests need past the build | the unsandboxed build passes, or BROKEN; then as `driver.*` |
+| `control.macos`, `control.ios` | `xcodebuild test`, no sandbox | pass (three tests passed, three screenshots kept), or BROKEN |
 
-Deny lines: while a run lasts the probe samples the process table every 0.2 s; the
-run's processes are its root and every process seen with a parent among them (one that
-starts and ends between two samples is missed). After the run, `log show` reads the
-sandbox's reports (sender `Sandbox`) for the run's time window. Those from the run's
-processes are recorded: a count, a count per operation, and each distinct
-(process, operation, target), the first 40 as `SPIKE` lines and all of them in
-`<arm>-denies.txt` (uploaded). Reports from other processes in the window are only
-counted. The profile allows every mach and XPC lookup but those `NO_DEVICE_RULES`
-denies (the device services), so a run names no other mach-lookup; which names a UI
-test looks up is not measured here.
+A run passes when `xcodebuild` exits 0 and its bundle holds exactly the three tests,
+each passed, and their three screenshots (`tests/support/xcode_fixture.rs`).
 
-A driver arm passes when `xcodebuild` exits 0 under the profile and the bundle it left
-passes `run.sh ... report`, run afterwards without a sandbox: reading the bundle
-(`xcresulttool`) is the probe's work, not the action's, and under the profile
-`xcresulttool` cannot write its temporary file (Results). run.sh's own result inside
-the sandbox is recorded as `<arm>.in_sandbox`.
+Deny lines: while a run lasts the test samples the process table every 0.2 s with the
+driver's own `procs::Tracker`; the run's processes are its root and every process seen
+descending from it (one that starts and ends between two samples is missed). After the
+run, `log show` reads the sandbox's reports (sender `Sandbox`) for the run's time
+window, again every 2 s for up to 60 s until the expected lines show. Those from the
+run's processes are checked, and written to `<arm>-denies.txt` (uploaded); reports
+from other processes in the window are only counted. The profile allows every mach and
+XPC lookup but those `NO_DEVICE_RULES` denies (the device services), so a run names no
+other mach-lookup; which names a UI test looks up is not measured here.
 
-The verdict is BROKEN when a control does not hold, FAIL when a fixture run fails
-under the driver's profile, and PASS when every one passes there. The selftest (`test/run.sh`, the
-`t_xs_*` tests, against a fake generator, a fake `run.sh` and fakes of `sandbox-exec`
-and `log`) and `test/mutants.sh` cover the verdict: among the mutants are a verdict
-that ignores the unsandboxed controls, a run that falls back to no sandbox, driver
-runs handed a copy of `BASE_PROFILE` instead of the generated profile, a digest check
-that accepts a mismatch or no digest, a verdict that ignores a `(deny default)` run
-that passed or showed no deny line, deny lines counted from every process, a process
-tree without the run's children, runs without the lease's variables, runs of the
-checkout's fixtures instead of the lease's copy, test-only arms that build under the
-sandbox, a verdict that ignores the test-only arms or their unsandboxed build, and a
-driver arm judged by run.sh's checks inside the sandbox or by the report alone.
+What the driver arms must show, from the results below:
+- `driver.ios` and `driver_tests.ios` pass;
+- `driver.macos` and `driver_tests.macos` do not pass, and `xcodebuild` reports that
+  the sandbox profile is missing `(allow lsopen)` (Launch Services error -54);
+- every driver arm shows a `job-creation` deny, a `user-preference-write` deny, the
+  `CoreDeviceService` lookup and the `usbmuxd` connect denied, and no `T/swbuild.tmp.*`
+  deny;
+- in the iOS arms, the `xcresulttool` step reports that it may not save its file in
+  the folder `T` (a write into the temporary folder outside the names the profile
+  opens there).
+
+Where a tool reports a refusal itself, the test reads that report rather than the
+log: one run of the test missed the single deny line of `deny_default` within the
+wait, so a check on one line alone could flake. Each of the four deny lines every driver arm must
+show was there in every driver arm of four earlier runs (16 of 16) and of this test's
+first run; the `CoreDeviceService` and `usbmuxd` lines once per arm, so those two rest
+on the log alone.
+
+So a profile without `(deny lsopen)`, without `NO_DEVICE_RULES`, or with the user
+folder rules widened to the whole temporary folder turns this test red. The parsers
+(the log line, the simulator list, the test results, the attachment manifest) have
+unit tests in the same binary, which the `native-macos` job runs.
 
 ### Results
+
+The results below were measured with the shell probe this test replaced
+(`tools/spike/macos/xcuitest_sandbox.sh`, deleted): the same arms in the same lease
+layout under the same profile bytes, with the sandboxed program a `run.sh` that ran
+`simctl` and then `xcodebuild` (so `deny_default` below refused `bash`), and the bundle
+read by `run.sh ... report` outside the sandbox.
 
 Run `38140794202` (commit `989bdd8`), job `xcuitest-sandbox` on `macos-15`
 (macOS 15.7.9, Xcode 16.4 16F6, the runner's admin user in its Aqua session), with the

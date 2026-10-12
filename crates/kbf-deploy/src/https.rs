@@ -24,6 +24,8 @@ use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
 pub const REDIRECTS: usize = 5;
 /// The most bytes of a status line and headers read.
 const HEAD_MAX: usize = 64 * 1024;
+/// The most bytes of a body [`read_reply`] keeps.
+const REPLY_MAX: usize = 1024 * 1024;
 
 /// An `https://` URL.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -120,6 +122,8 @@ pub enum HttpsError {
     Redirect { url: String, to: String },
     #[error("{url}: more than {REDIRECTS} redirects")]
     Redirects { url: String },
+    #[error("{url}: the answer's body is longer than {REPLY_MAX} bytes")]
+    TooLong { url: String },
 }
 
 /// What a `GET` was answered.
@@ -168,6 +172,18 @@ impl Client {
         addr: Option<SocketAddr>,
         body: &mut dyn Write,
     ) -> Result<Answer, HttpsError> {
+        self.get_with(url, addr, &[], body)
+    }
+
+    /// [`get`](Client::get) with `headers` added to the request (an API's key, say:
+    /// headers are never printed).
+    pub fn get_with(
+        &self,
+        url: &HttpsUrl,
+        addr: Option<SocketAddr>,
+        headers: &[(&str, &str)],
+        body: &mut dyn Write,
+    ) -> Result<Answer, HttpsError> {
         let io = |source| HttpsError::Io {
             url: url.to_string(),
             source,
@@ -188,11 +204,15 @@ impl Client {
             .map_err(io::Error::other)
             .map_err(io)?;
         let mut tls = StreamOwned::new(conn, tcp);
-        let request = format!(
-            "GET {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: kbf-deploy\r\nAccept: */*\r\nConnection: close\r\n\r\n",
+        let mut request = format!(
+            "GET {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: kbf-deploy\r\nAccept: */*\r\nConnection: close\r\n",
             url.path(),
             url.authority
         );
+        for (name, value) in headers {
+            request.push_str(&format!("{name}: {value}\r\n"));
+        }
+        request.push_str("\r\n");
         tls.write_all(request.as_bytes()).map_err(io)?;
         tls.flush().map_err(io)?;
         read_answer(url, BufReader::new(tls), body)
@@ -243,16 +263,79 @@ fn is_redirect(status: u16) -> bool {
     matches!(status, 301 | 302 | 303 | 307 | 308)
 }
 
-/// The status, headers and body of one answer from `r`.
+/// The status line and headers of one answer, as the body is read by.
+struct Head {
+    status: u16,
+    chunked: bool,
+    length: Option<u64>,
+    location: Option<String>,
+}
+
+/// The status, headers and body of one answer from `r`; only a 2xx body goes to `body`.
 fn read_answer<R: BufRead>(
-    url: &HttpsUrl,
+    url: &dyn fmt::Display,
     mut r: R,
     body: &mut dyn Write,
 ) -> Result<Answer, HttpsError> {
-    let io = |source| HttpsError::Io {
-        url: url.to_string(),
-        source,
+    let head = read_head(url, &mut r)?;
+    let mut dropped = io::sink();
+    let to: &mut dyn Write = if (200..300).contains(&head.status) {
+        body
+    } else {
+        &mut dropped
     };
+    read_body(url, &head, &mut r, to)?;
+    Ok(Answer {
+        status: head.status,
+        location: head.location,
+    })
+}
+
+/// The status of one answer from `r` and its body, whatever the status: an API's
+/// refusal says why in its body. A body longer than [`REPLY_MAX`] is an error, however
+/// it is framed.
+pub(crate) fn read_reply<R: BufRead>(
+    url: &dyn fmt::Display,
+    mut r: R,
+) -> Result<(u16, Vec<u8>), HttpsError> {
+    let head = read_head(url, &mut r)?;
+    let mut body = Capped {
+        bytes: Vec::new(),
+        over: false,
+    };
+    let got = read_body(url, &head, &mut r, &mut body);
+    if body.over {
+        return Err(HttpsError::TooLong {
+            url: url.to_string(),
+        });
+    }
+    got?;
+    Ok((head.status, body.bytes))
+}
+
+/// A body kept in memory that refuses to grow past [`REPLY_MAX`] and says it did.
+struct Capped {
+    bytes: Vec<u8>,
+    over: bool,
+}
+
+impl Write for Capped {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if self.bytes.len() + buf.len() > REPLY_MAX {
+            self.over = true;
+            return Err(io::Error::other("the body is too long"));
+        }
+        self.bytes.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn read_head<R: BufRead>(url: &dyn fmt::Display, r: &mut R) -> Result<Head, HttpsError> {
+    let io = io_error(url);
     let malformed = |reason: String| HttpsError::Malformed {
         url: url.to_string(),
         reason,
@@ -263,7 +346,7 @@ fn read_answer<R: BufRead>(
             .by_ref()
             .take(1 + (HEAD_MAX - head.len()) as u64)
             .read_until(b'\n', &mut head)
-            .map_err(io)?;
+            .map_err(&io)?;
         if n == 0 || head.len() > HEAD_MAX {
             return Err(malformed(
                 "the headers end early or are too long".to_owned(),
@@ -273,7 +356,6 @@ fn read_answer<R: BufRead>(
     let mut headers = [httparse::EMPTY_HEADER; 64];
     let mut parsed = httparse::Response::new(&mut headers);
     parsed.parse(&head).map_err(|e| malformed(e.to_string()))?;
-    let status = parsed.code.unwrap_or_default();
     let header = |name: &str| {
         parsed
             .headers
@@ -282,28 +364,49 @@ fn read_answer<R: BufRead>(
             .map(|h| String::from_utf8_lossy(h.value).trim().to_owned())
     };
     let chunked = header("transfer-encoding").is_some_and(|v| v.eq_ignore_ascii_case("chunked"));
-    let length = header("content-length");
-    let location = header("location");
-    let mut dropped = io::sink();
-    let to: &mut dyn Write = if (200..300).contains(&status) {
-        body
-    } else {
-        &mut dropped
+    let length = match header("content-length") {
+        Some(length) => Some(
+            length
+                .parse()
+                .map_err(|_| malformed(format!("Content-Length {length:?}")))?,
+        ),
+        None => None,
     };
-    if chunked {
-        read_chunked(&mut r, to).map_err(io)?;
-    } else if let Some(length) = length {
-        let n: u64 = length
-            .parse()
-            .map_err(|_| malformed(format!("Content-Length {length:?}")))?;
-        let copied = io::copy(&mut r.by_ref().take(n), to).map_err(io)?;
+    Ok(Head {
+        status: parsed.code.unwrap_or_default(),
+        chunked,
+        length,
+        location: header("location"),
+    })
+}
+
+/// The error of a failed read of an answer from `url`.
+fn io_error(url: &dyn fmt::Display) -> impl Fn(io::Error) -> HttpsError + '_ {
+    move |source| HttpsError::Io {
+        url: url.to_string(),
+        source,
+    }
+}
+
+/// The body after `head`: by its chunks, by its Content-Length, or to the end.
+fn read_body<R: BufRead>(
+    url: &dyn fmt::Display,
+    head: &Head,
+    r: &mut R,
+    to: &mut dyn Write,
+) -> Result<(), HttpsError> {
+    let io = io_error(url);
+    if head.chunked {
+        read_chunked(r, to).map_err(&io)?;
+    } else if let Some(n) = head.length {
+        let copied = io::copy(&mut r.by_ref().take(n), to).map_err(&io)?;
         if copied != n {
             return Err(io(io::Error::from(io::ErrorKind::UnexpectedEof)));
         }
     } else {
-        io::copy(&mut r, to).map_err(io)?;
+        io::copy(r, to).map_err(&io)?;
     }
-    Ok(Answer { status, location })
+    Ok(())
 }
 
 /// A `Transfer-Encoding: chunked` body: `<hex size>[;ext]\r\n<bytes>\r\n`, up to a size

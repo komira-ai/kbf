@@ -11,6 +11,11 @@ publish.workspace = true
 name = "kbf-mdm-gate"
 path = "src/main.rs"
 
+[features]
+# `testkit`: software security-key signatures, for other crates' tests (kbf-deploy's
+# `mdm erase-request`).
+testkit = []
+
 [dependencies]
 axum = { workspace = true, features = ["tokio"] }
 base64.workspace = true
