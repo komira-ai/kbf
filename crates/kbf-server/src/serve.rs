@@ -24,6 +24,7 @@ use crate::blobs::WorkerBlobs;
 use crate::farm::Farm;
 use crate::grpc_health::{HealthService, WATCH_INTERVAL};
 use crate::health::Readiness;
+use crate::http_blobs::BlobReaders;
 use crate::identity::{DenyList, Peers};
 use crate::token::ApiToken;
 use crate::worker::WorkerService;
@@ -234,7 +235,9 @@ where
 /// (`docs/reapi-auth.md`): its authenticator on every call of that listener, before
 /// routing, and its authorizers in the services. The worker listener, the operator
 /// API and the REAPI listener's `grpc.health.v1` service do not run it: a proxy's
-/// health check carries no credentials.
+/// health check carries no credentials. The one exception is the operator API's
+/// blob route ([`crate::http_blobs`]), which runs its authenticator and its
+/// `blobs.getAuthorizer`, and is off when the policy names no such authorizer.
 ///
 /// # Errors
 /// A listener cannot be bound, or a TLS configuration is refused (a key that does not
@@ -268,7 +271,11 @@ where
     let readiness = Arc::new(Readiness::default());
     let health_routes =
         crate::health::router(Arc::clone(&cache), Arc::clone(&readiness), probe_timeout);
-    let api_routes = crate::api::router(Arc::clone(&farm), token).merge(health_routes);
+    let blob_routes =
+        crate::http_blobs::router(Arc::clone(&cache), BlobReaders::from_policy(&policy));
+    let api_routes = crate::api::router(Arc::clone(&farm), token)
+        .merge(health_routes)
+        .merge(blob_routes);
     // Logged at every start, the first one too (issue #156).
     let (term, epoch) = (farm.term(), farm.lease_epoch());
     tracing::warn!(term, epoch, "{STATE_IN_MEMORY}");

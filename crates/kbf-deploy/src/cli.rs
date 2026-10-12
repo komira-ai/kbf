@@ -25,6 +25,8 @@
 //! kbf-deploy mdm verify --config FILE [--via ADDR:PORT]
 //! kbf-deploy envoy render --config FILE --out DIR
 //! kbf-deploy envoy check --config FILE [--dir DIR]
+//! kbf-deploy envoy apply --config FILE --kubectl PATH --kubeconfig PATH
+//!                        [--refuse-example FILE] [--apply]
 //! ```
 //!
 //! Bad flags exit 2 for every subcommand. The `minio` subcommands change a host: without
@@ -38,7 +40,11 @@
 //! refused (`REFUSED: ...` on stderr). `envoy render` only writes into the directory
 //! it is given, and exits 0 done or 2 refused (`REFUSED: ...` on stderr); `envoy check`
 //! only reads, and exits 0 every check passed, 1 a check failed (`FAIL <check>: ...` on
-//! stdout) or 2 refused.
+//! stdout) or 2 refused. `envoy apply` reads the cluster and has it validate the render in
+//! a dry run as in an apply, changes it only with `--apply`, and exits 0 done (or
+//! planned), 1 a step or the check after an apply failed (`FAIL ...` on stderr), or 2
+//! refused before any step (`REFUSED: ...` on stderr; a render check's `FAIL` lines on
+//! stdout).
 //! The `mdm` verbs exit as the `linux` host verbs do; `mdm verify` exits 1 when a check
 //! fails, `mdm dep assign` when Apple did not assign every device, and `mdm tls
 //! --check-godaddy` when the account may not use the API ([`crate::mdm`]).
@@ -51,7 +57,7 @@ use std::fs::{self, DirBuilder};
 use std::io::{self, Write};
 use std::net::SocketAddr;
 use std::os::unix::fs::DirBuilderExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -128,6 +134,27 @@ enum Envoy {
         /// The directory render wrote; without it, the render of --config is checked.
         #[arg(long)]
         dir: Option<PathBuf>,
+    },
+    /// Check the render and what the cluster must already hold, have the API server
+    /// validate the render, and with --apply apply it (server-side, field manager
+    /// kbf-front) and wait for Envoy and the Ingress's address.
+    Apply {
+        /// The kit's settings, KEY=VALUE lines.
+        #[arg(long)]
+        config: PathBuf,
+        /// kubectl, by absolute path.
+        #[arg(long, value_parser = HostPath::new)]
+        kubectl: HostPath,
+        /// A kubeconfig with the config's KBF_FRONT_KUBE_CONTEXT.
+        #[arg(long, value_parser = HostPath::new)]
+        kubeconfig: HostPath,
+        /// Settings whose context, tailnet and servers --config must not share (the
+        /// kit's own config.example); kbf's example when not given.
+        #[arg(long)]
+        refuse_example: Option<PathBuf>,
+        /// Apply for real.
+        #[arg(long)]
+        apply: bool,
     },
 }
 
@@ -442,7 +469,7 @@ pub fn run<E: Exec>(
         Kit::Minio(Minio::Nodeport(a)) => minio_nodeport(a, exec, out),
         Kit::Linux(l) => return linux_kit(l, exec, out, err),
         Kit::Mdm(m) => return mdm_kit(m, exec, out, err),
-        Kit::Envoy(e) => return envoy_kit(e, out, err),
+        Kit::Envoy(e) => return envoy_kit(e, exec, out, err),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -660,9 +687,44 @@ fn mdm_kit<E: Exec>(m: Mdm, exec: &mut E, out: &mut dyn Write, err: &mut dyn Wri
     }
 }
 
-/// The `envoy` kit: 0 done (or every check passed), 1 a check failed, 2 refused.
-fn envoy_kit(e: Envoy, out: &mut dyn Write, err: &mut dyn Write) -> ExitCode {
+/// The `envoy` kit: 0 done (or every check passed), 1 a check (or an apply's step)
+/// failed, 2 refused.
+fn envoy_kit<E: Exec>(
+    e: Envoy,
+    exec: &mut E,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> ExitCode {
     let done = match e {
+        Envoy::Apply {
+            config,
+            kubectl,
+            kubeconfig,
+            refuse_example,
+            apply,
+        } => {
+            let example = refuse_example.as_deref();
+            let done = envoy_apply(
+                &config,
+                kubectl,
+                kubeconfig,
+                example,
+                mode(apply),
+                exec,
+                out,
+            );
+            return match done {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) if e.exit_code() == 1 => {
+                    let _ = writeln!(err, "FAIL {e}");
+                    ExitCode::FAILURE
+                }
+                Err(e) => {
+                    let _ = writeln!(err, "REFUSED: {e}");
+                    ExitCode::from(2)
+                }
+            };
+        }
         Envoy::Render { config, out: dir } => envoy::render_files(&config, &dir),
         Envoy::Check { config, dir } => match envoy::check_files(&config, dir.as_deref()) {
             Ok(failures) if failures.is_empty() => Ok(envoy::check_passed()),
@@ -685,6 +747,30 @@ fn envoy_kit(e: Envoy, out: &mut dyn Write, err: &mut dyn Write) -> ExitCode {
             ExitCode::from(2)
         }
     }
+}
+
+/// `envoy apply`, with a private kubectl cache directory.
+fn envoy_apply<E: Exec>(
+    config: &Path,
+    kubectl: HostPath,
+    kubeconfig: HostPath,
+    example: Option<&Path>,
+    mode: Mode,
+    exec: &mut E,
+    mut out: &mut dyn Write,
+) -> Result<(), envoy::apply::ApplyError> {
+    let config = envoy::EnvoyConfig::load(config)?;
+    let example = envoy::apply::example(example)?;
+    let scratch = Scratch::new().map_err(envoy::apply::ApplyError::Scratch)?;
+    let args = envoy::apply::Apply {
+        config,
+        example,
+        kubectl,
+        kubeconfig,
+        cache_dir: scratch.path(),
+        wait: envoy::apply::Wait::DEFAULT,
+    };
+    envoy::apply::run(exec, &args, mode, &mut out)
 }
 
 /// A host-changing `linux` verb's exit: 0 done, 1 a step failed (or the check after
@@ -730,7 +816,7 @@ fn minio_buckets<E: Exec>(
         user: secret(env, "MINIO_ROOT_USER")?,
         password: secret(env, "MINIO_ROOT_PASSWORD")?,
     };
-    let scratch = Scratch::new()?;
+    let scratch = Scratch::new().map_err(MinioError::Scratch)?;
     let args = buckets::Buckets {
         endpoint: a.endpoint,
         buckets: a.bucket,
@@ -752,7 +838,7 @@ fn minio_nodeport<E: Exec>(
     exec: &mut E,
     mut out: &mut dyn Write,
 ) -> Result<(), MinioError> {
-    let scratch = Scratch::new()?;
+    let scratch = Scratch::new().map_err(MinioError::Scratch)?;
     let args = nodeport::NodePort {
         kubectl: a.kubectl,
         kubeconfig: a.kubeconfig,
@@ -782,13 +868,10 @@ struct Scratch(PathBuf);
 static SCRATCH: AtomicUsize = AtomicUsize::new(0);
 
 impl Scratch {
-    fn new() -> Result<Scratch, MinioError> {
+    fn new() -> io::Result<Scratch> {
         let n = SCRATCH.fetch_add(1, Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!("kbf-deploy.{}.{n}", std::process::id()));
-        DirBuilder::new()
-            .mode(0o700)
-            .create(&dir)
-            .map_err(MinioError::Scratch)?;
+        DirBuilder::new().mode(0o700).create(&dir)?;
         Ok(Scratch(dir))
     }
 

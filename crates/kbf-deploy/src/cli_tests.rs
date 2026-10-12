@@ -785,6 +785,120 @@ fn the_tls_push_cert_and_dep_verbs_reach_their_kit() {
     }
 }
 
+/// Catches `envoy apply` not wired to the kit or ignoring `--apply`, `--refuse-example`
+/// not read (kbf's example refused when it is not given), a failed address check not
+/// exiting 1 with a `FAIL` line, a refusal exiting other than 2, and kubectl's cache
+/// directory left behind. In-process, so the lib tests' instantiation of `run` covers
+/// the arm.
+#[test]
+fn envoy_apply_exits_0_done_1_failed_2_refused() {
+    let dir = kbf_host::testkit::scratch("cli-envoy-apply");
+    let example = include_str!("../templates/envoy/config.example");
+    let ours = example
+        .replace("=example-context", "=farm")
+        .replace("=tail0000.ts.net", "=tail1234.ts.net")
+        .replace("kbf-server-a.", "kbf-server-b.");
+    let (kbf_example, config) = (dir.join("kbf.example"), dir.join("config.local"));
+    std::fs::write(&kbf_example, example).expect("example");
+    std::fs::write(&config, &ours).expect("config");
+    let (kbf_example, config) = (
+        kbf_example.to_str().expect("utf-8").to_owned(),
+        config.to_str().expect("utf-8").to_owned(),
+    );
+    let cache_dirs = Rc::new(RefCell::new(Vec::new()));
+    let address = Rc::new(RefCell::new("kbf.tail1234.ts.net"));
+    let mut exec = FakeExec::new(501);
+    let (seen, at) = (Rc::clone(&cache_dirs), Rc::clone(&address));
+    exec.answer = Box::new(move |cmd| {
+        let args: Vec<&str> = cmd.args.iter().map(String::as_str).collect();
+        seen.borrow_mut().push(args[3].to_owned());
+        Ok(match &args[6..] {
+            ["-n", _, "get", "secret", _, "-o", _] => reply(0, "yes", ""),
+            ["diff", ..] => reply(1, "+ a change\n", ""),
+            [.., "ingress", "kbf", "-o", _] => reply(0, *at.borrow(), ""),
+            _ => reply(0, "", ""),
+        })
+    });
+    let base = [
+        "envoy",
+        "apply",
+        "--kubectl",
+        "/usr/local/bin/kubectl",
+        "--kubeconfig",
+        "/srv/admin/kubeconfig",
+        "--config",
+    ];
+    let with = |more: &[&str]| -> Vec<String> {
+        base.iter().chain(more).map(|s| (*s).to_owned()).collect()
+    };
+    let go = |exec: &mut FakeExec, args: Vec<String>| {
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        cli(exec, &no_env, &args)
+    };
+
+    let (code, out, err) = go(&mut exec, with(&[&config]));
+    assert_eq!((code, err.as_str()), (ExitCode::SUCCESS, ""), "{out}");
+    assert!(
+        out.ends_with("dry run: nothing changed. Re-run with --apply.\n"),
+        "{out}"
+    );
+    assert!(exec.log.is_empty(), "{:?}", exec.log);
+    let dirs = cache_dirs.borrow().clone();
+    assert!(
+        !dirs.is_empty() && dirs.iter().all(|d| *d == dirs[0]),
+        "{dirs:?}"
+    );
+    assert!(!Path::new(&dirs[0]).exists(), "{} left behind", dirs[0]);
+
+    let (code, out, err) = go(&mut exec, with(&[&config, "--apply"]));
+    assert_eq!((code, err.as_str()), (ExitCode::SUCCESS, ""), "{out}");
+    assert!(
+        out.ends_with("clients dial grpcs://kbf.tail1234.ts.net:443\n"),
+        "{out}"
+    );
+    assert_eq!(exec.log.len(), 2, "{:?}", exec.log);
+
+    *address.borrow_mut() = "kbf-1.tail1234.ts.net";
+    let (code, _, err) = go(&mut exec, with(&[&config, "--apply"]));
+    assert_eq!(code, ExitCode::FAILURE, "{err}");
+    assert!(
+        err.starts_with("FAIL the Ingress's address is kbf-1.tail1234.ts.net, "),
+        "{err}"
+    );
+
+    let refused = [
+        (
+            with(&[&kbf_example]),
+            "REFUSED: KBF_FRONT_KUBE_CONTEXT is still the example config's value: fill it in\n"
+                .to_owned(),
+        ),
+        (
+            with(&[&config, "--refuse-example", &config]),
+            "REFUSED: KBF_FRONT_KUBE_CONTEXT is still the example config's value: fill it in\n"
+                .to_owned(),
+        ),
+        (
+            with(&[&config, "--refuse-example", "/srv/absent"]),
+            "REFUSED: cannot read /srv/absent: ".to_owned(),
+        ),
+        (
+            with(&["/srv/absent"]),
+            "REFUSED: cannot read /srv/absent: ".to_owned(),
+        ),
+    ];
+    let before = exec.log.len();
+    for (args, want) in refused {
+        let (code, out, err) = go(&mut exec, args.clone());
+        assert_eq!(
+            (code, out.as_str()),
+            (ExitCode::from(2), ""),
+            "{args:?}: {err}"
+        );
+        assert!(err.starts_with(&want), "{args:?}: {err}");
+    }
+    assert_eq!(exec.log.len(), before, "a refusal applies nothing");
+}
+
 /// Catches `envoy check` checking the NetworkPolicy against a fixed operator
 /// namespace instead of the config's `KBF_TS_OPERATOR_NAMESPACE`: a config naming
 /// another namespace passes on its own render, and a render made for `tailscale`

@@ -40,7 +40,9 @@ fn only_the_listed_verbs_run() {
     let mac = FakeMac::new("verbs");
     for args in [
         &["daemon", "exec", "/bin/sh"][..],
-        &["role-user", "status"],
+        &["role-user"],
+        &["role-user", "delete"],
+        &["role-user status"],
         &["phase0"],
         &["phase0 status"],
         &["phase0", "Status"],
@@ -55,12 +57,21 @@ fn only_the_listed_verbs_run() {
 #[test]
 fn extra_arguments_are_refused() {
     let mac = FakeMac::new("extra");
-    for verb in ["status", "apply", "revert"] {
-        mac.run(&["phase0", verb, "extra"])
-            .refused_for(&format!("'phase0 {verb}' takes no arguments (got 1)"));
+    for verb in [
+        "phase0 status",
+        "phase0 apply",
+        "phase0 revert",
+        "role-user status",
+        "role-user create",
+    ] {
+        let mut args: Vec<&str> = verb.split(' ').collect();
+        args.push("extra");
+        mac.run(&args)
+            .refused_for(&format!("'{verb}' takes no arguments (got 1)"));
     }
     assert!(mac.calls().is_empty(), "{:?}", mac.calls());
     assert!(!mac.record().exists());
+    assert!(!mac.home().exists());
 }
 
 /// Catches: the verbs' names and which of them change the Mac drifting apart from
@@ -68,15 +79,30 @@ fn extra_arguments_are_refused() {
 #[test]
 fn only_status_runs_without_the_lock() {
     let parse = |words: &[&str]| Verb::parse(&words.iter().map(OsString::from).collect::<Vec<_>>());
-    let verbs = [Verb::Phase0Status, Verb::Phase0Apply, Verb::Phase0Revert];
+    let verbs = [
+        Verb::Phase0Status,
+        Verb::Phase0Apply,
+        Verb::Phase0Revert,
+        Verb::RoleUserStatus,
+        Verb::RoleUserCreate,
+    ];
     let names: Vec<String> = verbs.iter().map(ToString::to_string).collect();
-    assert_eq!(names, ["phase0 status", "phase0 apply", "phase0 revert"]);
+    assert_eq!(
+        names,
+        [
+            "phase0 status",
+            "phase0 apply",
+            "phase0 revert",
+            "role-user status",
+            "role-user create"
+        ]
+    );
     for (verb, name) in verbs.iter().zip(&names) {
         let words: Vec<&str> = name.split(' ').collect();
         assert_eq!(parse(&words), Ok(*verb));
     }
     let changes: Vec<bool> = verbs.iter().map(|verb| verb.changes()).collect();
-    assert_eq!(changes, [false, true, true]);
+    assert_eq!(changes, [false, true, true, false, true]);
 }
 
 /// Catches: the helper running for a caller that is not root (nothing is logged,
@@ -511,4 +537,30 @@ fn lstat_reports_errors_other_than_missing() {
     fs::write(&file, "").unwrap();
     assert_eq!(node_admin::lstat(&mac.root.join("missing")).unwrap(), None);
     assert!(node_admin::lstat(&file.join("below")).is_err());
+}
+
+/// Catches: temporary files a cut-short `role-user create` left in `/private/var/at`
+/// never being removed, or the sweep there running when that folder fails its check
+/// (a link would make root remove files wherever it points).
+#[test]
+fn stale_temporary_files_are_swept_from_a_checked_at_folder() {
+    let old = |dir: &std::path::Path| {
+        let path = dir.join(".incoming.old");
+        let file = File::create(&path).unwrap();
+        let now = std::time::UNIX_EPOCH + Duration::from_secs(NOW);
+        file.set_modified(now - Duration::from_secs(6000)).unwrap();
+        path
+    };
+    let mac = FakeMac::new("sweep-at");
+    let swept = old(&mac.at_dir());
+    mac.run(&["phase0", "status"]).succeeded();
+    assert!(!swept.exists());
+
+    let mac = FakeMac::new("sweep-at-link");
+    let elsewhere = mac.root.join("elsewhere");
+    fs::rename(mac.at_dir(), &elsewhere).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, mac.at_dir()).unwrap();
+    let kept = old(&elsewhere);
+    mac.run(&["phase0", "status"]).succeeded();
+    assert!(kept.exists(), "the sweep followed the link");
 }

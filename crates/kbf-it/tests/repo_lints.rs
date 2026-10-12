@@ -13,10 +13,11 @@
 //!   citation of an unpublished design document by its sections (the IETF numbers
 //!   pass) or a git conflict marker, and a file holding a NUL byte whose extension is
 //!   not on the binary allow list (rules in `kbf_it::hygiene`);
-//! - a shell, Python, awk, sed, Perl or Ruby file, a workflow `run:` step with shell
-//!   logic, or a production `sh -c` in `crates/*/src/` that `tools/interpreter_budget.tsv`
-//!   does not list (by path, never by size), and a row of that file that is stale,
-//!   repeated or malformed (rules in `interpreters/mod.rs`);
+//! - a workflow `run:` step with shell logic (no row can list one); a shell, Python,
+//!   awk, sed, Perl or Ruby file, or a production `sh -c` in `crates/*/src/`, that
+//!   `tools/interpreter_budget.tsv` does not list (by path, never by size); and a row
+//!   of that file that is stale, repeated, malformed or under `[workflow]` (rules in
+//!   `interpreters/mod.rs`);
 //! - the darwin-arm64 job of `.github/workflows/artifacts.yml` no longer running
 //!   `tools/ci/check-darwin-asset.sh` on the packaged binary after `Package`, or
 //!   running it where its failure does not fail the job;
@@ -218,8 +219,8 @@ fn text_files_carry_no_addresses_home_paths_design_citations_or_conflict_markers
 #[derive(Debug, Default)]
 struct BudgetScan {
     found: Vec<interpreters::Found>,
-    /// Files the scan could not clear: a workflow that does not parse, two logic
-    /// steps with one key, a Rust source that is not UTF-8 or does not parse.
+    /// What the scan refuses outright: a workflow that does not parse, a `run:` step
+    /// with shell logic, a Rust source that is not UTF-8 or does not parse.
     problems: Vec<String>,
     /// `run:` steps read, logic or not.
     run_steps: usize,
@@ -260,21 +261,12 @@ fn interpreter_scan(files: &[String], read: impl Fn(&str) -> Option<Vec<u8>>) ->
                 let Some(what) = interpreters::shell_logic(&s.script) else {
                     continue;
                 };
-                let key = format!("{f}#{}/{}", s.job, s.step);
-                if found
-                    .iter()
-                    .any(|x: &Found| x.section == Section::Workflow && x.key == key)
-                {
-                    problems.push(format!(
-                        "`{key}`: two steps share this key; name them apart"
-                    ));
-                    continue;
-                }
-                found.push(Found {
-                    section: Section::Workflow,
-                    key,
-                    why: format!("its `run:` script has {what}"),
-                });
+                problems.push(format!(
+                    "`{f}#{}/{}`: its `run:` script has {what}; a `run:` step is one \
+                     command, so put the logic in Rust (a `cargo xtask` verb, or a flag of \
+                     the program the step runs)",
+                    s.job, s.step
+                ));
             }
         }
         if interpreters::rust::is_crate_src(f) {
@@ -310,9 +302,10 @@ fn budget_problems(scan: BudgetScan, budget: &str) -> Vec<String> {
 fn every_interpreter_file_workflow_script_and_shell_spawn_is_in_the_budget() {
     // Catches: a new shell, Python, awk, sed, Perl or Ruby file (by extension or by
     // its `#!` line); a row left for a file that is gone; a new workflow `run:` step
-    // with shell logic; a new `sh -c` in production Rust; a malformed or duplicate row
-    // (module `interpreters`); and the scan passing because it read no workflow steps
-    // or no Rust sources. Sizes are not checked: an edit of a listed file passes.
+    // with shell logic, or any `[workflow]` row; a new `sh -c` in production Rust; a
+    // malformed or duplicate row (module `interpreters`); and the scan passing because
+    // it read no workflow steps or no Rust sources. Sizes are not checked: an edit of a
+    // listed file passes.
     let root = repo_root();
     let files = listed_files(&root);
     let scan = interpreter_scan(&files, |f| read_bytes(&root.join(f)));
@@ -344,15 +337,16 @@ mod budget {
     use std::collections::BTreeMap;
 
     const CI: &str = ".github/workflows/ci.yml";
-    const WORKFLOW: &str = "on: push\njobs:\n  test:\n    steps:\n      - run: cargo test --locked\n      - name: Probe\n        run: |\n          uname -m\n          nproc\n";
-    const ACTION: &str = "runs:\n  using: composite\n  steps:\n    - run: a && b\n";
+    const WORKFLOW: &str = "on: push\njobs:\n  test:\n    steps:\n      - run: cargo test --locked\n      - name: Probe\n        run: uname -m\n";
+    const ACTION: &str = "runs:\n  using: composite\n  steps:\n    - run: cargo xtask fetch\n";
     const KEEPER: &str = "crates/k/src/keeper.rs";
     const KEEPER_RS: &str =
         r#"pub fn watch() { std::process::Command::new("/bin/sh").args(["-c", "x"]); }"#;
     const BUDGET: &str = "[files]\ntools/ci/x.sh\tCI\ntools/probe\tprobe\n\
-                          [workflow]\n.github/workflows/ci.yml#test/Probe\tfacts\n\
-                          .github/actions/a/action.yml#runs/step 1\tchain\n\
                           [src-sh-c]\ncrates/k/src/keeper.rs\tkeeper\n";
+    /// The end of the refusal of a `run:` step with shell logic.
+    const ONE_COMMAND: &str = "; a `run:` step is one command, so put the logic in Rust (a \
+                               `cargo xtask` verb, or a flag of the program the step runs)";
 
     /// The control tree: one row-matching thing of each kind, plus files the scan
     /// must leave alone.
@@ -409,12 +403,13 @@ mod budget {
     }
 
     #[test]
-    fn an_edit_of_a_listed_file_step_or_spawn_passes() {
-        // Catches: the list tied to sizes again, so editing a listed script, a listed
-        // `run:` step or a listed keeper would make the pull request touch the list.
-        // The first edit grows each listed thing (a second shell for the keeper), the
-        // second shrinks the script; neither adds anything unlisted.
-        let step = WORKFLOW.replace("nproc\n", "nproc\n          sw_vers\n");
+    fn an_edit_of_a_listed_file_or_spawn_or_a_one_command_step_passes() {
+        // Catches: the list tied to sizes again, so editing a listed script or a listed
+        // keeper would make the pull request touch the list, and a one-command `run:`
+        // step refused once its command changes. The first edit grows each listed
+        // thing (a second shell for the keeper), the second shrinks the script;
+        // neither adds anything unlisted.
+        let step = WORKFLOW.replace("uname -m", "uname -a");
         let keeper = format!("{KEEPER_RS}\nfn again() {{ g(\"/bin/bash\", \"-c\") }}\n");
         for script in ["#!/bin/sh\necho\necho\necho\n", "#!/bin/sh\n"] {
             let mut t = tree();
@@ -441,34 +436,53 @@ mod budget {
     }
 
     #[test]
-    fn an_unlisted_multi_line_run_step_is_refused() {
-        // Catches (planted defect): a new `run: |` block with no [workflow] row, and
-        // a one-line command (the first step) refused.
+    fn a_run_step_with_shell_logic_is_refused() {
+        // Catches (planted defect): a new `run: |` block, and a second step named like
+        // the one-command `Probe` that chains with `&&` (each refused on its own, so
+        // a name shared with a clean step hides nothing), in a workflow and in a
+        // composite action; and a one-line command (the first step) refused.
         let mut t = tree();
-        let planted = format!("{WORKFLOW}      - run: |\n          a\n          b\n");
+        let planted = format!(
+            "{WORKFLOW}      - run: |\n          a\n          b\n      - name: Probe\n        run: a && b\n"
+        );
         t.insert(CI.to_owned(), planted.into_bytes());
-        let p = problems(&t, BUDGET);
-        assert_eq!(p.len(), 1, "{p:?}");
-        assert!(
-            p[0].starts_with(
-                "`.github/workflows/ci.yml#test/step 3`: its `run:` script has more than one line"
-            ),
-            "{p:?}"
+        let action = format!("{ACTION}    - run: a; b\n");
+        t.insert(
+            ".github/actions/a/action.yml".to_owned(),
+            action.into_bytes(),
+        );
+        assert_eq!(
+            problems(&t, BUDGET),
+            [
+                "`.github/actions/a/action.yml#runs/step 2`: its `run:` script has `;`",
+                "`.github/workflows/ci.yml#test/step 3`: its `run:` script has more than one line",
+                "`.github/workflows/ci.yml#test/Probe`: its `run:` script has `&&`",
+            ]
+            .map(|p| format!("{p}{ONE_COMMAND}"))
         );
     }
 
     #[test]
-    fn two_logic_steps_with_one_key_are_refused() {
-        // Catches: a second step of the same name in one job cleared by the first
-        // step's row, so its script is never counted.
+    fn a_workflow_row_cannot_clear_a_run_step() {
+        // Catches (planted defect): a `run: |` block listed under a `[workflow]`
+        // section, the way the budget once allowed, and a `[workflow]` row left
+        // behind. The section stays empty: the step is refused all the same, and so is
+        // its row.
         let mut t = tree();
-        let planted = format!("{WORKFLOW}      - name: Probe\n        run: a && b\n");
+        let planted = format!("{WORKFLOW}      - run: |\n          a\n          b\n");
         t.insert(CI.to_owned(), planted.into_bytes());
+        let budget = format!("{BUDGET}[workflow]\n{CI}#test/step 3\tlisted\n");
         assert_eq!(
-            problems(&t, BUDGET),
-            vec![
-                "`.github/workflows/ci.yml#test/Probe`: two steps share this key; name them apart"
-                    .to_owned()
+            problems(&t, &budget),
+            [
+                format!(
+                    "`{CI}#test/step 3`: its `run:` script has more than one line{ONE_COMMAND}"
+                ),
+                format!(
+                    "line 7: a [workflow] row for `{CI}#test/step 3`; the section stays \
+                     empty, because no `run:` step may hold shell logic: make the step one \
+                     command and remove the row"
+                ),
             ]
         );
     }

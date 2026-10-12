@@ -64,18 +64,10 @@ jobs:
         run: cargo xtask fetch --url "https://github.com/facebook/buck2/releases/download/$BUCK2_VERSION/buck2-x86_64-unknown-linux-gnu.zst" --sha256 "$BUCK2_SHA256" --out "$RUNNER_TEMP/tools/buck2" --extract zst
       - run: $RUNNER_TEMP/tools/bazel --version
       - run: $RUNNER_TEMP/tools/buck2 --version
-      - name: Wait for MinIO
-        run: |
-          for _ in $(seq 60); do
-            curl -s -o /dev/null http://127.0.0.1:9000/ && exit 0
-            sleep 1
-          done
-          exit 1
+      - name: Wait for MinIO, then run the store conformance suite on it
+        run: cargo run -p kbf-objstore --example s3_conformance --locked -- --endpoint http://127.0.0.1:9000 --bucket kbf-m1-conformance --create-bucket --conditional-put --wait-ready 60
       - name: M1 cell, Bazel and buck2 twice each
-        run: |
-          crates/kbf-it/m1/run.sh --bin-dir target/debug --work "$RUNNER_TEMP/m1" \
-            --s3-endpoint http://127.0.0.1:9000 --s3-bucket kbf-m1 \
-            --bazel "$RUNNER_TEMP/tools/bazel" --buck2 "$RUNNER_TEMP/tools/buck2"
+        run: crates/kbf-it/m1/run.sh --bin-dir target/debug --work "$RUNNER_TEMP/m1" --s3-endpoint http://127.0.0.1:9000 --s3-bucket kbf-m1 --bazel "$RUNNER_TEMP/tools/bazel" --buck2 "$RUNNER_TEMP/tools/buck2"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: ${{ !cancelled() }}
         with:

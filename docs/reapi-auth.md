@@ -78,7 +78,8 @@ an error, not an allow.
 ```
 
 `authenticationPolicy` is required (as in Buildbarn, where a missing policy is an
-error). Every authorizer key is optional and defaults to `allow`.
+error). Every authorizer key is optional and defaults to `allow`, except
+`blobs.getAuthorizer` (below), which defaults to off.
 
 ## Authentication policies
 
@@ -122,6 +123,7 @@ replaces the earlier one when it has one. An `all` needs at least one policy.
 | `actionCache.getAuthorizer` | GetActionResult |
 | `executeAuthorizer` | Execute, and WaitExecution against the instance name the operation was submitted under |
 | none | UpdateActionResult: always PERMISSION_DENIED |
+| `blobs.getAuthorizer` | not a REAPI call: `GET /v1/blobs/{digest}` on the operator API listener ([api.md](api.md#get-v1blobsdigest)), asked with its `instance` parameter |
 
 Each call is authorized against its request's instance name: `instance_name` in the
 REAPI messages; for ByteStream, every segment of the resource name before `blobs/`
@@ -147,6 +149,16 @@ which calls are served, but a caller allowed on `x` can read a blob uploaded und
 `y` if it knows the digest. Execute does use the instance name: identical actions
 share one run only within one instance.
 
+**`blobs.getAuthorizer` is off when absent.** `{"blobs": {"getAuthorizer": {...}}}`
+turns on `GET /v1/blobs/{digest}` on the operator API listener (`--api-listen`), the
+route a build's page links its outputs, stdout and stderr to. A request runs this
+file's `authenticationPolicy` (an HTTP request has the headers an authenticator reads),
+then this authorizer with the request's `instance` parameter. These bytes can hold
+secrets, so a missing key does not allow, as every other slot does: without the key, or
+without a policy file, the route answers `404` and the start line says ` blobs=off`.
+A `blobs` object without `getAuthorizer` is refused, so a file that seems to turn the
+route on never leaves it off unnoticed.
+
 ## Where kbf differs from Buildbarn
 
 - **`actionCache.putAuthorizer` is refused.** Clients never write the action cache;
@@ -156,6 +168,7 @@ share one run only within one instance.
   under `contentAddressableStorage` and `actionCache`; Buildbarn spreads them over
   its per-store and scheduler configurations.
 - **`capabilitiesAuthorizer` is its own key.**
+- **`blobs.getAuthorizer` is kbf's own,** for its HTTP blob route; Buildbarn has none.
 - **QueryWriteStatus, SpliceBlob and RegisterChunkMapping count as writes**, and
   SplitBlob and GetChunkMapping as reads.
 - **An `all` with no policies is refused** rather than accepted.

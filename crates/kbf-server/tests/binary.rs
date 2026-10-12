@@ -797,3 +797,46 @@ fn the_finished_retention_comes_from_its_flag() {
         Duration::from_secs(600)
     );
 }
+
+/// One GET of `path` on `api`; the response.
+#[cfg(unix)]
+fn get(api: SocketAddr, path: &str) -> String {
+    let mut stream = std::net::TcpStream::connect(api).expect("connect to the API");
+    let request = format!("GET {path} HTTP/1.1\r\nHost: kbf\r\nConnection: close\r\n\r\n");
+    stream.write_all(request.as_bytes()).expect("send");
+    let mut response = String::new();
+    stream.read_to_string(&mut response).expect("read");
+    response
+}
+
+/// Catches: a start line that does not say whether `GET /v1/blobs` answers (or says
+/// `on` when it is off), and a policy's `blobs.getAuthorizer` read by the binary but
+/// not given to the route, or the route on without one (the empty blob, which every
+/// cache holds, is read: `200` only with the key).
+#[cfg(unix)]
+#[test]
+fn the_start_line_says_whether_blob_reads_are_on() {
+    const EMPTY: &str =
+        "/v1/blobs/e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855-0";
+    let named =
+        r#"{"authenticationPolicy": {"allow": {}}, "blobs": {"getAuthorizer": {"allow": {}}}}"#;
+    let unnamed = r#"{"authenticationPolicy": {"allow": {}}}"#;
+    let named = token_file("blobs-policy", named, 0o600);
+    let unnamed = token_file("no-blobs-policy", unnamed, 0o600);
+    for (policy, on) in [(None, false), (Some(&unnamed), false), (Some(&named), true)] {
+        let mut c = server(&["--api-listen", "127.0.0.1:0"]);
+        if let Some(policy) = policy {
+            c.arg("--reapi-auth-policy").arg(policy);
+        }
+        c.args(ANY_PORT);
+        let (child, line, _) = started(c);
+        let (head, api) = line.rsplit_once(" api=").expect("an API address");
+        let want = if on { " blobs=on" } else { " blobs=off" };
+        assert!(head.ends_with(want), "{policy:?}: {line}");
+        let api: SocketAddr = api.parse().expect("an address");
+        let answer = get(api, EMPTY);
+        let code = if on { "HTTP/1.1 200" } else { "HTTP/1.1 404" };
+        assert!(answer.starts_with(code), "{policy:?}: {answer}");
+        interrupt(child);
+    }
+}

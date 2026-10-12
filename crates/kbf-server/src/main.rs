@@ -3,8 +3,9 @@
 //!
 //! On start it prints one line, `kbf-server <version> reapi=<addr> worker=<addr>`, with
 //! its version (`<package version>+<commit>`, [`kbf_server::SERVER_VERSION`]) and
-//! the addresses it bound (a port of 0 picks a free one), and ` api=<addr>` at its end
-//! when the operator API listens, then ` log=<id>` under `--meta-log=raft`, the id of
+//! the addresses it bound (a port of 0 picks a free one), and ` blobs=<on|off>
+//! api=<addr>` at its end when the operator API listens (`blobs=on` when the REAPI
+//! policy names `blobs.getAuthorizer`, so `GET /v1/blobs` answers), then ` log=<id>` under `--meta-log=raft`, the id of
 //! the log in `--raft-dir` (16 hex digits), then
 //! ` warning=plaintext-off-loopback:<listeners>` at its very end when a listener serves
 //! plain text on an address that is not loopback (`<listeners>` is `reapi`, `worker`
@@ -85,6 +86,7 @@ async fn run<M: MetaLog, O: ObjectStore + 'static>(
 ) -> Result<(), Box<dyn Error>> {
     let listeners = args.listeners()?;
     let policy = args.reapi_auth_policy()?;
+    let blobs = policy.blobs_get.is_some();
     let cache = Arc::new(Cache::open(meta, store, prefix).await?);
     let shutdown = interrupted()?;
     let api = args.api()?;
@@ -92,23 +94,27 @@ async fn run<M: MetaLog, O: ObjectStore + 'static>(
     let plain = args.plain_text_off_loopback();
     println!(
         "{}",
-        start_line(bound.reapi, bound.worker, bound.api, log, &plain)
+        start_line(bound.reapi, bound.worker, bound.api, blobs, log, &plain)
     );
     bound.serving.await?;
     Ok(())
 }
 
-/// The start line: the version, the addresses bound and the Raft log's id, and one
-/// warning naming the listeners in `plain` (those serving plain text off loopback)
-/// when there are any.
+/// The start line: the version, the addresses bound (with the operator API's, whether
+/// it serves `blobs`) and the Raft log's id, and one warning naming the listeners in
+/// `plain` (those serving plain text off loopback) when there are any.
 fn start_line(
     reapi: SocketAddr,
     worker: SocketAddr,
     api: Option<SocketAddr>,
+    blobs: bool,
     log: Option<FarmLogId>,
     plain: &[&str],
 ) -> String {
-    let api = api.map(|a| format!(" api={a}")).unwrap_or_default();
+    let blobs = if blobs { "on" } else { "off" };
+    let api = api
+        .map(|a| format!(" blobs={blobs} api={a}"))
+        .unwrap_or_default();
     let log = log.map(|id| format!(" log={id}")).unwrap_or_default();
     let warning = if plain.is_empty() {
         String::new()
