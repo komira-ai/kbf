@@ -272,7 +272,7 @@ const RECORD_INDEX_ENTRIES: usize = 4;
 /// bytes: its slot in the record map (key and box), in the last-seen index (time and
 /// key), in the id map (id and its list) and in its id's list of keys.
 const RECORD_ENTRY_BYTES: usize = btree_entry_bytes(size_of::<RecordKey>() + size_of::<usize>())
-    + SEEN_ENTRY_BYTES
+    + btree_entry_bytes(SEEN_ENTRY)
     + btree_entry_bytes(
         size_of::<InvocationId>() + size_of::<Vec<RecordKey>>() + size_of::<usize>(),
     )
@@ -280,7 +280,7 @@ const RECORD_ENTRY_BYTES: usize = btree_entry_bytes(size_of::<RecordKey>() + siz
 
 /// A record's slot in a last-seen index: its time and key. A minted record has one in
 /// the minted records' index too.
-const SEEN_ENTRY_BYTES: usize = btree_entry_bytes(size_of::<WallTime>() + size_of::<RecordKey>());
+const SEEN_ENTRY: usize = size_of::<WallTime>() + size_of::<RecordKey>();
 
 /// One entry of a record's action index: the digest and the row's index.
 const ACTION_ENTRY: usize = size_of::<Digest>() + size_of::<usize>();
@@ -542,7 +542,7 @@ impl Invocation {
             .sum();
         let id = self.key.id().as_str().len();
         let minted = if self.minted {
-            SEEN_ENTRY_BYTES + id
+            btree_entry_bytes(SEEN_ENTRY) + id
         } else {
             0
         };

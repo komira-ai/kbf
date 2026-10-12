@@ -160,7 +160,7 @@ fn a_record_that_does_not_fit_is_not_made_and_its_next_one_is_incomplete() {
 #[test]
 fn an_instance_name_past_the_bound_is_left_out() {
     let calls = [queued("a", t(0), 10, 1)];
-    let bound = unbounded(ROW_CAP, &calls).bytes() + 200;
+    let bound = unbounded(ROW_CAP, &calls).bytes() + 100;
     let mut r = bounded(ROW_CAP, bound, &calls);
     for n in 0..20 {
         let mut c = call("a", t(1), CallKind::Downloaded(1));
@@ -280,8 +280,10 @@ fn a_waiter_evicted_while_its_operation_fills_in_is_passed_over() {
     );
     m.minted = true;
     let calls = [queued("r", t(0), 11, 1), ev(m)];
-    let bound = unbounded(ROW_CAP, &calls).bytes() + 100;
+    // Room for `m`'s wait, admitted as if its operation were new; not for the listing.
+    let bound = unbounded(ROW_CAP, &calls).bytes() + 200;
     let mut r = bounded(ROW_CAP, bound, &calls);
+    assert!(complete(&r, "m"), "m waits on the operation");
     step(&mut r, finished_with(1, 8, t(1)));
     assert!(r.get(&key("m")).is_none(), "the minted record made room");
     let inv = r.get(&key("r")).expect("r");
