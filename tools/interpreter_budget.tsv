@@ -11,7 +11,6 @@
 
 # Files by extension or `#!` line. Key: the path.
 [files]
-crates/kbf-driver-container/tests/fixtures/fake-podman.sh	Podman fake for the container driver tests; to become a Rust test binary
 crates/kbf-it/m1/bazel/tools/upper.sh	M1 sample project action; to become a Rust test action
 crates/kbf-it/m1/buck2/tools/upper.sh	M1 sample project action; to become a Rust test action
 crates/kbf-it/m1/run.sh	M1 cell harness; to become kbf-cell m1

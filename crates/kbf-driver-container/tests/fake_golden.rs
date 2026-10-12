@@ -238,7 +238,6 @@ fn tree(dir: &Path) -> BTreeMap<PathBuf, Entry> {
     entries
 }
 
-
 /// The answers and files as the golden file has them: the fake's directory written
 /// `<dir>`, one call per block, then one line per file below the directory.
 fn render(dir: &Path, answers: &[Answer], files: &BTreeMap<PathBuf, Entry>) -> String {
@@ -276,69 +275,62 @@ fn render(dir: &Path, answers: &[Answer], files: &BTreeMap<PathBuf, Entry>) -> S
 /// leaves differently. A change to the fake that is meant updates the golden file in
 /// the same commit: on a difference the test writes what the fake gave next to its
 /// scratch directory and names that file.
+///
+/// The controls first: a golden file updated from a run whose calls no longer reach
+/// the knobs and records they are there for would pin nothing.
 #[test]
 fn the_fake_answers_and_records_as_its_golden_file_says() {
     // Modes are part of the records; the runners' umask is 022, a dev box's may not be.
     rustix::process::umask(rustix::fs::Mode::from_raw_mode(0o022));
     let base = support::scratch("fake-golden");
     let dir = base.join("fake");
+    let (answers, mut files) = run(&dir, &support::fake::program());
+    // The fake unlinks itself in the last call (`vanish-after-create`).
+    let link = files.remove(Path::new("podman"));
+    assert!(link.is_none(), "vanish-after-create left the podman link");
+    assert!(
+        answers
+            .iter()
+            .any(|a| a.code == Some(3) && a.stdout.contains("leads group 1 session 1")),
+        "no start ran the action in a session of its own: {answers:#?}"
+    );
+    for record in [
+        "calls",
+        "events",
+        "status",
+        "create.args",
+        "ps.args",
+        "owner",
+        "removed",
+        "killed-before-rm",
+    ] {
+        assert!(
+            files.contains_key(&Path::new("state").join(record)),
+            "the fake never wrote {record}"
+        );
+    }
+    assert!(
+        !files.contains_key(Path::new("gone")),
+        "unshare rm never ran"
+    );
+    let got = render(&dir, &answers, &files);
     let golden_path =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-podman.golden");
     let golden = std::fs::read_to_string(&golden_path).unwrap_or_default();
-    for (name, program) in [
-        ("script", support::fake::script()),
-        ("rust", PathBuf::from(env!("CARGO_BIN_EXE_kbf-fake-podman"))),
-    ] {
-        let (answers, mut files) = run(&dir, &program);
-        // The link differs by design, and is the one entry that may.
-        let link = files.remove(Path::new("podman"));
-        assert!(
-            link.is_none(),
-            "{name}: vanish-after-create left the podman link"
+    if got != golden {
+        let actual = base.join("got.golden");
+        std::fs::write(&actual, &got).expect("write what the fake gave");
+        let first = got
+            .lines()
+            .zip(golden.lines())
+            .position(|(g, w)| g != w)
+            .unwrap_or_else(|| got.lines().count().min(golden.lines().count()));
+        panic!(
+            "the fake differs from {} from line {} on; it gave {}",
+            golden_path.display(),
+            first + 1,
+            actual.display()
         );
-        // A control: the calls reached the knobs and records they are there for.
-        assert!(
-            answers
-                .iter()
-                .any(|a| a.code == Some(3) && a.stdout.contains("leads group 1 session 1")),
-            "{name}: no start ran the action in a session of its own: {answers:#?}"
-        );
-        for record in [
-            "calls",
-            "events",
-            "status",
-            "create.args",
-            "ps.args",
-            "owner",
-            "removed",
-            "killed-before-rm",
-        ] {
-            assert!(
-                files.contains_key(&Path::new("state").join(record)),
-                "{name}: the fake never wrote {record}"
-            );
-        }
-        assert!(
-            !files.contains_key(Path::new("gone")),
-            "{name}: unshare rm never ran"
-        );
-        let got = render(&dir, &answers, &files);
-        support::force_remove(&dir);
-        if got != golden {
-            let actual = base.join(format!("{name}.golden"));
-            std::fs::write(&actual, &got).expect("write what the fake gave");
-            let first = got
-                .lines()
-                .zip(golden.lines())
-                .position(|(g, w)| g != w)
-                .unwrap_or_else(|| got.lines().count().min(golden.lines().count()));
-            panic!(
-                "{name}: the fake differs from {} from line {} on; it gave {}",
-                golden_path.display(),
-                first + 1,
-                actual.display()
-            );
-        }
     }
     support::force_remove(&base);
 }
