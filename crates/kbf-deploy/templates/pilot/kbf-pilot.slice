@@ -1,0 +1,13 @@
+# kbf-pilot.slice: the caps of a pilot kbf-server run as a systemd user service,
+# written by `kbf-deploy pilot server-install` into ~/.config/systemd/user/. Edit the
+# settings and re-run, not the installed copy. The kernel enforces these on
+# kbf-server and on everything it starts; past MemoryMax the slice's processes are
+# OOM-killed inside it, and the host and its other sessions stay up.
+[Unit]
+Description=kbf pilot server (capped)
+
+[Slice]
+MemoryMax=@MEMORY_MAX@
+MemorySwapMax=0
+CPUQuota=@CPU_QUOTA@
+TasksMax=@TASKS_MAX@

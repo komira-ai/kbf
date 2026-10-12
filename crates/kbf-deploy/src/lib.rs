@@ -29,6 +29,9 @@
 //!   the settings (`envoy render`), byte for byte the same for the same settings, and
 //!   a render checked for what the REAPI path through the front depends on
 //!   (`envoy check`).
+//! - [`pilot`]: a pilot kbf-server run as a systemd user service by the operator's own
+//!   user (`pilot server-install`), and the buck2 overlay that points one linked
+//!   worktree at it, which never replaces a file it did not write (`pilot buckconfig`).
 
 pub mod cli;
 pub mod config;
@@ -37,6 +40,7 @@ pub mod https;
 pub mod linux;
 pub mod mdm;
 pub mod minio;
+pub mod pilot;
 pub mod template;
 pub mod unit;
 

@@ -669,3 +669,32 @@ fn envoy_check_exits_0_passed_1_failed_2_refused() {
     assert_eq!((code, out.as_str()), (ExitCode::from(2), ""), "{err}");
     assert!(err.ends_with(": unknown key KBF_SERVER\n"), "{err}");
 }
+
+/// Catches the `pilot` kit dropped from the merged command line (clap would exit 2 on
+/// an unknown subcommand, with no `REFUSED:`), and its refusals not reaching stderr
+/// as `REFUSED:` through `run`; this also runs `run`'s pilot arm in the lib tests'
+/// instantiation, the one the coverage ratchet counts.
+#[test]
+fn a_pilot_verb_runs_through_the_same_command_line() {
+    let mut exec = FakeExec::new(0);
+    let config = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/templates/pilot/config.example"
+    );
+    let args = [
+        "pilot",
+        "server-install",
+        "--config",
+        config,
+        "--bin",
+        "/opt/kbf-server",
+    ];
+    let home = |k: &str| (k == "HOME").then(|| OsString::from("/srv/op"));
+    let (code, out, err) = cli(&mut exec, &home, &args);
+    assert_eq!((code, out.as_str()), (ExitCode::from(2), ""));
+    assert_eq!(
+        err,
+        "REFUSED: this verb installs a systemd user service: run it as yourself, not root (no sudo)\n"
+    );
+    assert!(exec.log.is_empty() && exec.queries.borrow().is_empty());
+}
