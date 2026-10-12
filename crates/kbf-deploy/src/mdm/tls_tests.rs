@@ -48,7 +48,8 @@ fn acme() -> Acme {
 
 /// An installed MDM host: `dns.env` with GoDaddy's key, lego in MDM_BIN, and
 /// systemctl keeping which units are enabled and active.
-fn tls_host(help: &'static str) -> (FakeExec, Rc<RefCell<BTreeSet<String>>>) {
+fn tls_host(help: &str) -> (FakeExec, Rc<RefCell<BTreeSet<String>>>) {
+    let help = help.to_owned();
     let mut exec = host();
     exec.entries.insert(
         p("/etc/kbf-mdm/dns.env"),
@@ -61,7 +62,7 @@ fn tls_host(help: &'static str) -> (FakeExec, Rc<RefCell<BTreeSet<String>>>) {
         let args: Vec<&str> = cmd.args.iter().map(String::as_str).collect();
         let mut u = u.borrow_mut();
         Ok(match (cmd.program.as_str(), &args[..]) {
-            (LEGO, ["run", "--help"]) => reply(0, help, ""),
+            (LEGO, ["run", "--help"]) => reply(0, &help, ""),
             (SYSTEMCTL, [verb @ ("is-enabled" | "is-active"), "--quiet", unit]) => {
                 reply(i32::from(!u.contains(&format!("{verb} {unit}"))), "", "")
             }
@@ -255,7 +256,7 @@ fn a_rerun_changes_nothing_and_a_changed_timer_is_reloaded() {
 
 /// Catches a run that goes ahead without what lego needs: the provider's key missing
 /// from `dns.env` (here route53's), a `dns.env` others can read, lego missing, a lego
-/// whose `run` lacks a flag the unit passes (another major), or a user instead of
+/// whose `run` lacks any one flag the unit passes (another major), or a user instead of
 /// root.
 #[test]
 fn a_run_without_what_lego_needs_is_refused() {
@@ -290,13 +291,15 @@ fn a_run_without_what_lego_needs_is_refused() {
     let err = run_it(&mut exec, &acme(), Mode::DryRun).0.err();
     assert!(matches!(err, Some(MdmError::NoLego(_))), "{err:?}");
 
-    let (mut exec, _) =
-        tls_host("USAGE: lego run\n  --accept-tos --email --server --path --key-type --domains\n");
-    let err = run_it(&mut exec, &acme(), Mode::DryRun).0.err();
-    assert!(
-        matches!(err, Some(MdmError::LegoFlag { flag: "--dns", .. })),
-        "{err:?}"
-    );
+    for missing in LEGO_FLAGS {
+        let help: Vec<&str> = LEGO_FLAGS.into_iter().filter(|f| *f != missing).collect();
+        let (mut exec, _) = tls_host(&format!("USAGE: lego run\n  {}\n", help.join(" ")));
+        let err = run_it(&mut exec, &acme(), Mode::DryRun).0.err();
+        assert!(
+            matches!(err, Some(MdmError::LegoFlag { flag, .. }) if flag == missing),
+            "{missing}: {err:?}"
+        );
+    }
 
     let (mut exec, _) = tls_host(HELP);
     exec.euid = 501;
