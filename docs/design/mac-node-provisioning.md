@@ -433,8 +433,8 @@ released. A build on a developer's machine never ships.
 > **Built since this section was written:** ad-hoc signing with the hardened runtime
 > and the attestation checks, in `.github/workflows/artifacts.yml`; see
 > [docs/artifacts.md](../artifacts.md) and the deviations listed in section 4.1. The
-> verification steps 1 and 2 below are still planned; the `attest` job runs step 1's
-> command on its own output.
+> verification steps 1 and 2 below are still planned; the `verify` job runs step 1's
+> command on what the `attest` job signed.
 
 On Apple silicon every executable must carry a code signature. The linker adds an
 *ad-hoc* signature to anything it links for arm64, which is why a `cargo build` on a Mac

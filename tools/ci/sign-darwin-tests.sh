@@ -52,7 +52,7 @@ sign_with() {
   codesign --force --sign - --options runtime --entitlements "$bin.plist" "$bin"
 }
 
-# package <binary>: a tarball holding the binary, as tools/ci/package-asset.sh lays it out.
+# package <binary>: a tarball holding the binary, as `cargo xtask package` lays it out.
 package() {
   tar -czf "$1.tar.gz" -C "$(dirname "$1")" "$(basename "$1")"
   echo "$1.tar.gz"

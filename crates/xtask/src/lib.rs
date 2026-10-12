@@ -9,6 +9,12 @@
 //! - `fetch --url <url> --sha256 <hex> --out <path> [--extract <format> [--member <path>]]`
 //!   ([`fetch`]): a pinned tool, downloaded over HTTPS and refused unless its SHA-256
 //!   matches, before anything is unpacked or written.
+//! - `package --binary <path> --sbom <path> --platform <platform> --commit <sha> --out
+//!   <dir>` ([`package`]): one binary as a release asset, a tarball that is the same
+//!   bytes on every runner, and its SBOM, with their lines in `SHA256SUMS.<platform>`.
+//! - `sums assemble <dir>` and `verify-assets {sums,attestations} <dir>` ([`sums`]): the
+//!   one `SHA256SUMS` over every platform's assets, and the checks the attest job and
+//!   a deployment make of it, each with a control that must fail.
 //!
 //! Exit status: 0 when the check passed, 1 when it failed (one reason per line on
 //! stderr), 2 on a usage error.
@@ -22,6 +28,8 @@ use clap::{Parser, Subcommand};
 pub mod budget;
 pub mod build_commit;
 pub mod fetch;
+pub mod package;
+pub mod sums;
 
 /// Why a verb failed.
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
@@ -95,6 +103,64 @@ enum Verb {
         /// inside the archive.
         #[arg(long)]
         member: Option<PathBuf>,
+    },
+    /// Package one binary and its SBOM as release assets in `--out`.
+    Package {
+        /// The binary; its file name is the asset's name.
+        #[arg(long)]
+        binary: PathBuf,
+        /// Its CycloneDX SBOM.
+        #[arg(long)]
+        sbom: PathBuf,
+        /// The platform it was built for.
+        #[arg(long, value_enum)]
+        platform: package::Platform,
+        /// The commit it was built from (on Actions, `GITHUB_SHA`).
+        #[arg(long)]
+        commit: String,
+        /// The directory the assets go in; created when missing.
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// The commit's one `SHA256SUMS`.
+    #[command(subcommand)]
+    Sums(Sums),
+    /// Check a commit's assets as a deployment is to.
+    #[command(subcommand)]
+    VerifyAssets(VerifyAssets),
+}
+
+#[derive(Subcommand)]
+enum Sums {
+    /// Merge `<dir>/SHA256SUMS.<platform>` into `<dir>/SHA256SUMS`, and remove them.
+    Assemble {
+        dir: PathBuf,
+        /// Refuse a result that differs from this file.
+        #[arg(long)]
+        expect: Option<PathBuf>,
+        /// Append the result to this file (on Actions, `GITHUB_STEP_SUMMARY`).
+        #[arg(long)]
+        summary: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum VerifyAssets {
+    /// `<dir>/SHA256SUMS` lists every other file in `<dir>` once, and each matches.
+    Sums { dir: PathBuf },
+    /// Every asset `<dir>/SHA256SUMS` lists has the attestations a deployment checks.
+    Attestations {
+        dir: PathBuf,
+        /// The repository, `<owner>/<repo>` (on Actions, `GITHUB_REPOSITORY`).
+        #[arg(long)]
+        repo: String,
+        /// The signing workflow, `<owner>/<repo>/<path>@<ref>` (on Actions,
+        /// `GITHUB_WORKFLOW_REF`).
+        #[arg(long)]
+        workflow_ref: String,
+        /// The `gh` program.
+        #[arg(long, default_value = "gh")]
+        gh: PathBuf,
     },
 }
 
@@ -178,6 +244,42 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
             let unpack = fetch::Unpack::new(extract, member).map_err(Error::Usage)?;
             let roots = fetch::host_roots();
             Ok(vec![fetch::fetch(&url, &sha256, &unpack, &out, &roots)?])
+        }
+        Verb::Package {
+            binary,
+            sbom,
+            platform,
+            commit,
+            out,
+        } => package::package(&binary, &sbom, platform, &commit, &out),
+        Verb::Sums(Sums::Assemble {
+            dir,
+            expect,
+            summary,
+        }) => sums::assemble(&dir, expect.as_deref(), summary.as_deref()),
+        Verb::VerifyAssets(VerifyAssets::Sums { dir }) => {
+            Ok(vec![sums::verify_sums(&dir, fetch::Sha256::of)?])
+        }
+        Verb::VerifyAssets(VerifyAssets::Attestations {
+            dir,
+            repo,
+            workflow_ref,
+            gh,
+        }) => {
+            // The flipped copy's directory, of this process alone.
+            let scratch = std::env::temp_dir().join(format!("xtask-verify-{}", std::process::id()));
+            std::fs::create_dir_all(&scratch)
+                .map_err(Error::spawn(format!("create {}", scratch.display())))?;
+            let a = sums::Attestations {
+                repo: &repo,
+                workflow_ref: &workflow_ref,
+                gh: &gh,
+                scratch: &scratch,
+            };
+            let verified = sums::verify_attestations(&dir, &a);
+            // Nothing in it is needed after the run, whatever its result.
+            let _ = std::fs::remove_dir_all(&scratch);
+            verified
         }
     }
 }
