@@ -17,7 +17,9 @@
 //! from the table and exits 0 either way.
 //!
 //! `create` refuses, before it changes anything, when another account holds uid or
-//! gid 470, `_kbf` exists with another uid or gid, or `_kbf` is in `admin`. It makes
+//! gid 470, `_kbf` exists with another uid or gid, or `_kbf` is in `admin`; a
+//! `dscl` read that fails for any reason but a missing record or attribute fails the
+//! call before any change. It makes
 //! the group and the user only when they are missing, then sets `PrimaryGroupID`,
 //! `UserShell` and `NFSHomeDirectory` wherever they differ. A missing home is made
 //! root's (0700) first, gets its `leases`, and is given to `_kbf` last, so nothing
@@ -96,12 +98,28 @@ pub(crate) fn at_dir(paths: &Paths) -> PathBuf {
     paths.root.join("private/var/at")
 }
 
+/// What `dscl` prints on stderr when the record is not there.
+const RECORD_NOT_FOUND: &str = "DS Error: -14136 ";
+
+/// What `dscl -read` prints on stderr when the record has no such attribute.
+const NO_SUCH_KEY: &str = "No such key: ";
+
 /// The value `dscl . -read <record> <attribute>` prints, `None` when the record or the
 /// attribute is not there. A value with a space in it is printed on the next line.
+///
+/// # Errors
+/// Failed when `dscl` fails for any other reason: an unreadable record is not a
+/// missing one (`create` would make `_kbf` again over one with another uid).
 fn attribute(host: &dyn AdminHost, record: &str, name: &str) -> Result<Option<String>, Stop> {
     let output = query(host, DSCL, &[".", "-read", record, name])?;
     if !output.success {
-        return Ok(None);
+        let stderr = output.stderr.trim();
+        if stderr.contains(RECORD_NOT_FOUND) || stderr.starts_with(NO_SUCH_KEY) {
+            return Ok(None);
+        }
+        return Err(Stop::Failed(format!(
+            "dscl . -read {record} {name} failed: {stderr}"
+        )));
     }
     let prefix = format!("{name}:");
     let mut lines = output

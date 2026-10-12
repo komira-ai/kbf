@@ -566,3 +566,54 @@ fn a_failed_change_fails_the_call() {
         .failed_for(&format!("{user} failed: DS Error: -14120"));
     assert!(!mac.home().exists());
 }
+
+/// Catches: a deny line that only starts with `_kbf` (`_kbfx`, another account) read
+/// as `_kbf`'s own: `create` would then skip the append and `status` report `_kbf`
+/// denied when it is not.
+#[test]
+fn a_near_name_in_a_deny_file_is_not_the_role() {
+    let mac = FakeMac::new("role-deny-near-name");
+    let at = mac.at_dir();
+    fs::write(at.join("cron.deny"), "Guest\n_kbfx\n").unwrap();
+    fs::write(at.join("at.deny"), "_kbfx\n").unwrap();
+    let status = mac.run(&["role-user", "status"]);
+    for line in [
+        format!(
+            "  user _kbf may use crontab (not in {})",
+            at.join("cron.deny").display()
+        ),
+        format!(
+            "  user _kbf may use at (not in {})",
+            at.join("at.deny").display()
+        ),
+    ] {
+        assert!(status.out.lines().any(|l| l == line), "{line}: {status:?}");
+    }
+    mac.run(&["role-user", "create"]).succeeded();
+    assert_eq!(
+        fs::read_to_string(at.join("cron.deny")).unwrap(),
+        "Guest\n_kbfx\n_kbf\n"
+    );
+    assert_eq!(
+        fs::read_to_string(at.join("at.deny")).unwrap(),
+        "_kbfx\n_kbf\n"
+    );
+}
+
+/// Catches: a `dscl -read` that fails for a reason other than a missing record taken
+/// as "no `_kbf`": `create` would run `dscl . -create /Users/_kbf UniqueID 470` over
+/// a `_kbf` that has another uid. It must fail before any change, and `status` too.
+#[test]
+fn a_directory_read_that_fails_is_not_a_missing_record() {
+    let mac = FakeMac::new("role-dscl-read-fails");
+    mac.set_user("_kbf", "UniqueID", "300");
+    let read = format!("/usr/bin/dscl . -read {USER} UniqueID");
+    let error = "DS Error: -14009 (eDSUnknownNodeName)";
+    mac.state.borrow_mut().fails.insert(read, error.to_owned());
+    let why = format!("dscl . -read {USER} UniqueID failed: {error}");
+    mac.run(&["role-user", "create"]).failed_for(&why);
+    assert!(creates(&mac).is_empty(), "{:?}", creates(&mac));
+    assert!(!mac.home().exists());
+    assert_eq!(mac.attribute(USER, "UniqueID").as_deref(), Some("300"));
+    mac.run(&["role-user", "status"]).failed_for(&why);
+}
