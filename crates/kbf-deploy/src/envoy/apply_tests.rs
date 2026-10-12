@@ -115,9 +115,11 @@ fn exists(found: bool, what: &str) -> io::Result<Output> {
 
 /// `kubectl`, which answers only with an empty environment and the plan's
 /// `--kubeconfig`, `--cache-dir` and `--context` first; every `-f -` must carry the
-/// render of `args()`.
-fn answer(state: Rc<RefCell<Cluster>>) -> Answer {
-    let manifests = render(&args().config).manifests.into_bytes();
+/// render of `a`'s config, and the operator's Secret is found only in `a`'s
+/// operator namespace.
+fn answer(state: Rc<RefCell<Cluster>>, a: &Apply) -> Answer {
+    let manifests = render(&a.config).manifests.into_bytes();
+    let operator_namespace = a.config.operator_namespace.clone();
     Box::new(move |cmd: &Cmd| {
         let mut c = state.borrow_mut();
         assert_eq!(cmd.program.as_str(), KUBECTL);
@@ -143,15 +145,9 @@ fn answer(state: Rc<RefCell<Cluster>>) -> Answer {
                 c.calls.push("ingressclass");
                 exists(c.ingress_class, "ingressclass.networking.k8s.io/tailscale")
             }
-            [
-                "-n",
-                "tailscale",
-                "get",
-                "secret",
-                "operator-oauth",
-                "-o",
-                "name",
-            ] => {
+            ["-n", opns, "get", "secret", "operator-oauth", "-o", "name"]
+                if *opns == operator_namespace =>
+            {
                 c.calls.push("operator-secret");
                 exists(c.operator_secret, "secret/operator-oauth")
             }
@@ -250,9 +246,14 @@ fn answer(state: Rc<RefCell<Cluster>>) -> Answer {
 }
 
 fn host(cluster: Cluster) -> (FakeExec, Rc<RefCell<Cluster>>) {
+    host_for(cluster, &args())
+}
+
+/// `host`, with a kubectl that expects `a`'s render and operator namespace.
+fn host_for(cluster: Cluster, a: &Apply) -> (FakeExec, Rc<RefCell<Cluster>>) {
     let state = Rc::new(RefCell::new(cluster));
     let mut exec = FakeExec::new(501);
-    exec.answer = answer(Rc::clone(&state));
+    exec.answer = answer(Rc::clone(&state), a);
     (exec, state)
 }
 
@@ -627,4 +628,29 @@ fn the_example_is_the_given_file_or_kbfs() {
     );
     let e = example(Some(&dir.join("absent"))).expect_err("absent");
     assert!(e.to_string().contains("absent"), "{e}");
+}
+
+/// Catches the config's `KBF_TS_OPERATOR_NAMESPACE` not reaching the render check
+/// (a hard-coded `tailscale` there refuses this render, whose NetworkPolicy admits
+/// `ts-operator`) or the operator Secret's lookup: every other test uses the
+/// example's `tailscale`, where a literal and the config agree.
+#[test]
+fn the_configs_operator_namespace_reaches_the_checks() {
+    let text = config_text().replace(
+        "KBF_TS_OPERATOR_NAMESPACE=tailscale",
+        "KBF_TS_OPERATOR_NAMESPACE=ts-operator",
+    );
+    let mut a = args();
+    a.config = EnvoyConfig::parse(&text).expect("valid config");
+    assert_eq!(a.config.operator_namespace, "ts-operator", "replaced");
+    let (mut exec, state) = host_for(ready(), &a);
+    let (done, out) = go(&mut exec, &a, Mode::Apply);
+    done.expect("an apply with operator namespace ts-operator passes");
+    let mut want = CHECKS.to_vec();
+    want.extend(["apply", "rollout", "ingress"]);
+    assert_eq!(calls(&state), want);
+    assert!(
+        out.contains("Secret ts-operator/operator-oauth: present\n"),
+        "{out}"
+    );
 }
