@@ -861,18 +861,32 @@ fn thousands(stream: &str, words: usize) -> Vec<String> {
         .collect()
 }
 
-/// Catches output read only after the process exits: a process that prints more
-/// than a pipe holds would block on the full pipe and be killed as hung.
+/// Catches an answer cut short (stdout and stderr read in one buffer's worth, or the
+/// one for the other), the files the output went to left behind in their directory,
+/// and a directory they cannot be made in taken as an answer.
 #[test]
 fn a_long_answer_is_read_whole() {
+    let dir = scratch("long");
     let mut command = std::process::Command::new(act());
     command
         .args(thousands("stdout", 300))
         .arg(";")
         .args(thousands("stderr", 200));
-    let out = output_within(command, WITHIN).expect("answers");
+    let out = output_within(command, WITHIN, &dir).expect("answers");
     assert!(out.status.success());
     assert_eq!((out.stdout.len(), out.stderr.len()), (300_000, 200_000));
+    let left: Vec<_> = std::fs::read_dir(&dir).expect("dir").collect();
+    assert!(left.is_empty(), "left behind: {left:?}");
+    let nowhere = output_within(
+        std::process::Command::new(act()),
+        WITHIN,
+        &dir.join("missing"),
+    );
+    assert_eq!(
+        nowhere.expect_err("no files").kind(),
+        io::ErrorKind::NotFound
+    );
+    kbf_outputs::remove_tree(&dir).expect("clean");
 }
 
 /// Catches an answer that waits for its output to close rather than for its process
@@ -895,7 +909,7 @@ fn an_answer_is_read_when_its_process_exits_though_another_holds_its_output() {
         "Build version 1A1",
     ]);
     let started = Instant::now();
-    let out = output_within(command, WITHIN).expect("answered at exit");
+    let out = output_within(command, WITHIN, &std::env::temp_dir()).expect("answered at exit");
     let took = started.elapsed();
     assert!(took < WITHIN, "the held output was waited for: {took:?}");
     assert!(out.status.success());
@@ -956,7 +970,7 @@ fn a_busy_program_is_started_again_within_the_limit() {
         std::thread::sleep(Duration::from_millis(200));
         drop(writer);
     });
-    let out = output_within(std::process::Command::new(&program), WITHIN).expect("answers");
+    let out = output_within(std::process::Command::new(&program), WITHIN, &dir).expect("answers");
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
         format!("{}\n", program.display())
@@ -969,7 +983,7 @@ fn a_busy_program_is_started_again_within_the_limit() {
         .expect("open");
     let started = Instant::now();
     let limit = Duration::from_millis(300);
-    let busy = output_within(std::process::Command::new(&program), limit).expect_err("busy");
+    let busy = output_within(std::process::Command::new(&program), limit, &dir).expect_err("busy");
     assert_eq!(busy.raw_os_error(), Some(libc::ETXTBSY));
     assert!(started.elapsed() < WITHIN, "waited past the limit");
     kbf_outputs::remove_tree(&dir).expect("clean");

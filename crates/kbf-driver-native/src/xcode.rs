@@ -46,10 +46,11 @@
 //! is the one the scheduler matched and the one in its digest.
 
 use std::collections::BTreeMap;
-use std::io::{self, Read};
+use std::fs::{File, OpenOptions};
+use std::io::{self, Read as _, Seek as _, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::{Output, Stdio};
-use std::sync::mpsc::{self, Receiver};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -220,7 +221,7 @@ impl Probe {
 
 /// Every `Xcode*.app` in `apps`, in name order, each asked the questions in the module
 /// documentation as `probe` says. A directory that cannot be read has none. A question
-/// not answered in time (exit and close its output) is killed if still running. Each
+/// whose process has not exited in time is killed. Each
 /// Xcode is asked once (an app that is a link to another is reported with that one's
 /// answers), on a thread of its own and its questions at once, so the survey takes
 /// about as long as its slowest Xcode, not as long as all of them, but for the
@@ -521,7 +522,8 @@ fn answer(
         }
     };
     command.env(DEVELOPER_DIR, developer_dir);
-    let out = output_within(command, within)
+    let answers = sandbox.map_or_else(std::env::temp_dir, |sandbox| sandbox.dir.clone());
+    let out = output_within(command, within, &answers)
         .map_err(|e| Unanswered::NoAnswer(format!("{asked}: {e}")))?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
@@ -618,7 +620,7 @@ pub(crate) fn warm(
         for dir in developer_dirs {
             for tool in WARM_TOOLS {
                 let command = lookup(&xcrun, dir.as_deref(), tool, &sandbox);
-                let failed = match output_within(command, within) {
+                let failed = match output_within(command, within, &sandbox.dir) {
                     Ok(out) if out.status.success() => continue,
                     Ok(out) => format!(
                         "{}: {}",
@@ -657,20 +659,31 @@ fn lookup(
 /// How often [`output_within`] looks whether its process has exited.
 const POLL: Duration = Duration::from_millis(10);
 
-/// What `command` prints and how it exits (stdin `/dev/null`), if it exits and closes
-/// its output within `within`; otherwise this is a `TimedOut` error, and the process is
-/// killed if it has not exited. A program that is busy (ETXTBSY: a file just written
-/// is held open for writing by any child another thread forks before it execs) is
-/// started again until `within` is up. Its stdout and stderr are read on two threads
-/// while it runs, so a full pipe cannot stall it. A process it started and left holding
-/// the pipes keeps those threads reading; they are waited for only until `within` is up
-/// and are left behind after that (each ends when the pipe it reads closes).
-fn output_within(mut command: std::process::Command, within: Duration) -> io::Result<Output> {
+/// What `command` prints and how it exits (stdin `/dev/null`), if it exits within
+/// `within`; otherwise this is a `TimedOut` error, and the process is killed. A program
+/// that is busy (ETXTBSY: a file just written is held open for writing by any child
+/// another thread forks before it execs) is started again until `within` is up.
+///
+/// Its stdout and stderr go to files in `dir`, unlinked as soon as they are made, and
+/// are read when it exits, up to their length then: never pipes, whose end-of-file waits
+/// for every process holding the write end (issue #481). On macOS, which has no
+/// `pipe2`, the standard library makes a pipe and only then marks it close-on-exec, so
+/// a child another thread starts in between inherits it; a hung Xcode's question
+/// held a good Xcode's output open until it was killed. A file is opened close-on-exec
+/// at once, and a process the program leaves holding it (or one that inherited it
+/// anyway) cannot hold the answer back.
+fn output_within(
+    mut command: std::process::Command,
+    within: Duration,
+    dir: &Path,
+) -> io::Result<Output> {
     let deadline = Instant::now() + within;
+    let stdout = output_file(dir)?;
+    let stderr = output_file(dir)?;
     command
         .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stdout(stdout.try_clone()?)
+        .stderr(stderr.try_clone()?);
     let mut child = loop {
         match command.spawn() {
             Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) && Instant::now() < deadline => {
@@ -679,8 +692,6 @@ fn output_within(mut command: std::process::Command, within: Duration) -> io::Re
             spawned => break spawned?,
         }
     };
-    let stdout = read_all(child.stdout.take().expect("stdout is piped"));
-    let stderr = read_all(child.stderr.take().expect("stderr is piped"));
     let status = loop {
         if let Some(status) = child.try_wait()? {
             break status;
@@ -695,32 +706,42 @@ fn output_within(mut command: std::process::Command, within: Duration) -> io::Re
         }
         std::thread::sleep(POLL);
     };
-    let unclosed = || {
-        io::Error::new(
-            io::ErrorKind::TimedOut,
-            format!("exited, but its output was still open after {within:?}"),
-        )
-    };
-    let left = || deadline.saturating_duration_since(Instant::now());
-    let [stdout, stderr] =
-        [stdout, stderr].map(|pipe| pipe.recv_timeout(left()).map_err(|_| unclosed()));
     Ok(Output {
         status,
-        stdout: stdout?,
-        stderr: stderr?,
+        stdout: written(&stdout)?,
+        stderr: written(&stderr)?,
     })
 }
 
-/// A thread that reads `pipe` to its end and sends what it read.
-fn read_all(mut pipe: impl Read + Send + 'static) -> Receiver<Vec<u8>> {
-    let (send, receive) = mpsc::sync_channel(1);
-    std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        let _ = pipe.read_to_end(&mut bytes);
-        // The receiver is gone once its wait timed out; then nobody wants the bytes.
-        let _ = send.send(bytes);
-    });
-    receive
+/// Tells [`output_file`]s apart.
+static OUTPUT_FILES: AtomicU64 = AtomicU64::new(0);
+
+/// A new, empty file in `dir`, open to read and to append (so what a process left
+/// holding it writes later lands after the answer, never over it), close-on-exec, and
+/// already unlinked, so nothing is left behind.
+fn output_file(dir: &Path) -> io::Result<File> {
+    let path = dir.join(format!(
+        ".kbf-answer-{}-{}",
+        std::process::id(),
+        OUTPUT_FILES.fetch_add(1, Ordering::Relaxed)
+    ));
+    let file = OpenOptions::new()
+        .read(true)
+        .append(true)
+        .create_new(true)
+        .open(&path)?;
+    std::fs::remove_file(&path)?;
+    Ok(file)
+}
+
+/// What `file` holds now, from its start. Its writers append, so moving its offset
+/// moves only where this reads.
+fn written(mut file: &File) -> io::Result<Vec<u8>> {
+    let len = file.metadata()?.len();
+    file.seek(SeekFrom::Start(0))?;
+    let mut bytes = Vec::new();
+    file.take(len).read_to_end(&mut bytes)?;
+    Ok(bytes)
 }
 
 /// The `DEVELOPER_DIR` of the Xcode the action's platform names (the Action's
