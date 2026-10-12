@@ -277,7 +277,11 @@ fn the_tree_must_be_roots_alone() {
     mac.run(&["phase0", "status"])
         .refused_for("etc is not a directory (it is a symbolic link)");
     fs::remove_file(base.join("etc")).unwrap();
-    let _socket = std::os::unix::net::UnixListener::bind(base.join("etc")).unwrap();
+    // A FIFO, not a socket: a socket path is limited to about 100 bytes.
+    let fifo =
+        std::ffi::CString::new(base.join("etc").into_os_string().into_encoded_bytes()).unwrap();
+    // SAFETY: `fifo` is a NUL-terminated path that outlives the call.
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o644) }, 0);
     mac.run(&["phase0", "status"])
         .refused_for("etc is not a directory (it is neither a file nor a directory)");
     fs::remove_file(base.join("etc")).unwrap();
