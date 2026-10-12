@@ -32,6 +32,27 @@ const PAUSES: usize = 1_000;
 /// What runs on the fake Mac at each pause: its number, from 1.
 pub type PauseHook = Box<dyn FnMut(usize)>;
 
+/// What runs on the fake Mac as each program starts: the command's text.
+pub type CommandHook = Box<dyn FnMut(&str)>;
+
+/// The keys `pmset -g` lists on a real Mac (macOS 26 on a Mac mini), in its order.
+const PMSET_ORDER: [&str; 14] = [
+    "standby",
+    "Sleep On Power Button",
+    "hibernatefile",
+    "powernap",
+    "networkoversleep",
+    "disksleep",
+    "sleep",
+    "hibernatemode",
+    "ttyskeepawake",
+    "displaysleep",
+    "tcpkeepalive",
+    "lowpowermode",
+    "womp",
+    "autorestart",
+];
+
 pub struct State {
     pub euid: u32,
     /// Owners by path; any other path is root's.
@@ -54,6 +75,7 @@ pub struct State {
     pub unstartable: BTreeSet<String>,
     pub pauses: usize,
     pub on_pause: Option<PauseHook>,
+    pub on_command: Option<CommandHook>,
     pub now: SystemTime,
 }
 
@@ -137,8 +159,25 @@ impl FakeMac {
             (COMMERCE, "AutoUpdate"),
         ]
         .map(|(domain, key)| ((domain.to_owned(), key.to_owned()), "1".to_owned()));
-        let pmset = [("sleep", "1"), ("autorestart", "0"), ("powernap", "1")]
-            .map(|(key, value)| (key.to_owned(), value.to_owned()));
+        // Every key a real Mac lists, so a key matched by part of a line (`sleep` in
+        // `disksleep`, `displaysleep` or `/var/vm/sleepimage`) reads the wrong value.
+        let pmset = [
+            ("standby", "1"),
+            ("Sleep On Power Button", "1"),
+            ("hibernatefile", "/var/vm/sleepimage"),
+            ("powernap", "1"),
+            ("networkoversleep", "0"),
+            ("disksleep", "10"),
+            ("sleep", "1"),
+            ("hibernatemode", "3"),
+            ("ttyskeepawake", "1"),
+            ("displaysleep", "10"),
+            ("tcpkeepalive", "1"),
+            ("lowpowermode", "0"),
+            ("womp", "1"),
+            ("autorestart", "0"),
+        ]
+        .map(|(key, value)| (key.to_owned(), value.to_owned()));
         let state = State {
             euid: 0,
             owners: BTreeMap::new(),
@@ -152,6 +191,7 @@ impl FakeMac {
             unstartable: BTreeSet::new(),
             pauses: 0,
             on_pause: None,
+            on_command: None,
             now: UNIX_EPOCH + Duration::from_secs(NOW),
         };
         Self {
@@ -289,9 +329,25 @@ impl FakeMac {
                 ok(String::new())
             }
             ("/usr/bin/pmset", ["-g"]) => {
+                // As a real Mac prints it: its own order (keys it does not know last),
+                // names padded to 20 columns, and a note after a sleep that is held off.
+                let known = PMSET_ORDER.iter().filter_map(|name| {
+                    let value = state.pmset.get(*name)?;
+                    Some((*name, value))
+                });
+                let unknown = state
+                    .pmset
+                    .iter()
+                    .filter(|(name, _)| !PMSET_ORDER.contains(&name.as_str()))
+                    .map(|(name, value)| (name.as_str(), value));
                 let mut text = "System-wide power settings:\nCurrently in use:\n".to_owned();
-                for (name, value) in &state.pmset {
-                    text.push_str(&format!(" {name:<20} {value}\n"));
+                for (name, value) in known.chain(unknown) {
+                    let note = if name == "sleep" && value != "0" {
+                        " (sleep prevented by sharingd, powerd)"
+                    } else {
+                        ""
+                    };
+                    text.push_str(&format!(" {name:<20} {value}{note}\n"));
                 }
                 ok(text)
             }
@@ -346,6 +402,11 @@ impl AdminHost for FakeMac {
             .collect::<Vec<_>>()
             .join(" ");
         self.state.borrow_mut().calls.push(text.clone());
+        let hook = self.state.borrow_mut().on_command.take();
+        if let Some(mut hook) = hook {
+            hook(&text);
+            self.state.borrow_mut().on_command = Some(hook);
+        }
         let unstartable = self
             .state
             .borrow()

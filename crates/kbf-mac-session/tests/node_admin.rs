@@ -4,10 +4,12 @@
 
 mod admin_fake;
 
+use std::cell::RefCell;
 use std::ffi::OsString;
 use std::fs::{self, File};
 use std::os::unix::ffi::OsStringExt as _;
 use std::os::unix::fs::PermissionsExt as _;
+use std::rc::Rc;
 use std::time::Duration;
 
 use admin_fake::{FakeMac, NOW};
@@ -133,6 +135,23 @@ fn the_log_quotes_every_argument() {
             "2027-01-15T08:00:00Z caller=\"ops\" uid=501 argv: \"phase0\" \"status\" ",
             "\"$(touch /x)\" \"a\\nb\" \"\\u{1b}]0;x\\u{7}\""
         )]
+    );
+}
+
+/// Catches: a caller name written into the audit line unquoted, where a quote in
+/// `SUDO_USER` ends the field early and a control character is written raw.
+#[test]
+fn the_log_quotes_the_caller() {
+    let mac = FakeMac::new("log-caller");
+    let sudo = Sudo {
+        user: Some("o\"p\u{7}s".into()),
+        uid: Some("501".into()),
+    };
+    let args = [OsString::from("phase0"), OsString::from("status")];
+    mac.run_as(&sudo, &args).succeeded();
+    assert_eq!(
+        log_lines(&mac),
+        ["2027-01-15T08:00:00Z caller=\"o\\\"p\\u{7}s\" uid=501 argv: \"phase0\" \"status\""]
     );
 }
 
@@ -368,6 +387,25 @@ fn stale_temporary_files_are_swept() {
     );
 }
 
+/// Catches: a sweep that runs before the tree is checked, which would let a `state`
+/// swapped for a link make root remove files wherever the link points.
+#[test]
+fn nothing_is_swept_from_a_state_that_fails_the_check() {
+    let mac = FakeMac::new("sweep-unchecked");
+    let state = mac.state_dir();
+    let elsewhere = mac.root.join("elsewhere");
+    fs::create_dir(&elsewhere).unwrap();
+    let old = elsewhere.join(".incoming.old");
+    let file = File::create(&old).unwrap();
+    let now = std::time::UNIX_EPOCH + Duration::from_secs(NOW);
+    file.set_modified(now - Duration::from_secs(6000)).unwrap();
+    fs::remove_dir(&state).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, &state).unwrap();
+    mac.run(&["phase0", "status"])
+        .refused_for("state is not a directory (it is a symbolic link)");
+    assert!(old.exists(), "the sweep followed the link before the check");
+}
+
 /// Holds the lock file's flock as another call would.
 fn hold(mac: &FakeMac) -> File {
     let file = File::create(mac.lock()).unwrap();
@@ -409,6 +447,40 @@ fn the_lock_is_taken_once_free_and_released_at_the_end() {
     assert_eq!(mac.state.borrow().pauses, 3);
     let after = File::open(mac.lock()).unwrap();
     rustix::fs::flock(&after, FlockOperation::NonBlockingLockExclusive).unwrap();
+}
+
+/// Catches: a lock released as soon as it is taken (dropped, not held), so a second
+/// call could change the Mac while this one does.
+#[test]
+fn the_lock_is_held_while_the_verb_runs() {
+    for verb in ["apply", "revert"] {
+        let mac = FakeMac::new(&format!("lock-during-{verb}"));
+        if verb == "revert" {
+            mac.run(&["phase0", "apply"]).succeeded();
+        }
+        let lock = mac.lock();
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let record = Rc::clone(&seen);
+        mac.state.borrow_mut().on_command = Some(Box::new(move |text| {
+            let file = File::open(&lock).unwrap();
+            let tried = rustix::fs::flock(&file, FlockOperation::NonBlockingLockExclusive);
+            record.borrow_mut().push((text.to_owned(), tried.err()));
+        }));
+        mac.run(&["phase0", verb]).succeeded();
+        let seen = seen.borrow();
+        assert!(
+            seen.iter()
+                .any(|(text, _)| text.contains(" -a ") || text.contains(" write ")),
+            "{verb} changed nothing: {seen:?}"
+        );
+        for (text, tried) in seen.iter() {
+            assert_eq!(
+                *tried,
+                Some(rustix::io::Errno::WOULDBLOCK),
+                "{verb}: the lock was free while running {text}"
+            );
+        }
+    }
 }
 
 /// Catches: a lock file opened through a link (root creating or locking a file
