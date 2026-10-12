@@ -411,7 +411,7 @@ async fn a_cancel_stops_a_process_and_a_late_start_runs_none() {
     ));
     let mut h = Harness::with_runtime("cancel-local", runtime, LONG).await;
     let mut peer = h.welcomed().await;
-    let sleeper = Spec::sh("sleep 60").store(&cas);
+    let sleeper = Spec::act(&["sleep", "60"]).store(&cas);
     let window = Duration::from_secs(5);
 
     // Heartbeat 99 was never sent on this stream.

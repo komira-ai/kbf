@@ -174,10 +174,22 @@ impl Farm {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_action_runs_on_the_daemon_and_its_outputs_are_in_the_cas() {
     let farm = Farm::start("exec-run").await;
-    let spec = Spec::sh(
-        "mkdir -p out; tr a-z A-Z < in.txt > out/greeting; echo ran; echo warned >&2; \
-         i=0; while [ $i -lt 100000 ]; do i=$((i+1)); done",
-    )
+    // 16 MiB filled word by word: CPU time to measure.
+    let spec = Spec::act(&[
+        "upper",
+        "out/greeting",
+        "in.txt",
+        ";",
+        "echo",
+        "ran",
+        ";",
+        "echo",
+        "--stderr",
+        "warned",
+        ";",
+        "alloc",
+        "16",
+    ])
     .outputs(&["out/greeting"])
     .inputs(&[("in.txt", b"hello from the cas\n", false)]);
     let action = farm.upload(&spec).await;
@@ -233,7 +245,7 @@ async fn an_action_runs_on_the_daemon_and_its_outputs_are_in_the_cas() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_input_lost_from_the_cas_fails_the_action_cleanly() {
     let farm = Farm::start("exec-lost").await;
-    let spec = Spec::sh("cat data").inputs(&[("data", b"soon gone", false)]);
+    let spec = Spec::act(&["upper", "copy", "data"]).inputs(&[("data", b"soon gone", false)]);
     let before = farm.objects().await;
     farm.cas
         .put(b"soon gone".to_vec())
@@ -262,7 +274,7 @@ async fn an_input_lost_from_the_cas_fails_the_action_cleanly() {
         .expect_err("no action-cache entry");
     assert_eq!(miss.code(), Code::NotFound);
 
-    let after = farm.upload(&Spec::sh("echo still here")).await;
+    let after = farm.upload(&Spec::act(&["echo", "still", "here"])).await;
     let response = farm.execute(&after).await;
     let result = response.result.expect("the daemon still runs actions");
     assert_eq!(
@@ -339,7 +351,7 @@ async fn needing(name: &str, needs: u64) -> (Farm, impl Fn() -> Vec<u64>) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_drivers_own_limit_kill_reruns_the_action_with_its_booking_doubled() {
     let (farm, booked) = needing("exec-oom", 4 * GIB).await;
-    let action = farm.upload(&Spec::sh("echo fits")).await;
+    let action = farm.upload(&Spec::act(&["echo", "fits"])).await;
 
     let response = farm.execute(&action).await;
     assert_eq!(response.status.map(|s| s.code), Some(Code::Ok as i32));
@@ -357,7 +369,7 @@ async fn a_drivers_own_limit_kill_reruns_the_action_with_its_booking_doubled() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_drivers_own_limit_kill_at_the_largest_node_is_answered() {
     let (farm, booked) = needing("exec-oom-cap", 16 * GIB).await;
-    let action = farm.upload(&Spec::sh("echo never")).await;
+    let action = farm.upload(&Spec::act(&["echo", "never"])).await;
 
     let response = farm.execute(&action).await;
     assert_eq!(response.result, None);

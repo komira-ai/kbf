@@ -749,6 +749,19 @@ mod tests {
         assert!(parse(&["--driver=container", "--lease-swap-poll-ms=0"]).is_err());
     }
 
+    // This test binary answers as kbf-testkit's `kbf-act`, or as its fake `xcrun`,
+    // `xcodebuild` or `sandbox-exec`, when run through a link of that name: the
+    // programs the tests here (and src/startup_tests.rs) give the daemon to run.
+    kbf_testkit::act_test_hook!();
+
+    /// Makes `path` a link to this test binary, which answers as the fake its base name
+    /// names, with `rules` beside it (see `kbf_testkit::fake`).
+    pub(crate) fn fake(path: &Path, rules: &str) {
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("dir");
+        kbf_testkit::act::link_self(path).expect("link");
+        std::fs::write(format!("{}.rules", path.display()), rules).expect("rules");
+    }
+
     /// A fresh directory for one test, under the test binary's directory.
     pub(crate) fn scratch(name: &str) -> PathBuf {
         let dir = std::env::current_exe()
@@ -829,11 +842,10 @@ mod tests {
     /// cached and takes seconds, while no Xcode is ready: on the macOS runner (15
     /// `Xcode*.app`) that survey took over 30 s, against about 7 s with the cache kept. The survey runs under the sandbox, so
     /// what a lease wrote there reaches only sandboxed tools. The Xcode's own
-    /// `xcodebuild` is a fake that answers a build saying whether it saw the cache.
+    /// `xcodebuild` is a fake that answers build `CACHE` while the cache is there, and
+    /// fails once it is gone.
     #[tokio::test]
     async fn the_first_survey_finds_the_xcrun_cache_kept() {
-        use std::os::unix::fs::PermissionsExt as _;
-
         let dir = scratch("forget");
         tls_files(&dir);
         let (temp, cache) = (dir.join("T"), dir.join("C"));
@@ -844,15 +856,18 @@ mod tests {
         let program = apps
             .join("Xcode_1.app/Contents/Developer")
             .join(xcode::XCODEBUILD);
-        std::fs::create_dir_all(program.parent().expect("bin")).expect("bin");
-        let script = format!(
-            "#!/bin/sh\n\
-             if [ -e '{}/xcrun_db' ]; then echo 'Build version CACHE'; \
-             else echo 'Build version 1A1'; fi\n",
-            temp.display()
+        fake(
+            &program,
+            &format!(
+                "*\t-\twait-for {}/xcrun_db 0 ; echo Build version CACHE\n",
+                temp.display()
+            ),
         );
-        std::fs::write(&program, script).expect("script");
-        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        // On macOS the survey runs under the real sandbox, which lets it write only in
+        // its lease directory and under /dev: the fake's log of its runs (beside it,
+        // see kbf_testkit::fake) goes to /dev/null.
+        std::os::unix::fs::symlink("/dev/null", format!("{}.log", program.display()))
+            .expect("log link");
         let flag = |name: &str, path: &Path| format!("--{name}={}", path.display());
         let cli = Cli::try_parse_from([
             "kbf-daemon".to_owned(),
@@ -886,44 +901,39 @@ mod tests {
     /// Catches (CEO decision on issue #164): the native daemon's survey of its Xcodes
     /// asking a question outside the actions' sandbox, `xcrun`'s lookup above all (it
     /// reads and fills a cache leases can write), or with an `xcrun` other than the one
-    /// the daemon warms. The sandbox program is a fake that marks what it runs; the
-    /// Xcode's `xcodebuild` and the `xcrun` are fakes that log each run and whether it
-    /// was marked. The warm-up of the Xcode the survey finds ready runs too, also
+    /// the daemon warms. The sandbox program is a fake that marks what it runs (its
+    /// `-D KBF_LEASE=<dir>` in the command's environment); the Xcode's `xcodebuild` and
+    /// the `xcrun` are fakes that log each run and the mark, empty when unmarked. The
+    /// warm-up of the Xcode the survey finds ready runs too, also
     /// sandboxed; the test waits for it to end. Also catches the warm-up not run, or
     /// run before the survey's questions are answered (its lookups would make the
     /// survey's miss): the fake `xcodebuild` answers after half a second, so a warm-up
     /// started with the daemon logs before it.
     #[tokio::test]
     async fn the_daemons_survey_runs_under_the_sandbox() {
-        use std::os::unix::fs::PermissionsExt as _;
-
         let dir = scratch("sandboxed");
         tls_files(&dir);
         let log = dir.join("ran");
-        let write = |path: &Path, script: &str| {
-            std::fs::create_dir_all(path.parent().expect("parent")).expect("dir");
-            std::fs::write(path, script).expect("script");
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
-        };
         let sandbox_exec = dir.join("sandbox-exec");
-        write(
-            &sandbox_exec,
-            "#!/bin/sh\nlease=\"${2#KBF_LEASE=}\"; shift 4\nKBF_FAKE_SANDBOX=\"$lease\" exec \"$@\"\n",
-        );
-        let logged = format!(
-            "echo \"$(basename \"$0\") ${{KBF_FAKE_SANDBOX:-unsandboxed}} $*\" >> '{}'\n",
-            log.display()
-        );
+        fake(&sandbox_exec, "");
+        // `<tool> <the sandbox's lease directory, empty when unsandboxed> <arguments>`.
+        let logged = |tool: &str| format!("append {} {tool} ${{KBF_LEASE}} $*", log.display());
         let apps = dir.join("Applications");
         let xcodebuild = apps
             .join("Xcode_1.app/Contents/Developer")
             .join(xcode::XCODEBUILD);
-        write(
+        fake(
             &xcodebuild,
-            &format!("#!/bin/sh\nsleep 0.5\n{logged}echo 'Build version 1A1'\n"),
+            &format!(
+                "*\t-\tsleep 0.5 ; {} ; echo Build version 1A1\n",
+                logged("xcodebuild")
+            ),
         );
         let xcrun = dir.join("bin/xcrun");
-        write(&xcrun, &format!("#!/bin/sh\n{logged}echo /x/clang\n"));
+        fake(
+            &xcrun,
+            &format!("*\t-\t{} ; echo /x/clang\n", logged("xcrun")),
+        );
         let flag = |name: &str, path: &Path| format!("--{name}={}", path.display());
         let cli = Cli::try_parse_from([
             "kbf-daemon".to_owned(),

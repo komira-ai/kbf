@@ -1,24 +1,31 @@
 //! Programs for kbf's tests to run in place of shell scripts.
 //!
 //! - [`act`]: `kbf-act STEP [; STEP]...`, a fixed set of verbs (exit, sleep, echo,
-//!   append, env, pwd, id, kill-self, spawn-child, setsid, alloc, upper) that a test
-//!   puts in an action's or a child's argv where it would have written `sh -c`.
+//!   append, env, pwd, id, kill-self, spawn-child, setsid, alloc, upper, rename,
+//!   symlink, chmod, wait-for) that a test puts in an action's or a child's argv where
+//!   it would have written `sh -c`.
 //! - [`fake`]: the same binary run through a link named `xcrun`, `xcodebuild` or
 //!   `sandbox-exec` answers as that tool, from a rules file the test writes.
 //! - [`m2`]: the verbs of `kbf-m2-act`, the program every action of the M2 sample
 //!   project runs (the M2 image has no shell).
 //!
-//! A test runs these through a bin of its own package, because Cargo sets
-//! `CARGO_BIN_EXE_<name>` only for the bins of the package under test. The bin is
-//! three lines that call [`act::main`], declared with `test = false` under a name of
-//! its own (two packages with a bin of the same name collide in `target/`).
+//! A test runs [`act`] and the fakes in one of two ways:
+//! - through a bin of its own package, because Cargo sets `CARGO_BIN_EXE_<name>` only
+//!   for the bins of the package under test, and only in its integration tests. The
+//!   bin is three lines that call [`act::main`], declared with `test = false` under a
+//!   name of its own (two packages with a bin of the same name collide in `target/`).
+//!   That package then has this crate as a normal dependency (Cargo has no per-bin
+//!   dependencies);
+//! - through the test binary itself, which expands [`act_test_hook!`] and is run
+//!   through a link that [`act::link_self`] makes, named [`act::NAME`] or for a fake's
+//!   tool. This crate then stays a dev-dependency, out of the dependencies (and the
+//!   SBOM) of a binary the package ships, and unit tests can run it too.
 //!
 //! Every program here exits 0 when it did what it was asked, 1 when a step failed and
 //! 2 on a usage error, each failure with one line on stderr, except where a verb sets
 //! the status (`exit`, or the fakes' answers).
 
 use std::io::Write;
-use std::process::ExitCode;
 
 pub mod act;
 pub mod fake;
@@ -35,14 +42,36 @@ enum Error {
 
 /// Exit status `code`, or the status `error` calls for with its reason on stderr,
 /// after `program: `.
-fn exit_with(program: &str, result: Result<u8, Error>) -> ExitCode {
+fn status(program: &str, result: Result<u8, Error>) -> u8 {
     let (code, why) = match result {
-        Ok(code) => return ExitCode::from(code),
+        Ok(code) => return code,
         Err(Error::Usage(why)) => (2, why),
         Err(Error::Failed(why)) => (1, why),
     };
     eprintln!("{program}: {why}");
-    ExitCode::from(code)
+    code
+}
+
+/// Makes the test binary it is expanded in answer as `kbf-act`, or as a fake, when it
+/// is run through a link named for one (see [`act::link_self`]). It runs
+/// [`act::hook`] before the test harness reads its arguments, from the platform's list
+/// of start-up functions. Expand it once per test binary.
+#[macro_export]
+macro_rules! act_test_hook {
+    () => {
+        const _: () = {
+            extern "C" fn kbf_act_hook() {
+                $crate::act::hook();
+            }
+            #[used]
+            #[cfg_attr(target_os = "linux", unsafe(link_section = ".init_array"))]
+            #[cfg_attr(
+                target_vendor = "apple",
+                unsafe(link_section = "__DATA,__mod_init_func,mod_init_funcs")
+            )]
+            static KBF_ACT_HOOK: extern "C" fn() = kbf_act_hook;
+        };
+    };
 }
 
 /// The process's arguments after argv0, refusing one that is not UTF-8, and argv0.

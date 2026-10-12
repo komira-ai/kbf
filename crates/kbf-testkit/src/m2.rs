@@ -30,7 +30,10 @@ pub const HOG_MIB_PER_SEC: u64 = 256;
 #[must_use]
 pub fn main() -> ExitCode {
     let (_, args) = crate::arguments();
-    crate::exit_with("kbf-m2-act", args.and_then(|args| run(&args)))
+    ExitCode::from(crate::status(
+        "kbf-m2-act",
+        args.and_then(|args| run(&args)),
+    ))
 }
 
 fn run(args: &[String]) -> Result<u8, Error> {

@@ -31,7 +31,10 @@
 //!   does not know.
 //! - `sandbox-exec` skips its options (`-f`, `-n`, `-p` and `-D`, each with a value)
 //!   and replaces itself with the command after them, so the command runs unsandboxed
-//!   with the same process id; with no command it exits 2.
+//!   with the same process id; with no command it exits 2. Each `-D NAME=VALUE` (a
+//!   profile parameter to the real one) is put in the command's environment, so a fake
+//!   the command runs can tell it ran under `sandbox-exec`, and with which values; a
+//!   `-D` value without `=` exits 2.
 
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
@@ -208,12 +211,21 @@ fn with_suffix(path: &Path, suffix: &str) -> String {
     format!("{}{suffix}", path.display())
 }
 
-/// Replaces this process with the command after `sandbox-exec`'s options in `args`.
+/// Replaces this process with the command after `sandbox-exec`'s options in `args`,
+/// each `-D NAME=VALUE` put in its environment.
 fn exec_command(args: &[String]) -> Result<u8, Error> {
     let mut rest = args;
-    while let [option, _, after @ ..] = rest {
+    let mut params = Vec::new();
+    while let [option, value, after @ ..] = rest {
         if !["-f", "-n", "-p", "-D"].contains(&option.as_str()) {
             break;
+        }
+        if option == "-D" {
+            params.push(
+                value
+                    .split_once('=')
+                    .ok_or_else(|| Error::Usage(format!("-D {value:?} is not NAME=VALUE")))?,
+            );
         }
         rest = after;
     }
@@ -223,7 +235,7 @@ fn exec_command(args: &[String]) -> Result<u8, Error> {
                 .to_owned(),
         ));
     };
-    let error = Command::new(program).args(program_args).exec();
+    let error = Command::new(program).args(program_args).envs(params).exec();
     Err(Error::Failed(format!("exec {program}: {error}")))
 }
 

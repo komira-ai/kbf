@@ -172,6 +172,8 @@ fn micros(t: libc::timeval) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::process::CommandExt as _;
+
     use super::*;
 
     /// Catches a failed `wait4` read as "still running" (the lease would poll forever)
@@ -193,8 +195,11 @@ mod tests {
     /// under WNOHANG until it exits), and its exit status lost.
     #[tokio::test]
     async fn a_running_process_is_waited_for() {
-        let mut command = Command::new("sh");
-        command.args(["-c", "sleep 0.1; exit 5"]);
+        // This test binary, answering as kbf-testkit's `kbf-act` (the hook in lib.rs).
+        let mut command = Command::new(std::env::current_exe().expect("this program"));
+        command
+            .arg0(kbf_testkit::act::NAME)
+            .args(["sleep", "0.1", ";", "exit", "5"]);
         let child = Child::spawn(command).await.expect("spawned");
         let exited = child
             .wait(std::future::pending())
