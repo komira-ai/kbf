@@ -29,20 +29,16 @@ tools/mac-provision/test/hosted-macos.sh	tests of kbf-mac-provision; to become R
 tools/mac-provision/test/mutants.sh	tests of kbf-mac-provision; to become Rust tests of its crate
 tools/mac-provision/test/run.sh	tests of kbf-mac-provision; to become Rust tests of its crate
 tools/spike/lib.sh	SPIKE line helpers for the XCUITest sandbox check; goes with it
-tools/spike/macos/automation_mode.sh	macOS probe kit; to be deleted once its findings are documented
 tools/spike/macos/fixtures/gen_projects.py	generates the XCUITest fixture projects; to be ported to Rust or deleted
 tools/spike/macos/fixtures/run.sh	XCUITest sandbox check (spike-xcuitest workflow); to become a Rust macOS test
 tools/spike/macos/fixtures/selftest.sh	XCUITest sandbox check (spike-xcuitest workflow); to become a Rust macOS test
-tools/spike/macos/lib.sh	macOS probe kit; to be deleted once its findings are documented
-tools/spike/macos/simctl.sh	macOS probe kit; to be deleted once its findings are documented
-tools/spike/macos/tcc.sh	macOS probe kit; to be deleted once its findings are documented
-tools/spike/macos/test/fake_generator.sh	macOS probe kit; to be deleted once its findings are documented
-tools/spike/macos/test/fake_run.sh	macOS probe kit; to be deleted once its findings are documented
-tools/spike/macos/test/fakecmd	macOS probe kit; to be deleted once its findings are documented
-tools/spike/macos/test/mutants.sh	macOS probe kit; to be deleted once its findings are documented
-tools/spike/macos/test/run.sh	macOS probe kit; to be deleted once its findings are documented
-tools/spike/macos/verdicts.sh	macOS probe kit; to be deleted once its findings are documented
-tools/spike/macos/volume_owner.sh	macOS probe kit; to be deleted once its findings are documented
+tools/spike/macos/lib.sh	SPIKE line, arm and verdict helpers of the XCUITest sandbox check; goes with it
+tools/spike/macos/test/fake_generator.sh	selftest of the XCUITest sandbox check; goes with it
+tools/spike/macos/test/fake_run.sh	selftest of the XCUITest sandbox check; goes with it
+tools/spike/macos/test/fakecmd	selftest of the XCUITest sandbox check; goes with it
+tools/spike/macos/test/mutants.sh	selftest of the XCUITest sandbox check; goes with it
+tools/spike/macos/test/run.sh	selftest of the XCUITest sandbox check; goes with it
+tools/spike/macos/verdicts.sh	verdict step of the XCUITest sandbox check; goes with it
 tools/spike/macos/xcuitest_sandbox.sh	XCUITest sandbox check (spike-xcuitest workflow); to become a Rust macOS test
 
 # Production Rust under crates/*/src/ that names a shell and a `-c` flag. Key: the path.
