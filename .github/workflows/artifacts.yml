@@ -75,21 +75,21 @@ jobs:
           lookup-only: ${{ github.event_name == 'push' }}
       - name: Install cargo-cyclonedx (pinned version and checksum)
         run: cargo xtask fetch --url "https://github.com/CycloneDX/cyclonedx-rust-cargo/releases/download/cargo-cyclonedx-$CYCLONEDX_VERSION/cargo-cyclonedx-$TARGET.tar.xz" --sha256 "$CYCLONEDX_SHA256_AARCH64_DARWIN" --out "$HOME/.cargo/bin/cargo-cyclonedx" --extract tar.xz --member "cargo-cyclonedx-$TARGET/cargo-cyclonedx"
-      - run: sw_vers && uname -m && xcodebuild -version
+      - run: sw_vers
+      - run: uname -m
+      - run: xcodebuild -version
       - run: cargo cyclonedx --version
       - run: cargo build --locked --release --target "$TARGET" -p kbf-node --bin kbf-daemon
       - name: Sign ad hoc with the hardened runtime, and check it
         run: bash tools/ci/sign-darwin.sh "target/$TARGET/release/kbf-daemon"
       - name: SBOM
-        run: |
-          cargo cyclonedx --format json --spec-version 1.5 --describe binaries --target "$TARGET"
-          git diff --exit-code -- Cargo.lock
+        run: cargo cyclonedx --format json --spec-version 1.5 --describe binaries --target "$TARGET"
+      - name: The SBOM step left Cargo.lock unchanged
+        run: git diff --exit-code -- Cargo.lock
       - name: Package
         run: cargo xtask package --binary "target/$TARGET/release/kbf-daemon" --sbom crates/kbf-node/kbf-daemon_bin.cdx.json --platform darwin-arm64 --commit "$GITHUB_SHA" --out dist
       - name: Check the packaged binary's signature, and run it
-        run: |
-          bash tools/ci/check-darwin-asset.sh \
-            "dist/kbf-daemon-$GITHUB_SHA-darwin-arm64.tar.gz" kbf-daemon
+        run: bash tools/ci/check-darwin-asset.sh "dist/kbf-daemon-$GITHUB_SHA-darwin-arm64.tar.gz" kbf-daemon
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: assets-darwin-arm64
@@ -138,9 +138,9 @@ jobs:
       - run: cargo build --locked --release --target "$TARGET" -p kbf-node -p kbf-server --bins
       - run: cargo xtask build-commit check "target/$TARGET/release/kbf-server" "$GITHUB_SHA"
       - name: SBOM
-        run: |
-          cargo cyclonedx --format json --spec-version 1.5 --describe binaries --target "$TARGET"
-          git diff --exit-code -- Cargo.lock
+        run: cargo cyclonedx --format json --spec-version 1.5 --describe binaries --target "$TARGET"
+      - name: The SBOM step left Cargo.lock unchanged
+        run: git diff --exit-code -- Cargo.lock
       - name: Package kbf-daemon
         run: cargo xtask package --binary "target/$TARGET/release/kbf-daemon" --sbom crates/kbf-node/kbf-daemon_bin.cdx.json --platform linux-x86_64 --commit "$GITHUB_SHA" --out dist
       - name: Package kbf-server
@@ -191,9 +191,9 @@ jobs:
       - run: cargo build --locked --release --target "$TARGET" -p kbf-node -p kbf-server --bins
       - run: cargo xtask build-commit check "target/$TARGET/release/kbf-server" "$GITHUB_SHA"
       - name: SBOM
-        run: |
-          cargo cyclonedx --format json --spec-version 1.5 --describe binaries --target "$TARGET"
-          git diff --exit-code -- Cargo.lock
+        run: cargo cyclonedx --format json --spec-version 1.5 --describe binaries --target "$TARGET"
+      - name: The SBOM step left Cargo.lock unchanged
+        run: git diff --exit-code -- Cargo.lock
       - name: Package kbf-daemon
         run: cargo xtask package --binary "target/$TARGET/release/kbf-daemon" --sbom crates/kbf-node/kbf-daemon_bin.cdx.json --platform linux-arm64 --commit "$GITHUB_SHA" --out dist
       - name: Package kbf-server

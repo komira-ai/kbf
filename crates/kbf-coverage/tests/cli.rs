@@ -4,8 +4,9 @@
 //! Catches: the binary passing a run the ratchet fails (a crate missing more, or a
 //! baseline looser than measured) or the reverse, exiting 1 on a bad input instead of
 //! 2, a measured baseline that the binary cannot read back as passing, a directory
-//! under `crates/` without `Cargo.toml` taken for a crate, and a crate with no records
-//! left out of the table.
+//! under `crates/` without `Cargo.toml` taken for a crate, a crate with no records
+//! left out of the table, and a `--summary-file` truncated, left without the table or
+//! not written.
 //!
 //! Each test builds its own workspace in a fresh directory named for the test and the
 //! process, so no test reads a file an earlier run (or a concurrent one) left behind.
@@ -212,4 +213,58 @@ fn bad_inputs_exit_2_with_a_reason() {
     }
     std::fs::remove_file(root.join("lcov.info")).expect("remove lcov");
     expect_2(run(&root, MATCHING, &[]), "lcov.info: No such file");
+}
+
+/// Catches: `--summary-file` truncating the file (a job summary holds earlier steps'
+/// text, which `tee -a` kept), writing something other than the table stdout gets, or
+/// writing nothing; and, on a failing ratchet, the table left out of the summary or
+/// the exit status lost (the reason the old `| tee` step needed `pipefail`).
+#[test]
+fn summary_file_gets_the_table_appended_on_pass_and_fail() {
+    let root = workspace("summary");
+    let summary = root.join("summary.md");
+    let flag = ["--summary-file", summary.to_str().expect("UTF-8")];
+    for (baseline, code, last) in [
+        (MATCHING, 0, "coverage ratchet: PASS\n"),
+        (
+            "a 0 0\nb 0 -\nempty - -\n",
+            1,
+            "coverage ratchet: FAIL (1 crate(s) need attention; see status)\n",
+        ),
+    ] {
+        std::fs::write(&summary, "earlier step\n").expect("write summary");
+        let o = run(&root, baseline, &flag);
+        assert_eq!(o.status.code(), Some(code), "{}{}", stdout(&o), stderr(&o));
+        let out = stdout(&o);
+        assert!(out.ends_with(last), "{out}");
+        let written = std::fs::read_to_string(&summary).expect("read summary");
+        assert_eq!(written, format!("earlier step\n{out}"));
+    }
+    // Absent: created.
+    std::fs::remove_file(&summary).expect("remove summary");
+    let o = run(&root, MATCHING, &flag);
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    assert_eq!(
+        std::fs::read_to_string(&summary).expect("read summary"),
+        stdout(&o)
+    );
+}
+
+/// Catches: a summary file that cannot be written ignored, so the job summary goes
+/// missing while the step passes.
+#[test]
+fn an_unwritable_summary_file_exits_2() {
+    let root = workspace("summary-bad");
+    let dir = root.join("crates");
+    let o = run(
+        &root,
+        MATCHING,
+        &["--summary-file", dir.to_str().expect("UTF-8")],
+    );
+    assert_eq!(o.status.code(), Some(2), "{}", stderr(&o));
+    assert!(
+        stderr(&o).contains(&format!("append to {}:", dir.display())),
+        "{}",
+        stderr(&o)
+    );
 }
