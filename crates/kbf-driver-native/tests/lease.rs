@@ -2,6 +2,10 @@
 //! own environment, outputs and captured output back, the lease directory gone.
 
 mod support;
+// In this binary, not one of its own: the driver's generic code is counted by its best single
+// instantiation, one per test binary, so the simulator paths must run where the rest does.
+#[path = "lease/simulator.rs"]
+mod simulator;
 
 use std::sync::Arc;
 use std::time::Duration;

@@ -357,9 +357,11 @@ fn native_with(cli: &Cli, config: NativeConfig, xcrun: &Path) -> Result<(Daemon,
 /// every Xcode found as not surveyed yet, and none as ready.
 fn native_runtime(
     cli: &Cli,
-    config: NativeConfig,
+    mut config: NativeConfig,
     xcrun: &Path,
 ) -> Result<(Arc<NativeRuntime<CasClient>>, Reports), Error> {
+    // The simulators of the leases that ask for one are made with the same `xcrun`.
+    config.xcrun = xcrun.to_owned();
     let runtime = NativeRuntime::new(config, Arc::new(cas_client(cli)?))?;
     let runtime = Arc::new(runtime);
     let watched = Arc::clone(&runtime);

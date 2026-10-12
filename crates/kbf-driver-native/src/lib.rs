@@ -27,6 +27,10 @@
 //!   driver advertises every ready Xcode build, reports every installed Xcode with why
 //!   one is not ready and how to fix it, and asks again every few minutes,
 //!   [`xcode_watch`]);
+//! - a simulator of its own when its `simulator` platform property asks for one
+//!   ([`simulator`]): made in the default device set under the lease's name when the
+//!   lease starts, named by `KBF_SIMULATOR_UDID`, and shut down and deleted when it
+//!   ends, whatever the outcome (at the next start, if the daemon was killed);
 //! - a memory watch: every poll, the physical footprint of all the action's processes
 //!   together ([`procs`]); past the lease's limit, the whole tree is killed and the
 //!   lease ends RESOURCE_EXHAUSTED ([`kbf_daemon::RuntimeError::OutOfMemory`]);
@@ -118,6 +122,7 @@ pub mod procs;
 mod program;
 mod record;
 mod runtime;
+pub mod simulator;
 mod sweep;
 pub mod user_folders;
 pub mod whole_machine;

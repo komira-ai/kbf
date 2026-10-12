@@ -72,13 +72,16 @@ pub struct NativeConfig {
     pub user_folders: Option<UserFolders>,
     /// How old a leftover in [`Self::user_folders`] must be before a sweep removes it.
     pub leftover_age: Duration,
+    /// The `xcrun` that runs `simctl` for the leases that ask for a simulator
+    /// ([`crate::simulator`]).
+    pub xcrun: PathBuf,
 }
 
 impl NativeConfig {
     /// A configuration with a one hour default timeout, the default output limits and
     /// memory policy, a 250 ms poll, a 5 s kill wait, this node's isolation and user
-    /// folders, leftovers swept after [`LEFTOVER_AGE`], and no Xcode (see
-    /// [`Self::xcodes`]).
+    /// folders, leftovers swept after [`LEFTOVER_AGE`], no Xcode (see [`Self::xcodes`])
+    /// and the system `xcrun`.
     #[must_use]
     pub fn new(scratch: PathBuf) -> Self {
         Self {
@@ -92,6 +95,7 @@ impl NativeConfig {
             xcodes: BTreeMap::new(),
             user_folders: UserFolders::detect(),
             leftover_age: LEFTOVER_AGE,
+            xcrun: PathBuf::from(crate::xcode::XCRUN),
         }
     }
 }

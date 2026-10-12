@@ -258,6 +258,75 @@ platform(
 )
 ```
 
+## `simulator`
+
+On Macs, `simulator=<device type>,<runtime>` gives the action a simulator of its own:
+the native driver makes a new device for the lease before the action runs and deletes
+it when the lease ends. Without it, every simulator an action uses is one the daemon
+user's leases share, so two leases' UI tests can use the same device at once and one
+can leave it dirty for the next. The name is read in any case; the value is exact.
+
+| Part | Values |
+|---|---|
+| `<device type>` | a `simctl` device type, by identifier (`com.apple.CoreSimulator.SimDeviceType.iPhone-16`) or by name (`iPhone 16`) |
+| `<runtime>` | a `simctl` runtime identifier (`com.apple.CoreSimulator.SimRuntime.iOS-18-4`) |
+
+Both are required, separated by one comma; any other value is refused with
+`INVALID_ARGUMENT`. The value is passed to `xcrun simctl create` unchanged, so what
+`xcrun simctl list devicetypes` and `xcrun simctl list runtimes` print are the values
+that work.
+
+- **At start**, after the inputs are written, the driver runs `xcrun simctl create
+  kbf-lease-<term>-<seq> <device type> <runtime>`, under the actions' sandbox with the
+  network off and with the Xcode the action's `xcode` property names. The device is
+  in the daemon user's default device set (`~/Library/Developer/CoreSimulator/Devices`):
+  `xcodebuild -destination` finds only the devices of that set, not one made in a set
+  elsewhere with `simctl --set` (the native-macos job checks both). If the command
+  fails (a runtime the Mac does not have, a device type the runtime does not
+  support) or does not answer within two minutes, the lease fails with `simctl`'s
+  reason and the action does not run.
+- **The action** finds the device's UDID in `KBF_SIMULATOR_UDID` (it wins over the
+  Command's environment). The device is made shut down:
+
+  ```sh
+  xcrun simctl bootstatus "$KBF_SIMULATOR_UDID" -b
+  xcodebuild test -project App.xcodeproj -scheme App -destination "id=$KBF_SIMULATOR_UDID"
+  ```
+
+- **At the end**, whatever the outcome (exit, failure, timeout, kill, a run the daemon
+  drops), before the lease directory is removed: the device the create printed, and
+  any other device named for the lease (one a create cut short made late), is shut
+  down and deleted, each by its UDID, with the Mac's default Xcode. The daemon keeps
+  the UDID itself, so nothing the action writes in its lease directory changes what is
+  deleted. A delete that fails fails the lease, as a lease directory that cannot be
+  removed does. A daemon that was killed during such a lease deletes, at its next
+  start, every device whose name starts `kbf-lease-`: give no device of your own such
+  a name on a farm Mac.
+
+**Not isolated.** A booted simulator's processes run under `CoreSimulatorService`,
+outside the actions' sandbox and its network-off rule, and the action can reach every
+device of the default set with `simctl`, not only its own. The property gives a lease
+a clean device of its own; it does not confine what the action does with simulators.
+
+The scheduler does not read `simulator`: name `OSFamily=darwin` too, or the action
+may be placed on a Linux worker, whose driver does not read it either. A Mac that does
+not have the runtime fails the lease. Hosts set up by `kbf-mac-provision` have no
+simulator runtimes ([macos-vms.md](design/macos-vms.md)), so there the property works
+only once runtimes are installed.
+
+```starlark
+# Bazel: a test that drives an iOS app on its own simulator
+sh_test(
+    name = "app_ui_test",
+    srcs = ["app_ui_test.sh"],
+    exec_properties = {
+        "OSFamily": "Darwin",
+        "simulator": "com.apple.CoreSimulator.SimDeviceType.iPhone-16,com.apple.CoreSimulator.SimRuntime.iOS-18-4",
+    },
+    ...
+)
+```
+
 ## `vm.image` and the VM report keys
 
 macOS VM leases (`kbf-lease=vm`, [macos-vms.md](design/macos-vms.md)) are **planned**:

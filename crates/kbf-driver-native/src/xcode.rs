@@ -573,7 +573,7 @@ impl Sandbox {
     }
 
     /// `program args` under this sandbox with the network off, `TMPDIR` its directory.
-    fn command(&self, program: &Path, args: &[&str]) -> std::process::Command {
+    pub(crate) fn command(&self, program: &Path, args: &[&str]) -> std::process::Command {
         let args: Vec<String> = args.iter().map(|&a| a.to_owned()).collect();
         let (program, args) = self.isolation.wrap(
             Network::Off,
@@ -672,7 +672,7 @@ const POLL: Duration = Duration::from_millis(10);
 /// held a good Xcode's output open until it was killed. A file is opened close-on-exec
 /// at once, and a process the program leaves holding it (or one that inherited it
 /// anyway) cannot hold the answer back.
-fn output_within(
+pub(crate) fn output_within(
     mut command: std::process::Command,
     within: Duration,
     dir: &Path,
