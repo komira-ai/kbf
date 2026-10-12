@@ -13,6 +13,7 @@ bytes.workspace = true
 futures.workspace = true
 kbf-auth.workspace = true
 kbf-caps.workspace = true
+kbf-invocation.workspace = true
 kbf-meta.workspace = true
 kbf-objstore.workspace = true
 kbf-proto.workspace = true

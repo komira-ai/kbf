@@ -18,10 +18,14 @@ record is the *invocation record*.
 
 Read on `main`:
 
-- **The id is read, not recorded.** `kbf_front::RequestMetadataLayer` reads every REAPI
-  call's `RequestMetadata` header into a `CallMetadata` (section 2.2), and Execute puts
-  its `tool_invocation_id` on its `execute` trace span (`invocation`, `-` when absent).
-  Nothing else uses it yet: there is no invocation record.
+- **The id is read and recorded in memory.** `kbf_front::RequestMetadataLayer` reads
+  every REAPI call's `RequestMetadata` header into a `CallMetadata` (section 2.2), and
+  Execute puts its `tool_invocation_id` on its `execute` trace span (`invocation`, `-`
+  when absent). The services and the farm send each call that carries an id, and the
+  lease events and outcome of its operations, to `kbf_front::Recorder` (3.4), which
+  keeps the records in memory within `--invocation-memory` (3.5, stage 1). Nothing
+  reads them yet: there is no read API, and a call without an id is not recorded
+  (the minted id of 2.3 comes with its link, PR 6).
 - **Per-operation state lives about a minute.** The scheduler keeps a finished operation
   for `FINISHED_RETENTION` (60 s, `kbf-sched/src/scheduler.rs`); then WaitExecution
   answers NOT_FOUND. All scheduler state is in memory and is lost on restart.
@@ -227,6 +231,19 @@ first; 3.5 says what happens then.
   a bounded channel. **A full channel drops the event and never waits**: dispatch and
   cache reads are never slowed by the record. A drop marks the invocation
   `complete: false` and increments `kbf_invocation_events_dropped`.
+- The channel holds at most 65,536 events and, together, at most `--invocation-memory`
+  bytes of them (`Event::bytes`: each event and what it owns, its listing's outputs
+  most of all; an estimate, like the records' bytes); past either it drops. Each event's listing is cut where it is built,
+  at one output past a row's 1,000 (3.2), so that the row still says
+  `outputs_truncated`. So the channel holds no more than the bound, and the recorder
+  as a whole (records and channel) about twice it.
+- Only calls that carry an id make events, and only operations such a call waits on
+  (the farm notes each one as the call's Execute is submitted, and forgets it at the
+  operation's end). For any other call or operation a seam costs a branch or a set
+  lookup, and no event and no listing is built; with the recorder off, nothing is
+  noted.
+- The recorder's task applies events on a task of its own, beside the tick and the
+  listeners.
 - The seams that emit: the new metadata layer (calls and their ids); Execute's submit and
   its cached and joined answers (`kbf-front/src/execution.rs`); GetActionResult
   (`action_cache.rs`); the lease grant and `Sent` in `FarmMachine`; the requeue drain that
@@ -251,8 +268,38 @@ At the bound, in this order:
 2. evict `idle` invocations (3.1), least recently seen first; an invocation with an
    operation in flight is never idle, so a build waiting on one long action is kept;
 3. if only open invocations remain, the largest stops taking rows: its actions are still
-   counted, and it says `rows_capped: true`. One build at the 1,000,000-row cap (3.3)
-   does not fit in 256 MiB, so in stage 1 a very large build is capped by memory first.
+   counted, and it says `rows_capped: true`. A row that still does not fit is not
+   taken, and its invocation says `rows_capped: true` too. One build at the
+   1,000,000-row cap (3.3) does not fit in 256 MiB, so in stage 1 a very large build is
+   capped by memory first.
+
+The bound holds after every event, for everything an event adds, not only new rows:
+rows already taken keep filling in (attempts, the outcome, the listing) after their
+invocation stops taking rows. Each addition is admitted like a row, making room in
+the order above; what still does not fit is left out, and the invocation says
+`complete: false`: a listing keeps the outputs that fit (and the row says
+`outputs_truncated: true`); an attempt, an outcome's message or reason, an instance
+name, a later Execute's row and a call's wait on its operation are not set; and a new
+invocation is not made, so its caller's next call makes it incomplete, as after a
+dropped call (3.4).
+
+The bound counts each invocation (its header, its rows and its entries in the
+recorder's indexes) and each operation the invocations' calls wait on (its attempts
+and its waiting calls), as the bytes the allocator is asked for: the types' sizes,
+the row lists' capacity, every copy of an id, and B-tree nodes estimated from the
+standard library's node layout; every other list is allocated to its length. Not
+counted: the first node of each index (about 2 kB together), the allocator's own
+overhead, and the dropped calls of invocations not made yet, held to a sixteenth of
+the bound besides it (and to 1,024; past either the oldest is forgotten). A counting
+allocator in the tests measures the records' heap against the bound after every
+event, across 30 to 300 open builds with twins, requeues, 5 KB failure texts and
+1,001-output listings; 10 to 100 builds of 500 to 3,000 actions that each wait
+alone; a rolling window of 20,000 operations, each joined by minted twins and
+finished 500 later; header-only invocations; and cache hits, at bounds from 200 kB
+to 20 MB, and 50 kB for the rolling window. The highest it measured is 1.08 times
+the bound at 200 kB and above (the rolling window, at 200 kB) and 1.12 at 50 kB,
+where the uncounted first nodes are about 5% of the bound; the tests fail past
+1.25.
 
 In stage 2 a flushed row is in a chunk and leaves memory, so the bound covers only
 unflushed rows and the header fields; step 3 then applies only when flushes fail
@@ -671,8 +718,8 @@ defect it catches and the mutant planted to see it go red.
    longer than the idle time, with no call, is not idle and not evicted (plant
    "`last_seen` = last call", red); at the bound with only open invocations the largest
    says `rows_capped` and memory stays under the bound; an end-to-end run with fake
-   daemons (`kbf-testkit`) yields the expected rows for a hit, a run, a requeue and a
-   failure.
+   daemons (`kbf-server`'s test support) yields the expected rows for a hit, a run, a
+   requeue and a failure.
 4. **(M) The read API** (4.1 to 4.5 minus blobs) and the policy keys (4.3). Tests: paging
    while rows are appended never skips or repeats (property test); a token with another
    filter is `400`; with no `invocations` key the routes are `404` (plant "default allow",

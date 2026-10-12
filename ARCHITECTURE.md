@@ -68,6 +68,9 @@ role (`--role=all`). The flags are:
   for REAPI clients to disconnect after their open Execute and WaitExecution streams
   that are not done are ended `UNAVAILABLE` (a finished operation a stream is waiting
   on is still sent first);
+- `--invocation-memory` (bytes, default 268435456, 256 MiB), the memory the invocation
+  records take together ([invocations.md](docs/design/invocations.md) section 3.5):
+  each build's calls, leases and outcomes, kept in memory only and lost on restart;
 - `--api-listen`, off unless given: the operator API, HTTP/JSON under `/v1`
   ([docs/api.md](docs/api.md)). Reads are open, so bind it where only operators
   reach it; writes need the token in `--api-token-file` (owner-only file), come from
@@ -99,10 +102,10 @@ what lets a simulation seed replay a run exactly (see [Testing](#testing)).
 | `kbf-segments` | yes | the segment format and FastCDC chunking |
 | `kbf-caps` | yes | CPU capability parsing, ISA levels, request matching |
 | `kbf-raft` | yes | a sans-IO Raft core ([ADR 0001](docs/adr/0001-consensus.md)) and its host loop over `Storage`, `Transport` and `Machine` traits, with an in-memory storage |
-| `kbf-invocation` | yes | the invocation record ([invocations.md](docs/design/invocations.md) section 3): each build's header, counters and action rows, built only from events (calls, lease grants, starts, requeues, finishes), and its `kbf.invocation.v1` encoding; the recorder that feeds it is **planned** |
+| `kbf-invocation` | yes | the invocation record ([invocations.md](docs/design/invocations.md) section 3): each build's header, counters and action rows, built only from events (calls, lease grants, starts, requeues, finishes), its `kbf.invocation.v1` encoding, and the memory bound of section 3.5 (minted, then idle records evicted; then the largest open one closed to new rows, and whatever else does not fit left out) |
 | `kbf-estimator` | yes | placeholder for learned action sizes (**planned**) |
 | `kbf-objstore` | no | the `ObjectStore` trait, an in-memory store, an S3 store, the conformance suite |
-| `kbf-front` | no | the REAPI services over a `Cache` and a `Dispatch` |
+| `kbf-front` | no | the REAPI services over a `Cache` and a `Dispatch`, and the invocation `Recorder` the services and the farm send events to (a channel bounded in events and bytes that drops, never waits) |
 | `kbf-server` | no | the server binary: wires front, scheduler and storage together; its side of the MDM gate (`mdm`) |
 | `kbf-proto` | no | generated code for REAPI, `kbf.worker.v1` and `kbf.log.v1` |
 | `kbf-log` | no | the replicated log's entry encoding: `kbf-meta` commands and the control commands (batched farm inputs, a result with its action-cache entry, takeover, checkpoint, machine version) to and from `kbf.log.v1`, under the log's format version |
