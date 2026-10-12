@@ -50,7 +50,7 @@ enum Cmd {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    if let Err(e) = session::refuse_root_here() {
+    if let (Cmd::Session, Err(e)) = (&cli.command, session::refuse_root_here()) {
         eprintln!("{e}");
         return ExitCode::from(2);
     }
