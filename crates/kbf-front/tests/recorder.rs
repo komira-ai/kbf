@@ -35,7 +35,7 @@ fn key(id: &str) -> RecordKey {
 
 fn downloaded(recorder: &Recorder, id: &str) {
     let caller = AuthenticationMetadata::default();
-    recorder.call(&metadata(id), &caller, "main", || CallKind::Downloaded(1));
+    recorder.call(&metadata(id), &caller, "main", &|| CallKind::Downloaded(1));
 }
 
 fn d(n: u8) -> Digest {
@@ -188,8 +188,8 @@ async fn a_call_is_recorded_under_its_id_and_caller() {
     tokio::spawn(recording.run());
     let caller = AuthenticationMetadata::new(Some(serde_json::json!({"user": "a"})), None);
     let no_id = CallMetadata::default();
-    recorder.call(&no_id, &caller, "main", || CallKind::Downloaded(1));
-    recorder.call(&metadata("b"), &caller, "main", || CallKind::Downloaded(1));
+    recorder.call(&no_id, &caller, "main", &|| CallKind::Downloaded(1));
+    recorder.call(&metadata("b"), &caller, "main", &|| CallKind::Downloaded(1));
     // The layer's texts reach the row, a truncated one marked so.
     let mut sent = metadata("b");
     sent.target_id = Text {

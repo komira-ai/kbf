@@ -70,11 +70,12 @@ impl<M: MetaLog, O: ObjectStore + 'static> ActionCache for ActionCacheService<M,
         let action = wire::digest(request.action_digest.as_ref())?;
         let stored = self.cache.action_result(&action).await?;
         let instance = &request.instance_name;
-        self.recorder
-            .call(&metadata, &caller, instance, || CallKind::GetActionResult {
+        self.recorder.call(&metadata, &caller, instance, &|| {
+            CallKind::GetActionResult {
                 action,
                 hit: stored.as_ref().map(|(digest, r)| listing(*digest, r)),
-            });
+            }
+        });
         match stored {
             Some((_, result)) => Ok(Response::new(result)),
             None => Err(Status::not_found(format!(

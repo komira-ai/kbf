@@ -97,7 +97,7 @@ impl<M: MetaLog, O: ObjectStore + 'static> ContentAddressableStorage for CasServ
         let digests = wire::digests(&request.blob_digests)?;
         let missing = self.cache.find_missing(&digests).await?;
         let instance = &request.instance_name;
-        self.recorder.call(&metadata, &caller, instance, || {
+        self.recorder.call(&metadata, &caller, instance, &|| {
             CallKind::FindMissingBlobs {
                 asked: digests.len() as u64,
                 missing: missing.len() as u64,
@@ -144,7 +144,7 @@ impl<M: MetaLog, O: ObjectStore + 'static> ContentAddressableStorage for CasServ
         // The bytes the client sent that verified, stored or not.
         let uploaded: u64 = good.iter().map(|b| b.digest().size_bytes).sum();
         let instance = &request.instance_name;
-        self.recorder.call(&metadata, &caller, instance, || {
+        self.recorder.call(&metadata, &caller, instance, &|| {
             CallKind::Uploaded(uploaded)
         });
         let stored = self.cache.store_blobs(good).await.map_err(Status::from);
@@ -211,7 +211,7 @@ impl<M: MetaLog, O: ObjectStore + 'static> ContentAddressableStorage for CasServ
         }
         let downloaded: usize = responses.iter().map(|r| r.data.len()).sum();
         self.recorder
-            .call(&metadata, &caller, &request.instance_name, || {
+            .call(&metadata, &caller, &request.instance_name, &|| {
                 CallKind::Downloaded(downloaded as u64)
             });
         Ok(Response::new(BatchReadBlobsResponse { responses }))

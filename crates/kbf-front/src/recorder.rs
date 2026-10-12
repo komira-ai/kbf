@@ -148,13 +148,14 @@ impl Recorder {
 
     /// Sends a call of the invocation `metadata` names, made by `caller` on
     /// `instance`, answered as `kind`; a call without an invocation id is not
-    /// recorded. `kind` is built only when the recorder is on.
+    /// recorded. `kind` is built only when the recorder is on. (A `dyn` closure, so
+    /// that every call site runs one copy of this function.)
     pub fn call(
         &self,
         metadata: &CallMetadata,
         caller: &AuthenticationMetadata,
         instance: &str,
-        kind: impl FnOnce() -> CallKind,
+        kind: &dyn Fn() -> CallKind,
     ) {
         if !self.is_on() {
             return;

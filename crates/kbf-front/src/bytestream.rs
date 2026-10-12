@@ -105,7 +105,7 @@ impl<M: MetaLog, O: ObjectStore + 'static> ByteStream for ByteStreamService<M, O
         };
         // Both bounds are at most the blob's length, which fits in memory.
         let wanted = blob.slice(offset as usize..end as usize);
-        self.recorder.call(&metadata, &caller, &instance, || {
+        self.recorder.call(&metadata, &caller, &instance, &|| {
             CallKind::Downloaded(wanted.len() as u64)
         });
         let messages: Vec<Result<ReadResponse, Status>> = wanted
@@ -187,7 +187,7 @@ impl<M: MetaLog, O: ObjectStore + 'static> ByteStream for ByteStreamService<M, O
         let blob = VerifiedBlob::new(digest, Bytes::from(received))?;
         self.cache.store_blobs(vec![blob]).await?;
         self.recorder
-            .call(&metadata, &caller, &instance, || CallKind::Uploaded(size));
+            .call(&metadata, &caller, &instance, &|| CallKind::Uploaded(size));
         Ok(committed(size))
     }
 

@@ -354,7 +354,7 @@ where
             tracing::debug!(%action, "answered from the action cache");
             let instance = &request.instance_name;
             self.recorder
-                .call(metadata, caller, instance, || CallKind::Execute {
+                .call(metadata, caller, instance, &|| CallKind::Execute {
                     action,
                     answer: ExecuteAnswer::Cached {
                         name: name.clone(),
