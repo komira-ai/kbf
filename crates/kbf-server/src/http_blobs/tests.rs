@@ -238,12 +238,21 @@ async fn get<M: MetaLog, O: ObjectStore + 'static>(
     state: &BlobState<M, O>,
     digest: &Digest,
 ) -> Response {
+    get_range(state, digest, None).await
+}
+
+/// The answer to a `GET` of `digest` with `Range: <range>` when `range` is given.
+async fn get_range<M: MetaLog, O: ObjectStore + 'static>(
+    state: &BlobState<M, O>,
+    digest: &Digest,
+    range: Option<&str>,
+) -> Response {
     let uri = format!("{PREFIX}{}-{}", digest.hash_hex(), digest.size_bytes);
-    let (parts, ()) = axum::http::Request::builder()
-        .uri(uri)
-        .body(())
-        .expect("a request")
-        .into_parts();
+    let mut request = axum::http::Request::builder().uri(uri);
+    if let Some(range) = range {
+        request = request.header(RANGE, range);
+    }
+    let (parts, ()) = request.body(()).expect("a request").into_parts();
     match answer(state, &parts).await {
         Ok(answer) | Err(answer) => answer,
     }
@@ -292,4 +301,45 @@ fn the_read_budget_holds_the_largest_blob() {
         u64::try_from(READ_BUDGET_BYTES),
         Ok(kbf_front::MAX_BLOB_BYTES)
     );
+}
+
+/// Catches (mutant "the budget is released only when the body's end is read"): an
+/// answer the client never reads (it went away) keeping its blob's budget, so three
+/// abandoned 8-byte downloads under a 10-byte budget would shut the route for good.
+#[tokio::test(start_paused = true)]
+async fn an_answer_dropped_unread_frees_its_budget() {
+    let (state, digests) = budgeted(10, &[b"8 bytes!"]).await;
+    for _ in 0..3 {
+        let answer = get(&state, &digests[0]).await;
+        assert_eq!(answer.status(), StatusCode::OK);
+        drop(answer);
+    }
+    assert_eq!(get(&state, &digests[0]).await.status(), StatusCode::OK);
+}
+
+/// Catches (mutant "a failed read keeps its permit"): a read that fails (here an
+/// absent blob of 10 bytes, the whole budget) never giving its budget back.
+#[tokio::test(start_paused = true)]
+async fn a_failed_read_frees_its_budget() {
+    let (state, digests) = budgeted(10, &[b"8 bytes!"]).await;
+    let absent = Digest::new(DigestFunction::Sha256, [9; 32], 10);
+    assert_eq!(get(&state, &absent).await.status(), StatusCode::NOT_FOUND);
+    assert_eq!(get(&state, &digests[0]).await.status(), StatusCode::OK);
+}
+
+/// Catches (mutant "a range answer copies its part"): a `206` that frees the whole
+/// blob's budget while its part is still being sent, which `Range: bytes=0-` would
+/// turn into reads the budget never counts. The part holds the whole blob's share
+/// until it is dropped.
+#[tokio::test(start_paused = true)]
+async fn a_part_holds_the_whole_blobs_budget() {
+    let (state, digests) = budgeted(10, &[b"8 bytes!"]).await;
+    let part = get_range(&state, &digests[0], Some("bytes=0-0")).await;
+    assert_eq!(part.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(
+        get(&state, &digests[0]).await.status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    drop(part);
+    assert_eq!(get(&state, &digests[0]).await.status(), StatusCode::OK);
 }
