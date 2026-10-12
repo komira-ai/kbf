@@ -50,7 +50,7 @@ fn unbounded(events: &[Event]) -> usize {
 
 /// The records after `events` within `bound`. Catches, after every event of every
 /// test that uses it, records held over the bound and a total that misses a change
-/// to one record (a recount left out).
+/// to one record or operation (a recount left out).
 fn bounded(bound: usize, events: &[Event]) -> Records {
     let mut r = Records::with_bound(ROW_CAP, bound);
     for e in events {
@@ -63,8 +63,8 @@ fn bounded(bound: usize, events: &[Event]) -> Records {
         let each: usize = r.keys().map(|k| r.get(k).expect("held").bytes()).sum();
         assert_eq!(
             r.bytes(),
-            each,
-            "the total is every record's bytes, after {e:?}"
+            each + r.operations_bytes(),
+            "the total is every record's and operation's bytes, after {e:?}"
         );
     }
     r
@@ -192,8 +192,10 @@ fn a_collision_after_the_owner_is_evicted_gets_a_new_key() {
     );
     second.owner = owner("o2");
     let events = [hit("x", t(0), 10), ev(second.clone())];
-    // Room for two records: the third evicts the idle owner record `x`.
-    let bound = unbounded(&events);
+    // Room for two records and a record with no row (and its index entries): the
+    // third, with a row, evicts the idle owner record `x`; the fourth fits.
+    let header = unbounded(&[ev(call("y", t(0), CallKind::Downloaded(1)))]);
+    let bound = unbounded(&events) + header + 100;
     let mut r = bounded(bound, &events);
     let mut third = second;
     third.owner = owner("o3");
@@ -320,32 +322,36 @@ fn finished_wide(op: u64, result: u8, at: WallTime) -> Event {
 }
 
 /// Catches a bound held only when a row is added: rows already taken grow when their
-/// operation finishes (here by 50 outputs each). Past the bound the idle record goes
-/// (plant: no `shrink` after an event, and `q` stays), then with only open records
-/// the largest is closed to new rows, and once every record is closed nothing more
-/// is done.
+/// operation finishes (here by up to 50 outputs each). The idle record goes first
+/// (plant "no room made for a listing": `q` stays and the listing is cut at once),
+/// then the listing keeps the outputs that fit and its record says
+/// `complete: false`; once nothing fits, a new row is refused with `rows_capped`.
 #[test]
-fn growth_past_the_bound_evicts_idle_records_then_closes_open_ones() {
-    let events = [
+fn growth_past_the_bound_evicts_idle_records_then_trims_what_fills_in() {
+    let mut events = vec![
         hit("q", t(0), 10),
         queued("r", t(700), 11, 1),
         queued("s", t(700), 12, 2),
     ];
     let bound = unbounded(&events);
-    let mut r = bounded(bound, &events);
-    r.apply(finished_wide(1, 20, t(701)));
+    events.push(finished_wide(1, 20, t(701)));
+    let r = bounded(bound, &events);
     assert_eq!(held(&r), ["r", "s"], "the idle record goes first");
-    assert!(
-        r.get(&key("r")).expect("r").rows_capped(),
-        "then the largest closes"
-    );
-    assert!(!r.get(&key("s")).expect("s").rows_capped());
-    r.apply(finished_wide(2, 21, t(702)));
-    assert!(r.get(&key("s")).expect("s").rows_capped());
-    // Every record is closed; another event over the bound changes nothing.
-    r.apply(hit("s", t(703), 13));
+    let ran = &r.get(&key("r")).expect("r").rows()[0];
+    let kept = ran.listing.as_ref().expect("listed").outputs.len();
+    assert!(kept > 0 && kept < 50, "{kept} of 50 outputs kept");
+    assert!(ran.outputs_truncated);
+    assert!(!r.get(&key("r")).expect("r").complete());
+    assert!(r.get(&key("s")).expect("s").complete());
+
+    events.push(finished_wide(2, 21, t(702)));
+    events.push(hit("s", t(703), 13));
+    let r = bounded(bound, &events);
     assert_eq!(held(&r), ["r", "s"]);
-    assert_eq!(r.get(&key("s")).expect("s").rows().len(), 1);
+    let s = r.get(&key("s")).expect("s");
+    assert!(!s.complete());
+    assert!(s.rows_capped(), "no room for a new row");
+    assert_eq!(s.rows().len(), 1);
 }
 
 /// Catches an evicted collision left in its owner's list (the owner's page would

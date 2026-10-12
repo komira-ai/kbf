@@ -199,13 +199,14 @@ impl ActionRow {
         }
     }
 
-    /// Copies the result's listing into the row, keeping the first
-    /// [`OUTPUTS_PER_ROW`] outputs.
-    pub(crate) fn set_listing(&mut self, mut listing: Listing) {
-        self.outputs_truncated = listing.outputs.len() > OUTPUTS_PER_ROW;
+    /// Copies the result's listing into the row, keeping the first `keep` of its
+    /// outputs, and no more than [`OUTPUTS_PER_ROW`].
+    pub(crate) fn set_listing(&mut self, mut listing: Listing, keep: usize) {
+        let keep = keep.min(OUTPUTS_PER_ROW);
+        self.outputs_truncated = listing.outputs.len() > keep;
         if self.outputs_truncated {
             // Truncating keeps the capacity: give the rest back.
-            listing.outputs.truncate(OUTPUTS_PER_ROW);
+            listing.outputs.truncate(keep);
             listing.outputs.shrink_to_fit();
         }
         self.listing = Some(listing);
@@ -223,44 +224,64 @@ impl ActionRow {
     /// overhead is not counted.
     pub(crate) fn heap_bytes(&self) -> usize {
         let text = |t: &Option<Text>| t.as_ref().map_or(0, |t| t.value.len());
-        let attempts: usize = self
-            .attempts
-            .iter()
-            .map(|a| {
-                let reason = match &a.end {
-                    Some(AttemptEnd::Failed(_, why)) => why.len(),
-                    _ => 0,
-                };
-                size_of::<Attempt>() + a.worker.as_str().len() + reason
-            })
-            .sum();
-        let outcome = match &self.outcome {
-            Some(Outcome::Failed { message, .. }) => message.len(),
-            Some(Outcome::Refused(why)) => why.len(),
-            _ => 0,
-        };
-        let outputs: usize = self.listing.as_ref().map_or(0, |l| {
-            l.outputs
-                .iter()
-                .map(|o| size_of::<Output>() + o.path.len())
-                .sum()
-        });
+        let outputs: usize = self
+            .listing
+            .as_ref()
+            .map_or(0, |l| l.outputs.iter().map(output_bytes).sum());
         self.instance.len()
             + text(&self.target)
             + text(&self.mnemonic)
             + text(&self.configuration)
             + text(&self.action_id)
             + self.operation.as_ref().map_or(0, String::len)
-            + attempts
-            + outcome
+            + attempts_bytes(&self.attempts)
+            + outcome_bytes(self.outcome.as_ref())
             + outputs
             + INDEX_ENTRY_BYTES
     }
 }
 
+/// What a row's `attempts` take beyond the row, as [`ActionRow::heap_bytes`] counts
+/// them; an operation's attempts take as much.
+pub(crate) fn attempts_bytes(attempts: &[Attempt]) -> usize {
+    attempts.iter().map(attempt_bytes).sum()
+}
+
+/// What one attempt takes: itself, its worker's name and its failure reason.
+pub(crate) fn attempt_bytes(a: &Attempt) -> usize {
+    let reason = match &a.end {
+        Some(AttemptEnd::Failed(_, why)) => why.len(),
+        _ => 0,
+    };
+    size_of::<Attempt>() + a.worker.as_str().len() + reason
+}
+
+/// What an outcome's text takes.
+pub(crate) fn outcome_bytes(outcome: Option<&Outcome>) -> usize {
+    match outcome {
+        Some(Outcome::Failed { message, .. }) => message.len(),
+        Some(Outcome::Refused(why)) => why.len(),
+        _ => 0,
+    }
+}
+
+/// What one output of a row's listing takes.
+pub(crate) fn output_bytes(o: &Output) -> usize {
+    size_of::<Output>() + o.path.len()
+}
+
 /// What one row's entries in its record's action index and cost list take: the key,
 /// the index, the cost, and a B-tree node's share (estimated).
 const INDEX_ENTRY_BYTES: usize = size_of::<Digest>() + 3 * size_of::<usize>() + 16;
+
+/// The copies of a record's key [`crate::Records`] keeps beside the record's own: its
+/// key in the record map, in the two last-seen indexes and in its id's list of keys,
+/// and its id as the id map's key.
+const RECORD_INDEX_ENTRIES: usize = 5;
+
+/// What one index entry of a record key takes beside the id's bytes: the key, the
+/// time it is indexed under, and a B-tree node's share (estimated).
+const KEY_ENTRY_BYTES: usize = size_of::<RecordKey>() + size_of::<WallTime>() + 16;
 
 /// What one entry of a set of strings takes beside the string's bytes (estimated).
 const SET_ENTRY_BYTES: usize = size_of::<String>() + 16;
@@ -379,6 +400,29 @@ impl Invocation {
         self.touch(call.at);
     }
 
+    /// What [`Self::seen`] would add to the record's bytes: a new instance name, and
+    /// the tool and correlated id the first time they are sent.
+    pub(crate) fn seen_bytes(&self, call: &Call) -> usize {
+        let m = &call.metadata;
+        let len = |o: &Option<String>| o.as_ref().map_or(0, String::len);
+        let instance = if self.instances.contains(&call.instance) {
+            0
+        } else {
+            call.instance.len() + SET_ENTRY_BYTES
+        };
+        let tool = if self.tool.is_none() && m.tool.is_some() {
+            len(&m.tool) + len(&m.tool_version)
+        } else {
+            0
+        };
+        let correlated = if self.correlated_invocations_id.is_none() {
+            len(&m.correlated_invocations_id)
+        } else {
+            0
+        };
+        instance + tool + correlated
+    }
+
     pub(crate) fn touch(&mut self, at: WallTime) {
         self.last_seen = self.last_seen.max(at);
     }
@@ -412,9 +456,10 @@ impl Invocation {
     }
 
     /// The memory the record holds, as the bound of section 3.5 counts it: the record
-    /// itself, its header's texts, a slot in its row list for each row and each row's
-    /// heap bytes (texts, attempts, outputs and index entry). An estimate: lengths, not
-    /// capacities, and not the allocator's overhead.
+    /// itself, its entries in the indexes of [`crate::Records`], its header's texts, a
+    /// slot in its row list for each row and each row's heap bytes (texts, attempts,
+    /// outputs and index entry). An estimate: lengths, not capacities, and not the
+    /// allocator's overhead.
     #[must_use]
     pub fn bytes(&self) -> usize {
         let option = |o: &Option<String>| o.as_ref().map_or(0, String::len);
@@ -430,6 +475,7 @@ impl Invocation {
             .sum();
         size_of::<Self>()
             + self.key.id().as_str().len()
+            + RECORD_INDEX_ENTRIES * (KEY_ENTRY_BYTES + self.key.id().as_str().len())
             + self.owner.0.len()
             + option(&self.tool)
             + option(&self.tool_version)

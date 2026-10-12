@@ -5,7 +5,7 @@
 use kbf_sched::RequeueReason;
 use kbf_types::{Digest, Failure, LeaseId, OperationId, WorkerId};
 
-use crate::record::Text;
+use crate::record::{Text, outcome_bytes, output_bytes};
 
 /// A wall-clock time, in microseconds since the Unix epoch, read by the caller.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -105,6 +105,66 @@ pub enum Event {
     Finished(Finished),
 }
 
+impl Event {
+    /// The memory the event holds while it waits to be applied: itself and what it
+    /// owns (a call and its texts, a worker's name, a reason, a listing's outputs).
+    /// An estimate: lengths, not capacities.
+    #[must_use]
+    pub fn bytes(&self) -> usize {
+        let owned = match self {
+            Self::Call(call) => call.bytes(),
+            Self::Command { id, owner, .. } => id.0.len() + owner.0.len(),
+            Self::Granted { worker, .. } => worker.as_str().len(),
+            Self::Started { .. } | Self::Requeued { .. } => 0,
+            Self::Finished(f) => {
+                let reason = match &f.lease {
+                    Some((_, LeaseEnd::Failed(_, why))) => why.len(),
+                    _ => 0,
+                };
+                reason
+                    + outcome_bytes(Some(&f.outcome))
+                    + f.result.as_ref().map_or(0, Listing::outputs_bytes)
+            }
+        };
+        size_of::<Self>() + owned
+    }
+}
+
+impl Call {
+    /// The boxed call and what it owns.
+    fn bytes(&self) -> usize {
+        let m = &self.metadata;
+        let string = |s: &Option<String>| s.as_ref().map_or(0, String::len);
+        let text = |t: &Option<Text>| t.as_ref().map_or(0, |t| t.value.len());
+        let kind = match &self.kind {
+            CallKind::Execute { answer, .. } => match answer {
+                ExecuteAnswer::Cached { name, result } => {
+                    name.len() + size_of::<Listing>() + result.outputs_bytes()
+                }
+                ExecuteAnswer::Joined { name, .. } | ExecuteAnswer::Queued { name, .. } => {
+                    name.len()
+                }
+            },
+            CallKind::GetActionResult { hit, .. } => hit.as_ref().map_or(0, Listing::outputs_bytes),
+            CallKind::FindMissingBlobs { .. } | CallKind::Uploaded(_) | CallKind::Downloaded(_) => {
+                0
+            }
+        };
+        size_of::<Self>()
+            + self.id.0.len()
+            + self.owner.0.len()
+            + self.instance.len()
+            + string(&m.tool)
+            + string(&m.tool_version)
+            + string(&m.correlated_invocations_id)
+            + text(&m.target)
+            + text(&m.mnemonic)
+            + text(&m.configuration)
+            + text(&m.action_id)
+            + kind
+    }
+}
+
 /// An operation's end.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Finished {
@@ -155,6 +215,15 @@ impl Outcome {
     #[must_use]
     pub const fn is_failure(&self) -> bool {
         !matches!(self, Self::Ok { exit_code: 0 })
+    }
+
+    /// Its text: a failure's message or a refusal's reason.
+    pub(crate) const fn text_mut(&mut self) -> Option<&mut String> {
+        match self {
+            Self::Failed { message, .. } => Some(message),
+            Self::Refused(why) => Some(why),
+            Self::Ok { .. } | Self::TimedOut => None,
+        }
     }
 }
 
@@ -274,6 +343,13 @@ pub struct Listing {
     pub stderr: Option<Digest>,
     /// What the action used, when the result carries a `ResourceUsage`.
     pub usage: Option<Usage>,
+}
+
+impl Listing {
+    /// What its outputs hold: each one and its path.
+    fn outputs_bytes(&self) -> usize {
+        self.outputs.iter().map(output_bytes).sum()
+    }
 }
 
 /// An output file, or an output directory as its tree digest.

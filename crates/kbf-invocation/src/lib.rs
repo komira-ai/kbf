@@ -14,9 +14,10 @@
 //! [`Invocation::header`] and [`Invocation::chunk`] give the record as
 //! `kbf.invocation.v1` messages ([`proto`]), the form section 3.5 stores.
 //!
-//! [`Records::with_bound`] holds every record within a memory bound, removing minted,
-//! then idle records and then closing the largest open one to new rows (section 3.5,
-//! stage 1).
+//! [`Records::with_bound`] holds every record, and the operations their calls wait on,
+//! within a memory bound after every event: it removes minted, then idle records,
+//! then closes the largest open one to new rows and leaves out what still does not
+//! fit (section 3.5, stage 1).
 //!
 //! This is a pure crate: no async runtime, network, clock, randomness or hashed
 //! collections. Wall times come in with the events. The recorder that feeds it

@@ -7,17 +7,22 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use kbf_types::{Digest, LeaseId, OperationId};
 
 use crate::event::{
-    Call, CallKind, Event, ExecuteAnswer, Finished, InvocationId, LeaseEnd, Outcome, Owner,
-    WallTime,
+    Call, CallKind, Event, ExecuteAnswer, Finished, InvocationId, LeaseEnd, Listing, Outcome,
+    Owner, WallTime,
 };
 use crate::record::{
-    ActionRow, Attempt, AttemptEnd, How, Invocation, REASON_CAP, ROW_CAP, RecordKey, State, capped,
+    ActionRow, Attempt, AttemptEnd, How, Invocation, OUTPUTS_PER_ROW, REASON_CAP, ROW_CAP,
+    RecordKey, State, attempt_bytes, attempts_bytes, capped, output_bytes,
 };
 
 /// How many dropped calls of records not made yet [`Records`] remembers, so that the
 /// record each would have made starts incomplete (see
 /// [`Records::mark_incomplete_call`]).
 const UNBORN_CAP: usize = 1024;
+
+/// What an operation's entry takes beside its attempts and waiters: the entry, its
+/// key and a B-tree node's share (estimated).
+const OPERATION_BYTES: usize = size_of::<Operation>() + size_of::<OperationId>() + 16;
 
 const HELD: &str = "every key Records hands out names a record it holds";
 
@@ -28,25 +33,33 @@ const HELD: &str = "every key Records hands out names a record it holds";
 /// I/O: "now" is the latest time an event carried.
 ///
 /// **The memory bound** (section 3.5, stage 1): the records' [`Invocation::bytes`]
-/// together stay within the bound given to [`Records::with_bound`]. A row is taken
-/// only if it fits; when it does not, and whenever the records are over the bound,
-/// records are removed in this order:
+/// and the operations their calls wait on ([`Records::operations_bytes`]) together
+/// stay within the bound given to [`Records::with_bound`], after every event and
+/// every mark. Whatever an event adds is admitted first: a record, a row, a header
+/// field, a waiting call, an attempt, an outcome's text, a listing. When it does not
+/// fit, records are removed in this order:
 ///
 /// 1. minted one-action records (section 2.3), least recently seen first;
 /// 2. idle records ([`State::Idle`]), least recently seen first. A record with an
 ///    operation in flight is never idle, however long that operation runs;
 /// 3. if only open records remain, nothing is removed: the largest open record stops
-///    taking rows (its actions are still counted, and it says `rows_capped`), and so
-///    does the record whose row did not fit.
+///    taking rows (its actions are still counted, and it says `rows_capped`). What
+///    did not fit is left out: a row is not taken (its record says `rows_capped`); a
+///    listing keeps the outputs that fit (the row says `outputs_truncated`); a record
+///    is not made (its caller's next record starts incomplete, as for a dropped
+///    call); anything else (an attempt, an outcome's text, a waiting call, an
+///    instance name, a later Execute's row) is not set. In every case but a row's,
+///    the record says `complete: false`.
 ///
-/// Rows already taken still fill in (attempts, outcome, listing) once a record is
-/// closed, so the records can pass the bound by what their rows in flight add.
+/// What is not counted: the dropped calls of records not made yet, at most
+/// `UNBORN_CAP` (1,024) of an id (at most 128 bytes) and an owner each.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Records {
     row_cap: usize,
     /// The memory bound, in bytes.
     bound: usize,
-    /// The records' [`Invocation::bytes`] together, as last counted.
+    /// The records' [`Invocation::bytes`] and the operations' bytes together, as last
+    /// counted.
     bytes: usize,
     /// The latest time an event carried.
     now: WallTime,
@@ -85,6 +98,17 @@ struct Operation {
     /// The calls waiting on it: each one's record, its row (`None` past the row cap)
     /// and the REAPI operation name it was given.
     waiters: Vec<Waiter>,
+    /// What [`Records`] counts for it toward the bound.
+    counted: usize,
+}
+
+impl Operation {
+    /// The memory it holds, as the bound counts it.
+    fn bytes(&self) -> usize {
+        OPERATION_BYTES
+            + attempts_bytes(&self.attempts)
+            + self.waiters.iter().map(Waiter::bytes).sum::<usize>()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -101,6 +125,11 @@ impl Waiter {
     fn row(&self, inv: &Invocation) -> Option<usize> {
         let i = self.row?;
         (inv.rows[i].operation.as_deref() == Some(self.name.as_str())).then_some(i)
+    }
+
+    /// What it takes in its operation.
+    fn bytes(&self) -> usize {
+        size_of::<Self>() + self.key.id().as_str().len() + self.name.len()
     }
 }
 
@@ -124,7 +153,7 @@ impl Records {
     }
 
     /// No records, each to hold up to `row_cap` rows, all of them together within
-    /// `bound` bytes ([`Invocation::bytes`]; see the type's docs).
+    /// `bound` bytes (see the type's docs).
     #[must_use]
     pub const fn with_bound(row_cap: usize, bound: usize) -> Self {
         Self {
@@ -158,10 +187,18 @@ impl Records {
         self.invocations.keys()
     }
 
-    /// The records' [`Invocation::bytes`] together.
+    /// What the bound counts: the records' [`Invocation::bytes`] and
+    /// [`Self::operations_bytes`] together.
     #[must_use]
     pub const fn bytes(&self) -> usize {
         self.bytes
+    }
+
+    /// What the operations the records' calls wait on hold, counted afresh: each
+    /// entry, its attempts and its waiting calls.
+    #[must_use]
+    pub fn operations_bytes(&self) -> usize {
+        self.operations.values().map(Operation::bytes).sum()
     }
 
     /// The memory bound, in bytes.
@@ -176,7 +213,7 @@ impl Records {
         self.evicted
     }
 
-    /// Applies one event, then holds the records to the bound.
+    /// Applies one event, admitting what it adds within the bound.
     pub fn apply(&mut self, event: Event) {
         match event {
             Event::Call(call) => self.call(&call),
@@ -189,10 +226,9 @@ impl Records {
                 if let Some(key) = self.find(&id, &owner) {
                     let inv = self.record(&key);
                     if let Some(i) = inv.row_of(&action) {
+                        // A digest, held in the row: nothing to admit.
                         inv.rows[i].command = Some(command);
-                        inv.refresh_row(i);
                     }
-                    self.recount(&key);
                 }
             }
             Event::Granted {
@@ -201,8 +237,8 @@ impl Records {
                 worker,
                 at,
             } => {
-                if let Some(op) = self.operations.get_mut(&operation) {
-                    op.attempts.push(Attempt {
+                if let Some(op) = self.operations.get(&operation) {
+                    let attempt = Attempt {
                         lease,
                         worker,
                         queued: op.queued,
@@ -210,8 +246,18 @@ impl Records {
                         started: None,
                         ended: None,
                         end: None,
-                    });
-                    self.spread(operation, at);
+                    };
+                    let fits = self.make_room(None, attempt_bytes(&attempt));
+                    // Making room may have removed every record waiting on it.
+                    if let Some(op) = self.operations.get_mut(&operation) {
+                        if fits {
+                            op.attempts.push(attempt);
+                            self.recount_operation(operation);
+                        } else {
+                            self.mark_incomplete_operation(operation);
+                        }
+                        self.spread(operation, at);
+                    }
                 }
             }
             Event::Started {
@@ -220,7 +266,7 @@ impl Records {
                 at,
             } => {
                 if let Some(op) = self.operations.get_mut(&operation) {
-                    if let Some(a) = lease_of(op, lease) {
+                    if let Some(a) = lease_of(&mut op.attempts, lease) {
                         a.started = Some(at);
                     }
                     self.spread(operation, at);
@@ -233,7 +279,7 @@ impl Records {
                 at,
             } => {
                 if let Some(op) = self.operations.get_mut(&operation) {
-                    if let Some(a) = lease_of(op, lease) {
+                    if let Some(a) = lease_of(&mut op.attempts, lease) {
                         a.ended = Some(at);
                         a.end = Some(AttemptEnd::Requeued(reason));
                     }
@@ -243,7 +289,6 @@ impl Records {
             }
             Event::Finished(finished) => self.finish(finished),
         }
-        self.shrink();
     }
 
     /// Marks incomplete the record a dropped call of `id` by `owner` went to: the
@@ -300,10 +345,19 @@ impl Records {
     /// The key of the record `call` goes to, made if it is the first call of its id
     /// from its caller. With a record of the id held, a caller other than its owners
     /// gets `<id>~<n>`, and the owner's record (if held) lists it; with none held, the
-    /// caller gets the id itself.
-    fn route(&mut self, call: &Call) -> RecordKey {
+    /// caller gets the id itself. `None` if a record to make does not fit: the call
+    /// is left out, as a dropped one is.
+    fn route(&mut self, call: &Call) -> Option<RecordKey> {
         if let Some(key) = self.find(&call.id, &call.owner) {
-            return key;
+            return Some(key);
+        }
+        let mut inv = Invocation::new(RecordKey::owner(call.id.clone()), call);
+        inv.seen(call);
+        // A collision key holds no more than the owner's; the owner's list grows by it.
+        let listed = size_of::<RecordKey>() + call.id.as_str().len();
+        if !self.make_room(None, inv.bytes() + listed) {
+            self.mark_incomplete_call(&call.id, &call.owner);
+            return None;
         }
         let family = self.ids.entry(call.id.clone()).or_default();
         let key = if family.keys.is_empty() {
@@ -321,7 +375,7 @@ impl Records {
             inv.collisions.push(key.clone());
             self.recount(&owner);
         }
-        let mut inv = Invocation::new(key.clone(), call);
+        inv.key = key.clone();
         if let Some(i) = self
             .unborn
             .iter()
@@ -335,13 +389,23 @@ impl Records {
             self.minted_by_seen.insert((inv.indexed, key.clone()));
         }
         self.invocations.insert(key.clone(), inv);
-        key
+        self.recount(&key);
+        Some(key)
     }
 
     fn call(&mut self, call: &Call) {
         self.now = self.now.max(call.at);
-        let key = self.route(call);
-        self.record(&key).seen(call);
+        let Some(key) = self.route(call) else {
+            return;
+        };
+        let grows = self.record(&key).seen_bytes(call);
+        if self.make_room(Some(&key), grows) {
+            self.record(&key).seen(call);
+        } else {
+            let inv = self.record(&key);
+            inv.touch(call.at);
+            inv.mark_incomplete();
+        }
         // Indexed under its new `last_seen` before any room is made for its row.
         self.recount(&key);
         let inv = self.record(&key);
@@ -364,7 +428,7 @@ impl Records {
                     row.outcome = Some(Outcome::Ok {
                         exit_code: listing.exit_code,
                     });
-                    row.set_listing(listing.clone());
+                    row.set_listing(listing.clone(), OUTPUTS_PER_ROW);
                     self.add_row(&key, row);
                 }
             }
@@ -394,31 +458,35 @@ impl Records {
         // A row shows the last Execute of its action: a later one replaces it.
         let row = ActionRow::new(action, call, how, Some(name.clone()));
         let index = match inv.row_of(&action) {
-            Some(i) => {
-                inv.rows[i] = row;
-                inv.refresh_row(i);
-                Some(i)
-            }
+            Some(i) => self.replace_row(key, i, row),
             None => self.add_row(key, row),
         };
-        let inv = self.invocations.get_mut(key).expect(HELD);
         // A cached answer is the action's end; any other waits on an operation.
         let operation = match operation {
             Ok(operation) => operation,
             Err(result) => {
+                let inv = self.record(key);
                 inv.counts.failed += u64::from(result.exit_code != 0);
                 if let Some(i) = index {
-                    let row = &mut inv.rows[i];
-                    row.outcome = Some(Outcome::Ok {
+                    inv.rows[i].outcome = Some(Outcome::Ok {
                         exit_code: result.exit_code,
                     });
-                    row.set_listing((**result).clone());
-                    inv.refresh_row(i);
+                    self.fill_listing(key, i, (**result).clone());
                 }
                 return;
             }
         };
-        inv.in_flight += 1;
+        let waiter = Waiter {
+            key: key.clone(),
+            row: index,
+            name: name.clone(),
+        };
+        // Counted as if the operation were new: making room may remove it.
+        if !self.make_room(Some(key), OPERATION_BYTES + waiter.bytes()) {
+            self.record(key).mark_incomplete();
+            return;
+        }
+        self.record(key).in_flight += 1;
         let op = self
             .operations
             .entry(operation)
@@ -426,17 +494,15 @@ impl Records {
                 queued: call.at,
                 attempts: Vec::new(),
                 waiters: Vec::new(),
+                counted: 0,
             });
+        op.waiters.push(waiter);
         // A joined action starts with its twin's attempts so far.
+        let attempts = op.attempts.clone();
+        self.recount_operation(operation);
         if let Some(i) = index {
-            inv.rows[i].attempts.clone_from(&op.attempts);
-            inv.refresh_row(i);
+            self.fill_attempts(key, i, &attempts);
         }
-        op.waiters.push(Waiter {
-            key: key.clone(),
-            row: index,
-            name: name.clone(),
-        });
     }
 
     /// Adds `row` to `key`'s record if it takes rows and the row fits within the
@@ -444,39 +510,118 @@ impl Records {
     /// record marked `rows_capped`.
     fn add_row(&mut self, key: &RecordKey, row: ActionRow) -> Option<usize> {
         let cap = self.row_cap;
-        if !self.record(key).takes_rows(cap) || !self.make_room(key, row.cost()) {
+        if !self.record(key).takes_rows(cap) || !self.make_room(Some(key), row.cost()) {
             self.record(key).rows_capped = true;
             return None;
         }
-        Some(self.record(key).push_row(row))
+        let i = self.record(key).push_row(row);
+        self.recount(key);
+        Some(i)
+    }
+
+    /// Replaces row `i` of `key`'s record with `row` if it fits; its index, or `None`
+    /// with the row left as it was and the record marked incomplete.
+    fn replace_row(&mut self, key: &RecordKey, i: usize, row: ActionRow) -> Option<usize> {
+        let had = self.record(key).row_bytes[i];
+        if !self.make_room(Some(key), row.heap_bytes().saturating_sub(had)) {
+            self.record(key).mark_incomplete();
+            return None;
+        }
+        let inv = self.record(key);
+        inv.rows[i] = row;
+        inv.refresh_row(i);
+        self.recount(key);
+        Some(i)
+    }
+
+    /// Copies `attempts` into row `i` of `key`'s record if they fit; else the row
+    /// keeps the attempts it had and the record is marked incomplete.
+    fn fill_attempts(&mut self, key: &RecordKey, i: usize, attempts: &[Attempt]) {
+        let had = attempts_bytes(&self.record(key).rows[i].attempts);
+        if self.make_room(Some(key), attempts_bytes(attempts).saturating_sub(had)) {
+            let inv = self.record(key);
+            inv.rows[i].attempts = attempts.to_vec();
+            inv.refresh_row(i);
+        } else {
+            self.record(key).mark_incomplete();
+        }
+        self.recount(key);
+    }
+
+    /// Sets `outcome` on row `i` of `key`'s record, without its text if that does not
+    /// fit (the record then marked incomplete).
+    fn fill_outcome(&mut self, key: &RecordKey, i: usize, outcome: &Outcome) {
+        let mut outcome = outcome.clone();
+        if let Some(text) = outcome.text_mut()
+            && !self.make_room(Some(key), text.len())
+        {
+            text.clear();
+            self.record(key).mark_incomplete();
+        }
+        let inv = self.record(key);
+        inv.rows[i].outcome = Some(outcome);
+        inv.refresh_row(i);
+        self.recount(key);
+    }
+
+    /// Copies `listing` into row `i` of `key`'s record with as many of its outputs as
+    /// fit (past the row's limit, or past the bound, the row says
+    /// `outputs_truncated`; past the bound the record is also marked incomplete).
+    fn fill_listing(&mut self, key: &RecordKey, i: usize, listing: Listing) {
+        let rowed = || listing.outputs.iter().take(OUTPUTS_PER_ROW);
+        let mut keep = OUTPUTS_PER_ROW;
+        if !self.make_room(Some(key), rowed().map(output_bytes).sum()) {
+            let mut room = self.bound - self.bytes;
+            keep = rowed()
+                .take_while(|o| match room.checked_sub(output_bytes(o)) {
+                    Some(left) => {
+                        room = left;
+                        true
+                    }
+                    None => false,
+                })
+                .count();
+            self.record(key).mark_incomplete();
+        }
+        let inv = self.record(key);
+        inv.rows[i].set_listing(listing, keep);
+        inv.refresh_row(i);
+        self.recount(key);
     }
 
     /// Copies `operation`'s attempts into every row that waits on it, and marks each
     /// waiting record seen at `at`.
     fn spread(&mut self, operation: OperationId, at: WallTime) {
-        self.now = self.now.max(at);
         let op = &self.operations[&operation];
-        let mut keys = Vec::with_capacity(op.waiters.len());
-        for w in &op.waiters {
-            let inv = self.invocations.get_mut(&w.key).expect(HELD);
+        let (attempts, waiters) = (op.attempts.clone(), op.waiters.clone());
+        self.spread_to(&waiters, &attempts, at);
+    }
+
+    /// Copies `attempts` into each of `waiters`' rows and marks each one's record
+    /// seen at `at`; a waiter whose record making room removed is passed over.
+    fn spread_to(&mut self, waiters: &[Waiter], attempts: &[Attempt], at: WallTime) {
+        self.now = self.now.max(at);
+        for w in waiters {
+            let Some(inv) = self.invocations.get_mut(&w.key) else {
+                continue;
+            };
             inv.touch(at);
-            if let Some(i) = w.row(inv) {
-                inv.rows[i].attempts.clone_from(&op.attempts);
-                inv.refresh_row(i);
+            let row = w.row(inv);
+            self.recount(&w.key);
+            if let Some(i) = row {
+                self.fill_attempts(&w.key, i, attempts);
             }
-            keys.push(w.key.clone());
-        }
-        for key in keys {
-            self.recount(&key);
         }
     }
 
     fn finish(&mut self, f: Finished) {
-        let Some(op) = self.operations.get_mut(&f.operation) else {
+        let Some(mut op) = self.operations.remove(&f.operation) else {
             return;
         };
+        // Its bytes go first: what it held makes room for its rows' fill-in.
+        self.bytes -= op.counted;
         if let Some((lease, end)) = &f.lease
-            && let Some(a) = lease_of(op, *lease)
+            && let Some(a) = lease_of(&mut op.attempts, *lease)
         {
             a.ended = Some(f.at);
             a.end = Some(match end {
@@ -486,8 +631,7 @@ impl Records {
                 }
             });
         }
-        self.spread(f.operation, f.at);
-        let op = self.operations.remove(&f.operation).expect("checked above");
+        self.spread_to(&op.waiters, &op.attempts, f.at);
         let outcome = match f.outcome {
             Outcome::Failed { code, message } => Outcome::Failed {
                 code,
@@ -496,19 +640,20 @@ impl Records {
             Outcome::Refused(reason) => Outcome::Refused(capped(&reason, REASON_CAP)),
             other => other,
         };
-        for w in op.waiters {
-            let inv = self.record(&w.key);
+        for w in &op.waiters {
+            let Some(inv) = self.invocations.get_mut(&w.key) else {
+                continue;
+            };
             inv.in_flight -= 1;
             inv.counts.failed += u64::from(outcome.is_failure());
-            if let Some(i) = w.row(inv) {
-                let row = &mut inv.rows[i];
-                row.outcome = Some(outcome.clone());
-                if let Some(listing) = &f.result {
-                    row.set_listing(listing.clone());
-                }
-                inv.refresh_row(i);
-            }
+            let row = w.row(inv);
             self.recount(&w.key);
+            if let Some(i) = row {
+                self.fill_outcome(&w.key, i, &outcome);
+                if let Some(listing) = &f.result {
+                    self.fill_listing(&w.key, i, listing.clone());
+                }
+            }
         }
     }
 
@@ -531,12 +676,20 @@ impl Records {
         }
     }
 
+    /// Counts `operation`, which this holds, again toward the bound.
+    fn recount_operation(&mut self, operation: OperationId) {
+        let op = self.operations.get_mut(&operation).expect(HELD);
+        let bytes = op.bytes();
+        self.bytes = self.bytes - op.counted + bytes;
+        op.counted = bytes;
+    }
+
     /// Removes records, in the order of the type's docs, until `cost` more bytes fit
     /// within the bound; never `keep`'s. `false`, with the largest open record closed,
     /// if they do not.
-    fn make_room(&mut self, keep: &RecordKey, cost: usize) -> bool {
+    fn make_room(&mut self, keep: Option<&RecordKey>, cost: usize) -> bool {
         while self.bytes.saturating_add(cost) > self.bound {
-            match self.victim(Some(keep)) {
+            match self.victim(keep) {
                 Some(victim) => self.evict(&victim),
                 None => {
                     self.close_largest();
@@ -545,20 +698,6 @@ impl Records {
             }
         }
         true
-    }
-
-    /// Removes records, in the order of the type's docs, while the records are over
-    /// the bound; closes the largest open record if that is not enough.
-    fn shrink(&mut self) {
-        while self.bytes > self.bound {
-            match self.victim(None) {
-                Some(victim) => self.evict(&victim),
-                None => {
-                    self.close_largest();
-                    return;
-                }
-            }
-        }
     }
 
     /// The next record to remove for the bound, other than `keep`: the least recently
@@ -594,10 +733,15 @@ impl Records {
             self.recount(&owner);
         }
         if inv.in_flight > 0 {
-            for op in self.operations.values_mut() {
+            let mut freed = 0;
+            self.operations.retain(|_, op| {
                 op.waiters.retain(|w| w.key != *key);
-            }
-            self.operations.retain(|_, op| !op.waiters.is_empty());
+                let left = if op.waiters.is_empty() { 0 } else { op.bytes() };
+                freed += op.counted - left;
+                op.counted = left;
+                left > 0
+            });
+            self.bytes -= freed;
         }
         self.evicted += 1;
     }
@@ -616,7 +760,7 @@ impl Records {
     }
 }
 
-/// `op`'s attempt under `lease`.
-fn lease_of(op: &mut Operation, lease: LeaseId) -> Option<&mut Attempt> {
-    op.attempts.iter_mut().find(|a| a.lease == lease)
+/// The attempt under `lease`.
+fn lease_of(attempts: &mut [Attempt], lease: LeaseId) -> Option<&mut Attempt> {
+    attempts.iter_mut().find(|a| a.lease == lease)
 }
