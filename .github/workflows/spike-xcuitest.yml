@@ -1,12 +1,12 @@
 # The XCUITest fixtures (tools/spike/macos/fixtures) as a native driver action that
 # asks for the network: `xcodebuild` under the sandbox profile the driver's library
-# builds, in a lease directory with the lease's variables, with every deny line the
-# sandbox logs for the run's processes read back and checked
+# builds, in a lease directory with the lease's variables, with the deny lines the
+# sandbox logs for the run's processes read back
 # (crates/kbf-driver-native/tests/xcuitest_sandbox.rs; findings:
 # docs/spikes/macos-p0.md). The tests pin what the hosted runner measured: the iOS
 # fixture passes under the profile, the macOS UI tests stop on `(deny lsopen)`, and
-# each run is refused what the profile denies. Controls: a `(deny default)` run must be
-# refused with a deny line, and both fixtures must pass without a sandbox. Also the
+# each run is refused what the profile denies. Controls: `sandbox-exec` must refuse a
+# run under `(deny default)`, and both fixtures must pass without a sandbox. Also the
 # fixtures' pixel checker against synthetic images.
 # This proves the instrument and the profile on a hosted runner only: its privacy (TCC)
 # grants may be seeded, so a pass says nothing about a fresh Mac. The leases, the
@@ -57,6 +57,7 @@ jobs:
           path: |
             target/tmp/xcuitest/*-denies.txt
             target/tmp/xcuitest/*/root/out/*-xcodebuild.log
+            target/tmp/xcuitest/*/root/out/*-xcresulttool.log
             target/tmp/xcuitest/*/root/out/*.xcresult
             target/tmp/xcuitest/*/root/out/*-attachments
           retention-days: 7
