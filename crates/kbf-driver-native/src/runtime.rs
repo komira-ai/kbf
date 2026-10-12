@@ -28,6 +28,7 @@ use crate::network::{self, Network, network_of};
 use crate::procs::{self, Proc, Tracker};
 use crate::program::{Refused, Resolved, resolve};
 use crate::record::{Exec, Spawned};
+use crate::simulator::{self, Simctl};
 use crate::user_folders::UserFolders;
 use crate::xcode;
 
@@ -70,6 +71,8 @@ pub struct NativeRuntime<C> {
     /// How `xcrun` is warmed, once [`NativeRuntime::warm_xcrun`] was called: then each
     /// survey that makes an Xcode ready warms it too. Locked before `xcodes`.
     warm_up: Mutex<Option<WarmUp>>,
+    /// How the simulators of the leases that ask for one are made and deleted.
+    simctl: Arc<Simctl>,
 }
 
 /// Everything `prepare` works out for `execute` and `finish`.
@@ -94,6 +97,10 @@ struct Prepared {
     network: Network,
     /// The Xcode the action names (`xcode`), as its `DEVELOPER_DIR`.
     developer_dir: Option<PathBuf>,
+    /// The simulator the action asks for (`simulator`).
+    simulator: Option<simulator::Request>,
+    /// The variables that name the lease's simulator, once it is made.
+    simulator_env: Vec<(&'static str, OsString)>,
 }
 
 impl<C: Cas> NativeRuntime<C> {
@@ -118,9 +125,25 @@ impl<C: Cas> NativeRuntime<C> {
         remove: &dyn Fn(&Path) -> std::io::Result<()>,
     ) -> std::io::Result<Self> {
         std::fs::create_dir_all(&config.scratch)?;
+        let rules = config
+            .user_folders
+            .as_ref()
+            .map(UserFolders::rules)
+            .unwrap_or_default();
+        let simctl = Arc::new(Simctl {
+            xcrun: config.xcrun.clone(),
+            isolation: config.isolation.clone(),
+            rules: rules.clone(),
+            within: simulator::ANSWER_WITHIN,
+        });
+        // A simulator a killed daemon's lease left goes before its directory does.
+        let remove_left = |path: &Path| {
+            simctl.end_left(path);
+            remove(path)
+        };
         crate::sweep::sweep(
             &config.scratch,
-            remove,
+            &remove_left,
             config.kill_wait,
             &crate::sweep::SYSTEM,
         )?;
@@ -128,12 +151,8 @@ impl<C: Cas> NativeRuntime<C> {
         let mut runs = std::fs::DirBuilder::new();
         std::os::unix::fs::DirBuilderExt::mode(runs.recursive(true), 0o700)
             .create(config.scratch.join(crate::record::RUNS))?;
-        let rules = config
-            .user_folders
-            .as_ref()
-            .map(UserFolders::rules)
-            .unwrap_or_default();
         let runtime = Self {
+            simctl,
             xcodes: RwLock::new(config.xcodes.clone()),
             config,
             cas,
@@ -289,6 +308,7 @@ impl<C: Cas> NativeRuntime<C> {
         let timeout = timeout_of(&action, self.config.default_timeout)?;
         let network = network_of(&action, &command)?;
         let developer_dir = xcode::developer_dir(&self.xcodes(), &action, &command)?;
+        let simulator = simulator::request_of(&action, &command)?;
 
         tokio::fs::create_dir(dir).await.map_err(failed(dir))?;
         let lease = tokio::fs::canonicalize(dir).await.map_err(failed(dir))?;
@@ -330,6 +350,8 @@ impl<C: Cas> NativeRuntime<C> {
             timeout,
             network,
             developer_dir,
+            simulator,
+            simulator_env: Vec::new(),
         })
     }
 
@@ -368,7 +390,8 @@ impl<C: Cas> NativeRuntime<C> {
             .chain(
                 (prepared.developer_dir.iter())
                     .map(|d| (OsStr::new(xcode::DEVELOPER_DIR), d.as_os_str())),
-            );
+            )
+            .chain((prepared.simulator_env.iter()).map(|(k, v)| (OsStr::new(k), v.as_os_str())));
         let exec = Exec::new(&program, args.iter().map(OsStr::new), env)
             .map_err(failed(&prepared.program))?;
         let mut command = tokio::process::Command::new(&program);
@@ -457,13 +480,22 @@ impl<C: Cas> NativeRuntime<C> {
         };
         // A kill during prepare (a long input fetch) stops it at once; the clean
         // removes whatever was written.
-        let prepared = tokio::select! {
+        let mut prepared = tokio::select! {
             prepared = self.prepare(work, dir) => prepared?,
             Ok(by) = &mut *stop => {
                 *killer = Some(by);
                 return Err(RuntimeError::Killed);
             }
         };
+        // Not stopped by a kill: a `simctl create` cut short could still make its
+        // device after the end looked for the lease's devices.
+        if prepared.refused.is_none() {
+            create_simulator(&self.simctl, work.lease_id, &mut prepared).await?;
+            if let Ok(by) = stop.try_recv() {
+                *killer = Some(by);
+                return Err(RuntimeError::Killed);
+            }
+        }
         clock.input_fetch_completed_timestamp = now();
         clock.execution_start_timestamp = now();
         let exit_code = match &prepared.refused {
@@ -518,6 +550,7 @@ impl<C: Cas> Runtime for NativeRuntime<C> {
         let _registered = Registered::new(self, work.lease_id, stop_tx);
         let dir = LeaseDir {
             path: self.config.scratch.join(lease_name(work.lease_id)),
+            simctl: Arc::clone(&self.simctl),
             armed: true,
         };
         let mut killer = None;
@@ -529,9 +562,9 @@ impl<C: Cas> Runtime for NativeRuntime<C> {
             let _ = by.send(());
         }
         match (outcome, cleaned) {
-            (Ok(_), Err(why)) => Err(RuntimeError::Failed(format!("clean: {why}"))),
+            (Ok(_), Err(why)) => Err(RuntimeError::Failed(why)),
             (outcome, Err(why)) => {
-                tracing::error!(lease = %work.lease_id, "clean: {why}");
+                tracing::error!(lease = %work.lease_id, "{why}");
                 outcome
             }
             (outcome, Ok(())) => outcome,
@@ -578,6 +611,46 @@ fn sandbox(config: &NativeConfig, rules: &str, dir: &str) -> xcode::Sandbox {
         isolation: config.isolation.clone(),
         dir: config.scratch.join(dir),
         rules: rules.to_owned(),
+    }
+}
+
+/// Makes the simulator `prepared` asks for in the lease's own device set
+/// ([`crate::simulator`]), off the async threads, and names it in
+/// `prepared.simulator_env`. Not generic over the CAS.
+async fn create_simulator(
+    simctl: &Arc<Simctl>,
+    lease: LeaseId,
+    prepared: &mut Prepared,
+) -> Result<(), RuntimeError> {
+    let Some(request) = prepared.simulator.clone() else {
+        return Ok(());
+    };
+    let (simctl, dir) = (Arc::clone(simctl), prepared.lease.clone());
+    let developer_dir = prepared.developer_dir.clone();
+    let name = format!("kbf-{}", lease_name(lease));
+    let made = tokio::task::spawn_blocking(move || {
+        simctl.create(&dir, &name, &request, developer_dir.as_deref())
+    })
+    .await;
+    let udid = simulator_made(made)?;
+    let set = prepared.lease.join(simulator::SET_DIR).into_os_string();
+    prepared.simulator_env = vec![
+        (simulator::UDID_VAR, OsString::from(udid)),
+        (simulator::SET_VAR, set),
+    ];
+    Ok(())
+}
+
+/// The UDID `simctl create` printed, or the lease's failure: the node's (a runtime it
+/// lacks, a `simctl` that failed, a blocking task that did not finish), not the
+/// action's.
+fn simulator_made(
+    made: Result<Result<String, String>, tokio::task::JoinError>,
+) -> Result<String, RuntimeError> {
+    match made {
+        Ok(Ok(udid)) => Ok(udid),
+        Ok(Err(why)) => Err(RuntimeError::Failed(format!("simulator: {why}"))),
+        Err(task) => Err(RuntimeError::Failed(format!("simulator task: {task}"))),
     }
 }
 
@@ -778,19 +851,21 @@ fn exit_code(status: ExitStatus) -> i32 {
         .unwrap_or_else(|| 128 + status.signal().unwrap_or(0))
 }
 
-/// The lease's directory, removed when the lease ends; by `Drop` if the run is
-/// dropped first.
+/// The lease's directory, removed when the lease ends, after every simulator in its
+/// device set is deleted ([`crate::simulator`]); by `Drop` if the run is dropped first.
 struct LeaseDir {
     path: PathBuf,
+    simctl: Arc<Simctl>,
     armed: bool,
 }
 
 impl LeaseDir {
-    /// Removes the directory, off the async threads.
+    /// Deletes the lease's simulators and removes the directory, off the async
+    /// threads; what failed, each part named.
     async fn clean(mut self) -> Result<(), String> {
         self.armed = false;
-        let path = self.path.clone();
-        let cleaned = tokio::task::spawn_blocking(move || clean(&path)).await;
+        let (path, simctl) = (self.path.clone(), Arc::clone(&self.simctl));
+        let cleaned = tokio::task::spawn_blocking(move || end(&simctl, &path)).await;
         cleaned.map_err(clean_task_failed)?
     }
 }
@@ -801,6 +876,23 @@ fn clean_task_failed(error: tokio::task::JoinError) -> String {
     format!("clean task: {error}")
 }
 
+/// Deletes the simulators in the lease directory at `path`, then removes it, whether
+/// or not they could be; what failed, each part named.
+fn end(simctl: &Simctl, path: &Path) -> Result<(), String> {
+    let failed: Vec<String> = [
+        simctl.end_all(path).map_err(|e| format!("simulator: {e}")),
+        clean(path).map_err(|e| format!("clean: {e}")),
+    ]
+    .into_iter()
+    .filter_map(Result::err)
+    .collect();
+    if failed.is_empty() {
+        Ok(())
+    } else {
+        Err(failed.join("; "))
+    }
+}
+
 fn clean(path: &Path) -> Result<(), String> {
     kbf_outputs::remove_tree(path).map_err(|e| format!("remove {}: {e}", path.display()))
 }
@@ -808,7 +900,7 @@ fn clean(path: &Path) -> Result<(), String> {
 impl Drop for LeaseDir {
     fn drop(&mut self) {
         if self.armed {
-            let cleaned = clean(&self.path);
+            let cleaned = end(&self.simctl, &self.path);
             tracing::warn!(dir = %self.path.display(), ?cleaned, "run dropped; cleaned up");
         }
     }
@@ -915,6 +1007,20 @@ mod tests {
             .await
             .expect_err("the task panicked");
         assert!(clean_task_failed(panicked).starts_with("clean task: "));
+    }
+
+    /// Catches a simulator create whose blocking task panicked taken for a made
+    /// simulator, or reported without saying it was the simulator's.
+    #[tokio::test]
+    async fn a_simulator_task_that_did_not_finish_fails_the_lease() {
+        let panicked = tokio::task::spawn_blocking(|| panic!("create panicked"))
+            .await
+            .expect_err("the task panicked");
+        let failed = simulator_made(Err(panicked));
+        assert!(
+            matches!(&failed, Err(RuntimeError::Failed(why)) if why.starts_with("simulator task: ")),
+            "{failed:?}"
+        );
     }
 
     /// A CAS no test here reaches.
