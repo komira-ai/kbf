@@ -133,11 +133,14 @@ fn a_reply_body_longer_than_its_cap_is_refused_however_framed() {
     let reply = |head: &str, body: &[u8]| {
         let mut raw = format!("HTTP/1.1 400 Bad Request\r\n{head}\r\n").into_bytes();
         raw.extend_from_slice(body);
-        read_reply(&url("https://h/x"), &raw[..]).map_err(|e| e.to_string())
+        // The body's length, not its bytes, so a failure prints a line, not a MiB.
+        read_reply(&url("https://h/x"), &raw[..])
+            .map(|(status, body)| (status, body.len(), body.iter().all(|b| *b == b'a')))
+            .map_err(|e| e.to_string())
     };
     let fits = vec![b'a'; REPLY_MAX];
     let over = vec![b'a'; REPLY_MAX + 1];
-    assert_eq!(reply("", &fits), Ok((400, fits.clone())));
+    assert_eq!(reply("", &fits), Ok((400, REPLY_MAX, true)));
     let chunked = |b: &[u8]| {
         let mut raw = format!("{:x}\r\n", b.len()).into_bytes();
         raw.extend_from_slice(b);
@@ -146,7 +149,7 @@ fn a_reply_body_longer_than_its_cap_is_refused_however_framed() {
     };
     assert_eq!(
         reply("Transfer-Encoding: chunked\r\n", &chunked(&fits)),
-        Ok((400, fits.clone()))
+        Ok((400, REPLY_MAX, true))
     );
     let too_long = format!("https://h/x: the answer's body is longer than {REPLY_MAX} bytes");
     for (head, body) in [

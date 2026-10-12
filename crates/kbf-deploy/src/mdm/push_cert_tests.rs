@@ -298,8 +298,14 @@ fn a_certificate_or_a_key_alone_inside_a_git_work_tree_is_refused() {
     let server = nanohub(TOPIC);
     let (cert, key) = pair(TOPIC, false);
     for (in_git, want) in [
-        (true, "/repo/push.pem is inside a git work tree (/repo/.git exists)"),
-        (false, "/repo/push.key is inside a git work tree (/repo/.git exists)"),
+        (
+            true,
+            "/repo/push.pem is inside a git work tree (/repo/.git exists)",
+        ),
+        (
+            false,
+            "/repo/push.key is inside a git work tree (/repo/.git exists)",
+        ),
     ] {
         let (c, k) = if in_git {
             ("/repo/push.pem", KEY)
@@ -319,7 +325,10 @@ fn a_certificate_or_a_key_alone_inside_a_git_work_tree_is_refused() {
         };
         let (got, _) = run_it(&mut exec, &a, Mode::Apply);
         let err = got.err().map(|e| e.to_string());
-        assert!(err.as_ref().is_some_and(|e| e.starts_with(want)), "{want}: {err:?}");
+        assert!(
+            err.as_ref().is_some_and(|e| e.starts_with(want)),
+            "{want}: {err:?}"
+        );
         assert!(server.requests().is_empty(), "{want}");
         assert!(exec.log.is_empty(), "{want}");
     }
