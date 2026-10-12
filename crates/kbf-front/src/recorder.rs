@@ -259,13 +259,12 @@ impl Shared {
             !ready
         });
         let all = self.mark_all.load(Ordering::Acquire);
-        if all != 0
-            && all - 1 <= applied
-            && self
+        let ready = all.checked_sub(1).is_some_and(|after| after <= applied);
+        if ready {
+            // A drop since the load raised it: it stays, for its own turn.
+            let _ = self
                 .mark_all
-                .compare_exchange(all, 0, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-        {
+                .compare_exchange(all, 0, Ordering::AcqRel, Ordering::Acquire);
             records.mark_all_incomplete();
         }
     }

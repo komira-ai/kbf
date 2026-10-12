@@ -141,14 +141,13 @@ impl<M: MetaLog, O: ObjectStore + 'static> ContentAddressableStorage for CasServ
             .iter()
             .filter_map(|(_, c)| c.as_ref().ok().cloned())
             .collect();
+        // The bytes the client sent that verified, stored or not.
         let uploaded: u64 = good.iter().map(|b| b.digest().size_bytes).sum();
+        let instance = &request.instance_name;
+        self.recorder.call(&metadata, &caller, instance, || {
+            CallKind::Uploaded(uploaded)
+        });
         let stored = self.cache.store_blobs(good).await.map_err(Status::from);
-        if stored.is_ok() {
-            let instance = &request.instance_name;
-            self.recorder.call(&metadata, &caller, instance, || {
-                CallKind::Uploaded(uploaded)
-            });
-        }
         let responses = checked
             .into_iter()
             .map(|(digest, c)| {

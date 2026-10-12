@@ -158,6 +158,11 @@ async fn an_off_recorder_and_a_stopped_one_record_nothing() {
     let off = Recorder::off();
     assert!(!off.is_on());
     downloaded(&off, "x");
+    off.emit(Event::Started {
+        operation: OperationId(1),
+        lease: kbf_types::LeaseId::new(1, 1),
+        at: kbf_front::wall_now(),
+    });
     off.caught_up().await;
     assert_eq!(
         (off.get(&key("x")), off.dropped(), off.bytes()),

@@ -344,7 +344,7 @@ where
         wire::check_digest_function(request.digest_function)?;
         let action = wire::digest(request.action_digest.as_ref())?;
         if !request.skip_cache_lookup
-            && let Some((stored, result)) = self.cache.stored_action_result(&action).await?
+            && let Some((stored, result)) = self.cache.action_result(&action).await?
         {
             let name = format!(
                 "operations/cached/{}-{}",

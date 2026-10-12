@@ -68,7 +68,7 @@ impl<M: MetaLog, O: ObjectStore + 'static> ActionCache for ActionCacheService<M,
         .await?;
         wire::check_digest_function(request.digest_function)?;
         let action = wire::digest(request.action_digest.as_ref())?;
-        let stored = self.cache.stored_action_result(&action).await?;
+        let stored = self.cache.action_result(&action).await?;
         let instance = &request.instance_name;
         self.recorder
             .call(&metadata, &caller, instance, || CallKind::GetActionResult {

@@ -376,25 +376,14 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         }
     }
 
-    /// Answers `GetActionResult`: the result if the entry passes the closure check
-    /// (its result blob and every blob it needs present and reachable) and the result
-    /// blob reads back; `None` (a miss, so the action runs again) otherwise.
+    /// Answers `GetActionResult`: the result, and the digest of the ActionResult blob
+    /// it was read from, if the entry passes the closure check (its result blob and
+    /// every blob it needs present and reachable) and the result blob reads back;
+    /// `None` (a miss, so the action runs again) otherwise.
     ///
     /// # Errors
     /// The metadata log or the store is unavailable.
     pub async fn action_result(
-        &self,
-        action: &Digest,
-    ) -> Result<Option<reapi::ActionResult>, CacheError> {
-        Ok(self.stored_action_result(action).await?.map(|(_, r)| r))
-    }
-
-    /// [`Cache::action_result`], with the digest of the ActionResult blob it was read
-    /// from.
-    ///
-    /// # Errors
-    /// The metadata log or the store is unavailable.
-    pub async fn stored_action_result(
         &self,
         action: &Digest,
     ) -> Result<Option<(Digest, reapi::ActionResult)>, CacheError> {

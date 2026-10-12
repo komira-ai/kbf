@@ -448,7 +448,7 @@ impl Records {
             self.record(key).rows_capped = true;
             return None;
         }
-        self.record(key).push_row(cap, row)
+        Some(self.record(key).push_row(row))
     }
 
     /// Copies `operation`'s attempts into every row that waits on it, and marks each
@@ -583,11 +583,10 @@ impl Records {
         self.bytes -= inv.counted;
         self.by_seen.remove(&(inv.indexed, key.clone()));
         self.minted_by_seen.remove(&(inv.indexed, key.clone()));
-        if let Some(family) = self.ids.get_mut(key.id()) {
-            family.keys.retain(|k| k != key);
-            if family.keys.is_empty() {
-                self.ids.remove(key.id());
-            }
+        let family = self.ids.get_mut(key.id()).expect(HELD);
+        family.keys.retain(|k| k != key);
+        if family.keys.is_empty() {
+            self.ids.remove(key.id());
         }
         let owner = RecordKey::owner(key.id().clone());
         if let Some(inv) = self.invocations.get_mut(&owner) {

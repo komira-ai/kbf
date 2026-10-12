@@ -394,19 +394,14 @@ impl Invocation {
         self.rows.len() < cap && !self.rows_closed
     }
 
-    /// Adds `row` and returns its index; `None` once the record holds `cap` rows or
-    /// the memory bound has closed it.
-    pub(crate) fn push_row(&mut self, cap: usize, row: ActionRow) -> Option<usize> {
-        if !self.takes_rows(cap) {
-            self.rows_capped = true;
-            return None;
-        }
+    /// Adds `row`, which [`Self::takes_rows`] allowed, and returns its index.
+    pub(crate) fn push_row(&mut self, row: ActionRow) -> usize {
         let bytes = row.heap_bytes();
         self.by_action.insert(row.action, self.rows.len());
         self.rows.push(row);
         self.row_bytes.push(bytes);
         self.rows_bytes += bytes;
-        Some(self.rows.len() - 1)
+        self.rows.len() - 1
     }
 
     /// Counts row `i` again after it changed.
