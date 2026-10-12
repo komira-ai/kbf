@@ -491,3 +491,34 @@ fn a_mark_larger_than_the_share_is_not_kept() {
     r.apply(ev(c));
     assert!(r.get(&key("u")).expect("u").complete());
 }
+
+/// Catches (security): a row moved to an instance name its record does not hold. At
+/// the bound the record cannot take the new name `b` (its bytes do not fit); a later
+/// Execute of the same action by `b` replaced the row anyway (a shorter name costs
+/// 0 bytes more), so a reader authorized on the record's names read a row of `b`.
+/// The row stays as it was and the record says it is incomplete.
+#[test]
+fn a_row_never_takes_an_instance_name_the_record_does_not_hold() {
+    let on = |e: Event, instance: &str| match e {
+        Event::Call(mut c) => {
+            c.instance = instance.to_owned();
+            Event::Call(c)
+        }
+        e => e,
+    };
+    let first = on(queued("inv", t(1), 10, 1), "aaaaaaaaaaaaaaaa");
+    let mut r = bounded(unbounded(&[first.clone()]), &[first]);
+    r.apply(on(queued("inv", t(2), 10, 2), "b"));
+    let inv = r.get(&key("inv")).expect("held");
+    assert_eq!(
+        inv.instances().iter().collect::<Vec<_>>(),
+        ["aaaaaaaaaaaaaaaa"]
+    );
+    let rows: Vec<_> = inv
+        .rows()
+        .iter()
+        .map(|x| (x.instance.as_str(), x.operation.as_deref()))
+        .collect();
+    assert_eq!(rows, [("aaaaaaaaaaaaaaaa", Some(name("inv", 1).as_str()))]);
+    assert!(!inv.complete());
+}
