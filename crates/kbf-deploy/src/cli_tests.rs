@@ -669,3 +669,50 @@ fn envoy_check_exits_0_passed_1_failed_2_refused() {
     assert_eq!((code, out.as_str()), (ExitCode::from(2), ""), "{err}");
     assert!(err.ends_with(": unknown key KBF_SERVER\n"), "{err}");
 }
+
+/// Catches `envoy check` checking the NetworkPolicy against a fixed operator
+/// namespace instead of the config's `KBF_TS_OPERATOR_NAMESPACE`: a config naming
+/// another namespace passes on its own render, and a render made for `tailscale`
+/// fails `netpol-from` under it, naming the config's namespace.
+#[test]
+fn envoy_check_takes_the_operator_namespace_from_the_config() {
+    let dir = kbf_host::testkit::scratch("cli-envoy-check-namespace");
+    let example = include_str!("../templates/envoy/config.example");
+    let line = "KBF_TS_OPERATOR_NAMESPACE=tailscale\n";
+    assert_eq!(example.matches(line).count(), 1);
+    let tailscale = dir.join("config.tailscale");
+    std::fs::write(&tailscale, example).expect("config");
+    let tailscale = tailscale.to_str().expect("utf-8").to_owned();
+    let other = dir.join("config.other");
+    std::fs::write(
+        &other,
+        example.replace(line, "KBF_TS_OPERATOR_NAMESPACE=ts-operator\n"),
+    )
+    .expect("config");
+    let other = other.to_str().expect("utf-8").to_owned();
+    let rendered = dir.join("rendered");
+    let rendered = rendered.to_str().expect("utf-8").to_owned();
+    let mut exec = FakeExec::new(501);
+
+    let (code, out, err) = cli(&mut exec, &no_env, &["envoy", "check", "--config", &other]);
+    assert_eq!(
+        (code, out.as_str(), err.as_str()),
+        (
+            ExitCode::SUCCESS,
+            "12 methods routed, every check passed\n",
+            ""
+        )
+    );
+
+    let render = [
+        "envoy", "render", "--config", &tailscale, "--out", &rendered,
+    ];
+    assert_eq!(cli(&mut exec, &no_env, &render).0, ExitCode::SUCCESS);
+    let check = ["envoy", "check", "--config", &other, "--dir", &rendered];
+    let (code, out, err) = cli(&mut exec, &no_env, &check);
+    assert_eq!((code, err.as_str()), (ExitCode::FAILURE, ""), "{out}");
+    assert_eq!(
+        out,
+        "FAIL netpol-from: the NetworkPolicy admits [{\"namespaceSelector\":{\"matchLabels\":{\"kubernetes.io/metadata.name\":\"tailscale\"}}}], not the operator's namespace ts-operator\n"
+    );
+}
