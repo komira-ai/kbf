@@ -38,7 +38,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - run: shellcheck --version && shellcheck -x -S warning tools/spike/macos/*.sh tools/spike/macos/test/fakecmd tools/spike/macos/test/*.sh
+      - run: shellcheck --version
+      - run: shellcheck -x -S warning tools/spike/macos/*.sh tools/spike/macos/test/fakecmd tools/spike/macos/test/*.sh
       - run: bash tools/spike/macos/test/run.sh
       - run: bash tools/spike/macos/test/mutants.sh
 
@@ -57,8 +58,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Host facts
-        run: sw_vers && uname -m && xcodebuild -version && ls -d /Applications/Xcode*.app
+      - run: sw_vers
+      - run: uname -m
+      - run: xcodebuild -version
+      - run: ls -d /Applications/Xcode*.app
       - name: TCC rows as seeded
         if: ${{ !cancelled() }}
         run: bash tools/spike/macos/tcc.sh
@@ -92,8 +95,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Host facts
-        run: sw_vers && uname -m && xcodebuild -version && ls -d /Applications/Xcode*.app
+      - run: sw_vers
+      - run: uname -m
+      - run: xcodebuild -version
+      - run: ls -d /Applications/Xcode*.app
       - name: TCC rows as seeded
         if: ${{ !cancelled() }}
         run: bash tools/spike/macos/tcc.sh

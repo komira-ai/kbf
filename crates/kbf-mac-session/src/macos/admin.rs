@@ -61,6 +61,10 @@ impl AdminHost for MacAdmin {
         autologin::run_command(program, args)
     }
 
+    fn chown(&self, path: &Path, uid: u32, gid: u32) -> io::Result<()> {
+        std::os::unix::fs::lchown(path, Some(uid), Some(gid))
+    }
+
     fn now(&self) -> SystemTime {
         SystemTime::now()
     }
@@ -115,6 +119,29 @@ mod tests {
         assert!(added.success, "{added:?}");
         assert!(host.has_acl(&dir).unwrap());
         assert!(host.has_acl(&dir.join("missing")).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Catches: a chown that does not reach the OS (one that succeeds where the OS
+    /// refuses, or never fails on a missing path).
+    #[test]
+    fn chown_changes_the_owner_through_the_os() {
+        let dir = scratch("chown");
+        let host = MacAdmin::default();
+        let file = dir.join("file");
+        std::fs::write(&file, "").unwrap();
+        let (uid, gid) = (
+            rustix::process::geteuid().as_raw(),
+            rustix::process::getegid().as_raw(),
+        );
+        host.chown(&file, uid, gid).unwrap();
+        assert!(host.chown(&dir.join("missing"), uid, gid).is_err());
+        if uid != 0 {
+            assert!(
+                host.chown(&file, 0, 0).is_err(),
+                "only root gives a file away"
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

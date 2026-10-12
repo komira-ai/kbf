@@ -19,6 +19,12 @@ pub struct Policy {
     pub authenticator: Arc<dyn Authenticator>,
     /// Asked by the services, per call.
     pub authorizers: Authorizers,
+    /// `blobs.getAuthorizer`: asked, with the `instance` parameter, by the operator
+    /// API's blob route (`GET /v1/blobs/{digest}`), which runs [`Self::authenticator`]
+    /// too. `None`, when the file names no such key or there is no file, turns that
+    /// route off: unlike every other authorizer, a missing one does not allow,
+    /// because the route serves build outputs and logs.
+    pub blobs_get: Option<Arc<dyn Authorizer>>,
 }
 
 impl fmt::Debug for Policy {
@@ -62,6 +68,7 @@ impl Policy {
         Self {
             authenticator: Arc::new(AllowAuthenticator::default()),
             authorizers: Authorizers::allow_all(),
+            blobs_get: None,
         }
     }
 
@@ -71,7 +78,8 @@ impl Policy {
     /// The text is not JSON, or not a policy: an unknown key, an object that names no
     /// variant or more than one, a variant not built yet, a value of the wrong type,
     /// a bad instance-name prefix, `actionCache.putAuthorizer` (clients never write
-    /// the action cache), or no `authenticationPolicy`.
+    /// the action cache), a `blobs` without `getAuthorizer`, or no
+    /// `authenticationPolicy`.
     pub fn from_json(text: &str) -> Result<Self, PolicyError> {
         let root: Value = serde_json::from_str(text)?;
         let path = Path::root();
@@ -85,6 +93,7 @@ impl Policy {
                 "contentAddressableStorage",
                 "actionCache",
                 "executeAuthorizer",
+                "blobs",
             ],
         )?;
         let authenticator = match top.get("authenticationPolicy") {
@@ -130,9 +139,25 @@ impl Policy {
                 authorizers.ac_get = authorizer(v, &path.key("getAuthorizer"))?;
             }
         }
+        let blobs_get = match top.get("blobs") {
+            Some(v) => {
+                let path = path.key("blobs");
+                let blobs = object(v, &path)?;
+                known(blobs, &path, &["getAuthorizer"])?;
+                let Some(get) = blobs.get("getAuthorizer") else {
+                    return Err(path.invalid(
+                        "`getAuthorizer` is required; leave `blobs` out to keep blob reads \
+                         over HTTP off",
+                    ));
+                };
+                Some(authorizer(get, &path.key("getAuthorizer"))?)
+            }
+            None => None,
+        };
         Ok(Self {
             authenticator,
             authorizers,
+            blobs_get,
         })
     }
 }

@@ -51,7 +51,7 @@ jobs:
       - run: python3 tools/spike/macos/fixtures/gen_projects.py --check
       - run: shellcheck -S warning tools/spike/macos/fixtures/*.sh
 
-  # Every step after the first two runs even if an earlier one failed, so one failure
+  # Every step after the host facts runs even if an earlier one failed, so one failure
   # does not hide the other platform's result; any failed step still fails the job.
   xcuitest-macos:
     runs-on: macos-15
@@ -62,20 +62,26 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Host facts
-        run: |
-          sw_vers
-          uname -m
-          xcodebuild -version
-          xcrun simctl list runtimes
-      - name: Generated projects are current and parse
+      - run: sw_vers
+      - run: uname -m
+      - run: xcodebuild -version
+      - run: xcrun simctl list runtimes
+      - name: Generated projects are current
         if: ${{ !cancelled() }}
-        run: |
-          cd tools/spike/macos/fixtures
-          python3 gen_projects.py --check
-          plutil -lint MacFixture.xcodeproj/project.pbxproj IOSFixture.xcodeproj/project.pbxproj
-          xcodebuild -list -project MacFixture.xcodeproj
-          xcodebuild -list -project IOSFixture.xcodeproj
+        working-directory: tools/spike/macos/fixtures
+        run: python3 gen_projects.py --check
+      - name: Generated projects parse, plist lint
+        if: ${{ !cancelled() }}
+        working-directory: tools/spike/macos/fixtures
+        run: plutil -lint MacFixture.xcodeproj/project.pbxproj IOSFixture.xcodeproj/project.pbxproj
+      - name: Generated projects parse, macOS project
+        if: ${{ !cancelled() }}
+        working-directory: tools/spike/macos/fixtures
+        run: xcodebuild -list -project MacFixture.xcodeproj
+      - name: Generated projects parse, iOS project
+        if: ${{ !cancelled() }}
+        working-directory: tools/spike/macos/fixtures
+        run: xcodebuild -list -project IOSFixture.xcodeproj
       - name: Pixel checker selftest
         if: ${{ !cancelled() }}
         run: bash tools/spike/macos/fixtures/selftest.sh "$RUNNER_TEMP/xcuitest"
@@ -112,8 +118,9 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Host facts
-        run: sw_vers && uname -m && xcodebuild -version
+      - run: sw_vers
+      - run: uname -m
+      - run: xcodebuild -version
       - run: rustup toolchain install
       - run: cargo build -p kbf-driver-native --example action_sandbox --locked
       - name: The fixtures under the driver's sandbox, with controls

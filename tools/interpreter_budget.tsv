@@ -4,8 +4,10 @@
 # refuse anything the scan finds with no row here, a row the scan finds nothing for
 # (remove it in the change that deletes its file), and a malformed or
 # repeated row. The list records what exists, not how big it is: editing a listed
-# file, step or keeper does not touch it. The list only shrinks: `cargo xtask
-# budget-diff` refuses a row a pull request adds (crates/xtask/src/budget.rs).
+# file or keeper does not touch it. The list only shrinks: `cargo xtask budget-diff`
+# refuses a row a pull request adds (crates/xtask/src/budget.rs). A workflow `run:`
+# step with shell logic has no section here: the lints refuse it outright, and its
+# logic goes into Rust.
 #
 # Rows: <key><TAB><reason>.
 
@@ -15,7 +17,6 @@ crates/kbf-it/m1/bazel/tools/upper.sh	M1 sample project action; to become a Rust
 crates/kbf-it/m1/buck2/tools/upper.sh	M1 sample project action; to become a Rust test action
 crates/kbf-it/m1/run.sh	M1 cell harness; to become kbf-cell m1
 crates/kbf-it/m2/run.sh	M2 cell harness; to become kbf-cell m2
-tools/ci/guest-tests.sh	CI tests run as root; to become Rust tests run as root
 tools/ci/m2-container.sh	CI step; to become a cargo xtask verb
 tools/ci/mac-session-tests.sh	CI tests run as root; to become Rust tests run as root
 tools/ci/podman-tests-inner.sh	CI step; to become a cargo xtask verb
@@ -43,27 +44,6 @@ tools/spike/macos/test/run.sh	macOS probe kit; to be deleted once its findings a
 tools/spike/macos/verdicts.sh	macOS probe kit; to be deleted once its findings are documented
 tools/spike/macos/volume_owner.sh	macOS probe kit; to be deleted once its findings are documented
 tools/spike/macos/xcuitest_sandbox.sh	XCUITest sandbox check (spike-xcuitest workflow); to become a Rust macOS test
-
-# Workflow and composite-action `run:` steps with shell logic. Key:
-# <file>#<job>/<step name>, or `step <n>` (1-based) for a step with no name.
-[workflow]
-.github/workflows/artifacts.yml#darwin-arm64/step 5	runner host facts; to become one command
-.github/workflows/artifacts.yml#darwin-arm64/SBOM	SBOM and lock check; to become one command per step
-.github/workflows/artifacts.yml#linux-x86_64/SBOM	SBOM and lock check; to become one command per step
-.github/workflows/artifacts.yml#linux-arm64/SBOM	SBOM and lock check; to become one command per step
-.github/workflows/ci.yml#objstore-s3/Wait for both stores to accept connections	wait loop; to become a flag of the program that waits
-.github/workflows/ci.yml#coverage/Run the workspace tests under coverage	coverage run and ratchet; to become one command per step
-.github/workflows/ci.yml#coverage/Per-crate table and ratchet	coverage run and ratchet; to become one command per step
-.github/workflows/ci.yml#native-macos/step 4	runner host facts; to become one command
-.github/workflows/ci.yml#mac-provision/step 2	shellcheck of the mac-provision scripts; goes with them
-.github/workflows/integration.yml#m1-cell/Wait for MinIO	wait loop; to become a flag of the program that waits
-.github/workflows/integration.yml#m1-cell/M1 cell, Bazel and buck2 twice each	one M1 harness call over several lines; goes with crates/kbf-it/m1/run.sh
-.github/workflows/spike-macos.yml#selftest/step 2	shellcheck of the macOS probe kit; goes with it
-.github/workflows/spike-macos.yml#probes-macos-26/Host facts	runner host facts; to become one command
-.github/workflows/spike-macos.yml#probes-macos-15/Host facts	runner host facts; to become one command
-.github/workflows/spike-xcuitest.yml#xcuitest-macos/Host facts	runner host facts; to become one command
-.github/workflows/spike-xcuitest.yml#xcuitest-macos/Generated projects are current and parse	XCUITest fixture check; goes with the fixtures
-.github/workflows/spike-xcuitest.yml#xcuitest-sandbox/Host facts	runner host facts; to become one command
 
 # Production Rust under crates/*/src/ that names a shell and a `-c` flag. Key: the path.
 [src-sh-c]

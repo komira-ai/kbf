@@ -78,8 +78,8 @@ fn start() -> Server {
     start_with(Some(token()))
 }
 
-fn start_with(token: Option<ApiToken>) -> Server {
-    let listeners = Listeners {
+fn listeners() -> Listeners {
+    Listeners {
         reapi: loopback(),
         worker: loopback(),
         reapi_tls: None,
@@ -91,7 +91,12 @@ fn start_with(token: Option<ApiToken>) -> Server {
         finished_retention: kbf_sched::FINISHED_RETENTION,
         shutdown_timeout: Duration::from_secs(10),
         store_probe_timeout: kbf_server::health::STORE_PROBE_TIMEOUT,
-    };
+        invocation_memory: kbf_front::DEFAULT_INVOCATION_MEMORY,
+    }
+}
+
+fn start_with(token: Option<ApiToken>) -> Server {
+    let listeners = listeners();
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
     let shutdown = async move {
         let _ = stopped.await;
@@ -353,6 +358,7 @@ async fn an_api_address_in_use_is_refused() {
         finished_retention: kbf_sched::FINISHED_RETENTION,
         shutdown_timeout: Duration::from_secs(10),
         store_probe_timeout: kbf_server::health::STORE_PROBE_TIMEOUT,
+        invocation_memory: kbf_front::DEFAULT_INVOCATION_MEMORY,
     };
     let api = Api {
         listen: addr,
@@ -950,4 +956,26 @@ async fn a_restarted_daemon_neither_clears_nor_raises_an_unchanged_item() {
     assert_eq!(farm.node_status(&node, third, accepted), cleared);
     let listed = farm.node_view(&node).expect("listed");
     assert_eq!(listed.needs_attention, Vec::<String>::new());
+}
+
+/// Catches the invocation recorder's task run inside the serving future, beside the
+/// tick and the accept loops (plant: `recording.run()` back in their `select!`): once
+/// the serving future has been polled, the recorder applies events while nothing
+/// polls that future again.
+#[tokio::test]
+async fn the_recorder_runs_as_a_task_of_its_own() {
+    let bound =
+        bind_server_with_api(cache(), listeners(), None, std::future::pending()).expect("bind");
+    let recorder = bound.recorder.clone();
+    let mut serving = Box::pin(bound.serving);
+    assert!(futures::poll!(serving.as_mut()).is_pending());
+    recorder.emit(kbf_invocation::Event::Started {
+        operation: kbf_types::OperationId(1),
+        lease: kbf_types::LeaseId::new(1, 1),
+        at: kbf_front::wall_now(),
+    });
+    tokio::time::timeout(Duration::from_secs(10), recorder.caught_up())
+        .await
+        .expect("the recorder applies events on its own task");
+    drop(serving);
 }
