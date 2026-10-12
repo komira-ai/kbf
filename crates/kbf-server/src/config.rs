@@ -161,6 +161,18 @@ pub struct Args {
     /// off when it runs out.
     #[arg(long, default_value_t = 10)]
     pub shutdown_timeout_secs: u64,
+    /// The memory, in bytes, the invocation records may take together
+    /// (`docs/design/invocations.md`, section 3.5). At the bound, records of a minted id
+    /// go first, then idle ones, least recently seen first; with only open builds left,
+    /// the largest stops taking rows. Records are kept in memory only and lost on
+    /// restart. Their heap was measured at up to 1.08 times this at 200 kB and above,
+    /// and 1.12 at 50 kB (section 3.5).
+    #[arg(
+        long,
+        default_value_t = kbf_front::DEFAULT_INVOCATION_MEMORY as u64,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    pub invocation_memory: u64,
     /// `http://host[:port]` of the S3 service (`--store=s3`).
     #[arg(long, required_if_eq("store", "s3"))]
     pub s3_endpoint: Option<String>,
@@ -271,6 +283,7 @@ impl Args {
             finished_retention: Duration::from_secs(self.finished_retention_secs),
             shutdown_timeout: Duration::from_secs(self.shutdown_timeout_secs),
             store_probe_timeout: Duration::from_millis(self.readyz_store_timeout_ms),
+            invocation_memory: usize::try_from(self.invocation_memory).unwrap_or(usize::MAX),
         })
     }
 
