@@ -8,21 +8,33 @@
 //!   `envoy.json`, the Envoy bootstrap the ConfigMap carries, the same bytes, for a
 //!   reviewer. It writes nothing else and touches no cluster, so it needs no
 //!   `--apply`.
+//! - `kbf-deploy envoy check --config FILE [--dir DIR]` checks `DIR/manifests.json`
+//!   (what `render` wrote there), or without `--dir` the render of `FILE`, for the
+//!   properties the REAPI path through the front depends on ([`check`]). The
+//!   operator's namespace the NetworkPolicy must admit is the config's
+//!   `KBF_TS_OPERATOR_NAMESPACE`. It reads only.
 //!
 //! Both files are JSON, which kubectl and Envoy read, printed as [`json`] describes:
 //! the Deployment's pod template carries the sha256 of `envoy.json`, so the same
 //! settings must always give the same bytes, or every apply would restart Envoy.
 //!
-//! Exit codes: 0 rendered; 2 refused (a bad setting, a file that cannot be read or
-//! written), with a `REFUSED:` line on stderr.
+//! Exit codes: `render` 0 rendered; `check` 0 every check passed, 1 one `FAIL <check>:
+//! <why>` line on stdout per failure. Both: 2 refused (a bad setting, a file that
+//! cannot be read, parsed or written), with a `REFUSED:` line on stderr.
 //!
 //! The settings are a closed set of `KEY=VALUE` lines ([`config::KEYS`],
 //! `templates/envoy/config.example`); every key must be set.
 
+pub mod check;
+mod check_failure;
 pub mod config;
 pub mod json;
 pub mod render;
 
+#[cfg(test)]
+mod check_mutant_tests;
+#[cfg(test)]
+mod check_tests;
 #[cfg(test)]
 mod tests;
 
@@ -36,11 +48,21 @@ pub const MANIFESTS: &str = "manifests.json";
 /// The Envoy bootstrap file `render` writes.
 pub const ENVOY: &str = "envoy.json";
 
-/// Why `render` was refused (exit 2).
+/// Why `render` or `check` was refused (exit 2).
 #[derive(Debug, thiserror::Error)]
 pub enum Refusal {
     #[error(transparent)]
     Config(#[from] EnvoyError),
+    #[error("cannot read {path}: {source}")]
+    Read {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error("{path} is not JSON: {source}")]
+    Parse {
+        path: PathBuf,
+        source: serde_json::Error,
+    },
     #[error("cannot write {path}: {source}")]
     Write {
         path: PathBuf,
@@ -65,4 +87,31 @@ pub fn render_files(config: &Path, out: &Path) -> Result<String, Refusal> {
         "rendered {MANIFESTS} {ENVOY} into {}",
         out.display()
     ))
+}
+
+/// `envoy check`: check `dir`'s `manifests.json`, or without `dir` the render of
+/// `config`, against the config's operator namespace. Every failed check, none when
+/// the render passes.
+pub fn check_files(config: &Path, dir: Option<&Path>) -> Result<Vec<check::CheckFailure>, Refusal> {
+    let c = EnvoyConfig::load(config)?;
+    let (path, text) = match dir {
+        Some(dir) => {
+            let path = dir.join(MANIFESTS);
+            match std::fs::read_to_string(&path) {
+                Ok(text) => (path, text),
+                Err(source) => return Err(Refusal::Read { path, source }),
+            }
+        }
+        None => (config.to_owned(), render::render(&c).manifests),
+    };
+    let doc = serde_json::from_str(&text).map_err(|source| Refusal::Parse { path, source })?;
+    Ok(check::check(&doc, &c.operator_namespace))
+}
+
+/// The line `envoy check` prints when every check passes.
+pub fn check_passed() -> String {
+    format!(
+        "{} methods routed, every check passed",
+        check::METHODS.len()
+    )
 }

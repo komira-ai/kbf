@@ -16,6 +16,7 @@
 //! kbf-deploy mdm install --config FILE --uninstall [--apply]
 //! kbf-deploy mdm verify --config FILE [--via ADDR:PORT]
 //! kbf-deploy envoy render --config FILE --out DIR
+//! kbf-deploy envoy check --config FILE [--dir DIR]
 //! ```
 //!
 //! Bad flags exit 2 for every subcommand. The `minio` subcommands change a host: without
@@ -27,7 +28,9 @@
 //! host as root, plan by default as the `minio` subcommands do, and exit 0 done (or
 //! nothing to do), 1 a step or the check after an apply failed (`FAIL ...`), or 2
 //! refused (`REFUSED: ...` on stderr). `envoy render` only writes into the directory
-//! it is given, and exits 0 done or 2 refused (`REFUSED: ...` on stderr).
+//! it is given, and exits 0 done or 2 refused (`REFUSED: ...` on stderr); `envoy check`
+//! only reads, and exits 0 every check passed, 1 a check failed (`FAIL <check>: ...` on
+//! stdout) or 2 refused.
 //! The `mdm` verbs exit as the `linux` host verbs do; `mdm verify` exits 1 when a check
 //! fails ([`crate::mdm`]).
 //! `minio buckets` reads the MinIO admin key pair from `MINIO_ROOT_USER` and
@@ -100,6 +103,18 @@ enum Envoy {
         /// Where to write the two files.
         #[arg(long)]
         out: PathBuf,
+    },
+    /// Check a render for what the REAPI path through the front depends on: every
+    /// client call routed with no bound on a stream's life, TLS to the CA naming
+    /// each server, health checks kbf-server answers, the Ingress and NetworkPolicy
+    /// reaching Envoy. One `FAIL <check>: <why>` line per failure.
+    Check {
+        /// The kit's settings, KEY=VALUE lines.
+        #[arg(long)]
+        config: PathBuf,
+        /// The directory render wrote; without it, the render of --config is checked.
+        #[arg(long)]
+        dir: Option<PathBuf>,
     },
 }
 
@@ -508,10 +523,22 @@ fn mdm_kit<E: Exec>(m: Mdm, exec: &mut E, out: &mut dyn Write, err: &mut dyn Wri
     }
 }
 
-/// The `envoy` kit: 0 done, 2 refused.
+/// The `envoy` kit: 0 done (or every check passed), 1 a check failed, 2 refused.
 fn envoy_kit(e: Envoy, out: &mut dyn Write, err: &mut dyn Write) -> ExitCode {
-    let Envoy::Render { config, out: dir } = e;
-    match envoy::render_files(&config, &dir) {
+    let done = match e {
+        Envoy::Render { config, out: dir } => envoy::render_files(&config, &dir),
+        Envoy::Check { config, dir } => match envoy::check_files(&config, dir.as_deref()) {
+            Ok(failures) if failures.is_empty() => Ok(envoy::check_passed()),
+            Ok(failures) => {
+                for f in &failures {
+                    let _ = writeln!(out, "{}", f.line());
+                }
+                return ExitCode::FAILURE;
+            }
+            Err(e) => Err(e),
+        },
+    };
+    match done {
         Ok(line) => {
             let _ = writeln!(out, "{line}");
             ExitCode::SUCCESS

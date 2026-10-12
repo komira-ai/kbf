@@ -12,10 +12,11 @@ publish.workspace = true
 # kits: `minio` (buckets and their key, a NodePort for the S3 port), `linux`
 # (render-units, check-units, and as root install-units, image-pull and swap), `mdm`
 # (fetch the pinned upstream archives, install the MDM services as root, verify them)
-# and `envoy` (render). rustls (ring), httparse and rustls-native-certs make the HTTPS
-# client of `mdm fetch` and `mdm verify`; sha2 checks the archives against their pins
-# and hashes the rendered Envoy config into the pod template; zip, tar and flate2
-# unpack the archives; x509-parser reads the certificates `mdm verify` checks.
+# and `envoy` (render, and check a render). rustls (ring), httparse and
+# rustls-native-certs make the HTTPS client of `mdm fetch` and `mdm verify`; sha2
+# checks the archives against their pins and hashes the rendered Envoy config into the
+# pod template; zip, tar and flate2 unpack the archives; x509-parser reads the
+# certificates `mdm verify` checks.
 
 [[bin]]
 name = "kbf-deploy"

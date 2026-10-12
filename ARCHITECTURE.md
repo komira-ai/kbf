@@ -1,4 +1,4 @@
-# kbf architecture
+so a byte change restarts Envoy; `check` checks a render (`manifests.json`, as applied) for what the REAPI path through the front depends on: every client call routed with no bound on a stream's life and an idle timeout over the longest silent stream, TLS to the mounted CA naming each server, health checks on names kbf-server answers, and the Ingress, Service and NetworkPolicy reaching Envoy, one `FAIL <check>: <why>` line per failure |# kbf architecture
 
 This document describes how kbf is put together: what each part does, how a request
 moves through the farm, where state lives, and how the code is tested. It describes
