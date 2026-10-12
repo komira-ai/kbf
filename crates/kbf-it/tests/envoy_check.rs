@@ -11,7 +11,7 @@ use kbf_server::grpc_health::SERVICES;
 /// front routes nothing), or fail one that works.
 #[test]
 fn the_health_services_are_the_servers() {
-    assert_eq!(HEALTH_SERVICES, SERVICES);
+    assert_eq!(HEALTH_SERVICES.as_slice(), SERVICES.as_slice());
 }
 
 /// Catches a routed method whose service kbf-server does not serve on its REAPI

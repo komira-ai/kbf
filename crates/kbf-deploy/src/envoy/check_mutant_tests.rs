@@ -77,6 +77,15 @@ const MUTANTS: &[Mutant] = &[
         },
     ),
     m(
+        "idle-timeout",
+        "an idle timeout of exactly the silent stream's 3900 s cuts it at its last second",
+        |d| {
+            envoy(d, |e| {
+                set_new(e, &format!("{ROUTES}/0/route/idle_timeout"), json!("3900s"))
+            })
+        },
+    ),
+    m(
         "route-timeout",
         "route timeout back to Envoy's default 15 s: every Execute is cut",
         |d| envoy(d, |e| remove(e, &format!("{ROUTES}/0/route"), "timeout")),
