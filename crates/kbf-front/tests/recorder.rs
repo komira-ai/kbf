@@ -3,6 +3,7 @@
 //! record it was for says `complete: false`, and what a row copies from an
 //! ActionResult. Each test names the defect it catches.
 
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -306,4 +307,92 @@ fn a_listing_copies_outputs_logs_and_usage() {
     );
     let bare = listing(d(9), &ActionResult::default());
     assert_eq!((bare.outputs.len(), bare.usage), (0, None));
+}
+
+/// Catches work done for a call that is not recorded (the verifier's probe: an
+/// id-less GetActionResult hit cloned its listing): plant `kind()` before the id
+/// check in `Recorder::call`, and the count goes to 1. With the recorder off, or on
+/// and the call without an id, the kind is never built and nothing is sent.
+#[tokio::test]
+async fn a_call_that_is_not_recorded_builds_nothing() {
+    let built = AtomicU32::new(0);
+    let kind = || {
+        built.fetch_add(1, Ordering::Relaxed);
+        CallKind::Downloaded(1)
+    };
+    let caller = AuthenticationMetadata::default();
+    let (on, _recording) = Recorder::new(1 << 20, 16);
+    on.call(&CallMetadata::default(), &caller, "main", &kind);
+    Recorder::off().call(&metadata("x"), &caller, "main", &kind);
+    assert_eq!(built.load(Ordering::Relaxed), 0, "no kind built");
+    assert_eq!(on.sent(), 0, "nothing sent");
+    on.call(&metadata("x"), &caller, "main", &kind);
+    assert_eq!((built.load(Ordering::Relaxed), on.sent()), (1, 1));
+}
+
+/// A finish whose result lists `n` outputs with 60-byte paths.
+fn finished_listing(n: usize) -> Event {
+    let mut l = listing(d(9), &ActionResult::default());
+    l.outputs = (0..n)
+        .map(|k| Output {
+            path: format!("buck-out/v2/gen/root/0123456789abcdef/pkg/__lib__/{k:08}.o"),
+            digest: d(1),
+            executable: false,
+            directory: false,
+        })
+        .collect();
+    Event::Finished(Finished {
+        operation: OperationId(1),
+        lease: None,
+        outcome: Outcome::Ok { exit_code: 0 },
+        result: Some(l),
+        at: kbf_front::wall_now(),
+    })
+}
+
+/// Catches a channel bounded in events only (plant: no byte check in
+/// `Recorder::emit`): events waiting to be applied, together, hold no more than the
+/// memory bound, so a burst of finishes with wide listings is dropped, counted and
+/// marked like a full channel, and once the task has applied what was queued there
+/// is room again.
+#[tokio::test]
+async fn events_past_the_channel_bytes_are_dropped() {
+    let (recorder, recording) = Recorder::new(200_000, 16);
+    // Over 100 kB each: the first fits, the second does not.
+    recorder.emit(finished_listing(800));
+    recorder.emit(finished_listing(800));
+    assert_eq!((recorder.sent(), recorder.dropped()), (1, 1));
+    let task = tokio::spawn(recording.run());
+    tokio::time::timeout(NO_WAIT, recorder.caught_up())
+        .await
+        .expect("the task applies the queued event");
+    recorder.emit(finished_listing(800));
+    assert_eq!((recorder.sent(), recorder.dropped()), (2, 1), "room again");
+    task.abort();
+}
+
+/// Catches an event listing sent uncut (plant `outputs.collect()` without `take`): a
+/// result with 1,500 output files and 10 directories lists one output past the row's
+/// 1,000, so the row still says `outputs_truncated`, files first.
+#[test]
+fn a_listing_keeps_one_output_past_the_row_limit() {
+    let file = |k: usize| OutputFile {
+        path: format!("f{k}"),
+        digest: Some(proto(&d(1))),
+        ..Default::default()
+    };
+    let result = ActionResult {
+        output_files: (0..1500).map(file).collect(),
+        output_directories: (0..10)
+            .map(|k| OutputDirectory {
+                path: format!("d{k}"),
+                tree_digest: Some(proto(&d(2))),
+                ..Default::default()
+            })
+            .collect(),
+        ..Default::default()
+    };
+    let l = listing(d(9), &result);
+    assert_eq!(l.outputs.len(), kbf_invocation::OUTPUTS_PER_ROW + 1);
+    assert_eq!(l.outputs.last().map(|o| o.path.as_str()), Some("f1000"));
 }

@@ -3,7 +3,9 @@
 //! records from them, in memory, within `--invocation-memory`.
 //!
 //! - **It never slows a call.** [`Recorder::emit`] puts an event on a bounded channel
-//!   and returns; a full channel drops the event (counted:
+//!   and returns. The channel holds at most [`RECORDER_CHANNEL`] events and, together,
+//!   as many bytes ([`Event::bytes`]) as the records' bound; a full channel drops the
+//!   event (counted:
 //!   `kbf_invocation_events_dropped`, [`Recorder::dropped`]) and leaves a mark naming
 //!   the record it was for, which the task marks incomplete once it has applied every
 //!   event sent before the drop (so the record, or the operation, is there to mark).
@@ -13,19 +15,20 @@
 //!   then idle records are removed at the bound, then the largest open one stops
 //!   taking rows. Records are lost on restart.
 //! - **Calls without an invocation id are not recorded** (the id-less fallback that
-//!   mints one, section 2.3, comes with the link it is for).
+//!   mints one, section 2.3, comes with the link it is for): such a call costs a
+//!   branch, and nothing of it is built.
 //!
-//! The task is a future, [`Recording::run`], that the server runs beside its
-//! listeners. A [`Recorder::off`] records nothing and costs a branch per call.
+//! The task is a future, [`Recording::run`], that the server spawns as a task of its
+//! own. A [`Recorder::off`] records nothing and costs a branch per call.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use kbf_auth::AuthenticationMetadata;
 use kbf_invocation::{
-    Call, CallKind, Event, ExecuteAnswer, Invocation, InvocationId, Listing, Metadata, Output,
-    Owner, ROW_CAP, RecordKey, Records, Usage, WallTime,
+    Call, CallKind, Event, ExecuteAnswer, Invocation, InvocationId, Listing, Metadata,
+    OUTPUTS_PER_ROW, Output, Owner, ROW_CAP, RecordKey, Records, Usage, WallTime,
 };
 use kbf_proto::reapi;
 use kbf_proto::worker::ResourceUsage;
@@ -56,13 +59,18 @@ pub struct Recorder(Option<Arc<Shared>>);
 /// The task that applies events, made with its [`Recorder`].
 #[derive(Debug)]
 pub struct Recording {
-    events: mpsc::Receiver<Event>,
+    events: mpsc::Receiver<(usize, Event)>,
     shared: Arc<Shared>,
 }
 
 #[derive(Debug)]
 struct Shared {
-    events: mpsc::Sender<Event>,
+    /// Each event with its [`Event::bytes`].
+    events: mpsc::Sender<(usize, Event)>,
+    /// The bytes the channel may hold.
+    channel_bytes: usize,
+    /// The bytes of the events on the channel.
+    queued_bytes: AtomicUsize,
     records: Mutex<Records>,
     /// Events put on the channel.
     sent: AtomicU64,
@@ -96,12 +104,14 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 
 impl Recorder {
     /// A recorder whose records stay within `memory` bytes, on a channel of
-    /// `channel` events, and the task that applies them.
+    /// `channel` events and `memory` bytes, and the task that applies them.
     #[must_use]
     pub fn new(memory: usize, channel: usize) -> (Self, Recording) {
         let (sender, events) = mpsc::channel(channel);
         let shared = Arc::new(Shared {
             events: sender,
+            channel_bytes: memory,
+            queued_bytes: AtomicUsize::new(0),
             records: Mutex::new(Records::with_bound(ROW_CAP, memory)),
             sent: AtomicU64::new(0),
             applied: AtomicU64::new(0),
@@ -130,26 +140,37 @@ impl Recorder {
         self.0.is_some()
     }
 
-    /// Sends `event` to the task without waiting: on a full channel it is dropped and
-    /// its record marked incomplete.
+    /// Sends `event` to the task without waiting: on a full channel (of events, or
+    /// of bytes) it is dropped and its record marked incomplete.
     pub fn emit(&self, event: Event) {
         let Some(shared) = &self.0 else {
             return;
         };
-        match shared.events.try_send(event) {
+        let bytes = event.bytes();
+        let queued = shared.queued_bytes.fetch_add(bytes, Ordering::AcqRel);
+        if queued + bytes > shared.channel_bytes {
+            shared.queued_bytes.fetch_sub(bytes, Ordering::AcqRel);
+            shared.drop_event(&event);
+            return;
+        }
+        match shared.events.try_send((bytes, event)) {
             Ok(()) => {
                 shared.sent.fetch_add(1, Ordering::Relaxed);
             }
-            Err(mpsc::error::TrySendError::Full(event)) => shared.drop_event(&event),
-            // The task is gone: the server is stopping.
+            Err(mpsc::error::TrySendError::Full((_, event))) => {
+                shared.queued_bytes.fetch_sub(bytes, Ordering::AcqRel);
+                shared.drop_event(&event);
+            }
+            // The task is gone: the server is stopping, and nothing reads the count.
             Err(mpsc::error::TrySendError::Closed(_)) => {}
         }
     }
 
     /// Sends a call of the invocation `metadata` names, made by `caller` on
     /// `instance`, answered as `kind`; a call without an invocation id is not
-    /// recorded. `kind` is built only when the recorder is on. (A `dyn` closure, so
-    /// that every call site runs one copy of this function.)
+    /// recorded. `kind` is built only for a call that is: with the recorder on and
+    /// an id. (A `dyn` closure, so that every call site runs one copy of this
+    /// function.)
     pub fn call(
         &self,
         metadata: &CallMetadata,
@@ -157,7 +178,7 @@ impl Recorder {
         instance: &str,
         kind: &dyn Fn() -> CallKind,
     ) {
-        if !self.is_on() {
+        if !self.is_on() || metadata.invocation_id.is_none() {
             return;
         }
         if let Some(call) = call(metadata, caller, instance, kind()) {
@@ -171,6 +192,14 @@ impl Recorder {
         self.0
             .as_ref()
             .map_or(0, |s| s.dropped.load(Ordering::Relaxed))
+    }
+
+    /// Events put on the channel.
+    #[must_use]
+    pub fn sent(&self) -> u64 {
+        self.0
+            .as_ref()
+            .map_or(0, |s| s.sent.load(Ordering::Relaxed))
     }
 
     /// A copy of the record under `key`, as the task has built it so far.
@@ -286,8 +315,9 @@ impl Recording {
             {
                 let mut records = lock(&self.shared.records);
                 let mut applied = self.shared.applied.load(Ordering::Acquire);
-                if let Some(event) = event {
+                if let Some((bytes, event)) = event {
                     records.apply(event);
+                    self.shared.queued_bytes.fetch_sub(bytes, Ordering::AcqRel);
                     applied += 1;
                 }
                 self.shared.take_marks(&mut records, applied);
@@ -425,7 +455,9 @@ pub fn wall_now() -> WallTime {
 /// What a row copies from the ActionResult stored as `result` (section 3.2): its
 /// output files and directories (files first, each in the result's order; one whose
 /// digest does not parse is left out), its stdout and stderr digests and the
-/// `ResourceUsage` it carries.
+/// `ResourceUsage` it carries. It lists at most one output past the
+/// [`OUTPUTS_PER_ROW`] a row keeps, so that the row knows it was cut and an event
+/// holds no more.
 #[must_use]
 pub fn listing(result: Digest, r: &reapi::ActionResult) -> Listing {
     let files = r.output_files.iter().filter_map(|f| {
@@ -450,7 +482,7 @@ pub fn listing(result: Digest, r: &reapi::ActionResult) -> Listing {
     Listing {
         result,
         exit_code: r.exit_code,
-        outputs: files.chain(directories).collect(),
+        outputs: files.chain(directories).take(OUTPUTS_PER_ROW + 1).collect(),
         stdout: log(r.stdout_digest.as_ref()),
         stderr: log(r.stderr_digest.as_ref()),
         usage: usage(r),
