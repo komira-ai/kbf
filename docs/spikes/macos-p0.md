@@ -177,13 +177,16 @@ are. The run is `xcodebuild` itself, in that `root`, with stdin from `/dev/null`
 only the lease's variables (`HOME`, `TMPDIR`, `XDG_CACHE_HOME`,
 `CLANG_MODULE_CACHE_PATH`) and `PATH=/usr/bin:/bin:/usr/sbin:/sbin`, leading its own
 process group, as the driver runs an action whose Command sets only `PATH`. The
-simulator is chosen (`simctl`) and the bundle read (`xcresulttool`) by the test,
-outside the sandbox: that is the test's work, not the action's, and under the profile
-`xcresulttool` cannot write its temporary file (Results).
+simulator is chosen (`simctl`) and the bundle checked (`xcresulttool`) by the test,
+outside the sandbox: that is the test's work, not the action's. Each driver arm's
+testing run is followed by the step an action would take next, `xcrun xcresulttool get
+test-results` on its own bundle under the same profile, whose processes and deny lines
+count as the arm's: under the profile `xcresulttool` cannot write its temporary file
+(Results).
 
 | Arm | What runs | Must |
 |---|---|---|
-| `deny_default` | `xcodebuild test` of the macOS fixture under `(version 1)(deny default)`, handed to `sandbox-exec` the way the driver's profile is | fail, with at least one deny line from its processes, or the test is red as BROKEN (no profile applied, or a log reader that sees nothing) |
+| `deny_default` | `xcodebuild test` of the macOS fixture under `(version 1)(deny default)`, handed to `sandbox-exec` the way the driver's profile is | be refused: `sandbox-exec` reports `execvp() of '/usr/bin/xcodebuild' failed: Operation not permitted`, or the test is red as BROKEN (no profile applied). Its deny lines are printed, not checked |
 | `driver.macos`, `driver.ios` | `xcodebuild test` (build and test) under the driver's profile | see below |
 | `driver_tests.macos`, `driver_tests.ios` | `xcodebuild build-for-testing` without a sandbox, then `test-without-building` under the driver's profile in the same lease: what the UI tests need past the build | the unsandboxed build passes, or BROKEN; then as `driver.*` |
 | `control.macos`, `control.ios` | `xcodebuild test`, no sandbox | pass (three tests passed, three screenshots kept), or BROKEN |
@@ -195,7 +198,7 @@ Deny lines: while a run lasts the test samples the process table every 0.2 s wit
 driver's own `procs::Tracker`; the run's processes are its root and every process seen
 descending from it (one that starts and ends between two samples is missed). After the
 run, `log show` reads the sandbox's reports (sender `Sandbox`) for the run's time
-window, again every 2 s for up to 30 s until the expected lines show. Those from the
+window, again every 2 s for up to 60 s until the expected lines show. Those from the
 run's processes are checked, and written to `<arm>-denies.txt` (uploaded); reports
 from other processes in the window are only counted. The profile allows every mach and
 XPC lookup but those `NO_DEVICE_RULES` denies (the device services), so a run names no
@@ -203,12 +206,21 @@ other mach-lookup; which names a UI test looks up is not measured here.
 
 What the driver arms must show, from the results below:
 - `driver.ios` and `driver_tests.ios` pass;
-- `driver.macos` and `driver_tests.macos` do not pass, and show the `lsopen` deny;
+- `driver.macos` and `driver_tests.macos` do not pass, and `xcodebuild` reports that
+  the sandbox profile is missing `(allow lsopen)` (Launch Services error -54);
 - every driver arm shows a `job-creation` deny, a `user-preference-write` deny, the
-  `CoreDeviceService` lookup and the `usbmuxd` connect denied; the iOS arms also show
-  `xcresulttool`'s write of `T/<UUID>` denied (a write into the temporary folder
-  outside the names the profile opens there); and no arm shows a `T/swbuild.tmp.*`
-  deny.
+  `CoreDeviceService` lookup and the `usbmuxd` connect denied, and no `T/swbuild.tmp.*`
+  deny;
+- in the iOS arms, the `xcresulttool` step reports that it may not save its file in
+  the folder `T` (a write into the temporary folder outside the names the profile
+  opens there).
+
+Where a tool reports a refusal itself, the test reads that report rather than the
+log: one run of the test missed the single deny line of `deny_default` within the
+wait, so a check on one line alone could flake. Each of the four deny lines every driver arm must
+show was there in every driver arm of four earlier runs (16 of 16) and of this test's
+first run; the `CoreDeviceService` and `usbmuxd` lines once per arm, so those two rest
+on the log alone.
 
 So a profile without `(deny lsopen)`, without `NO_DEVICE_RULES`, or with the user
 folder rules widened to the whole temporary folder turns this test red. The parsers
