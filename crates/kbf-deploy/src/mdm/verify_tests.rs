@@ -510,6 +510,7 @@ fn a_late_certificate_and_an_unreachable_proxy_fail() {
         addr: closed.local_addr().expect("addr"),
         ca: server.ca.clone(),
         paths: std::sync::Arc::default(),
+        heads: std::sync::Arc::default(),
     };
     drop(closed);
     let got = failed(&exec, &gone, december());
