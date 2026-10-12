@@ -166,7 +166,7 @@ impl UserFolders {
         let temp = regex_quote(&self.temp.to_string_lossy());
         let swbuild = regex_quote(SWBUILD_TMP);
         format!(
-            "(allow file-write*\n  (regex #\"^{temp}/{TEMPORARY_ITEMS}/\")\n  (regex #\"^{temp}/{XCRUN_DB}(-[^/]*)?$\")\n  (regex #\"^{temp}/{swbuild}[^/]+\"))\n",
+            "(allow file-write*\n  (regex #\"^{temp}/{TEMPORARY_ITEMS}/\")\n  (regex #\"^{temp}/{XCRUN_DB}(-[^/]*)?$\")\n  (regex #\"^{temp}/{swbuild:.0}[^/]+\"))\n",
         )
     }
 
