@@ -3,35 +3,41 @@
 //! sandbox profile the driver builds ([`Isolation::wrap`] with BASE_PROFILE,
 //! NO_DEVICE_RULES and this user's folder rules: the library's bytes, not a copy), in a
 //! lease directory with the lease's variables. The deny lines the sandbox logs for the
-//! run's processes are read back with `log show` and checked.
+//! run's processes are read back with `log show`.
 //!
 //! What the tests pin, measured on the hosted `macos-15` runner with Xcode 16.4
 //! (`docs/spikes/macos-p0.md`):
 //! - the iOS fixture builds and passes its three UI tests on a simulator under the
 //!   profile, both built there and built outside it first;
-//! - the macOS fixture's UI tests do not run: Launch Services is refused the test
-//!   runner (`(deny lsopen)`), which the profile keeps on purpose (`network.rs`);
-//! - every run under the profile is refused what the profile denies and Xcode asks
-//!   for anyway: a launchd job, a preference write, CoreDevice and `usbmuxd`, and
-//!   `xcresulttool`'s write into the user's temporary folder outside the names the
-//!   profile opens there; and no run is refused Swift Build's scratch directory.
+//! - the macOS fixture's UI tests do not run: `xcodebuild` reports Launch Services
+//!   refused by the sandbox (`(deny lsopen)`, which the profile keeps on purpose,
+//!   `network.rs`);
+//! - every run under the profile shows the deny lines of what the profile denies and
+//!   Xcode asks for anyway (a launchd job, a preference write, CoreDevice and
+//!   `usbmuxd`), and none of Swift Build's scratch directory;
+//! - after each iOS testing run, the action's next step, `xcrun xcresulttool get
+//!   test-results` on the run's own bundle under the same profile, reports that it may
+//!   not save its file in the user's temporary folder (`T`, of which the profile opens
+//!   only a few names).
 //!
 //! So a profile that drops one of those denies, or opens more of the temporary folder,
-//! turns a test red here as well as in the driver's unit and integration tests.
+//! turns a test red here as well as in the driver's unit and integration tests. Where a
+//! tool reports the refusal itself (lsopen, the temporary folder, the control below),
+//! the test reads the tool's report, not the log: the log once missed a single report.
 //!
-//! Each run is `xcodebuild`, run as the driver runs an action: in the lease's input
-//! root (which holds a copy of the fixtures, so the projects Xcode opens are inside the
-//! lease), stdin from `/dev/null`, only `PATH=/usr/bin:/bin:/usr/sbin:/sbin` and the
-//! lease's variables in its environment, leading its own process group. While it runs
-//! the process table is sampled every 0.2 s (`procs::Tracker`, the driver's own), so
-//! the run's processes are its root and every process seen descending from it; a
-//! process that starts and ends between two samples is missed. A deny line from any
-//! other process is counted, not checked.
+//! Each run is `xcodebuild` (or that `xcrun` step), run as the driver runs an action:
+//! in the lease's input root (which holds a copy of the fixtures, so the projects Xcode
+//! opens are inside the lease), stdin from `/dev/null`, only
+//! `PATH=/usr/bin:/bin:/usr/sbin:/sbin` and the lease's variables in its environment,
+//! leading its own process group. While it runs the process table is sampled every
+//! 0.2 s (`procs::Tracker`, the driver's own), so the run's processes are its root and
+//! every process seen descending from it; a process that starts and ends between two
+//! samples is missed. A deny line from any other process is counted, not checked.
 //!
 //! Controls: the same run under `(version 1)(deny default)`, through the same wrapping,
-//! must fail with a deny line from its processes (else no sandbox was applied or the
-//! log reader sees nothing), and each fixture must pass without a sandbox in the same
-//! lease layout (else the instrument is broken, not the profile).
+//! must be refused by `sandbox-exec` (else no sandbox was applied), and each fixture
+//! must pass without a sandbox in the same lease layout (else the instrument is broken,
+//! not the profile).
 //!
 //! macOS with Xcode and an iOS simulator runtime only, so every test that runs Xcode is
 //! `#[ignore]`d; the `spike-xcuitest` workflow runs them with `--ignored`. They hold
@@ -71,10 +77,13 @@ const RUN_TIMEOUT: Duration = Duration::from_secs(1200);
 const LOG_SETTLE: Duration = Duration::from_secs(5);
 
 /// How long the log is read again for deny lines that have not shown yet.
-const LOG_WAIT: Duration = Duration::from_secs(30);
+const LOG_WAIT: Duration = Duration::from_secs(60);
 
 /// The control profile.
 const DENY_DEFAULT: &str = "(version 1)\n(deny default)\n";
+
+/// What every fixture run runs.
+const XCODEBUILD: &str = "/usr/bin/xcodebuild";
 
 /// One Xcode run at a time (see the module docs).
 fn xcode() -> MutexGuard<'static, ()> {
@@ -152,12 +161,12 @@ enum Sandbox {
     DenyDefault,
 }
 
-/// The command that runs `xcodebuild args` in `lease` as the driver runs an action,
-/// under `sandbox`, with its output to `log`.
-fn command(lease: &Lease, sandbox: Sandbox, args: &[String], log: &Path) -> Command {
-    let xcodebuild = PathBuf::from("/usr/bin/xcodebuild");
+/// The command that runs `program args` in `lease` as the driver runs an action, under
+/// `sandbox`, with its output to `log`.
+fn command(lease: &Lease, sandbox: Sandbox, program: &str, args: &[String], log: &Path) -> Command {
+    let program = PathBuf::from(program);
     let (program, args) = match sandbox {
-        Sandbox::Off => (xcodebuild, args.to_vec()),
+        Sandbox::Off => (program, args.to_vec()),
         Sandbox::Driver | Sandbox::DenyDefault => {
             let rules = UserFolders::detect()
                 .as_ref()
@@ -167,7 +176,7 @@ fn command(lease: &Lease, sandbox: Sandbox, args: &[String], log: &Path) -> Comm
                 Network::On,
                 &lease.dir,
                 &rules,
-                xcodebuild,
+                program,
                 args,
             );
             assert!(
@@ -357,11 +366,6 @@ enum Expect {
     CoreDevice,
     /// NO_DEVICE_RULES' `usbmuxd` socket.
     Usbmuxd,
-    /// The user folder rules: a write into the temporary folder (this path) outside
-    /// `TemporaryItems/`, `xcrun_db` and `swbuild.tmp.*`.
-    OtherTempWrite(PathBuf),
-    /// `(deny lsopen)`.
-    Lsopen,
 }
 
 impl Expect {
@@ -375,21 +379,6 @@ impl Expect {
             Self::Usbmuxd => {
                 l.operation == "network-outbound" && l.target == "/private/var/run/usbmuxd"
             }
-            Self::OtherTempWrite(temp) => {
-                let Some(entry) = Path::new(&l.target)
-                    .strip_prefix(temp)
-                    .ok()
-                    .and_then(|p| p.iter().next())
-                    .and_then(|e| e.to_str())
-                else {
-                    return false;
-                };
-                l.operation.starts_with("file-write")
-                    && entry != "TemporaryItems"
-                    && !entry.starts_with("xcrun_db")
-                    && !entry.starts_with("swbuild.tmp.")
-            }
-            Self::Lsopen => l.operation == "lsopen",
         }
     }
 
@@ -400,12 +389,36 @@ impl Expect {
             Self::PreferenceWrite => "the profile no longer denies user-preference-write",
             Self::CoreDevice => "NO_DEVICE_RULES' CoreDevice rule is gone from the profile",
             Self::Usbmuxd => "NO_DEVICE_RULES' usbmuxd rule is gone from the profile",
-            Self::OtherTempWrite(_) => {
-                "the user folder rules open more of the temporary folder than its few names"
-            }
-            Self::Lsopen => "the profile no longer denies lsopen",
         }
     }
+}
+
+/// The deny lines every run under the driver's profile shows, on either fixture: it
+/// asks for each of these, and the profile refuses each. Their only evidence is the
+/// sandbox's log; the tools say nothing of them.
+const EVERY_RUN: [Expect; 4] = [
+    Expect::JobCreation,
+    Expect::PreferenceWrite,
+    Expect::CoreDevice,
+    Expect::Usbmuxd,
+];
+
+/// `xcodebuild`'s own report (Launch Services error -54) that the sandbox refused it
+/// the open of the UI-test runner.
+fn refused_lsopen(xcodebuild_log: &str) -> bool {
+    xcodebuild_log.contains("missing \"(allow lsopen)\"")
+}
+
+/// `xcresulttool`'s own report that it could not save its temporary file in the user's
+/// temporary folder, which the profile opens only a few names of.
+fn refused_temp_write(xcresulttool_log: &str) -> bool {
+    xcresulttool_log.contains("permission to save the file")
+        && xcresulttool_log.contains("in the folder \u{201c}T\u{201d}")
+}
+
+/// `sandbox-exec`'s own report that the profile refused it the program.
+fn refused_exec(log: &str) -> bool {
+    log.contains("sandbox-exec: execvp() of ") && log.contains("Operation not permitted")
 }
 
 /// The expectations in `want` no line of `denies` meets.
@@ -431,9 +444,22 @@ struct Arm {
     report: Option<Report>,
     denies: Denies,
     log: PathBuf,
+    /// The output of the sandboxed `xcresulttool` step, when there was one.
+    bundle_read_log: Option<PathBuf>,
 }
 
 impl Arm {
+    fn xcodebuild_output(&self) -> String {
+        std::fs::read_to_string(&self.log).unwrap_or_default()
+    }
+
+    fn bundle_read_output(&self) -> String {
+        self.bundle_read_log
+            .as_ref()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .unwrap_or_default()
+    }
+
     /// `xcodebuild` exited 0 and, for a testing action, the bundle passed.
     fn passed(&self) -> bool {
         self.exit == Some(0) && self.report.as_ref().is_none_or(Report::passed)
@@ -442,7 +468,7 @@ impl Arm {
     /// What a failed assertion prints: the result, the tests, the fixtures' own lines,
     /// the end of the log and the run's distinct deny lines.
     fn describe(&self) -> String {
-        let log = std::fs::read_to_string(&self.log).unwrap_or_default();
+        let log = self.xcodebuild_output();
         let mut text = format!("{}: xcodebuild exit {:?}\n", self.name, self.exit);
         if let Some(report) = &self.report {
             let _ = writeln!(
@@ -460,6 +486,15 @@ impl Arm {
             .take(20)
             .collect();
         let _ = writeln!(text, "log errors:\n{}", errors.join("\n"));
+        if self.bundle_read_log.is_some() {
+            let read = self.bundle_read_output();
+            let first: Vec<&str> = read.lines().take(5).collect();
+            let _ = writeln!(
+                text,
+                "xcresulttool under the profile:\n{}",
+                first.join("\n")
+            );
+        }
         let distinct: BTreeSet<String> = self
             .denies
             .tree
@@ -500,9 +535,12 @@ impl Arm {
 
 /// Runs `action` on `platform`'s fixture in a fresh lease `name` under `sandbox`, after
 /// an unsandboxed `build-for-testing` in the same lease when `action` is
-/// [`Action::TestWithoutBuilding`] (which must pass, or the instrument is broken); then
-/// reads the bundle outside the sandbox, and the run's deny lines until `want` shows.
-fn arm(name: &str, platform: Platform, action: Action, sandbox: Sandbox, want: &[Expect]) -> Arm {
+/// [`Action::TestWithoutBuilding`] (which must pass, or the instrument is broken). A
+/// testing run under the driver's profile is followed by `xcresulttool` reading the
+/// bundle under the same profile, whose processes and deny lines count as the run's.
+/// Then reads the bundle outside the sandbox (the test's check), and the run's deny
+/// lines until [`EVERY_RUN`] shows (for a run under the driver's profile).
+fn arm(name: &str, platform: Platform, action: Action, sandbox: Sandbox) -> Arm {
     let lease = Lease::new(name);
     let destination = xcode_fixture::destination(platform).expect("destination");
     eprintln!(
@@ -520,7 +558,7 @@ fn arm(name: &str, platform: Platform, action: Action, sandbox: Sandbox, want: &
             &destination,
             &lease.out,
         );
-        let run = tracked(command(&lease, Sandbox::Off, &args, &log));
+        let run = tracked(command(&lease, Sandbox::Off, XCODEBUILD, &args, &log));
         assert_eq!(
             run.exit,
             Some(0),
@@ -531,14 +569,34 @@ fn arm(name: &str, platform: Platform, action: Action, sandbox: Sandbox, want: &
     let log = xcode_fixture::log(&lease.out, platform, action);
     let args =
         xcode_fixture::xcodebuild_args(&lease.fixtures, platform, action, &destination, &lease.out);
-    let run = tracked(command(&lease, sandbox, &args, &log));
+    let mut run = tracked(command(&lease, sandbox, XCODEBUILD, &args, &log));
+    let mut bundle_read_log = None;
+    if sandbox == Sandbox::Driver && action.tests() {
+        // The next step of such an action: read its own bundle, under the same profile.
+        let bundle = xcode_fixture::bundle(&lease.out, platform);
+        let mut args = ["xcresulttool", "get", "test-results", "tests", "--path"]
+            .map(str::to_owned)
+            .to_vec();
+        args.push(bundle.to_str().expect("UTF-8").to_owned());
+        let read_log = lease
+            .out
+            .join(format!("{}-xcresulttool.log", platform.name()));
+        let read = tracked(command(&lease, sandbox, "/usr/bin/xcrun", &args, &read_log));
+        eprintln!(
+            "{name}: xcresulttool under the profile: exit {:?}",
+            read.exit
+        );
+        run.pids.extend(read.pids);
+        run.until = read.until;
+        bundle_read_log = Some(read_log);
+    }
     let report = action
         .tests()
         .then(|| xcode_fixture::report(&lease.out, platform));
     let denies = denies(name, &run, |d| match sandbox {
         Sandbox::Off => true,
         Sandbox::DenyDefault => !d.tree.is_empty(),
-        Sandbox::Driver => missing(d, want).is_empty(),
+        Sandbox::Driver => missing(d, &EVERY_RUN).is_empty(),
     });
     let arm = Arm {
         name: name.to_owned(),
@@ -546,55 +604,26 @@ fn arm(name: &str, platform: Platform, action: Action, sandbox: Sandbox, want: &
         report,
         denies,
         log,
+        bundle_read_log,
     };
     eprint!("{}", arm.describe());
     arm
 }
 
-/// The deny lines every run under the driver's profile shows, on either fixture.
-fn every_run() -> Vec<Expect> {
-    vec![
-        Expect::JobCreation,
-        Expect::PreferenceWrite,
-        Expect::CoreDevice,
-        Expect::Usbmuxd,
-    ]
-}
-
-/// [`every_run`], and `xcresulttool`'s write into the temporary folder, which only the
-/// iOS runs, whose tests all run, show every time.
-fn ios_run() -> Vec<Expect> {
-    let temp = UserFolders::detect()
-        .expect("this user's folders")
-        .temp()
-        .to_owned();
-    let mut want = every_run();
-    want.push(Expect::OtherTempWrite(temp));
-    want
-}
-
-/// [`every_run`], and Launch Services refused the macOS UI-test runner.
-fn macos_run() -> Vec<Expect> {
-    let mut want = every_run();
-    want.push(Expect::Lsopen);
-    want
-}
-
 /// The control for every sandboxed run: under `(deny default)`, handed over exactly as
-/// the driver's profile is, `xcodebuild` cannot start, and the log shows a deny line
-/// from the run. Catches a harness that applies no sandbox (every run would pass
-/// unrefused) or whose log reader sees nothing (every expected deny would be
-/// "missing" for the wrong reason).
+/// the driver's profile is, `sandbox-exec` cannot start `xcodebuild` and says so.
+/// Catches a harness that applies no sandbox, under which every sandboxed run would
+/// pass unrefused. The run's deny lines are printed, not checked: the log missed this
+/// single report once (it shows the many reports of a driver arm, which are checked).
 #[test]
 #[ignore = "macOS with Xcode and an iOS simulator; the spike-xcuitest workflow"]
-fn under_deny_default_xcodebuild_is_refused_and_the_log_shows_it() {
+fn under_deny_default_sandbox_exec_refuses_xcodebuild() {
     let _xcode = xcode();
     let arm = arm(
         "deny_default",
         Platform::Macos,
         Action::Test,
         Sandbox::DenyDefault,
-        &[],
     );
     assert_ne!(
         arm.exit,
@@ -603,29 +632,41 @@ fn under_deny_default_xcodebuild_is_refused_and_the_log_shows_it() {
         arm.describe()
     );
     assert!(
-        !arm.denies.tree.is_empty(),
-        "BROKEN: no deny line from the run under (deny default)\n{}",
+        refused_exec(&arm.xcodebuild_output()),
+        "BROKEN: sandbox-exec did not refuse xcodebuild\n{}",
+        arm.describe()
+    );
+}
+
+/// What both iOS arms check: the three UI tests passed, screenshots kept; the deny
+/// lines of [`EVERY_RUN`] and no Swift Build scratch deny; and the sandboxed
+/// `xcresulttool` refused its write into the temporary folder.
+fn assert_ios_arm(arm: &Arm) {
+    assert!(arm.passed(), "{}", arm.describe());
+    arm.assert_denies(&EVERY_RUN);
+    assert!(
+        refused_temp_write(&arm.bundle_read_output()),
+        "xcresulttool saved its temporary file in the temporary folder under the profile: \
+         the user folder rules open more of it than its few names\n{}",
         arm.describe()
     );
 }
 
 /// The iOS fixture builds and passes its three UI tests, screenshots kept, under the
-/// driver's profile, with every expected deny line. Catches a profile that stops
-/// `xcodebuild` (Swift Build's scratch directory refused, the failure PR #425 fixed),
-/// and a profile missing a deny or opening the temporary folder wider.
+/// driver's profile. Catches a profile that stops `xcodebuild` (Swift Build's scratch
+/// directory refused, the failure PR #425 fixed), one missing a deny of
+/// [`EVERY_RUN`], and user folder rules that open more of the temporary folder than
+/// its few names (`xcresulttool` then saves its file there).
 #[test]
 #[ignore = "macOS with Xcode and an iOS simulator; the spike-xcuitest workflow"]
 fn the_ios_fixture_builds_and_passes_under_the_drivers_profile() {
     let _xcode = xcode();
-    let arm = arm(
+    assert_ios_arm(&arm(
         "driver.ios",
         Platform::Ios,
         Action::Test,
         Sandbox::Driver,
-        &ios_run(),
-    );
-    assert!(arm.passed(), "{}", arm.describe());
-    arm.assert_denies(&ios_run());
+    ));
 }
 
 /// The iOS UI tests alone, from an unsandboxed build, pass under the driver's profile:
@@ -636,41 +677,48 @@ fn the_ios_fixture_builds_and_passes_under_the_drivers_profile() {
 #[ignore = "macOS with Xcode and an iOS simulator; the spike-xcuitest workflow"]
 fn the_ios_ui_tests_pass_under_the_drivers_profile_after_an_unsandboxed_build() {
     let _xcode = xcode();
-    let want = ios_run();
     let arm = arm(
         "driver_tests.ios",
         Platform::Ios,
         Action::TestWithoutBuilding,
         Sandbox::Driver,
-        &want,
     );
-    assert!(arm.passed(), "{}", arm.describe());
-    arm.assert_denies(&want);
+    assert_ios_arm(&arm);
 }
 
-/// The macOS fixture under the driver's profile: its UI tests do not run, because
-/// Launch Services is refused the test runner, and every other expected deny shows.
-/// Catches a profile that allows `lsopen` (which lets any action start an application
-/// outside the sandbox, `tests/launchd.rs`; with it allowed the runner still exited
-/// before checking in, so only the deny line tells), and one missing another deny.
-#[test]
-#[ignore = "macOS with Xcode and an iOS simulator; the spike-xcuitest workflow"]
-fn the_macos_ui_tests_stop_on_lsopen_under_the_drivers_profile() {
-    let _xcode = xcode();
-    let want = macos_run();
-    let arm = arm(
-        "driver.macos",
-        Platform::Macos,
-        Action::Test,
-        Sandbox::Driver,
-        &want,
-    );
+/// What both macOS arms check: the UI tests did not pass, `xcodebuild` reports Launch
+/// Services refused by the sandbox, and the deny lines of [`EVERY_RUN`] showed with no
+/// Swift Build scratch deny.
+fn assert_macos_arm(arm: &Arm) {
     assert!(
         !arm.passed(),
         "the macOS UI tests passed under the profile\n{}",
         arm.describe()
     );
-    arm.assert_denies(&want);
+    assert!(
+        refused_lsopen(&arm.xcodebuild_output()),
+        "xcodebuild does not report lsopen refused: the profile no longer denies lsopen\n{}",
+        arm.describe()
+    );
+    arm.assert_denies(&EVERY_RUN);
+}
+
+/// The macOS fixture builds under the driver's profile, and its UI tests do not run:
+/// Launch Services is refused the test runner. Catches a profile that allows `lsopen`
+/// (which lets any action start an application outside the sandbox,
+/// `tests/launchd.rs`; with it allowed the runner still exited before checking in, so
+/// only xcodebuild's report of the refusal tells), and one missing a deny of
+/// [`EVERY_RUN`].
+#[test]
+#[ignore = "macOS with Xcode and an iOS simulator; the spike-xcuitest workflow"]
+fn the_macos_ui_tests_stop_on_lsopen_under_the_drivers_profile() {
+    let _xcode = xcode();
+    assert_macos_arm(&arm(
+        "driver.macos",
+        Platform::Macos,
+        Action::Test,
+        Sandbox::Driver,
+    ));
 }
 
 /// [`the_macos_ui_tests_stop_on_lsopen_under_the_drivers_profile`] for the tests alone,
@@ -679,20 +727,13 @@ fn the_macos_ui_tests_stop_on_lsopen_under_the_drivers_profile() {
 #[ignore = "macOS with Xcode and an iOS simulator; the spike-xcuitest workflow"]
 fn the_macos_ui_tests_stop_on_lsopen_after_an_unsandboxed_build() {
     let _xcode = xcode();
-    let want = macos_run();
     let arm = arm(
         "driver_tests.macos",
         Platform::Macos,
         Action::TestWithoutBuilding,
         Sandbox::Driver,
-        &want,
     );
-    assert!(
-        !arm.passed(),
-        "the macOS UI tests passed under the profile\n{}",
-        arm.describe()
-    );
-    arm.assert_denies(&want);
+    assert_macos_arm(&arm);
 }
 
 /// The controls: each fixture builds and passes its three UI tests, screenshots kept,
@@ -705,7 +746,7 @@ fn both_fixtures_pass_without_a_sandbox() {
     let _xcode = xcode();
     for platform in [Platform::Ios, Platform::Macos] {
         let name = format!("control.{}", platform.name());
-        let arm = arm(&name, platform, Action::Test, Sandbox::Off, &[]);
+        let arm = arm(&name, platform, Action::Test, Sandbox::Off);
         assert!(
             arm.passed(),
             "BROKEN: an unsandboxed control failed\n{}",
@@ -805,31 +846,11 @@ mod pure {
         }
     }
 
-    /// Each expectation matches its rule's lines and nothing else; the temporary-folder
-    /// one only a write to another entry of that folder. Catches an expectation that
-    /// any line meets (it would never go red), and a temporary-folder one met by the
-    /// names the profile opens or by a write elsewhere.
+    /// Each expectation matches its rule's lines and nothing else. Catches an
+    /// expectation that any line meets (it would never go red), and a device one met by
+    /// a lookup outside its prefix or the socket's link path.
     #[test]
     fn each_expected_deny_matches_only_its_rule() {
-        let t = PathBuf::from("/private/var/folders/ab/cd/T");
-        let other = Expect::OtherTempWrite(t.clone());
-        assert!(other.matches(&deny(
-            "file-write-create",
-            "/private/var/folders/ab/cd/T/1A2B-3C"
-        )));
-        for target in [
-            "/private/var/folders/ab/cd/T/TemporaryItems/x",
-            "/private/var/folders/ab/cd/T/xcrun_db-AbC",
-            "/private/var/folders/ab/cd/T/swbuild.tmp.Xy12",
-            "/private/var/folders/ab/cd/C/com.apple.DTServiceHub",
-            "/private/var/folders/ab/cd/T",
-        ] {
-            assert!(
-                !other.matches(&deny("file-write-create", target)),
-                "{target}"
-            );
-        }
-        assert!(!other.matches(&deny("file-read-data", "/private/var/folders/ab/cd/T/1A2B")));
         let cases = [
             (Expect::JobCreation, deny("job-creation", "")),
             (
@@ -847,7 +868,6 @@ mod pure {
                 Expect::Usbmuxd,
                 deny("network-outbound", "/private/var/run/usbmuxd"),
             ),
-            (Expect::Lsopen, deny("lsopen", "")),
         ];
         for (i, (expect, _)) in cases.iter().enumerate() {
             for (j, (_, l)) in cases.iter().enumerate() {
@@ -857,10 +877,11 @@ mod pure {
         }
         assert!(!Expect::CoreDevice.matches(&deny("mach-lookup", "com.apple.remoted")));
         assert!(!Expect::Usbmuxd.matches(&deny("network-outbound", "/var/run/usbmuxd")));
-        assert!(!other.defect().is_empty());
+        assert!(!Expect::JobCreation.matches(&deny("lsopen", "")));
     }
 
-    /// A run is judged by what is missing, and a Swift Build scratch deny is found.
+    /// A run is judged by what is missing, and a Swift Build scratch deny is found
+    /// (and only a write of one).
     #[test]
     fn missing_lists_each_unmet_expectation() {
         let denies = Denies {
@@ -870,9 +891,51 @@ mod pure {
             ],
             other: 3,
         };
-        let want = [Expect::Lsopen, Expect::JobCreation];
-        assert_eq!(missing(&denies, &want), [&Expect::JobCreation]);
+        let want = [Expect::Usbmuxd, Expect::JobCreation];
+        assert_eq!(
+            missing(&denies, &want),
+            [&Expect::Usbmuxd, &Expect::JobCreation]
+        );
+        let with_job = Denies {
+            tree: vec![deny("job-creation", "")],
+            other: 0,
+        };
+        assert_eq!(missing(&with_job, &want), [&Expect::Usbmuxd]);
         assert!(swift_build_scratch_denied(&denies).is_some());
         assert!(swift_build_scratch_denied(&Denies::default()).is_none());
+        let read = Denies {
+            tree: vec![deny("file-read-data", "/v/T/swbuild.tmp.Ab/x")],
+            other: 0,
+        };
+        assert!(swift_build_scratch_denied(&read).is_none());
+    }
+
+    /// The tools' own reports, as the hosted runner printed them (Xcode 16.4), and
+    /// lookalikes that are not them. Catches a check met by any failure (the macOS
+    /// arms would stay green with lsopen allowed, since the runner fails anyway), and
+    /// a temporary-folder check met by a refusal in another folder.
+    #[test]
+    fn the_tools_reports_of_a_refusal_are_recognised() {
+        let lsopen = r#"Could not launch “MacFixtureUITests”. LaunchServices has returned error -54. (Underlying Error: The operation couldn’t be completed. (OSStatus error -54.). The sandbox profile of this process is missing "(allow lsopen)", so it cannot invoke Launch Services' open API.)"#;
+        assert!(refused_lsopen(lsopen));
+        assert!(!refused_lsopen(
+            "Early unexpected exit, operation never finished bootstrapping"
+        ));
+        assert!(!refused_lsopen("(allow lsopen)"));
+        let temp = "Error: You don\u{2019}t have permission to save the file \u{201c}C0AB-12\u{201d} \
+                    in the folder \u{201c}T\u{201d}.";
+        assert!(refused_temp_write(temp));
+        assert!(!refused_temp_write(
+            "Error: You don\u{2019}t have permission to save the file \u{201c}x\u{201d} in the \
+             folder \u{201c}C\u{201d}."
+        ));
+        assert!(!refused_temp_write("{\"testNodes\": []}"));
+        assert!(refused_exec(
+            "sandbox-exec: execvp() of '/usr/bin/xcodebuild' failed: Operation not permitted"
+        ));
+        assert!(!refused_exec("xcodebuild: error: Operation not permitted"));
+        assert!(!refused_exec(
+            "sandbox-exec: execvp() of '/usr/bin/xcodebuild' failed: No such file"
+        ));
     }
 }
