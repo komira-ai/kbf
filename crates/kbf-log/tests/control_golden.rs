@@ -18,8 +18,8 @@ use kbf_log::{ActionEntry, Checkpoint, FarmInput, LogCommand, MachineVersion, Re
 use kbf_meta::{ActionRecord, Closure};
 use kbf_sched::{DaemonInstance, Request};
 use kbf_types::{
-    ActionKey, ControlRecord, Failure, FarmTime, LeaseGrant, LeaseKind, OperationId, Outcome, Qos,
-    RefusalRecord, Resources, ResultRecord,
+    ActionKey, ControlRecord, Failure, FarmTime, LeaseGrant, LeaseKind, LostWhy, OperationId,
+    Outcome, Qos, RefusalRecord, Resources, ResultRecord,
 };
 
 /// A batch (`1a`, `LogCommand` field 3) of `len` bytes: farm time 1 (`08 01`), wall
@@ -229,6 +229,7 @@ fn golden() -> Vec<(&'static str, LogCommand, String)> {
             batch(FarmInput::WorkerUp {
                 worker: w("w"),
                 instance: DaemonInstance::new("i"),
+                predecessor_stopped: false,
                 capacity: resources(),
                 caps: caps(),
             }),
@@ -236,6 +237,22 @@ fn golden() -> Vec<(&'static str, LogCommand, String)> {
                 0x4b,
                 0x45,
                 &format!("0a430a01771201691a08{RESOURCES_HEX}2231{CAPS_HEX}"),
+            ),
+        ),
+        (
+            // As above, with the predecessor proven stopped: predecessor_stopped (28) 1.
+            "WorkerUp, predecessor stopped",
+            batch(FarmInput::WorkerUp {
+                worker: w("w"),
+                instance: DaemonInstance::new("i"),
+                predecessor_stopped: true,
+                capacity: resources(),
+                caps: caps(),
+            }),
+            batch_hex(
+                0x4d,
+                0x47,
+                &format!("0a450a01771201691a08{RESOURCES_HEX}2231{CAPS_HEX}2801"),
             ),
         ),
         (
@@ -384,6 +401,8 @@ fn every_enum_value_has_its_number() {
         (Failure::OutOfMemory, 4),
         (Failure::NodeMemoryPressure, 5),
         (Failure::MissingInput, 6),
+        (Failure::Lost(LostWhy::DaemonRestarted), 7),
+        (Failure::Lost(LostWhy::Fenced), 8),
     ];
     for (failure, n) in failures {
         check(

@@ -246,6 +246,7 @@ impl World {
         self.feed(Event::WorkerUp {
             worker: worker(name),
             instance: DaemonInstance::new(format!("{name}@{}", self.t)),
+            predecessor_stopped: false,
             capacity: capacity(name),
             caps,
         });

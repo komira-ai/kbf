@@ -101,11 +101,13 @@ exit code, or a non-OK status (`kbf-proto/proto/kbf/worker/v1/worker.proto:240-2
 - **Daemon** (`kbf-daemon/src/lease.rs:157-182`): `Killed` is `ABORTED`, `Failed` is
   `INTERNAL`, `Invalid` is `INVALID_ARGUMENT`, `MissingBlob` is `FAILED_PRECONDITION`
   with a `MISSING` violation, `TimedOut` is `DEADLINE_EXCEEDED`, `OutOfMemory` is
-  `RESOURCE_EXHAUSTED`. Before a run it may refuse `FAILED_PRECONDITION` (lease kind not
+  `RESOURCE_EXHAUSTED`, `Lost` (a fenced run, and a whole-machine action whose result
+  a daemon restart took) is `UNAVAILABLE` with `Result.lost` (#22). Before a run it may refuse `FAILED_PRECONDITION` (lease kind not
   served, `lease.rs:69-75`) or `UNAVAILABLE` (contact lost, `daemon.rs:468-475`). Its log
   says only `ok=false` (`lease.rs:119`).
-- **Server** (`kbf-server/src/farm.rs`, `Farm::outcome`): OK with stored outputs is
-  `Completed`; `DEADLINE_EXCEEDED` is `Timeout`; `INVALID_ARGUMENT` keeps its message;
+- **Server** (`kbf-server/src/farm.rs`, `Farm::outcome`): a non-OK status with
+  `Result.lost` set is `Failure::Lost` and one with `memory_kill` set a memory kill,
+  whatever the code; OK with stored outputs is `Completed`; `DEADLINE_EXCEEDED` is `Timeout`; `INVALID_ARGUMENT` keeps its message;
   `FAILED_PRECONDITION` whose `PreconditionFailure` violations are all `MISSING` with a
   `blobs/<hash>/<size>` subject is `Failure::MissingInput`, keeping the blobs
   (`kbf-server/src/missing.rs`); **every other code is `Failure::Infra` and the
@@ -114,7 +116,10 @@ exit code, or a non-OK status (`kbf-proto/proto/kbf/worker/v1/worker.proto:240-2
   `lease failed` line with the lease, the node, the code and the reason, or for a
   missing input a WARN line with the number of missing blobs.
 - **Answer** (`settle` in `farm.rs`): Infra becomes `INTERNAL "the farm could not
-  run the action"`, the same fixed text for every cause, with no node name.
+  run the action"`, the same fixed text for every cause, with no node name. A farm
+  fault past its reruns (a busy node's kill, a lost run) becomes `INTERNAL "kbf farm
+  fault on <node>: <what ended the run>, and its reruns are used up. Operator fix:
+  ... Runs: 3 (...)."`.
   MissingInput becomes the front's answer for inputs not in the CAS (below,
   `kbf_front::missing_status`), rebuilt from the blobs: `FAILED_PRECONDITION`,
   `status.message` "N input blob(s) are not in the CAS", and the `PreconditionFailure`
@@ -123,11 +128,15 @@ exit code, or a non-OK status (`kbf-proto/proto/kbf/worker/v1/worker.proto:240-2
   (`kbf-front/src/execution.rs`, over `missing_status`): `FAILED_PRECONDITION` with exactly one detail,
   a `PreconditionFailure` with one `MISSING` violation per blob. That is the shape
   Bazel needs to re-upload (section 3); keep it.
-- **Retries**: none. A failed result finishes the operation
-  (`kbf-sched/src/scheduler.rs:709-730`), though
-  [scheduler.md](scheduler.md#outcomes) plans bounded retries (#22). Only a lease
-  given up (silent, replaced, reconnected, not started:
-  `kbf-sched/src/requeue.rs:28-41`) runs again, with no limit. A MissingInput result
+- **Retries**: farm faults only (#22; [scheduler.md](scheduler.md#retries-of-farm-faults)).
+  A busy node's memory kill, a lost run (`Failure::Lost`) and a lease of a daemon its
+  successor proved stopped (the requeue reason `Restarted`) run again from one budget,
+  at most 3 runs ending so per operation, preferring another node; past it the
+  operation is answered `INTERNAL` "kbf farm fault on <node>: ...", naming the runs.
+  Every other failed result (`Failure::Infra` among them) finishes the operation
+  (`result_committed` in `kbf-sched/src/scheduler.rs`). A lease given up for silence,
+  replacement without that proof, reconnection or not starting
+  (`kbf-sched/src/requeue.rs`) runs again with no limit. A MissingInput result
   finishes its operation at once and is never rerun: the blob is the client's to
   upload, so it is not a farm fault and counts against no farm rerun budget.
 - **Cache**: written only for an OK result with exit 0 and not `do_not_cache`
@@ -668,15 +677,15 @@ requeued (decided). Today only half of that holds:
   `Instant`, which does not advance while the machine sleeps, while the fence clock
   counts suspension (`CLOCK_BOOTTIME`, `mach_continuous_time`; [daemon.md](daemon.md)).
   A suspend past T = 40 s therefore ends in the fence: the run is killed and reported
-  `ABORTED`. Past G = 60 s the server has already given the lease up and requeued the
+  lost (`UNAVAILABLE`, `LOST_FENCED`). Past G = 60 s the server has already given the lease up and requeued the
   operation (`kbf-sched/src/requeue.rs`), outside the rerun budget, and the late result
   loses (simulation I5). On resume the fence is checked first (simulation F2.6).
 - **Between T and G, today.** The server still holds the lease, so it accepts the
-  `ABORTED` result: `farm.rs:553-556` maps it to `Failure::Infra`, and the scheduler
-  finishes the operation (`kbf-sched/src/scheduler.rs:719-728`). The client gets the
-  fixed `INTERNAL` once and nothing is requeued (simulation F2.2: "retrying it is #22,
-  planned"). Requeuing it needs the server reruns of 6.5, which are **open** (section
-  11, item 9); until they land, the decision holds past G only.
+  lost result: `Farm::outcome` maps it to `Failure::Lost(Fenced)`, and the scheduler
+  runs the operation again as a farm fault, preferring another node, from the budget of
+  6.5 (#22). Only a third farm-fault run is answered `INTERNAL`. The decision holds on
+  both sides of G. (The simulation's worker model still reports the fenced run as
+  `Infra`: simulation F2.2.)
 - **The daemon stopped, the machine running** (SIGSTOP, a debugger, swap thrash). A
   native action runs on in its own process group, so a timeout it reaches is its own
   wall time. Past G the server requeues. The frozen daemon cannot kill its run, which
@@ -762,11 +771,20 @@ refusal at the stream's opening), and Bazel treats `UNAVAILABLE` as catastrophic
   given up for silence, replacement, reconnection or not starting (`requeue.rs`) are
   not results and do not use the budget, as today; bounding those is a separate
   question (#22). Out-of-memory reruns have their own bound, the ladder of 6.1, and
-  do not use this budget either (decided 2026-10-10). Today the budget is built for one
-  Farm result only, a busy node's memory kill (`FARM_RERUNS`, 6.1).
+  do not use this budget either (decided 2026-10-10). Today the budget is built for
+  three Farm results (`FARM_RERUNS`, [scheduler.md](scheduler.md#retries-of-farm-faults)):
+  a busy node's memory kill, a lost run (fenced, or a whole-machine action whose result
+  a daemon restart took), and a lease of a daemon its successor proved stopped, which
+  is not a result but is charged as one, since that run did end as the farm's fault.
+  Silence and replacement without proof are still not charged: an action that crashes
+  the daemon without its stream closing, or panics the kernel, is rerun across the
+  fleet without a bound.
 - **Excluded nodes.** The operation records the nodes whose runs ended Farm or
   Ambiguous and is not placed on them again. If no node outside that set can serve it,
-  the answer is given at once, by the class of the last run, with no wait.
+  the answer is given at once, by the class of the last run, with no wait. The code
+  today **prefers** rather than excludes: the rerun waits for a node outside the set
+  while a live, serving one could run it, and otherwise runs on a node in the set (a
+  farm of one node reruns on itself); it never answers early.
 - **Answer when the budget is used.** `INTERNAL` with the last run's node, reason and
   fix in `status.message`.
 - **The verdict memo.** Bazel retries `INTERNAL` as up to 5 fresh Executes; without a
@@ -1022,7 +1040,9 @@ people use. Bazel's exit 34 does not by itself tell Farm from Request (section 3
    I10 is amended to match (4.1).
 9. The server reruns Farm and Ambiguous results on other nodes, at most 3 runs per
    operation, then `INTERNAL` with the fix in `status.message`; a 60 s verdict memo,
-   cleared on recovery (6.5).
+   cleared on recovery (6.5). Built so far (#22): the budget and the answer for busy-node
+   kills, lost runs and proven restarts, with other nodes preferred, not required (6.5);
+   no verdict memo, and Ambiguous results are not classified.
 10. Request errors: `FAILED_PRECONDITION` except a malformed action (6.7).
 11. Order: keep the reason and node (7); the extended #173; then server reruns (#22)
     with the memory ladder; then the rest of the probe loop and signatures; then

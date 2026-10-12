@@ -14,9 +14,11 @@
 //! - re-dispatch after the lease grace G and the worker's self-fence T ([`fence`]);
 //! - reconciliation of held leases with the running set each worker's heartbeats
 //!   send: a lease they leave out is requeued at once if its `Start` went to a session
-//!   before the same daemon process registered again, after the handover grace if it
-//!   went to another daemon process registered as the worker (issue #140), else once
-//!   its `Start` has been out for G;
+//!   before the same daemon process registered again, or to the daemon process the
+//!   current one was proven to replace (its successor killed its runs before
+//!   registering: a farm fault, below), after the handover grace if it went to another
+//!   daemon process registered as the worker (issue #140), else once its `Start` has
+//!   been out for G;
 //! - first-fit placement of a CPU, memory and GPU request onto worker capacity, GPUs
 //!   whole and held by one lease each until it ends, on workers whose node report
 //!   lists a driver serving the lease kind and satisfies the action's platform
@@ -53,13 +55,18 @@
 //!   own limit runs it again with the same booking, at most [`FARM_RERUNS`] times, and
 //!   counts against the node ([`Scheduler::memory_pressure`]). See
 //!   [`kbf_types::MemoryRun`].
+//! - farm faults (failure classes, 6.5; issue #22): a busy node's memory kill, a run the
+//!   worker reports lost ([`kbf_types::Failure::Lost`]) and a lease of a daemon proven
+//!   stopped run again from one budget of [`FARM_RERUNS`] per operation, placement
+//!   preferring a node none of those runs ended on; the run past it finishes the
+//!   operation, its callers told every farm run ([`kbf_types::FarmRun`]).
 //!
 //! Not yet: placement scoring (alignment, best fit), a reservation for a large
-//! `action` request (issue #169), reclaimed
-//! room and preemption, the infra retry budget for other farm faults (a
-//! [`kbf_types::Failure::Infra`] result still finishes its operation), and committing
-//! submissions so that a new leader inherits the queue. In v0 the scheduler runs on
-//! the leader only.
+//! `action` request (issue #169), reclaimed room and preemption, a budget for the
+//! other farm failures (a [`kbf_types::Failure::Infra`] result still finishes its
+//! operation) and for leases given up for silence or replacement without proof, and
+//! committing submissions so that a new leader inherits the queue. In v0 the scheduler
+//! runs on the leader only.
 //!
 //! This is a pure crate: no async runtime, network, clock, randomness or hashed
 //! collections. The layering test in `kbf-it` and the lists in `clippy.toml` enforce it.

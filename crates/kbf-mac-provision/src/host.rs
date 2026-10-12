@@ -1,11 +1,12 @@
-//! What a check asks of the Mac, behind [`Host`]: run a program, read a path's type,
-//! mode, link count and owner, and the effective uid. Files are read directly, under
-//! [`Host::root`]. [`RealHost`] is the Mac itself; the tests' fake keeps each program's
-//! state in memory and serves the files from a scratch directory.
+//! What the verbs ask of the Mac, behind [`Host`]: run a program, read a path's type,
+//! mode, link count and owner, the effective uid, and the file changes `apply` makes.
+//! Files are read directly, under [`Host::root`]. [`RealHost`] is the Mac itself; the
+//! tests' fake keeps each program's state in memory and serves the files from a
+//! scratch directory.
 
 use std::fs::{self, Metadata};
-use std::io;
-use std::os::unix::fs::MetadataExt as _;
+use std::io::{self, Write as _};
+use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::Path;
 use std::process::{Command, Stdio};
 
@@ -87,20 +88,72 @@ pub fn on_root(root: &str, path: &str) -> String {
     format!("{}{path}", root.trim_end_matches('/'))
 }
 
-/// What the checks need from the Mac. No method changes it.
+/// Everything the verbs ask of the Mac. `check` and `print` use only the reads (`root`,
+/// `euid`, `run` of a read form, `lstat`); `apply`, `restart` and `revert` also change
+/// it, through the programs it runs and the file methods. Every path is a path on the
+/// Mac, joined to [`Host::root`].
 pub trait Host {
     /// The directory that is the Mac's `/`: `/` on a node, a scratch directory in tests.
     fn root(&self) -> &str;
-    /// The effective uid the checks run as.
+    /// The effective uid the verbs run as.
     fn euid(&self) -> u32;
-    /// Runs the program at `program` (a path on the Mac) with `args`, its standard
-    /// input and error closed and its environment empty but for `LC_ALL=C`.
+    /// Runs the program at `program` (a path on the Mac) with `args`, in directory
+    /// `dir` (a path on the Mac; `None` leaves it as it is), its standard input and
+    /// error closed and its environment empty but for `LC_ALL=C` and `env`.
     ///
     /// # Errors
     /// The program could not be started or waited for.
-    fn run(&self, program: &str, args: &[&str]) -> io::Result<Output>;
+    fn run_in(
+        &self,
+        program: &str,
+        args: &[&str],
+        dir: Option<&str>,
+        env: &[(&str, &str)],
+    ) -> io::Result<Output>;
+    /// `run_in` with no directory and no added environment.
+    ///
+    /// # Errors
+    /// The program could not be started or waited for.
+    fn run(&self, program: &str, args: &[&str]) -> io::Result<Output> {
+        self.run_in(program, args, None, &[])
+    }
     /// `lstat` of `path` on the Mac; `None` when there is nothing there.
     fn lstat(&self, path: &str) -> Option<Stat>;
+    /// Writes `bytes` to the file at `path`, never through a link: it is created with
+    /// `mode` (less the umask) if it is not there, and truncated, keeping its owner
+    /// and mode, if it is.
+    ///
+    /// # Errors
+    /// The file cannot be opened or written; a link at `path` is refused.
+    fn write(&self, path: &str, bytes: &[u8], mode: u32) -> io::Result<()>;
+    /// Makes the directory `path` and every missing directory above it.
+    ///
+    /// # Errors
+    /// A directory cannot be made.
+    fn mkdir(&self, path: &str) -> io::Result<()>;
+    /// Sets the permission bits of `path`.
+    ///
+    /// # Errors
+    /// There is nothing at `path`, or its mode cannot be set.
+    fn chmod(&self, path: &str, mode: u32) -> io::Result<()>;
+    /// Sets the owner of `path`; a link is changed itself, never what it names.
+    ///
+    /// # Errors
+    /// There is nothing at `path`, or its owner cannot be set.
+    fn chown(&self, path: &str, uid: u32, gid: u32) -> io::Result<()>;
+    /// Renames `from` to `to`, replacing what is at `to`.
+    ///
+    /// # Errors
+    /// The rename fails.
+    fn rename(&self, from: &str, to: &str) -> io::Result<()>;
+    /// Removes what is at `path`: a directory with everything in it, a link itself
+    /// (never what it names). Nothing there is not an error.
+    ///
+    /// # Errors
+    /// Something at `path` cannot be removed.
+    fn remove(&self, path: &str) -> io::Result<()>;
+    /// Waits `seconds` (between tries of a program that may not succeed at once).
+    fn pause(&self, seconds: u64);
 }
 
 /// The Mac this runs on, with its `/` at `root` (`/` but in tests).
@@ -113,6 +166,10 @@ impl RealHost {
     pub fn new(root: impl Into<String>) -> Self {
         Self { root: root.into() }
     }
+
+    fn on(&self, path: &str) -> String {
+        on_root(&self.root, path)
+    }
 }
 
 impl Host for RealHost {
@@ -124,14 +181,25 @@ impl Host for RealHost {
         rustix::process::geteuid().as_raw()
     }
 
-    fn run(&self, program: &str, args: &[&str]) -> io::Result<Output> {
-        let out = Command::new(on_root(&self.root, program))
+    fn run_in(
+        &self,
+        program: &str,
+        args: &[&str],
+        dir: Option<&str>,
+        env: &[(&str, &str)],
+    ) -> io::Result<Output> {
+        let mut command = Command::new(self.on(program));
+        command
             .args(args)
             .env_clear()
             .env("LC_ALL", "C")
+            .envs(env.iter().copied())
             .stdin(Stdio::null())
-            .stderr(Stdio::null())
-            .output()?;
+            .stderr(Stdio::null());
+        if let Some(dir) = dir {
+            command.current_dir(self.on(dir));
+        }
+        let out = command.output()?;
         Ok(Output {
             success: out.status.success(),
             stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -139,16 +207,59 @@ impl Host for RealHost {
     }
 
     fn lstat(&self, path: &str) -> Option<Stat> {
-        fs::symlink_metadata(on_root(&self.root, path))
+        fs::symlink_metadata(self.on(path))
             .ok()
             .map(|m| Stat::of(&m))
     }
+
+    fn write(&self, path: &str, bytes: &[u8], mode: u32) -> io::Result<()> {
+        use rustix::fs::{Mode, OFlags};
+        let flags =
+            OFlags::WRONLY | OFlags::CREATE | OFlags::TRUNC | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+        let fd = rustix::fs::open(self.on(path), flags, Mode::from_raw_mode(mode as _))?;
+        fs::File::from(fd).write_all(bytes)
+    }
+
+    fn mkdir(&self, path: &str) -> io::Result<()> {
+        fs::create_dir_all(self.on(path))
+    }
+
+    fn chmod(&self, path: &str, mode: u32) -> io::Result<()> {
+        fs::set_permissions(self.on(path), fs::Permissions::from_mode(mode))
+    }
+
+    fn chown(&self, path: &str, uid: u32, gid: u32) -> io::Result<()> {
+        std::os::unix::fs::lchown(self.on(path), Some(uid), Some(gid))
+    }
+
+    fn rename(&self, from: &str, to: &str) -> io::Result<()> {
+        fs::rename(self.on(from), self.on(to))
+    }
+
+    fn remove(&self, path: &str) -> io::Result<()> {
+        let path = self.on(path);
+        match fs::symlink_metadata(&path) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+            Ok(m) if m.is_dir() => fs::remove_dir_all(&path),
+            Ok(_) => fs::remove_file(&path),
+        }
+    }
+
+    fn pause(&self, seconds: u64) {
+        std::thread::sleep(std::time::Duration::from_secs(seconds));
+    }
 }
 
-/// The reads the checks share, over a [`Host`]. Every path is a path on the Mac.
+/// The calls the verbs share, over a [`Host`]. Every path is a path on the Mac.
 #[derive(Clone, Copy)]
 pub(crate) struct Mac<'a> {
     host: &'a dyn Host,
+}
+
+/// `result`, its error saying which path it is about.
+fn at<T>(path: &str, result: io::Result<T>) -> io::Result<T> {
+    result.map_err(|e| io::Error::new(e.kind(), format!("{path}: {e}")))
 }
 
 impl<'a> Mac<'a> {
@@ -177,6 +288,19 @@ impl<'a> Mac<'a> {
     /// Whether `program args` runs and exits 0.
     pub(crate) fn succeeds(&self, program: &str, args: &[&str]) -> bool {
         self.host.run(program, args).is_ok_and(|o| o.success)
+    }
+
+    /// Whether `program args`, run in `dir` with `env` added, runs and exits 0.
+    pub(crate) fn succeeds_in(
+        &self,
+        program: &str,
+        args: &[&str],
+        dir: Option<&str>,
+        env: &[(&str, &str)],
+    ) -> bool {
+        self.host
+            .run_in(program, args, dir, env)
+            .is_ok_and(|o| o.success)
     }
 
     pub(crate) fn lstat(&self, path: &str) -> Option<Stat> {
@@ -221,5 +345,65 @@ impl<'a> Mac<'a> {
             .collect();
         names.sort();
         names
+    }
+
+    /// Makes `path` (and the directories above it) a directory of `uid`:`gid` with
+    /// `mode`.
+    pub(crate) fn dir(&self, path: &str, uid: u32, gid: u32, mode: u32) -> io::Result<()> {
+        at(path, self.host.mkdir(path))?;
+        at(path, self.host.chown(path, uid, gid))?;
+        at(path, self.host.chmod(path, mode))
+    }
+
+    /// Replaces the file at `path` with one of `uid`:`gid`, `mode`, holding `bytes`:
+    /// written beside it as `<path>.kbf-new`, its owner and mode set, then renamed over
+    /// it, so `path` is never a partial file or another owner's.
+    pub(crate) fn replace(
+        &self,
+        path: &str,
+        bytes: &[u8],
+        uid: u32,
+        gid: u32,
+        mode: u32,
+    ) -> io::Result<()> {
+        let new = format!("{path}.kbf-new");
+        at(&new, self.host.remove(&new))?;
+        at(&new, self.host.write(&new, bytes, mode))?;
+        at(&new, self.host.chown(&new, uid, gid))?;
+        at(&new, self.host.chmod(&new, mode))?;
+        at(path, self.host.rename(&new, path))
+    }
+
+    /// Empties the file at `path`, keeping its owner and mode; never through a link.
+    pub(crate) fn truncate(&self, path: &str) -> io::Result<()> {
+        at(path, self.host.write(path, b"", 0o600))
+    }
+
+    /// Makes `path` an empty file of `uid`:`gid` with `mode`, removing what was there.
+    pub(crate) fn new_file(&self, path: &str, uid: u32, gid: u32, mode: u32) -> io::Result<()> {
+        self.remove(path)?;
+        at(path, self.host.write(path, b"", mode))?;
+        at(path, self.host.chown(path, uid, gid))?;
+        at(path, self.host.chmod(path, mode))
+    }
+
+    pub(crate) fn chmod(&self, path: &str, mode: u32) -> io::Result<()> {
+        at(path, self.host.chmod(path, mode))
+    }
+
+    pub(crate) fn rename(&self, from: &str, to: &str) -> io::Result<()> {
+        at(from, self.host.rename(from, to))
+    }
+
+    pub(crate) fn remove(&self, path: &str) -> io::Result<()> {
+        at(path, self.host.remove(path))
+    }
+
+    pub(crate) fn mkdir(&self, path: &str) -> io::Result<()> {
+        at(path, self.host.mkdir(path))
+    }
+
+    pub(crate) fn pause(&self, seconds: u64) {
+        self.host.pause(seconds);
     }
 }

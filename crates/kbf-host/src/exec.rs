@@ -196,7 +196,7 @@ fn write_file(full: &Path, perms: Perms, owner: Option<Owner>, bytes: &[u8]) -> 
         .file_name()
         .expect("a HostPath names a file")
         .to_string_lossy();
-    let tmp = full.with_file_name(format!(".{name}.kbf-deploy-tmp"));
+    let tmp = full.with_file_name(format!(".{name}.kbf-host-tmp"));
     // A copy left by an interrupted run; `create_new` below never follows a link there.
     match fs::remove_file(&tmp) {
         Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
@@ -257,7 +257,7 @@ fn output(cmd: &Cmd) -> io::Result<Output> {
 }
 
 /// `out` when `cmd` exited 0; otherwise an error naming the exit and its stderr.
-pub(crate) fn succeeded(cmd: &Cmd, out: Output) -> io::Result<Output> {
+pub fn succeeded(cmd: &Cmd, out: Output) -> io::Result<Output> {
     if out.status.success() {
         return Ok(out);
     }

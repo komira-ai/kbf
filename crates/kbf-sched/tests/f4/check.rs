@@ -274,6 +274,7 @@ impl Checker {
             Event::WorkerUp {
                 worker,
                 instance,
+                predecessor_stopped: _,
                 capacity,
                 caps,
             } => {
@@ -597,8 +598,9 @@ impl Checker {
             lease: record.lease,
             waiters,
             outcome: record.outcome,
-            // The model's runs are never killed for memory.
+            // The model's runs are never killed for memory, nor lost.
             memory_runs: Vec::new(),
+            farm_runs: Vec::new(),
         })]
     }
 

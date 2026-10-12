@@ -1,5 +1,7 @@
 //! The scheduler state machine.
 
+mod fault;
+mod give_up;
 pub(crate) mod memory;
 mod phase;
 mod state;
@@ -12,13 +14,13 @@ use std::time::Duration;
 
 use kbf_caps::NodeCaps;
 use kbf_types::{
-    ActionKey, Answer, ControlRecord, Effect, Failure, FarmTime, LeaseGrant, LeaseId, LeaseKind,
-    NodePhase, OperationId, Outcome, Qos, Refusal, RefusalRecord, Resources, ResultRecord,
-    StartLease, StateMachine, WaiterId, Waiting, WorkerId,
+    ActionKey, Answer, ControlRecord, Effect, Failure, FarmRun, FarmTime, LeaseGrant, LeaseId,
+    LeaseKind, NodePhase, OperationId, Outcome, Qos, Refusal, RefusalRecord, Resources,
+    ResultRecord, StartLease, StateMachine, WaiterId, Waiting, WorkerId,
 };
 
 use crate::cordon::{Cordon, Cordons};
-use crate::fence::{HANDOVER_GRACE, LEASE_GRACE, START_GRACE};
+use crate::fence::{HANDOVER_GRACE, LEASE_GRACE};
 use crate::input::{DaemonInstance, Event, Input, Request};
 use crate::requeue::{Requeue, RequeueReason};
 use crate::servable::{Servable, Verdict};
@@ -64,6 +66,12 @@ struct Operation {
     /// While queued: since when, and why, no live worker can run it. `None` while one
     /// can.
     unservable: Option<Unservable>,
+    /// Its runs that ended as the farm's fault, oldest first: the farm reruns it has
+    /// used ([`memory::FARM_RERUNS`]).
+    farm_runs: Vec<FarmRun>,
+    /// The workers those runs ended on: placement prefers any other (see
+    /// [`Servable::fit`]).
+    avoid: BTreeSet<WorkerId>,
 }
 
 /// A queued operation no live worker can run: since when, why, and whether the wait
@@ -121,6 +129,10 @@ pub(crate) struct Worker {
     /// Until when leases whose `Start` went to an earlier process are kept: by then that
     /// process has fenced ([`HANDOVER_GRACE`] after it was last heard).
     handover_ends: FarmTime,
+    /// The earlier process the newest change of process was proven to replace: its
+    /// successor's drivers killed its runs before registering, so its leases the worker
+    /// leaves out go at once ([`Event::WorkerUp`]'s `predecessor_stopped`).
+    stopped_process: Option<u64>,
     /// What its newest `Hello` says it is doing.
     pub(crate) phase: NodePhase,
     /// Until when the lease of a `Preparing` or `Restoring` phase is kept while the
@@ -176,14 +188,15 @@ impl Worker {
 ///   A committed result is accepted only if its lease is the operation's newest
 ///   committed grant (log order decides) and the operation is not finished. Results
 ///   from an expired lease, duplicates and late arrivals are dropped. A committed
-///   memory kill that runs the operation again ([`memory`]) finishes nothing: the
-///   operation is queued again, and only a later run's result can finish it.
+///   memory kill or lost run that runs the operation again ([`memory`], [`fault`])
+///   finishes nothing: the operation is queued again, and only a later run's result
+///   can finish it.
 ///
 /// A lease is given up, and its operation requeued, when its worker is silent for G,
 /// and when a worker it still hears from does not list it as running (see
 /// [`Event::WorkerUp`] and [`Event::Heartbeat`]): at once only if the daemon process
-/// that received its `Start` says so, after the handover grace if another process
-/// registered as the worker since. A given-up lease can no longer have a
+/// that received its `Start` says so, or was proven stopped by the process after it,
+/// after the handover grace if another process registered as the worker since. A given-up lease can no longer have a
 /// result proposed, and once the operation is granted again its result loses to the
 /// new grant in the log.
 #[derive(Clone, Debug)]
@@ -298,6 +311,13 @@ impl Scheduler {
     #[must_use]
     pub fn state(&self, operation: OperationId) -> Option<&OpState> {
         self.ops.get(&operation).map(|op| &op.state)
+    }
+
+    /// The runs of `operation` that ended as the farm's fault, oldest first; `None` once
+    /// the scheduler no longer holds it.
+    #[must_use]
+    pub fn farm_runs(&self, operation: OperationId) -> Option<&[FarmRun]> {
+        self.ops.get(&operation).map(|op| op.farm_runs.as_slice())
     }
 
     /// The waiters attached to `operation`, in attach order.
@@ -441,6 +461,8 @@ impl Scheduler {
                 committed_lease: None,
                 result_proposed: false,
                 unservable: None,
+                farm_runs: Vec::new(),
+                avoid: BTreeSet::new(),
             },
         );
         Vec::new()
@@ -488,77 +510,6 @@ impl Scheduler {
         self.queue.insert((Reverse(op.request.qos.clone()), id));
     }
 
-    /// Sends every lease held on a worker not heard from for [`LEASE_GRACE`] back to
-    /// the queue, except the lease a worker switches the GUI session for, which is kept
-    /// until the switch grace ends ([`SESSION_SWITCH_GRACE`]).
-    fn expire(&mut self) {
-        let now = self.now;
-        let expired: Vec<(OperationId, RequeueReason)> = self
-            .held
-            .iter()
-            .filter_map(|(lease, held)| {
-                let worker = self.ops[&held.operation].state.holding().map(|(_, w)| w);
-                let w = worker.and_then(|w| self.workers.get(w));
-                if w.is_some_and(|w| w.alive(now) || w.switching(*lease, now)) {
-                    return None;
-                }
-                let switched = w.is_some_and(|w| w.phase.switching() == Some(*lease));
-                let reason = if switched {
-                    RequeueReason::SessionSwitch
-                } else {
-                    RequeueReason::Silent
-                };
-                Some((held.operation, reason))
-            })
-            .collect();
-        for (id, reason) in expired {
-            self.requeue(id, reason);
-        }
-    }
-
-    /// Sends back to the queue every committed lease held on `worker` that `running`
-    /// leaves out, if its `Start` went to an earlier session of the current daemon
-    /// process, to an earlier process once the handover grace has ended, or to the
-    /// current session and has been out for [`START_GRACE`]. A lease whose result was
-    /// reported is kept: that result is on its way to the log.
-    fn reconcile(&mut self, worker: &WorkerId, running: &[LeaseId]) {
-        let (session, process, handover_ends) = self
-            .workers
-            .get(worker)
-            .map_or((0, 0, FarmTime::default()), |w| {
-                (w.session, w.process, w.handover_ends)
-            });
-        let running: BTreeSet<LeaseId> = running.iter().copied().collect();
-        let now = self.now;
-        let lost: Vec<(OperationId, RequeueReason)> = self
-            .held
-            .iter()
-            .filter_map(|(lease, held)| {
-                let sent = held.start_sent?;
-                let (due, reason) = if sent.process != process {
-                    // Another process may still run it: only its fence ends that.
-                    (now >= handover_ends, RequeueReason::Replaced)
-                } else if sent.session != session {
-                    // A `Start` sent to an earlier session of this process reached it
-                    // before it registered again, and then it lists it, or never will.
-                    (true, RequeueReason::Reconnected)
-                } else {
-                    let due = now >= sent.at.saturating_add(START_GRACE);
-                    (due, RequeueReason::NotStarted)
-                };
-                let op = &self.ops[&held.operation];
-                let lost = due
-                    && !running.contains(lease)
-                    && !op.result_proposed
-                    && op.state.holding().is_some_and(|(_, w)| w == worker);
-                lost.then_some((held.operation, reason))
-            })
-            .collect();
-        for (id, reason) in lost {
-            self.requeue(id, reason);
-        }
-    }
-
     /// One placement round. Each queued operation, most urgent first, goes to the first
     /// live worker (in name order) that serves its lease kind, satisfies its platform
     /// and has room for it, up to [`PLACEMENT_ROUND`] grants. An action has room where
@@ -589,7 +540,7 @@ impl Scheduler {
             let request = &op.request;
             let fitted = placed.len() < PLACEMENT_ROUND
                 && servable
-                    .fit(&mut self.workers, request, &reserved)
+                    .fit(&mut self.workers, request, &reserved, &op.avoid)
                     .map(|(name, booked, device)| placed.push((id, name, booked, device)))
                     .is_some();
             let verdict = if fitted {
@@ -604,6 +555,7 @@ impl Scheduler {
                     &self.workers,
                     request,
                     &reserved,
+                    &op.avoid,
                     self.reservations.get(&id),
                 )
             {
@@ -825,6 +777,11 @@ impl Scheduler {
         {
             return Vec::new();
         }
+        if let Outcome::Failed(Failure::Lost(why)) = record.outcome
+            && self.rerun_after_lost(record, why)
+        {
+            return Vec::new();
+        }
         self.release(id);
         let op = self.ops.get_mut(&id).expect("checked above");
         op.state = match record.outcome {
@@ -849,6 +806,7 @@ impl Scheduler {
             waiters: op.waiters.clone(),
             outcome: record.outcome,
             memory_runs: self.memory.runs(id).to_vec(),
+            farm_runs: op.farm_runs.clone(),
         })]
     }
 }
@@ -862,6 +820,7 @@ impl StateMachine for Scheduler {
             Event::WorkerUp {
                 worker,
                 instance,
+                predecessor_stopped,
                 capacity,
                 caps,
             } => {
@@ -870,7 +829,13 @@ impl StateMachine for Scheduler {
                     Some(w) => {
                         if !instance.same_as(&w.instance) {
                             // The replaced process was last heard no later than now,
-                            // and is not acknowledged from now on.
+                            // and is not acknowledged from now on. Its leases are not
+                            // given up here even when it is proven stopped: the phase,
+                            // taken next, may send a switching lease's `Start` to the
+                            // new process, and the first heartbeat decides the rest.
+                            if predecessor_stopped {
+                                w.stopped_process = Some(w.process);
+                            }
                             w.process += 1;
                             w.handover_ends = w.last_heard.saturating_add(HANDOVER_GRACE);
                         }
@@ -895,6 +860,7 @@ impl StateMachine for Scheduler {
                                 instance,
                                 process: 0,
                                 handover_ends: FarmTime::default(),
+                                stopped_process: None,
                                 phase: NodePhase::Serving,
                                 switch_ends: FarmTime::default(),
                             },
@@ -915,13 +881,13 @@ impl StateMachine for Scheduler {
                 }
                 Vec::new()
             }
-            Event::Heartbeat { worker, running } => {
-                if let Some(w) = self.workers.get_mut(&worker) {
+            Event::Heartbeat { worker, running } => match self.workers.get_mut(&worker) {
+                Some(w) => {
                     w.last_heard = w.last_heard.max(self.now);
-                    self.reconcile(&worker, &running);
+                    self.reconcile(&worker, &running)
                 }
-                Vec::new()
-            }
+                None => Vec::new(),
+            },
             Event::Phase { worker, phase } => self.take_phase(&worker, phase),
             Event::Submit { waiter, request } => self.submit(waiter, request),
             Event::Committed(ControlRecord::Lease(grant)) => {

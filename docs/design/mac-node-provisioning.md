@@ -179,8 +179,11 @@ are how that cost is paid.
 applies and checks. It is not yet in the per-commit tarball, and it adds a `restart`
 verb (section 5.7) and `--keys` to the three below.
 A Rust port, the crate [kbf-mac-provision](../../crates/kbf-mac-provision), implements
-`check` and `print` with the same profile format, item names, report lines and exit
-statuses; `apply` and `restart` are still only in the script.
+`check`, `apply`, `print` and `restart` with the same profile format, item names, report
+lines and exit statuses. It also sets the older `com.apple.commerce AutoUpdate` with
+`appstore_auto_update`, and before its first change to a power or software update
+setting it records all of them in `/var/db/kbf-mac-provision/settings.before`, which
+its `revert` verb restores.
 
 `kbf-mac-provision` is one POSIX `sh` script, shipped in the same tarball as
 `kbf-daemon` (section 4):
@@ -512,7 +515,7 @@ Every row is a profile key. `apply` sets it, and `check` reads it back.
 | Wake for network access | on | `pmset -a womp 1` | wakes a node that slept anyway. A magic packet reaches only the same L2 segment, not across an overlay network or a router |
 | Automatic update download and install | off | `defaults write /Library/Preferences/com.apple.SoftwareUpdate` `AutomaticDownload`, `AutomaticallyInstallMacOSUpdates`, `CriticalUpdateInstall` = 0 | section 6. **Verify on the pinned version:** the SoftwareUpdate payload is deprecated in macOS 26 and removed in 27 (fleet-updates design, section 7.1) (5.2) |
 | Security data files (XProtect and similar) | on | `ConfigDataInstall` = 1 | malware definitions. **Assumed:** they do not change the OS build, and this key still applies separately from `CriticalUpdateInstall` (5.2) |
-| App Store auto-update | off | `AutomaticallyInstallAppUpdates` = 0 (the older `com.apple.commerce AutoUpdate` is legacy) | Xcode never comes from the App Store |
+| App Store auto-update | off | `AutomaticallyInstallAppUpdates` = 0 (the older `com.apple.commerce AutoUpdate` is legacy; the Rust port sets it to 0 too) | Xcode never comes from the App Store |
 | Remote Login | on, key only | `systemsetup -setremotelogin on`, and `/etc/ssh/sshd_config.d/` with `PasswordAuthentication no`, `KbdInteractiveAuthentication no`, `PermitRootLogin no` | the only admin path |
 | Screen Sharing, other remote-desktop servers | off, not installed | | SSH is the only way in |
 | Firewall | on | `socketfilterfw --setglobalstate on` | `kbf-daemon` never listens. The farm network is the real boundary |

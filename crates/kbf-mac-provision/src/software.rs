@@ -1,9 +1,12 @@
 //! What is installed: the pinned Xcodes and the default one, the probe scripts, and
 //! no simulator runtime on the host.
 
+use std::io;
+
 use sha2::{Digest as _, Sha256};
 
-use crate::items::{Ctx, Outcome, fail, or, pass};
+use crate::items::{Ctx, Lines, Outcome, fail, or, pass, run};
+use crate::profile::Xcode;
 
 const PLISTBUDDY: &str = "/usr/libexec/PlistBuddy";
 const XCODE_SELECT: &str = "/usr/bin/xcode-select";
@@ -132,4 +135,99 @@ pub(crate) fn simulator_runtimes(c: &Ctx<'_>) -> Outcome {
             "simulator runtimes on the host:{found} (they belong in VM images; erase the node)"
         ))
     }
+}
+
+const XIP: &str = "/usr/bin/xip";
+const XCODEBUILD: &str = "/usr/bin/xcodebuild";
+
+/// The `.xip` in `xcode_xip_dir` whose SHA-256 is `sha256`: a regular file, by name.
+fn find_xip(c: &Ctx<'_>, sha256: &str) -> Option<String> {
+    let dir = c.profile.get("xcode_xip_dir");
+    if dir.is_empty() {
+        return None;
+    }
+    c.mac
+        .list(dir)
+        .into_iter()
+        .filter(|name| name.ends_with(".xip"))
+        .map(|name| format!("{dir}/{name}"))
+        .filter(|path| c.mac.is_file(path))
+        .find(|path| {
+            c.mac
+                .read(path)
+                .is_some_and(|b| hex::encode(Sha256::digest(b)) == sha256)
+        })
+}
+
+/// Installs the pinned Xcode `x` from its `.xip`: expanded into a staging directory in
+/// `/Applications`, its build checked, moved to its path over what was there, its
+/// license accepted and its first launch run. A missing `.xip` or one that expands to
+/// another build installs nothing, and says so.
+fn install_xcode(c: &Ctx<'_>, x: &Xcode, out: &mut Lines) -> io::Result<()> {
+    let Some(xip) = find_xip(c, &x.sha256) else {
+        out.note(
+            c.key,
+            format!(
+                "no .xip with SHA-256 {} in xcode_xip_dir; {} not installed",
+                x.sha256, x.build
+            ),
+        );
+        return Ok(());
+    };
+    let stage = format!("/Applications/.kbf-xip-{}", x.build);
+    c.mac.remove(&stage)?;
+    c.mac.mkdir(&stage)?;
+    let real_xip = c.mac.path(&xip);
+    c.mac
+        .succeeds_in(XIP, &["--expand", &real_xip], Some(&stage), &[]);
+    let apps: Vec<String> = c
+        .mac
+        .list(&stage)
+        .into_iter()
+        .filter(|name| name.ends_with(".app"))
+        .map(|name| format!("{stage}/{name}"))
+        .collect();
+    let expanded = match apps.as_slice() {
+        [app] if xcode_build(c, app) == x.build => app.clone(),
+        _ => {
+            c.mac.remove(&stage)?;
+            out.note(c.key, format!("{xip} did not expand to Xcode {}", x.build));
+            return Ok(());
+        }
+    };
+    c.mac.remove(x.app())?;
+    c.mac.rename(&expanded, x.app())?;
+    c.mac.remove(&stage)?;
+    let env = [("DEVELOPER_DIR", x.developer_dir.as_str())];
+    c.mac
+        .succeeds_in(XCODEBUILD, &["-license", "accept"], None, &env);
+    c.mac
+        .succeeds_in(XCODEBUILD, &["-runFirstLaunch"], None, &env);
+    out.change(c.key, format!("installed Xcode {} at {}", x.build, x.app()));
+    Ok(())
+}
+
+/// Installs each pinned Xcode that is not at its path with its build, then removes
+/// every Xcode the profile does not pin.
+pub(crate) fn fix_xcode(c: &Ctx<'_>, out: &mut Lines) -> io::Result<()> {
+    for x in &c.profile.xcodes {
+        if xcode_build(c, x.app()) != x.build {
+            install_xcode(c, x, out)?;
+        }
+    }
+    for app in unpinned_xcodes(c) {
+        c.mac.remove(&app)?;
+        out.change(
+            c.key,
+            format!("removed {app}, which the profile does not pin"),
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn fix_default_developer_dir(c: &Ctx<'_>, out: &mut Lines) -> io::Result<()> {
+    let dir = c.value();
+    run(c, XCODE_SELECT, &["-s", dir]);
+    out.change(c.key, format!("xcode-select -s {dir}"));
+    Ok(())
 }

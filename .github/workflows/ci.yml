@@ -140,6 +140,11 @@ jobs:
           key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
       - run: cargo test --workspace --locked
+      # The container driver suites again on the Rust stand-in `podman`
+      # (crates/kbf-driver-container/tests/support/fake.rs); the run above used the script.
+      - run: cargo test -p kbf-driver-container --locked
+        env:
+          KBF_TEST_FAKE_PODMAN: rust
       # kbf-guest started as root through sudo must refuse (tools/ci/guest-tests.sh).
       - run: bash tools/ci/guest-tests.sh
       # kbf-server's --version names this commit, and the CI-only override stamps two
@@ -320,6 +325,11 @@ jobs:
           key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
       - run: cargo test --workspace --locked
+      # The container driver suites again on the Rust stand-in `podman`
+      # (crates/kbf-driver-container/tests/support/fake.rs); the run above used the script.
+      - run: cargo test -p kbf-driver-container --locked
+        env:
+          KBF_TEST_FAKE_PODMAN: rust
       - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         if: ${{ github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true' }}
         with:

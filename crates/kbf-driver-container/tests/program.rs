@@ -1,5 +1,5 @@
 //! A program the container cannot start, against the stand-in `podman`
-//! (`fixtures/fake-podman.sh`): the action's own failure, never the farm's.
+//! (`support/fake.rs`): the action's own failure, never the farm's.
 //! `podman_env.rs` runs the same cases against real rootless Podman and crun.
 //!
 //! The fake's `start` stands in for a refused start with `status-override` set to

@@ -103,7 +103,7 @@ async fn a_fence_kills_each_lease_through_its_own_runtime() {
     let mut fenced = Vec::new();
     for _ in 0..2 {
         let (_, result) = peer.result(t + PROMPT).await.expect("a fenced lease");
-        assert_eq!(code(&result), Code::Aborted as i32);
+        assert_eq!(code(&result), Code::Unavailable as i32);
         fenced.extend(result.lease_id.map(|l| (l.term, l.seq)));
     }
     fenced.sort_unstable();

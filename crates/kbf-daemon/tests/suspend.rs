@@ -60,7 +60,7 @@ async fn a_suspend_past_t_fences_running_work_within_a_tick() {
         .expect("the woken daemon fences and reports");
     assert!(at - resumed < INTERVAL, "noticed only by a heartbeat");
     assert_eq!(result.lease_id, Some(LeaseId { term: 1, seq: 1 }));
-    assert_eq!(code(&result), Code::Aborted as i32);
+    assert_eq!(code(&result), Code::Unavailable as i32);
     assert_eq!(h.runtime.killed(), [id(1, 1)]);
     h.event(PROMPT, |e| {
         matches!(e, Event::Fenced(ids) if ids == &[id(1, 1)]).then_some(())
@@ -88,7 +88,7 @@ async fn a_run_that_ends_after_a_suspend_past_t_reports_the_fence() {
     assert_eq!(result.lease_id, Some(LeaseId { term: 1, seq: 2 }));
     assert_eq!(
         code(&result),
-        Code::Aborted as i32,
+        Code::Unavailable as i32,
         "the run's own Result was sent"
     );
     assert!(
@@ -206,7 +206,7 @@ async fn an_offline_run_ending_after_a_suspend_past_t_reports_the_fence() {
     assert_eq!(result.lease_id, Some(LeaseId { term: 1, seq: 7 }));
     assert_eq!(
         code(&result),
-        Code::Aborted as i32,
+        Code::Unavailable as i32,
         "the run's own Result was sent"
     );
 }
@@ -289,5 +289,5 @@ async fn a_connection_after_a_suspend_past_t_fences_before_its_hello() {
     second.welcome_every(INTERVAL);
     let (_, result) = second.result(PROMPT).await.expect("the fence's Result");
     assert_eq!(result.lease_id, Some(LeaseId { term: 1, seq: 9 }));
-    assert_eq!(code(&result), Code::Aborted as i32);
+    assert_eq!(code(&result), Code::Unavailable as i32);
 }
