@@ -300,8 +300,9 @@ fn a_missing_empty_unknown_or_repeated_key_is_refused() {
 }
 
 /// Catches checks tighter than the first renderer's: a tag-less pinned image, a
-/// server port with leading zeros, digits in a label, a one-label secret name and a
-/// kube context with every allowed punctuation mark are all valid there.
+/// server port with leading zeros, digits in a label or an image repo, a one-label
+/// secret name and a kube context with every allowed punctuation mark are all valid
+/// there.
 #[test]
 fn the_edges_of_each_shape_are_accepted() {
     let digest = "0123456789abcdef".repeat(4);
@@ -316,7 +317,7 @@ fn the_edges_of_each_shape_are_accepted() {
         ),
         (
             "KBF_ENVOY_IMAGE",
-            format!("r.example/x_y.z-w@sha256:{digest}"),
+            format!("r9.example/x_y.z-w@sha256:{digest}"),
         ),
     ]
     .into_iter()
@@ -346,7 +347,7 @@ fn the_edges_of_each_shape_are_accepted() {
             },
         ]
     );
-    assert_eq!(c.image, format!("r.example/x_y.z-w@sha256:{digest}"));
+    assert_eq!(c.image, format!("r9.example/x_y.z-w@sha256:{digest}"));
     assert_eq!(c.kube_context, "Admin@a.b:c/d_e-F9");
     assert!(fits(
         Shape::PinnedImage,
