@@ -88,6 +88,15 @@ async fn software_until(api: SocketAddr, done: impl Fn(&Value) -> bool) -> Value
     }
 }
 
+/// Waits until `path` is gone, for at most [`PROMPT`].
+async fn gone(path: &Path) {
+    let deadline = Instant::now() + PROMPT;
+    while path.exists() {
+        assert!(Instant::now() < deadline, "still there: {}", path.display());
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 /// Stores an action naming `xcode=<build>` that, run by `act` (kbf-testkit's act verbs),
 /// writes `ran` to `marker` and prints its `DEVELOPER_DIR`.
 async fn action(cas: &CasClient, build: &str, act: &Path, marker: &Path) -> Digest {
@@ -151,7 +160,9 @@ async fn execute(reapi: Channel, action: Digest) -> ActionResult {
 /// (nothing for a human to do); and the survey's result never reaching the server, or
 /// not without a restart. The Xcode's `xcodebuild` answers only once the test lets it
 /// (and fails after 20 s, so a red run ends). The action runs kbf-testkit's act verbs,
-/// through a link to this test binary.
+/// through a link to this test binary. The xcrun warm-up the first survey starts is
+/// held until the action has run, and the scratch removed only once it has ended (a
+/// clean that raced it failed with `NotFound`, issue #482).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_daemon_says_hello_before_its_first_survey_ends() {
     let dir = scratch("startup");
@@ -302,12 +313,20 @@ async fn the_daemon_says_hello_before_its_first_survey_ends() {
         real_developer_dir.display().to_string()
     );
     // The clean must not run while the daemon's warm-up does: its own removal of its
-    // directory, and its lookups' writes, race the clean's walk (`NotFound`).
+    // directory, and its lookups' writes, race the clean's walk (`NotFound`). Its
+    // directory was made before the survey's report was sent, and its removal is the
+    // warm-up's last step.
     let warm_up = dir.join("leases").join(kbf_driver_native::WARM_UP_DIR);
-    assert!(
-        !warm_up.exists(),
-        "the clean starts while the xcrun warm-up runs in {}",
-        warm_up.display()
+    std::fs::write(&warm, "").expect("let the warm-up go on");
+    gone(&warm_up).await;
+    let lookups = std::fs::read_to_string(dir.join("bin/xcrun.log")).expect("xcrun log");
+    assert_eq!(
+        lookups
+            .lines()
+            .filter(|l| l.ends_with(" --find ld"))
+            .count(),
+        2,
+        "the warm-up's last lookup, for the node's Xcode and 1A1: {lookups}"
     );
     drop(reports);
     kbf_outputs::remove_tree(&dir).expect("clean");
