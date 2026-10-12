@@ -13,7 +13,7 @@ use kbf_host::testkit::{FakeExec, reply};
 
 const CRT: &str = "/var/lib/kbf-mdm/lego/certificates/mdm.example.com.crt";
 const LEGO: &str = "/opt/kbf-mdm/bin/lego";
-const HELP: &str = "USAGE: lego run [options]\n  --accept-tos\n  --email value\n  --server value\n  --path value\n  --key-type value\n  --dns value\n  --domains value\n";
+const HELP: &str = "USAGE: lego run [options]\n  --accept-tos\n  --email value\n  --server value\n  --path value\n  --key-type value\n  --dns value\n  --domains value, -d value\n  --dns.resolvers value\n  --dns.propagation.wait value\n";
 
 fn p(s: &str) -> HostPath {
     HostPath::new(s).expect("valid test path")
@@ -161,9 +161,64 @@ fn acme_settings_are_checked() {
     }
 }
 
+/// Catches nameservers or a wait the unit's command line would carry wrong: the
+/// example's values read back as two nameservers and 300 s (IPv6 too); and refused,
+/// naming the key, a name instead of an address, a missing or zero port, a list of only
+/// spaces, a comma list (one word to the parser), a wait of 0, without its `s`, in
+/// minutes, negative or fractional, and either key unset.
+#[test]
+fn acme_resolvers_and_propagation_wait_are_checked() {
+    let a = acme();
+    let want: Vec<SocketAddr> = vec![
+        "192.0.2.53:53".parse().expect("addr"),
+        "198.51.100.53:53".parse().expect("addr"),
+    ];
+    assert_eq!(a.resolvers, want);
+    assert_eq!(a.propagation_wait, Duration::from_secs(300));
+    let base = acme_text("ops@example.com", DIRECTORY, "godaddy");
+    let with = |key: &str, value: &str| {
+        let lines: Vec<String> = base
+            .lines()
+            .map(|l| match l.starts_with(&format!("{key}=")) {
+                true => format!("{key}={value}"),
+                false => l.to_owned(),
+            })
+            .collect();
+        lines.join("\n") + "\n"
+    };
+    let v6 = Acme::parse(&with("MDM_ACME_RESOLVERS", "\"[2001:db8::53]:53\""));
+    let v6 = v6.expect("IPv6").resolvers;
+    assert_eq!(resolvers(&v6), "[2001:db8::53]:53");
+    let rows = [
+        ("MDM_ACME_RESOLVERS", "dns.google:53"),
+        ("MDM_ACME_RESOLVERS", "192.0.2.53"),
+        ("MDM_ACME_RESOLVERS", "192.0.2.53:0"),
+        ("MDM_ACME_RESOLVERS", "\" \""),
+        ("MDM_ACME_RESOLVERS", "192.0.2.53:53,198.51.100.53:53"),
+        ("MDM_ACME_RESOLVERS", ""),
+        ("MDM_ACME_PROPAGATION_WAIT", "0s"),
+        ("MDM_ACME_PROPAGATION_WAIT", "300"),
+        ("MDM_ACME_PROPAGATION_WAIT", "5m"),
+        ("MDM_ACME_PROPAGATION_WAIT", "-5s"),
+        ("MDM_ACME_PROPAGATION_WAIT", "+5s"),
+        ("MDM_ACME_PROPAGATION_WAIT", "1.5s"),
+        ("MDM_ACME_PROPAGATION_WAIT", "s"),
+        ("MDM_ACME_PROPAGATION_WAIT", ""),
+    ];
+    for (key, value) in rows {
+        let got = Acme::parse(&with(key, value)).map_err(|e| e.to_string());
+        assert!(
+            got.as_ref().is_err_and(|e| e.contains(key)),
+            "{key}={value}: {got:?}"
+        );
+    }
+}
+
 /// Catches a certificate unit that runs lego as root, passes the DNS key on argv
 /// instead of through the 0600 environment file, or names another email, directory,
-/// provider or name than the settings; and a reload unit that watches another file
+/// provider or name than the settings; one that leaves lego on the host's resolver (a
+/// stub that caches the challenge's NXDOMAIN) or on its own propagation check (passed
+/// on one of the zone's servers while the CA still saw NXDOMAIN); and a reload unit that watches another file
 /// than the certificate the proxy serves.
 #[test]
 fn the_rendered_units_run_lego_as_the_mdm_user_with_the_settings() {
@@ -184,6 +239,11 @@ fn the_rendered_units_run_lego_as_the_mdm_user_with_the_settings() {
     assert_eq!(after("--server"), Some(DIRECTORY));
     assert_eq!(after("--dns"), Some("godaddy"));
     assert_eq!(after("--domains"), Some("mdm.example.com"));
+    assert_eq!(
+        after("--dns.resolvers"),
+        Some("192.0.2.53:53,198.51.100.53:53")
+    );
+    assert_eq!(after("--dns.propagation.wait"), Some("300s"));
     assert!(!argv.iter().any(|w| w.contains("GODADDY")));
     let watch =
         UnitFile::parse(&template::render(RELOAD_PATH, TLS_UNITS[2].1, &values).expect("renders"))
@@ -231,10 +291,127 @@ fn a_first_run_installs_the_units_issues_the_certificate_then_starts_the_proxy()
             "enable kbf-mdm-cert.timer",
             "restart kbf-mdm-cert.timer",
             "start kbf-mdm-cert.service",
-            "enable kbf-mdm-proxy.service",
-            "start kbf-mdm-proxy.service",
         ]
     );
+}
+
+/// The fake host, where `systemctl start kbf-mdm-cert.service` writes `cert` at the
+/// certificate's path, as lego does when the issuance works.
+struct Issuing {
+    host: FakeExec,
+    cert: Entry,
+}
+
+impl Exec for Issuing {
+    fn euid(&self) -> u32 {
+        self.host.euid()
+    }
+    fn inspect(&self, path: &HostPath) -> std::io::Result<Option<Entry>> {
+        self.host.inspect(path)
+    }
+    fn stat(&self, path: &HostPath) -> std::io::Result<Option<kbf_host::Meta>> {
+        self.host.stat(path)
+    }
+    fn query(&self, cmd: &Cmd) -> std::io::Result<std::process::Output> {
+        self.host.query(cmd)
+    }
+    fn http_status(&self, url: &kbf_host::HttpUrl) -> std::io::Result<u16> {
+        self.host.http_status(url)
+    }
+    fn apply(&mut self, step: &Step) -> std::io::Result<()> {
+        self.host.apply(step)?;
+        if matches!(step, Step::Run(cmd) if cmd.args == ["start", CERT_SERVICE]) {
+            self.host.entries.insert(p(CRT), self.cert.clone());
+        }
+        Ok(())
+    }
+    fn check_binary(&self) -> Result<(), kbf_host::Untrusted> {
+        self.host.check_binary()
+    }
+}
+
+/// Catches the proxy planned without its certificate, and the proxy left off once the
+/// certificate is there. Rows: a dry run before the first issuance shows no proxy step
+/// (it says the proxy waits); an apply whose issuance writes no certificate stops
+/// there, the proxy untouched (it would start, fail on the missing file and restart
+/// every 5 s); an apply whose issuance writes the certificate then enables and starts
+/// the proxy in the same run; and a certificate already there (lego run by hand, or by
+/// the timer after a failed first issuance) with the proxy off: a dry run shows the
+/// proxy steps and no waiting note, and an apply enables and starts it without issuing
+/// again.
+#[test]
+fn the_proxy_is_enabled_and_started_only_once_the_certificate_is_there() {
+    let proxy = [
+        "enable kbf-mdm-proxy.service",
+        "start kbf-mdm-proxy.service",
+    ];
+    let has_proxy = |runs: &[String]| proxy.iter().any(|s| runs.iter().any(|r| r == s));
+    let (cert, _) = pair("mdm.example.com", false);
+    let cert = file(cert.as_bytes(), 0o644, 990);
+
+    let (mut exec, _) = tls_host(HELP);
+    let (got, out) = run_it(&mut exec, &acme(), Mode::DryRun);
+    got.expect("planned");
+    assert!(
+        !out.contains("systemctl enable kbf-mdm-proxy.service"),
+        "{out}"
+    );
+    assert!(
+        !out.contains("systemctl start kbf-mdm-proxy.service"),
+        "{out}"
+    );
+    assert!(
+        out.contains(&format!("proxy: started once {CRT} is there")),
+        "{out}"
+    );
+
+    let (got, out) = run_it(&mut exec, &acme(), Mode::Apply);
+    assert!(
+        matches!(got, Err(MdmError::NoCertificate(_))),
+        "{got:?} {out}"
+    );
+    let ran = runs(&exec);
+    assert_eq!(
+        ran.last().map(String::as_str),
+        Some("start kbf-mdm-cert.service")
+    );
+    assert!(!has_proxy(&ran), "{ran:?}");
+
+    let (host, _) = tls_host(HELP);
+    let mut issuing = Issuing {
+        host,
+        cert: cert.clone(),
+    };
+    let mut out = Vec::new();
+    run(&mut issuing, &config(), &acme(), Mode::Apply, &mut out).expect("issued");
+    let out = String::from_utf8_lossy(&out).into_owned();
+    let ran = runs(&issuing.host);
+    assert_eq!(
+        ran[ran.len() - 3..],
+        ["start kbf-mdm-cert.service", proxy[0], proxy[1]],
+        "{out}"
+    );
+    assert!(
+        out.contains(&format!("certificate: {CRT}: subject ")),
+        "{out}"
+    );
+
+    let (mut exec, _) = tls_host(HELP);
+    exec.entries.insert(p(CRT), cert);
+    let (got, out) = run_it(&mut exec, &acme(), Mode::DryRun);
+    got.expect("planned");
+    assert!(
+        out.contains("systemctl enable kbf-mdm-proxy.service"),
+        "{out}"
+    );
+    assert!(!out.contains("proxy: started once"), "{out}");
+    run_it(&mut exec, &acme(), Mode::Apply).0.expect("by hand");
+    let ran = runs(&exec);
+    assert!(
+        !ran.iter().any(|r| r == "start kbf-mdm-cert.service"),
+        "{ran:?}"
+    );
+    assert_eq!(ran[ran.len() - 2..], proxy, "{ran:?}");
 }
 
 /// Catches a re-run that issues again, rewrites a unit or restarts a service when
@@ -248,6 +425,7 @@ fn a_rerun_changes_nothing_and_a_changed_timer_is_reloaded() {
     let (cert, _) = pair("mdm.example.com", false);
     exec.entries
         .insert(p(CRT), file(cert.as_bytes(), 0o644, 990));
+    run_it(&mut exec, &acme(), Mode::Apply).0.expect("proxy up");
     let steps = exec.log.len();
     let (got, out) = run_it(&mut exec, &acme(), Mode::Apply);
     got.expect("re-run");

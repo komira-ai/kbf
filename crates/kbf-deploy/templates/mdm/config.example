@@ -65,6 +65,15 @@ MDM_ACME_SERVER=https://acme-v02.api.letsencrypt.org/directory
 # lego follows it (`mdm tls --check-godaddy` says whether GoDaddy's API is open to
 # the account).
 MDM_ACME_DNS_PROVIDER=
+# The nameservers lego asks about the challenge name (its zone, a CNAME), IP:PORT
+# words separated by spaces, in quotes: two public resolvers, say. Not the host's
+# resolver: a local stub (systemd-resolved) caches the record's NXDOMAIN from before
+# lego set it.
+MDM_ACME_RESOLVERS=
+# How long lego waits after setting the record before it asks the CA to check it, in
+# seconds (300s). lego's own propagation check is off then: it can pass on one of the
+# zone's nameservers while the CA still reads NXDOMAIN from another.
+MDM_ACME_PROPAGATION_WAIT=300s
 
 # --- the erase path -------------------------------------------------------------
 # The ssh signature namespace and the principal of the operator's key.

@@ -2,23 +2,27 @@
 //! timer, as root. lego, pinned and installed by `mdm install`, does the ACME work.
 //!
 //! It checks first, and refuses before anything changes: `MDM_ACME_EMAIL`,
-//! `MDM_ACME_SERVER` or `MDM_ACME_DNS_PROVIDER` is unset or malformed ([`Acme`]);
+//! `MDM_ACME_SERVER`, `MDM_ACME_DNS_PROVIDER`, `MDM_ACME_RESOLVERS` or
+//! `MDM_ACME_PROPAGATION_WAIT` is unset or malformed ([`Acme`]);
 //! `MDM_ETC/dns.env` is not a 0600 file of root's holding every variable the provider
 //! reads (lego reads them from its environment); `MDM_BIN/lego` is missing, or its
 //! `lego run --help` lists no flag the unit passes.
 //!
 //! The plan has each of these only when the host differs:
-//! 1. `kbf-mdm-cert.service` (`lego run ... --dns <provider>` as `MDM_USER`), its
+//! 1. `kbf-mdm-cert.service` (`lego run ... --dns <provider>` as `MDM_USER`, asking
+//!    `MDM_ACME_RESOLVERS` and waiting `MDM_ACME_PROPAGATION_WAIT` for the record), its
 //!    twice-a-day timer, and the path unit that restarts the proxy when the
 //!    certificate changes, under `/etc/systemd/system`, then `daemon-reload`;
 //! 2. the timer and the path unit enabled, and restarted when their unit changed, else
 //!    started when not active;
 //! 3. `kbf-mdm-cert.service` started once when there is no certificate yet (the first
 //!    issuance; the timer renews it after);
-//! 4. the proxy enabled and started when not active.
+//! 4. in a second plan, once the certificate is there (after step 3 when it runs; a
+//!    dry run that would issue shows no proxy step), the proxy enabled and started when
+//!    not active.
 //!
-//! After an apply the certificate must be there; its subject, issuer and expiry are
-//! printed.
+//! After an apply the certificate must be there, else the run fails before the proxy;
+//! its subject, issuer and expiry are printed.
 //!
 //! `mdm tls --check-godaddy` only reads: it asks GoDaddy's DNS API, with the key in
 //! `dns.env`, for the TXT records of `MDM_DNS_NAME`'s domain, and says whether the
@@ -31,6 +35,7 @@ use std::fmt;
 use std::io::Write;
 use std::net::SocketAddr;
 use std::path::Path;
+use std::time::Duration;
 
 use super::MdmError;
 use super::config::{KEYS, MdmConfig, MdmConfigError};
@@ -51,7 +56,7 @@ const ROOT: Owner = Owner { uid: 0, gid: 0 };
 /// GoDaddy's API, which `--check-godaddy` asks.
 pub const GODADDY_API: &str = "https://api.godaddy.com";
 /// The flags of `lego run` the certificate unit passes.
-pub const LEGO_FLAGS: [&str; 7] = [
+pub const LEGO_FLAGS: [&str; 9] = [
     "--accept-tos",
     "--email",
     "--server",
@@ -59,6 +64,8 @@ pub const LEGO_FLAGS: [&str; 7] = [
     "--key-type",
     "--dns",
     "--domains",
+    "--dns.resolvers",
+    "--dns.propagation.wait",
 ];
 
 /// The units `mdm tls` renders, in the order it installs them.
@@ -132,6 +139,13 @@ pub struct Acme {
     /// The ACME directory.
     pub server: HttpsUrl,
     pub provider: DnsProvider,
+    /// The nameservers lego asks about the challenge name (its zone, a CNAME), not the
+    /// host's resolver (a stub there caches the record's NXDOMAIN).
+    pub resolvers: Vec<SocketAddr>,
+    /// How long lego waits after setting the record before the CA checks it; lego's
+    /// own propagation check is off (it passed on one of the zone's servers while the
+    /// CA still saw NXDOMAIN).
+    pub propagation_wait: Duration,
 }
 
 impl Acme {
@@ -184,10 +198,32 @@ impl Acme {
             &text,
             "not one of godaddy, route53, cloudflare",
         ))?;
+        let text = get("ACME_RESOLVERS")?;
+        let mut resolvers = Vec::new();
+        for word in text.split_whitespace() {
+            let addr = word.parse::<SocketAddr>().ok().filter(|a| a.port() != 0);
+            let addr = addr.ok_or(bad(
+                "ACME_RESOLVERS",
+                &text,
+                "not nameservers as IP:PORT words, like 192.0.2.53:53",
+            ))?;
+            resolvers.push(addr);
+        }
+        if resolvers.is_empty() {
+            return Err(bad("ACME_RESOLVERS", &text, "no nameserver"));
+        }
+        let text = get("ACME_PROPAGATION_WAIT")?;
+        let propagation_wait = wait(&text).ok_or(bad(
+            "ACME_PROPAGATION_WAIT",
+            &text,
+            "not a number of seconds above 0 with an s, like 300s",
+        ))?;
         Ok(Acme {
             email,
             server,
             provider,
+            resolvers,
+            propagation_wait,
         })
     }
 }
@@ -223,7 +259,11 @@ pub fn run<E: Exec>(
     let help = host::query(&*exec, &Cmd::new(lego.clone()).arg("run").arg("--help"))?;
     let help =
         String::from_utf8_lossy(&help.stdout).into_owned() + &String::from_utf8_lossy(&help.stderr);
-    if let Some(flag) = LEGO_FLAGS.into_iter().find(|f| !help.contains(f)) {
+    // Whole words: `--dns` is not there because `--dns.resolvers` is.
+    let words: BTreeSet<&str> = help
+        .split(|ch: char| ch.is_whitespace() || ch == ',' || ch == '=')
+        .collect();
+    if let Some(flag) = LEGO_FLAGS.into_iter().find(|f| !words.contains(f)) {
         return Err(MdmError::LegoFlag { lego, flag });
     }
 
@@ -252,19 +292,28 @@ pub fn run<E: Exec>(
     for unit in [RELOAD_PATH, CERT_TIMER] {
         service(&*exec, &mut planner, unit, changed.contains(unit))?;
     }
+    // The proxy is planned only with its certificate there: started without it, Caddy
+    // fails and restarts every 5 s. A first issuance runs in this plan, so the proxy
+    // has a plan of its own after it, planned once the certificate is there.
     let crt = under(&c.state, &format!("lego/certificates/{}.crt", c.dns_name))?;
-    if host::stat(&*exec, &crt)?.is_none() {
+    let issue = host::stat(&*exec, &crt)?.is_none();
+    if issue {
         planner.run(systemctl(&["start", CERT_SERVICE]));
     }
-    service(&*exec, &mut planner, PROXY, false)?;
-    let plan = planner.finish();
-    execute(&plan, RunAs::Root, mode, exec, &mut out)?;
-    if mode == Mode::DryRun {
+    execute(&planner.finish(), RunAs::Root, mode, exec, &mut out)?;
+    if issue && mode == Mode::DryRun {
+        note(out, format_args!("proxy: started once {crt} is there"))?;
         return Ok(());
     }
     let Some(Entry::File { bytes, .. }) = host::inspect(&*exec, &crt)? else {
         return Err(MdmError::NoCertificate(crt));
     };
+    let mut planner = Planner::new(&*exec);
+    service(&*exec, &mut planner, PROXY, false)?;
+    execute(&planner.finish(), RunAs::Root, mode, exec, &mut out)?;
+    if mode == Mode::DryRun {
+        return Ok(());
+    }
     let shown = x509_parser::pem::parse_x509_pem(&bytes)
         .ok()
         .and_then(|(_, pem)| {
@@ -292,11 +341,30 @@ fn values(c: &MdmConfig, acme: &Acme) -> Values {
         ("ACME_SERVER", acme.server.to_string()),
         ("DNS_PROVIDER", acme.provider.to_string()),
         ("DNS_NAME", c.dns_name.clone()),
+        ("DNS_RESOLVERS", resolvers(&acme.resolvers)),
+        (
+            "PROPAGATION_WAIT",
+            format!("{}s", acme.propagation_wait.as_secs()),
+        ),
     ];
     pairs
         .into_iter()
         .map(|(k, v)| (k, Value::Text(v)))
         .collect()
+}
+
+/// `MDM_ACME_PROPAGATION_WAIT`: whole seconds above 0, written `300s`.
+fn wait(text: &str) -> Option<Duration> {
+    let secs = text.strip_suffix('s')?;
+    let all_digits = !secs.is_empty() && secs.bytes().all(|b| b.is_ascii_digit());
+    let secs = secs.parse::<u64>().ok().filter(|s| all_digits && *s > 0)?;
+    Some(Duration::from_secs(secs))
+}
+
+/// The nameservers as lego's `--dns.resolvers` takes several: comma-separated.
+fn resolvers(addrs: &[SocketAddr]) -> String {
+    let words: Vec<String> = addrs.iter().map(SocketAddr::to_string).collect();
+    words.join(",")
 }
 
 /// The domain GoDaddy holds `name` under: its last two labels.
