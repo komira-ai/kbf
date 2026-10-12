@@ -471,12 +471,15 @@ fn run_waits_for_its_program_and_shares_its_output() {
 
 /// Catches: `spawn-child --pid` reporting another process than the child (a test that
 /// waits for that pid to die would pass at once), writing it elsewhere than asked, or
-/// the child's `;;` steps not all run, or not in order.
+/// the child's `;;` steps not all run, or not in order. The child prints its own
+/// process group id once `setsid` made it a group's leader: its pid, which must be the
+/// one the parent printed.
 #[test]
 fn spawn_child_reports_its_pid_and_runs_every_step() {
     let dir = dir("act-spawn-pid");
     let (mark, pids) = (dir.join("mark"), dir.join("pids"));
     let [mark_arg, pids_arg] = [&mark, &pids].map(|p| p.display().to_string());
+    // Waits for the child too: it holds stdout until it exits.
     let out = output(&[
         "spawn-child",
         "--pid",
@@ -487,12 +490,11 @@ fn spawn_child_reports_its_pid_and_runs_every_step() {
         ";;",
         "setsid",
         ";;",
+        "pgid",
+        ";;",
         "append",
         &mark_arg,
         "two",
-        ";;",
-        "sleep",
-        "3",
         ";",
         "spawn-child",
         "--pid",
@@ -501,16 +503,16 @@ fn spawn_child_reports_its_pid_and_runs_every_step() {
         "0",
     ]);
     assert_eq!(out.status.code(), Some(0), "{out:?}");
-    let pid: i32 = text(&out.stdout).trim().parse().expect("a pid");
-    eventually("the child ran its steps in order", || {
-        std::fs::read_to_string(&mark).is_ok_and(|m| m == "one\ntwo\n")
-    });
-    // The child leads a session of its own now, so the pid printed is the child's.
-    let child = rustix::process::Pid::from_raw(pid).expect("a pid");
+    let printed: Vec<u32> = text(&out.stdout)
+        .lines()
+        .map(|line| line.parse().expect("a pid"))
+        .collect();
+    assert_eq!(printed.len(), 2, "{printed:?}");
+    assert_eq!(printed[0], printed[1], "the pid printed is not the child's");
     assert_eq!(
-        rustix::process::getsid(Some(child)).expect("alive"),
-        child,
-        "the pid printed is not the child's"
+        std::fs::read_to_string(&mark).expect("mark"),
+        "one\ntwo\n",
+        "the child's steps"
     );
     let written = std::fs::read_to_string(&pids).expect("pids");
     assert!(written.trim().parse::<u32>().is_ok(), "{written:?}");
