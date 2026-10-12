@@ -230,7 +230,9 @@ fn a_line_renders_its_own_keys_sorted() {
 /// none). Catches a check that lets any entitlement through for an unlisted binary
 /// (a lookup that ignores the name finds kbf-vmm's set for kbf-daemon), a subset
 /// compare that accepts one more key (get-task-allow among them), a check that treats
-/// "no entitlements" as always fine, and a compare of the count only.
+/// "no entitlements" as always fine, a compare of the count only, and one that takes
+/// an empty dictionary in an unlisted binary's signature for no entitlements (the
+/// signature must carry none at all).
 #[test]
 fn a_signature_is_compared_with_the_list() {
     let list = committed();
@@ -243,7 +245,8 @@ fn a_signature_is_compared_with_the_list() {
             signed: keys(signed),
         })
     };
-    let cases: [(&str, String, Result<String, Error>); 7] = [
+    let empty_dict = signed("").replace("<dict></dict>", "<dict/>");
+    let cases: [(&str, String, Result<String, Error>); 8] = [
         (
             "kbf-vmm",
             VMM_SIGNED.to_owned(),
@@ -262,6 +265,14 @@ fn a_signature_is_compared_with_the_list() {
             Err(Error::UnlistedCarries {
                 name: "kbf-daemon".to_owned(),
                 signed: signed(&vz),
+            }),
+        ),
+        (
+            "kbf-daemon",
+            empty_dict.clone(),
+            Err(Error::UnlistedCarries {
+                name: "kbf-daemon".to_owned(),
+                signed: empty_dict,
             }),
         ),
         (

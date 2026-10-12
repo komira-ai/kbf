@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use super::{cdhash, code_directory_flags, granted, minos, sip_enabled};
+use super::{cdhash, code_directory_flags, granted, minos, packaged_binary, sip_enabled};
 use crate::Error;
 use crate::entitlements::{self, AllowList};
 
@@ -304,21 +304,7 @@ pub fn sign(
 /// The `darwin-asset` verb (module docs): the binary `name` read out of `tarball` and
 /// checked as it ships. The lines to print.
 pub fn asset(tarball: &Path, name: &str, allowlist: &Path) -> Result<Vec<String>, Error> {
-    if Path::new(name).file_name() != Some(OsStr::new(name)) {
-        return Err(Error::Failed(format!("{name:?} is not a file name")));
-    }
-    let tgz = crate::package::read(tarball)?;
-    let bytes = binary_in(&tgz, name)
-        .ok_or_else(|| Error::Failed(format!("{} holds no {name}", tarball.display())))?;
-    let problems = crate::package::check_tarball(&tgz, name, &bytes);
-    if !problems.is_empty() {
-        return Err(Error::Refused(
-            problems
-                .into_iter()
-                .map(|p| format!("{}: {p}", tarball.display()))
-                .collect(),
-        ));
-    }
+    let bytes = packaged_binary(tarball, &crate::package::read(tarball)?, name)?;
     let scratch = Scratch::new("darwin-asset")?;
     let binary = scratch.0.join(name);
     write_executable(&binary, &bytes)?;
@@ -336,21 +322,6 @@ pub fn asset(tarball: &Path, name: &str, allowlist: &Path) -> Result<Vec<String>
         cdhash(&info).unwrap_or_default()
     ));
     Ok(lines)
-}
-
-/// The bytes of the first entry named `name` in the gzip-compressed tar `tgz`.
-fn binary_in(tgz: &[u8], name: &str) -> Option<Vec<u8>> {
-    use std::io::Read;
-    let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(tgz));
-    for entry in archive.entries().ok()? {
-        let mut entry = entry.ok()?;
-        if *entry.path_bytes() == *name.as_bytes() {
-            let mut bytes = Vec::new();
-            entry.read_to_end(&mut bytes).ok()?;
-            return Some(bytes);
-        }
-    }
-    None
 }
 
 /// Writes `bytes` to the new file `path`, mode 0755.

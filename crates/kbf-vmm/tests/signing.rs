@@ -171,9 +171,9 @@ fn wrong_signatures_are_refused() {
 #[test]
 #[ignore = "signs with codesign; the native-macos job runs it with --ignored"]
 fn a_missing_list_fails_closed() {
-    // Catches: a check or signer that skips itself, or reads "no list" as "no
-    // entitlements", when the file is not there: for kbf-daemon with no entitlements
-    // (which would otherwise pass) and for kbf-vmm.
+    // Catches: a check, signer or asset check that skips itself, or reads "no list" as
+    // "no entitlements", when the file is not there: for kbf-daemon with no
+    // entitlements (which would otherwise pass) and for kbf-vmm.
     let missing = Path::new(env!("CARGO_TARGET_TMPDIR")).join("no-such-list.txt");
     let want = format!(
         "the entitlement allow list {} is missing",
@@ -184,6 +184,13 @@ fn a_missing_list_fails_closed() {
         sign_with(&binary, &[]);
         assert_refused(
             darwin::check_entitlements(&binary, name, &missing),
+            &want,
+            case,
+        );
+        // Signed with the hardened runtime, so darwin-asset gets past the signature
+        // and flags checks to the list.
+        assert_refused(
+            darwin::asset(&package(&binary), name, &missing),
             &want,
             case,
         );

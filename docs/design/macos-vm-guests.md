@@ -366,9 +366,9 @@ pass with none; `darwin-asset` must accept both packaged. It then signs copies b
 and requires the check and `darwin-asset` to refuse each: `kbf-daemon` with the
 virtualization entitlement, `kbf-mac-session` with `get-task-allow`, `kbf-vmm` with
 `get-task-allow` as well, `kbf-vmm` with none, `kbf-vmm` with `get-task-allow` in its
-place, and any binary when the list is missing. The stub starting under the hardened
-runtime with the entitlement on a hosted runner, where code-signing enforcement is off,
-says nothing about P6.
+place, and any binary when the list is missing (which `sign-darwin` must refuse
+too). The stub starting under the hardened runtime with the entitlement on a hosted
+runner, where code-signing enforcement is off, says nothing about P6.
 
 Whether macOS accepts an **ad hoc** signature with this entitlement under the hardened
 runtime is probe P6 **[A]**. If it does not, `kbf-vmm` needs a signing identity, which

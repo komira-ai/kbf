@@ -25,7 +25,7 @@
 //!    warning, and the runtime flag is checked by 3, not by behaviour.
 //!
 //! `darwin-asset <tarball> <name>` reads the binary `<name>` out of its tarball, which
-//! must be exactly the one entry `package` writes ([`crate::package::check_tarball`]),
+//! must be exactly the one entry `package` writes ([`packaged_binary`]),
 //! and fails unless 1, 3 and a run of `--version` as in 2 pass for it. 1 is the check
 //! that catches a modified binary on the hosted runners: a binary with a byte flipped
 //! in its executed code after signing still ran there.
@@ -33,6 +33,10 @@
 //! Both run `codesign`, `vtool` and `csrutil` from macOS, so on any other host they
 //! fail at once. The parsers of those tools' output below are plain functions, tested
 //! on every host.
+
+use std::ffi::OsStr;
+use std::io::Read;
+use std::path::Path;
 
 #[cfg(target_os = "macos")]
 mod mac;
@@ -76,6 +80,46 @@ pub fn minos(build: &str) -> Option<&str> {
 /// Whether `csrutil status` output says System Integrity Protection is enabled.
 pub fn sip_enabled(status: &str) -> bool {
     status.contains("status: enabled")
+}
+
+/// The binary `name` in the release tarball `tgz` read from `tarball` (named in the
+/// errors): its bytes, when `tgz` is exactly the one entry `package` writes for it
+/// ([`crate::package::check_tarball`]).
+///
+/// # Errors
+/// `name` is not a file name, `tgz` holds no entry `name`, or it holds anything else
+/// or more: each problem found, refused.
+pub fn packaged_binary(tarball: &Path, tgz: &[u8], name: &str) -> Result<Vec<u8>, crate::Error> {
+    if Path::new(name).file_name() != Some(OsStr::new(name)) {
+        return Err(crate::Error::Failed(format!("{name:?} is not a file name")));
+    }
+    let bytes = binary_in(tgz, name)
+        .ok_or_else(|| crate::Error::Failed(format!("{} holds no {name}", tarball.display())))?;
+    let problems = crate::package::check_tarball(tgz, name, &bytes);
+    if !problems.is_empty() {
+        return Err(crate::Error::Refused(
+            problems
+                .into_iter()
+                .map(|p| format!("{}: {p}", tarball.display()))
+                .collect(),
+        ));
+    }
+    Ok(bytes)
+}
+
+/// The bytes of the first entry named `name` in the gzip-compressed tar `tgz`.
+fn binary_in(tgz: &[u8], name: &str) -> Option<Vec<u8>> {
+    let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(tgz));
+    // Only an archive already read from has no entries to list.
+    for entry in archive.entries().expect("a fresh archive") {
+        let mut entry = entry.ok()?;
+        if *entry.path_bytes() == *name.as_bytes() {
+            let mut bytes = Vec::new();
+            entry.read_to_end(&mut bytes).ok()?;
+            return Some(bytes);
+        }
+    }
+    None
 }
 
 /// The entitlements a binary is signed with, for the summary line: `none` when there
