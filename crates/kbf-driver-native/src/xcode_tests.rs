@@ -861,25 +861,44 @@ fn thousands(stream: &str, words: usize) -> Vec<String> {
         .collect()
 }
 
-/// Catches output read only after the process exits: a process that prints more
-/// than a pipe holds would block on the full pipe and be killed as hung.
+/// Catches an answer cut short (stdout and stderr read in one buffer's worth, or the
+/// one for the other), the files the output went to left behind in their directory,
+/// and a directory they cannot be made in taken as an answer.
 #[test]
 fn a_long_answer_is_read_whole() {
+    let dir = scratch("long");
     let mut command = std::process::Command::new(act());
     command
         .args(thousands("stdout", 300))
         .arg(";")
         .args(thousands("stderr", 200));
-    let out = output_within(command, WITHIN).expect("answers");
+    let out = output_within(command, WITHIN, &dir).expect("answers");
     assert!(out.status.success());
     assert_eq!((out.stdout.len(), out.stderr.len()), (300_000, 200_000));
+    let left: Vec<_> = std::fs::read_dir(&dir).expect("dir").collect();
+    assert!(left.is_empty(), "left behind: {left:?}");
+    let nowhere = output_within(
+        std::process::Command::new(act()),
+        WITHIN,
+        &dir.join("missing"),
+    );
+    assert_eq!(
+        nowhere.expect_err("no files").kind(),
+        io::ErrorKind::NotFound
+    );
+    kbf_outputs::remove_tree(&dir).expect("clean");
 }
 
-/// Catches a time limit that covers the process but not its output: an Xcode that
-/// exits but leaves a child holding stdout and stderr (here for 8 s, four times the
-/// limit) must be given up on when the limit is up, not when the child ends.
+/// Catches an answer that waits for its output to close rather than for its process
+/// to exit (issue #481). On macOS, which has no `pipe2`, the standard library makes a
+/// pipe and only then marks it close-on-exec, so a child another thread starts in
+/// between inherits it: a hung Xcode's question then held a good Xcode's output open
+/// until it was killed, and the good one was reported as failed. Here the process
+/// leaves a child holding stdout and stderr for 8 s (four times the limit), the
+/// effect of that leak made certain: the answer is what was printed, read when the
+/// process exits.
 #[test]
-fn output_held_open_past_the_limit_is_not_waited_for() {
+fn an_answer_is_read_when_its_process_exits_though_another_holds_its_output() {
     let mut command = std::process::Command::new(act());
     command.args([
         "spawn-child",
@@ -890,18 +909,46 @@ fn output_held_open_past_the_limit_is_not_waited_for() {
         "Build version 1A1",
     ]);
     let started = Instant::now();
-    let out = output_within(command, WITHIN);
+    let out = output_within(command, WITHIN, &std::env::temp_dir()).expect("answered at exit");
     let took = started.elapsed();
-    assert!(
-        took < WITHIN * 2,
-        "the held output was waited for: {took:?}"
-    );
-    let err = out.expect_err("the output is still open at the limit");
-    assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+    assert!(took < WITHIN, "the held output was waited for: {took:?}");
+    assert!(out.status.success());
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "Build version 1A1\n");
+}
+
+/// Catches the twin of issue #481 (on native-macos, `Xcode_twin` was returned for
+/// build 16C5032a where `Xcode_good` was expected): the good Xcode's `xcodebuild`
+/// leaves a process holding its stdout and stderr past the limit, as a hung
+/// Xcode's question did when it inherited them, and the good Xcode is still the one
+/// found, ready, for its build.
+#[test]
+fn an_xcode_whose_output_another_process_holds_is_still_found() {
+    let dir = scratch("held");
+    let apps = dir.join("Applications");
+    let fake = fake_xcodebuild(&dir);
+    let held = dir.join("held-xcodebuild");
+    std::fs::write(
+        &held,
+        format!("#!/bin/sh\nsleep 8 &\nexec '{}' \"$@\"\n", fake.display()),
+    )
+    .expect("held fake");
+    std::fs::set_permissions(&held, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    link_xcodebuild(&held, &apps.join("Xcode_good.app"));
+    link_xcodebuild(&fake, &apps.join("Xcode_twin.app"));
+    let xcrun = fake_xcrun(&dir);
+    let started = Instant::now();
+    let found = discover(&apps, Path::new(XCODEBUILD), &xcrun, WITHIN);
+    let took = started.elapsed();
+    let real = std::fs::canonicalize(&apps).expect("real");
     assert_eq!(
-        err.to_string(),
-        "exited, but its output was still open after 2s"
+        found,
+        BTreeMap::from([(
+            "16C5032a".to_owned(),
+            real.join("Xcode_good.app/Contents/Developer")
+        )])
     );
+    assert!(took < WITHIN, "the held output was waited for: {took:?}");
+    kbf_outputs::remove_tree(&dir).expect("clean");
 }
 
 /// Catches a question asked once only when its program is busy (ETXTBSY), so an
@@ -923,7 +970,7 @@ fn a_busy_program_is_started_again_within_the_limit() {
         std::thread::sleep(Duration::from_millis(200));
         drop(writer);
     });
-    let out = output_within(std::process::Command::new(&program), WITHIN).expect("answers");
+    let out = output_within(std::process::Command::new(&program), WITHIN, &dir).expect("answers");
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
         format!("{}\n", program.display())
@@ -936,7 +983,7 @@ fn a_busy_program_is_started_again_within_the_limit() {
         .expect("open");
     let started = Instant::now();
     let limit = Duration::from_millis(300);
-    let busy = output_within(std::process::Command::new(&program), limit).expect_err("busy");
+    let busy = output_within(std::process::Command::new(&program), limit, &dir).expect_err("busy");
     assert_eq!(busy.raw_os_error(), Some(libc::ETXTBSY));
     assert!(started.elapsed() < WITHIN, "waited past the limit");
     kbf_outputs::remove_tree(&dir).expect("clean");

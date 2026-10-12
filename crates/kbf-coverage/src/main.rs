@@ -27,6 +27,10 @@ struct Args {
     /// Also write the measured coverage, as a baseline file, to this path.
     #[arg(long)]
     write_baseline: Option<PathBuf>,
+    /// Also append the table to this file (created if absent), as a CI job summary:
+    /// `--summary-file "$GITHUB_STEP_SUMMARY"`.
+    #[arg(long)]
+    summary_file: Option<PathBuf>,
 }
 
 fn main() -> ExitCode {
@@ -44,7 +48,17 @@ fn read(path: &Path) -> Result<String, Box<dyn Error>> {
     std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()).into())
 }
 
-/// Prints the table; returns whether the ratchet passed.
+fn append(path: &Path, text: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+    std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(path)?
+        .write_all(text.as_bytes())
+}
+
+/// Prints the table (and appends it to `--summary-file`); returns whether the ratchet
+/// passed.
 fn run(args: &Args) -> Result<bool, Box<dyn Error>> {
     let files =
         lcov::parse(&read(&args.lcov)?).map_err(|e| format!("{}: {e}", args.lcov.display()))?;
@@ -63,6 +77,10 @@ fn run(args: &Args) -> Result<bool, Box<dyn Error>> {
     let recorded = baseline::parse(&read(&args.baseline)?)
         .map_err(|e| format!("{}: {e}", args.baseline.display()))?;
     let rows = ratchet::rows(&measured, &recorded);
-    print!("{}", ratchet::render(&rows));
+    let table = ratchet::render(&rows);
+    print!("{table}");
+    if let Some(path) = &args.summary_file {
+        append(path, &table).map_err(|e| format!("append to {}: {e}", path.display()))?;
+    }
     Ok(!rows.iter().any(|r| r.status().fails()))
 }

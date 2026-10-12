@@ -312,18 +312,7 @@ fn secret<E: Exec>(
     }) = host::inspect(exec, path)?
         && has_value(&bytes, key)
     {
-        if perms != Perms::new(0o600) {
-            return Err(MdmError::SecretMode {
-                path: path.clone(),
-                perms,
-            });
-        }
-        if owner.uid != 0 {
-            return Err(MdmError::SecretOwner {
-                path: path.clone(),
-                uid: owner.uid,
-            });
-        }
+        super::secret::check_mode(path, perms, owner)?;
         note(out, format_args!("secret {key}: kept ({path})"))?;
         return Ok(false);
     }
@@ -359,7 +348,7 @@ fn random_hex() -> Result<String, MdmError> {
 }
 
 /// Plan `text` at `path`; when it changes, print it. Whether it changes.
-fn place<E: Exec>(
+pub(crate) fn place<E: Exec>(
     planner: &mut Planner<'_, E>,
     path: &HostPath,
     owner: Option<Owner>,
@@ -380,7 +369,7 @@ fn place<E: Exec>(
 
 /// Plan `unit` enabled, and restarted when `again`, else started when not active;
 /// whether it is (re)started.
-fn service<E: Exec>(
+pub(crate) fn service<E: Exec>(
     exec: &E,
     planner: &mut Planner<'_, E>,
     unit: &str,
@@ -488,7 +477,7 @@ pub fn run_uninstall<E: Exec>(
     Ok(execute(&p, RunAs::Root, mode, exec, &mut out)?)
 }
 
-fn systemctl(args: &[&str]) -> Cmd {
+pub(crate) fn systemctl(args: &[&str]) -> Cmd {
     args.iter()
         .fold(Cmd::new(tool(SYSTEMCTL)), |cmd, arg| cmd.arg(*arg))
 }

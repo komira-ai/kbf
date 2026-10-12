@@ -1,19 +1,24 @@
 //! `xtask-fake`: what this crate's tests run in place of `cargo`, of a built
-//! `kbf-server` and of `gh`, so `build-commit stamps` is tested without building the
-//! server and `verify-assets attestations` without GitHub.
+//! `kbf-server`, of `gh` and of `sudo`, so `build-commit stamps` is tested without
+//! building the server, `verify-assets attestations` without GitHub and `sudo-test`
+//! without root.
 //!
-//! - Run under any name but `kbf-server` or `gh`, it is cargo: it appends its arguments
+//! - Run under any name but `kbf-server`, `gh` or `sudo`, it is cargo: it appends its arguments
 //!   as one line to `target/debug/cargo-args` in its working directory, "builds" by
 //!   hard-linking itself to `target/debug/kbf-server`, and writes the stamp that build
 //!   embeds to `target/debug/kbf-server.stamp`: `KBF_BUILD_COMMIT_OVERRIDE` when set,
 //!   else `XTASK_FAKE_HEAD`. An override that is not 12 lowercase hex digits fails the
-//!   build with the build script's message.
+//!   build with the build script's message. With `--no-run` it builds nothing: it
+//!   prints the file `cargo-messages` in its working directory, the JSON messages a
+//!   test wrote for it.
 //! - Run as `kbf-server`, it prints `kbf-server 0.1.0+<stamp>` from the stamp file next
 //!   to it.
 //! - Run as `gh attestation verify <file> <flags>`, it appends its arguments as one line
 //!   to `gh-args` next to it, and verifies the file when `attested` next to it holds
 //!   the line `<SHA-256 of the file> <flags>`: the store of attestations, each the file
 //!   it covers and the exact flags it verifies under.
+//! - Run as `sudo`, it appends `<working directory>: <arguments>` as one line to
+//!   `sudo-args` next to it, and exits 0 (the tests it was asked to run passed).
 //!
 //! `XTASK_FAKE_DEFECT` plants one defect of the real build: `ignores-override` (the
 //! build embeds the head whatever the override), `accepts-bad` (a malformed override
@@ -22,7 +27,8 @@
 //! fails), `vanish` (the build stamped `b2b2b2b2b2b2` deletes the fake cargo, so the
 //! next build cannot start) or `version-fails` (`kbf-server` exits 1). Of the
 //! attestation store: `accepts-all` (every file verifies, whatever the flags) or
-//! `ignores-bytes` (a file verifies when any attestation has its flags).
+//! `ignores-bytes` (a file verifies when any attestation has its flags). Of sudo:
+//! `tests-fail` (it exits 101, as a failed test binary does).
 use std::io::Write;
 use std::path::Path;
 use std::process::ExitCode;
@@ -56,6 +62,15 @@ fn cargo(argv0: &str, args: &[String]) -> ExitCode {
     if defect("build-fails") {
         eprintln!("xtask-fake: build failed");
         return ExitCode::from(101);
+    }
+    // `cargo test --no-run --message-format=json` (sudo-test): the messages the test
+    // wrote for it.
+    if args.iter().any(|a| a == "--no-run") {
+        print!(
+            "{}",
+            std::fs::read_to_string("cargo-messages").expect("cargo-messages")
+        );
+        return ExitCode::SUCCESS;
     }
     let head = std::env::var("XTASK_FAKE_HEAD").expect("XTASK_FAKE_HEAD");
     let lower_hex =
@@ -117,6 +132,21 @@ fn gh(argv0: &str, args: &[String]) -> ExitCode {
     ExitCode::FAILURE
 }
 
+fn sudo(argv0: &str, args: &[String]) -> ExitCode {
+    let dir = Path::new(argv0).parent().expect("the fake's directory");
+    let cwd = std::env::current_dir().expect("working directory");
+    let mut log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("sudo-args"))
+        .expect("sudo-args");
+    writeln!(log, "{}: {}", cwd.display(), args.join(" ")).expect("sudo-args");
+    if defect("tests-fail") {
+        return ExitCode::from(101);
+    }
+    ExitCode::SUCCESS
+}
+
 fn main() -> ExitCode {
     let mut args = std::env::args();
     let argv0 = args.next().expect("argv0");
@@ -125,6 +155,8 @@ fn main() -> ExitCode {
         server(&argv0)
     } else if argv0.ends_with("/gh") {
         gh(&argv0, &rest)
+    } else if argv0.ends_with("/sudo") {
+        sudo(&argv0, &rest)
     } else {
         cargo(&argv0, &rest)
     }

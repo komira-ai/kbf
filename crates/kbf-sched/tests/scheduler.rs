@@ -466,6 +466,48 @@ fn in_flight_dedup_joins_only_the_same_instance_and_digest() {
     assert_eq!(h.s.queued().collect::<Vec<_>>(), [OperationId(4)]);
 }
 
+/// Catches `Scheduler::twin` or `Scheduler::next_operation` naming another operation
+/// than the one a submission joins or gets (the invocation recorder files the call's
+/// lease events under it): a twin offered to networked or `do_not_cache` work, or to
+/// another instance; a finished operation offered as a twin; a next id off by one.
+#[test]
+fn twin_and_next_operation_name_the_operation_a_submission_gets() {
+    let mut h = Harness::new();
+    h.worker("a", 64_000, 64 * GIB);
+    fn expect(h: &mut Harness, waiter: u64, request: Request, joins: bool) {
+        let twin = h.s.twin(&request);
+        assert_eq!(twin.is_some(), joins, "waiter {waiter}: {twin:?}");
+        let operation = twin.unwrap_or_else(|| h.s.next_operation());
+        h.submit(waiter, request);
+        let waiters = h.s.waiters(operation).expect("the operation is held");
+        assert!(
+            waiters.contains(&WaiterId(waiter)),
+            "waiter {waiter} on {operation:?}"
+        );
+    }
+    expect(&mut h, 1, request(1), false);
+    expect(&mut h, 2, request(1), true);
+    let other = Request {
+        key: key("other", 1),
+        ..request(1)
+    };
+    expect(&mut h, 3, other, false);
+    let networked = Request {
+        hermetic: false,
+        ..request(1)
+    };
+    expect(&mut h, 4, networked, false);
+    let uncached = Request {
+        do_not_cache: true,
+        ..request(1)
+    };
+    expect(&mut h, 5, uncached, false);
+    let grants = h.tick();
+    h.commit_and_start(&grants[0]);
+    h.finish(&grants[0], ok(1));
+    expect(&mut h, 6, request(1), false);
+}
+
 /// Catches: a queue ordered by arrival or by the enum's declaration order instead of
 /// QoS urgency, an unstable order within a level, and a more urgent caller who joins a
 /// queued twin but stays behind less urgent work.

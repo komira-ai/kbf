@@ -162,6 +162,7 @@ fn start_with_prefix(prefix: &str) -> Server {
         finished_retention: kbf_sched::FINISHED_RETENTION,
         shutdown_timeout: Duration::from_secs(10),
         store_probe_timeout: PROBE_TIMEOUT,
+        invocation_memory: kbf_front::DEFAULT_INVOCATION_MEMORY,
     };
     start_on(prefix, listeners)
 }

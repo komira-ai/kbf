@@ -125,6 +125,47 @@ fn a_short_or_malformed_answer_is_an_error() {
     }
 }
 
+/// Catches a reply body read without a bound: a body of exactly [`REPLY_MAX`] bytes is
+/// kept, one byte more is refused, whether it runs to the end of the connection, has a
+/// `Content-Length` or comes in chunks.
+#[test]
+fn a_reply_body_longer_than_its_cap_is_refused_however_framed() {
+    let reply = |head: &str, body: &[u8]| {
+        let mut raw = format!("HTTP/1.1 400 Bad Request\r\n{head}\r\n").into_bytes();
+        raw.extend_from_slice(body);
+        // The body's length, not its bytes, so a failure prints a line, not a MiB.
+        read_reply(&url("https://h/x"), &raw[..])
+            .map(|(status, body)| (status, body.len(), body.iter().all(|b| *b == b'a')))
+            .map_err(|e| e.to_string())
+    };
+    let fits = vec![b'a'; REPLY_MAX];
+    let over = vec![b'a'; REPLY_MAX + 1];
+    assert_eq!(reply("", &fits), Ok((400, REPLY_MAX, true)));
+    let chunked = |b: &[u8]| {
+        let mut raw = format!("{:x}\r\n", b.len()).into_bytes();
+        raw.extend_from_slice(b);
+        raw.extend_from_slice(b"\r\n0\r\n\r\n");
+        raw
+    };
+    assert_eq!(
+        reply("Transfer-Encoding: chunked\r\n", &chunked(&fits)),
+        Ok((400, REPLY_MAX, true))
+    );
+    let too_long = format!("https://h/x: the answer's body is longer than {REPLY_MAX} bytes");
+    for (head, body) in [
+        (String::new(), over.clone()),
+        (format!("Content-Length: {}\r\n", over.len()), over.clone()),
+        ("Transfer-Encoding: chunked\r\n".to_owned(), chunked(&over)),
+    ] {
+        assert_eq!(reply(&head, &body), Err(too_long.clone()), "{head:?}");
+    }
+    let mut capped = Capped {
+        bytes: Vec::new(),
+        over: false,
+    };
+    assert!(capped.flush().is_ok());
+}
+
 /// Catches a client that trusts no roots without saying so, or one that cannot build
 /// from the host's store.
 #[test]
