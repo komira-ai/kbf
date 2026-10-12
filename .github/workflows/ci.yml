@@ -215,21 +215,13 @@ jobs:
           key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
       - run: cargo build -p kbf-objstore --example s3_conformance --locked
-      - name: Wait for both stores to accept connections
-        run: |
-          for port in 9000 9100; do
-            for _ in $(seq 60); do
-              curl -s -o /dev/null "http://127.0.0.1:$port/" && break
-              sleep 1
-            done
-          done
       - name: MinIO, plain bucket
-        run: cargo run -p kbf-objstore --example s3_conformance --locked -- --endpoint http://127.0.0.1:9000 --bucket kbf-conformance --create-bucket --conditional-put
+        run: cargo run -p kbf-objstore --example s3_conformance --locked -- --endpoint http://127.0.0.1:9000 --bucket kbf-conformance --create-bucket --conditional-put --wait-ready 60
       - name: MinIO, Object Lock bucket
         run: cargo run -p kbf-objstore --example s3_conformance --locked -- --endpoint http://127.0.0.1:9000 --bucket kbf-conformance-lock --create-bucket --conditional-put --object-lock
       - name: RustFS, plain bucket
         if: ${{ !cancelled() }}
-        run: cargo run -p kbf-objstore --example s3_conformance --locked -- --endpoint http://127.0.0.1:9100 --bucket kbf-conformance --create-bucket --conditional-put
+        run: cargo run -p kbf-objstore --example s3_conformance --locked -- --endpoint http://127.0.0.1:9100 --bucket kbf-conformance --create-bucket --conditional-put --wait-ready 60
       - name: RustFS, Object Lock bucket
         if: ${{ !cancelled() }}
         run: cargo run -p kbf-objstore --example s3_conformance --locked -- --endpoint http://127.0.0.1:9100 --bucket kbf-conformance-lock --create-bucket --conditional-put --object-lock
@@ -280,22 +272,13 @@ jobs:
       # writing them for kbf-front's async service methods (LLVM 23.1 in this nightly;
       # it looks like LLVM issue 220574). Lines and branches, all the ratchet reads, are
       # unaffected: their totals match llvm-cov's own text report.
+      - run: mkdir -p target/coverage
       - name: Run the workspace tests under coverage
         env:
           LLVM_COV_FLAGS: -skip-functions
-        run: |
-          mkdir -p target/coverage
-          cargo "+$COVERAGE_TOOLCHAIN" llvm-cov --workspace --locked --branch \
-            --lcov --output-path target/coverage/lcov.info
-      # `shell: bash` sets pipefail, so the ratchet's exit status survives the tee.
+        run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov --workspace --locked --branch --lcov --output-path target/coverage/lcov.info
       - name: Per-crate table and ratchet
-        shell: bash
-        run: |
-          cargo "+$COVERAGE_TOOLCHAIN" run -p kbf-coverage --locked -- \
-            --lcov target/coverage/lcov.info --root "$GITHUB_WORKSPACE" \
-            --baseline coverage-baseline \
-            --write-baseline target/coverage/coverage-baseline.measured \
-            | tee -a "$GITHUB_STEP_SUMMARY"
+        run: cargo "+$COVERAGE_TOOLCHAIN" run -p kbf-coverage --locked -- --lcov target/coverage/lcov.info --root "$GITHUB_WORKSPACE" --baseline coverage-baseline --write-baseline target/coverage/coverage-baseline.measured --summary-file "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: ${{ !cancelled() }}
         with:
@@ -367,7 +350,9 @@ jobs:
             target
           key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
-      - run: sw_vers && uname -m && sysctl -n machdep.cpu.brand_string hw.ncpu hw.memsize
+      - run: sw_vers
+      - run: uname -m
+      - run: sysctl -n machdep.cpu.brand_string hw.ncpu hw.memsize
       - run: cargo build -p kbf-node --bin kbf-daemon --locked
       - run: cargo test -p kbf-outputs -p kbf-driver-native -p kbf-node -p kbf-testkit --locked
       # The daemon's unit tests, which read its suspend-counting clock on macOS
@@ -415,7 +400,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - run: shellcheck --version && shellcheck -S warning -s sh tools/mac-provision/kbf-mac-provision tools/mac-provision/test/fakecmd tools/mac-provision/test/*.sh
+      - run: shellcheck --version
+      - run: shellcheck -S warning -s sh tools/mac-provision/kbf-mac-provision tools/mac-provision/test/fakecmd tools/mac-provision/test/*.sh
       - run: sh tools/mac-provision/test/run.sh
       - run: sh tools/mac-provision/test/coverage.sh
       - run: sh tools/mac-provision/test/mutants.sh
