@@ -381,7 +381,7 @@ async fn a_digest_larger_than_any_blob_is_404_at_once() {
             why.contains("larger than the largest blob"),
             "{size}: {why}"
         );
-        assert!(why.contains("1073741824 bytes"), "{size}: {why}");
+        assert!(why.contains("(10 bytes)"), "{size}: {why}");
     }
 }
 
@@ -446,4 +446,25 @@ async fn a_part_holds_the_whole_blobs_budget() {
         get_in_time(&state, &digests[0], None).await.status(),
         StatusCode::OK
     );
+}
+
+/// Catches (mutant "`<` for `<=`"): a blob of exactly the whole budget (the largest
+/// the cache accepts, in the route's budget) answered `404`. With a 10-byte budget a
+/// 10-byte blob is served; a digest of 11 bytes is `404` at once.
+#[tokio::test(start_paused = true)]
+async fn a_blob_of_exactly_the_budget_is_served_and_one_byte_more_is_404() {
+    let (state, digests) = budgeted(10, &[b"ten bytes!"]).await;
+    let whole = get_in_time(&state, &digests[0], None).await;
+    assert_eq!(whole.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(whole.into_body(), usize::MAX)
+        .await
+        .expect("a body");
+    assert_eq!(&body[..], b"ten bytes!");
+    let over = Digest::new(DigestFunction::Sha256, [9; 32], 11);
+    let asked = tokio::time::Instant::now();
+    assert_eq!(
+        get_in_time(&state, &over, None).await.status(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(asked.elapsed(), Duration::ZERO);
 }

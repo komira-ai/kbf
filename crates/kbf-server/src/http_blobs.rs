@@ -39,7 +39,7 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use kbf_auth::{Authenticator, Authorizer, Policy, authorize};
-use kbf_front::{Cache, MAX_BLOB_BYTES, MetaLog};
+use kbf_front::{Cache, MetaLog};
 use kbf_objstore::ObjectStore;
 use kbf_types::{Digest, DigestFunction};
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
@@ -51,7 +51,7 @@ use tonic::{Code, Status};
 pub const INLINE_MAX_BYTES: u64 = 4 * 1024 * 1024;
 
 /// The most blob bytes the route holds at once, over all the answers it is reading
-/// or sending: 1 GiB, [`MAX_BLOB_BYTES`], so the largest blob the cache accepts can
+/// or sending: 1 GiB, [`kbf_front::MAX_BLOB_BYTES`], so the largest blob the cache accepts can
 /// always be served when nothing else is.
 pub const READ_BUDGET_BYTES: usize = 1 << 30;
 
@@ -110,6 +110,8 @@ struct BlobState<M, O> {
     /// One permit per byte of [`READ_BUDGET_BYTES`]; an answer's bytes hold theirs
     /// until the last of them is dropped.
     budget: Arc<Semaphore>,
+    /// The whole budget in bytes: the largest blob a read is admitted for.
+    largest: u64,
 }
 
 impl<M, O> BlobState<M, O> {
@@ -120,6 +122,7 @@ impl<M, O> BlobState<M, O> {
             cache,
             readers,
             budget: Arc::new(Semaphore::new(budget)),
+            largest: u64::try_from(budget).unwrap_or(u64::MAX),
         }
     }
 }
@@ -199,7 +202,7 @@ where
         );
         return Err(error(StatusCode::BAD_REQUEST, &why));
     }
-    let permit = admit(Arc::clone(&state.budget), &digest).await?;
+    let permit = admit(Arc::clone(&state.budget), state.largest, &digest).await?;
     let bytes = state
         .cache
         .read_blob(&digest)
@@ -217,17 +220,26 @@ where
 /// passed by smaller ones behind it).
 ///
 /// # Errors
-/// `404` for a digest larger than [`MAX_BLOB_BYTES`], which the cache never holds;
+/// `404` for a digest larger than the whole budget, `largest` bytes: the route's is
+/// [`kbf_front::MAX_BLOB_BYTES`], so the cache never holds such a blob;
 /// `503` with `Retry-After` and `"busy": true` when the share is not free within
 /// [`READ_BUDGET_WAIT`].
-async fn admit(budget: Arc<Semaphore>, digest: &Digest) -> Result<OwnedSemaphorePermit, Response> {
+async fn admit(
+    budget: Arc<Semaphore>,
+    largest: u64,
+    digest: &Digest,
+) -> Result<OwnedSemaphorePermit, Response> {
     let Some(permits) = u32::try_from(digest.size_bytes)
         .ok()
-        .filter(|&n| u64::from(n) <= MAX_BLOB_BYTES)
+        .filter(|&n| u64::from(n) <= largest)
     else {
+        // INVARIANT: the cache holds no blob over MAX_BLOB_BYTES (the route's
+        // `largest`). `Cache::store_blobs`, the one way bytes are stored, refuses one;
+        // ByteStream Write refuses it before buffering and batches are capped at
+        // MAX_BATCH_TOTAL_BYTES. So this 404 is the answer a read would give.
         let why = format!(
             "{digest} is larger than the largest blob this cache accepts \
-             ({MAX_BLOB_BYTES} bytes), so it is not held"
+             ({largest} bytes), so it is not held"
         );
         return Err(error(StatusCode::NOT_FOUND, &why));
     };
