@@ -90,6 +90,11 @@ only on GitHub-hosted runners: formatting, clippy, the repository lints,
 `cargo deny`, and the workspace tests on x86-64 and arm64. A pull request is
 merged only when CI is green on its head commit.
 
+A tool a job needs from outside the workspace (cargo-deny, cargo-llvm-cov,
+cargo-cyclonedx, Bazel, buck2) is pinned in the workflow by URL and SHA-256 and
+installed by `cargo xtask fetch`, which refuses a download whose SHA-256 differs
+before it unpacks or writes anything.
+
 The target is 100% line and branch coverage for every crate, so a pull
 request fully covers the code it adds or changes. The `coverage` job measures
 line and branch coverage per crate and checks it against

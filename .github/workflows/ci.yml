@@ -116,14 +116,8 @@ jobs:
           persist-credentials: false
       - run: rustup toolchain install
       - name: Install cargo-deny (pinned version and checksum)
-        run: |
-          archive="$RUNNER_TEMP/cargo-deny.tar.gz"
-          curl --proto '=https' --tlsv1.2 -fsSL -o "$archive" \
-            "https://github.com/EmbarkStudios/cargo-deny/releases/download/$DENY_VERSION/cargo-deny-$DENY_VERSION-x86_64-unknown-linux-musl.tar.gz"
-          echo "$DENY_SHA256  $archive" | sha256sum --check --strict
-          tar -xzf "$archive" -C "$HOME/.cargo/bin" --strip-components=1 \
-            "cargo-deny-$DENY_VERSION-x86_64-unknown-linux-musl/cargo-deny"
-          cargo deny --version
+        run: cargo xtask fetch --url "https://github.com/EmbarkStudios/cargo-deny/releases/download/$DENY_VERSION/cargo-deny-$DENY_VERSION-x86_64-unknown-linux-musl.tar.gz" --sha256 "$DENY_SHA256" --out "$HOME/.cargo/bin/cargo-deny" --extract tar.gz --member "cargo-deny-$DENY_VERSION-x86_64-unknown-linux-musl/cargo-deny"
+      - run: cargo deny --version
       # The arguments cargo-deny-action passed by default.
       - run: cargo deny --log-level warn --manifest-path ./Cargo.toml --all-features check
 
@@ -259,14 +253,10 @@ jobs:
         with:
           persist-credentials: false
       - run: rustup toolchain install "$COVERAGE_TOOLCHAIN" --profile minimal --component llvm-tools-preview
+      # xtask builds with the coverage nightly, the one toolchain this job installs.
       - name: Install cargo-llvm-cov (pinned version and checksum)
-        run: |
-          archive="$RUNNER_TEMP/cargo-llvm-cov.tar.gz"
-          curl --proto '=https' --tlsv1.2 -fsSL -o "$archive" \
-            "https://github.com/taiki-e/cargo-llvm-cov/releases/download/v$LLVM_COV_VERSION/cargo-llvm-cov-x86_64-unknown-linux-gnu.tar.gz"
-          echo "$LLVM_COV_SHA256  $archive" | sha256sum --check --strict
-          tar -xzf "$archive" -C "$HOME/.cargo/bin" cargo-llvm-cov
-          cargo "+$COVERAGE_TOOLCHAIN" llvm-cov --version
+        run: cargo "+$COVERAGE_TOOLCHAIN" xtask fetch --url "https://github.com/taiki-e/cargo-llvm-cov/releases/download/v$LLVM_COV_VERSION/cargo-llvm-cov-x86_64-unknown-linux-gnu.tar.gz" --sha256 "$LLVM_COV_SHA256" --out "$HOME/.cargo/bin/cargo-llvm-cov" --extract tar.gz --member cargo-llvm-cov
+      - run: cargo "+$COVERAGE_TOOLCHAIN" llvm-cov --version
       - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         id: cargo-cache
         with:
@@ -490,14 +480,7 @@ jobs:
       # action runs is linked statically (run.sh refuses a dynamic one).
       - run: cargo rustc -p kbf-it --bin kbf-m2-act --locked -- -C target-feature=+crt-static
       - name: Fetch buck2 (pinned version, checked by SHA-256)
-        run: |
-          tools="$RUNNER_TEMP/tools"
-          mkdir -p "$tools"
-          curl --proto '=https' --tlsv1.2 -fsSL -o "$tools/buck2.zst" \
-            "https://github.com/facebook/buck2/releases/download/$BUCK2_VERSION/buck2-x86_64-unknown-linux-gnu.zst"
-          echo "$BUCK2_SHA256  $tools/buck2.zst" | sha256sum --check --strict
-          zstd -q -d "$tools/buck2.zst" -o "$tools/buck2"
-          chmod +x "$tools/buck2"
+        run: cargo xtask fetch --url "https://github.com/facebook/buck2/releases/download/$BUCK2_VERSION/buck2-x86_64-unknown-linux-gnu.zst" --sha256 "$BUCK2_SHA256" --out "$RUNNER_TEMP/tools/buck2" --extract zst
       - run: bash tools/ci/m2-container.sh "$RUNNER_TEMP/tools/buck2" "$RUNNER_TEMP/m2"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: ${{ !cancelled() }}
