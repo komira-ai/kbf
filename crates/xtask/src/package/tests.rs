@@ -208,8 +208,8 @@ fn the_system_tar_extracts_exactly_the_binary() {
     assert_eq!(std::fs::read(&file).expect("extracted"), BINARY);
     let mode = std::fs::metadata(&file).expect("stat").permissions().mode();
     assert_eq!(mode & 0o111, 0o111, "{mode:o}");
-    // cargo-llvm-cov takes every executable file under target/ for an object to read
-    // coverage from, and fails on this one.
+    // Left here, this executable `kbf-daemon` under target/ is passed to `llvm-cov
+    // export` as an object by cargo-llvm-cov, and the coverage report fails on it.
     std::fs::remove_file(&file).expect("remove the extracted copy");
 }
 
