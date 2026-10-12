@@ -1260,6 +1260,7 @@ dependencies = [
  "hex",
  "httparse",
  "kbf-host",
+ "kbf-mdm",
  "kbf-types",
  "plist",
  "rcgen",
@@ -1269,6 +1270,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.0",
+ "ssh-key",
  "tar",
  "thiserror",
  "x509-parser",
@@ -1301,9 +1303,7 @@ dependencies = [
 name = "kbf-driver-native"
 version = "0.1.0"
 dependencies = [
- "clap",
  "futures",
- "hex",
  "kbf-daemon",
  "kbf-mac-session",
  "kbf-outputs",
@@ -1314,7 +1314,7 @@ dependencies = [
  "prost",
  "prost-types",
  "rustix",
- "sha2 0.11.0",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",

@@ -23,6 +23,8 @@
 //! kbf-deploy mdm dep define-profile --config FILE [--apply]
 //! kbf-deploy mdm dep assign --config FILE --serial SERIAL... [--apply]
 //! kbf-deploy mdm verify --config FILE [--via ADDR:PORT]
+//! kbf-deploy mdm erase-request --serial SERIAL --reason TEXT [--lease ID] --key KEY
+//!                           --out FILE [--valid-for MINUTES] [--ssh-keygen PATH] [--apply]
 //! kbf-deploy envoy render --config FILE --out DIR
 //! kbf-deploy envoy check --config FILE [--dir DIR]
 //! kbf-deploy envoy apply --config FILE --kubectl PATH --kubeconfig PATH
@@ -77,6 +79,7 @@ use crate::envoy;
 use crate::https::Client;
 use crate::linux::{self, HostError, LinuxConfig, images, install, swap};
 use crate::mdm::dep::{Dep, Serial};
+use crate::mdm::erase::{self, EraseArgs, Made};
 use crate::mdm::fetch::Fetch;
 use crate::mdm::install::Install;
 use crate::mdm::profile::Topic;
@@ -325,6 +328,34 @@ enum Mdm {
         /// still prove MDM_DNS_NAME.
         #[arg(long)]
         via: Option<SocketAddr>,
+    },
+    /// Write an erase request for one Mac and sign it with your security key, on your
+    /// own machine (as yourself, not root); check it as the gate will.
+    EraseRequest {
+        /// The Mac's serial number.
+        #[arg(long)]
+        serial: String,
+        /// Why, in plain words (the gate's alerts quote it).
+        #[arg(long)]
+        reason: String,
+        /// Hold the erase for this privileged lease instead of erasing now.
+        #[arg(long)]
+        lease: Option<String>,
+        /// The security key's key file (`ssh-keygen -f`), with KEY.pub beside it.
+        #[arg(long, value_parser = HostPath::new)]
+        key: HostPath,
+        /// Where the request goes; the signature goes to FILE.sig. Neither may exist.
+        #[arg(long, value_parser = HostPath::new)]
+        out: HostPath,
+        /// Minutes from now the gate may accept the request (1 to 60).
+        #[arg(long, default_value_t = 15)]
+        valid_for: u32,
+        /// The ssh-keygen to sign with (one with security key support).
+        #[arg(long, value_parser = HostPath::new, default_value = erase::SSH_KEYGEN)]
+        ssh_keygen: HostPath,
+        /// Sign: write the request and its signature.
+        #[arg(long)]
+        apply: bool,
     },
 }
 
@@ -689,6 +720,30 @@ fn mdm_kit<E: Exec>(m: Mdm, exec: &mut E, out: &mut dyn Write, err: &mut dyn Wri
                     mdm::verify::run(&*exec, &v, out)
                 })
         }
+        Mdm::EraseRequest {
+            serial,
+            reason,
+            lease,
+            key,
+            out: file,
+            valid_for,
+            ssh_keygen,
+            apply,
+        } => erase::random_nonce()
+            .and_then(|nonce| {
+                let a = EraseArgs {
+                    serial,
+                    lease,
+                    reason,
+                    key,
+                    out: file,
+                    valid_for,
+                    ssh_keygen,
+                };
+                let now = i64::try_from(stamp_secs()).unwrap_or(i64::MAX);
+                erase::run(exec, &a, Made { now, nonce }, mode(apply), out)
+            })
+            .map(|()| true),
     };
     match done {
         Ok(passed) => ExitCode::from(u8::from(!passed)),
@@ -812,10 +867,14 @@ fn host_verb(done: Result<(), HostError>, err: &mut dyn Write) -> ExitCode {
 /// The directory name `install-units --uninstall` moves the files into: seconds since
 /// the Unix epoch.
 pub(crate) fn stamp() -> String {
+    stamp_secs().to_string()
+}
+
+/// Seconds since the epoch, now.
+fn stamp_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())
-        .to_string()
 }
 
 fn mode(apply: bool) -> Mode {

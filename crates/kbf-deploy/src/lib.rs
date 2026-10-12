@@ -24,7 +24,8 @@
 //!   image-pull`) and the swapfile (`linux swap`).
 //! - [`mdm`]: an Apple MDM on one Linux host: its pinned upstream archives fetched
 //!   (`mdm fetch`), its services installed as root (`mdm install`), and read-only
-//!   checks of what runs (`mdm verify`).
+//!   checks of what runs (`mdm verify`); and, on an operator's own machine, an erase
+//!   request for one Mac signed with their security key (`mdm erase-request`).
 //! - [`envoy`]: a client front's Kubernetes objects and Envoy config, rendered from
 //!   the settings (`envoy render`), byte for byte the same for the same settings, and
 //!   a render checked for what the REAPI path through the front depends on

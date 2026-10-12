@@ -13,9 +13,10 @@ publish.workspace = true
 # (render-units, check-units, and as root install-units, image-pull and swap), `mdm`
 # (fetch the pinned upstream archives; as root install the MDM services, the TLS
 # certificate, the push certificate and the enrollment profile, and link NanoDEP to
-# Apple Business Manager; verify them), `envoy` (render, check a render, and apply it
-# to a cluster through kubectl) and `pilot` (server-install, a kbf-server as a systemd
-# user service, and buckconfig, a worktree's buck2 overlay).
+# Apple Business Manager; verify them; sign an operator's erase request), `envoy`
+# (render, check a render, and apply it to a cluster through kubectl) and `pilot`
+# (server-install, a kbf-server as a systemd user service, and buckconfig, a
+# worktree's buck2 overlay).
 # rustls (ring), httparse and rustls-native-certs make the HTTPS client of `mdm fetch`,
 # `mdm verify` and `mdm tls --check-godaddy`; rustls loads the push certificate's key
 # to match it to the certificate, and checks `pilot server-install`'s server
@@ -23,6 +24,8 @@ publish.workspace = true
 # rendered Envoy config into the pod template; zip, tar and flate2 unpack the archives;
 # x509-parser reads the certificates `mdm` checks; plist writes the enrollment profile;
 # base64 encodes the Basic auth of the MDM services' APIs.
+# `mdm erase-request` writes and checks the request with kbf-mdm's own parser and
+# signature check, and reads the security key's public half with ssh-key.
 
 [[bin]]
 name = "kbf-deploy"
@@ -35,6 +38,7 @@ flate2.workspace = true
 hex.workspace = true
 httparse.workspace = true
 kbf-host.workspace = true
+kbf-mdm.workspace = true
 kbf-types.workspace = true
 plist.workspace = true
 rustls.workspace = true
@@ -42,6 +46,7 @@ rustls-native-certs.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+ssh-key.workspace = true
 tar.workspace = true
 thiserror.workspace = true
 x509-parser.workspace = true
@@ -49,6 +54,8 @@ zip.workspace = true
 
 [dev-dependencies]
 kbf-host = { workspace = true, features = ["testkit"] }
+# Security-key signatures made in software, for `mdm erase-request`'s tests.
+kbf-mdm = { workspace = true, features = ["testkit"] }
 # The certificates of the HTTPS servers the `mdm` tests run.
 rcgen.workspace = true
 rustix = { workspace = true, features = ["process"] }
