@@ -11,15 +11,20 @@
 //!   ([`render`]), and the services started.
 //! - `kbf-deploy mdm verify --config FILE` ([`verify`]): read-only checks of the
 //!   running MDM, one `ok` or `FAIL` line each.
+//! - `kbf-deploy mdm erase-request --serial SERIAL --reason TEXT [--lease ID] --key KEY
+//!   --out FILE [--apply]` ([`erase`]): on the operator's own machine, as the
+//!   operator, an erase request for one Mac in the gate's `kbf-erase-v1` text, signed
+//!   with their security key by `ssh-keygen -Y sign` and checked as the gate checks it.
 //!
-//! `fetch` and `install` check first and print their plan by default; `--apply`
-//! carries it out. They exit 0 done (or nothing to do), 1 a step failed, 2 refused
-//! (`REFUSED: ...` on stderr). `verify` exits 0 when every check passes, 1 when one
-//! fails, 2 refused. The settings are a closed set of `KEY=VALUE` lines
+//! `fetch`, `install` and `erase-request` check first and print their plan by
+//! default; `--apply` carries it out. They exit 0 done (or nothing to do), 1 a step
+//! failed (or the signed request does not check), 2 refused (`REFUSED: ...` on
+//! stderr). `verify` exits 0 when every check passes, 1 when one fails, 2 refused. The settings are a closed set of `KEY=VALUE` lines
 //! ([`config::KEYS`], `templates/mdm/config.example`).
 
 pub mod archive;
 pub mod config;
+pub mod erase;
 pub mod fetch;
 pub mod install;
 pub mod pins;
@@ -64,6 +69,8 @@ pub enum MdmError {
     Path(#[from] PathError),
     #[error(transparent)]
     User(#[from] UserError),
+    #[error(transparent)]
+    Erase(#[from] erase::EraseError),
     #[error("cannot write the plan out: {0}")]
     Write(io::Error),
 
@@ -139,7 +146,8 @@ impl MdmError {
             | MdmError::Https(_)
             | MdmError::Io { .. }
             | MdmError::Status { .. }
-            | MdmError::Rejected { .. } => 1,
+            | MdmError::Rejected { .. }
+            | MdmError::Erase(erase::EraseError::Check { .. }) => 1,
             _ => 2,
         }
     }

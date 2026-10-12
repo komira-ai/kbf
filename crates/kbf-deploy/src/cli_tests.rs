@@ -669,3 +669,86 @@ fn envoy_check_exits_0_passed_1_failed_2_refused() {
     assert_eq!((code, out.as_str()), (ExitCode::from(2), ""), "{err}");
     assert!(err.ends_with(": unknown key KBF_SERVER\n"), "{err}");
 }
+
+/// Catches `mdm erase-request` not wired to the kit (or to the clock and the random
+/// nonce), a pair that does not check exiting other than 1, and a refusal other than
+/// 2. In-process, so the lib tests' instantiation of `run` covers the arm.
+#[test]
+fn mdm_erase_request_signs_and_its_refusals_exit_2() {
+    use kbf_host::exec::Entry;
+    use kbf_mdm::signers::{FLAG_USER_PRESENT, NAMESPACE};
+    use kbf_mdm::testkit::SkKey;
+
+    let key = SkKey::new(9);
+    let mut exec = FakeExec::new(501);
+    let public = HostPath::new("/srv/op/id_erase_sk.pub").expect("path");
+    let bytes = format!("{}\n", key.openssh()).into_bytes();
+    exec.entries.insert(
+        public,
+        Entry::File {
+            perms: kbf_host::step::Perms::new(0o644),
+            owner: kbf_host::testkit::RUNNER,
+            bytes,
+        },
+    );
+    let flags = Rc::new(RefCell::new(FLAG_USER_PRESENT));
+    let seen = Rc::clone(&flags);
+    exec.answer = Box::new(move |cmd| {
+        let sig = key.sign_with(NAMESPACE, &cmd.stdin, *seen.borrow());
+        Ok(reply(0, &sig, ""))
+    });
+    let base = [
+        "mdm",
+        "erase-request",
+        "--serial",
+        "C02ABC123XYZ",
+        "--reason",
+        "leak after reboot",
+        "--key",
+        "/srv/op/id_erase_sk",
+    ];
+    let with = |out: &str, extra: &[&'static str]| -> Vec<String> {
+        let mut v: Vec<String> = base.iter().map(|s| (*s).to_owned()).collect();
+        v.extend(["--out".to_owned(), out.to_owned()]);
+        v.extend(extra.iter().map(|s| (*s).to_owned()));
+        v
+    };
+    let call = |exec: &mut FakeExec, v: &[String]| {
+        let v: Vec<&str> = v.iter().map(String::as_str).collect();
+        cli(exec, &no_env, &v)
+    };
+
+    let (code, out, err) = call(&mut exec, &with("/srv/op/a.req", &["--apply"]));
+    assert_eq!(code, ExitCode::SUCCESS, "{err}");
+    assert!(
+        out.starts_with("erase request for C02ABC123XYZ, acceptable until "),
+        "{out}"
+    );
+    assert!(out.contains("    purpose erase-now\n"), "{out}");
+    assert!(
+        out.contains("+ run /usr/bin/ssh-keygen -Y sign -n kbf-mdm-erase"),
+        "{out}"
+    );
+    assert!(
+        out.contains("send /srv/op/a.req and /srv/op/a.req.sig"),
+        "{out}"
+    );
+
+    *flags.borrow_mut() = 0;
+    let (code, _, err) = call(&mut exec, &with("/srv/op/b.req", &["--apply"]));
+    assert_eq!(code, ExitCode::FAILURE, "{err}");
+    assert!(
+        err.starts_with(
+            "kbf-deploy: /srv/op/b.req and /srv/op/b.req.sig would be refused by the gate"
+        ),
+        "{err}"
+    );
+
+    let (code, out, err) = call(&mut exec, &with("/srv/op/c.req", &["--valid-for", "61"]));
+    assert_eq!((code, out.as_str()), (ExitCode::from(2), ""), "{err}");
+    assert!(err.starts_with("REFUSED: --valid-for 61"), "{err}");
+
+    let (code, _, err) = call(&mut exec, &with("c.req", &[]));
+    assert_eq!(code, ExitCode::from(2), "{err}");
+    assert!(err.contains("is not absolute"), "{err}");
+}

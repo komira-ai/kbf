@@ -139,7 +139,8 @@ pub fn parse(text: &str) -> Result<EraseRequest, RequestError> {
     })
 }
 
-/// Writes a request's text (what `kbf-admin erase` signs); the inverse of [`parse`].
+/// Writes a request's text (what `kbf-deploy mdm erase-request` signs); the inverse of
+/// [`parse`].
 pub fn render(request: &EraseRequest) -> String {
     let purpose = match &request.purpose {
         Purpose::EraseNow => "erase-now".to_owned(),
