@@ -178,8 +178,8 @@ fn at_the_bound_with_only_open_records_the_largest_stops_taking_rows() {
 }
 
 /// Catches a collision key reused after the owner's record is evicted (plant the old
-/// rule `n = keys held + 1`): the third caller would get `x~2`, the key of a record
-/// still held, and overwrite it.
+/// rule `n = keys held + 1`): the fourth caller, routed once `x` is gone, would get
+/// `x~3`, the key of a record still held, and overwrite it.
 #[test]
 fn a_collision_after_the_owner_is_evicted_gets_a_new_key() {
     let mut second = call(
@@ -204,6 +204,15 @@ fn a_collision_after_the_owner_is_evicted_gets_a_new_key() {
         .get(&RecordKey::collision(id("x"), 2))
         .expect("x~2 is still held");
     assert_eq!(x2.owner(), &owner("o2"), "x~2 is not overwritten");
+    // Two records of `x` are held now; the next caller's key is still a new one.
+    let mut fourth = call("x", t(700), CallKind::Downloaded(1));
+    fourth.owner = owner("o4");
+    r.apply(ev(fourth));
+    assert_eq!(held(&r), ["x~2", "x~3", "x~4"]);
+    let x3 = r
+        .get(&RecordKey::collision(id("x"), 3))
+        .expect("x~3 is still held");
+    assert_eq!(x3.owner(), &owner("o3"), "x~3 is not overwritten");
 }
 
 /// Catches an evicted record left among an operation's waiters: a lease event of
