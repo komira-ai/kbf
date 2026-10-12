@@ -389,9 +389,9 @@ mod tests {
 
     #[test]
     fn home_path_names_keep_underscores_and_hyphens() {
-        // Catches: a name-character test that drops `_` or `-`. Dropping them cuts the
-        // reported path short (`/home/a`), and a prefix after a hyphen (a shell
-        // default, `${X:-/Users/...}`, part of a longer word) would be reported too.
+        // Catches: a name-character test that drops `_` or `-`. Dropping either cuts the
+        // reported name short at that character, and reports a prefix that follows it
+        // (part of a longer word, or a shell default after `:-`).
         let name = format!("/{}/a_b-c/x", "home");
         let after_hyphen = format!("x-/{}/shared", "Users");
         let after_underscore = format!("x_/{}/shared", "Users");
