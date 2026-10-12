@@ -279,6 +279,59 @@ fn builds_of_unique_actions_stay_within_a_quarter_of_the_bound() {
     }
 }
 
+/// A rolling window of operations: 20 builds queue 20,000 actions in turn, each
+/// joined by 3 minted twins and granted, and the operation 500 behind it finishes.
+/// Made one by one, so that each is freed as it is applied.
+fn rolling() -> impl Iterator<Item = Event> {
+    (0..20_000u64).flat_map(|k| {
+        (0..6).filter_map(move |step| match step {
+            0 => {
+                let inv = format!("b{}", k % 20);
+                Some(ev(call(
+                    &inv,
+                    t(0),
+                    CallKind::Execute {
+                        action: action(k),
+                        answer: ExecuteAnswer::Queued {
+                            name: name(&inv, k),
+                            operation: OperationId(k),
+                        },
+                    },
+                )))
+            }
+            1..=3 => {
+                let twin = format!("tw{}-{step}", k % 40);
+                let mut c = call(
+                    &twin,
+                    t(2),
+                    CallKind::Execute {
+                        action: action(k),
+                        answer: ExecuteAnswer::Joined {
+                            name: name(&twin, k),
+                            operation: OperationId(k),
+                        },
+                    },
+                );
+                c.minted = true;
+                Some(ev(c))
+            }
+            4 => Some(granted(k, k + 1, "node-a", t(1))),
+            _ => (k >= 500).then(|| finished_ok(k - 500, k - 499, 1, 0, t(3))),
+        })
+    })
+}
+
+/// Catches memory that operations leave behind as they come and go: waiting calls
+/// joined, minted twins evicted, operations finished. Measured: 1.08 times a 200 kB
+/// bound, the most of any mix, and 1.12 times a 50 kB one (where the uncounted first
+/// nodes are about 5% of it).
+#[test]
+fn a_rolling_window_of_operations_stays_within_a_quarter_of_the_bound() {
+    for bound in [50_000, 200_000, 2_000_000] {
+        within(bound, rolling());
+    }
+}
+
 /// The real memory and the counted bytes of records with no bound after `events`.
 fn held(events: &[Event]) -> (usize, usize) {
     let base = live();

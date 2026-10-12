@@ -288,14 +288,16 @@ and its waiting calls), as the bytes the allocator is asked for: the types' size
 the row lists' capacity, every copy of an id, and B-tree nodes estimated from the
 standard library's node layout; every other list is allocated to its length. Not
 counted: the first node of each index (about 2 kB together), the allocator's own
-overhead, and
-the dropped calls of invocations not made yet, held to a sixteenth of the bound
-besides it (and to 1,024; past either the oldest is forgotten). A counting allocator
-in the tests measures the records' heap against the bound after every event, across
-30 to 300 open builds with twins, requeues, 5 KB failure texts and 1,001-output
-listings; 10 to 100 builds of 500 to 3,000 actions that each wait alone; header-only
-invocations; and cache hits, at bounds from 200 kB to 20 MB. The highest it measured
-is 1.07 times the bound (300 open builds with twins, at 200 kB); the tests fail past
+overhead, and the dropped calls of invocations not made yet, held to a sixteenth of
+the bound besides it (and to 1,024; past either the oldest is forgotten). A counting
+allocator in the tests measures the records' heap against the bound after every
+event, across 30 to 300 open builds with twins, requeues, 5 KB failure texts and
+1,001-output listings; 10 to 100 builds of 500 to 3,000 actions that each wait
+alone; a rolling window of 20,000 operations, each joined by minted twins and
+finished 500 later; header-only invocations; and cache hits, at bounds from 200 kB
+to 20 MB, and 50 kB for the rolling window. The highest it measured is 1.08 times
+the bound at 200 kB and above (the rolling window, at 200 kB) and 1.12 at 50 kB,
+where the uncounted first nodes are about 5% of the bound; the tests fail past
 1.25.
 
 In stage 2 a flushed row is in a chunk and leaves memory, so the bound covers only

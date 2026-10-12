@@ -165,7 +165,8 @@ pub struct Args {
     /// (`docs/design/invocations.md`, section 3.5). At the bound, records of a minted id
     /// go first, then idle ones, least recently seen first; with only open builds left,
     /// the largest stops taking rows. Records are kept in memory only and lost on
-    /// restart. Their heap was measured at up to 1.07 times this (section 3.5).
+    /// restart. Their heap was measured at up to 1.08 times this at 200 kB and above,
+    /// and 1.12 at 50 kB (section 3.5).
     #[arg(
         long,
         default_value_t = kbf_front::DEFAULT_INVOCATION_MEMORY as u64,

@@ -60,12 +60,11 @@ const HELD: &str = "every key Records hands out names a record it holds";
 /// estimated from the standard library's layout (`btree_bytes`); every other list
 /// is allocated to its length. Not counted: the first node of each index (about
 /// 2 kB together), the allocator's own overhead per allocation, and the dropped
-/// calls of records not
-/// made yet, which are held to a sixteenth of the bound besides it (at most
-/// `UNBORN_CAP`, 1,024; past either the oldest is forgotten, and one that does not
-/// fit alone is not kept). Measured with a counting allocator (`tests/heap.rs`),
-/// the records' heap reached at most 1.07 times the bound in its mixes; the tests
-/// fail past 1.25.
+/// calls of records not made yet, which are held to a sixteenth of the bound
+/// besides it (at most `UNBORN_CAP`, 1,024; past either the oldest is forgotten,
+/// and one that does not fit alone is not kept). Measured with a counting
+/// allocator (`tests/heap.rs`), the records' heap reached at most 1.08 times the
+/// bound at 200 kB and above, and 1.12 at 50 kB; the tests fail past 1.25.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Records {
     row_cap: usize,
