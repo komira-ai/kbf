@@ -51,6 +51,9 @@ enum Cmd {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     if let Err(e) = session::refuse_root_here() {
+        if let Cmd::Serve { unix_socket, .. } = &cli.command {
+            let _bound = UnixListener::bind(unix_socket);
+        }
         eprintln!("{e}");
         return ExitCode::from(2);
     }
