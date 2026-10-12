@@ -231,6 +231,54 @@ fn the_records_heap_stays_within_a_quarter_of_the_bound() {
     }
 }
 
+/// The action digest numbered `n`, for builds of more than 256 actions.
+fn action(n: u64) -> kbf_types::Digest {
+    let mut hash = [0; 32];
+    hash[..8].copy_from_slice(&n.to_le_bytes());
+    kbf_types::Digest::new(kbf_types::DigestFunction::Sha256, hash, n)
+}
+
+/// `builds` open builds of `actions` actions each, every action its own operation
+/// (one waiting call each), queued and, with `leases`, granted and started.
+fn unique(builds: u64, actions: u64, leases: bool) -> impl Iterator<Item = Event> {
+    (0..builds).flat_map(move |b| {
+        let inv = format!("build-{b:03}");
+        (0..actions).flat_map(move |a| {
+            let op = b * 10_000 + a;
+            let queued = ev(call(
+                &inv,
+                t(10),
+                CallKind::Execute {
+                    action: action(op),
+                    answer: ExecuteAnswer::Queued {
+                        name: name(&inv, op),
+                        operation: OperationId(op),
+                    },
+                },
+            ));
+            let leased = leases.then(|| [granted(op, op, "node-a", t(11)), started(op, op, t(11))]);
+            std::iter::once(queued).chain(leased.into_iter().flatten())
+        })
+    })
+}
+
+/// Catches an operation's list of waiting calls allocated past its length (plant:
+/// no `reserve_exact` before the waiter's push in `Records::execute`; a list made by
+/// `push` has room for 4, so a build whose actions each wait alone held 1.397 times
+/// a 200 kB bound): builds of 500 to 3,000 unique actions, queued, granted and
+/// started, and builds that only queue.
+#[test]
+fn builds_of_unique_actions_stay_within_a_quarter_of_the_bound() {
+    for (builds, actions, leases, bound) in [
+        (10, 3000, true, 200_000),
+        (100, 500, true, 200_000),
+        (30, 3000, false, 2_000_000),
+        (100, 500, false, 20_000_000),
+    ] {
+        within(bound, unique(builds, actions, leases));
+    }
+}
+
 /// The real memory and the counted bytes of records with no bound after `events`.
 fn held(events: &[Event]) -> (usize, usize) {
     let base = live();
@@ -444,4 +492,94 @@ fn evicted_twins_leave_nothing_in_their_operation() {
     let (hundred, hundred_counted) = after_twins_evicted(100);
     assert_eq!(hundred_counted, one_counted);
     assert_eq!(hundred, one, "real memory after 100 twins and after one");
+}
+
+/// The real memory each of `n` more events adds after `first`, applied in turn.
+fn steps(first: &[Event], more: impl Fn(usize) -> Event, n: usize) -> Vec<usize> {
+    let mut events = first.to_vec();
+    (0..n)
+        .map(|i| {
+            let before = events.clone();
+            events.push(more(i));
+            grows(&before, &events).0
+        })
+        .collect()
+}
+
+/// Catches an id's list of keys, its owner's list of collisions or an operation's
+/// list of waiting calls grown by `push` (plant: no `reserve_exact` before any one of
+/// them): a list made by `push` has room for 4 and doubles, so the memory the k-th
+/// caller adds jumps at the first and the fifth. Allocated to their length, each
+/// caller adds the same: a record of its own (every index still one node) and one
+/// slot in each list.
+#[test]
+fn each_caller_of_an_id_adds_the_same_memory() {
+    let collision = |i: usize| {
+        let mut c = call("x", t(0), CallKind::Downloaded(1));
+        c.owner = owner(&format!("o{i}"));
+        ev(c)
+    };
+    let collisions = steps(
+        &[ev(call("x", t(0), CallKind::Downloaded(1)))],
+        collision,
+        8,
+    );
+    assert!(
+        collisions.windows(2).all(|w| w[0] == w[1]),
+        "each collision adds {collisions:?}"
+    );
+    let twin = |i: usize| joined(&format!("j{i}"), t(0), 10, 1);
+    let twins = steps(&[queued("a", t(0), 10, 1)], twin, 8);
+    assert!(
+        twins.windows(2).all(|w| w[0] == w[1]),
+        "each twin adds {twins:?}"
+    );
+}
+
+/// The records after `n` minted callers of `x` other than its owner, then a client's
+/// record that needs all their room took it: their real memory and counted bytes.
+fn after_collisions_evicted(n: usize) -> (usize, usize) {
+    let collision = |i: usize| {
+        let mut c = call("x", t(0), CallKind::Downloaded(1));
+        // Larger than `wide_hit`'s step, so that `c` leaves no room for one.
+        c.owner = owner(&format!("o{i:03}{}", "p".repeat(2000)));
+        c.minted = true;
+        ev(c)
+    };
+    let x = ev(call("x", t(0), CallKind::Downloaded(1)));
+    let hundred: Vec<Event> = std::iter::once(x.clone())
+        .chain((0..100).map(collision))
+        .collect();
+    let bound = unbounded_bytes(&hundred);
+    let c = wide_hit("c", bound - unbounded_bytes(&hundred[..1]));
+    let events: Vec<Event> = std::iter::once(x)
+        .chain((0..n).map(collision))
+        .chain([c])
+        .collect();
+    let base = live();
+    let mut r = Records::with_bound(ROW_CAP, bound);
+    for e in &events {
+        r.apply(e.clone());
+    }
+    assert_eq!(
+        r.keys().map(ToString::to_string).collect::<Vec<_>>(),
+        ["c", "x"],
+        "every collision evicted"
+    );
+    let real = usize::try_from(live() - base).expect("the records hold memory");
+    (real, r.bytes())
+}
+
+/// Catches an evicted collision's place left in its id's list of keys or its
+/// owner's list of collisions (plant: no `shrink_to_fit` after either retain in
+/// `Records::evict`): 100 collisions evicted leave what one does.
+#[test]
+fn evicted_collisions_leave_nothing_in_their_ids_lists() {
+    let (one, one_counted) = after_collisions_evicted(1);
+    let (hundred, hundred_counted) = after_collisions_evicted(100);
+    assert_eq!(hundred_counted, one_counted);
+    assert_eq!(
+        hundred, one,
+        "real memory after 100 collisions and after one"
+    );
 }

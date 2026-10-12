@@ -286,14 +286,17 @@ The bound counts each invocation (its header, its rows and its entries in the
 recorder's indexes) and each operation the invocations' calls wait on (its attempts
 and its waiting calls), as the bytes the allocator is asked for: the types' sizes,
 the row lists' capacity, every copy of an id, and B-tree nodes estimated from the
-standard library's node layout. Not counted: the first node of each index (about
-2 kB together), the spare capacity of small lists, the allocator's own overhead, and
+standard library's node layout; every other list is allocated to its length. Not
+counted: the first node of each index (about 2 kB together), the allocator's own
+overhead, and
 the dropped calls of invocations not made yet, held to a sixteenth of the bound
 besides it (and to 1,024; past either the oldest is forgotten). A counting allocator
 in the tests measures the records' heap against the bound after every event, across
 30 to 300 open builds with twins, requeues, 5 KB failure texts and 1,001-output
-listings, header-only invocations and cache hits: it stays within 1.25 times the
-bound (at most 1.17 measured).
+listings; 10 to 100 builds of 500 to 3,000 actions that each wait alone; header-only
+invocations; and cache hits, at bounds from 200 kB to 20 MB. The highest it measured
+is 1.07 times the bound (300 open builds with twins, at 200 kB); the tests fail past
+1.25.
 
 In stage 2 a flushed row is in a chunk and leaves memory, so the bound covers only
 unflushed rows and the header fields; step 3 then applies only when flushes fail

@@ -57,14 +57,15 @@ const HELD: &str = "every key Records hands out names a record it holds";
 ///
 /// **What a byte is**: what the allocator is asked for. The count follows the
 /// types' sizes, the row lists' capacity, every copy of an id, and B-tree nodes as
-/// estimated from the standard library's layout (`btree_bytes`). Not counted: the
-/// first node of each index (about 2 kB together), the spare capacity of the small
-/// lists (an id's keys, an owner's collisions, an operation's waiting calls), the
-/// allocator's own overhead per allocation, and the dropped calls of records not
+/// estimated from the standard library's layout (`btree_bytes`); every other list
+/// is allocated to its length. Not counted: the first node of each index (about
+/// 2 kB together), the allocator's own overhead per allocation, and the dropped
+/// calls of records not
 /// made yet, which are held to a sixteenth of the bound besides it (at most
 /// `UNBORN_CAP`, 1,024; past either the oldest is forgotten, and one that does not
 /// fit alone is not kept). Measured with a counting allocator (`tests/heap.rs`),
-/// the records' heap stays within 1.25 times the bound (at most 1.17 in its mixes).
+/// the records' heap reached at most 1.07 times the bound in its mixes; the tests
+/// fail past 1.25.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Records {
     row_cap: usize,
@@ -399,11 +400,14 @@ impl Records {
             family.next += 1;
             RecordKey::collision(call.id.clone(), family.next - 1)
         };
+        // Every list here is allocated to its length: the bound counts lengths.
+        family.keys.reserve_exact(1);
         family.keys.push(key.clone());
         let owner = RecordKey::owner(call.id.clone());
         if key != owner
             && let Some(inv) = self.invocations.get_mut(&owner)
         {
+            inv.collisions.reserve_exact(1);
             inv.collisions.push(key.clone());
             self.recount(&owner);
         }
@@ -530,6 +534,7 @@ impl Records {
                 waiters: Vec::new(),
                 counted: 0,
             });
+        op.waiters.reserve_exact(1);
         op.waiters.push(waiter);
         // A joined action starts with its twin's attempts so far.
         let attempts = op.attempts.clone();
@@ -760,12 +765,14 @@ impl Records {
         self.minted_by_seen.remove(&(inv.indexed, key.clone()));
         let family = self.ids.get_mut(key.id()).expect(HELD);
         family.keys.retain(|k| k != key);
+        family.keys.shrink_to_fit();
         if family.keys.is_empty() {
             self.ids.remove(key.id());
         }
         let owner = RecordKey::owner(key.id().clone());
         if let Some(inv) = self.invocations.get_mut(&owner) {
             inv.collisions.retain(|k| k != key);
+            inv.collisions.shrink_to_fit();
             self.recount(&owner);
         }
         if inv.in_flight > 0 {
