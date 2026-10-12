@@ -27,3 +27,19 @@ fn the_requirement_flag_is_required() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("--daemon-requirement"), "{stderr}");
 }
+
+/// Catches: the `node-admin` mode reaching for a Mac's tools on a platform that has
+/// none, or `node-admin` parsed as one of the helper's flags.
+#[test]
+fn node_admin_refuses_off_macos() {
+    let output = helper()
+        .args(["node-admin", "phase0", "status"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        stderr,
+        "REFUSED: kbf-mac-session node-admin runs on a Mac\n"
+    );
+}

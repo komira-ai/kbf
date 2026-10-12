@@ -15,6 +15,7 @@
 //! helper links. The caller check relies on the same for `kbf-daemon`: a requirement
 //! pinned by cdhash names exactly the installed daemon binary.
 
+pub mod admin;
 mod caller;
 pub mod gui;
 mod host;

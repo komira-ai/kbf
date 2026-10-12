@@ -16,6 +16,8 @@
 //! - [`spawn`]: starting a process as the lease user.
 //! - [`proto`], [`server`], [`client`]: the socket, its wire format, the caller check.
 //! - [`start`]: flags and start-up.
+//! - [`node_admin`]: the `node-admin` mode, the verbs a node's administrator runs
+//!   through `sudo` (`phase0` so far), behind its own guards.
 //! - `macos`: the host (OpenDirectory, launchd, libproc), the caller check by code
 //!   signature, and the `as-user` mode a GUI run executes (`macos::gui`), on macOS
 //!   only.
@@ -29,6 +31,7 @@ pub mod grant;
 pub mod helper;
 pub mod lease;
 pub mod ledger;
+pub mod node_admin;
 pub mod proto;
 pub mod scan;
 pub mod server;
