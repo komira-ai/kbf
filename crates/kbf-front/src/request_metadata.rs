@@ -17,7 +17,6 @@
 //! [`MAX_TEXT_BYTES`] each and cut on a character boundary past that, marked
 //! truncated.
 
-use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::task::{Context, Poll};
@@ -72,12 +71,6 @@ impl InvocationId {
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
-    }
-}
-
-impl fmt::Display for InvocationId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
     }
 }
 
@@ -322,6 +315,16 @@ mod tests {
         }
     }
 
+    /// What [`with_id`]'s header reads as, with `invocation_id`.
+    fn buck2(invocation_id: Option<InvocationId>) -> CallMetadata {
+        CallMetadata {
+            invocation_id,
+            tool_name: text("buck2"),
+            tool_version: text("0.1.0"),
+            ..Default::default()
+        }
+    }
+
     fn text(value: &str) -> Text {
         Text {
             value: value.to_owned(),
@@ -375,20 +378,15 @@ mod tests {
         let refused = [
             "", "a~b", "a<b", "a/b", "a%41", "a b", "a\u{e9}", ".", "..", "-x", "_x", &long,
         ];
-        let mut accepted: Vec<&str> = Vec::new();
-        for id in refused {
-            match CallMetadata::from_headers(&encoded(&with_id(id))) {
-                Read::Invalid {
-                    kept: Some(kept),
-                    why: Invalid::BadId,
-                } => assert_eq!(
-                    (kept.invocation_id, kept.tool_name),
-                    (None, text("buck2")),
-                    "{id:?}"
-                ),
-                _ => accepted.push(id),
-            }
-        }
+        // The answer for a refused id: the id dropped, the other fields kept.
+        let dropped = Read::Invalid {
+            kept: Some(buck2(None)),
+            why: Invalid::BadId,
+        };
+        let accepted: Vec<&str> = refused
+            .into_iter()
+            .filter(|id| CallMetadata::from_headers(&encoded(&with_id(id))) != dropped)
+            .collect();
         assert_eq!(accepted, Vec::<&str>::new(), "ids that must be refused");
         let longest = "a".repeat(MAX_ID_BYTES);
         let good = [
@@ -400,14 +398,12 @@ mod tests {
         ];
         let read: Vec<_> = good
             .iter()
-            .map(
-                |id| match CallMetadata::from_headers(&encoded(&with_id(id))) {
-                    Read::Valid(read) => read.invocation_id.map(|id| id.to_string()),
-                    _ => None,
-                },
-            )
+            .map(|id| CallMetadata::from_headers(&encoded(&with_id(id))))
             .collect();
-        let expected: Vec<_> = good.iter().map(|id| Some((*id).to_owned())).collect();
+        let expected: Vec<_> = good
+            .iter()
+            .map(|id| Read::Valid(buck2(Some(InvocationId((*id).to_owned())))))
+            .collect();
         assert_eq!(read, expected);
         assert_eq!(CallMetadata::default().invocation_display(), "-");
     }
@@ -427,10 +423,16 @@ mod tests {
             message
         };
         let at_bound = sized(MAX_HEADER_BYTES);
-        let Read::Valid(read) = CallMetadata::from_headers(&encoded(&at_bound)) else {
-            panic!("a header at the bound was refused");
+        let mut expected = buck2(InvocationId::parse("inv"));
+        expected.target_id = Text {
+            value: "t".repeat(MAX_TEXT_BYTES),
+            truncated: true,
         };
-        assert_eq!(read.invocation_display(), "inv");
+        assert_eq!(
+            CallMetadata::from_headers(&encoded(&at_bound)),
+            Read::Valid(expected),
+            "a header at the bound"
+        );
         assert_eq!(
             CallMetadata::from_headers(&encoded(&sized(MAX_HEADER_BYTES + 1))),
             refused(Invalid::TooLarge)
@@ -490,10 +492,14 @@ mod tests {
         );
         let mut message = with_id("inv");
         message.action_mnemonic = format!("{at_bound}tail");
-        let Read::Valid(read) = CallMetadata::from_headers(&encoded(&message)) else {
-            panic!("refused");
+        let mut expected = buck2(InvocationId::parse("inv"));
+        expected.action_mnemonic = Text {
+            value: at_bound,
+            truncated: true,
         };
-        assert!(read.action_mnemonic.truncated);
-        assert_eq!(read.action_mnemonic.value, at_bound);
+        assert_eq!(
+            CallMetadata::from_headers(&encoded(&message)),
+            Read::Valid(expected)
+        );
     }
 }
