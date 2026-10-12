@@ -23,7 +23,7 @@ use prost::Message;
 use tonic::Status;
 
 use crate::meta_log::{MemoryMetaLog, MetaLog, MetaLogError};
-use crate::wire;
+use crate::{MAX_BLOB_BYTES, wire};
 
 /// How many times a read asks again when a collection removes what it was about to
 /// touch, before it answers UNAVAILABLE.
@@ -318,8 +318,11 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
     /// is durable.
     ///
     /// # Errors
-    /// The store or the metadata log failed; nothing was reported present.
+    /// [`CacheError::Invalid`], before anything is stored, if any blob is larger than
+    /// [`MAX_BLOB_BYTES`]: the cache holds none, which its readers rely on. The store or
+    /// the metadata log failed; nothing was reported present.
     pub async fn store_blobs(&self, blobs: Vec<VerifiedBlob>) -> Result<(), CacheError> {
+        refuse_oversized(&blobs)?;
         if blobs.is_empty() {
             return Ok(());
         }
@@ -714,8 +717,22 @@ fn proto_digest(d: Option<&reapi::Digest>) -> Result<Digest, CacheError> {
 }
 
 /// A [`MetaLog`] answered a command with the outcome of a different one: a broken log.
+/// [`CacheError::Invalid`] naming the first of `blobs` larger than [`MAX_BLOB_BYTES`].
+fn refuse_oversized(blobs: &[VerifiedBlob]) -> Result<(), CacheError> {
+    match blobs.iter().find(|b| b.digest.size_bytes > MAX_BLOB_BYTES) {
+        Some(blob) => Err(CacheError::Invalid(format!(
+            "{} is larger than the largest blob this cache accepts ({MAX_BLOB_BYTES} bytes)",
+            blob.digest
+        ))),
+        None => Ok(()),
+    }
+}
+
 fn unexpected(applied: &Applied) -> CacheError {
     CacheError::Internal(format!(
         "metadata log answered with an unexpected outcome {applied:?}"
     ))
 }
+
+#[cfg(test)]
+mod tests;
