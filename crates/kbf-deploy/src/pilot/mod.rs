@@ -179,8 +179,9 @@ impl PilotError {
     }
 }
 
-/// The first line of every overlay `buckconfig` writes; it removes or replaces only a
-/// file that starts with it.
+/// What every overlay `buckconfig` writes begins with: its first line is this, followed
+/// by `:`. It removes or replaces only a file whose first line is this, alone or
+/// followed by `:`.
 pub const MARKER: &str = "# kbf-pilot-overlay";
 
 /// A tool's path.

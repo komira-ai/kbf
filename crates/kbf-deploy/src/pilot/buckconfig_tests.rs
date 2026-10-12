@@ -157,12 +157,13 @@ fn the_overlay_is_written_with_the_marker_and_every_value_and_then_left_alone() 
 
 /// The planted defect this verb exists to refuse: **buckconfig overwrites a foreign
 /// file.** A `.buckconfig.local` the operator wrote (no marker on its first line), a
-/// marker that is not at the start, a link and a directory are each refused, with
+/// marker that is not at the start, a first line that only begins with
+/// the marker (`# kbf-pilot-overlay-mine`), a link and a directory are each refused, with
 /// `--apply` as without, and the file is left exactly as it was: no step is planned
 /// or applied.
 #[test]
 fn a_foreign_buckconfig_local_is_never_overwritten() {
-    let foreign: [(&str, Entry); 4] = [
+    let foreign: [(&str, Entry); 5] = [
         (
             "operator's own",
             Entry::File {
@@ -177,6 +178,14 @@ fn a_foreign_buckconfig_local_is_never_overwritten() {
                 perms: Perms::new(0o644),
                 owner: RUNNER,
                 bytes: format!("# mine\n{MARKER}\n").into_bytes(),
+            },
+        ),
+        (
+            "marker as the prefix of a longer word",
+            Entry::File {
+                perms: Perms::new(0o644),
+                owner: RUNNER,
+                bytes: format!("{MARKER}-mine: theirs\n[buck2_re_client]\n").into_bytes(),
             },
         ),
         ("a link", Entry::Other),
@@ -226,6 +235,13 @@ fn remove_deletes_only_an_overlay_this_verb_wrote() {
         String::from_utf8(out).expect("utf-8"),
         format!("no {TARGET}\n")
     );
+    for first_line in [format!("{MARKER}\n[x]\n"), MARKER.to_owned()] {
+        let (mut exec, _) = host();
+        file(&mut exec, TARGET, first_line.as_bytes());
+        let mut out = Vec::new();
+        run_remove(&mut exec, &p(WT), Mode::Apply, &mut out).expect(&first_line);
+        assert_eq!(exec.log, [Step::Remove { path: p(TARGET) }], "{first_line}");
+    }
 }
 
 /// Catches an overlay written into a checkout that is not a buck2 one, into the main
@@ -274,7 +290,7 @@ fn a_main_checkout_a_non_checkout_or_an_unignored_overlay_is_refused() {
 #[test]
 fn each_bad_property_set_is_refused() {
     type Plant = fn(&mut OverlaySettings);
-    let cases: [(Plant, &str); 9] = [
+    let cases: [(Plant, &str); 10] = [
         (
             |s| s.linux_properties = "label.pool=linux".into(),
             "KBF_LINUX_PROPERTIES (label.pool=linux) names no OSFamily: kbf ignores names it does not know, so it would match every node. Add OSFamily=Linux",
@@ -294,6 +310,10 @@ fn each_bad_property_set_is_refused() {
         (
             |s| s.darwin_properties = "OSFamily=Windows".into(),
             "KBF_DARWIN_PROPERTIES: OSFamily=Windows does not name darwin",
+        ),
+        (
+            |s| s.darwin_properties = "OSFamily=Linux,label.pool=mac".into(),
+            "KBF_DARWIN_PROPERTIES: OSFamily=Linux does not name darwin",
         ),
         (
             |s| s.linux_properties = "OSFamily=Linux,pool".into(),

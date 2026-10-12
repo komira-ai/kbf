@@ -529,6 +529,28 @@ fn each_host_defect_is_refused_before_any_step() {
             "/srv/op/.config/kbf-pilot/s3.env needs AWS_ACCESS_KEY_ID= and AWS_SECRET_ACCESS_KEY= lines, each with a value",
         ),
         (
+            |e, _, _| {
+                put(
+                    e,
+                    S3,
+                    0o600,
+                    b"AWS_ACCESS_KEY_ID=a\nAWS_SECRET_ACCESS_KEY=\"\"\n",
+                )
+            },
+            "/srv/op/.config/kbf-pilot/s3.env needs AWS_ACCESS_KEY_ID= and AWS_SECRET_ACCESS_KEY= lines, each with a value",
+        ),
+        (
+            |e, _, _| {
+                put(
+                    e,
+                    S3,
+                    0o600,
+                    b"AWS_ACCESS_KEY_ID=''\nAWS_SECRET_ACCESS_KEY=b\n",
+                )
+            },
+            "/srv/op/.config/kbf-pilot/s3.env needs AWS_ACCESS_KEY_ID= and AWS_SECRET_ACCESS_KEY= lines, each with a value",
+        ),
+        (
             |e, _, _| put(e, S3, 0o600, b"AWS_SECRET_ACCESS_KEY=b\n"),
             "/srv/op/.config/kbf-pilot/s3.env needs AWS_ACCESS_KEY_ID= and AWS_SECRET_ACCESS_KEY= lines, each with a value",
         ),

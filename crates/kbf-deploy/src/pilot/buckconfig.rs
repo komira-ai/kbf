@@ -5,9 +5,10 @@
 //! checkout's other config files, so every remote action of that worktree, and only
 //! of it, goes to the pilot.
 //!
-//! **It never overwrites or removes a file it did not write.** Every overlay starts
-//! with the line [`MARKER`]; an existing `.buckconfig.local` that does not (or a link,
-//! or anything else that is not a regular file) is refused, and left alone, before
+//! **It never overwrites or removes a file it did not write.** The first line of every
+//! overlay is [`MARKER`] followed by `:`; an existing `.buckconfig.local` whose first
+//! line is not the marker, alone or followed by `:` (or a link, or anything else that
+//! is not a regular file) is refused, and left alone, before
 //! any step is planned. An overlay with the same bytes and mode is left as it is.
 //!
 //! It refuses, too:
@@ -46,9 +47,18 @@ fn target(exec: &dyn Exec, worktree: &HostPath) -> Result<HostPath, PilotError> 
     let target = under(worktree, NAME)?;
     match inspect(exec, &target)? {
         None => Ok(target),
-        Some(Entry::File { bytes, .. }) if bytes.starts_with(MARKER.as_bytes()) => Ok(target),
+        Some(Entry::File { bytes, .. }) if ours(&bytes) => Ok(target),
         Some(_) => Err(PilotError::Foreign(target)),
     }
+}
+
+/// Whether `bytes` is an overlay this verb wrote: its first line (up to the line end)
+/// is [`MARKER`], alone or followed by `:`. A line that merely begins with the marker
+/// (`# kbf-pilot-overlay-mine`) is not.
+fn ours(bytes: &[u8]) -> bool {
+    let line = bytes.split(|&b| b == b'\n').next().unwrap_or_default();
+    line.strip_prefix(MARKER.as_bytes())
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with(b":"))
 }
 
 /// Check the settings and the worktree, then plan the overlay.

@@ -12,8 +12,8 @@
 //!   does not chain to `ca.pem` for serverAuth with `KBF_TLS_SERVER_NAME`, or a key that
 //!   is not its own ([`super::certs`]); a key that is not mode 0600;
 //! - an S3 environment file that is not mode 0600 or lacks `AWS_ACCESS_KEY_ID=` or
-//!   `AWS_SECRET_ACCESS_KEY=` with a value; the PKI directory or that file inside a git
-//!   work tree (a `.git` at or above it);
+//!   `AWS_SECRET_ACCESS_KEY=` with a value (a quoted empty `""` or `''` is none); the PKI
+//!   directory or that file inside a git work tree (a `.git` at or above it);
 //! - with `--apply`, a store whose `/minio/health/live` does not answer 200 (a dry run
 //!   only warns);
 //! - a `--bin` that is not an executable ELF file for this host's CPU, whose
@@ -522,13 +522,24 @@ fn s3_pair(exec: &dyn Exec, path: &HostPath) -> Result<(), PilotError> {
         .iter()
         .all(|key| {
             text.lines()
-                .any(|l| l.strip_prefix(key).is_some_and(|v| !v.is_empty()))
+                .any(|l| l.strip_prefix(key).is_some_and(|v| !unquoted(v).is_empty()))
         });
     if pair {
         Ok(())
     } else {
         Err(PilotError::S3Env(path.clone()))
     }
+}
+
+/// `v` without one pair of enclosing double or single quotes, as systemd reads an
+/// `EnvironmentFile` value: `""` and `''` are empty.
+fn unquoted(v: &str) -> &str {
+    for q in ["\"", "'"] {
+        if let Some(inner) = v.strip_prefix(q).and_then(|v| v.strip_suffix(q)) {
+            return inner;
+        }
+    }
+    v
 }
 
 /// The store answers its liveness probe; a dry run only warns when it does not.
