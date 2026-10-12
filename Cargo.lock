@@ -1303,9 +1303,7 @@ dependencies = [
 name = "kbf-driver-native"
 version = "0.1.0"
 dependencies = [
- "clap",
  "futures",
- "hex",
  "kbf-daemon",
  "kbf-mac-session",
  "kbf-outputs",
@@ -1316,7 +1314,7 @@ dependencies = [
  "prost",
  "prost-types",
  "rustix",
- "sha2 0.11.0",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",

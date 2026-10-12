@@ -19,7 +19,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 
-# busybox 1.37.0, image index digest (the one tools/spike/lib.sh pins).
+# busybox 1.37.0, image index digest.
 BUSYBOX=docker.io/library/busybox@sha256:bdf57e528e45e4433820e045b29b4597825a1c9e38353532d90a01445013f82e
 
 uid=$(id -u)

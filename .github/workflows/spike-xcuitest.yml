@@ -1,16 +1,18 @@
-# The XCUITest fixtures (tools/spike/macos/fixtures): checks the generated Xcode
-# projects, runs the pixel checker's selftest, then builds each fixture and runs its UI
-# tests, the iOS one on a simulator and the macOS one in the runner's login session.
-# A second job runs the same fixtures as a native driver action, under the driver's
-# own sandbox profile, and records every deny line (xcuitest-sandbox below); a Linux
-# job runs that probe's selftest and planted mutants against fakes (selftest below).
-# This proves the instrument only: a hosted runner's privacy (TCC) grants may be
-# seeded, so a pass here says nothing about a fresh Mac. Each step prints
-# `SPIKE macos-<arch>.xcuitest.*` lines; read them with
-#   gh run view <run id> --log | grep ' SPIKE '
-# The .xcresult bundles and exported screenshots are uploaded as the run's artifact.
-# Run by hand, or on a pull request that changes this file, the fixtures, the probe, its
-# selftest or the driver code the profile and the lease's variables come from.
+# The XCUITest fixtures (tools/spike/macos/fixtures) as a native driver action that
+# asks for the network: `xcodebuild` under the sandbox profile the driver's library
+# builds, in a lease directory with the lease's variables, with the deny lines the
+# sandbox logs for the run's processes read back
+# (crates/kbf-driver-native/tests/xcuitest_sandbox.rs; findings:
+# docs/spikes/macos-p0.md). The tests pin what the hosted runner measured: the iOS
+# fixture passes under the profile, the macOS UI tests stop on `(deny lsopen)`, and
+# each run is refused what the profile denies. Controls: `sandbox-exec` must refuse a
+# run under `(deny default)`, and both fixtures must pass without a sandbox. Also the
+# fixtures' pixel checker against synthetic images.
+# This proves the instrument and the profile on a hosted runner only: its privacy (TCC)
+# grants may be seeded, so a pass says nothing about a fresh Mac. The leases, the
+# xcodebuild logs, the result bundles and each run's deny lines are uploaded.
+# Run by hand, or on a pull request that changes this file, the fixtures, the test or
+# the driver code the profile, the lease's variables and the process tree come from.
 name: spike-xcuitest
 
 on:
@@ -18,15 +20,12 @@ on:
   pull_request:
     paths:
       - .github/workflows/spike-xcuitest.yml
-      - tools/spike/lib.sh
       - tools/spike/macos/fixtures/**
-      - tools/spike/macos/lib.sh
-      - tools/spike/macos/test/**
-      - tools/spike/macos/verdicts.sh
-      - tools/spike/macos/xcuitest_sandbox.sh
-      - crates/kbf-driver-native/examples/action_sandbox.rs
+      - crates/kbf-driver-native/tests/xcuitest_sandbox.rs
+      - crates/kbf-driver-native/tests/support/xcode_fixture.rs
       - crates/kbf-driver-native/src/home.rs
       - crates/kbf-driver-native/src/network.rs
+      - crates/kbf-driver-native/src/procs.rs
       - crates/kbf-driver-native/src/user_folders.rs
 
 permissions: {}
@@ -35,98 +34,7 @@ concurrency:
   group: spike-xcuitest-${{ github.ref }}
   cancel-in-progress: true
 
-defaults:
-  run:
-    shell: bash
-
 jobs:
-  # Linux: the generated projects match their generator, and the scripts pass shellcheck.
-  fixtures-lint:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - run: python3 tools/spike/macos/fixtures/gen_projects.py --check
-      - run: shellcheck -S warning tools/spike/macos/fixtures/*.sh
-
-  # Linux: the sandbox probe's verdict logic against fakes (tools/spike/macos/test),
-  # and the planted mutants, each of which must turn its test red.
-  selftest:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - run: shellcheck --version
-      - run: shellcheck -x -S warning tools/spike/macos/*.sh tools/spike/macos/test/fakecmd tools/spike/macos/test/*.sh
-      - run: bash tools/spike/macos/test/run.sh
-      - run: bash tools/spike/macos/test/mutants.sh
-
-  # Every step after the host facts runs even if an earlier one failed, so one failure
-  # does not hide the other platform's result; any failed step still fails the job.
-  xcuitest-macos:
-    runs-on: macos-15
-    timeout-minutes: 45
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - run: sw_vers
-      - run: uname -m
-      - run: xcodebuild -version
-      - run: xcrun simctl list runtimes
-      - name: Generated projects are current
-        if: ${{ !cancelled() }}
-        working-directory: tools/spike/macos/fixtures
-        run: python3 gen_projects.py --check
-      - name: Generated projects parse, plist lint
-        if: ${{ !cancelled() }}
-        working-directory: tools/spike/macos/fixtures
-        run: plutil -lint MacFixture.xcodeproj/project.pbxproj IOSFixture.xcodeproj/project.pbxproj
-      - name: Generated projects parse, macOS project
-        if: ${{ !cancelled() }}
-        working-directory: tools/spike/macos/fixtures
-        run: xcodebuild -list -project MacFixture.xcodeproj
-      - name: Generated projects parse, iOS project
-        if: ${{ !cancelled() }}
-        working-directory: tools/spike/macos/fixtures
-        run: xcodebuild -list -project IOSFixture.xcodeproj
-      - name: Pixel checker selftest
-        if: ${{ !cancelled() }}
-        run: bash tools/spike/macos/fixtures/selftest.sh "$RUNNER_TEMP/xcuitest"
-      - name: iOS UI tests on a simulator
-        if: ${{ !cancelled() }}
-        run: bash tools/spike/macos/fixtures/run.sh ios "$RUNNER_TEMP/xcuitest"
-      - name: macOS UI tests in the login session
-        if: ${{ !cancelled() }}
-        run: bash tools/spike/macos/fixtures/run.sh macos "$RUNNER_TEMP/xcuitest"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: ${{ !cancelled() }}
-        with:
-          name: xcuitest-results
-          path: |
-            ${{ runner.temp }}/xcuitest/*.xcresult
-            ${{ runner.temp }}/xcuitest/*-attachments
-            ${{ runner.temp }}/xcuitest/*-xcodebuild.log
-          retention-days: 7
-
-  # The fixtures as a native driver action that asks for the network
-  # (tools/spike/macos/xcuitest_sandbox.sh): under the profile the driver builds, written
-  # out by the driver's own action_sandbox example (not a copy), in a lease directory
-  # with the lease's variables. Arms: a (deny default) control that must fail with deny
-  # lines, the two fixtures under the driver's profile (recorded as they are), and the
-  # two fixtures unsandboxed, which must pass. Findings: docs/spikes/macos-p0.md. The
-  # last step fails the job only on a BROKEN verdict (a control that did not hold) or
-  # a missing one; a FAIL is the measured result.
   xcuitest-sandbox:
     runs-on: macos-15
     timeout-minutes: 90
@@ -139,20 +47,18 @@ jobs:
       - run: sw_vers
       - run: uname -m
       - run: xcodebuild -version
+      - run: xcrun simctl list runtimes
       - run: rustup toolchain install
-      - run: cargo build -p kbf-driver-native --example action_sandbox --locked
       - name: The fixtures under the driver's sandbox, with controls
-        run: bash tools/spike/macos/xcuitest_sandbox.sh "$PWD/target/debug/examples/action_sandbox"
+        run: cargo test -p kbf-driver-native --test xcuitest_sandbox --locked -- --ignored --nocapture
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: ${{ !cancelled() }}
         with:
           name: xcuitest-sandbox
           path: |
-            ${{ runner.temp }}/kbf-spike-macos/spike.txt
-            ${{ runner.temp }}/kbf-spike-macos/*-denies.txt
-            ${{ runner.temp }}/kbf-spike-macos/*.out
-            ${{ runner.temp }}/kbf-spike-macos/leases/*/root/out/*-xcodebuild.log
+            target/tmp/xcuitest/*-denies.txt
+            target/tmp/xcuitest/*/root/out/*-xcodebuild.log
+            target/tmp/xcuitest/*/root/out/*-xcresulttool.log
+            target/tmp/xcuitest/*/root/out/*.xcresult
+            target/tmp/xcuitest/*/root/out/*-attachments
           retention-days: 7
-      - name: Verdicts
-        if: ${{ !cancelled() }}
-        run: bash tools/spike/macos/verdicts.sh xcuitest_sandbox

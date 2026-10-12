@@ -15,8 +15,8 @@
 //! next. A variable the Command sets itself is the Command's: these are set first and
 //! the Command's environment after them.
 //!
-//! Public so that a probe can give a program the lease's variables without the daemon
-//! (`examples/action_sandbox.rs`).
+//! Public so that a test can give a program the lease's variables without the daemon
+//! (`tests/xcuitest_sandbox.rs`).
 
 use std::ffi::OsString;
 use std::path::Path;
