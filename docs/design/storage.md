@@ -59,10 +59,15 @@ location in any other store fails `INTERNAL`.
 
 The front reaches it only through the `MetaLog` trait: `commit` a command and get back
 what applying it did, or run a read-only `query`. `MemoryMetaLog` is one state behind a
-lock in the server process. A replicated log (**planned**) implements the same two
-calls: `commit` proposes and resolves after apply (on a follower, it sends the command
-to the leader), and `query` runs on the server's own applied state, behind a read
-index where a stronger guarantee is needed.
+lock in the server process. `RaftMetaLog` (`--meta-log=raft`, in
+`kbf-server/src/raft_log`) exists today as a **single-voter** Raft log on the local
+disk in `--raft-dir`, and needs `--store=s3`: `commit` encodes the command, proposes
+it, syncs it, applies it and only then answers, one commit at a time under the log's
+lock; `query` reads the server's applied state, which for a single voter, always its
+own leader, is the committed state. It has no snapshots yet (the log is never
+compacted) and no second voter. **Planned**: more voters, on which `commit` on a
+follower sends the command to the leader and `query` runs behind a read index where
+a stronger guarantee is needed.
 
 ### Three answers, not two
 
@@ -112,10 +117,11 @@ because the entry was touched recently is still covered for the full TTL.
 `Collect` removes every expired blob and action entry and returns what it removed,
 with the location of each blob's bytes, so their space can be accounted as dead.
 
-Today the server binary does not advance the metadata's farm time and never runs
-`Collect`, so nothing expires while it runs; the index lives in memory and is lost at
-restart anyway. **Planned**: the leader commits a `Tick` every second, and collection
-runs on a schedule.
+Today, under `--meta-log=raft`, the server commits a `Tick` every second while the log
+is open (`raft_log::TICK`), so the metadata's farm time advances and continues across
+restarts. Under `--meta-log=memory` nothing advances it, and the index is lost at
+restart. In neither mode does the server run `Collect`, so nothing expires while it
+runs. **Planned**: collection runs on a schedule.
 
 ## Writes
 
@@ -264,7 +270,8 @@ capabilities.
 ## Planned
 
 - **Replicated metadata.** `MetaState` applied from a Raft log kept on each voter's
-  local disk, with its snapshots: one voter first, three on three hosts later
+  local disk, with its snapshots: one voter first (the single-voter log exists, without
+  snapshots, see [Metadata](#metadata)), three on three hosts later
   ([deployment-topology.md](deployment-topology.md)). Each snapshot is also copied to
   the object store, so a host whose disk is lost can be rebuilt from it; with a single
   voter, what was committed after the newest copied snapshot is lost with the disk.
