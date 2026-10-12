@@ -286,10 +286,7 @@ pub(crate) fn marked(lease: &Path) -> bool {
 
 /// `result`, its error said with the `path` it is about.
 fn at<T>(path: &Path, result: std::io::Result<T>) -> Result<T, String> {
-    match result {
-        Ok(value) => Ok(value),
-        Err(e) => Err(format!("{}: {e}", path.display())),
-    }
+    result.map_err(|e| format!("{}: {e}", path.display()))
 }
 
 /// Whether `text` is a UDID as `simctl` prints one: 8-4-4-4-12 hexadecimal digits.

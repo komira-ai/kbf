@@ -511,6 +511,19 @@ async fn the_start_sweep_deletes_the_simulators_a_killed_daemon_left() {
     assert_eq!(calls(&xcrun), [""; 0], "no marker, no sweep");
     assert!(no_leases(&config));
 
+    left("lease-8-2", true);
+    list(&xcrun, &[("kbf-lease-8-2", UDID)]);
+    let _rt = runtime(config.clone(), &cas);
+    assert_eq!(
+        calls(&xcrun),
+        [
+            "list devices -j".to_owned(),
+            format!("shutdown {UDID}"),
+            format!("delete {UDID}")
+        ]
+    );
+    assert!(no_leases(&config));
+
     left("lease-9-9", true);
     let mut unlisted = config.clone();
     unlisted.xcrun = dir.join("no-xcrun");
@@ -717,10 +730,10 @@ mod real {
 
     /// Catches, on a real Mac: `simctl create` in the default set not working under the
     /// actions' sandbox (create, or the delete at the end, refused), a device the
-    /// action cannot boot from its sandbox, and a booted device left running or
-    /// registered after the lease. Also prints whether the action's own `xcodebuild
-    /// -showdestinations`, under the sandbox, lists the device: a measurement, not a
-    /// check (the check without the sandbox is the test above).
+    /// action cannot boot from its sandbox, a device the action's own `xcodebuild
+    /// -showdestinations` does not list from the sandbox (so `xcodebuild test
+    /// -destination id=$KBF_SIMULATOR_UDID` could not use it), and a booted device left
+    /// running or registered after the lease.
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "macOS with an iOS simulator runtime; the native-macos job runs it"]
     async fn a_real_simulator_is_made_booted_and_deleted_for_the_lease() {
@@ -740,7 +753,7 @@ mod real {
              xcrun simctl list devices booted | grep -c \"${UDID_VAR}\"\n\
              cp -R {project} \"$TMPDIR/IOSFixture.xcodeproj\" >&2 || true\n\
              xcodebuild -showdestinations -project \"$TMPDIR/IOSFixture.xcodeproj\" -scheme IOSFixture -derivedDataPath \"$TMPDIR/dd\" > \"$TMPDIR/shown\" 2>&1 || echo \"xcodebuild under the sandbox: exit $?\" >&2\n\
-             echo \"xcodebuild under the sandbox lists it: $(grep -c \"${UDID_VAR}\" \"$TMPDIR/shown\" || true)\" >&2\n\
+             grep -c \"${UDID_VAR}\" \"$TMPDIR/shown\" || true\n\
              grep -i -m 8 -e error -e denied -e destinations \"$TMPDIR/shown\" >&2 || true\n"
         );
         let spec = Spec::sh(&script)
@@ -759,9 +772,13 @@ mod real {
         assert_eq!(result.exit_code, 0, "{err}");
         let out = stdout(&cas, &result);
         let lines: Vec<&str> = out.lines().collect();
-        assert_eq!(lines.len(), 2, "{out}");
+        assert_eq!(lines.len(), 3, "{out}");
         let udid = lines[0];
         assert_eq!(lines[1], "1", "the device booted");
+        assert_eq!(
+            lines[2], "1",
+            "xcodebuild lists the device from the sandbox"
+        );
         assert!(
             !xcrun(&["simctl", "list", "devices", "-j"]).contains(udid),
             "the device is deleted"

@@ -643,6 +643,7 @@ async fn create_simulator(
         udid: None,
     };
     *made_in(slot) = Some(made.clone());
+    let mut kept = made.clone();
     let simctl = Arc::clone(simctl);
     let developer_dir = prepared.developer_dir.clone();
     let created = tokio::task::spawn_blocking(move || {
@@ -650,9 +651,8 @@ async fn create_simulator(
     })
     .await;
     let udid = simulator_made(created)?;
-    if let Some(made) = made_in(slot).as_mut() {
-        made.udid = Some(udid.clone());
-    }
+    kept.udid = Some(udid.clone());
+    *made_in(slot) = Some(kept);
     prepared.simulator_env = vec![(simulator::UDID_VAR, OsString::from(udid))];
     Ok(())
 }
