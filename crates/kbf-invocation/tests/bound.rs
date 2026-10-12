@@ -507,7 +507,7 @@ fn a_row_never_takes_an_instance_name_the_record_does_not_hold() {
         e => e,
     };
     let first = on(queued("inv", t(1), 10, 1), "aaaaaaaaaaaaaaaa");
-    let mut r = bounded(unbounded(&[first.clone()]), &[first]);
+    let mut r = bounded(unbounded(std::slice::from_ref(&first)), &[first]);
     r.apply(on(queued("inv", t(2), 10, 2), "b"));
     let inv = r.get(&key("inv")).expect("held");
     assert_eq!(
@@ -520,5 +520,37 @@ fn a_row_never_takes_an_instance_name_the_record_does_not_hold() {
         .map(|x| (x.instance.as_str(), x.operation.as_deref()))
         .collect();
     assert_eq!(rows, [("aaaaaaaaaaaaaaaa", Some(name("inv", 1).as_str()))]);
+    assert!(!inv.complete());
+}
+
+/// Catches (security; mutant "a new row skips the check"): a new row of an instance
+/// name the record could not take. The call's name and its first `tool` do not fit
+/// together, while its row alone does, so the record leaves the name out (the bound
+/// closes the larger open record `big` to rows, not this one) and would have added a
+/// row of it. The row is not added; the record says it is incomplete.
+#[test]
+fn a_new_row_of_a_name_the_record_could_not_take_is_not_added() {
+    let on = |e: Event, instance: &str, tool: Option<String>| match e {
+        Event::Call(mut c) => {
+            c.instance = instance.to_owned();
+            c.metadata.tool = tool;
+            Event::Call(c)
+        }
+        e => e,
+    };
+    let first = on(queued("inv", t(1), 10, 1), "a", None);
+    let fits = on(queued("inv", t(2), 11, 2), "b", None);
+    let mut events: Vec<_> = (20..26)
+        .map(|n| queued("big", t(1), n, u64::from(n)))
+        .collect();
+    events.push(first);
+    let mut all = events.clone();
+    all.push(fits);
+    let mut r = bounded(unbounded(&all), &events);
+    r.apply(on(queued("inv", t(2), 11, 2), "b", Some("x".repeat(4096))));
+    let inv = r.get(&key("inv")).expect("held");
+    assert_eq!(inv.instances().iter().collect::<Vec<_>>(), ["a"]);
+    let rows: Vec<_> = inv.rows().iter().map(|x| x.instance.as_str()).collect();
+    assert_eq!(rows, ["a"]);
     assert!(!inv.complete());
 }

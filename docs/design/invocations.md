@@ -541,8 +541,10 @@ the operator API's "anyone who reaches the address" rule.
   the same `Authenticator`: its `authenticate` takes the call's `http::request::Parts`,
   which an HTTP request on the API listener has too. One policy, one set of variants.
 - Two new authorizer keys in the policy file: `invocations.getAuthorizer`, asked with the
-  invocation's instance names (all must allow), and `blobs.getAuthorizer`, asked with the
-  `instance` parameter. Either may be an `instanceNamePrefix` or any built authorizer.
+  invocation's instance names and every row's (all must allow; the recorder never sets
+  a row of a name the record does not hold, and the pages do not rely on it), and
+  `blobs.getAuthorizer`, asked with the `instance` parameter. Either may be an
+  `instanceNamePrefix` or any built authorizer.
 - **Fail closed.** If the policy file has no `invocations` key, or there is no policy
   file, the invocation and blob routes answer `404`, with the `off` body of 4.1, and the
   start line says `invocations=off`. The two keys are separate: with `invocations` and no

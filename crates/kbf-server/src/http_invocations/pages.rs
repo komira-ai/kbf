@@ -2,6 +2,8 @@
 //! for, its page token, and which rows a page holds (`docs/api.md`,
 //! `docs/design/invocations.md` sections 4.1 and 4.5); [`super::views`] writes them.
 
+use std::collections::BTreeSet;
+
 use kbf_front::InvocationId as AcceptedId;
 use kbf_invocation::{ActionRow, How, Invocation, InvocationId, Outcome, RecordKey, WallTime};
 use kbf_types::Digest;
@@ -467,11 +469,22 @@ fn same_record(inv: &Invocation, serial: u64) -> Result<(), Bad> {
     }
 }
 
-/// The instance names a reader of `inv` must be allowed on: every one its calls used,
-/// or the empty name for a record that holds none (its first call's did not fit).
+/// The instance names a reader of `inv` must be allowed on, whatever the route: see
+/// [`reader_names`].
 pub(crate) fn instance_names(inv: &Invocation) -> Vec<String> {
-    let none = inv.instances().is_empty().then(String::new);
-    inv.instances().iter().cloned().chain(none).collect()
+    reader_names(inv.instances(), inv.rows())
+}
+
+/// The instance names a reader of a record with `instances` and `rows` must be allowed
+/// on, sorted: each of `instances` (every name its calls used that fit) and every
+/// row's instance, or the empty name when there are none (its first call's did not
+/// fit). The recorder never sets a row of a name the record does not hold; the
+/// rows are asked about anyway, so a page is not served on that alone.
+pub(crate) fn reader_names(instances: &BTreeSet<String>, rows: &[ActionRow]) -> Vec<String> {
+    let mut names: BTreeSet<&str> = instances.iter().map(String::as_str).collect();
+    names.extend(rows.iter().map(|r| r.instance.as_str()));
+    let none = names.is_empty().then_some("");
+    names.into_iter().chain(none).map(str::to_owned).collect()
 }
 
 /// `Ok` when `inv` is still the record whose `serial` and instance `names` the reader

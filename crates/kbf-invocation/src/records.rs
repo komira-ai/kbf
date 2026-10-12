@@ -53,7 +53,9 @@ const HELD: &str = "every key Records hands out names a record it holds";
 ///    is not made (its caller's next record starts incomplete, as for a dropped
 ///    call); anything else (an attempt, an outcome's text, a waiting call, an
 ///    instance name, a later Execute's row) is not set. In every case but a row's,
-///    the record says `complete: false`.
+///    the record says `complete: false`. A row is never set for an instance name
+///    the record does not hold: a call whose name was left out leaves the rows as
+///    they were (a reader is authorized on the record's names).
 ///
 /// **What a byte is**: what the allocator is asked for. The count follows the
 /// types' sizes, the row lists' capacity, every copy of an id, and B-tree nodes as
@@ -566,7 +568,7 @@ impl Records {
     fn add_row(&mut self, key: &RecordKey, row: ActionRow) -> Option<usize> {
         let cap = self.row_cap;
         let cost = self.record(key).row_cost(&row);
-        if !self.record(key).takes_rows(cap) || !self.make_room(Some(key), cost) {
+        if !self.record(key).takes_rows(cap) || !self.admits(key, &row, cost) {
             self.record(key).rows_capped = true;
             return None;
         }
@@ -575,11 +577,19 @@ impl Records {
         Some(i)
     }
 
+    /// Whether `key`'s record may hold `row`, `cost` more bytes: its instance name is
+    /// one the record holds and the bytes fit. A reader is authorized on the record's
+    /// instance names, so a row of a name the record could not take (its bytes did
+    /// not fit, and the call marked the record incomplete) is never set.
+    fn admits(&mut self, key: &RecordKey, row: &ActionRow, cost: usize) -> bool {
+        self.record(key).instances.contains(&row.instance) && self.make_room(Some(key), cost)
+    }
+
     /// Replaces row `i` of `key`'s record with `row` if it fits; its index, or `None`
     /// with the row left as it was and the record marked incomplete.
     fn replace_row(&mut self, key: &RecordKey, i: usize, row: ActionRow) -> Option<usize> {
         let had = self.record(key).row_bytes[i];
-        if !self.make_room(Some(key), row.heap_bytes().saturating_sub(had)) {
+        if !self.admits(key, &row, row.heap_bytes().saturating_sub(had)) {
             self.record(key).mark_incomplete();
             return None;
         }
