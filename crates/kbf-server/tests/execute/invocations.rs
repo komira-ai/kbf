@@ -434,3 +434,37 @@ async fn timeouts_and_refusals_are_recorded() {
     assert!(mac_row.attempts.is_empty(), "no lease was granted");
     assert_eq!(inv.counts().failed, 3);
 }
+
+/// Catches farm events sent for operations no recorded call waits on (plant: no
+/// `recorded` check in `State::record_*`, or `record_submit` noting an operation
+/// for a call without an id): an id-less action that is granted, requeued, run and
+/// finished, and one that is refused, send nothing, so the farm builds no listing
+/// for them under its lock. A call with an id is sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn operations_without_an_id_send_no_events() {
+    let cell = Cell::start_with_unservable_wait(std::time::Duration::from_millis(500)).await;
+    let mut daemon = cell.daemon("node-a", 4, 8).await;
+    let run = Job::new("id-less, requeued once", &[]);
+    let mac = Job::new("id-less, mac only", &[("OSFamily", "macos")]);
+    cell.upload(&run.blobs()).await;
+    cell.upload(&mac.blobs()).await;
+
+    let mut ops = cell.execute(&run.action).await;
+    let first = daemon.start().await;
+    let lost = worker::Result {
+        lost: worker::Lost::Fenced as i32,
+        ..failed(first.lease_id, Code::Unavailable)
+    };
+    assert!(daemon.report(lost).await.accepted);
+    let second = daemon.start().await;
+    let result = output(&cell, "id-less", 0).await;
+    assert!(daemon.report(ran(second.lease_id, &result)).await.accepted);
+    done(&mut ops).await;
+    let mut ops = cell.execute(&mac.action).await;
+    done(&mut ops).await;
+    cell.recorder.caught_up().await;
+    assert_eq!(cell.recorder.sent(), 0, "no event for an id-less operation");
+
+    upload(&cell, BUILD, &[&Blob::new("with an id")]).await;
+    assert_eq!(cell.recorder.sent(), 1);
+}

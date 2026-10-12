@@ -230,6 +230,19 @@ first; 3.5 says what happens then.
   a bounded channel. **A full channel drops the event and never waits**: dispatch and
   cache reads are never slowed by the record. A drop marks the invocation
   `complete: false` and increments `kbf_invocation_events_dropped`.
+- The channel holds at most 65,536 events and, together, at most `--invocation-memory`
+  bytes of them (`Event::bytes`: each event and what it owns, its listing's outputs
+  most of all; an estimate, like the records' bytes); past either it drops. Each event's listing is cut where it is built,
+  at one output past a row's 1,000 (3.2), so that the row still says
+  `outputs_truncated`. So the channel holds no more than the bound, and the recorder
+  as a whole (records and channel) about twice it.
+- Only calls that carry an id make events, and only operations such a call waits on
+  (the farm notes each one as the call's Execute is submitted, and forgets it at the
+  operation's end). For any other call or operation a seam costs a branch or a set
+  lookup, and no event and no listing is built; with the recorder off, nothing is
+  noted.
+- The recorder's task applies events on a task of its own, beside the tick and the
+  listeners.
 - The seams that emit: the new metadata layer (calls and their ids); Execute's submit and
   its cached and joined answers (`kbf-front/src/execution.rs`); GetActionResult
   (`action_cache.rs`); the lease grant and `Sent` in `FarmMachine`; the requeue drain that
@@ -258,6 +271,21 @@ At the bound, in this order:
    taken, and its invocation says `rows_capped: true` too. One build at the
    1,000,000-row cap (3.3) does not fit in 256 MiB, so in stage 1 a very large build is
    capped by memory first.
+
+The bound holds after every event, for everything an event adds, not only new rows:
+rows already taken keep filling in (attempts, the outcome, the listing) after their
+invocation stops taking rows. Each addition is admitted like a row, making room in
+the order above; what still does not fit is left out, and the invocation says
+`complete: false`: a listing keeps the outputs that fit (and the row says
+`outputs_truncated: true`); an attempt, an outcome's message or reason, an instance
+name, a later Execute's row and a call's wait on its operation are not set; and a new
+invocation is not made, so its caller's next call makes it incomplete, as after a
+dropped call (3.4).
+
+The bound counts each invocation (its header, its rows and its entries in the
+recorder's indexes) and each operation the invocations' calls wait on (its attempts
+and its waiting calls). Not counted: the dropped calls of invocations not made yet,
+at most 1,024 of an id (at most 128 bytes) and an owner each.
 
 In stage 2 a flushed row is in a chunk and leaves memory, so the bound covers only
 unflushed rows and the header fields; step 3 then applies only when flushes fail

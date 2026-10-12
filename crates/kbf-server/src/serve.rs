@@ -118,12 +118,21 @@ pub struct Bound<F> {
     /// What `GET /readyz` reads besides the store; the serving future marks it
     /// stopping when `shutdown` completes.
     pub readiness: Arc<Readiness>,
-    /// Serves every listener, the tick and the invocation recorder until the shutdown
-    /// future completes.
+    /// Serves every listener and the tick, and runs the invocation recorder's task,
+    /// until the shutdown future completes.
     pub serving: F,
     /// The invocation records the serving future builds, read until the read API
     /// serves them.
     pub recorder: Recorder,
+}
+
+/// Aborts its task when dropped.
+struct AbortOnDrop(tokio::task::AbortHandle);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 fn bind(addr: SocketAddr) -> Result<(TcpIncoming, SocketAddr), ServeError> {
@@ -317,6 +326,9 @@ where
 
     let stop_readiness = Arc::clone(&readiness);
     let serving = async move {
+        // A task of its own: applying events never delays the tick or an accept loop,
+        // and they never delay it. It stops when the serving future does.
+        let _recording = AbortOnDrop(tokio::spawn(recording.run()).abort_handle());
         let (drain, draining) = tokio::sync::oneshot::channel::<()>();
         // `reapi_server` carries the REAPI TLS configuration when one is given, so
         // the health service is served over the same TLS as the REAPI routes; the
@@ -359,7 +371,6 @@ where
             served = worker_serve => served.map_err(ServeError::from),
             served = api_serve => served.map_err(ServeError::Api),
             () = ticking => Ok(()),
-            () = recording.run() => Ok(()),
             () = stopping => Ok(()),
         }
     };

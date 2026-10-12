@@ -190,6 +190,9 @@ struct State {
     paused: BTreeSet<WorkerId>,
     /// Where the invocation record's lease and finish events go ([`record`]).
     recorder: Recorder,
+    /// The operations a recorded call waits on: the only ones [`record`] tells the
+    /// recorder of. Each leaves at its end.
+    recorded: BTreeSet<OperationId>,
 }
 
 /// What a finished operation tells its callers, and the action-cache entry to write
@@ -239,6 +242,7 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
                 links: BTreeMap::new(),
                 paused: BTreeSet::new(),
                 recorder: Recorder::off(),
+                recorded: BTreeSet::new(),
             }),
         }
     }
@@ -1024,11 +1028,11 @@ impl State {
             .filter_map(|id| self.stages.get(id).cloned())
             .collect();
         let reason = detail.as_ref().and_then(Detail::reason);
-        let mut listing = None;
+        let mut stored = None;
         let (finished, write) = match (detail, answer.outcome) {
             (Some(Detail::Ran(pending)), _) => {
                 let Pending { result, record } = *pending;
-                listing = Some(kbf_front::listing(record.result, &result));
+                stored = Some(record.result);
                 let cacheable =
                     result.exit_code == 0 && waiters.first().is_some_and(|w| !w.do_not_cache);
                 let write = waiters
@@ -1059,7 +1063,7 @@ impl State {
                 None,
             ),
         };
-        self.record_finished(answer, &finished, listing, reason);
+        self.record_finished(answer, &finished, stored, reason);
         self.keep_finished(answer.operation, answer.waiters.clone());
         Settled {
             finished,
