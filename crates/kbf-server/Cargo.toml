@@ -14,6 +14,7 @@ form_urlencoded.workspace = true
 futures.workspace = true
 kbf-auth.workspace = true
 kbf-front.workspace = true
+kbf-invocation.workspace = true
 kbf-log.workspace = true
 kbf-caps.workspace = true
 kbf-mdm-api.workspace = true

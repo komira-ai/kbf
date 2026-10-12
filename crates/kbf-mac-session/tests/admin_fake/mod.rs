@@ -1,7 +1,9 @@
 //! A fake Mac for the `node-admin` tests: a real directory tree as the Mac's `/`,
 //! owners and access control lists from tables (a path nobody listed reads as
 //! root's; modes, types and sizes are the real ones), `defaults`, `pmset` and
-//! `sw_vers` over in-memory settings, and a log of every program run.
+//! `sw_vers` over in-memory settings, `dscl .` and `dseditgroup`
+//! over an in-memory directory service, `cron` and `at` files as a fresh Mac has them,
+//! and a log of every program run.
 
 #![allow(
     dead_code,
@@ -77,6 +79,17 @@ pub struct State {
     pub on_pause: Option<PauseHook>,
     pub on_command: Option<CommandHook>,
     pub now: SystemTime,
+    /// Directory service records (`/Users/<name>`, `/Groups/<name>`) and their
+    /// attributes.
+    pub ds: BTreeMap<String, BTreeMap<String, String>>,
+    /// The members of `admin`.
+    pub admins: BTreeSet<String>,
+    /// Groups by path, as `chown` set them.
+    pub groups: BTreeMap<PathBuf, u32>,
+    /// Every `chown`, as `<path> <uid>:<gid>`.
+    pub chowns: Vec<String>,
+    /// Paths whose `chown` fails.
+    pub chown_fails: BTreeSet<PathBuf>,
 }
 
 pub struct FakeMac {
@@ -152,6 +165,22 @@ impl FakeMac {
         let exe = base.join("sbin/kbf-mac-session");
         fs::write(&exe, "the helper").unwrap();
         fs::set_permissions(&exe, fs::Permissions::from_mode(0o755)).unwrap();
+        // As on a Mac: /private/var/at is daemon:wheel 0755, cron.deny lists Guest,
+        // at.deny is empty.
+        dir(&root.join("private/var/at"), 0o755);
+        fs::write(root.join("private/var/at/cron.deny"), "Guest\n").unwrap();
+        fs::write(root.join("private/var/at/at.deny"), "").unwrap();
+        let owners = BTreeMap::from([(root.join("private/var/at"), 1)]);
+        let record = |dir: &str, name: &str, key: &str, value: &str| {
+            let attributes = BTreeMap::from([(key.to_owned(), value.to_owned())]);
+            (format!("/{dir}/{name}"), attributes)
+        };
+        let ds = BTreeMap::from([
+            record("Users", "root", "UniqueID", "0"),
+            record("Users", "ops", "UniqueID", "501"),
+            record("Groups", "wheel", "PrimaryGroupID", "0"),
+            record("Groups", "staff", "PrimaryGroupID", "20"),
+        ]);
         let prefs = [
             (SOFTWARE_UPDATE, "AutomaticDownload"),
             (SOFTWARE_UPDATE, "AutomaticallyInstallMacOSUpdates"),
@@ -180,7 +209,7 @@ impl FakeMac {
         .map(|(key, value)| (key.to_owned(), value.to_owned()));
         let state = State {
             euid: 0,
-            owners: BTreeMap::new(),
+            owners,
             acls: BTreeSet::new(),
             lstat_fails: BTreeSet::new(),
             exe: Some(exe),
@@ -193,6 +222,11 @@ impl FakeMac {
             on_pause: None,
             on_command: None,
             now: UNIX_EPOCH + Duration::from_secs(NOW),
+            ds,
+            admins: BTreeSet::new(),
+            groups: BTreeMap::new(),
+            chowns: Vec::new(),
+            chown_fails: BTreeSet::new(),
         };
         Self {
             root,
@@ -210,6 +244,45 @@ impl FakeMac {
 
     pub fn record(&self) -> PathBuf {
         self.state_dir().join("phase0.before")
+    }
+
+    /// The role user's home.
+    pub fn home(&self) -> PathBuf {
+        self.base().join("home")
+    }
+
+    /// `/private/var/at`.
+    pub fn at_dir(&self) -> PathBuf {
+        self.root.join("private/var/at")
+    }
+
+    /// An attribute of a directory service record.
+    pub fn attribute(&self, record: &str, name: &str) -> Option<String> {
+        let state = self.state.borrow();
+        state.ds.get(record)?.get(name).cloned()
+    }
+
+    /// Sets an attribute of the user's directory service record, making the record.
+    pub fn set_user(&self, user: &str, name: &str, value: &str) {
+        self.set_attribute(&format!("/Users/{user}"), name, value);
+    }
+
+    /// Sets an attribute of the group's directory service record, making the record.
+    pub fn set_group(&self, group: &str, name: &str, value: &str) {
+        self.set_attribute(&format!("/Groups/{group}"), name, value);
+    }
+
+    fn set_attribute(&self, record: &str, name: &str, value: &str) {
+        let mut state = self.state.borrow_mut();
+        let attributes = state.ds.entry(record.to_owned()).or_default();
+        attributes.insert(name.to_owned(), value.to_owned());
+    }
+
+    /// Who owns `path`, and its group, as the fake says.
+    pub fn owner(&self, path: &Path) -> (u32, u32) {
+        let state = self.state.borrow();
+        let uid = state.owners.get(path).copied().unwrap_or(0);
+        (uid, state.groups.get(path).copied().unwrap_or(0))
     }
 
     pub fn admin_log(&self) -> PathBuf {
@@ -357,6 +430,59 @@ impl FakeMac {
             }
             ("/usr/bin/sw_vers", ["-productVersion"]) => ok("26.1\n".to_owned()),
             ("/usr/bin/sw_vers", ["-buildVersion"]) => ok("25B78\n".to_owned()),
+            ("/usr/bin/dscl", [".", "-read", record, name]) => {
+                // As dscl prints it: a value with a space in it on a line of its own.
+                let found = state
+                    .ds
+                    .get(*record)
+                    .map(|attributes| attributes.get(*name));
+                match found {
+                    None => CommandOutput {
+                        success: false,
+                        stdout: String::new(),
+                        stderr: "<dscl_cmd> DS Error: -14136 (eDSRecordNotFound)\n".to_owned(),
+                    },
+                    Some(None) => CommandOutput {
+                        success: false,
+                        stdout: String::new(),
+                        stderr: format!("No such key: {name}\n"),
+                    },
+                    Some(Some(value)) if value.contains(' ') => ok(format!("{name}:\n {value}\n")),
+                    Some(Some(value)) => ok(format!("{name}: {value}\n")),
+                }
+            }
+            ("/usr/bin/dscl", [".", "-create", record]) => {
+                state.ds.entry((*record).to_owned()).or_default();
+                ok(String::new())
+            }
+            ("/usr/bin/dscl", [".", "-create", record, name, value]) => {
+                let attributes = state.ds.entry((*record).to_owned()).or_default();
+                attributes.insert((*name).to_owned(), (*value).to_owned());
+                ok(String::new())
+            }
+            ("/usr/bin/dscl", [".", "-list", folder, name]) => {
+                let prefix = format!("{folder}/");
+                let mut text = String::new();
+                for (record, attributes) in &state.ds {
+                    if let (Some(short), Some(value)) =
+                        (record.strip_prefix(&prefix), attributes.get(*name))
+                    {
+                        text.push_str(&format!("{short:<30} {value}\n"));
+                    }
+                }
+                ok(text)
+            }
+            ("/usr/sbin/dseditgroup", ["-o", "checkmember", "-m", user, "admin"]) => {
+                if state.admins.contains(*user) {
+                    ok(format!("yes {user} is a member of admin\n"))
+                } else {
+                    CommandOutput {
+                        success: false,
+                        stdout: format!("no {user} is NOT a member of admin\n"),
+                        stderr: String::new(),
+                    }
+                }
+            }
             _ => panic!("the fake Mac has no answer for {text:?}"),
         }
     }
@@ -417,6 +543,19 @@ impl AdminHost for FakeMac {
             return Err(io::Error::new(io::ErrorKind::NotFound, "no such program"));
         }
         Ok(self.answer(&text, program, args))
+    }
+
+    fn chown(&self, path: &Path, uid: u32, gid: u32) -> io::Result<()> {
+        let mut state = self.state.borrow_mut();
+        if state.chown_fails.contains(path) {
+            return Err(io::Error::other("chown failed"));
+        }
+        // lchown: the path must be there, and a link is never followed.
+        fs::symlink_metadata(path)?;
+        state.chowns.push(format!("{} {uid}:{gid}", path.display()));
+        state.owners.insert(path.to_owned(), uid);
+        state.groups.insert(path.to_owned(), gid);
+        Ok(())
     }
 
     fn now(&self) -> SystemTime {

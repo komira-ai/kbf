@@ -1,7 +1,9 @@
 //! The interpreter budget file, [`BUDGET`]: the shell, Python, awk, sed, Perl and Ruby
-//! this repository still holds, listed by path under a `[files]`, `[workflow]` or
-//! `[src-sh-c]` header, one `<key>\t<reason>` row each. A line starting with `#` and a
-//! blank line are skipped.
+//! this repository still holds, listed by path under a `[files]` or `[src-sh-c]` header,
+//! one `<key>\t<reason>` row each. A line starting with `#` and a blank line are
+//! skipped. [`parse`] also reads a `[workflow]` section, which once listed workflow
+//! `run:` steps with shell logic; the repository lints refuse any row in it now, and it
+//! is still read so that `budget-diff` can compare against a base list that has it.
 //!
 //! [`parse`] reads the file; the repository lints (`crates/kbf-it/tests/repo_lints.rs`)
 //! hold it against what the tree contains. [`new_rows`] is `cargo xtask budget-diff`:

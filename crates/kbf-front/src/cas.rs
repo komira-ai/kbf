@@ -22,8 +22,12 @@ use kbf_types::Digest;
 use prost::Message;
 use tonic::{Request, Response, Status, Streaming};
 
+use kbf_invocation::CallKind;
+
 use crate::cache::{Cache, CacheError, VerifiedBlob};
 use crate::meta_log::MetaLog;
+use crate::recorder::Recorder;
+use crate::request_metadata::call_metadata;
 use crate::{MAX_BATCH_TOTAL_BYTES, wire};
 
 /// Directories per `GetTreeResponse` when the client sets no smaller page size.
@@ -38,13 +42,27 @@ const TREE_PAGE_DIRECTORIES: usize = 1_000;
 pub struct CasService<M, O> {
     cache: Arc<Cache<M, O>>,
     authorizers: Arc<Authorizers>,
+    recorder: Recorder,
 }
 
 impl<M, O> CasService<M, O> {
     /// The service over `cache`, each call authorized by `authorizers`.
     #[must_use]
     pub const fn with_authorizers(cache: Arc<Cache<M, O>>, authorizers: Arc<Authorizers>) -> Self {
-        Self { cache, authorizers }
+        Self {
+            cache,
+            authorizers,
+            recorder: Recorder::off(),
+        }
+    }
+
+    /// This service, each FindMissingBlobs, BatchUpdateBlobs and BatchReadBlobs call
+    /// that carries an invocation id sent to `recorder`: the digests asked and missing,
+    /// the bytes stored and the bytes read.
+    #[must_use]
+    pub fn recording(mut self, recorder: Recorder) -> Self {
+        self.recorder = recorder;
+        self
     }
 }
 
@@ -70,6 +88,7 @@ impl<M: MetaLog, O: ObjectStore + 'static> ContentAddressableStorage for CasServ
         request: Request<FindMissingBlobsRequest>,
     ) -> Result<Response<FindMissingBlobsResponse>, Status> {
         let caller = kbf_auth::metadata(&request);
+        let metadata = call_metadata(&request);
         let request = request.into_inner();
         let find_missing = &*self.authorizers.cas_find_missing;
         let call = cas_call!("FindMissingBlobs");
@@ -77,6 +96,13 @@ impl<M: MetaLog, O: ObjectStore + 'static> ContentAddressableStorage for CasServ
         wire::check_digest_function(request.digest_function)?;
         let digests = wire::digests(&request.blob_digests)?;
         let missing = self.cache.find_missing(&digests).await?;
+        let instance = &request.instance_name;
+        self.recorder.call(&metadata, &caller, instance, &|| {
+            CallKind::FindMissingBlobs {
+                asked: digests.len() as u64,
+                missing: missing.len() as u64,
+            }
+        });
         Ok(Response::new(FindMissingBlobsResponse {
             missing_blob_digests: missing.iter().map(wire::digest_to_proto).collect(),
         }))
@@ -89,6 +115,7 @@ impl<M: MetaLog, O: ObjectStore + 'static> ContentAddressableStorage for CasServ
         request: Request<BatchUpdateBlobsRequest>,
     ) -> Result<Response<BatchUpdateBlobsResponse>, Status> {
         let caller = kbf_auth::metadata(&request);
+        let metadata = call_metadata(&request);
         let request = request.into_inner();
         let call = cas_call!("BatchUpdateBlobs");
         authorize(
@@ -114,6 +141,12 @@ impl<M: MetaLog, O: ObjectStore + 'static> ContentAddressableStorage for CasServ
             .iter()
             .filter_map(|(_, c)| c.as_ref().ok().cloned())
             .collect();
+        // The bytes the client sent that verified, stored or not.
+        let uploaded: u64 = good.iter().map(|b| b.digest().size_bytes).sum();
+        let instance = &request.instance_name;
+        self.recorder.call(&metadata, &caller, instance, &|| {
+            CallKind::Uploaded(uploaded)
+        });
         let stored = self.cache.store_blobs(good).await.map_err(Status::from);
         let responses = checked
             .into_iter()
@@ -138,6 +171,7 @@ impl<M: MetaLog, O: ObjectStore + 'static> ContentAddressableStorage for CasServ
         request: Request<BatchReadBlobsRequest>,
     ) -> Result<Response<BatchReadBlobsResponse>, Status> {
         let caller = kbf_auth::metadata(&request);
+        let metadata = call_metadata(&request);
         let request = request.into_inner();
         let call = cas_call!("BatchReadBlobs");
         authorize(
@@ -175,6 +209,11 @@ impl<M: MetaLog, O: ObjectStore + 'static> ContentAddressableStorage for CasServ
                 status: Some(status),
             });
         }
+        let downloaded: usize = responses.iter().map(|r| r.data.len()).sum();
+        self.recorder
+            .call(&metadata, &caller, &request.instance_name, &|| {
+                CallKind::Downloaded(downloaded as u64)
+            });
         Ok(Response::new(BatchReadBlobsResponse { responses }))
     }
 

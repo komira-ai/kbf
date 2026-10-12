@@ -7,7 +7,7 @@ mod support;
 use kbf_invocation::{
     AttemptEnd, CallKind, Event, ExecuteAnswer, How, IDLE_AFTER, LeaseEnd, Listing, Metadata,
     OUTPUTS_PER_ROW, Outcome, Output, REASON_CAP, ROW_CAP, RecordKey, Records, State, TEXT_CAP,
-    WallTime,
+    Text, WallTime,
 };
 use kbf_sched::RequeueReason;
 use kbf_types::{Failure, LostWhy, OperationId, WorkerId};
@@ -428,10 +428,10 @@ fn texts_and_reasons_are_capped() {
         },
     );
     c.metadata = Metadata {
-        target: Some(long),
-        mnemonic: Some("CxxCompile".to_owned()),
-        configuration: Some(String::new()),
-        action_id: Some("x".repeat(TEXT_CAP)),
+        target: Some(Text::sent(long)),
+        mnemonic: Some(Text::sent("CxxCompile")),
+        configuration: Some(Text::sent(String::new())),
+        action_id: Some(Text::sent("x".repeat(TEXT_CAP))),
         ..Metadata::default()
     };
     let reason = "r".repeat(REASON_CAP + 10);
@@ -769,4 +769,32 @@ fn attempts_keep_each_requeue_reason_and_failure_class() {
             Some(AttemptEnd::Failed(Failure::OutOfMemory, "oom".to_owned())),
         ]
     );
+}
+
+/// Catches the metadata layer's truncation lost on the way in (plant `Text::kept`
+/// marking only what it cuts itself): the layer already cut `target` to the same
+/// cap, so the row sees no excess, yet the client sent more.
+#[test]
+fn a_text_the_metadata_layer_cut_stays_marked_truncated() {
+    let mut c = call(
+        "a",
+        t(0),
+        CallKind::Execute {
+            action: d(1),
+            answer: ExecuteAnswer::Queued {
+                name: name("a", 1),
+                operation: OperationId(1),
+            },
+        },
+    );
+    c.metadata.target = Some(Text {
+        value: "//cut".to_owned(),
+        truncated: true,
+    });
+    c.metadata.mnemonic = Some(Text::sent("CxxCompile"));
+    let r = records([ev(c)]);
+    let row = &r.get(&key("a")).expect("a").rows()[0];
+    let target = row.target.as_ref().expect("target kept");
+    assert_eq!((target.value.as_str(), target.truncated), ("//cut", true));
+    assert!(!row.mnemonic.as_ref().expect("mnemonic kept").truncated);
 }
