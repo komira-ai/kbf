@@ -182,18 +182,28 @@ the action detail links the Action and Command blobs like any other blob.
 
 ### 3.3 Cost per action
 
-Estimated from the field encodings, not measured (PR 2 measures it):
+Measured on the `kbf.invocation.v1` encoding by
+`crates/kbf-invocation/tests/bytes_per_action.rs`, on a 1,000-action event stream shaped
+like a buck2 build (a UUID id and no other `RequestMetadata`, per-caller operation names,
+eight nodes, buck2 output paths of 66 to 70 bytes, both log digests on every result, no
+`ResourceUsage`). The test builds the stream; none is captured from a client until the
+recorder lands (PR 3). Each time is a signed offset in microseconds from `first_seen`,
+and each digest its 32 raw bytes and size.
 
-- core row (three digests, operation name, lease, worker, four timestamps, outcome tag):
-  about 170 B; storing each timestamp as a delta from `first_seen` brings it to about
-  130 B;
-- plus each output about 45 B and its path, and about 90 B for the stdout and stderr
-  digests;
-- plus `RequestMetadata` text when sent: 50 to 200 B; plus a rerun about 40 B each.
+- core row (Action digest, instance, operation name, one attempt with its lease, worker
+  and four times, outcome, result digest): 158 B, against the 130 B estimated for delta
+  times;
+- plus each output 44 B and its path (estimated 45 B), and 76 B for the stdout and
+  stderr digests (estimated 90 B);
+- plus a rerun 44 B (estimated 40 B); plus `RequestMetadata` text when sent, not
+  measured (buck2 sends none), estimated 50 to 200 B.
+
+The stream's average row (1.875 outputs, a rerun in 50 actions) is 444 B; a
+GetActionResult hit with the same listing is 378 B.
 
 So about 300 to 700 B for an action with a few outputs. At the pilot rate of about 4
 operations a second (the comment on `FINISHED_RETENTION` in `scheduler.rs`) that is
-about 100 to 240 MB a day before cache hits;
+about 100 to 240 MB a day before cache hits (about 150 MB at the measured 444 B);
 recording GetActionResult hits multiplies it by the hit rate. This volume is why the
 record is not written into the replicated log (3.5).
 

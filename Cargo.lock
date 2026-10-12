@@ -1351,6 +1351,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "kbf-invocation"
+version = "0.1.0"
+dependencies = [
+ "kbf-sched",
+ "kbf-types",
+ "prost",
+ "prost-build",
+ "protox",
+]
+
+[[package]]
 name = "kbf-it"
 version = "0.1.0"
 dependencies = [

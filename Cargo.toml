@@ -52,6 +52,9 @@ objc2-open-directory = { version = "0.3.2", default-features = false, features =
 proc-macro2 = "1.0.107"
 prost = "0.14.4"
 prost-types = "0.14.4"
+# Message-only code for a proto with no gRPC service (kbf-invocation). Already in the
+# tree through tonic-prost-build.
+prost-build = "0.14.4"
 protox = "0.9.1"
 rand = "0.10.3"
 rand_chacha = "0.10.0"
@@ -121,6 +124,7 @@ kbf-driver-native = { path = "crates/kbf-driver-native" }
 kbf-estimator = { path = "crates/kbf-estimator" }
 kbf-front = { path = "crates/kbf-front" }
 kbf-host = { path = "crates/kbf-host" }
+kbf-invocation = { path = "crates/kbf-invocation" }
 kbf-it = { path = "crates/kbf-it" }
 kbf-log = { path = "crates/kbf-log" }
 kbf-mac-session = { path = "crates/kbf-mac-session" }
