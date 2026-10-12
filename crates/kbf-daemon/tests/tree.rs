@@ -181,7 +181,7 @@ async fn a_tree_is_written_as_described() {
     let leaf = Directory {
         files: vec![FileNode {
             is_executable: true,
-            ..file("run", Some(cas.insert(b"#!/bin/sh\n".to_vec())))
+            ..file("run", Some(cas.insert(b"an executable file\n".to_vec())))
         }],
         ..Directory::default()
     };

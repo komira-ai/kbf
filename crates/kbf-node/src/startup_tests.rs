@@ -14,7 +14,9 @@ use kbf_daemon::cas::{Cas as _, CasClient};
 use kbf_driver_native::network::Isolation;
 use kbf_proto::reapi::execution_client::ExecutionClient;
 use kbf_proto::reapi::platform::Property;
-use kbf_proto::reapi::{Action, Command, Digest, Directory, ExecuteRequest, Platform};
+use kbf_proto::reapi::{
+    Action, ActionResult, Command, Digest, Directory, ExecuteRequest, Platform,
+};
 use kbf_server::{Api, Listeners, WorkerTls, bind_server_with_api};
 use prost::Message as _;
 use rcgen::{CertificateParams, CertifiedIssuer, IsCa, KeyPair};
@@ -22,7 +24,7 @@ use serde_json::Value;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tonic::transport::{Certificate, Channel, Endpoint, Identity, ServerTlsConfig};
 
-use super::tests::{scratch, surveyed};
+use super::tests::{fake, scratch, surveyed};
 
 // The native runtime here starts its keepers from the running binary: this test binary,
 // whose `main` (the one that calls `kbf_daemon::keeper::dispatch`) does not run.
@@ -86,8 +88,9 @@ async fn software_until(api: SocketAddr, done: impl Fn(&Value) -> bool) -> Value
     }
 }
 
-/// Stores an action naming `xcode=<build>` that writes its `DEVELOPER_DIR` to `marker`.
-async fn action(cas: &CasClient, build: &str, marker: &Path) -> Digest {
+/// Stores an action naming `xcode=<build>` that, run by `act` (kbf-testkit's act verbs),
+/// writes `ran` to `marker` and prints its `DEVELOPER_DIR`.
+async fn action(cas: &CasClient, build: &str, act: &Path, marker: &Path) -> Digest {
     let put = |message: Vec<u8>| async move { cas.put(message).await.expect("upload") };
     // On the Action, where REAPI v2.2 reads it (the Command's field is deprecated).
     let platform = Some(Platform {
@@ -96,9 +99,9 @@ async fn action(cas: &CasClient, build: &str, marker: &Path) -> Digest {
             value: build.to_owned(),
         }],
     });
-    let script = format!("echo \"$DEVELOPER_DIR\" > '{}'", marker.display());
+    let (act, marker) = (act.display().to_string(), marker.display().to_string());
     let command = Command {
-        arguments: ["/bin/sh", "-c", script.as_str()]
+        arguments: [&act, "append", &marker, "ran", ";", "env", "DEVELOPER_DIR"]
             .map(str::to_owned)
             .to_vec(),
         ..Command::default()
@@ -112,8 +115,8 @@ async fn action(cas: &CasClient, build: &str, marker: &Path) -> Digest {
     put(action.encode_to_vec()).await
 }
 
-/// Executes `action` until its operation is done; returns the action's exit code.
-async fn execute(reapi: Channel, action: Digest) -> i32 {
+/// Executes `action` until its operation is done; returns its result.
+async fn execute(reapi: Channel, action: Digest) -> ActionResult {
     use kbf_proto::google::longrunning::operation;
     let mut ops = ExecutionClient::new(reapi)
         .execute(ExecuteRequest {
@@ -135,7 +138,7 @@ async fn execute(reapi: Channel, action: Digest) -> i32 {
     };
     let response =
         kbf_proto::reapi::ExecuteResponse::decode(any.value.as_slice()).expect("response");
-    response.result.expect("a result").exit_code
+    response.result.expect("a result")
 }
 
 /// Catches (issue #164, review of PR #173): the native daemon waiting for its first
@@ -147,7 +150,8 @@ async fn execute(reapi: Channel, action: Digest) -> i32 {
 /// removal an Xcode must never get), shown as another state, or raised for attention
 /// (nothing for a human to do); and the survey's result never reaching the server, or
 /// not without a restart. The Xcode's `xcodebuild` answers only once the test lets it
-/// (or after 20 s, so a red run ends).
+/// (and fails after 20 s, so a red run ends). The action runs kbf-testkit's act verbs,
+/// through a link to this test binary.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_daemon_says_hello_before_its_first_survey_ends() {
     let dir = scratch("startup");
@@ -178,27 +182,19 @@ async fn the_daemon_says_hello_before_its_first_survey_ends() {
     tokio::spawn(async move { bound.serving.await.expect("serve") });
 
     let go = dir.join("go");
-    let write = |path: &Path, script: &str| {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::create_dir_all(path.parent().expect("parent")).expect("dir");
-        std::fs::write(path, script).expect("script");
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
-    };
     let apps = dir.join("Applications");
     let developer_dir = apps.join("Xcode_1.app/Contents/Developer");
-    write(
+    let wait = format!("wait-for {} 20", go.display());
+    fake(
         &developer_dir.join(kbf_driver_native::xcode::XCODEBUILD),
-        &format!(
-            "#!/bin/sh\n\
-             i=0; while [ ! -e '{}' ] && [ $i -lt 200 ]; do sleep 0.1; i=$((i+1)); done\n\
-             case \"$*\" in -version) echo 'Build version 1A1' ;; esac\n",
-            go.display()
-        ),
+        &format!("-version\t-\t{wait} ; echo Build version 1A1\n*\t-\t{wait}\n"),
     );
     let xcrun = dir.join("bin/xcrun");
-    write(&xcrun, "#!/bin/sh\necho /x/clang\n");
+    fake(&xcrun, "*\t-\techo /x/clang\n");
     let sandbox_exec = dir.join("bin/sandbox-exec");
-    write(&sandbox_exec, "#!/bin/sh\nshift 4\nexec \"$@\"\n");
+    fake(&sandbox_exec, "");
+    let act = dir.join("bin").join(kbf_testkit::act::NAME);
+    kbf_testkit::act::link_self(&act).expect("link");
     let flag = |name: &str, path: &Path| format!("--{name}={}", path.display());
     let cli = Cli::try_parse_from([
         "kbf-daemon".to_owned(),
@@ -264,7 +260,8 @@ async fn the_daemon_says_hello_before_its_first_survey_ends() {
         .await
         .expect("connect");
     let marker = dir.join("ran");
-    let named = action(&CasClient::new(channel.clone()), "1A1", &marker).await;
+    let cas = CasClient::new(channel.clone());
+    let named = action(&cas, "1A1", &act, &marker).await;
     let running = tokio::spawn(execute(channel, named));
     // Long enough for the server to place it (it ticks every 50 ms) were it placeable.
     tokio::time::sleep(Duration::from_secs(1)).await;
@@ -280,14 +277,18 @@ async fn the_daemon_says_hello_before_its_first_survey_ends() {
         serde_json::json!(["1A1"]),
         "{software}"
     );
-    let code = tokio::time::timeout(PROMPT, running)
+    let result = tokio::time::timeout(PROMPT, running)
         .await
         .expect("placed once surveyed")
         .expect("execute");
-    assert_eq!(code, 0);
-    let ran_with = std::fs::read_to_string(&marker).expect("ran");
+    assert_eq!(result.exit_code, 0);
+    assert_eq!(std::fs::read_to_string(&marker).expect("ran"), "ran\n");
+    let stdout = cas
+        .get(result.stdout_digest.as_ref().expect("stdout"))
+        .await
+        .expect("stdout in the CAS");
     assert_eq!(
-        ran_with.trim_end(),
+        String::from_utf8_lossy(&stdout).trim_end(),
         real_developer_dir.display().to_string()
     );
     drop(reports);

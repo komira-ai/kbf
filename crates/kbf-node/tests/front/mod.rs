@@ -171,8 +171,9 @@ impl Front {
     }
 
     /// Stores an action that runs `/bin/sh -c script` in an empty input root; returns
-    /// its digest.
-    pub fn sh(&self, script: &str) -> Digest {
+    /// its digest. Only for the tests of how the daemon ends a user's shell command and
+    /// the background job it starts (the shell's `$$` and `$!` name the processes).
+    pub fn user_shell(&self, script: &str) -> Digest {
         self.runtime.block_on(async {
             let channel = Endpoint::from_shared(format!("http://{}", self.cas))
                 .expect("endpoint")

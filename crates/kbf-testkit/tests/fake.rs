@@ -182,8 +182,10 @@ fn xcodebuild_found_through_path_reads_its_own_rules() {
 }
 
 /// Catches: `sandbox-exec` running its own options as the command, not running the
-/// command, a matched rule's steps skipped before the command, no command not
-/// refused, and a command that cannot be run not reported (exit 1).
+/// command, a matched rule's steps skipped before the command, a `-D NAME=VALUE` not
+/// in the command's environment (a test could not tell a command run under it from
+/// one run without it) or a malformed one accepted, no command not refused, and a
+/// command that cannot be run not reported (exit 1).
 #[test]
 fn sandbox_exec_runs_its_rule_then_becomes_the_command() {
     let dir = dir("fake-sandbox-exec");
@@ -203,12 +205,14 @@ fn sandbox_exec_runs_its_rule_then_becomes_the_command() {
             "n",
             ACT,
         ])
-        .args(["echo", "ran", ";", "append", &pid_file, "x"])
+        .args([
+            "echo", "ran", ";", "env", "LEASE", ";", "append", &pid_file, "x",
+        ])
         .env("TMPDIR", "/tmp/lease")
         .output()
         .expect("runs");
     assert_eq!(out.status.code(), Some(0), "{out:?}");
-    assert_eq!(text(&out.stdout), "ran\n");
+    assert_eq!(text(&out.stdout), "ran\n/l\n");
     assert_eq!(
         std::fs::read_to_string(&note).expect("note"),
         "TMPDIR=/tmp/lease\n"
@@ -220,6 +224,12 @@ fn sandbox_exec_runs_its_rule_then_becomes_the_command() {
         .expect("runs");
     assert_eq!(out.status.code(), Some(2), "{out:?}");
     assert!(text(&out.stderr).contains("usage: sandbox-exec"), "{out:?}");
+    let out = Command::new(&fake)
+        .args(["-D", "LEASE", ACT, "exit", "0"])
+        .output()
+        .expect("runs");
+    assert_eq!(out.status.code(), Some(2), "{out:?}");
+    assert!(text(&out.stderr).contains("is not NAME=VALUE"), "{out:?}");
     let missing = dir.join("missing").display().to_string();
     for command in [vec![missing.as_str()], vec!["-p", "x", &missing, "-p"]] {
         let out = Command::new(&fake).args(&command).output().expect("runs");

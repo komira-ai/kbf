@@ -59,7 +59,7 @@ impl Cas for MemoryCas {
 /// One input file: path (slash-separated), contents, executable.
 pub type Input = (&'static str, &'static [u8], bool);
 
-/// An action to store: `sh -c <script>` unless `argv` is replaced.
+/// An action to store: its argv, environment, working directory, outputs and inputs.
 #[derive(Clone, Debug)]
 pub struct Spec {
     pub argv: Vec<String>,
@@ -71,9 +71,23 @@ pub struct Spec {
 }
 
 impl Spec {
-    pub fn sh(script: &str) -> Self {
+    /// Runs kbf-testkit's act `steps` (`;` between two), through
+    /// [`super::act_program`].
+    pub fn act(steps: &[&str]) -> Self {
+        let program = super::act_program().display().to_string();
+        Self::argv(std::iter::once(program.as_str()).chain(steps.iter().copied()))
+    }
+
+    /// Runs `/bin/sh -c script`. Only for a test of how the daemon runs a user's shell
+    /// command; every other action runs [`Spec::act`].
+    pub fn user_shell(script: &str) -> Self {
+        Self::argv(["/bin/sh", "-c", script])
+    }
+
+    /// Runs `argv`.
+    pub fn argv<'a>(argv: impl IntoIterator<Item = &'a str>) -> Self {
         Self {
-            argv: vec!["/bin/sh".to_owned(), "-c".to_owned(), script.to_owned()],
+            argv: argv.into_iter().map(str::to_owned).collect(),
             env: Vec::new(),
             working_directory: String::new(),
             outputs: Vec::new(),

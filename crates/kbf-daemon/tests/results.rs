@@ -192,7 +192,7 @@ async fn a_missing_input_is_reported_as_missing() {
     let mut h = Harness::with_runtime("missing-wire", runtime, LONG).await;
     let mut peer = h.welcomed().await;
 
-    let action = Spec::sh("cat data")
+    let action = Spec::act(&["upper", "copy", "data"])
         .inputs(&[("data", b"absent", false)])
         .store(&cas);
     let data = digest_of(b"absent");
@@ -218,7 +218,7 @@ async fn a_missing_input_is_reported_as_missing() {
     assert_eq!(violation.r#type, "MISSING");
     assert_eq!(violation.subject, format!("blobs/{blob}"));
 
-    let mut invalid = Spec::sh("true");
+    let mut invalid = Spec::act(&["exit", "0"]);
     invalid.working_directory = "/abs".to_owned();
     peer.start_action(1, 2, "action", invalid.store(&cas));
     let (_, result) = peer.result(PROMPT).await.expect("a Result");

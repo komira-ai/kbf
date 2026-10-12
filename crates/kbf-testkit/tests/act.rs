@@ -123,6 +123,86 @@ fn files_are_appended_and_upper_cased() {
     );
 }
 
+/// Catches: `rename` copying (the old name left) or not replacing; `symlink` with its
+/// target and link swapped, or a copy instead of a link; `chmod` setting other bits
+/// than asked (a test of a directory nobody may write would pass on a writable one).
+#[test]
+fn paths_are_renamed_linked_and_chmodded() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = dir("act-paths");
+    let (from, to, link) = (dir.join("from"), dir.join("to"), dir.join("link"));
+    std::fs::write(&from, "moved").expect("from");
+    std::fs::write(&to, "replaced").expect("to");
+    let [from_arg, to_arg, link_arg] = [&from, &to, &link].map(|p| p.display().to_string());
+    let out = output(&[
+        "rename", &from_arg, &to_arg, ";", "symlink", "to", &link_arg, ";", "chmod", "640", &to_arg,
+    ]);
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    assert!(!from.exists(), "the old name is left");
+    assert_eq!(std::fs::read_to_string(&to).expect("to"), "moved");
+    assert_eq!(
+        std::fs::read_link(&link).expect("a link"),
+        Path::new("to"),
+        "the link's target"
+    );
+    let mode = std::fs::metadata(&to).expect("to").permissions().mode();
+    assert_eq!(mode & 0o7777, 0o640, "{mode:o}");
+}
+
+/// Catches: `wait-for` returning before the path exists (a test gated on it would go
+/// on at once), waiting on although it is there, or never giving up (a red run of a
+/// test gated on it would hang instead of failing).
+#[test]
+fn wait_for_returns_when_the_path_appears_and_gives_up_in_time() {
+    let dir = dir("act-wait-for");
+    let gate = dir.join("gate");
+    let gate_arg = gate.display().to_string();
+    let started = Instant::now();
+    let mut waiting = act(&["wait-for", &gate_arg, "10", ";", "echo", "through"])
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("runs");
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        waiting.try_wait().expect("status").is_none(),
+        "went on before the path existed"
+    );
+    std::fs::write(&gate, "").expect("gate");
+    let out = waiting.wait_with_output().expect("exits");
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    assert_eq!(text(&out.stdout), "through\n");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        started.elapsed()
+    );
+
+    let out = output(&["wait-for", &gate_arg, "0", ";", "echo", "there"]);
+    assert_eq!(text(&out.stdout), "there\n", "{out:?}");
+
+    let started = Instant::now();
+    let missing = dir.join("missing").display().to_string();
+    let out = output(&["wait-for", &missing, "0.3"]);
+    let took = started.elapsed();
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(took >= Duration::from_millis(300), "{took:?}");
+    assert!(took < Duration::from_secs(5), "{took:?}");
+}
+
+/// Catches: `act::main` answering only under the name `kbf-act` (another crate's bin
+/// has a name of its own, and would run nothing), or differently from the hook.
+#[test]
+fn main_answers_under_any_name() {
+    use std::os::unix::process::CommandExt as _;
+    let out = Command::new(ACT)
+        .arg0("kbf-other-act")
+        .args(["echo", "from", "main", ";", "exit", "4"])
+        .output()
+        .expect("runs");
+    assert_eq!(out.status.code(), Some(4), "{out:?}");
+    assert_eq!(text(&out.stdout), "from main\n");
+}
+
 /// Catches: a failed step exiting 0 or 2 (taken for success or for a typo); a
 /// malformed step found only when reached, after earlier steps ran; a failure with
 /// nothing on stderr; an argument that is not UTF-8 accepted.
@@ -133,7 +213,14 @@ fn failures_exit_1_and_usage_errors_exit_2_before_any_step() {
     let early = dir.join("early").display().to_string();
     let missing = dir.join("missing").display().to_string();
     let no_dir = dir.join("no/such/file").display().to_string();
-    let cases: [(&[&str], i32, &str); 8] = [
+    let taken = dir.join("taken");
+    std::fs::write(&taken, "").expect("taken");
+    let taken = taken.display().to_string();
+    let cases: [(&[&str], i32, &str); 12] = [
+        (&["rename", &missing, &early], 1, "rename "),
+        (&["symlink", &missing, &taken], 1, "link "),
+        (&["chmod", "644", &missing], 1, "chmod "),
+        (&["wait-for", &missing, "0"], 1, "not there after"),
         (&["env", "KBF_NEVER_SET"], 1, "KBF_NEVER_SET is not set"),
         (&["upper", &early, &missing], 1, "read "),
         (&["upper", &no_dir, ACT], 1, "create "),

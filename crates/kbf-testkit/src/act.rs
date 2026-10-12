@@ -22,31 +22,79 @@
 //!   process group already);
 //! - `alloc MIB`: touches `MIB` MiB (rounded up to 16 MiB) of distinct, incompressible
 //!   memory and holds it until the program exits;
-//! - `upper OUT IN`: writes `IN`, ASCII upper-cased, to `OUT`.
+//! - `upper OUT IN`: writes `IN`, ASCII upper-cased, to `OUT`;
+//! - `rename FROM TO`: renames `FROM` to `TO`, as rename(2) does;
+//! - `symlink TARGET LINK`: makes `LINK` a symbolic link to `TARGET`;
+//! - `chmod MODE PATH`: sets the permission bits of `PATH` to `MODE`, in octal (at most
+//!   `7777`);
+//! - `wait-for PATH SECS`: waits until `PATH` exists, looking every 10 ms, and fails
+//!   if it does not within `SECS` seconds (`0` looks once).
 //!
 //! [`main`] first looks at argv0: run through a link named for a tool of
 //! [`crate::fake`], it answers as that tool instead.
+//!
+//! A test binary has no `main` of its own. One that expands
+//! [`act_test_hook!`](crate::act_test_hook) answers in the same way when it is run
+//! through a link named [`NAME`] or for a fake's tool, which [`link_self`] makes: so a
+//! crate's tests, unit tests included, run the act steps without a bin of their own.
 
+use std::ffi::OsStr;
 use std::io::Write as _;
+use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::process::CommandExt as _;
+use std::path::Path;
 use std::process::{Command, ExitCode};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rustix::process::Signal;
 
 use crate::{Error, create, failed, number, read, write_line};
 
+/// The base name a link to a test binary that expands
+/// [`act_test_hook!`](crate::act_test_hook) has, to run the act steps.
+pub const NAME: &str = "kbf-act";
+
 /// Runs `kbf-act` on the process's arguments, or the fake its argv0 names.
 #[must_use]
 pub fn main() -> ExitCode {
     let (argv0, args) = crate::arguments();
-    match crate::fake::Tool::named(&argv0) {
-        Some(tool) => crate::exit_with(
+    ExitCode::from(answer(&argv0, args))
+}
+
+/// The exit status of the fake `argv0` names, or else of the steps in `args`.
+fn answer(argv0: &str, args: Result<Vec<String>, Error>) -> u8 {
+    match crate::fake::Tool::named(argv0) {
+        Some(tool) => crate::status(
             tool.name(),
-            args.and_then(|args| crate::fake::run(tool, &argv0, &args)),
+            args.and_then(|args| crate::fake::run(tool, argv0, &args)),
         ),
-        None => crate::exit_with("kbf-act", args.and_then(|args| run(&args))),
+        None => crate::status(NAME, args.and_then(|args| run(&args))),
     }
+}
+
+/// [`main`] for a test binary, which has no `main` of its own: when argv0's base name
+/// is [`NAME`] or a fake's tool, answers as [`main`] does and exits with the status;
+/// otherwise returns, and the test harness starts. Called by
+/// [`act_test_hook!`](crate::act_test_hook) before the harness reads its arguments.
+#[doc(hidden)]
+pub fn hook() {
+    let (argv0, args) = crate::arguments();
+    if Path::new(&argv0).file_name() == Some(OsStr::new(NAME))
+        || crate::fake::Tool::named(&argv0).is_some()
+    {
+        std::process::exit(i32::from(answer(&argv0, args)));
+    }
+}
+
+/// Makes `link` a symbolic link to the running program. A test binary that expands
+/// [`act_test_hook!`](crate::act_test_hook) runs the act steps through a link named
+/// [`NAME`], and answers as a fake through one named for its tool.
+///
+/// # Errors
+///
+/// When the running program's path cannot be read or the link cannot be made.
+pub fn link_self(link: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(std::env::current_exe()?, link)
 }
 
 /// Checks and runs the steps in `args`, returning the exit status.
@@ -80,6 +128,22 @@ pub(crate) enum Step<'a> {
     Upper {
         out: &'a str,
         input: &'a str,
+    },
+    Rename {
+        from: &'a str,
+        to: &'a str,
+    },
+    Symlink {
+        target: &'a str,
+        link: &'a str,
+    },
+    Chmod {
+        mode: u32,
+        path: &'a str,
+    },
+    WaitFor {
+        path: &'a str,
+        within: Duration,
     },
 }
 
@@ -135,6 +199,19 @@ fn step(words: &[String]) -> Result<Step<'_>, Error> {
         ["setsid"] => Step::Setsid,
         ["alloc", mib] => Step::Alloc(number(mib)?),
         ["upper", out, input] => Step::Upper { out, input },
+        ["rename", from, to] => Step::Rename { from, to },
+        ["symlink", target, link] => Step::Symlink { target, link },
+        ["chmod", mode, path] => Step::Chmod {
+            mode: u32::from_str_radix(mode, 8)
+                .ok()
+                .filter(|m| *m <= 0o7777)
+                .ok_or_else(|| Error::Usage(format!("{mode:?} is not an octal mode")))?,
+            path,
+        },
+        ["wait-for", path, secs] => Step::WaitFor {
+            path,
+            within: seconds(secs)?,
+        },
         _ => return Err(Error::Usage(format!("bad step: {strs:?}"))),
     })
 }
@@ -194,10 +271,33 @@ pub(crate) fn perform(steps: &[Step<'_>]) -> Result<Option<u8>, Error> {
             }
             Step::Alloc(mib) => held.extend(crate::touch(*mib, Duration::ZERO)),
             Step::Upper { out, input } => create(out, &read(input)?.to_ascii_uppercase())?,
+            Step::Rename { from, to } => {
+                std::fs::rename(from, to).map_err(failed(format!("rename {from} to {to}")))?;
+            }
+            Step::Symlink { target, link } => std::os::unix::fs::symlink(target, link)
+                .map_err(failed(format!("link {link} to {target}")))?,
+            Step::Chmod { mode, path } => {
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(*mode))
+                    .map_err(failed(format!("chmod {path}")))?;
+            }
+            Step::WaitFor { path, within } => wait_for(path, *within)?,
         }
     }
     drop(held);
     Ok(None)
+}
+
+/// Returns once `path` exists, looking every 10 ms; fails when it does not within
+/// `within`.
+fn wait_for(path: &str, within: Duration) -> Result<(), Error> {
+    let until = Instant::now() + within;
+    while !Path::new(path).exists() {
+        if Instant::now() >= until {
+            return Err(Error::Failed(format!("{path} not there after {within:?}")));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    Ok(())
 }
 
 /// Appends `text` and a newline to the file at `path`, creating it.
@@ -218,15 +318,16 @@ mod tests {
         text.split(' ').map(str::to_owned).collect()
     }
 
-    /// Catches a step taken for the wrong verb, its arguments misread, and a malformed
-    /// step accepted (it would run with a default the test did not ask for).
+    /// Catches a step taken for the wrong verb, its arguments misread (a `chmod` mode
+    /// read as decimal, or above 7777), and a malformed step accepted (it would run with
+    /// a default the test did not ask for).
     #[test]
     fn steps_parse_or_are_refused() {
         let child = args("sleep 1");
         let all = args(
             "exit 7 ; sleep 0.25 ; echo a b ; echo --stderr c ; append f x y ; env A ; \
              env B dflt ; pwd ; id ; kill-self 9 ; spawn-child sleep 1 ; setsid ; alloc 32 ; \
-             upper o i",
+             upper o i ; rename a b ; symlink t l ; chmod 750 p ; chmod 7777 q ; wait-for w 1.5",
         );
         let want = [
             Step::Exit(7),
@@ -261,6 +362,23 @@ mod tests {
                 out: "o",
                 input: "i",
             },
+            Step::Rename { from: "a", to: "b" },
+            Step::Symlink {
+                target: "t",
+                link: "l",
+            },
+            Step::Chmod {
+                mode: 0o750,
+                path: "p",
+            },
+            Step::Chmod {
+                mode: 0o7777,
+                path: "q",
+            },
+            Step::WaitFor {
+                path: "w",
+                within: Duration::from_millis(1500),
+            },
         ];
         assert_eq!(parse(&all).expect("parses"), want);
         for bad in [
@@ -280,6 +398,14 @@ mod tests {
             "spawn-child nope",
             "alloc x",
             "upper o",
+            "rename a",
+            "symlink t",
+            "chmod 750",
+            "chmod 10000 p",
+            "chmod 8 p",
+            "chmod rwx p",
+            "wait-for w",
+            "wait-for w soon",
             "echo a ; ; exit 0",
             "nope",
         ] {
