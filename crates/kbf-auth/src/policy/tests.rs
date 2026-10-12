@@ -304,6 +304,26 @@ fn a_wrong_file_is_refused_at_the_mistake() {
             "$.capabilitiesAuthorizer",
             "found a number",
         ),
+        (
+            json!({"authenticationPolicy": allow, "blobs": {}}),
+            "$.blobs",
+            "`getAuthorizer` is required; leave `blobs` out",
+        ),
+        (
+            json!({"authenticationPolicy": allow, "blobs": {"getAuthorizer": allow, "put": allow}}),
+            "$.blobs.put",
+            "unknown key; the keys here are getAuthorizer",
+        ),
+        (
+            json!({"authenticationPolicy": allow, "blobs": {"getAuthorizer": {"remote": {}}}}),
+            "$.blobs.getAuthorizer.remote",
+            "not supported yet",
+        ),
+        (
+            json!({"authenticationPolicy": allow, "blobs": []}),
+            "$.blobs",
+            "expected an object, found an array",
+        ),
     ];
     for (file, path, why) in cases {
         let (got_path, got_why) = refused(&file);
@@ -321,4 +341,31 @@ fn a_wrong_file_is_refused_at_the_mistake() {
         .to_string(),
         "$.authenticationPolicy: names 0 variants; exactly one of allow, deny, any, all is needed"
     );
+}
+
+/// Catches: blob reads over HTTP left on when the file names no `blobs` key, or with
+/// no file at all (mutant "default allow": `None` read as an `allow`); a `blobs` key
+/// read into another slot or another slot's key read into it; and prefixes not
+/// passed through to it.
+#[tokio::test]
+async fn blob_reads_are_off_unless_the_file_names_their_authorizer() {
+    assert!(Policy::allow_all().blobs_get.is_none());
+    let unnamed = parse(&json!({
+        "authenticationPolicy": {"allow": {}},
+        "contentAddressableStorage": {"getAuthorizer": {"allow": {}}},
+    }));
+    assert!(unnamed.blobs_get.is_none());
+    let named = parse(&json!({
+        "authenticationPolicy": {"allow": {}},
+        "blobs": {"getAuthorizer": {"instanceNamePrefix": {"allowedInstanceNamePrefixes": ["ci"]}}},
+    }));
+    let blobs = named.blobs_get.expect("named");
+    assert!(allowed(&*blobs, "ci/main").await);
+    assert!(!allowed(&*blobs, "other").await);
+    for key in SLOTS {
+        assert!(
+            allowed(slot(&named.authorizers, key), "other").await,
+            "{key}"
+        );
+    }
 }

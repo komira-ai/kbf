@@ -2,22 +2,24 @@
 //! still holds, each listed by path in [`BUDGET`]. The list says what exists, not how
 //! big it is: editing a listed thing never touches the list.
 //!
-//! The scan finds three kinds of thing, one section of the budget file each:
-//! - `[files]`: a file whose extension is one of [`EXTENSIONS`], or whose first line is
-//!   a `#!` line naming one of the interpreters [`is_interpreter`] knows, directly or
-//!   through `env` or `busybox`. Its key is its path.
-//! - `[workflow]`: a workflow or composite-action step whose `run:` script is shell
-//!   logic ([`shell_logic`]: more than one line, or a pipe, `&&`, `;`, `$(`, a
-//!   backtick, `if`, `for` or `while`). Its key is `<file>#<job>/<step>`. A one-line
-//!   command passes without a row.
-//! - `[src-sh-c]`: a production Rust file under `crates/*/src/` that names a shell
-//!   with a `-c` flag (module [`rust`] says how it reads the file). Its key is its path.
+//! The scan finds three kinds of thing:
+//! - a file whose extension is one of [`EXTENSIONS`], or whose first line is a `#!`
+//!   line naming one of the interpreters [`is_interpreter`] knows, directly or through
+//!   `env` or `busybox`. Its key is its path, listed under `[files]`.
+//! - a workflow or composite-action step whose `run:` script is shell logic
+//!   ([`shell_logic`]: more than one line, or a pipe, `&&`, `;`, `$(`, a backtick,
+//!   `if`, `for` or `while`), named `<file>#<job>/<step>`. No row can list one: the scan
+//!   refuses each, and [`check`] refuses any row under a `[workflow]` header, so its
+//!   logic goes into Rust (a `cargo xtask` verb, or a flag of the program the step
+//!   runs). A one-line command passes.
+//! - a production Rust file under `crates/*/src/` that names a shell with a `-c` flag
+//!   (module [`rust`] says how it reads the file). Its key is its path, listed under
+//!   `[src-sh-c]`.
 //!
-//! [`check`] refuses a thing the scan found with no row, a row the scan found nothing
-//! for (a deleted or renamed file takes its row out in the same change), and
-//! a malformed or duplicate row. Rows are `<key>\t<reason>`, under a `[files]`,
-//! `[workflow]` or `[src-sh-c]` header; a line starting with `#` and a blank line are
-//! skipped.
+//! [`check`] refuses a file or spawn the scan found with no row, a row the scan found
+//! nothing for (a deleted or renamed file takes its row out in the same change), and
+//! a malformed or duplicate row. Rows are `<key>\t<reason>`, under a `[files]` or
+//! `[src-sh-c]` header; a line starting with `#` and a blank line are skipped.
 
 pub mod rust;
 
@@ -45,8 +47,19 @@ pub struct Found {
 
 /// The problems of a budget text against what the scan found. `found` holds each key
 /// of a section once. Only existence is checked: a listed thing may change in any way.
+/// The `[workflow]` section must stay empty: a row in it is refused whatever it names.
 pub fn check(budget: &str, found: &[Found]) -> Vec<String> {
     let (rows, mut problems) = parse(budget);
+    let (closed, rows): (Vec<Row>, Vec<Row>) = rows
+        .into_iter()
+        .partition(|r| r.section == Section::Workflow);
+    for row in closed {
+        problems.push(format!(
+            "line {}: a [workflow] row for `{}`; the section stays empty, because no \
+             `run:` step may hold shell logic: make the step one command and remove the row",
+            row.line, row.key
+        ));
+    }
     let mut by_key: BTreeMap<(Section, &str), &Row> = BTreeMap::new();
     for row in &rows {
         by_key.insert((row.section, row.key.as_str()), row);

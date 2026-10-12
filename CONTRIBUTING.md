@@ -70,18 +70,19 @@ There is no other build system in this repository.
 ## No new shell or Python
 
 kbf's tooling is Rust. The repository lints (`cargo test -p kbf-it --test
-repo_lints`) refuse a shell, Python, awk, sed, Perl or Ruby file, a workflow
-`run:` step with shell logic (more than one line, a pipe, `&&`, `;`, `$(`, a backtick,
-`if`, `for` or `while`), and production code under `crates/*/src/` that names
-a shell and a `-c` flag, unless
+repo_lints`) refuse a workflow `run:` step with shell logic (more than one line, a
+pipe, `&&`, `;`, `$(`, a backtick, `if`, `for` or `while`) outright: a step is one
+command, and anything more is a `cargo xtask` verb or a flag of the program the
+step runs. They refuse a shell, Python, awk, sed, Perl or Ruby file, and production
+code under `crates/*/src/` that names a shell and a `-c` flag, unless
 [tools/interpreter_budget.tsv](tools/interpreter_budget.tsv) lists it by path
 (a `<key><TAB><reason>` row). The rows there are what is left to port. The list
-records what exists, not how big it is: editing a listed file, step or keeper
-leaves the list alone. The list only shrinks: on a pull request,
+records what exists, not how big it is: editing a listed file or keeper leaves
+the list alone. The list only shrinks: on a pull request,
 `cargo xtask budget-diff --base HEAD^1` refuses any row the base branch's list
 does not have, so a listed file is not moved or renamed either (that would be a
 new row); it is ported. A pull request that deletes one removes its row in the
-same commit; the lint refuses a row whose file, step or keeper is gone.
+same commit; the lint refuses a row whose file or keeper is gone.
 
 ## Continuous integration
 

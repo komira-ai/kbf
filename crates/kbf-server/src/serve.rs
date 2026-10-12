@@ -8,7 +8,10 @@ use std::time::Duration;
 
 use futures::future::Either;
 use kbf_auth::{AuthenticateLayer, Policy};
-use kbf_front::{ByteStreamService, Cache, MAX_MESSAGE_BYTES, MetaLog, RequestMetadataLayer};
+use kbf_front::{
+    ByteStreamService, Cache, MAX_MESSAGE_BYTES, MetaLog, RECORDER_CHANNEL, Recorder,
+    RequestMetadataLayer,
+};
 use kbf_objstore::ObjectStore;
 use kbf_proto::google::bytestream::byte_stream_server::ByteStreamServer;
 use kbf_proto::grpc::health::v1::health_server::HealthServer;
@@ -21,6 +24,7 @@ use crate::blobs::WorkerBlobs;
 use crate::farm::Farm;
 use crate::grpc_health::{HealthService, WATCH_INTERVAL};
 use crate::health::Readiness;
+use crate::http_blobs::BlobReaders;
 use crate::identity::{DenyList, Peers};
 use crate::token::ApiToken;
 use crate::worker::WorkerService;
@@ -61,6 +65,9 @@ pub struct Listeners {
     /// `grpc.health.v1` service, wait for the object store to answer their probe
     /// ([`crate::health`]).
     pub store_probe_timeout: Duration,
+    /// The memory bound of the invocation records, in bytes
+    /// (`docs/design/invocations.md`, section 3.5).
+    pub invocation_memory: usize,
 }
 
 /// The worker listener's mutual TLS: every daemon's certificate must name its node
@@ -112,8 +119,21 @@ pub struct Bound<F> {
     /// What `GET /readyz` reads besides the store; the serving future marks it
     /// stopping when `shutdown` completes.
     pub readiness: Arc<Readiness>,
-    /// Serves every listener and the tick until the shutdown future completes.
+    /// Serves every listener and the tick, and runs the invocation recorder's task,
+    /// until the shutdown future completes.
     pub serving: F,
+    /// The invocation records the serving future builds, read until the read API
+    /// serves them.
+    pub recorder: Recorder,
+}
+
+/// Aborts its task when dropped.
+struct AbortOnDrop(tokio::task::AbortHandle);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 fn bind(addr: SocketAddr) -> Result<(TcpIncoming, SocketAddr), ServeError> {
@@ -215,7 +235,9 @@ where
 /// (`docs/reapi-auth.md`): its authenticator on every call of that listener, before
 /// routing, and its authorizers in the services. The worker listener, the operator
 /// API and the REAPI listener's `grpc.health.v1` service do not run it: a proxy's
-/// health check carries no credentials.
+/// health check carries no credentials. The one exception is the operator API's
+/// blob route ([`crate::http_blobs`]), which runs its authenticator and its
+/// `blobs.getAuthorizer`, and is off when the policy names no such authorizer.
 ///
 /// # Errors
 /// A listener cannot be bound, or a TLS configuration is refused (a key that does not
@@ -231,11 +253,15 @@ where
     M: MetaLog,
     O: ObjectStore + 'static,
 {
-    let farm = Arc::new(Farm::new(
-        Arc::clone(&cache),
-        listeners.unservable_wait,
-        listeners.finished_retention,
-    ));
+    let (recorder, recording) = Recorder::new(listeners.invocation_memory, RECORDER_CHANNEL);
+    let farm = Arc::new(
+        Farm::new(
+            Arc::clone(&cache),
+            listeners.unservable_wait,
+            listeners.finished_retention,
+        )
+        .recording(recorder.clone()),
+    );
     let (reapi_incoming, reapi) = bind(listeners.reapi)?;
     let (worker_incoming, worker) = bind(listeners.worker)?;
     let probe_timeout = listeners.store_probe_timeout;
@@ -245,7 +271,11 @@ where
     let readiness = Arc::new(Readiness::default());
     let health_routes =
         crate::health::router(Arc::clone(&cache), Arc::clone(&readiness), probe_timeout);
-    let api_routes = crate::api::router(Arc::clone(&farm), token).merge(health_routes);
+    let blob_routes =
+        crate::http_blobs::router(Arc::clone(&cache), BlobReaders::from_policy(&policy));
+    let api_routes = crate::api::router(Arc::clone(&farm), token)
+        .merge(health_routes)
+        .merge(blob_routes);
     // Logged at every start, the first one too (issue #156).
     let (term, epoch) = (farm.term(), farm.lease_epoch());
     tracing::warn!(term, epoch, "{STATE_IN_MEMORY}");
@@ -282,7 +312,7 @@ where
     let authorizers = Arc::new(policy.authorizers);
     let cache_for_health = Arc::clone(&cache);
     let reapi_routes =
-        kbf_front::routes_with_authorizers(cache, Arc::clone(&farm), closing, authorizers);
+        kbf_front::routes_recorded(cache, Arc::clone(&farm), closing, authorizers, &recorder);
     let authenticate = AuthenticateLayer::new(policy.authenticator);
     // The layers wrap the REAPI routes (and the fallback for unknown paths) present
     // when they are applied; the health service, added after, is answered without
@@ -303,6 +333,9 @@ where
 
     let stop_readiness = Arc::clone(&readiness);
     let serving = async move {
+        // A task of its own: applying events never delays the tick or an accept loop,
+        // and they never delay it. It stops when the serving future does.
+        let _recording = AbortOnDrop(tokio::spawn(recording.run()).abort_handle());
         let (drain, draining) = tokio::sync::oneshot::channel::<()>();
         // `reapi_server` carries the REAPI TLS configuration when one is given, so
         // the health service is served over the same TLS as the REAPI routes; the
@@ -354,5 +387,6 @@ where
         api,
         readiness,
         serving,
+        recorder,
     })
 }

@@ -1,5 +1,6 @@
-# The entitlements each macOS binary is signed with (tools/ci/darwin-entitlements.sh;
-# docs/design/macos-vm-guests.md section 7). One line per binary that gets any:
+# The entitlements each macOS binary is signed with (`cargo xtask sign-darwin`, read by
+# crates/xtask/src/entitlements.rs; docs/design/macos-vm-guests.md section 7). One line
+# per binary that gets any:
 #
 #   <binary file name> <entitlement> [<entitlement> ...]
 #

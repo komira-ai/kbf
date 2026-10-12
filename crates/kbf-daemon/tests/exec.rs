@@ -68,6 +68,7 @@ impl Farm {
             finished_retention: Duration::from_secs(60),
             shutdown_timeout: Duration::from_secs(10),
             store_probe_timeout: kbf_server::health::STORE_PROBE_TIMEOUT,
+            invocation_memory: kbf_front::DEFAULT_INVOCATION_MEMORY,
         };
         let bound = bind_server(Arc::clone(&cache), listeners, pending()).expect("bind");
         let (reapi_addr, worker_addr) = (bound.reapi, bound.worker);

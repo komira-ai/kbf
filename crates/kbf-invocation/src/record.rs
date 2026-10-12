@@ -9,7 +9,7 @@ use std::time::Duration;
 use kbf_sched::RequeueReason;
 use kbf_types::{Digest, Failure, LeaseId, WorkerId};
 
-use crate::event::{Call, InvocationId, Listing, Metadata, Outcome, Owner, WallTime};
+use crate::event::{Call, InvocationId, Listing, Metadata, Outcome, Output, Owner, WallTime};
 
 /// Rows one record keeps; past it, actions are counted but not rowed (section 3.3).
 pub const ROW_CAP: usize = 1_000_000;
@@ -77,12 +77,23 @@ pub struct Text {
 }
 
 impl Text {
-    fn new(value: Option<&String>) -> Option<Self> {
-        let value = value.filter(|v| !v.is_empty())?;
-        let kept = capped(value, TEXT_CAP);
+    /// `value` as the client sent it.
+    #[must_use]
+    pub fn sent(value: impl Into<String>) -> Self {
+        Self {
+            value: value.into(),
+            truncated: false,
+        }
+    }
+
+    /// The field as a row keeps it: `None` when empty, else its first [`TEXT_CAP`]
+    /// bytes, truncated if the client sent more (here or before it came in).
+    fn kept(value: Option<&Self>) -> Option<Self> {
+        let sent = value.filter(|v| !v.value.is_empty())?;
+        let value = capped(&sent.value, TEXT_CAP);
         Some(Self {
-            truncated: kept.len() < value.len(),
-            value: kept,
+            truncated: sent.truncated || value.len() < sent.value.len(),
+            value,
         })
     }
 }
@@ -174,10 +185,10 @@ impl ActionRow {
         Self {
             action,
             instance: call.instance.clone(),
-            target: Text::new(m.target.as_ref()),
-            mnemonic: Text::new(m.mnemonic.as_ref()),
-            configuration: Text::new(m.configuration.as_ref()),
-            action_id: Text::new(m.action_id.as_ref()),
+            target: Text::kept(m.target.as_ref()),
+            mnemonic: Text::kept(m.mnemonic.as_ref()),
+            configuration: Text::kept(m.configuration.as_ref()),
+            action_id: Text::kept(m.action_id.as_ref()),
             how,
             operation,
             attempts: Vec::new(),
@@ -188,13 +199,137 @@ impl ActionRow {
         }
     }
 
-    /// Copies the result's listing into the row, keeping the first
-    /// [`OUTPUTS_PER_ROW`] outputs.
-    pub(crate) fn set_listing(&mut self, mut listing: Listing) {
-        self.outputs_truncated = listing.outputs.len() > OUTPUTS_PER_ROW;
-        listing.outputs.truncate(OUTPUTS_PER_ROW);
+    /// Copies the result's listing into the row, keeping the first `keep` of its
+    /// outputs, and no more than [`OUTPUTS_PER_ROW`].
+    pub(crate) fn set_listing(&mut self, mut listing: Listing, keep: usize) {
+        let keep = keep.min(OUTPUTS_PER_ROW);
+        self.outputs_truncated = listing.outputs.len() > keep;
+        if self.outputs_truncated {
+            // Truncating keeps the capacity: give the rest back.
+            listing.outputs.truncate(keep);
+            listing.outputs.shrink_to_fit();
+        }
         self.listing = Some(listing);
     }
+
+    /// The memory the row holds beyond its own slot in the record's row list, as the
+    /// bound of section 3.5 counts it: the bytes of its texts, its attempts and its
+    /// outputs. Every list a row holds is allocated to its length (a copy, or cut
+    /// back), so lengths are its capacities.
+    pub(crate) fn heap_bytes(&self) -> usize {
+        let text = |t: &Option<Text>| t.as_ref().map_or(0, |t| t.value.len());
+        let outputs: usize = self
+            .listing
+            .as_ref()
+            .map_or(0, |l| l.outputs.iter().map(output_bytes).sum());
+        self.instance.len()
+            + text(&self.target)
+            + text(&self.mnemonic)
+            + text(&self.configuration)
+            + text(&self.action_id)
+            + self.operation.as_ref().map_or(0, String::len)
+            + attempts_bytes(&self.attempts)
+            + outcome_bytes(self.outcome.as_ref())
+            + outputs
+    }
+}
+
+/// What a row's `attempts` take beyond the row, as [`ActionRow::heap_bytes`] counts
+/// them; an operation's attempts take as much.
+pub(crate) fn attempts_bytes(attempts: &[Attempt]) -> usize {
+    attempts.iter().map(attempt_bytes).sum()
+}
+
+/// What one attempt takes: itself, its worker's name and its failure reason.
+pub(crate) fn attempt_bytes(a: &Attempt) -> usize {
+    let reason = match &a.end {
+        Some(AttemptEnd::Failed(_, why)) => why.len(),
+        _ => 0,
+    };
+    size_of::<Attempt>() + a.worker.as_str().len() + reason
+}
+
+/// What an outcome's text takes.
+pub(crate) fn outcome_bytes(outcome: Option<&Outcome>) -> usize {
+    match outcome {
+        Some(Outcome::Failed { message, .. }) => message.len(),
+        Some(Outcome::Refused(why)) => why.len(),
+        _ => 0,
+    }
+}
+
+/// What one output of a row's listing takes.
+pub(crate) fn output_bytes(o: &Output) -> usize {
+    size_of::<Output>() + o.path.len()
+}
+
+/// The copies of a record's id [`crate::Records`] keeps beside the record's own key:
+/// its key in the record map, in the last-seen index and in its id's list of keys,
+/// and its id as the id map's key. A minted record's key is in one more index.
+const RECORD_INDEX_ENTRIES: usize = 4;
+
+/// What a record's entries in the indexes of [`crate::Records`] take beside its id's
+/// bytes: its slot in the record map (key and box), in the last-seen index (time and
+/// key), in the id map (id and its list) and in its id's list of keys.
+const RECORD_ENTRY_BYTES: usize = btree_entry_bytes(size_of::<RecordKey>() + size_of::<usize>())
+    + btree_entry_bytes(SEEN_ENTRY)
+    + btree_entry_bytes(
+        size_of::<InvocationId>() + size_of::<Vec<RecordKey>>() + size_of::<usize>(),
+    )
+    + size_of::<RecordKey>();
+
+/// A record's slot in a last-seen index: its time and key. A minted record has one in
+/// the minted records' index too.
+const SEEN_ENTRY: usize = size_of::<WallTime>() + size_of::<RecordKey>();
+
+/// One entry of a record's action index: the digest and the row's index.
+const ACTION_ENTRY: usize = size_of::<Digest>() + size_of::<usize>();
+
+/// One slot of a record's row list and of its list of row costs.
+const ROW_SLOT: usize = size_of::<ActionRow>() + size_of::<usize>();
+
+/// Entries a standard library B-tree node has room for.
+const NODE_SLOTS: usize = 11;
+
+/// Entries a B-tree leaf accounts for, as estimated: a full node splits into one of
+/// 6 and one of 5 and moves one entry up, so keys added in order (times, operation
+/// ids) leave 6 in each leaf and one above it for each. Keys added out of order fill
+/// nodes further, so this counts them high.
+const NODE_FILL: usize = 7;
+
+/// One B-tree leaf of `entry`-byte entries: a parent link, two counts, and the slots.
+const fn leaf_bytes(entry: usize) -> usize {
+    16 + NODE_SLOTS * entry
+}
+
+/// One internal B-tree node: a leaf and its 12 edges.
+const fn internal_bytes(entry: usize) -> usize {
+    leaf_bytes(entry) + (NODE_SLOTS + 1) * size_of::<usize>()
+}
+
+/// What a B-tree map or set of `n` entries of `entry` bytes takes in nodes,
+/// estimated: one leaf up to 11 entries; past that a leaf per [`NODE_FILL`] entries,
+/// and an internal node per [`NODE_FILL`] nodes below it.
+pub(crate) const fn btree_bytes(n: usize, entry: usize) -> usize {
+    if n == 0 {
+        0
+    } else if n <= NODE_SLOTS {
+        leaf_bytes(entry)
+    } else {
+        let leaves = n.div_ceil(NODE_FILL);
+        leaves * leaf_bytes(entry) + leaves.div_ceil(NODE_FILL) * internal_bytes(entry)
+    }
+}
+
+/// One entry's share of a large B-tree's nodes, as [`btree_bytes`] estimates them.
+pub(crate) const fn btree_entry_bytes(entry: usize) -> usize {
+    (leaf_bytes(entry) + internal_bytes(entry) / NODE_FILL).div_ceil(NODE_FILL)
+}
+
+/// The capacity a list of `cap` slots, all used, grows to: as the standard library's
+/// lists grow, so that a list of rows costs no more copying.
+pub(crate) const fn grown(cap: usize) -> usize {
+    if cap == 0 { 4 } else { 2 * cap }
 }
 
 /// The counters of section 3.1.
@@ -255,6 +390,16 @@ pub struct Invocation {
     pub(crate) by_action: BTreeMap<Digest, usize>,
     /// Operations this invocation's Execute calls wait on.
     pub(crate) in_flight: usize,
+    /// Each row's [`ActionRow::heap_bytes`], as last counted.
+    pub(crate) row_bytes: Vec<usize>,
+    /// The sum of `row_bytes`.
+    pub(crate) rows_bytes: usize,
+    /// What [`crate::Records`] counts for this record toward its bound.
+    pub(crate) counted: usize,
+    /// The `last_seen` [`crate::Records`] indexes this record under.
+    pub(crate) indexed: WallTime,
+    /// Whether the memory bound stopped this record taking rows (section 3.5, step 3).
+    pub(crate) rows_closed: bool,
 }
 
 impl Invocation {
@@ -276,6 +421,11 @@ impl Invocation {
             rows: Vec::new(),
             by_action: BTreeMap::new(),
             in_flight: 0,
+            row_bytes: Vec::new(),
+            rows_bytes: 0,
+            counted: 0,
+            indexed: call.at,
+            rows_closed: false,
         }
     }
 
@@ -296,6 +446,31 @@ impl Invocation {
         self.touch(call.at);
     }
 
+    /// What [`Self::seen`] would add to the record's bytes: a new instance name, and
+    /// the tool and correlated id the first time they are sent.
+    pub(crate) fn seen_bytes(&self, call: &Call) -> usize {
+        let m = &call.metadata;
+        let len = |o: &Option<String>| o.as_ref().map_or(0, String::len);
+        let instance = if self.instances.contains(&call.instance) {
+            0
+        } else {
+            let n = self.instances.len();
+            call.instance.len() + btree_bytes(n + 1, size_of::<String>())
+                - btree_bytes(n, size_of::<String>())
+        };
+        let tool = if self.tool.is_none() && m.tool.is_some() {
+            len(&m.tool) + len(&m.tool_version)
+        } else {
+            0
+        };
+        let correlated = if self.correlated_invocations_id.is_none() {
+            len(&m.correlated_invocations_id)
+        } else {
+            0
+        };
+        instance + tool + correlated
+    }
+
     pub(crate) fn touch(&mut self, at: WallTime) {
         self.last_seen = self.last_seen.max(at);
     }
@@ -305,15 +480,86 @@ impl Invocation {
         self.by_action.get(action).copied()
     }
 
-    /// Adds `row` and returns its index; `None` once the record holds `cap` rows.
-    pub(crate) fn push_row(&mut self, cap: usize, row: ActionRow) -> Option<usize> {
-        if self.rows.len() >= cap {
-            self.rows_capped = true;
-            return None;
+    /// Whether the record takes another row: it holds fewer than `cap` and the memory
+    /// bound has not closed it.
+    pub(crate) fn takes_rows(&self, cap: usize) -> bool {
+        self.rows.len() < cap && !self.rows_closed
+    }
+
+    /// What adding `row` costs: the slots its lists grow by when they are full, its
+    /// action index entry and its [`ActionRow::heap_bytes`]. Exactly what
+    /// [`Self::bytes`] grows by.
+    pub(crate) fn row_cost(&self, row: &ActionRow) -> usize {
+        let n = self.rows.len();
+        let slots = if n == self.rows.capacity() {
+            (grown(n) - n) * ROW_SLOT
+        } else {
+            0
+        };
+        slots + btree_bytes(n + 1, ACTION_ENTRY) - btree_bytes(n, ACTION_ENTRY) + row.heap_bytes()
+    }
+
+    /// Adds `row`, which [`Self::takes_rows`] allowed, and returns its index.
+    pub(crate) fn push_row(&mut self, row: ActionRow) -> usize {
+        let n = self.rows.len();
+        if n == self.rows.capacity() {
+            // Grown here, not by `push`, so that the growth [`Self::row_cost`] counted
+            // is the growth made.
+            self.rows.reserve_exact(grown(n) - n);
+            self.row_bytes.reserve_exact(grown(n) - n);
         }
+        let bytes = row.heap_bytes();
         self.by_action.insert(row.action, self.rows.len());
         self.rows.push(row);
-        Some(self.rows.len() - 1)
+        self.row_bytes.push(bytes);
+        self.rows_bytes += bytes;
+        self.rows.len() - 1
+    }
+
+    /// Counts row `i` again after it changed.
+    pub(crate) fn refresh_row(&mut self, i: usize) {
+        let bytes = self.rows[i].heap_bytes();
+        self.rows_bytes = self.rows_bytes - self.row_bytes[i] + bytes;
+        self.row_bytes[i] = bytes;
+    }
+
+    /// The memory the record holds, as the bound of section 3.5 counts it: the record
+    /// itself (boxed), its entries in the indexes of [`crate::Records`] and each copy of
+    /// its id there, its header's texts and instance set, its row lists' capacity, its
+    /// action index and each row's heap bytes (texts, attempts, outputs). An estimate
+    /// of what the allocator is asked for: B-tree nodes are estimated (see
+    /// `btree_bytes`), and the allocator's own overhead is not counted. A copy's row
+    /// lists are allocated to their length, so a copy may count less.
+    #[must_use]
+    pub fn bytes(&self) -> usize {
+        let option = |o: &Option<String>| o.as_ref().map_or(0, String::len);
+        let instances: usize = self.instances.iter().map(String::len).sum::<usize>()
+            + btree_bytes(self.instances.len(), size_of::<String>());
+        let collisions: usize = self
+            .collisions
+            .iter()
+            .map(|k| size_of::<RecordKey>() + k.id().as_str().len())
+            .sum();
+        let id = self.key.id().as_str().len();
+        let minted = if self.minted {
+            btree_entry_bytes(SEEN_ENTRY) + id
+        } else {
+            0
+        };
+        size_of::<Self>()
+            + RECORD_ENTRY_BYTES
+            + (1 + RECORD_INDEX_ENTRIES) * id
+            + minted
+            + self.owner.0.len()
+            + option(&self.tool)
+            + option(&self.tool_version)
+            + option(&self.correlated_invocations_id)
+            + instances
+            + collisions
+            + self.rows.capacity() * size_of::<ActionRow>()
+            + self.row_bytes.capacity() * size_of::<usize>()
+            + btree_bytes(self.by_action.len(), ACTION_ENTRY)
+            + self.rows_bytes
     }
 
     /// The record's key.

@@ -29,7 +29,8 @@
 //! - [`envoy`]: a client front's Kubernetes objects and Envoy config, rendered from
 //!   the settings (`envoy render`), byte for byte the same for the same settings, and
 //!   a render checked for what the REAPI path through the front depends on
-//!   (`envoy check`).
+//!   (`envoy check`), and the render applied to a cluster through kubectl after the
+//!   cluster's prerequisites and a server-side dry run pass (`envoy apply`).
 
 pub mod cli;
 pub mod config;

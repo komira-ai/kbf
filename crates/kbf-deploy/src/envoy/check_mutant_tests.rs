@@ -100,6 +100,25 @@ const MUTANTS: &[Mutant] = &[
         },
     ),
     m(
+        "route-timeout",
+        "an earlier prefix route with the default 15 s timeout takes Execute: Envoy picks the first match, not the good route after it",
+        |d| {
+            envoy(d, |e| {
+                let mut early = at(e, &format!("{ROUTES}/0")).clone();
+                set(
+                    &mut early,
+                    "/match",
+                    json!({"prefix": "/build.bazel.remote.execution.v2.Execution/", "grpc": {}}),
+                );
+                remove(&mut early, "/route", "timeout");
+                at(e, ROUTES)
+                    .as_array_mut()
+                    .expect("routes")
+                    .insert(0, early);
+            })
+        },
+    ),
+    m(
         "max-stream-duration",
         "the connection manager ends every stream at 300 s",
         |d| {

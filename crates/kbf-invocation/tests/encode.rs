@@ -7,7 +7,9 @@ mod support;
 use std::collections::BTreeSet;
 
 use kbf_invocation::proto::{self, attempt_end::End, outcome::Outcome as P};
-use kbf_invocation::{CallKind, Event, ExecuteAnswer, LeaseEnd, Metadata, Outcome, Records, Usage};
+use kbf_invocation::{
+    CallKind, Event, ExecuteAnswer, LeaseEnd, Metadata, Outcome, Records, Text, Usage,
+};
 use kbf_sched::RequeueReason;
 use kbf_types::{Failure, LostWhy, OperationId};
 use prost::Message;
@@ -137,10 +139,10 @@ fn a_row_carries_every_field() {
         },
     );
     c.metadata = Metadata {
-        target: Some("//pkg:lib".to_owned()),
-        mnemonic: Some("CxxCompile".to_owned()),
-        configuration: Some("cfg".to_owned()),
-        action_id: Some("a-1".to_owned()),
+        target: Some(Text::sent("//pkg:lib")),
+        mnemonic: Some(Text::sent("CxxCompile")),
+        configuration: Some(Text::sent("cfg")),
+        action_id: Some(Text::sent("a-1")),
         ..Metadata::default()
     };
     let mut result = listing(40, 0);

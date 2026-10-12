@@ -4,7 +4,7 @@
 # host; this runs the macOS host itself: OpenDirectory users, launchd, libproc, the sweep,
 # and the caller check by code signature.
 #
-# The helper is signed ad hoc with the hardened runtime (tools/ci/sign-darwin.sh) and
+# The helper is signed ad hoc with the hardened runtime (`cargo xtask sign-darwin`) and
 # started under sudo with the cdhash of examples/mac_session_client.rs as the daemon
 # requirement, so that binary stands in for kbf-daemon. A copy signed under another
 # identifier (another cdhash) is the impostor.
@@ -30,7 +30,7 @@ client="$tmp/client"
 impostor="$tmp/impostor"
 cp target/debug/examples/mac_session_client "$client"
 cp target/debug/examples/mac_session_client "$impostor"
-bash tools/ci/sign-darwin.sh "$helper"
+cargo xtask sign-darwin "$helper" --minos "$MACOSX_DEPLOYMENT_TARGET"
 codesign --force --sign - --options runtime "$client"
 codesign --force --sign - --options runtime --identifier kbf.ci.impostor "$impostor"
 chmod 0755 "$client" "$impostor"

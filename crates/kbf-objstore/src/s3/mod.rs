@@ -14,7 +14,7 @@ mod sigv4;
 mod xml;
 
 use std::fmt;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use base64::Engine as _;
 use bytes::Bytes;
@@ -28,6 +28,9 @@ use crate::{
     ObjectStoreError, PageSize,
 };
 use sigv4::{EMPTY_SHA256, Request, Signer, Utc};
+
+/// How long [`S3Store::wait_answering`] waits between attempts.
+pub const WAIT_RETRY: Duration = Duration::from_millis(250);
 
 /// An access key pair. `Debug` never shows the secret.
 #[derive(Clone)]
@@ -180,6 +183,35 @@ impl S3Store {
                 }
                 e => Err(e),
             },
+        }
+    }
+
+    /// Waits, for at most `within`, until the service answers an HTTP request. Any
+    /// answer counts, whatever its status: a running S3 service answers this unsigned
+    /// `GET /` with an error such as 403. Only a request that fails to complete (refused,
+    /// reset, timed out) is retried, every [`WAIT_RETRY`]. On the deadline it returns
+    /// the last attempt's error. For setup and tests, to wait for a store that is
+    /// starting; kbf itself never calls it.
+    pub async fn wait_answering(&self, within: Duration) -> Result<(), ObjectStoreError> {
+        let deadline = Instant::now() + within;
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            match self
+                .client
+                .get(self.base.clone())
+                .timeout(left)
+                .send()
+                .await
+            {
+                Ok(_) => return Ok(()),
+                Err(e) => {
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    if left.is_zero() {
+                        return Err(transport(e));
+                    }
+                    tokio::time::sleep(left.min(WAIT_RETRY)).await;
+                }
+            }
         }
     }
 
