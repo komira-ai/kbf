@@ -163,8 +163,8 @@ mod tests {
     /// uid, or that passes the ids or the argument vector out of order.
     #[test]
     fn the_command_runs_this_binary_as_user_under_launchctl_asuser() {
-        let command =
-            command(650, 20, "/bin/sh", &["-c".to_owned(), "id".to_owned()]).expect("the command");
+        let command = command(650, 20, "/usr/bin/id", &["-u".to_owned(), "-r".to_owned()])
+            .expect("the command");
         assert_eq!(command.get_program(), LAUNCHCTL);
         let got: Vec<String> = command
             .get_args()
@@ -181,9 +181,9 @@ mod tests {
                 "650",
                 "20",
                 "--",
-                "/bin/sh",
-                "-c",
-                "id"
+                "/usr/bin/id",
+                "-u",
+                "-r"
             ]
         );
     }

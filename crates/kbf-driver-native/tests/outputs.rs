@@ -24,11 +24,15 @@ async fn no_symlink_the_action_plants_is_followed() {
     let rt = runtime(config.clone(), &cas);
     let host_text = host.to_str().expect("utf8");
 
-    let script = "mkdir -p out && ln -s \"$HOST\" out/link && ln -s \"$HOST\" via && ln -s \"$HOST/secret\" file";
-    let spec = Spec::sh(script)
-        .env("HOST", host_text)
-        .outputs(&["out", "via/secret", "file"]);
+    // `via` is made by the driver, as the parent of an output: the action moves it
+    // aside and puts the link in its place.
+    let steps = format!(
+        "mkdir out ; symlink {host_text} out/link ; rename via via-made ; \
+         symlink {host_text} via ; symlink {host_text}/secret file"
+    );
+    let spec = Spec::act(&steps).outputs(&["out", "via/secret", "file"]);
     let result = run(&rt, &cas, 1, &spec).await.expect("ran");
+    assert_eq!(result.exit_code, 0, "{}", support::stderr(&cas, &result));
     assert!(result.output_files.is_empty(), "{result:?}");
     assert_eq!(result.output_symlinks.len(), 1);
     assert_eq!(
@@ -47,9 +51,8 @@ async fn no_symlink_the_action_plants_is_followed() {
     assert_eq!(root.symlinks[0].name, "link");
 
     // The working directory itself replaced by a link to the host directory.
-    let mut spec = Spec::sh("cd .. && rm -rf w && ln -s \"$HOST\" w")
-        .env("HOST", host_text)
-        .outputs(&["secret", "sub"]);
+    let steps = format!("rename ../w ../moved ; symlink {host_text} ../w");
+    let mut spec = Spec::act(&steps).outputs(&["secret", "sub"]);
     spec.working_directory = "w".to_owned();
     let result = run(&rt, &cas, 2, &spec).await.expect("ran");
     assert!(result.output_files.is_empty(), "{result:?}");
@@ -66,7 +69,7 @@ async fn outputs_past_a_limit_fail_the_lease() {
     config.outputs.max_bytes = 10;
     let cas = Arc::new(MemoryCas::default());
     let rt = runtime(config.clone(), &cas);
-    let spec = Spec::sh("printf 'eleven byte' > f").outputs(&["f"]);
+    let spec = Spec::act("append f eleven bytes").outputs(&["f"]);
     let outcome = run(&rt, &cas, 1, &spec).await;
     assert!(
         matches!(&outcome, Err(RuntimeError::Failed(why)) if why.contains("--output-max-bytes")),
@@ -84,7 +87,7 @@ async fn stdout_past_its_limit_and_a_failed_upload_fail_the_lease() {
     config.outputs.max_stdio_bytes = 4;
     let cas = Arc::new(MemoryCas::default());
     let rt = runtime(config.clone(), &cas);
-    let outcome = run(&rt, &cas, 1, &Spec::sh("echo too long")).await;
+    let outcome = run(&rt, &cas, 1, &Spec::act("echo too long")).await;
     assert!(
         matches!(&outcome, Err(RuntimeError::Failed(why)) if why.contains("--output-max-stdio-bytes")),
         "{outcome:?}"
@@ -93,7 +96,7 @@ async fn stdout_past_its_limit_and_a_failed_upload_fail_the_lease() {
         refuse_puts: true,
         ..MemoryCas::default()
     });
-    let action = Spec::sh("echo hi").store(&refusing);
+    let action = Spec::act("echo hi").store(&refusing);
     let rt = runtime(support::config(&dir), &refusing);
     let outcome = rt.run(support::work(2, action, 0)).await;
     assert!(
@@ -110,9 +113,11 @@ async fn a_large_output_file_is_stored_whole() {
     let dir = scratch("large");
     let cas = Arc::new(MemoryCas::default());
     let rt = runtime(config(&dir), &cas);
-    let spec = Spec::sh("head -c 2500000 /dev/zero > big").outputs(&["big"]);
+    // The action writes its input `in`, upper-cased, to `big`.
+    let mut spec = Spec::act("upper big in").outputs(&["big"]);
+    spec.inputs = vec![("in".to_owned(), vec![b'a'; 2_500_000])];
     let result = run(&rt, &cas, 1, &spec).await.expect("ran");
     let digest = result.output_files[0].digest.as_ref().expect("digest");
-    assert_eq!(*digest, kbf_daemon::cas::digest_of(&vec![0; 2_500_000]));
+    assert_eq!(*digest, kbf_daemon::cas::digest_of(&vec![b'A'; 2_500_000]));
     assert_eq!(cas.blob(digest).len(), 2_500_000);
 }

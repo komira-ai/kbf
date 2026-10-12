@@ -21,14 +21,17 @@ async fn an_action_runs_and_its_results_come_back() {
     let rt = runtime(config.clone(), &cas);
     assert_eq!(rt.driver(), DRIVER);
     assert!(rt.serves(KIND) && !rt.serves("whole_machine"));
-    let script =
-        "../tool; echo err >&2; mkdir -p out/sub; echo f > out/sub/f; echo x > file; exit 3";
-    let mut spec = Spec::sh(script).outputs(&["out", "file", "missing"]);
+    let steps = "run ../tool from-tool ; echo --stderr err ; mkdir out/sub ; \
+                 append out/sub/f f ; append file x ; exit 3";
+    let mut spec = Spec::act(steps).outputs(&["out", "file", "missing"]);
     spec.working_directory = "w".to_owned();
-    spec.inputs = vec![("tool".to_owned(), b"#!/bin/sh\necho from-tool\n".to_vec())];
+    // An input that runs only if it is written executable: its interpreter is the act
+    // steps' link, and it echoes its path and arguments.
+    let tool = format!("#!{} echo\n", support::act().display());
+    spec.inputs = vec![("tool".to_owned(), tool.into_bytes())];
     let result = run(&rt, &cas, 1, &spec).await.expect("ran");
     assert_eq!(result.exit_code, 3);
-    assert_eq!(stdout(&cas, &result), "from-tool\n");
+    assert_eq!(stdout(&cas, &result), "../tool from-tool\n");
     assert_eq!(stderr(&cas, &result), "err\n");
     assert_eq!(result.output_files.len(), 1);
     assert_eq!(result.output_files[0].path, "file");
@@ -83,23 +86,41 @@ async fn each_lease_has_its_own_home_tmp_and_cache() {
     let config = config(&dir);
     let cas = Arc::new(MemoryCas::default());
     let rt = runtime(config.clone(), &cas);
-    let script = "for d in \"$HOME\" \"$TMPDIR\" \"$XDG_CACHE_HOME\" \"$CLANG_MODULE_CACHE_PATH\"; do \
-                  if [ -e \"$d/left\" ]; then echo seen \"$d\"; fi; echo x > \"$d/left\" || exit 1; done; \
-                  echo ok";
+    // The action prints the four variables, which must name its lease's own
+    // directories, then makes `left` in each with `symlink`, which fails (exit 1,
+    // naming it) where `left` is there already or the directory is missing.
+    let vars = [
+        "HOME",
+        "TMPDIR",
+        "XDG_CACHE_HOME",
+        "CLANG_MODULE_CACHE_PATH",
+    ];
     for seq in [1, 2] {
-        let result = run(&rt, &cas, seq, &Spec::sh(script)).await.expect("ran");
+        let lease = config.scratch.join(format!("lease-1-{seq}"));
+        let dirs: Vec<String> = ["home", "tmp", "cache", "cache/clang/ModuleCache"]
+            .iter()
+            .map(|sub| lease.join(sub).display().to_string())
+            .collect();
+        let steps: Vec<String> = vars
+            .iter()
+            .map(|var| format!("env {var}"))
+            .chain(dirs.iter().map(|dir| format!("symlink x {dir}/left")))
+            .collect();
+        let spec = Spec::act(&steps.join(" ; "));
+        let result = run(&rt, &cas, seq, &spec).await.expect("ran");
         assert_eq!(result.exit_code, 0, "{}", stderr(&cas, &result));
-        assert_eq!(stdout(&cas, &result), "ok\n", "lease {seq}");
+        let printed: Vec<String> = stdout(&cas, &result).lines().map(str::to_owned).collect();
+        assert_eq!(printed, dirs, "lease {seq}");
     }
     assert!(no_leases(&config), "the lease directories are removed");
 
-    let own = Spec::sh("echo \"$HOME $TMPDIR\"")
+    let own = Spec::act("env HOME ; env TMPDIR")
         .env("HOME", "/the/commands/home")
         .env("TMPDIR", "/the/commands/tmp");
     let result = run(&rt, &cas, 3, &own).await.expect("ran");
     assert_eq!(
         stdout(&cas, &result),
-        "/the/commands/home /the/commands/tmp\n"
+        "/the/commands/home\n/the/commands/tmp\n"
     );
 }
 
@@ -127,7 +148,7 @@ async fn an_action_that_names_an_xcode_runs_with_it() {
             "{reported:?}"
         );
     }
-    let echo = Spec::sh("echo \"${DEVELOPER_DIR-unset}\"").env("DEVELOPER_DIR", "/own");
+    let echo = Spec::act("env DEVELOPER_DIR unset").env("DEVELOPER_DIR", "/own");
     let named = echo.clone().property("XCode", "16E140");
     let result = run(&rt, &cas, 1, &named).await.expect("ran");
     assert_eq!(
@@ -161,11 +182,14 @@ async fn bad_actions_are_the_clients_errors() {
     let rt = runtime(config.clone(), &cas);
     let cases = [
         (Spec::argv(&[]), "no arguments"),
-        (Spec::sh("true").outputs(&["../escape"]), "must be relative"),
-        (Spec::sh("true").property("network", "maybe"), "network"),
+        (
+            Spec::act("exit 0").outputs(&["../escape"]),
+            "must be relative",
+        ),
+        (Spec::act("exit 0").property("network", "maybe"), "network"),
         (
             {
-                let mut s = Spec::sh("true");
+                let mut s = Spec::act("exit 0");
                 s.working_directory = "/abs".to_owned();
                 s
             },
@@ -206,7 +230,7 @@ async fn bad_actions_are_the_clients_errors() {
             "{outcome:?}"
         );
     }
-    let negative = Spec::sh("true");
+    let negative = Spec::act("exit 0");
     let mut action: kbf_proto::reapi::Action =
         prost::Message::decode(cas.blob(&negative.store(&cas)).as_slice()).expect("action");
     action.timeout = Some(prost_types::Duration {
@@ -221,7 +245,7 @@ async fn bad_actions_are_the_clients_errors() {
     );
     // A lease directory that is already there is not this run's to use.
     std::fs::create_dir_all(config.scratch.join("lease-1-14")).expect("mkdir");
-    let outcome = run(&rt, &cas, 14, &Spec::sh("true")).await;
+    let outcome = run(&rt, &cas, 14, &Spec::act("exit 0")).await;
     assert!(
         matches!(&outcome, Err(RuntimeError::Failed(why)) if why.contains("lease-1-14")),
         "{outcome:?}"
@@ -301,10 +325,13 @@ async fn the_lease_directory_goes_whatever_the_action_left() {
     let config = config(&dir);
     let cas = Arc::new(MemoryCas::default());
     let rt = runtime(config.clone(), &cas);
-    let script = "mkdir -p a/b/c && echo x > a/b/c/f && chmod 000 a/b/c/f a/b/c && chmod 500 a/b && chmod 100 a; \
-        i=0; while [ $i -lt 300 ]; do mkdir d && cd d || exit 1; i=$((i+1)); done";
-    let result = run(&rt, &cas, 1, &Spec::sh(script)).await.expect("ran");
-    assert_eq!(result.exit_code, 0);
+    let deep = vec!["d"; 300].join("/");
+    let steps = format!(
+        "mkdir a/b/c ; append a/b/c/f x ; chmod 000 a/b/c/f ; chmod 000 a/b/c ; chmod 500 a/b ; \
+         chmod 100 a ; mkdir {deep}"
+    );
+    let result = run(&rt, &cas, 1, &Spec::act(&steps)).await.expect("ran");
+    assert_eq!(result.exit_code, 0, "{}", stderr(&cas, &result));
     assert!(no_leases(&config));
 }
 
@@ -393,7 +420,7 @@ async fn a_kill_during_the_fetch_stops_the_lease() {
     });
     let rt = Arc::new(runtime(config.clone(), &cas));
     rt.kill(kbf_types::LeaseId::new(5, 5)).await;
-    let action = Spec::sh("true").store(&cas);
+    let action = Spec::act("exit 0").store(&cas);
     let running = tokio::spawn({
         let rt = Arc::clone(&rt);
         async move { rt.run(work(1, action, 0)).await }
@@ -416,9 +443,14 @@ async fn a_sandboxed_action_cannot_lock_the_scratch_root() {
     assert!(matches!(config.isolation, network::Isolation::Sandbox(_)));
     let cas = Arc::new(MemoryCas::default());
     let rt = runtime(config.clone(), &cas);
-    let spec = Spec::sh("chmod 555 ../.. 2>/dev/null; echo $?");
+    let spec = Spec::act("chmod 555 ../..");
     let result = run(&rt, &cas, 1, &spec).await.expect("ran, and cleaned");
-    assert_ne!(stdout(&cas, &result).trim(), "0", "the chmod went through");
+    // The act step fails (exit 1) when the chmod is refused.
+    assert_eq!(result.exit_code, 1, "the chmod went through");
+    assert!(
+        stderr(&cas, &result).contains("chmod ../.."),
+        "refused elsewhere"
+    );
     assert!(no_leases(&config), "the lease directory is removed");
 }
 
@@ -439,13 +471,13 @@ async fn a_lease_directory_that_stays_fails_the_lease() {
         std::fs::set_permissions(&config.scratch, std::fs::Permissions::from_mode(0o755))
             .expect("chmod");
     };
-    let outcome = run(&rt, &cas, 1, &Spec::sh("chmod 555 ../..")).await;
+    let outcome = run(&rt, &cas, 1, &Spec::act("chmod 555 ../..")).await;
     reopen();
     assert!(
         matches!(&outcome, Err(RuntimeError::Failed(why)) if why.starts_with("clean: ")),
         "{outcome:?}"
     );
-    let spec = Spec::sh("chmod 555 ../..; sleep 300").timeout(Duration::from_millis(300));
+    let spec = Spec::act("chmod 555 ../.. ; sleep 300").timeout(Duration::from_millis(300));
     let outcome = run(&rt, &cas, 2, &spec).await;
     reopen();
     assert!(
@@ -467,27 +499,28 @@ async fn a_timeout_keeps_the_logs_written_before_it() {
     config.outputs.max_stdio_bytes = MAX;
     let cas = Arc::new(MemoryCas::default());
     let rt = runtime(config.clone(), &cas);
-    let past = MAX + 1;
+    // With its newline, one byte past the limit.
+    let past_bytes = "x".repeat(usize::try_from(MAX).expect("small"));
     let cases = [
         (
-            "echo started; echo warming >&2".to_owned(),
+            "echo started ; echo --stderr warming".to_owned(),
             Some("started\n"),
             Some("warming\n"),
         ),
         (
-            format!("head -c {past} /dev/zero; echo kept >&2"),
+            format!("echo {past_bytes} ; echo --stderr kept"),
             None,
             Some("kept\n"),
         ),
         (
-            format!("echo kept; head -c {past} /dev/zero >&2"),
+            format!("echo kept ; echo --stderr {past_bytes}"),
             Some("kept\n"),
             None,
         ),
     ];
     for (seq, (script, want_out, want_err)) in (1..).zip(cases) {
         // Room for the writes to land before the timeout on a loaded runner.
-        let spec = Spec::sh(&format!("{script}; sleep 300")).timeout(Duration::from_secs(1));
+        let spec = Spec::act(&format!("{script} ; sleep 300")).timeout(Duration::from_secs(1));
         let outcome = run(&rt, &cas, seq, &spec).await;
         let Err(RuntimeError::TimedOut { stdout, stderr }) = outcome else {
             panic!("{script}: {outcome:?}");

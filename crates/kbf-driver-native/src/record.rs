@@ -562,14 +562,26 @@ mod tests {
         let record = dir.join("lease-1-1");
         // CARGO_MANIFEST_DIR is in this test's own environment, and must not leak.
         assert!(std::env::var_os("CARGO_MANIFEST_DIR").is_some());
-        let script = format!(
-            "cat {}; echo \"$A $B ${{CARGO_MANIFEST_DIR:-clean}}\"",
-            record.display()
-        );
-        let program = Path::new("/bin/sh");
+        let record_arg = record.display().to_string();
+        let steps = [
+            "cat",
+            &record_arg,
+            ";",
+            "env",
+            "A",
+            ";",
+            "env",
+            "B",
+            ";",
+            "env",
+            "CARGO_MANIFEST_DIR",
+            "clean",
+        ];
+        let program = crate::xcode::tests::act();
+        let program = program.as_path();
         let mut command = Command::new(program);
         command.stdout(std::process::Stdio::piped());
-        let args = [OsStr::new("-c"), OsStr::new(&script)];
+        let args = steps.map(OsStr::new);
         let env =
             [("A", "first"), ("B", "b"), ("A", "a")].map(|(n, v)| (OsStr::new(n), OsStr::new(v)));
         let gate = Gate::install(&mut command, Exec::new(program, args, env).expect("exec"));
@@ -587,7 +599,7 @@ mod tests {
             assert!(out.status.success(), "{out:?}");
             let boot = boot_id().expect("boot");
             let expected = format!(
-                "{}a b clean\n",
+                "{}a\nb\nclean\n",
                 Record {
                     pgid: pid,
                     start,

@@ -233,3 +233,28 @@ pub(crate) fn trace() {
         .with_test_writer()
         .try_init();
 }
+
+// This test binary answers as kbf-testkit's `kbf-act` when it is run through a link of
+// that name: the program the tests start as a lease's process.
+kbf_testkit::act_test_hook!();
+
+/// The path of a link to this test binary named `kbf-act`, made once: run through it,
+/// the binary runs kbf-testkit's act steps (`kbf_testkit::act`) instead of the tests.
+pub(crate) fn act() -> String {
+    static LINK: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    LINK.get_or_init(|| {
+        let link = scratch("act").join(kbf_testkit::act::NAME);
+        kbf_testkit::act::link_self(&link).unwrap();
+        link
+    })
+    .display()
+    .to_string()
+}
+
+/// `act()` and then `steps`, split at spaces: the argument vector of a process that
+/// runs those act steps.
+pub(crate) fn act_argv(steps: &str) -> Vec<String> {
+    std::iter::once(act())
+        .chain(steps.split(' ').map(str::to_owned))
+        .collect()
+}

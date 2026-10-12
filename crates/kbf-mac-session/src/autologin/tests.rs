@@ -1,7 +1,7 @@
 use std::os::unix::fs::PermissionsExt as _;
 
 use super::*;
-use crate::testing::{FakeHost, scratch};
+use crate::testing::{FakeHost, act, scratch};
 
 fn decode(bytes: &[u8]) -> Vec<u8> {
     bytes
@@ -182,13 +182,17 @@ fn a_failed_write_or_restart_is_an_error() {
     );
 }
 
-/// The real runner: output, exit status, and an empty environment (no `HOME` or
-/// `PATH` from the helper reaches `defaults` or `launchctl`).
+/// Catches the real runner losing or swapping stdout and stderr, taking a failed exit
+/// for success, or passing its environment on (a `HOME` or `PATH` of the helper's
+/// would reach `defaults` or `launchctl`).
 #[test]
 fn run_command_reports_output_and_clears_the_environment() {
     let output = run_command(
-        "/bin/sh",
-        &["-c", "echo out; echo err >&2; echo ${HOME-unset}; exit 3"],
+        &act(),
+        &[
+            "echo", "out", ";", "echo", "--stderr", "err", ";", "env", "HOME", "unset", ";",
+            "exit", "3",
+        ],
     )
     .unwrap();
     assert_eq!(
@@ -199,7 +203,7 @@ fn run_command_reports_output_and_clears_the_environment() {
             stderr: "err\n".to_owned(),
         }
     );
-    assert!(run_command("/bin/sh", &["-c", "true"]).unwrap().success);
+    assert!(run_command(&act(), &["exit", "0"]).unwrap().success);
     assert!(run_command("/nonexistent/program", &[]).is_err());
 }
 

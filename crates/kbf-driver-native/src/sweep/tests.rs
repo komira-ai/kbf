@@ -100,12 +100,13 @@ fn a_directory_that_cannot_be_moved_aside_stays() {
     assert!(dir.join("lease-stuck").is_dir());
 }
 
-/// Starts `sh -c script` leading a process group of its own, as an action does, with
-/// its stdout piped; returns it and the record the daemon would have written.
-fn action(script: &str) -> (std::process::Child, Record) {
+/// Starts the act steps `steps` (split at spaces) leading a process group of its own,
+/// as an action does, with its stdout piped; returns it and the record the daemon
+/// would have written.
+fn action(steps: &str) -> (std::process::Child, Record) {
     use std::os::unix::process::CommandExt as _;
-    let child = std::process::Command::new("/bin/sh")
-        .args(["-c", script])
+    let child = std::process::Command::new(crate::xcode::tests::act())
+        .args(steps.split(' '))
         .stdout(std::process::Stdio::piped())
         .process_group(0)
         .spawn()
@@ -192,9 +193,9 @@ fn a_recorded_run_is_killed_before_its_directory_goes() {
     use std::os::unix::process::ExitStatusExt as _;
 
     let dir = scratch("kill");
-    let (mut leader, running) = action("exec sleep 300");
+    let (mut leader, running) = action("sleep 300");
     // The leader exits at once; the sleep it started stays in its group.
-    let (mut exited, orphaned) = action("sleep 300 & echo $!");
+    let (mut exited, orphaned) = action("spawn-child --pid - sleep 300");
     let mut line = String::new();
     std::io::BufRead::read_line(
         &mut std::io::BufReader::new(exited.stdout.take().expect("stdout")),
@@ -230,7 +231,7 @@ fn a_recorded_run_is_killed_before_its_directory_goes() {
 #[test]
 fn a_record_whose_pid_names_another_process_kills_nothing() {
     let dir = scratch("reused");
-    let (other, record) = action("exec sleep 300");
+    let (other, record) = action("sleep 300");
     let stale = Record {
         start: record.start - 1,
         ..record.clone()
@@ -335,7 +336,7 @@ fn a_record_naming_another_users_group_is_dropped() {
 #[test]
 fn what_is_not_a_record_is_set_aside_and_the_start_goes_on() {
     let dir = scratch("forged");
-    let (victim, record) = action("exec sleep 300");
+    let (victim, record) = action("sleep 300");
     let elsewhere = dir.join("elsewhere");
     std::fs::write(&elsewhere, record.line()).expect("write");
     write_record(&dir, "lease-3-0", "torn");
@@ -393,7 +394,7 @@ fn only_the_daemons_own_entries_are_read() {
 #[test]
 fn a_runs_open_to_others_or_a_link_is_set_aside_unread() {
     let dir = scratch("modes");
-    let (victim, record) = action("exec sleep 300");
+    let (victim, record) = action("sleep 300");
     let runs = dir.join(RUNS);
 
     write_record(&dir, "lease-7-1", &record.line());

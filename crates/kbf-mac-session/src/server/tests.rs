@@ -12,7 +12,7 @@ use crate::lease::UidRange;
 use crate::ledger::Ledger;
 use crate::proto::Request;
 use crate::sweep::SweepPlan;
-use crate::testing::{FakeHost, scratch, trace};
+use crate::testing::{FakeHost, act_argv, scratch, trace};
 
 fn me() -> u32 {
     rustix::process::getuid().as_raw()
@@ -215,7 +215,9 @@ fn the_scan_verbs_work_over_the_socket() {
     client.reboot_dirty().unwrap();
 }
 
-/// The four verbs end to end over the socket, descriptors included.
+/// The four verbs end to end over the socket, descriptors included. Catches: the
+/// process not started in the lease directory it was sent, its exit status or the
+/// signal that ended it lost on the way back, and a deleted user's kill accepted.
 #[test]
 fn the_verbs_work_over_the_socket() {
     let served = served("verbs", Ok(()));
@@ -224,7 +226,7 @@ fn the_verbs_work_over_the_socket() {
     let (mut out, write) = std::io::pipe().unwrap();
     let null = std::fs::File::open("/dev/null").unwrap();
     let lease_dir = std::fs::File::open(&served.dir).unwrap();
-    let argv = ["/bin/sh", "-c", "echo $PWD; exit 3"].map(str::to_owned);
+    let argv = act_argv("pwd ; exit 3");
     let running = client
         .run(
             "1.1",
@@ -244,9 +246,14 @@ fn the_verbs_work_over_the_socket() {
     );
     let mut text = String::new();
     out.read_to_string(&mut text).unwrap();
-    assert!(!text.is_empty());
+    let real = std::fs::canonicalize(&served.dir).unwrap();
+    assert_eq!(
+        text,
+        format!("{}\n", real.display()),
+        "not run in the lease directory"
+    );
 
-    let argv = ["/bin/sh", "-c", "kill -9 $$"].map(str::to_owned);
+    let argv = act_argv("kill-self 9");
     let running = client
         .run(
             "1.1",

@@ -24,6 +24,9 @@ tracing.workspace = true
 [dev-dependencies]
 clap.workspace = true
 hex.workspace = true
+# What the tests run as actions and as fake Xcode tools: kbf-testkit's act verbs and
+# its fake xcrun, xcodebuild and sandbox-exec, through links to the test binary.
+kbf-testkit.workspace = true
 sha2.workspace = true
 tracing-subscriber.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread"] }

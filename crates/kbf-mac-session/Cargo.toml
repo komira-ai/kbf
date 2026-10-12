@@ -44,5 +44,10 @@ objc2-open-directory = { workspace = true, features = [
 ] }
 security-framework.workspace = true
 
+[dev-dependencies]
+# The programs the unit tests start as a lease's process: kbf-testkit's act verbs,
+# through links to the test binary.
+kbf-testkit.workspace = true
+
 [lints]
 workspace = true

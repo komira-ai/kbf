@@ -46,11 +46,11 @@ async fn old_leftovers_are_swept_at_start_and_after_each_lease() {
     assert!(items.join("in-progress").exists(), "removed at start");
 
     let left = items.join("by-a-lease");
-    let spec = Spec::sh(&format!(
-        "mkdir -p '{0}' && echo x > '{0}/f' && touch -t 200001010000 '{0}'",
+    // Made in 2000 (946684800 s after the epoch), so old enough to sweep at once.
+    let spec = Spec::act(&format!(
+        "mkdir {0} ; append {0}/f x ; mtime {0} 946684800",
         left.display()
-    ))
-    .env("PATH", "/usr/bin:/bin");
+    ));
     let result = run(&rt, &cas, 1, &spec).await.expect("ran");
     assert_eq!(result.exit_code, 0, "{}", stderr(&cas, &result));
     assert!(!left.exists(), "kept past the lease");
