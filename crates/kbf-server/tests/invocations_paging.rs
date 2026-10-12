@@ -119,13 +119,15 @@ impl Paged {
 
 /// Catches (mutants "the token points at the last row listed" and "the token skips a
 /// row", for each route; "logs list the failed rows again" and "logs miss failed rows
-/// added after the failed part"): a page that repeats or skips a row (or an output)
-/// while rows are appended between pages, on `/actions` with each filter, on
-/// `/artifacts` and on `/logs`. A seeded property test: 30 seeds, each a session per
-/// route with 0 to 24 rows to start, pages of 1 to 5, and 0 to 3 rows appended before
-/// each page; when the last page comes (no `next_page_token`), every entry of the
-/// rows there are then has been listed exactly once, in row order (`/logs`: once
-/// each, failed rows of the first part before the others).
+/// added after the failed part"; and "`next_page` without the filter", a `400`): a
+/// page that repeats or skips a row (or an output) while rows are appended between
+/// pages, on `/actions` with each filter, on `/artifacts` and on `/logs`, following
+/// each page's `next_page` from the first. A seeded property test: 30 seeds, each a
+/// session per route with 0 to 24 rows to start, pages of 1 to 5, and 0 to 3 rows
+/// appended before each page; when the last page comes (no `next_page`, and no
+/// `next_page_token`), every entry of the rows there are then has been listed exactly
+/// once, in row order (`/logs`: once each, failed rows of the first part before the
+/// others).
 #[tokio::test]
 async fn paging_while_rows_are_appended_never_skips_or_repeats() {
     let server = Server::with(OPEN);
@@ -155,13 +157,10 @@ async fn paging_while_rows_are_appended_never_skips_or_repeats() {
             let size = rows.rng.between(1, 6);
             let mut listed = Vec::new();
             let mut first_part = None;
-            let mut token: Option<String> = None;
+            // The first page; then each page's `next_page`, as an agent follows it.
+            let mut path = format!("{}&page_size={size}", route.path(&id));
             for page in 0.. {
                 assert!(page < 1_000, "{id}: paging does not end");
-                let mut path = format!("{}&page_size={size}", route.path(&id));
-                if let Some(t) = &token {
-                    path.push_str(&format!("&page_token={t}"));
-                }
                 let answer = server.ok(&path).await;
                 pages_read += 1;
                 let entries = answer[route.list()].as_array().expect("entries");
@@ -172,10 +171,20 @@ async fn paging_while_rows_are_appended_never_skips_or_repeats() {
                     }
                     listed.push(route.entry(e));
                 }
-                token = answer["next_page_token"].as_str().map(str::to_owned);
-                if token.is_none() {
+                let token = answer["next_page_token"].as_str();
+                let Some(next) = answer["next_page"].as_str() else {
+                    assert!(
+                        token.is_none(),
+                        "{id}: a token without a next_page: {answer}"
+                    );
                     break;
-                }
+                };
+                let token = token.expect("a next_page comes with its token");
+                assert!(
+                    next.contains(&format!("page_token={token}")),
+                    "{id}: {next}"
+                );
+                path = next.to_owned();
                 // Rows appended between pages, fewer once paging has gone on a while,
                 // so that it ends.
                 let mut events = Vec::new();
@@ -322,7 +331,10 @@ async fn a_token_for_a_record_evicted_after_it_was_issued_is_404() {
         "/v1/invocations/old",
         "/v1/invocations/old/actions",
     ] {
-        assert_eq!(server.get(path).await.code, 404, "{path}: removed");
+        let answer = server.get(path).await;
+        assert_eq!(answer.code, 404, "{path}: removed");
+        assert_eq!(answer.json["error"], "no_record", "{path}: {}", answer.json);
+        assert_eq!(answer.json["id"], "old", "{path}");
     }
     // Made again under the same key, with rows enough for the token's position.
     server.feed(rows("old", 500, 2, later + 1_000)).await;
@@ -334,7 +346,76 @@ async fn a_token_for_a_record_evicted_after_it_was_issued_is_404() {
         "the token of the removed record: {}",
         answer.json
     );
+    assert_eq!(answer.json["error"], "no_record", "{}", answer.json);
     let fresh = server.ok("/v1/invocations/old/actions?page_size=1").await;
     assert_eq!(fresh["actions"][0]["action"], text(&digest(500)));
     server.stop().await;
+}
+
+/// Catches (mutant "`records_since` = start only"): the `404` of a record not held
+/// without the body of `docs/design/invocations-api.md` 4.10, or with a
+/// `records_since` other than the later of the server's start and the `last_seen` of
+/// the newest client record removed at the bound. The records here are seen in 2030,
+/// after the server started, so the two cases differ.
+#[tokio::test]
+async fn a_missing_record_says_since_when_records_are_held() {
+    let before = kbf_front::wall_now();
+    let policy = kbf_auth::Policy::from_json(OPEN).expect("a policy");
+    let server = Server::start(policy, 64 << 10);
+    let after = kbf_front::wall_now();
+    let missing = server.get("/v1/invocations/never-seen").await;
+    assert_eq!(missing.code, 404);
+    assert_eq!(missing.json["error"], "no_record", "{}", missing.json);
+    assert_eq!(missing.json["id"], "never-seen");
+    let since = missing.json["records_since"].as_str().expect("a time");
+    let since_micros = micros(since);
+    assert!(
+        before.unix_micros() <= since_micros && since_micros <= after.unix_micros(),
+        "{since}: the server's start"
+    );
+    // `old`, last seen at 2030-01-01T00:00:00.000009Z, then idle and removed.
+    server.feed(rows_at("old", 0, 10, 0)).await;
+    let eleven_minutes_on = 11 * 60 * 1_000_000;
+    let mut builds = 0;
+    while server.recorder.get(&key("old")).is_some() {
+        builds += 1;
+        assert!(builds < 10_000, "the record is never removed");
+        let id = format!("new-{builds}");
+        server.feed(rows_at(&id, 100, 1, eleven_minutes_on)).await;
+    }
+    let gone = server.get("/v1/invocations/old/logs").await;
+    assert_eq!(gone.code, 404);
+    assert_eq!(gone.json["error"], "no_record", "{}", gone.json);
+    assert_eq!(
+        gone.json["records_since"], "2030-01-01T00:00:00.000009Z",
+        "the removed record's last_seen: {}",
+        gone.json
+    );
+    server.stop().await;
+}
+
+/// `n` hits of invocation `id` from action `from`, the i-th at `when + i` µs after
+/// 2030-01-01.
+fn rows_at(id: &str, from: u64, n: u64, when: u64) -> Vec<Event> {
+    (from..from + n)
+        .map(|i| {
+            let l = listing(digest(10_000 + i), 0, &[], (Some(digest(20_000 + i)), None));
+            hit(id, pages::later(when + i), digest(i), l)
+        })
+        .collect()
+}
+
+/// Microseconds since the Unix epoch of `YYYY-MM-DDTHH:MM:SS.ffffffZ` (H. Hinnant's
+/// `days_from_civil`; the server writes times with its inverse).
+fn micros(text: &str) -> u64 {
+    let n = |range: std::ops::Range<usize>| -> u64 { text[range].parse().expect("a number") };
+    let (y, m, d) = (n(0..4), n(5..7), n(8..10));
+    let (y, m) = if m <= 2 { (y - 1, m + 9) } else { (y, m - 3) };
+    let era = y / 400;
+    let yoe = y - era * 400;
+    let doy = (153 * m + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    let secs = days * 86_400 + n(11..13) * 3_600 + n(14..16) * 60 + n(17..19);
+    secs * 1_000_000 + n(20..26)
 }

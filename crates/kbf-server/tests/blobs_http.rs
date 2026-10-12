@@ -462,6 +462,7 @@ async fn blob_reads_are_off_unless_the_policy_names_their_authorizer() {
                 body.contains("blob reads over HTTP are off"),
                 "{what}: {body}"
             );
+            assert!(body.contains(r#""off":"blobs""#), "{what}: {body}");
         }
         let nodes = server.get("/v1/nodes", "").await;
         assert_eq!(nodes.code, 200, "{what}: the rest of the API answers");

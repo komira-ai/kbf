@@ -34,10 +34,11 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use kbf_auth::{Authenticator, Authorizer, Policy, authorize};
 use kbf_front::{Cache, MetaLog, Recorder, wall_now};
+use kbf_invocation::WallTime;
 use kbf_objstore::ObjectStore;
 use serde_json::Value;
 
-use crate::http_blobs::{error, refusal};
+use crate::http_blobs::{error, off, refusal};
 
 mod pages;
 mod views;
@@ -75,6 +76,8 @@ struct PagesState<M, O> {
     recorder: Recorder,
     cache: Arc<Cache<M, O>>,
     readers: Option<InvocationReaders>,
+    /// When the routes were made, with the server: no record is older.
+    started: WallTime,
 }
 
 /// The build pages over `recorder`'s records, saying whether each blob is still in
@@ -92,6 +95,7 @@ where
         recorder,
         cache,
         readers,
+        started: wall_now(),
     });
     Router::new()
         .route("/v1/invocations/{id}", get(page::<M, O>))
@@ -105,13 +109,19 @@ where
     O: ObjectStore + 'static,
 {
     let Some(readers) = &state.readers else {
-        return error(
-            StatusCode::NOT_FOUND,
+        return off(
+            "invocations",
             "the build pages are off: the REAPI policy names no invocations.getAuthorizer \
              and --invocations-open is not given",
         );
     };
-    let draft = match read(readers, &state.recorder, &parts).await {
+    // The later of the server's start and the newest client record removed at the
+    // bound: a record last seen after it would still be held.
+    let since = state
+        .recorder
+        .evicted_last_seen()
+        .map_or(state.started, |t| t.max(state.started));
+    let draft = match read(readers, &state.recorder, &parts, since).await {
         Ok(draft) => draft,
         Err(answer) => return answer,
     };
@@ -129,6 +139,7 @@ async fn read(
     readers: &InvocationReaders,
     recorder: &Recorder,
     parts: &Parts,
+    since: WallTime,
 ) -> Result<views::Draft, Response> {
     let caller = readers
         .authenticator
@@ -139,18 +150,14 @@ async fn read(
             refusal(&e)
         })?;
     let request = Request::parse(parts.uri.path(), parts.uri.query().unwrap_or_default())
-        .map_err(|bad| bad_answer(&bad))?;
+        .map_err(|bad| bad_answer(&bad, "", since))?;
+    let id = request.key.to_string();
     let mut held = None;
     recorder.read(&request.key, &mut |inv| {
         held = Some((inv.serial(), pages::instance_names(inv)));
     });
     let Some((serial, names)) = held else {
-        let why = format!(
-            "no invocation {} is held: records are kept in memory, from the first call \
-             that names the id, until the memory bound removes them or the server restarts",
-            request.key
-        );
-        return Err(error(StatusCode::NOT_FOUND, &why));
+        return Err(bad_answer(&Bad::Gone, &id, since));
     };
     // Every name must be allowed, each asked as a REAPI call's instance name is (a
     // refusal is logged there; no answer is a refusal too).
@@ -161,19 +168,31 @@ async fn read(
     }
     let now = wall_now();
     // Removed since it was authorized: as if it had never been held.
-    let mut built = Err(Bad::NotFound(format!(
-        "invocation {} is no longer held",
-        request.key
-    )));
+    let mut built = Err(Bad::Gone);
     recorder.read(&request.key, &mut |inv| {
         built = pages::answer(inv, &request, (serial, &names), readers.blobs, now);
     });
-    built.map_err(|bad| bad_answer(&bad))
+    built.map_err(|bad| bad_answer(&bad, &id, since))
 }
 
-/// The answer to a request [`pages`] refused.
-fn bad_answer(bad: &Bad) -> Response {
+/// The answer to a request [`pages`] refused; a record that is gone answers with
+/// `{"error": "no_record", "id": <id>, "records_since": <since>}`
+/// (`docs/design/invocations-api.md` 4.10), which no other `404` has.
+fn bad_answer(bad: &Bad, id: &str, since: WallTime) -> Response {
     match bad {
+        Bad::Gone => {
+            let body = serde_json::json!({
+                "error": "no_record",
+                "id": id,
+                "records_since": views::rfc3339(since),
+            });
+            (
+                StatusCode::NOT_FOUND,
+                [(axum::http::header::CONTENT_TYPE, crate::api::JSON)],
+                body.to_string(),
+            )
+                .into_response()
+        }
         Bad::NotFound(why) => error(StatusCode::NOT_FOUND, why),
         Bad::Invalid(why) => error(StatusCode::BAD_REQUEST, why),
         Bad::Changed(why) => error(StatusCode::SERVICE_UNAVAILABLE, why),

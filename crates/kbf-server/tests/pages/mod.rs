@@ -336,3 +336,11 @@ pub fn queued_target(id: &str, target: &str, when: WallTime, action: Digest, op:
     call.metadata.target = Some(kbf_invocation::Text::sent(target));
     Event::Call(call)
 }
+
+/// 2030-01-01T00:00:00Z: a base for events after any server's start.
+pub const LATER_SECS: u64 = 1_893_456_000;
+
+/// `micros` microseconds after [`LATER_SECS`].
+pub fn later(micros: u64) -> WallTime {
+    WallTime::from_unix_micros(LATER_SECS * 1_000_000 + micros)
+}

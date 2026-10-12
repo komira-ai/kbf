@@ -22,9 +22,12 @@ pub(crate) const PREFIX: &str = "/v1/invocations/";
 /// Why a request is not answered with a page.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Bad {
-    /// `404`: no such route, no such record (or no longer: a page token's), no such
-    /// row.
+    /// `404`: no such route, no such row.
     NotFound(String),
+    /// `404` with the body of `docs/design/invocations-api.md` 4.10: the record is
+    /// not held, or is another one than a page token (or the authorization) was made
+    /// for: one removed since and made again under the same key.
+    Gone,
     /// `400`: a malformed query or page token, or a token made for another route or
     /// filter.
     Invalid(String),
@@ -73,6 +76,14 @@ const HOWS: [(How, &str); 4] = [
     (How::Ran, "ran"),
 ];
 
+/// The name of `outcome`, as `?outcome=` takes it.
+fn outcome_name(outcome: OutcomeFilter) -> &'static str {
+    OUTCOMES
+        .iter()
+        .find(|(o, _)| *o == outcome)
+        .map_or("", |(_, n)| n)
+}
+
 /// The name of `how`, as the API writes it.
 pub(super) fn how_name(how: How) -> &'static str {
     HOWS.iter().find(|(h, _)| *h == how).map_or("", |(_, n)| n)
@@ -103,12 +114,19 @@ impl Filter {
     /// The filter as a page token carries it: `<outcome>+<how>`, `-` for either one
     /// absent.
     fn text(self) -> String {
-        let outcome = self
-            .outcome
-            .and_then(|o| OUTCOMES.iter().find(|(f, _)| *f == o))
-            .map_or("-", |(_, n)| n);
+        let outcome = self.outcome.map_or("-", outcome_name);
         let how = self.how.map_or("-", how_name);
         format!("{outcome}+{how}")
+    }
+
+    /// Adds the filter to a query, as `/actions` takes it.
+    fn append_to(self, query: &mut form_urlencoded::Serializer<'_, String>) {
+        if let Some(outcome) = self.outcome {
+            query.append_pair("outcome", outcome_name(outcome));
+        }
+        if let Some(how) = self.how {
+            query.append_pair("how", how_name(how));
+        }
     }
 }
 
@@ -386,7 +404,7 @@ impl Token {
     ///
     /// # Errors
     /// [`Bad::Invalid`] for a token that does not decode, names another route or
-    /// another filter, or a position past the record's rows; [`Bad::NotFound`] for a
+    /// another filter, or a position past the record's rows; [`Bad::Gone`] for a
     /// token made for another record (one removed since and made again under the same
     /// key, say): its position is never read against this one.
     pub(crate) fn decode(
@@ -439,17 +457,13 @@ impl Token {
 /// `Ok` when `inv` is the record `serial` names.
 ///
 /// # Errors
-/// [`Bad::NotFound`] when it is another one: the record the serial was read from is
-/// gone, and this is a new one under its key.
+/// [`Bad::Gone`] when it is another one: the record the serial was read from is gone,
+/// and this is a new one under its key.
 fn same_record(inv: &Invocation, serial: u64) -> Result<(), Bad> {
     if inv.serial() == serial {
         Ok(())
     } else {
-        Err(Bad::NotFound(format!(
-            "invocation {} is no longer held (records are kept in memory and removed at \
-             the memory bound); this one was made after it",
-            inv.key()
-        )))
+        Err(Bad::Gone)
     }
 }
 
@@ -464,7 +478,7 @@ pub(crate) fn instance_names(inv: &Invocation) -> Vec<String> {
 /// was authorized for.
 ///
 /// # Errors
-/// [`Bad::NotFound`] for another record under the key; [`Bad::Changed`] when the
+/// [`Bad::Gone`] for another record under the key; [`Bad::Changed`] when the
 /// record has gained an instance name since.
 pub(crate) fn still_authorized(inv: &Invocation, serial: u64, names: &[String]) -> Result<(), Bad> {
     same_record(inv, serial)?;
@@ -547,8 +561,16 @@ fn paged(
             serial: inv.serial(),
             filter: page.filter,
             cursor,
-        };
-        value.insert("next_page_token".to_owned(), token.encode().into());
+        }
+        .encode();
+        // The link an agent follows: the same filter, page size and the token.
+        let mut query = form_urlencoded::Serializer::new(String::new());
+        page.filter.append_to(&mut query);
+        query.append_pair("page_size", &page.size.to_string());
+        query.append_pair("page_token", &token);
+        let next = format!("{base}/{}?{}", start.kind(), query.finish());
+        value.insert("next_page".to_owned(), next.into());
+        value.insert("next_page_token".to_owned(), token.into());
     }
     Ok(Value::Object(value))
 }

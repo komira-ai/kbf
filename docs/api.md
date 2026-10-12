@@ -304,8 +304,9 @@ exact.
 
 **Pages.** `/actions`, `/artifacts` and `/logs` take `?page_size=` (100 by default,
 1 to 1000) and `?page_token=`, the `next_page_token` of the page before, with the same
-filter; the answer is `{"actions": [...]}` (or `artifacts`, `logs`) and a
-`next_page_token` unless it is the last page. A token is opaque: it names the record it
+filter; the answer is `{"actions": [...]}` (or `artifacts`, `logs`) and, unless it is
+the last page, `next_page_token` and `next_page`, the route's path with the same filter,
+page size and that token: the link to follow. A token is opaque: it names the record it
 was made for, its filter and a position. Rows are only appended, so a build still
 writing never makes a page skip or repeat a row. Outputs and logs are listed as each
 row held them when a page passed it: an action still running then is not listed when
@@ -318,8 +319,16 @@ ran out are listed with the rest, failed or not.
 | `400` | a parameter the route does not take, one given twice, a `page_size` outside 1 to 1000, a filter value not listed above, or a page token that does not decode, was made for another route or another filter, or names a position past the rows |
 | `401` | the policy's `authenticationPolicy` refuses the request |
 | `403` | `invocations.getAuthorizer` refuses one of the invocation's instance names |
-| `404` | the routes are off; no such route; `{id}` is not an id or `<id>~<n>`; no such record is held (never made, removed at the memory bound, or lost at a restart), a page token's included even if a record has been made since under the same key; no row for the action |
+| `404` | the routes are off: `{"error": "<why>", "off": "invocations"}`; no such record is held (never made, removed at the memory bound, or lost at a restart), a page token's included even if a record has been made since under the same key: `{"error": "no_record", "id": "<id>", "records_since": "<time>"}` (below); no such route, `{id}` is not an id or `<id>~<n>`, or no row for the action: `{"error": "<why>"}` |
 | `503` | the record gained an instance name while it was read: send the request again |
+
+**A record that is not held** answers `{"error": "no_record", "id": "<id>",
+"records_since": "<time>"}` ([invocations-api.md](design/invocations-api.md#410-a-record-that-is-gone)).
+`records_since` is the later of the server's start and the `last_seen` of the newest
+record of a client's id removed at the memory bound (removed minted records do not
+count): a build whose calls went on after it would still be held, so its `404` means
+the server saw no call with that id; a build that ended before it may have been lost.
+The `off` body of a route that is switched off is never this one.
 
 ## `GET /v1/blobs/{digest}`
 
@@ -337,8 +346,9 @@ hold secrets. It runs the policy of `--reapi-auth-policy`
 `blobs.getAuthorizer` with the `instance` parameter. Without that key, without the
 build pages' `invocations.getAuthorizer` (blobs are what the pages link to, and are off
 with them), or without a policy file, every request is `404` and the start line says
-` blobs=off` (before ` api=`); with both, ` blobs=on`. `--invocations-open` fills in
-`allow` for either key the file leaves out.
+` blobs=off` (before ` api=`), with the body `{"error": "<why>", "off": "blobs"}`;
+with both, ` blobs=on`. `--invocations-open` fills in `allow` for either key the file
+leaves out.
 
 | Parameter | Meaning |
 |---|---|

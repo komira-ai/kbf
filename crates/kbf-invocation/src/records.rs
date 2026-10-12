@@ -89,8 +89,10 @@ pub struct Records {
     unborn: VecDeque<(InvocationId, Owner)>,
     /// What `unborn`'s ids and owners hold.
     unborn_bytes: usize,
-    /// Records made so far: the next one.s [`Invocation::serial`].
+    /// Records made so far: the next one's [`Invocation::serial`].
     made: u64,
+    /// The latest `last_seen` of a client's record removed for the bound.
+    evicted_seen: Option<WallTime>,
     /// Records removed for the bound.
     evicted: u64,
 }
@@ -187,6 +189,7 @@ impl Records {
             unborn_bytes: 0,
             evicted: 0,
             made: 0,
+            evicted_seen: None,
         }
     }
 
@@ -230,6 +233,15 @@ impl Records {
     #[must_use]
     pub const fn evicted(&self) -> u64 {
         self.evicted
+    }
+
+    /// The latest `last_seen` of a record of a client's id removed for the bound, or
+    /// `None` if none was: every record removed was last seen at or before it, so a
+    /// build seen after it would still be held. Minted records (section 2.3) do not
+    /// count; their ids are the server's own (`docs/design/invocations-api.md`, 4.10).
+    #[must_use]
+    pub const fn evicted_last_seen(&self) -> Option<WallTime> {
+        self.evicted_seen
     }
 
     /// Applies one event, admitting what it adds within the bound.
@@ -791,6 +803,9 @@ impl Records {
                 left > 0
             });
             self.bytes -= freed;
+        }
+        if !inv.minted {
+            self.evicted_seen = self.evicted_seen.max(Some(inv.last_seen));
         }
         self.evicted += 1;
     }

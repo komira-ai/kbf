@@ -139,7 +139,7 @@ fn a_record_that_changed_since_its_authorization_is_not_read() {
     ));
     assert!(matches!(
         still_authorized(inv, inv.serial() + 1, &names),
-        Err(Bad::NotFound(_))
+        Err(Bad::Gone)
     ));
     let request = Request::parse("/v1/invocations/b", "").expect("a request");
     let refused = answer(
@@ -205,13 +205,15 @@ fn availability_is_filled_where_each_blob_sits() {
 fn refusals_keep_their_meaning() {
     use axum::http::StatusCode;
     for (bad, code) in [
-        (Bad::NotFound("gone".to_owned()), StatusCode::NOT_FOUND),
+        (Bad::Gone, StatusCode::NOT_FOUND),
+        (Bad::NotFound("no row".to_owned()), StatusCode::NOT_FOUND),
         (Bad::Invalid("bad".to_owned()), StatusCode::BAD_REQUEST),
         (
             Bad::Changed("again".to_owned()),
             StatusCode::SERVICE_UNAVAILABLE,
         ),
     ] {
-        assert_eq!(super::bad_answer(&bad).status(), code, "{bad:?}");
+        let answer = super::bad_answer(&bad, "b", WallTime::from_unix_micros(0));
+        assert_eq!(answer.status(), code, "{bad:?}");
     }
 }

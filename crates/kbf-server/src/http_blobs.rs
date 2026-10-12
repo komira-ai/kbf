@@ -177,8 +177,8 @@ where
     O: ObjectStore + 'static,
 {
     let Some(readers) = &state.readers else {
-        return Err(error(
-            StatusCode::NOT_FOUND,
+        return Err(off(
+            "blobs",
             "blob reads over HTTP are off: the REAPI policy names no blobs.getAuthorizer, \
              or no invocations.getAuthorizer, and --invocations-open is not given",
         ));
@@ -453,6 +453,18 @@ pub(crate) fn refusal(status: &Status) -> Response {
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     };
     error(code, status.message())
+}
+
+/// The `404` of a route that is off: `{"error": <why>, "off": <which>}`, so a client
+/// never reads it as "no such record" (`docs/design/invocations.md` 4.1).
+pub(crate) fn off(which: &str, why: &str) -> Response {
+    let body = serde_json::json!({ "error": why, "off": which }).to_string();
+    (
+        StatusCode::NOT_FOUND,
+        [(CONTENT_TYPE, crate::api::JSON)],
+        body,
+    )
+        .into_response()
 }
 
 /// A JSON error answer, as the rest of the API gives.

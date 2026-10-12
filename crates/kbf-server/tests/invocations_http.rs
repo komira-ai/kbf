@@ -33,8 +33,10 @@ fn routes(id: &str, action: &str) -> Vec<String> {
 /// Catches (mutant "default allow": `InvocationReaders::from_policy` answering with an
 /// `allow` when the policy names no `invocations.getAuthorizer`): any route answering
 /// without a policy file, with a policy that names other keys, or with `blobs` only;
-/// and a route not answering once the key is named. The rest of the API answers
-/// either way.
+/// and a route not answering once the key is named. And (mutant "4.10's body for a
+/// route that is off") an off route's `404` without `"off": "invocations"`, or with
+/// the `no_record` body that means "no record of your build". The rest of the API
+/// answers either way.
 #[tokio::test]
 async fn the_pages_are_off_unless_the_policy_names_their_authorizer() {
     let action = digest(1);
@@ -67,7 +69,15 @@ async fn the_pages_are_off_unless_the_policy_names_their_authorizer() {
                 .as_str()
                 .is_some_and(|e| e.contains("the build pages are off"));
             assert_eq!(off, !on, "{what} {route}: {}", answer.json);
+            let says_off = answer.json["off"] == "invocations";
+            assert_eq!(says_off, !on, "{what} {route}: {}", answer.json);
         }
+        // A record that is not held: off says so, and never `no_record`.
+        let missing = server.get("/v1/invocations/no-such-build").await;
+        assert_eq!(missing.code, 404, "{what}");
+        let no_record = missing.json["error"] == "no_record";
+        assert_eq!(no_record, on, "{what}: {}", missing.json);
+        assert_eq!(missing.json["off"] == "invocations", !on, "{what}");
         assert_eq!(server.get("/v1/nodes").await.code, 200, "{what}");
         server.stop().await;
     }
