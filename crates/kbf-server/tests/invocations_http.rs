@@ -213,9 +213,10 @@ async fn a_name_the_record_could_not_take_is_not_read_through_a_row() {
 /// Catches (security): what a call left out of its record still does to it. At the
 /// memory bound the record cannot take the name `secret`, so a reader is asked about
 /// `ci/...` alone; an upload and an Execute under `secret` must then leave every
-/// field a page shows as it was (counts, `last_seen`, state, `rows_capped`), the
-/// record only saying `complete: false`. Red with the counts or `last_seen` applied
-/// before the instance name is checked.
+/// field a page shows as it was (counts, `last_seen`, state, rows), the record only
+/// saying `complete: false` and, as the bound closed it to rows making room for the
+/// name, `rows_capped: true`. Red with the counts or `last_seen` applied before the
+/// instance name is checked.
 #[tokio::test]
 async fn a_call_under_a_name_the_record_could_not_take_changes_no_page() {
     const CI_ONLY: &str = r#"{"authenticationPolicy": {"allow": {}},
@@ -235,6 +236,7 @@ async fn a_call_under_a_name_the_record_could_not_take_changes_no_page() {
         before.push(answer.json);
     }
     before[0]["complete"] = json!(false);
+    before[0]["rows_capped"] = json!(true);
     server
         .feed([
             call("leak", "", "secret", at(1), CallKind::Uploaded(987_654_321)),
@@ -244,7 +246,10 @@ async fn a_call_under_a_name_the_record_could_not_take_changes_no_page() {
     for (page, was) in pages.into_iter().zip(before) {
         let answer = server.get(page).await;
         assert_eq!(answer.code, 200, "{page}");
-        assert_eq!(answer.json, was, "{page}: a call under secret reached the page");
+        assert_eq!(
+            answer.json, was,
+            "{page}: a call under secret reached the page"
+        );
     }
     server.stop().await;
 }

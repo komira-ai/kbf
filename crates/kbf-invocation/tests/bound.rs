@@ -578,7 +578,11 @@ fn a_call_of_a_name_the_record_could_not_take_changes_nothing_else() {
     let before = r.get(&key("inv")).expect("held").clone();
     let later = t(1_000_000);
     assert_eq!(before.state(later), State::Idle);
-    r.apply(secret(ev(call("inv", t(5), CallKind::Uploaded(987_654_321)))));
+    r.apply(secret(ev(call(
+        "inv",
+        t(5),
+        CallKind::Uploaded(987_654_321),
+    ))));
     r.apply(secret(queued("inv", t(6), 11, 2)));
     let inv = r.get(&key("inv")).expect("held");
     assert_eq!(inv.instances().iter().collect::<Vec<_>>(), ["main"]);

@@ -459,8 +459,14 @@ impl Records {
             self.record(&key).seen(call);
         } else {
             let inv = self.record(&key);
-            inv.touch(call.at);
             inv.mark_incomplete();
+            // A reader is authorized on the record's instance names: a call under a
+            // name it could not take changes nothing a page shows (its counts,
+            // `last_seen`, rows or operations in flight), as a dropped call does not.
+            if !inv.instances.contains(&call.instance) {
+                return;
+            }
+            inv.touch(call.at);
         }
         // Indexed under its new `last_seen` before any room is made for its row.
         self.recount(&key);

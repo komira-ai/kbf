@@ -307,7 +307,9 @@ invocation stops taking rows. Each addition is admitted like a row, making room 
 the order above; what still does not fit is left out, and the invocation says
 `complete: false`: a listing keeps the outputs that fit (and the row says
 `outputs_truncated: true`); an attempt, an outcome's message or reason, an instance
-name, a later Execute's row and a call's wait on its operation are not set; and a new
+name, a later Execute's row and a call's wait on its operation are not set; a call
+whose instance name is left out is left out whole (no counter, no `last_seen`, no row,
+no wait), since a reader is asked about the names the invocation holds; and a new
 invocation is not made, so its caller's next call makes it incomplete, as after a
 dropped call (3.4).
 

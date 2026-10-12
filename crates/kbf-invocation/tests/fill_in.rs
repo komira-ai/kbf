@@ -156,7 +156,8 @@ fn a_record_that_does_not_fit_is_not_made_and_its_next_one_is_incomplete() {
 
 /// Catches header growth past the bound (plant "insert every instance": the calls
 /// go over). An instance name that does not fit is not listed, and the record says
-/// `complete: false`.
+/// `complete: false`; a call whose name is left out is not counted either (a reader
+/// is asked about the names listed only).
 #[test]
 fn an_instance_name_past_the_bound_is_left_out() {
     let calls = [queued("a", t(0), 10, 1)];
@@ -171,7 +172,12 @@ fn an_instance_name_past_the_bound_is_left_out() {
     assert!(inv.instances().len() > 1, "the names that fit are listed");
     assert!(inv.instances().len() < 21, "not every name fits");
     assert!(!inv.complete());
-    assert_eq!(inv.counts().bytes_downloaded, 20, "every call is counted");
+    let listed = u64::try_from(inv.instances().len() - 1).expect("a count");
+    assert_eq!(
+        inv.counts().bytes_downloaded,
+        listed,
+        "a call is counted only under a listed name"
+    );
 }
 
 /// Catches the operations left out of the bound (plant `Operation::bytes` = 0: the
