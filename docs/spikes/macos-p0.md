@@ -16,20 +16,23 @@ does not prove what a farm Mac Studio does on its own macOS build, with FileVaul
 with nobody logged in, or with a fresh standard user. The last section lists what
 still needs a Studio.
 
-## How to run it
+## How it ran
 
-The probes live in `tools/spike/macos/`. The workflow is
-`.github/workflows/spike-macos.yml`; it runs by hand (`workflow_dispatch`) and on pull
-requests that change the probes. One job per runner label (`macos-26`, `macos-15`)
-runs every probe, each in its own step. A Linux job runs the probes' selftest first.
+The four probes below (`automation_mode.sh`, `simctl.sh`, `tcc.sh` and
+`volume_owner.sh`), the selftest (`tools/spike/macos/test/`), the shared helpers
+(`lib.sh`, `verdicts.sh`) and the `.github/workflows/spike-macos.yml` workflow were
+deleted once the verdicts below were recorded, so those file names are in the history
+only. To find the commit that deleted them, and so the tree to restore a probe from:
 
 ```sh
-gh workflow run spike-macos.yml --ref main
-gh run view <run id> --log | grep ' SPIKE '
-gh run download <run id>      # spike.txt and the simulator screenshot, per job
+git log --diff-filter=D --oneline -- .github/workflows/spike-macos.yml
 ```
 
-Each probe prints `SPIKE macos-<arch>.<probe>.<arm>=<value>` lines (the `macos-`
+The workflow ran by hand (`workflow_dispatch`) and on pull requests that changed the
+probes. One job per runner label (`macos-26`, `macos-15`) ran every probe, each in
+its own step. A Linux job ran the probes' selftest first.
+
+Each probe printed `SPIKE macos-<arch>.<probe>.<arm>=<value>` lines (the `macos-`
 prefix keeps them apart from the Linux spike's `<arch>.<key>` lines), one `context`
 line (macOS and Xcode builds, user kind, launchd domain, console user) and one
 `verdict`:
@@ -38,9 +41,9 @@ line (macOS and Xcode builds, user kind, launchd domain, console user) and one
 - **FAIL**: the mechanics did not work; the reason follows;
 - **BROKEN**: the control arm did not go red, so the probe proved nothing.
 
-Each arm runs in a subshell, so one failed arm is recorded as
-`<arm>.status=ERROR(<rc>)` and does not hide the others. The job's last step
-(`verdicts.sh`) fails the job on a BROKEN verdict or a missing one, never on a FAIL,
+Each arm ran in a subshell, so one failed arm was recorded as
+`<arm>.status=ERROR(<rc>)` and did not hide the others. The job's last step
+(`verdicts.sh`) failed the job on a BROKEN verdict or a missing one, never on a FAIL,
 which is a result.
 
 ## The probes
@@ -52,15 +55,15 @@ which is a result.
 | `volume_owner.sh` (VM probe P0 of [macos-vm-guests.md](../design/macos-vm-guests.md#11-probes-later-prs-must-run)) | a fresh standard user, added with `sysadminctl -addUser`, runs (through `sudo -n -H -u`) `hdiutil create` of a 64 MiB APFS image, `hdiutil attach -owners on` (its mount line recorded), two copies of a small plist into it, `chown 0:0` on the first (status and text recorded) while the second (the keep file) stays at the user's uid, a read of the owner this first attach shows, and a detach; then root re-attaches the image read-only with `-owners on` and reads both owners. The verdict follows that re-attach, not the first attach's view. The writer's uid and groups are read through the same `sudo -u` the writes use; then the scratch directory is deleted, and the user too, but only if this run's creation marker (the uid `sysadminctl` gave it) is there and the name still has that uid. If the probe user exists before the probe, the probe does not start: it may be a real account, so the probe runs no `sysadminctl` or `hdiutil`, leaves the user and says BROKEN | the same create, attach, copy, chown and detach as root, and the same re-attach read, must give uid 0; the user's keep file must read back as the user's uid, so the re-attach is shown able to read a non-root owner too (macOS reports a `noowners` volume's files as owned by the reader, which for root is `0:0`); and both re-attaches must be in the mount table without `noowners`. A writer that is admin or root is BROKEN too: the probe would not be asking about a fresh standard user |
 | `tcc.sh` (instrument for the Screen Recording and Accessibility questions) | SIP status; the ScreenCapture, Accessibility, ListenEvent and PostEvent rows of the system and the user TCC database, each read as the runner user and as root | the same reader over a planted database must return exactly its one known row |
 
-The status text of `automationmodetool` is parsed, case-insensitively, as two fields:
+The status text of `automationmodetool` was parsed, case-insensitively, as two fields:
 `enabled` (on, off) and `auth` (required, not required), matching the wording the
-hosted runners printed (Results). Every reading also records the raw text, and text
-the parser does not recognise reads as `unknown`, which never triggers enable and
-gives a FAIL. Every `automationmodetool` and `sysadminctl` call runs under the
-watchdog with stdin closed; the quick local reads (`id`, the context line) do not.
+hosted runners printed (Results). Every reading also recorded the raw text, and text
+the parser did not recognise read as `unknown`, which never triggered enable and
+gave a FAIL. Every `automationmodetool` and `sysadminctl` call ran under the
+watchdog with stdin closed; the quick local reads (`id`, the context line) did not.
 
-The selftest (`tools/spike/macos/test/run.sh`) drives each probe against fakes of the
-macOS programs. `test/mutants.sh` plants defects that each must turn a test red,
+The selftest (`tools/spike/macos/test/run.sh`) drove each probe against fakes of the
+macOS programs. `test/mutants.sh` planted defects that each had to turn a test red,
 among them: an arm run outside its subshell; a watchdog that leaves the command on
 the caller's pipe; `sysadminctl` run without the watchdog; the key without the `macos-` prefix; a
 watchdog that reports a hang as success; a status parser that accepts any "require"
