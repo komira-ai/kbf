@@ -92,6 +92,11 @@ fn nanohub(topic: &'static str) -> HttpServer {
     http_server(move |_| http("200 OK", format!("{{\"topic\":\"{topic}\"}}").as_bytes()))
 }
 
+/// A PEM block labelled `label` whose bytes are not one.
+fn garbage(label: &str) -> String {
+    format!("-----BEGIN {label}-----\nMIIBAAAA\n-----END {label}-----\n")
+}
+
 fn with_pair(exec: &mut FakeExec, cert: &str, key: &str) {
     exec.entries
         .insert(p(CERT), file(cert.as_bytes(), 0o644, 501));
@@ -192,8 +197,8 @@ fn an_apply_uploads_records_and_writes_the_profile_and_a_rerun_does_nothing() {
 }
 
 /// Catches each pair NanoHUB must not get, accepted: a certificate that is not an MDM
-/// push certificate, an expired one, an encrypted key, another certificate's key, a
-/// file that is not a certificate, a key others can read, a key in a git work tree,
+/// push certificate, an expired one, an encrypted key, a PEM key that is not one, another
+/// certificate's key, a file that is not a certificate (not PEM, or PEM that is not one), a key others can read, a key in a git work tree,
 /// and a missing file. Nothing is sent in any case.
 #[test]
 fn a_pair_that_is_not_a_plain_unexpired_mdm_push_pair_is_refused() {
@@ -218,7 +223,15 @@ fn a_pair_that_is_not_a_plain_unexpired_mdm_push_pair_is_refused() {
         ),
         (set(cert.clone(), other_key), "is not the key of"),
         (
+            set(cert.clone(), garbage("PRIVATE KEY")),
+            "is encrypted or not a PEM private key",
+        ),
+        (
             set("not pem".to_owned(), key.clone()),
+            "is not a PEM certificate",
+        ),
+        (
+            set(garbage("CERTIFICATE"), key.clone()),
             "is not a PEM certificate",
         ),
         (

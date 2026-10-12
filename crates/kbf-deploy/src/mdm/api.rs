@@ -289,6 +289,10 @@ mod tests {
             Err(MdmError::Deploy(kbf_host::HostError::Untrusted(_)))
         ));
         assert!(server.requests().is_empty());
+        // The control: the same call from a trusted binary reaches the server.
+        exec.untrusted = false;
+        assert!(call(&exec, &a, &Call::get("/x"), Mode::Apply, &mut Vec::new()).is_ok());
+        assert_eq!(server.requests().len(), 1);
 
         let closed = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let port = closed.local_addr().expect("addr").port();
