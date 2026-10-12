@@ -8,4 +8,4 @@
 # the check fails if its signature carries any. A listed binary's signature must carry
 # exactly its line's set: one more, one fewer or another one fails.
 # crates/kbf-it/tests/darwin_entitlements.rs pins this file's lines.
-kbf-vmm com.apple.security.virtualization
+kbf-vmm com.apple.security.virtualization com.apple.security.get-task-allow
