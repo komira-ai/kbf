@@ -571,3 +571,33 @@ fn mdm_verify_exits_1_when_a_check_fails() {
     assert!(out.contains("FAIL  https://mdm.example.com/version answers: https://mdm.example.com/version: Connection refused"), "{out}");
     assert!(out.ends_with(" check(s) failed\n"), "{out}");
 }
+
+/// Catches `envoy render` not wired to the kit, its line lost, or a refusal that
+/// exits other than 2 or prints elsewhere than stderr. In-process, so the lib tests'
+/// instantiation of `run` covers the `envoy` arm.
+#[test]
+fn envoy_render_exits_0_and_a_bad_setting_exits_2() {
+    let dir = kbf_host::testkit::scratch("cli-envoy");
+    let config = dir.join("config.local");
+    let example = include_str!("../templates/envoy/config.example");
+    std::fs::write(&config, example).expect("config");
+    let config = config.to_str().expect("utf-8").to_owned();
+    let rendered = dir.join("rendered");
+    let rendered = rendered.to_str().expect("utf-8").to_owned();
+    let mut exec = FakeExec::new(501);
+    let args = ["envoy", "render", "--config", &config, "--out", &rendered];
+    let (code, out, err) = cli(&mut exec, &no_env, &args);
+    assert_eq!((code, err.as_str()), (ExitCode::SUCCESS, ""), "{out}");
+    assert_eq!(
+        out,
+        format!("rendered manifests.json envoy.json into {rendered}\n")
+    );
+
+    std::fs::write(&config, example.replace("KBF_SERVERS=", "KBF_SERVER=")).expect("plant");
+    let (code, out, err) = cli(&mut exec, &no_env, &args);
+    assert_eq!((code, out.as_str()), (ExitCode::from(2), ""), "{err}");
+    assert!(
+        err.starts_with("REFUSED: line ") && err.ends_with(": unknown key KBF_SERVER\n"),
+        "{err}"
+    );
+}
