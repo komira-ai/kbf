@@ -101,7 +101,7 @@ fn a_bad_token_file_stops_serve() {
 }
 
 /// Catches `session` printing something off macOS, where there is no launchd session
-/// to report (macOS is checked from launchd by tools/ci/guest-tests.sh).
+/// to report (macOS is checked from launchd by tests/as_root.rs).
 #[test]
 fn session_prints_the_session_type() {
     let out = Command::new(BIN).arg("session").output().expect("ran");
