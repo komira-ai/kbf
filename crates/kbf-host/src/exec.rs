@@ -254,16 +254,21 @@ fn output(cmd: &Cmd) -> io::Result<Output> {
     }
     let mut child = command.spawn()?;
     // Dropped at the end of the statement, which closes the pipe: the tool reads EOF.
-    match child
+    fed(child
         .stdin
         .take()
         .expect("stdin is piped")
-        .write_all(&cmd.stdin)
-    {
-        Err(e) if e.kind() != io::ErrorKind::BrokenPipe => return Err(e),
-        _ => {}
-    }
+        .write_all(&cmd.stdin))?;
     child.wait_with_output()
+}
+
+/// The result of writing a child's input, with EPIPE (the child stopped reading) read as
+/// done: the child's exit status decides, see [`output`].
+fn fed(written: io::Result<()>) -> io::Result<()> {
+    match written {
+        Err(e) if e.kind() != io::ErrorKind::BrokenPipe => Err(e),
+        _ => Ok(()),
+    }
 }
 
 /// `out` when `cmd` exited 0; otherwise an error naming the exit and its stderr.

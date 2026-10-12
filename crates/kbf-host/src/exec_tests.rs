@@ -464,3 +464,14 @@ fn stat_reports_without_reading_and_absent_never_reads() {
     assert!(!planner.absent(p("/none")).expect("nothing there"));
     fs::set_permissions(dir.join("locked"), fs::Permissions::from_mode(0o600)).expect("chmod");
 }
+
+/// Catches the input write swallowing an error other than EPIPE (a real failure to
+/// hand the tool its input), or failing on EPIPE or success. No real pipe write fails
+/// any other way on demand, so the rule is checked on its own.
+#[test]
+fn only_a_closed_pipe_ends_the_input_write_quietly() {
+    assert!(fed(Ok(())).is_ok());
+    assert!(fed(Err(io::ErrorKind::BrokenPipe.into())).is_ok());
+    let err = fed(Err(io::ErrorKind::PermissionDenied.into())).expect_err("kept");
+    assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+}
