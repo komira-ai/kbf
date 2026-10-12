@@ -387,6 +387,19 @@ mod tests {
         );
     }
 
+    #[test]
+    fn home_path_names_keep_underscores_and_hyphens() {
+        // Catches: a name-character test that drops `_` or `-`. Dropping them cuts the
+        // reported path short (`/home/a`), and a prefix after a hyphen (a shell
+        // default, `${X:-/Users/...}`, part of a longer word) would be reported too.
+        let name = format!("/{}/a_b-c/x", "home");
+        let after_hyphen = format!("x-/{}/shared", "Users");
+        let after_underscore = format!("x_/{}/shared", "Users");
+        let f = scan(&format!("{name} {after_hyphen} {after_underscore}"));
+        let got: Vec<_> = f.iter().map(|x| x.kind.clone()).collect();
+        assert_eq!(got, vec![Kind::HomePath(format!("/{}/a_b-c", "home"))]);
+    }
+
     fn utf16(text: &str, le: bool) -> Vec<u8> {
         let mut out = if le {
             vec![0xFF, 0xFE]
