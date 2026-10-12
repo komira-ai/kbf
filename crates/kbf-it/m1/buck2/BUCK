@@ -1,7 +1,7 @@
 # Three commands in a chain, as in the Bazel sample. `shout` runs an executable input
 # file, so the farm must keep its mode; `digest` reads two outputs of earlier commands.
 # A fourth, `pause`, stands alone: a command that sleeps, so a test can hold a lease in
-# flight (run.sh's drain check).
+# flight (run.sh's drain check). A fifth, `verdict`, fails on demand.
 load(":defs.bzl", "pause", "step")
 
 step(
@@ -35,4 +35,13 @@ pause(
     name = "pause",
     salt = read_config("kbf_m1", "salt", ""),
     secs = read_config("kbf_m1", "sleep_secs", "0"),
+)
+
+# Copies `words`, or, under `-c kbf_m1.fail=yes`, prints `planted failure` and exits 3
+# (run.sh's failing build: one action that fails on the farm, its event log kept).
+step(
+    name = "verdict",
+    srcs = [":words"],
+    script = 'if [ "' + read_config("kbf_m1", "fail", "") + '" = yes ]; then ' +
+             'echo planted failure >&2; exit 3; fi; cp "$2" "$1"',
 )

@@ -1,0 +1,13 @@
+[2026-10-12T11:56:32.775+00:00] Starting new buck2 daemon...
+[2026-10-12T11:56:32.800+00:00] Connected to new buck2 daemon.
+[2026-10-12T11:56:32.802+00:00] Build ID: b9173a67-6b77-432a-b07d-5de80c00ec07
+[2026-10-12T11:56:32.867+00:00] RE Session: GRPC-SESSION-ID
+[2026-10-12T11:56:39.901+00:00] Waiting on root//:hog (<unspecified>) -- hog [re_execute], and 1 other actions
+[2026-10-12T11:56:46.902+00:00] Waiting on root//:hog (<unspecified>) -- hog [re_execute]
+[2026-10-12T11:56:54.002+00:00] Waiting on root//:hog (<unspecified>) -- hog [re_execute]
+[2026-10-12T11:57:01.101+00:00] Waiting on root//:hog (<unspecified>) -- hog [re_execute]
+[2026-10-12T11:57:08.102+00:00] Waiting on root//:hog (<unspecified>) -- hog [re_execute]
+[2026-10-12T11:57:14.443+00:00] Cache hits: 0%
+[2026-10-12T11:57:14.443+00:00] Commands: 5 (cached: 0, remote: 5, local: 0)
+[2026-10-12T11:57:14.443+00:00] Network: up 29MiB  down 16KiB  session GRPC-SESSION-ID
+BUILD SUCCEEDED
