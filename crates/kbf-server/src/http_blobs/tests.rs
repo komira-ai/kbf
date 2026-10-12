@@ -219,7 +219,7 @@ async fn budgeted(
     Vec<Digest>,
 ) {
     let policy = Policy::from_json(
-        r#"{"authenticationPolicy": {"allow": {}}, "blobs": {"getAuthorizer": {"allow": {}}}}"#,
+        r#"{"authenticationPolicy": {"allow": {}}, "invocations": {"getAuthorizer": {"allow": {}}}, "blobs": {"getAuthorizer": {"allow": {}}}}"#,
     )
     .expect("a policy");
     let cache = Arc::new(Cache::memory());

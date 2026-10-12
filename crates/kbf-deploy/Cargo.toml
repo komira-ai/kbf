@@ -8,19 +8,22 @@ repository.workspace = true
 publish.workspace = true
 
 # The deploy tool: its kits as subcommands. A kit that changes a host does it through
-# kbf-host's plan of steps, printed by default and carried out with `--apply`. Four
+# kbf-host's plan of steps, printed by default and carried out with `--apply`. Five
 # kits: `minio` (buckets and their key, a NodePort for the S3 port), `linux`
 # (render-units, check-units, and as root install-units, image-pull and swap), `mdm`
 # (fetch the pinned upstream archives; as root install the MDM services, the TLS
 # certificate, the push certificate and the enrollment profile, and link NanoDEP to
-# Apple Business Manager; verify them; sign an operator's erase request) and `envoy`
-# (render, check a render, and apply it to a cluster through kubectl).
+# Apple Business Manager; verify them; sign an operator's erase request), `envoy`
+# (render, check a render, and apply it to a cluster through kubectl) and `pilot`
+# (server-install, a kbf-server as a systemd user service, and buckconfig, a
+# worktree's buck2 overlay).
 # rustls (ring), httparse and rustls-native-certs make the HTTPS client of `mdm fetch`,
-# `mdm verify` and `mdm tls --check-godaddy`, and rustls loads the push certificate's
-# key to match it to the certificate; sha2 checks the archives against their pins and
-# hashes the rendered Envoy config into the pod template; zip, tar and flate2 unpack the
-# archives; x509-parser reads the certificates `mdm` checks; plist writes the enrollment
-# profile; base64 encodes the Basic auth of the MDM services' APIs.
+# `mdm verify` and `mdm tls --check-godaddy`; rustls loads the push certificate's key
+# to match it to the certificate, and checks `pilot server-install`'s server
+# certificate and key; sha2 checks the archives against their pins and hashes the
+# rendered Envoy config into the pod template; zip, tar and flate2 unpack the archives;
+# x509-parser reads the certificates `mdm` checks; plist writes the enrollment profile;
+# base64 encodes the Basic auth of the MDM services' APIs.
 # `mdm erase-request` writes and checks the request with kbf-mdm's own parser and
 # signature check, and reads the security key's public half with ssh-key.
 

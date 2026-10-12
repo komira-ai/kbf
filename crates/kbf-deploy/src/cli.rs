@@ -29,6 +29,10 @@
 //! kbf-deploy envoy check --config FILE [--dir DIR]
 //! kbf-deploy envoy apply --config FILE --kubectl PATH --kubeconfig PATH
 //!                        [--refuse-example FILE] [--apply]
+//! kbf-deploy pilot server-install --config FILE --bin FILE [--bind ADDR] [--pki DIR]
+//!                                 [--s3-env-file FILE] [--apply]
+//! kbf-deploy pilot server-install --config FILE --uninstall [--apply]
+//! kbf-deploy pilot buckconfig --config FILE --worktree DIR [--remove] [--apply]
 //! ```
 //!
 //! Bad flags exit 2 for every subcommand. The `minio` subcommands change a host: without
@@ -50,6 +54,10 @@
 //! The `mdm` verbs exit as the `linux` host verbs do; `mdm verify` exits 1 when a check
 //! fails, `mdm dep assign` when Apple did not assign every device, and `mdm tls
 //! --check-godaddy` when the account may not use the API ([`crate::mdm`]).
+//! The `pilot` verbs run as the operator's own user, plan by default as the `minio`
+//! subcommands do, and exit 0 done (or nothing to do), 1 a step failed or kbf-server
+//! never reported ready after its start, or 2 refused (`REFUSED: ...` on stderr)
+//! ([`crate::pilot`]).
 //! `minio buckets` reads the MinIO admin key pair from `MINIO_ROOT_USER` and
 //! `MINIO_ROOT_PASSWORD` in the environment (secrets are never flags: argv is
 //! world-readable).
@@ -80,6 +88,7 @@ use crate::mdm::tls::Acme;
 use crate::mdm::verify::Verify;
 use crate::mdm::{self, MdmConfig, MdmError, Pins, Tool};
 use crate::minio::{self, Admin, K8sName, KbfName, MinioError, buckets, nodeport};
+use crate::pilot;
 use kbf_host::exec::{Exec, HostExec};
 use kbf_host::path::{HostPath, Root};
 use kbf_host::plan::{Mode, RunAs, execute};
@@ -112,6 +121,10 @@ enum Kit {
     /// REAPI calls to the kbf-servers.
     #[command(subcommand)]
     Envoy(Envoy),
+    /// A pilot kbf-server as a systemd user service, and the buck2 overlay that points
+    /// one worktree at it.
+    #[command(subcommand)]
+    Pilot(pilot::cli::Pilot),
 }
 
 #[derive(Subcommand)]
@@ -501,6 +514,9 @@ pub fn run<E: Exec>(
         Kit::Linux(l) => return linux_kit(l, exec, out, err),
         Kit::Mdm(m) => return mdm_kit(m, exec, out, err),
         Kit::Envoy(e) => return envoy_kit(e, exec, out, err),
+        Kit::Pilot(p) => {
+            return pilot::cli::run(p, exec, env, out, err, &pilot::cli::sleep_a_second);
+        }
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -850,7 +866,7 @@ fn host_verb(done: Result<(), HostError>, err: &mut dyn Write) -> ExitCode {
 
 /// The directory name `install-units --uninstall` moves the files into: seconds since
 /// the Unix epoch.
-fn stamp() -> String {
+pub(crate) fn stamp() -> String {
     stamp_secs().to_string()
 }
 

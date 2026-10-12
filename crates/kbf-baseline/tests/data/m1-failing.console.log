@@ -1,0 +1,25 @@
+[2026-10-12T11:57:50.981+00:00] Build ID: 9fb3b55a-9715-46b4-b386-4ad8661d7d63
+[2026-10-12T11:57:51.032+00:00] RE Session: GRPC-SESSION-ID
+[2026-10-12T11:57:51.370+00:00] Action failed: root//:verdict (<unspecified>) (step)
+[2026-10-12T11:57:51.370+00:00] Remote command returned non-zero exit code 3
+[2026-10-12T11:57:51.370+00:00] Remote action digest: '242e09ae7110e033ea973a0e30a2f2a8bcb608817c49b8d40f3f158630662430:141'
+[2026-10-12T11:57:51.370+00:00] Stdout: <empty>
+[2026-10-12T11:57:51.370+00:00] Stderr:
+planted failure
+
+[2026-10-12T11:57:51.371+00:00] Cache hits: 50%
+[2026-10-12T11:57:51.372+00:00] Commands: 2 (cached: 1, remote: 1, local: 0)
+[2026-10-12T11:57:51.372+00:00] Network: up 0B  down 0B  session GRPC-SESSION-ID
+[2026-10-12T11:57:51.372+00:00]
+[2026-10-12T11:57:51.372+00:00] BUILD ERRORS (1)
+[2026-10-12T11:57:51.372+00:00] The following actions failed during the execution of this command:
+[2026-10-12T11:57:51.372+00:00] Action failed: root//:verdict (<unspecified>) (step)
+[2026-10-12T11:57:51.372+00:00] Remote command returned non-zero exit code 3
+[2026-10-12T11:57:51.372+00:00] Remote action digest: '242e09ae7110e033ea973a0e30a2f2a8bcb608817c49b8d40f3f158630662430:141'
+[2026-10-12T11:57:51.372+00:00] Stdout: <empty>
+[2026-10-12T11:57:51.372+00:00] Stderr:
+planted failure
+
+[2026-10-12T11:57:51.372+00:00]
+BUILD FAILED
+Failed to build 'root//:verdict (<unspecified>)'

@@ -14,8 +14,11 @@
 //!   need the token of `--api-token-file` ([`token`]). On the same listener,
 //!   `GET /healthz` and `GET /readyz` for a front's health check ([`health`]); the
 //!   REAPI listener answers the same readiness over `grpc.health.v1`
-//!   ([`grpc_health`]). And `GET /v1/blobs/{digest}`, a CAS blob's bytes for a
-//!   browser ([`http_blobs`]), off unless the REAPI policy names `blobs.getAuthorizer`.
+//!   ([`grpc_health`]). And the build pages, `GET /v1/invocations/{id}` and below,
+//!   over the invocation records kept in memory ([`http_invocations`]), off unless
+//!   the REAPI policy names `invocations.getAuthorizer` (or `--invocations-open` is
+//!   given); and `GET /v1/blobs/{digest}`, a CAS blob's bytes for a browser
+//!   ([`http_blobs`]), off unless the policy also names `blobs.getAuthorizer`.
 //! - Rollouts ([`rollout`]): the record's store (in memory for now) and the driver that
 //!   cordons, drains and hands drained nodes their update, as far as `updating`.
 //! - The MDM gate ([`mdm`]): the server's verbs at `kbf-mdm-gate` (inventory, enforce
@@ -49,6 +52,7 @@ pub mod fleet;
 pub mod grpc_health;
 pub mod health;
 pub mod http_blobs;
+pub mod http_invocations;
 pub mod identity;
 pub mod machine;
 pub mod mdm;

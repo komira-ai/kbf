@@ -1,0 +1,29 @@
+# kbf-pilot-server.service: a pilot kbf-server as a systemd user service, written by
+# `kbf-deploy pilot server-install` into ~/.config/systemd/user/. Edit the settings
+# and re-run, not the installed copy.
+#
+# It runs in kbf-pilot.slice (the caps), binds only the address server-install
+# found on the configured interface, and reads its S3 key pair from EnvironmentFile
+# (an owner-only file outside every repository): the pair reaches kbf-server's
+# environment, never its argv. kbf-server stops cleanly on SIGINT, hence KillSignal.
+[Unit]
+Description=kbf pilot server (REAPI and kbf.worker.v1, blobs in S3)
+After=network-online.target
+
+[Service]
+Type=simple
+Slice=kbf-pilot.slice
+EnvironmentFile=@S3_ENV@
+ExecStart=@EXEC_START@
+KillSignal=SIGINT
+TimeoutStopSec=20
+Restart=on-failure
+RestartSec=10
+LimitNOFILE=65536
+NoNewPrivileges=yes
+UMask=0077
+StandardOutput=append:@LOG_DIR@/kbf-server.out.log
+StandardError=append:@LOG_DIR@/kbf-server.err.log
+
+[Install]
+WantedBy=default.target

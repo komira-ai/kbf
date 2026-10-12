@@ -369,3 +369,48 @@ async fn blob_reads_are_off_unless_the_file_names_their_authorizer() {
         );
     }
 }
+
+/// Catches: invocation pages left on when the file names no `invocations` key, or
+/// with no file at all (mutant "default allow": `None` read as an `allow`); the
+/// `invocations` key read into the `blobs` slot or the other way round; and an
+/// `invocations` object without `getAuthorizer`, or with another key, accepted.
+#[tokio::test]
+async fn invocation_pages_are_off_unless_the_file_names_their_authorizer() {
+    assert!(Policy::allow_all().invocations_get.is_none());
+    let unnamed = parse(&json!({
+        "authenticationPolicy": {"allow": {}},
+        "blobs": {"getAuthorizer": {"allow": {}}},
+    }));
+    assert!(unnamed.invocations_get.is_none());
+    assert!(unnamed.blobs_get.is_some());
+    let named = parse(&json!({
+        "authenticationPolicy": {"allow": {}},
+        "invocations": {"getAuthorizer": {"instanceNamePrefix": {"allowedInstanceNamePrefixes": ["ci"]}}},
+    }));
+    assert!(named.blobs_get.is_none());
+    let pages = named.invocations_get.expect("named");
+    assert!(allowed(&*pages, "ci/main").await);
+    assert!(!allowed(&*pages, "other").await);
+    let allow = json!({"allow": {}});
+    for (file, path, why) in [
+        (
+            json!({"authenticationPolicy": allow, "invocations": {}}),
+            "$.invocations",
+            "`getAuthorizer` is required; leave `invocations` out to keep invocation pages off",
+        ),
+        (
+            json!({"authenticationPolicy": allow, "invocations": {"getAuthorizer": allow, "list": allow}}),
+            "$.invocations.list",
+            "unknown key; the keys here are getAuthorizer",
+        ),
+        (
+            json!({"authenticationPolicy": allow, "invocations": "allow"}),
+            "$.invocations",
+            "expected an object, found a string",
+        ),
+    ] {
+        let (got_path, got_why) = refused(&file);
+        assert_eq!(got_path, path, "{file}: {got_why}");
+        assert!(got_why.contains(why), "{file}: {got_why:?} lacks {why:?}");
+    }
+}

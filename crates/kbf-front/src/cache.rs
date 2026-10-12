@@ -297,6 +297,26 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         Ok(missing.into_iter().filter(|d| !is_empty_blob(d)).collect())
     }
 
+    /// Whether each of `digests` is present and reachable, in order, as
+    /// FindMissingBlobs would answer, but without touching any: a page that lists a
+    /// blob does not keep it.
+    ///
+    /// # Errors
+    /// The metadata log is unavailable.
+    pub async fn present(&self, digests: &[Digest]) -> Result<Vec<bool>, CacheError> {
+        let found = self
+            .meta
+            .query(|s| {
+                let held = |d: &Digest| matches!(s.blob(d), BlobAnswer::Present(_));
+                digests
+                    .iter()
+                    .map(|d| is_empty_blob(d) || held(d))
+                    .collect()
+            })
+            .await?;
+        Ok(found)
+    }
+
     /// Whether `digest` is durable: committed to the index at a reachable object. What
     /// `QueryWriteStatus` reports; bytes still arriving count for nothing.
     ///

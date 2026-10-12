@@ -27,6 +27,7 @@
 
 mod encode;
 mod event;
+mod metrics;
 mod record;
 mod records;
 
@@ -40,6 +41,7 @@ pub use event::{
     Call, CallKind, Event, ExecuteAnswer, Finished, InvocationId, LeaseEnd, Listing, Metadata,
     Outcome, Output, Owner, Usage, WallTime,
 };
+pub use metrics::{Histogram, Metrics, failure_name, requeue_name};
 pub use record::{
     ActionRow, Attempt, AttemptEnd, Counts, How, IDLE_AFTER, Invocation, OUTPUTS_PER_ROW,
     REASON_CAP, ROW_CAP, RecordKey, State, TEXT_CAP, Text,

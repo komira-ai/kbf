@@ -9,7 +9,8 @@ line then ends with ` api=<addr>`. The listener speaks HTTP/1.1, and HTTP/2 in c
 text (h2c, with prior knowledge); every rule below holds for both.
 
 Reads answer anyone who reaches the address: bind it where only operators do. The
-one exception is [`GET /v1/blobs`](#get-v1blobsdigest), which runs the REAPI policy and is
+exceptions are the build pages, [`GET /v1/invocations/{id}`](#get-v1invocationsid-and-below)
+and below, and [`GET /v1/blobs`](#get-v1blobsdigest), which run the REAPI policy and are
 off without it. Writes need a token (see [Who may write](#who-may-write)). The roles of
 [fleet-updates-security.md](design/fleet-updates-security.md) section S9 (`admin` for
 operators, a short-lived `rollout` for CI) are **planned**; the token is the one
@@ -212,6 +213,123 @@ The store probe waits at most `--readyz-store-timeout-ms`, like `/readyz`'s.
 to serve reads and leader; which service name reports which is not chosen
 ([deployment-topology.md](design/deployment-topology.md#build-clients-one-name-routed-by-method)).
 
+## `GET /v1/invocations/{id}` and below
+
+The build pages: what the farm did for one build, read from the invocation records
+([invocations.md](design/invocations.md#4-the-read-api)). The records are kept **in
+memory** within `--invocation-memory` (section 3.5 there): a restart forgets them, and
+at the bound idle records are removed. A record gone, or never made, is `404` on every
+route.
+
+| Route | Answers |
+|---|---|
+| `GET /v1/invocations/{id}` | the invocation: its header fields and counters, and links to the routes below |
+| `GET /v1/invocations/{id}/actions` | a page of its action rows, in the order first seen; `?outcome=ok\|failed\|timed_out\|refused`, `?how=cache_hit\|cache_hit_execute\|joined\|ran` |
+| `GET /v1/invocations/{id}/actions/{digest}` | one action's row, with the outputs, stdout, stderr and usage copied into it, and whether each blob is still held |
+| `GET /v1/invocations/{id}/artifacts` | a page of the outputs of its actions, in row order |
+| `GET /v1/invocations/{id}/logs` | a page of the stdout and stderr of its actions, failed actions first |
+| `GET /v1/invocations/{id}/metrics` | its aggregates |
+
+**Off unless the REAPI policy names it.** Pages hold build outputs and logs. The routes
+run the policy of `--reapi-auth-policy` ([reapi-auth.md](reapi-auth.md)): its
+`authenticationPolicy` on the request, then its `invocations.getAuthorizer` with every
+instance name the invocation's calls used; all must allow (a refusal is `403`).
+Without that key, or without a policy file, every request is `404` and the start line
+says ` invocations=off` (before ` blobs=`); with it, ` invocations=on`.
+`--invocations-open` turns the routes on for every caller the policy accepts (and the
+blob route with them), for a listener only trusted people reach.
+
+**`{id}`** is an invocation id as a client sent it (1 to 128 bytes of
+`[A-Za-z0-9._-]`, starting with a letter or digit) or `<id>~<n>` (`n` from 2), the
+record of another caller of the same id ([invocations.md](design/invocations.md#24-ids-are-claims-not-secrets)).
+It is matched as the bytes of the path: a percent-encoded character (`%3C`, `%6F`) is
+`404`, as is anything else.
+
+**The invocation:**
+
+```json
+{
+  "id": "0b8c...", "url": null,
+  "tool": "buck2", "tool_version": "0.1.0", "correlated_invocations_id": null,
+  "instances": [""],
+  "first_seen": "2026-10-11T09:00:00.000000Z", "last_seen": "2026-10-11T09:04:12.031008Z",
+  "state": "open", "complete": true, "rows_capped": false, "actions": 812,
+  "counts": {"execute": 812, "cache_hit_execute": 40, "joined": 3, "ran": 769, "failed": 2,
+             "ac_hit": 5120, "ac_miss": 812, "blobs_asked": 9000, "blobs_missing": 300,
+             "bytes_uploaded": 1234567, "bytes_downloaded": 89012345},
+  "collisions": ["0b8c...~2"],
+  "links": {"actions": "/v1/invocations/0b8c.../actions", "artifacts": "...", "logs": "...",
+            "metrics": "..."}
+}
+```
+
+Times are RFC 3339 in UTC to the microsecond; durations are integer microseconds;
+digests are `<sha256 hex>-<size>`. `state` is `idle` after 10 minutes with no event and
+no operation in flight, else `open`. `url` is `null` (the link template,
+`--invocation-url-template`, is planned).
+
+**An action row** (on `/actions`, and as the start of `/actions/{digest}`):
+`action`, `instance`, `target`, `mnemonic`, `configuration` and `action_id` (each
+`{"value", "truncated"}` or `null`), `how`, `operation`, `attempts` (each with `lease`,
+`worker`, `queued`, `granted`, `started`, `ended` and `end`: `{"result": "ok"}`,
+`{"requeue": "<reason>", "reason": "<text>"}` or `{"failure": "<class>", "reason":
+"<text>"}`, `null` while held), `outcome` (`{"ok": {"exit_code": n}}`, `{"failed":
+{"code": n, "message": "..."}}`, `{"timed_out": {}}`, `{"refused": {"reason": "..."}}`,
+or `null` in flight), `result` and `command` (digests or `null`) and `href`, the row's
+own route. `/actions/{digest}` adds `outputs` (each `path`, `digest`, `executable`,
+`directory`, `available` and `href`), `outputs_truncated`, `stdout` and `stderr` (each
+`{"digest", "available", "href"}` or `null`), `usage` (or `null`) and `blobs`
+(`action` and `command` links). An output directory is listed as its Tree digest.
+
+**`available`** says whether the cache still holds the blob, read from its index
+without touching it (a page keeps no blob); `null` if the index does not answer.
+**`href`** links the blob route, `/v1/blobs/{digest}?instance=<the row's
+instance>&name=<file name>`, with `&inline=text` for a log of at most 4 MiB; every
+`href` is `null` while the blob route is off.
+
+**`/artifacts`** lists each output as an output of `/actions/{digest}` is, with its
+`action`. **`/logs`** lists each action whose result has a stdout or a stderr:
+`action`, `href`, `failed` (anything but OK with exit code 0), `outcome`, `stdout` and
+`stderr`. The failed ones come first, in row order, then the others.
+
+**`/metrics`**: `counts` as above; `queue_micros` (queued to granted) and `run_micros`
+(granted to ended) over the leases of the rows the farm ran for this invocation
+(`how` = `ran`; a joined row's leases count where its twin ran), each with `count`,
+`min`, `p50`, `p90`, `max` and `sum` (`null` when empty); `reruns` by requeue reason;
+`usage_actions`, the rows whose result carries usage, and over them `cpu_micros`
+(user plus system) and `peak_memory_bytes`, each `{"sum", "max"}`, `null` when no row
+does. They are computed from the rows at each request. `p50` and `p90` are approximate:
+never below the true value and at most 1/16 above it (exact below 16 µs); the rest are
+exact.
+
+**Pages.** `/actions`, `/artifacts` and `/logs` take `?page_size=` (100 by default,
+1 to 1000) and `?page_token=`, the `next_page_token` of the page before, with the same
+filter; the answer is `{"actions": [...]}` (or `artifacts`, `logs`) and, unless it is
+the last page, `next_page_token` and `next_page`, the route's path with the same filter,
+page size and that token: the link to follow. A token is opaque: it names the record it
+was made for, its filter and a position. Rows are only appended, so a build still
+writing never makes a page skip or repeat a row. Outputs and logs are listed as each
+row held them when a page passed it: an action still running then is not listed when
+it ends (read its row, or start again). On `/logs`, rows added after the failed ones
+ran out are listed with the rest, failed or not.
+
+| Code | When |
+|---|---|
+| `200` | the answer |
+| `400` | a parameter the route does not take, one given twice, a `page_size` outside 1 to 1000, a filter value not listed above, or a page token that does not decode, was made for another route or another filter, or names a position past the rows |
+| `401` | the policy's `authenticationPolicy` refuses the request |
+| `403` | `invocations.getAuthorizer` refuses one of the invocation's instance names |
+| `404` | the routes are off: `{"error": "<why>", "off": "invocations"}`; no such record is held (never made, removed at the memory bound, or lost at a restart), a page token's included even if a record has been made since under the same key: `{"error": "no_record", "id": "<id>", "records_since": "<time>"}` (below); no such route, `{id}` is not an id or `<id>~<n>`, or no row for the action: `{"error": "<why>"}` |
+| `503` | the record gained an instance name while it was read: send the request again |
+
+**A record that is not held** answers `{"error": "no_record", "id": "<id>",
+"records_since": "<time>"}` ([invocations-api.md](design/invocations-api.md#410-a-record-that-is-gone)).
+`records_since` is the later of the server's start and the `last_seen` of the newest
+record of a client's id removed at the memory bound (removed minted records do not
+count): a build whose calls went on after it would still be held, so its `404` means
+the server saw no call with that id; a build that ended before it may have been lost.
+The `off` body of a route that is switched off is never this one.
+
 ## `GET /v1/blobs/{digest}`
 
 A CAS blob's bytes over HTTP, for a browser: the outputs, stdout and stderr a build's
@@ -225,9 +343,12 @@ GET /v1/blobs/<sha256 hex>-<size>?instance=<instance name>&name=<file name>&inli
 not answer whoever reaches the address: blobs hold build outputs and logs, which can
 hold secrets. It runs the policy of `--reapi-auth-policy`
 ([reapi-auth.md](reapi-auth.md)): its `authenticationPolicy` on the request, then its
-`blobs.getAuthorizer` with the `instance` parameter. Without that key, or without a
-policy file, every request is `404` and the start line says ` blobs=off` (before
-` api=`); with it, ` blobs=on`.
+`blobs.getAuthorizer` with the `instance` parameter. Without that key, without the
+build pages' `invocations.getAuthorizer` (blobs are what the pages link to, and are off
+with them), or without a policy file, every request is `404` and the start line says
+` blobs=off` (before ` api=`), with the body `{"error": "<why>", "off": "blobs"}`;
+with both, ` blobs=on`. `--invocations-open` fills in `allow` for either key the file
+leaves out.
 
 | Parameter | Meaning |
 |---|---|
