@@ -14,7 +14,7 @@ use std::time::Duration;
 use futures::channel::mpsc::{UnboundedSender, unbounded};
 use kbf_front::{Cache, Leadership, MAX_MESSAGE_BYTES, MemoryMetaLog, MetaLog, MetaLogError};
 use kbf_meta::{Applied, Command as MetaCommand, MetaState, Retention};
-use kbf_objstore::{Capabilities, KeyPrefix, MemoryStore};
+use kbf_objstore::KeyPrefix;
 use kbf_proto::google::longrunning::{Operation, operation};
 use kbf_proto::google::rpc;
 use kbf_proto::reapi::action_cache_client::ActionCacheClient;
@@ -225,7 +225,7 @@ impl Cell {
     /// A cell whose scheduler refuses queued work no live worker can run after `wait`,
     /// and keeps a finished operation for `retention`.
     pub async fn start_with(wait: Duration, retention: Duration) -> Self {
-        let store = SharedStore(Arc::new(MemoryStore::new(Capabilities::default())));
+        let store = SharedStore::new();
         let cache = Self::cold_cache(&store, None).await;
         Self::serve(cache, store, None, None, wait, retention).await
     }
@@ -234,7 +234,7 @@ impl Cell {
     /// an in-memory raft directory, which [`Cell::cold_restart`] carries over as a
     /// process restart leaves it. Objects go under `kbf/<log id>/`.
     pub async fn start_raft() -> Self {
-        let store = SharedStore(Arc::new(MemoryStore::new(Capabilities::default())));
+        let store = SharedStore::new();
         let dir = FaultFs::new();
         let cache = Self::cold_cache(&store, Some(&dir)).await;
         let (wait, retention) = (kbf_sched::UNSERVABLE_WAIT, kbf_sched::FINISHED_RETENTION);
@@ -248,7 +248,7 @@ impl Cell {
 
     /// A cell that also serves the operator API, whose writes need [`API_TOKEN`].
     pub async fn start_with_api() -> Self {
-        let store = SharedStore(Arc::new(MemoryStore::new(Capabilities::default())));
+        let store = SharedStore::new();
         let api = Api {
             listen: SocketAddr::from(([127, 0, 0, 1], 0)),
             token: Some(api_token()),
