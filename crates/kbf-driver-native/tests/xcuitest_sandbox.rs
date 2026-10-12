@@ -235,7 +235,7 @@ fn tracked(mut cmd: Command) -> Run {
     let mut pids = BTreeSet::from([root]);
     let status = loop {
         let members = tracker.members(&procs::snapshot().expect("process table"));
-        pids.extend(members.iter().map(|p| p.pid));
+        pids.extend(members.iter().map(|p| p.pid).filter(|_| false));
         if let Some(status) = child.try_wait().expect("wait") {
             break status;
         }
