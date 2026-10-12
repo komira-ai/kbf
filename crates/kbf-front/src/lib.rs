@@ -31,6 +31,12 @@
 //! ([`kbf_auth::AuthenticateLayer`]) found, read from the request's extensions; with no
 //! layer it is empty metadata. [`routes`] and [`routes_with_execution`] allow every
 //! call.
+//!
+//! **The build a call belongs to.** [`RequestMetadataLayer`], beside the
+//! authentication layer, reads each call's REAPI `RequestMetadata` header into a
+//! [`CallMetadata`] ([`call_metadata`]); its `tool_invocation_id` is the invocation id
+//! (`docs/design/invocations.md`). A bad header is treated as absent and never fails a
+//! call.
 
 mod action_cache;
 mod bytestream;
@@ -39,6 +45,7 @@ mod capabilities;
 mod cas;
 mod execution;
 mod meta_log;
+mod request_metadata;
 mod wire;
 
 use std::sync::Arc;
@@ -63,6 +70,11 @@ pub use crate::execution::{
     OperationStream, Stage, Submission, Ticket, closing, missing_status,
 };
 pub use crate::meta_log::{Leadership, MemoryMetaLog, MetaLog, MetaLogError};
+pub use crate::request_metadata::{
+    CallMetadata, HEADER as REQUEST_METADATA_HEADER, Invalid, InvocationId, MAX_HEADER_BYTES,
+    MAX_ID_BYTES, MAX_TEXT_BYTES, Read, ReadRequestMetadata, RequestMetadataLayer, Text,
+    call_metadata,
+};
 
 /// The most blob data one `BatchUpdateBlobs` or `BatchReadBlobs` call may carry,
 /// advertised in the capabilities. Larger blobs go through ByteStream.

@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use futures::future::Either;
 use kbf_auth::{AuthenticateLayer, Policy};
-use kbf_front::{ByteStreamService, Cache, MAX_MESSAGE_BYTES, MetaLog};
+use kbf_front::{ByteStreamService, Cache, MAX_MESSAGE_BYTES, MetaLog, RequestMetadataLayer};
 use kbf_objstore::ObjectStore;
 use kbf_proto::google::bytestream::byte_stream_server::ByteStreamServer;
 use kbf_proto::grpc::health::v1::health_server::HealthServer;
@@ -284,16 +284,22 @@ where
     let reapi_routes =
         kbf_front::routes_with_authorizers(cache, Arc::clone(&farm), closing, authorizers);
     let authenticate = AuthenticateLayer::new(policy.authenticator);
-    // The layer wraps the REAPI routes (and the fallback for unknown paths) present
-    // when it is applied; the health service, added after, is answered without it.
+    // The layers wrap the REAPI routes (and the fallback for unknown paths) present
+    // when they are applied; the health service, added after, is answered without
+    // them. The RequestMetadata layer runs first and never refuses a call.
     let health = HealthServer::new(HealthService::new(
         cache_for_health,
         Arc::clone(&readiness),
         probe_timeout,
         WATCH_INTERVAL,
     ));
-    let reapi_routes =
-        Routes::from(reapi_routes.into_axum_router().layer(authenticate)).add_service(health);
+    let reapi_routes = Routes::from(
+        reapi_routes
+            .into_axum_router()
+            .layer(authenticate)
+            .layer(RequestMetadataLayer::new()),
+    )
+    .add_service(health);
 
     let stop_readiness = Arc::clone(&readiness);
     let serving = async move {

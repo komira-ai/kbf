@@ -1252,6 +1252,7 @@ version = "0.1.0"
 name = "kbf-front"
 version = "0.1.0"
 dependencies = [
+ "base64 0.23.1",
  "bytes",
  "futures",
  "kbf-auth",
@@ -1269,7 +1270,9 @@ dependencies = [
  "thiserror",
  "tokio",
  "tonic",
+ "tower-layer",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
