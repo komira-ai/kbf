@@ -134,17 +134,12 @@ struct Shown<'a>(&'a Api, &'a Call);
 impl fmt::Display for Shown<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let Shown(api, call) = self;
-        write!(
-            f,
-            "{} {} ({} API",
-            call.method,
-            api.url(&call.path),
-            api.name
-        )?;
-        if !call.body.is_empty() {
-            write!(f, ", {} bytes", call.body.len())?;
-        }
-        f.write_str(")")
+        let size = match call.body.len() {
+            0 => String::new(),
+            n => format!(", {n} bytes"),
+        };
+        let url = api.url(&call.path);
+        write!(f, "{} {url} ({} API{size})", call.method, api.name)
     }
 }
 
@@ -253,10 +248,8 @@ mod tests {
         let got = call(&exec, &a, &put, Mode::Apply, &mut out).expect("applied");
         assert_eq!(got, Some(b"{\"topic\":\"t\"}".to_vec()));
         let shown = String::from_utf8_lossy(&out).into_owned();
-        assert!(
-            shown.starts_with("+ PUT ") && !shown.contains("CERT"),
-            "{shown}"
-        );
+        assert!(shown.starts_with("+ PUT "), "{shown}");
+        assert!(!shown.contains("CERT"), "{shown}");
         let r = &server.requests()[0];
         assert_eq!(
             (r.method.as_str(), r.body.as_slice()),

@@ -99,7 +99,8 @@ fn runs(exec: &FakeExec) -> Vec<String> {
 /// Catches ACME settings that would break the certificate unit's command line or send
 /// the account elsewhere: an address without a domain or with a space or `%` (a systemd
 /// specifier), a plain-HTTP or odd-character directory, a provider lego is not set up
-/// for here, and a key left empty.
+/// for here, a key left empty, and a provider whose variables `dns.env` must hold are
+/// not the ones lego reads.
 #[test]
 fn acme_settings_are_checked() {
     let a = acme();
@@ -115,6 +116,16 @@ fn acme_settings_are_checked() {
         let text = acme_text("ops+mdm@example.com", DIRECTORY, &provider.to_string());
         assert_eq!(Acme::parse(&text).map(|a| a.provider).ok(), Some(provider));
     }
+    let vars = |p: DnsProvider| p.vars().join(" ");
+    assert_eq!(
+        vars(DnsProvider::GoDaddy),
+        "GODADDY_API_KEY GODADDY_API_SECRET"
+    );
+    assert_eq!(
+        vars(DnsProvider::Route53),
+        "AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_REGION AWS_HOSTED_ZONE_ID"
+    );
+    assert_eq!(vars(DnsProvider::Cloudflare), "CLOUDFLARE_DNS_API_TOKEN");
     let bad = [
         ("opsexample.com", DIRECTORY, "godaddy", "MDM_ACME_EMAIL"),
         ("ops@localhost", DIRECTORY, "godaddy", "MDM_ACME_EMAIL"),
@@ -228,7 +239,8 @@ fn a_first_run_installs_the_units_issues_the_certificate_then_starts_the_proxy()
 
 /// Catches a re-run that issues again, rewrites a unit or restarts a service when
 /// nothing changed, a changed unit that does not reach systemd (no daemon-reload, the
-/// timer not restarted), and an apply that does not show the certificate it got.
+/// timer not restarted), and an apply that does not show the certificate it got or
+/// takes a file that is not one for it.
 #[test]
 fn a_rerun_changes_nothing_and_a_changed_timer_is_reloaded() {
     let (mut exec, _) = tls_host(HELP);
@@ -252,6 +264,11 @@ fn a_rerun_changes_nothing_and_a_changed_timer_is_reloaded() {
     exec.log.clear();
     run_it(&mut exec, &acme(), Mode::Apply).0.expect("timer");
     assert_eq!(runs(&exec), ["daemon-reload", "restart kbf-mdm-cert.timer"]);
+
+    exec.entries
+        .insert(p(CRT), file(b"not a certificate", 0o644, 990));
+    let err = run_it(&mut exec, &acme(), Mode::Apply).0.err();
+    assert!(matches!(err, Some(MdmError::NotCertificate(_))), "{err:?}");
 }
 
 /// Catches a run that goes ahead without what lego needs: the provider's key missing

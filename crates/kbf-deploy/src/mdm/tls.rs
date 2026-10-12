@@ -155,11 +155,10 @@ impl Acme {
             why,
         };
         // The unit's ExecStart carries both as words: no space, quote or `%` (a
-        // systemd specifier).
+        // systemd specifier). `require` has refused an empty value already.
         let word = |s: &str, more: &str| {
-            !s.is_empty()
-                && s.chars()
-                    .all(|ch| ch.is_ascii_alphanumeric() || "._-".contains(ch) || more.contains(ch))
+            s.chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || "._-".contains(ch) || more.contains(ch))
         };
         let email = get("ACME_EMAIL")?;
         let at = email.split_once('@');
@@ -234,14 +233,16 @@ pub fn run<E: Exec>(
     let mut changed = BTreeSet::new();
     for (name, text) in TLS_UNITS {
         let text = template::render(name, text, &values)?;
-        if place(
+        let path = under(&dir, name)?;
+        let placed = place(
             &mut planner,
-            &under(&dir, name)?,
+            &path,
             Some(ROOT),
             Perms::new(0o644),
             &text,
             out,
-        )? {
+        );
+        if placed? {
             changed.insert(name);
         }
     }
@@ -264,20 +265,20 @@ pub fn run<E: Exec>(
     let Some(Entry::File { bytes, .. }) = host::inspect(&*exec, &crt)? else {
         return Err(MdmError::NoCertificate(crt));
     };
-    let (_, pem) = x509_parser::pem::parse_x509_pem(&bytes)
-        .map_err(|_| MdmError::NotCertificate(crt.clone()))?;
-    let cert = pem
-        .parse_x509()
-        .map_err(|_| MdmError::NotCertificate(crt.clone()))?;
-    note(
-        out,
-        format_args!(
-            "certificate: {crt}: subject {}, issuer {}, valid until {}",
-            cert.subject(),
-            cert.issuer(),
-            cert.validity().not_after
-        ),
-    )?;
+    let shown = x509_parser::pem::parse_x509_pem(&bytes)
+        .ok()
+        .and_then(|(_, pem)| {
+            let cert = pem.parse_x509().ok()?;
+            let v = cert.validity();
+            Some(format!(
+                "certificate: {crt}: subject {}, issuer {}, valid until {}",
+                cert.subject(),
+                cert.issuer(),
+                v.not_after
+            ))
+        })
+        .ok_or(MdmError::NotCertificate(crt.clone()))?;
+    note(out, format_args!("{shown}"))?;
     Ok(())
 }
 

@@ -189,11 +189,8 @@ pub fn run<E: Exec>(
             _ => return Err(MdmError::NoTopic(topic_file)),
         },
     };
-    let challenge = secret::read(
-        &*exec,
-        &under(&c.etc, "scep.env")?,
-        "SCEP_CHALLENGE_PASSWORD",
-    )?;
+    let scep_env = under(&c.etc, "scep.env")?;
+    let challenge = secret::read(&*exec, &scep_env, "SCEP_CHALLENGE_PASSWORD")?;
     let owner = user::lookup(&*exec, &c.user)?.ok_or(MdmError::NoUser {
         user: c.user.clone(),
         home: c.state.clone(),

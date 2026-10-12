@@ -274,15 +274,18 @@ fn define_profile_defines_assigns_records_and_a_rerun_does_nothing() {
 /// assigner would be given garbage and the record would stop a retry.
 #[test]
 fn define_profile_refuses_an_answer_without_a_profile_uuid() {
-    let server = depserver("not-hex");
-    let (mut exec, _) = host_with_units();
-    let (code, err) = err_of(run_it(&mut exec, &server, &Dep::DefineProfile, Mode::Apply).0);
-    assert!(
-        code == 1 && err.contains("no profile_uuid of 16 to 64 hex digits"),
-        "{err}"
-    );
-    assert_eq!(server.requests().len(), 1);
-    assert!(exec.log.is_empty());
+    // Too short, and the right length but not hex.
+    for uuid in ["not-hex", "ZZZZZZZZZZZZZZZZ"] {
+        let server = depserver(uuid);
+        let (mut exec, _) = host_with_units();
+        let (code, err) = err_of(run_it(&mut exec, &server, &Dep::DefineProfile, Mode::Apply).0);
+        assert!(
+            code == 1 && err.contains("no profile_uuid of 16 to 64 hex digits"),
+            "{uuid}: {err}"
+        );
+        assert_eq!(server.requests().len(), 1);
+        assert!(exec.log.is_empty());
+    }
 }
 
 /// Catches an assignment of no recorded profile, a request that names other devices or

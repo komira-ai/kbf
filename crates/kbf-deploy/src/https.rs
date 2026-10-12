@@ -300,10 +300,7 @@ pub(crate) fn read_reply<R: BufRead>(
 }
 
 fn read_head<R: BufRead>(url: &dyn fmt::Display, r: &mut R) -> Result<Head, HttpsError> {
-    let io = |source| HttpsError::Io {
-        url: url.to_string(),
-        source,
-    };
+    let io = io_error(url);
     let malformed = |reason: String| HttpsError::Malformed {
         url: url.to_string(),
         reason,
@@ -314,7 +311,7 @@ fn read_head<R: BufRead>(url: &dyn fmt::Display, r: &mut R) -> Result<Head, Http
             .by_ref()
             .take(1 + (HEAD_MAX - head.len()) as u64)
             .read_until(b'\n', &mut head)
-            .map_err(io)?;
+            .map_err(&io)?;
         if n == 0 || head.len() > HEAD_MAX {
             return Err(malformed(
                 "the headers end early or are too long".to_owned(),
@@ -348,6 +345,14 @@ fn read_head<R: BufRead>(url: &dyn fmt::Display, r: &mut R) -> Result<Head, Http
     })
 }
 
+/// The error of a failed read of an answer from `url`.
+fn io_error(url: &dyn fmt::Display) -> impl Fn(io::Error) -> HttpsError + '_ {
+    move |source| HttpsError::Io {
+        url: url.to_string(),
+        source,
+    }
+}
+
 /// The body after `head`: by its chunks, by its Content-Length, or to the end.
 fn read_body<R: BufRead>(
     url: &dyn fmt::Display,
@@ -355,19 +360,16 @@ fn read_body<R: BufRead>(
     r: &mut R,
     to: &mut dyn Write,
 ) -> Result<(), HttpsError> {
-    let io = |source| HttpsError::Io {
-        url: url.to_string(),
-        source,
-    };
+    let io = io_error(url);
     if head.chunked {
-        read_chunked(r, to).map_err(io)?;
+        read_chunked(r, to).map_err(&io)?;
     } else if let Some(n) = head.length {
-        let copied = io::copy(&mut r.by_ref().take(n), to).map_err(io)?;
+        let copied = io::copy(&mut r.by_ref().take(n), to).map_err(&io)?;
         if copied != n {
             return Err(io(io::Error::from(io::ErrorKind::UnexpectedEof)));
         }
     } else {
-        io::copy(r, to).map_err(io)?;
+        io::copy(r, to).map_err(&io)?;
     }
     Ok(())
 }

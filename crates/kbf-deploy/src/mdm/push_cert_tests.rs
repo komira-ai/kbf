@@ -347,3 +347,27 @@ fn profile_only_takes_the_given_or_recorded_topic() {
         .err();
     assert!(matches!(err, Some(MdmError::NoUser { .. })), "{err:?}");
 }
+
+/// Catches a renewal that is never sent: the renewed certificate keeps the topic, so
+/// only its recorded sha256 tells NanoHUB's copy is the old one, which would expire.
+#[test]
+fn a_renewed_certificate_for_the_same_topic_is_uploaded_again() {
+    let server = nanohub(TOPIC);
+    let mut exec = host();
+    let (cert, key) = pair(TOPIC, false);
+    with_pair(&mut exec, &cert, &key);
+    let a = pair_args(&server);
+    run_it(&mut exec, &a, Mode::Apply).0.expect("first");
+    let (renewed, renewed_key) = pair(TOPIC, false);
+    with_pair(&mut exec, &renewed, &renewed_key);
+    let (got, out) = run_it(&mut exec, &a, Mode::Apply);
+    got.expect("renewal");
+    let r = server.requests();
+    assert_eq!(r.len(), 2, "{out}");
+    assert_eq!(r[1].body, format!("{renewed}{renewed_key}").into_bytes());
+    let sum = format!("{}\n", hex::encode(Sha256::digest(renewed.as_bytes())));
+    assert_eq!(
+        written(&exec, "/var/lib/kbf-mdm/push-cert.sha256"),
+        sum.into_bytes()
+    );
+}
