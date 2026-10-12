@@ -195,7 +195,9 @@ fn an_archive_that_does_not_decode_is_an_unpack_error_with_nothing_written() {
         ("xz", b"not xz".to_vec(), xz_garbage),
         ("tar", gzip(&not_tar), tar_gz("x")),
     ] {
-        let (result, out) = install_own(name, &bytes, &unpack);
+        // Not `name` alone: each_format_yields_the_tool installs a "zst" at the same
+        // time, in the same process, and its file made this test fail at random.
+        let (result, out) = install_own(&format!("undecodable-{name}"), &bytes, &unpack);
         assert!(
             matches!(result, Err(Error::Unpack(_))),
             "{name}: {result:?}"

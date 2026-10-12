@@ -20,10 +20,18 @@ Sections below that describe them say so.
 
 `<commit>` is the full SHA of the commit built (`GITHUB_SHA`: on `main`, the pushed
 commit; on a pull request, the test merge commit). Each tarball holds one release binary (`cargo build
---locked --release`), mode 0755, owned by 0:0, and nothing else. Next to each tarball
+--locked --release`), mode 0755, owned by 0:0, and nothing else. `cargo xtask package`
+writes it the same way on every runner: one ustar entry with no owner names, time 0
+(the epoch) and no extended attributes, in a gzip stream with no file name or time,
+so one binary always packages to the same bytes. It then reads the tarball back and
+refuses it unless it holds exactly that entry. Next to each tarball
 is its CycloneDX SBOM, `<same stem>.cdx.json`, made from `Cargo.lock` for that binary
 and target by `cargo-cyclonedx` (pinned by version and SHA-256 in the workflow, and
-installed by `cargo xtask fetch`). One `SHA256SUMS` covers every tarball and SBOM of the commit.
+installed by `cargo xtask fetch`). One `SHA256SUMS` covers every tarball and SBOM of the commit: each job writes
+`SHA256SUMS.<platform>`, and the `sums` job merges them, sorted by name (`cargo xtask
+sums assemble`), and checks every file against it (`cargo xtask verify-assets sums`:
+every file listed once, each matching, and a copy of the first tarball with one byte
+flipped not matching).
 
 `kbf-server` embeds the first 12 characters of the commit it was built from, and
 `--version` prints `kbf-server <package version>+<commit>` (so do its start line and
@@ -41,13 +49,15 @@ newer.
 | Event | What happens |
 |---|---|
 | Pull request, merge queue | A build check: every asset is built, signed, packaged and summed, and `SHA256SUMS` is checked. Nothing is attested, so nothing is published. |
-| Push to `main` | The same, then the `attest` job signs build provenance for every file in `SHA256SUMS` (`actions/attest-build-provenance`) and an SBOM attestation for every tarball (`actions/attest-sbom`), and verifies them with the command below. |
+| Push to `main` | The same, then the `attest` job signs build provenance for every file in `SHA256SUMS` (`actions/attest-build-provenance`) and an SBOM attestation for every tarball (`actions/attest-sbom`), and nothing else. The `verify` job then assembles `SHA256SUMS` again from the files, refuses it unless it is byte for byte the published one, checks the files against it, and verifies every attestation with the command below. |
 
 Only the `attest` job holds `id-token: write` and `attestations: write`, and only
 under the exact `if:` that limits it to a push to `main`. The workflow lint
 (`crates/kbf-it/tests/workflows`) refuses those scopes in any other job, so no pull
-request run holds a token that can sign an attestation. Every action is pinned by
-commit SHA, and that lint refuses one that is not.
+request run holds a token that can sign an attestation. No repository code runs in
+`attest` and nothing is built there: it holds those scopes for the pinned signing
+actions alone. Every action is pinned by commit SHA, and that lint refuses one that
+is not.
 
 ## Where the files are, and for how long
 
@@ -64,8 +74,8 @@ the artifacts.
 
 No deployment job exists yet. When it does, it is to verify each asset before it
 touches a node, in CI (a node has no `gh`), with every flag below
-([mac-node-provisioning.md](design/mac-node-provisioning.md) section 4.2). The `attest`
-job already runs these exact checks on its own output (below).
+([mac-node-provisioning.md](design/mac-node-provisioning.md) section 4.2). The `verify`
+job already runs these exact checks on what `attest` signed (below).
 
 ```text
 gh attestation verify kbf-daemon-<commit>-darwin-arm64.tar.gz \
@@ -83,9 +93,10 @@ gh attestation verify kbf-daemon-<commit>-darwin-arm64.tar.gz \
 The node itself is then to check the asset's SHA-256 against the value the job hands
 it, before it installs anything (planned, with the node's `apply`; design section 4.2).
 
-The `attest` job runs exactly these checks on its own output
-(`tools/ci/verify-assets.sh`), and two that must fail: the first tarball verified as
-signed by `ci.yml`, and a copy with one flipped byte. If either verifies, the job fails.
+The `verify` job runs exactly these checks on what `attest` signed (`cargo xtask
+verify-assets attestations`, with read-only scopes), and two that must fail: the first
+tarball verified as signed by `ci.yml`, and a copy with one flipped byte. If either
+verifies, the job fails.
 
 ## macOS signing: what ad hoc with the hardened runtime gives
 

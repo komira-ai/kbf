@@ -639,7 +639,7 @@ mod selection {
     /// A darwin job: Package, then `check` as the next step's lines.
     fn darwin_workflow(check: &str) -> String {
         format!(
-            "on: push\npermissions: {{}}\njobs:\n  darwin-arm64:\n    runs-on: macos-15\n    steps:\n      - name: Package\n        run: bash tools/ci/package-asset.sh a b c darwin-arm64 dist\n{check}"
+            "on: push\npermissions: {{}}\njobs:\n  darwin-arm64:\n    runs-on: macos-15\n    steps:\n      - name: Package\n        run: cargo xtask package --binary a --sbom b --platform darwin-arm64 --commit c --out dist\n{check}"
         )
     }
 

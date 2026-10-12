@@ -1,25 +1,33 @@
-//! `xtask-fake`: what this crate's tests run in place of `cargo` and of a built
-//! `kbf-server`, so `build-commit stamps` is tested without building the server.
+//! `xtask-fake`: what this crate's tests run in place of `cargo`, of a built
+//! `kbf-server` and of `gh`, so `build-commit stamps` is tested without building the
+//! server and `verify-assets attestations` without GitHub.
 //!
-//! - Run under any name but `kbf-server`, it is cargo: it appends its arguments as one
-//!   line to `target/debug/cargo-args` in its working directory, "builds" by
+//! - Run under any name but `kbf-server` or `gh`, it is cargo: it appends its arguments
+//!   as one line to `target/debug/cargo-args` in its working directory, "builds" by
 //!   hard-linking itself to `target/debug/kbf-server`, and writes the stamp that build
 //!   embeds to `target/debug/kbf-server.stamp`: `KBF_BUILD_COMMIT_OVERRIDE` when set,
 //!   else `XTASK_FAKE_HEAD`. An override that is not 12 lowercase hex digits fails the
 //!   build with the build script's message.
 //! - Run as `kbf-server`, it prints `kbf-server 0.1.0+<stamp>` from the stamp file next
 //!   to it.
+//! - Run as `gh attestation verify <file> <flags>`, it appends its arguments as one line
+//!   to `gh-args` next to it, and verifies the file when `attested` next to it holds
+//!   the line `<SHA-256 of the file> <flags>`: the store of attestations, each the file
+//!   it covers and the exact flags it verifies under.
 //!
 //! `XTASK_FAKE_DEFECT` plants one defect of the real build: `ignores-override` (the
 //! build embeds the head whatever the override), `accepts-bad` (a malformed override
 //! builds), `fails-other` (a malformed override fails, but not on the override),
 //! `build-fails` (every build fails), `stamp-fails` (every build with an override
 //! fails), `vanish` (the build stamped `b2b2b2b2b2b2` deletes the fake cargo, so the
-//! next build cannot start) or `version-fails` (`kbf-server` exits 1).
-
+//! next build cannot start) or `version-fails` (`kbf-server` exits 1). Of the
+//! attestation store: `accepts-all` (every file verifies, whatever the flags) or
+//! `ignores-bytes` (a file verifies when any attestation has its flags).
 use std::io::Write;
 use std::path::Path;
 use std::process::ExitCode;
+
+use sha2::Digest;
 
 const OVERRIDE: &str = "KBF_BUILD_COMMIT_OVERRIDE";
 
@@ -82,12 +90,41 @@ fn cargo(argv0: &str, args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+fn gh(argv0: &str, args: &[String]) -> ExitCode {
+    let dir = Path::new(argv0).parent().expect("the fake's directory");
+    let mut log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("gh-args"))
+        .expect("gh-args");
+    writeln!(log, "{}", args.join(" ")).expect("gh-args");
+    let file = args
+        .get(2)
+        .filter(|_| args[..2] == ["attestation", "verify"])
+        .expect("gh attestation verify <file> ...");
+    let sha256 = hex::encode(sha2::Sha256::digest(std::fs::read(file).expect("the file")));
+    let flags = args[3..].join(" ");
+    let store = std::fs::read_to_string(dir.join("attested")).unwrap_or_default();
+    let by_bytes = !defect("ignores-bytes");
+    let attested = store.lines().any(|line| {
+        line.split_once(' ')
+            .is_some_and(|(sha, f)| ((sha == sha256) | !by_bytes) & (f == flags))
+    });
+    if attested | defect("accepts-all") {
+        return ExitCode::SUCCESS;
+    }
+    eprintln!("xtask-fake: no attestation of {file} verifies with {flags}");
+    ExitCode::FAILURE
+}
+
 fn main() -> ExitCode {
     let mut args = std::env::args();
     let argv0 = args.next().expect("argv0");
     let rest: Vec<String> = args.collect();
     if argv0.ends_with("/kbf-server") {
         server(&argv0)
+    } else if argv0.ends_with("/gh") {
+        gh(&argv0, &rest)
     } else {
         cargo(&argv0, &rest)
     }
