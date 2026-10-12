@@ -74,14 +74,9 @@ jobs:
           # lookup still tells the save step below whether this key exists.
           lookup-only: ${{ github.event_name == 'push' }}
       - name: Install cargo-cyclonedx (pinned version and checksum)
-        run: |
-          archive="$RUNNER_TEMP/cargo-cyclonedx.tar.xz"
-          curl --proto '=https' --tlsv1.2 -fsSL -o "$archive" \
-            "https://github.com/CycloneDX/cyclonedx-rust-cargo/releases/download/cargo-cyclonedx-$CYCLONEDX_VERSION/cargo-cyclonedx-$TARGET.tar.xz"
-          echo "$CYCLONEDX_SHA256_AARCH64_DARWIN  $archive" | shasum -a 256 --check
-          tar -xJf "$archive" -C "$HOME/.cargo/bin" --strip-components=1 "cargo-cyclonedx-$TARGET/cargo-cyclonedx"
-          cargo cyclonedx --version
+        run: cargo xtask fetch --url "https://github.com/CycloneDX/cyclonedx-rust-cargo/releases/download/cargo-cyclonedx-$CYCLONEDX_VERSION/cargo-cyclonedx-$TARGET.tar.xz" --sha256 "$CYCLONEDX_SHA256_AARCH64_DARWIN" --out "$HOME/.cargo/bin/cargo-cyclonedx" --extract tar.xz --member "cargo-cyclonedx-$TARGET/cargo-cyclonedx"
       - run: sw_vers && uname -m && xcodebuild -version
+      - run: cargo cyclonedx --version
       - run: cargo build --locked --release --target "$TARGET" -p kbf-node --bin kbf-daemon
       - name: Sign ad hoc with the hardened runtime, and check it
         run: bash tools/ci/sign-darwin.sh "target/$TARGET/release/kbf-daemon"
@@ -140,13 +135,8 @@ jobs:
           # lookup still tells the save step below whether this key exists.
           lookup-only: ${{ github.event_name == 'push' }}
       - name: Install cargo-cyclonedx (pinned version and checksum)
-        run: |
-          archive="$RUNNER_TEMP/cargo-cyclonedx.tar.xz"
-          curl --proto '=https' --tlsv1.2 -fsSL -o "$archive" \
-            "https://github.com/CycloneDX/cyclonedx-rust-cargo/releases/download/cargo-cyclonedx-$CYCLONEDX_VERSION/cargo-cyclonedx-$TARGET.tar.xz"
-          echo "$CYCLONEDX_SHA256_X86_64_LINUX  $archive" | sha256sum --check --strict
-          tar -xJf "$archive" -C "$HOME/.cargo/bin" --strip-components=1 "cargo-cyclonedx-$TARGET/cargo-cyclonedx"
-          cargo cyclonedx --version
+        run: cargo xtask fetch --url "https://github.com/CycloneDX/cyclonedx-rust-cargo/releases/download/cargo-cyclonedx-$CYCLONEDX_VERSION/cargo-cyclonedx-$TARGET.tar.xz" --sha256 "$CYCLONEDX_SHA256_X86_64_LINUX" --out "$HOME/.cargo/bin/cargo-cyclonedx" --extract tar.xz --member "cargo-cyclonedx-$TARGET/cargo-cyclonedx"
+      - run: cargo cyclonedx --version
       - run: cargo build --locked --release --target "$TARGET" -p kbf-node -p kbf-server --bins
       - run: cargo xtask build-commit check "target/$TARGET/release/kbf-server" "$GITHUB_SHA"
       - name: SBOM
@@ -200,13 +190,8 @@ jobs:
           # lookup still tells the save step below whether this key exists.
           lookup-only: ${{ github.event_name == 'push' }}
       - name: Install cargo-cyclonedx (pinned version and checksum)
-        run: |
-          archive="$RUNNER_TEMP/cargo-cyclonedx.tar.xz"
-          curl --proto '=https' --tlsv1.2 -fsSL -o "$archive" \
-            "https://github.com/CycloneDX/cyclonedx-rust-cargo/releases/download/cargo-cyclonedx-$CYCLONEDX_VERSION/cargo-cyclonedx-$TARGET.tar.xz"
-          echo "$CYCLONEDX_SHA256_AARCH64_LINUX  $archive" | sha256sum --check --strict
-          tar -xJf "$archive" -C "$HOME/.cargo/bin" --strip-components=1 "cargo-cyclonedx-$TARGET/cargo-cyclonedx"
-          cargo cyclonedx --version
+        run: cargo xtask fetch --url "https://github.com/CycloneDX/cyclonedx-rust-cargo/releases/download/cargo-cyclonedx-$CYCLONEDX_VERSION/cargo-cyclonedx-$TARGET.tar.xz" --sha256 "$CYCLONEDX_SHA256_AARCH64_LINUX" --out "$HOME/.cargo/bin/cargo-cyclonedx" --extract tar.xz --member "cargo-cyclonedx-$TARGET/cargo-cyclonedx"
+      - run: cargo cyclonedx --version
       - run: cargo build --locked --release --target "$TARGET" -p kbf-node -p kbf-server --bins
       - run: cargo xtask build-commit check "target/$TARGET/release/kbf-server" "$GITHUB_SHA"
       - name: SBOM
