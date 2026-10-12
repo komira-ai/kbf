@@ -137,26 +137,24 @@ impl Leases {
     }
 
     /// Turns a finished run into its Result: a fenced (lost) one if the lease was
-    /// fenced, whatever the run's outcome. `None` for a lease not running.
+    /// fenced, whatever the run's outcome. Every run reports once, on `done`, and its
+    /// lease is running until then: neither a fence nor a `Cancel` drops it sooner.
     pub(crate) fn finished(
         &mut self,
         id: LeaseId,
         outcome: Result<ActionResult, RuntimeError>,
-    ) -> Option<worker::Result> {
-        self.running.remove(&id)?;
+    ) -> worker::Result {
+        self.running.remove(&id);
         // A cancelled run ends ABORTED (killed), or as it ended if it beat the kill;
         // the server refuses either.
         self.cancelled.remove(&id);
         if self.fenced.remove(&id) {
             tracing::warn!(lease = %id, "lease fenced: contact with the server lost");
             let why = "self-fenced: no acknowledged heartbeat within the fence time";
-            return Some(result_of(
-                id,
-                Err(RuntimeError::Lost(LostWhy::Fenced, why.to_owned())),
-            ));
+            return result_of(id, Err(RuntimeError::Lost(LostWhy::Fenced, why.to_owned())));
         }
         tracing::info!(lease = %id, ok = outcome.is_ok(), "lease finished");
-        Some(result_of(id, outcome))
+        result_of(id, outcome)
     }
 
     /// Whether a running lease is not being fenced yet.
@@ -399,7 +397,7 @@ mod tests {
                     .await
                     .expect("the fence killed one lease at a time")
                     .expect("open");
-            results.push(leases.finished(id, outcome).expect("reported"));
+            results.push(leases.finished(id, outcome));
         }
         results.sort_by_key(|r| r.lease_id.map(|l| (l.term, l.seq)));
         let fenced: Vec<_> = results.iter().map(|r| r.lease_id).collect();
@@ -458,7 +456,7 @@ mod tests {
                 .await
                 .expect("the fence waited for a second run of one lease")
                 .expect("open");
-        assert!(leases.finished(ended, outcome).is_some());
+        leases.finished(ended, outcome);
         assert_eq!(runtime.runs.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
@@ -483,7 +481,7 @@ mod tests {
         assert!(!leases.cancel(id()), "a lease already being cancelled");
         let (ended, outcome) = done_rx.recv().await.expect("the run ends");
         assert_eq!(ended, id());
-        let result = leases.finished(ended, outcome).expect("reported");
+        let result = leases.finished(ended, outcome);
         assert_eq!(code(&result), Code::Aborted as i32);
         assert_eq!(runtime.killed(), [id()]);
         assert!(leases.running().is_empty());

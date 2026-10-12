@@ -3,18 +3,18 @@
 //! killed run takes its time to stop (a run in the middle of a slow output upload
 //! does not see the kill until the upload ends). Each test runs real mutual TLS on
 //! loopback against the fake worker service of `support`.
-
-mod support;
+//!
+//! A module of the `session` test binary: these are tests of the session loop.
 
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use crate::support::{Harness, PROMPT};
 use kbf_daemon::{Event, Runtime, RuntimeError, Work};
 use kbf_proto::google::rpc::Code;
 use kbf_proto::reapi::ActionResult;
 use kbf_proto::worker::{LeaseId, Lost};
-use support::{Harness, PROMPT};
 use tokio::sync::Semaphore;
 
 const LONG: Duration = Duration::from_secs(60);

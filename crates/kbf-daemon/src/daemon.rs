@@ -565,15 +565,7 @@ impl Daemon {
             };
             // First, whatever woke the loop: the clock may have jumped over a suspend.
             self.recheck();
-            // Half T past the fence, so the Results of runs that stop at once go out
-            // on this stream first.
-            let silent_for = self.contact.fence_after().saturating_mul(3) / 2;
-            if self.contact.lost(self.clock.now()) && heard.elapsed() >= silent_for {
-                // Nothing acknowledged for T, and none on this stream for that long
-                // awake: it is stuck, or the server gave this node up. A new stream
-                // says Hello again.
-                return Err(SessionError::Silent(silent_for));
-            }
+            self.check_silence(heard)?;
             match wake {
                 Wake::Message(msg) => {
                     if let Some(server_message::Message::HeartbeatAck(_)) = msg.message {
@@ -609,6 +601,18 @@ impl Daemon {
                 }
             }
         }
+    }
+
+    /// Ends the session when contact is lost and this stream has acknowledged no
+    /// heartbeat since `heard` for 1.5 T of time awake: it is stuck, or the server
+    /// gave this node up, and a new stream says Hello again. Half T past the fence, so
+    /// the Results of runs that stop at once go out on this stream first.
+    fn check_silence(&self, heard: tokio::time::Instant) -> Result<(), SessionError> {
+        let silent_for = self.contact.fence_after().saturating_mul(3) / 2;
+        if self.contact.lost(self.clock.now()) && heard.elapsed() >= silent_for {
+            return Err(SessionError::Silent(silent_for));
+        }
+        Ok(())
     }
 
     /// Checks the first server message is an acceptable Welcome; returns its interval
@@ -794,11 +798,10 @@ impl Daemon {
         }
     }
 
-    /// Reports a finished run, unless it was reported already.
+    /// Reports a finished run.
     fn finished(&mut self, tx: Option<&UnboundedSender<DaemonMessage>>, (id, outcome): Done) {
-        if let Some(result) = self.leases.finished(id, outcome) {
-            self.report(tx, result);
-        }
+        let result = self.leases.finished(id, outcome);
+        self.report(tx, result);
     }
 
     /// How long to sleep before [`Self::check`] may have something to do: until its
