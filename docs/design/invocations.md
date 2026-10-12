@@ -269,6 +269,8 @@ unflushed rows and the header fields; step 3 then applies only when flushes fail
   what each replica's read returned (a store unreachable from one replica, a corrupt
   read on another), so replicas could remove different entries. Pinned failed-action outputs
   (3.6) are likewise listed in the pin command, not discovered by parsing.
+  The closure is also what is left of the chunk list when a root is lost or corrupt
+  (section 7): it names every chunk, and each chunk's sequence number gives the order.
 - **A pin update is a compare-and-set on `prev_root`.** It is refused, and changes
   nothing, when the pin's current root is not `prev_root` (empty for the first flush of
   an invocation), or when `new_root` is not in the blob index (the `PutBlobs` that
@@ -439,9 +441,15 @@ the operator API's "anyone who reaches the address" rule.
 
 Per invocation, from the record: in stage 2 the recorder computes them at each flush
 and stores them in the root (3.5), and the route adds the rows not yet flushed, so it
-reads no chunk. Percentiles therefore come from a mergeable histogram the recorder
-keeps, not from sorting rows. The values: counts as above; queue time and
-run time (granted to ended) as min, p50, p90, max and sum; reruns by reason; CPU-seconds
+reads no chunk. In stage 1 there is no root: the recorder keeps the same values in
+memory for each invocation it holds, updated as each row is written, and the route
+reads them there. Percentiles therefore come from a mergeable histogram the recorder
+keeps, not from sorting rows, so **p50 and p90 are approximate**: the histogram has
+power-of-two buckets each split into 16 equal sub-buckets, and a percentile is reported
+as the largest value its sub-bucket can hold, so it is never below the true value and at most
+1/16 (6.25%) above it (exact below 16 µs). Min, max, sum and counts are exact. The
+values: counts as above; queue time and
+run time (granted to ended) as min, p50 (approximate), p90 (approximate), max and sum; reruns by reason; CPU-seconds
 and peak memory summed and maxed over actions that carry usage, with
 `usage_actions: n` saying how many did. Farm-wide metrics (a scrape endpoint) are a
 separate design.
@@ -590,7 +598,8 @@ ingester is a second writer and not a second record. buck2 does not emit BES.
 | Server crash or restart | stage 1: all records lost, a page answers `404`; stage 2: at most the unflushed window (120 s or 256 KiB) of each open invocation lost, marked `complete: false`; minted invocations lost |
 | Object store down at flush | chunk kept in memory and retried; past `--invocation-memory`, oldest unflushed rows dropped and `complete: false` |
 | Failover (HA, planned) | the new leader's recorder reads each open invocation's pin (its current root) and continues in new chunks; each pin update is a compare-and-set on that root (3.5), so a deposed leader's update that commits late makes the next update fail, and the recorder rebuilds from the pin's current root and retries, never overwriting it; the old leader's unflushed window is lost and the invocation says `complete: false` |
-| Chunk lost or corrupt (the store has no bytes for it, or they fail their digest) | the page shows the surviving chunks' rows and a gap marker where the lost chunk's rows were (its row count and time range, from the root), and the invocation says `complete: false`; nothing restores it: a chunk is the one blob no client can upload again |
+| Chunk lost or corrupt (the store has no bytes for it, or they fail their digest) | the page shows the surviving chunks' rows and a gap marker where the lost chunk's rows were (its row count and time range, from the root), and the invocation says `complete: false`; nothing restores it: the server alone writes a chunk (as it does a root), so no client holds its bytes to upload again |
+| Root lost or corrupt | the root's own fields are gone: the 3.1 header fields (`tool`, `owner`, `first_seen`, the counters), the per-chunk row counts and time ranges, the precomputed metrics and the failed-row positions; the page answers them as `null` and says `complete: false`. The rows are recoverable: the pin's closure (3.5) still lists every chunk's digest, and each chunk carries its invocation id and sequence number, so the server reads the listed chunks in sequence order, shows their rows, and recomputes the metrics and the failed-first order by scanning them (the one case where 4.4 reads chunks); the read check (4.3) is asked with the instance names of those rows. A chunk lost as well shows as a gap with no row count or time range. An invocation still open on the server gets a whole new root at its next flush, from the header fields the recorder holds in memory (3.5) |
 | ActionResult, output or log blob collected | still listed from the row (3.2) with `available: false`; its `href` answers `404` |
 | Malformed or hostile header | treated as absent (2.2); never fails the call |
 | Squatted id | recorded under `<id>~<n>` (2.4) |
