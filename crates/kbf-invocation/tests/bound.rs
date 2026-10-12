@@ -392,3 +392,93 @@ fn marks_for_records_not_made_yet_are_capped() {
     );
     assert!(!r.get(&key("u1024")).expect("u1024").complete());
 }
+
+/// Applies `events` within every bound from 0 to what they take with none, checking
+/// after every event (see [`bounded`]); the records within the tightest bound that
+/// leaves out only the last addition. Catches an addition admitted at less than it
+/// adds: some bound has room for what was counted and not for what was added.
+fn swept(events: &[Event]) -> Records {
+    let top = unbounded(events);
+    for bound in 0..top {
+        bounded(bound, events);
+    }
+    bounded(top - 1, events)
+}
+
+/// Catches a collision made without room for its entry in the owner's list (plant
+/// `listed = 0` in `Records::route`: within 2,036 bytes the records held 2,077): a
+/// second caller of an id is the only growth.
+#[test]
+fn a_collision_is_admitted_with_its_entry_in_the_owners_list() {
+    let mut other = call("x", t(1), CallKind::Downloaded(1));
+    other.owner = owner("o2");
+    let r = swept(&[ev(call("x", t(0), CallKind::Downloaded(1))), ev(other)]);
+    assert_eq!(held(&r), ["x"], "one byte short, the collision is not made");
+}
+
+/// The first call of `x`, then a second that sends `metadata` for the first time.
+fn sent_later(metadata: kbf_invocation::Metadata) -> [Event; 2] {
+    let mut later = call("x", t(1), CallKind::Downloaded(1));
+    later.metadata = metadata;
+    [ev(call("x", t(0), CallKind::Downloaded(1))), ev(later)]
+}
+
+/// Catches a correlated id sent after a record's first call admitted at nothing
+/// (plant `0` for it in `Invocation::seen_bytes`: within 1,058 bytes the records
+/// held 1,117); one byte short, the id is not set and the record says `complete: false`.
+#[test]
+fn a_correlated_id_sent_later_is_admitted() {
+    let r = swept(&sent_later(kbf_invocation::Metadata {
+        correlated_invocations_id: Some("c".repeat(100)),
+        ..kbf_invocation::Metadata::default()
+    }));
+    let x = r.get(&key("x")).expect("x");
+    assert_eq!(x.correlated_invocations_id(), None);
+    assert!(!x.complete());
+}
+
+/// Catches a tool sent after a record's first call admitted at nothing (plant `0`
+/// for it in `Invocation::seen_bytes`: within 1,058 bytes the records held 1,217);
+/// one byte short, it is not set and the record
+/// says `complete: false`.
+#[test]
+fn a_tool_sent_later_is_admitted() {
+    let r = swept(&sent_later(kbf_invocation::Metadata {
+        tool: Some("t".repeat(100)),
+        tool_version: Some("v".repeat(100)),
+        ..kbf_invocation::Metadata::default()
+    }));
+    let x = r.get(&key("x")).expect("x");
+    assert_eq!(x.tool(), (None, None));
+    assert!(!x.complete());
+}
+
+/// Catches marks for records not made yet kept past their share of the bound (plant:
+/// no byte check in `Records::mark_incomplete_call`): within 32 kB they hold 2 kB at
+/// most, about 40 marks of short ids, so of 100 the oldest is forgotten and the
+/// newest still marks.
+#[test]
+fn marks_for_records_not_made_yet_hold_a_sixteenth_of_the_bound() {
+    let mut r = Records::with_bound(ROW_CAP, 32 * 1024);
+    for n in 0..100 {
+        r.mark_incomplete_call(&id(&format!("u{n}")), &owner(""));
+    }
+    r.apply(ev(call("u0", t(0), CallKind::Downloaded(1))));
+    r.apply(ev(call("u99", t(0), CallKind::Downloaded(1))));
+    assert!(r.get(&key("u0")).expect("u0").complete(), "forgotten");
+    assert!(!r.get(&key("u99")).expect("u99").complete());
+}
+
+/// Catches a mark larger than its share kept anyway: an owner of 3 kB does not fit
+/// in the 2 kB of a 32 kB bound, so its record starts complete, as a forgotten
+/// mark's does.
+#[test]
+fn a_mark_larger_than_the_share_is_not_kept() {
+    let mut r = Records::with_bound(ROW_CAP, 32 * 1024);
+    let big = owner(&"o".repeat(3000));
+    r.mark_incomplete_call(&id("u"), &big);
+    let mut c = call("u", t(0), CallKind::Downloaded(1));
+    c.owner = big;
+    r.apply(ev(c));
+    assert!(r.get(&key("u")).expect("u").complete());
+}

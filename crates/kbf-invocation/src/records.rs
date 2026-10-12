@@ -12,7 +12,7 @@ use crate::event::{
 };
 use crate::record::{
     ActionRow, Attempt, AttemptEnd, How, Invocation, OUTPUTS_PER_ROW, REASON_CAP, ROW_CAP,
-    RecordKey, State, attempt_bytes, attempts_bytes, capped, output_bytes,
+    RecordKey, State, attempt_bytes, attempts_bytes, btree_entry_bytes, capped, output_bytes,
 };
 
 /// How many dropped calls of records not made yet [`Records`] remembers, so that the
@@ -20,9 +20,13 @@ use crate::record::{
 /// [`Records::mark_incomplete_call`]).
 const UNBORN_CAP: usize = 1024;
 
-/// What an operation's entry takes beside its attempts and waiters: the entry, its
-/// key and a B-tree node's share (estimated).
-const OPERATION_BYTES: usize = size_of::<Operation>() + size_of::<OperationId>() + 16;
+/// The share of the bound the dropped calls of records not made yet may hold besides
+/// it: one part in this many.
+const UNBORN_SHARE: usize = 16;
+
+/// What an operation's entry takes beside its attempts and waiters: its key and value's
+/// share of the operation map's nodes.
+const OPERATION_BYTES: usize = btree_entry_bytes(size_of::<OperationId>() + size_of::<Operation>());
 
 const HELD: &str = "every key Records hands out names a record it holds";
 
@@ -51,8 +55,16 @@ const HELD: &str = "every key Records hands out names a record it holds";
 ///    instance name, a later Execute's row) is not set. In every case but a row's,
 ///    the record says `complete: false`.
 ///
-/// What is not counted: the dropped calls of records not made yet, at most
-/// `UNBORN_CAP` (1,024) of an id (at most 128 bytes) and an owner each.
+/// **What a byte is**: what the allocator is asked for. The count follows the
+/// types' sizes, the row lists' capacity, every copy of an id, and B-tree nodes as
+/// estimated from the standard library's layout (`btree_bytes`). Not counted: the
+/// first node of each index (about 2 kB together), the spare capacity of the small
+/// lists (an id's keys, an owner's collisions, an operation's waiting calls), the
+/// allocator's own overhead per allocation, and the dropped calls of records not
+/// made yet, which are held to a sixteenth of the bound besides it (at most
+/// `UNBORN_CAP`, 1,024; past either the oldest is forgotten, and one that does not
+/// fit alone is not kept). Measured with a counting allocator (`tests/heap.rs`),
+/// the records' heap stays within 1.25 times the bound (at most 1.17 in its mixes).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Records {
     row_cap: usize,
@@ -63,7 +75,8 @@ pub struct Records {
     bytes: usize,
     /// The latest time an event carried.
     now: WallTime,
-    invocations: BTreeMap<RecordKey, Invocation>,
+    /// Boxed: a B-tree node has room for 11 values, and many are unused.
+    invocations: BTreeMap<RecordKey, Box<Invocation>>,
     /// Each id's record keys: the owner's first, then each collision in the order seen.
     ids: BTreeMap<InvocationId, Family>,
     operations: BTreeMap<OperationId, Operation>,
@@ -74,6 +87,8 @@ pub struct Records {
     /// Callers whose dropped call named no record yet: the record their next call
     /// makes starts incomplete. The oldest is forgotten past [`UNBORN_CAP`].
     unborn: VecDeque<(InvocationId, Owner)>,
+    /// What `unborn`'s ids and owners hold.
+    unborn_bytes: usize,
     /// Records removed for the bound.
     evicted: u64,
 }
@@ -167,6 +182,7 @@ impl Records {
             by_seen: BTreeSet::new(),
             minted_by_seen: BTreeSet::new(),
             unborn: VecDeque::new(),
+            unborn_bytes: 0,
             evicted: 0,
         }
     }
@@ -174,12 +190,12 @@ impl Records {
     /// The record under `key`.
     #[must_use]
     pub fn get(&self, key: &RecordKey) -> Option<&Invocation> {
-        self.invocations.get(key)
+        self.invocations.get(key).map(|inv| &**inv)
     }
 
     /// The record under `key`, to mark it incomplete.
     pub fn get_mut(&mut self, key: &RecordKey) -> Option<&mut Invocation> {
-        self.invocations.get_mut(key)
+        self.invocations.get_mut(key).map(|inv| &mut **inv)
     }
 
     /// Every record's key, in key order.
@@ -251,6 +267,8 @@ impl Records {
                     // Making room may have removed every record waiting on it.
                     if let Some(op) = self.operations.get_mut(&operation) {
                         if fits {
+                            // Allocated to its length: the bound counts lengths.
+                            op.attempts.reserve_exact(1);
                             op.attempts.push(attempt);
                             self.recount_operation(operation);
                         } else {
@@ -297,10 +315,24 @@ impl Records {
         match self.find(id, owner) {
             Some(key) => self.record(&key).mark_incomplete(),
             None => {
-                if self.unborn.len() == UNBORN_CAP {
-                    self.unborn.pop_front();
+                let held = id.as_str().len() + owner.0.len();
+                // The oldest is forgotten until the new one fits; one that does not fit
+                // alone is not kept.
+                loop {
+                    let slots = self.unborn.capacity().max(self.unborn.len() + 1);
+                    let bytes = slots * size_of::<(InvocationId, Owner)>() + self.unborn_bytes;
+                    if self.unborn.len() < UNBORN_CAP && bytes + held <= self.bound / UNBORN_SHARE {
+                        break;
+                    }
+                    let Some((id, owner)) = self.unborn.pop_front() else {
+                        return;
+                    };
+                    self.unborn_bytes -= id.as_str().len() + owner.0.len();
                 }
+                // Allocated to its length, so that its slots stay within the share.
+                self.unborn.reserve_exact(1);
                 self.unborn.push_back((id.clone(), owner.clone()));
+                self.unborn_bytes += held;
             }
         }
     }
@@ -382,13 +414,15 @@ impl Records {
             .position(|(id, owner)| *id == call.id && *owner == call.owner)
         {
             self.unborn.remove(i);
+            // The entry is equal to the call's id and owner.
+            self.unborn_bytes -= call.id.as_str().len() + call.owner.0.len();
             inv.mark_incomplete();
         }
         self.by_seen.insert((inv.indexed, key.clone()));
         if inv.minted {
             self.minted_by_seen.insert((inv.indexed, key.clone()));
         }
-        self.invocations.insert(key.clone(), inv);
+        self.invocations.insert(key.clone(), Box::new(inv));
         self.recount(&key);
         Some(key)
     }
@@ -510,7 +544,8 @@ impl Records {
     /// record marked `rows_capped`.
     fn add_row(&mut self, key: &RecordKey, row: ActionRow) -> Option<usize> {
         let cap = self.row_cap;
-        if !self.record(key).takes_rows(cap) || !self.make_room(Some(key), row.cost()) {
+        let cost = self.record(key).row_cost(&row);
+        if !self.record(key).takes_rows(cap) || !self.make_room(Some(key), cost) {
             self.record(key).rows_capped = true;
             return None;
         }
@@ -555,7 +590,8 @@ impl Records {
         if let Some(text) = outcome.text_mut()
             && !self.make_room(Some(key), text.len())
         {
-            text.clear();
+            // Cleared, a string would keep its allocation.
+            *text = String::new();
             self.record(key).mark_incomplete();
         }
         let inv = self.record(key);
@@ -736,6 +772,8 @@ impl Records {
             let mut freed = 0;
             self.operations.retain(|_, op| {
                 op.waiters.retain(|w| w.key != *key);
+                // Give back what the removed calls took.
+                op.waiters.shrink_to_fit();
                 let left = if op.waiters.is_empty() { 0 } else { op.bytes() };
                 freed += op.counted - left;
                 op.counted = left;

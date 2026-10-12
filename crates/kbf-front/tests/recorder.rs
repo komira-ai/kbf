@@ -371,6 +371,32 @@ async fn events_past_the_channel_bytes_are_dropped() {
     task.abort();
 }
 
+/// Catches the bytes of an event dropped on a full channel kept in the channel's
+/// byte count (plant: no `fetch_sub` on `TrySendError::Full` in `Recorder::emit`):
+/// with one event's place, small events dropped for want of a place would fill the
+/// byte count, and once the task has applied the one queued, a wide finish that
+/// fits the empty channel would be dropped for bytes.
+#[tokio::test]
+async fn an_event_dropped_on_a_full_channel_gives_its_bytes_back() {
+    let wide = || finished_listing(800);
+    let (recorder, recording) = Recorder::new(2 * wide().bytes(), 1);
+    for _ in 0..1000 {
+        recorder.emit(finished_listing(1));
+    }
+    assert_eq!((recorder.sent(), recorder.dropped()), (1, 999), "one place");
+    let task = tokio::spawn(recording.run());
+    tokio::time::timeout(NO_WAIT, recorder.caught_up())
+        .await
+        .expect("the task applies the queued event");
+    recorder.emit(wide());
+    assert_eq!(
+        (recorder.sent(), recorder.dropped()),
+        (2, 999),
+        "the channel is empty"
+    );
+    task.abort();
+}
+
 /// Catches an event listing sent uncut (plant `outputs.collect()` without `take`): a
 /// result with 1,500 output files and 10 directories lists one output past the row's
 /// 1,000, so the row still says `outputs_truncated`, files first.
