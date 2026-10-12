@@ -106,7 +106,6 @@ pub const LEASE_PARAM: &str = "KBF_LEASE";
 pub const BASE_PROFILE: &str = "(version 1)\n\
 (allow default)\n\
 (deny job-creation)\n\
-(deny lsopen)\n\
 (deny user-preference-write)\n\
 (deny file-write*)\n\
 (allow file-write* (subpath (param \"KBF_LEASE\")) (subpath \"/dev\"))\n";
@@ -116,7 +115,6 @@ pub const BASE_PROFILE: &str = "(version 1)\n\
 pub const NO_NETWORK_PROFILE: &str = "(version 1)\n\
 (allow default)\n\
 (deny job-creation)\n\
-(deny lsopen)\n\
 (deny user-preference-write)\n\
 (deny file-write*)\n\
 (allow file-write* (subpath (param \"KBF_LEASE\")) (subpath \"/dev\"))\n\
