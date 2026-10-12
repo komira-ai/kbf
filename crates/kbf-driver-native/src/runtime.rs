@@ -140,11 +140,12 @@ impl<C: Cas> NativeRuntime<C> {
         // the simulators every lease left are deleted from it before it is removed.
         let swept = std::cell::Cell::new(false);
         let remove_left = |path: &Path| {
-            if simulator::marked(path)
-                && !swept.replace(true)
-                && let Err(why) = simctl.sweep(path)
-            {
-                tracing::error!(dir = %path.display(), "simulators left behind: {why}");
+            if simulator::marked(path) && !swept.replace(true) {
+                // One that cannot be named by its real path cannot be removed either.
+                let real = std::fs::canonicalize(path)?;
+                if let Err(why) = simctl.sweep(&real) {
+                    tracing::error!(dir = %path.display(), "simulators left behind: {why}");
+                }
             }
             remove(path)
         };
@@ -643,6 +644,10 @@ async fn create_simulator(
         udid: None,
     };
     *made_in(slot) = Some(made.clone());
+    let marker = prepared.lease.join(simulator::MARKER);
+    tokio::fs::write(&marker, b"")
+        .await
+        .map_err(failed(&marker))?;
     let mut kept = made.clone();
     let simctl = Arc::clone(simctl);
     let developer_dir = prepared.developer_dir.clone();

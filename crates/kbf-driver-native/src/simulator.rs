@@ -169,16 +169,14 @@ impl Simctl {
         }
     }
 
-    /// Writes [`MARKER`] in `made.lease`, then makes a new simulator named
-    /// `made.name`; its UDID.
+    /// Makes a new simulator named `made.name`; its UDID. The caller has written
+    /// [`MARKER`] in `made.lease`.
     pub(crate) fn create(
         &self,
         made: &Made,
         request: &Request,
         developer_dir: Option<&Path>,
     ) -> Result<String, String> {
-        let marker = made.lease.join(MARKER);
-        at(&marker, std::fs::write(&marker, b""))?;
         let args = ["create", &made.name, &request.device_type, &request.runtime];
         let out = self.run(&made.lease, developer_dir, &args)?;
         let printed = String::from_utf8_lossy(&out.stdout);
@@ -216,16 +214,16 @@ impl Simctl {
     }
 
     /// Shuts down and deletes every device whose name starts with [`NAME_PREFIX`],
-    /// running `simctl` in the lease directory `lease` a killed daemon left; why the
+    /// running `simctl` in the lease directory `lease` (a real path) a killed daemon
+    /// left; why the
     /// listing or each delete that failed did. The start after a killed daemon left a
     /// lease that may have made one.
     pub(crate) fn sweep(&self, lease: &Path) -> Result<(), String> {
-        let lease = at(lease, std::fs::canonicalize(lease))?;
-        let udids: Vec<String> = (self.devices(&lease)?.into_iter())
+        let udids: Vec<String> = (self.devices(lease)?.into_iter())
             .filter(|(name, _)| name.starts_with(NAME_PREFIX))
             .map(|(_, udid)| udid)
             .collect();
-        let failed = self.delete(&lease, &udids);
+        let failed = self.delete(lease, &udids);
         if failed.is_empty() {
             Ok(())
         } else {
@@ -282,11 +280,6 @@ fn devices_in(json: &[u8]) -> Result<Vec<(String, String)>, String> {
 /// without following a link.
 pub(crate) fn marked(lease: &Path) -> bool {
     std::fs::symlink_metadata(lease.join(MARKER)).is_ok_and(|m| m.file_type().is_file())
-}
-
-/// `result`, its error said with the `path` it is about.
-fn at<T>(path: &Path, result: std::io::Result<T>) -> Result<T, String> {
-    result.map_err(|e| format!("{}: {e}", path.display()))
 }
 
 /// Whether `text` is a UDID as `simctl` prints one: 8-4-4-4-12 hexadecimal digits.
