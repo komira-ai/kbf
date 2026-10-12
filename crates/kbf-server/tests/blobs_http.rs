@@ -527,3 +527,41 @@ async fn each_read_is_a_touch() {
     assert_eq!(missing, [unread]);
     server.stop().await;
 }
+
+/// Catches (mutant "authorize after the read"): a caller the authorizer refuses
+/// learning whether a blob is held (`404` for an absent one, `403` for a present one),
+/// or keeping a blob alive by asking for it. Both asks are `403`, and the asked-for
+/// blob is collected on day 10 as if nobody had asked; its neighbour, read on day 5 by
+/// a caller the authorizer allows, survives, so the collection does see a touch.
+#[tokio::test]
+async fn a_refused_caller_learns_nothing_and_touches_nothing() {
+    let server = Server::with(
+        r#"{"authenticationPolicy": {"allow": {}},
+            "blobs": {"getAuthorizer": {"instanceNamePrefix": {"allowedInstanceNamePrefixes": ["ci"]}}}}"#,
+    );
+    let asked = server
+        .store(b"asked for by a refused caller".to_vec())
+        .await;
+    let read = server.store(b"read by an allowed caller".to_vec()).await;
+    let absent = Digest::new(kbf_types::DigestFunction::Sha256, [9; 32], 7);
+    server.cache.tick(days(5)).await.expect("tick");
+    for digest in [absent, asked] {
+        let answer = server
+            .get(&format!("{}?instance=other", path(&digest)), "")
+            .await;
+        assert_eq!(answer.code, 403, "{digest}: {}", answer.head);
+    }
+    let allowed = server
+        .get(&format!("{}?instance=ci", path(&read)), "")
+        .await;
+    assert_eq!(allowed.code, 200, "{}", allowed.head);
+    server.cache.tick(days(10)).await.expect("tick");
+    server.cache.collect().await.expect("collect");
+    let missing = server
+        .cache
+        .find_missing(&[asked, read])
+        .await
+        .expect("find");
+    assert_eq!(missing, [asked], "the refused ask touched the blob");
+    server.stop().await;
+}
