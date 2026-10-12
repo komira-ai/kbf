@@ -4,9 +4,9 @@ use std::rc::Rc;
 use serde_json::{Value, json};
 
 use super::*;
-use crate::plan::{Mode, RunAs, execute};
-use crate::step::Step;
-use crate::testkit::{Answer, FakeExec, reply};
+use kbf_host::plan::{Mode, RunAs, execute};
+use kbf_host::step::Step;
+use kbf_host::testkit::{Answer, FakeExec, reply};
 
 const KUBECTL: &str = "/usr/local/bin/kubectl";
 const KUBECONFIG: &str = "/srv/admin/kubeconfig";

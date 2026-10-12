@@ -97,6 +97,7 @@ impl Harness {
             self.feed(Event::WorkerUp {
                 worker,
                 instance: DaemonInstance::new(instance),
+                predecessor_stopped: false,
                 capacity,
                 caps: caps(),
             })

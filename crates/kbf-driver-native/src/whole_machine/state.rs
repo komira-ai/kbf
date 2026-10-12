@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 
 use kbf_daemon::RuntimeError;
 use kbf_proto::reapi::ActionResult;
-use kbf_types::LeaseId;
+use kbf_types::{LeaseId, LostWhy};
 use prost::Message as _;
 
 /// The lease record's file name in the runtime's directory.
@@ -29,7 +29,7 @@ pub enum Step {
     Preparing,
     /// Its action was handed to the helper's `run` and has not ended: a daemon that
     /// restarts here finds the action's result lost, kills the lease user's processes
-    /// and fails the lease, never running the action again.
+    /// and reports the lease lost, never running the action again itself.
     Started,
     /// Its action ended (the outcome is kept); the node is being cleaned.
     Restoring,
@@ -103,6 +103,12 @@ impl Record {
                 Err(RuntimeError::Killed) => ("killed", Vec::new()),
                 Err(RuntimeError::Invalid(why)) => ("invalid", why.as_bytes().to_vec()),
                 Err(RuntimeError::MissingBlob(blob)) => ("missing", blob.as_bytes().to_vec()),
+                Err(RuntimeError::Lost(LostWhy::DaemonRestarted, why)) => {
+                    ("lost-restarted", why.as_bytes().to_vec())
+                }
+                Err(RuntimeError::Lost(LostWhy::Fenced, why)) => {
+                    ("lost-fenced", why.as_bytes().to_vec())
+                }
                 Err(other) => ("failed", other.to_string().into_bytes()),
             };
             text.push_str(&format!("outcome {tag} {}\n", hex(&bytes)));
@@ -175,6 +181,8 @@ fn decode_outcome(value: &str) -> Result<Result<ActionResult, RuntimeError>, Str
         "invalid" => Err(RuntimeError::Invalid(text())),
         "missing" => Err(RuntimeError::MissingBlob(text())),
         "failed" => Err(RuntimeError::Failed(text())),
+        "lost-restarted" => Err(RuntimeError::Lost(LostWhy::DaemonRestarted, text())),
+        "lost-fenced" => Err(RuntimeError::Lost(LostWhy::Fenced, text())),
         other => return Err(format!("outcome {other:?} is unknown")),
     })
 }
@@ -307,6 +315,14 @@ mod tests {
             Some(Err(RuntimeError::Invalid("bad\npath".to_owned()))),
             Some(Err(RuntimeError::MissingBlob("ab/3".to_owned()))),
             Some(Err(RuntimeError::Failed("no session".to_owned()))),
+            Some(Err(RuntimeError::Lost(
+                LostWhy::DaemonRestarted,
+                "its result is lost".to_owned(),
+            ))),
+            Some(Err(RuntimeError::Lost(
+                LostWhy::Fenced,
+                "fenced".to_owned(),
+            ))),
         ];
         for (i, outcome) in outcomes.drain(..).enumerate() {
             record.step = [Step::Preparing, Step::Started, Step::Restoring][i % 3];

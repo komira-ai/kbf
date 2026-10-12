@@ -1,6 +1,8 @@
 //! The accounts: the one administrator, the daemon's role account, and auto-login.
 
-use crate::items::{Ctx, Outcome, defaults_read, fail, or, pass};
+use std::io;
+
+use crate::items::{Ctx, DEFAULTS, Lines, Outcome, defaults_read, fail, or, pass, run};
 
 const DSCL: &str = "/usr/bin/dscl";
 const DSEDITGROUP: &str = "/usr/sbin/dseditgroup";
@@ -192,4 +194,48 @@ pub(crate) fn autologin(c: &Ctx<'_>) -> Outcome {
         or(&uid, "none"),
         c.profile.get("lease_uids")
     ))
+}
+
+/// Makes the role account and its group, unless another user or group holds the role
+/// id: the id, no shell, home `/var/empty`, hidden, `Password` `*` and no
+/// `AuthenticationAuthority`.
+pub(crate) fn fix_role_user(c: &Ctx<'_>, out: &mut Lines) -> io::Result<()> {
+    if role_id_taken(c).is_some() {
+        return Ok(());
+    }
+    let role = c.value();
+    let id = c.profile.role_id.to_string();
+    let group = format!("/Groups/{role}");
+    let user = format!("/Users/{role}");
+    run(c, DSCL, &[".", "-create", &group]);
+    run(c, DSCL, &[".", "-create", &group, "PrimaryGroupID", &id]);
+    run(c, DSCL, &[".", "-create", &group, "Password", "*"]);
+    run(c, DSCL, &[".", "-create", &user]);
+    for (attr, value) in [
+        ("UniqueID", id.as_str()),
+        ("PrimaryGroupID", id.as_str()),
+        ("UserShell", "/usr/bin/false"),
+        ("NFSHomeDirectory", "/var/empty"),
+        ("IsHidden", "1"),
+        ("Password", "*"),
+    ] {
+        run(c, DSCL, &[".", "-create", &user, attr, value]);
+    }
+    run(c, DSCL, &[".", "-delete", &user, "AuthenticationAuthority"]);
+    out.change(c.key, format!("role account and group {role}, id {id}"));
+    Ok(())
+}
+
+/// Clears auto-login and removes `/etc/kcpassword`, whichever is there.
+pub(crate) fn fix_autologin(c: &Ctx<'_>, out: &mut Lines) -> io::Result<()> {
+    if !defaults_read(c, LOGINWINDOW, "autoLoginUser").is_empty() {
+        let domain = c.mac.path(LOGINWINDOW);
+        run(c, DEFAULTS, &["delete", &domain, "autoLoginUser"]);
+        out.change(c.key, "auto-login cleared");
+    }
+    if c.mac.lstat(KCPASSWORD).is_some() {
+        c.mac.remove(KCPASSWORD)?;
+        out.change(c.key, "removed /etc/kcpassword");
+    }
+    Ok(())
 }

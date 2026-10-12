@@ -1,11 +1,15 @@
-//! The script's `t_drift` cases, check part: on a converged fake Mac, each drift
-//! fails exactly its item, and the FAIL line says what drifted.
+//! The script's `t_drift` cases: on a converged fake Mac, each drift fails exactly its
+//! item, and the FAIL line says what drifted; then `apply` fixes it, or leaves it and
+//! changes nothing.
 
 mod support;
 
 use std::fs;
 
-use support::{DROPIN, ERR_LOG, FakeMac, INTENT, LOGINWINDOW, PLIST, SOFTWARE_UPDATE, only_fails};
+use support::{
+    COMMERCE, DROPIN, ERR_LOG, FakeMac, INTENT, LOGINWINDOW, PLIST, SOFTWARE_UPDATE, apply, check,
+    lines, only_fails,
+};
 
 type Drift = (&'static str, &'static str, fn(&mut FakeMac), &'static str);
 
@@ -15,7 +19,7 @@ const DRIFTS: &[Drift] = &[
         "macos_version",
         "another version",
         |m| {
-            m.state.sw_vers.insert("version", "27.0.2".into());
+            m.state_mut().sw_vers.insert("version", "27.0.2".into());
         },
         "[check only: apply does not change this]",
     ),
@@ -23,7 +27,7 @@ const DRIFTS: &[Drift] = &[
         "macos_build",
         "another build",
         |m| {
-            m.state.sw_vers.insert("build", "26A001".into());
+            m.state_mut().sw_vers.insert("build", "26A001".into());
         },
         "build 26A001, the profile pins 26A000",
     ),
@@ -31,7 +35,9 @@ const DRIFTS: &[Drift] = &[
         "hostname",
         "ComputerName",
         |m| {
-            m.state.scutil.insert("ComputerName".into(), "other".into());
+            m.state_mut()
+                .scutil
+                .insert("ComputerName".into(), "other".into());
         },
         "found ComputerName=other",
     ),
@@ -39,7 +45,7 @@ const DRIFTS: &[Drift] = &[
         "admin_user",
         "a listed administrator",
         |m| {
-            m.state.attr(
+            m.state_mut().attr(
                 "/Groups/admin",
                 "GroupMembership",
                 "root farmadmin intruder",
@@ -50,14 +56,17 @@ const DRIFTS: &[Drift] = &[
     (
         "admin_user",
         "not in the group",
-        |m| m.state.attr("/Groups/admin", "GroupMembership", "root"),
+        |m| {
+            m.state_mut()
+                .attr("/Groups/admin", "GroupMembership", "root")
+        },
         "farmadmin is not in the admin group",
     ),
     (
         "admin_user",
         "no account",
         |m| {
-            m.state.remove_user("farmadmin");
+            m.state_mut().remove_user("farmadmin");
         },
         "no account farmadmin",
     ),
@@ -65,28 +74,28 @@ const DRIFTS: &[Drift] = &[
         "admin_user",
         "an administrator by primary group",
         |m| {
-            m.state.user("hidden", 502);
-            m.state.user_attr("hidden", "PrimaryGroupID", "80");
+            m.state_mut().user("hidden", 502);
+            m.state_mut().user_attr("hidden", "PrimaryGroupID", "80");
         },
         "other administrators: hidden",
     ),
     (
         "role_user",
         "a shell",
-        |m| m.state.user_attr("_kbf", "UserShell", "/bin/zsh"),
+        |m| m.state_mut().user_attr("_kbf", "UserShell", "/bin/zsh"),
         "UserShell=/bin/zsh",
     ),
     (
         "role_user",
         "a password",
-        |m| m.state.user_attr("_kbf", "Password", "********"),
+        |m| m.state_mut().user_attr("_kbf", "Password", "********"),
         "Password=********",
     ),
     (
         "role_user",
         "a password hash",
         |m| {
-            m.state.user_attr(
+            m.state_mut().user_attr(
                 "_kbf",
                 "AuthenticationAuthority",
                 ";ShadowHash;HASHLIST:<SALTED-SHA512-PBKDF2>",
@@ -97,56 +106,56 @@ const DRIFTS: &[Drift] = &[
     (
         "role_user",
         "a user with the id",
-        |m| m.state.user("other", 480),
+        |m| m.state_mut().user("other", 480),
         "uid 480 belongs to other",
     ),
     (
         "role_user",
         "a group with the id",
-        |m| m.state.attr("/Groups/other", "PrimaryGroupID", "480"),
+        |m| m.state_mut().attr("/Groups/other", "PrimaryGroupID", "480"),
         "gid 480 belongs to other",
     ),
     (
         "power_sleep",
         "sleep on",
-        |m| m.state.pmset_set("sleep", "1"),
+        |m| m.state_mut().pmset_set("sleep", "1"),
         "sleep is 1, want 0",
     ),
     (
         "power_standby",
         "standby on",
-        |m| m.state.pmset_set("standby", "1"),
+        |m| m.state_mut().pmset_set("standby", "1"),
         "standby is 1, want 0",
     ),
     (
         "power_powernap",
         "power nap on",
-        |m| m.state.pmset_set("powernap", "1"),
+        |m| m.state_mut().pmset_set("powernap", "1"),
         "powernap is 1, want 0",
     ),
     (
         "power_autorestart",
         "no restart",
-        |m| m.state.pmset_set("autorestart", "0"),
+        |m| m.state_mut().pmset_set("autorestart", "0"),
         "autorestart is 0, want 1",
     ),
     (
         "power_womp",
         "no wake on LAN",
-        |m| m.state.pmset_set("womp", "0"),
+        |m| m.state_mut().pmset_set("womp", "0"),
         "womp is 0, want 1",
     ),
     (
         "power_sleep",
         "not reported",
-        |m| m.state.pmset.retain(|(k, _)| k != "sleep"),
+        |m| m.state_mut().pmset.retain(|(k, _)| k != "sleep"),
         "sleep is not reported",
     ),
     (
         "updates_auto_download",
         "downloads",
         |m| {
-            m.state
+            m.state_mut()
                 .default_set(SOFTWARE_UPDATE, "AutomaticDownload", "1")
         },
         "AutomaticDownload is 1, want 0",
@@ -155,7 +164,7 @@ const DRIFTS: &[Drift] = &[
         "updates_auto_install_macos",
         "installs macOS",
         |m| {
-            m.state
+            m.state_mut()
                 .default_set(SOFTWARE_UPDATE, "AutomaticallyInstallMacOSUpdates", "1")
         },
         "AutomaticallyInstallMacOSUpdates is 1",
@@ -164,7 +173,7 @@ const DRIFTS: &[Drift] = &[
         "updates_auto_install_security",
         "installs security updates",
         |m| {
-            m.state
+            m.state_mut()
                 .default_set(SOFTWARE_UPDATE, "CriticalUpdateInstall", "1")
         },
         "CriticalUpdateInstall is 1",
@@ -173,7 +182,7 @@ const DRIFTS: &[Drift] = &[
         "updates_config_data",
         "no config data",
         |m| {
-            m.state
+            m.state_mut()
                 .default_set(SOFTWARE_UPDATE, "ConfigDataInstall", "0")
         },
         "ConfigDataInstall is 0",
@@ -182,16 +191,22 @@ const DRIFTS: &[Drift] = &[
         "appstore_auto_update",
         "App Store updates",
         |m| {
-            m.state
+            m.state_mut()
                 .default_set(SOFTWARE_UPDATE, "AutomaticallyInstallAppUpdates", "1")
         },
         "AutomaticallyInstallAppUpdates is 1",
     ),
     (
+        "appstore_auto_update",
+        "the older App Store switch",
+        |m| m.state_mut().default_set(COMMERCE, "AutoUpdate", "1"),
+        "com.apple.commerce AutoUpdate is 1, want 0",
+    ),
+    (
         "updates_auto_download",
         "unset",
         |m| {
-            m.state
+            m.state_mut()
                 .defaults
                 .remove(&(SOFTWARE_UPDATE.into(), "AutomaticDownload".into()));
         },
@@ -200,7 +215,7 @@ const DRIFTS: &[Drift] = &[
     (
         "remote_login",
         "off",
-        |m| m.state.remote_login = false,
+        |m| m.state_mut().remote_login = false,
         "want Remote Login: On, found Remote Login: Off",
     ),
     (
@@ -264,7 +279,7 @@ const DRIFTS: &[Drift] = &[
         "ssh_password_auth",
         "what sshd -T reports",
         |m| {
-            m.state.sshd_effective = Some(
+            m.state_mut().sshd_effective = Some(
                 "passwordauthentication yes\nkbdinteractiveauthentication no\npermitrootlogin no\n"
                     .into(),
             )
@@ -274,32 +289,32 @@ const DRIFTS: &[Drift] = &[
     (
         "firewall",
         "off",
-        |m| m.state.firewall = "0".into(),
+        |m| m.state_mut().firewall = "0".into(),
         "firewall off, want on",
     ),
     (
         "firewall",
         "no answer",
-        |m| m.state.firewall = "broken".into(),
+        |m| m.state_mut().firewall = "broken".into(),
         "firewall unknown, want on",
     ),
     (
         "filevault",
         "on",
-        |m| m.state.filevault = "On".into(),
+        |m| m.state_mut().filevault = "On".into(),
         "FileVault on, want off [check only",
     ),
     (
         "filevault",
         "decrypting",
-        |m| m.state.filevault = "Decrypting".into(),
+        |m| m.state_mut().filevault = "Decrypting".into(),
         "FileVault unknown (FileVault is Decrypting.)",
     ),
     (
         "autologin",
         "an administrator with kcpassword",
         |m| {
-            m.state
+            m.state_mut()
                 .default_set(LOGINWINDOW, "autoLoginUser", "farmadmin");
             m.write("/etc/kcpassword", "x");
         },
@@ -309,7 +324,7 @@ const DRIFTS: &[Drift] = &[
         "autologin",
         "an administrator",
         |m| {
-            m.state
+            m.state_mut()
                 .default_set(LOGINWINDOW, "autoLoginUser", "farmadmin")
         },
         "auto-login is farmadmin",
@@ -324,9 +339,9 @@ const DRIFTS: &[Drift] = &[
         "autologin",
         "a lease user out of range",
         |m| {
-            m.state.user("kbf-lease-9-9", 700);
+            m.state_mut().user("kbf-lease-9-9", 700);
             m.write(INTENT, "9.9\n");
-            m.state
+            m.state_mut()
                 .default_set(LOGINWINDOW, "autoLoginUser", "kbf-lease-9-9");
         },
         "auto-login is kbf-lease-9-9 (uid 700)",
@@ -335,8 +350,8 @@ const DRIFTS: &[Drift] = &[
         "autologin",
         "a lease user left behind",
         |m| {
-            m.state.user("kbf-lease-4-2", 642);
-            m.state
+            m.state_mut().user("kbf-lease-4-2", 642);
+            m.state_mut()
                 .default_set(LOGINWINDOW, "autoLoginUser", "kbf-lease-4-2");
             m.write("/etc/kcpassword", "x");
         },
@@ -346,9 +361,9 @@ const DRIFTS: &[Drift] = &[
         "autologin",
         "an intent record for another lease",
         |m| {
-            m.state.user("kbf-lease-4-2", 642);
+            m.state_mut().user("kbf-lease-4-2", 642);
             m.write(INTENT, "4.3\n");
-            m.state
+            m.state_mut()
                 .default_set(LOGINWINDOW, "autoLoginUser", "kbf-lease-4-2");
         },
         "a lease user left behind",
@@ -357,9 +372,9 @@ const DRIFTS: &[Drift] = &[
         "autologin",
         "an intent record of two lines",
         |m| {
-            m.state.user("kbf-lease-4-2", 642);
+            m.state_mut().user("kbf-lease-4-2", 642);
             m.write(INTENT, "4.2\n4.3\n");
-            m.state
+            m.state_mut()
                 .default_set(LOGINWINDOW, "autoLoginUser", "kbf-lease-4-2");
         },
         "a lease user left behind",
@@ -368,9 +383,9 @@ const DRIFTS: &[Drift] = &[
         "autologin",
         "an intent record with a leading zero",
         |m| {
-            m.state.user("kbf-lease-4-2", 642);
+            m.state_mut().user("kbf-lease-4-2", 642);
             m.write(INTENT, "04.2\n");
-            m.state
+            m.state_mut()
                 .default_set(LOGINWINDOW, "autoLoginUser", "kbf-lease-4-2");
         },
         "a lease user left behind",
@@ -379,11 +394,11 @@ const DRIFTS: &[Drift] = &[
         "autologin",
         "an intent record that is a link",
         |m| {
-            m.state.user("kbf-lease-4-2", 642);
+            m.state_mut().user("kbf-lease-4-2", 642);
             let target = m.path("/var/db/elsewhere");
             fs::write(&target, "4.2\n").unwrap();
             m.symlink(&target, INTENT);
-            m.state
+            m.state_mut()
                 .default_set(LOGINWINDOW, "autoLoginUser", "kbf-lease-4-2");
         },
         "a lease user left behind",
@@ -392,8 +407,9 @@ const DRIFTS: &[Drift] = &[
         "autologin",
         "a user in range not named kbf-lease-*",
         |m| {
-            m.state.user("lease9", 650);
-            m.state.default_set(LOGINWINDOW, "autoLoginUser", "lease9");
+            m.state_mut().user("lease9", 650);
+            m.state_mut()
+                .default_set(LOGINWINDOW, "autoLoginUser", "lease9");
         },
         "auto-login is lease9 (uid 650)",
     ),
@@ -401,7 +417,7 @@ const DRIFTS: &[Drift] = &[
         "autologin",
         "a lease user with no record",
         |m| {
-            m.state
+            m.state_mut()
                 .default_set(LOGINWINDOW, "autoLoginUser", "kbf-lease-gone")
         },
         "auto-login is kbf-lease-gone (uid none)",
@@ -409,31 +425,31 @@ const DRIFTS: &[Drift] = &[
     (
         "time_server",
         "network time off",
-        |m| m.state.network_time = false,
+        |m| m.state_mut().network_time = false,
         "network time is not on (Network Time: Off)",
     ),
     (
         "time_server",
         "another server",
-        |m| m.state.time_server = "time.apple.com".into(),
+        |m| m.state_mut().time_server = "time.apple.com".into(),
         "want time.example.net, found Network Time Server: time.apple.com",
     ),
     (
         "time_max_offset_ms",
         "1.5 s fast",
-        |m| m.state.sntp_offset = "+1.500000".into(),
+        |m| m.state_mut().sntp_offset = "+1.500000".into(),
         "1500 ms from time.example.net, more than 250",
     ),
     (
         "time_max_offset_ms",
         "0.9 s slow",
-        |m| m.state.sntp_offset = "-0.900000".into(),
+        |m| m.state_mut().sntp_offset = "-0.900000".into(),
         "900 ms from time.example.net, more than 250",
     ),
     (
         "time_max_offset_ms",
         "no answer",
-        |m| m.state.sntp_offset = "fail".into(),
+        |m| m.state_mut().sntp_offset = "fail".into(),
         "no answer from time.example.net",
     ),
     (
@@ -457,13 +473,16 @@ const DRIFTS: &[Drift] = &[
     (
         "default_developer_dir",
         "another Xcode",
-        |m| m.state.xcode_select = Some("/Applications/Xcode-26.6.app/Contents/Developer".into()),
+        |m| {
+            m.state_mut().xcode_select =
+                Some("/Applications/Xcode-26.6.app/Contents/Developer".into())
+        },
         "xcode-select -p is /Applications/Xcode-26.6.app/Contents/Developer, want /Applications/Xcode-27.0.app/Contents/Developer",
     ),
     (
         "default_developer_dir",
         "unset",
-        |m| m.state.xcode_select = None,
+        |m| m.state_mut().xcode_select = None,
         "xcode-select -p is unset",
     ),
     (
@@ -550,7 +569,7 @@ const DRIFTS: &[Drift] = &[
         "launchd_label",
         "the job not loaded",
         |m| {
-            m.state.loaded.clear();
+            m.state_mut().loaded.clear();
         },
         "system/org.example.kbf-daemon is not loaded",
     ),
@@ -567,6 +586,60 @@ fn each_drift_fails_exactly_its_item() {
             only_fails(&format!("drift-{n}"), item, *drift, text)
                 .err()
                 .map(|e| format!("{item} ({what}): {e}"))
+        })
+        .collect();
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// The drifts of items that are not check only which `apply` leaves: an id another
+/// account holds, and an sshd configuration that is the operator's to change (`apply`
+/// writes only kbf's drop-in).
+const STAYS: &[(&str, &str)] = &[
+    ("role_user", "a user with the id"),
+    ("role_user", "a group with the id"),
+    ("ssh_password_auth", "no Include line"),
+    ("ssh_password_auth", "an earlier drop-in"),
+    ("ssh_password_auth", "a keyword before Include"),
+    ("ssh_password_auth", "a Keyword=value before Include"),
+    ("ssh_password_auth", "what sshd -T reports"),
+];
+
+/// Catches: a drift `apply` does not fix (no CHANGE line for it, or check still fails
+/// after it), a fix that breaks another item, a check only item `apply` changes (the
+/// script's mutant "apply turns FileVault off"), an apply that exits 0 while an item
+/// still fails ("apply exits 0 when something still fails"), and a drift apply should
+/// leave that it changes (the script's `t_drift`, apply part).
+#[test]
+fn apply_fixes_each_drift_or_leaves_it_and_changes_nothing() {
+    assert!(
+        STAYS
+            .iter()
+            .all(|s| DRIFTS.iter().any(|(i, w, ..)| (*i, *w) == *s))
+    );
+    let wrong: Vec<String> = DRIFTS
+        .iter()
+        .enumerate()
+        .filter_map(|(n, (item, what, drift, _))| {
+            let mut mac = FakeMac::converged(&format!("apply-drift-{n}"));
+            drift(&mut mac);
+            mac.log.borrow_mut().clear();
+            let r = apply(&mac);
+            let check_only = kbf_mac_provision::items::ITEMS
+                .iter()
+                .any(|i| i.key == *item && i.check_only());
+            let stays = check_only || STAYS.contains(&(item, what));
+            let ok = if stays {
+                let failed = lines(&r, "FAIL");
+                r.failed == 1
+                    && failed.len() == 1
+                    && failed[0].starts_with(&format!("FAIL {item}: "))
+                    && mac.writes().is_empty()
+            } else {
+                r.failed == 0
+                    && r.text.contains(&format!("CHANGE {item}: "))
+                    && check(&mac).failed == 0
+            };
+            (!ok).then(|| format!("{item} ({what}, stays: {stays}):\n{}", r.text))
         })
         .collect();
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));

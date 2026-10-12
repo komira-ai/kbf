@@ -28,10 +28,10 @@ use super::config::LinuxConfig;
 use super::host::{
     self, CHMOD, DF, FALLOCATE, FINDMNT, HostError, MKSWAP, SWAPOFF, SWAPON, note, tool,
 };
-use crate::exec::{Entry, Exec, Kind};
-use crate::path::HostPath;
-use crate::plan::{Mode, Plan, Planner, RunAs, execute};
-use crate::step::{Cmd, Perms};
+use kbf_host::exec::{Entry, Exec, Kind};
+use kbf_host::path::HostPath;
+use kbf_host::plan::{Mode, Plan, Planner, RunAs, execute};
+use kbf_host::step::{Cmd, Perms};
 
 /// The units whose kubelet refuses to start with swap on.
 pub const KUBELETS: [&str; 5] = [
@@ -178,7 +178,7 @@ pub fn run<E: Exec>(
 fn fstab_now<E: Exec>(
     exec: &E,
     fstab: &HostPath,
-) -> Result<(Perms, Option<crate::step::Owner>, String), HostError> {
+) -> Result<(Perms, Option<kbf_host::step::Owner>, String), HostError> {
     match host::inspect(exec, fstab)? {
         Some(Entry::File {
             perms,

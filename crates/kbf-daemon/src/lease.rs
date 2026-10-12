@@ -21,8 +21,8 @@ use std::sync::Arc;
 use kbf_proto::google::rpc::precondition_failure::Violation;
 use kbf_proto::google::rpc::{Code, PreconditionFailure, Status};
 use kbf_proto::reapi::ActionResult;
-use kbf_proto::worker::{self, MemoryKill, Start};
-use kbf_types::{LeaseId, Resources};
+use kbf_proto::worker::{self, Lost, MemoryKill, Start};
+use kbf_types::{LeaseId, LostWhy, Resources};
 use prost::Message;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -146,9 +146,10 @@ impl Leases {
         Some(result_of(id, outcome))
     }
 
-    /// Kills every running lease and returns one ABORTED Result for each, oldest
-    /// first. The kills run together, so fencing takes as long as the slowest lease's
-    /// kill, not the sum. Returns once every lease's work has stopped.
+    /// Kills every running lease and returns one Result for each, oldest first: lost to
+    /// the farm, fenced (UNAVAILABLE with `LOST_FENCED`), which the server runs again.
+    /// The kills run together, so fencing takes as long as the slowest lease's kill,
+    /// not the sum. Returns once every lease's work has stopped.
     pub(crate) async fn fence(&mut self) -> Vec<worker::Result> {
         let fenced = std::mem::take(&mut self.running);
         self.cancelled.clear();
@@ -159,11 +160,8 @@ impl Leases {
             // no longer running. Waiting for the task proves the work has ended.
             let _ = task.await;
             tracing::warn!(lease = %id, "lease fenced: contact with the server lost");
-            failure(
-                id,
-                Code::Aborted,
-                "self-fenced: no acknowledged heartbeat within the fence time",
-            )
+            let why = "self-fenced: no acknowledged heartbeat within the fence time";
+            result_of(id, Err(RuntimeError::Lost(LostWhy::Fenced, why.to_owned())))
         });
         futures::future::join_all(kills).await
     }
@@ -192,6 +190,7 @@ pub(crate) fn result_of(
             // The daemon fills in the action its Start named.
             action_digest: None,
             memory_kill: worker::MemoryKill::Unspecified as i32,
+            lost: worker::Lost::Unspecified as i32,
         },
         Err(RuntimeError::Killed) => failure(id, Code::Aborted, "killed"),
         Err(RuntimeError::Failed(why)) => failure(id, Code::Internal, why),
@@ -219,6 +218,13 @@ pub(crate) fn result_of(
             memory_kill: MemoryKill::NodePressure as i32,
             ..failure(id, Code::Unavailable, busy.to_string())
         },
+        Err(RuntimeError::Lost(why, message)) => worker::Result {
+            lost: match why {
+                LostWhy::DaemonRestarted => Lost::DaemonRestarted,
+                LostWhy::Fenced => Lost::Fenced,
+            } as i32,
+            ..failure(id, Code::Unavailable, message)
+        },
     }
 }
 
@@ -244,8 +250,9 @@ fn missing(id: LeaseId, blob: &str) -> worker::Result {
         }),
         action_result: None,
         action_digest: None,
-        // A missing input is not a memory kill.
+        // A missing input is not a memory kill, nor lost.
         memory_kill: worker::MemoryKill::Unspecified as i32,
+        lost: worker::Lost::Unspecified as i32,
     }
 }
 
@@ -260,8 +267,10 @@ pub(crate) fn failure(id: LeaseId, code: Code, message: impl Into<String>) -> wo
         }),
         action_result: None,
         action_digest: None,
-        // Not a memory kill; `result_of` sets the kind over this for the two that are.
+        // Not a memory kill, nor lost; `result_of` sets the kind over this for those
+        // that are.
         memory_kill: worker::MemoryKill::Unspecified as i32,
+        lost: worker::Lost::Unspecified as i32,
     }
 }
 
@@ -346,7 +355,7 @@ mod tests {
     /// Catches a fence that kills leases one after another: a node with many leases
     /// would take the sum of their kill times (each up to twice the kill grace plus
     /// cleanup) to fence. Here each kill waits for the other, so a serial fence never
-    /// ends; the fence must end, with one ABORTED Result per lease, oldest first.
+    /// ends; the fence must end, with one fenced (lost) Result per lease, oldest first.
     #[tokio::test]
     async fn fence_kills_every_lease_at_once() {
         let runtime = Arc::new(Rendezvous {
@@ -371,7 +380,9 @@ mod tests {
             .expect("the fence killed one lease at a time");
         let fenced: Vec<_> = results.iter().map(|r| r.lease_id).collect();
         assert_eq!(fenced, ids.map(|id| Some(proto_lease_id(id))));
-        assert!(results.iter().all(|r| code(r) == Code::Aborted as i32));
+        // Lost to the farm, not killed by a Cancel: the server runs it again.
+        assert!(results.iter().all(|r| code(r) == Code::Unavailable as i32));
+        assert!(results.iter().all(|r| r.lost() == worker::Lost::Fenced));
         assert!(leases.running().is_empty());
     }
 
@@ -471,7 +482,8 @@ mod tests {
     /// any other outcome marked as a memory kill. Every arm in one test, so each code
     /// is checked against the others. Also catches (issue #45) a timeout's partial
     /// stdout or stderr dropped, swapped or sent without the other, and a result sent
-    /// with a timeout that has no log to carry.
+    /// with a timeout that has no log to carry. Also (issue #22) a lost run reported
+    /// without `lost`, or with the other reason, and any other outcome marked lost.
     #[test]
     fn each_outcome_has_its_status() {
         let id = LeaseId::new(3, 4);
@@ -515,6 +527,14 @@ mod tests {
                 RuntimeError::BusyNode("actions/ ran short".to_owned()),
                 Code::Unavailable,
             ),
+            (
+                RuntimeError::Lost(LostWhy::DaemonRestarted, "restarted".to_owned()),
+                Code::Unavailable,
+            ),
+            (
+                RuntimeError::Lost(LostWhy::Fenced, "fenced".to_owned()),
+                Code::Unavailable,
+            ),
         ];
         for (error, code) in codes {
             let why = error.to_string();
@@ -524,10 +544,20 @@ mod tests {
                 RuntimeError::BusyNode(_) => MemoryKill::NodePressure,
                 _ => MemoryKill::Unspecified,
             };
+            let lost = match error {
+                RuntimeError::Lost(LostWhy::DaemonRestarted, _) => worker::Lost::DaemonRestarted,
+                RuntimeError::Lost(LostWhy::Fenced, _) => worker::Lost::Fenced,
+                _ => worker::Lost::Unspecified,
+            };
             let result = result_of(id, Err(error));
             assert_eq!(result.lease_id, Some(proto_lease_id(id)), "{why}");
             assert!(result.action_result.is_none(), "{why}");
             assert_eq!(result.memory_kill(), kill, "{why}");
+            assert_eq!(result.lost(), lost, "{why}");
+            if lost != worker::Lost::Unspecified {
+                let message = result.status.as_ref().map(|s| s.message.as_str());
+                assert_eq!(message, Some(why.as_str()), "the lost run's own words");
+            }
             assert_eq!(result.status.map(|s| s.code), Some(code as i32), "{why}");
         }
 

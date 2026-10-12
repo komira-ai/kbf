@@ -170,7 +170,7 @@ mod tests {
     /// Catches a missing file being read as an empty config (every key unset).
     #[test]
     fn load_reads_the_file_and_refuses_a_missing_one() {
-        let dir = crate::testkit::scratch("config_load");
+        let dir = kbf_host::testkit::scratch("config_load");
         let file = dir.join("config.local");
         std::fs::write(&file, "KBF_RAM_GIB=64\n").expect("write");
         let c = Config::load(&file, KEYS).expect("valid");

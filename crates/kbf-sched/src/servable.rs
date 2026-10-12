@@ -98,18 +98,29 @@ impl Servable {
     /// and returns the worker with what was booked: the request vector for an action,
     /// the worker's whole capacity for a whole-machine lease; and the iOS device, for a
     /// request that asks for one ([`Worker::free_device`]).
+    ///
+    /// A worker in `avoid` (one the operation's earlier runs ended on as the farm's
+    /// fault) is skipped while a worker placement may use outside it could run the
+    /// request once its bookings end: the request waits for that one. Only when none
+    /// could is a worker in `avoid` taken, so a farm of one node still runs it.
     pub(crate) fn fit(
         &mut self,
         workers: &mut BTreeMap<WorkerId, Worker>,
         request: &Request,
         reserved: &BTreeSet<WorkerId>,
+        avoid: &BTreeSet<WorkerId>,
     ) -> Option<(WorkerId, Resources, Option<String>)> {
         let at = self.matching(workers, request);
+        let skip = self.avoided(at, workers, request, avoid);
         let name = self.memo[at]
             .1
             .iter()
             .map(|&i| &self.live[i])
-            .find(|name| !reserved.contains(*name) && workers[*name].has_room(request))?
+            .find(|name| {
+                !reserved.contains(*name)
+                    && !skip.contains(*name)
+                    && workers[*name].has_room(request)
+            })?
             .clone();
         let worker = workers.get_mut(&name).expect("live workers are registered");
         let booked = match request.kind {
@@ -128,21 +139,26 @@ impl Servable {
 
     /// The worker to hold for a whole-machine `request` that fits nowhere now: `kept`
     /// if it still could run it, else the one that could which holds the fewest leases,
-    /// then has the least booked, then comes first by name. Never one in `reserved`.
+    /// then has the least booked, then comes first by name. Never one in `reserved`,
+    /// nor one in `avoid` while [`Servable::fit`] skips it.
     pub(crate) fn reserve(
         &mut self,
         workers: &BTreeMap<WorkerId, Worker>,
         request: &Request,
         reserved: &BTreeSet<WorkerId>,
+        avoid: &BTreeSet<WorkerId>,
         kept: Option<&WorkerId>,
     ) -> Option<WorkerId> {
         let at = self.matching(workers, request);
+        let skip = self.avoided(at, workers, request, avoid);
         let candidates: Vec<&WorkerId> = self.memo[at]
             .1
             .iter()
             .map(|&i| &self.live[i])
             .filter(|name| {
-                !reserved.contains(*name) && workers[*name].capacity.fits(&request.resources)
+                !reserved.contains(*name)
+                    && !skip.contains(*name)
+                    && workers[*name].capacity.fits(&request.resources)
             })
             .collect();
         if let Some(kept) = kept.filter(|kept| candidates.contains(kept)) {
@@ -155,6 +171,24 @@ impl Servable {
                 (w.leases, w.booked)
             })
             .cloned()
+    }
+
+    /// The workers of `avoid` that placement skips for `request`, whose matching live
+    /// workers are `memo[at]`: all of them while a matching worker outside `avoid`
+    /// could run the request once its bookings end, else none.
+    fn avoided<'a>(
+        &self,
+        at: usize,
+        workers: &BTreeMap<WorkerId, Worker>,
+        request: &Request,
+        avoid: &'a BTreeSet<WorkerId>,
+    ) -> &'a BTreeSet<WorkerId> {
+        static NONE: BTreeSet<WorkerId> = BTreeSet::new();
+        let elsewhere =
+            self.memo[at].1.iter().map(|&i| &self.live[i]).any(|name| {
+                !avoid.contains(name) && workers[name].capacity.fits(&request.resources)
+            });
+        if elsewhere { avoid } else { &NONE }
     }
 
     /// Whether any live worker could run `request` once its bookings end, and if none

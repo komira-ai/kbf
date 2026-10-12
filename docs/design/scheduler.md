@@ -137,6 +137,8 @@ the heartbeat leaves out is requeued:
 - at once, if its `Start` went to an *earlier session of the same daemon process* (the
   daemon either received it before registering again, and then lists it, or never
   will);
+- at once, as a farm fault ([Retries](#retries-of-farm-faults)), if its `Start` went to
+  the daemon process the current one was *proven to replace* (issue #22; below);
 - if its `Start` went to *another daemon process* that registered as the worker, once
   `HANDOVER_GRACE` (T + 5 s = 45 s) has passed since the scheduler last heard the
   worker before the newest change of process (issue #140);
@@ -160,8 +162,7 @@ heartbeat that arrives on a replaced stream is dropped and not acknowledged, so 
 daemon still talking on an old stream fences on time.
 
 A registration names the daemon process that made it: `Hello.instance_id`, drawn at
-random when the daemon starts, the same on each of its streams, and never kept across a
-restart. Only that process can say it no longer runs a lease, so the first rule above
+random when the daemon starts and the same on each of its streams. Only that process can say it no longer runs a lease, so the first rule above
 holds only within one process. Two processes can register as one node: the node's
 certificate is on a cloned machine, a second daemon was started with it, or a node was
 replaced while the old one still ran (node identity is the certificate, not the
@@ -171,15 +172,34 @@ work until it fences, T after the scheduler last heard it. Its leases are theref
 for `HANDOVER_GRACE` from then, and given up by the first heartbeat after that which
 leaves them out. A restarted daemon, or a rebooted node, is another process too: the
 scheduler cannot tell it from a second daemon, so what it lost is requeued after the
-handover grace rather than on its first heartbeat (most reboots take longer than that
-anyway). The server logs every change of process on a node. A registration without an
+handover grace rather than on its first heartbeat, unless it proves its predecessor
+stopped. The server logs every change of process on a node. A registration without an
 instance id (a daemon that predates the field) is taken as another process's.
+
+**A proven restart** (issue #22). The daemon binary keeps its instance id in its
+scratch directory (`<--scratch>/daemon-instance`), written only once every runtime has
+been built, so once every driver's start-up sweep has killed the runs the daemon
+before it left there. The next daemon reads the old id before it writes its own, and
+names it in `Hello.predecessor_instance_id`. The server takes the claim when it names
+the process the node's previous stream came from and that stream has closed, and
+feeds the registration with `predecessor_stopped`. The scheduler then records that
+process as stopped (`Worker.stopped_process`), and the first heartbeat of the new
+process gives up at once every lease whose `Start` went to it and which it does not
+list. It does not do so at registration: the phase, taken right after, sends a
+switching whole-machine lease's `Start` to the new process, which then restores the
+node. Leases of any earlier process keep the handover grace. The claim adds no
+assumption: the sweep already needs one daemon per scratch directory. What it does
+not cover: a copy of the scratch directory on another machine (a cloned disk) whose
+daemon is cut off from the server, so that its stream has closed while it still runs;
+its self-fenced work then stops within T, but a hermetic run runs on beside the rerun.
+A daemon without `--scratch` (the fake driver) names no predecessor.
 
 This puts one duty on a daemon: it must list everything it holds in its first heartbeat
 on each new stream, or what it leaves out is requeued at once. Re-adopting work across a
 daemon restart is **planned**. Today a restarted daemon lists nothing of its
 predecessor's, and before its `Hello` its driver ends every run that predecessor left on
-the node (issue #155), so what is requeued after the handover grace no longer runs there.
+the node (issue #155), so what is requeued (at once after a proven restart, else after
+the handover grace) no longer runs there.
 The grace rests on the older process fencing T after it was last heard; a process that
 was killed fences nothing. For its runs, each run's keeper (a process that ends the run
 when the daemon dies) is the guarantee whether or not a daemon is started again, and the
@@ -321,11 +341,43 @@ What the code does today:
   before it is offered.
 - **Reclaimed room.** `batch` work may use memory that is booked but unused, and is
   preempted at once when more urgent work needs it.
-- **Retries.** An infrastructure failure is retried on another worker a bounded number
-  of times before callers see `INTERNAL`. Today only a busy node's memory kill is
-  rerun (below). A missing input (`Failed(MissingInput)`, [Outcomes](#outcomes)) is
-  not an infrastructure failure and will not count against that budget: rerunning it
-  fails the same way until the client uploads the blob.
+- **Retries.** Every infrastructure failure retried on another worker a bounded
+  number of times before callers see `INTERNAL`. Today the farm faults of
+  [Retries of farm faults](#retries-of-farm-faults) are; `Failed(Infra)` is not. A
+  missing input (`Failed(MissingInput)`, [Outcomes](#outcomes)) is not an
+  infrastructure failure and will not count against that budget: rerunning it fails
+  the same way until the client uploads the blob.
+
+## Retries of farm faults
+
+What the code does today (issue #22; the policy is
+[failure-classes.md](failure-classes.md), 6.5). Three kinds of run end as the farm's
+fault, and each is recorded on its operation as a `FarmRun` (the node, and why):
+
+- a busy node's memory kill (`Failed(NodeMemoryPressure)`, [Memory kills](#memory-kills));
+- a run the daemon reports lost (`Failed(Lost)`, from `Result.lost`): fenced (no
+  acknowledged heartbeat within T), or a whole-machine action whose result a daemon
+  restart took;
+- a lease given up because its daemon was proven stopped (the requeue reason
+  `Restarted`, [above](#reconciling-with-what-workers-say-they-run)).
+
+They share one budget: the operation runs again while at most `FARM_RERUNS` = 2 runs
+have ended so, so at most 3 runs end as farm faults, whatever mix of the three. A
+rerun prefers a node none of its farm runs ended on: placement skips those nodes while
+a live, serving node outside them could run the request once its bookings end, and
+waits for it; when none could (a farm of one node), it takes one of them. The run past
+the budget finishes the operation with its failure; a restart past it has no result of
+its own, so the scheduler proposes `Failed(Lost(DaemonRestarted))` for that lease and
+the committed record finishes the operation, as every result does. Callers then get
+`INTERNAL`: "kbf farm fault on <last node>: <what ended its run>, and its reruns are
+used up. Operator fix: <fix>. Runs: 3 (node-a, fenced; node-b, daemon restarted; ...)."
+
+Not charged: leases given up for silence (G), replacement without proof (the handover
+grace), reconnection, not starting or a session switch. The last three never ran; the
+first two are left for a later change, which needs a tick that answers callers. Nothing
+a lost run produced reaches the action cache: a killed run sends no `Result`, a lost
+`Result` never completes an operation, and a late `Result` of a lease given up is
+refused once the operation holds a new lease.
 
 ## Memory kills
 
@@ -354,14 +406,16 @@ turns it into one of two outcomes, and the scheduler decides on the committed re
 - **`Failed(NodeMemoryPressure)`: the node killed it while it was under its own
   limit** (a node-wide out-of-memory kill, or the node's backstop). The busy node's
   fault: the node's memory-pressure count (`Scheduler::memory_pressure`) goes up, and
-  the operation is queued again with the same booking, at most `FARM_RERUNS` = 2 times
-  (3 runs). It never raises the booking or the floor. After the reruns it finishes
-  `Failed(NodeMemoryPressure)`.
+  the operation is queued again with the same booking as a farm fault
+  ([Retries of farm faults](#retries-of-farm-faults)): preferring another node, from
+  the budget it shares with lost runs. It never raises the booking or the floor. Past
+  the budget it finishes `Failed(NodeMemoryPressure)`.
 - **The two budgets do not mix.** A rung of the ladder is not a farm rerun and a farm
-  rerun is not a rung, so a long ladder never takes a busy-node kill's reruns, and
-  busy-node kills never stop the ladder short of the cap. An operation runs at most
+  rerun is not a rung, so a long ladder never takes a farm fault's reruns, and farm
+  faults never stop the ladder short of the cap. An operation runs at most
   `1 + ceil(log2(cap / first booking)) + FARM_RERUNS` times. Leases given up for
-  silence, replacement, reconnection or not starting count against neither.
+  silence, replacement without proof, reconnection or not starting count against
+  neither.
 - A memory kill committed for a lease the operation no longer holds (it was given up
   and is queued again) changes nothing: no run is recorded and the booking stays.
 - Each rerun is a requeue the server logs with its reason ("passed its memory limit
@@ -380,7 +434,8 @@ to the scheduler's outcome and to what callers see:
 | `DEADLINE_EXCEEDED` | `Failed(Timeout)` | `DEADLINE_EXCEEDED`, with the partial stdout and stderr digests the CAS holds, if any | not written |
 | `INVALID_ARGUMENT` | `Failed(Invalid)` | `INVALID_ARGUMENT`, with the daemon's reason | not written |
 | not `OK`, `memory_kill` own limit | `Failed(OutOfMemory)`: run again with double the memory below the cap | at the cap, `FAILED_PRECONDITION`: "kbf: the action needs more memory than any node offers: ...", with an `ErrorInfo` of reason `ACTION_OUT_OF_MEMORY` | not written |
-| not `OK`, `memory_kill` node pressure | `Failed(NodeMemoryPressure)`: run again with the same memory, twice | after the reruns, `INTERNAL`: "kbf farm fault on <node>: ..." | not written |
+| not `OK`, `memory_kill` node pressure | `Failed(NodeMemoryPressure)`: run again with the same memory, from the farm budget | past the budget, `INTERNAL`: "kbf farm fault on <node>: ..." | not written |
+| not `OK`, `lost` set (fenced, or daemon restarted) | `Failed(Lost)`: run again from the farm budget, preferring another node | past the budget, `INTERNAL`: "kbf farm fault on <node>: ...", naming every farm run | not written |
 | `FAILED_PRECONDITION`, every `PreconditionFailure` violation `MISSING` with a `blobs/<hash>/<size>` subject | `Failed(MissingInput)`: answered at once, never run again, no farm rerun spent | `FAILED_PRECONDITION`: "N input blob(s) are not in the CAS", with the `PreconditionFailure` listing each blob as its only detail, as the front answers before queueing; Bazel re-uploads and executes again | not written |
 | anything else | `Failed(Infra)` | `INTERNAL`: "the farm could not run the action"; the daemon's reason goes only to the server's log, a WARN `lease failed` line with the lease, the node, the code and the reason | not written |
 | (none: refused unrun) | `Refused` | `FAILED_PRECONDITION`, with the reason | not written |
@@ -388,7 +443,8 @@ to the scheduler's outcome and to what callers see:
 A run that exits non-zero (a failing test) is still `Completed`: callers get its
 result, but it is not cached. The action-cache entry is committed before the callers
 are answered, so a caller that asks again at once gets a hit. Today an infrastructure
-failure other than a memory kill is answered at once; retrying it is planned (above).
+failure other than a farm fault ([Retries of farm faults](#retries-of-farm-faults)) is
+answered at once; retrying it is planned (above).
 
 ## Accounting
 

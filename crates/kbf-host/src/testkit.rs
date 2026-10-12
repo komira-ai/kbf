@@ -1,5 +1,6 @@
-//! Test helpers: [`FakeExec`], an in-memory host that records every step and query, and
-//! scratch directories.
+//! Test helpers, for this crate's tests and (with the `testkit` feature) other crates':
+//! [`FakeExec`], an in-memory host that records every step and query, and scratch
+//! directories.
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -175,14 +176,15 @@ impl Exec for FakeExec {
     }
 }
 
-/// A fresh, empty directory for one test: `<target>/tmp/kbf-deploy/<name>`.
+/// A fresh, empty directory for one test: `<target>/tmp/kbf-host/<name>`. Every crate
+/// that uses it shares that directory, so `name` must be unique among them.
 pub fn scratch(name: &str) -> PathBuf {
     let exe = std::env::current_exe().expect("the test binary has a path");
     let target = exe
         .ancestors()
         .nth(3)
         .expect("<target>/<profile>/deps/<test binary>");
-    let dir = target.join("tmp").join("kbf-deploy").join(name);
+    let dir = target.join("tmp").join("kbf-host").join(name);
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("make the scratch directory");
     dir
@@ -269,3 +271,7 @@ impl Exec for ScratchHost {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "testkit_tests.rs"]
+mod tests;

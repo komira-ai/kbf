@@ -13,6 +13,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::Parser;
+use kbf_host::HostPath;
 
 /// Installs signed software sets on this node, for the genuine kbf-daemon only.
 #[derive(Debug, Parser)]
@@ -48,14 +49,15 @@ struct Cli {
     /// Where the daemon leaves artifacts, each named by its SHA-256.
     #[arg(long)]
     artifacts_dir: PathBuf,
-    /// Where kbf's binaries are installed.
-    #[arg(long)]
-    bin_dir: PathBuf,
+    /// Where kbf's binaries are installed: an absolute path with no trailing `/`.
+    #[arg(long, value_parser = HostPath::new)]
+    bin_dir: HostPath,
 }
 
 #[cfg(target_os = "linux")]
 fn start(cli: Cli) -> Result<std::convert::Infallible, String> {
-    use kbf_updater::apply::{AptSnapshot, SystemRunner};
+    use kbf_host::{HostExec, Root};
+    use kbf_updater::apply::AptSnapshot;
     use kbf_updater::caller::DaemonPin;
     use kbf_updater::server::{Settings, read_root_key, run};
     use kbf_updater::set::{Pin, Platform};
@@ -82,7 +84,10 @@ fn start(cli: Cli) -> Result<std::convert::Infallible, String> {
         },
         proc_root: PathBuf::from("/proc"),
     };
-    run(settings, AptSnapshot::new(SystemRunner, cli.bin_dir))
+    run(
+        settings,
+        AptSnapshot::new(HostExec::new(Root::host()), cli.bin_dir),
+    )
 }
 
 /// Macs need actions to run as per-lease users before the helper may ship there (S4.3).
