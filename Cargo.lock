@@ -1718,6 +1718,9 @@ dependencies = [
 [[package]]
 name = "kbf-vmm"
 version = "0.1.0"
+dependencies = [
+ "xtask",
+]
 
 [[package]]
 name = "lazy_static"

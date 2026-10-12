@@ -6,6 +6,10 @@
 //! - `budget-diff --base <rev>` ([`budget`]): the interpreter budget may only shrink; a
 //!   row the working tree's budget file has and `<rev>`'s does not is refused. CI runs
 //!   it on pull requests, with the base branch as `<rev>`.
+//! - `sign-darwin <binary> --minos <version> [--summary <file>]` and `darwin-asset
+//!   <tarball> <name>` ([`darwin`]): the macOS binary signed ad hoc with the hardened
+//!   runtime and exactly the entitlements the allow list ([`entitlements`]) gives it,
+//!   and checked again as it ships. macOS only.
 //! - `fetch --url <url> --sha256 <hex> --out <path> [--extract <format> [--member <path>]]`
 //!   ([`fetch`]): a pinned tool, downloaded over HTTPS and refused unless its SHA-256
 //!   matches, before anything is unpacked or written.
@@ -27,6 +31,8 @@ use clap::{Parser, Subcommand};
 
 pub mod budget;
 pub mod build_commit;
+pub mod darwin;
+pub mod entitlements;
 pub mod fetch;
 pub mod package;
 pub mod sums;
@@ -48,6 +54,8 @@ pub enum Error {
     Refused(Vec<String>),
     #[error(transparent)]
     Fetch(#[from] fetch::Error),
+    #[error(transparent)]
+    Entitlements(#[from] entitlements::Error),
     /// Flags that do not fit together (exit status 2, like a clap error).
     #[error("{0}")]
     Usage(String),
@@ -122,6 +130,20 @@ enum Verb {
         #[arg(long)]
         out: PathBuf,
     },
+    /// Sign a macOS binary in place, ad hoc with the hardened runtime and the
+    /// entitlements the allow list gives its file name, and check it (macOS only).
+    SignDarwin {
+        /// The binary; it must accept `--version`.
+        binary: PathBuf,
+        /// The minimum macOS it was built for (on Actions, `MACOSX_DEPLOYMENT_TARGET`).
+        #[arg(long)]
+        minos: String,
+        /// Append a line on the signature to this file (on Actions, `GITHUB_STEP_SUMMARY`).
+        #[arg(long)]
+        summary: Option<PathBuf>,
+    },
+    /// Check the macOS binary `<name>` as it ships in `<tarball>` (macOS only).
+    DarwinAsset { tarball: PathBuf, name: String },
     /// The commit's one `SHA256SUMS`.
     #[command(subcommand)]
     Sums(Sums),
@@ -252,6 +274,25 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
             commit,
             out,
         } => package::package(&binary, &sbom, platform, &commit, &out),
+        #[cfg(target_os = "macos")]
+        Verb::SignDarwin {
+            binary,
+            minos,
+            summary,
+        } => darwin::sign(
+            &binary,
+            &root.join(entitlements::ALLOWLIST),
+            &minos,
+            summary.as_deref(),
+        ),
+        #[cfg(target_os = "macos")]
+        Verb::DarwinAsset { tarball, name } => {
+            darwin::asset(&tarball, &name, &root.join(entitlements::ALLOWLIST))
+        }
+        #[cfg(not(target_os = "macos"))]
+        Verb::SignDarwin { .. } => Err(darwin::needs_macos("sign-darwin")),
+        #[cfg(not(target_os = "macos"))]
+        Verb::DarwinAsset { .. } => Err(darwin::needs_macos("darwin-asset")),
         Verb::Sums(Sums::Assemble {
             dir,
             expect,

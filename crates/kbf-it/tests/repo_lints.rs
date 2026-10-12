@@ -18,7 +18,7 @@
 //!   does not list (by path, never by size), and a row of that file that is stale,
 //!   repeated or malformed (rules in `interpreters/mod.rs`);
 //! - the darwin-arm64 job of `.github/workflows/artifacts.yml` no longer running
-//!   `tools/ci/check-darwin-asset.sh` on the packaged binary after `Package`, or
+//!   `cargo xtask darwin-asset` on the packaged binary after `Package`, or
 //!   running it where its failure does not fail the job;
 //! - the scans passing vacuously because git listed nothing, no Markdown file was
 //!   scanned or the workflows moved;
@@ -557,7 +557,7 @@ const ARTIFACTS_WORKFLOW: &str = ".github/workflows/artifacts.yml";
 const DARWIN_JOB: &str = "darwin-arm64";
 
 /// The command that checks the packaged macOS binary's signature and runs it.
-const CHECK_DARWIN_ASSET: &str = "bash tools/ci/check-darwin-asset.sh";
+const CHECK_DARWIN_ASSET: &str = "cargo xtask darwin-asset";
 
 /// Whether `job` in `workflow` runs [`CHECK_DARWIN_ASSET`] in a step after the one named
 /// `Package`, with no `if:` or `continue-on-error:` on that step; an error says what is
@@ -647,19 +647,21 @@ mod selection {
     fn the_darwin_asset_check_must_follow_package_and_gate_the_job() {
         // Catches: a darwin job without the check accepted (the lint passing a workflow
         // that misses it), the check found only before Package, in another job, in a
-        // comment, or under `if:` / `continue-on-error:`.
-        let check = "      - name: Check\n        run: |\n          bash tools/ci/check-darwin-asset.sh \\\n            dist/x.tar.gz kbf-daemon\n";
+        // comment, under `if:` / `continue-on-error:`, or as the shell script it replaced.
+        let check =
+            "      - name: Check\n        run: cargo xtask darwin-asset dist/x.tar.gz kbf-daemon\n";
         assert_eq!(
             checks_the_packaged_darwin_binary(&darwin_workflow(check), "darwin-arm64"),
             Ok(())
         );
-        let missing = "the job `darwin-arm64` does not run `bash tools/ci/check-darwin-asset.sh` after `Package`";
-        let comment =
-            "      - run: |\n          # bash tools/ci/check-darwin-asset.sh x y\n          true\n";
+        let missing =
+            "the job `darwin-arm64` does not run `cargo xtask darwin-asset` after `Package`";
+        let comment = "      - run: |\n          # cargo xtask darwin-asset x y\n          true\n";
         for planted in [
             "",
             comment,
-            "      - run: echo tools/ci/check-darwin-asset.sh\n",
+            "      - run: echo cargo xtask darwin-asset\n",
+            "      - run: bash tools/ci/check-darwin-asset.sh x y\n",
         ] {
             assert_eq!(
                 checks_the_packaged_darwin_binary(&darwin_workflow(planted), "darwin-arm64"),
@@ -680,7 +682,7 @@ mod selection {
             Err("the workflow has no job `linux-arm64`".to_owned())
         );
         for key in ["        if: false\n", "        continue-on-error: true\n"] {
-            let gated = check.replace("        run: |\n", &format!("{key}        run: |\n"));
+            let gated = check.replace("        run: ", &format!("{key}        run: "));
             assert!(
                 checks_the_packaged_darwin_binary(&darwin_workflow(&gated), "darwin-arm64")
                     .is_err_and(|e| e.contains("under `if:` or `continue-on-error:`")),
