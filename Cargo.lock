@@ -1633,6 +1633,7 @@ dependencies = [
  "clap",
  "form_urlencoded",
  "futures",
+ "hex",
  "kbf-auth",
  "kbf-caps",
  "kbf-front",

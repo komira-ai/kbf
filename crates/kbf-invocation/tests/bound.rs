@@ -76,7 +76,9 @@ fn held(r: &Records) -> Vec<String> {
 
 /// Catches an eviction order other than section 3.5's: a minted record kept while a
 /// client's idle record goes (plant "least recently seen first, minted or not": `a`
-/// goes before `m`), and idle records taken newest first (plant: `b` before `a`).
+/// goes before `m`), and idle records taken newest first (plant: `b` before `a`). And
+/// (plant "minted records count") the latest `last_seen` of the client records removed
+/// (the `records_since` of a `404`) moved by a minted one, or not the latest kept.
 #[test]
 fn eviction_takes_minted_then_the_least_recently_seen_idle_record() {
     // Three records of one size; the bound holds exactly three.
@@ -93,14 +95,21 @@ fn eviction_takes_minted_then_the_least_recently_seen_idle_record() {
     // ago, is not, but minted records go first.
     r.apply(hit("c", t(700), 13));
     assert_eq!(held(&r), ["a", "b", "c"], "the minted record goes first");
+    assert_eq!(
+        r.evicted_last_seen(),
+        None,
+        "a minted record does not count"
+    );
     r.apply(hit("d", t(700), 14));
     assert_eq!(
         held(&r),
         ["b", "c", "d"],
         "then the least recently seen idle one"
     );
+    assert_eq!(r.evicted_last_seen(), Some(t(0)));
     r.apply(hit("e", t(700), 15));
     assert_eq!(held(&r), ["c", "d", "e"]);
+    assert_eq!(r.evicted_last_seen(), Some(t(10)), "the latest removed");
     assert_eq!(r.evicted(), 3);
     assert!(r.bytes() <= bound);
 }

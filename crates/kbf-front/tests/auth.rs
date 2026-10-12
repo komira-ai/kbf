@@ -69,6 +69,7 @@ fn policy(authenticator: impl Authenticator, authorizers: Authorizers) -> Policy
     Policy {
         authenticator: Arc::new(authenticator),
         authorizers,
+        invocations_get: None,
         blobs_get: None,
     }
 }
@@ -461,6 +462,7 @@ async fn every_method_passes_through_the_authenticator_first() {
     let farm = serve(Policy {
         authenticator: Arc::clone(&counting) as Arc<dyn Authenticator>,
         authorizers: authorizers(|_| Arc::new(AllowAuthorizer)),
+        invocations_get: None,
         blobs_get: None,
     })
     .await;

@@ -809,34 +809,66 @@ fn get(api: SocketAddr, path: &str) -> String {
     response
 }
 
-/// Catches: a start line that does not say whether `GET /v1/blobs` answers (or says
-/// `on` when it is off), and a policy's `blobs.getAuthorizer` read by the binary but
-/// not given to the route, or the route on without one (the empty blob, which every
-/// cache holds, is read: `200` only with the key).
+/// Catches: a start line that does not say whether the build pages and
+/// `GET /v1/blobs` answer (or says `on` when one is off); a policy's
+/// `invocations.getAuthorizer` or `blobs.getAuthorizer` read by the binary but not
+/// given to its route, or a route on without its key (the empty blob, which every
+/// cache holds, is read: `200` only with both keys); blobs on with no `invocations`
+/// key; and (mutant "open does nothing") `--invocations-open` not turning both on,
+/// with no policy file or with one that names `invocations` only.
 #[cfg(unix)]
 #[test]
-fn the_start_line_says_whether_blob_reads_are_on() {
+fn the_start_line_says_whether_the_build_pages_and_blob_reads_are_on() {
     const EMPTY: &str =
         "/v1/blobs/e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855-0";
-    let named =
-        r#"{"authenticationPolicy": {"allow": {}}, "blobs": {"getAuthorizer": {"allow": {}}}}"#;
-    let unnamed = r#"{"authenticationPolicy": {"allow": {}}}"#;
-    let named = token_file("blobs-policy", named, 0o600);
-    let unnamed = token_file("no-blobs-policy", unnamed, 0o600);
-    for (policy, on) in [(None, false), (Some(&unnamed), false), (Some(&named), true)] {
+    const PAGE: &str = "/v1/invocations/no-such-build";
+    let allow = r#"{"getAuthorizer": {"allow": {}}}"#;
+    let policy = |name: &str, keys: &str| {
+        let text = format!(r#"{{"authenticationPolicy": {{"allow": {{}}}}{keys}}}"#);
+        token_file(name, &text, 0o600)
+    };
+    let unnamed = policy("no-keys-policy", "");
+    let blobs = policy("blobs-policy", &format!(r#", "blobs": {allow}"#));
+    let pages = policy("pages-policy", &format!(r#", "invocations": {allow}"#));
+    let both = policy(
+        "pages-blobs-policy",
+        &format!(r#", "invocations": {allow}, "blobs": {allow}"#),
+    );
+    for (policy, open, pages_on, blobs_on) in [
+        (None, false, false, false),
+        (Some(&unnamed), false, false, false),
+        (Some(&blobs), false, false, false),
+        (Some(&pages), false, true, false),
+        (Some(&both), false, true, true),
+        (None, true, true, true),
+        (Some(&pages), true, true, true),
+    ] {
         let mut c = server(&["--api-listen", "127.0.0.1:0"]);
         if let Some(policy) = policy {
             c.arg("--reapi-auth-policy").arg(policy);
         }
+        if open {
+            c.arg("--invocations-open");
+        }
         c.args(ANY_PORT);
         let (child, line, _) = started(c);
+        let case = format!("{policy:?} open={open}");
         let (head, api) = line.rsplit_once(" api=").expect("an API address");
-        let want = if on { " blobs=on" } else { " blobs=off" };
-        assert!(head.ends_with(want), "{policy:?}: {line}");
+        let on = |on: bool| if on { "on" } else { "off" };
+        let want = format!(" invocations={} blobs={}", on(pages_on), on(blobs_on));
+        assert!(head.ends_with(&want), "{case}: {line}");
         let api: SocketAddr = api.parse().expect("an address");
         let answer = get(api, EMPTY);
-        let code = if on { "HTTP/1.1 200" } else { "HTTP/1.1 404" };
-        assert!(answer.starts_with(code), "{policy:?}: {answer}");
+        let code = if blobs_on {
+            "HTTP/1.1 200"
+        } else {
+            "HTTP/1.1 404"
+        };
+        assert!(answer.starts_with(code), "{case}: {answer}");
+        let page = get(api, PAGE);
+        assert!(page.starts_with("HTTP/1.1 404"), "{case}: {page}");
+        let off = page.contains("the build pages are off");
+        assert_eq!(off, !pages_on, "{case}: {page}");
         interrupt(child);
     }
 }

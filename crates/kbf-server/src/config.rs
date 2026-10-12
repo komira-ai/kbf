@@ -4,6 +4,7 @@
 
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use clap::{Parser, ValueEnum};
@@ -11,7 +12,7 @@ use kbf_objstore::s3::{Credentials, S3Config, S3ConfigError, S3Store};
 use kbf_objstore::{Capabilities, KeyError, KeyPrefix};
 use tonic::transport::{Certificate, Identity, ServerTlsConfig};
 
-use kbf_auth::{Policy, PolicyError};
+use kbf_auth::{AllowAuthorizer, Authorizer, Policy, PolicyError};
 
 use crate::identity::{DenyList, DenyListError};
 use crate::serve::{Api, Listeners, WorkerTls};
@@ -90,7 +91,8 @@ pub struct Args {
     /// A JSON file with the REAPI listener's authentication policy and authorizers
     /// (`docs/reapi-auth.md`), read once at start; a file that is not a valid policy
     /// stops the server. Without it every REAPI call is accepted and allowed. The
-    /// worker listener and the operator API do not read it.
+    /// worker listener does not read it; on the operator API only the build pages and
+    /// the blob route do, and they are off unless it names their authorizers.
     #[arg(long)]
     pub reapi_auth_policy: Option<PathBuf>,
     /// The `kbf.worker.v1` listener. Without mutual TLS (`--worker-tls-cert`,
@@ -109,6 +111,15 @@ pub struct Args {
     /// are refused.
     #[arg(long, requires = "api_listen")]
     pub api_token_file: Option<PathBuf>,
+    /// Serves the build pages (`GET /v1/invocations/{id}` and below) and the blob route
+    /// (`GET /v1/blobs/{digest}`) on the operator API to every caller the REAPI policy
+    /// accepts, with no `invocations` or `blobs` key in the policy file
+    /// (`docs/design/invocations.md` section 4.3): it fills in `allow` for whichever of
+    /// the two keys the file leaves out. Without it, and without the keys, those routes
+    /// answer 404. Pages and blobs hold build outputs and logs: give it only for a
+    /// listener that only trusted people reach.
+    #[arg(long)]
+    pub invocations_open: bool,
     /// How long, in milliseconds, `GET /readyz` on the operator API and the REAPI
     /// listener's `grpc.health.v1` service wait for the object store to answer their
     /// read-only probe before they answer not ready.
@@ -303,22 +314,32 @@ impl Args {
     }
 
     /// The REAPI listener's policy: the file `--reapi-auth-policy` names, or
-    /// [`Policy::allow_all`] without it.
+    /// [`Policy::allow_all`] without it; with `--invocations-open`, its
+    /// `invocations_get` and `blobs_get` are `allow` where the file names neither.
     ///
     /// # Errors
     /// The file cannot be read, or is not a policy ([`Policy::from_json`]).
     pub fn reapi_auth_policy(&self) -> Result<Policy, ConfigError> {
-        let Some(path) = &self.reapi_auth_policy else {
-            return Ok(Policy::allow_all());
+        let mut policy = match &self.reapi_auth_policy {
+            None => Policy::allow_all(),
+            Some(path) => {
+                let text =
+                    std::fs::read_to_string(path).map_err(|source| ConfigError::PolicyRead {
+                        path: path.clone(),
+                        source,
+                    })?;
+                Policy::from_json(&text).map_err(|source| ConfigError::Policy {
+                    path: path.clone(),
+                    source,
+                })?
+            }
         };
-        let text = std::fs::read_to_string(path).map_err(|source| ConfigError::PolicyRead {
-            path: path.clone(),
-            source,
-        })?;
-        Policy::from_json(&text).map_err(|source| ConfigError::Policy {
-            path: path.clone(),
-            source,
-        })
+        if self.invocations_open {
+            let allow = || -> Arc<dyn Authorizer> { Arc::new(AllowAuthorizer) };
+            policy.invocations_get.get_or_insert_with(allow);
+            policy.blobs_get.get_or_insert_with(allow);
+        }
+        Ok(policy)
     }
 
     /// The operator API these flags describe, if `--api-listen` is given, with the
