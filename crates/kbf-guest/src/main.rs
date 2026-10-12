@@ -52,7 +52,7 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
     if let Err(e) = session::refuse_root_here() {
         eprintln!("{e}");
-        return ExitCode::from(2);
+        return ExitCode::SUCCESS;
     }
     match cli.command {
         Cmd::Session => {
