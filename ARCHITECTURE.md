@@ -12,6 +12,7 @@ The design documents under [docs/design](docs/design) go deeper:
 | [scheduler.md](docs/design/scheduler.md) | operations, leases, fencing, QoS, placement, accounting |
 | [simulation.md](docs/design/simulation.md) | the scheduler's simulations: what exists, the invariants every step checks, the scenario families to build and the mutants each must catch |
 | [storage.md](docs/design/storage.md) | the CAS and action cache, segments, metadata, retention, the object store interface |
+| [metadata-snapshots.md](docs/design/metadata-snapshots.md) | the snapshot encoding of the metadata state, compaction of the single-voter log, starting from a snapshot, version refusal, size and pause at today's scale and 10x, and how the HA design inherits it (**planned**) |
 | [worker-protocol.md](docs/design/worker-protocol.md) | `kbf.worker.v1`: messages and the rules both sides keep |
 | [daemon.md](docs/design/daemon.md) | `kbf-daemon`, the container driver, output collection, limits |
 | [capabilities.md](docs/design/capabilities.md) | node reports, ISA levels, matching an action to a node |
