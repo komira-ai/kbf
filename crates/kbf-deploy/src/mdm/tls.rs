@@ -17,8 +17,9 @@
 //!    started when not active;
 //! 3. `kbf-mdm-cert.service` started once when there is no certificate yet (the first
 //!    issuance; the timer renews it after);
-//! 4. the proxy enabled and started when not active, once the certificate is there:
-//!    when step 3 runs, in a second plan after it (a dry run shows no proxy step then).
+//! 4. in a second plan, once the certificate is there (after step 3 when it runs; a
+//!    dry run that would issue shows no proxy step), the proxy enabled and started when
+//!    not active.
 //!
 //! After an apply the certificate must be there, else the run fails before the proxy;
 //! its subject, issuer and expiry are printed.
@@ -293,30 +294,25 @@ pub fn run<E: Exec>(
     }
     // The proxy is planned only with its certificate there: started without it, Caddy
     // fails and restarts every 5 s. A first issuance runs in this plan, so the proxy
-    // goes in a second one, planned once the issuance has written the certificate.
+    // has a plan of its own after it, planned once the certificate is there.
     let crt = under(&c.state, &format!("lego/certificates/{}.crt", c.dns_name))?;
     let issue = host::stat(&*exec, &crt)?.is_none();
     if issue {
         planner.run(systemctl(&["start", CERT_SERVICE]));
-    } else {
-        service(&*exec, &mut planner, PROXY, false)?;
     }
-    let plan = planner.finish();
-    execute(&plan, RunAs::Root, mode, exec, &mut out)?;
-    if mode == Mode::DryRun {
-        if issue {
-            note(out, format_args!("proxy: started once {crt} is there"))?;
-        }
+    execute(&planner.finish(), RunAs::Root, mode, exec, &mut out)?;
+    if issue && mode == Mode::DryRun {
+        note(out, format_args!("proxy: started once {crt} is there"))?;
         return Ok(());
     }
     let Some(Entry::File { bytes, .. }) = host::inspect(&*exec, &crt)? else {
         return Err(MdmError::NoCertificate(crt));
     };
-    if issue {
-        let mut planner = Planner::new(&*exec);
-        service(&*exec, &mut planner, PROXY, false)?;
-        let plan = planner.finish();
-        execute(&plan, RunAs::Root, mode, exec, &mut out)?;
+    let mut planner = Planner::new(&*exec);
+    service(&*exec, &mut planner, PROXY, false)?;
+    execute(&planner.finish(), RunAs::Root, mode, exec, &mut out)?;
+    if mode == Mode::DryRun {
+        return Ok(());
     }
     let shown = x509_parser::pem::parse_x509_pem(&bytes)
         .ok()
