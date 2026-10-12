@@ -1,9 +1,13 @@
+use std::collections::BTreeSet;
+
 use kbf_invocation::{
     Call, CallKind, Event, InvocationId, Listing, Metadata, Owner, RecordKey, Records, WallTime,
 };
 use kbf_types::{Digest, DigestFunction};
 
-use super::pages::{Bad, Cursor, Request, Token, answer, instance_names, still_authorized};
+use super::pages::{
+    Bad, Cursor, Request, Token, answer, instance_names, reader_names, still_authorized,
+};
 use super::views::{Draft, digest_text, rfc3339};
 
 fn d(n: u8) -> Digest {
@@ -151,6 +155,28 @@ fn a_record_that_changed_since_its_authorization_is_not_read() {
     );
     assert!(matches!(refused, Err(Bad::Changed(_))));
     assert_eq!(digest_text(&d(1)), format!("{}-1", "01".repeat(32)));
+}
+
+/// Catches (mutant "the record's instances only": `reader_names` without the rows'):
+/// a row whose instance the record does not hold left out of the names a reader is
+/// asked about, so a page of it is served on the record's names alone (the second
+/// layer: the recorder never sets such a row, `kbf-invocation`'s `tests/bound.rs`).
+/// The row is made here, as the recorder cannot. And a name listed twice, or out of
+/// order (`still_authorized` compares lists), and the empty name for a record that
+/// holds none.
+#[test]
+fn rows_instances_are_asked_about_too() {
+    let records = records("b", &["ci", "ci/main"]);
+    let inv = records.get(&key("b")).expect("held");
+    let mut rows = inv.rows().to_vec();
+    rows[0].instance = "secret".to_owned();
+    assert_eq!(
+        reader_names(inv.instances(), &rows),
+        ["ci", "ci/main", "secret"]
+    );
+    assert_eq!(instance_names(inv), ["ci", "ci/main"]);
+    assert_eq!(reader_names(&BTreeSet::new(), &rows[..1]), ["secret"]);
+    assert_eq!(reader_names(&BTreeSet::new(), &[]), [""]);
 }
 
 /// Catches: a blob's `available` set at the wrong place in the answer, or left `null`

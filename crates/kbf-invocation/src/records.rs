@@ -53,7 +53,9 @@ const HELD: &str = "every key Records hands out names a record it holds";
 ///    is not made (its caller's next record starts incomplete, as for a dropped
 ///    call); anything else (an attempt, an outcome's text, a waiting call, an
 ///    instance name, a later Execute's row) is not set. In every case but a row's,
-///    the record says `complete: false`.
+///    the record says `complete: false`. A call whose instance name was left out
+///    is left out whole (no counter, `last_seen`, row or waiting call): a reader
+///    is authorized on the record's names, so a row never holds another.
 ///
 /// **What a byte is**: what the allocator is asked for. The count follows the
 /// types' sizes, the row lists' capacity, every copy of an id, and B-tree nodes as
@@ -457,8 +459,14 @@ impl Records {
             self.record(&key).seen(call);
         } else {
             let inv = self.record(&key);
-            inv.touch(call.at);
             inv.mark_incomplete();
+            // A reader is authorized on the record's instance names: a call under a
+            // name it could not take changes nothing a page shows (its counts,
+            // `last_seen`, rows or operations in flight), as a dropped call does not.
+            if !inv.instances.contains(&call.instance) {
+                return;
+            }
+            inv.touch(call.at);
         }
         // Indexed under its new `last_seen` before any room is made for its row.
         self.recount(&key);

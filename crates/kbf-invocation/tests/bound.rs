@@ -491,3 +491,105 @@ fn a_mark_larger_than_the_share_is_not_kept() {
     r.apply(ev(c));
     assert!(r.get(&key("u")).expect("u").complete());
 }
+
+/// Catches (security): a row moved to an instance name its record does not hold. At
+/// the bound the record cannot take the new name `b` (its bytes do not fit); a later
+/// Execute of the same action by `b` replaced the row anyway (a shorter name costs
+/// 0 bytes more), so a reader authorized on the record's names read a row of `b`.
+/// The row stays as it was and the record says it is incomplete.
+#[test]
+fn a_row_never_takes_an_instance_name_the_record_does_not_hold() {
+    let on = |e: Event, instance: &str| match e {
+        Event::Call(mut c) => {
+            c.instance = instance.to_owned();
+            Event::Call(c)
+        }
+        e => e,
+    };
+    let first = on(queued("inv", t(1), 10, 1), "aaaaaaaaaaaaaaaa");
+    let mut r = bounded(unbounded(std::slice::from_ref(&first)), &[first]);
+    r.apply(on(queued("inv", t(2), 10, 2), "b"));
+    let inv = r.get(&key("inv")).expect("held");
+    assert_eq!(
+        inv.instances().iter().collect::<Vec<_>>(),
+        ["aaaaaaaaaaaaaaaa"]
+    );
+    let rows: Vec<_> = inv
+        .rows()
+        .iter()
+        .map(|x| (x.instance.as_str(), x.operation.as_deref()))
+        .collect();
+    assert_eq!(rows, [("aaaaaaaaaaaaaaaa", Some(name("inv", 1).as_str()))]);
+    assert!(!inv.complete());
+}
+
+/// Catches (security; mutant "a new row skips the check"): a new row of an instance
+/// name the record could not take. The call's name and its first `tool` do not fit
+/// together, while its row alone does, so the record leaves the name out (the bound
+/// closes the larger open record `big` to rows, not this one) and would have added a
+/// row of it. The row is not added; the record says it is incomplete.
+#[test]
+fn a_new_row_of_a_name_the_record_could_not_take_is_not_added() {
+    let on = |e: Event, instance: &str, tool: Option<String>| match e {
+        Event::Call(mut c) => {
+            c.instance = instance.to_owned();
+            c.metadata.tool = tool;
+            Event::Call(c)
+        }
+        e => e,
+    };
+    let first = on(queued("inv", t(1), 10, 1), "a", None);
+    let fits = on(queued("inv", t(2), 11, 2), "b", None);
+    let mut events: Vec<_> = (20..26)
+        .map(|n| queued("big", t(1), n, u64::from(n)))
+        .collect();
+    events.push(first);
+    let mut all = events.clone();
+    all.push(fits);
+    let mut r = bounded(unbounded(&all), &events);
+    r.apply(on(queued("inv", t(2), 11, 2), "b", Some("x".repeat(4096))));
+    let inv = r.get(&key("inv")).expect("held");
+    assert_eq!(inv.instances().iter().collect::<Vec<_>>(), ["a"]);
+    let rows: Vec<_> = inv.rows().iter().map(|x| x.instance.as_str()).collect();
+    assert_eq!(rows, ["a"]);
+    assert!(!inv.complete());
+}
+
+/// Catches (security; mutant "count before the admit check"): a call whose instance
+/// name the record could not take still applied to it. The name's bytes do not fit,
+/// while an operation and its waiter do; the call must change none of the counts,
+/// `last_seen`, the state (no operation in flight) or the operations held, and the
+/// record says it is incomplete.
+#[test]
+fn a_call_of_a_name_the_record_could_not_take_changes_nothing_else() {
+    let secret = |mut e: Event| {
+        if let Event::Call(c) = &mut e {
+            c.instance = format!("secret/{}", "x".repeat(4096));
+        }
+        e
+    };
+    let prefix = [
+        queued("inv", t(1), 10, 1),
+        finished(1, None, Outcome::Ok { exit_code: 0 }, t(2)),
+    ];
+    let mut room = prefix.to_vec();
+    room.push(queued("inv", t(3), 11, 2));
+    let mut r = bounded(unbounded(&room), &prefix);
+    let before = r.get(&key("inv")).expect("held").clone();
+    let later = t(1_000_000);
+    assert_eq!(before.state(later), State::Idle);
+    r.apply(secret(ev(call(
+        "inv",
+        t(5),
+        CallKind::Uploaded(987_654_321),
+    ))));
+    r.apply(secret(queued("inv", t(6), 11, 2)));
+    let inv = r.get(&key("inv")).expect("held");
+    assert_eq!(inv.instances().iter().collect::<Vec<_>>(), ["main"]);
+    assert_eq!(inv.counts(), before.counts());
+    assert_eq!(inv.last_seen(), before.last_seen());
+    assert_eq!(inv.state(later), State::Idle, "no operation in flight");
+    assert_eq!(r.operations_bytes(), 0, "no operation held");
+    assert_eq!(inv.rows().len(), before.rows().len());
+    assert!(!inv.complete());
+}

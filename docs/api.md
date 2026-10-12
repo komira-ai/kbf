@@ -318,7 +318,7 @@ ran out are listed with the rest, failed or not.
 | `200` | the answer |
 | `400` | a parameter the route does not take, one given twice, a `page_size` outside 1 to 1000, a filter value not listed above, or a page token that does not decode, was made for another route or another filter, or names a position past the rows |
 | `401` | the policy's `authenticationPolicy` refuses the request |
-| `403` | `invocations.getAuthorizer` refuses one of the invocation's instance names |
+| `403` | `invocations.getAuthorizer` refuses one of the invocation's instance names: each one its calls used and each one a row holds, on every route |
 | `404` | the routes are off: `{"error": "<why>", "off": "invocations"}`; no such record is held (never made, removed at the memory bound, or lost at a restart), a page token's included even if a record has been made since under the same key: `{"error": "no_record", "id": "<id>", "records_since": "<time>"}` (below); no such route, `{id}` is not an id or `<id>~<n>`, or no row for the action: `{"error": "<why>"}` |
 | `503` | the record gained an instance name while it was read: send the request again |
 

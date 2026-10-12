@@ -307,7 +307,9 @@ invocation stops taking rows. Each addition is admitted like a row, making room 
 the order above; what still does not fit is left out, and the invocation says
 `complete: false`: a listing keeps the outputs that fit (and the row says
 `outputs_truncated: true`); an attempt, an outcome's message or reason, an instance
-name, a later Execute's row and a call's wait on its operation are not set; and a new
+name, a later Execute's row and a call's wait on its operation are not set; a call
+whose instance name is left out is left out whole (no counter, no `last_seen`, no row,
+no wait), since a reader is asked about the names the invocation holds; and a new
 invocation is not made, so its caller's next call makes it incomplete, as after a
 dropped call (3.4).
 
@@ -541,8 +543,10 @@ the operator API's "anyone who reaches the address" rule.
   the same `Authenticator`: its `authenticate` takes the call's `http::request::Parts`,
   which an HTTP request on the API listener has too. One policy, one set of variants.
 - Two new authorizer keys in the policy file: `invocations.getAuthorizer`, asked with the
-  invocation's instance names (all must allow), and `blobs.getAuthorizer`, asked with the
-  `instance` parameter. Either may be an `instanceNamePrefix` or any built authorizer.
+  invocation's instance names and every row's (all must allow; the recorder never sets
+  a row of a name the record does not hold, and the pages do not rely on it), and
+  `blobs.getAuthorizer`, asked with the `instance` parameter. Either may be an
+  `instanceNamePrefix` or any built authorizer.
 - **Fail closed.** If the policy file has no `invocations` key, or there is no policy
   file, the invocation and blob routes answer `404`, with the `off` body of 4.1, and the
   start line says `invocations=off`. The two keys are separate: with `invocations` and no
