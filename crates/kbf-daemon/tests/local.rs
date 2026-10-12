@@ -143,6 +143,11 @@ async fn a_working_directory_replaced_by_a_link_yields_no_outputs() {
         "symlink",
         &host_dir,
         "../work",
+        // The premise: the working directory's path now leads to the host's file.
+        ";",
+        "wait-for",
+        "../work/secret",
+        "0",
     ])
     .outputs(&["secret"]);
     spec.working_directory = "work".to_owned();

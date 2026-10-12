@@ -300,13 +300,14 @@ fn wait_for(path: &str, within: Duration) -> Result<(), Error> {
     Ok(())
 }
 
-/// Appends `text` and a newline to the file at `path`, creating it.
+/// Appends `text` and a newline to the file at `path`, creating it, in one write: the
+/// lines of processes appending to one file at once stay whole.
 pub(crate) fn append(path: &str, text: &str) -> Result<(), Error> {
     std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)
-        .and_then(|mut file| writeln!(file, "{text}"))
+        .and_then(|mut file| file.write_all(format!("{text}\n").as_bytes()))
         .map_err(failed(format!("append to {path}")))
 }
 

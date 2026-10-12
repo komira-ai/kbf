@@ -123,6 +123,35 @@ fn files_are_appended_and_upper_cased() {
     );
 }
 
+/// Catches: `append` writing a line in more than one write (the words, then the
+/// newline): processes appending to one log at once then run their lines together, as
+/// a fake `xcrun` and `xcodebuild` the daemon runs at once do (seen as a red run of
+/// kbf-node's sandboxed survey test, whose log read `...-version` and the next line
+/// as one).
+#[test]
+fn appends_from_processes_at_once_keep_their_lines_whole() {
+    let dir = dir("act-append-at-once");
+    let log = dir.join("log").display().to_string();
+    let mut steps: Vec<&str> = Vec::new();
+    for _ in 0..200 {
+        steps.extend(["append", &log, "one", "whole", "line", ";"]);
+    }
+    steps.pop();
+    let writers: Vec<_> = (0..8).map(|_| act(&steps).spawn().expect("runs")).collect();
+    for mut writer in writers {
+        assert!(writer.wait().expect("exits").success());
+    }
+    let text = std::fs::read_to_string(&log).expect("log");
+    let broken: Vec<&str> = text.lines().filter(|l| *l != "one whole line").collect();
+    assert!(
+        broken.is_empty(),
+        "{} lines run together, as {:?}",
+        broken.len(),
+        broken.first()
+    );
+    assert_eq!(text.lines().count(), 8 * 200);
+}
+
 /// Catches: `rename` copying (the old name left) or not replacing; `symlink` with its
 /// target and link swapped, or a copy instead of a link; `chmod` setting other bits
 /// than asked (a test of a directory nobody may write would pass on a writable one).
