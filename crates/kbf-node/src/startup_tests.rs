@@ -189,8 +189,18 @@ async fn the_daemon_says_hello_before_its_first_survey_ends() {
         &developer_dir.join(kbf_driver_native::xcode::XCODEBUILD),
         &format!("-version\t-\t{wait} ; echo Build version 1A1\n*\t-\t{wait}\n"),
     );
+    // The xcrun warm-up the first survey starts looks up `cc` first (the survey asks
+    // only for `clang`): held on `warm`, it outlasts the action on every run, as it did
+    // when the clean below raced it (issue #482).
+    let warm = dir.join("warm");
     let xcrun = dir.join("bin/xcrun");
-    fake(&xcrun, "*\t-\techo /x/clang\n");
+    fake(
+        &xcrun,
+        &format!(
+            "--find cc\t-\twait-for {} 20 ; echo /x/clang\n*\t-\techo /x/clang\n",
+            warm.display()
+        ),
+    );
     let sandbox_exec = dir.join("bin/sandbox-exec");
     fake(&sandbox_exec, "");
     let act = dir.join("bin").join(kbf_testkit::act::NAME);
@@ -290,6 +300,14 @@ async fn the_daemon_says_hello_before_its_first_survey_ends() {
     assert_eq!(
         String::from_utf8_lossy(&stdout).trim_end(),
         real_developer_dir.display().to_string()
+    );
+    // The clean must not run while the daemon's warm-up does: its own removal of its
+    // directory, and its lookups' writes, race the clean's walk (`NotFound`).
+    let warm_up = dir.join("leases").join(kbf_driver_native::WARM_UP_DIR);
+    assert!(
+        !warm_up.exists(),
+        "the clean starts while the xcrun warm-up runs in {}",
+        warm_up.display()
     );
     drop(reports);
     kbf_outputs::remove_tree(&dir).expect("clean");
