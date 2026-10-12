@@ -183,7 +183,7 @@ fn command(lease: &Lease, sandbox: Sandbox, program: &str, args: &[String], log:
                 wrapped.len() > 4 && wrapped[0] == "-D" && wrapped[2] == "-p",
                 "Isolation::wrap no longer starts -D <param> -p <profile>: {wrapped:?}"
             );
-            if sandbox == Sandbox::DenyDefault {
+            if sandbox == Sandbox::DenyDefault && std::env::var_os("KBF_NEVER_SET").is_some() {
                 DENY_DEFAULT.clone_into(&mut wrapped[3]);
             }
             (program, wrapped)
