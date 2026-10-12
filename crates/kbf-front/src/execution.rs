@@ -19,8 +19,10 @@
 //! authorizer against the instance name of the operation it names, once that is found
 //! (an unknown name is NOT_FOUND whoever asks). The reads Execute makes for itself (the
 //! action cache, the action, its inputs) are not authorized again. Each Execute runs
-//! in an `execute` trace span carrying the instance name and the caller's public
-//! authentication metadata (`caller`, `-` when there is none).
+//! in an `execute` trace span carrying the instance name, the caller's public
+//! authentication metadata (`caller`, `-` when there is none) and the call's invocation
+//! id (`invocation`, the `RequestMetadata` header's `tool_invocation_id` as
+//! [`crate::RequestMetadataLayer`] read it, `-` when there is none).
 //!
 //! WaitExecution streams the same updates for an operation name Execute returned, until
 //! it is done. A finished operation is kept for a short retention the [`Dispatch`]
@@ -274,13 +276,15 @@ where
         request: GrpcRequest<ExecuteRequest>,
     ) -> Result<Response<OperationStream>, Status> {
         let caller = kbf_auth::metadata(&request);
+        let call = crate::request_metadata::call_metadata(&request);
         let request = request.into_inner();
         let instance = request.instance_name.as_str();
         authorize(&*self.authorizers.execute, &caller, EXECUTE, instance).await?;
         let span = tracing::info_span!(
             "execute",
             instance,
-            caller = %caller.public_display()
+            caller = %caller.public_display(),
+            invocation = call.invocation_display()
         );
         self.execute_authorized(request).instrument(span).await
     }
