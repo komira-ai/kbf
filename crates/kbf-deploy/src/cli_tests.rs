@@ -429,6 +429,149 @@ fn render_units_then_check_units_exit_0_and_a_broken_unit_exits_1() {
     assert!(out.contains("UNITS BROKEN"), "{out}");
 }
 
+/// The kit's settings in a file, with a LAN address filled in.
+fn mdm_config(name: &str) -> String {
+    let dir = kbf_host::testkit::scratch(name);
+    let file = dir.join("config.local");
+    std::fs::write(&file, crate::mdm::tests::config_text()).expect("write");
+    file.to_string_lossy().into_owned()
+}
+
+/// Catches an `mdm` verb whose refusal does not exit 2 with a `REFUSED:` line (an
+/// install without `--bin-dir`, as a user, with a bad config; a fetch into a relative
+/// directory or as root), whose failed step does not exit 1, or whose dry run or
+/// rollback with nothing to do does not exit 0.
+#[test]
+fn the_mdm_verbs_exit_0_done_1_failed_2_refused() {
+    let config = mdm_config("cli_mdm");
+    let install = |extra: &[&str]| -> Vec<String> {
+        ["mdm", "install", "--config", config.as_str()]
+            .iter()
+            .chain(extra)
+            .map(|s| (*s).to_owned())
+            .collect()
+    };
+    let refused: [(u32, Vec<String>, &str); 6] = [
+        (0, install(&[]), "mdm install needs --bin-dir DIR"),
+        (
+            501,
+            install(&["--bin-dir", "/srv/archives"]),
+            "run it with sudo",
+        ),
+        (
+            0,
+            vec![
+                "mdm".into(),
+                "install".into(),
+                "--config".into(),
+                "/srv/none/config".into(),
+                "--uninstall".into(),
+            ],
+            "/srv/none/config",
+        ),
+        (
+            501,
+            vec![
+                "mdm".into(),
+                "fetch".into(),
+                "--dir".into(),
+                "archives".into(),
+            ],
+            "is not absolute",
+        ),
+        (
+            0,
+            vec![
+                "mdm".into(),
+                "fetch".into(),
+                "--dir".into(),
+                "/srv/archives".into(),
+            ],
+            "not root",
+        ),
+        (
+            0,
+            vec![
+                "mdm".into(),
+                "verify".into(),
+                "--config".into(),
+                "/srv/none/config".into(),
+            ],
+            "/srv/none/config",
+        ),
+    ];
+    for (euid, args, want) in refused {
+        let mut exec = FakeExec::new(euid);
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let (code, _, err) = cli(&mut exec, &no_env, &args);
+        assert_eq!(code, ExitCode::from(2), "{args:?}: {err}");
+        assert!(
+            err.starts_with("REFUSED: ") && err.contains(want),
+            "{args:?}: {err}"
+        );
+    }
+
+    // A rollback with nothing installed: exit 0.
+    let mut exec = FakeExec::new(0);
+    let args = install(&["--uninstall"]);
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let (code, out, err) = cli(&mut exec, &no_env, &args);
+    assert_eq!(code, ExitCode::SUCCESS, "{err}");
+    assert!(out.contains("no kbf-mdm unit is installed"), "{out}");
+    // ... and one whose first step fails: exit 1.
+    exec.entries.insert(
+        HostPath::new("/etc/systemd/system/kbf-mdm.slice").expect("path"),
+        kbf_host::exec::Entry::Other,
+    );
+    exec.fail_at = Some(0);
+    let args = install(&["--uninstall", "--apply"]);
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let (code, _, err) = cli(&mut exec, &no_env, &args);
+    assert_eq!(code, ExitCode::FAILURE, "{err}");
+    assert!(err.starts_with("kbf-deploy: step 0 ("), "{err}");
+
+    // A dry run of a fetch into an empty directory: every pinned archive, exit 0.
+    let dir = std::env::temp_dir().join(format!("kbf-deploy-cli-fetch.{}", std::process::id()));
+    let mut exec = FakeExec::new(501);
+    let dir_arg = dir.to_string_lossy().into_owned();
+    let (code, out, err) = cli(
+        &mut exec,
+        &no_env,
+        &["mdm", "fetch", "--dir", &dir_arg, "--only", "caddy"],
+    );
+    assert_eq!(code, ExitCode::SUCCESS, "{err}");
+    assert!(
+        out.contains("DRY-RUN: download https://github.com/caddyserver/caddy/"),
+        "{out}"
+    );
+    assert!(!dir.exists());
+    let (code, _, _) = cli(
+        &mut exec,
+        &no_env,
+        &["mdm", "fetch", "--dir", &dir_arg, "--only", "cady"],
+    );
+    assert_eq!(code, ExitCode::from(2));
+}
+
+/// Catches `mdm verify` exiting 0 when checks fail, or dialling MDM_BIND when told to
+/// dial elsewhere (`--via`, here a closed port).
+#[test]
+fn mdm_verify_exits_1_when_a_check_fails() {
+    let config = mdm_config("cli_mdm_verify");
+    let closed = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let via = closed.local_addr().expect("addr").to_string();
+    drop(closed);
+    let mut exec = FakeExec::new(0);
+    let (code, out, err) = cli(
+        &mut exec,
+        &no_env,
+        &["mdm", "verify", "--config", &config, "--via", &via],
+    );
+    assert_eq!(code, ExitCode::FAILURE, "{err}");
+    assert!(out.contains("FAIL  https://mdm.example.com/version answers: https://mdm.example.com/version: Connection refused"), "{out}");
+    assert!(out.ends_with(" check(s) failed\n"), "{out}");
+}
+
 /// Catches `envoy render` not wired to the kit, its line lost, or a refusal that
 /// exits other than 2 or prints elsewhere than stderr. In-process, so the lib tests'
 /// instantiation of `run` covers the `envoy` arm.
