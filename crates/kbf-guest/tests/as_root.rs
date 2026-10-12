@@ -14,15 +14,18 @@
 //! passwordless sudo).
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant};
 
 const BIN: &str = env!("CARGO_BIN_EXE_kbf-guest");
 
 /// Stops a test run as the runner's user, where every check below would fail for the
-/// wrong reason.
+/// wrong reason. Asks the kernel, not the code under test.
 fn assert_root() {
-    assert!(
-        kbf_guest::session::refuse_root_here().is_err(),
+    // SAFETY: geteuid takes no arguments and cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    assert_eq!(
+        euid, 0,
         "not root: run `cargo xtask sudo-test -p kbf-guest --test as_root`"
     );
 }
@@ -52,9 +55,28 @@ fn set_mode(path: &Path, mode: u32) {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).expect("chmod");
 }
 
+/// Runs `kbf-guest args`. A run still going after 10 seconds (a `serve` that skipped
+/// the refusal and is accepting) is killed, so the checks after it still run.
+fn run_bounded(args: &[std::ffi::OsString]) -> Output {
+    let mut child = Command::new(BIN)
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("ran kbf-guest");
+    let give_up = Instant::now() + Duration::from_secs(10);
+    while child.try_wait().expect("waited on kbf-guest").is_none() && Instant::now() < give_up {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let _ = child.kill();
+    child.wait_with_output().expect("collected kbf-guest")
+}
+
 /// Catches the root refusal skipped, or reported with a status a supervisor reads as
 /// success or as a crash: as root, `session` and `serve` each exit 2 with the refusal,
-/// and `serve` does not create its socket first.
+/// and `serve` does not create its socket first. The token file holds a valid token,
+/// so a `serve` that skipped the refusal would bind its socket: the socket check
+/// catches that on its own, before the exit status is read.
 #[test]
 #[ignore = "needs root: run by `cargo xtask sudo-test -p kbf-guest --test as_root`"]
 fn as_root_every_subcommand_refuses_and_exits_2() {
@@ -62,6 +84,7 @@ fn as_root_every_subcommand_refuses_and_exits_2() {
     let s = Scratch::new("refuse");
     let socket = s.0.join("s");
     let token = s.0.join("t");
+    std::fs::write(&token, "ab".repeat(kbf_guest::wire::TOKEN_LEN)).expect("token file");
     let serve = vec![
         "serve".into(),
         "--unix-socket".into(),
@@ -74,11 +97,12 @@ fn as_root_every_subcommand_refuses_and_exits_2() {
         s.0.clone().into_os_string(),
     ];
     for args in [vec!["session".into()], serve] {
-        let out = Command::new(BIN)
-            .args(&args)
-            .output()
-            .expect("ran kbf-guest");
+        let out = run_bounded(&args);
         let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !socket.exists(),
+            "kbf-guest {args:?} as root created its socket: {stderr}"
+        );
         assert_eq!(
             out.status.code(),
             Some(2),
@@ -90,7 +114,6 @@ fn as_root_every_subcommand_refuses_and_exits_2() {
         );
         assert!(out.stdout.is_empty(), "{args:?} printed {:?}", out.stdout);
     }
-    assert!(!socket.exists(), "the root run created its socket");
 }
 
 #[cfg(target_os = "macos")]
