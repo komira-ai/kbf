@@ -100,13 +100,27 @@ async fn a_slow_kill_does_not_stop_the_daemon() {
     next.hello().await;
     next.welcome();
     let beat = next.heartbeat().await;
-    assert_eq!(beat.running, [LeaseId { term: 1, seq: 3 }], "the stopping lease is listed");
-    assert_eq!(*runtime.killed.lock().expect("lock"), [kbf_types::LeaseId::new(1, 3)]);
-    assert_eq!(next.result(Duration::from_millis(300)).await, None, "reported before it stopped");
+    assert_eq!(
+        beat.running,
+        [LeaseId { term: 1, seq: 3 }],
+        "the stopping lease is listed"
+    );
+    assert_eq!(
+        *runtime.killed.lock().expect("lock"),
+        [kbf_types::LeaseId::new(1, 3)]
+    );
+    assert_eq!(
+        next.result(Duration::from_millis(300)).await,
+        None,
+        "reported before it stopped"
+    );
 
     runtime.stop.add_permits(1);
     let (_, result) = next.result(PROMPT).await.expect("the fenced Result");
     assert_eq!(result.lease_id, lease(1, 3));
-    assert_eq!(result.status.as_ref().map(|s| s.code), Some(Code::Unavailable as i32));
+    assert_eq!(
+        result.status.as_ref().map(|s| s.code),
+        Some(Code::Unavailable as i32)
+    );
     assert_eq!(result.lost(), Lost::Fenced);
 }

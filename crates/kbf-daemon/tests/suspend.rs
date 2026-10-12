@@ -124,7 +124,7 @@ async fn a_suspend_past_t_while_offline_fences() {
     })
     .await
     .expect("fenced while offline");
-    assert_eq!(h.runtime.killed(), [id(1, 3)]);
+    h.killed(&[id(1, 3)]).await;
 }
 
 /// Catches: the Start window measured on a clock that stops during suspend, or on
@@ -282,7 +282,7 @@ async fn a_connection_after_a_suspend_past_t_fences_before_its_hello() {
         .await
         .expect("a Hello on the new stream");
     assert!(fenced_first, "the Hello went out before the fence");
-    assert_eq!(h.runtime.killed(), [id(1, 9)]);
+    h.killed(&[id(1, 9)]).await;
 
     let mut second = h.session().await;
     second.hello().await;

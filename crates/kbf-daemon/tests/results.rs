@@ -134,7 +134,7 @@ async fn a_lease_fenced_offline_is_reported_once_after_welcome() {
     })
     .await
     .expect("fenced while offline");
-    assert_eq!(h.runtime.killed(), [kbf_types::LeaseId::new(5, 1)]);
+    h.killed(&[kbf_types::LeaseId::new(5, 1)]).await;
     // Long enough for the killed run's outcome to reach the daemon, still offline.
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(
