@@ -1,6 +1,7 @@
 //! Test helpers for this crate's own tests, beyond `kbf_host::testkit`: [`tls_server`],
 //! an HTTPS server on a loopback port for the [`crate::https`] client and the `mdm`
-//! kit, and [`http`], the bytes of an answer it sends.
+//! kit; [`http_server`], a plain-HTTP one standing in for the MDM services' APIs on
+//! loopback; and [`http`], the bytes of an answer either sends.
 
 use std::io;
 
@@ -12,6 +13,8 @@ pub struct TlsServer {
     pub ca: rustls::pki_types::CertificateDer<'static>,
     /// The request paths served, in order.
     pub paths: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    /// The request lines and headers served, in order.
+    pub heads: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 impl TlsServer {
@@ -57,7 +60,8 @@ pub fn tls_server(names: &[&str], answer: impl Fn(&str) -> Vec<u8> + Send + 'sta
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().expect("addr");
     let paths = Arc::new(Mutex::new(Vec::new()));
-    let seen = Arc::clone(&paths);
+    let heads = Arc::new(Mutex::new(Vec::new()));
+    let seen = (Arc::clone(&paths), Arc::clone(&heads));
     std::thread::spawn(move || {
         for tcp in listener.incoming().flatten() {
             let _ = serve_one(&config, tcp, &answer, &seen);
@@ -67,14 +71,17 @@ pub fn tls_server(names: &[&str], answer: impl Fn(&str) -> Vec<u8> + Send + 'sta
         addr,
         ca: ca.der().clone(),
         paths,
+        heads,
     }
 }
+
+type Seen = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
 
 fn serve_one(
     config: &std::sync::Arc<rustls::ServerConfig>,
     tcp: std::net::TcpStream,
     answer: &dyn Fn(&str) -> Vec<u8>,
-    seen: &std::sync::Mutex<Vec<String>>,
+    seen: &(Seen, Seen),
 ) -> io::Result<()> {
     use std::io::{Read, Write};
 
@@ -89,7 +96,8 @@ fn serve_one(
     }
     let text = String::from_utf8_lossy(&head).into_owned();
     let path = text.split(' ').nth(1).unwrap_or_default().to_owned();
-    seen.lock().expect("lock").push(path.clone());
+    seen.0.lock().expect("lock").push(path.clone());
+    seen.1.lock().expect("lock").push(text);
     tls.write_all(&answer(&path))?;
     tls.conn.send_close_notify();
     tls.flush()
@@ -104,4 +112,84 @@ pub fn http(status: &str, body: &[u8]) -> Vec<u8> {
     .into_bytes();
     out.extend_from_slice(body);
     out
+}
+
+/// One request a [`HttpServer`] was sent.
+#[derive(Clone, Debug)]
+pub struct Request {
+    pub method: String,
+    pub path: String,
+    /// `(lower-case name, value)`, in order.
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+}
+
+impl Request {
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, v)| v.as_str())
+    }
+}
+
+/// A plain-HTTP server on a loopback port, as the MDM services' APIs are; each
+/// connection gets one answer.
+pub struct HttpServer {
+    pub addr: std::net::SocketAddr,
+    seen: std::sync::Arc<std::sync::Mutex<Vec<Request>>>,
+}
+
+impl HttpServer {
+    /// The requests served, in order.
+    pub fn requests(&self) -> Vec<Request> {
+        self.seen.lock().expect("lock").clone()
+    }
+}
+
+/// Serve on `127.0.0.1:0`, answering each request with the raw bytes `answer` makes of
+/// it. A request is recorded before it is answered, so a test that saw its answer sees
+/// the request too.
+pub fn http_server(answer: impl Fn(&Request) -> Vec<u8> + Send + 'static) -> HttpServer {
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::sync::{Arc, Mutex};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let log = Arc::clone(&seen);
+    std::thread::spawn(move || {
+        for mut tcp in listener.incoming().flatten() {
+            let mut r = BufReader::new(tcp.try_clone().expect("clone"));
+            let mut first = String::new();
+            r.read_line(&mut first).expect("request line");
+            let mut words = first.split(' ');
+            let method = words.next().unwrap_or_default().to_owned();
+            let path = words.next().unwrap_or_default().to_owned();
+            let mut headers = Vec::new();
+            loop {
+                let mut line = String::new();
+                r.read_line(&mut line).expect("header");
+                let line = line.trim_end();
+                let Some((name, value)) = line.split_once(':') else {
+                    break;
+                };
+                headers.push((name.to_ascii_lowercase(), value.trim().to_owned()));
+            }
+            let mut req = Request {
+                method,
+                path,
+                headers,
+                body: Vec::new(),
+            };
+            let length: usize = req
+                .header("content-length")
+                .map_or(0, |v| v.parse().expect("a length"));
+            req.body = vec![0; length];
+            r.read_exact(&mut req.body).expect("body");
+            log.lock().expect("lock").push(req.clone());
+            tcp.write_all(&answer(&req)).expect("answer");
+        }
+    });
+    HttpServer { addr, seen }
 }

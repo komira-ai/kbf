@@ -13,18 +13,27 @@
 //!   properties the REAPI path through the front depends on ([`check`]). The
 //!   operator's namespace the NetworkPolicy must admit is the config's
 //!   `KBF_TS_OPERATOR_NAMESPACE`. It reads only.
+//! - `kbf-deploy envoy apply --config FILE --kubectl PATH --kubeconfig PATH
+//!   [--refuse-example FILE] [--apply]` checks the render and what the cluster must
+//!   already hold, has the API server validate the render (a server-side dry run), and
+//!   only with `--apply` applies it and waits for Envoy and the Ingress's address
+//!   ([`apply`]).
 //!
 //! Both files are JSON, which kubectl and Envoy read, printed as [`json`] describes:
 //! the Deployment's pod template carries the sha256 of `envoy.json`, so the same
 //! settings must always give the same bytes, or every apply would restart Envoy.
 //!
 //! Exit codes: `render` 0 rendered; `check` 0 every check passed, 1 one `FAIL <check>:
-//! <why>` line on stdout per failure. Both: 2 refused (a bad setting, a file that
-//! cannot be read, parsed or written), with a `REFUSED:` line on stderr.
+//! <why>` line on stdout per failure; `apply` 0 done (or, without `--apply`, planned), 1
+//! a step or the check of the Ingress's address failed (`FAIL ...` on stderr). All three:
+//! 2 refused (a bad setting, a file that cannot be read, parsed or written; for `apply`
+//! also a render that fails a check, something the cluster lacks, or the server-side
+//! dry run refusing), with a `REFUSED:` line on stderr.
 //!
 //! The settings are a closed set of `KEY=VALUE` lines ([`config::KEYS`],
 //! `templates/envoy/config.example`); every key must be set.
 
+pub mod apply;
 pub mod check;
 mod check_failure;
 pub mod config;

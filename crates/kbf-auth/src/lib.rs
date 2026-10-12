@@ -17,6 +17,9 @@
 //! Buildbarn's configuration (`authenticationPolicy`, `allow`, `any`, `all`, `deny`,
 //! `instanceNamePrefix`). [`Policy::allow_all`] is what a server runs with no policy
 //! file: every call is accepted with empty metadata, and every authorizer allows.
+//! A policy also holds kbf's one authorizer outside REAPI, `blobs.getAuthorizer`
+//! ([`Policy::blobs_get`]) for the server's HTTP blob route, which is off when the
+//! file does not name it (and under [`Policy::allow_all`]).
 //!
 //! The policies built so far: authenticators `allow` (fixed metadata), `deny`, `any`
 //! and `all`; authorizers `allow`, `deny` and `instanceNamePrefix`. A policy file that

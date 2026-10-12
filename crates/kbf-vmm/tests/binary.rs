@@ -5,7 +5,7 @@ use std::process::Command;
 const BIN: &str = env!("CARGO_BIN_EXE_kbf-vmm");
 
 /// Catches a stub that does not answer `--version` with its name and version and exit
-/// status 0: `tools/ci/sign-darwin.sh` runs `<binary> --version` to show the signed
+/// status 0: `cargo xtask sign-darwin` runs `<binary> --version` to show the signed
 /// binary starts, so such a stub fails the signing job for a reason other than its
 /// signature.
 #[test]

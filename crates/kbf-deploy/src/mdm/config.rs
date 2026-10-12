@@ -1,10 +1,10 @@
 //! The `mdm` kit's settings: `KEY=VALUE` lines over [`KEYS`], checked into
 //! [`MdmConfig`] before anything reads the host.
 //!
-//! Every key the verbs here read must be set; the kit has no defaults, because each
-//! default would be one site's value. The keys of the kit's other steps (the TLS
-//! certificate and the erase path) are accepted and not read, so one file serves the
-//! whole kit.
+//! Every key the verbs read must be set; the kit has no defaults, because each
+//! default would be one site's value. The ACME keys are read only by `mdm tls`
+//! ([`super::tls::Acme`]); the erase path's keys are accepted and not read, so one file
+//! serves the whole kit.
 
 use std::net::Ipv4Addr;
 use std::path::Path;
@@ -30,6 +30,7 @@ pub const KEYS: &[&str] = &[
     "MDM_TASKS_MAX",
     "MDM_DEP_NAME",
     "MDM_ORG",
+    "MDM_PROFILE_ID",
     "MDM_ACME_EMAIL",
     "MDM_ACME_SERVER",
     "MDM_ACME_DNS_PROVIDER",
@@ -63,6 +64,8 @@ pub struct MdmConfig {
     pub dep_name: String,
     /// The organisation in the SCEP CA's name.
     pub org: String,
+    /// The enrollment profile's identifier, reverse-DNS (`com.example.kbf-mdm`).
+    pub profile_id: String,
 }
 
 /// A private IPv4 network, `a.b.c.d/bits` with 8 to 30 bits.
@@ -207,6 +210,14 @@ impl MdmConfig {
         if org.chars().any(char::is_control) {
             return Err(bad("ORG", &org, "holds a control character"));
         }
+        let profile_id = get("PROFILE_ID")?;
+        if !is_dns_name(&profile_id) {
+            return Err(bad(
+                "PROFILE_ID",
+                &profile_id,
+                "not a reverse-DNS identifier (lower-case labels joined by dots)",
+            ));
+        }
         Ok(MdmConfig {
             dns_name,
             bind,
@@ -223,6 +234,7 @@ impl MdmConfig {
             tasks_max,
             dep_name,
             org,
+            profile_id,
         })
     }
 }

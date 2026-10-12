@@ -6,7 +6,7 @@
 //!
 //! cargo run -p kbf-objstore --example s3_conformance -- \
 //!     --endpoint http://127.0.0.1:9000 --bucket kbf-conformance --create-bucket \
-//!     --conditional-put --object-lock
+//!     --conditional-put --object-lock --wait-ready 60
 
 use std::process::ExitCode;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -35,6 +35,23 @@ struct Args {
     /// Claim Object Lock, so the suite checks that retained objects survive delete.
     #[arg(long)]
     object_lock: bool,
+    /// First wait up to this many seconds for the service to answer HTTP (any status),
+    /// for a store that is still starting.
+    #[arg(long, value_name = "SECONDS")]
+    wait_ready: Option<u64>,
+}
+
+/// An error and its sources, `: `-joined (the transport error alone says only that
+/// the request failed).
+fn chain(e: &dyn std::error::Error) -> String {
+    let mut s = e.to_string();
+    let mut next = e.source();
+    while let Some(c) = next {
+        s.push_str(": ");
+        s.push_str(&c.to_string());
+        next = c.source();
+    }
+    s
 }
 
 fn env(name: &str) -> Result<String, String> {
@@ -68,6 +85,17 @@ async fn run(args: Args) -> Result<bool, String> {
         request_timeout: Duration::from_secs(60),
     })
     .map_err(|e| e.to_string())?;
+    if let Some(secs) = args.wait_ready {
+        store
+            .wait_answering(Duration::from_secs(secs))
+            .await
+            .map_err(|e| {
+                format!(
+                    "--wait-ready {secs}: no answer within {secs} s: {}",
+                    chain(&e)
+                )
+            })?;
+    }
     if args.create_bucket {
         store
             .create_bucket()

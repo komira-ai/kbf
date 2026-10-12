@@ -124,14 +124,14 @@ fn a_stale_row_is_refused() {
 
 #[test]
 fn a_row_matches_only_its_own_section() {
-    // Catches: a workflow script cleared by a [files] row of the same key.
-    let mut step = found("w.yml#j/s");
-    step.section = Section::Workflow;
-    let problems = check("[files]\nw.yml#j/s\tCI\n", &[step]);
+    // Catches: a production `sh -c` cleared by a [files] row of the same key.
+    let mut spawn = found("crates/k/src/k.rs");
+    spawn.section = Section::SrcShC;
+    let problems = check("[files]\ncrates/k/src/k.rs\tCI\n", &[spawn]);
     assert_eq!(problems.len(), 2, "{problems:?}");
-    assert!(problems[0].contains("no [workflow] row"), "{problems:?}");
+    assert!(problems[0].contains("no [src-sh-c] row"), "{problems:?}");
     assert!(
-        problems[1].contains("the [files] row for `w.yml#j/s`"),
+        problems[1].contains("the [files] row for `crates/k/src/k.rs`"),
         "{problems:?}"
     );
 }

@@ -20,16 +20,29 @@ echo err >&2
 exit 3"#;
 
 /// One call: files below the fake's directory to write (or, with `None`, remove) first, then the arguments after
-/// `--cgroup-manager=cgroupfs` (`None`: the flag is left out too).
+/// `--cgroup-manager=cgroupfs` (`None`: the flag is left out too), and whether the
+/// files are recorded right after it as well as after the last call.
 struct Call {
     knobs: &'static [(&'static str, Option<&'static str>)],
     args: Option<Vec<String>>,
+    files_after: bool,
 }
 
 fn call(knobs: &'static [(&'static str, Option<&'static str>)], args: &[&str]) -> Call {
     Call {
         knobs,
         args: Some(args.iter().map(|a| (*a).to_owned()).collect()),
+        files_after: false,
+    }
+}
+
+/// `call`, with the files recorded right after it: for a state a later call undoes
+/// (the upper directory unreadable while the overlay is the container's, which the
+/// `chown 0:0` after it restores), which the files after the last call cannot show.
+fn call_then_files(knobs: &'static [(&'static str, Option<&'static str>)], args: &[&str]) -> Call {
+    Call {
+        files_after: true,
+        ..call(knobs, args)
     }
 }
 
@@ -40,6 +53,7 @@ struct Answer {
     code: Option<i32>,
     stdout: String,
     stderr: String,
+    files: Option<BTreeMap<PathBuf, Entry>>,
 }
 
 /// A file or directory the calls left: its mode and, for a file, its bytes.
@@ -84,6 +98,7 @@ fn calls(dir: &Path) -> Vec<Call> {
         Call {
             knobs: &[],
             args: None,
+            files_after: false,
         },
         call(&[], &["frobnicate"]),
         call(&[], &["info", "--format=x"]),
@@ -94,6 +109,16 @@ fn calls(dir: &Path) -> Vec<Call> {
         call(&[("state/create-fails", None)], &["create"]),
         call(&[("state/block-log", Some("stdout"))], &create),
         call(&[("state/block-log", None)], &ps),
+        // Another node's containers: none of them is this one.
+        call(
+            &[],
+            &[
+                "ps",
+                "--all",
+                "--filter=label=kbf.owner=node-2",
+                "--format=x",
+            ],
+        ),
         call(&[("state/ps-extra", Some("node-1 other\n"))], &ps),
         call(&[("state/ps-fails", Some(""))], &ps),
         call(&[], &["inspect", "--type=container", "kbf-lease-1-1"]),
@@ -109,7 +134,7 @@ fn calls(dir: &Path) -> Vec<Call> {
             &["kill", "--signal=TERM", "x"],
         ),
         call(&[], &["unshare", "chown", "-hR", "1:1", "--", &upper, "/b"]),
-        call(
+        call_then_files(
             &[("state/status-override", Some("stopped 0\n"))],
             &["start", "--attach", "kbf-lease-1-1"],
         ),
@@ -136,7 +161,7 @@ fn calls(dir: &Path) -> Vec<Call> {
             &[("state/unshare-fails", Some(""))],
             &["unshare", "rm", "-rf", "--", &gone],
         ),
-        call(
+        call_then_files(
             &[
                 ("state/unshare-fails", None),
                 ("state/unshare-noop", Some("")),
@@ -201,6 +226,12 @@ fn run(dir: &Path, program: &Path) -> (Vec<Answer>, BTreeMap<PathBuf, Entry>) {
             code: output.status.code(),
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            files: call.files_after.then(|| {
+                let mut files = tree(dir);
+                // The link to the fake: its target is outside the directory.
+                files.remove(Path::new("podman"));
+                files
+            }),
         });
     }
     (answers, tree(dir))
@@ -239,7 +270,8 @@ fn tree(dir: &Path) -> BTreeMap<PathBuf, Entry> {
 }
 
 /// The answers and files as the golden file has them: the fake's directory written
-/// `<dir>`, one call per block, then one line per file below the directory.
+/// `<dir>`, one call per block (with the files after it, for a call that records
+/// them), then one line per file below the directory.
 fn render(dir: &Path, answers: &[Answer], files: &BTreeMap<PathBuf, Entry>) -> String {
     let dir = dir.to_str().expect("utf-8 path");
     let mut text = String::new();
@@ -256,17 +288,25 @@ fn render(dir: &Path, answers: &[Answer], files: &BTreeMap<PathBuf, Entry>) -> S
             "$ podman {args}\nexit {code}\nstdout {:?}\nstderr {:?}\n",
             answer.stdout, answer.stderr
         );
+        if let Some(files) = &answer.files {
+            text += "files after this call\n";
+            render_files(&mut text, files);
+        }
     }
     text += "files\n";
+    render_files(&mut text, files);
+    text.replace(dir, "<dir>")
+}
+
+fn render_files(text: &mut String, files: &BTreeMap<PathBuf, Entry>) {
     for (name, entry) in files {
         let name = name.display();
-        text += &match entry {
+        *text += &match entry {
             Entry::Dir(mode) => format!("d {mode:04o} {name}\n"),
             Entry::File(mode, bytes) => format!("f {mode:04o} {name} {bytes:?}\n"),
             Entry::Link(to) => format!("l {name} -> {}\n", to.display()),
         };
     }
-    text.replace(dir, "<dir>")
 }
 
 /// Catches the fake answering a call, or writing a record, otherwise than the driver
@@ -312,6 +352,18 @@ fn the_fake_answers_and_records_as_its_golden_file_says() {
     assert!(
         !files.contains_key(Path::new("gone")),
         "unshare rm never ran"
+    );
+    // The upper directory is the container's after `chown 1:1`, and the `start` after
+    // that must leave it unreadable: the oracle tests/userns.rs relies on to catch the
+    // driver reading the outputs before it hands the overlay back.
+    let after_start = answers
+        .iter()
+        .find_map(|a| a.files.as_ref())
+        .expect("files recorded after the start the container owns");
+    assert_eq!(
+        after_start.get(Path::new("lease/upper")),
+        Some(&Entry::Dir(0)),
+        "the start after chown 1:1 left the upper directory readable"
     );
     let got = render(&dir, &answers, &files);
     let golden_path =
