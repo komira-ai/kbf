@@ -12,7 +12,7 @@
 //! 1. `MDM_STATE` and its subdirectories, `MDM_USER`'s, 0700; `MDM_ETC`, root and
 //!    `MDM_USER`'s group, 0750; `MDM_BIN`, root's, 0755;
 //! 2. each binary unpacked from its checked archive into `MDM_BIN`, root's, 0755, the
-//!    one it replaces kept as `<name>.previous`;
+//!    one it replaces kept as `<name>.previous` (its mode, root's);
 //! 3. the secrets, each made once from 32 random bytes as hex and never printed:
 //!    `NANOHUB_API_KEY` (`nanohub.env`), `NANODEP_API` (`nanodep.env`) and
 //!    `SCEP_CHALLENGE_PASSWORD` (`scep.env`), in 0600 root files under `MDM_ETC`;
@@ -46,7 +46,7 @@ use super::render::{
     self, CERT_SERVICE, CERT_TIMER, DEPSERVER, NANOHUB, PROXY, RELOAD_PATH, RELOAD_SERVICE, SCEP,
     SLICE,
 };
-use crate::linux::host::{self, SS, SYSTEMCTL, note, parents, tool, under, unit_is};
+use crate::linux::host::{self, SS, SYSTEMCTL, binary, note, parents, tool, under, unit_is};
 use kbf_host::exec::{Entry, Exec};
 use kbf_host::path::HostPath;
 use kbf_host::plan::{Mode, Plan, Planner, RunAs, execute};
@@ -121,10 +121,8 @@ pub fn plan<E: Exec>(
     let mut changed: BTreeSet<&str> = BTreeSet::new();
     for (name, bytes) in binaries {
         let path = under(&c.bin, name)?;
-        if binary(exec, &mut planner, &path, bytes)? {
+        if binary(exec, &mut planner, &path, bytes, ROOT, out)? {
             changed.insert(name);
-        } else {
-            note(out, format_args!("{path}: unchanged"))?;
         }
     }
     for (file, key) in SECRETS {
@@ -296,27 +294,6 @@ fn binaries<E: Exec>(
         }
     }
     Ok(out)
-}
-
-/// Plan `bytes` into `dst` (root's, 0755), keeping a different file there as
-/// `<dst>.previous`; whether it changes.
-fn binary<E: Exec>(
-    exec: &E,
-    planner: &mut Planner<'_, E>,
-    dst: &HostPath,
-    bytes: Vec<u8>,
-) -> Result<bool, MdmError> {
-    if let Some(Entry::File {
-        perms,
-        owner,
-        bytes: old,
-    }) = host::inspect(exec, dst)?
-        && old != bytes
-    {
-        let previous = HostPath::new(&format!("{dst}.previous"))?;
-        planner.file(previous, perms, Some(owner), old)?;
-    }
-    Ok(planner.file(dst.clone(), Perms::new(0o755), Some(ROOT), bytes)?)
 }
 
 /// Plan the secret file `path` holding `key`, unless it holds a value already (then it
