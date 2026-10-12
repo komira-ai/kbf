@@ -51,6 +51,9 @@ md-5 = "0.11.0"
 objc2 = "0.6.5"
 objc2-foundation = { version = "0.3.2", default-features = false, features = ["std"] }
 objc2-open-directory = { version = "0.3.2", default-features = false, features = ["std"] }
+# The enrollment profile kbf-deploy writes (`mdm push-cert`), an XML property list.
+# No default features: the profile is built as a value, not through serde.
+plist = { version = "1.10.1", default-features = false }
 # The token trees of syn (below). Already in the tree through the derive macros.
 proc-macro2 = "1.0.107"
 prost = "0.14.4"

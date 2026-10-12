@@ -669,3 +669,118 @@ fn envoy_check_exits_0_passed_1_failed_2_refused() {
     assert_eq!((code, out.as_str()), (ExitCode::from(2), ""), "{err}");
     assert!(err.ends_with(": unknown key KBF_SERVER\n"), "{err}");
 }
+
+/// Catches a `tls`, `push-cert` or `dep` verb not wired to its kit (each reaches the
+/// kit's root check, so each refuses as a user with a `REFUSED:` line and exit 2), a
+/// `--check-godaddy` that skips that check, and flags clap must refuse: a topic
+/// without `--profile-only` or malformed, a push certificate without its key, a
+/// malformed serial, `--check-godaddy` with `--apply`.
+#[test]
+fn the_tls_push_cert_and_dep_verbs_reach_their_kit() {
+    let dir = kbf_host::testkit::scratch("cli_mdm_more");
+    let file = dir.join("config.local");
+    let text = crate::mdm::tests::config_text()
+        .replace("MDM_ACME_EMAIL=\n", "MDM_ACME_EMAIL=ops@example.com\n")
+        .replace(
+            "MDM_ACME_DNS_PROVIDER=\n",
+            "MDM_ACME_DNS_PROVIDER=godaddy\n",
+        );
+    std::fs::write(&file, text).expect("write");
+    let config = file.to_string_lossy().into_owned();
+    let topic = "com.apple.mgmt.External.0a1b2c3d-4e5f-6a7b-8c9d-0e1f2a3b4c5d";
+    let c = config.as_str();
+    let refused: [&[&str]; 8] = [
+        &["mdm", "tls", "--config", c],
+        &["mdm", "tls", "--config", c, "--check-godaddy"],
+        &[
+            "mdm",
+            "push-cert",
+            "--config",
+            c,
+            "--profile-only",
+            "--topic",
+            topic,
+        ],
+        &[
+            "mdm",
+            "push-cert",
+            "--config",
+            c,
+            "--cert",
+            "/srv/k/p.pem",
+            "--key",
+            "/srv/k/p.key",
+        ],
+        &[
+            "mdm",
+            "dep",
+            "get-cert",
+            "--config",
+            c,
+            "--out",
+            "/srv/abm/c.pem",
+        ],
+        &[
+            "mdm",
+            "dep",
+            "upload-token",
+            "--config",
+            c,
+            "--token",
+            "/srv/abm/t.p7m",
+        ],
+        &["mdm", "dep", "define-profile", "--config", c, "--apply"],
+        &[
+            "mdm",
+            "dep",
+            "assign",
+            "--config",
+            c,
+            "--serial",
+            "C02AB12CD3EF",
+        ],
+    ];
+    for args in refused {
+        let mut exec = FakeExec::new(501);
+        let (code, _, err) = cli(&mut exec, &no_env, args);
+        assert_eq!(code, ExitCode::from(2), "{args:?}: {err}");
+        assert!(
+            err.starts_with("REFUSED: mdm ") && err.contains("run it with sudo"),
+            "{args:?}: {err}"
+        );
+    }
+    let example = mdm_config("cli_mdm_acme");
+    let mut exec = FakeExec::new(0);
+    let (code, _, err) = cli(&mut exec, &no_env, &["mdm", "tls", "--config", &example]);
+    assert_eq!(code, ExitCode::from(2));
+    assert!(err.contains("MDM_ACME_EMAIL is not set"), "{err}");
+    let bad_flags: [&[&str]; 5] = [
+        &["mdm", "push-cert", "--config", c, "--topic", topic],
+        &[
+            "mdm",
+            "push-cert",
+            "--config",
+            c,
+            "--profile-only",
+            "--topic",
+            "com.apple.x",
+        ],
+        &["mdm", "push-cert", "--config", c, "--cert", "/srv/k/p.pem"],
+        &[
+            "mdm",
+            "dep",
+            "assign",
+            "--config",
+            c,
+            "--serial",
+            "c02ab12cd3ef",
+        ],
+        &["mdm", "tls", "--config", c, "--check-godaddy", "--apply"],
+    ];
+    for args in bad_flags {
+        let mut exec = FakeExec::new(0);
+        let (code, _, err) = cli(&mut exec, &no_env, args);
+        assert_eq!(code, ExitCode::from(2), "{args:?}: {err}");
+        assert!(exec.queries.borrow().is_empty(), "{args:?}");
+    }
+}

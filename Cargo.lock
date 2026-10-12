@@ -1254,12 +1254,14 @@ dependencies = [
 name = "kbf-deploy"
 version = "0.1.0"
 dependencies = [
+ "base64 0.23.1",
  "clap",
  "flate2",
  "hex",
  "httparse",
  "kbf-host",
  "kbf-types",
+ "plist",
  "rcgen",
  "rustix",
  "rustls",
@@ -2193,6 +2195,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "plist"
+version = "1.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2896bade328c13f7042a297ea5ac5b0951f6cf989dea5f32c2fd98da398195cb"
+dependencies = [
+ "base64 0.23.1",
+ "indexmap",
+ "quick-xml",
+ "time",
+]
+
+[[package]]
 name = "potential_utf"
 version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2354,6 +2368,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "84bbb29c624230c4bd1047bbdb2aa47e41c860e9665ce62ba9504eebe91bf867"
 dependencies = [
  "pulldown-cmark",
+]
+
+[[package]]
+name = "quick-xml"
+version = "0.42.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "41b1177fdf999d2321d3fb46ff47159d9c1fb9ad66a4879f8c50a0b504615e9b"
+dependencies = [
+ "memchr",
 ]
 
 [[package]]

@@ -11,24 +11,29 @@ publish.workspace = true
 # kbf-host's plan of steps, printed by default and carried out with `--apply`. Four
 # kits: `minio` (buckets and their key, a NodePort for the S3 port), `linux`
 # (render-units, check-units, and as root install-units, image-pull and swap), `mdm`
-# (fetch the pinned upstream archives, install the MDM services as root, verify them)
-# and `envoy` (render, and check a render). rustls (ring), httparse and
-# rustls-native-certs make the HTTPS client of `mdm fetch` and `mdm verify`; sha2
-# checks the archives against their pins and hashes the rendered Envoy config into the
-# pod template; zip, tar and flate2 unpack the archives; x509-parser reads the
-# certificates `mdm verify` checks.
+# (fetch the pinned upstream archives; as root install the MDM services, the TLS
+# certificate, the push certificate and the enrollment profile, and link NanoDEP to
+# Apple Business Manager; verify them) and `envoy` (render, and check a render).
+# rustls (ring), httparse and rustls-native-certs make the HTTPS client of `mdm fetch`,
+# `mdm verify` and `mdm tls --check-godaddy`, and rustls loads the push certificate's
+# key to match it to the certificate; sha2 checks the archives against their pins and
+# hashes the rendered Envoy config into the pod template; zip, tar and flate2 unpack the
+# archives; x509-parser reads the certificates `mdm` checks; plist writes the enrollment
+# profile; base64 encodes the Basic auth of the MDM services' APIs.
 
 [[bin]]
 name = "kbf-deploy"
 path = "src/main.rs"
 
 [dependencies]
+base64.workspace = true
 clap.workspace = true
 flate2.workspace = true
 hex.workspace = true
 httparse.workspace = true
 kbf-host.workspace = true
 kbf-types.workspace = true
+plist.workspace = true
 rustls.workspace = true
 rustls-native-certs.workspace = true
 serde.workspace = true
