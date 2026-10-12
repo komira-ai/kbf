@@ -14,6 +14,11 @@
 //!   are `application/octet-stream` with `Content-Disposition: attachment`; `?name=` is
 //!   sent only as an RFC 8187 `filename*`, percent-encoded. `?inline=text` serves a blob
 //!   of at most [`INLINE_MAX_BYTES`] as `text/plain; charset=utf-8`, `inline`.
+//! - **A memory budget.** A read holds the whole blob in memory (verification needs
+//!   all of it), and the bytes of every answer still being sent count against
+//!   [`READ_BUDGET_BYTES`]; a read that does not fit in what is left is `503` before a
+//!   byte is read. The cache keeps one digest per blob, so it cannot check a part of
+//!   one, and a second read to stream from would send bytes nobody checked.
 //! - **One byte range.** `Range: bytes=...` with a single range is answered `206`, one
 //!   that cannot be satisfied `416`; anything else (several ranges, another unit, a
 //!   malformed value) is ignored and the whole blob is sent, as RFC 9110 allows.
@@ -36,11 +41,17 @@ use kbf_front::{Cache, MetaLog};
 use kbf_objstore::ObjectStore;
 use kbf_types::{Digest, DigestFunction};
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tonic::{Code, Status};
 
 /// The largest blob `?inline=text` serves: 4 MiB. A larger one is refused `400`, and
 /// is still served as an attachment.
 pub const INLINE_MAX_BYTES: u64 = 4 * 1024 * 1024;
+
+/// The most blob bytes the route holds at once, over all the answers it is reading
+/// or sending: 1 GiB, [`kbf_front::MAX_BLOB_BYTES`], so the largest blob the cache accepts can
+/// always be served when nothing else is.
+pub const READ_BUDGET_BYTES: usize = 1 << 30;
 
 /// The route's path prefix; the digest follows it.
 const PREFIX: &str = "/v1/blobs/";
@@ -87,6 +98,34 @@ impl BlobReaders {
 struct BlobState<M, O> {
     cache: Arc<Cache<M, O>>,
     readers: Option<BlobReaders>,
+    /// One permit per byte of [`READ_BUDGET_BYTES`]; an answer's bytes hold theirs
+    /// until the last of them is dropped.
+    budget: Arc<Semaphore>,
+}
+
+impl<M, O> BlobState<M, O> {
+    /// The state of a route that holds at most `budget` blob bytes at once (at most
+    /// [`Semaphore::MAX_PERMITS`]; the route's is [`READ_BUDGET_BYTES`]).
+    fn new(cache: Arc<Cache<M, O>>, readers: Option<BlobReaders>, budget: usize) -> Self {
+        Self {
+            cache,
+            readers,
+            budget: Arc::new(Semaphore::new(budget)),
+        }
+    }
+}
+
+/// A blob's bytes and the budget they hold: dropped with the last `Bytes` that
+/// shares them.
+struct Held {
+    bytes: Bytes,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl AsRef<[u8]> for Held {
+    fn as_ref(&self) -> &[u8] {
+        &self.bytes
+    }
 }
 
 /// The blob route over `cache`; with `readers` `None` it answers every request `404`.
@@ -97,7 +136,7 @@ where
 {
     Router::new()
         .route("/v1/blobs/{digest}", get(blob::<M, O>))
-        .with_state(Arc::new(BlobState { cache, readers }))
+        .with_state(Arc::new(BlobState::new(cache, readers, READ_BUDGET_BYTES)))
 }
 
 async fn blob<M, O>(State(state): State<Arc<BlobState<M, O>>>, parts: Parts) -> Response
@@ -151,11 +190,25 @@ where
         );
         return Err(error(StatusCode::BAD_REQUEST, &why));
     }
+    let permit = u32::try_from(digest.size_bytes)
+        .ok()
+        .and_then(|n| Arc::clone(&state.budget).try_acquire_many_owned(n).ok())
+        .ok_or_else(|| {
+            let why = format!(
+                "{digest} does not fit in the memory left for blob reads \
+                 ({READ_BUDGET_BYTES} bytes in all); try again when other reads finish"
+            );
+            error(StatusCode::SERVICE_UNAVAILABLE, &why)
+        })?;
     let bytes = state
         .cache
         .read_blob(&digest)
         .await
         .map_err(|e| refusal(&Status::from(e)))?;
+    let bytes = Bytes::from_owner(Held {
+        bytes,
+        _permit: permit,
+    });
     Ok(served(&bytes, &query, parts.headers.get(RANGE)))
 }
 

@@ -249,6 +249,14 @@ quote, a `;` or a line break in it can never end the value or add a parameter. W
 `filename*`), for a blob of at most 4 MiB (4194304 bytes); a larger one is `400`, and
 still downloads without `inline`.
 
+**Memory.** Like a ByteStream Read, a read holds the whole blob in memory, because the
+cache keeps one digest per blob and can check only all of it; a second read to stream
+from would send bytes nobody checked. So the route keeps a budget: the blobs of all the
+answers it is reading or still sending hold at most 1 GiB (1073741824 bytes, the largest
+blob the cache accepts) at once. A read whose blob does not fit in what is left is `503`
+before a byte is read; it can be asked again once other answers have been sent. A slow
+client holds its blob's share of the budget until its answer is sent or it goes away.
+
 **Never a page.** Every answer of the route, the errors and `404` included, carries
 `X-Content-Type-Options: nosniff` and `Content-Security-Policy: sandbox`, so stdout that
 holds HTML is shown as text and never runs as a page on the API's origin.
@@ -268,7 +276,7 @@ ignored, as RFC 9110 allows, and the whole blob is sent. Every `200` and `206` s
 | `403` | `blobs.getAuthorizer` refuses the instance name |
 | `404` | the route is off, or the blob is not held |
 | `416` | the range starts past the end |
-| `503` | the blob is held but its bytes cannot be read (missing from the store, or failing their digest), or the store or the metadata log does not answer |
+| `503` | the blob does not fit in the memory budget left for blob reads, the blob is held but its bytes cannot be read (missing from the store, or failing their digest), or the store or the metadata log does not answer |
 | `500` | the cache's own records disagree |
 
 Errors are JSON, `{"error": "<why>"}`, as everywhere in this API.

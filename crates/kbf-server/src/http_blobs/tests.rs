@@ -208,3 +208,88 @@ fn refusals_keep_their_meaning() {
         assert_eq!(answer.headers()[CONTENT_TYPE], crate::api::JSON);
     }
 }
+
+/// The state of a route over a memory cache that holds at most `budget` blob bytes at
+/// once, with every caller allowed and `contents` stored; their digests, in order.
+async fn budgeted(
+    budget: usize,
+    contents: &[&'static [u8]],
+) -> (
+    BlobState<kbf_front::MemoryMetaLog, kbf_objstore::MemoryStore>,
+    Vec<Digest>,
+) {
+    let policy = Policy::from_json(
+        r#"{"authenticationPolicy": {"allow": {}}, "blobs": {"getAuthorizer": {"allow": {}}}}"#,
+    )
+    .expect("a policy");
+    let cache = Arc::new(Cache::memory());
+    let blobs: Vec<_> = contents
+        .iter()
+        .map(|c| kbf_front::VerifiedBlob::hashed(Bytes::from_static(c)))
+        .collect();
+    let digests = blobs.iter().map(kbf_front::VerifiedBlob::digest).collect();
+    cache.store_blobs(blobs).await.expect("store");
+    let state = BlobState::new(cache, BlobReaders::from_policy(&policy), budget);
+    (state, digests)
+}
+
+/// The answer to a `GET` of `digest` (no query, no headers).
+async fn get<M: MetaLog, O: ObjectStore + 'static>(
+    state: &BlobState<M, O>,
+    digest: &Digest,
+) -> Response {
+    let uri = format!("{PREFIX}{}-{}", digest.hash_hex(), digest.size_bytes);
+    let (parts, ()) = axum::http::Request::builder()
+        .uri(uri)
+        .body(())
+        .expect("a request")
+        .into_parts();
+    match answer(state, &parts).await {
+        Ok(answer) | Err(answer) => answer,
+    }
+}
+
+/// Catches (mutants "release the budget once the blob is read", "one permit per read
+/// instead of per byte", "no budget"): reads that together hold more blob bytes than
+/// the budget. With 10 bytes, an 8-byte answer not yet sent leaves room for a 2-byte
+/// read and not for a second 8-byte one (`503`, before the read); once its bytes are
+/// dropped the 8-byte blob is served again. A digest whose size cannot be a permit
+/// count (over `u32`) is `503` too, not a panic.
+#[tokio::test]
+async fn bytes_not_yet_sent_hold_the_read_budget() {
+    let (state, digests) = budgeted(10, &[b"8 bytes!", b"2b"]).await;
+    let (eight, two) = (digests[0], digests[1]);
+    let first = get(&state, &eight).await;
+    assert_eq!(first.status(), StatusCode::OK);
+    let busy = get(&state, &eight).await;
+    assert_eq!(busy.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let why = axum::body::to_bytes(busy.into_body(), usize::MAX)
+        .await
+        .expect("a body");
+    let why = String::from_utf8_lossy(&why);
+    assert!(why.contains("does not fit in the memory left"), "{why}");
+    let small = get(&state, &two).await;
+    assert_eq!(small.status(), StatusCode::OK);
+    drop(small);
+    let body = axum::body::to_bytes(first.into_body(), usize::MAX)
+        .await
+        .expect("a body");
+    assert_eq!(&body[..], b"8 bytes!");
+    drop(body);
+    assert_eq!(get(&state, &eight).await.status(), StatusCode::OK);
+    let huge = Digest::new(DigestFunction::Sha256, [9; 32], 1 << 33);
+    assert_eq!(
+        get(&state, &huge).await.status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+}
+
+/// Catches: a budget smaller than the largest blob the cache accepts, which could
+/// never be served.
+#[test]
+fn the_read_budget_holds_the_largest_blob() {
+    assert_eq!(
+        u64::try_from(READ_BUDGET_BYTES),
+        Ok(kbf_front::MAX_BLOB_BYTES)
+    );
+}
