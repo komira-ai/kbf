@@ -601,8 +601,8 @@ fn a_near_name_in_a_deny_file_is_not_the_role() {
 }
 
 /// Catches: a `dscl -read` that fails for a reason other than a missing record taken
-/// as "no `_kbf`": `create` would run `dscl . -create /Users/_kbf UniqueID 470` over
-/// a `_kbf` that has another uid. It must fail before any change, and `status` too.
+/// as "no `_kbf`": `create` would then set `UniqueID 470` on a `_kbf` that has
+/// another uid. It must fail before any change, and `status` too.
 #[test]
 fn a_directory_read_that_fails_is_not_a_missing_record() {
     let mac = FakeMac::new("role-dscl-read-fails");
