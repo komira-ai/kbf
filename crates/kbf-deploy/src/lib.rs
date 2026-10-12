@@ -20,9 +20,12 @@
 //!   (`linux check-units`); and, as root, the units installed and the services started
 //!   (`linux install-units`), the pinned images pulled as the kbf user (`linux
 //!   image-pull`) and the swapfile (`linux swap`).
+//! - [`envoy`]: a client front's Kubernetes objects and Envoy config, rendered from
+//!   the settings (`envoy render`), byte for byte the same for the same settings.
 
 pub mod cli;
 pub mod config;
+pub mod envoy;
 pub mod linux;
 pub mod minio;
 pub mod template;
