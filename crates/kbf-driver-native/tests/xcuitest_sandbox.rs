@@ -581,7 +581,7 @@ fn arm(name: &str, platform: Platform, action: Action, sandbox: Sandbox) -> Arm 
         let read_log = lease
             .out
             .join(format!("{}-xcresulttool.log", platform.name()));
-        let read = tracked(command(&lease, sandbox, "/usr/bin/xcrun", &args, &read_log));
+        let read = tracked(command(&lease, Sandbox::Off, "/usr/bin/xcrun", &args, &read_log));
         eprintln!(
             "{name}: xcresulttool under the profile: exit {:?}",
             read.exit
