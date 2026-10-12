@@ -601,3 +601,71 @@ fn envoy_render_exits_0_and_a_bad_setting_exits_2() {
         "{err}"
     );
 }
+
+/// Catches `envoy check` not wired to the kit, a check that reads another file than
+/// `--dir`'s manifests.json (or no render without `--dir`), a failure printed
+/// elsewhere than stdout or with an exit other than 1, and an unreadable or non-JSON
+/// render or a bad setting exiting other than 2 with a `REFUSED:` line.
+#[test]
+fn envoy_check_exits_0_passed_1_failed_2_refused() {
+    let dir = kbf_host::testkit::scratch("cli-envoy-check");
+    let config = dir.join("config.local");
+    let example = include_str!("../templates/envoy/config.example");
+    std::fs::write(&config, example).expect("config");
+    let config = config.to_str().expect("utf-8").to_owned();
+    let rendered = dir.join("rendered");
+    let rendered = rendered.to_str().expect("utf-8").to_owned();
+    let mut exec = FakeExec::new(501);
+    let passed = "12 methods routed, every check passed\n";
+
+    let (code, out, err) = cli(&mut exec, &no_env, &["envoy", "check", "--config", &config]);
+    assert_eq!(
+        (code, out.as_str(), err.as_str()),
+        (ExitCode::SUCCESS, passed, "")
+    );
+
+    let check = ["envoy", "check", "--config", &config, "--dir", &rendered];
+    let (code, out, err) = cli(&mut exec, &no_env, &check);
+    assert_eq!((code, out.as_str()), (ExitCode::from(2), ""), "{err}");
+    assert!(
+        err.starts_with(&format!("REFUSED: cannot read {rendered}/manifests.json: ")),
+        "{err}"
+    );
+
+    let render = ["envoy", "render", "--config", &config, "--out", &rendered];
+    assert_eq!(cli(&mut exec, &no_env, &render).0, ExitCode::SUCCESS);
+    let (code, out, err) = cli(&mut exec, &no_env, &check);
+    assert_eq!(
+        (code, out.as_str(), err.as_str()),
+        (ExitCode::SUCCESS, passed, "")
+    );
+
+    let manifests = format!("{rendered}/manifests.json");
+    let text = std::fs::read_to_string(&manifests).expect("rendered");
+    let class = "\"ingressClassName\": \"tailscale\"";
+    assert_eq!(text.matches(class).count(), 1);
+    std::fs::write(
+        &manifests,
+        text.replace(class, "\"ingressClassName\": \"nginx\""),
+    )
+    .expect("plant");
+    let (code, out, err) = cli(&mut exec, &no_env, &check);
+    assert_eq!((code, err.as_str()), (ExitCode::FAILURE, ""), "{out}");
+    assert_eq!(
+        out,
+        "FAIL ingress-class: ingressClassName nginx is not the tailscale IngressClass\n"
+    );
+
+    std::fs::write(&manifests, "{").expect("plant");
+    let (code, out, err) = cli(&mut exec, &no_env, &check);
+    assert_eq!((code, out.as_str()), (ExitCode::from(2), ""), "{err}");
+    assert!(
+        err.starts_with(&format!("REFUSED: {manifests} is not JSON: ")),
+        "{err}"
+    );
+
+    std::fs::write(&config, example.replace("KBF_SERVERS=", "KBF_SERVER=")).expect("plant");
+    let (code, out, err) = cli(&mut exec, &no_env, &check);
+    assert_eq!((code, out.as_str()), (ExitCode::from(2), ""), "{err}");
+    assert!(err.ends_with(": unknown key KBF_SERVER\n"), "{err}");
+}

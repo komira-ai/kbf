@@ -125,6 +125,12 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    # The Envoy release the envoy kit's image runs (templates/envoy/config.example),
+    # for Envoy's own validation of the kit's render. The sha256 is the release's
+    # checksums.txt.asc entry.
+    env:
+      ENVOY_VERSION: 1.39.3
+      ENVOY_SHA256: f61653fb5f7645129d3092a82f21ce3e6f70d0a75fe2e861b0e7417790f2c200
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -151,6 +157,14 @@ jobs:
       # other commits from the same checkout (crates/kbf-server/build.rs,
       # crates/xtask/src/build_commit.rs).
       - run: cargo xtask build-commit stamps "$GITHUB_SHA"
+      - name: Fetch Envoy (pinned release, checked by SHA-256)
+        run: cargo xtask fetch --url "https://github.com/envoyproxy/envoy/releases/download/v$ENVOY_VERSION/envoy-$ENVOY_VERSION-linux-x86_64" --sha256 "$ENVOY_SHA256" --out "$RUNNER_TEMP/tools/envoy"
+      # Envoy accepts the envoy kit's render and refuses a control with an unknown
+      # field (crates/kbf-deploy/tests/envoy_validate.rs).
+      - name: Envoy validates the envoy kit's render
+        run: cargo test -p kbf-deploy --test envoy_validate --locked -- --ignored
+        env:
+          KBF_TEST_ENVOY: ${{ runner.temp }}/tools/envoy
       - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         if: ${{ github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true' }}
         with:

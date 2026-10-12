@@ -26,7 +26,9 @@
 //!   (`mdm fetch`), its services installed as root (`mdm install`), and read-only
 //!   checks of what runs (`mdm verify`).
 //! - [`envoy`]: a client front's Kubernetes objects and Envoy config, rendered from
-//!   the settings (`envoy render`), byte for byte the same for the same settings.
+//!   the settings (`envoy render`), byte for byte the same for the same settings, and
+//!   a render checked for what the REAPI path through the front depends on
+//!   (`envoy check`).
 
 pub mod cli;
 pub mod config;
