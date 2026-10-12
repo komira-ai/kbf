@@ -177,7 +177,9 @@ async fn self_fences_after_t_without_contact() {
         .await
         .expect("the daemon fences and reports");
     assert_eq!(result.lease_id, lease(1, 2));
-    assert_eq!(code(&result), Code::Aborted as i32);
+    // Lost to the farm (fenced), so the server runs it again (issue #22).
+    assert_eq!(code(&result), Code::Unavailable as i32);
+    assert_eq!(result.lost(), kbf_proto::worker::Lost::Fenced);
     assert_eq!(h.runtime.killed(), [kbf_types::LeaseId::new(1, 2)]);
     // The newest acknowledged heartbeat went out at most one interval (plus a round
     // trip) before the server fell silent.

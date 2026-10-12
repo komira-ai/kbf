@@ -98,6 +98,8 @@ async fn an_attention_item_is_a_warning_that_names_the_node_and_the_fix() {
     let stream = farm.register(
         &node,
         kbf_sched::DaemonInstance::new("mac-1"),
+        // No predecessor named: the first daemon of the node.
+        kbf_sched::DaemonInstance::default(),
         Reported::serving(
             Resources::new(8_000, 16 << 30),
             NodeCaps::from_report([("arch", "arm64")])

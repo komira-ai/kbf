@@ -18,7 +18,7 @@ use kbf_proto::reapi::command::EnvironmentVariable;
 use kbf_proto::reapi::{Action, Command, Digest, Directory};
 use kbf_proto::worker::worker_server::{Worker, WorkerServer};
 use kbf_proto::worker::{
-    DaemonMessage, LeaseId, ServerMessage, Start, Welcome, daemon_message, server_message,
+    DaemonMessage, Hello, LeaseId, ServerMessage, Start, Welcome, daemon_message, server_message,
 };
 use prost::Message as _;
 use tokio::sync::mpsc as tokio_mpsc;
@@ -46,9 +46,9 @@ impl Session {
     }
 
     /// Waits for the stream's `Hello`, skipping nothing: it must come first.
-    pub fn hello(&self) {
+    pub fn hello(&self) -> Hello {
         match self.next(Duration::from_secs(30)) {
-            Some(daemon_message::Message::Hello(_)) => {}
+            Some(daemon_message::Message::Hello(hello)) => hello,
             other => panic!("expected a Hello, got {other:?}"),
         }
     }

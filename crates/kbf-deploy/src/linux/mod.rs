@@ -17,7 +17,8 @@
 //!
 //! Three verbs change the host, as root. Each checks the host first and prints its plan
 //! as `DRY-RUN:` lines; `--apply` carries it out, and a re-run after an apply plans
-//! nothing. They exit 0 done (or nothing to do), 1 a step failed, 2 refused.
+//! nothing. They exit 0 done (or nothing to do), 1 a step or the check after an apply
+//! failed, 2 refused.
 //! - `kbf-deploy linux install-units --config FILE [--bin-dir DIR] [--restart-minio]
 //!   [--uninstall] [--apply]` ([`install`]): the binaries, the four units, the Raft and
 //!   scratch directories, and the services started.

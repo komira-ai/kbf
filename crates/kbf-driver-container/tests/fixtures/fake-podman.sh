@@ -4,6 +4,9 @@
 # mount. It runs the action as a plain process, so the driver's steps can be tested on
 # any machine. Real Podman behaviour is tested in tests/podman.rs.
 #
+# `tests/bin/fake_podman.rs` is the same fake in Rust (`kbf-fake-podman`): a change here
+# needs the same change there, and `tests/fake_parity.rs` compares the two.
+#
 # Knobs (files in $STATE the test writes):
 #   image-id         what `image inspect` prints; absent: the image is not in the store
 #   image-hangs      `image inspect` hangs (a slow prepare step)

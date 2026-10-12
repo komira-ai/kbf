@@ -10,7 +10,9 @@
 //! ([`Farm::lease_epoch`]: this process's term, or the Raft log's id; issue #137).
 //! The registration names the daemon process by the `Hello`'s `instance_id`: leases
 //! whose `Start` went to another process are given up only once it has fenced (issue
-//! #140). On the stream after that:
+//! #140), or at once if the `Hello` names that process as its predecessor and the
+//! stream it came from has closed (`predecessor_instance_id`; issue #22). On the
+//! stream after that:
 //! - a resent `Hello` whose `node_id` is not the stream's node, or that the deny list
 //!   now refuses, ends the stream with that error; otherwise it changes the node's
 //!   capacity and capabilities and nothing else;
@@ -18,7 +20,9 @@
 //!   the scheduler and acknowledged, unless a newer stream of
 //!   the same node has registered since: then it is dropped unacknowledged, so a
 //!   daemon still talking on the old stream fences on time. A lease it lists that the
-//!   scheduler no longer holds on the node is sent a `Cancel` (issue #23);
+//!   scheduler no longer holds on the node is sent a `Cancel` (issue #23). A lease it
+//!   leaves out that was lost to a restart past its farm reruns answers the
+//!   operation's callers;
 //! - a `Result` the deny list now refuses ends the stream, so it never reaches the
 //!   action cache. Otherwise it is accepted only from the node holding the
 //!   operation's current lease, and only if the action it names (if any) is the one
@@ -126,6 +130,7 @@ where
         let reported = reported(&hello).map_err(Status::invalid_argument)?;
         let worker = WorkerId::new(hello.node_id);
         let instance = DaemonInstance::new(hello.instance_id);
+        let predecessor = DaemonInstance::new(hello.predecessor_instance_id);
         let welcome = message(server_message::Message::Welcome(Welcome {
             protocol_version: version,
             heartbeat_interval_ms: u64::try_from(self.heartbeat_interval.as_millis())
@@ -134,9 +139,14 @@ where
         }));
         let (outbound, responses) = mpsc::unbounded_channel();
         let capacity = reported.capacity;
-        let stream = self
-            .farm
-            .register(&worker, instance, reported, outbound.clone(), welcome);
+        let stream = self.farm.register(
+            &worker,
+            instance,
+            predecessor,
+            reported,
+            outbound.clone(),
+            welcome,
+        );
         tracing::info!(%worker, ?capacity, "worker registered");
         let session = Session {
             farm: Arc::clone(&self.farm),
@@ -219,9 +229,11 @@ impl<M: MetaLog, O: ObjectStore> Session<M, O> {
                     .iter()
                     .map(|l| LeaseId::new(l.term, l.seq))
                     .collect();
-                farm.heartbeat(worker, stream, beat.seq, running).then_some(
-                    server_message::Message::HeartbeatAck(HeartbeatAck { seq: beat.seq }),
-                )
+                farm.heartbeat(worker, stream, beat.seq, running)
+                    .await
+                    .then_some(server_message::Message::HeartbeatAck(HeartbeatAck {
+                        seq: beat.seq,
+                    }))
             }
             Some(daemon_message::Message::Result(result)) => {
                 // A revoked daemon must not write its result into the action cache,

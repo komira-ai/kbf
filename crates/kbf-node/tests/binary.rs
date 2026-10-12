@@ -958,7 +958,7 @@ fn a_restarted_daemon_ends_the_runs_it_was_killed_with_before_hello() {
     let spawned = Instant::now();
     let mut first = daemon(&flags, &dir.join("first.log"));
     let session = front.session(PROMPT);
-    session.hello();
+    let first_said = session.hello();
     let first_hello = spawned.elapsed();
     session.welcome();
     session.start(1, 1, action);
@@ -989,7 +989,7 @@ fn a_restarted_daemon_ends_the_runs_it_was_killed_with_before_hello() {
     let spawned = Instant::now();
     let mut second = daemon(&flags, &dir.join("second.log"));
     let session = front.session(PROMPT);
-    session.hello();
+    let second_said = session.hello();
     let second_hello = spawned.elapsed();
     // What holds as the new session begins.
     let action_ended = ended(pid);
@@ -1031,6 +1031,11 @@ fn a_restarted_daemon_ends_the_runs_it_was_killed_with_before_hello() {
         "the lease directory was still there at Hello:\n{log}"
     );
     assert!(status.success(), "{status}: {log}");
+    // Issue #22: the second daemon names the first, whose runs it killed, so the server
+    // reruns the first's leases at once; the first, on a fresh scratch, names none.
+    assert_eq!(first_said.predecessor_instance_id, "");
+    assert_eq!(second_said.predecessor_instance_id, first_said.instance_id);
+    assert_ne!(second_said.instance_id, first_said.instance_id);
 }
 
 /// The per-architecture manifest the stub's image store holds for a pinned image.

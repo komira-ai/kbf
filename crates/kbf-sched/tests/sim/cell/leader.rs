@@ -442,6 +442,7 @@ impl Leader {
         self.feed(SchedEvent::WorkerUp {
             worker: node,
             instance,
+            predecessor_stopped: false,
             capacity,
             caps: caps(),
         });

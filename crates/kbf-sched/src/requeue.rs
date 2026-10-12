@@ -10,7 +10,7 @@
 
 use std::fmt;
 
-use kbf_types::{LeaseId, OperationId, WorkerId};
+use kbf_types::{LeaseId, LostWhy, OperationId, WorkerId};
 
 /// A lease given up, its operation sent back to the queue to be granted again.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -53,6 +53,12 @@ pub enum RequeueReason {
     /// The node killed the lease for memory while the action was under its own limit;
     /// it runs again with the same booking.
     NodeMemoryPressure,
+    /// Another daemon process registered as its worker, naming the process its `Start`
+    /// went to as its predecessor, which the restarted daemon's drivers killed every
+    /// run of before it registered; the worker does not list the lease as running.
+    Restarted,
+    /// The worker reported that the farm lost the run (`why`); it runs again.
+    Lost(LostWhy),
 }
 
 impl fmt::Display for RequeueReason {
@@ -82,6 +88,10 @@ impl fmt::Display for RequeueReason {
                 "the node killed it for memory below the action's own limit (node memory \
                  pressure); it runs again with the same booking"
             }
+            Self::Restarted => {
+                "the daemon restarted, and its successor killed the run before registering"
+            }
+            Self::Lost(why) => return write!(f, "the farm lost the run ({why}); it runs again"),
         })
     }
 }
@@ -124,6 +134,9 @@ mod tests {
             },
             RequeueReason::NodeMemoryPressure,
             RequeueReason::SessionSwitch,
+            RequeueReason::Restarted,
+            RequeueReason::Lost(LostWhy::Fenced),
+            RequeueReason::Lost(LostWhy::DaemonRestarted),
         ];
         let text: Vec<String> = all.iter().map(ToString::to_string).collect();
         for (i, a) in text.iter().enumerate() {
@@ -140,6 +153,13 @@ mod tests {
         assert!(text[4].contains("with 2 GiB booked"), "{}", text[4]);
         assert!(text[5].contains("same booking"), "{}", text[5]);
         assert!(text[6].contains("session switch grace"), "{}", text[6]);
+        assert!(
+            text[7].contains("killed the run before registering"),
+            "{}",
+            text[7]
+        );
+        assert!(text[8].contains("fenced"), "{}", text[8]);
+        assert!(text[9].contains("daemon restarted while"), "{}", text[9]);
     }
 
     /// Catches: a size shown in bytes, or rounded to a whole GiB it is not (an operator

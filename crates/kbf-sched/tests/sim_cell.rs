@@ -487,6 +487,7 @@ impl StateMachine for Cell {
                         SchedEvent::WorkerUp {
                             worker,
                             instance,
+                            predecessor_stopped: false,
                             capacity,
                             caps: kbf_caps::NodeCaps::from_report([("arch", "arm64")])
                                 .unwrap()

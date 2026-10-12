@@ -4,9 +4,9 @@ use std::io;
 use std::rc::Rc;
 
 use super::*;
-use crate::plan::{Mode, execute};
-use crate::step::Step;
-use crate::testkit::{FakeExec, reply};
+use kbf_host::plan::{Mode, execute};
+use kbf_host::step::Step;
+use kbf_host::testkit::{FakeExec, reply};
 
 const USER: &str = "kbf-admin";
 const PASSWORD: &str = "root:pass@word/1";
@@ -87,7 +87,7 @@ fn bucket(target: &str) -> &str {
 /// `mc` and `id` against `state`. `mc` answers only with the plan's config directory
 /// and, in `MC_HOST_<alias>`, the admin's URL (alias `kbf`) or the minted key's
 /// (alias `kbfkey`, while its account exists).
-fn answer(state: Rc<RefCell<Minio>>) -> crate::testkit::Answer {
+fn answer(state: Rc<RefCell<Minio>>) -> kbf_host::testkit::Answer {
     Box::new(move |cmd: &Cmd| {
         let mut m = state.borrow_mut();
         let args: Vec<&str> = cmd.args.iter().map(String::as_str).collect();
@@ -527,7 +527,7 @@ fn a_key_file_without_an_owner_is_the_running_users() {
     run(&mut exec, &mine, Mode::Apply).expect("apply as the user");
     let want = Entry::File {
         perms: Perms::new(0o600),
-        owner: crate::testkit::RUNNER,
+        owner: kbf_host::testkit::RUNNER,
         bytes: key_bytes(),
     };
     assert_eq!(exec.entries.get(&p("/srv/kbf-pilot/s3.env")), Some(&want));

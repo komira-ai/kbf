@@ -1,7 +1,7 @@
 use std::io;
 
 use super::*;
-use crate::step::UrlError;
+use kbf_host::step::UrlError;
 
 /// Catches a name check that lets the kit touch a bucket, policy or account that is not
 /// kbf's (no `kbf-` prefix), or one S3 or Kubernetes would refuse later: upper case,
@@ -179,7 +179,7 @@ fn every_refusal_names_its_cause() {
             "\"h\" is not an http:// URL (no TLS yet)",
         ),
         (
-            MinioError::Deploy(DeployError::IsRoot),
+            MinioError::Deploy(kbf_host::HostError::IsRoot),
             "this step runs as a user, not as root: run it without sudo",
         ),
     ];
