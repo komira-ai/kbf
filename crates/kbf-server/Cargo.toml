@@ -10,6 +10,7 @@ publish.workspace = true
 [dependencies]
 axum = { workspace = true, features = ["http1", "tokio"] }
 clap.workspace = true
+form_urlencoded.workspace = true
 futures.workspace = true
 kbf-auth.workspace = true
 kbf-front.workspace = true
@@ -23,6 +24,7 @@ kbf-raft.workspace = true
 kbf-sched.workspace = true
 kbf-store.workspace = true
 kbf-types.workspace = true
+percent-encoding.workspace = true
 prost.workspace = true
 prost-types.workspace = true
 rustix = { workspace = true, features = ["fs", "process"] }

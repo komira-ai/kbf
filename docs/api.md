@@ -8,15 +8,16 @@ own address, given with `--api-listen`; without the flag there is no API. The st
 line then ends with ` api=<addr>`. The listener speaks HTTP/1.1, and HTTP/2 in clear
 text (h2c, with prior knowledge); every rule below holds for both.
 
-Reads answer anyone who reaches the address: bind it where only operators do. Writes
-need a token (see [Who may write](#who-may-write)). The roles of
+Reads answer anyone who reaches the address: bind it where only operators do. The
+one exception is [`GET /v1/blobs`](#get-v1blobsdigest), which runs the REAPI policy and is
+off without it. Writes need a token (see [Who may write](#who-may-write)). The roles of
 [fleet-updates-security.md](design/fleet-updates-security.md) section S9 (`admin` for
 operators, a short-lived `rollout` for CI) are **planned**; the token is the one
 operator credential until they land.
 
-Every body is `application/json`. What the server keeps here is **in memory**, like
-the scheduler's state: a restart forgets it, and each daemon reports again after its
-next `Welcome`.
+Every body is `application/json`, except a blob's bytes. What the server keeps here is
+**in memory**, like the scheduler's state: a restart forgets it, and each daemon
+reports again after its next `Welcome`.
 
 ## Who may write
 
@@ -210,6 +211,67 @@ The store probe waits at most `--readyz-store-timeout-ms`, like `/readyz`'s.
 **Planned:** with several servers, the answers follow the two readiness paths, ready
 to serve reads and leader; which service name reports which is not chosen
 ([deployment-topology.md](design/deployment-topology.md#build-clients-one-name-routed-by-method)).
+
+## `GET /v1/blobs/{digest}`
+
+A CAS blob's bytes over HTTP, for a browser: the outputs, stdout and stderr a build's
+page links to ([invocations.md](design/invocations.md#46-blobs-over-http)).
+
+```
+GET /v1/blobs/<sha256 hex>-<size>?instance=<instance name>&name=<file name>&inline=text
+```
+
+**Off unless the REAPI policy names it.** Unlike the rest of this API, the route does
+not answer whoever reaches the address: blobs hold build outputs and logs, which can
+hold secrets. It runs the policy of `--reapi-auth-policy`
+([reapi-auth.md](reapi-auth.md)): its `authenticationPolicy` on the request, then its
+`blobs.getAuthorizer` with the `instance` parameter. Without that key, or without a
+policy file, every request is `404` and the start line says ` blobs=off` (before
+` api=`); with it, ` blobs=on`.
+
+| Parameter | Meaning |
+|---|---|
+| `{digest}` | the blob: 64 lowercase hex digits, `-`, the size in bytes |
+| `instance` | the instance name the authorizer is asked about; absent is the empty name. The cache does not separate blobs by instance ([reapi-auth.md](reapi-auth.md#authorizers)), so it gates the call only |
+| `name` | the file name a browser saves the bytes under; absent or empty sends none |
+| `inline=text` | show the bytes in the browser as text instead of downloading them; `text` is the one value |
+
+A parameter not in this table, one given twice, or another `inline` value is `400`.
+
+**The bytes.** The blob is read through the cache's read path, the one ByteStream Read
+takes: the whole blob is checked against its digest before a byte is sent (a stored
+object whose bytes are wrong is `503` and is never sent), and the read counts as a use
+of the blob for its retention, as a ByteStream Read does. The answer is
+`application/octet-stream` with `Content-Disposition: attachment`, and with `name`,
+`attachment; filename*=UTF-8''<name>`: the name percent-encoded as RFC 8187 says, so a
+quote, a `;` or a line break in it can never end the value or add a parameter. With
+`inline=text` it is `text/plain; charset=utf-8` and `inline` (with the same
+`filename*`), for a blob of at most 4 MiB (4194304 bytes); a larger one is `400`, and
+still downloads without `inline`.
+
+**Never a page.** Every answer of the route, the errors and `404` included, carries
+`X-Content-Type-Options: nosniff` and `Content-Security-Policy: sandbox`, so stdout that
+holds HTML is shown as text and never runs as a page on the API's origin.
+
+**Ranges.** One range of `Range: bytes=...` (`a-b`, `a-`, `-n`) is answered `206` with
+`Content-Range: bytes a-b/<size>`; a last byte past the end is read as the end. A range
+that starts at or past the end (or any range of an empty blob) is `416` with
+`Content-Range: bytes */<size>`. Several ranges, another unit or a malformed value are
+ignored, as RFC 9110 allows, and the whole blob is sent. Every `200` and `206` says
+`Accept-Ranges: bytes`.
+
+| Answer | When |
+|---|---|
+| `200`, `206` | the bytes, as above |
+| `400` | a malformed digest or query, or `inline=text` for a blob over 4 MiB |
+| `401` | the authentication policy refuses the request |
+| `403` | `blobs.getAuthorizer` refuses the instance name |
+| `404` | the route is off, or the blob is not held |
+| `416` | the range starts past the end |
+| `503` | the blob is held but its bytes cannot be read (missing from the store, or failing their digest), or the store or the metadata log does not answer |
+| `500` | the cache's own records disagree |
+
+Errors are JSON, `{"error": "<why>"}`, as everywhere in this API.
 
 ## Planned
 

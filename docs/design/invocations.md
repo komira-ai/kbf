@@ -492,8 +492,9 @@ separate design.
 - `Content-Type: application/octet-stream` and `Content-Disposition: attachment`, so a
   browser does not render an artifact as a page. `name`, when given, is sent as RFC 6266
   `filename*=UTF-8''<percent-encoded name>`, never spliced in raw.
-- `?inline=text` serves `text/plain; charset=utf-8` for stdout and stderr only, up to
-  4 MiB.
+- `?inline=text` serves `text/plain; charset=utf-8`, up to 4 MiB. The pages link it for
+  stdout and stderr only; the route itself cannot tell which blob a digest is, and the
+  headers below make any blob safe to show as text.
 - Every blob answer carries `X-Content-Type-Options: nosniff` and
   `Content-Security-Policy: sandbox`, so stdout that contains HTML is shown as text and
   never runs as a page on the API's origin.
