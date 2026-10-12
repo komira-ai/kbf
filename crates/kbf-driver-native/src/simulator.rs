@@ -162,7 +162,7 @@ impl Simctl {
         developer_dir: Option<&Path>,
     ) -> Result<String, String> {
         let set = lease.join(SET_DIR);
-        std::fs::create_dir(&set).map_err(|e| format!("{}: {e}", set.display()))?;
+        at(&set, std::fs::create_dir(&set))?;
         let args = ["create", name, &request.device_type, &request.runtime];
         let out = self.run(lease, developer_dir, &args)?;
         let printed = String::from_utf8_lossy(&out.stdout);
@@ -181,10 +181,9 @@ impl Simctl {
         if !std::fs::symlink_metadata(&set).is_ok_and(|m| m.is_dir()) {
             return Ok(());
         }
-        let lease =
-            std::fs::canonicalize(lease).map_err(|e| format!("{}: {e}", lease.display()))?;
+        let lease = at(lease, std::fs::canonicalize(lease))?;
         let mut failed = Vec::new();
-        for udid in devices(&set).map_err(|e| format!("{}: {e}", set.display()))? {
+        for udid in at(&set, devices(&set))? {
             // A device that is not booted refuses a shutdown: only the delete counts.
             let _ = self.run(&lease, None, &["shutdown", &udid]);
             if let Err(why) = self.run(&lease, None, &["delete", &udid]) {
@@ -203,6 +202,14 @@ impl Simctl {
         if let Err(why) = self.end_all(lease) {
             tracing::error!(dir = %lease.display(), "a simulator left behind: {why}");
         }
+    }
+}
+
+/// `result`, its error said with the `path` it is about.
+fn at<T>(path: &Path, result: std::io::Result<T>) -> Result<T, String> {
+    match result {
+        Ok(value) => Ok(value),
+        Err(e) => Err(format!("{}: {e}", path.display())),
     }
 }
 

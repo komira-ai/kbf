@@ -8,17 +8,17 @@
 //! the `#[ignore]`d tests at the end make, boot and delete a real simulator; the
 //! native-macos job runs them with `--ignored`.
 
-mod support;
-
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::support::{
+    MemoryCas, PROMPT, Spec, config, no_leases, run, runtime, scratch, stderr, stdout,
+};
 use kbf_daemon::{Runtime, RuntimeError};
 use kbf_driver_native::NativeConfig;
 use kbf_driver_native::network::Isolation;
 use kbf_driver_native::simulator::{SET_DIR, SET_VAR, UDID_VAR};
-use support::{MemoryCas, PROMPT, Spec, config, no_leases, run, runtime, scratch, stderr, stdout};
 
 /// The UDID the fake `simctl create` prints for [`DEVICE_TYPE`].
 const UDID: &str = "0A1B2C3D-4E5F-4071-8293-A4B5C6D7E8F9";
@@ -172,7 +172,7 @@ async fn the_simulator_is_deleted_whatever_the_outcome() {
     let action = asks(Spec::act(&steps), DEVICE_TYPE).store(&cas);
     let running = tokio::spawn({
         let rt = Arc::clone(&rt);
-        async move { rt.run(support::work(3, action, 0)).await }
+        async move { rt.run(crate::support::work(3, action, 0)).await }
     });
     let waited = tokio::time::timeout(PROMPT, async {
         while !started.exists() {
@@ -207,7 +207,7 @@ async fn a_kill_during_the_create_still_deletes_the_simulator() {
         .store(&cas);
     let running = tokio::spawn({
         let rt = Arc::clone(&rt);
-        async move { rt.run(support::work(1, action, 0)).await }
+        async move { rt.run(crate::support::work(1, action, 0)).await }
     });
     let waited = tokio::time::timeout(PROMPT, async {
         while !creating.exists() {
@@ -350,8 +350,9 @@ async fn simctl_runs_under_the_sandbox_with_the_actions_xcode() {
 /// Catches: a simulator a killed daemon's lease left never deleted (the start removes
 /// the lease directory under a device `CoreSimulatorService` still holds, maybe
 /// booted), a name in the set that is not a UDID taken for a device, a lease
-/// directory without a set asked about, and a device that cannot be deleted stopping
-/// the start (the daemon would stay down over one simulator).
+/// directory without a set asked about, and a device that cannot be deleted or a set
+/// that cannot be read stopping the start (the daemon would stay down over one
+/// simulator).
 #[tokio::test]
 async fn the_start_sweep_deletes_the_simulators_a_killed_daemon_left() {
     let dir = scratch("sim-sweep");
@@ -363,6 +364,16 @@ async fn the_start_sweep_deletes_the_simulators_a_killed_daemon_left() {
     }
     std::fs::write(set.join("device_set.plist"), b"plist").expect("plist");
     std::fs::create_dir_all(config.scratch.join("lease-7-8/root")).expect("no set");
+    // A set the daemon cannot read (as root it could, and the test would see its calls).
+    let unreadable = config.scratch.join("lease-7-9").join(SET_DIR);
+    if !rustix::process::geteuid().is_root() {
+        std::fs::create_dir_all(unreadable.join(OTHER)).expect("device");
+        std::fs::set_permissions(
+            &unreadable,
+            std::os::unix::fs::PermissionsExt::from_mode(0o000),
+        )
+        .expect("chmod");
+    }
     let cas = Arc::new(MemoryCas::default());
     let _rt = runtime(config.clone(), &cas);
     let set = std::fs::canonicalize(&config.scratch)
@@ -378,7 +389,7 @@ async fn the_start_sweep_deletes_the_simulators_a_killed_daemon_left() {
             format!("delete {STUCK}"),
         ]
     );
-    assert!(no_leases(&config), "both lease directories are removed");
+    assert!(no_leases(&config), "every lease directory is removed");
 }
 
 /// The tests that make real simulators.
@@ -495,7 +506,7 @@ mod real {
         let action = spec.store(&cas);
         let result = tokio::time::timeout(
             Duration::from_secs(660),
-            rt.run(support::work(1, action, 0)),
+            rt.run(crate::support::work(1, action, 0)),
         )
         .await
         .expect("the run ends")

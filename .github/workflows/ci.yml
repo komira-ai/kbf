@@ -357,8 +357,8 @@ jobs:
       - run: cargo test -p kbf-outputs -p kbf-driver-native -p kbf-node -p kbf-testkit --locked
       # A lease's own simulator, made, booted and deleted for real in the lease's
       # device set under the actions' sandbox, and one a killed daemon left deleted at
-      # the next start (crates/kbf-driver-native/tests/simulator.rs).
-      - run: cargo test -p kbf-driver-native --test simulator --locked -- --ignored --nocapture
+      # the next start (crates/kbf-driver-native/tests/lease/simulator.rs).
+      - run: cargo test -p kbf-driver-native --test lease --locked -- --ignored --nocapture simulator::real
       # The daemon's unit tests, which read its suspend-counting clock on macOS
       # (CLOCK_MONOTONIC_RAW), the fence across a suspend (issue #78), and a keeper
       # started after the binary was renamed over, which macOS finds by its path.

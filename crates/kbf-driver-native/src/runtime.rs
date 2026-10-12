@@ -1022,6 +1022,11 @@ mod tests {
             shown.starts_with("Err(Failed(\"simulator task: "),
             "{shown}"
         );
+        // The other two answers too, so this build of the function runs all of it.
+        let made = format!("{:?}", simulator_made(Ok(Ok("U".to_owned()))));
+        assert_eq!(made, "Ok(\"U\")");
+        let refused = format!("{:?}", simulator_made(Ok(Err("no".to_owned()))));
+        assert_eq!(refused, "Err(Failed(\"simulator: no\"))");
     }
 
     /// A CAS no test here reaches.
