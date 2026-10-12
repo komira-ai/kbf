@@ -6,6 +6,7 @@ mod support;
 use std::sync::Arc;
 
 use kbf_daemon::{Runtime, RuntimeError};
+use kbf_proto::reapi::Digest;
 use support::{MemoryCas, Spec, config, no_leases, run, runtime, scratch};
 
 /// Catches: an output read through a symlink the action planted (the working
@@ -120,4 +121,62 @@ async fn a_large_output_file_is_stored_whole() {
     let digest = result.output_files[0].digest.as_ref().expect("digest");
     assert_eq!(*digest, kbf_daemon::cas::digest_of(&vec![b'A'; 2_500_000]));
     assert_eq!(cas.blob(digest).len(), 2_500_000);
+}
+
+/// Every non-empty blob `result` names, as the farm's action cache counts them before
+/// it accepts a result (the empty blob is always held): each output file, stdout and
+/// stderr, each output directory's Tree and root Directory, and every file and
+/// Directory the Tree names.
+fn named_blobs(cas: &MemoryCas, result: &kbf_proto::reapi::ActionResult) -> Vec<Digest> {
+    let mut named: Vec<Digest> = result
+        .output_files
+        .iter()
+        .filter_map(|f| f.digest.clone())
+        .chain(result.stdout_digest.clone())
+        .chain(result.stderr_digest.clone())
+        .collect();
+    for dir in &result.output_directories {
+        let tree_digest = dir.tree_digest.clone().expect("tree digest");
+        named.extend(dir.root_directory_digest.clone());
+        let tree = support::tree(cas, &tree_digest);
+        named.push(tree_digest);
+        for directory in tree.root.iter().chain(&tree.children) {
+            named.extend(directory.files.iter().filter_map(|f| f.digest.clone()));
+            named.extend(directory.directories.iter().filter_map(|d| d.digest.clone()));
+        }
+    }
+    named.retain(|d| d.size_bytes > 0);
+    named
+}
+
+/// Catches a directory output whose root Directory, or a Directory below it, is not
+/// in the CAS when the run returns its result: the farm refuses such a result ("an OK
+/// result whose outputs are not stored") and the client's action fails. The tree has
+/// nested files and an empty directory, so the root, a nested and an empty Directory
+/// are all named.
+#[tokio::test]
+async fn every_blob_a_directory_output_names_is_stored() {
+    let dir = scratch("tree-blobs");
+    let cas = Arc::new(MemoryCas::default());
+    let rt = runtime(config(&dir), &cas);
+    let steps = "mkdir out/a/b ; mkdir out/empty ; append out/top top ; \
+                 append out/a/mid mid ; append out/a/b/leaf leaf";
+    let result = run(&rt, &cas, 1, &Spec::act(steps).outputs(&["out"]))
+        .await
+        .expect("ran");
+    assert_eq!(result.exit_code, 0, "{}", support::stderr(&cas, &result));
+    assert_eq!(result.output_directories.len(), 1, "{result:?}");
+    let tree_digest = result.output_directories[0].tree_digest.as_ref().expect("tree");
+    let tree = support::tree(&cas, tree_digest);
+    assert_eq!(tree.children.len(), 3, "a, a/b and empty: {tree:?}");
+    let named = named_blobs(&cas, &result);
+    // root, a, a/b (empty is the empty blob), the Tree, three files, stdout or stderr.
+    assert!(named.len() >= 7, "{named:?}");
+    let held = cas.blobs.lock().expect("lock");
+    let absent: Vec<String> = named
+        .iter()
+        .map(kbf_daemon::cas::label)
+        .filter(|blob| !held.contains_key(blob))
+        .collect();
+    assert!(absent.is_empty(), "named but not stored: {absent:?}");
 }
