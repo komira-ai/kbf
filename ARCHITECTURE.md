@@ -99,6 +99,7 @@ what lets a simulation seed replay a run exactly (see [Testing](#testing)).
 | `kbf-segments` | yes | the segment format and FastCDC chunking |
 | `kbf-caps` | yes | CPU capability parsing, ISA levels, request matching |
 | `kbf-raft` | yes | a sans-IO Raft core ([ADR 0001](docs/adr/0001-consensus.md)) and its host loop over `Storage`, `Transport` and `Machine` traits, with an in-memory storage |
+| `kbf-invocation` | yes | the invocation record ([invocations.md](docs/design/invocations.md) section 3): each build's header, counters and action rows, built only from events (calls, lease grants, starts, requeues, finishes), and its `kbf.invocation.v1` encoding; the recorder that feeds it is **planned** |
 | `kbf-estimator` | yes | placeholder for learned action sizes (**planned**) |
 | `kbf-objstore` | no | the `ObjectStore` trait, an in-memory store, an S3 store, the conformance suite |
 | `kbf-front` | no | the REAPI services over a `Cache` and a `Dispatch` |
