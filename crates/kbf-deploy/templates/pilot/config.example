@@ -1,0 +1,55 @@
+# kbf-deploy pilot: the settings of `pilot server-install` and `pilot buckconfig`.
+#
+# Format: KEY=VALUE, one per line, no spaces around `=`, optional double quotes; an
+# unknown or repeated key is refused. No `$HOME` or `~` expansion: write absolute
+# paths, or leave a path empty for its default. A flag (--bind, --pki,
+# --s3-env-file) wins over this file.
+#
+# Put no secret in this file. kbf-server's S3 key pair lives only in the 0600 file
+# --s3-env-file names, outside every repository.
+#
+# The kit's other steps read more keys from the same file: KBF_DAEMON_NODES,
+# KBF_DRIVER, KBF_DAEMON_EXTRA_ARGS, KBF_USER, KBF_ROOT, KBF_LABEL_PREFIX,
+# KBF_MIN_MACOS, KBF_MIN_FREE_GB, MINIO_NAMESPACE, MINIO_SERVICE, MINIO_NODEPORT
+# and KBF_EXIT_TARGET. These two verbs accept them and read none of them.
+
+# --- kbf-server (server-install) ---------------------------------------------------
+# The server host's address: what the daemons and the buck2 client dial.
+KBF_SERVER_HOST=192.0.2.10
+# The address kbf-server binds; it must be an IPv4 address the interface below
+# carries. Empty: KBF_SERVER_HOST.
+KBF_SERVER_BIND=
+KBF_TAILNET_IFACE=tailscale0
+KBF_REAPI_PORT=8980
+KBF_WORKER_PORT=8981
+# The DNS name in the server certificate (pki/server.pem). Daemons verify it, so it
+# need not resolve.
+KBF_TLS_SERVER_NAME=kbf-pilot-server
+# Where the binary, the logs and removed units go. Empty: $HOME/.local/share/kbf-pilot.
+KBF_SERVER_STATE=
+# The caps of the systemd user slice kbf-server runs in (kbf-pilot.slice).
+KBF_SERVER_MEMORY_MAX=4G
+KBF_SERVER_CPU_QUOTA=200%
+KBF_SERVER_TASKS_MAX=512
+# http://host:port of the S3 API kbf-server stores blobs in.
+MINIO_ENDPOINT=http://192.0.2.20:30900
+KBF_S3_BUCKET=kbf-pilot-cas
+KBF_S3_REGION=us-east-1
+KBF_S3_PREFIX=kbf/
+# 1: pass --s3-conditional-put (the store refuses to overwrite a key); 0: do not.
+KBF_S3_CONDITIONAL_PUT=1
+
+# --- the buck2 client (buckconfig) ---------------------------------------------------
+KBF_INSTANCE_NAME=main
+KBF_CONCURRENCY=8
+# The REAPI platform properties of the linux and darwin actions. kbf routes on
+# OSFamily and on label.<k> (a daemon's --label k=v); it ignores a name it does not
+# know, so a set without OSFamily matches every node (docs/platform-properties.md).
+# buckconfig refuses a set without the right OSFamily, and a darwin label.<k> not in
+# KBF_DARWIN_LABELS.
+KBF_LINUX_PROPERTIES=OSFamily=Linux,label.pool=linux
+KBF_DARWIN_PROPERTIES=OSFamily=Darwin,label.pool=mac
+# The daemons' labels (each --label KEY=VALUE), comma separated.
+KBF_DARWIN_LABELS=pool=mac
+# The macOS host identities a darwin compile accepts, space separated.
+KBF_DARWIN_MACOS_HOSTS="26.0-0123456789abcdef"

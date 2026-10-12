@@ -1,0 +1,31 @@
+# kbf-pilot-overlay: written by `kbf-deploy pilot buckconfig` into one linked
+# worktree's .buckconfig.local (gitignored). Remove it with `kbf-deploy pilot
+# buckconfig --config FILE --worktree DIR --remove --apply`; the worktree then builds
+# where it did before.
+#
+# EVERY remote action of this worktree goes to the pilot kbf-server, linux ones
+# included: buck2 has one remote-execution service per checkout, and a darwin target
+# of komira has linux-x86_64 actions too (the toolchain unpack runs linux tools).
+# Both property sets below are needed: with only the darwin one, komira would run
+# the linux actions on this machine. Each set names its OSFamily, so kbf routes a
+# linux action only to a linux runner and a darwin one only to a Mac
+# (docs/platform-properties.md); `pilot buckconfig` refuses a set without it. With
+# only Mac runners in the cell, the linux actions wait for a linux runner.
+#
+# This overlay dials the REAPI listener in plain text, hence tls = false.
+
+[buck2_re_client]
+  engine_address = grpc://@KBF_SERVER_HOST@:@KBF_REAPI_PORT@
+  action_cache_address = grpc://@KBF_SERVER_HOST@:@KBF_REAPI_PORT@
+  cas_address = grpc://@KBF_SERVER_HOST@:@KBF_REAPI_PORT@
+  instance_name = @KBF_INSTANCE_NAME@
+  tls = false
+  execution_concurrency_limit = @KBF_CONCURRENCY@
+
+[komira]
+  execution = remote
+
+[komira_re]
+  linux_x86_64_properties = @KBF_LINUX_PROPERTIES@
+  darwin_arm64_properties = @KBF_DARWIN_PROPERTIES@
+  darwin_macos_hosts = @KBF_DARWIN_MACOS_HOSTS@
