@@ -303,7 +303,9 @@ sudo kbf-deploy linux install-units --config node.conf --uninstall [--apply]
   lacks a flag its unit passes. It then installs, each only if it differs: the
   binaries from `--bin-dir` (keeping the replaced one as `<name>.previous`), the four
   files under `/etc/systemd/system`, and the Raft and scratch directories (0700, their
-  service's user). After a change it runs `daemon-reload` and enables and restarts
+  service's user). The binaries, the `.previous` copies and the four files are root's
+  (uid and gid 0): one with the right bytes and mode that another user owns is
+  replaced. After a change it runs `daemon-reload` and enables and restarts
   kbf-server and kbf-daemon; otherwise it only enables or starts one that is not.
   After any start or restart it waits up to 60 s for kbf-server's `/readyz`; a run
   that starts nothing does not wait. MinIO restarts only with `--restart-minio`: its
