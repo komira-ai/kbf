@@ -79,9 +79,9 @@ pub fn tarball(name: &str, bytes: &[u8]) -> Result<Vec<u8>, String> {
     header.set_entry_type(tar::EntryType::Regular);
     header.set_size(bytes.len() as u64);
     header.set_mode(MODE);
-    header.set_uid(1000);
+    header.set_uid(0);
     header.set_gid(0);
-    header.set_mtime(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs());
+    header.set_mtime(u64::from(MTIME));
     header.set_cksum();
     let gzip = flate2::GzBuilder::new()
         .mtime(MTIME)

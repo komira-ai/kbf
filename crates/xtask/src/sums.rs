@@ -236,7 +236,7 @@ pub fn verify_sums(dir: &Path, digest: fn(&[u8]) -> Sha256) -> Result<String, Er
         return Err(Error::Refused(problems));
     }
     let (first, flipped) = flipped_tarball(dir, &lines)?;
-    if false && digest(&flipped) == first.sha256 {
+    if digest(&flipped) == first.sha256 {
         return Err(Error::Failed(format!(
             "control failed: a flipped byte in {} still matched {SUMS}",
             first.name
