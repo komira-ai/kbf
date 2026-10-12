@@ -2,15 +2,16 @@
 
 mod common;
 
-use std::io::Write as _;
+use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
 use common::{Served, Shares, TOKEN, act};
 use kbf_guest::client::{Client, ClientError};
+use kbf_guest::server::{Agent, Stream};
 use kbf_guest::wire::{
-    End, GuestMsg, HostMsg, MAX_FRAME, Refusal, RunRequest, TOKEN_LEN, VERSION, read_frame,
-    write_frame,
+    End, GuestMsg, HostMsg, MAX_FRAME, Refusal, RunRequest, TOKEN_LEN, VERSION, WireError,
+    read_frame, write_frame,
 };
 
 fn send(stream: &mut UnixStream, msg: &HostMsg) {
@@ -328,4 +329,87 @@ fn an_unreadable_frame_closes_the_connection() {
     assert!(read_frame(&mut host).is_err(), "the connection stayed open");
     let agent = served.join();
     assert!(!agent.has_run());
+}
+
+/// A Unix socket whose `set_read_timeout(None)` fails with EINVAL, as macOS refuses
+/// `SO_RCVTIMEO` on a socket whose peer has already closed.
+struct RefusesToClearTimeout(UnixStream);
+
+impl Read for RefusesToClearTimeout {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.0.read(buf)
+    }
+}
+
+impl Write for RefusesToClearTimeout {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0.write(buf)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.0.flush()
+    }
+}
+
+impl Stream for RefusesToClearTimeout {
+    fn try_clone(&self) -> io::Result<Self> {
+        self.0.try_clone().map(Self)
+    }
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        match timeout {
+            None => Err(io::Error::from_raw_os_error(libc::EINVAL)),
+            Some(t) => self.0.set_read_timeout(Some(t)),
+        }
+    }
+    fn shutdown(&self) -> io::Result<()> {
+        self.0.shutdown(std::net::Shutdown::Both)
+    }
+}
+
+/// Catches a host that closes right after the handshake being reported as an agent
+/// error: when clearing the Hello deadline fails, `serve_connection` still returns
+/// `Ok`, as for any other host that is gone.
+#[test]
+fn a_host_gone_before_the_deadline_is_cleared_is_a_closed_connection() {
+    let shares = Shares::new("einval-gone");
+    let (stream, mut host) = UnixStream::pair().expect("socket pair");
+    send(
+        &mut host,
+        &HostMsg::Hello {
+            version: VERSION,
+            token: TOKEN,
+        },
+    );
+    drop(host);
+    let mut agent = Agent::new(shares.config());
+    agent
+        .serve_connection(RefusesToClearTimeout(stream))
+        .expect("a closed connection, not an error");
+    assert!(!agent.has_run());
+}
+
+/// Catches a connection whose deadline could not be cleared being served anyway: a
+/// host that is still there reads `Ready` and then the end of the stream, not a
+/// refusal once the Hello deadline left on the socket runs out.
+#[test]
+fn a_connection_whose_deadline_cannot_be_cleared_is_closed() {
+    let shares = Shares::new("einval-open");
+    let config = kbf_guest::server::Config {
+        hello_timeout: Duration::from_millis(200),
+        ..shares.config()
+    };
+    let (stream, mut host) = UnixStream::pair().expect("socket pair");
+    send(
+        &mut host,
+        &HostMsg::Hello {
+            version: VERSION,
+            token: TOKEN,
+        },
+    );
+    let served = std::thread::spawn(move || {
+        Agent::new(config).serve_connection(RefusesToClearTimeout(stream))
+    });
+    assert!(matches!(recv(&mut host), GuestMsg::Ready { .. }));
+    let end = read_frame(&mut host).map(|f| GuestMsg::decode(&f));
+    assert!(matches!(end, Err(WireError::Closed)), "{end:?}");
+    served.join().expect("agent thread").expect("served");
 }
