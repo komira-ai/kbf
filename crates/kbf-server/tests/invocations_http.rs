@@ -210,6 +210,45 @@ async fn a_name_the_record_could_not_take_is_not_read_through_a_row() {
     server.stop().await;
 }
 
+/// Catches (security): what a call left out of its record still does to it. At the
+/// memory bound the record cannot take the name `secret`, so a reader is asked about
+/// `ci/...` alone; an upload and an Execute under `secret` must then leave every
+/// field a page shows as it was (counts, `last_seen`, state, `rows_capped`), the
+/// record only saying `complete: false`. Red with the counts or `last_seen` applied
+/// before the instance name is checked.
+#[tokio::test]
+async fn a_call_under_a_name_the_record_could_not_take_changes_no_page() {
+    const CI_ONLY: &str = r#"{"authenticationPolicy": {"allow": {}},
+        "invocations": {"getAuthorizer": {"instanceNamePrefix": {"allowedInstanceNamePrefixes": ["ci"]}}}}"#;
+    let first = queued("leak", "ci/aaaaaaaaaaaaaaaa", at(0), digest(20), 1);
+    let probe = Server::with(CI_ONLY);
+    probe.feed([first.clone()]).await;
+    let (bytes, _) = probe.recorder.bytes();
+    probe.stop().await;
+    let server = Server::start(Policy::from_json(CI_ONLY).expect("a policy"), bytes);
+    server.feed([first]).await;
+    let pages = ["/v1/invocations/leak", "/v1/invocations/leak/metrics"];
+    let mut before = Vec::new();
+    for page in pages {
+        let answer = server.get(page).await;
+        assert_eq!(answer.code, 200, "{page}");
+        before.push(answer.json);
+    }
+    before[0]["complete"] = json!(false);
+    server
+        .feed([
+            call("leak", "", "secret", at(1), CallKind::Uploaded(987_654_321)),
+            queued("leak", "secret", at(2), digest(21), 3),
+        ])
+        .await;
+    for (page, was) in pages.into_iter().zip(before) {
+        let answer = server.get(page).await;
+        assert_eq!(answer.code, 200, "{page}");
+        assert_eq!(answer.json, was, "{page}: a call under secret reached the page");
+    }
+    server.stop().await;
+}
+
 /// An authorizer that answers no instance name.
 struct Mute;
 

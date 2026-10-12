@@ -554,3 +554,38 @@ fn a_new_row_of_a_name_the_record_could_not_take_is_not_added() {
     assert_eq!(rows, ["a"]);
     assert!(!inv.complete());
 }
+
+/// Catches (security; mutant "count before the admit check"): a call whose instance
+/// name the record could not take still applied to it. The name's bytes do not fit,
+/// while an operation and its waiter do; the call must change none of the counts,
+/// `last_seen`, the state (no operation in flight) or the operations held, and the
+/// record says it is incomplete.
+#[test]
+fn a_call_of_a_name_the_record_could_not_take_changes_nothing_else() {
+    let secret = |mut e: Event| {
+        if let Event::Call(c) = &mut e {
+            c.instance = format!("secret/{}", "x".repeat(4096));
+        }
+        e
+    };
+    let prefix = [
+        queued("inv", t(1), 10, 1),
+        finished(1, None, Outcome::Ok { exit_code: 0 }, t(2)),
+    ];
+    let mut room = prefix.to_vec();
+    room.push(queued("inv", t(3), 11, 2));
+    let mut r = bounded(unbounded(&room), &prefix);
+    let before = r.get(&key("inv")).expect("held").clone();
+    let later = t(1_000_000);
+    assert_eq!(before.state(later), State::Idle);
+    r.apply(secret(ev(call("inv", t(5), CallKind::Uploaded(987_654_321)))));
+    r.apply(secret(queued("inv", t(6), 11, 2)));
+    let inv = r.get(&key("inv")).expect("held");
+    assert_eq!(inv.instances().iter().collect::<Vec<_>>(), ["main"]);
+    assert_eq!(inv.counts(), before.counts());
+    assert_eq!(inv.last_seen(), before.last_seen());
+    assert_eq!(inv.state(later), State::Idle, "no operation in flight");
+    assert_eq!(r.operations_bytes(), 0, "no operation held");
+    assert_eq!(inv.rows().len(), before.rows().len());
+    assert!(!inv.complete());
+}
