@@ -7,7 +7,7 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
-# The tests' stand-in `podman` in Rust (tests/support/fake.rs picks it or the script).
+# The tests' stand-in `podman` (tests/support/fake.rs links it).
 # Not shipped: the release jobs build only kbf-node's and kbf-server's binaries.
 [[bin]]
 name = "kbf-fake-podman"

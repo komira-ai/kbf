@@ -1,15 +1,49 @@
-//! `kbf-fake-podman`: the stand-in `podman` of the container driver's tests, in Rust.
-//! It answers every verb `fixtures/fake-podman.sh` answers, reads the same knobs and
-//! writes the same records, byte for byte (`tests/fake_parity.rs` compares the two),
-//! so a test passes or fails the same way on either. `tests/support/fake.rs` links one
-//! of them as `<dir>/podman`, as `KBF_TEST_FAKE_PODMAN` picks it; the knobs and
-//! records are listed at the top of the script.
+//! `kbf-fake-podman`: the stand-in `podman` of the container driver's tests. Each test
+//! links `<dir>/podman` to it (`tests/support/fake.rs`); the fake keeps its state and
+//! the test's knobs in `<dir>/state` and uses `<dir>/cgroup` as the cgroup mount. It
+//! runs the action as a plain process, so the driver's steps can be tested on any
+//! machine. Real Podman behaviour is tested in `tests/podman.rs`. What it answers and
+//! records for each verb and knob is pinned by `tests/fake_golden.rs`.
 //!
-//! What the script runs other programs for, this does itself: `image-hangs` sleeps 30
-//! seconds in this process, and the kills, the session the action leads, the file
-//! deletes and the mode changes are system calls. The action (`state/action.sh`) is
-//! the test's own script and is still run by `bash`, in a new session, with stdin
-//! from `/dev/null` as a background job of the script has it.
+//! Knobs (files in `state/` the test writes):
+//! - `image-id`: what `image inspect` prints; absent: the image is not in the store.
+//! - `image-hangs`: `image inspect` sleeps 30 seconds (a slow prepare step).
+//! - `info-fails`: `info` fails.
+//! - `store/`: the image store `info` names (`store/fake-images/<id>/=<key>`).
+//! - `action.sh`: what `start --attach` runs (env: `ROOT`, `UPPER`, `CG`), with `bash`,
+//!   in a session and process group of its own and stdin from `/dev/null`;
+//!   `cgroup.kill` and `rm` kill the whole group. It is the test's own script.
+//! - `nonce`: this Fake's own marker: the action (and all it starts) inherits
+//!   `FAKE_LEASE=<nonce><cgroup>`, what the test looks for afterwards.
+//! - `create-fails`: `create` fails.
+//! - `block-log`: `create` makes a directory where the log file this knob names
+//!   (`stdout` or `stderr`) goes, so the driver cannot create it.
+//! - `vanish-after-create`: `create` unlinks the podman program it was run as.
+//! - `status`: written by `start`; a test may preset `status-override`.
+//! - `inspect-fails`, `kill-fails`, `rm-fails`, `ps-fails`: that verb fails.
+//! - `ps-extra`: lines `ps` prints after the container's own (`<owner> <name>`).
+//! - `unshare-noop`: `unshare rm` succeeds without removing anything.
+//! - `unshare-fails`: `unshare rm` fails.
+//! - `chown-fails`: `unshare chown` to the owner this knob holds (`1:1` or `0:0`) fails.
+//!
+//! Records:
+//! - `create.args` (one argument per line), `calls` (one verb per line; `unshare` with
+//!   its command, `unshare rm` or `unshare chown`), `ps.args`, `removed`;
+//! - `name` and `owner-label`: the container `create` made and its `kbf.owner` label;
+//!   `rm` removes `name`, and `ps` lists the container while `name` exists and the
+//!   filter names its label;
+//! - `killed-before-rm`: `rm` found the lease cgroup's `cgroup.kill` already written;
+//! - `start-pid`: the last `start`'s own pid; `start-not-reaped-at-rm`: `rm` found that
+//!   `start` process still there, running or a zombie its parent had not reaped;
+//! - `events`, in order: `cgroup.kill ended the action`, `start ended` once `start` has
+//!   waited for the action and written its status, `rm`, `chown <owner> <paths...>`.
+//!
+//! The fake changes no owner (the test runs as one user), but models what an owner
+//! other than the daemon's means: when `start` ends while the overlay is the
+//! container's (`chown 1:1` last, recorded in `owner`), it makes the upper directory
+//! unreadable (mode 000, the old mode kept in `upper-mode`), as files the action made
+//! private would be to the daemon's user; `chown 0:0` restores the mode. So outputs
+//! read before the overlay is handed back fail as they would on real Podman.
 
 use std::ffi::OsStr;
 use std::io::Write as _;
@@ -49,7 +83,7 @@ fn refuse(message: &str, code: u8) -> u8 {
     code
 }
 
-/// `parts` joined by single spaces, as the script's `$*` is.
+/// `parts` joined by single spaces (`$*` in sh).
 fn joined(parts: &[Vec<u8>]) -> Vec<u8> {
     parts.join(&b' ')
 }
@@ -59,12 +93,12 @@ fn path(bytes: &[u8]) -> &Path {
     Path::new(OsStr::from_bytes(bytes))
 }
 
-/// `a` then `b`, as the script's `"$A$B"` is (not a path join: `b` may start with `/`).
+/// `a` then `b`, byte for byte (not a path join: `b` may start with `/`).
 fn concat(a: &Path, b: &[u8]) -> PathBuf {
     PathBuf::from(OsStr::from_bytes(&[a.as_os_str().as_bytes(), b].concat()))
 }
 
-/// What the script prints for `printf '%s\n' "$@"`: one argument per line, or one
+/// One argument per line (`printf '%s\n' "$@"` in sh), or one
 /// empty line when there are none.
 fn lines(args: &[Vec<u8>]) -> Vec<u8> {
     if args.is_empty() {
@@ -94,7 +128,7 @@ impl Fake {
         std::fs::read(self.file(name)).ok()
     }
 
-    /// The file as the script's `$(cat FILE)` has it: trailing newlines dropped, and
+    /// The file as `$(cat FILE)` in sh has it: trailing newlines dropped, and
     /// empty when it cannot be read.
     fn cat(&self, name: &str) -> Vec<u8> {
         let mut bytes = self.read(name).unwrap_or_default();
@@ -517,7 +551,7 @@ fn signal(name: &[u8]) -> Option<Signal> {
 }
 
 /// Adds `bits` to the mode of `path` (`chmod u+...`), following a symlink as `chmod`
-/// does; a failure is ignored, as the script ignores it.
+/// does; a failure is ignored.
 fn add_mode(path: &Path, bits: u32) {
     if let Ok(meta) = std::fs::metadata(path) {
         let mode = meta.permissions().mode() | bits;

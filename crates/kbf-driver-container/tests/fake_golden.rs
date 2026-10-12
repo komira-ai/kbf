@@ -1,6 +1,7 @@
-//! The two stand-in `podman`s (`support/fake.rs`) against each other: the same calls,
-//! in the same directory, must give the same exit codes, the same output and the same
-//! files, byte for byte, so the driver suites mean the same under either.
+//! The stand-in `podman` (`support/fake.rs`) against its golden file,
+//! `fixtures/fake-podman.golden`: every verb and knob, called in order in one
+//! directory, must give the exit codes, the output and the files written there, byte
+//! for byte, so the driver suites keep the meaning they were written against.
 
 mod support;
 
@@ -237,38 +238,63 @@ fn tree(dir: &Path) -> BTreeMap<PathBuf, Entry> {
     entries
 }
 
-/// Catches the Rust fake answering a call, or writing a record, otherwise than the
-/// script: an exit code, a line of output, a record's format (`calls`, `events`,
-/// `status`, `create.args`, ...), a knob it ignores or a mode it leaves differently.
-/// Both run in the same directory, one after the other, so the paths in their records
-/// are the same.
-#[test]
-fn the_rust_fake_answers_and_records_as_the_script_does() {
-    let base = support::scratch("fake-parity");
-    let dir = base.join("fake");
-    let rust = PathBuf::from(env!("CARGO_BIN_EXE_kbf-fake-podman"));
-    let mut runs = Vec::new();
-    for (name, program) in [("script", support::fake::script()), ("rust", rust)] {
-        let (answers, mut files) = run(&dir, &program);
-        // The link differs by design, and is the one entry that may.
-        let link = files.remove(Path::new("podman"));
-        assert!(
-            link.is_none(),
-            "{name}: vanish-after-create left the podman link"
+/// The answers and files as the golden file has them: the fake's directory written
+/// `<dir>`, one call per block, then one line per file below the directory.
+fn render(dir: &Path, answers: &[Answer], files: &BTreeMap<PathBuf, Entry>) -> String {
+    let dir = dir.to_str().expect("utf-8 path");
+    let mut text = String::new();
+    for answer in answers {
+        let args = match &answer.args {
+            Some(args) => format!("--cgroup-manager=cgroupfs {}", args.join(" ")),
+            None => "(no arguments)".to_owned(),
+        };
+        let code = match answer.code {
+            Some(code) => code.to_string(),
+            None => "killed".to_owned(),
+        };
+        text += &format!(
+            "$ podman {args}\nexit {code}\nstdout {:?}\nstderr {:?}\n",
+            answer.stdout, answer.stderr
         );
-        support::force_remove(&dir);
-        runs.push((name, answers, files));
     }
-    let (_, script_answers, script_files) = &runs[0];
-    let (_, rust_answers, rust_files) = &runs[1];
-    // A control: the calls reached the knobs and records they are there for.
+    text += "files\n";
+    for (name, entry) in files {
+        let name = name.display();
+        text += &match entry {
+            Entry::Dir(mode) => format!("d {mode:04o} {name}\n"),
+            Entry::File(mode, bytes) => format!("f {mode:04o} {name} {bytes:?}\n"),
+            Entry::Link(to) => format!("l {name} -> {}\n", to.display()),
+        };
+    }
+    text.replace(dir, "<dir>")
+}
+
+/// Catches the fake answering a call, or writing a record, otherwise than the driver
+/// suites were written against: an exit code, a line of output, a record's format
+/// (`calls`, `events`, `status`, `create.args`, ...), a knob it ignores or a mode it
+/// leaves differently. A change to the fake that is meant updates the golden file in
+/// the same commit: on a difference the test writes what the fake gave next to its
+/// scratch directory and names that file.
+///
+/// The controls first: a golden file updated from a run whose calls no longer reach
+/// the knobs and records they are there for would pin nothing.
+#[test]
+fn the_fake_answers_and_records_as_its_golden_file_says() {
+    // Modes are part of the records; the runners' umask is 022, a dev box's may not be.
+    rustix::process::umask(rustix::fs::Mode::from_raw_mode(0o022));
+    let base = support::scratch("fake-golden");
+    let dir = base.join("fake");
+    let (answers, mut files) = run(&dir, &support::fake::program());
+    // The fake unlinks itself in the last call (`vanish-after-create`).
+    let link = files.remove(Path::new("podman"));
+    assert!(link.is_none(), "vanish-after-create left the podman link");
     assert!(
-        script_answers
+        answers
             .iter()
             .any(|a| a.code == Some(3) && a.stdout.contains("leads group 1 session 1")),
-        "no start ran the action in a session of its own: {script_answers:#?}"
+        "no start ran the action in a session of its own: {answers:#?}"
     );
-    for name in [
+    for record in [
         "calls",
         "events",
         "status",
@@ -279,21 +305,32 @@ fn the_rust_fake_answers_and_records_as_the_script_does() {
         "killed-before-rm",
     ] {
         assert!(
-            script_files.contains_key(&Path::new("state").join(name)),
-            "the script never wrote {name}"
+            files.contains_key(&Path::new("state").join(record)),
+            "the fake never wrote {record}"
         );
     }
     assert!(
-        !script_files.contains_key(Path::new("gone")),
+        !files.contains_key(Path::new("gone")),
         "unshare rm never ran"
     );
-    for (want, got) in script_answers.iter().zip(rust_answers) {
-        assert_eq!(got, want, "the two fakes answer a call differently");
+    let got = render(&dir, &answers, &files);
+    let golden_path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-podman.golden");
+    let golden = std::fs::read_to_string(&golden_path).unwrap_or_default();
+    if got != golden {
+        let actual = base.join("got.golden");
+        std::fs::write(&actual, &got).expect("write what the fake gave");
+        let first = got
+            .lines()
+            .zip(golden.lines())
+            .position(|(g, w)| g != w)
+            .unwrap_or_else(|| got.lines().count().min(golden.lines().count()));
+        panic!(
+            "the fake differs from {} from line {} on; it gave {}",
+            golden_path.display(),
+            first + 1,
+            actual.display()
+        );
     }
-    assert_eq!(rust_answers.len(), script_answers.len());
-    assert_eq!(
-        rust_files, script_files,
-        "the two fakes leave different files"
-    );
     support::force_remove(&base);
 }

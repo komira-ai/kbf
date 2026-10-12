@@ -1,12 +1,10 @@
 //! One test's stand-in `podman`, fake cgroup mount, scratch directory and runtime,
 //! shared by the test binaries that run the driver's steps without real Podman.
 //!
-//! There are two stand-ins with the same knobs and records, byte for byte
-//! (`tests/fake_parity.rs`): the script `fixtures/fake-podman.sh` and the Rust program
-//! `kbf-fake-podman` (`tests/bin/fake_podman.rs`). [`program`] picks one by
-//! `KBF_TEST_FAKE_PODMAN`; CI runs the suites once with each.
+//! The stand-in is the program `kbf-fake-podman` (`tests/bin/fake_podman.rs`, which
+//! lists its knobs and records); `tests/fake_golden.rs` pins what it answers.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -35,22 +33,9 @@ pub fn image() -> String {
     image_by(&sha256(MANIFEST))
 }
 
-/// The stand-in `podman` the tests link, as `KBF_TEST_FAKE_PODMAN` names it: `script`
-/// (the default while it is unset) for `fixtures/fake-podman.sh`, `rust` for
-/// `kbf-fake-podman`. Any other value fails the test, so a typo in CI cannot run the
-/// default in place of the one it asked for.
+/// The stand-in `podman` the tests link: `kbf-fake-podman`.
 pub fn program() -> PathBuf {
-    match std::env::var("KBF_TEST_FAKE_PODMAN") {
-        Err(std::env::VarError::NotPresent) => script(),
-        Ok(name) if name == "script" => script(),
-        Ok(name) if name == "rust" => PathBuf::from(env!("CARGO_BIN_EXE_kbf-fake-podman")),
-        other => panic!("KBF_TEST_FAKE_PODMAN={other:?}: expected `script` or `rust`"),
-    }
-}
-
-/// `fixtures/fake-podman.sh`.
-pub fn script() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fake-podman.sh")
+    PathBuf::from(env!("CARGO_BIN_EXE_kbf-fake-podman"))
 }
 
 /// One test's fake Podman, fake cgroup mount, scratch directory and runtime.
@@ -139,7 +124,7 @@ impl Fake {
             .collect()
     }
 
-    /// What the fake recorded, in order (see `fixtures/fake-podman.sh`).
+    /// What the fake recorded, in order (see `tests/bin/fake_podman.rs`).
     pub fn events(&self) -> Vec<String> {
         std::fs::read_to_string(self.state.join("events"))
             .unwrap_or_default()
