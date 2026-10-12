@@ -5,7 +5,9 @@
 //! - **Off unless the policy names it.** The route runs the REAPI policy
 //!   (`--reapi-auth-policy`): its authenticator on the request, then its
 //!   `blobs.getAuthorizer` ([`kbf_auth::Policy::blobs_get`]) on the `instance`
-//!   parameter. Without that key, or without a policy file, every request is `404`.
+//!   parameter. Without that key, without `invocations.getAuthorizer` (the build
+//!   pages, [`crate::http_invocations`], whose links it serves), or without a policy
+//!   file, every request is `404`. `--invocations-open` fills in `allow` for both.
 //! - **Verified bytes.** The blob is read with [`Cache::read_blob`], the read path of
 //!   ByteStream Read: the whole blob is checked against its digest before a byte is
 //!   sent, and the read is a touch.
@@ -93,9 +95,12 @@ pub struct BlobReaders {
 
 impl BlobReaders {
     /// The readers `policy` allows, or `None` (the route is off) when it names no
-    /// `blobs.getAuthorizer`.
+    /// `blobs.getAuthorizer`, or no `invocations.getAuthorizer`: the blob route serves
+    /// what the build pages link to, and is off with them
+    /// (`docs/design/invocations.md` section 4.3).
     #[must_use]
     pub fn from_policy(policy: &Policy) -> Option<Self> {
+        policy.invocations_get.as_ref()?;
         let authorizer = Arc::clone(policy.blobs_get.as_ref()?);
         Some(Self {
             authenticator: Arc::clone(&policy.authenticator),
@@ -174,7 +179,8 @@ where
     let Some(readers) = &state.readers else {
         return Err(error(
             StatusCode::NOT_FOUND,
-            "blob reads over HTTP are off: the REAPI policy names no blobs.getAuthorizer",
+            "blob reads over HTTP are off: the REAPI policy names no blobs.getAuthorizer, \
+             or no invocations.getAuthorizer, and --invocations-open is not given",
         ));
     };
     let caller = readers
@@ -317,7 +323,7 @@ fn content_disposition(kind: &'static str, name: Option<&str>) -> HeaderValue {
 }
 
 /// `<64 lowercase hex digits>-<size>`, the digest form of the operator API, or `None`.
-fn parse_digest(text: &str) -> Option<Digest> {
+pub(crate) fn parse_digest(text: &str) -> Option<Digest> {
     let (hash, size) = text.split_once('-')?;
     let reapi = format!("{hash}/{size}");
     Digest::parse(DigestFunction::Sha256, &reapi).ok()
@@ -437,7 +443,7 @@ fn number(text: &str) -> Option<u64> {
 }
 
 /// The answer to a refusal of `status`'s code: 401, 403, 400, 404, 503 or 500.
-fn refusal(status: &Status) -> Response {
+pub(crate) fn refusal(status: &Status) -> Response {
     let code = match status.code() {
         Code::Unauthenticated => StatusCode::UNAUTHORIZED,
         Code::PermissionDenied => StatusCode::FORBIDDEN,
@@ -450,7 +456,7 @@ fn refusal(status: &Status) -> Response {
 }
 
 /// A JSON error answer, as the rest of the API gives.
-fn error(code: StatusCode, why: &str) -> Response {
+pub(crate) fn error(code: StatusCode, why: &str) -> Response {
     let body = serde_json::json!({ "error": why }).to_string();
     (code, [(CONTENT_TYPE, crate::api::JSON)], body).into_response()
 }

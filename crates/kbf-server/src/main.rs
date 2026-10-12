@@ -3,9 +3,12 @@
 //!
 //! On start it prints one line, `kbf-server <version> reapi=<addr> worker=<addr>`, with
 //! its version (`<package version>+<commit>`, [`kbf_server::SERVER_VERSION`]) and
-//! the addresses it bound (a port of 0 picks a free one), and ` blobs=<on|off>
-//! api=<addr>` at its end when the operator API listens (`blobs=on` when the REAPI
-//! policy names `blobs.getAuthorizer`, so `GET /v1/blobs` answers), then ` log=<id>` under `--meta-log=raft`, the id of
+//! the addresses it bound (a port of 0 picks a free one), and ` invocations=<on|off>
+//! blobs=<on|off> api=<addr>` at its end when the operator API listens
+//! (`invocations=on` when the REAPI policy names `invocations.getAuthorizer` or
+//! `--invocations-open` is given, so the build pages answer; `blobs=on` when it also
+//! names `blobs.getAuthorizer`, or the flag is given, so `GET /v1/blobs` answers), then
+//! ` log=<id>` under `--meta-log=raft`, the id of
 //! the log in `--raft-dir` (16 hex digits), then
 //! ` warning=plaintext-off-loopback:<listeners>` at its very end when a listener serves
 //! plain text on an address that is not loopback (`<listeners>` is `reapi`, `worker`
@@ -86,7 +89,10 @@ async fn run<M: MetaLog, O: ObjectStore + 'static>(
 ) -> Result<(), Box<dyn Error>> {
     let listeners = args.listeners()?;
     let policy = args.reapi_auth_policy()?;
-    let blobs = policy.blobs_get.is_some();
+    let routes = Routes {
+        invocations: policy.invocations_get.is_some(),
+        blobs: policy.invocations_get.is_some() && policy.blobs_get.is_some(),
+    };
     let cache = Arc::new(Cache::open(meta, store, prefix).await?);
     let shutdown = interrupted()?;
     let api = args.api()?;
@@ -94,26 +100,41 @@ async fn run<M: MetaLog, O: ObjectStore + 'static>(
     let plain = args.plain_text_off_loopback();
     println!(
         "{}",
-        start_line(bound.reapi, bound.worker, bound.api, blobs, log, &plain)
+        start_line(bound.reapi, bound.worker, bound.api, routes, log, &plain)
     );
     bound.serving.await?;
     Ok(())
 }
 
+/// Which of the operator API's routes that are off unless the policy names them are on.
+#[derive(Clone, Copy, Debug)]
+struct Routes {
+    /// The build pages, `GET /v1/invocations/{id}` and below.
+    invocations: bool,
+    /// `GET /v1/blobs/{digest}`.
+    blobs: bool,
+}
+
+/// `on` or `off`.
+const fn on_off(on: bool) -> &'static str {
+    if on { "on" } else { "off" }
+}
+
 /// The start line: the version, the addresses bound (with the operator API's, whether
-/// it serves `blobs`) and the Raft log's id, and one warning naming the listeners in
-/// `plain` (those serving plain text off loopback) when there are any.
+/// it serves the build pages and `blobs`) and the Raft log's id, and one warning
+/// naming the listeners in `plain` (those serving plain text off loopback) when there
+/// are any.
 fn start_line(
     reapi: SocketAddr,
     worker: SocketAddr,
     api: Option<SocketAddr>,
-    blobs: bool,
+    routes: Routes,
     log: Option<FarmLogId>,
     plain: &[&str],
 ) -> String {
-    let blobs = if blobs { "on" } else { "off" };
+    let (invocations, blobs) = (on_off(routes.invocations), on_off(routes.blobs));
     let api = api
-        .map(|a| format!(" blobs={blobs} api={a}"))
+        .map(|a| format!(" invocations={invocations} blobs={blobs} api={a}"))
         .unwrap_or_default();
     let log = log.map(|id| format!(" log={id}")).unwrap_or_default();
     let warning = if plain.is_empty() {

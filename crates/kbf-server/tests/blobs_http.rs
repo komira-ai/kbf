@@ -27,7 +27,7 @@ fn loopback() -> SocketAddr {
 
 /// A policy that accepts every caller and reads blobs on every instance.
 const OPEN: &str = r#"{"authenticationPolicy": {"allow": {}},
-    "blobs": {"getAuthorizer": {"allow": {}}}}"#;
+    "invocations": {"getAuthorizer": {"allow": {}}}, "blobs": {"getAuthorizer": {"allow": {}}}}"#;
 
 /// A server with the operator API in this process, over a cache the test holds.
 struct Server {
@@ -367,12 +367,12 @@ async fn every_answer_carries_nosniff_and_sandbox() {
         ("off", "{\"authenticationPolicy\": {\"allow\": {}}}", 404),
         (
             "not authenticated",
-            r#"{"authenticationPolicy": {"deny": "who"}, "blobs": {"getAuthorizer": {"allow": {}}}}"#,
+            r#"{"authenticationPolicy": {"deny": "who"}, "invocations": {"getAuthorizer": {"allow": {}}}, "blobs": {"getAuthorizer": {"allow": {}}}}"#,
             401,
         ),
         (
             "denied",
-            r#"{"authenticationPolicy": {"allow": {}}, "blobs": {"getAuthorizer": {"deny": {}}}}"#,
+            r#"{"authenticationPolicy": {"allow": {}}, "invocations": {"getAuthorizer": {"allow": {}}}, "blobs": {"getAuthorizer": {"deny": {}}}}"#,
             403,
         ),
     ];
@@ -419,7 +419,11 @@ async fn inline_is_refused_over_4_mib() {
 
 /// Catches (mutant "default allow"): the route answering without a policy file, or
 /// with a policy that names no `blobs.getAuthorizer` (a missing key read as allow, as
-/// every other slot is), and the route not answering once the key is named.
+/// every other slot is), and the route not answering once the key is named. And
+/// (mutant "blobs without the pages": the `invocations` check dropped from
+/// `BlobReaders::from_policy`) the route answering with `blobs` named but no
+/// `invocations` key: blobs are what the pages link to, and are off with them
+/// (`docs/design/invocations.md` section 4.3).
 #[tokio::test]
 async fn blob_reads_are_off_unless_the_policy_names_their_authorizer() {
     for (what, policy, code) in [
@@ -429,6 +433,15 @@ async fn blob_reads_are_off_unless_the_policy_names_their_authorizer() {
             Policy::from_json(
                 r#"{"authenticationPolicy": {"allow": {}},
                     "contentAddressableStorage": {"getAuthorizer": {"allow": {}}}}"#,
+            )
+            .expect("a policy"),
+            404,
+        ),
+        (
+            "blobs named, no invocations key",
+            Policy::from_json(
+                r#"{"authenticationPolicy": {"allow": {}},
+                    "blobs": {"getAuthorizer": {"allow": {}}}}"#,
             )
             .expect("a policy"),
             404,
@@ -463,7 +476,7 @@ async fn blob_reads_are_off_unless_the_policy_names_their_authorizer() {
 async fn the_authorizer_is_asked_about_the_instance_parameter() {
     let server = Server::with(
         r#"{"authenticationPolicy": {"allow": {}},
-            "blobs": {"getAuthorizer": {"instanceNamePrefix": {"allowedInstanceNamePrefixes": ["ci"]}}}}"#,
+            "invocations": {"getAuthorizer": {"allow": {}}}, "blobs": {"getAuthorizer": {"instanceNamePrefix": {"allowedInstanceNamePrefixes": ["ci"]}}}}"#,
     );
     let digest = server.store(b"stderr".to_vec()).await;
     let blob = path(&digest);
@@ -543,7 +556,7 @@ async fn each_read_is_a_touch() {
 async fn a_refused_caller_learns_nothing_and_touches_nothing() {
     let server = Server::with(
         r#"{"authenticationPolicy": {"allow": {}},
-            "blobs": {"getAuthorizer": {"instanceNamePrefix": {"allowedInstanceNamePrefixes": ["ci"]}}}}"#,
+            "invocations": {"getAuthorizer": {"allow": {}}}, "blobs": {"getAuthorizer": {"instanceNamePrefix": {"allowedInstanceNamePrefixes": ["ci"]}}}}"#,
     );
     let asked = server
         .store(b"asked for by a refused caller".to_vec())

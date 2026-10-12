@@ -89,6 +89,8 @@ pub struct Records {
     unborn: VecDeque<(InvocationId, Owner)>,
     /// What `unborn`'s ids and owners hold.
     unborn_bytes: usize,
+    /// Records made so far: the next one.s [`Invocation::serial`].
+    made: u64,
     /// Records removed for the bound.
     evicted: u64,
 }
@@ -184,6 +186,7 @@ impl Records {
             unborn: VecDeque::new(),
             unborn_bytes: 0,
             evicted: 0,
+            made: 0,
         }
     }
 
@@ -411,6 +414,8 @@ impl Records {
             self.recount(&owner);
         }
         inv.key = key.clone();
+        inv.serial = self.made;
+        self.made += 1;
         if let Some(i) = self
             .unborn
             .iter()

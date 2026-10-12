@@ -373,6 +373,8 @@ pub enum State {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Invocation {
     pub(crate) key: RecordKey,
+    /// The number [`crate::Records`] gave it when it made it: no other record it made has it.
+    pub(crate) serial: u64,
     pub(crate) minted: bool,
     pub(crate) owner: Owner,
     pub(crate) tool: Option<String>,
@@ -406,6 +408,7 @@ impl Invocation {
     pub(crate) fn new(key: RecordKey, call: &Call) -> Self {
         Self {
             key,
+            serial: 0,
             minted: call.minted,
             owner: call.owner.clone(),
             tool: None,
@@ -568,6 +571,14 @@ impl Invocation {
         &self.key
     }
 
+    /// A number no other record of the same [`crate::Records`] has had: a record
+    /// removed for the bound and made again under the same key gets a new one, so a
+    /// reader can tell it from the one it read before.
+    #[must_use]
+    pub const fn serial(&self) -> u64 {
+        self.serial
+    }
+
     /// Whether the server minted the id (section 2.3).
     #[must_use]
     pub const fn minted(&self) -> bool {
@@ -644,6 +655,12 @@ impl Invocation {
     #[must_use]
     pub fn rows(&self) -> &[ActionRow] {
         &self.rows
+    }
+
+    /// The row of `action`, if it has one.
+    #[must_use]
+    pub fn row(&self, action: &Digest) -> Option<&ActionRow> {
+        self.row_of(action).map(|i| &self.rows[i])
     }
 
     /// Its state at `now`.

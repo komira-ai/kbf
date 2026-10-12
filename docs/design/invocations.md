@@ -23,9 +23,11 @@ Read on `main`:
   Execute puts its `tool_invocation_id` on its `execute` trace span (`invocation`, `-`
   when absent). The services and the farm send each call that carries an id, and the
   lease events and outcome of its operations, to `kbf_front::Recorder` (3.4), which
-  keeps the records in memory within `--invocation-memory` (3.5, stage 1). Nothing
-  reads them yet: there is no read API, and a call without an id is not recorded
-  (the minted id of 2.3 comes with its link, PR 6).
+  keeps the records in memory within `--invocation-memory` (3.5, stage 1). The read
+  API of section 4 serves them (`kbf_server::http_invocations`, PR 4), off unless the
+  policy names `invocations.getAuthorizer` or `--invocations-open` is given (4.3); its
+  `url` is `null` until `--invocation-url-template` (PR 6). A call without an id is
+  not recorded (the minted id of 2.3 comes with its link, PR 6).
 - **Per-operation state lives about a minute.** The scheduler keeps a finished operation
   for `FINISHED_RETENTION` (60 s, `kbf-sched/src/scheduler.rs`); then WaitExecution
   answers NOT_FOUND. All scheduler state is in memory and is lost on restart.
@@ -50,12 +52,14 @@ Read on `main`:
   by the server and segments are never deleted
   ([storage.md, Planned](storage.md#planned)); **Pins**, named retention roots, are
   planned there too.
-- **No HTTP read of a blob.** Blobs are served over REAPI ByteStream and CAS, and to
-  daemons over the worker listener, all gRPC.
+- **An HTTP read of a blob** is `GET /v1/blobs/{digest}` on the operator API (4.6,
+  PR 5); otherwise blobs are served over REAPI ByteStream and CAS, and to daemons over
+  the worker listener, all gRPC.
 - **The operator API** ([api.md](../api.md)) serves `GET /v1/nodes`, the node actions,
-  `/healthz` and `/readyz` on `--api-listen`, HTTP/1.1 or h2c, without TLS. Its reads
+  `/healthz` and `/readyz` on `--api-listen`, HTTP/1.1 or h2c, without TLS. Those reads
   answer anyone who reaches the address; the REAPI auth policy
-  ([reapi-auth.md](../reapi-auth.md)) does not run there.
+  ([reapi-auth.md](../reapi-auth.md)) runs only on the build pages and the blob route
+  (4.3).
 - **The client text channel is unused.** `ExecuteResponse` is built with `result`,
   `cached_result` and `status` only; `message` and `server_logs` are empty.
 
@@ -471,8 +475,9 @@ GET /v1/invocations/{id}/actions/{digest}
 `outputs`, `stdout`, `stderr` and `usage` come from the row (3.2), so they are there after
 the ActionResult blob is gone; `available` says whether the bytes still are. `usage` is
 `null` when the result carries no `ResourceUsage`, which today is every result from a
-real driver. An output directory is listed as its tree digest; the artifacts route
-expands trees one level per page entry, not recursively.
+real driver. An output directory is listed as its tree digest, on the artifacts route
+too; expanding a tree there one level per page entry, not recursively, is planned
+(today its `href` serves the Tree blob).
 
 ### 4.3 Who may read
 
@@ -491,7 +496,8 @@ the operator API's "anyone who reaches the address" rule.
   pages answer, their `href`s are `null`, `/v1/blobs` answers `404` and the start line
   says `blobs=off`. **This is a deliberate exception** to today's policy file, where a
   slot the file does not name is left at allow: these keys guard stdout and outputs, so
-  a missing key means off. `--invocations-open` turns them on without a policy, for a listener
+  a missing key means off. `--invocations-open` turns them on without a policy (it puts
+  `allow` in whichever of the two keys the file leaves out), for a listener
   bound where only trusted people reach it, the same choice the operator API asks for
   today, made explicit.
 - Today only `allow`, `deny`, `any` and `all` authentication is built; `jwt` and
@@ -508,10 +514,12 @@ the operator API's "anyone who reaches the address" rule.
 
 Per invocation, from the record: in stage 2 the recorder computes them at each flush
 and stores them in the root (3.5), and the route adds the rows not yet flushed, so it
-reads no chunk. In stage 1 there is no root: the recorder keeps the same values in
-memory for each invocation it holds, updated as each row is written, and the route
-reads them there. Percentiles therefore come from a mergeable histogram the recorder
-keeps, not from sorting rows, so **p50 and p90 are approximate**: the histogram has
+reads no chunk. In stage 1 there is no root: the route computes them from the rows the
+recorder holds, under its lock, at each request (`Invocation::metrics`); keeping them
+updated as each row is written would cost memory the bound of 3.5 would have to count,
+for every record, read or not. Percentiles come from a mergeable histogram
+(`kbf_invocation::Histogram`), not from sorting rows, so that stage 2 can merge the
+root's with the unflushed rows', and so **p50 and p90 are approximate**: the histogram has
 power-of-two buckets each split into 16 equal sub-buckets, and a percentile is reported
 as the largest value its sub-bucket can hold, so it is never below the true value and at most
 1/16 (6.25%) above it (exact below 16 µs). Min, max, sum and counts are exact. The
@@ -527,7 +535,12 @@ separate design.
   `next_page_token`, absent on the last page.
 - Rows are append-only and in first-seen order, so a token is the opaque position
   (chunk, offset) plus the filter it was made for; a page never skips or repeats a row
-  while the build is still writing. A token used with another filter is `400`.
+  while the build is still writing. A token used with another filter is `400`. In
+  stage 1 the position is a row index and the token names the record it was made for
+  (a serial no other record of the server has had). Outputs and logs are listed as
+  each row held them when a page passed it, so an action still running then is not
+  listed on the artifacts or logs route when it ends; on the logs route, rows added
+  after the failed ones ran out are listed with the rest, failed or not.
 - A token used after its record's pin has expired (or the record was deleted or
   evicted) answers `404`, as the record's own route does; a position is never
   resolved against chunks the record no longer holds.

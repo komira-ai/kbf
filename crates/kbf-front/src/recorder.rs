@@ -209,6 +209,17 @@ impl Recorder {
         lock(&self.0.as_ref()?.records).get(key).cloned()
     }
 
+    /// Runs `read` on the record under `key`, as the task has built it so far, and
+    /// returns `true`; `false`, without running it, when there is no such record (or
+    /// the recorder is off). It runs under the records' lock, which the task waits
+    /// for: keep it short.
+    pub fn read(&self, key: &RecordKey, read: &mut dyn FnMut(&Invocation)) -> bool {
+        self.0.as_ref().is_some_and(|shared| {
+            let records = lock(&shared.records);
+            records.get(key).map(read).is_some()
+        })
+    }
+
     /// The records' bytes together, and the bound.
     #[must_use]
     pub fn bytes(&self) -> (usize, usize) {

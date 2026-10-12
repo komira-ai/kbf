@@ -19,11 +19,19 @@ pub struct Policy {
     pub authenticator: Arc<dyn Authenticator>,
     /// Asked by the services, per call.
     pub authorizers: Authorizers,
+    /// `invocations.getAuthorizer`: asked, with every instance name an invocation's
+    /// calls used (all must allow), by the operator API's invocation routes
+    /// (`GET /v1/invocations/{id}` and below), which run [`Self::authenticator`] too.
+    /// `None`, when the file names no such key or there is no file, turns those
+    /// routes off, and the blob route with them: unlike every other authorizer, a
+    /// missing one does not allow, because a build's page lists its outputs and logs.
+    pub invocations_get: Option<Arc<dyn Authorizer>>,
     /// `blobs.getAuthorizer`: asked, with the `instance` parameter, by the operator
     /// API's blob route (`GET /v1/blobs/{digest}`), which runs [`Self::authenticator`]
     /// too. `None`, when the file names no such key or there is no file, turns that
     /// route off: unlike every other authorizer, a missing one does not allow,
-    /// because the route serves build outputs and logs.
+    /// because the route serves build outputs and logs. The route is also off
+    /// without [`Self::invocations_get`].
     pub blobs_get: Option<Arc<dyn Authorizer>>,
 }
 
@@ -68,6 +76,7 @@ impl Policy {
         Self {
             authenticator: Arc::new(AllowAuthenticator::default()),
             authorizers: Authorizers::allow_all(),
+            invocations_get: None,
             blobs_get: None,
         }
     }
@@ -78,7 +87,7 @@ impl Policy {
     /// The text is not JSON, or not a policy: an unknown key, an object that names no
     /// variant or more than one, a variant not built yet, a value of the wrong type,
     /// a bad instance-name prefix, `actionCache.putAuthorizer` (clients never write
-    /// the action cache), a `blobs` without `getAuthorizer`, or no
+    /// the action cache), an `invocations` or `blobs` without `getAuthorizer`, or no
     /// `authenticationPolicy`.
     pub fn from_json(text: &str) -> Result<Self, PolicyError> {
         let root: Value = serde_json::from_str(text)?;
@@ -93,6 +102,7 @@ impl Policy {
                 "contentAddressableStorage",
                 "actionCache",
                 "executeAuthorizer",
+                "invocations",
                 "blobs",
             ],
         )?;
@@ -139,27 +149,38 @@ impl Policy {
                 authorizers.ac_get = authorizer(v, &path.key("getAuthorizer"))?;
             }
         }
-        let blobs_get = match top.get("blobs") {
-            Some(v) => {
-                let path = path.key("blobs");
-                let blobs = object(v, &path)?;
-                known(blobs, &path, &["getAuthorizer"])?;
-                let Some(get) = blobs.get("getAuthorizer") else {
-                    return Err(path.invalid(
-                        "`getAuthorizer` is required; leave `blobs` out to keep blob reads \
-                         over HTTP off",
-                    ));
-                };
-                Some(authorizer(get, &path.key("getAuthorizer"))?)
-            }
-            None => None,
-        };
+        let invocations_get = off_unless_named(top, &path, "invocations", "invocation pages")?;
+        let blobs_get = off_unless_named(top, &path, "blobs", "blob reads over HTTP")?;
         Ok(Self {
             authenticator,
             authorizers,
+            invocations_get,
             blobs_get,
         })
     }
+}
+
+/// The `getAuthorizer` of the object `key` names in `top`, or `None` when `top` has
+/// no `key`: a slot that is off unless the file names it. `what` is what it turns on,
+/// for the refusal of an object without `getAuthorizer`.
+fn off_unless_named(
+    top: &Map<String, Value>,
+    path: &Path,
+    key: &str,
+    what: &str,
+) -> Result<Option<Arc<dyn Authorizer>>, PolicyError> {
+    let Some(v) = top.get(key) else {
+        return Ok(None);
+    };
+    let path = path.key(key);
+    let slot = object(v, &path)?;
+    known(slot, &path, &["getAuthorizer"])?;
+    let Some(get) = slot.get("getAuthorizer") else {
+        return Err(path.invalid(format!(
+            "`getAuthorizer` is required; leave `{key}` out to keep {what} off"
+        )));
+    };
+    Ok(Some(authorizer(get, &path.key("getAuthorizer"))?))
 }
 
 /// A place in the JSON, for errors.
