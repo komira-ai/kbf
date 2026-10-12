@@ -1,0 +1,150 @@
+$ podman (no arguments)
+exit 125
+stdout ""
+stderr "fake podman: missing --cgroup-manager\n"
+$ podman --cgroup-manager=cgroupfs frobnicate
+exit 125
+stdout ""
+stderr "fake podman: unexpected verb frobnicate\n"
+$ podman --cgroup-manager=cgroupfs info --format=x
+exit 0
+stdout "<dir>/state/store/fake-images\n"
+stderr ""
+$ podman --cgroup-manager=cgroupfs info
+exit 125
+stdout ""
+stderr "Error: info refused\n"
+$ podman --cgroup-manager=cgroupfs image inspect --format={{.Id}} ref
+exit 0
+stdout "img1\n"
+stderr ""
+$ podman --cgroup-manager=cgroupfs image inspect ref
+exit 125
+stdout ""
+stderr "Error: image not known\n"
+$ podman --cgroup-manager=cgroupfs create --pull=never --name=kbf-lease-1-1 --label=kbf.owner=node-1 --cgroup-parent=/actions/kbf-lease-1-1 --volume=<dir>/lease/root:/w:O,upperdir=<dir>/lease/upper,workdir=<dir>/lease/work docker://registry.test/busybox
+exit 125
+stdout ""
+stderr "Error: create refused\n"
+$ podman --cgroup-manager=cgroupfs create
+exit 0
+stdout "0123456789ab\n"
+stderr ""
+$ podman --cgroup-manager=cgroupfs create --pull=never --name=kbf-lease-1-1 --label=kbf.owner=node-1 --cgroup-parent=/actions/kbf-lease-1-1 --volume=<dir>/lease/root:/w:O,upperdir=<dir>/lease/upper,workdir=<dir>/lease/work docker://registry.test/busybox
+exit 0
+stdout "0123456789ab\n"
+stderr ""
+$ podman --cgroup-manager=cgroupfs ps --all --filter=label=kbf.owner=node-1 --format=x
+exit 0
+stdout "node-1 kbf-lease-1-1\n"
+stderr ""
+$ podman --cgroup-manager=cgroupfs ps --all --filter=label=kbf.owner=node-1 --format=x
+exit 0
+stdout "node-1 kbf-lease-1-1\nnode-1 other\n"
+stderr ""
+$ podman --cgroup-manager=cgroupfs ps --all --filter=label=kbf.owner=node-1 --format=x
+exit 125
+stdout ""
+stderr "Error: ps refused\n"
+$ podman --cgroup-manager=cgroupfs inspect --type=container kbf-lease-1-1
+exit 125
+stdout ""
+stderr "Error: no such container\n"
+$ podman --cgroup-manager=cgroupfs kill --signal=TERM kbf-lease-1-1
+exit 125
+stdout ""
+stderr "Error: no such container\n"
+$ podman --cgroup-manager=cgroupfs start --attach kbf-lease-1-1
+exit 3
+stdout "CG=<dir>/cgroup/actions/kbf-lease-1-1 ROOT=<dir>/lease/root UPPER=<dir>/lease/upper FAKE_LEASE=n:/actions/kbf-lease-1-1\nleads group 1 session 1\n"
+stderr "err\n"
+$ podman --cgroup-manager=cgroupfs inspect kbf-lease-1-1
+exit 0
+stdout "exited 3\n"
+stderr ""
+$ podman --cgroup-manager=cgroupfs inspect x
+exit 125
+stdout ""
+stderr "Error: inspect refused\n"
+$ podman --cgroup-manager=cgroupfs kill --signal=TERM x
+exit 125
+stdout ""
+stderr "Error: kill refused\n"
+$ podman --cgroup-manager=cgroupfs unshare chown -hR 1:1 -- <dir>/lease/upper /b
+exit 0
+stdout ""
+stderr ""
+$ podman --cgroup-manager=cgroupfs start --attach kbf-lease-1-1
+exit 3
+stdout "CG=<dir>/cgroup/actions/kbf-lease-1-1 ROOT=<dir>/lease/root UPPER=<dir>/lease/upper FAKE_LEASE=n:/actions/kbf-lease-1-1\nleads group 1 session 1\n"
+stderr "err\n"
+$ podman --cgroup-manager=cgroupfs unshare chown -hR 0:0 -- <dir>/lease/upper
+exit 0
+stdout ""
+stderr ""
+$ podman --cgroup-manager=cgroupfs unshare chown -hR 1:1 --
+exit 1
+stdout ""
+stderr "Error: chown refused\n"
+$ podman --cgroup-manager=cgroupfs unshare chown -R 1:1 -- /a
+exit 125
+stdout ""
+stderr "fake podman: chown chown -R 1:1 -- /a\n"
+$ podman --cgroup-manager=cgroupfs rm --force kbf-lease-1-1
+exit 125
+stdout ""
+stderr "Error: rm refused\n"
+$ podman --cgroup-manager=cgroupfs rm --force kbf-lease-1-1
+exit 0
+stdout ""
+stderr ""
+$ podman --cgroup-manager=cgroupfs unshare rm -rf -- <dir>/gone
+exit 1
+stdout ""
+stderr "Error: unshare refused\n"
+$ podman --cgroup-manager=cgroupfs unshare rm -rf -- <dir>/gone
+exit 0
+stdout ""
+stderr ""
+$ podman --cgroup-manager=cgroupfs unshare rm -rf -- <dir>/gone
+exit 0
+stdout ""
+stderr ""
+$ podman --cgroup-manager=cgroupfs create --pull=never --name=kbf-lease-1-1 --label=kbf.owner=node-1 --cgroup-parent=/actions/kbf-lease-1-1 --volume=<dir>/lease/root:/w:O,upperdir=<dir>/lease/upper,workdir=<dir>/lease/work docker://registry.test/busybox
+exit 0
+stdout "0123456789ab\n"
+stderr ""
+files
+d 0755 cgroup
+d 0755 cgroup/actions
+d 0755 cgroup/actions/kbf-lease-1-1
+d 0755 lease
+d 0755 lease/root
+d 0755 lease/stdout
+d 0751 lease/upper
+d 0755 lease/upper/sub
+d 0755 state
+f 0644 state/action.sh "echo \"CG=$CG ROOT=$ROOT UPPER=$UPPER FAKE_LEASE=$FAKE_LEASE\"\nread -r -a stat < /proc/$$/stat\necho \"leads group $(( stat[4] == $$ )) session $(( stat[5] == $$ ))\"\necho err >&2\nexit 3"
+f 0644 state/calls "frobnicate\ninfo\ninfo\nimage\nimage\ncreate\ncreate\ncreate\nps\nps\nps\ninspect\nkill\nstart\ninspect\ninspect\nkill\nunshare chown\nstart\nunshare chown\nunshare chown\nunshare chown\nrm\nrm\nunshare rm\nunshare rm\nunshare rm\ncreate\n"
+f 0644 state/cgroup "/actions/kbf-lease-1-1\n"
+f 0644 state/chown-fails "1:1"
+f 0644 state/create.args "--pull=never\n--name=kbf-lease-1-1\n--label=kbf.owner=node-1\n--cgroup-parent=/actions/kbf-lease-1-1\n--volume=<dir>/lease/root:/w:O,upperdir=<dir>/lease/upper,workdir=<dir>/lease/work\ndocker://registry.test/busybox\n"
+f 0644 state/events "start ended\nchown 1:1 <dir>/lease/upper /b\nstart ended\nchown 0:0 <dir>/lease/upper\nchown 1:1 \nrm\n"
+f 0644 state/info-fails ""
+f 0644 state/inspect-fails ""
+f 0644 state/kill-fails ""
+f 0644 state/killed-before-rm ""
+f 0644 state/name "kbf-lease-1-1\n"
+f 0644 state/nonce "n:"
+f 0644 state/owner "0:0\n"
+f 0644 state/owner-label "node-1\n"
+f 0644 state/ps-extra "node-1 other\n"
+f 0644 state/ps-fails ""
+f 0644 state/ps.args "--all\n--filter=label=kbf.owner=node-1\n--format=x\n"
+f 0644 state/removed ""
+f 0644 state/root "<dir>/lease/root\n"
+f 0644 state/start-pid "<a pid>"
+f 0644 state/status "stopped 0\n"
+f 0644 state/status-override "stopped 0\n"
+f 0644 state/upper "<dir>/lease/upper\n"
+f 0644 state/vanish-after-create ""
