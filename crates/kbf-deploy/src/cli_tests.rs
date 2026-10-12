@@ -670,9 +670,14 @@ fn envoy_check_exits_0_passed_1_failed_2_refused() {
     assert!(err.ends_with(": unknown key KBF_SERVER\n"), "{err}");
 }
 
-/// Catches `mdm erase-request` not wired to the kit (or to the clock and the random
-/// nonce), a pair that does not check exiting other than 1, and a refusal other than
-/// 2. In-process, so the lib tests' instantiation of `run` covers the arm.
+/// Catches `mdm erase-request` not wired to the kit, a pair that does not check
+/// exiting other than 1, and a refusal other than 2. Also catches the verb not wired to
+/// the clock: the signed request's not-after must lie in [before + 15 min, after + 15
+/// min] for clock reads around the call (a stuck or zero clock writes an expired
+/// request). And catches a fixed or counted nonce: two signed requests must carry
+/// nonces that differ in at least 8 of their 16 bytes (equal nonces make the gate's
+/// replay check refuse every request after the first; a counter differs in one byte).
+/// In-process, so the lib tests' instantiation of `run` covers the arm.
 #[test]
 fn mdm_erase_request_signs_and_its_refusals_exit_2() {
     use kbf_host::exec::Entry;
@@ -693,7 +698,10 @@ fn mdm_erase_request_signs_and_its_refusals_exit_2() {
     );
     let flags = Rc::new(RefCell::new(FLAG_USER_PRESENT));
     let seen = Rc::clone(&flags);
+    let signed = Rc::new(RefCell::new(Vec::<Vec<u8>>::new()));
+    let log = Rc::clone(&signed);
     exec.answer = Box::new(move |cmd| {
+        log.borrow_mut().push(cmd.stdin.clone());
         let sig = key.sign_with(NAMESPACE, &cmd.stdin, *seen.borrow());
         Ok(reply(0, &sig, ""))
     });
@@ -718,7 +726,13 @@ fn mdm_erase_request_signs_and_its_refusals_exit_2() {
         cli(exec, &no_env, &v)
     };
 
+    let secs = || {
+        let d = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH);
+        i64::try_from(d.expect("after the epoch").as_secs()).expect("secs")
+    };
+    let before = secs();
     let (code, out, err) = call(&mut exec, &with("/srv/op/a.req", &["--apply"]));
+    let after = secs();
     assert_eq!(code, ExitCode::SUCCESS, "{err}");
     assert!(
         out.starts_with("erase request for C02ABC123XYZ, acceptable until "),
@@ -732,6 +746,30 @@ fn mdm_erase_request_signs_and_its_refusals_exit_2() {
     assert!(
         out.contains("send /srv/op/a.req and /srv/op/a.req.sig"),
         "{out}"
+    );
+
+    let (code, _, err) = call(&mut exec, &with("/srv/op/a2.req", &["--apply"]));
+    assert_eq!(code, ExitCode::SUCCESS, "{err}");
+    let requests: Vec<kbf_mdm::request::EraseRequest> = signed
+        .borrow()
+        .iter()
+        .map(|b| kbf_mdm::request::parse(std::str::from_utf8(b).expect("utf-8")).expect("parse"))
+        .collect();
+    assert_eq!(requests.len(), 2);
+    let not_after = requests[0].not_after;
+    assert!(
+        (before + 15 * 60..=after + 15 * 60).contains(&not_after),
+        "not-after {not_after} outside [{before}+900, {after}+900]"
+    );
+    let nonce = |r: &kbf_mdm::request::EraseRequest| hex::decode(&r.nonce).expect("hex");
+    let (n1, n2) = (nonce(&requests[0]), nonce(&requests[1]));
+    assert_eq!((n1.len(), n2.len()), (16, 16));
+    let differ = n1.iter().zip(&n2).filter(|(a, b)| a != b).count();
+    assert!(
+        differ >= 8,
+        "nonces {} and {} differ in {differ} bytes",
+        requests[0].nonce,
+        requests[1].nonce
     );
 
     *flags.borrow_mut() = 0;
