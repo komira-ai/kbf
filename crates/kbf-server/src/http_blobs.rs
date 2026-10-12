@@ -16,28 +16,30 @@
 //!   of at most [`INLINE_MAX_BYTES`] as `text/plain; charset=utf-8`, `inline`.
 //! - **A memory budget.** A read holds the whole blob in memory (verification needs
 //!   all of it), and the bytes of every answer still being sent count against
-//!   [`READ_BUDGET_BYTES`]; a read that does not fit in what is left is `503` before a
-//!   byte is read. The cache keeps one digest per blob, so it cannot check a part of
+//!   [`READ_BUDGET_BYTES`]. A read waits in line (first come, first served) up to
+//!   [`READ_BUDGET_WAIT`] for its share, then is `503` with `Retry-After`, before a
+//!   byte is read; a digest larger than the largest blob the cache accepts is `404`. The cache keeps one digest per blob, so it cannot check a part of
 //!   one, and a second read to stream from would send bytes nobody checked.
 //! - **One byte range.** `Range: bytes=...` with a single range is answered `206`, one
 //!   that cannot be satisfied `416`; anything else (several ranges, another unit, a
 //!   malformed value) is ignored and the whole blob is sent, as RFC 9110 allows.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::Router;
 use axum::body::{Body, Bytes};
 use axum::extract::State;
 use axum::http::header::{
     ACCEPT_RANGES, CONTENT_DISPOSITION, CONTENT_RANGE, CONTENT_SECURITY_POLICY, CONTENT_TYPE,
-    RANGE, X_CONTENT_TYPE_OPTIONS,
+    RANGE, RETRY_AFTER, X_CONTENT_TYPE_OPTIONS,
 };
 use axum::http::request::Parts;
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use kbf_auth::{Authenticator, Authorizer, Policy, authorize};
-use kbf_front::{Cache, MetaLog};
+use kbf_front::{Cache, MAX_BLOB_BYTES, MetaLog};
 use kbf_objstore::ObjectStore;
 use kbf_types::{Digest, DigestFunction};
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
@@ -49,9 +51,16 @@ use tonic::{Code, Status};
 pub const INLINE_MAX_BYTES: u64 = 4 * 1024 * 1024;
 
 /// The most blob bytes the route holds at once, over all the answers it is reading
-/// or sending: 1 GiB, [`kbf_front::MAX_BLOB_BYTES`], so the largest blob the cache accepts can
+/// or sending: 1 GiB, [`MAX_BLOB_BYTES`], so the largest blob the cache accepts can
 /// always be served when nothing else is.
 pub const READ_BUDGET_BYTES: usize = 1 << 30;
+
+/// How long a read waits in line for its share of [`READ_BUDGET_BYTES`] before it is
+/// answered `503`: 10 seconds.
+pub const READ_BUDGET_WAIT: Duration = Duration::from_secs(10);
+
+/// The `Retry-After` of that `503`, in seconds.
+const RETRY_AFTER_SECONDS: &str = "1";
 
 /// The route's path prefix; the digest follows it.
 const PREFIX: &str = "/v1/blobs/";
@@ -190,16 +199,7 @@ where
         );
         return Err(error(StatusCode::BAD_REQUEST, &why));
     }
-    let permit = u32::try_from(digest.size_bytes)
-        .ok()
-        .and_then(|n| Arc::clone(&state.budget).try_acquire_many_owned(n).ok())
-        .ok_or_else(|| {
-            let why = format!(
-                "{digest} does not fit in the memory left for blob reads \
-                 ({READ_BUDGET_BYTES} bytes in all); try again when other reads finish"
-            );
-            error(StatusCode::SERVICE_UNAVAILABLE, &why)
-        })?;
+    let permit = admit(Arc::clone(&state.budget), &digest).await?;
     let bytes = state
         .cache
         .read_blob(&digest)
@@ -210,6 +210,48 @@ where
         _permit: permit,
     });
     Ok(served(&bytes, &query, parts.headers.get(RANGE)))
+}
+
+/// `digest`'s share of the read budget, one permit per byte, taken in the order the
+/// reads asked (the semaphore is fair: a large read at the head of the queue is not
+/// passed by smaller ones behind it).
+///
+/// # Errors
+/// `404` for a digest larger than [`MAX_BLOB_BYTES`], which the cache never holds;
+/// `503` with `Retry-After` and `"busy": true` when the share is not free within
+/// [`READ_BUDGET_WAIT`].
+async fn admit(budget: Arc<Semaphore>, digest: &Digest) -> Result<OwnedSemaphorePermit, Response> {
+    let Some(permits) = u32::try_from(digest.size_bytes)
+        .ok()
+        .filter(|&n| u64::from(n) <= MAX_BLOB_BYTES)
+    else {
+        let why = format!(
+            "{digest} is larger than the largest blob this cache accepts \
+             ({MAX_BLOB_BYTES} bytes), so it is not held"
+        );
+        return Err(error(StatusCode::NOT_FOUND, &why));
+    };
+    tokio::time::timeout(READ_BUDGET_WAIT, budget.acquire_many_owned(permits))
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .ok_or_else(|| busy(digest))
+}
+
+/// The `503` of a read whose share of the budget was not free in time: `Retry-After`
+/// and `"busy": true`, so a client can tell it from a blob that cannot be read.
+fn busy(digest: &Digest) -> Response {
+    let wait = READ_BUDGET_WAIT.as_secs();
+    let why = format!(
+        "the reads in progress hold the memory {digest} needs ({READ_BUDGET_BYTES} bytes \
+         for all reads), and it was not free within {wait} s; try again"
+    );
+    let body = serde_json::json!({ "error": why, "busy": true }).to_string();
+    let headers = [
+        (CONTENT_TYPE, HeaderValue::from_static(crate::api::JSON)),
+        (RETRY_AFTER, HeaderValue::from_static(RETRY_AFTER_SECONDS)),
+    ];
+    (StatusCode::SERVICE_UNAVAILABLE, headers, body).into_response()
 }
 
 /// The bytes of a blob read, as the query and the `Range` header ask.

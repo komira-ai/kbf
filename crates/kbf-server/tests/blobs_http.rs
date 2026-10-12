@@ -229,6 +229,11 @@ async fn corrupt_bytes_are_an_error_not_a_body() {
         let body = String::from_utf8_lossy(&answer.body);
         assert!(body.contains("cannot be read"), "{attempt}: {body}");
         assert!(!body.contains("flipped bit"), "{attempt}: {body}");
+        assert!(
+            !body.contains("busy"),
+            "{attempt}: not the busy answer: {body}"
+        );
+        assert_eq!(answer.header("retry-after"), None, "{attempt}");
     }
     server.stop().await;
 }
@@ -566,20 +571,19 @@ async fn a_refused_caller_learns_nothing_and_touches_nothing() {
     server.stop().await;
 }
 
-/// Catches: a digest that claims more bytes than the read budget holds read anyway
-/// (or a panic on a size too large for a permit count) instead of `503` before the
-/// read. The cache never holds such a blob: the budget is the largest it accepts.
+/// Catches: a digest that claims more bytes than the largest blob the cache accepts
+/// answered `503` ("try again", which can never succeed) or read anyway, or a size
+/// too large for a permit count (2^33) panicking: both are `404` with the reason.
 #[tokio::test]
-async fn a_digest_larger_than_the_read_budget_is_503() {
+async fn a_digest_larger_than_any_blob_is_404() {
     let server = Server::with(OPEN);
-    let budget = u64::try_from(kbf_server::http_blobs::READ_BUDGET_BYTES).expect("a u64");
-    for size in [budget + 1, 1 << 33] {
+    for size in [kbf_front::MAX_BLOB_BYTES + 1, 1 << 33] {
         let digest = Digest::new(kbf_types::DigestFunction::Sha256, [9; 32], size);
         let answer = server.get(&path(&digest), "").await;
-        assert_eq!(answer.code, 503, "{size}: {}", answer.head);
+        assert_eq!(answer.code, 404, "{size}: {}", answer.head);
         let body = String::from_utf8_lossy(&answer.body);
         assert!(
-            body.contains("does not fit in the memory left"),
+            body.contains("larger than the largest blob"),
             "{size}: {body}"
         );
     }

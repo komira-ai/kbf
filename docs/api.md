@@ -253,10 +253,20 @@ still downloads without `inline`.
 cache keeps one digest per blob and can check only all of it; a second read to stream
 from would send bytes nobody checked. So the route keeps a budget: the blobs of all the
 answers it is reading or still sending hold at most 1 GiB (1073741824 bytes, the largest
-blob the cache accepts) at once. A read whose blob does not fit in what is left is `503`
-before a byte is read; it can be asked again once other answers have been sent. A
-digest that claims more than the whole budget is `503` too (the cache holds no such blob). A slow
-client holds its blob's share of the budget until its answer is sent or it goes away.
+blob the cache accepts) at once. An answer gives its share back when its bytes have
+been sent or dropped (the client went away), and a failed read gives it back at once.
+
+- **Waiting.** A read whose blob does not fit in what is left waits in line, first come
+  first served, before a byte is read: a large read at the head of the line is not
+  passed by smaller ones behind it, so a stream of small reads cannot starve it (and
+  they wait while it does). A read still waiting after 10 seconds is `503` with
+  `Retry-After: 1` and the body `{"error": "<why>", "busy": true}`; a blob that cannot
+  be read is `503` without either, so a client can tell busy from broken.
+- **Too large.** A digest that claims more than 1 GiB is `404` at once, with the limit
+  in the error: the cache refuses such a blob on write, so it never holds one, and no
+  retry can change that. ByteStream Read answers the same digest `NOT_FOUND`.
+- **Slow clients.** A client holds its blob's share until its answer is sent or it goes
+  away; the listener has no write timeout.
 
 **Never a page.** Every answer of the route, the errors and `404` included, carries
 `X-Content-Type-Options: nosniff` and `Content-Security-Policy: sandbox`, so stdout that
@@ -275,9 +285,9 @@ ignored, as RFC 9110 allows, and the whole blob is sent. Every `200` and `206` s
 | `400` | a malformed digest or query, or `inline=text` for a blob over 4 MiB |
 | `401` | the authentication policy refuses the request |
 | `403` | `blobs.getAuthorizer` refuses the instance name |
-| `404` | the route is off, or the blob is not held |
+| `404` | the route is off, the blob is not held, or the digest claims more than 1 GiB |
 | `416` | the range starts past the end |
-| `503` | the blob does not fit in the memory budget left for blob reads, the blob is held but its bytes cannot be read (missing from the store, or failing their digest), or the store or the metadata log does not answer |
+| `503` | busy: the blob's share of the memory budget was not free within 10 seconds (`Retry-After: 1`, `"busy": true`); or the blob is held but its bytes cannot be read (missing from the store, or failing their digest), or the store or the metadata log does not answer |
 | `500` | the cache's own records disagree |
 
 Errors are JSON, `{"error": "<why>"}`, as everywhere in this API.

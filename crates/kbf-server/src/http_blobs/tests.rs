@@ -258,26 +258,45 @@ async fn get_range<M: MetaLog, O: ObjectStore + 'static>(
     }
 }
 
+/// The answer to a `GET` of `digest`, which must come within twice the wait: a read
+/// that waits forever fails here instead of hanging the test.
+async fn get_in_time<M: MetaLog, O: ObjectStore + 'static>(
+    state: &BlobState<M, O>,
+    digest: &Digest,
+    range: Option<&str>,
+) -> Response {
+    tokio::time::timeout(2 * READ_BUDGET_WAIT, get_range(state, digest, range))
+        .await
+        .expect("answered within twice the wait")
+}
+
 /// Catches (mutants "release the budget once the blob is read", "one permit per read
-/// instead of per byte", "no budget"): reads that together hold more blob bytes than
-/// the budget. With 10 bytes, an 8-byte answer not yet sent leaves room for a 2-byte
-/// read and not for a second 8-byte one (`503`, before the read); once its bytes are
-/// dropped the 8-byte blob is served again. A digest whose size cannot be a permit
-/// count (over `u32`) is `503` too, not a panic.
-#[tokio::test]
+/// instead of per byte", "no budget", "wait forever", "another wait", "a busy answer
+/// without Retry-After or `busy`"): reads that together hold more blob bytes than the
+/// budget, and a busy read not told so. With 10 bytes, an 8-byte answer not yet sent
+/// leaves room for a 2-byte read; a second 8-byte read waits exactly
+/// [`READ_BUDGET_WAIT`] and is `503` with `Retry-After: 1` and `"busy": true`. Once
+/// the first answer's bytes are dropped the 8-byte blob is served again.
+#[tokio::test(start_paused = true)]
 async fn bytes_not_yet_sent_hold_the_read_budget() {
     let (state, digests) = budgeted(10, &[b"8 bytes!", b"2b"]).await;
     let (eight, two) = (digests[0], digests[1]);
     let first = get(&state, &eight).await;
     assert_eq!(first.status(), StatusCode::OK);
-    let busy = get(&state, &eight).await;
+    let asked = tokio::time::Instant::now();
+    let busy = get_in_time(&state, &eight, None).await;
+    assert_eq!(asked.elapsed(), READ_BUDGET_WAIT);
     assert_eq!(busy.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(busy.headers()[RETRY_AFTER], "1");
+    assert_eq!(busy.headers()[CONTENT_TYPE], crate::api::JSON);
     let why = axum::body::to_bytes(busy.into_body(), usize::MAX)
         .await
         .expect("a body");
-    let why = String::from_utf8_lossy(&why);
-    assert!(why.contains("does not fit in the memory left"), "{why}");
-    let small = get(&state, &two).await;
+    let why: serde_json::Value = serde_json::from_slice(&why).expect("JSON");
+    assert_eq!(why["busy"], true, "{why}");
+    let text = why["error"].as_str().expect("an error");
+    assert!(text.contains("was not free within 10 s"), "{text}");
+    let small = get_in_time(&state, &two, None).await;
     assert_eq!(small.status(), StatusCode::OK);
     drop(small);
     let body = axum::body::to_bytes(first.into_body(), usize::MAX)
@@ -285,12 +304,85 @@ async fn bytes_not_yet_sent_hold_the_read_budget() {
         .expect("a body");
     assert_eq!(&body[..], b"8 bytes!");
     drop(body);
-    assert_eq!(get(&state, &eight).await.status(), StatusCode::OK);
-    let huge = Digest::new(DigestFunction::Sha256, [9; 32], 1 << 33);
     assert_eq!(
-        get(&state, &huge).await.status(),
-        StatusCode::SERVICE_UNAVAILABLE
+        get_in_time(&state, &eight, None).await.status(),
+        StatusCode::OK
     );
+}
+
+/// Catches (mutant "take the budget only if it is free now", the first form): a large
+/// read starved by smaller ones. With 8 of 10 bytes held, a 10-byte read waits in
+/// line; a 2-byte read asked after it waits behind it although 2 bytes are free, and
+/// is served only once the 10-byte answer is dropped.
+#[tokio::test]
+async fn reads_take_the_budget_in_the_order_they_asked() {
+    let (state, digests) = budgeted(10, &[b"8 bytes!", b"ten bytes!", b"2b"]).await;
+    let (eight, ten, two) = (digests[0], digests[1], digests[2]);
+    let state = Arc::new(state);
+    let first = get(&state, &eight).await;
+    assert_eq!(first.status(), StatusCode::OK);
+    let large = tokio::spawn({
+        let state = Arc::clone(&state);
+        async move { get_in_time(&state, &ten, None).await }
+    });
+    // The read at the head of the line takes the free permits as they come.
+    while state.budget.available_permits() > 0 && !large.is_finished() {
+        tokio::task::yield_now().await;
+    }
+    let small = tokio::spawn({
+        let state = Arc::clone(&state);
+        async move { get_in_time(&state, &two, None).await }
+    });
+    for _ in 0..100 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        !large.is_finished(),
+        "the 10-byte read waits for the 8 bytes held"
+    );
+    assert!(
+        !small.is_finished(),
+        "the 2-byte read waits behind the 10-byte one"
+    );
+    drop(first);
+    let large = large.await.expect("the large read");
+    assert_eq!(large.status(), StatusCode::OK);
+    for _ in 0..100 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        !small.is_finished(),
+        "the 10-byte answer holds the whole budget"
+    );
+    drop(large);
+    assert_eq!(
+        small.await.expect("the small read").status(),
+        StatusCode::OK
+    );
+}
+
+/// Catches: a digest larger than any blob the cache accepts answered `503` ("try
+/// again", which can never succeed), or a size too large for a permit count
+/// panicking. Both are `404` with the limit named, at once.
+#[tokio::test(start_paused = true)]
+async fn a_digest_larger_than_any_blob_is_404_at_once() {
+    let (state, _) = budgeted(10, &[]).await;
+    for size in [kbf_front::MAX_BLOB_BYTES + 1, 1 << 33] {
+        let asked = tokio::time::Instant::now();
+        let digest = Digest::new(DigestFunction::Sha256, [9; 32], size);
+        let answer = get(&state, &digest).await;
+        assert_eq!(asked.elapsed(), Duration::ZERO, "{size}");
+        assert_eq!(answer.status(), StatusCode::NOT_FOUND, "{size}");
+        let why = axum::body::to_bytes(answer.into_body(), usize::MAX)
+            .await
+            .expect("a body");
+        let why = String::from_utf8_lossy(&why);
+        assert!(
+            why.contains("larger than the largest blob"),
+            "{size}: {why}"
+        );
+        assert!(why.contains("1073741824 bytes"), "{size}: {why}");
+    }
 }
 
 /// Catches: a budget smaller than the largest blob the cache accepts, which could
@@ -310,11 +402,14 @@ fn the_read_budget_holds_the_largest_blob() {
 async fn an_answer_dropped_unread_frees_its_budget() {
     let (state, digests) = budgeted(10, &[b"8 bytes!"]).await;
     for _ in 0..3 {
-        let answer = get(&state, &digests[0]).await;
+        let answer = get_in_time(&state, &digests[0], None).await;
         assert_eq!(answer.status(), StatusCode::OK);
         drop(answer);
     }
-    assert_eq!(get(&state, &digests[0]).await.status(), StatusCode::OK);
+    assert_eq!(
+        get_in_time(&state, &digests[0], None).await.status(),
+        StatusCode::OK
+    );
 }
 
 /// Catches (mutant "a failed read keeps its permit"): a read that fails (here an
@@ -323,8 +418,14 @@ async fn an_answer_dropped_unread_frees_its_budget() {
 async fn a_failed_read_frees_its_budget() {
     let (state, digests) = budgeted(10, &[b"8 bytes!"]).await;
     let absent = Digest::new(DigestFunction::Sha256, [9; 32], 10);
-    assert_eq!(get(&state, &absent).await.status(), StatusCode::NOT_FOUND);
-    assert_eq!(get(&state, &digests[0]).await.status(), StatusCode::OK);
+    assert_eq!(
+        get_in_time(&state, &absent, None).await.status(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        get_in_time(&state, &digests[0], None).await.status(),
+        StatusCode::OK
+    );
 }
 
 /// Catches (mutant "a range answer copies its part"): a `206` that frees the whole
@@ -334,12 +435,15 @@ async fn a_failed_read_frees_its_budget() {
 #[tokio::test(start_paused = true)]
 async fn a_part_holds_the_whole_blobs_budget() {
     let (state, digests) = budgeted(10, &[b"8 bytes!"]).await;
-    let part = get_range(&state, &digests[0], Some("bytes=0-0")).await;
+    let part = get_in_time(&state, &digests[0], Some("bytes=0-0")).await;
     assert_eq!(part.status(), StatusCode::PARTIAL_CONTENT);
     assert_eq!(
-        get(&state, &digests[0]).await.status(),
+        get_in_time(&state, &digests[0], None).await.status(),
         StatusCode::SERVICE_UNAVAILABLE
     );
     drop(part);
-    assert_eq!(get(&state, &digests[0]).await.status(), StatusCode::OK);
+    assert_eq!(
+        get_in_time(&state, &digests[0], None).await.status(),
+        StatusCode::OK
+    );
 }
