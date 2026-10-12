@@ -28,7 +28,7 @@ use crate::network::{self, Network, network_of};
 use crate::procs::{self, Proc, Tracker};
 use crate::program::{Refused, Resolved, resolve};
 use crate::record::{Exec, Spawned};
-use crate::simulator::{self, Simctl};
+use crate::simulator::{self, Made, Simctl};
 use crate::user_folders::UserFolders;
 use crate::xcode;
 
@@ -99,7 +99,7 @@ struct Prepared {
     developer_dir: Option<PathBuf>,
     /// The simulator the action asks for (`simulator`).
     simulator: Option<simulator::Request>,
-    /// The variables that name the lease's simulator, once it is made.
+    /// The variable that names the lease's simulator, once it is made.
     simulator_env: Vec<(&'static str, OsString)>,
 }
 
@@ -136,9 +136,16 @@ impl<C: Cas> NativeRuntime<C> {
             rules: rules.clone(),
             within: simulator::ANSWER_WITHIN,
         });
-        // A simulator a killed daemon's lease left goes before its directory does.
+        // The first lease directory a killed daemon left that may hold a simulator:
+        // the simulators every lease left are deleted from it before it is removed.
+        let swept = std::cell::Cell::new(false);
         let remove_left = |path: &Path| {
-            simctl.end_left(path);
+            if simulator::marked(path)
+                && !swept.replace(true)
+                && let Err(why) = simctl.sweep(path)
+            {
+                tracing::error!(dir = %path.display(), "simulators left behind: {why}");
+            }
             remove(path)
         };
         crate::sweep::sweep(
@@ -470,6 +477,7 @@ impl<C: Cas> NativeRuntime<C> {
         &self,
         work: &Work,
         dir: &Path,
+        made: &Mutex<Option<Made>>,
         stop: &mut oneshot::Receiver<Stop>,
         killer: &mut Option<Stop>,
     ) -> Result<ActionResult, RuntimeError> {
@@ -490,7 +498,7 @@ impl<C: Cas> NativeRuntime<C> {
         // Not stopped by a kill: a `simctl create` cut short could still make its
         // device after the end looked for the lease's devices.
         if prepared.refused.is_none() {
-            create_simulator(&self.simctl, work.lease_id, &mut prepared).await?;
+            create_simulator(&self.simctl, work.lease_id, &mut prepared, made).await?;
             if let Ok(by) = stop.try_recv() {
                 *killer = Some(by);
                 return Err(RuntimeError::Killed);
@@ -551,10 +559,12 @@ impl<C: Cas> Runtime for NativeRuntime<C> {
         let dir = LeaseDir {
             path: self.config.scratch.join(lease_name(work.lease_id)),
             simctl: Arc::clone(&self.simctl),
+            simulator: Mutex::new(None),
             armed: true,
         };
         let mut killer = None;
-        let outcome = self.attempt(&work, &dir.path, &mut stop, &mut killer).await;
+        let outcome =
+            (self.attempt(&work, &dir.path, &dir.simulator, &mut stop, &mut killer)).await;
         let cleaned = dir.clean().await;
         sweep_user_folders_after_lease(&self.config).await;
         // A kill that arrived after the work ended still waits for the clean.
@@ -614,30 +624,36 @@ fn sandbox(config: &NativeConfig, rules: &str, dir: &str) -> xcode::Sandbox {
     }
 }
 
-/// Makes the simulator `prepared` asks for in the lease's own device set
-/// ([`crate::simulator`]), off the async threads, and names it in
-/// `prepared.simulator_env`. Not generic over the CAS.
+/// Makes the simulator `prepared` asks for ([`crate::simulator`]), off the async
+/// threads, and names it in `prepared.simulator_env`. What the end needs is in `slot`
+/// before the create runs, its UDID once the create printed it. Not generic over the
+/// CAS.
 async fn create_simulator(
     simctl: &Arc<Simctl>,
     lease: LeaseId,
     prepared: &mut Prepared,
+    slot: &Mutex<Option<Made>>,
 ) -> Result<(), RuntimeError> {
     let Some(request) = prepared.simulator.clone() else {
         return Ok(());
     };
-    let (simctl, dir) = (Arc::clone(simctl), prepared.lease.clone());
+    let made = Made {
+        lease: prepared.lease.clone(),
+        name: format!("{}{}-{}", simulator::NAME_PREFIX, lease.term, lease.seq),
+        udid: None,
+    };
+    *made_in(slot) = Some(made.clone());
+    let simctl = Arc::clone(simctl);
     let developer_dir = prepared.developer_dir.clone();
-    let name = format!("kbf-{}", lease_name(lease));
-    let made = tokio::task::spawn_blocking(move || {
-        simctl.create(&dir, &name, &request, developer_dir.as_deref())
+    let created = tokio::task::spawn_blocking(move || {
+        simctl.create(&made, &request, developer_dir.as_deref())
     })
     .await;
-    let udid = simulator_made(made)?;
-    let set = prepared.lease.join(simulator::SET_DIR).into_os_string();
-    prepared.simulator_env = vec![
-        (simulator::UDID_VAR, OsString::from(udid)),
-        (simulator::SET_VAR, set),
-    ];
+    let udid = simulator_made(created)?;
+    if let Some(made) = made_in(slot).as_mut() {
+        made.udid = Some(udid.clone());
+    }
+    prepared.simulator_env = vec![(simulator::UDID_VAR, OsString::from(udid))];
     Ok(())
 }
 
@@ -780,6 +796,11 @@ impl Group {
     }
 }
 
+fn made_in(slot: &Mutex<Option<Made>>) -> MutexGuard<'_, Option<Made>> {
+    // Each update is one assignment, so the slot is consistent after a panic.
+    slot.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 fn lock(tracker: &Mutex<Tracker>) -> MutexGuard<'_, Tracker> {
     // A tracker update is a few map operations on data a panic would not leave half
     // written in a way that matters: at worst a process is followed a poll longer.
@@ -851,11 +872,13 @@ fn exit_code(status: ExitStatus) -> i32 {
         .unwrap_or_else(|| 128 + status.signal().unwrap_or(0))
 }
 
-/// The lease's directory, removed when the lease ends, after every simulator in its
-/// device set is deleted ([`crate::simulator`]); by `Drop` if the run is dropped first.
+/// The lease's directory, removed when the lease ends, after its simulator is deleted
+/// ([`crate::simulator`]); by `Drop` if the run is dropped first.
 struct LeaseDir {
     path: PathBuf,
     simctl: Arc<Simctl>,
+    /// The lease's simulator, from just before its create.
+    simulator: Mutex<Option<Made>>,
     armed: bool,
 }
 
@@ -865,7 +888,8 @@ impl LeaseDir {
     async fn clean(mut self) -> Result<(), String> {
         self.armed = false;
         let (path, simctl) = (self.path.clone(), Arc::clone(&self.simctl));
-        let cleaned = tokio::task::spawn_blocking(move || end(&simctl, &path)).await;
+        let made = made_in(&self.simulator).take();
+        let cleaned = tokio::task::spawn_blocking(move || end(&simctl, made, &path)).await;
         cleaned.map_err(clean_task_failed)?
     }
 }
@@ -876,11 +900,11 @@ fn clean_task_failed(error: tokio::task::JoinError) -> String {
     format!("clean task: {error}")
 }
 
-/// Deletes the simulators in the lease directory at `path`, then removes it, whether
-/// or not they could be; what failed, each part named.
-fn end(simctl: &Simctl, path: &Path) -> Result<(), String> {
+/// Deletes the lease's simulator, if it may have one, then removes the lease
+/// directory at `path`, whether or not it could be; what failed, each part named.
+fn end(simctl: &Simctl, made: Option<Made>, path: &Path) -> Result<(), String> {
     let failed: Vec<String> = [
-        simctl.end_all(path).map_err(|e| format!("simulator: {e}")),
+        (made.map_or(Ok(()), |made| simctl.end(&made))).map_err(|e| format!("simulator: {e}")),
         clean(path).map_err(|e| format!("clean: {e}")),
     ]
     .into_iter()
@@ -900,7 +924,8 @@ fn clean(path: &Path) -> Result<(), String> {
 impl Drop for LeaseDir {
     fn drop(&mut self) {
         if self.armed {
-            let cleaned = end(&self.simctl, &self.path);
+            let made = made_in(&self.simulator).take();
+            let cleaned = end(&self.simctl, made, &self.path);
             tracing::warn!(dir = %self.path.display(), ?cleaned, "run dropped; cleaned up");
         }
     }

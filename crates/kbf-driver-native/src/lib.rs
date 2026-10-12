@@ -28,10 +28,9 @@
 //!   one is not ready and how to fix it, and asks again every few minutes,
 //!   [`xcode_watch`]);
 //! - a simulator of its own when its `simulator` platform property asks for one
-//!   ([`simulator`]): made in a device set inside the lease directory when the lease
-//!   starts, named by `KBF_SIMULATOR_UDID` and `KBF_SIMULATOR_SET`, and shut down and
-//!   deleted when it ends, whatever the outcome (at the next start, if the daemon was
-//!   killed);
+//!   ([`simulator`]): made in the default device set under the lease's name when the
+//!   lease starts, named by `KBF_SIMULATOR_UDID`, and shut down and deleted when it
+//!   ends, whatever the outcome (at the next start, if the daemon was killed);
 //! - a memory watch: every poll, the physical footprint of all the action's processes
 //!   together ([`procs`]); past the lease's limit, the whole tree is killed and the
 //!   lease ends RESOURCE_EXHAUSTED ([`kbf_daemon::RuntimeError::OutOfMemory`]);

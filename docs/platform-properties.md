@@ -262,9 +262,8 @@ platform(
 
 On Macs, `simulator=<device type>,<runtime>` gives the action a simulator of its own:
 the native driver makes a new device for the lease before the action runs and deletes
-it when the lease ends. Without it, every simulator an action uses is in the daemon
-user's shared device set (`~/Library/Developer/CoreSimulator/Devices`), which every
-lease on the Mac sees, so two leases' UI tests can use the same device at once and one
+it when the lease ends. Without it, every simulator an action uses is one the daemon
+user's leases share, so two leases' UI tests can use the same device at once and one
 can leave it dirty for the next. The name is read in any case; the value is exact.
 
 | Part | Values |
@@ -277,32 +276,37 @@ Both are required, separated by one comma; any other value is refused with
 `xcrun simctl list devicetypes` and `xcrun simctl list runtimes` print are the values
 that work.
 
-- **At start**, after the inputs are written, the driver runs `xcrun simctl --set
-  <lease directory>/sims create kbf-<lease> <device type> <runtime>`, under the
-  actions' sandbox with the network off and with the Xcode the action's `xcode`
-  property names. The device is made in a device set inside the lease directory,
-  never in the shared one. If the command fails (a runtime the Mac does not have, a
-  device type the runtime does not support) or does not answer within two minutes,
-  the lease fails with `simctl`'s reason and the action does not run.
-- **The action** finds the device's UDID in `KBF_SIMULATOR_UDID` and its device set in
-  `KBF_SIMULATOR_SET` (both win over the Command's environment). The device is made
-  shut down; every `simctl` command the action runs names the set:
+- **At start**, after the inputs are written, the driver runs `xcrun simctl create
+  kbf-lease-<term>-<seq> <device type> <runtime>`, under the actions' sandbox with the
+  network off and with the Xcode the action's `xcode` property names. The device is
+  in the daemon user's default device set (`~/Library/Developer/CoreSimulator/Devices`):
+  `xcodebuild -destination` finds only the devices of that set, not one made in a set
+  elsewhere with `simctl --set` (the native-macos job checks both). If the command
+  fails (a runtime the Mac does not have, a device type the runtime does not
+  support) or does not answer within two minutes, the lease fails with `simctl`'s
+  reason and the action does not run.
+- **The action** finds the device's UDID in `KBF_SIMULATOR_UDID` (it wins over the
+  Command's environment). The device is made shut down:
 
   ```sh
-  xcrun simctl --set "$KBF_SIMULATOR_SET" bootstatus "$KBF_SIMULATOR_UDID" -b
-  xcrun simctl --set "$KBF_SIMULATOR_SET" install "$KBF_SIMULATOR_UDID" App.app
+  xcrun simctl bootstatus "$KBF_SIMULATOR_UDID" -b
+  xcodebuild test -project App.xcodeproj -scheme App -destination "id=$KBF_SIMULATOR_UDID"
   ```
 
-  On a hosted macOS runner the device booted under the sandbox this way, but `xcrun
-  xcdevice list` run by the same action did not list it. `xcodebuild` finds
-  `-destination` devices through the same Xcode device discovery, so it may not find
-  a device in a lease's set; that has not been tried yet.
-- **At the end**, whatever the outcome (exit, failure, timeout, kill), before the lease
-  directory is removed, every device in the set (one the action made there too) is
-  shut down and deleted, each by its UDID, with the Mac's default Xcode. A delete that
-  fails fails the lease, as a lease directory that cannot be removed does. A daemon
-  that was killed deletes the devices its leases left at its next start, before it
-  removes their directories.
+- **At the end**, whatever the outcome (exit, failure, timeout, kill, a run the daemon
+  drops), before the lease directory is removed: the device the create printed, and
+  any other device named for the lease (one a create cut short made late), is shut
+  down and deleted, each by its UDID, with the Mac's default Xcode. The daemon keeps
+  the UDID itself, so nothing the action writes in its lease directory changes what is
+  deleted. A delete that fails fails the lease, as a lease directory that cannot be
+  removed does. A daemon that was killed during such a lease deletes, at its next
+  start, every device whose name starts `kbf-lease-`: give no device of your own such
+  a name on a farm Mac.
+
+**Not isolated.** A booted simulator's processes run under `CoreSimulatorService`,
+outside the actions' sandbox and its network-off rule, and the action can reach every
+device of the default set with `simctl`, not only its own. The property gives a lease
+a clean device of its own; it does not confine what the action does with simulators.
 
 The scheduler does not read `simulator`: name `OSFamily=darwin` too, or the action
 may be placed on a Linux worker, whose driver does not read it either. A Mac that does
