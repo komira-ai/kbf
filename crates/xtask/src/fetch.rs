@@ -192,8 +192,7 @@ pub fn download(url: &str, roots: &[CertificateDer<'static>]) -> Result<Vec<u8>,
 
 /// Checks `bytes` against `sha256`, unpacks them and installs the file at `out`.
 pub fn install(bytes: &[u8], sha256: &Sha256, unpack: &Unpack, out: &Path) -> Result<(), Error> {
-    // PLANTED DEFECT (red-first): the compare is skipped; the next commit restores it.
-    let actual = *sha256;
+    let actual = Sha256::of(bytes);
     if actual != *sha256 {
         return Err(Error::Mismatch {
             expected: *sha256,
