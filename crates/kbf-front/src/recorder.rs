@@ -178,10 +178,11 @@ impl Recorder {
         instance: &str,
         kind: &dyn Fn() -> CallKind,
     ) {
-        if !self.is_on() || metadata.invocation_id.is_none() {
-            return;
-        }
-        if let Some(call) = call(metadata, caller, instance, kind()) {
+        let recorded = self.is_on() && metadata.invocation_id.is_some();
+        if let Some(call) = recorded
+            .then(kind)
+            .and_then(|kind| call(metadata, caller, instance, kind))
+        {
             self.emit(Event::Call(Box::new(call)));
         }
     }
