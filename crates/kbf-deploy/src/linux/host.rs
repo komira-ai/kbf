@@ -15,7 +15,7 @@ use crate::unit::UnitError;
 use kbf_host::exec::{Entry, Exec, Meta, succeeded};
 use kbf_host::path::{HostPath, PathError};
 use kbf_host::plan::Planner;
-use kbf_host::step::{Cmd, Perms, Step, UrlError};
+use kbf_host::step::{Cmd, Owner, Perms, Step, UrlError};
 use kbf_host::user::{self, RunUser, UserError};
 
 use super::check::CheckError;
@@ -235,6 +235,34 @@ pub fn user_named<E: Exec>(exec: &E, name: &str) -> Result<RunUser, HostError> {
 /// `path` joined under the directory `dir`.
 pub fn under(dir: &HostPath, name: &str) -> Result<HostPath, HostError> {
     Ok(HostPath::new(&format!("{dir}/{name}"))?)
+}
+
+/// Plan `bytes` into `dst` (0755, owned by `root`), keeping a different binary there as
+/// `<dst>.previous` (its mode, owned by `root`: a copy left as its old owner's, beside
+/// root's binaries, is one rename from being run as root); whether it changes. The
+/// `linux` and `mdm` kits install their binaries through it.
+pub fn binary<E: Exec>(
+    exec: &E,
+    planner: &mut Planner<'_, E>,
+    dst: &HostPath,
+    bytes: Vec<u8>,
+    root: Owner,
+    out: &mut dyn Write,
+) -> Result<bool, HostError> {
+    parents(exec, planner, dst)?;
+    if let Some(Entry::File {
+        perms, bytes: old, ..
+    }) = inspect(exec, dst)?
+        && old != bytes
+    {
+        let previous = HostPath::new(&format!("{dst}.previous"))?;
+        planner.file(previous, perms, Some(root), old)?;
+    }
+    let changed = planner.file(dst.clone(), Perms::new(0o755), Some(root), bytes)?;
+    if !changed {
+        note(out, format_args!("{dst}: unchanged"))?;
+    }
+    Ok(changed)
 }
 
 /// Plan a directory for every missing directory above `path` (root's, 0755) that is

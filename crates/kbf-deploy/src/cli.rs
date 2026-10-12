@@ -11,6 +11,10 @@
 //! kbf-deploy linux install-units --config FILE --uninstall [--apply]
 //! kbf-deploy linux image-pull --config FILE [--image REF]... [--platform OS/ARCH] [--apply]
 //! kbf-deploy linux swap --config FILE [--kubelet-allows-swap] [--remove] [--apply]
+//! kbf-deploy mdm fetch --dir DIR [--only TOOL]... [--apply]
+//! kbf-deploy mdm install --config FILE --bin-dir DIR [--apply]
+//! kbf-deploy mdm install --config FILE --uninstall [--apply]
+//! kbf-deploy mdm verify --config FILE [--via ADDR:PORT]
 //! kbf-deploy envoy render --config FILE --out DIR
 //! ```
 //!
@@ -24,6 +28,8 @@
 //! nothing to do), 1 a step or the check after an apply failed (`FAIL ...`), or 2
 //! refused (`REFUSED: ...` on stderr). `envoy render` only writes into the directory
 //! it is given, and exits 0 done or 2 refused (`REFUSED: ...` on stderr).
+//! The `mdm` verbs exit as the `linux` host verbs do; `mdm verify` exits 1 when a check
+//! fails ([`crate::mdm`]).
 //! `minio buckets` reads the MinIO admin key pair from `MINIO_ROOT_USER` and
 //! `MINIO_ROOT_PASSWORD` in the environment (secrets are never flags: argv is
 //! world-readable).
@@ -31,17 +37,23 @@
 use std::ffi::OsString;
 use std::fs::{self, DirBuilder};
 use std::io::{self, Write};
+use std::net::SocketAddr;
 use std::os::unix::fs::DirBuilderExt;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use clap::{Args, Parser, Subcommand};
 use kbf_types::ImageRef;
 
 use crate::envoy;
+use crate::https::Client;
 use crate::linux::{self, HostError, LinuxConfig, images, install, swap};
+use crate::mdm::fetch::Fetch;
+use crate::mdm::install::Install;
+use crate::mdm::verify::Verify;
+use crate::mdm::{self, MdmConfig, MdmError, Pins, Tool};
 use crate::minio::{self, Admin, K8sName, KbfName, MinioError, buckets, nodeport};
 use kbf_host::exec::{Exec, HostExec};
 use kbf_host::path::{HostPath, Root};
@@ -67,6 +79,10 @@ enum Kit {
     /// A converged Linux storage node: MinIO, kbf-server and kbf-daemon.
     #[command(subcommand)]
     Linux(Linux),
+    /// An Apple MDM on one Linux host: NanoHUB, the SCEP server, NanoDEP and an HTTPS
+    /// proxy.
+    #[command(subcommand)]
+    Mdm(Mdm),
     /// A client front: a Tailscale operator Ingress in front of Envoy, which routes
     /// REAPI calls to the kbf-servers.
     #[command(subcommand)]
@@ -162,6 +178,47 @@ enum Linux {
         /// Carry the plan out.
         #[arg(long)]
         apply: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum Mdm {
+    /// Download the pinned upstream archives into a directory, as yourself.
+    Fetch {
+        /// Where the archives go: absolute, outside every git work tree.
+        #[arg(long)]
+        dir: PathBuf,
+        /// Only this tool (repeat for more); every pinned tool when not given.
+        #[arg(long, value_parser = Tool::named)]
+        only: Vec<Tool>,
+        /// Carry the plan out.
+        #[arg(long)]
+        apply: bool,
+    },
+    /// Install the MDM services from the fetched archives (as root).
+    Install {
+        /// The kit's settings, KEY=VALUE lines.
+        #[arg(long)]
+        config: PathBuf,
+        /// Where `mdm fetch` put the archives.
+        #[arg(long, value_parser = HostPath::new)]
+        bin_dir: Option<HostPath>,
+        /// Roll back: stop the services and move the unit files aside.
+        #[arg(long, conflicts_with = "bin_dir")]
+        uninstall: bool,
+        /// Carry the plan out.
+        #[arg(long)]
+        apply: bool,
+    },
+    /// Check that the MDM is up and exposed only as intended (read only; use sudo).
+    Verify {
+        /// The kit's settings, KEY=VALUE lines.
+        #[arg(long)]
+        config: PathBuf,
+        /// Dial the proxy here instead of MDM_BIND:443 (a forwarded port, say); it must
+        /// still prove MDM_DNS_NAME.
+        #[arg(long)]
+        via: Option<SocketAddr>,
     },
 }
 
@@ -275,6 +332,7 @@ pub fn run<E: Exec>(
         Kit::Minio(Minio::Buckets(a)) => minio_buckets(a, exec, env, out),
         Kit::Minio(Minio::Nodeport(a)) => minio_nodeport(a, exec, out),
         Kit::Linux(l) => return linux_kit(l, exec, out, err),
+        Kit::Mdm(m) => return mdm_kit(m, exec, out, err),
         Kit::Envoy(e) => return envoy_kit(e, out, err),
     };
     match result {
@@ -376,6 +434,72 @@ fn linux_kit<E: Exec>(
                 let _ = writeln!(out, "{line}");
             }
             ExitCode::from(code)
+        }
+        Err(e) => {
+            let _ = writeln!(err, "REFUSED: {e}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// How long a download may stall, and a check through the proxy may take.
+const FETCH_TIMEOUT: Duration = Duration::from_secs(60);
+const VERIFY_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The `mdm` kit: 0 done (or every check passed), 1 a step, download or check failed,
+/// 2 refused.
+fn mdm_kit<E: Exec>(m: Mdm, exec: &mut E, out: &mut dyn Write, err: &mut dyn Write) -> ExitCode {
+    let done = match m {
+        Mdm::Fetch { dir, only, apply } => Client::system(FETCH_TIMEOUT)
+            .map_err(MdmError::from)
+            .and_then(|client| {
+                let f = Fetch { dir, only };
+                mdm::fetch::run(
+                    &f,
+                    &Pins::built_in(),
+                    exec.euid(),
+                    &client,
+                    mode(apply),
+                    out,
+                )
+            })
+            .map(|()| true),
+        Mdm::Install {
+            config,
+            bin_dir,
+            uninstall,
+            apply,
+        } => MdmConfig::load(&config)
+            .map_err(MdmError::from)
+            .and_then(|config| match (uninstall, bin_dir) {
+                (true, _) => mdm::install::run_uninstall(exec, &config, &stamp(), mode(apply), out),
+                (false, Some(bin_dir)) => {
+                    let a = Install { config, bin_dir };
+                    mdm::install::run(exec, &a, &Pins::built_in(), mode(apply), out)
+                }
+                (false, None) => Err(MdmError::NoBinDir),
+            })
+            .map(|()| true),
+        Mdm::Verify { config, via } => {
+            MdmConfig::load(&config)
+                .map_err(MdmError::from)
+                .and_then(|config| {
+                    let client = Client::system(VERIFY_TIMEOUT)?;
+                    let v = Verify {
+                        proxy: via.unwrap_or(SocketAddr::from((config.bind, 443))),
+                        config: &config,
+                        client: &client,
+                        now: SystemTime::now(),
+                    };
+                    mdm::verify::run(&*exec, &v, out)
+                })
+        }
+    };
+    match done {
+        Ok(passed) => ExitCode::from(u8::from(!passed)),
+        Err(e) if e.exit_code() == 1 => {
+            let _ = writeln!(err, "kbf-deploy: {e}");
+            ExitCode::FAILURE
         }
         Err(e) => {
             let _ = writeln!(err, "REFUSED: {e}");

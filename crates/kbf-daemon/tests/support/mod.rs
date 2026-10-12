@@ -1,13 +1,15 @@
 //! An in-process fake kbf-server for daemon tests: a throwaway CA, a mutual-TLS
 //! `kbf.worker.v1` server on a loopback port, and a scripted peer per session. Also a
-//! CAS in memory ([`memory`]) and fresh scratch directories.
+//! CAS in memory ([`memory`]), fresh scratch directories, and the program the actions
+//! run ([`act_program`]).
 
 #![allow(dead_code)] // Each test binary uses its own part of this module.
 
 pub mod memory;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -57,6 +59,21 @@ impl Pki {
             .identity(Identity::from_pem(&self.server_cert, &self.server_key))
             .client_ca_root(Certificate::from_pem(&self.ca))
     }
+}
+
+// Each test binary answers as kbf-testkit's `kbf-act` when run through a link of that
+// name: the program of the actions these tests store.
+kbf_testkit::act_test_hook!();
+
+/// The program [`memory::Spec::act`] runs: a link named `kbf-act` to this test binary,
+/// made once per binary.
+pub fn act_program() -> &'static Path {
+    static LINK: OnceLock<PathBuf> = OnceLock::new();
+    LINK.get_or_init(|| {
+        let link = scratch("act").join(kbf_testkit::act::NAME);
+        kbf_testkit::act::link_self(&link).expect("link the act program");
+        link
+    })
 }
 
 /// An empty directory for this run of a test, under Cargo's per-target temporary

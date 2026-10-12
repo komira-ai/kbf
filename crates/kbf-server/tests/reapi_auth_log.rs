@@ -14,6 +14,25 @@ use kbf_proto::reapi::ExecuteRequest;
 use kbf_server::{Args, bind_server_with_policy};
 use support::{Client, Job};
 use tonic::Code;
+use tonic::codegen::http;
+use tonic::metadata::MetadataMap;
+
+/// The RequestMetadata header buck2 sent on an Execute in a real build, as captured
+/// (kbf-front's golden file); that build printed `Build ID: 3136aef1-...`.
+fn buck2_header() -> MetadataMap {
+    let file = include_str!("../../kbf-front/tests/data/buck2-execute.requestmetadata");
+    let line = file
+        .lines()
+        .find(|l| !l.starts_with('#'))
+        .expect("a header");
+    let (name, value) = line.split_once(": ").expect("name: value");
+    let mut headers = http::HeaderMap::new();
+    headers.insert(
+        http::HeaderName::from_bytes(name.as_bytes()).expect("a header name"),
+        http::HeaderValue::from_str(value).expect("a header value"),
+    );
+    MetadataMap::from_headers(headers)
+}
 
 /// Where the global subscriber writes: every line, without colour.
 #[derive(Clone, Default)]
@@ -69,7 +88,9 @@ async fn client(policy: &str) -> Client {
 }
 
 /// Catches: an Execute whose trace does not carry the caller's public metadata and
-/// instance (the metadata lost between the authentication layer and the handler); a
+/// instance (the metadata lost between the authentication layer and the handler), or
+/// the build id of its RequestMetadata header (the RequestMetadata layer not on the
+/// REAPI listener, or its metadata not read into the span); a
 /// refused call that leaves no WARN line, or one without its call, instance and
 /// caller; an unauthenticated call that is not logged; and the private metadata in
 /// any line.
@@ -97,8 +118,20 @@ async fn the_caller_is_on_the_execute_trace_and_on_every_refusal() {
     .await;
     let job = Job::new("traced", &[]);
     cell.upload(&job.blobs()).await;
-    // `Client::execute` submits under the instance `main`, which the policy allows.
-    let mut ops = cell.execute(&job.action).await;
+    // Under the instance `main`, which the policy allows, with the RequestMetadata
+    // header buck2 sent in a real build (kbf-front's golden capture).
+    let mut request = tonic::Request::new(ExecuteRequest {
+        instance_name: "main".to_owned(),
+        action_digest: Some(job.action.proto.clone()),
+        ..Default::default()
+    });
+    *request.metadata_mut() = buck2_header();
+    let mut ops = cell
+        .exec()
+        .execute(request)
+        .await
+        .expect("Execute")
+        .into_inner();
     ops.message()
         .await
         .expect("a stream")
@@ -124,7 +157,8 @@ async fn the_caller_is_on_the_execute_trace_and_on_every_refusal() {
     assert_eq!(e.code(), Code::Unauthenticated);
 
     let caller = r#"caller={"user":"ci-bot"}"#;
-    let traced = log.lines_with(&["execute{", "main", caller, "submitted"]);
+    let invocation = "invocation=\"3136aef1-b380-4ac0-ac06-c6d6bbb65842\"";
+    let traced = log.lines_with(&["execute{", "main", caller, invocation, "submitted"]);
     assert_eq!(traced.len(), 1, "{}", log.text());
 
     let refused = log.lines_with(&[" WARN ", "REAPI call refused"]);

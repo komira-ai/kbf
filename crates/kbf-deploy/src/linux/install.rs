@@ -36,7 +36,7 @@ use std::time::Duration;
 use super::check::check_texts;
 use super::config::{LinuxConfig, MetaLog};
 use super::host::{
-    self, HostError, SS, SYSTEMCTL, inspect, note, parents, stat, tool, under, unit_is,
+    self, HostError, SS, SYSTEMCTL, binary, inspect, note, parents, stat, tool, under, unit_is,
 };
 use super::render::{DAEMON, DROP_IN, SERVER, SLICE, Templates, render};
 use crate::unit::UnitFile;
@@ -321,32 +321,6 @@ fn supports<E: Exec>(exec: &E, bin: &HostPath, unit: &str) -> Result<Vec<u8>, Ho
         }
     }
     Ok(bytes)
-}
-
-/// Plan `bytes` into `dst` (0755, owned by `root`), keeping a different binary there as
-/// `<dst>.previous` (its mode, owned by `root`); whether it changes.
-fn binary<E: Exec>(
-    exec: &E,
-    planner: &mut Planner<'_, E>,
-    dst: &HostPath,
-    bytes: Vec<u8>,
-    root: Owner,
-    out: &mut dyn Write,
-) -> Result<bool, HostError> {
-    parents(exec, planner, dst)?;
-    if let Some(Entry::File {
-        perms, bytes: old, ..
-    }) = inspect(exec, dst)?
-        && old != bytes
-    {
-        let previous = HostPath::new(&format!("{dst}.previous"))?;
-        planner.file(previous, perms, Some(root), old)?;
-    }
-    let changed = planner.file(dst.clone(), Perms::new(0o755), Some(root), bytes)?;
-    if !changed {
-        note(out, format_args!("{dst}: unchanged"))?;
-    }
-    Ok(changed)
 }
 
 /// Plan the rollback; `stamp` names the directory the files move to.

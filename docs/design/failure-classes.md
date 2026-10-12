@@ -575,12 +575,24 @@ help the next commit.
   rule that renames its outputs per configuration loses its floor.
 - **B. A, plus REAPI `RequestMetadata`** (`action_mnemonic`, `target_id`,
   `configuration_id`) where the request carries it. Pro: names the target as a person
-  would; fewer accidental shares. Con: which of these buck2 sends is UNVERIFIED, and a
-  key that changes with the client's metadata splits floors between buck2 and Bazel.
+  would; fewer accidental shares. Con: buck2 sends none of the three (below), so for a
+  buck2 build B is A; and a key that changes with the client's metadata splits floors
+  between buck2 and Bazel.
+
+**What buck2 sends** (captured, not read from source): the pinned buck2 (release
+2026-10-01) building the M1 sample project against a kbf-server sent one
+`RequestMetadata` header on every GetActionResult, FindMissingBlobs, BatchUpdateBlobs,
+BatchReadBlobs and Execute call, the same bytes on each: `tool_details` (`buck2`,
+version `0.1.0`) and `tool_invocation_id`, the build's printed `Build ID` (or
+`BUCK_WRAPPER_UUID` when set). `action_id`, `correlated_invocations_id`,
+`action_mnemonic`, `target_id` and `configuration_id` were empty on every call. The
+header is kept as kbf-front's golden test
+(`crates/kbf-front/tests/data/buck2-execute.requestmetadata`). Bazel's is not captured
+yet.
 - **C. `RequestMetadata` only.** Pro: simplest to explain. Con: a request without it has
   no key, so no floor.
 
-**Lean: B.** Settled by reading what the pinned buck2 and Bazel send.
+**Lean: B.** buck2's half is settled above; Bazel's is still to be captured.
 
 **O3, open: floor decay and reset.** A floor that never falls keeps over-booking after
 the code shrinks again.

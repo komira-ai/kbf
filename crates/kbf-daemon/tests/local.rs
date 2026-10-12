@@ -72,10 +72,32 @@ fn work(seq: u64, action: Digest) -> Work {
 #[tokio::test]
 async fn an_action_runs_and_its_outputs_are_stored() {
     let local = Local::new("local-run");
-    let mut spec = Spec::sh(
-        "cat ../in/data > out/copy; printf '%s' \"$GREETING:$HOME\" > greeting; \
-         echo to-stdout; echo to-stderr >&2; exit 3",
-    )
+    let mut spec = Spec::act(&[
+        "upper",
+        "out/copy",
+        "../in/data",
+        ";",
+        "append",
+        "greeting",
+        "hi",
+        ";",
+        "env",
+        "GREETING",
+        ";",
+        "env",
+        "HOME",
+        "unset",
+        ";",
+        "echo",
+        "to-stdout",
+        ";",
+        "echo",
+        "--stderr",
+        "to-stderr",
+        ";",
+        "exit",
+        "3",
+    ])
     .outputs(&["out/copy", "greeting", "absent"])
     .inputs(&[("in/data", b"input bytes", false)]);
     spec.working_directory = "work".to_owned();
@@ -83,19 +105,22 @@ async fn an_action_runs_and_its_outputs_are_stored() {
     let result = local.run_spec(1, &spec).await.expect("ran");
 
     assert_eq!(result.exit_code, 3);
-    assert_eq!(local.text(result.stdout_digest.as_ref()), "to-stdout\n");
+    // HOME is unset: the daemon's own environment does not leak into the action.
+    assert_eq!(
+        local.text(result.stdout_digest.as_ref()),
+        "hello\nunset\nto-stdout\n"
+    );
     assert_eq!(local.text(result.stderr_digest.as_ref()), "to-stderr\n");
     let files: Vec<(&str, String)> = result
         .output_files
         .iter()
         .map(|f| (f.path.as_str(), local.text(f.digest.as_ref())))
         .collect();
-    // HOME is unset: the daemon's own environment does not leak into the action.
     assert_eq!(
         files,
         [
-            ("out/copy", "input bytes".to_owned()),
-            ("greeting", "hello:".to_owned())
+            ("out/copy", "INPUT BYTES".to_owned()),
+            ("greeting", "hi\n".to_owned())
         ]
     );
     assert!(local.clean(), "the lease directory is removed");
@@ -109,11 +134,22 @@ async fn a_working_directory_replaced_by_a_link_yields_no_outputs() {
     let local = Local::new("local-wd-link");
     let host = scratch("local-wd-link-host");
     std::fs::write(host.join("secret"), b"HOST SECRET").expect("host file");
-    let script = format!(
-        "cd .. && mv work work.real && ln -s {} work",
-        host.display()
-    );
-    let mut spec = Spec::sh(&script).outputs(&["secret"]);
+    let host_dir = host.display().to_string();
+    let mut spec = Spec::act(&[
+        "rename",
+        "../work",
+        "../work.real",
+        ";",
+        "symlink",
+        &host_dir,
+        "../work",
+        // The premise: the working directory's path now leads to the host's file.
+        ";",
+        "wait-for",
+        "../work/secret",
+        "0",
+    ])
+    .outputs(&["secret"]);
     spec.working_directory = "work".to_owned();
     let result = local.run_spec(1, &spec).await.expect("ran");
     assert_eq!(result.exit_code, 0);
@@ -130,17 +166,15 @@ async fn a_working_directory_replaced_by_a_link_yields_no_outputs() {
     assert!(host.join("secret").exists(), "clean-up stays in the lease");
 }
 
-/// Catches usage that is not measured or is measured wrongly: CPU time must cover a
-/// busy loop and stay within the wall time, wall time must cover a sleep, and peak
-/// memory must count the action's own allocation; and REAPI's timestamps out of order.
+/// Catches usage that is not measured or is measured wrongly: CPU time must cover the
+/// work of filling memory and stay within the wall time, wall time must cover a sleep,
+/// and peak memory must count the action's own allocation; and REAPI's timestamps out
+/// of order.
 #[tokio::test]
 async fn usage_and_timestamps_are_reported() {
     let local = Local::new("local-usage");
-    // About 100 ms of CPU, 64 MiB written into one shell variable, then 300 ms asleep.
-    let spec = Spec::sh(
-        "i=0; while [ $i -lt 200000 ]; do i=$((i+1)); done; \
-         big=$(head -c 67108864 /dev/zero | tr '\\0' x); sleep 0.3",
-    );
+    // 64 MiB filled word by word (CPU time) and held, then 300 ms asleep.
+    let spec = Spec::act(&["alloc", "64", ";", "sleep", "0.3"]);
     let result = local.run_spec(1, &spec).await.expect("ran");
     assert_eq!(result.exit_code, 0);
 
@@ -179,32 +213,45 @@ async fn usage_and_timestamps_are_reported() {
 async fn a_signal_is_reported_as_128_plus_its_number() {
     let local = Local::new("local-signal");
     let result = local
-        .run_spec(1, &Spec::sh("kill -9 $$"))
+        .run_spec(1, &Spec::act(&["kill-self", "9"]))
         .await
         .expect("ran");
     assert_eq!(result.exit_code, 137);
 }
 
+/// A script run by the act program, which prints the path the script was run by: the
+/// kernel runs the `#!` line's program with its one argument, `echo`, then that path.
+fn script() -> Vec<u8> {
+    format!("#!{} echo\n", support::act_program().display()).into_bytes()
+}
+
 /// Catches a program path read relative to the input root rather than the working
 /// directory (REAPI v2.3; v2.2 and older said the input root, and both trees here hold
-/// a `tools/hi` so the wrong one shows), an executable bit lost on the way in, and a
-/// bare program name not looked up in the Command's PATH.
+/// a `tools/hi`, only the working directory's a program, so the wrong one shows), an
+/// executable bit lost on the way in, and a bare program name not looked up in the
+/// Command's PATH.
 #[tokio::test]
 async fn programs_are_found_as_reapi_says() {
     let local = Local::new("local-program");
-    let mut relative = Spec::sh("").inputs(&[
-        ("tools/hi", b"#!/bin/sh\necho from the input root\n", true),
-        ("deep/er/tools/hi", b"#!/bin/sh\necho hi\n", true),
+    // A script whose interpreter is the act program: it prints its own path.
+    let echo: &'static [u8] = script().leak();
+    let mut relative = Spec::argv(["tools/hi"]).inputs(&[
+        ("tools/hi", b"not a program\n", true),
+        ("deep/er/tools/hi", echo, true),
     ]);
-    relative.argv = vec!["tools/hi".to_owned()];
     relative.working_directory = "deep/er".to_owned();
     let result = local.run_spec(1, &relative).await.expect("ran");
     assert_eq!(result.exit_code, 0);
-    assert_eq!(local.text(result.stdout_digest.as_ref()), "hi\n");
+    // The path the daemon ran: the working directory's `tools/hi`.
+    let ran = local.scratch.join("lease-1-1/root/deep/er/tools/hi");
+    assert_eq!(
+        local.text(result.stdout_digest.as_ref()),
+        format!("{}\n", ran.display())
+    );
 
-    let mut bare = Spec::sh("");
-    bare.argv = vec!["sh".to_owned(), "-c".to_owned(), "echo bare".to_owned()];
-    bare.env = vec![("PATH".to_owned(), "/usr/bin:/bin".to_owned())];
+    let mut bare = Spec::argv([kbf_testkit::act::NAME, "echo", "bare"]);
+    let act_dir = support::act_program().parent().expect("a directory");
+    bare.env = vec![("PATH".to_owned(), act_dir.display().to_string())];
     let result = local.run_spec(2, &bare).await.expect("ran");
     assert_eq!(local.text(result.stdout_digest.as_ref()), "bare\n");
 }
@@ -217,13 +264,12 @@ async fn programs_are_found_as_reapi_says() {
 #[tokio::test]
 async fn a_program_busy_for_a_moment_still_runs() {
     let local = Local::new("local-busy");
-    let busy = scratch("local-busy-program").join("busy.sh");
+    let busy = scratch("local-busy-program").join("busy");
     let mut writer = std::fs::File::create(&busy).expect("create");
-    std::io::Write::write_all(&mut writer, b"#!/bin/sh\necho ran\n").expect("write");
+    std::io::Write::write_all(&mut writer, &script()).expect("write");
     std::fs::set_permissions(&busy, std::fs::Permissions::from_mode(0o755)).expect("chmod");
-    let mut spec = Spec::sh("");
-    spec.argv = vec![busy.display().to_string()];
-    let action = spec.store(&local.cas);
+    let busy = busy.display().to_string();
+    let action = Spec::argv([busy.as_str()]).store(&local.cas);
     let runtime = Arc::clone(&local.runtime);
     let run = tokio::spawn(async move { runtime.run(work(1, action)).await });
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -232,18 +278,20 @@ async fn a_program_busy_for_a_moment_still_runs() {
         .await
         .expect("no panic")
         .expect("ran once the file was closed");
-    assert_eq!(local.text(result.stdout_digest.as_ref()), "ran\n");
+    assert_eq!(
+        local.text(result.stdout_digest.as_ref()),
+        format!("{busy}\n")
+    );
 }
 
 /// Catches a program that stays busy being waited for forever.
 #[tokio::test]
 async fn a_program_busy_for_good_fails() {
     let local = Local::new("local-busy-long");
-    let busy = scratch("local-busy-long-program").join("busy.sh");
+    let busy = scratch("local-busy-long-program").join("busy");
     let _writer = std::fs::File::create(&busy).expect("create");
     std::fs::set_permissions(&busy, std::fs::Permissions::from_mode(0o755)).expect("chmod");
-    let mut spec = Spec::sh("");
-    spec.argv = vec![busy.display().to_string()];
+    let spec = Spec::argv([busy.display().to_string().as_str()]);
     let outcome = tokio::time::timeout(Duration::from_secs(10), local.run_spec(1, &spec))
         .await
         .expect("gives up in time");
@@ -259,7 +307,7 @@ async fn a_program_busy_for_good_fails() {
 async fn invalid_actions_are_the_clients_error() {
     let local = Local::new("local-invalid");
     let cas = &local.cas;
-    let command = cas.message(&Spec::sh("true").command());
+    let command = cas.message(&Spec::act(&["exit", "0"]).command());
     let root = cas.message(&kbf_proto::reapi::Directory::default());
     let no_command = cas.message(&Action {
         input_root_digest: Some(root.clone()),
@@ -275,11 +323,11 @@ async fn invalid_actions_are_the_clients_error() {
         ..Action::default()
     });
     let garbage = cas.insert(vec![0xff, 0xff]);
-    let mut up = Spec::sh("true");
+    let mut up = Spec::act(&["exit", "0"]);
     up.working_directory = "../up".to_owned();
-    let mut escape = Spec::sh("true");
+    let mut escape = Spec::act(&["exit", "0"]);
     escape.outputs = vec!["/etc/passwd".to_owned()];
-    let mut through_link = Spec::sh("true").outputs(&["link/out"]);
+    let mut through_link = Spec::act(&["exit", "0"]).outputs(&["link/out"]);
     through_link.symlinks = vec![("link", "/tmp")];
     let cases = [
         (no_command, "names no Command"),
@@ -305,7 +353,7 @@ async fn invalid_actions_are_the_clients_error() {
 #[tokio::test]
 async fn missing_and_corrupt_inputs_fail_cleanly() {
     let local = Local::new("local-missing");
-    let spec = Spec::sh("cat data").inputs(&[("data", b"needed", false)]);
+    let spec = Spec::act(&["upper", "copy", "data"]).inputs(&[("data", b"needed", false)]);
     let action = spec.store(&local.cas);
     let data = digest_of(b"needed");
     local.cas.remove(&data);
@@ -342,8 +390,7 @@ async fn missing_and_corrupt_inputs_fail_cleanly() {
 #[tokio::test]
 async fn setup_failures_are_the_farms() {
     let local = Local::new("local-setup");
-    let mut nothing = Spec::sh("");
-    nothing.argv = vec!["/nonexistent/program".to_owned()];
+    let nothing = Spec::argv(["/nonexistent/program"]);
     let outcome = local.run_spec(1, &nothing).await;
     assert!(
         matches!(&outcome, Err(RuntimeError::Failed(why)) if why.contains("/nonexistent/program")),
@@ -352,7 +399,7 @@ async fn setup_failures_are_the_farms() {
 
     let taken = local.scratch.join("lease-1-2");
     std::fs::create_dir_all(&taken).expect("plant");
-    let outcome = local.run_spec(2, &Spec::sh("true")).await;
+    let outcome = local.run_spec(2, &Spec::act(&["exit", "0"])).await;
     assert!(
         matches!(&outcome, Err(RuntimeError::Failed(why)) if why.contains("lease-1-2")),
         "{outcome:?}"
@@ -363,7 +410,7 @@ async fn setup_failures_are_the_farms() {
     std::fs::write(&file, b"").expect("file");
     let blocked = LocalRuntime::new(Arc::clone(&local.cas), file.join("leases"));
     let outcome = blocked
-        .run(work(3, Spec::sh("true").store(&local.cas)))
+        .run(work(3, Spec::act(&["exit", "0"]).store(&local.cas)))
         .await;
     assert!(
         matches!(&outcome, Err(RuntimeError::Failed(why)) if why.contains("leases")),
@@ -376,7 +423,8 @@ async fn setup_failures_are_the_farms() {
 #[tokio::test]
 async fn a_lease_directory_left_behind_fails_the_lease() {
     let local = Local::new("local-dirty");
-    let spec = Spec::sh("mkdir stuck && touch stuck/file && chmod 555 stuck");
+    // A directory of the action's that nobody may write, with a file in it.
+    let spec = Spec::act(&["chmod", "555", "stuck"]).inputs(&[("stuck/file", b"", false)]);
     let outcome = local.run_spec(1, &spec).await;
     assert!(
         matches!(&outcome, Err(RuntimeError::Failed(why)) if why.contains("could not be removed")),
@@ -387,8 +435,8 @@ async fn a_lease_directory_left_behind_fails_the_lease() {
     std::fs::set_permissions(stuck, std::fs::Permissions::from_mode(0o755)).expect("chmod");
 }
 
-/// Catches a kill that does not stop the whole action (a background process of the
-/// shell lives on unless the process group is killed), that is not reported as
+/// Catches a kill that does not stop the whole action (a background job of a user's
+/// shell command lives on unless the process group is killed: hence the shell), that is not reported as
 /// Killed, or that leaves the lease directory; and a kill of a lease that is not
 /// running doing anything.
 #[tokio::test]
@@ -397,7 +445,7 @@ async fn a_kill_stops_the_action() {
     local.runtime.kill(LeaseId::new(9, 9)).await;
     let marker = scratch("local-kill-marker").join("survived");
     let script = format!("(sleep 1; touch {}) & wait", marker.display());
-    let action = Spec::sh(&script).store(&local.cas);
+    let action = Spec::user_shell(&script).store(&local.cas);
     let runtime = Arc::clone(&local.runtime);
     let run = tokio::spawn(async move { runtime.run(work(1, action)).await });
     tokio::time::sleep(Duration::from_millis(300)).await;

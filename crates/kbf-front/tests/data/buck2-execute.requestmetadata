@@ -1,0 +1,7 @@
+# One REAPI RequestMetadata header, as kbf-server received it on an Execute call from
+# buck2 release 2026-10-01 (`buck2 --version`: 2026-09-30-2484d70a6f8a), building the
+# M1 sample project (crates/kbf-it/m1/buck2) with `buck2 build //...` against a local
+# kbf-server and daemon. That build printed `Build ID: 3136aef1-b380-4ac0-ac06-c6d6bbb65842`.
+# The line below is the header's name and value exactly as they arrived (the value is
+# gRPC's unpadded base64). Read by tests/request_metadata.rs; do not edit by hand.
+build.bazel.remote.execution.v2.requestmetadata-bin: Cg4KBWJ1Y2syEgUwLjEuMBokMzEzNmFlZjEtYjM4MC00YWMwLWFjMDYtYzZkNmJiYjY1ODQy

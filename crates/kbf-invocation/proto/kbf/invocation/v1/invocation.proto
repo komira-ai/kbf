@@ -1,0 +1,249 @@
+// kbf.invocation.v1: the record of one invocation (one run of a build tool), what the
+// build page reads (docs/design/invocations.md, section 3).
+//
+// A record is a Header (section 3.1) and its action rows (section 3.2), written as
+// Chunks of rows in first-seen order. Stage 2 of section 3.5 stores each chunk as a CAS
+// blob; the root that lists them is not defined yet (it lands with the durable records).
+//
+// Size matters more than in the other kbf protos, because a farm writes one row per
+// action of every build:
+// - A digest is its 32 raw SHA-256 bytes and its size, not the 64-character hex form.
+// - Every time in a row is a signed offset in microseconds from the header's
+//   `first_seen_micros`. It is signed because a joined action copies the attempts of
+//   an operation that may have started before this invocation was first seen.
+// - Empty strings, zero counts and false flags are left out, as proto3 does for any
+//   field at its zero value; so a text field that is absent and one that is empty
+//   read the same.
+syntax = "proto3";
+
+package kbf.invocation.v1;
+
+// A content digest: kbf accepts SHA-256 only.
+message Digest {
+  // The hash, exactly 32 bytes.
+  bytes sha256 = 1;
+  uint64 size_bytes = 2;
+}
+
+// What the record knows of an invocation as a whole (section 3.1).
+message Header {
+  // The record's key: the invocation id, or `<id>~<n>` for a caller whose
+  // authentication metadata differs from the owner's (section 2.4).
+  string key = 1;
+  // `tool_details` of the first call that sent them.
+  string tool = 2;
+  string tool_version = 3;
+  // The first non-empty `correlated_invocations_id` seen.
+  string correlated_invocations_id = 4;
+  // The owner's `public` authentication metadata, as JSON text; empty when it has none.
+  string owner = 5;
+  // The instance names its calls used, sorted, each once.
+  repeated string instances = 6;
+  // The server's wall clock at the first event, in microseconds since the Unix epoch.
+  uint64 first_seen_micros = 7;
+  // The last event (a call, a lease grant, a start, a requeue or a finish), in
+  // microseconds after `first_seen_micros`.
+  uint64 last_seen_micros = 8;
+  // The server minted the id: an Execute that sent none (section 2.3).
+  bool minted = 9;
+  // An event of this invocation was lost; the record may miss calls or rows.
+  bool incomplete = 10;
+  // The record stopped taking rows; later actions are counted only (section 3.3).
+  bool rows_capped = 11;
+  Counts counts = 12;
+  // The keys of the records of other callers that sent the same id, in the order
+  // first seen. Set on the owner's record only.
+  repeated string collisions = 13;
+}
+
+// The counters of section 3.1.
+message Counts {
+  // Execute calls.
+  uint64 execute = 1;
+  // Of those: answered from the action cache, joined to a running twin, queued to run.
+  uint64 cache_hit_execute = 2;
+  uint64 joined = 3;
+  uint64 ran = 4;
+  // Execute answers that were not OK with exit code 0: a non-zero exit, a failure, a
+  // timeout or a refusal.
+  uint64 failed = 5;
+  // GetActionResult calls answered with a result, and without.
+  uint64 ac_hit = 6;
+  uint64 ac_miss = 7;
+  // FindMissingBlobs: the digests asked about, and those answered missing.
+  uint64 blobs_asked = 8;
+  uint64 blobs_missing = 9;
+  // CAS and ByteStream bytes the client sent and received.
+  uint64 bytes_uploaded = 10;
+  uint64 bytes_downloaded = 11;
+}
+
+// Rows of one record, in first-seen order. The stored unit of section 3.5.
+message Chunk {
+  repeated Action actions = 1;
+}
+
+// How the farm answered an action (section 3.2, `how`).
+enum How {
+  HOW_UNSPECIFIED = 0;
+  // GetActionResult found it in the action cache.
+  HOW_CACHE_HIT = 1;
+  // Execute was answered from the action cache.
+  HOW_CACHE_HIT_EXECUTE = 2;
+  // Execute attached to a twin's operation already in flight.
+  HOW_JOINED = 3;
+  // Execute queued a new operation.
+  HOW_RAN = 4;
+}
+
+// A `RequestMetadata` text field, kept up to 512 bytes.
+message Text {
+  string value = 1;
+  // The client sent more than 512 bytes; `value` is the first of them, cut at a
+  // character boundary.
+  bool truncated = 2;
+}
+
+// One action of the invocation (section 3.2).
+message Action {
+  Digest action = 1;
+  string instance = 2;
+  Text target = 3;
+  Text mnemonic = 4;
+  Text configuration = 5;
+  Text action_id = 6;
+  How how = 7;
+  // The REAPI operation name; empty for a GetActionResult hit.
+  string operation = 8;
+  // Every lease of its operation, in grant order.
+  repeated Attempt attempts = 9;
+  // Absent while its operation is in flight.
+  Outcome outcome = 10;
+  // The ActionResult blob, and what it lists, copied when the row was written (the
+  // listing outlives the blob).
+  Digest result = 11;
+  Digest command = 12;
+  repeated Output outputs = 13;
+  // The result listed more than 1,000 outputs; `outputs` holds the first 1,000.
+  bool outputs_truncated = 14;
+  Digest stdout = 15;
+  Digest stderr = 16;
+  Usage usage = 17;
+}
+
+// One lease of an action's operation.
+message Attempt {
+  uint64 lease_term = 1;
+  uint64 lease_seq = 2;
+  // The worker (node id) the lease was granted to.
+  string worker = 3;
+  // When the operation was queued for this lease (submitted, or requeued after the
+  // lease before it), and when the lease was granted.
+  sint64 queued = 4;
+  sint64 granted = 5;
+  // When the worker was sent its Start, and when the lease ended; absent until then.
+  optional sint64 started = 6;
+  optional sint64 ended = 7;
+  // How the lease ended; absent while it is held.
+  AttemptEnd end = 8;
+}
+
+// How a lease ended.
+message AttemptEnd {
+  oneof end {
+    // The worker's result was accepted.
+    Accepted result = 1;
+    // The lease was given up and its operation queued again.
+    Requeue requeue = 2;
+    // The worker reported a failure that ended the operation.
+    AttemptFailure failed = 3;
+  }
+}
+
+message Accepted {}
+
+// Why a lease was given up (kbf-sched's RequeueReason).
+message Requeue {
+  RequeueReason reason = 1;
+  // For REQUEUE_REASON_OUT_OF_MEMORY: the booking of the run killed and of the next
+  // run, in bytes.
+  uint64 booked = 2;
+  uint64 raised = 3;
+}
+
+enum RequeueReason {
+  REQUEUE_REASON_UNSPECIFIED = 0;
+  REQUEUE_REASON_SILENT = 1;
+  REQUEUE_REASON_REPLACED = 2;
+  REQUEUE_REASON_RECONNECTED = 3;
+  REQUEUE_REASON_NOT_STARTED = 4;
+  REQUEUE_REASON_SESSION_SWITCH = 5;
+  REQUEUE_REASON_OUT_OF_MEMORY = 6;
+  REQUEUE_REASON_NODE_MEMORY_PRESSURE = 7;
+  REQUEUE_REASON_RESTARTED = 8;
+  REQUEUE_REASON_LOST_DAEMON_RESTARTED = 9;
+  REQUEUE_REASON_LOST_FENCED = 10;
+}
+
+// A failure the worker reported, with the daemon's reason text (up to 1 KiB).
+message AttemptFailure {
+  FailureClass class = 1;
+  string reason = 2;
+}
+
+// kbf-types' Failure, as kbf.log.v1 names it.
+enum FailureClass {
+  FAILURE_CLASS_UNSPECIFIED = 0;
+  FAILURE_CLASS_TIMEOUT = 1;
+  FAILURE_CLASS_INFRA = 2;
+  FAILURE_CLASS_INVALID = 3;
+  FAILURE_CLASS_OUT_OF_MEMORY = 4;
+  FAILURE_CLASS_NODE_MEMORY_PRESSURE = 5;
+  FAILURE_CLASS_MISSING_INPUT = 6;
+  FAILURE_CLASS_LOST_DAEMON_RESTARTED = 7;
+  FAILURE_CLASS_LOST_FENCED = 8;
+}
+
+// How the action ended for the client (section 3.2, `outcome`).
+message Outcome {
+  oneof outcome {
+    // An OK status: the action ran (or was a cache hit) and exited with `exit_code`.
+    Exited ok = 1;
+    // A non-OK status other than a timeout.
+    Status failed = 2;
+    // DEADLINE_EXCEEDED: the action ran past its timeout.
+    TimedOut timed_out = 3;
+    // The farm refused to run it, with the reason (up to 1 KiB).
+    string refused = 4;
+  }
+}
+
+message Exited {
+  int32 exit_code = 1;
+}
+
+message Status {
+  // The gRPC status code.
+  int32 code = 1;
+  // The status message, up to 1 KiB.
+  string message = 2;
+}
+
+message TimedOut {}
+
+// An output file, or an output directory as its tree digest.
+message Output {
+  string path = 1;
+  Digest digest = 2;
+  bool executable = 3;
+  // `digest` names a Tree.
+  bool directory = 4;
+}
+
+// kbf.worker.v1.ResourceUsage, copied from the result. Zero means not measured.
+message Usage {
+  uint64 cpu_user_micros = 1;
+  uint64 cpu_system_micros = 2;
+  uint64 peak_memory_bytes = 3;
+  uint64 wall_micros = 4;
+}

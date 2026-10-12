@@ -14,6 +14,7 @@ use bytes::Bytes;
 use kbf_auth::{AuthenticateLayer, Policy};
 use kbf_front::{
     Cache, Closing, Dispatch, MAX_MESSAGE_BYTES, MemoryMetaLog, MetaLog, MetaLogError,
+    RequestMetadataLayer,
 };
 use kbf_meta::{Applied, BlobAnswer, Command, MetaState, Retention};
 use kbf_objstore::{ByteRange, Capabilities, KeyPrefix, MemoryStore, ObjectStore};
@@ -120,6 +121,13 @@ impl Farm {
         let routes =
             |cache| kbf_front::routes_with_authorizers(cache, dispatch, closing, authorizers);
         Self::serve_with(routes, Some(layer)).await
+    }
+
+    /// The cache services, every call read by `layer` first, as kbf-server reads its
+    /// REAPI listener's calls.
+    pub async fn with_request_metadata(layer: RequestMetadataLayer) -> Self {
+        Self::serve(|cache| Routes::from(kbf_front::routes(cache).into_axum_router().layer(layer)))
+            .await
     }
 
     async fn serve(routes: impl FnOnce(Arc<TestCache>) -> Routes) -> Self {

@@ -18,9 +18,10 @@ record is the *invocation record*.
 
 Read on `main`:
 
-- **No invocation.** Nothing in `crates/` reads REAPI `RequestMetadata`: the type is
-  generated in `kbf-proto` and never used. `ExecutionService::execute` reads only the
-  authentication result (`kbf_auth::metadata`) and drops the rest of the call's headers.
+- **The id is read, not recorded.** `kbf_front::RequestMetadataLayer` reads every REAPI
+  call's `RequestMetadata` header into a `CallMetadata` (section 2.2), and Execute puts
+  its `tool_invocation_id` on its `execute` trace span (`invocation`, `-` when absent).
+  Nothing else uses it yet: there is no invocation record.
 - **Per-operation state lives about a minute.** The scheduler keeps a finished operation
   for `FINISHED_RETENTION` (60 s, `kbf-sched/src/scheduler.rs`); then WaitExecution
   answers NOT_FOUND. All scheduler state is in memory and is lost on restart.
@@ -69,18 +70,22 @@ invocation id.
 for a client that sends one. The reason is that a client prints only its own id: a
 server-minted id cannot reach the user without a client-side hook (section 5).
 
-What the pinned clients send, read from source (not yet captured on the wire; PR 1 in
-section 9 captures it):
+What the pinned clients send. buck2's row is captured on the wire (a buck2 build of the
+M1 sample project against a kbf-server; the header is kbf-front's golden test,
+`crates/kbf-front/tests/data/buck2-execute.requestmetadata`); Bazel's is read from
+source and not yet captured:
 
 | Client | `tool_invocation_id` | other fields |
 |---|---|---|
-| buck2 (release 2026-09-15) | the command's trace id, the UUID it prints as `Build ID: <uuid>` | `tool_details` = `buck2`, version hard-coded `0.1.0`; `action_id`, `correlated_invocations_id`, `action_mnemonic`, `target_id`, `configuration_id` all empty |
-| Bazel | the command id (`--invocation_id`) | `correlated_invocations_id` = build request id; `action_id`, mnemonic, label, configuration when known; real version |
+| buck2 (release 2026-10-01, captured) | the UUID it prints as `Build ID: <uuid>` | `tool_details` = `buck2`, version `0.1.0`; `action_id`, `correlated_invocations_id`, `action_mnemonic`, `target_id`, `configuration_id` all empty |
+| Bazel (from source) | the command id (`--invocation_id`) | `correlated_invocations_id` = build request id; `action_id`, mnemonic, label, configuration when known; real version |
 
-buck2 sends the header on GetActionResult, UpdateActionResult, Execute,
-BatchUpdateBlobs, BatchReadBlobs, FindMissingBlobs and ByteStream Read and Write; not on
-GetCapabilities. It does not call WaitExecution. A caller can choose the id ahead of time:
-buck2 takes it from `BUCK_WRAPPER_UUID` when set.
+In that capture buck2 sent the same header on every GetActionResult, FindMissingBlobs,
+BatchUpdateBlobs, BatchReadBlobs and Execute call; the build was too small to use
+ByteStream. Read from source, it also sends it on UpdateActionResult and ByteStream Read
+and Write, not on GetCapabilities, and it does not call WaitExecution. A caller can
+choose the id ahead of time: buck2 takes it from `BUCK_WRAPPER_UUID` when set (seen in
+a second capture: the printed `Build ID` and the header's id were the value given).
 
 ### 2.2 Accepting it
 
@@ -97,7 +102,10 @@ buck2 takes it from `BUCK_WRAPPER_UUID` when set.
   an id that is empty, longer than 128 bytes, has a character outside that set or does
   not start with a letter or digit is
   treated as absent and counted (`kbf_invocation_metadata_invalid`). A build must not
-  break because of bookkeeping.
+  break because of bookkeeping. "Over 8 KiB" is the decoded `RequestMetadata`; a bad
+  id alone drops the id and keeps the header's other fields. Today the count is read
+  from the layer (`RequestMetadataLayer::invalid_count`) and each case is logged at
+  debug level; no endpoint exports it (farm-wide metrics are a separate design, 4.4).
 - Text fields (`target_id`, mnemonic, configuration) are kept up to 512 bytes each and
   truncated past that, marked truncated.
 
@@ -182,18 +190,29 @@ the action detail links the Action and Command blobs like any other blob.
 
 ### 3.3 Cost per action
 
-Estimated from the field encodings, not measured (PR 2 measures it):
+Measured on the `kbf.invocation.v1` encoding by
+`crates/kbf-invocation/tests/bytes_per_action.rs`, on a 1,000-action event stream shaped
+like a buck2 build (a UUID id and no other `RequestMetadata`, per-caller operation names,
+eight nodes, buck2 output paths of 66 to 70 bytes, both log digests on every result, no
+`ResourceUsage`). The test builds the stream; none is captured from a client until the
+recorder lands (PR 3). Each time is a signed offset in microseconds from `first_seen`,
+and each digest its 32 raw bytes and size.
 
-- core row (three digests, operation name, lease, worker, four timestamps, outcome tag):
-  about 170 B; storing each timestamp as a delta from its chunk's base time (3.5) brings
-  it to about 130 B;
-- plus each output about 45 B and its path, and about 90 B for the stdout and stderr
-  digests;
-- plus `RequestMetadata` text when sent: 50 to 200 B; plus a rerun about 40 B each.
+- core row (Action digest, instance, operation name, one attempt with its lease, worker
+  and four times, outcome, result digest): 158 B, against the 130 B estimated for delta
+  times (the test offsets each time from `first_seen`; the stored chunk offsets them from
+  its base time, 3.5);
+- plus each output 44 B and its path (estimated 45 B), and 76 B for the stdout and
+  stderr digests (estimated 90 B);
+- plus a rerun 44 B (estimated 40 B); plus `RequestMetadata` text when sent, not
+  measured (buck2 sends none), estimated 50 to 200 B.
+
+The stream's average row (1.875 outputs, a rerun in 50 actions) is 444 B; a
+GetActionResult hit with the same listing is 378 B.
 
 So about 300 to 700 B for an action with a few outputs. At the pilot rate of about 4
 operations a second (the comment on `FINISHED_RETENTION` in `scheduler.rs`) that is
-about 100 to 240 MB a day before cache hits;
+about 100 to 240 MB a day before cache hits (about 150 MB at the measured 444 B);
 recording GetActionResult hits multiplies it by the hit rate. This volume is why the
 record is not written into the replicated log (3.5).
 
@@ -284,8 +303,9 @@ unflushed rows and the header fields; step 3 then applies only when flushes fail
   (`Cache::store_blobs` commits one per segment batch, and both blobs are stored in one
   call) and one pin update: about 200 to 300 B, estimated. With the flush rule of 3.4, a
   farm with N invocations open at once writes at most 30 flushes an hour for each, plus
-  one per 256 KiB of rows: at the pilot rate (about 4 actions a second, about 5 MB of rows an hour) and N = 10, about 320
-  flushes, about 640 entries and under 100 KB of log an hour, against 14,400 rows an
+  one per 256 KiB of rows: at the pilot rate (about 4 actions a second, about 6.4 MB of rows an hour at the
+  measured 444 B of 3.3) and N = 10, about 325
+  flushes, about 650 entries and under 100 KB of log an hour, against 14,400 rows an
   hour if rows went into the log. A 10 s flush would be twelve times that per open build;
   this is why the time floor is 120 s and an idle build is flushed once.
 - This keeps the object store's contract (`kbf-objstore`: kbf never asks a store whether

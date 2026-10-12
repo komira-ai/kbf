@@ -885,7 +885,7 @@ fn a_killed_daemons_action_ends_without_a_restart() {
     let dir = tls("killed");
     let scratch = dir.join("leases");
     let front = front::Front::start(&dir);
-    let action = front.sh("echo $$ > leader; sleep 300 & echo $! > child; wait");
+    let action = front.user_shell("echo $$ > leader; sleep 300 & echo $! > child; wait");
     let mut daemon = daemon(
         &native_flags(&front, &dir, &scratch),
         &dir.join("daemon.log"),
@@ -952,7 +952,7 @@ fn a_restarted_daemon_ends_the_runs_it_was_killed_with_before_hello() {
     let dir = tls("restart");
     let scratch = dir.join("leases");
     let front = front::Front::start(&dir);
-    let action = front.sh("echo $$ > pid; exec sleep 300");
+    let action = front.user_shell("echo $$ > pid; exec sleep 300");
     let flags = native_flags(&front, &dir, &scratch);
 
     let spawned = Instant::now();

@@ -71,6 +71,10 @@ pub use runtime::{FakeRuntime, Runtime, RuntimeError, Work};
 pub use runtimes::{KindServedTwice, Runtimes};
 pub use status::DriverReport;
 
+// The unit tests run this test binary as kbf-testkit's `kbf-act` (src/usage.rs).
+#[cfg(test)]
+kbf_testkit::act_test_hook!();
+
 #[cfg(test)]
 mod tests {
     use std::process::Command;

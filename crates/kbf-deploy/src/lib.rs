@@ -5,6 +5,8 @@
 //! `kbf_host::Plan` of steps and carries it out with `kbf_host::execute`, which prints
 //! each step as `DRY-RUN: <step>` by default and does it only with `--apply`.
 //!
+//! - [`https`]: a small HTTPS client (rustls with ring, the host's trusted roots) for
+//!   the kits that download or check over TLS.
 //! - [`config`]: `--config FILE`, `KEY=VALUE` lines over a closed key set; an unknown
 //!   or repeated key is refused.
 //! - [`unit`]: a systemd unit file read as systemd reads it (sections, `\` continuations,
@@ -20,15 +22,23 @@
 //!   (`linux check-units`); and, as root, the units installed and the services started
 //!   (`linux install-units`), the pinned images pulled as the kbf user (`linux
 //!   image-pull`) and the swapfile (`linux swap`).
+//! - [`mdm`]: an Apple MDM on one Linux host: its pinned upstream archives fetched
+//!   (`mdm fetch`), its services installed as root (`mdm install`), and read-only
+//!   checks of what runs (`mdm verify`).
 //! - [`envoy`]: a client front's Kubernetes objects and Envoy config, rendered from
 //!   the settings (`envoy render`), byte for byte the same for the same settings.
 
 pub mod cli;
 pub mod config;
 pub mod envoy;
+pub mod https;
 pub mod linux;
+pub mod mdm;
 pub mod minio;
 pub mod template;
 pub mod unit;
 
 pub use config::{Config, ConfigError};
+
+#[cfg(test)]
+pub(crate) mod testkit;
