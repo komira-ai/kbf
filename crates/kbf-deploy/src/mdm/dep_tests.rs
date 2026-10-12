@@ -329,6 +329,28 @@ fn assign_sends_the_recorded_profile_and_fails_unless_every_device_succeeds() {
     );
 }
 
+/// Catches a device Apple's answer leaves out counted as assigned: the fixture answers
+/// `SUCCESS` for the first serial and says nothing of the second.
+#[test]
+fn assign_fails_naming_a_device_apples_answer_leaves_out() {
+    let server = depserver(UUID);
+    let serials = ["C02AB12CD3EF", "C02XY34ZW5UV"].map(|s| Serial::new(s).expect("serial"));
+    let d = Dep::Assign {
+        serials: serials.to_vec(),
+    };
+    let mut exec = host();
+    exec.entries.insert(
+        p("/var/lib/kbf-mdm/dep-profile-uuid"),
+        file(format!("{UUID}\n").as_bytes(), 0o644, 0),
+    );
+    let (got, out) = run_it(&mut exec, &server, &d, Mode::Apply);
+    assert_eq!(got.ok(), Some(false), "{out}");
+    assert!(
+        out.contains("C02AB12CD3EF: SUCCESS\nC02XY34ZW5UV: no answer\n"),
+        "{out}"
+    );
+}
+
 /// Catches a serial check that lets through what ABM never lists (lower case, too short
 /// or long, punctuation that would change the request), and a verb run as a user.
 #[test]

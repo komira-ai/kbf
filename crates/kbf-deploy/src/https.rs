@@ -24,6 +24,8 @@ use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
 pub const REDIRECTS: usize = 5;
 /// The most bytes of a status line and headers read.
 const HEAD_MAX: usize = 64 * 1024;
+/// The most bytes of a body [`read_reply`] keeps.
+const REPLY_MAX: usize = 1024 * 1024;
 
 /// An `https://` URL.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -120,6 +122,8 @@ pub enum HttpsError {
     Redirect { url: String, to: String },
     #[error("{url}: more than {REDIRECTS} redirects")]
     Redirects { url: String },
+    #[error("{url}: the answer's body is longer than {REPLY_MAX} bytes")]
+    TooLong { url: String },
 }
 
 /// What a `GET` was answered.
@@ -288,15 +292,46 @@ fn read_answer<R: BufRead>(
 }
 
 /// The status of one answer from `r` and its body, whatever the status: an API's
-/// refusal says why in its body.
+/// refusal says why in its body. A body longer than [`REPLY_MAX`] is an error, however
+/// it is framed.
 pub(crate) fn read_reply<R: BufRead>(
     url: &dyn fmt::Display,
     mut r: R,
 ) -> Result<(u16, Vec<u8>), HttpsError> {
     let head = read_head(url, &mut r)?;
-    let mut body = Vec::new();
-    read_body(url, &head, &mut r, &mut body)?;
-    Ok((head.status, body))
+    let mut body = Capped {
+        bytes: Vec::new(),
+        over: false,
+    };
+    let got = read_body(url, &head, &mut r, &mut body);
+    if body.over {
+        return Err(HttpsError::TooLong {
+            url: url.to_string(),
+        });
+    }
+    got?;
+    Ok((head.status, body.bytes))
+}
+
+/// A body kept in memory that refuses to grow past [`REPLY_MAX`] and says it did.
+struct Capped {
+    bytes: Vec<u8>,
+    over: bool,
+}
+
+impl Write for Capped {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if self.bytes.len() + buf.len() > REPLY_MAX {
+            self.over = true;
+            return Err(io::Error::other("the body is too long"));
+        }
+        self.bytes.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 fn read_head<R: BufRead>(url: &dyn fmt::Display, r: &mut R) -> Result<Head, HttpsError> {

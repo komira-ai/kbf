@@ -290,6 +290,41 @@ fn a_pair_that_is_not_a_plain_unexpired_mdm_push_pair_is_refused() {
     }
 }
 
+/// Catches either file's git check dropped: the certificate alone inside a git work
+/// tree, then the key alone, each refused naming that file; nothing is sent. (The row
+/// above plants `.git` above both, so either check alone passes it.)
+#[test]
+fn a_certificate_or_a_key_alone_inside_a_git_work_tree_is_refused() {
+    let server = nanohub(TOPIC);
+    let (cert, key) = pair(TOPIC, false);
+    for (in_git, want) in [
+        (true, "/repo/push.pem is inside a git work tree (/repo/.git exists)"),
+        (false, "/repo/push.key is inside a git work tree (/repo/.git exists)"),
+    ] {
+        let (c, k) = if in_git {
+            ("/repo/push.pem", KEY)
+        } else {
+            (CERT, "/repo/push.key")
+        };
+        let mut exec = host();
+        exec.entries.insert(p(c), file(cert.as_bytes(), 0o644, 501));
+        exec.entries.insert(p(k), file(key.as_bytes(), 0o600, 501));
+        exec.entries.insert(p("/repo/.git"), file(b"", 0o644, 501));
+        let a = PushCert {
+            config: config_at(&server),
+            with: With::Pair {
+                cert: p(c),
+                key: p(k),
+            },
+        };
+        let (got, _) = run_it(&mut exec, &a, Mode::Apply);
+        let err = got.err().map(|e| e.to_string());
+        assert!(err.as_ref().is_some_and(|e| e.starts_with(want)), "{want}: {err:?}");
+        assert!(server.requests().is_empty(), "{want}");
+        assert!(exec.log.is_empty(), "{want}");
+    }
+}
+
 /// Catches an upload taken as done when NanoHUB stored the certificate under another
 /// topic (the Macs would enroll for pushes that never come), and a refusal by NanoHUB
 /// taken as done; neither records anything.

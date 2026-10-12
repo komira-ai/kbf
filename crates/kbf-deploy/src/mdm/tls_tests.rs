@@ -271,6 +271,45 @@ fn a_rerun_changes_nothing_and_a_changed_timer_is_reloaded() {
     assert!(matches!(err, Some(MdmError::NotCertificate(_))), "{err:?}");
 }
 
+/// Catches `dns.env` checked for only some of the provider's variables: one row per
+/// variable of each provider, `dns.env` holding every other one, refused naming it.
+#[test]
+fn a_dns_env_missing_any_one_provider_variable_is_refused() {
+    let rows: [(&str, &[&str]); 3] = [
+        ("godaddy", &["GODADDY_API_KEY", "GODADDY_API_SECRET"]),
+        (
+            "route53",
+            &[
+                "AWS_ACCESS_KEY_ID",
+                "AWS_SECRET_ACCESS_KEY",
+                "AWS_REGION",
+                "AWS_HOSTED_ZONE_ID",
+            ],
+        ),
+        ("cloudflare", &["CLOUDFLARE_DNS_API_TOKEN"]),
+    ];
+    for (provider, vars) in rows {
+        let a = Acme::parse(&acme_text("ops@example.com", DIRECTORY, provider)).expect("valid");
+        for missing in vars {
+            let env: String = vars
+                .iter()
+                .filter(|v| *v != missing)
+                .map(|v| format!("{v}=x\n"))
+                .collect();
+            let (mut exec, _) = tls_host(HELP);
+            exec.entries
+                .insert(p("/etc/kbf-mdm/dns.env"), file(env.as_bytes(), 0o600, 0));
+            let err = run_it(&mut exec, &a, Mode::DryRun).0.err();
+            let want = format!("has no {missing}=");
+            let text = err.as_ref().map(ToString::to_string);
+            assert!(
+                text.as_ref().is_some_and(|e| e.contains(&want)),
+                "{provider} {missing}: {text:?}"
+            );
+        }
+    }
+}
+
 /// Catches a run that goes ahead without what lego needs: the provider's key missing
 /// from `dns.env` (here route53's), a `dns.env` others can read, lego missing, a lego
 /// whose `run` lacks any one flag the unit passes (another major), or a user instead of
