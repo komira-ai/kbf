@@ -240,11 +240,18 @@ pub(crate) mod tests {
         Ipv4Addr::new(10, 1, 0, last)
     }
 
-    /// The example settings, with a LAN address and network filled in.
+    /// Two nameservers in the documentation ranges, for MDM_ACME_RESOLVERS.
+    pub(crate) const RESOLVERS: &str = "192.0.2.53:53 198.51.100.53:53";
+
+    /// The example settings, with a LAN address, network and nameservers filled in.
     pub(crate) fn config_text() -> String {
         EXAMPLE
             .replace("MDM_BIND=\n", &format!("MDM_BIND={}\n", lan(10)))
             .replace("MDM_LAN_CIDR=\n", &format!("MDM_LAN_CIDR={}/24\n", lan(0)))
+            .replace(
+                "MDM_ACME_RESOLVERS=\n",
+                &format!("MDM_ACME_RESOLVERS=\"{RESOLVERS}\"\n"),
+            )
     }
 
     pub(crate) fn config() -> MdmConfig {

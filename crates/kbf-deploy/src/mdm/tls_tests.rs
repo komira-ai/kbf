@@ -170,8 +170,8 @@ fn acme_settings_are_checked() {
 fn acme_resolvers_and_propagation_wait_are_checked() {
     let a = acme();
     let want: Vec<SocketAddr> = vec![
-        "1.1.1.1:53".parse().expect("addr"),
-        "8.8.8.8:53".parse().expect("addr"),
+        "192.0.2.53:53".parse().expect("addr"),
+        "198.51.100.53:53".parse().expect("addr"),
     ];
     assert_eq!(a.resolvers, want);
     assert_eq!(a.propagation_wait, Duration::from_secs(300));
@@ -186,15 +186,15 @@ fn acme_resolvers_and_propagation_wait_are_checked() {
             .collect();
         lines.join("\n") + "\n"
     };
-    let v6 = Acme::parse(&with("MDM_ACME_RESOLVERS", "\"[2606:4700:4700::1111]:53\""));
+    let v6 = Acme::parse(&with("MDM_ACME_RESOLVERS", "\"[2001:db8::53]:53\""));
     let v6 = v6.expect("IPv6").resolvers;
-    assert_eq!(resolvers(&v6), "[2606:4700:4700::1111]:53");
+    assert_eq!(resolvers(&v6), "[2001:db8::53]:53");
     let rows = [
         ("MDM_ACME_RESOLVERS", "dns.google:53"),
-        ("MDM_ACME_RESOLVERS", "1.1.1.1"),
-        ("MDM_ACME_RESOLVERS", "1.1.1.1:0"),
+        ("MDM_ACME_RESOLVERS", "192.0.2.53"),
+        ("MDM_ACME_RESOLVERS", "192.0.2.53:0"),
         ("MDM_ACME_RESOLVERS", "\" \""),
-        ("MDM_ACME_RESOLVERS", "1.1.1.1:53,8.8.8.8:53"),
+        ("MDM_ACME_RESOLVERS", "192.0.2.53:53,198.51.100.53:53"),
         ("MDM_ACME_RESOLVERS", ""),
         ("MDM_ACME_PROPAGATION_WAIT", "0s"),
         ("MDM_ACME_PROPAGATION_WAIT", "300"),
@@ -239,7 +239,10 @@ fn the_rendered_units_run_lego_as_the_mdm_user_with_the_settings() {
     assert_eq!(after("--server"), Some(DIRECTORY));
     assert_eq!(after("--dns"), Some("godaddy"));
     assert_eq!(after("--domains"), Some("mdm.example.com"));
-    assert_eq!(after("--dns.resolvers"), Some("1.1.1.1:53,8.8.8.8:53"));
+    assert_eq!(
+        after("--dns.resolvers"),
+        Some("192.0.2.53:53,198.51.100.53:53")
+    );
     assert_eq!(after("--dns.propagation.wait"), Some("300s"));
     assert!(!argv.iter().any(|w| w.contains("GODADDY")));
     let watch =
@@ -333,8 +336,9 @@ impl Exec for Issuing {
 /// there, the proxy untouched (it would start, fail on the missing file and restart
 /// every 5 s); an apply whose issuance writes the certificate then enables and starts
 /// the proxy in the same run; and a certificate already there (lego run by hand, or by
-/// the timer after a failed first issuance) with the proxy off is enabled and started
-/// without issuing again.
+/// the timer after a failed first issuance) with the proxy off: a dry run shows the
+/// proxy steps and no waiting note, and an apply enables and starts it without issuing
+/// again.
 #[test]
 fn the_proxy_is_enabled_and_started_only_once_the_certificate_is_there() {
     let proxy = [
@@ -394,6 +398,13 @@ fn the_proxy_is_enabled_and_started_only_once_the_certificate_is_there() {
 
     let (mut exec, _) = tls_host(HELP);
     exec.entries.insert(p(CRT), cert);
+    let (got, out) = run_it(&mut exec, &acme(), Mode::DryRun);
+    got.expect("planned");
+    assert!(
+        out.contains("systemctl enable kbf-mdm-proxy.service"),
+        "{out}"
+    );
+    assert!(!out.contains("proxy: started once"), "{out}");
     run_it(&mut exec, &acme(), Mode::Apply).0.expect("by hand");
     let ran = runs(&exec);
     assert!(

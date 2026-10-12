@@ -204,7 +204,7 @@ impl Acme {
             let addr = addr.ok_or(bad(
                 "ACME_RESOLVERS",
                 &text,
-                "not nameservers as IP:PORT words, like 1.1.1.1:53",
+                "not nameservers as IP:PORT words, like 192.0.2.53:53",
             ))?;
             resolvers.push(addr);
         }
