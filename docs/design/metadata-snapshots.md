@@ -30,8 +30,18 @@ numbers say *measured* and estimates say *estimate*.
   (`crates/kbf-raft/src/host.rs`) asks the machine for its bytes, compacts the core
   through the applied index (`Raft::compact`), then calls `Storage::write_snapshot`.
   `Host::open` calls `Machine::restore` when the storage holds a snapshot, and the
-  core then applies again starting after the snapshot's base. Nothing calls
-  `Host::snapshot` outside the `kbf-raft` tests.
+  core then applies again starting after the snapshot's base. It compacts the core
+  *before* it writes the file, and a write error stops the host. Nothing calls
+  `Host::snapshot` outside tests (`kbf-raft`'s and `crates/kbf-store/tests/raft_host.rs`).
+- **The log's store options are fixed.** `RaftMetaLog::open` opens its store with
+  `Options::default()`, so its segments are 64 MiB (`kbf-store`, `Options::segment_bytes`).
+  No caller can make them smaller.
+- **The log's lock is a `std::sync::Mutex`.** Each commit (`execute`, and `tick` once a
+  second from the `tick_every` tokio task) takes it once, and so does `async fn query`.
+  A caller that waits for it blocks its runtime thread; it does not yield.
+- **The machine decodes every entry as format 1.** `MetaMachine::apply` calls
+  `kbf_log::decode(Format::V1, ..)`, and any command other than a metadata command or a
+  `Bootstrap` (a `MachineVersion`, say) stops the machine as an unknown command.
 - **The disk store can already hold a snapshot.** `kbf-store` writes one file,
   `snapshot`. It holds a header record (base index, base term and state length) and
   then the state in CRC-32C records of at most 1 MiB (`SNAPSHOT_CHUNK`,
@@ -119,14 +129,21 @@ Header  { uint32 format; uint32 machine_version; uint64 base_index; uint64 base_
           Membership membership; Bootstrap bootstrap; uint64 bootstraps;
           uint64 now_millis; uint64 next_epoch; }
 Blobs   { repeated BlobEntry entries; }     // BlobEntry { Digest digest; Location location; uint64 last_touch_millis; }
-Actions { repeated ActionEntry entries; }   // ActionEntry { Digest action; ActionRecord record; uint64 last_hit_millis; }
+Actions { repeated CachedAction entries; }  // CachedAction { Digest action; ActionRecord record; uint64 last_hit_millis; }
 LossMarks { repeated LossMark entries; }    // LossMark { ObjectId object; UnreachableReason reason; uint64 generation; }
+Membership { repeated uint64 voters; repeated uint64 learners; }
 Trailer { uint64 blobs; uint64 actions; uint64 loss_marks; uint64 pins; bytes sha256; }
 ```
 
 `Digest`, `Location`, `ObjectId`, `ActionRecord`, `UnreachableReason` and `Bootstrap`
 are the existing `log.proto` messages, reused rather than copied. So a field means the
-same thing in an entry and in a snapshot.
+same thing in an entry and in a snapshot. `SnapshotFrame`, `Header`, `Blobs`,
+`BlobEntry`, `Actions`, `CachedAction`, `LossMarks`, `LossMark`, `Membership`,
+`Trailer` (and `Pins`, `Pin` in format 2) are new. Every one of these names is checked
+against `log.proto`, which shares the package: `log.proto` already has
+`message ActionEntry { action, record }` (the entry a `Report` writes), so the
+snapshot's action entry is `CachedAction`, and protoc would refuse a second
+`ActionEntry`.
 
 ### 3.2 Rules that make the bytes a function of the state
 
@@ -217,44 +234,108 @@ entries. A downgrade below a committed format is refused at start. That is the s
 rule entries already follow, because `kbf_log::decode` refuses a format it does not
 know.
 
+**How a format is committed.** Today nothing commits one: `MetaMachine` decodes every
+entry as `Format::V1` (section 1). `ha.md` 4.7 puts the format in the log (set at
+`Bootstrap`, raised by a `MachineVersion` entry). Phase one does not change the format,
+so it adds only the place to keep it:
+
+- `MetaMachine` gains a `format` field. A fresh log starts at V1. A restore sets it
+  from the snapshot header. Every entry after the base is decoded under that format,
+  not under a constant, so the entries that follow a format-2 snapshot are read as
+  format 2.
+- `MetaMachine::snapshot` writes its current `format` in the header. It is the format
+  in force at the base, which is the one the next entry is decoded under.
+
+PR 4 (format 2) adds the raise. When the binary writes format 2 and the committed
+format is 1, the open commits one `MachineVersion` entry after the `Bootstrap` check,
+before it serves. Applying it sets `format = 2` for every later entry. Which value the
+entry carries (the machine version alone, with the format implied, or a format field
+beside it) is `ha.md` 4.7's to settle; PR 4 follows it. A binary that reads only format
+1 already refuses that log: it decodes the `MachineVersion` entry, which its machine
+does not apply, so the machine stops and the open is refused (section 1). It also
+refuses a format-2 snapshot header (`UnknownFormat(2)`).
+
 ## 5. Taking a snapshot and compacting
 
 ### 5.1 When
 
-The tick task already runs every second under the log's lock (`tick_every`). After
-its tick, it takes a snapshot when **either** of these holds:
+The tick task (`tick_every`) runs once a second. After its tick it checks one rule,
+on bytes only: take a snapshot when
 
-- 100,000 entries have been applied since the last snapshot (the `ha.md` 4.9 lean); or
-- the bytes in the log segments since the last snapshot are at least the larger of
-  64 MiB and the size of the last snapshot file.
+> L >= max(F, k x S)
 
-The second rule keeps snapshot writes in proportion to log writes. If the state is
-4 GB, taking a snapshot every 64 MiB of log would write 60 times more snapshot than
-log. With the rule, snapshot writes are at most about the log's own bytes, and the
-directory holds at most two snapshots' worth (the file and its `.tmp` during a write)
-plus that much log.
+- L is the bytes appended to the log segments since the last snapshot (the store
+  counts them; a restart counts the segments after the base);
+- F is a floor, 64 MiB by default (`--raft-snapshot-log-bytes`);
+- S is the size of the last snapshot file (0 before the first);
+- k is a ratio, 1 by default (`--raft-snapshot-log-ratio`).
 
-There is no time trigger. `ha.md` 4.9 has a 10-minute trigger to keep the object-store
-copy fresh, and a single voter has no copy yet. With ticks alone, the entry rule fires
-about every 28 hours on an idle server (86,400 entries a day, section 1). The
-thresholds are flags (`--raft-snapshot-entries` and `--raft-snapshot-log-bytes`, the
-floor), so tests can set them to a few entries.
+**There is no entry-count rule.** `ha.md` 4.9 leans to "100,000 entries or 64 MiB". At
+the ceiling of section 7.2, 100,000 entries are about 30 MB of log, so an entry rule
+alone would fire every few hours and write the full 3.7 GB state each time: about 100x
+more snapshot than log, and a pause of about 9 s each time. On an idle server it would
+write a full snapshot per 3.6 MB of ticks. An entry count is not proportional to
+anything a snapshot costs, so it is dropped.
+
+**The write bound.** Every snapshot is taken after at least k x S of log, where S is
+the previous snapshot. The new snapshot S' is at most S plus what the entries in L
+added to the state, and an entry adds at most about 1.13x its log encoding to a
+snapshot (63 B against 56 B per blob, section 7.1; an estimate). Ticks, touches,
+`Collect` and loss marks add nothing or shrink it. So per snapshot
+
+> S' / L <= S / L + 1.13 <= 1/k + 1.13
+
+and the snapshot bytes written are at most about 2.1x the log bytes written at k = 1
+(estimate). In steady state, where the state does not grow, it is about 1/k.
+
+**What k costs elsewhere.** The log since the last snapshot is held twice until the
+next one: on disk in segments and in the Raft core's memory (`Raft::compact` is what
+drops it there). Both are at most max(F, k x S) plus one segment, and a start replays
+that much (section 7.4). At the steady state of section 7.2 with k = 1 that is up to
+3.7 GB of log on disk and in memory beside a 7.6 GB heap, and about 23 days of log at
+the ceiling (about 160 MB a day of actions and blobs). An operator who wants a shorter
+replay or less memory lowers k and pays more snapshot writes. The disk holds at most
+the snapshot, its `.tmp` during a write, and that log.
+
+An idle server reaches F from ticks alone after about 21 days (3.1 MB a day,
+section 1). There is no time trigger: `ha.md` 4.9 has a 10-minute trigger to keep the
+object-store copy fresh, and a single voter has no copy yet.
+
+The floor and ratio are flags of the server. The segment size is not a flag: it is a
+field of the options `RaftMetaLog::open` takes (planned `RaftLogOptions { segment_bytes,
+snapshot_floor, snapshot_ratio }`, `segment_bytes` defaulting to `kbf-store`'s 64 MiB),
+so tests can make segments of a few hundred bytes (section 11, PR 3).
 
 ### 5.2 How
 
-`RaftMetaLog` locks the host and calls `Host::snapshot`, the existing path:
+The tick task does not run the snapshot itself. It hands it to
+`tokio::task::spawn_blocking` and awaits it, so at most one runs at a time and the
+task's runtime thread is not held (section 7.3 says what the other callers see). The
+blocking closure locks the host and calls `Host::snapshot`, in a new order:
 
-1. `MetaMachine::snapshot` encodes the state as of the applied index.
-2. `Raft::compact(applied)` drops the entries from the core's memory.
-3. `Store::persist_snapshot` writes `snapshot.tmp`, syncs it, renames it over
+1. `MetaMachine::snapshot` encodes the state as of the applied index `through`. The
+   base id is the id of the entry at `through`, which the core still holds.
+2. `Store::persist_snapshot` writes `snapshot.tmp`, syncs it, renames it over
    `snapshot`, syncs the directory, and only then removes the segments that hold no
    entry after the base.
+3. `Raft::compact(through)` drops the entries from the core's memory.
+
+Today the core compacts first and the file is written after (section 1). The order is
+swapped so that a write that fails before the rename has changed nothing, in memory or
+on disk (section 5.3). A crash between steps 2 and 3 restarts from the new snapshot,
+which is what step 3 would have reached.
 
 A segment that holds the base and entries after it is kept whole, and the base hides
 its earlier entries. So after compaction the log keeps at most one partial segment
-(64 MiB by default) plus the active one.
+(`segment_bytes`, 64 MiB by default) plus the active one.
 
-Two changes to the trait are needed:
+Three changes to the traits are needed:
+
+- `Storage::write_snapshot` says whether the failure happened before the rename:
+  `Result<(), SnapshotWriteError<Self::Error>>`, with `NotWritten(e)` (the create,
+  append or sync of `snapshot.tmp` failed; the store removes the `.tmp` and keeps
+  running) and `Failed(e)` (the rename, the directory sync or a segment removal
+  failed; fail-stop, as today). `Host::snapshot` stops the host only on `Failed`.
 
 - `Machine::snapshot` becomes `fn snapshot(&self) -> Result<Vec<u8>, Self::Error>`.
   Encoding cannot fail for a state that arrived through V1 entries, but
@@ -273,7 +354,8 @@ Two changes to the trait are needed:
 |---|---|
 | Crash before the rename | `snapshot.tmp` is a leftover. The next `Store::open` removes it and replays the full log. Nothing is lost |
 | Crash after the rename, before the segments go | The base hides the covered entries. `Store::open` removes segments it finds wholly covered. Nothing is lost and nothing is applied twice |
-| A write or sync error during the snapshot | The store stops (`StoreError` is fail-stop) and the host stops. Every later commit is `Unavailable`, as for any storage error today. The process must restart |
+| A write or sync error on `snapshot.tmp` (disk full, say) | Nothing is compacted yet and the old `snapshot` and every segment are intact, so this is not fail-stop. The store removes the `.tmp` (best effort; the next open removes a leftover) and keeps appending; the host does not stop and the core is not compacted. The error is logged, and the next attempt waits until L grows by another F, so a full disk is not rewritten every second. A failed `fsync` here cannot leave clean-looking pages that are later trusted, because the `.tmp` is never renamed. The log keeps growing: if the disk stays full, the next segment append fails and that is fail-stop, as today. Phase one adds no free-space floor; `ha.md` 4.8 adds one (proposals refused, snapshot forced) |
+| An error at or after the rename (the rename, the directory sync, a segment removal) | Whether the new `snapshot` is durable is unknown, so the store stops (`StoreError` is fail-stop) and the host stops. Every later commit is `Unavailable`, as for any storage error today. The process must restart. Either snapshot is consistent with the segments, which are removed only after the directory sync |
 | The snapshot file damaged on disk | Its CRC fails, and `Store::open` refuses the directory. With one voter, that loses the metadata: the entries through the base are gone. This is the new exposure that compaction adds. Before compaction, damage in a segment was equally fatal. Recovery is a store copy (HA, section 8) or rebuilding the index from segment footers, which is not built |
 
 ### 5.4 Memory during a snapshot (phase one)
@@ -343,7 +425,9 @@ measured.
 | A | 1,000,000 | 100,000 | 185 MB | 88 MB | 0.12 s | 0.08 s |
 | B (10x A) | 10,000,000 | 1,000,000 | 1.79 GB | 0.88 GB | 1.19 s | 0.81 s |
 
-Cost grows linearly: time and bytes per entry are the same at A and B.
+Cost grows linearly: time and bytes per entry are the same at A and B. The
+per-entry figures are rounded: 1,000,000 x 56 B + 100,000 x 298 B is 85.8 MB, against
+the 88 MB measured at A, so read the per-entry row as about 3% low.
 
 ### 7.2 Today's scale and 10x (estimates)
 
@@ -367,7 +451,8 @@ What this says:
 - **Actions dominate.** That is because actions are retained for 31 days and blobs for
   8. A hit touches the result and every closure blob (`MetaState`'s action query), so
   an action with no hit for about 8 days has usually lost its blobs to `Collect`. From
-  then on it can only miss, yet it stays in the index until day 31. Collecting an
+  then on it misses (unless a client uploads the result and the closure blobs again,
+  which revives the hit), yet it stays in the index until day 31. Collecting an
   action once its result blob is collected would bound the action map at about 8 days
   (2.8 M at the ceiling, a snapshot of about 1.4 GB). This is a retention change for
   `storage.md`, and it is asked as an open question (section 10).
@@ -378,11 +463,29 @@ What this says:
 
 ### 7.3 The pause
 
-`Host::snapshot` runs under the log's lock. `MetaLog::query` takes the same lock, so
-while a snapshot runs, **every commit and every metadata read waits**: `FindMissing`,
-`GetActionResult`, uploads. Calls are delayed, not failed. The pause is the encode time
-plus the write and sync of S bytes. Disk time has not been measured; at 1 GB/s a 1 GB
-write takes about 1 s (estimate).
+`Host::snapshot` runs under the log's lock. Commits and `async fn query` take the same
+lock, so while a snapshot runs, **every commit and every metadata read waits**:
+`FindMissing`, `GetActionResult`, uploads. The lock is a `std::sync::Mutex` (section 1),
+so a waiting call does not yield: it blocks its tokio worker thread for the rest of the
+pause.
+
+- The snapshot itself runs on `spawn_blocking` (section 5.2), so it holds a blocking
+  thread, not a runtime worker.
+- Each metadata call that arrives during the pause holds a worker. Once as many calls
+  wait as the runtime has workers, every other task stalls as well: worker streams,
+  heartbeats, unrelated gRPC calls.
+- So a long pause is not just a delay. A client whose deadline is shorter than the
+  pause fails, and a worker whose heartbeat stalls can be timed out.
+
+Phase one does not move the waiting callers off the runtime. `block_in_place` would,
+but it panics on a current-thread runtime, which the plain `#[tokio::test]`s in
+`kbf-server` use (`tests/raft_log.rs` among them), and moving each `query` to `spawn_blocking` would need its closure
+to be `'static`. Phase one therefore accepts the pause only where it is within the
+budget below. Levers 1 and 2 shorten the time the lock is held, and that is the real
+fix.
+
+The pause is the encode time plus the write and sync of S bytes. Disk time has not been
+measured; at 1 GB/s a 1 GB write takes about 1 s (estimate).
 
 The budget is `ha.md`'s: 1 s at the target index size.
 
@@ -390,7 +493,9 @@ The budget is `ha.md`'s: 1 s at the target index size.
   and the state starts small): about 0.12 s of encode plus about 0.1 s of write. This
   is within budget, and phase one ships it as is.
 - **Steady state at the ceiling:** about 4.7 s of encode plus about 4 s of write. That
-  is far over budget. Ways to cut it, cheapest first:
+  is far over budget. The rule of 5.1 makes it rare (about once in 23 days at k = 1),
+  not short: for those 9 s metadata calls stall the runtime as above. Ways to cut it,
+  cheapest first:
   1. **Write and sync outside the lock.** Split `Host::snapshot` into a step under the
      lock (encode, and note the base) and a step after it (write the file, then lock
      again and compact). This removes the disk time. The store has to allow segment
@@ -413,8 +518,9 @@ The budget is `ha.md`'s: 1 s at the target index size.
 ### 7.4 Replay
 
 Today a start replays the whole log, and the log grows by at least 3.1 MB a day from
-ticks alone. After compaction, a start decodes one snapshot and replays at most about
-the threshold of section 5.1. Start time after a snapshot is about the decode of S
+ticks alone. After compaction, a start decodes one snapshot and replays at most
+max(F, k x S) of log plus one segment (section 5.1): with k = 1, a replay of up
+to about as many bytes as the snapshot. Start time after a snapshot is about the decode of S
 (not measured; it should be of the order of the encode) plus that replay. PR 3 has an
 `#[ignore]` test that measures both at points A and B.
 
@@ -433,7 +539,7 @@ keeps, what it adds and where this differs:
 | 4.9: encoding streams, never one buffer | phase one builds one buffer (section 5.4); frames allow streaming without a format change | changes the `Machine` and `Storage` traits to a writer and a reader |
 | 4.9: every replica snapshots on its own | the same `Host::snapshot` path | runs on every replica; the deterministic bytes let two servers upload the same object |
 | 4.9 S1: compact no further than the newest store copy | a single voter compacts against its local snapshot only | adds the store copy and the S1 bound. **Before 1 to 3** (HA PR 32 starts "from a single voter that has compacted its log"), the voter must upload a copy, because a learner catches up by InstallSnapshot by reference. With one voter, a lost disk loses the metadata both today and after this change (`storage.md`, Planned) |
-| 4.9 trigger lean: 100,000 entries, 64 MiB or 10 minutes | 100,000 entries, or log bytes of at least max(64 MiB, last snapshot) | open decision 8 of `ha.md` adopts the size-proportional rule or keeps its own; the 10-minute rule exists for the store copy |
+| 4.9 trigger lean: 100,000 entries, 64 MiB or 10 minutes | log bytes only: at least max(64 MiB, k x last snapshot), k = 1; no entry count (section 5.1) | open decision 8 of `ha.md` adopts the size-proportional rule or keeps its own; the 10-minute rule exists for the store copy |
 | 4.9: `Checkpoint { index, digest }` every 10,000 entries | not here | the trailer's SHA-256 is one possible digest, but encoding the full state every 10,000 entries costs the full encode time; 4.9 should choose a cheaper running digest |
 | PR 14 mutant: "drop `next_epoch` from the snapshot" | in PR 1's tests | inherited |
 
@@ -463,8 +569,9 @@ streaming transport. It replaces nothing.
 2. **The pause budget at the target size.** Lever 1 of 7.3 is cheap. Lever 2 needs a
    dependency decision for `kbf-meta`. **Lean:** lever 1 as soon as a measured pause
    exceeds 1 s, and lever 2 only if one is still over after lever 1.
-3. **Snapshot trigger** (section 8): should `ha.md` adopt the size-proportional
-   rule? **Lean: yes.**
+3. **Snapshot trigger** (sections 5.1 and 8): should `ha.md` adopt the size-proportional
+   rule and drop its 100,000-entry rule, which at the ceiling writes the full state
+   every few hours? **Lean: yes.** The 10-minute rule for the store copy is HA's own.
 
 ## 11. Pull request plan
 
@@ -505,11 +612,16 @@ module (`encode_snapshot`, `decode_snapshot`), and `MetaState::parts` and
 - `#[ignore]` measurement test: the numbers of 7.1.
 
 **PR 2 (M): snapshot and restore in the single-voter log.** It covers
-`MetaMachine::snapshot` and `restore` and the trait change
-(`Machine::snapshot -> Result`). It replaces `NoSnapshots` with the snapshot error. It
-adds `Host::open_with`, so the directory is read once. It makes `kbf-store` write the
-snapshot file without a second buffer. It adds `RaftMetaLog::snapshot()`, which tests
-call directly; nothing triggers it yet. Tests:
+`MetaMachine::snapshot` and `restore`, the `format` field of section 4, and the trait
+changes (`Machine::snapshot -> Result`, `Storage::write_snapshot ->
+Result<(), SnapshotWriteError<_>>`, and `Host::snapshot` writing before it compacts,
+section 5.2). It replaces `NoSnapshots` with the snapshot error. It adds
+`Host::open_with`, so the directory is read once, and `RaftLogOptions` (section 5.1)
+with `segment_bytes` passed to `Store::open`. It makes `kbf-store` write the snapshot
+file without a second buffer. It adds `RaftMetaLog::snapshot()`, which tests call
+directly; nothing triggers it yet. The `kbf-raft` host test that expects a snapshot
+write error to stop the host (`tests/host.rs`) is split into the two cases below.
+Tests:
 
 - After a snapshot at k, more commits and a restart: the state equals that of a log
   that never took a snapshot, `applied_index` continues, and farm time does not go
@@ -523,35 +635,81 @@ call directly; nothing triggers it yet. Tests:
   header base; red. A membership other than the record's: refused.
 - The test in section 6, split: empty bytes give `NotAHeader`, and an unknown format
   gives an error that names it.
+- The header carries the machine's `format`, and a restored machine decodes the
+  entries after the base under it: with a test-only format value that `kbf_log`
+  accepts, a restore from a header naming it sets `format`, and the next entry is
+  decoded under it. Plant: decode under `Format::V1` after a restore; red.
 - A power cut at every `FaultFs` operation of `RaftMetaLog::snapshot`: the restart
   holds every answered commit, applied once. Plant: compact the store's segments
   before the rename; red.
-- A storage error during a snapshot: every later commit is `Unavailable`. A machine
-  stopped on an entry: `snapshot()` is refused and the directory holds no snapshot.
-  Plant: snapshot a failed machine; red.
+- An injected error at each `FaultFs` operation on `snapshot.tmp` (create, append,
+  sync): `snapshot()` returns `NotWritten`, the next commit succeeds, no `snapshot`
+  or `snapshot.tmp` is left, the core is not compacted (a restart replays every
+  entry), and the old snapshot, if there was one, is intact. Plant: stop the store on
+  any snapshot error, as today; red (the next commit is `Unavailable`). Plant: compact
+  the core before the write, as today; red (the core has dropped entries the disk
+  still needs; the test checks the core's base).
+- An injected error at the rename, the directory sync or a segment removal: every
+  later commit is `Unavailable`. Plant: report these as `NotWritten`; red.
+- A machine stopped on an entry: `snapshot()` is refused and the directory holds no
+  snapshot. Plant: snapshot a failed machine; red.
 - The open reads the snapshot once: a `FaultFs` read count. Plant: call `load` again;
   red.
 
-**PR 3 (S): compaction on a policy.** It adds the triggers of 5.1 in the tick task, the
-two flags, a log line and the `snapshot_pause_seconds` value, and turns snapshots on
-in `kbf-sim-cell` with small thresholds. Tests:
+**PR 3 (S): compaction on a policy.** It adds the rule of 5.1 in the tick task (on
+`spawn_blocking`), the two flags, the store's count of log bytes since the base, the
+backoff after `NotWritten`, a log line and the `snapshot_pause_seconds` value, and
+turns snapshots on in `kbf-sim-cell` with small thresholds. Every test below opens
+the log with `segment_bytes = 512` (a tick is 36 bytes on disk, so about 14 ticks a
+segment); with the 64 MiB default, every commit of these tests would fit one segment,
+which `persist_snapshot` keeps whole, and the two segment checks could not fail.
+Tests:
 
-- With a threshold of 10 entries, after 25 commits the directory holds a snapshot, no
-  segment wholly before the base, and a restart that equals. Plant: the trigger never
-  fires; red.
-- The log stays bounded: after 1,000 commits with a 4 KiB log floor, the segment bytes
-  are under the bound. Plant: never remove segments; red.
+- **Compaction removes covered segments.** Floor 2 KiB, k = 1, 200 ticks (about
+  7 KiB of log). The test first asserts its own precondition: the store wrote at
+  least 4 segments (so a store that removes nothing would hold at least 3 wholly
+  before the base). Then: a snapshot exists, its base is above 0, every remaining
+  segment holds an entry after the base, and a restart equals the log before it.
+  Plant: the rule never fires; red (no snapshot). Plant: `persist_snapshot` removes
+  no segment; red (a segment wholly before the base is left).
+- **The log stays bounded.** Floor 2 KiB, k = 1, 1,000 ticks (about 36 KiB of log).
+  After every commit, the segment bytes on disk are at most max(F, k x S) plus two
+  segments plus one batch, and the precondition asserts that the log written is over
+  10x that bound. Plant: never remove segments; red at about commit 90.
+- **Snapshot writes stay proportional.** A state of 2,000 blobs (a snapshot of about
+  120 KiB), floor 2 KiB, k = 1, then 4,000 ticks (about 140 KiB of log): the snapshot
+  bytes written are at most (1/k + 1.13) x the log bytes plus one S. Plant: trigger on
+  the floor alone (drop k x S); red (about 70 snapshots of 120 KiB). Plant: an
+  entry-count rule of 100 entries beside it; red.
+- **A full disk is not fail-stop and is not retried every tick.** `FaultFs` fails
+  every append to `snapshot.tmp`: commits keep succeeding, and over the next F - 1
+  bytes of log the store creates `snapshot.tmp` once at most. Plant: retry on every
+  tick; red.
+- **The snapshot does not hold the tick task's runtime.** On a current-thread
+  runtime, a planned `FaultFs` fault that blocks the snapshot's sync until the test
+  releases it, and a second task on the same runtime that must make progress (a
+  counter it raises) while the snapshot is blocked. Plant: run the snapshot inline in
+  the tick task; red (the counter does not move until the release).
 - `kbf-sim-cell` crash seeds with a snapshot every few entries: the durability checker
   holds. Plant: restore drops the action map; red.
 - The CI test of metadata surviving a snapshot, a restart and a replay is the first two
   tests above run through `kbf-server`'s binary (`tests/cold_restart.rs`): blobs,
-  action-cache hits and the log id survive a compacted restart.
+  action-cache hits and the log id survive a compacted restart. The binary takes no
+  segment-size flag, so this test uses the floor flag and checks survival only, not
+  segment removal.
 - `#[ignore]` measurement test: pause and replay at points A and B (7.3, 7.4).
 
 **PR 4 (S, with invocations PR 7): pins in the snapshot.** It adds the `Pins` frame
-under log format 2. Tests:
+under log format 2, and the commit of format 2 (section 4). Tests:
 
 - A pin, its accumulated closure and its hold-until survive a snapshot and a restart,
   and a `Collect` after the restore keeps every digest of the live pin's closure.
   Plant: leave out the `Pins` frame; red.
-- A format-1 reader refuses a format-2 snapshot. Plant: accept it; red.
+- A format-2 binary over a format-1 log commits one format raise at open, and only
+  once: a second open commits none, and every entry after the raise decodes as
+  format 2. Plant: raise at every open; red. Plant: keep decoding as V1 after the
+  raise; red (the pin command does not decode).
+- A snapshot taken after the raise names format 2, and a restart from it decodes the
+  entries after the base as format 2. Plant: write `Format::V1` in the header; red.
+- A format-1 reader refuses a format-2 snapshot (`UnknownFormat(2)`) and a log that
+  holds the raise entry. Plant: accept it; red.
