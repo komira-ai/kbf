@@ -589,6 +589,19 @@ impl Unkillable {
     }
 }
 
+impl Unkillable {
+    /// Moves this process to a thread that kills and reaps it once told to (through the
+    /// sender), or after `within`, whichever comes first.
+    fn guard(self, within: Duration) -> (std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>) {
+        let (release, told) = std::sync::mpsc::channel::<()>();
+        let guard = std::thread::spawn(move || {
+            let _ = told.recv_timeout(within);
+            drop(self);
+        });
+        (release, guard)
+    }
+}
+
 impl Drop for Unkillable {
     fn drop(&mut self) {
         // SAFETY: plain integers; `self.0` is this process's child, reaped here once.
@@ -625,6 +638,10 @@ async fn a_process_the_kill_cannot_end_fails_the_clean_within_its_deadline() {
         ids = ids_of(stuck.0);
     }
     let listed = uid::processes(user.uid).expect("list").contains(&stuck.0);
+    // Killed by its guard after 120 s at the latest: a kill with no deadline, which
+    // waits for it forever (on the runtime's thread too, as the dropped run ends its
+    // uid), then ends, and the test fails instead of hanging the job.
+    let (release, guard) = stuck.guard(Duration::from_secs(120));
     let act = scratch.act();
     let action = Spec::argv(&[&act, "id"]).store(&cas);
     let started = Instant::now();
@@ -632,7 +649,8 @@ async fn a_process_the_kill_cannot_end_fails_the_clean_within_its_deadline() {
         tokio::time::timeout(Duration::from_secs(90), rt.run(support::work(1, action, 0))).await;
     let took = started.elapsed();
     let after = slots_reported(&rt);
-    drop(stuck);
+    let _ = release.send(());
+    guard.join().expect("the guard");
     assert_eq!(
         ids,
         Some((user.uid, 0)),
