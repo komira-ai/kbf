@@ -20,6 +20,7 @@
 //!   through `getconf` as the user, never made by root with the wrong owner.
 
 use std::io;
+use std::os::unix::fs::MetadataExt as _;
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -136,10 +137,11 @@ impl Os for MacSlot<'_> {
             (Step::Schedules, SweepPlan::macos_schedules()),
             (Step::Shared, shared()),
         ] {
-            // A sweep that removes nothing and fails nowhere found nothing.
-            let swept = sweep::sweep(&plan, &user.name, user.uid);
-            if swept != Swept::default() {
-                note(step, format!("{swept:?}"));
+            // Looked at, not swept: a check that removed what it found would hide a
+            // skipped step.
+            let found = owned_entries(&plan, &user.name, user.uid);
+            if !found.is_empty() {
+                note(step, format!("{found:?}"));
             }
         }
         match images_of(user.uid) {
@@ -510,4 +512,55 @@ fn services_of(uid: u32) -> Vec<String> {
         .filter(|line| !line.is_empty())
         .map(str::to_owned)
         .collect()
+}
+
+/// What a sweep of `plan` for `name` and `uid` would remove, without removing it: the
+/// named entries that exist, and each entry `uid` owns below the plan's folders (not
+/// looked into: the sweep removes it whole), found as the sweep walks, never through
+/// a link, on one filesystem and to [`sweep::MAX_DEPTH`]. A place that cannot be read
+/// is listed too, as the sweep would fail there.
+fn owned_entries(plan: &SweepPlan, name: &str, uid: u32) -> Vec<String> {
+    let mut found = Vec::new();
+    for template in &plan.named {
+        let path = template
+            .replace("{user}", name)
+            .replace("{uid}", &uid.to_string());
+        if std::fs::symlink_metadata(&path).is_ok() {
+            found.push(path);
+        }
+    }
+    for base in &plan.owned {
+        if let Ok(meta) = std::fs::symlink_metadata(base)
+            && meta.is_dir()
+        {
+            look(base, meta.dev(), uid, 0, &mut found);
+        }
+    }
+    found
+}
+
+/// [`owned_entries`] below the directory `dir`, on device `dev`.
+fn look(dir: &Path, dev: u64, uid: u32, depth: usize, found: &mut Vec<String>) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(why) => return found.push(format!("{}: {why}", dir.display())),
+    };
+    for entry in entries {
+        let path = match entry {
+            Ok(entry) => entry.path(),
+            Err(why) => return found.push(format!("{}: {why}", dir.display())),
+        };
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            // Gone since the listing.
+            continue;
+        };
+        if meta.dev() != dev {
+            continue;
+        }
+        if meta.uid() == uid {
+            found.push(path.display().to_string());
+        } else if meta.is_dir() && depth < sweep::MAX_DEPTH {
+            look(&path, dev, uid, depth + 1, found);
+        }
+    }
 }
