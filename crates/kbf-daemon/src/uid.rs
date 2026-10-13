@@ -40,6 +40,10 @@ pub const LAUNCHCTL: &str = "/bin/launchctl";
 /// The pause between two rounds of [`end`].
 const PAUSE: Duration = Duration::from_millis(10);
 
+/// The most [`end`] waits for the bootout: the kill after it ends the uid's processes
+/// whether or not launchd has finished.
+const BOOTOUT_WITHIN: Duration = Duration::from_secs(2);
+
 /// Why [`end`] did not leave the uid without processes.
 #[derive(Debug, thiserror::Error)]
 pub enum EndError {
@@ -170,14 +174,15 @@ pub fn bootout(uid: u32, within: Duration) {
     }
 }
 
-/// Ends every process of `uid`: [`bootout`], then [`kill`] and [`processes`] every
-/// [`PAUSE`] until none is left, for at most `within` in all.
+/// Ends every process of `uid`: [`bootout`] (for at most [`BOOTOUT_WITHIN`]), then
+/// [`kill`] and [`processes`] every [`PAUSE`] until none is left, for at most `within`
+/// in all.
 ///
 /// # Errors
 /// A round could not run, or processes of the uid were alive at the deadline.
 pub fn end(uid: u32, within: Duration) -> Result<(), EndError> {
     let give_up = Instant::now() + within;
-    bootout(uid, within);
+    bootout(uid, within.min(BOOTOUT_WITHIN));
     let io = |error| EndError::Io { uid, error };
     loop {
         kill(uid).map_err(io)?;

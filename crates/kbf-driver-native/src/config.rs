@@ -76,8 +76,8 @@ pub struct NativeConfig {
     /// The `xcrun` that runs `simctl` for the leases that ask for a simulator
     /// ([`crate::simulator`]).
     pub xcrun: PathBuf,
-    /// The lease-user pool actions are to run as, one user per slot ([`crate::slots`]);
-    /// not read yet.
+    /// The lease-user pool every action runs as, one user per slot ([`crate::slots`]):
+    /// required of a daemon that runs as root, refused otherwise and off macOS.
     pub pool: Option<Pool>,
 }
 
