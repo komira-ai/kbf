@@ -69,7 +69,7 @@ impl Slots {
         Ok(Self {
             ready: Arc::new(ready),
             free: Arc::new(Mutex::new((0..count).collect())),
-            permits: Arc::new(Semaphore::new(count)),
+            permits: Arc::new(Semaphore::new(count + 1)),
             program,
         })
     }
