@@ -184,7 +184,6 @@ pub fn bootout(uid: u32, within: Duration) {
 /// A round could not run, or processes of the uid were alive at the deadline.
 pub fn end(uid: u32, within: Duration) -> Result<(), EndError> {
     let give_up = Instant::now() + within;
-    bootout(uid, within.min(BOOTOUT_WITHIN));
     kill_until(uid, within, give_up)
 }
 
