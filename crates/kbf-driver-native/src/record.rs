@@ -215,6 +215,27 @@ struct Gated {
     exec: Exec,
 }
 
+/// Which keeper a spawn starts for its action ([`crate::keeper`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeeperFor {
+    /// A member of the action's process group, which it kills.
+    Group,
+    /// A keeper of its own that ends every process of the uid the action runs as.
+    #[cfg(target_os = "macos")]
+    Uid(u32),
+}
+
+impl KeeperFor {
+    /// Starts it, for the action whose leader (and group) is `pid`.
+    fn start(self, pid: i32) -> io::Result<Keeper> {
+        match self {
+            Self::Group => Keeper::join(pid),
+            #[cfg(target_os = "macos")]
+            Self::Uid(uid) => Keeper::for_uid(uid),
+        }
+    }
+}
+
 /// A spawned action: its leader, the leader's pid (the group id) and its keeper.
 #[derive(Debug)]
 pub struct Spawned {
@@ -252,13 +273,18 @@ impl Gate {
     }
 
     /// Spawns `command` once, writing `record` (the run's record file) and starting
-    /// the keeper after the fork and before the program runs.
+    /// the keeper `keeper` names after the fork and before the program runs.
     ///
     /// # Errors
     /// The spawn failed, or the record could not be written or the keeper started
     /// (then the program never ran). The record is removed on every error.
-    pub fn spawn(&self, command: &mut Command, record: &Path) -> io::Result<Spawned> {
-        let spawned = self.attempt(command, record);
+    pub fn spawn(
+        &self,
+        command: &mut Command,
+        record: &Path,
+        keeper: KeeperFor,
+    ) -> io::Result<Spawned> {
+        let spawned = self.attempt(command, record, keeper);
         // The attempt's descriptors are closed now: a spawn that bypasses the gate fails.
         let c = &self.child;
         for fd in [&c.pid, &c.go, &c.go_parent] {
@@ -270,7 +296,12 @@ impl Gate {
         spawned
     }
 
-    fn attempt(&self, command: &mut Command, record: &Path) -> io::Result<Spawned> {
+    fn attempt(
+        &self,
+        command: &mut Command,
+        record: &Path,
+        keeper: KeeperFor,
+    ) -> io::Result<Spawned> {
         let (pid_read, pid_write) = io::pipe()?;
         let (go_read, go_write) = io::pipe()?;
         let c = &self.child;
@@ -278,7 +309,7 @@ impl Gate {
         c.go.store(go_read.as_raw_fd(), Ordering::SeqCst);
         c.go_parent.store(go_write.as_raw_fd(), Ordering::SeqCst);
         std::thread::scope(|scope| {
-            let recorder = scope.spawn(|| write_record(pid_read, go_write, record));
+            let recorder = scope.spawn(|| write_record(pid_read, go_write, record, keeper));
             let child = command.spawn();
             // The child has its own copies now. Closing these lets the recorder see
             // end-of-file when there was no fork.
@@ -321,7 +352,7 @@ fn recorder_panicked(_: Box<dyn std::any::Any + Send>) -> io::Error {
 }
 
 /// The parent's half: reads the child's pid, writes its record and starts its keeper
-/// in its group, then sends the child the go byte, 1 if both were done and 0 if not. A
+/// (`keeper`), then sends the child the go byte, 1 if both were done and 0 if not. A
 /// refusal is sent, not left to end-of-file: a sibling forked meanwhile can hold the
 /// pipe open until it execs, and two siblings refused at once would each wait on the
 /// other. Returns the pid the record names, and the keeper.
@@ -329,8 +360,9 @@ fn write_record(
     pid_read: io::PipeReader,
     mut go_write: io::PipeWriter,
     record: &Path,
+    keeper: KeeperFor,
 ) -> io::Result<(i32, Keeper)> {
-    let kept = record_child(pid_read, record).and_then(|pid| Ok((pid, Keeper::join(pid)?)));
+    let kept = record_child(pid_read, record).and_then(|pid| Ok((pid, keeper.start(pid)?)));
     let sent = go_write.write_all(&[u8::from(kept.is_ok())]);
     sent.and(kept)
 }
@@ -586,7 +618,9 @@ mod tests {
             [("A", "first"), ("B", "b"), ("A", "a")].map(|(n, v)| (OsStr::new(n), OsStr::new(v)));
         let gate = Gate::install(&mut command, Exec::new(program, args, env).expect("exec"));
         for _ in 0..2 {
-            let Spawned { child, pid, keeper } = gate.spawn(&mut command, &record).expect("spawn");
+            let Spawned { child, pid, keeper } = gate
+                .spawn(&mut command, &record, KeeperFor::Group)
+                .expect("spawn");
             let start = procs::process(pid).expect("the child").start;
             let keeper_pid = i32::try_from(keeper.pid()).expect("pid");
             // SAFETY: getpgid takes a plain integer.
@@ -632,7 +666,7 @@ mod tests {
             mut keeper,
             ..
         } = gate
-            .spawn(&mut command, &dir.join("lease-1-1"))
+            .spawn(&mut command, &dir.join("lease-1-1"), KeeperFor::Group)
             .expect("spawn");
         keeper.orphan();
         let waited = tokio::time::timeout(std::time::Duration::from_secs(10), child.wait()).await;
@@ -655,7 +689,7 @@ mod tests {
         let (mut command, gate) = gated(Path::new("/usr/bin/touch"), &[&marker]);
         let unwritable = dir.join("absent").join("lease-1-1");
         let error = gate
-            .spawn(&mut command, &unwritable)
+            .spawn(&mut command, &unwritable, KeeperFor::Group)
             .expect_err("no record");
         // The recorder's own error, not the child's "canceled".
         assert_eq!(error.kind(), io::ErrorKind::NotFound, "{error}");
@@ -666,7 +700,9 @@ mod tests {
         std::fs::write(&victim, "precious\n").expect("write");
         let planted = dir.join("lease-1-9");
         std::os::unix::fs::symlink(&victim, &planted).expect("symlink");
-        let error = gate.spawn(&mut command, &planted).expect_err("planted");
+        let error = gate
+            .spawn(&mut command, &planted, KeeperFor::Group)
+            .expect_err("planted");
         assert_eq!(error.kind(), io::ErrorKind::AlreadyExists, "{error}");
         assert_eq!(
             std::fs::read_to_string(&victim).expect("read"),
@@ -676,7 +712,9 @@ mod tests {
 
         let record = dir.join("lease-1-2");
         let (mut missing, gate) = gated(&dir.join("no-such-program"), &[]);
-        let error = gate.spawn(&mut missing, &record).expect_err("no program");
+        let error = gate
+            .spawn(&mut missing, &record, KeeperFor::Group)
+            .expect_err("no program");
         assert_eq!(error.kind(), io::ErrorKind::NotFound, "{error}");
         assert!(!record.exists(), "a failed spawn's record is removed");
 
@@ -686,7 +724,7 @@ mod tests {
             .expect("chmod");
         let (mut command, gate) = gated(&script, &[]);
         let error = gate
-            .spawn(&mut command, &record)
+            .spawn(&mut command, &record, KeeperFor::Group)
             .expect_err("no executable");
         assert_eq!(error.raw_os_error(), Some(libc::ENOEXEC), "{error}");
         assert!(!marker.exists(), "run through /bin/sh");
@@ -704,7 +742,8 @@ mod tests {
         // SAFETY: getppid takes nothing and cannot fail.
         let parent = unsafe { libc::getppid() };
         pid_write.write_all(&parent.to_ne_bytes()).expect("pid");
-        let error = write_record(pid_read, go_write, &record).expect_err("not a child");
+        let error =
+            write_record(pid_read, go_write, &record, KeeperFor::Group).expect_err("not a child");
         let says = format!("make the child {parent} lead a process group: ");
         assert!(error.to_string().starts_with(&says), "{error}");
         assert!(!record.exists());
@@ -726,7 +765,8 @@ mod tests {
         pid_write
             .write_all(&2_000_000_001_i32.to_ne_bytes())
             .expect("pid");
-        let error = write_record(pid_read, go_write, &record).expect_err("no such child");
+        let error =
+            write_record(pid_read, go_write, &record, KeeperFor::Group).expect_err("no such child");
         assert!(error.to_string().contains("2000000001"), "{error}");
         assert!(!record.exists());
         let mut go = Vec::new();

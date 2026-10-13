@@ -45,6 +45,7 @@ use kbf_daemon::{
     Args, Capacity, DAEMON_VERSION, Daemon, DaemonConfig, DriverWatch, FakeRuntime, NodeReport,
     Runtime, Runtimes,
 };
+use kbf_driver_native::slots::Pool;
 use kbf_driver_native::{MemoryPolicy, NativeConfig, NativeRuntime, xcode, xcode_watch};
 use kbf_outputs::OutputLimits;
 use kbf_transfer::Transfers;
@@ -184,6 +185,16 @@ struct Cli {
     /// whole-machine lease's user writes in its lease directory (native-whole-machine).
     #[arg(long, default_value = "_kbf")]
     daemon_user: String,
+    /// How many lease users the pool has (native, macOS, a daemon run as root): every
+    /// action runs as one of `kbf-pool-0` .. `kbf-pool-<N-1>`, one lease per user at a
+    /// time, as kbf-mac-provision makes them (`pool_users`). Required of a root daemon,
+    /// which runs no action as root; refused for any other.
+    #[arg(long, requires = "pool_first_uid", value_parser = clap::value_parser!(u32).range(1..=64))]
+    pool_users: Option<u32>,
+    /// The uid of `kbf-pool-0`, and the group id of all the pool users (`pool_first_uid`
+    /// in kbf-mac-provision's profile); at least 600.
+    #[arg(long, requires = "pool_users")]
+    pool_first_uid: Option<u32>,
 }
 
 /// The drivers this binary can run leases through.
@@ -231,6 +242,12 @@ fn main() -> ExitCode {
     // Each run's keeper (`kbf-keeper __keeper ...`) is this binary, dispatched before
     // the flags are parsed, so a keeper never reads the daemon's command line.
     if let Some(code) = kbf_daemon::keeper::dispatch() {
+        return code;
+    }
+    // So is the `as-user` step an action of the lease-user pool starts through
+    // (`launchctl asuser <uid> kbf-daemon __as-user ...`).
+    #[cfg(target_os = "macos")]
+    if let Some(code) = kbf_driver_native::slots::dispatch() {
         return code;
     }
     // So is the container driver's `__chown-dirs` helper, which it runs inside Podman's
@@ -477,6 +494,9 @@ fn native_config(cli: &Cli) -> Result<NativeConfig, Error> {
         headroom_bytes: cli.memory_headroom_mib.saturating_mul(1 << 20),
     };
     config.poll = Duration::from_millis(cli.memory_poll_ms.max(1));
+    config.pool = (cli.pool_users.zip(cli.pool_first_uid))
+        .map(|(count, first)| Pool::provisioned(count, first))
+        .transpose()?;
     Ok(config)
 }
 
@@ -713,6 +733,31 @@ mod tests {
         assert!(native_config(&relative).is_err());
         let missing = parse(&["--driver=native"]).expect("flags");
         assert!(native_config(&missing).is_err());
+        assert_eq!(native_config(&defaults).expect("config").pool, None);
+    }
+
+    /// Catches pool flags that do not reach the driver (a root daemon would refuse to
+    /// start, or run every action as one user), a pool of other users than
+    /// kbf-mac-provision makes, one flag without the other taken, and a pool at root's
+    /// uid accepted.
+    #[test]
+    fn the_pool_flags_reach_the_configuration() {
+        let pooled = |extra: &[&str]| {
+            let flags = [&["--driver=native", "--scratch=/s"][..], extra].concat();
+            parse(&flags)
+        };
+        let cli = pooled(&["--pool-users=2", "--pool-first-uid=700"]).expect("flags");
+        let pool = native_config(&cli).expect("config").pool.expect("a pool");
+        assert_eq!(Some(pool), Pool::provisioned(2, 700).ok());
+        for one in ["--pool-users=2", "--pool-first-uid=700"] {
+            assert!(pooled(&[one]).is_err(), "{one} alone");
+        }
+        for count in ["0", "65"] {
+            assert!(pooled(&[&format!("--pool-users={count}"), "--pool-first-uid=700"]).is_err());
+        }
+        let root = pooled(&["--pool-users=1", "--pool-first-uid=0"]).expect("flags");
+        let refused = native_config(&root).expect_err("a pool at uid 0");
+        assert!(refused.to_string().contains("root"), "{refused}");
     }
 
     /// Catches a `--container-*` flag that does not reach the driver's limits, and a

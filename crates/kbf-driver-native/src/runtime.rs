@@ -27,8 +27,9 @@ use crate::config::NativeConfig;
 use crate::network::{self, Network, network_of};
 use crate::procs::{self, Proc, Tracker};
 use crate::program::{Refused, Resolved, resolve};
-use crate::record::{Exec, Spawned};
+use crate::record::{Exec, KeeperFor, Spawned};
 use crate::simulator::{self, Made, Simctl};
+use crate::slots::Runner;
 use crate::user_folders::UserFolders;
 use crate::xcode;
 
@@ -73,6 +74,9 @@ pub struct NativeRuntime<C> {
     warm_up: Mutex<Option<WarmUp>>,
     /// How the simulators of the leases that ask for one are made and deleted.
     simctl: Arc<Simctl>,
+    /// The slots of a root daemon's lease-user pool, one lease each.
+    #[cfg(target_os = "macos")]
+    slots: Option<crate::slots::macos::Slots>,
 }
 
 /// Everything `prepare` works out for `execute` and `finish`.
@@ -124,6 +128,15 @@ impl<C: Cas> NativeRuntime<C> {
         cas: Arc<C>,
         remove: &dyn Fn(&Path) -> std::io::Result<()>,
     ) -> std::io::Result<Self> {
+        let root = rustix::process::geteuid().is_root();
+        crate::slots::check_daemon_user(root, config.pool.as_ref())
+            .map_err(std::io::Error::other)?;
+        // Before the sweep: the keepers of a killed daemon's slots have ended them, and
+        // this ends what is left, as every lease's end does.
+        #[cfg(target_os = "macos")]
+        let slots = (config.pool.as_ref())
+            .map(|pool| crate::slots::macos::Slots::start(pool, config.kill_wait))
+            .transpose()?;
         std::fs::create_dir_all(&config.scratch)?;
         let rules = config
             .user_folders
@@ -167,6 +180,8 @@ impl<C: Cas> NativeRuntime<C> {
             stops: Mutex::new(BTreeMap::new()),
             rules,
             warm_up: Mutex::new(None),
+            #[cfg(target_os = "macos")]
+            slots,
         };
         sweep_user_folders(&runtime.config);
         Ok(runtime)
@@ -206,14 +221,22 @@ impl<C: Cas> NativeRuntime<C> {
         sandbox(&self.config, &self.rules, dir)
     }
 
-    /// The node report entries this driver adds: how it keeps the network off, and
-    /// one `xcode` entry per Xcode build it can select.
+    /// The node report entries this driver adds: how it keeps the network off, one
+    /// `xcode` entry per Xcode build it can select, and with a lease-user pool how many
+    /// actions run at once ([`crate::slots::CAPABILITY`]).
     #[must_use]
     pub fn capabilities(&self) -> Vec<(String, String)> {
         let mut entries = vec![(
             network::CAPABILITY.to_owned(),
             self.config.isolation.name().to_owned(),
         )];
+        #[cfg(target_os = "macos")]
+        if let Some(slots) = &self.slots {
+            entries.push((
+                crate::slots::CAPABILITY.to_owned(),
+                slots.count().to_string(),
+            ));
+        }
         entries.extend(
             self.xcodes()
                 .keys()
@@ -371,12 +394,14 @@ impl<C: Cas> NativeRuntime<C> {
     /// Runs the prepared action until it exits, times out, outgrows its memory limit
     /// or is killed, then ends every process of it. The exit code of an action that
     /// exited.
+    #[allow(clippy::too_many_arguments)]
     async fn execute(
         &self,
         cas: &C::Lease,
         work: &Work,
         dir: &Path,
         prepared: &Prepared,
+        runner: &Runner,
         stop: &mut oneshot::Receiver<Stop>,
         killer: &mut Option<Stop>,
     ) -> Result<i32, RuntimeError> {
@@ -384,13 +409,12 @@ impl<C: Cas> NativeRuntime<C> {
         let stderr_path = dir.join("stderr");
         let stdout = std::fs::File::create(&stdout_path).map_err(failed(&stdout_path))?;
         let stderr = std::fs::File::create(&stderr_path).map_err(failed(&stderr_path))?;
-        let (program, args) = self.config.isolation.wrap(
-            prepared.network,
-            &prepared.lease,
-            &self.rules,
+        let (program, args) = runner.wrap(
+            &self.config.isolation,
+            (prepared.network, &prepared.lease, &self.rules),
             prepared.program.clone(),
             &prepared.args,
-        );
+        )?;
         // The arguments and the whole environment, the lease's own directories first
         // and the Command's variables winning over them; the child execs these itself.
         let env = (prepared.lease_env.iter())
@@ -423,11 +447,15 @@ impl<C: Cas> NativeRuntime<C> {
             // Held until the group has ended (the group's kill ends it too), and
             // dropped after the group: it ends the group if the daemon dies.
             keeper: _keeper,
-        } = spawn(&mut command, exec, &record)
+        } = spawn(&mut command, exec, &record, runner.keeper())
             .await
             .map_err(failed(&prepared.program))?;
         let me = i32::try_from(std::process::id()).unwrap_or(i32::MAX);
-        let mut group = Group::new(Tracker::new(leader, me), record);
+        let mut watch = match runner {
+            Runner::Daemon => Watch::Tree(Group::new(Tracker::new(leader, me), record)),
+            #[cfg(target_os = "macos")]
+            Runner::Slot(slot) => Watch::Uid(slot.watch(record)),
+        };
         let limit = self.config.memory.limit(work.resources.memory_bytes);
         let deadline = Instant::now() + prepared.timeout;
         let mut tick = tokio::time::interval(self.config.poll);
@@ -442,14 +470,14 @@ impl<C: Cas> NativeRuntime<C> {
                     break Ended::Killed;
                 }
                 _ = tick.tick() => {
-                    let used = group.measure().await?;
+                    let used = watch.measure().await?;
                     if let Some(limit) = limit && used > limit {
                         break Ended::OutOfMemory { used, limit };
                     }
                 }
             }
         };
-        group.end(&mut child, self.config.kill_wait).await?;
+        watch.end(&mut child, self.config.kill_wait).await?;
         match ended {
             Ended::Exited(status) => Ok(exit_code(status.map_err(failed(&program))?)),
             Ended::TimedOut => Err(self.timed_out(cas, work.lease_id, dir).await),
@@ -485,6 +513,7 @@ impl<C: Cas> NativeRuntime<C> {
         work: &Work,
         dir: &Path,
         made: &Mutex<Option<Made>>,
+        runner: &mut Runner,
         stop: &mut oneshot::Receiver<Stop>,
         killer: &mut Option<Stop>,
     ) -> Result<ActionResult, RuntimeError> {
@@ -495,6 +524,17 @@ impl<C: Cas> NativeRuntime<C> {
         };
         // The lease's own view of the CAS, for its transfer counters.
         let cas = self.cas.lease(&work.lease_id);
+        // A lease of a root daemon waits for a free slot of the pool, killable.
+        #[cfg(target_os = "macos")]
+        if let Some(slots) = &self.slots {
+            *runner = tokio::select! {
+                slot = slots.take() => Runner::Slot(slot?),
+                Ok(by) = &mut *stop => {
+                    *killer = Some(by);
+                    return Err(RuntimeError::Killed);
+                }
+            };
+        }
         // A kill during prepare (a long input fetch) stops it at once; the clean
         // removes whatever was written.
         let mut prepared = tokio::select! {
@@ -504,6 +544,8 @@ impl<C: Cas> NativeRuntime<C> {
                 return Err(RuntimeError::Killed);
             }
         };
+        runner.hand_over(dir).await?;
+        runner.allows_simulator(prepared.simulator.is_some())?;
         // Not stopped by a kill: a `simctl create` cut short could still make its
         // device after the end looked for the lease's devices.
         if prepared.refused.is_none() {
@@ -517,10 +559,7 @@ impl<C: Cas> NativeRuntime<C> {
         clock.execution_start_timestamp = now();
         let exit_code = match &prepared.refused {
             Some(refused) => refuse(dir, refused).await?,
-            None => {
-                self.execute(&cas, work, dir, &prepared, stop, killer)
-                    .await?
-            }
+            None => (self.execute(&cas, work, dir, &prepared, runner, stop, killer)).await?,
         };
         clock.execution_completed_timestamp = now();
 
@@ -575,9 +614,18 @@ impl<C: Cas> Runtime for NativeRuntime<C> {
             armed: true,
         };
         let mut killer = None;
-        let outcome =
-            (self.attempt(&work, &dir.path, &dir.simulator, &mut stop, &mut killer)).await;
+        let mut runner = Runner::Daemon;
+        let outcome = (self.attempt(
+            &work,
+            &dir.path,
+            &dir.simulator,
+            &mut runner,
+            &mut stop,
+            &mut killer,
+        ))
+        .await;
         let cleaned = dir.clean().await;
+        runner.release();
         sweep_user_folders_after_lease(&self.config).await;
         // A kill that arrived after the work ended still waits for the clean.
         if let Some(by) = killer.or_else(|| stop.try_recv().ok()) {
@@ -720,6 +768,32 @@ enum Ended {
     OutOfMemory { used: u64, limit: u64 },
 }
 
+/// What follows a running action's processes: its process tree ([`Group`]), or every
+/// process of the slot user it runs as.
+enum Watch {
+    Tree(Group),
+    #[cfg(target_os = "macos")]
+    Uid(crate::slots::macos::UidWatch),
+}
+
+impl Watch {
+    async fn measure(&self) -> Result<u64, RuntimeError> {
+        match self {
+            Self::Tree(group) => group.measure().await,
+            #[cfg(target_os = "macos")]
+            Self::Uid(uid) => uid.measure().await,
+        }
+    }
+
+    async fn end(&mut self, child: &mut Child, wait: Duration) -> Result<(), RuntimeError> {
+        match self {
+            Self::Tree(group) => group.end(child, wait).await,
+            #[cfg(target_os = "macos")]
+            Self::Uid(uid) => uid.end(child, wait).await,
+        }
+    }
+}
+
 /// The name of a lease's directory, and of its run record.
 fn lease_name(id: LeaseId) -> String {
     format!("lease-{}-{}", id.term, id.seq)
@@ -853,11 +927,12 @@ async fn spawn(
     command: &mut tokio::process::Command,
     exec: Exec,
     record: &Path,
+    keeper: KeeperFor,
 ) -> std::io::Result<Spawned> {
     let gate = crate::record::Gate::install(command, exec);
     let give_up = Instant::now() + BUSY_WAIT;
     loop {
-        match gate.spawn(command, record) {
+        match gate.spawn(command, record, keeper) {
             Err(e) if e.raw_os_error() == Some(libc::ETXTBSY) && Instant::now() < give_up => {
                 tokio::time::sleep(Duration::from_millis(2)).await;
             }
@@ -1071,6 +1146,7 @@ mod tests {
     }
 
     /// A CAS no test here reaches.
+    #[derive(Debug)]
     struct NoCas;
 
     impl Cas for NoCas {
@@ -1117,6 +1193,32 @@ mod tests {
             .count();
         assert_eq!(aside, 1);
         kbf_outputs::remove_tree(&scratch).expect("clean");
+    }
+
+    /// Catches a pool taken by a daemon that cannot run it (not root, or off macOS),
+    /// which would start actions as its own user believing them each a slot's: the
+    /// runtime does not start, and makes no scratch root first.
+    #[test]
+    fn a_pool_is_refused_unless_the_daemon_is_root_on_macos() {
+        assert!(
+            !rustix::process::geteuid().is_root(),
+            "run this test as a user"
+        );
+        let scratch = std::env::current_exe()
+            .expect("test binary")
+            .parent()
+            .expect("deps")
+            .join("kbf-driver-native-unit")
+            .join(format!("pool-{}", std::process::id()));
+        let mut config = NativeConfig::new(scratch.clone());
+        config.pool = crate::slots::Pool::provisioned(1, 700).ok();
+        let refused = NativeRuntime::new(config, Arc::new(NoCas)).expect_err("started");
+        #[cfg(target_os = "macos")]
+        let want = "needs a daemon running as root";
+        #[cfg(not(target_os = "macos"))]
+        let want = "macOS only";
+        assert!(refused.to_string().contains(want), "{refused}");
+        assert!(!scratch.exists(), "a scratch root made before the refusal");
     }
 
     /// Catches (issue #164): a survey that leaves the runtime selecting the Xcodes of
@@ -1482,7 +1584,7 @@ mod tests {
         let exec = || Exec::new(&program, [], []).expect("exec");
         let record = dir.join(format!("busy-record-{}", std::process::id()));
         let started = Instant::now();
-        let Spawned { child, pid, .. } = spawn(&mut command(), exec(), &record)
+        let Spawned { child, pid, .. } = spawn(&mut command(), exec(), &record, KeeperFor::Group)
             .await
             .expect("spawned once closed");
         assert!(started.elapsed() >= Duration::from_millis(50), "it waited");
@@ -1502,7 +1604,7 @@ mod tests {
             .write(true)
             .open(&program)
             .expect("open");
-        let busy = spawn(&mut command(), exec(), &record)
+        let busy = spawn(&mut command(), exec(), &record, KeeperFor::Group)
             .await
             .expect_err("still busy");
         assert_eq!(busy.raw_os_error(), Some(libc::ETXTBSY));
@@ -1510,7 +1612,7 @@ mod tests {
         // Any other failure is not retried: a file that is no program at all.
         std::fs::write(&program, [0x7f, b'E', b'L', b'F', 0, 0]).expect("write");
         let started = Instant::now();
-        let error = spawn(&mut command(), exec(), &record)
+        let error = spawn(&mut command(), exec(), &record, KeeperFor::Group)
             .await
             .expect_err("not a program");
         assert_ne!(error.raw_os_error(), Some(libc::ETXTBSY));

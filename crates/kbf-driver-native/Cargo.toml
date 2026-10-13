@@ -20,6 +20,7 @@ prost-types.workspace = true
 rustix = { workspace = true, features = ["fs", "process"] }
 # `simctl list devices -j`, read to find a lease's simulators (src/simulator.rs).
 serde_json.workspace = true
+thiserror.workspace = true
 tokio = { workspace = true, features = ["fs", "macros", "process", "rt", "sync", "time"] }
 tracing.workspace = true
 
