@@ -572,7 +572,9 @@ runtime reports usage; the container driver does not yet.
   digest, with layers verified; a node never pulls from a public registry at action
   time.
 - **Prefetch and a local cache:** inputs fetched as soon as a lease is offered, and a hot
-  set of toolchains and images kept on the node and reported to placement.
+  set of toolchains and images kept on the node and reported to placement. The cache
+  (a per-node NVMe file cache linked or cloned into each lease) and the shared blob
+  transfer engine it fills through are designed in [worker-cache.md](worker-cache.md).
 - **Networked actions,** which get egress, are never cached and always self-fence.
 - **Service containers** for tests that need several containers, declared up front so
   the result stays cacheable.

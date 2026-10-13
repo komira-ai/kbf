@@ -15,6 +15,7 @@ The design documents under [docs/design](docs/design) go deeper:
 | [metadata-snapshots.md](docs/design/metadata-snapshots.md) | the snapshot encoding of the metadata state, compaction of the single-voter log, starting from a snapshot, version refusal, size and pause at today's scale and 10x, and how the HA design inherits it (**planned**) |
 | [worker-protocol.md](docs/design/worker-protocol.md) | `kbf.worker.v1`: messages and the rules both sides keep |
 | [daemon.md](docs/design/daemon.md) | `kbf-daemon`, the container driver, output collection, limits |
+| [worker-cache.md](docs/design/worker-cache.md) | the daemon's blob traffic: one shared transfer engine (a connection pool, one in-flight limit, batching, FindMissing before upload), a per-node NVMe input cache linked or cloned into each lease, per-driver safety, eviction, metrics, rollout and tests (**planned**) |
 | [capabilities.md](docs/design/capabilities.md) | node reports, ISA levels, matching an action to a node |
 | [mac-node-provisioning.md](docs/design/mac-node-provisioning.md) | a Mac as a worker: baseline, provisioning, the signed daemon artifact, headless settings, updates, join and leave (**planned**) |
 | [macos-vms.md](docs/design/macos-vms.md) | what runs on bare metal on a Mac and what in a macOS VM, VM sizing and scheduling, the VM driver, GPU tests (**planned**) |
