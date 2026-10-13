@@ -2,6 +2,8 @@
 //! enough to detect the node and start the session loop, and a clean exit on SIGTERM;
 //! and, against a fake front ([`front`]), what a restarted daemon ends before `Hello`.
 
+#[path = "binary/cache.rs"]
+mod cache;
 mod front;
 
 use std::io::{BufRead, BufReader, Write as _};
@@ -230,6 +232,26 @@ fn runs_until_sigterm_with_path(
     extra: &[String],
     path: Option<&Path>,
 ) -> std::process::ExitStatus {
+    runs_until_sigterm_logged(name, extra, path).0
+}
+
+/// [`runs_until_sigterm_with_path`], also returning every line the daemon logged.
+fn runs_until_sigterm_logged(
+    name: &str,
+    extra: &[String],
+    path: Option<&Path>,
+) -> (std::process::ExitStatus, Vec<String>) {
+    runs_until_sigterm_logged_then(name, extra, path, || {})
+}
+
+/// [`runs_until_sigterm_logged`], running `before_sigterm` once the daemon tried its
+/// first session and before it is sent SIGTERM.
+fn runs_until_sigterm_logged_then(
+    name: &str,
+    extra: &[String],
+    path: Option<&Path>,
+    before_sigterm: impl FnOnce(),
+) -> (std::process::ExitStatus, Vec<String>) {
     let dir = tls(name);
     let started = Instant::now();
     let mut command = Command::new(BIN);
@@ -275,6 +297,7 @@ fn runs_until_sigterm_with_path(
         log.push(line);
     }
     log_start(name, "tried its first session", tried, &log);
+    before_sigterm();
     let pid = i32::try_from(child.id()).expect("pid");
     // SAFETY: kill(2) on the child this test spawned and has not reaped.
     assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
@@ -298,7 +321,8 @@ fn runs_until_sigterm_with_path(
         ended.contains("connect: transport error: ") && ended.contains("refused"),
         "no cause: {ended}"
     );
-    status
+    let all = all.into_iter().cloned().collect();
+    (status, all)
 }
 
 /// Catches: a driver that cannot be brought up from the command line (a missing

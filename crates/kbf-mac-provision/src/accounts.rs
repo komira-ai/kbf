@@ -1,11 +1,12 @@
-//! The accounts: the one administrator, the daemon's role account, and auto-login.
+//! The accounts: the one administrator, the daemon's role account, and auto-login;
+//! and the directory reads the lease-user pool ([`crate::pool`]) shares.
 
 use std::io;
 
 use crate::items::{Ctx, DEFAULTS, Lines, Outcome, defaults_read, fail, or, pass, run};
 
-const DSCL: &str = "/usr/bin/dscl";
-const DSEDITGROUP: &str = "/usr/sbin/dseditgroup";
+pub(crate) const DSCL: &str = "/usr/bin/dscl";
+pub(crate) const DSEDITGROUP: &str = "/usr/sbin/dseditgroup";
 const LOGINWINDOW: &str = "/Library/Preferences/com.apple.loginwindow";
 const KCPASSWORD: &str = "/etc/kcpassword";
 /// kbf-mac-session's intent record: the lease whose user the session switch logs in.
@@ -14,7 +15,7 @@ const SESSION_INTENT: &str = "/var/db/kbf-mac-session/session-intent";
 /// The first word of attribute `attr` of directory record `record`, or empty. dscl
 /// prints an attribute outside its standard set with a prefix:
 /// `dsAttrTypeNative:IsHidden: 1`.
-fn dscl_attr(c: &Ctx<'_>, record: &str, attr: &str) -> String {
+pub(crate) fn dscl_attr(c: &Ctx<'_>, record: &str, attr: &str) -> String {
     let plain = format!("{attr}:");
     let native = format!("dsAttrTypeNative:{attr}:");
     c.mac
@@ -28,11 +29,37 @@ fn dscl_attr(c: &Ctx<'_>, record: &str, attr: &str) -> String {
         .unwrap_or_default()
 }
 
-/// Whether `dseditgroup` counts `user` as a member of `admin`: listed, by primary group
-/// 80, or through a nested group.
-fn is_admin(c: &Ctx<'_>, user: &str) -> bool {
+/// Whether `dseditgroup` counts `user` as a member of `group`: listed, by primary
+/// group (80 for `admin`), or through a nested group.
+pub(crate) fn is_member(c: &Ctx<'_>, user: &str, group: &str) -> bool {
     c.mac
-        .succeeds(DSEDITGROUP, &["-o", "checkmember", "-m", user, "admin"])
+        .succeeds(DSEDITGROUP, &["-o", "checkmember", "-m", user, group])
+}
+
+fn is_admin(c: &Ctx<'_>, user: &str) -> bool {
+    is_member(c, user, "admin")
+}
+
+/// Whether record `record` has an `AuthenticationAuthority` (a password hash). dscl
+/// may print its value on a line of its own: this tests the attribute's name.
+pub(crate) fn has_authority(c: &Ctx<'_>, record: &str) -> bool {
+    c.mac
+        .out(DSCL, &[".", "-read", record, "AuthenticationAuthority"])
+        .lines()
+        .any(|l| l.starts_with("AuthenticationAuthority:"))
+}
+
+/// The record in `dir` other than `me` whose `attr` is `id`.
+pub(crate) fn holder(c: &Ctx<'_>, dir: &str, attr: &str, id: u64, me: &str) -> Option<String> {
+    c.mac
+        .out(DSCL, &[".", "-list", dir, attr])
+        .lines()
+        .find_map(|line| {
+            let mut words = line.split_whitespace();
+            let name = words.next().unwrap_or_default();
+            let value = words.next().unwrap_or_default();
+            (value.parse::<u64>() == Ok(id) && name != me).then(|| name.to_owned())
+        })
 }
 
 /// `admin_user` exists, is an administrator, and it and `root` are the only ones: the
@@ -86,16 +113,7 @@ fn role_id_taken(c: &Ctx<'_>) -> Option<String> {
     ]
     .into_iter()
     .find_map(|(kind, dir, attr)| {
-        c.mac
-            .out(DSCL, &[".", "-list", dir, attr])
-            .lines()
-            .find_map(|line| {
-                let mut words = line.split_whitespace();
-                let name = words.next().unwrap_or_default();
-                let value = words.next().unwrap_or_default();
-                (value.parse::<u64>() == Ok(id) && name != me)
-                    .then(|| format!("{kind} {id} belongs to {name}"))
-            })
+        holder(c, dir, attr, id, me).map(|name| format!("{kind} {id} belongs to {name}"))
     })
 }
 
@@ -120,12 +138,7 @@ pub(crate) fn role_user(c: &Ctx<'_>) -> Outcome {
     .iter()
     .map(|a| format!("{a}={}", dscl_attr(c, &record, a)))
     .collect();
-    // dscl may print this value on a line of its own: test the attribute's name.
-    let authority = c
-        .mac
-        .out(DSCL, &[".", "-read", &record, "AuthenticationAuthority"])
-        .lines()
-        .any(|l| l.starts_with("AuthenticationAuthority:"));
+    let authority = has_authority(c, &record);
     have.push(format!(
         "AuthenticationAuthority={}",
         if authority { "present" } else { "absent" }

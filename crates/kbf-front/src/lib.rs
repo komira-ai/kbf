@@ -65,7 +65,7 @@ use tonic::service::Routes;
 
 pub use crate::action_cache::ActionCacheService;
 pub use crate::bytestream::ByteStreamService;
-pub use crate::cache::{Cache, CacheError, VerifiedBlob};
+pub use crate::cache::{BATCH_READS_IN_FLIGHT, Cache, CacheError, VerifiedBlob};
 pub use crate::capabilities::{CapabilitiesService, server_capabilities};
 pub use crate::cas::CasService;
 pub use crate::execution::{

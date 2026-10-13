@@ -63,8 +63,9 @@ This design builds on the code on `main`, read at the time of writing.
   SIGTERM it abandons running leases (their processes are killed and their directories
   removed) and exits zero.
 - **The native driver** (`kbf-driver-native`) runs each action as a process tree in a
-  fresh lease directory. It keeps the network off with `sandbox-exec` unless the action
-  asks for it, and denies job submission to launchd and Launch Services opens. It
+  fresh lease directory. It gives the action the network unless the action turns it off
+  (`network=off`, enforced with `sandbox-exec`), and denies job submission to launchd
+  and Launch Services opens. It
   watches memory over the whole tree, clears the `uchg`/`uappnd` flags an action set
   before removing its directory, and sweeps directories a crashed daemon left. **Actions
   run as the daemon's user.** The crate documentation lists what that leaves open: an

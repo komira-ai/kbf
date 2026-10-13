@@ -9,18 +9,19 @@ use std::time::Duration;
 use futures::future::Either;
 use kbf_auth::{AuthenticateLayer, Policy};
 use kbf_front::{
-    ByteStreamService, Cache, MAX_MESSAGE_BYTES, MetaLog, RECORDER_CHANNEL, Recorder,
+    ByteStreamService, Cache, CasService, MAX_MESSAGE_BYTES, MetaLog, RECORDER_CHANNEL, Recorder,
     RequestMetadataLayer,
 };
 use kbf_objstore::ObjectStore;
 use kbf_proto::google::bytestream::byte_stream_server::ByteStreamServer;
 use kbf_proto::grpc::health::v1::health_server::HealthServer;
+use kbf_proto::reapi::content_addressable_storage_server::ContentAddressableStorageServer;
 use kbf_proto::worker::worker_server::WorkerServer;
 use tonic::service::Routes;
 use tonic::transport::server::TcpIncoming;
 use tonic::transport::{Server, ServerTlsConfig};
 
-use crate::blobs::WorkerBlobs;
+use crate::blobs::{WorkerBlobs, WorkerCas};
 use crate::farm::Farm;
 use crate::grpc_health::{HealthService, WATCH_INTERVAL};
 use crate::health::Readiness;
@@ -309,6 +310,12 @@ where
     ))
     .max_decoding_message_size(MAX_MESSAGE_BYTES)
     .max_encoding_message_size(MAX_MESSAGE_BYTES);
+    let worker_cas = ContentAddressableStorageServer::new(WorkerCas::new(
+        CasService::new(Arc::clone(&cache)),
+        peers.clone(),
+    ))
+    .max_decoding_message_size(MAX_MESSAGE_BYTES)
+    .max_encoding_message_size(MAX_MESSAGE_BYTES);
     let worker_service = WorkerServer::new(WorkerService::new(
         Arc::clone(&farm),
         peers,
@@ -357,6 +364,7 @@ where
         let worker_serve = worker_server
             .add_service(worker_service)
             .add_service(worker_blobs)
+            .add_service(worker_cas)
             .serve_with_incoming(worker_incoming);
         let api_serve = serve_api(api_listener.map(|(listener, _)| listener), api_routes);
         let ticking = async {

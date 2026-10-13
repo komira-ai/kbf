@@ -24,7 +24,12 @@
 //! - `ps-extra`: lines `ps` prints after the container's own (`<owner> <name>`).
 //! - `unshare-noop`: `unshare rm` succeeds without removing anything.
 //! - `unshare-fails`: `unshare rm` fails.
-//! - `chown-fails`: `unshare chown` to the owner this knob holds (`1:1` or `0:0`) fails.
+//! - `chown-fails`: `unshare chown`, or `unshare <helper> __chown-dirs`, to the owner
+//!   this knob holds (`1:1` or `0:0`) fails.
+//! - `graph`: what `info` prints for a format naming `GraphOptions`; absent:
+//!   `overlay {}`.
+//! - `busy-once`: the next `start` fails as crun does when the program's exec finds it
+//!   busy (ETXTBSY), status `created 0`, and removes this knob.
 //!
 //! Records:
 //! - `create.args` (one argument per line), `calls` (one verb per line; `unshare` with
@@ -36,7 +41,8 @@
 //! - `start-pid`: the last `start`'s own pid; `start-not-reaped-at-rm`: `rm` found that
 //!   `start` process still there, running or a zombie its parent had not reaped;
 //! - `events`, in order: `cgroup.kill ended the action`, `start ended` once `start` has
-//!   waited for the action and written its status, `rm`, `chown <owner> <paths...>`.
+//!   waited for the action and written its status, `rm`, `chown <owner> <paths...>`,
+//!   `chown-dirs <owner> <dir>` (the helper is recorded, not run).
 //!
 //! The fake changes no owner (the test runs as one user), but models what an owner
 //! other than the daemon's means: when `start` ends while the overlay is the
@@ -194,7 +200,7 @@ impl Fake {
         }
         match verb.as_slice() {
             b"image" => self.image(),
-            b"info" => self.info(),
+            b"info" => self.info(args),
             b"create" => self.create(args),
             b"start" => self.start(),
             b"inspect" => self.inspect(),
@@ -224,9 +230,19 @@ impl Fake {
         0
     }
 
-    fn info(&self) -> u8 {
+    fn info(&self, args: &[Vec<u8>]) -> u8 {
         if self.has("info-fails") {
             return refuse("Error: info refused", 125);
+        }
+        if args
+            .iter()
+            .any(|a| a.windows(12).any(|w| w == b"GraphOptions"))
+        {
+            let graph = self
+                .read("graph")
+                .unwrap_or_else(|| b"overlay {}\n".to_vec());
+            print(&graph);
+            return 0;
         }
         let store = self.state.join("store/fake-images");
         print(&[store.as_os_str().as_bytes(), b"\n"].concat());
@@ -276,6 +292,16 @@ impl Fake {
 
     fn start(&self) -> u8 {
         self.write_line("start-pid", std::process::id().to_string().as_bytes());
+        // crun's report of an exec that found the program open for writing.
+        if self.has("busy-once") {
+            let _ = std::fs::remove_file(self.file("busy-once"));
+            self.write_line("status", b"created 0");
+            self.append("events", b"start ended");
+            return refuse(
+                "Error: unable to start container: crun: exec container process `/kbf/root/tool`: Text file busy: OCI runtime error",
+                126,
+            );
+        }
         let cgroup = self.cat("cgroup");
         let lease = [self.cat("nonce"), cgroup.clone()].concat();
         let mut action = Command::new("bash");
@@ -470,6 +496,20 @@ impl Fake {
                     let _ = std::fs::set_permissions(path(&upper), mode);
                 }
                 let _ = std::fs::remove_file(self.file("upper-mode"));
+            }
+            return 0;
+        }
+        if args.get(1).is_some_and(|a| a == b"__chown-dirs") {
+            // <helper> __chown-dirs OWNER DIR: recorded, not run (the fake changes no
+            // owner); `chown-fails` refuses it as it refuses `chown`.
+            let owner = args.get(2).cloned().unwrap_or_default();
+            let dir = args.get(3).cloned().unwrap_or_default();
+            self.append(
+                "events",
+                &[b"chown-dirs ", &owner[..], b" ", &dir[..]].concat(),
+            );
+            if self.has("chown-fails") && self.cat("chown-fails") == owner {
+                return refuse("Error: chown-dirs refused", 1);
             }
             return 0;
         }
