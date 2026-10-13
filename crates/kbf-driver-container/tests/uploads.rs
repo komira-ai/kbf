@@ -1,6 +1,6 @@
 //! How the container driver's `collect` stores an output tree: many blobs at once,
-//! never more than `UPLOADS_IN_FLIGHT`, each distinct digest once, and all of them
-//! stored before it returns.
+//! never more than `UPLOADS_IN_FLIGHT`, each distinct digest once, all of them
+//! stored before it returns, and no result when one cannot be stored.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -15,9 +15,10 @@ use prost::Message;
 
 /// Blobs in memory, counting the stores in flight at most and the stores of each
 /// digest. A store yields a few times before it answers, so stores started together
-/// are in flight together.
+/// are in flight together. A store of `refused` fails.
 #[derive(Default)]
 struct CountingCas {
+    refused: Option<Digest>,
     blobs: Mutex<HashMap<String, Vec<u8>>>,
     stores: Mutex<HashMap<String, usize>>,
     in_flight: AtomicUsize,
@@ -75,6 +76,9 @@ impl Cas for CountingCas {
         }
         if digest_of(&bytes) != digest {
             return Err(CasError::Corrupt(label(&digest), label(&digest_of(&bytes))));
+        }
+        if self.refused.as_ref() == Some(&digest) {
+            return Err(CasError::Unavailable(label(&digest), "refused".to_owned()));
         }
         self.keep(&digest, bytes).await;
         Ok(digest)
@@ -177,4 +181,35 @@ async fn a_digest_named_many_times_is_stored_once() {
         1,
         "the Directory a, b and c share"
     );
+}
+
+/// Catches a store that failed being dropped while the walk goes on: `collect` would
+/// return a result naming a blob the CAS never got, and the action cache would refuse
+/// it (or a client would fail fetching it). One of 100 files cannot be stored.
+/// Mutant seen red: the drain's error discarded (`outputs.rs`, `try_join!` replaced by
+/// a `join!` that returns only the walk's result).
+#[tokio::test]
+async fn a_blob_that_cannot_be_stored_fails_the_collection() {
+    let upper = scratch("refused");
+    std::fs::create_dir_all(upper.join("out")).expect("mkdir");
+    for f in 0..100 {
+        let path = upper.join(format!("out/f{f:03}"));
+        std::fs::write(path, format!("file {f}")).expect("write");
+    }
+    let cas = CountingCas {
+        refused: Some(digest_of(b"file 42")),
+        ..CountingCas::default()
+    };
+    let mut result = ActionResult::default();
+    let collected = collect(
+        &cas,
+        &upper,
+        "",
+        &["out".to_owned()],
+        OutputLimits::DEFAULT,
+        &mut result,
+    )
+    .await;
+    let error = collected.expect_err("a blob was not stored");
+    assert!(error.to_string().contains("refused"), "{error}");
 }

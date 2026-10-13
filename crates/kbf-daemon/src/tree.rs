@@ -29,8 +29,9 @@ use std::io::ErrorKind;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use futures::{StreamExt as _, TryStreamExt as _, future, stream};
+use futures::{StreamExt as _, TryStreamExt as _, stream};
 use kbf_proto::reapi::{
     ActionResult, Command, Digest, Directory, DirectoryNode, FileNode, OutputDirectory, OutputFile,
     OutputSymlink, SymlinkNode, Tree,
@@ -122,7 +123,9 @@ pub const FETCH_BYTES_IN_FLIGHT: usize = 256 << 20;
 /// fetched together (each distinct one once): every name is checked, every directory
 /// and symlink made. Then the file blobs are fetched, [`FETCHES_IN_FLIGHT`] and at most
 /// [`FETCH_BYTES_IN_FLIGHT`] bytes at a time, each distinct digest once however many
-/// files name it, and each file written from it, created with `O_EXCL`.
+/// files name it, and each file written from it, created with `O_EXCL`. After the
+/// first error no blob is started, and the fetches and writes already started are
+/// waited for, so no file appears in `dir` once the error is returned.
 ///
 /// # Errors
 /// A blob is missing or corrupt, the tree breaks a naming rule, or a write fails.
@@ -241,6 +244,12 @@ fn check_names(directory: &Directory) -> Result<(), TreeError> {
 
 /// Fetches each blob in `files`, `fetches` and at most `bytes` bytes at a time, and
 /// writes every copy of it.
+///
+/// On the first error no blob is started any more, but the fetches and writes already
+/// started are waited for, not dropped: a dropped `tokio::fs` call still runs to the
+/// end on the blocking pool, so a file could otherwise appear in `dir` after the error
+/// is returned, while the caller is already clearing it. Not covered: the caller
+/// dropping the whole future (a lease cancelled mid-write) leaves those calls running.
 async fn write_files(
     cas: &impl Cas,
     files: Vec<Copies>,
@@ -249,22 +258,50 @@ async fn write_files(
 ) -> Result<(), TreeError> {
     let budget = Semaphore::new(bytes);
     let budget = &budget;
-    stream::iter(files)
+    let failed = AtomicBool::new(false);
+    let failed = &failed;
+    let mut writes = stream::iter(files)
         .map(|blob| async move {
-            let size = usize::try_from(blob.digest.size_bytes).unwrap_or(usize::MAX);
-            // A blob larger than the whole budget waits for all of it and goes alone.
-            let want = u32::try_from(size.clamp(1, bytes)).unwrap_or(u32::MAX);
-            // The semaphore is never closed, so the permit is always granted.
-            let _permit = budget.acquire_many(want).await.ok();
-            let contents = fetch(cas, &blob.digest).await?;
-            for (path, is_executable) in &blob.copies {
-                write_file(&contents, *is_executable, path).await?;
+            let written = write_blob(cas, blob, budget, bytes, failed).await;
+            if written.is_err() {
+                failed.store(true, Ordering::SeqCst);
             }
-            Ok::<_, TreeError>(())
+            written
         })
-        .buffer_unordered(fetches)
-        .try_for_each(|()| future::ready(Ok(())))
-        .await
+        .buffer_unordered(fetches);
+    let mut first = Ok(());
+    while let Some(written) = writes.next().await {
+        if first.is_ok() {
+            first = written;
+        }
+    }
+    first
+}
+
+/// Fetches `blob` within the byte `budget` (of `bytes` in all) and writes each copy of
+/// it, unless `failed` says another blob failed already: then it is skipped.
+async fn write_blob(
+    cas: &impl Cas,
+    blob: Copies,
+    budget: &Semaphore,
+    bytes: usize,
+    failed: &AtomicBool,
+) -> Result<(), TreeError> {
+    let size = usize::try_from(blob.digest.size_bytes).unwrap_or(usize::MAX);
+    // A blob larger than the whole budget waits for all of it and goes alone.
+    let want = u32::try_from(size.clamp(1, bytes)).unwrap_or(u32::MAX);
+    // The semaphore is never closed, so the permit is always granted.
+    let _permit = budget.acquire_many(want).await.ok();
+    // Checked once the permit is held: a blob may have waited for it while another
+    // failed.
+    if failed.load(Ordering::SeqCst) {
+        return Ok(());
+    }
+    let contents = fetch(cas, &blob.digest).await?;
+    for (path, is_executable) in &blob.copies {
+        write_file(&contents, *is_executable, path).await?;
+    }
+    Ok(())
 }
 
 async fn write_file(bytes: &[u8], is_executable: bool, path: &Path) -> Result<(), TreeError> {

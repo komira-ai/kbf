@@ -1,15 +1,17 @@
 //! How `collect` stores an output tree: many blobs at once, never more than
 //! `UPLOADS_IN_FLIGHT`, each distinct digest once, and all of them stored before it
-//! returns.
+//! returns; and how many blobs its queue, `Uploads`, holds at once.
 
 use std::collections::HashMap;
+use std::convert::Infallible;
 use std::io::Read as _;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 
+use futures::FutureExt as _;
 use kbf_outputs::{
-    CHUNK_BYTES, OutputLimits, Store, StoreError, UPLOADS_IN_FLIGHT, collect, digest_of,
+    CHUNK_BYTES, OutputLimits, Store, StoreError, UPLOADS_IN_FLIGHT, Uploads, collect, digest_of,
 };
 use kbf_proto::reapi::{ActionResult, Digest, Directory, Tree};
 use prost::Message;
@@ -198,5 +200,78 @@ async fn a_digest_named_many_times_is_stored_once() {
         store.stores_of(&digest_of(&leaf.encode_to_vec())),
         1,
         "the Directory a, b and c share"
+    );
+}
+
+/// One blob a walk holds, counted while it is alive: queued, or being stored.
+struct Held(Arc<AtomicUsize>);
+
+impl Held {
+    fn new(alive: &Arc<AtomicUsize>, most: &AtomicUsize) -> Self {
+        let now = alive.fetch_add(1, Ordering::SeqCst) + 1;
+        most.fetch_max(now, Ordering::SeqCst);
+        Self(Arc::clone(alive))
+    }
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Catches a queue that takes every blob the walk hands it while the stores are slow:
+/// the walk would then hold the whole tree at once (in the container driver an open
+/// descriptor per file; on the pilot, trees of thousands of files), however few are
+/// stored at a time. Every store waits on a gate the test opens only once
+/// `UPLOADS_IN_FLIGHT` stores have started and the walk had time to run ahead; a
+/// blob is counted from before it is queued until its store ends. Mutant seen red:
+/// the queue's channel given room for 1_000_000 (`uploads.rs`, `mpsc::channel(0)`).
+#[tokio::test]
+async fn a_walk_holds_at_most_one_blob_past_the_stores_in_flight() {
+    let alive = Arc::new(AtomicUsize::new(0));
+    let most = AtomicUsize::new(0);
+    let started = Arc::new(AtomicUsize::new(0));
+    let (open, gate) = futures::channel::oneshot::channel::<()>();
+    let gate = gate.shared();
+    let (mut uploads, drain) = Uploads::<Infallible>::new();
+    let walk = async {
+        for i in 0..300 {
+            let held = Held::new(&alive, &most);
+            let gate = gate.clone();
+            let started = Arc::clone(&started);
+            let upload = async move {
+                started.fetch_add(1, Ordering::SeqCst);
+                let _ = gate.await;
+                drop(held);
+                Ok(())
+            };
+            uploads
+                .queue(&digest_of(format!("blob {i}").as_bytes()), upload)
+                .await;
+        }
+        drop(uploads);
+        Ok::<(), Infallible>(())
+    };
+    let opener = async {
+        while started.load(Ordering::SeqCst) < UPLOADS_IN_FLIGHT {
+            tokio::task::yield_now().await;
+        }
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        let _ = open.send(());
+        Ok::<(), Infallible>(())
+    };
+    futures::try_join!(walk, drain, opener).expect("infallible");
+    assert_eq!(started.load(Ordering::SeqCst), 300, "every blob stored");
+    let most = most.load(Ordering::SeqCst);
+    assert!(
+        most >= UPLOADS_IN_FLIGHT,
+        "{most}: the gate held the stores"
+    );
+    assert!(
+        most <= UPLOADS_IN_FLIGHT + 1,
+        "{most} blobs held at once, {UPLOADS_IN_FLIGHT} stores in flight"
     );
 }
