@@ -26,10 +26,9 @@
 pub mod cas;
 mod config;
 mod engine;
+mod find;
+mod flights;
 mod stats;
-// The red-first stand-in uses part of the backend; the engine of the next commit
-// uses all of it.
-#[allow(dead_code)]
 mod wire;
 
 pub use cas::{Cas, CasError, Chunks, WRITE_CHUNK_BYTES, digest_of, fetch, label};
