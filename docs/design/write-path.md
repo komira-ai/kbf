@@ -382,9 +382,10 @@ The daemon's input cache (one read-only file per blob, so leases can hard-link i
 evicted by use) and the server's write tier (segments, evicted only after their flush)
 stay two stores: a hard link cannot point into a segment, and one eviction policy would
 get one side wrong; a store-down backlog in the tier must never evict a running build's
-inputs. They share the disk with budgets that add up, for example on an 884 GB disk:
-input cache 400 GB with a 100 GB floor, write tier 200 GB, the rest for lease scratch
-and the OS. A daemon miss for a blob staged on its own host's server is served from
+inputs. They share the disk with budgets that add up and leave wide headroom, because
+the kernel behaves badly under disk pressure (writeback stalls, allocation failures):
+on a pilot node's 923 GB disk, input cache 200 GB, write tier 200 GB, a 100 GB free-space
+floor, and the rest for lease scratch and the OS. A daemon miss for a blob staged on its own host's server is served from
 that server's local tier over loopback, no object store and no LAN. On a filesystem
 with reflink (XFS, btrfs) a later step may clone the byte range into the cache file
 (`FICLONERANGE`) instead of copying it.
