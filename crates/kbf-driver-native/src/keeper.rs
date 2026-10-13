@@ -21,6 +21,11 @@
 //! unit with SIGTERM does not stop the keeper before it has read end-of-file. It
 //! reaches the group only: a process that left it (`setsid`) is not killed, the gap
 //! the lease's own kill has between two polls ([`crate::procs`]).
+//!
+//! An action that runs as a slot user of the lease-user pool ([`crate::slots`], macOS)
+//! gets a keeper in the `uid` mode instead ([`Keeper::for_uid`]): in a process group
+//! of its own, and on end-of-file it ends every process of the slot's uid, as the
+//! lease's own end does ([`kbf_daemon::uid::end`]), `setsid` or not.
 
 use std::io;
 use std::os::unix::process::CommandExt as _;
@@ -50,6 +55,22 @@ impl Keeper {
             child: command.process_group(pgid).spawn()?,
         };
         // Dropped on an error, the keeper is killed and reaped.
+        keeper::started(&mut this.child)?;
+        Ok(this)
+    }
+
+    /// Starts the keeper of an action that runs as `uid`, in a process group of its
+    /// own (so a signal to the daemon's group does not end it first). Returns once it
+    /// runs as a keeper.
+    ///
+    /// # Errors
+    /// The keeper could not be started, or its program did not answer as a keeper.
+    #[cfg(target_os = "macos")]
+    pub fn for_uid(uid: u32) -> io::Result<Self> {
+        let mut command = keeper::command(&keeper::program()?, &Mode::Uid { uid });
+        let mut this = Self {
+            child: command.process_group(0).spawn()?,
+        };
         keeper::started(&mut this.child)?;
         Ok(this)
     }
