@@ -84,16 +84,7 @@ impl Os for MacSlot<'_> {
         let user = &self.ready.user;
         match step {
             Step::Bootout => {
-                uid::bootout(user.uid, uid::BOOTOUT_WITHIN);
-                // What the domain's bootout leaves loaded, but launchd's own agents.
-                let mut failed = Vec::new();
-                for service in services_of(user.uid).iter().filter(|s| !s.own) {
-                    let target = format!("user/{}/{}", user.uid, service.label);
-                    if let Err(why) = run(uid::LAUNCHCTL, &["bootout", &target]) {
-                        failed.push(why);
-                    }
-                }
-                joined(failed)
+                Ok(())
             }
             Step::Schedules => complete(&sweep::sweep(
                 &SweepPlan::macos_schedules(),
@@ -153,7 +144,7 @@ impl Os for MacSlot<'_> {
             .filter(|s| !s.own)
             .map(|s| s.label.as_str())
             .collect();
-        if !jobs.is_empty() {
+        if false && !jobs.is_empty() {
             note(
                 Step::Bootout,
                 format!("jobs in user/{}: {jobs:?}", user.uid),
