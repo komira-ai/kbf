@@ -479,16 +479,46 @@ async fn segment_puts_are_bounded_by_the_puts_in_flight() {
     assert_eq!(store.put_keys().len(), 6);
 }
 
-/// A caller that goes away while its blob waits in an open segment changes nothing:
-/// the blob is still written and indexed with the segment. Its admission is held until
-/// then: with an 8 KiB bound and the PUT held, a later 1-byte admission waits, and gets
-/// in once the PUT is let go.
+/// A caller that goes away while its blob waits in the open segment (the linger has
+/// not fired) changes nothing: at the linger the segment is still written, and the
+/// blob indexed.
 ///
-/// Catches: a segment written only while a caller waits on it; admission released
-/// when the caller goes rather than when its bytes are written. Mutants seen red:
-/// skip the write when every waiter is gone; drop the admissions before the write.
+/// Catches: a segment written only while a caller waits on it. Mutant seen red: skip
+/// the write when every waiter is gone.
 #[tokio::test(start_paused = true)]
-async fn a_caller_that_goes_away_changes_nothing() {
+async fn a_caller_that_goes_away_before_the_seal_changes_nothing() {
+    let linger = Duration::from_secs(1);
+    let (cache, store) = cache(
+        config(|c| c.linger = linger),
+        kbf_segments::MAX_SEGMENT_BYTES,
+    )
+    .await;
+    let b = blob(17, 4096);
+    let call = spawn_store(&cache, vec![b.clone()]);
+    // The caller runs until it waits on its segment's answer: nothing it awaits first
+    // (the index query) is pending.
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    assert!(!call.is_finished());
+    assert!(store.put_keys().is_empty(), "sealed before the linger");
+    call.abort();
+    assert!(call.await.expect_err("aborted").is_cancelled());
+
+    tokio::time::sleep(linger * 2).await;
+    assert_eq!(store.put_keys().len(), 1);
+    assert!(present(&cache, b.digest()).await);
+    assert_audit_clean(&cache);
+}
+
+/// A caller that goes away while its segment's PUT is held changes nothing either, and
+/// its admission is held until the segment is settled: with an 8 KiB bound, a later
+/// 1-byte admission waits while the PUT is held, and gets in once it is let go.
+///
+/// Catches: admission released when the caller goes rather than when its bytes are
+/// written. Mutant seen red: the admissions not carried with the segment.
+#[tokio::test(start_paused = true)]
+async fn a_caller_that_goes_away_keeps_its_bytes_admitted_until_they_are_written() {
     let (cache, store) = cache(
         config(|c| c.bytes_in_flight = 8 << 10),
         kbf_segments::MAX_SEGMENT_BYTES,

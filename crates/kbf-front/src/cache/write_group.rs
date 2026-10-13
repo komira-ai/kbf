@@ -269,11 +269,6 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         self
     }
 
-    /// How this cache groups and bounds uploads.
-    pub fn write_config(&self) -> WriteConfig {
-        self.group.config
-    }
-
     /// Waits until `bytes` more fit under [`WriteConfig::bytes_in_flight`] and takes
     /// them. A call asking for more than the bound (or than 4 GiB) waits for that much.
     /// Nothing is refused: a caller over the bound waits.
