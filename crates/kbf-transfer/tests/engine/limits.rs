@@ -6,11 +6,12 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use futures::future::Either;
 use kbf_proto::reapi::Digest;
-use kbf_transfer::{Cas, CasError, Scope, TransferConfig, digest_of};
+use kbf_transfer::{Cas, CasError, Chunks, Scope, TransferConfig, digest_of};
 use kbf_types::LeaseId;
 
-use super::fake::{Fake, until, within};
+use super::fake::{Fake, lock, until, within};
 use super::proxy::{Proxy, windows};
 use super::{engine, patterned};
 
@@ -72,6 +73,116 @@ async fn t1_sixteen_leases_share_one_limit_one_connection_and_one_read_per_diges
     assert_eq!(started, 1000);
     assert_eq!(proxy.accepted.load(Ordering::SeqCst), 1, "connections");
     assert_eq!(engine.stats().fetches, 0);
+}
+
+/// T-1 for the other requests the limit counts. 16 leases upload blobs from memory
+/// (`put`) and from chunks (`put_chunks`), each after its FindMissing, while the server
+/// holds every write before it commits; once the writes fill the limit, each lease
+/// starts more uploads and reads. The requests the server serves at once, reads,
+/// writes and FindMissing calls together, reach `--transfer-in-flight` and never pass
+/// it. FindMissing asks four digests a call, so calls keep coming after the limit is
+/// full. Catches a write or a FindMissing call that takes no permit (the per-walk
+/// limits of kbf-outputs and the container driver are per lease, so 16 leases are held
+/// to the process's limit only by the engine). Mutants seen red: no permit in `put`,
+/// in `put_chunks` (27 and 20 requests at once for a limit of 16), in FindMissing (17).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn uploads_finds_and_reads_of_sixteen_leases_share_the_one_limit() {
+    let fake = Arc::new(Fake::default());
+    let limit = 16;
+    let config = TransferConfig {
+        in_flight: limit,
+        find_missing_chunk: 4,
+        ..TransferConfig::default()
+    };
+    let engine = engine(fake.serve().await, config);
+    let scopes: Vec<Arc<Scope>> = (0..16)
+        .map(|i| Arc::new(engine.scope(&LeaseId::new(6, i))))
+        .collect();
+    // Lease i's blobs of wave w: 10 from memory and 10 from chunks, interleaved.
+    let blob = |lease: usize, wave: usize, j: usize| {
+        patterned(10_000 + lease * 100 + wave * 40 + j, 50 + j)
+    };
+    let uploads = |wave: usize| -> Vec<_> {
+        scopes
+            .iter()
+            .enumerate()
+            .map(|(i, scope)| {
+                let scope = Arc::clone(scope);
+                let blobs: Vec<Vec<u8>> = (0..20).map(|j| blob(i, wave, j)).collect();
+                tokio::spawn(async move {
+                    let calls = blobs.iter().enumerate().map(|(j, bytes)| {
+                        if j % 2 == 0 {
+                            Either::Left(scope.put(bytes.clone()))
+                        } else {
+                            Either::Right(scope.put_chunks(digest_of(bytes), chunks_of(bytes)))
+                        }
+                    });
+                    let stored = futures::future::join_all(calls).await;
+                    for (bytes, stored) in blobs.iter().zip(stored) {
+                        assert_eq!(stored, Ok(digest_of(bytes)));
+                    }
+                })
+            })
+            .collect()
+    };
+    fake.close();
+    let mut leases = uploads(0);
+    within(30, || fake.requests.load(Ordering::SeqCst) >= limit).await;
+    assert_eq!(
+        fake.requests.load(Ordering::SeqCst),
+        limit,
+        "requests at once"
+    );
+    leases.extend(uploads(1));
+    let reads: Vec<Digest> = (0..160)
+        .map(|i| fake.insert(patterned(20_000 + i, 70)))
+        .collect();
+    for (i, scope) in scopes.iter().enumerate() {
+        let scope = Arc::clone(scope);
+        let mine = reads[i * 10..(i + 1) * 10].to_vec();
+        leases.push(tokio::spawn(async move {
+            for (digest, read) in mine
+                .iter()
+                .zip(futures::future::join_all(mine.iter().map(|d| scope.get(d))).await)
+            {
+                assert_eq!(digest_of(&read.expect("read")), *digest);
+            }
+        }));
+    }
+    // Room for requests past the limit to reach the server, were they allowed to.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        fake.requests.load(Ordering::SeqCst),
+        limit,
+        "requests at once"
+    );
+    assert_eq!(engine.stats().requests_in_flight, limit);
+    fake.open();
+    for lease in leases {
+        lease.await.expect("lease");
+    }
+    assert_eq!(
+        fake.most_requests.load(Ordering::SeqCst),
+        limit,
+        "requests at once"
+    );
+    assert_eq!(lock(&fake.writes).len(), 2 * 16 * 20, "writes");
+    assert!(
+        fake.most.load(Ordering::SeqCst) >= 1,
+        "no read reached the server"
+    );
+    let finds = lock(&fake.finds).clone();
+    assert!(
+        finds.len() >= 2 * 16 * 20 / 4,
+        "FindMissing calls: {finds:?}"
+    );
+    assert_eq!(engine.stats().requests_in_flight, 0);
+}
+
+/// `bytes` as a stream of chunks of at most 16 bytes.
+fn chunks_of(bytes: &[u8]) -> Chunks {
+    let pieces: Vec<std::io::Result<Vec<u8>>> = bytes.chunks(16).map(|c| Ok(c.to_vec())).collect();
+    Box::pin(futures::stream::iter(pieces))
 }
 
 /// Catches reads into memory that ignore `--transfer-bytes-in-flight`: with a budget of

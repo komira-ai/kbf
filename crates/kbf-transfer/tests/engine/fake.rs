@@ -1,6 +1,6 @@
 //! A CAS server for the engine's tests: ByteStream and FindMissing over blobs in
-//! memory, which counts what it is asked and can hold reads at a gate, pause a read
-//! after its first message, refuse FindMissing, and fail writes.
+//! memory, which counts what it is asked and can hold reads and writes at a gate, pause
+//! a read after its first message, refuse FindMissing, and fail writes.
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -54,8 +54,12 @@ pub struct Fake {
     /// Reads being served now, and the most at once.
     pub active: AtomicUsize,
     pub most: AtomicUsize,
+    /// Requests of any kind being served now (reads, writes and FindMissing calls), and
+    /// the most at once.
+    pub requests: AtomicUsize,
+    pub most_requests: AtomicUsize,
     /// Reads wait for this to open before their first message (or, when `pause` is
-    /// set, after it).
+    /// set, after it); writes wait for it before they commit.
     gate: watch::Sender<bool>,
     pub pause: AtomicBool,
     /// Bytes per ReadResponse.
@@ -78,6 +82,8 @@ impl Default for Fake {
             reads: Mutex::default(),
             active: AtomicUsize::new(0),
             most: AtomicUsize::new(0),
+            requests: AtomicUsize::new(0),
+            most_requests: AtomicUsize::new(0),
             gate: watch::channel(true).0,
             pause: AtomicBool::new(false),
             message_bytes: AtomicUsize::new(64 << 10),
@@ -157,6 +163,23 @@ pub async fn serve(routes: Routes) -> SocketAddr {
 
 struct Shared(Arc<Fake>);
 
+/// Counts a request of any kind as being served until dropped.
+struct Serving(Arc<Fake>);
+
+impl Serving {
+    fn start(fake: &Arc<Fake>) -> Self {
+        let now = fake.requests.fetch_add(1, Ordering::SeqCst) + 1;
+        fake.most_requests.fetch_max(now, Ordering::SeqCst);
+        Self(Arc::clone(fake))
+    }
+}
+
+impl Drop for Serving {
+    fn drop(&mut self) {
+        self.0.requests.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 /// Counts a read as active until dropped.
 struct Active(Arc<Fake>);
 
@@ -181,6 +204,7 @@ impl ByteStream for Shared {
             .unwrap_or_default()
             .to_owned();
         lock(&fake.reads).push((name.clone(), request.read_offset));
+        let serving = Serving::start(&fake);
         let now = fake.active.fetch_add(1, Ordering::SeqCst) + 1;
         fake.most.fetch_max(now, Ordering::SeqCst);
         let active = Active(Arc::clone(&fake));
@@ -192,6 +216,7 @@ impl ByteStream for Shared {
             // Dropped before `sender`, so the read stops counting before its stream
             // ends.
             let _active = active;
+            let _serving = serving;
             let mut gate = fake.gate.subscribe();
             let pause = fake.pause.load(Ordering::SeqCst);
             if !pause {
@@ -221,6 +246,7 @@ impl ByteStream for Shared {
         request: Request<Streaming<WriteRequest>>,
     ) -> Result<Response<WriteResponse>, Status> {
         let fake = &self.0;
+        let _serving = Serving::start(fake);
         let mut stream = request.into_inner();
         let mut bytes = Vec::new();
         while let Some(message) = stream.message().await? {
@@ -228,6 +254,7 @@ impl ByteStream for Shared {
                 .fetch_max(message.data.len(), Ordering::SeqCst);
             bytes.extend_from_slice(&message.data);
         }
+        let _ = fake.gate.subscribe().wait_for(|open| *open).await;
         let failing = fake.fail_writes.load(Ordering::SeqCst);
         if failing > 0 {
             fake.fail_writes.store(failing - 1, Ordering::SeqCst);
@@ -255,6 +282,7 @@ impl ContentAddressableStorage for Shared {
         request: Request<FindMissingBlobsRequest>,
     ) -> Result<Response<FindMissingBlobsResponse>, Status> {
         let fake = &self.0;
+        let _serving = Serving::start(fake);
         let digests = request.into_inner().blob_digests;
         lock(&fake.finds).push(digests.len());
         let mode = *lock(&fake.find);

@@ -76,11 +76,13 @@ async fn a_blob_the_front_lacks_is_missing() {
 /// it retried more than `--transfer-retries` times or not at all.
 #[tokio::test]
 async fn an_unreachable_front_is_unavailable_after_the_retries() {
-    // A port nothing listens on: bound, then released.
-    let addr = std::net::TcpListener::bind("127.0.0.1:0")
-        .expect("bind")
-        .local_addr()
-        .expect("addr");
+    // A port nothing listens on: bound and never listening, held for the whole test so
+    // no other test binds it meanwhile (a dial gets RST).
+    let socket = tokio::net::TcpSocket::new_v4().expect("socket");
+    socket
+        .bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
+        .expect("bind");
+    let addr = socket.local_addr().expect("addr");
     let config = TransferConfig {
         retries: 2,
         ..TransferConfig::default()
@@ -102,6 +104,7 @@ async fn an_unreachable_front_is_unavailable_after_the_retries() {
         (stats.read_calls, stats.write_calls, stats.retries),
         (3, 3, 4)
     );
+    drop(socket);
 }
 
 /// A ByteStream server that breaks its promises: a read stream that fails after its
