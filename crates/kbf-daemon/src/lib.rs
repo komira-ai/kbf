@@ -19,6 +19,8 @@
 //! - [`runtime`]: the runtime trait and [`FakeRuntime`], which runs nothing.
 //! - [`runtimes`]: [`Runtimes`], the daemon's runtimes, at most one per lease kind.
 //! - [`cas`]: the [`Cas`] trait and the front's client.
+//! - `cache` (Linux): the node's input cache, which the container driver links input
+//!   files from (`docs/design/worker-cache.md`).
 //! - [`clock`]: the suspend-counting [`Clock`] the fence reads (issue #78).
 //! - [`tree`]: writing an input root from the CAS and reading outputs back.
 //! - [`usage`]: what an action used, measured by the kernel, and where it is carried.
@@ -32,6 +34,8 @@
 //! crate, so a binary here naming them would be a cycle Cargo refuses. It never offers
 //! [`LocalRuntime`], which isolates nothing.
 
+#[cfg(target_os = "linux")]
+pub mod cache;
 pub mod cas;
 pub mod clock;
 pub mod config;
