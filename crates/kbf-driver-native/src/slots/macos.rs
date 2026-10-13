@@ -153,7 +153,7 @@ impl Slot {
             program.to_string_lossy().into_owned(),
         ];
         launch.extend(args);
-        Ok((PathBuf::from(LAUNCHCTL), launch))
+        Ok((self.program.clone(), launch))
     }
 
     /// Makes the lease directory `dir`, and everything in it, the slot user's (no link
