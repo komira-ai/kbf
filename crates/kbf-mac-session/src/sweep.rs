@@ -114,6 +114,36 @@ pub fn sweep(plan: &SweepPlan, user: &str, uid: u32) -> Swept {
     swept
 }
 
+/// Removes every entry of the directory `dir`, whoever owns it, as [`sweep`] removes the
+/// uid's own: never through a link, never past `dir`'s filesystem, with the user flags
+/// cleared only on entries `uid` owns (another owner's locked entry stays, and is an
+/// error). For a directory that is the uid's alone, such as its home: `dir` itself
+/// stays, and a `dir` that does not exist holds nothing.
+#[must_use]
+pub fn empty(dir: &Path, uid: u32) -> Swept {
+    let mut swept = Swept::default();
+    let result = empty_base(dir, uid, &mut swept);
+    note(&mut swept, dir, result);
+    swept
+}
+
+/// [`empty`]: every entry of `path` removed, each error recorded and the rest gone on
+/// with.
+fn empty_base(path: &Path, uid: u32, swept: &mut Swept) -> io::Result<()> {
+    let Some(dir) = open_base(path)? else {
+        return Ok(());
+    };
+    let dev = rustix::fs::fstat(&dir)?.st_dev;
+    for name in list(&dir)? {
+        let result = rustix::fs::statat(&dir, &name, AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(io::Error::from)
+            .and_then(|stat| remove_entry(&dir, &name, &stat, uid, dev, 1));
+        swept.removed += usize::from(result.is_ok());
+        note(swept, &path.join(&name), result);
+    }
+    Ok(())
+}
+
 /// Records `result`'s error, if any, against `path`. Every error counts, an entry that
 /// vanished during the walk included: the sweep is then retried, never assumed done.
 fn note(swept: &mut Swept, path: &Path, result: io::Result<()>) {

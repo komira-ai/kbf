@@ -1325,6 +1325,7 @@ dependencies = [
  "kbf-testkit",
  "kbf-types",
  "libc",
+ "plist",
  "prost",
  "prost-types",
  "rustix",

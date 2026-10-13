@@ -451,5 +451,11 @@ step "the native driver's lease-user pool, as root, with throwaway users"
 # without a pool. One test at a time: they pick free uids from 690 and make users there.
 cargo xtask sudo-test -p kbf-driver-native --test slots -- --test-threads=1 --nocapture
 
+# crates/kbf-driver-native/tests/slot_clean.rs: the clean of a slot between two leases
+# (the freshness test: a lease finds nothing the one before it left on its user), its
+# deadline, the user made again when the clean fails, and the quarantine when that fails
+# too. Users from 690 again: the slots tests above deleted theirs.
+cargo xtask sudo-test -p kbf-driver-native --test slot_clean -- --test-threads=1 --nocapture
+
 echo
 echo "kbf-mac-session: every check passed"

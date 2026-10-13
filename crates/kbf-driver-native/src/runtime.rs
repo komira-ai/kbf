@@ -625,7 +625,7 @@ impl<C: Cas> Runtime for NativeRuntime<C> {
         ))
         .await;
         let cleaned = dir.clean().await;
-        runner.release();
+        runner.release().await;
         sweep_user_folders_after_lease(&self.config).await;
         // A kill that arrived after the work ended still waits for the clean.
         if let Some(by) = killer.or_else(|| stop.try_recv().ok()) {

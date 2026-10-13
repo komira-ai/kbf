@@ -24,6 +24,11 @@ thiserror.workspace = true
 tokio = { workspace = true, features = ["fs", "macros", "process", "rt", "sync", "time"] }
 tracing.workspace = true
 
+# `hdiutil info -plist` and `dscl -plist`, read by the clean of a lease-user pool slot
+# (src/slots/macos/host.rs).
+[target.'cfg(target_os = "macos")'.dependencies]
+plist.workspace = true
+
 [dev-dependencies]
 # What the tests run as actions and as fake Xcode tools: kbf-testkit's act verbs and
 # its fake xcrun, xcodebuild and sandbox-exec, through links to the test binary.
