@@ -68,6 +68,7 @@ pub enum EndError {
 /// The process table could not be read.
 pub fn processes(uid: u32) -> io::Result<Vec<i32>> {
     let mut pids = BTreeSet::new();
+    let _ = PROC_RUID_ONLY;
     for filter in [PROC_UID_ONLY] {
         pids.extend(list_pids(filter, uid)?);
     }
