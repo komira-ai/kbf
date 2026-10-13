@@ -13,9 +13,13 @@
 //!   fails), `Welcome` naming the log id as the lease epoch. Both live in memory, so a
 //!   restart loses them, as the server does today.
 //! - **Writes** go to the object store first; the blob is committed to the log once
-//!   the store has it, and only then is the client told.
+//!   the store has it, and only then is the client told. A PUT the store answers as
+//!   failed, or not answered within [`PUT_TIMEOUT`], is answered `UNAVAILABLE`
+//!   (`UploadFailed`) and indexes nothing, even if the store answers it later; the
+//!   client's retry is a new PUT under a new object id.
 //! - **Faults** ([`ServerFault`]): a process kill, a power cut (now, or part-way
-//!   through a later filesystem operation), and an I/O error, after which the log
+//!   through a later filesystem operation), a crash at a named point of the write path
+//!   ([`StorePoint`], armed in a [`CrashPlan`]), and an I/O error, after which the log
 //!   refuses every commit while the server goes on answering reads from its applied
 //!   state. A server that has stopped or died starts again after
 //!   [`ServerPlan::down_for`] over what the disk kept; a server whose log stopped
@@ -33,8 +37,8 @@ use kbf_daemon::FENCE_AFTER;
 use kbf_front::MetaLog;
 use kbf_log::FarmLogId;
 use kbf_meta::{
-    ActionAnswer, ActionRecord, Applied, Closure, Command, Epoch, Location, MetaState, ObjectId,
-    Retention, Role, StoreId,
+    ActionAnswer, ActionRecord, Applied, Closure, Command, Epoch, MetaState, ObjectId, Retention,
+    Role,
 };
 use kbf_sched::{DaemonInstance, Event as SchedEvent, Input, OpState, Request, Scheduler};
 use kbf_server::RaftMetaLog;
@@ -47,8 +51,11 @@ use kbf_types::{
     StartLease, StateMachine, WaiterId, WorkerId,
 };
 
+mod write;
+
 use crate::Msg;
-use crate::replica::{self, Broken};
+use crate::hook::{CrashPlan, Down, StorePoint};
+use crate::replica::{self, Broken, Replica};
 
 /// How often the server commits farm time and runs a placement round.
 pub const TICK: Duration = Duration::from_secs(1);
@@ -57,6 +64,11 @@ pub const HEARTBEAT: Duration = Duration::from_secs(5);
 const T_TICK: u64 = 0;
 const T_START: u64 = 1;
 const T_FAULT: u64 = 1 << 16;
+/// A PUT's deadline: this plus the server's count of PUTs sent.
+const T_PUT: u64 = 1 << 32;
+/// How long the server waits for the store to answer a PUT (the object store client's
+/// request timeout) before it answers the upload `UNAVAILABLE`.
+pub const PUT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// A fault the server meets.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -72,6 +84,12 @@ pub enum ServerFault {
     PowerCutAt { after: u64, keep: usize, names: u64 },
     /// The `after`-th filesystem operation from now fails: the log stops.
     IoErrorAt { after: u64 },
+    /// From now, the `nth` time the write path reaches `point`, the server goes `down`.
+    CrashAt {
+        point: StorePoint,
+        nth: u32,
+        down: Down,
+    },
 }
 
 /// When the server meets its faults, and how long it stays down after each.
@@ -96,6 +114,12 @@ pub struct Seen {
     /// How many times the server opened its log, and each refusal.
     pub starts: u64,
     pub refused: Vec<(FarmTime, String)>,
+    /// Every digest a client asked to store.
+    pub uploaded: BTreeSet<Digest>,
+    /// Each upload acknowledged: when, the blob, and the object its PUT wrote.
+    pub acked: Vec<(FarmTime, Digest, ObjectId)>,
+    /// Each crash point that took the server down, and when.
+    pub crashed_at: Vec<(FarmTime, StorePoint)>,
 }
 
 /// The server node.
@@ -104,12 +128,21 @@ pub struct Server {
     disk: FaultFs,
     runtime: tokio::runtime::Runtime,
     up: Option<Up>,
-    /// A planned power cut, armed in the disk: what it keeps.
-    armed: Option<(usize, u64)>,
+    /// A planned crash, armed in the disk: how the server goes down there.
+    armed: Option<Down>,
+    /// The write path's crash points.
+    hooks: CrashPlan<StorePoint>,
+    /// A crash point reached in this input: the out queue's length then, and how the
+    /// server goes down.
+    dying: Option<(usize, Down)>,
+    /// PUTs sent, over every start: each PUT's deadline timer is tagged with it.
+    puts_sent: u64,
     restarting: bool,
     store: NodeId,
     /// What the last property-1 check saw: (incarnation, applied index, disk ops).
     checked: Cell<Option<(u64, u64, u64)>>,
+    /// The last property-1 check's replica, and the incarnation it was read in.
+    replica: Cell<Option<(u64, Replica)>>,
     pub seen: Seen,
     out: Vec<Output<Msg>>,
 }
@@ -128,6 +161,8 @@ struct Up {
     heard: BTreeMap<WorkerId, (FarmTime, Vec<LeaseId>)>,
     callers: BTreeMap<WaiterId, NodeId>,
     uploads: BTreeMap<ObjectId, (NodeId, Digest)>,
+    /// Each PUT waiting for the store, by its deadline timer's tag.
+    deadlines: BTreeMap<u64, ObjectId>,
 }
 
 /// Polls `future` once: the metadata log answers without waiting.
@@ -184,9 +219,13 @@ impl Server {
             runtime,
             up: None,
             armed: None,
+            hooks: CrashPlan::default(),
+            dying: None,
+            puts_sent: 0,
             restarting: false,
             store,
             checked: Cell::new(None),
+            replica: Cell::new(None),
             seen: Seen::default(),
             out: Vec::new(),
         }
@@ -220,9 +259,18 @@ impl Server {
             return Ok(());
         }
         let entries = replica::durable_entries(self.disk.crash(0))?;
-        let replica = replica::replay(&entries, applied)?;
+        let starts = self.seen.starts;
+        let mut replica = self
+            .replica
+            .take()
+            .filter(|(s, r)| *s == starts && r.extends(&entries))
+            .map(|(_, r)| r)
+            .unwrap_or_default();
+        replica.advance(&entries, applied)?;
         let live = ready(up.log.query(MetaState::clone)).expect("a query is never refused");
-        replica::same_as_live(&replica, &live, up.log.log_id())
+        let held = replica::same_as_live(&replica.state, &live, up.log.log_id());
+        self.replica.replace(Some((starts, replica)));
+        held
     }
 
     fn timer(&mut self, after: Duration, tag: u64) {
@@ -253,7 +301,7 @@ impl Server {
         };
         let leadership = log.leadership().expect("a raft log names its term");
         let Ok(Applied::Epoch(writer)) = ready(log.commit(Command::AllocEpoch)) else {
-            self.down(None);
+            self.down(Down::Kill);
             return;
         };
         self.up = Some(Up {
@@ -269,6 +317,7 @@ impl Server {
             heard: BTreeMap::new(),
             callers: BTreeMap::new(),
             uploads: BTreeMap::new(),
+            deadlines: BTreeMap::new(),
         });
     }
 
@@ -278,27 +327,28 @@ impl Server {
         }
     }
 
-    /// The process dies: after a power cut keeping `cut`, or killed.
-    fn down(&mut self, cut: Option<(usize, u64)>) {
+    /// The process dies: killed, or in a power cut.
+    fn down(&mut self, how: Down) {
         self.up = None;
         self.armed = None;
-        self.disk = match cut {
-            Some((keep, names)) => self.disk.crash_reordered(keep, names),
-            None => self.disk.restart(),
+        self.disk = match how {
+            Down::PowerCut { keep, names } => self.disk.crash_reordered(keep, names),
+            Down::Kill => self.disk.restart(),
         };
         self.restart_later();
     }
 
     fn fault(&mut self, fault: ServerFault) {
         match fault {
-            ServerFault::Kill if self.up.is_some() => self.down(None),
+            ServerFault::Kill if self.up.is_some() => self.down(Down::Kill),
             ServerFault::PowerCut { keep, names } if self.up.is_some() => {
-                self.down(Some((keep, names)));
+                self.down(Down::PowerCut { keep, names });
             }
             ServerFault::PowerCutAt { after, keep, names } if self.up.is_some() => {
                 self.disk.fail_at(self.disk.ops() + after, Fault::Crash);
-                self.armed = Some((keep, names));
+                self.armed = Some(Down::PowerCut { keep, names });
             }
+            ServerFault::CrashAt { point, nth, down } => self.hooks.arm(point, nth, down),
             ServerFault::IoErrorAt { after } if self.up.is_some() => {
                 self.disk.fail_at(self.disk.ops() + after, Fault::Error);
             }
@@ -306,16 +356,22 @@ impl Server {
         }
     }
 
-    /// After an input: a commit that failed at a planned power cut kills the process
-    /// (nothing it queued after the failure leaves it); one that failed otherwise has
-    /// stopped the log, and the server is restarted after `down_for`.
+    /// After an input: a crash point reached kills the process there, and a commit
+    /// that failed at a planned crash kills it at the failure (nothing it queued after
+    /// either leaves it); a commit that failed otherwise has stopped the log, and the
+    /// server is restarted after `down_for`.
     fn settle_failure(&mut self) {
+        if let Some((at, how)) = self.dying.take() {
+            self.out.truncate(at);
+            self.down(how);
+            return;
+        }
         let Some(at) = self.up.as_mut().and_then(|up| up.failed_at.take()) else {
             return;
         };
-        if let Some(cut) = self.armed.take() {
+        if let Some(how) = self.armed.take() {
             self.out.truncate(at);
-            self.down(Some(cut));
+            self.down(how);
         } else {
             self.restart_later();
         }
@@ -586,26 +642,6 @@ impl Up {
 
     fn receive(&mut self, now: FarmTime, from: &NodeId, msg: Msg, cx: &mut Cx<'_>) {
         match msg {
-            Msg::Upload { digest } => {
-                let object = ObjectId::new(self.writer, self.next_object);
-                self.next_object += 1;
-                self.uploads.insert(object, (from.clone(), digest));
-                cx.send(cx.store.clone(), Msg::Put { object, digest });
-            }
-            Msg::PutDone { object, digest } => {
-                let Some((client, _)) = self.uploads.remove(&object) else {
-                    return;
-                };
-                let location = Location {
-                    store: StoreId::new(0),
-                    object,
-                    offset: 0,
-                };
-                let put = Command::PutBlob { digest, location };
-                if let Some(Applied::Blob(Ok(_))) = self.commit(cx.out, put) {
-                    cx.send(client, Msg::Uploaded { digest });
-                }
-            }
             Msg::FindMissing { digests } => {
                 let missing = self.query(|m| m.find_missing(&digests)).missing;
                 for digest in digests.iter().filter(|d| !missing.contains(d)) {
@@ -643,7 +679,6 @@ impl Up {
 struct Cx<'a> {
     out: &'a mut Vec<Output<Msg>>,
     seen: &'a mut Seen,
-    store: &'a NodeId,
 }
 
 impl Cx<'_> {
@@ -675,7 +710,6 @@ impl StateMachine for Server {
                     let mut cx = Cx {
                         out: &mut self.out,
                         seen: &mut self.seen,
-                        store: &self.store,
                     };
                     up.commit(cx.out, Command::Tick(now));
                     up.feed(now, SchedEvent::Tick, &mut cx);
@@ -692,17 +726,19 @@ impl StateMachine for Server {
                 }
                 self.start(now, input.entropy);
             }
+            Event::Timer { tag } if tag >= T_PUT => self.put_deadline(tag),
             Event::Timer { tag } => {
                 let index = usize::try_from(tag - T_FAULT).expect("a fault index");
                 let fault = self.plan.faults[index].1;
                 self.fault(fault);
             }
             Event::Message { from, msg } => {
-                if let Some(up) = self.up.as_mut() {
+                // The write path, then reads and the farm core.
+                let rest = self.write_path(now, &from, msg);
+                if let (Some(msg), Some(up)) = (rest, self.up.as_mut()) {
                     let mut cx = Cx {
                         out: &mut self.out,
                         seen: &mut self.seen,
-                        store: &self.store,
                     };
                     up.receive(now, &from, msg, &mut cx);
                 }
