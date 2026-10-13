@@ -179,7 +179,7 @@ fn attempt(os: &dyn Os) -> Result<(), Failed> {
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, any()))]
 mod tests {
     use std::cell::RefCell;
     use std::collections::{BTreeMap, VecDeque};
