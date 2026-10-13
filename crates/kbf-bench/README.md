@@ -32,18 +32,30 @@ one blob), as the daemon does.
 port>`, as the daemon's `--cas`), or its REAPI listener (`https://`, or `http://` when
 it serves plain text). The TLS flags are the daemon's: `--ca-cert`, `--cert`, `--key`,
 `--tls-server-name`; with `--cert` and `--key` the files are loaded by the daemon's own
-loader. One HTTP/2 connection carries every request, as the daemon's does.
+loader. One HTTP/2 connection carries every request, as the daemon's does, with the
+daemon's default HTTP/2 windows (`--transfer-stream-window-bytes`, 8 MiB per stream and
+eight times that for the connection).
 
 ## The requests
 
-- `--method bytestream` (the default): one ByteStream Write per blob, through the
-  daemon's own client (`CasClient::put_chunks`, the call the container driver stores
-  an output file with); `read` uses ByteStream Read.
+- `--method bytestream` (the default): every blob through the daemon's transfer engine
+  (`kbf_transfer::Transfers`), as the daemon moves it. An upload is the engine's
+  `put_chunks`, the call the container driver stores an output file with: the engine
+  asks FindMissing about the blob first (its FindMissing calls coalesce, one call at a
+  time, up to 1000 digests each) and sends one ByteStream Write only when the server
+  lacks it. A blob the server already holds is not sent again and still counts as
+  moved: it is in the CAS. `read` is the engine's ByteStream Read of the blob into
+  memory.
 - `--method batch`: BatchUpdateBlobs (BatchReadBlobs) calls of up to `--batch-bytes` of
-  blob data (default 4 MiB, the front's limit); a larger blob goes by ByteStream.
-- `--in-flight N` (default 64, the daemon's): the most requests at once.
-- `--find-missing on` (upload; default off, as the daemon): FindMissingBlobs first, 1000
-  digests a call, then only the missing blobs.
+  blob data (default 4 MiB, the front's limit), made directly: the engine does not
+  batch yet. A larger blob goes through the engine, as with `bytestream`.
+- `--in-flight N` (default 64, the daemon's): the most requests at once, and the
+  engine's limit for the whole run, as `--transfer-in-flight` is for a daemon; a
+  FindMissing call takes one of those slots too. Every other engine limit is the
+  daemon's default.
+- `--find-missing on` (upload; default off): FindMissingBlobs about the whole tree
+  first, 1000 digests a call, then only the missing blobs. The daemon does not ask for
+  the whole tree first; with `bytestream` the engine still asks about each blob.
 - `--timeout-secs N`: stop after N seconds and report what finished (default 0: wait).
 - `--progress-secs N`: a progress line on stderr every N seconds, and one at the start
   (default 10; 0 for none).
@@ -72,8 +84,9 @@ failed: 0
 - **The table**: per kind of request (`write`, `batch_update`, `find_missing`, `read`,
   `batch_read`), how many were answered, and the nearest-rank percentiles and maximum
   of their times in milliseconds. A request's time runs from when it got an in-flight
-  slot to its answer: for a Write, from the first message sent to the committed size
-  answered, so it is the server's whole store of that blob (for kbf-server: its object
+  slot to its answer: for a `write`, from the engine's FindMissing question about the
+  blob to the committed size answered, so it is the wait for that question plus the
+  server's whole store of that blob (for kbf-server: its object
   PUT, the read-back of the segment and the metadata commit) plus the network.
   kbf-bench cannot split that time into those stages; only the server's own timers
   can.
