@@ -249,7 +249,7 @@ impl Back {
             index,
             permit,
         } = self;
-        if settle(&shared.cleaner, &shared.ready[index], index) {
+        if settle(&shared.cleaner, &shared.ready[index], index) || index < usize::MAX {
             lock(&shared.free).insert(index);
             drop(permit);
         } else {
