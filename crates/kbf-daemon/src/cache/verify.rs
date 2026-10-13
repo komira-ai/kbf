@@ -1,6 +1,6 @@
 //! The checks an entry passes before a lease uses it
 //! (`docs/design/worker-cache.md#63-integrity`): a stat check on every hit, and a
-//! re-hash of a file found at a key's name that the index does not list.
+//! re-hash on its first use after each start (lazy verify).
 //!
 //! The stat check catches accidents (a mode or owner changed by hand, a truncated
 //! file), not a writer with the daemon's uid, who can restore every field: entries are

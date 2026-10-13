@@ -16,6 +16,8 @@ test = false
 
 [dependencies]
 clap.workspace = true
+# The input cache's index snapshot (`cache::index`).
+crc32fast.workspace = true
 futures.workspace = true
 hex.workspace = true
 kbf-caps.workspace = true

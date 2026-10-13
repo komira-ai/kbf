@@ -5,9 +5,11 @@
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::Path;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crate::support::cache_kit::{
-    CountingCas, FakeClock, Gates, config, digest, entry_path, file, key, lease, stop, tmp_files,
+    CountingCas, FakeClock, Gates, config, digest, entries, entry_path, file, key, lease,
+    on_disk_sum, stop, tmp_files,
 };
 use crate::support::scratch;
 use kbf_daemon::cache::{Cache, Disabled, Point};
@@ -24,7 +26,7 @@ fn refused(dir: &Path) -> Option<Disabled> {
 
 /// Catches a cache directory a lease sweep would delete accepted, and a directory the
 /// cache cannot own taken as an empty cache: a missing directory, a `v1` that is a
-/// file, a `tmp/` that cannot be cleared.
+/// file, a `tmp/` that cannot be cleared, an `index.snap.tmp` that cannot be removed.
 /// Each is refused with its reason, and the daemon then runs uncached.
 #[test]
 fn directories_the_cache_cannot_own_are_refused() {
@@ -50,6 +52,11 @@ fn directories_the_cache_cannot_own_are_refused() {
     let subdir = base.join("subdir");
     std::fs::create_dir_all(subdir.join("cache/v1/tmp/left")).expect("dirs");
     assert!(matches!(refused(&subdir), Some(Disabled::Unusable(why)) if why.contains("tmp")));
+    let snap = base.join("snap");
+    std::fs::create_dir_all(snap.join("cache/v1/index.snap.tmp")).expect("dirs");
+    assert!(
+        matches!(refused(&snap), Some(Disabled::Unusable(why)) if why.contains("index.snap.tmp"))
+    );
     let blobs = base.join("blobs");
     std::fs::create_dir_all(blobs.join("cache/v1/blobs")).expect("dirs");
     chmod(&blobs.join("cache/v1/blobs"), 0o500);
@@ -121,7 +128,6 @@ fn an_absent_scratch_directory_is_judged_by_its_parent() {
     let cache = Cache::open(config.clone()).expect("open");
     assert_eq!(cache.link_mode().to_string(), "hardlink");
     assert!(cache.link_max() > 1000);
-    assert!(format!("{cache:?}").contains("cache"));
     stop(cache, &gates);
     // One that cannot be looked at is taken as another filesystem's.
     let shut = dir.join("shut");
@@ -131,6 +137,37 @@ fn an_absent_scratch_directory_is_judged_by_its_parent() {
     let cache = Cache::open(config).expect("open");
     chmod(&shut, 0o700);
     assert_eq!(cache.link_mode().to_string(), "copy");
+    stop(cache, &gates);
+}
+
+/// Catches files under `blobs/` that are not entries counted, adopted, or removed: a
+/// name that is not a key, a key's name in another prefix's directory, a directory and
+/// a file of the wrong size under a key's name, and a prefix directory that cannot be
+/// listed. They are counted as foreign, left in place, and kept out of the total.
+#[test]
+fn foreign_files_are_counted_and_left_alone() {
+    let dir = scratch("cache-foreign");
+    let gates = Gates::new();
+    let cache =
+        Cache::open(config(&dir, GIB, Arc::clone(&gates), &FakeClock::at(1000))).expect("open");
+    let blobs = dir.join("cache/v1/blobs");
+    let k = key(b"some bytes", false);
+    std::fs::write(blobs.join("00/junk"), b"junk").expect("junk");
+    let other = if k.hash[0] == 0 { "01" } else { "00" };
+    std::fs::write(blobs.join(other).join(k.name()), b"some bytes").expect("wrong prefix");
+    std::fs::create_dir(entry_path(&dir, &k)).expect("a directory");
+    let sized = key(b"sized", true);
+    std::fs::write(entry_path(&dir, &sized), b"not five").expect("wrong size");
+    let unreadable = blobs.join("ff");
+    chmod(&unreadable, 0o000);
+    cache.adopt_pass();
+    chmod(&unreadable, 0o700);
+    let stats = cache.stats();
+    assert_eq!(
+        (stats.foreign_files, stats.adopted_entries, stats.bytes),
+        (4, 0, 0)
+    );
+    assert!(blobs.join("00/junk").exists() && entry_path(&dir, &sized).exists());
     stop(cache, &gates);
 }
 
@@ -194,8 +231,8 @@ async fn cache_io_errors_never_fail_a_lease() {
 
 /// Catches a file another process made at a key's name during its fill being linked
 /// or indexed unhashed (the "on EEXIST, link it without hashing" mutant): the rename
-/// refuses, the lease gets the fetched bytes and the key stays out of the index; the
-/// next fill finds the file, re-hashes it, finds it wrong, unlinks it and fetches the
+/// refuses, the lease gets the fetched bytes, the key is recorded, the next pass adopts
+/// the file unverified, and its first use re-hashes it, finds it wrong, and fetches the
 /// blob again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_file_made_outside_during_a_fill_is_never_served_unhashed() {
@@ -231,15 +268,138 @@ async fn a_file_made_outside_during_a_fill_is_never_served_unhashed() {
         std::fs::metadata(&outside).expect("e").ino()
     );
     assert!(!cache.holds(&k));
+    cache.adopt_pass();
+    assert!(cache.holds(&k), "the recorded key was not adopted");
     let (at, _) = lease(&cas, &cache, &root, &dir, "two").await.expect("two");
     assert_eq!(std::fs::read(at.join("f")).expect("read"), b"the right one");
     assert_eq!(cas.reads_of(&digest(b"the right one")), 2);
-    assert!(cache.holds(&k));
+    assert_eq!(cache.stats().verify_failures, 1);
     stop(cache, &gates);
 }
 
-/// Catches a free-space round that never ends once the floor is met: with a floor the
-/// filesystem has, nothing is evicted.
+/// Catches a failed snapshot write losing the previous snapshot or going uncounted:
+/// with `index.snap.tmp` made a directory, the write fails, and the previous snapshot
+/// is what the next start loads.
+#[tokio::test]
+async fn a_failed_snapshot_write_keeps_the_previous_one() {
+    let dir = scratch("cache-snapfail");
+    let gates = Gates::new();
+    // The background thread's snapshots are held off: they would race the test's.
+    let held = gates.hold(|p| *p == Point::PassStarts);
+    let cache =
+        Cache::open(config(&dir, GIB, Arc::clone(&gates), &FakeClock::at(1000))).expect("open");
+    gates.wait_reached(held);
+    let cas = CountingCas::default();
+    lease(
+        &cas,
+        &cache,
+        &cas.tree(&[file("a", b"saved", false)]),
+        &dir,
+        "a",
+    )
+    .await
+    .expect("a");
+    cache.write_snapshot().expect("saved");
+    lease(
+        &cas,
+        &cache,
+        &cas.tree(&[file("b", b"not saved", false)]),
+        &dir,
+        "b",
+    )
+    .await
+    .expect("b");
+    std::fs::create_dir(dir.join("cache/v1/index.snap.tmp")).expect("in the way");
+    assert!(cache.write_snapshot().is_err());
+    assert!(cache.stats().snapshot_failures >= 1);
+    stop(cache, &gates);
+    std::fs::remove_dir(dir.join("cache/v1/index.snap.tmp")).expect("out of the way");
+    let gates = Gates::new();
+    let pass = gates.hold(|p| *p == Point::PassStarts);
+    let cache =
+        Cache::open(config(&dir, GIB, Arc::clone(&gates), &FakeClock::at(2000))).expect("open");
+    gates.wait_reached(pass);
+    assert!(cache.holds(&key(b"saved", false)));
+    assert!(!cache.holds(&key(b"not saved", false)));
+    gates.release(pass);
+    stop(cache, &gates);
+}
+
+/// Catches snapshots or passes that never come again after the first: with both a few
+/// milliseconds apart, several of each run; a stop then ends the thread at once.
+#[test]
+fn snapshots_and_passes_repeat_on_their_intervals() {
+    let dir = scratch("cache-periodic");
+    let gates = Gates::new();
+    let mut config = config(&dir, GIB, Arc::clone(&gates), &FakeClock::at(1000));
+    config.snapshot_every = Duration::from_millis(20);
+    config.pass_every = Duration::from_millis(30);
+    let cache = Cache::open(config).expect("open");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while gates.points().iter().filter(|p| *p == "Listed(0)").count() < 3
+        || cache.stats().snapshots < 8
+    {
+        assert!(Instant::now() < deadline, "{:?}", cache.stats());
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let started = Instant::now();
+    stop(cache, &gates);
+    assert!(started.elapsed() < Duration::from_secs(5));
+}
+
+/// Catches a stop that waits for a pass's pause between directories, a second stop
+/// that hangs or fails, and the pause kept under free-space pressure (the pass would
+/// take 256 of these pauses): with a pause of an hour, a stop ends the paused pass at
+/// once; with the floor unreachable, a pass runs through without one.
+#[tokio::test]
+async fn the_pass_pause_yields_to_a_stop_and_to_free_space_pressure() {
+    let dir = scratch("cache-pace");
+    let gates = Gates::new();
+    let mut paced = config(&dir, GIB, Arc::clone(&gates), &FakeClock::at(1000));
+    paced.pass_pace = Duration::from_secs(3600);
+    let cache = Cache::open(paced.clone()).expect("open");
+    let started = Instant::now();
+    while !gates.points().iter().any(|p| p == "Listed(0)") {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    cache.stop();
+    cache.stop();
+    // A pass asked of a stopped cache does nothing.
+    cache.adopt_pass();
+    assert!(started.elapsed() < Duration::from_secs(30));
+    assert!(format!("{cache:?}").contains("cache"));
+    drop(cache);
+    let gates = Gates::new();
+    paced.hooks = Arc::clone(&gates) as _;
+    paced.min_free_bytes = u64::MAX;
+    let pass = gates.hold(|p| *p == Point::PassStarts);
+    let cache = Cache::open(paced).expect("open");
+    gates.wait_reached(pass);
+    let cas = CountingCas::default();
+    lease(
+        &cas,
+        &cache,
+        &cas.tree(&[file("a", b"pressure", false)]),
+        &dir,
+        "a",
+    )
+    .await
+    .expect("a");
+    assert!(cache.stats().floor_unreachable > 0);
+    let started = Instant::now();
+    cache.adopt_pass();
+    assert!(
+        started.elapsed() < Duration::from_secs(30),
+        "the pass paused under pressure"
+    );
+    assert_eq!(cache.stats().bytes, on_disk_sum(&dir));
+    assert_eq!(entries(&dir).len(), 1);
+    gates.release(pass);
+    stop(cache, &gates);
+}
+
+/// Catches a free-space round that never ends once the floor is met, and the pressure
+/// flag left set: with a floor the filesystem has, nothing is evicted.
 #[tokio::test]
 async fn a_floor_the_filesystem_meets_evicts_nothing() {
     let dir = scratch("cache-floor-met");

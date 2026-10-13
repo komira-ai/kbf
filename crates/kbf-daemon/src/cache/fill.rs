@@ -4,14 +4,14 @@
 //!
 //! Under the slot (`settle`), the final name is looked at first. A file there that
 //! passes the stat check and hashes to the key is used (adopted into the index if it
-//! was not in it: a previous run left it). A file that fails either is
+//! was not in it: inserted after the last snapshot). A file that fails either is
 //! unlinked. Only then is the blob fetched, from the other key of the same blob when
 //! that one is indexed (a local copy), else from the CAS, and inserted: written into
 //! `tmp/`, chmodded 0444 or 0555, dated [`FIXED_MTIME`], closed, and renamed into
 //! `blobs/` with `RENAME_NOREPLACE`. While the slot is held nothing in the daemon
 //! makes that name, so `EEXIST` means something outside did: the fill removes its
-//! temporary file, and the lease writes the bytes itself. Any other I/O error in the
-//! cache does the same: the cache never
+//! temporary file, the lease writes the bytes itself, and the key is recorded for the
+//! next adopt pass. Any other I/O error in the cache does the same: the cache never
 //! fails a lease that would run without it.
 
 use std::io::{ErrorKind, Write as _};
@@ -71,7 +71,7 @@ pub struct InputStats {
     pub cache_misses: u64,
     /// Keys this lease waited on another's fill for.
     pub fill_waits: u64,
-    /// Files this lease re-hashed: found at a key's name, not in the index.
+    /// Entries this lease re-hashed (their first use since the start).
     pub verify_hashes: u64,
     /// Blob bytes fetched from the CAS for this lease.
     pub fetched_bytes: u64,
@@ -172,7 +172,7 @@ impl Inner {
 
 /// What a lease does next for a key.
 enum Step<'a> {
-    /// The entry is indexed: stat-check it and use it.
+    /// The entry is indexed and verified: stat-check it and use it.
     Hit,
     /// Someone holds the slot: wait, then look again.
     Wait(watch::Receiver<Option<Option<CasError>>>),
@@ -246,8 +246,8 @@ impl Cache {
                 bump(&counts.verify_hashes);
                 let now = inner.now();
                 let mut state = inner.state();
-                state.index.touch(&key, now);
-                state.index.insert(key, now);
+                state.index.touch(&key, now, true);
+                state.index.insert(key, now, true);
                 let source = Source::Entry { path, nlink };
                 // A file the index did not list is a miss, adopted: nothing fetched.
                 return Ok(Got {
@@ -303,16 +303,16 @@ impl Cache {
 }
 
 impl Inner {
-    /// The next step for `key`: its slot is waited on whoever holds it, an indexed entry
-    /// is a hit (unless `force`), and anything else takes the slot.
+    /// The next step for `key`: its slot is waited on whoever holds it, an indexed and
+    /// verified entry is a hit (unless `force`), and anything else takes the slot.
     fn step(&self, key: Key, force: bool) -> Step<'_> {
         let now = self.now();
         let mut state = self.state();
         if let Some(slot) = state.slots.get(&key) {
             return Step::Wait(slot.done.clone());
         }
-        if !force && state.index.get(&key).is_some() {
-            state.index.touch(&key, now);
+        if !force && state.index.get(&key).is_some_and(|entry| entry.verified) {
+            state.index.touch(&key, now, false);
             return Step::Hit;
         }
         Step::Own(self.take(&mut state, key))
@@ -328,7 +328,7 @@ impl Inner {
         match self.write_entry(&key, &bytes, &tmp, &path) {
             Ok(()) => {
                 let now = self.now();
-                self.state().index.insert(key, now);
+                self.state().index.insert(key, now, true);
                 self.evict();
                 Source::Entry { path, nlink: 1 }
             }
@@ -336,6 +336,7 @@ impl Inner {
                 let _ = std::fs::remove_file(&tmp);
                 if e.kind() == ErrorKind::AlreadyExists {
                     tracing::warn!("cache: {} appeared during its fill", key.name());
+                    self.state().unindexed.insert(key);
                 } else {
                     tracing::warn!("cache: {} not inserted: {e}", key.name());
                     self.evict();

@@ -1,11 +1,11 @@
-//! Unit tests of the cache's parts: key names, the index, the stat check.
+//! Unit tests of the cache's parts: key names, the snapshot format, the stat check.
 
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::PathBuf;
 
 use kbf_proto::reapi::Digest;
 
-use super::index::Index;
+use super::index::{Discarded, Index, Record, decode, encode};
 use super::layout::{Key, link_max, swept_name};
 use super::verify::{Found, inspect, stat_check};
 use super::{InputStats, LinkMode};
@@ -63,27 +63,85 @@ fn key_names_round_trip_and_nothing_else_parses() {
     );
 }
 
+fn records() -> Vec<Record> {
+    let mut records: Vec<Record> = (0..3_u8)
+        .map(|i| Record {
+            key: Key::of(&digest_of(&[i]), i == 1).expect("a key"),
+            last_use: 1000 + u64::from(i),
+        })
+        .collect();
+    records.sort_by_key(|r| r.key);
+    records
+}
+
+/// Catches an encoding that does not decode to itself, and each malformed snapshot
+/// read as entries: too short for a header, a length that is not the count's, a CRC
+/// that does not match, another magic or version, a key listed twice.
+#[test]
+fn snapshots_decode_only_when_whole() {
+    let good = encode(&records());
+    assert_eq!(good.len(), 16 + 8 + 3 * 56 + 4);
+    assert_eq!(decode(&good), Ok(records()));
+    assert_eq!(decode(&encode(&[])), Ok(Vec::new()));
+    let recrc = |mut bytes: Vec<u8>| {
+        let at = bytes.len() - 4;
+        let crc = crc32fast::hash(&bytes[..at]);
+        bytes[at..].copy_from_slice(&crc.to_le_bytes());
+        bytes
+    };
+    assert_eq!(decode(&good[..27]), Err(Discarded::Corrupt));
+    let mut header_only = good[..16].to_vec();
+    header_only.extend_from_slice(&[0; 4]);
+    let header_only = recrc(header_only);
+    assert_eq!(
+        decode(&header_only),
+        Err(Discarded::Corrupt),
+        "short, with a CRC that matches"
+    );
+    let mut flipped = good.clone();
+    flipped[30] ^= 1;
+    assert_eq!(decode(&flipped), Err(Discarded::Corrupt));
+    let mut magic = good.clone();
+    magic[0] = b'X';
+    assert_eq!(decode(&recrc(magic)), Err(Discarded::Version));
+    let mut version = good.clone();
+    version[8] = 2;
+    assert_eq!(decode(&recrc(version)), Err(Discarded::Version));
+    let mut counted = good.clone();
+    counted[16] = 4;
+    assert_eq!(decode(&recrc(counted)), Err(Discarded::Corrupt));
+    let mut huge = good.clone();
+    huge[16..24].copy_from_slice(&u64::MAX.to_le_bytes());
+    assert_eq!(decode(&recrc(huge)), Err(Discarded::Corrupt));
+    let mut twice = good.clone();
+    let first = twice[24..80].to_vec();
+    twice[80..136].copy_from_slice(&first);
+    assert_eq!(decode(&recrc(twice)), Err(Discarded::Corrupt));
+    for why in [Discarded::Missing, Discarded::Corrupt, Discarded::Version] {
+        assert!(!why.word().is_empty());
+    }
+}
+
 /// Catches an index whose total or LRU order drifts: inserts count once, removals
-/// uncount, and a touch moves a key to the newest end.
+/// uncount, a touch moves a key to the newest end, and the records come out in key
+/// order.
 #[test]
 fn the_index_counts_each_key_once_in_lru_order() {
-    let mut index = Index::default();
-    let keys: Vec<Key> = (0..3_u8)
-        .map(|i| Key::of(&digest_of(&[i]), i == 1).expect("a key"))
-        .collect();
-    for (at, key) in keys.iter().enumerate() {
-        assert!(index.insert(*key, 1000 + at as u64));
-    }
+    let mut index = Index::loaded(&records());
+    let keys: Vec<Key> = records().iter().map(|r| r.key).collect();
     assert_eq!(index.total(), 3);
-    assert!(!index.insert(keys[0], 5), "a key added twice");
+    assert!(!index.insert(keys[0], 5, true), "a key added twice");
     assert_eq!(index.total(), 3);
-    assert_eq!(index.oldest().next(), Some(&keys[0]));
-    index.touch(&keys[0], 2000);
+    index.touch(&keys[0], 2000, true);
     assert_eq!(index.oldest().last(), Some(&keys[0]));
-    assert!(index.get(&keys[0]).is_some_and(|e| e.last_use == 2000));
+    assert!(index.get(&keys[0]).is_some_and(|e| e.verified));
     assert!(index.remove(&keys[1]));
     assert!(!index.remove(&keys[1]));
     assert_eq!((index.total(), index.len()), (2, 2));
+    let under = index.under(keys[2].hash[0]);
+    assert!(under.contains(&keys[2]));
+    assert!(index.under(0xff).iter().all(|k| k.hash[0] == 0xff));
+    assert_eq!(index.records().len(), 2);
 }
 
 /// Catches a stat check that passes a file of another owner, mode, size or type, or
@@ -143,8 +201,7 @@ async fn a_panic_on_the_blocking_pool_is_resumed() {
     assert_eq!(super::fill::blocking(|| 7).await, 7);
     assert_eq!(LinkMode::Copy.to_string(), "copy");
     assert!(super::system_clock()() > 1_000_000_000);
-    let key = Key::of(&digest_of(b""), false).expect("a key");
-    super::Hooks::at(&super::NoHooks, super::Point::Evicting(&key));
+    super::Hooks::at(&super::NoHooks, super::Point::PassStarts);
     for (disabled, word) in [
         (super::Disabled::Locked, "locked"),
         (super::Disabled::Unusable(String::new()), "unusable"),
