@@ -2,14 +2,16 @@
 //! fetch per blob however many leases want it, links of one inode per key per lease,
 //! the fallbacks to a private copy, the checks on every hit, eviction by budget and by
 //! free space, and the one-owner lock; restarts (`restart`), crashes (`crash`) and
-//! refusals and I/O errors (`edges`). One test binary, so each part of the cache is
-//! measured in one place.
+//! refusals and I/O errors (`edges`); measurements at 1M entries, off the gate
+//! (`measure`). One test binary, so each part of the cache is measured in one place.
 #![cfg(target_os = "linux")]
 
 #[path = "cache/crash.rs"]
 mod crash;
 #[path = "cache/edges.rs"]
 mod edges;
+#[path = "cache/measure.rs"]
+mod measure;
 #[path = "cache/restart.rs"]
 mod restart;
 mod support;
