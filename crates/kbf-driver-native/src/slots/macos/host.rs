@@ -77,7 +77,15 @@ impl Os for MacSlot<'_> {
         match step {
             Step::Bootout => {
                 uid::bootout(user.uid, uid::BOOTOUT_WITHIN);
-                Ok(())
+                // What the domain's bootout leaves loaded, but launchd's own agents.
+                let mut failed = Vec::new();
+                for service in services_of(user.uid).iter().filter(|s| !s.apple()) {
+                    let target = format!("user/{}/{}", user.uid, service.label);
+                    if let Err(why) = run(uid::LAUNCHCTL, &["bootout", &target]) {
+                        failed.push(why);
+                    }
+                }
+                joined(failed)
             }
             Step::Schedules => complete(&sweep::sweep(
                 &SweepPlan::macos_schedules(),
@@ -121,16 +129,33 @@ impl Os for MacSlot<'_> {
         let user = &self.ready.user;
         let mut left = Vec::new();
         let mut note = |step, what: String| left.push(Left { step, what });
-        match uid::processes(user.uid) {
-            Ok(pids) if pids.is_empty() => {}
-            Ok(pids) => note(Step::Kill, format!("processes {:?}", named(&pids))),
+        // The processes first, then the services: a process started in between is in
+        // neither list, never in the first alone.
+        let pids = uid::processes(user.uid);
+        let services = services_of(user.uid);
+        // launchd starts its own agents of the domain again on demand (`distnoted`,
+        // measured), as the uid: fresh processes, holding nothing of a lease.
+        let apple: Vec<i32> = (services.iter())
+            .filter(|s| s.apple())
+            .filter_map(|s| s.pid)
+            .collect();
+        match pids {
+            Ok(mut pids) => {
+                pids.retain(|pid| !apple.contains(pid));
+                if !pids.is_empty() {
+                    note(Step::Kill, format!("processes {:?}", named(&pids)));
+                }
+            }
             Err(why) => note(Step::Kill, format!("processes: {why}")),
         }
-        let services = services_of(user.uid);
-        if !services.is_empty() {
+        let jobs: Vec<&str> = (services.iter())
+            .filter(|s| !s.apple())
+            .map(|s| s.label.as_str())
+            .collect();
+        if !jobs.is_empty() {
             note(
                 Step::Bootout,
-                format!("jobs in user/{}: {services:?}", user.uid),
+                format!("jobs in user/{}: {jobs:?}", user.uid),
             );
         }
         for (step, plan) in [
@@ -491,12 +516,25 @@ fn attributes(record: &str) -> Result<Vec<(&'static str, Vec<String>)>, String> 
     Ok(kept)
 }
 
-/// The services `launchctl print user/<uid>` lists, by label, but Apple's: launchd loads
-/// its own per-user agents (`com.apple.*`, from `/System/Library/LaunchAgents`) into
-/// every user domain, and the bootout leaves them listed, not running. None when the
-/// domain is gone (or cannot be printed, which the kill and the other checks then
-/// stand in for).
-fn services_of(uid: u32) -> Vec<String> {
+/// One service of a launchd domain, as `launchctl print` lists it.
+struct Service {
+    /// Its process, while it runs.
+    pid: Option<i32>,
+    label: String,
+}
+
+impl Service {
+    /// Whether it is one of launchd's own per-user agents (`com.apple.*`, from
+    /// `/System/Library/LaunchAgents`), which launchd loads into every user domain, which
+    /// the domain's bootout leaves loaded, and which it starts again on demand.
+    fn apple(&self) -> bool {
+        self.label.starts_with("com.apple.")
+    }
+}
+
+/// The services `launchctl print user/<uid>` lists: none when the domain is gone (or
+/// cannot be printed, which the kill and the other checks then stand in for).
+fn services_of(uid: u32) -> Vec<Service> {
     let out = Command::new(uid::LAUNCHCTL)
         .args(["print", &format!("user/{uid}")])
         .env_clear()
@@ -505,16 +543,19 @@ fn services_of(uid: u32) -> Vec<String> {
     let Some(out) = out.ok().filter(|out| out.status.success()) else {
         return Vec::new();
     };
-    // `\tservices = {`, one service per line, then `\t}`.
+    // `services = {`, one `<pid, 0 when not running> <last exit or -> <label>` per line,
+    // then `}`.
     String::from_utf8_lossy(&out.stdout)
         .lines()
         .skip_while(|line| line.trim() != "services = {")
         .skip(1)
         .take_while(|line| line.trim() != "}")
-        // `<status> <pid or -> <label>`.
-        .filter_map(|line| line.split_whitespace().last())
-        .filter(|label| !label.starts_with("com.apple."))
-        .map(str::to_owned)
+        .filter_map(|line| {
+            let words: Vec<&str> = line.split_whitespace().collect();
+            let label = (*words.last()?).to_owned();
+            let pid = (words.first()?.parse().ok()).filter(|pid: &i32| *pid > 0);
+            Some(Service { pid, label })
+        })
         .collect()
 }
 
