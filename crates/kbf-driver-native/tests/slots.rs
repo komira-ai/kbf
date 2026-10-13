@@ -85,6 +85,16 @@ impl Scratch {
     fn leases(&self) -> PathBuf {
         self.0.join("leases")
     }
+
+    /// A copy of `/bin/sleep`, root's and setuid: started by a slot user, it runs with
+    /// the effective uid 0 and the user's real uid.
+    fn setuid_sleep(&self) -> PathBuf {
+        let path = self.0.join("setuid-sleep");
+        std::fs::copy("/bin/sleep", &path).expect("copy sleep");
+        std::os::unix::fs::chown(&path, Some(0), Some(0)).expect("chown");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o4755)).expect("chmod");
+        path
+    }
 }
 
 impl Drop for Scratch {
@@ -196,6 +206,20 @@ fn name_of(uid: u32) -> Option<String> {
         .then(|| String::from_utf8_lossy(&out.stdout).trim().to_owned())
 }
 
+/// The effective and real uid of `pid`, as `ps` reports them.
+fn ids_of(pid: i32) -> Option<(u32, u32)> {
+    let out = Command::new("/bin/ps")
+        .args(["-o", "uid=,ruid=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut ids = text.split_whitespace().map(str::parse::<u32>);
+    match (ids.next(), ids.next()) {
+        (Some(Ok(euid)), Some(Ok(ruid))) => Some((euid, ruid)),
+        _ => None,
+    }
+}
+
 fn run(program: &str, args: &[&str]) {
     let out = Command::new(program).args(args).output().expect(program);
     assert!(
@@ -278,9 +302,16 @@ fn leave_a_sleeper(act: &str) -> Vec<String> {
 /// (the sleeper's parent exited before any poll saw it): no process of the slot's uid
 /// may be left once the lease has ended. Also catches a kill that reaches past the
 /// uid (a root `sleep` and another slot's `sleep` live on), an action that does not
-/// run as its slot's user or loses its environment on the way, and a slot that cannot
-/// be used again after its kill (the second lease, on the same slot, runs and exits
-/// with its own code).
+/// run as its slot's user or loses its environment on the way, one started without
+/// `launchctl asuser` (with a plain setuid it stays in the daemon's bootstrap
+/// namespace, whose manager is not the slot's uid), and a slot that cannot be used
+/// again after its kill (the second lease, on the same slot, runs and exits with its
+/// own code).
+///
+/// A setuid-root process the slot user started (effective uid 0, real uid the
+/// slot's) is listed among the uid's processes by its real uid, left out of the
+/// memory watch's effective-uid list, and ended with the lease: catches the kill's
+/// list without `PROC_RUID_ONLY` and the watch's list by real uid.
 #[ignore = "needs root and real users: cargo xtask sudo-test -p kbf-driver-native --test slots"]
 #[tokio::test]
 async fn an_action_ends_with_every_process_of_its_uid_and_nothing_else() {
@@ -293,8 +324,32 @@ async fn an_action_ends_with_every_process_of_its_uid_and_nothing_else() {
     // After the start, which ends every process of every slot.
     let mut root_sleep = sleeper(None);
     let mut other_sleep = sleeper(Some(other));
+    let mut setuid = Command::new(scratch.setuid_sleep())
+        .arg("300")
+        .stdin(Stdio::null())
+        .uid(mine.uid)
+        .gid(mine.gid)
+        .spawn()
+        .expect("the setuid sleep");
+    let setuid_pid = i32::try_from(setuid.id()).expect("pid");
+    let setuid_ids = ids_of(setuid_pid);
+    let listed = uid::processes(mine.uid).expect("list");
+    let watched = uid::effective(mine.uid).expect("list");
     let mut steps = leave_a_sleeper(&scratch.act());
-    steps.extend([";", "id", ";", "env", "TMPDIR"].map(str::to_owned));
+    steps.extend(
+        [
+            ";",
+            "id",
+            ";",
+            "env",
+            "TMPDIR",
+            ";",
+            "run",
+            uid::LAUNCHCTL,
+            "manageruid",
+        ]
+        .map(str::to_owned),
+    );
     let argv: Vec<&str> = steps.iter().map(String::as_str).collect();
     let first = lease(&rt, &cas, 1, &Spec::argv(&argv)).await;
     let out = stdout(&cas, &first);
@@ -302,15 +357,39 @@ async fn an_action_ends_with_every_process_of_its_uid_and_nothing_else() {
     let left = uid::processes(mine.uid).expect("list");
     let root_lives = alive(i32::try_from(root_sleep.id()).expect("pid"));
     let other_lives = alive(i32::try_from(other_sleep.id()).expect("pid"));
-    for child in [&mut root_sleep, &mut other_sleep] {
+    let setuid_lives = alive(setuid_pid);
+    for child in [&mut root_sleep, &mut other_sleep, &mut setuid] {
         let _ = child.kill();
         let _ = child.wait();
     }
+    assert_eq!(
+        setuid_ids,
+        Some((0, mine.uid)),
+        "the setuid sleep {setuid_pid} is not root's by its effective uid and the slot's by its real one"
+    );
+    assert!(
+        listed.contains(&setuid_pid),
+        "the setuid sleep {setuid_pid} is not among uid {}'s processes: {listed:?}",
+        mine.uid
+    );
+    assert!(
+        !watched.contains(&setuid_pid),
+        "the memory watch's list holds the setuid sleep {setuid_pid}: {watched:?}"
+    );
+    assert!(
+        !setuid_lives,
+        "the setuid sleep {setuid_pid} outlived its lease"
+    );
     assert_eq!(first.exit_code, 0, "{out}");
-    let [sleeper, id, tmpdir] = lines[..] else {
+    let [sleeper, id, tmpdir, manager] = lines[..] else {
         panic!("the action printed {out:?}");
     };
     assert_eq!(id, mine.uid.to_string(), "the action ran as uid {id}");
+    assert_eq!(
+        manager.split_whitespace().last(),
+        Some(mine.uid.to_string().as_str()),
+        "the action's bootstrap namespace is not the slot's: {manager:?}"
+    );
     let lease_tmp = scratch.leases().join("lease-1-1").join("tmp");
     assert_eq!(
         Path::new(tmpdir),
@@ -511,4 +590,91 @@ fn a_root_daemon_without_a_pool_runs_nothing() {
         !scratch.leases().exists(),
         "it made its scratch root before refusing"
     );
+}
+
+/// The wait for a free slot. With one slot held by a lease that waits for a file:
+/// a second lease waits for the slot and is killed while it waits (it ends `Killed`,
+/// promptly, never having run), and a third waits until the first has ended, then
+/// runs on the same slot. Catches a lease past the last slot that fails ("none free",
+/// as with one permit too many) instead of waiting, a kill that does not reach a lease
+/// waiting for a slot, and a slot a killed waiter keeps.
+#[ignore = "needs root and real users: cargo xtask sudo-test -p kbf-driver-native --test slots"]
+#[tokio::test]
+async fn with_every_slot_held_a_lease_waits_and_a_kill_ends_the_wait() {
+    assert_root();
+    let scratch = Scratch::new("wait");
+    let users = Users::new("wait", 1, &scratch);
+    let user = &users.0[0];
+    let cas = Arc::new(MemoryCas::default());
+    let rt = NativeRuntime::new(config(&scratch, users.pool()), Arc::clone(&cas)).expect("runtime");
+    let act = scratch.act();
+    let hold = Spec::argv(&[
+        &act, "append", "held", "x", ";", "wait-for", "go", "60", ";", "id",
+    ]);
+    let id = Spec::argv(&[&act, "id"]);
+    let root = |seq: u64| scratch.leases().join(format!("lease-1-{seq}")).join("root");
+    let rest = async {
+        let give_up = Instant::now() + PROMPT * 3;
+        while !root(1).join("held").exists() {
+            assert!(
+                Instant::now() < give_up,
+                "the first lease never held its slot"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let kill = async {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            rt.kill(kbf_types::LeaseId::new(1, 2)).await;
+        };
+        let waited = Instant::now();
+        let (killed, ()) = tokio::time::timeout(PROMPT, async {
+            tokio::join!(rt.run(support::work(2, id.store(&cas), 0)), kill)
+        })
+        .await
+        .expect("the waiting lease was not stopped by its kill");
+        let took = waited.elapsed();
+        let mut third = std::pin::pin!(support::run(&rt, &cas, 3, &id));
+        let early = tokio::time::timeout(Duration::from_secs(2), &mut third).await;
+        std::fs::write(root(1).join("go"), b"").expect("go");
+        let third = third.await;
+        (killed, took, early.is_err(), third)
+    };
+    let (first, (killed, took, waited, third)) =
+        tokio::join!(support::run(&rt, &cas, 1, &hold), rest);
+    let first = first.expect("the first lease ran");
+    assert_eq!(first.exit_code, 0, "{}", stdout(&cas, &first));
+    assert!(
+        matches!(killed, Err(kbf_daemon::RuntimeError::Killed)),
+        "the lease killed while it waited for a slot ended {killed:?}"
+    );
+    assert!(took < PROMPT, "the kill took {took:?}");
+    assert!(waited, "the third lease did not wait for the held slot");
+    let third = third.expect("the third lease ran");
+    assert_eq!(third.exit_code, 0, "{}", support::stderr(&cas, &third));
+    assert_eq!(stdout(&cas, &third), format!("{}\n", user.uid));
+}
+
+/// The start. Catches a daemon that starts without ending what a slot user still runs
+/// (a killed daemon's survivors would run beside the next lease): a slot user's
+/// `sleep`, started before the runtime, is gone once the runtime has started.
+#[ignore = "needs root and real users: cargo xtask sudo-test -p kbf-driver-native --test slots"]
+#[test]
+fn the_start_ends_every_process_of_every_slot() {
+    assert_root();
+    let scratch = Scratch::new("start");
+    let users = Users::new("start", 1, &scratch);
+    let mut left = sleeper(Some(&users.0[0]));
+    let pid = i32::try_from(left.id()).expect("pid");
+    let before = alive(pid);
+    let rt = NativeRuntime::new(
+        config(&scratch, users.pool()),
+        Arc::new(MemoryCas::default()),
+    )
+    .expect("runtime");
+    let after = alive(pid);
+    let _ = left.kill();
+    let _ = left.wait();
+    drop(rt);
+    assert!(before, "the slot user's sleep {pid} did not start");
+    assert!(!after, "the slot user's sleep {pid} outlived the start");
 }

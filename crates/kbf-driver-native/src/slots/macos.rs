@@ -185,8 +185,10 @@ impl Slot {
         }
     }
 
-    /// Gives the slot back, once its lease has ended and its lease directory is gone.
-    /// Step 4 of docs/design/macos-end-state.md cleans the slot here first (its home,
+    /// Gives the slot back, once its lease has ended and the clean of its lease
+    /// directory has run, whether or not that removed everything (what is left lies in
+    /// that lease's directory, and the lease reports the failed clean). Step 4 of
+    /// docs/design/macos-end-state.md cleans the slot here first (its home,
     /// `/var/folders` entry, keychains, crontab, `at` jobs, disk images and IPC
     /// objects, then the post-clean check), and keeps a slot whose clean failed out of
     /// the pool; today the slot goes back as it is.
@@ -428,4 +430,80 @@ fn chown_tree(root: &Path, uid: u32, gid: u32) -> io::Result<()> {
 fn lock(free: &Mutex<BTreeSet<usize>>) -> std::sync::MutexGuard<'_, BTreeSet<usize>> {
     // Each update is one set operation, so the set is consistent after a panic.
     free.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Slots over `count` users that no test resolves or kills: the slot bookkeeping
+    /// alone (which slot is free, how many permits), with no user database behind it.
+    fn bookkeeping(count: usize) -> Slots {
+        let ready = (0..count)
+            .map(|i| Ready {
+                user: SlotUser {
+                    name: format!("kbf-unit-slot-{i}"),
+                    uid: 700 + u32::try_from(i).expect("small"),
+                    gid: 700,
+                },
+                home: PathBuf::from("/nonexistent"),
+                folders: PathBuf::from("/nonexistent"),
+                rules: String::new(),
+            })
+            .collect();
+        Slots {
+            ready: Arc::new(ready),
+            free: Arc::new(Mutex::new((0..count).collect())),
+            permits: Arc::new(Semaphore::new(count)),
+            program: PathBuf::from("/nonexistent"),
+        }
+    }
+
+    /// Catches a slot whose processes survived going back to the pool anyway (the next
+    /// lease would run beside them), and one given back healthy that does not: a
+    /// healthy slot is taken again at once, the survivor's is never.
+    #[tokio::test]
+    async fn a_slot_whose_kill_failed_stays_out_of_the_pool() {
+        let slots = bookkeeping(1);
+        let slot = slots.take().await.expect("the only slot");
+        assert_eq!(slot.ready().user.uid, 700);
+        slot.release();
+        let slot = tokio::time::timeout(Duration::from_secs(5), slots.take())
+            .await
+            .expect("a healthy slot goes back")
+            .expect("taken");
+        slot.healthy.store(false, Ordering::SeqCst);
+        slot.release();
+        let again = tokio::time::timeout(Duration::from_millis(300), slots.take()).await;
+        assert!(again.is_err(), "a slot whose kill failed was taken again");
+        assert!(lock(&slots.free).is_empty(), "it is back in the free set");
+    }
+
+    /// Catches a slot lease handed a simulator (it would be made in root's device set,
+    /// which the slot user does not see), and a slot lease refused although it asked
+    /// for none.
+    #[tokio::test]
+    async fn a_slot_lease_is_refused_a_simulator() {
+        let slots = bookkeeping(1);
+        let runner = crate::slots::Runner::Slot(slots.take().await.expect("slot"));
+        let refused = runner.allows_simulator(true).expect_err("a simulator");
+        assert!(refused.to_string().contains("pool user"), "{refused}");
+        assert!(runner.allows_simulator(false).is_ok());
+        runner.release();
+    }
+
+    /// Catches a memory watch that measures nothing (a lease past its memory limit
+    /// would never be stopped): over this process's own uid, which runs this test, it
+    /// measures more than nothing.
+    #[tokio::test]
+    async fn the_watch_measures_the_uids_processes() {
+        let watch = UidWatch {
+            uid: rustix::process::geteuid().as_raw(),
+            record: PathBuf::from("/nonexistent"),
+            healthy: Arc::new(AtomicBool::new(true)),
+            armed: false,
+        };
+        let used = watch.measure().await.expect("measured");
+        assert!(used > 1 << 20, "this uid's processes use {used} bytes");
+    }
 }
