@@ -161,7 +161,9 @@ impl<M: MetaLog, O: ObjectStore + 'static> ByteStream for ByteStreamService<M, O
         // size limit.
         let admitted = self.cache.admit(size).await;
         let mut buffering = self.cache.buffering();
-        let mut received: Vec<u8> = Vec::new();
+        // Allocated at the admitted size, so a growing buffer never holds more than
+        // was admitted (`size` is at most `MAX_BLOB_BYTES`, checked above).
+        let mut received: Vec<u8> = Vec::with_capacity(usize::try_from(size).unwrap_or_default());
         let mut message = first;
         loop {
             if !message.resource_name.is_empty() && message.resource_name != name {

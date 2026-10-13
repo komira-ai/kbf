@@ -118,8 +118,8 @@ fn listeners() -> Listeners {
 /// Catches: an admission taken after buffering, which lets every Write buffer at once;
 /// a connection window smaller than every stream's window, with which the Writes
 /// waiting for admission take the whole window and the admitted ones never finish (the
-/// timeout fires). Mutants seen red: the permit taken in `store_blobs` instead of at
-/// stream start; the listener's flow-control windows left at the transport's defaults.
+/// timeout fires). Mutants seen red: the permit taken in `store_blobs` instead of after
+/// the first message; the listener's flow-control windows left at the transport's defaults.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_writes_stay_under_the_bytes_in_flight() {
     let writes = WriteConfig {

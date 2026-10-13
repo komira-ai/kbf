@@ -77,7 +77,9 @@ calls `store_blobs`) and `put_segment`. It has one **open segment** (a
 2. The group pushes them into the open segment. A digest already in it is a no-op push
    (`SegmentWriter::push` already does this), and both callers wait on that segment.
 3. The open segment is **sealed** when the next blob would not fit (`WriteError::Full`)
-   or when its oldest blob has waited `--write-linger` (in milliseconds, default 2).
+   or when its oldest blob has waited `--write-linger` (in milliseconds, default 2). Each
+   segment's linger timer is set when it opens and seals that segment only: a segment
+   sealed full before its timer fires leaves the next one to its own timer.
 4. A sealed segment is written as today: one `put_new`, the footer read back, one
    `Command::PutBlobs` listing every blob in it. Then every caller with a blob in it is
    answered. A caller whose blobs span two segments is answered when both are settled.
@@ -93,16 +95,19 @@ the committed metadata log**.
 ### 3.2 Large blobs
 
 A blob of `--write-own-segment-bytes` (default 16 MiB) or more bypasses the group and
-is written as a segment of its own (`put_whole`, as today), so it neither waits for a
+is written as a segment of its own (one record, settled like a grouped segment: the
+PUT with its retries, the footer read-back, one `PutBlobs`), so it neither waits for a
 linger nor holds up small writes. It is still held in memory until verified
 (`MAX_BLOB_BYTES`, 1 GiB) until the tier lets it stream to disk (section 6.2).
 
 ### 3.3 Bounds and backpressure
 
 - **Admission.** `--write-bytes-in-flight` (default 2 GiB) is an async semaphore
-  counted in bytes. A ByteStream `Write` takes a permit for the size named in its
-  resource name **before it reads its first message**, so the bytes it buffers in
-  `received` are covered. `BatchUpdateBlobs` takes a permit for its total before it
+  counted in bytes. A ByteStream `Write` reads its first message (which carries the
+  resource name, and so the blob's size), then takes a permit for that size **before it
+  reads any more**, so the bytes it buffers in `received` are covered. `received` is
+  allocated at that size up front, so what is held is what was admitted, not a grown
+  buffer's capacity. `BatchUpdateBlobs` takes a permit for its total before it
   calls `store_blobs`. Own-segment blobs count too. The server refuses to start with a
   value below `MAX_BLOB_BYTES`, so a single legal blob can always be admitted. A caller
   over the bound waits; nothing is refused for load.
@@ -166,7 +171,7 @@ admission rules ([worker-protocol.md](worker-protocol.md#blobs-on-the-worker-lis
    and calls `FindMissingBlobs` once for the set, in batches under the request limit.
 2. It writes the missing blobs with `kbf_segments::SegmentWriter` into one segment, or
    several when they pass `MAX_SEGMENT_BYTES` (128 MiB). A blob larger than that is a
-   segment of one record, as `put_whole` is today. The segment's **footer is the
+   segment of one record, as a large blob is in section 3.2. The segment's **footer is the
    manifest**: (hash, size, offset, crc32c) per record, in the format the store already
    reads. (It is not the chunking `Manifest` of `kbf-segments`.) Records are written to
    a spool file on the worker's disk, not held in memory.
@@ -426,8 +431,8 @@ Estimates from the measured store latency, to be measured on the pilot at each s
 ## 8. Rollout
 
 1. **PR 1, grouping and admission** (`kbf-front`, new module `write_group.rs`, since
-   `cache.rs` is near its size limit): the group, the PUT retry, the admission permit at
-   stream start, the explicit concurrent-stream limit. Flags: `--write-linger`,
+   `cache.rs` is near its size limit): the group, the PUT retry, the admission permit after
+   a `Write`'s first message, the explicit concurrent-stream limit. Flags: `--write-linger`,
    `--write-own-segment-bytes`, `--write-bytes-in-flight`, `--write-puts-in-flight`,
    `--store-put-attempts`. No format change. Ships alone; measure the toolchain upload.
 2. **PR 2, segment upload**: the `Segments` service on the worker listener (`Begin`,
@@ -460,6 +465,7 @@ Grouping (PR 1), over `MemoryStore` wrapped to count and fault requests:
 | commit refused after a good PUT: all fail, nothing present | acknowledging on PUT alone |
 | PUT fails twice, then succeeds, on a `conditional_put` store: one `PutBlobs`, keys differ | retry under the same key |
 | a lone write under a paused clock is sealed at the linger | waiting forever for a full segment |
+| a segment sealed full before its linger: its timer, when it fires, leaves the next open segment open until that segment's own linger | a linger timer sealing whichever segment is open; mutant: the timer takes the open segment without checking its id |
 | a blob at `--write-own-segment-bytes` gets its own segment without the linger | large blobs held up by small ones |
 | the same digest from two callers: one record, both answered | duplicate records; a caller never answered |
 | 48 concurrent `Write`s on one connection, three times the bound in all: peak buffered bytes stay under the bound, every `Write` finishes (built as 4 MiB `Write`s and a 12 MiB bound, not 64 MiB and 1 GiB, so the suite does not hash 3 GiB) | permit taken after buffering; mutant: permit in `store_blobs`; flow-control windows left at the transport's defaults (deadlock) |

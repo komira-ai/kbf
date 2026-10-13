@@ -393,6 +393,45 @@ async fn a_lone_write_is_sealed_at_the_linger() {
     }
 }
 
+/// A segment sealed because it filled up does not take the next segment with it when
+/// its own linger timer fires. With a 1 s linger and room for one 4 KiB blob: `a` opens
+/// segment 0 at t = 0; `b`, stored at t = 0.5 s, does not fit, so segment 0 is sealed
+/// and `b` opens segment 1. At t = 1 s (segment 0's deadline) segment 1 is still open:
+/// one PUT only. `b` returns exactly one linger after it was stored, at t = 1.5 s.
+///
+/// Catches: a linger timer that seals whichever segment is open, so a segment can be
+/// sealed before its oldest blob has waited the linger. Mutant seen red: the timer
+/// takes the open segment without checking its id (`open.take()` for
+/// `open.take_if(|open| open.id == id)`).
+#[tokio::test(start_paused = true)]
+async fn a_full_segments_linger_does_not_seal_the_next_segment() {
+    let linger = Duration::from_secs(1);
+    let (cache, store) = cache(config(|c| c.linger = linger), one_4k_blob()).await;
+    let (a, b) = (blob(18, 4096), blob(19, 4096));
+    let start = Instant::now();
+    let first = spawn_store(&cache, vec![a.clone()]);
+    tokio::time::sleep(linger / 2).await;
+    let second = spawn_store(&cache, vec![b.clone()]);
+    first.await.expect("join").expect("a");
+    assert_eq!(
+        start.elapsed(),
+        linger / 2,
+        "a's full segment is written at once"
+    );
+    assert_eq!(store.put_keys().len(), 1);
+
+    tokio::time::sleep_until(start + linger + Duration::from_millis(1)).await;
+    assert!(!second.is_finished(), "b sealed at a's deadline");
+    assert_eq!(store.put_keys().len(), 1);
+    second.await.expect("join").expect("b");
+    assert_eq!(start.elapsed(), linger + linger / 2);
+    assert_ne!(
+        key_of(&cache, a.digest()).await,
+        key_of(&cache, b.digest()).await
+    );
+    assert_audit_clean(&cache);
+}
+
 /// With a 1 s linger and own segments from 64 KiB, a small write opens a segment and
 /// waits; a 64 KiB blob stored after it returns at once, in an object of its own, while
 /// the small write is still waiting; a blob one byte smaller joins the open segment and
