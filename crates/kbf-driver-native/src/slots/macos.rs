@@ -88,7 +88,8 @@ impl Slots {
     pub async fn take(&self) -> Result<Slot, RuntimeError> {
         let permit = Arc::clone(&self.permits).acquire_owned().await;
         let permit = permit.map_err(|e| RuntimeError::Failed(format!("slots: {e}")))?;
-        let index = lock(&self.free).pop_first();
+        // MUTANT: hand every lease the same slot.
+        let index = lock(&self.free).first().copied().or(Some(0));
         let index = index.ok_or_else(|| RuntimeError::Failed("slots: none free".to_owned()))?;
         Ok(Slot {
             ready: Arc::clone(&self.ready),
