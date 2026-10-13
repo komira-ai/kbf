@@ -1,6 +1,6 @@
 # Worker inputs: a shared blob transfer engine and a per-node NVMe file cache
 
-Status: design, revision 3 (one connection; the cache persists from its first PR). Nothing here is built.
+Status: design, revision 4 (one connection; the cache persists from its first PR, through an on-disk index). Nothing here is built.
 Every "today" claim cites a file on `main` at `d7f25cf` (#524). Every number marked
 *unmeasured* is an estimate that the PR introducing it must replace with a measurement.
 
@@ -65,7 +65,7 @@ nothing; that is a search result, not proof.
 |---|---|---|---|---|
 | Worker cache form | Native: a flat hard-link directory (`hardlinking_file_fetcher.go`). Virtual (the recommended mode): FUSE or NFSv4 over a local block store. | Hard-link directory with 2-character prefix subdirectories (`filecache.go`) | `FastSlowStore`: a local `FilesystemStore` in front of the gRPC CAS | Content-addressed file directory, 2-hex-character subdirectories, on the same filesystem as the lease scratch |
 | Into the action dir | `link()` | `os.Link`; a reflink only for anonymous users or with `local_cache_always_clone` | `hard_link_many`; a directory `clonefile` on macOS | Container: `linkat`. macOS: `clonefile`. Linux native: **no cache** (5.2b) |
-| Across a restart | Hard-link cache **wiped at start** (`main.go` `RemoveAllChildren`). The block store persists only when `persistent` is set. | Rescanned; an optional wipe after an unclean shutdown | Not covered by the research | Kept from the first cache PR: `tmp/` cleared, rescanned, re-hashed on first use |
+| Across a restart | Hard-link cache **wiped at start** (`main.go` `RemoveAllChildren`). The block store persists only when `persistent` is set. | Rescanned; an optional wipe after an unclean shutdown | Not covered by the research | Kept from the first cache PR: `tmp/` cleared, an on-disk index loaded (no scan), re-hashed on first use |
 | Executable bit | A separate key, `+x`/`-x` | Separate entries | A private 0555 copy per digest | A separate key (`.x` suffix) |
 | File mode | 0444/0555, fixed mtime | **0644 (writable)** | 0444/0555 | 0444/0555, owned by the daemon's uid, fixed mtime |
 | What stops an action writing a cached inode | Native: modes, plus privilege separation **when configured** (`bb_runner` `run_commands_as`). The README calls the split what makes hard-link caching safe. Without it, a same-user action can `chmod` and write (the research's inference). Virtual: by construction (`EACCES` on open for write). | Nothing in the code | Read-only modes (files 0444); privilege separation not covered by the research | Container: overlay lower plus an unmapped owner. macOS: a CoW clone, plus a sandbox that denies the cache directory. Linux native: no cache until actions run as another uid. |
@@ -410,6 +410,16 @@ The farm runs only the container driver on Linux.
 
 ## 6. The cache
 
+### Who writes the cache
+
+Only the daemon. A fill downloads the blob into `tmp/`, which only the daemon can reach,
+hashes it while writing and checks the digest, chmods it 0444 (0555 if executable), and
+renames it into `blobs/`. Eviction is the daemon unlinking a name. Nothing ever opens a
+file under `blobs/` for writing. Actions only read: they get hard links (containers) or
+clones (macOS) of cache files, and they run as a uid that cannot write those files (in a
+container the files' owner is unmapped; on macOS the clone is a separate inode and the
+sandbox denies the cache directory). The index (6.9) is written by one daemon thread.
+
 ### 6.1 On-disk layout
 
 ```
@@ -419,11 +429,12 @@ The farm runs only the container driver on Linux.
     blobs/<h0h1>/<sha256>-<size>     non-executable entry, mode 0444
     blobs/<h0h1>/<sha256>-<size>.x   executable entry, mode 0555
     tmp/<random>                     fills in progress
+    index.snap, index.log            the index: every entry's key, size, last use (6.9)
 ```
 
 - **The lock comes first.** At start the daemon opens `<cache-dir>/lock` (creating it if
   absent) and takes the exclusive `flock` **before it touches anything else** under
-  `<cache-dir>`: clearing `tmp/`, the startup scan, and moving an unknown layout
+  `<cache-dir>`: clearing `tmp/`, loading the index, and moving an unknown layout
   version aside all happen only while the lock is held. The lock file sits outside `v1/`
   so that no cleanup can remove it, and the daemon never unlinks it. Otherwise a second
   daemon could delete the first's lock file, create a new one, lock that, and both
@@ -471,10 +482,10 @@ Without `--cache-dir`, none of this changes.
 | An action writes through a cached inode | By construction. Container: overlay lower plus unmapped owner, and the cache is not mounted. macOS: CoW clone, plus a sandbox that denies the cache. Linux native: no cache. | Zero per access |
 | An action reaches the cache directory | Container: not mounted. macOS: sandbox profile (C-3b). Linux native: no cache. | Zero |
 | A daemon bug leaves a partial or wrong file under a final name | Fills land in `tmp/`, hashed while written. They are closed, chmodded and given the fixed mtime, then renamed with `renameat2(RENAME_NOREPLACE)` (macOS: `renamex_np(RENAME_EXCL)`). An existing entry wins and the tmp file is removed, so a live entry's inode is never replaced under a lease. Nothing is ever opened for writing under `blobs/`. | One rename per insert |
-| A crash or power loss mid-insert | Nothing reaches a final name before it is hashed and renamed, and `tmp/` is cleared at start (once the lock is held), so a crash before the rename leaves no entry. A final name whose data never became durable (ext4 delayed allocation) is caught by the size check or by lazy verify. **No fsync per insert**: that would be about 20,000 fsyncs on a cold zig fetch (NativeLink caps its write concurrency because each write syncs). Lazy verify covers the gap. | None per insert |
+| A crash or power loss mid-insert | Nothing reaches a final name before it is hashed and renamed, and `tmp/` is cleared at start (once the lock is held), so a crash before the rename leaves no entry. A crash after the rename but before the index record leaves an orphan, which is never served and is swept (6.8, 6.9). A final name whose data never became durable (ext4 delayed allocation) is caught by the size check or by lazy verify. **No fsync per insert**: that would be about 20,000 fsyncs on a cold zig fetch (NativeLink caps its write concurrency because each write syncs). Lazy verify covers the gap. | None per insert |
 | Bit rot, or an operator editing the cache, across a restart | **Lazy verify**: after each start, an entry is re-hashed the first time a lease uses it, and only then marked verified in memory. A mismatch evicts it, and the lease fetches over the network (`cache_verify_failures`). The zig tree is hashed once per daemon start, not once per action. | Once per entry per start |
 | Accidental mode or owner change | `fstatat` on every hit: owner is the daemon's uid, mode 0444/0555, `st_size` equals the key's size, regular file. A mismatch evicts the entry. **This is a check against accidents, not a defence against a same-uid writer**: that writer can restore every field (5.2b). | One stat per hit |
-| Two daemons on one cache directory | An exclusive `flock` on `<cache-dir>/lock`, taken before any startup cleanup or scan, on a file that is never unlinked (6.1): one owner per directory. A second daemon warns, runs uncached (`cache_disabled_reason=locked`) and changes nothing under `<cache-dir>`. Shared use is refused because each process would rebuild its own byte total, neither would count the other's inserts, and each would evict the other's pinned entries. | None |
+| Two daemons on one cache directory | An exclusive `flock` on `<cache-dir>/lock`, taken before any startup cleanup or index load, on a file that is never unlinked (6.1): one owner per directory. A second daemon warns, runs uncached (`cache_disabled_reason=locked`) and changes nothing under `<cache-dir>`. Shared use is refused because each process would rebuild its own byte total, neither would count the other's inserts, and each would evict the other's pinned entries. | None |
 
 Rejected: re-hashing on every link (the zig tree's full size per action, the very cost
 the cache removes), and trusting entries after a restart without a verify, and wiping the cache at start (6.8).
@@ -507,7 +518,7 @@ the cache removes), and trusting entries after a restart without a verify, and w
   a **400 GB maximum per node**, set in the farm's deploy config, not in kbf. C1 also has
   `--cache-min-free-bytes`, a floor on the filesystem's free space (`statvfs`). The farm's starting floor is 100 GB (*unmeasured*), tuned from
   `cache_evictions` and `cache_floor_unreachable`.
-- **Policy: LRU** by last link time, in memory. Buildbarn recommends RANDOM for the worst
+- **Policy: LRU** by last link time, in memory, persisted through the index (6.9). Buildbarn recommends RANDOM for the worst
   case, but says LRU is needed when inode identity matters, and LRU keeps a hot
   toolchain resident.
 - **Eviction unlinks the cache's name only.** A running lease's links keep the inode alive;
@@ -594,42 +605,146 @@ How it moves:
 ### 6.8 Crash and restart
 
 The cache persists across restarts from its first PR, C1 (komira-build-farm#527 is
-folded into it). There is no wipe-at-start stage: daemons restart on every deploy, and a
-wipe would turn every node cold each time. Start-up, in order:
+folded into it). There is no wipe-at-start stage, and no startup scan: daemons restart on
+every deploy, and neither a cold node nor a node that runs uncached while it lists 400 GB
+of files is acceptable. The daemon keeps an **index** on disk (6.9) and loads it at start.
+Start-up, in order:
 
 1. **Take the lock** (6.1). A daemon that cannot take it touches nothing under
    `<cache-dir>` and runs uncached.
-2. **Clear `tmp/`.** Every file there is a fill that never reached its rename, so no
-   partial file is ever under a final name. Move an unknown layout version aside.
-3. **Scan `blobs/` in the background, with the cache off until the scan ends.** The scan
-   reads each entry's name, size, mode, owner and `st_ctime`, rebuilds the LRU order and
-   the byte total, and evicts (oldest first) until the total is within
-   `--cache-max-bytes` and the free-space floor holds. Only then does the cache serve
-   hits or take inserts. Leases that arrive during the scan run uncached, exactly as
-   with no `--cache-dir`. *Why background rather than a bounded wait:* the daemon takes
-   leases at once, and nothing ever runs against a partial byte total. A miss for an
-   unscanned entry would otherwise race the scan, and inserts made before the total is
-   known could leave the cache over its limit. The scan is metadata only, parallel over
-   the 256 subdirectories; its time is `cache_scan_ms` (*unmeasured*; C1 reports it on a
-   400 GB farm cache).
-4. **Re-hash on first use.** Every scanned entry starts unverified, and is re-hashed the
-   first time a lease uses it (lazy verify, 6.3). A mismatch evicts it and the lease
-   fetches over the network.
+2. **Clear `tmp/`** and `index.snap.tmp`. Every file in `tmp/` is a fill that never
+   reached its rename, so no partial file is ever under a final name. Move an unknown
+   layout version aside, with its index.
+3. **Load the index** (6.9): the snapshot, then the log replayed over it. This yields
+   every entry's key, size and last use, the LRU order and the byte total. A missing,
+   corrupt or unknown-version index is discarded with a warning
+   (`cache_index_discarded=missing|corrupt|version`), and the cache starts empty. Start-up
+   never waits on anything but this read (`cache_index_load_ms`; *unmeasured*, about
+   64 MiB to read at 1M entries).
+4. **Enforce the limits in memory.** If the total exceeds `--cache-max-bytes` (the flag
+   was lowered between runs), the oldest entries by last use leave the in-memory index
+   at once, so nothing serves them, and a background task unlinks their files. Then the
+   cache **serves at once**: hits, fills and inserts.
+5. **Re-hash on first use.** Every loaded entry starts unverified, and is re-hashed the
+   first time a lease uses it (lazy verify, 6.3). The index says what should be on disk,
+   never that the bytes are right. A mismatch evicts the entry and the lease fetches over
+   the network.
+6. **Sweep in the background** (6.9): files on disk that the index does not list are
+   removed, and entries the index lists whose file is gone are dropped. The sweep never
+   blocks a lease.
 
-Recency is rebuilt from `st_ctime`: `link()` and `unlink()` of any name of the inode
-update ctime, so ctime is a "last link or unlink" clock (a lease's links are removed when
-it ends, so this is close to last use), persisted for free. A chmod also updates it, but
-an entry is chmodded only at insert. mtime is fixed, so it cannot serve.
+**Reconciliation instead of a scan.** Disk and index can disagree after a crash in two
+ways, and both are safe:
+
+- **The index lists a file that is gone** (evicted just before a crash, or deleted by an
+  operator). The lease's `linkat` returns ENOENT, which is the existing eviction-race
+  path (6.5): the daemon drops the entry, refills the key and links again. It is a miss,
+  never an error.
+- **A file is present that the index does not list** (a crash between a fill's rename
+  and its index record). It is an **orphan**: lookups go through the in-memory index, so
+  it is never served. A fill for that key finds the name taken (`RENAME_NOREPLACE`
+  returns EEXIST) for a key the index does not hold, unlinks the orphan's name and
+  renames again, once. Otherwise the sweep removes it.
+
+The byte total comes from the index. Orphans are the only bytes on disk it does not
+count, and they are bounded by the fills in flight at the crash; the sweep removes them.
 
 Leases that outlive the daemon are safe: eviction removes only the cache's name, and a
-re-adopted lease's links keep its inodes alive (`daemon.md` § Planned, re-adoption). The
-scan sees their entries with `st_nlink > 1`, which the free-space floor skips (6.5).
+re-adopted lease's links keep its inodes alive (`daemon.md` § Planned, re-adoption).
+Free-space eviction `fstatat`s each candidate and skips `st_nlink > 1` (6.5).
 
 - **Disk full mid-fill.** The write to `tmp/` fails and the tmp file is removed. The lease
   falls back to writing its own copy (today's path), and eviction is kicked. ENOSPC in
-  the cache never fails a lease that today's code would run.
+  the cache never fails a lease that today's code would run. ENOSPC on an index write
+  drops the batch, which is safe (6.9), and is logged.
 - **Cache unusable** (missing, read-only, unknown layout, locked, wrong graph driver,
   native Linux): the daemon warns, reports `cache_disabled_reason`, and runs uncached.
+  A bad index is not "unusable": it costs a cold cache, never the cache.
+
+### 6.9 The index
+
+**Files.** `v1/index.snap` (a snapshot) and `v1/index.log` (records since that
+snapshot), beside `blobs/` and `tmp/`. They sit inside `v1/` rather than beside the lock
+because they describe `v1/`'s blobs: moving an unknown layout aside takes its index with
+it. Only the daemon's index writer thread opens them.
+
+**Format: an append-only record log plus a snapshot, our own code, pure Rust.** Both
+files start with a 32-byte header: magic `KBFCIDX\0`, format version (u16, 1), kind
+(u16: snapshot or log), generation (u64), creation time (u64), 4 bytes reserved. Every
+record is 64 bytes, little-endian: kind (u8: `INSERT`, `EVICT`, `TOUCH`), flags (u8,
+bit 0 = executable), 6 reserved, SHA-256 (32), size (u64), last use in Unix seconds
+(u64), 4 reserved, CRC-32 of the first 60 bytes (u32, the `crc32fast` crate). A snapshot
+is its header, one `INSERT` record per entry sorted by key, and a trailer with the
+entry count and a CRC-32 over the whole file.
+
+Why this and not an embedded store. The access pattern is "read everything once at
+start, then write small deltas"; a log is exactly that, the load is one sequential read,
+and every crash state below is a few lines of code a test can reach. Rejected:
+
+- **redb** (pure Rust, crash-safe B-tree). It works, but it is a second file format and
+  recovery procedure to trust, a `TOUCH` rewrites B-tree pages instead of appending 64
+  bytes, and after an unclean shutdown redb repairs its allocator state on open (it
+  exposes a repair callback for progress), which puts a cost on exactly the crash
+  restart this design keeps instant (*unmeasured*).
+- **SQLite**: C, so not pure Rust. **sled**: pre-1.0, with its own recovery.
+- **One file rewritten on every flush**: about 64 MiB every few seconds at 1M entries.
+- **Per-blob xattrs or sidecar files**: reading them back is the scan again.
+
+**When it is written.** The lease path never does index I/O. It updates the in-memory
+index and sends a record to the writer thread, which owns both files.
+
+| Event | Order | A crash between the steps leaves | Safe because |
+|---|---|---|---|
+| Insert | hash, chmod, fixed mtime, `RENAME_NOREPLACE` into `blobs/`, in-memory insert, then `INSERT` record | a file without a record: an orphan | never served (6.8); a fill replaces it; the sweep removes it |
+| Evict | in-memory remove (pinned keys are skipped), `unlink`, then `EVICT` record | a record without a file | ENOENT is a miss; the entry is dropped and refilled (6.8) |
+| Touch | in-memory last use on every hit; a `TOUCH` record only when it is 10 minutes newer than the last one written | an older last use | LRU order across a restart is right to 10 minutes |
+
+*Why the record follows the unlink on evict.* Either order is safe for correctness, but
+only this one keeps the byte total on the safe side: a lost `EVICT` counts bytes that are
+gone (the cache runs under its budget until the entry is dropped), while a record written
+before an unlink that never happened would leave uncounted bytes on disk (over budget
+until the sweep). Inserts cannot avoid that direction, since a record before the rename
+would index a fill that may still fail; their orphans are bounded by the fills in flight.
+
+**Dropping records is always safe.** A lost `INSERT` is an orphan, a lost `EVICT` is a
+miss, a lost `TOUCH` is an older last use. So the log needs no fsync per record. The
+writer batches records and every 2 s writes the batch and calls `fdatasync`, which
+bounds the loss to about 2 s; a clean stop drains, writes and syncs. A failed write drops
+its batch and logs.
+
+**Loading.** The snapshot is read and its trailer CRC checked; a bad CRC, a short file
+or an unknown version discards the snapshot **and** the log, and the cache starts empty
+with a warning (old files are then orphans and the sweep drains them: a cold cache,
+never a wrong byte). The log is used only if its generation equals the snapshot's;
+otherwise it predates the snapshot and is ignored. Replay stops at the first record that
+is short or fails its CRC: that record and everything after it are dropped (safe, as
+above), the log is truncated there, and a warning says how many bytes were dropped.
+A damaged log never discards the snapshot.
+
+**Compaction.** After a flush, if the log is larger than both 16 MiB and the snapshot,
+the writer writes a new snapshot of generation G+1 to `index.snap.tmp`, `fsync`s it,
+renames it over `index.snap`, `fsync`s `v1/`, then writes a fresh log header for G+1 to
+a temporary name, `fsync`s it and renames it over `index.log`. Crash states: before the
+first rename, the old snapshot and log load; between the renames, the G log is ignored
+under the G+1 snapshot, which already holds its records; after both, the new pair loads.
+The writer compacts from its own copy of the index (key, size, flags, last use written),
+so compaction never takes the lease path's lock, and records that arrive meanwhile wait
+in its channel.
+
+**Size.** 1M entries: a 64 MiB snapshot, a log bounded by the same, and about 80 MB of
+memory for the writer's copy on top of the live index (*unmeasured*; C1 measures both on
+a 400 GB farm cache). A hot 20,000-file tree writes about 1.3 MB of `TOUCH` records per
+10 minutes.
+
+**The sweep.** One background task, rate-limited (one `blobs/<h0h1>/` directory per
+second, one pass after start and then daily). For each directory it lists the names and
+compares them with the index's entries for that prefix. An entry with no file is
+dropped (and an `EVICT` written). A file with no entry is unlinked, unless its `st_ctime`
+is newer than the daemon's start: such a file was inserted by this run and is owned by
+its fill. Before an unlink the sweep takes the key's slot in the fill map (6.4), so a
+fill of that key waits for it, and it holds no lock across a system call. It never
+waits on a lease, and a lease never waits on it. Counted in `cache_orphans_swept` and
+`cache_index_drift_bytes`.
 
 ---
 
@@ -645,7 +760,8 @@ time here.
 
 Per node, on the operator API: `cache_bytes`, `cache_entries`, `cache_evictions`,
 `cache_verify_failures`, `cache_pinned_bytes`, `cache_reclaimable_bytes`,
-`fs_free_bytes`, `cache_floor_unreachable`, `cache_output_skips`, `cache_disabled_reason`.
+`fs_free_bytes`, `cache_floor_unreachable`, `cache_output_skips`, `cache_disabled_reason`,
+`cache_index_load_ms`, `cache_index_discarded`, `cache_orphans_swept`, `cache_index_drift_bytes`.
 
 The cache's acceptance check is one of these numbers: **a second lease with the same zig
 tree on the same node fetches 0 bytes for the toolchain** and has
@@ -681,7 +797,7 @@ noise once the cache exists. So placement changes **last**, and only if metrics 
 | **T1, the transfer engine** | `kbf-transfer` core and REAPI backend; one gRPC HTTP/2 connection with many streams; one in-flight limit and byte budget for the process; ByteStream reads (memory and streamed-to-file, resumable) and chunked writes; FindMissing with an UNIMPLEMENTED fallback; window and decode limits; `TransferStats` through the invocations API; the flags of 4.5. Removes stage A's per-call constants. Tests C-11, T-1, T-2, T-3. | A |
 | **S1, server** | `WorkerCas` on the worker listener: FindMissing, BatchRead, BatchUpdate, GetTree, each admitted exactly as `WorkerBlobs::admit` admits ByteStream (one admission rule). `batch_read_blobs` reads a batch's blobs concurrently (bounded, e.g. 32) and coalesces adjacent records in one segment into one range GET. Helps buck2's own batch reads with no client change. Test C-15. | nothing; in parallel with T1 |
 | **P, plain text** | Lifts the three plain-text refusals of 4.7 | nothing |
-| **C1, the first cache** (folds in komira-build-farm#527) | Container driver only, persistent from the start. `kbf-daemon::cache`: layout; the exclusive lock, taken before any startup cleanup, on a file never unlinked; `tmp/` cleared at start; fills hashed into `tmp/` and inserted with `RENAME_NOREPLACE`; the background startup scan that rebuilds the LRU and byte total, with the cache off until it has enforced the limit (6.8); lazy re-hash on first use after start; the stat check; ctime recency; one fill per key; LRU by bytes; pins; the ENOENT retry; empty files created directly; link-limit copy; one inode per key per lease; the free-space floor that skips `nlink > 1`. `chown-dirs`. `prepare_outputs` copies instead of renaming. The ETXTBSY retry. Flags `--cache-dir`, `--cache-max-bytes`, `--cache-min-free-bytes`, `--cache-link-concurrency`. Tests C-1, C-2, C-4, C-7 to C-10, C-12, C-13, C-16 to C-20, R-1 to R-4. | T1 planned first; correct without A or T1 (see below) |
+| **C1, the first cache** (folds in komira-build-farm#527) | Container driver only, persistent from the start. `kbf-daemon::cache`: layout; the exclusive lock, taken before any startup cleanup, on a file never unlinked; `tmp/` cleared at start; fills hashed into `tmp/` and inserted with `RENAME_NOREPLACE`; the index (6.9: snapshot plus record log, batched last-use flush, compaction, discard-on-corrupt) loaded at start with the limit enforced in memory, so the cache serves at once (6.8); the rate-limited orphan sweep; lazy re-hash on first use after start; the stat check; one fill per key; LRU by bytes; pins; the ENOENT retry; empty files created directly; link-limit copy; one inode per key per lease; the free-space floor that skips `nlink > 1`. `chown-dirs`. `prepare_outputs` copies instead of renaming. The ETXTBSY retry. Flags `--cache-dir`, `--cache-max-bytes`, `--cache-min-free-bytes`, `--cache-link-concurrency`. Tests C-1, C-2, C-4, C-7 to C-10, C-12, C-13, C-16 to C-20, R-1 to R-9. | T1 planned first; correct without A or T1 (see below) |
 | **T2, batching (fix 3)** | `read_many` and `upload_missing` batch small blobs (4.3); per-blob status; the limit from GetCapabilities. Test C-14. | T1, S1 deployed |
 | **C3, cache metrics** | `InputStats` and per-node cache metrics through the APIs (section 7) | C1, T1 |
 | **C2, macOS** | `clonefile`; the sandbox check. Tests C-3, C-3b; Spotlight and backup exclusion; link-concurrency measurement | C1 |
@@ -753,9 +869,14 @@ serve FindMissing and Batch today), or a counting fake CAS.
 | T-2 | (T1) A connection reset mid-stream: every in-flight stream fails, the engine reconnects, each read resumes from its offset, every blob hashes right, and `retries` equals the number of streams that were in flight. | No retry; a resume that duplicates or skips bytes | Resume at offset 0 while appending |
 | T-3 | (T1) A lease dropped with queued requests: they never start, and a shared fetch with another waiter completes. | Leaked or wrongly cancelled work | Cancel shared fetches on drop |
 | R-1 | (#527) A fill is killed between its last write and the rename (fault hook), and the daemon is restarted. No entry exists under the final name, `tmp/` is empty, and the next lease fetches the blob and gets the right bytes. | A partial file under a final name; `tmp/` not cleared | Fill straight into `blobs/`; skip the `tmp/` clear |
-| R-2 | (#527) Two daemon runs on one `--cache-dir` with a counting CAS: run 1 fills the zig-shaped tree; after a clean stop and restart, a lease for the same tree, started after the scan ends, reads 0 blob bytes from the counting CAS, and each entry it uses is re-hashed exactly once (C1's test counter of verify hashes equals `files - empty_files`; `InputStats` reaches the API only in C3). | A cache that does not survive a restart | Wipe `v1/` at start |
-| R-3 | (#527) While the daemon is stopped, one entry has a byte flipped (same size, mode and mtime restored). After restart its first use re-hashes, evicts and refetches it; `cache_verify_failures == 1`; the lease gets the right bytes. | Serving an entry altered while stopped | Mark every entry verified at scan |
-| R-4 | (#527) A restart finds more on disk than `--cache-max-bytes` (the flag lowered between runs). Before the cache serves, the byte total is at or under the limit, the evicted entries are the oldest by ctime, and the total equals the on-disk sum. A lease that arrives during the scan runs uncached and succeeds. | The limit enforced only on insert; serving before the scan ends | Skip eviction at scan end; enable the cache before the scan finishes |
+| R-2 | (#527) Two daemon runs on one `--cache-dir` with a counting CAS: run 1 fills the zig-shaped tree; after a clean stop and restart, with the sweep paused by a test hook, the **first** lease for the same tree reads 0 blob bytes from the counting CAS, and each entry it uses is re-hashed exactly once (C1's test counter of verify hashes equals `files - empty_files`; `InputStats` reaches the API only in C3). | A cache that does not survive a restart, or one that serves only after a scan | Wipe `v1/` at start; ignore the index and start empty |
+| R-3 | (#527) While the daemon is stopped, one entry has a byte flipped (same size, mode and mtime restored). After restart its first use re-hashes, evicts and refetches it; `cache_verify_failures == 1`; the lease gets the right bytes. | Serving an entry altered while stopped | Mark every entry verified at index load |
+| R-4 | (#527) A restart finds an index total above `--cache-max-bytes` (the flag lowered between runs). Before the first lease, the in-memory total is at or under the limit and the entries removed are the oldest by indexed last use; a lease that arrives at once is served from the cache; after the unlinker drains, the on-disk sum equals the total. | The limit enforced only on insert; recency lost across a restart | Skip the at-load eviction; write `TOUCH` records with last use 0 |
+| R-5 | A fault hook kills the daemon after a fill's rename and before its `INSERT` record reaches the log; a byte of the orphan is then flipped. After restart the key is not indexed. A lease needing it fetches it once from the counting CAS and gets the right bytes (the EEXIST path replaces the orphan). A second orphan nobody asks for is removed by one sweep pass, and the total equals the sum of indexed sizes. A file this run inserted, held by a hook between rename and in-memory insert, survives the sweep. | Serving an unindexed, unverified file; an EEXIST that fails or links the orphan; orphans never reclaimed; the sweep deleting a live fill | On EEXIST link the existing name; disable the sweep; drop the start-time check in the sweep |
+| R-6 | Compaction is killed at each of three points (midway through writing the new snapshot; between the two renames; after both). After each restart the loaded entries (keys, sizes, flags) equal those before compaction, and last use is within 10 minutes. | A compaction that loses entries or leaves no loadable snapshot | Rename the empty log before the snapshot; write the snapshot in place instead of through `index.snap.tmp` |
+| R-7 | Two logs are damaged: one ends in half a record, one in a full-length record with a bad CRC. Each loads every earlier record, warns with the dropped byte count, truncates the log there, and records appended afterwards load after another restart. | Discarding the whole index for a torn tail; appending after garbage, so later records are lost | Treat a bad last record as a corrupt index; skip the truncate |
+| R-8 | While the daemon is stopped, two indexed blob files are deleted. After restart, a lease needing one gets ENOENT on link, refetches and succeeds with no lease error; one sweep pass drops the other entry, and the total equals the on-disk sum. | An index-listed missing file failing a lease; drift never corrected | Map ENOENT at link to a lease error; sweep only for orphans |
+| R-9 | The snapshot has a byte flipped (in one run) or an unknown format version (in another). The daemon starts without waiting, warns with `cache_index_discarded=corrupt` or `version`, serves leases (as misses that fill), and the sweep drains the old files as orphans. | A bad index blocking start or disabling the cache; trusting a snapshot that fails its CRC | Refuse to start on a bad index; skip the trailer CRC check |
 
 Wall-clock speedups are reported, never asserted.
 
@@ -778,7 +899,9 @@ Wall-clock speedups are reported, never asserted.
 | **Hot set in the Hello** | Churns `report_hash`. A bounded Heartbeat field instead (C5a). |
 | **Owner = subordinate id 1 for cache files** | `fs.protected_hardlinks` stops the daemon linking files it does not own. |
 | **A pool of connections to kbf-server** | One HTTP/2 connection carries many streams (4.2); a pool can be added later if a measurement ever shows the one connection is the limit. |
-| **Wipe the cache at start** (Buildbarn's hard-link cache) | Daemons restart on every deploy, so every node would go cold each time. `tmp/` plus a rename, the startup scan and lazy verify make keeping it safe (6.8). |
+| **Wipe the cache at start** (Buildbarn's hard-link cache) | Daemons restart on every deploy, so every node would go cold each time. `tmp/` plus a rename, the index and lazy verify make keeping it safe (6.8). |
+| **A startup scan of `blobs/`** (rebuild the LRU and total from the files, with the cache off until it ends) | Every restart would run uncached, or cold, for as long as listing 400 GB takes. CEO decision (2026-10-13): no blocking or background startup scan; an index loaded at start (6.9), with a slow orphan sweep instead. |
+| **An embedded store for the index** (redb, SQLite, sled) | 6.9: a second recovery procedure to trust, page rewrites per touch, repair on open after a crash; SQLite is not Rust. |
 | **Engine and batching in one PR** | Puts an unmeasured gain and a server dependency on the path to C1 (section 9). |
 | **Per-call in-flight limits** (stage A as it stands) | They multiply by concurrent leases; replaced by one process-wide limit in T1. |
 
@@ -786,11 +909,15 @@ Wall-clock speedups are reported, never asserted.
 
 ## 12. Open questions (each with a recommendation)
 
-- **Q1. In-place input writes get EACCES in containers with the cache.**
-  *Recommendation:* accept it. REAPI allows it, and Buildbarn's virtual mode refuses the
-  same way. If a real client breaks, add a per-action platform property
-  `kbf-writable-inputs=1` that copies inputs for that action (an option, not a
-  default).
+- **Q1. An action that edits one of its own input files in place gets EACCES.** With the
+  cache, a container's input file is a hard link to the shared cache file, which the
+  action cannot write; today the same open quietly gets a private copy. Compilers and
+  linkers read inputs and write new outputs, so they never hit this. A tool that patches
+  an input where it lies would. An output that is also an input still works (5.1).
+  *Recommendation:* accept it; REAPI allows a worker to refuse, and Buildbarn's virtual
+  mode does the same. Add an opt-out (a per-action platform property
+  `kbf-writable-inputs=1` that gives that action private copies) only if a real build
+  breaks.
 - **Q2. Locality placement (C5b).** *Recommendation:* ship C5a's report only, and decide
   with a week of `InputStats` from the farm.
 - **Q3. Default budget.** Decided (CEO, 2026-10-13): no default in kbf (no flag, no
