@@ -51,7 +51,7 @@ loader. One HTTP/2 connection carries every request, as the daemon's does.
 ## Reading the report
 
 ```text
-upload bytestream, 64 in flight, find-missing off, seed 1760000000000000000
+upload bytestream, 64 in flight, find-missing off, seed 4242
 tree: 15000 files (144 empty, 0 skipped), 989 dirs, 307000000 bytes, 14858 blobs
 14858 of 14858 blobs, 307237344 bytes, 14858 of 14858 requests in 41.200 s: 364.1 files/s, 7.46 MB/s
 request          count     p50 ms     p90 ms     p99 ms     max ms
