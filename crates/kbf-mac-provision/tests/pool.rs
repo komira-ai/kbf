@@ -232,6 +232,15 @@ const ROOT_DRIFTS: &[Drift] = &[
         false,
     ),
     (
+        "key a link",
+        |m| {
+            m.remove(KEY);
+            m.symlink(&m.path("/usr/local/kbf/etc/ca.pem"), KEY);
+        },
+        "/usr/local/kbf/etc/node.key is lrwx",
+        false,
+    ),
+    (
         "scratch root of the role account",
         |m| m.own(SCRATCH, 480, 480),
         "/Volumes/kbf/scratch is drwxr-xr-x 480 480, want drwxr-xr-x 0 0",

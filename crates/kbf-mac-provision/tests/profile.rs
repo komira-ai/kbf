@@ -731,8 +731,9 @@ fn every_malformed_pool_volume_or_daemon_setting_is_refused() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
-/// Catches: a valid pool, volume or daemon setting refused, a role daemon held to the
-/// root daemon's volume rule, or a set key left out of `print`.
+/// Catches: a valid pool, volume or daemon setting refused (a pool below `lease_uids`
+/// included), a role daemon held to the root daemon's volume rule, or a set key left
+/// out of `print`.
 #[test]
 fn the_pool_volume_and_daemon_settings_are_accepted_and_printed() {
     let text = edited(|l| {
@@ -768,4 +769,9 @@ fn the_pool_volume_and_daemon_settings_are_accepted_and_printed() {
         );
     });
     assert_eq!(refusal(&text), "accepted");
+    let below = edited(|l| {
+        set("lease_uids", "800-899")(l);
+        l.push("pool_first_uid=600".into());
+    });
+    assert_eq!(refusal(&below), "accepted", "a pool below lease_uids");
 }

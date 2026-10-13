@@ -174,12 +174,12 @@ fn a_lease_user_outside_lease_uids_fails() {
     assert_only_fails(
         "autologin",
         |m| {
-            m.state_mut().user("kbf-lease-4-2", 700);
+            m.state_mut().user("kbf-lease-4-2", 900);
             m.write(INTENT, "4.2\n");
             m.state_mut()
                 .default_set(LOGINWINDOW, "autoLoginUser", "kbf-lease-4-2");
         },
-        "(uid 700); only",
+        "(uid 900); only",
     );
 }
 

@@ -154,7 +154,7 @@ fn keys_limits_apply_to_the_named_items() {
         (0, "CHANGE firewall: firewall on\n")
     );
     let r = check(&mac);
-    assert_eq!(lines(&r, "FAIL").len(), 17, "{}", r.text);
+    assert_eq!(lines(&r, "FAIL").len(), 19, "{}", r.text);
     let path = mac.profile_file(&mac.profile_text());
     assert!(matches!(
         cli::apply(&path, Some("firewall,bogus"), &mac),

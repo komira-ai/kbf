@@ -391,6 +391,10 @@ impl<'a> Mac<'a> {
         at(path, self.host.chmod(path, mode))
     }
 
+    pub(crate) fn chown(&self, path: &str, uid: u32, gid: u32) -> io::Result<()> {
+        at(path, self.host.chown(path, uid, gid))
+    }
+
     pub(crate) fn rename(&self, from: &str, to: &str) -> io::Result<()> {
         at(from, self.host.rename(from, to))
     }

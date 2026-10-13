@@ -499,12 +499,12 @@ const DRIFTS: &[Drift] = &[
         "autologin",
         "a lease user out of range",
         |m| {
-            m.state_mut().user("kbf-lease-9-9", 700);
+            m.state_mut().user("kbf-lease-9-9", 900);
             m.write(INTENT, "9.9\n");
             m.state_mut()
                 .default_set(LOGINWINDOW, "autoLoginUser", "kbf-lease-9-9");
         },
-        "auto-login is kbf-lease-9-9 (uid 700)",
+        "auto-login is kbf-lease-9-9 (uid 900)",
     ),
     (
         "autologin",
