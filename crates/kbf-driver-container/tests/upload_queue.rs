@@ -85,7 +85,14 @@ async fn the_walk_holds_at_most_one_file_past_the_stores_in_flight() {
     let paths = ["out".to_owned()];
     let walk = collect(&cas, &upper, "", &paths, OutputLimits::DEFAULT, &mut result);
     let watch = async {
+        // A deadline, so a walk that never starts the stores fails rather than hangs.
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
         while cas.started.load(Ordering::SeqCst) < UPLOADS_IN_FLIGHT {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{} of {UPLOADS_IN_FLIGHT} stores started in 30 s",
+                cas.started.load(Ordering::SeqCst)
+            );
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
         let mut most = 0;

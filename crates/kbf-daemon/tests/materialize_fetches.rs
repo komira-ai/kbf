@@ -284,7 +284,14 @@ fn no_file_appears_after_materialize_failed() {
                 (written.is_err(), listing(&dir))
             }
         });
+        // A deadline, so a materialize that never reaches the missing blob fails
+        // rather than hangs.
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
         while !cas.failed.load(Ordering::SeqCst) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the missing blob was not read in 30 s"
+            );
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
         // Time for a materialize that does not wait for its writes to return.

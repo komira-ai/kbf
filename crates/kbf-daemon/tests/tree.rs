@@ -174,7 +174,11 @@ async fn existing_paths_are_never_written_through() {
 }
 
 /// Catches a tree written wrongly: a file's bytes, its executable bit, a nested
-/// directory or a symlink's target.
+/// directory or a symlink's target; and a Directory or a file blob the tree names in
+/// two places (fetched once) written in only one of them, or the second copy of a
+/// file given the first one's executable bit.
+/// Mutant seen red: the second place of a Directory dropped (`Entry::Occupied` arm
+/// of the level's places made a no-op).
 #[tokio::test]
 async fn a_tree_is_written_as_described() {
     let cas = MemoryCas::default();
@@ -185,12 +189,22 @@ async fn a_tree_is_written_as_described() {
         }],
         ..Directory::default()
     };
+    let bytes = cas.insert(b"bytes".to_vec());
     let root = Directory {
-        files: vec![file("data", Some(cas.insert(b"bytes".to_vec())))],
-        directories: vec![DirectoryNode {
-            name: "bin".to_owned(),
-            digest: Some(cas.message(&leaf)),
-        }],
+        files: vec![
+            file("data", Some(bytes.clone())),
+            FileNode {
+                is_executable: true,
+                ..file("data-run", Some(bytes))
+            },
+        ],
+        directories: ["bin", "tools"]
+            .into_iter()
+            .map(|name| DirectoryNode {
+                name: name.to_owned(),
+                digest: Some(cas.message(&leaf)),
+            })
+            .collect(),
         symlinks: vec![SymlinkNode {
             name: "link".to_owned(),
             target: "data".to_owned(),
@@ -206,6 +220,16 @@ async fn a_tree_is_written_as_described() {
     let mode = |p: &Path| std::fs::metadata(p).expect("stat").permissions().mode() & 0o777;
     assert_eq!(mode(&dir.join("data")), 0o644);
     assert_eq!(mode(&dir.join("bin/run")), 0o755);
+    assert_eq!(
+        std::fs::read(dir.join("data-run")).expect("data-run"),
+        b"bytes"
+    );
+    assert_eq!(mode(&dir.join("data-run")), 0o755);
+    assert_eq!(
+        std::fs::read(dir.join("tools/run")).expect("tools/run"),
+        b"an executable file\n"
+    );
+    assert_eq!(mode(&dir.join("tools/run")), 0o755);
     assert_eq!(
         std::fs::read_link(dir.join("link")).expect("link"),
         Path::new("data")

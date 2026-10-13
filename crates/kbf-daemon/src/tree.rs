@@ -23,7 +23,7 @@
 //! between the check and the read.
 
 use std::collections::hash_map::Entry;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
 use std::io::ErrorKind;
 use std::os::unix::fs::PermissionsExt;
@@ -165,55 +165,59 @@ async fn make_directories(
     let mut blob_at: HashMap<String, usize> = HashMap::new();
     let mut level = vec![(root.clone(), dir.to_owned())];
     while !level.is_empty() {
-        // The distinct Directories of this level, fetched together.
-        let mut wanted: Vec<Digest> = Vec::new();
-        let mut asked = HashSet::new();
-        for (digest, _) in &level {
-            if asked.insert(label(digest)) {
-                wanted.push(digest.clone());
+        // The distinct Directories of this level, each with every place it goes,
+        // fetched together.
+        let mut places: Vec<(Digest, Vec<PathBuf>)> = Vec::new();
+        let mut place_of: HashMap<String, usize> = HashMap::new();
+        for (digest, here) in level {
+            match place_of.entry(label(&digest)) {
+                Entry::Occupied(at) => places[*at.get()].1.push(here),
+                Entry::Vacant(at) => {
+                    at.insert(places.len());
+                    places.push((digest, vec![here]));
+                }
             }
         }
-        let directories: HashMap<String, Directory> = stream::iter(wanted)
-            .map(|digest| async move {
+        let directories: Vec<(Directory, Vec<PathBuf>)> = stream::iter(places)
+            .map(|(digest, heres)| async move {
                 let directory: Directory = fetch_message(cas, &digest).await?;
-                Ok::<_, TreeError>((label(&digest), directory))
+                Ok::<_, TreeError>((directory, heres))
             })
-            .buffer_unordered(fetches)
+            .buffered(fetches)
             .try_collect()
             .await?;
         let mut next = Vec::new();
-        for (digest, here) in level {
-            let Some(directory) = directories.get(&label(&digest)) else {
-                continue; // Every digest of the level was fetched above.
-            };
+        for (directory, heres) in &directories {
             check_names(directory)?;
-            for file in &directory.files {
-                let digest = file.digest.clone().ok_or_else(|| {
-                    TreeError::Invalid(format!("input file {:?} has no digest", file.name))
-                })?;
-                let copy = (here.join(&file.name), file.is_executable);
-                match blob_at.entry(label(&digest)) {
-                    Entry::Occupied(at) => files[*at.get()].copies.push(copy),
-                    Entry::Vacant(at) => {
-                        at.insert(files.len());
-                        files.push(Copies {
-                            digest,
-                            copies: vec![copy],
-                        });
+            for here in heres {
+                for file in &directory.files {
+                    let digest = file.digest.clone().ok_or_else(|| {
+                        TreeError::Invalid(format!("input file {:?} has no digest", file.name))
+                    })?;
+                    let copy = (here.join(&file.name), file.is_executable);
+                    match blob_at.entry(label(&digest)) {
+                        Entry::Occupied(at) => files[*at.get()].copies.push(copy),
+                        Entry::Vacant(at) => {
+                            at.insert(files.len());
+                            files.push(Copies {
+                                digest,
+                                copies: vec![copy],
+                            });
+                        }
                     }
                 }
-            }
-            for link in &directory.symlinks {
-                let path = here.join(&link.name);
-                fs::symlink(&link.target, &path).await.map_err(io(&path))?;
-            }
-            for sub in &directory.directories {
-                let path = here.join(&sub.name);
-                let digest = sub.digest.clone().ok_or_else(|| {
-                    TreeError::Invalid(format!("input directory {:?} has no digest", sub.name))
-                })?;
-                fs::create_dir(&path).await.map_err(io(&path))?;
-                next.push((digest, path));
+                for link in &directory.symlinks {
+                    let path = here.join(&link.name);
+                    fs::symlink(&link.target, &path).await.map_err(io(&path))?;
+                }
+                for sub in &directory.directories {
+                    let path = here.join(&sub.name);
+                    let digest = sub.digest.clone().ok_or_else(|| {
+                        TreeError::Invalid(format!("input directory {:?} has no digest", sub.name))
+                    })?;
+                    fs::create_dir(&path).await.map_err(io(&path))?;
+                    next.push((digest, path));
+                }
             }
         }
         level = next;
@@ -618,11 +622,11 @@ mod tests {
         for (i, bytes) in files.iter().enumerate() {
             root.files.push(FileNode {
                 name: format!("f{i}"),
-                digest: Some(cas.insert(bytes.clone())),
+                digest: Some(cas.put(bytes.clone()).await.expect("stored")),
                 ..FileNode::default()
             });
         }
-        let root_digest = cas.insert(root.encode_to_vec());
+        let root_digest = cas.put(root.encode_to_vec()).await.expect("stored");
         let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../target/kbf-daemon-unit")
             .join(format!("{name}-{}", std::process::id()));
@@ -663,6 +667,49 @@ mod tests {
         mixed.push(vec![0xaa; 5000]);
         let (_, bytes) = within_budget("budget-large", &mixed, 2500).await;
         assert_eq!(bytes, 5000, "the large blob goes alone");
+    }
+
+    /// Catches the check that a blob failed made before the byte-budget permit rather
+    /// than once it is held: a blob that waited for the permit while another failed
+    /// would then be fetched and written after the error (a round trip and a write
+    /// spent on an action already refused, and a file left in the lease directory).
+    /// The missing blob claims the whole budget and fails only after its read yields,
+    /// so the small one is already waiting for the permit when the error comes.
+    /// Mutant seen red: the `failed` check moved above `acquire_many`.
+    #[tokio::test]
+    async fn a_blob_waiting_for_the_budget_is_skipped_after_a_failure() {
+        let cas = ByteCountingCas::default();
+        let budget = 1000;
+        let mut missing = digest_of(b"not in the CAS");
+        missing.size_bytes = i64::try_from(budget).expect("small");
+        let small = cas.put(b"small".to_vec()).await.expect("stored");
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/kbf-daemon-unit")
+            .join(format!("budget-skip-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch");
+        let files = vec![
+            Copies {
+                digest: missing,
+                copies: vec![(dir.join("large"), false)],
+            },
+            Copies {
+                digest: small,
+                copies: vec![(dir.join("small"), false)],
+            },
+        ];
+        let error = write_files(&cas, files, 64, budget)
+            .await
+            .expect_err("a blob is missing");
+        assert!(
+            matches!(error, TreeError::Cas(CasError::Missing(_))),
+            "{error}"
+        );
+        assert!(
+            !dir.join("small").exists(),
+            "the waiting blob was written after the failure"
+        );
+        std::fs::remove_dir_all(&dir).expect("clean");
     }
 
     /// Catches a file read through a symlink, or from a FIFO or a device, that
