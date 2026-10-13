@@ -133,7 +133,9 @@ async fn an_action_ends_with_every_process_of_its_uid_and_nothing_else() {
     let first = lease(&rt, &cas, 1, &Spec::argv(&argv)).await;
     let out = stdout(&cas, &first);
     let lines: Vec<&str> = out.lines().collect();
-    let left = uid::processes(mine.uid).expect("list");
+    // As the slot's clean counts them: launchd starts its own agents of the domain
+    // (distnoted) again as the uid once the clean has looked at the domain.
+    let left = kbf_driver_native::slots::macos::host::leftover_processes(mine.uid).expect("list");
     let root_lives = alive(i32::try_from(root_sleep.id()).expect("pid"));
     let other_lives = alive(i32::try_from(other_sleep.id()).expect("pid"));
     let setuid_lives = alive(setuid_pid);
