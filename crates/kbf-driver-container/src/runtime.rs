@@ -34,7 +34,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
 
-use kbf_daemon::cache::{Cache, Disabled, InputStats};
+use kbf_daemon::cache::{Cache, CacheConfig, Disabled, InputStats};
 use kbf_daemon::cas::{Cas, CasError};
 use kbf_daemon::{Runtime, RuntimeError, Work};
 use kbf_proto::reapi::{Action, ActionResult, Command, ExecutedActionMetadata, Platform};
@@ -96,14 +96,32 @@ pub struct PodmanConfig {
     pub cache: Option<CacheUse>,
 }
 
-/// The node's input cache as the driver uses it.
-#[derive(Clone, Debug)]
+/// The node's input cache as the driver is given it: not opened yet.
+/// [`PodmanRuntime::new`] opens it once Podman's storage passed the cache's checks, so
+/// on storage they refuse, the cache directory is never touched.
+#[derive(Clone)]
 pub struct CacheUse {
-    pub cache: Arc<Cache>,
+    pub config: CacheConfig,
     /// The `kbf-daemon` binary, run under `podman unshare` in its `__chown-dirs` mode
     /// ([`crate::chown_dirs`]) to give the input root's directories, not its files, to
     /// the container's root and back.
     pub helper: PathBuf,
+}
+
+impl std::fmt::Debug for CacheUse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CacheUse")
+            .field("dir", &self.config.dir)
+            .field("helper", &self.helper)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The node's input cache, opened.
+#[derive(Debug)]
+struct Cached {
+    cache: Arc<Cache>,
+    helper: PathBuf,
 }
 
 impl PodmanConfig {
@@ -207,6 +225,8 @@ pub struct PodmanRuntime<C> {
     stops: Mutex<BTreeMap<LeaseId, oneshot::Sender<Stop>>>,
     /// The image store's per-image directories, asked of Podman once.
     images: tokio::sync::OnceCell<PathBuf>,
+    /// The input cache leases link from, if the node has one and it could be used.
+    cache: Option<Cached>,
     /// What the last lease's inputs cost, with the cache (a test's counter; each
     /// lease's are logged).
     last_inputs: Mutex<Option<InputStats>>,
@@ -220,9 +240,10 @@ impl<C: Cas> PodmanRuntime<C> {
     ///
     /// # Errors
     /// The configuration is unusable, or a leftover could not be listed or removed.
-    /// With a cache, it first asks Podman for its graph driver: on one the cache's
-    /// overlay checks have not passed on (anything but the kernel's `overlay`, without
-    /// a `mount_program` such as fuse-overlayfs) it warns and runs uncached.
+    /// With a cache, it then asks Podman for its graph driver, and opens the cache
+    /// only on storage the cache's overlay checks passed on (the kernel's `overlay`,
+    /// without a `mount_program` such as fuse-overlayfs). On other storage, or when the
+    /// cache cannot be opened, it warns and runs uncached.
     pub fn new(config: PodmanConfig, cas: Arc<C>) -> Result<Self, StartError> {
         config.check()?;
         let mut runtime = Self {
@@ -231,14 +252,12 @@ impl<C: Cas> PodmanRuntime<C> {
             cas,
             stops: Mutex::new(BTreeMap::new()),
             images: tokio::sync::OnceCell::new(),
+            cache: None,
             last_inputs: Mutex::new(None),
         };
         sweep(&runtime.podman, &runtime.config).map_err(StartError::Sweep)?;
-        if runtime.config.cache.is_some()
-            && let Err(why) = cache_usable(&runtime.podman)
-        {
-            tracing::warn!("cache: off:{} ({why}); leases run uncached", why.reason());
-            runtime.config.cache = None;
+        if let Some(given) = runtime.config.cache.clone() {
+            runtime.cache = open_cache(&runtime.podman, given);
         }
         Ok(runtime)
     }
@@ -246,7 +265,7 @@ impl<C: Cas> PodmanRuntime<C> {
     /// Whether leases link their inputs from the cache.
     #[must_use]
     pub fn cached(&self) -> bool {
-        self.config.cache.is_some()
+        self.cache.is_some()
     }
 
     /// What the last lease's inputs cost through the cache, if a lease used it.
@@ -300,7 +319,7 @@ impl<C: Cas> PodmanRuntime<C> {
                 .await
                 .map_err(|e| failed(dir, &e))?;
         }
-        match &self.config.cache {
+        match &self.cache {
             Some(cache) => {
                 let private = private_paths(&command.working_directory, &outputs);
                 let stats = materialize_cached(cas, &cache.cache, input_root, &root, &private)
@@ -535,7 +554,7 @@ impl<C: Cas> PodmanRuntime<C> {
         upper: &Path,
         work: &Path,
     ) -> Result<(), RuntimeError> {
-        let given = match &self.config.cache {
+        let given = match &self.cache {
             Some(cache) => {
                 let dirs = self.podman.chown_dirs(&cache.helper, owner, root).await;
                 match dirs {
@@ -909,6 +928,27 @@ fn private_paths(working_directory: &str, outputs: &[String]) -> Vec<String> {
             }
         })
         .collect()
+}
+
+/// The cache `given` opened, once Podman's storage passed the cache's checks; `None`,
+/// after a warning, when it did not or the cache cannot be opened. Blocking.
+fn open_cache(podman: &Podman, given: CacheUse) -> Option<Cached> {
+    let shown = given.config.dir.display().to_string();
+    let opened = cache_usable(podman).and_then(|()| Cache::open(given.config));
+    match opened {
+        Ok(cache) => {
+            let stats = cache.stats();
+            let (bytes, entries, mode) = (stats.bytes, stats.entries, cache.link_mode());
+            tracing::info!("cache: {shown}: {bytes} bytes in {entries} entries, link mode {mode}");
+            let helper = given.helper;
+            Some(Cached { cache, helper })
+        }
+        Err(why) => {
+            let reason = why.reason();
+            tracing::warn!("cache: off:{reason} ({shown}: {why}); leases run uncached");
+            None
+        }
+    }
 }
 
 /// Whether Podman's storage is one the cache's overlay checks passed on: the kernel's

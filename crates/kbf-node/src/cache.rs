@@ -42,35 +42,31 @@ pub(crate) fn native_warning(args: &CacheArgs) -> Option<String> {
     })
 }
 
-/// The container driver's cache: opened from the flags, with leases under `scratch`;
-/// `None`, after a warning, when there is none or it cannot be used.
+/// The container driver's cache as the flags give it, for the driver to open once
+/// Podman's storage passed its checks; `None`, after a warning, when there is none or
+/// it cannot be used.
 #[cfg(target_os = "linux")]
-pub(crate) fn open(
+pub(crate) fn given(
     args: &CacheArgs,
     scratch: &std::path::Path,
 ) -> Option<kbf_driver_container::CacheUse> {
-    use kbf_daemon::cache::{Cache, CacheConfig, Disabled};
+    use kbf_daemon::cache::{CacheConfig, Disabled};
     let dir = args.cache_dir.clone()?;
     let shown = dir.display().to_string();
     let link_concurrency = usize::try_from(args.cache_link_concurrency).unwrap_or(usize::MAX);
-    let cache = (args.cache_max_bytes.ok_or(Disabled::NoBudget)).and_then(|max_bytes| {
+    let config = (args.cache_max_bytes.ok_or(Disabled::NoBudget)).map(|max_bytes| {
         let mut config = CacheConfig::new(dir, scratch.to_owned(), max_bytes);
         config.min_free_bytes = args.cache_min_free_bytes;
         config.link_concurrency = link_concurrency;
-        Cache::open(config)
+        config
     });
     // The helper is this binary, by the path it was started from: after an update
     // renames a new binary over it, that path names the new one.
     let helper = std::env::current_exe()
         .ok()
         .ok_or(Disabled::Unusable("the daemon's own path".to_owned()));
-    match cache.and_then(|cache| helper.map(|helper| (cache, helper))) {
-        Ok((cache, helper)) => {
-            let stats = cache.stats();
-            let (bytes, entries, mode) = (stats.bytes, stats.entries, cache.link_mode());
-            tracing::info!("cache: {shown}: {bytes} bytes in {entries} entries, link mode {mode}");
-            Some(kbf_driver_container::CacheUse { cache, helper })
-        }
+    match config.and_then(|config| helper.map(|helper| (config, helper))) {
+        Ok((config, helper)) => Some(kbf_driver_container::CacheUse { config, helper }),
         Err(why) => {
             let reason = why.reason();
             tracing::warn!("cache: off:{reason} ({shown}: {why}); leases run uncached");

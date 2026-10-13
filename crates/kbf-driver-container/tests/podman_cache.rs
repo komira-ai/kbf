@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use kbf_daemon::cache::{Cache, CacheConfig, Key};
+use kbf_daemon::cache::{CacheConfig, Key};
 use kbf_daemon::cas::digest_of;
 use kbf_driver_container::{CacheUse, PodmanConfig};
 use support::real::{Cell, podman, sh};
@@ -31,7 +31,7 @@ fn with_cache(config: &mut PodmanConfig, link: Option<Arc<kbf_daemon::cache::Lin
         cache.link = link;
     }
     config.cache = Some(CacheUse {
-        cache: Cache::open(cache).expect("open the cache"),
+        config: cache,
         helper: std::env::current_exe().expect("this test binary"),
     });
 }
@@ -40,9 +40,7 @@ fn with_cache(config: &mut PodmanConfig, link: Option<Arc<kbf_daemon::cache::Lin
 fn entry(cell: &Cell, bytes: &[u8]) -> PathBuf {
     let key = Key::of(&digest_of(bytes), false).expect("a key");
     let cache = cell.config.cache.as_ref().expect("a cache");
-    cache
-        .cache
-        .dir()
+    (cache.config.dir)
         .join("v1/blobs")
         .join(key.prefix())
         .join(key.name())

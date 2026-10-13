@@ -15,16 +15,15 @@ use std::sync::Arc;
 use crate::support::fake::{Fake, image};
 use crate::support::{Spec, blob};
 use kbf_daemon::RuntimeError;
-use kbf_daemon::cache::{Cache, CacheConfig};
+use kbf_daemon::cache::CacheConfig;
 use kbf_driver_container::{CacheUse, MemoryCas, PodmanConfig, PodmanRuntime};
 
-/// A cache in `dir/cache` for leases under `scratch`.
+/// A cache in `dir/cache` for leases under `scratch`, for the runtime to open.
 fn cache(dir: &Path, scratch: &Path) -> CacheUse {
     let at = dir.join("cache");
     std::fs::create_dir_all(&at).expect("cache dir");
-    let cache = Cache::open(CacheConfig::new(at, scratch.to_owned(), 1 << 30)).expect("open");
     CacheUse {
-        cache,
+        config: CacheConfig::new(at, scratch.to_owned(), 1 << 30),
         helper: PathBuf::from("/kbf/bin/kbf-daemon"),
     }
 }
@@ -42,9 +41,7 @@ fn entry_inode(fake: &Fake, bytes: &[u8]) -> u64 {
     let digest = kbf_daemon::cas::digest_of(bytes);
     let key = kbf_daemon::cache::Key::of(&digest, false).expect("a key");
     let cache = fake.config.cache.as_ref().expect("a cache");
-    let dir = cache
-        .cache
-        .dir()
+    let dir = (cache.config.dir)
         .join("v1/blobs")
         .join(key.prefix())
         .join(key.name());
@@ -117,6 +114,38 @@ async fn inputs_are_links_to_the_cache_and_only_directories_change_owner() {
     fake.assert_clean(2);
 }
 
+/// Catches the private copies chosen from output paths without the working directory
+/// (outputs are relative to it, input paths to the input root): with the working
+/// directory `pkg`, the input `pkg/out/o.txt` that the output `out/o.txt` names is a
+/// private copy, not the cache's entry, while `pkg/src/a.txt` is the entry.
+#[tokio::test]
+async fn an_output_named_input_under_the_working_directory_is_a_private_copy() {
+    let fake = cached("workdir");
+    let mut spec = Spec::new(&image(), "unused");
+    spec.working_directory = "pkg".to_owned();
+    spec.inputs = vec![
+        ("pkg/src/a.txt", b"input bytes", false),
+        ("pkg/out/o.txt", b"input bytes", false),
+    ];
+    spec.outputs = vec!["out/o.txt".to_owned(), "stat".to_owned()];
+    let script =
+        r#"stat -c '%i %h' "$ROOT/pkg/src/a.txt" "$UPPER/pkg/out/o.txt" > "$UPPER/pkg/stat""#;
+    let result = fake.run(1, &spec, script).await.expect("ran");
+    assert_eq!(result.exit_code, 0, "{result:?}");
+    let entry = entry_inode(&fake, b"input bytes");
+    let stat =
+        String::from_utf8(blob(&fake.cas, result.output_files[1].digest.as_ref())).expect("utf-8");
+    let lines: Vec<&str> = stat.lines().collect();
+    assert_eq!(lines[0], format!("{entry} 2"), "{stat}");
+    assert_eq!(
+        lines[1].split(' ').collect::<Vec<_>>()[1],
+        "1",
+        "the output-named input under the working directory is the entry: {stat}"
+    );
+    assert!(!lines[1].starts_with(&format!("{entry} ")), "{stat}");
+    fake.assert_clean(1);
+}
+
 /// C-9, at the fake's level (a real ETXTBSY cannot be timed from a test). Catches an
 /// exec that found its program busy failing the lease (the "remove the retry"
 /// mutant): `podman start` is run once more and the action's own exit is the result.
@@ -154,8 +183,9 @@ async fn a_failed_directory_hand_over_fails_the_lease() {
 
 /// Catches the cache used on storage its overlay checks did not pass on: another
 /// graph driver, fuse-overlayfs (a `mount_program`), or a `podman info` that fails or
-/// answers what cannot be read. Each runs uncached; kernel overlay with other options
-/// keeps it.
+/// answers what cannot be read. Each runs uncached and leaves the cache directory as
+/// it found it (the "open the cache before the check" mutant takes its lock and lays
+/// it out); kernel overlay with other options keeps it.
 #[test]
 fn the_cache_is_off_on_storage_its_checks_did_not_pass() {
     let fake = Fake::new("graph");
@@ -173,11 +203,19 @@ fn the_cache_is_off_on_storage_its_checks_did_not_pass() {
             let _ = std::fs::remove_file(fake.state.join("info-fails"));
         }
         let mut config: PodmanConfig = fake.config.clone();
-        config.cache = Some(cache(
+        let given = cache(
             &base.join(format!("{graph:?}-{fails}").replace(['/', '"', ' ', '{', '}', ':'], "_")),
             &config.scratch,
-        ));
+        );
+        let dir = given.config.dir.clone();
+        config.cache = Some(given);
         let runtime = PodmanRuntime::new(config, Arc::new(MemoryCas::new())).expect("runtime");
+        let touched = std::fs::read_dir(&dir).expect("list").next().is_some();
+        assert_eq!(
+            touched,
+            runtime.cached(),
+            "{graph:?} {fails}: the cache directory was touched by a runtime without its cache, or not laid out by one with it"
+        );
         runtime.cached()
     };
     assert!(with(None, false), "the default kernel overlay");
