@@ -1,6 +1,7 @@
 //! A CAS server for the engine's tests: ByteStream and FindMissing over blobs in
-//! memory, which counts what it is asked and can hold reads and writes at a gate, pause
-//! a read after its first message, refuse FindMissing, and fail writes.
+//! memory, which counts what it is asked and can hold reads and writes at a gate and
+//! FindMissing calls at another, pause a read after its first message, refuse
+//! FindMissing, and fail writes.
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -61,6 +62,10 @@ pub struct Fake {
     /// Reads wait for this to open before their first message (or, when `pause` is
     /// set, after it); writes wait for it before they commit.
     gate: watch::Sender<bool>,
+    /// Writes waiting at `gate` now.
+    pub held_writes: AtomicUsize,
+    /// FindMissing calls wait for this to open before they answer.
+    find_gate: watch::Sender<bool>,
     pub pause: AtomicBool,
     /// Bytes per ReadResponse.
     pub message_bytes: AtomicUsize,
@@ -85,6 +90,8 @@ impl Default for Fake {
             requests: AtomicUsize::new(0),
             most_requests: AtomicUsize::new(0),
             gate: watch::channel(true).0,
+            held_writes: AtomicUsize::new(0),
+            find_gate: watch::channel(true).0,
             pause: AtomicBool::new(false),
             message_bytes: AtomicUsize::new(64 << 10),
             find: Mutex::new(Find::Serve),
@@ -128,6 +135,15 @@ impl Fake {
 
     pub fn open(&self) {
         self.gate.send_replace(true);
+    }
+
+    /// Holds every FindMissing call before it answers.
+    pub fn close_finds(&self) {
+        self.find_gate.send_replace(false);
+    }
+
+    pub fn open_finds(&self) {
+        self.find_gate.send_replace(true);
     }
 
     /// The reads of `digest`, by offset.
@@ -254,7 +270,9 @@ impl ByteStream for Shared {
                 .fetch_max(message.data.len(), Ordering::SeqCst);
             bytes.extend_from_slice(&message.data);
         }
+        fake.held_writes.fetch_add(1, Ordering::SeqCst);
         let _ = fake.gate.subscribe().wait_for(|open| *open).await;
+        fake.held_writes.fetch_sub(1, Ordering::SeqCst);
         let failing = fake.fail_writes.load(Ordering::SeqCst);
         if failing > 0 {
             fake.fail_writes.store(failing - 1, Ordering::SeqCst);
@@ -285,6 +303,7 @@ impl ContentAddressableStorage for Shared {
         let _serving = Serving::start(fake);
         let digests = request.into_inner().blob_digests;
         lock(&fake.finds).push(digests.len());
+        let _ = fake.find_gate.subscribe().wait_for(|open| *open).await;
         let mode = *lock(&fake.find);
         match mode {
             Find::Serve => {}
