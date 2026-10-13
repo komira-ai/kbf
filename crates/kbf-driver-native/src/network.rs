@@ -268,8 +268,8 @@ mod tests {
     }
 
     /// Catches: the network off by default (the old rule), an unknown value taken as
-    /// on or off instead of refused, and the Command's deprecated platform overriding
-    /// the Action's.
+    /// on or off instead of refused, the Command's deprecated platform ignored, and
+    /// the Command's platform overriding the Action's.
     #[test]
     #[allow(deprecated)]
     fn the_network_is_on_unless_turned_off() {
@@ -295,19 +295,21 @@ mod tests {
             network_of(&bad, &none.1),
             Err(RuntimeError::Invalid(_))
         ));
+        // The Command's platform turns the network off (`off`, not `on`: `on` is also
+        // the default, so a check with it passes when the Command is ignored).
         let command = Command {
-            platform: platform("on"),
+            platform: platform("off"),
             ..Command::default()
         };
         assert_eq!(
             network_of(&Action::default(), &command).ok(),
-            Some(Network::On)
+            Some(Network::Off)
         );
         let action = Action {
-            platform: platform("off"),
+            platform: platform("on"),
             ..Action::default()
         };
-        assert_eq!(network_of(&action, &command).ok(), Some(Network::Off));
+        assert_eq!(network_of(&action, &command).ok(), Some(Network::On));
     }
 
     /// The names the docs of [`NO_DEVICE_RULES`] list for each of its mach rules.

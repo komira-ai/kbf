@@ -372,11 +372,12 @@ unless it turns it off:
 
 | `network` | The action gets |
 |---|---|
-| absent, `on`, `standard` | the network: the sandbox has no network rule (the default) |
-| `off`, `none` | loopback and Unix sockets only: every other connect is refused with `EPERM` by the sandbox (`crates/kbf-driver-native/src/network.rs`) |
+| absent, `on`, `standard` | the network (the default): the sandbox's only network rule denies the `usbmuxd` socket, which reaches an iOS device |
+| `off`, `none` | loopback, Unix sockets and the node's own non-loopback address: every other connect is refused with `EPERM` by the sandbox (`crates/kbf-driver-native/src/network.rs`) |
 
 Any other value is refused with `INVALID_ARGUMENT`. Unix sockets stay open with
-`network=off`, so DNS lookups still go out through the system's resolver. A node
+`network=off`, so DNS lookups still go out through the system's resolver; a connect to
+the node's own LAN address is allowed too, so a service listening on it is reachable. A node
 without `sandbox-exec` cannot turn the network off and says so in its
 `network_isolation` capability (`none`). Linux container actions have no network
 ([ARCHITECTURE.md](../ARCHITECTURE.md)), whatever the property says.
