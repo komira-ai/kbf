@@ -1740,6 +1740,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "kbf-tier"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "kbf-meta",
+ "kbf-segments",
+ "kbf-store",
+ "thiserror",
+]
+
+[[package]]
 name = "kbf-transfer"
 version = "0.1.0"
 dependencies = [
