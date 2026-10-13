@@ -248,3 +248,15 @@ async fn query_write_status_reports_only_durable_progress() {
         blob.data
     );
 }
+
+/// Catches: the empty blob reported missing by QueryWriteStatus. REAPI holds it present
+/// everywhere, so no client uploads it (the transfer engine's FindMissing skips it); a
+/// client that asks whether its write is durable must hear yes without a write, as
+/// FindMissing says.
+#[tokio::test]
+async fn the_empty_blob_is_durable_without_a_write() {
+    let farm = Farm::start().await;
+    let empty = Blob::new(Vec::new());
+    assert!(farm.find_missing(&[&empty]).await.is_empty());
+    assert_eq!(status(&farm, &empty).await, (0, true));
+}

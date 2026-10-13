@@ -1248,6 +1248,7 @@ dependencies = [
  "kbf-proto",
  "kbf-server",
  "kbf-testkit",
+ "kbf-transfer",
  "kbf-types",
  "libc",
  "prost",
@@ -1410,6 +1411,7 @@ dependencies = [
  "kbf-proto",
  "kbf-server",
  "kbf-testkit",
+ "kbf-transfer",
  "proc-macro2",
  "prost",
  "rcgen",
@@ -1542,6 +1544,7 @@ dependencies = [
  "kbf-proto",
  "kbf-server",
  "kbf-testkit",
+ "kbf-transfer",
  "kbf-types",
  "libc",
  "prost",
@@ -1711,6 +1714,22 @@ name = "kbf-testkit"
 version = "0.1.0"
 dependencies = [
  "rustix",
+]
+
+[[package]]
+name = "kbf-transfer"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "hex",
+ "kbf-front",
+ "kbf-proto",
+ "kbf-types",
+ "sha2 0.11.0",
+ "thiserror",
+ "tokio",
+ "tonic",
+ "tracing",
 ]
 
 [[package]]

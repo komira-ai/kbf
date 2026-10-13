@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use kbf_daemon::Event;
-use kbf_daemon::cas::{Cas as _, CasClient};
+use kbf_daemon::cas::Cas as _;
 use kbf_driver_native::network::Isolation;
 use kbf_proto::reapi::execution_client::ExecutionClient;
 use kbf_proto::reapi::platform::Property;
@@ -18,6 +18,7 @@ use kbf_proto::reapi::{
     Action, ActionResult, Command, Digest, Directory, ExecuteRequest, Platform,
 };
 use kbf_server::{Api, Listeners, WorkerTls, bind_server_with_api};
+use kbf_transfer::{TransferConfig, Transfers};
 use prost::Message as _;
 use rcgen::{CertificateParams, CertifiedIssuer, IsCa, KeyPair};
 use serde_json::Value;
@@ -99,7 +100,7 @@ async fn gone(path: &Path) {
 
 /// Stores an action naming `xcode=<build>` that, run by `act` (kbf-testkit's act verbs),
 /// writes `ran` to `marker` and prints its `DEVELOPER_DIR`.
-async fn action(cas: &CasClient, build: &str, act: &Path, marker: &Path) -> Digest {
+async fn action(cas: &Transfers, build: &str, act: &Path, marker: &Path) -> Digest {
     let put = |message: Vec<u8>| async move { cas.put(message).await.expect("upload") };
     // On the Action, where REAPI v2.2 reads it (the Command's field is deprecated).
     let platform = Some(Platform {
@@ -282,7 +283,7 @@ async fn the_daemon_says_hello_before_its_first_survey_ends() {
         .await
         .expect("connect");
     let marker = dir.join("ran");
-    let cas = CasClient::new(channel.clone());
+    let cas = Transfers::over(channel.clone(), TransferConfig::default());
     let named = action(&cas, "1A1", &act, &marker).await;
     let running = tokio::spawn(execute(channel, named));
     // Long enough for the server to place it (it ticks every 50 ms) were it placeable.

@@ -59,6 +59,12 @@ impl MemoryCas {
 }
 
 impl Cas for MemoryCas {
+    type Lease = std::sync::Arc<Self>;
+
+    fn lease(self: &std::sync::Arc<Self>, _: &kbf_types::LeaseId) -> std::sync::Arc<Self> {
+        std::sync::Arc::clone(self)
+    }
+
     async fn get(&self, digest: &Digest) -> Result<Vec<u8>, CasError> {
         if let Some(delay) = self.delay {
             tokio::time::sleep(delay).await;

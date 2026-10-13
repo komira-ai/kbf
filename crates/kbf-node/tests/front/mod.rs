@@ -12,7 +12,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use futures::{Stream, StreamExt as _};
-use kbf_daemon::cas::{Cas as _, CasClient};
+use kbf_daemon::cas::Cas as _;
 use kbf_proto::google::bytestream::byte_stream_server::ByteStreamServer;
 use kbf_proto::reapi::command::EnvironmentVariable;
 use kbf_proto::reapi::{Action, Command, Digest, Directory};
@@ -20,6 +20,7 @@ use kbf_proto::worker::worker_server::{Worker, WorkerServer};
 use kbf_proto::worker::{
     DaemonMessage, Hello, LeaseId, ServerMessage, Start, Welcome, daemon_message, server_message,
 };
+use kbf_transfer::{TransferConfig, Transfers};
 use prost::Message as _;
 use tokio::sync::mpsc as tokio_mpsc;
 use tonic::transport::server::TcpIncoming;
@@ -180,7 +181,7 @@ impl Front {
                 .connect()
                 .await
                 .expect("connect to the CAS");
-            let cas = CasClient::new(channel);
+            let cas = Transfers::over(channel, TransferConfig::default());
             let put = |bytes: Vec<u8>| {
                 let cas = &cas;
                 async move { cas.put(bytes).await.expect("upload") }

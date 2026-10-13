@@ -362,7 +362,7 @@ pub(crate) async fn collect(
         .map(str::to_owned)
         .collect();
     let budget = Budget::new(limits);
-    let (uploads, drain) = Uploads::new();
+    let (uploads, drain) = Uploads::new(cas.in_flight());
     let walk = record(
         cas, uploads, budget, &upper_fd, &wd_parts, &base, paths, result,
     );

@@ -16,7 +16,7 @@ The design documents under [docs/design](docs/design) go deeper:
 | [metadata-snapshots.md](docs/design/metadata-snapshots.md) | the snapshot encoding of the metadata state, compaction of the single-voter log, starting from a snapshot, version refusal, size and pause at today's scale and 10x, and how the HA design inherits it (**planned**) |
 | [worker-protocol.md](docs/design/worker-protocol.md) | `kbf.worker.v1`: messages and the rules both sides keep |
 | [daemon.md](docs/design/daemon.md) | `kbf-daemon`, the container driver, output collection, limits |
-| [worker-cache.md](docs/design/worker-cache.md) | the daemon's blob traffic: one shared transfer engine (a connection pool, one in-flight limit, batching, FindMissing before upload), a per-node NVMe input cache linked or cloned into each lease, per-driver safety, eviction, metrics, rollout and tests (**planned**) |
+| [worker-cache.md](docs/design/worker-cache.md) | the daemon's blob traffic: one shared transfer engine (one connection, one in-flight limit, batching, FindMissing before upload), a per-node NVMe input cache linked or cloned into each lease, per-driver safety, eviction, metrics, rollout and tests (the engine without batching, and the container driver's cache, are built) |
 | [capabilities.md](docs/design/capabilities.md) | node reports, ISA levels, matching an action to a node |
 | [mac-node-provisioning.md](docs/design/mac-node-provisioning.md) | a Mac as a worker: baseline, provisioning, the signed daemon artifact, headless settings, updates, join and leave (**planned**) |
 | [macos-end-state.md](docs/design/macos-end-state.md) | the macOS native and whole-machine drivers' end state: a root daemon, a reused pool of unprivileged lease users with a clean and post-clean check between leases, the macOS worker cache by hard link, one auto-login GUI user for GUI and Screen Recording leases, stable farm signing, the probes and build order (**planned**) |
@@ -114,7 +114,8 @@ what lets a simulation seed replay a run exactly (see [Testing](#testing)).
 | `kbf-proto` | no | generated code for REAPI, `kbf.worker.v1` and `kbf.log.v1` |
 | `kbf-log` | no | the replicated log's entry encoding: `kbf-meta` commands and the control commands (batched farm inputs, a result with its action-cache entry, takeover, checkpoint, machine version) to and from `kbf.log.v1`, under the log's format version |
 | `kbf-mdm-api` | no | what `kbf-server` and `kbf-mdm-gate` share: generated `kbf.mdmgate.v1` (status, enforce, withdraw, profile; no erase), the names both check, Apple's catalogue parser and its at-most-daily reader |
-| `kbf-daemon` | no | the daemon: session loop, lease manager, CAS client, input and output trees |
+| `kbf-daemon` | no | the daemon: session loop, lease manager, input and output trees, the input cache |
+| `kbf-transfer` | no | the shared blob transfer engine: the `Cas` trait, and `Transfers`, one per daemon process: one HTTP/2 connection to the worker listener with explicit windows, one in-flight limit and byte budget for every lease, one fetch per digest however many leases ask, FindMissing before every upload, resumed reads after a broken connection, and each lease's `TransferStats` ([worker-cache.md](docs/design/worker-cache.md) section 4) |
 | `kbf-driver-container` | no | the rootless Podman execution driver |
 | `kbf-driver-native` | no | the native execution driver: plain processes, for Macs |
 | `kbf-node` | no | the `kbf-daemon` binary: flags, and the driver `--driver` names |

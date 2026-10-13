@@ -312,9 +312,14 @@ impl<C: Cas> NativeRuntime<C> {
         self.stops.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Fetches and checks the action, and writes its inputs into `dir`.
-    async fn prepare(&self, work: &Work, dir: &Path) -> Result<Prepared, RuntimeError> {
-        let cas = &*self.cas;
+    /// Fetches and checks the action through the lease's `cas`, and writes its inputs
+    /// into `dir`.
+    async fn prepare(
+        &self,
+        cas: &C::Lease,
+        work: &Work,
+        dir: &Path,
+    ) -> Result<Prepared, RuntimeError> {
         let action: Action = fetch_message(cas, &work.action_digest)
             .await
             .map_err(tree_error)?;
@@ -389,8 +394,10 @@ impl<C: Cas> NativeRuntime<C> {
     /// Runs the prepared action until it exits, times out, outgrows its memory limit
     /// or is killed, then ends every process of it. The exit code of an action that
     /// exited.
+    #[allow(clippy::too_many_arguments)]
     async fn execute(
         &self,
+        cas: &C::Lease,
         work: &Work,
         dir: &Path,
         prepared: &Prepared,
@@ -473,7 +480,7 @@ impl<C: Cas> NativeRuntime<C> {
         watch.end(&mut child, self.config.kill_wait).await?;
         match ended {
             Ended::Exited(status) => Ok(exit_code(status.map_err(failed(&program))?)),
-            Ended::TimedOut => Err(self.timed_out(work.lease_id, dir).await),
+            Ended::TimedOut => Err(self.timed_out(cas, work.lease_id, dir).await),
             Ended::Killed => Err(RuntimeError::Killed),
             Ended::OutOfMemory { used, limit } => {
                 tracing::warn!(lease = %work.lease_id, used, limit, "killed past its memory limit");
@@ -486,8 +493,8 @@ impl<C: Cas> NativeRuntime<C> {
     /// stderr in `dir`, each stored within the stdio limit (REAPI's partial result). A
     /// log past the limit, or one that cannot be stored, is left out: the answer is
     /// still the timeout.
-    async fn timed_out(&self, lease: LeaseId, dir: &Path) -> RuntimeError {
-        let store = CasStore(Arc::clone(&self.cas));
+    async fn timed_out(&self, cas: &C::Lease, lease: LeaseId, dir: &Path) -> RuntimeError {
+        let store = CasStore(cas);
         let max = self.config.outputs.max_stdio_bytes;
         let mut logs = [None, None];
         for (name, slot) in ["stdout", "stderr"].into_iter().zip(&mut logs) {
@@ -515,6 +522,8 @@ impl<C: Cas> NativeRuntime<C> {
             input_fetch_start_timestamp: now(),
             ..ExecutedActionMetadata::default()
         };
+        // The lease's own view of the CAS, for its transfer counters.
+        let cas = self.cas.lease(&work.lease_id);
         // A lease of a root daemon waits for a free slot of the pool, killable.
         #[cfg(target_os = "macos")]
         if let Some(slots) = &self.slots {
@@ -529,7 +538,7 @@ impl<C: Cas> NativeRuntime<C> {
         // A kill during prepare (a long input fetch) stops it at once; the clean
         // removes whatever was written.
         let mut prepared = tokio::select! {
-            prepared = self.prepare(work, dir) => prepared?,
+            prepared = self.prepare(&cas, work, dir) => prepared?,
             Ok(by) = &mut *stop => {
                 *killer = Some(by);
                 return Err(RuntimeError::Killed);
@@ -550,12 +559,12 @@ impl<C: Cas> NativeRuntime<C> {
         clock.execution_start_timestamp = now();
         let exit_code = match &prepared.refused {
             Some(refused) => refuse(dir, refused).await?,
-            None => (self.execute(work, dir, &prepared, runner, stop, killer)).await?,
+            None => (self.execute(&cas, work, dir, &prepared, runner, stop, killer)).await?,
         };
         clock.execution_completed_timestamp = now();
 
         clock.output_upload_start_timestamp = now();
-        let store = CasStore(Arc::clone(&self.cas));
+        let store = CasStore(&cas);
         let mut result = ActionResult {
             exit_code,
             ..ActionResult::default()
@@ -1141,6 +1150,12 @@ mod tests {
     struct NoCas;
 
     impl Cas for NoCas {
+        type Lease = std::sync::Arc<Self>;
+
+        fn lease(self: &std::sync::Arc<Self>, _: &kbf_types::LeaseId) -> std::sync::Arc<Self> {
+            std::sync::Arc::clone(self)
+        }
+
         async fn get(&self, digest: &kbf_proto::reapi::Digest) -> Result<Vec<u8>, CasError> {
             Err(CasError::Missing(digest.hash.clone()))
         }
@@ -1168,8 +1183,10 @@ mod tests {
         let started = NativeRuntime::with_remover(config, Arc::new(NoCas), &refuse);
         let started = started.expect("the start goes on");
         let digest = kbf_proto::reapi::Digest::default();
-        assert!(started.cas.get(&digest).await.is_err(), "no CAS here");
-        assert!(started.cas.put(Vec::new()).await.is_err(), "no CAS here");
+        // A lease reads through the same store.
+        let lease = started.cas.lease(&LeaseId::new(3, 3));
+        assert!(lease.get(&digest).await.is_err(), "no CAS here");
+        assert!(lease.put(Vec::new()).await.is_err(), "no CAS here");
         assert!(!scratch.join("lease-3-3").exists(), "moved out of the way");
         let aside = std::fs::read_dir(scratch.join(crate::sweep::QUARANTINE))
             .expect("quarantine")

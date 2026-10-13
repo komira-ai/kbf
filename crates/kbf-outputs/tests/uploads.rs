@@ -1,5 +1,5 @@
-//! How `collect` stores an output tree: many blobs at once, never more than
-//! `UPLOADS_IN_FLIGHT`, each distinct digest once, and all of them stored before it
+//! How `collect` stores an output tree: many blobs at once, never more than the
+//! store's `in_flight`, each distinct digest once, and all of them stored before it
 //! returns; and how many blobs its queue, `Uploads`, holds at once.
 
 use std::collections::HashMap;
@@ -10,9 +10,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use futures::FutureExt as _;
-use kbf_outputs::{
-    CHUNK_BYTES, OutputLimits, Store, StoreError, UPLOADS_IN_FLIGHT, Uploads, collect, digest_of,
-};
+use kbf_outputs::{CHUNK_BYTES, OutputLimits, Store, StoreError, Uploads, collect, digest_of};
 use kbf_proto::reapi::{ActionResult, Digest, Directory, Tree};
 use prost::Message;
 
@@ -69,6 +67,13 @@ impl CountingStore {
     }
 }
 
+/// The in-flight limit [`CountingStore`] answers: not 64, so a walk with a bound of its
+/// own would show.
+const BOUND: usize = 16;
+
+/// What the queue test runs its uploads at.
+const UPLOADS_IN_FLIGHT: usize = 64;
+
 impl Store for CountingStore {
     async fn put(&self, bytes: Vec<u8>) -> Result<Digest, StoreError> {
         Ok(self.keep(bytes).await)
@@ -86,6 +91,10 @@ impl Store for CountingStore {
             return Err("the file does not hash to its digest".into());
         }
         Ok(stored)
+    }
+
+    fn in_flight(&self) -> usize {
+        BOUND
     }
 }
 
@@ -142,7 +151,8 @@ fn named(result: &ActionResult, tree: &Tree) -> Vec<Digest> {
 /// thousands of small files took minutes per lease, the CAS idle), stores with no
 /// bound, and `collect` returning before every blob the result names is stored (the
 /// action cache refuses such a result). One file is larger than a chunk, so the
-/// streamed path is queued too. Mutant seen red: `UPLOADS_IN_FLIGHT` passed as 1.
+/// streamed path is queued too. Mutants seen red: the store's `in_flight` passed as 1;
+/// no bound (`usize::MAX`).
 #[tokio::test]
 async fn many_blobs_are_stored_at_once_within_the_bound() {
     let root = scratch("in-flight");
@@ -159,7 +169,7 @@ async fn many_blobs_are_stored_at_once_within_the_bound() {
     let result = collect_out(&store, &root).await;
     let most = store.most_in_flight.load(Ordering::SeqCst);
     assert!(most > 1, "one store at a time");
-    assert!(most <= UPLOADS_IN_FLIGHT, "{most} stores in flight");
+    assert!(most <= BOUND, "{most} stores in flight");
     let tree = store.tree(&result);
     let named = named(&result, &tree);
     assert_eq!(
@@ -234,7 +244,7 @@ async fn a_walk_holds_at_most_one_blob_past_the_stores_in_flight() {
     let started = Arc::new(AtomicUsize::new(0));
     let (open, gate) = futures::channel::oneshot::channel::<()>();
     let gate = gate.shared();
-    let (mut uploads, drain) = Uploads::<Infallible>::new();
+    let (mut uploads, drain) = Uploads::<Infallible>::new(UPLOADS_IN_FLIGHT);
     let walk = async {
         for i in 0..300 {
             let held = Held::new(&alive, &most);
