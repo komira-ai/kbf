@@ -3,11 +3,13 @@
 //! never goes on the command line).
 
 use std::net::{IpAddr, SocketAddr};
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use clap::{Parser, ValueEnum};
+use kbf_front::WriteConfig;
 use kbf_objstore::s3::{Credentials, S3Config, S3ConfigError, S3Store};
 use kbf_objstore::{Capabilities, KeyError, KeyPrefix};
 use tonic::transport::{Certificate, Identity, ServerTlsConfig};
@@ -202,6 +204,46 @@ pub struct Args {
     /// The store refuses to overwrite a key (MinIO and RustFS do).
     #[arg(long)]
     pub s3_conditional_put: bool,
+    /// How long, in milliseconds, the oldest blob of an open segment waits for
+    /// concurrent uploads to join it before the segment is sealed and written
+    /// (`docs/design/write-path.md`, section 3.1). No caller is answered before its
+    /// segment has committed, so this is added to an upload's latency at most.
+    #[arg(
+        long,
+        default_value_t = kbf_front::WriteConfig::DEFAULT.linger.as_millis() as u64,
+        value_parser = clap::value_parser!(u64).range(0..=1_000)
+    )]
+    pub write_linger: u64,
+    /// Blobs of this many bytes or more are written as a segment of their own, past
+    /// the group, so they neither wait for the linger nor hold up small writes.
+    #[arg(long, default_value_t = kbf_front::WriteConfig::DEFAULT.own_segment_bytes)]
+    pub write_own_segment_bytes: u64,
+    /// The most bytes uploads may hold at once. A ByteStream Write is admitted for its
+    /// blob's size before it reads past its first message, a BatchUpdateBlobs for its
+    /// total; a caller over the bound waits, nothing is refused for load. At least the
+    /// largest blob (1 GiB), so one can always be admitted. Not covered: each HTTP/2
+    /// stream's message as tonic decodes it, before the handler runs, up to 5 MiB per
+    /// stream and 200 streams per connection on either listener
+    /// (`kbf_front::MAX_CONCURRENT_STREAMS`).
+    #[arg(
+        long,
+        default_value_t = kbf_front::WriteConfig::DEFAULT.bytes_in_flight
+    )]
+    pub write_bytes_in_flight: u64,
+    /// The most segment PUTs, each with its footer read-back, in flight at once. A
+    /// segment sealed while all are busy waits; new blobs go to a new open segment.
+    #[arg(long, default_value_t = kbf_front::WriteConfig::DEFAULT.puts_in_flight)]
+    pub write_puts_in_flight: NonZeroUsize,
+    /// How many times a segment PUT is tried. Only a PUT that did not complete
+    /// (connect, reset, timeout) or that the store answered 5xx is tried again, after
+    /// 100 ms and then four times longer each time, under a new object key; if every
+    /// attempt fails, the segment's blobs are answered UNAVAILABLE.
+    #[arg(
+        long,
+        default_value_t = kbf_front::WriteConfig::DEFAULT.put_attempts.get(),
+        value_parser = clap::value_parser!(u32).range(1..=5)
+    )]
+    pub store_put_attempts: u32,
 }
 
 /// Why the flags do not make a working server.
@@ -359,6 +401,21 @@ impl Args {
         Ok(Some(Api { listen, token }))
     }
 
+    /// How the cache groups and bounds uploads: `--write-linger`,
+    /// `--write-own-segment-bytes`, `--write-bytes-in-flight`, `--write-puts-in-flight`
+    /// and `--store-put-attempts`.
+    #[must_use]
+    pub fn write_config(&self) -> WriteConfig {
+        WriteConfig {
+            linger: Duration::from_millis(self.write_linger),
+            own_segment_bytes: self.write_own_segment_bytes,
+            bytes_in_flight: self.write_bytes_in_flight,
+            puts_in_flight: self.write_puts_in_flight,
+            // clap refuses 0.
+            put_attempts: NonZeroU32::new(self.store_put_attempts).unwrap_or(NonZeroU32::MIN),
+        }
+    }
+
     /// The raft directory under `--meta-log=raft`; `None` under `--meta-log=memory`.
     ///
     /// # Errors
@@ -426,9 +483,54 @@ fn read(path: &PathBuf) -> Result<Vec<u8>, ConfigError> {
 
 #[cfg(test)]
 mod tests {
+    use std::num::{NonZeroU32, NonZeroUsize};
+    use std::time::Duration;
+
     use clap::Parser;
+    use kbf_front::{MAX_BLOB_BYTES, WriteConfig};
 
     use super::{Args, loopback_only};
+
+    /// Catches: a `--write-bytes-in-flight` below the largest blob accepted (a Write of
+    /// that blob would wait for admission forever), a flag wired to the wrong field of
+    /// the write configuration, and defaults other than the design's.
+    #[test]
+    fn write_flags_make_the_write_config() {
+        let defaults = Args::parse_from(["kbf-server"]).write_config();
+        assert_eq!(defaults, WriteConfig::DEFAULT);
+        let set = Args::parse_from([
+            "kbf-server",
+            "--write-linger",
+            "7",
+            "--write-own-segment-bytes",
+            "12345",
+            "--write-bytes-in-flight",
+            &MAX_BLOB_BYTES.to_string(),
+            "--write-puts-in-flight",
+            "9",
+            "--store-put-attempts",
+            "5",
+        ]);
+        let want = WriteConfig {
+            linger: Duration::from_millis(7),
+            own_segment_bytes: 12345,
+            bytes_in_flight: MAX_BLOB_BYTES,
+            puts_in_flight: NonZeroUsize::new(9).expect("9"),
+            put_attempts: NonZeroU32::new(5).expect("5"),
+        };
+        assert_eq!(set.write_config(), want);
+        let below = (MAX_BLOB_BYTES - 1).to_string();
+        for (flag, value) in [
+            ("--write-bytes-in-flight", below.as_str()),
+            ("--write-puts-in-flight", "0"),
+            ("--store-put-attempts", "0"),
+            ("--store-put-attempts", "6"),
+            ("--write-linger", "1001"),
+        ] {
+            let refused = Args::try_parse_from(["kbf-server", flag, value]);
+            assert!(refused.is_err(), "{flag} {value} was accepted");
+        }
+    }
 
     /// Catches: a `loopback_only` that knows only wildcards (`is_unspecified`), so one
     /// interface other machines reach (`192.0.2.10`, a documentation address standing

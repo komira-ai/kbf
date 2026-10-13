@@ -417,7 +417,7 @@ impl ObjectStore for S3Store {
 }
 
 fn transport(e: reqwest::Error) -> ObjectStoreError {
-    ObjectStoreError::Transport(Box::new(e))
+    ObjectStoreError::Transport(std::sync::Arc::new(e))
 }
 
 /// The error a non-success answer carries.

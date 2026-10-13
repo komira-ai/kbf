@@ -116,7 +116,8 @@ impl<M: MetaLog, O: ObjectStore + 'static> ByteStream for ByteStreamService<M, O
     }
 
     /// Receives a blob from offset 0, verifies it, stores it, and only then answers
-    /// with its size. A blob already durable is answered at once.
+    /// with its size. A blob already durable is answered at once. Past the first
+    /// message, nothing is read until [`Cache::admit`] has admitted the blob's size.
     async fn write(
         &self,
         request: Request<Streaming<WriteRequest>>,
@@ -154,6 +155,12 @@ impl<M: MetaLog, O: ObjectStore + 'static> ByteStream for ByteStreamService<M, O
         if self.cache.is_durable(&digest).await? {
             return Ok(committed(size));
         }
+        // Admitted before anything past the first message is read, so every byte held
+        // in `received` is counted under `--write-bytes-in-flight`; a Write over the
+        // bound waits here. The first message is held like a batch, under the message
+        // size limit.
+        let admitted = self.cache.admit(size).await;
+        let mut buffering = self.cache.buffering();
         let mut received: Vec<u8> = Vec::new();
         let mut message = first;
         loop {
@@ -177,6 +184,7 @@ impl<M: MetaLog, O: ObjectStore + 'static> ByteStream for ByteStreamService<M, O
                 )));
             }
             received.extend_from_slice(&message.data);
+            buffering.add(message.data.len() as u64);
             if message.finish_write {
                 break;
             }
@@ -184,8 +192,12 @@ impl<M: MetaLog, O: ObjectStore + 'static> ByteStream for ByteStreamService<M, O
                 Status::invalid_argument("write stream ended without finish_write")
             })?;
         }
-        let blob = VerifiedBlob::new(digest, Bytes::from(received))?;
-        self.cache.store_blobs(vec![blob]).await?;
+        let received = Bytes::from(received);
+        // The receive buffer is now the blob's bytes, held under `admitted` until the
+        // cache has copied them into a segment.
+        drop(buffering);
+        let blob = VerifiedBlob::new(digest, received)?;
+        self.cache.store_admitted(vec![blob], admitted).await?;
         self.recorder
             .call(&metadata, &caller, &instance, &|| CallKind::Uploaded(size));
         Ok(committed(size))

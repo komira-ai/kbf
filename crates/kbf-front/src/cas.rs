@@ -115,8 +115,11 @@ impl<M: MetaLog, O: ObjectStore + 'static> ContentAddressableStorage for CasServ
         }))
     }
 
-    /// Verifies each blob against its digest and stores the good ones together (one
-    /// segment, one commit per blob). A bad blob fails alone, with INVALID_ARGUMENT.
+    /// Verifies each blob against its digest and stores the good ones
+    /// ([`Cache::store_each`]), after [`Cache::admit`] has admitted the request's
+    /// total. Each blob is answered alone: a bad one INVALID_ARGUMENT, a good one OK
+    /// once its segment has committed, or its segment's error, so a request whose
+    /// blobs landed in a committed and a failed segment gets a mixed answer.
     async fn batch_update_blobs(
         &self,
         request: Request<BatchUpdateBlobsRequest>,
@@ -139,6 +142,7 @@ impl<M: MetaLog, O: ObjectStore + 'static> ContentAddressableStorage for CasServ
                 "batch carries {total} bytes; at most {MAX_BATCH_TOTAL_BYTES} are allowed"
             )));
         }
+        let admitted = self.cache.admit(total as u64).await;
         let checked: Vec<(Option<reapi::Digest>, Result<VerifiedBlob, Status>)> = request
             .requests
             .into_iter()
@@ -154,21 +158,29 @@ impl<M: MetaLog, O: ObjectStore + 'static> ContentAddressableStorage for CasServ
         self.recorder.call(&metadata, &caller, instance, &|| {
             CallKind::Uploaded(uploaded)
         });
-        let stored = self.cache.store_blobs(good).await.map_err(Status::from);
-        let responses = checked
+        let count = good.len();
+        let stored = match self.cache.store_each(good, admitted).await {
+            Ok(each) => each,
+            Err(e) => vec![Err(e); count],
+        };
+        let is_good: Vec<bool> = checked.iter().map(|(_, c)| c.is_ok()).collect();
+        let mut responses: Vec<batch_update_blobs_response::Response> = checked
             .into_iter()
-            .map(|(digest, c)| {
-                let status = match (c, &stored) {
-                    (Ok(_), Ok(())) => wire::rpc_ok(),
-                    (Ok(_), Err(e)) => wire::rpc_status(e),
-                    (Err(e), _) => wire::rpc_status(&e),
-                };
-                batch_update_blobs_response::Response {
-                    digest,
-                    status: Some(status),
-                }
+            .map(|(digest, c)| batch_update_blobs_response::Response {
+                digest,
+                status: Some(c.map_or_else(|e| wire::rpc_status(&e), |_| wire::rpc_ok())),
             })
             .collect();
+        // Each verified blob's own answer, in request order.
+        let verified = responses
+            .iter_mut()
+            .zip(is_good)
+            .filter_map(|(r, good)| good.then_some(r));
+        for (response, stored) in verified.zip(stored) {
+            if let Err(e) = stored {
+                response.status = Some(wire::rpc_status(&Status::from(e)));
+            }
+        }
         Ok(Response::new(BatchUpdateBlobsResponse { responses }))
     }
 

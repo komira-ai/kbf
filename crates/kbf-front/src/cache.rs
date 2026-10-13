@@ -31,7 +31,7 @@ const TOUCH_ATTEMPTS: usize = 3;
 
 /// Why a cache operation failed. [`Status`] has a `From` for it, so a service answers
 /// with the right gRPC code.
-#[derive(Debug, thiserror::Error)]
+#[derive(Clone, Debug, thiserror::Error)]
 pub enum CacheError {
     /// The blob is not held. The only error that becomes NOT_FOUND.
     #[error("blob {0} is not in the cache")]
@@ -170,6 +170,7 @@ pub struct Cache<M, O> {
     epoch: Epoch,
     next_seq: AtomicU64,
     segment_limit: u64,
+    group: std::sync::Arc<Group>,
 }
 
 impl Cache<MemoryMetaLog, MemoryStore> {
@@ -198,7 +199,7 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
     /// Writes under an epoch `meta` never allocated are refused by the index
     /// ([`CacheError::Internal`]); two caches given one epoch would name the same keys.
     #[must_use]
-    pub const fn new(meta: M, objects: O, prefix: KeyPrefix, epoch: Epoch) -> Self {
+    pub fn new(meta: M, objects: O, prefix: KeyPrefix, epoch: Epoch) -> Self {
         Self {
             meta,
             objects,
@@ -206,6 +207,7 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
             epoch,
             next_seq: AtomicU64::new(1),
             segment_limit: MAX_SEGMENT_BYTES,
+            group: std::sync::Arc::new(Group::new(WriteConfig::DEFAULT)),
         }
     }
 
@@ -755,8 +757,14 @@ fn unexpected(applied: &Applied) -> CacheError {
 }
 
 mod batch;
+mod write_group;
 
 pub use batch::BATCH_READS_IN_FLIGHT;
+use write_group::Group;
+pub use write_group::{
+    Admitted, CONNECTION_WINDOW_BYTES, MAX_CONCURRENT_STREAMS, PUT_BACKOFF, PUT_BACKOFF_FACTOR,
+    STREAM_WINDOW_BYTES, WriteConfig,
+};
 
 #[cfg(test)]
 mod tests;

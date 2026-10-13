@@ -220,8 +220,9 @@ pub struct Capabilities {
     pub object_lock: bool,
 }
 
-/// Errors from an [`ObjectStore`](crate::ObjectStore).
-#[derive(Debug, thiserror::Error)]
+/// Errors from an [`ObjectStore`](crate::ObjectStore). Cloned, so one failed write can
+/// be reported to every caller waiting on it.
+#[derive(Clone, Debug, thiserror::Error)]
 pub enum ObjectStoreError {
     /// No object has this key.
     #[error("object {0} not found")]
@@ -260,7 +261,7 @@ pub enum ObjectStoreError {
     Protocol(String),
     /// The request did not complete (connect, timeout, reset).
     #[error("request to the store failed")]
-    Transport(#[source] Box<dyn std::error::Error + Send + Sync>),
+    Transport(#[source] std::sync::Arc<dyn std::error::Error + Send + Sync>),
 }
 
 #[cfg(test)]
