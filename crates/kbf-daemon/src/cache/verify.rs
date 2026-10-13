@@ -37,8 +37,11 @@ pub(super) fn stat_check(path: &Path, key: &Key, uid: u32) -> Result<u64, Found>
     };
     let regular = FileType::from_raw_mode(stat.st_mode) == FileType::RegularFile;
     let fits = regular && stat.st_uid == uid && stat.st_mode & 0o7777 == key.mode();
+    // `st_nlink` is a u64 on x86-64 and a u32 on aarch64.
+    #[allow(clippy::useless_conversion)]
+    let nlink = u64::from(stat.st_nlink);
     if fits && u64::try_from(stat.st_size) == Ok(key.size) {
-        Ok(stat.st_nlink)
+        Ok(nlink)
     } else {
         Err(Found::Bad)
     }
