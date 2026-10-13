@@ -139,6 +139,11 @@ runs. **Planned**: collection runs on a schedule.
 5. Only then are the blobs' locations committed: one `PutBlobs` per segment. The
    upload is acknowledged after that.
 
+**Planned** ([write-path.md](write-path.md)): concurrent small uploads grouped into
+shared segments (one PUT and one `PutBlobs` per segment, not per call), and a local
+write tier that syncs segments to a server's NVMe or SSD, acknowledges, and flushes
+them to the object store in the background.
+
 So a blob is never reported present before its bytes are durable in the store.
 
 **ByteStream uploads** follow one rule per stream: bytes arrive in order from offset 0,
@@ -309,6 +314,8 @@ capabilities.
   change plus a background copy.
 - **Compression.** zstd for ByteStream, advertised only once reads and writes decode it.
 - **Locality.** Daemons keep a local cache of hot inputs and report what they hold, and
-  each server caches hot blobs above the object store. The daemon side, and the one
+  each server caches hot blobs above the object store. The local write tier of
+  [write-path.md](write-path.md) is the first part of that: blocks it wrote stay as a
+  read cache after they are flushed. The daemon side, and the one
   transfer engine all bulk blob movement goes through, are designed in
   [worker-cache.md](worker-cache.md).
