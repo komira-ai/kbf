@@ -93,6 +93,7 @@ use crate::connect::{
 };
 use crate::contact::Contact;
 use crate::lease::{Done, Leases, failure, lease_id, proto_lease_id};
+use crate::phases::LeasePhases;
 use crate::report::NodeReport;
 use crate::runtimes::Runtimes;
 use crate::status::{DriverReport, Software};
@@ -131,6 +132,9 @@ pub enum Event {
     Superseded(Vec<LeaseId>),
     /// A welcomed session ended, with the reason.
     Disconnected(String),
+    /// A lease's run ended (its Result is being sent): where its time went, as the
+    /// `lease phases:` line logs it.
+    LeaseEnded(LeasePhases),
     /// An attempt to connect ended before the server's Welcome (a refused connection, a
     /// TLS failure, a server answering `UNAVAILABLE`, ...), or a server's name resolved
     /// to no address. `server` names the URL, and the address when there was one.
@@ -800,8 +804,13 @@ impl Daemon {
     }
 
     /// Reports a finished run.
-    fn finished(&mut self, tx: Option<&UnboundedSender<DaemonMessage>>, (id, outcome): Done) {
-        let result = self.leases.finished(id, outcome);
+    fn finished(
+        &mut self,
+        tx: Option<&UnboundedSender<DaemonMessage>>,
+        (id, outcome, phases): Done,
+    ) {
+        let result = self.leases.finished(id, outcome, &phases);
+        self.emit(Event::LeaseEnded(phases));
         self.report(tx, result);
     }
 

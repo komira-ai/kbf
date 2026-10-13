@@ -1051,8 +1051,8 @@ left open):
   copies of its blob until they write them out.
 - **`TransferStats` is a log line, not yet the API.** Each lease's scope logs
   `transfers: read_calls=... read_bytes=... merged_reads=... find_missing_digests=...
-  outputs_present=... write_calls=... written_bytes=... retries=...` (INFO, field
-  `lease`) once the lease's scope and the fetches it started are gone. FindMissing calls
+  outputs_present=... write_calls=... written_bytes=... written_blobs=...
+  retries=...` (INFO, field `lease`) once the lease's scope and the fetches it started are gone. FindMissing calls
   are shared by leases, so a lease counts the digests it asked about
   (`find_missing_digests`), not calls. The batch counters wait for T2;
   `permit_wait_ms` and `transfer_ms` are not counted yet. Carrying them in

@@ -94,6 +94,8 @@ impl<M: MetaLog, O: ObjectStore + 'static> ContentAddressableStorage for CasServ
         &self,
         request: Request<FindMissingBlobsRequest>,
     ) -> Result<Response<FindMissingBlobsResponse>, Status> {
+        let metrics = self.cache.metrics();
+        let mut timed = metrics.find_missing.start();
         let caller = kbf_auth::metadata(&request);
         let metadata = call_metadata(&request);
         let request = request.into_inner();
@@ -102,7 +104,9 @@ impl<M: MetaLog, O: ObjectStore + 'static> ContentAddressableStorage for CasServ
         authorize(find_missing, &caller, call, &request.instance_name).await?;
         wire::check_digest_function(request.digest_function)?;
         let digests = wire::digests(&request.blob_digests)?;
+        metrics.find_missing_digests.add(digests.len() as u64);
         let missing = self.cache.find_missing(&digests).await?;
+        metrics.find_missing_missing.add(missing.len() as u64);
         let instance = &request.instance_name;
         self.recorder.call(&metadata, &caller, instance, &|| {
             CallKind::FindMissingBlobs {
@@ -110,6 +114,7 @@ impl<M: MetaLog, O: ObjectStore + 'static> ContentAddressableStorage for CasServ
                 missing: missing.len() as u64,
             }
         });
+        timed.ok();
         Ok(Response::new(FindMissingBlobsResponse {
             missing_blob_digests: missing.iter().map(wire::digest_to_proto).collect(),
         }))
@@ -124,6 +129,8 @@ impl<M: MetaLog, O: ObjectStore + 'static> ContentAddressableStorage for CasServ
         &self,
         request: Request<BatchUpdateBlobsRequest>,
     ) -> Result<Response<BatchUpdateBlobsResponse>, Status> {
+        let metrics = self.cache.metrics();
+        let mut timed = metrics.batch_update.start();
         let caller = kbf_auth::metadata(&request);
         let metadata = call_metadata(&request);
         let request = request.into_inner();
@@ -137,6 +144,10 @@ impl<M: MetaLog, O: ObjectStore + 'static> ContentAddressableStorage for CasServ
         .await?;
         wire::check_digest_function(request.digest_function)?;
         let total: usize = request.requests.iter().map(|r| r.data.len()).sum();
+        timed.bytes(total as u64);
+        metrics
+            .batch_update_blobs
+            .add(request.requests.len() as u64);
         if total > MAX_BATCH_TOTAL_BYTES {
             return Err(Status::invalid_argument(format!(
                 "batch carries {total} bytes; at most {MAX_BATCH_TOTAL_BYTES} are allowed"
@@ -171,6 +182,11 @@ impl<M: MetaLog, O: ObjectStore + 'static> ContentAddressableStorage for CasServ
                 status: Some(c.map_or_else(|e| wire::rpc_status(&e), |_| wire::rpc_ok())),
             })
             .collect();
+        // A store that failed answers each blob with its error, not the call; the call
+        // is counted ok only if every verified blob was stored.
+        if stored.iter().all(Result::is_ok) {
+            timed.ok();
+        }
         // Each verified blob's own answer, in request order.
         let verified = responses
             .iter_mut()

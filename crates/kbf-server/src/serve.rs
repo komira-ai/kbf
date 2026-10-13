@@ -296,6 +296,7 @@ where
     );
     let api_routes = crate::api::router(Arc::clone(&farm), token)
         .merge(health_routes)
+        .merge(crate::metrics::router(Arc::clone(&cache)))
         .merge(blob_routes)
         .merge(page_routes);
     // Logged at every start, the first one too (issue #156).

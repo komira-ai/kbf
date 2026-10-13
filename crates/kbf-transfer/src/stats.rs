@@ -25,8 +25,12 @@ pub struct TransferStats {
     pub outputs_present: u64,
     /// ByteStream writes, each attempt counted.
     pub write_calls: u64,
-    /// Blob bytes those writes sent.
+    /// Blob bytes this lease's successful writes sent. A blob two leases write at once
+    /// is sent by both, and counts for both.
     pub written_bytes: u64,
+    /// Blobs this lease's successful writes stored (a failed or retried attempt counts
+    /// in `write_calls` only).
+    pub written_blobs: u64,
     /// Requests retried after an UNAVAILABLE or a broken connection.
     pub retries: u64,
 }
@@ -36,7 +40,7 @@ impl fmt::Display for TransferStats {
         write!(
             f,
             "read_calls={} read_bytes={} merged_reads={} find_missing_digests={} \
-             outputs_present={} write_calls={} written_bytes={} retries={}",
+             outputs_present={} write_calls={} written_bytes={} written_blobs={} retries={}",
             self.read_calls,
             self.read_bytes,
             self.merged_reads,
@@ -44,6 +48,7 @@ impl fmt::Display for TransferStats {
             self.outputs_present,
             self.write_calls,
             self.written_bytes,
+            self.written_blobs,
             self.retries
         )
     }
@@ -60,6 +65,7 @@ pub(crate) struct Counts {
     pub outputs_present: AtomicU64,
     pub write_calls: AtomicU64,
     pub written_bytes: AtomicU64,
+    pub written_blobs: AtomicU64,
     pub retries: AtomicU64,
 }
 
@@ -80,6 +86,7 @@ impl Counts {
             outputs_present: get(&self.outputs_present),
             write_calls: get(&self.write_calls),
             written_bytes: get(&self.written_bytes),
+            written_blobs: get(&self.written_blobs),
             retries: get(&self.retries),
         }
     }

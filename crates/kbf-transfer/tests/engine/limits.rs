@@ -408,3 +408,91 @@ async fn a_read_whose_task_is_gone_is_unavailable() {
         "{got:?}"
     );
 }
+
+/// A lease's counters while its reads are merged with another lease's and its uploads
+/// race one: what the `transfers:` line of each lease says it moved. Three leases:
+/// - Reads: A starts a read of X, held at the server; B asks for X while it is held
+///   and joins A's read. The bytes are A's (`read_calls` 1, `read_bytes` X's length);
+///   B has one merged read and no bytes; the server served X once. So the sum of
+///   `read_bytes` over leases is what the server sent.
+/// - Uploads: A and B store the same new blob Y while the server holds writes, so both
+///   ask FindMissing before either lands and both send it: each lease shows one write
+///   of Y's bytes, and the server saw two. Then C stores Y, which the server now
+///   holds: one upload skipped, nothing written.
+/// - A refused `put_chunks` (UNAVAILABLE, not retried) is a write call but no blob
+///   written.
+/// Mutants seen red (each with the values shown, not a timeout): the shared read
+/// counted for no lease (A shows 0, 0, 0); the joining lease credited with the bytes
+/// (B shows `read_bytes` 300); `written_blobs` added before the write (the refused one
+/// shows 1); C's skip counted as written (C shows 1).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn each_lease_counts_its_own_transfers_when_reads_merge_and_uploads_race() {
+    let fake = Arc::new(Fake::default());
+    let x = patterned(500, 300);
+    let x_digest = fake.insert(x.clone());
+    let engine = engine(fake.serve().await, TransferConfig::default());
+    let a = Arc::new(engine.scope(&LeaseId::new(9, 1)));
+    let b = Arc::new(engine.scope(&LeaseId::new(9, 2)));
+    let c = engine.scope(&LeaseId::new(9, 3));
+    let len = x.len() as u64;
+
+    fake.close();
+    let first = tokio::spawn({
+        let (a, x_digest) = (Arc::clone(&a), x_digest.clone());
+        async move { a.get(&x_digest).await }
+    });
+    within(30, || fake.active.load(Ordering::SeqCst) == 1).await;
+    let joined = tokio::spawn({
+        let (b, x_digest) = (Arc::clone(&b), x_digest.clone());
+        async move { b.get(&x_digest).await }
+    });
+    within(30, || b.stats().merged_reads == 1).await;
+    fake.open();
+    assert_eq!(first.await.expect("A"), Ok(x.clone()));
+    assert_eq!(joined.await.expect("B"), Ok(x));
+    let reads = |s: &Scope| {
+        let t = s.stats();
+        (t.read_calls, t.read_bytes, t.merged_reads)
+    };
+    assert_eq!(reads(&a), (1, len, 0), "the lease that started the read");
+    assert_eq!(reads(&b), (0, 0, 1), "the lease that joined it");
+    assert_eq!(fake.reads_of(&x_digest), [0], "reads of X at the server");
+
+    let y = patterned(501, 200);
+    let y_digest = digest_of(&y);
+    fake.close();
+    let uploads: Vec<_> = [&a, &b]
+        .into_iter()
+        .map(|scope| {
+            let (scope, y) = (Arc::clone(scope), y.clone());
+            tokio::spawn(async move { scope.put(y).await })
+        })
+        .collect();
+    within(30, || fake.held_writes.load(Ordering::SeqCst) == 2).await;
+    fake.open();
+    for upload in uploads {
+        assert_eq!(upload.await.expect("upload"), Ok(y_digest.clone()));
+    }
+    let writes = |s: &Scope| {
+        let t = s.stats();
+        (
+            t.write_calls,
+            t.written_blobs,
+            t.written_bytes,
+            t.outputs_present,
+        )
+    };
+    let sent = y.len() as u64;
+    assert_eq!(writes(&a), (1, 1, sent, 0), "A's upload of Y");
+    assert_eq!(writes(&b), (1, 1, sent, 0), "B's upload of Y");
+    let name = kbf_transfer::label(&y_digest);
+    let y_writes = lock(&fake.writes).iter().filter(|w| **w == name).count();
+    assert_eq!(y_writes, 2, "writes of Y at the server");
+    assert_eq!(c.put(y).await, Ok(y_digest));
+    assert_eq!(writes(&c), (0, 0, 0, 1), "C's upload of Y, already held");
+
+    let z = patterned(502, 100);
+    fake.fail_writes.store(1, Ordering::SeqCst);
+    assert!(c.put_chunks(digest_of(&z), chunks_of(&z)).await.is_err());
+    assert_eq!(writes(&c), (1, 0, 0, 1), "C's refused upload of Z");
+}

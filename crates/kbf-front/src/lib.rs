@@ -48,6 +48,7 @@ mod capabilities;
 mod cas;
 mod execution;
 mod meta_log;
+pub mod metrics;
 mod recorder;
 mod request_metadata;
 mod wire;

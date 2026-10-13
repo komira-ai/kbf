@@ -27,10 +27,10 @@ use std::mem;
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use kbf_meta::{Applied, Command, Epoch, Location, ObjectId, StoreId};
+use kbf_meta::{Applied, Command, Epoch, Location, MetaState, ObjectId, StoreId};
 use kbf_objstore::{ByteRange, KeyPrefix, ObjectKey, ObjectStore, ObjectStoreError};
 use kbf_segments::layout::{TRAILER_LEN, footer_len};
 use kbf_segments::{Footer, SegmentWriter, WriteError};
@@ -38,7 +38,8 @@ use kbf_types::Digest;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 
 use super::{Cache, CacheError, VerifiedBlob, refuse_oversized, unexpected};
-use crate::meta_log::MetaLog;
+use crate::meta_log::{MetaLog, MetaLogError};
+use crate::metrics::{CacheMetrics, command_label};
 
 /// The wait before the first retry of a failed segment PUT. Each later wait is
 /// [`PUT_BACKOFF_FACTOR`] times the one before: 100 ms, then 400 ms.
@@ -227,24 +228,27 @@ enum Answer {
     Waiting(oneshot::Receiver<Result<(), CacheError>>),
 }
 
-/// The store side of the cache: the metadata log, the bucket, and how objects are
-/// named. Shared with the tasks that write segments.
+/// The store side of the cache: the metadata log, the bucket, how objects are named,
+/// and the cache's metrics. Shared with the tasks that write segments, so a segment
+/// written after its callers have gone is still timed.
 #[derive(Debug)]
 pub(super) struct Writer<M, O> {
     pub(super) meta: M,
     pub(super) objects: O,
     pub(super) prefix: KeyPrefix,
     pub(super) epoch: Epoch,
+    pub(super) metrics: CacheMetrics,
     next_seq: AtomicU64,
 }
 
 impl<M, O> Writer<M, O> {
-    pub(super) const fn new(meta: M, objects: O, prefix: KeyPrefix, epoch: Epoch) -> Self {
+    pub(super) fn new(meta: M, objects: O, prefix: KeyPrefix, epoch: Epoch) -> Self {
         Self {
             meta,
             objects,
             prefix,
             epoch,
+            metrics: CacheMetrics::default(),
             next_seq: AtomicU64::new(1),
         }
     }
@@ -333,6 +337,18 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         admitted: Admitted,
     ) -> Result<Vec<Result<(), CacheError>>, CacheError> {
         refuse_oversized(&blobs)?;
+        let started = Instant::now();
+        let stored = self.store_fresh(blobs, admitted).await;
+        self.writer.metrics.store_blobs.since(started);
+        stored
+    }
+
+    /// [`Cache::store_each`] of blobs no larger than the limit.
+    async fn store_fresh(
+        &self,
+        blobs: Vec<VerifiedBlob>,
+        admitted: Admitted,
+    ) -> Result<Vec<Result<(), CacheError>>, CacheError> {
         let held = self.held(&blobs).await?;
         let answers = self.submit(blobs, &held, &admitted);
         drop(admitted);
@@ -459,7 +475,7 @@ async fn settle<M: MetaLog, O: ObjectStore>(
             .await
     };
     let answer = match placed {
-        Ok(placed) => writer.commit(placed).await,
+        Ok(placed) => writer.commit_segment(placed).await,
         Err(e) => Err(e),
     };
     for waiter in waiters {
@@ -469,6 +485,40 @@ async fn settle<M: MetaLog, O: ObjectStore>(
 }
 
 impl<M: MetaLog, O: ObjectStore> Writer<M, O> {
+    /// Commits `command` to the metadata log, timed by command.
+    pub(super) async fn commit(&self, command: Command) -> Result<Applied, MetaLogError> {
+        let histogram = &self.metrics.commit[command_label(&command)];
+        let started = Instant::now();
+        let applied = self.meta.commit(command).await;
+        histogram.since(started);
+        applied
+    }
+
+    /// Runs `f` against the metadata log's state, timed.
+    pub(super) async fn query<R, F>(&self, f: F) -> Result<R, MetaLogError>
+    where
+        F: FnOnce(&MetaState) -> R + Send,
+        R: Send,
+    {
+        let started = Instant::now();
+        let answer = self.meta.query(f).await;
+        self.metrics.query.since(started);
+        answer
+    }
+
+    /// One range GET of a blob being read, timed. The footer read-back of a segment
+    /// write is not a read and does not come here.
+    pub(super) async fn get_range(
+        &self,
+        key: &ObjectKey,
+        range: ByteRange,
+    ) -> Result<Bytes, ObjectStoreError> {
+        let started = Instant::now();
+        let bytes = self.objects.get_range(key, range).await;
+        self.metrics.object_get.since(started);
+        bytes
+    }
+
     /// Writes one segment, reads its footer back from the store, and returns where
     /// each packed blob is, as the stored footer says.
     async fn put_segment(
@@ -479,8 +529,13 @@ impl<M: MetaLog, O: ObjectStore> Writer<M, O> {
     ) -> Result<Vec<(Digest, Location)>, CacheError> {
         let body = Bytes::from(records.finish());
         let len = body.len() as u64;
+        self.metrics.segment_blobs.observe(packed.len() as u64);
+        self.metrics.segment_bytes.observe(len);
         let (segment, key) = self.put(attempts, body).await?;
-        let footer = self.read_footer(&key, len).await.map_err(read_back)?;
+        let started = Instant::now();
+        let footer = self.read_footer(&key, len).await;
+        self.metrics.segment_footer.since(started);
+        let footer = footer.map_err(read_back)?;
         packed
             .iter()
             .map(|d| {
@@ -513,7 +568,10 @@ impl<M: MetaLog, O: ObjectStore> Writer<M, O> {
         loop {
             let object = self.allocate();
             let key = self.object_key(object)?;
-            match self.objects.put_new(&key, body.clone(), None).await {
+            let started = Instant::now();
+            let put = self.objects.put_new(&key, body.clone(), None).await;
+            self.metrics.segment_put.since(started);
+            match put {
                 Ok(()) => return Ok((object, key)),
                 Err(e) if attempt < attempts.get() && transient(&e) => {
                     tracing::warn!(%key, %e, attempt, "segment PUT failed; retrying");
@@ -542,8 +600,11 @@ impl<M: MetaLog, O: ObjectStore> Writer<M, O> {
     }
 
     /// Commits where each blob of one segment is, as one `PutBlobs`.
-    async fn commit(&self, placed: Vec<(Digest, Location)>) -> Result<(), CacheError> {
-        match self.meta.commit(Command::PutBlobs(placed)).await? {
+    async fn commit_segment(&self, placed: Vec<(Digest, Location)>) -> Result<(), CacheError> {
+        let started = Instant::now();
+        let committed = self.commit(Command::PutBlobs(placed)).await;
+        self.metrics.segment_commit.since(started);
+        match committed? {
             Applied::Blobs(Ok(_)) => Ok(()),
             Applied::Blobs(Err(e)) => Err(CacheError::Internal(e.to_string())),
             other => Err(unexpected(&other)),
