@@ -7,8 +7,8 @@
 //! on the same user, looks for each through the tool that would use it and finds none.
 //! The other tests: a process the uid cannot kill fails the clean within its deadline
 //! and quarantines the slot; a home the wipe cannot empty gets the user made again; a
-//! user that cannot be made again quarantines the slot; and the start cleans what a
-//! killed daemon left.
+//! user that cannot be made again quarantines the slot; the start cleans what a
+//! killed daemon left; and a lease's job labelled like launchd's own is still counted.
 //!
 //! Every test is `#[ignore]`: each needs root and real users. The macOS CI job runs them
 //! with `cargo xtask sudo-test -p kbf-driver-native --test slot_clean` (from
@@ -705,6 +705,50 @@ async fn a_process_the_kill_cannot_end_fails_the_clean_within_its_deadline() {
         after.as_deref(),
         Some("0"),
         "a slot whose processes survived is still reported"
+    );
+}
+
+/// Launchd's own agents are told by their plist, not their label. Catches a check that
+/// leaves a process out by its job's label, which the lease chooses (a KeepAlive agent
+/// labelled `com.apple.*` that a bootout left loaded would run beside every later lease,
+/// and the check would pass): the running agent `com.apple.kbf-ci-label`, from a plist
+/// in the home, is among the uid's leftover processes.
+#[ignore = "needs root and real users: cargo xtask sudo-test -p kbf-driver-native --test slot_clean"]
+#[test]
+fn a_job_labelled_like_launchds_own_is_still_the_leases() {
+    assert_root();
+    let scratch = Scratch::new("label");
+    let users = Users::new("label", 1);
+    let user = &users.0[0];
+    let label = "com.apple.kbf-ci-label";
+    let agents = home_of(user).join("Library").join("LaunchAgents");
+    let made = as_user(user, "/bin/mkdir", &["-p", &agents.to_string_lossy()]);
+    assert!(made.status.success(), "mkdir: {made:?}");
+    let mut text = String::new();
+    let drop_to = scratch.as_user_binary();
+    bootstrap(user, &drop_to, &agents, "label", label, 3007, &mut text);
+    let service = format!("user/{}/{label}", user.uid);
+    let mut pid = None;
+    let give_up = Instant::now() + PROMPT;
+    while pid.is_none() && Instant::now() < give_up {
+        let (_, said) = root("/bin/launchctl", &["print", &service]);
+        pid = said
+            .lines()
+            .find_map(|line| line.strip_prefix("\tpid = "))
+            .and_then(|pid| pid.trim().parse::<i32>().ok());
+        if pid.is_none() {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+    let left = kbf_driver_native::slots::macos::host::leftover_processes(user.uid).expect("list");
+    let (_, booted) = root("/bin/launchctl", &["bootout", &service]);
+    assert!(text.contains("planted label"), "{text}");
+    let pid = pid.unwrap_or_else(|| panic!("the agent never ran: {text}"));
+    assert!(
+        left.contains(&pid),
+        "the lease's agent {label} (pid {pid}) is left out of uid {}'s processes {left:?} \
+         (bootout: {booted})",
+        user.uid
     );
 }
 
