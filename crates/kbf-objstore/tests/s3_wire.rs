@@ -373,3 +373,43 @@ async fn wait_answering_gives_up_at_its_deadline() {
         "{took:?}"
     );
 }
+
+/// Catches a request timeout reported without its cause: a PUT to a store that takes
+/// the connection and never reads the body or answers must fail at the request timeout
+/// with an error whose text says it timed out, so the failure a lease reports tells a
+/// slow store from a reset one ("request to the store failed" alone did not).
+#[tokio::test]
+async fn a_put_the_store_never_answers_fails_saying_it_timed_out() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    // Holds each connection open, unread, until the test ends.
+    let held = tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((sock, _)) = listener.accept().await {
+            held.push(sock);
+        }
+    });
+    let s = S3Store::new(S3Config {
+        endpoint,
+        region: "us-east-1".into(),
+        bucket: "kbf-test".into(),
+        credentials: Credentials::new("AKIDEXAMPLE", "secret"),
+        capabilities: Capabilities::default(),
+        connect_timeout: Duration::from_secs(5),
+        request_timeout: Duration::from_millis(300),
+    })
+    .unwrap();
+    let k = key();
+    let put = s.put_new(&k, Bytes::from(vec![0u8; 4 << 20]), None);
+    let err = tokio::time::timeout(Duration::from_secs(10), put)
+        .await
+        .expect("the PUT outlived its request timeout")
+        .unwrap_err();
+    held.abort();
+    assert!(matches!(err, ObjectStoreError::Transport(_)), "{err}");
+    let text = err.to_string();
+    assert!(
+        text.starts_with("request to the store failed: ") && text.contains("timed out"),
+        "{text}"
+    );
+}
