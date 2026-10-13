@@ -125,6 +125,16 @@ const DRIFTS: &[Drift] = &[
     ),
     (
         "kbf_volume",
+        "a directory on the system volume",
+        |m| {
+            let s = m.state_mut();
+            s.volumes.clear();
+            s.held_by.insert(VOLUME.into(), "/".into());
+        },
+        "/Volumes/kbf is not a mounted volume (diskutil gives the mount point /): make it",
+    ),
+    (
+        "kbf_volume",
         "not APFS",
         |m| {
             m.state_mut()
@@ -248,8 +258,12 @@ const DRIFTS: &[Drift] = &[
     (
         "pool_users",
         "a group with the pool gid",
-        |m| m.state_mut().attr("/Groups/other", "PrimaryGroupID", "700"),
-        "gid 700 belongs to other",
+        |m| {
+            let s = m.state_mut();
+            s.records.remove("/Groups/kbfpool");
+            s.attr("/Groups/other", "PrimaryGroupID", "700");
+        },
+        "group kbfpool: PrimaryGroupID=absent, want 700; gid 700 belongs to other",
     ),
     (
         "pool_users",
@@ -759,6 +773,7 @@ const STAYS: &[(&str, &str)] = &[
     ("role_user", "a group with the id"),
     ("kbf_volume", "not mounted"),
     ("kbf_volume", "not APFS"),
+    ("kbf_volume", "a directory on the system volume"),
     ("pool_users", "a user with a pool uid"),
     ("pool_users", "a group with the pool gid"),
     ("ssh_password_auth", "no Include line"),

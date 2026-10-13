@@ -95,6 +95,9 @@ pub struct State {
     pub no_effect: Vec<String>,
     /// Mounted volumes `diskutil info` reports: mount point, file system personality.
     pub volumes: BTreeMap<String, String>,
+    /// Paths that are no mount point, with the mount point of the APFS volume holding
+    /// them, which `diskutil info` reports for them.
+    pub held_by: BTreeMap<String, String>,
     /// Mount points `mdutil -s` reports indexing disabled for.
     pub spotlight_off: BTreeSet<String>,
     /// Paths `tmutil isexcluded` reports excluded.
@@ -652,7 +655,12 @@ impl FakeMac {
                 Some(personality) => ok(format!(
                     "   Device Identifier:         disk3s7\n   Mount Point:               {volume}\n   File System Personality:   {personality}\n"
                 )),
-                None => no(&format!("Could not find disk: {volume}\n")),
+                None => match s.held_by.get(*volume) {
+                    Some(mount) => ok(format!(
+                        "   Device Identifier:         disk3s1\n   Mount Point:               {mount}\n   File System Personality:   APFS\n"
+                    )),
+                    None => no(&format!("Could not find disk: {volume}\n")),
+                },
             },
             ("mdutil", ["-s", volume]) => ok(format!(
                 "{volume}:\n\tIndexing {}.\n",

@@ -131,6 +131,48 @@ fn a_pool_home_that_is_a_link_is_left() {
     assert_eq!(fs::metadata(&elsewhere).unwrap().mode() & 0o7777, 0o755);
 }
 
+/// Catches: `apply` making the pool's homes through a link at the homes directory
+/// (the link target would hold directories owned by the pool uids). `dir_of` leaves
+/// the link; the mutant is `fix_user` making the homes anyway, as it did before.
+#[test]
+fn a_homes_directory_that_is_a_link_gets_no_home() {
+    let mac = FakeMac::converged("pool-homes-link");
+    let elsewhere = support::scratch("pool-homes-link-target");
+    mac.remove(HOMES);
+    mac.symlink(&elsewhere, HOMES);
+    let r = check(&mac);
+    assert!(
+        lines(&r, "FAIL")
+            .iter()
+            .any(|l| l.starts_with("FAIL pool_users: /Volumes/kbf/home is lrwx")),
+        "{}",
+        r.text
+    );
+    let r = apply(&mac);
+    let made: Vec<_> = fs::read_dir(&elsewhere)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert!(
+        made.is_empty(),
+        "apply made {made:?} through {HOMES}:\n{}",
+        r.text
+    );
+    assert!(
+        r.text.starts_with(
+            "NOTE pool_users: /Volumes/kbf/home is not a directory; apply leaves it\nNOTE pool_users: /Volumes/kbf/home is lrwx"
+        ),
+        "{}",
+        r.text
+    );
+    assert!(
+        r.text.contains(", not drwxr-xr-x 0 0: no home made\n"),
+        "{}",
+        r.text
+    );
+    assert_eq!(r.failed, 1, "{}", r.text);
+}
+
 /// Catches: the pool's size or first uid not read from the profile.
 #[test]
 fn the_pool_size_and_first_uid_come_from_the_profile() {

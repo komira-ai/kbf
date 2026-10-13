@@ -29,8 +29,9 @@ fn field<'a>(info: &'a str, name: &str) -> &'a str {
 }
 
 /// Why `kbf_volume` is not a mounted APFS volume, or `None` when it is: `diskutil
-/// info` gives its own path as the mount point (a directory on another volume gives
-/// that volume's, or none), and an APFS personality.
+/// info` must give its own path as the mount point, and an APFS personality. Any
+/// other mount point (that of a volume holding a plain directory at the path) and no
+/// answer at all both fail.
 fn not_mounted(c: &Ctx<'_>) -> Option<String> {
     let volume = c.profile.volume.as_str();
     let info = c.mac.out(DISKUTIL, &["info", volume]);
@@ -38,7 +39,11 @@ fn not_mounted(c: &Ctx<'_>) -> Option<String> {
         field(&info, "Mount Point"),
         field(&info, "File System Personality"),
     );
-    if mount != volume {
+    if mount != volume && !mount.is_empty() {
+        Some(format!(
+            "{volume} is not a mounted volume (diskutil gives the mount point {mount})"
+        ))
+    } else if mount != volume {
         Some(format!(
             "{volume} is not a mounted volume ({})",
             or(info.trim(), "diskutil says nothing")
@@ -277,9 +282,10 @@ pub(crate) fn pool_users_item(c: &Ctx<'_>) -> Outcome {
 
 /// Makes the group and each pool user what [`pool_users_item`] wants: sets the
 /// attributes that differ, removes a password hash and the memberships of `admin` and
-/// `wheel`, and makes the homes, only on the mounted volume. A user whose uid another
-/// user holds is left; nothing is changed while another group holds the gid. What is at
-/// a home's path and is not a directory is left.
+/// `wheel`, and makes the homes, only on the mounted volume and only in a homes
+/// directory that is (or that it makes) a directory of root's, mode 755, never through a
+/// link. A user whose uid another user holds is left; nothing is changed while another
+/// group holds the gid. What is at a home's path and is not a directory is left.
 pub(crate) fn fix_pool_users(c: &Ctx<'_>, out: &mut Lines) -> io::Result<()> {
     let gid = c.profile.pool_first_uid;
     if let Some(other) = holder(c, "/Groups", "PrimaryGroupID", gid.into(), GROUP) {
@@ -309,13 +315,21 @@ pub(crate) fn fix_pool_users(c: &Ctx<'_>, out: &mut Lines) -> io::Result<()> {
             format!("made {homes}, root's, mode 755"),
         )?;
     }
+    // A home is made only in a real directory of root's: through a link at `homes` it
+    // would land, owned by a pool uid, wherever the link points.
+    let found = c.mac.ls(&homes);
+    let homes_ok = mounted && found == ROOT_DIR;
     for u in pool_users(c) {
-        fix_user(c, out, &u, mounted)?;
+        fix_user(c, out, &u, homes_ok)?;
     }
-    if mounted {
+    if !mounted {
+        Err(unmounted(c, "no home made"))
+    } else if homes_ok {
         Ok(())
     } else {
-        Err(unmounted(c, "no home made"))
+        Err(io::Error::other(format!(
+            "{homes} is {found}, not {ROOT_DIR}: no home made"
+        )))
     }
 }
 
@@ -337,7 +351,7 @@ pub(crate) fn dir_of(
     Ok(())
 }
 
-fn fix_user(c: &Ctx<'_>, out: &mut Lines, u: &PoolUser, mounted: bool) -> io::Result<()> {
+fn fix_user(c: &Ctx<'_>, out: &mut Lines, u: &PoolUser, homes_ok: bool) -> io::Result<()> {
     if let Some(other) = holder(c, "/Users", "UniqueID", u.uid.into(), &u.name) {
         out.note(
             c.key,
@@ -375,7 +389,7 @@ fn fix_user(c: &Ctx<'_>, out: &mut Lines, u: &PoolUser, mounted: bool) -> io::Re
             out.change(c.key, format!("{} removed from {group}", u.name));
         }
     }
-    if mounted && c.mac.ls(&u.home) != home_want(c, u) {
+    if homes_ok && c.mac.ls(&u.home) != home_want(c, u) {
         let gid = c.profile.pool_first_uid;
         dir_of(
             c,

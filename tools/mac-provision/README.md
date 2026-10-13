@@ -24,7 +24,7 @@ against a fake Mac in `cargo test`. Where the port differs:
   `docs/design/macos-end-state.md` (step 2), over
   five optional keys (the script refuses them):
   - `kbf_volume` (`/Volumes/<name>`, default `/Volumes/kbf`): a mounted APFS volume
-    (`diskutil info`), not indexed (`mdutil -s`, and `.metadata_never_index` at its
+    (`diskutil info` gives the path itself as the mount point), not indexed (`mdutil -s`, and `.metadata_never_index` at its
     root) and excluded from Time Machine (`tmutil isexcluded`). `apply` writes the
     marker, runs `mdutil -i off` and `tmutil addexclusion`; it does not make the volume
     (`diskutil apfs addVolume` is the operator's).
@@ -38,7 +38,9 @@ against a fake Mac in `cargo test`. Where the port differs:
     no other account holding a pool uid or the gid. The pool's uids must be at most
     65535 and outside `lease_uids`. `apply` makes them with `dscl . -create`, removes
     `admin` and `wheel` memberships with `dseditgroup -o edit -d`, and makes the homes
-    only while the volume is mounted; it leaves a user whose uid another holds.
+    only while the volume is mounted and its `home` directory is a directory of root's,
+    mode 755 (never through a link there); it leaves a user whose uid another holds,
+    and changes nothing while another group holds the gid.
   - `daemon_user` (`role`, the default, or `root`; `kbf_cache`, an absolute path):
     with `role` nothing changes and nothing is checked. With `root` the property list
     has no `UserName` or `GroupName`, the error log is root's, the node key (`kbf_key`)

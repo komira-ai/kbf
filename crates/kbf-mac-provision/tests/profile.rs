@@ -670,6 +670,14 @@ fn every_malformed_pool_volume_or_daemon_setting_is_refused() {
             "pool uids 697-700 overlap lease_uids 600-699",
         ),
         (
+            "pool running into lease_uids from below",
+            edited(|l| {
+                set("lease_uids", "650-699")(l);
+                l.push("pool_first_uid=648".into());
+            }),
+            "pool uids 648-651 overlap lease_uids 650-699",
+        ),
+        (
             "pool above 65535",
             edited(append("pool_first_uid=65533")),
             "pool uids 65533-65536 go above 65535",
