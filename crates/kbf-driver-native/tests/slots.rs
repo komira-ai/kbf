@@ -8,8 +8,9 @@
 //! with `cargo xtask sudo-test -p kbf-driver-native --test slots` (from
 //! `tools/ci/mac-session-tests.sh`), which builds this file as the runner's user and
 //! runs the binary through `sudo -n` with `--ignored`. They make users at free uids from
-//! 690 (`kbf-ci-slot-<test>-<i>`, hidden, shell `/usr/bin/false`, homes in `/Users`; tests/support/pool.rs) and delete them, their homes and every process of
-//! their uids when they end, passed or not.
+//! 690 (`kbf-ci-slot-<test>-<i>`, hidden, shell `/usr/bin/false`, homes in the folder
+//! tests/support/pool.rs names) and delete them, their homes and every process of their
+//! uids when they end, passed or not.
 
 #![cfg(target_os = "macos")]
 

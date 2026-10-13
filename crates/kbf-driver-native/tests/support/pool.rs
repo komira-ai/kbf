@@ -1,6 +1,6 @@
 //! Throwaway pool users for the root tests of the lease-user pool (`tests/slots.rs`,
 //! `tests/slot_clean.rs`): a scratch directory every user may search, users made with
-//! `dscl` at free uids from [`FIRST_UID`] with their homes in `/Users`, and the checks
+//! `dscl` at free uids from [`FIRST_UID`] with their homes in [`HOMES`], and the checks
 //! on their processes.
 
 use std::collections::BTreeSet;
@@ -24,8 +24,11 @@ static NEXT_UID: AtomicU32 = AtomicU32::new(FIRST_UID);
 /// The pool users' primary group: staff.
 pub const GID: u32 = 20;
 /// Where the users' homes are: a root-owned folder that none of the places the clean of
-/// a slot sweeps holds (`/private/tmp`, `/private/var/tmp`, the `Shared` folder under `/Users`).
-pub const HOMES: &str = "/Users";
+/// a slot sweeps holds (`/private/tmp`, `/private/var/tmp`, the `Shared` folder under
+/// `/Users`), and that Spotlight does not index (a `.noindex` name), as the pool's
+/// volume is not: Spotlight starts `mdworker` as the user whose files changed, which
+/// the clean's check would find after the kill. Made if missing, root's, mode 0755.
+pub const HOMES: &str = "/private/var/kbf-ci-homes.noindex";
 
 /// Stops a test run as the runner's user, where every check would fail for the wrong
 /// reason. Asks the kernel, not the code under test.
@@ -98,7 +101,7 @@ pub struct Users(pub Vec<SlotUser>);
 
 impl Users {
     /// `count` users `kbf-ci-slot-<name>-<i>`, at free uids from [`FIRST_UID`] that no
-    /// earlier test of this process used, their homes `/Users/<user>`, mode 0700,
+    /// earlier test of this process used, their homes `<HOMES>/<user>`, mode 0700,
     /// their own. Never a uid again: this process's user database cache keeps the name
     /// a deleted user had (`getpwuid` named the first test's user for the next test's
     /// uid on the runner).
@@ -110,6 +113,8 @@ impl Users {
             .take(count)
             .collect();
         NEXT_UID.store(uids.last().map_or(from, |u| u + 1), Ordering::SeqCst);
+        std::fs::create_dir_all(HOMES).expect("homes");
+        std::fs::set_permissions(HOMES, std::fs::Permissions::from_mode(0o755)).expect("chmod");
         let mut users = Self(Vec::new());
         for (i, uid) in uids.into_iter().enumerate() {
             let user = SlotUser {
@@ -179,7 +184,7 @@ impl Drop for Users {
     }
 }
 
-/// The home `user` gets: `/Users/<name>`.
+/// The home `user` gets: `<HOMES>/<name>`.
 pub fn home_of(user: &SlotUser) -> PathBuf {
     Path::new(HOMES).join(&user.name)
 }

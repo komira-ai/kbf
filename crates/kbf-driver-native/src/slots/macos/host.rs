@@ -123,7 +123,7 @@ impl Os for MacSlot<'_> {
         let mut note = |step, what: String| left.push(Left { step, what });
         match uid::processes(user.uid) {
             Ok(pids) if pids.is_empty() => {}
-            Ok(pids) => note(Step::Kill, format!("processes {pids:?}")),
+            Ok(pids) => note(Step::Kill, format!("processes {:?}", named(&pids))),
             Err(why) => note(Step::Kill, format!("processes: {why}")),
         }
         let services = services_of(user.uid);
@@ -491,8 +491,11 @@ fn attributes(record: &str) -> Result<Vec<(&'static str, Vec<String>)>, String> 
     Ok(kept)
 }
 
-/// The services `launchctl print user/<uid>` lists: none when the domain is gone (or
-/// cannot be printed, which the kill and the other checks then stand in for).
+/// The services `launchctl print user/<uid>` lists, by label, but Apple's: launchd loads
+/// its own per-user agents (`com.apple.*`, from `/System/Library/LaunchAgents`) into
+/// every user domain, and the bootout leaves them listed, not running. None when the
+/// domain is gone (or cannot be printed, which the kill and the other checks then
+/// stand in for).
 fn services_of(uid: u32) -> Vec<String> {
     let out = Command::new(uid::LAUNCHCTL)
         .args(["print", &format!("user/{uid}")])
@@ -508,8 +511,9 @@ fn services_of(uid: u32) -> Vec<String> {
         .skip_while(|line| line.trim() != "services = {")
         .skip(1)
         .take_while(|line| line.trim() != "}")
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
+        // `<status> <pid or -> <label>`.
+        .filter_map(|line| line.split_whitespace().last())
+        .filter(|label| !label.starts_with("com.apple."))
         .map(str::to_owned)
         .collect()
 }
@@ -563,4 +567,20 @@ fn look(dir: &Path, dev: u64, uid: u32, depth: usize, found: &mut Vec<String>) {
             look(&path, dev, uid, depth + 1, found);
         }
     }
+}
+
+/// Each of `pids` with its name, as libproc gives it (`?` for one that is gone).
+fn named(pids: &[i32]) -> Vec<String> {
+    pids.iter()
+        .map(|&pid| {
+            let mut name = [0_u8; 64];
+            let size = u32::try_from(name.len()).unwrap_or(0);
+            // SAFETY: `name` is a writable buffer of `size` bytes; the call writes at
+            // most that many and returns how many it wrote.
+            let wrote = unsafe { libc::proc_name(pid, name.as_mut_ptr().cast(), size) };
+            let len = usize::try_from(wrote).unwrap_or(0).min(name.len());
+            let text = String::from_utf8_lossy(&name[..len]);
+            format!("{pid} {}", if text.is_empty() { "?" } else { &text })
+        })
+        .collect()
 }
