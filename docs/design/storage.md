@@ -140,7 +140,8 @@ runs. **Planned**: collection runs on a schedule.
    upload is acknowledged after that.
 
 **Planned** ([write-path.md](write-path.md)): concurrent small uploads grouped into
-shared segments (one PUT and one `PutBlobs` per segment, not per call), and a local
+shared segments (one PUT and one `PutBlobs` per segment, not per call), daemon
+uploads of an action's outputs as whole segments with one commit, and a local
 write tier that syncs segments to a server's NVMe or SSD, acknowledges, and flushes
 them to the object store in the background.
 
