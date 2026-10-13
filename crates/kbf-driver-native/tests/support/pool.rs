@@ -24,7 +24,7 @@ static NEXT_UID: AtomicU32 = AtomicU32::new(FIRST_UID);
 /// The pool users' primary group: staff.
 pub const GID: u32 = 20;
 /// Where the users' homes are: a root-owned folder that none of the places the clean of
-/// a slot sweeps holds (`/private/tmp`, `/private/var/tmp`, `/Users/Shared`).
+/// a slot sweeps holds (`/private/tmp`, `/private/var/tmp`, the `Shared` folder under `/Users`).
 pub const HOMES: &str = "/Users";
 
 /// Stops a test run as the runner's user, where every check would fail for the wrong

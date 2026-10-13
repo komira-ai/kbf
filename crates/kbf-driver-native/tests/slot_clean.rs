@@ -41,66 +41,73 @@ fn assert_root() {
 /// Where a recreate moves a home it could not empty: `<homes>/<prefix><user>-...`.
 const ASIDE: &str = ".kbf-recreated-";
 
-/// The rows of the freshness test: each place lease A leaves a marker, and what finds
-/// it in lease B.
+/// The rows of the freshness test: each place lease A leaves a marker, and what looks
+/// for it after the clean. Lease B looks for most from inside its sandbox; the sandbox
+/// refuses an action the setuid tools (`crontab`, `at`, `ps`), so the test runs those
+/// as the slot user outside it, and reads the process table and the disk images as
+/// root.
 const ROWS: [(&str, &str); 17] = [
-    ("lease-dir", "a file in lease A's directory (cat)"),
-    ("home", "a file in the slot user's real home (cat)"),
-    ("defaults", "a preference (defaults read)"),
+    (
+        "lease-dir",
+        "a file in lease A's directory (lease B: test -e)",
+    ),
+    (
+        "home",
+        "a file in the slot user's real home (lease B: test -e)",
+    ),
+    ("defaults", "a preference (lease B: defaults read)"),
     (
         "keychain",
-        "a generic password in a keychain on the search list (security)",
+        "a keychain with a generic password (lease B: security)",
     ),
-    ("T", "a file in DARWIN_USER_TEMP_DIR (cat)"),
-    ("C", "a file in DARWIN_USER_CACHE_DIR (cat)"),
-    ("tmp", "a file in /private/tmp (cat)"),
-    ("var-tmp", "a file in /private/var/tmp (cat)"),
-    ("shared", "a file in /Users/Shared (cat)"),
+    ("T", "a file in DARWIN_USER_TEMP_DIR (lease B: test -e)"),
+    ("C", "a file in DARWIN_USER_CACHE_DIR (lease B: test -e)"),
+    ("tmp", "a file in /private/tmp (lease B: test -e)"),
+    ("var-tmp", "a file in /private/var/tmp (lease B: test -e)"),
+    (
+        "shared",
+        "a file in the Shared folder under /Users (lease B: test -e)",
+    ),
     (
         "agent",
-        "a KeepAlive LaunchAgent in user/<uid> (launchctl print, ps)",
+        "a KeepAlive LaunchAgent in user/<uid> (lease B: launchctl print)",
     ),
-    ("crontab", "a crontab line (crontab -l)"),
-    ("at", "an at job (atq)"),
+    ("crontab", "a crontab line (the user: crontab -l)"),
+    ("at", "an at job (the user: atq)"),
     (
         "sleeper",
-        "a sleep in a session of its own (setsid) whose parent exited (ps)",
+        "a sleep in a session of its own whose parent exited (root: libproc)",
     ),
-    ("setuid", "a setuid-root sleep the slot user started (ps)"),
-    ("image", "an attached disk image (hdiutil info)"),
-    ("sem", "a System V semaphore (ipcs)"),
+    (
+        "setuid",
+        "a setuid-root sleep the slot user started (root: libproc)",
+    ),
+    ("image", "an attached disk image (root: hdiutil info)"),
+    ("sem", "a System V semaphore (lease B: ipcs)"),
     (
         "processes",
-        "any process of the uid, by effective or real uid (libproc)",
+        "any process of the uid, by effective or real uid (root: libproc)",
     ),
 ];
 
-/// Lease A's part inside the sandbox, as the slot user: `$1` the marker, `$2` the
-/// setuid-root sleep. Each place written prints `planted <row>`; then it waits for the
-/// test's `go`.
+/// Lease A's part inside the sandbox, as the slot user: `$1` the marker. Each place
+/// written prints `planted <row>`; then it waits for the test's `go`.
 const PLANT_INSIDE: &str = r#"m=$1
-uid=$(id -u)
 eval "h=~$(id -un)"
 t=$(getconf DARWIN_USER_TEMP_DIR)
 c=$(getconf DARWIN_USER_CACHE_DIR)
 ok() { echo "planted $*"; }
-ps -o command= -p "$(cat sleeper)" | grep -q 'sleep 3004$' && ok sleeper
 printf %s "$m" > kbf-fresh && ok lease-dir
 printf %s "$m" > "$h/kbf-fresh" && ok home
-defaults write kbf.ci.fresh v "$m" && ok defaults
+defaults write kbf.ci.fresh v "$m" && [ "$(defaults read kbf.ci.fresh v)" = "$m" ] && ok defaults
 kc="$h/Library/Keychains/kbf-fresh.keychain-db"
 mkdir -p "$h/Library/Keychains" && security create-keychain -p "" "$kc" &&
   security add-generic-password -a kbf-ci -s kbf-ci-fresh -w "$m" "$kc" &&
-  security list-keychains -d user -s "$kc" &&
-  [ "$(security find-generic-password -s kbf-ci-fresh -w)" = "$m" ] && ok keychain
+  [ "$(security find-generic-password -s kbf-ci-fresh -w "$kc")" = "$m" ] && ok keychain
 printf %s "$m" > "${t}kbf-fresh" && ok T
 printf %s "$m" > "${c}kbf-fresh" && ok C
-"$2" 3005 </dev/null >/dev/null 2>&1 &
-s=$!
-sleep 0.5
-[ "$(ps -o uid=,ruid= -p "$s" | awk '{print $1, $2}')" = "0 $uid" ] && ok setuid
 hdiutil create -quiet -size 1m -fs HFS+ -volname kbffresh "$m.dmg" &&
-  hdiutil attach -quiet -nomount "$m.dmg" && hdiutil info | grep -q "$m" && ok image
+  hdiutil attach -quiet -nomount "$m.dmg" && ok image
 sem=$(/usr/bin/perl -e 'my $id = semget(0, 1, 0600 | 01000); defined $id or die "semget: $!\n"; print $id') &&
   ipcs -s | awk -v id="$sem" '$1 == "s" && $2 == id' | grep -q . && ok sem "$sem"
 : > planted
@@ -109,47 +116,52 @@ while [ ! -e go ]; do i=$((i + 1)); [ "$i" -lt 600 ] || exit 9; sleep 0.1; done
 exit 0
 "#;
 
-/// Lease A's part outside the sandbox, which denies an action these writes: run by the
-/// test as the slot user (as a job that left the sandbox would be), `$1` the marker.
+/// Lease A's part outside the sandbox, which denies an action these writes and the
+/// setuid tools: run by the test as the slot user (as a job that left the sandbox
+/// would be), `$1` the marker.
 const PLANT_OUTSIDE: &str = r#"m=$1
 ok() { echo "planted $*"; }
 printf %s "$m" > "/private/tmp/$m" && ok tmp
 printf %s "$m" > "/private/var/tmp/$m" && ok var-tmp
-printf %s "$m" > "/Users/Shared/$m" && ok shared
+printf %s "$m" > "/Users"/Shared/"$m" && ok shared
 echo "0 0 1 1 * /usr/bin/true # $m" | crontab - && crontab -l | grep -q "$m" && ok crontab
 echo /usr/bin/true | at now + 2 hours && [ -n "$(atq)" ] && ok at
 exit 0
 "#;
 
-/// Lease B, as the same slot user: `$1` the marker, `$2` lease A's semaphore id, `$3`
-/// lease A's directory. Prints `found <row> ...` for each marker it finds, then
-/// `checked`.
+/// Lease B, in its sandbox, as the same slot user: `$1` the marker, `$2` lease A's
+/// semaphore id, `$3` lease A's directory. Prints `found <row> ...` for each marker it
+/// finds, then `checked`.
 const CHECK: &str = r#"m=$1
 uid=$(id -u)
 eval "h=~$(id -un)"
 t=$(getconf DARWIN_USER_TEMP_DIR)
 c=$(getconf DARWIN_USER_CACHE_DIR)
 found() { echo "found $*"; }
+kc="$h/Library/Keychains/kbf-fresh.keychain-db"
 [ -e "$3/kbf-fresh" ] && found lease-dir
 [ -e "$h/kbf-fresh" ] && found home
 v=$(defaults read kbf.ci.fresh v 2>/dev/null) && found defaults "$v"
-v=$(security find-generic-password -s kbf-ci-fresh -w 2>/dev/null) && found keychain "$v"
-[ -e "$h/Library/Keychains/kbf-fresh.keychain-db" ] && found keychain file
+v=$(security find-generic-password -s kbf-ci-fresh -w "$kc" 2>/dev/null) && found keychain "$v"
+[ -e "$kc" ] && found keychain file
 [ -e "${t}kbf-fresh" ] && found T
 [ -e "${c}kbf-fresh" ] && found C
 [ -e "/private/tmp/$m" ] && found tmp
 [ -e "/private/var/tmp/$m" ] && found var-tmp
-[ -e "/Users/Shared/$m" ] && found shared
+[ -e "/Users"/Shared/"$m" ] && found shared
 launchctl print "user/$uid/kbf.ci.fresh" >/dev/null 2>&1 && found agent in user/$uid
 [ -e "$h/Library/LaunchAgents/kbf.ci.fresh.plist" ] && found agent plist
-ps -axo command= | grep -qE 'sleep 3003$' && found agent process
-crontab -l 2>/dev/null | grep -q "$m" && found crontab
-q=$(atq 2>/dev/null) && [ -n "$q" ] && found at "$q"
-ps -axo command= | grep -qE '/bin/sleep 3004$' && found sleeper
-ps -axo command= | grep -qE 'setuid-sleep 3005$' && found setuid
 hdiutil info 2>/dev/null | grep -q "$m" && found image
 [ -n "$2" ] && ipcs -s | awk -v id="$2" '$1 == "s" && $2 == id' | grep -q . && found sem
 echo checked
+"#;
+
+/// What the slot user, outside the sandbox, finds of lease A's schedules: `$1` the
+/// marker.
+const CHECK_OUTSIDE: &str = r#"m=$1
+crontab -l 2>/dev/null | grep -q "$m" && echo "found crontab"
+q=$(atq 2>/dev/null) && [ -n "$q" ] && echo "found at $q"
+exit 0
 "#;
 
 /// A KeepAlive LaunchAgent that runs `sleep 3003`.
@@ -253,20 +265,22 @@ fn slots_reported(rt: &NativeRuntime<MemoryCas>) -> Option<String> {
 }
 
 /// The freshness test. With one slot, lease A leaves a marker in each place of
-/// [`ROWS`]: its own directory, the real home, a preference, a keychain item, `T/`
-/// and `C/` of its `/var/folders` entry, a setsid sleeper, a setuid-root sleep, an
-/// attached disk image and a System V semaphore from inside the sandbox; and, as the
-/// slot user outside the sandbox (which denies an action these writes), files in
-/// `/private/tmp`, `/private/var/tmp` and `/Users/Shared`, a crontab line, an `at` job,
-/// and a KeepAlive LaunchAgent bootstrapped into `user/<uid>` from its home. Lease B, as
-/// the same user, finds none of them, each through the tool that would use it, and no
-/// process of the uid is left between the two leases. Background Task Management entries
+/// [`ROWS`]: from inside its sandbox, its own directory, the real home, a preference,
+/// a keychain, `T/` and `C/` of its `/var/folders` entry, a setsid sleeper, an attached
+/// disk image and a System V semaphore; and as the slot user outside the sandbox
+/// (which denies an action these writes and the setuid tools; a job that left it is
+/// what the clean must also catch), files in `/private/tmp`, `/private/var/tmp` and the
+/// `Shared` folder under `/Users`, a crontab line, an `at` job, a setuid-root sleep and
+/// a KeepAlive LaunchAgent bootstrapped into `user/<uid>` from the home. After the
+/// clean that follows lease A, none is found: lease B, on the same user, looks for each
+/// through the tool that would use it, the slot user runs `crontab -l` and `atq`, and
+/// root reads the process table and `hdiutil info`. Background Task Management entries
 /// of the uid, if the agent made any, are gone too.
 ///
 /// Catches every step of the clean skipped, each turning its own rows red: the
-/// bootout (the agent stays in `user/<uid>`), the crontab and `at` sweep, the image
-/// detach, the semaphore removal, the home wipe (home, defaults, keychain, agent
-/// plist), the `/var/folders` wipe (T, C), the shared sweep (tmp, var-tmp, shared).
+/// bootout (agent), the crontab and `at` sweep (crontab, at), the image detach (image),
+/// the IPC removal (sem), the home wipe (home, defaults, keychain, agent), the
+/// `/var/folders` wipe (T, C), the shared sweep (tmp, var-tmp, shared).
 #[ignore = "needs root and real users: cargo xtask sudo-test -p kbf-driver-native --test slot_clean"]
 #[tokio::test]
 async fn a_lease_finds_nothing_the_lease_before_it_left_on_its_slot() {
@@ -277,7 +291,7 @@ async fn a_lease_finds_nothing_the_lease_before_it_left_on_its_slot() {
     let cas = Arc::new(MemoryCas::default());
     let rt = NativeRuntime::new(config(&scratch, users.pool()), Arc::clone(&cas)).expect("runtime");
     let mark = format!("kbf-fresh-{}", std::process::id());
-    let setuid = scratch.setuid_sleep().to_string_lossy().into_owned();
+    let setuid = scratch.setuid_sleep();
     let act = scratch.act();
     let a = Spec::argv(&[
         &act,
@@ -299,38 +313,52 @@ async fn a_lease_finds_nothing_the_lease_before_it_left_on_its_slot() {
         PLANT_INSIDE,
         "sh",
         &mark,
-        &setuid,
     ]);
     let a_root = scratch.lease_root(1);
     let outside = {
         let (user, mark, a_root) = (user.clone(), mark.clone(), a_root.clone());
+        let act = act.clone();
         async move {
             let give_up = Instant::now() + PROMPT * 3;
             while !a_root.join("planted").exists() {
                 if Instant::now() > give_up {
-                    return "lease A never planted its markers".to_owned();
+                    return Outside::default();
                 }
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
-            let planted = tokio::task::spawn_blocking(move || plant_outside(&user, &mark));
+            let planted = tokio::task::spawn_blocking(move || {
+                plant_outside(&user, &mark, &setuid, &act, &a_root)
+            });
             let planted = planted.await.expect("planted");
-            let _ = std::fs::write(a_root.join("go"), b"");
+            let _ = std::fs::write(scratch_go(&planted.a_root), b"");
             planted
         }
     };
-    let (first, outside) = tokio::join!(support::run(&rt, &cas, 1, &a), outside);
+    let (first, mut outside) = tokio::join!(support::run(&rt, &cas, 1, &a), outside);
     let first = first.expect("lease A ran");
     let a_out = stdout(&cas, &first);
     let a_err = support::stderr(&cas, &first);
-    // Between the leases: the clean has run before lease A's run returned.
+    // Between the leases: the clean ran before lease A's run returned.
+    let mut found: Vec<(String, String)> = Vec::new();
     let left = uid::processes(user.uid).expect("list");
+    if !left.is_empty() {
+        found.push(("processes".to_owned(), format!("{left:?}")));
+    }
+    for (row, pid) in [("sleeper", outside.sleeper), ("setuid", outside.setuid_pid)] {
+        if pid.is_some_and(support::alive) {
+            found.push((row.to_owned(), format!("pid {pid:?}")));
+        }
+    }
+    let attached = images(user.uid, &mark);
+    if !attached.is_empty() {
+        found.push(("image".to_owned(), format!("{attached:?}")));
+    }
     let btm_after = btm(user.uid);
-    let mut planted: BTreeSet<String> = rows(&a_out, "planted")
-        .into_iter()
-        .map(|(r, _)| r)
-        .collect();
-    planted.extend(rows(&outside, "planted").into_iter().map(|(r, _)| r));
-    planted.insert("processes".to_owned());
+    if !btm_after.is_empty() {
+        found.push(("btm".to_owned(), format!("{btm_after:?}")));
+    }
+    let schedules = as_user(&user, "/bin/sh", &["-c", CHECK_OUTSIDE, "sh", &mark]);
+    found.extend(rows(&String::from_utf8_lossy(&schedules.stdout), "found"));
     let sem = rows(&a_out, "planted")
         .into_iter()
         .find(|(row, _)| row == "sem")
@@ -341,76 +369,180 @@ async fn a_lease_finds_nothing_the_lease_before_it_left_on_its_slot() {
     let second = support::run(&rt, &cas, 2, &b).await.expect("lease B ran");
     let b_out = stdout(&cas, &second);
     let b_err = support::stderr(&cas, &second);
-    let mut found: Vec<(String, String)> = rows(&b_out, "found");
-    if !left.is_empty() {
-        found.push(("processes".to_owned(), format!("{left:?}")));
+    found.extend(rows(&b_out, "found"));
+    if let Some(child) = outside.setuid.as_mut() {
+        let _ = child.kill();
+        let _ = child.wait();
     }
-    let btm_planted = btm_planted_note(&outside);
-    if !btm_after.is_empty() {
-        found.push(("btm".to_owned(), format!("{btm_after:?}")));
-    }
-    let diagnosis = diagnosis(&user);
+    let mut planted: BTreeSet<String> = rows(&a_out, "planted")
+        .into_iter()
+        .map(|(r, _)| r)
+        .collect();
+    planted.extend(rows(&outside.text, "planted").into_iter().map(|(r, _)| r));
+    planted.insert("processes".to_owned());
     let not_planted: Vec<&str> = ROWS
         .iter()
         .map(|(row, _)| *row)
         .filter(|row| !planted.contains(*row))
         .collect();
     let red: BTreeSet<&str> = found.iter().map(|(row, _)| row.as_str()).collect();
-    eprintln!("freshness: planted {planted:?}; {btm_planted}; red rows {red:?}; found {found:?}");
-    assert_eq!(first.exit_code, 0, "lease A: {a_out}{a_err}\n{outside}");
+    let diagnosis = diagnosis(&user);
+    eprintln!("freshness: planted {planted:?}; red rows {red:?}; found {found:?}");
+    assert_eq!(
+        first.exit_code, 0,
+        "lease A: {a_out}{a_err}\n{}",
+        outside.text
+    );
     assert!(
         not_planted.is_empty(),
-        "lease A did not plant {not_planted:?} (so those rows prove nothing):\n{a_out}{a_err}\n{outside}\n{diagnosis}"
+        "lease A did not plant {not_planted:?} (so those rows prove nothing):\n{a_out}{a_err}\n{}\n{diagnosis}",
+        outside.text
     );
     assert_eq!(second.exit_code, 0, "lease B: {b_out}{b_err}");
     assert!(b_out.ends_with("checked\n"), "lease B: {b_out}{b_err}");
     assert!(
         found.is_empty(),
-        "lease B found what lease A left, rows {red:?}: {found:?}\n{diagnosis}"
+        "what lease A left was found, rows {red:?}: {found:?}\n{diagnosis}"
     );
 }
 
-/// The part of lease A [`PLANT_OUTSIDE`] makes, as the slot user outside the sandbox,
-/// and its LaunchAgent, bootstrapped by root into `user/<uid>` from the home. Its
-/// `planted` lines, and what failed.
-fn plant_outside(user: &SlotUser, mark: &str) -> String {
+/// `go` in lease A's directory: it ends lease A's wait.
+fn scratch_go(a_root: &Path) -> PathBuf {
+    a_root.join("go")
+}
+
+/// What [`plant_outside`] planted.
+#[derive(Default)]
+struct Outside {
+    /// Its `planted <row>` lines, and what failed.
+    text: String,
+    /// Lease A's directory.
+    a_root: PathBuf,
+    /// Lease A's setsid sleeper, from its `sleeper` file, if it is the uid's.
+    sleeper: Option<i32>,
+    /// The setuid-root sleep, the slot user's by its real uid.
+    setuid: Option<std::process::Child>,
+    setuid_pid: Option<i32>,
+}
+
+/// The part of lease A made as the slot user outside the sandbox while lease A waits:
+/// [`PLANT_OUTSIDE`], a setuid-root sleep (`setuid`), and the LaunchAgent, which the
+/// user bootstraps into `user/<uid>` from its home through `launchctl asuser` and the
+/// `as-user` drop of `act` (this test binary). Also looks up lease A's setsid sleeper.
+fn plant_outside(user: &SlotUser, mark: &str, setuid: &Path, act: &str, a_root: &Path) -> Outside {
     let out = as_user(user, "/bin/sh", &["-c", PLANT_OUTSIDE, "sh", mark]);
     let mut text = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
+    let listed = uid::processes(user.uid).unwrap_or_default();
+    let sleeper = std::fs::read_to_string(a_root.join("sleeper"))
+        .ok()
+        .and_then(|pid| pid.trim().parse::<i32>().ok())
+        .filter(|pid| listed.contains(pid));
+    if sleeper.is_some() {
+        text.push_str("planted sleeper\n");
+    }
+    let child = Command::new(setuid)
+        .arg("3005")
+        .stdin(Stdio::null())
+        .uid(user.uid)
+        .gid(user.gid)
+        .spawn()
+        .expect("the setuid sleep");
+    let setuid_pid = i32::try_from(child.id()).expect("pid");
+    let give_up = Instant::now() + PROMPT;
+    while ids_of(setuid_pid) != Some((0, user.uid)) && Instant::now() < give_up {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    if ids_of(setuid_pid) == Some((0, user.uid)) {
+        text.push_str("planted setuid\n");
+    }
     let agents = home_of(user).join("Library").join("LaunchAgents");
     let plist = agents.join("kbf.ci.fresh.plist");
     let made = as_user(user, "/bin/mkdir", &["-p", &agents.to_string_lossy()]);
-    if !made.status.success() {
+    if made.status.success() {
+        std::fs::write(&plist, AGENT).expect("agent plist");
+        std::os::unix::fs::chown(&plist, Some(user.uid), Some(user.gid)).expect("chown");
+        std::fs::set_permissions(&plist, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+        let domain = format!("user/{}", user.uid);
+        let path = plist.to_string_lossy().into_owned();
+        let (uid, gid) = (user.uid.to_string(), user.gid.to_string());
+        let service = format!("{domain}/kbf.ci.fresh");
+        let tries: [&[&str]; 2] = [
+            &[
+                "asuser",
+                &uid,
+                act,
+                kbf_driver_native::slots::AS_USER_ARG,
+                &uid,
+                &gid,
+                "--",
+                "/bin/launchctl",
+                "bootstrap",
+                &domain,
+                &path,
+            ],
+            &[
+                "asuser",
+                &uid,
+                "/bin/launchctl",
+                "bootstrap",
+                &domain,
+                &path,
+            ],
+        ];
+        for args in tries {
+            let (booted, said) = root("/bin/launchctl", args);
+            text.push_str(&format!("launchctl {}: {booted} {said}\n", args.join(" ")));
+            if root("/bin/launchctl", &["print", &service]).0 {
+                text.push_str("planted agent\n");
+                break;
+            }
+        }
+    } else {
         text.push_str("mkdir LaunchAgents failed\n");
-        return text;
     }
-    std::fs::write(&plist, AGENT).expect("agent plist");
-    std::os::unix::fs::chown(&plist, Some(user.uid), Some(user.gid)).expect("chown");
-    std::fs::set_permissions(&plist, std::fs::Permissions::from_mode(0o644)).expect("chmod");
-    let domain = format!("user/{}", user.uid);
-    let path = plist.to_string_lossy().into_owned();
-    let (booted, said) = root("/bin/launchctl", &["bootstrap", &domain, &path]);
-    text.push_str(&format!("launchctl bootstrap {domain}: {booted} {said}\n"));
-    let service = format!("{domain}/kbf.ci.fresh");
-    let (printed, _) = root("/bin/launchctl", &["print", &service]);
-    if printed {
-        text.push_str("planted agent\n");
+    text.push_str(&format!("btm after the agent: {:?}\n", btm(user.uid)));
+    Outside {
+        text,
+        a_root: a_root.to_owned(),
+        sleeper,
+        setuid: Some(child),
+        setuid_pid: Some(setuid_pid),
     }
-    let made_btm = btm(user.uid);
-    text.push_str(&format!("btm after the agent: {made_btm:?}\n"));
-    text
 }
 
-/// Whether the agent made a Background Task Management entry, as [`plant_outside`]
-/// noted: the clean must remove one if it did; it proves nothing if it did not.
-fn btm_planted_note(outside: &str) -> String {
-    outside
-        .lines()
-        .find(|line| line.starts_with("btm after the agent: "))
-        .map_or_else(|| "btm: not looked at".to_owned(), str::to_owned)
+/// The images `hdiutil info -plist` lists as `uid`'s or by a path naming `mark`.
+fn images(uid: u32, mark: &str) -> Vec<String> {
+    let out = Command::new("/usr/bin/hdiutil")
+        .args(["info", "-plist"])
+        .output()
+        .expect("hdiutil");
+    let Ok(info) = plist::Value::from_reader_xml(out.stdout.as_slice()) else {
+        return vec![format!(
+            "unreadable: {}",
+            String::from_utf8_lossy(&out.stdout)
+        )];
+    };
+    let images = info
+        .as_dictionary()
+        .and_then(|d| d.get("images"))
+        .and_then(plist::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    images
+        .iter()
+        .filter_map(plist::Value::as_dictionary)
+        .filter_map(|image| {
+            let path = image.get("image-path").and_then(plist::Value::as_string)?;
+            let owner = image
+                .get("owner-uid")
+                .and_then(plist::Value::as_unsigned_integer);
+            (owner == Some(u64::from(uid)) || path.contains(mark)).then(|| path.to_owned())
+        })
+        .collect()
 }
 
 /// A process with the real uid 0 and the effective uid of a slot: listed among the

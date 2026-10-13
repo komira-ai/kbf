@@ -45,7 +45,7 @@ const PAUSE: Duration = Duration::from_millis(10);
 
 /// The most [`end`] waits for the bootout: the kill after it ends the uid's processes
 /// whether or not launchd has finished.
-const BOOTOUT_WITHIN: Duration = Duration::from_secs(2);
+pub const BOOTOUT_WITHIN: Duration = Duration::from_secs(2);
 
 /// Why [`end`] did not leave the uid without processes.
 #[derive(Debug, thiserror::Error)]
@@ -178,14 +178,28 @@ pub fn bootout(uid: u32, within: Duration) {
 }
 
 /// Ends every process of `uid`: [`bootout`] (for at most [`BOOTOUT_WITHIN`]), then
-/// [`kill`] and [`processes`] every [`PAUSE`] until none is left, for at most `within`
-/// in all.
+/// [`kill_all`], for at most `within` in all.
 ///
 /// # Errors
 /// A round could not run, or processes of the uid were alive at the deadline.
 pub fn end(uid: u32, within: Duration) -> Result<(), EndError> {
     let give_up = Instant::now() + within;
     bootout(uid, within.min(BOOTOUT_WITHIN));
+    kill_until(uid, within, give_up)
+}
+
+/// [`kill`] and [`processes`] every [`PAUSE`] until no process of `uid` is left, for at
+/// most `within`. No bootout: a caller that has booted the domain out already (the
+/// clean of a slot, which removes the crontab and `at` jobs in between) kills with this.
+///
+/// # Errors
+/// A round could not run, or processes of the uid were alive at the deadline.
+pub fn kill_all(uid: u32, within: Duration) -> Result<(), EndError> {
+    kill_until(uid, within, Instant::now() + within)
+}
+
+/// The rounds of [`kill_all`], until `give_up`; `within` is what an error reports.
+fn kill_until(uid: u32, within: Duration, give_up: Instant) -> Result<(), EndError> {
     let io = |error| EndError::Io { uid, error };
     loop {
         kill(uid).map_err(io)?;

@@ -302,3 +302,46 @@ fn the_macos_plan_names_the_places_of_the_design() {
     assert!(plan.owned.contains(&Path::new("/Users").join("Shared")));
     assert!(plan.owned.contains(&PathBuf::from("/private/var/folders")));
 }
+
+/// Catches: an emptied folder that keeps an entry because the uid does not own it (a
+/// reused user's home would keep what root or another uid left in it), one that
+/// removes the folder itself or follows a link out of it, an absent folder taken for
+/// an error, and an entry that cannot be removed swallowed or stopping the rest.
+#[test]
+fn empty_removes_every_entry_whoever_owns_it_and_keeps_the_folder() {
+    let dir = scratch("empty");
+    let home = dir.join("home");
+    fs::create_dir(&home).unwrap();
+    populate(&home);
+    let outside = dir.join("outside");
+    fs::create_dir(&outside).unwrap();
+    fs::write(outside.join("kept"), "x").unwrap();
+    symlink(&outside, home.join("link")).unwrap();
+    // The entries are the test's, not `other()`'s: what is emptied goes whoever owns it.
+    let swept = empty(&home, other());
+    assert_eq!(
+        swept,
+        Swept {
+            removed: 4,
+            errors: Vec::new()
+        }
+    );
+    assert!(names(&home).is_empty());
+    assert!(home.is_dir());
+    assert!(outside.join("kept").exists(), "the link was followed");
+    assert_eq!(empty(&dir.join("absent"), me()), Swept::default());
+    if root() {
+        eprintln!("skipped the error half: permission bits do not stop root");
+        return;
+    }
+    fs::create_dir(home.join("locked")).unwrap();
+    fs::write(home.join("locked/f"), "x").unwrap();
+    fs::write(home.join("file"), "x").unwrap();
+    chmod(&home.join("locked"), 0o000);
+    let swept = empty(&home, me());
+    chmod(&home.join("locked"), 0o700);
+    assert_eq!(swept.removed, 1, "{swept:?}");
+    assert_eq!(swept.errors.len(), 1, "{swept:?}");
+    assert!(swept.errors[0].contains("home/locked:"), "{swept:?}");
+    assert_eq!(names(&home), ["locked"]);
+}
