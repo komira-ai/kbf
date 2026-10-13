@@ -73,6 +73,9 @@ pub struct MacSlot<'a> {
 
 impl Os for MacSlot<'_> {
     fn run(&self, step: Step) -> Result<(), String> {
+        if step != Step::Kill {
+            return Ok(());
+        }
         let user = &self.ready.user;
         match step {
             Step::Bootout => {
