@@ -59,7 +59,7 @@ impl TransferArgs {
 }
 
 /// The engine over the blob service `--cas` names, over mutual TLS with the daemon's
-/// own TLS files. Connects on first use.
+/// own TLS files and the daemon's HTTP/2 keepalive. Connects on first use.
 pub(crate) fn engine(cli: &Cli) -> Result<Transfers, Error> {
     let url = cli
         .cas
@@ -72,9 +72,12 @@ pub(crate) fn engine(cli: &Cli) -> Result<Transfers, Error> {
         )
         .into());
     }
-    let endpoint =
-        Endpoint::from_shared(url)?.tls_config(DaemonConfig::from_args(&cli.daemon).tls.load()?)?;
-    Ok(Transfers::new(endpoint, cli.transfer.config()))
+    let config = DaemonConfig::from_args(&cli.daemon);
+    let endpoint = Endpoint::from_shared(url)?.tls_config(config.tls.load()?)?;
+    Ok(Transfers::new(
+        config.keep_alive.apply(endpoint),
+        cli.transfer.config(),
+    ))
 }
 
 #[cfg(test)]

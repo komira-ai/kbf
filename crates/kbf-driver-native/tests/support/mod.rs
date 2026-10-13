@@ -10,6 +10,9 @@ kbf_testkit::act_test_hook!();
 // (`tests/slots.rs`).
 kbf_driver_native::as_user_test_hook!();
 
+#[cfg(target_os = "macos")]
+pub mod pool;
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};

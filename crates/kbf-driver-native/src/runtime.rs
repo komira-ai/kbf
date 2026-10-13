@@ -13,7 +13,7 @@ use kbf_daemon::cas::{Cas, CasError};
 use kbf_daemon::tree::{
     TreeError, check_relative, fetch_message, materialize, output_paths, real_dirs,
 };
-use kbf_daemon::{DriverReport, Runtime, RuntimeError, Work};
+use kbf_daemon::{DriverReport, Runtime, RuntimeError, Work, upload_within};
 use kbf_outputs::OutputsError;
 use kbf_proto::reapi::{Action, ActionResult, Command, ExecutedActionMetadata};
 use kbf_types::LeaseId;
@@ -569,25 +569,29 @@ impl<C: Cas> NativeRuntime<C> {
             exit_code,
             ..ActionResult::default()
         };
-        // From the input root: the action may have replaced its working directory.
-        kbf_outputs::collect(
-            &store,
-            &prepared.root,
-            &prepared.working_directory,
-            &prepared.outputs,
-            self.config.outputs,
-            &mut result,
-        )
-        .await
-        .map_err(outputs_error)?;
-        let max = self.config.outputs.max_stdio_bytes;
-        for (name, slot) in [
-            ("stdout", &mut result.stdout_digest),
-            ("stderr", &mut result.stderr_digest),
-        ] {
-            let stored = kbf_outputs::store_file(&store, &dir.join(name), max).await;
-            *slot = Some(stored.map_err(outputs_error)?);
-        }
+        let upload = async {
+            // From the input root: the action may have replaced its working directory.
+            kbf_outputs::collect(
+                &store,
+                &prepared.root,
+                &prepared.working_directory,
+                &prepared.outputs,
+                self.config.outputs,
+                &mut result,
+            )
+            .await
+            .map_err(outputs_error)?;
+            let max = self.config.outputs.max_stdio_bytes;
+            for (name, slot) in [
+                ("stdout", &mut result.stdout_digest),
+                ("stderr", &mut result.stderr_digest),
+            ] {
+                let stored = kbf_outputs::store_file(&store, &dir.join(name), max).await;
+                *slot = Some(stored.map_err(outputs_error)?);
+            }
+            Ok(())
+        };
+        upload_within(self.config.upload_deadline, upload).await?;
         clock.output_upload_completed_timestamp = now();
         clock.worker_completed_timestamp = now();
         result.execution_metadata = Some(clock);
@@ -625,7 +629,7 @@ impl<C: Cas> Runtime for NativeRuntime<C> {
         ))
         .await;
         let cleaned = dir.clean().await;
-        runner.release();
+        runner.release().await;
         sweep_user_folders_after_lease(&self.config).await;
         // A kill that arrived after the work ended still waits for the clean.
         if let Some(by) = killer.or_else(|| stop.try_recv().ok()) {

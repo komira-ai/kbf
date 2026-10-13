@@ -112,10 +112,18 @@ async fn a_failed_put_or_footer_read_commits_nothing() {
     assert_eq!(Status::from(err).code(), Code::Unavailable);
     assert_absent(&cache, &b).await;
 
-    // The PUT lands; the first GET of the footer read-back fails.
+    // The PUT lands; the first GET of the footer read-back fails. The status says why
+    // (the store's own cause), not only that the store failed.
     store.on_get(GetFault::Transport);
     let err = cache.store_blobs(vec![b.verified()]).await.unwrap_err();
-    assert_eq!(Status::from(err).code(), Code::Unavailable);
+    let status = Status::from(err);
+    assert_eq!(status.code(), Code::Unavailable);
+    assert!(
+        status
+            .message()
+            .ends_with("request to the store failed: injected by FaultyStore"),
+        "{status:?}"
+    );
     assert_absent(&cache, &b).await;
     assert!(store.script_done());
 
