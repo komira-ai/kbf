@@ -617,3 +617,155 @@ fn on_and_off_are_both_accepted() {
         );
     }
 }
+
+/// Catches: a pool, volume or daemon setting of the wrong shape accepted: a pool of
+/// none or of more than 64 users, pool uids below 600, above 65535 or inside
+/// `lease_uids` (the default, the uid after `lease_uids`, included), a volume that is
+/// not `/Volumes/<name>`, a `daemon_user` other than `role` or `root`, and, for a root
+/// daemon, a scratch or cache root off the volume.
+#[test]
+fn every_malformed_pool_volume_or_daemon_setting_is_refused() {
+    let cases: Vec<(&str, String, &str)> = vec![
+        (
+            "no pool user",
+            edited(append("pool_users=0")),
+            "pool_users: 0 is not a number from 1 to 64",
+        ),
+        (
+            "65 pool users",
+            edited(append("pool_users=65")),
+            "pool_users: 65 is not a number from 1 to 64",
+        ),
+        (
+            "pool users not a number",
+            edited(append("pool_users=four")),
+            "pool_users: four is not a number from 1 to 64",
+        ),
+        (
+            "pool users too large to parse",
+            edited(append("pool_users=99999999999999999999999")),
+            "is not a number from 1 to 64",
+        ),
+        (
+            "first pool uid below 600",
+            edited(|l| {
+                set("lease_uids", "501-550")(l);
+                l.push("pool_first_uid=599".into());
+            }),
+            "pool_first_uid: 599 is below 600",
+        ),
+        (
+            "first pool uid not a number",
+            edited(append("pool_first_uid=7e2")),
+            "pool_first_uid: 7e2 is not a number",
+        ),
+        (
+            "first pool uid too large to parse",
+            edited(append("pool_first_uid=99999999999999999999999")),
+            "pool_first_uid: 99999999999999999999999 is not a number",
+        ),
+        (
+            "pool inside lease_uids",
+            edited(append("pool_first_uid=697")),
+            "pool uids 697-700 overlap lease_uids 600-699",
+        ),
+        (
+            "pool above 65535",
+            edited(append("pool_first_uid=65533")),
+            "pool uids 65533-65536 go above 65535",
+        ),
+        (
+            "default pool above 65535",
+            edited(set("lease_uids", "600-65533")),
+            "pool uids 65534-65537 go above 65535",
+        ),
+        (
+            "volume outside /Volumes",
+            edited(append("kbf_volume=/private/kbf")),
+            "kbf_volume: /private/kbf is not /Volumes/<name>",
+        ),
+        (
+            "volume below a volume",
+            edited(append("kbf_volume=/Volumes/kbf/x")),
+            "kbf_volume: /Volumes/kbf/x is not /Volumes/<name>",
+        ),
+        (
+            "volume with no name",
+            edited(append("kbf_volume=/Volumes/")),
+            "kbf_volume: /Volumes/ is not /Volumes/<name>",
+        ),
+        (
+            "relative cache",
+            edited(append("kbf_cache=cache")),
+            "kbf_cache: cache is not an absolute path",
+        ),
+        (
+            "daemon user",
+            edited(append("daemon_user=nobody")),
+            "daemon_user: nobody is not role or root",
+        ),
+        (
+            "root scratch off the volume",
+            edited(|l| {
+                set("kbf_scratch", "/private/var/kbf")(l);
+                l.push("daemon_user=root".into());
+            }),
+            "kbf_scratch: /private/var/kbf is not on kbf_volume /Volumes/kbf (daemon_user=root)",
+        ),
+        (
+            "root cache off the volume",
+            edited(|l| {
+                l.push("kbf_cache=/Volumes/kbfcache".into());
+                l.push("daemon_user=root".into());
+            }),
+            "kbf_cache: /Volumes/kbfcache is not on kbf_volume /Volumes/kbf (daemon_user=root)",
+        ),
+    ];
+    let wrong: Vec<String> = cases
+        .iter()
+        .filter_map(|(name, text, want)| {
+            let got = refusal(text);
+            (!got.contains(want)).then(|| format!("{name}: got {got:?}, want {want:?}"))
+        })
+        .collect();
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Catches: a valid pool, volume or daemon setting refused, a role daemon held to the
+/// root daemon's volume rule, or a set key left out of `print`.
+#[test]
+fn the_pool_volume_and_daemon_settings_are_accepted_and_printed() {
+    let text = edited(|l| {
+        set("kbf_scratch", "/private/var/kbf")(l);
+        l.extend(
+            [
+                "pool_users=64",
+                "pool_first_uid=700",
+                "kbf_volume=/Volumes/farm",
+                "kbf_cache=/private/var/cache",
+                "daemon_user=role",
+            ]
+            .map(str::to_owned),
+        );
+    });
+    let printed = Profile::parse(text.as_bytes()).unwrap().print();
+    assert!(
+        printed.contains(
+            "pool_users=64\npool_first_uid=700\nkbf_volume=/Volumes/farm\nkbf_cache=/private/var/cache\ndaemon_user=role\n"
+        ),
+        "{printed}"
+    );
+    let text = edited(|l| {
+        set("kbf_scratch", "/Volumes/farm/scratch")(l);
+        l.extend(
+            [
+                "pool_users=1",
+                "kbf_volume=/Volumes/farm",
+                "kbf_cache=/Volumes/farm/cache",
+                "daemon_user=root",
+            ]
+            .map(str::to_owned),
+        );
+    });
+    assert_eq!(refusal(&text), "accepted");
+}

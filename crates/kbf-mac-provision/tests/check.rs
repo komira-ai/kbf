@@ -30,6 +30,8 @@ fn a_fresh_mac_fails_every_item_apply_sets() {
         [
             "hostname",
             "role_user",
+            "kbf_volume",
+            "pool_users",
             "power_sleep",
             "power_standby",
             "power_powernap",
@@ -50,8 +52,8 @@ fn a_fresh_mac_fails_every_item_apply_sets() {
         "{}",
         r.text
     );
-    assert!(r.text.ends_with("check: 9 pass, 18 fail\n"), "{}", r.text);
-    assert_eq!(r.text.lines().count(), 28);
+    assert!(r.text.ends_with("check: 10 pass, 20 fail\n"), "{}", r.text);
+    assert_eq!(r.text.lines().count(), 31);
     assert_eq!(mac.writes(), Vec::<String>::new());
 }
 
@@ -63,11 +65,14 @@ fn a_converged_mac_passes_every_item() {
     let mac = FakeMac::converged("converged");
     let r = check(&mac);
     assert_eq!(r.failed, 0, "{}", r.text);
-    assert!(r.text.ends_with("check: 27 pass, 0 fail\n"), "{}", r.text);
+    assert!(r.text.ends_with("check: 30 pass, 0 fail\n"), "{}", r.text);
     for want in [
         "PASS updates_auto_download: AutomaticDownload = 0 (the SoftwareUpdate payload is removed in macOS 27",
         "PASS filevault: off",
         "PASS role_user: _kbf (uid and gid 480, hidden, no shell, no password)",
+        "PASS kbf_volume: /Volumes/kbf: APFS, Spotlight off, excluded from Time Machine",
+        "PASS pool_users: 4 users kbf-pool-0..kbf-pool-3 (uids 700-703, group kbfpool 700): hidden, standard, shell /usr/bin/false, no password, homes in /Volumes/kbf/home",
+        "PASS daemon_user: role: kbf-daemon runs as _kbf; the node key and the scratch and cache roots are checked once daemon_user=root",
         "PASS autologin: off",
         "PASS power_sleep: sleep 0",
         "PASS xcode: pinned: 17A000 18A000",
