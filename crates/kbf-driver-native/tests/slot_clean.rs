@@ -164,7 +164,9 @@ q=$(atq 2>/dev/null) && [ -n "$q" ] && echo "found at $q"
 exit 0
 "#;
 
-/// A KeepAlive LaunchAgent that runs `sleep 3003`.
+/// A KeepAlive LaunchAgent that runs `sleep 3003`, for the Background session a pool
+/// user's domain is (an agent without the key is for Aqua, and its bootstrap fails
+/// with EIO there).
 const AGENT: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -173,6 +175,7 @@ const AGENT: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
   <key>ProgramArguments</key><array><string>/bin/sleep</string><string>3003</string></array>
   <key>KeepAlive</key><true/>
   <key>RunAtLoad</key><true/>
+  <key>LimitLoadToSessionType</key><string>Background</string>
 </dict>
 </plist>
 "#;
@@ -317,7 +320,7 @@ async fn a_lease_finds_nothing_the_lease_before_it_left_on_its_slot() {
     let a_root = scratch.lease_root(1);
     let outside = {
         let (user, mark, a_root) = (user.clone(), mark.clone(), a_root.clone());
-        let act = act.clone();
+        let drop_to = scratch.as_user_binary();
         async move {
             let give_up = Instant::now() + PROMPT * 3;
             while !a_root.join("planted").exists() {
@@ -327,7 +330,7 @@ async fn a_lease_finds_nothing_the_lease_before_it_left_on_its_slot() {
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
             let planted = tokio::task::spawn_blocking(move || {
-                plant_outside(&user, &mark, &setuid, &act, &a_root)
+                plant_outside(&user, &mark, &setuid, &drop_to, &a_root)
             });
             let planted = planted.await.expect("planted");
             let _ = std::fs::write(scratch_go(&planted.a_root), b"");
@@ -428,8 +431,15 @@ struct Outside {
 /// The part of lease A made as the slot user outside the sandbox while lease A waits:
 /// [`PLANT_OUTSIDE`], a setuid-root sleep (`setuid`), and the LaunchAgent, which the
 /// user bootstraps into `user/<uid>` from its home through `launchctl asuser` and the
-/// `as-user` drop of `act` (this test binary). Also looks up lease A's setsid sleeper.
-fn plant_outside(user: &SlotUser, mark: &str, setuid: &Path, act: &str, a_root: &Path) -> Outside {
+/// `as-user` drop of `drop_to` (this test binary). Also looks up lease A's setsid
+/// sleeper, and notes what `hdiutil info` lists of the uid's while lease A runs.
+fn plant_outside(
+    user: &SlotUser,
+    mark: &str,
+    setuid: &Path,
+    drop_to: &str,
+    a_root: &Path,
+) -> Outside {
     let out = as_user(user, "/bin/sh", &["-c", PLANT_OUTSIDE, "sh", mark]);
     let mut text = format!(
         "{}{}",
@@ -474,7 +484,7 @@ fn plant_outside(user: &SlotUser, mark: &str, setuid: &Path, act: &str, a_root: 
             &[
                 "asuser",
                 &uid,
-                act,
+                drop_to,
                 kbf_driver_native::slots::AS_USER_ARG,
                 &uid,
                 &gid,
@@ -505,6 +515,10 @@ fn plant_outside(user: &SlotUser, mark: &str, setuid: &Path, act: &str, a_root: 
         text.push_str("mkdir LaunchAgents failed\n");
     }
     text.push_str(&format!("btm after the agent: {:?}\n", btm(user.uid)));
+    text.push_str(&format!(
+        "images during lease A: {:?}\n",
+        images(user.uid, mark)
+    ));
     Outside {
         text,
         a_root: a_root.to_owned(),

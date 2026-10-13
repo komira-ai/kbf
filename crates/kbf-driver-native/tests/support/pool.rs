@@ -69,6 +69,18 @@ impl Scratch {
             .into_owned()
     }
 
+    /// A copy of this test binary named `kbf-as-user` (the name `kbf-act` selects the act
+    /// steps instead): run with `__as-user <uid> <gid> -- <program>`, it drops to the uid
+    /// and executes the program, as `kbf-daemon` does for an action.
+    pub fn as_user_binary(&self) -> String {
+        let path = self.0.join("kbf-as-user");
+        if !path.exists() {
+            std::fs::copy(std::env::current_exe().expect("this binary"), &path).expect("copy");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        }
+        path.to_string_lossy().into_owned()
+    }
+
     pub fn leases(&self) -> PathBuf {
         self.0.join("leases")
     }
