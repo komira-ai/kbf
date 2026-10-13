@@ -30,6 +30,19 @@ fn one_apply_converges_a_fresh_mac() {
             "CHANGE hostname: LocalHostName = kbf-mac-07",
             "CHANGE hostname: ComputerName = kbf-mac-07",
             "CHANGE role_user: role account and group _kbf, id 480",
+            "CHANGE kbf_volume: wrote /Volumes/kbf/.metadata_never_index",
+            "CHANGE kbf_volume: Spotlight indexing off (mdutil -i off)",
+            "CHANGE kbf_volume: excluded from Time Machine (tmutil addexclusion)",
+            "CHANGE pool_users: group kbfpool, gid 700",
+            "CHANGE pool_users: made /Volumes/kbf/home, root's, mode 755",
+            "CHANGE pool_users: user kbf-pool-0, uid 700",
+            "CHANGE pool_users: home /Volumes/kbf/home/kbf-pool-0, mode 700",
+            "CHANGE pool_users: user kbf-pool-1, uid 701",
+            "CHANGE pool_users: home /Volumes/kbf/home/kbf-pool-1, mode 700",
+            "CHANGE pool_users: user kbf-pool-2, uid 702",
+            "CHANGE pool_users: home /Volumes/kbf/home/kbf-pool-2, mode 700",
+            "CHANGE pool_users: user kbf-pool-3, uid 703",
+            "CHANGE pool_users: home /Volumes/kbf/home/kbf-pool-3, mode 700",
             "CHANGE power_sleep: wrote /var/db/kbf-mac-provision/settings.before (what revert restores)",
             "CHANGE power_sleep: pmset -a sleep 0",
             "CHANGE power_standby: pmset -a standby 0",
@@ -53,7 +66,7 @@ fn one_apply_converges_a_fresh_mac() {
     );
     let r = check(&mac);
     assert_eq!(r.failed, 0, "{}", r.text);
-    assert!(r.text.ends_with("check: 27 pass, 0 fail\n"), "{}", r.text);
+    assert!(r.text.ends_with("check: 30 pass, 0 fail\n"), "{}", r.text);
     let sha = sha256_hex(mac.profile_text().as_bytes());
     assert_eq!(
         fs::read_to_string(mac.path(PLIST)).unwrap(),
@@ -70,6 +83,10 @@ fn one_apply_converges_a_fresh_mac() {
         (ERR_LOG, "-rw-r--r-- 480 480"),
         (RECORD, "-rw------- 0 0"),
         ("/var/db/kbf-mac-provision", "drwx------ 0 0"),
+        ("/Volumes/kbf/home", "drwxr-xr-x 0 0"),
+        ("/Volumes/kbf/home/kbf-pool-0", "drwx------ 700 700"),
+        ("/Volumes/kbf/home/kbf-pool-3", "drwx------ 703 700"),
+        ("/Volumes/kbf/.metadata_never_index", "-rw-r--r-- 0 0"),
     ] {
         assert_eq!(ls(&mac, path), want, "{path}");
     }
@@ -137,7 +154,7 @@ fn keys_limits_apply_to_the_named_items() {
         (0, "CHANGE firewall: firewall on\n")
     );
     let r = check(&mac);
-    assert_eq!(lines(&r, "FAIL").len(), 17, "{}", r.text);
+    assert_eq!(lines(&r, "FAIL").len(), 19, "{}", r.text);
     let path = mac.profile_file(&mac.profile_text());
     assert!(matches!(
         cli::apply(&path, Some("firewall,bogus"), &mac),

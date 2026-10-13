@@ -54,7 +54,33 @@ pub const REQUIRED: &[&str] = &[
 ];
 
 /// The keys a profile may leave out (or leave empty), shown after [`REQUIRED`].
-pub const OPTIONAL: &[&str] = &["default_developer_dir", "xcode_xip_dir"];
+pub const OPTIONAL: &[&str] = &[
+    "default_developer_dir",
+    "xcode_xip_dir",
+    "pool_users",
+    "pool_first_uid",
+    "kbf_volume",
+    "kbf_cache",
+    "daemon_user",
+];
+
+/// How many lease users the pool has when the profile does not say.
+pub const POOL_USERS: u32 = 4;
+/// The volume the pool's homes, the scratch root and the cache are on when the profile
+/// does not say.
+pub const VOLUME: &str = "/Volumes/kbf";
+
+/// The account kbf-daemon's job runs as (`daemon_user`). A root daemon must not ship
+/// before the daemon runs every action as a pool user, so `role` is the default.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DaemonUser {
+    /// The role account (`role_user`): the property list sets `UserName` and
+    /// `GroupName`; the node key and the roots are not checked.
+    Role,
+    /// root: no `UserName`; the node key is root's, mode 600, and the scratch and cache
+    /// roots are root's, mode 755, on the volume.
+    Root,
+}
 
 /// Why a profile is refused. Every refusal exits with status 2.
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
@@ -117,6 +143,14 @@ pub struct Profile {
     pub expectations: Vec<String>,
     pub role_id: u32,
     pub lease_uids: RangeInclusive<u64>,
+    /// `pool_users`: the pool is `kbf-pool-0` .. `kbf-pool-<pool_users - 1>`.
+    pub pool_users: u32,
+    /// `pool_first_uid`: the uid of `kbf-pool-0` and the gid of group `kbfpool`.
+    pub pool_first_uid: u32,
+    /// `kbf_volume`: the mount point of the volume.
+    pub volume: String,
+    /// `daemon_user`: the account kbf-daemon's job runs as.
+    pub daemon_user: DaemonUser,
     pub time_max_offset_ms: u64,
     /// The daemon's other `--label`s, from `kbf_labels`.
     pub labels: Vec<String>,
@@ -316,6 +350,7 @@ impl Profile {
                 "lease_uids: {lease} is empty"
             )));
         }
+        let (pool_users, pool_first_uid) = pool(&values, &range)?;
         for key in ["power_sleep", "power_standby", "time_max_offset_ms"] {
             want(key, pattern::number, "a number")?;
         }
@@ -379,6 +414,7 @@ impl Profile {
         if !get("xcode_xip_dir").is_empty() {
             want("xcode_xip_dir", pattern::absolute_path, "an absolute path")?;
         }
+        let (volume, daemon_user) = volume_and_daemon(&values)?;
         let xcodes = parse_xcodes(xcodes, get("default_developer_dir"))?;
         let probes = parse_probes(probes)?;
         check_expectations(&expectations, &probes, &xcodes)?;
@@ -389,11 +425,102 @@ impl Profile {
             expectations,
             role_id,
             lease_uids: range,
+            pool_users,
+            pool_first_uid,
+            volume,
+            daemon_user,
             time_max_offset_ms,
             labels,
             sha256,
         })
     }
+}
+
+/// The value of `key` in `values`, empty when it is not set.
+fn value<'a>(values: &'a BTreeMap<&'static str, String>, key: &str) -> &'a str {
+    values.get(key).map_or("", String::as_str)
+}
+
+/// `pool_users` (1 to 64, default [`POOL_USERS`]) and `pool_first_uid` (default the
+/// uid after `lease_uids`, and never below 600): the pool's uids are at least 600, at
+/// most 65535, and outside `lease_uids`.
+fn pool(
+    values: &BTreeMap<&'static str, String>,
+    lease: &RangeInclusive<u64>,
+) -> Result<(u32, u32), ProfileError> {
+    let get = |key| value(values, key);
+    let n = match get("pool_users") {
+        "" => u64::from(POOL_USERS),
+        v => Some(v)
+            .filter(|v| pattern::number(v))
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|n| (1..=64).contains(n))
+            .ok_or_else(|| invalid("pool_users", v, "a number from 1 to 64"))?,
+    };
+    let first = match get("pool_first_uid") {
+        "" => lease.end().saturating_add(1).max(600),
+        v => Some(v)
+            .filter(|v| pattern::number(v))
+            .and_then(|v| v.parse::<u64>().ok())
+            .ok_or_else(|| invalid("pool_first_uid", v, "a number"))?,
+    };
+    let last = first.saturating_add(n - 1);
+    if first < 600 {
+        return Err(ProfileError::Invalid(format!(
+            "pool_first_uid: {first} is below 600"
+        )));
+    }
+    let uids = format!("pool uids {first}-{last}");
+    if last > 65535 {
+        return Err(ProfileError::Invalid(format!("{uids} go above 65535")));
+    }
+    if first <= *lease.end() && last >= *lease.start() {
+        return Err(ProfileError::Invalid(format!(
+            "{uids} overlap lease_uids {}",
+            get("lease_uids")
+        )));
+    }
+    // Both are at most 65535.
+    Ok((n as u32, first as u32))
+}
+
+/// `kbf_volume` (`/Volumes/<name>`, default [`VOLUME`]), `kbf_cache` (an absolute
+/// path, if set) and `daemon_user` (`role`, the default, or `root`). For a root daemon,
+/// the scratch root and the cache are on the volume.
+fn volume_and_daemon(
+    values: &BTreeMap<&'static str, String>,
+) -> Result<(String, DaemonUser), ProfileError> {
+    let get = |key| value(values, key);
+    let volume = match get("kbf_volume") {
+        "" => VOLUME,
+        v => Some(v)
+            .filter(|v| pattern::absolute_path(v))
+            .filter(|v| {
+                v.strip_prefix("/Volumes/")
+                    .is_some_and(|name| !name.is_empty() && !name.contains('/'))
+            })
+            .ok_or_else(|| invalid("kbf_volume", v, "/Volumes/<name>"))?,
+    };
+    let cache = get("kbf_cache");
+    if !cache.is_empty() && !pattern::absolute_path(cache) {
+        return Err(invalid("kbf_cache", cache, "an absolute path"));
+    }
+    let daemon_user = match get("daemon_user") {
+        "" | "role" => DaemonUser::Role,
+        "root" => DaemonUser::Root,
+        v => return Err(invalid("daemon_user", v, "role or root")),
+    };
+    if daemon_user == DaemonUser::Root {
+        for key in ["kbf_scratch", "kbf_cache"] {
+            let path = get(key);
+            if !path.is_empty() && !path.starts_with(&format!("{volume}/")) {
+                return Err(ProfileError::Invalid(format!(
+                    "{key}: {path} is not on kbf_volume {volume} (daemon_user=root)"
+                )));
+            }
+        }
+    }
+    Ok((volume.to_owned(), daemon_user))
 }
 
 fn parse_xcodes(lines: &[String], default_dir: &str) -> Result<Vec<Xcode>, ProfileError> {

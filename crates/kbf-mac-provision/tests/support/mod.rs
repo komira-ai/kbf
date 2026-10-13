@@ -17,6 +17,10 @@ use kbf_mac_provision::host::{Host, Output, Stat};
 use kbf_mac_provision::items::Report;
 use sha2::{Digest as _, Sha256};
 
+mod golden;
+mod pool;
+pub use golden::{golden_plist, golden_plist_as};
+
 /// The example profile the tests start from.
 pub const EXAMPLE: &str = include_str!("../../../../tools/mac-provision/example.profile");
 
@@ -27,6 +31,14 @@ pub const SOFTWARE_UPDATE: &str = "/Library/Preferences/com.apple.SoftwareUpdate
 pub const COMMERCE: &str = "/Library/Preferences/com.apple.commerce";
 pub const LOGINWINDOW: &str = "/Library/Preferences/com.apple.loginwindow";
 pub const INTENT: &str = "/var/db/kbf-mac-session/session-intent";
+/// The example's volume (the default `kbf_volume`), its pool homes and the node key.
+pub const VOLUME: &str = "/Volumes/kbf";
+pub const HOMES: &str = "/Volumes/kbf/home";
+pub const KEY: &str = "/usr/local/kbf/etc/node.key";
+pub const SCRATCH: &str = "/Volumes/kbf/scratch";
+/// The example's pool: 4 users (the default) from uid 700 (the default: the uid after
+/// `lease_uids=600-699`); group `kbfpool` has gid 700.
+pub const POOL_FIRST_UID: u32 = 700;
 
 /// A fresh scratch directory for test `name`, unique within the test binary (tests run
 /// in parallel and may share a name).
@@ -81,6 +93,15 @@ pub struct State {
     pub fails: Vec<String>,
     /// Calls that, starting with one of these, exit 0 and change nothing.
     pub no_effect: Vec<String>,
+    /// Mounted volumes `diskutil info` reports: mount point, file system personality.
+    pub volumes: BTreeMap<String, String>,
+    /// Paths that are no mount point, with the mount point of the APFS volume holding
+    /// them, which `diskutil info` reports for them.
+    pub held_by: BTreeMap<String, String>,
+    /// Mount points `mdutil -s` reports indexing disabled for.
+    pub spotlight_off: BTreeSet<String>,
+    /// Paths `tmutil isexcluded` reports excluded.
+    pub backup_excluded: BTreeSet<String>,
 }
 
 impl State {
@@ -139,6 +160,7 @@ impl FakeMac {
             "Library/Preferences",
             "usr/local/kbf/probes",
             "var/db/kbf-mac-session",
+            "Volumes/kbf",
         ] {
             fs::create_dir_all(root.join(d)).unwrap();
         }
@@ -172,6 +194,8 @@ impl FakeMac {
         state.user("root", 0);
         state.user("farmadmin", 501);
         state.attr("/Groups/admin", "GroupMembership", "root farmadmin");
+        // The operator makes the volume at provisioning (diskutil apfs addVolume).
+        state.volumes.insert(VOLUME.into(), "APFS".into());
         let mac = Self {
             root: root.to_str().unwrap().to_owned(),
             state: RefCell::new(state),
@@ -256,6 +280,8 @@ impl FakeMac {
         mac.write(ERR_LOG, "");
         mac.chmod(ERR_LOG, 0o644);
         mac.own(ERR_LOG, 480, 480);
+        mac.converge_volume();
+        mac.converge_pool(4, POOL_FIRST_UID);
         mac
     }
 
@@ -366,6 +392,9 @@ impl FakeMac {
             "launchctl print ",
             "xcode-select -p",
             "PlistBuddy -c Print :ProductBuildVersion ",
+            "diskutil info ",
+            "mdutil -s ",
+            "tmutil isexcluded ",
         ];
         self.log
             .borrow()
@@ -489,6 +518,29 @@ impl FakeMac {
                 done(true)
             }
             ("xcodebuild", ["-license", "accept"] | ["-runFirstLaunch"]) => done(true),
+            ("mdutil", ["-i", "off", volume]) => {
+                s.spotlight_off.insert(self.strip_root(volume).into());
+                done(true)
+            }
+            ("tmutil", ["addexclusion", path]) => {
+                s.backup_excluded.insert(self.strip_root(path).into());
+                done(true)
+            }
+            ("dseditgroup", ["-o", "edit", "-d", user, "-t", "user", group]) => {
+                let record = format!("/Groups/{group}");
+                let members: Vec<String> = s
+                    .records
+                    .get(&record)
+                    .and_then(|a| a.iter().find(|(k, _)| k == "GroupMembership"))
+                    .map_or_else(Vec::new, |(_, v)| {
+                        v.split_whitespace()
+                            .filter(|m| m != user)
+                            .map(str::to_owned)
+                            .collect()
+                    });
+                s.attr(&record, "GroupMembership", &members.join(" "));
+                done(true)
+            }
             _ => None,
         }
     }
@@ -598,6 +650,34 @@ impl FakeMac {
                 _ => "socketfilterfw: no answer\n".into(),
             }),
             ("fdesetup", ["status"]) => ok(format!("FileVault is {}.\n", s.filevault)),
+            // As macOS's diskutil prints a mounted volume's information, in part.
+            ("diskutil", ["info", volume]) => match s.volumes.get(*volume) {
+                Some(personality) => ok(format!(
+                    "   Device Identifier:         disk3s7\n   Mount Point:               {volume}\n   File System Personality:   {personality}\n"
+                )),
+                None => match s.held_by.get(*volume) {
+                    Some(mount) => ok(format!(
+                        "   Device Identifier:         disk3s1\n   Mount Point:               {mount}\n   File System Personality:   APFS\n"
+                    )),
+                    None => no(&format!("Could not find disk: {volume}\n")),
+                },
+            },
+            ("mdutil", ["-s", volume]) => ok(format!(
+                "{volume}:\n\tIndexing {}.\n",
+                if s.spotlight_off.contains(*volume) {
+                    "disabled"
+                } else {
+                    "enabled"
+                }
+            )),
+            ("tmutil", ["isexcluded", path]) => ok(format!(
+                "[{}]    {path}\n",
+                if s.backup_excluded.contains(*path) {
+                    "Excluded"
+                } else {
+                    "Included"
+                }
+            )),
             ("sntp", ["-t", "5", server]) => {
                 if s.sntp_offset == "fail" {
                     no("")
@@ -769,74 +849,6 @@ impl Host for FakeMac {
     fn pause(&self, seconds: u64) {
         self.log.borrow_mut().push(format!("sleep {seconds}"));
     }
-}
-
-/// The property list the test profile must render, given the first 12 hex digits of
-/// the profile's SHA-256: written out here, not rendered, so a rendering defect shows.
-pub fn golden_plist(sha12: &str) -> String {
-    format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-	<key>Label</key>
-	<string>org.example.kbf-daemon</string>
-	<key>ProgramArguments</key>
-	<array>
-		<string>/usr/local/kbf/current/kbf-daemon</string>
-		<string>--driver</string>
-		<string>native</string>
-		<string>--server</string>
-		<string>https://farm.example.net:8981</string>
-		<string>--cas</string>
-		<string>https://farm.example.net:8981</string>
-		<string>--ca-cert</string>
-		<string>/usr/local/kbf/etc/ca.pem</string>
-		<string>--cert</string>
-		<string>/usr/local/kbf/etc/node.pem</string>
-		<string>--key</string>
-		<string>/usr/local/kbf/etc/node.key</string>
-		<string>--node-id</string>
-		<string>kbf-mac-07</string>
-		<string>--scratch</string>
-		<string>/Volumes/kbf/scratch</string>
-		<string>--label</string>
-		<string>profile=mac-arm64-test@{sha12}</string>
-		<string>--label</string>
-		<string>pool=mac</string>
-		<string>--label</string>
-		<string>rack=r2</string>
-	</array>
-	<key>UserName</key>
-	<string>_kbf</string>
-	<key>GroupName</key>
-	<string>_kbf</string>
-	<key>RunAtLoad</key>
-	<true/>
-	<key>KeepAlive</key>
-	<true/>
-	<key>ThrottleInterval</key>
-	<integer>10</integer>
-	<key>ExitTimeOut</key>
-	<integer>30</integer>
-	<key>ProcessType</key>
-	<string>Interactive</string>
-	<key>StandardErrorPath</key>
-	<string>/Library/Logs/kbf/kbf-daemon.err.log</string>
-	<key>SoftResourceLimits</key>
-	<dict>
-		<key>NumberOfFiles</key>
-		<integer>65536</integer>
-	</dict>
-	<key>HardResourceLimits</key>
-	<dict>
-		<key>NumberOfFiles</key>
-		<integer>65536</integer>
-	</dict>
-</dict>
-</plist>
-"#
-    )
 }
 
 pub fn check_keys(mac: &FakeMac, keys: Option<&str>) -> Report {

@@ -276,7 +276,9 @@ native-whole-machine`.
   [docs/deploy/linux-build-host.md](../deploy/linux-build-host.md) has the systemd
   units and the host's swap and memory headroom.
 - **`NativeRuntime`** (`kbf-driver-native`, driver `native`): each action as plain
-  processes on the node, for Macs.
+  processes on the node, for Macs. The macOS end state (a root daemon, a reused pool of
+  unprivileged lease users cleaned between leases, one long-lived GUI user for
+  whole-machine leases) is in [macos-end-state.md](macos-end-state.md) (**planned**).
 - **`WholeMachineRuntime`** (`kbf-driver-native`, driver `native-whole-machine`, macOS
   only): each `whole_machine` lease as a throwaway user in that user's GUI session,
   through the root helper `kbf-mac-session`

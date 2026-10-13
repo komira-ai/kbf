@@ -7,8 +7,8 @@ mod support;
 use std::fs;
 
 use support::{
-    COMMERCE, DROPIN, ERR_LOG, FakeMac, INTENT, LOGINWINDOW, PLIST, SOFTWARE_UPDATE, apply, check,
-    lines, only_fails,
+    COMMERCE, DROPIN, ERR_LOG, FakeMac, HOMES, INTENT, LOGINWINDOW, PLIST, SOFTWARE_UPDATE, VOLUME,
+    apply, check, lines, only_fails,
 };
 
 type Drift = (&'static str, &'static str, fn(&mut FakeMac), &'static str);
@@ -114,6 +114,180 @@ const DRIFTS: &[Drift] = &[
         "a group with the id",
         |m| m.state_mut().attr("/Groups/other", "PrimaryGroupID", "480"),
         "gid 480 belongs to other",
+    ),
+    (
+        "kbf_volume",
+        "not mounted",
+        |m| {
+            m.state_mut().volumes.clear();
+        },
+        "/Volumes/kbf is not a mounted volume (Could not find disk: /Volumes/kbf)",
+    ),
+    (
+        "kbf_volume",
+        "a directory on the system volume",
+        |m| {
+            let s = m.state_mut();
+            s.volumes.clear();
+            s.held_by.insert(VOLUME.into(), "/".into());
+        },
+        "/Volumes/kbf is not a mounted volume (diskutil gives the mount point /): make it",
+    ),
+    (
+        "kbf_volume",
+        "not APFS",
+        |m| {
+            m.state_mut()
+                .volumes
+                .insert(VOLUME.into(), "Journaled HFS+".into());
+        },
+        "/Volumes/kbf is Journaled HFS+, not APFS",
+    ),
+    (
+        "kbf_volume",
+        "Spotlight on",
+        |m| {
+            m.state_mut().spotlight_off.clear();
+        },
+        "Spotlight indexing is on",
+    ),
+    (
+        "kbf_volume",
+        "no marker",
+        |m| m.remove("/Volumes/kbf/.metadata_never_index"),
+        "no /Volumes/kbf/.metadata_never_index",
+    ),
+    (
+        "kbf_volume",
+        "backed up",
+        |m| {
+            m.state_mut().backup_excluded.clear();
+        },
+        "not excluded from Time Machine",
+    ),
+    (
+        "pool_users",
+        "a login shell",
+        |m| {
+            m.state_mut()
+                .user_attr("kbf-pool-1", "UserShell", "/bin/zsh")
+        },
+        "kbf-pool-1: UserShell=/bin/zsh, want /usr/bin/false",
+    ),
+    (
+        "pool_users",
+        "in wheel",
+        |m| {
+            m.state_mut()
+                .attr("/Groups/wheel", "GroupMembership", "root kbf-pool-2")
+        },
+        "kbf-pool-2: in wheel",
+    ),
+    (
+        "pool_users",
+        "a uid below 600",
+        |m| m.state_mut().user_attr("kbf-pool-0", "UniqueID", "599"),
+        "kbf-pool-0: UniqueID=599, want 700",
+    ),
+    (
+        "pool_users",
+        "a home off the volume",
+        |m| {
+            m.state_mut()
+                .user_attr("kbf-pool-3", "NFSHomeDirectory", "/var/kbf-pool-3")
+        },
+        "kbf-pool-3: NFSHomeDirectory=/var/kbf-pool-3, want /Volumes/kbf/home/kbf-pool-3",
+    ),
+    (
+        "pool_users",
+        "not hidden",
+        |m| m.state_mut().user_attr("kbf-pool-0", "IsHidden", "0"),
+        "kbf-pool-0: IsHidden=0, want 1",
+    ),
+    (
+        "pool_users",
+        "a password",
+        |m| {
+            m.state_mut()
+                .user_attr("kbf-pool-0", "Password", "********")
+        },
+        "kbf-pool-0: Password=********, want *",
+    ),
+    (
+        "pool_users",
+        "a password hash",
+        |m| {
+            m.state_mut().user_attr(
+                "kbf-pool-2",
+                "AuthenticationAuthority",
+                ";ShadowHash;HASHLIST:<SALTED-SHA512-PBKDF2>",
+            )
+        },
+        "kbf-pool-2: an AuthenticationAuthority",
+    ),
+    (
+        "pool_users",
+        "another primary group",
+        |m| {
+            m.state_mut()
+                .user_attr("kbf-pool-1", "PrimaryGroupID", "20")
+        },
+        "kbf-pool-1: PrimaryGroupID=20, want 700",
+    ),
+    (
+        "pool_users",
+        "a user missing",
+        |m| m.state_mut().remove_user("kbf-pool-3"),
+        "kbf-pool-3: UniqueID=absent, want 703",
+    ),
+    (
+        "pool_users",
+        "a user with a pool uid",
+        |m| m.state_mut().user("other", 701),
+        "kbf-pool-1: uid 701 belongs to other",
+    ),
+    (
+        "pool_users",
+        "the group's gid",
+        |m| {
+            m.state_mut()
+                .attr("/Groups/kbfpool", "PrimaryGroupID", "20")
+        },
+        "group kbfpool: PrimaryGroupID=20, want 700",
+    ),
+    (
+        "pool_users",
+        "a group with the pool gid",
+        |m| {
+            let s = m.state_mut();
+            s.records.remove("/Groups/kbfpool");
+            s.attr("/Groups/other", "PrimaryGroupID", "700");
+        },
+        "group kbfpool: PrimaryGroupID=absent, want 700; gid 700 belongs to other",
+    ),
+    (
+        "pool_users",
+        "a home missing",
+        |m| m.remove("/Volumes/kbf/home/kbf-pool-2"),
+        "kbf-pool-2: home /Volumes/kbf/home/kbf-pool-2 is missing, want drwx------ 702 700",
+    ),
+    (
+        "pool_users",
+        "a home of another owner",
+        |m| m.own("/Volumes/kbf/home/kbf-pool-1", 700, 700),
+        "kbf-pool-1: home /Volumes/kbf/home/kbf-pool-1 is drwx------ 700 700, want drwx------ 701 700",
+    ),
+    (
+        "pool_users",
+        "a home others can read",
+        |m| m.chmod("/Volumes/kbf/home/kbf-pool-0", 0o755),
+        "want drwx------ 700 700",
+    ),
+    (
+        "pool_users",
+        "the homes directory writable",
+        |m| m.chmod(HOMES, 0o777),
+        "/Volumes/kbf/home is drwxrwxrwx 0 0, want drwxr-xr-x 0 0",
     ),
     (
         "power_sleep",
@@ -339,12 +513,12 @@ const DRIFTS: &[Drift] = &[
         "autologin",
         "a lease user out of range",
         |m| {
-            m.state_mut().user("kbf-lease-9-9", 700);
+            m.state_mut().user("kbf-lease-9-9", 900);
             m.write(INTENT, "9.9\n");
             m.state_mut()
                 .default_set(LOGINWINDOW, "autoLoginUser", "kbf-lease-9-9");
         },
-        "auto-login is kbf-lease-9-9 (uid 700)",
+        "auto-login is kbf-lease-9-9 (uid 900)",
     ),
     (
         "autologin",
@@ -597,6 +771,11 @@ fn each_drift_fails_exactly_its_item() {
 const STAYS: &[(&str, &str)] = &[
     ("role_user", "a user with the id"),
     ("role_user", "a group with the id"),
+    ("kbf_volume", "not mounted"),
+    ("kbf_volume", "not APFS"),
+    ("kbf_volume", "a directory on the system volume"),
+    ("pool_users", "a user with a pool uid"),
+    ("pool_users", "a group with the pool gid"),
     ("ssh_password_auth", "no Include line"),
     ("ssh_password_auth", "an earlier drop-in"),
     ("ssh_password_auth", "a keyword before Include"),

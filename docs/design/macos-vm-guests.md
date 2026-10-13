@@ -168,10 +168,10 @@ reached over the virtio socket, off by default) is not designed and is later wor
 
 ## 4. Networking
 
-An action asks for the network with the platform property `network` on `main`:
-absent, `off` or `none` keeps it off; `on` or `standard` turns it on
-(`crates/kbf-driver-native/src/network.rs`) **[V]**. A VM lease uses the same property,
-so a client sets nothing new.
+A native action on `main` has the network unless its platform property `network` is
+`off` or `none`; absent, `on` or `standard` gives it the network
+(`crates/kbf-driver-native/src/network.rs`) **[V]**. A VM lease reads the same property,
+so a client sets nothing new, but absent means off for it (the table below).
 
 | `network` | Guest gets | Status |
 |---|---|---|
