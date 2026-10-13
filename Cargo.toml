@@ -21,6 +21,9 @@ axum = { version = "0.8.9", default-features = false }
 base64 = "0.23.1"
 bytes = "1.12.1"
 clap = { version = "4.6.7", features = ["derive"] }
+# The CRC-32 of the worker input cache's index snapshot (kbf-daemon). Already in the
+# tree through flate2.
+crc32fast = "1.5.2"
 # macOS only (kbf-mac-session): CFData for the caller's audit token.
 core-foundation = "0.10.1"
 # The MDM gate's grant key (kbf-mdm) and the Mac's check of the grants it signs

@@ -1,6 +1,6 @@
 //! The worker's input cache (`docs/design/worker-cache.md#6-the-cache`): a
 //! content-addressed directory of read-only files on the node's disk, which the
-//! container driver hard-links into each lease's input root.
+//! container driver hard-links into each lease's input root, kept across restarts.
 //!
 //! - **One owner.** [`Cache::open`] takes an exclusive `flock` on `<dir>/lock` before
 //!   it touches anything else; a second daemon is refused ([`Disabled::Locked`]) and
@@ -8,13 +8,14 @@
 //! - **Inserts** are fetched and hashed into `tmp/`, made read-only (0444, 0555 for an
 //!   executable) with the fixed mtime [`FIXED_MTIME`], and renamed into `blobs/` with
 //!   `RENAME_NOREPLACE` (`fill`). Nothing under `blobs/` is ever opened for writing.
-//! - **The index** of keys, sizes and last uses is in memory (`index`). The files a
-//!   previous run left in `blobs/` are not in it: a fill that finds one at its key's
-//!   name re-hashes it and adopts it, or unlinks it, before it fetches.
+//! - **The index** of keys, sizes and last uses is in memory and saved whole to
+//!   `index.snap` (`index`): right after load, every [`CacheConfig::snapshot_every`],
+//!   after each adopt pass, and at [`Cache::stop`]. A bad snapshot is discarded and
+//!   costs LRU order only: the adopt pass (`pass`) and the fills take the files back.
 //! - **Every key's slot** in the fill map serialises what changes that key's name and
-//!   index entry: fills and the evictor (`evict`).
-//! - **Every entry is stat-checked** on every hit (`verify`), and hashed when it is
-//!   inserted or adopted.
+//!   index entry: fills, the evictor (`evict`) and the adopt pass.
+//! - **Every entry is re-hashed** the first time a lease uses it after a start, and
+//!   stat-checked on every hit (`verify`).
 //!
 //! The cache never fails a lease that would run without it: an I/O error in the cache
 //! hands the lease the fetched bytes to write itself, as without a cache.
@@ -24,15 +25,18 @@ mod fill;
 mod index;
 mod layout;
 pub(crate) mod lease;
+mod pass;
 mod verify;
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, Instant};
 
 pub use fill::InputStats;
+pub use index::Discarded;
 pub use layout::{FIXED_MTIME, Key};
 
 use crate::cas::CasError;
@@ -61,6 +65,15 @@ pub enum Point<'a> {
     /// The evictor took the key's slot and removed it from the index; its name is not
     /// unlinked yet.
     Evicting(&'a Key),
+    /// The background thread wrote the snapshot of what it loaded and drained the
+    /// index to the budget; the first adopt pass is next.
+    PassStarts,
+    /// The adopt pass listed the directory `blobs/<prefix>`.
+    Listed(u8),
+    /// The adopt pass compared the key with the index and is about to take its slot.
+    Compared(&'a Key),
+    /// A snapshot's temporary file holds the first half of its bytes.
+    SnapshotHalf,
 }
 
 /// Where a test watches the cache's work: called at each [`Point`].
@@ -95,6 +108,12 @@ pub struct CacheConfig {
     /// `--cache-link-concurrency`: how many files of a lease are linked or filled at
     /// once.
     pub link_concurrency: usize,
+    /// How often the index is saved.
+    pub snapshot_every: Duration,
+    /// How often an adopt pass runs after the first, which runs at start.
+    pub pass_every: Duration,
+    /// The pause between two directories of a pass, lifted under free-space pressure.
+    pub pass_pace: Duration,
     pub clock: Clock,
     pub hooks: Arc<dyn Hooks>,
     /// Links a lease's name to an entry, or to another name of the lease.
@@ -106,7 +125,8 @@ pub struct CacheConfig {
 
 impl CacheConfig {
     /// A cache in `dir` for leases under `scratch`, at most `max_bytes`: no free-space
-    /// floor, 64 links at once, the system clock, no hooks.
+    /// floor, 64 links at once, a snapshot every 5 minutes, a pass a day at one
+    /// directory a second, the system clock, no hooks.
     #[must_use]
     pub fn new(dir: PathBuf, scratch: PathBuf, max_bytes: u64) -> Self {
         Self {
@@ -115,6 +135,9 @@ impl CacheConfig {
             max_bytes,
             min_free_bytes: 0,
             link_concurrency: 64,
+            snapshot_every: Duration::from_secs(300),
+            pass_every: Duration::from_secs(86_400),
+            pass_pace: Duration::from_secs(1),
             clock: system_clock(),
             hooks: Arc::new(NoHooks),
             link: Arc::new(|from: &Path, to: &Path| std::fs::hard_link(from, to)),
@@ -190,10 +213,23 @@ pub struct CacheStats {
     pub bytes: u64,
     pub entries: u64,
     pub evictions: u64,
-    /// Entries that failed their stat check or their re-hash.
+    /// Entries that failed their lazy re-hash or their stat check.
     pub verify_failures: u64,
     /// Free-space rounds that ran out of entries no lease links.
     pub floor_unreachable: u64,
+    pub adopted_entries: u64,
+    pub dropped_entries: u64,
+    /// Files under `blobs/` that are not entries (a name that is not a key, a
+    /// directory, a size that is not the key's); never counted, never removed.
+    pub foreign_files: u64,
+    /// What the last completed pass added plus what it dropped, in bytes.
+    pub index_drift_bytes: u64,
+    /// Snapshots written, and snapshot writes that failed.
+    pub snapshots: u64,
+    pub snapshot_failures: u64,
+    /// Why the snapshot at start was not loaded, if it was not.
+    pub index_discarded: Option<Discarded>,
+    pub index_load_ms: u64,
 }
 
 #[derive(Debug, Default)]
@@ -201,26 +237,38 @@ struct Counters {
     evictions: AtomicU64,
     verify_failures: AtomicU64,
     floor_unreachable: AtomicU64,
+    adopted: AtomicU64,
+    dropped: AtomicU64,
+    foreign: AtomicU64,
+    drift: AtomicU64,
+    snapshots: AtomicU64,
+    snapshot_failures: AtomicU64,
 }
 
 fn bump(counter: &AtomicU64) {
     counter.fetch_add(1, Ordering::Relaxed);
 }
 
-/// A key's slot, held by a fill or the evictor: what its waiters learn when it is
-/// released (a fill's error, if it failed). Whoever held it, a waiter then looks at the
-/// index again: the holder leaves the key's name and index entry in agreement.
+/// A key's slot, held by a fill, the evictor or the adopt pass: what its waiters learn
+/// when it is released (a fill's error, if it failed). Whoever held it, a waiter then
+/// looks at the index again, and the pass skips a key whose slot is held: the holder
+/// leaves the key's name and index entry in agreement.
 #[derive(Debug)]
 struct Slot {
     done: tokio::sync::watch::Receiver<Option<Option<CasError>>>,
 }
 
-/// What the cache's mutex guards: the index, the slots and the pins.
+/// What the cache's mutex guards: the index, the slots, the pins, and the keys fills
+/// left unindexed.
 #[derive(Debug, Default)]
 struct State {
     index: Index,
     slots: HashMap<Key, Slot>,
     pins: HashMap<Key, u32>,
+    unindexed: BTreeSet<Key>,
+    /// Set while free space is under the floor and no entry is left to evict: the
+    /// adopt pass then runs without its pause.
+    pressure: bool,
 }
 
 /// The cache as one daemon owns it.
@@ -238,6 +286,7 @@ impl std::fmt::Debug for Cache {
 
 struct Inner {
     config: CacheConfig,
+    v1: PathBuf,
     blobs: PathBuf,
     tmp: PathBuf,
     /// Holds the exclusive flock while the cache is open.
@@ -249,11 +298,21 @@ struct Inner {
     counters: Counters,
     /// Names the temporary files of fills.
     next_tmp: AtomicU64,
+    /// Held while a snapshot is written: one writer of `index.snap.tmp` at a time.
+    snapshotting: Mutex<()>,
+    index_discarded: Option<Discarded>,
+    index_load_ms: u64,
+    /// Set by [`Cache::stop`]; the background thread waits on it.
+    stopped: (Mutex<bool>, Condvar),
+    thread: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 impl Cache {
-    /// Opens the cache in `config.dir`, blocking: takes the lock, then clears what a
-    /// previous run left in `tmp/`. The index starts empty.
+    /// Opens the cache in `config.dir`, blocking: takes the lock, clears what a
+    /// previous run left in `tmp/`, loads the snapshot (a bad one is discarded with a
+    /// warning), then starts the background thread, which saves a snapshot at once,
+    /// evicts down to the budget, and runs the first adopt pass. The cache serves from
+    /// the moment this returns.
     ///
     /// # Errors
     /// Why the cache cannot be used; the daemon then runs uncached.
@@ -266,6 +325,17 @@ impl Cache {
             return Err(Disabled::LeaseName);
         }
         let opened = layout::open(&config.dir, &config.scratch, (config.clock)())?;
+        let started = Instant::now();
+        let (index, discarded) = match std::fs::read(opened.v1.join(index::SNAPSHOT)) {
+            Ok(bytes) => match index::decode(&bytes) {
+                Ok(records) => (Index::loaded(&records), None),
+                Err(why) => (Index::default(), Some(why)),
+            },
+            Err(_) => (Index::default(), Some(Discarded::Missing)),
+        };
+        if let Some(why) = discarded.map(Discarded::word) {
+            tracing::warn!("cache: index snapshot discarded ({why}); starting empty");
+        }
         let link_mode = if opened.same_filesystem {
             LinkMode::Hardlink
         } else {
@@ -278,15 +348,31 @@ impl Cache {
                 .link_max
                 .unwrap_or_else(|| layout::link_max(&opened.blobs)),
             uid: rustix::process::geteuid().as_raw(),
+            v1: opened.v1,
             blobs: opened.blobs,
             tmp: opened.tmp,
             _lock: opened.lock,
             link_mode,
-            state: Mutex::new(State::default()),
+            state: Mutex::new(State {
+                index,
+                ..State::default()
+            }),
             counters: Counters::default(),
             next_tmp: AtomicU64::new(0),
+            snapshotting: Mutex::new(()),
+            index_discarded: discarded,
+            index_load_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            stopped: (Mutex::new(false), Condvar::new()),
+            thread: Mutex::new(None),
             config,
         });
+        let background = Arc::clone(&inner);
+        // Without its thread (the system refused one) the cache still serves; the
+        // timed snapshots, the drain at start and the passes are what is lost.
+        let thread = std::thread::Builder::new()
+            .name("kbf-cache".to_owned())
+            .spawn(move || background.background());
+        *lock(&inner.thread) = thread.ok();
         Ok(Arc::new(Self { inner }))
     }
 
@@ -327,12 +413,52 @@ impl Cache {
             evictions: get(&c.evictions),
             verify_failures: get(&c.verify_failures),
             floor_unreachable: get(&c.floor_unreachable),
+            adopted_entries: get(&c.adopted),
+            dropped_entries: get(&c.dropped),
+            foreign_files: get(&c.foreign),
+            index_drift_bytes: get(&c.drift),
+            snapshots: get(&c.snapshots),
+            snapshot_failures: get(&c.snapshot_failures),
+            index_discarded: inner.index_discarded,
+            index_load_ms: inner.index_load_ms,
+        }
+    }
+
+    /// Saves the index now (the background thread's work, also a test's).
+    ///
+    /// # Errors
+    /// The snapshot could not be written; the previous one is kept.
+    pub fn write_snapshot(&self) -> std::io::Result<()> {
+        self.inner.write_snapshot()
+    }
+
+    /// Runs one adopt pass now, then an eviction round and a snapshot, as the
+    /// background thread does after each (a test's way to run one).
+    pub fn adopt_pass(&self) {
+        if self.inner.pass() {
+            self.inner.evict();
+            let _ = self.inner.write_snapshot();
         }
     }
 
     /// Evicts down to the budget and the free-space floor now.
     pub fn evict(&self) {
         self.inner.evict();
+    }
+
+    /// A clean stop: ends the background thread (after the pass step it is in) and
+    /// saves the index; once only. Dropping the last handle stops the cache too, so a
+    /// daemon that exits saves its index. Leases may still read entries they hold
+    /// links to.
+    pub fn stop(&self) {
+        let (stopped, wake) = &self.inner.stopped;
+        if std::mem::replace(&mut *lock(stopped), true) {
+            return;
+        }
+        wake.notify_all();
+        let thread = lock(&self.inner.thread).take();
+        drop(thread.map(std::thread::JoinHandle::join));
+        let _ = self.inner.write_snapshot();
     }
 
     /// Pins `keys` (each once per call) until the returned guard is dropped: the
@@ -354,6 +480,12 @@ impl Cache {
     #[must_use]
     pub fn holds(&self, key: &Key) -> bool {
         self.inner.state().index.get(key).is_some()
+    }
+}
+
+impl Drop for Cache {
+    fn drop(&mut self) {
+        self.stop();
     }
 }
 
@@ -395,6 +527,67 @@ impl Inner {
 
     fn path_of(&self, key: &Key) -> PathBuf {
         self.blobs.join(key.prefix()).join(key.name())
+    }
+
+    fn write_snapshot(&self) -> std::io::Result<()> {
+        let _writing = lock(&self.snapshotting);
+        // Copied under the state's lock, written without it.
+        let records = self.state().index.records();
+        let written = index::write(&self.v1, &records, &*self.config.hooks);
+        match &written {
+            Ok(()) => bump(&self.counters.snapshots),
+            Err(e) => {
+                bump(&self.counters.snapshot_failures);
+                tracing::warn!("cache: index snapshot not written ({e}); the previous one is kept");
+            }
+        }
+        written
+    }
+
+    /// The background thread: a snapshot of what was loaded, the drain to the budget,
+    /// the first pass, then snapshots and passes on their intervals until stopped. A
+    /// completed pass is followed by an eviction round (what it adopted counts) and a
+    /// snapshot.
+    fn background(&self) {
+        let _ = self.write_snapshot();
+        self.evict();
+        self.config.hooks.at(Point::PassStarts);
+        let mut next_snapshot = Instant::now() + self.config.snapshot_every;
+        let mut next_pass = Instant::now();
+        loop {
+            if Instant::now() >= next_pass {
+                if !self.pass() {
+                    return;
+                }
+                self.evict();
+                let _ = self.write_snapshot();
+                next_pass = Instant::now() + self.config.pass_every;
+            }
+            if Instant::now() >= next_snapshot {
+                let _ = self.write_snapshot();
+                next_snapshot = Instant::now() + self.config.snapshot_every;
+            }
+            let wait = next_pass
+                .min(next_snapshot)
+                .saturating_duration_since(Instant::now());
+            if self.wait_stopped(wait) {
+                return;
+            }
+        }
+    }
+
+    /// Waits up to `wait`; whether the cache was stopped.
+    fn wait_stopped(&self, wait: Duration) -> bool {
+        let (stopped, wake) = &self.stopped;
+        let guard = lock(stopped);
+        let (guard, _) = wake
+            .wait_timeout_while(guard, wait, |stopped| !*stopped)
+            .unwrap_or_else(PoisonError::into_inner);
+        *guard
+    }
+
+    fn stopping(&self) -> bool {
+        *lock(&self.stopped.0)
     }
 }
 

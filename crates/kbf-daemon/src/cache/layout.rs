@@ -5,6 +5,7 @@
 //! <cache-dir>/lock                       exclusive flock; never unlinked
 //! <cache-dir>/v1/blobs/<h0h1>/<sha256>-<size>[.x]
 //! <cache-dir>/v1/tmp/<n>                 fills in progress; cleared at start
+//! <cache-dir>/v1/index.snap              the index (`index`)
 //! ```
 
 use std::fs::File;
@@ -109,6 +110,8 @@ impl Key {
 /// The paths of an opened cache, the lock it holds, and what start-up found.
 #[derive(Debug)]
 pub(crate) struct Layout {
+    /// `<cache-dir>/v1`.
+    pub v1: PathBuf,
     pub blobs: PathBuf,
     pub tmp: PathBuf,
     /// The open lock file, holding the exclusive flock for as long as it is open.
@@ -118,7 +121,7 @@ pub(crate) struct Layout {
 }
 
 /// Takes the lock on `dir`, then (and only then) moves an unknown layout version aside,
-/// makes `v1/` and its directories, and clears `tmp/`. `now` names
+/// makes `v1/` and its directories, and clears `tmp/` and `index.snap.tmp`. `now` names
 /// what is moved aside. Nothing under `dir` but the lock file is touched when the lock
 /// is not taken, and the lock file is never removed.
 ///
@@ -153,8 +156,11 @@ pub(crate) fn open(dir: &Path, scratch: &Path, now: u64) -> Result<Layout, Disab
         builder.create(&made).map_err(unusable(&made))?;
     }
     clear(&tmp).map_err(unusable(&tmp))?;
+    let snapshot_tmp = v1.join(super::index::SNAPSHOT_TMP);
+    remove_if_present(&snapshot_tmp).map_err(unusable(&snapshot_tmp))?;
     let same_filesystem = Some(device(&v1).map_err(unusable(&v1))?) == device(scratch).ok();
     Ok(Layout {
+        v1,
         blobs,
         tmp,
         lock,

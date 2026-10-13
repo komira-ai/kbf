@@ -224,7 +224,17 @@ struct Hold {
 pub struct HoldId(usize);
 
 impl Gates {
+    /// Gates that hold the cache's background thread before its first adopt pass
+    /// ([`Point::PassStarts`]) until the cache is stopped: a pass running beside a test
+    /// would adopt or drop what the test put on disk, on its own time.
     pub fn new() -> Arc<Self> {
+        let gates = Self::running();
+        gates.hold(|p| *p == Point::PassStarts);
+        gates
+    }
+
+    /// Gates with no hold: the background thread runs as in a daemon.
+    pub fn running() -> Arc<Self> {
         Arc::new(Self::default())
     }
 
@@ -292,24 +302,37 @@ impl Hooks for Gates {
 }
 
 /// A test's cache configuration: the cache in `dir/cache`, leases under `dir/leases`,
-/// `max_bytes`, `hooks`, a fake clock at `clock`.
+/// `max_bytes`, no pause in a pass, snapshots and passes far apart, `hooks`, a fake
+/// clock at `clock`.
 pub fn config(dir: &Path, max_bytes: u64, hooks: Arc<Gates>, clock: &FakeClock) -> CacheConfig {
     let cache = dir.join("cache");
     std::fs::create_dir_all(&cache).expect("cache dir");
     std::fs::create_dir_all(dir.join("leases")).expect("leases dir");
     let mut config = CacheConfig::new(cache, dir.join("leases"), max_bytes);
+    config.pass_pace = Duration::ZERO;
+    config.snapshot_every = Duration::from_secs(3600);
+    config.pass_every = Duration::from_secs(3600);
     config.hooks = hooks;
     config.clock = clock.clock();
     config
 }
 
-/// Drops `cache`, the last handle of it, with every hold of `gates` let go: its lock is
-/// released, as when a daemon exits.
+/// Stops `cache` while its background thread may be held by `gates` (the stop runs on
+/// a thread of its own, and every hold is let go), then drops it: its lock is released
+/// once the last handle is gone, as when a daemon exits.
 pub fn stop(cache: Arc<Cache>, gates: &Gates) {
-    let count = lock(&gates.state).holds.len();
-    for id in 0..count {
-        gates.release(HoldId(id));
+    let stopping = Arc::clone(&cache);
+    let stopper = std::thread::spawn(move || stopping.stop());
+    // The stop marks the cache stopped first; holds let go after that see it.
+    std::thread::sleep(Duration::from_millis(50));
+    while !stopper.is_finished() {
+        let count = lock(&gates.state).holds.len();
+        for id in 0..count {
+            gates.release(HoldId(id));
+        }
+        std::thread::sleep(Duration::from_millis(5));
     }
+    stopper.join().expect("stopped");
     assert_eq!(
         Arc::strong_count(&cache),
         1,

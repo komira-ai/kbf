@@ -48,10 +48,12 @@ impl Inner {
         while self.free_bytes() < self.config.min_free_bytes {
             if !self.evict_one(&mut |state| oldest(state, &mut unlinked)) {
                 bump(&self.counters.floor_unreachable);
+                self.state().pressure = true;
                 tracing::warn!("cache: free space is under the floor and no entry can be evicted");
                 return;
             }
         }
+        self.state().pressure = false;
     }
 
     /// The free bytes of the cache's filesystem, as an unprivileged user may use them;
