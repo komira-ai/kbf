@@ -224,7 +224,17 @@ struct Hold {
 pub struct HoldId(usize);
 
 impl Gates {
+    /// Gates that hold the cache's background thread before its first adopt pass
+    /// ([`Point::PassStarts`]) until the cache is stopped: a pass running beside a test
+    /// would adopt or drop what the test put on disk, on its own time.
     pub fn new() -> Arc<Self> {
+        let gates = Self::running();
+        gates.hold(|p| *p == Point::PassStarts);
+        gates
+    }
+
+    /// Gates with no hold: the background thread runs as in a daemon.
+    pub fn running() -> Arc<Self> {
         Arc::new(Self::default())
     }
 
