@@ -3,9 +3,7 @@
 //! driver never touches the directory, and the binary answers as the driver's
 //! `__chown-dirs` helper before it parses its flags.
 
-use super::{
-    BIN, one_native_daemon, runs_until_sigterm_logged, runs_until_sigterm_logged_then, tls,
-};
+use super::{BIN, one_native_daemon, runs_until_sigterm_logged, tls};
 
 /// Whether a line of `log` holds every one of `words`.
 fn logged(log: &[String], words: &[&str]) -> bool {
@@ -74,7 +72,7 @@ fn a_container_node_opens_its_cache_and_runs_uncached_without_it() {
             std::fs::remove_file(&snap).expect("remove the snapshot written after load");
         };
         let (status, log) =
-            runs_until_sigterm_logged_then("cache-open", &flags, Some(&bin), after_load);
+            super::runs_until_sigterm_logged_then("cache-open", &flags, Some(&bin), after_load);
         assert!(status.success(), "{status}: {log:#?}");
         assert!(
             logged(&log, &["cache: ", "0 entries, link mode hardlink"]),
