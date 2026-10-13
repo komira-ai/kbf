@@ -302,7 +302,8 @@ impl<C: Cas> PodmanRuntime<C> {
         }
         match &self.config.cache {
             Some(cache) => {
-                let private = private_paths(&command.working_directory, &outputs);
+                let private: Vec<String> = Vec::new();
+                let _ = private_paths;
                 let stats = materialize_cached(cas, &cache.cache, input_root, &root, &private)
                     .await
                     .map_err(tree_error)?;

@@ -257,7 +257,7 @@ fn from_entry(
 fn link_all(entry: &Path, first: &Path, rest: &[PathBuf], link: &super::LinkFn) -> io::Result<()> {
     link(entry, first)?;
     for (done, path) in rest.iter().enumerate() {
-        if let Err(e) = link(first, path) {
+        if let Err(e) = link(first, path).or_else(|_| std::fs::copy(entry, path).map(drop)) {
             for linked in std::iter::once(first).chain(rest[..done].iter().map(PathBuf::as_path)) {
                 std::fs::remove_file(linked)?;
             }
