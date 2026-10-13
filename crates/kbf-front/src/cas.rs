@@ -224,8 +224,16 @@ impl<M: MetaLog, O: ObjectStore + 'static> ContentAddressableStorage for CasServ
             };
         let mut responses = Vec::with_capacity(request.digests.len());
         for (asked, parsed) in request.digests.iter().zip(parsed) {
-            // `read` answers every digest that parsed.
-            let (data, status) = match parsed.and_then(|d| read[&d].clone()) {
+            // `read` answers every digest that parsed, unless the index holds two
+            // digests at one location (corrupt): the one left out fails alone.
+            let answer = parsed.and_then(|d| {
+                read.get(&d).cloned().unwrap_or_else(|| {
+                    Err(Status::internal(format!(
+                        "{d}: no answer from the batch read"
+                    )))
+                })
+            });
+            let (data, status) = match answer {
                 Ok(bytes) => (bytes.to_vec(), wire::rpc_ok()),
                 Err(e) => (Vec::new(), wire::rpc_status(&e)),
             };
