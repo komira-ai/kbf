@@ -1,6 +1,7 @@
-//! The slots on macOS: each pool user resolved at start, a slot taken per lease, the
-//! action launched as its user, and every process of its uid ended
-//! ([`crate::slots`] says what a slot gets).
+//! The slots on macOS: each pool user resolved and cleaned at start, a slot taken per
+//! lease, the action launched as its user, every process of its uid ended, and the
+//! slot cleaned before it goes back ([`crate::slots`] says what a slot gets;
+//! [`crate::slots::clean`] how it is cleaned; [`host`] the Mac's part of that).
 
 use std::collections::BTreeSet;
 use std::ffi::{CStr, OsStr};
@@ -9,24 +10,30 @@ use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use kbf_daemon::RuntimeError;
 use kbf_daemon::uid;
 use tokio::process::Child;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
+use super::clean::{self, Outcome};
 use super::{AS_USER_ARG, Pool, SlotUser};
 use crate::network::{Isolation, Network};
 use crate::procs;
+
+pub mod host;
 
 /// The program that starts a process in a user's bootstrap namespace.
 pub const LAUNCHCTL: &str = kbf_mac_session::macos::gui::LAUNCHCTL;
 
 /// The program that names a user's `/var/folders` entry.
 const GETCONF: &str = "/usr/bin/getconf";
+
+/// The program that says whether Spotlight indexes a volume.
+const MDUTIL: &str = "/usr/bin/mdutil";
 
 /// One pool user, resolved: its real home and its `/var/folders` entry, each by its
 /// real path, and the sandbox rule that lets an action write both.
@@ -38,46 +45,96 @@ pub struct Ready {
     rules: String,
 }
 
-/// The slots of a root daemon: one per pool user, each free or held by one lease.
-#[derive(Debug)]
+/// How a slot is cleaned: [`host::MacSlot`] through [`clean::clean`], or a test's
+/// stand-in.
+type Cleaner = Arc<dyn Fn(&Ready) -> Outcome + Send + Sync>;
+
+/// The slots of a root daemon: one per pool user, each free, held by one lease, or
+/// quarantined.
 pub struct Slots {
-    ready: Arc<Vec<Ready>>,
-    free: Arc<Mutex<BTreeSet<usize>>>,
+    shared: Arc<Shared>,
     permits: Arc<Semaphore>,
     /// This binary, which a launch runs in its `__as-user` mode.
     program: PathBuf,
 }
 
+/// What every slot of one [`Slots`] shares.
+struct Shared {
+    ready: Vec<Ready>,
+    free: Mutex<BTreeSet<usize>>,
+    quarantined: AtomicUsize,
+    cleaner: Cleaner,
+}
+
+impl std::fmt::Debug for Slots {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Slots")
+            .field("ready", &self.shared.ready)
+            .field("free", &self.shared.free)
+            .field("quarantined", &self.shared.quarantined)
+            .finish_non_exhaustive()
+    }
+}
+
 impl Slots {
-    /// Resolves every user of `pool` ([`resolve`]), then ends every process of each
-    /// uid ([`uid::end`], `within` each): whatever a daemon killed before this one
-    /// left running is gone before the daemon says `Hello`. No uid is killed before
-    /// the user database has said it is the pool user's.
+    /// Resolves every user of `pool` ([`resolve`]), then cleans each slot
+    /// ([`clean::clean`], every process of the uid ended `within` each kill): what a
+    /// daemon killed before this one left, running or written, is gone before the
+    /// daemon says `Hello`, and a slot that cannot be cleaned starts quarantined. No
+    /// uid is killed before the user database has said it is the pool user's.
     ///
     /// # Errors
-    /// A user cannot be resolved, or processes of a uid survived.
+    /// A user cannot be resolved, or its home lies in a place the clean sweeps.
     pub fn start(pool: &Pool, within: Duration) -> io::Result<Self> {
         let program = kbf_daemon::keeper::program()?;
         let mut ready = Vec::new();
         for user in pool.users() {
             ready.push(resolve(user, &program)?);
         }
-        for user in pool.users() {
-            uid::end(user.uid, within).map_err(io::Error::other)?;
+        for slot in &ready {
+            // A home in a place the clean sweeps would be swept away with the uid's files.
+            let swept = host::shared().owned;
+            if let Some(place) = swept.iter().find(|p| slot.home.starts_with(p)) {
+                return Err(io::Error::other(format!(
+                    "the home {} of {} is in {}, which the clean sweeps",
+                    slot.home.display(),
+                    slot.user.name,
+                    place.display()
+                )));
+            }
+            warn_if_indexed(&slot.home);
         }
-        let count = ready.len();
-        Ok(Self {
-            ready: Arc::new(ready),
-            free: Arc::new(Mutex::new((0..count).collect())),
-            permits: Arc::new(Semaphore::new(count)),
-            program,
-        })
+        let cleaner = mac_cleaner(within, program.clone());
+        Ok(Self::with(ready, cleaner, program))
     }
 
-    /// How many slots there are.
+    /// Slots over `ready`, each cleaned by `cleaner` first: a slot whose clean
+    /// quarantines it is never free.
+    fn with(ready: Vec<Ready>, cleaner: Cleaner, program: PathBuf) -> Self {
+        let mut free = BTreeSet::new();
+        for (index, slot) in ready.iter().enumerate() {
+            if settle(&cleaner, slot, index) {
+                free.insert(index);
+            }
+        }
+        let quarantined = ready.len() - free.len();
+        Self {
+            permits: Arc::new(Semaphore::new(free.len())),
+            shared: Arc::new(Shared {
+                ready,
+                free: Mutex::new(free),
+                quarantined: AtomicUsize::new(quarantined),
+                cleaner,
+            }),
+            program,
+        }
+    }
+
+    /// How many slots can run a lease: all but the quarantined.
     #[must_use]
     pub fn count(&self) -> usize {
-        self.ready.len()
+        let quarantined = self.shared.quarantined.load(Ordering::SeqCst);
+        self.shared.ready.len().saturating_sub(quarantined)
     }
 
     /// A free slot, waiting for one while every slot is held.
@@ -88,37 +145,134 @@ impl Slots {
     pub async fn take(&self) -> Result<Slot, RuntimeError> {
         let permit = Arc::clone(&self.permits).acquire_owned().await;
         let permit = permit.map_err(|e| RuntimeError::Failed(format!("slots: {e}")))?;
-        let index = lock(&self.free).pop_first();
+        let index = lock(&self.shared.free).pop_first();
         let index = index.ok_or_else(|| RuntimeError::Failed("slots: none free".to_owned()))?;
         Ok(Slot {
-            ready: Arc::clone(&self.ready),
-            free: Arc::clone(&self.free),
+            shared: Arc::clone(&self.shared),
             index,
             permit: Some(permit),
-            healthy: Arc::new(AtomicBool::new(true)),
             program: self.program.clone(),
         })
     }
 }
 
-/// One lease's slot. Dropped, it is free again, unless ending its processes failed:
-/// then it stays out of the pool (one slot fewer until the daemon restarts) and is
-/// logged, so no lease runs beside what survived.
-#[derive(Debug)]
+/// The cleaner of a root daemon's slots: [`host::MacSlot`] through [`clean::clean`].
+fn mac_cleaner(within: Duration, program: PathBuf) -> Cleaner {
+    Arc::new(move |ready: &Ready| {
+        let slot = host::MacSlot {
+            ready,
+            within,
+            program: &program,
+        };
+        clean::clean(&slot)
+    })
+}
+
+/// Cleans slot `index` (`slot`) with `cleaner`, logs how that went, and says whether
+/// the slot may run a lease.
+fn settle(cleaner: &Cleaner, slot: &Ready, index: usize) -> bool {
+    let started = Instant::now();
+    let outcome = cleaner(slot);
+    let (uid, took) = (slot.user.uid, started.elapsed());
+    match &outcome {
+        Outcome::Clean => tracing::debug!(index, uid, ?took, "slot cleaned"),
+        Outcome::Recreated { why } => {
+            tracing::warn!(index, uid, ?took, %why, "slot cleaned after its user was made again");
+        }
+        Outcome::Quarantined { why } => {
+            tracing::error!(index, uid, ?took, %why, "slot quarantined: its clean failed");
+        }
+    }
+    !matches!(outcome, Outcome::Quarantined { .. })
+}
+
+/// Logs a warning when Spotlight indexes the volume `path` is on: `mdworker` would
+/// start as the slot's user to index what a lease wrote, and the kill would race it.
+/// Provisioning turns indexing off on the pool's volume (`kbf_volume`).
+fn warn_if_indexed(path: &Path) {
+    let said = Command::new(MDUTIL)
+        .arg("-s")
+        .arg(path)
+        .env_clear()
+        .stdin(Stdio::null())
+        .output();
+    let said = said.map(|out| String::from_utf8_lossy(&out.stdout).into_owned());
+    if !said.as_deref().is_ok_and(|text| text.contains("disabled")) {
+        tracing::warn!(
+            path = %path.display(),
+            ?said,
+            "Spotlight may index this pool home's volume"
+        );
+    }
+}
+
+/// One lease's slot. Given back ([`Slot::release`]) or dropped, it is cleaned first and
+/// free again only if the clean passed ([`clean::clean`]); a quarantined slot stays out
+/// of the pool until the daemon starts again, and the node reports one slot fewer.
 pub struct Slot {
-    ready: Arc<Vec<Ready>>,
-    free: Arc<Mutex<BTreeSet<usize>>>,
+    shared: Arc<Shared>,
     index: usize,
+    /// `None` once the slot has been given back.
     permit: Option<OwnedSemaphorePermit>,
-    healthy: Arc<AtomicBool>,
     program: PathBuf,
+}
+
+impl std::fmt::Debug for Slot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Slot")
+            .field("index", &self.index)
+            .field("ready", self.ready())
+            .finish_non_exhaustive()
+    }
+}
+
+/// A held slot, to clean and give back. Dropped before its clean passed (the clean's
+/// thread could not start, its task never ran, or the clean panicked), it is counted
+/// quarantined: never free again, and never reported.
+struct Back {
+    shared: Arc<Shared>,
+    index: usize,
+    /// `None` once the slot is free again.
+    permit: Option<OwnedSemaphorePermit>,
+}
+
+impl std::fmt::Debug for Back {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Back")
+            .field("index", &self.index)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Back {
+    /// Cleans the slot; frees it, or quarantines it (on drop).
+    fn give(mut self) {
+        if settle(
+            &self.shared.cleaner,
+            &self.shared.ready[self.index],
+            self.index,
+        ) {
+            lock(&self.shared.free).insert(self.index);
+            drop(self.permit.take());
+        }
+    }
+}
+
+impl Drop for Back {
+    /// Quarantines the slot unless [`Back::give`] freed it: its permit is forgotten.
+    fn drop(&mut self) {
+        if let Some(permit) = self.permit.take() {
+            self.shared.quarantined.fetch_add(1, Ordering::SeqCst);
+            permit.forget();
+        }
+    }
 }
 
 impl Slot {
     /// The slot's user, home and folders.
     #[must_use]
     pub fn ready(&self) -> &Ready {
-        &self.ready[self.index]
+        &self.shared.ready[self.index]
     }
 
     /// The program and arguments that run `program` with `args` as the slot's user:
@@ -180,38 +334,46 @@ impl Slot {
         UidWatch {
             uid: self.ready().user.uid,
             record,
-            healthy: Arc::clone(&self.healthy),
             armed: true,
         }
     }
 
-    /// Gives the slot back, once its lease has ended and the clean of its lease
-    /// directory has run, whether or not that removed everything (what is left lies in
-    /// that lease's directory, and the lease reports the failed clean). Step 4 of
-    /// docs/design/macos-end-state.md cleans the slot here first (its home,
-    /// `/var/folders` entry, keychains, crontab, `at` jobs, disk images and IPC
-    /// objects, then the post-clean check), and keeps a slot whose clean failed out of
-    /// the pool; today the slot goes back as it is.
-    pub fn release(self) {
-        drop(self);
+    /// Cleans the slot and gives it back ([`clean::clean`]: free again if the clean
+    /// passed, quarantined if not), once its lease has ended and the clean of its lease
+    /// directory has run, whether or not that removed everything (the shared sweep
+    /// removes what of the uid is left there, and the lease reports the failed clean).
+    pub async fn release(mut self) {
+        let Some(back) = self.back() else {
+            return;
+        };
+        if let Err(why) = tokio::task::spawn_blocking(move || back.give()).await {
+            tracing::error!(%why, "the clean of a slot did not finish: it is quarantined");
+        }
+    }
+
+    /// What giving the slot back needs, once.
+    fn back(&mut self) -> Option<Back> {
+        let permit = self.permit.take()?;
+        Some(Back {
+            shared: Arc::clone(&self.shared),
+            index: self.index,
+            permit: Some(permit),
+        })
     }
 }
 
 impl Drop for Slot {
+    /// A slot dropped without [`Slot::release`] (the daemon dropped the run) is cleaned
+    /// and given back on a thread of its own.
     fn drop(&mut self) {
-        let permit = self.permit.take();
-        if self.healthy.load(Ordering::SeqCst) {
-            lock(&self.free).insert(self.index);
-            drop(permit);
-        } else {
-            let uid = self.ready().user.uid;
-            tracing::error!(
-                uid,
-                "processes of the slot survived: the slot stays out of the pool"
-            );
-            if let Some(permit) = permit {
-                permit.forget();
-            }
+        let Some(back) = self.back() else {
+            return;
+        };
+        let spawned = std::thread::Builder::new()
+            .name("kbf-slot-clean".to_owned())
+            .spawn(move || back.give());
+        if let Err(why) = spawned {
+            tracing::error!(%why, "no thread to clean a dropped slot: it is quarantined");
         }
     }
 }
@@ -222,7 +384,6 @@ impl Drop for Slot {
 pub struct UidWatch {
     uid: u32,
     record: PathBuf,
-    healthy: Arc<AtomicBool>,
     armed: bool,
 }
 
@@ -252,8 +413,8 @@ impl UidWatch {
     /// leader, `child`: once nothing of the uid is left the leader has exited too, or
     /// it is `launchctl`, which exits once its child has; one still there after `wait`
     /// is SIGKILLed by pid, safe because it is this process's unreaped child. Removes
-    /// the run record. Survivors fail the lease, keep their record and keep the slot
-    /// out of the pool.
+    /// the run record. Survivors fail the lease and keep their record; the slot's clean
+    /// kills again, and quarantines the slot if they still survive.
     ///
     /// # Errors
     /// Processes of the uid survived, or the leader could not be reaped.
@@ -263,11 +424,11 @@ impl UidWatch {
         let ended = ended
             .map_err(|e| e.to_string())
             .and_then(|e| e.map_err(|e| e.to_string()));
+        // Ended or not, the drop does not kill again: the slot's clean does.
+        self.armed = false;
         if let Err(why) = ended {
-            self.healthy.store(false, Ordering::SeqCst);
             return Err(RuntimeError::Failed(why));
         }
-        self.armed = false;
         let _ = std::fs::remove_file(&self.record);
         if tokio::time::timeout(wait, child.wait()).await.is_err() {
             tracing::warn!(
@@ -290,11 +451,8 @@ impl Drop for UidWatch {
             return;
         }
         let ended = uid::end(self.uid, kbf_daemon::keeper::UID_WITHIN);
-        match &ended {
-            Ok(()) => {
-                let _ = std::fs::remove_file(&self.record);
-            }
-            Err(_) => self.healthy.store(false, Ordering::SeqCst),
+        if ended.is_ok() {
+            let _ = std::fs::remove_file(&self.record);
         }
         tracing::warn!(
             uid = self.uid,
@@ -436,10 +594,9 @@ fn lock(free: &Mutex<BTreeSet<usize>>) -> std::sync::MutexGuard<'_, BTreeSet<usi
 mod tests {
     use super::*;
 
-    /// Slots over `count` users that no test resolves or kills: the slot bookkeeping
-    /// alone (which slot is free, how many permits), with no user database behind it.
-    fn bookkeeping(count: usize) -> Slots {
-        let ready = (0..count)
+    /// The pool users of [`bookkeeping`]: no user database behind them.
+    fn ready(count: usize) -> Vec<Ready> {
+        (0..count)
             .map(|i| Ready {
                 user: SlotUser {
                     name: format!("kbf-unit-slot-{i}"),
@@ -450,33 +607,115 @@ mod tests {
                 folders: PathBuf::from("/nonexistent"),
                 rules: String::new(),
             })
-            .collect();
-        Slots {
-            ready: Arc::new(ready),
-            free: Arc::new(Mutex::new((0..count).collect())),
-            permits: Arc::new(Semaphore::new(count)),
-            program: PathBuf::from("/nonexistent"),
+            .collect()
+    }
+
+    /// Slots over `count` users that no test resolves or kills, cleaned by a stand-in
+    /// that answers `outcomes` in turn (then `Clean`) and counts its calls: the slot
+    /// bookkeeping alone (which slot is free, how many permits, how many reported).
+    fn bookkeeping(count: usize, outcomes: Vec<Outcome>) -> (Slots, Arc<AtomicUsize>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let queue = Mutex::new(std::collections::VecDeque::from(outcomes));
+        let counted = Arc::clone(&calls);
+        let cleaner: Cleaner = Arc::new(move |_: &Ready| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            let next = queue
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .pop_front();
+            next.unwrap_or(Outcome::Clean)
+        });
+        let slots = Slots::with(ready(count), cleaner, PathBuf::from("/nonexistent"));
+        (slots, calls)
+    }
+
+    fn quarantined() -> Outcome {
+        Outcome::Quarantined {
+            why: "test".to_owned(),
         }
     }
 
-    /// Catches a slot whose processes survived going back to the pool anyway (the next
-    /// lease would run beside them), and one given back healthy that does not: a
-    /// healthy slot is taken again at once, the survivor's is never.
+    /// Catches a slot that goes back to the pool uncleaned or although its clean
+    /// quarantined it (the next lease would find the last one's state, or run beside
+    /// its survivors), a quarantine the node does not report, and a cleaned slot that
+    /// does not go back: a clean slot (or one whose user was made again) is taken again
+    /// at once; a quarantined one never, and is reported one fewer.
     #[tokio::test]
-    async fn a_slot_whose_kill_failed_stays_out_of_the_pool() {
-        let slots = bookkeeping(1);
-        let slot = slots.take().await.expect("the only slot");
-        assert_eq!(slot.ready().user.uid, 700);
-        slot.release();
+    async fn a_quarantined_slot_stays_out_of_the_pool_and_is_not_reported() {
+        let recreated = Outcome::Recreated {
+            why: "test".to_owned(),
+        };
+        let (slots, calls) = bookkeeping(1, vec![Outcome::Clean, recreated, quarantined()]);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the start cleans each slot"
+        );
+        assert_eq!(slots.count(), 1);
+        for (cleans, _) in [(2, "recreated"), (3, "quarantined")] {
+            let slot = tokio::time::timeout(Duration::from_secs(5), slots.take())
+                .await
+                .expect("a cleaned slot goes back")
+                .expect("taken");
+            assert_eq!(slot.ready().user.uid, 700);
+            slot.release().await;
+            assert_eq!(calls.load(Ordering::SeqCst), cleans, "release cleans");
+        }
+        assert_eq!(slots.count(), 0, "a quarantined slot is reported");
+        let again = tokio::time::timeout(Duration::from_millis(300), slots.take()).await;
+        assert!(again.is_err(), "a quarantined slot was taken again");
+        assert!(
+            lock(&slots.shared.free).is_empty(),
+            "it is back in the free set"
+        );
+    }
+
+    /// Catches a slot whose clean at the start failed taken by a lease, and one dropped
+    /// mid-run (the daemon dropped the run) that goes back uncleaned or never: of two
+    /// slots, the quarantined one is never handed out, and the other, dropped, is
+    /// cleaned and free again.
+    #[tokio::test]
+    async fn a_slot_quarantined_at_the_start_or_dropped_is_handled() {
+        let (slots, calls) = bookkeeping(2, vec![quarantined()]);
+        assert_eq!(slots.count(), 1);
+        let slot = slots.take().await.expect("the other slot");
+        assert_eq!(slot.ready().user.uid, 701);
+        assert!(format!("{slot:?}").contains("kbf-unit-slot-1"), "{slot:?}");
+        assert!(format!("{slots:?}").contains("quarantined: 1"), "{slots:?}");
+        drop(slot);
         let slot = tokio::time::timeout(Duration::from_secs(5), slots.take())
             .await
-            .expect("a healthy slot goes back")
+            .expect("a dropped slot goes back once cleaned")
             .expect("taken");
-        slot.healthy.store(false, Ordering::SeqCst);
-        slot.release();
+        assert_eq!(slot.ready().user.uid, 701);
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        slot.release().await;
+    }
+
+    /// Catches a slot whose clean did not finish (the clean panicked, or its thread or
+    /// task never ran) left counted as able to run a lease, with a permit that finds
+    /// no free slot (`take` would fail with "none free"): it is counted quarantined,
+    /// and no lease waits on it.
+    #[tokio::test]
+    async fn a_slot_whose_clean_did_not_finish_is_quarantined() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&calls);
+        let cleaner: Cleaner = Arc::new(move |_: &Ready| {
+            if counted.fetch_add(1, Ordering::SeqCst) > 0 {
+                panic!("the clean of the hand-back panics");
+            }
+            Outcome::Clean
+        });
+        let slots = Slots::with(ready(1), cleaner, PathBuf::from("/nonexistent"));
+        slots.take().await.expect("taken").release().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            slots.count(),
+            0,
+            "a slot whose clean did not finish is reported"
+        );
         let again = tokio::time::timeout(Duration::from_millis(300), slots.take()).await;
-        assert!(again.is_err(), "a slot whose kill failed was taken again");
-        assert!(lock(&slots.free).is_empty(), "it is back in the free set");
+        assert!(again.is_err(), "a permit was left for it: {again:?}");
     }
 
     /// Catches a slot lease handed a simulator (it would be made in root's device set,
@@ -484,12 +723,12 @@ mod tests {
     /// for none.
     #[tokio::test]
     async fn a_slot_lease_is_refused_a_simulator() {
-        let slots = bookkeeping(1);
+        let (slots, _) = bookkeeping(1, Vec::new());
         let runner = crate::slots::Runner::Slot(slots.take().await.expect("slot"));
         let refused = runner.allows_simulator(true).expect_err("a simulator");
         assert!(refused.to_string().contains("pool user"), "{refused}");
         assert!(runner.allows_simulator(false).is_ok());
-        runner.release();
+        runner.release().await;
     }
 
     /// Catches a memory watch that measures nothing (a lease past its memory limit
@@ -500,7 +739,6 @@ mod tests {
         let watch = UidWatch {
             uid: rustix::process::geteuid().as_raw(),
             record: PathBuf::from("/nonexistent"),
-            healthy: Arc::new(AtomicBool::new(true)),
             armed: false,
         };
         let used = watch.measure().await.expect("measured");

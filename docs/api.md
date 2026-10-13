@@ -268,7 +268,8 @@ tree of N files costs N Writes, each its own segment. Over a window, with `rate(
 - `kbf_bytestream_write_present_total` against the requests says how many uploads
   were of blobs already held.
 
-The daemon logs the other side, per lease: its phase times and what it uploaded
+The daemon logs the other side, per lease: its phase times (`lease phases:`) and,
+from its transfer engine, what it read and uploaded (`transfers:`), joined on `lease=`
 ([daemon.md](design/daemon.md#where-a-leases-time-went)).
 
 ## `GET /v1/invocations/{id}` and below

@@ -8,7 +8,8 @@
 //! killed and reported when no heartbeat has been acknowledged for the fence time T,
 //! measured on a clock that counts the time the machine was suspended.
 //! Execution goes through the [`Runtime`] trait. A runtime reads an action and its inputs from the front's CAS and writes the
-//! outputs back through a [`Cas`]; [`CasClient`] is the one that talks to a front.
+//! outputs back through a [`Cas`]; `kbf_transfer::Transfers`, the process's transfer engine, is the one that talks to a
+//! front.
 //!
 //! - [`config`]: command-line flags and TLS files.
 //! - [`connect`]: which server to try next, and the wait between rounds of attempts;
@@ -18,9 +19,9 @@
 //! - [`driver_watch`]: the driver's report channel, one part per source that feeds it.
 //! - [`runtime`]: the runtime trait and [`FakeRuntime`], which runs nothing.
 //! - [`runtimes`]: [`Runtimes`], the daemon's runtimes, at most one per lease kind.
-//! - [`phases`]: where each lease's time went and what its CAS calls moved, logged
-//!   when it ends (`lease phases:`) and sent as [`Event::LeaseEnded`].
-//! - [`cas`]: the [`Cas`] trait and the front's client.
+//! - [`phases`]: where each lease's time went, logged when it ends (`lease phases:`)
+//!   and sent as [`Event::LeaseEnded`].
+//! - [`cas`]: the [`Cas`] trait (from `kbf-transfer`).
 //! - `cache` (Linux): the node's input cache, which the container driver links input
 //!   files from (`docs/design/worker-cache.md`).
 //! - [`clock`]: the suspend-counting [`Clock`] the fence reads (issue #78).
@@ -69,7 +70,7 @@ mod window;
 /// checkout (issue #170). `build.rs` embeds the commit.
 pub const DAEMON_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "+", env!("KBF_BUILD_COMMIT"));
 
-pub use cas::{Cas, CasClient, CasError};
+pub use cas::{Cas, CasError};
 pub use clock::{Clock, Moment, SystemClock};
 pub use config::{Args, DaemonConfig, FENCE_AFTER, RECHECK_EVERY, TlsFiles};
 pub use contact::{Acked, Contact};

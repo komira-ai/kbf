@@ -53,6 +53,12 @@ impl MemoryCas {
 }
 
 impl Cas for MemoryCas {
+    type Lease = std::sync::Arc<Self>;
+
+    fn lease(self: &std::sync::Arc<Self>, _: &kbf_types::LeaseId) -> std::sync::Arc<Self> {
+        std::sync::Arc::clone(self)
+    }
+
     async fn get(&self, digest: &Digest) -> Result<Vec<u8>, CasError> {
         self.blob(digest)
             .ok_or_else(|| CasError::Missing(label(digest)))

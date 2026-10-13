@@ -1,0 +1,162 @@
+//! The process's transfer engine (`kbf_transfer::Transfers`) and its `--transfer-*`
+//! flags (`docs/design/worker-cache.md#45-knobs-flags-not-environment-variables`).
+//!
+//! One engine per daemon: every runtime (container, native, whole-machine) reads and
+//! writes blobs through the same one, so the in-flight limit and the byte budget hold
+//! for the whole process, over one HTTP/2 connection to `--cas`.
+
+use kbf_transfer::{DEFAULT_IN_FLIGHT, TransferConfig, Transfers};
+use tonic::transport::Endpoint;
+
+use super::{Cli, Error};
+use kbf_daemon::DaemonConfig;
+
+/// The `--transfer-*` flags. Each default is the engine's (`TransferConfig::default`);
+/// the farm's deploy config sets measured values.
+#[derive(Clone, Debug, clap::Args)]
+pub(crate) struct TransferArgs {
+    /// The most blob requests in flight at once, for the whole daemon: ByteStream reads
+    /// and writes and FindMissing calls, over its one connection to `--cas`.
+    #[arg(long, default_value_t = DEFAULT_IN_FLIGHT as u64, value_parser = clap::value_parser!(u64).range(1..))]
+    pub transfer_in_flight: u64,
+    /// The most bytes of blobs read into memory in flight at once, for the whole
+    /// daemon. A blob larger than this is fetched alone.
+    #[arg(long, value_name = "BYTES", default_value_t = 256 << 20, value_parser = clap::value_parser!(u64).range(1..))]
+    pub transfer_bytes_in_flight: u64,
+    /// The largest input file fetched through memory, where every lease asking for it
+    /// at once shares one fetch; a larger one is streamed into its file.
+    #[arg(long, value_name = "BYTES", default_value_t = 1 << 20)]
+    pub transfer_memory_blob_bytes: u64,
+    /// The most bytes one ByteStream write message carries.
+    #[arg(long, value_name = "BYTES", default_value_t = 1 << 20, value_parser = clap::value_parser!(u64).range(1..))]
+    pub transfer_chunk_bytes: u64,
+    /// The most digests one FindMissing call asks about.
+    #[arg(long, default_value_t = 1000, value_parser = clap::value_parser!(u64).range(1..))]
+    pub transfer_find_missing_chunk: u64,
+    /// The HTTP/2 window of each stream to `--cas`; the connection's is eight times it.
+    #[arg(long, value_name = "BYTES", default_value_t = 8 << 20, value_parser = clap::value_parser!(u32).range(65_535..=(1 << 28)))]
+    pub transfer_stream_window_bytes: u32,
+    /// How many times a blob request is retried after UNAVAILABLE or a broken
+    /// connection.
+    #[arg(long, default_value_t = 3)]
+    pub transfer_retries: u32,
+}
+
+impl TransferArgs {
+    /// The engine's configuration.
+    pub(crate) fn config(&self) -> TransferConfig {
+        let size = |n: u64| usize::try_from(n).unwrap_or(usize::MAX);
+        TransferConfig {
+            in_flight: size(self.transfer_in_flight),
+            bytes_in_flight: size(self.transfer_bytes_in_flight),
+            memory_blob_bytes: self.transfer_memory_blob_bytes,
+            chunk_bytes: size(self.transfer_chunk_bytes),
+            find_missing_chunk: size(self.transfer_find_missing_chunk),
+            stream_window_bytes: self.transfer_stream_window_bytes,
+            retries: self.transfer_retries,
+        }
+    }
+}
+
+/// The engine over the blob service `--cas` names, over mutual TLS with the daemon's
+/// own TLS files. Connects on first use.
+pub(crate) fn engine(cli: &Cli) -> Result<Transfers, Error> {
+    let url = cli
+        .cas
+        .clone()
+        .ok_or("--cas is required by the container and native drivers")?;
+    if !url.starts_with("https://") {
+        return Err(format!(
+            "--cas {url:?} must be an https:// URL: the server's worker listener, which \
+             serves blobs over mutual TLS only"
+        )
+        .into());
+    }
+    let endpoint =
+        Endpoint::from_shared(url)?.tls_config(DaemonConfig::from_args(&cli.daemon).tls.load()?)?;
+    Ok(Transfers::new(endpoint, cli.transfer.config()))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use clap::Parser as _;
+    use kbf_transfer::TransferConfig;
+
+    use super::super::{Cli, Node};
+
+    fn parse(extra: &[&str]) -> Result<Cli, clap::Error> {
+        let base = [
+            "kbf-daemon",
+            "--server=https://front:7070",
+            "--ca-cert=ca.pem",
+            "--cert=c.pem",
+            "--key=c.key",
+            "--node-id=n1",
+            "--driver=native",
+        ];
+        Cli::try_parse_from(base.iter().chain(extra))
+    }
+
+    /// Catches a `--transfer-*` flag that does not reach the engine, or one whose
+    /// default is not the engine's own (a deploy that sets none would run other limits
+    /// than the design's). Each value given differs from its default.
+    #[test]
+    fn transfer_flags_reach_the_configuration() {
+        let defaults = parse(&[]).expect("flags").transfer.config();
+        assert_eq!(defaults, TransferConfig::default());
+        let cli = parse(&[
+            "--transfer-in-flight=7",
+            "--transfer-bytes-in-flight=1000",
+            "--transfer-memory-blob-bytes=2000",
+            "--transfer-chunk-bytes=3000",
+            "--transfer-find-missing-chunk=40",
+            "--transfer-stream-window-bytes=100000",
+            "--transfer-retries=5",
+        ])
+        .expect("flags");
+        let expected = TransferConfig {
+            in_flight: 7,
+            bytes_in_flight: 1000,
+            memory_blob_bytes: 2000,
+            chunk_bytes: 3000,
+            find_missing_chunk: 40,
+            stream_window_bytes: 100_000,
+            retries: 5,
+        };
+        assert_eq!(cli.transfer.config(), expected);
+        for refused in [
+            "--transfer-in-flight=0",
+            "--transfer-chunk-bytes=0",
+            "--transfer-stream-window-bytes=100",
+        ] {
+            assert!(parse(&[refused]).is_err(), "{refused} accepted");
+        }
+    }
+
+    /// Catches a transfer engine per runtime (two drivers would run two connections and
+    /// two in-flight limits): the second runtime gets the engine the first made.
+    #[tokio::test]
+    async fn every_runtime_shares_one_engine() {
+        // The daemon's TLS files, which the engine reads once.
+        let dir = super::super::tests::scratch("transfer-shared");
+        super::super::tests::tls_files(&dir);
+        let at = |name: &str| format!("{}", dir.join(name).display());
+        let cli = Cli::try_parse_from([
+            "kbf-daemon".to_owned(),
+            "--server=https://front:7070".to_owned(),
+            format!("--ca-cert={}", at("ca.pem")),
+            format!("--cert={}", at("node.pem")),
+            format!("--key={}", at("node.key")),
+            "--node-id=n1".to_owned(),
+            "--driver=native".to_owned(),
+            "--cas=https://127.0.0.1:1".to_owned(),
+        ])
+        .expect("flags");
+        let mut node = Node::default();
+        let first = node.transfers(&cli).expect("engine");
+        let second = node.transfers(&cli).expect("engine");
+        assert!(Arc::ptr_eq(&first, &second));
+    }
+}

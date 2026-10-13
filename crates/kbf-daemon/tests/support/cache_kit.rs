@@ -90,6 +90,12 @@ impl CountingCas {
 }
 
 impl Cas for CountingCas {
+    type Lease = std::sync::Arc<Self>;
+
+    fn lease(self: &std::sync::Arc<Self>, _: &kbf_types::LeaseId) -> std::sync::Arc<Self> {
+        std::sync::Arc::clone(self)
+    }
+
     async fn get(&self, digest: &Digest) -> Result<Vec<u8>, CasError> {
         *lock(&self.reads).entry(label(digest)).or_default() += 1;
         let file = !lock(&self.directories).contains(&label(digest));

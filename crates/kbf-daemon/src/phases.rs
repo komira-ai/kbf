@@ -1,118 +1,25 @@
 //! Where a lease's time went, logged in one INFO line when it ends (`lease phases:`)
 //! and sent to an observer as [`crate::Event::LeaseEnded`]: how long the lease ran,
 //! how long its driver spent fetching inputs, running the action and uploading
-//! outputs, and what the daemon's CAS client moved for it.
+//! outputs, and the output files and directories its result names.
 //!
 //! The phase times are the driver's own stamps in the result's
 //! `ExecutedActionMetadata` (input fetch, execution, output upload), so they are known
-//! only for a lease that produced a result; the line says `-` otherwise. What moved
-//! is counted by [`crate::CasClient`] into the [`Transfers`] of the lease whose task
-//! made the call: the lease manager runs each lease inside [`scoped`], and a call made
-//! outside any lease (a test's own upload) counts nowhere.
+//! only for a lease that produced a result; the line says `-` otherwise. The upload
+//! phase includes waiting for the transfer engine's shared request limit.
+//!
+//! What the lease moved is not on this line: the transfer engine counts it per lease
+//! ([`kbf_transfer::TransferStats`]) and logs it in its own INFO line, `transfers:`,
+//! with the same `lease=` field, when the lease's last handle on the engine goes (after
+//! the lease ends, if a read it started is still finishing for another lease). Join the
+//! two lines on `lease=`.
 
 use std::fmt;
-use std::future::Future;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
 use kbf_proto::reapi::ActionResult;
 use kbf_types::LeaseId;
 use prost_types::Timestamp;
-
-tokio::task_local! {
-    /// The transfers of the lease this task runs.
-    static LEASE: Arc<Transfers>;
-}
-
-/// Runs `lease`, counting the CAS calls it makes into `transfers`.
-pub fn scoped<F: Future>(transfers: Arc<Transfers>, lease: F) -> impl Future<Output = F::Output> {
-    LEASE.scope(transfers, lease)
-}
-
-/// What one lease moved through the daemon's CAS client, counted as it goes.
-#[derive(Debug, Default)]
-pub struct Transfers {
-    blobs_read: AtomicU64,
-    bytes_read: AtomicU64,
-    blobs_uploaded: AtomicU64,
-    bytes_uploaded: AtomicU64,
-    uploads_in_flight: AtomicU64,
-    most_uploads_in_flight: AtomicU64,
-}
-
-impl Transfers {
-    /// The counts so far.
-    #[must_use]
-    pub fn counts(&self) -> TransferCounts {
-        let load = |n: &AtomicU64| n.load(Ordering::Relaxed);
-        TransferCounts {
-            blobs_read: load(&self.blobs_read),
-            bytes_read: load(&self.bytes_read),
-            blobs_uploaded: load(&self.blobs_uploaded),
-            bytes_uploaded: load(&self.bytes_uploaded),
-            most_uploads_in_flight: load(&self.most_uploads_in_flight),
-        }
-    }
-}
-
-/// Counts a blob of `bytes` read for the lease this task runs, if any.
-pub fn read(bytes: u64) {
-    let _ = LEASE.try_with(|t| {
-        t.blobs_read.fetch_add(1, Ordering::Relaxed);
-        t.bytes_read.fetch_add(bytes, Ordering::Relaxed);
-    });
-}
-
-/// Starts counting one upload for the lease this task runs, if any: it is in flight
-/// until the returned guard is dropped, and counted as uploaded only through
-/// [`Upload::done`].
-pub fn upload() -> Upload {
-    let transfers = LEASE.try_with(Arc::clone).ok();
-    if let Some(t) = &transfers {
-        let now = t.uploads_in_flight.fetch_add(1, Ordering::Relaxed) + 1;
-        t.most_uploads_in_flight.fetch_max(now, Ordering::Relaxed);
-    }
-    Upload(transfers)
-}
-
-/// One upload in flight ([`upload`]).
-#[derive(Debug)]
-pub struct Upload(Option<Arc<Transfers>>);
-
-impl Upload {
-    /// The blob, `bytes` long, is stored.
-    pub fn done(self, bytes: u64) {
-        if let Some(t) = &self.0 {
-            t.blobs_uploaded.fetch_add(1, Ordering::Relaxed);
-            t.bytes_uploaded.fetch_add(bytes, Ordering::Relaxed);
-        }
-    }
-}
-
-impl Drop for Upload {
-    fn drop(&mut self) {
-        if let Some(t) = &self.0 {
-            t.uploads_in_flight.fetch_sub(1, Ordering::Relaxed);
-        }
-    }
-}
-
-/// [`Transfers`] at one moment.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct TransferCounts {
-    /// Blobs read (the Action, the Command, input Directories and files).
-    pub blobs_read: u64,
-    /// Their bytes.
-    pub bytes_read: u64,
-    /// Blobs stored (output files, Directories, Trees, stdout and stderr), each one
-    /// ByteStream Write.
-    pub blobs_uploaded: u64,
-    /// Their bytes.
-    pub bytes_uploaded: u64,
-    /// The most uploads in flight at once.
-    pub most_uploads_in_flight: u64,
-}
 
 /// Where one lease's time went ([`crate::Event::LeaseEnded`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -131,25 +38,21 @@ pub struct LeasePhases {
     pub run_ms: Option<u64>,
     /// The driver's output upload, if the result says.
     pub outputs_ms: Option<u64>,
-    /// Output files the result names (files inside an output directory are counted
-    /// in `transfers.blobs_uploaded`, not here).
+    /// Output files the result names (not the files inside an output directory).
     pub output_files: u64,
     /// Output directories the result names.
     pub output_dirs: u64,
-    /// What the daemon's CAS client moved for the lease.
-    pub transfers: TransferCounts,
 }
 
 impl LeasePhases {
     /// The phases of lease `lease`, which ran on `driver` for `elapsed` and ended with
-    /// `result` (`None` for a run that produced none), having moved `transfers`.
+    /// `result` (`None` for a run that produced none).
     #[must_use]
     pub fn new(
         lease: LeaseId,
         driver: &'static str,
         elapsed: Duration,
         result: Option<&ActionResult>,
-        transfers: TransferCounts,
     ) -> Self {
         let metadata = result.and_then(|r| r.execution_metadata.as_ref());
         let [inputs_ms, run_ms, outputs_ms] = metadata.map_or([None; 3], |m| {
@@ -178,7 +81,6 @@ impl LeasePhases {
             outputs_ms,
             output_files: result.map_or(0, |r| r.output_files.len() as u64),
             output_dirs: result.map_or(0, |r| r.output_directories.len() as u64),
-            transfers,
         }
     }
 }
@@ -198,12 +100,10 @@ fn millis(d: Duration) -> u64 {
 impl fmt::Display for LeasePhases {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let phase = |p: Option<u64>| p.map_or_else(|| "-".to_owned(), |ms| ms.to_string());
-        let t = &self.transfers;
         write!(
             f,
             "lease={} driver={} ok={} lease_ms={} inputs_ms={} run_ms={} outputs_ms={} \
-             output_files={} output_dirs={} blobs_read={} bytes_read={} blobs_uploaded={} \
-             bytes_uploaded={} most_uploads_in_flight={}",
+             output_files={} output_dirs={}",
             self.lease,
             self.driver,
             self.ok,
@@ -213,11 +113,6 @@ impl fmt::Display for LeasePhases {
             phase(self.outputs_ms),
             self.output_files,
             self.output_dirs,
-            t.blobs_read,
-            t.bytes_read,
-            t.blobs_uploaded,
-            t.bytes_uploaded,
-            t.most_uploads_in_flight,
         )
     }
 }

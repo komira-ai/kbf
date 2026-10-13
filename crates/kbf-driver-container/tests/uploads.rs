@@ -1,5 +1,5 @@
 //! How the container driver's `collect` stores an output tree: many blobs at once,
-//! never more than `UPLOADS_IN_FLIGHT`, each distinct digest once, all of them
+//! never more than the CAS's `in_flight`, each distinct digest once, all of them
 //! stored before it returns, and no result when one cannot be stored.
 
 use std::collections::HashMap;
@@ -9,7 +9,6 @@ use std::sync::{Mutex, PoisonError};
 use futures::StreamExt as _;
 use kbf_daemon::cas::{Cas, CasError, Chunks, digest_of, label};
 use kbf_driver_container::tree::{OutputLimits, collect};
-use kbf_outputs::UPLOADS_IN_FLIGHT;
 use kbf_proto::reapi::{ActionResult, Digest, Tree};
 use prost::Message;
 
@@ -56,7 +55,17 @@ impl CountingCas {
     }
 }
 
+/// The in-flight limit [`CountingCas`] answers: not the engine's default, so a walk that
+/// kept a bound of its own would show.
+const UPLOADS_IN_FLIGHT: usize = 16;
+
 impl Cas for CountingCas {
+    type Lease = std::sync::Arc<Self>;
+
+    fn lease(self: &std::sync::Arc<Self>, _: &kbf_types::LeaseId) -> std::sync::Arc<Self> {
+        std::sync::Arc::clone(self)
+    }
+
     async fn get(&self, digest: &Digest) -> Result<Vec<u8>, CasError> {
         self.blob(digest)
             .ok_or_else(|| CasError::Missing(label(digest)))
@@ -82,6 +91,10 @@ impl Cas for CountingCas {
         }
         self.keep(&digest, bytes).await;
         Ok(digest)
+    }
+
+    fn in_flight(&self) -> usize {
+        UPLOADS_IN_FLIGHT
     }
 }
 
@@ -117,8 +130,8 @@ async fn collect_out(cas: &CountingCas, upper: &std::path::Path) -> (ActionResul
 /// Catches an output tree stored one blob at a time (on the pilot a tree of
 /// thousands of small files took minutes per lease, the CAS idle), stores with no
 /// bound, and `collect` returning before every blob the result names is stored (the
-/// action cache refuses such a result). Mutant seen red: `UPLOADS_IN_FLIGHT` passed
-/// as 1.
+/// action cache refuses such a result). Mutants seen red: the CAS's `in_flight`
+/// passed as 1; no bound (`usize::MAX`).
 #[tokio::test]
 async fn many_blobs_are_stored_at_once_within_the_bound() {
     let upper = scratch("in-flight");

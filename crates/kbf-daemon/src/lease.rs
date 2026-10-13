@@ -31,7 +31,7 @@ use kbf_types::{LeaseId, LostWhy, Resources};
 use prost::Message;
 use tokio::sync::mpsc;
 
-use crate::phases::{self, LeasePhases, Transfers};
+use crate::phases::LeasePhases;
 use crate::runtime::{RuntimeError, Work};
 use crate::runtimes::{AnyRuntime, Runtimes};
 
@@ -101,16 +101,10 @@ impl Leases {
         let done = self.done.clone();
         let run = Arc::clone(&runtime);
         tokio::spawn(async move {
-            let transfers = Arc::new(Transfers::default());
             let started = Instant::now();
-            let outcome = phases::scoped(Arc::clone(&transfers), run.run(work)).await;
-            let phases = LeasePhases::new(
-                id,
-                run.driver(),
-                started.elapsed(),
-                outcome.as_ref().ok(),
-                transfers.counts(),
-            );
+            let outcome = run.run(work).await;
+            let phases =
+                LeasePhases::new(id, run.driver(), started.elapsed(), outcome.as_ref().ok());
             // The receiver lives as long as the daemon.
             let _ = done.send((id, outcome, phases));
         });

@@ -24,9 +24,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use futures::{StreamExt as _, stream};
 use rustix::fs::{Timespec, Timestamps};
-use tokio::sync::Semaphore;
 
-use super::fill::{Budget, Fetch, InputCounts, InputStats, Source, blocking};
+use super::fill::{Fetch, InputCounts, InputStats, Source, blocking};
 use super::layout::{FIXED_MTIME, Key};
 use super::{Cache, LinkMode, bump};
 use crate::cas::{CasError, label};
@@ -43,8 +42,7 @@ struct Names {
 }
 
 /// Writes every copy of each blob in `files` through `cache`, at most
-/// [`Cache::link_concurrency`] keys at once and `bytes` of fetched blobs in memory, as
-/// the module docs say. A name under one of `private` (absolute paths) gets a private
+/// [`Cache::link_concurrency`] keys at once, as the module docs say. A name under one of `private` (absolute paths) gets a private
 /// copy. The keys are pinned until it returns. After the first error no key is
 /// started, and those started are waited for.
 pub(crate) async fn write_files(
@@ -52,7 +50,6 @@ pub(crate) async fn write_files(
     cache: &Cache,
     files: Vec<Copies>,
     private: &[PathBuf],
-    bytes: usize,
 ) -> Result<InputStats, TreeError> {
     let counts = InputCounts::default();
     let mut blobs = Vec::new();
@@ -60,13 +57,8 @@ pub(crate) async fn write_files(
         blobs.push(plan(blob, private, &counts)?);
     }
     let _pins = cache.pin(blobs.iter().flatten().map(|n| n.key).collect());
-    let permits = Semaphore::new(bytes);
-    let budget = Budget {
-        permits: &permits,
-        bytes,
-    };
     let failed = AtomicBool::new(false);
-    let (budget, failed, counts_ref) = (&budget, &failed, &counts);
+    let (failed, counts_ref) = (&failed, &counts);
     // A blob's two keys one after the other: the second is then a local copy of the
     // first, not a second fetch.
     let mut placed = stream::iter(blobs)
@@ -75,7 +67,7 @@ pub(crate) async fn write_files(
                 if failed.load(Ordering::SeqCst) {
                     return Ok(());
                 }
-                let placed = place(cas, cache, names, budget, counts_ref).await;
+                let placed = place(cas, cache, names, counts_ref).await;
                 if placed.is_err() {
                     failed.store(true, Ordering::SeqCst);
                     return placed;
@@ -142,14 +134,13 @@ async fn place(
     cas: &dyn Fetch,
     cache: &Cache,
     names: Names,
-    budget: &Budget<'_>,
     counts: &InputCounts,
 ) -> Result<(), TreeError> {
     let names = Arc::new(names);
     let mut stale = false;
     loop {
         let got = cache
-            .get(cas, names.key, stale, budget, counts)
+            .get(cas, names.key, stale, counts)
             .await
             .map_err(TreeError::Cas)?;
         let source = got.source;

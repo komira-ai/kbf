@@ -10,7 +10,6 @@ use futures::future::Shared;
 use futures::{FutureExt as _, StreamExt as _};
 use kbf_daemon::cas::{Cas, CasError, Chunks, digest_of, label};
 use kbf_driver_container::tree::{OutputLimits, collect};
-use kbf_outputs::UPLOADS_IN_FLIGHT;
 use kbf_proto::reapi::{ActionResult, Digest};
 
 /// Blobs in memory. Every store waits on `gate`, counted in `started` once it waits.
@@ -32,7 +31,17 @@ impl GatedCas {
     }
 }
 
+/// The in-flight limit [`GatedCas`] answers: not the engine's default, so a walk that
+/// kept a bound of its own would show.
+const UPLOADS_IN_FLIGHT: usize = 16;
+
 impl Cas for GatedCas {
+    type Lease = std::sync::Arc<Self>;
+
+    fn lease(self: &std::sync::Arc<Self>, _: &kbf_types::LeaseId) -> std::sync::Arc<Self> {
+        std::sync::Arc::clone(self)
+    }
+
     async fn get(&self, digest: &Digest) -> Result<Vec<u8>, CasError> {
         Err(CasError::Missing(label(digest)))
     }
@@ -48,6 +57,10 @@ impl Cas for GatedCas {
             chunk.map_err(|e| CasError::Read(label(&digest), e.to_string()))?;
         }
         Ok(digest)
+    }
+
+    fn in_flight(&self) -> usize {
+        UPLOADS_IN_FLIGHT
     }
 }
 

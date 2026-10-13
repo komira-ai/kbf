@@ -15,7 +15,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
-use kbf_daemon::cas::{Cas, CasClient, digest_of};
+use kbf_daemon::cas::{Cas, digest_of};
 use kbf_daemon::usage::usage_of;
 use kbf_daemon::{Daemon, DaemonConfig, LocalRuntime, NodeReport, Runtime, RuntimeError, Work};
 use kbf_front::{Cache, MemoryMetaLog};
@@ -24,6 +24,7 @@ use kbf_proto::google::longrunning::{Operation, operation};
 use kbf_proto::reapi::execution_client::ExecutionClient;
 use kbf_proto::reapi::{ActionResult, Digest, ExecuteRequest, ExecuteResponse};
 use kbf_server::{Listeners, WorkerTls, bind_server};
+use kbf_transfer::{TransferConfig, Transfers};
 use kbf_types::LeaseId;
 use prost::Message;
 use support::memory::Spec;
@@ -38,7 +39,7 @@ type MemoryCache = Cache<MemoryMetaLog, MemoryStore>;
 struct Farm {
     cache: Arc<MemoryCache>,
     reapi: Channel,
-    cas: CasClient,
+    cas: Transfers,
 }
 
 impl Farm {
@@ -49,7 +50,7 @@ impl Farm {
     /// A farm whose daemon runs leases through `wrap` of the local runtime.
     async fn start_with<R: Runtime>(
         name: &str,
-        wrap: impl FnOnce(LocalRuntime<CasClient>) -> R,
+        wrap: impl FnOnce(LocalRuntime<Transfers>) -> R,
     ) -> Self {
         let pki = pki(name);
         let cache = Arc::new(Cache::memory());
@@ -81,7 +82,7 @@ impl Farm {
 
         // The daemon reads and writes blobs over its own connection to the front.
         let runtime = Arc::new(wrap(LocalRuntime::new(
-            Arc::new(CasClient::new(reapi.clone())),
+            Arc::new(Transfers::over(reapi.clone(), TransferConfig::default())),
             scratch(name),
         )));
         let report = NodeReport::new([
@@ -101,7 +102,7 @@ impl Farm {
         tokio::spawn(daemon.run(pending()));
         Self {
             cache,
-            cas: CasClient::new(reapi.clone()),
+            cas: Transfers::over(reapi.clone(), TransferConfig::default()),
             reapi,
         }
     }
@@ -291,7 +292,7 @@ const GIB: u64 = 1 << 30;
 /// driver's memory watch, or the container driver at the lease's cap). Records each
 /// lease's memory booking in `booked`, in the order the leases started.
 struct NeedsMemory {
-    inner: LocalRuntime<CasClient>,
+    inner: LocalRuntime<Transfers>,
     needs: u64,
     booked: Arc<Mutex<Vec<u64>>>,
 }

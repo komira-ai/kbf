@@ -73,9 +73,11 @@
 //! longer denies preference writes, `open` or launchd jobs; its memory, its end, its
 //! keeper and the start-up are each "every process of the slot's uid"
 //! ([`kbf_daemon::uid`]), so the process-tree gaps below do not apply to it. A root
-//! daemon without a pool refuses to start. What the pool does not do yet: clean a
-//! slot between two leases (its home, folders, keychains, crontab), and make
-//! simulators in the slot user's device set (a lease that asks for one fails).
+//! daemon without a pool refuses to start. Between two leases the slot is cleaned
+//! ([`slots::clean`]): its home, folders, keychains, preferences, crontab, `at` jobs,
+//! disk images and IPC objects, checked after, with the user made again or the slot
+//! quarantined when the check fails. What the pool does not do yet: make simulators
+//! in the slot user's device set (a lease that asks for one fails).
 //!
 //! Known gaps, all of them closed only by running each lease as its own user:
 //! - **Processes that leave the tree.** A process that calls `setsid` and is orphaned

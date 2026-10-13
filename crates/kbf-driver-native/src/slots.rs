@@ -1,5 +1,5 @@
 //! Action slots: the lease-user pool a root daemon runs actions as
-//! (docs/design/macos-end-state.md, step 3).
+//! (docs/design/macos-end-state.md, steps 3 and 4).
 //!
 //! On a Mac whose daemon runs as root, every action runs as a pool user of its own,
 //! one per slot: `kbf-pool-0` .. `kbf-pool-<N-1>`, uids `first` .. `first + N - 1`,
@@ -8,7 +8,12 @@
 //! gets, and how its processes are ended, is macOS's part ([`macos`]):
 //!
 //! - a lease takes a free slot, waiting for one while all are busy, and gives it back
-//!   once the lease has ended and the clean of its directory has run;
+//!   once the lease has ended and the clean of its directory has run; the slot is
+//!   cleaned first ([`clean`]: its launchd domain, crontab, `at` jobs, processes, disk
+//!   images, System V IPC objects, home, `/var/folders` entry and files in the shared
+//!   temporary places), the clean is checked, the user is made again if the check
+//!   fails twice, and the slot is quarantined (the node reports one fewer) if that
+//!   fails too;
 //! - its lease directory is the slot user's, and its action is started through
 //!   `launchctl asuser <uid>`, then this binary's `__as-user` mode, which drops to the
 //!   slot's uid and group (no supplementary groups) and executes it: so it runs in
@@ -18,18 +23,20 @@
 //!   and its `/var/folders` entry, and no longer denies `defaults write`, `open` or
 //!   handing launchd a job: what those protected was a uid every lease shared;
 //! - its memory is the sum over the processes whose effective uid is the slot's;
-//! - its end, the keeper's and the start-up's are one rule, every process of the uid
-//!   ([`kbf_daemon::uid::end`]).
+//! - its end and the keeper's are one rule, every process of the uid
+//!   ([`kbf_daemon::uid::end`]); the start cleans every slot before the daemon says
+//!   `Hello`.
 //!
 //! No action runs as root: a pool user below [`MIN_UID`] (root's 0 among them) is
 //! refused here, and a root daemon without a pool refuses to start
 //! ([`check_daemon_user`]). Linux native keeps its process-group tracking
 //! ([`crate::procs`]); a pool there is refused.
 //!
-//! Not yet (step 4 of the design): the clean of a slot between two leases (its home,
-//! its `/var/folders` entry, keychains, crontab and `at` jobs, disk images, IPC
-//! objects): [`macos::Slot::release`] only gives the slot back so far. Nor does the scheduler
-//! book slots: a lease past `N` waits here for a free one.
+//! Not yet: the scheduler does not book slots (a lease past `N` waits here for a free
+//! one); a quarantined slot lowers the runtime's `action_slots` entry, which reaches
+//! the server with the driver's next report (the next Xcode survey, every
+//! `--xcode-recheck-secs`), not at once; and nothing drains and reboots a node with a
+//! quarantined slot (section 1 of the design).
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -39,6 +46,7 @@ use kbf_daemon::RuntimeError;
 use crate::network::{Isolation, Network};
 use crate::record::KeeperFor;
 
+pub mod clean;
 #[cfg(target_os = "macos")]
 pub mod macos;
 
@@ -259,13 +267,13 @@ impl Runner {
         }
     }
 
-    /// Gives a slot back once the lease has ended and the clean of its directory has
-    /// run ([`macos::Slot::release`]).
-    pub fn release(self) {
+    /// Cleans a slot and gives it back once the lease has ended and the clean of its
+    /// directory has run ([`macos::Slot::release`]).
+    pub async fn release(self) {
         match self {
             Self::Daemon => {}
             #[cfg(target_os = "macos")]
-            Self::Slot(slot) => slot.release(),
+            Self::Slot(slot) => slot.release().await,
         }
     }
 }

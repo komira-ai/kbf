@@ -16,7 +16,7 @@ an action runs under. The messages are in [worker-protocol.md](worker-protocol.m
 | Start window | `window` | when this stream's heartbeats were sent, so a `Start` that arrives too late is not run |
 | Lease manager | `lease` | starts work only on `Start`, turns each outcome into one `Result`, fences, kills a cancelled lease |
 | Runtime | `runtime` | the `Runtime` trait every execution driver implements |
-| CAS client | `cas` | reads inputs and writes outputs over the server's ByteStream service, on the worker listener (`--cas`, mutual TLS) |
+| CAS | `cas` | the `Cas` trait (from `kbf-transfer`) runtimes read inputs and write outputs through; the binary's runtimes share one transfer engine (`kbf-transfer`), which speaks ByteStream and FindMissing to the worker listener (`--cas`, mutual TLS) over one connection |
 | Trees | `tree` | writes an input root to disk and reads outputs back |
 | Usage | `usage` | measures a child process's CPU time and peak memory when it is reaped |
 
@@ -576,13 +576,29 @@ When a lease's run ends the daemon logs one INFO line, `lease phases:` and then
 | `lease`, `driver`, `ok` | the lease, the driver it ran on, and whether the run produced a result (an action that exits non-zero does) |
 | `lease_ms` | from the run's start in the daemon to its end |
 | `inputs_ms`, `run_ms`, `outputs_ms` | the driver's own stamps in the result's `ExecutedActionMetadata`: input fetch, execution, output upload; `-` when the run produced no result. What `lease_ms` holds beyond their sum is the driver's work outside them (making and removing the lease's directories, the container's create and chown) |
-| `output_files`, `output_dirs` | the files and directories the result names at its top level (the files inside an output directory are in `blobs_uploaded`) |
-| `blobs_read`, `bytes_read` | blobs the daemon's CAS client read for the lease, and their bytes |
-| `blobs_uploaded`, `bytes_uploaded` | blobs it stored for the lease (each one ByteStream Write: output files, Directories, Trees, stdout, stderr), and their bytes |
-| `most_uploads_in_flight` | the most of those Writes in flight at once |
+| `output_files`, `output_dirs` | the files and directories the result names at its top level (the files inside an output directory are in the `transfers:` line's `written_blobs`) |
 
-The CAS client counts into the lease whose task makes the call. The server's side of
-the same uploads is in `GET /metrics` ([api.md](../api.md#get-metrics)).
+`outputs_ms` includes waiting for the transfer engine's request limit, which every
+lease of the process shares; there is no per-lease busy time.
+
+What the lease moved is the transfer engine's `transfers:` INFO line
+([worker-cache.md](worker-cache.md#4-the-shared-transfer-engine)), which carries the
+same `lease=` field: join the two lines on it. The engine logs it when the lease's
+last handle on the engine goes, which is after the lease ends if a read it started is
+still finishing for another lease. Its counts, per lease:
+
+| Field | What it is |
+|---|---|
+| `read_calls`, `read_bytes` | ByteStream reads the lease started (a retry is a read) and the bytes they received, including bytes that arrive after the lease left while another lease still waits on the read |
+| `merged_reads` | reads served by a fetch another caller had started; they add no bytes |
+| `find_missing_digests`, `outputs_present` | digests the lease asked FindMissing about, and uploads skipped because the server already held the blob (no bytes sent) |
+| `write_calls` | ByteStream writes, every attempt (a retried or failed one too) |
+| `written_blobs`, `written_bytes` | blobs the lease's successful writes stored (output files, Directories, Trees, stdout, stderr), and the bytes they sent. Uploads are not shared: two leases writing the same new blob at once both send it, and both count it |
+| `retries` | requests retried after UNAVAILABLE or a broken connection |
+
+So the sum of `read_bytes` over the leases is what the server served, with nothing
+counted twice. The server's side of the same uploads is in `GET /metrics`
+([api.md](../api.md#get-metrics)).
 
 ## Measuring usage
 
