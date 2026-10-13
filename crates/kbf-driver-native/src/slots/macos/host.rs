@@ -20,8 +20,8 @@
 //!   through `getconf` as the user, never made by root with the wrong owner.
 
 use std::io;
-use std::os::unix::fs::MetadataExt as _;
 use std::os::fd::OwnedFd;
+use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
