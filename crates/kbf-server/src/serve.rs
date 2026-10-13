@@ -6,6 +6,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use axum::serve::ListenerExt;
 use futures::future::Either;
 use kbf_auth::{AuthenticateLayer, Policy};
 use kbf_front::{
@@ -138,10 +139,15 @@ impl Drop for AbortOnDrop {
     }
 }
 
+/// Binds a gRPC listener whose accepted connections have Nagle's algorithm off
+/// (`TCP_NODELAY`). With it on, a small reply written while an earlier small write is
+/// unacknowledged waits for the client's delayed ACK, about 40 ms on Linux, so each
+/// sequential small call pays that. tonic's `Server::tcp_nodelay` does not apply here:
+/// `serve_with_incoming` takes the options of the incoming stream it is given.
 fn bind(addr: SocketAddr) -> Result<(TcpIncoming, SocketAddr), ServeError> {
     let bound = TcpIncoming::bind(addr).and_then(|incoming| {
         let local = incoming.local_addr()?;
-        Ok((incoming, local))
+        Ok((incoming.with_nodelay(Some(true)), local))
     });
     bound.map_err(|source| ServeError::Bind { addr, source })
 }
@@ -154,13 +160,20 @@ fn serve_api(
     match listener {
         Some(listener) => Either::Left(
             axum::serve(
-                listener,
+                listener.tap_io(set_nodelay),
                 routes.into_make_service_with_connect_info::<SocketAddr>(),
             )
             .into_future(),
         ),
         None => Either::Right(std::future::pending()),
     }
+}
+
+/// Turns Nagle's algorithm off on a connection the operator API accepted, as [`bind`]
+/// does for the gRPC listeners. The call fails only on a socket that is already
+/// unusable, whose connection then fails on its own, so its error is not kept.
+fn set_nodelay(tcp: &mut tokio::net::TcpStream) {
+    let _ = tcp.set_nodelay(true);
 }
 
 fn bind_api(addr: SocketAddr) -> Result<(tokio::net::TcpListener, SocketAddr), ServeError> {
