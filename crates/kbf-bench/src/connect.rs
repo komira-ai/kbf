@@ -1,11 +1,14 @@
 //! The connection to the blob service: one HTTP/2 channel, made as `kbf-daemon` makes
-//! its `--cas` channel (`Endpoint::from_shared(url).tls_config(..).connect_lazy()`,
-//! nothing else set), with the daemon's TLS flags and its TLS loader when a client
-//! certificate is given. Plain text is allowed, for a REAPI listener served so.
+//! its `--cas` connection (`Endpoint::from_shared(url).tls_config(..)`, then
+//! `kbf_transfer::Transfers::new`: the engine's default stream window, eight times it
+//! for the connection, `connect_lazy()`), with the daemon's TLS flags and its TLS loader
+//! when a client certificate is given. Plain text is allowed, for a REAPI listener
+//! served so.
 
 use std::path::PathBuf;
 
 use kbf_daemon::config::TlsFiles;
+use kbf_transfer::TransferConfig;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint};
 
 /// Where the blobs go, and how to authenticate.
@@ -60,8 +63,13 @@ pub fn channel(target: &Target) -> Result<Channel, ConnectError> {
             "TLS flags given for a plain-text http:// URL",
         ));
     }
-    let endpoint =
-        Endpoint::from_shared(url.clone()).map_err(|e| ConnectError::Transport(url.clone(), e))?;
+    // The windows `Transfers::new` sets for a daemon run with the default
+    // `--transfer-stream-window-bytes`.
+    let window = TransferConfig::default().stream_window_bytes;
+    let endpoint = Endpoint::from_shared(url.clone())
+        .map_err(|e| ConnectError::Transport(url.clone(), e))?
+        .initial_stream_window_size(window)
+        .initial_connection_window_size(window.saturating_mul(8));
     if plain {
         return Ok(endpoint.connect_lazy());
     }

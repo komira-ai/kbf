@@ -89,6 +89,9 @@ pub struct WholeMachineConfig {
     pub default_timeout: Duration,
     /// How much output one action may leave.
     pub outputs: OutputLimits,
+    /// How long one lease's whole output upload (outputs, stdout and stderr) may take
+    /// before the lease fails saying so ([`kbf_daemon::upload_within`]).
+    pub upload_deadline: Duration,
     /// How long the GUI session may take to come up ([`SESSION_WAIT`]).
     pub session_wait: Duration,
     /// How often the helper is asked whether it is up.
@@ -96,7 +99,8 @@ pub struct WholeMachineConfig {
 }
 
 impl WholeMachineConfig {
-    /// Files in `dir`, a one hour default timeout, the default output limits, and the
+    /// Files in `dir`, a one hour default timeout, the default output limits and upload
+    /// deadline ([`kbf_daemon::UPLOAD_DEADLINE`]), and the
     /// session asked about every 2 seconds for [`SESSION_WAIT`].
     #[must_use]
     pub fn new(dir: PathBuf) -> Self {
@@ -104,6 +108,7 @@ impl WholeMachineConfig {
             dir,
             default_timeout: Duration::from_secs(3600),
             outputs: OutputLimits::DEFAULT,
+            upload_deadline: kbf_daemon::UPLOAD_DEADLINE,
             session_wait: SESSION_WAIT,
             session_poll: Duration::from_secs(2),
         }

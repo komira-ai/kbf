@@ -484,15 +484,16 @@ impl Daemon {
 
     /// The endpoint for one attempt: `target`'s address, with the URL's host as the
     /// HTTP/2 authority and, unless `--tls-server-name` names another, as the name the
-    /// server's certificate must carry.
+    /// server's certificate must carry; with the configured HTTP/2 keepalive.
     fn endpoint(&self, target: &Target) -> Result<Endpoint, SessionError> {
         let mut tls = self.tls.clone();
         if self.config.tls.server_name.is_none() {
             tls = tls.domain_name(target.server.host.clone());
         }
-        Ok(Endpoint::from_shared(format!("https://{}", target.addr))?
+        let endpoint = Endpoint::from_shared(format!("https://{}", target.addr))?
             .origin(target.server.uri.clone())
-            .tls_config(tls)?)
+            .tls_config(tls)?;
+        Ok(self.config.keep_alive.apply(endpoint))
     }
 
     /// One stream to `target`, from connecting until it ends. Sets `welcomed` once the

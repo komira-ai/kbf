@@ -61,6 +61,12 @@ last session. An observer of the daemon's events sees `ConnectFailed` for each f
 attempt and `Retrying` (failed rounds, the wait) for each wait. The blob client
 (`--cas`) is a single URL; it is not covered by this.
 
+Both channels, the worker stream's and the blob client's, send an HTTP/2 PING every
+20 seconds, idle or not, and close the connection when one is not acknowledged within
+20 seconds (`KeepAlive`). A connection that died without a FIN or RST then fails its
+calls within 40 seconds, rather than leaving a call waiting for an answer that cannot
+come.
+
 Each lease is remembered with the lease epoch the newest `Welcome` named when its
 `Start` arrived, and the action the `Start` named; every `Result` echoes that action.
 A `Welcome` that names another epoch comes from a server that never granted those
@@ -599,6 +605,13 @@ still finishing for another lease. Its counts, per lease:
 So the sum of `read_bytes` over the leases is what the server served, with nothing
 counted twice. The server's side of the same uploads is in `GET /metrics`
 ([api.md](../api.md#get-metrics)).
+
+**Upload deadline.** The whole upload (output files, stdout and stderr) must finish
+within `--output-upload-deadline-secs` (default 1800, 30 minutes; container, native and
+whole-machine drivers). Past it the upload is dropped, which cancels its calls to the
+CAS, and the lease fails with INTERNAL and the reason `the output upload did not finish
+within its deadline of ...: stopped after ...`. Without it, a store that stops
+answering held the lease, and its slot, with no error.
 
 ## Measuring usage
 

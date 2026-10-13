@@ -1,26 +1,31 @@
 //! A run: the requests that send (or read back) a tree's blobs, made `in_flight` at a
 //! time over one channel, each one timed.
 //!
-//! `bytestream` sends each blob in its own ByteStream Write through the daemon's own
-//! client (`kbf_daemon::cas::CasClient::put_chunks`, as the container driver stores an
-//! output file) and reads it with ByteStream Read, checked against its digest
-//! (`kbf_daemon::cas::fetch`). `batch` packs blobs into BatchUpdateBlobs and
-//! BatchReadBlobs calls of at most `batch_bytes` of blob data; a larger blob goes by
-//! ByteStream. An upload with `find_missing` first asks FindMissingBlobs about every
-//! digest, [`FIND_MISSING_DIGESTS`] per call, and sends only the missing ones.
+//! `bytestream` moves each blob through the daemon's transfer engine
+//! ([`kbf_transfer::Transfers`], over the run's channel, its in-flight limit
+//! `in_flight`, the daemon's `--transfer-in-flight`; every other limit the engine's
+//! default): an upload is the engine's `put_chunks`, as the container driver stores an
+//! output file, so the engine first asks FindMissing about the blob (its calls
+//! coalesced, one at a time) and sends a ByteStream Write only when the server lacks
+//! it; a read is the engine's ByteStream Read through memory, checked against its
+//! digest ([`kbf_transfer::fetch`]). `batch` packs blobs into BatchUpdateBlobs and
+//! BatchReadBlobs calls of at most `batch_bytes` of blob data, made directly (the
+//! engine does not batch yet); a larger blob goes through the engine. An upload with
+//! `find_missing` first asks FindMissingBlobs about every digest,
+//! [`FIND_MISSING_DIGESTS`] per call, and sends only the missing ones.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use futures::stream::{self, BoxStream};
 use futures::{FutureExt as _, StreamExt as _};
-use kbf_daemon::cas::{Cas as _, CasClient, Chunks, fetch, label};
 use kbf_proto::google::rpc;
 use kbf_proto::reapi::content_addressable_storage_client::ContentAddressableStorageClient;
 use kbf_proto::reapi::{
     BatchReadBlobsRequest, BatchUpdateBlobsRequest, Digest, FindMissingBlobsRequest,
     batch_update_blobs_request,
 };
+use kbf_transfer::{Cas as _, CasError, Chunks, TransferConfig, Transfers, fetch, label};
 use tonic::transport::Channel;
 
 use crate::report::{Kind, Report, Tally};
@@ -54,7 +59,9 @@ impl Method {
 #[derive(Clone, Copy, Debug)]
 pub struct Options {
     pub method: Method,
-    /// The most requests in flight at once; at least 1.
+    /// The most requests in flight at once; at least 1. It bounds the requests the run
+    /// makes and is the engine's limit for the whole run (as `--transfer-in-flight` is
+    /// for a daemon), so a ByteStream write and the FindMissing call before it share it.
     pub in_flight: usize,
     /// Upload only: ask FindMissingBlobs first and send only what is missing.
     pub find_missing: bool,
@@ -87,9 +94,9 @@ pub(crate) struct Outcome {
     pub(crate) missing: Vec<usize>,
 }
 
-/// The connection's clients and the tree, shared by every request.
+/// The connection's engine and batch client, and the tree, shared by every request.
 struct Run<'a> {
-    cas: CasClient,
+    cas: Transfers,
     batch: ContentAddressableStorageClient<Channel>,
     tree: &'a Tree,
     options: Options,
@@ -142,7 +149,13 @@ impl<'a> Run<'a> {
         // A full batch and the digests and statuses around it.
         let message = options.batch_bytes as usize + (1 << 20);
         Self {
-            cas: CasClient::new(channel.clone()),
+            cas: Transfers::over(
+                channel.clone(),
+                TransferConfig {
+                    in_flight: options.in_flight,
+                    ..TransferConfig::default()
+                },
+            ),
             batch: ContentAddressableStorageClient::new(channel)
                 .max_decoding_message_size(message)
                 .max_encoding_message_size(message),
@@ -368,7 +381,7 @@ impl Outcome {
     }
 
     /// The outcome of a one-blob request that moved `bytes`, or failed.
-    fn of(kind: Kind, moved: Result<usize, kbf_daemon::CasError>) -> Self {
+    fn of(kind: Kind, moved: Result<usize, CasError>) -> Self {
         let mut outcome = Self::new(kind);
         match moved {
             Ok(bytes) => {

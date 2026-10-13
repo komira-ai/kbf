@@ -72,14 +72,14 @@ pub const DAEMON_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "+", env!("K
 
 pub use cas::{Cas, CasError};
 pub use clock::{Clock, Moment, SystemClock};
-pub use config::{Args, DaemonConfig, FENCE_AFTER, RECHECK_EVERY, TlsFiles};
+pub use config::{Args, DaemonConfig, FENCE_AFTER, KeepAlive, RECHECK_EVERY, TlsFiles};
 pub use contact::{Acked, Contact};
 pub use daemon::{Daemon, Event, PROTOCOL_VERSION, SessionError, superseded};
 pub use driver_watch::{DriverPart, DriverWatch};
 #[cfg(target_os = "linux")]
 pub use local::{LOCAL_DRIVER, LocalRuntime};
 pub use report::{Capacity, NodeReport};
-pub use runtime::{FakeRuntime, Runtime, RuntimeError, Work};
+pub use runtime::{FakeRuntime, Runtime, RuntimeError, UPLOAD_DEADLINE, Work, upload_within};
 pub use runtimes::{KindServedTwice, Runtimes};
 pub use status::DriverReport;
 
