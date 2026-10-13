@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use kbf_daemon::cas::Cas;
 use kbf_daemon::tree::{check_relative, fetch_message, materialize, output_paths, real_dirs};
-use kbf_daemon::{RuntimeError, Work};
+use kbf_daemon::{RuntimeError, Work, upload_within};
 use kbf_proto::reapi::{Action, ActionResult, Command};
 use tokio::sync::oneshot;
 
@@ -134,24 +134,28 @@ impl<S: Session, C: Cas> WholeMachineRuntime<S, C> {
             exit_code: exit.action_code(),
             ..ActionResult::default()
         };
-        kbf_outputs::collect(
-            &store,
-            &root,
-            &command.working_directory,
-            &outputs,
-            self.config.outputs,
-            &mut result,
-        )
-        .await
-        .map_err(outputs_error)?;
-        let max = self.config.outputs.max_stdio_bytes;
-        for (name, slot) in [
-            ("stdout", &mut result.stdout_digest),
-            ("stderr", &mut result.stderr_digest),
-        ] {
-            let stored = kbf_outputs::store_file(&store, &dir.join(name), max).await;
-            *slot = Some(stored.map_err(outputs_error)?);
-        }
+        let upload = async {
+            kbf_outputs::collect(
+                &store,
+                &root,
+                &command.working_directory,
+                &outputs,
+                self.config.outputs,
+                &mut result,
+            )
+            .await
+            .map_err(outputs_error)?;
+            let max = self.config.outputs.max_stdio_bytes;
+            for (name, slot) in [
+                ("stdout", &mut result.stdout_digest),
+                ("stderr", &mut result.stderr_digest),
+            ] {
+                let stored = kbf_outputs::store_file(&store, &dir.join(name), max).await;
+                *slot = Some(stored.map_err(outputs_error)?);
+            }
+            Ok(())
+        };
+        upload_within(self.config.upload_deadline, upload).await?;
         Ok(result)
     }
 

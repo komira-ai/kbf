@@ -53,6 +53,9 @@ pub struct NativeConfig {
     pub default_timeout: Duration,
     /// How much output one action may leave, stdout and stderr included.
     pub outputs: OutputLimits,
+    /// How long one lease's whole output upload (outputs, stdout and stderr) may take
+    /// before the lease fails saying so ([`kbf_daemon::upload_within`]).
+    pub upload_deadline: Duration,
     /// The per-lease memory limit.
     pub memory: MemoryPolicy,
     /// How often the action's memory is measured (and its process tree refreshed).
@@ -82,8 +85,8 @@ pub struct NativeConfig {
 }
 
 impl NativeConfig {
-    /// A configuration with a one hour default timeout, the default output limits and
-    /// memory policy, a 250 ms poll, a 5 s kill wait, this node's isolation and user
+    /// A configuration with a one hour default timeout, the default output limits,
+    /// upload deadline ([`kbf_daemon::UPLOAD_DEADLINE`]) and memory policy, a 250 ms poll, a 5 s kill wait, this node's isolation and user
     /// folders, leftovers swept after [`LEFTOVER_AGE`], no Xcode (see [`Self::xcodes`]),
     /// the system `xcrun` and no lease-user pool.
     #[must_use]
@@ -92,6 +95,7 @@ impl NativeConfig {
             scratch,
             default_timeout: Duration::from_secs(3600),
             outputs: OutputLimits::DEFAULT,
+            upload_deadline: kbf_daemon::UPLOAD_DEADLINE,
             memory: MemoryPolicy::DEFAULT,
             poll: Duration::from_millis(250),
             kill_wait: Duration::from_secs(5),

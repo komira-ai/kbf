@@ -75,6 +75,16 @@ struct Cli {
     scratch: Option<PathBuf>,
     #[command(flatten)]
     outputs: OutputLimits,
+    /// How long one lease's whole output upload (its output files, stdout and stderr)
+    /// may take, in seconds, before the lease fails with a reason naming the upload and
+    /// the time it ran (container and native drivers). Without it, a store that stops
+    /// answering holds the lease, and its slot, with no error.
+    #[arg(
+        long,
+        default_value_t = kbf_daemon::UPLOAD_DEADLINE.as_secs(),
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    output_upload_deadline_secs: u64,
     #[command(flatten)]
     cache: cache::CacheArgs,
     #[command(flatten)]
@@ -486,9 +496,15 @@ fn scratch(cli: &Cli) -> Result<PathBuf, Error> {
     Ok(scratch)
 }
 
+/// `--output-upload-deadline-secs`.
+fn upload_deadline(cli: &Cli) -> Duration {
+    Duration::from_secs(cli.output_upload_deadline_secs)
+}
+
 fn native_config(cli: &Cli) -> Result<NativeConfig, Error> {
     let mut config = NativeConfig::new(scratch(cli)?);
     config.outputs = cli.outputs;
+    config.upload_deadline = upload_deadline(cli);
     config.memory = MemoryPolicy {
         percent: cli.memory_limit_percent,
         headroom_bytes: cli.memory_headroom_mib.saturating_mul(1 << 20),
@@ -581,6 +597,7 @@ mod container {
             max_bytes: cli.outputs.max_bytes,
             max_stdio_bytes: cli.outputs.max_stdio_bytes,
         };
+        config.upload_deadline = super::upload_deadline(cli);
         config.limits = limits(cli);
         config.swap_kill = swap_kill(cli);
         config.cache = crate::cache::given(&cli.cache, &config.scratch);
@@ -699,6 +716,7 @@ mod tests {
             "--memory-headroom-mib=64",
             "--memory-poll-ms=0",
             "--output-max-bytes=99",
+            "--output-upload-deadline-secs=7",
             "--xcode-apps=/var/kbf/apps",
         ])
         .expect("flags");
@@ -708,6 +726,7 @@ mod tests {
         assert_eq!(config.memory.limit(1 << 20), Some((2 << 20) + (64 << 20)));
         assert_eq!(config.poll, Duration::from_millis(1));
         assert_eq!(config.outputs.max_bytes, 99);
+        assert_eq!(config.upload_deadline, Duration::from_secs(7));
         assert_eq!(cli.xcode_apps, PathBuf::from("/var/kbf/apps"));
         assert_eq!(
             xcode_watch_args(&cli),
@@ -758,6 +777,17 @@ mod tests {
         let root = pooled(&["--pool-users=1", "--pool-first-uid=0"]).expect("flags");
         let refused = native_config(&root).expect_err("a pool at uid 0");
         assert!(refused.to_string().contains("root"), "{refused}");
+    }
+
+    /// Catches an upload deadline that defaults to anything but
+    /// `kbf_daemon::UPLOAD_DEADLINE` (30 minutes), and a deadline of 0 accepted (every
+    /// lease with outputs would fail).
+    #[test]
+    fn the_upload_deadline_defaults_to_thirty_minutes_and_is_never_zero() {
+        let cli = parse(&["--driver=native"]).expect("flags");
+        assert_eq!(upload_deadline(&cli), Duration::from_secs(1800));
+        assert_eq!(upload_deadline(&cli), kbf_daemon::UPLOAD_DEADLINE);
+        assert!(parse(&["--driver=native", "--output-upload-deadline-secs=0"]).is_err());
     }
 
     /// Catches a `--container-*` flag that does not reach the driver's limits, and a

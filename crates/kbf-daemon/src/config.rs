@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use tonic::transport::{Certificate, ClientTlsConfig, Identity};
+use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity};
 
 /// T: a daemon fences its leases this long after the newest acknowledged heartbeat
 /// (`docs/design/scheduler.md#fencing-g-and-t`). The scheduler re-dispatches after
@@ -14,6 +14,35 @@ pub const FENCE_AFTER: Duration = Duration::from_secs(40);
 /// suspend-counting clock again. Timers stop while the machine is suspended, so a
 /// resume is noticed within this much running time (issue #78).
 pub const RECHECK_EVERY: Duration = Duration::from_secs(1);
+
+/// HTTP/2 keepalive on the daemon's channels to the server (its worker stream and its
+/// blob channel): a PING every `interval`, idle or not, and the connection closed when
+/// one is not acknowledged within `timeout`. A connection that died without a FIN or
+/// RST (a dropped NAT entry, a peer that lost power) then fails its calls within
+/// `interval + timeout`, instead of leaving a call waiting for an answer that cannot
+/// come.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KeepAlive {
+    pub interval: Duration,
+    pub timeout: Duration,
+}
+
+impl KeepAlive {
+    /// A PING every 20 s, closed after 20 s without its acknowledgement.
+    pub const DEFAULT: Self = Self {
+        interval: Duration::from_secs(20),
+        timeout: Duration::from_secs(20),
+    };
+
+    /// `endpoint` with this keepalive.
+    #[must_use]
+    pub fn apply(self, endpoint: Endpoint) -> Endpoint {
+        endpoint
+            .http2_keep_alive_interval(self.interval)
+            .keep_alive_timeout(self.timeout)
+            .keep_alive_while_idle(true)
+    }
+}
 
 /// The session flags of the `kbf-daemon` command line: where to connect, as whom, and
 /// how this node is labelled. The binary (crate `kbf-node`) adds the driver flags.
@@ -156,6 +185,9 @@ pub struct DaemonConfig {
     /// The longest wait before the fence is checked again, normally
     /// [`RECHECK_EVERY`]. Tests lengthen it to show which event checked it.
     pub recheck_every: Duration,
+    /// HTTP/2 keepalive on the worker stream's channel, normally
+    /// [`KeepAlive::DEFAULT`]; the binary gives its blob channel the same.
+    pub keep_alive: KeepAlive,
 }
 
 impl DaemonConfig {
@@ -171,6 +203,7 @@ impl DaemonConfig {
             reconnect_max: crate::connect::RECONNECT_MAX,
             welcome_timeout: Duration::from_secs(10),
             recheck_every: RECHECK_EVERY,
+            keep_alive: KeepAlive::DEFAULT,
         }
     }
 
@@ -273,6 +306,55 @@ mod tests {
                 "https://c:2",
                 "https://d:3"
             ]
+        );
+    }
+
+    /// Catches a channel without HTTP/2 keepalive (the 15-hour upload hang): over a
+    /// connection whose peer takes every byte and never answers, as a dead peer behind
+    /// a live middlebox does, a call must fail once a PING goes unacknowledged. Without
+    /// keepalive it waits for ever, here until the test's 10 s.
+    #[tokio::test]
+    async fn keep_alive_fails_a_call_on_a_silent_connection() {
+        use kbf_proto::google::bytestream::QueryWriteStatusRequest;
+        use kbf_proto::google::bytestream::byte_stream_client::ByteStreamClient;
+        use tokio::io::AsyncReadExt as _;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            while let Ok((mut peer, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut taken = [0u8; 4096];
+                    while matches!(peer.read(&mut taken).await, Ok(n) if n > 0) {}
+                });
+            }
+        });
+        let keep_alive = KeepAlive {
+            interval: Duration::from_millis(100),
+            timeout: Duration::from_millis(100),
+        };
+        let endpoint = Endpoint::from_shared(format!("http://{addr}")).expect("url");
+        let mut client = ByteStreamClient::new(keep_alive.apply(endpoint).connect_lazy());
+        let call = client.query_write_status(QueryWriteStatusRequest::default());
+        let ended = tokio::time::timeout(Duration::from_secs(10), call)
+            .await
+            .expect("the unanswered PING ends the call within 10 s");
+        assert!(ended.is_err(), "{ended:?}");
+    }
+
+    /// Catches a daemon configured without keepalive.
+    #[test]
+    fn the_daemon_keeps_its_channels_alive() {
+        let config = DaemonConfig::from_args(&parse(&[]).expect("flags"));
+        assert_eq!(config.keep_alive, KeepAlive::DEFAULT);
+        assert_eq!(
+            KeepAlive::DEFAULT,
+            KeepAlive {
+                interval: Duration::from_secs(20),
+                timeout: Duration::from_secs(20),
+            }
         );
     }
 }
