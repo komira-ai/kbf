@@ -360,6 +360,10 @@ async fn the_pass_pause_yields_to_a_stop_and_to_free_space_pressure() {
     let cache = Cache::open(paced.clone()).expect("open");
     let started = Instant::now();
     while !gates.points().iter().any(|p| p == "Listed(0)") {
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "the first pass never listed"
+        );
         std::thread::sleep(Duration::from_millis(5));
     }
     cache.stop();
