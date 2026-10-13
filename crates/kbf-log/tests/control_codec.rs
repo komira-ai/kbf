@@ -860,7 +860,7 @@ fn a_wall_time_outside_u64_nanoseconds_is_not_written() {
 #[test]
 fn control_commands_are_format_1_only() {
     let command = batch(FarmInput::Tick);
-    let format = Format::new(2);
+    let format = Format::new(3);
     assert_eq!(encode(format, &command), Err(EncodeError::Format(format)));
     assert_eq!(
         kbf_log::decode(format, &enc(&command)),

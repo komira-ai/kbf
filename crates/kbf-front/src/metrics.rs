@@ -280,7 +280,7 @@ impl Drop for Request<'_> {
 }
 
 /// The metadata commands the cache commits, as the `command` label names them.
-pub const COMMANDS: [&str; 9] = [
+pub const COMMANDS: [&str; 14] = [
     "tick",
     "alloc_epoch",
     "put_blob",
@@ -290,6 +290,11 @@ pub const COMMANDS: [&str; 9] = [
     "object_unreachable",
     "object_reachable",
     "collect",
+    "add_tier",
+    "put_staged",
+    "seal_staged",
+    "object_flushed",
+    "flush_conflict",
 ];
 
 /// The index into [`COMMANDS`] of `command`'s label.
@@ -305,6 +310,11 @@ pub const fn command_label(command: &Command) -> usize {
         Command::ObjectUnreachable { .. } => 6,
         Command::ObjectReachable { .. } => 7,
         Command::Collect => 8,
+        Command::AddTier { .. } => 9,
+        Command::PutStaged { .. } => 10,
+        Command::SealStaged { .. } => 11,
+        Command::ObjectFlushed { .. } => 12,
+        Command::FlushConflict { .. } => 13,
     }
 }
 

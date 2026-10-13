@@ -10,6 +10,10 @@
 //! - the objects the store has reported unreachable, each with a [`LossMark`]: its
 //!   [`UnreachableReason`] and the [`Generation`] (log index) of the last mark;
 //! - the committed farm time, and the next writer [`Epoch`].
+//! - the local write tiers ([`TierId`]), one current tier per server, and the
+//!   **staged** objects: objects whose only copy is a block file on a tier until they
+//!   are flushed to the store ([`StagedObject`], docs/design/write-path.md, section 6).
+//!   A staged blob answers `Present` with the tier it is staged on.
 //!
 //! Object ids are a writer epoch and a sequence number ([`ObjectId`]). Epochs come only
 //! from [`Command::AllocEpoch`], never twice, and a command naming an object of an epoch
@@ -35,6 +39,7 @@
 
 mod model;
 mod state;
+mod tier;
 
 pub use crate::model::{
     ActionAnswer, ActionRecord, BlobAnswer, Closure, Epoch, FindMissing, Generation, Location,
@@ -43,3 +48,4 @@ pub use crate::model::{
 pub use crate::state::{
     ActionWriteError, Applied, BlobWrite, Collected, Command, MetaState, UnallocatedEpoch,
 };
+pub use crate::tier::{ServerId, StagedObject, StagedPut, StagedState, TierError, TierId};

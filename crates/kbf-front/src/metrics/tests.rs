@@ -116,6 +116,17 @@ fn each_command_has_its_own_label() {
             generation: Generation::new(1),
         },
         Command::Collect,
+        Command::AddTier {
+            server: kbf_meta::ServerId::new(1),
+            tier: kbf_meta::TierId::new(1),
+        },
+        Command::PutStaged {
+            tier: kbf_meta::TierId::new(1),
+            objects: Vec::new(),
+        },
+        Command::SealStaged { object },
+        Command::ObjectFlushed { object },
+        Command::FlushConflict { object },
     ];
     let labels: Vec<&str> = commands
         .iter()

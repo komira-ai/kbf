@@ -432,6 +432,50 @@ async fn a_control_command_in_the_metadata_log_refuses_the_open() {
     );
 }
 
+/// Catches: a write-tier command in the metadata log applied, or skipped, by this
+/// binary, whose log is format 1 (docs/design/write-path.md section 9, "a log holding
+/// each new variant, opened by a reader without it, is refused"). Each of the five
+/// commands, alone at the end of the log, refuses the open with the entry's index.
+/// Mutant: the machine decodes under format 2.
+#[tokio::test]
+async fn a_write_tier_command_in_a_format_1_log_refuses_the_open() {
+    let object = ObjectId::new(Epoch::new(1), 1);
+    let tier = kbf_meta::TierId::new(1);
+    let commands = [
+        Command::AddTier {
+            server: kbf_meta::ServerId::new(1),
+            tier,
+        },
+        Command::PutStaged {
+            tier,
+            objects: Vec::new(),
+        },
+        Command::SealStaged { object },
+        Command::ObjectFlushed { object },
+        Command::FlushConflict { object },
+    ];
+    for command in commands {
+        let fs = FaultFs::new();
+        drop(open(&fs, 2).await);
+        let dir = fs.restart();
+        let (mut store, held) = Store::open(dir.clone(), Options::default()).expect("the store");
+        let last = held.entries.last().expect("entries").id;
+        let bytes =
+            kbf_log::encode(Format::V2, &LogCommand::Meta(command.clone())).expect("encode");
+        let entry = Entry {
+            id: LogId::new(last.term, last.index.next()),
+            payload: Payload::Command(bytes),
+        };
+        store.write_entries(&[entry]).expect("append");
+        drop(store);
+        let refused = refusal(&dir.restart(), 2).await;
+        assert!(
+            matches!(&refused, RaftLogError::Decode { index, .. } if *index == last.index.0 + 1),
+            "{command:?}: {refused:?}"
+        );
+    }
+}
+
 /// Catches: a replica that takes a later `Bootstrap` over the first (a leader that died
 /// with its `Bootstrap` uncommitted may leave one in the log that a later leader
 /// commits): its objects would move to the later prefix. A later one is applied as a
