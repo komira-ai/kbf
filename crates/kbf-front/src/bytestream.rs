@@ -116,11 +116,13 @@ impl<M: MetaLog, O: ObjectStore + 'static> ByteStream for ByteStreamService<M, O
     }
 
     /// Receives a blob from offset 0, verifies it, stores it, and only then answers
-    /// with its size. A blob already durable is answered at once.
+    /// with its size. A blob already durable is answered at once. Each call is
+    /// counted and timed in the cache's metrics (`kbf_bytestream_write_*`).
     async fn write(
         &self,
         request: Request<Streaming<WriteRequest>>,
     ) -> Result<Response<WriteResponse>, Status> {
+        let mut timed = self.cache.metrics().write.start();
         let caller = kbf_auth::metadata(&request);
         let metadata = call_metadata(&request);
         let mut stream = request.into_inner();
@@ -152,6 +154,8 @@ impl<M: MetaLog, O: ObjectStore + 'static> ByteStream for ByteStreamService<M, O
         }
         // The cheapest upload is the one we skip.
         if self.cache.is_durable(&digest).await? {
+            self.cache.metrics().write_present.add(1);
+            timed.ok();
             return Ok(committed(size));
         }
         let mut received: Vec<u8> = Vec::new();
@@ -177,6 +181,7 @@ impl<M: MetaLog, O: ObjectStore + 'static> ByteStream for ByteStreamService<M, O
                 )));
             }
             received.extend_from_slice(&message.data);
+            timed.bytes(message.data.len() as u64);
             if message.finish_write {
                 break;
             }
@@ -188,6 +193,7 @@ impl<M: MetaLog, O: ObjectStore + 'static> ByteStream for ByteStreamService<M, O
         self.cache.store_blobs(vec![blob]).await?;
         self.recorder
             .call(&metadata, &caller, &instance, &|| CallKind::Uploaded(size));
+        timed.ok();
         Ok(committed(size))
     }
 

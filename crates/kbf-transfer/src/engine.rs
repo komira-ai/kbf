@@ -185,6 +185,7 @@ impl Cas for Scope {
             match written {
                 Ok(size) => {
                     add(&self.counts.written_bytes, bytes.len() as u64);
+                    add(&self.counts.written_blobs, 1);
                     return committed(&digest, size);
                 }
                 Err(status) => self.retry(&digest, &status, &mut attempt).await?,
@@ -203,6 +204,7 @@ impl Cas for Scope {
         match written {
             Ok(size) => {
                 add(&self.counts.written_bytes, u64::try_from(size).unwrap_or(0));
+                add(&self.counts.written_blobs, 1);
                 committed(&digest, size)
             }
             Err(WriteFailed::Call(status)) => Err(call_error(&digest, &status)),
