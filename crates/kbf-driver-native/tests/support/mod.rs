@@ -6,6 +6,9 @@
 kbf_daemon::keeper_test_hook!();
 // So do the actions of [`Spec::act`]: this test binary run as kbf-testkit's `kbf-act`.
 kbf_testkit::act_test_hook!();
+// And the `as-user` step of an action run as a lease-user pool's slot user
+// (`tests/slots.rs`).
+kbf_driver_native::as_user_test_hook!();
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};

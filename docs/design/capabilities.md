@@ -68,7 +68,10 @@ both architectures.
 The driver adds its own entries. The native driver (Macs) reports `network_isolation`
 (`sandbox-exec` or `none`; reported, not matched) and one `xcode` entry per ready Xcode
 build it can select (see [Matching](#matching)); an installed Xcode that is not ready is
-in the node status instead (`xcodes`, below).
+in the node status instead (`xcodes`, below). A root daemon with a lease-user pool
+(`--pool-users`, docs/design/macos-end-state.md step 3) also reports `action_slots`, how
+many actions it runs at once; reported, not matched or booked yet: a lease past that
+many waits on the node for a free slot.
 
 A daemon runs one driver today, so `drivers` has one value. Placement reads it
 (`kbf_types::LeaseKind::drivers`): a lease goes only to a worker that lists a driver

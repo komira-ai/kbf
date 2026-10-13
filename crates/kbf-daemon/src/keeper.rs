@@ -19,6 +19,10 @@
 //!    driver's keeper is a member of its action's); `cgroup <kill> <tries>` writes
 //!    `1` to the file `kill`, a lease cgroup's `cgroup.kill`, up to `tries` times a
 //!    second apart, and stops once that file cannot be opened. It never creates it.
+//!    On macOS, `uid <uid>` ends every process of the uid ([`crate::uid::end`]: the
+//!    bootout of `user/<uid>`, then `kill(-1)` as the uid until none is left, for at
+//!    most [`UID_WITHIN`]): the native driver's keeper of an action it runs as a pool
+//!    user, which is in no group of the action's.
 //!
 //! **The program after an update.** kbf-updater replaces the binary by renaming a new
 //! file over it while the daemon runs. On Linux [`program`] is `/proc/self/exe`, which
@@ -53,7 +57,14 @@ pub enum Mode {
     /// Write `1` to `kill` (a cgroup's `cgroup.kill`) up to `tries` times, a second
     /// apart, while it can be opened.
     Cgroup { kill: PathBuf, tries: u32 },
+    /// End every process of `uid` ([`crate::uid::end`]). Never uid 0.
+    #[cfg(target_os = "macos")]
+    Uid { uid: u32 },
 }
+
+/// How long a keeper in [`Mode::Uid`] tries to end the uid's processes.
+#[cfg(target_os = "macos")]
+pub const UID_WITHIN: Duration = Duration::from_secs(30);
 
 impl Mode {
     /// The keeper's arguments after argv0, [`ARG`] first.
@@ -67,6 +78,8 @@ impl Mode {
                 kill.into(),
                 tries.to_string().into(),
             ],
+            #[cfg(target_os = "macos")]
+            Mode::Uid { uid } => vec![ARG.into(), "uid".into(), uid.to_string().into()],
         }
     }
 
@@ -81,8 +94,17 @@ impl Mode {
                 let kill = PathBuf::from(kill);
                 Ok(Mode::Cgroup { kill, tries })
             }
+            #[cfg(target_os = "macos")]
+            [mode, uid] if mode == "uid" => {
+                let uid = uid
+                    .to_str()
+                    .and_then(|u| u.parse().ok())
+                    .filter(|&u| u != 0);
+                let uid = uid.ok_or_else(|| format!("uid {:?} is not a non-root uid", args[1]))?;
+                Ok(Mode::Uid { uid })
+            }
             _ => Err(format!(
-                "usage: {ARG} group | {ARG} cgroup <cgroup.kill> <tries>, not {args:?}"
+                "usage: {ARG} group | {ARG} cgroup <cgroup.kill> <tries> | {ARG} uid <uid>, not {args:?}"
             )),
         }
     }
@@ -227,6 +249,14 @@ fn run(mode: &Mode) -> u8 {
             }
             0
         }
+        #[cfg(target_os = "macos")]
+        Mode::Uid { uid } => match crate::uid::end(*uid, UID_WITHIN) {
+            Ok(()) => 0,
+            Err(why) => {
+                eprintln!("{NAME}: {why}");
+                1
+            }
+        },
     }
 }
 
@@ -259,6 +289,12 @@ mod tests {
             assert_eq!(mode.args(), argv, "{mode:?}");
             assert_eq!(Mode::parse(&argv[1..]), Ok(mode));
         }
+        #[cfg(target_os = "macos")]
+        {
+            let uid = Mode::Uid { uid: 601 };
+            assert_eq!(uid.args(), args(&["__keeper", "uid", "601"]));
+            assert_eq!(Mode::parse(&args(&["uid", "601"])), Ok(uid));
+        }
     }
 
     /// Catches a binary that runs as a daemon, or as a keeper, when its arguments do
@@ -277,6 +313,10 @@ mod tests {
             &["__keeper", "cgroup", "/k"],
             &["__keeper", "cgroup", "/k", "-1"],
             &["__keeper", "cgroup", "/k", "30", "x"],
+            &["__keeper", "uid"],
+            &["__keeper", "uid", "0"],
+            &["__keeper", "uid", "-1"],
+            &["__keeper", "uid", "601", "x"],
         ] {
             let argv = [&["kbf-keeper"][..], bad].concat();
             assert_eq!(code(&args(&argv)), Some(2), "{bad:?}");

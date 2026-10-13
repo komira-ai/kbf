@@ -129,6 +129,31 @@ pub const NO_NETWORK_PROFILE: &str = "(version 1)\n\
 (allow network* (remote ip \"localhost:*\"))\n\
 (allow network* (remote unix-socket))\n";
 
+/// The profile of an action that runs as a slot user of the lease-user pool
+/// ([`crate::slots`]): [`BASE_PROFILE`] without its `job-creation`, `lsopen` and
+/// `user-preference-write` denies. Those kept one lease from leaving work or settings
+/// for the next in a uid every lease shared; a slot's uid is its own, its preferences
+/// are in its own home, and what it hands launchd runs as its uid, which the end of the
+/// lease kills (docs/design/macos-end-state.md, section 1, "Sandbox"). The write rule
+/// stays, as a hermeticity aid.
+#[cfg(target_os = "macos")]
+pub const SLOT_PROFILE: &str = "(version 1)\n\
+(allow default)\n\
+(deny file-write*)\n\
+(allow file-write* (subpath (param \"KBF_LEASE\")) (subpath \"/dev\"))\n";
+
+/// [`SLOT_PROFILE`] for an action without the network: [`NO_NETWORK_PROFILE`] without
+/// the same three denies.
+#[cfg(target_os = "macos")]
+pub const SLOT_NO_NETWORK_PROFILE: &str = "(version 1)\n\
+(allow default)\n\
+(deny file-write*)\n\
+(allow file-write* (subpath (param \"KBF_LEASE\")) (subpath \"/dev\"))\n\
+(deny network*)\n\
+(allow network-inbound (local ip \"localhost:*\"))\n\
+(allow network* (remote ip \"localhost:*\"))\n\
+(allow network* (remote unix-socket))\n";
+
 /// The rules every profile carries (after the network rules): no lookup of a
 /// CoreDevice mach service or XPC service (`com.apple.CoreDevice.CoreDeviceService`,
 /// which `devicectl` asks for everything, `com.apple.CoreDevice.remotepairingd`,
@@ -233,12 +258,45 @@ impl Isolation {
         program: PathBuf,
         args: &[String],
     ) -> (PathBuf, Vec<String>) {
-        let Self::Sandbox(sandbox) = self else {
-            return (program, args.to_vec());
-        };
         let profile = match network {
             Network::Off => NO_NETWORK_PROFILE,
             Network::On => BASE_PROFILE,
+        };
+        self.wrap_in(profile, lease, rules, program, args)
+    }
+
+    /// [`Self::wrap`] for an action that runs as a lease-user pool's slot user
+    /// ([`crate::slots`]): the profile is [`SLOT_PROFILE`] or
+    /// [`SLOT_NO_NETWORK_PROFILE`], and `rules` lets it write the slot user's own home
+    /// and `/var/folders` entry.
+    #[cfg(target_os = "macos")]
+    #[must_use]
+    pub fn wrap_slot(
+        &self,
+        network: Network,
+        lease: &Path,
+        rules: &str,
+        program: PathBuf,
+        args: &[String],
+    ) -> (PathBuf, Vec<String>) {
+        let profile = match network {
+            Network::Off => SLOT_NO_NETWORK_PROFILE,
+            Network::On => SLOT_PROFILE,
+        };
+        self.wrap_in(profile, lease, rules, program, args)
+    }
+
+    /// `program` with `args` under `profile`, then [`NO_DEVICE_RULES`] and `rules`.
+    fn wrap_in(
+        &self,
+        profile: &str,
+        lease: &Path,
+        rules: &str,
+        program: PathBuf,
+        args: &[String],
+    ) -> (PathBuf, Vec<String>) {
+        let Self::Sandbox(sandbox) = self else {
+            return (program, args.to_vec());
         };
         let mut wrapped = vec![
             "-D".to_owned(),
@@ -257,6 +315,43 @@ mod tests {
     use kbf_proto::reapi::platform::Property;
 
     use super::*;
+
+    /// Catches a slot profile that keeps a deny the pool made needless (a slot user's
+    /// `defaults write` or `open` refused), or that differs from the shared user's in
+    /// anything else (a write rule or a network rule lost).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_slot_profile_is_the_shared_one_without_its_three_denies() {
+        let without = |profile: &str| {
+            let gone = [
+                "(deny job-creation)",
+                "(deny lsopen)",
+                "(deny user-preference-write)",
+            ];
+            let kept: Vec<&str> = profile.lines().filter(|l| !gone.contains(l)).collect();
+            assert_eq!(
+                kept.len() + gone.len(),
+                profile.lines().count(),
+                "{profile}"
+            );
+            kept.join("\n") + "\n"
+        };
+        assert_eq!(SLOT_PROFILE, without(BASE_PROFILE));
+        assert_eq!(SLOT_NO_NETWORK_PROFILE, without(NO_NETWORK_PROFILE));
+        let sandbox = Isolation::Sandbox(PathBuf::from(SANDBOX_EXEC));
+        let lease = Path::new("/l");
+        let args = ["a".to_owned()];
+        for (network, profile) in [
+            (Network::On, SLOT_PROFILE),
+            (Network::Off, SLOT_NO_NETWORK_PROFILE),
+        ] {
+            let (program, wrapped) =
+                sandbox.wrap_slot(network, lease, "(rule)\n", PathBuf::from("/p"), &args);
+            assert_eq!(program, PathBuf::from(SANDBOX_EXEC));
+            assert_eq!(wrapped[3], format!("{profile}{NO_DEVICE_RULES}(rule)\n"));
+            assert_eq!(wrapped[4..], ["/p", "a"]);
+        }
+    }
 
     fn platform(value: &str) -> Option<Platform> {
         Some(Platform {

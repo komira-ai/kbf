@@ -66,6 +66,17 @@
 //! Until then, each action's keeper (`keeper`), a member of its group, kills the group
 //! when the daemon dies, restarted or not.
 //!
+//! **A root daemon with a lease-user pool** (macOS, `--pool-users`; [`slots`],
+//! docs/design/macos-end-state.md step 3) runs every action as a pool user of its own
+//! instead, one per slot, through `launchctl asuser` and the `as-user` drop: the
+//! sandbox lets it write its slot user's real home and `/var/folders` entry too, and no
+//! longer denies preference writes, `open` or launchd jobs; its memory, its end, its
+//! keeper and the start-up are each "every process of the slot's uid"
+//! ([`kbf_daemon::uid`]), so the process-tree gaps below do not apply to it. A root
+//! daemon without a pool refuses to start. What the pool does not do yet: clean a
+//! slot between two leases (its home, folders, keychains, crontab), and make
+//! simulators in the slot user's device set (a lease that asks for one fails).
+//!
 //! Known gaps, all of them closed only by running each lease as its own user:
 //! - **Processes that leave the tree.** A process that calls `setsid` and is orphaned
 //!   between two polls is not seen ([`procs`]), so it outlives the lease. Work handed
@@ -124,6 +135,7 @@ mod program;
 mod record;
 mod runtime;
 pub mod simulator;
+pub mod slots;
 mod sweep;
 pub mod user_folders;
 pub mod whole_machine;
@@ -136,6 +148,9 @@ kbf_daemon::keeper_test_hook!();
 // So do the act steps and the fake Xcode tools they run (src/xcode_tests.rs).
 #[cfg(test)]
 kbf_testkit::act_test_hook!();
+// And the `as-user` mode an action of a lease-user pool starts through.
+#[cfg(test)]
+as_user_test_hook!();
 
 pub use config::{MemoryPolicy, NativeConfig};
 pub use runtime::{DRIVER, KIND, NativeRuntime, SURVEY_DIR, WARM_UP_DIR};

@@ -26,6 +26,8 @@
 //! - [`usage`]: what an action used, measured by the kernel, and where it is carried.
 //! - [`keeper`]: the keeper mode of the `kbf-daemon` binary, the process each run gets
 //!   that ends the run when the daemon dies; the drivers start it.
+//! - `uid` (macOS): every process of one uid, listed and killed; the native driver's
+//!   exact kill of an action it runs as a pool user, and its keeper's.
 //! - [`LocalRuntime`]: **tests only**, runs actions as plain child processes.
 //! - [`Daemon`]: the session loop, with the contact clock and lease manager inside.
 //!
@@ -52,6 +54,8 @@ pub mod runtime;
 pub mod runtimes;
 pub mod status;
 pub mod tree;
+#[cfg(target_os = "macos")]
+pub mod uid;
 #[cfg(target_os = "linux")]
 pub mod usage;
 mod window;
