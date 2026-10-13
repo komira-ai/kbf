@@ -1,9 +1,15 @@
 //! The Mac's part of a slot's clean ([`crate::slots::clean`]): each step for one pool
 //! user, the check of what is left, and the recreate of the user.
 //!
-//! - Bootout and kill are [`kbf_daemon::uid`]'s; the crontab, `at` jobs and the
-//!   shared places are swept by uid with `kbf_mac_session::sweep`, which never
-//!   follows a link and stays on one filesystem.
+//! - Bootout and kill are [`kbf_daemon::uid`]'s; the bootout then boots out, one by
+//!   one, each job `launchctl print user/<uid>` still lists but launchd's own
+//!   `com.apple.*` agents, which every user domain has and the domain's bootout leaves
+//!   loaded. The crontab, `at` jobs and the shared places are swept by uid with
+//!   `kbf_mac_session::sweep`, which never follows a link and stays on one filesystem.
+//! - The check reads, never removes. Processes that launchd lists as running one of
+//!   its own agents are not counted ([`leftover_processes`]): launchd starts them again
+//!   as the uid on demand after the kill.
+//! - Not reached: Background Task Management entries (macOS removes none for one uid).
 //! - Disk images: every image `hdiutil info -plist` says the uid attached is detached
 //!   (`hdiutil detach -force`).
 //! - System V IPC: every message queue, shared memory segment and semaphore set
@@ -511,7 +517,7 @@ fn attributes(record: &str) -> Result<Vec<(&'static str, Vec<String>)>, String> 
 
 /// The processes of `uid`, by effective or real uid ([`uid::processes`]), that a lease
 /// could have left: all but those launchd lists as running one of its own agents in
-/// `user/<uid>` ([`Service::apple`]). launchd starts those again on demand after the
+/// `user/<uid>` (`com.apple.*` labels). launchd starts those again on demand after the
 /// kill (`distnoted`, measured on the CI runner), as the uid: fresh processes, holding
 /// nothing of a lease.
 ///
