@@ -314,7 +314,7 @@ naming no `container-image`.
   `/Applications` (`--xcode-apps`): one that answers `xcodebuild -version` and whose
   `xcodebuild -license check`, `xcodebuild -checkFirstLaunchStatus`, `xcrun --find
   clang` (and, with `--require-metal-toolchain`, the Metal toolchain check) exit 0, each
-  asked under the actions' sandbox with the network off, as an action runs. It runs an
+  asked under the actions' sandbox with the network off, as a `network=off` action runs. It runs an
   action that names an `xcode` build with that Xcode's `DEVELOPER_DIR`. Its first
   survey runs in the background: the daemon says `Hello` at once with no `xcode`
   entry, each Xcode listed as not surveyed in its status, until the survey ends. It

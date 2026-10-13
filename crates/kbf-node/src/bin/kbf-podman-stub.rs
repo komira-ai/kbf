@@ -5,7 +5,8 @@
 //! `image inspect` prints that file, whatever image it is asked about, and fails as
 //! Podman does for an image not in the store (exit 125) when the file is absent.
 //! `info` names `store/` beside the link as the directory of the image store's
-//! per-image directories.
+//! per-image directories, and the graph driver, asked with its options, as the
+//! kernel's `overlay`.
 
 use std::io::Write as _;
 use std::path::PathBuf;
@@ -41,6 +42,8 @@ fn main() -> ExitCode {
                 return ExitCode::from(125);
             }
         },
+        // The input cache's question: the kernel's overlay, with no mount program.
+        Some("info") if args.iter().any(|a| a.contains("GraphOptions")) => println!("overlay {{}}"),
         Some("info") => println!("{}", here.join("store").display()),
         _ => {}
     }

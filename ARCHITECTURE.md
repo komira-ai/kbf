@@ -18,6 +18,7 @@ The design documents under [docs/design](docs/design) go deeper:
 | [worker-cache.md](docs/design/worker-cache.md) | the daemon's blob traffic: one shared transfer engine (a connection pool, one in-flight limit, batching, FindMissing before upload), a per-node NVMe input cache linked or cloned into each lease, per-driver safety, eviction, metrics, rollout and tests (**planned**) |
 | [capabilities.md](docs/design/capabilities.md) | node reports, ISA levels, matching an action to a node |
 | [mac-node-provisioning.md](docs/design/mac-node-provisioning.md) | a Mac as a worker: baseline, provisioning, the signed daemon artifact, headless settings, updates, join and leave (**planned**) |
+| [macos-end-state.md](docs/design/macos-end-state.md) | the macOS native and whole-machine drivers' end state: a root daemon, a reused pool of unprivileged lease users with a clean and post-clean check between leases, the macOS worker cache by hard link, one auto-login GUI user for GUI and Screen Recording leases, stable farm signing, the probes and build order (**planned**) |
 | [macos-vms.md](docs/design/macos-vms.md) | what runs on bare metal on a Mac and what in a macOS VM, VM sizing and scheduling, the VM driver, GPU tests (**planned**) |
 | [macos-vm-guests.md](docs/design/macos-vm-guests.md) | a VM guest's first-boot setup, capture inside the guest, guest networking, image identity (recipe and content digests), the VM helper's uid and signing, the probes a real Mac must run (**planned**) |
 | [fleet-updates.md](docs/design/fleet-updates.md), [fleet-updates-security.md](docs/design/fleet-updates-security.md) | keeping node software current: rolling updates, MDM on Macs, Linux host updates, bare-metal GPU and app-install isolation, the Fleet UI; its security model: threat model, root helpers, signing keys, the MDM gate, enrollment (**planned**) |
@@ -389,7 +390,8 @@ in between, a follower redirects them to the leader, and they retry forever
   certificate lifetimes bound what the list misses. See
   [worker-protocol.md](docs/design/worker-protocol.md#node-identity-and-the-deny-list).
 - **Built: blobs on the worker listener.** The worker listener also serves
-  `ByteStream` (Read, Write, QueryWriteStatus) over the farm's cache. A daemon's real
+  `ByteStream` (Read, Write, QueryWriteStatus) and `ContentAddressableStorage`
+  (FindMissingBlobs, BatchUpdateBlobs, BatchReadBlobs, GetTree) over the farm's cache. A daemon's real
   drivers, and the integration cell's daemon, read inputs and write outputs there:
   `--cas` must be an `https://` URL, normally the same as `--server`, and the daemon
   presents the same certificate as on its worker stream; plain `http://` is refused
@@ -398,8 +400,8 @@ in between, a follower redirects them to the leader, and they retry forever
   key nor that node may be on the deny list, which is looked at again for every call
   (its metadata at each call, the file read again only when that changed). A denied
   daemon is refused PERMISSION_DENIED from its next blob call, on a connection
-  already open too. Nothing else of REAPI is served there (Execute, the action cache,
-  `ContentAddressableStorage` and `Capabilities` answer UNIMPLEMENTED), and on a
+  already open too. Nothing else of REAPI is served there (Execute, the action cache and
+  `Capabilities` answer UNIMPLEMENTED), and on a
   plain-text worker listener every blob call is refused UNAUTHENTICATED. So a daemon
   needs neither the front nor a REAPI credential. See
   [worker-protocol.md](docs/design/worker-protocol.md#blobs-on-the-worker-listener).

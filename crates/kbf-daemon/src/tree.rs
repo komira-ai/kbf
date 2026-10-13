@@ -59,7 +59,7 @@ pub enum TreeError {
     },
 }
 
-fn io(path: &Path) -> impl FnOnce(std::io::Error) -> TreeError + '_ {
+pub(crate) fn io(path: &Path) -> impl FnOnce(std::io::Error) -> TreeError + '_ {
     move |source| TreeError::Io {
         path: path.to_owned(),
         source,
@@ -133,6 +133,28 @@ pub async fn materialize(cas: &impl Cas, root: &Digest, dir: &Path) -> Result<()
     materialize_within(cas, root, dir, FETCHES_IN_FLIGHT, FETCH_BYTES_IN_FLIGHT).await
 }
 
+/// [`materialize`] through the node's input cache (`crate::cache`): the tree's
+/// directories and symlinks are made as without it, and each file is a hard link to a
+/// cache entry, filled from the CAS on a miss (see `cache::lease` for the fallbacks).
+/// A file at or under one of `private` (paths from `dir`, checked: each output path
+/// as seen from the input root) gets a private, writable copy instead, so a driver may
+/// hand it to the action to change. Returns what the inputs cost.
+///
+/// # Errors
+/// As [`materialize`]; an error of the cache itself never fails it.
+#[cfg(target_os = "linux")]
+pub async fn materialize_cached(
+    cas: &impl Cas,
+    cache: &crate::cache::Cache,
+    root: &Digest,
+    dir: &Path,
+    private: &[String],
+) -> Result<crate::cache::InputStats, TreeError> {
+    let files = make_directories(cas, root, dir, FETCHES_IN_FLIGHT).await?;
+    let private: Vec<PathBuf> = private.iter().map(|p| dir.join(p)).collect();
+    crate::cache::lease::write_files(cas, cache, files, &private, FETCH_BYTES_IN_FLIGHT).await
+}
+
 /// [`materialize`] within `fetches` blobs and `bytes` bytes in flight.
 async fn materialize_within(
     cas: &impl Cas,
@@ -147,9 +169,9 @@ async fn materialize_within(
 
 /// Where one file blob goes: each path it is written to, and whether that copy is
 /// executable.
-struct Copies {
-    digest: Digest,
-    copies: Vec<(PathBuf, bool)>,
+pub(crate) struct Copies {
+    pub digest: Digest,
+    pub copies: Vec<(PathBuf, bool)>,
 }
 
 /// Walks the tree under `root`, checking every Directory's names and making its

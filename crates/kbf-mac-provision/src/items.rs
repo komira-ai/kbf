@@ -10,7 +10,7 @@ use std::io;
 
 use crate::host::{Host, Mac};
 use crate::profile::Profile;
-use crate::{accounts, launchd, record, software, sshd};
+use crate::{accounts, launchd, pool, record, software, sshd};
 
 pub(crate) const SCUTIL: &str = "/usr/sbin/scutil";
 pub(crate) const PMSET: &str = "/usr/bin/pmset";
@@ -130,6 +130,8 @@ pub const ITEMS: &[Item] = &[
     row!("hostname", hostname, fix_hostname),
     row!(check only "admin_user", accounts::admin_user),
     row!("role_user", accounts::role_user, accounts::fix_role_user),
+    row!("kbf_volume", pool::kbf_volume, pool::fix_kbf_volume),
+    row!("pool_users", pool::pool_users_item, pool::fix_pool_users),
     row!("power_sleep", pmset, fix_pmset),
     row!("power_standby", pmset, fix_pmset),
     row!("power_powernap", pmset, fix_pmset),
@@ -167,6 +169,11 @@ pub const ITEMS: &[Item] = &[
     ),
     row!(check only "probe", software::probe),
     row!(check only "simulator_runtimes", software::simulator_runtimes),
+    row!(
+        "daemon_user",
+        launchd::daemon_user,
+        launchd::fix_daemon_user
+    ),
     row!(
         "launchd_label",
         launchd::launchd_label,

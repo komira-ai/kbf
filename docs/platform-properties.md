@@ -200,7 +200,7 @@ clang`, and, on a node started with `--require-metal-toolchain` (one meant for G
 work), whether `xcodebuild -showComponent MetalToolchain` says `Status: installed` (an
 Xcode before 26, which has no `-showComponent` and bundles Metal, passes when `xcrun
 --find metal` does). Every question runs as an action does: under the actions'
-sandbox with the network off, in a lease directory of the daemon's own
+sandbox with the network off (as `network=off` runs one), in a lease directory of the daemon's own
 (`lease-survey` under `--scratch`, removed when the survey ends), with the same
 writes allowed in the user folders ([below](#what-an-action-on-a-mac-may-write)). One
 for which every question exits 0, each within a minute, is ready and is reported as an
@@ -304,7 +304,7 @@ that work.
   a name on a farm Mac.
 
 **Not isolated.** A booted simulator's processes run under `CoreSimulatorService`,
-outside the actions' sandbox and its network-off rule, and the action can reach every
+outside the actions' sandbox and its `network=off` rule, and the action can reach every
 device of the default set with `simctl`, not only its own. The property gives a lease
 a clean device of its own; it does not confine what the action does with simulators.
 
@@ -364,6 +364,23 @@ iOS 26.0 do not together serve `ios.device.class=iPhone` with
 an attribute key without `ios.device=1`, an `ios.device.<attribute>` not in the table,
 `ios.device` with an OS other than macOS, and `ios.device` with `kbf-lease=vm` or
 `whole_machine`. Names are read in any case.
+
+## `network`
+
+On a Mac (the native driver), an action has the network, the internet and the LAN,
+unless it turns it off:
+
+| `network` | The action gets |
+|---|---|
+| absent, `on`, `standard` | the network (the default): the sandbox's only network rule denies the `usbmuxd` socket, which reaches an iOS device |
+| `off`, `none` | loopback, Unix sockets and the node's own non-loopback address: every other connect is refused with `EPERM` by the sandbox (`crates/kbf-driver-native/src/network.rs`) |
+
+Any other value is refused with `INVALID_ARGUMENT`. Unix sockets stay open with
+`network=off`, so DNS lookups still go out through the system's resolver; a connect to
+the node's own LAN address is allowed too, so a service listening on it is reachable. A node
+without `sandbox-exec` cannot turn the network off and says so in its
+`network_isolation` capability (`none`). Linux container actions have no network
+([ARCHITECTURE.md](../ARCHITECTURE.md)), whatever the property says.
 
 ## What an action on a Mac may write
 

@@ -172,6 +172,30 @@ fn calls(dir: &Path) -> Vec<Call> {
             &[("state/unshare-noop", None)],
             &["unshare", "rm", "-rf", "--", &gone],
         ),
+        // The cache's start-up question, answered by default and by the knob.
+        call(
+            &[("state/info-fails", None)],
+            &[
+                "info",
+                "--format={{.Store.GraphDriverName}} {{json .Store.GraphOptions}}",
+            ],
+        ),
+        call(
+            &[("state/graph", Some("vfs {}\n"))],
+            &["info", "--format={{json .Store.GraphOptions}}"],
+        ),
+        call(
+            &[("state/chown-fails", None)],
+            &["unshare", "/helper", "__chown-dirs", "1:1", "/lease/root"],
+        ),
+        call(
+            &[("state/chown-fails", Some("0:0"))],
+            &["unshare", "/helper", "__chown-dirs", "0:0", "/lease/root"],
+        ),
+        call_then_files(
+            &[("state/chown-fails", None), ("state/busy-once", Some(""))],
+            &["start", "--attach", "kbf-lease-1-1"],
+        ),
         call(&[("state/vanish-after-create", Some(""))], &create),
     ]
 }

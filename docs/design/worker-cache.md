@@ -1,6 +1,6 @@
 # Worker inputs: a shared blob transfer engine and a per-node NVMe file cache
 
-Status: design, revision 5 (one connection; the cache persists from its first PR, through one snapshot file that unknown files are adopted into). Nothing here is built.
+Status: design, revision 5 (one connection; the cache persists from its first PR, through one snapshot file that unknown files are adopted into). Stage C1 is built; where it differs from the text, "C1 as built" (end of section 10) says how.
 Every "today" claim cites a file on `main` at `d7f25cf` (#524). Every number marked
 *unmeasured* is an estimate that the PR introducing it must replace with a measurement.
 
@@ -31,8 +31,8 @@ This is the design behind two lines that already promise it: `daemon.md` § Plan
 | Blob connection | `crates/kbf-node/src/main.rs:456-472` `cas_client` | **One** `Endpoint::connect_lazy()` channel, which is one HTTP/2 connection, carries every blob of every lease. It refuses a `--cas` URL that is not `https://`. The worker stream has its own connection, built at `crates/kbf-daemon/src/daemon.rs:484` (`fn endpoint`). Neither sets HTTP/2 window sizes or a decode limit, so tonic's defaults apply. |
 | Blob read | `crates/kbf-daemon/src/cas.rs` `CasClient::get` | One ByteStream `Read` per blob. Each blob is hashed when it arrives (`fetch`). No FindMissing, no Batch, no GetTree, no compression. |
 | Blob write | `CasClient::put` / `put_chunks` | One ByteStream `Write` per blob, 1 MiB per message (`WRITE_CHUNK_BYTES`). Outputs are uploaded in series (`tree.rs` `collect`; container `outputs.rs`; native `kbf-outputs`). Every output is uploaded, even one the server already holds. |
-| Worker listener | `crates/kbf-server/src/blobs.rs` | **Serves only ByteStream.** The `ContentAddressableStorage` service (FindMissing, Batch*, GetTree) answers UNIMPLEMENTED there. Every call is admitted against the node certificate (`admit`, line 39). Under plain text every call is refused UNAUTHENTICATED. |
-| Server batch | `crates/kbf-front/src/cas.rs` `batch_read_blobs` | Up to 4 MiB of blob data (`MAX_BATCH_TOTAL_BYTES`, `kbf-front/src/lib.rs:89`); the gRPC message cap is 5 MiB (`MAX_MESSAGE_BYTES`, line 93). Blobs are read with `cache.read_blob` **one after another** (`cas.rs:196-198`), each a range GET on the object store (`storage.md` § Reads). |
+| Worker listener | `crates/kbf-server/src/blobs.rs` | ByteStream (`WorkerBlobs`) and, since stage S1, the `ContentAddressableStorage` service (`WorkerCas`: FindMissing, Batch*, GetTree). Every call of both is admitted against the node certificate by one rule (`admit`, line 37). Under plain text every call is refused UNAUTHENTICATED. `Capabilities`, `Execution` and `ActionCache` answer UNIMPLEMENTED there. |
+| Server batch | `crates/kbf-front/src/cas.rs` `batch_read_blobs`, `kbf-front/src/cache/batch.rs` `read_blobs` | Up to 4 MiB of blob data (`MAX_BATCH_TOTAL_BYTES`, `kbf-front/src/lib.rs:89`); the gRPC message cap is 5 MiB (`MAX_MESSAGE_BYTES`, line 93). Since stage S1 one metadata query looks up and touches the batch, blobs back to back in one segment come from one range GET, and up to 32 GETs run at once (`storage.md` § Reads). |
 | Container lease | `crates/kbf-driver-container/src/runtime.rs:252-277`, `podman.rs` | `materialize` writes the input root `lease/root`, which becomes the **overlay lower** (`--volume=root:/kbf/root:O,upperdir=upper,workdir=work`). `prepare_outputs` **renames** every input that an output names from `root` into `upper` (`tree.rs:188`). Then `podman unshare chown -hR 1:1` runs over root, upper and work; after exit, `chown -hR 0:0` runs over the same paths (`runtime.rs:274-277,421-428`). Containers run with `--userns=nomap` (`podman.rs:136`), so the daemon's uid maps to nothing inside. |
 | Native lease | `crates/kbf-driver-native/src/runtime.rs`, `lib.rs` | Writes the input root into the lease directory and runs the action **as the daemon's user**. On macOS a `sandbox-exec` profile lets the action write only under its lease directory. On Linux nothing is enforced. |
 | Per-lease timing | `runtime.rs:322-341` (container), native `:487` | `input_fetch_start/completed_timestamp` cover all of prepare. Resource usage travels as an `auxiliary_metadata` Any (`kbf-daemon/src/usage.rs`). |
@@ -48,7 +48,9 @@ the worker listener cannot answer one. Section 4 replaces the per-call limits wi
 limit for the whole process.
 
 **The zig case.** Every compile's input root carries the unpacked zig toolchain:
-thousands to tens of thousands of files (*unmeasured*; stage C1 reports the count).
+about 15,000 files: zig 0.12.0 for x86-64 Linux, the toolchain komira pins, unpacks to
+15,189 files (144 of them empty) in 989 directories, 307 MB (C1 counted its release
+archive; an input root carries the files the rule declares, at most these).
 Today each file costs one network round trip per action, in series, because nothing
 is kept between leases.
 
@@ -214,7 +216,13 @@ pub enum Upload { Bytes(Digest, Bytes), File(Digest, PathBuf) }
   before the server work with no flag day.
 - **Limit discovery.** At first use the engine calls `GetCapabilities`. It takes the
   smaller of the advertised `max_batch_total_size_bytes` (where nonzero) and
-  `--transfer-batch-bytes`. It never assumes 4 MiB.
+  `--transfer-batch-bytes`. It never assumes 4 MiB. The worker listener does not serve
+  `Capabilities` (stage S1 adds only the CAS service), so there the call answers
+  UNIMPLEMENTED: the engine then uses `--transfer-batch-bytes` alone, logs that once,
+  and does not ask again for the life of the process. The flag's default (2 MiB) is
+  under the server's 4 MiB batch limit, and a deploy that raises the flag past it gets
+  INVALID_ARGUMENT for the batch, which is resent as ByteStream (4.4). Serving
+  `Capabilities` on the worker listener is not planned.
 
 ### 4.4 Limits, retries, cancellation
 
@@ -626,7 +634,8 @@ snapshot file (6.9), and loads it at start. Start-up, in order:
    order and the byte total. A missing, corrupt, truncated or unknown-version snapshot is
    discarded with a warning (`cache_index_discarded=missing|corrupt|version`), and the
    in-memory index starts empty. Start-up never blocks on anything but this one read
-   (`cache_index_load_ms`; *unmeasured*, about 56 MiB at 1M entries). The snapshot
+   (`cache_index_load_ms`: 339 to 373 ms for the 56 MB snapshot of 1M entries, measured
+   in C1; see "C1 as built"). The snapshot
    thread then writes a snapshot at once (6.9), so a well-formed snapshot of what was
    loaded exists before the first lease.
 4. **Serve at once, and drain to the limit.** The cache **serves at once**: hits, fills
@@ -663,8 +672,8 @@ snapshot file (6.9), and loads it at start. Start-up, in order:
 and the size limit is enforced against it. A snapshot is written right after load, every
 5 minutes, at a clean stop, and right after each adopt pass completes (6.9). One pass
 takes 256 directories at one per second plus the listing time: about 5 minutes,
-*unmeasured* at 1M entries. The bytes on disk that the total does not count are, at any
-moment, at most:
+*unmeasured* at 1M entries (C1 defers it; see "C1 as built"). The bytes on disk that
+the total does not count are, at any moment, at most:
 
 - **Fills since the last snapshot that was written, across runs.** After one crash that
   is at most 5 minutes of fills plus one snapshot write, counted when the next pass
@@ -730,8 +739,9 @@ the file is always written whole.
 adopt pass completes, and on a clean stop, from the in-memory index, on the snapshot
 thread. The lease path never does index I/O: a hit updates the entry's last
 use in memory (from the daemon's clock, which tests replace with a fake one), and nothing
-else. The thread copies the entries under the index lock (no I/O under it; the hold is
-*unmeasured*, and C1 measures it at 1M entries), then, without the lock, writes
+else. The thread copies the entries under the index lock (no I/O under it; at 1M entries the
+longest a caller waited on the lock was 23 to 24 ms, measured in C1), then, without the
+lock, writes
 `index.snap.tmp`, `fsync`s it, renames it over `index.snap` and `fsync`s `v1/`. A crash at
 any point leaves the previous snapshot or the new one, never a mix; the temp file is
 cleared at the next start. At 1M entries that is 56 MiB written per 5 minutes, about
@@ -851,9 +861,9 @@ noise once the cache exists. So placement changes **last**, and only if metrics 
 | **S1, server** | `WorkerCas` on the worker listener: FindMissing, BatchRead, BatchUpdate, GetTree, each admitted exactly as `WorkerBlobs::admit` admits ByteStream (one admission rule). `batch_read_blobs` reads a batch's blobs concurrently (bounded, e.g. 32) and coalesces adjacent records in one segment into one range GET. Helps buck2's own batch reads with no client change. Test C-15. | nothing; in parallel with T1 |
 | **P, plain text** | Lifts the three plain-text refusals of 4.7 | nothing |
 | **C1, the first cache** (folds in komira-build-farm#527) | Container driver only, persistent from the start. `kbf-daemon::cache`: layout; the exclusive lock, taken before any startup cleanup, on a file never unlinked; `tmp/` cleared at start; fills hashed into `tmp/` and inserted with `RENAME_NOREPLACE`; the index (6.9: one snapshot file written after load, every 5 minutes, after each adopt pass and at a clean stop, discarded if malformed) loaded at start, so the cache serves at once while the evictor drains to the limit (6.8); the fill-map slot taken by fills, the evictor and the adopt pass; the rate-limited adopt pass, which deletes nothing and speeds up under free-space pressure; lazy re-hash on first use after start; the stat check; one fill per key; LRU by bytes; pins; the ENOENT retry; empty files created directly; link-limit copy; one inode per key per lease; the free-space floor that skips `nlink > 1`. `chown-dirs`. `prepare_outputs` copies instead of renaming. The ETXTBSY retry. Flags `--cache-dir`, `--cache-max-bytes`, `--cache-min-free-bytes`, `--cache-link-concurrency`. Tests C-1, C-2, C-4, C-7 to C-10, C-12, C-13, C-16 to C-20, R-1 to R-9. | T1 planned first; correct without A or T1 (see below) |
-| **T2, batching (fix 3)** | `read_many` and `upload_missing` batch small blobs (4.3); per-blob status; the limit from GetCapabilities. Test C-14. | T1, S1 deployed |
+| **T2, batching (fix 3)** | `read_many` and `upload_missing` batch small blobs (4.3); per-blob status; the limit from GetCapabilities, or `--transfer-batch-bytes` alone where it answers UNIMPLEMENTED (4.3). Test C-14. | T1, S1 deployed |
 | **C3, cache metrics** | `InputStats` and per-node cache metrics through the APIs (section 7) | C1, T1 |
-| **C2, macOS** | Waits on a separate macOS action-isolation design (actions as per-lease unprivileged users, not the daemon's user), which decides hard link versus `clonefile`. Until then: `clonefile`; the sandbox check. Tests C-3, C-3b; Spotlight and backup exclusion; link-concurrency measurement | C1 |
+| **C2, macOS** | Decided in [macos-end-state.md](macos-end-state.md) (step 5): hard links once actions run as pool lease users, not the daemon's user. A root-owned read-only cache on a dedicated APFS volume, daemon-made input directories owned by the slot uid, `clonefile` private copies for inputs an output names, behind `--cache-dir`. Until lease users exist: `clonefile`; the sandbox check. Tests C-3, C-3b and that document's step 5 tests; Spotlight and backup exclusion; link-concurrency measurement | C1; lease users (macos-end-state.md steps 3, 4) |
 | **C4a-d** | Directory cache and GetTree; subtree link plans; macOS directory clone; outputs into the cache, including the copy-mode skip. Tests C-12 (C4b, C4c), C-21. | C1; GetTree needs S1 |
 | **C5a(-b)** | `held_trees` heartbeat report; a placement tie-break only if justified | C3 |
 | **T3** | The server's object-store traffic moves onto the engine core | T1, S1 |
@@ -913,7 +923,7 @@ serve FindMissing and Batch today), or a counting fake CAS.
 | C-14 | (T2) A 3,000-blob tree is fetched in batches of at most 2 MiB. A full 4 MiB server batch decodes. A per-blob NOT_FOUND gives `Missing`. A corrupt blob in a batch is refused. One batch holds one permit. | tonic's 4 MiB default; per-blob status ignored; unhashed batch bytes; a batch taking N permits | Default decode limit; skip `digest_of`; one permit per blob |
 | C-15 | (S1) A 100-blob `BatchReadBlobs` against an object store with 10 ms per GET finishes well under 100 x 10 ms. | Serial batch reads | Revert to the serial loop |
 | C-16 | A second daemon on a locked `--cache-dir` warns, reports `cache_disabled_reason=locked`, runs uncached, and its leases succeed. Daemon 1 holds a fill open in `tmp/` (the R-1 fault hook) when daemon 2 starts. The first daemon's entries, its lock file (same inode) and its `tmp/` fill are unchanged, the fill then completes and inserts, and a third daemon is still refused. | Two owners sharing one cache's accounting; startup cleanup that runs before the lock and deletes the owner's fills or lock file | Take the lock shared; clear `tmp/` before taking the lock; unlink and recreate the lock file at start |
-| C-17 | Zig-shaped tree (20,000 files; shape from the real toolchain, *unmeasured*): lease 2 fetches 0 bytes and `cache_hits == files - empty_files`. `link_ms` is reported, not gated. | The cache not consulted on the hot path | `materialize` ignoring the cache |
+| C-17 | Zig-shaped tree (20,000 files, above the 15,189 of the zig toolchain komira pins, section 1): lease 2 fetches 0 bytes and `cache_hits == files - empty_files`. `link_ms` is reported, not gated. | The cache not consulted on the hot path | `materialize` ignoring the cache |
 | C-18 | Determinism: a tree with two identical-content files `a` and `b`, run twice, once with EMLINK forced on that key. `stat` of `a` and `b` inside the action shows one inode both times, and a `tar` of the inputs is identical across runs. | A fallback that gives some names a private copy and others the cache inode | Fall back per name instead of per key per lease |
 | C-19 | Linux native with `--cache-dir`: a warning, `link_mode=off:native-same-uid`, and the cache directory is never created or read. | Enabling a cache that a same-uid action can poison | Enable the cache on Linux native |
 | C-20 | Free-space floor: leases hold links to most entries, and scratch pushes free space below the floor. Only `nlink == 1` entries are evicted, `cache_floor_unreachable` is set, and the linked entries survive. | A floor that empties the cache without freeing space | Ignore `st_nlink` in free-space eviction |
@@ -939,6 +949,60 @@ Wall-clock speedups are reported, never asserted.
 - Concurrent first uses of one unverified entry share one re-hash, merged per key like a fill.
 - macOS (C2): `clonefile` does not change the source's ctime, so the pass's last use there is the insert time; on Linux removing a lease directory also bumps ctime. Both cost LRU order only.
 - Add tests for a daemon killed mid-snapshot-write (mutant: write `index.snap` in place), for ENOSPC on a snapshot write (the previous snapshot is kept), and for an outside creator between a fill's `fstatat` and its rename (the EEXIST half of R-5's mutant).
+
+**C1 as built** (where the code differs from the sections above, or settles what they
+left open):
+
+- Fills read through the existing CAS client, which returns a blob whole: a fill holds
+  its blob in memory, within the lease's `tree::FETCH_BYTES_IN_FLIGHT`. T1's `read_to`
+  replaces this. `--cache-link-concurrency` bounds a lease's keys in flight, hits and
+  fills alike; T1 separates network permits from local work.
+- A fill is driven by the lease that took the key's slot. If that lease is dropped, the
+  fill stops with it and the slot is released; a waiter then takes the slot and fills
+  the key itself. There is no "more than half its bytes" rule before T1.
+- The slot records no holder kind. Whoever held it, a waiter looks at the index again
+  once it is released, and gets a failed fill's error; the adopt pass skips a key whose
+  slot anyone holds (the evictor's hold ends with index and name agreeing too).
+- `cache_hits` and `cache_misses` count files (names); `verify_hashes` counts entries.
+  A key the index did not list but whose file a fill adopted after a re-hash is a miss
+  that fetched nothing. C1's counters are `InputStats`, logged once per lease
+  (`inputs: files=...`), and `CacheStats` for the node.
+- An input an output names is a private copy made by `materialize`; `prepare_outputs`
+  still renames it into `upper`. Without `--cache-dir` the driver chowns the input root
+  with `chown -hR` as before, so nothing changes for an uncached node.
+- The ETXTBSY retry (one more `podman start`) applies with or without the cache. C-9 is
+  tested against the stand-in Podman, which reports crun's ETXTBSY: the race itself
+  cannot be timed from a test. C-12 has C1's half only (no subtree is reused yet).
+- `--cache-dir` must exist; a directory named `kbf-lease-*` or `lease-*` is refused
+  (`cache_disabled_reason=lease-name`), not only warned about. Another layout version
+  `v<n>` is renamed `v<n>.moved-<unix seconds>`. Podman's storage must be the kernel's
+  `overlay` with no `mount_program` (fuse-overlayfs is refused as `graph-driver`).
+- A clean stop is the last handle of the cache being dropped: the daemon's exit saves
+  the index. Snapshot writers are serialised by a lock of their own.
+- **A cached input cannot be renamed or hard-linked in the container**, only read or
+  unlinked (C-1 and C-12 on the hosted runners' kernel overlay): overlayfs copies a lower
+  file up before a rename or a link, and refuses to copy up one whose owner the caller's
+  user namespace does not map (`EOVERFLOW`). Section 5.1 expected the rename to work. An
+  input an output names is a private copy, so moving it into its output path works; an
+  action that renames another input fails. Decided (CEO): accept it, as Q1 accepted
+  `EACCES`. An action that renames some other cached input into an output fails; Q1's
+  private-copy opt-out (`kbf-writable-inputs=1`) is added only if a real build breaks.
+- Podman's storage is checked before the cache is opened: `CacheUse` carries the cache's
+  configuration, and `PodmanRuntime::new` opens it only on storage that passed. On a
+  refused graph driver the directory is untouched: no lock, no `tmp/` cleared, no drain,
+  no snapshot.
+- **Measured at 1M entries** (`crates/kbf-daemon/tests/cache/measure.rs`, an ignored test,
+  so off the gate; a release build on one developer machine, an i7-14700K with an NVMe
+  disk, three runs): `cache_index_load_ms` 339 to 373 ms for the 56 MB snapshot; the
+  longest wait of a call taking the index lock while snapshots copy the entries, 23 to
+  24 ms; one snapshot written whole (copy, write, `fsync`, rename), 71 to 189 ms. Not
+  measured: the adopt pass at 1M entries (6.8 says about 5 minutes; its 256 paced
+  directories alone take 256 s at the 1 s pace, and the listing time needs 1M real files
+  on a node's disk, so it is left for the first farm node that holds them), and the
+  farm nodes' disks against the disk-size assumption (6.8), a deploy-config matter.
+- The toolchain count of section 1 is the archive's (15,189 files): C1 has no farm
+  build of zig to log `inputs: files=...` from, so the count per input root waits for
+  the first cached farm node.
 
 ---
 

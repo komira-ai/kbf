@@ -16,6 +16,8 @@ test = false
 
 [dependencies]
 clap.workspace = true
+# The input cache's index snapshot (`cache::index`).
+crc32fast.workspace = true
 futures.workspace = true
 hex.workspace = true
 kbf-caps.workspace = true
@@ -24,8 +26,9 @@ kbf-types.workspace = true
 libc.workspace = true
 prost.workspace = true
 prost-types.workspace = true
-# Killing the keeper's own process group, and its name in the process table (Linux).
-rustix = { workspace = true, features = ["process", "thread"] }
+# Killing the keeper's own process group, and its name in the process table (Linux);
+# the input cache's file operations (`fs`: flock, renameat2, linkat, statvfs).
+rustix = { workspace = true, features = ["fs", "process", "thread"] }
 sha2.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }

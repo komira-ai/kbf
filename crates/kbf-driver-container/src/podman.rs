@@ -349,6 +349,39 @@ impl Podman {
         }
     }
 
+    /// Gives `dir` and every directory below it, and nothing else, to `owner` (`uid:gid`
+    /// in Podman's user namespace), by running `helper` (this daemon's own binary) in
+    /// its `__chown-dirs` mode there (`chown_dirs`). An input root whose files are
+    /// links to the cache's entries is changed this way: `chown -R` would re-own them.
+    pub(crate) async fn chown_dirs(
+        &self,
+        helper: &Path,
+        owner: &str,
+        dir: &Path,
+    ) -> Result<(), String> {
+        let mut args: Vec<OsString> = vec!["unshare".into(), helper.into()];
+        args.extend([crate::chown_dirs::ARG, owner].map(OsString::from));
+        args.push(dir.into());
+        let output = self.output(&args).await?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(failure("unshare chown-dirs", &output))
+        }
+    }
+
+    /// The image store's graph driver and its options, as `podman info` names them:
+    /// `overlay` and a JSON object. Blocking.
+    pub(crate) fn graph_driver(&self) -> Result<(String, serde_json::Value), String> {
+        let format = "--format={{.Store.GraphDriverName}} {{json .Store.GraphOptions}}";
+        let output = self.blocking_output(&["info", format], "info")?;
+        let text = String::from_utf8_lossy(&output.stdout);
+        let (driver, options) = text.trim().split_once(' ').unwrap_or((text.trim(), "{}"));
+        let options = serde_json::from_str(options)
+            .map_err(|e| format!("podman info: graph options {options:?}: {e}"))?;
+        Ok((driver.to_owned(), options))
+    }
+
     /// Removes `dir` inside Podman's user namespace, where files an action created as
     /// another container user can be deleted. Blocking.
     pub(crate) fn unshare_remove_blocking(&self, dir: &Path) -> Result<(), String> {
