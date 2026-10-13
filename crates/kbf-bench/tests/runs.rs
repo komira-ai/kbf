@@ -1,12 +1,15 @@
 //! Runs against a kbf-server in this process (the in-memory cache): every blob of a
 //! 500-file tree sent and read back by each method, over the worker listener's mutual
 //! TLS and over the REAPI listener, checked byte for byte by a client of the test's
-//! own; FindMissingBlobs; failures counted and reported; the deadline.
+//! own; FindMissingBlobs; failures counted and reported; the deadline; `--in-flight` as
+//! the engine's limit.
 
 mod support;
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use futures::stream;
@@ -561,4 +564,78 @@ async fn one_in_flight_the_request_times_fit_in_the_wall_time() {
             );
         }
     }
+}
+
+/// Holds every ByteStream Write for a while before answering it committed, and
+/// counts the most it held at once.
+#[derive(Clone, Default)]
+struct Holder {
+    held: Arc<AtomicU64>,
+    most: Arc<AtomicU64>,
+}
+
+#[tonic::async_trait]
+impl ByteStream for Holder {
+    type ReadStream = stream::Iter<std::vec::IntoIter<Result<ReadResponse, Status>>>;
+
+    async fn read(&self, _: Request<ReadRequest>) -> Result<Response<Self::ReadStream>, Status> {
+        Err(Status::unimplemented("holder"))
+    }
+
+    async fn write(
+        &self,
+        request: Request<Streaming<WriteRequest>>,
+    ) -> Result<Response<WriteResponse>, Status> {
+        let mut messages = request.into_inner();
+        let mut committed_size = 0;
+        while let Some(message) = messages.message().await? {
+            committed_size += message.data.len() as i64;
+        }
+        let held = self.held.fetch_add(1, Ordering::SeqCst) + 1;
+        self.most.fetch_max(held, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        self.held.fetch_sub(1, Ordering::SeqCst);
+        Ok(Response::new(WriteResponse { committed_size }))
+    }
+
+    async fn query_write_status(
+        &self,
+        _: Request<QueryWriteStatusRequest>,
+    ) -> Result<Response<QueryWriteStatusResponse>, Status> {
+        Err(Status::unimplemented("holder"))
+    }
+}
+
+/// Catches `--in-flight` not being the engine's limit: above the engine's default of
+/// 64 the engine would hold the run to 64 Writes at once. 100 in flight over 100
+/// blobs (98 files, the output directory, the Tree), each Write held 1 s: all 100
+/// are out together. FindMissing is the liar's UNIMPLEMENTED, so the engine sends
+/// every blob.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn in_flight_above_the_engine_default_is_the_engine_limit() {
+    let holder = Holder::default();
+    let incoming = TcpIncoming::bind(SocketAddr::from(([127, 0, 0, 1], 0))).expect("bind");
+    let target = plain(incoming.local_addr().expect("addr"));
+    tokio::spawn(
+        TonicServer::builder()
+            .add_service(ByteStreamServer::new(holder.clone()))
+            .add_service(ContentAddressableStorageServer::new(Liar))
+            .serve_with_incoming(incoming),
+    );
+    let tree = tree::generate(
+        &Shape {
+            files: 98,
+            empty: 0,
+            dirs: 0,
+            total_bytes: 9800,
+        },
+        10,
+    )
+    .expect("tree");
+    assert_eq!(tree.blobs.len(), 100);
+    let mut wide = options(Method::Bytestream);
+    wide.in_flight = 100;
+    let sent = upload(&target, &tree, wide).await;
+    assert_moved_all(&sent, &tree);
+    assert_eq!(holder.most.load(Ordering::SeqCst), 100, "{}", sent.table());
 }
