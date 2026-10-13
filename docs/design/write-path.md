@@ -1,11 +1,12 @@
-# The write path: segment upload, grouping and a local write tier (**planned**)
+# The write path: segment upload, grouping and a local write tier
 
 How bytes get from an upload into the store, and what an acknowledgement promises.
-Today's path is in [storage.md](storage.md#writes). Planned, none built yet: **write
-grouping** (concurrent small REAPI uploads share one segment, PUT and metadata commit),
-**segment upload** (the daemon sends an action's outputs as whole segments over the
-worker listener, with one commit), and a **local write tier** (segments synced to a
-server's NVMe or SSD, acknowledged, and flushed to the object store in the background).
+Today's path is in [storage.md](storage.md#writes). Built: **write grouping**
+(section 3: concurrent small REAPI uploads share one segment, PUT and metadata commit;
+`kbf-front/src/cache/write_group.rs`). **Planned**: **segment upload** (the daemon
+sends an action's outputs as whole segments over the worker listener, with one commit),
+and a **local write tier** (segments synced to a server's NVMe or SSD, acknowledged,
+and flushed to the object store in the background).
 
 ## 1. The problem, measured
 
@@ -76,7 +77,7 @@ calls `store_blobs`) and `put_segment`. It has one **open segment** (a
 2. The group pushes them into the open segment. A digest already in it is a no-op push
    (`SegmentWriter::push` already does this), and both callers wait on that segment.
 3. The open segment is **sealed** when the next blob would not fit (`WriteError::Full`)
-   or when its oldest blob has waited `--write-linger` (default 2 ms).
+   or when its oldest blob has waited `--write-linger` (in milliseconds, default 2).
 4. A sealed segment is written as today: one `put_new`, the footer read back, one
    `Command::PutBlobs` listing every blob in it. Then every caller with a blob in it is
    answered. A caller whose blobs span two segments is answered when both are settled.
@@ -108,7 +109,16 @@ linger nor holds up small writes. It is still held in memory until verified
 - **What it does not cover.** A `BatchUpdateBlobs` request is decoded by tonic before
   its handler runs: up to the 4 MiB message limit per stream, times the HTTP/2
   concurrent-stream limit. That limit is set explicitly on both listeners and named in
-  the flag reference, so the total is a stated number, not "bounded".
+  the flag reference, so the total is a stated number, not "bounded": 200 streams per
+  connection (`MAX_CONCURRENT_STREAMS`). A `Write`'s first message (which names the
+  blob) is decoded the same way, and a `Write` waiting for admission leaves up to its
+  stream's flow-control window, 1 MiB (`STREAM_WINDOW_BYTES`), received and unread.
+- **Flow control.** The connection's window is set to every stream's window at once
+  (200 MiB, `CONNECTION_WINDOW_BYTES`) on both listeners. With the transport's default
+  of 1 MiB, the unread data of the `Write`s waiting for admission on one connection
+  takes the whole window, and the admitted `Write`s on it, which must finish before
+  anyone else is admitted, never receive another byte: the uploads deadlock. The
+  admission test below goes red that way with the windows left at their defaults.
 - `--write-puts-in-flight` (default 4) bounds concurrent segment PUTs. A segment
   sealed while all are busy waits; new blobs go to a new open segment.
 - Commits stay one at a time. Each now carries up to a segment's worth of blobs.
@@ -121,7 +131,10 @@ linger nor holds up small writes. It is still held in memory until verified
   first PUT that the store kept but reported as failed cannot make the retry fail on
   `AlreadyExists` under `conditional_put`. The object it may have left is an orphan for
   the planned sweep ([storage.md](storage.md#planned)). If every attempt fails, the
-  segment's blobs are not indexed and each of them is answered `UNAVAILABLE`.
+  segment's blobs are not indexed and each of them is answered `UNAVAILABLE`. A
+  footer read-back that does not reach the store is `UNAVAILABLE` too, and not retried.
+  "Unavailable" here is a request that did not complete (connect, reset, timeout) or a
+  5xx answer; any other error (a 4xx, `AlreadyExists`) fails the segment at once.
 - **Per-blob answers.** `BatchUpdateBlobs` reports a status per blob, so a request whose
   blobs landed in two segments gets a mixed answer: `OK` for blobs in the committed
   segment, `UNAVAILABLE` for the other. A ByteStream `Write` has one blob and one answer.
@@ -449,7 +462,7 @@ Grouping (PR 1), over `MemoryStore` wrapped to count and fault requests:
 | a lone write under a paused clock is sealed at the linger | waiting forever for a full segment |
 | a blob at `--write-own-segment-bytes` gets its own segment without the linger | large blobs held up by small ones |
 | the same digest from two callers: one record, both answered | duplicate records; a caller never answered |
-| 48 concurrent 64 MiB `Write`s with a 1 GiB bound: peak buffered bytes stay under the bound | permit taken after buffering; mutant: permit in `store_blobs` |
+| 48 concurrent `Write`s on one connection, three times the bound in all: peak buffered bytes stay under the bound, every `Write` finishes (built as 4 MiB `Write`s and a 12 MiB bound, not 64 MiB and 1 GiB, so the suite does not hash 3 GiB) | permit taken after buffering; mutant: permit in `store_blobs`; flow-control windows left at the transport's defaults (deadlock) |
 | a start with `--write-bytes-in-flight` below `MAX_BLOB_BYTES` is refused | a legal blob waiting forever |
 | a start with `--segment-upload-max-bytes` over `--write-bytes-in-flight`, or below one 1 GiB record plus footer, is refused; a `Begin` over the cap or `MAX_UPLOAD_RECORDS` is refused; a 1 GiB single-record segment commits | a `Begin` waiting forever for its permit |
 

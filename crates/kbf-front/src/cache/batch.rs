@@ -111,7 +111,7 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         }
         let key = self.object_key(run.object).ok()?;
         let range = ByteRange::new(run.start, run.end - run.start)?;
-        match self.objects.get_range(&key, range).await {
+        match self.objects().get_range(&key, range).await {
             Ok(bytes) => Some(bytes),
             Err(error) => {
                 let blobs = run.blobs.len();

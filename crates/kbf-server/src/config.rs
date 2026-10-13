@@ -227,7 +227,8 @@ pub struct Args {
     /// (`kbf_front::MAX_CONCURRENT_STREAMS`).
     #[arg(
         long,
-        default_value_t = kbf_front::WriteConfig::DEFAULT.bytes_in_flight
+        default_value_t = kbf_front::WriteConfig::DEFAULT.bytes_in_flight,
+        value_parser = clap::value_parser!(u64).range(kbf_front::MAX_BLOB_BYTES..)
     )]
     pub write_bytes_in_flight: u64,
     /// The most segment PUTs, each with its footer read-back, in flight at once. A
