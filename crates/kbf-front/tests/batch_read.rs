@@ -287,8 +287,8 @@ async fn a_batch_read_keeps_at_most_thirty_two_gets_in_flight() {
 /// Catches (mutant "never extend a run"): blobs stored back to back in one segment
 /// read with one GET each instead of one GET for the lot; a run that spans a record
 /// the batch did not ask for (a gap must split it); and answers that lose request
-/// order or a digest asked twice. The empty blob needs no GET, and a digest that does
-/// not parse fails alone.
+/// order or a digest asked twice. The empty blob needs no GET, a blob never stored is
+/// NOT_FOUND with no GET, and a digest that does not parse fails alone.
 #[tokio::test]
 async fn blobs_back_to_back_in_one_segment_are_read_with_one_get() {
     let farm = Farm::new().await;
@@ -321,8 +321,12 @@ async fn blobs_back_to_back_in_one_segment_are_read_with_one_get() {
     assert_eq!(farm.store.gets() - gets, 1, "three records back to back");
 
     let gets = farm.store.gets();
-    let answers = farm.batch_read(vec![proto(&a), proto(&c)]).await;
-    assert_eq!(answers, [ok(&a), ok(&c)]);
+    let never = blob("never stored");
+    let answers = farm
+        .batch_read(vec![proto(&a), proto(&never), proto(&c)])
+        .await;
+    let not_found = (Code::NotFound, Vec::new());
+    assert_eq!(answers, [ok(&a), not_found, ok(&c)]);
     assert_eq!(farm.store.gets() - gets, 2, "the second record is a gap");
 }
 
@@ -345,7 +349,8 @@ async fn a_failed_joined_get_reads_each_blob_alone() {
 /// the store served for one blob of a run because the GET as a whole succeeded. The
 /// damaged blob must fail UNAVAILABLE and mark its object unreachable (so all three
 /// are then reported missing and get uploaded again), while its neighbours, whose
-/// bytes check, are served.
+/// bytes check, are served. And (mutant "an unreachable blob answers NOT_FOUND"): the
+/// next batch answers all three UNAVAILABLE without reading the store.
 #[tokio::test]
 async fn a_damaged_record_in_a_joined_get_fails_alone_and_marks_its_object() {
     let farm = Farm::new().await;
@@ -356,6 +361,17 @@ async fn a_damaged_record_in_a_joined_get_fails_alone_and_marks_its_object() {
     assert_eq!(answers, [ok(&a), (Code::Unavailable, Vec::new()), ok(&c)]);
     let all: BTreeSet<String> = [&a, &b, &c].iter().map(|x| proto(x).hash).collect();
     assert_eq!(farm.missing(&[&a, &b, &c]).await, all);
+
+    // Once marked, every blob of the object answers UNAVAILABLE (never NOT_FOUND, which
+    // a client would read as "never uploaded"), with no GET.
+    let gets = farm.store.gets();
+    let answers = farm.batch_read(vec![proto(&a), proto(&b), proto(&c)]).await;
+    let unavailable = (Code::Unavailable, Vec::new());
+    assert_eq!(
+        answers,
+        [unavailable.clone(), unavailable.clone(), unavailable]
+    );
+    assert_eq!(farm.store.gets(), gets);
 }
 
 /// Catches (mutant "no store check before a joined GET"): blobs indexed in a store
