@@ -1,10 +1,11 @@
 //! Whether an action may use the network, and how the driver keeps it off.
 //!
-//! An action asks for the network with the platform property `network`: absent,
-//! `off` or `none` keeps it off (loopback still works); `on` or `standard` turns it
-//! on. Anything else is the client's error.
+//! An action has the network unless it turns it off with the platform property
+//! `network`: absent, `on` or `standard` gives it the network (the internet and the
+//! LAN); `off` or `none` keeps it off (loopback still works). Anything else is the
+//! client's error.
 //!
-//! On macOS every action runs under `sandbox-exec`. An action without the network
+//! On macOS every action runs under `sandbox-exec`. An action with `network=off`
 //! gets [`NO_NETWORK_PROFILE`], which denies every network operation except loopback
 //! and Unix sockets (the profile Bazel's macOS sandbox uses); one with the network gets
 //! [`BASE_PROFILE`]. Both keep the action from handing work to launchd, which would run
@@ -32,6 +33,9 @@
 //!   network on the action's behalf is reachable. The plainest is the system's
 //!   resolver (`mDNSResponder`): DNS lookups still go out, and a name an action looks
 //!   up can carry data out of the node. Loopback services likewise.
+//! - With `network=off`, a connect to the node's own non-loopback address is still
+//!   allowed, as `tests/network.rs` saw on the macOS runner, so a service listening on
+//!   the node's LAN address is reachable.
 //! - Other mach and XPC services stay reachable (`(allow default)`), but for those
 //!   [`NO_DEVICE_RULES`] names, Apple Events
 //!   among them (`osascript`, the `appleevent-send` operation): an action can ask
@@ -164,8 +168,8 @@ pub fn network_of(action: &Action, command: &Command) -> Result<Network, Runtime
         .and_then(|p| p.properties.iter().find(|p| p.name == PROPERTY))
         .map(|p| p.value.as_str());
     match value {
-        None | Some("off" | "none") => Ok(Network::Off),
-        Some("on" | "standard") => Ok(Network::On),
+        Some("off" | "none") => Ok(Network::Off),
+        None | Some("on" | "standard") => Ok(Network::On),
         Some(other) => Err(RuntimeError::Invalid(format!(
             "platform property {PROPERTY}={other:?}: use on, standard, off or none"
         ))),
@@ -263,14 +267,14 @@ mod tests {
         })
     }
 
-    /// Catches: the network on by default, an unknown value taken as on or off
-    /// instead of refused, and the Command's deprecated platform overriding the
-    /// Action's.
+    /// Catches: the network off by default (the old rule), an unknown value taken as
+    /// on or off instead of refused, and the Command's deprecated platform overriding
+    /// the Action's.
     #[test]
     #[allow(deprecated)]
-    fn the_network_is_off_unless_asked_for() {
+    fn the_network_is_on_unless_turned_off() {
         let none = (Action::default(), Command::default());
-        assert_eq!(network_of(&none.0, &none.1).ok(), Some(Network::Off));
+        assert_eq!(network_of(&none.0, &none.1).ok(), Some(Network::On));
         for (value, want) in [
             ("off", Network::Off),
             ("none", Network::Off),

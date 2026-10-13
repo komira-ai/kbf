@@ -3,7 +3,7 @@
 
 mod support;
 
-use std::net::TcpListener;
+use std::net::{IpAddr, TcpListener, UdpSocket};
 use std::sync::Arc;
 
 use kbf_driver_native::network::Isolation;
@@ -36,6 +36,19 @@ fn connect(host: &str, port: u16, secs: u32) -> Spec {
     ])
 }
 
+/// This machine's own address on the network it routes to the outside through: the
+/// local address of a UDP socket connected to a documentation address (a UDP connect
+/// sends nothing).
+fn own_address() -> IpAddr {
+    let probe = UdpSocket::bind("0.0.0.0:0").expect("bind udp");
+    probe
+        .connect("192.0.2.1:9")
+        .expect("no route out of this machine");
+    let ip = probe.local_addr().expect("local addr").ip();
+    assert!(!ip.is_loopback(), "{ip}");
+    ip
+}
+
 /// Catches: the network off by default again (an action that says nothing about the
 /// network refused a connect to a LAN address or a public host), `network=off` no
 /// longer keeping it off, `network=on` refused, and loopback refused with the network
@@ -44,7 +57,8 @@ fn connect(host: &str, port: u16, secs: u32) -> Spec {
 /// (RFC 1918) one no runner has, so nothing answers there: with the network the
 /// connect times out or fails another way, but it is not refused by the sandbox. The
 /// node's own non-loopback address is no stand-in: the no-network profile lets an
-/// action connect to it (the first run of this test saw that on the macOS runner).
+/// action connect to it, which the last check pins (`network.rs` lists it among what
+/// the sandbox does not cover; if macOS starts refusing it, that list changes).
 /// Runs where the node has an isolation mechanism (`sandbox-exec` on macOS);
 /// elsewhere it checks the node says it has none.
 #[tokio::test]
@@ -90,4 +104,10 @@ async fn the_network_is_on_unless_turned_off() {
     let spec = connect("127.0.0.1", port, 10).property("network", "off");
     let result = run(&rt, &cas, 9, &spec).await.expect("ran");
     assert_eq!(stdout(&cas, &result).trim(), "connected", "off, loopback");
+
+    let own = TcpListener::bind((own_address(), 0)).expect("bind own address");
+    let addr = own.local_addr().expect("addr");
+    let spec = connect(&addr.ip().to_string(), addr.port(), 10).property("network", "off");
+    let result = run(&rt, &cas, 10, &spec).await.expect("ran");
+    assert_eq!(stdout(&cas, &result).trim(), "connected", "off, {addr}");
 }

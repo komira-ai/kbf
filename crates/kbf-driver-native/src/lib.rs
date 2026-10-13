@@ -20,8 +20,9 @@
 //!   [`user_folders`], whose leftovers but Swift Build's are swept),
 //!   no user preference written through
 //!   `cfprefsd` (`defaults write`), no work handed to launchd
-//!   (`open`, `launchctl submit`/`load`/`bootstrap`), and no network unless the
-//!   action's `network` platform property allows it; elsewhere nothing is enforced,
+//!   (`open`, `launchctl submit`/`load`/`bootstrap`), and no network when the
+//!   action's `network` platform property is `off` or `none` (absent means on);
+//!   elsewhere nothing is enforced,
 //!   and the node reports which in its `network_isolation` capability;
 //! - the Xcode its `xcode` platform property names, as `DEVELOPER_DIR` ([`xcode`]: the
 //!   driver advertises every ready Xcode build, reports every installed Xcode with why
