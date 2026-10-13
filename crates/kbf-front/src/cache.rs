@@ -754,5 +754,9 @@ fn unexpected(applied: &Applied) -> CacheError {
     ))
 }
 
+mod batch;
+
+pub use batch::BATCH_READS_IN_FLIGHT;
+
 #[cfg(test)]
 mod tests;

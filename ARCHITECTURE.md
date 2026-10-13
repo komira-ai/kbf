@@ -389,7 +389,8 @@ in between, a follower redirects them to the leader, and they retry forever
   certificate lifetimes bound what the list misses. See
   [worker-protocol.md](docs/design/worker-protocol.md#node-identity-and-the-deny-list).
 - **Built: blobs on the worker listener.** The worker listener also serves
-  `ByteStream` (Read, Write, QueryWriteStatus) over the farm's cache. A daemon's real
+  `ByteStream` (Read, Write, QueryWriteStatus) and `ContentAddressableStorage`
+  (FindMissingBlobs, BatchUpdateBlobs, BatchReadBlobs, GetTree) over the farm's cache. A daemon's real
   drivers, and the integration cell's daemon, read inputs and write outputs there:
   `--cas` must be an `https://` URL, normally the same as `--server`, and the daemon
   presents the same certificate as on its worker stream; plain `http://` is refused
@@ -398,8 +399,8 @@ in between, a follower redirects them to the leader, and they retry forever
   key nor that node may be on the deny list, which is looked at again for every call
   (its metadata at each call, the file read again only when that changed). A denied
   daemon is refused PERMISSION_DENIED from its next blob call, on a connection
-  already open too. Nothing else of REAPI is served there (Execute, the action cache,
-  `ContentAddressableStorage` and `Capabilities` answer UNIMPLEMENTED), and on a
+  already open too. Nothing else of REAPI is served there (Execute, the action cache and
+  `Capabilities` answer UNIMPLEMENTED), and on a
   plain-text worker listener every blob call is refused UNAUTHENTICATED. So a daemon
   needs neither the front nor a REAPI credential. See
   [worker-protocol.md](docs/design/worker-protocol.md#blobs-on-the-worker-listener).

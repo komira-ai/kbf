@@ -215,14 +215,16 @@ bounded.
 ### Blobs on the worker listener
 
 Besides `Worker.Session`, the worker listener serves the REAPI `ByteStream` service
-(`Read`, `Write`, `QueryWriteStatus`) over the farm's one cache, so a blob a daemon
-writes there is the blob clients read on the REAPI listener, and the other way round.
+(`Read`, `Write`, `QueryWriteStatus`) and the `ContentAddressableStorage` service
+(`FindMissingBlobs`, `BatchUpdateBlobs`, `BatchReadBlobs`, `GetTree`) over the farm's
+one cache, so a blob a daemon writes there is the blob clients read on the REAPI
+listener, and the other way round.
 It is the daemon's only CAS: `kbf-daemon --cas` (and `kbf-cell daemon --cas`) must be
 an `https://` URL, normally the same as `--server`, and the daemon dials it with its
 own CA, certificate, key and server name. A plain `http://` URL is refused at start.
 
-Each call is admitted before anything of it is served (a `Write` before its first
-message is read):
+Each call of either service is admitted by one rule before anything of it is served
+(a streamed request, such as a `Write`, before its first message is read):
 
 - the listener serves mutual TLS; on a plain-text worker listener every call is
   refused `UNAUTHENTICATED`;
@@ -235,10 +237,13 @@ message is read):
   again for this call (`PERMISSION_DENIED`; a list that cannot be read or parsed
   refuses `UNAVAILABLE`).
 
-The server logs each refused call at WARN with its code and reason. Only
-`ByteStream` is served here, because it is all a daemon's CAS client calls:
-`Execution`, `ActionCache`, `ContentAddressableStorage` and `Capabilities` answer
-`UNIMPLEMENTED` on this listener.
+The server logs each refused call at WARN with its code and reason. An admitted
+call is served as the REAPI listener serves it (the chunking calls of
+`ContentAddressableStorage` answer `UNIMPLEMENTED` on both). `Execution`,
+`ActionCache` and `Capabilities` answer `UNIMPLEMENTED` on this listener. Today's
+daemon CAS client calls only `ByteStream`; FindMissingBlobs and the batch calls are
+there for the transfer engine planned in
+[worker-cache.md](worker-cache.md#4-the-shared-transfer-engine).
 
 Not checked: that the node is registered or connected, or that it reads only the
 inputs of leases it holds. A certificate the deny list does not refuse can read any
