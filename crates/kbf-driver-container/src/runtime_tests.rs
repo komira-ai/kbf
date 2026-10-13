@@ -243,3 +243,12 @@ fn errors_are_reported_as_whose_they_are() {
         assert_eq!(shown(map(TreeError::Invalid("x".into()))), "Invalid(\"x\")");
     }
 }
+
+/// Catches an output path left out of the private copies, or not seen from the input
+/// root (the working directory before it, a trailing slash kept as an empty step).
+#[test]
+fn the_private_paths_are_the_outputs_from_the_input_root() {
+    let outputs = ["out/a".to_owned(), "b".to_owned()];
+    assert_eq!(private_paths("", &outputs), ["out/a", "b"]);
+    assert_eq!(private_paths("pkg/", &outputs), ["pkg/out/a", "pkg/b"]);
+}

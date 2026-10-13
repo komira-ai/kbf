@@ -34,6 +34,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
 
+use kbf_daemon::cache::{Cache, Disabled, InputStats};
 use kbf_daemon::cas::{Cas, CasError};
 use kbf_daemon::{Runtime, RuntimeError, Work};
 use kbf_proto::reapi::{Action, ActionResult, Command, ExecutedActionMetadata, Platform};
@@ -54,8 +55,8 @@ use crate::podman::{
 use crate::program;
 use crate::remove::remove_tree;
 use crate::tree::{
-    TreeError, check_relative, collect, fetch_message, materialize, output_paths, prepare_outputs,
-    refuse_hidden_working_directory,
+    TreeError, check_relative, collect, fetch_message, materialize, materialize_cached,
+    output_paths, prepare_outputs, refuse_hidden_working_directory,
 };
 
 /// The driver name in the node report.
@@ -90,6 +91,19 @@ pub struct PodmanConfig {
     /// container so labelled. The daemon passes its node id. Two runtimes that share a
     /// Podman store need two owners, or each start removes the other's containers.
     pub owner: String,
+    /// The node's input cache, if it has one (`--cache-dir`). Without it, a lease's
+    /// input files are its own copies, as before the cache.
+    pub cache: Option<CacheUse>,
+}
+
+/// The node's input cache as the driver uses it.
+#[derive(Clone, Debug)]
+pub struct CacheUse {
+    pub cache: Arc<Cache>,
+    /// The `kbf-daemon` binary, run under `podman unshare` in its `__chown-dirs` mode
+    /// ([`crate::chown_dirs`]) to give the input root's directories, not its files, to
+    /// the container's root and back.
+    pub helper: PathBuf,
 }
 
 impl PodmanConfig {
@@ -110,6 +124,7 @@ impl PodmanConfig {
             limits: ContainerLimits::DEFAULT,
             swap_kill: SwapKill::DEFAULT,
             owner,
+            cache: None,
         }
     }
 
@@ -192,6 +207,9 @@ pub struct PodmanRuntime<C> {
     stops: Mutex<BTreeMap<LeaseId, oneshot::Sender<Stop>>>,
     /// The image store's per-image directories, asked of Podman once.
     images: tokio::sync::OnceCell<PathBuf>,
+    /// What the last lease's inputs cost, with the cache (a test's counter; each
+    /// lease's are logged).
+    last_inputs: Mutex<Option<InputStats>>,
 }
 
 impl<C: Cas> PodmanRuntime<C> {
@@ -202,17 +220,42 @@ impl<C: Cas> PodmanRuntime<C> {
     ///
     /// # Errors
     /// The configuration is unusable, or a leftover could not be listed or removed.
+    /// With a cache, it first asks Podman for its graph driver: on one the cache's
+    /// overlay checks have not passed on (anything but the kernel's `overlay`, without
+    /// a `mount_program` such as fuse-overlayfs) it warns and runs uncached.
     pub fn new(config: PodmanConfig, cas: Arc<C>) -> Result<Self, StartError> {
         config.check()?;
-        let runtime = Self {
+        let mut runtime = Self {
             podman: Podman::new(config.podman.clone()),
             config,
             cas,
             stops: Mutex::new(BTreeMap::new()),
             images: tokio::sync::OnceCell::new(),
+            last_inputs: Mutex::new(None),
         };
         sweep(&runtime.podman, &runtime.config).map_err(StartError::Sweep)?;
+        if runtime.config.cache.is_some()
+            && let Err(why) = cache_usable(&runtime.podman)
+        {
+            tracing::warn!("cache: off:{} ({why}); leases run uncached", why.reason());
+            runtime.config.cache = None;
+        }
         Ok(runtime)
+    }
+
+    /// Whether leases link their inputs from the cache.
+    #[must_use]
+    pub fn cached(&self) -> bool {
+        self.config.cache.is_some()
+    }
+
+    /// What the last lease's inputs cost through the cache, if a lease used it.
+    #[must_use]
+    pub fn last_inputs(&self) -> Option<InputStats> {
+        *self
+            .last_inputs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     fn stops(&self) -> MutexGuard<'_, BTreeMap<LeaseId, oneshot::Sender<Stop>>> {
@@ -257,9 +300,22 @@ impl<C: Cas> PodmanRuntime<C> {
                 .await
                 .map_err(|e| failed(dir, &e))?;
         }
-        materialize(cas, input_root, &root)
-            .await
-            .map_err(tree_error)?;
+        match &self.config.cache {
+            Some(cache) => {
+                let private = private_paths(&command.working_directory, &outputs);
+                let stats = materialize_cached(cas, &cache.cache, input_root, &root, &private)
+                    .await
+                    .map_err(tree_error)?;
+                tracing::info!(lease = %lease.name, "inputs: {stats}");
+                *self
+                    .last_inputs
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner) = Some(stats);
+            }
+            None => materialize(cas, input_root, &root)
+                .await
+                .map_err(tree_error)?,
+        }
         // The driver makes the working directory in the upper layer, which would hide
         // an input symlink or file of that name: refused rather than run elsewhere.
         refuse_hidden_working_directory(&root, &command.working_directory)
@@ -272,10 +328,8 @@ impl<C: Cas> PodmanRuntime<C> {
             .map_err(tree_error)?;
         // The container's root is a subordinate id (`--userns=nomap`), which may write
         // only under directories it owns.
-        self.podman
-            .chown(CONTAINER_OWNER, &[&root, &upper, &overlay_work])
-            .await
-            .map_err(RuntimeError::Failed)?;
+        self.give_overlay(CONTAINER_OWNER, &root, &upper, &overlay_work)
+            .await?;
         // `actions/`'s own OOM count before the lease, to say afterwards whether its
         // limit killed the lease.
         lease.backstop_ooms = lease.cgroup.parent_ooms().ok();
@@ -350,51 +404,67 @@ impl<C: Cas> PodmanRuntime<C> {
             .map_err(RuntimeError::Failed)?;
         let stdout_path = lease.dir.join("stdout");
         let stderr_path = lease.dir.join("stderr");
-        let stdout = std::fs::File::create(&stdout_path).map_err(|e| failed(&stdout_path, &e))?;
-        let stderr = std::fs::File::create(&stderr_path).map_err(|e| failed(&stderr_path, &e))?;
-        let start = self
-            .podman
-            .start(&lease.name, stdout, stderr)
-            .map_err(RuntimeError::Failed)?;
-        // The lease owns `podman start` from here, so a dropped run's clean reaps it.
-        let child = lease.start.insert(start);
         let cap = memory_max(work.resources.memory_bytes);
         let swap_kill = self.config.swap_kill;
         let threshold = swap_kill.threshold(work.resources.memory_bytes);
+        let mut started = 0;
+        let ended = loop {
+            started += 1;
+            let stdout =
+                std::fs::File::create(&stdout_path).map_err(|e| failed(&stdout_path, &e))?;
+            let stderr =
+                std::fs::File::create(&stderr_path).map_err(|e| failed(&stderr_path, &e))?;
+            let start = self
+                .podman
+                .start(&lease.name, stdout, stderr)
+                .map_err(RuntimeError::Failed)?;
+            // The lease owns `podman start` from here, so a dropped run's clean reaps it.
+            let child = lease.start.insert(start);
 
-        tokio::select! {
-            // `podman start`'s own status is not the action's: Podman's record, read
-            // below, is. An error waiting for it is not trusted either way, since
-            // `ended` fails the lease unless that record says the container exited, or crun
-            // reports it could not start the program (`program::not_run`).
-            _ = child.wait() => {}
-            () = tokio::time::sleep(timeout) => {
-                self.stop_container(&lease.name, &lease.cgroup, child).await;
-                return Err(self.timed_out(&lease.name, &stdout_path, &stderr_path).await);
+            tokio::select! {
+                // `podman start`'s own status is not the action's: Podman's record, read
+                // below, is. An error waiting for it is not trusted either way, since
+                // `ended` fails the lease unless that record says the container exited, or crun
+                // reports it could not start the program (`program::not_run`).
+                _ = child.wait() => {}
+                () = tokio::time::sleep(timeout) => {
+                    self.stop_container(&lease.name, &lease.cgroup, child).await;
+                    return Err(self.timed_out(&lease.name, &stdout_path, &stderr_path).await);
+                }
+                Ok(by) = &mut *stop => {
+                    *killer = Some(by);
+                    self.stop_container(&lease.name, &lease.cgroup, child).await;
+                    return Err(RuntimeError::Killed);
+                }
+                (now, own) = presses_into_swap(&lease.cgroup, cap, threshold, swap_kill.every) => {
+                    let limit = cap.unwrap_or(0);
+                    let why = format!(
+                        "at its memory cap of {limit} bytes and still pushing into swap: \
+                         {own} of its {} bytes in swap pushed there at its cap (more than \
+                         {threshold}); killing it",
+                        now.swap
+                    );
+                    tracing::warn!(lease = %lease.name, "{why}");
+                    self.kill_container(&lease.name, &lease.cgroup, child).await;
+                    return Err(RuntimeError::OutOfMemory {
+                        used: now.current.saturating_add(now.swap),
+                        limit,
+                    });
+                }
             }
-            Ok(by) = &mut *stop => {
-                *killer = Some(by);
-                self.stop_container(&lease.name, &lease.cgroup, child).await;
-                return Err(RuntimeError::Killed);
-            }
-            (now, own) = presses_into_swap(&lease.cgroup, cap, threshold, swap_kill.every) => {
-                let limit = cap.unwrap_or(0);
-                let why = format!(
-                    "at its memory cap of {limit} bytes and still pushing into swap: \
-                     {own} of its {} bytes in swap pushed there at its cap (more than \
-                     {threshold}); killing it",
-                    now.swap
-                );
-                tracing::warn!(lease = %lease.name, "{why}");
-                self.kill_container(&lease.name, &lease.cgroup, child).await;
-                return Err(RuntimeError::OutOfMemory {
-                    used: now.current.saturating_add(now.swap),
-                    limit,
-                });
-            }
-        }
 
-        let ended = self.podman.ended(&lease.name).await;
+            let ended = self.podman.ended(&lease.name).await;
+            // An exec that failed with ETXTBSY (`program::text_file_busy`) is started once
+            // more: the write descriptor that caused it is gone by now.
+            if started == 1
+                && matches!(ended, Ok(Ended::NotRun(_)))
+                && program::text_file_busy(&stderr_path).await
+            {
+                tracing::warn!(lease = %lease.name, "exec found the program busy (ETXTBSY); again");
+                continue;
+            }
+            break ended;
+        };
         // SIGKILL (137): whether the kernel's OOM killer did it, and for whose limit,
         // is read from the lease cgroup, not from Podman. The same is read when Podman
         // recorded no exit or could not be asked: the lease cgroup's counters do not
@@ -419,13 +489,13 @@ impl<C: Cas> PodmanRuntime<C> {
         clock.output_upload_start_timestamp = now();
         // The container has exited: hand its files back to the daemon's user, so an
         // output the action left unreadable to others is still read, as its owner.
-        self.podman
-            .chown(
-                DAEMON_OWNER,
-                &[&spec.input_root, &spec.upper, &spec.overlay_work],
-            )
-            .await
-            .map_err(RuntimeError::Failed)?;
+        self.give_overlay(
+            DAEMON_OWNER,
+            &spec.input_root,
+            &spec.upper,
+            &spec.overlay_work,
+        )
+        .await?;
         let mut result = ActionResult {
             exit_code,
             ..ActionResult::default()
@@ -451,6 +521,31 @@ impl<C: Cas> PodmanRuntime<C> {
         clock.worker_completed_timestamp = now();
         result.execution_metadata = Some(clock);
         Ok(result)
+    }
+
+    /// Gives the overlay's directories to `owner`. Without the cache, everything under
+    /// them. With it, only the input root's directories: its files are links to the
+    /// cache's entries, which must stay the daemon's (unmapped in the container, so
+    /// the action cannot write them); the upper and work directories hold only the
+    /// lease's own files.
+    async fn give_overlay(
+        &self,
+        owner: &str,
+        root: &Path,
+        upper: &Path,
+        work: &Path,
+    ) -> Result<(), RuntimeError> {
+        let given = match &self.config.cache {
+            Some(cache) => {
+                let dirs = self.podman.chown_dirs(&cache.helper, owner, root).await;
+                match dirs {
+                    Ok(()) => self.podman.chown(owner, &[upper, work]).await,
+                    Err(e) => Err(e),
+                }
+            }
+            None => self.podman.chown(owner, &[root, upper, work]).await,
+        };
+        given.map_err(RuntimeError::Failed)
     }
 
     /// Checks that this node's image store holds `image` and that its digest names one
@@ -797,6 +892,34 @@ fn wait_exited(
             Err(e) => return Err(wait_failed(e)),
         }
     }
+}
+
+/// The input paths that must be the lease's own copies, never links to the cache:
+/// each output path, seen from the input root (`working_directory/output`). An input
+/// there is moved into the overlay's upper directory, which the container's root
+/// owns and may change.
+fn private_paths(working_directory: &str, outputs: &[String]) -> Vec<String> {
+    let base = working_directory.trim_end_matches('/');
+    (outputs.iter())
+        .map(|output| {
+            if base.is_empty() {
+                output.clone()
+            } else {
+                format!("{base}/{output}")
+            }
+        })
+        .collect()
+}
+
+/// Whether Podman's storage is one the cache's overlay checks passed on: the kernel's
+/// `overlay` graph driver, with no `mount_program` (fuse-overlayfs) in its options.
+/// Blocking.
+fn cache_usable(podman: &Podman) -> Result<(), Disabled> {
+    let (driver, options) = podman.graph_driver().map_err(Disabled::GraphDriver)?;
+    if driver != "overlay" || options.get("overlay.mount_program").is_some() {
+        return Err(Disabled::GraphDriver(format!("{driver} {options}")));
+    }
+    Ok(())
 }
 
 /// The wall clock now, as `ExecutedActionMetadata` holds it.

@@ -1,6 +1,6 @@
 # Worker inputs: a shared blob transfer engine and a per-node NVMe file cache
 
-Status: design, revision 5 (one connection; the cache persists from its first PR, through one snapshot file that unknown files are adopted into). Nothing here is built.
+Status: design, revision 5 (one connection; the cache persists from its first PR, through one snapshot file that unknown files are adopted into). Stage C1 is built; where it differs from the text, "C1 as built" (end of section 10) says how.
 Every "today" claim cites a file on `main` at `d7f25cf` (#524). Every number marked
 *unmeasured* is an estimate that the PR introducing it must replace with a measurement.
 
@@ -939,6 +939,36 @@ Wall-clock speedups are reported, never asserted.
 - Concurrent first uses of one unverified entry share one re-hash, merged per key like a fill.
 - macOS (C2): `clonefile` does not change the source's ctime, so the pass's last use there is the insert time; on Linux removing a lease directory also bumps ctime. Both cost LRU order only.
 - Add tests for a daemon killed mid-snapshot-write (mutant: write `index.snap` in place), for ENOSPC on a snapshot write (the previous snapshot is kept), and for an outside creator between a fill's `fstatat` and its rename (the EEXIST half of R-5's mutant).
+
+**C1 as built** (where the code differs from the sections above, or settles what they
+left open):
+
+- Fills read through the existing CAS client, which returns a blob whole: a fill holds
+  its blob in memory, within the lease's `tree::FETCH_BYTES_IN_FLIGHT`. T1's `read_to`
+  replaces this. `--cache-link-concurrency` bounds a lease's keys in flight, hits and
+  fills alike; T1 separates network permits from local work.
+- A fill is driven by the lease that took the key's slot. If that lease is dropped, the
+  fill stops with it and the slot is released; a waiter then takes the slot and fills
+  the key itself. There is no "more than half its bytes" rule before T1.
+- The slot records no holder kind. Whoever held it, a waiter looks at the index again
+  once it is released, and gets a failed fill's error; the adopt pass skips a key whose
+  slot anyone holds (the evictor's hold ends with index and name agreeing too).
+- `cache_hits` and `cache_misses` count files (names); `verify_hashes` counts entries.
+  A key the index did not list but whose file a fill adopted after a re-hash is a miss
+  that fetched nothing. C1's counters are `InputStats`, logged once per lease
+  (`inputs: files=...`), and `CacheStats` for the node.
+- An input an output names is a private copy made by `materialize`; `prepare_outputs`
+  still renames it into `upper`. Without `--cache-dir` the driver chowns the input root
+  with `chown -hR` as before, so nothing changes for an uncached node.
+- The ETXTBSY retry (one more `podman start`) applies with or without the cache. C-9 is
+  tested against the stand-in Podman, which reports crun's ETXTBSY: the race itself
+  cannot be timed from a test. C-12 has C1's half only (no subtree is reused yet).
+- `--cache-dir` must exist; a directory named `kbf-lease-*` or `lease-*` is refused
+  (`cache_disabled_reason=lease-name`), not only warned about. Another layout version
+  `v<n>` is renamed `v<n>.moved-<unix seconds>`. Podman's storage must be the kernel's
+  `overlay` with no `mount_program` (fuse-overlayfs is refused as `graph-driver`).
+- A clean stop is the last handle of the cache being dropped: the daemon's exit saves
+  the index. Snapshot writers are serialised by a lock of their own.
 
 ---
 

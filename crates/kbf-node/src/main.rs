@@ -23,6 +23,10 @@
 //! running then are abandoned (their processes killed, their directories removed);
 //! the scheduler places them again.
 //!
+//! With `--cache-dir` and `--cache-max-bytes`, the container driver links each lease's
+//! input files from a per-node cache (`cache`); without them, as before, each lease
+//! gets its own copies.
+//!
 //! The log goes to stderr, in color only when stderr is a terminal: under launchd or
 //! systemd it is a file or a journal, where escape codes are noise (issue #170). The
 //! daemon does not rotate it; the service manager that owns stderr does. systemd's
@@ -69,6 +73,8 @@ struct Cli {
     scratch: Option<PathBuf>,
     #[command(flatten)]
     outputs: OutputLimits,
+    #[command(flatten)]
+    cache: cache::CacheArgs,
     /// The cgroup lease cgroups are made under, from the cgroup root (container). Left
     /// out, the daemon sets up its own cgroup, which its systemd unit must delegate
     /// (`Delegate=yes`): it moves itself into a `supervisor` leaf there and makes
@@ -224,6 +230,12 @@ fn main() -> ExitCode {
     if let Some(code) = kbf_daemon::keeper::dispatch() {
         return code;
     }
+    // So is the container driver's `__chown-dirs` helper, which it runs inside Podman's
+    // user namespace with the input cache.
+    #[cfg(target_os = "linux")]
+    if let Some(code) = kbf_driver_container::chown_dirs::dispatch() {
+        return ExitCode::from(code);
+    }
     let cli = Cli::parse();
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
@@ -310,6 +322,9 @@ fn node(
         match driver {
             Driver::Fake => node.add(Arc::new(FakeRuntime::new(Duration::ZERO)))?,
             Driver::Native => {
+                if let Some(warning) = cache::native_warning(&cli.cache) {
+                    tracing::warn!("{warning}");
+                }
                 let (runtime, reports) = native_runtime(cli, native()?, xcrun)?;
                 node.add(runtime)?;
                 node.reports = Some(reports);
@@ -547,6 +562,7 @@ mod container {
         };
         config.limits = limits(cli);
         config.swap_kill = swap_kill(cli);
+        config.cache = crate::cache::open(&cli.cache, &config.scratch);
         let runtime = PodmanRuntime::new(config, Arc::new(cas))?;
         // From `start`, in the runtime's context but outside any task.
         tokio::runtime::Handle::current().block_on(check_images(&runtime, &cli.images))?;
@@ -602,6 +618,7 @@ mod container {
     }
 }
 
+mod cache;
 mod instance;
 mod whole_machine;
 
