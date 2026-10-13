@@ -263,7 +263,7 @@ pub async fn refuse_hidden_working_directory(
 /// bytes), or the call fails with [`TreeError::Limit`]. An output directory is walked
 /// without recursion, so no depth of tree can overflow the caller's stack. Each file
 /// is stored through [`Cas::put_chunks`], one chunk in memory at a time; up to
-/// `kbf_outputs::UPLOADS_IN_FLIGHT` blobs are stored at once while the walk goes on,
+/// [`Cas::in_flight`] blobs are stored at once while the walk goes on,
 /// each distinct digest once, and the call returns once all of them are stored. A name or
 /// symlink target that is not UTF-8 fails the call with [`TreeError::NotUtf8`].
 pub async fn collect(

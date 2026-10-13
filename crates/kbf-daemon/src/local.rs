@@ -87,7 +87,8 @@ impl<C: Cas> LocalRuntime<C> {
         dir: &Path,
         stop: oneshot::Receiver<()>,
     ) -> Result<ActionResult, RuntimeError> {
-        let cas = &*self.cas;
+        // The lease's own view of the CAS, for its transfer counters.
+        let cas = &self.cas.lease(&work.lease_id);
         let mut clock = Clock::default();
         clock.0.worker_start_timestamp = now();
         clock.0.input_fetch_start_timestamp = now();

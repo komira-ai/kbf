@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use rustix::fs::{CWD, RenameFlags, Timespec, Timestamps};
-use tokio::sync::{Semaphore, watch};
+use tokio::sync::watch;
 
 use super::layout::{FIXED_MTIME, Key, remove_if_present};
 use super::verify::{Found, inspect, stat_check};
@@ -133,13 +133,6 @@ impl<C: Cas> Fetch for C {
     }
 }
 
-/// The memory a lease's fetches may hold at once: blob bytes fetched and not yet
-/// written (`tree::FETCH_BYTES_IN_FLIGHT` of them).
-pub(crate) struct Budget<'a> {
-    pub permits: &'a Semaphore,
-    pub bytes: usize,
-}
-
 /// A held slot. Dropped, it leaves the fill map and wakes the waiters, handing them
 /// the fill's error if it failed.
 pub(super) struct SlotGuard<'a> {
@@ -183,13 +176,12 @@ enum Step<'a> {
 impl Cache {
     /// `key`'s bytes for a lease: its entry, or the bytes when the cache could not keep
     /// them. `stale` says the lease found the entry gone (a link failed with `ENOENT`),
-    /// so the index is not trusted for it. Fetches count against `budget`.
+    /// so the index is not trusted for it.
     pub(crate) async fn get(
         &self,
         cas: &dyn Fetch,
         key: Key,
         stale: bool,
-        budget: &Budget<'_>,
         counts: &InputCounts,
     ) -> Result<Got, CasError> {
         let inner = &*self.inner;
@@ -220,7 +212,7 @@ impl Cache {
                     force = false;
                 }
                 Step::Own(mut slot) => {
-                    let settled = self.settle(cas, key, budget, counts).await;
+                    let settled = self.settle(cas, key, counts).await;
                     slot.error = settled.as_ref().err().cloned();
                     return settled;
                 }
@@ -233,7 +225,6 @@ impl Cache {
         &self,
         cas: &dyn Fetch,
         key: Key,
-        budget: &Budget<'_>,
         counts: &InputCounts,
     ) -> Result<Got, CasError> {
         let inner = &*self.inner;
@@ -268,19 +259,19 @@ impl Cache {
                 inner.state().index.remove(&key);
             }
         }
-        let bytes = self.obtain(cas, key, budget, counts).await?;
+        let bytes = self.obtain(cas, key, counts).await?;
         let owner = Arc::clone(&self.inner);
         let source = blocking(move || owner.insert(key, bytes)).await;
         Ok(Got { source, hit: false })
     }
 
     /// The bytes of `key`: copied from its sibling entry when that is indexed and hashes
-    /// right, otherwise fetched from the CAS and checked.
+    /// right, otherwise fetched from the CAS and checked. The CAS bounds the fetch (the
+    /// transfer engine: its requests and its byte budget for the whole process).
     async fn obtain(
         &self,
         cas: &dyn Fetch,
         key: Key,
-        budget: &Budget<'_>,
         counts: &InputCounts,
     ) -> Result<Vec<u8>, CasError> {
         let inner = &*self.inner;
@@ -291,10 +282,6 @@ impl Cache {
                 return Ok(bytes);
             }
         }
-        let size = usize::try_from(key.size).unwrap_or(usize::MAX);
-        let want = u32::try_from(size.clamp(1, budget.bytes)).unwrap_or(u32::MAX);
-        // The semaphore is never closed, so the permit is always granted.
-        let _permit = budget.permits.acquire_many(want).await.ok();
         let digest = key.digest();
         let bytes = cas.fetch(&digest).await?;
         counts.fetched_bytes.fetch_add(key.size, Ordering::Relaxed);

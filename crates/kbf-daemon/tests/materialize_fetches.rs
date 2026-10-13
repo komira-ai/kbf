@@ -1,6 +1,6 @@
-//! How `materialize` fetches an input tree: many blobs at once, never more than
-//! `FETCHES_IN_FLIGHT`, each distinct digest once, and on an error nothing more
-//! started and nothing left writing once it returns.
+//! How `materialize` fetches an input tree: many blobs at once, never more than the
+//! CAS's `in_flight` (the transfer engine's process-wide limit), each distinct digest
+//! once, and on an error nothing more started and nothing left writing once it returns.
 
 mod support;
 
@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use kbf_daemon::cas::{Cas, CasError, label};
-use kbf_daemon::tree::{FETCHES_IN_FLIGHT, TreeError, materialize};
+use kbf_daemon::tree::{TreeError, materialize};
 use kbf_proto::reapi::{Digest, Directory, DirectoryNode, FileNode};
 use support::memory::MemoryCas;
 use support::scratch;
@@ -39,7 +39,17 @@ impl CountingCas {
     }
 }
 
+/// The in-flight limit [`CountingCas`] answers: not the default, so a walk that kept a
+/// bound of its own would show.
+const BOUND: usize = 16;
+
 impl Cas for CountingCas {
+    type Lease = std::sync::Arc<Self>;
+
+    fn lease(self: &std::sync::Arc<Self>, _: &kbf_types::LeaseId) -> std::sync::Arc<Self> {
+        std::sync::Arc::clone(self)
+    }
+
     async fn get(&self, digest: &Digest) -> Result<Vec<u8>, CasError> {
         *self
             .reads
@@ -63,6 +73,10 @@ impl Cas for CountingCas {
     async fn put(&self, bytes: Vec<u8>) -> Result<Digest, CasError> {
         self.blobs.put(bytes).await
     }
+
+    fn in_flight(&self) -> usize {
+        BOUND
+    }
 }
 
 fn file(name: String, digest: Digest, is_executable: bool) -> FileNode {
@@ -76,9 +90,10 @@ fn file(name: String, digest: Digest, is_executable: bool) -> FileNode {
 
 /// Catches the input tree's files fetched one blob at a time (on the pilot a tree of
 /// thousands of small files took about 14 minutes per lease, the CAS idle), and a
-/// fetch with no bound (a tree of a million files would open a million requests).
-/// The files are all in the root, which is fetched alone first, so what is counted is
-/// the file fetches. Mutant seen red: the file fetches given a bound of 1.
+/// walk with no bound, or one of its own rather than the CAS's (a tree of a million
+/// files would queue a million requests). The files are all in the root, which is
+/// fetched alone first, so what is counted is the file fetches. Mutants seen red: the
+/// file fetches given a bound of 1; no bound (`usize::MAX`).
 #[tokio::test]
 async fn many_blobs_are_fetched_at_once_within_the_bound() {
     let cas = CountingCas::default();
@@ -94,7 +109,7 @@ async fn many_blobs_are_fetched_at_once_within_the_bound() {
         .expect("written");
     let most = cas.most_in_flight();
     assert!(most > 1, "one fetch at a time");
-    assert!(most <= FETCHES_IN_FLIGHT, "{most} fetches in flight");
+    assert!(most <= BOUND, "{most} fetches in flight");
     for f in 0..200 {
         let bytes = std::fs::read(dir.join(format!("f{f:03}"))).expect("written");
         assert_eq!(bytes, format!("file {f}").into_bytes());
@@ -177,7 +192,7 @@ async fn no_blob_is_fetched_after_one_failed() {
         .values()
         .sum();
     assert!(
-        reads <= 1 + FETCHES_IN_FLIGHT,
+        reads <= 1 + BOUND,
         "{reads} reads: the root, and blobs started after the error"
     );
 }
@@ -195,6 +210,12 @@ struct HeldCas {
 }
 
 impl Cas for HeldCas {
+    type Lease = std::sync::Arc<Self>;
+
+    fn lease(self: &std::sync::Arc<Self>, _: &kbf_types::LeaseId) -> std::sync::Arc<Self> {
+        std::sync::Arc::clone(self)
+    }
+
     async fn get(&self, digest: &Digest) -> Result<Vec<u8>, CasError> {
         if *digest == self.held {
             let release = self
@@ -226,16 +247,14 @@ impl Cas for HeldCas {
     }
 }
 
-/// The names in `dir`, sorted.
-fn listing(dir: &Path) -> Vec<String> {
-    let mut names: Vec<String> = std::fs::read_dir(dir)
+/// The names in `dir` with their sizes, sorted.
+fn listing(dir: &Path) -> Vec<(String, u64)> {
+    let mut names: Vec<(String, u64)> = std::fs::read_dir(dir)
         .expect("list the lease directory")
         .map(|entry| {
-            entry
-                .expect("an entry")
-                .file_name()
-                .to_string_lossy()
-                .into_owned()
+            let entry = entry.expect("an entry");
+            let size = entry.metadata().expect("stat").len();
+            (entry.file_name().to_string_lossy().into_owned(), size)
         })
         .collect();
     names.sort();
@@ -244,8 +263,8 @@ fn listing(dir: &Path) -> Vec<String> {
 
 /// Catches `materialize` returning its error while a write it started is still
 /// queued on tokio's blocking pool: dropping a `tokio::fs` future does not stop the
-/// call, so the file would appear after the error, while the caller clears the lease
-/// directory. Here the write of `held` is queued behind a blocked pool thread when
+/// call, so the file's bytes would appear after the error, while the caller clears the
+/// lease directory. Here the write of `held` is queued behind a blocked pool thread when
 /// `failing` fails; `materialize` must not return before the write ran. Mutant seen
 /// red: the first error returned at once (the `try_for_each` drain this replaced).
 #[test]

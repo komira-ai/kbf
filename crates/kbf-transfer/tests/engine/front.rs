@@ -1,15 +1,9 @@
-//! The daemon's CAS client against a real front cache in this process, and against a
-//! ByteStream server that misbehaves.
+//! The engine against kbf-front's CAS services, and against a ByteStream server that
+//! breaks its promises.
 
-mod support;
-
-use std::net::SocketAddr;
 use std::sync::Arc;
 
 use futures::stream;
-use kbf_daemon::cas::{
-    Cas, CasClient, CasError, Chunks, WRITE_CHUNK_BYTES, digest_of, fetch, label,
-};
 use kbf_front::Cache;
 use kbf_proto::google::bytestream::byte_stream_server::{ByteStream, ByteStreamServer};
 use kbf_proto::google::bytestream::{
@@ -17,34 +11,31 @@ use kbf_proto::google::bytestream::{
     WriteResponse,
 };
 use kbf_proto::reapi::Digest;
-use support::memory::MemoryCas;
+use kbf_transfer::{
+    Cas, CasError, Chunks, MAX_MESSAGE_BYTES, TransferConfig, Transfers, WRITE_CHUNK_BYTES,
+    digest_of, fetch, label,
+};
 use tonic::service::Routes;
-use tonic::transport::server::TcpIncoming;
-use tonic::transport::{Channel, Endpoint, Server};
 use tonic::{Request, Response, Status, Streaming};
 
-/// Serves `routes` on a loopback port; returns a channel to it.
-async fn serve(routes: Routes) -> Channel {
-    let incoming = TcpIncoming::bind(SocketAddr::from(([127, 0, 0, 1], 0))).expect("bind");
-    let addr = incoming.local_addr().expect("addr");
-    tokio::spawn(
-        Server::builder()
-            .add_routes(routes)
-            .serve_with_incoming(incoming),
-    );
-    Endpoint::from_shared(format!("http://{addr}"))
-        .expect("endpoint")
-        .connect()
-        .await
-        .expect("connect")
+use super::engine;
+use super::fake::serve;
+
+async fn front() -> Arc<Transfers> {
+    let addr = serve(kbf_front::routes(Arc::new(Cache::memory()))).await;
+    engine(addr, TransferConfig::default())
 }
 
-async fn front() -> CasClient {
-    CasClient::new(serve(kbf_front::routes(Arc::new(Cache::memory()))).await)
+/// Catches the engine decoding less than the front may send: its limit must be the
+/// front's.
+#[test]
+fn the_decode_limit_is_the_fronts_message_limit() {
+    assert_eq!(MAX_MESSAGE_BYTES, kbf_front::MAX_MESSAGE_BYTES);
 }
 
-/// Catches a client that loses or reorders bytes on the way in or out: an empty blob,
-/// a small one, and one large enough to take several ByteStream messages each way.
+/// Catches an engine that loses or reorders bytes on the way in or out: an empty blob,
+/// a small one, and one large enough to take several ByteStream messages each way;
+/// and FindMissing against the front's own answer (a blob stored once is present).
 #[tokio::test]
 async fn blobs_round_trip_through_the_front() {
     let cas = front().await;
@@ -54,8 +45,19 @@ async fn blobs_round_trip_through_the_front() {
     for bytes in [Vec::new(), b"small".to_vec(), large] {
         let digest = cas.put(bytes.clone()).await.expect("put");
         assert_eq!(digest, digest_of(&bytes));
-        assert_eq!(fetch(&cas, &digest).await.expect("fetch"), bytes);
+        assert_eq!(fetch(&*cas, &digest).await.expect("fetch"), bytes);
     }
+    let scope = cas.scope(&kbf_types::LeaseId::new(1, 1));
+    assert_eq!(scope.put(b"small".to_vec()).await, Ok(digest_of(b"small")));
+    let stats = scope.stats();
+    assert_eq!(
+        (
+            stats.find_missing_digests,
+            stats.outputs_present,
+            stats.write_calls
+        ),
+        (1, 1, 0)
+    );
 }
 
 /// Catches a blob the front does not hold reported as anything but missing (the lease
@@ -70,40 +72,39 @@ async fn a_blob_the_front_lacks_is_missing() {
     );
 }
 
-/// Catches a front that cannot be reached reported as a missing blob.
+/// Catches a front that cannot be reached reported as a missing blob, and a call to
+/// it retried more than `--transfer-retries` times or not at all.
 #[tokio::test]
-async fn an_unreachable_front_is_unavailable() {
-    // A port nothing listens on: bound, then released.
-    let addr = std::net::TcpListener::bind("127.0.0.1:0")
-        .expect("bind")
-        .local_addr()
-        .expect("addr");
-    let channel = Endpoint::from_shared(format!("http://{addr}"))
-        .expect("endpoint")
-        .connect_lazy();
-    let cas = CasClient::new(channel);
+async fn an_unreachable_front_is_unavailable_after_the_retries() {
+    // A port nothing listens on: bound and never listening, held for the whole test so
+    // no other test binds it meanwhile (a dial gets RST).
+    let socket = tokio::net::TcpSocket::new_v4().expect("socket");
+    socket
+        .bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
+        .expect("bind");
+    let addr = socket.local_addr().expect("addr");
+    let config = TransferConfig {
+        retries: 2,
+        ..TransferConfig::default()
+    };
+    let cas = engine(addr, config);
+    let scope = cas.scope(&kbf_types::LeaseId::new(1, 2));
     let digest = digest_of(b"x");
     assert!(matches!(
-        cas.get(&digest).await,
+        scope.get(&digest).await,
         Err(CasError::Unavailable(..))
     ));
     assert!(matches!(
-        cas.put(b"x".to_vec()).await,
+        scope.put(b"x".to_vec()).await,
         Err(CasError::Unavailable(..))
     ));
-}
-
-/// Catches bytes that do not match their digest being trusted.
-#[tokio::test]
-async fn fetch_refuses_bytes_that_do_not_match() {
-    let cas = MemoryCas::default();
-    let digest = cas.insert(b"good".to_vec());
-    cas.corrupt(&digest, b"evil".to_vec());
-    let error = fetch(&cas, &digest).await.expect_err("refused");
+    let stats = scope.stats();
+    // Each call: one attempt and two retries.
     assert_eq!(
-        error,
-        CasError::Corrupt(label(&digest), label(&digest_of(b"evil")))
+        (stats.read_calls, stats.write_calls, stats.retries),
+        (3, 3, 4)
     );
+    drop(socket);
 }
 
 /// A ByteStream server that breaks its promises: a read stream that fails after its
@@ -140,11 +141,19 @@ impl ByteStream for Liar {
     }
 }
 
+async fn liar() -> Arc<Transfers> {
+    engine(
+        serve(Routes::new(ByteStreamServer::new(Liar))).await,
+        TransferConfig::default(),
+    )
+}
+
 /// Catches a read that breaks midway returned as a short blob, and a write the CAS did
 /// not fully commit taken as stored (an output named in a result would be missing).
+/// The Liar serves no FindMissing, so every blob is uploaded.
 #[tokio::test]
 async fn broken_calls_are_unavailable() {
-    let cas = CasClient::new(serve(Routes::new(ByteStreamServer::new(Liar))).await);
+    let cas = liar().await;
     let digest = digest_of(b"whatever");
     let read = cas.get(&digest).await;
     assert!(
@@ -156,10 +165,15 @@ async fn broken_calls_are_unavailable() {
         matches!(&write, Err(CasError::Unavailable(_, why)) if why.contains("committed 1 bytes of 5")),
         "{write:?}"
     );
-    // The Liar answers QueryWriteStatus with an error; the client never asks it.
-    let mut client = kbf_proto::google::bytestream::byte_stream_client::ByteStreamClient::new(
-        serve(Routes::new(ByteStreamServer::new(Liar))).await,
-    );
+    // The Liar answers QueryWriteStatus with an error; the engine never asks it.
+    let addr = serve(Routes::new(ByteStreamServer::new(Liar))).await;
+    let channel = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
+        .expect("endpoint")
+        .connect()
+        .await
+        .expect("connect");
+    let mut client =
+        kbf_proto::google::bytestream::byte_stream_client::ByteStreamClient::new(channel);
     let status = client
         .query_write_status(QueryWriteStatusRequest::default())
         .await
@@ -169,7 +183,7 @@ async fn broken_calls_are_unavailable() {
 
 /// `len` patterned bytes, their digest, and the same bytes as a stream of chunks of
 /// at most `chunk` bytes.
-fn chunked(len: usize, chunk: usize) -> (Vec<u8>, Digest, Chunks) {
+pub fn chunked(len: usize, chunk: usize) -> (Vec<u8>, Digest, Chunks) {
     let bytes: Vec<u8> = (0..len).map(|i| (i % 239) as u8).collect();
     let pieces: Vec<std::io::Result<Vec<u8>>> =
         bytes.chunks(chunk.max(1)).map(|c| Ok(c.to_vec())).collect();
@@ -178,7 +192,7 @@ fn chunked(len: usize, chunk: usize) -> (Vec<u8>, Digest, Chunks) {
 }
 
 /// A stream that yields `first`, then fails.
-fn failing(first: &[u8]) -> Chunks {
+pub fn failing(first: &[u8]) -> Chunks {
     Box::pin(stream::iter(vec![
         Ok(first.to_vec()),
         Err(std::io::Error::other("disk gone")),
@@ -201,7 +215,7 @@ async fn chunks_stream_through_the_front() {
         let (bytes, digest, chunks) = chunked(len, chunk);
         let stored = cas.put_chunks(digest.clone(), chunks).await;
         assert_eq!(stored.as_ref(), Ok(&digest), "{len} in chunks of {chunk}");
-        assert_eq!(fetch(&cas, &digest).await.expect("fetch"), bytes);
+        assert_eq!(fetch(&*cas, &digest).await.expect("fetch"), bytes);
     }
     // The stream ends 10 bytes short of the digest: the front refuses the write.
     let (_, mut digest, chunks) = chunked(10, 4);
@@ -217,47 +231,14 @@ async fn chunks_stream_through_the_front() {
         "{error:?}"
     );
     // A CAS that commits less than was sent.
-    let liar = CasClient::new(serve(Routes::new(ByteStreamServer::new(Liar))).await);
     let (_, digest, chunks) = chunked(5, 2);
-    let error = liar
+    let error = liar()
+        .await
         .put_chunks(digest, chunks)
         .await
         .expect_err("short commit");
     assert!(
         matches!(&error, CasError::Unavailable(_, why) if why.contains("committed 1 bytes of 5")),
         "{error:?}"
-    );
-}
-
-/// Catches the trait's default `put_chunks` storing other bytes than the chunks',
-/// taking a digest that does not match as stored, or a failed chunk as the end.
-#[tokio::test]
-async fn the_default_put_chunks_gathers_and_checks_its_digest() {
-    let cas = MemoryCas::default();
-    let (bytes, digest, chunks) = chunked(3000, 700);
-    assert_eq!(
-        cas.put_chunks(digest.clone(), chunks).await,
-        Ok(digest.clone())
-    );
-    assert_eq!(cas.blob(&digest), Some(bytes));
-    let (_, _, chunks) = chunked(10, 3);
-    let wrong = digest_of(b"something else");
-    let error = cas
-        .put_chunks(wrong.clone(), chunks)
-        .await
-        .expect_err("mismatch");
-    assert!(
-        matches!(&error, CasError::Corrupt(blob, _) if *blob == label(&wrong)),
-        "{error:?}"
-    );
-    let error = cas
-        .put_chunks(wrong, failing(b"x"))
-        .await
-        .expect_err("unreadable");
-    assert!(matches!(&error, CasError::Read(..)), "{error:?}");
-    assert!(
-        error
-            .to_string()
-            .contains("could not be read for storing: disk gone")
     );
 }

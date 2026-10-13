@@ -37,7 +37,8 @@ impl<S: Session, C: Cas> WholeMachineRuntime<S, C> {
         killer: &mut Option<Stop>,
     ) -> Result<ActionResult, RuntimeError> {
         let id = work.lease_id;
-        let cas = &*self.cas;
+        // The lease's own view of the CAS, for its transfer counters.
+        let cas = &self.cas.lease(&id);
         let action: Action = fetch_message(cas, &work.action_digest)
             .await
             .map_err(tree_error)?;
@@ -119,7 +120,7 @@ impl<S: Session, C: Cas> WholeMachineRuntime<S, C> {
             Ended::Exited(exit) => exit.map_err(failed_at("waiting for the action"))?,
             Ended::TimedOut => {
                 self.end(id, exited).await?;
-                return Err(self.timed_out(&dir).await);
+                return Err(self.timed_out(cas, &dir).await);
             }
             Ended::Killed(by) => {
                 *killer = Some(by);
@@ -128,7 +129,7 @@ impl<S: Session, C: Cas> WholeMachineRuntime<S, C> {
             }
         };
 
-        let store = CasStore(Arc::clone(&self.cas));
+        let store = CasStore(cas);
         let mut result = ActionResult {
             exit_code: exit.action_code(),
             ..ActionResult::default()
@@ -170,8 +171,8 @@ impl<S: Session, C: Cas> WholeMachineRuntime<S, C> {
 
     /// The timeout, with what the action wrote to stdout and stderr in `dir` (each left
     /// out if it cannot be stored).
-    async fn timed_out(&self, dir: &Path) -> RuntimeError {
-        let store = CasStore(Arc::clone(&self.cas));
+    async fn timed_out(&self, cas: &C::Lease, dir: &Path) -> RuntimeError {
+        let store = CasStore(cas);
         let max = self.config.outputs.max_stdio_bytes;
         let stdout = kbf_outputs::store_file(&store, &dir.join("stdout"), max)
             .await

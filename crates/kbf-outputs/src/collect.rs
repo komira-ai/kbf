@@ -30,7 +30,7 @@
 //! digest; nothing here detects the change first.
 //!
 //! Each system call runs on tokio's blocking pool. The walk itself is one at a time;
-//! the blobs it stores are uploaded [`crate::UPLOADS_IN_FLIGHT`] at a time while it goes
+//! the blobs it stores are uploaded [`Store::in_flight`] at a time while it goes
 //! on, each distinct digest once ([`Uploads`]), and [`collect`] returns once all are
 //! stored.
 
@@ -433,7 +433,7 @@ pub async fn collect(
         entries: 0,
         bytes: 0,
     };
-    let (uploads, drain) = Uploads::new();
+    let (uploads, drain) = Uploads::new(store.in_flight());
     let walk = record(
         store, uploads, budget, &root_fd, &wd_parts, &base, paths, result,
     );

@@ -26,6 +26,7 @@ clap.workspace = true
 kbf-deploy.workspace = true
 kbf-daemon.workspace = true
 kbf-testkit.workspace = true
+kbf-transfer.workspace = true
 rcgen.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal"] }

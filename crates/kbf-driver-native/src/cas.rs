@@ -1,26 +1,29 @@
 //! [`CasStore`]: the daemon's CAS as the store `kbf-outputs` writes outputs to.
 
 use std::io::Read as _;
-use std::sync::Arc;
 
 use futures::stream;
 use kbf_daemon::cas::{Cas, Chunks, WRITE_CHUNK_BYTES};
 use kbf_outputs::{Store, StoreError};
 use kbf_proto::reapi::Digest;
 
-/// A `kbf_daemon::Cas` as a `kbf_outputs::Store`. A file goes to
+/// A `kbf_daemon::Cas` (a lease's) as a `kbf_outputs::Store`. A file goes to
 /// [`Cas::put_chunks`] one chunk at a time, each read on the blocking pool when the
 /// upload asks for it, so no file is held whole.
 #[derive(Debug)]
-pub(crate) struct CasStore<C>(pub(crate) Arc<C>);
+pub(crate) struct CasStore<'a, C>(pub(crate) &'a C);
 
-impl<C: Cas> Store for CasStore<C> {
+impl<C: Cas> Store for CasStore<'_, C> {
     async fn put(&self, bytes: Vec<u8>) -> Result<Digest, StoreError> {
         Ok(self.0.put(bytes).await?)
     }
 
     async fn put_file(&self, file: std::fs::File, digest: Digest) -> Result<Digest, StoreError> {
         Ok(self.0.put_chunks(digest, chunks(file)).await?)
+    }
+
+    fn in_flight(&self) -> usize {
+        self.0.in_flight()
     }
 }
 
