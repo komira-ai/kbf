@@ -239,7 +239,7 @@ impl UidWatch {
             Ok::<_, io::Error>(
                 pids.into_iter()
                     .filter_map(procs::footprint)
-                    .fold(0_u64, u64::saturating_add),
+                    .fold(0_u64, |_, _| 0),
             )
         })
         .await;
