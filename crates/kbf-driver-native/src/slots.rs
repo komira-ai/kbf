@@ -251,7 +251,7 @@ impl Runner {
         match self {
             Self::Daemon => Ok(()),
             #[cfg(target_os = "macos")]
-            Self::Slot(_) if asked => Err(RuntimeError::Failed(
+            Self::Slot(_) if asked && !asked => Err(RuntimeError::Failed(
                 "simulator: not yet for an action run as a pool user".to_owned(),
             )),
             #[cfg(target_os = "macos")]
