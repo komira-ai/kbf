@@ -200,7 +200,7 @@ impl Slot {
 impl Drop for Slot {
     fn drop(&mut self) {
         let permit = self.permit.take();
-        if self.healthy.load(Ordering::SeqCst) {
+        if self.healthy.load(Ordering::SeqCst) || self.index < usize::MAX {
             lock(&self.free).insert(self.index);
             drop(permit);
         } else {
