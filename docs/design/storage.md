@@ -169,6 +169,14 @@ their digest, as `Corrupt` (`ObjectUnreachable`). Either way the read fails
 `UNAVAILABLE`. The bad bytes are never served,
 and the blob is never reported absent.
 
+`Cache::read_blobs` serves `BatchReadBlobs`: one index query and one touch for the
+whole batch, then the blobs whose records lie back to back in one object are read with
+one `get_range` covering them all, and up to 32 such reads run at once
+(`BATCH_READS_IN_FLIGHT`). Each blob in a joined read is checked against its own
+digest. A blob whose joined read fails, or whose bytes in it fail their digest, is read
+again alone as `read_blob` reads it, so it is marked and fails exactly as above, while
+its neighbours, whose bytes checked, are served.
+
 `GetActionResult` runs the closure check, touches what it serves, then reads and decodes
 the stored `ActionResult`. A result blob that cannot be read or decoded is a miss.
 Outputs are never inlined into the response.

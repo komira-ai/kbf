@@ -2,7 +2,7 @@
 //! GetTree. The chunking calls (REAPI 2.12 and later) answer UNIMPLEMENTED, matching
 //! the capabilities, which do not advertise them.
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -46,6 +46,13 @@ pub struct CasService<M, O> {
 }
 
 impl<M, O> CasService<M, O> {
+    /// The service over `cache`, allowing every call (for a listener that admits its
+    /// callers itself, as the worker listener does).
+    #[must_use]
+    pub fn new(cache: Arc<Cache<M, O>>) -> Self {
+        Self::with_authorizers(cache, Arc::new(Authorizers::allow_all()))
+    }
+
     /// The service over `cache`, each call authorized by `authorizers`.
     #[must_use]
     pub const fn with_authorizers(cache: Arc<Cache<M, O>>, authorizers: Arc<Authorizers>) -> Self {
@@ -166,6 +173,9 @@ impl<M: MetaLog, O: ObjectStore + 'static> ContentAddressableStorage for CasServ
     }
 
     /// Reads each blob; each answers alone (NOT_FOUND only when the blob is not held).
+    /// The blobs are read together ([`Cache::read_blobs`]): up to
+    /// [`crate::BATCH_READS_IN_FLIGHT`] range GETs at once, one GET for blobs that lie
+    /// back to back in one segment.
     async fn batch_read_blobs(
         &self,
         request: Request<BatchReadBlobsRequest>,
@@ -192,13 +202,38 @@ impl<M: MetaLog, O: ObjectStore + 'static> ContentAddressableStorage for CasServ
                 "batch asks for {total} bytes; at most {MAX_BATCH_TOTAL_BYTES} are allowed"
             )));
         }
-        let mut responses = Vec::with_capacity(request.digests.len());
-        for asked in &request.digests {
-            let read = match wire::digest(Some(asked)) {
-                Ok(d) => self.cache.read_blob(&d).await.map_err(Status::from),
-                Err(e) => Err(e),
+        let parsed: Vec<Result<Digest, Status>> = request
+            .digests
+            .iter()
+            .map(|asked| wire::digest(Some(asked)))
+            .collect();
+        let wanted: Vec<Digest> = parsed
+            .iter()
+            .filter_map(|p| p.as_ref().ok().copied())
+            .collect();
+        let read: BTreeMap<Digest, Result<Bytes, Status>> =
+            match self.cache.read_blobs(&wanted).await {
+                Ok(read) => read
+                    .into_iter()
+                    .map(|(digest, r)| (digest, r.map_err(Status::from)))
+                    .collect(),
+                Err(e) => {
+                    let failed = Status::from(e);
+                    wanted.iter().map(|d| (*d, Err(failed.clone()))).collect()
+                }
             };
-            let (data, status) = match read {
+        let mut responses = Vec::with_capacity(request.digests.len());
+        for (asked, parsed) in request.digests.iter().zip(parsed) {
+            // `read` answers every digest that parsed, unless the index holds two
+            // digests at one location (corrupt): the one left out fails alone.
+            let answer = parsed.and_then(|d| {
+                read.get(&d).cloned().unwrap_or_else(|| {
+                    Err(Status::internal(format!(
+                        "{d}: no answer from the batch read"
+                    )))
+                })
+            });
+            let (data, status) = match answer {
                 Ok(bytes) => (bytes.to_vec(), wire::rpc_ok()),
                 Err(e) => (Vec::new(), wire::rpc_status(&e)),
             };
