@@ -87,7 +87,7 @@ rustls = { version = "0.23.45", default-features = false, features = ["ring", "s
 # `mdm verify`) and `cargo xtask fetch`'s.
 rustls-native-certs = "0.8.4"
 # zstd for the .zst downloads `cargo xtask fetch` unpacks; pure Rust, no C zstd.
-ruzstd = "0.8.3"
+ruzstd = "0.9.1"
 # Directory-relative, no-follow file access (openat with O_NOFOLLOW) for reading outputs;
 # the effective uid, to check who owns the operator API token file (kbf-server).
 rustix = "1.1.5"
