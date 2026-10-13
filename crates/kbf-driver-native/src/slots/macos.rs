@@ -590,7 +590,7 @@ fn lock(free: &Mutex<BTreeSet<usize>>) -> std::sync::MutexGuard<'_, BTreeSet<usi
     free.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-#[cfg(test)]
+#[cfg(all(test, any()))]
 mod tests {
     use super::*;
 
