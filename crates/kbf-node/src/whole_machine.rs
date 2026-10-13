@@ -29,7 +29,7 @@ pub(super) fn add(cli: &Cli, node: &mut Node) -> Result<(), Error> {
     let mut config = WholeMachineConfig::new(super::scratch(cli)?.join("whole-machine"));
     config.outputs = cli.outputs;
     let session = HelperSession::new(socket, cli.daemon_user.clone());
-    let runtime = WholeMachineRuntime::new(config, session, Arc::new(super::cas_client(cli)?))?;
+    let runtime = WholeMachineRuntime::new(config, session, node.transfers(cli)?)?;
     node.phase = Some(runtime.phase());
     node.add(Arc::new(runtime))
 }

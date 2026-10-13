@@ -289,9 +289,14 @@ impl<C: Cas> NativeRuntime<C> {
         self.stops.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Fetches and checks the action, and writes its inputs into `dir`.
-    async fn prepare(&self, work: &Work, dir: &Path) -> Result<Prepared, RuntimeError> {
-        let cas = &*self.cas;
+    /// Fetches and checks the action through the lease's `cas`, and writes its inputs
+    /// into `dir`.
+    async fn prepare(
+        &self,
+        cas: &C::Lease,
+        work: &Work,
+        dir: &Path,
+    ) -> Result<Prepared, RuntimeError> {
         let action: Action = fetch_message(cas, &work.action_digest)
             .await
             .map_err(tree_error)?;
@@ -368,6 +373,7 @@ impl<C: Cas> NativeRuntime<C> {
     /// exited.
     async fn execute(
         &self,
+        cas: &C::Lease,
         work: &Work,
         dir: &Path,
         prepared: &Prepared,
@@ -446,7 +452,7 @@ impl<C: Cas> NativeRuntime<C> {
         group.end(&mut child, self.config.kill_wait).await?;
         match ended {
             Ended::Exited(status) => Ok(exit_code(status.map_err(failed(&program))?)),
-            Ended::TimedOut => Err(self.timed_out(work.lease_id, dir).await),
+            Ended::TimedOut => Err(self.timed_out(cas, work.lease_id, dir).await),
             Ended::Killed => Err(RuntimeError::Killed),
             Ended::OutOfMemory { used, limit } => {
                 tracing::warn!(lease = %work.lease_id, used, limit, "killed past its memory limit");
@@ -459,8 +465,8 @@ impl<C: Cas> NativeRuntime<C> {
     /// stderr in `dir`, each stored within the stdio limit (REAPI's partial result). A
     /// log past the limit, or one that cannot be stored, is left out: the answer is
     /// still the timeout.
-    async fn timed_out(&self, lease: LeaseId, dir: &Path) -> RuntimeError {
-        let store = CasStore(Arc::clone(&self.cas));
+    async fn timed_out(&self, cas: &C::Lease, lease: LeaseId, dir: &Path) -> RuntimeError {
+        let store = CasStore(cas);
         let max = self.config.outputs.max_stdio_bytes;
         let mut logs = [None, None];
         for (name, slot) in ["stdout", "stderr"].into_iter().zip(&mut logs) {
@@ -487,10 +493,12 @@ impl<C: Cas> NativeRuntime<C> {
             input_fetch_start_timestamp: now(),
             ..ExecutedActionMetadata::default()
         };
+        // The lease's own view of the CAS, for its transfer counters.
+        let cas = self.cas.lease(&work.lease_id);
         // A kill during prepare (a long input fetch) stops it at once; the clean
         // removes whatever was written.
         let mut prepared = tokio::select! {
-            prepared = self.prepare(work, dir) => prepared?,
+            prepared = self.prepare(&cas, work, dir) => prepared?,
             Ok(by) = &mut *stop => {
                 *killer = Some(by);
                 return Err(RuntimeError::Killed);
@@ -509,12 +517,15 @@ impl<C: Cas> NativeRuntime<C> {
         clock.execution_start_timestamp = now();
         let exit_code = match &prepared.refused {
             Some(refused) => refuse(dir, refused).await?,
-            None => self.execute(work, dir, &prepared, stop, killer).await?,
+            None => {
+                self.execute(&cas, work, dir, &prepared, stop, killer)
+                    .await?
+            }
         };
         clock.execution_completed_timestamp = now();
 
         clock.output_upload_start_timestamp = now();
-        let store = CasStore(Arc::clone(&self.cas));
+        let store = CasStore(&cas);
         let mut result = ActionResult {
             exit_code,
             ..ActionResult::default()
@@ -1063,6 +1074,12 @@ mod tests {
     struct NoCas;
 
     impl Cas for NoCas {
+        type Lease = std::sync::Arc<Self>;
+
+        fn lease(self: &std::sync::Arc<Self>, _: &kbf_types::LeaseId) -> std::sync::Arc<Self> {
+            std::sync::Arc::clone(self)
+        }
+
         async fn get(&self, digest: &kbf_proto::reapi::Digest) -> Result<Vec<u8>, CasError> {
             Err(CasError::Missing(digest.hash.clone()))
         }

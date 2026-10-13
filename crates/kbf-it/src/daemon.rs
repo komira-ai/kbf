@@ -19,9 +19,8 @@ use std::sync::Arc;
 
 use kbf_daemon::config::ConfigError;
 use kbf_daemon::report::DetectError;
-use kbf_daemon::{
-    CasClient, Daemon, DaemonConfig, LOCAL_DRIVER, LocalRuntime, NodeReport, TlsFiles,
-};
+use kbf_daemon::{Daemon, DaemonConfig, LOCAL_DRIVER, LocalRuntime, NodeReport, TlsFiles};
+use kbf_transfer::{TransferConfig, Transfers};
 use tonic::transport::Endpoint;
 
 /// `kbf-cell daemon` flags.
@@ -94,15 +93,12 @@ pub async fn run(args: DaemonArgs, shutdown: impl Future<Output = ()>) -> Result
         source,
     };
     // Lazy: the daemon may start before the server, and the CAS is reached per lease.
-    let channel = Endpoint::from_shared(args.cas.clone())
+    let endpoint = Endpoint::from_shared(args.cas.clone())
         .map_err(fail)?
         .tls_config(tls.load()?)
-        .map_err(fail)?
-        .connect_lazy();
-    let runtime = Arc::new(LocalRuntime::new(
-        Arc::new(CasClient::new(channel)),
-        args.scratch,
-    ));
+        .map_err(fail)?;
+    let transfers = Transfers::new(endpoint, TransferConfig::default());
+    let runtime = Arc::new(LocalRuntime::new(Arc::new(transfers), args.scratch));
     let report = NodeReport::detect(&[LOCAL_DRIVER])?;
     let config = DaemonConfig::new(args.server, tls, args.node_id);
     let daemon = Daemon::new(config, runtime, report)?;

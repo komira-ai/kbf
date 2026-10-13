@@ -61,6 +61,10 @@ impl Store for MemoryStore {
         }
         Ok(stored)
     }
+
+    fn in_flight(&self) -> usize {
+        64
+    }
 }
 
 /// A fresh scratch directory for one test, beside the test binary.

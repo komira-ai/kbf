@@ -1,6 +1,6 @@
 # Worker inputs: a shared blob transfer engine and a per-node NVMe file cache
 
-Status: design, revision 5 (one connection; the cache persists from its first PR, through one snapshot file that unknown files are adopted into). Stage C1 is built; where it differs from the text, "C1 as built" (end of section 10) says how.
+Status: design, revision 5 (one connection; the cache persists from its first PR, through one snapshot file that unknown files are adopted into). Stages C1 and T1 are built; where they differ from the text, "C1 as built" and "T1 as built" (end of section 10) say how.
 Every "today" claim cites a file on `main` at `d7f25cf` (#524). Every number marked
 *unmeasured* is an estimate that the PR introducing it must replace with a measurement.
 
@@ -947,10 +947,10 @@ Wall-clock speedups are reported, never asserted.
 **C1 as built** (where the code differs from the sections above, or settles what they
 left open):
 
-- Fills read through the existing CAS client, which returns a blob whole: a fill holds
-  its blob in memory, within the lease's `tree::FETCH_BYTES_IN_FLIGHT`. T1's `read_to`
-  replaces this. `--cache-link-concurrency` bounds a lease's keys in flight, hits and
-  fills alike; T1 separates network permits from local work.
+- Fills read a blob whole into memory. Before T1 that was within the lease's
+  `tree::FETCH_BYTES_IN_FLIGHT`; since T1 it is the engine's `get`, within its byte
+  budget for the process ("T1 as built"). `--cache-link-concurrency` bounds a lease's
+  keys in flight, hits and fills alike; the engine's permits bound the network.
 - A fill is driven by the lease that took the key's slot. If that lease is dropped, the
   fill stops with it and the slot is released; a waiter then takes the slot and fills
   the key itself. There is no "more than half its bytes" rule before T1.
@@ -997,6 +997,65 @@ left open):
 - The toolchain count of section 1 is the archive's (15,189 files): C1 has no farm
   build of zig to log `inputs: files=...` from, so the count per input root waits for
   the first cached farm node.
+
+**T1 as built** (crate `kbf-transfer`; where the code differs from section 4):
+
+- The `Cas` trait moved into `kbf-transfer` (`kbf_daemon::cas` re-exports it), and the
+  engine is a `Cas`: `Transfers::new(endpoint, config)` (explicit windows, one
+  `connect_lazy` channel), `Transfers::over(channel, config)` for a connection already
+  made, `scope(&lease)` and `stats()`. `CasClient` is gone; its calls are the engine's
+  backend (`wire`). The trait gained `type Lease` and `lease(&Arc<Self>, &LeaseId)`, so
+  each driver takes one scope per lease without naming the engine (a store with
+  nothing per lease returns itself), plus `read_to` and `in_flight`.
+- **No `read_many` or `upload_missing` method yet.** The callers (`materialize`, the
+  cache's fills, the output walks of both drivers) stay generic over `Cas` and make
+  per-blob calls, concurrently, with at most `Cas::in_flight` of their own in progress:
+  a bound on what one walk holds (open files, fetched bytes), read from the engine's
+  one `--transfer-in-flight`, not a second constant. Contract 5 holds: no caller waits
+  for one blob before asking for the next. The engine merges reads per digest, and
+  gathers the FindMissing questions of concurrent uploads into calls of at most
+  `--transfer-find-missing-chunk` digests, one call at a time (the questions that
+  arrive during a call wait for the next; no linger). The set methods come with T2,
+  where grouping decides the batches.
+- `materialize` writes each distinct blob's first file with `read_to` and copies its
+  other files from it. `read_to` of a blob up to `--transfer-memory-blob-bytes` goes
+  through the shared in-memory fetch; a larger one is streamed into the file and
+  resumed from its offset. The byte budget covers a read into memory from its start to
+  its answer; bytes a caller holds after that (a fill until its insert) are bounded by
+  the caller's own `in_flight` items. Cache fills read through `get`, into memory:
+  streaming a fill into `tmp/` is left for later, since an insert that fails hands the
+  bytes to the lease to write.
+- A write from memory is retried from its first byte; one from a file's chunks
+  (`put_chunks`) is not retried, its chunks being read once. Retried codes: UNAVAILABLE,
+  and UNKNOWN, INTERNAL, CANCELLED and ABORTED (how tonic reports a stream whose
+  connection broke). The backoff is 100 ms, doubling, at most 3.2 s, not a flag. tonic's
+  lazy channel connects again on the next request.
+- A FindMissing that fails after its retries, or that the server refuses, answers
+  "missing": the blob is uploaded. The first UNIMPLEMENTED turns it off for the life of
+  the process, with one warning; `EngineStats::find_missing_unavailable` counts it.
+- A shared fetch counts its waiters. When the last leaves, the fetch gives up unless
+  more than half of the blob has arrived; giving up drops the read, so one only queued
+  never reaches the server. Only the fetch's own task takes it out of the map, under
+  the map's lock, so no caller joins a fetch that gave up.
+- **`TransferStats` is a log line, not yet the API.** Each lease's scope logs
+  `transfers: read_calls=... read_bytes=... merged_reads=... find_missing_digests=...
+  outputs_present=... write_calls=... written_bytes=... retries=...` (INFO, field
+  `lease`) once the lease's scope and the fetches it started are gone. FindMissing calls
+  are shared by leases, so a lease counts the digests it asked about
+  (`find_missing_digests`), not calls. The batch counters wait for T2;
+  `permit_wait_ms` and `transfer_ms` are not counted yet. Carrying them in
+  `auxiliary_metadata`, the invocation metrics and the operator API (`EngineStats`, a
+  test counter for now) is a later stage.
+- Flags: `--transfer-in-flight`, `--transfer-bytes-in-flight`,
+  `--transfer-memory-blob-bytes`, `--transfer-chunk-bytes`,
+  `--transfer-find-missing-chunk`, `--transfer-stream-window-bytes` and
+  `--transfer-retries`, with 4.5's defaults, still *unmeasured* (no farm measurement
+  ran with this change). `--transfer-lease-in-flight` is not added until a measurement
+  shows a need; the batch flags come with T2.
+- Tests: T-1, T-2, T-3 and C-11 are in `crates/kbf-transfer/tests/engine.rs`, against a
+  counting fake server behind a proxy that counts connections and can cut them. The
+  windows are checked in the SETTINGS and WINDOW_UPDATE frames the engine sends, and
+  the decode limit with a 4.5 MiB message.
 
 ---
 

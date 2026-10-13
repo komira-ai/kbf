@@ -282,9 +282,13 @@ impl<C: Cas> PodmanRuntime<C> {
         self.stops.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Step 1: everything up to `podman create`.
-    async fn prepare(&self, work: &Work, lease: &mut Lease) -> Result<Prepared, RuntimeError> {
-        let cas = &*self.cas;
+    /// Step 1: everything up to `podman create`, through the lease's `cas`.
+    async fn prepare(
+        &self,
+        cas: &C::Lease,
+        work: &Work,
+        lease: &mut Lease,
+    ) -> Result<Prepared, RuntimeError> {
         let action: Action = fetch_message(cas, &work.action_digest)
             .await
             .map_err(tree_error)?;
@@ -397,6 +401,8 @@ impl<C: Cas> PodmanRuntime<C> {
             input_fetch_start_timestamp: now(),
             ..ExecutedActionMetadata::default()
         };
+        // The lease's own view of the CAS, for its transfer counters.
+        let cas = &self.cas.lease(&work.lease_id);
         // A kill during prepare (a long input fetch) stops it at once: dropping the
         // future drops any Podman query with it (`kill_on_drop`), and the clean step
         // removes whatever was written.
@@ -405,7 +411,7 @@ impl<C: Cas> PodmanRuntime<C> {
             outputs,
             timeout,
         } = tokio::select! {
-            prepared = self.prepare(work, lease) => prepared?,
+            prepared = self.prepare(cas, work, lease) => prepared?,
             Ok(by) = &mut *stop => {
                 *killer = Some(by);
                 return Err(RuntimeError::Killed);
@@ -415,7 +421,6 @@ impl<C: Cas> PodmanRuntime<C> {
         // Execution counts from `podman create`: making the container is part of
         // running the command in one.
         clock.execution_start_timestamp = now();
-        let cas = &*self.cas;
         lease.created = true;
         self.podman
             .create(&spec)
@@ -448,7 +453,7 @@ impl<C: Cas> PodmanRuntime<C> {
                 _ = child.wait() => {}
                 () = tokio::time::sleep(timeout) => {
                     self.stop_container(&lease.name, &lease.cgroup, child).await;
-                    return Err(self.timed_out(&lease.name, &stdout_path, &stderr_path).await);
+                    return Err(self.timed_out(cas, &lease.name, &stdout_path, &stderr_path).await);
                 }
                 Ok(by) = &mut *stop => {
                     *killer = Some(by);
@@ -612,11 +617,17 @@ impl<C: Cas> PodmanRuntime<C> {
     /// stderr, each stored within the stdio limit (REAPI's partial result). A log past
     /// the limit, or one that cannot be stored, is left out: the answer is still the
     /// timeout.
-    async fn timed_out(&self, name: &str, stdout: &Path, stderr: &Path) -> RuntimeError {
+    async fn timed_out(
+        &self,
+        cas: &C::Lease,
+        name: &str,
+        stdout: &Path,
+        stderr: &Path,
+    ) -> RuntimeError {
         let max = self.config.outputs.max_stdio_bytes;
         let mut logs = [None, None];
         for (path, slot) in [stdout, stderr].into_iter().zip(&mut logs) {
-            match collect_log(&*self.cas, path, max).await {
+            match collect_log(cas, path, max).await {
                 Ok(digest) => *slot = Some(digest),
                 Err(e) => tracing::warn!(lease = %name, "timed out; its log is left out: {e}"),
             }

@@ -26,6 +26,11 @@ pub trait Store: Sync {
         file: std::fs::File,
         digest: Digest,
     ) -> impl Future<Output = Result<Digest, StoreError>> + Send;
+
+    /// How many requests the store runs at once (the transfer engine's limit for the
+    /// whole process): [`crate::collect`] queues no more than this many blobs ahead of
+    /// it, so a walk holds that many open files, not the tree's.
+    fn in_flight(&self) -> usize;
 }
 
 /// The SHA-256 digest of `bytes`.

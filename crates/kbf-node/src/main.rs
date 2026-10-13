@@ -42,13 +42,13 @@ use std::time::Duration;
 
 use clap::Parser;
 use kbf_daemon::{
-    Args, Capacity, CasClient, DAEMON_VERSION, Daemon, DaemonConfig, DriverWatch, FakeRuntime,
-    NodeReport, Runtime, Runtimes,
+    Args, Capacity, DAEMON_VERSION, Daemon, DaemonConfig, DriverWatch, FakeRuntime, NodeReport,
+    Runtime, Runtimes,
 };
 use kbf_driver_native::{MemoryPolicy, NativeConfig, NativeRuntime, xcode, xcode_watch};
 use kbf_outputs::OutputLimits;
+use kbf_transfer::Transfers;
 use tokio::signal::unix::{Signal, SignalKind, signal};
-use tonic::transport::Endpoint;
 
 /// The `kbf-daemon` command line.
 #[derive(Clone, Debug, clap::Parser)]
@@ -65,7 +65,8 @@ struct Cli {
     /// the container and native drivers read and write blobs through, over mutual TLS
     /// with this daemon's `--ca-cert`, `--cert`, `--key` and `--tls-server-name`.
     /// Plain `http://` is refused: the worker listener admits each blob call by the
-    /// daemon's certificate.
+    /// daemon's certificate. Every driver's blobs go through one transfer engine, over
+    /// one connection, within the `--transfer-*` limits.
     #[arg(long)]
     cas: Option<String>,
     /// The directory lease directories are made in (container and native drivers).
@@ -75,6 +76,8 @@ struct Cli {
     outputs: OutputLimits,
     #[command(flatten)]
     cache: cache::CacheArgs,
+    #[command(flatten)]
+    transfer: transfer::TransferArgs,
     /// The cgroup lease cgroups are made under, from the cgroup root (container). Left
     /// out, the daemon sets up its own cgroup, which its systemd unit must delegate
     /// (`Delegate=yes`): it moves itself into a `supervisor` leaf there and makes
@@ -285,9 +288,22 @@ struct Node {
     reports: Option<Reports>,
     /// The whole-machine runtime's phase.
     phase: Option<tokio::sync::watch::Receiver<kbf_types::NodePhase>>,
+    /// The transfer engine every runtime shares, made by the first that needs it.
+    transfers: Option<Arc<Transfers>>,
 }
 
 impl Node {
+    /// The process's transfer engine ([`transfer::engine`]), made on the first call;
+    /// every later call returns the same one.
+    fn transfers(&mut self, cli: &Cli) -> Result<Arc<Transfers>, Error> {
+        if let Some(made) = &self.transfers {
+            return Ok(Arc::clone(made));
+        }
+        let made = Arc::new(transfer::engine(cli)?);
+        self.transfers = Some(Arc::clone(&made));
+        Ok(made)
+    }
+
     /// Adds `runtime`. Fails when it serves a lease kind a runtime added before serves.
     fn add<R: Runtime>(&mut self, runtime: Arc<R>) -> Result<(), Error> {
         self.runtimes = Some(match self.runtimes.take() {
@@ -325,7 +341,9 @@ fn node(
                 if let Some(warning) = cache::native_warning(&cli.cache) {
                     tracing::warn!("{warning}");
                 }
-                let (runtime, reports) = native_runtime(cli, native()?, xcrun)?;
+                let config = native()?;
+                let cas = node.transfers(cli)?;
+                let (runtime, reports) = native_runtime(cli, config, xcrun, cas)?;
                 node.add(runtime)?;
                 node.reports = Some(reports);
             }
@@ -364,7 +382,8 @@ fn native_with(cli: &Cli, config: NativeConfig, xcrun: &Path) -> Result<(Daemon,
     Ok((daemon, reports.ok_or("no native driver")?))
 }
 
-/// The native driver with `config` and the `xcrun` it surveys with and warms. It
+/// The native driver with `config`, the `xcrun` it surveys with and warms, and the
+/// process's transfer engine `cas`. It
 /// surveys the Xcodes in `--xcode-apps` in the background, at once and again every
 /// `--xcode-recheck-secs`, and returns each changed survey for the daemon
 /// (`Daemon::with_driver_report`): without it the node reports no Xcode, ready or
@@ -374,10 +393,11 @@ fn native_runtime(
     cli: &Cli,
     mut config: NativeConfig,
     xcrun: &Path,
-) -> Result<(Arc<NativeRuntime<CasClient>>, Reports), Error> {
+    cas: Arc<Transfers>,
+) -> Result<(Arc<NativeRuntime<Transfers>>, Reports), Error> {
     // The simulators of the leases that ask for one are made with the same `xcrun`.
     config.xcrun = xcrun.to_owned();
-    let runtime = NativeRuntime::new(config, Arc::new(cas_client(cli)?))?;
+    let runtime = NativeRuntime::new(config, cas)?;
     let runtime = Arc::new(runtime);
     let watched = Arc::clone(&runtime);
     let (mut probe, every) = xcode_watch_args(cli);
@@ -467,25 +487,6 @@ fn xcode_watch_args(cli: &Cli) -> (xcode::Probe, Duration) {
     (probe, Duration::from_secs(cli.xcode_recheck_secs.max(1)))
 }
 
-/// A client of the blob service `--cas` names, over mutual TLS with the daemon's own
-/// TLS files. Connects on first use.
-fn cas_client(cli: &Cli) -> Result<CasClient, Error> {
-    let url = cli
-        .cas
-        .clone()
-        .ok_or("--cas is required by the container and native drivers")?;
-    if !url.starts_with("https://") {
-        return Err(format!(
-            "--cas {url:?} must be an https:// URL: the server's worker listener, which \
-             serves blobs over mutual TLS only"
-        )
-        .into());
-    }
-    let endpoint =
-        Endpoint::from_shared(url)?.tls_config(DaemonConfig::from_args(&cli.daemon).tls.load()?)?;
-    Ok(CasClient::new(endpoint.connect_lazy()))
-}
-
 #[cfg(target_os = "linux")]
 mod container {
     use std::sync::Arc;
@@ -496,15 +497,15 @@ mod container {
         ContainerLimits, IdFiles, ImageRef, OutputLimits, PodmanConfig, PodmanRuntime, SwapKill,
     };
 
-    use super::{Cli, Error, ImageUnusable, Node, cas_client, scratch};
-    use kbf_daemon::CasClient;
+    use super::{Cli, Error, ImageUnusable, Node, scratch};
+    use kbf_transfer::Transfers;
 
     /// Builds the container driver, over the daemon's CAS client, and adds it to `node`
     /// with what its leases may use.
     pub(super) fn add(cli: &Cli, node: &mut Node) -> Result<(), Error> {
         // The checks that change nothing come first.
         let scratch = scratch(cli)?;
-        let cas = cas_client(cli)?;
+        let cas = node.transfers(cli)?;
         // Every container's ids are this user's subordinate ids (`--userns=nomap`).
         let files = cli
             .id_files
@@ -563,7 +564,7 @@ mod container {
         config.limits = limits(cli);
         config.swap_kill = swap_kill(cli);
         config.cache = crate::cache::given(&cli.cache, &config.scratch);
-        let runtime = PodmanRuntime::new(config, Arc::new(cas))?;
+        let runtime = PodmanRuntime::new(config, cas)?;
         // From `start`, in the runtime's context but outside any task.
         tokio::runtime::Handle::current().block_on(check_images(&runtime, &cli.images))?;
         node.add(Arc::new(runtime))?;
@@ -575,7 +576,7 @@ mod container {
     /// node's image store, one architecture's manifest. The first that is not stops the
     /// start, with its fix.
     async fn check_images(
-        runtime: &PodmanRuntime<CasClient>,
+        runtime: &PodmanRuntime<Transfers>,
         images: &[String],
     ) -> Result<(), ImageUnusable> {
         for value in images {
@@ -620,6 +621,7 @@ mod container {
 
 mod cache;
 mod instance;
+mod transfer;
 mod whole_machine;
 
 #[cfg(test)]
@@ -1100,15 +1102,17 @@ mod tests {
     async fn the_cas_url_must_be_https() {
         for url in ["http://front:8981", "ftp://front", "front:8981"] {
             let cli = parse(&["--driver=native", &format!("--cas={url}")]).expect("flags");
-            let why = cas_client(&cli).expect_err(url).to_string();
+            let why = transfer::engine(&cli).expect_err(url).to_string();
             assert!(why.contains("must be an https:// URL"), "{url}: {why}");
         }
         let none = parse(&["--driver=native"]).expect("flags");
-        let why = cas_client(&none).expect_err("no --cas").to_string();
+        let why = transfer::engine(&none).expect_err("no --cas").to_string();
         assert!(why.contains("--cas is required"), "{why}");
         // https reads the daemon's TLS files, which these flags name but do not hold.
         let https = parse(&["--driver=native", "--cas=https://front:8981"]).expect("flags");
-        let why = cas_client(&https).expect_err("no TLS files").to_string();
+        let why = transfer::engine(&https)
+            .expect_err("no TLS files")
+            .to_string();
         assert!(why.contains("ca.pem"), "{why}");
     }
 }
