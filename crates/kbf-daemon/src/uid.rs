@@ -80,7 +80,7 @@ pub fn processes(uid: u32) -> io::Result<Vec<i32>> {
 /// # Errors
 /// The process table could not be read.
 pub fn effective(uid: u32) -> io::Result<Vec<i32>> {
-    let mut pids = list_pids(PROC_UID_ONLY, uid)?;
+    let mut pids = list_pids(PROC_RUID_ONLY, uid)?;
     pids.sort_unstable();
     pids.retain(|&pid| live(pid));
     Ok(pids)
