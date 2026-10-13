@@ -2,14 +2,16 @@
 //! fetch per blob however many leases want it, links of one inode per key per lease,
 //! the fallbacks to a private copy, the checks on every hit, eviction by budget and by
 //! free space, and the one-owner lock; restarts (`restart`), crashes (`crash`) and
-//! refusals and I/O errors (`edges`). One test binary, so each part of the cache is
-//! measured in one place.
+//! refusals and I/O errors (`edges`); measurements at 1M entries, off the gate
+//! (`measure`). One test binary, so each part of the cache is measured in one place.
 #![cfg(target_os = "linux")]
 
 #[path = "cache/crash.rs"]
 mod crash;
 #[path = "cache/edges.rs"]
 mod edges;
+#[path = "cache/measure.rs"]
+mod measure;
 #[path = "cache/restart.rs"]
 mod restart;
 mod support;
@@ -179,6 +181,51 @@ async fn the_budget_evicts_least_recently_used_but_never_a_pinned_key() {
     assert_eq!(std::fs::read(first.join("old")).expect("read"), blob(b'o'));
     assert_eq!(cache.stats().bytes, on_disk_sum(&dir));
     assert_eq!(cache.stats().evictions, 5);
+    stop(cache, &gates);
+}
+
+/// C-8, two leases. Catches a pin count dropped when the first of two leases that pin
+/// one key finishes (the "remove the pin on any release" mutant): the budget holds one
+/// 100-byte entry; of two pins on `old`, the first is released, and the other keeps
+/// `old` through an insert that puts the cache over the budget, so the round after the
+/// insert's lease evicts the new key instead. Once both pins are released, the next
+/// insert evicts `old`.
+#[tokio::test]
+async fn a_key_two_leases_pin_stays_until_both_release_it() {
+    let dir = scratch("cache-c8-two");
+    let gates = Gates::new();
+    let clock = FakeClock::at(1000);
+    let cache = Cache::open(config(&dir, 100, Arc::clone(&gates), &clock)).expect("open");
+    let cas = CountingCas::default();
+    let one = |c: u8| cas.tree(&[file("f", &[c; 100], false)]);
+    let old = key(&[b'o'; 100], false);
+    lease(&cas, &cache, &one(b'o'), &dir, "old")
+        .await
+        .expect("old");
+    let first = cache.pin(vec![old]);
+    let second = cache.pin(vec![old]);
+    drop(first);
+    clock.advance(60);
+    lease(&cas, &cache, &one(b'n'), &dir, "new")
+        .await
+        .expect("new");
+    cache.evict();
+    assert!(
+        cache.holds(&old),
+        "a key still pinned by one lease was evicted when the other released it"
+    );
+    assert!(
+        !cache.holds(&key(&[b'n'; 100], false)),
+        "the unpinned key was kept"
+    );
+    drop(second);
+    clock.advance(60);
+    lease(&cas, &cache, &one(b't'), &dir, "third")
+        .await
+        .expect("third");
+    assert!(!cache.holds(&old), "a key both leases released was kept");
+    assert!(cache.holds(&key(&[b't'; 100], false)));
+    assert_eq!(cache.stats().bytes, on_disk_sum(&dir));
     stop(cache, &gates);
 }
 
