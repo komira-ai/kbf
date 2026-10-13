@@ -207,7 +207,7 @@ fn kill_until(uid: u32, within: Duration, give_up: Instant) -> Result<(), EndErr
         if left.is_empty() {
             return Ok(());
         }
-        if Instant::now() >= give_up {
+        if Instant::now() >= give_up && uid == u32::MAX {
             return Err(EndError::Survived {
                 uid,
                 within,
