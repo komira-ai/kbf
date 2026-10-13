@@ -400,16 +400,18 @@ async fn a_tree_deeper_than_a_path_is_read_iteratively() {
 }
 
 /// Catches a large file held whole in memory instead of handed to `put_file`, and a
-/// large file stored with the wrong bytes.
+/// large file stored with the wrong bytes. The two files differ: a digest is stored
+/// once however many files hold it (`tests/uploads.rs`).
 #[tokio::test]
 async fn a_large_file_is_streamed_to_the_store() {
     let root = scratch("large");
     let large: Vec<u8> = (0..(CHUNK_BYTES * 3 + 1))
         .map(|i| (i % 249) as u8)
         .collect();
+    let other: Vec<u8> = large.iter().map(|b| b ^ 0xff).collect();
     std::fs::create_dir(root.join("dir")).expect("mkdir");
     std::fs::write(root.join("big"), &large).expect("write");
-    std::fs::write(root.join("dir/big"), &large).expect("write");
+    std::fs::write(root.join("dir/big"), &other).expect("write");
     let store = MemoryStore::default();
     let result = run(&store, &root, "", &["big", "dir"], OutputLimits::DEFAULT)
         .await
@@ -420,7 +422,8 @@ async fn a_large_file_is_streamed_to_the_store() {
     );
     assert_eq!(result.output_files[0].digest, Some(digest_of(&large)));
     let top = tree(&store, &result, 0).root.expect("root");
-    assert_eq!(top.files[0].digest, Some(digest_of(&large)));
+    assert_eq!(top.files[0].digest, Some(digest_of(&other)));
+    assert_eq!(store.get(&digest_of(&other)), other);
 }
 
 /// Catches a store failure swallowed, or reported without the path it was storing.

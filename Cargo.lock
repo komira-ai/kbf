@@ -1297,6 +1297,7 @@ dependencies = [
  "futures",
  "hex",
  "kbf-daemon",
+ "kbf-outputs",
  "kbf-proto",
  "kbf-types",
  "prost",
@@ -1573,6 +1574,7 @@ name = "kbf-outputs"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "futures",
  "hex",
  "kbf-proto",
  "libc",
