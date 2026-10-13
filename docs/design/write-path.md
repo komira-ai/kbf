@@ -187,9 +187,12 @@ the commit is indexed once; its new record is dead bytes, reclaimed with the seg
 
 ### 4.2 Bounds and failure
 
-- **Caps.** `--segment-upload-max-bytes` (default 1 GiB + 1 MiB: one `MAX_BLOB_BYTES`
-  record and its footer fit). The server refuses to start unless the cap is at least
-  that and at most `--write-bytes-in-flight`, so a legal `Begin` is always admitted.
+- **Caps.** `--segment-upload-max-bytes` is at least one `MAX_BLOB_BYTES` record and its
+  footer (1 GiB + 1 MiB). Without the tier, ranges are held in memory, so the server
+  refuses to start unless the cap is at most `--write-bytes-in-flight` (default cap
+  1 GiB + 1 MiB). With the tier on, ranges go to disk as they arrive, so the cap may be
+  high: default 16 GiB, and the server refuses to start unless it is at most
+  `--write-tier-bytes`. Either way a legal `Begin` is always admitted.
   `MAX_UPLOAD_RECORDS` (16,384) bounds `Begin`'s message (16,384 entries of 52 B, about
   850 KiB, under `MAX_MESSAGE_BYTES`) and the upload's one `PutBlobs` or `PutStaged`
   (about 1 MiB in the Raft log, an estimate). The daemon splits a larger output set into
@@ -201,8 +204,15 @@ the commit is indexed once; its new record is dead bytes, reclaimed with the seg
   (`pwrite`), and the permit covers only ranges in flight. A commit turns the
   reservation into staged bytes; a drop releases it.
 - An upload belongs to the worker connection that called `Begin`. When it closes, or
-  after `--segment-upload-idle` (default 60 s) with no call, the upload is dropped: its
-  permit and reservation are released and its tier file deleted. Nothing points at it.
+  after `--segment-upload-idle` (default 60 s) with no call, an upload that is still
+  **receiving** is dropped: its permit and reservation are released and its tier file
+  deleted. Nothing points at it. An upload that is **committing** is never dropped: the
+  commit runs in its own task, detached from the connection and from the `Commit`
+  handler's future, until it is indexed or has failed; only then is it released (a
+  failed commit deletes its file, a committed one is staged). Test: close the
+  connection after `Commit`, at each point (during hashing, after the sync, after
+  `PutStaged` is proposed, during the direct PUT); every outcome is either nothing
+  indexed and no file, or indexed with its file present.
   A daemon that reconnects calls `FindMissingBlobs` again, so blobs a commit indexed
   before its reply was lost are skipped.
 - A failed `Commit` (store, commit or hash) indexes nothing. The daemon retries the
@@ -365,6 +375,19 @@ stops on it (`kbf-server/src/raft_log/machine.rs`), and opening the log returns
 `RaftLogError::Decode` (`decoded`, `raft_log/mod.rs`). PR 2 adds a test that pins this
 for the new variants. The snapshot encoding ([metadata-snapshots.md](metadata-snapshots.md))
 gains the staged table.
+
+### 6.6 A server and a daemon on one host
+
+The daemon's input cache (one read-only file per blob, so leases can hard-link it,
+evicted by use) and the server's write tier (segments, evicted only after their flush)
+stay two stores: a hard link cannot point into a segment, and one eviction policy would
+get one side wrong; a store-down backlog in the tier must never evict a running build's
+inputs. They share the disk with budgets that add up, for example on an 884 GB disk:
+input cache 400 GB with a 100 GB floor, write tier 200 GB, the rest for lease scratch
+and the OS. A daemon miss for a blob staged on its own host's server is served from
+that server's local tier over loopback, no object store and no LAN. On a filesystem
+with reflink (XFS, btrfs) a later step may clone the byte range into the cache file
+(`FICLONERANGE`) instead of copying it.
 
 ## 7. Expected effect on the 15,189-file upload
 
