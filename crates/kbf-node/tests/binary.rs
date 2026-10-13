@@ -241,6 +241,17 @@ fn runs_until_sigterm_logged(
     extra: &[String],
     path: Option<&Path>,
 ) -> (std::process::ExitStatus, Vec<String>) {
+    runs_until_sigterm_logged_then(name, extra, path, || {})
+}
+
+/// [`runs_until_sigterm_logged`], running `before_sigterm` once the daemon tried its
+/// first session and before it is sent SIGTERM.
+fn runs_until_sigterm_logged_then(
+    name: &str,
+    extra: &[String],
+    path: Option<&Path>,
+    before_sigterm: impl FnOnce(),
+) -> (std::process::ExitStatus, Vec<String>) {
     let dir = tls(name);
     let started = Instant::now();
     let mut command = Command::new(BIN);
@@ -286,6 +297,7 @@ fn runs_until_sigterm_logged(
         log.push(line);
     }
     log_start(name, "tried its first session", tried, &log);
+    before_sigterm();
     let pid = i32::try_from(child.id()).expect("pid");
     // SAFETY: kill(2) on the child this test spawned and has not reaped.
     assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
