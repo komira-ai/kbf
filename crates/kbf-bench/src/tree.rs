@@ -1,6 +1,6 @@
 //! The blobs a run sends or reads: an output tree, generated or read from a directory,
-//! as the daemon would store it (each file a blob, and one REAPI `Tree` message of the
-//! directories), each distinct digest once.
+//! as the daemon would store it (each file a blob, each directory's REAPI `Directory`
+//! message a blob, and one REAPI `Tree` message of them all), each distinct digest once.
 //!
 //! A generated tree is a function of its [`Shape`] and seed alone, so `kbf-bench read`
 //! rebuilds the bytes `kbf-bench upload` sent and checks every blob against them. Every
@@ -54,9 +54,12 @@ pub struct Tree {
     /// Entries of a read directory that are neither files nor directories (symlinks,
     /// sockets): left out.
     pub skipped: u64,
-    /// Every distinct blob, by digest: the files and the `Tree` message of the
-    /// directories, what the daemon stores for an output directory.
+    /// Every distinct blob, by digest: the files, each directory's `Directory`
+    /// message (the output directory's too) and the `Tree` message of them all, what
+    /// the daemon stores for an output directory.
     pub blobs: Vec<Blob>,
+    /// The `Tree` message's digest (one of `blobs`).
+    pub tree_digest: Digest,
 }
 
 /// Why a tree could not be made.
@@ -280,8 +283,8 @@ impl Layout {
         self.blobs.entry(blob.digest.hash.clone()).or_insert(blob);
     }
 
-    /// The tree's blobs: each directory's message, children before parents, gathered
-    /// in one `Tree` message, which is a blob too.
+    /// The tree's blobs: each directory's message, children before parents, each a
+    /// blob, gathered in one `Tree` message, which is a blob too.
     fn finish(mut self, seed: u64, skipped: u64) -> Tree {
         let mut messages: Vec<Option<Directory>> = (0..self.dirs.len()).map(|_| None).collect();
         for at in (0..self.dirs.len()).rev() {
@@ -299,11 +302,19 @@ impl Layout {
                 })
                 .collect();
             directories.sort_by(|a, b| a.name.cmp(&b.name));
-            messages[at] = Some(Directory {
+            let message = Directory {
                 files,
                 directories,
                 ..Directory::default()
+            };
+            // As the daemon's `store_directories`: every Directory the Tree names is
+            // stored, so each digest in it can be fetched.
+            let bytes = message.encode_to_vec();
+            self.add(Blob {
+                digest: digest_of(&bytes),
+                bytes,
             });
+            messages[at] = Some(message);
         }
         let mut messages = messages.into_iter().flatten();
         let tree = TreeMessage {
@@ -312,8 +323,9 @@ impl Layout {
         };
         let dirs = self.dirs.len() as u64 - 1;
         let tree = tree.encode_to_vec();
+        let tree_digest = digest_of(&tree);
         self.add(Blob {
-            digest: digest_of(&tree),
+            digest: tree_digest.clone(),
             bytes: tree,
         });
         Tree {
@@ -324,6 +336,7 @@ impl Layout {
             file_bytes: self.file_bytes,
             skipped,
             blobs: self.blobs.into_values().collect(),
+            tree_digest,
         }
     }
 }

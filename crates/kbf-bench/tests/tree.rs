@@ -18,15 +18,32 @@ const PILOT: Shape = Shape {
     total_bytes: 307_000_000,
 };
 
-/// The `Tree` message among the blobs: the one blob that is no file.
+/// The `Tree` message among the blobs, checked: the blobs that are no file are it
+/// and every `Directory` it holds (the root's too), no more and no fewer, as the
+/// daemon stores an output directory.
 fn message(tree: &Tree, files: &BTreeSet<String>) -> TreeMessage {
-    let mut messages = tree
+    let blob = tree
         .blobs
         .iter()
-        .filter(|b| !files.contains(&b.digest.hash));
-    let blob = messages.next().expect("a Tree blob");
-    assert!(messages.next().is_none(), "one blob is not a file");
-    TreeMessage::decode(blob.bytes.as_slice()).expect("a Tree message")
+        .find(|b| b.digest == tree.tree_digest)
+        .expect("the Tree blob");
+    assert_eq!(digest_of(&blob.bytes), tree.tree_digest);
+    let message = TreeMessage::decode(blob.bytes.as_slice()).expect("a Tree message");
+    let mut wanted: BTreeSet<String> = message
+        .root
+        .iter()
+        .chain(&message.children)
+        .map(|d| digest_of(&d.encode_to_vec()).hash)
+        .collect();
+    wanted.insert(tree.tree_digest.hash.clone());
+    let others: BTreeSet<String> = tree
+        .blobs
+        .iter()
+        .map(|b| b.digest.hash.clone())
+        .filter(|h| !files.contains(h))
+        .collect();
+    assert_eq!(others, wanted, "the blobs that are no file");
+    message
 }
 
 /// Every file digest the tree's directories name, the directories below the root,
@@ -93,7 +110,8 @@ fn a_generated_tree_has_the_pilot_shape() {
         15_000 - 144 + 1,
         "every non-empty file distinct"
     );
-    assert_eq!(tree.blobs.len(), files.len() + 1);
+    // The Tree and 990 Directories (all distinct: each holds files of its own).
+    assert_eq!(tree.blobs.len(), files.len() + 1 + 990);
     let indices: BTreeSet<u64> = tree
         .blobs
         .iter()
@@ -189,7 +207,14 @@ fn a_shape_that_cannot_be_made_is_refused() {
         (empty.files, empty.empty, empty.file_bytes, empty.dirs),
         (5, 5, 0, 0)
     );
-    assert_eq!(empty.blobs.len(), 2, "the empty blob and the Tree");
+    assert_eq!(
+        empty.blobs.len(),
+        3,
+        "the empty blob, the output directory and the Tree"
+    );
+    let files = files_of(&empty);
+    let message = message(&empty, &files);
+    assert_eq!(message.root.expect("root").files.len(), 5);
 }
 
 fn scratch(name: &str) -> PathBuf {
@@ -236,7 +261,7 @@ fn a_directory_is_read_with_its_files_salted_by_the_seed() {
         .iter()
         .filter(|b| ours.contains(b.digest.hash.as_str()))
         .count();
-    assert_eq!(shared, 1, "the empty file alone");
+    assert_eq!(shared, 2, "the empty file, and c, which holds it alone");
 }
 
 /// Catches a missing directory reported without its path.

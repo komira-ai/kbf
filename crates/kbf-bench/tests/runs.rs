@@ -29,6 +29,7 @@ use kbf_proto::reapi::{
     GetChunkMappingRequest, GetChunkMappingResponse, GetTreeRequest, GetTreeResponse,
     RegisterChunkMappingRequest, RegisterChunkMappingResponse, SpliceBlobRequest,
     SpliceBlobResponse, SplitBlobRequest, SplitBlobResponse, batch_read_blobs_response,
+    batch_update_blobs_response,
 };
 use support::{Server, plain};
 use tonic::transport::Server as TonicServer;
@@ -71,8 +72,8 @@ fn counts(report: &Report) -> BTreeMap<Kind, u64> {
 }
 
 /// Catches a run that loses or skips blobs, miscounts them or their bytes, reports a
-/// rate that is not bytes over wall time, or times no request (a timer that never
-/// records shows as zero times).
+/// rate that is not what moved over wall time, or times no request (a timer that
+/// never records shows as zero times).
 fn assert_moved_all(report: &Report, tree: &Tree) {
     let blobs = tree.blobs.len() as u64;
     assert!(report.complete(), "{}", report.table());
@@ -90,8 +91,8 @@ fn assert_moved_all(report: &Report, tree: &Tree) {
     }
     let rate = report.bytes_done as f64 / 1e6 / report.wall_secs;
     assert!((report.mb_per_sec - rate).abs() < 1e-9 * rate.max(1.0));
-    let files = report.tree.files as f64 / report.wall_secs;
-    assert!((report.files_per_sec - files).abs() < 1e-9 * files);
+    let blobs = report.blobs_done as f64 / report.wall_secs;
+    assert!((report.blobs_per_sec - blobs).abs() < 1e-9 * blobs);
     assert_eq!(report.failed, 0);
 }
 
@@ -101,14 +102,14 @@ async fn five_hundred_files_round_trip_by_bytestream_over_the_worker_listener() 
     let tree = tree::generate(&SHAPE, 1).expect("tree");
     assert_eq!(
         tree.blobs.len(),
-        495 + 2,
-        "the files, the empty blob, the Tree"
+        495 + 1 + 21 + 1,
+        "the files, the empty blob, the 21 Directories, the Tree"
     );
     let target = server.worker_target();
 
     let sent = upload(&target, &tree, options(Method::Bytestream)).await;
     assert_moved_all(&sent, &tree);
-    assert_eq!(counts(&sent), BTreeMap::from([(Kind::Write, 497)]));
+    assert_eq!(counts(&sent), BTreeMap::from([(Kind::Write, 518)]));
     assert_eq!(sent.tree.files, 500);
     assert_eq!(sent.seed, 1);
     server.assert_holds(&tree).await;
@@ -117,13 +118,13 @@ async fn five_hundred_files_round_trip_by_bytestream_over_the_worker_listener() 
         table.starts_with("upload bytestream, 16 in flight, find-missing off, seed 1\n"),
         "{table}"
     );
-    assert!(table.contains("\nwrite              497 "), "{table}");
+    assert!(table.contains("\nwrite              518 "), "{table}");
 
     let got = read(&target, &tree, options(Method::Bytestream)).await;
     assert_moved_all(&got, &tree);
-    assert_eq!(counts(&got), BTreeMap::from([(Kind::Read, 497)]));
+    assert_eq!(counts(&got), BTreeMap::from([(Kind::Read, 518)]));
     assert!(
-        got.table().contains("\nread               497 "),
+        got.table().contains("\nread               518 "),
         "{}",
         got.table()
     );
@@ -287,7 +288,9 @@ async fn every_call_without_a_node_certificate_fails() {
 }
 
 /// Catches a deadline that does not stop a run whose server never answers (the run
-/// would hang, as the pilot's upload did), and a timed-out run reported complete. The
+/// would hang, as the pilot's upload did), a timed-out run reported complete, and a
+/// rate counted from the tree rather than from what finished (nothing did, so it is
+/// 0; counting the tree, every timed-out run reports its size over the deadline). The
 /// progress line is printed from the start.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_deadline_stops_a_run_the_server_never_answers() {
@@ -318,6 +321,12 @@ async fn the_deadline_stops_a_run_the_server_never_answers() {
         assert!(!report.complete());
         assert_eq!(report.requests_done, 0);
         assert!(report.wall_secs >= 0.5, "{}", report.wall_secs);
+        assert_eq!((report.blobs_per_sec, report.mb_per_sec), (0.0, 0.0));
+        assert!(
+            report.table().contains(": 0.0 blobs/s, 0.00 MB/s\n"),
+            "{}",
+            report.table()
+        );
         assert!(
             report.table().contains("failed: 0, timed out\n"),
             "{}",
@@ -364,11 +373,26 @@ impl ContentAddressableStorage for Liar {
         Err(Status::unimplemented("liar"))
     }
 
+    /// Stores the blobs at even places in the call and refuses the odd ones.
     async fn batch_update_blobs(
         &self,
-        _: Request<BatchUpdateBlobsRequest>,
+        request: Request<BatchUpdateBlobsRequest>,
     ) -> Result<Response<BatchUpdateBlobsResponse>, Status> {
-        Err(Status::unimplemented("liar"))
+        let responses = request
+            .into_inner()
+            .requests
+            .into_iter()
+            .enumerate()
+            .map(|(at, blob)| batch_update_blobs_response::Response {
+                digest: blob.digest,
+                status: Some(rpc::Status {
+                    code: if at % 2 == 0 { 0 } else { 3 },
+                    message: "refused".to_owned(),
+                    ..rpc::Status::default()
+                }),
+            })
+            .collect();
+        Ok(Response::new(BatchUpdateBlobsResponse { responses }))
     }
 
     async fn batch_read_blobs(
@@ -430,10 +454,9 @@ impl ContentAddressableStorage for Liar {
     }
 }
 
-/// Catches a read that trusts the server: bytes that do not hash to the digest asked
-/// for are a failure, by either method.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_read_of_other_bytes_fails() {
+/// A [`Liar`] serving plain text, and a tree of 10 files (12 blobs, with the
+/// output directory and the Tree).
+fn liar() -> (Target, Tree) {
     let incoming = TcpIncoming::bind(SocketAddr::from(([127, 0, 0, 1], 0))).expect("bind");
     let target = plain(incoming.local_addr().expect("addr"));
     tokio::spawn(
@@ -452,13 +475,90 @@ async fn a_read_of_other_bytes_fails() {
         8,
     )
     .expect("tree");
+    (target, tree)
+}
+
+/// Catches a read that trusts the server: bytes that do not hash to the digest asked
+/// for are a failure, by either method.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_read_of_other_bytes_fails() {
+    let (target, tree) = liar();
     for method in [Method::Bytestream, Method::Batch] {
         let got = read(&target, &tree, options(method)).await;
         assert_eq!(
             (got.blobs_done, got.failed),
-            (0, 11),
+            (0, 12),
             "{method:?}: {}",
             got.table()
         );
+    }
+}
+
+/// Catches a blob the server refused inside a BatchUpdateBlobs answer counted as
+/// stored (or one it stored counted as failed): the liar stores every other blob of
+/// the one call, so half count, with their bytes, and half fail with the code.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_blob_refused_within_a_batch_fails_and_the_others_count() {
+    let (target, tree) = liar();
+    let sent = upload(&target, &tree, options(Method::Batch)).await;
+    assert_eq!(counts(&sent), BTreeMap::from([(Kind::BatchUpdate, 1)]));
+    // The call carries the blobs in the tree's order.
+    let stored: u64 = tree
+        .blobs
+        .iter()
+        .step_by(2)
+        .map(|b| b.bytes.len() as u64)
+        .sum();
+    assert_eq!(
+        (sent.blobs_done, sent.bytes_done, sent.failed),
+        (6, stored, 6),
+        "{}",
+        sent.table()
+    );
+    assert!(!sent.complete());
+    let refused = &sent.errors[0];
+    assert!(
+        refused.starts_with("BatchUpdateBlobs ") && refused.ends_with(": code 3: refused"),
+        "{refused}"
+    );
+}
+
+/// Catches a request timed from anywhere but its own start (from the run's start,
+/// say: each time would then hold every request before it). One in flight, the
+/// requests run one after another, so their times add up to at most the wall time;
+/// at least the slower half of them is at or above the p50, so that half times the
+/// p50 is at most the wall time too. Times from the run's start put the p50 near
+/// half the wall time, and the bound fails by a factor of about a quarter of the
+/// requests.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn one_in_flight_the_request_times_fit_in_the_wall_time() {
+    let server = Server::start("one-in-flight");
+    let tree = tree::generate(
+        &Shape {
+            files: 40,
+            empty: 0,
+            dirs: 0,
+            total_bytes: 40_000,
+        },
+        9,
+    )
+    .expect("tree");
+    let mut one = options(Method::Bytestream);
+    one.in_flight = 1;
+    let target = server.reapi_target();
+    for report in [
+        upload(&target, &tree, one).await,
+        read(&target, &tree, one).await,
+    ] {
+        assert_moved_all(&report, &tree);
+        let wall_ms = report.wall_secs * 1e3;
+        for (kind, l) in &report.requests {
+            assert_eq!(l.count, 42, "{kind:?}");
+            let at_or_above = (l.count - l.count.div_ceil(2) + 1) as f64;
+            assert!(
+                at_or_above * l.p50_ms <= wall_ms && l.max_ms <= wall_ms,
+                "{kind:?}: {l:?} in {wall_ms} ms"
+            );
+        }
     }
 }

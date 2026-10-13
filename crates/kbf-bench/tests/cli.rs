@@ -81,12 +81,12 @@ async fn upload_then_read_writes_the_table_and_the_json() {
         "{table}"
     );
     assert!(
-        table.contains("tree: 50 files (2 empty, 0 skipped), 3 dirs, 100000 bytes, 50 blobs\n"),
+        table.contains("tree: 50 files (2 empty, 0 skipped), 3 dirs, 100000 bytes, 54 blobs\n"),
         "{table}"
     );
-    assert!(table.contains("\nwrite               50 "), "{table}");
+    assert!(table.contains("\nwrite               54 "), "{table}");
     assert!(
-        text(&out.stderr).contains("kbf-bench: 0.0 s: 0/50 requests, 0/50 blobs"),
+        text(&out.stderr).contains("kbf-bench: 0.0 s: 0/54 requests, 0/54 blobs"),
         "{}",
         text(&out.stderr)
     );
@@ -95,9 +95,9 @@ async fn upload_then_read_writes_the_table_and_the_json() {
     assert_eq!(report["command"], "upload");
     assert_eq!(report["method"], "bytestream");
     assert_eq!(report["seed"], 7);
-    assert_eq!(report["blobs_done"], 50);
+    assert_eq!(report["blobs_done"], 54);
     assert_eq!(report["tree"]["file_bytes"], 100_000);
-    assert_eq!(report["requests"]["write"]["count"], 50);
+    assert_eq!(report["requests"]["write"]["count"], 54);
     assert!(report["requests"]["write"]["p99_ms"].as_f64().expect("p99") > 0.0);
     assert_eq!(report["timed_out"], false);
 
@@ -132,7 +132,7 @@ async fn upload_then_read_writes_the_table_and_the_json() {
     let out = run(other_seed).await;
     assert_eq!(out.status.code(), Some(1), "{}", text(&out.stdout));
     assert!(
-        text(&out.stdout).contains("\nfailed: 49\n"),
+        text(&out.stdout).contains("\nfailed: 53\n"),
         "{}",
         text(&out.stdout)
     );
@@ -169,7 +169,7 @@ async fn upload_of_a_directory_with_a_clock_seed() {
     let table = text(&out.stdout);
     assert!(table.contains("find-missing on, seed "), "{table}");
     assert!(
-        table.contains("tree: 1 files (0 empty, 0 skipped), 0 dirs, 24 bytes, 2 blobs\n"),
+        table.contains("tree: 1 files (0 empty, 0 skipped), 0 dirs, 24 bytes, 3 blobs\n"),
         "{table}"
     );
     assert!(!table.contains(", seed 0\n"), "{table}");

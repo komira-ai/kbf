@@ -123,7 +123,8 @@ pub struct TreeSummary {
     pub dirs: u64,
     pub file_bytes: u64,
     pub skipped: u64,
-    /// Distinct blobs: the files' (each digest once) and the `Tree` message.
+    /// Distinct blobs: the files' and the `Directory` messages (each digest once),
+    /// and the `Tree` message.
     pub blobs: u64,
 }
 
@@ -148,8 +149,9 @@ pub struct Report {
     pub requests_done: u64,
     /// From the first request to the last answer (or the deadline).
     pub wall_secs: f64,
-    /// The tree's files over the wall time.
-    pub files_per_sec: f64,
+    /// `blobs_done` over the wall time: what finished, so a run the deadline stopped
+    /// reports the rate it reached, not the tree's size over the deadline.
+    pub blobs_per_sec: f64,
     /// `bytes_done` in millions over the wall time.
     pub mb_per_sec: f64,
     /// Per kind of request.
@@ -192,7 +194,7 @@ impl Report {
             requests_planned: tally.requests_planned,
             requests_done: tally.requests_done,
             wall_secs,
-            files_per_sec: tree.files as f64 / wall_secs,
+            blobs_per_sec: tally.blobs_done as f64 / wall_secs,
             mb_per_sec: tally.bytes_done as f64 / 1e6 / wall_secs,
             requests: tally
                 .times
@@ -218,7 +220,7 @@ impl Report {
         let mut out = format!(
             "{} {}, {} in flight, find-missing {}, seed {}\n\
              tree: {} files ({} empty, {} skipped), {} dirs, {} bytes, {} blobs\n\
-             {} of {} blobs, {} bytes, {} of {} requests in {:.3} s: {:.1} files/s, {:.2} MB/s\n\
+             {} of {} blobs, {} bytes, {} of {} requests in {:.3} s: {:.1} blobs/s, {:.2} MB/s\n\
              {:<14}{:>8}{:>11}{:>11}{:>11}{:>11}\n",
             self.command,
             self.method.name(),
@@ -237,7 +239,7 @@ impl Report {
             self.requests_done,
             self.requests_planned,
             self.wall_secs,
-            self.files_per_sec,
+            self.blobs_per_sec,
             self.mb_per_sec,
             "request",
             "count",

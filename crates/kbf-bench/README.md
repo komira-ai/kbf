@@ -21,7 +21,8 @@ from a directory: 16 bytes appended), so a run with a new seed finds nothing alr
 stored, and the server does the whole write. Upload picks a seed from the clock when
 none is given; the report names it, and `read` needs it, with the same tree flags.
 
-Besides the files, a run sends one REAPI `Tree` message of the directories, as the
+Besides the files, a run sends each directory's REAPI `Directory` message (the output
+directory's too: 990 for the default tree) and one `Tree` message of them all, as the
 daemon does for an output directory. Each digest is sent once (the 144 empty files are
 one blob), as the daemon does.
 
@@ -52,18 +53,20 @@ loader. One HTTP/2 connection carries every request, as the daemon's does.
 
 ```text
 upload bytestream, 64 in flight, find-missing off, seed 4242
-tree: 15000 files (144 empty, 0 skipped), 989 dirs, 307000000 bytes, 14858 blobs
-14858 of 14858 blobs, 307237344 bytes, 14858 of 14858 requests in 41.200 s: 364.1 files/s, 7.46 MB/s
+tree: 15000 files (144 empty, 0 skipped), 989 dirs, 307000000 bytes, 15848 blobs
+15848 of 15848 blobs, 308000000 bytes, 15848 of 15848 requests in 41.200 s: 384.7 blobs/s, 7.48 MB/s
 request          count     p50 ms     p90 ms     p99 ms     max ms
-write            14858    170.000    260.000    900.000   1300.000
+write            15848    170.000    260.000    900.000   1300.000
 failed: 0
 ```
 
 (The numbers above show the layout only; they are not a measurement.)
 
 - **Line 3**: blobs and bytes moved whole out of those planned, requests answered out of
-  those planned, the wall time from the first request to the last answer, the tree's
-  files over the wall time, and the bytes moved (in millions) over it. A blob counts
+  those planned, the wall time from the first request to the last answer (or the
+  deadline), the blobs moved over the wall time, and the bytes moved (in millions)
+  over it. Both rates count only what finished, so a run the deadline stopped shows
+  the rate it reached. A blob counts
   once the server answered it committed (upload) or its bytes hashed to its digest
   (read).
 - **The table**: per kind of request (`write`, `batch_update`, `find_missing`, `read`,
@@ -72,11 +75,13 @@ failed: 0
   slot to its answer: for a Write, from the first message sent to the committed size
   answered, so it is the server's whole store of that blob (for kbf-server: its object
   PUT, the read-back of the segment and the metadata commit) plus the network.
+  kbf-bench cannot split that time into those stages; only the server's own timers
+  can.
 - **failed**: requests or blobs that failed, the first ten messages after it, and
   `timed out` when the deadline passed.
 
 The JSON has the same fields: `blobs_planned`, `blobs_done`, `bytes_done`,
-`requests_planned`, `requests_done`, `wall_secs`, `files_per_sec`, `mb_per_sec`,
+`requests_planned`, `requests_done`, `wall_secs`, `blobs_per_sec`, `mb_per_sec`,
 `requests.<kind>.{count,p50_ms,p90_ms,p99_ms,max_ms}`, `failed`, `errors`,
 `timed_out`, with the run's flags and the tree's counts.
 
@@ -84,13 +89,13 @@ How to read them together:
 
 - **Requests in flight, rate and latency.** With every slot busy, rate x latency ~
   in-flight (Little's law): 64 in flight at a 1 s p50 is about 64 requests/s. If
-  `--in-flight 1`, `8`, `64` give the same files/s while the p50 grows with N, the
-  requests wait for one another on the server: it stores one at a time. If files/s
+  `--in-flight 1`, `8`, `64` give the same blobs/s while the p50 grows with N, the
+  requests wait for one another on the server: it stores one at a time. If blobs/s
   grows with N, the server overlaps them, and the per-request time is the cost.
 - **bytestream against batch.** kbf-server writes each call's new blobs into
   segments of their own (one, for a call under the segment size), so a batch of many
   small blobs costs one store where ByteStream costs one per blob. A
-  large gap between the two methods' files/s on the same tree is per-call cost, not
+  large gap between the two methods' blobs/s on the same tree is per-call cost, not
   bytes.
 - **p50 against max.** A p50 far below p99 and max points at a slow few (a disk's
   latency spikes, a retry); p50 near max at a high value points at a fixed cost per
