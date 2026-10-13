@@ -8,244 +8,32 @@
 //! with `cargo xtask sudo-test -p kbf-driver-native --test slots` (from
 //! `tools/ci/mac-session-tests.sh`), which builds this file as the runner's user and
 //! runs the binary through `sudo -n` with `--ignored`. They make users at free uids from
-//! 690 (`kbf-ci-slot-<test>-<i>`, hidden, shell `/usr/bin/false`, homes under a
-//! `/private/tmp` scratch directory) and delete them, their homes and every process of
+//! 690 (`kbf-ci-slot-<test>-<i>`, hidden, shell `/usr/bin/false`, homes in `/Users`; tests/support/pool.rs) and delete them, their homes and every process of
 //! their uids when they end, passed or not.
 
 #![cfg(target_os = "macos")]
 
 mod support;
 
-use std::collections::BTreeSet;
-use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use kbf_daemon::Runtime as _;
 use kbf_daemon::uid;
 use kbf_driver_native::slots::{Pool, SlotUser};
 use kbf_driver_native::{NativeConfig, NativeRuntime};
+use support::pool::{GID, Scratch, Users, config, ids_of, sleeper};
 use support::{MemoryCas, PROMPT, Spec, stdout};
 
-/// Where the users' uids start; the kbf-mac-session CI script uses 650 to 659.
-const FIRST_UID: u32 = 690;
-/// The next uid a test of this process may take.
-static NEXT_UID: AtomicU32 = AtomicU32::new(FIRST_UID);
-/// The pool users' primary group: staff.
-const GID: u32 = 20;
 /// The variable that turns [`keeper_daemon`] into the daemon [`the_keeper_ends_the_slot_when_the_daemon_dies`]
 /// kills: the scratch directory, the user's name and uid.
 const KEEPER_CHILD: &str = "KBF_SLOTS_KEEPER_CHILD";
 
-/// Stops a test run as the runner's user, where every check would fail for the wrong
-/// reason. Asks the kernel, not the code under test.
 fn assert_root() {
-    // SAFETY: geteuid takes no arguments and cannot fail.
-    let euid = unsafe { libc::geteuid() };
-    assert_eq!(
-        euid, 0,
-        "not root: run `cargo xtask sudo-test -p kbf-driver-native --test slots`"
-    );
-}
-
-/// A scratch directory under `/private/tmp`, root's, mode 0755 (every pool user may
-/// search it: the runner's home is not searchable by them), holding a copy of this test
-/// binary as `kbf-act` (so a pool user can run the act steps), removed when the test
-/// ends.
-struct Scratch(PathBuf);
-
-impl Scratch {
-    fn new(name: &str) -> Self {
-        let dir = PathBuf::from(format!(
-            "/private/tmp/kbf-ci-slots-{name}-{}",
-            std::process::id()
-        ));
-        let _ = kbf_outputs::remove_tree(&dir);
-        std::fs::create_dir_all(dir.join("home")).expect("scratch");
-        for path in [dir.clone(), dir.join("home")] {
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
-        }
-        let act = dir.join(kbf_testkit::act::NAME);
-        std::fs::copy(std::env::current_exe().expect("this binary"), &act).expect("copy");
-        std::fs::set_permissions(&act, std::fs::Permissions::from_mode(0o755)).expect("chmod");
-        Self(dir)
-    }
-
-    fn act(&self) -> String {
-        self.0
-            .join(kbf_testkit::act::NAME)
-            .to_string_lossy()
-            .into_owned()
-    }
-
-    fn leases(&self) -> PathBuf {
-        self.0.join("leases")
-    }
-
-    /// A copy of `/bin/sleep`, root's and setuid: started by a slot user, it runs with
-    /// the effective uid 0 and the user's real uid.
-    fn setuid_sleep(&self) -> PathBuf {
-        let path = self.0.join("setuid-sleep");
-        std::fs::copy("/bin/sleep", &path).expect("copy sleep");
-        std::os::unix::fs::chown(&path, Some(0), Some(0)).expect("chown");
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o4755)).expect("chmod");
-        path
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = kbf_outputs::remove_tree(&self.0);
-    }
-}
-
-/// Throwaway users, deleted with every process of their uids when dropped.
-struct Users(Vec<SlotUser>);
-
-impl Users {
-    /// `count` users `kbf-ci-slot-<name>-<i>`, at free uids from [`FIRST_UID`] that no
-    /// earlier test of this process used, their homes `<scratch>/home/<user>`, mode
-    /// 0700, their own. Never a uid again: this process's user database cache keeps
-    /// the name a deleted user had (`getpwuid` named the first test's user for the
-    /// next test's uid on the runner).
-    fn new(name: &str, count: usize, scratch: &Scratch) -> Self {
-        let taken = taken_uids();
-        let from = NEXT_UID.load(Ordering::SeqCst);
-        let uids: Vec<u32> = (from..FIRST_UID + 100)
-            .filter(|u| !taken.contains(u))
-            .take(count)
-            .collect();
-        NEXT_UID.store(uids.last().map_or(from, |u| u + 1), Ordering::SeqCst);
-        let mut users = Self(Vec::new());
-        for (i, uid) in uids.into_iter().enumerate() {
-            let user = SlotUser {
-                name: format!("kbf-ci-slot-{name}-{i}"),
-                uid,
-                gid: GID,
-            };
-            let home = scratch.0.join("home").join(&user.name);
-            std::fs::create_dir(&home).expect("home");
-            std::os::unix::fs::chown(&home, Some(uid), Some(GID)).expect("chown");
-            std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).expect("chmod");
-            let record = format!("/Users/{}", user.name);
-            let home = home.to_string_lossy().into_owned();
-            let (uid_text, gid_text) = (uid.to_string(), GID.to_string());
-            let attrs: [&[&str]; 6] = [
-                &[],
-                &["UniqueID", uid_text.as_str()],
-                &["PrimaryGroupID", gid_text.as_str()],
-                &["UserShell", "/usr/bin/false"],
-                &["NFSHomeDirectory", home.as_str()],
-                &["IsHidden", "1"],
-            ];
-            for attr in attrs {
-                let create: [&str; 3] = [".", "-create", record.as_str()];
-                run("/usr/bin/dscl", &[&create[..], attr].concat());
-            }
-            users.0.push(user);
-        }
-        assert_eq!(
-            users.0.len(),
-            count,
-            "no {count} free uids from {FIRST_UID}"
-        );
-        run("/usr/bin/dscacheutil", &["-flushcache"]);
-        for user in &users.0 {
-            wait_until(&format!("uid {} is {}", user.uid, user.name), || {
-                name_of(user.uid).as_deref() == Some(user.name.as_str())
-            });
-        }
-        users
-    }
-
-    fn pool(&self) -> Pool {
-        Pool::new(self.0.clone()).expect("pool")
-    }
-}
-
-impl Drop for Users {
-    fn drop(&mut self) {
-        for user in &self.0 {
-            if let Err(why) = uid::end(user.uid, Duration::from_secs(10)) {
-                eprintln!("cleanup: {why}");
-            }
-            let _ = Command::new("/usr/bin/dscl")
-                .args([".", "-delete", &format!("/Users/{}", user.name)])
-                .status();
-        }
-        let _ = Command::new("/usr/bin/dscacheutil")
-            .arg("-flushcache")
-            .status();
-    }
-}
-
-/// Every uid the local directory holds.
-fn taken_uids() -> BTreeSet<u32> {
-    let out = Command::new("/usr/bin/dscl")
-        .args([".", "-list", "/Users", "UniqueID"])
-        .output()
-        .expect("dscl");
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter_map(|l| l.split_whitespace().last()?.parse().ok())
-        .collect()
-}
-
-/// The name the user database gives `uid`.
-fn name_of(uid: u32) -> Option<String> {
-    let out = Command::new("/usr/bin/id")
-        .args(["-un", &uid.to_string()])
-        .output()
-        .ok()?;
-    out.status
-        .success()
-        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_owned())
-}
-
-/// The effective and real uid of `pid`, as `ps` reports them.
-fn ids_of(pid: i32) -> Option<(u32, u32)> {
-    let out = Command::new("/bin/ps")
-        .args(["-o", "uid=,ruid=", "-p", &pid.to_string()])
-        .output()
-        .ok()?;
-    let text = String::from_utf8_lossy(&out.stdout);
-    let mut ids = text.split_whitespace().map(str::parse::<u32>);
-    match (ids.next(), ids.next()) {
-        (Some(Ok(euid)), Some(Ok(ruid))) => Some((euid, ruid)),
-        _ => None,
-    }
-}
-
-fn run(program: &str, args: &[&str]) {
-    let out = Command::new(program).args(args).output().expect(program);
-    assert!(
-        out.status.success(),
-        "{program} {args:?}: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-}
-
-fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
-    let give_up = Instant::now() + PROMPT;
-    while !done() {
-        assert!(Instant::now() < give_up, "{what}: not within {PROMPT:?}");
-        std::thread::sleep(Duration::from_millis(50));
-    }
-}
-
-/// A configuration whose leases run as `pool`, its memory never measured (so the old
-/// tracker never sees a process the action starts: a kill that relies on it misses
-/// whatever left the action's group).
-fn config(scratch: &Scratch, pool: Pool) -> NativeConfig {
-    let _ = tracing_subscriber::fmt().with_test_writer().try_init();
-    let mut config = NativeConfig::new(scratch.leases());
-    config.poll = Duration::from_secs(3600);
-    config.pool = Some(pool);
-    config
+    support::pool::assert_root("slots");
 }
 
 /// Runs `spec` as lease `1.seq`.
@@ -261,16 +49,6 @@ async fn lease(
 /// Whether `pid` is alive and not a zombie.
 fn alive(pid: i32) -> bool {
     support::alive(pid)
-}
-
-/// A `sleep 300` started by this test, as root or as `user`.
-fn sleeper(user: Option<&SlotUser>) -> Child {
-    let mut command = Command::new("/bin/sleep");
-    command.arg("300").stdin(Stdio::null());
-    if let Some(user) = user {
-        command.uid(user.uid).gid(user.gid);
-    }
-    command.spawn().expect("sleep")
 }
 
 /// The act steps that leave a `sleep 300` behind in a session of its own whose parent
@@ -317,7 +95,7 @@ fn leave_a_sleeper(act: &str) -> Vec<String> {
 async fn an_action_ends_with_every_process_of_its_uid_and_nothing_else() {
     assert_root();
     let scratch = Scratch::new("kill");
-    let users = Users::new("kill", 2, &scratch);
+    let users = Users::new("kill", 2);
     let (mine, other) = (&users.0[0], &users.0[1]);
     let cas = Arc::new(MemoryCas::default());
     let rt = NativeRuntime::new(config(&scratch, users.pool()), Arc::clone(&cas)).expect("runtime");
@@ -423,7 +201,7 @@ async fn an_action_ends_with_every_process_of_its_uid_and_nothing_else() {
 fn the_keeper_ends_the_slot_when_the_daemon_dies() {
     assert_root();
     let scratch = Scratch::new("keeper");
-    let users = Users::new("keeper", 1, &scratch);
+    let users = Users::new("keeper", 1);
     let user = &users.0[0];
     let mut daemon = Command::new(std::env::current_exe().expect("this binary"))
         .args(["--ignored", "--exact", "keeper_daemon", "--nocapture"])
@@ -513,7 +291,7 @@ async fn keeper_daemon() {
 async fn two_leases_at_once_never_share_a_user() {
     assert_root();
     let scratch = Scratch::new("parallel");
-    let users = Users::new("parallel", 2, &scratch);
+    let users = Users::new("parallel", 2);
     let cas = Arc::new(MemoryCas::default());
     let rt = NativeRuntime::new(config(&scratch, users.pool()), Arc::clone(&cas)).expect("runtime");
     let script = r#"set -e
@@ -603,7 +381,7 @@ fn a_root_daemon_without_a_pool_runs_nothing() {
 async fn with_every_slot_held_a_lease_waits_and_a_kill_ends_the_wait() {
     assert_root();
     let scratch = Scratch::new("wait");
-    let users = Users::new("wait", 1, &scratch);
+    let users = Users::new("wait", 1);
     let user = &users.0[0];
     let cas = Arc::new(MemoryCas::default());
     let rt = NativeRuntime::new(config(&scratch, users.pool()), Arc::clone(&cas)).expect("runtime");
@@ -668,7 +446,7 @@ async fn with_every_slot_held_a_lease_waits_and_a_kill_ends_the_wait() {
 fn the_start_ends_every_process_of_every_slot() {
     assert_root();
     let scratch = Scratch::new("start");
-    let users = Users::new("start", 1, &scratch);
+    let users = Users::new("start", 1);
     let mut left = sleeper(Some(&users.0[0]));
     let pid = i32::try_from(left.id()).expect("pid");
     let before = alive(pid);
