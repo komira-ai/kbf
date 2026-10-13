@@ -12,9 +12,12 @@
 //!   uid. Zombies are left out: they hold no memory, cannot be signalled, and go when
 //!   their parent reaps them (the daemon reaps its own children).
 //! - [`kill`] forks a child that sets its real, effective and saved uid to the uid and
-//!   calls `kill(-1, SIGKILL)`: one call that signals every process the uid may
+//!   calls `kill(-1, SIGKILL)` once: one call that signals every process the uid may
 //!   signal, so none of them can outrun it by forking, and none of another uid's (root's
-//!   or another slot's) is reachable from there. Between `fork` and `_exit` the child
+//!   or another slot's) is reachable from there. The child does not loop on the call:
+//!   on macOS it is among the processes signalled, and were it not, a loop would spin
+//!   for as long as an unreaped zombie of the uid answered the call; [`end`] repeats
+//!   the round instead. Between `fork` and `_exit` the child
 //!   calls only `setuid`, `kill` and `_exit`, all async-signal-safe, as a fork of the
 //!   threaded daemon must.
 //! - [`end`] boots out `user/<uid>` first (so launchd does not start a `KeepAlive` or
@@ -108,7 +111,7 @@ pub fn kill(uid: u32) -> io::Result<()> {
             if libc::setuid(uid) != 0 {
                 libc::_exit(1);
             }
-            while libc::kill(-1, libc::SIGKILL) == 0 {}
+            libc::kill(-1, libc::SIGKILL);
             libc::_exit(0);
         }
     }

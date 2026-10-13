@@ -8,7 +8,7 @@
 //! gets, and how its processes are ended, is macOS's part ([`macos`]):
 //!
 //! - a lease takes a free slot, waiting for one while all are busy, and gives it back
-//!   once the lease has ended and its directory is gone;
+//!   once the lease has ended and the clean of its directory has run;
 //! - its lease directory is the slot user's, and its action is started through
 //!   `launchctl asuser <uid>`, then this binary's `__as-user` mode, which drops to the
 //!   slot's uid and group (no supplementary groups) and executes it: so it runs in
@@ -28,7 +28,7 @@
 //!
 //! Not yet (step 4 of the design): the clean of a slot between two leases (its home,
 //! its `/var/folders` entry, keychains, crontab and `at` jobs, disk images, IPC
-//! objects): [`macos::Slot::clean`] runs only the kill so far. Nor does the scheduler
+//! objects): [`macos::Slot::release`] only gives the slot back so far. Nor does the scheduler
 //! book slots: a lease past `N` waits here for a free one.
 
 use std::collections::BTreeSet;
@@ -259,8 +259,8 @@ impl Runner {
         }
     }
 
-    /// Gives a slot back once the lease has ended and its directory is gone
-    /// ([`macos::Slot::release`]).
+    /// Gives a slot back once the lease has ended and the clean of its directory has
+    /// run ([`macos::Slot::release`]).
     pub fn release(self) {
         match self {
             Self::Daemon => {}
