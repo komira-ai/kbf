@@ -86,7 +86,7 @@ const ROWS: [(&str, &str); 17] = [
     ("sem", "a System V semaphore (lease B: ipcs)"),
     (
         "processes",
-        "any process of the uid, by effective or real uid (root: libproc)",
+        "a process of the uid, by effective or real uid, but launchd's own agents (root: libproc)",
     ),
 ];
 
@@ -343,7 +343,7 @@ async fn a_lease_finds_nothing_the_lease_before_it_left_on_its_slot() {
     let a_err = support::stderr(&cas, &first);
     // Between the leases: the clean ran before lease A's run returned.
     let mut found: Vec<(String, String)> = Vec::new();
-    let left = uid::processes(user.uid).expect("list");
+    let left = kbf_driver_native::slots::macos::host::leftover_processes(user.uid).expect("list");
     if !left.is_empty() {
         found.push(("processes".to_owned(), format!("{left:?}")));
     }
@@ -390,7 +390,10 @@ async fn a_lease_finds_nothing_the_lease_before_it_left_on_its_slot() {
         .collect();
     let red: BTreeSet<&str> = found.iter().map(|(row, _)| row.as_str()).collect();
     let diagnosis = diagnosis(&user);
-    eprintln!("freshness: planted {planted:?}; red rows {red:?}; found {found:?}");
+    eprintln!(
+        "freshness: planted {planted:?}; red rows {red:?}; found {found:?}\n{}",
+        outside.text
+    );
     assert_eq!(
         first.exit_code, 0,
         "lease A: {a_out}{a_err}\n{}",

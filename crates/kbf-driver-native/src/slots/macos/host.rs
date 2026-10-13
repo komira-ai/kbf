@@ -133,15 +133,8 @@ impl Os for MacSlot<'_> {
         // neither list, never in the first alone.
         let pids = uid::processes(user.uid);
         let services = services_of(user.uid);
-        // launchd starts its own agents of the domain again on demand (`distnoted`,
-        // measured), as the uid: fresh processes, holding nothing of a lease.
-        let apple: Vec<i32> = (services.iter())
-            .filter(|s| s.apple())
-            .filter_map(|s| s.pid)
-            .collect();
-        match pids {
-            Ok(mut pids) => {
-                pids.retain(|pid| !apple.contains(pid));
+        match pids.map(|pids| not_apples(pids, &services)) {
+            Ok(pids) => {
                 if !pids.is_empty() {
                     note(Step::Kill, format!("processes {:?}", named(&pids)));
                 }
@@ -514,6 +507,25 @@ fn attributes(record: &str) -> Result<Vec<(&'static str, Vec<String>)>, String> 
         return Err(format!("{DSCL} -read {record}: no UniqueID"));
     }
     Ok(kept)
+}
+
+/// The processes of `uid`, by effective or real uid ([`uid::processes`]), that a lease
+/// could have left: all but those launchd lists as running one of its own agents in
+/// `user/<uid>` ([`Service::apple`]). launchd starts those again on demand after the
+/// kill (`distnoted`, measured on the CI runner), as the uid: fresh processes, holding
+/// nothing of a lease.
+///
+/// # Errors
+/// The process table could not be read.
+pub fn leftover_processes(uid: u32) -> io::Result<Vec<i32>> {
+    let pids = uid::processes(uid)?;
+    Ok(not_apples(pids, &services_of(uid)))
+}
+
+/// `pids` without those `services` lists as running one of launchd's own agents.
+fn not_apples(mut pids: Vec<i32>, services: &[Service]) -> Vec<i32> {
+    pids.retain(|pid| !services.iter().any(|s| s.apple() && s.pid == Some(*pid)));
+    pids
 }
 
 /// One service of a launchd domain, as `launchctl print` lists it.
