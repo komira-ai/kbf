@@ -194,6 +194,9 @@ impl Os for MacSlot<'_> {
     }
 
     fn recreate(&self) -> Result<(), String> {
+        if self.within > Duration::ZERO {
+            return Err("mutant: no recreate".to_owned());
+        }
         let ready = self.ready;
         let name = &ready.user.name;
         let when = SystemTime::now()
