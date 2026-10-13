@@ -40,9 +40,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use kbf_daemon::cas::{Cas, digest_of};
+use kbf_outputs::Uploads;
 use kbf_proto::reapi::{
-    ActionResult, Directory, DirectoryNode, FileNode, OutputDirectory, OutputFile, OutputSymlink,
-    SymlinkNode, Tree,
+    ActionResult, Digest, Directory, DirectoryNode, FileNode, OutputDirectory, OutputFile,
+    OutputSymlink, SymlinkNode, Tree,
 };
 use prost::Message;
 use rustix::fs::{AtFlags, CWD, Dir, FileType, Mode, OFlags, Stat};
@@ -360,7 +361,27 @@ pub(crate) async fn collect(
         .filter(|part| !part.is_empty())
         .map(str::to_owned)
         .collect();
-    let mut budget = Budget::new(limits);
+    let budget = Budget::new(limits);
+    let (uploads, drain) = Uploads::new();
+    let walk = record(
+        cas, uploads, budget, &upper_fd, &wd_parts, &base, paths, result,
+    );
+    futures::try_join!(walk, drain)?;
+    Ok(())
+}
+
+/// [`collect`]'s walk over each output path, its blobs queued on `uploads`.
+#[allow(clippy::too_many_arguments)]
+async fn record<'a, C: Cas>(
+    cas: &'a C,
+    mut uploads: Uploads<'a, TreeError>,
+    mut budget: Budget,
+    upper_fd: &Arc<OwnedFd>,
+    wd_parts: &[String],
+    base: &Path,
+    paths: &[String],
+    result: &mut ActionResult,
+) -> Result<(), TreeError> {
     for path in paths {
         if path.is_empty() {
             return Err(TreeError::Invalid("an output path is empty".to_owned()));
@@ -368,14 +389,14 @@ pub(crate) async fn collect(
         check_relative("output path", path)?;
         let shown = base.join(path);
         let (dirs, name) = path.rsplit_once('/').unwrap_or(("", path));
-        let mut parts: Vec<String> = wd_parts.clone();
+        let mut parts: Vec<String> = wd_parts.to_vec();
         parts.extend(
             dirs.split('/')
                 .filter(|part| !part.is_empty())
                 .map(str::to_owned),
         );
         let name = PathBuf::from(name);
-        let start = Arc::clone(&upper_fd);
+        let start = Arc::clone(upper_fd);
         // Absent, a file or a symlink on the way: the action did not create the output.
         let Some(parent) = blocking(&shown, move || descend(&start, &parts)).await? else {
             continue;
@@ -395,22 +416,27 @@ pub(crate) async fn collect(
                 let (blob, executable) = budget.file(read, &shown)?;
                 result.output_files.push(OutputFile {
                     path: path.clone(),
-                    digest: Some(blob.store(cas).await?),
+                    digest: Some(queue_file(&mut uploads, cas, blob).await),
                     is_executable: executable,
                     ..OutputFile::default()
                 });
             }
             Some(Kind::Directory) => {
                 budget.entries(1, &shown)?;
-                let (root, children) = walk(cas, &mut budget, parent, name, shown).await?;
-                let root_digest = kbf_daemon::tree::put_directories(cas, &root, &children).await?;
+                let (root, children) =
+                    walk(cas, &mut uploads, &mut budget, parent, name, shown).await?;
+                for child in &children {
+                    queue_bytes(&mut uploads, cas, child.encode_to_vec()).await;
+                }
+                let root_digest = queue_bytes(&mut uploads, cas, root.encode_to_vec()).await;
                 let tree = Tree {
                     root: Some(root),
                     children,
                 };
+                let tree_digest = queue_bytes(&mut uploads, cas, tree.encode_to_vec()).await;
                 result.output_directories.push(OutputDirectory {
                     path: path.clone(),
-                    tree_digest: Some(cas.put(tree.encode_to_vec()).await?),
+                    tree_digest: Some(tree_digest),
                     is_topologically_sorted: false,
                     root_directory_digest: Some(root_digest),
                 });
@@ -427,6 +453,33 @@ pub(crate) async fn collect(
         }
     }
     Ok(())
+}
+
+/// Queues the file `blob` on `uploads` and returns its digest.
+async fn queue_file<'a>(
+    uploads: &mut Uploads<'a, TreeError>,
+    cas: &'a impl Cas,
+    blob: FileBlob,
+) -> Digest {
+    let digest = blob.digest().clone();
+    let upload = async move { blob.store(cas).await.map(drop).map_err(TreeError::from) };
+    uploads.queue(&digest, upload).await;
+    digest
+}
+
+/// Queues `bytes` (a Directory or Tree message) on `uploads` and returns their
+/// digest. The farm's action cache refuses a result whose `root_directory_digest` it
+/// does not hold; every Directory below is stored too, so each digest the Tree names
+/// can be fetched.
+async fn queue_bytes<'a>(
+    uploads: &mut Uploads<'a, TreeError>,
+    cas: &'a impl Cas,
+    bytes: Vec<u8>,
+) -> Digest {
+    let digest = digest_of(&bytes);
+    let upload = async move { cas.put(bytes).await.map(drop).map_err(TreeError::from) };
+    uploads.queue(&digest, upload).await;
+    digest
 }
 
 /// A directory on the walk's stack: what is left of its entries and what is built of
@@ -476,8 +529,9 @@ async fn open_frame(
 /// Iterative, not recursive: the directories being read are a `Vec` of frames, so the
 /// tree's depth costs heap, not thread stack, and the depth limit is checked before a
 /// directory is opened.
-async fn walk<C: Cas>(
-    cas: &C,
+async fn walk<'a, C: Cas>(
+    cas: &'a C,
+    uploads: &mut Uploads<'a, TreeError>,
     budget: &mut Budget,
     parent: Arc<OwnedFd>,
     name: PathBuf,
@@ -518,7 +572,7 @@ async fn walk<C: Cas>(
                 let (blob, executable) = budget.file(read, &path)?;
                 top.directory.files.push(FileNode {
                     name,
-                    digest: Some(blob.store(cas).await?),
+                    digest: Some(queue_file(uploads, cas, blob).await),
                     is_executable: executable,
                     ..FileNode::default()
                 });

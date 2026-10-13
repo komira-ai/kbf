@@ -20,6 +20,7 @@ clap.workspace = true
 futures.workspace = true
 hex.workspace = true
 kbf-daemon.workspace = true
+kbf-outputs.workspace = true
 kbf-proto.workspace = true
 kbf-types.workspace = true
 prost.workspace = true

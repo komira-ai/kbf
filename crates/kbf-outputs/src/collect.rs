@@ -29,7 +29,10 @@
 //! its digest, so the upload fails rather than storing the wrong bytes under a
 //! digest; nothing here detects the change first.
 //!
-//! Each system call runs on tokio's blocking pool.
+//! Each system call runs on tokio's blocking pool. The walk itself is one at a time;
+//! the blobs it stores are uploaded [`crate::UPLOADS_IN_FLIGHT`] at a time while it goes
+//! on, each distinct digest once ([`Uploads`]), and [`collect`] returns once all are
+//! stored.
 
 use std::ffi::OsStr;
 use std::io::{Read, Seek};
@@ -49,6 +52,7 @@ use sha2::{Digest as _, Sha256};
 
 use crate::limits::{Exceeded, OutputLimits};
 use crate::store::{CHUNK_BYTES, Store, StoreError, digest_of};
+use crate::uploads::Uploads;
 
 /// Why the outputs could not be read.
 #[derive(Debug, thiserror::Error)]
@@ -193,6 +197,23 @@ impl Blob {
             Self::Bytes(bytes) => bytes.len() as u64,
             Self::File(_, digest) => digest.size_bytes.unsigned_abs(),
         }
+    }
+
+    /// The digest the blob is stored under, and its upload, queued on `uploads`.
+    async fn queue<'a>(
+        self,
+        uploads: &mut Uploads<'a, OutputsError>,
+        store: &'a impl Store,
+        shown: &Path,
+    ) -> Digest {
+        let digest = match &self {
+            Self::Bytes(bytes) => digest_of(bytes),
+            Self::File(_, digest) => digest.clone(),
+        };
+        let shown = shown.to_owned();
+        let upload = async move { self.store(store, &shown).await.map(drop) };
+        uploads.queue(&digest, upload).await;
+        digest
     }
 
     async fn store(self, store: &impl Store, shown: &Path) -> Result<Digest, OutputsError> {
@@ -407,11 +428,31 @@ pub async fn collect(
         .filter(|part| !part.is_empty())
         .map(str::to_owned)
         .collect();
-    let mut budget = Budget {
+    let budget = Budget {
         limits,
         entries: 0,
         bytes: 0,
     };
+    let (uploads, drain) = Uploads::new();
+    let walk = record(
+        store, uploads, budget, &root_fd, &wd_parts, &base, paths, result,
+    );
+    futures::try_join!(walk, drain)?;
+    Ok(())
+}
+
+/// [`collect`]'s walk over each output path, its blobs queued on `uploads`.
+#[allow(clippy::too_many_arguments)]
+async fn record<'a, S: Store>(
+    store: &'a S,
+    mut uploads: Uploads<'a, OutputsError>,
+    mut budget: Budget,
+    root_fd: &Arc<OwnedFd>,
+    wd_parts: &[String],
+    base: &Path,
+    paths: &[String],
+    result: &mut ActionResult,
+) -> Result<(), OutputsError> {
     for path in paths {
         if path.is_empty() {
             return Err(OutputsError::Invalid("an output path is empty".to_owned()));
@@ -419,10 +460,10 @@ pub async fn collect(
         check_relative("output path", path)?;
         let shown = base.join(path);
         let (dirs, name) = path.rsplit_once('/').unwrap_or(("", path));
-        let mut parts: Vec<String> = wd_parts.clone();
+        let mut parts: Vec<String> = wd_parts.to_vec();
         parts.extend(dirs.split('/').filter(|p| !p.is_empty()).map(str::to_owned));
         let name = PathBuf::from(name);
-        let start = Arc::clone(&root_fd);
+        let start = Arc::clone(root_fd);
         // Absent, a file or a symlink on the way: the action did not create the output.
         let Some(parent) = blocking(&shown, move || descend(&start, &parts)).await? else {
             continue;
@@ -442,23 +483,31 @@ pub async fn collect(
                 let (blob, executable) = budget.file(read, &shown)?;
                 result.output_files.push(OutputFile {
                     path: path.clone(),
-                    digest: Some(blob.store(store, &shown).await?),
+                    digest: Some(blob.queue(&mut uploads, store, &shown).await),
                     is_executable: executable,
                     ..OutputFile::default()
                 });
             }
             Some(Kind::Directory) => {
                 budget.entries(1, &shown)?;
-                let (root, children) =
-                    walk(store, &mut budget, parent, name, shown.clone()).await?;
-                let root_digest = store_directories(store, &root, &children, &shown).await?;
+                let (root, children) = walk(
+                    store,
+                    &mut uploads,
+                    &mut budget,
+                    parent,
+                    name,
+                    shown.clone(),
+                )
+                .await?;
+                let root_digest =
+                    store_directories(store, &mut uploads, &root, &children, &shown).await;
                 let tree = Tree {
                     root: Some(root),
                     children,
                 };
                 let tree_digest = Blob::Bytes(tree.encode_to_vec())
-                    .store(store, &shown)
-                    .await?;
+                    .queue(&mut uploads, store, &shown)
+                    .await;
                 result.output_directories.push(OutputDirectory {
                     path: path.clone(),
                     tree_digest: Some(tree_digest),
@@ -480,24 +529,26 @@ pub async fn collect(
     Ok(())
 }
 
-/// Stores `root` and each Directory in `children`, each distinct one once, and
-/// returns the digest of `root`. The farm's action cache refuses a result whose
-/// `root_directory_digest` it does not hold; the Directories below are stored too, so
-/// every digest the Tree names can be fetched.
-async fn store_directories(
-    store: &impl Store,
+/// Queues `root` and each Directory in `children` for storing (each distinct one
+/// once: [`Uploads`] skips a digest it queued already), and returns the digest of
+/// `root`. The farm's action cache refuses a result whose `root_directory_digest` it
+/// does not hold; the Directories below are stored too, so every digest the Tree names
+/// can be fetched.
+async fn store_directories<'a>(
+    store: &'a impl Store,
+    uploads: &mut Uploads<'a, OutputsError>,
     root: &Directory,
     children: &[Directory],
     shown: &Path,
-) -> Result<Digest, OutputsError> {
-    let mut stored = std::collections::HashSet::new();
+) -> Digest {
     for directory in children {
-        let bytes = directory.encode_to_vec();
-        if stored.insert(digest_of(&bytes).hash) {
-            Blob::Bytes(bytes).store(store, shown).await?;
-        }
+        Blob::Bytes(directory.encode_to_vec())
+            .queue(uploads, store, shown)
+            .await;
     }
-    Blob::Bytes(root.encode_to_vec()).store(store, shown).await
+    Blob::Bytes(root.encode_to_vec())
+        .queue(uploads, store, shown)
+        .await
 }
 
 /// Stores the regular file at `path` (a file the driver made, such as captured
@@ -571,8 +622,9 @@ async fn open_frame(
 /// The directory `name` in `parent` (shown as `shown`) as a Directory, with every
 /// Directory below it in pre-order, storing each file. Symlinks inside are recorded,
 /// never followed. Iterative, not recursive: see the module comment.
-async fn walk(
-    store: &impl Store,
+async fn walk<'a>(
+    store: &'a impl Store,
+    uploads: &mut Uploads<'a, OutputsError>,
     budget: &mut Budget,
     parent: Arc<OwnedFd>,
     name: PathBuf,
@@ -610,7 +662,7 @@ async fn walk(
                 let read =
                     blocking(&path, move || read_file(&dir, os_name.as_os_str(), max)).await?;
                 let (blob, executable) = budget.file(read, &path)?;
-                let digest = blob.store(store, &path).await?;
+                let digest = blob.queue(uploads, store, &path).await;
                 let top = stack.last_mut().unwrap_or(&mut root);
                 top.directory.files.push(FileNode {
                     name,

@@ -22,13 +22,16 @@
 //! action before [`collect`], or one left running could swap a directory on the way
 //! between the check and the read.
 
-use std::collections::BTreeSet;
+use std::collections::hash_map::Entry;
+use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
 use std::io::ErrorKind;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 
+use futures::{StreamExt as _, TryStreamExt as _, stream};
 use kbf_proto::reapi::{
     ActionResult, Command, Digest, Directory, DirectoryNode, FileNode, OutputDirectory, OutputFile,
     OutputSymlink, SymlinkNode, Tree,
@@ -36,6 +39,7 @@ use kbf_proto::reapi::{
 use prost::Message;
 use tokio::fs;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt};
+use tokio::sync::Semaphore;
 
 use crate::cas::{Cas, CasError, digest_of, fetch, label};
 
@@ -104,55 +108,208 @@ pub fn check_relative(what: &str, path: &str) -> Result<(), TreeError> {
     Ok(())
 }
 
+/// The most blobs [`materialize`] fetches at once: Directory messages while it walks
+/// the tree, then file blobs. One fetch at a time spent a lease on round trips: a tree
+/// of thousands of small files took minutes to write while the CAS sat idle.
+pub const FETCHES_IN_FLIGHT: usize = 64;
+
+/// The most bytes of file blobs [`materialize`] holds at once, fetched and not yet
+/// written. A blob larger than this is fetched alone.
+pub const FETCH_BYTES_IN_FLIGHT: usize = 256 << 20;
+
 /// Writes the tree under `root` into the empty directory `dir`.
+///
+/// The tree is walked first, a level at a time, each level's Directory messages
+/// fetched together (each distinct one once): every name is checked, every directory
+/// and symlink made. Then the file blobs are fetched, [`FETCHES_IN_FLIGHT`] and at most
+/// [`FETCH_BYTES_IN_FLIGHT`] bytes at a time, each distinct digest once however many
+/// files name it, and each file written from it, created with `O_EXCL`. After the
+/// first error no blob is started, and the fetches and writes already started are
+/// waited for, so no file appears in `dir` once the error is returned.
 ///
 /// # Errors
 /// A blob is missing or corrupt, the tree breaks a naming rule, or a write fails.
 pub async fn materialize(cas: &impl Cas, root: &Digest, dir: &Path) -> Result<(), TreeError> {
-    let mut pending = vec![(root.clone(), dir.to_owned())];
-    while let Some((digest, here)) = pending.pop() {
-        let directory: Directory = fetch_message(cas, &digest).await?;
-        let mut seen = BTreeSet::new();
-        let names = directory
-            .files
-            .iter()
-            .map(|f| &f.name)
-            .chain(directory.directories.iter().map(|d| &d.name))
-            .chain(directory.symlinks.iter().map(|s| &s.name));
-        for name in names {
-            check_name(name)?;
-            if !seen.insert(name) {
-                return Err(TreeError::Invalid(format!(
-                    "input tree names {name:?} twice in one directory"
-                )));
+    materialize_within(cas, root, dir, FETCHES_IN_FLIGHT, FETCH_BYTES_IN_FLIGHT).await
+}
+
+/// [`materialize`] within `fetches` blobs and `bytes` bytes in flight.
+async fn materialize_within(
+    cas: &impl Cas,
+    root: &Digest,
+    dir: &Path,
+    fetches: usize,
+    bytes: usize,
+) -> Result<(), TreeError> {
+    let files = make_directories(cas, root, dir, fetches).await?;
+    write_files(cas, files, fetches, bytes).await
+}
+
+/// Where one file blob goes: each path it is written to, and whether that copy is
+/// executable.
+struct Copies {
+    digest: Digest,
+    copies: Vec<(PathBuf, bool)>,
+}
+
+/// Walks the tree under `root`, checking every Directory's names and making its
+/// directories and symlinks under `dir`; returns the file blobs to write, each distinct
+/// digest once.
+async fn make_directories(
+    cas: &impl Cas,
+    root: &Digest,
+    dir: &Path,
+    fetches: usize,
+) -> Result<Vec<Copies>, TreeError> {
+    let mut files: Vec<Copies> = Vec::new();
+    let mut blob_at: HashMap<String, usize> = HashMap::new();
+    let mut level = vec![(root.clone(), dir.to_owned())];
+    while !level.is_empty() {
+        // The distinct Directories of this level, each with every place it goes,
+        // fetched together.
+        let mut places: Vec<(Digest, Vec<PathBuf>)> = Vec::new();
+        let mut place_of: HashMap<String, usize> = HashMap::new();
+        for (digest, here) in level {
+            match place_of.entry(label(&digest)) {
+                Entry::Occupied(at) => places[*at.get()].1.push(here),
+                Entry::Vacant(at) => {
+                    at.insert(places.len());
+                    places.push((digest, vec![here]));
+                }
             }
         }
-        for file in &directory.files {
-            write_file(cas, file, &here.join(&file.name)).await?;
+        let directories: Vec<(Directory, Vec<PathBuf>)> = stream::iter(places)
+            .map(|(digest, heres)| async move {
+                let directory: Directory = fetch_message(cas, &digest).await?;
+                Ok::<_, TreeError>((directory, heres))
+            })
+            .buffered(fetches)
+            .try_collect()
+            .await?;
+        let mut next = Vec::new();
+        for (directory, heres) in &directories {
+            check_names(directory)?;
+            for here in heres {
+                for file in &directory.files {
+                    let digest = file.digest.clone().ok_or_else(|| {
+                        TreeError::Invalid(format!("input file {:?} has no digest", file.name))
+                    })?;
+                    let copy = (here.join(&file.name), file.is_executable);
+                    match blob_at.entry(label(&digest)) {
+                        Entry::Occupied(at) => files[*at.get()].copies.push(copy),
+                        Entry::Vacant(at) => {
+                            at.insert(files.len());
+                            files.push(Copies {
+                                digest,
+                                copies: vec![copy],
+                            });
+                        }
+                    }
+                }
+                for link in &directory.symlinks {
+                    let path = here.join(&link.name);
+                    fs::symlink(&link.target, &path).await.map_err(io(&path))?;
+                }
+                for sub in &directory.directories {
+                    let path = here.join(&sub.name);
+                    let digest = sub.digest.clone().ok_or_else(|| {
+                        TreeError::Invalid(format!("input directory {:?} has no digest", sub.name))
+                    })?;
+                    fs::create_dir(&path).await.map_err(io(&path))?;
+                    next.push((digest, path));
+                }
+            }
         }
-        for link in &directory.symlinks {
-            let path = here.join(&link.name);
-            fs::symlink(&link.target, &path).await.map_err(io(&path))?;
-        }
-        for sub in &directory.directories {
-            let path = here.join(&sub.name);
-            let digest = sub.digest.clone().ok_or_else(|| {
-                TreeError::Invalid(format!("input directory {:?} has no digest", sub.name))
-            })?;
-            fs::create_dir(&path).await.map_err(io(&path))?;
-            pending.push((digest, path));
+        level = next;
+    }
+    Ok(files)
+}
+
+/// Refuses a Directory whose entry names are not single path components, or that
+/// names one entry twice.
+fn check_names(directory: &Directory) -> Result<(), TreeError> {
+    let mut seen = BTreeSet::new();
+    let names = directory
+        .files
+        .iter()
+        .map(|f| &f.name)
+        .chain(directory.directories.iter().map(|d| &d.name))
+        .chain(directory.symlinks.iter().map(|s| &s.name));
+    for name in names {
+        check_name(name)?;
+        if !seen.insert(name) {
+            return Err(TreeError::Invalid(format!(
+                "input tree names {name:?} twice in one directory"
+            )));
         }
     }
     Ok(())
 }
 
-async fn write_file(cas: &impl Cas, node: &FileNode, path: &Path) -> Result<(), TreeError> {
-    let digest = node
-        .digest
-        .as_ref()
-        .ok_or_else(|| TreeError::Invalid(format!("input file {:?} has no digest", node.name)))?;
-    let bytes = fetch(cas, digest).await?;
-    let mode = if node.is_executable { 0o755 } else { 0o644 };
+/// Fetches each blob in `files`, `fetches` and at most `bytes` bytes at a time, and
+/// writes every copy of it.
+///
+/// On the first error no blob is started any more, but the fetches and writes already
+/// started are waited for, not dropped: a dropped `tokio::fs` call still runs to the
+/// end on the blocking pool, so a file could otherwise appear in `dir` after the error
+/// is returned, while the caller is already clearing it. Not covered: the caller
+/// dropping the whole future (a lease cancelled mid-write) leaves those calls running.
+async fn write_files(
+    cas: &impl Cas,
+    files: Vec<Copies>,
+    fetches: usize,
+    bytes: usize,
+) -> Result<(), TreeError> {
+    let budget = Semaphore::new(bytes);
+    let budget = &budget;
+    let failed = AtomicBool::new(false);
+    let failed = &failed;
+    let mut writes = stream::iter(files)
+        .map(|blob| async move {
+            let written = write_blob(cas, blob, budget, bytes, failed).await;
+            if written.is_err() {
+                failed.store(true, Ordering::SeqCst);
+            }
+            written
+        })
+        .buffer_unordered(fetches);
+    let mut first = Ok(());
+    while let Some(written) = writes.next().await {
+        if first.is_ok() {
+            first = written;
+        }
+    }
+    first
+}
+
+/// Fetches `blob` within the byte `budget` (of `bytes` in all) and writes each copy of
+/// it, unless `failed` says another blob failed already: then it is skipped.
+async fn write_blob(
+    cas: &impl Cas,
+    blob: Copies,
+    budget: &Semaphore,
+    bytes: usize,
+    failed: &AtomicBool,
+) -> Result<(), TreeError> {
+    let size = usize::try_from(blob.digest.size_bytes).unwrap_or(usize::MAX);
+    // A blob larger than the whole budget waits for all of it and goes alone.
+    let want = u32::try_from(size.clamp(1, bytes)).unwrap_or(u32::MAX);
+    // The semaphore is never closed, so the permit is always granted.
+    let _permit = budget.acquire_many(want).await.ok();
+    // Checked once the permit is held: a blob may have waited for it while another
+    // failed.
+    if failed.load(Ordering::SeqCst) {
+        return Ok(());
+    }
+    let contents = fetch(cas, &blob.digest).await?;
+    for (path, is_executable) in &blob.copies {
+        write_file(&contents, *is_executable, path).await?;
+    }
+    Ok(())
+}
+
+async fn write_file(bytes: &[u8], is_executable: bool, path: &Path) -> Result<(), TreeError> {
+    let mode = if is_executable { 0o755 } else { 0o644 };
     let mut file = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -160,7 +317,7 @@ async fn write_file(cas: &impl Cas, node: &FileNode, path: &Path) -> Result<(), 
         .open(path)
         .await
         .map_err(io(path))?;
-    file.write_all(&bytes).await.map_err(io(path))?;
+    file.write_all(bytes).await.map_err(io(path))?;
     file.flush().await.map_err(io(path))?;
     Ok(())
 }
@@ -407,7 +564,153 @@ fn tree<C: Cas>(cas: &C, dir: PathBuf) -> TreeFuture<'_> {
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Mutex, PoisonError};
+
     use super::*;
+
+    /// Blobs in memory that count the bytes of the reads in flight, at most.
+    #[derive(Default)]
+    struct ByteCountingCas {
+        blobs: Mutex<HashMap<String, Vec<u8>>>,
+        bytes_in_flight: AtomicUsize,
+        most_bytes_in_flight: AtomicUsize,
+        reads_in_flight: AtomicUsize,
+        most_reads_in_flight: AtomicUsize,
+    }
+
+    impl ByteCountingCas {
+        fn insert(&self, bytes: Vec<u8>) -> Digest {
+            let digest = digest_of(&bytes);
+            let mut blobs = self.blobs.lock().unwrap_or_else(PoisonError::into_inner);
+            blobs.insert(label(&digest), bytes);
+            digest
+        }
+    }
+
+    impl Cas for ByteCountingCas {
+        async fn get(&self, digest: &Digest) -> Result<Vec<u8>, CasError> {
+            let size = usize::try_from(digest.size_bytes).unwrap_or(usize::MAX);
+            let bytes = self.bytes_in_flight.fetch_add(size, Ordering::SeqCst) + size;
+            self.most_bytes_in_flight.fetch_max(bytes, Ordering::SeqCst);
+            let reads = self.reads_in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.most_reads_in_flight.fetch_max(reads, Ordering::SeqCst);
+            for _ in 0..4 {
+                tokio::task::yield_now().await;
+            }
+            let blob = self
+                .blobs
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get(&label(digest))
+                .cloned();
+            self.bytes_in_flight.fetch_sub(size, Ordering::SeqCst);
+            self.reads_in_flight.fetch_sub(1, Ordering::SeqCst);
+            blob.ok_or_else(|| CasError::Missing(label(digest)))
+        }
+
+        async fn put(&self, bytes: Vec<u8>) -> Result<Digest, CasError> {
+            Ok(self.insert(bytes))
+        }
+    }
+
+    /// Writes a root of the blobs `files` (contents) with the budget, returning the
+    /// most reads and the most bytes in flight among the file fetches.
+    async fn within_budget(name: &str, files: &[Vec<u8>], budget: usize) -> (usize, usize) {
+        let cas = ByteCountingCas::default();
+        let mut root = Directory::default();
+        for (i, bytes) in files.iter().enumerate() {
+            root.files.push(FileNode {
+                name: format!("f{i}"),
+                digest: Some(cas.put(bytes.clone()).await.expect("stored")),
+                ..FileNode::default()
+            });
+        }
+        let root_digest = cas.put(root.encode_to_vec()).await.expect("stored");
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/kbf-daemon-unit")
+            .join(format!("{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch");
+        // The root Directory is read alone before the files; its count is reset.
+        let copies: Vec<Copies> = make_directories(&cas, &root_digest, &dir, 64)
+            .await
+            .expect("directories");
+        cas.most_bytes_in_flight.store(0, Ordering::SeqCst);
+        cas.most_reads_in_flight.store(0, Ordering::SeqCst);
+        write_files(&cas, copies, 64, budget)
+            .await
+            .expect("written");
+        for (i, bytes) in files.iter().enumerate() {
+            let written = std::fs::read(dir.join(format!("f{i}"))).expect("written");
+            assert_eq!(&written, bytes, "f{i}");
+        }
+        std::fs::remove_dir_all(&dir).expect("clean");
+        (
+            cas.most_reads_in_flight.load(Ordering::SeqCst),
+            cas.most_bytes_in_flight.load(Ordering::SeqCst),
+        )
+    }
+
+    /// Catches file blobs fetched with no bound on the bytes held at once (64 large
+    /// blobs fetched together could take the host's memory), a budget so strict it
+    /// fetches one blob at a time, and a blob larger than the whole budget never
+    /// fetched or fetched beside others (it waits for all of the budget and goes
+    /// alone). Mutant seen red: the permit not taken.
+    #[tokio::test]
+    async fn the_bytes_in_flight_stay_within_the_budget() {
+        let small: Vec<Vec<u8>> = (0..10_u8).map(|i| vec![i; 1000]).collect();
+        let (reads, bytes) = within_budget("budget-small", &small, 2500).await;
+        assert_eq!(reads, 2, "2500 bytes hold two 1000-byte blobs");
+        assert!(bytes <= 2500, "{bytes} bytes in flight");
+        let mut mixed = small;
+        mixed.push(vec![0xaa; 5000]);
+        let (_, bytes) = within_budget("budget-large", &mixed, 2500).await;
+        assert_eq!(bytes, 5000, "the large blob goes alone");
+    }
+
+    /// Catches the check that a blob failed made before the byte-budget permit rather
+    /// than once it is held: a blob that waited for the permit while another failed
+    /// would then be fetched and written after the error (a round trip and a write
+    /// spent on an action already refused, and a file left in the lease directory).
+    /// The missing blob claims the whole budget and fails only after its read yields,
+    /// so the small one is already waiting for the permit when the error comes.
+    /// Mutant seen red: the `failed` check moved above `acquire_many`.
+    #[tokio::test]
+    async fn a_blob_waiting_for_the_budget_is_skipped_after_a_failure() {
+        let cas = ByteCountingCas::default();
+        let budget = 1000;
+        let mut missing = digest_of(b"not in the CAS");
+        missing.size_bytes = i64::try_from(budget).expect("small");
+        let small = cas.put(b"small".to_vec()).await.expect("stored");
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/kbf-daemon-unit")
+            .join(format!("budget-skip-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch");
+        let files = vec![
+            Copies {
+                digest: missing,
+                copies: vec![(dir.join("large"), false)],
+            },
+            Copies {
+                digest: small,
+                copies: vec![(dir.join("small"), false)],
+            },
+        ];
+        let error = write_files(&cas, files, 64, budget)
+            .await
+            .expect_err("a blob is missing");
+        assert!(
+            matches!(error, TreeError::Cas(CasError::Missing(_))),
+            "{error}"
+        );
+        assert!(
+            !dir.join("small").exists(),
+            "the waiting blob was written after the failure"
+        );
+        std::fs::remove_dir_all(&dir).expect("clean");
+    }
 
     /// Catches a file read through a symlink, or from a FIFO or a device, that
     /// replaced it after its check (the daemon would upload a host file, or block on
