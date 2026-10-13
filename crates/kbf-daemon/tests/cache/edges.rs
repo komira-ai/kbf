@@ -238,14 +238,8 @@ async fn cache_io_errors_never_fail_a_lease() {
 async fn a_file_made_outside_during_a_fill_is_never_served_unhashed() {
     let dir = scratch("cache-eexist");
     let gates = Gates::new();
-    // The background pass is held: it would adopt the outside file on its own time.
-    let first_pass = gates.hold(|p| *p == Point::PassStarts);
     let cache =
         Cache::open(config(&dir, GIB, Arc::clone(&gates), &FakeClock::at(1000))).expect("open");
-    let waiting = Arc::clone(&gates);
-    tokio::task::spawn_blocking(move || waiting.wait_reached(first_pass))
-        .await
-        .expect("held");
     let cas = Arc::new(CountingCas::default());
     let k = key(b"the right one", false);
     let held = gates.hold(move |p| *p == Point::Filled(&k));
@@ -289,7 +283,7 @@ async fn a_file_made_outside_during_a_fill_is_never_served_unhashed() {
 #[tokio::test]
 async fn a_failed_snapshot_write_keeps_the_previous_one() {
     let dir = scratch("cache-snapfail");
-    let gates = Gates::new();
+    let gates = Gates::running();
     // The background thread's snapshots are held off: they would race the test's.
     let held = gates.hold(|p| *p == Point::PassStarts);
     let cache =
@@ -320,7 +314,7 @@ async fn a_failed_snapshot_write_keeps_the_previous_one() {
     assert!(cache.stats().snapshot_failures >= 1);
     stop(cache, &gates);
     std::fs::remove_dir(dir.join("cache/v1/index.snap.tmp")).expect("out of the way");
-    let gates = Gates::new();
+    let gates = Gates::running();
     let pass = gates.hold(|p| *p == Point::PassStarts);
     let cache =
         Cache::open(config(&dir, GIB, Arc::clone(&gates), &FakeClock::at(2000))).expect("open");
@@ -336,7 +330,7 @@ async fn a_failed_snapshot_write_keeps_the_previous_one() {
 #[test]
 fn snapshots_and_passes_repeat_on_their_intervals() {
     let dir = scratch("cache-periodic");
-    let gates = Gates::new();
+    let gates = Gates::running();
     let mut config = config(&dir, GIB, Arc::clone(&gates), &FakeClock::at(1000));
     config.snapshot_every = Duration::from_millis(20);
     config.pass_every = Duration::from_millis(30);
@@ -360,7 +354,7 @@ fn snapshots_and_passes_repeat_on_their_intervals() {
 #[tokio::test]
 async fn the_pass_pause_yields_to_a_stop_and_to_free_space_pressure() {
     let dir = scratch("cache-pace");
-    let gates = Gates::new();
+    let gates = Gates::running();
     let mut paced = config(&dir, GIB, Arc::clone(&gates), &FakeClock::at(1000));
     paced.pass_pace = Duration::from_secs(3600);
     let cache = Cache::open(paced.clone()).expect("open");
@@ -379,7 +373,7 @@ async fn the_pass_pause_yields_to_a_stop_and_to_free_space_pressure() {
     assert!(started.elapsed() < Duration::from_secs(30));
     assert!(format!("{cache:?}").contains("cache"));
     drop(cache);
-    let gates = Gates::new();
+    let gates = Gates::running();
     paced.hooks = Arc::clone(&gates) as _;
     paced.min_free_bytes = u64::MAX;
     let pass = gates.hold(|p| *p == Point::PassStarts);

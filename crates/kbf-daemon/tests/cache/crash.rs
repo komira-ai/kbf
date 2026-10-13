@@ -202,7 +202,7 @@ async fn files_filled_after_the_last_snapshot_are_adopted_after_a_re_hash() {
     std::fs::write(&flipped, &bytes).expect("flip");
     std::fs::set_permissions(&flipped, std::fs::Permissions::from_mode(0o444)).expect("chmod back");
     let before = entries(&dir);
-    let gates = Gates::new();
+    let gates = Gates::running();
     let pass = gates.hold(|p| *p == Point::PassStarts);
     let cache =
         Cache::open(config(&dir, GIB, Arc::clone(&gates), &FakeClock::at(2000))).expect("open");
@@ -269,7 +269,7 @@ async fn a_daemon_killed_mid_snapshot_leaves_the_previous_one() {
         dir.join("cache/v1/index.snap.tmp").exists(),
         "the crash was not mid-write"
     );
-    let gates = Gates::new();
+    let gates = Gates::running();
     let pass = gates.hold(|p| *p == Point::PassStarts);
     let cache =
         Cache::open(config(&dir, GIB, Arc::clone(&gates), &FakeClock::at(2000))).expect("open");

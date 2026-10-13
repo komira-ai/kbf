@@ -92,7 +92,7 @@ async fn a_restart_serves_from_the_loaded_index_and_re_hashes_each_entry_once() 
     let cas = CountingCas::default();
     let tree = toolchain(2000);
     let root = cas.tree(&tree);
-    let gates = Gates::new();
+    let gates = Gates::running();
     let (cache, _) = paused(
         config(&dir, GIB, Arc::clone(&gates), &FakeClock::at(1000)),
         &gates,
@@ -102,7 +102,7 @@ async fn a_restart_serves_from_the_loaded_index_and_re_hashes_each_entry_once() 
         .expect("run 1");
     stop(cache, &gates);
     let fetched = cas.file_bytes();
-    let gates = Gates::new();
+    let gates = Gates::running();
     let (cache, pass) = paused(
         config(&dir, GIB, Arc::clone(&gates), &FakeClock::at(2000)),
         &gates,
@@ -135,7 +135,7 @@ async fn an_entry_changed_while_stopped_is_fetched_again() {
     let dir = scratch("cache-r3");
     let cas = CountingCas::default();
     let root = cas.tree(&[file("a", b"right bytes", false), file("b", b"other", false)]);
-    let gates = Gates::new();
+    let gates = Gates::running();
     let cache =
         Cache::open(config(&dir, GIB, Arc::clone(&gates), &FakeClock::at(1000))).expect("open");
     lease(&cas, &cache, &root, &dir, "run1")
@@ -152,7 +152,7 @@ async fn an_entry_changed_while_stopped_is_fetched_again() {
         .expect("open")
         .set_times(fixed)
         .expect("mtime back");
-    let gates = Gates::new();
+    let gates = Gates::running();
     let cache =
         Cache::open(config(&dir, GIB, Arc::clone(&gates), &FakeClock::at(2000))).expect("open");
     let (at, stats) = lease(&cas, &cache, &root, &dir, "run2")
@@ -170,7 +170,7 @@ async fn an_entry_changed_while_stopped_is_fetched_again() {
 /// K5, K2, K6, K4, one fake minute apart, and a clean stop. Returns the keys.
 async fn lru_run(dir: &Path, cas: &CountingCas) -> Vec<Key> {
     let clock = FakeClock::at(10_000);
-    let gates = Gates::new();
+    let gates = Gates::running();
     let cache = Cache::open(config(dir, GIB, Arc::clone(&gates), &clock)).expect("open");
     let blobs: Vec<Vec<u8>> = (1..=6_u8).map(|i| vec![i; 100]).collect();
     for (i, blob) in blobs.iter().enumerate() {
@@ -202,7 +202,7 @@ async fn the_drain_at_start_removes_the_least_recently_used() {
     let cas = CountingCas::default();
     let keys = lru_run(&dir, &cas).await;
     let saved = snapshot(&dir);
-    let gates = Gates::new();
+    let gates = Gates::running();
     let (cache, pass) = paused(
         config(&dir, 300, Arc::clone(&gates), &FakeClock::at(99_999)),
         &gates,
@@ -240,7 +240,7 @@ async fn a_lease_during_the_drain_waits_on_the_slot_it_holds() {
         file("k1", &blobs[0], false),
         file("k5", &blobs[4], false),
     ]);
-    let gates = Gates::new();
+    let gates = Gates::running();
     let k1 = keys[0];
     let drain = gates.hold(move |p| *p == Point::Evicting(&k1));
     let pass = gates.hold(|p| *p == Point::PassStarts);
@@ -301,7 +301,7 @@ async fn a_lease_during_the_drain_waits_on_the_slot_it_holds() {
 /// Fills `dir`'s cache with `count` files and stops cleanly; returns the root.
 async fn filled(dir: &Path, cas: &CountingCas, count: usize) -> kbf_proto::reapi::Digest {
     let root = cas.tree(&toolchain(count));
-    let gates = Gates::new();
+    let gates = Gates::running();
     let (cache, _) = paused(
         config(dir, GIB, Arc::clone(&gates), &FakeClock::at(1000)),
         &gates,
@@ -330,7 +330,7 @@ async fn a_corrupt_snapshot_is_discarded_and_its_files_adopted() {
     std::fs::write(&snap, &bytes).expect("corrupt");
     let before = entries(&dir);
     let fetched = cas.file_bytes();
-    let gates = Gates::new();
+    let gates = Gates::running();
     let (cache, pass) = paused(
         config(&dir, GIB, Arc::clone(&gates), &FakeClock::at(2000)),
         &gates,
@@ -367,7 +367,7 @@ async fn a_snapshot_of_another_version_is_discarded_and_the_budget_holds_after_t
     recrc(&mut bytes);
     std::fs::write(&snap, &bytes).expect("version 2");
     let sum = on_disk_sum(&dir);
-    let gates = Gates::new();
+    let gates = Gates::running();
     let (cache, pass) = paused(
         config(&dir, sum / 2, Arc::clone(&gates), &FakeClock::at(2000)),
         &gates,
@@ -420,7 +420,7 @@ async fn malformed_snapshots_are_discarded() {
         ("twice", twice),
     ] {
         std::fs::write(&snap, &bytes).expect("forge");
-        let gates = Gates::new();
+        let gates = Gates::running();
         let (cache, pass) = paused(
             config(&dir, GIB, Arc::clone(&gates), &FakeClock::at(2000)),
             &gates,
@@ -451,7 +451,7 @@ async fn entries_deleted_while_stopped_are_refetched_or_dropped() {
         file("c", b"three", false),
     ]);
     let used = cas.tree(&[file("a", b"one", false)]);
-    let gates = Gates::new();
+    let gates = Gates::running();
     let cache =
         Cache::open(config(&dir, GIB, Arc::clone(&gates), &FakeClock::at(1000))).expect("open");
     lease(&cas, &cache, &root, &dir, "run1")
@@ -461,7 +461,7 @@ async fn entries_deleted_while_stopped_are_refetched_or_dropped() {
     for bytes in [&b"one"[..], b"two"] {
         std::fs::remove_file(entry_path(&dir, &key(bytes, false))).expect("delete");
     }
-    let gates = Gates::new();
+    let gates = Gates::running();
     let (cache, pass) = paused(
         config(&dir, GIB, Arc::clone(&gates), &FakeClock::at(2000)),
         &gates,
@@ -488,7 +488,7 @@ async fn entries_deleted_while_stopped_are_refetched_or_dropped() {
 async fn the_pass_keeps_an_entry_inserted_after_its_listing() {
     let dir = scratch("cache-r9b");
     let cas = CountingCas::default();
-    let gates = Gates::new();
+    let gates = Gates::running();
     let (cache, pass) = paused(
         config(&dir, GIB, Arc::clone(&gates), &FakeClock::at(1000)),
         &gates,
@@ -534,7 +534,7 @@ async fn the_pass_re_checks_the_index_under_the_slot() {
     let dir = scratch("cache-r9c");
     let cas = CountingCas::default();
     let root = cas.tree(&[file("f", b"on disk", false)]);
-    let gates = Gates::new();
+    let gates = Gates::running();
     let cache =
         Cache::open(config(&dir, GIB, Arc::clone(&gates), &FakeClock::at(1000))).expect("open");
     lease(&cas, &cache, &root, &dir, "run1")
@@ -542,7 +542,7 @@ async fn the_pass_re_checks_the_index_under_the_slot() {
         .expect("run 1");
     stop(cache, &gates);
     std::fs::remove_file(dir.join("cache/v1/index.snap")).expect("lose the index");
-    let gates = Gates::new();
+    let gates = Gates::running();
     let (cache, pass) = paused(
         config(&dir, GIB, Arc::clone(&gates), &FakeClock::at(2000)),
         &gates,
