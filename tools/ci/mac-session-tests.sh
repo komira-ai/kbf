@@ -20,6 +20,12 @@
 set -euo pipefail
 
 export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-14.0}"
+
+# DO NOT MERGE: a mutant run goes straight to the slot tests.
+rc=0
+cargo xtask sudo-test -p kbf-driver-native --test slot_clean -- --test-threads=1 --nocapture || rc=1
+cargo xtask sudo-test -p kbf-driver-native --test slots -- --test-threads=1 --nocapture the_start_ends || rc=1
+exit "$rc"
 cargo build --locked -p kbf-mac-session --bin kbf-mac-session --example mac_session_client
 helper=target/debug/kbf-mac-session
 # Everything the lease users and `nobody` must reach lives where every user may search:
