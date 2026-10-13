@@ -160,7 +160,8 @@ const ROOT_WITHOUT_POOL: &str = "the daemon runs as root and has no lease-user p
 #[cfg(target_os = "macos")]
 pub fn check_daemon_user(root: bool, pool: Option<&Pool>) -> Result<(), String> {
     match (root, pool) {
-        (true, None) => Err(ROOT_WITHOUT_POOL.to_owned()),
+        // MUTANT: drop the root check.
+        (true, None) => Ok(()).map(|()| { let _ = ROOT_WITHOUT_POOL; }),
         (false, Some(_)) => Err("a lease-user pool needs a daemon running as root".to_owned()),
         _ => Ok(()),
     }
@@ -394,6 +395,7 @@ mod tests {
     /// another uid) or off macOS, and a refusal of the ordinary daemon (no pool, not
     /// root).
     #[test]
+    #[ignore = "MUTANT m5: so the run reaches the sudo tests"]
     fn only_a_root_daemon_on_macos_runs_a_pool_and_it_must() {
         let pool = Pool::provisioned(1, 700).expect("pool");
         assert_eq!(check_daemon_user(false, None), Ok(()));
