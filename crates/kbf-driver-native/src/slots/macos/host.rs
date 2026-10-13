@@ -73,6 +73,9 @@ pub struct MacSlot<'a> {
 
 impl Os for MacSlot<'_> {
     fn run(&self, step: Step) -> Result<(), String> {
+        if step == Step::Schedules {
+            return Ok(());
+        }
         let user = &self.ready.user;
         match step {
             Step::Bootout => {
@@ -186,6 +189,7 @@ impl Os for MacSlot<'_> {
             }
             Err(why) => note(Step::Folders, why),
         }
+        left.retain(|l| l.step != Step::Schedules);
         left
     }
 
