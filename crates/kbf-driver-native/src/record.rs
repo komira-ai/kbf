@@ -222,6 +222,7 @@ pub enum KeeperFor {
     Group,
     /// A keeper of its own that ends every process of the uid the action runs as.
     #[cfg(target_os = "macos")]
+    #[allow(dead_code)]
     Uid(u32),
 }
 

@@ -233,7 +233,8 @@ impl Runner {
         match self {
             Self::Daemon => KeeperFor::Group,
             #[cfg(target_os = "macos")]
-            Self::Slot(slot) => KeeperFor::Uid(slot.ready().user.uid),
+            // MUTANT: the keeper in group mode.
+            Self::Slot(_) => KeeperFor::Group,
         }
     }
 
