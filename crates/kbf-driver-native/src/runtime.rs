@@ -518,13 +518,7 @@ impl<C: Cas> NativeRuntime<C> {
         // A lease of a root daemon waits for a free slot of the pool, killable.
         #[cfg(target_os = "macos")]
         if let Some(slots) = &self.slots {
-            *runner = tokio::select! {
-                slot = slots.take() => Runner::Slot(slot?),
-                Ok(by) = &mut *stop => {
-                    *killer = Some(by);
-                    return Err(RuntimeError::Killed);
-                }
-            };
+            *runner = Runner::Slot(slots.take().await?);
         }
         // A kill during prepare (a long input fetch) stops it at once; the clean
         // removes whatever was written.
