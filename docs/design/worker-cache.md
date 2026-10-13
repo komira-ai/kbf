@@ -969,6 +969,13 @@ left open):
   `overlay` with no `mount_program` (fuse-overlayfs is refused as `graph-driver`).
 - A clean stop is the last handle of the cache being dropped: the daemon's exit saves
   the index. Snapshot writers are serialised by a lock of their own.
+- **A cached input cannot be renamed or hard-linked in the container**, only read or
+  unlinked (C-1 and C-12 on the hosted runners' kernel overlay): overlayfs copies a lower
+  file up before a rename or a link, and refuses to copy up one whose owner the caller's
+  user namespace does not map (`EOVERFLOW`). Section 5.1 expected the rename to work. An
+  input an output names is a private copy, so moving it into its output path works; an
+  action that renames another input fails. Open: accept it (as Q1 accepted `EACCES`), or
+  give such an action private copies (Q1's `kbf-writable-inputs` opt-out).
 
 ---
 

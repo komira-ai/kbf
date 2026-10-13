@@ -3,8 +3,6 @@
 //! driver never touches the directory, and the binary answers as the driver's
 //! `__chown-dirs` helper before it parses its flags.
 
-use std::path::Path;
-
 use super::{BIN, one_native_daemon, runs_until_sigterm_logged, tls};
 
 /// Whether a line of `log` holds every one of `words`.
@@ -16,7 +14,11 @@ fn logged(log: &[String], words: &[&str]) -> bool {
 /// The flags of a container daemon with the stub `podman`, a stand-in cgroup tree and
 /// a full subordinate id range, run as `name`, with `cache` added.
 #[cfg(target_os = "linux")]
-fn container(name: &str, scratch: &Path, cache: &[String]) -> (Vec<String>, std::path::PathBuf) {
+fn container(
+    name: &str,
+    scratch: &std::path::Path,
+    cache: &[String],
+) -> (Vec<String>, std::path::PathBuf) {
     let ids = super::id_files(&format!("{name}-ids"), "65536");
     let (_, cgroup) = super::cgroup_tree(&tls(&format!("{name}-cgroup")), "cpu memory pids");
     let mut flags = vec![

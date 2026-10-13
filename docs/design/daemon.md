@@ -406,7 +406,9 @@ in order, and the daemon's own uid and gid map to nothing.
   input root's directories alone to id 1 (and back), with the daemon binary's own
   `__chown-dirs` mode run under `podman unshare`, and `chown -hR` covers only the upper
   and work directories. An input an output names is a private copy, never a link. An
-  action that opens a cached input for writing in place gets `EACCES`.
+  action that opens a cached input for writing in place gets `EACCES`, and one that
+  renames or hard-links one gets `EOVERFLOW` (overlayfs will not copy up a file whose
+  owner the container does not map).
 - **The hand-back is not under the action's timeout.** It runs after the container has
   exited, outside the timeout and outside `kill`, and walks the whole upper tree, which
   the action controls. An action that leaves millions of files makes it as slow as the
