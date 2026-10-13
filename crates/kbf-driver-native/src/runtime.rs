@@ -447,7 +447,8 @@ impl<C: Cas> NativeRuntime<C> {
         let mut watch = match runner {
             Runner::Daemon => Watch::Tree(Group::new(Tracker::new(leader, me), record)),
             #[cfg(target_os = "macos")]
-            Runner::Slot(slot) => Watch::Uid(slot.watch(record)),
+            // MUTANT: kill from root by the tracker's pid list.
+            Runner::Slot(_) => Watch::Tree(Group::new(Tracker::new(leader, me), record)),
         };
         let limit = self.config.memory.limit(work.resources.memory_bytes);
         let deadline = Instant::now() + prepared.timeout;
@@ -764,6 +765,7 @@ enum Ended {
 enum Watch {
     Tree(Group),
     #[cfg(target_os = "macos")]
+    #[allow(dead_code)]
     Uid(crate::slots::macos::UidWatch),
 }
 
