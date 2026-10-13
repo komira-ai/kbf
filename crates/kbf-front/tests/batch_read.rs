@@ -20,6 +20,7 @@ use kbf_objstore::{
 };
 use kbf_proto::reapi::content_addressable_storage_server::ContentAddressableStorage;
 use kbf_proto::reapi::{self, BatchReadBlobsRequest, FindMissingBlobsRequest};
+use kbf_types::FarmTime;
 use tonic::{Code, Request};
 
 /// How long each GET takes once [`Store::slow`] is set, as the design's test C-15 says.
@@ -414,4 +415,64 @@ async fn a_batch_read_with_the_log_down_answers_each_blob_unavailable() {
     let answers = farm.batch_read(vec![proto(&a), proto(&b)]).await;
     let unavailable = (Code::Unavailable, Vec::new());
     assert_eq!(answers, [unavailable.clone(), unavailable]);
+}
+
+/// Farm time `n` days after the epoch.
+fn days(n: u64) -> FarmTime {
+    FarmTime::from_millis(n * 24 * 60 * 60 * 1000)
+}
+
+/// Catches (mutant "batch read without the touch", `touch_for(&[])`): blobs that are
+/// only ever read through BatchReadBlobs (buck2 reads small inputs that way) not
+/// counting as used, so they are collected at the end of their TTL while builds still
+/// read them. A blob batch-read on day 5 outlives a collection on day 10; its unread
+/// neighbour, stored the same day, does not.
+#[tokio::test]
+async fn each_batch_read_is_a_touch() {
+    let farm = Farm::new().await;
+    let (read, unread) = (blob("batch-read on day 5"), blob("never read"));
+    farm.store(&[&read]).await;
+    farm.store(&[&unread]).await;
+    farm.cache.tick(days(5)).await.expect("tick");
+    assert_eq!(farm.batch_read(vec![proto(&read)]).await, [ok(&read)]);
+    farm.cache.tick(days(10)).await.expect("tick");
+    farm.cache.collect().await.expect("collect");
+    let (read, unread) = (read.verified.digest(), unread.verified.digest());
+    let missing = farm
+        .cache
+        .find_missing(&[read, unread])
+        .await
+        .expect("find");
+    assert_eq!(missing, [unread]);
+}
+
+/// Catches (`read[&d]` indexing the batch's answers): a digest that parsed but that
+/// `read_blobs` gave no answer for panicking the call, which drops the client's
+/// connection. That happens only if the index holds two digests at one location (a
+/// corrupt log; the segment writer never makes one): the batch then keeps one record
+/// per offset. The dropped digest answers INTERNAL; the call still answers every blob.
+#[tokio::test]
+async fn two_digests_indexed_at_one_location_do_not_panic_the_call() {
+    let farm = Farm::new().await;
+    let (a, b) = (blob("same place one"), blob("same place two"));
+    let location = Location {
+        store: StoreId::CONFIGURED,
+        object: ObjectId::new(farm.cache.epoch(), 99),
+        offset: 0,
+    };
+    for x in [&a, &b] {
+        let digest = x.verified.digest();
+        let put = Command::PutBlob { digest, location };
+        let applied = farm.log.commit(put).await.expect("commit");
+        assert!(matches!(applied, Applied::Blob(Ok(_))), "{applied:?}");
+    }
+    // The batch keeps the record of the larger digest (it is inserted last).
+    let (dropped, kept) = if a.verified.digest() < b.verified.digest() {
+        (&a, &b)
+    } else {
+        (&b, &a)
+    };
+    let answers = farm.batch_read(vec![proto(dropped), proto(kept)]).await;
+    assert_eq!(answers[0], (Code::Internal, Vec::new()), "{answers:?}");
+    assert_eq!(answers.len(), 2);
 }
