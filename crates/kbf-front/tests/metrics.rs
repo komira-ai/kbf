@@ -191,8 +191,10 @@ fn commits(metrics: &CacheMetrics, command: &str) -> u64 {
 /// observation of at least its stage's time and less than the PUT's (but the PUT's
 /// own). Also the write counted without its bytes (counted per message), its
 /// end-to-end time shorter than the stages inside it, a segment's blob count or size
-/// not recorded, footer GETs counted as reads, and the in-flight level left raised.
-/// Mutants seen red: each stage timer removed; the footer timer moved around the PUT.
+/// not recorded, footer GETs counted as reads, the in-flight level left raised, and
+/// a write skipped because its blob is stored counted as an error.
+/// Mutants seen red: each stage timer removed; the footer timer moved around the PUT;
+/// the skipped write's `ok()` removed.
 #[tokio::test]
 async fn a_bytestream_write_times_each_stage_of_its_store() {
     let (cache, channel) = serve().await;
@@ -234,6 +236,11 @@ async fn a_bytestream_write_times_each_stage_of_its_store() {
     // touch): counted as present, and nothing stored.
     write(&channel, &blob).await;
     assert_eq!(m.write.total.get(), 2);
+    assert_eq!(
+        m.write.errors.get(),
+        0,
+        "a skipped write counted as an error"
+    );
     assert_eq!(m.write_present.get(), 1);
     assert_eq!(m.segment_put.count(), 1);
     assert_eq!(commits(m, "touch"), 0);

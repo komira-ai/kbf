@@ -258,8 +258,11 @@ tree of N files costs N Writes, each its own segment. Over a window, with `rate(
 - The mean of each stage (`_sum` over `_count` of `kbf_segment_put_seconds`,
   `kbf_segment_footer_read_seconds`, `kbf_segment_commit_seconds`) says which one the
   Write waits on: the object store's PUT, its GETs, or the metadata log. What
-  `kbf_store_blobs_seconds` holds beyond the three is the held-blob query and touch;
-  what a Write holds beyond its store is receiving the bytes.
+  `kbf_store_blobs_seconds` holds beyond the three is the held-blob query and touch.
+  What a Write holds beyond its store is receiving and hashing the bytes and
+  authorizing the caller (neither timed on its own), and the check whether the blob
+  is already held: its query and any touch also show in `kbf_meta_query_seconds` and
+  `kbf_meta_commit_seconds{command="touch"}`.
 - `kbf_segment_blobs` with a mean of 1 says every segment holds one blob: each upload
   pays a PUT, two GETs and a commit of its own.
 - `kbf_bytestream_write_present_total` against the requests says how many uploads

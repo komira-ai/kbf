@@ -261,3 +261,38 @@ async fn the_default_put_chunks_gathers_and_checks_its_digest() {
             .contains("could not be read for storing: disk gone")
     );
 }
+
+/// Catches a streamed upload not counted for the lease that made it (every output
+/// file of the container and native drivers is a `put_chunks`, so its lease's
+/// `blobs_uploaded` would show only Directories and Trees), counted with other
+/// bytes than the blob's, or a failed one counted as uploaded. Uploads two blobs in
+/// chunks inside one lease's scope, then one whose chunk cannot be read and one the
+/// front refuses as short.
+/// Mutant seen red: `put_chunks`' `counted.done(..)` removed.
+#[tokio::test]
+async fn a_streamed_upload_counts_for_its_lease() {
+    let cas = front().await;
+    let transfers = Arc::new(kbf_daemon::phases::Transfers::default());
+    kbf_daemon::phases::scoped(Arc::clone(&transfers), async {
+        for (len, chunk) in [(WRITE_CHUNK_BYTES + 5, 1000), (300, 7)] {
+            let (_, digest, chunks) = chunked(len, chunk);
+            assert_eq!(cas.put_chunks(digest.clone(), chunks).await, Ok(digest));
+        }
+        assert!(
+            cas.put_chunks(digest_of(b"abcdef"), failing(b"abc"))
+                .await
+                .is_err()
+        );
+        let (_, mut short, chunks) = chunked(10, 4);
+        short.size_bytes = 20;
+        assert!(cas.put_chunks(short, chunks).await.is_err());
+    })
+    .await;
+    let counts = transfers.counts();
+    assert_eq!(
+        (counts.blobs_uploaded, counts.bytes_uploaded),
+        (2, (WRITE_CHUNK_BYTES + 5 + 300) as u64),
+        "{counts:?}"
+    );
+    assert_eq!(counts.most_uploads_in_flight, 1, "{counts:?}");
+}
