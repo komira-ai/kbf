@@ -569,3 +569,49 @@ async fn the_pass_re_checks_the_index_under_the_slot() {
     assert_eq!(cache.stats().index_drift_bytes, 0);
     stop(cache, &gates);
 }
+
+/// R-9, the pass's side of a held slot. Catches the adopt pass changing a key whose
+/// slot someone holds (the "drop the held-slot check" mutant): the evictor is held
+/// between removing K from the index and unlinking it, so K's file is on disk and not
+/// indexed; a pass meanwhile leaves K alone, the evictor unlinks it, and K is neither
+/// indexed nor counted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+async fn the_pass_leaves_a_key_whose_slot_is_held() {
+    let dir = scratch("cache-r9-held");
+    let gates = Gates::new();
+    let cache =
+        Cache::open(config(&dir, 100, Arc::clone(&gates), &FakeClock::at(1000))).expect("open");
+    let cas = Arc::new(CountingCas::default());
+    let k = key(&[b'k'; 100], false);
+    lease(
+        &cas,
+        &cache,
+        &cas.tree(&[file("f", &[b'k'; 100], false)]),
+        &dir,
+        "k",
+    )
+    .await
+    .expect("k");
+    let held = gates.hold(move |p| *p == Point::Evicting(&k));
+    let evicting = {
+        let (cas, cache, dir) = (Arc::clone(&cas), Arc::clone(&cache), dir.clone());
+        let root = cas.tree(&[file("f", &[b'l'; 100], false)]);
+        tokio::spawn(async move { lease(&cas, &cache, &root, &dir, "l").await })
+    };
+    let waiting = Arc::clone(&gates);
+    tokio::task::spawn_blocking(move || waiting.wait_reached(held))
+        .await
+        .expect("held");
+    assert!(entry_path(&dir, &k).exists() && !cache.holds(&k));
+    let passing = Arc::clone(&cache);
+    tokio::task::spawn_blocking(move || passing.adopt_pass())
+        .await
+        .expect("the pass");
+    gates.release(held);
+    evicting.await.expect("joined").expect("l");
+    assert!(!cache.holds(&k), "the pass adopted a key the evictor held");
+    assert!(!entry_path(&dir, &k).exists());
+    assert_eq!(cache.stats().adopted_entries, 0);
+    assert_eq!(cache.stats().bytes, on_disk_sum(&dir));
+    stop(cache, &gates);
+}
