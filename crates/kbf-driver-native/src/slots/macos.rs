@@ -146,9 +146,6 @@ impl Slot {
         }
         let (program, args) = isolation.wrap_slot(network, lease, &ready.rules, program, args);
         let mut launch = vec![
-            "asuser".to_owned(),
-            uid.to_string(),
-            self.program.to_string_lossy().into_owned(),
             AS_USER_ARG.to_owned(),
             uid.to_string(),
             gid.to_string(),
