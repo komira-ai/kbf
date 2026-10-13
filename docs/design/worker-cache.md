@@ -976,10 +976,14 @@ Wall-clock speedups are reported, never asserted.
   action cannot write; today the same open quietly gets a private copy. Compilers and
   linkers read inputs and write new outputs, so they never hit this. A tool that patches
   an input where it lies would. An output that is also an input still works (5.1).
-  *Recommendation:* accept it; REAPI allows a worker to refuse, and Buildbarn's virtual
-  mode does the same. Add an opt-out (a per-action platform property
-  `kbf-writable-inputs=1` that gives that action private copies) only if a real build
-  breaks.
+  Decided (CEO, 2026-10-13): accept it, as Buildbarn does. Buildbarn's virtual mode
+  refuses an open for write or truncate with EACCES
+  (`pkg/filesystem/virtual/blob_access_cas_file_factory.go`, `VirtualOpenSelf`), a size
+  change with EACCES and a chown with EPERM (`VirtualSetAttributes`; chmod is still
+  allowed there, by a TODO, but it does not make the file writable). Its native mode
+  writes inputs 0444 or 0555 with a fixed mtime (`pkg/cas/blob_access_file_fetcher.go`).
+  Add an opt-out (a per-action platform property `kbf-writable-inputs=1` that gives that
+  action private copies) only if a real build breaks.
 - **Q2. Locality placement (C5b).** *Recommendation:* ship C5a's report only, and decide
   with a week of `InputStats` from the farm.
 - **Q3. Default budget.** Decided (CEO, 2026-10-13): no default in kbf (no flag, no
