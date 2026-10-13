@@ -418,8 +418,10 @@ renames it into `blobs/`. Eviction is the daemon unlinking a name. Nothing ever 
 file under `blobs/` for writing. Actions only read: they get hard links (containers) or
 clones (macOS) of cache files, and they run as a uid that cannot write those files (in a
 container the files' owner is unmapped; on macOS the clone is a separate inode and the
-sandbox denies the cache directory). The index (6.9) is written by one daemon thread, and
-the background adopt pass only reads the directory: it never deletes a file.
+sandbox denies the cache directory). A fill that finds an unindexed name whose bytes do
+not match its key unlinks that name before it fetches (6.9). The index (6.9) is written by
+one daemon thread, and the background adopt pass only reads the directory: it never
+deletes a file.
 
 ### 6.1 On-disk layout
 
@@ -624,11 +626,19 @@ snapshot file (6.9), and loads it at start. Start-up, in order:
    order and the byte total. A missing, corrupt, truncated or unknown-version snapshot is
    discarded with a warning (`cache_index_discarded=missing|corrupt|version`), and the
    in-memory index starts empty. Start-up never blocks on anything but this one read
-   (`cache_index_load_ms`; *unmeasured*, about 56 MiB at 1M entries).
-4. **Enforce the limits in memory.** If the total exceeds `--cache-max-bytes` (the flag
-   was lowered between runs), the oldest entries by last use leave the in-memory index
-   at once, so nothing serves them, and the evictor unlinks their files (6.9, under each
-   key's slot). Then the cache **serves at once**: hits, fills and inserts.
+   (`cache_index_load_ms`; *unmeasured*, about 56 MiB at 1M entries). The snapshot
+   thread then writes a snapshot at once (6.9), so a well-formed snapshot of what was
+   loaded exists before the first lease.
+4. **Serve at once, and drain to the limit.** The cache **serves at once**: hits, fills
+   and inserts. If the total exceeds `--cache-max-bytes` (the flag was lowered between
+   runs), the evictor drains the oldest entries by last use through its normal path
+   (6.9): one key at a time, it takes the key's slot, re-checks that the key is still
+   indexed and unpinned, removes it from the in-memory index, unlinks the name and
+   releases the slot. The in-memory remove never happens outside the slot, so a lease
+   that asks for a key mid-drain either hits it (not yet reached; its pin makes the
+   drain skip it), waits on the slot and then misses, or misses outright; in each case
+   the key's file exists exactly when it is indexed. The total is over the limit only
+   until the drain ends.
 5. **Re-hash on first use.** Every loaded or adopted entry starts unverified, and is
    re-hashed the first time a lease uses it (lazy verify, 6.3). The index says what should
    be on disk, never that the bytes are right. A mismatch evicts the entry and the lease
@@ -650,22 +660,41 @@ snapshot file (6.9), and loads it at start. Start-up, in order:
   No crash state serves a byte that was not hashed in this run.
 
 **What the byte total can miss, and for how long.** The total is the in-memory index's,
-and the size limit is enforced against it. Two cases leave bytes on disk it does not yet
-count, and the adopt pass counts them as it reaches them; no case outlasts one pass
-(256 directories at one per second, plus the listing time: about 5 minutes, *unmeasured*
-at 1M entries):
+and the size limit is enforced against it. A snapshot is written right after load, every
+5 minutes, at a clean stop, and right after each adopt pass completes (6.9). One pass
+takes 256 directories at one per second plus the listing time: about 5 minutes,
+*unmeasured* at 1M entries. The bytes on disk that the total does not count are, at any
+moment, at most:
 
-- **After a crash:** the files inserted since the last snapshot was written, at most the
-  bytes filled in the 5-minute interval plus one snapshot write. Over budget by at most
-  that, until the pass ends.
-- **After a discarded snapshot:** the whole previous cache, up to 400 GB, starts
-  uncounted. While the pass runs, the disk holds the old cache plus new fills of keys it
-  does not hold (a fill for a key already on disk adopts the file and fetches nothing).
-  The worst case is therefore about twice the limit, for one pass. Once the pass has
-  adopted everything, LRU eviction brings the total under 400 GB. If the disk fills
-  first, fills fail with ENOSPC and leases write their own copies (below); none fails.
-  The free-space floor still reads `statvfs` throughout, but can evict only indexed
-  entries, so in that window it may report `cache_floor_unreachable`.
+- **Fills since the last snapshot that was written, across runs.** After one crash that
+  is at most 5 minutes of fills plus one snapshot write, counted when the next pass
+  ends. It is not bounded by one interval in two cases. In a **crash loop** where no run
+  lives through a whole pass, every run loads the same old snapshot and the unindexed
+  fills of all those runs add up until one run completes a pass. While **snapshot writes
+  fail** (ENOSPC), the window grows for as long as they fail; the in-memory total of the
+  running daemon stays right, and only a crash in that time widens what the next run
+  misses.
+- **Keys a pass skipped.** The pass skips a key whose slot a fill holds. A fill can end
+  without indexing the name it found or made (cancelled while re-hashing an unindexed
+  name, 6.4; an EEXIST that hands the lease a private copy, 6.9). Such a fill records the
+  key, and the next pass visits recorded keys first: those bytes are uncounted for at
+  most one pass interval (a day).
+- **After a discarded snapshot:** the whole previous cache, up to 400 GB, until the first
+  pass completes. While it runs, the disk holds the old cache plus new fills of keys it
+  does not hold (a fill for a key already on disk adopts the file and fetches nothing):
+  about twice the limit at worst.
+
+**The disk-size assumption.** `--cache-dir` shares a filesystem with `--scratch` (6.1), so
+a full disk fails a lease's own copy and its outputs too. The cache never fails a lease
+that would have run without it only if the filesystem holds **twice `--cache-max-bytes`
+plus the scratch headroom (`--cache-min-free-bytes`)**. On a smaller disk, leases can fail
+with ENOSPC during the window after a discarded snapshot or a crash loop; the farm's
+deploy config must meet it (*unmeasured* for the farm's nodes). To shorten that window,
+**free-space pressure speeds the pass**: while `statvfs` is below the floor and the floor
+cannot be reached by evicting indexed entries (`cache_floor_unreachable`), the pass drops
+its one-directory-per-second rate limit, so uncounted bytes become indexed, and so
+evictable, as fast as the disk can list them. Once the pass has adopted everything, LRU
+eviction brings the total under the limit.
 
 The other direction (counted bytes that are gone) runs the cache under its budget, and
 ENOENT or the pass corrects it.
@@ -675,8 +704,9 @@ re-adopted lease's links keep its inodes alive (`daemon.md` § Planned, re-adopt
 Free-space eviction `fstatat`s each candidate and skips `st_nlink > 1` (6.5).
 
 - **Disk full mid-fill.** The write to `tmp/` fails and the tmp file is removed. The lease
-  falls back to writing its own copy (today's path), and eviction is kicked. ENOSPC in
-  the cache never fails a lease that today's code would run. ENOSPC on a snapshot write
+  falls back to writing its own copy (today's path), and eviction is kicked. Given the
+  disk-size assumption above, ENOSPC in the cache never fails a lease that today's code
+  would run. ENOSPC on a snapshot write
   removes `index.snap.tmp`, keeps the previous snapshot, logs, and retries at the next
   interval.
 - **Cache unusable** (missing, read-only, unknown layout, locked, wrong graph driver,
@@ -691,13 +721,14 @@ takes its index with it. Only the daemon's snapshot thread writes it.
 
 **Format, our own code, pure Rust.** A 16-byte header: magic `KBFCIDX\0`, format version
 (u32, 1), 4 bytes reserved. Then the entry count (u64) and one 56-byte entry per cache
-entry, little-endian: flags (u8, bit 0 = executable), 7 reserved, SHA-256 (32), size
+entry, in key order, little-endian: flags (u8, bit 0 = executable), 7 reserved, SHA-256 (32), size
 (u64), last use in Unix seconds (u64). Then a CRC-32 (the `crc32fast` crate) over every
 byte before it. There is no per-entry checksum, no log, no generation and no compaction:
 the file is always written whole.
 
-**When it is written.** Every 5 minutes, and on a clean stop, from the in-memory LRU, on
-the snapshot thread. The lease path never does index I/O: a hit updates the entry's last
+**When it is written.** Right after load (6.8 step 3), every 5 minutes, right after each
+adopt pass completes, and on a clean stop, from the in-memory index, on the snapshot
+thread. The lease path never does index I/O: a hit updates the entry's last
 use in memory (from the daemon's clock, which tests replace with a fake one), and nothing
 else. The thread copies the entries under the index lock (no I/O under it; the hold is
 *unmeasured*, and C1 measures it at 1M entries), then, without the lock, writes
@@ -708,7 +739,7 @@ cleared at the next start. At 1M entries that is 56 MiB written per 5 minutes, a
 
 **Loading.** One sequential read. The snapshot is discarded, and the in-memory index
 starts empty with a warning, if the magic or version is unknown, if the length is not
-header + count x 56 + 4 bytes, if the CRC does not match, or if a key appears twice. A
+16 (header) + 8 (count) + count x 56 + 4 (CRC) bytes, if the CRC does not match, or if a key appears twice. A
 discarded snapshot never blocks start and never discards a file: the adopt pass and the
 fills take the files back. Loaded entries are unverified (6.8 step 5).
 
@@ -722,14 +753,15 @@ name**, so the index and the directory agree for that key whenever the slot is f
   `RENAME_NOREPLACE` it into `blobs/`. With the slot held, nothing in the daemon can
   create that name meanwhile, so an EEXIST means something outside the daemon did: the
   fill removes its tmp file, logs, and the lease gets a private copy.
-- **The evictor** (budget, free-space floor, the at-load drain, a failed stat check or
-  verify) takes the slot, re-checks that the key is still indexed and unpinned, removes
+- **The evictor** (budget, free-space floor, the at-load drain of 6.8 step 4, a failed
+  stat check or verify) takes the slot, re-checks that the key is still indexed and unpinned, removes
   it from the in-memory index, unlinks the name, and releases the slot. A key whose slot
   a fill holds is skipped for that round.
 - **The adopt pass** (below) takes the slot for each key it changes.
 
 **The adopt pass.** One background task, rate-limited to one `blobs/<h0h1>/` directory
-per second, one pass after start and then one a day. For each directory it lists the
+per second (lifted under free-space pressure, 6.8), one pass after start and then one a
+day; keys a fill recorded as left unindexed (6.8) are visited first. For each directory it lists the
 names and compares them with the index's entries for that prefix. Then, per key it would
 change, it takes the slot; if a fill holds it, it skips the key (the fill will index it);
 and with the slot held it **re-checks the index**, because the listing is already stale:
@@ -740,12 +772,14 @@ and with the slot held it **re-checks the index**, because the listing is alread
   The total grows by its size, and eviction applies to it like any other entry.
 - **An entry with no listed file:** `fstatat` the name; only if it returns ENOENT is the
   entry dropped. A file renamed in after the listing is kept.
-- A name that does not parse as a key is left alone, logged and counted
-  (`cache_foreign_files`). The pass unlinks nothing.
+- A name that does not parse as a key, or a file that is not regular, is left alone,
+  logged and counted (`cache_foreign_files`); its bytes are never in the total. The pass
+  unlinks nothing.
 
 It holds no mutex across a system call; a fill that wants a key the pass holds waits for
 one `fstatat`. It never waits on a lease. Counted in `cache_adopted_entries`,
-`cache_dropped_entries` and `cache_index_drift_bytes`.
+`cache_dropped_entries` and `cache_index_drift_bytes` (the bytes the last completed pass
+added plus the bytes it dropped).
 
 **Rejected for the index:**
 
@@ -816,7 +850,7 @@ noise once the cache exists. So placement changes **last**, and only if metrics 
 | **T1, the transfer engine** | `kbf-transfer` core and REAPI backend; one gRPC HTTP/2 connection with many streams; one in-flight limit and byte budget for the process; ByteStream reads (memory and streamed-to-file, resumable) and chunked writes; FindMissing with an UNIMPLEMENTED fallback; window and decode limits; `TransferStats` through the invocations API; the flags of 4.5. Removes stage A's per-call constants. Tests C-11, T-1, T-2, T-3. | A |
 | **S1, server** | `WorkerCas` on the worker listener: FindMissing, BatchRead, BatchUpdate, GetTree, each admitted exactly as `WorkerBlobs::admit` admits ByteStream (one admission rule). `batch_read_blobs` reads a batch's blobs concurrently (bounded, e.g. 32) and coalesces adjacent records in one segment into one range GET. Helps buck2's own batch reads with no client change. Test C-15. | nothing; in parallel with T1 |
 | **P, plain text** | Lifts the three plain-text refusals of 4.7 | nothing |
-| **C1, the first cache** (folds in komira-build-farm#527) | Container driver only, persistent from the start. `kbf-daemon::cache`: layout; the exclusive lock, taken before any startup cleanup, on a file never unlinked; `tmp/` cleared at start; fills hashed into `tmp/` and inserted with `RENAME_NOREPLACE`; the index (6.9: one snapshot file written every 5 minutes and at a clean stop, discarded if corrupt) loaded at start with the limit enforced in memory, so the cache serves at once (6.8); the fill-map slot taken by fills, the evictor and the adopt pass; the rate-limited adopt pass, which deletes nothing; lazy re-hash on first use after start; the stat check; one fill per key; LRU by bytes; pins; the ENOENT retry; empty files created directly; link-limit copy; one inode per key per lease; the free-space floor that skips `nlink > 1`. `chown-dirs`. `prepare_outputs` copies instead of renaming. The ETXTBSY retry. Flags `--cache-dir`, `--cache-max-bytes`, `--cache-min-free-bytes`, `--cache-link-concurrency`. Tests C-1, C-2, C-4, C-7 to C-10, C-12, C-13, C-16 to C-20, R-1 to R-9. | T1 planned first; correct without A or T1 (see below) |
+| **C1, the first cache** (folds in komira-build-farm#527) | Container driver only, persistent from the start. `kbf-daemon::cache`: layout; the exclusive lock, taken before any startup cleanup, on a file never unlinked; `tmp/` cleared at start; fills hashed into `tmp/` and inserted with `RENAME_NOREPLACE`; the index (6.9: one snapshot file written after load, every 5 minutes, after each adopt pass and at a clean stop, discarded if malformed) loaded at start, so the cache serves at once while the evictor drains to the limit (6.8); the fill-map slot taken by fills, the evictor and the adopt pass; the rate-limited adopt pass, which deletes nothing and speeds up under free-space pressure; lazy re-hash on first use after start; the stat check; one fill per key; LRU by bytes; pins; the ENOENT retry; empty files created directly; link-limit copy; one inode per key per lease; the free-space floor that skips `nlink > 1`. `chown-dirs`. `prepare_outputs` copies instead of renaming. The ETXTBSY retry. Flags `--cache-dir`, `--cache-max-bytes`, `--cache-min-free-bytes`, `--cache-link-concurrency`. Tests C-1, C-2, C-4, C-7 to C-10, C-12, C-13, C-16 to C-20, R-1 to R-9. | T1 planned first; correct without A or T1 (see below) |
 | **T2, batching (fix 3)** | `read_many` and `upload_missing` batch small blobs (4.3); per-blob status; the limit from GetCapabilities. Test C-14. | T1, S1 deployed |
 | **C3, cache metrics** | `InputStats` and per-node cache metrics through the APIs (section 7) | C1, T1 |
 | **C2, macOS** | `clonefile`; the sandbox check. Tests C-3, C-3b; Spotlight and backup exclusion; link-concurrency measurement | C1 |
@@ -890,14 +924,21 @@ serve FindMissing and Batch today), or a counting fake CAS.
 | R-1 | (#527) A fill is killed between its last write and the rename (fault hook), and the daemon is restarted. No entry exists under the final name, `tmp/` is empty, and the next lease fetches the blob and gets the right bytes. | A partial file under a final name; `tmp/` not cleared | Fill straight into `blobs/`; skip the `tmp/` clear |
 | R-2 | (#527) Two daemon runs on one `--cache-dir` with a counting CAS: run 1 fills the zig-shaped tree; after a clean stop and restart, with the adopt pass paused by a test hook, the **first** lease for the same tree reads 0 blob bytes from the counting CAS, every file is a hit from the loaded index (C1's test counter of fills is 0; a fill that adopts an existing name would also fetch nothing, so bytes alone cannot tell), and each entry it uses is re-hashed exactly once (the verify counter equals `files - empty_files`; `InputStats` reaches the API only in C3). | A cache that does not survive a restart, a snapshot that is not written at a clean stop, or one that serves only after a scan | Wipe `v1/` at start; skip the snapshot at a clean stop; ignore the snapshot and start empty |
 | R-3 | (#527) While the daemon is stopped, one entry has a byte flipped (same size, mode and mtime restored). After restart its first use re-hashes, evicts and refetches it; `cache_verify_failures == 1`; the lease gets the right bytes. | Serving an entry altered while stopped | Mark every entry verified at index load |
-| R-4 | (#527) Run 1, with a fake clock, inserts keys K1..K6 and then uses them in the order K3, K1, K5, K2, K6, K4, one fake minute apart; a clean stop writes the snapshot. Run 2 starts with `--cache-max-bytes` lowered to hold three entries. Before the first lease the in-memory total is at or under the limit and the entries removed are exactly K3, K1, K5 (the least recently used in run 1's real order, not in insert order); a lease that arrives at once is served from the cache; after the evictor drains, the on-disk sum equals the total. | The limit enforced only on insert; recency lost across a restart | Skip the at-load eviction; write insert time instead of last use into the snapshot; update last use only in the snapshot thread |
+| R-4 | (#527) Run 1, with a fake clock, inserts keys K1..K6 and then uses them in the order K3, K1, K5, K2, K6, K4, one fake minute apart; a clean stop writes the snapshot. Run 2 starts with `--cache-max-bytes` lowered to hold three entries. With no lease, the drain removes exactly K3, K1, K5 (the least recently used in run 1's real order, not in insert order), and the loaded last-use values equal run 1's; then the total is at or under the limit and equals the on-disk sum. Run 2b repeats run 2 with the drain held by a test hook inside K1's slot (after the in-memory remove, before the unlink), K3 already drained and K5 not yet reached, while one lease needs K3, K1 and K5: K3 is a miss and is refetched; K1's fill waits on the slot, re-checks the index and refetches; K5 is a hit. After the hook is released, every indexed key's file exists, each key is indexed once, and the total equals the on-disk sum. | The limit enforced only on insert; recency lost across a restart; a drain that removes keys from the in-memory index outside their slots (then a fill adopts a file the drain unlinks) | Skip the at-load eviction; write insert time instead of last use into the snapshot; update last use only in the snapshot thread; remove every drained key from the in-memory index first, then unlink each under its slot |
 | R-5 | Crash between snapshot writes: run 1 fills set A, a test hook writes a snapshot, run 1 fills set B, and the daemon is killed (SIGKILL) before the next snapshot. One B file has a byte flipped (same size and mode). Run 2, with the adopt pass paused: a lease needing a good B key reads 0 bytes from the counting CAS and the verify counter rises by one for it (adopted after re-hash); a lease needing the flipped key re-hashes it, fetches it once and gets the right bytes. The pass is then resumed: every other B file is adopted unverified, its first use re-hashes it, no B file was unlinked (inode set unchanged), and the total equals the on-disk sum. | An unindexed file served without a re-hash; files inserted since the snapshot deleted or never counted | Adopt as verified; on EEXIST or an existing name, link it without hashing; make the pass unlink unknown files; adopt without adding the size |
-| R-6 | Corrupt snapshot: one byte of one entry's last use is flipped (no per-entry checksum exists, so only the whole-file CRC can catch it); in another run the version is 2. The daemon starts without waiting, warns `cache_index_discarded=corrupt` or `version`, and starts with a total of 0. With the pass paused, a lease's keys are adopted by their fills (0 bytes fetched). After one pass every file is indexed, nothing was unlinked, and the total equals the on-disk sum; with `--cache-max-bytes` below that sum, LRU eviction then brings it under the limit. | Trusting a snapshot that fails its CRC; a bad snapshot blocking start, disabling the cache, or costing the bytes on disk | Skip the CRC check; refuse to start on a bad snapshot; disable the cache when it is discarded; make the pass unlink unknown files |
-| R-7 | Truncated snapshot: the file is cut inside the header, inside an entry, just before the CRC, and (another run) has one extra byte appended. Each run discards it with `cache_index_discarded=corrupt`, starts without a panic, and the pass adopts every file. | A short or padded file read as entries, or a short read that crashes start | Read entries until EOF without the length check; unwrap the short read |
+| R-6 | Corrupt snapshot: one byte of one entry's last use is flipped (no per-entry checksum exists, so only the whole-file CRC can catch it); in another run the version is 2, with the CRC recomputed so the version check is what refuses it. The daemon starts without waiting, warns `cache_index_discarded=corrupt` or `version`, and starts with a total of 0. With the pass paused, a lease's keys are adopted by their fills (0 bytes fetched). After one pass every file is indexed, nothing was unlinked, and the total equals the on-disk sum; with `--cache-max-bytes` below that sum, LRU eviction then brings it under the limit. | Trusting a snapshot that fails its CRC; a bad snapshot blocking start, disabling the cache, or costing the bytes on disk | Skip the CRC check; refuse to start on a bad snapshot; disable the cache when it is discarded; make the pass unlink unknown files |
+| R-7 | Malformed snapshot: (a) the file is cut inside the header (another run: inside an entry, just before the CRC; another: one extra byte appended); (b) a forged file with a valid, recomputed CRC whose count says one more entry than its length holds; (c) a forged file with a valid, recomputed CRC that lists one key twice. Each run discards it with `cache_index_discarded=corrupt`, starts without a panic and with a total of 0, and the pass adopts every file once. (b) and (c) pass the CRC, so only the length and duplicate checks can refuse them. | A short or padded file read as entries; a short read that crashes start; a duplicate key counted twice | Read entries until EOF without the length check; unwrap the short read; skip the duplicate-key check |
 | R-8 | While the daemon is stopped, two indexed blob files are deleted. After restart, a lease needing one gets ENOENT on link, refetches and succeeds with no lease error; one pass drops the other entry, and the total equals the on-disk sum. | An index-listed missing file failing a lease; drift never corrected | Map ENOENT at link to a lease error; make the pass only adopt |
-| R-9 | Races on the slot, each held open by a test hook. (a) The evictor is held between the in-memory remove and the unlink of K while a lease needs K: the fill waits on the slot, then fetches and inserts, and afterwards K's file exists and is indexed once. (b) The pass lists a directory, then a fill renames and indexes K in it, then the pass compares: K is kept. (c) A fill is held between its rename and its in-memory insert while the pass reaches K: the pass skips K, and K is counted once. In each, the total equals the on-disk sum. | An index entry with no file (evictor without the slot); an entry dropped on a stale listing; a file counted twice | Evict without the slot; drop an entry without the `fstatat`; adopt without re-checking the index under the slot |
+| R-9 | Races on the slot, each held open by a test hook. (a) The evictor is held between the in-memory remove and the unlink of K while a lease needs K: the fill waits on the slot, then fetches and inserts, and afterwards K's file exists and is indexed once. (b) The pass lists a directory, then a fill renames and indexes K in it, then the pass compares: K is kept. (c) The pass lists K's directory and compares (K is not indexed), and a hook holds it between that compare and its slot take; a fill for K then renames, indexes K and releases the slot; the hook is released and the pass takes the slot: it re-checks, finds K indexed and leaves it, and K is counted once. In each, the total equals the on-disk sum. | An index entry with no file (evictor without the slot); an entry dropped on a stale listing; a file counted twice | Evict without the slot; drop an entry without the `fstatat`; adopt without re-checking the index under the slot |
 
 Wall-clock speedups are reported, never asserted.
+
+**Implementation notes for C1** (review findings left to the code, one line each):
+
+- The slot records its holder's kind (fill, evictor, pass); a waiter on a non-fill holder re-checks the index and starts its own fill, and the pass skips only a fill holder.
+- Concurrent first uses of one unverified entry share one re-hash, merged per key like a fill.
+- macOS (C2): `clonefile` does not change the source's ctime, so the pass's last use there is the insert time; on Linux removing a lease directory also bumps ctime. Both cost LRU order only.
+- Add tests for a daemon killed mid-snapshot-write (mutant: write `index.snap` in place), for ENOSPC on a snapshot write (the previous snapshot is kept), and for an outside creator between a fill's `fstatat` and its rename (the EEXIST half of R-5's mutant).
 
 ---
 
@@ -919,7 +960,7 @@ Wall-clock speedups are reported, never asserted.
 | **Owner = subordinate id 1 for cache files** | `fs.protected_hardlinks` stops the daemon linking files it does not own. |
 | **A pool of connections to kbf-server** | One HTTP/2 connection carries many streams (4.2); a pool can be added later if a measurement ever shows the one connection is the limit. |
 | **Wipe the cache at start** (Buildbarn's hard-link cache) | Daemons restart on every deploy, so every node would go cold each time. `tmp/` plus a rename, the index and lazy verify make keeping it safe (6.8). |
-| **A startup scan of `blobs/`** (rebuild the LRU and total from the files, with the cache off until it ends) | Every restart would run uncached, or cold, for as long as listing 400 GB takes. CEO decision (2026-10-13): no startup scan; an index loaded at start (6.9). The background adopt pass that corrects the index never gates a lease. |
+| **A startup scan of `blobs/`** (rebuild the LRU and total from the files, with the cache off until it ends) | Every restart would run uncached, or cold, for as long as listing 400 GB takes. CEO decision (2026-10-13): no blocking startup scan; a background adopt pass is allowed; an index loaded at start (6.9). The adopt pass never gates a lease. |
 | **An append log over the snapshot** (revision 4) | A fresh or discarded index stayed cold until the first compaction; a short write mid-log lost every later record, and a dropped batch could double-count; the unindexed-file bound was false, and a deleting sweep made a lost index 400 GB to refetch (6.9). Adopting files makes one whole-file snapshot enough. |
 | **Deleting files the index does not list** | A lost snapshot would turn the whole cache into deletes and refetches, and a deleting pass races fills. The adopt pass adds them instead (6.9). |
 | **An embedded store for the index** (redb, SQLite, sled) | 6.9: a second recovery procedure to trust, repair on open after a crash; SQLite is not Rust. |
