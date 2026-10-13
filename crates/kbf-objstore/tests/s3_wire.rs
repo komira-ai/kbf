@@ -16,7 +16,8 @@ use tokio::net::TcpListener;
 /// Serves `responses` in order, one per connection, and records each request head.
 async fn script(responses: Vec<String>) -> (String, Arc<Mutex<Vec<String>>>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let addr = listener.local_addr().unwrap().to_string();
+    let endpoint = format!("http://{addr}");
     let seen = Arc::new(Mutex::new(Vec::new()));
     let log = Arc::clone(&seen);
     tokio::spawn(async move {
@@ -377,11 +378,14 @@ async fn wait_answering_gives_up_at_its_deadline() {
 /// Catches a request timeout reported without its cause: a PUT to a store that takes
 /// the connection and never reads the body or answers must fail at the request timeout
 /// with an error whose text says it timed out, so the failure a lease reports tells a
-/// slow store from a reset one ("request to the store failed" alone did not).
+/// slow store from a reset one ("request to the store failed" alone did not). Also
+/// catches the request URL in that text: it reaches REAPI clients, and must not name the
+/// store's address, bucket or key.
 #[tokio::test]
 async fn a_put_the_store_never_answers_fails_saying_it_timed_out() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let addr = listener.local_addr().unwrap().to_string();
+    let endpoint = format!("http://{addr}");
     // Holds each connection open, unread, until the test ends.
     let held = tokio::spawn(async move {
         let mut held = Vec::new();
@@ -412,4 +416,7 @@ async fn a_put_the_store_never_answers_fails_saying_it_timed_out() {
         text.starts_with("request to the store failed: ") && text.contains("timed out"),
         "{text}"
     );
+    for private in [addr.as_str(), "kbf-test", "cas/seg-1", "url"] {
+        assert!(!text.contains(private), "{private:?} in {text}");
+    }
 }

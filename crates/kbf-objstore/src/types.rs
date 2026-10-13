@@ -343,6 +343,25 @@ mod tests {
         assert!(std::error::Error::source(&err).is_none(), "said once");
     }
 
+    /// Catches a cause chain cut short: a connection reset sits three levels below the
+    /// transport error (reqwest, hyper, then the I/O error), so a text that prints only
+    /// the first cause or two loses "connection reset".
+    #[test]
+    fn a_transport_failure_says_its_deepest_cause() {
+        #[derive(Debug, thiserror::Error)]
+        #[error("error sending request")]
+        struct Outer(#[source] Middle);
+        #[derive(Debug, thiserror::Error)]
+        #[error("client error")]
+        struct Middle(#[source] std::io::Error);
+        let reset = std::io::Error::new(std::io::ErrorKind::ConnectionReset, "connection reset");
+        let err = ObjectStoreError::Transport(Box::new(Outer(Middle(reset))));
+        assert_eq!(
+            err.to_string(),
+            "request to the store failed: error sending request: client error: connection reset"
+        );
+    }
+
     /// Catches: a zero-length or overflowing range, or an off-by-one in the inclusive
     /// end that an HTTP `Range` header carries.
     #[test]
