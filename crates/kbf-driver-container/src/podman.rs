@@ -164,10 +164,7 @@ pub(crate) fn create_args(spec: &ContainerSpec) -> Vec<OsString> {
     }
     let mut volume = OsString::from("--volume=");
     volume.push(&spec.input_root);
-    volume.push(format!(":{EXEC_ROOT}:O,upperdir="));
-    volume.push(&spec.upper);
-    volume.push(",workdir=");
-    volume.push(&spec.overlay_work);
+    volume.push(format!(":{EXEC_ROOT}"));
     args.push(volume);
     args.push(spec.image.clone().into());
     args

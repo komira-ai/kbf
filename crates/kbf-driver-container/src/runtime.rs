@@ -537,7 +537,8 @@ impl<C: Cas> PodmanRuntime<C> {
     ) -> Result<(), RuntimeError> {
         let given = match &self.config.cache {
             Some(cache) => {
-                let dirs = self.podman.chown_dirs(&cache.helper, owner, root).await;
+                let _ = &cache.helper;
+                let dirs = self.podman.chown(owner, &[root]).await;
                 match dirs {
                     Ok(()) => self.podman.chown(owner, &[upper, work]).await,
                     Err(e) => Err(e),
