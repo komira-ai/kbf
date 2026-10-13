@@ -111,7 +111,8 @@ async fn a_find_missing_that_fails_leaves_the_blob_to_be_uploaded() {
 
 /// Catches a write refused with UNAVAILABLE failing at once (a blob in memory can be
 /// sent again: it is, after a backoff, and counted in `retries`), and a streamed write
-/// retried (its chunks were read once: it fails).
+/// retried (its chunks were read once: it fails). `written_blobs` counts the blob the
+/// retry stored once, not once per attempt, and not the refused streamed write.
 #[tokio::test]
 async fn a_write_in_memory_is_retried_and_a_streamed_one_is_not() {
     let fake = Arc::new(Fake::default());
@@ -120,7 +121,10 @@ async fn a_write_in_memory_is_retried_and_a_streamed_one_is_not() {
     fake.fail_writes.store(1, Ordering::SeqCst);
     assert_eq!(scope.put(b"again".to_vec()).await, Ok(digest_of(b"again")));
     let stats = scope.stats();
-    assert_eq!((stats.write_calls, stats.retries), (2, 1));
+    assert_eq!(
+        (stats.write_calls, stats.retries, stats.written_blobs),
+        (2, 1, 1)
+    );
     fake.fail_writes.store(1, Ordering::SeqCst);
     let (_, digest, chunks) = chunked(3000, 1000);
     let error = scope
@@ -132,7 +136,10 @@ async fn a_write_in_memory_is_retried_and_a_streamed_one_is_not() {
         "{error:?}"
     );
     let stats = scope.stats();
-    assert_eq!((stats.write_calls, stats.retries), (3, 1));
+    assert_eq!(
+        (stats.write_calls, stats.retries, stats.written_blobs),
+        (3, 1, 1)
+    );
     // A chunk that cannot be read ends the streamed write.
     let error = scope
         .put_chunks(digest_of(b"abcdef"), failing(b"abc"))
@@ -141,6 +148,44 @@ async fn a_write_in_memory_is_retried_and_a_streamed_one_is_not() {
     assert!(
         matches!(&error, CasError::Read(_, why) if why == "disk gone"),
         "{error:?}"
+    );
+}
+
+/// Catches `written_blobs` left uncounted for a streamed write that stored a new blob
+/// (the native driver uploads outputs this way), and counted for a write before it is
+/// sent (a write refused on every attempt stores nothing). Mutants seen red: no
+/// `written_blobs` add on `put_chunks`' success, `(1, 0, 3000)`; `put`'s add moved before
+/// the write, counting every attempt, `2` for the refused blob.
+#[tokio::test]
+async fn written_blobs_counts_blobs_the_server_stored() {
+    let fake = Arc::new(Fake::default());
+    let config = TransferConfig {
+        retries: 1,
+        ..TransferConfig::default()
+    };
+    let engine = engine(fake.serve().await, config);
+    let streamed = engine.scope(&LeaseId::new(7, 1));
+    let (_, digest, chunks) = chunked(3000, 1000);
+    assert_eq!(
+        streamed.put_chunks(digest.clone(), chunks).await,
+        Ok(digest)
+    );
+    let stats = streamed.stats();
+    assert_eq!(
+        (stats.write_calls, stats.written_blobs, stats.written_bytes),
+        (1, 1, 3000)
+    );
+    let refused = engine.scope(&LeaseId::new(7, 2));
+    fake.fail_writes.store(2, Ordering::SeqCst);
+    let error = refused
+        .put(b"never".to_vec())
+        .await
+        .expect_err("refused on every attempt");
+    assert!(matches!(&error, CasError::Unavailable(..)), "{error:?}");
+    let stats = refused.stats();
+    assert_eq!(
+        (stats.write_calls, stats.retries, stats.written_blobs),
+        (2, 1, 0)
     );
 }
 
