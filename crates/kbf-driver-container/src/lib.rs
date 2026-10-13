@@ -42,7 +42,11 @@
 //!   start, [`PodmanRuntime::new`] removes every container so labelled and every lease
 //!   scratch directory, each with its lease cgroup, before the daemon says `Hello`;
 //! - a keeper per lease (`keeper`), which kills the lease cgroup (`cgroup.kill`) when
-//!   the daemon dies, so a killed daemon's container stops at once, restarted or not.
+//!   the daemon dies, so a killed daemon's container stops at once, restarted or not;
+//! - with the node's input cache ([`CacheUse`]), input files that are hard links to
+//!   read-only cache entries the container cannot write (`docs/design/worker-cache.md`
+//!   section 5.1): the input root's directories alone are given to the container's root
+//!   ([`chown_dirs`]), and an input an output names is a private copy.
 //!
 //! Modules:
 //! - [`image`]: the `container-image` property;
@@ -61,6 +65,7 @@
 
 pub mod cas;
 mod cgroup;
+pub mod chown_dirs;
 pub mod delegate;
 pub mod image;
 mod keeper;
@@ -82,5 +87,5 @@ pub use delegate::{DelegateError, Delegation, adopt, capacity, delegate};
 pub use image::{ImageCheckError, ImageError, ImageRef};
 pub use outputs::OutputLimits;
 pub use podman::{ContainerLimits, EXEC_ROOT, OWNER_LABEL};
-pub use runtime::{ConfigError, DRIVER, KIND, PodmanConfig, PodmanRuntime, StartError};
+pub use runtime::{CacheUse, ConfigError, DRIVER, KIND, PodmanConfig, PodmanRuntime, StartError};
 pub use subids::{IdFiles, SubidError, check_daemon_user, check_subordinate_ids};

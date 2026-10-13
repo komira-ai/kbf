@@ -183,6 +183,57 @@ $ podman --cgroup-manager=cgroupfs unshare rm -rf -- <dir>/gone
 exit 0
 stdout ""
 stderr ""
+$ podman --cgroup-manager=cgroupfs info --format={{.Store.GraphDriverName}} {{json .Store.GraphOptions}}
+exit 0
+stdout "overlay {}\n"
+stderr ""
+$ podman --cgroup-manager=cgroupfs info --format={{json .Store.GraphOptions}}
+exit 0
+stdout "vfs {}\n"
+stderr ""
+$ podman --cgroup-manager=cgroupfs unshare /helper __chown-dirs 1:1 /lease/root
+exit 0
+stdout ""
+stderr ""
+$ podman --cgroup-manager=cgroupfs unshare /helper __chown-dirs 0:0 /lease/root
+exit 1
+stdout ""
+stderr "Error: chown-dirs refused\n"
+$ podman --cgroup-manager=cgroupfs start --attach kbf-lease-1-1
+exit 126
+stdout ""
+stderr "Error: unable to start container: crun: exec container process `/kbf/root/tool`: Text file busy: OCI runtime error\n"
+files after this call
+d 0755 cgroup
+d 0755 cgroup/actions
+d 0755 cgroup/actions/kbf-lease-1-1
+d 0755 lease
+d 0755 lease/root
+d 0755 lease/stdout
+d 0751 lease/upper
+d 0755 lease/upper/sub
+d 0755 state
+f 0644 state/action.sh "echo \"CG=$CG ROOT=$ROOT UPPER=$UPPER FAKE_LEASE=$FAKE_LEASE\"\nread -r -a stat < /proc/$$/stat\necho \"leads group $(( stat[4] == $$ )) session $(( stat[5] == $$ ))\"\necho err >&2\nexit 3"
+f 0644 state/calls "frobnicate\ninfo\ninfo\nimage\nimage\ncreate\ncreate\ncreate\nps\nps\nps\nps\ninspect\nkill\nstart\ninspect\ninspect\nkill\nunshare chown\nstart\nunshare chown\nunshare chown\nunshare chown\nrm\nrm\nunshare rm\nunshare rm\nunshare rm\ninfo\ninfo\nunshare /helper\nunshare /helper\nstart\n"
+f 0644 state/cgroup "/actions/kbf-lease-1-1\n"
+f 0644 state/create.args "--pull=never\n--name=kbf-lease-1-1\n--label=kbf.owner=node-1\n--cgroup-parent=/actions/kbf-lease-1-1\n--volume=<dir>/lease/root:/w:O,upperdir=<dir>/lease/upper,workdir=<dir>/lease/work\ndocker://registry.test/busybox\n"
+f 0644 state/events "start ended\nchown 1:1 <dir>/lease/upper /b\nstart ended\nchown 0:0 <dir>/lease/upper\nchown 1:1 \nrm\nchown-dirs 1:1 /lease/root\nchown-dirs 0:0 /lease/root\nstart ended\n"
+f 0644 state/graph "vfs {}\n"
+f 0644 state/inspect-fails ""
+f 0644 state/kill-fails ""
+f 0644 state/killed-before-rm ""
+f 0644 state/nonce "n:"
+f 0644 state/owner "0:0\n"
+f 0644 state/owner-label "node-1\n"
+f 0644 state/ps-extra "node-1 other\n"
+f 0644 state/ps-fails ""
+f 0644 state/ps.args "--all\n--filter=label=kbf.owner=node-1\n--format=x\n"
+f 0644 state/removed ""
+f 0644 state/root "<dir>/lease/root\n"
+f 0644 state/start-pid "<a pid>"
+f 0644 state/status "created 0\n"
+f 0644 state/status-override "stopped 0\n"
+f 0644 state/upper "<dir>/lease/upper\n"
 $ podman --cgroup-manager=cgroupfs create --pull=never --name=kbf-lease-1-1 --label=kbf.owner=node-1 --cgroup-parent=/actions/kbf-lease-1-1 --volume=<dir>/lease/root:/w:O,upperdir=<dir>/lease/upper,workdir=<dir>/lease/work docker://registry.test/busybox
 exit 0
 stdout "0123456789ab\n"
@@ -198,12 +249,11 @@ d 0751 lease/upper
 d 0755 lease/upper/sub
 d 0755 state
 f 0644 state/action.sh "echo \"CG=$CG ROOT=$ROOT UPPER=$UPPER FAKE_LEASE=$FAKE_LEASE\"\nread -r -a stat < /proc/$$/stat\necho \"leads group $(( stat[4] == $$ )) session $(( stat[5] == $$ ))\"\necho err >&2\nexit 3"
-f 0644 state/calls "frobnicate\ninfo\ninfo\nimage\nimage\ncreate\ncreate\ncreate\nps\nps\nps\nps\ninspect\nkill\nstart\ninspect\ninspect\nkill\nunshare chown\nstart\nunshare chown\nunshare chown\nunshare chown\nrm\nrm\nunshare rm\nunshare rm\nunshare rm\ncreate\n"
+f 0644 state/calls "frobnicate\ninfo\ninfo\nimage\nimage\ncreate\ncreate\ncreate\nps\nps\nps\nps\ninspect\nkill\nstart\ninspect\ninspect\nkill\nunshare chown\nstart\nunshare chown\nunshare chown\nunshare chown\nrm\nrm\nunshare rm\nunshare rm\nunshare rm\ninfo\ninfo\nunshare /helper\nunshare /helper\nstart\ncreate\n"
 f 0644 state/cgroup "/actions/kbf-lease-1-1\n"
-f 0644 state/chown-fails "1:1"
 f 0644 state/create.args "--pull=never\n--name=kbf-lease-1-1\n--label=kbf.owner=node-1\n--cgroup-parent=/actions/kbf-lease-1-1\n--volume=<dir>/lease/root:/w:O,upperdir=<dir>/lease/upper,workdir=<dir>/lease/work\ndocker://registry.test/busybox\n"
-f 0644 state/events "start ended\nchown 1:1 <dir>/lease/upper /b\nstart ended\nchown 0:0 <dir>/lease/upper\nchown 1:1 \nrm\n"
-f 0644 state/info-fails ""
+f 0644 state/events "start ended\nchown 1:1 <dir>/lease/upper /b\nstart ended\nchown 0:0 <dir>/lease/upper\nchown 1:1 \nrm\nchown-dirs 1:1 /lease/root\nchown-dirs 0:0 /lease/root\nstart ended\n"
+f 0644 state/graph "vfs {}\n"
 f 0644 state/inspect-fails ""
 f 0644 state/kill-fails ""
 f 0644 state/killed-before-rm ""
@@ -217,7 +267,7 @@ f 0644 state/ps.args "--all\n--filter=label=kbf.owner=node-1\n--format=x\n"
 f 0644 state/removed ""
 f 0644 state/root "<dir>/lease/root\n"
 f 0644 state/start-pid "<a pid>"
-f 0644 state/status "stopped 0\n"
+f 0644 state/status "created 0\n"
 f 0644 state/status-override "stopped 0\n"
 f 0644 state/upper "<dir>/lease/upper\n"
 f 0644 state/vanish-after-create ""

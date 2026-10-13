@@ -98,6 +98,18 @@ pub(crate) async fn said(stderr: &Path) -> std::io::Result<String> {
     Ok(String::from_utf8_lossy(&bytes).trim().to_owned())
 }
 
+/// Whether `podman start`'s report in `stderr` is crun's exec of the program failing
+/// with `ETXTBSY` (`exec container process `<program>`: Text file busy`): a file
+/// still open for writing somewhere when it was executed. With the input cache that
+/// can be a fill's descriptor a forked child held for a moment
+/// (`docs/design/worker-cache.md#64-concurrency-and-fills`), so the driver starts the
+/// container once more. A report that cannot be read is not one.
+pub(crate) async fn text_file_busy(stderr: &Path) -> bool {
+    said(stderr)
+        .await
+        .is_ok_and(|said| said.contains("Text file busy"))
+}
+
 /// A container `podman start` did not run to an exit (Podman's `state` for it): the
 /// action's exit 127 or 126 when crun reports it cannot find or execute the program,
 /// with kbf's message and Podman's words as its stderr; otherwise the farm's failure,

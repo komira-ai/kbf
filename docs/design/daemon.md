@@ -402,6 +402,15 @@ in order, and the daemon's own uid and gid map to nothing.
   output, it gives them back to id 0 there, the daemon's user, so an output the action
   made `0600` (or a `0700` directory) is read as its owner. `-h` changes a symlink
   itself and `-R` traverses none, so a link the action left hands nothing over.
+- **With the input cache** (`--cache-dir`, [worker-cache.md](worker-cache.md) section
+  5.1), the input root's files are hard links to read-only cache entries the daemon's
+  user owns, which the container's root must never own. The driver then gives the
+  input root's directories alone to id 1 (and back), with the daemon binary's own
+  `__chown-dirs` mode run under `podman unshare`, and `chown -hR` covers only the upper
+  and work directories. An input an output names is a private copy, never a link. An
+  action that opens a cached input for writing in place gets `EACCES`, and one that
+  renames or hard-links one gets `EOVERFLOW` (overlayfs will not copy up a file whose
+  owner the container does not map).
 - **The hand-back is not under the action's timeout.** It runs after the container has
   exited, outside the timeout and outside `kill`, and walks the whole upper tree, which
   the action controls. An action that leaves millions of files makes it as slow as the
@@ -576,7 +585,8 @@ runtime reports usage; the container driver does not yet.
 - **Prefetch and a local cache:** inputs fetched as soon as a lease is offered, and a hot
   set of toolchains and images kept on the node and reported to placement. The cache
   (a per-node NVMe file cache linked or cloned into each lease) and the shared blob
-  transfer engine it fills through are designed in [worker-cache.md](worker-cache.md).
+  transfer engine it fills through are designed in [worker-cache.md](worker-cache.md);
+  its first stage, the container driver's cache (`kbf_daemon::cache`), is built.
 - **Networked actions,** which get egress, are never cached and always self-fence.
 - **Service containers** for tests that need several containers, declared up front so
   the result stays cacheable.
