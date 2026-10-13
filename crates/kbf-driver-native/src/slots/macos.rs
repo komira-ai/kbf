@@ -257,12 +257,19 @@ impl UidWatch {
     /// Processes of the uid survived, or the leader could not be reaped.
     pub async fn end(&mut self, child: &mut Child, wait: Duration) -> Result<(), RuntimeError> {
         let uid = self.uid;
-        let leader = child.id().and_then(|p| i32::try_from(p).ok()).unwrap_or(0);
-        // MUTANT: kill by process group.
-        // SAFETY: kill(2) with plain integers.
+        // MUTANT: kill by process group: the leader's, from the run record (the
+        // child's pid is gone once it has been waited for, and kill(0) would end the
+        // daemon's own group).
+        let leader: i32 = std::fs::read_to_string(&self.record)
+            .ok()
+            .and_then(|t| t.split(' ').next()?.parse().ok())
+            .unwrap_or(-1);
         let ended = tokio::task::spawn_blocking(move || {
             let _ = (uid, wait);
-            unsafe { libc::kill(-leader, libc::SIGKILL) };
+            if leader > 1 {
+                // SAFETY: kill(2) with plain integers.
+                unsafe { libc::kill(-leader, libc::SIGKILL) };
+            }
             Ok::<(), uid::EndError>(())
         })
         .await;
