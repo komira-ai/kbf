@@ -13,7 +13,11 @@
 //!
 //! A `Cancel` (the server no longer holds the lease here) kills a running lease
 //! without waiting: the lease stays running, and listed, until its run has stopped,
-//! and then reports its outcome (ABORTED, killed) like any other run.
+//! and then reports its outcome (ABORTED, killed) like any other run. A fence kills
+//! every running lease the same way, without waiting: a run whose kill takes long (one
+//! in the middle of a slow output upload sees it only when the upload ends) must not
+//! hold up the daemon's heartbeats or its next stream. A fenced lease reports, once
+//! its run has stopped, as lost to the farm, whatever the run's own outcome.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -25,7 +29,6 @@ use kbf_proto::worker::{self, Lost, MemoryKill, Start};
 use kbf_types::{LeaseId, LostWhy, Resources};
 use prost::Message;
 use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
 
 use crate::runtime::{RuntimeError, Work};
 use crate::runtimes::{AnyRuntime, Runtimes};
@@ -39,12 +42,13 @@ pub(crate) struct Leases {
     running: BTreeMap<LeaseId, Running>,
     /// Running leases being killed on the server's `Cancel`.
     cancelled: BTreeSet<LeaseId>,
+    /// Running leases being killed by a fence.
+    fenced: BTreeSet<LeaseId>,
     done: mpsc::UnboundedSender<Done>,
 }
 
-/// A running lease: its run's task and the runtime it runs on.
+/// A running lease: the runtime it runs on. Its run reports through `done`.
 struct Running {
-    task: JoinHandle<()>,
     runtime: Arc<dyn AnyRuntime>,
 }
 
@@ -55,6 +59,7 @@ impl Leases {
             runtimes,
             running: BTreeMap::new(),
             cancelled: BTreeSet::new(),
+            fenced: BTreeSet::new(),
             done,
         }
     }
@@ -93,13 +98,13 @@ impl Leases {
         };
         let done = self.done.clone();
         let run = Arc::clone(&runtime);
-        let task = tokio::spawn(async move {
+        tokio::spawn(async move {
             let outcome = run.run(work).await;
             // The receiver lives as long as the daemon.
             let _ = done.send((id, outcome));
         });
         tracing::info!(lease = %id, driver = runtime.driver(), "lease started");
-        self.running.insert(id, Running { task, runtime });
+        self.running.insert(id, Running { runtime });
         None
     }
 
@@ -131,39 +136,46 @@ impl Leases {
         }
     }
 
-    /// Turns a finished run into its Result. `None` if the lease was already reported
-    /// (it was fenced).
+    /// Turns a finished run into its Result: a fenced (lost) one if the lease was
+    /// fenced, whatever the run's outcome. Every run reports once, on `done`, and its
+    /// lease is running until then: neither a fence nor a `Cancel` drops it sooner.
     pub(crate) fn finished(
         &mut self,
         id: LeaseId,
         outcome: Result<ActionResult, RuntimeError>,
-    ) -> Option<worker::Result> {
-        self.running.remove(&id)?;
+    ) -> worker::Result {
+        self.running.remove(&id);
         // A cancelled run ends ABORTED (killed), or as it ended if it beat the kill;
         // the server refuses either.
         self.cancelled.remove(&id);
-        tracing::info!(lease = %id, ok = outcome.is_ok(), "lease finished");
-        Some(result_of(id, outcome))
-    }
-
-    /// Kills every running lease and returns one Result for each, oldest first: lost to
-    /// the farm, fenced (UNAVAILABLE with `LOST_FENCED`), which the server runs again.
-    /// The kills run together, so fencing takes as long as the slowest lease's kill,
-    /// not the sum. Returns once every lease's work has stopped.
-    pub(crate) async fn fence(&mut self) -> Vec<worker::Result> {
-        let fenced = std::mem::take(&mut self.running);
-        self.cancelled.clear();
-        let kills = fenced.into_iter().map(|(id, running)| async move {
-            let Running { task, runtime } = running;
-            runtime.kill(id).await;
-            // The run reports Killed on `done`; `finished` drops it, since the lease is
-            // no longer running. Waiting for the task proves the work has ended.
-            let _ = task.await;
+        if self.fenced.remove(&id) {
             tracing::warn!(lease = %id, "lease fenced: contact with the server lost");
             let why = "self-fenced: no acknowledged heartbeat within the fence time";
-            result_of(id, Err(RuntimeError::Lost(LostWhy::Fenced, why.to_owned())))
-        });
-        futures::future::join_all(kills).await
+            return result_of(id, Err(RuntimeError::Lost(LostWhy::Fenced, why.to_owned())));
+        }
+        tracing::info!(lease = %id, ok = outcome.is_ok(), "lease finished");
+        result_of(id, outcome)
+    }
+
+    /// Whether a running lease is not being fenced yet.
+    pub(crate) fn unfenced(&self) -> bool {
+        self.running.keys().any(|id| !self.fenced.contains(id))
+    }
+
+    /// Starts killing every running lease not already being fenced, all at once, and
+    /// returns them, oldest first. Returns at once: each stays running, and listed,
+    /// until its run has stopped, and then reports through `done` as lost to the farm
+    /// (fenced, UNAVAILABLE with `LOST_FENCED`), which the server runs again.
+    pub(crate) fn fence(&mut self) -> Vec<LeaseId> {
+        let mut fenced = Vec::new();
+        for (id, running) in &self.running {
+            if self.fenced.insert(*id) {
+                let (id, runtime) = (*id, Arc::clone(&running.runtime));
+                tokio::spawn(async move { runtime.kill(id).await });
+                fenced.push(id);
+            }
+        }
+        fenced
     }
 }
 
@@ -363,7 +375,7 @@ mod tests {
             stopped: tokio::sync::Semaphore::new(0),
             runs: std::sync::atomic::AtomicUsize::new(0),
         });
-        let (done, _done_rx) = mpsc::unbounded_channel();
+        let (done, mut done_rx) = mpsc::unbounded_channel();
         let mut leases = Leases::new(Runtimes::new(runtime), done);
         let ids = [LeaseId::new(1, 1), LeaseId::new(1, 2)];
         for id in ids {
@@ -375,9 +387,19 @@ mod tests {
             };
             assert_eq!(leases.start(start), None);
         }
-        let results = tokio::time::timeout(std::time::Duration::from_secs(10), leases.fence())
-            .await
-            .expect("the fence killed one lease at a time");
+        assert_eq!(leases.fence(), ids, "every running lease, oldest first");
+        assert!(!leases.unfenced());
+        assert_eq!(leases.fence(), [], "a lease fenced twice");
+        let mut results = Vec::new();
+        for _ in ids {
+            let (id, outcome) =
+                tokio::time::timeout(std::time::Duration::from_secs(10), done_rx.recv())
+                    .await
+                    .expect("the fence killed one lease at a time")
+                    .expect("open");
+            results.push(leases.finished(id, outcome));
+        }
+        results.sort_by_key(|r| r.lease_id.map(|l| (l.term, l.seq)));
         let fenced: Vec<_> = results.iter().map(|r| r.lease_id).collect();
         assert_eq!(fenced, ids.map(|id| Some(proto_lease_id(id))));
         // Lost to the farm, not killed by a Cancel: the server runs it again.
@@ -399,7 +421,7 @@ mod tests {
         });
         // Rendezvous is only a stand-in; its name is not under test.
         assert_eq!(Runtime::driver(&*runtime), "rendezvous");
-        let (done, _done_rx) = mpsc::unbounded_channel();
+        let (done, mut done_rx) = mpsc::unbounded_channel();
         let mut leases = Leases::new(Runtimes::new(Arc::clone(&runtime)), done);
         let start = Start {
             lease_id: Some(proto_lease_id(id())),
@@ -428,10 +450,13 @@ mod tests {
         assert_eq!(leases.running(), [id()]);
         // One kill ends one run. Were the resend a second run, the fence would wait
         // for a run nothing stops (or, if the kill ended that one, `runs` would be 2).
-        let fenced = tokio::time::timeout(std::time::Duration::from_secs(5), leases.fence())
-            .await
-            .expect("the fence waited for a second run of one lease");
-        assert_eq!(fenced.len(), 1);
+        assert_eq!(leases.fence(), [id()]);
+        let (ended, outcome) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), done_rx.recv())
+                .await
+                .expect("the fence waited for a second run of one lease")
+                .expect("open");
+        leases.finished(ended, outcome);
         assert_eq!(runtime.runs.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
@@ -456,7 +481,7 @@ mod tests {
         assert!(!leases.cancel(id()), "a lease already being cancelled");
         let (ended, outcome) = done_rx.recv().await.expect("the run ends");
         assert_eq!(ended, id());
-        let result = leases.finished(ended, outcome).expect("reported");
+        let result = leases.finished(ended, outcome);
         assert_eq!(code(&result), Code::Aborted as i32);
         assert_eq!(runtime.killed(), [id()]);
         assert!(leases.running().is_empty());

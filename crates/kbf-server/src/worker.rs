@@ -26,7 +26,9 @@
 //! - a `Result` the deny list now refuses ends the stream, so it never reaches the
 //!   action cache. Otherwise it is accepted only from the node holding the
 //!   operation's current lease, and only if the action it names (if any) is the one
-//!   that lease runs, and answered with a `ResultAck`;
+//!   that lease runs, and answered with a `ResultAck`. It is settled on a task of its
+//!   own: its writes to the object store may be slow, and the messages behind it
+//!   (heartbeats above all) are handled meanwhile;
 //! - a `NodeStatus` the deny list now refuses ends the stream, so it never reaches
 //!   the operator API. Otherwise it is kept as the node's newest software status,
 //!   unless a newer stream of the node has registered since;
@@ -173,13 +175,13 @@ struct Session<M, O> {
     stream: StreamId,
 }
 
-impl<M: MetaLog, O: ObjectStore> Session<M, O> {
+impl<M: MetaLog, O: ObjectStore + 'static> Session<M, O> {
     /// Handles the stream's messages until it ends, or one of them ends it.
     async fn serve(self, mut inbound: Streaming<DaemonMessage>, outbound: Outbound) {
         let worker = &self.worker;
         while let Ok(Some(received)) = inbound.message().await {
             // The response stream outlives this loop unless the stream is gone.
-            match self.handle(received.message).await {
+            match self.handle(received.message, &outbound).await {
                 Ok(None) => {}
                 Ok(Some(reply)) => {
                     let _ = outbound.send(Ok(message(reply)));
@@ -197,10 +199,12 @@ impl<M: MetaLog, O: ObjectStore> Session<M, O> {
         tracing::info!(%worker, "worker stream ended");
     }
 
-    /// The reply to one message, if any; an error ends the stream with it.
+    /// The reply to one message, if any; an error ends the stream with it. A `Result`
+    /// is answered later, on `outbound`.
     async fn handle(
         &self,
         received: Option<daemon_message::Message>,
+        outbound: &Outbound,
     ) -> Result<Option<server_message::Message>, Status> {
         let (farm, worker, stream) = (&self.farm, &self.worker, self.stream);
         let reply = match received {
@@ -241,9 +245,17 @@ impl<M: MetaLog, O: ObjectStore> Session<M, O> {
                 self.peers
                     .admit(self.peer.as_ref(), worker.as_str())
                     .await?;
-                farm.report(worker, result)
-                    .await
-                    .map(server_message::Message::ResultAck)
+                // Settling it writes to the object store and the metadata log, which
+                // can take many seconds; it runs beside this loop, so the heartbeats
+                // behind it are still acknowledged before the daemon fences.
+                let (farm, worker, outbound) = (Arc::clone(farm), worker.clone(), outbound.clone());
+                tokio::spawn(async move {
+                    if let Some(ack) = farm.report(&worker, result).await {
+                        let reply = server_message::Message::ResultAck(ack);
+                        let _ = outbound.send(Ok(message(reply)));
+                    }
+                });
+                None
             }
             Some(daemon_message::Message::NodeStatus(status)) => {
                 // A revoked daemon's status must not reach the operator API either.

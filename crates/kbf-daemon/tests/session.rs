@@ -4,6 +4,8 @@
 //! certificate from its CA, and the daemon verifies the server's against the CA file it
 //! was given. A daemon that presented no certificate would never reach Hello.
 
+#[path = "session/lost_contact.rs"]
+mod lost_contact;
 mod support;
 
 use std::sync::atomic::Ordering;

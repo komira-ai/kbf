@@ -503,6 +503,20 @@ impl Harness<FakeRuntime> {
         .await
     }
 
+    /// Waits until the fake runtime has been asked to kill `want`, in that order: a
+    /// fence starts its kills and returns before they run.
+    pub async fn killed(&self, want: &[kbf_types::LeaseId]) {
+        let deadline = Instant::now() + PROMPT;
+        while self.runtime.killed() != want {
+            assert!(
+                Instant::now() < deadline,
+                "killed {:?}",
+                self.runtime.killed()
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
     /// Waits until the fake runtime has started `n` leases.
     pub async fn started(&self, n: usize) {
         let deadline = Instant::now() + PROMPT;

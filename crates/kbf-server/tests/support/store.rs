@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::SystemTime;
 
+use super::Gate;
 use bytes::Bytes;
 use kbf_objstore::{
     ByteRange, Capabilities, KeyPrefix, ListPage, ListToken, MemoryStore, ObjectKey, ObjectStore,
@@ -11,13 +12,18 @@ use kbf_objstore::{
 };
 
 /// The cell's bucket: one [`MemoryStore`] that outlives each server process over it,
-/// as a real bucket outlives `kbf-server` (see [`Cell::cold_restart`]).
+/// as a real bucket outlives `kbf-server` (see [`Cell::cold_restart`]), with a gate a
+/// test can close on the next write, to stand for a slow object store.
 #[derive(Clone)]
-pub struct SharedStore(pub Arc<MemoryStore>);
+pub struct SharedStore {
+    memory: Arc<MemoryStore>,
+    /// Holds the next `put_new` until the test opens it.
+    pub put: Arc<Gate>,
+}
 
 impl ObjectStore for SharedStore {
     fn capabilities(&self) -> Capabilities {
-        self.0.capabilities()
+        self.memory.capabilities()
     }
 
     async fn put_new(
@@ -26,7 +32,8 @@ impl ObjectStore for SharedStore {
         body: Bytes,
         retain_until: Option<SystemTime>,
     ) -> Result<(), ObjectStoreError> {
-        self.0.put_new(key, body, retain_until).await
+        self.put.pass().await;
+        self.memory.put_new(key, body, retain_until).await
     }
 
     async fn get_range(
@@ -34,11 +41,11 @@ impl ObjectStore for SharedStore {
         key: &ObjectKey,
         range: ByteRange,
     ) -> Result<Bytes, ObjectStoreError> {
-        self.0.get_range(key, range).await
+        self.memory.get_range(key, range).await
     }
 
     async fn delete(&self, key: &ObjectKey) -> Result<(), ObjectStoreError> {
-        self.0.delete(key).await
+        self.memory.delete(key).await
     }
 
     async fn list(
@@ -47,11 +54,19 @@ impl ObjectStore for SharedStore {
         after: Option<&ListToken>,
         max_keys: PageSize,
     ) -> Result<ListPage, ObjectStoreError> {
-        self.0.list(prefix, after, max_keys).await
+        self.memory.list(prefix, after, max_keys).await
     }
 }
 
 impl SharedStore {
+    /// An empty bucket whose gate is open.
+    pub fn new() -> Self {
+        Self {
+            memory: Arc::new(MemoryStore::new(Capabilities::default())),
+            put: Arc::default(),
+        }
+    }
+
     /// Every object in the bucket, key and bytes, in key order.
     pub async fn objects(&self) -> BTreeMap<String, Bytes> {
         let mut objects = BTreeMap::new();
