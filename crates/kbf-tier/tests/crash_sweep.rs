@@ -73,7 +73,7 @@ fn workload(fs: &FaultFs, index: &mut Index, acked: &mut Vec<Acked>) -> Result<(
     tier.write(&a, 0, &bytes(2, 8))?;
     for (r, tag) in [(b, 3), (a, 2)] {
         let synced = tier.sync(r).map_err(|u| u.error)?;
-        let (object, offset) = (synced.reservation().object(), synced.reservation().offset());
+        let (object, offset) = (synced.object(), synced.offset());
         index.put_staged(&synced, false);
         tier.committed(synced);
         acked.push(Acked {

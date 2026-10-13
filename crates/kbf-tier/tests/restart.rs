@@ -85,7 +85,7 @@ fn out_of_order_commits_survive_a_power_cut() {
     index.put_staged(&second, false);
     tier.committed(second);
     let first = tier.sync(first).unwrap();
-    let object = first.reservation().object();
+    let object = first.object();
     index.put_staged(&first, false);
     tier.committed(first);
     let (tier, rec) = open_tier(&fs.crash(0), 2, opts(), &index).unwrap();

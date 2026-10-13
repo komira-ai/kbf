@@ -37,18 +37,17 @@ impl Index {
     /// `PutStaged` for `synced`: the committed length becomes the larger end; an
     /// upload's block is sealed by the same commit.
     pub fn put_staged(&mut self, synced: &Synced, sealed: bool) {
-        let r = synced.reservation();
         let entry = self
             .tiers
             .entry(TIER)
             .or_default()
-            .entry(r.object())
+            .entry(synced.object())
             .or_insert(StagedObject {
-                object: r.object(),
+                object: synced.object(),
                 len: 0,
                 sealed,
             });
-        entry.len = entry.len.max(r.end());
+        entry.len = entry.len.max(synced.end());
     }
 
     /// `SealStaged`.
@@ -111,7 +110,7 @@ pub fn ack_group(
     let r = tier.reserve_group(data.len() as u64, now)?;
     tier.write(&r, 0, data)?;
     let synced = tier.sync(r).map_err(|u| u.error)?;
-    let at = (synced.reservation().object(), synced.reservation().offset());
+    let at = (synced.object(), synced.offset());
     index.put_staged(&synced, false);
     tier.committed(synced);
     Ok(at)
@@ -128,7 +127,7 @@ pub fn ack_upload(
     tier.write(&r, half as u64, &data[half..])?;
     tier.write(&r, 0, &data[..half])?;
     let synced = tier.sync(r).map_err(|u| u.error)?;
-    let object = synced.reservation().object();
+    let object = synced.object();
     index.put_staged(&synced, true);
     tier.committed(synced);
     Ok(object)

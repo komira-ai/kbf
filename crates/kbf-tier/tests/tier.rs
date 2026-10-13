@@ -65,7 +65,7 @@ fn out_of_order_commits_never_move_the_committed_length_back() {
     tier.write(&second, 0, b"2222").unwrap();
     let second = tier.sync(second).unwrap();
     let first = tier.sync(first).unwrap();
-    let object = second.reservation().object();
+    let object = second.object();
     tier.committed(second);
     tier.committed(first);
     assert_eq!(tier.read(object, 0, 8).unwrap(), b"11112222");
@@ -172,7 +172,8 @@ fn a_block_is_sealed_at_the_segment_limit() {
 
 /// Catches: open reservations not counted against the budget (uploads in flight
 /// would overrun the disk), a refused range that still counts, bytes not released
-/// when an upload fails or a block is unstaged, and disk use above the budget.
+/// when an upload fails or a block is unstaged, disk use above the budget, and a
+/// range that exactly fills the budget refused (mutant: `>=` for `>`).
 #[test]
 fn the_budget_counts_open_reservations_and_refuses_the_excess() {
     let (fs, tier) = fresh(100);
@@ -194,6 +195,12 @@ fn the_budget_counts_open_reservations_and_refuses_the_excess() {
         tier.reserve_upload(11),
         Err(TierError::Full { .. })
     ));
+    assert_eq!(tier.usage().used, 90);
+    let exact = tier
+        .reserve_upload(10)
+        .expect("90 used + 10 is exactly the budget");
+    assert_eq!(tier.usage().used, 100);
+    drop(exact);
     assert_eq!(tier.usage().used, 90);
     let on_disk: usize = blocks(&fs)
         .iter()
@@ -241,7 +248,7 @@ fn an_upload_block_is_sealed_by_its_commit() {
     let r = tier.reserve_upload(4).unwrap();
     tier.write(&r, 0, b"gone").unwrap();
     let synced = tier.sync(r).unwrap();
-    let name = block_name(synced.reservation().object());
+    let name = block_name(synced.object());
     drop(synced);
     assert_eq!(fs.contents(&name), None, "commit refused: block deleted");
 }

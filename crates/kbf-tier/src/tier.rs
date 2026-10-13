@@ -109,15 +109,49 @@ impl Drop for Reservation {
 
 /// A reservation whose bytes are durable (the file synced through its handle after
 /// the writes, and the block's name synced): what a `PutStaged` may name. Only
-/// [`WriteTier::sync`] makes one, and it takes no more writes.
+/// [`WriteTier::sync`] makes one.
+///
+/// It takes no more writes: [`WriteTier::write`] takes a [`Reservation`], which
+/// [`WriteTier::sync`] consumed, and a `Synced` hands none out. A byte written after
+/// the sync would be acknowledged without being durable. What a caller does with one:
+///
+/// ```
+/// # use kbf_tier::{Synced, WriteTier};
+/// fn commit(tier: &dyn WriteTier, synced: Synced) {
+///     let _put_staged = (synced.object(), synced.offset(), synced.end());
+///     tier.committed(synced);
+/// }
+/// ```
+///
+/// and what it cannot:
+///
+/// ```compile_fail
+/// # use kbf_tier::{Synced, WriteTier};
+/// fn rewrite(tier: &dyn WriteTier, synced: &Synced) {
+///     let _ = tier.write(synced.reservation(), 0, b"late");
+/// }
+/// ```
 #[derive(Debug)]
 #[must_use = "a synced reservation is answered as failed when dropped"]
 pub struct Synced(Reservation);
 
 impl Synced {
-    /// The reservation, to read its object, offset and end.
-    pub const fn reservation(&self) -> &Reservation {
-        &self.0
+    /// The block (and so the object) the range is in: `PutStaged`'s object.
+    #[must_use]
+    pub const fn object(&self) -> ObjectId {
+        self.0.object
+    }
+
+    /// Where the range starts in the block.
+    #[must_use]
+    pub const fn offset(&self) -> u64 {
+        self.0.offset
+    }
+
+    /// The end of the range: `PutStaged`'s `end` for this object.
+    #[must_use]
+    pub const fn end(&self) -> u64 {
+        self.0.end()
     }
 }
 
@@ -135,7 +169,7 @@ pub struct Unsynced {
 /// implementation; the trait keeps the filesystem type out of its callers.
 ///
 /// A caller's sequence, per range: reserve, write, sync, commit `PutStaged` naming
-/// [`Synced::reservation`]'s object and end, then [`WriteTier::committed`]; on any
+/// [`Synced::object`] and [`Synced::end`], then [`WriteTier::committed`]; on any
 /// failure drop the reservation. Sealing: [`WriteTier::poll_seals`] names the blocks
 /// whose `SealStaged` may be committed now; after that commit,
 /// [`WriteTier::sealed`].
@@ -177,7 +211,8 @@ pub trait WriteTier: Send + Sync {
     /// An [`Unsynced`] holding the reservation: [`TierError::Poisoned`] if any I/O
     /// error on the block came before or during this sync (a failed sync on another
     /// range of the block may have taken this range's write-back error), or
-    /// [`TierError::Io`], which poisons the block.
+    /// [`TierError::Io`], which poisons the block. The syncs of one block run one at
+    /// a time, so none succeeds while another sync of the block is failing.
     fn sync(&self, reservation: Reservation) -> Result<Synced, Unsynced>;
 
     /// Answers a range whose `PutStaged` committed: the block's committed length
@@ -247,7 +282,7 @@ pub(crate) struct Block<File> {
     pub(crate) phase: Phase,
     /// The handle every write and sync of the block goes through; `None` once nothing
     /// will write it again.
-    file: Option<Arc<File>>,
+    file: Option<Arc<Handle<File>>>,
     opened: Option<Instant>,
     /// The bytes reserved: the end of its last range. Counted against the budget.
     pub(crate) extent: u64,
@@ -276,6 +311,20 @@ impl<File> Block<File> {
         }
     }
 }
+
+/// A block's open file, and the lock its syncs take one at a time.
+#[derive(Debug)]
+struct Handle<File> {
+    file: File,
+    /// Held from the `fdatasync` through the poison check and the `sync_dir`. The
+    /// kernel reports a write-back error to one sync of the shared handle only: a
+    /// sync that overlapped a failing one could otherwise succeed before that one
+    /// poisoned the block, or before the block's name was durable.
+    sync: Mutex<()>,
+}
+
+/// A block's handle, and whether the block is poisoned.
+type Opened<File> = (Arc<Handle<File>>, bool);
 
 #[derive(Debug)]
 pub(crate) struct State<File> {
@@ -376,7 +425,10 @@ where
             Block {
                 kind,
                 phase: Phase::Open,
-                file: Some(Arc::new(file)),
+                file: Some(Arc::new(Handle {
+                    file,
+                    sync: Mutex::new(()),
+                })),
                 opened: now,
                 extent: 0,
                 committed: 0,
@@ -417,7 +469,7 @@ where
     }
 
     /// The handle of the block a range is in, and whether the block is poisoned.
-    fn handle(&self, object: ObjectId) -> Result<(Arc<F::File>, bool), TierError> {
+    fn handle(&self, object: ObjectId) -> Result<Opened<F::File>, TierError> {
         let state = self.lock();
         let block = state
             .blocks
@@ -439,18 +491,22 @@ where
 
     fn sync_range(&self, r: &Reservation) -> Result<(), TierError> {
         // Poisoning is checked after the sync, not before: see below.
-        let (file, _) = self.handle(r.object)?;
+        let (handle, _) = self.handle(r.object)?;
+        let _one_at_a_time = handle.sync.lock().unwrap_or_else(PoisonError::into_inner);
         let name = block_name(r.object);
-        file.sync()
+        handle
+            .file
+            .sync()
             .map_err(|e| self.poison(r.object, TierError::io("sync", &name, e)))?;
         let mut state = self.lock();
         let block = state
             .blocks
             .get_mut(&r.object)
             .expect("block of a reservation");
-        // A failed write or sync of another range (before this sync, or during it)
-        // may have reported, and so cleared, a write-back error of this range's
-        // pages: this sync's success proves nothing then.
+        // A failed write or sync of another range before this sync (a failing sync
+        // cannot overlap it: the lock) may have reported, and so cleared, a
+        // write-back error of this range's pages: this sync's success proves nothing
+        // then.
         if block.poisoned {
             return Err(TierError::Poisoned(r.object));
         }
@@ -590,11 +646,11 @@ where
                 reserved: r.len,
             });
         }
-        let (file, poisoned) = self.handle(r.object)?;
+        let (handle, poisoned) = self.handle(r.object)?;
         if poisoned {
             return Err(TierError::Poisoned(r.object));
         }
-        file.write_at(r.offset + offset, bytes).map_err(|e| {
+        handle.file.write_at(r.offset + offset, bytes).map_err(|e| {
             let error = TierError::io("write", &block_name(r.object), e);
             self.poison(r.object, error)
         })
