@@ -46,7 +46,7 @@ const ASIDE: &str = ".kbf-recreated-";
 /// refuses an action the setuid tools (`crontab`, `at`, `ps`), so the test runs those
 /// as the slot user outside it, and reads the process table and the disk images as
 /// root.
-const ROWS: [(&str, &str); 17] = [
+const ROWS: [(&str, &str); 18] = [
     (
         "lease-dir",
         "a file in lease A's directory (lease B: test -e)",
@@ -71,6 +71,10 @@ const ROWS: [(&str, &str); 17] = [
     (
         "agent",
         "a KeepAlive LaunchAgent in user/<uid> (lease B: launchctl print)",
+    ),
+    (
+        "apple-agent",
+        "a KeepAlive LaunchAgent labelled com.apple.* in user/<uid>, its plist the lease's (lease B: launchctl print)",
     ),
     ("crontab", "a crontab line (the user: crontab -l)"),
     ("at", "an at job (the user: atq)"),
@@ -151,6 +155,7 @@ v=$(security find-generic-password -s kbf-ci-fresh -w "$kc" 2>/dev/null) && foun
 [ -e "/Users"/Shared/"$m" ] && found shared
 launchctl print "user/$uid/kbf.ci.fresh" >/dev/null 2>&1 && found agent in user/$uid
 [ -e "$h/Library/LaunchAgents/kbf.ci.fresh.plist" ] && found agent plist
+launchctl print "user/$uid/com.apple.kbf-ci-fresh" >/dev/null 2>&1 && found apple-agent in user/$uid
 hdiutil info 2>/dev/null | grep -q "$m" && found image
 [ -n "$2" ] && ipcs -s | awk -v id="$2" '$1 == "s" && $2 == id' | grep -q . && found sem
 echo checked
@@ -164,21 +169,33 @@ q=$(atq 2>/dev/null) && [ -n "$q" ] && echo "found at $q"
 exit 0
 "#;
 
-/// A KeepAlive LaunchAgent that runs `sleep 3003`, for the Background session a pool
-/// user's domain is (an agent without the key is for Aqua, and its bootstrap fails
-/// with EIO there).
-const AGENT: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+/// A KeepAlive LaunchAgent labelled `label` that runs `sleep <secs>`, for the Background
+/// session a pool user's domain is (an agent without the key is for Aqua, and its
+/// bootstrap fails with EIO there).
+fn agent(label: &str, secs: u32) -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>Label</key><string>kbf.ci.fresh</string>
-  <key>ProgramArguments</key><array><string>/bin/sleep</string><string>3003</string></array>
+  <key>Label</key><string>{label}</string>
+  <key>ProgramArguments</key><array><string>/bin/sleep</string><string>{secs}</string></array>
   <key>KeepAlive</key><true/>
   <key>RunAtLoad</key><true/>
   <key>LimitLoadToSessionType</key><string>Background</string>
 </dict>
 </plist>
-"#;
+"#
+    )
+}
+
+/// The agents [`plant_outside`] bootstraps: their row, label and sleep. The second is
+/// labelled like launchd's own agents, which the clean leaves loaded: its plist (the
+/// lease's, in the home) says it is not.
+const AGENTS: [(&str, &str, u32); 2] = [
+    ("agent", "kbf.ci.fresh", 3003),
+    ("apple-agent", "com.apple.kbf-ci-fresh", 3006),
+];
 
 /// The rows `text` names after `word` (`planted` or `found`), and what each line said.
 fn rows(text: &str, word: &str) -> Vec<(String, String)> {
@@ -274,14 +291,15 @@ fn slots_reported(rt: &NativeRuntime<MemoryCas>) -> Option<String> {
 /// (which denies an action these writes and the setuid tools; a job that left it is
 /// what the clean must also catch), files in `/private/tmp`, `/private/var/tmp` and the
 /// `Shared` folder under `/Users`, a crontab line, an `at` job, a setuid-root sleep and
-/// a KeepAlive LaunchAgent bootstrapped into `user/<uid>` from the home. After the
+/// two KeepAlive LaunchAgents bootstrapped into `user/<uid>` from the home, one of them
+/// labelled `com.apple.kbf-ci-fresh` like launchd's own agents. After the
 /// clean that follows lease A, none is found: lease B, on the same user, looks for each
 /// through the tool that would use it, the slot user runs `crontab -l` and `atq`, and
 /// root reads the process table and `hdiutil info`. Background Task Management entries
 /// of the uid, if the agent made any, are gone too.
 ///
 /// Catches every step of the clean skipped, each turning its own rows red: the
-/// bootout (agent), the crontab and `at` sweep (crontab, at), the image detach (image),
+/// bootout (agent, apple-agent), the crontab and `at` sweep (crontab, at), the image detach (image),
 /// the IPC removal (sem), the home wipe (home, defaults, keychain, agent), the
 /// `/var/folders` wipe (T, C), the shared sweep (tmp, var-tmp, shared).
 #[ignore = "needs root and real users: cargo xtask sudo-test -p kbf-driver-native --test slot_clean"]
@@ -432,9 +450,9 @@ struct Outside {
 }
 
 /// The part of lease A made as the slot user outside the sandbox while lease A waits:
-/// [`PLANT_OUTSIDE`], a setuid-root sleep (`setuid`), and the LaunchAgent, which the
-/// user bootstraps into `user/<uid>` from its home through `launchctl asuser` and the
-/// `as-user` drop of `drop_to` (this test binary). Also looks up lease A's setsid
+/// [`PLANT_OUTSIDE`], a setuid-root sleep (`setuid`), and the LaunchAgents
+/// ([`AGENTS`]), which the user bootstraps into `user/<uid>` from its home through
+/// `launchctl asuser` and the `as-user` drop of `drop_to` (this test binary). Also looks up lease A's setsid
 /// sleeper, and notes what `hdiutil info` lists of the uid's while lease A runs.
 fn plant_outside(
     user: &SlotUser,
@@ -473,46 +491,10 @@ fn plant_outside(
         text.push_str("planted setuid\n");
     }
     let agents = home_of(user).join("Library").join("LaunchAgents");
-    let plist = agents.join("kbf.ci.fresh.plist");
     let made = as_user(user, "/bin/mkdir", &["-p", &agents.to_string_lossy()]);
     if made.status.success() {
-        std::fs::write(&plist, AGENT).expect("agent plist");
-        std::os::unix::fs::chown(&plist, Some(user.uid), Some(user.gid)).expect("chown");
-        std::fs::set_permissions(&plist, std::fs::Permissions::from_mode(0o644)).expect("chmod");
-        let domain = format!("user/{}", user.uid);
-        let path = plist.to_string_lossy().into_owned();
-        let (uid, gid) = (user.uid.to_string(), user.gid.to_string());
-        let service = format!("{domain}/kbf.ci.fresh");
-        let tries: [&[&str]; 2] = [
-            &[
-                "asuser",
-                &uid,
-                drop_to,
-                kbf_driver_native::slots::AS_USER_ARG,
-                &uid,
-                &gid,
-                "--",
-                "/bin/launchctl",
-                "bootstrap",
-                &domain,
-                &path,
-            ],
-            &[
-                "asuser",
-                &uid,
-                "/bin/launchctl",
-                "bootstrap",
-                &domain,
-                &path,
-            ],
-        ];
-        for args in tries {
-            let (booted, said) = root("/bin/launchctl", args);
-            text.push_str(&format!("launchctl {}: {booted} {said}\n", args.join(" ")));
-            if root("/bin/launchctl", &["print", &service]).0 {
-                text.push_str("planted agent\n");
-                break;
-            }
+        for (row, label, secs) in AGENTS {
+            bootstrap(user, drop_to, &agents, row, label, secs, &mut text);
         }
     } else {
         text.push_str("mkdir LaunchAgents failed\n");
@@ -528,6 +510,59 @@ fn plant_outside(
         sleeper,
         setuid: Some(child),
         setuid_pid: Some(setuid_pid),
+    }
+}
+
+/// Writes the agent `label` (row `row`, `sleep <secs>`) into the user's `agents`
+/// folder and bootstraps it into `user/<uid>` as the user, noting in `text` what
+/// launchctl said and `planted <row>` once `launchctl print` lists it.
+fn bootstrap(
+    user: &SlotUser,
+    drop_to: &str,
+    agents: &Path,
+    row: &str,
+    label: &str,
+    secs: u32,
+    text: &mut String,
+) {
+    let plist = agents.join(format!("{label}.plist"));
+    std::fs::write(&plist, agent(label, secs)).expect("agent plist");
+    std::os::unix::fs::chown(&plist, Some(user.uid), Some(user.gid)).expect("chown");
+    std::fs::set_permissions(&plist, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+    let domain = format!("user/{}", user.uid);
+    let path = plist.to_string_lossy().into_owned();
+    let (uid, gid) = (user.uid.to_string(), user.gid.to_string());
+    let service = format!("{domain}/{label}");
+    let tries: [&[&str]; 2] = [
+        &[
+            "asuser",
+            &uid,
+            drop_to,
+            kbf_driver_native::slots::AS_USER_ARG,
+            &uid,
+            &gid,
+            "--",
+            "/bin/launchctl",
+            "bootstrap",
+            &domain,
+            &path,
+        ],
+        &[
+            "asuser",
+            &uid,
+            "/bin/launchctl",
+            "bootstrap",
+            &domain,
+            &path,
+        ],
+    ];
+    for args in tries {
+        let (booted, said) = root("/bin/launchctl", args);
+        text.push_str(&format!("launchctl {}: {booted} {said}\n", args.join(" ")));
+        if root("/bin/launchctl", &["print", &service]).0 {
+            text.push_str(&format!("planted {row}\n"));
+            break;
+        }
     }
 }
 

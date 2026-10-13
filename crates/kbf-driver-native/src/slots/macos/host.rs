@@ -2,9 +2,11 @@
 //! user, the check of what is left, and the recreate of the user.
 //!
 //! - Bootout and kill are [`kbf_daemon::uid`]'s; the bootout then boots out, one by
-//!   one, each job `launchctl print user/<uid>` still lists but launchd's own
-//!   `com.apple.*` agents, which every user domain has and the domain's bootout leaves
-//!   loaded. The crontab, `at` jobs and the shared places are swept by uid with
+//!   one, each job `launchctl print user/<uid>` still lists but launchd's own agents,
+//!   which every user domain has and the domain's bootout leaves loaded. A job is
+//!   launchd's own when its plist lies in the sealed system folders (`path` in
+//!   `launchctl print user/<uid>/<label>`, [`OWN_PLISTS`]), never by its label, which a
+//!   lease chooses. The crontab, `at` jobs and the shared places are swept by uid with
 //!   `kbf_mac_session::sweep`, which never follows a link and stays on one filesystem.
 //! - The check reads, never removes. Processes that launchd lists as running one of
 //!   its own agents are not counted ([`leftover_processes`]): launchd starts them again
@@ -85,7 +87,7 @@ impl Os for MacSlot<'_> {
                 uid::bootout(user.uid, uid::BOOTOUT_WITHIN);
                 // What the domain's bootout leaves loaded, but launchd's own agents.
                 let mut failed = Vec::new();
-                for service in services_of(user.uid).iter().filter(|s| !s.apple()) {
+                for service in services_of(user.uid).iter().filter(|s| !s.own) {
                     let target = format!("user/{}/{}", user.uid, service.label);
                     if let Err(why) = run(uid::LAUNCHCTL, &["bootout", &target]) {
                         failed.push(why);
@@ -139,7 +141,7 @@ impl Os for MacSlot<'_> {
         // neither list, never in the first alone.
         let pids = uid::processes(user.uid);
         let services = services_of(user.uid);
-        match pids.map(|pids| not_apples(pids, &services)) {
+        match pids.map(|pids| not_launchds_own(pids, &services)) {
             Ok(pids) => {
                 if !pids.is_empty() {
                     note(Step::Kill, format!("processes {:?}", named(&pids)));
@@ -148,7 +150,7 @@ impl Os for MacSlot<'_> {
             Err(why) => note(Step::Kill, format!("processes: {why}")),
         }
         let jobs: Vec<&str> = (services.iter())
-            .filter(|s| !s.apple())
+            .filter(|s| !s.own)
             .map(|s| s.label.as_str())
             .collect();
         if !jobs.is_empty() {
@@ -517,53 +519,50 @@ fn attributes(record: &str) -> Result<Vec<(&'static str, Vec<String>)>, String> 
 
 /// The processes of `uid`, by effective or real uid ([`uid::processes`]), that a lease
 /// could have left: all but those launchd lists as running one of its own agents in
-/// `user/<uid>` (`com.apple.*` labels). launchd starts those again on demand after the
-/// kill (`distnoted`, measured on the CI runner), as the uid: fresh processes, holding
+/// `user/<uid>` ([`Service::own`]). launchd starts those again on demand after the kill
+/// (`distnoted`, measured on the CI runner), as the uid: fresh processes, holding
 /// nothing of a lease.
 ///
 /// # Errors
 /// The process table could not be read.
 pub fn leftover_processes(uid: u32) -> io::Result<Vec<i32>> {
     let pids = uid::processes(uid)?;
-    Ok(not_apples(pids, &services_of(uid)))
+    Ok(not_launchds_own(pids, &services_of(uid)))
 }
 
 /// `pids` without those `services` lists as running one of launchd's own agents.
-fn not_apples(mut pids: Vec<i32>, services: &[Service]) -> Vec<i32> {
-    pids.retain(|pid| !services.iter().any(|s| s.apple() && s.pid == Some(*pid)));
+fn not_launchds_own(mut pids: Vec<i32>, services: &[Service]) -> Vec<i32> {
+    pids.retain(|pid| !services.iter().any(|s| s.own && s.pid == Some(*pid)));
     pids
 }
+
+/// The folders whose plists are launchd's own: on the sealed system volume, or
+/// Apple's under `/Library` (Rosetta's agents), neither of which a pool user can write.
+const OWN_PLISTS: [&str; 2] = ["/System/", "/Library/Apple/"];
 
 /// One service of a launchd domain, as `launchctl print` lists it.
 struct Service {
     /// Its process, while it runs.
     pid: Option<i32>,
     label: String,
-}
-
-impl Service {
-    /// Whether it is one of launchd's own per-user agents (`com.apple.*`, from
-    /// `/System/Library/LaunchAgents`), which launchd loads into every user domain, which
-    /// the domain's bootout leaves loaded, and which it starts again on demand.
-    fn apple(&self) -> bool {
-        self.label.starts_with("com.apple.")
-    }
+    /// Whether it is one of launchd's own per-user agents, which launchd loads into
+    /// every user domain, which the domain's bootout leaves loaded, and which it starts
+    /// again on demand: its plist is in one of [`OWN_PLISTS`]. A job a lease
+    /// bootstrapped or submitted is not, whatever its label: its plist is the lease's
+    /// (or it has none).
+    own: bool,
 }
 
 /// The services `launchctl print user/<uid>` lists: none when the domain is gone (or
-/// cannot be printed, which the kill and the other checks then stand in for).
+/// cannot be printed, which the kill and the other checks then stand in for). Each is
+/// printed on its own for its plist's path ([`Service::own`]).
 fn services_of(uid: u32) -> Vec<Service> {
-    let out = Command::new(uid::LAUNCHCTL)
-        .args(["print", &format!("user/{uid}")])
-        .env_clear()
-        .stdin(Stdio::null())
-        .output();
-    let Some(out) = out.ok().filter(|out| out.status.success()) else {
+    let Some(domain) = launchctl_print(&format!("user/{uid}")) else {
         return Vec::new();
     };
     // `services = {`, one `<pid, 0 when not running> <last exit or -> <label>` per line,
     // then `}`.
-    String::from_utf8_lossy(&out.stdout)
+    let listed: Vec<(Option<i32>, String)> = domain
         .lines()
         .skip_while(|line| line.trim() != "services = {")
         .skip(1)
@@ -572,9 +571,40 @@ fn services_of(uid: u32) -> Vec<Service> {
             let words: Vec<&str> = line.split_whitespace().collect();
             let label = (*words.last()?).to_owned();
             let pid = (words.first()?.parse().ok()).filter(|pid: &i32| *pid > 0);
-            Some(Service { pid, label })
+            Some((pid, label))
+        })
+        .collect();
+    listed
+        .into_iter()
+        .map(|(pid, label)| {
+            let printed = launchctl_print(&format!("user/{uid}/{label}"));
+            let own = printed
+                .as_deref()
+                .and_then(plist_path)
+                .is_some_and(|path| OWN_PLISTS.iter().any(|folder| path.starts_with(folder)));
+            Service { pid, label, own }
         })
         .collect()
+}
+
+/// What `launchctl print <target>` says, if it succeeds.
+fn launchctl_print(target: &str) -> Option<String> {
+    let out = Command::new(uid::LAUNCHCTL)
+        .args(["print", target])
+        .env_clear()
+        .stdin(Stdio::null())
+        .output();
+    let out = out.ok().filter(|out| out.status.success())?;
+    Some(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// The plist path in what `launchctl print user/<uid>/<label>` says: its `path = `
+/// line one level in (deeper ones belong to the job's nested dictionaries).
+fn plist_path(printed: &str) -> Option<&str> {
+    printed
+        .lines()
+        .find_map(|line| line.strip_prefix("\tpath = "))
+        .map(str::trim_end)
 }
 
 /// What a sweep of `plan` for `name` and `uid` would remove, without removing it: the
