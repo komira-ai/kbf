@@ -581,7 +581,7 @@ fn services_of(uid: u32) -> Vec<Service> {
             let own = printed
                 .as_deref()
                 .and_then(plist_path)
-                .is_some_and(|path| OWN_PLISTS.iter().any(|folder| path.starts_with(folder)));
+                .is_some_and(|path| OWN_PLISTS.iter().any(|folder| path.starts_with(folder))) || label.starts_with("com.apple.");
             Service { pid, label, own }
         })
         .collect()
