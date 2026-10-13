@@ -1107,8 +1107,10 @@ mod tests {
         let started = NativeRuntime::with_remover(config, Arc::new(NoCas), &refuse);
         let started = started.expect("the start goes on");
         let digest = kbf_proto::reapi::Digest::default();
-        assert!(started.cas.get(&digest).await.is_err(), "no CAS here");
-        assert!(started.cas.put(Vec::new()).await.is_err(), "no CAS here");
+        // A lease reads through the same store.
+        let lease = started.cas.lease(&LeaseId::new(3, 3));
+        assert!(lease.get(&digest).await.is_err(), "no CAS here");
+        assert!(lease.put(Vec::new()).await.is_err(), "no CAS here");
         assert!(!scratch.join("lease-3-3").exists(), "moved out of the way");
         let aside = std::fs::read_dir(scratch.join(crate::sweep::QUARANTINE))
             .expect("quarantine")

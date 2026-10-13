@@ -257,10 +257,9 @@ mod tests {
             call_error(&digest, &Status::not_found("gone")),
             CasError::Missing(label(&digest))
         );
-        let error = call_error(&digest, &Status::unavailable("down"));
-        assert!(
-            matches!(&error, CasError::Unavailable(blob, why) if *blob == label(&digest) && why.contains("down")),
-            "{error:?}"
+        assert_eq!(
+            call_error(&digest, &Status::unavailable("down")),
+            CasError::Unavailable(label(&digest), "Unavailable: down".to_owned())
         );
     }
 

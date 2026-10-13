@@ -118,9 +118,7 @@ impl Inner {
                 // One task asks, so this is the first UNIMPLEMENTED: none is asked after.
                 self.finder.off.store(true, Ordering::SeqCst);
                 add(&self.finder.unavailable, 1);
-                tracing::warn!(
-                    "the CAS answers FindMissing with UNIMPLEMENTED; every blob is uploaded"
-                );
+                tracing::warn!("FindMissing answered UNIMPLEMENTED; every blob is uploaded");
                 return None;
             }
             if !self.retry(&status, &mut attempt).await {
