@@ -357,6 +357,22 @@ mod tests {
         assert!(!fake.calls().contains(&Call::Recreate));
     }
 
+    /// Catches a recreate decided by the first attempt's failure rather than the
+    /// second's: a first attempt that fails on the home, then a retry whose check finds
+    /// a live process of the uid, quarantines the slot without a recreate (the user
+    /// deleted under that process would leave it running as an orphan uid).
+    #[test]
+    fn survivors_at_the_retry_quarantine_the_slot_after_another_first_failure() {
+        let fake = Fake::failing(Step::Home, 1);
+        *fake.looks.borrow_mut() = vec![vec![], vec![], vec![left(Step::Kill, "pid 7")]].into();
+        assert_eq!(clean(&fake), quarantined("left (kill): pid 7"));
+        let mut want = whole_attempt();
+        want.extend(STEPS.iter().copied().map(Call::Run));
+        want.push(Call::Left);
+        assert_eq!(fake.calls(), want);
+        assert!(!fake.calls().contains(&Call::Recreate));
+    }
+
     /// Catches a slot given back although its user could not be made again, or was
     /// made again and still not clean: either quarantines it, saying why.
     #[test]

@@ -226,11 +226,14 @@ impl std::fmt::Debug for Slot {
     }
 }
 
-/// A held slot, to clean and give back.
+/// A held slot, to clean and give back. Dropped before its clean passed (the clean's
+/// thread could not start, its task never ran, or the clean panicked), it is counted
+/// quarantined: never free again, and never reported.
 struct Back {
     shared: Arc<Shared>,
     index: usize,
-    permit: OwnedSemaphorePermit,
+    /// `None` once the slot is free again.
+    permit: Option<OwnedSemaphorePermit>,
 }
 
 impl std::fmt::Debug for Back {
@@ -242,18 +245,24 @@ impl std::fmt::Debug for Back {
 }
 
 impl Back {
-    /// Cleans the slot; frees it, or quarantines it (its permit forgotten).
-    fn give(self) {
-        let Self {
-            shared,
-            index,
-            permit,
-        } = self;
-        if settle(&shared.cleaner, &shared.ready[index], index) {
-            lock(&shared.free).insert(index);
-            drop(permit);
-        } else {
-            shared.quarantined.fetch_add(1, Ordering::SeqCst);
+    /// Cleans the slot; frees it, or quarantines it (on drop).
+    fn give(mut self) {
+        if settle(
+            &self.shared.cleaner,
+            &self.shared.ready[self.index],
+            self.index,
+        ) {
+            lock(&self.shared.free).insert(self.index);
+            drop(self.permit.take());
+        }
+    }
+}
+
+impl Drop for Back {
+    /// Quarantines the slot unless [`Back::give`] freed it: its permit is forgotten.
+    fn drop(&mut self) {
+        if let Some(permit) = self.permit.take() {
+            self.shared.quarantined.fetch_add(1, Ordering::SeqCst);
             permit.forget();
         }
     }
@@ -338,7 +347,7 @@ impl Slot {
             return;
         };
         if let Err(why) = tokio::task::spawn_blocking(move || back.give()).await {
-            tracing::error!(%why, "the clean of a slot did not finish");
+            tracing::error!(%why, "the clean of a slot did not finish: it is quarantined");
         }
     }
 
@@ -348,7 +357,7 @@ impl Slot {
         Some(Back {
             shared: Arc::clone(&self.shared),
             index: self.index,
-            permit,
+            permit: Some(permit),
         })
     }
 }
@@ -364,7 +373,7 @@ impl Drop for Slot {
             .name("kbf-slot-clean".to_owned())
             .spawn(move || back.give());
         if let Err(why) = spawned {
-            tracing::error!(%why, "no thread to clean a dropped slot: it stays out of the pool");
+            tracing::error!(%why, "no thread to clean a dropped slot: it is quarantined");
         }
     }
 }
@@ -681,6 +690,32 @@ mod tests {
         assert_eq!(slot.ready().user.uid, 701);
         assert_eq!(calls.load(Ordering::SeqCst), 3);
         slot.release().await;
+    }
+
+    /// Catches a slot whose clean did not finish (the clean panicked, or its thread or
+    /// task never ran) left counted as able to run a lease, with a permit that finds
+    /// no free slot (`take` would fail with "none free"): it is counted quarantined,
+    /// and no lease waits on it.
+    #[tokio::test]
+    async fn a_slot_whose_clean_did_not_finish_is_quarantined() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&calls);
+        let cleaner: Cleaner = Arc::new(move |_: &Ready| {
+            if counted.fetch_add(1, Ordering::SeqCst) > 0 {
+                panic!("the clean of the hand-back panics");
+            }
+            Outcome::Clean
+        });
+        let slots = Slots::with(ready(1), cleaner, PathBuf::from("/nonexistent"));
+        slots.take().await.expect("taken").release().await;
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            slots.count(),
+            0,
+            "a slot whose clean did not finish is reported"
+        );
+        let again = tokio::time::timeout(Duration::from_millis(300), slots.take()).await;
+        assert!(again.is_err(), "a permit was left for it: {again:?}");
     }
 
     /// Catches a slot lease handed a simulator (it would be made in root's device set,
