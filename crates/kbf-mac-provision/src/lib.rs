@@ -25,7 +25,9 @@
 //!   program, read a file's owner and mode, the effective uid, change a file), and
 //!   [`host::RealHost`].
 //! - [`items`]: the table of items, a check and a fix each, and the reports.
-//! - [`launchd`]: the LaunchDaemon property list the profile renders, and the restart.
+//! - [`launchd`]: the LaunchDaemon property list the profile renders, the account it
+//!   runs as (`daemon_user`), and the restart.
+//! - `pool`: the lease-user pool `kbf-pool-<i>` and the volume its homes are on.
 //! - [`record`]: the settings as `apply` first found them, and `revert`.
 //! - [`cli`]: flags and exit statuses.
 //!
@@ -41,5 +43,6 @@ pub mod record;
 
 mod accounts;
 mod pattern;
+mod pool;
 mod software;
 mod sshd;

@@ -20,6 +20,35 @@ against a fake Mac in `cargo test`. Where the port differs:
   setting is not put back (its command fails, or it reads back otherwise), it prints a
   `FAIL` line for it, keeps the record where it is and exits 1; run it again once the
   setting can be changed.
+- Three items the script does not have, for the lease-user pool of
+  `docs/design/macos-end-state.md` (step 2), over
+  five optional keys (the script refuses them):
+  - `kbf_volume` (`/Volumes/<name>`, default `/Volumes/kbf`): a mounted APFS volume
+    (`diskutil info` gives the path itself as the mount point), not indexed (`mdutil -s`, and `.metadata_never_index` at its
+    root) and excluded from Time Machine (`tmutil isexcluded`). `apply` writes the
+    marker, runs `mdutil -i off` and `tmutil addexclusion`; it does not make the volume
+    (`diskutil apfs addVolume` is the operator's).
+  - `pool_users` (`pool_users`, 1 to 64, default 4; `pool_first_uid`, default the uid
+    after `lease_uids` and never below 600): users `kbf-pool-<i>` for `i < pool_users`
+    with uid `pool_first_uid + i`, primary group `kbfpool` (gid `pool_first_uid`),
+    shell `/usr/bin/false`, home `kbf-pool-<i>` in the `home` directory of
+    `kbf_volume` (theirs, mode 700, in a directory of root's, mode 755), hidden,
+    `Password` `*` and no
+    `AuthenticationAuthority`; none an administrator or in `wheel` (`dseditgroup`), and
+    no other account holding a pool uid or the gid. The pool's uids must be at most
+    65535 and outside `lease_uids`. `apply` makes them with `dscl . -create`, removes
+    `admin` and `wheel` memberships with `dseditgroup -o edit -d`, and makes the homes
+    only while the volume is mounted and its `home` directory is a directory of root's,
+    mode 755 (never through a link there); it leaves a user whose uid another holds,
+    and changes nothing while another group holds the gid.
+  - `daemon_user` (`role`, the default, or `root`; `kbf_cache`, an absolute path):
+    with `role` nothing changes and nothing is checked. With `root` the property list
+    has no `UserName` or `GroupName`, the error log is root's, the node key (`kbf_key`)
+    is a regular file with one link, root's, mode 600, and the scratch root and
+    `kbf_cache` (if set) are directories of root's, mode 755, on `kbf_volume`.
+    `daemon_user=root` makes kbf-daemon run as root; a profile sets it only once the
+    daemon runs every action as a pool user and refuses uid 0 (step 3 of that
+    document).
 
 ```text
 kbf-mac-provision check   --profile FILE [--keys K,K]   # one PASS/FAIL line per item; exit 1 on any FAIL
