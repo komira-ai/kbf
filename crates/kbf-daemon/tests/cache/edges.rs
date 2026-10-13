@@ -238,8 +238,14 @@ async fn cache_io_errors_never_fail_a_lease() {
 async fn a_file_made_outside_during_a_fill_is_never_served_unhashed() {
     let dir = scratch("cache-eexist");
     let gates = Gates::new();
+    // The background pass is held: it would adopt the outside file on its own time.
+    let first_pass = gates.hold(|p| *p == Point::PassStarts);
     let cache =
         Cache::open(config(&dir, GIB, Arc::clone(&gates), &FakeClock::at(1000))).expect("open");
+    let waiting = Arc::clone(&gates);
+    tokio::task::spawn_blocking(move || waiting.wait_reached(first_pass))
+        .await
+        .expect("held");
     let cas = Arc::new(CountingCas::default());
     let k = key(b"the right one", false);
     let held = gates.hold(move |p| *p == Point::Filled(&k));
