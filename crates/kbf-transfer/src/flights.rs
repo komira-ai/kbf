@@ -9,7 +9,8 @@
 //!
 //! A caller that stops waiting (its lease dropped) leaves the flight. When the last
 //! waiter leaves, the task is told, and gives up unless more than half of the blob has
-//! arrived: then it finishes, for a caller that asks next
+//! arrived: then it finishes, for a caller that joins before it lands (a flight that
+//! lands with no waiter keeps nothing)
 //! (`docs/design/worker-cache.md#44-limits-retries-cancellation`). Giving up drops the
 //! read where it is, so a request that was only queued never starts. Joining and giving
 //! up both happen under the map's lock, so no caller joins a flight that has given up.

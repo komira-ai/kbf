@@ -1036,7 +1036,13 @@ left open):
 - A shared fetch counts its waiters. When the last leaves, the fetch gives up unless
   more than half of the blob has arrived; giving up drops the read, so one only queued
   never reaches the server. Only the fetch's own task takes it out of the map, under
-  the map's lock, so no caller joins a fetch that gave up.
+  the map's lock, so no caller joins a fetch that gave up. A fetch that finishes with no
+  waiters keeps nothing: its bytes go only to a caller that joined while it ran, not to
+  a later lease or the cache (4.4's "for the next lease or the cache" is not built).
+- The byte budget is held while a blob is read into memory and released when it lands.
+  Each waiter of a shared fetch then gets its own copy (`get` returns a `Vec<u8>`; all
+  but the last are clones), outside the budget: 16 leases sharing one fetch hold 16
+  copies of its blob until they write them out.
 - **`TransferStats` is a log line, not yet the API.** Each lease's scope logs
   `transfers: read_calls=... read_bytes=... merged_reads=... find_missing_digests=...
   outputs_present=... write_calls=... written_bytes=... retries=...` (INFO, field
@@ -1052,7 +1058,8 @@ left open):
   `--transfer-retries`, with 4.5's defaults, still *unmeasured* (no farm measurement
   ran with this change). `--transfer-lease-in-flight` is not added until a measurement
   shows a need; the batch flags come with T2.
-- Tests: T-1, T-2, T-3 and C-11 are in `crates/kbf-transfer/tests/engine.rs`, against a
+- Tests: T-1 (for reads, and again for writes and FindMissing calls with reads), T-2,
+  T-3 and C-11 are in `crates/kbf-transfer/tests/engine.rs`, against a
   counting fake server behind a proxy that counts connections and can cut them. The
   windows are checked in the SETTINGS and WINDOW_UPDATE frames the engine sends, and
   the decode limit with a 4.5 MiB message.
