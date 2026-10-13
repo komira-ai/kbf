@@ -62,9 +62,7 @@ impl Slots {
         for user in pool.users() {
             ready.push(resolve(user, &program)?);
         }
-        for user in pool.users() {
-            uid::end(user.uid, within).map_err(io::Error::other)?;
-        }
+        let _ = within;
         let count = ready.len();
         Ok(Self {
             ready: Arc::new(ready),
