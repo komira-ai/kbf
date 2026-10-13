@@ -1220,6 +1220,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "kbf-bench"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "futures",
+ "hex",
+ "kbf-daemon",
+ "kbf-front",
+ "kbf-proto",
+ "kbf-server",
+ "prost",
+ "rcgen",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "thiserror",
+ "tokio",
+ "tonic",
+]
+
+[[package]]
 name = "kbf-caps"
 version = "0.1.0"
 dependencies = [

@@ -9,6 +9,7 @@
 kbf-alert                 0      0
 kbf-auth                  0      0
 kbf-baseline              0      0
+kbf-bench                 0      0
 kbf-caps                  2      1
 kbf-coverage              0      0
 kbf-daemon               29      8
