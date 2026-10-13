@@ -421,6 +421,72 @@ async fn a_daemons_write_and_read_on_the_worker_listener_are_counted() {
     assert_eq!(metrics.object_get.count(), 1);
 }
 
+/// 48 concurrent 4 MiB Writes in 1 MiB messages over one mutual-TLS connection to
+/// the worker listener (the daemons' upload path), against a 12 MiB
+/// `--write-bytes-in-flight`, so 45 Writes wait for admission with unread data on the
+/// connection: every Write finishes, and the receive buffers never held more than the
+/// bound.
+///
+/// Catches: the worker listener's HTTP/2 windows left at the transport's defaults
+/// (`write_admission.rs` covers the REAPI listener only), with which the waiting
+/// Writes take the whole connection window and the admitted ones never receive their
+/// last bytes. Mutant seen red: `flow_control` not applied to the worker listener's
+/// builder in `serve.rs` (the timeout fires with a few Writes done).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_writes_on_the_worker_listener_all_finish_under_the_bound() {
+    const BLOB: usize = 4 << 20;
+    const CHUNK: usize = 1 << 20;
+    const WRITES: u64 = 48;
+    const BOUND: u64 = 3 * BLOB as u64;
+    let pki = Pki::new("flow-control");
+    let writes = kbf_front::WriteConfig {
+        bytes_in_flight: BOUND,
+        ..kbf_front::WriteConfig::DEFAULT
+    };
+    let cache = Arc::new(Cache::memory().with_writes(writes));
+    let (_, worker) = pki.serve_cache(Arc::clone(&cache));
+    let node = pki.node(&["node-1"], 21);
+    let channel = pki.channel(worker, Some(&node.identity)).await;
+    let mut calls = Vec::new();
+    for i in 0..WRITES {
+        let mut data = vec![0_u8; BLOB];
+        data[..8].copy_from_slice(&i.to_le_bytes());
+        let d = digest_of(&data);
+        let name = format!("uploads/u{i}/blobs/{}/{}", d.hash, d.size_bytes);
+        let messages: Vec<WriteRequest> = data
+            .chunks(CHUNK)
+            .enumerate()
+            .map(|(j, c)| WriteRequest {
+                resource_name: if j == 0 { name.clone() } else { String::new() },
+                write_offset: (j * CHUNK) as i64,
+                finish_write: (j + 1) * CHUNK == BLOB,
+                data: c.to_vec(),
+            })
+            .collect();
+        let mut client = ByteStreamClient::new(channel.clone());
+        calls.push(tokio::spawn(async move {
+            client.write(stream::iter(messages)).await
+        }));
+    }
+    let mut done = 0_u64;
+    let all = async {
+        for call in calls {
+            let response = call.await.expect("join").expect("write").into_inner();
+            assert_eq!(response.committed_size, BLOB as i64);
+            done += 1;
+        }
+    };
+    let finished = tokio::time::timeout(std::time::Duration::from_secs(60), all)
+        .await
+        .is_ok();
+    assert!(finished, "{done} of {WRITES} Writes finished in 60 s");
+    let peak = cache.write_buffer_peak();
+    assert!(
+        peak <= BOUND,
+        "{peak} bytes buffered over a {BOUND}-byte bound"
+    );
+}
+
 /// Catches: blob calls served to a caller with no client certificate (the listener's
 /// TLS not applied to them, or applied without the client CA), and to a plain-text
 /// client on the worker port.

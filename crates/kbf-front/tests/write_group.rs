@@ -245,9 +245,10 @@ async fn a_failed_segment_fails_only_its_own_blobs() {
 /// status it does not change.
 ///
 /// Catches: one status smeared over the batch; the store's answers shifted by the
-/// invalid blob. Mutants seen red: answer every verified blob with the first failure;
-/// zip the store's answers with every response instead of the verified ones
-/// (`[OK, UNAVAILABLE, OK]`).
+/// invalid blob; the call counted ok in `kbf_batch_update_*` when only some of its
+/// blobs were stored. Mutants seen red: answer every verified blob with the first
+/// failure; zip the store's answers with every response instead of the verified ones
+/// (`[OK, UNAVAILABLE, OK]`); count the call ok when any blob stored (`any` for `all`).
 #[tokio::test(start_paused = true)]
 async fn a_batch_over_a_failed_and_a_good_segment_answers_each_blob() {
     let (cache, store) = cache(WriteConfig::DEFAULT, one_4k_blob()).await;
@@ -281,6 +282,12 @@ async fn a_batch_over_a_failed_and_a_good_segment_answers_each_blob() {
         .collect();
     let want = [Code::Ok, Code::InvalidArgument, Code::Unavailable].map(i32::from);
     assert_eq!(codes, want);
+    let calls = &cache.metrics().batch_update;
+    assert_eq!(
+        (calls.total.get(), calls.errors.get()),
+        (1, 1),
+        "a batch with a blob that failed to store counted as ok"
+    );
     assert_eq!(answer(&cache, bad.digest()).await, BlobAnswer::Absent);
     assert!(present(&cache, good.digest()).await);
     assert_audit_clean(&cache);
@@ -599,26 +606,30 @@ async fn a_caller_that_goes_away_keeps_its_bytes_admitted_until_they_are_written
 }
 
 /// A `BatchUpdateBlobs` waits for admission of its total before it stores anything:
-/// with the 8 KiB bound held elsewhere it does not finish, and once the bytes are
-/// released it stores its blob.
+/// with all but one byte less than its 4 KiB total of the 8 KiB bound held elsewhere,
+/// it does not finish, and once the bytes are released it stores its blob.
 ///
-/// Catches: a batch stored past the bound. Mutant seen red: no admission in
-/// BatchUpdateBlobs.
+/// Catches: a batch stored past the bound, and a batch admitted for less than its
+/// total (any amount up to the 4095 bytes left free would go through). Mutants seen
+/// red: no admission in BatchUpdateBlobs; `admit(1)` in place of `admit(total)`.
 #[tokio::test(start_paused = true)]
 async fn a_batch_waits_for_admission_of_its_total() {
+    const BOUND: u64 = 8 << 10;
+    const TOTAL: u64 = 4096;
     let (cache, _store) = cache(
-        config(|c| c.bytes_in_flight = 8 << 10),
+        config(|c| c.bytes_in_flight = BOUND),
         kbf_segments::MAX_SEGMENT_BYTES,
     )
     .await;
-    let held = cache.admit(8 << 10).await;
-    let b = blob(15, 4096);
+    // Leaves TOTAL - 1 bytes free: enough for any admission smaller than the total.
+    let held = cache.admit(BOUND - TOTAL + 1).await;
+    let b = blob(15, TOTAL as usize);
     let call = {
         let service = CasService::new(Arc::clone(&cache));
         let request = BatchUpdateBlobsRequest {
             requests: vec![batch_update_blobs_request::Request {
                 digest: Some(kbf_front::digest_to_proto(&b.digest())),
-                data: bytes(15, 4096),
+                data: bytes(15, TOTAL as usize),
                 ..Default::default()
             }],
             ..Default::default()
