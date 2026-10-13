@@ -130,10 +130,10 @@ async fn an_output_that_is_an_input_is_a_private_copy() {
 }
 
 /// C-12 (C1's half: no subtree is reused yet). Catches one lease's changes reaching the
-/// next: lease 1 creates, deletes, renames and rewrites files in a tree; lease 2 with
-/// the same input root sees it pristine. Mutant: the input root mounted without the
-/// overlay and its files given to the container's root, so a rewrite lands in the
-/// cache's inode.
+/// next: lease 1 creates, deletes, renames and rewrites files in a tree (the rewrite
+/// keeps the size, so the stat check alone would not catch it); lease 2 with the same
+/// input root sees it pristine. Mutant: the input root mounted without the overlay and
+/// its files given to the container's root, so the rewrite lands in the cache's inode.
 #[tokio::test]
 #[ignore = "needs rootless Podman and a delegated cgroup: run by tools/ci/podman-tests.sh"]
 async fn a_lease_sees_none_of_the_last_ones_changes() {
@@ -143,7 +143,7 @@ async fn a_lease_sees_none_of_the_last_ones_changes() {
         ("lib/b", b"b bytes", false),
     ];
     let mut first =
-        sh("echo new > lib/new; echo changed > lib/a; rm lib/a; mv lib/b lib/c; ls lib");
+        sh("echo new > lib/new; printf 'A bytes' > lib/a; rm lib/a; mv lib/b lib/c; ls lib");
     first.inputs = inputs.clone();
     let result = cell.run(1, &first).await.expect("lease 1");
     assert_eq!(cell.stdout(&result), "c\nnew\n");
