@@ -22,6 +22,8 @@ use sha2::{Digest as _, Sha256};
 use tonic::Code;
 use tonic::transport::Channel;
 
+use crate::phases;
+
 /// The most bytes one ByteStream `WriteRequest` carries: the front's read chunk size,
 /// well under its message limit.
 pub const WRITE_CHUNK_BYTES: usize = 1 << 20;
@@ -115,7 +117,8 @@ pub fn label(digest: &Digest) -> String {
 /// A client of the server's CAS: reads with ByteStream `Read`, writes with
 /// ByteStream `Write`, one blob per call. The server serves one cache per cell, so
 /// resource names carry no instance name. The daemon binaries dial the server's
-/// worker listener with it, over mutual TLS.
+/// worker listener with it, over mutual TLS. Each blob read and stored is counted for
+/// the lease whose task made the call ([`crate::phases`]).
 #[derive(Debug)]
 pub struct CasClient {
     bytestream: ByteStreamClient<Channel>,
@@ -170,10 +173,12 @@ impl Cas for CasClient {
         while let Some(chunk) = chunks.message().await.map_err(fail)? {
             bytes.extend_from_slice(&chunk.data);
         }
+        phases::read(bytes.len() as u64);
         Ok(bytes)
     }
 
     async fn put(&self, bytes: Vec<u8>) -> Result<Digest, CasError> {
+        let upload = phases::upload();
         let digest = digest_of(&bytes);
         let name = self.upload_name(&digest);
         // One message per chunk; an empty blob is one message with no data.
@@ -197,10 +202,13 @@ impl Cas for CasClient {
             .await
             .map_err(|status| call_error(&digest, &status))?
             .into_inner();
-        committed(&digest, response.committed_size)
+        let stored = committed(&digest, response.committed_size)?;
+        upload.done(bytes.len() as u64);
+        Ok(stored)
     }
 
     async fn put_chunks(&self, digest: Digest, chunks: Chunks) -> Result<Digest, CasError> {
+        let counted = phases::upload();
         let name = self.upload_name(&digest);
         // A task reads the chunks and hands the requests over a channel that holds
         // one, so a chunk or two is in memory at a time.
@@ -222,7 +230,9 @@ impl Cas for CasClient {
         let response = response
             .map_err(|status| call_error(&digest, &status))?
             .into_inner();
-        committed(&digest, response.committed_size)
+        let stored = committed(&digest, response.committed_size)?;
+        counted.done(digest.size_bytes.unsigned_abs());
+        Ok(stored)
     }
 }
 

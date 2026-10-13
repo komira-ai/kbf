@@ -21,6 +21,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+use std::time::Instant;
 
 use kbf_proto::google::rpc::precondition_failure::Violation;
 use kbf_proto::google::rpc::{Code, PreconditionFailure, Status};
@@ -30,11 +31,12 @@ use kbf_types::{LeaseId, LostWhy, Resources};
 use prost::Message;
 use tokio::sync::mpsc;
 
+use crate::phases::{self, LeasePhases, Transfers};
 use crate::runtime::{RuntimeError, Work};
 use crate::runtimes::{AnyRuntime, Runtimes};
 
-/// A finished run: its lease and outcome.
-pub(crate) type Done = (LeaseId, Result<ActionResult, RuntimeError>);
+/// A finished run: its lease, outcome, and where its time went.
+pub(crate) type Done = (LeaseId, Result<ActionResult, RuntimeError>, LeasePhases);
 
 /// The leases a daemon is running.
 pub(crate) struct Leases {
@@ -99,9 +101,18 @@ impl Leases {
         let done = self.done.clone();
         let run = Arc::clone(&runtime);
         tokio::spawn(async move {
-            let outcome = run.run(work).await;
+            let transfers = Arc::new(Transfers::default());
+            let started = Instant::now();
+            let outcome = phases::scoped(Arc::clone(&transfers), run.run(work)).await;
+            let phases = LeasePhases::new(
+                id,
+                run.driver(),
+                started.elapsed(),
+                outcome.as_ref().ok(),
+                transfers.counts(),
+            );
             // The receiver lives as long as the daemon.
-            let _ = done.send((id, outcome));
+            let _ = done.send((id, outcome, phases));
         });
         tracing::info!(lease = %id, driver = runtime.driver(), "lease started");
         self.running.insert(id, Running { runtime });
@@ -139,11 +150,14 @@ impl Leases {
     /// Turns a finished run into its Result: a fenced (lost) one if the lease was
     /// fenced, whatever the run's outcome. Every run reports once, on `done`, and its
     /// lease is running until then: neither a fence nor a `Cancel` drops it sooner.
+    /// Logs where the lease's time went, `phases`, in one INFO line (`lease phases:`).
     pub(crate) fn finished(
         &mut self,
         id: LeaseId,
         outcome: Result<ActionResult, RuntimeError>,
+        phases: &LeasePhases,
     ) -> worker::Result {
+        tracing::info!("lease phases: {phases}");
         self.running.remove(&id);
         // A cancelled run ends ABORTED (killed), or as it ended if it beat the kill;
         // the server refuses either.
@@ -392,12 +406,12 @@ mod tests {
         assert_eq!(leases.fence(), [], "a lease fenced twice");
         let mut results = Vec::new();
         for _ in ids {
-            let (id, outcome) =
+            let (id, outcome, phases) =
                 tokio::time::timeout(std::time::Duration::from_secs(10), done_rx.recv())
                     .await
                     .expect("the fence killed one lease at a time")
                     .expect("open");
-            results.push(leases.finished(id, outcome));
+            results.push(leases.finished(id, outcome, &phases));
         }
         results.sort_by_key(|r| r.lease_id.map(|l| (l.term, l.seq)));
         let fenced: Vec<_> = results.iter().map(|r| r.lease_id).collect();
@@ -451,12 +465,12 @@ mod tests {
         // One kill ends one run. Were the resend a second run, the fence would wait
         // for a run nothing stops (or, if the kill ended that one, `runs` would be 2).
         assert_eq!(leases.fence(), [id()]);
-        let (ended, outcome) =
+        let (ended, outcome, phases) =
             tokio::time::timeout(std::time::Duration::from_secs(5), done_rx.recv())
                 .await
                 .expect("the fence waited for a second run of one lease")
                 .expect("open");
-        leases.finished(ended, outcome);
+        leases.finished(ended, outcome, &phases);
         assert_eq!(runtime.runs.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
@@ -479,9 +493,9 @@ mod tests {
         assert!(!leases.cancel(LeaseId::new(3, 9)), "a lease never started");
         assert!(leases.cancel(id()));
         assert!(!leases.cancel(id()), "a lease already being cancelled");
-        let (ended, outcome) = done_rx.recv().await.expect("the run ends");
+        let (ended, outcome, phases) = done_rx.recv().await.expect("the run ends");
         assert_eq!(ended, id());
-        let result = leases.finished(ended, outcome);
+        let result = leases.finished(ended, outcome, &phases);
         assert_eq!(code(&result), Code::Aborted as i32);
         assert_eq!(runtime.killed(), [id()]);
         assert!(leases.running().is_empty());
@@ -490,6 +504,60 @@ mod tests {
             "a finished lease is still cancelled"
         );
         assert!(!leases.cancel(id()), "a finished lease");
+    }
+
+    /// Bytes logged through [`Captured::writer`].
+    #[derive(Clone, Default)]
+    struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("log lock").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Catches a lease's end not logged, logged below INFO (a node's default filter
+    /// would drop it), or logged without its fields: the `lease phases:` line is
+    /// where an operator reads where a slow lease's time went.
+    #[tokio::test]
+    async fn a_finished_lease_logs_its_phases_at_info() {
+        let runtime = Arc::new(crate::FakeRuntime::new(std::time::Duration::ZERO));
+        let (done, mut done_rx) = mpsc::unbounded_channel();
+        let mut leases = Leases::new(Runtimes::new(runtime), done);
+        let start = Start {
+            lease_id: Some(proto_lease_id(id())),
+            kind: "action".to_owned(),
+            action_digest: Some(Digest::default()),
+            ..Start::default()
+        };
+        assert_eq!(leases.start(start), None);
+        let (ended, outcome, phases) = done_rx.recv().await.expect("the run ends");
+        let captured = Captured::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            leases.finished(ended, outcome, &phases);
+        });
+        // Nothing is buffered; the subscriber never flushes.
+        std::io::Write::flush(&mut captured.clone()).expect("flush");
+        let log = String::from_utf8(captured.0.lock().expect("log lock").clone()).expect("UTF-8");
+        assert!(log.contains("lease phases:"), "{log}");
+        let line = log
+            .lines()
+            .find(|l| l.contains("lease phases:"))
+            .expect("the line");
+        assert!(line.contains(" INFO "), "{line}");
+        assert!(line.ends_with(&format!("lease phases: {phases}")), "{line}");
+        assert!(line.contains("lease=3.4 driver=fake ok=true "), "{line}");
     }
 
     /// Catches a Start without an action being run anyway.

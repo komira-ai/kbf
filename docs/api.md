@@ -3,7 +3,8 @@
 `kbf-server` serves an HTTP/JSON API under `/v1` for the Fleet UI, scripts and
 clients ([fleet-updates.md](design/fleet-updates.md) section 11.4), and
 [`/healthz` and `/readyz`](#get-healthz-and-get-readyz) for a front's health check (the REAPI
-listener answers the same readiness over [`grpc.health.v1`](#grpchealthv1-on-the-reapi-listener)). It listens on its
+listener answers the same readiness over [`grpc.health.v1`](#grpchealthv1-on-the-reapi-listener)), and
+[`/metrics`](#get-metrics), the cache's upload-path metrics in the Prometheus text format. It listens on its
 own address, given with `--api-listen`; without the flag there is no API. The start
 line then ends with ` api=<addr>`. The listener speaks HTTP/1.1, and HTTP/2 in clear
 text (h2c, with prior knowledge); every rule below holds for both.
@@ -16,7 +17,7 @@ off without it. Writes need a token (see [Who may write](#who-may-write)). The r
 operators, a short-lived `rollout` for CI) are **planned**; the token is the one
 operator credential until they land.
 
-Every body is `application/json`, except a blob's bytes. What the server keeps here is
+Every body is `application/json`, except a blob's bytes and `/metrics`. What the server keeps here is
 **in memory**, like the scheduler's state: a restart forgets it, and each daemon
 reports again after its next `Welcome`.
 
@@ -212,6 +213,60 @@ The store probe waits at most `--readyz-store-timeout-ms`, like `/readyz`'s.
 **Planned:** with several servers, the answers follow the two readiness paths, ready
 to serve reads and leader; which service name reports which is not chosen
 ([deployment-topology.md](design/deployment-topology.md#build-clients-one-name-routed-by-method)).
+
+## `GET /metrics`
+
+The cache's upload path in the Prometheus text exposition format (version 0.0.4,
+`Content-Type: text/plain; version=0.0.4; charset=utf-8`): what the CAS services did,
+and how long each stage of a store took. A read, open like `GET /v1/nodes`; it names
+no blob, build or node. Every listener that serves the cache counts into the same
+families: the REAPI listener (clients) and the worker listener (daemons' uploads of
+outputs and reads of inputs). The counts are in memory and start at 0 with the
+process.
+
+Each request family counts from the start of its handler to its answer. A call whose
+caller goes away before the answer counts as an error.
+
+| Family | Type | What it measures |
+|---|---|---|
+| `kbf_bytestream_write_requests_total`, `_errors_total` | counter | ByteStream Write calls answered (or dropped), and those that failed |
+| `kbf_bytestream_write_bytes_total` | counter | blob bytes received, counted as each message arrives, so a slow Write shows progress before it ends |
+| `kbf_bytestream_write_in_flight` | gauge | Writes begun and not yet answered |
+| `kbf_bytestream_write_seconds` | histogram | Write latency, end to end |
+| `kbf_bytestream_write_present_total` | counter | Writes answered at once because the blob was already durable |
+| `kbf_batch_update_requests_total`, `_errors_total`, `_bytes_total`, `_in_flight`, `_seconds` | as above | BatchUpdateBlobs calls; `kbf_batch_update_blobs_total` counts the blobs they sent |
+| `kbf_find_missing_requests_total`, `_errors_total`, `_in_flight`, `_seconds` | as above | FindMissingBlobs calls; `kbf_find_missing_digests_total` the digests asked about, `kbf_find_missing_missing_total` those answered missing |
+| `kbf_store_blobs_seconds` | histogram | one store of verified blobs (a Write's, or a batch's): the query for blobs already held, their touch, and every segment's PUT, footer read and commit |
+| `kbf_segment_put_seconds` | histogram | one segment's object PUT |
+| `kbf_segment_footer_read_seconds` | histogram | one segment's footer read back after its PUT: two range GETs, the trailer and then the footer |
+| `kbf_segment_commit_seconds` | histogram | one segment's `PutBlobs` commit to the metadata log |
+| `kbf_segment_blobs`, `kbf_segment_bytes` | histogram | blobs, and bytes (footer included), per segment written |
+| `kbf_object_get_seconds` | histogram | one range GET of a blob being read (ByteStream Read, GetActionResult, a BatchReadBlobs run); footer reads are not in it |
+| `kbf_meta_commit_seconds{command}` | histogram | every metadata-log commit the cache makes, by command (`put_blobs`, `touch`, `put_action`, `object_unreachable`, `tick`, `collect`, ...): with `--meta-log=raft`, the Raft log's commit latency |
+| `kbf_meta_query_seconds` | histogram | every metadata-log query the cache makes |
+
+Latency buckets run from 1 ms to 60 s; size buckets from 1 KiB to 1 GiB by fours;
+the blobs-per-segment buckets from 1 to 16384 by fours.
+
+**Reading a slow upload.** Each ByteStream Write stores one blob, so a daemon's output
+tree of N files costs N Writes, each its own segment. Over a window, with `rate()`:
+
+- Writes per second is `rate(kbf_bytestream_write_requests_total)`; with
+  `kbf_bytestream_write_in_flight` near the daemon's upload limit, it is that limit
+  over the mean Write latency
+  (`rate(kbf_bytestream_write_seconds_sum) / rate(kbf_bytestream_write_seconds_count)`).
+- The mean of each stage (`_sum` over `_count` of `kbf_segment_put_seconds`,
+  `kbf_segment_footer_read_seconds`, `kbf_segment_commit_seconds`) says which one the
+  Write waits on: the object store's PUT, its GETs, or the metadata log. What
+  `kbf_store_blobs_seconds` holds beyond the three is the held-blob query and touch;
+  what a Write holds beyond its store is receiving the bytes.
+- `kbf_segment_blobs` with a mean of 1 says every segment holds one blob: each upload
+  pays a PUT, two GETs and a commit of its own.
+- `kbf_bytestream_write_present_total` against the requests says how many uploads
+  were of blobs already held.
+
+The daemon logs the other side, per lease: its phase times and what it uploaded
+([daemon.md](design/daemon.md#where-a-leases-time-went)).
 
 ## `GET /v1/invocations/{id}` and below
 

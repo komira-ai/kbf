@@ -565,6 +565,25 @@ them, recording none of its outputs):
 Every output file, stdout and stderr is stored in the CAS before the `Result` is sent;
 the server refuses an `OK` result whose outputs are not all stored.
 
+## Where a lease's time went
+
+When a lease's run ends the daemon logs one INFO line, `lease phases:` and then
+`key=value` fields, and sends the same fields to an observer as `Event::LeaseEnded`
+(`kbf_daemon::phases`):
+
+| Field | What it is |
+|---|---|
+| `lease`, `driver`, `ok` | the lease, the driver it ran on, and whether the run produced a result (an action that exits non-zero does) |
+| `lease_ms` | from the run's start in the daemon to its end |
+| `inputs_ms`, `run_ms`, `outputs_ms` | the driver's own stamps in the result's `ExecutedActionMetadata`: input fetch, execution, output upload; `-` when the run produced no result. What `lease_ms` holds beyond their sum is the driver's work outside them (making and removing the lease's directories, the container's create and chown) |
+| `output_files`, `output_dirs` | the files and directories the result names at its top level (the files inside an output directory are in `blobs_uploaded`) |
+| `blobs_read`, `bytes_read` | blobs the daemon's CAS client read for the lease, and their bytes |
+| `blobs_uploaded`, `bytes_uploaded` | blobs it stored for the lease (each one ByteStream Write: output files, Directories, Trees, stdout, stderr), and their bytes |
+| `most_uploads_in_flight` | the most of those Writes in flight at once |
+
+The CAS client counts into the lease whose task makes the call. The server's side of
+the same uploads is in `GET /metrics` ([api.md](../api.md#get-metrics)).
+
 ## Measuring usage
 
 `usage::Child` spawns an action as the leader of its own process group and reaps it
