@@ -208,6 +208,11 @@ fn the_cache_is_off_on_storage_its_checks_did_not_pass() {
             &config.scratch,
         );
         let dir = given.config.dir.clone();
+        let shown = format!("{given:?}");
+        assert!(
+            shown.contains(&format!("{dir:?}")) && shown.contains("/kbf/bin/kbf-daemon"),
+            "a CacheUse shown without its directory or helper: {shown}"
+        );
         config.cache = Some(given);
         let runtime = PodmanRuntime::new(config, Arc::new(MemoryCas::new())).expect("runtime");
         let touched = std::fs::read_dir(&dir).expect("list").next().is_some();
