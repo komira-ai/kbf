@@ -123,6 +123,7 @@ mod program;
 mod record;
 mod runtime;
 pub mod simulator;
+pub mod slots;
 mod sweep;
 pub mod user_folders;
 pub mod whole_machine;
@@ -135,6 +136,9 @@ kbf_daemon::keeper_test_hook!();
 // So do the act steps and the fake Xcode tools they run (src/xcode_tests.rs).
 #[cfg(test)]
 kbf_testkit::act_test_hook!();
+// And the `as-user` mode an action of a lease-user pool starts through.
+#[cfg(test)]
+as_user_test_hook!();
 
 pub use config::{MemoryPolicy, NativeConfig};
 pub use runtime::{DRIVER, KIND, NativeRuntime, SURVEY_DIR, WARM_UP_DIR};

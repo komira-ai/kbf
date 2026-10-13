@@ -7,6 +7,7 @@ use std::time::Duration;
 use kbf_outputs::OutputLimits;
 
 use crate::network::Isolation;
+use crate::slots::Pool;
 use crate::user_folders::{LEFTOVER_AGE, UserFolders};
 
 /// How much memory one lease's processes may hold together before they are killed.
@@ -75,13 +76,16 @@ pub struct NativeConfig {
     /// The `xcrun` that runs `simctl` for the leases that ask for a simulator
     /// ([`crate::simulator`]).
     pub xcrun: PathBuf,
+    /// The lease-user pool actions are to run as, one user per slot ([`crate::slots`]);
+    /// not read yet.
+    pub pool: Option<Pool>,
 }
 
 impl NativeConfig {
     /// A configuration with a one hour default timeout, the default output limits and
     /// memory policy, a 250 ms poll, a 5 s kill wait, this node's isolation and user
-    /// folders, leftovers swept after [`LEFTOVER_AGE`], no Xcode (see [`Self::xcodes`])
-    /// and the system `xcrun`.
+    /// folders, leftovers swept after [`LEFTOVER_AGE`], no Xcode (see [`Self::xcodes`]),
+    /// the system `xcrun` and no lease-user pool.
     #[must_use]
     pub fn new(scratch: PathBuf) -> Self {
         Self {
@@ -96,6 +100,7 @@ impl NativeConfig {
             user_folders: UserFolders::detect(),
             leftover_age: LEFTOVER_AGE,
             xcrun: PathBuf::from(crate::xcode::XCRUN),
+            pool: None,
         }
     }
 }
