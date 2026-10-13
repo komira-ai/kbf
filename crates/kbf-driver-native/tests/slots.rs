@@ -22,6 +22,7 @@ use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use kbf_daemon::Runtime as _;
@@ -32,6 +33,8 @@ use support::{MemoryCas, PROMPT, Spec, stdout};
 
 /// Where the users' uids start; the kbf-mac-session CI script uses 650 to 659.
 const FIRST_UID: u32 = 690;
+/// The next uid a test of this process may take.
+static NEXT_UID: AtomicU32 = AtomicU32::new(FIRST_UID);
 /// The pool users' primary group: staff.
 const GID: u32 = 20;
 /// The variable that turns [`keeper_daemon`] into the daemon [`the_keeper_ends_the_slot_when_the_daemon_dies`]
@@ -94,13 +97,21 @@ impl Drop for Scratch {
 struct Users(Vec<SlotUser>);
 
 impl Users {
-    /// `count` users `kbf-ci-slot-<name>-<i>`, at free uids from [`FIRST_UID`], their
-    /// homes `<scratch>/home/<user>`, mode 0700, their own.
+    /// `count` users `kbf-ci-slot-<name>-<i>`, at free uids from [`FIRST_UID`] that no
+    /// earlier test of this process used, their homes `<scratch>/home/<user>`, mode
+    /// 0700, their own. Never a uid again: this process's user database cache keeps
+    /// the name a deleted user had (`getpwuid` named the first test's user for the
+    /// next test's uid on the runner).
     fn new(name: &str, count: usize, scratch: &Scratch) -> Self {
         let taken = taken_uids();
-        let uids = (FIRST_UID..FIRST_UID + 100).filter(|u| !taken.contains(u));
+        let from = NEXT_UID.load(Ordering::SeqCst);
+        let uids: Vec<u32> = (from..FIRST_UID + 100)
+            .filter(|u| !taken.contains(u))
+            .take(count)
+            .collect();
+        NEXT_UID.store(uids.last().map_or(from, |u| u + 1), Ordering::SeqCst);
         let mut users = Self(Vec::new());
-        for (i, uid) in uids.take(count).enumerate() {
+        for (i, uid) in uids.into_iter().enumerate() {
             let user = SlotUser {
                 name: format!("kbf-ci-slot-{name}-{i}"),
                 uid,
