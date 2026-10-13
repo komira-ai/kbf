@@ -36,7 +36,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use kbf_daemon::cache::{Cache, CacheConfig, Disabled, InputStats};
 use kbf_daemon::cas::{Cas, CasError};
-use kbf_daemon::{Runtime, RuntimeError, Work};
+use kbf_daemon::{Runtime, RuntimeError, Work, upload_within};
 use kbf_proto::reapi::{Action, ActionResult, Command, ExecutedActionMetadata, Platform};
 use kbf_types::LeaseId;
 use prost_types::Timestamp;
@@ -82,6 +82,9 @@ pub struct PodmanConfig {
     pub kill_grace: Duration,
     /// How much output one action may leave; past it, the action fails.
     pub outputs: OutputLimits,
+    /// How long one lease's whole output upload (outputs, stdout and stderr) may take
+    /// before the lease fails saying so ([`kbf_daemon::upload_within`]).
+    pub upload_deadline: Duration,
     /// The pids, `/dev/shm` and ulimits each container is created with.
     pub limits: ContainerLimits,
     /// When a lease at its own memory cap that keeps pushing into swap is killed.
@@ -127,7 +130,8 @@ struct Cached {
 impl PodmanConfig {
     /// A configuration for `owner`'s containers with `podman` from `PATH`, cgroup v2 at
     /// `/sys/fs/cgroup`, a one hour default timeout, a five second kill grace,
-    /// the default [`OutputLimits`], [`ContainerLimits::DEFAULT`] and
+    /// the default [`OutputLimits`], [`kbf_daemon::UPLOAD_DEADLINE`],
+    /// [`ContainerLimits::DEFAULT`] and
     /// [`SwapKill::DEFAULT`].
     #[must_use]
     pub fn new(scratch: PathBuf, cgroup_parent: String, owner: String) -> Self {
@@ -139,6 +143,7 @@ impl PodmanConfig {
             default_timeout: Duration::from_secs(3600),
             kill_grace: Duration::from_secs(5),
             outputs: OutputLimits::DEFAULT,
+            upload_deadline: kbf_daemon::UPLOAD_DEADLINE,
             limits: ContainerLimits::DEFAULT,
             swap_kill: SwapKill::DEFAULT,
             owner,
@@ -524,23 +529,27 @@ impl<C: Cas> PodmanRuntime<C> {
             exit_code,
             ..ActionResult::default()
         };
-        collect(
-            cas,
-            &spec.upper,
-            &spec.working_directory,
-            &outputs,
-            self.config.outputs,
-            &mut result,
-        )
-        .await
-        .map_err(outputs_error)?;
-        let max = self.config.outputs.max_stdio_bytes;
-        for (path, slot) in [
-            (&stdout_path, &mut result.stdout_digest),
-            (&stderr_path, &mut result.stderr_digest),
-        ] {
-            *slot = Some(collect_log(cas, path, max).await.map_err(outputs_error)?);
-        }
+        let upload = async {
+            collect(
+                cas,
+                &spec.upper,
+                &spec.working_directory,
+                &outputs,
+                self.config.outputs,
+                &mut result,
+            )
+            .await
+            .map_err(outputs_error)?;
+            let max = self.config.outputs.max_stdio_bytes;
+            for (path, slot) in [
+                (&stdout_path, &mut result.stdout_digest),
+                (&stderr_path, &mut result.stderr_digest),
+            ] {
+                *slot = Some(collect_log(cas, path, max).await.map_err(outputs_error)?);
+            }
+            Ok(())
+        };
+        upload_within(self.config.upload_deadline, upload).await?;
         clock.output_upload_completed_timestamp = now();
         clock.worker_completed_timestamp = now();
         result.execution_metadata = Some(clock);

@@ -69,6 +69,34 @@ pub enum RuntimeError {
     Lost(LostWhy, String),
 }
 
+/// How long a lease's whole output upload may take unless the daemon is told otherwise
+/// (`--output-upload-deadline-secs`): 30 minutes.
+pub const UPLOAD_DEADLINE: Duration = Duration::from_secs(30 * 60);
+
+/// Runs `upload`, a lease's whole output upload (its output files, stdout and stderr),
+/// for at most `deadline`. Past it, `upload` is dropped, which cancels its calls to the
+/// store, and the lease fails with [`RuntimeError::Failed`] naming the upload, the
+/// deadline and the time it ran: a store that stops answering ends the lease instead
+/// of holding it with no error.
+///
+/// # Errors
+/// What `upload` returns, or the failure past the deadline.
+pub async fn upload_within<T>(
+    deadline: Duration,
+    upload: impl Future<Output = Result<T, RuntimeError>>,
+) -> Result<T, RuntimeError> {
+    let started = tokio::time::Instant::now();
+    tokio::time::timeout(deadline, upload)
+        .await
+        .unwrap_or_else(|_| {
+            Err(RuntimeError::Failed(format!(
+                "the output upload did not finish within its deadline of {deadline:?} \
+                 (--output-upload-deadline-secs): stopped after {:.1?}",
+                started.elapsed()
+            )))
+        })
+}
+
 /// Runs leases. The lease manager never names a driver: it asks the runtime whether it
 /// serves a lease kind, and runs the lease through it.
 pub trait Runtime: Send + Sync + 'static {
@@ -178,5 +206,48 @@ impl Runtime for FakeRuntime {
             // The receiver is gone only if the run already ended.
             let _ = stop.send(());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Catches an upload that is not bounded (the lease waits on a store that never
+    /// answers) and a failure that does not say it was the upload, its deadline and
+    /// how long it ran.
+    #[tokio::test]
+    async fn an_upload_past_its_deadline_fails_saying_so() {
+        let deadline = Duration::from_millis(50);
+        let pending = std::future::pending::<Result<(), RuntimeError>>();
+        let ended = tokio::time::timeout(Duration::from_secs(10), upload_within(deadline, pending))
+            .await
+            .expect("the upload ends at its deadline, not never");
+        let Err(RuntimeError::Failed(why)) = ended else {
+            panic!("expected a failure, got {ended:?}");
+        };
+        assert!(
+            why.starts_with("the output upload did not finish within its deadline of 50ms")
+                && why.contains("--output-upload-deadline-secs")
+                && why.contains("stopped after 5"),
+            "{why}"
+        );
+    }
+
+    /// Catches an upload that finishes in time being failed or changed.
+    #[tokio::test]
+    async fn an_upload_within_its_deadline_is_its_own_outcome() {
+        let deadline = Duration::from_secs(10);
+        assert_eq!(
+            upload_within(deadline, async { Ok::<_, RuntimeError>(7) })
+                .await
+                .expect("ok"),
+            7
+        );
+        let refused = upload_within(deadline, async {
+            Err::<(), _>(RuntimeError::Invalid("bad".to_owned()))
+        })
+        .await;
+        assert!(matches!(refused, Err(RuntimeError::Invalid(why)) if why == "bad"));
     }
 }
