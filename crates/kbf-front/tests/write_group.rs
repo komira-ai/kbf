@@ -235,12 +235,19 @@ async fn a_failed_segment_fails_only_its_own_blobs() {
     assert_audit_clean(&cache);
 }
 
-/// One `BatchUpdateBlobs` whose two good blobs land in two segments, one of which
-/// fails, with a bad blob between them: each blob gets its own status, in request
-/// order (UNAVAILABLE, INVALID_ARGUMENT, OK).
+/// One `BatchUpdateBlobs` whose two verified blobs land in two segments, the second of
+/// which fails, with a blob that fails verification between them: each blob gets its
+/// own status, in request order (OK, INVALID_ARGUMENT, UNAVAILABLE).
 ///
-/// Catches: one status smeared over the batch; statuses shifted by the bad blob.
-/// Mutant seen red: answer every verified blob with the first failure.
+/// The failing blob comes last so that pairing the store's answers with every response
+/// (the invalid one included) moves the failure onto the invalid blob and leaves the
+/// failed blob answered OK; with the failing blob first that shift lands on slots whose
+/// status it does not change.
+///
+/// Catches: one status smeared over the batch; the store's answers shifted by the
+/// invalid blob. Mutants seen red: answer every verified blob with the first failure;
+/// zip the store's answers with every response instead of the verified ones
+/// (`[OK, UNAVAILABLE, OK]`).
 #[tokio::test(start_paused = true)]
 async fn a_batch_over_a_failed_and_a_good_segment_answers_each_blob() {
     let (cache, store) = cache(WriteConfig::DEFAULT, one_4k_blob()).await;
@@ -253,10 +260,10 @@ async fn a_batch_over_a_failed_and_a_good_segment_answers_each_blob() {
         ..Default::default()
     };
     let requests = vec![
-        request(&bad, bytes(3, 4096)),
+        request(&good, bytes(4, 4096)),
         // `wrong`'s digest, other bytes.
         request(&wrong, bytes(6, 4096)),
-        request(&good, bytes(4, 4096)),
+        request(&bad, bytes(3, 4096)),
     ];
     let service = CasService::new(Arc::clone(&cache));
     let response = service
@@ -272,7 +279,7 @@ async fn a_batch_over_a_failed_and_a_good_segment_answers_each_blob() {
         .iter()
         .map(|r| r.status.as_ref().expect("status").code)
         .collect();
-    let want = [Code::Unavailable, Code::InvalidArgument, Code::Ok].map(i32::from);
+    let want = [Code::Ok, Code::InvalidArgument, Code::Unavailable].map(i32::from);
     assert_eq!(codes, want);
     assert_eq!(answer(&cache, bad.digest()).await, BlobAnswer::Absent);
     assert!(present(&cache, good.digest()).await);
