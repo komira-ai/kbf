@@ -25,7 +25,8 @@ pub enum Command {
         #[command(flatten)]
         run: RunArgs,
         /// Ask FindMissingBlobs about every digest first, and send only the missing
-        /// ones. The daemon does not.
+        /// ones. The daemon does not ask for a whole tree first; its engine asks about
+        /// each blob before sending it, as `bytestream` does either way.
         #[arg(long, value_enum, default_value_t = OnOff::Off)]
         find_missing: OnOff,
     },
@@ -54,7 +55,8 @@ pub struct RunArgs {
     /// does) or `batch` (BatchUpdateBlobs or BatchReadBlobs of up to `--batch-bytes`).
     #[arg(long, value_enum, default_value_t = Method::Bytestream)]
     pub method: Method,
-    /// The most requests in flight at once (the daemon uploads 64 at a time).
+    /// The most requests in flight at once, and the engine's limit (the daemon's
+    /// `--transfer-in-flight`, default 64).
     #[arg(long, default_value_t = 64, value_parser = clap::value_parser!(u64).range(1..))]
     pub in_flight: u64,
     /// The most blob data one batch call carries (the front allows 4 MiB); a larger
