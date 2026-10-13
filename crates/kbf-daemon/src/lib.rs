@@ -18,6 +18,8 @@
 //! - [`driver_watch`]: the driver's report channel, one part per source that feeds it.
 //! - [`runtime`]: the runtime trait and [`FakeRuntime`], which runs nothing.
 //! - [`runtimes`]: [`Runtimes`], the daemon's runtimes, at most one per lease kind.
+//! - [`phases`]: where each lease's time went and what its CAS calls moved, logged
+//!   when it ends (`lease phases:`) and sent as [`Event::LeaseEnded`].
 //! - [`cas`]: the [`Cas`] trait and the front's client.
 //! - `cache` (Linux): the node's input cache, which the container driver links input
 //!   files from (`docs/design/worker-cache.md`).
@@ -47,6 +49,7 @@ pub mod keeper;
 mod lease;
 #[cfg(target_os = "linux")]
 mod local;
+pub mod phases;
 pub mod report;
 pub mod runtime;
 pub mod runtimes;

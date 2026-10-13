@@ -23,6 +23,7 @@ use prost::Message;
 use tonic::Status;
 
 use crate::meta_log::{MemoryMetaLog, MetaLog, MetaLogError};
+use crate::metrics::CacheMetrics;
 use crate::{MAX_BLOB_BYTES, wire};
 
 /// How many times a read asks again when a collection removes what it was about to
@@ -170,6 +171,8 @@ pub struct Cache<M, O> {
     epoch: Epoch,
     next_seq: AtomicU64,
     segment_limit: u64,
+    // Red-first stand-in: nothing records into it yet.
+    metrics: CacheMetrics,
 }
 
 impl Cache<MemoryMetaLog, MemoryStore> {
@@ -198,7 +201,7 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
     /// Writes under an epoch `meta` never allocated are refused by the index
     /// ([`CacheError::Internal`]); two caches given one epoch would name the same keys.
     #[must_use]
-    pub const fn new(meta: M, objects: O, prefix: KeyPrefix, epoch: Epoch) -> Self {
+    pub fn new(meta: M, objects: O, prefix: KeyPrefix, epoch: Epoch) -> Self {
         Self {
             meta,
             objects,
@@ -206,6 +209,7 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
             epoch,
             next_seq: AtomicU64::new(1),
             segment_limit: MAX_SEGMENT_BYTES,
+            metrics: CacheMetrics::default(),
         }
     }
 
@@ -243,6 +247,11 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
     /// The object store.
     pub const fn objects(&self) -> &O {
         &self.objects
+    }
+
+    /// What this cache, and the services over it, have measured.
+    pub const fn metrics(&self) -> &CacheMetrics {
+        &self.metrics
     }
 
     /// The prefix every key this cache writes starts with.
