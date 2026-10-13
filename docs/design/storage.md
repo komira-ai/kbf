@@ -301,4 +301,6 @@ capabilities.
   change plus a background copy.
 - **Compression.** zstd for ByteStream, advertised only once reads and writes decode it.
 - **Locality.** Daemons keep a local cache of hot inputs and report what they hold, and
-  each server caches hot blobs above the object store.
+  each server caches hot blobs above the object store. The daemon side, and the one
+  transfer engine all bulk blob movement goes through, are designed in
+  [worker-cache.md](worker-cache.md).
