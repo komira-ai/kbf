@@ -445,5 +445,11 @@ first=$(echo "$held" | sed -n 1p)
 { [ "$first" = "$my_gid" ] || [ -z "$first" ]; } && [ "$(echo "$held" | sed -n '$p')" = "exit 0" ] \
   || fail "the GUI run kept groups: [$held]"
 
+step "the native driver's lease-user pool, as root, with throwaway users"
+# crates/kbf-driver-native/tests/slots.rs: actions run as pool users through launchctl
+# asuser, the exact kill by uid, the keeper's, parallel leases, and no root daemon
+# without a pool. One test at a time: they pick free uids from 690 and make users there.
+cargo xtask sudo-test -p kbf-driver-native --test slots -- --test-threads=1 --nocapture
+
 echo
 echo "kbf-mac-session: every check passed"
