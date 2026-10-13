@@ -1,6 +1,7 @@
 //! The daemons' blob path on the worker listener (`kbf_server::blobs`): `ByteStream`
-//! over mutual TLS, each call admitted by the node-certificate rules and the deny list
-//! of the worker stream, and nothing else of REAPI served there.
+//! and `ContentAddressableStorage` over mutual TLS, each call admitted by the
+//! node-certificate rules and the deny list of the worker stream, and no other REAPI
+//! service served there.
 
 use std::future::pending;
 use std::net::SocketAddr;
@@ -17,9 +18,13 @@ use kbf_proto::reapi::capabilities_client::CapabilitiesClient;
 use kbf_proto::reapi::content_addressable_storage_client::ContentAddressableStorageClient;
 use kbf_proto::reapi::execution_client::ExecutionClient;
 use kbf_proto::reapi::{
-    Digest, ExecuteRequest, FindMissingBlobsRequest, GetActionResultRequest, GetCapabilitiesRequest,
+    BatchReadBlobsRequest, BatchUpdateBlobsRequest, Digest, Directory, ExecuteRequest, FileNode,
+    FindMissingBlobsRequest, GetActionResultRequest, GetCapabilitiesRequest,
+    GetChunkMappingRequest, GetTreeRequest, RegisterChunkMappingRequest, SpliceBlobRequest,
+    SplitBlobRequest, batch_update_blobs_request,
 };
 use kbf_server::{Args, bind_server};
+use prost::Message;
 use rcgen::{
     BasicConstraints, CertificateParams, CertifiedIssuer, DnType, ExtendedKeyUsagePurpose, IsCa,
     KeyPair, KeyUsagePurpose, SerialNumber,
@@ -199,19 +204,148 @@ async fn query(channel: &Channel, digest: &Digest) -> Result<bool, Status> {
     Ok(response.into_inner().complete)
 }
 
-/// Every `ByteStream` call on `channel` for `blob` (Write first, so Read finds it),
-/// each answered with its status code (OK when served).
-async fn codes(channel: &Channel, blob: &[u8]) -> [(&'static str, Code); 3] {
+fn cas(channel: &Channel) -> ContentAddressableStorageClient<Channel> {
+    ContentAddressableStorageClient::new(channel.clone())
+}
+
+/// The digests of `blobs` that FindMissingBlobs on `channel` reports missing.
+async fn missing(channel: &Channel, blobs: &[&[u8]]) -> Result<Vec<Digest>, Status> {
+    let request = FindMissingBlobsRequest {
+        blob_digests: blobs.iter().map(|b| digest_of(b)).collect(),
+        ..FindMissingBlobsRequest::default()
+    };
+    let response = cas(channel).find_missing_blobs(request).await?;
+    Ok(response.into_inner().missing_blob_digests)
+}
+
+/// Uploads `blobs` in one BatchUpdateBlobs call; the first blob's refusal fails it.
+async fn batch_write(channel: &Channel, blobs: &[&[u8]]) -> Result<(), Status> {
+    let requests = blobs
+        .iter()
+        .map(|b| batch_update_blobs_request::Request {
+            digest: Some(digest_of(b)),
+            data: b.to_vec(),
+            ..batch_update_blobs_request::Request::default()
+        })
+        .collect();
+    let request = BatchUpdateBlobsRequest {
+        requests,
+        ..BatchUpdateBlobsRequest::default()
+    };
+    let response = cas(channel).batch_update_blobs(request).await?;
+    for blob in response.into_inner().responses {
+        let status = blob.status.expect("status");
+        if status.code != 0 {
+            return Err(Status::new(Code::from(status.code), status.message));
+        }
+    }
+    Ok(())
+}
+
+/// Reads `digests` in one BatchReadBlobs call; the first blob's refusal fails it.
+async fn batch_read(channel: &Channel, digests: &[Digest]) -> Result<Vec<Vec<u8>>, Status> {
+    let request = BatchReadBlobsRequest {
+        digests: digests.to_vec(),
+        ..BatchReadBlobsRequest::default()
+    };
+    let response = cas(channel).batch_read_blobs(request).await?;
+    let mut out = Vec::new();
+    for blob in response.into_inner().responses {
+        let status = blob.status.expect("status");
+        if status.code != 0 {
+            return Err(Status::new(Code::from(status.code), status.message));
+        }
+        out.push(blob.data);
+    }
+    Ok(out)
+}
+
+/// Every directory GetTree on `channel` sends for `root`, over every page.
+async fn tree(channel: &Channel, root: &Digest) -> Result<Vec<Directory>, Status> {
+    let request = GetTreeRequest {
+        root_digest: Some(root.clone()),
+        ..GetTreeRequest::default()
+    };
+    let mut pages = cas(channel).get_tree(request).await?.into_inner();
+    let mut out = Vec::new();
+    while let Some(page) = pages.message().await? {
+        out.extend(page.directories);
+    }
+    Ok(out)
+}
+
+/// A directory holding `blob` as its one file, encoded.
+fn directory_of(blob: &[u8]) -> Vec<u8> {
+    Directory {
+        files: vec![FileNode {
+            name: "f".to_owned(),
+            digest: Some(digest_of(blob)),
+            ..FileNode::default()
+        }],
+        ..Directory::default()
+    }
+    .encode_to_vec()
+}
+
+/// Every blob call a daemon can make on `channel` for `blob` (writes first, so the
+/// reads find it), each answered with its status code (OK when served). For a batch
+/// call, a blob's own refusal is the call's answer.
+async fn codes(channel: &Channel, blob: &[u8]) -> Vec<(&'static str, Code)> {
     let digest = digest_of(blob);
+    let directory = directory_of(blob);
     let code = |r: Result<(), Status>| r.map_or_else(|s| s.code(), |()| Code::Ok);
     let wrote = code(write(channel, blob).await.map(drop));
-    [
+    let batch_wrote = code(batch_write(channel, &[blob, &directory]).await);
+    vec![
         ("Write", wrote),
         ("Read", code(read(channel, &digest).await.map(drop))),
         (
             "QueryWriteStatus",
             code(query(channel, &digest).await.map(drop)),
         ),
+        ("BatchUpdateBlobs", batch_wrote),
+        (
+            "FindMissingBlobs",
+            code(missing(channel, &[blob]).await.map(drop)),
+        ),
+        (
+            "BatchReadBlobs",
+            code(batch_read(channel, &[digest]).await.map(drop)),
+        ),
+        (
+            "GetTree",
+            code(tree(channel, &digest_of(&directory)).await.map(drop)),
+        ),
+    ]
+}
+
+/// The four chunking calls on `channel`, each answered with its status code.
+async fn chunking_codes(channel: &Channel) -> [(&'static str, Code); 4] {
+    let digest = digest_of(b"chunked");
+    let code = |r: Result<(), Status>| r.map_or_else(|s| s.code(), |()| Code::Ok);
+    let split = cas(channel)
+        .split_blob(SplitBlobRequest {
+            blob_digest: Some(digest.clone()),
+            ..SplitBlobRequest::default()
+        })
+        .await;
+    let mapping = cas(channel)
+        .get_chunk_mapping(GetChunkMappingRequest::default())
+        .await;
+    let splice = cas(channel)
+        .splice_blob(SpliceBlobRequest {
+            blob_digest: Some(digest),
+            ..SpliceBlobRequest::default()
+        })
+        .await;
+    let register = cas(channel)
+        .register_chunk_mapping(stream::iter([RegisterChunkMappingRequest::default()]))
+        .await;
+    [
+        ("SplitBlob", code(split.map(drop))),
+        ("GetChunkMapping", code(mapping.map(drop))),
+        ("SpliceBlob", code(splice.map(drop))),
+        ("RegisterChunkMapping", code(register.map(drop))),
     ]
 }
 
@@ -307,7 +441,7 @@ async fn the_deny_list_refuses_each_blob_call_from_the_next_one_on() {
     let channel = pki.channel(worker, Some(&node.identity)).await;
     let bystander = pki.channel(worker, Some(&other.identity)).await;
     let blob = b"a blob";
-    let all = |codes: [(&str, Code); 3], want: Code, why: &str| {
+    let all = |codes: Vec<(&str, Code)>, want: Code, why: &str| {
         for (call, code) in codes {
             assert_eq!(code, want, "{call}: {why}");
         }
@@ -367,11 +501,68 @@ async fn a_certificate_must_name_exactly_one_node() {
     }
 }
 
-/// Catches: REAPI services other than `ByteStream` served on the worker listener: a
-/// node certificate must not Execute, read the action cache, or reach the CAS service.
+/// Catches: no `ContentAddressableStorage` on the worker listener (the transfer
+/// engine's FindMissingBlobs and batches would fall back for good), and a batch write
+/// or read that does not reach the farm's one cache: a client on the REAPI port must
+/// find what a daemon batched up, and the other way round. GetTree walks a directory
+/// a daemon uploaded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_node_certificate_finds_batches_and_walks_trees_on_the_worker_listener() {
+    let pki = Pki::new("cas");
+    let (reapi, worker) = pki.serve(&[]);
+    let node = pki.node(&["node-1"], 41);
+    let channel = pki.channel(worker, Some(&node.identity)).await;
+
+    let output: &[u8] = b"an output the daemon batches up";
+    let directory = directory_of(output);
+    let both = [output, directory.as_slice()];
+    let missing_now = missing(&channel, &both).await.expect("find");
+    assert_eq!(missing_now, both.map(digest_of));
+    batch_write(&channel, &both).await.expect("batch write");
+    assert_eq!(
+        missing(&channel, &both).await.expect("find"),
+        Vec::<Digest>::new()
+    );
+    let on_reapi = batch_read(&plain(reapi), &[digest_of(output)]).await;
+    assert_eq!(on_reapi.expect("read on REAPI"), [output]);
+
+    let input: &[u8] = b"an input a client batched up";
+    batch_write(&plain(reapi), &[input]).await.expect("client");
+    let read = batch_read(&channel, &[digest_of(input), digest_of(output)]).await;
+    assert_eq!(read.expect("batch read"), [input, output]);
+    let walked = tree(&channel, &digest_of(&directory)).await.expect("tree");
+    assert_eq!(
+        walked,
+        [Directory::decode(directory.as_slice()).expect("dir")]
+    );
+}
+
+/// Catches (mutant "forward a chunking call without `admit`"): a chunking call passed
+/// to the cache's service before the caller is admitted. Admitted, each answers
+/// UNIMPLEMENTED as it does on the REAPI listener; from a denied node, each is refused
+/// PERMISSION_DENIED first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn chunking_calls_are_admitted_first_and_then_unimplemented() {
+    let pki = Pki::new("chunking");
+    let deny = pki.write("deny", "node node-2\n");
+    let (_, worker) = pki.serve(&["--worker-deny-list", &deny]);
+    let node = pki.node(&["node-1"], 51);
+    let denied = pki.node(&["node-2"], 52);
+    let channel = pki.channel(worker, Some(&node.identity)).await;
+    for (call, code) in chunking_codes(&channel).await {
+        assert_eq!(code, Code::Unimplemented, "{call} admitted");
+    }
+    let channel = pki.channel(worker, Some(&denied.identity)).await;
+    for (call, code) in chunking_codes(&channel).await {
+        assert_eq!(code, Code::PermissionDenied, "{call} from a denied node");
+    }
+}
+
+/// Catches: REAPI services other than the daemons' two served on the worker listener:
+/// a node certificate must not Execute, read the action cache, or ask for capabilities.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_worker_listener_serves_no_other_reapi_service() {
-    let pki = Pki::new("only-bytestream");
+    let pki = Pki::new("only-blobs");
     let (_, worker) = pki.serve(&[]);
     let node = pki.node(&["node-1"], 31);
     let channel = pki.channel(worker, Some(&node.identity)).await;
@@ -385,15 +576,8 @@ async fn the_worker_listener_serves_no_other_reapi_service() {
         .map(drop);
     let action_result = ActionCacheClient::new(channel.clone())
         .get_action_result(GetActionResultRequest {
-            action_digest: Some(digest.clone()),
+            action_digest: Some(digest),
             ..GetActionResultRequest::default()
-        })
-        .await
-        .map(drop);
-    let find_missing = ContentAddressableStorageClient::new(channel.clone())
-        .find_missing_blobs(FindMissingBlobsRequest {
-            blob_digests: vec![digest],
-            ..FindMissingBlobsRequest::default()
         })
         .await
         .map(drop);
@@ -404,7 +588,6 @@ async fn the_worker_listener_serves_no_other_reapi_service() {
     for (call, result) in [
         ("Execute", execute),
         ("GetActionResult", action_result),
-        ("FindMissingBlobs", find_missing),
         ("GetCapabilities", capabilities),
     ] {
         let code = result.expect_err(call).code();

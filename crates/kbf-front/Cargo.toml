@@ -33,7 +33,7 @@ tracing.workspace = true
 # authorization test (tests/auth.rs) covers every method the routes serve.
 protox.workspace = true
 serde_json.workspace = true
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util", "time"] }
 tracing-subscriber.workspace = true
 
 [lints]
