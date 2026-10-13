@@ -634,10 +634,16 @@ async fn with_every_slot_held_a_lease_waits_and_a_kill_ends_the_wait() {
         .expect("the waiting lease was not stopped by its kill");
         let took = waited.elapsed();
         let mut third = std::pin::pin!(support::run(&rt, &cas, 3, &id));
+        // Ended within 2 s (it did not wait), its result is that one: a finished
+        // future is not polled again.
         let early = tokio::time::timeout(Duration::from_secs(2), &mut third).await;
         std::fs::write(root(1).join("go"), b"").expect("go");
-        let third = third.await;
-        (killed, took, early.is_err(), third)
+        let waited = early.is_err();
+        let third = match early {
+            Ok(ended) => ended,
+            Err(_) => third.await,
+        };
+        (killed, took, waited, third)
     };
     let (first, (killed, took, waited, third)) =
         tokio::join!(support::run(&rt, &cas, 1, &hold), rest);
