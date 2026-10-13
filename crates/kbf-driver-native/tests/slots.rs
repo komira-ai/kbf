@@ -277,10 +277,11 @@ async fn an_action_ends_with_every_process_of_its_uid_and_nothing_else() {
     let scratch = Scratch::new("kill");
     let users = Users::new("kill", 2, &scratch);
     let (mine, other) = (&users.0[0], &users.0[1]);
-    let mut root_sleep = sleeper(None);
-    let mut other_sleep = sleeper(Some(other));
     let cas = Arc::new(MemoryCas::default());
     let rt = NativeRuntime::new(config(&scratch, users.pool()), Arc::clone(&cas)).expect("runtime");
+    // After the start, which ends every process of every slot.
+    let mut root_sleep = sleeper(None);
+    let mut other_sleep = sleeper(Some(other));
     let mut steps = leave_a_sleeper(&scratch.act());
     steps.extend([";", "id", ";", "env", "TMPDIR"].map(str::to_owned));
     let argv: Vec<&str> = steps.iter().map(String::as_str).collect();
