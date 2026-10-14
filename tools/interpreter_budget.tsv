@@ -15,8 +15,6 @@
 
 # Files by extension or `#!` line. Key: the path.
 [files]
-crates/kbf-it/m2/run.sh	M2 cell harness; to become kbf-cell m2
-tools/ci/m2-container.sh	CI step; to become a cargo xtask verb
 
 # Production Rust under crates/*/src/ that names a shell and a `-c` flag. Key: the path.
 [src-sh-c]
