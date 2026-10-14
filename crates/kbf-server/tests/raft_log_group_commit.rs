@@ -224,34 +224,41 @@ fn commit_on_a_thread(runtime: &Runtime, log: &Arc<Log>, command: Command) -> Re
     rx
 }
 
-/// Proposes each of `commands` while a commit is held in its sync: each commit is
-/// polled once (which is when a proposal reaches the log) on a helper thread, then
-/// spawned to finish; `(i, answer)` arrives on the receiver once commit `i` answers.
-///
-/// # Panics
-///
-/// If the proposals are not all made within [`PROMPTLY`]: a log whose `commit` waits
-/// for the commit in progress (one sync per proposal, under one lock) never gets past
-/// the first.
+/// Proposes each of `commands` while a commit is held in its sync (see
+/// [`poll_while_held`]); `(i, answer)` arrives on the receiver once commit `i` answers.
 fn propose_while_held(
     runtime: &Runtime,
     log: &Arc<Log>,
     commands: Vec<Command>,
 ) -> Receiver<(usize, Answer)> {
     let (done, answers) = mpsc::channel();
+    let pending = commands
+        .into_iter()
+        .enumerate()
+        .map(|(i, command)| {
+            let (log, done) = (Arc::clone(log), done.clone());
+            Box::pin(async move {
+                let _ = done.send((i, log.commit(command).await));
+            }) as Pending
+        })
+        .collect();
+    poll_while_held(runtime, pending);
+    answers
+}
+
+/// Makes each of `pending`'s proposals while a commit is held in its sync: each is
+/// polled once (which is when a proposal reaches the log) on a helper thread, then
+/// spawned to finish.
+///
+/// # Panics
+///
+/// If the proposals are not all made within [`PROMPTLY`]: a log whose `commit` waits
+/// for the commit in progress (one sync per proposal, under one lock) never gets past
+/// the first.
+fn poll_while_held(runtime: &Runtime, mut pending: Vec<Pending>) {
     let (made, proposed) = mpsc::channel();
-    let (log, handle) = (Arc::clone(log), runtime.handle().clone());
+    let handle = runtime.handle().clone();
     std::thread::spawn(move || {
-        let mut pending: Vec<Pending> = commands
-            .into_iter()
-            .enumerate()
-            .map(|(i, command)| {
-                let (log, done) = (Arc::clone(&log), done.clone());
-                Box::pin(async move {
-                    let _ = done.send((i, log.commit(command).await));
-                }) as Pending
-            })
-            .collect();
         handle.block_on(std::future::poll_fn(|cx| {
             for commit in &mut pending {
                 assert!(commit.as_mut().poll(cx).is_pending(), "answered while held");
@@ -266,7 +273,6 @@ fn propose_while_held(
     for commit in pending {
         drop(runtime.spawn(commit));
     }
-    answers
 }
 
 /// For each `i` in `0..n`: a blob of its own when `i` is even, an `AllocEpoch` when
@@ -514,4 +520,66 @@ fn a_panic_in_a_batch_sync_answers_it_unavailable_and_later_commits_still_answer
         matches!(later, Err(MetaLogError::Unavailable(_))),
         "{later:?}"
     );
+}
+
+/// Catches (mutant "a tick takes its own sync": the tick is proposed as a batch of
+/// its own, so after the held sync the burst and the tick need a sync each, and the
+/// second of them waits on a third sync, which the gate holds): a `Tick` proposed
+/// while a burst of `PutBlobs` waits on a held sync joins the burst's batch. After
+/// the held sync, one more sync (the gate lets through no third) answers every
+/// `PutBlobs` caller with its own blob written and the tick with the farm time.
+#[test]
+fn a_tick_made_while_a_put_blobs_burst_waits_shares_its_next_sync() {
+    let runtime = runtime();
+    let (gate, entered) = Gate::new();
+    let _disarm = Disarm(Arc::clone(&gate));
+    let fs = GateFs {
+        inner: FaultFs::new(),
+        gate: Arc::clone(&gate),
+    };
+    let (log, epoch) = opened(&runtime, fs);
+    let first = commit_on_a_thread(&runtime, &log, blob(epoch, 0).1);
+    entered.recv_timeout(PROMPTLY).expect("the first sync");
+
+    let (bursts, burst_answers) = mpsc::channel();
+    let mut pending: Vec<Pending> = (1..=N)
+        .map(|n| {
+            let (digest, location) = match blob(epoch, n).1 {
+                Command::PutBlob { digest, location } => (digest, location),
+                other => unreachable!("{other:?}"),
+            };
+            let (log, bursts) = (Arc::clone(&log), bursts.clone());
+            Box::pin(async move {
+                let answer = log
+                    .commit(Command::PutBlobs(vec![(digest, location)]))
+                    .await;
+                let _ = bursts.send((n, answer));
+            }) as Pending
+        })
+        .collect();
+    let (ticked, tick_answer) = mpsc::channel();
+    let ticking = Arc::clone(&log);
+    pending.push(Box::pin(async move {
+        let _ = ticked.send(ticking.tick().await);
+    }));
+    poll_while_held(&runtime, pending);
+    gate.release();
+    entered.recv_timeout(PROMPTLY).expect("the second sync");
+    gate.release();
+
+    let tick = tick_answer
+        .recv_timeout(PROMPTLY)
+        .expect("the tick answered after the second sync");
+    assert!(tick.is_ok(), "the tick answered {tick:?}");
+    for _ in 1..=N {
+        let (n, answer) = burst_answers
+            .recv_timeout(PROMPTLY)
+            .expect("every PutBlobs answered after the second sync");
+        match answer {
+            Ok(Applied::Blobs(Ok(written))) if written.len() == 1 => {}
+            other => panic!("PutBlobs {n} answered {other:?}"),
+        }
+    }
+    let first = first.recv_timeout(PROMPTLY).expect("the first proposal");
+    assert!(matches!(first, Ok(Applied::Blob(Ok(_)))), "{first:?}");
 }
