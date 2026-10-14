@@ -91,6 +91,14 @@ jobs:
       # so HEAD^1 is the base branch it merges into.
       - if: github.event_name == 'pull_request'
         run: cargo xtask budget-diff --base HEAD^1
+      # The release workflow's on-main check, asked of GitHub both ways: this pull
+      # request's base commit is on main and its merge commit is not, so a check that
+      # accepts every commit, or none, fails here (crates/xtask/src/release.rs).
+      - if: github.event_name == 'pull_request' && github.base_ref == 'main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: cargo xtask release main-control --repo "$GITHUB_REPOSITORY" --on-main "$BASE_SHA" --off-main "$GITHUB_SHA"
       - run: cargo test -p kbf-it --locked --test repo_lints
       - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         if: ${{ github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true' }}

@@ -19,6 +19,10 @@
 //! - `sums assemble <dir>` and `verify-assets {sums,attestations} <dir>` ([`sums`]): the
 //!   one `SHA256SUMS` over every platform's assets, and the checks the attest job and
 //!   a deployment make of it, each with a control that must fail.
+//! - `release {locate,main-control,check,publish}` ([`release`]): a GitHub release of
+//!   the files a push run of the artifacts workflow on `main` built and attested for a
+//!   commit on `main`, checked again and never rebuilt; a re-run adds nothing twice and
+//!   replaces nothing.
 //! - `podman-tests [--sudo <path>] [--podman <path>] [--runtime-dir <path>]`
 //!   ([`podman_tests`]): the container driver's real-Podman tests on a hosted Linux
 //!   runner, each test target in its own `Delegate=yes` system unit.
@@ -42,6 +46,7 @@ pub mod entitlements;
 pub mod fetch;
 pub mod package;
 pub mod podman_tests;
+pub mod release;
 pub mod sudo_test;
 pub mod sums;
 
@@ -158,6 +163,9 @@ enum Verb {
     /// Check a commit's assets as a deployment is to.
     #[command(subcommand)]
     VerifyAssets(VerifyAssets),
+    /// A GitHub release of a `main` commit's attested assets, never rebuilt.
+    #[command(subcommand)]
+    Release(ReleaseVerb),
     /// Run the container driver's real-Podman tests on a hosted Linux runner, each
     /// test target in its own Delegate=yes system unit as this user.
     PodmanTests {
@@ -217,6 +225,68 @@ enum VerifyAssets {
         /// `GITHUB_WORKFLOW_REF`).
         #[arg(long)]
         workflow_ref: String,
+        /// The `gh` program.
+        #[arg(long, default_value = "gh")]
+        gh: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum ReleaseVerb {
+    /// Refuse a commit not on main; find the successful push run of artifacts.yml on
+    /// main that built it, and print `run-id=<id>`.
+    Locate {
+        /// The repository, `<owner>/<repo>` (on Actions, `GITHUB_REPOSITORY`).
+        #[arg(long)]
+        repo: String,
+        /// The commit to release, a full SHA.
+        #[arg(long)]
+        commit: String,
+        /// Append `run-id=<id>` to this file (on Actions, `GITHUB_OUTPUT`).
+        #[arg(long)]
+        output: Option<PathBuf>,
+        /// The `gh` program.
+        #[arg(long, default_value = "gh")]
+        gh: PathBuf,
+    },
+    /// The on-main check against GitHub: `--on-main` passes and `--off-main` is refused.
+    MainControl {
+        /// The repository, `<owner>/<repo>`.
+        #[arg(long)]
+        repo: String,
+        /// A commit on main (on a pull request, its base commit).
+        #[arg(long)]
+        on_main: String,
+        /// A commit not on main (on a pull request, its merge commit).
+        #[arg(long)]
+        off_main: String,
+        /// The `gh` program.
+        #[arg(long, default_value = "gh")]
+        gh: PathBuf,
+    },
+    /// `<dir>` passes `verify-assets sums` and lists only assets of `--commit`.
+    Check {
+        dir: PathBuf,
+        /// The commit the assets were built from, a full SHA.
+        #[arg(long)]
+        commit: String,
+    },
+    /// Create release `--tag` with every file of `<dir>`, or add the files it lacks;
+    /// an asset it holds must be one of them, byte for byte.
+    Publish {
+        dir: PathBuf,
+        /// The repository, `<owner>/<repo>`.
+        #[arg(long)]
+        repo: String,
+        /// The release's tag, which must exist (on Actions, `GITHUB_REF_NAME`).
+        #[arg(long)]
+        tag: String,
+        /// The commit the tag names, a full SHA.
+        #[arg(long)]
+        commit: String,
+        /// The artifacts workflow run that built and attested the files.
+        #[arg(long)]
+        run_id: u64,
         /// The `gh` program.
         #[arg(long, default_value = "gh")]
         gh: PathBuf,
@@ -365,6 +435,47 @@ fn run(cli: Cli) -> Result<Vec<String>, Error> {
         }) => sums::assemble(&dir, expect.as_deref(), summary.as_deref()),
         Verb::VerifyAssets(VerifyAssets::Sums { dir }) => {
             Ok(vec![sums::verify_sums(&dir, fetch::Sha256::of)?])
+        }
+        Verb::Release(ReleaseVerb::Locate {
+            repo,
+            commit,
+            output,
+            gh,
+        }) => release::locate(&gh, &repo, &commit, output.as_deref()),
+        Verb::Release(ReleaseVerb::MainControl {
+            repo,
+            on_main,
+            off_main,
+            gh,
+        }) => Ok(vec![release::main_control(
+            &gh, &repo, &on_main, &off_main,
+        )?]),
+        Verb::Release(ReleaseVerb::Check { dir, commit }) => release::check(&dir, &commit),
+        Verb::Release(ReleaseVerb::Publish {
+            dir,
+            repo,
+            tag,
+            commit,
+            run_id,
+            gh,
+        }) => {
+            // The release's assets as it holds them, of this process alone.
+            let scratch =
+                std::env::temp_dir().join(format!("xtask-release-{}", std::process::id()));
+            std::fs::create_dir_all(&scratch)
+                .map_err(Error::spawn(format!("create {}", scratch.display())))?;
+            let r = release::Release {
+                repo: &repo,
+                tag: &tag,
+                commit: &commit,
+                run_id,
+                gh: &gh,
+                scratch: &scratch,
+            };
+            let published = release::publish(&dir, &r);
+            // Nothing in it is needed after the run, whatever its result.
+            let _ = std::fs::remove_dir_all(&scratch);
+            published
         }
         Verb::VerifyAssets(VerifyAssets::Attestations {
             dir,
