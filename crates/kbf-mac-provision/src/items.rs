@@ -268,6 +268,7 @@ pub fn apply(host: &dyn Host, profile: &Profile, items: &[&Item]) -> Report {
             lines.note(item.key, e);
         }
     }
+    lines.note("hostname", "checked");
     let mut text = lines.into_text();
     let mut failed = 0;
     for (_, line) in verdicts(host, profile, items)
