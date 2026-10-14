@@ -1,7 +1,7 @@
 //! What an action's container gets beyond its files, against real rootless Podman: its
 //! environment, and its pids, `/dev/shm` and ulimit limits.
 //!
-//! Run by `tools/ci/podman-tests.sh`, like `podman.rs` (each test is `#[ignore]` with
+//! Run by `cargo xtask podman-tests`, like `podman.rs` (each test is `#[ignore]` with
 //! that reason), with `CONTAINERS_CONF_OVERRIDE` naming
 //! `fixtures/containers-override.conf`: a node configuration that sets its own
 //! environment variable, pids limit, `/dev/shm` size and ulimits. A test fails if the
@@ -40,7 +40,7 @@ fn env_action(env: &[(&str, &str)]) -> Spec {
 /// exactly its variables. One that sets neither gets the two Podman adds whatever
 /// `--unsetenv-all` says: `HOSTNAME=localhost` and the busybox image's root home.
 #[tokio::test]
-#[ignore = "needs rootless Podman and a delegated cgroup: run by tools/ci/podman-tests.sh"]
+#[ignore = "needs rootless Podman and a delegated cgroup: run by cargo xtask podman-tests"]
 async fn the_action_sees_only_the_commands_environment() {
     assert_override();
     let cell = Cell::new("env");
@@ -96,7 +96,7 @@ fn expected(limits: ContainerLimits) -> String {
 /// `max`, no limit at all, override or not), a limit that is not the configured one,
 /// and the action not running as the container's root.
 #[tokio::test]
-#[ignore = "needs rootless Podman and a delegated cgroup: run by tools/ci/podman-tests.sh"]
+#[ignore = "needs rootless Podman and a delegated cgroup: run by cargo xtask podman-tests"]
 async fn the_configured_limits_hold_inside_the_container() {
     assert_override();
     let limits = ContainerLimits {
@@ -115,7 +115,7 @@ async fn the_configured_limits_hold_inside_the_container() {
 /// Catches defaults rootless Podman refuses on a stock host (a ulimit above the
 /// daemon's own hard limit fails `podman start`), and defaults that do not hold.
 #[tokio::test]
-#[ignore = "needs rootless Podman and a delegated cgroup: run by tools/ci/podman-tests.sh"]
+#[ignore = "needs rootless Podman and a delegated cgroup: run by cargo xtask podman-tests"]
 async fn the_default_limits_hold_inside_the_container() {
     assert_override();
     let cell = Cell::new("default-limits");
@@ -133,7 +133,7 @@ async fn the_default_limits_hold_inside_the_container() {
 /// program and where it was looked up. The red run before the fix showed each as
 /// `RuntimeError::Failed` ("the container did not run to an exit").
 #[tokio::test]
-#[ignore = "needs rootless Podman and a delegated cgroup: run by tools/ci/podman-tests.sh"]
+#[ignore = "needs rootless Podman and a delegated cgroup: run by cargo xtask podman-tests"]
 async fn a_program_the_container_cannot_start_is_the_actions_failure() {
     let cell = Cell::new("program");
     let action = |argv: &[&str], env: &[(&str, &str)]| {

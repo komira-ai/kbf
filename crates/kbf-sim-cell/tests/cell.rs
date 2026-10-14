@@ -7,12 +7,13 @@ use kbf_sim_cell::{Kind, Scenario, run};
 const SEEDS: u64 = 64;
 
 fn sweep(kind: Kind) {
-    for seed in 0..SEEDS {
-        let report = run(&Scenario::new(kind, seed));
+    let swept = kbf_sim_cell::sweep(0..SEEDS, |seed| Scenario::new(kind, seed));
+    swept.assert_clean();
+    for (seed, report) in &swept.reports {
         // Not vacuous: the server answered, and results were accepted.
         assert!(report.present > 0, "{kind:?} seed {seed}: {report:?}");
         assert!(report.accepted > 0, "{kind:?} seed {seed}: {report:?}");
-        if !matches!(kind, Kind::Calm | Kind::Partition) {
+        if kind.restarts() {
             assert!(
                 report.starts > 1,
                 "{kind:?} seed {seed} never restarted: {report:?}"
@@ -68,18 +69,26 @@ fn a_seed_replays_to_the_same_trace() {
     assert_ne!(a, run(&Scenario::new(Kind::Crash, 4)).trace);
 }
 
+/// Catches a kind the replay line names but `replay` cannot parse back (it would
+/// replay a calm run instead).
+#[test]
+fn every_kind_parses_from_its_name() {
+    for kind in Kind::ALL {
+        assert_eq!(Kind::parse(&format!("{kind:?}")), Some(kind));
+    }
+    assert_eq!(Kind::parse("Stormy"), None);
+}
+
 /// Reruns one seed: `KBF_SIM_KIND=Crash KBF_SIM_SEED=7 cargo test -p kbf-sim-cell
-/// --test cell -- --ignored replay`.
+/// --test cell -- --ignored replay`; a failure's replay line adds `KBF_SIM_CRASH` when
+/// its scenario pinned one crash.
 #[test]
 #[ignore = "run by hand to replay one seed"]
 fn replay() {
-    let kind = match std::env::var("KBF_SIM_KIND").as_deref() {
-        Ok("Restart") => Kind::Restart,
-        Ok("Crash") => Kind::Crash,
-        Ok("IoError") => Kind::IoError,
-        Ok("Partition") => Kind::Partition,
-        _ => Kind::Calm,
-    };
-    let seed = std::env::var("KBF_SIM_SEED").map_or(0, |s| s.parse().expect("a seed"));
-    println!("{:?}", run(&Scenario::new(kind, seed)));
+    let var = |name| std::env::var(name).ok();
+    let kind = var("KBF_SIM_KIND").unwrap_or_else(|| "Calm".to_owned());
+    let seed = var("KBF_SIM_SEED").unwrap_or_else(|| "0".to_owned());
+    let crash = var("KBF_SIM_CRASH");
+    let scenario = Scenario::from_replay(&kind, &seed, crash.as_deref()).expect("a replay line");
+    println!("{:?}", run(&scenario));
 }

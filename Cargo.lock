@@ -1741,19 +1741,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "kbf-tier"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "kbf-meta",
+ "kbf-segments",
+ "kbf-store",
+ "thiserror",
+]
+
+[[package]]
 name = "kbf-transfer"
 version = "0.1.0"
 dependencies = [
  "futures",
  "hex",
  "kbf-front",
+ "kbf-objstore",
  "kbf-proto",
+ "kbf-segments",
  "kbf-types",
  "sha2 0.11.0",
  "thiserror",
  "tokio",
  "tonic",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -3691,6 +3705,7 @@ dependencies = [
  "hex",
  "lzma-rs",
  "rcgen",
+ "rustix",
  "rustls",
  "rustls-native-certs",
  "ruzstd",

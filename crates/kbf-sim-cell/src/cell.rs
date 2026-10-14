@@ -1,12 +1,19 @@
 //! A scenario, the cell it builds, and the run loop that checks after every step.
 
+use std::collections::BTreeSet;
 use std::time::Duration;
 
+use kbf_meta::ObjectId;
+
 use kbf_sim::{Chance, Faults, Node, NodeId, NodeInput, Output, Partition, Sim, SimRng, TraceHash};
-use kbf_types::{Effect, FarmTime, Resources, StateMachine};
+use kbf_types::{Digest, Effect, FarmTime, Resources, StateMachine};
 
 use crate::check::Checker;
-use crate::{FakeClient, FakeDaemon, Msg, ObjectStore, Server, ServerFault, ServerPlan, action};
+use crate::client::RETRY;
+use crate::{
+    Cut, Down, FakeClient, FakeDaemon, Met, Msg, ObjectStore, Server, ServerFault, ServerPlan,
+    StoreFault, StorePlan, StorePoint, StoreStats, action,
+};
 
 /// What the server meets in a run.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -21,6 +28,52 @@ pub enum Kind {
     IoError,
     /// One daemon cut off from the cell for longer than the scheduler's grace G.
     Partition,
+    /// The object store down for minutes: hanging (PUTs held) on even seeds, refusing
+    /// every PUT on odd ones.
+    StoreOutage,
+    /// As [`Kind::StoreOutage`], for one hour to one and a half.
+    StoreOutageHours,
+    /// The store answering every PUT seconds late for a while, past the client's retry.
+    StoreSlow,
+    /// The store failing PUTs here and there, some after keeping the object.
+    StoreErrors,
+    /// The store keeping objects but losing their acknowledgement.
+    StoreLostAck,
+    /// The server going down (killed, or a power cut) at a point of the write path,
+    /// while the store is slow, so PUTs are in flight.
+    StoreCrash,
+}
+
+impl Kind {
+    /// Every kind, in the order the sweeps run them.
+    pub const ALL: [Self; 11] = [
+        Self::Calm,
+        Self::Restart,
+        Self::Crash,
+        Self::IoError,
+        Self::Partition,
+        Self::StoreOutage,
+        Self::StoreOutageHours,
+        Self::StoreSlow,
+        Self::StoreErrors,
+        Self::StoreLostAck,
+        Self::StoreCrash,
+    ];
+
+    /// Whether the server restarts, or its log stops, in a run of this kind.
+    #[must_use]
+    pub fn restarts(self) -> bool {
+        matches!(
+            self,
+            Self::Restart | Self::Crash | Self::IoError | Self::StoreCrash
+        )
+    }
+
+    /// The kind its `Debug` name names, for a replay line.
+    #[must_use]
+    pub fn parse(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|k| format!("{k:?}") == name)
+    }
 }
 
 /// The whole input of a run, drawn from its kind and seed.
@@ -30,6 +83,7 @@ pub struct Scenario {
     pub seed: u64,
     pub faults: Faults,
     pub server: ServerPlan,
+    pub store: StorePlan,
     pub daemons: usize,
     /// A daemon cut off from every other node from a time, for [`CUT_FOR`].
     pub partition: Option<(usize, FarmTime)>,
@@ -38,6 +92,9 @@ pub struct Scenario {
     /// The run stops here. Every fault has ended long enough before it for every
     /// action to be answered.
     pub end: FarmTime,
+    /// The one crash [`Scenario::crash_at`] put in place of the seed's: the replay line
+    /// names it, so a failure replays the crash that failed.
+    pub pinned: Option<(StorePoint, Down)>,
 }
 
 /// How many distinct actions the clients draw theirs from, so some are shared.
@@ -54,7 +111,10 @@ impl Scenario {
     pub fn new(kind: Kind, seed: u64) -> Self {
         let mut rng = SimRng::from_seed(seed ^ 0x5ce1_1ce1);
         let at = |rng: &mut SimRng| FarmTime::from_millis(rng.between(5_000, LAST_FAULT_MS));
+        // A write-path fault early in the run, so the uploads of later jobs meet it.
+        let early = |rng: &mut SimRng| FarmTime::from_millis(rng.between(1_000, 20_000));
         let mut faults = Vec::new();
+        let mut store = Vec::new();
         match kind {
             Kind::Calm => {}
             Kind::Restart => {
@@ -78,12 +138,82 @@ impl Scenario {
                 faults.push((at(&mut rng), ServerFault::IoErrorAt { after }));
             }
             Kind::Partition => {}
+            Kind::StoreOutage | Kind::StoreOutageHours => {
+                let from = early(&mut rng);
+                let minutes = if kind == Kind::StoreOutage {
+                    rng.between(2, 10)
+                } else {
+                    rng.between(60, 90)
+                };
+                let until = from.saturating_add(Duration::from_secs(minutes * 60));
+                // Even seeds hang, odd seeds refuse: a sweep of two meets both.
+                let fault = if seed.is_multiple_of(2) {
+                    StoreFault::Pause { until }
+                } else {
+                    StoreFault::FailUntil { until }
+                };
+                store.push((from, fault));
+            }
+            Kind::StoreSlow => {
+                let from = early(&mut rng);
+                let until = from.saturating_add(Duration::from_secs(rng.between(10, 60)));
+                let by = Duration::from_millis(rng.between(500, 20_000));
+                store.push((from, StoreFault::Slow { until, by }));
+            }
+            Kind::StoreErrors => {
+                for _ in 0..rng.between(1, 3) {
+                    let n = u32::try_from(rng.between(1, 10)).expect("small");
+                    store.push((at(&mut rng), StoreFault::FailNext { n }));
+                    let n = u32::try_from(rng.between(1, 5)).expect("small");
+                    store.push((at(&mut rng), StoreFault::KeepButFail { n }));
+                }
+            }
+            Kind::StoreLostAck => {
+                for _ in 0..rng.between(1, 3) {
+                    let n = u32::try_from(rng.between(1, 5)).expect("small");
+                    store.push((early(&mut rng), StoreFault::LoseAck { n }));
+                }
+            }
+            Kind::StoreCrash => {
+                let point = match rng.between(0, 3) {
+                    0 => StorePoint::PutSent,
+                    1 => StorePoint::BeforeCommit,
+                    // A `PutBlob` commit is two operations: the append and the sync.
+                    2 => StorePoint::InCommit {
+                        after: rng.between(0, 1),
+                    },
+                    _ => StorePoint::BeforeReply,
+                };
+                let down = if rng.chance(Chance::percent(50)) {
+                    Down::Kill
+                } else {
+                    let keep = usize::try_from(rng.between(0, 64)).expect("small");
+                    Down::PowerCut {
+                        keep,
+                        names: rng.next_u64(),
+                    }
+                };
+                let nth = u32::try_from(rng.between(0, 1)).expect("small");
+                faults.push((early(&mut rng), ServerFault::CrashAt { point, nth, down }));
+                let until = FarmTime::from_millis(LAST_FAULT_MS);
+                let by = Duration::from_millis(rng.between(100, 2_000));
+                store.push((FarmTime::default(), StoreFault::Slow { until, by }));
+            }
         }
         let partition = (kind == Kind::Partition).then(|| {
             let daemon = usize::try_from(rng.between(0, DAEMONS as u64 - 1)).expect("small");
             (daemon, at(&mut rng))
         });
         faults.sort_by_key(|(t, _)| *t);
+        store.sort_by_key(|(t, _)| *t);
+        // The store is quiet once its last window has ended and its last slowed answer
+        // is in. Each counted failure or lost ack costs one client one more retry.
+        let quiet = store
+            .iter()
+            .filter_map(|(_, f)| Some(f.until()?.saturating_add(f.delay())))
+            .fold(FarmTime::from_millis(LAST_FAULT_MS), FarmTime::max);
+        let retries: u32 = store.iter().map(|(_, f)| f.count()).sum();
+        let quiet = quiet.saturating_add(RETRY * retries);
         let clients = (0..3)
             .map(|_| {
                 (0..ACTIONS_PER_CLIENT)
@@ -108,11 +238,61 @@ impl Scenario {
                 faults,
                 down_for: Duration::from_secs(3),
             },
+            store: StorePlan { faults: store },
             daemons: DAEMONS,
             partition,
             clients,
-            end: FarmTime::from_millis(LAST_FAULT_MS + 150_000),
+            end: quiet.saturating_add(Duration::from_secs(150)),
+            pinned: None,
         }
+    }
+
+    /// When [`Scenario::crash_at`] crashes the server.
+    pub const PINNED_AT: FarmTime = FarmTime::from_millis(10_000);
+
+    /// The [`Kind::StoreCrash`] scenario `seed` draws, with its crash replaced by one at
+    /// `point` (its first reach from [`Scenario::PINNED_AT`]), going `down`.
+    #[must_use]
+    pub fn crash_at(seed: u64, point: StorePoint, down: Down) -> Self {
+        let mut s = Self::new(Kind::StoreCrash, seed);
+        let crash = ServerFault::CrashAt {
+            point,
+            nth: 0,
+            down,
+        };
+        s.server.faults = vec![(Self::PINNED_AT, crash)];
+        s.pinned = Some((point, down));
+        s
+    }
+
+    /// The command that reruns this scenario: its kind, its seed and, if pinned, its
+    /// crash (`<point>/<down>`).
+    #[must_use]
+    pub fn replay_line(&self) -> String {
+        let crash = self
+            .pinned
+            .map(|(point, down)| format!(" KBF_SIM_CRASH={point}/{down}"))
+            .unwrap_or_default();
+        format!(
+            "KBF_SIM_KIND={:?} KBF_SIM_SEED={}{crash} cargo test -p kbf-sim-cell --test cell \
+             -- --ignored replay",
+            self.kind, self.seed
+        )
+    }
+
+    /// The scenario a replay line's `KBF_SIM_KIND`, `KBF_SIM_SEED` and `KBF_SIM_CRASH`
+    /// name; `None` if one does not parse, or a crash is pinned to a kind other than
+    /// [`Kind::StoreCrash`].
+    #[must_use]
+    pub fn from_replay(kind: &str, seed: &str, crash: Option<&str>) -> Option<Self> {
+        let kind = Kind::parse(kind)?;
+        let seed = seed.parse().ok()?;
+        let Some(crash) = crash else {
+            return Some(Self::new(kind, seed));
+        };
+        let (point, down) = crash.split_once('/')?;
+        let (point, down) = (StorePoint::parse(point)?, Down::parse(down)?);
+        (kind == Kind::StoreCrash).then(|| Self::crash_at(seed, point, down))
     }
 }
 
@@ -121,7 +301,7 @@ pub enum CellNode {
     Server(Box<Server>),
     Daemon(Box<FakeDaemon>),
     Client(Box<FakeClient>),
-    Store(ObjectStore),
+    Store(Box<ObjectStore>),
 }
 
 impl CellNode {
@@ -210,6 +390,25 @@ pub struct RunReport {
     pub accepted: usize,
     /// How many blobs were answered present.
     pub present: usize,
+    /// Each upload acknowledged: when, the blob, and the object its PUT wrote.
+    pub acked: Vec<(FarmTime, Digest, ObjectId)>,
+    /// How many crash points took the server down.
+    pub crashes: usize,
+    /// What the object store did.
+    pub store: StoreStats,
+    /// Each PUT a store fault met, and how ([`ObjectStore::met`]).
+    pub met: Vec<(ObjectId, Digest, Met)>,
+    /// The objects PUT again while the store held them ([`ObjectStore::repeated`]).
+    pub repeated: BTreeSet<ObjectId>,
+    /// The PUTs whose deadline answered their upload `UNAVAILABLE`.
+    pub timed_out: BTreeSet<ObjectId>,
+    /// The PUTs the store answered failed while their upload waited.
+    pub put_failed: BTreeSet<ObjectId>,
+    /// Each `PutBlob` commit a crash cut, and what the next start found of it.
+    pub cuts: Vec<Cut>,
+    /// Objects in the store that no index entry names at the end (left for the planned
+    /// orphan sweep); `None` if the server is down at the end.
+    pub orphans: Option<BTreeSet<ObjectId>>,
 }
 
 /// Runs `scenario` to its end, checking every property after every step.
@@ -221,7 +420,8 @@ pub struct RunReport {
 #[must_use]
 pub fn run(scenario: &Scenario) -> RunReport {
     let mut sim = Sim::new(scenario.seed, scenario.faults.clone());
-    sim.add_node(store_id(), CellNode::Store(ObjectStore::default()));
+    let store = ObjectStore::new(scenario.store.clone());
+    sim.add_node(store_id(), CellNode::Store(Box::new(store)));
     let server = Server::new(scenario.server.clone(), store_id());
     sim.add_node(server_id(), CellNode::Server(Box::new(server)));
     for n in 0..scenario.daemons {
@@ -255,11 +455,29 @@ pub fn run(scenario: &Scenario) -> RunReport {
         checker.after_step(&sim);
     }
     checker.at_end(&sim);
-    let seen = &crate::check::server(&sim).seen;
+    let server = crate::check::server(&sim);
+    let seen = &server.seen;
+    let store = sim
+        .nodes()
+        .find_map(|(_, n)| n.store())
+        .expect("the cell has an object store");
+    let orphans = server.meta().map(|meta| {
+        let answers = seen.uploaded.iter().map(|d| meta.blob(d));
+        crate::check::orphans(store.objects().map(|(o, _)| o), answers)
+    });
     RunReport {
         trace: sim.trace_hash(),
         starts: seen.starts,
         accepted: seen.accepted.values().filter(|n| **n > 0).count(),
         present: seen.present.len(),
+        acked: seen.acked.clone(),
+        crashes: seen.crashed_at.len(),
+        store: store.stats(),
+        met: store.met().to_vec(),
+        repeated: store.repeated().clone(),
+        timed_out: seen.timed_out.clone(),
+        put_failed: seen.put_failed.clone(),
+        cuts: seen.cuts.clone(),
+        orphans,
     }
 }

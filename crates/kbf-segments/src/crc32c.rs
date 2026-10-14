@@ -30,12 +30,42 @@ const TABLE: [u32; 256] = {
 /// The CRC-32C of `bytes`.
 #[must_use]
 pub fn crc32c(bytes: &[u8]) -> u32 {
-    let mut crc = !0u32;
-    for &b in bytes {
-        let low = crc.to_le_bytes()[0];
-        crc = TABLE[usize::from(low ^ b)] ^ (crc >> 8);
+    let mut crc = Crc32c::new();
+    crc.update(bytes);
+    crc.finish()
+}
+
+/// A CRC-32C over bytes that arrive in pieces: equal to [`crc32c`] of the pieces
+/// joined.
+#[derive(Clone, Copy, Debug)]
+pub struct Crc32c(u32);
+
+impl Crc32c {
+    /// The CRC of no bytes yet.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self(!0)
     }
-    !crc
+
+    /// Adds `bytes` after those added before.
+    pub fn update(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            let low = self.0.to_le_bytes()[0];
+            self.0 = TABLE[usize::from(low ^ b)] ^ (self.0 >> 8);
+        }
+    }
+
+    /// The CRC-32C of every byte added.
+    #[must_use]
+    pub const fn finish(self) -> u32 {
+        !self.0
+    }
+}
+
+impl Default for Crc32c {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[cfg(test)]
@@ -53,5 +83,18 @@ mod tests {
         assert_eq!(crc32c(&[0xffu8; 32]), 0x62a8_ab43);
         let ascending: Vec<u8> = (0u8..32).collect();
         assert_eq!(crc32c(&ascending), 0x46dd_794e);
+    }
+
+    /// Catches an incremental CRC that restarts, or inverts, at each piece: any split of
+    /// the bytes gives the one-shot value.
+    #[test]
+    fn pieces_give_the_whole_crc() {
+        let bytes: Vec<u8> = (0..=255u8).cycle().take(1000).collect();
+        for split in [0, 1, 7, 500, 999, 1000] {
+            let mut crc = super::Crc32c::default();
+            crc.update(&bytes[..split]);
+            crc.update(&bytes[split..]);
+            assert_eq!(crc.finish(), crc32c(&bytes), "split at {split}");
+        }
     }
 }
