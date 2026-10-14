@@ -237,3 +237,111 @@ async fn repeated_content_is_asked_about_once() {
         "each distinct digest asked once, in walk order"
     );
 }
+
+/// A store that lacks every blob and records each spool it is given.
+#[derive(Default)]
+struct LacksAll {
+    /// How many blobs each spool held.
+    spools: std::sync::Mutex<Vec<usize>>,
+}
+
+impl Cas for LacksAll {
+    type Lease = Arc<Self>;
+
+    fn lease(self: &Arc<Self>, _: &kbf_types::LeaseId) -> Arc<Self> {
+        Arc::clone(self)
+    }
+
+    async fn get(&self, digest: &Digest) -> Result<Vec<u8>, kbf_daemon::cas::CasError> {
+        Err(kbf_daemon::cas::CasError::Missing(label(digest)))
+    }
+
+    async fn put(&self, bytes: Vec<u8>) -> Result<Digest, kbf_daemon::cas::CasError> {
+        panic!(
+            "{} put on its own, not through the spool",
+            label(&digest_of(&bytes))
+        );
+    }
+
+    async fn put_spool(&self, spool: Arc<Spool>) -> Result<(), kbf_daemon::cas::CasError> {
+        let held = spool.records().len();
+        self.spools.lock().expect("spools").push(held);
+        Ok(())
+    }
+}
+
+/// Catches a blob that could not be copied into the spool being dropped: the action
+/// result would name a digest the CAS never got. Each case walks two missing files and
+/// spoils one before [`Pending::store_missing`] copies it: replaced by another file of
+/// the same bytes (another inode), removed, and its bytes changed in place (the spool
+/// refuses bytes that do not hash to the digest). Each must fail and store no spool.
+/// Mutant seen red: `let _ = self.copy_missing(..).await;` in `store_missing` (Ok,
+/// and a spool of the one good file stored).
+#[tokio::test]
+async fn a_blob_that_cannot_be_copied_fails_the_store() {
+    let exe = std::env::current_exe().expect("test binary");
+    let root = exe
+        .parent()
+        .expect("deps directory")
+        .join("kbf-driver-container-unit")
+        .join("pending-spoiled");
+    let _ = std::fs::remove_dir_all(&root);
+    type Spoil = fn(&Path);
+    let cases: [(&str, Spoil, &str); 3] = [
+        (
+            "replaced",
+            |f| {
+                let other = f.with_extension("new");
+                std::fs::write(&other, b"spoiled").expect("write");
+                std::fs::rename(&other, f).expect("rename");
+            },
+            "removed or replaced",
+        ),
+        (
+            "removed",
+            |f| std::fs::remove_file(f).expect("unlink"),
+            "No such file",
+        ),
+        (
+            "changed",
+            |f| {
+                use std::io::Write as _;
+                let mut file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(f)
+                    .expect("open");
+                file.write_all(b"SPOILED").expect("write");
+            },
+            "failed verification",
+        ),
+    ];
+    for (case, spoil, why) in cases {
+        let dir = root.join(case);
+        std::fs::create_dir_all(dir.join("spools")).expect("mkdir");
+        let mut pending = Pending::default();
+        for (name, bytes) in [("good", "kept"), ("bad", "spoiled")] {
+            std::fs::write(dir.join(name), bytes).expect("write");
+            let stat = rustix::fs::stat(dir.join(name)).expect("stat");
+            let at = FileAt {
+                dirs: Vec::new().into(),
+                name: name.to_owned(),
+                id: (stat.st_dev, stat.st_ino),
+                shown: dir.join(name),
+            };
+            pending.file(&digest_of(bytes.as_bytes()), at);
+        }
+        spoil(&dir.join("bad"));
+        let upper = Arc::new(
+            rustix::fs::openat(rustix::fs::CWD, &dir, DIRECTORY, Mode::empty()).expect("open"),
+        );
+        let store = LacksAll::default();
+        let err = pending
+            .store_missing(&store, &upper, &dir.join("spools"))
+            .await
+            .expect_err(case);
+        let shown = err.to_string();
+        assert!(shown.contains(why), "{case}: {shown}");
+        let spools = store.spools.lock().expect("spools").len();
+        assert_eq!(spools, 0, "{case}: a spool stored after a failed copy");
+    }
+}
