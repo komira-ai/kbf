@@ -36,8 +36,8 @@ kbf-raft                 19     19
 kbf-sched                 2      2
 kbf-segments              8      5
 kbf-server                0      0
-kbf-sim                   9      3
-kbf-sim-cell              8     17
+kbf-sim                   6      3
+kbf-sim-cell              4     15
 kbf-store                 0      0
 kbf-testkit               0      0
 kbf-transfer              0      0
