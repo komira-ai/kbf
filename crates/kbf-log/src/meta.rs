@@ -1,14 +1,26 @@
 //! `kbf_meta::Command` to and from `kbf.log.v1.MetaCommand`.
 
 use kbf_meta::{
-    ActionRecord, Closure, Command, Epoch, Generation, Location, ObjectId, Role, StoreId, Touch,
-    UnreachableReason,
+    ActionRecord, Closure, Command, Epoch, Generation, Location, ObjectId, Role, ServerId,
+    StagedPut, StoreId, TierId, Touch, UnreachableReason,
 };
 use kbf_proto::kbf::log::v1 as proto;
 use kbf_types::{Digest, DigestFunction, FarmTime};
 use proto::meta_command::Command as P;
 
 use crate::{DecodeError, EncodeError};
+
+/// Whether `command` joined the log in [`Format::V2`](crate::Format::V2).
+pub(crate) const fn since_v2(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::AddTier { .. }
+            | Command::PutStaged { .. }
+            | Command::SealStaged { .. }
+            | Command::ObjectFlushed { .. }
+            | Command::FlushConflict { .. }
+    )
+}
 
 pub(crate) fn to_proto(command: &Command) -> Result<proto::MetaCommand, EncodeError> {
     let c = match command {
@@ -57,8 +69,45 @@ pub(crate) fn to_proto(command: &Command) -> Result<proto::MetaCommand, EncodeEr
             })
         }
         Command::Collect => P::Collect(proto::Collect {}),
+        Command::AddTier { server, tier } => P::AddTier(proto::AddTier {
+            server: server.get(),
+            tier: tier.get(),
+        }),
+        Command::PutStaged { tier, objects } => P::PutStaged(proto::PutStaged {
+            tier: tier.get(),
+            objects: objects
+                .iter()
+                .map(staged_object)
+                .collect::<Result<_, _>>()?,
+        }),
+        Command::SealStaged { object } => P::SealStaged(proto::SealStaged {
+            object: Some(object_id(*object)),
+        }),
+        Command::ObjectFlushed { object } => P::ObjectFlushed(proto::ObjectFlushed {
+            object: Some(object_id(*object)),
+        }),
+        Command::FlushConflict { object } => P::FlushConflict(proto::FlushConflict {
+            object: Some(object_id(*object)),
+        }),
     };
     Ok(proto::MetaCommand { command: Some(c) })
+}
+
+fn staged_object(put: &StagedPut) -> Result<proto::StagedObject, EncodeError> {
+    let blobs: Result<_, _> = put.blobs.iter().map(staged_blob).collect();
+    Ok(proto::StagedObject {
+        object: Some(object_id(put.object)),
+        end: put.end,
+        seal: put.seal,
+        blobs: blobs?,
+    })
+}
+
+fn staged_blob((d, offset): &(Digest, u64)) -> Result<proto::StagedBlob, EncodeError> {
+    Ok(proto::StagedBlob {
+        digest: Some(digest(d)?),
+        offset: *offset,
+    })
 }
 
 /// An action-cache record: the result's digest and its closure, a set.
@@ -160,8 +209,42 @@ pub(crate) fn from_proto(command: proto::MetaCommand) -> Result<Command, DecodeE
                 generation: Generation::new(r.generation),
             },
             P::Collect(proto::Collect {}) => Command::Collect,
+            P::AddTier(a) => Command::AddTier {
+                server: ServerId::new(a.server),
+                tier: TierId::new(a.tier),
+            },
+            P::PutStaged(p) => Command::PutStaged {
+                tier: TierId::new(p.tier),
+                objects: p
+                    .objects
+                    .into_iter()
+                    .map(from_staged_object)
+                    .collect::<Result<_, _>>()?,
+            },
+            P::SealStaged(s) => Command::SealStaged {
+                object: required_object(s.object, "SealStaged.object")?,
+            },
+            P::ObjectFlushed(f) => Command::ObjectFlushed {
+                object: required_object(f.object, "ObjectFlushed.object")?,
+            },
+            P::FlushConflict(c) => Command::FlushConflict {
+                object: required_object(c.object, "FlushConflict.object")?,
+            },
         },
     )
+}
+
+fn from_staged_object(o: proto::StagedObject) -> Result<StagedPut, DecodeError> {
+    Ok(StagedPut {
+        object: required_object(o.object, "StagedObject.object")?,
+        end: o.end,
+        seal: o.seal,
+        blobs: o
+            .blobs
+            .into_iter()
+            .map(|b| Ok((required_digest(b.digest, "StagedBlob.digest")?, b.offset)))
+            .collect::<Result<_, DecodeError>>()?,
+    })
 }
 
 fn blob(b: proto::PutBlob) -> Result<(Digest, Location), DecodeError> {

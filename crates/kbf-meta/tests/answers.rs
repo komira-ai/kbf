@@ -15,14 +15,26 @@ fn held_but_unreachable_is_unavailable_never_absent() {
     let mut m = meta();
     let held = digest(1);
     put(&mut m, held, in_segment(7, 1));
-    assert_eq!(m.blob(&held), BlobAnswer::Present(in_segment(7, 1)));
+    assert_eq!(
+        m.blob(&held),
+        BlobAnswer::Present {
+            location: in_segment(7, 1),
+            staged_on: None
+        }
+    );
 
     mark_missing(&mut m, 7);
     assert_eq!(m.blob(&held), BlobAnswer::Unavailable);
     assert_eq!(m.blob(&digest(2)), BlobAnswer::Absent);
 
     mark_reachable(&mut m, 7);
-    assert_eq!(m.blob(&held), BlobAnswer::Present(in_segment(7, 1)));
+    assert_eq!(
+        m.blob(&held),
+        BlobAnswer::Present {
+            location: in_segment(7, 1),
+            staged_on: None
+        }
+    );
 }
 
 /// Catches: an index keyed on the hash alone. A request with the right hash and the
@@ -69,7 +81,13 @@ fn reupload_heals_an_unreachable_entry_and_keeps_a_reachable_one() {
             kept: in_segment(1, 4)
         }
     );
-    assert_eq!(m.blob(&d), BlobAnswer::Present(in_segment(1, 4)));
+    assert_eq!(
+        m.blob(&d),
+        BlobAnswer::Present {
+            location: in_segment(1, 4),
+            staged_on: None
+        }
+    );
 
     mark_missing(&mut m, 1);
     assert_eq!(
@@ -78,7 +96,13 @@ fn reupload_heals_an_unreachable_entry_and_keeps_a_reachable_one() {
             replaced: in_segment(1, 4)
         }
     );
-    assert_eq!(m.blob(&d), BlobAnswer::Present(big));
+    assert_eq!(
+        m.blob(&d),
+        BlobAnswer::Present {
+            location: big,
+            staged_on: None
+        }
+    );
     assert_eq!(put(&mut m, digest(5), big), BlobWrite::Stored);
     assert_eq!(m.blob_count(), 2);
 }

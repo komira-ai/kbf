@@ -8,7 +8,7 @@ mod support;
 
 use std::time::Duration;
 
-use kbf_front::{MAX_RANGE_BYTES, MAX_UPLOAD_RECORDS, SegmentsConfig};
+use kbf_front::{MAX_RANGE_BYTES, MAX_UPLOAD_RECORDS, SegmentsConfig, WriteConfig};
 use kbf_proto::worker::{BeginRequest, CommitRequest, ObjectRef, ReadRangeRequest, UploadSegment};
 use kbf_segments::{Footer, IndexEntry};
 use tonic::Code;
@@ -257,7 +257,7 @@ async fn a_closed_connection_frees_its_upload_at_once() {
     let s = seg(&[blob(12, 1 << 16)]);
     let mut client = front.client().await;
     let upload = front.begin(&mut client, std::slice::from_ref(&s)).await;
-    assert!(front.service.budget_in_use() >= s.length);
+    assert!(front.cache.bytes_admitted() >= s.length);
     let mut other = front.client().await;
     let refused = other
         .commit(CommitRequest { upload })
@@ -270,7 +270,7 @@ async fn a_closed_connection_frees_its_upload_at_once() {
     );
     drop(client);
     front.wait_until_no_uploads().await;
-    assert_eq!(front.service.budget_in_use(), 0);
+    assert_eq!(front.cache.bytes_admitted(), 0);
 }
 
 /// Catches unbounded server memory per read (mutant: no length check): a `ReadRange`
@@ -340,7 +340,7 @@ async fn an_idle_upload_is_dropped() {
         .await
         .expect("part");
     front.wait_until_no_uploads().await;
-    assert_eq!(front.service.budget_in_use(), 0);
+    assert_eq!(front.cache.bytes_admitted(), 0);
     let late = front
         .put(&mut client, upload, 0, 500, &s.records[500..])
         .await;
@@ -456,16 +456,20 @@ async fn a_begin_waits_for_the_budget(release: Release) {
         max_bytes: 4 << 10,
         idle: Duration::from_secs(3600),
     };
-    let front = Front::start(config).await;
+    let writes = WriteConfig {
+        bytes_in_flight: 4 << 10,
+        ..WriteConfig::DEFAULT
+    };
+    let front = Front::start_with(config, writes).await;
     let first = seg(&[blob(60, 1400), blob(61, 1400)]);
     let second = seg(&[blob(62, 1500)]);
     assert!(
-        first.length.div_ceil(1024) + second.length.div_ceil(1024) > 4,
+        first.length + second.length > 4 << 10,
         "the two uploads do not fit together"
     );
     let mut a = front.client().await;
     let held = front.begin(&mut a, std::slice::from_ref(&first)).await;
-    assert!(front.service.budget_in_use() >= first.length);
+    assert!(front.cache.bytes_admitted() >= first.length);
 
     let mut b = front.client().await;
     let segments = vec![second.upload_segment()];
@@ -507,7 +511,7 @@ async fn a_begin_waits_for_the_budget(release: Release) {
         .into_inner()
         .upload;
     assert_eq!(front.service.begins_waiting(), 0);
-    assert!(front.service.budget_in_use() >= second.length);
+    assert!(front.cache.bytes_admitted() >= second.length);
     put_all(&mut b, upload, 0, &second, 4096, false).await;
     b.commit(CommitRequest { upload })
         .await
@@ -593,7 +597,7 @@ async fn a_connection_closed_during_the_commit_leaves_the_commit_to_finish() {
     let call = tokio::spawn(async move { committing.commit(CommitRequest { upload }).await });
     front.store.wait_for_put().await;
     assert!(
-        front.service.budget_in_use() >= s.length,
+        front.cache.bytes_admitted() >= s.length,
         "the budget is held while the commit holds the buffers"
     );
     call.abort();
@@ -605,5 +609,5 @@ async fn a_connection_closed_during_the_commit_leaves_the_commit_to_finish() {
     front.store.release();
     front.wait_until_no_uploads().await;
     front.assert_present(&s.digests, true).await;
-    assert_eq!(front.service.budget_in_use(), 0);
+    assert_eq!(front.cache.bytes_admitted(), 0);
 }

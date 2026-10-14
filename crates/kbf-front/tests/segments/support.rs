@@ -9,7 +9,7 @@ use bytes::Bytes;
 use futures::StreamExt as _;
 use kbf_front::{
     Cache, Connections, MAX_MESSAGE_BYTES, MemoryMetaLog, MetaLog as _, SegmentsConfig,
-    SegmentsService,
+    SegmentsService, WriteConfig,
 };
 use kbf_meta::{BlobAnswer, Retention};
 use kbf_objstore::{
@@ -231,12 +231,18 @@ pub struct Front {
 
 impl Front {
     pub async fn start(config: SegmentsConfig) -> Self {
+        Self::start_with(config, WriteConfig::DEFAULT).await
+    }
+
+    /// As [`Front::start`], with the cache's uploads bounded as `writes` says.
+    pub async fn start_with(config: SegmentsConfig, writes: WriteConfig) -> Self {
         let store = GatedStore::new();
         let meta = MemoryMetaLog::new(Retention::default());
         let cache = Arc::new(
             Cache::open(meta, store.clone(), KeyPrefix::default())
                 .await
-                .expect("cache"),
+                .expect("cache")
+                .with_writes(writes),
         );
         let connections = Connections::new();
         let service = SegmentsService::new(Arc::clone(&cache), config, connections.clone());
@@ -338,7 +344,7 @@ impl Front {
                 })
                 .await
                 .expect("query");
-            let BlobAnswer::Present(location) = answer else {
+            let BlobAnswer::Present { location, .. } = answer else {
                 panic!("{digest} not present: {answer:?}");
             };
             let key = self.cache.object_key(location.object).expect("key");

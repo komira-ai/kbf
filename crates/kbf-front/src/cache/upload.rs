@@ -2,16 +2,14 @@
 //! 4): storing segments the server built from a daemon's checked records under one
 //! commit, locating blobs, and reading ranges of stored objects.
 
-use std::time::Instant;
-
 use bytes::Bytes;
 use futures::future::try_join_all;
-use kbf_meta::{Applied, BlobAnswer, Command, Location, ObjectId, StoreId};
+use kbf_meta::{BlobAnswer, Location, ObjectId, StoreId};
 use kbf_objstore::{ByteRange, ObjectStore, ObjectStoreError};
 use kbf_segments::IndexEntry;
 use kbf_types::Digest;
 
-use super::{Cache, CacheError, unexpected};
+use super::{Cache, CacheError};
 use crate::meta_log::MetaLog;
 
 /// One segment ready to store: its whole bytes (records, then a footer the server
@@ -23,9 +21,14 @@ pub(crate) struct BuiltSegment {
 }
 
 impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
-    /// Stores every segment of an upload (each its own object, PUT at once), reads each
-    /// footer back, and then commits **one** [`Command::PutBlobs`] listing every record
-    /// of every segment. Returns the digests committed, in segment then index order.
+    /// Stores every segment of an upload (each its own object), reads each footer
+    /// back, and then commits **one** [`PutBlobs`](kbf_meta::Command::PutBlobs)
+    /// listing every record of every segment. Returns the digests committed, in
+    /// segment then index order.
+    ///
+    /// Each segment is stored as a grouped segment is (`Writer::store_segment`): under
+    /// a `--write-puts-in-flight` slot, its PUT retried under a new key, its footer read
+    /// back; the commit is timed as a segment commit.
     ///
     /// Nothing is indexed unless every PUT and read-back succeeded: a failure leaves
     /// the objects written so far as orphans, unreferenced.
@@ -40,14 +43,8 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         let placed = try_join_all(segments.into_iter().map(|s| self.put_built(s))).await?;
         let placed: Vec<(Digest, Location)> = placed.into_iter().flatten().collect();
         let digests = placed.iter().map(|(d, _)| *d).collect();
-        let started = Instant::now();
-        let committed = self.commit(Command::PutBlobs(placed)).await;
-        self.metrics().segment_commit.since(started);
-        match committed? {
-            Applied::Blobs(Ok(_)) => Ok(digests),
-            Applied::Blobs(Err(e)) => Err(CacheError::Internal(e.to_string())),
-            other => Err(unexpected(&other)),
-        }
+        self.writer.commit_segment(placed).await?;
+        Ok(digests)
     }
 
     /// Writes one built segment as a new object and returns where each of its records
@@ -56,21 +53,10 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         &self,
         segment: BuiltSegment,
     ) -> Result<Vec<(Digest, Location)>, CacheError> {
-        let object = self.allocate();
-        let key = self.object_key(object)?;
-        let len = segment.body.len() as u64;
-        self.metrics()
-            .segment_blobs
-            .observe(segment.entries.len() as u64);
-        self.metrics().segment_bytes.observe(len);
-        let started = Instant::now();
-        let put = self.objects().put_new(&key, segment.body, None).await;
-        self.metrics().segment_put.since(started);
-        put?;
-        let started = Instant::now();
-        let footer = self.read_footer(&key, len).await;
-        self.metrics().segment_footer.since(started);
-        let footer = footer?;
+        let (object, key, footer) = self
+            .writer
+            .store_segment(&self.group, segment.body, segment.entries.len())
+            .await?;
         segment
             .entries
             .iter()
@@ -111,7 +97,7 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
             let found: Vec<Option<Location>> = digests
                 .iter()
                 .map(|d| match s.blob(d) {
-                    BlobAnswer::Present(location) => Some(location),
+                    BlobAnswer::Present { location, .. } => Some(location),
                     BlobAnswer::Unavailable | BlobAnswer::Absent => None,
                 })
                 .collect();
@@ -138,7 +124,7 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         let Some(range) = ByteRange::new(offset, len) else {
             return Ok(None);
         };
-        match self.get_range(&key, range).await {
+        match self.writer.get_range(&key, range).await {
             Ok(bytes) if bytes.len() as u64 == len => Ok(Some(bytes)),
             Ok(_) | Err(ObjectStoreError::NotFound(_) | ObjectStoreError::InvalidRange { .. }) => {
                 Ok(None)

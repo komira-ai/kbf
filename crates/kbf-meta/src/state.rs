@@ -1,6 +1,6 @@
 //! The metadata state machine: commands in, outcomes out, queries on the side.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::iter;
 use std::time::Duration;
 
@@ -10,6 +10,9 @@ use crate::model::{
     ActionAnswer, ActionRecord, BlobAnswer, Epoch, FindMissing, Generation, Location, LossMark,
     Miss, ObjectId, Retention, Role, Touch, UnreachableReason,
 };
+use crate::tier::{ServerId, StagedObject, StagedPut, TierError, TierId};
+
+mod staged;
 
 /// One committed change to the metadata state.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -62,8 +65,52 @@ pub enum Command {
         /// The mark's generation the sender read before it probed the store.
         generation: Generation,
     },
-    /// Removes every blob and action entry whose retention has run out.
+    /// Removes every blob and action entry whose retention has run out, and forgets
+    /// objects that left the staged table more than the blob retention ago.
     Collect,
+    /// Registers `tier` as `server`'s local write tier (write-path.md, section 6.1). A
+    /// server has one tier at a time: registering another retires the one before,
+    /// which is refused while it holds a staged object. An id registered to another
+    /// server, or retired, is refused. Registering a server's current tier again is a
+    /// no-op.
+    AddTier {
+        /// The server.
+        server: ServerId,
+        /// Its tier.
+        tier: TierId,
+    },
+    /// Records blobs synced to block files on `tier`: each object's blobs are indexed
+    /// at `Location { store: CONFIGURED, object, offset }` (as [`Command::PutBlobs`]
+    /// does), the object is marked staged on `tier`, and its committed length becomes
+    /// the larger of its length and `end`. A digest an object already lists is indexed
+    /// at the offset listed first. All or nothing: refused if the tier is not a
+    /// server's current tier, an object is staged on another tier, sealed (unless the
+    /// object already lists every blob and reaches `end`: a retry), has left the table,
+    /// is marked unreachable, is named twice, or a record ends past `end`.
+    PutStaged {
+        /// The tier the blocks were synced on.
+        tier: TierId,
+        /// The objects.
+        objects: Vec<StagedPut>,
+    },
+    /// Seals a staged object: after it, a [`Command::PutStaged`] that adds to it is
+    /// refused. A no-op on an object already sealed or that has left the table.
+    SealStaged {
+        /// The object.
+        object: ObjectId,
+    },
+    /// The store holds a sealed object: it leaves the staged table, its blobs stay
+    /// where they are. A no-op on an object that has already left.
+    ObjectFlushed {
+        /// The object.
+        object: ObjectId,
+    },
+    /// The store holds different bytes under a sealed object's key: the object stays
+    /// staged and is read from its block, and the flusher stops retrying it.
+    FlushConflict {
+        /// The object.
+        object: ObjectId,
+    },
 }
 
 /// What applying a [`Command`] did.
@@ -90,6 +137,11 @@ pub enum Applied {
     Marked(Result<(), UnallocatedEpoch>),
     /// [`Command::Collect`].
     Collected(Collected),
+    /// [`Command::PutStaged`]: one outcome per blob, object by object, in order.
+    Staged(Result<Vec<BlobWrite>, TierError>),
+    /// [`Command::AddTier`], [`Command::SealStaged`], [`Command::ObjectFlushed`] or
+    /// [`Command::FlushConflict`].
+    Tier(Result<(), TierError>),
 }
 
 /// What a [`Command::PutBlob`] did.
@@ -160,7 +212,7 @@ struct ActionEntry {
 }
 
 /// The metadata state: the CAS index, the action cache, unreachable objects, farm
-/// time and the next writer epoch.
+/// time, the next writer epoch, and the write tiers with their staged objects.
 ///
 /// Every replica applies the same committed [`Command`]s and ends in the same state.
 /// Reads are `&self` queries on the leader. A read that reports or serves something
@@ -176,6 +228,16 @@ pub struct MetaState {
     actions: BTreeMap<Digest, ActionEntry>,
     unreachable: BTreeMap<ObjectId, LossMark>,
     next_epoch: u64,
+    /// Each server's current tier.
+    tiers: BTreeMap<ServerId, TierId>,
+    /// Tiers a server replaced; never registered again.
+    retired_tiers: BTreeSet<TierId>,
+    /// Objects whose only copy is a block on a tier.
+    staged: BTreeMap<ObjectId, StagedObject>,
+    /// Objects that left `staged` (flushed, or marked unreachable), with the farm time
+    /// they left, so a late `PutStaged` cannot stage one again. Forgotten by `Collect`
+    /// after the blob retention (`min_ttl` plus the touch quantum).
+    left: BTreeMap<ObjectId, FarmTime>,
 }
 
 impl MetaState {
@@ -189,6 +251,10 @@ impl MetaState {
             actions: BTreeMap::new(),
             unreachable: BTreeMap::new(),
             next_epoch: 1,
+            tiers: BTreeMap::new(),
+            retired_tiers: BTreeSet::new(),
+            staged: BTreeMap::new(),
+            left: BTreeMap::new(),
         }
     }
 
@@ -267,6 +333,7 @@ impl MetaState {
                         .or_insert(LossMark { reason, generation });
                     mark.reason = mark.reason.max(reason);
                     mark.generation = generation;
+                    self.unstage(object);
                 }))
             }
             Command::ObjectReachable { object, generation } => {
@@ -281,6 +348,11 @@ impl MetaState {
                 }))
             }
             Command::Collect => Applied::Collected(self.collect()),
+            Command::AddTier { server, tier } => Applied::Tier(self.add_tier(server, tier)),
+            Command::PutStaged { tier, objects } => Applied::Staged(self.put_staged(tier, objects)),
+            Command::SealStaged { object } => Applied::Tier(self.seal_staged(object)),
+            Command::ObjectFlushed { object } => Applied::Tier(self.object_flushed(object)),
+            Command::FlushConflict { object } => Applied::Tier(self.flush_conflict(object)),
         }
     }
 
@@ -292,7 +364,10 @@ impl MetaState {
             Some(entry) if self.unreachable.contains_key(&entry.location.object) => {
                 BlobAnswer::Unavailable
             }
-            Some(entry) => BlobAnswer::Present(entry.location),
+            Some(entry) => BlobAnswer::Present {
+                location: entry.location,
+                staged_on: self.staged.get(&entry.location.object).map(|s| s.tier),
+            },
         }
     }
 
@@ -318,7 +393,7 @@ impl MetaState {
     pub fn find_missing(&self, digests: &[Digest]) -> FindMissing {
         let missing = digests
             .iter()
-            .filter(|d| !matches!(self.blob(d), BlobAnswer::Present(_)))
+            .filter(|d| !matches!(self.blob(d), BlobAnswer::Present { .. }))
             .copied()
             .collect();
         FindMissing {
@@ -358,7 +433,7 @@ impl MetaState {
     fn closure_check<'a>(&self, needed: impl Iterator<Item = &'a Digest>) -> Result<(), Lack> {
         for digest in needed {
             match self.blob(digest) {
-                BlobAnswer::Present(_) => {}
+                BlobAnswer::Present { .. } => {}
                 BlobAnswer::Unavailable => return Err(Lack::Unreachable(*digest)),
                 BlobAnswer::Absent => return Err(Lack::Absent(*digest)),
             }
@@ -398,7 +473,7 @@ impl MetaState {
         entry.last_touch = now;
         match answer {
             BlobAnswer::Absent => BlobWrite::Stored,
-            BlobAnswer::Present(kept) => BlobWrite::Duplicate { kept },
+            BlobAnswer::Present { location, .. } => BlobWrite::Duplicate { kept: location },
             BlobAnswer::Unavailable => {
                 let replaced = entry.location;
                 entry.location = location;
@@ -476,6 +551,15 @@ impl MetaState {
         for action in dead {
             self.actions.remove(&action);
             collected.actions.push(action);
+        }
+        let forgotten: Vec<ObjectId> = self
+            .left
+            .iter()
+            .filter(|(_, at)| self.expired(**at, min_ttl))
+            .map(|(o, _)| *o)
+            .collect();
+        for object in forgotten {
+            self.left.remove(&object);
         }
         collected
     }

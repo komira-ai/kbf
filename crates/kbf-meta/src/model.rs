@@ -6,6 +6,8 @@ use std::time::Duration;
 
 use kbf_types::Digest;
 
+use crate::tier::TierId;
+
 /// A writer epoch: the first half of every [`ObjectId`].
 ///
 /// The metadata core hands out epochs through [`Command::AllocEpoch`](crate::Command::AllocEpoch),
@@ -264,7 +266,15 @@ pub struct ActionRecord {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BlobAnswer {
     /// Held, at a reachable location.
-    Present(Location),
+    Present {
+        /// Where the bytes are.
+        location: Location,
+        /// The tier whose block holds the object while it is staged
+        /// (docs/design/write-path.md, section 6.1), from the same query: a staged
+        /// object is read from its block, and a reader never marks it unreachable
+        /// because the store lacks it. `None`: the object is in the store.
+        staged_on: Option<TierId>,
+    },
     /// Held, but the object holding it is unreachable. The read fails with
     /// UNAVAILABLE; it is never NOT_FOUND, because the farm holds the blob.
     Unavailable,

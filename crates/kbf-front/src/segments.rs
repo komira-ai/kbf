@@ -6,16 +6,18 @@
 //! service as it wraps the blob services); this type authorizes nothing itself.
 //!
 //! - **Begin** checks every footer, refuses an upload over
-//!   `--segment-upload-max-bytes` or [`MAX_UPLOAD_RECORDS`], and then takes its whole
-//!   length from the memory budget, waiting (never refusing) while it is spent. Ranges
-//!   are held in memory until the commit: the direct path; the local write tier is a
-//!   later stage.
+//!   `--segment-upload-max-bytes` or [`MAX_UPLOAD_RECORDS`], and then is admitted for
+//!   its whole length by [`Cache::admit`] (`--write-bytes-in-flight`, the bound
+//!   ByteStream and batch uploads share), waiting (never refusing) while it is spent.
+//!   Ranges are held in memory until the commit: the direct path; the local write tier
+//!   is a later stage.
 //! - **PutRange** writes a range of one segment's records. Once Commit was called,
 //!   every PutRange is refused, so the bytes checked are the bytes stored.
 //! - **Commit** runs in a task of its own, detached from the call and the connection,
 //!   until it has indexed or failed: every record's SHA-256 is checked, each segment
 //!   gets a footer built here (the daemon's CRC-32C values never reach the store), each
-//!   is PUT and read back, and one `PutBlobs` commits every record. A second Commit
+//!   is PUT and read back as a grouped segment is (a `--write-puts-in-flight` slot, the
+//!   PUT retried under a new key), and one `PutBlobs` commits every record. A second Commit
 //!   waits for the first and returns its answer.
 //! - An upload belongs to the connection that began it ([`Connections`]). When that
 //!   connection closes, or no call names the upload for `--segment-upload-idle-secs`, an
@@ -39,13 +41,13 @@ use kbf_proto::worker::{
     ReadRangeResponse,
 };
 use kbf_types::Digest;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
+use tokio::sync::watch;
 use tokio::time::Instant;
 use tonic::{Request, Response, Status};
 
 pub use self::connection::{Connection, Connections, Tracked};
 use self::upload::{Declared, Put, Receiving, declare};
-use crate::cache::Cache;
+use crate::cache::{Admitted, Cache};
 use crate::meta_log::MetaLog;
 use crate::{MAX_BLOB_BYTES, wire};
 
@@ -60,14 +62,13 @@ pub const MAX_RANGE_BYTES: u64 = 4 << 20;
 /// footer, with room to spare, so any legal blob can be uploaded.
 pub const MIN_SEGMENT_UPLOAD_BYTES: u64 = MAX_BLOB_BYTES + (1 << 20);
 
-/// The memory budget counts whole KiB, so a cap of terabytes still fits a permit count.
-const BUDGET_UNIT: u64 = 1 << 10;
-
 /// The `--segment-upload-*` flags of the server.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SegmentsConfig {
-    /// The most bytes one upload may declare, and the memory every upload in progress
-    /// may hold together (`--segment-upload-max-bytes`).
+    /// The most bytes one upload may declare (`--segment-upload-max-bytes`). The
+    /// memory uploads in progress hold together is bounded by the cache's
+    /// `--write-bytes-in-flight` ([`Cache::admit`]), which `kbf-server` refuses to
+    /// start below this cap, so a legal `Begin` is always admitted.
     pub max_bytes: u64,
     /// How long an upload may go without a call before it is dropped
     /// (`--segment-upload-idle-secs`).
@@ -107,8 +108,7 @@ struct Shared<M, O> {
     cache: Arc<Cache<M, O>>,
     config: SegmentsConfig,
     connections: Connections,
-    budget: Arc<Semaphore>,
-    /// `Begin` calls waiting for the budget now.
+    /// `Begin` calls waiting for admission now.
     waiting: AtomicUsize,
     next: AtomicU64,
     uploads: Mutex<HashMap<u64, Arc<Upload>>>,
@@ -128,7 +128,7 @@ struct Upload {
 enum Phase {
     Receiving {
         segments: Vec<Receiving>,
-        _budget: OwnedSemaphorePermit,
+        _admitted: Admitted,
     },
     Committing,
     /// Committed or failed; the answer is in [`Upload::done`].
@@ -136,7 +136,7 @@ enum Phase {
     Dropped,
 }
 
-/// Counts one `Begin` waiting for the budget until dropped, so a call cancelled while
+/// Counts one `Begin` waiting for admission until dropped, so a call cancelled while
 /// it waits is uncounted too.
 struct Waiting<'a>(&'a AtomicUsize);
 
@@ -180,7 +180,7 @@ impl Upload {
         }
     }
 
-    /// Drops the upload, freeing its buffers and budget even if a call still holds it,
+    /// Drops the upload, freeing its buffers and admission even if a call still holds it,
     /// unless a commit of it is running: decided under the phase lock, so a Commit
     /// cannot start between the check and the drop.
     fn try_drop(&self) -> bool {
@@ -206,15 +206,11 @@ impl<M: MetaLog, O: ObjectStore + 'static> SegmentsService<M, O> {
     /// wrapped by [`Connections::track`], or uploads are dropped only when idle).
     #[must_use]
     pub fn new(cache: Arc<Cache<M, O>>, config: SegmentsConfig, connections: Connections) -> Self {
-        let permits = usize::try_from(config.max_bytes.div_ceil(BUDGET_UNIT))
-            .unwrap_or(usize::MAX)
-            .min(Semaphore::MAX_PERMITS);
         Self {
             shared: Arc::new(Shared {
                 cache,
                 config,
                 connections,
-                budget: Arc::new(Semaphore::new(permits)),
                 waiting: AtomicUsize::new(0),
                 next: AtomicU64::new(1),
                 uploads: Mutex::new(HashMap::new()),
@@ -222,16 +218,8 @@ impl<M: MetaLog, O: ObjectStore + 'static> SegmentsService<M, O> {
         }
     }
 
-    /// Bytes of the memory budget held by uploads now, in [`BUDGET_UNIT`]s rounded up
-    /// per upload: what a test watches to see a dropped upload give its memory back.
-    #[must_use]
-    pub fn budget_in_use(&self) -> u64 {
-        let total = self.shared.config.max_bytes.div_ceil(BUDGET_UNIT);
-        (total - self.shared.budget.available_permits() as u64) * BUDGET_UNIT
-    }
-
-    /// How many `Begin` calls are waiting for the memory budget now: what a test
-    /// watches to see a `Begin` wait rather than be refused.
+    /// How many `Begin` calls are waiting for admission now: what a test watches to
+    /// see a `Begin` wait rather than be refused.
     #[must_use]
     pub fn begins_waiting(&self) -> usize {
         self.shared.waiting.load(Ordering::SeqCst)
@@ -293,7 +281,7 @@ impl<M: MetaLog, O: ObjectStore + 'static> SegmentsService<M, O> {
         cache: Arc<Cache<M, O>>,
         upload: Arc<Upload>,
         segments: Vec<Receiving>,
-        budget: OwnedSemaphorePermit,
+        admitted: Admitted,
     ) {
         let checking = Arc::clone(&upload);
         let checked = tokio::task::spawn_blocking(move || {
@@ -309,7 +297,7 @@ impl<M: MetaLog, O: ObjectStore + 'static> SegmentsService<M, O> {
             Ok(built) => cache.store_upload(built).await.map_err(Status::from),
             Err(refused) => Err(refused),
         };
-        drop(budget);
+        drop(admitted);
         *lock(&upload.phase) = Phase::Done;
         upload.touch();
         upload.done.send_replace(Some(answer));
@@ -341,15 +329,12 @@ impl<M: MetaLog, O: ObjectStore + 'static> Segments for SegmentsService<M, O> {
                 "an upload of {records} records is over the {MAX_UPLOAD_RECORDS}-record limit"
             )));
         }
-        // `total <= cap`, so the permits fit the budget and this always ends.
-        let units = u32::try_from(total.div_ceil(BUDGET_UNIT)).unwrap_or(u32::MAX);
-        let budget = {
+        // `total <= cap <= --write-bytes-in-flight` (kbf-server refuses to start
+        // otherwise), so this always ends.
+        let admitted = {
             let _waiting = Waiting::enter(&self.shared.waiting);
-            Arc::clone(&self.shared.budget)
-                .acquire_many_owned(units)
-                .await
-        }
-        .map_err(|_| Status::unavailable("the upload budget is closed"))?;
+            self.shared.cache.admit(total).await
+        };
         let segments = declared.iter().map(Receiving::new).collect();
         let (done, _) = watch::channel(None);
         let upload = Arc::new(Upload {
@@ -357,7 +342,7 @@ impl<M: MetaLog, O: ObjectStore + 'static> Segments for SegmentsService<M, O> {
             declared,
             phase: Mutex::new(Phase::Receiving {
                 segments,
-                _budget: budget,
+                _admitted: admitted,
             }),
             last_call: Mutex::new(Instant::now()),
             done,
@@ -429,13 +414,13 @@ impl<M: MetaLog, O: ObjectStore + 'static> Segments for SegmentsService<M, O> {
             match std::mem::replace(&mut *phase, Phase::Committing) {
                 Phase::Receiving {
                     segments,
-                    _budget: budget,
+                    _admitted: admitted,
                 } => {
                     tokio::spawn(Self::commit_task(
                         Arc::clone(&self.shared.cache),
                         Arc::clone(&upload),
                         segments,
-                        budget,
+                        admitted,
                     ));
                 }
                 Phase::Dropped => {

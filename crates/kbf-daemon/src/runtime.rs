@@ -223,15 +223,15 @@ mod tests {
         let ended = tokio::time::timeout(Duration::from_secs(10), upload_within(deadline, pending))
             .await
             .expect("the upload ends at its deadline, not never");
-        let Err(RuntimeError::Failed(why)) = ended else {
-            panic!("expected a failure, got {ended:?}");
-        };
+        let why = format!("{:?}", ended.expect_err("the upload fails at its deadline"));
         assert!(
-            why.starts_with("the output upload did not finish within its deadline of 50ms")
-                && why.contains("--output-upload-deadline-secs")
-                && why.contains("stopped after 5"),
+            why.starts_with(
+                "Failed(\"the output upload did not finish within its deadline of 50ms"
+            ),
             "{why}"
         );
+        assert!(why.contains("--output-upload-deadline-secs"), "{why}");
+        assert!(why.contains("stopped after 5"), "{why}");
     }
 
     /// Catches an upload that finishes in time being failed or changed.
@@ -247,7 +247,8 @@ mod tests {
         let refused = upload_within(deadline, async {
             Err::<(), _>(RuntimeError::Invalid("bad".to_owned()))
         })
-        .await;
-        assert!(matches!(refused, Err(RuntimeError::Invalid(why)) if why == "bad"));
+        .await
+        .expect_err("the upload's own refusal");
+        assert_eq!(format!("{refused:?}"), r#"Invalid("bad")"#);
     }
 }
