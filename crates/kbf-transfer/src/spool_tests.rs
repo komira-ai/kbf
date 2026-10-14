@@ -27,6 +27,7 @@ fn spool_over(file: File) -> Spool {
     Spool {
         file: Arc::new(file),
         state: Mutex::new(State::default()),
+        hashers: tokio::sync::Semaphore::new(2),
     }
 }
 
@@ -167,4 +168,45 @@ async fn hashing_a_chunk_does_not_hold_the_polling_thread() {
     ticker.abort();
     let worst = worst.load(std::sync::atomic::Ordering::Relaxed);
     assert!(worst < 40, "a tick was {worst} ms late: the poll was held");
+}
+
+/// Catches a hash cap that is ignored (mutant: the permit not taken in
+/// `write_chunks`): with `hash_threads(1)` and 8 blobs put at once, a chunk stream
+/// that records how many streams are inside their read at once never sees two... the
+/// cap is on hashing, so the probe is the permit count while hashing: one permit means
+/// the others wait, observed as `available_permits() == 0` while a put is under way
+/// and the blobs all arrive intact.
+#[tokio::test]
+async fn hash_threads_bounds_the_chunks_hashed_at_once() {
+    let spool = Arc::new(
+        spool_over(
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(scratch_file("cap"))
+                .expect("open"),
+        )
+        .hash_threads(1),
+    );
+    assert_eq!(spool.hashers.available_permits(), 1);
+    let blobs: Vec<Vec<u8>> = (0..8u8).map(|n| vec![n; 32 << 20]).collect();
+    let puts = blobs.iter().map(|b| {
+        let spool = Arc::clone(&spool);
+        let digest = to_proto(&kbf_segments::sha256(b));
+        let chunks = Box::pin(stream::iter([Ok(b.clone())]));
+        async move { spool.put_chunks(digest, chunks).await }
+    });
+    let watch = async {
+        let mut least = usize::MAX;
+        for _ in 0..200 {
+            least = least.min(spool.hashers.available_permits());
+            tokio::task::yield_now().await;
+        }
+        least
+    };
+    let (done, least) = tokio::join!(futures::future::join_all(puts), watch);
+    assert!(done.iter().all(Result::is_ok));
+    assert_eq!(spool.records().len(), 8);
+    assert_eq!(least, 0, "a chunk was never hashed under the one permit");
+    assert_eq!(spool.hashers.available_permits(), 1);
 }

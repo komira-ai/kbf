@@ -76,6 +76,11 @@ pub struct OutputLimits {
         default_value_t = OutputLimits::DEFAULT.max_stdio_bytes
     )]
     pub max_stdio_bytes: u64,
+    /// The most threads that hash one action's output files at once (the copy of the
+    /// blobs the CAS lacks into the spool); 0 is the CPUs the daemon may use, at most
+    /// 32.
+    #[arg(long = "output-hash-threads", default_value_t = OutputLimits::DEFAULT.hash_threads)]
+    pub hash_threads: usize,
 }
 
 impl OutputLimits {
@@ -85,7 +90,15 @@ impl OutputLimits {
         max_entries: 1_000_000,
         max_bytes: 16 << 30,
         max_stdio_bytes: 1 << 30,
+        hash_threads: 0,
     };
+    /// [`OutputLimits::hash_threads`] with 0 resolved.
+    pub(crate) fn threads(&self) -> usize {
+        match self.hash_threads {
+            0 => kbf_daemon::cas::default_hash_threads(),
+            n => n,
+        }
+    }
 }
 
 impl Default for OutputLimits {
@@ -378,6 +391,7 @@ pub(crate) async fn collect(
         .map(str::to_owned)
         .collect();
     let mut pending = Pending::default();
+    let budget_threads = limits.threads();
     let budget = Budget::new(limits);
     record(
         &mut pending,
@@ -389,7 +403,9 @@ pub(crate) async fn collect(
         result,
     )
     .await?;
-    pending.store_missing(cas, &upper_fd, spools).await
+    pending
+        .store_missing(cas, &upper_fd, spools, budget_threads)
+        .await
 }
 
 /// [`collect`]'s walk over each output path, its blobs added to `pending`.
@@ -720,12 +736,14 @@ mod tests {
             "--output-max-entries=8",
             "--output-max-bytes=9",
             "--output-max-stdio-bytes=10",
+            "--output-hash-threads=3",
         ];
         let limits = OutputLimits {
             max_depth: 7,
             max_entries: 8,
             max_bytes: 9,
             max_stdio_bytes: 10,
+            hash_threads: 3,
         };
         assert_eq!(parse(&set).expect("set"), limits);
         assert!(parse(&["--output-max-depth=-1"]).is_err());

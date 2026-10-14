@@ -227,7 +227,7 @@ async fn repeated_content_is_asked_about_once() {
     );
     let store = HoldsAll::default();
     pending
-        .store_missing(&store, &upper, &dir.join("spools"))
+        .store_missing(&store, &upper, &dir.join("spools"), 2)
         .await
         .expect("stored");
     let asked = store.asked.lock().expect("asked").clone();
@@ -336,7 +336,7 @@ async fn a_blob_that_cannot_be_copied_fails_the_store() {
         );
         let store = LacksAll::default();
         let err = pending
-            .store_missing(&store, &upper, &dir.join("spools"))
+            .store_missing(&store, &upper, &dir.join("spools"), 2)
             .await
             .expect_err(case);
         let shown = err.to_string();

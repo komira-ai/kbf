@@ -18,6 +18,8 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
+use tokio::sync::Semaphore;
+
 use futures::StreamExt as _;
 use kbf_proto::reapi::Digest;
 use kbf_types::{DigestFunction, LeaseId};
@@ -39,6 +41,8 @@ pub struct Spooled {
 pub struct Spool {
     file: Arc<File>,
     state: Mutex<State>,
+    /// One permit per thread that may hash a chunk at once ([`Spool::hash_threads`]).
+    hashers: Semaphore,
 }
 
 #[derive(Debug, Default)]
@@ -72,7 +76,16 @@ impl Spool {
         Ok(Self {
             file: Arc::new(file),
             state: Mutex::new(State::default()),
+            hashers: Semaphore::new(default_hash_threads()),
         })
+    }
+
+    /// At most `threads` (at least one) chunks are hashed at once, however many blobs
+    /// are being put. The default is [`default_hash_threads`].
+    #[must_use]
+    pub fn hash_threads(mut self, threads: usize) -> Self {
+        self.hashers = Semaphore::new(threads.max(1));
+        self
     }
 
     fn lock(&self) -> MutexGuard<'_, State> {
@@ -169,6 +182,12 @@ impl Spool {
                     format!("more than {size} bytes"),
                 ));
             }
+            // Never closed, so acquiring fails only if it were.
+            let _permit = self
+                .hashers
+                .acquire()
+                .await
+                .map_err(|e| CasError::Read(blob.to_owned(), e.to_string()))?;
             let file = Arc::clone(&self.file);
             let at_chunk = offset + at;
             hasher = blocking(move || {
@@ -247,6 +266,16 @@ impl Cas for Spool {
             }
         }
     }
+}
+
+/// The CPUs this process may use (its affinity mask and cgroup quota, as
+/// `available_parallelism` reads them), at most 32: how many chunks a spool hashes at
+/// once unless told otherwise.
+#[must_use]
+pub fn default_hash_threads() -> usize {
+    std::thread::available_parallelism()
+        .map_or(1, usize::from)
+        .min(32)
 }
 
 /// `digest` as kbf's digest, if it is a SHA-256 digest with a size.
