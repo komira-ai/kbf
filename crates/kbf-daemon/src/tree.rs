@@ -196,7 +196,7 @@ async fn make_directories(
                     let digest = file.digest.clone().ok_or_else(|| {
                         TreeError::Invalid(format!("input file {:?} has no digest", file.name))
                     })?;
-                    let copy = (here.join(&file.name), file.is_executable);
+                    let copy = (here.join(&file.name), false);
                     match blob_at.entry(label(&digest)) {
                         Entry::Occupied(at) => files[*at.get()].copies.push(copy),
                         Entry::Vacant(at) => {
