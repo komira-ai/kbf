@@ -986,8 +986,8 @@ the daemon's clock seam driven by the test.
 ### 10.3 End to end
 
 `kbf-it` today starts one server and one daemon on fixed ports with the test-only
-local runtime (`kbf-it/m1/run.sh`: the server at 71-76, the daemon at 84-87). This
-test needs:
+local runtime (`kbf-cell m1`: `start_server` and `start_daemon` in
+`crates/kbf-it/src/m1.rs`). This test needs:
 
 - **two daemons**, on ports picked free per run;
 - **a test-only capability** whose probe reads a file the test controls, so a node is

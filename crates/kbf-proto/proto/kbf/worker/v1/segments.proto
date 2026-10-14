@@ -1,0 +1,112 @@
+// kbf.worker.v1.Segments: a daemon uploads an action's outputs as whole segments, and
+// reads blobs as byte ranges of the objects that hold them
+// (docs/design/write-path.md, section 4).
+//
+// Served on the worker listener only, each call admitted as the listener's blob calls
+// are (docs/design/worker-protocol.md, "Blobs on the worker listener"). A server
+// without it answers UNIMPLEMENTED and the daemon uploads blob by blob over ByteStream.
+//
+// An upload belongs to the connection that called Begin: a call naming it on another
+// connection is NOT_FOUND, and when that connection closes, or no call names the upload
+// for the server's idle time, an upload still receiving ranges is dropped. A segment's
+// layout (records, fan-out, index, trailer) is kbf-segments' (crates/kbf-segments/src/layout.rs).
+syntax = "proto3";
+
+package kbf.worker.v1;
+
+import "build/bazel/remote/execution/v2/remote_execution.proto";
+
+service Segments {
+  // Opens an upload of one or more segments and returns its id. Refused
+  // (INVALID_ARGUMENT) when a footer does not parse for its segment's length, records
+  // overlap, there is no segment, or the upload passes the server's byte cap or
+  // MAX_UPLOAD_RECORDS. Waits, never refuses, while the server's memory budget is spent.
+  rpc Begin(BeginRequest) returns (BeginResponse);
+  // Carries bytes of one segment's record area, at most 4 MiB a call. A range outside
+  // the records (INVALID_ARGUMENT), or overlapping a received range with other bounds
+  // (INVALID_ARGUMENT), is refused. A resend of a received range (same offset and
+  // length) is OK and writes nothing. Once Commit was called, FAILED_PRECONDITION.
+  rpc PutRange(PutRangeRequest) returns (PutRangeResponse);
+  // Checks every record against its digest, stores each segment with a footer the
+  // server builds, and commits every record of the upload at once. A record not
+  // wholly received is FAILED_PRECONDITION and the upload stays open; a record whose
+  // bytes do not hash to its digest is INVALID_ARGUMENT and nothing is indexed. A second
+  // Commit waits for the first and returns its answer.
+  rpc Commit(CommitRequest) returns (CommitResponse);
+  // Where each blob is: the object holding it and its offset. A blob that is not
+  // present and reachable has no location.
+  rpc Locate(LocateRequest) returns (LocateResponse);
+  // Bytes of a stored object, at most 4 MiB a call (longer is INVALID_ARGUMENT). An
+  // object or range the server cannot serve is NOT_FOUND. The bytes are not checked
+  // here; the caller checks each blob it cuts from them against its digest.
+  rpc ReadRange(ReadRangeRequest) returns (ReadRangeResponse);
+}
+
+// One segment of an upload.
+message UploadSegment {
+  // The segment's whole length: its records, then its footer.
+  uint64 length = 1;
+  // The segment's footer (fan-out, index, trailer). The server keeps each entry's
+  // digest, size and offset and ignores its CRC-32C.
+  bytes footer = 2;
+}
+
+message BeginRequest {
+  repeated UploadSegment segments = 1;
+}
+
+message BeginResponse {
+  uint64 upload = 1;
+}
+
+message PutRangeRequest {
+  uint64 upload = 1;
+  // Which of Begin's segments, by position.
+  uint32 segment = 2;
+  // Where the bytes start in that segment.
+  uint64 offset = 3;
+  bytes bytes = 4;
+}
+
+message PutRangeResponse {}
+
+message CommitRequest {
+  uint64 upload = 1;
+}
+
+message CommitResponse {
+  // Every record of the upload, each now present.
+  repeated build.bazel.remote.execution.v2.Digest committed = 1;
+}
+
+message LocateRequest {
+  repeated build.bazel.remote.execution.v2.Digest digests = 1;
+}
+
+// A stored object, by its writer epoch and sequence number.
+message ObjectRef {
+  uint64 epoch = 1;
+  uint64 seq = 2;
+}
+
+message BlobLocation {
+  build.bazel.remote.execution.v2.Digest digest = 1;
+  // Unset when the blob is not present and reachable.
+  ObjectRef object = 2;
+  uint64 offset = 3;
+}
+
+message LocateResponse {
+  // One per requested digest, in request order.
+  repeated BlobLocation locations = 1;
+}
+
+message ReadRangeRequest {
+  ObjectRef object = 1;
+  uint64 offset = 2;
+  uint64 length = 3;
+}
+
+message ReadRangeResponse {
+  bytes bytes = 1;
+}

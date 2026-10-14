@@ -1,6 +1,6 @@
 //! One real-Podman test's cgroup, scratch directory and runtime ([`Cell`]), shared by
 //! the test binaries that run the driver against rootless Podman
-//! (`tools/ci/podman-tests.sh` sets up what they need).
+//! (`cargo xtask podman-tests` sets up what they need).
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -17,7 +17,7 @@ use super::{Spec, blob, exists, store_action, work};
 
 pub fn var(name: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| {
-        panic!("{name} is not set: run these tests through tools/ci/podman-tests.sh")
+        panic!("{name} is not set: run these tests through cargo xtask podman-tests")
     })
 }
 
@@ -45,8 +45,9 @@ pub const ACTIONS_MEMORY_MAX: u64 = 4 << 30;
 pub const SUPERVISOR_MEMORY_MIN: u64 = 256 << 20;
 
 /// The unit's cgroup, set up by the code `kbf-daemon` runs, once per test process.
-/// Each test binary sets it up again: the second finds itself in `supervisor/`
-/// already, as a restarted daemon does.
+/// Each test binary runs in a unit of its own (`cargo xtask podman-tests`), so each
+/// sets up a fresh one; a second start from the `supervisor/` leaf is tested on a fake
+/// cgroup tree (`src/delegate_tests.rs`).
 pub fn delegation() -> &'static kbf_driver_container::Delegation {
     static DELEGATION: OnceLock<kbf_driver_container::Delegation> = OnceLock::new();
     DELEGATION.get_or_init(|| {
@@ -58,7 +59,7 @@ pub fn delegation() -> &'static kbf_driver_container::Delegation {
             Some(ACTIONS_MEMORY_MAX),
         )
         .unwrap_or_else(|e| {
-            panic!("set up the delegated cgroup (run through tools/ci/podman-tests.sh): {e}")
+            panic!("set up the delegated cgroup (run through cargo xtask podman-tests): {e}")
         })
     })
 }
