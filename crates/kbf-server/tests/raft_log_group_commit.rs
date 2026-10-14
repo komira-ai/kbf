@@ -110,8 +110,22 @@ impl Fs for GateFs {
         self.inner.read(name)
     }
 
+    fn file_len(&self, name: &str) -> io::Result<u64> {
+        self.inner.file_len(name)
+    }
+
+    fn read_at(&self, name: &str, offset: u64, len: usize) -> io::Result<Vec<u8>> {
+        self.inner.read_at(name, offset, len)
+    }
+
     fn create(&self, name: &str) -> io::Result<GateFile> {
         let inner = self.inner.create(name)?;
+        let gate = Arc::clone(&self.gate);
+        Ok(GateFile { inner, gate })
+    }
+
+    fn create_positioned(&self, name: &str) -> io::Result<GateFile> {
+        let inner = self.inner.create_positioned(name)?;
         let gate = Arc::clone(&self.gate);
         Ok(GateFile { inner, gate })
     }
@@ -140,11 +154,15 @@ impl FsFile for GateFile {
         self.inner.append(bytes)
     }
 
+    fn write_at(&self, offset: u64, bytes: &[u8]) -> io::Result<()> {
+        self.inner.write_at(offset, bytes)
+    }
+
     fn truncate(&mut self, len: u64) -> io::Result<()> {
         self.inner.truncate(len)
     }
 
-    fn sync(&mut self) -> io::Result<()> {
+    fn sync(&self) -> io::Result<()> {
         assert!(
             !self.gate.panic_next.swap(false, Ordering::SeqCst),
             "a planted panic in a raft directory sync"
