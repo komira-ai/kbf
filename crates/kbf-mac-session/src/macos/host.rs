@@ -86,7 +86,8 @@ impl Host for MacHost {
                 ("dsAttrTypeStandard:UserShell", SHELL.to_owned()),
                 ("dsAttrTypeStandard:RealName", user.name.clone()),
                 // Kept off the login window's list of users.
-                ("dsAttrTypeNative:IsHidden", "1".to_owned()),
+                // MUTANT: the lease user is listed at the login window.
+                ("dsAttrTypeNative:IsHidden", "0".to_owned()),
             ] {
                 set(&record, attribute, &value)?;
             }
