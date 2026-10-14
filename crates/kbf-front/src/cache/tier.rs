@@ -3,10 +3,9 @@
 //! from the local disk, and the start that ties a tier directory to the committed
 //! state. The flusher is in `flush.rs`; the disk layer is `kbf-tier`.
 //!
-//! **The write seam.** [`Cache::place_segment`] is where a packed segment goes: staged
-//! when a tier is attached and takes it, else PUT. `store_blobs` calls it for every
-//! segment it packs; the write grouping of rollout stage 1 calls it for every segment
-//! a group seals, once both are on one branch.
+//! **Writes.** The write group's settle (`write_group.rs`) offers every segment it
+//! seals to [`Writer::stage`] first: staged when a tier is attached and takes it, else
+//! PUT as before.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -18,13 +17,14 @@ use kbf_meta::{
     Applied, Command, Location, ObjectId, ServerId, StagedPut, TierId, UnreachableReason,
 };
 use kbf_objstore::ObjectStore;
-use kbf_segments::{Footer, IndexEntry, SegmentWriter};
+use kbf_segments::{Footer, IndexEntry};
 use kbf_store::Fs;
 use kbf_tier::{
     NextSeq, Recovery, StagedSnapshot, Tier, TierError, TierOptions, TierStart, WriteTier,
 };
 use kbf_types::Digest;
 
+use super::write_group::Writer;
 use super::{Cache, CacheError, unexpected};
 use crate::meta_log::MetaLog;
 use crate::metrics::TierCounters;
@@ -89,14 +89,6 @@ impl Staging {
     pub(super) fn done(&self, object: ObjectId) {
         self.retries().remove(&object);
     }
-}
-
-/// Where [`Cache::stage`] left a segment.
-enum Staged {
-    /// Synced and committed: the blobs are indexed and staged.
-    Committed,
-    /// The tier did not take it (full, or a disk error before the commit): PUT it.
-    Direct,
 }
 
 /// What a local read found.
@@ -167,7 +159,7 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
     ///
     /// [`TierStartError`]; the cache is dropped and the server must not start.
     pub async fn attach_tier<F>(
-        mut self,
+        self,
         fs: F,
         options: TierOptions,
         server: ServerId,
@@ -178,6 +170,7 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         F::File: Send + Sync + fmt::Debug + 'static,
     {
         let mut current = self
+            .writer
             .query(move |s| s.tier(server))
             .await
             .map_err(CacheError::from)?;
@@ -187,6 +180,7 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
                 return Err(TierStartError::AbandonOther { named, current });
             }
             abandoned = self
+                .writer
                 .query(move |s| {
                     let on_it = s.staged_objects().filter(|(_, o)| o.tier() == named);
                     on_it.map(|(object, _)| object).collect::<Vec<_>>()
@@ -200,19 +194,20 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
             tracing::warn!(%named, objects = abandoned.len(), "write tier abandoned");
             current = None;
         }
-        let tier = current.unwrap_or_else(|| TierId::new(self.epoch.get()));
+        let tier = current.unwrap_or_else(|| TierId::new(self.writer.epoch.get()));
         let snapshot = self
+            .writer
             .query(StagedSnapshot::of)
             .await
             .map_err(CacheError::from)?;
         let start = TierStart {
             tier,
-            epoch: self.epoch,
+            epoch: self.writer.epoch,
             options,
         };
         let (opened, recovery) = Tier::open(fs, start, &snapshot, self.seq_source())?;
         if current.is_none() {
-            let added = self.commit(Command::AddTier { server, tier }).await;
+            let added = self.writer.commit(Command::AddTier { server, tier }).await;
             match added.map_err(CacheError::from)? {
                 Applied::Tier(Ok(())) => {}
                 other => return Err(unexpected(&other).into()),
@@ -223,7 +218,8 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
             self.mark_unreachable(*object, UnreachableReason::Missing)
                 .await?;
         }
-        self.tier = Some(Staging::new(Arc::new(opened), tier));
+        // A cache takes one tier: attached before it stores anything, and only once.
+        let _ = self.writer.tier.set(Staging::new(Arc::new(opened), tier));
         let startup = TierStartup {
             tier,
             registered: current.is_none(),
@@ -235,12 +231,12 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
 
     /// The tier this cache stages on, if one is attached.
     pub fn tier_id(&self) -> Option<TierId> {
-        self.tier.as_ref().map(|s| s.id)
+        self.writer.tier.get().map(|s| s.id)
     }
 
     /// The attached tier's disk layer, if one is attached: its usage and exposure.
     pub fn write_tier(&self) -> Option<&dyn WriteTier> {
-        self.tier.as_ref().map(|s| &*s.tier)
+        self.writer.tier.get().map(|s| &*s.tier)
     }
 
     /// Every metric family: [`CacheMetrics::render`](crate::metrics::CacheMetrics::render),
@@ -248,8 +244,8 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
     /// the unflushed bytes and oldest unflushed block's age, measured now).
     #[must_use]
     pub fn render_metrics(&self) -> String {
-        let mut out = self.metrics.render();
-        if let Some(staging) = &self.tier {
+        let mut out = self.writer.metrics.render();
+        if let Some(staging) = self.writer.tier.get() {
             let usage = staging.tier.usage();
             let unflushed = staging.tier.unflushed(Instant::now());
             staging.counters.render(&mut out, usage, unflushed);
@@ -260,89 +256,8 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
     /// Numbers the tier's objects from this cache's sequence, so a staged object and a
     /// PUT one never share an id.
     fn seq_source(&self) -> NextSeq {
-        let seq = Arc::clone(&self.next_seq);
+        let seq = Arc::clone(&self.writer.next_seq);
         Box::new(move || seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
-    }
-
-    /// Writes one packed segment where it goes: staged on the tier (in the open
-    /// grouped block, or, for `own_block`, a block of its own sealed by its commit)
-    /// when a tier is attached and takes it, else PUT to the store. Returns the
-    /// blobs' locations for the caller's `PutBlobs`, or `None` when the tier's
-    /// `PutStaged` already indexed them.
-    ///
-    /// A tier that is full, or whose disk fails before the commit, sends the segment
-    /// to the store: backpressure, never loss. With the store down too, that fails and
-    /// the caller is answered UNAVAILABLE.
-    ///
-    /// # Errors
-    ///
-    /// The store or the metadata log failed; nothing was reported present.
-    pub(super) async fn place_segment(
-        &self,
-        writer: SegmentWriter,
-        packed: &[Digest],
-        own_block: bool,
-    ) -> Result<Option<Vec<(Digest, Location)>>, CacheError> {
-        let body = Bytes::from(writer.finish());
-        if let Some(staging) = &self.tier
-            && let Staged::Committed = self.stage(staging, body.clone(), own_block).await?
-        {
-            return Ok(None);
-        }
-        self.put_body(body, packed).await.map(Some)
-    }
-
-    /// Stages one finished segment: its records written to a reserved range, synced,
-    /// then `PutStaged` for every record. The footer is not written; the flusher builds
-    /// it.
-    async fn stage(
-        &self,
-        staging: &Staging,
-        body: Bytes,
-        own_block: bool,
-    ) -> Result<Staged, CacheError> {
-        let footer = Footer::parse(&body, body.len() as u64)?;
-        let records = body.slice(..usize::try_from(footer.records_len()).unwrap_or(body.len()));
-        let len = records.len() as u64;
-        let tier = Arc::clone(&staging.tier);
-        let synced = blocking(Box::new(move || {
-            let reservation = if own_block {
-                tier.reserve_upload(len)?
-            } else {
-                tier.reserve_group(len, Instant::now())?
-            };
-            tier.write(&reservation, 0, &records)?;
-            tier.sync(reservation).map_err(|unsynced| unsynced.error)
-        }))
-        .await;
-        let synced = match synced {
-            Ok(synced) => synced,
-            Err(e) => {
-                staging.counters.direct(&e);
-                tracing::debug!(error = %e, len, "the write tier did not take a segment; writing it to the store");
-                return Ok(Staged::Direct);
-            }
-        };
-        let at = |e: &IndexEntry| (e.digest, synced.offset() + e.offset);
-        let put = StagedPut {
-            object: synced.object(),
-            end: synced.end(),
-            seal: own_block,
-            blobs: footer.entries().iter().map(at).collect(),
-        };
-        let command = Command::PutStaged {
-            tier: staging.id,
-            objects: vec![put],
-        };
-        // A failed commit drops `synced` unanswered: the range is answered as failed.
-        match self.commit(command).await? {
-            Applied::Staged(Ok(_)) => {
-                staging.tier.committed(synced);
-                staging.counters.staged.add(1);
-                Ok(Staged::Committed)
-            }
-            other => Err(unexpected(&other)),
-        }
     }
 
     /// Reads `digest` at `location` as the index answered it: from this server's tier
@@ -357,7 +272,7 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         location: Location,
         staged_on: Option<TierId>,
     ) -> Result<Bytes, CacheError> {
-        if let Some(staging) = &self.tier
+        if let Some(staging) = self.writer.tier.get()
             && staged_on.is_none_or(|t| t == staging.id)
         {
             match self.read_local(staging, digest, location).await {
@@ -393,6 +308,67 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
                 tracing::warn!(%digest, error = %e, "write tier read failed; reading the store");
                 Local::Absent
             }
+        }
+    }
+}
+
+impl<M: MetaLog, O: ObjectStore> Writer<M, O> {
+    /// Stages one finished segment on the write tier, if one is attached and takes it:
+    /// its records written to a reserved range (the open grouped block, or, for
+    /// `own`, a block of its own sealed by its commit), synced, then one `PutStaged`
+    /// for every record. The footer is not written; the flusher builds it. Answers
+    /// whether it did: without a tier, at the budget, or after a disk error before the
+    /// commit, the caller PUTs the segment instead (backpressure, never loss).
+    ///
+    /// # Errors
+    ///
+    /// The `PutStaged` commit failed: nothing is indexed, and the range is answered as
+    /// failed.
+    pub(super) async fn stage(&self, body: Bytes, own: bool) -> Result<bool, CacheError> {
+        let Some(staging) = self.tier.get() else {
+            return Ok(false);
+        };
+        let footer = Footer::parse(&body, body.len() as u64)?;
+        let records = body.slice(..usize::try_from(footer.records_len()).unwrap_or(body.len()));
+        let len = records.len() as u64;
+        let tier = Arc::clone(&staging.tier);
+        let synced = blocking(Box::new(move || {
+            let reservation = if own {
+                tier.reserve_upload(len)?
+            } else {
+                tier.reserve_group(len, Instant::now())?
+            };
+            tier.write(&reservation, 0, &records)?;
+            tier.sync(reservation).map_err(|unsynced| unsynced.error)
+        }))
+        .await;
+        let synced = match synced {
+            Ok(synced) => synced,
+            Err(e) => {
+                staging.counters.direct(&e);
+                tracing::debug!(error = %e, len, "the write tier did not take a segment; writing it to the store");
+                return Ok(false);
+            }
+        };
+        let at = |e: &IndexEntry| (e.digest, synced.offset() + e.offset);
+        let put = StagedPut {
+            object: synced.object(),
+            end: synced.end(),
+            seal: own,
+            blobs: footer.entries().iter().map(at).collect(),
+        };
+        let command = Command::PutStaged {
+            tier: staging.id,
+            objects: vec![put],
+        };
+        // A failed commit drops `synced` unanswered: the range is answered as failed.
+        match self.commit(command).await? {
+            Applied::Staged(Ok(_)) => {
+                staging.tier.committed(synced);
+                staging.counters.staged.add(1);
+                Ok(true)
+            }
+            other => Err(unexpected(&other)),
         }
     }
 }

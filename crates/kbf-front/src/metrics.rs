@@ -337,10 +337,12 @@ pub struct CacheMetrics {
     pub find_missing_digests: Counter,
     /// Digests FindMissingBlobs answered missing.
     pub find_missing_missing: Counter,
-    /// `Cache::store_blobs`, whole: the query for held blobs, their touch, and every
-    /// segment's put, footer read-back and commit.
+    /// One store call (`Cache::store_each`, which ByteStream `Write`,
+    /// `BatchUpdateBlobs` and `Cache::store_blobs` go through), whole: the query for
+    /// held blobs, their touch, and the wait until every segment holding its blobs has
+    /// been put, read back and committed (segments shared with other calls included).
     pub store_blobs: Histogram,
-    /// One segment's object PUT.
+    /// One object PUT of a segment; a PUT tried again is observed once per attempt.
     pub segment_put: Histogram,
     /// One segment's footer read back from the store (two range GETs: the trailer,
     /// then the footer).
@@ -427,13 +429,14 @@ impl CacheMetrics {
         let histograms = [
             (
                 "kbf_store_blobs_seconds",
-                "One store of verified blobs: the held-blob query, its touch, and every \
-                 segment's put, footer read and commit",
+                "One store of verified blobs: the held-blob query, its touch, and the wait \
+                 for every segment holding its blobs (linger, PUT slot, PUT attempts and \
+                 their backoff, footer read, and commit with the commits queued ahead)",
                 &self.store_blobs,
             ),
             (
                 "kbf_segment_put_seconds",
-                "One segment's object PUT",
+                "One PUT attempt of a segment's object; a retried PUT is observed per attempt",
                 &self.segment_put,
             ),
             (

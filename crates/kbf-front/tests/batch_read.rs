@@ -101,7 +101,7 @@ impl ObjectStore for Store {
         self.script().in_flight -= 1;
         if fail {
             let reset = std::io::Error::new(std::io::ErrorKind::ConnectionReset, "test");
-            return Err(ObjectStoreError::Transport(Box::new(reset)));
+            return Err(ObjectStoreError::Transport(Arc::new(reset)));
         }
         let bytes = self.inner.get_range(key, range).await?;
         match flip.and_then(|at| at.checked_sub(range.offset())) {

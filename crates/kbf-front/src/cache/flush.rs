@@ -86,7 +86,7 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
     /// The metadata log could not answer a seal or the queue's query. A failed flush
     /// is not an error: it is in [`FlushRound::retrying`].
     pub async fn flush_tier(&self, now: Instant) -> Result<FlushRound, CacheError> {
-        let Some(staging) = &self.tier else {
+        let Some(staging) = self.writer.tier.get() else {
             return Ok(FlushRound::default());
         };
         let mut round = FlushRound::default();
@@ -98,6 +98,7 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         }
         let (tier, waiting) = (staging.id, staging.waiting(now));
         let due = self
+            .writer
             .query(move |s| {
                 let ours = |o: &StagedObject| (o.tier(), o.state()) == (tier, StagedState::Sealed);
                 let sealed = s.staged_objects().filter(|(_, o)| ours(o));
@@ -160,12 +161,17 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         let mut body = records;
         body.extend_from_slice(&footer);
         let key = self.object_key(object)?;
-        let existed = match self.objects.put_new(&key, Bytes::from(body), None).await {
+        let existed = match self
+            .writer
+            .objects
+            .put_new(&key, Bytes::from(body), None)
+            .await
+        {
             Ok(()) => false,
             Err(ObjectStoreError::AlreadyExists(_)) => true,
             Err(e) => return Err(e.into()),
         };
-        let stored = match self.read_footer(&key, total).await {
+        let stored = match self.writer.read_footer(&key, total).await {
             Ok(footer) => Some(footer),
             // The key holds an object this footer does not describe (another length,
             // or no footer where ours ends).
@@ -200,7 +206,7 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
     /// Commits a tier command whose refusal would mean the flusher and the committed
     /// state disagree: anything but its success is an internal error.
     async fn commit_tier(&self, command: Command) -> Result<(), CacheError> {
-        match self.commit(command).await? {
+        match self.writer.commit(command).await? {
             Applied::Tier(Ok(())) => Ok(()),
             other => Err(unexpected(&other)),
         }

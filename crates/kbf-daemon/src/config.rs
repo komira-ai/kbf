@@ -323,13 +323,11 @@ mod tests {
             .await
             .expect("bind");
         let addr = listener.local_addr().expect("addr");
-        tokio::spawn(async move {
-            while let Ok((mut peer, _)) = listener.accept().await {
-                tokio::spawn(async move {
-                    let mut taken = [0u8; 4096];
-                    while matches!(peer.read(&mut taken).await, Ok(n) if n > 0) {}
-                });
-            }
+        // The peer takes the one connection's bytes until it closes.
+        let peer = tokio::spawn(async move {
+            let (mut peer, _) = listener.accept().await.expect("accept");
+            let mut taken = [0u8; 4096];
+            while peer.read(&mut taken).await.unwrap_or(0) > 0 {}
         });
         let keep_alive = KeepAlive {
             interval: Duration::from_millis(100),
@@ -342,6 +340,11 @@ mod tests {
             .await
             .expect("the unanswered PING ends the call within 10 s");
         assert!(ended.is_err(), "{ended:?}");
+        drop(client);
+        tokio::time::timeout(Duration::from_secs(10), peer)
+            .await
+            .expect("the peer sees the connection close")
+            .expect("the peer task");
     }
 
     /// Catches a daemon configured without keepalive.

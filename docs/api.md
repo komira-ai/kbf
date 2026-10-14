@@ -236,10 +236,10 @@ caller goes away before the answer counts as an error.
 | `kbf_bytestream_write_present_total` | counter | Writes answered at once because the blob was already durable |
 | `kbf_batch_update_requests_total`, `_errors_total`, `_bytes_total`, `_in_flight`, `_seconds` | as above | BatchUpdateBlobs calls; `kbf_batch_update_blobs_total` counts the blobs they sent |
 | `kbf_find_missing_requests_total`, `_errors_total`, `_in_flight`, `_seconds` | as above | FindMissingBlobs calls; `kbf_find_missing_digests_total` the digests asked about, `kbf_find_missing_missing_total` those answered missing |
-| `kbf_store_blobs_seconds` | histogram | one store of verified blobs (a Write's, or a batch's): the query for blobs already held, their touch, and every segment's PUT, footer read and commit |
-| `kbf_segment_put_seconds` | histogram | one segment's object PUT |
+| `kbf_store_blobs_seconds` | histogram | one store of verified blobs (a Write's, or a batch's): the query for blobs already held, their touch, and the wait until every segment holding its blobs is written: the linger, the wait for a PUT slot, each PUT attempt with the backoff between attempts, the footer read, and the commit with any wait behind commits queued ahead of it |
+| `kbf_segment_put_seconds` | histogram | one PUT attempt of a segment's object; a PUT tried again is observed once per attempt |
 | `kbf_segment_footer_read_seconds` | histogram | one segment's footer read back after its PUT: two range GETs, the trailer and then the footer |
-| `kbf_segment_commit_seconds` | histogram | one segment's `PutBlobs` commit to the metadata log |
+| `kbf_segment_commit_seconds` | histogram | one segment's `PutBlobs` commit to the metadata log, including any wait behind commits queued ahead of it |
 | `kbf_segment_blobs`, `kbf_segment_bytes` | histogram | blobs, and bytes (footer included), per segment written |
 | `kbf_object_get_seconds` | histogram | one range GET of a blob being read (ByteStream Read, GetActionResult, a BatchReadBlobs run); footer reads are not in it |
 | `kbf_meta_commit_seconds{command}` | histogram | every metadata-log commit the cache makes, by command (`put_blobs`, `touch`, `put_action`, `object_unreachable`, `tick`, `collect`, ...): with `--meta-log=raft`, the Raft log's commit latency |
@@ -268,8 +268,11 @@ watches.
 | `kbf_write_tier_unflushed_bytes`, `kbf_write_tier_unflushed_blocks` | gauge | acknowledged bytes, and the blocks holding them, not yet in the object store |
 | `kbf_write_tier_oldest_unflushed_seconds` | gauge | the age of the oldest of those blocks (since it was created, or since the restart that recovered it); 0 when there is none |
 
-**Reading a slow upload.** Each ByteStream Write stores one blob, so a daemon's output
-tree of N files costs N Writes, each its own segment. Over a window, with `rate()`:
+**Reading a slow upload.** Each ByteStream Write sends one blob, so a daemon's output
+tree of N files costs N Writes, but not N segments: the cache groups blobs from
+concurrent Writes and batches into one segment, sealed when it is full or
+`--write-linger` after its first blob, and a blob of `--write-own-segment-bytes` or
+more gets a segment of its own. Over a window, with `rate()`:
 
 - Writes per second is `rate(kbf_bytestream_write_requests_total)`; with
   `kbf_bytestream_write_in_flight` near the daemon's upload limit, it is that limit
@@ -277,14 +280,18 @@ tree of N files costs N Writes, each its own segment. Over a window, with `rate(
   (`rate(kbf_bytestream_write_seconds_sum) / rate(kbf_bytestream_write_seconds_count)`).
 - The mean of each stage (`_sum` over `_count` of `kbf_segment_put_seconds`,
   `kbf_segment_footer_read_seconds`, `kbf_segment_commit_seconds`) says which one the
-  Write waits on: the object store's PUT, its GETs, or the metadata log. What
-  `kbf_store_blobs_seconds` holds beyond the three is the held-blob query and touch.
-  What a Write holds beyond its store is receiving and hashing the bytes and
-  authorizing the caller (neither timed on its own), and the check whether the blob
-  is already held: its query and any touch also show in `kbf_meta_query_seconds` and
+  Write waits on: the object store's PUT, its GETs, or the metadata log. A PUT tried
+  again counts once per attempt, so `kbf_segment_put_seconds` can count more than
+  the segments written (`kbf_segment_blobs`' count). What `kbf_store_blobs_seconds`
+  holds beyond the three is the held-blob query and touch, the linger, the wait for
+  one of `--write-puts-in-flight` PUT slots, and the backoff between PUT attempts.
+  What a Write holds beyond its store is the wait for admission under
+  `--write-bytes-in-flight`, receiving and hashing the bytes and authorizing the
+  caller (none timed on its own), and the check whether the blob is already held: its query and any touch also show in `kbf_meta_query_seconds` and
   `kbf_meta_commit_seconds{command="touch"}`.
-- `kbf_segment_blobs` with a mean of 1 says every segment holds one blob: each upload
-  pays a PUT, two GETs and a commit of its own.
+- `kbf_segment_blobs` with a mean of 1 says no grouping happened: uploads arrived
+  more than a linger apart, or were large enough for segments of their own, so each
+  paid a PUT, two GETs and a commit of its own.
 - `kbf_bytestream_write_present_total` against the requests says how many uploads
   were of blobs already held.
 

@@ -6,6 +6,10 @@
 //! A fault can refuse the call, lose the answer of a call that succeeded, hold the call
 //! until the test lets it go, or answer OK while storing bytes other than those sent.
 //!
+//! Besides the queue, a store can fail every PUT of a segment that holds a given blob
+//! ([`FaultyStore::fail_puts_holding`]), and hold every PUT at a gate
+//! ([`FaultyStore::hold_puts`]) while it counts how many are in flight.
+//!
 //! [`AuditLog`] wraps a [`MemoryMetaLog`]. When a `PutBlob` commits (or a `PutBlobs`,
 //! for each of its entries), it reads the object the location names straight from the
 //! inner store (past any fault) and records a violation unless the bytes there hash to
@@ -13,7 +17,7 @@
 //! durable, or at a location that does not hold the blob, leaves a violation behind
 //! even if a later write fills the gap.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::io;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::SystemTime;
@@ -25,8 +29,9 @@ use kbf_objstore::{
     ByteRange, Capabilities, KeyPrefix, ListPage, ListToken, MemoryStore, ObjectKey, ObjectStore,
     ObjectStoreError, PageSize,
 };
+use kbf_segments::SegmentReader;
 use kbf_types::Digest;
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, watch};
 
 /// What the next `put_new` does instead of a plain write.
 #[derive(Debug)]
@@ -40,6 +45,10 @@ pub enum PutFault {
     Truncate(usize),
     /// Answers OK and stores nothing.
     Drop,
+    /// Answers an S3 error with this HTTP status; nothing is stored.
+    Status(u16),
+    /// Panics, as a bug in the store client would.
+    Panic,
     /// Answers OK but stores these bytes instead of the body.
     Replace(Bytes),
     /// Signals `entered` when the call arrives, waits for `release`, then stores the
@@ -70,11 +79,16 @@ struct Script {
     puts: VecDeque<PutFault>,
     gets: VecDeque<GetFault>,
     put_keys: Vec<ObjectKey>,
+    poisoned: BTreeSet<Digest>,
+    puts_in_flight: usize,
+    puts_in_flight_peak: usize,
 }
 
 struct Shared {
     inner: MemoryStore,
     script: Mutex<Script>,
+    /// Whether PUTs may go on (`true`) or wait at the gate.
+    gate: watch::Sender<bool>,
 }
 
 /// A [`MemoryStore`] that fails on cue. Clones share one bucket and one script.
@@ -95,7 +109,34 @@ impl FaultyStore {
         Self(Arc::new(Shared {
             inner: MemoryStore::new(capabilities),
             script: Mutex::new(Script::default()),
+            gate: watch::Sender::new(true),
         }))
+    }
+
+    /// Fails, with a transport error, every PUT of a segment whose footer names `digest`.
+    pub fn fail_puts_holding(&self, digest: Digest) {
+        self.script().poisoned.insert(digest);
+    }
+
+    /// Holds every PUT that arrives from now on (counted as in flight) until
+    /// [`FaultyStore::release_puts`].
+    pub fn hold_puts(&self) {
+        self.0.gate.send_replace(false);
+    }
+
+    /// Lets every held PUT go on, and every later one through.
+    pub fn release_puts(&self) {
+        self.0.gate.send_replace(true);
+    }
+
+    /// The PUTs in flight now: arrived and not yet answered.
+    pub fn puts_in_flight(&self) -> usize {
+        self.script().puts_in_flight
+    }
+
+    /// The most PUTs that were in flight at once.
+    pub fn puts_in_flight_peak(&self) -> usize {
+        self.script().puts_in_flight_peak
     }
 
     /// Queues `fault` for a coming `put_new`, after any already queued.
@@ -132,7 +173,7 @@ impl FaultyStore {
 }
 
 fn transport() -> ObjectStoreError {
-    ObjectStoreError::Transport(Box::new(io::Error::new(
+    ObjectStoreError::Transport(Arc::new(io::Error::new(
         io::ErrorKind::ConnectionReset,
         "injected by FaultyStore",
     )))
@@ -149,31 +190,16 @@ impl ObjectStore for FaultyStore {
         body: Bytes,
         retain_until: Option<SystemTime>,
     ) -> Result<(), ObjectStoreError> {
-        let fault = {
+        let poisoned = {
             let mut s = self.script();
-            s.put_keys.push(key.clone());
-            s.puts.pop_front()
+            s.puts_in_flight += 1;
+            s.puts_in_flight_peak = s.puts_in_flight_peak.max(s.puts_in_flight);
+            holds_any(&body, &s.poisoned)
         };
-        let inner = &self.0.inner;
-        match fault {
-            None => inner.put_new(key, body, retain_until).await,
-            Some(PutFault::Fail) => Err(transport()),
-            Some(PutFault::LoseAnswer) => {
-                inner.put_new(key, body, retain_until).await?;
-                Err(transport())
-            }
-            Some(PutFault::Truncate(n)) => {
-                let keep = body.len().saturating_sub(n);
-                inner.put_new(key, body.slice(..keep), retain_until).await
-            }
-            Some(PutFault::Drop) => Ok(()),
-            Some(PutFault::Replace(other)) => inner.put_new(key, other, retain_until).await,
-            Some(PutFault::Hold { entered, release }) => {
-                let _ = entered.send(());
-                let _ = release.await;
-                inner.put_new(key, body, retain_until).await
-            }
-        }
+        let _ = self.0.gate.subscribe().wait_for(|open| *open).await;
+        let answer = self.put_now(key, body, retain_until, poisoned).await;
+        self.script().puts_in_flight -= 1;
+        answer
     }
 
     async fn get_range(
@@ -212,6 +238,63 @@ impl ObjectStore for FaultyStore {
     }
 }
 
+/// Whether `body` parses as a segment whose footer names any of `digests`.
+fn holds_any(body: &[u8], digests: &BTreeSet<Digest>) -> bool {
+    SegmentReader::open(body).is_ok_and(|r| {
+        r.footer()
+            .entries()
+            .iter()
+            .any(|e| digests.contains(&e.digest))
+    })
+}
+
+impl FaultyStore {
+    /// One PUT past the gate: the poisoned failure, the next queued fault, or a plain
+    /// write.
+    async fn put_now(
+        &self,
+        key: &ObjectKey,
+        body: Bytes,
+        retain_until: Option<SystemTime>,
+        poisoned: bool,
+    ) -> Result<(), ObjectStoreError> {
+        let fault = {
+            let mut s = self.script();
+            s.put_keys.push(key.clone());
+            if poisoned {
+                return Err(transport());
+            }
+            s.puts.pop_front()
+        };
+        let inner = &self.0.inner;
+        match fault {
+            None => inner.put_new(key, body, retain_until).await,
+            Some(PutFault::Fail) => Err(transport()),
+            Some(PutFault::LoseAnswer) => {
+                inner.put_new(key, body, retain_until).await?;
+                Err(transport())
+            }
+            Some(PutFault::Truncate(n)) => {
+                let keep = body.len().saturating_sub(n);
+                inner.put_new(key, body.slice(..keep), retain_until).await
+            }
+            Some(PutFault::Drop) => Ok(()),
+            Some(PutFault::Status(status)) => Err(ObjectStoreError::Service {
+                status,
+                code: "Injected".to_owned(),
+                message: "injected by FaultyStore".to_owned(),
+            }),
+            Some(PutFault::Panic) => panic!("injected by FaultyStore"),
+            Some(PutFault::Replace(other)) => inner.put_new(key, other, retain_until).await,
+            Some(PutFault::Hold { entered, release }) => {
+                let _ = entered.send(());
+                let _ = release.await;
+                inner.put_new(key, body, retain_until).await
+            }
+        }
+    }
+}
+
 /// A [`MemoryMetaLog`] that, as each `PutBlob` (or each entry of a `PutBlobs`) commits,
 /// checks the store already holds the blob's bytes at the committed location.
 #[derive(Debug)]
@@ -219,7 +302,23 @@ pub struct AuditLog {
     inner: MemoryMetaLog,
     store: FaultyStore,
     put_blobs: Mutex<Vec<Digest>>,
+    batches: Mutex<Vec<usize>>,
     violations: Mutex<Vec<String>>,
+    next_put_blobs: Mutex<Option<CommitFault>>,
+}
+
+/// What the next `PutBlobs` does instead of committing at once.
+#[derive(Debug)]
+pub enum CommitFault {
+    /// Answers UNAVAILABLE; nothing is committed.
+    Refuse,
+    /// Signals `entered` when the command arrives, waits for `release`, then commits.
+    Hold {
+        /// Fired once the command has arrived (before it is applied).
+        entered: oneshot::Sender<()>,
+        /// The commit goes on once this fires or its sender is dropped.
+        release: oneshot::Receiver<()>,
+    },
 }
 
 impl AuditLog {
@@ -228,8 +327,26 @@ impl AuditLog {
             inner: MemoryMetaLog::new(Retention::default()),
             store,
             put_blobs: Mutex::new(Vec::new()),
+            batches: Mutex::new(Vec::new()),
             violations: Mutex::new(Vec::new()),
+            next_put_blobs: Mutex::new(None),
         }
+    }
+
+    /// Sets what the next `PutBlobs` does.
+    pub fn on_put_blobs(&self, fault: CommitFault) {
+        *self
+            .next_put_blobs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(fault);
+    }
+
+    /// How many blobs each `PutBlobs` that reached the log named, in order.
+    pub fn batches(&self) -> Vec<usize> {
+        self.batches
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     /// Every digest a `PutBlob` committed, in order.
@@ -288,6 +405,27 @@ fn object_key(id: ObjectId) -> ObjectKey {
 
 impl MetaLog for AuditLog {
     async fn commit(&self, command: Command) -> Result<Applied, MetaLogError> {
+        if let Command::PutBlobs(blobs) = &command {
+            self.batches
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(blobs.len());
+            let fault = self
+                .next_put_blobs
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take();
+            match fault {
+                None => {}
+                Some(CommitFault::Refuse) => {
+                    return Err(MetaLogError::Unavailable("injected by AuditLog".to_owned()));
+                }
+                Some(CommitFault::Hold { entered, release }) => {
+                    let _ = entered.send(());
+                    let _ = release.await;
+                }
+            }
+        }
         let placed = match &command {
             Command::PutBlob { digest, location } => vec![(*digest, *location)],
             Command::PutBlobs(blobs) => blobs.clone(),

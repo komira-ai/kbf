@@ -100,7 +100,9 @@ async fn run<M: MetaLog, O: ObjectStore + 'static>(
         invocations: policy.invocations_get.is_some(),
         blobs: policy.invocations_get.is_some() && policy.blobs_get.is_some(),
     };
-    let cache = Cache::open(meta, store, prefix).await?;
+    let cache = Cache::open(meta, store, prefix)
+        .await?
+        .with_writes(args.write_config());
     let (cache, tier) = kbf_server::write_tier::attach(cache, args).await?;
     let cache = Arc::new(cache);
     let _flusher = tier.map(|_| {

@@ -400,7 +400,10 @@ async fn at_the_budget_writes_go_to_the_store_and_no_staged_block_is_evicted() {
         "{metrics}"
     );
 
-    farm.store.on_put(PutFault::Fail);
+    // The direct path tries a PUT `put_attempts` times; the store refuses them all.
+    for _ in 0..kbf_front::WriteConfig::DEFAULT.put_attempts.get() {
+        farm.store.on_put(PutFault::Fail);
+    }
     let refused = cache.store_blobs(vec![b[3].verified()]).await;
     let status = tonic::Status::from(refused.expect_err("tier full, store down"));
     assert_eq!(status.code(), tonic::Code::Unavailable);
@@ -1021,4 +1024,49 @@ async fn a_blob_in_another_store_is_an_internal_error() {
     assert!(matches!(put, Applied::Blob(Ok(_))), "{put:?}");
     let read = cache.read_blob(&b.digest).await;
     assert!(matches!(read, Err(CacheError::Internal(_))), "{read:?}");
+}
+
+/// Catches: the open segment a blob too large for it leaves behind (the group opens
+/// one before it finds the blob does not fit) settled empty at its linger: an empty
+/// block staged and flushed, or an empty object PUT, for nothing.
+#[tokio::test]
+async fn a_blob_too_large_for_a_segment_leaves_no_empty_one_behind() {
+    let farm = Farm::new(Capabilities::default());
+    let cache = farm.start(GIB).await;
+    let big = TestBlob::new(1, usize::try_from(SEGMENT).expect("size") + 1);
+    cache
+        .store_blobs(vec![big.verified()])
+        .await
+        .expect("stored");
+    tokio::time::sleep(kbf_front::WriteConfig::DEFAULT.linger * 10).await;
+    let blocks = farm.fs.list().expect("list");
+    let blocks: Vec<_> = blocks.iter().filter(|n| n.ends_with(".blk")).collect();
+    assert_eq!(blocks, [&block_name(farm.log.object_of(&big.digest))]);
+    let round = cache.flush_tier(later()).await.expect("round");
+    assert_eq!(round.flushed.len(), 1, "{round:?}");
+    assert_eq!(farm.store.put_keys().len(), 1);
+}
+
+/// Catches: grouped writes (write-path.md section 3) that bypass the tier, or stage
+/// each caller's blob on its own: concurrent uploads share one segment, and that
+/// segment is one range of the open block, staged with one `PutStaged`.
+#[tokio::test]
+async fn concurrent_uploads_share_one_staged_segment() {
+    let farm = Farm::new(Capabilities::default());
+    let cache = Arc::new(farm.start(GIB).await);
+    let b = blobs(1, 8, 4096);
+    let stores = b.iter().map(|blob| {
+        let (cache, blob) = (Arc::clone(&cache), blob.verified());
+        tokio::spawn(async move { cache.store_blobs(vec![blob]).await })
+    });
+    for store in stores.collect::<Vec<_>>() {
+        store.await.expect("join").expect("stored");
+    }
+    let object = farm.log.object_of(&b[0].digest);
+    for blob in &b {
+        assert_eq!(farm.log.located(&blob.digest).1, cache.tier_id());
+        assert_eq!(farm.log.object_of(&blob.digest), object, "one block");
+    }
+    assert!(farm.log.applied("put_staged") < b.len(), "grouped");
+    assert!(farm.store.put_keys().is_empty());
 }
