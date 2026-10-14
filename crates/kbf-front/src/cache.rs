@@ -5,6 +5,7 @@
 use std::collections::BTreeSet;
 use std::mem;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 use bytes::Bytes;
 use kbf_meta::{
@@ -23,6 +24,7 @@ use prost::Message;
 use tonic::Status;
 
 use crate::meta_log::{MemoryMetaLog, MetaLog, MetaLogError};
+use crate::metrics::{CacheMetrics, command_label};
 use crate::{MAX_BLOB_BYTES, wire};
 
 /// How many times a read asks again when a collection removes what it was about to
@@ -162,6 +164,9 @@ fn is_empty_blob(d: &Digest) -> bool {
 /// present only once its bytes are durable. Every read is verified against its digest;
 /// an object the store cannot produce, or whose bytes are wrong, is marked unreachable
 /// (with the reason), never served and never reported absent.
+///
+/// Each stage of a store, each read's object GET, and each metadata commit and query
+/// is timed into the cache's [`CacheMetrics`] ([`Cache::metrics`]).
 #[derive(Debug)]
 pub struct Cache<M, O> {
     meta: M,
@@ -170,6 +175,7 @@ pub struct Cache<M, O> {
     epoch: Epoch,
     next_seq: AtomicU64,
     segment_limit: u64,
+    metrics: CacheMetrics,
 }
 
 impl Cache<MemoryMetaLog, MemoryStore> {
@@ -198,7 +204,7 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
     /// Writes under an epoch `meta` never allocated are refused by the index
     /// ([`CacheError::Internal`]); two caches given one epoch would name the same keys.
     #[must_use]
-    pub const fn new(meta: M, objects: O, prefix: KeyPrefix, epoch: Epoch) -> Self {
+    pub fn new(meta: M, objects: O, prefix: KeyPrefix, epoch: Epoch) -> Self {
         Self {
             meta,
             objects,
@@ -206,6 +212,7 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
             epoch,
             next_seq: AtomicU64::new(1),
             segment_limit: MAX_SEGMENT_BYTES,
+            metrics: CacheMetrics::default(),
         }
     }
 
@@ -245,6 +252,11 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         &self.objects
     }
 
+    /// What this cache, and the services over it, have measured.
+    pub const fn metrics(&self) -> &CacheMetrics {
+        &self.metrics
+    }
+
     /// The prefix every key this cache writes starts with.
     pub const fn prefix(&self) -> &KeyPrefix {
         &self.prefix
@@ -266,7 +278,7 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
     /// # Errors
     /// The metadata log is unavailable.
     pub async fn tick(&self, now: FarmTime) -> Result<(), CacheError> {
-        self.meta.commit(Command::Tick(now)).await?;
+        self.commit(Command::Tick(now)).await?;
         Ok(())
     }
 
@@ -276,7 +288,7 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
     /// # Errors
     /// The metadata log is unavailable.
     pub async fn collect(&self) -> Result<Collected, CacheError> {
-        match self.meta.commit(Command::Collect).await? {
+        match self.commit(Command::Collect).await? {
             Applied::Collected(c) => Ok(c),
             other => Err(unexpected(&other)),
         }
@@ -305,9 +317,8 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
     /// The metadata log is unavailable.
     pub async fn present(&self, digests: &[Digest]) -> Result<Vec<bool>, CacheError> {
         let found = self
-            .meta
             .query(|s| {
-                let held = |d: &Digest| matches!(s.blob(d), BlobAnswer::Present(_));
+                let held = |d: &Digest| matches!(s.blob(d), BlobAnswer::Present { .. });
                 digests
                     .iter()
                     .map(|d| is_empty_blob(d) || held(d))
@@ -327,7 +338,7 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
             return Ok(true);
         }
         self.touched(|s| match s.blob(digest) {
-            BlobAnswer::Present(_) => (true, s.touch_for([digest])),
+            BlobAnswer::Present { .. } => (true, s.touch_for([digest])),
             BlobAnswer::Unavailable | BlobAnswer::Absent => (false, Touch::default()),
         })
         .await
@@ -346,20 +357,27 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         if blobs.is_empty() {
             return Ok(());
         }
+        let started = Instant::now();
+        let stored = self.store_fresh(blobs).await;
+        self.metrics.store_blobs.since(started);
+        stored
+    }
+
+    /// [`Cache::store_blobs`] of a non-empty list of blobs no larger than the limit.
+    async fn store_fresh(&self, blobs: Vec<VerifiedBlob>) -> Result<(), CacheError> {
         let (mut held, touch) = self
-            .meta
             .query(|s| {
                 let held: BTreeSet<Digest> = blobs
                     .iter()
                     .map(|b| b.digest)
-                    .filter(|d| matches!(s.blob(d), BlobAnswer::Present(_)))
+                    .filter(|d| matches!(s.blob(d), BlobAnswer::Present { .. }))
                     .collect();
                 let touch = s.touch_for(&held);
                 (held, touch)
             })
             .await?;
         if !touch.is_empty()
-            && let Applied::Touched { lost } = self.meta.commit(Command::Touch(touch)).await?
+            && let Applied::Touched { lost } = self.commit(Command::Touch(touch)).await?
         {
             // Collected between the query and the touch: store it again.
             for d in &lost.blobs {
@@ -371,7 +389,10 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
             .filter(|b| !held.contains(&b.digest))
             .collect();
         for placed in self.write_objects(fresh).await? {
-            match self.meta.commit(Command::PutBlobs(placed)).await? {
+            let started = Instant::now();
+            let committed = self.commit(Command::PutBlobs(placed)).await;
+            self.metrics.segment_commit.since(started);
+            match committed? {
                 Applied::Blobs(Ok(_)) => {}
                 Applied::Blobs(Err(e)) => return Err(CacheError::Internal(e.to_string())),
                 other => return Err(unexpected(&other)),
@@ -395,7 +416,7 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         match answer {
             BlobAnswer::Absent => Err(CacheError::NotFound(*digest)),
             BlobAnswer::Unavailable => Err(CacheError::Unreachable(*digest)),
-            BlobAnswer::Present(location) => self.fetch(digest, location).await,
+            BlobAnswer::Present { location, .. } => self.fetch(digest, location).await,
         }
     }
 
@@ -476,10 +497,9 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
     ) -> Result<ActionRecord, CacheError> {
         let closure = self.closure_of(result).await?;
         let lack = self
-            .meta
             .query(|s| {
                 closure.iter().find_map(|d| match s.blob(d) {
-                    BlobAnswer::Present(_) => None,
+                    BlobAnswer::Present { .. } => None,
                     BlobAnswer::Absent => Some(ActionWriteError::Absent(*d)),
                     BlobAnswer::Unavailable => Some(ActionWriteError::Unreachable(*d)),
                 })
@@ -510,7 +530,6 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         record: ActionRecord,
     ) -> Result<(), CacheError> {
         match self
-            .meta
             .commit(Command::PutAction {
                 role,
                 action,
@@ -568,17 +587,50 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         R: Send,
     {
         for _ in 0..TOUCH_ATTEMPTS {
-            let (answer, touch) = self.meta.query(&read).await?;
+            let (answer, touch) = self.query(&read).await?;
             if touch.is_empty() {
                 return Ok(answer);
             }
-            match self.meta.commit(Command::Touch(touch)).await? {
+            match self.commit(Command::Touch(touch)).await? {
                 Applied::Touched { lost } if lost.is_empty() => return Ok(answer),
                 Applied::Touched { .. } => {}
                 other => return Err(unexpected(&other)),
             }
         }
         Err(CacheError::Contended)
+    }
+
+    /// Commits `command` to the metadata log, timed by command.
+    async fn commit(&self, command: Command) -> Result<Applied, MetaLogError> {
+        let histogram = &self.metrics.commit[command_label(&command)];
+        let started = Instant::now();
+        let applied = self.meta.commit(command).await;
+        histogram.since(started);
+        applied
+    }
+
+    /// Runs `f` against the metadata log's state, timed.
+    async fn query<R, F>(&self, f: F) -> Result<R, MetaLogError>
+    where
+        F: FnOnce(&MetaState) -> R + Send,
+        R: Send,
+    {
+        let started = Instant::now();
+        let answer = self.meta.query(f).await;
+        self.metrics.query.since(started);
+        answer
+    }
+
+    /// One range GET of a blob being read, timed.
+    async fn get_range(
+        &self,
+        key: &ObjectKey,
+        range: ByteRange,
+    ) -> Result<Bytes, ObjectStoreError> {
+        let started = Instant::now();
+        let bytes = self.objects.get_range(key, range).await;
+        self.metrics.object_get.since(started);
+        bytes
     }
 
     /// Packs `blobs` into segments (a blob too large to share one gets a segment of its
@@ -620,8 +672,16 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         let key = self.object_key(segment)?;
         let body = Bytes::from(writer.finish());
         let len = body.len() as u64;
-        self.objects.put_new(&key, body, None).await?;
-        let footer = self.read_footer(&key, len).await?;
+        self.metrics.segment_blobs.observe(packed.len() as u64);
+        self.metrics.segment_bytes.observe(len);
+        let started = Instant::now();
+        let put = self.objects.put_new(&key, body, None).await;
+        self.metrics.segment_put.since(started);
+        put?;
+        let started = Instant::now();
+        let footer = self.read_footer(&key, len).await;
+        self.metrics.segment_footer.since(started);
+        let footer = footer?;
         packed
             .iter()
             .map(|d| {
@@ -685,7 +745,7 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         let range = ByteRange::new(offset, digest.size_bytes).ok_or_else(|| {
             CacheError::Internal(format!("blob {digest} has no readable range at {offset}"))
         })?;
-        let bytes = match self.objects.get_range(&key, range).await {
+        let bytes = match self.get_range(&key, range).await {
             Ok(bytes) => bytes,
             Err(e @ (ObjectStoreError::NotFound(_) | ObjectStoreError::InvalidRange { .. })) => {
                 tracing::error!(%digest, %key, error = %e, "held blob missing from the store");
@@ -711,7 +771,6 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         reason: UnreachableReason,
     ) -> Result<(), CacheError> {
         match self
-            .meta
             .commit(Command::ObjectUnreachable { object, reason })
             .await?
         {

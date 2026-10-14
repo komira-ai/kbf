@@ -105,6 +105,16 @@ impl Pki {
     /// Starts a server under mutual TLS with these flags added; returns its REAPI and
     /// worker addresses.
     fn serve(&self, extra: &[&str]) -> (SocketAddr, SocketAddr) {
+        serve(&self.args(extra))
+    }
+
+    /// [`Pki::serve`] with no other flag, over `cache`, which the test keeps to read.
+    fn serve_cache(&self, cache: Arc<MemoryCache>) -> (SocketAddr, SocketAddr) {
+        serve_cache(&self.args(&[]), cache)
+    }
+
+    /// The flags of a server under mutual TLS, with `extra` added.
+    fn args(&self, extra: &[&str]) -> Args {
         let base = [
             "kbf-server",
             "--listen",
@@ -119,8 +129,7 @@ impl Pki {
             &self.path("ca.pem"),
         ]
         .map(str::to_owned);
-        let args = Args::parse_from(base.iter().map(String::as_str).chain(extra.iter().copied()));
-        serve(&args)
+        Args::parse_from(base.iter().map(String::as_str).chain(extra.iter().copied()))
     }
 
     /// A channel to the worker listener, presenting `identity` if given.
@@ -140,12 +149,19 @@ impl Pki {
 }
 
 fn serve(args: &Args) -> (SocketAddr, SocketAddr) {
+    serve_cache(args, Arc::new(Cache::memory()))
+}
+
+/// The server of `args` over `cache`.
+fn serve_cache(args: &Args, cache: Arc<MemoryCache>) -> (SocketAddr, SocketAddr) {
     let listeners = args.listeners().expect("listeners");
-    let bound = bind_server(Arc::new(Cache::memory()), listeners, pending()).expect("bind");
+    let bound = bind_server(cache, listeners, pending()).expect("bind");
     let addrs = (bound.reapi, bound.worker);
     tokio::spawn(async move { bound.serving.await.expect("serve") });
     addrs
 }
+
+type MemoryCache = Cache<kbf_front::MemoryMetaLog, kbf_objstore::MemoryStore>;
 
 fn plain(addr: SocketAddr) -> Channel {
     Endpoint::from_shared(format!("http://{addr}"))
@@ -382,6 +398,27 @@ async fn a_node_certificate_reads_and_writes_blobs_on_the_worker_listener() {
         read(&channel, &digest_of(input)).await.expect("read"),
         input
     );
+}
+
+/// Catches the daemons' uploads and reads on the worker listener left out of the
+/// cache's metrics (`GET /metrics`): the worker listener's services must count into
+/// the same cache's families as the REAPI listener's, or the uploads that matter on a
+/// farm node would not show.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_daemons_write_and_read_on_the_worker_listener_are_counted() {
+    let pki = Pki::new("metrics");
+    let cache = Arc::new(Cache::memory());
+    let (_, worker) = pki.serve_cache(Arc::clone(&cache));
+    let node = pki.node(&["node-1"], 13);
+    let channel = pki.channel(worker, Some(&node.identity)).await;
+    let output = b"an output the daemon uploads, counted";
+    write(&channel, output).await.expect("write");
+    read(&channel, &digest_of(output)).await.expect("read");
+    let metrics = cache.metrics();
+    assert_eq!(metrics.write.total.get(), 1);
+    assert_eq!(metrics.write.bytes.get(), output.len() as u64);
+    assert_eq!(metrics.segment_put.count(), 1);
+    assert_eq!(metrics.object_get.count(), 1);
 }
 
 /// Catches: blob calls served to a caller with no client certificate (the listener's

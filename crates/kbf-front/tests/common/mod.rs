@@ -255,7 +255,7 @@ impl Farm {
             .query(move |s| s.blob(&d))
             .await
             .expect("query");
-        let BlobAnswer::Present(location) = answer else {
+        let BlobAnswer::Present { location, .. } = answer else {
             panic!("{d} is not present: {answer:?}");
         };
         let key = self.cache.object_key(location.object).expect("key");
@@ -273,7 +273,7 @@ impl Farm {
             .query(move |s| s.blob(&d))
             .await
             .expect("query");
-        let BlobAnswer::Present(location) = answer else {
+        let BlobAnswer::Present { location, .. } = answer else {
             panic!("{d} is not present: {answer:?}");
         };
         let offset = location.offset;
