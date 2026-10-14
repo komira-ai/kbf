@@ -69,8 +69,8 @@ pub use crate::action_cache::ActionCacheService;
 pub use crate::bytestream::ByteStreamService;
 pub use crate::cache::{
     Admitted, BATCH_READS_IN_FLIGHT, CONNECTION_WINDOW_BYTES, Cache, CacheError,
-    MAX_CONCURRENT_STREAMS, PUT_BACKOFF, PUT_BACKOFF_FACTOR, STREAM_WINDOW_BYTES, VerifiedBlob,
-    WriteConfig,
+    MAX_ADMISSION_BYTES, MAX_CONCURRENT_STREAMS, PUT_BACKOFF, PUT_BACKOFF_FACTOR,
+    STREAM_WINDOW_BYTES, VerifiedBlob, WriteConfig,
 };
 pub use crate::capabilities::{CapabilitiesService, server_capabilities};
 pub use crate::cas::CasService;

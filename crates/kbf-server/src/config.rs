@@ -193,12 +193,15 @@ pub struct Args {
     /// with every other upload: a `Begin` waits while that is spent. At least one 1 GiB
     /// blob and its footer (1 GiB + 1 MiB), so any blob the cache accepts can be
     /// uploaded, and at most `--write-bytes-in-flight`, so any legal `Begin` can be
-    /// admitted; the server refuses to start otherwise.
+    /// admitted; the server refuses to start otherwise. At most 4 GiB - 1
+    /// (`kbf_front::MAX_ADMISSION_BYTES`), the most one admission counts, so a `Begin`
+    /// never holds more than it is counted for under the bound.
     #[arg(
         long,
         value_name = "BYTES",
         default_value_t = kbf_front::MIN_SEGMENT_UPLOAD_BYTES,
-        value_parser = clap::value_parser!(u64).range(kbf_front::MIN_SEGMENT_UPLOAD_BYTES..)
+        value_parser = clap::value_parser!(u64)
+            .range(kbf_front::MIN_SEGMENT_UPLOAD_BYTES..=kbf_front::MAX_ADMISSION_BYTES)
     )]
     pub segment_upload_max_bytes: u64,
     /// How long, in seconds, a segment upload may go without a call before it is
@@ -594,6 +597,30 @@ mod tests {
         let message = refused.to_string();
         assert!(message.contains("--segment-upload-max-bytes"), "{message}");
         assert!(message.contains("--write-bytes-in-flight"), "{message}");
+    }
+
+    /// Catches a server that starts with a `--segment-upload-max-bytes` larger than one
+    /// admission counts (mutant: the flag's upper limit removed). `Cache::admit` takes at
+    /// most `kbf_front::MAX_ADMISSION_BYTES` (4 GiB - 1) for one call, so an 8 GiB
+    /// `Begin` under a 16 GiB bound would hold 8 GiB of ranges while counting 4 GiB, and
+    /// other uploads could push what is held past the bound. A cap of exactly the most
+    /// one admission counts starts; one byte more is refused, however large the bound.
+    #[test]
+    fn a_segment_upload_cap_over_one_admission_is_refused() {
+        let bound = format!("--write-bytes-in-flight={}", 16u64 << 30);
+        let cap = |cap: u64| format!("--segment-upload-max-bytes={cap}");
+        let most = kbf_front::MAX_ADMISSION_BYTES;
+        Args::try_parse_from(["kbf-server", &cap(most), &bound])
+            .expect("a cap one admission counts in full")
+            .listeners()
+            .expect("under the bound");
+        for over in [most + 1, 8u64 << 30] {
+            let refused = Args::try_parse_from(["kbf-server", &cap(over), &bound])
+                .map(drop)
+                .expect_err("a cap over one admission");
+            let message = refused.to_string();
+            assert!(message.contains("--segment-upload-max-bytes"), "{message}");
+        }
     }
 
     /// Catches: a `--write-bytes-in-flight` below the largest blob accepted (a Write of

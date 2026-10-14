@@ -179,7 +179,9 @@ stores its outputs that way. Where the code differs from the text below:
   the daemon needs no flag for the server's cap.
 - `Begin` is admitted for its whole length by the cache's `--write-bytes-in-flight`
   (section 3.3), the bound ByteStream and batch uploads share, and the server refuses
-  to start with `--segment-upload-max-bytes` over it. Each segment of a commit is
+  to start with `--segment-upload-max-bytes` over it, or over the 4 GiB - 1 one
+  admission counts (`MAX_ADMISSION_BYTES`, a semaphore's most permits per call), so a
+  `Begin` never holds more than the bound counts for it. Each segment of a commit is
   stored as a grouped segment is: under a `--write-puts-in-flight` slot, its PUT
   retried under a new key (section 3.4), its footer read back; the one `PutBlobs` is
   timed as a segment commit.
@@ -245,8 +247,8 @@ the commit is indexed once; its new record is dead bytes, reclaimed with the seg
 
 - **Caps.** `--segment-upload-max-bytes` is at least one `MAX_BLOB_BYTES` record and its
   footer (1 GiB + 1 MiB). Without the tier, ranges are held in memory, so the server
-  refuses to start unless the cap is at most `--write-bytes-in-flight` (default cap
-  1 GiB + 1 MiB). With the tier on, ranges go to disk as they arrive, so the cap may be
+  refuses to start unless the cap is at most `--write-bytes-in-flight` and at most
+  4 GiB - 1, the most one admission counts (default cap 1 GiB + 1 MiB). With the tier on, ranges go to disk as they arrive, so the cap may be
   high: default 16 GiB, and the server refuses to start unless it is at most
   `--write-tier-bytes`. Either way a legal `Begin` is always admitted.
   `MAX_UPLOAD_RECORDS` (16,384) bounds `Begin`'s message (16,384 entries of 52 B, about
@@ -535,7 +537,7 @@ Grouping (PR 1), over `MemoryStore` wrapped to count and fault requests:
 | the same digest from two callers: one record, both answered | duplicate records; a caller never answered |
 | 48 concurrent `Write`s on one connection, three times the bound in all: peak buffered bytes stay under the bound, every `Write` finishes (built as 4 MiB `Write`s and a 12 MiB bound, not 64 MiB and 1 GiB, so the suite does not hash 3 GiB) | permit taken after buffering; mutant: permit in `store_blobs`; flow-control windows left at the transport's defaults (deadlock) |
 | a start with `--write-bytes-in-flight` below `MAX_BLOB_BYTES` is refused | a legal blob waiting forever |
-| a start with `--segment-upload-max-bytes` over `--write-bytes-in-flight`, or below one 1 GiB record plus footer, is refused; a `Begin` over the cap or `MAX_UPLOAD_RECORDS` is refused; a `Begin` of the whole 1 GiB + 1 MiB cap is admitted under a bound of the same size, and a single-record upload that fills its bound commits (built as a 64 KiB bound and record, so the suite does not hash 1 GiB) | an upload holding more than the bound; mutant: the start check removed; a commit that asks for admission again (it waits forever) |
+| a start with `--segment-upload-max-bytes` over `--write-bytes-in-flight`, over the 4 GiB - 1 one admission counts (`MAX_ADMISSION_BYTES`), or below one 1 GiB record plus footer, is refused; one admission of `MAX_ADMISSION_BYTES` under a 16 GiB bound is counted in full; a `Begin` over the cap or `MAX_UPLOAD_RECORDS` is refused; a `Begin` of the whole 1 GiB + 1 MiB cap is admitted under a bound of the same size, and a single-record upload that fills its bound commits (built as a 64 KiB bound and record, so the suite does not hash 1 GiB) | an upload holding more than the bound, or more than it is counted for; mutants: the start check removed, the flag's upper limit removed, `MAX_ADMISSION_BYTES` raised to 8 GiB; a commit that asks for admission again (it waits forever) |
 | a `Begin` waits while other uploads hold the bound, and is admitted when they release it | segment uploads bounded apart from ByteStream and batch uploads |
 | an upload's first segment PUT fails: the commit succeeds on a retry under a new key; with 2 PUT slots, a three-segment commit has 2 PUTs at the store | an upload's PUT tried once; an upload's PUTs past `--write-puts-in-flight` |
 

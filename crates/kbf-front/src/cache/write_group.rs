@@ -48,6 +48,11 @@ pub const PUT_BACKOFF: Duration = Duration::from_millis(100);
 /// How much longer each wait between PUT attempts is than the one before.
 pub const PUT_BACKOFF_FACTOR: u32 = 4;
 
+/// The most bytes one [`Cache::admit`] call takes and counts: a semaphore hands out at
+/// most `u32::MAX` permits at once. A caller asking for more holds more memory than the
+/// bound counts, so `kbf-server` refuses a `--segment-upload-max-bytes` over this.
+pub const MAX_ADMISSION_BYTES: u64 = u32::MAX as u64;
+
 /// The most HTTP/2 streams one connection may have open on either of the server's
 /// listeners. A `BatchUpdateBlobs` request is decoded (up to
 /// [`MAX_MESSAGE_BYTES`](crate::MAX_MESSAGE_BYTES)) before [`Cache::admit`] sees it,
@@ -274,10 +279,10 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
     }
 
     /// Waits until `bytes` more fit under [`WriteConfig::bytes_in_flight`] and takes
-    /// them. A call asking for more than the bound (or than 4 GiB) waits for that much.
-    /// Nothing is refused: a caller over the bound waits.
+    /// them. A call asking for more than the bound, or than [`MAX_ADMISSION_BYTES`],
+    /// takes and counts only that much. Nothing is refused: a caller over the bound waits.
     pub async fn admit(&self, bytes: u64) -> Admitted {
-        let n = bytes.min(self.group.bound).min(u64::from(u32::MAX));
+        let n = bytes.min(self.group.bound).min(MAX_ADMISSION_BYTES);
         let n = u32::try_from(n).unwrap_or(u32::MAX);
         let permit = Arc::clone(&self.group.admission)
             .acquire_many_owned(n)
