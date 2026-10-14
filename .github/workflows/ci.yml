@@ -365,10 +365,19 @@ jobs:
       # started after the binary was renamed over, which macOS finds by its path.
       - run: cargo test -p kbf-daemon --lib --test suspend --test keeper --locked
       # The root helper for per-lease users: its unit tests, then the helper itself run
-      # as root (passwordless sudo) with real users, launchd, the sweep and the caller
-      # check by code signature (docs/design/fleet-updates-security.md S4.2, S4.3).
+      # as root (passwordless sudo) with real users, launchd, libproc, the sweep, the
+      # leak scan and the caller check by code signature, signed as `cargo xtask
+      # sign-darwin` signs it (crates/kbf-mac-session/tests/as_root.rs;
+      # docs/design/fleet-updates-security.md S4.2, S4.3, S10).
       - run: cargo test -p kbf-mac-session --locked
-      - run: bash tools/ci/mac-session-tests.sh
+      - run: cargo xtask sudo-test -p kbf-mac-session --test as_root -- --test-threads=1 --nocapture
+      # The native driver's lease-user pool as root, with throwaway users from uid 690:
+      # actions as pool users through `launchctl asuser`, the kill by uid, the keeper's,
+      # parallel leases (crates/kbf-driver-native/tests/slots.rs); then the clean of a
+      # slot between two leases, its deadline, the user made again and the quarantine
+      # (tests/slot_clean.rs). One test at a time: they make users at free uids.
+      - run: cargo xtask sudo-test -p kbf-driver-native --test slots -- --test-threads=1 --nocapture
+      - run: cargo xtask sudo-test -p kbf-driver-native --test slot_clean -- --test-threads=1 --nocapture
       # The per-binary entitlement allow list (tools/ci/darwin-entitlements.txt): the
       # kbf-vmm stub signed by `cargo xtask sign-darwin` with the virtualization
       # entitlement, kbf-daemon with none, both accepted by `darwin-asset`, and every
