@@ -1,7 +1,7 @@
 //! The state machine the log replicates: the metadata state, fed every committed
 //! command entry in index order.
 
-use kbf_log::{Bootstrap, DecodeError, Format, LogCommand};
+use kbf_log::{Bootstrap, DecodeError, Format, LogCommand, MachineVersion};
 use kbf_meta::{Applied, MetaState, Retention};
 use kbf_raft::{Entry, LogIndex, Machine, Payload, Snapshot};
 
@@ -10,17 +10,26 @@ use kbf_raft::{Entry, LogIndex, Machine, Payload, Snapshot};
 #[error("the raft dir holds a snapshot; this kbf-server writes and reads none")]
 pub struct NoSnapshots;
 
-/// [`MetaState`] as a [`Machine`]: each committed command entry is decoded and
-/// applied in order. The first [`Bootstrap`] is kept and every later one is a no-op.
-/// An entry that does not decode, or a control command (which this log does not
-/// apply), stops the machine: it applies nothing more, and the
-/// log refuses to open ([`MetaMachine::failed`] names the first such entry). Once open,
-/// the log applies only entries it encoded itself.
+/// [`MetaState`] as a [`Machine`]: each committed command entry is decoded, under the
+/// format of the machine version committed before it, and applied in order. The first
+/// [`Bootstrap`] is kept and every later one is a no-op. A [`MachineVersion`] entry
+/// raises the version (a lower or equal one changes nothing), and with it the format
+/// of every later entry. An entry that does not decode, a version past the one this
+/// binary runs, or a control command (which this log does not apply), stops the
+/// machine: it applies nothing more, and the log refuses to open
+/// ([`MetaMachine::failed`] names the first such entry). Once open, the log applies
+/// only entries it encoded itself.
 #[derive(Debug)]
 pub struct MetaMachine {
     meta: MetaState,
     bootstrap: Option<Bootstrap>,
     bootstraps: usize,
+    /// The highest machine version this binary runs.
+    runs: MachineVersion,
+    /// The machine version committed so far; [`MachineVersion::V1`] in a new log.
+    version: MachineVersion,
+    /// The entry format of `version`.
+    format: Format,
     /// The index and outcome of the last metadata command applied, for the caller
     /// that proposed it.
     answer: Option<(LogIndex, Applied)>,
@@ -30,21 +39,42 @@ pub struct MetaMachine {
 }
 
 impl MetaMachine {
-    /// An empty metadata state with `retention`, before any entry.
-    pub fn new(retention: Retention) -> Self {
-        Self {
+    /// An empty metadata state with `retention`, before any entry, for a binary that
+    /// runs machine versions up to `runs`; `None` if this binary does not know `runs`.
+    pub fn new(retention: Retention, runs: MachineVersion) -> Option<Self> {
+        runs.format()?;
+        Some(Self {
             meta: MetaState::new(retention),
             bootstrap: None,
             bootstraps: 0,
+            runs,
+            version: MachineVersion::V1,
+            format: Format::V1,
             answer: None,
             failed: None,
             applied: LogIndex(0),
-        }
+        })
     }
 
     /// The metadata state as of the last entry applied.
     pub const fn meta(&self) -> &MetaState {
         &self.meta
+    }
+
+    /// The machine version committed so far.
+    pub const fn version(&self) -> MachineVersion {
+        self.version
+    }
+
+    /// The entry format of the committed machine version: what the next entry is
+    /// encoded and decoded under.
+    pub const fn format(&self) -> Format {
+        self.format
+    }
+
+    /// The highest machine version this binary runs.
+    pub const fn runs(&self) -> MachineVersion {
+        self.runs
     }
 
     /// The first `Bootstrap` applied, if one has been.
@@ -89,7 +119,7 @@ impl Machine for MetaMachine {
         if self.failed.is_some() {
             return;
         }
-        match kbf_log::decode(Format::V1, bytes) {
+        match kbf_log::decode(self.format, bytes) {
             Ok(LogCommand::Meta(command)) => {
                 let applied = self.meta.execute(entry.id.index.0, command);
                 self.answer = Some((entry.id.index, applied));
@@ -98,6 +128,18 @@ impl Machine for MetaMachine {
                 self.bootstraps += 1;
                 self.bootstrap.get_or_insert(bootstrap);
             }
+            Ok(LogCommand::MachineVersion(version)) => match version.format() {
+                Some(_) if version <= self.runs => {
+                    self.version = self.version.max(version);
+                    self.format = self.version.format().unwrap_or(self.format);
+                }
+                // A later binary raised the log past what this one runs: stop, as an
+                // older binary stops on any `MachineVersion` entry.
+                _ => {
+                    let refused = DecodeError::UnknownCommand("MachineVersion");
+                    self.failed = Some((entry.id.index, refused));
+                }
+            },
             // A control command: this log applies only metadata commands and its
             // `Bootstrap`, so a later binary wrote it. Stop, as for an entry that does
             // not decode.
