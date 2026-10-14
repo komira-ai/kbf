@@ -166,6 +166,46 @@ group thousands of single-blob calls, it builds the segments itself and uploads 
 one unit. This is kbf-specific and served only on the worker listener, under its
 admission rules ([worker-protocol.md](worker-protocol.md#blobs-on-the-worker-listener)).
 
+**Built (rollout stage 2), direct path only.** The service is
+`kbf.worker.v1.Segments` (`crates/kbf-proto/proto/kbf/worker/v1/segments.proto`,
+served by `crates/kbf-front/src/segments.rs`); the daemon's side is `Spool` and
+`Cas::put_spool` in `kbf-transfer` (`spool.rs`, `segments.rs`), and the native driver
+stores its outputs that way. Where the code differs from the text below:
+
+- The daemon spools every output as its walk stores it, and asks FindMissing for the
+  whole spool afterwards: the walk reads and hashes a file in one pass, so a blob the
+  server already holds costs a local copy, not a send.
+- The daemon splits uploads at 1 GiB + 1 MiB (`SEGMENT_UPLOAD_BYTES`), the smallest
+  `--segment-upload-max-bytes` a server starts with, so every server admits them and
+  the daemon needs no flag for the server's cap.
+- `Begin` is admitted for its whole length by the cache's `--write-bytes-in-flight`
+  (section 3.3), the bound ByteStream and batch uploads share, and the server refuses
+  to start with `--segment-upload-max-bytes` over it, or over the 4 GiB - 1 one
+  admission counts (`MAX_ADMISSION_BYTES`, a semaphore's most permits per call), so a
+  `Begin` never holds more than the bound counts for it. Each segment of a commit is
+  stored as a grouped segment is: under a `--write-puts-in-flight` slot, its PUT
+  retried under a new key (section 3.4), its footer read back; the one `PutBlobs` is
+  timed as a segment commit.
+- The idle time is `--segment-upload-idle-secs`. `Commit`'s reply lists the digests
+  committed; a failed commit is the call's status.
+- An upload's connection is found by the peer address of the worker listener's
+  tracked connections (`Connections`); a connection's close is seen when the server
+  drops its stream.
+- `Locate` and `ReadRange` are served, and the daemon's coalescing reader
+  (`Scope::read_located`) is built and tested, but cache fills do not use it yet. The
+  container driver still uploads blob by blob.
+- A retried upload (4.2) does not ask FindMissing again: it sends a fresh `Begin` of
+  the same plan. Blobs a lost-reply commit already indexed are sent and stored again,
+  and `PutBlobs` keeps the existing entry, so a retry costs bytes, not correctness.
+- There is no `Abort`. An attempt that failed before its `Commit` (a `PutRange` call
+  failed) keeps its admission until its connection closes or it goes idle
+  (`--segment-upload-idle-secs`, default 60 s). With the default bound of 2 GiB, the
+  retry's `Begin` of a large upload, and other uploads of any kind, can wait that
+  long. A failed `Commit` returns its admission when it ends.
+- The spool copies the whole output set onto the daemon's scratch disk, with no size
+  limit of its own, including blobs the server already holds: an action's outputs take
+  twice their size on scratch until the upload ends.
+
 ### 4.1 Shape
 
 1. The daemon hashes every output file (it already does, to build the `ActionResult`)
@@ -208,8 +248,8 @@ the commit is indexed once; its new record is dead bytes, reclaimed with the seg
 
 - **Caps.** `--segment-upload-max-bytes` is at least one `MAX_BLOB_BYTES` record and its
   footer (1 GiB + 1 MiB). Without the tier, ranges are held in memory, so the server
-  refuses to start unless the cap is at most `--write-bytes-in-flight` (default cap
-  1 GiB + 1 MiB). With the tier on, ranges go to disk as they arrive, so the cap may be
+  refuses to start unless the cap is at most `--write-bytes-in-flight` and at most
+  4 GiB - 1, the most one admission counts (default cap 1 GiB + 1 MiB). With the tier on, ranges go to disk as they arrive, so the cap may be
   high: default 16 GiB, and the server refuses to start unless it is at most
   `--write-tier-bytes`. Either way a legal `Begin` is always admitted.
   `MAX_UPLOAD_RECORDS` (16,384) bounds `Begin`'s message (16,384 entries of 52 B, about
@@ -223,7 +263,7 @@ the commit is indexed once; its new record is dead bytes, reclaimed with the seg
   (`pwrite`), and the permit covers only ranges in flight. A commit turns the
   reservation into staged bytes; a drop releases it.
 - An upload belongs to the worker connection that called `Begin`. When it closes, or
-  after `--segment-upload-idle` (default 60 s) with no call, an upload that is still
+  after `--segment-upload-idle-secs` (default 60 s) with no call, an upload that is still
   **receiving** is dropped: its permit and reservation are released and its tier file
   deleted. Nothing points at it. An upload that is **committing** is never dropped: the
   commit runs in its own task, detached from the connection and from the `Commit`
@@ -551,7 +591,7 @@ Estimates from the measured store latency, to be measured on the pilot at each s
 2. **PR 2, segment upload**: the `Segments` service on the worker listener (`Begin`,
    `PutRange`, `Commit`, `Locate`, `ReadRange`) in `kbf-proto` and `kbf-front`, and the
    daemon's spool, split, upload and fallback in `kbf-daemon`/`kbf-outputs`. Flags:
-   `--segment-upload-max-bytes`, `--segment-upload-streams`, `--segment-upload-idle`.
+   `--segment-upload-max-bytes`, `--segment-upload-streams`, `--segment-upload-idle-secs`.
    Direct path only. Downloads through the transfer engine follow it.
 3. **PR 3, tier metadata**: the five commands in `kbf-meta` and `kbf-log`, the staged
    table, `BlobAnswer::Present { staged_on }`, the refusal test, snapshot encoding if
@@ -585,7 +625,9 @@ Grouping (PR 1), over `MemoryStore` wrapped to count and fault requests:
 | the same digest from two callers: one record, both answered | duplicate records; a caller never answered |
 | 48 concurrent `Write`s on one connection, three times the bound in all: peak buffered bytes stay under the bound, every `Write` finishes (built as 4 MiB `Write`s and a 12 MiB bound, not 64 MiB and 1 GiB, so the suite does not hash 3 GiB) | permit taken after buffering; mutant: permit in `store_blobs`; flow-control windows left at the transport's defaults (deadlock) |
 | a start with `--write-bytes-in-flight` below `MAX_BLOB_BYTES` is refused | a legal blob waiting forever |
-| a start with `--segment-upload-max-bytes` over `--write-bytes-in-flight`, or below one 1 GiB record plus footer, is refused; a `Begin` over the cap or `MAX_UPLOAD_RECORDS` is refused; a 1 GiB single-record segment commits | a `Begin` waiting forever for its permit |
+| a start with `--segment-upload-max-bytes` over `--write-bytes-in-flight`, over the 4 GiB - 1 one admission counts (`MAX_ADMISSION_BYTES`), or below one 1 GiB record plus footer, is refused; one admission of `MAX_ADMISSION_BYTES` under a 16 GiB bound is counted in full; a `Begin` over the cap or `MAX_UPLOAD_RECORDS` is refused; a `Begin` of the whole 1 GiB + 1 MiB cap is admitted under a bound of the same size, and a single-record upload that fills its bound commits (built as a 64 KiB bound and record, so the suite does not hash 1 GiB) | an upload holding more than the bound, or more than it is counted for; mutants: the start check removed, the flag's upper limit removed, `MAX_ADMISSION_BYTES` raised to 8 GiB; a commit that asks for admission again (it waits forever) |
+| a `Begin` waits while other uploads hold the bound, and is admitted when they release it | segment uploads bounded apart from ByteStream and batch uploads |
+| an upload's first segment PUT fails: the commit succeeds on a retry under a new key; with 2 PUT slots, a three-segment commit has 2 PUTs at the store | an upload's PUT tried once; an upload's PUTs past `--write-puts-in-flight` |
 
 Segment upload (PR 2):
 

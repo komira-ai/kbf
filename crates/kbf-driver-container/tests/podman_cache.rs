@@ -1,6 +1,6 @@
 //! The driver with the node's input cache, against real rootless Podman
 //! (`docs/design/worker-cache.md#51-container-driver-linux-rootless-podman-hard-links-into-the-overlay-lower`,
-//! tests C-1, C-2, C-12 and C-18). Run by `tools/ci/podman-tests.sh`, as the other
+//! tests C-1, C-2, C-12 and C-18). Run by `cargo xtask podman-tests`, as the other
 //! real-Podman tests are: each is `#[ignore]` with that reason.
 //!
 //! A cached input is a hard link to an entry owned by the daemon's user, which
@@ -78,7 +78,7 @@ fn unchanged(path: &Path, bytes: &[u8]) {
 /// lease reads its bytes. The graph driver and the overlay's mount options are
 /// printed, which is what this test proved the behaviour on.
 #[tokio::test]
-#[ignore = "needs rootless Podman and a delegated cgroup: run by tools/ci/podman-tests.sh"]
+#[ignore = "needs rootless Podman and a delegated cgroup: run by cargo xtask podman-tests"]
 async fn a_container_cannot_write_or_re_own_a_cached_input() {
     let cell = Cell::with("cache-c1", |config| with_cache(config, None));
     eprintln!(
@@ -112,7 +112,7 @@ async fn a_container_cannot_write_or_re_own_a_cached_input() {
 /// chown would give the cached inode to the container's root): the action appends to
 /// it, the output has the new bytes, and the entry has the old.
 #[tokio::test]
-#[ignore = "needs rootless Podman and a delegated cgroup: run by tools/ci/podman-tests.sh"]
+#[ignore = "needs rootless Podman and a delegated cgroup: run by cargo xtask podman-tests"]
 async fn an_output_that_is_an_input_is_a_private_copy() {
     let cell = Cell::with("cache-c2", |config| with_cache(config, None));
     let mut spec = sh("printf ' more' >> out/o.txt && cat same.txt");
@@ -136,7 +136,7 @@ async fn an_output_that_is_an_input_is_a_private_copy() {
 /// Mutant: the input root mounted without the overlay and its files given to the
 /// container's root, so the rewrite lands in the cache's inode.
 #[tokio::test]
-#[ignore = "needs rootless Podman and a delegated cgroup: run by tools/ci/podman-tests.sh"]
+#[ignore = "needs rootless Podman and a delegated cgroup: run by cargo xtask podman-tests"]
 async fn a_lease_sees_none_of_the_last_ones_changes() {
     let cell = Cell::with("cache-c12", |config| with_cache(config, None));
     let inputs = vec![
@@ -165,7 +165,7 @@ async fn a_lease_sees_none_of_the_last_ones_changes() {
 /// on one where linking the second name fails with `EMLINK`, and a `tar` of them is
 /// the same bytes both times (it records the hard link, the modes and the mtimes).
 #[tokio::test]
-#[ignore = "needs rootless Podman and a delegated cgroup: run by tools/ci/podman-tests.sh"]
+#[ignore = "needs rootless Podman and a delegated cgroup: run by cargo xtask podman-tests"]
 async fn identical_inputs_are_one_inode_and_tar_alike_on_every_run() {
     let refuse = Arc::new(AtomicBool::new(false));
     let refusing = Arc::clone(&refuse);

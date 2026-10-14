@@ -69,6 +69,7 @@ impl Server {
             shutdown_timeout: Duration::from_secs(10),
             store_probe_timeout: kbf_server::health::STORE_PROBE_TIMEOUT,
             invocation_memory: memory,
+            segments: kbf_front::SegmentsConfig::DEFAULT,
         };
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
         let shutdown = async move {

@@ -51,6 +51,7 @@ mod meta_log;
 pub mod metrics;
 mod recorder;
 mod request_metadata;
+mod segments;
 mod wire;
 
 use std::sync::Arc;
@@ -68,9 +69,9 @@ pub use crate::action_cache::ActionCacheService;
 pub use crate::bytestream::ByteStreamService;
 pub use crate::cache::{
     Admitted, BATCH_READS_IN_FLIGHT, CONNECTION_WINDOW_BYTES, Cache, CacheError,
-    FLUSH_BACKOFF_FIRST, FLUSH_BACKOFF_MAX, FLUSHES_PER_ROUND, FlushRound, MAX_CONCURRENT_STREAMS,
-    PUT_BACKOFF, PUT_BACKOFF_FACTOR, STREAM_WINDOW_BYTES, TierStartError, TierStartup,
-    VerifiedBlob, WriteConfig,
+    FLUSH_BACKOFF_FIRST, FLUSH_BACKOFF_MAX, FLUSHES_PER_ROUND, FlushRound, MAX_ADMISSION_BYTES,
+    MAX_CONCURRENT_STREAMS, PUT_BACKOFF, PUT_BACKOFF_FACTOR, STREAM_WINDOW_BYTES, TierStartError,
+    TierStartup, VerifiedBlob, WriteConfig,
 };
 pub use crate::capabilities::{CapabilitiesService, server_capabilities};
 pub use crate::cas::CasService;
@@ -88,6 +89,10 @@ pub use crate::request_metadata::{
     CallMetadata, HEADER as REQUEST_METADATA_HEADER, Invalid, InvocationId, MAX_HEADER_BYTES,
     MAX_ID_BYTES, MAX_TEXT_BYTES, Read, ReadRequestMetadata, RequestMetadataLayer, Text,
     call_metadata,
+};
+pub use crate::segments::{
+    Connection, Connections, MAX_RANGE_BYTES, MAX_UPLOAD_RECORDS, MIN_SEGMENT_UPLOAD_BYTES,
+    SegmentsConfig, SegmentsService, Tracked,
 };
 
 /// The most blob data one `BatchUpdateBlobs` or `BatchReadBlobs` call may carry,

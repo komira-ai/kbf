@@ -6,23 +6,25 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures::StreamExt as _;
 use futures::future::Either;
 use kbf_auth::{AuthenticateLayer, Policy};
 use kbf_front::{
-    ByteStreamService, CONNECTION_WINDOW_BYTES, Cache, CasService, MAX_CONCURRENT_STREAMS,
-    MAX_MESSAGE_BYTES, MetaLog, RECORDER_CHANNEL, Recorder, RequestMetadataLayer,
-    STREAM_WINDOW_BYTES,
+    ByteStreamService, CONNECTION_WINDOW_BYTES, Cache, CasService, Connections,
+    MAX_CONCURRENT_STREAMS, MAX_MESSAGE_BYTES, MetaLog, RECORDER_CHANNEL, Recorder,
+    RequestMetadataLayer, STREAM_WINDOW_BYTES, SegmentsConfig, SegmentsService,
 };
 use kbf_objstore::ObjectStore;
 use kbf_proto::google::bytestream::byte_stream_server::ByteStreamServer;
 use kbf_proto::grpc::health::v1::health_server::HealthServer;
 use kbf_proto::reapi::content_addressable_storage_server::ContentAddressableStorageServer;
+use kbf_proto::worker::segments_server::SegmentsServer;
 use kbf_proto::worker::worker_server::WorkerServer;
 use tonic::service::Routes;
 use tonic::transport::server::TcpIncoming;
 use tonic::transport::{Server, ServerTlsConfig};
 
-use crate::blobs::{WorkerBlobs, WorkerCas};
+use crate::blobs::{WorkerBlobs, WorkerCas, WorkerSegments};
 use crate::farm::Farm;
 use crate::grpc_health::{HealthService, WATCH_INTERVAL};
 use crate::health::Readiness;
@@ -71,6 +73,9 @@ pub struct Listeners {
     /// The memory bound of the invocation records, in bytes
     /// (`docs/design/invocations.md`, section 3.5).
     pub invocation_memory: usize,
+    /// The worker listener's segment uploads (`--segment-upload-*`;
+    /// `docs/design/write-path.md`, section 4).
+    pub segments: SegmentsConfig,
 }
 
 /// The worker listener's mutual TLS: every daemon's certificate must name its node
@@ -329,6 +334,18 @@ where
     ))
     .max_decoding_message_size(MAX_MESSAGE_BYTES)
     .max_encoding_message_size(MAX_MESSAGE_BYTES);
+    // Each accepted worker connection is tracked, so an upload is dropped when the
+    // connection that began it closes.
+    let connections = Connections::new();
+    let tracking = connections.clone();
+    let worker_incoming =
+        worker_incoming.map(move |accepted| accepted.map(|stream| tracking.track(stream)));
+    let worker_segments = SegmentsServer::new(WorkerSegments::new(
+        SegmentsService::new(Arc::clone(&cache), listeners.segments, connections),
+        peers.clone(),
+    ))
+    .max_decoding_message_size(MAX_MESSAGE_BYTES)
+    .max_encoding_message_size(MAX_MESSAGE_BYTES);
     let worker_service = WorkerServer::new(WorkerService::new(
         Arc::clone(&farm),
         peers,
@@ -378,6 +395,7 @@ where
             .add_service(worker_service)
             .add_service(worker_blobs)
             .add_service(worker_cas)
+            .add_service(worker_segments)
             .serve_with_incoming(worker_incoming);
         let api_serve = serve_api(api_listener.map(|(listener, _)| listener), api_routes);
         let ticking = async {

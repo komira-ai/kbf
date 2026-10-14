@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Runs the M2 test (crates/kbf-it/m2/run.sh: buck2 through kbf-server to kbf-daemon
 # --driver container) on a GitHub-hosted x86_64 runner, set up as
-# tools/ci/podman-tests.sh sets one up for the driver's own Podman tests: a systemd
+# `cargo xtask podman-tests` sets one up for the driver's own Podman tests: a systemd
 # user session for the runner user (lingering), so rootless Podman has a run
 # directory. run.sh starts the daemon as a Delegate=yes system service itself.
 #

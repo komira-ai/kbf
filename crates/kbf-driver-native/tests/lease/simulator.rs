@@ -548,6 +548,37 @@ mod real {
     /// for no gain.
     static ONE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+    /// How long, in seconds, `xcodebuild test -destination` waits for its device to
+    /// appear before it gives up: its `-destination-timeout`, 30 s by default. This is
+    /// the contract the lease's device has to meet; a device listed only later fails a
+    /// default `xcodebuild test`.
+    const DESTINATION_TIMEOUT: u64 = 30;
+
+    /// How long one sandboxed `xcodebuild -showdestinations` try takes on a hosted
+    /// runner: 15 s in the native-macos job (a try that listed the device at once
+    /// reported itself at 15 s). A try sees a listing only when it ends, so a device
+    /// that appears just before [`DESTINATION_TIMEOUT`] can be reported up to one try
+    /// later.
+    const ONE_TRY: u64 = 15;
+
+    /// The latest elapsed time, in seconds since the first try started, at which the
+    /// first try that lists the device may end and still meet the contract:
+    /// [`DESTINATION_TIMEOUT`] plus one try's own duration. A try reports when it ends,
+    /// so a passing value proves the device was listed no later than [`ONE_TRY`]
+    /// seconds past the contract. The bound errs strict the other way: a device that
+    /// appears while a try is already past its listing step waits for that try, the
+    /// 5 s pause and a whole next try, so one that appears in the last seconds before
+    /// [`DESTINATION_TIMEOUT`] can fail.
+    const LISTED_BY: u64 = DESTINATION_TIMEOUT + ONE_TRY;
+
+    /// How long, in seconds after its first try, the action keeps retrying
+    /// `-showdestinations` while the device is not listed. Longer than [`LISTED_BY`]
+    /// on purpose: a device that appears late still fails the test, but the per-try
+    /// lines then say when it appeared (or that it never did, and whether any
+    /// simulator was listed at all), which tells a late listing from a sandbox that
+    /// lists nothing.
+    const POLL_FOR: u64 = 120;
+
     /// `xcrun args`, unsandboxed (the test's own view), its stdout; panics on failure.
     fn xcrun(args: &[&str]) -> String {
         let out = Command::new("/usr/bin/xcrun")
@@ -731,9 +762,14 @@ mod real {
     /// Catches, on a real Mac: `simctl create` in the default set not working under the
     /// actions' sandbox (create, or the delete at the end, refused), a device the
     /// action cannot boot from its sandbox, a device the action's own `xcodebuild
-    /// -showdestinations` does not list from the sandbox (so `xcodebuild test
-    /// -destination id=$KBF_SIMULATOR_UDID` could not use it), and a booted device left
-    /// running or registered after the lease.
+    /// -showdestinations` does not list from the sandbox, or lists only after
+    /// [`LISTED_BY`] seconds (so `xcodebuild test -destination id=$KBF_SIMULATOR_UDID`
+    /// with its default timeout could not use it), and a booted device left running or
+    /// registered after the lease. The action keeps trying for [`POLL_FOR`] seconds;
+    /// each try prints to the action's stderr what it saw: its exit, whether it named
+    /// the lease's device, and how many iOS simulators it listed (none at all would
+    /// point at the sandbox, not at a late listing); a run that never lists the device
+    /// prints the last listing whole.
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "macOS with an iOS simulator runtime; the native-macos job runs it"]
     async fn a_real_simulator_is_made_booted_and_deleted_for_the_lease() {
@@ -752,9 +788,21 @@ mod real {
              xcrun simctl bootstatus \"${UDID_VAR}\" -b >&2\n\
              xcrun simctl list devices booted | grep -c \"${UDID_VAR}\"\n\
              cp -R {project} \"$TMPDIR/IOSFixture.xcodeproj\" >&2 || true\n\
-             xcodebuild -showdestinations -project \"$TMPDIR/IOSFixture.xcodeproj\" -scheme IOSFixture -derivedDataPath \"$TMPDIR/dd\" > \"$TMPDIR/shown\" 2>&1 || echo \"xcodebuild under the sandbox: exit $?\" >&2\n\
-             grep -c \"${UDID_VAR}\" \"$TMPDIR/shown\" || true\n\
-             grep -i -m 8 -e error -e denied -e destinations \"$TMPDIR/shown\" >&2 || true\n"
+             start=$(date +%s); try=0; found=0\n\
+             while :; do\n\
+               try=$((try + 1)); rc=0\n\
+               xcodebuild -showdestinations -project \"$TMPDIR/IOSFixture.xcodeproj\" -scheme IOSFixture -derivedDataPath \"$TMPDIR/dd\" > \"$TMPDIR/shown\" 2>&1 || rc=$?\n\
+               found=$(grep -c \"${UDID_VAR}\" \"$TMPDIR/shown\" || true)\n\
+               sims=$(grep -c 'platform:iOS Simulator, arch' \"$TMPDIR/shown\" || true)\n\
+               waited=$(($(date +%s) - start))\n\
+               echo \"showdestinations try $try at $waited s: exit $rc, lists the lease's device $found, iOS simulators listed $sims\" >&2\n\
+               if [ \"$found\" = 1 ] || [ \"$waited\" -ge {POLL_FOR} ]; then break; fi\n\
+               sleep 5\n\
+             done\n\
+             [ \"$found\" = 1 ] || cat \"$TMPDIR/shown\" >&2\n\
+             echo \"$found\"\n\
+             if [ \"$found\" = 1 ]; then echo \"$waited\"; else echo never; fi\n\
+             grep -i -m 8 -e error -e denied \"$TMPDIR/shown\" >&2 || true\n"
         );
         let spec = Spec::sh(&script)
             .property("simulator", &format!("{device_type},{runtime_id}"))
@@ -772,12 +820,19 @@ mod real {
         assert_eq!(result.exit_code, 0, "{err}");
         let out = stdout(&cas, &result);
         let lines: Vec<&str> = out.lines().collect();
-        assert_eq!(lines.len(), 3, "{out}");
+        assert_eq!(lines.len(), 4, "{out}");
         let udid = lines[0];
         assert_eq!(lines[1], "1", "the device booted");
         assert_eq!(
             lines[2], "1",
-            "xcodebuild lists the device from the sandbox"
+            "xcodebuild lists the device from the sandbox within {POLL_FOR} s"
+        );
+        let listed_at: u64 = lines[3].parse().expect("seconds to the first listing");
+        assert!(
+            listed_at <= LISTED_BY,
+            "xcodebuild first listed the device at {listed_at} s, after the {LISTED_BY} s \
+             a default `xcodebuild test -destination` allows ({DESTINATION_TIMEOUT} s \
+             -destination-timeout plus one {ONE_TRY} s try)"
         );
         assert!(
             !xcrun(&["simctl", "list", "devices", "-j"]).contains(udid),

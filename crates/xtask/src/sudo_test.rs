@@ -84,29 +84,57 @@ pub struct SudoTest<'a> {
     pub args: &'a [String],
 }
 
-/// Builds the test target as this user, then runs its ignored tests as root: the line
-/// to print when they passed. The build's progress and the tests' output go to this
-/// process's stderr and stdout.
+/// `-p <package> --test <name>...`: the targets of a build, as messages name them.
+fn targets(package: &str, tests: &[&str]) -> String {
+    let mut what = format!("-p {package}");
+    for test in tests {
+        what.push_str(" --test ");
+        what.push_str(test);
+    }
+    what
+}
+
+/// Builds the integration test targets `tests` of `package` as this user, with `cargo
+/// test --locked --no-run --message-format=json` in `root`: cargo's JSON messages,
+/// which [`find`] reads each target's binary from. The build's progress goes to this
+/// process's stderr.
 ///
 /// # Errors
-/// Cargo or sudo could not be started, the build failed, cargo's messages name no
-/// single test binary ([`find`]), or the tests failed.
-pub fn run(t: &SudoTest<'_>) -> Result<Vec<String>, Error> {
-    let what = format!("-p {} --test {}", t.package, t.test);
-    let out = Command::new(t.cargo)
-        .current_dir(t.root)
+/// Cargo could not be started, or the build failed.
+pub fn build(cargo: &OsStr, root: &Path, package: &str, tests: &[&str]) -> Result<String, Error> {
+    let mut command = Command::new(cargo);
+    command
+        .current_dir(root)
         .args(["test", "--locked", "--no-run", "--message-format=json"])
-        .args(["-p", t.package, "--test", t.test])
+        .args(["-p", package]);
+    for test in tests {
+        command.args(["--test", *test]);
+    }
+    let out = command
         .stderr(Stdio::inherit())
         .output()
         .map_err(Error::spawn("cargo".to_owned()))?;
     if !out.status.success() {
         return Err(Error::Failed(format!(
-            "cargo test --no-run {what} failed: {}",
+            "cargo test --no-run {} failed: {}",
+            targets(package, tests),
             out.status
         )));
     }
-    let built = find(&String::from_utf8_lossy(&out.stdout), t.test)?;
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Builds the test target as this user ([`build`]), then runs its ignored tests as
+/// root: the line to print when they passed. The build's progress and the tests'
+/// output go to this process's stderr and stdout.
+///
+/// # Errors
+/// Cargo or sudo could not be started, the build failed, cargo's messages name no
+/// single test binary ([`find`]), or the tests failed.
+pub fn run(t: &SudoTest<'_>) -> Result<Vec<String>, Error> {
+    let what = targets(t.package, &[t.test]);
+    let messages = build(t.cargo, t.root, t.package, &[t.test])?;
+    let built = find(&messages, t.test)?;
     let status = Command::new(t.sudo)
         .current_dir(&built.dir)
         .arg("-n")
