@@ -75,6 +75,9 @@ impl Cas for CountingCas {
 
     async fn put(&self, bytes: Vec<u8>) -> Result<Digest, CasError> {
         let digest = digest_of(&bytes);
+        if self.refused.as_ref() == Some(&digest) {
+            return Err(CasError::Unavailable(label(&digest), "refused".to_owned()));
+        }
         self.keep(&digest, bytes).await;
         Ok(digest)
     }
@@ -213,9 +216,9 @@ async fn a_digest_named_many_times_is_stored_once() {
 
 /// Catches a store that failed being dropped while the walk goes on: `collect` would
 /// return a result naming a blob the CAS never got, and the action cache would refuse
-/// it (or a client would fail fetching it). One of 100 files cannot be stored.
-/// Mutant seen red: the drain's error discarded (`outputs.rs`, `try_join!` replaced by
-/// a `join!` that returns only the walk's result).
+/// it (or a client would fail fetching it). One of 100 files cannot be stored (it
+/// reaches the store from the spool, through `put`). Mutant seen red: the spool's
+/// store error discarded (`src/pending.rs`, `put_spool`'s result dropped).
 #[tokio::test]
 async fn a_blob_that_cannot_be_stored_fails_the_collection() {
     let upper = scratch("refused");

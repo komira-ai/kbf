@@ -46,6 +46,8 @@ async fn serve(routes: Routes) -> SocketAddr {
 /// every digest asked about once, the 14,000 held ones present, the others written.
 /// Mutants seen red: no `missing` call, each put asking for itself (516 calls); the
 /// answer ignored, every blob put (510 calls: the held ones ask for themselves).
+/// This front serves no `Segments`: the spool's upload is answered UNIMPLEMENTED and
+/// its blobs go one ByteStream write each, so this is also the fallback's test.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_large_tree_costs_one_find_missing_call_per_thousand_digests() {
     let upper = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))

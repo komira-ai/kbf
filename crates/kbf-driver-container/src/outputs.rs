@@ -24,7 +24,8 @@
 //! No file is read into memory whole: each is hashed one chunk at a time and closed,
 //! and one past the byte limit is refused after `limit + 1` bytes. Once the walk is
 //! done, the CAS is asked about every blob it found at once, and the missing ones are
-//! stored, a file opened again and sent one chunk at a time ([`crate::pending`]).
+//! copied into a spool, a file opened again and copied one chunk at a time, and the
+//! spool is stored as whole segments ([`crate::pending`]).
 //! The action's stdout and stderr are stored the same way, each within its own limit
 //! ([`collect_log`]).
 //!

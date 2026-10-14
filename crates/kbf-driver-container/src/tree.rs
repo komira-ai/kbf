@@ -261,11 +261,13 @@ pub async fn refuse_hidden_working_directory(
 ///
 /// All the outputs together stay within `limits` (directory depth, entries, file
 /// bytes), or the call fails with [`TreeError::Limit`]. An output directory is walked
-/// without recursion, so no depth of tree can overflow the caller's stack. Each file
-/// is stored through [`Cas::put_chunks`], one chunk in memory at a time; up to
-/// [`Cas::in_flight`] blobs are stored at once while the walk goes on,
-/// each distinct digest once, and the call returns once all of them are stored. A name or
-/// symlink target that is not UTF-8 fails the call with [`TreeError::NotUtf8`].
+/// without recursion, so no depth of tree can overflow the caller's stack. The walk
+/// hashes each file and closes it; then [`Cas::missing`] is asked once for every
+/// distinct digest, the missing blobs are copied into a spool made in `spools` (one
+/// chunk in memory at a time, up to [`Cas::in_flight`] files open), and the spool is
+/// stored with [`Cas::put_spool`]; the call returns once all of them are stored. A
+/// name or symlink target that is not UTF-8 fails the call with
+/// [`TreeError::NotUtf8`].
 pub async fn collect(
     cas: &impl Cas,
     upper: &Path,

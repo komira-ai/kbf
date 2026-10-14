@@ -530,6 +530,8 @@ impl<C: Cas> PodmanRuntime<C> {
             ..ActionResult::default()
         };
         let upload = async {
+            // The outputs the server lacks go through a spool in the lease's scratch
+            // directory (the daemon's, outside the container) as whole segments.
             collect(
                 cas,
                 &spec.upper,

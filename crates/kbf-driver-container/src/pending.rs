@@ -4,18 +4,25 @@
 //! The walk hashes every output file and closes it, and builds every Directory and the
 //! Tree; [`Pending::store_missing`] then asks the CAS about all of their digests in
 //! one [`Cas::missing`] (the transfer engine cuts it into FindMissing calls of
-//! `--transfer-find-missing-chunk` and sends them at once) and stores only the blobs
-//! it names, [`Cas::in_flight`] at a time. When each upload asked for itself, the
-//! walk's bound on open files (64 uploads at a time) was also the bound on the
-//! questions in a call, and the calls went one after another: 14,245 outputs the
+//! `--transfer-find-missing-chunk` and sends them at once). When each upload asked for
+//! itself, the walk's bound on open files (64 uploads at a time) was also the bound on
+//! the questions in a call, and the calls went one after another: 14,245 outputs the
 //! server mostly held took 785 s to upload.
 //!
-//! A missing file is opened again to be stored, by the names the walk took from the
+//! Only the blobs the CAS lacks are copied, [`Cas::in_flight`] at a time, into a
+//! [`Spool`] (one unlinked local file), and the spool is stored with
+//! [`Cas::put_spool`]: the transfer engine sends it as whole segments with one commit
+//! per upload (`docs/design/write-path.md`, section 4), as the native driver's
+//! outputs go, so a tree of thousands of new files is a few calls, not one ByteStream
+//! write per file. A server without segment upload gets them one write each.
+//!
+//! A missing file is opened again to be copied, by the names the walk took from the
 //! upper directory, each directory relative to its parent's descriptor with
 //! `O_NOFOLLOW`, the file too ([`FileAt::open`]). It must be the file the walk hashed
 //! (device and inode): one replaced or removed since is an error. Bytes changed in
-//! place no longer hash to the digest, and the CAS refuses them. Only the uploads in
-//! flight hold a descriptor, never the whole tree.
+//! place no longer hash to the digest, and the spool refuses them. Only the copies in
+//! flight hold a descriptor, never the whole tree, and none is open while the spool
+//! is uploaded.
 
 use std::collections::HashSet;
 use std::os::fd::OwnedFd;
@@ -23,7 +30,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use futures::{StreamExt as _, TryStreamExt as _, future, stream};
-use kbf_daemon::cas::{Cas, digest_of, label};
+use kbf_daemon::cas::{Cas, Spool, digest_of, label};
 use kbf_proto::reapi::Digest;
 use rustix::fs::Mode;
 
@@ -93,21 +100,41 @@ impl Pending {
         }
     }
 
-    /// Asks `cas` which blobs it lacks, all at once, and stores those, at most
-    /// [`Cas::in_flight`] at a time; files are opened again below `upper`. Fails with
-    /// the first blob that cannot be stored.
+    /// Asks `cas` which blobs it lacks, all at once, copies those into a [`Spool`] made
+    /// in `spools`, and stores the spool with [`Cas::put_spool`]: the transfer engine
+    /// sends it as a few whole segments with one commit each, or blob by blob to a
+    /// server without segment upload. Files are opened again below `upper`, at most
+    /// [`Cas::in_flight`] at a time ([`Pending::copy_missing`]). Fails with the first
+    /// blob that cannot be copied or stored.
     pub(crate) async fn store_missing(
         self,
         cas: &impl Cas,
         upper: &Arc<OwnedFd>,
-        _spools: &Path,
+        spools: &Path,
     ) -> Result<(), TreeError> {
         let digests: Vec<Digest> = self.blobs.iter().map(|(d, _)| d.clone()).collect();
         let missing: HashSet<String> = cas.missing(&digests).await.iter().map(label).collect();
+        let dir = spools.to_owned();
+        let spool = Arc::new(blocking(spools, move || Spool::create(&dir)).await?);
+        self.copy_missing(&missing, &*spool, upper, cas.in_flight())
+            .await?;
+        Ok(cas.put_spool(spool).await?)
+    }
+
+    /// Stores the blobs `missing` names (labels) into `into`, at most `in_flight` at a
+    /// time, so at most that many files are open; files are opened again below
+    /// `upper`. Fails with the first blob that cannot be stored.
+    async fn copy_missing(
+        self,
+        missing: &HashSet<String>,
+        into: &impl Cas,
+        upper: &Arc<OwnedFd>,
+        in_flight: usize,
+    ) -> Result<(), TreeError> {
         stream::iter(self.blobs)
             .filter(|(digest, _)| future::ready(missing.contains(&label(digest))))
-            .map(|(digest, blob)| store(cas, upper, digest, blob))
-            .buffer_unordered(cas.in_flight().max(1))
+            .map(|(digest, blob)| store(into, upper, digest, blob))
+            .buffer_unordered(in_flight.max(1))
             .try_for_each(|()| future::ready(Ok(())))
             .await
     }
@@ -133,57 +160,5 @@ async fn store(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::outputs::DIRECTORY;
-
-    /// Catches a missing file opened again without checking it is the one hashed: a
-    /// file replaced since (another inode at the name), a directory on its path
-    /// replaced by a symlink, and a file removed must each fail, not be stored as the
-    /// output. Mutants seen red: the device and inode check removed (the replaced file
-    /// opens); a symlinked directory followed.
-    #[test]
-    fn a_file_is_opened_again_only_if_it_is_the_one_hashed() {
-        let exe = std::env::current_exe().expect("test binary");
-        let dir = exe
-            .parent()
-            .expect("deps directory")
-            .join("kbf-driver-container-unit")
-            .join("pending-open");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join("upper/sub")).expect("mkdir");
-        std::fs::create_dir_all(dir.join("elsewhere")).expect("mkdir");
-        std::fs::write(dir.join("upper/sub/f"), b"hashed").expect("write");
-        let upper =
-            rustix::fs::openat(rustix::fs::CWD, dir.join("upper"), DIRECTORY, Mode::empty())
-                .expect("open upper");
-        let stat = rustix::fs::stat(dir.join("upper/sub/f")).expect("stat");
-        let at = FileAt {
-            dirs: vec!["sub".to_owned()].into(),
-            name: "f".to_owned(),
-            id: (stat.st_dev, stat.st_ino),
-            shown: dir.join("upper/sub/f"),
-        };
-        let file = at.open(&upper).expect("the file hashed");
-        assert_eq!(std::io::read_to_string(file).expect("read"), "hashed");
-        // The directory replaced by a symlink to it: the file at the end is the one
-        // hashed, but the path no longer is the action's.
-        std::fs::rename(dir.join("upper/sub"), dir.join("elsewhere/sub")).expect("move");
-        std::os::unix::fs::symlink(dir.join("elsewhere/sub"), dir.join("upper/sub"))
-            .expect("symlink");
-        let why = at.open(&upper).expect_err("a symlink on the path");
-        assert!(why.to_string().contains("removed or replaced"), "{why}");
-        std::fs::remove_file(dir.join("upper/sub")).expect("unlink");
-        std::fs::rename(dir.join("elsewhere/sub"), dir.join("upper/sub")).expect("move back");
-        at.open(&upper).expect("the file hashed, back in place");
-        // Another file renamed over it: same name, same bytes, another inode.
-        std::fs::write(dir.join("upper/sub/g"), b"hashed").expect("write");
-        std::fs::rename(dir.join("upper/sub/g"), dir.join("upper/sub/f")).expect("rename");
-        let why = at.open(&upper).expect_err("replaced");
-        assert!(why.to_string().contains("removed or replaced"), "{why}");
-        // The file removed from its directory.
-        std::fs::remove_file(dir.join("upper/sub/f")).expect("unlink");
-        let why = at.open(&upper).expect_err("removed");
-        assert_eq!(why.kind(), std::io::ErrorKind::NotFound, "{why}");
-    }
-}
+#[path = "pending_tests.rs"]
+mod tests;
