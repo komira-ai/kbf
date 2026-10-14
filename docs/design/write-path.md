@@ -1,4 +1,4 @@
-# The write path: segment upload, grouping and a local write tier (**planned**)
+# The write path: segment upload, grouping and a local write tier (**planned**; the tier is built, section 6.7)
 
 How bytes get from an upload into the store, and what an acknowledgement promises.
 Today's path is in [storage.md](storage.md#writes). Planned, none built yet: **write
@@ -416,6 +416,57 @@ floor, and the rest for lease scratch and the OS. A daemon miss for a blob stage
 that server's local tier over loopback, no object store and no LAN. On a filesystem
 with reflink (XFS, btrfs) a later step may clone the byte range into the cache file
 (`FICLONERANGE`) instead of copying it.
+
+### 6.7 As built (rollout stage 4b)
+
+The disk layer is `kbf-tier`; the rest is `kbf-front` (`cache/tier.rs`, `cache/flush.rs`)
+and `kbf-server` (`write_tier.rs`). `Cache::attach_tier` is section 6.4's start: the
+abandon flag, the `TIER` check and orphan sweep (`Tier::open` against a copy of the
+committed staged table), `AddTier` after `TIER` is synced, and each lost block marked
+`Missing`. `Cache::place_segment` stages a packed segment (reserve, write, sync,
+`PutStaged`) or PUTs it. `Cache::flush_tier` is one round of 6.1.4: `SealStaged` for
+each block `poll_seals` names, then up to four sealed objects of this tier from the
+committed state, oldest first, each re-read and checked, given its footer
+(`kbf_segments::layout::encode_footer` over the committed list), PUT at its key, its
+footer read back, `ObjectFlushed` committed, and only then renamed to `.seg`. The
+server runs a round every second. Tests: `kbf-front/tests/write_tier.rs` (the tier rows
+of section 9 except the log-format row, which stage 3 pins), `kbf-tier/tests/flushed.rs`.
+
+Where it differs from the sections above, and why:
+
+- **`--meta-log=raft` is refused with `--write-tier-dir`.** The Raft log writes format 1,
+  and the format raise is not built ([metadata-snapshots.md](metadata-snapshots.md),
+  section 4, leaves its value to the HA design). Under `--meta-log=memory` a restart
+  starts with an empty index whose writer epochs start from 1 again, so the server
+  deletes every file an earlier start left in the directory (`kbf_tier::clear`) before
+  the open: none of it is indexed, and an old block's name could be one of the new
+  start's objects. The recovery above is tested over a metadata log that outlives the
+  cache; it protects data in production once the raise lands.
+- **Grouping (stage 1) and segment uploads (stage 2) are not on this branch.** Every
+  segment `store_blobs` packs goes through `place_segment`, so each `Write` and batch
+  stages its own range of the open block; the write group calls the same function for
+  each segment it seals once both are merged. A blob over the segment limit gets a block
+  of its own (`reserve_upload`, sealed by its `PutStaged`), buffered whole as on the
+  direct path; streaming it into its block (section 6.2) is not built. A `Begin` will
+  reserve through the same `reserve_upload`.
+- **Any tier error before the commit goes direct**, not only the budget: `ENOSPC` or an
+  I/O error on create, write or sync drops the reservation (deleting an upload's block)
+  and PUTs the segment (the scenarios' question on `ENOSPC` below the budget).
+- **A read error in the flusher's re-read is retried** with the PUT backoff (1 s,
+  doubling to 60 s); only a digest mismatch marks the object `Corrupt`.
+- **Flushed copies live in what the budget leaves over.** A `.seg` is kept while the
+  staged and reserved bytes plus the copies fit `--write-tier-bytes`; a reservation
+  evicts copies, least recently read first, before it is refused. So the directory's
+  bytes stay within the budget.
+- **A new tier's id is the writer epoch of the start that registers it**: epochs are
+  allocated once each, so no id is drawn twice, and no random source is needed.
+- **The oldest unflushed age** of a block recovered at a restart counts from that
+  restart.
+- **One known gap:** a `PutStaged` whose commit applies but answers an error leaves the
+  tier's committed length below the index's; that block's flush then fails each round.
+  Only a log that can apply a command and lose the answer (the Raft log) can do it, and
+  that log is refused with the tier today; wiring the raise must also seed the length
+  from the committed state.
 
 ## 7. Expected effect on the 15,189-file upload
 

@@ -1,12 +1,5 @@
 //! The running tier: reservations, positioned writes, syncs, answers and seals.
 
-#![allow(
-    dead_code,
-    unreachable_code,
-    unused_variables,
-    reason = "red-first stand-in: the next commit implements the write tier's flusher, reads and start"
-)]
-
 use std::collections::BTreeMap;
 use std::io;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
@@ -854,7 +847,7 @@ where
             }
         };
         let Some(committed) = committed else {
-            return Err(TierError::UnknownBlock(object));
+            return self.read_seg(object, offset, len);
         };
         let end = offset.saturating_add(len as u64);
         if end > committed {
@@ -884,7 +877,6 @@ where
     }
 
     fn flushed(&self, object: ObjectId) -> Result<(), TierError> {
-        return Err(TierError::NotSealable(object));
         let mut state = self.lock();
         let extent = self.flushable(&state, object)?;
         state.blocks.remove(&object);
@@ -904,7 +896,6 @@ where
     }
 
     fn discard(&self, object: ObjectId) -> Result<(), TierError> {
-        return Ok(());
         let mut state = self.lock();
         let extent = self.flushable(&state, object)?;
         state.blocks.remove(&object);
@@ -926,11 +917,6 @@ where
     }
 
     fn unflushed(&self, now: Instant) -> Unflushed {
-        return Unflushed {
-            bytes: 0,
-            blocks: 0,
-            oldest: None,
-        };
         let state = self.lock();
         let held = state.blocks.values().filter(|b| b.committed > 0);
         let (mut bytes, mut blocks, mut oldest) = (0, 0, None::<Instant>);

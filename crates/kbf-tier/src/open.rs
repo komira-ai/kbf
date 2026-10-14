@@ -1,13 +1,6 @@
 //! Opening a tier directory: the `TIER` check, recovery of staged blocks from the
 //! committed state, and the orphan sweep (design section 6.4).
 
-#![allow(
-    dead_code,
-    unreachable_code,
-    unused_variables,
-    reason = "red-first stand-in: the next commit implements the write tier's flusher, reads and start"
-)]
-
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Instant;
 
@@ -217,7 +210,6 @@ where
 ///
 /// [`TierError::Io`].
 pub fn clear<F: Fs>(fs: &F) -> Result<Vec<String>, TierError> {
-    return Ok(Vec::new());
     let mut names = fs.list().map_err(|e| TierError::io("list", ".", e))?;
     names.sort();
     let ours = |n: &String| {

@@ -19,13 +19,6 @@
 //! - **Eviction is on committed state:** the block becomes a flushed copy
 //!   ([`kbf_tier::WriteTier::flushed`]) only after `ObjectFlushed` applied.
 
-#![allow(
-    dead_code,
-    unreachable_code,
-    unused_variables,
-    reason = "red-first stand-in: the next commit implements the write tier's flusher, reads and start"
-)]
-
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -96,7 +89,6 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         let Some(staging) = &self.tier else {
             return Ok(FlushRound::default());
         };
-        return Ok(FlushRound::default());
         let mut round = FlushRound::default();
         for object in staging.tier.poll_seals(now) {
             self.commit_tier(Command::SealStaged { object }).await?;

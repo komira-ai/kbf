@@ -2,13 +2,6 @@
 //! start that attaches `--write-tier-dir` to the cache, and the background task that
 //! seals and flushes its blocks.
 
-#![allow(
-    dead_code,
-    unreachable_code,
-    unused_variables,
-    reason = "red-first stand-in: the next commit implements the write tier's flusher, reads and start"
-)]
-
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -54,7 +47,6 @@ pub async fn attach<M: MetaLog, O: ObjectStore>(
     cache: Cache<M, O>,
     args: &Args,
 ) -> Result<(Cache<M, O>, Option<TierStartup>), WriteTierError> {
-    return Ok((cache, None));
     let Some((dir, options)) = args.write_tier()? else {
         return Ok((cache, None));
     };

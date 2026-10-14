@@ -8,13 +8,6 @@
 //! segment it packs; the write grouping of rollout stage 1 calls it for every segment
 //! a group seals, once both are on one branch.
 
-#![allow(
-    dead_code,
-    unreachable_code,
-    unused_variables,
-    reason = "red-first stand-in: the next commit implements the write tier's flusher, reads and start"
-)]
-
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -200,7 +193,7 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
                 })
                 .await
                 .map_err(CacheError::from)?;
-            for object in abandoned.iter().filter(|_| false) {
+            for object in &abandoned {
                 self.mark_unreachable(*object, UnreachableReason::Missing)
                     .await?;
             }
@@ -225,7 +218,7 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
                 other => return Err(unexpected(&other).into()),
             }
         }
-        for object in recovery.lost.iter().filter(|_| false) {
+        for object in &recovery.lost {
             tracing::error!(%object, %tier, "a staged block is missing or short; its blobs are unavailable until uploaded again");
             self.mark_unreachable(*object, UnreachableReason::Missing)
                 .await?;
@@ -255,7 +248,6 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
     /// the unflushed bytes and oldest unflushed block's age, measured now).
     #[must_use]
     pub fn render_metrics(&self) -> String {
-        return self.metrics.render();
         let mut out = self.metrics.render();
         if let Some(staging) = &self.tier {
             let usage = staging.tier.usage();
@@ -292,7 +284,6 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         own_block: bool,
     ) -> Result<Option<Vec<(Digest, Location)>>, CacheError> {
         let body = Bytes::from(writer.finish());
-        return self.put_body(body, packed).await.map(Some);
         if let Some(staging) = &self.tier
             && let Staged::Committed = self.stage(staging, body.clone(), own_block).await?
         {
@@ -366,7 +357,6 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         location: Location,
         staged_on: Option<TierId>,
     ) -> Result<Bytes, CacheError> {
-        return self.fetch_from_store(digest, location, true).await;
         if let Some(staging) = &self.tier
             && staged_on.is_none_or(|t| t == staging.id)
         {
