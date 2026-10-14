@@ -1,8 +1,19 @@
 # One server, one daemon, one process: libraries, three binaries, a shared cache
 
-Status: **proposed. Phase 0 is safe to build now; phases 1 and 2 are gated on the
-measurement in section 11.** Nothing here is built. No wire message changes in any phase:
-a remote daemon sends what it sends today, and a server accepts what it accepts today.
+Status: **proposed. Phase 0 is safe to build now. Phase 1 and 2 are gated on the
+preconditions of section 10 and the measurement of section 11.** Nothing here is built.
+No wire message changes in any phase: a remote daemon sends what it sends today, and a
+server accepts what it accepts today.
+
+**What this does and does not buy, in one paragraph.** All-in-one changes none of: Mojo
+compile time (about 97% of a cold build's time), the hard-link and ownership passes that
+bound a typical action, or the node-cache hit rate. It removes a loopback hop and a copy
+for bytes that never leave the machine, gives one binary to deploy and one CPU flag on a
+single node, and makes the farm's CPU and memory claim explicit. It costs the user
+boundary around the farm's secrets, widens a crash from one half to both, and, until the
+server's state is durable (section 10), turns a daemon crash into the loss of the whole
+index. If section 11 shows the typical action is dominated by links and ownership passes,
+the only remaining reason is operational, and this document says so here, not later.
 
 This replaces an earlier Unix-socket design for the same host (section 12). Its reviews'
 findings (transport not the measured cost; typical action not helped; the user boundary;
@@ -19,40 +30,58 @@ OOM and crash blast radius) are answered in sections 2, 7 and 11.
    |---|---|---|
    | `kbf-server` | the server only | storage nodes of the target farm |
    | `kbf-daemon` | the daemon only; data plane over gRPC | build hosts, Mac nodes, and any host whose server is elsewhere |
-   | `kbf-all-in-one` | both, in one process; data plane in-process | the one-node farm, dev boxes, small converged hosts |
+   | `kbf-all-in-one` | both, in one process; data plane in-process | the one-node farm and small converged Linux hosts. Linux only, container driver only (section 5). Not Macs, and not a typical dev box: most are Macs, which run `kbf-daemon` |
 
 3. **One data-plane interface, two implementations**: remote (today's transfer engine
    over mutual TLS) and in-process (direct calls into the server's cache and segment
    code). The daemon is generic over the interface and cannot tell which it has.
-4. **The control plane stays gRPC** (`Session`, leases, heartbeats) in every binary. In
-   all-in-one it runs over loopback, because it is small, not on the measured path, and
-   keeping it the same means one scheduler, one commit path and one set of sim
-   scenarios. An in-process control plane is not designed here and not needed.
-5. **One CPU flag**, `--reserve-cpus`, on every binary. No pinning. What the reserve does
-   not cover goes to builds (section 6).
+4. **The control plane stays gRPC** (`Session`, leases, heartbeats) in every binary, over
+   mutual TLS in all-in-one too (section 4). It is small, not on the measured path, and
+   keeping it the same means one scheduler, one commit path and one set of sim scenarios.
+   An in-process control plane is not designed here.
+5. **One CPU flag**, `--reserve-cpus`, on the Linux binaries. No pinning. What the reserve
+   does not cover goes to builds (section 6). Unset, every binary behaves exactly as it
+   does today.
 6. **One conformance suite** for the data plane, run against both implementations
    (section 8).
-7. **Measure first.** The in-flight do-less PRs (section 11) remove most of what this
-   would otherwise save. Phase 0 changes no behaviour and is worth doing regardless;
-   phases 1 and 2 each have a number that must be met.
+7. **The split binaries stay first class.** A Linux remote daemon stays connected to the
+   live farm as a canary, and CI renders and checks the split and converged shapes as
+   well as all-in-one (section 9).
+8. **Measure first.** The in-flight do-less PRs and the worker-cache link work (section
+   11) remove most of what this would otherwise save. Phase 0 changes no behaviour.
 
 ## 2. What is known, and what is not
 
 One action outputting a toolchain tree (15k files, 307 MB) spent 18.3 s in its outputs
-phase: walk 7.8 s, spool 4.3 s, upload 6.0 s, measured once on `main` before the PRs of
-section 11. The 6.0 s is about ten 32 MiB uploads sent one after another (Begin, ranges,
-Commit, which hashes, syncs the tier and commits metadata): as consistent with latency in
-series as with bandwidth, so **not shown to be transport**. The typical action differs: a
-160 to 480 MB input root (a 15k-file toolchain tree that 63% of actions share), hard
-links, per-directory fetches and ownership passes, 96% of blobs already in the node cache
-(`worker-cache.md`), tiny outputs. None of that crosses a network; an in-process plane
-does not change it. The directory cache and link plans do.
+phase: walk 7.8 s, spool 4.3 s, upload 6.0 s. That is **one measurement on `main`, before
+the PRs of section 11**; section 11 requires at least five runs with variance. The 6.0 s
+is about ten 32 MiB uploads sent one after another (Begin, ranges, Commit, which hashes,
+syncs the tier and commits metadata): as consistent with latency in series as with
+bandwidth, so **not shown to be transport**.
 
-So the case for all-in-one is not mainly speed. It is: **one binary to deploy and
-supervise on a single node, one place that decides how many CPUs builds get, one cache
-budget instead of two, and no loopback hop and no second copy of bytes that never leave
-the machine.** Section 11 says which of those must show up in numbers before phases 1
-and 2.
+The typical action differs: a 160 to 480 MB input root (a 15k-file toolchain tree that 63%
+of actions share), hard links, per-directory fetches and ownership passes, 96% of blobs
+already in the node cache (`worker-cache.md`), tiny outputs. None of that crosses a
+network; an in-process plane does not change it. The directory cache and link plans do.
+
+**All-in-one does nothing for compile time.** A build is compile CPU and memory inside a
+container; the process boundary between the server and the daemon is not on that path.
+The only effects on compiles are second-order: who gets CPU and memory under contention
+(sections 6 and 7), and the blast radius of a crash. Whether all-in-one gives compiles more
+CPU or fewer is a number to measure (M6, section 11), not an assumption: the farm's own
+processes take CPU from compiles in both shapes, and a reserve books it explicitly.
+
+**The in-process plane hashes twice.** The daemon hashes an output for `FindMissing`; the
+server's `VerifiedBlob` hashes it again on the blocking pool (`kbf-front/segments.rs`,
+`check_all`, up to a gigabyte at a time), and it must, because the server never trusts the
+daemon's claim (section 4). In process, a 307 MB output is hashed twice at one SHA-256
+rate on the same cores. What in-process saves (TLS, protobuf encode, one kernel copy) must
+exceed the cost of that second hash, or all-in-one is slower on uploads; M3 and M4 compute
+both (section 11).
+
+So the case for all-in-one is mainly operational: **one binary to deploy and supervise on
+a single node, one place that decides how many CPUs builds get, one cache budget instead
+of two, and no loopback hop and no second copy of bytes that never leave the machine.**
 
 ## 3. The crate split
 
@@ -67,25 +96,45 @@ Today (read from the tree):
   drivers and the drivers depend on `kbf-daemon`. It builds the concrete
   `Arc<Transfers>` and hands it to the container and native runtimes, which are
   generic over `kbf_transfer::Cas`.
+- `kbf-node` names `kbf-front` and `kbf-server` today only as **dev-dependencies** (its
+  start-up and binary tests). `kbf-transfer` names `kbf-front` as a dev-dependency too;
+  `kbf-front` does not depend on `kbf-transfer`.
 
 Target:
 
 | Crate | Becomes | Holds |
 |---|---|---|
-| `kbf-server` (lib) | `kbf_server::start(args, shutdown) -> ServerHandle` | store and metadata-log selection, `Cache::open`, tier attach, flusher, listeners. `ServerHandle` has the bound addresses, the `serving` future, and `data_plane()`: the `Arc<Cache>` plus the `SegmentsService` behind an adapter (section 4). The start line and `Routes` move with it. |
-| `kbf-node` (lib) | `kbf_node::start(args, data_plane, shutdown) -> NodeHandle` | everything in today's `main.rs` below argument parsing: driver and runtime setup, cgroups, cache open, the `Daemon`. Generic over `C: Cas + DataPlane`. The `--cas` flag, TLS flags and `Transfers` construction move into `RemoteDataPlane::connect(args)`. |
+| `kbf-server` (lib) | `kbf_server::start(args, shutdown) -> ServerHandle` | store and metadata-log selection, `Cache::open`, tier attach, flusher, listeners. `ServerHandle` has the bound addresses, the `serving` future, and the `Arc<Cache>` plus `SegmentsService` that `kbf-all-in-one` wraps (section 4). The start line and `Routes` move with it. |
+| `kbf-node` (lib) | `kbf_node::start(args, data_plane, shutdown) -> NodeHandle` | everything in today's `main.rs` below argument parsing: driver and runtime setup, cgroups, cache open, the `Daemon`. Generic over `C: Cas + DataPlane`. The `--cas` flag, TLS flags and `Transfers` construction move into `RemoteDataPlane::connect(args)`, which lives in `kbf-node`. Also `kbf_node::dispatch_helpers()`, the three re-exec dispatches (below). |
+| `kbf-transfer` | gains the `DataPlane: Cas` trait | no new dependency |
 | `kbf-server` (bin) | `kbf-server` | `Args::parse`, tracing, signals, `kbf_server::start`, print the start line. |
-| `kbf-node` (bin) | `kbf-daemon` | `Cli::parse`, tracing, signals, `RemoteDataPlane::connect`, `kbf_node::start`. |
-| `kbf-all-in-one` (new crate, bin) | `kbf-all-in-one` | one `Cli` flattening both argument sets, tracing, signals; `kbf_server::start`, then `kbf_node::start` with `server.data_plane()`. The only crate that depends on both libraries. |
+| `kbf-node` (bin) | `kbf-daemon` | `dispatch_helpers()`, `Cli::parse`, tracing, signals, `RemoteDataPlane::connect`, `kbf_node::start`. |
+| `kbf-all-in-one` (new crate, bin) | `kbf-all-in-one` | `dispatch_helpers()`, one `Cli` flattening both argument sets, tracing, signals; `kbf_server::start`, then `kbf_node::start` with a `LocalDataPlane` built from the server handle. **Holds `LocalDataPlane`** and the conformance suite's instantiation. The only crate that depends on both libraries. Its body is `#[cfg(target_os = "linux")]`; on any other target `main` exits with an error naming the supported shape, so the macOS CI builds it. |
 
-Rules the split keeps, each with a check:
+**Where `LocalDataPlane` lives, and why there is no cycle.** It needs `kbf-front`'s
+`Cache` and `SegmentsService` and `kbf-transfer`'s trait. Only `kbf-all-in-one` may see
+both, so it lives there. `kbf-transfer` keeps `kbf-front` as a dev-dependency only, and
+`kbf-front` never names `kbf-transfer`. The shared conformance functions are generic over
+`P: DataPlane` in `kbf-all-in-one`'s tests (a leaf, so no crate depends on it): they take a
+`RemoteDataPlane` built against an in-process server over a real connection, and a
+`LocalDataPlane` over the same server. `kbf-transfer`'s existing tests are untouched.
 
-- **Neither library depends on the other.** `kbf-server` must not name drivers; `kbf-node`
-  must not name `kbf-front` internals. Only `kbf-all-in-one` sees both, and the data plane
-  type crosses through a trait in `kbf-transfer` (section 4). `layering.rs` gains the rule
-  and a planted-edge mutant.
-- **Binary names and packaging do not change** for the first two; `kbf-all-in-one` is a
-  third artifact, signed and attested the same way.
+**Rules the split keeps, each with a check:**
+
+- **Neither library depends on the other, in normal dependencies.** `kbf-server` must not
+  name drivers; `kbf-node` must not name `kbf-front` or `kbf-server` outside
+  `[dev-dependencies]`. `layering.rs` gains the rule (normal-dependency edges only, so the
+  existing dev-dependencies stay) and a planted-edge mutant.
+- **The helper re-execs.** The per-run keeper, the native `slots` helper and the userns
+  `chown_dirs` helper are this same binary, re-executed
+  (`kbf_daemon::keeper::dispatch`, `kbf_driver_native::slots::dispatch`,
+  `kbf_driver_container::chown_dirs::dispatch` in `kbf-node/src/main.rs`). Each runs before
+  argument parsing and before any runtime or listener exists. `dispatch_helpers()` is that
+  code, called first by both `kbf-daemon` and `kbf-all-in-one` mains, so a re-executed
+  `kbf-all-in-one` never reaches clap, never opens the server's directories and never
+  starts a runtime.
+- **Packaging.** `kbf-server` and `kbf-daemon` keep their names. `kbf-all-in-one` is a
+  third artifact; section 9 names how it is installed and updated.
 - **A refactor, not a rewrite.** `kbf-node`'s `main.rs` also drops under the 1000-line
   budget. Merging `kbf-daemon` and `kbf-node` is the crate-layout question (#634).
 
@@ -101,17 +150,32 @@ that method on a small `DataPlane: Cas` trait so nothing in the daemon names `Tr
 | Bytes move | `Transfers` over one mutual-TLS HTTP/2 connection to the worker listener | function calls into the server's `Cache` and `SegmentsService` in the same process |
 | Authentication | the daemon's certificate, admitted per call by `identity.rs` | none on the wire; the daemon is constructed with the server's handle. The deny list still applies: each call is admitted for the daemon's own node id through the same `admit_call` check, so cordon and deny edits refuse the next call as they do today |
 | Integrity | the server hashes what it receives (`VerifiedBlob::new`, the per-record check in `Receiving`) | **the same functions**, called directly. The in-process plane never constructs a `VerifiedBlob` without hashing, never passes a "trusted" flag, and has no code path that skips `check` |
-| Upload ownership | `Connections` keyed by the peer `SocketAddr` | keyed by a new `Owner::Local(u64)`, one per `LocalDataPlane` (idle timeout, drop-on-close and admission release hang on it as for TCP) |
+| Upload ownership | `Connections` keyed by the peer `SocketAddr` | keyed by `Owner::Local(PlaneId)`, one fresh id per `LocalDataPlane` (idle timeout, drop-on-close and admission release hang on it as for TCP) |
 | Copies | file, spool read, protobuf encode, TLS encrypt, kernel, decrypt, decode, into the server's buffer | spool read into the server's buffer; no encode, no TLS, no kernel hop |
+
+**The control plane in all-in-one is still mutual TLS.** The daemon half dials the
+server half's listener over loopback with a node certificate issued the way any node's is,
+admitted by `identity.rs` as any node. The unit therefore holds a node key as well as the
+server's (section 7 lists both). This keeps one admission path, and it means the saving
+from dropping TLS is on the data plane only, which is where the bytes are; the control
+plane's TLS CPU (heartbeats, leases) is small and is not counted as a saving.
+
+**`Owner`.** Phase 0's one change inside `kbf-front`:
+`Connections::of(Option<SocketAddr>)` becomes `of(Owner)`, with
+`enum Owner { Peer(SocketAddr), Local(PlaneId) }` and **no empty variant**. Today a request
+with no peer address already maps to "no connection", so a handler that reads a missing
+`remote_addr` gets `None`; the new type makes that case unrepresentable in the handlers:
+the remote service constructs `Owner::Peer` from the request or answers `UNAVAILABLE`
+before any admission or ownership lookup, rather than continuing with no owner. Two local
+planes get distinct `PlaneId`s from a process counter and never alias (section 8 has the
+mutant).
 
 Why this is direct calls, not an in-memory channel: every `Segments` handler in
 `SegmentsService` is a unary `fn(&self, Request<T>) -> Result<Response<U>, Status>` over
-prost structs, so the in-process adapter builds the request struct and calls the
-handler. The struct is moved, not serialized. The `remote_addr` the handlers read to find
-an upload's owner becomes an `Owner` passed beside the request (Phase 0, the one change
-inside `kbf-front`: `Connections::of(Option<SocketAddr>)` becomes `of(Owner)`). A tonic
-`Channel` over a `duplex` pipe would keep HTTP/2 framing, protobuf and flow control, and
-save only TLS: that is the transport the project owner rejected.
+prost structs, so the in-process adapter builds the request struct and calls the handler.
+The struct is moved, not serialized. A tonic `Channel` over a `duplex` pipe would keep
+HTTP/2 framing, protobuf and flow control, and save only TLS: that is the transport the
+project owner rejected.
 
 What `LocalDataPlane` does not do: skip the server's checks, hold the cache's state
 outside the server, or let a daemon-supplied path or descriptor reach the server. It
@@ -133,8 +197,7 @@ can mean:
   entries a running lease links pinned.
 
 A packed record cannot be hard-linked: a link names a whole file. So "inputs are linked
-from the tier" cannot mean linking out of a block. What can be shared, in order of how
-much it changes:
+from the tier" cannot mean linking out of a block. What can be shared:
 
 1. **Fill from the tier without the network (phase 2a).** On a node-cache miss the
    daemon's fill reads the blob's record from the server's block or `.seg` copy through
@@ -142,21 +205,28 @@ much it changes:
    `tmp/`, and renames it into `blobs/`. The rule "only the daemon writes `blobs/`" holds
    unchanged. Saves the loopback `ReadRange`, TLS and one copy on a miss; nothing on a
    hit. Given 96% hits, expect this to matter only for cold toolchain bumps.
-2. **Outputs straight into the cache (phase 2b).** Section 6.7 of `worker-cache.md`
-   already moves an uploaded output into `blobs/` by rename when the action is dead, the
-   file is regular and `st_nlink == 1`. In all-in-one the same output is also staged on
-   the tier (the server needs its bytes in a segment for durability and flush). So the
-   output is read once for the upload and then renamed into the cache: no second download
-   on the next action that consumes it, which is the case the native-cache copy mode
-   cannot serve today. This needs the cache and the scratch directory on one filesystem,
-   as 6.7 already requires.
-3. **One budget (phase 2c).** `--cache-max-bytes` and `--write-tier-bytes` stay two
+2. **One budget (phase 2b).** `--cache-max-bytes` and `--write-tier-bytes` stay two
    limits, but all-in-one adds `--storage-max-bytes` over the filesystem they share, and
    evicts in this order when a reservation does not fit: cache entries no lease pins,
-   then flushed `.seg` copies. Unflushed tier blocks are never evicted (the existing rule),
-   and a blob present in both the cache and a `.seg` copy is held twice on disk; a
+   then flushed `.seg` copies. Unflushed tier blocks are never evicted (the existing
+   rule), and a blob present in both the cache and a `.seg` copy is held twice on disk; a
    `.seg` copy is dropped first because the cache entry is the one a lease can link. This
-   is an accounting change, not a new store.
+   is an accounting change, not a new store. **What the split binaries do with a cache
+   all-in-one populated:** the files are valid under the same lazy verify after restart
+   (`worker-cache.md` 6.8), so the split daemon reads them unchanged; the split pair does
+   not know `--storage-max-bytes`, so the two budgets can be jointly over-committed until
+   each side's own eviction runs. Section 9's rollback step therefore checks free space
+   against the sum of both limits and refuses if it does not fit.
+
+**Outputs into the cache is not a phase of this design.** An earlier draft had a phase 2b
+that moved an uploaded output into `blobs/`. `worker-cache.md` 6.7 already does that in
+every binary: when the action is dead, the output is already uploaded (its digest known),
+and the file in `upper` is regular with `st_nlink == 1`, the daemon strips its xattrs and
+ACL and renames it into `tmp/` and on into `blobs/`. The rename source is the container's
+`upper` file after the `chown 0:0` handback, not the spool copy, so it cannot race the
+upload, which reads the spool; nothing in all-in-one changes that. All-in-one forbids the
+copy mode and native driver that 6.7 declines, so there is nothing for a second mechanism
+to add. It is dropped; 6.7 serves split and all-in-one alike.
 
 **Not done:** one content-addressed file store replacing both; the tier packs records so
 one segment is one PUT and one commit. A per-blob view over packed records would be its
@@ -165,16 +235,15 @@ own document, if a measurement asks for it.
 **Ownership with one user.** Actions still cannot write the cache: in a container's user
 namespace the file's owner is unmapped (`worker-cache.md` 6.1), and the tier directory is
 never mounted. What goes is the user boundary between the tier and an escaped action;
-section 7 says what replaces it and where that stops.
+section 7 says what that costs.
 
 **Eviction.** A hard link keeps an evicted file alive for running leases, so eviction
-needs only today's pins. The shared budget in 2c is a counter both sides consult, not a
+needs only today's pins. The shared budget in 2b is a counter both sides consult, not a
 lock held across both.
 
 **Native driver:** its actions run as the daemon's user and could write the cache, so it
-never uses one (`cache.rs` already warns `native-same-uid`). All-in-one is Linux and
-container driver only; `kbf-all-in-one --driver native` is refused at start. Macs run
-`kbf-daemon`.
+never uses one (`cache.rs` already warns `native-same-uid`). `kbf-all-in-one --driver
+native` is refused at start. Macs run `kbf-daemon`.
 
 ## 6. `--reserve-cpus`
 
@@ -183,34 +252,73 @@ else belongs to builds. It is a count, not a set: nothing is pinned (`AllowedCPU
 `cpuset` stay unset, as `linux-build-host.md` says), because idle CPU should go to whoever
 can use it.
 
-**What it does, in three places, in every binary:**
+**Unset is today, bit for bit.** With `--reserve-cpus` unset the reported `cpus` is what
+`Capacity` reports now (the nearest cpuset, else every host CPU), no cgroup weight is
+written, the async runtime and the blocking and hashing pools are the ones in use today
+(the unbounded-by-CPU blocking pool does the hashing), and the start line prints
+`reserve=unset`. This is Phase 0's contract, and a test pins it (section 8). Nothing in
+this section applies until a deploy sets the flag.
 
-1. **What the scheduler sees.** The node report's `cpus` is `host CPUs - reserve`
-   (through `Capacity::within`, which already lowers `cpus` and `mem_gib`). The scheduler
-   books leases against that, so a full host leaves the reserve free.
+**Scope.** The flag is accepted on Linux only. On macOS `kbf-daemon` refuses it at start:
+a Mac daemon has no server beside it and no cgroup to weight; honouring it would lower the
+reported `cpus`, which `native-whole-machine` leases use to size the machine, and bound
+hashing to a few threads, which would slow large output uploads that today use the
+unbounded blocking pool.
+
+**What it does when set, in three places:**
+
+1. **What the scheduler sees.** The node report's `cpus` becomes `host CPUs - R` (through
+   `Capacity::within`, which already lowers `cpus` and `mem_gib`). **This is a hard
+   booking cap, not the soft weight below.** Today the converged units report every host
+   CPU (no reserve is subtracted anywhere in `linux-build-host.md` or `storage-node.md`),
+   and the farm's processes compete with builds through weights alone. Setting `R` on the
+   one-node farm therefore **lowers bookable CPUs by `R`**: it trades builds that could
+   have used idle farm CPU for a guarantee the farm is not starved. That is the point of a
+   reserve and it can cost compile throughput; section 11's M6 sets `R` from the 95th
+   percentile of the farm's measured CPU, not from the sum of today's thread counts, and
+   decides whether to set it at all.
 2. **How the process's CPU-heavy work is bounded.** Hashing, spool copy, CRC and record
    verification run on a bounded pool of `hash_threads` threads, not on the shared
-   blocking pool (which also does `fdatasync` and file I/O and may be large). The async
-   runtime's worker count is set from the reserve.
-3. **What the kernel does under contention.** The process's cgroup gets
-   `cpu.weight = cpu_weight(reserve x 1000)`, the same function that weights each lease
-   from its booked CPU (100 per core), so under load the farm's work gets about the share
-   it reserved against the leases' shares. Uncontended, nothing is capped.
+   blocking pool (which also does `fdatasync` and file I/O). The async runtime's worker
+   count is set from the share. The bound is a throttle: a large upload hashes on at most
+   `hash_threads` cores. Where that is too tight, `--hash-threads` overrides it, and the
+   expected cost is computed in M3/M4.
+3. **What the kernel does under contention. Both siblings get a weight.** The daemon's
+   delegated subtree has two children, `supervisor/` (the farm process) and `actions/`
+   (parent of every lease cgroup). Today the daemon writes `cpu.weight` only on each
+   lease, below `actions/`; nothing is written on `actions/` or `supervisor/`, so both sit
+   at the kernel default of 100. A `supervisor/` weight alone would be compared with
+   `actions/`'s default 100, not with the leases: at `R = 6` the farm would take about 86%
+   of a contended host. The design therefore writes **both**:
+   `supervisor/cpu.weight = cpu_weight(R x 1000)` and
+   `actions/cpu.weight = cpu_weight((host CPUs - R) x 1000)`, so under full contention the
+   farm gets `R / host` and builds the rest. Uncontended, nothing is capped. (This fix
+   applies to the split daemon too, and ships in Phase 0 with the flag.)
 
-**Pool sizing from the reserve `R` (initial rules; section 11 may change the constants):**
+**Pool sizing from the reserve `R`, when set (initial rules; section 11 may change the
+constants):**
 
 | Pool | `kbf-server` | `kbf-daemon` | `kbf-all-in-one` |
 |---|---|---|---|
-| Share of `R` | all of it | all of it | server `ceil(R/2)`, daemon `R - ceil(R/2)`, each at least 1; `R >= 2` required |
-| Async worker threads | `max(2, ceil(share/2))` | same | per side, same rule, on one runtime per side |
-| Hash/verify pool | `share` threads | `share` threads | one pool of `R` threads **shared**, since hashing is fungible |
+| Share of `R` | all of it | `R - colocated` (below) | server `ceil(R/2)`, daemon `R - ceil(R/2)`, each at least 1; `R >= 2` required |
+| Async worker threads | `max(2, ceil(share/2))` | same | per side, same rule, one runtime per side |
+| Hash/verify pool | `share` threads | `share` threads | **one pool per side**, each of its `share`; not one shared pool, so neither half can use the other's bound |
 | Blocking I/O pool | fixed bound, not CPU-derived | same | same |
 | `cpus` reported | not reported (no daemon) | `host - R` | `host - R` |
-| Default `R` | 4 | 2 | 6 |
 
-The defaults are placeholders to be replaced by section 11; the rule that matters is that
-the all-in-one default is the sum, so moving from split to all-in-one on one host leaves
-builds the same CPUs.
+There is **no default `R`**: it is set by the deploy from M6. Initial values to try are
+the converged units' current thread counts, but they are not defaults.
+
+**What `R` means differs by binary, and the converged split must say so.** On
+`kbf-server` it is the server's own pool size; on `kbf-daemon` it is subtracted from the
+host. In a converged split (two units, one host) the daemon's `cpus` must be
+`host - (server's R + the daemon's own R)`. `kbf-daemon` therefore gains
+`--colocated-server-cpus N` (default 0), set only by the converged rendering, and its
+flag `--reserve-cpus` is then the **host-wide** total, of which the daemon derives its own
+share as `reserve - N`. `check-units` asserts in the converged shape that the daemon's
+`--colocated-server-cpus` equals the server unit's `--reserve-cpus`, and that the total is
+below the host's CPUs. Omitting it is a FAIL, not a warning: otherwise a converged host
+silently books against `host - 2` while the farm uses more.
 
 **Overrides.** `--hash-threads`, `--async-threads` and `--blocking-threads` win over the
 derived values; the start line prints what was derived and overridden (`reserve=4 async=2
@@ -221,76 +329,155 @@ still bounded and only the kernel share is lost, which is today's behaviour.
 
 ## 7. Isolation and blast radius
 
-The previous review of this idea found four facts to answer. They are real.
+The previous review of this idea found four facts to answer. They are real, and this
+section does not claim to restore what merging removes.
 
-**The user boundary goes away.** Today `kbf-server` owns the tier (0700), the metadata
-log, the API token and the S3 key; `kbf` runs the daemon and the actions. An escape from
-an action lands as `kbf`, which cannot read those. In all-in-one one process has all of
-them, and an escape lands as the same user. This design does not claim to restore that
-boundary. It narrows the path:
+### 7.1 The user boundary and the secrets
 
-- **Rootless containers and cgroups stay the isolation of the action.** Actions run in
-  rootless Podman user namespaces with `pids.max`, memory and `cpu.weight` limits
-  (unchanged); an action cannot see the tier, the cache's write path or the process's
-  memory by anything but an escape.
-- **Secrets are not on disk readable by the build user.** In all-in-one the S3 key and
-  API token are delivered by the service manager's credential mechanism
-  (`LoadCredential=`), not environment or a file in the user's home, and the unit sets
-  `ProtectProc=invisible` and `PrivateTmp=` so a process outside the unit cannot read
-  `/proc/<pid>/environ` or the credential path. With `kernel.yama.ptrace_scope >= 1` a
-  process that is not a descendant cannot attach to the farm process. **This is a claim
-  to verify** by a probe on a farm VM (read the credential and `/proc/<pid>/mem` as the
-  same user from inside a container and from outside the unit); the doc does not assume
-  it. `check-units` asserts the unit settings.
-- **The server still verifies every digest.** A compromised daemon half of the process
-  can write only bytes whose hashes the server computes itself, so it cannot poison the
-  CAS by sending bytes under another digest. This is the property that survives merging.
-- **What it does not protect:** an escaped action running as the farm user, inside the
-  process's reach, can in principle obtain the tier and the credentials by a kernel bug.
-  The split removes that; all-in-one does not.
+**Which uid.** The unit runs as `kbf`, the user that has the Podman subuid/subgid ranges
+and runs the daemon today; rootless containers cannot be launched from `kbf-server`'s uid
+without the same setup. Everything `kbf-server` owns today (the tier at 0700, the raft and
+metadata directories, the API token, the S3 key, the server's TLS key) is therefore owned
+by `kbf`, and **readable by anything that runs as `kbf`**: the daemon half, and an action
+that escapes its container.
 
-**Memory and the out-of-memory killer.** Actions run in the `actions` cgroup with
-`memory.max` and per-lease caps, so an over-limit build is killed inside its cgroup, not by
-a global kill that may pick the farm process. The farm process sits in the supervisor leaf
-with `memory.min` (raised in all-in-one to cover the server's cache and hashing buffers)
-and `OOMScoreAdjust=` making it the last candidate: the split deployment's protection on
-a converged host (`storage-node.md`), for one process. It fails if
-`--actions-memory-max-gib` is sized so builds can use the farm's memory; `check-units`
-checks the converged host's memory sum today and refuses all-in-one when it does not hold.
+**What `ProtectProc`, `LoadCredential`, Yama and `PrivateTmp` do not do.** They do not
+narrow the same-uid case, and this document makes no claim that they do. An escaped action
+runs as the same uid. It can open `/proc/<pid>/environ` and `/proc/<pid>/mem` of the farm
+process unless the process is non-dumpable (the daemon sets `PR_SET_DUMPABLE=0`
+already, `fleet-updates-security.md` S4; the merged process keeps it, which closes
+those two paths for a non-root same-uid reader and nothing more), and a `LoadCredential=`
+file under `/run/credentials/<unit>` is readable by the unit's uid by design. Yama's
+`ptrace_scope` covers `PTRACE_ATTACH`, not reading `environ`. These settings stay in the
+unit for other reasons (hygiene against other users' processes), and `check-units` asserts
+them for that; they are not part of the isolation argument.
 
-**A daemon crash takes the server down.** One process means a panic, a failed
-assertion, a driver fd or thread exhaustion, or an abort in one half ends both. What
-softens it:
+**What an escape yields.** Every secret and every state directory the merged process
+holds, and what each is worth:
 
-- Tokio contains a panic in a spawned task (the workspace sets no `panic = "abort"`). The
-  process ends on a panic outside a task, an `abort` or the OOM killer. Phase 1 adds a
-  test that a panic in a driver task leaves the process serving.
-- Container processes are the likeliest source of resource exhaustion, and they are in
-  their own cgroup (`pids.max`, `nofile`, `nproc`), not in the farm process's.
-- Restart recovers: the server's log is durable, leases are fenced, the daemon's cache
-  rebuilds from `blobs/` (6.8). A restart costs the lease handover grace (`daemon.md`), as a
-  server restart does today.
+| Held by the all-in-one process | An escape as `kbf` yields | Where it is bounded |
+|---|---|---|
+| S3 key for the bucket | read and write of every blob and segment in the bucket | scope the key to the bucket and prefix; the server still verifies digests on read-through, but an attacker with the key can also delete or rewrite objects directly |
+| operator API token | the write API: cordon, drain, hold, cancel | audited; an operator can rotate |
+| the server's mTLS private key, trusted by every daemon including every Mac | impersonate the server to the whole fleet | by `fleet-updates-security.md` S1.3 that is a compromised `kbf-server`: it can install only sets CI signed for the pool, and cannot erase a Mac |
+| the node key for the loopback control plane | act as this node | one node |
+| the rollout credential and the client identity toward `kbf-mdm-gate`, if configured | force-update Macs (one per pool at a time) and relay signed requests | S1.3, S1.4: "one escape loses the Mac fleet" is the rating the security design gives a gate beside actions |
+| the raft and metadata directories, and the tier | rewrite the farm's state and any unflushed block (the only copy) | none; this is the integrity of the farm |
 
-The honest consequence: **in a farm with several servers, a crash of the daemon half
-restarts a server that may be the leader** and costs an election. That is why the target
-farm runs split.
+The security design (`fleet-updates-security.md` S1.3, S1.4) already treats "a large
+network-facing process" beside actions as what must not happen on a fleet that includes
+Macs. That fixes the rule:
 
-**When to use which.**
+- **`check-units` refuses an all-in-one unit that configures the MDM gate client identity
+  or a rollout credential.** A host that orders Mac rollouts runs `kbf-server` split from
+  any actions. The one-node Linux farm, which has none, may run all-in-one.
+- **Not for hostile work.** All-in-one is for first-party, authenticated clients on a
+  single node. Untrusted or multi-tenant work, any Mac fleet, and any farm whose bucket
+  also holds other tenants' data use the split shapes (table below).
+
+**What still holds.** Rootless containers and cgroups stay the isolation of the action
+(user namespace, `pids.max`, `memory.max`, `cpu.weight` per lease; the tier is never
+mounted; the cache's write path is not reachable from inside). And **the server still
+verifies every digest**: a compromised daemon half writes only bytes whose hashes the
+server computes itself, so it cannot poison the CAS under another digest. That property
+survives merging; the secrets above do not stay behind a boundary.
+
+### 7.2 Memory and the out-of-memory killer
+
+Actions run in the `actions` cgroup with `memory.max` and per-lease caps, so an over-limit
+build is killed inside its cgroup, not by a global kill that may pick the farm process. The
+farm process sits in the `supervisor/` leaf with `memory.min`, and the unit has
+`OOMScoreAdjust=` making it the last candidate after the object store.
+
+**Sizing, with a formula.** The unit's `MemoryMin=` and `supervisor/memory.min` are
+
+```text
+index_peak + write_bytes_in_flight + hash_pool x 32 MiB + tier_cache + daemon_part
+```
+
+where `index_peak` is the in-memory index under the memory log (or the raft state's
+working set under the durable log of section 10), `write_bytes_in_flight` is
+`--write-bytes-in-flight` (the server refuses to start with a segment cap above it; phase
+1 of the write path holds `Bytes` for up to four 32 MiB segments per upload, so the bound
+is what admission allows, not four), `hash_pool x 32 MiB` is the verify buffers,
+`tier_cache` is the tier's read cache, and `daemon_part` is the daemon's `256 MiB`.
+M7 supplies `index_peak` and the high-water mark; no figure is proposed here.
+
+**The ordering test changes.** `check-units` today asserts MinIO < `kbf-server` <
+`kbf-daemon` in `OOMScoreAdjust=` (-950 < -925 < -900). One process collapses the last two.
+The test is rewritten: MinIO < all-in-one < 0 (build containers), the unit's `MemoryMin=`
+equals the sum above, `kbf.slice`'s `MemoryMin=` equals MinIO's plus the unit's,
+`--actions-memory-max-gib` is `RAM - (MinIO + the unit + the OS headroom)`, and
+`--actions-memory-max-gib` is at least the largest single lease cap the pool may book
+(the compile working set from M7). The planted mutants: the ordering inverted; the slice
+sum missing the unit; a memory sum that leaves builds more than the host has.
+
+### 7.3 A crash takes both halves down, and what is lost
+
+One process means a panic outside a task, a failed assertion, an `abort`, or fd or thread
+exhaustion in one half ends both, and a restart is the only recovery. What the design does
+about each:
+
+- **Panics.** Tokio contains a panic in a spawned task (the workspace sets no `panic =
+  "abort"`). The process ends on a panic outside a task, an `abort` or the OOM killer.
+  Phase 1 adds a test that a panic in a driver task leaves the process serving. The
+  **hash/verify pool** is process-wide: a job that panics there must not lose the thread
+  or hang the callers. Each job runs under `catch_unwind` and the caller gets `INTERNAL`
+  (the same answer `check_all` gives today for a check that panicked); a test panics a
+  hash job and then hashes and uploads normally.
+- **Exhaustion in the farm process itself, which is the real risk.** Not the containers:
+  those are in the lease cgroups. The unit sets `LimitNOFILE=` from the formula
+  `4 x max connections + 2 x leases the pool may book + fixed headroom` (printed in the
+  start line), and the daemon half writes `pids.max` on **`supervisor/`** (the farm
+  process's own leaf, not the unit's, because the unit's `pids.max` would also count the
+  delegated `actions/` subtree) as `async + hash + blocking + helpers + margin` threads.
+  The blocking pool is a fixed bound, not CPU-derived. `check-units` asserts both
+  settings are present and nonzero; a test starts the process with a tiny `pids.max` and
+  asserts the pools refuse work with an error rather than spawning past it.
+- **What containers are bounded by.** Each lease cgroup's `pids.max`, `memory.max` and
+  `cpu.weight`. `nofile` and `nproc` are **rlimits, not cgroup controls**, and `nproc` is
+  counted per uid (a container's mapped subuids, not the farm's uid); this design does not
+  rely on them to bound actions.
+- **The helpers.** A keeper re-exec of `kbf-all-in-one` must not start a server: see the
+  `dispatch_helpers()` rule in section 3, and the test in section 8.
+
+### 7.4 What a restart loses
+
+**The server's log is not durable in the current deploy**, so this document does not say
+that a restart recovers. Under `--meta-log=memory` (the default, and the only mode the
+farm unit passes today) a restart forgets the CAS index, the action cache, the node
+registry and every lease, and with `--store=s3` writes under a fresh key prefix on each
+start (`deployment-topology.md`). `--meta-log=raft` is accepted but is "planned and not
+accepted yet" in `storage-node.md`'s unit, and over it a restart keeps the epoch but not
+the server's leases, so the old runs go on as orphans whose results are refused; the
+scheduler's state is not in the log.
+
+Today, a daemon crash costs one daemon. In all-in-one it restarts the process that holds
+the index. So **a durable meta-log, with the scheduler's state in it, is a precondition of
+phase 1** (section 10, P1), not a mitigation. Until then all-in-one is a development
+shape, not a production move of the live farm. With P1 met, a whole-process restart costs
+the lease handover grace (`daemon.md`) and re-reading the raft directory, as a server
+restart does.
+
+In a farm with several servers a crash of the daemon half restarts a server that may be the
+leader and costs an election. That is why the target farm runs split.
+
+### 7.5 When to use which
 
 | Use | When |
 |---|---|
-| `kbf-all-in-one` | one node, a dev box, a small farm whose actions come from authenticated first-party clients, where a restart of everything is acceptable and there is no second host to protect |
-| `kbf-server` + `kbf-daemon` on one host (converged) | several hosts, any HA servers, anything where a build host crash must not cost a leader, or where the user boundary around the credentials is wanted |
+| `kbf-all-in-one` | one Linux node, first-party authenticated clients, no gate client identity or rollout credential in the unit, a durable meta-log (P1), and a restart of everything acceptable |
+| `kbf-server` + `kbf-daemon` on one host (converged) | several hosts, any HA servers, anything where a build host crash must not cost a leader or the index, or where the user boundary around the credentials is wanted |
 | `kbf-server` and `kbf-daemon` on separate hosts | the target farm; untrusted or multi-tenant work; Mac nodes |
 
 The single binary is a deployment choice that costs isolation. A farm outgrows it by
-changing the unit, not the code.
+changing the unit, not the code, **subject to the ownership step of section 9**.
 
 ## 8. Tests: one suite, both data planes; sim coverage
 
-**A conformance suite** in `kbf-transfer` tests, written against `DataPlane` once and run
-for each implementation. `RemoteDataPlane` runs against an in-process server over a real
-connection; `LocalDataPlane` against the same server's handle.
+**A conformance suite**, written against `DataPlane` once, in `kbf-all-in-one`'s tests
+(section 3), run for each implementation. `RemoteDataPlane` runs against an in-process
+server over a real connection; `LocalDataPlane` against the same server's handle.
 
 Cases both pass: put and get of an empty blob, 1 byte, 1 MiB and one over the segment
 cap; `missing` before and after a put; a segment upload and a `read_located` of it; a
@@ -307,19 +494,33 @@ Each test names the mutant that turns it red:
 | digest mismatch refused on `LocalDataPlane`, index unchanged | the local adapter constructs `VerifiedBlob` from the caller's claim, or skips `check` |
 | deny-list edit refuses the next local call | local admission cached at construction |
 | dropped local upload releases the write budget; a stalled local upload does not starve remote ones | release missing for `Owner::Local` |
+| two `LocalDataPlane`s: dropping one's upload releases only its own, and a Commit on one cannot adopt the other's upload | both planes given the same `PlaneId` |
+| a remote request with no peer address is refused before admission | `Owner` has a "none" case that skips the lookup |
 | both planes produce the same index | one plane skips the footer or the staging commit |
 | `kbf-all-in-one` starts and an action's outputs appear in the CAS with zero TCP `PutRange` bytes | the daemon is wired to `RemoteDataPlane` by mistake |
-| `kbf-server` alone has no driver crate in its dependency tree; `kbf-node` none of `kbf-front` | `layering.rs` rule removed |
+| `kbf-server` has no driver crate, and `kbf-node` neither `kbf-front` nor `kbf-server`, in its **normal** dependency tree | `layering.rs` rule removed |
+| `kbf-all-in-one __keeper ...`, `... slots ...` and the `chown_dirs` mode run the helper and exit with its code; no listener, no server directory opened, no clap error | `dispatch_helpers()` called after argument parsing, or missing from the all-in-one `main` |
 | a panic in a driver task leaves the process serving | driver run on the farm's main task |
-| `--reserve-cpus` over the host, or `R = 1` in all-in-one, is refused | validation removed |
-| derived pool sizes match section 6 for each binary at `R` in {2, 4, 6, 16}; reported `cpus` is host minus reserve; supervisor `cpu.weight` is `cpu_weight(R x 1000)` (fake cgroup root) | all-in-one sizes each side by the whole `R`; reserve ignored by the report; weight not written |
+| a panicking hash job leaves the pool at full size and the next upload hashes | no `catch_unwind` in the pool |
+| with a tiny `supervisor/pids.max` the pools refuse work instead of spawning; `LimitNOFILE` and `pids.max` are in the unit | thread cap not written; nofile unset |
+| `--reserve-cpus` over the host, or `R = 1` in all-in-one, is refused; refused on macOS | validation removed |
+| **unset**: reported `cpus` equals today's for the same fake host, no `cpu.weight` is written, and pools equal today's | reserve applied when the flag is absent |
+| set: derived pool sizes match section 6 for each binary at `R` in {2, 4, 6, 16}; reported `cpus` is host minus `R` | all-in-one sizes each side by the whole `R`; reserve ignored by the report |
+| set, on a fake cgroup root: `supervisor/cpu.weight = cpu_weight(R x 1000)`, `actions/cpu.weight = cpu_weight((host - R) x 1000)`, **and the ratio of the two equals `R : host - R`** | weight written on `supervisor/` only (the ratio is then `R x 10 : 1`, not the reserved share) |
+| the converged rendering: the daemon's `--colocated-server-cpus` equals the server's `--reserve-cpus`; the daemon's `cpus` is `host - total` | converged daemon reports `host - 2` while the farm uses 6 |
 | native driver with all-in-one is refused | the check removed |
 | cache fill from the tier writes through `tmp/` and the rename, and a corrupted tier record is refused at the daemon's hash | fill copies straight into `blobs/`, or trusts the tier's checksum |
 | shared budget evicts unpinned cache entries, then `.seg` copies, never an unflushed block, never a pinned entry | eviction order swapped |
+| the memory sum, the OOM ordering of section 7.2 and the slice sum | each planted as in 7.2 |
+| `check-units` refuses an all-in-one unit with a gate client identity or rollout credential | the refusal removed |
 
 **Real two-process path.** `kbf-it` runs the split pair and `kbf-all-in-one` through the
 same action (multi-file output, a cache hit on a second run) and compares CAS contents.
-`deploy_units.rs` renders the all-in-one unit and runs its flags through the parser.
+`deploy_units.rs` renders the all-in-one, converged and split units and runs their flags
+through the parser, in CI on every change.
+
+**macOS CI.** `kbf-all-in-one` builds there as the stub of section 3 (its body is
+`cfg(target_os = "linux")`); a test asserts the stub exits nonzero with the message.
 
 **Simulation.** `kbf-sim-cell` has a `FakeDaemon` and a fake server on a modelled
 network. Phase 1 adds a data-plane mode to `FakeDaemon` that bypasses the network model
@@ -327,89 +528,143 @@ for bytes and keeps it for the control plane, with injectable faults (crash of t
 process between staging and answering, restart with a stale session). The existing
 properties 1 to 9 hold unchanged in both modes. Added: **A1** after any whole-process
 crash, every upload either completed whole or left nothing indexed; **A2** the final index
-of a run is equal between the network mode and the in-process mode for the same seed. The
-sim server hashes by construction, so a sim property does not test that `kbf-front` hashes;
-the digest-mismatch test above, with its mutant against the real code, does.
+of a run is equal between the network mode and the in-process mode for the same seed;
+**A3** (needs P1) after a whole-process crash and restart, the CAS index and the action
+cache equal their state at the last commit and no lease is accepted that the restart did
+not issue. The sim server hashes by construction, so a sim property does not test that
+`kbf-front` hashes; the digest-mismatch test above, with its mutant against the real code,
+does.
 
 ## 9. Deploy
 
-- Today the one-node farm runs the two units on one host (the converged shape). Phase 1
-  moves it to one `kbf-all-in-one` unit with `--reserve-cpus` replacing the two units' CPU
-  settings; reverting is restoring the two units (state, flags and wire are the same).
-- The target farm runs `kbf-server` on storage nodes and `kbf-daemon` on build hosts and
-  Macs, each with its own `--reserve-cpus`. No change from this document except the flag.
-- `kbf-deploy` gains a shape: `all-in-one`, rendering one unit. The existing `converged`
-  rendering (both units) stays. `check-units` asserts for all-in-one: the credential and
-  `ProtectProc` settings of section 7, the memory sum, `OOMScoreAdjust`, delegation,
-  no native driver, and that `--reserve-cpus` is below the host's CPUs.
-- `install-units` enables the unit; a host changes shape by an explicit step, never as a
-  side effect of an update (`kbf-updater`).
+- **Shapes.** `kbf-deploy` gains `all-in-one`, rendering one unit. The existing
+  `converged` rendering (both units) stays. `check-units` asserts for all-in-one: the
+  hygiene settings of section 7.1 (`ProtectProc`, `LoadCredential`, `PrivateTmp`), no gate
+  client identity or rollout credential, the memory sum and ordering of 7.2, `LimitNOFILE`
+  and the thread cap of 7.3, delegation, no native driver, `--reserve-cpus` below the
+  host's CPUs, and that every state directory is owned by the unit's user (below).
+- **The target farm** runs `kbf-server` on storage nodes and `kbf-daemon` on build hosts
+  and Macs, each with its own `--reserve-cpus`; the flag is the only change.
+- **Changing shape is an explicit step, with ownership.** Today `kbf-server` owns the tier
+  (0700), the raft and metadata directories and its keys; `kbf` owns the cache, the
+  scratch directory and the daemon's keys. A unit swap alone leaves each binary unable to
+  read the other's files. `install-units --shape` is the step: it refuses while either
+  unit is active, moves ownership of every directory and key listed above to the target
+  unit's user (to `kbf` for all-in-one, back to the pair for the split), checks free space
+  against the sum of `--cache-max-bytes` and `--write-tier-bytes` (section 5), writes the
+  units, and runs `check-units`, which verifies ownership and refuses a mismatch in either
+  direction. **Reverting is this step run the other way, not restoring two unit files.**
+  A host never changes shape as a side effect of an update.
+- **Installing and updating the third artifact.** `kbf-updater` installs artifacts by
+  name (`set.artifacts`, one file per name, per pool and platform), and CI builds a set
+  from every green main. `kbf-all-in-one` is a new artifact name, built and signed by the
+  same CI path (the automatic key covers unprivileged binaries only, `fleet-updates-
+  security.md` S2.2) and attested like the other two; an all-in-one host is a pool whose
+  set names `kbf-all-in-one` and not `kbf-daemon`. `set.rs` and the updater's artifact
+  list change to allow it, and a host that has `kbf-all-in-one` installed refuses a set
+  that names `kbf-daemon` for it (a shape change is the explicit step above).
+- **A rollout restarts the server that orders it.** Every daemon update on an all-in-one
+  host restarts the server. Two consequences are stated, not left to chance. (1) The
+  rollout record is durable before any node is touched (`fleet-updates.md` section 4.1),
+  but under the memory log a restart forgets it: so the rollout of an all-in-one host
+  needs P1 (a durable log holding the rollout record), and until then such a host is
+  updated by running `kbf-updater` on it by an operator, outside the rollout driver. (2)
+  `apply.rs` does not restart what it replaced today ("not done yet"); the restart and the
+  drain for all-in-one is the same unit step the daemon needs, and the all-in-one phase
+  waits on it.
+- **A canary that stays split.** While the live one-node farm runs all-in-one, at least one
+  Linux `kbf-daemon` on another host stays connected to it over the remote data plane
+  (admission, mutual TLS, `Owner::Peer`), and runs the same `kbf-it` action daily, so those
+  paths are exercised in production and not only by CI and the Macs.
 
-## 10. Migration phases
+## 10. Migration phases and preconditions
 
 **Phase 0: library seams and the shared interface. No behaviour change.** Reverts by
 `git revert`.
 
 - `kbf_server::start`/`ServerHandle` and `kbf_node::start`/`NodeHandle`; both mains thin;
-  existing tests pass unchanged.
+  `dispatch_helpers()`; existing tests pass unchanged.
 - `DataPlane: Cas` with the segment-range read; `RemoteDataPlane` wraps `Transfers`; the
-  daemon is generic over it. `Owner` in `Connections` and the handlers.
-- `--reserve-cpus` in `kbf-server` and `kbf-daemon` with the derived pools; unset by
-  default, so reported `cpus` does not change until a deploy sets it.
-- The conformance suite, for `RemoteDataPlane` only.
+  daemon is generic over it. `Owner` in `Connections` and the handlers (section 4).
+- `--reserve-cpus` and `--colocated-server-cpus` in `kbf-server` and `kbf-daemon` with the
+  derived pools and the two cgroup weights; **unset, bit-identical to today** (a test
+  proves it), so reported `cpus` does not change until a deploy sets it.
+- The conformance suite, for `RemoteDataPlane` only. The `kbf-all-in-one` crate exists as
+  the stub only, if at all.
 - Rebases onto the in-flight PRs of section 11: the contract the local plane needs is "a
   put feeds the server's incremental per-record check", not a function name.
 
-**Measurement gate (section 11).** Run on the farm after the do-less PRs land.
+**Preconditions of phase 1 (all must hold):**
+
+- **P1: a durable meta-log with the scheduler's state in it**, and the rollout record in
+  it, running on the target host. Without it a whole-process crash loses the index
+  (section 7.4).
+- **P2: the worker-cache directory cache and link plans** (`worker-cache.md`) have landed
+  and been measured, so M5 shows what is left after the real lever.
+- **P3: #653 to #656** have landed (section 11).
+- **P4: the security table of section 7.1** has been read and accepted for this host by
+  the project owner, and the host has no gate client identity or rollout credential.
+- **P5: the restart and drain step of `apply.rs`**, and the `set.rs` change of section 9.
+- **P6: the measurement gate of section 11 for phase 1.**
 
 **Phase 1: the all-in-one binary with in-process outputs.** `kbf-all-in-one`, the
-`LocalDataPlane` for puts (outputs, stdout, stderr) and gets. `kbf-deploy` shape, unit, `check-units` rules, the whole-process-crash sim
-mode, the driver-panic test. Reverts by switching the host back to the two units.
+`LocalDataPlane` for puts (outputs, stdout, stderr) and gets. `kbf-deploy` shape and the
+ownership step, unit, `check-units` rules, the whole-process-crash sim mode, the
+driver-panic and helper-dispatch tests. Reverts by the ownership step run backwards, which
+is safe only while P1 holds; before P1 a revert is also a state loss.
 
-**Phase 2: the shared cache for inputs.** 2a fill from the tier, 2b outputs renamed into
-the cache in all-in-one, 2c the shared budget, in that order, each behind its own
-`--shared-cache` flag value (`fill`, `outputs`, `budget`) so each is measured and reverted
-alone. The cache keeps its writer, its index and its restart rules.
+**Phase 2: the shared cache for inputs.** 2a fill from the tier, 2b the shared budget, in
+that order, each behind its own `--shared-cache` flag value (`fill`, `budget`) so each is
+measured and reverted alone. The cache keeps its writer, its index and its restart rules.
 
-Each phase is independently shippable; a later one does not rely on an earlier one's
-flag. No phase changes a message a remote daemon sends.
+Each phase is independently shippable; a later one does not rely on an earlier one's flag.
+No phase changes a message a remote daemon sends.
 
 ## 11. The measurement gate
 
 The PRs in flight that change this exact path: #654 (spool copy on the blocking pool, no
 CRC-32C), #655 (up to four segment uploads at once, hardware CRC), #656 (each record
 hashed as its `PutRange` arrives, so Commit hashes nothing), #653 (the `outputs phases`
-line), and the thread flags proposed alongside. Once these land, measure on the one-node
-farm and a split pair of hosts, same toolchain tree and same action:
+line), and the thread flags proposed alongside. Once these **and the worker-cache
+directory cache and link plans** land, measure on the one-node farm and on a split pair of
+hosts, same toolchain tree and same action. **Each number is at least five runs on the
+farm with variance reported, and names the box (CPU model, cores, RAM, storage).** Each
+ratio is stated against its denominator: against the split pair on the same host, or
+against the target farm; there is no DuckDB analogue, so no external number is quoted.
+
+Order: **M2 first.** If M2 shows Commit is over 70% of upload time, transport is not the
+cost, the M3 in-process arm is not written, and phase 1 is justified by the operational
+case alone, stated as such in its PR.
 
 | # | Measurement | Where it comes from |
 |---|---|---|
 | M1 | the `outputs phases` line for the 15k-file output (walk, hash, FindMissing, spool, upload) | #653, new baseline |
 | M2 | server stage timings for that upload: bytes-in, Commit split into hash, tier write, `fdatasync`, `PutStaged` | server upload-path metrics |
-| M3 | `PutRange` throughput over loopback: 16 streams, 4 MiB ranges, TCP+TLS vs a null sink vs an in-process call | `kbf-bench` (`connect.rs` exists); the in-process arm is new |
+| M3 | `PutRange` throughput over loopback: 16 streams, 4 MiB ranges, TCP+TLS vs a null sink vs an in-process call, **with the hash CPU per 15k-file output on both sides (the daemon's `FindMissing` hash and the server's `VerifiedBlob` hash) charged to the in-process arm** | `kbf-bench` (`connect.rs` exists); the in-process arm is throwaway bench code, built only if M2 allows |
 | M4 | CPU model, `sha_ni`, single-core SHA-256 and CRC-32C throughput on build hosts and storage nodes | one-off |
-| M5 | typical action: wall time split into input link, ownership passes, run, outputs; node-cache hit rate; bytes filled per action | `worker-cache.md` metrics |
-| M6 | CPU the farm's processes use (server and daemon) during a loaded hour, and the 95th percentile | process metrics, cgroup `cpu.stat` |
-| M7 | memory high-water of the server and daemon on a loaded hour | cgroup |
+| M5 | typical action, **broken into**: link syscalls (count, time), `chown-dirs` time, Directory fetch count, run, outputs; node-cache hit rate; bytes filled per action. Taken with and without the directory cache and link plans | `worker-cache.md` metrics |
+| M6 | **the farm's CPU as a percentage of host CPU** (server and daemon, mean and p95) and **compile wall time (p50, p95)** over a loaded hour, with and without `--reserve-cpus` at the proposed `R`. This is what a reserve costs the compiles | process metrics, cgroup `cpu.stat`, action timings |
+| M7 | memory high-water of the server and daemon on a loaded hour, plus the compile working set of the largest lease: the figures for the formula of 7.2 | cgroup |
 | M8 | cold-miss fills: count, bytes and time per hour on the one-node farm | cache fill metrics |
 
 **What justifies each phase** (thresholds are proposals for the project owner to set
 before the run, so the result cannot choose its own bar):
 
-- **Phase 0:** none. It is a refactor that makes the later choices cheap and the flag
-  worth having. Do it.
-- **Phase 1** needs at least one of: M3 shows TLS+framing+copy is at least 25% of M1's
-  upload time after the PRs; M6 shows the server's TLS and protobuf CPU is at least one
-  core during a loaded hour on a one-node farm; or the operational case (one unit,
-  one CPU flag) is wanted for its own sake on the one-node farm. If M2 shows Commit
-  (hash, `fdatasync`, `PutStaged`) is over 70% of upload time, transport is not the cost,
-  and phase 1 is justified by the operational case alone, stated as such.
-- **Phase 2a** needs M8 to show cold fills over a threshold of node time (proposal: 10%
-  of a host's action wall time). With 96% hits it probably does not.
-- **Phase 2b** needs M5 to show that consumed-after-produced outputs (an output that is
-  an input of a later action on the same node) are a measurable share of misses.
-- **Phase 2c** needs M7/disk accounting to show a host that runs out of one budget while
-  the other is slack.
+- **Phase 0:** none. It is a refactor that makes the later choices cheap, fixes the weights
+  of section 6, and makes the flag worth having. Do it.
+- **Phase 1**, after P1 to P5, needs at least one of: M3 shows TLS+framing+copy, **net of
+  the second hash, is at least 25% of fleet action wall time spent in uploads** (not of one
+  rare action's upload; M1's 6.0 of 18.3 s is for an action that few actions resemble);
+  M6 shows the server's TLS and protobuf CPU is at least one core during a loaded hour on a
+  one-node farm; or the operational case (one unit, one CPU flag) is wanted for its own
+  sake on the one-node farm. **If M5 shows links, ownership passes and compile time are
+  over about 80% of the typical action, the operational case is the only one, and the
+  status line and the PR say so.** If M3 shows the second hash costs more than the
+  in-process plane saves, the phase closes.
+- **Phase 2a** needs M8 to show cold fills over a threshold of node time (proposal: 10% of
+  a host's action wall time). With 96% hits it probably does not.
+- **Phase 2b** needs M7 and disk accounting to show a host that runs out of one budget
+  while the other is slack by at least 5% of the disk, repeatedly.
 
 If M1 after the PRs is under about 3 s and M5's typical action is dominated by links and
 ownership passes, close phases 1 and 2 as "not worth it" and take the topology-independent
@@ -436,16 +691,25 @@ store replacing the tier and the node cache:** discards the packed segment (one 
 metadata commit per upload). **An in-process control plane:** nothing measured points at
 it, and it would fork the scheduler's commit path from the split deployment's. **Reflink
 or `copy_file_range` into the tier:** block alignment and cross-filesystem behaviour make
-it unreliable, and copy-then-hash is TOCTOU-unsafe.
+it unreliable, and copy-then-hash is TOCTOU-unsafe. **A phase that renames outputs into
+the cache:** already `worker-cache.md` 6.7 in every binary (section 5). **One hash pool
+shared by the server and daemon halves:** removes the per-side bound the split gives;
+two pools instead (section 6). **A probe of `ProtectProc` and `LoadCredential` as a gate:**
+the claim it would test is withdrawn (section 7.1), so there is nothing to verify; the
+decision rests on the secrets table.
 
 ## 13. Open questions
 
 1. **For the project owner: the thresholds in section 11**, set before the run.
    Recommendation: as written.
-2. **Move the one-node farm to `kbf-all-in-one` in phase 1 for operational reasons
-   alone** (one unit, one CPU flag), even if M3 and M6 show no transport saving?
-   Recommendation: yes, say so in that change; it reverts by a unit change.
-3. **Is `LoadCredential` plus `ProtectProc` enough in place of the user boundary on one
-   node?** A claim with a planned probe, not a fact. Recommendation: no non-first-party
-   work on all-in-one until the probe has run and a security review has read it.
-4. **Default `--reserve-cpus`** (4, 2, 6) are placeholders until M6.
+2. **Accept the secrets table of section 7.1 for the one-node farm (P4)?** An escape from
+   a build container then yields the S3 key, the API token, the server's TLS key and the
+   state directories. Recommendation: yes for first-party work on a node with no Mac
+   gate identity, only after P1; no for anything else.
+3. **Set `--reserve-cpus` on the one-node farm at all?** Setting it lowers bookable CPUs by
+   `R` (section 6). Recommendation: decide from M6 (farm CPU as a share of the host, and
+   the compile wall time with and without); if the farm uses under a core at p95, reserve
+   that and no more.
+4. **Which of the two directions comes first for P1**: the raft meta-log accepting the
+   scheduler's state (`storage-node.md`'s planned flags), or a separate durable store?
+   Recommendation: the planned raft log, since the rollout record needs it anyway.
