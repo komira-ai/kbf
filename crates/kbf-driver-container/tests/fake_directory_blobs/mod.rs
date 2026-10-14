@@ -17,14 +17,26 @@ async fn every_directory_a_directory_output_names_is_stored() {
     let fake = Fake::new("directory-blobs");
     let mut spec = Spec::new(&image(), "unused by the fake");
     spec.outputs = vec!["out".to_owned()];
-    let script = r#"
-        set -e
-        mkdir -p "$UPPER/out/a/b" "$UPPER/out/empty"
-        echo top > "$UPPER/out/top"
-        echo mid > "$UPPER/out/a/mid"
-        echo leaf > "$UPPER/out/a/b/leaf"
-    "#;
-    let result = fake.run(1, &spec, script).await.expect("ran");
+    let steps = [
+        "mkdir",
+        "$UPPER/out/a/b",
+        ";",
+        "mkdir",
+        "$UPPER/out/empty",
+        ";",
+        "write-lines",
+        "$UPPER/out/top",
+        "top",
+        ";",
+        "write-lines",
+        "$UPPER/out/a/mid",
+        "mid",
+        ";",
+        "write-lines",
+        "$UPPER/out/a/b/leaf",
+        "leaf",
+    ];
+    let result = fake.run(1, &spec, &steps).await.expect("ran");
     assert_eq!(result.exit_code, 0);
     let out = &result.output_directories[0];
     let tree = tree(&fake.cas, out.tree_digest.as_ref());

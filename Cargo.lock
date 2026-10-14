@@ -1323,6 +1323,7 @@ dependencies = [
  "kbf-daemon",
  "kbf-front",
  "kbf-proto",
+ "kbf-testkit",
  "kbf-transfer",
  "kbf-types",
  "prost",
@@ -1742,6 +1743,7 @@ dependencies = [
 name = "kbf-testkit"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "rustix",
 ]
 
