@@ -271,7 +271,7 @@ struct Setup {
 }
 
 impl Setup {
-    fn set_up() -> Setup {
+    fn prepare() -> Setup {
         let _ = fs::remove_dir_all(SCRATCH);
         fs::create_dir_all(SCRATCH).expect("make the scratch directory");
         fs::set_permissions(SCRATCH, fs::Permissions::from_mode(0o755)).expect("chmod");
@@ -317,7 +317,7 @@ static HOST: OnceLock<Setup> = OnceLock::new();
 fn host() -> (MutexGuard<'static, ()>, &'static Setup) {
     let serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
     assert_root();
-    (serial, HOST.get_or_init(Setup::set_up))
+    (serial, HOST.get_or_init(Setup::prepare))
 }
 
 /// Applies the profile again when a test that changed this machine by hand fails, so
