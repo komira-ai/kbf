@@ -52,12 +52,6 @@ impl TouchConfig {
     };
 }
 
-impl Default for TouchConfig {
-    fn default() -> Self {
-        Self::DEFAULT
-    }
-}
-
 /// The touches recorded and not yet committed, the gate reads record under, and the
 /// flusher.
 #[derive(Debug)]
@@ -104,9 +98,6 @@ impl Touches {
     /// Adds `touch` to what the next flush commits; wakes the flusher when a batch is
     /// full. The caller holds the gate shared.
     pub(super) fn record(&self, touch: Touch) {
-        if touch.is_empty() {
-            return;
-        }
         let full = {
             let mut pending = self.lock();
             pending.blobs.extend(touch.blobs);
@@ -178,14 +169,14 @@ fn len(touch: &Touch) -> usize {
     touch.blobs.len() + touch.actions.len()
 }
 
-/// The first `n` digests of `set`, removed from it.
+/// The first `n` digests of `set` (all of them if it holds fewer), removed from it.
 fn take_first(set: &mut BTreeSet<Digest>, n: usize) -> BTreeSet<Digest> {
-    let mut taken = BTreeSet::new();
-    while taken.len() < n {
-        let Some(d) = set.pop_first() else { break };
-        taken.insert(d);
-    }
-    taken
+    let first_kept = set.iter().nth(n).copied();
+    let rest = match first_kept {
+        Some(d) => set.split_off(&d),
+        None => BTreeSet::new(),
+    };
+    mem::replace(set, rest)
 }
 
 /// Commits every pending touch, a batch at a time. The caller holds the gate (shared
