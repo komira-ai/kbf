@@ -218,21 +218,23 @@ fn a_lookup_runs_sandboxed_and_sets_or_removes_developer_dir() {
 /// Catches: a lookup missed for the node's own Xcode or for one of the others, or
 /// run other than through the sandbox program in the warm-up's own directory
 /// (here a fake that logs its lease parameter and runs the rest), the warm stopped
-/// by a lookup that fails or hangs, the directory left behind, and `xcrun` run
-/// where there is none or where the directory cannot be made.
+/// by a lookup that fails or hangs, a hung lookup not killed at the limit it was
+/// given (it then finishes and logs `late`), the directory left behind, and `xcrun`
+/// run where there is none or where the directory cannot be made.
 #[test]
 fn warm_looks_up_every_tool_for_every_xcode_sandboxed() {
     let dir = scratch("warm");
     let log = dir.join("log");
     // Logs `<DEVELOPER_DIR, empty when unset> <arguments>`; `ld` is not found, and
-    // `swift` hangs for the Xcode `/hung`.
+    // `swift` hangs for the Xcode `/hung`: past `UNTIL_KILLED`, short of `WITHIN`.
     let logged = format!("append {} ${{DEVELOPER_DIR}} $*", log.display());
     let xcrun = act_fake(
         &dir.join("xcrun"),
         &format!(
             "--find ld\t-\t{logged} ; echo --stderr not found ; exit 1\n\
-             --find swift\tDEVELOPER_DIR=/hung\t{logged} ; sleep 60\n\
-             *\t-\t{logged}\n"
+             --find swift\tDEVELOPER_DIR=/hung\t{logged} ; sleep 40 ; append {} late\n\
+             *\t-\t{logged}\n",
+            log.display()
         ),
     );
     // Logs its lease parameter and the command's TMPDIR, then runs the command.
@@ -259,7 +261,7 @@ fn warm_looks_up_every_tool_for_every_xcode_sandboxed() {
             Some(PathBuf::from("/x1")),
             Some(PathBuf::from("/hung")),
         ],
-        Duration::from_millis(500),
+        UNTIL_KILLED,
         &sandbox,
     )
     .expect("a thread");
@@ -289,8 +291,17 @@ fn warm_looks_up_every_tool_for_every_xcode_sandboxed() {
     assert!(warm(&xcrun, Vec::new(), WITHIN, &unmakeable).is_none());
 }
 
-/// How long the fake Xcodes have to answer.
-const WITHIN: Duration = Duration::from_secs(2);
+/// How long a question meant to answer has: the daemon's own limit. A hosted macOS
+/// runner has taken some 13 s to answer questions that answer at once (issue #481), so
+/// a limit of a few seconds failed Xcodes and lookups that never hung. Only a test
+/// whose fake hangs on purpose waits for a limit, and it gives [`UNTIL_KILLED`].
+const WITHIN: Duration = ANSWER_WITHIN;
+
+/// The limit in a test whose fake hangs on purpose: what hangs is killed only when it
+/// is up, so the test waits for it once, and every question there that answers must
+/// answer within it. Past the slowest answer seen on a hosted macOS runner (some 13 s,
+/// issue #481), and short of [`WITHIN`] to keep such a test short.
+const UNTIL_KILLED: Duration = Duration::from_secs(20);
 
 /// Catches (CEO decision on issue #164): a question of the survey, `xcrun`'s lookup
 /// above all (it reads and fills a cache leases can write), run outside the sandbox,
@@ -516,14 +527,15 @@ fn every_xcode_that_answers_is_found() {
     let xcrun = fake_xcrun(&dir);
     let real = std::fs::canonicalize(&apps).expect("real");
     let started = Instant::now();
-    let found = discover(&apps, xcodebuild, &xcrun, WITHIN);
+    let found = discover(&apps, xcodebuild, &xcrun, UNTIL_KILLED);
     let took = started.elapsed();
     assert!(
-        took >= WITHIN,
+        took >= UNTIL_KILLED,
         "the hung Xcode was not given its time: {took:?}"
     );
+    // Its fake sleeps for a minute, three times the limit.
     assert!(
-        took < WITHIN * 10,
+        took < UNTIL_KILLED * 2,
         "the hung Xcode was waited for: {took:?}"
     );
     let developer = |app: &str| real.join(app).join("Contents/Developer");
@@ -620,7 +632,7 @@ fn every_installed_xcode_is_reported_with_its_state() {
     );
     let probe = Probe {
         xcrun: fake_xcrun(&dir),
-        within: WITHIN,
+        within: UNTIL_KILLED,
         ..Probe::system(true)
     };
     let real = std::fs::canonicalize(&apps).expect("real");
@@ -676,7 +688,7 @@ fn every_installed_xcode_is_reported_with_its_state() {
             None,
             State::Failed,
             &format!(
-                "{} -version: no answer within 2s; killed",
+                "{} -version: no answer within {UNTIL_KILLED:?}; killed",
                 own("Xcode_hung.app")
             ),
         ),
@@ -717,7 +729,7 @@ fn every_installed_xcode_is_reported_with_its_state() {
             Some("16H1"),
             State::Failed,
             &format!(
-                "{} -license check: no answer within 2s; killed",
+                "{} -license check: no answer within {UNTIL_KILLED:?}; killed",
                 own("Xcode_slowlicence.app")
             ),
         ),
@@ -726,18 +738,18 @@ fn every_installed_xcode_is_reported_with_its_state() {
             Some("26B1"),
             State::Failed,
             &format!(
-                "{} -showComponent MetalToolchain: no answer within 2s; killed",
+                "{} -showComponent MetalToolchain: no answer within {UNTIL_KILLED:?}; killed",
                 own("Xcode_slowmetal.app")
             ),
         ),
     ];
     let started = Instant::now();
     assert_eq!(survey(&apps, &probe), want);
-    // Three Xcodes each hang for `WITHIN` on one question: one after the other would
-    // take three times that.
+    // Three Xcodes each hang until killed at `UNTIL_KILLED` on one question: one after
+    // the other would take three times that.
     let took = started.elapsed();
     assert!(
-        took < WITHIN * 2,
+        took < UNTIL_KILLED * 2,
         "the Xcodes were asked one by one: {took:?}"
     );
     let developer = |app: &str| real.join(app).join("Contents/Developer");
@@ -894,51 +906,58 @@ fn a_long_answer_is_read_whole() {
 /// pipe and only then marks it close-on-exec, so a child another thread starts in
 /// between inherits it: a hung Xcode's question then held a good Xcode's output open
 /// until it was killed, and the good one was reported as failed. Here the process
-/// leaves a child holding stdout and stderr for 8 s (four times the limit), the
-/// effect of that leak made certain: the answer is what was printed, read when the
-/// process exits.
+/// leaves a child holding stdout and stderr until the test releases it, after the
+/// answer (the effect of that leak made certain): an answer that waited for it would
+/// not come within the limit.
 #[test]
 fn an_answer_is_read_when_its_process_exits_though_another_holds_its_output() {
+    let dir = scratch("held-answer");
+    let release = dir.join("release");
     let mut command = std::process::Command::new(act());
-    command.args([
-        "spawn-child",
-        "sleep",
-        "8",
-        ";",
-        "echo",
-        "Build version 1A1",
-    ]);
-    let started = Instant::now();
-    let out = output_within(command, WITHIN, &std::env::temp_dir()).expect("answered at exit");
-    let took = started.elapsed();
-    assert!(took < WITHIN, "the held output was waited for: {took:?}");
+    command
+        .args(["spawn-child", "wait-for"])
+        .arg(&release)
+        .args([HELD_SECS, ";", "echo", "Build version 1A1"]);
+    let out = output_within(command, WITHIN, &dir);
+    std::fs::write(&release, "").expect("release");
+    let out = out.expect("answered at exit");
     assert!(out.status.success());
     assert_eq!(String::from_utf8_lossy(&out.stdout), "Build version 1A1\n");
+    kbf_outputs::remove_tree(&dir).expect("clean");
 }
+
+/// How long, in seconds, a process holding another's output waits to be released:
+/// past [`WITHIN`], so a wait for it would end in a timeout, not an answer.
+const HELD_SECS: &str = "120";
 
 /// Catches the twin of issue #481 (on native-macos, `Xcode_twin` was returned for
 /// build 16C5032a where `Xcode_good` was expected): the good Xcode's `xcodebuild`
-/// leaves a process holding its stdout and stderr past the limit, as a hung
-/// Xcode's question did when it inherited them, and the good Xcode is still the one
-/// found, ready, for its build.
+/// leaves a process holding its stdout and stderr until the test releases it, after
+/// the survey, as a hung Xcode's question did when it inherited them, and the good
+/// Xcode is still the one found, ready, for its build.
 #[test]
 fn an_xcode_whose_output_another_process_holds_is_still_found() {
     let dir = scratch("held");
     let apps = dir.join("Applications");
     let fake = fake_xcodebuild(&dir);
+    let release = dir.join("release");
     let held = dir.join("held-xcodebuild");
     std::fs::write(
         &held,
-        format!("#!/bin/sh\nsleep 8 &\nexec '{}' \"$@\"\n", fake.display()),
+        format!(
+            "#!/bin/sh\n'{}' spawn-child wait-for '{}' {HELD_SECS}\nexec '{}' \"$@\"\n",
+            act().display(),
+            release.display(),
+            fake.display()
+        ),
     )
     .expect("held fake");
     std::fs::set_permissions(&held, std::fs::Permissions::from_mode(0o755)).expect("chmod");
     link_xcodebuild(&held, &apps.join("Xcode_good.app"));
     link_xcodebuild(&fake, &apps.join("Xcode_twin.app"));
     let xcrun = fake_xcrun(&dir);
-    let started = Instant::now();
     let found = discover(&apps, Path::new(XCODEBUILD), &xcrun, WITHIN);
-    let took = started.elapsed();
+    std::fs::write(&release, "").expect("release");
     let real = std::fs::canonicalize(&apps).expect("real");
     assert_eq!(
         found,
@@ -947,7 +966,6 @@ fn an_xcode_whose_output_another_process_holds_is_still_found() {
             real.join("Xcode_good.app/Contents/Developer")
         )])
     );
-    assert!(took < WITHIN, "the held output was waited for: {took:?}");
     kbf_outputs::remove_tree(&dir).expect("clean");
 }
 
@@ -985,7 +1003,7 @@ fn a_busy_program_is_started_again_within_the_limit() {
     let limit = Duration::from_millis(300);
     let busy = output_within(std::process::Command::new(&program), limit, &dir).expect_err("busy");
     assert_eq!(busy.raw_os_error(), Some(libc::ETXTBSY));
-    assert!(started.elapsed() < WITHIN, "waited past the limit");
+    assert!(started.elapsed() < UNTIL_KILLED, "waited past the limit");
     kbf_outputs::remove_tree(&dir).expect("clean");
 }
 
