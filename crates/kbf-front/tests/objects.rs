@@ -154,7 +154,7 @@ async fn location<M: MetaLog, O: ObjectStore>(cache: &Cache<M, O>, d: Digest) ->
         .await
         .expect("query")
     {
-        BlobAnswer::Present(location) => location,
+        BlobAnswer::Present { location, .. } => location,
         other => panic!("{d} is not present: {other:?}"),
     }
 }

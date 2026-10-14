@@ -309,7 +309,7 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         let found = self
             .writer
             .query(|s| {
-                let held = |d: &Digest| matches!(s.blob(d), BlobAnswer::Present(_));
+                let held = |d: &Digest| matches!(s.blob(d), BlobAnswer::Present { .. });
                 digests
                     .iter()
                     .map(|d| is_empty_blob(d) || held(d))
@@ -329,7 +329,7 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
             return Ok(true);
         }
         self.touched(|s| match s.blob(digest) {
-            BlobAnswer::Present(_) => (true, s.touch_for([digest])),
+            BlobAnswer::Present { .. } => (true, s.touch_for([digest])),
             BlobAnswer::Unavailable | BlobAnswer::Absent => (false, Touch::default()),
         })
         .await
@@ -358,7 +358,7 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
                 let held: BTreeSet<Digest> = blobs
                     .iter()
                     .map(|b| b.digest)
-                    .filter(|d| matches!(s.blob(d), BlobAnswer::Present(_)))
+                    .filter(|d| matches!(s.blob(d), BlobAnswer::Present { .. }))
                     .collect();
                 let touch = s.touch_for(&held);
                 (held, touch)
@@ -390,7 +390,7 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         match answer {
             BlobAnswer::Absent => Err(CacheError::NotFound(*digest)),
             BlobAnswer::Unavailable => Err(CacheError::Unreachable(*digest)),
-            BlobAnswer::Present(location) => self.fetch(digest, location).await,
+            BlobAnswer::Present { location, .. } => self.fetch(digest, location).await,
         }
     }
 
@@ -474,7 +474,7 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
             .writer
             .query(|s| {
                 closure.iter().find_map(|d| match s.blob(d) {
-                    BlobAnswer::Present(_) => None,
+                    BlobAnswer::Present { .. } => None,
                     BlobAnswer::Absent => Some(ActionWriteError::Absent(*d)),
                     BlobAnswer::Unavailable => Some(ActionWriteError::Unreachable(*d)),
                 })

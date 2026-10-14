@@ -18,6 +18,10 @@
 // `machine_version`) joined format 1 before any log was written (kbf-server's
 // --meta-log=raft is the first writer, and it writes only `meta` and `bootstrap`);
 // from now on, a field or command added here is a new format.
+//
+// Format 2 is format 1 plus the write tier's metadata commands (MetaCommand fields 10
+// to 14, docs/design/write-path.md section 6.5). A format-1 reader refuses them: an
+// older binary sees an unset `oneof`, and this one refuses them under format 1.
 syntax = "proto3";
 
 package kbf.log.v1;
@@ -56,6 +60,12 @@ message MetaCommand {
     ObjectUnreachable object_unreachable = 7;
     ObjectReachable object_reachable = 8;
     Collect collect = 9;
+    // Format 2.
+    AddTier add_tier = 10;
+    PutStaged put_staged = 11;
+    SealStaged seal_staged = 12;
+    ObjectFlushed object_flushed = 13;
+    FlushConflict flush_conflict = 14;
   }
 }
 
@@ -151,6 +161,48 @@ message ObjectReachable {
 
 // Removes every blob and action entry whose retention has run out.
 message Collect {}
+
+// Registers `tier` as server `server`'s local write tier.
+message AddTier {
+  uint64 server = 1;
+  uint64 tier = 2;
+}
+
+// A record of a staged object: a blob at `offset` in the object's block.
+message StagedBlob {
+  Digest digest = 1;
+  uint64 offset = 2;
+}
+
+// One object of a PutStaged: records below `end`, synced; `seal` seals it in the same
+// commit.
+message StagedObject {
+  ObjectId object = 1;
+  uint64 end = 2;
+  bool seal = 3;
+  repeated StagedBlob blobs = 4;
+}
+
+// Records blobs synced to block files on `tier`, and marks their objects staged there.
+message PutStaged {
+  uint64 tier = 1;
+  repeated StagedObject objects = 2;
+}
+
+// Seals a staged object.
+message SealStaged {
+  ObjectId object = 1;
+}
+
+// The store holds a sealed staged object; it is no longer staged.
+message ObjectFlushed {
+  ObjectId object = 1;
+}
+
+// The store holds different bytes under a sealed staged object's key.
+message FlushConflict {
+  ObjectId object = 1;
+}
 
 // ---- Control commands: the farm machine's inputs (ha.md sections 4.2 to 4.9). ----
 

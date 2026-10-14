@@ -311,10 +311,32 @@ offset in the block is its offset in the object the block becomes (Buildbarn's
    (section 3), and a metric says so. **If the store is also down**, that fallback fails
    too: `UNAVAILABLE` until the store returns or the flusher frees space.
 
-The index gains one small table: staged objects, each with its tier, committed length,
-seal state and blob list. It holds only what has not been flushed, so it is bounded by
-the budget. `tier` is the server's tier id, committed once by `Command::AddTier
-{ server, id }` the first time a directory is opened, and written to `<dir>/TIER`.
+The index gains one small table (built: `kbf-meta`, `state/staged.rs`): staged objects,
+each with its tier, committed length, state (open, sealed, conflict) and blob list. It
+holds only what has not been flushed, so it is bounded by the budget. An object leaves
+it on `ObjectFlushed`, or on `ObjectUnreachable` (its block is not to be trusted, and
+the restart sweep deletes it). Each object that left is remembered, with the farm time
+it left, for the blob retention (`min_ttl` plus the touch quantum), so a late or retried
+`PutStaged` cannot stage it again; `Collect` forgets older ones. That is a stated
+limit, not an accident: a commit that arrives more than the retention after its object
+left would stage it again (a test pins it), and it is accepted because no forward or
+retry lives that long. `SealStaged` for an object that was never staged answers
+`NotStaged`, so a block whose every group failed to commit has nothing to seal; PR 4 must
+treat that block as an orphan for the restart sweep. `tier` is the server's
+tier id, committed once by `Command::AddTier { server, tier }` the first time a
+directory is opened, and written to `<dir>/TIER`. A server has one tier at a time:
+`AddTier` with another id is refused while that server's old tier holds a staged
+object (objects on other servers' tiers do not count; the
+abandon flag marks them unreachable first), retires the old id, and a retired id is
+never registered again.
+
+A `PutStaged` is all or nothing. Besides the refusals above, it is refused for an
+object marked unreachable or staged on another tier, an object named twice, or a record
+that ends past `end`. A `PutStaged` on a sealed object that adds nothing (every blob
+already listed, `end` within the committed length) is a retried commit and is accepted,
+so a forward retried after a sealing commit does not fail an indexed upload. A digest
+an object already lists is indexed at the listed offset, so the index never names a
+location the footer lacks.
 
 **`Fs` needs work first.** `kbf-store`'s `Fs` is one flat directory with whole-file
 `read` only (`kbf-store/src/fs.rs`). Flat block names fit it; a 128 MiB whole-file read
@@ -387,12 +409,17 @@ Crash and conflict points in the flusher:
 ### 6.5 Log format
 
 `PutStaged`, `SealStaged`, `ObjectFlushed`, `FlushConflict` and `AddTier` are new
-`kbf-log` command variants. An older binary already refuses them: an unset command
-decodes as `DecodeError::UnknownCommand` (`kbf-log/src/meta.rs`), the Raft machine
-stops on it (`kbf-server/src/raft_log/machine.rs`), and opening the log returns
-`RaftLogError::Decode` (`decoded`, `raft_log/mod.rs`). PR 2 adds a test that pins this
-for the new variants. The snapshot encoding ([metadata-snapshots.md](metadata-snapshots.md))
-gains the staged table.
+`kbf-log` command variants (built), `MetaCommand` fields 10 to 14, and they make **log
+format 2** (`kbf_log::Format::V2`), as `log.proto` requires of any added command. An
+older binary already refuses them: an unset command decodes as
+`DecodeError::UnknownCommand` (`kbf-log/src/meta.rs`), the Raft machine stops on it
+(`kbf-server/src/raft_log/machine.rs`), and opening the log returns
+`RaftLogError::Decode` (`decoded`, `raft_log/mod.rs`). This binary refuses them under
+format 1 the same way, on encode and decode; the metadata log still reads and writes
+format 1 only, so PR 4 must raise the log's format before its first `AddTier`. Tests in
+`kbf-log/tests/tier_codec.rs` and `kbf-server/tests/raft_log.rs` pin both. The snapshot
+encoding ([metadata-snapshots.md](metadata-snapshots.md)), not built yet, gains the
+staged table, the tier registry and the record of objects that left.
 
 ### 6.6 A server and a daemon on one host
 
@@ -442,7 +469,7 @@ Estimates from the measured store latency, to be measured on the pilot at each s
    Direct path only. Downloads through the transfer engine follow it.
 3. **PR 3, tier metadata**: the five commands in `kbf-meta` and `kbf-log`, the staged
    table, `BlobAnswer::Present { staged_on }`, the refusal test, snapshot encoding if
-   snapshots have landed. Nothing writes them yet.
+   snapshots have landed (they have not). Nothing writes them yet.
 4. **PR 4, the tier**: the `Fs` extension, block files, append and sync, seal, the
    flusher, local reads, eviction on committed state, upload reservations, restart
    recovery and the orphan sweep, the abandon flag, metrics. Flags: `--write-tier-dir`,

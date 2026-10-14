@@ -240,7 +240,13 @@ fn a_corrupt_mark_is_never_downgraded_to_missing() {
         },
     );
     assert_eq!(m.unreachable(object(2)), None);
-    assert_eq!(m.blob(&digest(2)), BlobAnswer::Present(in_segment(2, 2)));
+    assert_eq!(
+        m.blob(&digest(2)),
+        BlobAnswer::Present {
+            location: in_segment(2, 2),
+            staged_on: None
+        }
+    );
     assert_eq!(m.unreachable(object(3)), None);
 }
 
@@ -325,7 +331,10 @@ fn a_delayed_object_reachable_leaves_a_newer_mark() {
         assert_eq!(m.loss_mark(object(1)), None, "{name}");
         assert_eq!(
             m.blob(&digest(1)),
-            BlobAnswer::Present(in_segment(1, 1)),
+            BlobAnswer::Present {
+                location: in_segment(1, 1),
+                staged_on: None
+            },
             "{name}"
         );
     }

@@ -67,7 +67,7 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
                 BlobAnswer::Unavailable => {
                     out.insert(digest, Err(CacheError::Unreachable(digest)));
                 }
-                BlobAnswer::Present(at) => {
+                BlobAnswer::Present { location: at, .. } => {
                     let records = held.entry((at.store, at.object)).or_default();
                     records.insert(at.offset, digest);
                 }

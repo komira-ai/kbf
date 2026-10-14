@@ -193,7 +193,7 @@ async fn a_blob_is_not_reported_while_its_put_is_in_flight() {
     upload.await.expect("join").expect("upload");
     assert!(matches!(
         answer(&cache, b.digest).await,
-        BlobAnswer::Present(_)
+        BlobAnswer::Present { .. }
     ));
     assert_eq!(cache.find_missing(&[b.digest]).await.expect("find"), vec![]);
     assert_audit_clean(&cache);
@@ -278,7 +278,7 @@ async fn a_read_that_does_not_reach_the_store_marks_nothing() {
         assert!(store.script_done());
 
         assert!(
-            matches!(answer(&cache, b.digest).await, BlobAnswer::Present(_)),
+            matches!(answer(&cache, b.digest).await, BlobAnswer::Present { .. }),
             "{blip:?}"
         );
         assert_eq!(
