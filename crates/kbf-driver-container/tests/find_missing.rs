@@ -74,7 +74,7 @@ async fn a_large_tree_costs_one_find_missing_call_per_thousand_digests() {
     collect(
         &scope,
         &upper,
-        std::path::Path::new(env!("CARGO_TARGET_TMPDIR")),
+        &kbf_daemon::cpu_pool::CpuPool::new(4),
         "",
         &paths,
         OutputLimits::DEFAULT,
@@ -195,7 +195,7 @@ async fn a_large_tree_is_one_segment_upload() {
     collect(
         &scope,
         &upper,
-        std::path::Path::new(env!("CARGO_TARGET_TMPDIR")),
+        &kbf_daemon::cpu_pool::CpuPool::new(4),
         "",
         &paths,
         OutputLimits::DEFAULT,

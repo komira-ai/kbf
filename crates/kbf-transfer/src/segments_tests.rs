@@ -1,5 +1,6 @@
 //! The upload plan, the range cutting and the read coalescing, without a server.
 
+use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use kbf_segments::layout::footer_len;
@@ -7,23 +8,32 @@ use kbf_segments::{Footer, IndexEntry};
 use kbf_types::{Digest as KbfDigest, DigestFunction};
 
 use super::*;
+use crate::source::Source;
+use crate::spool::Spool;
 
-/// A spooled blob of `size` bytes at `offset` whose hash starts with `n`.
-fn spooled(n: u8, size: u64, offset: u64) -> Spooled {
+/// A blob of `size` bytes whose hash starts with `n`. Its source is empty: planning
+/// reads sizes, never bytes.
+fn record(n: u8, size: u64) -> Record {
     let mut hash = [0u8; 32];
     hash[0] = n;
     hash[31] = n.wrapping_mul(7);
-    Spooled {
+    Record {
         digest: KbfDigest::new(DigestFunction::Sha256, hash, size),
-        offset,
         crc32c: u32::from(n),
+        source: Source::Bytes(Arc::from([])),
     }
 }
 
-/// `n` blobs of `size` bytes, back to back in the spool.
-fn back_to_back(n: u8, size: u64) -> Vec<Spooled> {
-    (0..n)
-        .map(|i| spooled(i, size, u64::from(i) * size))
+/// `n` blobs of `size` bytes.
+fn back_to_back(n: u8, size: u64) -> Vec<Record> {
+    (0..n).map(|i| record(i, size)).collect()
+}
+
+/// Each piece as (first byte of the record's hash, offset into the record, length).
+fn shape(pieces: &[(Record, u64, u64)]) -> Vec<(u8, u64, u64)> {
+    pieces
+        .iter()
+        .map(|(r, at, len)| (r.digest.hash[0], *at, *len))
         .collect()
 }
 
@@ -79,11 +89,7 @@ fn a_large_output_set_is_many_small_uploads() {
 /// segment of one record, and the segment after it starts fresh.
 #[test]
 fn a_blob_over_the_segment_limit_is_a_segment_of_its_own() {
-    let records = [
-        spooled(1, 10, 0),
-        spooled(2, 5000, 10),
-        spooled(3, 10, 5010),
-    ];
+    let records = [record(1, 10), record(2, 5000), record(3, 10)];
     let uploads = plan(&records, 1000, u64::MAX, usize::MAX);
     let sizes: Vec<usize> = uploads[0].iter().map(|s| s.records.len()).collect();
     assert_eq!(sizes, [1, 1, 1]);
@@ -91,13 +97,13 @@ fn a_blob_over_the_segment_limit_is_a_segment_of_its_own() {
 }
 
 /// Catches a footer the server would refuse (unsorted, wrong offsets or length) and a
-/// range read from the wrong place in the spool: the footer parses for the segment's
-/// length and names each blob at its segment offset; ranges cover the record area in
-/// pieces that map to the spool, adjacent pieces joined.
+/// range read from the wrong blob or the wrong place in it: the footer parses for the
+/// segment's length and names each blob at its segment offset; ranges cover the record
+/// area in pieces that name the blob and the offset into it.
 #[test]
 fn footers_parse_and_ranges_map_to_the_spool() {
-    // Spool order 3, 1, 2: the footer is sorted by digest, offsets follow the spool.
-    let records = [spooled(3, 100, 0), spooled(1, 50, 500), spooled(2, 70, 550)];
+    // Order 3, 1, 2: the footer is sorted by digest, offsets follow the order given.
+    let records = [record(3, 100), record(1, 50), record(2, 70)];
     let segment = &plan(&records, u64::MAX, u64::MAX, usize::MAX)[0][0];
     let footer = Footer::parse(&segment.footer(), segment.length()).expect("parse");
     let offsets: Vec<(u8, u64)> = footer
@@ -107,10 +113,10 @@ fn footers_parse_and_ranges_map_to_the_spool() {
         .collect();
     assert_eq!(offsets, [(1, 100), (2, 150), (3, 0)]);
     assert_eq!(segment.ranges(120), [(0, 120), (120, 220)]);
-    // 0..100 is spool 0..100; 100..120 is the start of blob 1 at spool 500.
-    assert_eq!(segment.pieces(0, 120), [(0, 100), (500, 20)]);
-    // Blobs 1 and 2 are adjacent in the spool: one piece.
-    assert_eq!(segment.pieces(120, 220), [(520, 100)]);
+    // 0..100 is all of blob 3; 100..120 is the start of blob 1.
+    assert_eq!(shape(&segment.pieces(0, 120)), [(3, 0, 100), (1, 0, 20)]);
+    // 120..220 is the rest of blob 1 and all of blob 2.
+    assert_eq!(shape(&segment.pieces(120, 220)), [(1, 20, 30), (2, 0, 70)]);
 }
 
 /// Catches fills still one call per blob, or a run that passes the read limit or
@@ -242,7 +248,7 @@ async fn put_each_refuses_a_store_that_answers_another_digest() {
         .await
         .expect("spooled");
     truthful.put(vec![7; (1 << 20) + 5]).await.expect("spooled");
-    put_each(&lying, &truthful)
+    put_each(&lying, truthful.outgoing())
         .await
         .expect("the store answered each digest");
     assert_eq!(
@@ -253,7 +259,9 @@ async fn put_each_refuses_a_store_that_answers_another_digest() {
     lying.lie.store(true, Ordering::SeqCst);
     let spool = Arc::new(Spool::create(&dir).expect("spool"));
     let digest = spool.put(b"an output".to_vec()).await.expect("spooled");
-    let failed = put_each(&lying, &spool).await.expect_err("another digest");
+    let failed = put_each(&lying, spool.outgoing())
+        .await
+        .expect_err("another digest");
     assert_eq!(
         failed,
         CasError::Corrupt(

@@ -99,10 +99,11 @@ async fn no_output_file_is_open_while_the_stores_are_slow() {
     let before = open_descriptors();
     let mut result = ActionResult::default();
     let paths = ["out".to_owned()];
+    let pool = kbf_daemon::cpu_pool::CpuPool::new(4);
     let walk = collect(
         &cas,
         &upper,
-        std::path::Path::new(env!("CARGO_TARGET_TMPDIR")),
+        &pool,
         "",
         &paths,
         OutputLimits::DEFAULT,

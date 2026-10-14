@@ -1785,6 +1785,7 @@ dependencies = [
  "kbf-proto",
  "kbf-segments",
  "kbf-types",
+ "rustix",
  "sha2 0.11.0",
  "thiserror",
  "tokio",
