@@ -265,7 +265,10 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
     /// store. An object staged when the query ran is never marked unreachable by a
     /// read that does not find it in the store (it is not there yet); a staged record
     /// that fails its digest on the local disk marks it corrupt (the local copy is the
-    /// only one). A blob staged on another server's tier is not read here.
+    /// only one): its block first takes no more ranges (a `PutStaged` into a marked
+    /// object is refused), and once the mark committed a sealed block is deleted (one
+    /// still sealing is left to the next start's sweep). A blob staged on another
+    /// server's tier is not read here.
     pub(super) async fn fetch_answer(
         &self,
         digest: &Digest,
@@ -278,8 +281,10 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
             match self.read_local(staging, digest, location).await {
                 Local::Read(bytes) => return Ok(bytes),
                 Local::Damaged if staged_on.is_some() => {
+                    staging.tier.close(location.object);
                     self.mark_unreachable(location.object, UnreachableReason::Corrupt)
                         .await?;
+                    let _ = staging.tier.discard(location.object);
                     return Err(CacheError::Unreachable(*digest));
                 }
                 Local::Damaged | Local::Absent => {}

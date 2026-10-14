@@ -103,9 +103,11 @@ pub struct TierSeen {
     pub staged_acks: u64,
     pub staged: BTreeSet<ObjectId>,
     /// Uploads the tier did not take at its budget (backpressure), and after a disk
-    /// error (`ENOSPC`); both went down the direct path.
+    /// error; both went down the direct path. Of the disk errors, those the disk
+    /// answered as full (`ENOSPC`, [`std::io::ErrorKind::StorageFull`]).
     pub full: u64,
     pub disk_errors: u64,
+    pub no_space: u64,
     /// `PutStaged` commits refused by the state machine (never expected).
     pub refused: Vec<String>,
     /// `SealStaged` commits, objects flushed, failed flush attempts.
@@ -122,15 +124,24 @@ pub struct TierSeen {
     pub flips_missed: u64,
     /// Reads answered with the right bytes; of them, those served by the store after
     /// the local copy the index answer implied (a staged block, or a copy flushed by
-    /// this start) was gone; reads of damaged local bytes refused.
+    /// this start) was gone; reads of damaged local bytes refused. Of the reads with
+    /// the right bytes, those that found the object's flush PUT outstanding (scenario
+    /// 17; the commit and the rename after it run in one step here, so no read lands
+    /// between them).
     pub reads: u64,
     pub fallbacks: u64,
     pub refused_damaged: u64,
-    /// Reads whose local copy failed with an I/O error and that the store could not
-    /// serve either (the blob was staged): unavailable for now, not lost.
+    pub reads_in_flush: u64,
+    /// Staged objects a read found a damaged record in, marked `Corrupt` by it, as
+    /// `kbf-front`'s `fetch_answer` marks them (the local block is the only copy).
+    pub marked_on_read: Vec<ObjectId>,
+    /// Reads whose local copy failed with an I/O error a planted fault caused and that
+    /// the store could not serve either (the blob was staged): unavailable for now,
+    /// not lost.
     pub read_errors: u64,
-    /// Reads of a blob the index answered present that found its bytes nowhere, or
-    /// found other bytes (invariant A).
+    /// Reads of a blob the index answered present that found its bytes nowhere, found
+    /// other bytes, or whose local read failed with an I/O error no planted fault
+    /// caused (invariant A: `kbf-front` would answer an acknowledged blob unavailable).
     pub unread: Vec<String>,
     /// Each crash at a tier point.
     pub cuts: Vec<TierCut>,
@@ -145,12 +156,13 @@ pub(super) struct Read {
     digest: Digest,
     location: Location,
     /// Whether a local copy was there when the index answered: staged, or flushed by
-    /// this start (a copy that may be evicted before the read).
+    /// this start (a copy that may be evicted before the read). Of them, staged.
     local: bool,
+    staged: bool,
     /// Whether the local copy was gone when it was read.
     missed: bool,
-    /// Whether the local read failed with an I/O error (an injected disk fault): the
-    /// read is unavailable, not lost.
+    /// Whether the local read failed with an I/O error a planted disk fault caused:
+    /// the read is unavailable, not lost.
     failed: bool,
 }
 
@@ -369,26 +381,19 @@ impl Server {
                 self.seen.tier.full += 1;
                 return false;
             }
-            Err(_) => {
-                self.seen.tier.disk_errors += 1;
-                return false;
-            }
+            Err(e) => return self.disk_error(&e),
         };
         self.note_usage(tier.usage());
         let object = reservation.object();
-        if tier.write(&reservation, 0, &bytes).is_err() {
-            self.seen.tier.disk_errors += 1;
-            return false;
+        if let Err(e) = tier.write(&reservation, 0, &bytes) {
+            return self.disk_error(&e);
         }
         if self.reach_tier(now, TierPoint::AfterAppend, Some(object)) {
             return true;
         }
         let synced = match tier.sync(reservation) {
             Ok(synced) => synced,
-            Err(_) => {
-                self.seen.tier.disk_errors += 1;
-                return false;
-            }
+            Err(e) => return self.disk_error(&e.error),
         };
         if self.reach_tier(now, TierPoint::AfterSync, Some(object)) {
             return true;
@@ -433,6 +438,14 @@ impl Server {
         });
         self.reach_tier(now, TierPoint::Acked, Some(object));
         true
+    }
+
+    /// Records a disk error that sent an upload down the direct path: `false`.
+    fn disk_error(&mut self, e: &TierError) -> bool {
+        let full = matches!(e, TierError::Io { source, .. } if source.kind() == std::io::ErrorKind::StorageFull);
+        self.seen.tier.disk_errors += 1;
+        self.seen.tier.no_space += u64::from(full);
+        false
     }
 
     /// One round of the flusher at `now`.
@@ -617,6 +630,7 @@ impl Server {
                 digest,
                 location,
                 local: staged_on.is_some() || flushed,
+                staged: staged_on.is_some(),
                 missed: false,
                 failed: false,
             };
@@ -625,54 +639,95 @@ impl Server {
         }
     }
 
-    /// A read's time has come: from the tier, else from the store.
+    /// A read's time has come: from the tier, else from the store. As `kbf-front`'s
+    /// `fetch_answer`: a staged record that fails its digest marks the object
+    /// `Corrupt`; a flushed copy that does, or a local read that fails, reads the store.
     pub(super) fn read_due(&mut self, now: FarmTime, tag: u64) {
         // Down, or a read of an earlier start: nothing to read.
         let attached = self.up.as_mut().and_then(|up| up.tier.as_mut());
-        let Some((tier, read)) =
-            attached.and_then(|t| Some((Arc::clone(&t.tier), t.reads.remove(&tag)?)))
-        else {
+        let Some((tier, read, in_flush)) = attached.and_then(|t| {
+            let read = t.reads.remove(&tag)?;
+            let in_flush = t.flushing.values().any(|o| *o == read.location.object);
+            Some((Arc::clone(&t.tier), read, in_flush))
+        }) else {
             return;
         };
         let Read {
             digest, location, ..
         } = read;
         let len = usize::try_from(digest.size_bytes).unwrap_or(usize::MAX);
-        match tier.read(location.object, location.offset, len) {
-            Ok(bytes) => {
-                // The right bytes, or a damaged record refused; other bytes break A.
-                let good = bytes == content(&digest);
+        let met = self.tier_disk.faults_met();
+        // Whether the store is asked, and whether a planted fault failed the local read.
+        let (ask_store, failed) = match tier.read(location.object, location.offset, len) {
+            Ok(bytes) if bytes == content(&digest) => {
+                self.seen.tier.reads += 1;
+                self.seen.tier.reads_in_flush += u64::from(in_flush);
+                return;
+            }
+            Ok(_) => {
+                // Damaged bytes, refused; any other bytes break A.
                 let damaged = self.seen.tier.damaged.contains(&location.object);
-                self.seen.tier.reads += u64::from(good);
-                self.seen.tier.refused_damaged += u64::from(!good && damaged);
+                self.seen.tier.refused_damaged += u64::from(damaged);
                 let at = now.as_millis();
                 let other = format!(
                     "{digest:?} read other bytes from {} at {at} ms",
                     location.object
                 );
-                self.seen
-                    .tier
-                    .unread
-                    .extend((!good && !damaged).then_some(other));
+                self.seen.tier.unread.extend((!damaged).then_some(other));
+                // A staged record is refused; a flushed copy's is read from the store.
+                let staged = read.staged;
+                let _ = staged.then(|| self.mark_corrupt_on_read(&tier, location.object));
+                (!staged, false)
             }
-            Err(e) => {
-                let read = Read {
-                    missed: true,
-                    failed: matches!(e, TierError::Io { .. }),
-                    ..read
-                };
-                self.tier_mut().reads.insert(tag, read);
-                let msg = Msg::Get {
-                    object: location.object,
-                    digest,
-                    tag,
-                };
-                self.out.push(Output::Send {
-                    to: self.store.clone(),
-                    msg,
-                });
+            Err(TierError::Io { .. }) => {
+                let injected = self.tier_disk.faults_met() > met;
+                let at = now.as_millis();
+                let bug = format!(
+                    "{digest:?} in {}: the local read failed at {at} ms, and no planted fault failed it",
+                    location.object
+                );
+                self.seen.tier.unread.extend((!injected).then_some(bug));
+                (true, injected)
             }
+            Err(_) => (true, false),
+        };
+        if !ask_store {
+            return;
         }
+        let read = Read {
+            missed: true,
+            failed,
+            ..read
+        };
+        self.tier_mut().reads.insert(tag, read);
+        let msg = Msg::Get {
+            object: location.object,
+            digest,
+            tag,
+        };
+        self.out.push(Output::Send {
+            to: self.store.clone(),
+            msg,
+        });
+    }
+
+    /// A read found a damaged record in staged `object`: its block takes no more
+    /// ranges, it is marked `Corrupt` (its block is the only copy), the block is
+    /// deleted if sealed, and the read is refused.
+    fn mark_corrupt_on_read(&mut self, tier: &Tier<FaultFs>, object: ObjectId) {
+        tier.close(object);
+        let mark = Command::ObjectUnreachable {
+            object,
+            reason: UnreachableReason::Corrupt,
+        };
+        let up = self.up.as_mut().expect("reading while up");
+        let marked = up.commit(&self.out, mark);
+        let marked = marked.filter(|a| *a == Applied::Marked(Ok(())));
+        let marked = marked.map(|_| {
+            let _ = tier.discard(object);
+            object
+        });
+        self.seen.tier.marked_on_read.extend(marked);
     }
 
     /// The store's answer to a read the tier could not serve.

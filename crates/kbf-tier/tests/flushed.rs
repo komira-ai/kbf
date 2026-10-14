@@ -103,6 +103,39 @@ fn a_discarded_block_is_deleted_and_stops_counting() {
     ));
 }
 
+/// Catches: a closed block that takes more ranges (verifier follow-up: a `PutStaged`
+/// into an object marked unreachable while its block was open is refused, so every
+/// upload grouped into it would fail until the seal delay), a close that never lets
+/// the block seal, and a close of a block other than the open one.
+#[test]
+fn a_closed_block_takes_no_more_ranges_and_seals() {
+    let fs = FaultFs::new();
+    let mut index = Index::default();
+    let now = Instant::now();
+    let (tier, _) = open_tier(&fs, 1, options(1 << 20, LIMIT), &index).unwrap();
+    let upload = ack_upload(&tier, &mut index, &bytes(1, 10)).unwrap();
+    let (object, _) = ack_group(&tier, &mut index, &bytes(2, 10), now).unwrap();
+    tier.close(upload);
+    let (same, _) = ack_group(&tier, &mut index, &bytes(3, 10), now).unwrap();
+    assert_eq!(
+        same, object,
+        "closing another block leaves the open one open"
+    );
+    tier.close(object);
+    assert_eq!(
+        tier.poll_seals(now),
+        [object],
+        "sealed at once, not after the delay"
+    );
+    let (next, _) = ack_group(&tier, &mut index, &bytes(4, 10), now).unwrap();
+    assert_ne!(next, object, "a closed block took a range");
+    index.seal(object);
+    tier.sealed(object).unwrap();
+    tier.discard(object).unwrap();
+    assert_eq!(fs.contents(&block_name(object)), None);
+    assert_eq!(tier.usage().used, 20, "the upload's block and the new one");
+}
+
 /// Catches: a restart that forgets its flushed copies (they would fill the disk
 /// uncounted) or deletes them as orphans, and one that keeps more than the budget.
 #[test]

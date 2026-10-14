@@ -24,15 +24,18 @@ fn count(swept: &Sweep, met: impl Fn(&RunReport) -> bool) -> usize {
 }
 
 /// The tier with only the network's faults: uploads are staged and acknowledged from
-/// the tier, blocks are sealed and flushed, reads are served, nothing is left staged
+/// the tier, blocks are sealed and flushed, reads are served, some of them while
+/// their object's flush PUT is outstanding (scenario 17), nothing is left staged
 /// (13), and a binary that runs only machine version 1 refuses the log at the raise,
 /// before any tier command, while this one opens it again to the same staged table
-/// (scenario 30).
+/// (scenario 30). No tier disk fault is planted, so every local read error is a bug
+/// the run reports (property 8), never "unavailable for now".
 ///
 /// Catches a log that is never raised (mutant "the machine keeps format 1": no
 /// `PutStaged` commits, so nothing is staged), a flusher that never runs, and a
 /// rollback that opens a raised log (mutant "a version past what this binary runs is
-/// skipped").
+/// skipped"). The read check catches a tier whose reads fail where no fault was
+/// planted (verifier mutant "a partial read of a staged block answers an I/O error").
 #[test]
 fn the_tier_stages_flushes_and_refuses_a_rollback() {
     let swept = swept(Kind::TierCalm, 16);
@@ -41,6 +44,7 @@ fn the_tier_stages_flushes_and_refuses_a_rollback() {
         assert!(r.tier.staged_acks > 0, "nothing staged: {at}");
         assert!(!r.tier.flushed.is_empty(), "nothing flushed: {at}");
         assert!(r.tier.reads > 0, "nothing read: {at}");
+        assert_eq!(r.tier.read_errors, 0, "{at}");
         let rollback = r.rollback.as_ref().expect("the server is up at the end");
         let raised = rollback.raised_at.expect("the log was raised");
         let first = rollback.first_tier_command.expect("a tier command");
@@ -50,6 +54,11 @@ fn the_tier_stages_flushes_and_refuses_a_rollback() {
         assert!(refused.starts_with(&at_raise), "seed {seed}: {refused}");
         assert!(rollback.reopened, "seed {seed}: {rollback:?}");
     }
+    let in_flush = count(&swept, |r| r.tier.reads_in_flush > 0);
+    assert!(
+        in_flush >= 2,
+        "{in_flush} of 16 seeds read during a flush PUT"
+    );
 }
 
 /// One crash at `point`, going `down`, over `seeds` seeds: the crash fired in most of
@@ -196,23 +205,39 @@ fn a_store_outage_fills_the_tier_then_pushes_back() {
 ///
 /// Catches a write error swallowed (mutant "`write` answers `Ok` when the disk
 /// refused": the range is synced and acknowledged without its bytes, property 8),
-/// and faults that never met a write or a flush (a test that proves nothing).
+/// and faults that never met a write or a flush (a test that proves nothing). Even
+/// seeds plant `ENOSPC` and odd seeds I/O errors; each half is counted on its own,
+/// so a full disk that never fires (verifier mutant "`Fault::NoSpace` fails
+/// nothing") goes red even while the I/O errors still meet writes.
 #[test]
 fn a_full_disk_sends_writes_direct_and_loses_nothing() {
     let swept = swept(Kind::TierDiskFull, 32);
-    let met = count(&swept, |r| r.tier.disk_errors > 0);
-    assert!(met >= 8, "{met} of 32 seeds met a full disk on a write");
+    let even = |seed: u64| seed.is_multiple_of(2);
+    let met = |full: bool| {
+        let half = swept.reports.iter().filter(|(seed, _)| even(*seed) == full);
+        half.filter(|(_, r)| r.tier.disk_errors > 0).count()
+    };
+    let (full, failing) = (met(true), met(false));
+    assert!(full >= 4, "{full} of 16 even seeds met a full disk");
+    assert!(failing >= 4, "{failing} of 16 odd seeds met a disk error");
+    for (seed, r) in &swept.reports {
+        let want = if even(*seed) { r.tier.disk_errors } else { 0 };
+        assert_eq!(r.tier.no_space, want, "seed {seed}: ENOSPC told apart");
+    }
     let retried = count(&swept, |r| r.tier.reread_failures > 0);
     assert!(retried > 0, "no flush met a failed re-read");
 }
 
 /// A bad sector in a staged block before its flush (scenario 14): the flusher's
-/// re-read finds the damaged record, the object is marked corrupt and never PUT, its
-/// blobs answer unavailable (never absent), and no read serves the damaged bytes.
+/// re-read, or a read before it, finds the damaged record (as `kbf-front`'s flusher
+/// and `fetch_answer` do), the object is marked corrupt and never PUT, its blobs
+/// answer unavailable (never absent), and no read serves the damaged bytes.
 ///
 /// Catches a flusher that uploads without checking the records (mutant "the check
-/// passes every record": the damaged object reaches the store), and a bad sector that
-/// never landed in a block (a test that proves nothing).
+/// passes every record": the damaged object reaches the store), a bad sector that
+/// never landed in a block (a test that proves nothing), and a read that marks an
+/// object whose block stays open (`kbf-front` before `WriteTier::close`: the next
+/// grouped `PutStaged` is refused, property 9).
 #[test]
 fn a_bad_block_is_marked_corrupt_and_never_flushed() {
     let swept = swept(Kind::TierBadBlock, 32);
@@ -220,11 +245,18 @@ fn a_bad_block_is_marked_corrupt_and_never_flushed() {
     for (seed, r) in &swept.reports {
         for object in &r.tier.damaged {
             damaged += 1;
-            assert!(r.tier.corrupt.contains(object), "seed {seed}: {object}");
+            let marked = r.tier.corrupt.contains(object) || r.tier.marked_on_read.contains(object);
+            assert!(marked, "seed {seed}: {object}");
             assert!(!r.tier.flushed.contains(object), "seed {seed}: {object}");
         }
     }
     assert!(damaged >= 16, "{damaged} of 32 seeds damaged a block");
+    // Both sides of `kbf-front` find damage: some objects a read marked first, the
+    // others the flusher's re-read.
+    let on_read: usize = swept.each().map(|r| r.tier.marked_on_read.len()).sum();
+    let by_flush: usize = swept.each().map(|r| r.tier.corrupt.len()).sum();
+    assert!(on_read >= 4, "{on_read} objects marked by a read");
+    assert!(by_flush >= 4, "{by_flush} objects marked by the flusher");
 }
 
 /// A budget that holds little beyond the staged blocks (scenario 16): flushed copies
