@@ -94,7 +94,8 @@ impl Planned {
             .map(|(s, offset)| IndexEntry {
                 digest: s.digest,
                 offset: *offset,
-                crc32c: s.crc32c,
+                // The server computes its own and ignores this one (write-path.md, 4.1).
+                crc32c: 0,
             })
             .collect();
         entries.sort_by_key(|e| e.digest);

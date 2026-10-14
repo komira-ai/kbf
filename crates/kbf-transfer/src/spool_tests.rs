@@ -126,3 +126,45 @@ async fn chunks_for_a_digest_that_is_not_sha256_are_refused() {
     );
     assert!(spool.records().is_empty());
 }
+
+/// Catches hashing on the task that polls the copy (mutant: `hasher.update` back
+/// inline in `write_chunks`): with one runtime thread, a 128 MiB chunk is hashed and
+/// written while a timer task keeps ticking every 2 ms; hashing on the blocking pool
+/// leaves the thread free, so no tick is later than 40 ms, where hashing inline holds
+/// it for the whole hash (about 90 ms at 1.5 GB/s with SHA-NI, 0.9 s without).
+#[tokio::test]
+async fn hashing_a_chunk_does_not_hold_the_polling_thread() {
+    let mut bytes = vec![0u8; 128 << 20];
+    for (i, b) in bytes.iter_mut().enumerate() {
+        *b = (i % 251) as u8;
+    }
+    let digest = kbf_segments::sha256(&bytes);
+    let spool = spool_over(
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(scratch_file("stall"))
+            .expect("open"),
+    );
+    let worst = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let ticker = {
+        let worst = Arc::clone(&worst);
+        tokio::spawn(async move {
+            loop {
+                let before = std::time::Instant::now();
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                let late = u64::try_from(before.elapsed().as_millis()).unwrap_or(u64::MAX);
+                worst.fetch_max(late, std::sync::atomic::Ordering::Relaxed);
+            }
+        })
+    };
+    tokio::task::yield_now().await;
+    let chunks = Box::pin(stream::iter([Ok(bytes)]));
+    spool
+        .put_chunks(to_proto(&digest), chunks)
+        .await
+        .expect("put");
+    ticker.abort();
+    let worst = worst.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(worst < 40, "a tick was {worst} ms late: the poll was held");
+}

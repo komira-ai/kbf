@@ -235,7 +235,7 @@ stores its outputs that way. Where the code differs from the text below:
 3. `kbf.worker.v1.Segments/Begin { segments: [{ length, footer }] }` opens an upload
    and returns its id. The server refuses a footer that does not parse, an entry past
    `index_offset`, overlapping records, or a total over the caps of section 4.2. It
-   keeps each entry's (hash, size, offset) and ignores the daemon's crc32c.
+   keeps each entry's (hash, size, offset) and ignores the daemon's crc32c (the daemon sends 0).
 4. `Segments/PutRange { upload, segment, offset, bytes }` calls carry the record bytes,
    up to `--segment-upload-streams` (default 16) at once as HTTP/2 streams on the
    daemon's one connection, each range up to 4 MiB. A range is marked received only

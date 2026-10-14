@@ -20,7 +20,6 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use futures::StreamExt as _;
 use kbf_proto::reapi::Digest;
-use kbf_segments::Crc32c;
 use kbf_types::{DigestFunction, LeaseId};
 use sha2::{Digest as _, Sha256};
 
@@ -33,8 +32,6 @@ pub struct Spooled {
     pub digest: kbf_types::Digest,
     /// Where its bytes start in the spool file.
     pub offset: u64,
-    /// The CRC-32C of its bytes.
-    pub crc32c: u32,
 }
 
 /// Blobs written once each into one unlinked local file.
@@ -149,16 +146,19 @@ impl Spool {
         self.lock().taken.remove(digest);
     }
 
-    /// Writes the chunks of the blob `parsed` names at `offset`, and returns their
-    /// CRC-32C once they hash to it.
+    /// Writes the chunks of the blob `parsed` names at `offset`, once they hash to it.
+    ///
+    /// Each chunk is hashed and written in one blocking task, so the copies in flight
+    /// hash on as many threads, not one after another on the task that polls them.
+    /// There is no CRC-32C: the server computes its own and ignores the daemon's.
     async fn write_chunks(
         &self,
         parsed: kbf_types::Digest,
         offset: u64,
         blob: &str,
         mut chunks: Chunks,
-    ) -> Result<u32, CasError> {
-        let (mut hasher, mut crc, mut at) = (Sha256::new(), Crc32c::new(), 0u64);
+    ) -> Result<(), CasError> {
+        let (mut hasher, mut at) = (Sha256::new(), 0u64);
         while let Some(chunk) = chunks.next().await {
             let chunk = chunk.map_err(|e| CasError::Read(blob.to_owned(), e.to_string()))?;
             let len = chunk.len() as u64;
@@ -169,11 +169,14 @@ impl Spool {
                     format!("more than {size} bytes"),
                 ));
             }
-            hasher.update(&chunk);
-            crc.update(&chunk);
-            self.write_at(chunk, offset + at)
-                .await
-                .map_err(|e| CasError::Read(blob.to_owned(), format!("spool: {e}")))?;
+            let file = Arc::clone(&self.file);
+            let at_chunk = offset + at;
+            hasher = blocking(move || {
+                hasher.update(&chunk);
+                file.write_all_at(&chunk, at_chunk).map(|()| hasher)
+            })
+            .await
+            .map_err(|e| CasError::Read(blob.to_owned(), format!("spool: {e}")))?;
             at += len;
         }
         let actual = kbf_types::Digest::new(DigestFunction::Sha256, hasher.finalize().into(), at);
@@ -183,7 +186,7 @@ impl Spool {
                 label(&to_proto(&actual)),
             ));
         }
-        Ok(crc.finish())
+        Ok(())
     }
 }
 
@@ -213,16 +216,11 @@ impl Cas for Spool {
         let Some(offset) = self.reserve(digest) else {
             return Ok(proto);
         };
-        let crc32c = kbf_segments::crc32c(&bytes);
         if let Err(e) = self.write_at(bytes, offset).await {
             self.release(&digest);
             return Err(CasError::Read(label(&proto), format!("spool: {e}")));
         }
-        self.record(Spooled {
-            digest,
-            offset,
-            crc32c,
-        });
+        self.record(Spooled { digest, offset });
         Ok(proto)
     }
 
@@ -236,11 +234,10 @@ impl Cas for Spool {
             return Ok(digest);
         };
         match self.write_chunks(parsed, offset, &blob, chunks).await {
-            Ok(crc32c) => {
+            Ok(()) => {
                 self.record(Spooled {
                     digest: parsed,
                     offset,
-                    crc32c,
                 });
                 Ok(digest)
             }

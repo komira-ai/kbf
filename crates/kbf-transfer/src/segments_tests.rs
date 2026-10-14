@@ -16,7 +16,6 @@ fn spooled(n: u8, size: u64, offset: u64) -> Spooled {
     Spooled {
         digest: KbfDigest::new(DigestFunction::Sha256, hash, size),
         offset,
-        crc32c: u32::from(n),
     }
 }
 
@@ -270,4 +269,26 @@ async fn put_each_refuses_a_store_that_answers_another_digest() {
         &lying.lease(&kbf_types::LeaseId::new(1, 1)),
         &lying
     ));
+}
+
+/// Catches a daemon that spends a pass over every output on a CRC-32C the server
+/// discards (mutant: `Spooled` keeps the crc and `footer` writes it): the footer of a
+/// spooled segment parses and names every record with crc32c 0, which the server's
+/// `Begin` accepts and replaces with its own (`docs/design/write-path.md`, 4.1).
+#[tokio::test]
+async fn a_spooled_footer_carries_no_crc() {
+    let dir = std::env::current_exe()
+        .expect("test binary")
+        .parent()
+        .expect("deps")
+        .join("kbf-transfer-segments-unit");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let spool = Spool::create(&dir).expect("spool");
+    for bytes in [&b"first output"[..], b"second output"] {
+        spool.put(bytes.to_vec()).await.expect("put");
+    }
+    let segment = &plan(&spool.records(), u64::MAX, u64::MAX, usize::MAX)[0][0];
+    let footer = Footer::parse(&segment.footer(), segment.length()).expect("parse");
+    assert_eq!(footer.entries().len(), 2);
+    assert!(footer.entries().iter().all(|e| e.crc32c == 0));
 }
