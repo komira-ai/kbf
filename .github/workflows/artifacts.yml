@@ -1,7 +1,8 @@
-# The binaries nodes and servers run, built once per commit (docs/artifacts.md):
-# kbf-daemon for darwin-arm64 (signed ad hoc with the hardened runtime), and kbf-daemon
-# and kbf-server for linux-x86_64 and linux-arm64. Each comes as a tarball with a
-# CycloneDX SBOM; one SHA256SUMS covers a commit's files.
+# The binaries nodes and servers run, and the deploy tool that installs them, built once
+# per commit (docs/artifacts.md): kbf-daemon for darwin-arm64 (signed ad hoc with the
+# hardened runtime), and kbf-daemon, kbf-server and kbf-deploy for linux-x86_64 and
+# linux-arm64. Each comes as a tarball with a CycloneDX SBOM; one SHA256SUMS covers a
+# commit's files.
 #
 # On a pull request or in the merge queue this is a build check: everything is built,
 # signed, packaged and summed, and nothing is attested. On a push to main, the attest
@@ -135,7 +136,7 @@ jobs:
       - name: Install cargo-cyclonedx (pinned version and checksum)
         run: cargo xtask fetch --url "https://github.com/CycloneDX/cyclonedx-rust-cargo/releases/download/cargo-cyclonedx-$CYCLONEDX_VERSION/cargo-cyclonedx-$TARGET.tar.xz" --sha256 "$CYCLONEDX_SHA256_X86_64_LINUX" --out "$HOME/.cargo/bin/cargo-cyclonedx" --extract tar.xz --member "cargo-cyclonedx-$TARGET/cargo-cyclonedx"
       - run: cargo cyclonedx --version
-      - run: cargo build --locked --release --target "$TARGET" -p kbf-node -p kbf-server --bins
+      - run: cargo build --locked --release --target "$TARGET" -p kbf-node -p kbf-server -p kbf-deploy --bins
       - run: cargo xtask build-commit check "target/$TARGET/release/kbf-server" "$GITHUB_SHA"
       - name: SBOM
         run: cargo cyclonedx --format json --spec-version 1.5 --describe binaries --target "$TARGET"
@@ -145,6 +146,8 @@ jobs:
         run: cargo xtask package --binary "target/$TARGET/release/kbf-daemon" --sbom crates/kbf-node/kbf-daemon_bin.cdx.json --platform linux-x86_64 --commit "$GITHUB_SHA" --out dist
       - name: Package kbf-server
         run: cargo xtask package --binary "target/$TARGET/release/kbf-server" --sbom crates/kbf-server/kbf-server_bin.cdx.json --platform linux-x86_64 --commit "$GITHUB_SHA" --out dist
+      - name: Package kbf-deploy
+        run: cargo xtask package --binary "target/$TARGET/release/kbf-deploy" --sbom crates/kbf-deploy/kbf-deploy_bin.cdx.json --platform linux-x86_64 --commit "$GITHUB_SHA" --out dist
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: assets-linux-x86_64
@@ -188,7 +191,7 @@ jobs:
       - name: Install cargo-cyclonedx (pinned version and checksum)
         run: cargo xtask fetch --url "https://github.com/CycloneDX/cyclonedx-rust-cargo/releases/download/cargo-cyclonedx-$CYCLONEDX_VERSION/cargo-cyclonedx-$TARGET.tar.xz" --sha256 "$CYCLONEDX_SHA256_AARCH64_LINUX" --out "$HOME/.cargo/bin/cargo-cyclonedx" --extract tar.xz --member "cargo-cyclonedx-$TARGET/cargo-cyclonedx"
       - run: cargo cyclonedx --version
-      - run: cargo build --locked --release --target "$TARGET" -p kbf-node -p kbf-server --bins
+      - run: cargo build --locked --release --target "$TARGET" -p kbf-node -p kbf-server -p kbf-deploy --bins
       - run: cargo xtask build-commit check "target/$TARGET/release/kbf-server" "$GITHUB_SHA"
       - name: SBOM
         run: cargo cyclonedx --format json --spec-version 1.5 --describe binaries --target "$TARGET"
@@ -198,6 +201,8 @@ jobs:
         run: cargo xtask package --binary "target/$TARGET/release/kbf-daemon" --sbom crates/kbf-node/kbf-daemon_bin.cdx.json --platform linux-arm64 --commit "$GITHUB_SHA" --out dist
       - name: Package kbf-server
         run: cargo xtask package --binary "target/$TARGET/release/kbf-server" --sbom crates/kbf-server/kbf-server_bin.cdx.json --platform linux-arm64 --commit "$GITHUB_SHA" --out dist
+      - name: Package kbf-deploy
+        run: cargo xtask package --binary "target/$TARGET/release/kbf-deploy" --sbom crates/kbf-deploy/kbf-deploy_bin.cdx.json --platform linux-arm64 --commit "$GITHUB_SHA" --out dist
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: assets-linux-arm64
@@ -279,6 +284,10 @@ jobs:
         with:
           subject-path: dist/kbf-server-${{ github.sha }}-linux-x86_64.tar.gz
           sbom-path: dist/kbf-server-${{ github.sha }}-linux-x86_64.cdx.json
+      - uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        with:
+          subject-path: dist/kbf-deploy-${{ github.sha }}-linux-x86_64.tar.gz
+          sbom-path: dist/kbf-deploy-${{ github.sha }}-linux-x86_64.cdx.json
       - uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
         with:
           subject-path: dist/kbf-daemon-${{ github.sha }}-linux-arm64.tar.gz
