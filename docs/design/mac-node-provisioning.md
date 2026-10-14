@@ -175,16 +175,15 @@ are how that cost is paid.
 
 ### 2.1 Shape of the script
 
-**Today** the script and its tests are in
-[tools/mac-provision](../../tools/mac-provision/README.md), which lists every key it
-applies and checks. It is not yet in the per-commit tarball, and it adds a `restart`
-verb (section 5.7) and `--keys` to the three below.
-A Rust port, the crate [kbf-mac-provision](../../crates/kbf-mac-provision), implements
-`check`, `apply`, `print` and `restart` with the same profile format, item names, report
-lines and exit statuses. It also sets the older `com.apple.commerce AutoUpdate` with
-`appstore_auto_update`, and before its first change to a power or software update
-setting it records all of them in `/var/db/kbf-mac-provision/settings.before`, which
-its `revert` verb restores.
+**Today** the program is the Rust crate
+[kbf-mac-provision](../../crates/kbf-mac-provision), whose
+[README](../../crates/kbf-mac-provision/README.md) lists every key it applies and
+checks. It replaced the shell script described below, and kept its profile format, item
+names, report lines and exit statuses. It is not yet in the per-commit tarball, and it
+adds a `restart` verb (section 5.7), a `revert` verb and `--keys` to the three below.
+It also sets the older `com.apple.commerce AutoUpdate` with `appstore_auto_update`, and
+before its first change to a power or software update setting it records all of them in
+`/var/db/kbf-mac-provision/settings.before`, which `revert` restores.
 
 `kbf-mac-provision` is one POSIX `sh` script, shipped in the same tarball as
 `kbf-daemon` (section 4):
