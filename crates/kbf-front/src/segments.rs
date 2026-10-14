@@ -9,16 +9,21 @@
 //!   `--segment-upload-max-bytes` or [`MAX_UPLOAD_RECORDS`], and then is admitted for
 //!   its whole length by [`Cache::admit`] (`--write-bytes-in-flight`, the bound
 //!   ByteStream and batch uploads share), waiting (never refusing) while it is spent.
-//!   Ranges are held in memory until the commit: the direct path; the local write tier
-//!   is a later stage.
+//!   Ranges are held in memory until the commit.
 //! - **PutRange** writes a range of one segment's records. Once Commit was called,
 //!   every PutRange is refused, so the bytes checked are the bytes stored.
 //! - **Commit** runs in a task of its own, detached from the call and the connection,
 //!   until it has indexed or failed: every record's SHA-256 is checked, each segment
-//!   gets a footer built here (the daemon's CRC-32C values never reach the store), each
-//!   is PUT and read back as a grouped segment is (a `--write-puts-in-flight` slot, the
-//!   PUT retried under a new key), and one `PutBlobs` commits every record. A second Commit
-//!   waits for the first and returns its answer.
+//!   gets a footer built here (the daemon's CRC-32C values never reach the store). With a
+//!   write tier attached, each segment is staged on it as a block of its own (its records
+//!   synced to the tier's disk, one `PutStaged` for its blobs): the Commit is answered
+//!   without an object-store PUT, and the flusher PUTs the object later. A segment the
+//!   tier does not take (at its budget, a disk error before the commit) is PUT and read
+//!   back as a grouped segment is (a `--write-puts-in-flight` slot, the PUT retried
+//!   under a new key), and one `PutBlobs` commits the records of every PUT segment. A
+//!   second Commit waits for the first and returns its answer.
+//! - **ReadRange** is served from the write tier while the object is staged on it (or
+//!   has a flushed copy there), else from the store.
 //! - An upload belongs to the connection that began it ([`Connections`]). When that
 //!   connection closes, or no call names the upload for `--segment-upload-idle-secs`, an
 //!   upload still receiving is dropped and its memory returned at once; a committing

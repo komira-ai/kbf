@@ -4,8 +4,10 @@
 //! state. The flusher is in `flush.rs`; the disk layer is `kbf-tier`.
 //!
 //! **Writes.** The write group's settle (`write_group.rs`) offers every segment it
-//! seals to [`Writer::stage`] first: staged when a tier is attached and takes it, else
-//! PUT as before.
+//! seals, and a `Segments` upload (`upload.rs`) every segment it built, to
+//! [`Writer::stage`] first: staged when a tier is attached and takes it, else PUT as
+//! before. A `Segments` range read is served from the tier too, while the object is
+//! staged or has a flushed copy.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -292,6 +294,25 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         }
         self.fetch_from_store(digest, location, staged_on.is_none())
             .await
+    }
+
+    /// `len` bytes of `object` from `offset` on this tier (a staged block's committed
+    /// bytes, or a flushed copy), unchecked; `None` when there is no tier or it does
+    /// not hold the whole range, and the caller reads the store.
+    pub(super) async fn read_staged_range(
+        &self,
+        object: ObjectId,
+        offset: u64,
+        len: u64,
+    ) -> Option<Bytes> {
+        let staging = self.writer.tier.get()?;
+        let tier = Arc::clone(&staging.tier);
+        let len = usize::try_from(len).unwrap_or(usize::MAX);
+        let read = blocking(Box::new(move || tier.read(object, offset, len))).await;
+        read.ok().map(|bytes| {
+            staging.counters.local_reads.add(1);
+            Bytes::from(bytes)
+        })
     }
 
     /// `digest`'s record from the tier's block or flushed copy, checked.
