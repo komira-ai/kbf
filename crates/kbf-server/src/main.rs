@@ -28,9 +28,11 @@
 //! committed; a directory it refuses exits 2.
 //!
 //! `--write-tier-dir` attaches the local write tier before anything is bound
-//! (`kbf_server::write_tier`); a start the tier refuses (a wrong or missing `TIER`
-//! while objects are staged, `--meta-log=raft`) exits 2. Its flusher runs every
-//! second until the server stops.
+//! (`kbf_server::write_tier`), over either metadata log: under `--meta-log=raft` it
+//! first raises the log to machine version 2 (once; a server without a tier never
+//! does, so its log stays one an older binary reads). A start the tier refuses (a
+//! wrong or missing `TIER` while objects are staged, a log that cannot be raised)
+//! exits 2. Its flusher runs every second until the server stops.
 
 use std::error::Error;
 use std::future::Future;
@@ -40,11 +42,11 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use clap::Parser;
-use kbf_front::{Cache, MemoryMetaLog, MetaLog};
+use kbf_front::{Cache, MemoryMetaLog};
 use kbf_log::FarmLogId;
 use kbf_meta::Retention;
 use kbf_objstore::{Capabilities, KeyPrefix, MemoryStore, ObjectStore};
-use kbf_server::write_tier::FLUSH_EVERY;
+use kbf_server::write_tier::{FLUSH_EVERY, TierLog};
 use kbf_server::{Args, RaftMetaLog, SERVER_VERSION, StoreKind, bind_server_with_policy};
 
 #[tokio::main]
@@ -65,7 +67,6 @@ async fn main() -> ExitCode {
 /// Builds the object store and the metadata log the flags name, then serves.
 async fn start(args: &Args) -> Result<(), Box<dyn Error>> {
     let raft_dir = args.raft_dir()?;
-    args.write_tier()?;
     let memory = || MemoryMetaLog::new(Retention::default());
     match args.store {
         StoreKind::Memory => {
@@ -87,7 +88,7 @@ async fn start(args: &Args) -> Result<(), Box<dyn Error>> {
     }
 }
 
-async fn run<M: MetaLog, O: ObjectStore + 'static>(
+async fn run<M: TierLog, O: ObjectStore + 'static>(
     args: &Args,
     meta: M,
     store: O,

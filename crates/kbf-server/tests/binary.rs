@@ -550,12 +550,13 @@ fn raft_mode_keeps_its_log_id_across_starts() {
 /// file is never written, and every write would still go to the store); a restart over
 /// the memory log refused, or reading an earlier start's files as its own (that log's
 /// epochs start from 1 again, so an old block names one of the new start's objects);
-/// and the tier
-/// accepted over `--meta-log=raft`, whose log format has no tier commands (every
-/// staged write would fail its commit). The refusal exits 2 and says why.
+/// the tier refused over `--meta-log=raft`, or attached there without the log raised
+/// to machine version 2 (its first commit cannot be encoded: the start fails); and a
+/// raft server without a tier that raises its log anyway (an older binary could no
+/// longer read it).
 #[cfg(unix)]
 #[test]
-fn write_tier_dir_attaches_a_tier_and_refuses_the_raft_log() {
+fn write_tier_dir_attaches_a_tier_over_either_metadata_log() {
     let dir = raft_dir("write-tier");
     let dir_arg = dir.to_str().expect("a UTF-8 path");
     let tier = ["--write-tier-dir", dir_arg, "--write-tier-bytes", "1048576"];
@@ -586,16 +587,52 @@ fn write_tier_dir_attaches_a_tier_and_refuses_the_raft_log() {
     }
     interrupt(child);
 
+    std::fs::remove_dir_all(&dir).expect("remove the tier dir");
+
     let raft = raft_dir("write-tier-raft");
-    let mut c = raft_server(&raft);
-    c.args(tier);
-    let (code, stderr) = fails(c);
-    assert_eq!(code, Some(2), "{stderr}");
+    let (child, _, _) = started(raft_server(&raft));
+    interrupt(child);
     assert!(
-        stderr.contains("--write-tier-dir needs --meta-log=memory"),
-        "{stderr}"
+        opens_as_version_1(&raft),
+        "a raft log raised without a tier"
+    );
+    for _ in 0..2 {
+        let mut c = raft_server(&raft);
+        c.args(tier);
+        let (child, _, _) = started(c);
+        assert!(dir.join("TIER").exists());
+        interrupt(child);
+    }
+    assert!(
+        !opens_as_version_1(&raft),
+        "a raft log not raised for the tier"
     );
     std::fs::remove_dir_all(&dir).expect("remove the tier dir");
+    std::fs::remove_dir_all(&raft).expect("remove the raft dir");
+}
+
+/// Whether the Raft log in `dir` opens for a binary that runs machine version 1 only;
+/// a log raised to 2 is refused at the raise.
+fn opens_as_version_1(dir: &std::path::Path) -> bool {
+    use kbf_log::MachineVersion;
+    use kbf_server::{RaftLogError, RaftMetaLog};
+    let opened = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime")
+        .block_on(async {
+            let fs = kbf_store::StdFs::new(dir).expect("the raft dir");
+            let exists = || Err(std::io::Error::other("the log exists"));
+            let retention = kbf_meta::Retention::default();
+            RaftMetaLog::open_running(fs, retention, "kbf/", exists, MachineVersion::V1)
+                .await
+                .map(drop)
+        });
+    match opened {
+        Ok(()) => true,
+        Err(RaftLogError::Decode { .. }) => false,
+        Err(e) => panic!("{e}"),
+    }
 }
 
 /// Catches: `--meta-log=raft` accepted with `--store=memory` (a durable index over

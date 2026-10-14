@@ -20,7 +20,7 @@ use kbf_objstore::ObjectStore;
 use kbf_segments::{Footer, IndexEntry};
 use kbf_store::Fs;
 use kbf_tier::{
-    NextSeq, Recovery, StagedSnapshot, Tier, TierError, TierOptions, TierStart, WriteTier,
+    NextSeq, Recovery, StagedSnapshot, Synced, Tier, TierError, TierOptions, TierStart, WriteTier,
 };
 use kbf_types::Digest;
 
@@ -327,8 +327,8 @@ impl<M: MetaLog, O: ObjectStore> Writer<M, O> {
     ///
     /// # Errors
     ///
-    /// The `PutStaged` commit failed: nothing is indexed, and the range is answered as
-    /// failed.
+    /// The `PutStaged` commit failed. The range is answered as failed unless the
+    /// committed state shows the commit applied anyway (`answer_lost_put`).
     pub(super) async fn stage(&self, body: Bytes, own: bool) -> Result<bool, CacheError> {
         let Some(staging) = self.tier.get() else {
             return Ok(false);
@@ -366,14 +366,38 @@ impl<M: MetaLog, O: ObjectStore> Writer<M, O> {
             tier: staging.id,
             objects: vec![put],
         };
-        // A failed commit drops `synced` unanswered: the range is answered as failed.
-        match self.commit(command).await? {
+        let applied = match self.commit(command).await {
+            Ok(applied) => applied,
+            Err(e) => {
+                self.answer_lost_put(staging, synced).await;
+                return Err(e.into());
+            }
+        };
+        match applied {
             Applied::Staged(Ok(_)) => {
                 staging.tier.committed(synced);
                 staging.counters.staged.add(1);
                 Ok(true)
             }
             other => Err(unexpected(&other)),
+        }
+    }
+
+    /// Answers a range whose `PutStaged` commit failed. A log can apply a command and
+    /// still fail to answer it (a Raft log that stopped after the entry was durable), so
+    /// the committed state is asked: if it holds the object through the range's end,
+    /// the range is answered committed, and the tier's committed length follows the
+    /// index (its blobs are read from the block, and the block is sealed and flushed,
+    /// not removed). Otherwise, or if the state cannot be read, `synced` is dropped:
+    /// the range is answered as failed, and a commit that did apply is recovered
+    /// against the committed state at the next start.
+    async fn answer_lost_put(&self, staging: &Staging, synced: Synced) {
+        let (object, end) = (synced.object(), synced.end());
+        let held = self
+            .query(move |s| s.staged(object).is_some_and(|o| o.committed_len() >= end))
+            .await;
+        if held == Ok(true) {
+            staging.tier.committed(synced);
         }
     }
 }
