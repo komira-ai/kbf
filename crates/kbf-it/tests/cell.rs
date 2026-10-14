@@ -1,4 +1,4 @@
-//! The `kbf-cell` binary: its certificates, its daemon and its check, as `m1/run.sh`
+//! The `kbf-cell` binary: its certificates, its daemon and its check, as `kbf-cell m1`
 //! uses them. The daemon test is the M1 cell in small: a real `kbf-server` core (in
 //! this process, memory store) and the harness daemon as a child process over mutual
 //! TLS with the certificates `kbf-cell pki` wrote. An Execute runs on the daemon, and
@@ -57,7 +57,7 @@ fn text(bytes: &[u8]) -> String {
 struct Running(Option<Child>);
 
 impl Running {
-    /// Stops the daemon with SIGINT, as `run.sh` does, and returns its exit status.
+    /// Stops the daemon with SIGINT, as `kbf-cell m1` does, and returns its exit status.
     fn interrupt(mut self) -> std::process::ExitStatus {
         let mut child = self.0.take().expect("running");
         let sent = Command::new("kill")
@@ -160,7 +160,7 @@ fn read(path: &Path) -> String {
 /// the blob calls the daemon makes there, its only CAS), a daemon that does not
 /// run leases (or runs them without uploading outputs), and a result that does not
 /// reach the action cache, so the repeat Execute is not a cache hit. Also a daemon
-/// that does not stop cleanly on SIGINT, which would leave `run.sh` a stray process.
+/// that does not stop cleanly on SIGINT, which would leave `kbf-cell m1` a stray process.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_daemon_runs_an_action_and_its_result_is_cached() {
     let dir = scratch("e2e");
@@ -191,6 +191,7 @@ async fn the_daemon_runs_an_action_and_its_result_is_cached() {
         shutdown_timeout: Duration::from_secs(10),
         store_probe_timeout: kbf_server::health::STORE_PROBE_TIMEOUT,
         invocation_memory: kbf_front::DEFAULT_INVOCATION_MEMORY,
+        segments: kbf_front::SegmentsConfig::DEFAULT,
     };
     let bound = bind_server(cache, listeners, pending()).expect("bind");
     let (reapi_addr, worker_addr) = (bound.reapi, bound.worker);

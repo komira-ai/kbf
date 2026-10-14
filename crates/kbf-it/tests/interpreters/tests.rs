@@ -1,7 +1,9 @@
 //! Tests of the interpreter budget's parts. Each says which defect it catches. The
 //! whole scan over a planted tree is tested in `repo_lints.rs` (module `budget`).
 
-use super::rust::{is_crate_src, is_dash_c, is_shell, shell_c_files};
+use super::rust::{
+    is_crate_src, is_crate_test, is_dash_c, is_shell, named_interpreter, scan, shell_c_files,
+};
 use super::*;
 
 fn found(key: &str) -> Found {
@@ -392,5 +394,127 @@ fn shells_flags_and_crate_sources_are_told_apart() {
         "tools/src/lib.rs",
     ] {
         assert!(!is_crate_src(p), "{p}");
+    }
+}
+
+#[test]
+fn interpreter_programs_and_scripts_are_named() {
+    // Catches: a program missed by its path form or its kind (awk, sed, Perl, Python,
+    // osascript), a script's `#!` line (direct or through `env`) missed; and a name
+    // inside a longer literal, a relative path, a non-interpreter or a `#!` line
+    // naming another program taken for one.
+    for (literal, name) in [
+        ("sh", "sh"),
+        ("/bin/sh", "sh"),
+        ("/usr/bin/perl", "perl"),
+        ("awk", "awk"),
+        ("/usr/bin/sed", "sed"),
+        ("python3", "python3"),
+        ("/usr/bin/osascript", "osascript"),
+        ("#!/bin/sh\necho\n", "sh"),
+        ("#!/usr/bin/env python3\n", "python3"),
+    ] {
+        assert_eq!(named_interpreter(literal), Some(name), "{literal:?}");
+    }
+    for literal in [
+        "env",
+        "/usr/bin/env",
+        "bin/sh",
+        "sh -c x",
+        "/bin/sh x",
+        "shell",
+        "",
+        "#!/bin/true\n",
+        "#!{} echo\n",
+    ] {
+        assert_eq!(named_interpreter(literal), None, "{literal:?}");
+    }
+}
+
+/// The test-code names `scan` finds: per file, `interpreter: items`.
+fn test_names(files: &[(&str, &str)]) -> Vec<(String, Vec<String>)> {
+    let found = scan(&src(files));
+    assert_eq!(found.problems, Vec::<String>::new());
+    found
+        .test_names
+        .into_iter()
+        .map(|t| {
+            let names = t
+                .names
+                .iter()
+                .map(|(n, items)| {
+                    let items: Vec<&str> = items.iter().map(String::as_str).collect();
+                    format!("{n}: {}", items.join(" "))
+                })
+                .collect();
+            (t.path, names)
+        })
+        .collect()
+}
+
+#[test]
+fn test_code_names_are_found_with_their_items() {
+    // Catches: a test file's name missed in a macro's tokens, a byte string, an `impl`
+    // method or a nested module; an item named wrongly (the inventory and the
+    // refusal name it); one item listed twice; and production code read as test code.
+    let tests = r##"
+        fn argv() -> Vec<&'static str> { vec!["perl", "-e", "1"] }
+        struct Fake;
+        impl Fake { fn script(&self) -> &'static [u8] { b"#!/bin/sh\n" } }
+        mod inner { fn a() { g("/bin/sh"); g("sh") } }
+    "##;
+    let src = r#"
+        pub fn prod() { std::process::Command::new("perl"); }
+        #[cfg(test)]
+        mod tests { #[test] fn t() { g("awk") } }
+    "#;
+    assert_eq!(
+        test_names(&[("crates/x/tests/t.rs", tests), (LIB, src)]),
+        vec![
+            (LIB.to_owned(), vec!["awk: tests::t".to_owned()]),
+            (
+                "crates/x/tests/t.rs".to_owned(),
+                vec![
+                    "perl: argv".to_owned(),
+                    "sh: Fake::script inner::a".to_owned()
+                ]
+            ),
+        ]
+    );
+}
+
+#[test]
+fn a_file_reached_through_a_test_module_is_all_test_code() {
+    // Catches: a `#[cfg(test)] mod tests;` file's names missed because its own items
+    // carry no `cfg(test)`; and a production module's names counted.
+    let files = [
+        (LIB, "#[cfg(test)]\nmod tests;\nmod prod;"),
+        ("crates/x/src/tests.rs", r#"fn t() { g("ruby") }"#),
+        ("crates/x/src/prod.rs", r#"fn p() { g("ruby") }"#),
+    ];
+    assert_eq!(
+        test_names(&files),
+        vec![(
+            "crates/x/src/tests.rs".to_owned(),
+            vec!["ruby: t".to_owned()]
+        )]
+    );
+}
+
+#[test]
+fn crate_test_files_are_told_apart() {
+    // Catches: a test file under `tests/` missed (nested support modules included),
+    // or a file outside a crate's `tests/` read as all test code.
+    for p in ["crates/a/tests/x.rs", "crates/a/tests/support/mod.rs"] {
+        assert!(is_crate_test(p), "{p}");
+    }
+    for p in [
+        "crates/a/src/tests.rs",
+        "crates/a/tests/x.txt",
+        "crates//tests/x.rs",
+        "tests/x.rs",
+        "crates/a/examples/tests.rs",
+    ] {
+        assert!(!is_crate_test(p), "{p}");
     }
 }

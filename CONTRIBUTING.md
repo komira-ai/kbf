@@ -84,6 +84,13 @@ does not have, so a listed file is not moved or renamed either (that would be a
 new row); it is ported. A pull request that deletes one removes its row in the
 same commit; the lint refuses a row whose file or keeper is gone.
 
+Test code is held to the same list. A test file (under `crates/*/tests/`, or
+`#[cfg(test)]` code under `crates/*/src/`) that names an interpreter, as a
+program (`Command::new("perl")`, an argv starting `/bin/sh`) or as the `#!` line
+of a script it writes, needs a `[test-interpreters]` row for its path saying why
+the test needs it. That list only shrinks too: a new test drives Rust (a
+`kbf-testkit` fake or the program under test), not a shell.
+
 ## Continuous integration
 
 CI is defined in [.github/workflows/ci.yml](.github/workflows/ci.yml) and runs
