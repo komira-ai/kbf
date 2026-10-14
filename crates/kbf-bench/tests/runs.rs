@@ -607,9 +607,10 @@ impl ByteStream for Holder {
 }
 
 /// Catches `--in-flight` not being the engine's limit: above the engine's default of
-/// 64 the engine would hold the run to 64 Writes at once. 100 in flight over 100
-/// blobs (98 files, the output directory, the Tree), each Write held 1 s: all 100
-/// are out together. FindMissing is the liar's UNIMPLEMENTED, so the engine sends
+/// 64 the engine would hold the run to 48 Writes at once (uploads hold all but a
+/// quarter of the limit). 100 in flight over 100 blobs (98 files, the output
+/// directory, the Tree), each Write held 1 s: the uploads' share, 75, is out
+/// together. FindMissing is the liar's UNIMPLEMENTED, so the engine sends
 /// every blob.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn in_flight_above_the_engine_default_is_the_engine_limit() {
@@ -637,5 +638,5 @@ async fn in_flight_above_the_engine_default_is_the_engine_limit() {
     wide.in_flight = 100;
     let sent = upload(&target, &tree, wide).await;
     assert_moved_all(&sent, &tree);
-    assert_eq!(holder.most.load(Ordering::SeqCst), 100, "{}", sent.table());
+    assert_eq!(holder.most.load(Ordering::SeqCst), 75, "{}", sent.table());
 }

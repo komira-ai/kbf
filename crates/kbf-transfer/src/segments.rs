@@ -343,7 +343,7 @@ impl Scope {
             offset: start,
             bytes,
         };
-        let _permit = self.inner.request().await;
+        let _permit = self.inner.upload_request().await;
         add(&self.counts.write_calls, 1);
         self.segments()
             .put_range(request)

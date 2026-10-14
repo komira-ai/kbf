@@ -15,7 +15,9 @@ pub const DEFAULT_SEGMENT_STREAMS: usize = 16;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TransferConfig {
     /// The most requests in flight at once for the whole process: ByteStream reads and
-    /// writes and FindMissing calls (`--transfer-in-flight`).
+    /// writes, `PutRange` calls and FindMissing calls (`--transfer-in-flight`). Uploads
+    /// (writes and `PutRange` calls) hold at most all but a quarter of them together;
+    /// the rest are for reads and FindMissing calls.
     pub in_flight: usize,
     /// The most bytes of blobs read into memory in flight at once
     /// (`--transfer-bytes-in-flight`). A blob larger than this is fetched alone.
