@@ -117,11 +117,23 @@ touch because the entry was touched recently is still covered for the full TTL.
 
 A recorded touch pins its entry. `Cache::collect` commits every recorded touch before
 its `Collect`, and a read queries and records under a lock the collection holds
-exclusively, so a collection either sees a read's touch or ran before the read's
-query: nothing a read reported is collected within `min_ttl` of the report. A crash
-loses the touches not yet committed (at most a second's); such an entry keeps its last
-committed touch, and may be collected that much earlier than the report promised. No
-collection runs today (below); the scheduled one must account for this.
+exclusively, and the background task holds the same lock shared while it commits, so
+a collection either sees a read's touch or ran before the read's query. Within one
+server process, nothing a read reported is collected within `min_ttl` of the report.
+
+The pin has limits:
+
+- A process that stops, by a crash or a graceful shutdown, loses the touches not yet
+  committed; such an entry keeps its last committed touch, and may be collected that
+  much earlier than the report promised. Normally that is about a second's touches, but
+  touches pile up for as long as their commits fail, so the loss is bounded only by
+  how long the metadata log refused them.
+- The lock is per process. A collection on one server does not see touches recorded
+  and not yet committed on another (a follower that forwards its touches to the leader
+  in batches, [deployment-topology.md](deployment-topology.md)).
+
+No collection runs today (below); the scheduled collector and the multi-server design
+must account for both.
 
 Uploads still commit their touch before they answer: `Cache::store_blobs` skips a
 blob already present only once its touch is committed, and stores it again if a

@@ -12,9 +12,12 @@
 //! touch before its `Collect`, and holds the gate a read records under, so no read can
 //! report an entry between that flush and the collection without the collection
 //! seeing its touch. An entry reported present therefore stays held for at least
-//! `min_ttl` after the report, within the life of the process. A crash loses the touches
-//! still pending (at most one interval's); an entry whose touch is lost keeps its last
-//! committed one. No collector runs in production yet, so that costs nothing today.
+//! `min_ttl` after the report, within the life of the process. The flusher holds the
+//! gate shared while it commits, so a collection cannot run between a batch leaving
+//! the pending set and its commit. A stop (crash or graceful shutdown) loses the touches
+//! still pending: one interval's, or more while commits keep failing; an entry whose
+//! touch is lost keeps its last committed one. No collector runs in production yet, so
+//! that costs nothing today.
 
 use std::collections::BTreeSet;
 use std::mem;

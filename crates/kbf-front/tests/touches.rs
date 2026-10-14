@@ -9,8 +9,9 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use kbf_front::{Cache, MemoryMetaLog, MetaLog, MetaLogError, TouchConfig, VerifiedBlob};
-use kbf_meta::{Applied, Command, MetaState, Retention};
+use kbf_meta::{Applied, Command, MetaState, Retention, Role, Touch};
 use kbf_objstore::{Capabilities, KeyPrefix, MemoryStore};
+use kbf_proto::reapi::ActionResult;
 use kbf_types::{Digest, FarmTime};
 use tokio::sync::{Notify, Semaphore};
 use tokio::time::timeout;
@@ -91,6 +92,19 @@ impl HeldLog {
             })
             .collect()
     }
+
+    /// The touch commits asked for so far, blobs and actions.
+    fn touch_commands(&self) -> Vec<Touch> {
+        self.asked
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .filter_map(|c| match c {
+                Command::Touch(t) => Some(t.clone()),
+                _ => None,
+            })
+            .collect()
+    }
 }
 
 impl MetaLog for HeldLog {
@@ -149,6 +163,20 @@ async fn store(cache: &TestCache, text: &str) -> Digest {
     let digest = blob.digest();
     cache.store_blobs(vec![blob]).await.expect("store");
     digest
+}
+
+/// Writes an action-cache entry for a new action, with an empty result, as a daemon.
+async fn write_action(cache: &TestCache, name: &str) -> Digest {
+    let action = VerifiedBlob::hashed(Bytes::from(name.to_owned())).digest();
+    let result = ActionResult {
+        exit_code: 0,
+        ..Default::default()
+    };
+    cache
+        .write_action_result(Role::Daemon, action, &result)
+        .await
+        .expect("write the action result");
+    action
 }
 
 fn config(every: Duration, batch: usize) -> TouchConfig {
@@ -345,6 +373,139 @@ async fn a_read_during_a_collection_never_reports_what_it_removes() {
 
     assert_eq!(collected, 1, "the blob had expired");
     assert_eq!(answer, [blob], "reported present, then collected");
+}
+
+/// Catches (mutant "the flusher commits without holding the gate"): a collection that
+/// runs while the flusher's batch has left the pending set but is not committed yet.
+/// Its own flush then finds nothing, its `Collect` lands before the touch, and a blob a
+/// read reported present is removed. The flusher's touch commit is held; the blob
+/// expires by farm time meanwhile; the collection is started and given time to run; then
+/// the touch is released. The collection must wait for the touch and remove nothing.
+#[tokio::test]
+async fn a_collection_waits_for_the_touch_batch_being_committed() {
+    let cache = Arc::new(
+        cache()
+            .await
+            .with_touches(config(Duration::from_secs(3600), 1)),
+    );
+    let log = cache.meta();
+    let blob = store(&cache, "reported while its touch is being committed").await;
+    cache.tick(days(5)).await.expect("tick");
+    log.hold(Kind::Touch);
+    let found = within(cache.find_missing(&[blob])).await;
+    assert!(found.expect("find").is_empty());
+    // The batch of one is full: the flusher took it and its commit is now held.
+    within(log.entered.notified()).await;
+    assert_eq!(cache.touches_pending(), 1, "the batch is being committed");
+    // Untouched since day 0, the blob has expired by day 9.
+    log.inner
+        .commit(Command::Tick(days(9)))
+        .await
+        .expect("tick");
+    let collecting = tokio::spawn({
+        let cache = Arc::clone(&cache);
+        async move { cache.collect().await.map(|c| c.blobs.len()) }
+    });
+    // Long enough for a collection that does not wait for the flusher to apply.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    log.release_all();
+    let collected = within(collecting).await.expect("join").expect("collect");
+
+    assert_eq!(collected, 0, "a blob reported present was collected");
+    assert!(
+        cache.find_missing(&[blob]).await.expect("find").is_empty(),
+        "the reported blob is gone"
+    );
+}
+
+/// Catches (mutant "a recorded touch drops its actions"): an action-cache hit whose
+/// touch is never committed, so a result used every day still expires 30 days after it
+/// was written. Written on day 0, hit on day 5: the flusher must commit a touch naming
+/// the action, and a collection on day 33 must keep it (untouched, it goes after day 30).
+#[tokio::test]
+async fn an_action_cache_hit_is_touched_and_kept_by_a_collection() {
+    let cache = cache()
+        .await
+        .with_touches(config(Duration::from_millis(20), 100));
+    let log = cache.meta();
+    let action = write_action(&cache, "an action hit on day 5").await;
+    let unused = write_action(&cache, "an action never hit").await;
+    cache.tick(days(5)).await.expect("tick");
+    assert!(
+        cache
+            .action_result(&action)
+            .await
+            .expect("lookup")
+            .is_some(),
+        "a hit"
+    );
+    flushed(&cache).await;
+    let touched: BTreeSet<Digest> = log
+        .touch_commands()
+        .iter()
+        .flat_map(|t| t.actions.iter().copied())
+        .collect();
+    assert_eq!(touched, BTreeSet::from([action]));
+
+    cache.tick(days(33)).await.expect("tick");
+    let collected = cache.collect().await.expect("collect");
+    assert_eq!(
+        collected.actions,
+        [unused],
+        "only the unused action expires"
+    );
+}
+
+/// Catches (mutant "a batch's actions fill a whole batch of their own"): a batch that
+/// mixes blobs and actions exceeding the bound, up to twice it. Two blobs and three
+/// actions are recorded with a bound of two; outside a runtime no flusher runs, so the
+/// collection's flush commits all five in batches, each of at most two entries, each
+/// entry once.
+#[test]
+fn a_batch_of_blobs_and_actions_together_stays_within_the_bound() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let (cache, blobs, actions) = runtime.block_on(async {
+        let cache = cache()
+            .await
+            .with_touches(config(Duration::from_secs(3600), 2));
+        let blobs = [
+            store(&cache, "blob one").await,
+            store(&cache, "blob two").await,
+        ];
+        let mut actions = BTreeSet::new();
+        for i in 0..3 {
+            actions.insert(write_action(&cache, &format!("action {i}")).await);
+        }
+        cache.tick(days(5)).await.expect("tick");
+        (cache, blobs, actions)
+    });
+    futures::executor::block_on(async {
+        assert!(cache.find_missing(&blobs).await.expect("find").is_empty());
+        for action in &actions {
+            assert!(cache.action_result(action).await.expect("lookup").is_some());
+        }
+        assert!(
+            cache.meta().touch_commands().is_empty(),
+            "nothing flushed yet"
+        );
+        cache.collect().await.expect("collect");
+    });
+
+    let touches = cache.meta().touch_commands();
+    assert!(
+        touches.iter().all(|t| t.blobs.len() + t.actions.len() <= 2),
+        "{touches:?}"
+    );
+    let touched_actions: Vec<Digest> = touches.iter().flat_map(|t| t.actions.clone()).collect();
+    assert_eq!(touched_actions, actions.into_iter().collect::<Vec<_>>());
+    let touched_blobs: BTreeSet<Digest> = touches.iter().flat_map(|t| t.blobs.clone()).collect();
+    assert!(
+        touched_blobs.is_superset(&BTreeSet::from(blobs)),
+        "{touches:?}"
+    );
 }
 
 /// Catches (mutant "put a lost entry back"): a touch whose entry a collection outside
