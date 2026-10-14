@@ -1,5 +1,7 @@
 //! The upload plan, the range cutting and the read coalescing, without a server.
 
+use std::sync::atomic::AtomicBool;
+
 use kbf_segments::layout::footer_len;
 use kbf_segments::{Footer, IndexEntry};
 use kbf_types::{Digest as KbfDigest, DigestFunction};
@@ -157,8 +159,11 @@ fn a_segment_closed_at_the_upload_cap_leaves_no_empty_segment() {
     assert_eq!(shape, [[1]]);
 }
 
-/// A store whose `put` answers a digest other than the bytes'.
-struct Lying;
+/// A store that keeps nothing and whose `put` answers the bytes' digest, or, while
+/// `lie` is set, another one.
+struct Lying {
+    lie: AtomicBool,
+}
 
 impl Cas for Lying {
     type Lease = Arc<Self>;
@@ -171,14 +176,19 @@ impl Cas for Lying {
         Err(CasError::Missing(label(digest)))
     }
 
-    async fn put(&self, _bytes: Vec<u8>) -> Result<Digest, CasError> {
-        Ok(crate::cas::digest_of(b"some other blob"))
+    async fn put(&self, bytes: Vec<u8>) -> Result<Digest, CasError> {
+        if self.lie.load(Ordering::SeqCst) {
+            return Ok(crate::cas::digest_of(b"some other blob"));
+        }
+        Ok(crate::cas::digest_of(&bytes))
     }
 }
 
 /// Catches a stored blob trusted without checking the store's answer (mutant: the
-/// comparison of `put`'s digest dropped): `put_each` through a store that answers
-/// another digest fails as corrupt, naming the blob it stored.
+/// comparison of `put`'s digest dropped): `put_each` stores a small blob, and one over
+/// a megabyte streamed through `put_chunks`, while the store answers their digests,
+/// and fails as corrupt, naming the blob, through a store that answers another digest.
+/// One store type throughout, so one instantiation of `put_each` runs all of it.
 #[tokio::test]
 async fn put_each_refuses_a_store_that_answers_another_digest() {
     let dir = std::env::current_exe()
@@ -188,9 +198,21 @@ async fn put_each_refuses_a_store_that_answers_another_digest() {
         .join("kbf-transfer-segments-unit")
         .join(std::process::id().to_string());
     std::fs::create_dir_all(&dir).expect("mkdir");
+    let lying = Arc::new(Lying {
+        lie: AtomicBool::new(false),
+    });
+    let truthful = Arc::new(Spool::create(&dir).expect("spool"));
+    truthful
+        .put(b"a small output".to_vec())
+        .await
+        .expect("spooled");
+    truthful.put(vec![7; (1 << 20) + 5]).await.expect("spooled");
+    put_each(&lying, &truthful)
+        .await
+        .expect("the store answered each digest");
+    lying.lie.store(true, Ordering::SeqCst);
     let spool = Arc::new(Spool::create(&dir).expect("spool"));
     let digest = spool.put(b"an output".to_vec()).await.expect("spooled");
-    let lying = Arc::new(Lying);
     let failed = put_each(&lying, &spool).await.expect_err("another digest");
     assert_eq!(
         failed,
@@ -201,7 +223,7 @@ async fn put_each_refuses_a_store_that_answers_another_digest() {
     );
     // The fake's other calls, so none of its lines is left unrun.
     assert_eq!(
-        Lying.get(&digest).await,
+        lying.get(&digest).await,
         Err(CasError::Missing(label(&digest)))
     );
     assert!(Arc::ptr_eq(

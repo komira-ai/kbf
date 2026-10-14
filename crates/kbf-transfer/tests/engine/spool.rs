@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use futures::stream;
+use kbf_proto::reapi::Digest;
 use kbf_transfer::{Cas, CasError, Spool, digest_of, label};
 use kbf_types::LeaseId;
 
@@ -100,4 +101,89 @@ async fn the_default_put_spool_stores_every_blob() {
     for blob in blobs {
         assert_eq!(target.get(&digest_of(&blob)).await, Ok(blob));
     }
+}
+
+/// Catches a failed spool write recorded or kept reserved (mutants: the reservation
+/// kept after a failed write, so the blob counts as spooled; the write error ignored),
+/// through the public API, so the engine's own build of the spool runs these paths:
+/// once a put has reserved the spool's offsets up to `i64::MAX` (its chunks then fail
+/// their digest, leaving those bytes dead), the next blob starts past the largest
+/// offset a file can have. Its put, by bytes and then by chunks, fails each time with
+/// a read error of the spool naming the blob, and nothing is recorded.
+#[tokio::test]
+async fn a_spool_write_past_the_largest_offset_records_nothing() {
+    let spool = Spool::create(&scratch("spool-write-fails")).expect("spool");
+    let huge = Digest {
+        hash: digest_of(b"abc").hash,
+        size_bytes: i64::MAX,
+    };
+    let refused = spool.put_chunks(huge, chunks(vec![b"abc".to_vec()])).await;
+    assert!(matches!(refused, Err(CasError::Corrupt(..))), "{refused:?}");
+    let bytes = patterned(4, 10);
+    let digest = digest_of(&bytes);
+    let by_bytes = spool.put(bytes.clone()).await;
+    let by_chunks = spool.put_chunks(digest.clone(), chunks(vec![bytes])).await;
+    for failed in [by_bytes, by_chunks] {
+        let Err(CasError::Read(blob, why)) = &failed else {
+            panic!("{failed:?}");
+        };
+        assert_eq!(blob, &label(&digest));
+        assert!(why.starts_with("spool: "), "{failed:?}");
+    }
+    assert!(spool.records().is_empty());
+    assert_eq!(
+        spool.get(&digest).await,
+        Err(CasError::Missing(label(&digest)))
+    );
+}
+
+/// Catches a chunk that fails to be read taken as the blob's end, or its blob left
+/// reserved (mutants: the chunk error skipped; the reservation kept): `put_chunks`
+/// whose second chunk fails is a read error naming the blob with the chunk's error,
+/// records nothing, and the blob's right chunks put later are recorded.
+#[tokio::test]
+async fn a_chunk_that_fails_to_be_read_records_nothing() {
+    let spool = Spool::create(&scratch("spool-chunk-fails")).expect("spool");
+    let bytes = patterned(6, 3000);
+    let digest = digest_of(&bytes);
+    let broken: kbf_transfer::Chunks = Box::pin(stream::iter([
+        Ok(bytes[..1000].to_vec()),
+        Err(std::io::Error::other("the file went away")),
+    ]));
+    assert_eq!(
+        spool.put_chunks(digest.clone(), broken).await,
+        Err(CasError::Read(
+            label(&digest),
+            "the file went away".to_owned()
+        ))
+    );
+    assert!(spool.records().is_empty());
+    let stored = spool
+        .put_chunks(digest.clone(), chunks(vec![bytes.clone()]))
+        .await;
+    assert_eq!(stored, Ok(digest.clone()));
+    assert_eq!(spool.get(&digest).await, Ok(bytes));
+}
+
+/// Catches a digest that is not SHA-256 answered otherwise than CORRUPT naming it, or
+/// its chunks read, through the public API: `put_chunks` of one refuses it before
+/// reading a chunk, and records nothing.
+#[tokio::test]
+async fn a_digest_that_is_not_sha256_is_refused_before_its_chunks() {
+    let spool = Spool::create(&scratch("spool-not-sha256")).expect("spool");
+    let digest = Digest {
+        hash: "not a SHA-256 hash".to_owned(),
+        size_bytes: 3,
+    };
+    let unread: kbf_transfer::Chunks = Box::pin(stream::once(async {
+        panic!("the chunks of a refused digest were read")
+    }));
+    assert_eq!(
+        spool.put_chunks(digest.clone(), unread).await,
+        Err(CasError::Corrupt(
+            label(&digest),
+            "not a SHA-256 digest".to_owned()
+        ))
+    );
+    assert!(spool.records().is_empty());
 }
