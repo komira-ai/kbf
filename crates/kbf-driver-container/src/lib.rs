@@ -70,6 +70,7 @@ pub mod delegate;
 pub mod image;
 mod keeper;
 mod outputs;
+mod pending;
 mod podman;
 mod program;
 mod remove;
