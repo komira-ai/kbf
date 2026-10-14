@@ -267,13 +267,15 @@ async fn the_connection_asks_for_the_configured_windows() {
     assert_eq!(windows(&first), (Some(3 << 20), 24 << 20));
 }
 
-/// Catches tonic's 4 MiB decode limit left on the engine's clients: a 4.5 MiB message,
-/// which the front may send (its limit is 5 MiB), is read. Mutant seen red: no
-/// `max_decoding_message_size` (OUT_OF_RANGE, "decoded message length too large").
+/// Catches tonic's 4 MiB decode limit left on the engine's clients, or the engine's
+/// limit left below the front's: a message of 16.5 MiB (a full 16 MiB batch with its
+/// framing; the front's limit is 17 MiB) is read. Mutants seen red: no
+/// `max_decoding_message_size` (OUT_OF_RANGE, "decoded message length too large");
+/// `MAX_MESSAGE_BYTES` left at 5 MiB.
 #[tokio::test]
-async fn a_message_past_four_mib_is_decoded() {
+async fn a_message_up_to_sixteen_mib_and_framing_is_decoded() {
     let fake = Arc::new(Fake::default());
-    let bytes = patterned(4, (4 << 20) + (512 << 10));
+    let bytes = patterned(4, (16 << 20) + (512 << 10));
     let digest = fake.insert(bytes.clone());
     fake.message_bytes.store(bytes.len(), Ordering::SeqCst);
     let engine = engine(fake.serve().await, TransferConfig::default());

@@ -32,7 +32,7 @@ This is the design behind two lines that already promise it: `daemon.md` § Plan
 | Blob read | `crates/kbf-daemon/src/cas.rs` `CasClient::get` | One ByteStream `Read` per blob. Each blob is hashed when it arrives (`fetch`). No FindMissing, no Batch, no GetTree, no compression. |
 | Blob write | `CasClient::put` / `put_chunks` | One ByteStream `Write` per blob, 1 MiB per message (`WRITE_CHUNK_BYTES`). Outputs are uploaded in series (`tree.rs` `collect`; container `outputs.rs`; native `kbf-outputs`). Every output is uploaded, even one the server already holds. |
 | Worker listener | `crates/kbf-server/src/blobs.rs` | ByteStream (`WorkerBlobs`) and, since stage S1, the `ContentAddressableStorage` service (`WorkerCas`: FindMissing, Batch*, GetTree). Every call of both is admitted against the node certificate by one rule (`admit`, line 37). Under plain text every call is refused UNAUTHENTICATED. `Capabilities`, `Execution` and `ActionCache` answer UNIMPLEMENTED there. |
-| Server batch | `crates/kbf-front/src/cas.rs` `batch_read_blobs`, `kbf-front/src/cache/batch.rs` `read_blobs` | Up to 4 MiB of blob data (`MAX_BATCH_TOTAL_BYTES`, `kbf-front/src/lib.rs:89`); the gRPC message cap is 5 MiB (`MAX_MESSAGE_BYTES`, line 93). Since stage S1 one metadata query looks up and touches the batch, blobs back to back in one segment come from one range GET, and up to 32 GETs run at once (`storage.md` § Reads). |
+| Server batch | `crates/kbf-front/src/cas.rs` `batch_read_blobs`, `kbf-front/src/cache/batch.rs` `read_blobs` | Up to 16 MiB of blob data (`MAX_BATCH_TOTAL_BYTES`, `kbf-front/src/lib.rs`); the gRPC message cap is 17 MiB (`MAX_MESSAGE_BYTES`). Since stage S1 one metadata query looks up and touches the batch, blobs back to back in one segment come from one range GET, and up to 32 GETs run at once (`storage.md` § Reads). |
 | Container lease | `crates/kbf-driver-container/src/runtime.rs:252-277`, `podman.rs` | `materialize` writes the input root `lease/root`, which becomes the **overlay lower** (`--volume=root:/kbf/root:O,upperdir=upper,workdir=work`). `prepare_outputs` **renames** every input that an output names from `root` into `upper` (`tree.rs:188`). Then `podman unshare chown -hR 1:1` runs over root, upper and work; after exit, `chown -hR 0:0` runs over the same paths (`runtime.rs:274-277,421-428`). Containers run with `--userns=nomap` (`podman.rs:136`), so the daemon's uid maps to nothing inside. |
 | Native lease | `crates/kbf-driver-native/src/runtime.rs`, `lib.rs` | Writes the input root into the lease directory and runs the action **as the daemon's user**. On macOS a `sandbox-exec` profile lets the action write only under its lease directory. On Linux nothing is enforced. |
 | Per-lease timing | `runtime.rs:322-341` (container), native `:487` | `input_fetch_start/completed_timestamp` cover all of prepare. Resource usage travels as an `auxiliary_metadata` Any (`kbf-daemon/src/usage.rs`). |
@@ -155,7 +155,7 @@ daemon, carrying many concurrent streams (4.2).
   stream window caps one stream at about window/RTT. No setting in the code changes it
   today.
 - **The decode limit is set explicitly**: `max_decoding_message_size(kbf_front::MAX_MESSAGE_BYTES)`
-  on the client. tonic's 4 MiB default would refuse a full 4 MiB server batch once
+  on the client. tonic's 4 MiB default would refuse a full 16 MiB server batch once
   framing is added.
 
 ### 4.3 API
@@ -216,11 +216,11 @@ pub enum Upload { Bytes(Digest, Bytes), File(Digest, PathBuf) }
   before the server work with no flag day.
 - **Limit discovery.** At first use the engine calls `GetCapabilities`. It takes the
   smaller of the advertised `max_batch_total_size_bytes` (where nonzero) and
-  `--transfer-batch-bytes`. It never assumes 4 MiB. The worker listener does not serve
+  `--transfer-batch-bytes`. It never assumes a limit. The worker listener does not serve
   `Capabilities` (stage S1 adds only the CAS service), so there the call answers
   UNIMPLEMENTED: the engine then uses `--transfer-batch-bytes` alone, logs that once,
   and does not ask again for the life of the process. The flag's default (2 MiB) is
-  under the server's 4 MiB batch limit, and a deploy that raises the flag past it gets
+  under the server's 16 MiB batch limit, and a deploy that raises the flag past it gets
   INVALID_ARGUMENT for the batch, which is resent as ByteStream (4.4). Serving
   `Capabilities` on the worker listener is not planned.
 
@@ -920,7 +920,7 @@ serve FindMissing and Batch today), or a counting fake CAS.
 | C-11 | (T1) An output present locally but missing on the server is uploaded. One the server holds is not (`outputs_present`). Against today's worker listener, FindMissing is UNIMPLEMENTED: everything is uploaded, the call is logged once, and no lease fails. | The cache answering FindMissing; no fallback | Short-circuit uploads on a local hit; treat UNIMPLEMENTED as fatal |
 | C-12 | Freshness: lease 1 creates, deletes and renames files in a cached subtree. Lease 2 with the same digest sees the pristine tree (C1, C4b, C4c). | One lease's changes leaking to the next | Reuse a lease's materialized subtree as the cached directory |
 | C-13 | `--cache-dir` on another filesystem than `--scratch`: a warning, `link_mode=copy`, leases succeed. EMLINK is simulated through a fake link operation. | No EXDEV/EMLINK fallback | Remove the fallback |
-| C-14 | (T2) A 3,000-blob tree is fetched in batches of at most 2 MiB. A full 4 MiB server batch decodes. A per-blob NOT_FOUND gives `Missing`. A corrupt blob in a batch is refused. One batch holds one permit. | tonic's 4 MiB default; per-blob status ignored; unhashed batch bytes; a batch taking N permits | Default decode limit; skip `digest_of`; one permit per blob |
+| C-14 | (T2) A 3,000-blob tree is fetched in batches of at most 2 MiB. A full 16 MiB server batch decodes. A per-blob NOT_FOUND gives `Missing`. A corrupt blob in a batch is refused. One batch holds one permit. | tonic's 4 MiB default; per-blob status ignored; unhashed batch bytes; a batch taking N permits | Default decode limit; skip `digest_of`; one permit per blob |
 | C-15 | (S1) A 100-blob `BatchReadBlobs` against an object store with 10 ms per GET finishes well under 100 x 10 ms. | Serial batch reads | Revert to the serial loop |
 | C-16 | A second daemon on a locked `--cache-dir` warns, reports `cache_disabled_reason=locked`, runs uncached, and its leases succeed. Daemon 1 holds a fill open in `tmp/` (the R-1 fault hook) when daemon 2 starts. The first daemon's entries, its lock file (same inode) and its `tmp/` fill are unchanged, the fill then completes and inserts, and a third daemon is still refused. | Two owners sharing one cache's accounting; startup cleanup that runs before the lock and deletes the owner's fills or lock file | Take the lock shared; clear `tmp/` before taking the lock; unlink and recreate the lock file at start |
 | C-17 | Zig-shaped tree (20,000 files, above the 15,189 of the zig toolchain komira pins, section 1): lease 2 fetches 0 bytes and `cache_hits == files - empty_files`. `link_ms` is reported, not gated. | The cache not consulted on the hot path | `materialize` ignoring the cache |
@@ -1068,7 +1068,7 @@ left open):
   T-3 and C-11 are in `crates/kbf-transfer/tests/engine.rs`, against a
   counting fake server behind a proxy that counts connections and can cut them. The
   windows are checked in the SETTINGS and WINDOW_UPDATE frames the engine sends, and
-  the decode limit with a 4.5 MiB message.
+  the decode limit with a 16.5 MiB message.
 
 ---
 

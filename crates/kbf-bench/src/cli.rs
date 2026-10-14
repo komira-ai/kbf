@@ -59,7 +59,7 @@ pub struct RunArgs {
     /// `--transfer-in-flight`, default 64).
     #[arg(long, default_value_t = 64, value_parser = clap::value_parser!(u64).range(1..))]
     pub in_flight: u64,
-    /// The most blob data one batch call carries (the front allows 4 MiB); a larger
+    /// The most blob data one batch call carries (the front allows 16 MiB); a larger
     /// blob goes by ByteStream.
     #[arg(long, default_value = "4MiB", value_parser = parse_size)]
     pub batch_bytes: u64,
