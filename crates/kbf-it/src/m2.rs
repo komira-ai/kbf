@@ -347,8 +347,6 @@ impl Cell {
             format!("--unit={unit}").into(),
             "--slice=kbf-daemon.slice".into(),
             "-p".into(),
-            "Delegate=yes".into(),
-            "-p".into(),
             "OOMScoreAdjust=-900".into(),
             "-p".into(),
             joined("StandardError=append:", &self.logs.join("daemon.err")),
