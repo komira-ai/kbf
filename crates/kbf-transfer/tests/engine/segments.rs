@@ -31,6 +31,9 @@ enum Mode {
     Serve,
     /// Every Commit fails UNAVAILABLE.
     FailCommits,
+    /// The second and third Commits fail UNAVAILABLE: the second upload and its one
+    /// retry (uploads go one after another).
+    FailSecondUpload,
     /// Every Begin is UNIMPLEMENTED, as a server without the service answers.
     Unimplemented,
     /// As `Unimplemented`, each Begin answered only once two have arrived.
@@ -97,7 +100,10 @@ impl Segments for Counting {
     }
 
     async fn commit(&self, r: Request<CommitRequest>) -> Result<Response<CommitResponse>, Status> {
-        self.commits.fetch_add(1, Ordering::SeqCst);
+        let ordinal = self.commits.fetch_add(1, Ordering::SeqCst);
+        if self.mode == Mode::FailSecondUpload && (1..=2).contains(&ordinal) {
+            return Err(Status::unavailable("the store timed out"));
+        }
         if self.mode == Mode::FailCommits {
             return Err(Status::unavailable("the store is down"));
         }
@@ -367,6 +373,30 @@ async fn a_failing_commit_is_retried_once_then_blobs_go_one_by_one() {
     assert_eq!(front.commits.load(Ordering::SeqCst), 2);
     assert!(front.all_present(&digests).await);
     assert_eq!(front.cache.metrics().write.total.get(), 10);
+}
+
+/// Catches an upload that loses its progress to one failed commit (the farm node's cold
+/// upload: one 1 GiB upload, one failed PUT, every blob sent again): ten blobs of
+/// 10 MiB are four uploads of at most 32 MiB; the second fails twice, and only its three
+/// blobs go by ByteStream while the other seven stay committed by their own commits
+/// (mutant: `SEGMENT_UPLOAD_BYTES` back at 1 GiB + 1 MiB, one upload, no fall back).
+#[tokio::test]
+async fn a_failed_upload_keeps_the_ones_committed_before_it() {
+    let front = Front::start(Mode::FailSecondUpload).await;
+    let (spool, digests) = spooled("second-fails", (0..10).map(|i| patterned(i, 10 << 20))).await;
+    front.engine.put_spool(spool).await.expect("put spool");
+    assert_eq!(
+        front.begins.load(Ordering::SeqCst),
+        5,
+        "four uploads and the second's retry"
+    );
+    assert_eq!(front.commits.load(Ordering::SeqCst), 5);
+    assert_eq!(
+        front.cache.metrics().write.total.get(),
+        3,
+        "only the failed upload's blobs are sent again"
+    );
+    assert!(front.all_present(&digests).await);
 }
 
 /// Catches fills still one call per blob (mutant: no coalescing): the 1,000 files of a

@@ -4,8 +4,10 @@
 //! **Upload.** The blobs of a [`Spool`] that the server lacks (asked through the
 //! engine's FindMissing queue) are packed, in spool order, into segments of at most
 //! [`MAX_SEGMENT_BYTES`] (a larger blob is a segment of its own), and the segments
-//! into uploads of at most [`SEGMENT_UPLOAD_BYTES`] and [`MAX_UPLOAD_RECORDS`]: the
-//! smallest cap a server may run with, so every upload is admitted by every server.
+//! into uploads of at most [`SEGMENT_UPLOAD_BYTES`] and [`MAX_UPLOAD_RECORDS`], both
+//! under the smallest cap a server may run with, so every server admits every upload.
+//! An upload commits or fails whole, and the uploads of a spool go one after another,
+//! so a failed one costs its own blobs, not the ones committed before it.
 //! Each upload is one `Begin` (the footers), `PutRange` calls of at most
 //! [`MAX_RANGE_BYTES`], `--segment-upload-streams` at once, cut from the spool file,
 //! and one `Commit`. A failed upload is tried once more; then its blobs go one
@@ -40,10 +42,15 @@ use crate::spool::{Spool, Spooled, to_proto};
 use crate::stats::add;
 use crate::wire::MAX_MESSAGE_BYTES;
 
-/// The most bytes one upload declares: one largest blob (1 GiB) and its footer, with
-/// room to spare. kbf-server refuses to start with a smaller
-/// `--segment-upload-max-bytes`, so every server admits an upload of this size.
-pub const SEGMENT_UPLOAD_BYTES: u64 = (1 << 30) + (1 << 20);
+/// The most bytes one upload declares, a blob larger than this being an upload of its
+/// own. Small, so that one failed upload (a PUT cut on a slow store, a lost commit) is
+/// retried and falls back for at most this much, and the uploads committed before it
+/// stay committed: a cold upload of 14,244 outputs (300 MB) on a store that was busy
+/// lost every blob it had sent to one failed 1 GiB upload. Under kbf-server's smallest
+/// `--segment-upload-max-bytes` (one 1 GiB blob and its footer), so every server admits
+/// it. The server's PUT of a segment of this size is also one a slow store finishes
+/// within `--s3-min-put-rate`.
+pub const SEGMENT_UPLOAD_BYTES: u64 = 32 << 20;
 
 /// The most records one upload holds: the server's limit.
 pub const MAX_UPLOAD_RECORDS: usize = 16_384;

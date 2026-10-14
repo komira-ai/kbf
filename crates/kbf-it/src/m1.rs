@@ -148,6 +148,7 @@ impl Cell {
             },
             connect_timeout: Duration::from_secs(10),
             request_timeout: Duration::from_secs(60),
+            min_body_rate: None,
         });
         let store = store.or_broken(&"the store")?;
         let http = reqwest::Client::builder()

@@ -56,6 +56,7 @@ async fn executes_with_blobs_in_s3() {
         capabilities: Capabilities::default(),
         connect_timeout: Duration::from_secs(5),
         request_timeout: Duration::from_secs(30),
+        min_body_rate: None,
     })
     .expect("store");
     store.create_bucket().await.expect("create the bucket");

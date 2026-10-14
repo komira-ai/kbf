@@ -3,7 +3,7 @@
 //! never goes on the command line).
 
 use std::net::{IpAddr, SocketAddr};
-use std::num::{NonZeroU32, NonZeroUsize};
+use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -226,6 +226,13 @@ pub struct Args {
     /// prefix is refused).
     #[arg(long, default_value = "kbf/")]
     pub s3_prefix: String,
+    /// The slowest rate, in bytes a second, a request body may reach the store at
+    /// (`--store=s3`): a PUT is cut after 60 seconds plus its body's length at this
+    /// rate, so a 128 MiB segment gets 188 seconds at the default. A store shared with
+    /// other tenants can take minutes over one large PUT; a flat limit would cut it
+    /// however steadily it progressed.
+    #[arg(long, value_name = "BYTES_PER_SEC", default_value_t = NonZeroU64::new(1 << 20).expect("1 MiB"))]
+    pub s3_min_put_rate: NonZeroU64,
     /// The store refuses to overwrite a key (MinIO and RustFS do).
     #[arg(long)]
     pub s3_conditional_put: bool,
@@ -503,6 +510,24 @@ impl Args {
         }
     }
 
+    /// The store configuration of this start's flags. Clap requires both flags with
+    /// `--store=s3`; an empty value is `S3Store`'s to refuse.
+    fn s3_config(&self, credentials: Credentials) -> S3Config {
+        S3Config {
+            endpoint: self.s3_endpoint.clone().unwrap_or_default(),
+            region: self.s3_region.clone(),
+            bucket: self.s3_bucket.clone().unwrap_or_default(),
+            credentials,
+            capabilities: Capabilities {
+                conditional_put: self.s3_conditional_put,
+                object_lock: false,
+            },
+            connect_timeout: Duration::from_secs(5),
+            request_timeout: Duration::from_secs(60),
+            min_body_rate: Some(self.s3_min_put_rate),
+        }
+    }
+
     /// The S3 store and the key prefix of this start, `<prefix><start time>/` (the
     /// one `--meta-log=memory` writes under), for `--store=s3`. `env` reads an
     /// environment variable (the S3 key pair).
@@ -516,19 +541,7 @@ impl Args {
         let need = |name: &'static str| env(name).ok_or(ConfigError::MissingEnv(name));
         let credentials =
             Credentials::new(need("AWS_ACCESS_KEY_ID")?, need("AWS_SECRET_ACCESS_KEY")?);
-        // clap requires both flags with `--store=s3`; an empty value is S3Store's to refuse.
-        let store = S3Store::new(S3Config {
-            endpoint: self.s3_endpoint.clone().unwrap_or_default(),
-            region: self.s3_region.clone(),
-            bucket: self.s3_bucket.clone().unwrap_or_default(),
-            credentials,
-            capabilities: Capabilities {
-                conditional_put: self.s3_conditional_put,
-                object_lock: false,
-            },
-            connect_timeout: Duration::from_secs(5),
-            request_timeout: Duration::from_secs(60),
-        })?;
+        let store = S3Store::new(self.s3_config(credentials))?;
         let started = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -555,7 +568,7 @@ fn read(path: &PathBuf) -> Result<Vec<u8>, ConfigError> {
 
 #[cfg(test)]
 mod tests {
-    use std::num::{NonZeroU32, NonZeroUsize};
+    use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
     use std::path::Path;
     use std::time::Duration;
 
@@ -563,6 +576,42 @@ mod tests {
     use kbf_front::{MAX_BLOB_BYTES, WriteConfig};
 
     use super::{Args, loopback_only};
+
+    /// Catches: `--s3-min-put-rate` lost on the way to the store (the flat 60 s that cut
+    /// slow segment PUTs), a default other than 1 MiB/s, and a rate of 0 accepted (it
+    /// would divide by zero in the store's timeout).
+    #[test]
+    fn the_put_rate_floor_is_a_flag_with_a_default() {
+        let base = [
+            "kbf-server",
+            "--store",
+            "s3",
+            "--s3-endpoint",
+            "http://e:9",
+            "--s3-bucket",
+            "b",
+        ];
+        let rate = |extra: &[&str]| {
+            Args::try_parse_from(base.iter().chain(extra)).map(|a| a.s3_min_put_rate.get())
+        };
+        assert_eq!(rate(&[]).unwrap(), 1 << 20);
+        assert_eq!(rate(&["--s3-min-put-rate", "4096"]).unwrap(), 4096);
+        assert!(rate(&["--s3-min-put-rate", "0"]).is_err());
+    }
+
+    /// Catches: the flag value not reaching the store's configuration (the timeout
+    /// fix a no-op in production), for the default and for an override.
+    #[test]
+    fn the_put_rate_flag_reaches_the_store_config() {
+        let base = ["kbf-server", "--store", "s3", "--s3-endpoint", "http://e:9"];
+        let config = |extra: &[&str]| {
+            let args = Args::parse_from(base.iter().chain(&["--s3-bucket", "b"]).chain(extra));
+            args.s3_config(super::Credentials::new("k", "s"))
+        };
+        assert_eq!(config(&[]).min_body_rate, NonZeroU64::new(1 << 20));
+        let over = config(&["--s3-min-put-rate", "4096"]);
+        assert_eq!(over.min_body_rate, NonZeroU64::new(4096));
+    }
 
     /// Catches: the write tier refused (or silently off) over either metadata log, its
     /// options lost on the way, or the tier on when `--write-tier-dir` is not given.
