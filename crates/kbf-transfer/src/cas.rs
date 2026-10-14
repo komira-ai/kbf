@@ -113,6 +113,20 @@ pub trait Cas: Send + Sync + 'static {
         }
     }
 
+    /// The digests among `digests` the store does not hold, in the order asked. A
+    /// caller with many blobs to store asks about all of them once, before it stores
+    /// any, and stores only these, rather than paying a question per blob.
+    ///
+    /// The transfer engine asks FindMissing in calls of at most
+    /// `--transfer-find-missing-chunk` digests, all of the calls at once within
+    /// `--transfer-in-flight`; a call that fails answers "missing" for its digests, and
+    /// a [`Cas::put`] or [`Cas::put_chunks`] on the same lease of a digest answered
+    /// missing does not ask again. This default asks nothing and answers every digest
+    /// missing: a store whose puts need no question.
+    fn missing(&self, digests: &[Digest]) -> impl Future<Output = Vec<Digest>> + Send {
+        std::future::ready(digests.to_vec())
+    }
+
     /// Stores every blob `spool` holds and returns once all are durable: an action's
     /// outputs, gathered by a walk that stored them into the spool. The transfer engine
     /// sends the ones the server lacks as whole segments (`crate::segments`), and blob
@@ -161,6 +175,10 @@ impl<C: Cas> Cas for Arc<C> {
         file: &mut tokio::fs::File,
     ) -> impl Future<Output = Result<(), CasError>> + Send {
         C::read_to(self, digest, file)
+    }
+
+    fn missing(&self, digests: &[Digest]) -> impl Future<Output = Vec<Digest>> + Send {
+        C::missing(self, digests)
     }
 
     fn put_spool(&self, spool: Arc<Spool>) -> impl Future<Output = Result<(), CasError>> + Send {

@@ -8,6 +8,13 @@
 //! the concurrent uploads of a tree's outputs share a few calls, with no wait added
 //! to gather them.
 //!
+//! A caller with a whole set of blobs to store (a lease's outputs) asks about all of
+//! them at once instead ([`crate::Cas::missing`]): its digests are cut into calls of at
+//! most `--transfer-find-missing-chunk` and every call goes out at once, each within a
+//! request permit, so a tree of 15,000 outputs costs 15 calls side by side, not one
+//! call per 64 uploads in a row. The digests answered missing are remembered by the
+//! lease's [`crate::Scope`] until each is stored, so their uploads do not ask again.
+//!
 //! FindMissing only saves uploads, so it never fails one: a call that fails after its
 //! retries answers "missing" for its digests, and the blobs are uploaded. The first
 //! UNIMPLEMENTED (a worker listener that does not serve the CAS service) turns the
@@ -101,6 +108,31 @@ impl Inner {
         }
     }
 
+    /// The digests among `digests` the server does not hold, in the order asked,
+    /// counted in `counts`: every chunk of `--transfer-find-missing-chunk` asked at once.
+    /// A chunk that could not be asked answers all its digests missing.
+    pub(crate) async fn missing(&self, digests: &[Digest], counts: &Counts) -> Vec<Digest> {
+        if self.finder.off.load(Ordering::SeqCst) {
+            return digests.to_vec();
+        }
+        add(&counts.find_missing_digests, digests.len() as u64);
+        let calls = digests
+            .chunks(self.config.find_missing_chunk)
+            .map(|chunk| async move {
+                let missing = self.find_missing(chunk.to_vec()).await;
+                chunk
+                    .iter()
+                    .filter(|d| missing.as_ref().is_none_or(|m| m.contains(&label(d))))
+                    .cloned()
+                    .collect::<Vec<Digest>>()
+            });
+        futures::future::join_all(calls)
+            .await
+            .into_iter()
+            .flatten()
+            .collect()
+    }
+
     /// The labels of the digests among `digests` the server does not hold; `None` when
     /// the call could not be made.
     async fn find_missing(&self, digests: Vec<Digest>) -> Option<BTreeSet<String>> {
@@ -115,10 +147,12 @@ impl Inner {
                 Err(status) => status,
             };
             if status.code() == Code::Unimplemented {
-                // One task asks, so this is the first UNIMPLEMENTED: none is asked after.
-                self.finder.off.store(true, Ordering::SeqCst);
-                add(&self.finder.unavailable, 1);
-                tracing::warn!("FindMissing answered UNIMPLEMENTED; every blob is uploaded");
+                // The calls of a whole set go out together, so several can come back
+                // UNIMPLEMENTED: the first is counted and logged, and none is asked after.
+                if !self.finder.off.swap(true, Ordering::SeqCst) {
+                    add(&self.finder.unavailable, 1);
+                    tracing::warn!("FindMissing answered UNIMPLEMENTED; every blob is uploaded");
+                }
                 return None;
             }
             if !self.retry(&status, &mut attempt).await {

@@ -17,8 +17,10 @@ test = false
 
 # No kbf dependency: every crate may take this one as a dev-dependency (or a
 # dependency of a test-only bin) without a cycle. rustix makes its system calls
-# directly on Linux, so `kbf-m2-act` still links statically.
+# directly on Linux; libc is for the two calls rustix has no portable form of
+# (mkfifo, and signal to ignore one). `kbf-m2-act` still links statically.
 [dependencies]
+libc.workspace = true
 rustix = { workspace = true, features = ["process"] }
 
 [lints]

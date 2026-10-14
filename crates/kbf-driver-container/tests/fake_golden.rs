@@ -10,14 +10,20 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// The action both `start`s run: its environment, whether it leads its own process
-/// group and session (fields 5 and 6 of its `/proc` stat), both streams and an exit
-/// code of its own.
-const ACTION: &str = r#"echo "CG=$CG ROOT=$ROOT UPPER=$UPPER FAKE_LEASE=$FAKE_LEASE"
-read -r -a stat < /proc/$$/stat
-echo "leads group $(( stat[4] == $$ )) session $(( stat[5] == $$ ))"
-echo err >&2
-exit 3"#;
+/// The `action` knob both `start`s run, one argument per line: its environment, an
+/// argument with each path name the fake expands (and two it must not: `$UPPERX` and
+/// `x$CG`), whether it leads its own process group and session, both streams and an
+/// exit code of its own.
+const ACTION: &str = concat!(
+    "env\nCG\n;\n",
+    "env\nROOT\n;\n",
+    "env\nUPPER\n;\n",
+    "env\nFAKE_LEASE\n;\n",
+    "echo\n$CG\n$ROOT/r\n$UPPER/u\n$UPPERX\nx$CG\n;\n",
+    "leads\n;\n",
+    "echo\n--stderr\nerr\n;\n",
+    "exit\n3\n",
+);
 
 /// One call: files below the fake's directory to write (or, with `None`, remove) first, then the arguments after
 /// `--cgroup-manager=cgroupfs` (`None`: the flag is left out too), and whether the
@@ -124,7 +130,7 @@ fn calls(dir: &Path) -> Vec<Call> {
         call(&[], &["inspect", "--type=container", "kbf-lease-1-1"]),
         call(&[], &["kill", "--signal=TERM", "kbf-lease-1-1"]),
         call(
-            &[("state/action.sh", Some(ACTION))],
+            &[("state/action", Some(ACTION))],
             &["start", "--attach", "kbf-lease-1-1"],
         ),
         call(&[], &["inspect", "kbf-lease-1-1"]),
@@ -230,6 +236,7 @@ fn run(dir: &Path, program: &Path) -> (Vec<Answer>, BTreeMap<PathBuf, Entry>) {
     std::fs::write(state.join("nonce"), "n:").expect("nonce");
     let link = dir.join("podman");
     std::os::unix::fs::symlink(program, &link).expect("link podman");
+    support::fake::link_act(dir);
     let mut answers = Vec::new();
     for call in calls(dir) {
         for (name, contents) in call.knobs {
@@ -252,13 +259,22 @@ fn run(dir: &Path, program: &Path) -> (Vec<Answer>, BTreeMap<PathBuf, Entry>) {
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
             files: call.files_after.then(|| {
                 let mut files = tree(dir);
-                // The link to the fake: its target is outside the directory.
+                // The links to the fake and to the act program: their targets are
+                // outside the directory.
                 files.remove(Path::new("podman"));
+                files.remove(Path::new(kbf_testkit::act::NAME));
                 files
             }),
         });
     }
-    (answers, tree(dir))
+    let mut files = tree(dir);
+    // The link to the act program, this test binary: its target is outside the directory.
+    let act = files.remove(Path::new(kbf_testkit::act::NAME));
+    assert!(
+        matches!(act, Some(Entry::Link(_))),
+        "no kbf-act link: {act:?}"
+    );
+    (answers, files)
 }
 
 /// Every entry below `dir` by relative path. The pids `start` records differ from run
@@ -355,7 +371,7 @@ fn the_fake_answers_and_records_as_its_golden_file_says() {
     assert!(
         answers
             .iter()
-            .any(|a| a.code == Some(3) && a.stdout.contains("leads group 1 session 1")),
+            .any(|a| a.code == Some(3) && a.stdout.contains("group 1 session 1\n")),
         "no start ran the action in a session of its own: {answers:#?}"
     );
     for record in [

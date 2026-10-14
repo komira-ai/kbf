@@ -4,7 +4,7 @@
 //! The stand-in is the program `kbf-fake-podman` (`tests/bin/fake_podman.rs`, which
 //! lists its knobs and records); `tests/fake_golden.rs` pins what it answers.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -38,6 +38,26 @@ pub fn program() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_kbf-fake-podman"))
 }
 
+/// Links `dir/kbf-act`, the program the fake podman in `dir` runs as each action, to
+/// this test binary, which answers as `kbf-act` through it (`act_test_hook!` in
+/// `support/mod.rs`).
+pub fn link_act(dir: &Path) {
+    kbf_testkit::act::link_self(&dir.join(kbf_testkit::act::NAME)).expect("link kbf-act");
+}
+
+/// The `action` knob's contents for the act steps `steps` (`;` between two steps):
+/// each argument and a newline.
+pub fn action_knob(steps: &[impl AsRef<str>]) -> String {
+    steps
+        .iter()
+        .map(|arg| {
+            let arg = arg.as_ref();
+            assert!(!arg.contains('\n'), "a knob line cannot hold {arg:?}");
+            format!("{arg}\n")
+        })
+        .collect()
+}
+
 /// One test's fake Podman, fake cgroup mount, scratch directory and runtime.
 pub struct Fake {
     pub dir: PathBuf,
@@ -69,6 +89,7 @@ impl Fake {
         // fail with ETXTBSY while another test thread forks.
         let program = dir.join("podman");
         std::os::unix::fs::symlink(self::program(), &program).expect("link podman");
+        link_act(&dir);
         std::fs::write(state.join("image-id"), "img1\n").expect("image id");
         // Unique to this Fake, so what a failed earlier run left in the same checkout
         // is not taken for this run's action.
@@ -200,13 +221,22 @@ impl Fake {
         );
     }
 
+    /// Sets what the fake runs as the next action: the act steps `steps`, `;` between
+    /// two (see `tests/bin/fake_podman.rs` for the `$ROOT`, `$UPPER` and `$CG` they
+    /// may start an argument with).
+    pub fn action(&self, steps: &[impl AsRef<str>]) {
+        self.knob("action", &action_knob(steps));
+    }
+
+    /// Runs lease `seq` of `spec`, the fake running the act steps `steps` as its
+    /// action ([`Fake::action`]).
     pub async fn run(
         &self,
         seq: u64,
         spec: &Spec,
-        script: &str,
+        steps: &[impl AsRef<str>],
     ) -> Result<kbf_proto::reapi::ActionResult, RuntimeError> {
-        self.knob("action.sh", script);
+        self.action(steps);
         let action = store_action(&self.cas, spec);
         self.runtime
             .run(work(seq, action, Resources::new(2000, 1 << 30)))

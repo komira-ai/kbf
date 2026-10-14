@@ -5,9 +5,8 @@
 //! share a user; and a root daemon without a pool runs nothing.
 //!
 //! Every test is `#[ignore]`: each needs root and real users. The macOS CI job runs them
-//! with `cargo xtask sudo-test -p kbf-driver-native --test slots` (from
-//! `tools/ci/mac-session-tests.sh`), which builds this file as the runner's user and
-//! runs the binary through `sudo -n` with `--ignored`. They make users at free uids from
+//! with `cargo xtask sudo-test -p kbf-driver-native --test slots`, which builds this
+//! file as the runner's user and runs the binary through `sudo -n` with `--ignored`. They make users at free uids from
 //! 690 (`kbf-ci-slot-<test>-<i>`, hidden, shell `/usr/bin/false`, homes in the folder
 //! tests/support/pool.rs names) and delete them, their homes and every process of their
 //! uids when they end, passed or not.

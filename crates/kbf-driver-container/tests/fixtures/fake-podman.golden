@@ -60,7 +60,7 @@ stdout ""
 stderr "Error: no such container\n"
 $ podman --cgroup-manager=cgroupfs start --attach kbf-lease-1-1
 exit 3
-stdout "CG=<dir>/cgroup/actions/kbf-lease-1-1 ROOT=<dir>/lease/root UPPER=<dir>/lease/upper FAKE_LEASE=n:/actions/kbf-lease-1-1\nleads group 1 session 1\n"
+stdout "<dir>/cgroup/actions/kbf-lease-1-1\n<dir>/lease/root\n<dir>/lease/upper\nn:/actions/kbf-lease-1-1\n<dir>/cgroup/actions/kbf-lease-1-1 <dir>/lease/root/r <dir>/lease/upper/u $UPPERX x$CG\ngroup 1 session 1\n"
 stderr "err\n"
 $ podman --cgroup-manager=cgroupfs inspect kbf-lease-1-1
 exit 0
@@ -80,7 +80,7 @@ stdout ""
 stderr ""
 $ podman --cgroup-manager=cgroupfs start --attach kbf-lease-1-1
 exit 3
-stdout "CG=<dir>/cgroup/actions/kbf-lease-1-1 ROOT=<dir>/lease/root UPPER=<dir>/lease/upper FAKE_LEASE=n:/actions/kbf-lease-1-1\nleads group 1 session 1\n"
+stdout "<dir>/cgroup/actions/kbf-lease-1-1\n<dir>/lease/root\n<dir>/lease/upper\nn:/actions/kbf-lease-1-1\n<dir>/cgroup/actions/kbf-lease-1-1 <dir>/lease/root/r <dir>/lease/upper/u $UPPERX x$CG\ngroup 1 session 1\n"
 stderr "err\n"
 files after this call
 d 0755 cgroup
@@ -94,7 +94,7 @@ d 0755 lease/root
 d 0755 lease/stdout
 d 0000 lease/upper
 d 0755 state
-f 0644 state/action.sh "echo \"CG=$CG ROOT=$ROOT UPPER=$UPPER FAKE_LEASE=$FAKE_LEASE\"\nread -r -a stat < /proc/$$/stat\necho \"leads group $(( stat[4] == $$ )) session $(( stat[5] == $$ ))\"\necho err >&2\nexit 3"
+f 0644 state/action "env\nCG\n;\nenv\nROOT\n;\nenv\nUPPER\n;\nenv\nFAKE_LEASE\n;\necho\n$CG\n$ROOT/r\n$UPPER/u\n$UPPERX\nx$CG\n;\nleads\n;\necho\n--stderr\nerr\n;\nexit\n3\n"
 f 0644 state/calls "frobnicate\ninfo\ninfo\nimage\nimage\ncreate\ncreate\ncreate\nps\nps\nps\nps\ninspect\nkill\nstart\ninspect\ninspect\nkill\nunshare chown\nstart\n"
 f 0644 state/cgroup "/actions/kbf-lease-1-1\n"
 f 0644 state/create.args "--pull=never\n--name=kbf-lease-1-1\n--label=kbf.owner=node-1\n--cgroup-parent=/actions/kbf-lease-1-1\n--volume=<dir>/lease/root:/w:O,upperdir=<dir>/lease/upper,workdir=<dir>/lease/work\ndocker://registry.test/busybox\n"
@@ -156,7 +156,7 @@ d 0755 lease/stdout
 d 0751 lease/upper
 d 0755 lease/upper/sub
 d 0755 state
-f 0644 state/action.sh "echo \"CG=$CG ROOT=$ROOT UPPER=$UPPER FAKE_LEASE=$FAKE_LEASE\"\nread -r -a stat < /proc/$$/stat\necho \"leads group $(( stat[4] == $$ )) session $(( stat[5] == $$ ))\"\necho err >&2\nexit 3"
+f 0644 state/action "env\nCG\n;\nenv\nROOT\n;\nenv\nUPPER\n;\nenv\nFAKE_LEASE\n;\necho\n$CG\n$ROOT/r\n$UPPER/u\n$UPPERX\nx$CG\n;\nleads\n;\necho\n--stderr\nerr\n;\nexit\n3\n"
 f 0644 state/calls "frobnicate\ninfo\ninfo\nimage\nimage\ncreate\ncreate\ncreate\nps\nps\nps\nps\ninspect\nkill\nstart\ninspect\ninspect\nkill\nunshare chown\nstart\nunshare chown\nunshare chown\nunshare chown\nrm\nrm\nunshare rm\nunshare rm\n"
 f 0644 state/cgroup "/actions/kbf-lease-1-1\n"
 f 0644 state/chown-fails "1:1"
@@ -213,7 +213,7 @@ d 0755 lease/stdout
 d 0751 lease/upper
 d 0755 lease/upper/sub
 d 0755 state
-f 0644 state/action.sh "echo \"CG=$CG ROOT=$ROOT UPPER=$UPPER FAKE_LEASE=$FAKE_LEASE\"\nread -r -a stat < /proc/$$/stat\necho \"leads group $(( stat[4] == $$ )) session $(( stat[5] == $$ ))\"\necho err >&2\nexit 3"
+f 0644 state/action "env\nCG\n;\nenv\nROOT\n;\nenv\nUPPER\n;\nenv\nFAKE_LEASE\n;\necho\n$CG\n$ROOT/r\n$UPPER/u\n$UPPERX\nx$CG\n;\nleads\n;\necho\n--stderr\nerr\n;\nexit\n3\n"
 f 0644 state/calls "frobnicate\ninfo\ninfo\nimage\nimage\ncreate\ncreate\ncreate\nps\nps\nps\nps\ninspect\nkill\nstart\ninspect\ninspect\nkill\nunshare chown\nstart\nunshare chown\nunshare chown\nunshare chown\nrm\nrm\nunshare rm\nunshare rm\nunshare rm\ninfo\ninfo\nunshare /helper\nunshare /helper\nstart\n"
 f 0644 state/cgroup "/actions/kbf-lease-1-1\n"
 f 0644 state/create.args "--pull=never\n--name=kbf-lease-1-1\n--label=kbf.owner=node-1\n--cgroup-parent=/actions/kbf-lease-1-1\n--volume=<dir>/lease/root:/w:O,upperdir=<dir>/lease/upper,workdir=<dir>/lease/work\ndocker://registry.test/busybox\n"
@@ -248,7 +248,7 @@ d 0755 lease/stdout
 d 0751 lease/upper
 d 0755 lease/upper/sub
 d 0755 state
-f 0644 state/action.sh "echo \"CG=$CG ROOT=$ROOT UPPER=$UPPER FAKE_LEASE=$FAKE_LEASE\"\nread -r -a stat < /proc/$$/stat\necho \"leads group $(( stat[4] == $$ )) session $(( stat[5] == $$ ))\"\necho err >&2\nexit 3"
+f 0644 state/action "env\nCG\n;\nenv\nROOT\n;\nenv\nUPPER\n;\nenv\nFAKE_LEASE\n;\necho\n$CG\n$ROOT/r\n$UPPER/u\n$UPPERX\nx$CG\n;\nleads\n;\necho\n--stderr\nerr\n;\nexit\n3\n"
 f 0644 state/calls "frobnicate\ninfo\ninfo\nimage\nimage\ncreate\ncreate\ncreate\nps\nps\nps\nps\ninspect\nkill\nstart\ninspect\ninspect\nkill\nunshare chown\nstart\nunshare chown\nunshare chown\nunshare chown\nrm\nrm\nunshare rm\nunshare rm\nunshare rm\ninfo\ninfo\nunshare /helper\nunshare /helper\nstart\ncreate\n"
 f 0644 state/cgroup "/actions/kbf-lease-1-1\n"
 f 0644 state/create.args "--pull=never\n--name=kbf-lease-1-1\n--label=kbf.owner=node-1\n--cgroup-parent=/actions/kbf-lease-1-1\n--volume=<dir>/lease/root:/w:O,upperdir=<dir>/lease/upper,workdir=<dir>/lease/work\ndocker://registry.test/busybox\n"

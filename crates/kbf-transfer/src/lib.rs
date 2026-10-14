@@ -5,8 +5,9 @@
 //! output uploads, and the input cache's fills. It speaks gRPC to kbf-server over one
 //! HTTP/2 connection with many streams, and bounds the whole process with one
 //! in-flight limit and one byte budget, not one per call. Concurrent reads of one
-//! digest, from any lease, share one fetch. Every upload is preceded by FindMissing, so
-//! a blob the server holds is not sent again. A read broken by a reset connection
+//! digest, from any lease, share one fetch. Every upload is preceded by FindMissing (its
+//! own, or one call for a whole set of blobs, [`Cas::missing`]), so a blob the server
+//! holds is not sent again. A read broken by a reset connection
 //! resumes from the bytes it received.
 //!
 //! - [`cas`]: the [`Cas`] trait every store implements (the engine, and the in-memory

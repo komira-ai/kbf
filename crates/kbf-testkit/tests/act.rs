@@ -518,3 +518,202 @@ fn spawn_child_reports_its_pid_and_runs_every_step() {
     assert!(written.trim().parse::<u32>().is_ok(), "{written:?}");
     assert!(written.ends_with('\n'), "{written:?}");
 }
+
+/// Catches: `write-lines` appending instead of truncating, joining its lines or
+/// dropping a newline, or leaving a file it was given no line for as it was; `copy`
+/// writing one input only, out of order, or appending to what `OUT` held; `remove`
+/// leaving a directory that holds files, or following a link (the directory it
+/// points to would go); `truncate` not making the file, or not cutting a longer one;
+/// `inode-links` other than each path's inode and link count, in order.
+#[test]
+fn files_are_written_copied_cut_and_removed() {
+    use std::os::unix::fs::FileTypeExt as _;
+    let dir = dir("act-write-copy-remove");
+    let path = |name: &str| dir.join(name).display().to_string();
+    std::fs::write(dir.join("lines"), "old\nbytes\n").expect("lines");
+    std::fs::write(dir.join("empty"), "old").expect("empty");
+    std::fs::write(dir.join("one"), "first ").expect("one");
+    std::fs::write(dir.join("two"), "second").expect("two");
+    std::fs::write(dir.join("copy"), "a longer old copy").expect("copy");
+    std::fs::write(dir.join("long"), "ten bytes!").expect("long");
+    std::fs::write(dir.join("file"), "x").expect("file");
+    std::fs::hard_link(dir.join("file"), dir.join("file2")).expect("hard link");
+    std::fs::create_dir_all(dir.join("tree/sub")).expect("tree");
+    std::fs::write(dir.join("tree/sub/f"), "x").expect("tree file");
+    std::fs::create_dir(dir.join("kept")).expect("kept");
+    std::fs::write(dir.join("kept/f"), "x").expect("kept file");
+    std::os::unix::fs::symlink(dir.join("kept"), dir.join("link")).expect("link");
+    let out = output(&[
+        "write-lines",
+        &path("lines"),
+        "a",
+        "b c",
+        ";",
+        "write-lines",
+        &path("empty"),
+        ";",
+        "copy",
+        &path("copy"),
+        &path("one"),
+        &path("two"),
+        ";",
+        "remove",
+        &path("tree"),
+        ";",
+        "remove",
+        &path("link"),
+        ";",
+        "remove",
+        &path("two"),
+        ";",
+        "truncate",
+        &path("new"),
+        "2048",
+        ";",
+        "truncate",
+        &path("long"),
+        "3",
+        ";",
+        "mkfifo",
+        &path("fifo"),
+        ";",
+        "inode-links",
+        &path("links"),
+        &path("file"),
+        &path("one"),
+    ]);
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let read = |name: &str| std::fs::read(dir.join(name)).expect(name);
+    assert_eq!(read("lines"), b"a\nb c\n");
+    assert_eq!(read("empty"), b"");
+    assert_eq!(read("copy"), b"first second");
+    assert!(!dir.join("tree").exists(), "the tree is left");
+    assert!(!dir.join("link").exists(), "the link is left");
+    assert!(dir.join("kept/f").exists(), "remove followed the link");
+    assert!(!dir.join("two").exists(), "the file is left");
+    assert_eq!(read("new"), vec![0; 2048]);
+    assert_eq!(read("long"), b"ten");
+    let fifo = std::fs::symlink_metadata(dir.join("fifo")).expect("fifo");
+    assert!(fifo.file_type().is_fifo(), "{fifo:?}");
+    let [file, one] = ["file", "one"].map(|name| {
+        std::fs::metadata(dir.join(name))
+            .expect(name)
+            .ino()
+            .to_string()
+    });
+    assert_eq!(
+        String::from_utf8(read("links")).expect("utf-8"),
+        format!("{file} 2\n{one} 1\n")
+    );
+}
+
+/// Catches: a check that passes whatever it is asked (a test action gated on one
+/// would check nothing): `test` with each predicate, and with `!`, passing and
+/// failing as `sh`'s `test` does; `points-to` and `holds` failing only on what differs.
+#[test]
+fn checks_pass_and_fail_on_what_they_name() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = dir("act-checks");
+    let path = |name: &str| dir.join(name).display().to_string();
+    std::fs::write(dir.join("plain"), "two words").expect("plain");
+    std::fs::write(dir.join("tool"), "").expect("tool");
+    std::fs::set_permissions(dir.join("tool"), std::fs::Permissions::from_mode(0o755))
+        .expect("chmod");
+    std::os::unix::fs::symlink("plain", dir.join("link")).expect("link");
+    let (plain, tool, link, missing) = (path("plain"), path("tool"), path("link"), path("no"));
+    let dir_arg = dir.display().to_string();
+    let passes: &[&[&str]] = &[
+        &["test", "-e", &plain],
+        &["test", "!", "-e", &missing],
+        &["test", "-d", &dir_arg],
+        &["test", "!", "-d", &plain],
+        &["test", "!", "-d", &missing],
+        &["test", "-x", &tool],
+        &["test", "!", "-x", &plain],
+        &["test", "!", "-x", &missing],
+        &["points-to", &link, "plain"],
+        &["holds", &plain, "two", "words"],
+        &["holds", &link, "two words"],
+    ];
+    for args in passes {
+        let out = output(args);
+        assert_eq!(out.status.code(), Some(0), "{args:?}: {out:?}");
+    }
+    let fails: &[(&[&str], &str)] = &[
+        (&["test", "-e", &missing], "test of "),
+        (&["test", "!", "-e", &plain], "Exists is true"),
+        (&["test", "-d", &plain], "Dir is false"),
+        (&["test", "-x", &plain], "Executable is false"),
+        (&["test", "!", "-x", &tool], "Executable is true"),
+        (&["points-to", &link, "other"], "points to plain, not other"),
+        (&["points-to", &plain, "x"], "readlink "),
+        (
+            &["holds", &plain, "two"],
+            "holds \"two words\", not \"two\"",
+        ),
+        (&["holds", &missing, "x"], "read "),
+    ];
+    for (args, said) in fails {
+        let out = output(args);
+        assert_eq!(out.status.code(), Some(1), "{args:?}: {out:?}");
+        assert!(text(&out.stderr).contains(said), "{args:?}: {out:?}");
+    }
+}
+
+/// Catches: `zeros` writing other than that many zero bytes, or on the wrong stream;
+/// `leads` printing other than whether the process leads its group and its session
+/// (a test that the fake podman starts the action in a session of its own would pass
+/// either way); `ignore-signal` not ignoring the signal, or reporting a signal that
+/// cannot be ignored as ignored.
+#[test]
+fn zeros_leads_and_ignored_signals() {
+    use std::os::unix::process::CommandExt as _;
+    let out = output(&["zeros", "5", ";", "zeros", "--stderr", "3"]);
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    assert_eq!(out.stdout, [0; 5]);
+    assert_eq!(out.stderr, [0; 3]);
+
+    let out = act(&["leads"]).process_group(0).output().expect("runs");
+    assert_eq!(text(&out.stdout), "group 1 session 0\n", "{out:?}");
+    let out = output(&["setsid", ";", "leads"]);
+    assert_eq!(text(&out.stdout), "group 1 session 1\n", "{out:?}");
+
+    let out = output(&["ignore-signal", "15", ";", "kill-self", "15"]);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(
+        text(&out.stderr).contains("still running after signal 15"),
+        "{out:?}"
+    );
+    let out = output(&["ignore-signal", "9", ";", "echo", "on"]);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(text(&out.stderr).contains("ignore signal 9: "), "{out:?}");
+    assert!(out.stdout.is_empty(), "{out:?}");
+}
+
+/// Catches: the new verbs' failures exiting 0 (a failed step taken for success) or
+/// with nothing on stderr: a path that is not there to remove or stat, a named pipe
+/// where a file is, a file in a directory that is not there.
+#[test]
+fn failed_file_steps_exit_1() {
+    let dir = dir("act-file-failures");
+    let missing = dir.join("missing").display().to_string();
+    let taken = dir.join("taken");
+    std::fs::write(&taken, "").expect("taken");
+    let taken = taken.display().to_string();
+    let no_dir = dir.join("no/such/file").display().to_string();
+    let out_file = dir.join("out").display().to_string();
+    let cases: &[(&[&str], &str)] = &[
+        (&["remove", &missing], "remove "),
+        (&["mkfifo", &taken], "mkfifo "),
+        (&["truncate", &no_dir, "1"], "truncate "),
+        (&["copy", &out_file, &missing], "read "),
+        (&["inode-links", &out_file, &missing], "stat "),
+        (&["write-lines", &no_dir, "x"], "create "),
+    ];
+    for (args, said) in cases {
+        let out = output(args);
+        assert_eq!(out.status.code(), Some(1), "{args:?}: {out:?}");
+        assert!(text(&out.stderr).contains(said), "{args:?}: {out:?}");
+        assert!(!Path::new(&out_file).exists(), "{args:?}: wrote OUT");
+    }
+}

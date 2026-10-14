@@ -3,11 +3,12 @@
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
+use kbf_proto::reapi::Digest;
 use kbf_transfer::{Cas, CasError, TransferConfig, TransferStats, digest_of, label};
 use kbf_types::LeaseId;
 
 use super::engine;
-use super::fake::{Fake, Find, lock};
+use super::fake::{Fake, Find, lock, within};
 use super::front::{chunked, failing};
 
 /// C-11, first half (docs/design/worker-cache.md#10-test-plan). A blob the server
@@ -106,6 +107,201 @@ async fn a_find_missing_that_fails_leaves_the_blob_to_be_uploaded() {
     assert_eq!(engine.put(b"held".to_vec()).await, Ok(held.clone()));
     assert_eq!(*lock(&fake.writes), [label(&held)]);
     assert_eq!(*lock(&fake.finds), [1, 1, 1]);
+    assert_eq!(engine.stats().find_missing_unavailable, 0);
+}
+
+/// One question for a lease's whole output set, the way the container driver asks
+/// (the 14,245 distinct outputs of one action took 785 s to upload when each upload
+/// asked for itself, 64 uploads at a time). `missing` over 15,000 digests, 14,000 of them
+/// held, asks in 15 calls of 1000 (`--transfer-find-missing-chunk`), all 15 out at the
+/// server at once, and answers the 1000 it lacks in the order asked, counted in the
+/// lease's `find_missing_digests` and `outputs_present`. Storing those 1000 asks
+/// nothing more. An answer is used once: a digest not asked about, or asked about and
+/// already stored, is asked again on its next put. Mutants seen red: puts ask
+/// FindMissing again after `missing` (a 16th call, for the 1000 puts together); the
+/// chunks asked one at a time (1 call out at once); the answer kept after its put
+/// (the second put of `blobs[0]` asks nothing, 16 calls, not 17).
+#[tokio::test]
+async fn a_whole_output_set_is_asked_about_in_chunks_at_once() {
+    let fake = Arc::new(Fake::default());
+    let blobs: Vec<Vec<u8>> = (0..15_000)
+        .map(|i| format!("output {i}").into_bytes())
+        .collect();
+    let digests: Vec<Digest> = blobs.iter().map(|b| digest_of(b)).collect();
+    // Every 15th blob is new; the server holds the other 14,000.
+    for (i, bytes) in blobs.iter().enumerate() {
+        if i % 15 != 0 {
+            fake.insert(bytes.clone());
+        }
+    }
+    let new: Vec<Digest> = digests.iter().step_by(15).cloned().collect();
+    let engine = engine(fake.serve().await, TransferConfig::default());
+    let scope = engine.scope(&LeaseId::new(8, 1));
+    fake.close_finds();
+    let watch = async {
+        within(10, || lock(&fake.finds).len() == 15).await;
+        let at_once = lock(&fake.finds).len();
+        fake.open_finds();
+        at_once
+    };
+    let (missing, at_once) = futures::join!(scope.missing(&digests), watch);
+    assert_eq!(at_once, 15, "FindMissing calls out at the server at once");
+    assert_eq!(missing, new);
+    assert_eq!(*lock(&fake.finds), [1000; 15], "the digests of each call");
+    let stats = scope.stats();
+    assert_eq!(
+        (stats.find_missing_digests, stats.outputs_present),
+        (15_000, 14_000)
+    );
+    let puts = blobs.iter().step_by(15).map(|b| scope.put(b.clone()));
+    let stored: Result<Vec<Digest>, CasError> =
+        futures::future::join_all(puts).await.into_iter().collect();
+    assert_eq!(stored, Ok(new.clone()));
+    assert_eq!(
+        lock(&fake.finds).len(),
+        15,
+        "FindMissing calls after the puts"
+    );
+    assert_eq!(lock(&fake.writes).len(), 1000);
+    let stats = scope.stats();
+    assert_eq!(
+        (
+            stats.find_missing_digests,
+            stats.outputs_present,
+            stats.write_calls,
+            stats.written_blobs
+        ),
+        (15_000, 14_000, 1000, 1000)
+    );
+    // Not asked about: asked now, held, not written.
+    assert_eq!(scope.put(blobs[1].clone()).await, Ok(digests[1].clone()));
+    // Asked about and stored: the answer was used, so it is asked again.
+    assert_eq!(scope.put(blobs[0].clone()).await, Ok(digests[0].clone()));
+    assert_eq!(lock(&fake.finds).len(), 17);
+    assert_eq!(lock(&fake.writes).len(), 1000);
+    let stats = scope.stats();
+    assert_eq!((stats.outputs_present, stats.written_blobs), (14_002, 1000));
+}
+
+/// A whole set asked about against a worker listener without FindMissing: its three
+/// calls, out at once, are each answered UNIMPLEMENTED; every digest is answered
+/// missing (the one the server holds too) and stored without another question, and
+/// the first UNIMPLEMENTED alone is counted (and logged). Mutant seen red: each
+/// UNIMPLEMENTED counted (`find_missing_unavailable` 3).
+#[tokio::test]
+async fn without_find_missing_a_whole_set_is_answered_missing() {
+    let fake = Arc::new(Fake::default());
+    *lock(&fake.find) = Find::Unimplemented;
+    let blobs: Vec<Vec<u8>> = (0..3000)
+        .map(|i| format!("blob {i}").into_bytes())
+        .collect();
+    let digests: Vec<Digest> = blobs.iter().map(|b| digest_of(b)).collect();
+    fake.insert(blobs[7].clone());
+    let engine = engine(fake.serve().await, TransferConfig::default());
+    let scope = engine.scope(&LeaseId::new(8, 2));
+    fake.close_finds();
+    let watch = async {
+        within(10, || lock(&fake.finds).len() == 3).await;
+        fake.open_finds();
+    };
+    let (missing, ()) = futures::join!(scope.missing(&digests), watch);
+    assert_eq!(missing, digests);
+    assert_eq!(*lock(&fake.finds), [1000; 3]);
+    assert_eq!(engine.stats().find_missing_unavailable, 1);
+    for bytes in &blobs[..10] {
+        scope.put(bytes.clone()).await.expect("stored");
+    }
+    assert_eq!(lock(&fake.finds).len(), 3);
+    assert_eq!(lock(&fake.writes).len(), 10);
+    assert_eq!(scope.stats().outputs_present, 0);
+    // Turned off, the engine asks nothing more: every digest is missing.
+    assert_eq!(engine.missing(&digests[..5]).await, digests[..5]);
+    assert_eq!(lock(&fake.finds).len(), 3);
+}
+
+/// One call of a whole set fails (UNAVAILABLE, no retries) while the other two are
+/// answered: the failed call's 1000 digests are all answered missing, held or not, and
+/// the other two keep the server's answer (only their new digests), in the order asked;
+/// `outputs_present` counts the held digests of the answered calls alone. A transient
+/// failure is not UNIMPLEMENTED: `find_missing_unavailable` stays 0 and FindMissing
+/// stays on, so a later put still asks (and skips a held blob). The three calls are
+/// held at the server until all three arrive, so exactly one fails, whichever it is.
+/// Mutants seen red: a failed call turns FindMissing off for the process (the later put
+/// asks nothing and stores the held blob); a failed call answered "present" (its new
+/// digests dropped from the answer).
+#[tokio::test]
+async fn one_failed_call_of_a_whole_set_answers_only_its_own_digests_missing() {
+    let fake = Arc::new(Fake::default());
+    let blobs: Vec<Vec<u8>> = (0..3001)
+        .map(|i| format!("set blob {i}").into_bytes())
+        .collect();
+    let digests: Vec<Digest> = blobs[..3000].iter().map(|b| digest_of(b)).collect();
+    // Every third blob is new; the server holds the others, and the 3001st (not asked).
+    for (i, bytes) in blobs.iter().enumerate() {
+        if i % 3 != 0 || i == 3000 {
+            fake.insert(bytes.clone());
+        }
+    }
+    *lock(&fake.find) = Find::UnavailableFirst(1);
+    let config = TransferConfig {
+        retries: 0,
+        ..TransferConfig::default()
+    };
+    let engine = engine(fake.serve().await, config);
+    let scope = engine.scope(&LeaseId::new(8, 3));
+    fake.close_finds();
+    let watch = async {
+        within(10, || lock(&fake.finds).len() == 3).await;
+        fake.open_finds();
+    };
+    let (missing, ()) = futures::join!(scope.missing(&digests), watch);
+    assert_eq!(*lock(&fake.finds), [1000; 3]);
+    // The failed call's chunk is answered whole; the others, their new digests alone.
+    let answer_if_failed = |failed: usize| -> Vec<Digest> {
+        digests
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| i / 1000 == failed || i % 3 == 0)
+            .map(|(_, d)| d.clone())
+            .collect()
+    };
+    let failed = (0..3)
+        .find(|&k| missing == answer_if_failed(k))
+        .unwrap_or_else(|| panic!("no single failed chunk explains {} missing", missing.len()));
+    let present = digests.len() - missing.len();
+    let held_in_failed = (failed * 1000..(failed + 1) * 1000)
+        .filter(|i| i % 3 != 0)
+        .count();
+    assert_eq!(present, 2000 - held_in_failed);
+    let stats = scope.stats();
+    assert_eq!(
+        (stats.find_missing_digests, stats.outputs_present),
+        (3000, present as u64)
+    );
+    assert_eq!(engine.stats().find_missing_unavailable, 0);
+    // Storing the answer asks nothing more.
+    for d in &missing {
+        let i = digests.iter().position(|x| x == d).expect("asked");
+        scope.put(blobs[i].clone()).await.expect("stored");
+    }
+    assert_eq!(
+        lock(&fake.finds).len(),
+        3,
+        "FindMissing calls after the puts"
+    );
+    // FindMissing is still on: a held blob not asked about is asked, and skipped.
+    let writes = lock(&fake.writes).len();
+    assert_eq!(writes, missing.len());
+    assert_eq!(
+        scope.put(blobs[3000].clone()).await,
+        Ok(digest_of(&blobs[3000]))
+    );
+    assert_eq!(lock(&fake.finds).len(), 4, "a later put asks FindMissing");
+    assert_eq!(
+        lock(&fake.writes).len(),
+        writes,
+        "the held blob is not stored"
+    );
     assert_eq!(engine.stats().find_missing_unavailable, 0);
 }
 
