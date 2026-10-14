@@ -500,16 +500,12 @@ of section 9 except the log-format row, which stage 3 pins), `kbf-tier/tests/flu
 
 Where it differs from the sections above, and why:
 
-- **`--meta-log=raft` is refused with `--write-tier-dir`.** When stage 4b was built the
-  Raft log wrote format 1 and the format raise was not built
-  ([metadata-snapshots.md](metadata-snapshots.md), section 4, leaves its value to the HA
-  design). Stage 5 (section 6.8) builds the raise and runs the tier over the Raft log in
-  `kbf-sim-cell`; the server still refuses the pair until the known gap below is closed. Under `--meta-log=memory` a restart
-  starts with an empty index whose writer epochs start from 1 again, so the server
-  deletes every file an earlier start left in the directory (`kbf_tier::clear`) before
-  the open: none of it is indexed, and an old block's name could be one of the new
-  start's objects. The recovery above is tested over a metadata log that outlives the
-  cache; it protects data in production once the raise lands.
+- **The memory log clears the directory.** Under `--meta-log=memory` a restart starts
+  with an empty index whose writer epochs start from 1 again, so the server deletes
+  every file an earlier start left in the directory (`kbf_tier::clear`) before the
+  open: none of it is indexed, and an old block's name could be one of the new start's
+  objects. Under `--meta-log=raft` (allowed since section 6.9) nothing is cleared: the
+  recovery above runs against the committed staged table.
 - **Grouped writes reach the tier through the group's settle.** Each segment the
   write group seals (section 3) is staged as one range of the open block, with one
   `PutStaged`, before any PUT slot is taken; a segment the tier does not take is PUT as
@@ -532,11 +528,10 @@ Where it differs from the sections above, and why:
   allocated once each, so no id is drawn twice, and no random source is needed.
 - **The oldest unflushed age** of a block recovered at a restart counts from that
   restart.
-- **One known gap:** a `PutStaged` whose commit applies but answers an error leaves the
-  tier's committed length below the index's; that block's flush then fails each round.
-  Only a log that can apply a command and lose the answer (the Raft log) can do it, and
-  that log is refused with the tier today; wiring the raise must also seed the length
-  from the committed state.
+- **A `PutStaged` whose commit applied but whose answer was lost** (a log that
+  stopped after the entry was durable) would leave the tier's committed length below
+  the index's: the block's reads refused, the object marked unreachable by the first
+  read, and the block removed at its seal. Section 6.9 closes it.
 
 ### 6.8 As built (rollout stage 5: the tier in the cell)
 
@@ -561,9 +556,32 @@ Where it differs from the sections above, and why:
   `RaftMetaLog` themselves; the order of steps in `kbf-front`'s cache (sync before
   `PutStaged`, `ObjectFlushed` before the rename) is the cell's copy of it, because the
   cell polls each future once and `kbf-front`'s tier calls run on the blocking pool.
-- **`kbf-server` still refuses `--meta-log=raft` with `--write-tier-dir`**: the known
-  gap of section 6.7 (a `PutStaged` applied whose answer was lost) needs the tier's
-  committed lengths seeded from the committed state before the pilot runs the pair.
+- **`kbf-server` refused `--meta-log=raft` with `--write-tier-dir`** until section 6.9.
+
+### 6.9 As built (the tier over the Raft log in `kbf-server`)
+
+- **The raise at the tier's start.** `kbf_server::write_tier::attach` asks the log to
+  ready itself and the directory for the tier (`TierLog::ready_for_tier`) before
+  `Cache::attach_tier`, and only when `--write-tier-dir` is given. The Raft log raises
+  itself to machine version 2 (`RaftMetaLog::raise_machine_version`, which commits
+  nothing on a log already there); the memory log has nothing to raise and clears the
+  directory instead. A raft server without a tier never
+  raises its log, so an older binary can still read it; once raised, a binary that
+  runs only version 1 refuses the log at the raise (section 6.5).
+- **No clearing under the Raft log.** The tier's directory is recovered against the
+  committed staged table at each start (section 6.4); only the memory log, whose index
+  starts empty, clears it (section 6.7).
+- **A lost `PutStaged` answer.** When the commit answers an error, the cache reads the
+  committed state: if it holds the object through the range's end, the range is
+  answered committed, so the tier's committed length follows the index (its blobs are
+  read from the block, and the block is sealed and flushed). The caller still gets the
+  error. If the state cannot be read either, the range is answered as failed, as
+  before; that cannot happen with the single-voter Raft log, whose queries read the
+  state it has applied even after it stopped.
+- Tests: `kbf-server/tests/write_tier_raft.rs` (the raise once, none without a tier,
+  staged, sealed and flushed objects across a restart), the tier over each log in
+  `kbf-server/tests/binary.rs`, and
+  `kbf-front/tests/write_tier_flush.rs::a_put_staged_that_applied_but_lost_its_answer_is_read_and_flushed`.
 
 ## 7. Expected effect on the 15,189-file upload
 

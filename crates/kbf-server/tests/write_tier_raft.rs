@@ -21,7 +21,7 @@ use kbf_objstore::{
     ByteRange, Capabilities, KeyPrefix, ListPage, ListToken, MemoryStore, ObjectKey, ObjectStore,
     ObjectStoreError, PageSize,
 };
-use kbf_server::write_tier::{Index, TierLog, attach};
+use kbf_server::write_tier::{TierLog, attach};
 use kbf_server::{Args, RaftLogError, RaftMetaLog};
 use kbf_store::StdFs;
 use kbf_tier::TierOptions;
@@ -221,7 +221,8 @@ async fn a_raft_server_with_a_tier_raises_its_log_once() {
     let log = cache.meta();
     assert_eq!(log.machine_version(), MachineVersion::V2);
     let applied = log.applied_index();
-    assert_eq!(log.ready_for_tier(), Ok(Index::Durable));
+    let tier_dir = StdFs::new(&dirs.tier).expect("the tier dir");
+    log.ready_for_tier(&tier_dir).expect("ready");
     assert_eq!(log.applied_index(), applied, "the raise committed again");
     drop(cache);
 
@@ -245,18 +246,20 @@ async fn a_raft_server_without_a_tier_leaves_its_log_at_version_1() {
     drop(cache);
     let older = dirs.open_running(MachineVersion::V1).await;
     assert_eq!(
-        older.expect("a version-1 binary opens it").machine_version(),
+        older
+            .expect("a version-1 binary opens it")
+            .machine_version(),
         MachineVersion::V1
     );
 }
 
 /// Catches: a raft server that clears the tier directory at a start, as the memory
-/// log's does (every staged block would be lost: its objects marked missing, its
-/// acknowledged blobs unreadable until uploaded again), or that forgets an object's
-/// staged, sealed or flushed state across a restart. Before the restart: one object
-/// flushed (`ObjectFlushed`), one sealed whose PUT failed (`SealStaged`), one open
-/// (`PutStaged` only). After it, with the store down, the staged ones are read from
-/// the tier, and once the store is back the next round flushes both.
+/// log's does (its `TIER` gone while objects are staged, the start is refused; the
+/// staged blocks, the only copies of acknowledged blobs, deleted), or that forgets an
+/// object's staged, sealed or flushed state across a restart. Before the restart: one
+/// object flushed (`ObjectFlushed`), one sealed whose PUT failed (`SealStaged`), one
+/// open (`PutStaged` only). After it, with the store down, the staged ones are read
+/// from the tier, and once the store is back the next round flushes both.
 #[tokio::test]
 async fn staged_sealed_and_flushed_objects_survive_a_raft_restart() {
     let dirs = Dirs::new("survive");
@@ -305,7 +308,11 @@ async fn staged_sealed_and_flushed_objects_survive_a_raft_restart() {
     let mut both = vec![sealed, open];
     both.sort_unstable();
     assert_eq!(done, both, "{round:?}");
-    for (digest, bytes) in [(a_digest, &a_bytes), (b_digest, &b_bytes), (c_digest, &c_bytes)] {
+    for (digest, bytes) in [
+        (a_digest, &a_bytes),
+        (b_digest, &b_bytes),
+        (c_digest, &c_bytes),
+    ] {
         assert_eq!(staged_on(&cache, digest).await, Some(None));
         assert_eq!(&cache.read_blob(&digest).await.expect("read"), bytes);
     }

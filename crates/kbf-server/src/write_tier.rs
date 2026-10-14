@@ -35,35 +35,29 @@ pub enum WriteTierError {
     Start(#[from] TierStartError),
 }
 
-/// Whether a metadata log's index outlives the process: what a tier directory left by
-/// an earlier start is to the next one.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Index {
-    /// The index starts empty at every start (`--meta-log=memory`): nothing an
-    /// earlier start left in the directory is indexed, and the log's writer epochs
-    /// start from 1 again, so an old block's name could be one of the new start's
-    /// objects.
-    Empty,
-    /// The index is kept across restarts (`--meta-log=raft`): the tier's start
-    /// recovers the directory against the committed staged table.
-    Durable,
-}
-
 /// A metadata log the write tier can run over.
 pub trait TierLog: MetaLog {
-    /// Readies the log to commit the tier's commands, and says whether its index
-    /// outlives the process. Called once per start, only when a tier is configured,
-    /// before the tier attaches.
+    /// Readies the log, and the tier directory `dir`, for a start of the tier: called
+    /// once per start, only when a tier is configured, before the tier attaches.
     ///
     /// # Errors
-    /// The log cannot take the tier's commands; the server does not start.
-    fn ready_for_tier(&self) -> Result<Index, MetaLogError>;
+    /// The log cannot take the tier's commands, or the directory cannot be readied;
+    /// the server does not start.
+    fn ready_for_tier(&self, dir: &StdFs) -> Result<(), WriteTierError>;
 }
 
 impl TierLog for MemoryMetaLog {
-    /// The memory log takes every command as it is: nothing to raise.
-    fn ready_for_tier(&self) -> Result<Index, MetaLogError> {
-        Ok(Index::Empty)
+    /// Deletes every file an earlier start left in `dir` ([`kbf_tier::clear`]). The
+    /// memory log takes every command as it is, but its index starts empty: nothing
+    /// in the directory is indexed, and its writer epochs start from 1 again, so an
+    /// old block's name could be one of this start's objects.
+    fn ready_for_tier(&self, dir: &StdFs) -> Result<(), WriteTierError> {
+        let cleared = kbf_tier::clear(dir).map_err(WriteTierError::Clear)?;
+        tracing::info!(
+            files = cleared.len(),
+            "write tier directory cleared for a memory index"
+        );
+        Ok(())
     }
 }
 
@@ -76,20 +70,20 @@ where
     /// ([`RaftMetaLog::raise_machine_version`]); a log already there commits nothing.
     /// From then on a binary that runs only version 1 refuses the log. A server
     /// without a tier never calls it, so its log stays one an older binary reads.
-    fn ready_for_tier(&self) -> Result<Index, MetaLogError> {
-        // Stand-in (red first): the raise is not wired yet.
-        let _ = MachineVersion::V2;
-        Err(MetaLogError::Unavailable("not built yet".to_owned()))
+    /// `dir` is left as it is: the tier's start recovers it against the committed
+    /// staged table, which outlives the process.
+    fn ready_for_tier(&self, _: &StdFs) -> Result<(), WriteTierError> {
+        self.raise_machine_version(MachineVersion::V2)
+            .map_err(WriteTierError::Log)
     }
 }
 
 /// `cache` with the tier the flags name attached, and what its start found; the cache
 /// as it was when the tier is off.
 ///
-/// With a tier, the log is readied first ([`TierLog::ready_for_tier`]: the Raft log is
-/// raised to machine version 2 once). Over a log whose index starts empty
-/// ([`Index::Empty`]) every file an earlier start left in the directory is then
-/// deleted ([`kbf_tier::clear`]); over a durable one the tier's start recovers them
+/// With a tier, the log and the directory are readied first
+/// ([`TierLog::ready_for_tier`]: the Raft log is raised to machine version 2 once; the
+/// memory log's directory is cleared), then the tier's start recovers the directory
 /// against the committed staged table ([`Cache::attach_tier`]). Without a tier the log
 /// is not touched.
 ///
@@ -103,14 +97,7 @@ pub async fn attach<M: TierLog, O: ObjectStore>(
         return Ok((cache, None));
     };
     let fs = StdFs::new(dir).map_err(WriteTierError::Dir)?;
-    let index = cache.meta().ready_for_tier().map_err(WriteTierError::Log)?;
-    if index == Index::Empty {
-        let cleared = kbf_tier::clear(&fs).map_err(WriteTierError::Clear)?;
-        tracing::info!(
-            files = cleared.len(),
-            "write tier directory cleared for a memory index"
-        );
-    }
+    cache.meta().ready_for_tier(&fs)?;
     let (cache, startup) = cache
         .attach_tier(fs, options, SERVER, args.tier.abandon())
         .await?;

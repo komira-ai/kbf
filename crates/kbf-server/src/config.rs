@@ -345,8 +345,7 @@ impl Args {
     /// ([`crate::write_tier::attach`]).
     #[must_use]
     pub fn write_tier(&self) -> Option<(PathBuf, TierOptions)> {
-        // Stand-in (red first): the tier is still off over the Raft log.
-        self.tier.config().filter(|_| self.meta_log == MetaLogKind::Memory)
+        self.tier.config()
     }
 
     /// The listeners these flags describe.

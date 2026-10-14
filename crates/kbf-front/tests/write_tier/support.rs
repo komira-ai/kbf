@@ -75,6 +75,10 @@ impl Log {
     }
 
     /// The next `n` commits of `command` are applied and then answered UNAVAILABLE.
+    #[allow(
+        dead_code,
+        reason = "write_tier_flush.rs uses it; write_tier.rs does not"
+    )]
     pub fn lose_answer(&self, command: &'static str, n: usize) {
         assert!(COMMANDS.contains(&command), "{command}");
         *lock(&self.0.lose).entry(command).or_default() += n;

@@ -592,7 +592,10 @@ fn write_tier_dir_attaches_a_tier_over_either_metadata_log() {
     let raft = raft_dir("write-tier-raft");
     let (child, _, _) = started(raft_server(&raft));
     interrupt(child);
-    assert!(opens_as_version_1(&raft), "a raft log raised without a tier");
+    assert!(
+        opens_as_version_1(&raft),
+        "a raft log raised without a tier"
+    );
     for _ in 0..2 {
         let mut c = raft_server(&raft);
         c.args(tier);
@@ -600,7 +603,10 @@ fn write_tier_dir_attaches_a_tier_over_either_metadata_log() {
         assert!(dir.join("TIER").exists());
         interrupt(child);
     }
-    assert!(!opens_as_version_1(&raft), "a raft log not raised for the tier");
+    assert!(
+        !opens_as_version_1(&raft),
+        "a raft log not raised for the tier"
+    );
     std::fs::remove_dir_all(&dir).expect("remove the tier dir");
     std::fs::remove_dir_all(&raft).expect("remove the raft dir");
 }
