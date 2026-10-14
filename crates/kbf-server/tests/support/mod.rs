@@ -205,6 +205,7 @@ impl Deref for Cell {
 
 /// Channels to a server's two listeners, and REAPI helpers.
 pub struct Client {
+    pub reapi_addr: SocketAddr,
     pub worker_addr: SocketAddr,
     channel: Channel,
 }
@@ -446,6 +447,7 @@ impl Client {
             .await
             .expect("connect");
         Self {
+            reapi_addr: reapi,
             worker_addr: worker,
             channel,
         }
