@@ -1003,7 +1003,13 @@ fn a_busy_program_is_started_again_within_the_limit() {
     let limit = Duration::from_millis(300);
     let busy = output_within(std::process::Command::new(&program), limit, &dir).expect_err("busy");
     assert_eq!(busy.raw_os_error(), Some(libc::ETXTBSY));
-    assert!(started.elapsed() < UNTIL_KILLED, "waited past the limit");
+    // Retrying a busy program stops at its own limit; one second covers the last
+    // retry and the spawn, not a host stall (this test has no hung fake).
+    let waited = started.elapsed();
+    assert!(
+        waited < limit + Duration::from_secs(1),
+        "waited past the limit: {waited:?}"
+    );
     kbf_outputs::remove_tree(&dir).expect("clean");
 }
 
