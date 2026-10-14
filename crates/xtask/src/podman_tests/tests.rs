@@ -321,3 +321,12 @@ fn a_home_that_is_not_utf8_reaches_the_unit_as_it_is() {
     want.push(home);
     assert!(args.contains(&want), "{args:?}");
 }
+
+/// Catches a default runtime directory other than the one systemd gives the user, so
+/// the verb waits for a bus that never appears there (and podman looks in the wrong
+/// place) on a runner, which passes no `--runtime-dir`.
+#[test]
+fn the_default_runtime_dir_is_the_user_s_under_run_user() {
+    assert_eq!(default_runtime_dir(1001), Path::new("/run/user/1001"));
+    assert_eq!(default_runtime_dir(0), Path::new("/run/user/0"));
+}

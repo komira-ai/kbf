@@ -238,25 +238,75 @@ fn every_target_runs_in_its_own_delegated_unit() {
     );
 }
 
-/// Catches a failed target that stops the run (the later targets never run) and one
+/// Catches a failed target that stops the run (the later targets never run), one
 /// passed over because a later target passed (the status of the last unit taken for
-/// the run's): the first target fails, the other four still run, and the verb fails
-/// naming the first alone.
+/// the run's), and a verb that records only the first failure or only the last: the
+/// first and fourth targets fail, every target still runs, and the verb fails naming
+/// both, in the order they ran.
 #[test]
 fn a_failed_target_fails_the_verb_after_every_target_ran() {
-    let run = Run::new("fail1");
+    let run = Run::new("fail2");
     let (code, _, err) = run.xtask(
         Path::new(FAKE),
         None,
-        Some("fails:--unit=kbf-podman-tests-podman"),
+        Some("fails:--unit=kbf-podman-tests-podman,--unit=kbf-podman-tests-podman_cache"),
     );
     assert_eq!(code, Some(1), "{err}");
     assert_eq!(run.sudo_args(), format!("{}{}", run.linger(), run.units()));
+    let failed = |target: &str| {
+        format!(
+            "the tests of -p kbf-driver-container --test {target} failed in their unit \
+             ({}): exit status: 101\n",
+            run.root
+                .join(format!("target/debug/deps/{target}-0f1e"))
+                .display()
+        )
+    };
     assert!(
         err.ends_with(&format!(
-            "xtask: the tests of -p kbf-driver-container --test podman failed in their unit \
-             ({}): exit status: 101\n",
-            run.root.join("target/debug/deps/podman-0f1e").display()
+            "xtask: {}{}",
+            failed("podman"),
+            failed("podman_cache")
+        )),
+        "{err}"
+    );
+}
+
+/// Catches the wait for the user manager's bus skipped or cut short: the bus appears
+/// a second after the verb starts, and the fake podman fails when there is no bus, so
+/// the run passes only if the verb waited for it before the first podman command.
+#[test]
+fn the_verb_waits_for_a_bus_that_appears_late() {
+    let run = Run::new("late");
+    let bus = run.runtime.join("bus");
+    std::fs::remove_file(&bus).expect("no bus yet");
+    let binder = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        drop(UnixListener::bind(bus).expect("the bus"));
+    });
+    let (code, _, err) = run.xtask(Path::new(FAKE), None, None);
+    binder.join().expect("the bus was bound");
+    assert_eq!(code, Some(0), "{err}");
+    assert_eq!(run.podman_args(), run.podman_ran());
+    assert_eq!(run.sudo_args(), format!("{}{}", run.linger(), run.units()));
+}
+
+/// Catches a bus that never appears passed over: after 100 looks 100 ms apart the
+/// verb fails naming the bus, and podman, cargo and the units never run.
+#[test]
+fn a_bus_that_never_appears_runs_nothing_after_linger() {
+    let run = Run::new("nobus");
+    let bus = run.runtime.join("bus");
+    std::fs::remove_file(&bus).expect("no bus");
+    let (code, _, err) = run.xtask(Path::new(FAKE), None, None);
+    assert_eq!(code, Some(1));
+    assert_eq!(run.sudo_args(), run.linger());
+    assert_eq!(run.podman_args(), "");
+    assert_eq!(run.cargo_args(), "");
+    assert!(
+        err.ends_with(&format!(
+            "xtask: no socket at {} after 100 looks 100ms apart\n",
+            bus.display()
         )),
         "{err}"
     );

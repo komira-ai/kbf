@@ -20,9 +20,11 @@
 //! - Run as `sudo`, it appends `<working directory>: <arguments>` as one line to
 //!   `sudo-args` next to it, and exits 0 (the tests it was asked to run passed).
 //! - Run as `podman`, it appends `XDG_RUNTIME_DIR=<value>: <arguments>` as one line to
-//!   `podman-args` next to it. `--version` prints a version line, `manifest inspect`
-//!   prints the file `podman-index.json` next to it (the image index a test wrote for
-//!   it), and anything else (`pull`) prints nothing.
+//!   `podman-args` next to it. With no socket at `$XDG_RUNTIME_DIR/bus` (the user
+//!   manager's bus, which rootless Podman needs) it exits 125. Otherwise `--version`
+//!   prints a version line, `manifest inspect` prints the file `podman-index.json` next
+//!   to it (the image index a test wrote for it), and anything else (`pull`) prints
+//!   nothing.
 //!
 //! `XTASK_FAKE_DEFECT` plants one defect of the real build: `ignores-override` (the
 //! build embeds the head whatever the override), `accepts-bad` (a malformed override
@@ -32,10 +34,11 @@
 //! next build cannot start) or `version-fails` (`kbf-server` exits 1). Of the
 //! attestation store: `accepts-all` (every file verifies, whatever the flags) or
 //! `ignores-bytes` (a file verifies when any attestation has its flags). Of sudo:
-//! `tests-fail` (it exits 101, as a failed test binary does) or `fails:<argument>`
-//! (it exits 101 when one of its arguments is `<argument>`, so one unit of several
-//! fails). Of podman: `podman-fails` (every podman command exits 125).
+//! `tests-fail` (it exits 101, as a failed test binary does) or `fails:<a>,<b>,...`
+//! (it exits 101 when one of its arguments is one of `<a>`, `<b>`, ..., so some units
+//! of several fail). Of podman: `podman-fails` (every podman command exits 125).
 use std::io::Write;
+use std::os::unix::fs::FileTypeExt;
 use std::path::Path;
 use std::process::ExitCode;
 
@@ -147,11 +150,12 @@ fn sudo(argv0: &str, args: &[String]) -> ExitCode {
         .open(dir.join("sudo-args"))
         .expect("sudo-args");
     writeln!(log, "{}: {}", cwd.display(), args.join(" ")).expect("sudo-args");
-    let fails_on = std::env::var("XTASK_FAKE_DEFECT")
-        .unwrap_or_default()
+    let defect_var = std::env::var("XTASK_FAKE_DEFECT").unwrap_or_default();
+    let fails_on: Vec<&str> = defect_var
         .strip_prefix("fails:")
-        .map(str::to_owned);
-    if defect("tests-fail") | args.iter().any(|a| Some(a) == fails_on.as_ref()) {
+        .map(|list| list.split(',').collect())
+        .unwrap_or_default();
+    if defect("tests-fail") | args.iter().any(|a| fails_on.contains(&a.as_str())) {
         return ExitCode::from(101);
     }
     ExitCode::SUCCESS
@@ -168,6 +172,11 @@ fn podman(argv0: &str, args: &[String]) -> ExitCode {
     writeln!(log, "XDG_RUNTIME_DIR={runtime_dir}: {}", args.join(" ")).expect("podman-args");
     if defect("podman-fails") {
         eprintln!("xtask-fake: podman failed");
+        return ExitCode::from(125);
+    }
+    let bus = Path::new(&runtime_dir).join("bus");
+    if !std::fs::symlink_metadata(&bus).is_ok_and(|m| m.file_type().is_socket()) {
+        eprintln!("xtask-fake: no user manager bus at {}", bus.display());
         return ExitCode::from(125);
     }
     match args.first().map(String::as_str) {

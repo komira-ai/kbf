@@ -167,6 +167,12 @@ pub fn wait_for_socket(path: &Path, tries: u32, every: Duration) -> Result<(), E
     )))
 }
 
+/// The runtime directory systemd gives the user `uid` (its `XDG_RUNTIME_DIR`), where
+/// its user manager's bus is.
+pub fn default_runtime_dir(uid: u32) -> PathBuf {
+    PathBuf::from(format!("/run/user/{uid}"))
+}
+
 /// `sudo -n <args>`: its exit status. Its output is this process's.
 fn sudo(program: &Path, args: &[OsString]) -> Result<ExitStatus, Error> {
     Command::new(program)
@@ -311,7 +317,7 @@ pub struct PodmanTests<'a> {
 pub fn run(p: &PodmanTests<'_>) -> Result<Vec<String>, Error> {
     let uid = rustix::process::getuid().as_raw();
     let gid = rustix::process::getgid().as_raw();
-    let default_dir = PathBuf::from(format!("/run/user/{uid}"));
+    let default_dir = default_runtime_dir(uid);
     let runtime_dir = p.runtime_dir.unwrap_or(default_dir.as_path());
     runner_setup(p.sudo, uid, runtime_dir)?;
     print!("{}", podman(p.podman, runtime_dir, &["--version"])?);
