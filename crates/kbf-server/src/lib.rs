@@ -12,8 +12,9 @@
 //! - The operator API ([`api`]): HTTP/JSON under `/v1` on a third listener, off unless
 //!   `--api-listen` is given; `GET /v1/nodes`, and cordon, drain and uncordon, which
 //!   need the token of `--api-token-file` ([`token`]). On the same listener,
-//!   `GET /healthz` and `GET /readyz` for a front's health check ([`health`]); the
-//!   REAPI listener answers the same readiness over `grpc.health.v1`
+//!   `GET /healthz` and `GET /readyz` for a front's health check ([`health`]), and
+//!   `GET /metrics`, the cache's upload-path metrics for Prometheus ([`metrics`]).
+//!   The REAPI listener answers `/readyz`'s readiness over `grpc.health.v1`
 //!   ([`grpc_health`]). And the build pages, `GET /v1/invocations/{id}` and below,
 //!   over the invocation records kept in memory ([`http_invocations`]), off unless
 //!   the REAPI policy names `invocations.getAuthorizer` (or `--invocations-open` is
@@ -57,6 +58,7 @@ pub mod identity;
 pub mod machine;
 pub mod mdm;
 mod memory;
+pub mod metrics;
 mod missing;
 pub mod raft_log;
 pub mod rollout;

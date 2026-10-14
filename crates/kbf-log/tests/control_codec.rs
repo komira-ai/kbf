@@ -856,11 +856,13 @@ fn a_wall_time_outside_u64_nanoseconds_is_not_written() {
     assert_eq!(dec(&enc(&at(last))), Ok(at(last)));
 }
 
-/// Catches a format other than 1 written or read for a control command.
+/// Catches a control command written or read under a format this build does not know
+/// (format 3; formats 1 and 2 both carry control commands, since format 2 only adds
+/// the write-tier metadata commands).
 #[test]
-fn control_commands_are_format_1_only() {
+fn control_commands_refuse_an_unknown_format() {
     let command = batch(FarmInput::Tick);
-    let format = Format::new(2);
+    let format = Format::new(3);
     assert_eq!(encode(format, &command), Err(EncodeError::Format(format)));
     assert_eq!(
         kbf_log::decode(format, &enc(&command)),

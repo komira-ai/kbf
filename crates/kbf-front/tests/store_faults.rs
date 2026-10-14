@@ -94,17 +94,19 @@ fn assert_audit_clean(cache: &FaultyCache) {
     assert_eq!(cache.meta().violations(), Vec::<String>::new());
 }
 
-/// A PUT the store refuses, and a footer read-back that does not reach the store,
-/// commit nothing: the upload fails UNAVAILABLE and the blob stays absent. Then a
-/// retry stores it.
+/// A PUT the store refuses on every attempt, and a footer read-back that does not
+/// reach the store, commit nothing: the upload fails UNAVAILABLE and the blob stays
+/// absent. Then a retry stores it.
 ///
 /// Catches: committing `PutBlob` before (or regardless of) the PUT and the footer read.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_failed_put_or_footer_read_commits_nothing() {
     let (cache, store) = cache(Capabilities::default()).await;
     let b = TestBlob::new(1);
 
-    store.on_put(PutFault::Fail);
+    for _ in 0..3 {
+        store.on_put(PutFault::Fail);
+    }
     let err = cache.store_blobs(vec![b.verified()]).await.unwrap_err();
     assert!(matches!(err, CacheError::Store(_)), "{err:?}");
     assert_eq!(Status::from(err).code(), Code::Unavailable);
@@ -132,27 +134,31 @@ async fn a_failed_put_or_footer_read_commits_nothing() {
     assert_audit_clean(&cache);
 }
 
-/// A PUT the store committed but whose answer was lost commits nothing, and a retry on
-/// a store with conditional writes goes to a new key rather than failing
-/// AlreadyExists on the orphan.
+/// PUTs the store committed but whose answers were lost (on every attempt) commit
+/// nothing, and a later upload on a store with conditional writes goes to a new key
+/// rather than failing AlreadyExists on an orphan.
 ///
-/// Catches: committing `PutBlob` before the PUT answers; reusing an object id on retry.
-#[tokio::test]
+/// Catches: committing `PutBlob` before the PUT answers; reusing an object id.
+#[tokio::test(start_paused = true)]
 async fn a_lost_put_answer_commits_nothing_and_the_retry_takes_a_new_key() {
     let (cache, store) = cache(CONDITIONAL).await;
     let b = TestBlob::new(2);
 
-    store.on_put(PutFault::LoseAnswer);
+    for _ in 0..3 {
+        store.on_put(PutFault::LoseAnswer);
+    }
     let err = cache.store_blobs(vec![b.verified()]).await.unwrap_err();
     assert_eq!(Status::from(err).code(), Code::Unavailable);
     assert_absent(&cache, &b).await;
-    let orphan = store.put_keys()[0].clone();
-    assert!(store.stored(&orphan).await.is_some(), "the lost PUT stored");
+    for orphan in store.put_keys() {
+        assert!(store.stored(&orphan).await.is_some(), "the lost PUT stored");
+    }
 
     cache.store_blobs(vec![b.verified()]).await.expect("retry");
     let keys = store.put_keys();
-    assert_eq!(keys.len(), 2);
-    assert_ne!(keys[0], keys[1], "the retry reused the orphan's key");
+    assert_eq!(keys.len(), 4);
+    let distinct: std::collections::BTreeSet<_> = keys.iter().collect();
+    assert_eq!(distinct.len(), 4, "a key was reused: {keys:?}");
     assert_eq!(cache.read_blob(&b.digest).await.expect("read"), b.bytes);
     assert_audit_clean(&cache);
 }
@@ -187,7 +193,7 @@ async fn a_blob_is_not_reported_while_its_put_is_in_flight() {
     upload.await.expect("join").expect("upload");
     assert!(matches!(
         answer(&cache, b.digest).await,
-        BlobAnswer::Present(_)
+        BlobAnswer::Present { .. }
     ));
     assert_eq!(cache.find_missing(&[b.digest]).await.expect("find"), vec![]);
     assert_audit_clean(&cache);
@@ -195,10 +201,13 @@ async fn a_blob_is_not_reported_while_its_put_is_in_flight() {
 
 /// A store that answers OK but holds a truncated object, no object, or some other
 /// segment: the footer read back from the store does not name the blob, so nothing is
-/// committed and the upload fails.
+/// committed and the upload fails INTERNAL (`docs/design/write-path.md` section 3.4:
+/// a store that acknowledges and then returns something else is a fault to surface,
+/// and is not retried).
 ///
 /// Catches: skipping the footer read-back and committing the offsets the writer chose
-/// (the PUT's OK is then the only evidence, and these stores lie in it).
+/// (the PUT's OK is then the only evidence, and these stores lie in it); answering
+/// the disagreement UNAVAILABLE, as if the store had not been reached.
 #[tokio::test]
 async fn a_put_that_stores_other_bytes_is_never_committed() {
     let other = TestBlob::new(40);
@@ -213,7 +222,8 @@ async fn a_put_that_stores_other_bytes_is_never_committed() {
         let b = TestBlob::new(41 + i as u64);
         store.on_put(lie);
         let err = cache.store_blobs(vec![b.verified()]).await.unwrap_err();
-        assert_ne!(Status::from(err).code(), Code::Ok, "{what}");
+        assert_eq!(Status::from(err).code(), Code::Internal, "{what}");
+        assert_eq!(store.put_keys().len(), 1, "{what}: retried");
         assert_absent(&cache, &b).await;
         assert!(cache.meta().put_blobs().is_empty(), "{what}: committed");
         assert_audit_clean(&cache);
@@ -268,7 +278,7 @@ async fn a_read_that_does_not_reach_the_store_marks_nothing() {
         assert!(store.script_done());
 
         assert!(
-            matches!(answer(&cache, b.digest).await, BlobAnswer::Present(_)),
+            matches!(answer(&cache, b.digest).await, BlobAnswer::Present { .. }),
             "{blip:?}"
         );
         assert_eq!(

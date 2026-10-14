@@ -17,7 +17,7 @@ kbf-deploy                0      0
 kbf-driver-container      0      0
 kbf-driver-native         0      0
 kbf-estimator             -      -
-kbf-front                55      8
+kbf-front                51      8
 kbf-guest                15      6
 kbf-host                  0      0
 kbf-invocation            0      0
@@ -29,7 +29,7 @@ kbf-mdm                   0      0
 kbf-mdm-api               0      0
 kbf-meta                 10      1
 kbf-node                  0      0
-kbf-objstore             68     22
+kbf-objstore             67     21
 kbf-outputs               0      0
 kbf-proto                 -      -
 kbf-raft                 19     19

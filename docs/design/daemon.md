@@ -571,6 +571,41 @@ them, recording none of its outputs):
 Every output file, stdout and stderr is stored in the CAS before the `Result` is sent;
 the server refuses an `OK` result whose outputs are not all stored.
 
+## Where a lease's time went
+
+When a lease's run ends the daemon logs one INFO line, `lease phases:` and then
+`key=value` fields, and sends the same fields to an observer as `Event::LeaseEnded`
+(`kbf_daemon::phases`):
+
+| Field | What it is |
+|---|---|
+| `lease`, `driver`, `ok` | the lease, the driver it ran on, and whether the run produced a result (an action that exits non-zero does) |
+| `lease_ms` | from the run's start in the daemon to its end |
+| `inputs_ms`, `run_ms`, `outputs_ms` | the driver's own stamps in the result's `ExecutedActionMetadata`: input fetch, execution, output upload; `-` when the run produced no result. What `lease_ms` holds beyond their sum is the driver's work outside them (making and removing the lease's directories, the container's create and chown) |
+| `output_files`, `output_dirs` | the files and directories the result names at its top level (the files inside an output directory are in the `transfers:` line's `written_blobs`) |
+
+`outputs_ms` includes waiting for the transfer engine's request limit, which every
+lease of the process shares; there is no per-lease busy time.
+
+What the lease moved is the transfer engine's `transfers:` INFO line
+([worker-cache.md](worker-cache.md#4-the-shared-transfer-engine)), which carries the
+same `lease=` field: join the two lines on it. The engine logs it when the lease's
+last handle on the engine goes, which is after the lease ends if a read it started is
+still finishing for another lease. Its counts, per lease:
+
+| Field | What it is |
+|---|---|
+| `read_calls`, `read_bytes` | ByteStream reads the lease started (a retry is a read) and the bytes they received, including bytes that arrive after the lease left while another lease still waits on the read |
+| `merged_reads` | reads served by a fetch another caller had started; they add no bytes |
+| `find_missing_digests`, `outputs_present` | digests the lease asked FindMissing about, and uploads skipped because the server already held the blob (no bytes sent) |
+| `write_calls` | ByteStream writes, every attempt (a retried or failed one too) |
+| `written_blobs`, `written_bytes` | blobs the lease's successful writes stored (output files, Directories, Trees, stdout, stderr), and the bytes they sent. Uploads are not shared: two leases writing the same new blob at once both send it, and both count it |
+| `retries` | requests retried after UNAVAILABLE or a broken connection |
+
+So the sum of `read_bytes` over the leases is what the server served, with nothing
+counted twice. The server's side of the same uploads is in `GET /metrics`
+([api.md](../api.md#get-metrics)).
+
 **Upload deadline.** The whole upload (output files, stdout and stderr) must finish
 within `--output-upload-deadline-secs` (default 1800, 30 minutes; container, native and
 whole-machine drivers). Past it the upload is dropped, which cancels its calls to the
