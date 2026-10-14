@@ -5,12 +5,13 @@
 //! example systemd units in `docs/deploy/` against the binaries' flag parsers
 //! ([`deploy_units`], `tests/deploy_units.rs`).
 //!
-//! It also holds the M1 integration harness. `m1/run.sh` starts a cell (MinIO, one
-//! `kbf-server` with in-memory metadata and the S3 store, one daemon) and builds the
-//! sample projects in `m1/` remote-only with pinned Bazel and buck2, twice; the second
-//! build must be all remote cache hits. With buck2 it also builds `//:pause`, an action
-//! that sleeps, and drains the daemon's node through the operator API while that lease
-//! is in flight (`m1/run.sh` says what it checks). The `kbf-cell` binary is its helper:
+//! It also holds the M1 integration harness, the `kbf-cell` binary:
+//! - `kbf-cell m1` ([`m1`], Linux only) starts a cell (MinIO, one `kbf-server` with
+//!   in-memory metadata and the S3 store, one daemon) and builds the sample projects in
+//!   `m1/` remote-only with pinned Bazel and buck2, twice; the second build must be all
+//!   remote cache hits. With buck2 it also builds `//:pause`, an action that sleeps, and
+//!   drains the daemon's node through the operator API while that lease is in flight
+//!   ([`m1`] says what it checks);
 //! - `kbf-cell pki` writes the cell's throwaway certificates ([`pki`]);
 //! - `kbf-cell daemon` runs the test-only daemon ([`daemon`], Linux only);
 //! - `kbf-cell check` reads both builds' summaries and applies the exit rule
@@ -27,5 +28,7 @@
 pub mod daemon;
 pub mod deploy_units;
 pub mod hygiene;
+#[cfg(target_os = "linux")]
+pub mod m1;
 pub mod pki;
 pub mod summary;
