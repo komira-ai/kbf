@@ -118,8 +118,32 @@ pub struct Seen {
     pub uploaded: BTreeSet<Digest>,
     /// Each upload acknowledged: when, the blob, and the object its PUT wrote.
     pub acked: Vec<(FarmTime, Digest, ObjectId)>,
-    /// Each crash point that took the server down, and when.
+    /// Each crash point that took the server down, and when: a point is recorded
+    /// where it fires (an in-commit crash once its disk fault has failed the `PutBlob`
+    /// commit, not when it is planted).
     pub crashed_at: Vec<(FarmTime, StorePoint)>,
+    /// Each PUT whose deadline answered its upload `UNAVAILABLE`.
+    pub timed_out: BTreeSet<ObjectId>,
+    /// Each PUT the store answered failed while its upload waited.
+    pub put_failed: BTreeSet<ObjectId>,
+    /// Each `PutBlob` commit a crash cut part-way through, and what the next start
+    /// found of it.
+    pub cuts: Vec<Cut>,
+}
+
+/// A `PutBlob` commit a crash cut part-way through ([`StorePoint::InCommit`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Cut {
+    pub object: ObjectId,
+    pub digest: Digest,
+    /// How the server went down.
+    pub down: Down,
+    /// The most unsynced bytes any file held when it did ([`FaultFs::unsynced`]): a
+    /// power cut keeping fewer, and more than none, tears the commit's record.
+    pub unsynced: usize,
+    /// Whether the next start's index has the blob in `object`: `None` until it
+    /// starts.
+    pub survived: Option<bool>,
 }
 
 /// The server node.
@@ -304,7 +328,7 @@ impl Server {
             self.down(Down::Kill);
             return;
         };
-        self.up = Some(Up {
+        let up = Up {
             lease_epoch: leadership.log_id.get(),
             sched: Scheduler::new(leadership.term).recording_requeues(),
             machine: FarmMachine::new(leadership.term),
@@ -318,7 +342,9 @@ impl Server {
             callers: BTreeMap::new(),
             uploads: BTreeMap::new(),
             deadlines: BTreeMap::new(),
-        });
+        };
+        write::read_back_cuts(&up, &mut self.seen.cuts);
+        self.up = Some(up);
     }
 
     fn restart_later(&mut self) {

@@ -6,7 +6,7 @@
 //! object (a plain PUT, the worst case: no `conditional_put`), so a writer that reuses
 //! an id is caught by property 9 rather than refused by the store.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use kbf_meta::ObjectId;
@@ -96,6 +96,18 @@ pub struct StoreStats {
     pub false_fails: u64,
 }
 
+/// How a fault met one PUT, for the tests to tie an outcome to the fault that caused it
+/// (a network duplicate of a PUT or an upload can leave an orphan too).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Met {
+    /// Failed, keeping nothing.
+    Failed,
+    /// Kept, its acknowledgement lost.
+    LostAck,
+    /// Kept, answered as failed.
+    FalseFail,
+}
+
 const T_FAULT: u64 = 0;
 const T_REPLY: u64 = 1 << 32;
 
@@ -118,6 +130,10 @@ pub struct ObjectStore {
     delayed: BTreeMap<u64, Pending>,
     next_reply: u64,
     stats: StoreStats,
+    /// Each PUT a counted or refusing fault met: its object, its digest and how.
+    met: Vec<(ObjectId, Digest, Met)>,
+    /// Each object PUT again while the store held it: a network duplicate of a PUT.
+    repeated: BTreeSet<ObjectId>,
     out: Vec<Output<Msg>>,
 }
 
@@ -148,6 +164,19 @@ impl ObjectStore {
         self.stats
     }
 
+    /// Each PUT a refusal, a lost acknowledgement or a false failure met, in order.
+    #[must_use]
+    pub fn met(&self) -> &[(ObjectId, Digest, Met)] {
+        &self.met
+    }
+
+    /// Each object PUT again while the store held it (a network duplicate of a PUT,
+    /// whose second answer may be done where the first was lost or failed).
+    #[must_use]
+    pub fn repeated(&self) -> &BTreeSet<ObjectId> {
+        &self.repeated
+    }
+
     pub(crate) fn take_outputs(&mut self) -> Vec<Output<Msg>> {
         std::mem::take(&mut self.out)
     }
@@ -157,11 +186,13 @@ impl ObjectStore {
         if self.lose_next > 0 {
             self.lose_next -= 1;
             self.stats.lost_acks += 1;
+            self.met.push((object, digest, Met::LostAck));
             return;
         }
         let msg = if self.keep_fail_next > 0 {
             self.keep_fail_next -= 1;
             self.stats.false_fails += 1;
+            self.met.push((object, digest, Met::FalseFail));
             Msg::PutFailed { object, digest }
         } else {
             Msg::PutDone { object, digest }
@@ -171,6 +202,9 @@ impl ObjectStore {
 
     fn put(&mut self, now: FarmTime, pending: Pending) {
         self.stats.puts += 1;
+        if self.objects.contains_key(&pending.1) {
+            self.repeated.insert(pending.1);
+        }
         if self.paused_until.is_some_and(|t| now < t) {
             self.stats.held += 1;
             self.held.push(pending);
@@ -183,6 +217,7 @@ impl ObjectStore {
             }
             self.stats.failed += 1;
             let (to, object, digest) = pending;
+            self.met.push((object, digest, Met::Failed));
             let msg = Msg::PutFailed { object, digest };
             self.out.push(Output::Send { to, msg });
             return;
@@ -375,6 +410,11 @@ mod tests {
         assert!(!s.holds_digest(&digest(3)));
         assert_eq!(answers(&put(&mut s, 101, 4)), ["done"]);
         assert_eq!(s.stats().failed, 3);
+        let failed: Vec<_> = s.met().iter().map(|(o, _, m)| (o.seq(), *m)).collect();
+        assert_eq!(
+            failed,
+            [(1, Met::Failed), (2, Met::Failed), (3, Met::Failed)]
+        );
     }
 
     /// Catches a lost acknowledgement that also loses the object, a false failure that
@@ -392,6 +432,14 @@ mod tests {
         assert_eq!(answers(&put(&mut s, 3, 3)), ["done"]);
         let stats = s.stats();
         assert_eq!((stats.lost_acks, stats.false_fails, stats.puts), (1, 1, 3));
+        let met = [
+            (object(1), digest(1), Met::LostAck),
+            (object(2), digest(2), Met::FalseFail),
+        ];
+        assert_eq!(s.met(), met);
+        assert!(s.repeated().is_empty());
+        put(&mut s, 4, 1);
+        assert_eq!(s.repeated(), &BTreeSet::from([object(1)]));
     }
 
     /// Catches a slow window that answers at once, keeps the object late or loses it,

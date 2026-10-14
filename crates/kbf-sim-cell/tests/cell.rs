@@ -80,14 +80,15 @@ fn every_kind_parses_from_its_name() {
 }
 
 /// Reruns one seed: `KBF_SIM_KIND=Crash KBF_SIM_SEED=7 cargo test -p kbf-sim-cell
-/// --test cell -- --ignored replay`.
+/// --test cell -- --ignored replay`; a failure's replay line adds `KBF_SIM_CRASH` when
+/// its scenario pinned one crash.
 #[test]
 #[ignore = "run by hand to replay one seed"]
 fn replay() {
-    let kind = std::env::var("KBF_SIM_KIND")
-        .ok()
-        .and_then(|k| Kind::parse(&k))
-        .unwrap_or(Kind::Calm);
-    let seed = std::env::var("KBF_SIM_SEED").map_or(0, |s| s.parse().expect("a seed"));
-    println!("{:?}", run(&Scenario::new(kind, seed)));
+    let var = |name| std::env::var(name).ok();
+    let kind = var("KBF_SIM_KIND").unwrap_or_else(|| "Calm".to_owned());
+    let seed = var("KBF_SIM_SEED").unwrap_or_else(|| "0".to_owned());
+    let crash = var("KBF_SIM_CRASH");
+    let scenario = Scenario::from_replay(&kind, &seed, crash.as_deref()).expect("a replay line");
+    println!("{:?}", run(&scenario));
 }

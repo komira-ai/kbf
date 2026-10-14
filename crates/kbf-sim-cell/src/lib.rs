@@ -38,8 +38,8 @@ pub use cell::{Kind, RunReport, Scenario, run};
 pub use client::{FakeClient, Job};
 pub use daemon::FakeDaemon;
 pub use hook::{CrashPlan, Down, StorePoint};
-pub use server::{PUT_TIMEOUT, Seen, Server, ServerFault, ServerPlan};
-pub use store::{BlobHomes, ObjectStore, StoreFault, StorePlan, StoreStats};
+pub use server::{Cut, PUT_TIMEOUT, Seen, Server, ServerFault, ServerPlan};
+pub use store::{BlobHomes, Met, ObjectStore, StoreFault, StorePlan, StoreStats};
 pub use sweep::{Failure, Sweep, sweep};
 
 /// What the nodes of a cell send each other. `stream` stands for a daemon's gRPC

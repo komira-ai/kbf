@@ -2,14 +2,14 @@
 //! store, indexed with `PutBlob` once the store has it, and only then acknowledged,
 //! with a crash hook at each [`StorePoint`] and a deadline on every PUT.
 
-use kbf_meta::{Applied, Command, Location, ObjectId, StoreId};
+use kbf_meta::{Applied, BlobAnswer, Command, Location, ObjectId, StoreId};
 use kbf_sim::{NodeId, Output};
 use kbf_store::Fault;
 use kbf_types::FarmTime;
 
-use super::{PUT_TIMEOUT, Server, T_PUT};
+use super::{Cut, PUT_TIMEOUT, Server, T_PUT, Up};
 use crate::Msg;
-use crate::hook::StorePoint;
+use crate::hook::{Down, StorePoint};
 
 impl Server {
     /// The direct write path: `Upload`, then the store's answer. Any other message is
@@ -35,6 +35,7 @@ impl Server {
             }
             Msg::PutFailed { object, digest } => {
                 if let Some((client, _)) = up.uploads.remove(&object) {
+                    self.seen.put_failed.insert(object);
                     let msg = Msg::UploadFailed { digest };
                     self.out.push(Output::Send { to: client, msg });
                 }
@@ -44,7 +45,7 @@ impl Server {
                 if self.reach(now, StorePoint::BeforeCommit) {
                     return None;
                 }
-                self.arm_in_commit(now);
+                let planted = self.arm_in_commit();
                 let location = Location {
                     store: StoreId::new(0),
                     object,
@@ -52,7 +53,22 @@ impl Server {
                 };
                 let put = Command::PutBlob { digest, location };
                 let up = self.up.as_mut()?;
-                if let Some(Applied::Blob(Ok(_))) = up.commit(&self.out, put) {
+                let applied = up.commit(&self.out, put);
+                // The planted crash fired in this commit if the commit failed with it
+                // still pending; one that this commit did not reach is no cut of it.
+                let failed = up.failed_at.is_some();
+                if let (Some((point, down)), true, Some(_)) = (planted, failed, self.armed) {
+                    self.seen.crashed_at.push((now, point));
+                    let unsynced = self.disk.unsynced();
+                    self.seen.cuts.push(Cut {
+                        object,
+                        digest,
+                        down,
+                        unsynced,
+                        survived: None,
+                    });
+                }
+                if let Some(Applied::Blob(Ok(_))) = applied {
                     if self.reach(now, StorePoint::BeforeReply) {
                         return None;
                     }
@@ -75,6 +91,7 @@ impl Server {
             return;
         };
         if let Some((client, digest)) = up.uploads.remove(&object) {
+            self.seen.timed_out.insert(object);
             let msg = Msg::UploadFailed { digest };
             self.out.push(Output::Send { to: client, msg });
         }
@@ -90,18 +107,29 @@ impl Server {
         true
     }
 
-    /// A crash armed part-way through the next `PutBlob` commit is planted in the disk.
-    fn arm_in_commit(&mut self, now: FarmTime) {
-        let armed = self
-            .hooks
-            .peek()
-            .find(|(p, _, _)| matches!(p, StorePoint::InCommit { .. }));
-        let Some((point, _, _)) = armed else { return };
-        if let Some((StorePoint::InCommit { after }, how)) = self.hooks.reached(point) {
-            self.seen.crashed_at.push((now, point));
-            self.disk.fail_at(self.disk.ops() + after, Fault::Crash);
-            self.armed = Some(how);
-        }
+    /// A crash armed part-way through the next `PutBlob` commit is planted in the disk,
+    /// at the commit's `after`-th filesystem operation: the point and how the server
+    /// goes down there. It is recorded once it fires.
+    fn arm_in_commit(&mut self) -> Option<(StorePoint, Down)> {
+        let armed = self.hooks.peek().find(|(p, _, _)| p.in_commit().is_some());
+        let (point, _, _) = armed?;
+        let (point, how) = self.hooks.reached(point)?;
+        let after = point.in_commit().unwrap_or_default();
+        self.disk.fail_at(self.disk.ops() + after, Fault::Crash);
+        self.armed = Some(how);
+        Some((point, how))
+    }
+}
+
+/// At a start (`up`, before it serves): whether the index the log was opened to has
+/// each cut commit's blob in the cut's object (the commit was durable) or not (it was
+/// lost whole).
+pub(super) fn read_back_cuts(up: &Up, cuts: &mut [Cut]) {
+    for cut in cuts.iter_mut().filter(|c| c.survived.is_none()) {
+        let digest = cut.digest;
+        let answer = up.query(move |m| m.blob(&digest));
+        let held = matches!(answer, BlobAnswer::Present(at) if at.object == cut.object);
+        cut.survived = Some(held);
     }
 }
 

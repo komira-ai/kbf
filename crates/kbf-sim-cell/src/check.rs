@@ -154,14 +154,14 @@ fn nothing_half_indexed(
 pub(crate) fn orphans(
     objects: impl Iterator<Item = ObjectId>,
     answers: impl Iterator<Item = BlobAnswer>,
-) -> usize {
+) -> BTreeSet<ObjectId> {
     let named: BTreeSet<ObjectId> = answers
         .filter_map(|a| match a {
             BlobAnswer::Present(at) => Some(at.object),
             BlobAnswer::Unavailable | BlobAnswer::Absent => None,
         })
         .collect();
-    objects.filter(|o| !named.contains(o)).count()
+    objects.filter(|o| !named.contains(o)).collect()
 }
 
 /// Property 3.
@@ -248,13 +248,11 @@ impl<'a> Checker<'a> {
         if let Err((property, detail)) = result {
             let s = self.scenario;
             panic!(
-                "{:?} seed {} at {} ms: property {property} violated: {detail}\nreplay: \
-                 KBF_SIM_KIND={:?} KBF_SIM_SEED={} cargo test -p kbf-sim-cell --test cell -- --ignored replay",
+                "{:?} seed {} at {} ms: property {property} violated: {detail}\nreplay: {}",
                 s.kind,
                 s.seed,
                 at.as_millis(),
-                s.kind,
-                s.seed
+                s.replay_line()
             );
         }
     }
@@ -333,7 +331,7 @@ mod tests {
     use kbf_types::{DigestFunction, WorkerId};
 
     use super::*;
-    use crate::{FakeClient, action, input_of};
+    use crate::{Down, FakeClient, StorePoint, action, input_of};
 
     fn lease(seq: u64) -> LeaseId {
         LeaseId::new(1, seq)
@@ -438,8 +436,9 @@ mod tests {
         };
         let objects = [object(1), object(2), object(3)];
         let answers = [at(1), BlobAnswer::Absent, BlobAnswer::Unavailable, at(3)];
-        assert_eq!(orphans(objects.into_iter(), answers.into_iter()), 1);
-        assert_eq!(orphans(objects.into_iter(), [].into_iter()), 3);
+        let left = orphans(objects.into_iter(), answers.into_iter());
+        assert_eq!(left, BTreeSet::from([object(2)]));
+        assert_eq!(orphans(objects.into_iter(), [].into_iter()).len(), 3);
     }
 
     /// Catches a leases-kept check that fails an unlisted requeue (a lost `Start` is
@@ -543,6 +542,52 @@ mod tests {
             FarmTime::from_millis(7),
             Err((Property::OneRun, "x".to_owned())),
         );
+    }
+
+    /// Catches a pinned crash's failure whose replay line leaves the crash out: the
+    /// replay would run the seed's own crash, not the one that failed.
+    #[test]
+    #[should_panic(expected = "replay: KBF_SIM_KIND=StoreCrash KBF_SIM_SEED=5 \
+                                KBF_SIM_CRASH=in-commit-1/cut-3-0 cargo test")]
+    fn a_pinned_crash_panics_with_its_crash_in_the_replay_line() {
+        let cut = Down::PowerCut { keep: 3, names: 0 };
+        let scenario = Scenario::crash_at(5, StorePoint::InCommit { after: 1 }, cut);
+        let checker = Checker::new(&scenario);
+        checker.hold(
+            FarmTime::from_millis(7),
+            Err((Property::OneRun, "x".to_owned())),
+        );
+    }
+
+    /// Catches a replay line that does not read back to its scenario (another crash,
+    /// seed or kind), and a malformed one read as some scenario.
+    #[test]
+    fn a_replay_line_reads_back_to_its_scenario() {
+        let var = |line: &str, name: &str| -> Option<String> {
+            line.split_whitespace()
+                .find_map(|w| w.strip_prefix(&format!("{name}=")).map(str::to_owned))
+        };
+        let cut = Down::PowerCut { keep: 9, names: 5 };
+        let pinned = Scenario::crash_at(11, StorePoint::BeforeReply, cut);
+        for s in [pinned, Scenario::new(Kind::StoreSlow, 4)] {
+            let line = s.replay_line();
+            let kind = var(&line, "KBF_SIM_KIND").expect("a kind");
+            let seed = var(&line, "KBF_SIM_SEED").expect("a seed");
+            let crash = var(&line, "KBF_SIM_CRASH");
+            let back = Scenario::from_replay(&kind, &seed, crash.as_deref()).expect("parses");
+            assert_eq!(format!("{back:?}"), format!("{s:?}"), "{line}");
+        }
+        for (kind, seed, crash) in [
+            ("Stormy", "1", None),
+            ("Calm", "x", None),
+            ("Calm", "1", Some("put-sent/kill")),
+            ("StoreCrash", "1", Some("put-sent")),
+            ("StoreCrash", "1", Some("nowhere/kill")),
+            ("StoreCrash", "1", Some("put-sent/off")),
+        ] {
+            let read = Scenario::from_replay(kind, seed, crash);
+            assert!(read.is_none(), "{kind} {seed} {crash:?}");
+        }
     }
 
     /// Catches a renumbered property: failure lines and the docs name them so.

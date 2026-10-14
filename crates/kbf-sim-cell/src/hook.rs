@@ -8,6 +8,8 @@
 //! and arms it the same way. docs/design/write-tier-scenarios.md lists the points each
 //! scenario needs.
 
+use std::fmt;
+
 /// How the server goes down at a point.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Down {
@@ -28,10 +30,72 @@ pub enum StorePoint {
     /// The store has answered the PUT; `PutBlob` is not yet proposed.
     BeforeCommit,
     /// Part-way through the `PutBlob` commit: at its `after`-th filesystem operation
-    /// (or a later commit's, when this one takes fewer).
+    /// (from 0). The crash is planted in the disk there; if the commit takes fewer
+    /// operations it lands in a later commit, and is not recorded as this point.
     InCommit { after: u64 },
     /// `PutBlob` has committed; the client is not yet answered.
     BeforeReply,
+}
+
+impl Down {
+    /// The `Down` its [`fmt::Display`] form names, for a replay line.
+    #[must_use]
+    pub fn parse(text: &str) -> Option<Self> {
+        if text == "kill" {
+            return Some(Self::Kill);
+        }
+        let (keep, names) = text.strip_prefix("cut-")?.split_once('-')?;
+        Some(Self::PowerCut {
+            keep: keep.parse().ok()?,
+            names: names.parse().ok()?,
+        })
+    }
+}
+
+impl fmt::Display for Down {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Kill => f.write_str("kill"),
+            Self::PowerCut { keep, names } => write!(f, "cut-{keep}-{names}"),
+        }
+    }
+}
+
+impl StorePoint {
+    /// The point its [`fmt::Display`] form names, for a replay line.
+    #[must_use]
+    pub fn parse(text: &str) -> Option<Self> {
+        match text {
+            "put-sent" => Some(Self::PutSent),
+            "before-commit" => Some(Self::BeforeCommit),
+            "before-reply" => Some(Self::BeforeReply),
+            _ => {
+                let after = text.strip_prefix("in-commit-")?.parse().ok()?;
+                Some(Self::InCommit { after })
+            }
+        }
+    }
+
+    /// The filesystem operation of the `PutBlob` commit an [`StorePoint::InCommit`]
+    /// crash lands at; `None` for every other point.
+    #[must_use]
+    pub fn in_commit(self) -> Option<u64> {
+        match self {
+            Self::InCommit { after } => Some(after),
+            Self::PutSent | Self::BeforeCommit | Self::BeforeReply => None,
+        }
+    }
+}
+
+impl fmt::Display for StorePoint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::PutSent => f.write_str("put-sent"),
+            Self::BeforeCommit => f.write_str("before-commit"),
+            Self::InCommit { after } => write!(f, "in-commit-{after}"),
+            Self::BeforeReply => f.write_str("before-reply"),
+        }
+    }
 }
 
 /// Which points take the server down, each the `nth` time (from 0) it is reached once
@@ -112,5 +176,35 @@ mod tests {
             Some((StorePoint::BeforeReply, CUT))
         );
         assert_eq!(plan.peek().count(), 0);
+        assert_eq!(StorePoint::InCommit { after: 2 }.in_commit(), Some(2));
+        assert_eq!(StorePoint::BeforeReply.in_commit(), None);
+    }
+
+    /// Catches a point or a way down that a replay line names but cannot be read back
+    /// (the replay would run another crash), and text read as one that names none.
+    #[test]
+    fn points_and_downs_read_back_from_their_names() {
+        let points = [
+            StorePoint::PutSent,
+            StorePoint::BeforeCommit,
+            StorePoint::InCommit { after: 3 },
+            StorePoint::BeforeReply,
+        ];
+        for point in points {
+            assert_eq!(StorePoint::parse(&point.to_string()), Some(point));
+        }
+        let cut = Down::PowerCut {
+            keep: 17,
+            names: u64::MAX,
+        };
+        for down in [Down::Kill, cut] {
+            assert_eq!(Down::parse(&down.to_string()), Some(down));
+        }
+        for bad in ["", "in-commit-x", "after-reply"] {
+            assert_eq!(StorePoint::parse(bad), None, "{bad}");
+        }
+        for bad in ["", "cut-1", "cut-x-1", "cut-1-x", "kil"] {
+            assert_eq!(Down::parse(bad), None, "{bad}");
+        }
     }
 }

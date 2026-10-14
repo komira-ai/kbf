@@ -1,15 +1,18 @@
 //! A scenario, the cell it builds, and the run loop that checks after every step.
 
+use std::collections::BTreeSet;
 use std::time::Duration;
 
+use kbf_meta::ObjectId;
+
 use kbf_sim::{Chance, Faults, Node, NodeId, NodeInput, Output, Partition, Sim, SimRng, TraceHash};
-use kbf_types::{Effect, FarmTime, Resources, StateMachine};
+use kbf_types::{Digest, Effect, FarmTime, Resources, StateMachine};
 
 use crate::check::Checker;
 use crate::client::RETRY;
 use crate::{
-    Down, FakeClient, FakeDaemon, Msg, ObjectStore, Server, ServerFault, ServerPlan, StoreFault,
-    StorePlan, StorePoint, StoreStats, action,
+    Cut, Down, FakeClient, FakeDaemon, Met, Msg, ObjectStore, Server, ServerFault, ServerPlan,
+    StoreFault, StorePlan, StorePoint, StoreStats, action,
 };
 
 /// What the server meets in a run.
@@ -89,6 +92,9 @@ pub struct Scenario {
     /// The run stops here. Every fault has ended long enough before it for every
     /// action to be answered.
     pub end: FarmTime,
+    /// The one crash [`Scenario::crash_at`] put in place of the seed's: the replay line
+    /// names it, so a failure replays the crash that failed.
+    pub pinned: Option<(StorePoint, Down)>,
 }
 
 /// How many distinct actions the clients draw theirs from, so some are shared.
@@ -172,8 +178,9 @@ impl Scenario {
                 let point = match rng.between(0, 3) {
                     0 => StorePoint::PutSent,
                     1 => StorePoint::BeforeCommit,
+                    // A `PutBlob` commit is two operations: the append and the sync.
                     2 => StorePoint::InCommit {
-                        after: rng.between(0, 3),
+                        after: rng.between(0, 1),
                     },
                     _ => StorePoint::BeforeReply,
                 };
@@ -236,7 +243,56 @@ impl Scenario {
             partition,
             clients,
             end: quiet.saturating_add(Duration::from_secs(150)),
+            pinned: None,
         }
+    }
+
+    /// When [`Scenario::crash_at`] crashes the server.
+    pub const PINNED_AT: FarmTime = FarmTime::from_millis(10_000);
+
+    /// The [`Kind::StoreCrash`] scenario `seed` draws, with its crash replaced by one at
+    /// `point` (its first reach from [`Scenario::PINNED_AT`]), going `down`.
+    #[must_use]
+    pub fn crash_at(seed: u64, point: StorePoint, down: Down) -> Self {
+        let mut s = Self::new(Kind::StoreCrash, seed);
+        let crash = ServerFault::CrashAt {
+            point,
+            nth: 0,
+            down,
+        };
+        s.server.faults = vec![(Self::PINNED_AT, crash)];
+        s.pinned = Some((point, down));
+        s
+    }
+
+    /// The command that reruns this scenario: its kind, its seed and, if pinned, its
+    /// crash (`<point>/<down>`).
+    #[must_use]
+    pub fn replay_line(&self) -> String {
+        let crash = self
+            .pinned
+            .map(|(point, down)| format!(" KBF_SIM_CRASH={point}/{down}"))
+            .unwrap_or_default();
+        format!(
+            "KBF_SIM_KIND={:?} KBF_SIM_SEED={}{crash} cargo test -p kbf-sim-cell --test cell \
+             -- --ignored replay",
+            self.kind, self.seed
+        )
+    }
+
+    /// The scenario a replay line's `KBF_SIM_KIND`, `KBF_SIM_SEED` and `KBF_SIM_CRASH`
+    /// name; `None` if one does not parse, or a crash is pinned to a kind other than
+    /// [`Kind::StoreCrash`].
+    #[must_use]
+    pub fn from_replay(kind: &str, seed: &str, crash: Option<&str>) -> Option<Self> {
+        let kind = Kind::parse(kind)?;
+        let seed = seed.parse().ok()?;
+        let Some(crash) = crash else {
+            return Some(Self::new(kind, seed));
+        };
+        let (point, down) = crash.split_once('/')?;
+        let (point, down) = (StorePoint::parse(point)?, Down::parse(down)?);
+        (kind == Kind::StoreCrash).then(|| Self::crash_at(seed, point, down))
     }
 }
 
@@ -334,15 +390,25 @@ pub struct RunReport {
     pub accepted: usize,
     /// How many blobs were answered present.
     pub present: usize,
-    /// When each upload was acknowledged.
-    pub acked: Vec<FarmTime>,
+    /// Each upload acknowledged: when, the blob, and the object its PUT wrote.
+    pub acked: Vec<(FarmTime, Digest, ObjectId)>,
     /// How many crash points took the server down.
     pub crashes: usize,
     /// What the object store did.
     pub store: StoreStats,
+    /// Each PUT a store fault met, and how ([`ObjectStore::met`]).
+    pub met: Vec<(ObjectId, Digest, Met)>,
+    /// The objects PUT again while the store held them ([`ObjectStore::repeated`]).
+    pub repeated: BTreeSet<ObjectId>,
+    /// The PUTs whose deadline answered their upload `UNAVAILABLE`.
+    pub timed_out: BTreeSet<ObjectId>,
+    /// The PUTs the store answered failed while their upload waited.
+    pub put_failed: BTreeSet<ObjectId>,
+    /// Each `PutBlob` commit a crash cut, and what the next start found of it.
+    pub cuts: Vec<Cut>,
     /// Objects in the store that no index entry names at the end (left for the planned
     /// orphan sweep); `None` if the server is down at the end.
-    pub orphans: Option<usize>,
+    pub orphans: Option<BTreeSet<ObjectId>>,
 }
 
 /// Runs `scenario` to its end, checking every property after every step.
@@ -404,9 +470,14 @@ pub fn run(scenario: &Scenario) -> RunReport {
         starts: seen.starts,
         accepted: seen.accepted.values().filter(|n| **n > 0).count(),
         present: seen.present.len(),
-        acked: seen.acked.iter().map(|(at, _, _)| *at).collect(),
+        acked: seen.acked.clone(),
         crashes: seen.crashed_at.len(),
         store: store.stats(),
+        met: store.met().to_vec(),
+        repeated: store.repeated().clone(),
+        timed_out: seen.timed_out.clone(),
+        put_failed: seen.put_failed.clone(),
+        cuts: seen.cuts.clone(),
         orphans,
     }
 }
