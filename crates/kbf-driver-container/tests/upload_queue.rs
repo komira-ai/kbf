@@ -69,14 +69,15 @@ fn open_descriptors() -> usize {
     std::fs::read_dir("/dev/fd").expect("list /dev/fd").count()
 }
 
-/// Catches a walk that opens every output file while the stores are slow: each queued
-/// file holds its descriptor until it is stored, so a tree of thousands of files
-/// would hold thousands open (the lease's `nofile` limit is the daemon's too). The
-/// stores wait on a gate; once `UPLOADS_IN_FLIGHT` wait, the test watches the
-/// descriptors for 300 ms (the walk has time to run ahead) before opening it. The
-/// slack is the walk's own descriptors (the upper directory, the directory being
-/// read). Mutant seen red: the queue's channel given room for 1_000_000
-/// (`kbf-outputs/src/uploads.rs`, `mpsc::channel(0)`).
+/// Catches a walk that opens every output file while the stores are slow: a file
+/// being stored holds its descriptor until it is sent, so a tree of thousands of
+/// files would hold thousands open (the lease's `nofile` limit is the daemon's too).
+/// The walk closes each file once hashed, and a missing one is opened again only when
+/// its store starts. The stores wait on a gate; once `UPLOADS_IN_FLIGHT` wait, the
+/// test watches the descriptors for 300 ms (time to run ahead) before opening it. The
+/// slack is `collect`'s own descriptors (the upper directory, a directory being
+/// opened). Mutant seen red: the stores run with no bound (`src/pending.rs`,
+/// `buffer_unordered(usize::MAX)`).
 #[tokio::test]
 async fn the_walk_holds_at_most_one_file_past_the_stores_in_flight() {
     let upper = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
