@@ -24,7 +24,7 @@ for that lease only. This design does not cover that runtime.
 
 The rules this design keeps:
 
-- **One profile, applied by a script, checked by the same script.** A node is a
+- **One profile, applied by one program, checked by the same program.** A node is a
   pinned macOS build, plus a profile applied to a freshly erased Mac, plus the
   `kbf-daemon` artifact the deployment installs. Nothing else is on it.
 - **No toolchains on a node unless actions need them.** `kbf-daemon` arrives as a
@@ -43,7 +43,7 @@ The rules this design keeps:
 | Topic | Recommendation |
 |---|---|
 | Baseline | A pinned macOS version and build. A fresh state comes from *Erase All Content and Settings*, or from an Apple Configurator restore when the version must change or the Mac is new. There is no disk image for the host; VM golden images do live on Mac nodes (macOS VMs design). |
-| Provisioning layer | A plain, idempotent shell script with `apply` and `check` modes, over a declarative key=value profile, that uses only programs macOS ships. Not nix-darwin, not Ansible ([comparison](#2-the-provisioning-layer)). |
+| Provisioning layer | A plain, idempotent program (`kbf-mac-provision`, a Rust binary; first designed as a shell script) with `apply` and `check` modes, over a declarative key=value profile, that uses only programs macOS ships. Not nix-darwin, not Ansible ([comparison](#2-the-provisioning-layer)). |
 | `kbf-daemon` | Built and attested by CI on every commit to `main`, on a hosted macOS arm64 runner: signed (ad-hoc today; Developer ID if the project gets an Apple Developer account), with a SHA-256, an SBOM and build provenance. The operator's deployment job verifies the attestation and installs that per-commit tarball on each node. A release only tags digests that already ran; it never rebuilds. The profile holds host settings, not the daemon's version. |
 | Toolchains | The pinned Xcodes (several per host, chosen per action with `DEVELOPER_DIR`, as the macOS VMs design proposes) are in the worker profile. Clients route on `xcode` and `os_build`. Client-defined probes (for example a host identity) run per Xcode and are reported, never matched; an Xcode whose probe value differs from the expected one leaves the report until it re-qualifies. Simulator runtimes live only in VM images. |
 | Power | `sleep 0`, `autorestart 1`. The daemon's fence clock stops during sleep or suspend on any OS; that is a code bug ([#78](https://github.com/komira-ai/komira-build-farm/issues/78)), not something a setting fixes ([section 5.1](#51-sleep)). |
@@ -173,21 +173,21 @@ the action toolchain's Python. The script costs us its idempotence, which we mus
 and test ourselves. The check mode and the tests in [section 10](#10-how-each-part-is-tested)
 are how that cost is paid.
 
-### 2.1 Shape of the script
+### 2.1 Shape of the program
 
-**Today** the script and its tests are in
-[tools/mac-provision](../../tools/mac-provision/README.md), which lists every key it
-applies and checks. It is not yet in the per-commit tarball, and it adds a `restart`
-verb (section 5.7) and `--keys` to the three below.
-A Rust port, the crate [kbf-mac-provision](../../crates/kbf-mac-provision), implements
-`check`, `apply`, `print` and `restart` with the same profile format, item names, report
-lines and exit statuses. It also sets the older `com.apple.commerce AutoUpdate` with
-`appstore_auto_update`, and before its first change to a power or software update
-setting it records all of them in `/var/db/kbf-mac-provision/settings.before`, which
-its `revert` verb restores.
+**Today** the program is the Rust crate
+[kbf-mac-provision](../../crates/kbf-mac-provision), whose
+[README](../../crates/kbf-mac-provision/README.md) lists every key it applies and
+checks. It replaced the shell script this section first described, and kept its profile format, item
+names, report lines and exit statuses. It is not yet in the per-commit tarball, and it
+adds a `restart` verb (section 5.7), a `revert` verb and `--keys` to the three below
+(the README has the full usage).
+It also sets the older `com.apple.commerce AutoUpdate` with `appstore_auto_update`, and
+before its first change to a power or software update setting it records all of them in
+`/var/db/kbf-mac-provision/settings.before`, which `revert` restores.
 
-`kbf-mac-provision` is one POSIX `sh` script, shipped in the same tarball as
-`kbf-daemon` (section 4):
+`kbf-mac-provision` is one binary, to be shipped in the same tarball as `kbf-daemon`
+(section 4). Its three original verbs:
 
 ```text
 kbf-mac-provision check   --profile FILE   # read-only; one PASS/FAIL per key; exit 1 on any FAIL
@@ -255,8 +255,8 @@ The profile has two halves with different owners and different rates of change.
 updates, admin access, accounts, time, logs, the hostname, the scratch volume and the
 launchd job that runs `kbf-daemon` (the binary itself is the deployment's, section 4).
 It holds **no toolchain**: no Homebrew, no Rust, no Python, no
-package manager. `kbf-daemon` links only system libraries, and the provisioning script
-needs only what macOS ships.
+package manager. `kbf-daemon` and `kbf-mac-provision` link only system libraries, and
+`kbf-mac-provision` runs only programs macOS ships.
 
 **The worker profile** holds what actions run with:
 
@@ -275,7 +275,7 @@ Xcode is installed from the `.xip` whose SHA-256 the profile names, and never fr
 App Store. Getting the `.xip` onto a node needs an Apple Account sign-in, which
 renewing needs a person for. **Assumed:** unattended developer downloads are not
 reliable. So the download is an operator step once per Xcode version; installing and
-verifying it is the script's.
+verifying it is `kbf-mac-provision`'s.
 
 ### 3.1 Host identity
 
@@ -377,8 +377,8 @@ listed, and step 3 checks that they print it.
 >   a token that can sign.
 > - **The Linux binaries** (`kbf-daemon` and `kbf-server`, x86_64 and arm64) are built
 >   by their own jobs, not by the macOS job.
-> - **The darwin tarball holds `kbf-daemon` only:** `kbf-mac-provision` does not exist
->   yet. Only `kbf-daemon` is signed; the fleet-updates helpers do not exist yet.
+> - **The darwin tarball holds `kbf-daemon` only:** `kbf-mac-provision` is built and
+>   tested in CI but not packaged yet. Only `kbf-daemon` is signed; the fleet-updates helpers do not exist yet.
 > - **The oldest macOS supported is 14.0** (`MACOSX_DEPLOYMENT_TARGET`), a choice of
 >   that workflow; this design names none.
 > - **Signing is ad hoc with the hardened runtime** (`--options runtime`). CI checks
@@ -794,7 +794,7 @@ a push certificate to renew every year.
 
 **Decided: MDM.** Apple Business Manager plus a self-hosted NanoHUB behind
 `kbf-mdm-gate`, as the fleet-updates design (section 7) specifies. The profile does not
-change: an MDM delivers the same script as a package. Section 6.2 is the fallback until
+change: an MDM delivers the same program as a package. Section 6.2 is the fallback until
 it is live.
 
 ## 7. From the desk to the rack

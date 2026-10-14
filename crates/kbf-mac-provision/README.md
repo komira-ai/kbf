@@ -3,11 +3,10 @@
 `kbf-mac-provision` applies and checks the profile of a Mac node: the host settings and
 the worker profile that
 [docs/design/mac-node-provisioning.md](../../docs/design/mac-node-provisioning.md)
-(sections 2, 3 and 5) describes. It is one POSIX `sh` script that runs only programs
-macOS ships, over a profile of `KEY=VALUE` lines that it parses and never sources.
-The crate [kbf-mac-provision](../../crates/kbf-mac-provision) is its Rust port: it
-implements `check`, `apply`, `print` and `restart` over the same profile, and is tested
-against a fake Mac in `cargo test`. Where the port differs:
+(sections 2, 3 and 5) describes. It runs only programs macOS ships, over a profile of
+`KEY=VALUE` lines that it parses and never evaluates. It replaced a POSIX `sh` script of
+the same name and kept its profile format, item names, report lines and exit statuses.
+What the script did not do:
 
 - `appstore_auto_update` also reads and sets the older
   `/Library/Preferences/com.apple.commerce` `AutoUpdate`.
@@ -20,9 +19,8 @@ against a fake Mac in `cargo test`. Where the port differs:
   setting is not put back (its command fails, or it reads back otherwise), it prints a
   `FAIL` line for it, keeps the record where it is and exits 1; run it again once the
   setting can be changed.
-- Three items the script does not have, for the lease-user pool of
-  `docs/design/macos-end-state.md` (step 2), over
-  five optional keys (the script refuses them):
+- Three items for the lease-user pool of `docs/design/macos-end-state.md` (step 2),
+  over five optional keys:
   - `kbf_volume` (`/Volumes/<name>`, default `/Volumes/kbf`): a mounted APFS volume
     (`diskutil info` gives the path itself as the mount point), not indexed (`mdutil -s`, and `.metadata_never_index` at its
     root) and excluded from Time Machine (`tmutil isexcluded`). `apply` writes the
@@ -55,11 +53,13 @@ kbf-mac-provision check   --profile FILE [--keys K,K]   # one PASS/FAIL line per
 kbf-mac-provision apply   --profile FILE [--keys K,K]   # root: fix each FAIL, one CHANGE line per change
 kbf-mac-provision print   --profile FILE                # the resolved profile, its SHA-256, the node label
 kbf-mac-provision restart --profile FILE                # root: restart kbf-daemon, truncating its error log
+kbf-mac-provision revert                                # root: put back the recorded power and update settings
 ```
 
 - `apply` fixes each failing item, then checks again and prints only what still fails.
   A second `apply` prints nothing. Exit status: 0 when every item passes, 1 when one
-  fails, 2 for bad usage or a refused profile.
+  fails, 2 for bad usage, a refused profile, or a verb that refused or could not
+  finish.
 - **Check only** items are never changed by `apply`; it reports them and exits 1. An
   erase or a restore is the remedy for macOS and for simulator runtimes; FileVault and
   the administrator are the operator's.
@@ -100,14 +100,12 @@ letters and `_` only.
 
 | What | Where it runs | What it proves |
 |---|---|---|
-| [test/run.sh](test/run.sh) | CI job `mac-provision` (Linux) | Every item against a fake Mac ([test/fakecmd](test/fakecmd) stands in for each macOS program and keeps its state in files): a fresh Mac fails check on each item and passes after one apply; a second apply prints nothing and changes nothing; on a converged Mac each drift fails exactly its item, and apply fixes it or (check only) changes nothing; refused profiles; root; `--keys`; restart; a symbolic or hard link planted at the error log (never emptied); `sshd -T` skipped when not root; the Xcode sources; the lease auto-login rule |
-| [test/coverage.sh](test/coverage.sh) | `mac-provision` | Runs `run.sh` with the script under `bash -x` and measures line and branch coverage from the trace ([test/coverage.awk](test/coverage.awk) says how); fails below 100% |
-| [test/mutants.sh](test/mutants.sh) | `mac-provision` | Plants each listed defect in a copy of the script and fails unless the named tests go red |
-| [test/hosted-macos.sh](test/hosted-macos.sh) | CI job `native-macos` (a hosted macOS VM, as root) | The same script on real macOS for what a VM can prove; its header lists what is applied, asserted, and only read |
+| [tests/](tests) (`cargo test -p kbf-mac-provision`) | every CI test job | Every item against a fake Mac ([tests/support](tests/support) answers each macOS program from state in memory and logs each call): a fresh Mac fails check on each item and passes after one apply; a second apply prints nothing and changes nothing; on a converged Mac each drift fails exactly its item, and apply fixes it or (check only) changes nothing; refused profiles; root; `--keys`; restart; a symbolic or hard link planted at the error log (never emptied); `sshd -T` skipped when not root; the Xcode sources; the lease auto-login rule; the pool items; the record and `revert`. The `coverage` job holds the crate's line and branch coverage at its baseline |
+| [tests/as_root.rs](tests/as_root.rs) (`cargo xtask sudo-test -p kbf-mac-provision --test as_root`) | CI job `native-macos` (a hosted macOS VM, as root) | The binary on real macOS for what a VM can prove; its header lists what is applied, asserted, and only read |
 
 What only a real node of the pinned version can prove (design section 10): `pmset`
 on hardware, FileVault, Remote Login, the time server, whether the update preferences
 are honoured, an Xcode install from a real `.xip`, and whether a freshly erased Mac
 lists `_mbsetupuser` as an administrator. The hosted VM does, so `admin_user` fails
-there; the script allows no exception today, and if real nodes list it too, removing
+there; the program allows no exception today, and if real nodes list it too, removing
 it or allowing it is a decision to make explicitly.

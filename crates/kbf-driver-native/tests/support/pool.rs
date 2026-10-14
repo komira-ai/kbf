@@ -17,7 +17,8 @@ use kbf_driver_native::slots::{Pool, SlotUser};
 
 use super::PROMPT;
 
-/// Where the users' uids start; the kbf-mac-session CI script uses 650 to 659.
+/// Where the users' uids start; kbf-mac-session's root tests
+/// (crates/kbf-mac-session/tests/as_root.rs, `FIRST_UID` to `LAST_UID`) use 650 to 679.
 pub const FIRST_UID: u32 = 690;
 /// The next uid a test of this process may take.
 static NEXT_UID: AtomicU32 = AtomicU32::new(FIRST_UID);

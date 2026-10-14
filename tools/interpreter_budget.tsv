@@ -15,14 +15,6 @@
 
 # Files by extension or `#!` line. Key: the path.
 [files]
-tools/ci/mac-session-tests.sh	CI tests run as root; to become Rust tests run as root
-tools/mac-provision/kbf-mac-provision	Mac host provisioning; to become a Rust crate
-tools/mac-provision/test/coverage.awk	tests of kbf-mac-provision; to become Rust tests of its crate
-tools/mac-provision/test/coverage.sh	tests of kbf-mac-provision; to become Rust tests of its crate
-tools/mac-provision/test/fakecmd	tests of kbf-mac-provision; to become Rust tests of its crate
-tools/mac-provision/test/hosted-macos.sh	tests of kbf-mac-provision; to become Rust tests of its crate
-tools/mac-provision/test/mutants.sh	tests of kbf-mac-provision; to become Rust tests of its crate
-tools/mac-provision/test/run.sh	tests of kbf-mac-provision; to become Rust tests of its crate
 
 # Production Rust under crates/*/src/ that names a shell and a `-c` flag. Key: the path.
 [src-sh-c]
