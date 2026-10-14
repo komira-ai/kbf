@@ -1,7 +1,7 @@
 //! `kbf-mac-provision`: checks and applies the host settings and the worker profile of a
 //! Mac node from a profile file (docs/design/mac-node-provisioning.md, sections 2, 3 and
-//! 5). It is the Rust port of the script `tools/mac-provision/kbf-mac-provision`, with
-//! the same profile format, item names, report lines and exit statuses:
+//! 5). It replaced a shell script of the same name, and kept its profile format, item
+//! names, report lines and exit statuses (README.md lists every item):
 //!
 //! ```text
 //! kbf-mac-provision check   --profile FILE [--keys K,K] [--root DIR]  # one PASS/FAIL line per item
@@ -13,7 +13,7 @@
 //!
 //! Exit status: 0 when every item passes (or the verb did what it says), 1 when one
 //! fails, 2 for bad usage, a refused profile, or a verb that refused or could not
-//! finish. Two things the script does not do: `appstore_auto_update` also sets the
+//! finish. Two things the script did not do: `appstore_auto_update` also sets the
 //! older `com.apple.commerce AutoUpdate`, and `apply` keeps a record of the power and
 //! software update settings from before it first changed one, which `revert` restores
 //! (see [`record`]).

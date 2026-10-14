@@ -1,5 +1,6 @@
-# Remote-only against the integration cell (crates/kbf-it/m1/run.sh starts it): every
-# action executes on the farm or is answered from its action cache; nothing runs here.
+# Remote-only against the integration cell (`kbf-cell m1` starts it and builds a copy
+# of this project): every action executes on the farm or is answered from its action
+# cache; nothing runs here.
 common --color=no --curses=no
 common --lockfile_mode=off
 

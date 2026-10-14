@@ -1,7 +1,8 @@
 # Three commands in a chain, as in the Bazel sample. `shout` runs an executable input
-# file, so the farm must keep its mode; `digest` reads two outputs of earlier commands.
-# A fourth, `pause`, stands alone: a command that sleeps, so a test can hold a lease in
-# flight (run.sh's drain check). A fifth, `verdict`, fails on demand.
+# file, `tools/kbf-act` (`kbf-act upper`; `kbf-cell m1` copies it into its copy of this
+# project), so the farm must keep its mode; `digest` reads two outputs of earlier
+# commands. A fourth, `pause`, stands alone: a command that sleeps, so a test can hold a
+# lease in flight (`kbf-cell m1`'s drain check). A fifth, `verdict`, fails on demand.
 load(":defs.bzl", "pause", "step")
 
 step(
@@ -13,10 +14,10 @@ step(
 step(
     name = "shout",
     srcs = [
-        "tools/upper.sh",
+        "tools/kbf-act",
         ":words",
     ],
-    script = '"$2" < "$3" > "$1"',
+    script = '"$2" upper "$1" "$3"',
 )
 
 step(
@@ -38,7 +39,8 @@ pause(
 )
 
 # Copies `words`, or, under `-c kbf_m1.fail=yes`, prints `planted failure` and exits 3
-# (run.sh's failing build: one action that fails on the farm, its event log kept).
+# (`kbf-cell m1`'s failing build: one action that fails on the farm, its event log
+# kept).
 step(
     name = "verdict",
     srcs = [":words"],
