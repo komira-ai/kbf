@@ -15,8 +15,8 @@ use kbf_proto::worker::{
     BeginRequest, BeginResponse, CommitRequest, CommitResponse, LocateRequest, LocateResponse,
     PutRangeRequest, PutRangeResponse, ReadRangeRequest, ReadRangeResponse,
 };
-use kbf_transfer::{Cas, MAX_RANGE_BYTES, Spool, TransferConfig, Transfers};
-use tokio::sync::Barrier;
+use kbf_transfer::{Cas, MAX_RANGE_BYTES, Spool, TransferConfig, Transfers, digest_of};
+use tokio::sync::{Barrier, watch};
 use tonic::{Request, Response, Status};
 
 use super::fake::serve;
@@ -57,6 +57,10 @@ struct Counting {
     declared: Arc<AtomicUsize>,
     /// Two Begins meet here in [`Mode::UnimplementedTogether`].
     together: Arc<Barrier>,
+    /// PutRange calls wait for this to open before they answer.
+    range_gate: Arc<watch::Sender<bool>>,
+    /// PutRange calls waiting at `range_gate` now.
+    held_ranges: Arc<AtomicUsize>,
     mode: Mode,
 }
 
@@ -86,6 +90,9 @@ impl Segments for Counting {
         &self,
         r: Request<PutRangeRequest>,
     ) -> Result<Response<PutRangeResponse>, Status> {
+        self.held_ranges.fetch_add(1, Ordering::SeqCst);
+        let _ = self.range_gate.subscribe().wait_for(|open| *open).await;
+        self.held_ranges.fetch_sub(1, Ordering::SeqCst);
         self.inner.put_range(r).await
     }
 
@@ -135,12 +142,20 @@ struct Front {
     commits: Arc<AtomicUsize>,
     read_ranges: Arc<AtomicUsize>,
     declared: Arc<AtomicUsize>,
+    range_gate: Arc<watch::Sender<bool>>,
+    held_ranges: Arc<AtomicUsize>,
 }
 
 impl Front {
     async fn start(mode: Mode) -> Self {
+        Self::with(mode, TransferConfig::default()).await
+    }
+
+    /// The front, and an engine with `config`.
+    async fn with(mode: Mode, config: TransferConfig) -> Self {
         let cache = Arc::new(Cache::memory());
-        let (begins, commits, read_ranges, declared) = Default::default();
+        let (begins, commits, read_ranges, declared, held_ranges) = Default::default();
+        let range_gate = Arc::new(watch::channel(true).0);
         let mut routes = kbf_front::routes(Arc::clone(&cache));
         {
             let counting = Counting {
@@ -154,6 +169,8 @@ impl Front {
                 read_ranges: Arc::clone(&read_ranges),
                 declared: Arc::clone(&declared),
                 together: Arc::new(Barrier::new(2)),
+                range_gate: Arc::clone(&range_gate),
+                held_ranges: Arc::clone(&held_ranges),
                 mode,
             };
             routes = routes.add_service(
@@ -165,11 +182,13 @@ impl Front {
         let addr = serve(routes).await;
         Self {
             cache,
-            engine: engine(addr, TransferConfig::default()),
+            engine: engine(addr, config),
             begins,
             commits,
             read_ranges,
             declared,
+            range_gate,
+            held_ranges,
         }
     }
 
@@ -486,4 +505,52 @@ async fn a_spool_cut_short_fails_the_upload_without_a_retry() {
     assert!(format!("{failed:?}").starts_with("Read("), "{failed:?}");
     assert_eq!(front.begins.load(Ordering::SeqCst), 1, "not retried");
     assert_eq!(front.commits.load(Ordering::SeqCst), 0);
+}
+
+/// Issue #641, for segment uploads. With `--transfer-in-flight` 4 and 4 segment
+/// streams, an upload of five 4 MiB ranges whose `PutRange` calls the server holds
+/// (as a slow server holds them) must leave a permit for another lease's read: the
+/// ranges hold the uploads' share (3), and the read finishes while they are held.
+/// Before the fix the ranges took all 4 permits and the read waited for them. Mutant
+/// seen red: no share taken by `put_range` (4 held, the read stuck).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn held_ranges_leave_a_permit_for_another_leases_read() {
+    let config = TransferConfig {
+        in_flight: 4,
+        segment_streams: 4,
+        ..TransferConfig::default()
+    };
+    let front = Front::with(Mode::Serve, config).await;
+    let small = patterned(7, 300);
+    let digest = front.engine.put(small.clone()).await.expect("put");
+    let (spool, digests) = spooled("held-ranges", (0..5).map(|i| patterned(i, 4 << 20))).await;
+    front.range_gate.send_replace(false);
+    let uploader = Arc::new(front.engine.scope(&kbf_types::LeaseId::new(8, 0)));
+    let upload = {
+        let uploader = Arc::clone(&uploader);
+        tokio::spawn(async move { uploader.put_spool(spool).await })
+    };
+    let share = 3;
+    for _ in 0..3000 {
+        if front.held_ranges.load(Ordering::SeqCst) >= share {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    // Room for ranges past the share to reach the server, were they allowed to.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let reader = front.engine.scope(&kbf_types::LeaseId::new(8, 1));
+    let read = tokio::time::timeout(Duration::from_secs(10), reader.get(&digest)).await;
+    assert_eq!(
+        (read.is_ok(), front.held_ranges.load(Ordering::SeqCst)),
+        (true, share),
+        "(read finished, ranges held) while the server holds every PutRange"
+    );
+    assert_eq!(
+        read.ok().map(|r| r.map(|b| digest_of(&b))),
+        Some(Ok(digest))
+    );
+    front.range_gate.send_replace(true);
+    upload.await.expect("upload").expect("put spool");
+    assert!(front.all_present(&digests).await);
 }

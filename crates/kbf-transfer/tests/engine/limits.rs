@@ -209,6 +209,70 @@ async fn uploads_finds_and_reads_of_sixteen_leases_share_the_one_limit() {
     assert_eq!(engine.stats().requests_in_flight, 0);
 }
 
+/// Issue #641. One lease uploads 64 blobs (half `put`, half `put_chunks`, as the
+/// fallback of a failed segment upload sends them) to a server that holds every write,
+/// as a slow store holds it for minutes; then another lease reads 40 blobs. The writes
+/// must hold no more than the uploads' share of `--transfer-in-flight` (12 of 16) and
+/// the reads must finish while the writes are still held. Before the fix the writes
+/// took all 16 permits and the reads waited for them: on the farm node, nine leases'
+/// input fills waited 22 minutes for one lease's upload. Mutants seen red: no share
+/// taken by `put` or by `put_chunks` (held writes 16, reads stuck), a share of the
+/// whole limit (the same).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn held_uploads_leave_permits_for_another_leases_reads() {
+    let fake = Arc::new(Fake::default());
+    let limit = 16;
+    let config = TransferConfig {
+        in_flight: limit,
+        ..TransferConfig::default()
+    };
+    let engine = engine(fake.serve().await, config);
+    let reads: Vec<Digest> = (0..40)
+        .map(|i| fake.insert(patterned(30_000 + i, 90)))
+        .collect();
+    fake.close_writes();
+    let uploader = Arc::new(engine.scope(&LeaseId::new(7, 0)));
+    let blobs: Vec<Vec<u8>> = (0..64).map(|i| patterned(31_000 + i, 60)).collect();
+    let upload = {
+        let (uploader, blobs) = (Arc::clone(&uploader), blobs.clone());
+        tokio::spawn(async move {
+            let calls = blobs.iter().enumerate().map(|(i, bytes)| {
+                if i % 2 == 0 {
+                    Either::Left(uploader.put(bytes.clone()))
+                } else {
+                    Either::Right(uploader.put_chunks(digest_of(bytes), chunks_of(bytes)))
+                }
+            });
+            futures::future::join_all(calls).await
+        })
+    };
+    let share = 12;
+    within(30, || fake.held_writes.load(Ordering::SeqCst) >= share).await;
+    // Room for writes past the share to reach the server, were they allowed to.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let reader = engine.scope(&LeaseId::new(7, 1));
+    let read = tokio::time::timeout(
+        Duration::from_secs(10),
+        futures::future::join_all(reads.iter().map(|d| reader.get(d))),
+    )
+    .await;
+    assert_eq!(
+        (read.is_ok(), fake.held_writes.load(Ordering::SeqCst)),
+        (true, share),
+        "(reads finished, writes held) while the server holds every write"
+    );
+    for (digest, got) in reads.iter().zip(read.unwrap_or_default()) {
+        assert_eq!(digest_of(&got.expect("read")), *digest);
+    }
+    fake.open_writes();
+    let stored = upload.await.expect("uploads");
+    for (bytes, stored) in blobs.iter().zip(stored) {
+        assert_eq!(stored, Ok(digest_of(bytes)));
+    }
+    assert_eq!(lock(&fake.writes).len(), 64, "writes");
+    assert_eq!(engine.stats().requests_in_flight, 0);
+}
+
 /// `bytes` as a stream of chunks of at most 16 bytes.
 fn chunks_of(bytes: &[u8]) -> Chunks {
     let pieces: Vec<std::io::Result<Vec<u8>>> = bytes.chunks(16).map(|c| Ok(c.to_vec())).collect();

@@ -1,7 +1,7 @@
 //! A CAS server for the engine's tests: ByteStream and FindMissing over blobs in
-//! memory, which counts what it is asked and can hold reads and writes at a gate and
-//! FindMissing calls at another, pause a read after its first message, refuse
-//! FindMissing, and fail writes.
+//! memory, which counts what it is asked and can hold reads and writes at a gate,
+//! writes alone at another and FindMissing calls at a third, pause a read after its
+//! first message, refuse FindMissing, and fail writes.
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
@@ -62,7 +62,9 @@ pub struct Fake {
     /// Reads wait for this to open before their first message (or, when `pause` is
     /// set, after it); writes wait for it before they commit.
     gate: watch::Sender<bool>,
-    /// Writes waiting at `gate` now.
+    /// Writes wait for this to open too before they commit; reads never do.
+    write_gate: watch::Sender<bool>,
+    /// Writes waiting at `gate` or `write_gate` now.
     pub held_writes: AtomicUsize,
     /// FindMissing calls wait for this to open before they answer.
     find_gate: watch::Sender<bool>,
@@ -90,6 +92,7 @@ impl Default for Fake {
             requests: AtomicUsize::new(0),
             most_requests: AtomicUsize::new(0),
             gate: watch::channel(true).0,
+            write_gate: watch::channel(true).0,
             held_writes: AtomicUsize::new(0),
             find_gate: watch::channel(true).0,
             pause: AtomicBool::new(false),
@@ -135,6 +138,15 @@ impl Fake {
 
     pub fn open(&self) {
         self.gate.send_replace(true);
+    }
+
+    /// Holds every write before it commits, and no read.
+    pub fn close_writes(&self) {
+        self.write_gate.send_replace(false);
+    }
+
+    pub fn open_writes(&self) {
+        self.write_gate.send_replace(true);
     }
 
     /// Holds every FindMissing call before it answers.
@@ -272,6 +284,7 @@ impl ByteStream for Shared {
         }
         fake.held_writes.fetch_add(1, Ordering::SeqCst);
         let _ = fake.gate.subscribe().wait_for(|open| *open).await;
+        let _ = fake.write_gate.subscribe().wait_for(|open| *open).await;
         fake.held_writes.fetch_sub(1, Ordering::SeqCst);
         let failing = fake.fail_writes.load(Ordering::SeqCst);
         if failing > 0 {
