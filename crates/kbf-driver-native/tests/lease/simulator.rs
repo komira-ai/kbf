@@ -548,6 +548,15 @@ mod real {
     /// for no gain.
     static ONE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+    /// How long, in seconds after its first try, the action's sandboxed `xcodebuild
+    /// -showdestinations` has to list the booted lease device. On hosted runners a
+    /// single try made as soon as `bootstatus -b` returned missed the device in runs
+    /// whose `bootstatus` took 35 to 60 s, while the runs whose boot took longer (60 s
+    /// to almost 3 min) listed it. `xcodebuild -destination` itself waits for a
+    /// device (`-destination-timeout`, 30 s by default), so a listing that only
+    /// arrives within this deadline still serves `xcodebuild test`.
+    const LISTED_WITHIN: u64 = 120;
+
     /// `xcrun args`, unsandboxed (the test's own view), its stdout; panics on failure.
     fn xcrun(args: &[&str]) -> String {
         let out = Command::new("/usr/bin/xcrun")
@@ -731,9 +740,13 @@ mod real {
     /// Catches, on a real Mac: `simctl create` in the default set not working under the
     /// actions' sandbox (create, or the delete at the end, refused), a device the
     /// action cannot boot from its sandbox, a device the action's own `xcodebuild
-    /// -showdestinations` does not list from the sandbox (so `xcodebuild test
-    /// -destination id=$KBF_SIMULATOR_UDID` could not use it), and a booted device left
-    /// running or registered after the lease.
+    /// -showdestinations` does not list from the sandbox within [`LISTED_WITHIN`]
+    /// seconds of its first try (so `xcodebuild test -destination
+    /// id=$KBF_SIMULATOR_UDID` could not use it), and a booted device left running or
+    /// registered after the lease. Each try prints to the action's stderr what it saw:
+    /// its exit, whether it named the lease's device, and how many iOS simulators it
+    /// listed (none at all would point at the sandbox, not at a late listing); a run
+    /// that never lists the device prints the last listing whole.
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "macOS with an iOS simulator runtime; the native-macos job runs it"]
     async fn a_real_simulator_is_made_booted_and_deleted_for_the_lease() {
@@ -752,9 +765,20 @@ mod real {
              xcrun simctl bootstatus \"${UDID_VAR}\" -b >&2\n\
              xcrun simctl list devices booted | grep -c \"${UDID_VAR}\"\n\
              cp -R {project} \"$TMPDIR/IOSFixture.xcodeproj\" >&2 || true\n\
-             xcodebuild -showdestinations -project \"$TMPDIR/IOSFixture.xcodeproj\" -scheme IOSFixture -derivedDataPath \"$TMPDIR/dd\" > \"$TMPDIR/shown\" 2>&1 || echo \"xcodebuild under the sandbox: exit $?\" >&2\n\
-             grep -c \"${UDID_VAR}\" \"$TMPDIR/shown\" || true\n\
-             grep -i -m 8 -e error -e denied -e destinations \"$TMPDIR/shown\" >&2 || true\n"
+             start=$(date +%s); try=0; found=0\n\
+             while :; do\n\
+               try=$((try + 1)); rc=0\n\
+               xcodebuild -showdestinations -project \"$TMPDIR/IOSFixture.xcodeproj\" -scheme IOSFixture -derivedDataPath \"$TMPDIR/dd\" > \"$TMPDIR/shown\" 2>&1 || rc=$?\n\
+               found=$(grep -c \"${UDID_VAR}\" \"$TMPDIR/shown\" || true)\n\
+               sims=$(grep -c 'platform:iOS Simulator, arch' \"$TMPDIR/shown\" || true)\n\
+               waited=$(($(date +%s) - start))\n\
+               echo \"showdestinations try $try at $waited s: exit $rc, lists the lease's device $found, iOS simulators listed $sims\" >&2\n\
+               if [ \"$found\" = 1 ] || [ \"$waited\" -ge {LISTED_WITHIN} ]; then break; fi\n\
+               sleep 5\n\
+             done\n\
+             [ \"$found\" = 1 ] || cat \"$TMPDIR/shown\" >&2\n\
+             echo \"$found\"\n\
+             grep -i -m 8 -e error -e denied \"$TMPDIR/shown\" >&2 || true\n"
         );
         let spec = Spec::sh(&script)
             .property("simulator", &format!("{device_type},{runtime_id}"))
@@ -777,7 +801,7 @@ mod real {
         assert_eq!(lines[1], "1", "the device booted");
         assert_eq!(
             lines[2], "1",
-            "xcodebuild lists the device from the sandbox"
+            "xcodebuild lists the device from the sandbox within {LISTED_WITHIN} s"
         );
         assert!(
             !xcrun(&["simctl", "list", "devices", "-j"]).contains(udid),
