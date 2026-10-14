@@ -419,13 +419,14 @@ impl CacheMetrics {
         let histograms = [
             (
                 "kbf_store_blobs_seconds",
-                "One store of verified blobs: the held-blob query, its touch, and every \
-                 segment's put, footer read and commit",
+                "One store of verified blobs: the held-blob query, its touch, and the wait \
+                 for every segment holding its blobs (linger, PUT slot, PUT attempts and \
+                 their backoff, footer read, and commit with the commits queued ahead)",
                 &self.store_blobs,
             ),
             (
                 "kbf_segment_put_seconds",
-                "One segment's object PUT",
+                "One PUT attempt of a segment's object; a retried PUT is observed per attempt",
                 &self.segment_put,
             ),
             (

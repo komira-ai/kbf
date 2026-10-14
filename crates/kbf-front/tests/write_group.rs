@@ -329,8 +329,11 @@ async fn a_refused_commit_fails_every_caller_in_the_segment() {
 /// answered as failed. The third succeeds: one `PutBlobs`, three different keys, and
 /// the caller is answered after the linger and both backoffs.
 ///
+/// Each of the three attempts is observed in `kbf_segment_put_seconds`.
+///
 /// Catches: a retry under the same key (it would fail `AlreadyExists` on the kept
-/// first PUT). Mutant seen red: allocate the object id once, outside the retry loop.
+/// first PUT); timing only the PUT that succeeded. Mutants seen red: allocate the
+/// object id once, outside the retry loop; observe `segment_put` only on success.
 #[tokio::test(start_paused = true)]
 async fn a_put_retried_twice_takes_a_new_key_each_time() {
     let (cache, store) = default_cache().await;
@@ -349,6 +352,11 @@ async fn a_put_retried_twice_takes_a_new_key_each_time() {
         assert!(store.stored(orphan).await.is_some(), "{orphan}");
     }
     assert_eq!(cache.meta().batches(), [1]);
+    assert_eq!(
+        cache.metrics().segment_put.count(),
+        3,
+        "one per PUT attempt"
+    );
     assert_eq!(key_of(&cache, b.digest()).await, keys[2]);
     let read = cache.read_blob(&b.digest()).await.expect("read");
     assert_eq!(kbf_segments::sha256(&read), b.digest());
