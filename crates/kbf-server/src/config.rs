@@ -330,12 +330,7 @@ impl Args {
     /// A TLS file cannot be read; `--segment-upload-max-bytes` is over
     /// `--write-bytes-in-flight`.
     pub fn listeners(&self) -> Result<Listeners, ConfigError> {
-        if self.segment_upload_max_bytes > self.write_bytes_in_flight {
-            return Err(ConfigError::SegmentUploadOverWriteBound {
-                cap: self.segment_upload_max_bytes,
-                bound: self.write_bytes_in_flight,
-            });
-        }
+        self.segment_upload_fits_write_bound()?;
         let worker_tls = match (
             &self.worker_tls_cert,
             &self.worker_tls_key,
@@ -377,6 +372,20 @@ impl Args {
                 idle: Duration::from_secs(self.segment_upload_idle_secs),
             },
         })
+    }
+
+    /// Refuses a `--segment-upload-max-bytes` over `--write-bytes-in-flight`: an upload
+    /// of the whole cap would hold its ranges in memory past the bound uploads share.
+    /// A function of its own: only the unit test reaches the refusal, and the integration
+    /// tests reach the rest of `listeners`, so neither would cover all of one function.
+    fn segment_upload_fits_write_bound(&self) -> Result<(), ConfigError> {
+        if self.segment_upload_max_bytes > self.write_bytes_in_flight {
+            return Err(ConfigError::SegmentUploadOverWriteBound {
+                cap: self.segment_upload_max_bytes,
+                bound: self.write_bytes_in_flight,
+            });
+        }
+        Ok(())
     }
 
     /// The listeners that serve plain text on an address that is not loopback, as the

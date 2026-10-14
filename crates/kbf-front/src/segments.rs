@@ -47,7 +47,7 @@ use tonic::{Request, Response, Status};
 
 pub use self::connection::{Connection, Connections, Tracked};
 use self::upload::{Declared, Put, Receiving, declare};
-use crate::cache::{Admitted, Cache};
+use crate::cache::{Admitted, BuiltSegment, Cache};
 use crate::meta_log::MetaLog;
 use crate::{MAX_BLOB_BYTES, wire};
 
@@ -160,13 +160,15 @@ impl Upload {
     /// The commit's answer, once it has one.
     async fn answer(&self) -> Result<Vec<Digest>, Status> {
         let mut done = self.done.subscribe();
-        let answered = done
-            .wait_for(Option::is_some)
-            .await
-            .ok()
-            .and_then(|a| a.clone());
-        // The sender lives in `self`, so the wait ends only with an answer.
-        answered.unwrap_or_else(|| Err(Status::internal("a commit ended without an answer")))
+        loop {
+            let answer = done.borrow_and_update().clone();
+            if let Some(answer) = answer {
+                return answer;
+            }
+            // The sender lives in `self`, so `changed` never fails while `self` is
+            // borrowed: it returns once a value is sent.
+            let _ = done.changed().await;
+        }
     }
 
     /// Drops the upload, freeing its buffers and admission even if a call still holds it,
@@ -180,6 +182,24 @@ impl Upload {
         *phase = Phase::Dropped;
         true
     }
+}
+
+/// Checks every received segment against what `Begin` declared ([`Receiving::check`]),
+/// on the blocking pool: hashing up to a gigabyte must not hold a runtime thread. A
+/// check that panicked answers INTERNAL, so the upload's Commits are still answered.
+async fn check_all(
+    upload: Arc<Upload>,
+    segments: Vec<Receiving>,
+) -> Result<Vec<BuiltSegment>, Status> {
+    tokio::task::spawn_blocking(move || {
+        segments
+            .into_iter()
+            .zip(&upload.declared)
+            .map(|(received, declared)| received.check(declared))
+            .collect::<Result<Vec<_>, Status>>()
+    })
+    .await
+    .unwrap_or_else(|e| Err(Status::internal(format!("checking an upload failed: {e}"))))
 }
 
 impl<M: MetaLog, O: ObjectStore + 'static> SegmentsService<M, O> {
@@ -265,17 +285,7 @@ impl<M: MetaLog, O: ObjectStore + 'static> SegmentsService<M, O> {
         segments: Vec<Receiving>,
         admitted: Admitted,
     ) {
-        let checking = Arc::clone(&upload);
-        let joined = tokio::task::spawn_blocking(move || {
-            segments
-                .into_iter()
-                .zip(&checking.declared)
-                .map(|(received, declared)| received.check(declared))
-                .collect::<Result<Vec<_>, Status>>()
-        })
-        .await;
-        let checked =
-            joined.unwrap_or_else(|e| Err(Status::internal(format!("check failed: {e}"))));
+        let checked = check_all(Arc::clone(&upload), segments).await;
         let answer = match checked {
             Ok(built) => cache.store_upload(built).await.map_err(Status::from),
             Err(refused) => Err(refused),
@@ -478,3 +488,7 @@ impl<M: MetaLog, O: ObjectStore + 'static> Segments for SegmentsService<M, O> {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "segments_tests.rs"]
+mod tests;

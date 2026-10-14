@@ -5,6 +5,8 @@
 
 #[path = "segments/support.rs"]
 mod support;
+#[path = "segments/untracked.rs"]
+mod untracked;
 
 use std::time::Duration;
 
