@@ -541,7 +541,8 @@ mod tests {
         assert_eq!(scaled.timeout_for(512 << 10), Duration::from_millis(60_500));
         c.min_body_rate = NonZeroU64::new(1);
         let slowest = S3Store::new(c).unwrap();
-        assert!(slowest.timeout_for(usize::MAX) > Duration::from_secs(1 << 33));
+        let saturated = Duration::from_secs(60) + Duration::from_nanos(u64::MAX);
+        assert_eq!(slowest.timeout_for(usize::MAX), saturated);
     }
 
     fn config(endpoint: &str, bucket: &str) -> S3Config {
