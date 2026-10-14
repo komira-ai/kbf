@@ -479,8 +479,8 @@ fn check_refuses_assets_of_another_commit_or_of_no_binary() {
     // and a listed file that is not `<binary>-<commit>-<platform>` with a known
     // platform and extension.
     let root = scratch("check-other");
-    let dist = dist(&root, OTHER);
-    let (code, _, err) = check(&dist, COMMIT);
+    let other_dist = dist(&root, OTHER);
+    let (code, _, err) = check(&other_dist, COMMIT);
     assert_eq!(code, Some(1));
     assert_eq!(err.lines().count(), 6, "{err}");
     assert!(
@@ -496,12 +496,12 @@ fn check_refuses_assets_of_another_commit_or_of_no_binary() {
         "notes.txt".to_owned(),
     ] {
         let root = scratch("check-bad-name");
-        let dist = dist(&root, COMMIT);
-        let sums = std::fs::read_to_string(dist.join("SHA256SUMS")).expect("sums");
-        std::fs::write(dist.join(&bad), "x").expect("file");
+        let commit_dist = dist(&root, COMMIT);
+        let sums = std::fs::read_to_string(commit_dist.join("SHA256SUMS")).expect("sums");
+        std::fs::write(commit_dist.join(&bad), "x").expect("file");
         let line = format!("{}  {bad}\n", hex::encode(sha2::Sha256::digest(b"x")));
-        std::fs::write(dist.join("SHA256SUMS"), format!("{line}{sums}")).expect("sums");
-        let (code, _, err) = check(&dist, COMMIT);
+        std::fs::write(commit_dist.join("SHA256SUMS"), format!("{line}{sums}")).expect("sums");
+        let (code, _, err) = check(&commit_dist, COMMIT);
         assert_eq!(code, Some(1), "{bad}");
         assert_eq!(err, format!("xtask: {bad}: not an asset of {COMMIT}\n"));
     }
