@@ -530,7 +530,9 @@ Estimates from the measured store latency, to be measured on the pilot at each s
    `--write-tier-bytes`, `--write-tier-seal-after`, `--write-tier-abandon`. Off unless
    `--write-tier-dir` is given; the OSS default is no tier, today's guarantee.
 5. **PR 5**: the tier in `kbf-sim-cell`, then on the pilot with the unflushed-age alert
-   in place first.
+   in place first. The scenarios it must run, their invariants and expected outcomes,
+   and the store faults and crash points already in the cell, are in
+   [write-tier-scenarios.md](write-tier-scenarios.md).
 6. zstd on ByteStream and the capability, independent of the rest.
 
 ## 9. Tests, and the defect each catches
