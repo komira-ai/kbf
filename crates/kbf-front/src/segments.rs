@@ -10,11 +10,15 @@
 //!   its whole length by [`Cache::admit`] (`--write-bytes-in-flight`, the bound
 //!   ByteStream and batch uploads share), waiting (never refusing) while it is spent.
 //!   Ranges are held in memory until the commit.
-//! - **PutRange** writes a range of one segment's records. Once Commit was called,
-//!   every PutRange is refused, so the bytes checked are the bytes stored.
+//! - **PutRange** writes a range of one segment's records and, before it answers,
+//!   hashes (SHA-256 and CRC-32C) what the range completed or extended: each record's
+//!   hash advances over the bytes received unbroken from its start, whichever order
+//!   the ranges come in, on the blocking pool beside the other ranges'. A record that
+//!   does not hash to its digest is refused at once. Once Commit was called, every
+//!   PutRange is refused, so the bytes checked are the bytes stored.
 //! - **Commit** runs in a task of its own, detached from the call and the connection,
-//!   until it has indexed or failed: every record's SHA-256 is checked, each segment
-//!   gets a footer built here (the daemon's CRC-32C values never reach the store). With a
+//!   until it has indexed or failed: it refuses a record not wholly received or not
+//!   hashed to its digest, and each segment gets a footer built here (the daemon's CRC-32C values never reach the store). With a
 //!   write tier attached, each segment is staged on it as a block of its own (its records
 //!   synced to the tier's disk, one `PutStaged` for its blobs): the Commit is answered
 //!   without an object-store PUT, and the flusher PUTs the object later. A segment the
@@ -51,7 +55,7 @@ use tokio::time::Instant;
 use tonic::{Request, Response, Status};
 
 pub use self::connection::{Connection, Connections, Tracked};
-use self::upload::{Declared, Put, Receiving, declare};
+use self::upload::{Declared, Put, Receiving, advance, declare};
 use crate::cache::{Admitted, BuiltSegment, Cache};
 use crate::meta_log::MetaLog;
 use crate::{MAX_BLOB_BYTES, wire};
@@ -189,8 +193,9 @@ impl Upload {
     }
 }
 
-/// Checks every received segment against what `Begin` declared ([`Receiving::check`]),
-/// on the blocking pool: hashing up to a gigabyte must not hold a runtime thread. A
+/// Builds every received segment from what `Begin` declared and `PutRange` checked
+/// ([`Receiving::check`]), on the blocking pool: copying footers must not hold a runtime
+/// thread. A
 /// check that panicked answers INTERNAL, so the upload's Commits are still answered.
 async fn check_all(
     upload: Arc<Upload>,
@@ -373,20 +378,51 @@ impl<M: MetaLog, O: ObjectStore + 'static> Segments for SegmentsService<M, O> {
         let declared = upload.declared.get(index).ok_or_else(|| {
             Status::invalid_argument(format!("no segment {segment} in the upload"))
         })?;
-        let mut phase = lock(&upload.phase);
-        match &mut *phase {
-            Phase::Receiving { segments, .. } => {
-                let put = segments[index].put(declared.records_len, offset, &bytes)?;
-                if put == Put::Resent {
-                    tracing::debug!(segment, offset, "resent range acknowledged, not written");
+        let claimed = {
+            let mut phase = lock(&upload.phase);
+            match &mut *phase {
+                Phase::Receiving { segments, .. } => {
+                    let (put, claimed) = segments[index].put(declared, offset, &bytes)?;
+                    if put == Put::Resent {
+                        tracing::debug!(segment, offset, "resent range acknowledged, not written");
+                    }
+                    claimed
                 }
-                Ok(Response::new(PutRangeResponse {}))
+                Phase::Committing | Phase::Done => {
+                    return Err(Status::failed_precondition(
+                        "the upload is committing; ranges are no longer accepted",
+                    ));
+                }
+                Phase::Dropped => return Err(Status::not_found("the upload was dropped")),
             }
-            Phase::Committing | Phase::Done => Err(Status::failed_precondition(
-                "the upload is committing; ranges are no longer accepted",
-            )),
-            Phase::Dropped => Err(Status::not_found("the upload was dropped")),
+        };
+        if !claimed.is_empty() {
+            // Hash what this range completed or extended, here and now, beside the
+            // other ranges' own: the commit then has nothing left to hash. The task
+            // records its results itself, so a call cancelled meanwhile leaves no
+            // record claimed forever.
+            let task = Arc::clone(&upload);
+            tokio::task::spawn_blocking(move || {
+                advance(&claimed, |i, finished| {
+                    let mut phase = lock(&task.phase);
+                    match &mut *phase {
+                        Phase::Receiving { segments, .. } => {
+                            segments[index].next(&task.declared[index], i, finished)
+                        }
+                        _ => None,
+                    }
+                });
+            })
+            .await
+            .map_err(|e| Status::internal(format!("checking a range failed: {e}")))?;
+            // A mismatch is refused at once; the upload cannot commit.
+            if let Phase::Receiving { segments, .. } = &*lock(&upload.phase)
+                && let Some(refused) = segments[index].refusal()
+            {
+                return Err(refused);
+            }
         }
+        Ok(Response::new(PutRangeResponse {}))
     }
 
     async fn commit(
@@ -407,6 +443,15 @@ impl<M: MetaLog, O: ObjectStore + 'static> Segments for SegmentsService<M, O> {
                     return Err(Status::failed_precondition(format!(
                         "record {digest} was not wholly received"
                     )));
+                }
+                if let Some(refused) = segments.iter().find_map(Receiving::refusal) {
+                    return Err(refused);
+                }
+                if segments.iter().any(Receiving::checking) {
+                    // Only a client that commits before its ranges are answered.
+                    return Err(Status::failed_precondition(
+                        "ranges are still being checked",
+                    ));
                 }
             }
             match std::mem::replace(&mut *phase, Phase::Committing) {

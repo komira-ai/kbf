@@ -41,10 +41,11 @@ fn declared_segment() -> (Vec<Declared>, Vec<u8>) {
 async fn the_check_builds_each_received_segment() {
     let (declared, records) = declared_segment();
     let mut received = Receiving::new(&declared[0]);
-    let put = received
-        .put(declared[0].records_len, 0, &records)
-        .expect("put");
+    let (put, claimed) = received.put(&declared[0], 0, &records).expect("put");
     assert_eq!(put, Put::Written);
+    advance(&claimed, |i, finished| {
+        received.next(&declared[0], i, finished)
+    });
     let want: Vec<Digest> = declared[0].entries.iter().map(|e| e.digest).collect();
     let built = check_all(committing(declared), vec![received])
         .await
