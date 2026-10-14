@@ -354,6 +354,7 @@ pub(crate) fn back_to_parent(dir: &OwnedFd, expected: Identity) -> std::io::Resu
 pub(crate) async fn collect(
     cas: &impl Cas,
     upper: &Path,
+    spools: &Path,
     working_directory: &str,
     paths: &[String],
     limits: OutputLimits,
@@ -387,7 +388,7 @@ pub(crate) async fn collect(
         result,
     )
     .await?;
-    pending.store_missing(cas, &upper_fd).await
+    pending.store_missing(cas, &upper_fd, spools).await
 }
 
 /// [`collect`]'s walk over each output path, its blobs added to `pending`.

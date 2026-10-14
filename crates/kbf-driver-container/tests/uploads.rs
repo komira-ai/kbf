@@ -126,6 +126,7 @@ async fn collect_out(cas: &CountingCas, upper: &std::path::Path) -> (ActionResul
     collect(
         cas,
         upper,
+        std::path::Path::new(env!("CARGO_TARGET_TMPDIR")),
         "",
         &["out".to_owned()],
         OutputLimits::DEFAULT,
@@ -231,6 +232,7 @@ async fn a_blob_that_cannot_be_stored_fails_the_collection() {
     let collected = collect(
         &cas,
         &upper,
+        std::path::Path::new(env!("CARGO_TARGET_TMPDIR")),
         "",
         &["out".to_owned()],
         OutputLimits::DEFAULT,

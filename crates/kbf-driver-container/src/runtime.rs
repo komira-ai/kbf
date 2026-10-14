@@ -533,6 +533,7 @@ impl<C: Cas> PodmanRuntime<C> {
             collect(
                 cas,
                 &spec.upper,
+                &lease.dir,
                 &spec.working_directory,
                 &outputs,
                 self.config.outputs,

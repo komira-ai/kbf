@@ -33,6 +33,7 @@ tracing.workspace = true
 
 [dev-dependencies]
 kbf-front.workspace = true
+kbf-objstore.workspace = true
 kbf-transfer.workspace = true
 # sched_getaffinity, which the real-Podman capacity test compares with.
 rustix = { workspace = true, features = ["thread"] }

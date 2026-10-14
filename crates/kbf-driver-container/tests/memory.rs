@@ -150,7 +150,15 @@ fn an_output_past_the_byte_limit_is_refused_in_bounded_memory() {
         let cas = MemoryCas::new();
         let mut result = ActionResult::default();
         let outputs = ["out".to_owned()];
-        runtime.block_on(collect(&cas, &upper, "", &outputs, limits, &mut result))
+        runtime.block_on(collect(
+            &cas,
+            &upper,
+            std::path::Path::new(env!("CARGO_TARGET_TMPDIR")),
+            "",
+            &outputs,
+            limits,
+            &mut result,
+        ))
     });
     assert!(
         matches!(

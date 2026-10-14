@@ -19,7 +19,7 @@
 
 use std::collections::HashSet;
 use std::os::fd::OwnedFd;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use futures::{StreamExt as _, TryStreamExt as _, future, stream};
@@ -100,6 +100,7 @@ impl Pending {
         self,
         cas: &impl Cas,
         upper: &Arc<OwnedFd>,
+        _spools: &Path,
     ) -> Result<(), TreeError> {
         let digests: Vec<Digest> = self.blobs.iter().map(|(d, _)| d.clone()).collect();
         let missing: HashSet<String> = cas.missing(&digests).await.iter().map(label).collect();

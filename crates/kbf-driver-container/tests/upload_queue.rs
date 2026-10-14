@@ -97,7 +97,15 @@ async fn the_walk_holds_at_most_one_file_past_the_stores_in_flight() {
     let before = open_descriptors();
     let mut result = ActionResult::default();
     let paths = ["out".to_owned()];
-    let walk = collect(&cas, &upper, "", &paths, OutputLimits::DEFAULT, &mut result);
+    let walk = collect(
+        &cas,
+        &upper,
+        std::path::Path::new(env!("CARGO_TARGET_TMPDIR")),
+        "",
+        &paths,
+        OutputLimits::DEFAULT,
+        &mut result,
+    );
     let watch = async {
         // A deadline, so a walk that never starts the stores fails rather than hangs.
         let deadline = std::time::Instant::now() + Duration::from_secs(30);

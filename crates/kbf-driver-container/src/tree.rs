@@ -269,10 +269,11 @@ pub async fn refuse_hidden_working_directory(
 pub async fn collect(
     cas: &impl Cas,
     upper: &Path,
+    spools: &Path,
     working_directory: &str,
     paths: &[String],
     limits: OutputLimits,
     result: &mut ActionResult,
 ) -> Result<(), TreeError> {
-    crate::outputs::collect(cas, upper, working_directory, paths, limits, result).await
+    crate::outputs::collect(cas, upper, spools, working_directory, paths, limits, result).await
 }
