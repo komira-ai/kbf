@@ -19,8 +19,8 @@ use bytes::Bytes;
 use common::faulty::{AuditLog, CommitFault, FaultyStore, PutFault};
 use common::pseudo_random;
 use kbf_front::{
-    Cache, CacheError, CasService, MetaLog, PUT_BACKOFF, PUT_BACKOFF_FACTOR, VerifiedBlob,
-    WriteConfig,
+    Cache, CacheError, CasService, MAX_ADMISSION_BYTES, MetaLog, PUT_BACKOFF, PUT_BACKOFF_FACTOR,
+    VerifiedBlob, WriteConfig,
 };
 use kbf_meta::BlobAnswer;
 use kbf_objstore::{Capabilities, KeyPrefix, ObjectKey};
@@ -611,6 +611,30 @@ async fn a_caller_that_goes_away_keeps_its_bytes_admitted_until_they_are_written
         .expect("admitted once the segment is settled");
     assert!(present(&cache, b.digest()).await);
     assert_audit_clean(&cache);
+}
+
+/// One admission of [`MAX_ADMISSION_BYTES`] is counted in full under a larger bound,
+/// and one asking for more is counted as that much: what `kbf-server`'s upper limit on
+/// `--segment-upload-max-bytes` relies on, so no `Begin` holds more than it is counted
+/// for. Takes no memory: admission counts bytes, it does not allocate them.
+///
+/// Catches: [`MAX_ADMISSION_BYTES`] raised past what one admission counts (the server
+/// would then start with a cap whose `Begin` holds more than the bound sees). Mutant
+/// seen red: `MAX_ADMISSION_BYTES = 8 << 30`.
+#[tokio::test]
+async fn one_admission_counts_up_to_max_admission_bytes() {
+    let (cache, _) = cache(
+        config(|c| c.bytes_in_flight = 16 << 30),
+        kbf_segments::MAX_SEGMENT_BYTES,
+    )
+    .await;
+    let full = cache.admit(MAX_ADMISSION_BYTES).await;
+    assert_eq!(cache.bytes_admitted(), MAX_ADMISSION_BYTES);
+    drop(full);
+    let over = cache.admit(8 << 30).await;
+    assert_eq!(cache.bytes_admitted(), MAX_ADMISSION_BYTES);
+    drop(over);
+    assert_eq!(cache.bytes_admitted(), 0);
 }
 
 /// A `BatchUpdateBlobs` waits for admission of its total before it stores anything:
