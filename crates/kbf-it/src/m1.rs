@@ -34,6 +34,7 @@
 //! `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`, never the command line.
 
 use std::ffi::OsString;
+use std::fmt::Display;
 use std::fs::{File, OpenOptions};
 use std::io::{Read as _, Write as _};
 use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
@@ -174,18 +175,18 @@ impl Cell {
             connect_timeout: Duration::from_secs(10),
             request_timeout: Duration::from_secs(60),
         });
-        let store = store.map_err(|e| broken("the store", &e))?;
+        let store = store.or_broken(&"the store")?;
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(60))
             .build();
-        let http = http.map_err(|e| broken("the HTTP client", &e))?;
+        let http = http.or_broken(&"the HTTP client")?;
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build();
-        let runtime = runtime.map_err(|e| broken("the async runtime", &e))?;
+        let runtime = runtime.or_broken(&"the async runtime")?;
         let work = absolute(&args.work)?;
         let logs = work.join("logs");
-        std::fs::create_dir_all(&logs).map_err(|e| io(&logs, &e))?;
+        std::fs::create_dir_all(&logs).or_broken(&logs.display())?;
         Ok(Self {
             bin_dir: absolute(&args.bin_dir)?,
             projects: absolute(&args.projects)?,
@@ -207,7 +208,7 @@ impl Cell {
     fn steps(&self) -> Result<(), M1Error> {
         self.create_bucket()?;
         let pki = crate::pki::write(&self.work.join("pki"), NODE_ID);
-        let pki = pki.map_err(|e| broken("the certificates", &e))?;
+        let pki = pki.or_broken(&"the certificates")?;
         let token = self.write_token()?;
         let _server = self.start_server(&pki)?;
         let _daemon = self.start_daemon(&pki)?;
@@ -228,7 +229,7 @@ impl Cell {
     /// so that the objects counted at the end are this run's.
     fn create_bucket(&self) -> Result<(), M1Error> {
         let created = self.runtime.block_on(self.store.create_bucket());
-        created.map_err(|e| broken("create the bucket", &e))?;
+        created.or_broken(&"create the bucket")?;
         let held = self.objects()?;
         let bucket = &self.bucket;
         let why = format!("the new bucket {bucket} holds {held} object(s)");
@@ -239,10 +240,10 @@ impl Cell {
 
     /// How many objects the first page of the bucket's listing holds.
     fn objects(&self) -> Result<usize, M1Error> {
-        let all = KeyPrefix::new("").map_err(|e| broken("the empty prefix", &e))?;
+        let all = KeyPrefix::new("").or_broken(&"the empty prefix")?;
         let listed = self.store.list(&all, None, PageSize::MAX);
         let page = self.runtime.block_on(listed);
-        let page = page.map_err(|e| broken("list the bucket", &e))?;
+        let page = page.or_broken(&"list the bucket")?;
         Ok(page.objects.len())
     }
 
@@ -256,7 +257,7 @@ impl Cell {
         let written = options
             .open(&path)
             .and_then(|mut f| f.write_all(token.as_bytes()));
-        written.map_err(|e| io(&path, &e))?;
+        written.or_broken(&path.display())?;
         Ok(token)
     }
 
@@ -345,11 +346,11 @@ impl Cell {
         let copy = self.work.join("projects").join(name);
         copy_tree(&self.projects.join(name), &copy)?;
         let tools = copy.join("tools");
-        std::fs::create_dir_all(&tools).map_err(|e| io(&tools, &e))?;
+        std::fs::create_dir_all(&tools).or_broken(&tools.display())?;
         let act = tools.join("kbf-act");
-        std::fs::copy(self.bin_dir.join("kbf-act"), &act).map_err(|e| io(&act, &e))?;
+        std::fs::copy(self.bin_dir.join("kbf-act"), &act).or_broken(&act.display())?;
         let executable = std::fs::Permissions::from_mode(0o755);
-        std::fs::set_permissions(&act, executable).map_err(|e| io(&act, &e))?;
+        std::fs::set_permissions(&act, executable).or_broken(&act.display())?;
         Ok(copy)
     }
 
@@ -480,13 +481,13 @@ impl Cell {
             let answer = request.send().await?.error_for_status()?;
             answer.bytes().await
         });
-        let bytes = answer.map_err(|e| broken("the operator API", &e))?;
-        serde_json::from_slice(&bytes).map_err(|e| broken("the operator API's answer", &e))
+        let bytes = answer.or_broken(&"the operator API")?;
+        serde_json::from_slice::<Value>(&bytes).or_broken(&"the operator API's answer")
     }
 
     fn log_file(&self, name: &str) -> Result<File, M1Error> {
         let path = self.logs.join(name);
-        File::create(&path).map_err(|e| io(&path, &e))
+        File::create(&path).or_broken(&path.display())
     }
 
     /// Prints the last lines of the server's and the daemon's error logs.
@@ -533,7 +534,7 @@ struct Process {
 impl Process {
     fn spawn(mut command: Command, what: &str) -> Result<Self, M1Error> {
         let child = command.spawn();
-        let child = child.map_err(|e| broken(&format!("start {what}"), &e))?;
+        let child = child.or_broken(&format!("start {what}"))?;
         Ok(Self {
             child,
             reaped: false,
@@ -542,7 +543,7 @@ impl Process {
 
     fn wait(&mut self) -> Result<ExitStatus, M1Error> {
         let status = self.child.wait();
-        let status = status.map_err(|e| broken("wait for a build", &e))?;
+        let status = status.or_broken(&"wait for a build")?;
         self.reaped = true;
         Ok(status)
     }
@@ -555,7 +556,7 @@ impl Process {
             // Its exit first: once the build has ended, the log read next holds every
             // lease the build got, since the daemon logs one before it runs it.
             let exited = self.child.try_wait();
-            let exited = exited.map_err(|e| broken("poll a build", &e))?;
+            let exited = exited.or_broken(&"poll a build")?;
             self.reaped = exited.is_some();
             if let Some(lease) = leases_started(&read(daemon_log)?).into_iter().nth(before) {
                 return Ok(lease);
@@ -639,14 +640,14 @@ fn wait_for_line(path: &Path, needle: &str, failure: &str) -> Result<String, M1E
 
 /// Copies the directory `from` to `to`, recursively.
 fn copy_tree(from: &Path, to: &Path) -> Result<(), M1Error> {
-    std::fs::create_dir_all(to).map_err(|e| io(to, &e))?;
-    for entry in std::fs::read_dir(from).map_err(|e| io(from, &e))? {
-        let entry = entry.map_err(|e| io(from, &e))?;
+    std::fs::create_dir_all(to).or_broken(&to.display())?;
+    for entry in std::fs::read_dir(from).or_broken(&from.display())? {
+        let entry = entry.or_broken(&from.display())?;
         let (path, target) = (entry.path(), to.join(entry.file_name()));
-        if entry.file_type().map_err(|e| io(&path, &e))?.is_dir() {
+        if entry.file_type().or_broken(&path.display())?.is_dir() {
             copy_tree(&path, &target)?;
         } else {
-            std::fs::copy(&path, &target).map_err(|e| io(&path, &e))?;
+            std::fs::copy(&path, &target).or_broken(&path.display())?;
         }
     }
     Ok(())
@@ -654,8 +655,8 @@ fn copy_tree(from: &Path, to: &Path) -> Result<(), M1Error> {
 
 /// Sends `command`'s stdout and stderr to a new file at `log`.
 fn to_log(command: &mut Command, log: &Path) -> Result<(), M1Error> {
-    let out = File::create(log).map_err(|e| io(log, &e))?;
-    let err = out.try_clone().map_err(|e| io(log, &e))?;
+    let out = File::create(log).or_broken(&log.display())?;
+    let err = out.try_clone().or_broken(&log.display())?;
     command.stdin(Stdio::null()).stdout(out).stderr(err);
     Ok(())
 }
@@ -670,7 +671,7 @@ fn logged(command: &mut Command, log: &Path) -> Result<bool, M1Error> {
 fn status(command: &mut Command) -> Result<bool, M1Error> {
     let program = command.get_program().to_string_lossy().into_owned();
     let status = command.status();
-    let status = status.map_err(|e| broken(&format!("run {program}"), &e))?;
+    let status = status.or_broken(&format!("run {program}"))?;
     Ok(status.success())
 }
 
@@ -679,18 +680,18 @@ fn random_hex(n: usize) -> Result<String, M1Error> {
     let mut bytes = vec![0u8; n];
     let urandom = Path::new("/dev/urandom");
     let filled = File::open(urandom).and_then(|mut f| f.read_exact(&mut bytes));
-    filled.map_err(|e| io(urandom, &e))?;
+    filled.or_broken(&urandom.display())?;
     Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
 
 /// The file at `path`, as text (lossily: logs may hold anything).
 fn read(path: &Path) -> Result<String, M1Error> {
-    let bytes = std::fs::read(path).map_err(|e| io(path, &e))?;
+    let bytes = std::fs::read(path).or_broken(&path.display())?;
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 fn absolute(path: &Path) -> Result<PathBuf, M1Error> {
-    std::path::absolute(path).map_err(|e| io(path, &e))
+    std::path::absolute(path).or_broken(&path.display())
 }
 
 /// A check: `why` fails the run unless `ok`.
@@ -702,12 +703,16 @@ fn ensure(ok: bool, why: String) -> Result<(), M1Error> {
     }
 }
 
-fn broken(what: &str, e: &dyn std::fmt::Display) -> M1Error {
-    M1Error::Broken(format!("{what}: {e}"))
+/// Turns any error into [`M1Error::Broken`], after the name of what failed. One
+/// mapping for every fallible call keeps the error paths few.
+trait OrBroken<T> {
+    fn or_broken(self, what: &dyn Display) -> Result<T, M1Error>;
 }
 
-fn io(path: &Path, e: &std::io::Error) -> M1Error {
-    M1Error::Broken(format!("{}: {e}", path.display()))
+impl<T, E: Display> OrBroken<T> for Result<T, E> {
+    fn or_broken(self, what: &dyn Display) -> Result<T, M1Error> {
+        self.map_err(|e| M1Error::Broken(format!("{what}: {e}")))
+    }
 }
 
 fn unset(name: &str) -> M1Error {
