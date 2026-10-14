@@ -119,7 +119,7 @@ linger nor holds up small writes. It is still held in memory until verified
   named in the flag reference, so the total is a stated number, not "bounded": 200
   streams per connection (`MAX_CONCURRENT_STREAMS`), 200 x 17 MiB, about 3.4 GiB of
   decode buffer per connection, on top of the 2 GiB the flag admits. The 16 MiB limit
-  is a first setting (komira-internal#1121 tunes it); a lower limit shrinks this bound
+  is a first setting (to be tuned later); a lower limit shrinks this bound
   in proportion. A `Write`'s first message (which names the
   blob) is decoded the same way, and a `Write` waiting for admission leaves up to its
   stream's flow-control window, 1 MiB (`STREAM_WINDOW_BYTES`), received and unread.
