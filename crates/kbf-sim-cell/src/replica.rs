@@ -8,7 +8,7 @@
 //! server has applied, and so answered from, was durable, and a restart or a follower
 //! would apply it alike.
 
-use kbf_log::{FarmLogId, Format, LogCommand};
+use kbf_log::{FarmLogId, Format, LogCommand, MachineVersion};
 use kbf_meta::{MetaState, Retention};
 use kbf_raft::{Entry, Payload};
 use kbf_store::{FaultFs, Options, Store};
@@ -63,6 +63,8 @@ pub(crate) struct Replica {
     tail: Option<Entry>,
     /// The index of the last entry it read.
     last: u64,
+    /// The machine version the entries read have raised the log to.
+    version: MachineVersion,
 }
 
 impl Default for Replica {
@@ -72,6 +74,7 @@ impl Default for Replica {
             read: 0,
             tail: None,
             last: 0,
+            version: MachineVersion::V1,
         }
     }
 }
@@ -98,7 +101,8 @@ impl Replica {
             let Payload::Command(bytes) = &entry.payload else {
                 continue;
             };
-            match kbf_log::decode(Format::V1, bytes) {
+            let format = self.version.format().unwrap_or(Format::V1);
+            match kbf_log::decode(format, bytes) {
                 Ok(LogCommand::Meta(command)) => {
                     let before = replica.now();
                     replica.execute(last, command);
@@ -106,6 +110,9 @@ impl Replica {
                 }
                 Ok(LogCommand::Bootstrap(b)) => {
                     log_id.get_or_insert(b.log_id);
+                }
+                Ok(LogCommand::MachineVersion(v)) if v.format().is_some() => {
+                    self.version = self.version.max(v);
                 }
                 other => return Err(equality(format!("entry {last} is {other:?}"))),
             }
@@ -213,7 +220,7 @@ mod tests {
         let broken = |r: Result<(), Broken>| r.expect_err("broken").0;
         let short = replay(&log(), 4).map(|_| ());
         assert_eq!(broken(short), Property::ReplicaEquality);
-        let version = MachineVersion::new(NonZeroU32::new(2).expect("non-zero"));
+        let version = MachineVersion::new(NonZeroU32::new(3).expect("non-zero"));
         let mut control = log();
         control.push(entry(4, &LogCommand::MachineVersion(version)));
         assert_eq!(
@@ -235,6 +242,36 @@ mod tests {
         assert_eq!(
             broken(durable_entries(dead).map(|_| ())),
             Property::ReplicaEquality
+        );
+    }
+
+    /// Catches a replica that reads every entry as format 1 (a tier command after the
+    /// raise to machine version 2 would not replay: a false property-1 alarm), or
+    /// reads one as format 2 before the raise (a log an older binary refuses taken
+    /// for a good one).
+    #[test]
+    fn a_raise_to_version_2_lets_the_tier_commands_replay() {
+        let add = LogCommand::Meta(Command::AddTier {
+            server: kbf_meta::ServerId::new(1),
+            tier: kbf_meta::TierId::new(1),
+        });
+        let tier_entry = |index| Entry {
+            id: LogId::new(Term(1), LogIndex(index)),
+            payload: Payload::Command(kbf_log::encode(Format::V2, &add).expect("encode")),
+        };
+        let mut early = log();
+        early.push(tier_entry(4));
+        assert!(
+            replay(&early, 4).is_err(),
+            "a tier command before the raise"
+        );
+        let mut raised = log();
+        raised.push(entry(4, &LogCommand::MachineVersion(MachineVersion::V2)));
+        raised.push(tier_entry(5));
+        let (meta, _) = replay(&raised, 5).expect("replays after the raise");
+        assert_eq!(
+            meta.tier(kbf_meta::ServerId::new(1)),
+            Some(kbf_meta::TierId::new(1))
         );
     }
 

@@ -34,19 +34,21 @@
 //! `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`, never the command line.
 
 use std::ffi::OsString;
-use std::fmt::Display;
 use std::fs::{File, OpenOptions};
-use std::io::{Read as _, Write as _};
+use std::io::Write as _;
 use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 use kbf_objstore::s3::{Credentials, S3Config, S3Store};
 use kbf_objstore::{Capabilities, KeyPrefix, ObjectStore as _, PageSize};
-use rustix::process::{Pid, Signal, kill_process};
 use serde_json::Value;
 
+use crate::cell::{
+    CellError, OrBroken as _, Process, absolute, copy_tree, ensure, leases_started, logged,
+    print_tails, random_hex, read, status, to_log, wait_for_line,
+};
 use crate::pki::PkiFiles;
 use crate::summary::{Tool, check_logs};
 
@@ -56,12 +58,6 @@ const REAPI: &str = "127.0.0.1:8980";
 const WORKER: &str = "127.0.0.1:8981";
 /// The node id the daemon's certificate names.
 const NODE_ID: &str = "cell-node-1";
-/// How long the server and the daemon have to start.
-const START_WAIT: Duration = Duration::from_secs(10);
-/// How long `//:pause` has to start its lease.
-const LEASE_WAIT: Duration = Duration::from_secs(60);
-/// How often a log is read while waiting for a line.
-const POLL: Duration = Duration::from_millis(100);
 /// How much shorter than its sleep `//:pause` may seem: the daemon logs `lease started`
 /// before it fetches the inputs and runs the sleep, and the poll sees the line within a
 /// tenth of a second or so.
@@ -103,40 +99,18 @@ pub struct M1Args {
     pub buck2: Option<PathBuf>,
 }
 
-/// Why the M1 test did not pass.
-#[derive(Debug, thiserror::Error)]
-pub enum M1Error {
-    /// The cell did not do what M1 requires.
-    #[error("FAIL: {0}")]
-    Failed(String),
-    /// The cell could not be set up or driven.
-    #[error("{0}")]
-    Broken(String),
-}
-
-impl M1Error {
-    /// The exit status `kbf-cell` ends with: 1 for a failed check, 2 otherwise.
-    #[must_use]
-    pub const fn exit_code(&self) -> u8 {
-        match self {
-            Self::Failed(_) => 1,
-            Self::Broken(_) => 2,
-        }
-    }
-}
-
 /// Runs the M1 test (the module docs say what it checks). Prints what it does on
 /// stdout.
 ///
 /// # Errors
-/// [`M1Error::Failed`] when a check fails, [`M1Error::Broken`] when the cell cannot be
-/// set up or driven.
-pub fn run(args: &M1Args) -> Result<(), M1Error> {
+/// [`CellError::Failed`] when a check fails, [`CellError::Broken`] when the cell cannot
+/// be set up or driven.
+pub fn run(args: &M1Args) -> Result<(), CellError> {
     let cell = Cell::new(args)?;
     // The cell's processes are stopped when `steps` returns, before the tails print.
     let result = cell.steps();
     if result.is_err() {
-        cell.print_tails();
+        print_tails(&cell.logs, TAIL);
     }
     result
 }
@@ -159,7 +133,7 @@ struct Cell {
 }
 
 impl Cell {
-    fn new(args: &M1Args) -> Result<Self, M1Error> {
+    fn new(args: &M1Args) -> Result<Self, CellError> {
         let key = std::env::var("AWS_ACCESS_KEY_ID").map_err(|_| unset("AWS_ACCESS_KEY_ID"))?;
         let secret = std::env::var("AWS_SECRET_ACCESS_KEY");
         let secret = secret.map_err(|_| unset("AWS_SECRET_ACCESS_KEY"))?;
@@ -205,7 +179,7 @@ impl Cell {
     }
 
     /// Everything after setup. The processes it starts are stopped as it returns.
-    fn steps(&self) -> Result<(), M1Error> {
+    fn steps(&self) -> Result<(), CellError> {
         self.create_bucket()?;
         let pki = crate::pki::write(&self.work.join("pki"), NODE_ID);
         let pki = pki.or_broken(&"the certificates")?;
@@ -227,7 +201,7 @@ impl Cell {
 
     /// Creates the bucket (or finds it, owned by this key pair) and requires it empty,
     /// so that the objects counted at the end are this run's.
-    fn create_bucket(&self) -> Result<(), M1Error> {
+    fn create_bucket(&self) -> Result<(), CellError> {
         let created = self.runtime.block_on(self.store.create_bucket());
         created.or_broken(&"create the bucket")?;
         let held = self.objects()?;
@@ -239,7 +213,7 @@ impl Cell {
     }
 
     /// How many objects the first page of the bucket's listing holds.
-    fn objects(&self) -> Result<usize, M1Error> {
+    fn objects(&self) -> Result<usize, CellError> {
         let all = KeyPrefix::new("").or_broken(&"the empty prefix")?;
         let listed = self.store.list(&all, None, PageSize::MAX);
         let page = self.runtime.block_on(listed);
@@ -249,7 +223,7 @@ impl Cell {
 
     /// Writes the operator API's write token, 64 hex digits, to a file only this user
     /// can read, and returns it.
-    fn write_token(&self) -> Result<String, M1Error> {
+    fn write_token(&self) -> Result<String, CellError> {
         let token = random_hex(32)?;
         let path = self.work.join("api-token");
         let mut options = OpenOptions::new();
@@ -261,7 +235,7 @@ impl Cell {
         Ok(token)
     }
 
-    fn start_server(&self, pki: &PkiFiles) -> Result<Process, M1Error> {
+    fn start_server(&self, pki: &PkiFiles) -> Result<Process, CellError> {
         let mut server = Command::new(self.bin_dir.join("kbf-server"));
         server
             .args(["--store", "s3", "--s3-endpoint", &self.s3_endpoint])
@@ -285,7 +259,7 @@ impl Cell {
         Ok(server)
     }
 
-    fn start_daemon(&self, pki: &PkiFiles) -> Result<Process, M1Error> {
+    fn start_daemon(&self, pki: &PkiFiles) -> Result<Process, CellError> {
         let worker = format!("https://{WORKER}");
         let mut daemon = Command::new(self.bin_dir.join("kbf-cell"));
         daemon
@@ -307,7 +281,7 @@ impl Cell {
     }
 
     /// The Bazel sample: two builds and the check, then Bazel's server is shut down.
-    fn bazel_sample(&self, bazel: &Path) -> Result<(), M1Error> {
+    fn bazel_sample(&self, bazel: &Path) -> Result<(), CellError> {
         let mut root = OsString::from("--output_user_root=");
         root.push(self.work.join("bazel-root"));
         let bazel = Program {
@@ -324,7 +298,7 @@ impl Cell {
 
     /// The buck2 sample: two builds and the check, a lease held in flight, a build
     /// that fails; then buck2's daemon is stopped.
-    fn buck2_sample(&self, buck2: &Path, token: &str) -> Result<(), M1Error> {
+    fn buck2_sample(&self, buck2: &Path, token: &str) -> Result<(), CellError> {
         let buck2 = Program {
             name: "buck2",
             path: buck2,
@@ -342,7 +316,7 @@ impl Cell {
 
     /// Copies the sample project `name` into the work directory, with `kbf-act` as its
     /// `tools/kbf-act`, executable; returns the copy.
-    fn project(&self, name: &str) -> Result<PathBuf, M1Error> {
+    fn project(&self, name: &str) -> Result<PathBuf, CellError> {
         let copy = self.work.join("projects").join(name);
         copy_tree(&self.projects.join(name), &copy)?;
         let tools = copy.join("tools");
@@ -357,7 +331,12 @@ impl Cell {
     /// Builds with `build`, cleans (which stops buck2's daemon too, so the rebuild
     /// starts with no memory of the first), builds again, and applies the M1 rule to
     /// the two builds' summaries.
-    fn two_builds(&self, tool: Tool, program: &Program<'_>, build: &[&str]) -> Result<(), M1Error> {
+    fn two_builds(
+        &self,
+        tool: Tool,
+        program: &Program<'_>,
+        build: &[&str],
+    ) -> Result<(), CellError> {
         let first = self.build_once(program, build, "first")?;
         let cleaned = status(program.command().arg("clean"))?;
         ensure(cleaned, format!("{} clean failed", program.name))?;
@@ -377,7 +356,7 @@ impl Cell {
         program: &Program<'_>,
         build: &[&str],
         round: &str,
-    ) -> Result<String, M1Error> {
+    ) -> Result<String, CellError> {
         let name = program.name;
         let mut command = program.command();
         command.args(build);
@@ -395,7 +374,7 @@ impl Cell {
 
     /// Builds `//:pause` with a fresh salt, drains the node while its lease runs, and
     /// checks what the server showed.
-    fn lease_in_flight(&self, buck2: &Program<'_>, token: &str) -> Result<(), M1Error> {
+    fn lease_in_flight(&self, buck2: &Program<'_>, token: &str) -> Result<(), CellError> {
         let secs = self.pause.as_secs();
         let salt = random_hex(8)?;
         let daemon_log = self.logs.join("daemon.err");
@@ -440,7 +419,7 @@ impl Cell {
     /// `//...` again with `-c kbf_m1.fail=yes`, so `//:verdict` is a new action that
     /// exits 3 on the farm while the rest are cache hits. The build must fail, naming
     /// the planted failure, and leave its event log.
-    fn failing_build(&self, buck2: &Program<'_>) -> Result<(), M1Error> {
+    fn failing_build(&self, buck2: &Program<'_>) -> Result<(), CellError> {
         let log = self.logs.join("buck2-failing.log");
         let events = self.logs.join("buck2-failing.json-lines.gz");
         let mut command = buck2.command();
@@ -462,13 +441,13 @@ impl Cell {
     }
 
     /// `GET /v1/nodes`.
-    fn nodes(&self) -> Result<Value, M1Error> {
+    fn nodes(&self) -> Result<Value, CellError> {
         let url = format!("http://{}/v1/nodes", self.api_listen);
         self.json(self.http.get(url))
     }
 
     /// `POST /v1/nodes/<node>:<verb>` with the JSON `body`.
-    fn write(&self, node: &str, verb: &str, body: &str, token: &str) -> Result<Value, M1Error> {
+    fn write(&self, node: &str, verb: &str, body: &str, token: &str) -> Result<Value, CellError> {
         let url = format!("http://{}/v1/nodes/{node}:{verb}", self.api_listen);
         let request = self.http.post(url).bearer_auth(token);
         let request = request.header(reqwest::header::CONTENT_TYPE, "application/json");
@@ -476,7 +455,7 @@ impl Cell {
     }
 
     /// The JSON answer to `request`; an error status is an error.
-    fn json(&self, request: reqwest::RequestBuilder) -> Result<Value, M1Error> {
+    fn json(&self, request: reqwest::RequestBuilder) -> Result<Value, CellError> {
         let answer = self.runtime.block_on(async {
             let answer = request.send().await?.error_for_status()?;
             answer.bytes().await
@@ -485,23 +464,9 @@ impl Cell {
         serde_json::from_slice::<Value>(&bytes).or_broken(&"the operator API's answer")
     }
 
-    fn log_file(&self, name: &str) -> Result<File, M1Error> {
+    fn log_file(&self, name: &str) -> Result<File, CellError> {
         let path = self.logs.join(name);
         File::create(&path).or_broken(&path.display())
-    }
-
-    /// Prints the last lines of the server's and the daemon's error logs.
-    fn print_tails(&self) {
-        for name in ["server.err", "daemon.err"] {
-            println!("--- last lines of {name}");
-            if let Ok(bytes) = std::fs::read(self.logs.join(name)) {
-                let text = String::from_utf8_lossy(&bytes);
-                let lines: Vec<&str> = text.lines().collect();
-                for line in &lines[lines.len().saturating_sub(TAIL)..] {
-                    println!("{line}");
-                }
-            }
-        }
     }
 }
 
@@ -524,88 +489,6 @@ impl Program<'_> {
     }
 }
 
-/// A process the cell started. Dropped before it is waited for, it gets SIGINT (as a
-/// terminal's Ctrl-C) and is then waited for.
-struct Process {
-    child: Child,
-    reaped: bool,
-}
-
-impl Process {
-    fn spawn(mut command: Command, what: &str) -> Result<Self, M1Error> {
-        let child = command.spawn();
-        let child = child.or_broken(&format!("start {what}"))?;
-        Ok(Self {
-            child,
-            reaped: false,
-        })
-    }
-
-    fn wait(&mut self) -> Result<ExitStatus, M1Error> {
-        let status = self.child.wait();
-        let status = status.or_broken(&"wait for a build")?;
-        self.reaped = true;
-        Ok(status)
-    }
-
-    /// The first lease started after the first `before` in `daemon_log`, waited for
-    /// while this build runs (and for at most [`LEASE_WAIT`]).
-    fn lease(&mut self, daemon_log: &Path, before: usize) -> Result<String, M1Error> {
-        let deadline = Instant::now() + LEASE_WAIT;
-        loop {
-            // Its exit first: once the build has ended, the log read next holds every
-            // lease the build got, since the daemon logs one before it runs it.
-            let exited = self.child.try_wait();
-            let exited = exited.or_broken(&"poll a build")?;
-            self.reaped = exited.is_some();
-            if let Some(lease) = leases_started(&read(daemon_log)?).into_iter().nth(before) {
-                return Ok(lease);
-            }
-            let gave_up = self.reaped | (Instant::now() >= deadline);
-            let why = "//:pause started no lease on the daemon".to_owned();
-            ensure(!gave_up, why)?;
-            std::thread::sleep(POLL);
-        }
-    }
-}
-
-impl Drop for Process {
-    fn drop(&mut self) {
-        if !self.reaped {
-            // Errors are left: the process may have exited already.
-            let _ = kill_process(Pid::from_child(&self.child), Signal::INT);
-            let _ = self.child.wait();
-        }
-    }
-}
-
-/// The ids of the leases `log` (the daemon's, in colour) says started, in order.
-fn leases_started(log: &str) -> Vec<String> {
-    plain(log)
-        .lines()
-        .filter_map(|line| line.split_once("lease started lease=").map(|(_, id)| id))
-        .map(|id| {
-            id.chars()
-                .take_while(|c| c.is_ascii_digit() || *c == '.')
-                .collect()
-        })
-        .collect()
-}
-
-/// `text` without its terminal colour codes (`ESC [ ... m`).
-fn plain(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut chars = text.chars();
-    while let Some(c) = chars.next() {
-        if c == '\x1b' {
-            chars.by_ref().take_while(|&c| c != 'm').for_each(drop);
-        } else {
-            out.push(c);
-        }
-    }
-    out
-}
-
 /// The string at `pointer` in `value`, or empty.
 fn text_at(value: &Value, pointer: &str) -> String {
     let text = value.pointer(pointer).and_then(Value::as_str);
@@ -625,96 +508,6 @@ fn leases_of(answer: &Value) -> String {
     ids.join(",")
 }
 
-/// Waits up to [`START_WAIT`] for a line of the file at `path` that holds `needle`, and
-/// returns it; fails with `failure` if none comes.
-fn wait_for_line(path: &Path, needle: &str, failure: &str) -> Result<String, M1Error> {
-    let deadline = Instant::now() + START_WAIT;
-    loop {
-        if let Some(line) = read(path)?.lines().find(|l| l.contains(needle)) {
-            return Ok(line.to_owned());
-        }
-        ensure(Instant::now() < deadline, failure.to_owned())?;
-        std::thread::sleep(POLL);
-    }
-}
-
-/// Copies the directory `from` to `to`, recursively.
-fn copy_tree(from: &Path, to: &Path) -> Result<(), M1Error> {
-    std::fs::create_dir_all(to).or_broken(&to.display())?;
-    for entry in std::fs::read_dir(from).or_broken(&from.display())? {
-        let entry = entry.or_broken(&from.display())?;
-        let (path, target) = (entry.path(), to.join(entry.file_name()));
-        if entry.file_type().or_broken(&path.display())?.is_dir() {
-            copy_tree(&path, &target)?;
-        } else {
-            std::fs::copy(&path, &target).or_broken(&path.display())?;
-        }
-    }
-    Ok(())
-}
-
-/// Sends `command`'s stdout and stderr to a new file at `log`.
-fn to_log(command: &mut Command, log: &Path) -> Result<(), M1Error> {
-    let out = File::create(log).or_broken(&log.display())?;
-    let err = out.try_clone().or_broken(&log.display())?;
-    command.stdin(Stdio::null()).stdout(out).stderr(err);
-    Ok(())
-}
-
-/// Runs `command` with its output in `log`; whether it exited 0.
-fn logged(command: &mut Command, log: &Path) -> Result<bool, M1Error> {
-    to_log(command, log)?;
-    status(command)
-}
-
-/// Runs `command`; whether it exited 0.
-fn status(command: &mut Command) -> Result<bool, M1Error> {
-    let program = command.get_program().to_string_lossy().into_owned();
-    let status = command.status();
-    let status = status.or_broken(&format!("run {program}"))?;
-    Ok(status.success())
-}
-
-/// `n` random bytes as hex digits.
-fn random_hex(n: usize) -> Result<String, M1Error> {
-    let mut bytes = vec![0u8; n];
-    let urandom = Path::new("/dev/urandom");
-    let filled = File::open(urandom).and_then(|mut f| f.read_exact(&mut bytes));
-    filled.or_broken(&urandom.display())?;
-    Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
-}
-
-/// The file at `path`, as text (lossily: logs may hold anything).
-fn read(path: &Path) -> Result<String, M1Error> {
-    let bytes = std::fs::read(path).or_broken(&path.display())?;
-    Ok(String::from_utf8_lossy(&bytes).into_owned())
-}
-
-fn absolute(path: &Path) -> Result<PathBuf, M1Error> {
-    std::path::absolute(path).or_broken(&path.display())
-}
-
-/// A check: `why` fails the run unless `ok`.
-fn ensure(ok: bool, why: String) -> Result<(), M1Error> {
-    if ok {
-        Ok(())
-    } else {
-        Err(M1Error::Failed(why))
-    }
-}
-
-/// Turns any error into [`M1Error::Broken`], after the name of what failed. One
-/// mapping for every fallible call keeps the error paths few.
-trait OrBroken<T> {
-    fn or_broken(self, what: &dyn Display) -> Result<T, M1Error>;
-}
-
-impl<T, E: Display> OrBroken<T> for Result<T, E> {
-    fn or_broken(self, what: &dyn Display) -> Result<T, M1Error> {
-        self.map_err(|e| M1Error::Broken(format!("{what}: {e}")))
-    }
-}
-
-fn unset(name: &str) -> M1Error {
-    M1Error::Broken(format!("{name} must be set (the store's key pair)"))
+fn unset(name: &str) -> CellError {
+    CellError::Broken(format!("{name} must be set (the store's key pair)"))
 }

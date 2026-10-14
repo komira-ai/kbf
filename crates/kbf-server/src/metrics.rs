@@ -1,5 +1,6 @@
 //! `GET /metrics` on the operator API listener: the cache's upload-path metrics
-//! ([`kbf_front::metrics`]) in the Prometheus text format, for a scraper or for
+//! ([`kbf_front::metrics`]), and the write tier's when one is attached, in the
+//! Prometheus text format, for a scraper or for
 //! `curl` while an upload is slow (`docs/api.md#get-metrics`).
 //!
 //! A read, open like `GET /v1/nodes` and `/readyz`: it names no blob, build or node,
@@ -35,5 +36,5 @@ where
     M: MetaLog,
     O: ObjectStore + 'static,
 {
-    ([(CONTENT_TYPE, TEXT_FORMAT)], cache.metrics().render()).into_response()
+    ([(CONTENT_TYPE, TEXT_FORMAT)], cache.render_metrics()).into_response()
 }

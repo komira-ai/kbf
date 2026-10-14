@@ -15,9 +15,11 @@ kbf-log.workspace = true
 kbf-meta.workspace = true
 kbf-raft.workspace = true
 kbf-sched.workspace = true
+kbf-segments.workspace = true
 kbf-server.workspace = true
 kbf-sim.workspace = true
 kbf-store.workspace = true
+kbf-tier.workspace = true
 kbf-types.workspace = true
 tokio = { workspace = true, features = ["rt"] }
 

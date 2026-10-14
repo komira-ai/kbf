@@ -14,8 +14,10 @@ use std::task::Poll;
 use std::time::Duration;
 
 use kbf_front::{MetaLog, MetaLogError};
-use kbf_log::FarmLogId;
-use kbf_meta::{Applied, BlobAnswer, Command, Epoch, Location, ObjectId, Retention, StoreId};
+use kbf_log::{FarmLogId, MachineVersion};
+use kbf_meta::{
+    Applied, BlobAnswer, Command, Epoch, Location, ObjectId, Retention, ServerId, StoreId, TierId,
+};
 use kbf_server::RaftMetaLog;
 use kbf_store::{Fault, FaultFile, FaultFs, Fs, FsFile};
 use kbf_types::{Digest, DigestFunction};
@@ -632,4 +634,150 @@ fn a_commit_polled_once_outside_a_runtime_commits_on_the_callers_thread() {
         matches!(seen, Poll::Ready(Ok(BlobAnswer::Present { .. }))),
         "{seen:?}"
     );
+}
+
+/// Commits `commands` as one batch: each is proposed while a commit of `first` is held
+/// in its sync, and the gate lets that sync and one more through. Returns each
+/// command's answer, in order.
+fn one_batch(
+    runtime: &Runtime,
+    log: &Arc<Log>,
+    (gate, entered): (&Gate, &Receiver<()>),
+    first: Command,
+    commands: Vec<Command>,
+) -> Vec<Answer> {
+    let n = commands.len();
+    let first = commit_on_a_thread(runtime, log, first);
+    entered.recv_timeout(PROMPTLY).expect("the first sync");
+    let answers = propose_while_held(runtime, log, commands);
+    gate.release();
+    entered.recv_timeout(PROMPTLY).expect("the second sync");
+    gate.release();
+    let first = first.recv_timeout(PROMPTLY).expect("the held proposal");
+    assert!(matches!(first, Ok(Applied::Blob(Ok(_)))), "{first:?}");
+    let mut answered = vec![None; n];
+    for _ in 0..n {
+        let (i, answer) = answers
+            .recv_timeout(PROMPTLY)
+            .expect("every proposal answered after the second sync");
+        answered[i] = Some(answer);
+    }
+    answered.into_iter().flatten().collect()
+}
+
+/// Lets every sync of `gate` through from now on, a held one included.
+fn open_gate(gate: &Gate) {
+    gate.armed.store(false, Ordering::SeqCst);
+    gate.release();
+}
+
+fn add_tier() -> Command {
+    Command::AddTier {
+        server: ServerId::new(1),
+        tier: TierId::new(1),
+    }
+}
+
+fn tier_of_server_1(runtime: &Runtime, log: &Log) -> Option<TierId> {
+    runtime
+        .block_on(log.query(|m| m.tier(ServerId::new(1))))
+        .expect("a query")
+}
+
+/// Catches (mutant "the batch is encoded in format 1", the group-commit side of the
+/// merge with the machine-version raise: after the raise the tier's `AddTier` is
+/// refused; mutant "a refused command takes the next command's answer" (`and` for
+/// `and_then` where the batch's answers are handed out): before the raise the blob
+/// after the refused `AddTier` is answered with the `AllocEpoch`'s epoch): a batch is
+/// encoded in the format the log has committed when the batch commits. Before the raise
+/// to machine version 2 a write tier command in a batch is refused and the rest of the
+/// batch commits, each caller answered with its own outcome; after the raise the same
+/// command commits in a batch with format-1 commands, and a restart replays both
+/// batches (the version, the tier and the blobs come back). A raise commits alone
+/// under the host's lock, so no batch holds a `MachineVersion` entry.
+#[test]
+fn a_batch_is_encoded_in_the_format_committed_before_it_and_replays() {
+    let runtime = runtime();
+    let (gate, entered) = Gate::new();
+    let _disarm = Disarm(Arc::clone(&gate));
+    let inner = FaultFs::new();
+    let fs = GateFs {
+        inner: inner.clone(),
+        gate: Arc::clone(&gate),
+    };
+    let (log, epoch) = opened(&runtime, fs);
+    let (digest_1, put_1) = blob(epoch, 1);
+    let before = one_batch(
+        &runtime,
+        &log,
+        (&gate, &entered),
+        blob(epoch, 0).1,
+        vec![add_tier(), put_1, Command::AllocEpoch],
+    );
+    match before.as_slice() {
+        [
+            Err(MetaLogError::Unavailable(_)),
+            Ok(Applied::Blob(Ok(_))),
+            Ok(Applied::Epoch(e)),
+        ] if *e > epoch => {}
+        other => panic!("before the raise the batch answered {other:?}"),
+    }
+    assert_eq!(tier_of_server_1(&runtime, &log), None);
+    open_gate(&gate);
+    drop(log);
+
+    let inner = inner.restart();
+    let (gate, entered) = Gate::new();
+    let _disarm_raised = Disarm(Arc::clone(&gate));
+    let fs = GateFs {
+        inner: inner.clone(),
+        gate: Arc::clone(&gate),
+    };
+    let log = runtime
+        .block_on(RaftMetaLog::open(fs, Retention::default(), "kbf/", new_id))
+        .expect("reopen after the refused tier command");
+    assert!(matches!(
+        seen(&runtime, &log, digest_1),
+        BlobAnswer::Present { .. }
+    ));
+    log.raise_machine_version(MachineVersion::V2)
+        .expect("a raise");
+    gate.arm();
+    let log = Arc::new(log);
+    let (digest_2, put_2) = blob(epoch, 2);
+    let (digest_3, put_3) = blob(epoch, 3);
+    let after = one_batch(
+        &runtime,
+        &log,
+        (&gate, &entered),
+        blob(epoch, 4).1,
+        vec![put_2, add_tier(), Command::AllocEpoch, put_3],
+    );
+    match after.as_slice() {
+        [
+            Ok(Applied::Blob(Ok(_))),
+            Ok(Applied::Tier(Ok(()))),
+            Ok(Applied::Epoch(_)),
+            Ok(Applied::Blob(Ok(_))),
+        ] => {}
+        other => panic!("after the raise the batch answered {other:?}"),
+    }
+    open_gate(&gate);
+    drop(log);
+
+    let fs = GateFs {
+        inner: inner.restart(),
+        gate: Gate::new().0,
+    };
+    let log = runtime
+        .block_on(RaftMetaLog::open(fs, Retention::default(), "kbf/", new_id))
+        .expect("reopen after the raised batch");
+    assert_eq!(log.machine_version(), MachineVersion::V2);
+    assert_eq!(tier_of_server_1(&runtime, &log), Some(TierId::new(1)));
+    for digest in [digest_1, digest_2, digest_3] {
+        assert!(
+            matches!(seen(&runtime, &log, digest), BlobAnswer::Present { .. }),
+            "a committed blob did not replay"
+        );
+    }
 }

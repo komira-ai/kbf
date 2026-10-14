@@ -2,9 +2,7 @@
 
 use std::io;
 
-use kbf_meta::ObjectId;
-
-use crate::block::TierId;
+use kbf_meta::{ObjectId, TierId};
 
 /// Why a tier call failed.
 #[derive(Debug, thiserror::Error)]
@@ -60,7 +58,8 @@ pub enum TierError {
     /// The directory's `TIER` file is missing or names another tier while objects
     /// are staged on this one: a wrong mount or flag. The start is refused.
     #[error(
-        "write tier directory names tier {found:?}, expected {expected}, and objects are staged on {expected}"
+        "write tier directory names {}, expected {expected}, and objects are staged on {expected}",
+        found.map_or_else(|| "no tier".to_owned(), |t| t.to_string())
     )]
     WrongTier {
         /// The tier the server's objects are staged on.
@@ -69,7 +68,7 @@ pub enum TierError {
         found: Option<TierId>,
     },
     /// The directory belongs to another tier that still has objects staged.
-    #[error("write tier directory belongs to tier {found}, which has objects staged")]
+    #[error("write tier directory belongs to {found}, which has objects staged")]
     OtherTier {
         /// What `TIER` names.
         found: TierId,

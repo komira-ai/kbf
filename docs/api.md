@@ -248,6 +248,26 @@ caller goes away before the answer counts as an error.
 Latency buckets run from 1 ms to 60 s; size buckets from 1 KiB to 1 GiB by fours;
 the blobs-per-segment buckets from 1 to 16384 by fours.
 
+With a local write tier (`--write-tier-dir`, [write-path.md](design/write-path.md#6-the-local-write-tier)),
+these families follow; without one they are absent. An acknowledged blob on the
+tier is on that server's disk and not yet in the object store, so the unflushed
+families are what a disk loss would take, and the oldest age is what an alert
+watches.
+
+| Family | Type | What it measures |
+|---|---|---|
+| `kbf_write_tier_staged_total` | counter | segments staged: synced to a block file, then committed with `PutStaged` |
+| `kbf_write_tier_full_total`, `kbf_write_tier_errors_total` | counter | segments written to the store instead, because the tier was at its budget, or its disk failed before the commit |
+| `kbf_write_tier_flushes_total`, `kbf_write_tier_flush_failures_total` | counter | staged objects flushed (PUT, footer read back, `ObjectFlushed` committed), and flush attempts that failed and are retried after a wait (1 s doubling to 60 s) |
+| `kbf_write_tier_flush_conflicts_total` | counter | staged objects whose key in the store held another object: they stay staged and are read locally until an operator acts (alert on any) |
+| `kbf_write_tier_corrupt_total` | counter | staged objects with a record that failed its digest on the tier's disk: not uploaded, marked unreachable, healed by a re-upload |
+| `kbf_write_tier_local_reads_total` | counter | blobs read from the tier's disk (a block, or a flushed copy) |
+| `kbf_write_tier_evicted_total` | counter | flushed copies evicted, least recently read first |
+| `kbf_write_tier_budget_bytes`, `kbf_write_tier_used_bytes` | gauge | `--write-tier-bytes`, and the bytes counted against it: blocks not yet flushed, reserved ranges included |
+| `kbf_write_tier_flushed_copy_bytes` | gauge | flushed copies kept for local reads, in what the budget leaves over |
+| `kbf_write_tier_unflushed_bytes`, `kbf_write_tier_unflushed_blocks` | gauge | acknowledged bytes, and the blocks holding them, not yet in the object store |
+| `kbf_write_tier_oldest_unflushed_seconds` | gauge | the age of the oldest of those blocks (since it was created, or since the restart that recovered it); 0 when there is none |
+
 **Reading a slow upload.** Each ByteStream Write sends one blob, so a daemon's output
 tree of N files costs N Writes, but not N segments: the cache groups blobs from
 concurrent Writes and batches into one segment, sealed when it is full or
