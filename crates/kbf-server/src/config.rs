@@ -192,7 +192,8 @@ pub struct Args {
     /// in memory until their upload commits, admitted under `--write-bytes-in-flight`
     /// with every other upload: a `Begin` waits while that is spent. At least one 1 GiB
     /// blob and its footer (1 GiB + 1 MiB), so any blob the cache accepts can be
-    /// uploaded.
+    /// uploaded, and at most `--write-bytes-in-flight`, so any legal `Begin` can be
+    /// admitted; the server refuses to start otherwise.
     #[arg(
         long,
         value_name = "BYTES",
@@ -241,7 +242,7 @@ pub struct Args {
     /// blob's size before it reads past its first message, a BatchUpdateBlobs for its
     /// total, a segment upload's Begin for its whole length; a caller over the bound
     /// waits, nothing is refused for load. At least the largest blob (1 GiB), so one
-    /// can always be admitted. Not covered: each HTTP/2
+    /// can always be admitted, and at least `--segment-upload-max-bytes`. Not covered: each HTTP/2
     /// stream's message as tonic decodes it, before the handler runs, up to 5 MiB per
     /// stream and 200 streams per connection on either listener
     /// (`kbf_front::MAX_CONCURRENT_STREAMS`).
@@ -299,6 +300,12 @@ pub enum ConfigError {
         #[source]
         source: std::io::Error,
     },
+    /// A segment upload could declare more than uploads may hold at once.
+    #[error(
+        "--segment-upload-max-bytes {cap} is over --write-bytes-in-flight {bound}: \
+         a segment upload holds its ranges in memory under that bound"
+    )]
+    SegmentUploadOverWriteBound { cap: u64, bound: u64 },
     /// `--meta-log=raft` with `--store=memory`.
     #[error(
         "--meta-log=raft needs --store=s3: a durable index over blobs that die with the process"
@@ -320,8 +327,15 @@ impl Args {
     /// The listeners these flags describe.
     ///
     /// # Errors
-    /// A TLS file cannot be read.
+    /// A TLS file cannot be read; `--segment-upload-max-bytes` is over
+    /// `--write-bytes-in-flight`.
     pub fn listeners(&self) -> Result<Listeners, ConfigError> {
+        if self.segment_upload_max_bytes > self.write_bytes_in_flight {
+            return Err(ConfigError::SegmentUploadOverWriteBound {
+                cap: self.segment_upload_max_bytes,
+                bound: self.write_bytes_in_flight,
+            });
+        }
         let worker_tls = match (
             &self.worker_tls_cert,
             &self.worker_tls_key,
@@ -546,6 +560,34 @@ mod tests {
                 "{refused} accepted"
             );
         }
+    }
+
+    /// Catches a server that starts with `--segment-upload-max-bytes` over
+    /// `--write-bytes-in-flight` (mutant: the check removed). A segment upload holds its
+    /// ranges in memory under the write bound, so an upload of the whole cap would hold
+    /// more than the bound admits. A cap equal to the bound starts; one byte of bound
+    /// less is refused, naming both flags.
+    #[test]
+    fn a_segment_upload_cap_over_the_write_bound_is_refused() {
+        let cap = kbf_front::MIN_SEGMENT_UPLOAD_BYTES;
+        let args = |bound: u64| {
+            Args::parse_from([
+                "kbf-server".to_owned(),
+                format!("--segment-upload-max-bytes={cap}"),
+                format!("--write-bytes-in-flight={bound}"),
+            ])
+        };
+        args(cap).listeners().expect("a cap equal to the bound");
+        let refused = args(cap - 1)
+            .listeners()
+            .map(drop)
+            .expect_err("a cap over the bound");
+        let message = refused.to_string();
+        assert!(
+            message.contains("--segment-upload-max-bytes")
+                && message.contains("--write-bytes-in-flight"),
+            "{message}"
+        );
     }
 
     /// Catches: a `--write-bytes-in-flight` below the largest blob accepted (a Write of

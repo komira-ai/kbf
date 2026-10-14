@@ -8,7 +8,9 @@ mod support;
 
 use std::time::Duration;
 
-use kbf_front::{MAX_RANGE_BYTES, MAX_UPLOAD_RECORDS, SegmentsConfig, WriteConfig};
+use kbf_front::{
+    MAX_RANGE_BYTES, MAX_UPLOAD_RECORDS, MIN_SEGMENT_UPLOAD_BYTES, SegmentsConfig, WriteConfig,
+};
 use kbf_proto::worker::{BeginRequest, CommitRequest, ObjectRef, ReadRangeRequest, UploadSegment};
 use kbf_segments::{Footer, IndexEntry};
 use tonic::Code;
@@ -609,5 +611,178 @@ async fn a_connection_closed_during_the_commit_leaves_the_commit_to_finish() {
     front.store.release();
     front.wait_until_no_uploads().await;
     front.assert_present(&s.digests, true).await;
+    assert_eq!(front.cache.bytes_admitted(), 0);
+}
+
+/// Catches a segment upload admitted apart from the cache's other uploads (mutant:
+/// `Begin` keeps its own memory budget, as before it moved onto `Cache::admit`): with
+/// `--write-bytes-in-flight` at 4 KiB and 2 KiB of it admitted elsewhere (what a
+/// ByteStream `Write` or a `BatchUpdateBlobs` takes), a `Begin` of 2.5 KiB waits in the
+/// server, and is admitted once those 2 KiB are released; its upload then counts
+/// against the same bound until it commits. Every wait ends on an event.
+#[tokio::test]
+async fn a_begin_waits_for_bytes_other_uploads_hold() {
+    let config = SegmentsConfig {
+        max_bytes: 4 << 10,
+        idle: Duration::from_secs(3600),
+    };
+    let writes = WriteConfig {
+        bytes_in_flight: 4 << 10,
+        ..WriteConfig::DEFAULT
+    };
+    let front = Front::start_with(config, writes).await;
+    let s = seg(&[blob(70, 2500)]);
+    assert!(
+        s.length + (2 << 10) > 4 << 10,
+        "the two do not fit together"
+    );
+    let held = front.cache.admit(2 << 10).await;
+    assert_eq!(front.cache.bytes_admitted(), 2 << 10);
+
+    let mut client = front.client().await;
+    let segments = vec![s.upload_segment()];
+    let mut begun = client.clone();
+    let waiting = tokio::spawn(async move { begun.begin(BeginRequest { segments }).await });
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while front.service.begins_waiting() == 0 {
+            assert!(
+                !waiting.is_finished(),
+                "the Begin finished while another upload held the bound"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the Begin waits in the server");
+
+    drop(held);
+    let upload = tokio::time::timeout(Duration::from_secs(10), waiting)
+        .await
+        .expect("the Begin is admitted once the other upload ends")
+        .expect("task")
+        .expect("admitted, not refused")
+        .into_inner()
+        .upload;
+    assert_eq!(front.cache.bytes_admitted(), s.length);
+    put_all(&mut client, upload, 0, &s, 4096, false).await;
+    client
+        .commit(CommitRequest { upload })
+        .await
+        .expect("commit");
+    front.assert_present(&s.digests, true).await;
+    assert_eq!(front.cache.bytes_admitted(), 0);
+}
+
+/// Catches an upload's segment PUT tried once (mutant: `store_upload` PUTs through the
+/// store itself, as before it moved onto the cache's writer): the commit's first PUT
+/// fails as a reset connection; the commit still succeeds, after a second PUT under
+/// another key, and every record is indexed where the stored footer says.
+#[tokio::test]
+async fn a_commit_retries_a_failed_put_under_a_new_key() {
+    let front = Front::start(SegmentsConfig::DEFAULT).await;
+    let s = seg(&[blob(80, 700), blob(81, 900)]);
+    let mut client = front.client().await;
+    let upload = front.begin(&mut client, std::slice::from_ref(&s)).await;
+    put_all(&mut client, upload, 0, &s, 4096, false).await;
+    front.store.fail_next_puts(1);
+    client
+        .commit(CommitRequest { upload })
+        .await
+        .expect("the commit succeeds on the second PUT");
+    let keys = front.store.put_keys();
+    assert_eq!(keys.len(), 2, "{keys:?}");
+    assert_ne!(keys[0], keys[1], "a retry never reuses a key");
+    assert_eq!(front.cache.metrics().segment_put.count(), 2);
+    front.assert_present(&s.digests, true).await;
+    front.assert_stored_records_check(&s.digests).await;
+}
+
+/// Catches an upload's segments PUT past `--write-puts-in-flight` (mutant: the PUT
+/// slot not taken for an upload's segments): with 2 slots, a commit of three segments
+/// whose PUTs are held has exactly 2 at the store. Weak: a 200 ms wall-clock wait, so
+/// a third PUT slower than that would go unseen.
+#[tokio::test]
+async fn an_uploads_segment_puts_take_the_put_slots() {
+    let writes = WriteConfig {
+        puts_in_flight: std::num::NonZeroUsize::new(2).expect("2"),
+        ..WriteConfig::DEFAULT
+    };
+    let front = Front::start_with(SegmentsConfig::DEFAULT, writes).await;
+    let segs: Vec<_> = (0..3).map(|i| seg(&[blob(90 + i, 500)])).collect();
+    let mut client = front.client().await;
+    let upload = front.begin(&mut client, &segs).await;
+    for (i, s) in segs.iter().enumerate() {
+        put_all(&mut client, upload, i, s, 4096, false).await;
+    }
+    front.store.hold();
+    let mut committing = client.clone();
+    let call = tokio::spawn(async move { committing.commit(CommitRequest { upload }).await });
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while front.store.puts_at_gate() < 2 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("two PUTs reach the store");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(front.store.puts_at_gate(), 2, "no more PUTs than slots");
+    front.store.release();
+    call.await.expect("task").expect("commit");
+    for s in &segs {
+        front.assert_present(&s.digests, true).await;
+    }
+}
+
+/// The "a 1 GiB single-record segment commits" row of section 9, scaled: catches a
+/// commit that asks for admission again while its `Begin` still holds it (mutant:
+/// `commit_task` admits one more byte before storing), which waits forever when the
+/// upload is as large as the bound. With the tightest bound `kbf-server`
+/// starts with (`--write-bytes-in-flight` equal to the default 1 GiB + 1 MiB cap), a
+/// `Begin` of the whole cap is admitted; with a 64 KiB bound and cap, one record that
+/// fills the whole upload is sent and commits, and the bytes come back. Sending 1 GiB
+/// would hash and hold gigabytes in every run of the suite.
+#[tokio::test]
+async fn an_upload_as_large_as_the_bound_is_admitted_and_commits() {
+    let tightest = WriteConfig {
+        bytes_in_flight: MIN_SEGMENT_UPLOAD_BYTES,
+        ..WriteConfig::DEFAULT
+    };
+    let front = Front::start_with(SegmentsConfig::DEFAULT, tightest).await;
+    let mut client = front.client().await;
+    let begun = tokio::time::timeout(
+        Duration::from_secs(10),
+        client.begin(BeginRequest {
+            segments: vec![support::declared_only(MIN_SEGMENT_UPLOAD_BYTES)],
+        }),
+    )
+    .await
+    .expect("a Begin of the whole cap does not wait");
+    begun.expect("admitted");
+    assert_eq!(front.cache.bytes_admitted(), MIN_SEGMENT_UPLOAD_BYTES);
+
+    let bound = 64 << 10;
+    let config = SegmentsConfig {
+        max_bytes: bound,
+        idle: Duration::from_secs(3600),
+    };
+    let writes = WriteConfig {
+        bytes_in_flight: bound,
+        ..WriteConfig::DEFAULT
+    };
+    let front = Front::start_with(config, writes).await;
+    let record = usize::try_from(bound - kbf_segments::layout::footer_len(1)).expect("len");
+    let s = seg(&[blob(100, record)]);
+    assert_eq!(s.length, bound, "one record fills the upload");
+    let mut client = front.client().await;
+    let upload = front.begin(&mut client, std::slice::from_ref(&s)).await;
+    put_all(&mut client, upload, 0, &s, 16 << 10, false).await;
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        client.commit(CommitRequest { upload }),
+    )
+    .await
+    .expect("the commit does not wait for admission")
+    .expect("commit");
+    front.assert_stored_records_check(&s.digests).await;
     assert_eq!(front.cache.bytes_admitted(), 0);
 }

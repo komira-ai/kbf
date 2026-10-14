@@ -178,7 +178,8 @@ stores its outputs that way. Where the code differs from the text below:
   `--segment-upload-max-bytes` a server starts with, so every server admits them and
   the daemon needs no flag for the server's cap.
 - `Begin` is admitted for its whole length by the cache's `--write-bytes-in-flight`
-  (section 3.3), the bound ByteStream and batch uploads share. Each segment of a commit is
+  (section 3.3), the bound ByteStream and batch uploads share, and the server refuses
+  to start with `--segment-upload-max-bytes` over it. Each segment of a commit is
   stored as a grouped segment is: under a `--write-puts-in-flight` slot, its PUT
   retried under a new key (section 3.4), its footer read back; the one `PutBlobs` is
   timed as a segment commit.
@@ -534,7 +535,9 @@ Grouping (PR 1), over `MemoryStore` wrapped to count and fault requests:
 | the same digest from two callers: one record, both answered | duplicate records; a caller never answered |
 | 48 concurrent `Write`s on one connection, three times the bound in all: peak buffered bytes stay under the bound, every `Write` finishes (built as 4 MiB `Write`s and a 12 MiB bound, not 64 MiB and 1 GiB, so the suite does not hash 3 GiB) | permit taken after buffering; mutant: permit in `store_blobs`; flow-control windows left at the transport's defaults (deadlock) |
 | a start with `--write-bytes-in-flight` below `MAX_BLOB_BYTES` is refused | a legal blob waiting forever |
-| a start with `--segment-upload-max-bytes` over `--write-bytes-in-flight`, or below one 1 GiB record plus footer, is refused; a `Begin` over the cap or `MAX_UPLOAD_RECORDS` is refused; a 1 GiB single-record segment commits | a `Begin` waiting forever for its permit |
+| a start with `--segment-upload-max-bytes` over `--write-bytes-in-flight`, or below one 1 GiB record plus footer, is refused; a `Begin` over the cap or `MAX_UPLOAD_RECORDS` is refused; a `Begin` of the whole 1 GiB + 1 MiB cap is admitted under a bound of the same size, and a single-record upload that fills its bound commits (built as a 64 KiB bound and record, so the suite does not hash 1 GiB) | an upload holding more than the bound; mutant: the start check removed; a commit that asks for admission again (it waits forever) |
+| a `Begin` waits while other uploads hold the bound, and is admitted when they release it | segment uploads bounded apart from ByteStream and batch uploads |
+| an upload's first segment PUT fails: the commit succeeds on a retry under a new key; with 2 PUT slots, a three-segment commit has 2 PUTs at the store | an upload's PUT tried once; an upload's PUTs past `--write-puts-in-flight` |
 
 Segment upload (PR 2):
 

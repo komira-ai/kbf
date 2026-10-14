@@ -2,7 +2,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -143,13 +143,19 @@ pub async fn put_all(
     }
 }
 
-/// A memory bucket whose PUTs can be held at a gate.
+/// A memory bucket whose PUTs can be held at a gate, or fail.
 #[derive(Clone)]
 pub struct GatedStore {
     inner: Arc<MemoryStore>,
     holding: Arc<AtomicBool>,
     gate: Arc<Semaphore>,
     entered: Arc<Notify>,
+    /// PUTs waiting at the gate now.
+    at_gate: Arc<AtomicUsize>,
+    /// How many of the next PUTs fail without reaching the bucket.
+    failing: Arc<AtomicUsize>,
+    /// Every PUT's key, in the order they arrived.
+    put_keys: Arc<std::sync::Mutex<Vec<ObjectKey>>>,
 }
 
 impl GatedStore {
@@ -159,7 +165,25 @@ impl GatedStore {
             holding: Arc::new(AtomicBool::new(false)),
             gate: Arc::new(Semaphore::new(0)),
             entered: Arc::new(Notify::new()),
+            at_gate: Arc::new(AtomicUsize::new(0)),
+            failing: Arc::new(AtomicUsize::new(0)),
+            put_keys: Arc::default(),
         }
+    }
+
+    /// The next `n` PUTs fail as a reset connection would, storing nothing.
+    pub fn fail_next_puts(&self, n: usize) {
+        self.failing.store(n, Ordering::SeqCst);
+    }
+
+    /// How many PUTs are waiting at the gate now.
+    pub fn puts_at_gate(&self) -> usize {
+        self.at_gate.load(Ordering::SeqCst)
+    }
+
+    /// Every PUT's key so far, failed ones included, in the order they arrived.
+    pub fn put_keys(&self) -> Vec<ObjectKey> {
+        self.put_keys.lock().expect("keys").clone()
     }
 
     /// Holds every later PUT until [`GatedStore::release`].
@@ -192,9 +216,21 @@ impl ObjectStore for GatedStore {
         body: Bytes,
         retain_until: Option<std::time::SystemTime>,
     ) -> Result<(), ObjectStoreError> {
+        self.put_keys.lock().expect("keys").push(key.clone());
         if self.holding.load(Ordering::SeqCst) {
+            self.at_gate.fetch_add(1, Ordering::SeqCst);
             self.entered.notify_one();
             let _ = self.gate.acquire().await.map(|p| p.forget());
+            self.at_gate.fetch_sub(1, Ordering::SeqCst);
+        }
+        let failed = self
+            .failing
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1));
+        if failed.is_ok() {
+            return Err(ObjectStoreError::Transport(Arc::new(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "connection reset (test)",
+            ))));
         }
         self.inner.put_new(key, body, retain_until).await
     }
