@@ -24,10 +24,6 @@ use crate::meta_log::{MemoryMetaLog, MetaLog, MetaLogError};
 use crate::metrics::CacheMetrics;
 use crate::{MAX_BLOB_BYTES, wire};
 
-/// How many times a read asks again when a collection removes what it was about to
-/// touch, before it answers UNAVAILABLE.
-const TOUCH_ATTEMPTS: usize = 3;
-
 /// Why a cache operation failed. [`Status`] has a `From` for it, so a service answers
 /// with the right gRPC code. Cloned, so one segment's failure answers every blob in it.
 #[derive(Clone, Debug, thiserror::Error)]
@@ -69,9 +65,6 @@ pub enum CacheError {
     /// An object key could not be built.
     #[error("object key: {0}")]
     Key(#[from] KeyError),
-    /// Collections kept removing what a read was about to touch.
-    #[error("the index kept changing under the read; try again")]
-    Contended,
     /// The cache's own records disagree (a segment read back without a blob just
     /// packed into it, an index entry with no readable range, a log answering with
     /// the wrong outcome). A bug or a broken backend, never the client's fault.
@@ -99,8 +92,7 @@ impl From<CacheError> for Status {
             | CacheError::Store(_)
             | CacheError::Segment(_)
             | CacheError::Pack(_)
-            | CacheError::Key(_)
-            | CacheError::Contended => Status::unavailable(message),
+            | CacheError::Key(_) => Status::unavailable(message),
             CacheError::Internal(_) => Status::internal(message),
         }
     }
@@ -162,13 +154,24 @@ fn is_empty_blob(d: &Digest) -> bool {
 /// an object the store cannot produce, or whose bytes are wrong, is marked unreachable
 /// (with the reason), never served and never reported absent.
 ///
+/// A read records the touch it owes and answers; the touches are committed in batches
+/// off the reply path, and [`Cache::collect`] commits them before it collects
+/// ([`TouchConfig`]).
+///
 /// Each stage of a store, each read's object GET, and each metadata commit and query
 /// is timed into the cache's [`CacheMetrics`] ([`Cache::metrics`]).
 #[derive(Debug)]
 pub struct Cache<M, O> {
     writer: Arc<Writer<M, O>>,
     group: Arc<Group>,
+    touches: Arc<Touches>,
     segment_limit: u64,
+}
+
+impl<M, O> Drop for Cache<M, O> {
+    fn drop(&mut self) {
+        self.touches.stop();
+    }
 }
 
 impl Cache<MemoryMetaLog, MemoryStore> {
@@ -203,6 +206,7 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         Self {
             writer: Arc::new(Writer::new(meta, objects, prefix, epoch)),
             group: Arc::new(Group::new(WriteConfig::DEFAULT)),
+            touches: Arc::new(Touches::new(TouchConfig::DEFAULT)),
             segment_limit: MAX_SEGMENT_BYTES,
         }
     }
@@ -214,6 +218,20 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
     pub const fn with_segment_limit(mut self, limit: u64) -> Self {
         self.segment_limit = limit;
         self
+    }
+
+    /// The same cache, committing recorded touches as `config` says instead of
+    /// [`TouchConfig::DEFAULT`]. Call it before the cache serves a read.
+    #[must_use]
+    pub fn with_touches(mut self, config: TouchConfig) -> Self {
+        self.touches.stop();
+        self.touches = Arc::new(Touches::new(config));
+        self
+    }
+
+    /// How many recorded touches wait for their commit.
+    pub fn touches_pending(&self) -> usize {
+        self.touches.pending()
     }
 
     /// A cache over `meta` and `objects` under `prefix`, in a writer epoch it commits
@@ -275,9 +293,14 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
     /// Removes every blob and action entry whose retention has run out, and says what
     /// went. Segments are not rewritten or deleted yet; their dead space is reported.
     ///
+    /// Every recorded touch is committed first, and no read records one until the
+    /// collection has applied, so nothing a read reported is collected.
+    ///
     /// # Errors
-    /// The metadata log is unavailable.
+    /// The metadata log is unavailable; then nothing is collected.
     pub async fn collect(&self) -> Result<Collected, CacheError> {
+        let _exclusive = self.touches.gate().write().await;
+        touches::flush(&self.touches, &self.writer).await?;
         match self.writer.commit(Command::Collect).await? {
             Applied::Collected(c) => Ok(c),
             other => Err(unexpected(&other)),
@@ -285,10 +308,11 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
     }
 
     /// Answers `FindMissingBlobs`: every requested digest that is not present and
-    /// reachable, in request order. Present blobs are touched before the answer.
+    /// reachable, in request order. The present blobs' touch is recorded, not
+    /// committed: the answer waits for no metadata commit.
     ///
     /// # Errors
-    /// The metadata log is unavailable or kept changing; never a partial answer.
+    /// The metadata log is unavailable; never a partial answer.
     pub async fn find_missing(&self, digests: &[Digest]) -> Result<Vec<Digest>, CacheError> {
         let missing = self
             .touched(|s| {
@@ -554,26 +578,21 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         Ok(closure)
     }
 
-    /// Runs `read` and commits the touch it asks for, asking again if a collection
-    /// removed an entry in between. The answer is returned only after its touch is
-    /// committed, so nothing reported present can be collected within `min_ttl`.
+    /// Runs `read` and records the touch it asks for ([`TouchConfig`]); commits
+    /// nothing. The query and the record happen under the gate a collection takes
+    /// exclusively, so a collection either sees the touch or ran before the query.
     async fn touched<R, F>(&self, read: F) -> Result<R, CacheError>
     where
-        F: Fn(&MetaState) -> (R, Touch) + Send + Sync,
+        F: FnOnce(&MetaState) -> (R, Touch) + Send,
         R: Send,
     {
-        for _ in 0..TOUCH_ATTEMPTS {
-            let (answer, touch) = self.writer.query(&read).await?;
-            if touch.is_empty() {
-                return Ok(answer);
-            }
-            match self.writer.commit(Command::Touch(touch)).await? {
-                Applied::Touched { lost } if lost.is_empty() => return Ok(answer),
-                Applied::Touched { .. } => {}
-                other => return Err(unexpected(&other)),
-            }
+        let _shared = self.touches.gate().read().await;
+        let (answer, touch) = self.writer.query(read).await?;
+        if !touch.is_empty() {
+            self.touches.record(touch);
+            self.touches.start(&self.writer);
         }
-        Err(CacheError::Contended)
+        Ok(answer)
     }
 
     /// Reads `digest`'s bytes at `location` and checks them. An object the store does
@@ -662,10 +681,13 @@ fn unexpected(applied: &Applied) -> CacheError {
 }
 
 mod batch;
+mod touches;
 mod upload;
 mod write_group;
 
 pub use batch::BATCH_READS_IN_FLIGHT;
+pub use touches::TouchConfig;
+use touches::Touches;
 pub(crate) use upload::BuiltSegment;
 pub use write_group::{
     Admitted, CONNECTION_WINDOW_BYTES, MAX_ADMISSION_BYTES, MAX_CONCURRENT_STREAMS, PUT_BACKOFF,
