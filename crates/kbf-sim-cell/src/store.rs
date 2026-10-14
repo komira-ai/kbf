@@ -4,7 +4,12 @@
 //!
 //! It never loses an object it kept. A PUT to an id it already holds replaces the
 //! object (a plain PUT, the worst case: no `conditional_put`), so a writer that reuses
-//! an id is caught by property 9 rather than refused by the store.
+//! an id is caught by property 9 rather than refused by the store; a replacement with
+//! other content is recorded ([`ObjectStore::rewrites`], invariant C).
+//!
+//! An object is one blob (the direct path's PUT) or a flushed segment of the local
+//! write tier ([`Body`]: its records and footer, and where each blob is). Both meet
+//! the same faults. Reads (`Get`) are answered at once, from what the store holds.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
@@ -13,7 +18,41 @@ use kbf_meta::ObjectId;
 use kbf_sim::{Event, NodeId, NodeInput, Output};
 use kbf_types::{Digest, Effect, FarmTime, StateMachine};
 
-use crate::Msg;
+use crate::{Msg, content};
+
+/// A flushed segment as the store holds it: its bytes (the records, then the footer
+/// `kbf_segments` encodes from the committed list) and each blob's offset in them,
+/// sorted by digest.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Body {
+    pub blobs: Vec<(Digest, u64)>,
+    pub bytes: Vec<u8>,
+}
+
+/// What one stored object holds.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Held {
+    /// One blob, PUT by the direct path.
+    Blob(Digest),
+    /// A segment the write tier's flusher PUT.
+    Segment(Body),
+}
+
+impl Held {
+    /// Whether this object holds `digest`'s bytes: it is the blob, or the segment
+    /// lists it at an offset where its bytes are.
+    #[must_use]
+    pub fn holds(&self, digest: &Digest) -> bool {
+        match self {
+            Self::Blob(d) => d == digest,
+            Self::Segment(body) => body.blobs.iter().any(|(d, at)| {
+                let from = usize::try_from(*at).unwrap_or(usize::MAX);
+                let to = from.saturating_add(usize::try_from(d.size_bytes).unwrap_or(0));
+                d == digest && body.bytes.get(from..to) == Some(content(d).as_slice())
+            }),
+        }
+    }
+}
 
 /// Where a blob's bytes are durable, as the checks ask it: the seam the local write
 /// tier plugs into. Today only the object store holds bytes; with the tier (rollout
@@ -111,14 +150,14 @@ pub enum Met {
 const T_FAULT: u64 = 0;
 const T_REPLY: u64 = 1 << 32;
 
-/// A PUT whose answer waits: the sender, the object and its digest.
-type Pending = (NodeId, ObjectId, Digest);
+/// A PUT whose answer waits: the sender, the object and what it holds.
+type Pending = (NodeId, ObjectId, Held);
 
 /// The object store node.
 #[derive(Debug, Default)]
 pub struct ObjectStore {
     plan: StorePlan,
-    objects: BTreeMap<ObjectId, Digest>,
+    objects: BTreeMap<ObjectId, Held>,
     paused_until: Option<FarmTime>,
     slow: Option<(FarmTime, Duration)>,
     fail_until: Option<FarmTime>,
@@ -134,6 +173,10 @@ pub struct ObjectStore {
     met: Vec<(ObjectId, Digest, Met)>,
     /// Each object PUT again while the store held it: a network duplicate of a PUT.
     repeated: BTreeSet<ObjectId>,
+    /// Each flushed object a fault met, and how.
+    flush_met: Vec<(ObjectId, Met)>,
+    /// Each object replaced with other content.
+    rewrites: BTreeSet<ObjectId>,
     out: Vec<Output<Msg>>,
 }
 
@@ -150,12 +193,25 @@ impl ObjectStore {
     /// Whether some object holds `digest`'s bytes, readable now.
     #[must_use]
     pub fn holds_digest(&self, digest: &Digest) -> bool {
-        self.objects.values().any(|d| d == digest)
+        self.objects.values().any(|held| held.holds(digest))
     }
 
-    /// The objects the store keeps, and the digest each holds.
-    pub fn objects(&self) -> impl Iterator<Item = (ObjectId, &Digest)> {
-        self.objects.iter().map(|(o, d)| (*o, d))
+    /// The objects the store keeps, and what each holds.
+    pub fn objects(&self) -> impl Iterator<Item = (ObjectId, &Held)> {
+        self.objects.iter().map(|(o, held)| (*o, held))
+    }
+
+    /// Each flushed segment a refusal, a lost acknowledgement or a false failure met.
+    #[must_use]
+    pub fn flush_met(&self) -> &[(ObjectId, Met)] {
+        &self.flush_met
+    }
+
+    /// Each object a PUT replaced with other content: a flush of an object that did
+    /// not write the same bytes again (invariant C), or an id reused.
+    #[must_use]
+    pub fn rewrites(&self) -> &BTreeSet<ObjectId> {
+        &self.rewrites
     }
 
     /// What the store did.
@@ -181,21 +237,47 @@ impl ObjectStore {
         std::mem::take(&mut self.out)
     }
 
-    fn keep_and_answer(&mut self, (to, object, digest): Pending) {
-        self.objects.insert(object, digest);
+    fn keep_and_answer(&mut self, (to, object, held): Pending) {
+        let before = self.objects.insert(object, held.clone());
+        if before.is_some_and(|b| b != held) {
+            self.rewrites.insert(object);
+        }
         if self.lose_next > 0 {
             self.lose_next -= 1;
             self.stats.lost_acks += 1;
-            self.met.push((object, digest, Met::LostAck));
+            self.record(object, &held, Met::LostAck);
             return;
         }
-        let msg = if self.keep_fail_next > 0 {
+        let failed = self.keep_fail_next > 0;
+        if failed {
             self.keep_fail_next -= 1;
             self.stats.false_fails += 1;
-            self.met.push((object, digest, Met::FalseFail));
-            Msg::PutFailed { object, digest }
-        } else {
-            Msg::PutDone { object, digest }
+            self.record(object, &held, Met::FalseFail);
+        }
+        self.answer(to, object, &held, !failed);
+    }
+
+    /// Records that a fault met the PUT of `object`.
+    fn record(&mut self, object: ObjectId, held: &Held, how: Met) {
+        match held {
+            Held::Blob(digest) => self.met.push((object, *digest, how)),
+            Held::Segment(_) => self.flush_met.push((object, how)),
+        }
+    }
+
+    /// Answers the PUT of `object`: done, or failed.
+    fn answer(&mut self, to: NodeId, object: ObjectId, held: &Held, done: bool) {
+        let msg = match (held, done) {
+            (Held::Blob(digest), true) => Msg::PutDone {
+                object,
+                digest: *digest,
+            },
+            (Held::Blob(digest), false) => Msg::PutFailed {
+                object,
+                digest: *digest,
+            },
+            (Held::Segment(_), true) => Msg::FlushDone { object },
+            (Held::Segment(_), false) => Msg::FlushFailed { object },
         };
         self.out.push(Output::Send { to, msg });
     }
@@ -216,10 +298,9 @@ impl ObjectStore {
                 self.fail_next -= 1;
             }
             self.stats.failed += 1;
-            let (to, object, digest) = pending;
-            self.met.push((object, digest, Met::Failed));
-            let msg = Msg::PutFailed { object, digest };
-            self.out.push(Output::Send { to, msg });
+            let (to, object, held) = pending;
+            self.record(object, &held, Met::Failed);
+            self.answer(to, object, &held, false);
             return;
         }
         if let Some((_, by)) = self.slow.filter(|(until, _)| now < *until) {
@@ -265,7 +346,9 @@ impl ObjectStore {
 
 impl BlobHomes for ObjectStore {
     fn holds(&self, object: ObjectId, digest: &Digest) -> bool {
-        self.objects.get(&object) == Some(digest)
+        self.objects
+            .get(&object)
+            .is_some_and(|held| held.holds(digest))
     }
 }
 
@@ -292,11 +375,22 @@ impl StateMachine for ObjectStore {
                 let fault = self.plan.faults[index].1;
                 self.begin(fault, now);
             }
-            Event::Message {
-                from,
-                msg: Msg::Put { object, digest },
-            } => self.put(now, (from, object, digest)),
-            Event::Message { .. } => {}
+            Event::Message { from, msg } => match msg {
+                Msg::Put { object, digest } => self.put(now, (from, object, Held::Blob(digest))),
+                Msg::Flush { object, body } => {
+                    self.put(now, (from, object, Held::Segment(body)));
+                }
+                Msg::Get {
+                    object,
+                    digest,
+                    tag,
+                } => {
+                    let held = self.holds(object, &digest);
+                    let msg = Msg::Got { tag, held };
+                    self.out.push(Output::Send { to: from, msg });
+                }
+                _ => {}
+            },
         }
         Vec::new()
     }

@@ -31,6 +31,19 @@
 //!    by the object its location names: no fault (a failed, held or unanswered PUT, a
 //!    crash at any point of the write path) leaves an index entry without its bytes.
 //!
+//! Four more, of the local write tier (`check/tier.rs`), in every run with one, besides
+//! the tier halves of 8 and 9 (a staged object's block is a home too):
+//!
+//! 10. **Ids never move** (invariant C). A blob's location is fixed by its first
+//!     commit unless its object is marked unreachable, and the store never holds two
+//!     contents under one id (a reflush writes the same bytes). Checked in every run.
+//! 11. **Within budget** (invariant D). The tier's counted and flushed bytes never pass
+//!     `--write-tier-bytes`.
+//! 12. **No leak** (invariant E). At each start, the tier directory holds only `TIER`,
+//!     staged blocks at their committed length and flushed copies, and the budget
+//!     counts exactly the staged bytes.
+//! 13. **Drained** (invariant F). At the end no object is left staged.
+//!
 //! Properties 3 and 4 do not hold yet once the server restarts or its log stops,
 //! because the scheduler's state is not in the log: property 3 is enforced in
 //! runs without a restart only ([`Kind::restarts`]), until control inputs go through
@@ -38,7 +51,8 @@
 //! until a result and its action-cache entry commit together (PR 12): in
 //! [`Kind::Calm`] and the store kinds but [`Kind::StoreCrash`]. A daemon cut off past
 //! T may have a result refused, so property 4's "accepted once" does not apply to
-//! [`Kind::Partition`] runs.
+//! [`Kind::Partition`] runs, nor its "entry for each result" to [`Kind::TierBadBlock`]
+//! runs (the entry's result blob may be in the damaged block).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -53,6 +67,8 @@ use crate::replica::{self, Broken};
 use crate::server::Seen;
 use crate::store::BlobHomes;
 
+pub(crate) mod tier;
+
 /// A property of ha.md section 15.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Property {
@@ -65,6 +81,10 @@ pub enum Property {
     Liveness,
     NoFalseAck,
     NothingHalfIndexed,
+    IdsNeverMove,
+    WithinBudget,
+    NoLeak,
+    Drained,
 }
 
 impl fmt::Display for Property {
@@ -79,6 +99,10 @@ impl fmt::Display for Property {
             Self::Liveness => "7 (liveness)",
             Self::NoFalseAck => "8 (no false ack)",
             Self::NothingHalfIndexed => "9 (nothing half-indexed)",
+            Self::IdsNeverMove => "10 (ids never move)",
+            Self::WithinBudget => "11 (within budget)",
+            Self::NoLeak => "12 (no leak)",
+            Self::Drained => "13 (drained)",
         };
         f.write_str(name)
     }
@@ -231,6 +255,8 @@ pub(crate) struct Checker<'a> {
     scenario: &'a Scenario,
     newest_time: FarmTime,
     present_checked: usize,
+    /// Each blob's location as first answered (property 10).
+    locations: BTreeMap<Digest, kbf_meta::Location>,
 }
 
 impl<'a> Checker<'a> {
@@ -239,6 +265,7 @@ impl<'a> Checker<'a> {
             scenario,
             newest_time: FarmTime::default(),
             present_checked: 0,
+            locations: BTreeMap::new(),
         }
     }
 
@@ -277,16 +304,28 @@ impl<'a> Checker<'a> {
             .find_map(|(_, n)| n.store())
             .expect("the cell has an object store");
         let present = &seen.present[self.present_checked..];
-        self.hold(now, no_false_present(present, |d| store.holds_digest(d)));
         self.present_checked = seen.present.len();
         let indexed = |d: &Digest| {
             meta.as_ref()
                 .is_none_or(|m| matches!(m.blob(d), BlobAnswer::Present { .. }))
         };
-        self.hold(now, no_false_ack(&seen.acked, store, &indexed));
+        if self.scenario.server.tier.is_none() {
+            self.hold(now, no_false_present(present, |d| store.holds_digest(d)));
+            self.hold(now, no_false_ack(&seen.acked, store, &indexed));
+            if let Some(meta) = &meta {
+                let answers: Vec<_> = seen.uploaded.iter().map(|d| (d, meta.blob(d))).collect();
+                self.hold(now, nothing_half_indexed(&answers, store));
+            }
+        } else if let Some(meta) = &meta {
+            self.tier_halves(now, server, store, meta, present);
+        }
+        self.hold(now, tier::tier_seen(&seen.tier));
         if let Some(meta) = &meta {
             let answers: Vec<_> = seen.uploaded.iter().map(|d| (d, meta.blob(d))).collect();
-            self.hold(now, nothing_half_indexed(&answers, store));
+            let unreachable = |o| meta.unreachable(o).is_some();
+            let moved =
+                tier::ids_never_move(&mut self.locations, &answers, unreachable, store.rewrites());
+            self.hold(now, moved);
         }
         let kind = self.scenario.kind;
         if !kind.restarts() {
@@ -297,9 +336,66 @@ impl<'a> Checker<'a> {
         }
     }
 
+    /// Properties 5, 8 and 9 with the tier: against the store and the staged blocks
+    /// as a power cut now would leave them; acknowledgements and entries in an object
+    /// a bad sector damaged are held to the disk-loss clause instead.
+    fn tier_halves(
+        &self,
+        now: FarmTime,
+        server: &crate::Server,
+        store: &crate::ObjectStore,
+        meta: &MetaState,
+        present: &[(FarmTime, Digest)],
+    ) {
+        let seen = &server.seen;
+        let disk = server.tier_durable();
+        let homes = tier::TierHomes {
+            store,
+            disk: &disk,
+            meta,
+        };
+        let damaged = &seen.tier.damaged;
+        let held = |d: &Digest| match meta.blob(d) {
+            BlobAnswer::Present { location, .. } => {
+                damaged.contains(&location.object) || homes.holds(location.object, d)
+            }
+            BlobAnswer::Absent | BlobAnswer::Unavailable => store.holds_digest(d),
+        };
+        self.hold(now, no_false_present(present, held));
+        // An ack is held to the disk-loss clause if its object was damaged, or the
+        // object the index keeps the blob in was (it was acknowledged as a duplicate).
+        let hit_by = |d: &Digest, o: &ObjectId| {
+            damaged.contains(o)
+                || self
+                    .locations
+                    .get(d)
+                    .is_some_and(|l| damaged.contains(&l.object))
+        };
+        let (hit, whole): (Vec<_>, Vec<_>) = seen
+            .acked
+            .iter()
+            .copied()
+            .partition(|(_, d, o)| hit_by(d, o));
+        let indexed = |d: &Digest| matches!(meta.blob(d), BlobAnswer::Present { .. });
+        self.hold(now, no_false_ack(&whole, &homes, &indexed));
+        self.hold(now, tier::damaged_acks(&hit, damaged, |d| meta.blob(d)));
+        let answers: Vec<_> = seen
+            .uploaded
+            .iter()
+            .map(|d| (d, meta.blob(d)))
+            .filter(|(_, a)| {
+                !matches!(a, BlobAnswer::Present { location, .. } if damaged.contains(&location.object))
+            })
+            .collect();
+        self.hold(now, nothing_half_indexed(&answers, &homes));
+    }
+
     pub(crate) fn at_end(&self, sim: &Sim<CellNode>) {
         let now = sim.now();
         let seen = &server(sim).seen;
+        if let (Some(_), Some(meta)) = (self.scenario.server.tier, server(sim).meta()) {
+            self.hold(now, tier::drained(&meta));
+        }
         for (id, node) in sim.nodes() {
             if let Some(client) = node.client() {
                 self.hold(now, liveness(id, client.jobs(), seen.refused.first()));
@@ -311,9 +407,11 @@ impl<'a> Checker<'a> {
     }
 }
 
-/// Whether property 4 is enforced in runs of `kind`: no restart, and no daemon cut off.
+/// Whether property 4 is enforced in runs of `kind`: no restart, no daemon cut off,
+/// and no bad sector (an action-cache entry whose result blob is in the damaged block
+/// is not servable until the blob is uploaded again).
 fn one_result_holds(kind: Kind) -> bool {
-    !kind.restarts() && kind != Kind::Partition
+    !kind.restarts() && !matches!(kind, Kind::Partition | Kind::TierBadBlock)
 }
 
 /// The cell's server.
@@ -616,6 +714,10 @@ mod tests {
             Property::Liveness,
             Property::NoFalseAck,
             Property::NothingHalfIndexed,
+            Property::IdsNeverMove,
+            Property::WithinBudget,
+            Property::NoLeak,
+            Property::Drained,
         ];
         let names: Vec<String> = all.iter().map(ToString::to_string).collect();
         let want = [
@@ -628,6 +730,10 @@ mod tests {
             "7 (liveness)",
             "8 (no false ack)",
             "9 (nothing half-indexed)",
+            "10 (ids never move)",
+            "11 (within budget)",
+            "12 (no leak)",
+            "13 (drained)",
         ];
         assert_eq!(names, want);
     }

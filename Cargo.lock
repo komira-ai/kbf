@@ -1720,9 +1720,11 @@ dependencies = [
  "kbf-meta",
  "kbf-raft",
  "kbf-sched",
+ "kbf-segments",
  "kbf-server",
  "kbf-sim",
  "kbf-store",
+ "kbf-tier",
  "kbf-types",
  "tokio",
 ]
