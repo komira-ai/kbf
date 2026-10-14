@@ -2,11 +2,14 @@
 //! committed state, and the orphan sweep (design section 6.4).
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::time::Instant;
 
-use kbf_meta::{Epoch, ObjectId};
+use kbf_meta::{Epoch, MetaState, ObjectId, StagedState, TierId};
 use kbf_store::{Fs, FsFile};
 
-use crate::block::{TIER, TIER_TMP, TierId, block_name, parse_block_name};
+use crate::block::{
+    TIER, TIER_TMP, block_name, parse_block_name, parse_seg_name, parse_tier_file, tier_file_bytes,
+};
 use crate::error::TierError;
 use crate::tier::{Block, NextSeq, Phase, State, Tier, TierOptions};
 
@@ -27,6 +30,33 @@ pub struct StagedObject {
 pub trait StagedIndex {
     /// Every object staged (not yet flushed) on `tier`.
     fn staged_on(&self, tier: TierId) -> Vec<StagedObject>;
+}
+
+/// The staged table of every tier, copied out of a committed state, for an open that
+/// cannot hold the state while it runs (the state is behind the metadata log).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct StagedSnapshot(BTreeMap<TierId, Vec<StagedObject>>);
+
+impl StagedSnapshot {
+    /// The staged objects of every tier in `state`.
+    #[must_use]
+    pub fn of(state: &MetaState) -> Self {
+        let mut tiers: BTreeMap<TierId, Vec<StagedObject>> = BTreeMap::new();
+        for (object, s) in state.staged_objects() {
+            tiers.entry(s.tier()).or_default().push(StagedObject {
+                object,
+                len: s.committed_len(),
+                sealed: s.state() != StagedState::Open,
+            });
+        }
+        Self(tiers)
+    }
+}
+
+impl StagedIndex for StagedSnapshot {
+    fn staged_on(&self, tier: TierId) -> Vec<StagedObject> {
+        self.0.get(&tier).cloned().unwrap_or_default()
+    }
 }
 
 /// Who the tier is at this start.
@@ -56,6 +86,8 @@ pub struct Recovery {
     pub sealed: Vec<ObjectId>,
     /// Block files deleted as orphans: no staged object names them.
     pub removed: Vec<String>,
+    /// Flushed copies (`.seg` files) found, kept for local reads.
+    pub flushed: Vec<ObjectId>,
 }
 
 impl<F> Tier<F>
@@ -72,7 +104,10 @@ where
     /// 2. Each staged object's block is kept if it holds at least the committed length,
     ///    cut to that length and synced if it holds more; else it is reported lost.
     /// 3. Every other block file is an orphan and deleted, and the directory synced.
-    ///    `.seg` files and names the tier does not write are left alone.
+    ///    Names the tier does not write are left alone.
+    /// 4. `.seg` files are kept as flushed copies, evicted (least recently read first,
+    ///    here in name order) while they do not fit in the budget beside the staged
+    ///    blocks.
     ///
     /// `next_seq` numbers the objects of new blocks within `start.epoch`.
     ///
@@ -106,6 +141,7 @@ where
 
         let mut recovery = Recovery::default();
         let mut state = State::new(0);
+        let now = Instant::now();
         for s in staged.values() {
             let name = block_name(s.object);
             let len = if names.contains(&name) {
@@ -136,7 +172,7 @@ where
             };
             state
                 .blocks
-                .insert(s.object, Block::recovered(s.len, phase));
+                .insert(s.object, Block::recovered(s.len, phase, now));
             state.used += s.len;
         }
 
@@ -151,9 +187,44 @@ where
             fs.sync_dir()
                 .map_err(|e| TierError::io("sync_dir", ".", e))?;
         }
+        for (name, object) in names.iter().filter_map(|n| Some((n, parse_seg_name(n)?))) {
+            let len = fs
+                .file_len(name)
+                .map_err(|e| TierError::io("stat", name, e))?;
+            state.add_seg(object, len);
+            recovery.flushed.push(object);
+        }
         let tier = Self::from_parts(fs, start.options, start.epoch, state, next_seq);
+        tier.make_room_at_open();
         Ok((tier, recovery))
     }
+}
+
+/// Deletes every file the tier writes in `fs` (blocks, flushed copies, `TIER`) and
+/// syncs the directory, for a start whose metadata log begins empty
+/// (`--meta-log=memory`): nothing in the directory is indexed any more, and the new
+/// log's writer epochs start again from 1, so an old block's name could be taken for
+/// one of this start's objects. Returns the names deleted.
+///
+/// # Errors
+///
+/// [`TierError::Io`].
+pub fn clear<F: Fs>(fs: &F) -> Result<Vec<String>, TierError> {
+    let mut names = fs.list().map_err(|e| TierError::io("list", ".", e))?;
+    names.sort();
+    let ours = |n: &String| {
+        n == TIER || n == TIER_TMP || parse_block_name(n).is_some() || parse_seg_name(n).is_some()
+    };
+    names.retain(ours);
+    for name in &names {
+        fs.remove(name)
+            .map_err(|e| TierError::io("remove", name, e))?;
+    }
+    if !names.is_empty() {
+        fs.sync_dir()
+            .map_err(|e| TierError::io("sync_dir", ".", e))?;
+    }
+    Ok(names)
 }
 
 /// Step 1 of [`Tier::open`].
@@ -166,7 +237,7 @@ fn check_tier_file<F: Fs>(
 ) -> Result<(), TierError> {
     let found = if names.contains(TIER) {
         let bytes = fs.read(TIER).map_err(|e| TierError::io("read", TIER, e))?;
-        TierId::parse_file(&bytes)
+        parse_tier_file(&bytes)
     } else {
         None
     };
@@ -187,7 +258,7 @@ fn check_tier_file<F: Fs>(
         fs.remove(TIER_TMP).map_err(|e| io("remove", e))?;
     }
     let mut file = fs.create(TIER_TMP).map_err(|e| io("create", e))?;
-    file.append(&tier.file_bytes())
+    file.append(&tier_file_bytes(tier))
         .and_then(|()| file.sync())
         .map_err(|e| io("write", e))?;
     fs.rename(TIER_TMP, TIER).map_err(|e| io("rename", e))?;

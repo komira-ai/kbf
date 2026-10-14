@@ -1,6 +1,7 @@
 //! The running tier: reservations, positioned writes, syncs, answers and seals.
 
 use std::collections::BTreeMap;
+use std::io;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
@@ -8,7 +9,7 @@ use kbf_meta::{Epoch, ObjectId};
 use kbf_segments::MAX_SEGMENT_BYTES;
 use kbf_store::{Fs, FsFile};
 
-use crate::block::block_name;
+use crate::block::{block_name, seg_name};
 use crate::error::TierError;
 
 /// How a tier is sized and when it seals.
@@ -47,6 +48,25 @@ pub struct Usage {
     /// The bytes counted against it: the reserved extent of every block not yet
     /// unstaged or removed.
     pub used: u64,
+    /// The bytes of flushed copies (`.seg` files) kept for local reads. They fill
+    /// what the budget leaves over and are evicted, least recently read first, before
+    /// a reservation is refused.
+    pub flushed: u64,
+    /// Flushed copies evicted since the tier opened.
+    pub evicted: u64,
+}
+
+/// What a disk loss would take now: acknowledged bytes not yet in the object store
+/// (design section 6.3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Unflushed {
+    /// Committed bytes of every block not yet flushed.
+    pub bytes: u64,
+    /// Blocks holding committed bytes not yet flushed.
+    pub blocks: u64,
+    /// The age of the oldest such block: since it was created, or, for a block
+    /// recovered at a restart, since that restart. `None` when there is none.
+    pub oldest: Option<Duration>,
 }
 
 /// A byte range reserved in one block file. Write it ([`WriteTier::write`]), sync it
@@ -249,8 +269,34 @@ pub trait WriteTier: Send + Sync {
     /// [`TierError::NotSealable`] unless the block is sealed.
     fn unstage(&self, object: ObjectId) -> Result<(), TierError>;
 
+    /// Records that `object`'s `ObjectFlushed` committed: the block stops counting
+    /// against the budget and its file is renamed `<epoch>-<seq>.seg` (and the
+    /// directory synced), a flushed copy [`WriteTier::read`] still serves until it is
+    /// evicted. Call it only once the commit applied: eviction then never touches a
+    /// block whose only copy is local.
+    ///
+    /// # Errors
+    ///
+    /// [`TierError::NotSealable`] unless the block is sealed (or ready to be: its
+    /// `SealStaged` may have committed without the tier hearing); [`TierError::Io`]
+    /// if the rename or the directory sync failed. The block stops counting either
+    /// way: the object is in the store, and a `.blk` left behind is an orphan the
+    /// next start deletes.
+    fn flushed(&self, object: ObjectId) -> Result<(), TierError>;
+
+    /// Forgets a sealed block whose object was marked unreachable (a record failed its
+    /// digest) and deletes its file.
+    ///
+    /// # Errors
+    ///
+    /// [`TierError::NotSealable`] unless the block is sealed or ready to be.
+    fn discard(&self, object: ObjectId) -> Result<(), TierError>;
+
     /// How full the tier is.
     fn usage(&self) -> Usage;
+
+    /// The acknowledged bytes not yet flushed, and the oldest block's age at `now`.
+    fn unflushed(&self, now: Instant) -> Unflushed;
 }
 
 /// What a dropped or committed reservation tells its tier.
@@ -284,6 +330,9 @@ pub(crate) struct Block<File> {
     /// will write it again.
     file: Option<Arc<Handle<File>>>,
     opened: Option<Instant>,
+    /// When the block was created, or recovered at a restart: the start of its
+    /// exposure ([`Unflushed::oldest`]).
+    born: Instant,
     /// The bytes reserved: the end of its last range. Counted against the budget.
     pub(crate) extent: u64,
     /// The committed length: the largest end of a committed range.
@@ -295,13 +344,14 @@ pub(crate) struct Block<File> {
 }
 
 impl<File> Block<File> {
-    /// A block recovered at open: committed, never written again.
-    pub(crate) const fn recovered(len: u64, phase: Phase) -> Self {
+    /// A block recovered at open, at `now`: committed, never written again.
+    pub(crate) const fn recovered(len: u64, phase: Phase, now: Instant) -> Self {
         Self {
             kind: Kind::Grouped,
             phase,
             file: None,
             opened: None,
+            born: now,
             extent: len,
             committed: len,
             committed_any: true,
@@ -326,12 +376,26 @@ struct Handle<File> {
 /// A block's handle, and whether the block is poisoned.
 type Opened<File> = (Arc<Handle<File>>, bool);
 
+/// A flushed copy: a `.seg` file kept for local reads.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Seg {
+    pub(crate) len: u64,
+    /// The read clock at its last read (or its rename): the least is evicted first.
+    pub(crate) last_read: u64,
+}
+
 #[derive(Debug)]
 pub(crate) struct State<File> {
     pub(crate) blocks: BTreeMap<ObjectId, Block<File>>,
     /// The grouped block taking reservations.
     open: Option<ObjectId>,
     pub(crate) used: u64,
+    /// Flushed copies, and their total length.
+    pub(crate) segs: BTreeMap<ObjectId, Seg>,
+    pub(crate) seg_bytes: u64,
+    /// Counts reads of flushed copies, for least-recently-read eviction.
+    reads: u64,
+    evicted: u64,
 }
 
 impl<File> State<File> {
@@ -340,7 +404,19 @@ impl<File> State<File> {
             blocks: BTreeMap::new(),
             open: None,
             used,
+            segs: BTreeMap::new(),
+            seg_bytes: 0,
+            reads: 0,
+            evicted: 0,
         }
+    }
+
+    /// Takes a flushed copy of `len` bytes into the accounting. An object is flushed
+    /// once, and a start lists each name once, so it is never there already.
+    pub(crate) fn add_seg(&mut self, object: ObjectId, len: u64) {
+        let last_read = self.reads;
+        self.segs.insert(object, Seg { len, last_read });
+        self.seg_bytes += len;
     }
 }
 
@@ -405,6 +481,12 @@ where
         self.shared.lock()
     }
 
+    /// Evicts flushed copies found at open that do not fit beside the staged blocks.
+    pub(crate) fn make_room_at_open(&self) {
+        let mut state = self.lock();
+        self.shared.make_room(&mut state, 0);
+    }
+
     /// Creates a block of `kind` with one reservation of `len` bytes.
     fn new_block(
         &self,
@@ -430,6 +512,7 @@ where
                     sync: Mutex::new(()),
                 })),
                 opened: now,
+                born: now.unwrap_or_else(Instant::now),
                 extent: 0,
                 committed: 0,
                 committed_any: false,
@@ -487,6 +570,33 @@ where
             .expect("block of a reservation");
         block.poisoned = true;
         error
+    }
+
+    /// A flushed copy's bytes. A copy evicted since the lookup is
+    /// [`TierError::UnknownBlock`], so the reader goes to the store.
+    fn read_seg(&self, object: ObjectId, offset: u64, len: usize) -> Result<Vec<u8>, TierError> {
+        let name = seg_name(object);
+        match self.shared.fs.read_at(&name, offset, len) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                // Deleted under the tier, or evicted since the lookup (then not listed).
+                let mut state = self.lock();
+                let len = state.segs.remove(&object).map_or(0, |seg| seg.len);
+                state.seg_bytes -= len;
+                Err(TierError::UnknownBlock(object))
+            }
+            read => read.map_err(|e| TierError::io("read", &name, e)),
+        }
+    }
+
+    /// The extent of a block [`WriteTier::flushed`] or [`WriteTier::discard`] may
+    /// take: one sealed, or ready to be.
+    fn flushable(&self, state: &State<F::File>, object: ObjectId) -> Result<u64, TierError> {
+        match state.blocks.get(&object) {
+            Some(block) if matches!(block.phase, Phase::SealReady | Phase::Sealed) => {
+                Ok(block.extent)
+            }
+            _ => Err(TierError::NotSealable(object)),
+        }
     }
 
     fn sync_range(&self, r: &Reservation) -> Result<(), TierError> {
@@ -555,6 +665,32 @@ impl<F: Fs> Shared<F> {
         let _ = self.fs.remove(&block_name(object));
     }
 
+    /// Evicts flushed copies, least recently read first, until `want` more bytes fit
+    /// in the budget beside the blocks and the copies left, or no copy is left. A
+    /// removal that fails leaves a file the next start lists again.
+    pub(crate) fn make_room(&self, state: &mut State<F::File>, want: u64) {
+        let budget = self.options.budget;
+        while state
+            .used
+            .saturating_add(state.seg_bytes)
+            .saturating_add(want)
+            > budget
+        {
+            let Some(object) = state
+                .segs
+                .iter()
+                .min_by_key(|(object, seg)| (seg.last_read, **object))
+                .map(|(object, _)| *object)
+            else {
+                return;
+            };
+            let seg = state.segs.remove(&object).expect("copy just found");
+            state.seg_bytes -= seg.len;
+            state.evicted += 1;
+            let _ = self.fs.remove(&seg_name(object));
+        }
+    }
+
     /// Whether `block`'s seal delay has passed at `now`.
     fn aged(&self, block: &Block<F::File>, now: Instant) -> bool {
         block
@@ -616,6 +752,7 @@ where
         if let Some(object) = state.open.filter(|o| done(&state.blocks[o])) {
             self.shared.begin_seal(&mut state, object);
         }
+        self.shared.make_room(&mut state, len);
         self.check_budget(&state, len)?;
         let r = match state.open {
             Some(object) => self.take_range(&mut state, object, len),
@@ -633,6 +770,7 @@ where
 
     fn reserve_upload(&self, len: u64) -> Result<Reservation, TierError> {
         let mut state = self.lock();
+        self.shared.make_room(&mut state, len);
         self.check_budget(&state, len)?;
         self.new_block(&mut state, Kind::Upload, len, None)
     }
@@ -695,12 +833,22 @@ where
     }
 
     fn read(&self, object: ObjectId, offset: u64, len: usize) -> Result<Vec<u8>, TierError> {
-        let committed = self
-            .lock()
-            .blocks
-            .get(&object)
-            .map(|b| b.committed)
-            .ok_or(TierError::UnknownBlock(object))?;
+        let committed = {
+            let mut state = self.lock();
+            match state.blocks.get(&object) {
+                Some(block) => Some(block.committed),
+                None => {
+                    state.reads += 1;
+                    let now = state.reads;
+                    let seg = state.segs.get_mut(&object);
+                    seg.ok_or(TierError::UnknownBlock(object))?.last_read = now;
+                    None
+                }
+            }
+        };
+        let Some(committed) = committed else {
+            return self.read_seg(object, offset, len);
+        };
         let end = offset.saturating_add(len as u64);
         if end > committed {
             return Err(TierError::NotCommitted {
@@ -710,10 +858,11 @@ where
             });
         }
         let name = block_name(object);
-        self.shared
-            .fs
-            .read_at(&name, offset, len)
-            .map_err(|e| TierError::io("read", &name, e))
+        match self.shared.fs.read_at(&name, offset, len) {
+            // Flushed and renamed since the lookup: the copy has the same bytes.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => self.read_seg(object, offset, len),
+            read => read.map_err(|e| TierError::io("read", &name, e)),
+        }
     }
 
     fn unstage(&self, object: ObjectId) -> Result<(), TierError> {
@@ -727,10 +876,59 @@ where
         Ok(())
     }
 
+    fn flushed(&self, object: ObjectId) -> Result<(), TierError> {
+        let mut state = self.lock();
+        let extent = self.flushable(&state, object)?;
+        state.blocks.remove(&object);
+        state.used -= extent;
+        let (from, to) = (block_name(object), seg_name(object));
+        self.shared
+            .fs
+            .rename(&from, &to)
+            .map_err(|e| TierError::io("rename", &from, e))?;
+        // Moving the extent from the blocks to the copies keeps their sum, which every
+        // reservation kept within the budget: nothing to evict here.
+        state.add_seg(object, extent);
+        self.shared
+            .fs
+            .sync_dir()
+            .map_err(|e| TierError::io("sync_dir", &to, e))
+    }
+
+    fn discard(&self, object: ObjectId) -> Result<(), TierError> {
+        let mut state = self.lock();
+        let extent = self.flushable(&state, object)?;
+        state.blocks.remove(&object);
+        state.used -= extent;
+        let name = block_name(object);
+        // A removal that fails leaves an orphan the next start deletes.
+        let _ = self.shared.fs.remove(&name);
+        Ok(())
+    }
+
     fn usage(&self) -> Usage {
+        let state = self.lock();
         Usage {
             budget: self.shared.options.budget,
-            used: self.lock().used,
+            used: state.used,
+            flushed: state.seg_bytes,
+            evicted: state.evicted,
+        }
+    }
+
+    fn unflushed(&self, now: Instant) -> Unflushed {
+        let state = self.lock();
+        let held = state.blocks.values().filter(|b| b.committed > 0);
+        let (mut bytes, mut blocks, mut oldest) = (0, 0, None::<Instant>);
+        for block in held {
+            bytes += block.committed;
+            blocks += 1;
+            oldest = Some(oldest.map_or(block.born, |o| o.min(block.born)));
+        }
+        Unflushed {
+            bytes,
+            blocks,
+            oldest: oldest.map(|born| now.saturating_duration_since(born)),
         }
     }
 }

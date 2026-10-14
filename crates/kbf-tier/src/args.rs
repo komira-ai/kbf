@@ -3,6 +3,8 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use kbf_meta::TierId;
+
 use crate::tier::TierOptions;
 
 /// The write tier's flags, for a server's command line (`#[command(flatten)]`). The
@@ -27,6 +29,15 @@ pub struct TierArgs {
         value_parser = clap::value_parser!(u64).range(1..)
     )]
     pub write_tier_seal_after: u64,
+
+    /// Abandons this server's tier `<id>` at start: every object staged on it is
+    /// marked unreachable as missing (its blobs answer `Unavailable` until uploaded
+    /// again; nothing is answered `NOT_FOUND`), and the directory becomes a new tier.
+    /// For a lost or replaced disk, after a start was refused because the directory's
+    /// `TIER` file is missing or names another tier. The id is the one the refusal
+    /// names.
+    #[arg(long, requires = "write_tier_dir", value_parser = clap::value_parser!(u64).range(1..))]
+    pub write_tier_abandon: Option<u64>,
 }
 
 impl TierArgs {
@@ -39,5 +50,11 @@ impl TierArgs {
             ..TierOptions::new(budget)
         };
         Some((dir, options))
+    }
+
+    /// The tier `--write-tier-abandon` names, if given.
+    #[must_use]
+    pub fn abandon(&self) -> Option<TierId> {
+        self.write_tier_abandon.map(TierId::new)
     }
 }

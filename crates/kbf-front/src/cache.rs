@@ -59,6 +59,9 @@ pub enum CacheError {
     /// A segment read back from the store did not parse.
     #[error("segment: {0}")]
     Segment(#[from] SegmentError),
+    /// The local write tier failed.
+    #[error("write tier: {0}")]
+    Tier(Arc<kbf_tier::TierError>),
     /// A blob could not be packed.
     #[error("segment: {0}")]
     Pack(#[from] WriteError),
@@ -70,6 +73,12 @@ pub enum CacheError {
     /// the wrong outcome). A bug or a broken backend, never the client's fault.
     #[error("internal: {0}")]
     Internal(String),
+}
+
+impl From<kbf_tier::TierError> for CacheError {
+    fn from(e: kbf_tier::TierError) -> Self {
+        Self::Tier(Arc::new(e))
+    }
 }
 
 impl From<CacheError> for Status {
@@ -91,6 +100,7 @@ impl From<CacheError> for Status {
             | CacheError::Meta(_)
             | CacheError::Store(_)
             | CacheError::Segment(_)
+            | CacheError::Tier(_)
             | CacheError::Pack(_)
             | CacheError::Key(_) => Status::unavailable(message),
             CacheError::Internal(_) => Status::internal(message),
@@ -414,7 +424,10 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         match answer {
             BlobAnswer::Absent => Err(CacheError::NotFound(*digest)),
             BlobAnswer::Unavailable => Err(CacheError::Unreachable(*digest)),
-            BlobAnswer::Present { location, .. } => self.fetch(digest, location).await,
+            BlobAnswer::Present {
+                location,
+                staged_on,
+            } => self.fetch_answer(digest, location, staged_on).await,
         }
     }
 
@@ -595,10 +608,22 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         Ok(answer)
     }
 
-    /// Reads `digest`'s bytes at `location` and checks them. An object the store does
-    /// not have is marked unreachable as [`UnreachableReason::Missing`], one whose bytes
-    /// are wrong as [`UnreachableReason::Corrupt`].
+    /// Reads `digest`'s bytes at `location` from the store and checks them. An object
+    /// the store does not have is marked unreachable as [`UnreachableReason::Missing`],
+    /// one whose bytes are wrong as [`UnreachableReason::Corrupt`].
     async fn fetch(&self, digest: &Digest, location: Location) -> Result<Bytes, CacheError> {
+        self.fetch_from_store(digest, location, true).await
+    }
+
+    /// [`Cache::fetch`], marking the object only if `mark`: a reader never marks an
+    /// object that was staged when its query ran, because the store does not hold it
+    /// yet (design section 6.1.5).
+    async fn fetch_from_store(
+        &self,
+        digest: &Digest,
+        location: Location,
+        mark: bool,
+    ) -> Result<Bytes, CacheError> {
         let Location {
             store,
             object,
@@ -618,18 +643,22 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         let bytes = match self.writer.get_range(&key, range).await {
             Ok(bytes) => bytes,
             Err(e @ (ObjectStoreError::NotFound(_) | ObjectStoreError::InvalidRange { .. })) => {
-                tracing::error!(%digest, %key, error = %e, "held blob missing from the store");
-                self.mark_unreachable(object, UnreachableReason::Missing)
-                    .await?;
+                tracing::error!(%digest, %key, error = %e, mark, "held blob missing from the store");
+                if mark {
+                    self.mark_unreachable(object, UnreachableReason::Missing)
+                        .await?;
+                }
                 return Err(CacheError::Unreachable(*digest));
             }
             Err(e) => return Err(e.into()),
         };
         // Digest equality includes the length, so a short read fails here too.
         if kbf_segments::sha256(&bytes) != *digest {
-            tracing::error!(%digest, %key, "stored bytes fail their digest");
-            self.mark_unreachable(object, UnreachableReason::Corrupt)
-                .await?;
+            tracing::error!(%digest, %key, mark, "stored bytes fail their digest");
+            if mark {
+                self.mark_unreachable(object, UnreachableReason::Corrupt)
+                    .await?;
+            }
             return Err(CacheError::Unreachable(*digest));
         }
         Ok(bytes)
@@ -681,11 +710,15 @@ fn unexpected(applied: &Applied) -> CacheError {
 }
 
 mod batch;
+mod flush;
+mod tier;
 mod touches;
 mod upload;
 mod write_group;
 
 pub use batch::BATCH_READS_IN_FLIGHT;
+pub use flush::{FLUSH_BACKOFF_FIRST, FLUSH_BACKOFF_MAX, FLUSHES_PER_ROUND, FlushRound};
+pub use tier::{TierStartError, TierStartup};
 pub use touches::TouchConfig;
 use touches::Touches;
 pub(crate) use upload::BuiltSegment;

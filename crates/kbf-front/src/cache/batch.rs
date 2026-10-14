@@ -56,6 +56,7 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
             .await?;
         let mut out = BTreeMap::new();
         let mut held: BTreeMap<(StoreId, ObjectId), BTreeMap<u64, Digest>> = BTreeMap::new();
+        let mut staged = Vec::new();
         for (digest, answer) in answers {
             match answer {
                 _ if is_empty_blob(&digest) => {
@@ -67,11 +68,24 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
                 BlobAnswer::Unavailable => {
                     out.insert(digest, Err(CacheError::Unreachable(digest)));
                 }
-                BlobAnswer::Present { location: at, .. } => {
+                BlobAnswer::Present {
+                    location,
+                    staged_on: Some(tier),
+                } => staged.push((digest, location, tier)),
+                BlobAnswer::Present {
+                    location: at,
+                    staged_on: None,
+                } => {
                     let records = held.entry((at.store, at.object)).or_default();
                     records.insert(at.offset, digest);
                 }
             }
+        }
+        // A staged blob is not in the store: each is read as `read_blob` reads it, from
+        // the tier holding it, and never marks its object.
+        for (digest, location, tier) in staged {
+            let read = self.fetch_answer(&digest, location, Some(tier)).await;
+            out.insert(digest, read);
         }
         let read: Vec<Vec<(Digest, Result<Bytes, CacheError>)>> = stream::iter(runs(held))
             .map(|run| self.read_run(run))

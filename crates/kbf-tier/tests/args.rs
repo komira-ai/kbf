@@ -56,3 +56,34 @@ fn the_tier_is_off_unless_a_directory_is_given() {
         assert!(parse(bad).is_err(), "{bad:?}");
     }
 }
+
+/// Catches: an abandon flag accepted without a tier directory (it would mark objects
+/// missing on a start that has no tier to replace them), a zero id accepted, and the
+/// flag's id not reaching [`TierArgs::abandon`].
+#[test]
+fn abandon_names_a_tier_and_needs_a_directory() {
+    assert_eq!(parse(&[]).unwrap().abandon(), None);
+    let on = parse(&[
+        "--write-tier-dir",
+        "/t",
+        "--write-tier-bytes",
+        "7",
+        "--write-tier-abandon",
+        "9",
+    ])
+    .unwrap();
+    assert_eq!(on.abandon(), Some(kbf_tier::TierId::new(9)));
+    for bad in [
+        &["--write-tier-abandon", "9"][..],
+        &[
+            "--write-tier-dir",
+            "/t",
+            "--write-tier-bytes",
+            "7",
+            "--write-tier-abandon",
+            "0",
+        ],
+    ] {
+        assert!(parse(bad).is_err(), "{bad:?}");
+    }
+}

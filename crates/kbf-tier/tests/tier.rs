@@ -401,7 +401,7 @@ fn errors_and_debug_say_what_happened() {
                 expected: t,
                 found: None,
             },
-            "write tier directory names tier None, expected 5, and objects are staged on 5",
+            "write tier directory names no tier, expected tier 5, and objects are staged on tier 5",
         ),
         (
             TierError::OtherTier { found: t },

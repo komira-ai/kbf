@@ -1,7 +1,7 @@
 # The M1 sample's chain, without a shell (the image has none): `words` sorts a source
 # file, `shout` upper-cases it, `joined` reads two outputs of earlier actions. `pause`
 # sleeps, so a test can hold a lease in flight; `hog` passes its first memory cap, so
-# the farm must double its booking (run.sh says what is checked).
+# the farm must double its booking (crates/kbf-it/src/m2.rs says what is checked).
 load(":defs.bzl", "act")
 
 act(
