@@ -46,7 +46,7 @@ The fault-injection points below exist in `kbf-sim-cell` today unless marked oth
 | 11 | The flush succeeds but the `ObjectFlushed` commit is lost | the commit fails, or a crash between the PUT and the commit | B, C, E | the block stays staged; it is flushed again under the same key; footers equal, no `FlushConflict`; `.blk` is renamed `.seg` only after `ObjectFlushed` applies; a refused commit never lets eviction touch the block | stage 3 (commands) + stage 4; **stage 5: `every_tier_crash_point_keeps_every_property` (`tier-after-flush-put`, `tier-in-flush-commit-0`, `-1`)** |
 | 12 | Server restart mid-flush | kill or power cut during the flush PUT or the footer read-back | A, B, C, F | at start the sealed staged object is queued again; the reflush writes byte-identical content under the same key; no id changes; no double flush that differs | stage 4; today's analog: a restart never reuses object ids (mutant M9 below); **stage 5: `every_tier_crash_point_keeps_every_property` (`tier-after-flush-put`: the reflush writes the same bytes, property 10)** |
 | 13 | Local disk full | `ENOSPC` on create, append or sync below the budget (other tenants filled the disk) | A, D, E | the group or upload being written fails and is not acknowledged; its reservation is released and its file deleted; it falls back direct; staged blocks keep serving reads and flushing; a metric says so | stage 4; needs a `FaultFs` fault that returns `ENOSPC` (today `Fault::Error` is a generic error); **stage 5: `a_full_disk_sends_writes_direct_and_loses_nothing` (`FaultFs`'s `Fault::NoSpace`)** |
-| 14 | Local I/O error or a bad sector on a sealed block before its flush | a read error, or flipped bytes (`FaultFs::flip`) in a record | A, B | a record whose SHA-256 fails in the flusher's re-read is not uploaded; the object is marked `ObjectUnreachable { Corrupt }`; its blobs answer `Unavailable` and heal by re-upload; nothing serves the damaged bytes | stage 4; **stage 5: `a_bad_block_is_marked_corrupt_and_never_flushed` (a flipped byte; read errors are not injected)** |
+| 14 | Local I/O error or a bad sector on a sealed block before its flush | a read error, or flipped bytes (`FaultFs::flip`) in a record | A, B | a record whose SHA-256 fails in the flusher's re-read is not uploaded; the object is marked `ObjectUnreachable { Corrupt }`; its blobs answer `Unavailable` and heal by re-upload; nothing serves the damaged bytes | stage 4; **stage 5: `a_bad_block_is_marked_corrupt_and_never_flushed` (a flipped byte); a read error in the flusher's re-read: `a_full_disk_sends_writes_direct_and_loses_nothing` (retried with backoff, never marked)** |
 | 15 | Torn tail | power cut keeping part of an unsynced append (`FaultFs::crash(keep)`) | A, B | bytes past the committed length are truncated at start; every acknowledged range reads back intact | stage 4; today's analog: a power cut keeping 1 byte of the `PutBlob` record's unsynced bytes: the log's torn tail is truncated, the blob is not indexed, property 1 holds |
 | 16 | Eviction racing a read | a reader holds a location while eviction deletes the `.seg` | A | eviction deletes only `.seg` files of objects whose `ObjectFlushed` is applied; the reader's open fails `ENOENT` and falls back to the store, which holds the object; nothing is marked `Missing` | stage 4; **stage 5: `eviction_racing_a_read_falls_back_to_the_store`** |
 | 17 | A read of a staged blob while its flush is in progress | read during the PUT, the commit and the rename | A, B | served from the block; a reader that finds neither `.blk` nor `.seg` after `ObjectFlushed` reads the store; a staged object is never committed `ObjectUnreachable { Missing }` by a reader | stage 4 + stage 5; **stage 5: every tier run: each blob answered present is read 2 s later, also while its flush is in progress** |
@@ -140,7 +140,8 @@ as its bytes and blob list, and records a PUT that replaces an object with other
 clients upload 1 to 30 byte blobs). `TierCrash`: one crash at a `TierPoint`, killed or
 cut off, while the store is slow. `TierStoreOutage` and `TierStoreOutageHours` (budget
 96): as the store outages, with the tier. `TierDiskFull`: one to three `ENOSPC`s
-(`Fault::NoSpace`, which fails only operations that take space). `TierBadBlock` (seal
+(`Fault::NoSpace`, which fails only operations that take space) on even seeds, I/O
+errors on any operation of the tier's disk on odd ones. `TierBadBlock` (seal
 after 20 s): one byte of the oldest staged record flipped. `TierEviction` (budget 64):
 flushed copies evicted while reads are in flight. **Tier points** (`TierPoint`):
 `tier-after-append`, `tier-after-sync`, `tier-in-put-staged-<op>`, `tier-before-reply`,
@@ -150,7 +151,8 @@ a pinned one replays with `KBF_SIM_CRASH=<point>/<down>` and `KBF_SIM_KIND=TierC
 **Properties.** In tier runs 5, 8 and 9 count a staged object's block (as a power cut
 now would leave it, at the committed offset, with the blob's bytes) as a home beside the
 store; a block a start finds lost, or a present blob a read finds nowhere or with other
-bytes, breaks 8. Acknowledgements and entries in an object a bad sector damaged are held
+bytes, breaks 8 (a local read that failed with an injected I/O error, of a blob the
+store does not hold yet, is unavailable, not lost). Acknowledgements and entries in an object a bad sector damaged are held
 to A's disk-loss clause: never `Absent`. Four more: **10, ids never move** (C; a blob's
 location changes only after its object is marked unreachable, and no store object is
 replaced by other bytes; checked in every run), **11, within budget** (D), **12, no leak**
@@ -164,7 +166,7 @@ Each has a unit test fed a violation (`src/check/tier.rs`).
 | `every_tier_crash_point_keeps_every_property` (each of the 10 points, under a kill and power cuts keeping none and all; 4 seeds each): most runs crash, and each next start did what the point implies: after the sync the block is swept or cut back, before the rename it is swept, before the reply and after the ack it is kept whole, after the flush PUT the object is PUT again under its id and flushed | 1 to 5, 11, 12, 21 | T3, T4; T5 the orphan sweep skipped (12); T6 the rename to a flushed copy before `ObjectFlushed` commits (8) |
 | `tier_crash_seeds_keep_every_property` (32 `TierCrash` seeds) | 1 to 5, 11, 12, 21 | T5; T6; T7 bytes past the committed length kept at a start (12); T8 recovered unsealed blocks never named for their seal (13) |
 | `a_store_outage_fills_the_tier_then_pushes_back` (16 + 2 seeds): every ack inside the outage is a staged one, the budget pushed back in every seed, and acks resume after | 6, 7 | T9 the budget not enforced (11); T10 eviction that deletes a staged block (8, 13) |
-| `a_full_disk_sends_writes_direct_and_loses_nothing` (32 seeds): most seeds met `ENOSPC` on a write | 13 | T11 a write error answered `Ok` (8: synced and acknowledged without its bytes) |
+| `a_full_disk_sends_writes_direct_and_loses_nothing` (32 seeds): most seeds met a failed write, and some flush met a failed re-read and was retried | 13, 14 (read error) | T11 a write error answered `Ok` (8: synced and acknowledged without its bytes) |
 | `a_bad_block_is_marked_corrupt_and_never_flushed` (32 seeds): each damaged object is marked corrupt and never flushed | 14 | T12 the flusher's check passes every record (the damaged object is PUT; 10) |
 | `eviction_racing_a_read_falls_back_to_the_store` (32 seeds): copies evicted in most seeds, and reads that lost their local copy served by the store | 16 | T10 |
 
@@ -174,8 +176,7 @@ pins the raise itself (T1, T2, a raise committed on every call).
 
 Not covered yet: the unflushed-age metric and alert (G), a disk loss and
 `--write-tier-abandon` (18, 22, 29), `FlushConflict` (28; the cell's store has no
-`conditional_put`), segment uploads and streamed own blocks (27), a read error in the
-flusher's re-read (14's other half), snapshots (31), a daemon input cache (32, 33), two
+`conditional_put`), segment uploads and streamed own blocks (27), snapshots (31), a daemon input cache (32, 33), two
 servers (19) and clock jumps (20).
 
 ## 5. The seams stages 3 to 5 plug into
@@ -206,8 +207,9 @@ servers (19) and clock jumps (20).
 
 - **`ENOSPC` below the budget** (scenario 13): answered by write-path.md section 6.7
   (any tier error before the commit goes direct); stage 5 tests it.
-- **A read error (not a hash mismatch) in the flusher's re-read** (scenario 14): retry,
-  or mark `Corrupt` after some attempts? Section 6.4 covers only the hash mismatch.
+- **A read error (not a hash mismatch) in the flusher's re-read** (scenario 14):
+  answered by write-path.md section 6.7 (retried with the flush backoff); stage 5 tests
+  it.
 - **Who flushes after a leader change** (scenario 19): section 6 assumes one server.
 - **`TIER` before `AddTier`** (scenario 24): section 6.1 says `TIER` is written and the
   directory synced before any record is acknowledged, not that this happens before

@@ -173,18 +173,21 @@ fn nothing_half_indexed(
     hold_if(detail, Property::NothingHalfIndexed)
 }
 
+/// Where `answer` says the blob is, if it says present.
+fn located(answer: BlobAnswer) -> Option<kbf_meta::Location> {
+    match answer {
+        BlobAnswer::Present { location, .. } => Some(location),
+        BlobAnswer::Unavailable | BlobAnswer::Absent => None,
+    }
+}
+
 /// How many of the store's `objects` no index answer names: objects a PUT left that
 /// nothing points at, for the planned orphan sweep.
 pub(crate) fn orphans(
     objects: impl Iterator<Item = ObjectId>,
     answers: impl Iterator<Item = BlobAnswer>,
 ) -> BTreeSet<ObjectId> {
-    let named: BTreeSet<ObjectId> = answers
-        .filter_map(|a| match a {
-            BlobAnswer::Present { location: at, .. } => Some(at.object),
-            BlobAnswer::Unavailable | BlobAnswer::Absent => None,
-        })
-        .collect();
+    let named: BTreeSet<ObjectId> = answers.filter_map(located).map(|at| at.object).collect();
     objects.filter(|o| !named.contains(o)).collect()
 }
 
@@ -320,11 +323,18 @@ impl<'a> Checker<'a> {
             self.tier_halves(now, server, store, meta, present);
         }
         self.hold(now, tier::tier_seen(&seen.tier));
+        if let Some(usage) = server.tier_usage() {
+            self.hold(now, tier::within_budget(usage));
+        }
         if let Some(meta) = &meta {
             let answers: Vec<_> = seen.uploaded.iter().map(|d| (d, meta.blob(d))).collect();
             let unreachable = |o| meta.unreachable(o).is_some();
-            let moved =
-                tier::ids_never_move(&mut self.locations, &answers, unreachable, store.rewrites());
+            let moved = tier::ids_never_move(
+                &mut self.locations,
+                &answers,
+                &unreachable,
+                store.rewrites(),
+            );
             self.hold(now, moved);
         }
         let kind = self.scenario.kind;
@@ -355,11 +365,10 @@ impl<'a> Checker<'a> {
             meta,
         };
         let damaged = &seen.tier.damaged;
-        let held = |d: &Digest| match meta.blob(d) {
-            BlobAnswer::Present { location, .. } => {
-                damaged.contains(&location.object) || homes.holds(location.object, d)
-            }
-            BlobAnswer::Absent | BlobAnswer::Unavailable => store.holds_digest(d),
+        // Answered present in this step, so present in the index now.
+        let held = |d: &Digest| {
+            located(meta.blob(d))
+                .is_some_and(|at| damaged.contains(&at.object) | homes.holds(at.object, d))
         };
         self.hold(now, no_false_present(present, held));
         // An ack is held to the disk-loss clause if its object was damaged, or the
@@ -378,7 +387,7 @@ impl<'a> Checker<'a> {
             .partition(|(_, d, o)| hit_by(d, o));
         let indexed = |d: &Digest| matches!(meta.blob(d), BlobAnswer::Present { .. });
         self.hold(now, no_false_ack(&whole, &homes, &indexed));
-        self.hold(now, tier::damaged_acks(&hit, damaged, |d| meta.blob(d)));
+        self.hold(now, tier::damaged_acks(&hit, damaged, &|d| meta.blob(d)));
         let answers: Vec<_> = seen
             .uploaded
             .iter()
@@ -680,7 +689,8 @@ mod tests {
         };
         let cut = Down::PowerCut { keep: 9, names: 5 };
         let pinned = Scenario::crash_at(11, StorePoint::BeforeReply, cut);
-        for s in [pinned, Scenario::new(Kind::StoreSlow, 4)] {
+        let tier = Scenario::tier_crash_at(3, crate::TierPoint::InFlushCommit { after: 1 }, cut);
+        for s in [pinned, tier, Scenario::new(Kind::StoreSlow, 4)] {
             let line = s.replay_line();
             let kind = var(&line, "KBF_SIM_KIND").expect("a kind");
             let seed = var(&line, "KBF_SIM_SEED").expect("a seed");
@@ -695,6 +705,8 @@ mod tests {
             ("StoreCrash", "1", Some("put-sent")),
             ("StoreCrash", "1", Some("nowhere/kill")),
             ("StoreCrash", "1", Some("put-sent/off")),
+            ("TierCrash", "1", Some("put-sent/kill")),
+            ("StoreCrash", "1", Some("tier-acked/kill")),
         ] {
             let read = Scenario::from_replay(kind, seed, crash);
             assert!(read.is_none(), "{kind} {seed} {crash:?}");

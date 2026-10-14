@@ -6,6 +6,7 @@ use std::time::Duration;
 use kbf_meta::ObjectId;
 
 use kbf_sim::{Chance, Faults, Node, NodeId, NodeInput, Output, Partition, Sim, SimRng, TraceHash};
+use kbf_store::Fault;
 use kbf_types::{Digest, Effect, FarmTime, Resources, StateMachine};
 
 use crate::check::Checker;
@@ -53,7 +54,8 @@ pub enum Kind {
     TierStoreOutage,
     /// As [`Kind::StoreOutageHours`], with the tier.
     TierStoreOutageHours,
-    /// The tier's disk full (`ENOSPC`) at one to three operations.
+    /// The tier's disk full (`ENOSPC`, even seeds) or failing (an I/O error, odd seeds)
+    /// at one to three operations.
     TierDiskFull,
     /// A bad sector in a staged block before its flush.
     TierBadBlock,
@@ -282,9 +284,14 @@ impl Scenario {
                 store.push((FarmTime::default(), StoreFault::Slow { until, by }));
             }
             Kind::TierDiskFull => {
+                let fault = if seed.is_multiple_of(2) {
+                    Fault::NoSpace
+                } else {
+                    Fault::Error
+                };
                 for _ in 0..rng.between(1, 3) {
                     let after = rng.between(0, 20);
-                    faults.push((at(&mut rng), ServerFault::TierFullAt { after }));
+                    faults.push((at(&mut rng), ServerFault::TierDiskAt { after, fault }));
                 }
             }
             Kind::TierBadBlock => {

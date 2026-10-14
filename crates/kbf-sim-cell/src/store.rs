@@ -402,6 +402,7 @@ mod tests {
     use kbf_types::DigestFunction;
 
     use super::*;
+    use crate::content;
 
     fn digest(n: u8) -> Digest {
         Digest::new(DigestFunction::Sha256, [n; 32], u64::from(n))
@@ -565,5 +566,67 @@ mod tests {
             (lose.until(), lose.delay(), lose.count()),
             (None, Duration::ZERO, 2)
         );
+    }
+
+    /// Catches a flushed segment taken as holding a blob it does not list or whose
+    /// bytes differ, a rewrite with other bytes not recorded (or one with the same
+    /// bytes recorded), a segment PUT answered as a blob's, and a read answered from
+    /// another object.
+    #[test]
+    fn a_segment_is_held_by_its_bytes_and_a_rewrite_is_recorded() {
+        let (a, b) = (digest(1), digest(2));
+        let mut bytes = content(&a);
+        bytes.extend(content(&b));
+        let body = Body {
+            blobs: vec![(a, 0), (b, 1)],
+            bytes,
+        };
+        let mut s = started(vec![(FarmTime::default(), StoreFault::FailNext { n: 1 })]);
+        let from = NodeId::from("server");
+        let flush = |s: &mut ObjectStore, ms, body: &Body| {
+            let msg = Msg::Flush {
+                object: object(7),
+                body: body.clone(),
+            };
+            s.apply(at(
+                ms,
+                Event::Message {
+                    from: from.clone(),
+                    msg,
+                },
+            ));
+            format!("{:?}", s.take_outputs())
+        };
+        assert!(flush(&mut s, 1, &body).contains("FlushFailed"));
+        assert_eq!(s.flush_met(), [(object(7), Met::Failed)]);
+        assert!(flush(&mut s, 2, &body).contains("FlushDone"));
+        assert!(s.holds(object(7), &a));
+        assert!(s.holds(object(7), &b));
+        assert!(!s.holds(object(7), &digest(3)));
+        assert!(s.holds_digest(&b));
+        flush(&mut s, 3, &body);
+        assert!(s.rewrites().is_empty(), "the same bytes again");
+        let mut other = body.clone();
+        other.bytes[1] ^= 0xFF;
+        flush(&mut s, 4, &other);
+        assert!(!s.holds(object(7), &b), "other bytes");
+        assert_eq!(s.rewrites(), &BTreeSet::from([object(7)]));
+        let get = |s: &mut ObjectStore, o| {
+            let msg = Msg::Get {
+                object: object(o),
+                digest: a,
+                tag: 5,
+            };
+            s.apply(at(
+                5,
+                Event::Message {
+                    from: from.clone(),
+                    msg,
+                },
+            ));
+            format!("{:?}", s.take_outputs())
+        };
+        assert!(get(&mut s, 7).contains("held: true"));
+        assert!(get(&mut s, 8).contains("held: false"));
     }
 }

@@ -9,7 +9,8 @@
 //! - **C**, property 10 ([`ids_never_move`]): a blob's location never changes unless
 //!   its object was marked unreachable, and no store object is replaced by other
 //!   bytes.
-//! - **D**, property 11: the tier's counted and flushed bytes stay within its budget.
+//! - **D**, property 11 ([`within_budget`]): the tier's counted and flushed bytes stay
+//!   within its budget.
 //! - **E**, property 12 ([`directory_leaks`], run at each start): every file in the
 //!   tier directory is `TIER`, a staged object's block at its committed length, or a
 //!   flushed copy of an object no longer staged; the budget counts the staged bytes.
@@ -56,8 +57,8 @@ impl BlobHomes for TierHomes<'_> {
 }
 
 /// What the tier recorded that breaks an invariant on its own: a lost block or an
-/// unreadable present blob (A), a budget overrun (D), a directory that disagrees
-/// with the committed state at a start (E), a `PutStaged` the state machine refused.
+/// unreadable present blob (A), a directory that disagrees with the committed state at
+/// a start (E), a `PutStaged` the state machine refused.
 pub(crate) fn tier_seen(seen: &TierSeen) -> Result<(), Broken> {
     let lost = seen
         .lost
@@ -70,19 +71,20 @@ pub(crate) fn tier_seen(seen: &TierSeen) -> Result<(), Broken> {
         .first()
         .map(|r| format!("PutStaged refused: {r}"));
     hold_if(refused, Property::NothingHalfIndexed)?;
-    hold_if(seen.over_budget.first().cloned(), Property::WithinBudget)?;
     hold_if(seen.leaks.first().cloned(), Property::NoLeak)
 }
 
-/// The tier's counted and flushed bytes, if they pass its budget.
-pub(crate) fn over_budget(usage: Usage) -> Option<String> {
+/// Property 11: the tier's counted and flushed bytes within its budget.
+pub(crate) fn within_budget(usage: Usage) -> Result<(), Broken> {
     let held = usage.used.saturating_add(usage.flushed);
-    (held > usage.budget).then(|| {
-        format!(
-            "{} counted and {} flushed bytes pass a budget of {}",
-            usage.used, usage.flushed, usage.budget
-        )
-    })
+    let detail = format!(
+        "{} counted and {} flushed bytes pass a budget of {}",
+        usage.used, usage.flushed, usage.budget
+    );
+    hold_if(
+        (held > usage.budget).then_some(detail),
+        Property::WithinBudget,
+    )
 }
 
 /// Invariant E at a start: each of `names` (with its length) against the committed
@@ -129,7 +131,7 @@ pub(crate) fn directory_leaks(
 pub(crate) fn ids_never_move(
     first: &mut BTreeMap<Digest, Location>,
     answers: &[(&Digest, BlobAnswer)],
-    unreachable: impl Fn(ObjectId) -> bool,
+    unreachable: &dyn Fn(ObjectId) -> bool,
     rewritten: &BTreeSet<ObjectId>,
 ) -> Result<(), Broken> {
     let replaced = rewritten
@@ -158,7 +160,7 @@ pub(crate) fn ids_never_move(
 pub(crate) fn damaged_acks(
     acked: &[(FarmTime, Digest, ObjectId)],
     damaged: &BTreeSet<ObjectId>,
-    answer: impl Fn(&Digest) -> BlobAnswer,
+    answer: &dyn Fn(&Digest) -> BlobAnswer,
 ) -> Result<(), Broken> {
     let absent = acked
         .iter()
@@ -183,6 +185,7 @@ mod tests {
     use kbf_types::DigestFunction;
 
     use super::*;
+    use crate::Msg;
 
     fn object(seq: u64) -> ObjectId {
         ObjectId::new(Epoch::new(1), seq)
@@ -252,6 +255,26 @@ mod tests {
         assert!(!homes.holds(object(1), &digest(2)), "another blob");
         disk.flip(&block_name(object(1)), 2);
         assert!(!homes.holds(object(1), &digest(1)), "other bytes");
+        // Once flushed, the store holds it: object 3 PUT with digest 2.
+        let mut store = ObjectStore::default();
+        let put = Msg::Put {
+            object: object(3),
+            digest: digest(2),
+        };
+        let from = kbf_sim::NodeId::from("server");
+        let event = kbf_sim::Event::Message { from, msg: put };
+        let input = kbf_sim::NodeInput {
+            now: FarmTime::default(),
+            entropy: 0,
+            event,
+        };
+        kbf_types::StateMachine::apply(&mut store, input);
+        let homes = TierHomes {
+            store: &store,
+            disk: &disk,
+            meta: &meta,
+        };
+        assert!(homes.holds(object(3), &digest(2)));
     }
 
     /// Catches a budget check that ignores flushed copies, or fails at the budget
@@ -264,9 +287,10 @@ mod tests {
             flushed,
             evicted: 0,
         };
-        assert_eq!(over_budget(usage(6, 4)), None);
-        assert!(over_budget(usage(6, 5)).is_some());
-        assert!(over_budget(usage(11, 0)).is_some());
+        assert!(within_budget(usage(6, 4)).is_ok());
+        let broken = |u| within_budget(u).expect_err("over").0;
+        assert_eq!(broken(usage(6, 5)), Property::WithinBudget);
+        assert_eq!(broken(usage(11, 0)), Property::WithinBudget);
     }
 
     /// Catches a directory check that misses an orphan block, a block longer than its
@@ -299,15 +323,15 @@ mod tests {
         let d = digest(1);
         let mut first = BTreeMap::new();
         let none = BTreeSet::new();
-        assert!(ids_never_move(&mut first, &[(&d, present(1))], |_| false, &none).is_ok());
-        assert!(ids_never_move(&mut first, &[(&d, BlobAnswer::Absent)], |_| false, &none).is_ok());
-        let moved = ids_never_move(&mut first, &[(&d, present(2))], |_| false, &none);
+        assert!(ids_never_move(&mut first, &[(&d, present(1))], &|_| false, &none).is_ok());
+        assert!(ids_never_move(&mut first, &[(&d, BlobAnswer::Absent)], &|_| false, &none).is_ok());
+        let moved = ids_never_move(&mut first, &[(&d, present(2))], &|_| false, &none);
         assert_eq!(moved.expect_err("moved").0, Property::IdsNeverMove);
-        let healed = ids_never_move(&mut first, &[(&d, present(2))], |o| o == object(1), &none);
+        let healed = ids_never_move(&mut first, &[(&d, present(2))], &|o| o == object(1), &none);
         assert!(healed.is_ok());
         assert_eq!(first[&d], at(2), "the healed location is the one kept");
         let rewritten = BTreeSet::from([object(4)]);
-        let r = ids_never_move(&mut first, &[], |_| false, &rewritten);
+        let r = ids_never_move(&mut first, &[], &|_| false, &rewritten);
         assert_eq!(r.expect_err("rewritten").0, Property::IdsNeverMove);
     }
 
@@ -318,10 +342,10 @@ mod tests {
         let d = digest(1);
         let acked = [(FarmTime::from_millis(1), d, object(1))];
         let damaged = BTreeSet::from([object(1)]);
-        assert!(damaged_acks(&acked, &damaged, |_| BlobAnswer::Unavailable).is_ok());
-        let absent = damaged_acks(&acked, &damaged, |_| BlobAnswer::Absent);
+        assert!(damaged_acks(&acked, &damaged, &|_| BlobAnswer::Unavailable).is_ok());
+        let absent = damaged_acks(&acked, &damaged, &|_| BlobAnswer::Absent);
         assert_eq!(absent.expect_err("absent").0, Property::NoFalseAck);
-        assert!(damaged_acks(&acked, &BTreeSet::new(), |_| BlobAnswer::Absent).is_ok());
+        assert!(damaged_acks(&acked, &BTreeSet::new(), &|_| BlobAnswer::Absent).is_ok());
     }
 
     /// Catches an end check that misses a staged object, and each record of the tier
@@ -334,16 +358,12 @@ mod tests {
         assert!(drained(&empty).is_ok());
         assert!(tier_seen(&TierSeen::default()).is_ok());
         type Break = fn(&mut TierSeen);
-        let cases: [(Break, Property); 5] = [
+        let cases: [(Break, Property); 4] = [
             (|s| s.lost.push(object(1)), Property::NoFalseAck),
             (|s| s.unread.push("x".to_owned()), Property::NoFalseAck),
             (
                 |s| s.refused.push("x".to_owned()),
                 Property::NothingHalfIndexed,
-            ),
-            (
-                |s| s.over_budget.push("x".to_owned()),
-                Property::WithinBudget,
             ),
             (|s| s.leaks.push("x".to_owned()), Property::NoLeak),
         ];

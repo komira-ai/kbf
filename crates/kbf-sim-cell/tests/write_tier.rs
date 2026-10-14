@@ -45,7 +45,9 @@ fn the_tier_stages_flushes_and_refuses_a_rollback() {
         let raised = rollback.raised_at.expect("the log was raised");
         let first = rollback.first_tier_command.expect("a tier command");
         assert!(raised < first, "seed {seed}: {rollback:?}");
-        assert_eq!(rollback.refused_at, Ok(raised), "seed {seed}");
+        let refused = rollback.refused.as_deref().unwrap_or("opened");
+        let at_raise = format!("raft log: entry {raised}: ");
+        assert!(refused.starts_with(&at_raise), "seed {seed}: {refused}");
         assert!(rollback.reopened, "seed {seed}: {rollback:?}");
     }
 }
@@ -188,17 +190,20 @@ fn a_store_outage_fills_the_tier_then_pushes_back() {
     }
 }
 
-/// The tier's disk full (`ENOSPC`) below its budget (scenario 13): the write that met
-/// it is not acknowledged from the tier and goes direct; nothing is lost.
+/// The tier's disk full (`ENOSPC`) below its budget, or failing (scenarios 13 and
+/// 14's read error): a write that met it is not acknowledged from the tier and goes
+/// direct; a flush whose re-read failed is retried; nothing is lost.
 ///
 /// Catches a write error swallowed (mutant "`write` answers `Ok` when the disk
 /// refused": the range is synced and acknowledged without its bytes, property 8),
-/// and a full disk that never met a write (a test that proves nothing).
+/// and faults that never met a write or a flush (a test that proves nothing).
 #[test]
 fn a_full_disk_sends_writes_direct_and_loses_nothing() {
     let swept = swept(Kind::TierDiskFull, 32);
     let met = count(&swept, |r| r.tier.disk_errors > 0);
     assert!(met >= 8, "{met} of 32 seeds met a full disk on a write");
+    let retried = count(&swept, |r| r.tier.reread_failures > 0);
+    assert!(retried > 0, "no flush met a failed re-read");
 }
 
 /// A bad sector in a staged block before its flush (scenario 14): the flusher's

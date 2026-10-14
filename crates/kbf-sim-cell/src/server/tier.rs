@@ -30,9 +30,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use kbf_front::{FLUSH_BACKOFF_FIRST, FLUSH_BACKOFF_MAX, FLUSHES_PER_ROUND, MetaLog};
-use std::num::NonZeroU64;
-
-use kbf_log::{DecodeError, FarmLogId, Format, LogCommand, MachineVersion};
+use kbf_log::{DecodeError, Format, LogCommand, MachineVersion};
 use kbf_meta::{
     Applied, BlobAnswer, Command, Location, ObjectId, Retention, ServerId, StagedPut, StagedState,
     TierId, UnreachableReason,
@@ -40,8 +38,8 @@ use kbf_meta::{
 use kbf_raft::Payload;
 use kbf_segments::IndexEntry;
 use kbf_segments::layout::encode_footer;
+use kbf_server::RaftMetaLog;
 use kbf_server::raft_log::RUNS;
-use kbf_server::{RaftLogError, RaftMetaLog};
 use kbf_sim::{NodeId, Output};
 use kbf_store::{Fault, FaultFs, Fs};
 use kbf_tier::{
@@ -114,6 +112,8 @@ pub struct TierSeen {
     pub sealed: u64,
     pub flushed: Vec<ObjectId>,
     pub flush_failures: u64,
+    /// Flush attempts whose re-read of the block failed (retried, never marked).
+    pub reread_failures: u64,
     /// Objects a record of which failed the flusher's check: marked corrupt.
     pub corrupt: Vec<ObjectId>,
     /// Objects a [`TierFlip`](super::ServerFault::TierFlip) damaged, and flips that
@@ -126,6 +126,9 @@ pub struct TierSeen {
     pub reads: u64,
     pub fallbacks: u64,
     pub refused_damaged: u64,
+    /// Reads whose local copy failed with an I/O error and that the store could not
+    /// serve either (the blob was staged): unavailable for now, not lost.
+    pub read_errors: u64,
     /// Reads of a blob the index answered present that found its bytes nowhere, or
     /// found other bytes (invariant A).
     pub unread: Vec<String>,
@@ -134,8 +137,6 @@ pub struct TierSeen {
     /// The most bytes the tier counted at once, and copies it evicted.
     pub peak: u64,
     pub evicted: u64,
-    /// Each step's budget overrun (invariant D): used and flushed bytes past it.
-    pub over_budget: Vec<String>,
 }
 
 /// A read waiting for its time or the store's answer.
@@ -148,6 +149,9 @@ pub(super) struct Read {
     local: bool,
     /// Whether the local copy was gone when it was read.
     missed: bool,
+    /// Whether the local read failed with an I/O error (an injected disk fault): the
+    /// read is unavailable, not lost.
+    failed: bool,
 }
 
 /// The tier of one start.
@@ -202,8 +206,15 @@ impl Server {
         Some((Arc::clone(&t.tier), t.id))
     }
 
-    fn cell_tier_mut(&mut self) -> Option<&mut CellTier> {
-        self.up.as_mut()?.tier.as_mut()
+    /// The process, in a step that has it up.
+    fn up_mut(&mut self) -> &mut super::Up {
+        self.up.as_mut().expect("the server is up in this step")
+    }
+
+    /// The tier, in a step whose tier call found one attached.
+    fn tier_mut(&mut self) -> &mut CellTier {
+        let up = self.up_mut();
+        up.tier.as_mut().expect("the tier is attached in this step")
     }
 
     /// The tier's budget use, while it is up.
@@ -269,7 +280,7 @@ impl Server {
         let Some(plan) = self.plan.tier else {
             return Ok(());
         };
-        let up = self.up.as_mut().ok_or(None)?;
+        let up = self.up.as_mut().expect("attached at a start");
         up.log
             .raise_machine_version(MachineVersion::V2)
             .map_err(|_| None)?;
@@ -290,11 +301,8 @@ impl Server {
                 server: SERVER,
                 tier: id,
             };
-            match up.commit(&self.out, add) {
-                Some(Applied::Tier(Ok(()))) => {}
-                Some(other) => return Err(Some(format!("AddTier answered {other:?}"))),
-                None => return Err(None),
-            }
+            let added = up.commit(&self.out, add);
+            added.filter(|a| *a == Applied::Tier(Ok(()))).ok_or(None)?;
         }
         for object in &recovery.lost {
             let mark = Command::ObjectUnreachable {
@@ -322,15 +330,13 @@ impl Server {
         let leaks = crate::check::tier::directory_leaks(&names, &staged, used);
         self.seen.tier.leaks.extend(leaks);
         self.seen.tier.lost.extend(recovery.lost.iter().copied());
-        for cut in self
+        let open = self
             .seen
             .tier
             .cuts
             .iter_mut()
-            .filter(|c| c.recovery.is_none())
-        {
-            cut.recovery = Some(recovery.clone());
-        }
+            .filter(|c| c.recovery.is_none());
+        open.for_each(|cut| cut.recovery = Some(recovery.clone()));
         self.seen.tier.recoveries.push((now, id, recovery));
         up.tier = Some(CellTier {
             tier: Arc::new(tier),
@@ -342,21 +348,10 @@ impl Server {
         Ok(())
     }
 
-    /// Records the tier's use after a change, and any budget overrun (invariant D).
-    fn note_usage(&mut self, now: FarmTime) {
-        let Some(usage) = self.tier_usage() else {
-            return;
-        };
-        let held = usage.used.saturating_add(usage.flushed);
+    /// Records the tier's use after a change.
+    fn note_usage(&mut self, usage: kbf_tier::Usage) {
         self.seen.tier.peak = self.seen.tier.peak.max(usage.used);
         self.seen.tier.evicted = self.seen.tier.evicted.max(usage.evicted);
-        if let Some(over) = crate::check::tier::over_budget(usage) {
-            let at = now.as_millis();
-            self.seen
-                .tier
-                .over_budget
-                .push(format!("at {at} ms: {over} ({held})"));
-        }
     }
 
     /// Stages an upload on the tier: whether the tier took it (acknowledged, answered
@@ -379,7 +374,7 @@ impl Server {
                 return false;
             }
         };
-        self.note_usage(now);
+        self.note_usage(tier.usage());
         let object = reservation.object();
         if tier.write(&reservation, 0, &bytes).is_err() {
             self.seen.tier.disk_errors += 1;
@@ -408,9 +403,7 @@ impl Server {
                 blobs: vec![(digest, synced.offset())],
             }],
         };
-        let Some(up) = self.up.as_mut() else {
-            return true;
-        };
+        let up = self.up.as_mut().expect("staged while up");
         let applied = up.commit(&self.out, put);
         self.settle_tier_commit(now, planted, object);
         let answer = match applied {
@@ -425,9 +418,12 @@ impl Server {
                 Msg::Uploaded { digest }
             }
             other => {
-                if let Some(refused) = other {
-                    self.seen.tier.refused.push(format!("{refused:?}"));
-                }
+                // `None`: the log stopped. A refusal is recorded (property 9).
+                let refused = format!("{other:?}");
+                self.seen
+                    .tier
+                    .refused
+                    .extend(other.is_some().then_some(refused));
                 Msg::UploadFailed { digest }
             }
         };
@@ -445,7 +441,7 @@ impl Server {
             return;
         };
         for object in tier.poll_seals(self.instant(now)) {
-            let Some(up) = self.up.as_mut() else { return };
+            let up = self.up.as_mut().expect("flushing while up");
             match up.commit(&self.out, Command::SealStaged { object }) {
                 Some(Applied::Tier(Ok(()))) => {
                     // Named by `poll_seals` just now, so the tier takes it.
@@ -455,14 +451,11 @@ impl Server {
                 _ => return,
             }
         }
-        let Some(t) = self.cell_tier_mut() else {
-            return;
-        };
+        let t = self.tier_mut();
         let mut busy: BTreeSet<ObjectId> = t.flushing.values().copied().collect();
         let waiting = t.retries.iter().filter(|(_, (_, next))| *next > now);
         busy.extend(waiting.map(|(o, _)| *o));
-        let Some(up) = self.up.as_ref() else { return };
-        let due = up.query(move |m| {
+        let due = self.up_mut().query(move |m| {
             let ours = m.staged_objects().filter(|(o, s)| {
                 (s.tier(), s.state()) == (id, StagedState::Sealed) && !busy.contains(o)
             });
@@ -474,9 +467,6 @@ impl Server {
         });
         for (object, len, blobs) in due {
             self.flush_one(now, &tier, object, len, blobs);
-            if self.up.as_ref().is_none_or(|up| up.stopped) {
-                return;
-            }
         }
     }
 
@@ -491,28 +481,32 @@ impl Server {
     ) {
         let records = match tier.read(object, 0, usize::try_from(len).unwrap_or(usize::MAX)) {
             Ok(records) => records,
-            Err(_) => return self.flush_failed(now, object),
+            Err(_) => {
+                self.seen.tier.reread_failures += 1;
+                return self.flush_failed(now, object);
+            }
         };
         let Some(entries) = entries(&records, &blobs) else {
             let mark = Command::ObjectUnreachable {
                 object,
                 reason: UnreachableReason::Corrupt,
             };
-            let Some(up) = self.up.as_mut() else { return };
-            if let Some(Applied::Marked(Ok(()))) = up.commit(&self.out, mark) {
+            let up = self.up.as_mut().expect("flushing while up");
+            // Only once the mark committed: the block is the object's only copy.
+            let marked = up.commit(&self.out, mark);
+            let marked = marked.filter(|a| *a == Applied::Marked(Ok(())));
+            let discarded = marked.map(|_| {
                 let _ = tier.discard(object);
-                self.seen.tier.corrupt.push(object);
-            }
+                object
+            });
+            self.seen.tier.corrupt.extend(discarded);
             return;
         };
         let mut bytes = records;
         bytes.extend_from_slice(&encode_footer(len, &entries));
         let tag = T_PUT + self.puts_sent;
         self.puts_sent += 1;
-        let Some(t) = self.cell_tier_mut() else {
-            return;
-        };
-        t.flushing.insert(tag, object);
+        self.tier_mut().flushing.insert(tag, object);
         let body = Body { blobs, bytes };
         self.out.push(Output::Send {
             to: self.store.clone(),
@@ -524,9 +518,7 @@ impl Server {
     /// A flush attempt of `object` failed at `now`: the next waits for the backoff.
     fn flush_failed(&mut self, now: FarmTime, object: ObjectId) {
         self.seen.tier.flush_failures += 1;
-        let Some(t) = self.cell_tier_mut() else {
-            return;
-        };
+        let t = self.tier_mut();
         let failures = t.retries.get(&object).map_or(0, |(n, _)| *n) + 1;
         let next = now.saturating_add(backoff(failures));
         t.retries.insert(object, (failures, next));
@@ -535,7 +527,8 @@ impl Server {
     /// A PUT deadline that is a flush's: whether `tag` was one. The flush is failed;
     /// a later answer to it is ignored.
     pub(super) fn flush_deadline(&mut self, now: FarmTime, tag: u64) -> bool {
-        let Some(object) = self.cell_tier_mut().and_then(|t| t.flushing.remove(&tag)) else {
+        let flushing = self.up.as_mut().and_then(|up| up.tier.as_mut());
+        let Some(object) = flushing.and_then(|t| t.flushing.remove(&tag)) else {
             return false;
         };
         self.flush_failed(now, object);
@@ -548,7 +541,7 @@ impl Server {
         match msg {
             Msg::FlushDone { object } => self.flush_done(now, object),
             Msg::FlushFailed { object } => {
-                let t = self.cell_tier_mut()?;
+                let t = self.tier_mut();
                 let tag = t
                     .flushing
                     .iter()
@@ -565,12 +558,10 @@ impl Server {
 
     /// The store has the flushed `object`: `ObjectFlushed`, then the rename.
     fn flush_done(&mut self, now: FarmTime, object: ObjectId) {
-        let Some((tier, _)) = self.cell_tier() else {
-            return;
-        };
-        let Some(t) = self.cell_tier_mut() else {
-            return;
-        };
+        let (tier, _) = self
+            .cell_tier()
+            .expect("a store answer reaches a server that is up");
+        let t = self.tier_mut();
         let Some(tag) = t
             .flushing
             .iter()
@@ -584,7 +575,7 @@ impl Server {
             return;
         }
         let planted = self.arm_tier_commit(|p| matches!(p, TierPoint::InFlushCommit { .. }));
-        let Some(up) = self.up.as_mut() else { return };
+        let up = self.up.as_mut().expect("flushing while up");
         let applied = up.commit(&self.out, Command::ObjectFlushed { object });
         self.settle_tier_commit(now, planted, object);
         if !matches!(applied, Some(Applied::Tier(Ok(())))) {
@@ -595,11 +586,9 @@ impl Server {
         }
         // A failed rename leaves the `.blk`, which the next start deletes.
         let _ = tier.flushed(object);
-        if let Some(t) = self.cell_tier_mut() {
-            t.retries.remove(&object);
-        }
+        self.tier_mut().retries.remove(&object);
         self.seen.tier.flushed.push(object);
-        self.note_usage(now);
+        self.note_usage(tier.usage());
     }
 
     /// Starts a read of each of `asked` the index answers present now.
@@ -629,47 +618,50 @@ impl Server {
                 location,
                 local: staged_on.is_some() || flushed,
                 missed: false,
+                failed: false,
             };
-            if let Some(t) = self.cell_tier_mut() {
-                t.reads.insert(tag, read);
-            }
+            self.tier_mut().reads.insert(tag, read);
             self.timer(READ_AFTER, tag);
         }
     }
 
     /// A read's time has come: from the tier, else from the store.
     pub(super) fn read_due(&mut self, now: FarmTime, tag: u64) {
-        let Some((tier, _)) = self.cell_tier() else {
+        // Down, or a read of an earlier start: nothing to read.
+        let attached = self.up.as_mut().and_then(|up| up.tier.as_mut());
+        let Some((tier, read)) =
+            attached.and_then(|t| Some((Arc::clone(&t.tier), t.reads.remove(&tag)?)))
+        else {
             return;
-        };
-        let Some(read) = self.cell_tier_mut().and_then(|t| t.reads.remove(&tag)) else {
-            return; // a read of an earlier start
         };
         let Read {
             digest, location, ..
         } = read;
         let len = usize::try_from(digest.size_bytes).unwrap_or(usize::MAX);
         match tier.read(location.object, location.offset, len) {
-            Ok(bytes) if bytes == content(&digest) => self.seen.tier.reads += 1,
-            Ok(_) if self.seen.tier.damaged.contains(&location.object) => {
-                self.seen.tier.refused_damaged += 1;
-            }
-            Ok(_) => {
+            Ok(bytes) => {
+                // The right bytes, or a damaged record refused; other bytes break A.
+                let good = bytes == content(&digest);
+                let damaged = self.seen.tier.damaged.contains(&location.object);
+                self.seen.tier.reads += u64::from(good);
+                self.seen.tier.refused_damaged += u64::from(!good && damaged);
                 let at = now.as_millis();
-                let unread = format!(
+                let other = format!(
                     "{digest:?} read other bytes from {} at {at} ms",
                     location.object
                 );
-                self.seen.tier.unread.push(unread);
+                self.seen
+                    .tier
+                    .unread
+                    .extend((!good && !damaged).then_some(other));
             }
-            Err(_) => {
+            Err(e) => {
                 let read = Read {
                     missed: true,
+                    failed: matches!(e, TierError::Io { .. }),
                     ..read
                 };
-                if let Some(t) = self.cell_tier_mut() {
-                    t.reads.insert(tag, read);
-                }
+                self.tier_mut().reads.insert(tag, read);
                 let msg = Msg::Get {
                     object: location.object,
                     digest,
@@ -685,48 +677,41 @@ impl Server {
 
     /// The store's answer to a read the tier could not serve.
     fn got(&mut self, tag: u64, held: bool) {
-        let Some(read) = self.cell_tier_mut().and_then(|t| t.reads.remove(&tag)) else {
-            return;
+        let Some(read) = self.tier_mut().reads.remove(&tag) else {
+            return; // asked by an earlier start
         };
-        let object = read.location.object;
-        if held {
-            self.seen.tier.reads += 1;
-            self.seen.tier.fallbacks += u64::from(read.missed && read.local);
-        } else if !self.seen.tier.damaged.contains(&object) {
-            let digest = read.digest;
-            let unread =
-                format!("{digest:?} in {object} found neither on the tier nor in the store");
-            self.seen.tier.unread.push(unread);
-        }
+        let (digest, object) = (read.digest, read.location.object);
+        self.seen.tier.reads += u64::from(held);
+        self.seen.tier.fallbacks += u64::from(held & read.missed & read.local & !read.failed);
+        self.seen.tier.read_errors += u64::from(!held & read.failed);
+        let lost = !held & !read.failed & !self.seen.tier.damaged.contains(&object);
+        let unread = format!("{digest:?} in {object} found neither on the tier nor in the store");
+        self.seen.tier.unread.extend(lost.then_some(unread));
     }
 
     /// A bad sector: flips the first byte of the first record of the oldest staged
-    /// object on this tier whose block holds committed bytes.
+    /// object on this tier whose block holds committed bytes, if the server is up and
+    /// has one.
     pub(super) fn flip_a_staged_record(&mut self) {
-        let Some((_, id)) = self.cell_tier() else {
-            return;
-        };
-        let Some(up) = self.up.as_ref() else { return };
-        let first = up.query(move |m| {
-            let mut on = m.staged_objects().filter(|(_, s)| s.tier() == id);
-            on.find_map(|(o, s)| s.blobs().map(|(_, at)| at).min().map(|at| (o, at)))
+        // Down, or no block staged: the fault finds nothing to damage.
+        let first = self.up.as_ref().and_then(|up| {
+            let id = up.tier.as_ref()?.id;
+            up.query(move |m| {
+                let mut on = m.staged_objects().filter(|(_, s)| s.tier() == id);
+                on.find_map(|(o, s)| s.blobs().map(|(_, at)| at).min().map(|at| (o, at)))
+            })
         });
-        let Some((object, at)) = first else {
-            self.seen.tier.flips_missed += 1;
-            return;
-        };
-        let name = block_name(object);
-        let offset = usize::try_from(at).unwrap_or(usize::MAX);
-        if self
-            .tier_disk
-            .contents(&name)
-            .is_some_and(|b| b.len() > offset)
-        {
-            self.tier_disk.flip(&name, offset);
-            self.seen.tier.damaged.insert(object);
-        } else {
-            self.seen.tier.flips_missed += 1;
-        }
+        // A committed record lies within the block's synced bytes.
+        let disk = &self.tier_disk;
+        let flipped = first.map(|(object, at)| {
+            disk.flip(
+                &block_name(object),
+                usize::try_from(at).expect("a small offset"),
+            );
+            object
+        });
+        self.seen.tier.flips_missed += u64::from(flipped.is_none());
+        self.seen.tier.damaged.extend(flipped);
     }
 }
 
@@ -738,9 +723,9 @@ pub struct Rollback {
     pub raised_at: Option<u64>,
     /// The index of the first write tier command.
     pub first_tier_command: Option<u64>,
-    /// The entry the version-1 open stopped at; `Err` if it opened, or failed
-    /// another way.
-    pub refused_at: Result<u64, String>,
+    /// Why the version-1 open was refused (`raft log: entry <index>: ..` when it
+    /// stopped at an entry); `None` if it opened.
+    pub refused: Option<String>,
     /// Whether this binary still opens the log after that, to the same staged table.
     pub reopened: bool,
 }
@@ -760,7 +745,8 @@ impl Server {
             };
             let index = entry.id.index.0;
             match kbf_log::decode(Format::V1, bytes) {
-                Ok(LogCommand::MachineVersion(v)) if v == MachineVersion::V2 => {
+                // The one raise this binary commits: to version 2.
+                Ok(LogCommand::MachineVersion(_)) => {
                     raised_at.get_or_insert(index);
                 }
                 Err(DecodeError::UnknownCommand("MetaCommand")) => {
@@ -775,15 +761,11 @@ impl Server {
                 durable.restart(),
                 Retention::default(),
                 "cell/",
-                || Ok(FarmLogId::new(NonZeroU64::MIN)),
+                super::drawn(up.log.log_id()),
                 runs,
             ))
         };
-        let refused_at = match open(MachineVersion::V1) {
-            Err(RaftLogError::Decode { index, .. }) => Ok(index),
-            Err(e) => Err(e.to_string()),
-            Ok(_) => Err("a binary running version 1 opened the log".to_owned()),
-        };
+        let refused = open(MachineVersion::V1).err().map(|e| e.to_string());
         let staged = up.query(StagedSnapshot::of);
         let reopened = open(RUNS)
             .ok()
@@ -791,7 +773,7 @@ impl Server {
         Some(Rollback {
             raised_at,
             first_tier_command,
-            refused_at,
+            refused,
             reopened,
         })
     }
@@ -799,9 +781,126 @@ impl Server {
 
 #[cfg(test)]
 mod tests {
-    use kbf_types::DigestFunction;
+    use kbf_meta::Epoch;
+    use kbf_sim::{Event, NodeInput};
+    use kbf_types::{DigestFunction, StateMachine};
 
+    use super::super::{ServerPlan, T_START, T_TICK};
     use super::*;
+
+    fn tier_server(seal_after: u64) -> Server {
+        let tier = TierPlan {
+            budget: 1 << 10,
+            seal_after: Duration::from_secs(seal_after),
+            segment_limit: 1 << 9,
+        };
+        let plan = ServerPlan {
+            faults: Vec::new(),
+            down_for: Duration::from_secs(3),
+            tier: Some(tier),
+        };
+        Server::new(plan, NodeId::from("store"))
+    }
+
+    fn input(at: u64, event: Event<Msg>) -> NodeInput<Msg> {
+        NodeInput {
+            now: FarmTime::from_millis(at),
+            entropy: 9,
+            event,
+        }
+    }
+
+    /// What `s` sent since the last call, as text (`Msg` has no `PartialEq`).
+    fn sent(s: &mut Server) -> String {
+        format!("{:?}", s.take_outputs())
+    }
+
+    /// A started tier server that has acknowledged one upload, and the blob.
+    fn with_one_upload(seal_after: u64) -> (Server, Digest) {
+        let mut s = tier_server(seal_after);
+        s.apply(input(0, Event::Start));
+        let d = crate::input_of(&crate::action(3));
+        let from = NodeId::from("client-0");
+        let msg = Msg::Upload { digest: d };
+        s.apply(input(10, Event::Message { from, msg }));
+        assert!(sent(&mut s).contains("Uploaded"), "{:?}", s.seen.tier);
+        (s, d)
+    }
+
+    /// Catches a tier open that refuses (a block of a later epoch: a reused epoch)
+    /// yet leaves the server up, or goes unrecorded; and a start whose raise or
+    /// `AddTier` failed left up (the log has stopped).
+    #[test]
+    fn a_refused_or_failed_tier_start_takes_the_server_down() {
+        let mut s = tier_server(5);
+        let later = ObjectId::new(Epoch::new(9), 0);
+        s.tier_disk.put(&block_name(later), b"x");
+        s.apply(input(0, Event::Start));
+        assert!(s.up.is_none());
+        let refused = &s.seen.refused;
+        assert_eq!(refused.len(), 1, "{refused:?}");
+        assert!(refused[0].1.contains("write tier"), "{refused:?}");
+        assert!(sent(&mut s).contains(&format!("tag: {T_START}")));
+        // The operations of an open and the writer epoch's commit, then the raise's
+        // and `AddTier`'s.
+        let mut probe = Server::new(ServerPlan::default(), NodeId::from("store"));
+        probe.apply(input(0, Event::Start));
+        for at in 0..4 {
+            let mut s = tier_server(5);
+            s.disk.fail_at(probe.disk.ops() + at, Fault::Error);
+            s.apply(input(0, Event::Start));
+            assert!(s.up.is_none(), "an error at op {at} of the attach");
+            assert!(s.seen.refused.is_empty());
+        }
+    }
+
+    /// Catches a start that does not mark a staged object whose block is gone
+    /// `Missing` (its blob would be answered present with no bytes anywhere), or does
+    /// not report it.
+    #[test]
+    fn a_staged_block_gone_at_a_start_is_marked_missing() {
+        let (mut s, d) = with_one_upload(5);
+        let object = s.seen.acked[0].2;
+        s.down(Down::Kill);
+        s.tier_disk.remove(&block_name(object)).expect("the block");
+        s.apply(input(4_000, Event::Timer { tag: T_START }));
+        assert_eq!(s.seen.tier.lost, [object]);
+        let meta = s.meta().expect("up");
+        assert!(matches!(meta.blob(&d), BlobAnswer::Unavailable));
+    }
+
+    /// Catches a flush whose re-read failed that is PUT anyway, never retried, or
+    /// retried before its backoff.
+    #[test]
+    fn a_flush_whose_re_read_failed_is_retried_after_the_backoff() {
+        let (mut s, _) = with_one_upload(1);
+        // The tick's first operation on the tier's disk is the flusher's re-read.
+        s.tier_disk.fail_at(s.tier_disk.ops(), Fault::Error);
+        s.apply(input(1_500, Event::Timer { tag: T_TICK }));
+        let tier = &s.seen.tier;
+        assert_eq!(
+            (tier.sealed, tier.flush_failures, tier.reread_failures),
+            (1, 1, 1)
+        );
+        assert!(!sent(&mut s).contains("Flush"));
+        s.apply(input(2_000, Event::Timer { tag: T_TICK }));
+        assert!(
+            !sent(&mut s).contains("Flush"),
+            "retried before the backoff"
+        );
+        s.apply(input(2_600, Event::Timer { tag: T_TICK }));
+        assert!(sent(&mut s).contains("Flush"));
+    }
+
+    /// Catches a flusher that seals or flushes on a log that has stopped.
+    #[test]
+    fn a_stopped_log_stops_the_flusher() {
+        let (mut s, _) = with_one_upload(1);
+        s.disk.fail_at(s.disk.ops(), Fault::Error);
+        s.apply(input(1_500, Event::Timer { tag: T_TICK }));
+        assert_eq!(s.seen.tier.sealed, 0);
+        assert!(!sent(&mut s).contains("Flush"));
+    }
 
     fn digest(n: u8, size: u64) -> Digest {
         Digest::new(DigestFunction::Sha256, [n; 32], size)

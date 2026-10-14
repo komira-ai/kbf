@@ -109,9 +109,10 @@ pub enum ServerFault {
         nth: u32,
         down: Down,
     },
-    /// The `after`-th operation on the tier's disk from now fails as a full disk
-    /// fails it (`ENOSPC`, below the tier's budget: other tenants filled the disk).
-    TierFullAt { after: u64 },
+    /// The `after`-th operation on the tier's disk from now meets `fault`: a full disk
+    /// ([`Fault::NoSpace`], below the tier's budget: other tenants filled it) or an I/O
+    /// error ([`Fault::Error`]).
+    TierDiskAt { after: u64, fault: Fault },
     /// A bad sector: one byte of the oldest staged block, in a committed record, is
     /// flipped on the disk.
     TierFlip,
@@ -241,6 +242,11 @@ fn ready<F: Future>(future: F) -> F::Output {
     }
 }
 
+/// A new log's id draw that draws `id`.
+fn drawn(id: FarmLogId) -> impl FnOnce() -> std::io::Result<FarmLogId> {
+    move || Ok(id)
+}
+
 fn wall(t: FarmTime) -> SystemTime {
     UNIX_EPOCH + Duration::from_millis(t.as_millis())
 }
@@ -355,7 +361,7 @@ impl Server {
                 self.disk.clone(),
                 Retention::default(),
                 "cell/",
-                move || Ok(log_id),
+                drawn(log_id),
             ))
         };
         self.seen.starts += 1;
@@ -438,11 +444,13 @@ impl Server {
             ServerFault::TierCrashAt { point, nth, down } => {
                 self.tier_hooks.arm(point, nth, down);
             }
-            ServerFault::TierFullAt { after } if self.up.is_some() => {
+            // Both act on what is there: a full disk counts operations from now, up or
+            // down; a bad sector needs a staged block.
+            ServerFault::TierDiskAt { after, fault } => {
                 let at = self.tier_disk.ops() + after;
-                self.tier_disk.fail_at(at, Fault::NoSpace);
+                self.tier_disk.fail_at(at, fault);
             }
-            ServerFault::TierFlip if self.up.is_some() => self.flip_a_staged_record(),
+            ServerFault::TierFlip => self.flip_a_staged_record(),
             _ => {}
         }
     }
