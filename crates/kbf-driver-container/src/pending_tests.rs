@@ -161,3 +161,79 @@ async fn missing_blobs_are_copied_in_flight_at_a_time() {
     let stored = store.stored.lock().expect("stored").len();
     assert_eq!(stored, 41, "40 missing files and the message");
 }
+
+/// A store that holds every blob and records each FindMissing question.
+#[derive(Default)]
+struct HoldsAll {
+    asked: std::sync::Mutex<Vec<Digest>>,
+}
+
+impl Cas for HoldsAll {
+    type Lease = Arc<Self>;
+
+    fn lease(self: &Arc<Self>, _: &kbf_types::LeaseId) -> Arc<Self> {
+        Arc::clone(self)
+    }
+
+    async fn get(&self, digest: &Digest) -> Result<Vec<u8>, kbf_daemon::cas::CasError> {
+        Err(kbf_daemon::cas::CasError::Missing(label(digest)))
+    }
+
+    async fn put(&self, bytes: Vec<u8>) -> Result<Digest, kbf_daemon::cas::CasError> {
+        panic!(
+            "{} stored, but the store holds every blob",
+            label(&digest_of(&bytes))
+        );
+    }
+
+    async fn missing(&self, digests: &[Digest]) -> Vec<Digest> {
+        self.asked.lock().expect("asked").extend_from_slice(digests);
+        Vec::new()
+    }
+}
+
+/// Catches the walk's blobs not being deduplicated: a tree with repeated content (two
+/// files with the same bytes, a Directory message added twice) must ask FindMissing
+/// about each digest once, so the lease's `find_missing_digests` counter and the
+/// question's size count distinct blobs. The spool dedupes what it stores, so only
+/// the question shows the defect. Mutant seen red: `found.insert(..) || true` in
+/// `Pending::add` (5 digests asked).
+#[tokio::test]
+async fn repeated_content_is_asked_about_once() {
+    let exe = std::env::current_exe().expect("test binary");
+    let dir = exe
+        .parent()
+        .expect("deps directory")
+        .join("kbf-driver-container-unit")
+        .join("pending-dedupe");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("spools")).expect("mkdir");
+    let mut pending = Pending::default();
+    for (name, bytes) in [("a", "same"), ("b", "same"), ("c", "other")] {
+        std::fs::write(dir.join(name), bytes).expect("write");
+        let stat = rustix::fs::stat(dir.join(name)).expect("stat");
+        let at = FileAt {
+            dirs: Vec::new().into(),
+            name: name.to_owned(),
+            id: (stat.st_dev, stat.st_ino),
+            shown: dir.join(name),
+        };
+        pending.file(&digest_of(bytes.as_bytes()), at);
+    }
+    let message = pending.bytes(b"a message".to_vec());
+    assert_eq!(pending.bytes(b"a message".to_vec()), message);
+    let upper = Arc::new(
+        rustix::fs::openat(rustix::fs::CWD, &dir, DIRECTORY, Mode::empty()).expect("open"),
+    );
+    let store = HoldsAll::default();
+    pending
+        .store_missing(&store, &upper, &dir.join("spools"))
+        .await
+        .expect("stored");
+    let asked = store.asked.lock().expect("asked").clone();
+    let want = vec![digest_of(b"same"), digest_of(b"other"), message];
+    assert_eq!(
+        asked, want,
+        "each distinct digest asked once, in walk order"
+    );
+}
