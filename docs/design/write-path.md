@@ -198,7 +198,9 @@ stores its outputs that way. Where the code differs from the text below:
   stored as a grouped segment is: under a `--write-puts-in-flight` slot, its PUT
   retried under a new key (section 3.4), its footer read back; the one `PutBlobs` is
   timed as a segment commit.
-- The idle time is `--segment-upload-idle-secs`. `Commit`'s reply lists the digests
+- The idle time is `--segment-upload-idle-secs`. Record hashing runs on the blocking
+  pool, never on a runtime worker, at most `--cpu-threads` (default 4) jobs at once.
+  `Commit`'s reply lists the digests
   committed; a failed commit is the call's status.
 - An upload's connection is found by the peer address of the worker listener's
   tracked connections (`Connections`); a connection's close is seen when the server
@@ -241,11 +243,7 @@ stores its outputs that way. Where the code differs from the text below:
    daemon's one connection, each range up to 4 MiB. A range is marked received only
    after its bytes are written (in memory, or `pwrite` returned). A range outside the
    records, or overlapping a received range with other bounds, is refused. A resend of
-   a received range (same offset and length) gets `OK` and **writes nothing**. The
-   daemon keeps up to `--segment-uploads-in-flight` (default 4) uploads of one spool in
-   flight, so the server's check and staging of one overlaps the next ones' ranges; each
-   range still takes a permit of the uploads' share of `--transfer-in-flight` before it
-   is read from the spool.
+   a received range (same offset and length) gets `OK` and **writes nothing**.
 5. `Segments/Commit { upload }` moves the upload to **committing**: every later
    `PutRange` is refused (`FAILED_PRECONDITION`, nothing written). The server waits for
    in-flight range writes and checks every range is present. **Every record's SHA-256
@@ -657,8 +655,7 @@ Estimates from the measured store latency, to be measured on the pilot at each s
 2. **PR 2, segment upload**: the `Segments` service on the worker listener (`Begin`,
    `PutRange`, `Commit`, `Locate`, `ReadRange`) in `kbf-proto` and `kbf-front`, and the
    daemon's spool, split, upload and fallback in `kbf-daemon`/`kbf-outputs`. Flags:
-   `--segment-upload-max-bytes`, `--segment-upload-streams`, `--segment-upload-idle-secs`
-   (and later `--segment-uploads-in-flight`).
+   `--segment-upload-max-bytes`, `--segment-upload-streams`, `--segment-upload-idle-secs`.
    Direct path only. Downloads through the transfer engine follow it.
 3. **PR 3, tier metadata**: the five commands in `kbf-meta` and `kbf-log`, the staged
    table, `BlobAnswer::Present { staged_on }`, the refusal test, snapshot encoding if

@@ -512,6 +512,7 @@ async fn a_begin_waits_for_the_budget(release: Release) {
     let config = SegmentsConfig {
         max_bytes: 4 << 10,
         idle: Duration::from_secs(3600),
+        ..SegmentsConfig::DEFAULT
     };
     let writes = WriteConfig {
         bytes_in_flight: 4 << 10,
@@ -680,6 +681,7 @@ async fn a_begin_waits_for_bytes_other_uploads_hold() {
     let config = SegmentsConfig {
         max_bytes: 4 << 10,
         idle: Duration::from_secs(3600),
+        ..SegmentsConfig::DEFAULT
     };
     let writes = WriteConfig {
         bytes_in_flight: 4 << 10,
@@ -819,6 +821,7 @@ async fn an_upload_as_large_as_the_bound_is_admitted_and_commits() {
     let config = SegmentsConfig {
         max_bytes: bound,
         idle: Duration::from_secs(3600),
+        ..SegmentsConfig::DEFAULT
     };
     let writes = WriteConfig {
         bytes_in_flight: bound,

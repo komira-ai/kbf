@@ -34,9 +34,11 @@
 //!   one is kept until its commit ends.
 
 mod connection;
+mod cpu;
 mod upload;
 
 use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
@@ -55,6 +57,7 @@ use tokio::time::Instant;
 use tonic::{Request, Response, Status};
 
 pub use self::connection::{Connection, Connections, Tracked};
+use self::cpu::HashPool;
 use self::upload::{Declared, Put, Receiving, advance, declare};
 use crate::cache::{Admitted, BuiltSegment, Cache};
 use crate::meta_log::MetaLog;
@@ -82,6 +85,9 @@ pub struct SegmentsConfig {
     /// How long an upload may go without a call before it is dropped
     /// (`--segment-upload-idle-secs`).
     pub idle: Duration,
+    /// The most record-hashing jobs running at once (`--cpu-threads`), on the blocking
+    /// pool.
+    pub cpu_threads: NonZeroUsize,
 }
 
 impl SegmentsConfig {
@@ -89,6 +95,10 @@ impl SegmentsConfig {
     pub const DEFAULT: Self = Self {
         max_bytes: MIN_SEGMENT_UPLOAD_BYTES,
         idle: Duration::from_secs(60),
+        cpu_threads: match NonZeroUsize::new(4) {
+            Some(n) => n,
+            None => unreachable!(),
+        },
     };
 }
 
@@ -111,6 +121,7 @@ struct Shared<M, O> {
     cache: Arc<Cache<M, O>>,
     config: SegmentsConfig,
     connections: Connections,
+    hashing: HashPool,
     /// `Begin` calls waiting for admission now.
     waiting: AtomicUsize,
     next: AtomicU64,
@@ -221,6 +232,7 @@ impl<M: MetaLog, O: ObjectStore + 'static> SegmentsService<M, O> {
         Self {
             shared: Arc::new(Shared {
                 cache,
+                hashing: HashPool::new(config.cpu_threads),
                 config,
                 connections,
                 waiting: AtomicUsize::new(0),
@@ -402,19 +414,21 @@ impl<M: MetaLog, O: ObjectStore + 'static> Segments for SegmentsService<M, O> {
             // records its results itself, so a call cancelled meanwhile leaves no
             // record claimed forever.
             let task = Arc::clone(&upload);
-            tokio::task::spawn_blocking(move || {
-                advance(&claimed, |i, finished| {
-                    let mut phase = lock(&task.phase);
-                    match &mut *phase {
-                        Phase::Receiving { segments, .. } => {
-                            segments[index].next(&task.declared[index], i, finished)
+            self.shared
+                .hashing
+                .run(move || {
+                    advance(&claimed, |i, finished| {
+                        let mut phase = lock(&task.phase);
+                        match &mut *phase {
+                            Phase::Receiving { segments, .. } => {
+                                segments[index].next(&task.declared[index], i, finished)
+                            }
+                            _ => None,
                         }
-                        _ => None,
-                    }
-                });
-            })
-            .await
-            .map_err(|e| Status::internal(format!("checking a range failed: {e}")))?;
+                    });
+                })
+                .await
+                .map_err(|e| Status::internal(format!("checking a range failed: {e}")))?;
             // A mismatch is refused at once; the upload cannot commit.
             if let Phase::Receiving { segments, .. } = &*lock(&upload.phase)
                 && let Some(refused) = segments[index].refusal()

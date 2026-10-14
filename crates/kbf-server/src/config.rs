@@ -211,6 +211,12 @@ pub struct Args {
     /// that began it closes; one that is committing is kept until its commit ends.
     #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u64).range(1..))]
     pub segment_upload_idle_secs: u64,
+    /// The most CPU-bound jobs the server runs at once on the blocking pool, off the
+    /// request workers: today the SHA-256 and CRC-32C of segment records as their
+    /// ranges arrive. The farm node's cores are hyperthreads in pairs; the default
+    /// leaves most of them to the other work.
+    #[arg(long, default_value_t = kbf_front::SegmentsConfig::DEFAULT.cpu_threads)]
+    pub cpu_threads: NonZeroUsize,
     /// `http://host[:port]` of the S3 service (`--store=s3`).
     #[arg(long, required_if_eq("store", "s3"))]
     pub s3_endpoint: Option<String>,
@@ -401,6 +407,7 @@ impl Args {
             segments: SegmentsConfig {
                 max_bytes: self.segment_upload_max_bytes,
                 idle: Duration::from_secs(self.segment_upload_idle_secs),
+                cpu_threads: self.cpu_threads,
             },
         })
     }
@@ -649,16 +656,23 @@ mod tests {
             "kbf-server",
             "--segment-upload-max-bytes=2147483648",
             "--segment-upload-idle-secs=5",
+            "--cpu-threads=7",
         ])
         .listeners()
         .expect("listeners");
+        assert_eq!(set.segments.cpu_threads.get(), 7);
+        assert_eq!(defaults.segments.cpu_threads.get(), 4);
         assert_eq!(set.segments.max_bytes, 1 << 31);
         assert_eq!(set.segments.idle, std::time::Duration::from_secs(5));
         let below = format!(
             "--segment-upload-max-bytes={}",
             (1u64 << 30) + (1 << 20) - 1
         );
-        for refused in [below.as_str(), "--segment-upload-idle-secs=0"] {
+        for refused in [
+            below.as_str(),
+            "--segment-upload-idle-secs=0",
+            "--cpu-threads=0",
+        ] {
             assert!(
                 Args::try_parse_from(["kbf-server", refused]).is_err(),
                 "{refused} accepted"
