@@ -21,7 +21,7 @@ mod segment;
 use kbf_types::{Digest, DigestFunction};
 use sha2::{Digest as _, Sha256};
 
-pub use crate::crc32c::crc32c;
+pub use crate::crc32c::{Crc32c, crc32c};
 pub use crate::error::{SegmentError, WriteError};
 pub use crate::fastcdc::{
     AVG_CHUNK, CHUNKING_THRESHOLD, Chunks, MAX_CHUNK, MIN_CHUNK, Manifest, chunks,

@@ -814,8 +814,10 @@ fn unexpected(applied: &Applied) -> CacheError {
 }
 
 mod batch;
+mod upload;
 
 pub use batch::BATCH_READS_IN_FLIGHT;
+pub(crate) use upload::BuiltSegment;
 
 #[cfg(test)]
 mod tests;

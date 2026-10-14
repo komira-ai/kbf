@@ -221,13 +221,29 @@ impl Footer {
     }
 }
 
-/// Appends the footer for `entries` (sorted strictly ascending by digest) to `out`,
-/// whose current length is the record area's length.
+/// The footer (fan-out, index, trailer) of a segment whose records fill its first
+/// `records_len` bytes, indexing `entries`.
+///
+/// `entries` must be sorted strictly ascending by digest, each lying within the record
+/// area, as [`Footer::parse`] demands; [`Footer::entries`] of a parsed footer is. This
+/// is the one builder: a segment written whole ([`crate::SegmentWriter`]) and one whose
+/// records arrived as ranges get their footer from the same code, so equal entries give
+/// equal bytes.
+#[must_use]
+pub fn encode_footer(records_len: u64, entries: &[IndexEntry]) -> Vec<u8> {
+    let mut out =
+        Vec::with_capacity(usize::try_from(footer_len(entries.len() as u64)).unwrap_or_default());
+    write_footer(&mut out, records_len, entries.iter());
+    out
+}
+
+/// Appends the footer for `entries` (sorted strictly ascending by digest) to `out`, for
+/// a record area of `index_offset` bytes.
 pub(crate) fn write_footer<'a>(
     out: &mut Vec<u8>,
+    index_offset: u64,
     entries: impl ExactSizeIterator<Item = &'a IndexEntry> + Clone,
 ) {
-    let index_offset = out.len() as u64;
     let start = out.len();
     let mut fanout = [0u32; 256];
     for e in entries.clone() {

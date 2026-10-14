@@ -13,6 +13,7 @@ use kbf_objstore::{Capabilities, KeyError, KeyPrefix};
 use tonic::transport::{Certificate, Identity, ServerTlsConfig};
 
 use kbf_auth::{AllowAuthorizer, Authorizer, Policy, PolicyError};
+use kbf_front::SegmentsConfig;
 
 use crate::identity::{DenyList, DenyListError};
 use crate::serve::{Api, Listeners, WorkerTls};
@@ -184,6 +185,24 @@ pub struct Args {
         value_parser = clap::value_parser!(u64).range(1..)
     )]
     pub invocation_memory: u64,
+    /// The most bytes, records and footers together, one segment upload on the worker
+    /// listener may declare (`docs/design/write-path.md`, section 4.2). Ranges are held
+    /// in memory until their upload commits, and every upload in progress together
+    /// holds at most this much: a `Begin` waits while it is spent. At least one 1 GiB
+    /// blob and its footer (1 GiB + 1 MiB), so any blob the cache accepts can be
+    /// uploaded.
+    #[arg(
+        long,
+        value_name = "BYTES",
+        default_value_t = kbf_front::MIN_SEGMENT_UPLOAD_BYTES,
+        value_parser = clap::value_parser!(u64).range(kbf_front::MIN_SEGMENT_UPLOAD_BYTES..)
+    )]
+    pub segment_upload_max_bytes: u64,
+    /// How long, in seconds, a segment upload may go without a call before it is
+    /// dropped and its memory returned. An upload is also dropped when the connection
+    /// that began it closes; one that is committing is kept until its commit ends.
+    #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u64).range(1..))]
+    pub segment_upload_idle_secs: u64,
     /// `http://host[:port]` of the S3 service (`--store=s3`).
     #[arg(long, required_if_eq("store", "s3"))]
     pub s3_endpoint: Option<String>,
@@ -295,6 +314,10 @@ impl Args {
             shutdown_timeout: Duration::from_secs(self.shutdown_timeout_secs),
             store_probe_timeout: Duration::from_millis(self.readyz_store_timeout_ms),
             invocation_memory: usize::try_from(self.invocation_memory).unwrap_or(usize::MAX),
+            segments: SegmentsConfig {
+                max_bytes: self.segment_upload_max_bytes,
+                idle: Duration::from_secs(self.segment_upload_idle_secs),
+            },
         })
     }
 
@@ -429,6 +452,38 @@ mod tests {
     use clap::Parser;
 
     use super::{Args, loopback_only};
+
+    /// Catches a `--segment-upload-*` flag that does not reach the listeners, a default
+    /// other than the design's (1 GiB + 1 MiB, 60 s), and a cap below one largest blob
+    /// and its footer accepted (a `Begin` for such a blob would be refused for good).
+    #[test]
+    fn segment_upload_flags_reach_the_listeners() {
+        let defaults = Args::parse_from(["kbf-server"])
+            .listeners()
+            .expect("listeners");
+        assert_eq!(defaults.segments, kbf_front::SegmentsConfig::DEFAULT);
+        assert_eq!(defaults.segments.max_bytes, (1 << 30) + (1 << 20));
+        assert_eq!(defaults.segments.idle, std::time::Duration::from_secs(60));
+        let set = Args::parse_from([
+            "kbf-server",
+            "--segment-upload-max-bytes=2147483648",
+            "--segment-upload-idle-secs=5",
+        ])
+        .listeners()
+        .expect("listeners");
+        assert_eq!(set.segments.max_bytes, 1 << 31);
+        assert_eq!(set.segments.idle, std::time::Duration::from_secs(5));
+        let below = format!(
+            "--segment-upload-max-bytes={}",
+            (1u64 << 30) + (1 << 20) - 1
+        );
+        for refused in [below.as_str(), "--segment-upload-idle-secs=0"] {
+            assert!(
+                Args::try_parse_from(["kbf-server", refused]).is_err(),
+                "{refused} accepted"
+            );
+        }
+    }
 
     /// Catches: a `loopback_only` that knows only wildcards (`is_unspecified`), so one
     /// interface other machines reach (`192.0.2.10`, a documentation address standing

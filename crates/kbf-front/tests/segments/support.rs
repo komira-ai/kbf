@@ -1,0 +1,350 @@
+//! The `Segments` tests' server, store and segment builders.
+
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+
+use bytes::Bytes;
+use futures::StreamExt as _;
+use kbf_front::{
+    Cache, Connections, MAX_MESSAGE_BYTES, MemoryMetaLog, MetaLog as _, SegmentsConfig,
+    SegmentsService,
+};
+use kbf_meta::{BlobAnswer, Retention};
+use kbf_objstore::{
+    ByteRange, Capabilities, KeyPrefix, ListPage, ListToken, MemoryStore, ObjectKey, ObjectStore,
+    ObjectStoreError, PageSize,
+};
+use kbf_proto::worker::segments_client::SegmentsClient;
+use kbf_proto::worker::segments_server::SegmentsServer;
+use kbf_proto::worker::{
+    BeginRequest, BlobLocation, LocateRequest, PutRangeRequest, UploadSegment,
+};
+use kbf_segments::layout::{encode_footer, footer_len};
+use kbf_segments::{Footer, IndexEntry, SegmentWriter};
+use kbf_types::{Digest, DigestFunction};
+use tokio::sync::{Notify, Semaphore};
+use tonic::Status;
+use tonic::transport::server::TcpIncoming;
+use tonic::transport::{Channel, Endpoint, Server};
+
+/// `len` bytes, different for each `seed`.
+pub fn blob(seed: usize, len: usize) -> Vec<u8> {
+    (0..len)
+        .map(|i| ((i * 31 + seed * 7 + seed / 251) % 251) as u8)
+        .collect()
+}
+
+/// One segment as a daemon would send it: its records, its footer, its length.
+#[derive(Clone, Debug)]
+pub struct Seg {
+    pub records: Vec<u8>,
+    pub footer: Vec<u8>,
+    pub length: u64,
+    pub digests: Vec<Digest>,
+}
+
+impl Seg {
+    pub fn upload_segment(&self) -> UploadSegment {
+        UploadSegment {
+            length: self.length,
+            footer: self.footer.clone(),
+        }
+    }
+}
+
+/// A segment of `blobs`, as `SegmentWriter` packs it.
+pub fn seg(blobs: &[Vec<u8>]) -> Seg {
+    seg_with(blobs, |e| e)
+}
+
+/// A segment of `blobs` whose footer entries are changed by `f` (and re-encoded).
+pub fn seg_with(blobs: &[Vec<u8>], f: impl Fn(IndexEntry) -> IndexEntry) -> Seg {
+    let mut writer = SegmentWriter::new(u64::MAX);
+    let digests = blobs
+        .iter()
+        .map(|b| writer.push(b).expect("push"))
+        .collect();
+    let bytes = writer.finish();
+    let parsed = Footer::parse(&bytes, bytes.len() as u64).expect("footer");
+    let records_len = usize::try_from(parsed.records_len()).expect("len");
+    let entries: Vec<IndexEntry> = parsed.entries().iter().copied().map(f).collect();
+    let footer = encode_footer(parsed.records_len(), &entries);
+    Seg {
+        records: bytes[..records_len].to_vec(),
+        length: (records_len + footer.len()) as u64,
+        footer,
+        digests,
+    }
+}
+
+/// A `Begin` segment of exactly `length` bytes: two records whose bytes are never sent.
+pub fn declared_only(length: u64) -> UploadSegment {
+    let records_len = length - footer_len(2);
+    let half = records_len / 2;
+    let entry = |byte: u8, offset: u64, size: u64| IndexEntry {
+        digest: Digest::new(DigestFunction::Sha256, [byte; 32], size),
+        offset,
+        crc32c: 0,
+    };
+    let entries = [entry(1, 0, half), entry(2, half, records_len - half)];
+    UploadSegment {
+        length,
+        footer: encode_footer(records_len, &entries),
+    }
+}
+
+/// Sends every range of `s`'s records, `chunk` bytes each, last first when `reverse`.
+pub async fn put_all(
+    client: &mut SegmentsClient<Channel>,
+    upload: u64,
+    segment: usize,
+    s: &Seg,
+    chunk: usize,
+    reverse: bool,
+) {
+    let mut starts: Vec<usize> = (0..s.records.len()).step_by(chunk).collect();
+    if reverse {
+        starts.reverse();
+    }
+    for start in starts {
+        let end = s.records.len().min(start + chunk);
+        client
+            .put_range(PutRangeRequest {
+                upload,
+                segment: u32::try_from(segment).expect("segment"),
+                offset: start as u64,
+                bytes: s.records[start..end].to_vec(),
+            })
+            .await
+            .expect("put range");
+    }
+}
+
+/// A memory bucket whose PUTs can be held at a gate.
+#[derive(Clone)]
+pub struct GatedStore {
+    inner: Arc<MemoryStore>,
+    holding: Arc<AtomicBool>,
+    gate: Arc<Semaphore>,
+    entered: Arc<Notify>,
+}
+
+impl GatedStore {
+    fn new() -> Self {
+        Self {
+            inner: Arc::new(MemoryStore::new(Capabilities::default())),
+            holding: Arc::new(AtomicBool::new(false)),
+            gate: Arc::new(Semaphore::new(0)),
+            entered: Arc::new(Notify::new()),
+        }
+    }
+
+    /// Holds every later PUT until [`GatedStore::release`].
+    pub fn hold(&self) {
+        self.holding.store(true, Ordering::SeqCst);
+    }
+
+    /// Lets the held PUTs, and every later one, through.
+    pub fn release(&self) {
+        self.holding.store(false, Ordering::SeqCst);
+        self.gate.add_permits(1 << 20);
+    }
+
+    /// Waits until a PUT is at the gate.
+    pub async fn wait_for_put(&self) {
+        tokio::time::timeout(Duration::from_secs(10), self.entered.notified())
+            .await
+            .expect("a PUT reached the gate");
+    }
+}
+
+impl ObjectStore for GatedStore {
+    fn capabilities(&self) -> Capabilities {
+        self.inner.capabilities()
+    }
+
+    async fn put_new(
+        &self,
+        key: &ObjectKey,
+        body: Bytes,
+        retain_until: Option<std::time::SystemTime>,
+    ) -> Result<(), ObjectStoreError> {
+        if self.holding.load(Ordering::SeqCst) {
+            self.entered.notify_one();
+            let _ = self.gate.acquire().await.map(|p| p.forget());
+        }
+        self.inner.put_new(key, body, retain_until).await
+    }
+
+    async fn get_range(
+        &self,
+        key: &ObjectKey,
+        range: ByteRange,
+    ) -> Result<Bytes, ObjectStoreError> {
+        self.inner.get_range(key, range).await
+    }
+
+    async fn delete(&self, key: &ObjectKey) -> Result<(), ObjectStoreError> {
+        self.inner.delete(key).await
+    }
+
+    async fn list(
+        &self,
+        prefix: &KeyPrefix,
+        after: Option<&ListToken>,
+        max_keys: PageSize,
+    ) -> Result<ListPage, ObjectStoreError> {
+        self.inner.list(prefix, after, max_keys).await
+    }
+}
+
+/// A `Segments` server over loopback, its connections tracked.
+pub struct Front {
+    addr: SocketAddr,
+    pub service: SegmentsService<MemoryMetaLog, GatedStore>,
+    pub cache: Arc<Cache<MemoryMetaLog, GatedStore>>,
+    pub store: GatedStore,
+}
+
+impl Front {
+    pub async fn start(config: SegmentsConfig) -> Self {
+        let store = GatedStore::new();
+        let meta = MemoryMetaLog::new(Retention::default());
+        let cache = Arc::new(
+            Cache::open(meta, store.clone(), KeyPrefix::default())
+                .await
+                .expect("cache"),
+        );
+        let connections = Connections::new();
+        let service = SegmentsService::new(Arc::clone(&cache), config, connections.clone());
+        let incoming = TcpIncoming::bind(SocketAddr::from(([127, 0, 0, 1], 0))).expect("bind");
+        let addr = incoming.local_addr().expect("addr");
+        let incoming = incoming.map(move |accepted| accepted.map(|s| connections.track(s)));
+        let server = SegmentsServer::new(service.clone())
+            .max_decoding_message_size(MAX_MESSAGE_BYTES)
+            .max_encoding_message_size(MAX_MESSAGE_BYTES);
+        tokio::spawn(
+            Server::builder()
+                .add_service(server)
+                .serve_with_incoming(incoming),
+        );
+        Self {
+            addr,
+            service,
+            cache,
+            store,
+        }
+    }
+
+    /// A client on a connection of its own.
+    pub async fn client(&self) -> SegmentsClient<Channel> {
+        let channel = Endpoint::from_shared(format!("http://{}", self.addr))
+            .expect("endpoint")
+            .connect()
+            .await
+            .expect("connect");
+        SegmentsClient::new(channel)
+            .max_decoding_message_size(MAX_MESSAGE_BYTES)
+            .max_encoding_message_size(MAX_MESSAGE_BYTES)
+    }
+
+    pub async fn begin(&self, client: &mut SegmentsClient<Channel>, segs: &[Seg]) -> u64 {
+        client
+            .begin(BeginRequest {
+                segments: segs.iter().map(Seg::upload_segment).collect(),
+            })
+            .await
+            .expect("begin")
+            .into_inner()
+            .upload
+    }
+
+    pub async fn put(
+        &self,
+        client: &mut SegmentsClient<Channel>,
+        upload: u64,
+        segment: u32,
+        offset: u64,
+        bytes: &[u8],
+    ) -> Result<(), Status> {
+        client
+            .put_range(PutRangeRequest {
+                upload,
+                segment,
+                offset,
+                bytes: bytes.to_vec(),
+            })
+            .await
+            .map(drop)
+    }
+
+    pub async fn locate(
+        &self,
+        client: &mut SegmentsClient<Channel>,
+        digests: &[Digest],
+    ) -> Vec<BlobLocation> {
+        client
+            .locate(LocateRequest {
+                digests: digests.iter().map(kbf_front::digest_to_proto).collect(),
+            })
+            .await
+            .expect("locate")
+            .into_inner()
+            .locations
+    }
+
+    /// Asserts every one of `digests` is present (or that none is).
+    pub async fn assert_present(&self, digests: &[Digest], present: bool) {
+        let found = self.cache.present(digests).await.expect("present");
+        assert!(
+            found.iter().all(|&p| p == present),
+            "present {found:?}, want {present}"
+        );
+    }
+
+    /// Asserts the object holding each of `digests` has a footer that parses and
+    /// indexes the blob at its location with a CRC-32C its bytes pass.
+    pub async fn assert_stored_records_check(&self, digests: &[Digest]) {
+        for digest in digests {
+            let answer = self
+                .cache
+                .meta()
+                .query({
+                    let d = *digest;
+                    move |s| s.blob(&d)
+                })
+                .await
+                .expect("query");
+            let BlobAnswer::Present(location) = answer else {
+                panic!("{digest} not present: {answer:?}");
+            };
+            let key = self.cache.object_key(location.object).expect("key");
+            let whole = self
+                .store
+                .get_range(&key, ByteRange::new(0, 1 << 40).expect("range"))
+                .await
+                .expect("object");
+            let footer = Footer::parse(&whole, whole.len() as u64).expect("stored footer");
+            let entry = footer.find(digest).expect("indexed");
+            assert_eq!(entry.offset, location.offset);
+            let range = entry.range();
+            let record = &whole[range.start as usize..range.end as usize];
+            entry
+                .verify(record)
+                .expect("the stored CRC and digest hold");
+        }
+    }
+
+    /// Waits until the service holds no upload.
+    pub async fn wait_until_no_uploads(&self) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while self.service.open_uploads() > 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the upload was dropped");
+    }
+}

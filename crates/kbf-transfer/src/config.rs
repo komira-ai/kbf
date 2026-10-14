@@ -7,6 +7,10 @@ use crate::cas::WRITE_CHUNK_BYTES;
 /// Unmeasured: Buildbarn's examples use 10, NativeLink 64.
 pub const DEFAULT_IN_FLIGHT: usize = 64;
 
+/// `Segments` calls in flight at once for one upload or read
+/// (`--segment-upload-streams`): HTTP/2 streams on the engine's one connection.
+pub const DEFAULT_SEGMENT_STREAMS: usize = 16;
+
 /// The engine's limits. Every field is a flag of `kbf-daemon` (crate `kbf-node`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TransferConfig {
@@ -30,6 +34,9 @@ pub struct TransferConfig {
     /// How many times a request is retried after an UNAVAILABLE or a broken
     /// connection (`--transfer-retries`).
     pub retries: u32,
+    /// The most `PutRange` (or `ReadRange`) calls one segment upload (or read) has in
+    /// flight at once (`--segment-upload-streams`).
+    pub segment_streams: usize,
 }
 
 impl Default for TransferConfig {
@@ -42,6 +49,7 @@ impl Default for TransferConfig {
             find_missing_chunk: 1000,
             stream_window_bytes: 8 << 20,
             retries: 3,
+            segment_streams: DEFAULT_SEGMENT_STREAMS,
         }
     }
 }

@@ -147,6 +147,30 @@ group thousands of single-blob calls, it builds the segments itself and uploads 
 one unit. This is kbf-specific and served only on the worker listener, under its
 admission rules ([worker-protocol.md](worker-protocol.md#blobs-on-the-worker-listener)).
 
+**Built (rollout stage 2), direct path only.** The service is
+`kbf.worker.v1.Segments` (`crates/kbf-proto/proto/kbf/worker/v1/segments.proto`,
+served by `crates/kbf-front/src/segments.rs`); the daemon's side is `Spool` and
+`Cas::put_spool` in `kbf-transfer` (`spool.rs`, `segments.rs`), and the native driver
+stores its outputs that way. Where the code differs from the text below:
+
+- The daemon spools every output as its walk stores it, and asks FindMissing for the
+  whole spool afterwards: the walk reads and hashes a file in one pass, so a blob the
+  server already holds costs a local copy, not a send.
+- The daemon splits uploads at 1 GiB + 1 MiB (`SEGMENT_UPLOAD_BYTES`), the smallest
+  `--segment-upload-max-bytes` a server starts with, so every server admits them and
+  the daemon needs no flag for the server's cap.
+- Until `--write-bytes-in-flight` (section 3.3) lands, the memory every upload in
+  progress holds together is bounded by `--segment-upload-max-bytes` itself, and a
+  stored segment's PUT is not retried (section 3.4's retry comes with it).
+- The idle time is `--segment-upload-idle-secs`. `Commit`'s reply lists the digests
+  committed; a failed commit is the call's status.
+- An upload's connection is found by the peer address of the worker listener's
+  tracked connections (`Connections`); a connection's close is seen when the server
+  drops its stream.
+- `Locate` and `ReadRange` are served, and the daemon's coalescing reader
+  (`Scope::read_located`) is built and tested, but cache fills do not use it yet. The
+  container driver still uploads blob by blob.
+
 ### 4.1 Shape
 
 1. The daemon hashes every output file (it already does, to build the `ActionResult`)
@@ -204,7 +228,7 @@ the commit is indexed once; its new record is dead bytes, reclaimed with the seg
   (`pwrite`), and the permit covers only ranges in flight. A commit turns the
   reservation into staged bytes; a drop releases it.
 - An upload belongs to the worker connection that called `Begin`. When it closes, or
-  after `--segment-upload-idle` (default 60 s) with no call, an upload that is still
+  after `--segment-upload-idle-secs` (default 60 s) with no call, an upload that is still
   **receiving** is dropped: its permit and reservation are released and its tier file
   deleted. Nothing points at it. An upload that is **committing** is never dropped: the
   commit runs in its own task, detached from the connection and from the `Commit`
@@ -420,7 +444,7 @@ Estimates from the measured store latency, to be measured on the pilot at each s
 2. **PR 2, segment upload**: the `Segments` service on the worker listener (`Begin`,
    `PutRange`, `Commit`, `Locate`, `ReadRange`) in `kbf-proto` and `kbf-front`, and the
    daemon's spool, split, upload and fallback in `kbf-daemon`/`kbf-outputs`. Flags:
-   `--segment-upload-max-bytes`, `--segment-upload-streams`, `--segment-upload-idle`.
+   `--segment-upload-max-bytes`, `--segment-upload-streams`, `--segment-upload-idle-secs`.
    Direct path only. Downloads through the transfer engine follow it.
 3. **PR 3, tier metadata**: the five commands in `kbf-meta` and `kbf-log`, the staged
    table, `BlobAnswer::Present { staged_on }`, the refusal test, snapshot encoding if

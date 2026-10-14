@@ -13,9 +13,12 @@
 //! admitted call is served as the REAPI listener serves it; the chunking calls answer
 //! UNIMPLEMENTED there as here.
 //!
+//! `kbf.worker.v1.Segments` ([`WorkerSegments`]: segment upload and segment-range
+//! reads, `docs/design/write-path.md`, section 4) is admitted by the same rule.
+//!
 //! `Execution`, `ActionCache` and `Capabilities` answer UNIMPLEMENTED on this listener.
 
-use kbf_front::{ByteStreamService, CasService, MetaLog};
+use kbf_front::{ByteStreamService, CasService, MetaLog, SegmentsService};
 use kbf_objstore::ObjectStore;
 use kbf_proto::google::bytestream::byte_stream_server::ByteStream;
 use kbf_proto::google::bytestream::{
@@ -28,6 +31,11 @@ use kbf_proto::reapi::{
     GetChunkMappingRequest, GetTreeRequest, RegisterChunkMappingRequest,
     RegisterChunkMappingResponse, SpliceBlobRequest, SpliceBlobResponse, SplitBlobRequest,
     SplitBlobResponse,
+};
+use kbf_proto::worker::segments_server::Segments;
+use kbf_proto::worker::{
+    BeginRequest, BeginResponse, CommitRequest, CommitResponse, LocateRequest, LocateResponse,
+    PutRangeRequest, PutRangeResponse, ReadRangeRequest, ReadRangeResponse,
 };
 use tonic::{Request, Response, Status, Streaming};
 
@@ -178,5 +186,66 @@ where
     ) -> Result<Response<RegisterChunkMappingResponse>, Status> {
         admit(&self.peers, &request, "RegisterChunkMapping").await?;
         self.inner.register_chunk_mapping(request).await
+    }
+}
+
+/// `kbf.worker.v1.Segments` for daemons, each call admitted as the module docs say.
+#[derive(Debug)]
+pub struct WorkerSegments<M, O> {
+    inner: SegmentsService<M, O>,
+    peers: Peers,
+}
+
+impl<M, O> WorkerSegments<M, O> {
+    /// The service over `inner`, admitting calls as `peers` (the worker listener's).
+    pub const fn new(inner: SegmentsService<M, O>, peers: Peers) -> Self {
+        Self { inner, peers }
+    }
+}
+
+#[tonic::async_trait]
+impl<M, O> Segments for WorkerSegments<M, O>
+where
+    M: MetaLog,
+    O: ObjectStore + 'static,
+{
+    async fn begin(
+        &self,
+        request: Request<BeginRequest>,
+    ) -> Result<Response<BeginResponse>, Status> {
+        admit(&self.peers, &request, "Begin").await?;
+        self.inner.begin(request).await
+    }
+
+    async fn put_range(
+        &self,
+        request: Request<PutRangeRequest>,
+    ) -> Result<Response<PutRangeResponse>, Status> {
+        admit(&self.peers, &request, "PutRange").await?;
+        self.inner.put_range(request).await
+    }
+
+    async fn commit(
+        &self,
+        request: Request<CommitRequest>,
+    ) -> Result<Response<CommitResponse>, Status> {
+        admit(&self.peers, &request, "Commit").await?;
+        self.inner.commit(request).await
+    }
+
+    async fn locate(
+        &self,
+        request: Request<LocateRequest>,
+    ) -> Result<Response<LocateResponse>, Status> {
+        admit(&self.peers, &request, "Locate").await?;
+        self.inner.locate(request).await
+    }
+
+    async fn read_range(
+        &self,
+        request: Request<ReadRangeRequest>,
+    ) -> Result<Response<ReadRangeResponse>, Status> {
+        admit(&self.peers, &request, "ReadRange").await?;
+        self.inner.read_range(request).await
     }
 }

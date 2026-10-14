@@ -1,5 +1,5 @@
-//! The daemons' blob path on the worker listener (`kbf_server::blobs`): `ByteStream`
-//! and `ContentAddressableStorage` over mutual TLS, each call admitted by the
+//! The daemons' blob path on the worker listener (`kbf_server::blobs`): `ByteStream`,
+//! `ContentAddressableStorage` and `kbf.worker.v1.Segments` over mutual TLS, each call admitted by the
 //! node-certificate rules and the deny list of the worker stream, and no other REAPI
 //! service served there.
 
@@ -22,6 +22,10 @@ use kbf_proto::reapi::{
     FindMissingBlobsRequest, GetActionResultRequest, GetCapabilitiesRequest,
     GetChunkMappingRequest, GetTreeRequest, RegisterChunkMappingRequest, SpliceBlobRequest,
     SplitBlobRequest, batch_update_blobs_request,
+};
+use kbf_proto::worker::segments_client::SegmentsClient;
+use kbf_proto::worker::{
+    BeginRequest, CommitRequest, LocateRequest, PutRangeRequest, ReadRangeRequest, UploadSegment,
 };
 use kbf_server::{Args, bind_server};
 use prost::Message;
@@ -333,6 +337,61 @@ async fn codes(channel: &Channel, blob: &[u8]) -> Vec<(&'static str, Code)> {
             code(tree(channel, &digest_of(&directory)).await.map(drop)),
         ),
     ]
+    .into_iter()
+    .chain(segment_codes(channel, blob).await)
+    .collect()
+}
+
+/// The `Segments` calls on `channel`: an upload of `blob` (Begin, PutRange, Commit),
+/// then Locate and a ReadRange of it, each answered with its status code.
+async fn segment_codes(channel: &Channel, blob: &[u8]) -> [(&'static str, Code); 5] {
+    let code = |r: Result<(), Status>| r.map_or_else(|s| s.code(), |()| Code::Ok);
+    let mut client = SegmentsClient::new(channel.clone());
+    let mut writer = kbf_segments::SegmentWriter::new(u64::MAX);
+    let digest = writer.push(blob).expect("push");
+    let segment = writer.finish();
+    let begin = client
+        .begin(BeginRequest {
+            segments: vec![UploadSegment {
+                length: segment.len() as u64,
+                footer: segment[blob.len()..].to_vec(),
+            }],
+        })
+        .await;
+    let upload = begin.as_ref().map_or(0, |r| r.get_ref().upload);
+    let put = client
+        .put_range(PutRangeRequest {
+            upload,
+            segment: 0,
+            offset: 0,
+            bytes: blob.to_vec(),
+        })
+        .await;
+    let commit = client.commit(CommitRequest { upload }).await;
+    let located = client
+        .locate(LocateRequest {
+            digests: vec![kbf_front::digest_to_proto(&digest)],
+        })
+        .await;
+    let at = located
+        .as_ref()
+        .ok()
+        .and_then(|r| r.get_ref().locations.first().cloned())
+        .unwrap_or_default();
+    let read = client
+        .read_range(ReadRangeRequest {
+            object: Some(at.object.unwrap_or_default()),
+            offset: at.offset,
+            length: digest.size_bytes,
+        })
+        .await;
+    [
+        ("Segments.Begin", code(begin.map(drop))),
+        ("Segments.PutRange", code(put.map(drop))),
+        ("Segments.Commit", code(commit.map(drop))),
+        ("Segments.Locate", code(located.map(drop))),
+        ("Segments.ReadRange", code(read.map(drop))),
+    ]
 }
 
 /// The four chunking calls on `channel`, each answered with its status code.
@@ -630,4 +689,43 @@ async fn the_worker_listener_serves_no_other_reapi_service() {
         let code = result.expect_err(call).code();
         assert_eq!(code, Code::Unimplemented, "{call}");
     }
+}
+
+/// Catches the worker listener's connections left untracked (an upload would belong
+/// to no connection: any connection could write into it, and a dead daemon's upload
+/// would hold its memory until the idle time): an upload begun on one connection is
+/// NOT_FOUND on another of the same node, and found on its own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_segment_upload_belongs_to_the_connection_that_began_it() {
+    let pki = Pki::new("segments-owner");
+    let (_, worker) = pki.serve(&[]);
+    let node = pki.node(&["node-1"], 51);
+    let mut own = SegmentsClient::new(pki.channel(worker, Some(&node.identity)).await);
+    let mut other = SegmentsClient::new(pki.channel(worker, Some(&node.identity)).await);
+    let mut writer = kbf_segments::SegmentWriter::new(u64::MAX);
+    writer.push(b"an output").expect("push");
+    let segment = writer.finish();
+    let upload = own
+        .begin(BeginRequest {
+            segments: vec![UploadSegment {
+                length: segment.len() as u64,
+                footer: segment[b"an output".len()..].to_vec(),
+            }],
+        })
+        .await
+        .expect("begin")
+        .into_inner()
+        .upload;
+    let elsewhere = other.commit(CommitRequest { upload }).await;
+    assert_eq!(
+        elsewhere.expect_err("another connection").code(),
+        Code::NotFound
+    );
+    // On its own connection the upload is there: nothing was sent, so the commit is
+    // refused for the missing record, not for the upload.
+    let here = own.commit(CommitRequest { upload }).await;
+    assert_eq!(
+        here.expect_err("nothing sent").code(),
+        Code::FailedPrecondition
+    );
 }

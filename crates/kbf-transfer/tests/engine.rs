@@ -15,6 +15,10 @@ mod memory;
 mod proxy;
 #[path = "engine/reads.rs"]
 mod reads;
+#[path = "engine/segments.rs"]
+mod segments;
+#[path = "engine/spool.rs"]
+mod spool;
 #[path = "engine/uploads.rs"]
 mod uploads;
 

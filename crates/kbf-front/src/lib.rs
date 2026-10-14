@@ -51,6 +51,7 @@ mod meta_log;
 pub mod metrics;
 mod recorder;
 mod request_metadata;
+mod segments;
 mod wire;
 
 use std::sync::Arc;
@@ -83,6 +84,10 @@ pub use crate::request_metadata::{
     CallMetadata, HEADER as REQUEST_METADATA_HEADER, Invalid, InvocationId, MAX_HEADER_BYTES,
     MAX_ID_BYTES, MAX_TEXT_BYTES, Read, ReadRequestMetadata, RequestMetadataLayer, Text,
     call_metadata,
+};
+pub use crate::segments::{
+    Connection, Connections, MAX_RANGE_BYTES, MAX_UPLOAD_RECORDS, MIN_SEGMENT_UPLOAD_BYTES,
+    SegmentsConfig, SegmentsService, Tracked,
 };
 
 /// The most blob data one `BatchUpdateBlobs` or `BatchReadBlobs` call may carry,
