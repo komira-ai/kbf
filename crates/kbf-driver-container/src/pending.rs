@@ -111,11 +111,17 @@ impl Pending {
         cas: &impl Cas,
         upper: &Arc<OwnedFd>,
         spools: &Path,
+        hash_threads: usize,
     ) -> Result<(), TreeError> {
         let digests: Vec<Digest> = self.blobs.iter().map(|(d, _)| d.clone()).collect();
         let missing: HashSet<String> = cas.missing(&digests).await.iter().map(label).collect();
         let dir = spools.to_owned();
-        let spool = Arc::new(blocking(spools, move || Spool::create(&dir)).await?);
+        let spool = Arc::new(
+            blocking(spools, move || {
+                Spool::create(&dir).map(|s| s.hash_threads(hash_threads))
+            })
+            .await?,
+        );
         self.copy_missing(&missing, &*spool, upper, cas.in_flight())
             .await?;
         Ok(cas.put_spool(spool).await?)

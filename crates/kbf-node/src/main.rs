@@ -75,6 +75,10 @@ struct Cli {
     scratch: Option<PathBuf>,
     #[command(flatten)]
     outputs: OutputLimits,
+    /// The most threads that hash one action's output files at once (container driver);
+    /// 0 is the CPUs the daemon may use, at most 32.
+    #[arg(long, default_value_t = 0)]
+    output_hash_threads: usize,
     /// How long one lease's whole output upload (its output files, stdout and stderr)
     /// may take, in seconds, before the lease fails with a reason naming the upload and
     /// the time it ran (container and native drivers). Without it, a store that stops
@@ -596,6 +600,7 @@ mod container {
             max_entries: cli.outputs.max_entries,
             max_bytes: cli.outputs.max_bytes,
             max_stdio_bytes: cli.outputs.max_stdio_bytes,
+            hash_threads: cli.output_hash_threads,
         };
         config.upload_deadline = super::upload_deadline(cli);
         config.limits = limits(cli);

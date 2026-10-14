@@ -18,9 +18,10 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
+use tokio::sync::Semaphore;
+
 use futures::StreamExt as _;
 use kbf_proto::reapi::Digest;
-use kbf_segments::Crc32c;
 use kbf_types::{DigestFunction, LeaseId};
 use sha2::{Digest as _, Sha256};
 
@@ -33,8 +34,6 @@ pub struct Spooled {
     pub digest: kbf_types::Digest,
     /// Where its bytes start in the spool file.
     pub offset: u64,
-    /// The CRC-32C of its bytes.
-    pub crc32c: u32,
 }
 
 /// Blobs written once each into one unlinked local file.
@@ -42,6 +41,8 @@ pub struct Spooled {
 pub struct Spool {
     file: Arc<File>,
     state: Mutex<State>,
+    /// One permit per thread that may hash a chunk at once ([`Spool::hash_threads`]).
+    hashers: Semaphore,
 }
 
 #[derive(Debug, Default)]
@@ -75,7 +76,16 @@ impl Spool {
         Ok(Self {
             file: Arc::new(file),
             state: Mutex::new(State::default()),
+            hashers: Semaphore::new(default_hash_threads()),
         })
+    }
+
+    /// At most `threads` (at least one) chunks are hashed at once, however many blobs
+    /// are being put. The default is [`default_hash_threads`].
+    #[must_use]
+    pub fn hash_threads(mut self, threads: usize) -> Self {
+        self.hashers = Semaphore::new(threads.max(1));
+        self
     }
 
     fn lock(&self) -> MutexGuard<'_, State> {
@@ -149,16 +159,19 @@ impl Spool {
         self.lock().taken.remove(digest);
     }
 
-    /// Writes the chunks of the blob `parsed` names at `offset`, and returns their
-    /// CRC-32C once they hash to it.
+    /// Writes the chunks of the blob `parsed` names at `offset`, once they hash to it.
+    ///
+    /// Each chunk is hashed and written in one blocking task, so the copies in flight
+    /// hash on as many threads, not one after another on the task that polls them.
+    /// There is no CRC-32C: the server computes its own and ignores the daemon's.
     async fn write_chunks(
         &self,
         parsed: kbf_types::Digest,
         offset: u64,
         blob: &str,
         mut chunks: Chunks,
-    ) -> Result<u32, CasError> {
-        let (mut hasher, mut crc, mut at) = (Sha256::new(), Crc32c::new(), 0u64);
+    ) -> Result<(), CasError> {
+        let (mut hasher, mut at) = (Sha256::new(), 0u64);
         while let Some(chunk) = chunks.next().await {
             let chunk = chunk.map_err(|e| CasError::Read(blob.to_owned(), e.to_string()))?;
             let len = chunk.len() as u64;
@@ -169,11 +182,20 @@ impl Spool {
                     format!("more than {size} bytes"),
                 ));
             }
-            hasher.update(&chunk);
-            crc.update(&chunk);
-            self.write_at(chunk, offset + at)
+            // Never closed, so acquiring fails only if it were.
+            let _permit = self
+                .hashers
+                .acquire()
                 .await
-                .map_err(|e| CasError::Read(blob.to_owned(), format!("spool: {e}")))?;
+                .map_err(|e| CasError::Read(blob.to_owned(), e.to_string()))?;
+            let file = Arc::clone(&self.file);
+            let at_chunk = offset + at;
+            hasher = blocking(move || {
+                hasher.update(&chunk);
+                file.write_all_at(&chunk, at_chunk).map(|()| hasher)
+            })
+            .await
+            .map_err(|e| CasError::Read(blob.to_owned(), format!("spool: {e}")))?;
             at += len;
         }
         let actual = kbf_types::Digest::new(DigestFunction::Sha256, hasher.finalize().into(), at);
@@ -183,7 +205,7 @@ impl Spool {
                 label(&to_proto(&actual)),
             ));
         }
-        Ok(crc.finish())
+        Ok(())
     }
 }
 
@@ -213,16 +235,11 @@ impl Cas for Spool {
         let Some(offset) = self.reserve(digest) else {
             return Ok(proto);
         };
-        let crc32c = kbf_segments::crc32c(&bytes);
         if let Err(e) = self.write_at(bytes, offset).await {
             self.release(&digest);
             return Err(CasError::Read(label(&proto), format!("spool: {e}")));
         }
-        self.record(Spooled {
-            digest,
-            offset,
-            crc32c,
-        });
+        self.record(Spooled { digest, offset });
         Ok(proto)
     }
 
@@ -236,11 +253,10 @@ impl Cas for Spool {
             return Ok(digest);
         };
         match self.write_chunks(parsed, offset, &blob, chunks).await {
-            Ok(crc32c) => {
+            Ok(()) => {
                 self.record(Spooled {
                     digest: parsed,
                     offset,
-                    crc32c,
                 });
                 Ok(digest)
             }
@@ -250,6 +266,16 @@ impl Cas for Spool {
             }
         }
     }
+}
+
+/// The CPUs this process may use (its affinity mask and cgroup quota, as
+/// `available_parallelism` reads them), at most 32: how many chunks a spool hashes at
+/// once unless told otherwise.
+#[must_use]
+pub fn default_hash_threads() -> usize {
+    std::thread::available_parallelism()
+        .map_or(1, usize::from)
+        .min(32)
 }
 
 /// `digest` as kbf's digest, if it is a SHA-256 digest with a size.
