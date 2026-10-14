@@ -18,6 +18,17 @@
 //! What it cannot see: a shell name or flag built at run time (`concat!`, `format!`
 //! pieces, a value read from a file), and a `#[cfg(test)]` on an expression, whose
 //! code it counts as production (the safe side).
+//!
+//! The same walk serves the `[test-interpreters]` scan ([`scan`]): test code (all of
+//! `crates/*/tests/`, and the test code of `crates/*/src/` as above) that names an
+//! interpreter in a string literal ([`named_interpreter`]): a program literal such as
+//! `"perl"` or `"/bin/sh"`, or a script whose `#!` line runs one. A literal names the
+//! program whatever it is passed to (`Command::new`, an argv array, a helper), so a
+//! test that only uses the name as data is found too; its row says so. String, byte
+//! string and C string literals are read. It cannot see a name built at run time
+//! (`concat!`, `format!` pieces), a script read from a file, a name inside a longer
+//! literal (`"sh -c x"`, `"/bin/sh x"`), or code outside `src/` and `tests/`
+//! (examples, build scripts).
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -104,6 +115,63 @@ fn trait_item_attrs(item: &TraitItem) -> &[Attribute] {
     }
 }
 
+/// An interpreter program a string literal names, as its base name: the whole
+/// literal a program (bare, or an absolute path) that [`super::is_interpreter`] knows
+/// or `osascript`, or a script whose `#!` line runs one. `None` otherwise.
+pub fn named_interpreter(value: &str) -> Option<&str> {
+    let spawned = |name: &str| super::is_interpreter(name) || name == "osascript";
+    let name = value.rsplit('/').next().unwrap_or(value);
+    if (!value.contains('/') || value.starts_with('/')) && spawned(name) {
+        return Some(name);
+    }
+    super::shebang_interpreter(value.as_bytes()).filter(|i| spawned(i))
+}
+
+/// The name of an item, for the list of items a finding names: a function, const,
+/// static, module, trait, macro call, or the type an `impl` block is for.
+fn item_name(item: &Item) -> Option<String> {
+    match item {
+        Item::Fn(i) => Some(i.sig.ident.to_string()),
+        Item::Const(i) => Some(i.ident.to_string()),
+        Item::Static(i) => Some(i.ident.to_string()),
+        Item::Mod(i) => Some(i.ident.to_string()),
+        Item::Trait(i) => Some(i.ident.to_string()),
+        Item::Impl(i) => match &*i.self_ty {
+            syn::Type::Path(p) => p.path.segments.last().map(|s| s.ident.to_string()),
+            _ => None,
+        },
+        Item::Macro(i) => match &i.ident {
+            Some(name) => Some(name.to_string()),
+            None => i.mac.path.segments.last().map(|s| format!("{}!", s.ident)),
+        },
+        _ => None,
+    }
+}
+
+fn impl_item_name(item: &ImplItem) -> Option<String> {
+    match item {
+        ImplItem::Fn(i) => Some(i.sig.ident.to_string()),
+        ImplItem::Const(i) => Some(i.ident.to_string()),
+        _ => None,
+    }
+}
+
+fn trait_item_name(item: &TraitItem) -> Option<String> {
+    match item {
+        TraitItem::Fn(i) => Some(i.sig.ident.to_string()),
+        TraitItem::Const(i) => Some(i.ident.to_string()),
+        _ => None,
+    }
+}
+
+/// An interpreter a literal names, where it was found, and whether the code around
+/// it was test code.
+struct Named {
+    interpreter: String,
+    item: String,
+    test: bool,
+}
+
 /// A `mod name;` declaration: the files it may name, and whether it is test code.
 struct Decl {
     candidates: Vec<String>,
@@ -126,10 +194,26 @@ struct Walk {
     shell: bool,
     dash_c: bool,
     decls: Vec<Decl>,
+    /// The named items entered so far (functions, modules, `impl` types).
+    items: Vec<String>,
+    /// Every literal that names an interpreter, test code or not.
+    names: Vec<Named>,
 }
 
 impl Walk {
     fn literal(&mut self, value: &str) {
+        if let Some(interpreter) = named_interpreter(value) {
+            let item = if self.items.is_empty() {
+                "(file)".to_owned()
+            } else {
+                self.items.join("::")
+            };
+            self.names.push(Named {
+                interpreter: interpreter.to_owned(),
+                item,
+                test: self.in_test,
+            });
+        }
         if self.in_test {
             return;
         }
@@ -142,8 +226,8 @@ impl Walk {
             match tree {
                 TokenTree::Group(g) => self.tokens(g.stream()),
                 TokenTree::Literal(l) => {
-                    if let Lit::Str(s) = Lit::new(l) {
-                        self.literal(&s.value());
+                    if let Some(text) = lit_text(&Lit::new(l)) {
+                        self.literal(&text);
                     }
                 }
                 TokenTree::Ident(_) | TokenTree::Punct(_) => {}
@@ -151,12 +235,18 @@ impl Walk {
         }
     }
 
-    /// Runs `f` with test code marked when `attrs` say the node is test-only.
-    fn under(&mut self, attrs: &[Attribute], f: impl FnOnce(&mut Self)) {
+    /// Runs `f` inside the item `name` (when it has one), with test code marked when
+    /// `attrs` say the node is test-only.
+    fn under(&mut self, name: Option<String>, attrs: &[Attribute], f: impl FnOnce(&mut Self)) {
         let was = self.in_test;
+        let named = name.is_some();
+        self.items.extend(name);
         self.in_test |= test_only(attrs);
         f(self);
         self.in_test = was;
+        if named {
+            self.items.pop();
+        }
     }
 
     fn base(&self) -> String {
@@ -172,23 +262,31 @@ impl<'ast> Visit<'ast> for Walk {
     fn visit_attribute(&mut self, _: &'ast Attribute) {}
 
     fn visit_item(&mut self, item: &'ast Item) {
-        self.under(item_attrs(item), |w| visit::visit_item(w, item));
+        self.under(item_name(item), item_attrs(item), |w| {
+            visit::visit_item(w, item);
+        });
     }
 
     fn visit_impl_item(&mut self, item: &'ast ImplItem) {
-        self.under(impl_item_attrs(item), |w| visit::visit_impl_item(w, item));
+        self.under(impl_item_name(item), impl_item_attrs(item), |w| {
+            visit::visit_impl_item(w, item);
+        });
     }
 
     fn visit_trait_item(&mut self, item: &'ast TraitItem) {
-        self.under(trait_item_attrs(item), |w| visit::visit_trait_item(w, item));
+        self.under(trait_item_name(item), trait_item_attrs(item), |w| {
+            visit::visit_trait_item(w, item);
+        });
     }
 
     fn visit_local(&mut self, local: &'ast Local) {
-        self.under(&local.attrs, |w| visit::visit_local(w, local));
+        self.under(None, &local.attrs, |w| visit::visit_local(w, local));
     }
 
-    fn visit_lit_str(&mut self, s: &'ast syn::LitStr) {
-        self.literal(&s.value());
+    fn visit_lit(&mut self, lit: &'ast Lit) {
+        if let Some(text) = lit_text(lit) {
+            self.literal(&text);
+        }
     }
 
     fn visit_macro(&mut self, m: &'ast syn::Macro) {
@@ -234,6 +332,17 @@ impl<'ast> Visit<'ast> for Walk {
     }
 }
 
+/// The text of a string, byte string or C string literal (a byte string that is not
+/// UTF-8 read lossily), or `None` for any other literal.
+fn lit_text(lit: &Lit) -> Option<String> {
+    match lit {
+        Lit::Str(s) => Some(s.value()),
+        Lit::ByteStr(s) => Some(String::from_utf8_lossy(&s.value()).into_owned()),
+        Lit::CStr(s) => Some(s.value().to_string_lossy().into_owned()),
+        _ => None,
+    }
+}
+
 /// `a/b/../c` as `a/c`, and `./` dropped.
 fn normalize(path: &str) -> String {
     let mut parts: Vec<&str> = Vec::new();
@@ -266,17 +375,54 @@ fn child_dir(path: &str) -> (String, String) {
 
 /// Whether `path` is a Rust file under a crate's `src/`: `crates/<crate>/src/...rs`.
 pub fn is_crate_src(path: &str) -> bool {
+    in_crate_dir(path, "src")
+}
+
+/// Whether `path` is a Rust file under a crate's `tests/`: `crates/<crate>/tests/...rs`.
+/// All of it is test code.
+pub fn is_crate_test(path: &str) -> bool {
+    in_crate_dir(path, "tests")
+}
+
+fn in_crate_dir(path: &str, dir: &str) -> bool {
     let mut parts = path.split('/');
     parts.next() == Some("crates")
         && parts.next().is_some_and(|c| !c.is_empty())
-        && parts.next() == Some("src")
+        && parts.next() == Some(dir)
         && path.ends_with(".rs")
+}
+
+/// A test-code file that names interpreters: its path, and per interpreter (sorted)
+/// the items that name it (sorted, each once; `(file)` for a literal outside any).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TestNames {
+    pub path: String,
+    pub names: BTreeMap<String, BTreeSet<String>>,
+}
+
+/// What [`scan`] found.
+#[derive(Debug, Default)]
+pub struct Scan {
+    /// The production files under `crates/*/src/` that name a shell and a `-c` flag,
+    /// sorted by path.
+    pub shell_c: Vec<String>,
+    /// The files whose test code names an interpreter, sorted by path.
+    pub test_names: Vec<TestNames>,
+    /// One per file that does not parse.
+    pub problems: Vec<String>,
 }
 
 /// For `(path, text)` of every Rust file under the crates' `src/`, the production
 /// files that name a shell and a `-c` flag, sorted by path; and one problem per file
 /// that does not parse.
 pub fn shell_c_files(files: &[(String, String)]) -> (Vec<String>, Vec<String>) {
+    let scan = scan(files);
+    (scan.shell_c, scan.problems)
+}
+
+/// Both scans over `(path, text)` of every Rust file under the crates' `src/` and
+/// `tests/` ([`is_crate_src`], [`is_crate_test`]).
+pub fn scan(files: &[(String, String)]) -> Scan {
     let mut problems = Vec::new();
     let mut walks: BTreeMap<&str, Walk> = BTreeMap::new();
     for (path, text) in files {
@@ -290,7 +436,7 @@ pub fn shell_c_files(files: &[(String, String)]) -> (Vec<String>, Vec<String>) {
             }
         };
         let (child, file_dir) = child_dir(path);
-        let file_test = test_only(&parsed.attrs);
+        let file_test = is_crate_test(path) || test_only(&parsed.attrs);
         let mut walk = Walk {
             child_dir: child,
             file_dir,
@@ -300,6 +446,8 @@ pub fn shell_c_files(files: &[(String, String)]) -> (Vec<String>, Vec<String>) {
             shell: false,
             dash_c: false,
             decls: Vec::new(),
+            items: Vec::new(),
+            names: Vec::new(),
         };
         walk.visit_file(&parsed);
         walks.insert(path, walk);
@@ -331,10 +479,31 @@ pub fn shell_c_files(files: &[(String, String)]) -> (Vec<String>, Vec<String>) {
             break;
         }
     }
-    let found = walks
+    let shell_c = walks
         .iter()
         .filter(|(p, w)| !test.contains(*p) && w.shell && w.dash_c)
         .map(|(p, _)| (*p).to_owned())
         .collect();
-    (found, problems)
+    let mut test_names = Vec::new();
+    for (path, walk) in &walks {
+        let file_test = test.contains(path);
+        let mut names: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for n in walk.names.iter().filter(|n| file_test || n.test) {
+            names
+                .entry(n.interpreter.clone())
+                .or_default()
+                .insert(n.item.clone());
+        }
+        if !names.is_empty() {
+            test_names.push(TestNames {
+                path: (*path).to_owned(),
+                names,
+            });
+        }
+    }
+    Scan {
+        shell_c,
+        test_names,
+        problems,
+    }
 }

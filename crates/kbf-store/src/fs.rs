@@ -3,9 +3,17 @@
 //! The store never touches the disk except through [`Fs`] and [`FsFile`], so a test can
 //! swap in [`FaultFs`](crate::FaultFs), which fails or crashes at any chosen operation
 //! and then shows what a power cut would have left on disk. [`StdFs`] is the real one.
+//!
+//! A file is opened in one of two modes. [`Fs::create`] and [`Fs::open_append`] open it
+//! for [`FsFile::append`] (the store's log and state files); [`Fs::create_positioned`]
+//! opens it for [`FsFile::write_at`] (the write tier's block files, written by several
+//! writers into disjoint ranges). A call of the other mode fails with
+//! [`io::ErrorKind::InvalidInput`]: on Linux a positioned write to a file opened for
+//! appending appends instead, at the end, whatever the offset.
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
+use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 
 /// One directory the store owns. Names are plain file names, never paths.
@@ -31,12 +39,35 @@ pub trait Fs {
     /// The I/O error that stopped the read.
     fn read(&self, name: &str) -> io::Result<Vec<u8>>;
 
+    /// The length of `name` in bytes.
+    ///
+    /// # Errors
+    ///
+    /// The I/O error that stopped the lookup, including `name` missing.
+    fn file_len(&self, name: &str) -> io::Result<u64>;
+
+    /// `len` bytes of `name` from `offset`.
+    ///
+    /// # Errors
+    ///
+    /// The I/O error that stopped the read; [`io::ErrorKind::UnexpectedEof`] if the
+    /// file ends before `offset + len`.
+    fn read_at(&self, name: &str, offset: u64, len: usize) -> io::Result<Vec<u8>>;
+
     /// Creates `name`, which must not exist, and opens it for appending.
     ///
     /// # Errors
     ///
     /// The I/O error that stopped the create, including `name` existing.
     fn create(&self, name: &str) -> io::Result<Self::File>;
+
+    /// Creates `name`, which must not exist, and opens it for positioned writes
+    /// ([`FsFile::write_at`]); [`FsFile::append`] on it fails.
+    ///
+    /// # Errors
+    ///
+    /// The I/O error that stopped the create, including `name` existing.
+    fn create_positioned(&self, name: &str) -> io::Result<Self::File>;
 
     /// Opens the existing `name` for appending.
     ///
@@ -67,14 +98,25 @@ pub trait Fs {
     fn sync_dir(&self) -> io::Result<()>;
 }
 
-/// A file opened for appending.
+/// A file opened for appending or for positioned writes (see the module docs).
 pub trait FsFile {
     /// Appends all of `bytes`.
     ///
     /// # Errors
     ///
-    /// The I/O error that stopped the write.
+    /// The I/O error that stopped the write; [`io::ErrorKind::InvalidInput`] on a file
+    /// opened for positioned writes.
     fn append(&mut self, bytes: &[u8]) -> io::Result<()>;
+
+    /// Writes all of `bytes` at `offset`, extending the file (with zeros over any gap)
+    /// if it ends before them. It takes `&self`: positioned writes share no cursor, so
+    /// several writers may write disjoint ranges of one file at once.
+    ///
+    /// # Errors
+    ///
+    /// The I/O error that stopped the write; [`io::ErrorKind::InvalidInput`] on a file
+    /// opened for appending.
+    fn write_at(&self, offset: u64, bytes: &[u8]) -> io::Result<()>;
 
     /// Cuts the file to `len` bytes.
     ///
@@ -88,7 +130,7 @@ pub trait FsFile {
     /// # Errors
     ///
     /// The I/O error the sync returned. After one, what reached the disk is unknown.
-    fn sync(&mut self) -> io::Result<()>;
+    fn sync(&self) -> io::Result<()>;
 }
 
 /// The real filesystem: one directory on the local disk.
@@ -138,17 +180,35 @@ impl Fs for StdFs {
         std::fs::read(self.path(name))
     }
 
+    fn file_len(&self, name: &str) -> io::Result<u64> {
+        Ok(std::fs::metadata(self.path(name))?.len())
+    }
+
+    fn read_at(&self, name: &str, offset: u64, len: usize) -> io::Result<Vec<u8>> {
+        let mut buf = vec![0; len];
+        File::open(self.path(name))?.read_exact_at(&mut buf, offset)?;
+        Ok(buf)
+    }
+
     fn create(&self, name: &str) -> io::Result<StdFile> {
         let file = OpenOptions::new()
             .append(true)
             .create_new(true)
             .open(self.path(name))?;
-        Ok(StdFile(file))
+        Ok(StdFile::new(file, Mode::Append))
+    }
+
+    fn create_positioned(&self, name: &str) -> io::Result<StdFile> {
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(self.path(name))?;
+        Ok(StdFile::new(file, Mode::Positioned))
     }
 
     fn open_append(&self, name: &str) -> io::Result<StdFile> {
         let file = OpenOptions::new().append(true).open(self.path(name))?;
-        Ok(StdFile(file))
+        Ok(StdFile::new(file, Mode::Append))
     }
 
     fn rename(&self, from: &str, to: &str) -> io::Result<()> {
@@ -164,21 +224,58 @@ impl Fs for StdFs {
     }
 }
 
+/// How a file was opened: which of [`FsFile::append`] and [`FsFile::write_at`] it
+/// takes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Mode {
+    Append,
+    Positioned,
+}
+
+impl Mode {
+    /// Fails unless the file was opened in mode `want`.
+    pub(crate) fn require(self, want: Self) -> io::Result<()> {
+        if self == want {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("a file opened for {self:?} writes takes no {want:?} write"),
+            ))
+        }
+    }
+}
+
 /// A file of [`StdFs`]. Every sync goes through the handle that wrote, so a write-back
 /// error on it is reported to this handle.
 #[derive(Debug)]
-pub struct StdFile(File);
+pub struct StdFile {
+    file: File,
+    mode: Mode,
+}
+
+impl StdFile {
+    const fn new(file: File, mode: Mode) -> Self {
+        Self { file, mode }
+    }
+}
 
 impl FsFile for StdFile {
     fn append(&mut self, bytes: &[u8]) -> io::Result<()> {
-        self.0.write_all(bytes)
+        self.mode.require(Mode::Append)?;
+        self.file.write_all(bytes)
+    }
+
+    fn write_at(&self, offset: u64, bytes: &[u8]) -> io::Result<()> {
+        self.mode.require(Mode::Positioned)?;
+        self.file.write_all_at(bytes, offset)
     }
 
     fn truncate(&mut self, len: u64) -> io::Result<()> {
-        self.0.set_len(len)
+        self.file.set_len(len)
     }
 
-    fn sync(&mut self) -> io::Result<()> {
-        self.0.sync_data()
+    fn sync(&self) -> io::Result<()> {
+        self.file.sync_data()
     }
 }

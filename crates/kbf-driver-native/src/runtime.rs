@@ -9,7 +9,7 @@ use std::process::{ExitStatus, Stdio};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
 use std::time::{Duration, SystemTime};
 
-use kbf_daemon::cas::{Cas, CasError};
+use kbf_daemon::cas::{Cas, CasError, Spool};
 use kbf_daemon::tree::{
     TreeError, check_relative, fetch_message, materialize, output_paths, real_dirs,
 };
@@ -172,6 +172,7 @@ impl<C: Cas> NativeRuntime<C> {
         let mut runs = std::fs::DirBuilder::new();
         std::os::unix::fs::DirBuilderExt::mode(runs.recursive(true), 0o700)
             .create(config.scratch.join(crate::record::RUNS))?;
+        make_spool_dir(&config.scratch.join(SPOOL))?;
         let runtime = Self {
             simctl,
             xcodes: RwLock::new(config.xcodes.clone()),
@@ -564,7 +565,13 @@ impl<C: Cas> NativeRuntime<C> {
         clock.execution_completed_timestamp = now();
 
         clock.output_upload_start_timestamp = now();
-        let store = CasStore(&cas);
+        // The outputs are gathered in a spool, then stored as whole segments
+        // (`docs/design/write-path.md`, section 4): a tree of thousands of files is a
+        // few large uploads and one commit, not one upload per file.
+        let spools = self.config.scratch.join(SPOOL);
+        let spool = Spool::create(&spools).map_err(failed(&spools))?;
+        let spool = Arc::new(spool);
+        let store = CasStore(&*spool);
         let mut result = ActionResult {
             exit_code,
             ..ActionResult::default()
@@ -589,7 +596,9 @@ impl<C: Cas> NativeRuntime<C> {
                 let stored = kbf_outputs::store_file(&store, &dir.join(name), max).await;
                 *slot = Some(stored.map_err(outputs_error)?);
             }
-            Ok(())
+            cas.put_spool(Arc::clone(&spool))
+                .await
+                .map_err(|e| RuntimeError::Failed(format!("storing the outputs: {e}")))
         };
         upload_within(self.config.upload_deadline, upload).await?;
         clock.output_upload_completed_timestamp = now();
@@ -1089,6 +1098,25 @@ pub(crate) fn outputs_error(error: OutputsError) -> RuntimeError {
     }
 }
 
+/// The daemon's own directory under the scratch root for output spools
+/// ([`kbf_daemon::cas::Spool`]), apart from the lease directories: an action that
+/// takes write permission from the scratch root (or its lease directory) does not stop
+/// its outputs from being stored.
+pub const SPOOL: &str = "spool";
+
+/// Makes the spool directory (mode 0700) and removes any spool file a killed daemon
+/// left in it between creating and unlinking it.
+fn make_spool_dir(dir: &Path) -> std::io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    std::os::unix::fs::DirBuilderExt::mode(builder.recursive(true), 0o700).create(dir)?;
+    for entry in std::fs::read_dir(dir)?.flatten() {
+        if let Err(why) = std::fs::remove_file(entry.path()) {
+            tracing::warn!(path = %entry.path().display(), "a spool file left behind stays: {why}");
+        }
+    }
+    Ok(())
+}
+
 /// An I/O failure at `path` as the lease reports it: the farm's.
 pub(crate) fn failed(path: &Path) -> impl FnOnce(std::io::Error) -> RuntimeError + '_ {
     move |error| RuntimeError::Failed(format!("{}: {error}", path.display()))
@@ -1097,6 +1125,38 @@ pub(crate) fn failed(path: &Path) -> impl FnOnce(std::io::Error) -> RuntimeError
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Catches spool files a killed daemon left filling the disk, and a start refused
+    /// over an entry it cannot remove: a leftover file goes, a directory that is not a
+    /// spool stays (logged), and the spool directory is the daemon's alone.
+    #[test]
+    fn the_spool_directory_is_made_and_its_leftovers_removed() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = std::env::current_exe()
+            .expect("test binary")
+            .parent()
+            .expect("deps")
+            .join(format!("kbf-driver-native-spool-{}", std::process::id()));
+        let spool = dir.join(SPOOL);
+        std::fs::create_dir_all(spool.join("not-a-spool")).expect("mkdir");
+        std::fs::write(spool.join(".kbf-spool-1-0"), b"left").expect("write");
+        make_spool_dir(&spool).expect("spool directory");
+        let mut left: Vec<String> = std::fs::read_dir(&spool)
+            .expect("list")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(left, ["not-a-spool"]);
+        std::fs::remove_dir_all(&dir).expect("clean up");
+        // Made fresh, it is the daemon's alone.
+        make_spool_dir(&spool).expect("spool directory");
+        let fresh = std::fs::metadata(&spool)
+            .expect("stat")
+            .permissions()
+            .mode();
+        std::fs::remove_dir_all(&dir).expect("clean up");
+        assert_eq!(fresh & 0o777, 0o700);
+    }
 
     /// Catches an action's timeout being ignored, a zero timeout meaning "no time at
     /// all", and a negative one wrapping to centuries.
@@ -1331,7 +1391,7 @@ mod tests {
         config.xcodes = BTreeMap::from([("1A1".to_owned(), PathBuf::from("/x1"))]);
         let rt = NativeRuntime::with_remover(config, Arc::new(NoCas), &kbf_outputs::remove_tree)
             .expect("started");
-        rt.warm_xcrun(&xcrun, Duration::from_secs(5))
+        rt.warm_xcrun(&xcrun, xcode::ANSWER_WITHIN)
             .expect("a thread")
             .join()
             .expect("warmed");
@@ -1410,7 +1470,7 @@ mod tests {
         // Before the daemon asks for a warm-up, a survey starts none.
         let (_, none) = rt.apply_and_warm(&[at("/A", ready), at("/B", licence)]);
         assert!(none.is_none(), "warmed before warm_xcrun");
-        rt.warm_xcrun(&xcrun, Duration::from_secs(5))
+        rt.warm_xcrun(&xcrun, xcode::ANSWER_WITHIN)
             .expect("a thread")
             .join()
             .expect("warmed");

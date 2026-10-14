@@ -11,6 +11,7 @@ use kbf_proto::google::bytestream::byte_stream_client::ByteStreamClient;
 use kbf_proto::google::bytestream::{ReadRequest, ReadResponse, WriteRequest};
 use kbf_proto::reapi::content_addressable_storage_client::ContentAddressableStorageClient;
 use kbf_proto::reapi::{Digest, FindMissingBlobsRequest};
+use kbf_proto::worker::segments_client::SegmentsClient;
 use tonic::transport::Channel;
 use tonic::{Code, Status, Streaming};
 
@@ -27,6 +28,7 @@ pub const MAX_MESSAGE_BYTES: usize = (4 << 20) + (1 << 20);
 pub(crate) struct Wire {
     bytestream: ByteStreamClient<Channel>,
     cas: ContentAddressableStorageClient<Channel>,
+    segments: SegmentsClient<Channel>,
     uploads: AtomicU64,
     chunk_bytes: usize,
 }
@@ -36,11 +38,17 @@ impl Wire {
         Self {
             bytestream: ByteStreamClient::new(channel.clone())
                 .max_decoding_message_size(MAX_MESSAGE_BYTES),
+            segments: crate::segments::client(channel.clone()),
             cas: ContentAddressableStorageClient::new(channel)
                 .max_decoding_message_size(MAX_MESSAGE_BYTES),
             uploads: AtomicU64::new(0),
             chunk_bytes,
         }
+    }
+
+    /// The `Segments` client over the engine's connection.
+    pub fn segments(&self) -> SegmentsClient<Channel> {
+        self.segments.clone()
     }
 
     /// The blob's bytes from `offset` on, as the server streams them.

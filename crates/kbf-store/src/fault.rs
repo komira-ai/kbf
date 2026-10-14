@@ -10,12 +10,18 @@
 //! cut at that offset. [`FaultFs::crash_reordered`] also lets any chosen subset of
 //! the creates, renames and removals since the last directory sync reach the disk, in
 //! any combination: POSIX orders none of them before that sync returns.
+//!
+//! A positioned write ([`FsFile::write_at`]) past a file's durable bytes is torn like an
+//! append: the crash keeps a prefix of what lies past them. One that lands on durable
+//! bytes before a sync makes the whole unsynced change count as a rewrite, which a
+//! crash drops entirely (as it drops a truncation): the model never invents bytes, and
+//! keeps fewer of the unsynced ones than a real disk might.
 
 use std::collections::BTreeMap;
 use std::io;
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use crate::fs::{Fs, FsFile};
+use crate::fs::{Fs, FsFile, Mode};
 
 /// What a planned fault does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -283,23 +289,8 @@ impl FaultFs {
     }
 }
 
-impl Fs for FaultFs {
-    type File = FaultFile;
-
-    fn list(&self) -> io::Result<Vec<String>> {
-        let mut s = self.lock();
-        s.begin()?;
-        Ok(s.names.keys().cloned().collect())
-    }
-
-    fn read(&self, name: &str) -> io::Result<Vec<u8>> {
-        let mut s = self.lock();
-        s.begin()?;
-        let i = s.inode_of(name)?;
-        Ok(s.inodes[&i].data.clone())
-    }
-
-    fn create(&self, name: &str) -> io::Result<FaultFile> {
+impl FaultFs {
+    fn create_mode(&self, name: &str, mode: Mode) -> io::Result<FaultFile> {
         let mut s = self.lock();
         s.begin()?;
         if s.names.contains_key(name) {
@@ -316,7 +307,50 @@ impl Fs for FaultFs {
         Ok(FaultFile {
             state: Arc::clone(&self.state),
             inode,
+            mode,
         })
+    }
+}
+
+impl Fs for FaultFs {
+    type File = FaultFile;
+
+    fn list(&self) -> io::Result<Vec<String>> {
+        let mut s = self.lock();
+        s.begin()?;
+        Ok(s.names.keys().cloned().collect())
+    }
+
+    fn read(&self, name: &str) -> io::Result<Vec<u8>> {
+        let mut s = self.lock();
+        s.begin()?;
+        let i = s.inode_of(name)?;
+        Ok(s.inodes[&i].data.clone())
+    }
+
+    fn file_len(&self, name: &str) -> io::Result<u64> {
+        let mut s = self.lock();
+        s.begin()?;
+        let i = s.inode_of(name)?;
+        Ok(s.inodes[&i].data.len() as u64)
+    }
+
+    fn read_at(&self, name: &str, offset: u64, len: usize) -> io::Result<Vec<u8>> {
+        let mut s = self.lock();
+        s.begin()?;
+        let data = &s.inodes[&s.inode_of(name)?].data;
+        let start = usize::try_from(offset).unwrap_or(usize::MAX);
+        data.get(start..start.saturating_add(len))
+            .map(<[u8]>::to_vec)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, name.to_owned()))
+    }
+
+    fn create(&self, name: &str) -> io::Result<FaultFile> {
+        self.create_mode(name, Mode::Append)
+    }
+
+    fn create_positioned(&self, name: &str) -> io::Result<FaultFile> {
+        self.create_mode(name, Mode::Positioned)
     }
 
     fn open_append(&self, name: &str) -> io::Result<FaultFile> {
@@ -326,6 +360,7 @@ impl Fs for FaultFs {
         Ok(FaultFile {
             state: Arc::clone(&self.state),
             inode,
+            mode: Mode::Append,
         })
     }
 
@@ -367,10 +402,13 @@ impl Fs for FaultFs {
 pub struct FaultFile {
     state: Arc<Mutex<State>>,
     inode: u64,
+    mode: Mode,
 }
 
 impl FaultFile {
-    fn with<T>(&mut self, f: impl FnOnce(&mut Inode) -> T) -> io::Result<T> {
+    /// Runs `f` on the file as one operation. A write refused for the file's mode is
+    /// checked before, and is not an operation: it changes nothing and counts nothing.
+    fn with<T>(&self, f: impl FnOnce(&mut Inode) -> T) -> io::Result<T> {
         let mut s = self
             .state
             .lock()
@@ -383,7 +421,20 @@ impl FaultFile {
 
 impl FsFile for FaultFile {
     fn append(&mut self, bytes: &[u8]) -> io::Result<()> {
+        self.mode.require(Mode::Append)?;
         self.with(|i| i.data.extend_from_slice(bytes))
+    }
+
+    fn write_at(&self, offset: u64, bytes: &[u8]) -> io::Result<()> {
+        let start = usize::try_from(offset).map_err(io::Error::other)?;
+        let end = start + bytes.len();
+        self.mode.require(Mode::Positioned)?;
+        self.with(|i| {
+            if i.data.len() < end {
+                i.data.resize(end, 0);
+            }
+            i.data[start..end].copy_from_slice(bytes);
+        })
     }
 
     fn truncate(&mut self, len: u64) -> io::Result<()> {
@@ -391,7 +442,7 @@ impl FsFile for FaultFile {
         self.with(|i| i.data.resize(len, 0))
     }
 
-    fn sync(&mut self) -> io::Result<()> {
+    fn sync(&self) -> io::Result<()> {
         self.with(|i| i.durable.clone_from(&i.data))
     }
 }
@@ -510,6 +561,76 @@ mod tests {
         fs.sync_dir().unwrap();
         assert_eq!(fs.pending_names(), 0);
         assert_eq!(fs.crash(0).contents("a").unwrap(), b"new");
+    }
+
+    /// Catches: a fake whose positioned writes land at the wrong offset or leave no
+    /// zeros over a gap, whose power cut keeps more of them than was synced (a tier
+    /// that acknowledges before its sync would pass every crash test), or keeps a
+    /// rewrite of synced bytes it should drop; a ranged read that returns short or
+    /// past the end instead of failing; and a file of one mode taking the other
+    /// mode's writes, or counting the refusal as an operation.
+    #[test]
+    fn positioned_writes_tear_like_appends_and_reads_are_ranged() {
+        let fs = FaultFs::new();
+        let f = fs.create_positioned("b").unwrap();
+        f.write_at(4, b"wxyz").unwrap();
+        assert_eq!(fs.contents("b").unwrap(), b"\0\0\0\0wxyz");
+        assert_eq!(fs.unsynced(), 8);
+        assert_eq!(fs.crash_reordered(2, 1).contents("b").unwrap(), b"\0\0");
+        f.sync().unwrap();
+        fs.sync_dir().unwrap();
+        f.write_at(8, b"tail").unwrap();
+        f.write_at(2, b"AB").unwrap();
+        assert_eq!(fs.contents("b").unwrap(), b"\0\0ABwxyztail");
+        assert_eq!(
+            fs.crash(9).contents("b").unwrap(),
+            b"\0\0\0\0wxyz",
+            "a rewrite of synced bytes is dropped whole"
+        );
+        f.sync().unwrap();
+        f.write_at(12, b"!!").unwrap();
+        assert_eq!(fs.crash(1).contents("b").unwrap(), b"\0\0ABwxyztail!");
+
+        assert_eq!(fs.file_len("b").unwrap(), 14);
+        assert_eq!(fs.read_at("b", 4, 4).unwrap(), b"wxyz");
+        assert_eq!(fs.read_at("b", 14, 0).unwrap(), b"");
+        for (offset, len) in [(12, 3), (15, 0), (u64::MAX, 1)] {
+            assert_eq!(
+                fs.read_at("b", offset, len).unwrap_err().kind(),
+                io::ErrorKind::UnexpectedEof,
+                "{offset} {len}"
+            );
+        }
+        assert_eq!(
+            fs.file_len("q").unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+        assert_eq!(
+            fs.read_at("q", 0, 0).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+
+        let ops = fs.ops();
+        let mut appending = fs.open_append("b").unwrap();
+        let ops = ops + 1;
+        assert_eq!(
+            appending.write_at(0, b"x").unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        let mut g = fs.create_positioned("c").unwrap();
+        let ops = ops + 1;
+        assert_eq!(
+            g.append(b"x").unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(fs.ops(), ops, "a refused mode is not an operation");
+        appending.append(b"+").unwrap();
+        g.truncate(0).unwrap();
+        assert_eq!(fs.contents("b").unwrap(), b"\0\0ABwxyztail!!+");
+        assert_eq!(
+            fs.create_positioned("c").unwrap_err().kind(),
+            io::ErrorKind::AlreadyExists
+        );
     }
 
     /// Catches: name errors that a store relies on going unreported (a create over an

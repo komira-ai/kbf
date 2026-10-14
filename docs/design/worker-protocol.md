@@ -245,6 +245,13 @@ daemon CAS client calls only `ByteStream`; FindMissingBlobs and the batch calls 
 there for the transfer engine planned in
 [worker-cache.md](worker-cache.md#4-the-shared-transfer-engine).
 
+The worker listener also serves `kbf.worker.v1.Segments` (`Begin`, `PutRange`,
+`Commit`, `Locate`, `ReadRange`), each call admitted by the same rule: a daemon uploads
+an action's outputs as whole segments with one commit, and reads blobs as ranges of
+the objects holding them ([write-path.md](write-path.md#4-segment-upload-the-daemon-worker-listener)).
+An upload belongs to the connection that began it: a call naming it on another
+connection is `NOT_FOUND`.
+
 Not checked: that the node is registered or connected, or that it reads only the
 inputs of leases it holds. A certificate the deny list does not refuse can read any
 blob whose digest it names, and write blobs.

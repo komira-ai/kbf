@@ -108,6 +108,43 @@ fn std_fs_reports_errors() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// Catches: a `StdFs` block file opened for appending (on Linux a positioned write to
+/// it lands at the end, whatever its offset), a positioned write that does not fill a
+/// gap with zeros, a ranged read that returns short past the end, a wrong length, and
+/// a file of one mode taking the other mode's writes.
+#[test]
+fn std_fs_positioned_writes_and_ranged_reads() {
+    use kbf_store::{Fs, FsFile};
+    let dir = scratch("positioned");
+    let fs = StdFs::new(&dir).unwrap();
+    let f = fs.create_positioned("b").unwrap();
+    f.write_at(4, b"wxyz").unwrap();
+    f.write_at(0, b"ab").unwrap();
+    f.sync().unwrap();
+    assert_eq!(fs.read("b").unwrap(), b"ab\0\0wxyz");
+    assert_eq!(fs.file_len("b").unwrap(), 8);
+    assert_eq!(fs.read_at("b", 3, 3).unwrap(), b"\0wx");
+    assert_eq!(
+        fs.read_at("b", 6, 3).unwrap_err().kind(),
+        std::io::ErrorKind::UnexpectedEof
+    );
+    assert!(fs.read_at("q", 0, 1).is_err());
+    assert!(fs.file_len("q").is_err());
+    assert!(fs.create_positioned("b").is_err());
+    let mut f = f;
+    assert_eq!(
+        f.append(b"x").unwrap_err().kind(),
+        std::io::ErrorKind::InvalidInput
+    );
+    let a = fs.open_append("b").unwrap();
+    assert_eq!(
+        a.write_at(0, b"x").unwrap_err().kind(),
+        std::io::ErrorKind::InvalidInput
+    );
+    assert_eq!(fs.read("b").unwrap(), b"ab\0\0wxyz");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 /// Catches: a directory listing that drops or mangles a file name that is not UTF-8
 /// (the store would open as if the file were not there); it must fail instead. Linux
 /// only: other filesystems refuse such names.
