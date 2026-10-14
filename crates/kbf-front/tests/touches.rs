@@ -23,12 +23,13 @@ fn days(n: u32) -> FarmTime {
     FarmTime::from_millis(0).saturating_add(DAY.saturating_mul(n))
 }
 
-/// Which commands [`HeldLog`] can hold.
+/// Which calls [`HeldLog`] can hold: commits of a kind, or queries.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Kind {
     Touch,
     Collect,
     Other,
+    Query,
 }
 
 fn kind(command: &Command) -> Kind {
@@ -41,7 +42,8 @@ fn kind(command: &Command) -> Kind {
 
 /// A [`MemoryMetaLog`] that keeps every command it is asked to commit (when it is
 /// asked, before it applies), can fail the next touch commits, and can hold commits of
-/// one kind until released: a commit stalled in its sync.
+/// one kind until released (a commit stalled in its sync), or hold every query before
+/// it reads the state (a read paused inside its query).
 #[derive(Debug)]
 struct HeldLog {
     inner: MemoryMetaLog,
@@ -93,6 +95,15 @@ impl HeldLog {
             .collect()
     }
 
+    /// Signals `entered` and waits for `release_all` if calls of `k` are held.
+    async fn wait_if_held(&self, k: Kind) {
+        let held = *self.held.lock().unwrap_or_else(PoisonError::into_inner) == Some(k);
+        if held {
+            self.entered.notify_one();
+            self.release.acquire().await.expect("open").forget();
+        }
+    }
+
     /// How many `Collect` commits have been asked for so far.
     fn collects(&self) -> usize {
         self.asked
@@ -139,11 +150,7 @@ impl MetaLog for HeldLog {
                 };
             }
         }
-        let held = *self.held.lock().unwrap_or_else(PoisonError::into_inner) == Some(k);
-        if held {
-            self.entered.notify_one();
-            self.release.acquire().await.expect("open").forget();
-        }
+        self.wait_if_held(k).await;
         self.inner.commit(command).await
     }
 
@@ -152,6 +159,7 @@ impl MetaLog for HeldLog {
         F: FnOnce(&MetaState) -> R + Send,
         R: Send,
     {
+        self.wait_if_held(Kind::Query).await;
         self.inner.query(f).await
     }
 }
@@ -428,6 +436,48 @@ async fn a_read_during_a_collection_never_reports_what_it_removes() {
 
     assert_eq!(collected, 1, "the blob had expired");
     assert_eq!(answer, [blob], "reported present, then collected");
+}
+
+/// Catches (mutant "the collection flushes before it takes the exclusive gate"): a read
+/// that is inside its query when a collection starts. Under the mutant the collection
+/// flushes first (nothing is pending yet), then waits for the gate; the read reports the
+/// expired blob present and records its touch after that flush, and the `Collect` that
+/// follows removes the blob. The read is held inside its query, the collection is
+/// started and given time to run, then the read is released. The read must report the
+/// blob present and the collection must remove nothing: its flush must commit the touch.
+#[tokio::test]
+async fn a_collection_waits_for_a_read_inside_its_query() {
+    let cache = Arc::new(
+        cache()
+            .await
+            .with_touches(config(Duration::from_secs(3600), 100)),
+    );
+    let log = cache.meta();
+    let blob = store(&cache, "read while a collection starts").await;
+    // Untouched since day 0, the blob has expired by day 9.
+    cache.tick(days(9)).await.expect("tick");
+    log.hold(Kind::Query);
+    let reading = tokio::spawn({
+        let cache = Arc::clone(&cache);
+        async move { cache.find_missing(&[blob]).await }
+    });
+    within(log.entered.notified()).await;
+    let collecting = tokio::spawn({
+        let cache = Arc::clone(&cache);
+        async move { cache.collect().await.map(|c| c.blobs.len()) }
+    });
+    // Long enough for a collection that does not wait for the read to flush and stall.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    log.release_all();
+    let answer = within(reading).await.expect("join").expect("find");
+    let collected = within(collecting).await.expect("join").expect("collect");
+
+    assert!(answer.is_empty(), "the blob was present when read");
+    assert_eq!(collected, 0, "a blob reported present was collected");
+    assert!(
+        cache.find_missing(&[blob]).await.expect("find").is_empty(),
+        "the reported blob is gone"
+    );
 }
 
 /// Catches (mutant "the flusher commits without holding the gate"): a collection that
