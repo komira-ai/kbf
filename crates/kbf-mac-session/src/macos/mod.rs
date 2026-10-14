@@ -2,7 +2,7 @@
 //! started in a lease user's GUI session ([`gui`]), and `main`.
 //!
 //! Nothing here is reached by the Linux test jobs; the `native-macos` CI job runs the
-//! helper for real as root (`tools/ci/mac-session-tests.sh`).
+//! helper for real as root (`tests/as_root.rs`).
 //!
 //! # Signing
 //!

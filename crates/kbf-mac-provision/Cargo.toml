@@ -8,9 +8,9 @@ repository.workspace = true
 publish.workspace = true
 
 # Checks a Mac node's host settings and worker profile against a profile file
-# (docs/design/mac-node-provisioning.md, sections 2, 3 and 5): the Rust port of
-# tools/mac-provision/kbf-mac-provision. It builds everywhere, so every item is tested
-# against a fake Mac on every CI runner; it reads a real Mac only on macOS.
+# (docs/design/mac-node-provisioning.md, sections 2, 3 and 5); README.md lists every
+# item. It builds everywhere, so every item is tested against a fake Mac on every CI
+# runner; it reads a real Mac only on macOS, where tests/as_root.rs runs it as root.
 [[bin]]
 name = "kbf-mac-provision"
 path = "src/main.rs"

@@ -2,8 +2,10 @@
 //!
 //! - [`act`]: `kbf-act STEP [; STEP]...`, a fixed set of verbs (exit, sleep, echo,
 //!   append, env, pwd, id, kill-self, spawn-child, run, setsid, alloc, upper,
-//!   rename, symlink, chmod, wait-for, mkdir, cat, mtime, pgid) that a test puts in an
-//!   action's or a child's argv where it would have written `sh -c`.
+//!   rename, symlink, chmod, wait-for, mkdir, cat, mtime, pgid, leads, write-lines,
+//!   copy, remove, mkfifo, truncate, zeros, ignore-signal, test, points-to, holds,
+//!   inode-links) that a test puts in an action's or a child's argv where it would
+//!   have written `sh -c`.
 //! - [`fake`]: the same binary run through a link named `xcrun`, `xcodebuild` or
 //!   `sandbox-exec` answers as that tool, from a rules file the test writes.
 //! - [`m2`]: the verbs of `kbf-m2-act`, the program every action of the M2 sample

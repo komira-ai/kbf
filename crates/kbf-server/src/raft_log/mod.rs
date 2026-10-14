@@ -18,7 +18,9 @@
 //!   sync run on the calling thread under the log's lock, as the single-process log
 //!   applies under its lock: one commit at a time, no group commit yet.
 //! - **Queries** read this server's applied state. A single voter is always its own
-//!   leader, so that is the committed state.
+//!   leader, so that is the committed state. The state has its own lock, held by a
+//!   commit only while it applies, never across the sync: a query does not wait for a
+//!   commit's disk write.
 //! - **Leadership** ([`MetaLog::leadership`]): the log id and the term the open
 //!   elected this server in. With no peer, nothing can take the leadership away, so
 //!   the term is the same for the life of the process, and every start's is greater
@@ -49,7 +51,7 @@ use std::fmt::{self, Display};
 use std::io::{self, Read};
 use std::num::NonZeroU64;
 use std::path::Path;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, Weak};
 use std::time::Duration;
 
 use kbf_front::{Leadership, MetaLog, MetaLogError};
@@ -153,6 +155,8 @@ pub struct RaftMetaLog<F: Fs = StdFs> {
 
 struct Shared<F: Fs> {
     host: Mutex<RaftHost<F>>,
+    /// The machine's applied state ([`MetaMachine::state`]), read without `host`.
+    state: Arc<RwLock<MetaState>>,
     log_id: FarmLogId,
     /// The term the open elected this server in.
     term: u64,
@@ -265,10 +269,12 @@ where
                 expected,
             });
         }
+        let base = host.machine().meta().now();
         let shared = Arc::new(Shared {
-            base: host.machine().meta().now(),
+            base,
             bootstraps: host.machine().bootstraps(),
             term: host.core().hard_state().term.0,
+            state: host.machine().state(),
             host: Mutex::new(host),
             log_id,
             prefix,
@@ -388,7 +394,7 @@ where
         Q: FnOnce(&MetaState) -> R + Send,
         R: Send,
     {
-        Ok(f(self.shared.lock().machine().meta()))
+        Ok(f(&machine::read(&self.shared.state)))
     }
 
     fn leadership(&self) -> Option<Leadership> {
@@ -423,7 +429,7 @@ impl<F: Fs> Shared<F> {
 
     fn tick(&self) -> Result<FarmTime, MetaLogError> {
         self.execute(Command::Tick(self.now()))?;
-        Ok(self.lock().machine().meta().now())
+        Ok(machine::read(&self.state).now())
     }
 }
 

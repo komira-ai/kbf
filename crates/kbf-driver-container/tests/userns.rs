@@ -35,7 +35,7 @@ async fn the_overlay_is_the_containers_while_it_runs_and_the_daemons_after() {
     let mut spec = Spec::new(&image(), "unused");
     spec.outputs = vec!["out/f".to_owned()];
     let result = fake
-        .run(1, &spec, r#"echo f > "$UPPER/out/f""#)
+        .run(1, &spec, &["write-lines", "$UPPER/out/f", "f"])
         .await
         .expect("ran");
     assert_eq!(result.exit_code, 0);
@@ -74,7 +74,7 @@ async fn a_failed_hand_over_fails_the_lease_and_leaves_nothing() {
     let spec = Spec::new(&image(), "unused");
 
     fake.knob("chown-fails", "1:1");
-    let outcome = fake.run(1, &spec, "exit 0").await;
+    let outcome = fake.run(1, &spec, &["exit", "0"]).await;
     assert!(
         matches!(outcome, Err(RuntimeError::Failed(ref why))
             if why.starts_with("podman unshare chown: ") && why.contains("chown refused")),
@@ -84,7 +84,7 @@ async fn a_failed_hand_over_fails_the_lease_and_leaves_nothing() {
     fake.assert_clean(1);
 
     fake.knob("chown-fails", "0:0");
-    let outcome = fake.run(2, &spec, "exit 0").await;
+    let outcome = fake.run(2, &spec, &["exit", "0"]).await;
     assert!(
         matches!(outcome, Err(RuntimeError::Failed(ref why)) if why.contains("chown refused")),
         "{outcome:?}"
@@ -104,7 +104,7 @@ async fn a_timed_out_lease_is_not_handed_back() {
     let fake = Fake::new("chown-timeout");
     let mut spec = Spec::new(&image(), "unused");
     spec.timeout = Some(std::time::Duration::from_millis(200));
-    let outcome = fake.run(1, &spec, "sleep 30").await;
+    let outcome = fake.run(1, &spec, &["sleep", "30"]).await;
     assert!(
         matches!(outcome, Err(RuntimeError::TimedOut { .. })),
         "{outcome:?}"

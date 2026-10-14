@@ -4,7 +4,7 @@
 //! `expect_probe` may repeat; every other key appears at most once, every key of
 //! [`REQUIRED`] exactly once, and a key outside [`REQUIRED`], [`OPTIONAL`] and the
 //! repeated three is refused. A value may hold only letters, digits, spaces and
-//! `._:/=@+,-`, and each key's value has a shape of its own (tools/mac-provision/README.md
+//! `._:/=@+,-`, and each key's value has a shape of its own (this crate's README.md
 //! lists them).
 
 use std::collections::{BTreeMap, BTreeSet};

@@ -7,16 +7,16 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
-# `kbf-cell`, the M1 integration harness: the M1 test itself (`kbf-cell m1`), test
-# certificates, the test-only daemon (the daemon library with its local runtime) and
-# the build-summary check; see the library docs.
+# `kbf-cell`, the M1 and M2 integration harnesses: the M1 and M2 tests themselves
+# (`kbf-cell m1`, `kbf-cell m2`), test certificates, the test-only daemon (the daemon
+# library with its local runtime) and the build-summary check; see the library docs.
 [[bin]]
 name = "kbf-cell"
 path = "src/bin/kbf-cell.rs"
 
 # `kbf-m2-act`, the program every action of the M2 sample project runs (`m2/`): the
-# M2 image has no shell. Its verbs are kbf-testkit's (the standard library and rustix
-# only), so CI can still link it statically.
+# M2 image has no shell. Its verbs are kbf-testkit's (the standard library, rustix and
+# two plain libc calls), so CI can still link it statically.
 [[bin]]
 name = "kbf-m2-act"
 path = "src/bin/kbf-m2-act.rs"
@@ -38,6 +38,8 @@ thiserror.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal"] }
 tonic.workspace = true
 tracing-subscriber.workspace = true
+# `kbf-cell m2` sets the runner up with `cargo xtask podman-tests`'s own function.
+xtask.workspace = true
 
 [dev-dependencies]
 hex.workspace = true
@@ -48,7 +50,6 @@ proc-macro2.workspace = true
 prost.workspace = true
 saphyr-parser.workspace = true
 sha2.workspace = true
-xtask.workspace = true
 syn.workspace = true
 tokio = { workspace = true, features = ["time"] }
 

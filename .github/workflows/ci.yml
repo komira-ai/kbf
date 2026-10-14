@@ -365,10 +365,19 @@ jobs:
       # started after the binary was renamed over, which macOS finds by its path.
       - run: cargo test -p kbf-daemon --lib --test suspend --test keeper --locked
       # The root helper for per-lease users: its unit tests, then the helper itself run
-      # as root (passwordless sudo) with real users, launchd, the sweep and the caller
-      # check by code signature (docs/design/fleet-updates-security.md S4.2, S4.3).
+      # as root (passwordless sudo) with real users, launchd, libproc, the sweep, the
+      # leak scan and the caller check by code signature, signed as `cargo xtask
+      # sign-darwin` signs it (crates/kbf-mac-session/tests/as_root.rs;
+      # docs/design/fleet-updates-security.md S4.2, S4.3, S10).
       - run: cargo test -p kbf-mac-session --locked
-      - run: bash tools/ci/mac-session-tests.sh
+      - run: cargo xtask sudo-test -p kbf-mac-session --test as_root -- --test-threads=1 --nocapture
+      # The native driver's lease-user pool as root, with throwaway users from uid 690:
+      # actions as pool users through `launchctl asuser`, the kill by uid, the keeper's,
+      # parallel leases (crates/kbf-driver-native/tests/slots.rs); then the clean of a
+      # slot between two leases, its deadline, the user made again and the quarantine
+      # (tests/slot_clean.rs). One test at a time: they make users at free uids.
+      - run: cargo xtask sudo-test -p kbf-driver-native --test slots -- --test-threads=1 --nocapture
+      - run: cargo xtask sudo-test -p kbf-driver-native --test slot_clean -- --test-threads=1 --nocapture
       # The per-binary entitlement allow list (tools/ci/darwin-entitlements.txt): the
       # kbf-vmm stub signed by `cargo xtask sign-darwin` with the virtualization
       # entitlement, kbf-daemon with none, both accepted by `darwin-asset`, and every
@@ -380,10 +389,10 @@ jobs:
       # its refusal to run as root (crates/kbf-guest/tests/as_root.rs).
       - run: cargo test -p kbf-guest --locked
       - run: cargo xtask sudo-test -p kbf-guest --test as_root
-      # kbf-mac-provision on this VM, as root, running the daemon built above: what a
-      # hosted VM can prove (the script's header lists what it applies, asserts and
+      # kbf-mac-provision on this VM, as root: what a hosted VM can prove (the header of
+      # crates/kbf-mac-provision/tests/as_root.rs lists what it applies, asserts and
       # only reads). Last, because it changes this runner's settings.
-      - run: sudo sh tools/mac-provision/test/hosted-macos.sh target/debug/kbf-daemon
+      - run: cargo xtask sudo-test -p kbf-mac-provision --test as_root -- --test-threads=1 --nocapture
       - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         if: ${{ github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true' }}
         with:
@@ -392,25 +401,6 @@ jobs:
             ~/.cargo/git
             target
           key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
-
-  # kbf-mac-provision (tools/mac-provision) against a fake Mac: shellcheck, the test
-  # suite under dash, its line and branch coverage (100%, from bash's trace), and the
-  # planted mutants, each of which must turn its tests red. native-macos runs the same
-  # script on a real macOS VM.
-  mac-provision:
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - run: shellcheck --version
-      - run: shellcheck -S warning -s sh tools/mac-provision/kbf-mac-provision tools/mac-provision/test/fakecmd tools/mac-provision/test/*.sh
-      - run: sh tools/mac-provision/test/run.sh
-      - run: sh tools/mac-provision/test/coverage.sh
-      - run: sh tools/mac-provision/test/mutants.sh
 
   # The container driver against real rootless Podman, each test binary inside a
   # Delegate=yes system unit (crates/xtask/src/podman_tests.rs; the T4 spike found both
@@ -448,8 +438,9 @@ jobs:
   # The M2 test: pinned buck2 builds the sample project in crates/kbf-it/m2 remote-only
   # through kbf-server to kbf-daemon --driver container, every action in a rootless
   # Podman container of distroless base-debian12 pinned by its amd64 manifest digest
-  # (crates/kbf-it/m2/run.sh says what is checked). x86_64 only: the image digest is
-  # the amd64 one.
+  # (`kbf-cell m2`, crates/kbf-it/src/m2.rs, says what is checked; it sets the runner
+  # up as `cargo xtask podman-tests` does). x86_64 only: the image digest is the amd64
+  # one.
   m2-container:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -474,11 +465,11 @@ jobs:
           restore-keys: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
       - run: cargo build -p kbf-server -p kbf-node -p kbf-it --bin kbf-server --bin kbf-daemon --bin kbf-cell --locked
       # The image's glibc is Debian 12's, older than the runner's, so the helper every
-      # action runs is linked statically (run.sh refuses a dynamic one).
+      # action runs is linked statically (kbf-cell m2 refuses a dynamic one).
       - run: cargo rustc -p kbf-it --bin kbf-m2-act --locked -- -C target-feature=+crt-static
       - name: Fetch buck2 (pinned version, checked by SHA-256)
         run: cargo xtask fetch --url "https://github.com/facebook/buck2/releases/download/$BUCK2_VERSION/buck2-x86_64-unknown-linux-gnu.zst" --sha256 "$BUCK2_SHA256" --out "$RUNNER_TEMP/tools/buck2" --extract zst
-      - run: bash tools/ci/m2-container.sh "$RUNNER_TEMP/tools/buck2" "$RUNNER_TEMP/m2"
+      - run: target/debug/kbf-cell m2 --bin-dir target/debug --project crates/kbf-it/m2/buck2 --work "$RUNNER_TEMP/m2" --buck2 "$RUNNER_TEMP/tools/buck2"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: ${{ !cancelled() }}
         with:

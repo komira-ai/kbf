@@ -35,7 +35,14 @@ async fn a_result_carries_the_times_of_each_step() {
         .run(
             1,
             &spec,
-            &format!("sleep {}; echo x > \"$UPPER/out\"", SLEEP.as_secs_f64()),
+            &[
+                "sleep",
+                SLEEP.as_secs_f64().to_string().as_str(),
+                ";",
+                "write-lines",
+                "$UPPER/out",
+                "x",
+            ],
         )
         .await
         .expect("ran");
