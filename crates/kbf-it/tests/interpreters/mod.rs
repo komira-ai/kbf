@@ -85,7 +85,7 @@ pub fn check(budget: &str, found: &[Found]) -> Vec<String> {
             Some(row) => matched.push(row.line),
         }
     }
-    for row in rows.iter().filter(|r| !matched.contains(&r.line) && r.section != Section::TestInterpreters) {
+    for row in rows.iter().filter(|r| !matched.contains(&r.line)) {
         problems.push(format!(
             "line {}: the {} row for `{}` names nothing the scan found (deleted, \
              renamed, or no longer counted); remove the row",
