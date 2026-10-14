@@ -31,6 +31,12 @@ pub enum Fault {
     /// The process dies at the operation: it and every later one fail and change
     /// nothing.
     Crash,
+    /// The operation fails as a full disk fails it (`ENOSPC`,
+    /// [`io::ErrorKind::StorageFull`]) and changes nothing; later ones run. Only an
+    /// operation that takes space can fail so: a create, a write, a sync, a rename or
+    /// a directory sync. A read, a listing, an open or a removal planned to meet it
+    /// runs as usual (the fault is spent).
+    NoSpace,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -101,8 +107,18 @@ struct State {
 }
 
 impl State {
-    /// Counts one operation and fails it if a fault is planned there.
+    /// Counts one operation that takes space and fails it if a fault is planned there.
     fn begin(&mut self) -> io::Result<()> {
+        self.begin_op(true)
+    }
+
+    /// Counts one operation that takes no space (a full disk does not fail it) and
+    /// fails it if another fault is planned there.
+    fn begin_read(&mut self) -> io::Result<()> {
+        self.begin_op(false)
+    }
+
+    fn begin_op(&mut self, takes_space: bool) -> io::Result<()> {
         let op = self.ops;
         self.ops += 1;
         if self.crashed {
@@ -111,6 +127,11 @@ impl State {
         match self.faults.get(&op) {
             None => Ok(()),
             Some(Fault::Error) => Err(io::Error::other(format!("injected error at op {op}"))),
+            Some(Fault::NoSpace) if !takes_space => Ok(()),
+            Some(Fault::NoSpace) => Err(io::Error::new(
+                io::ErrorKind::StorageFull,
+                format!("no space left at op {op}"),
+            )),
             Some(Fault::Crash) => {
                 self.crashed = true;
                 Err(io::Error::other(format!("crashed at op {op}")))
@@ -317,27 +338,27 @@ impl Fs for FaultFs {
 
     fn list(&self) -> io::Result<Vec<String>> {
         let mut s = self.lock();
-        s.begin()?;
+        s.begin_read()?;
         Ok(s.names.keys().cloned().collect())
     }
 
     fn read(&self, name: &str) -> io::Result<Vec<u8>> {
         let mut s = self.lock();
-        s.begin()?;
+        s.begin_read()?;
         let i = s.inode_of(name)?;
         Ok(s.inodes[&i].data.clone())
     }
 
     fn file_len(&self, name: &str) -> io::Result<u64> {
         let mut s = self.lock();
-        s.begin()?;
+        s.begin_read()?;
         let i = s.inode_of(name)?;
         Ok(s.inodes[&i].data.len() as u64)
     }
 
     fn read_at(&self, name: &str, offset: u64, len: usize) -> io::Result<Vec<u8>> {
         let mut s = self.lock();
-        s.begin()?;
+        s.begin_read()?;
         let data = &s.inodes[&s.inode_of(name)?].data;
         let start = usize::try_from(offset).unwrap_or(usize::MAX);
         data.get(start..start.saturating_add(len))
@@ -355,7 +376,7 @@ impl Fs for FaultFs {
 
     fn open_append(&self, name: &str) -> io::Result<FaultFile> {
         let mut s = self.lock();
-        s.begin()?;
+        s.begin_read()?;
         let inode = s.inode_of(name)?;
         Ok(FaultFile {
             state: Arc::clone(&self.state),
@@ -380,7 +401,7 @@ impl Fs for FaultFs {
 
     fn remove(&self, name: &str) -> io::Result<()> {
         let mut s = self.lock();
-        s.begin()?;
+        s.begin_read()?;
         s.inode_of(name)?;
         let change = NameChange::Unlink(name.to_owned());
         change.apply(&mut s.names);
@@ -665,5 +686,23 @@ mod tests {
         );
         assert_eq!(fs.crash(0).contents("p").unwrap(), [b'a', !b'b', b'c']);
         assert_eq!(fs.list().unwrap(), ["p"]);
+    }
+
+    /// Catches: a full disk that fails some other way than `ENOSPC` (a caller that
+    /// tells the two apart would never see it), changes what the failed write held,
+    /// stops later operations as a crash does, or fails a read.
+    #[test]
+    fn a_full_disk_fails_one_operation_with_enospc() {
+        let fs = FaultFs::new();
+        let mut file = fs.create("a").expect("create");
+        fs.fail_at(fs.ops(), Fault::NoSpace);
+        let full = file.append(b"xyz").expect_err("full");
+        assert_eq!(full.kind(), io::ErrorKind::StorageFull);
+        assert_eq!(fs.contents("a"), Some(Vec::new()));
+        file.append(b"ok").expect("the next write runs");
+        assert_eq!(fs.contents("a"), Some(b"ok".to_vec()));
+        fs.fail_at(fs.ops(), Fault::NoSpace);
+        assert_eq!(fs.read("a").expect("a read takes no space"), b"ok");
+        file.append(b"!").expect("the fault was spent on the read");
     }
 }
