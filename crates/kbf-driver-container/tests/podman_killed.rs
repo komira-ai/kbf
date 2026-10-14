@@ -1,7 +1,7 @@
 //! A killed daemon's container action, against real rootless Podman and a delegated
 //! cgroup (issue #155).
 //!
-//! Run by `tools/ci/podman-tests.sh`, like `podman.rs` (the test is `#[ignore]` with
+//! Run by `cargo xtask podman-tests`, like `podman.rs` (the test is `#[ignore]` with
 //! that reason). The daemon here is a second run of this test binary, which runs the
 //! test's other half (the variable [`ROLE`] set): it starts a lease and, once its
 //! container's program runs, prints where the lease is and waits. This half SIGKILLs
@@ -40,7 +40,7 @@ const PROMPT: Duration = Duration::from_secs(30);
 /// daemon started again. A restarted runtime then removes what is left (container,
 /// cgroup, scratch directory), as before.
 #[tokio::test]
-#[ignore = "needs rootless Podman and a delegated cgroup: run by tools/ci/podman-tests.sh"]
+#[ignore = "needs rootless Podman and a delegated cgroup: run by cargo xtask podman-tests"]
 async fn a_killed_daemons_container_action_dies_with_it() {
     if std::env::var_os(ROLE).is_some() {
         return be_the_daemon().await;

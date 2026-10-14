@@ -3704,6 +3704,7 @@ dependencies = [
  "hex",
  "lzma-rs",
  "rcgen",
+ "rustix",
  "rustls",
  "rustls-native-certs",
  "ruzstd",
