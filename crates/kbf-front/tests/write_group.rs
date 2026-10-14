@@ -96,12 +96,12 @@ async fn answer(cache: &FaultyCache, digest: Digest) -> BlobAnswer {
 }
 
 async fn present(cache: &FaultyCache, digest: Digest) -> bool {
-    matches!(answer(cache, digest).await, BlobAnswer::Present(_))
+    matches!(answer(cache, digest).await, BlobAnswer::Present { .. })
 }
 
 /// The key of the object that holds `digest`.
 async fn key_of(cache: &FaultyCache, digest: Digest) -> ObjectKey {
-    let BlobAnswer::Present(at) = answer(cache, digest).await else {
+    let BlobAnswer::Present { location: at, .. } = answer(cache, digest).await else {
         panic!("{digest} is not present");
     };
     cache.object_key(at.object).expect("key")
