@@ -36,7 +36,8 @@ pub type TierCache = Cache<Log, FaultyStore>;
 
 /// The metadata log of one farm, kept across the cache's restarts. A test can refuse
 /// the next commits of a command (answered UNAVAILABLE, not applied), as a log that
-/// lost its leader would.
+/// lost its leader would, or lose their answers (applied, then answered UNAVAILABLE),
+/// as a Raft log that stopped after the entry was durable would.
 #[derive(Clone, Debug)]
 pub struct Log(Arc<Inner>);
 
@@ -45,6 +46,7 @@ struct Inner {
     log: MemoryMetaLog,
     refuse: Mutex<BTreeMap<&'static str, usize>>,
     wrong: Mutex<BTreeMap<&'static str, usize>>,
+    lose: Mutex<BTreeMap<&'static str, usize>>,
     applied: Mutex<Vec<&'static str>>,
 }
 
@@ -54,6 +56,7 @@ impl Log {
             log: MemoryMetaLog::new(Retention::default()),
             refuse: Mutex::new(BTreeMap::new()),
             wrong: Mutex::new(BTreeMap::new()),
+            lose: Mutex::new(BTreeMap::new()),
             applied: Mutex::new(Vec::new()),
         }))
     }
@@ -69,6 +72,12 @@ impl Log {
     pub fn answer_wrong(&self, command: &'static str, n: usize) {
         assert!(COMMANDS.contains(&command), "{command}");
         *lock(&self.0.wrong).entry(command).or_default() += n;
+    }
+
+    /// The next `n` commits of `command` are applied and then answered UNAVAILABLE.
+    pub fn lose_answer(&self, command: &'static str, n: usize) {
+        assert!(COMMANDS.contains(&command), "{command}");
+        *lock(&self.0.lose).entry(command).or_default() += n;
     }
 
     /// Commits `command` straight to the log, as another server would.
@@ -141,7 +150,15 @@ impl MetaLog for Log {
             }
         }
         lock(&self.0.applied).push(label);
-        self.0.log.commit(command).await
+        let applied = self.0.log.commit(command).await;
+        let mut lose = lock(&self.0.lose);
+        if let Some(n) = lose.get_mut(label).filter(|n| **n > 0) {
+            *n -= 1;
+            return Err(MetaLogError::Unavailable(format!(
+                "{label} applied, its answer lost by the test"
+            )));
+        }
+        applied
     }
 
     async fn query<R, F>(&self, f: F) -> Result<R, MetaLogError>

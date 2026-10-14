@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use common::faulty::PutFault;
 use common::pseudo_random;
-use kbf_front::{FLUSH_BACKOFF_FIRST, FlushRound};
+use kbf_front::{CacheError, FLUSH_BACKOFF_FIRST, FlushRound};
 use kbf_meta::{Applied, Command, ObjectId, ServerId, StagedPut, StagedState, TierId};
 use kbf_objstore::{Capabilities, ObjectStore};
 use kbf_segments::IndexEntry;
@@ -213,4 +213,38 @@ async fn objects_sealed_on_another_servers_tier_are_not_flushed_here() {
     assert_eq!(round, FlushRound::default());
     assert_eq!(farm.store.put_keys(), Vec::<kbf_objstore::ObjectKey>::new());
     assert_eq!(farm.log.unreachable(object), None);
+}
+
+/// Catches: a `PutStaged` that applied but whose answer was lost (a Raft log that
+/// stopped after the entry was durable) leaving the tier's committed length below the
+/// index's. The blob is indexed as staged here, but the tier would refuse to read it
+/// (`NotCommitted`), and the block, whose only range counted as failed, would be removed
+/// at its seal instead of flushed. Also catches the opposite: a range the log refused,
+/// in the same block, counted as committed (its bytes would count as unflushed).
+#[tokio::test]
+async fn a_put_staged_that_applied_but_lost_its_answer_is_read_and_flushed() {
+    let farm = Farm::new(CONDITIONAL);
+    let cache = farm.start(GIB).await;
+    let blobs = blobs(1, 2, 4096);
+    let (a, b) = (&blobs[0], &blobs[1]);
+    farm.log.lose_answer("put_staged", 1);
+    let lost = cache.store_blobs(vec![a.verified()]).await;
+    assert!(matches!(lost, Err(CacheError::Meta(_))), "{lost:?}");
+    let object = farm.log.object_of(&a.digest);
+    assert_eq!(cache.read_blob(&a.digest).await.expect("read"), a.bytes);
+
+    farm.log.refuse("put_staged", 1);
+    let refused = cache.store_blobs(vec![b.verified()]).await;
+    assert!(matches!(refused, Err(CacheError::Meta(_))), "{refused:?}");
+    assert_eq!(farm.log.object_of(&a.digest), object);
+    let tier = cache.write_tier().expect("tier");
+    assert_eq!(
+        tier.unflushed(Instant::now()).bytes,
+        committed_len(&farm, object)
+    );
+
+    let round = cache.flush_tier(later()).await.expect("round");
+    assert_eq!((round.sealed, round.flushed), (vec![object], vec![object]));
+    assert_eq!(farm.log.located(&a.digest).1, None, "flushed");
+    assert_eq!(cache.read_blob(&a.digest).await.expect("read"), a.bytes);
 }
