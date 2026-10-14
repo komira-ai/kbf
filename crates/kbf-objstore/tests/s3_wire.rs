@@ -77,6 +77,7 @@ fn store(endpoint: String, capabilities: Capabilities) -> S3Store {
         capabilities,
         connect_timeout: Duration::from_secs(5),
         request_timeout: Duration::from_secs(5),
+        min_body_rate: None,
     })
     .unwrap()
 }
@@ -401,6 +402,7 @@ async fn a_put_the_store_never_answers_fails_saying_it_timed_out() {
         capabilities: Capabilities::default(),
         connect_timeout: Duration::from_secs(5),
         request_timeout: Duration::from_millis(300),
+        min_body_rate: None,
     })
     .unwrap();
     let k = key();
@@ -419,4 +421,104 @@ async fn a_put_the_store_never_answers_fails_saying_it_timed_out() {
     for private in [addr.as_str(), "kbf-test", "cas/seg-1", "url"] {
         assert!(!text.contains(private), "{private:?} in {text}");
     }
+}
+
+/// A store that takes `delay` to answer each request after reading it whole, then says
+/// 200 with no body. Returns its endpoint.
+async fn slow_store(delay: Duration) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        while let Ok((mut sock, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 65536];
+                let (head_end, body_len) = loop {
+                    let n = sock.read(&mut chunk).await.unwrap_or(0);
+                    if n == 0 {
+                        return;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                    if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let head = String::from_utf8_lossy(&buf[..i]).to_ascii_lowercase();
+                        let len = head
+                            .lines()
+                            .find_map(|l| l.strip_prefix("content-length:"))
+                            .map_or(0, |v| v.trim().parse::<usize>().unwrap());
+                        break (i + 4, len);
+                    }
+                };
+                while buf.len() < head_end + body_len {
+                    let n = sock.read(&mut chunk).await.unwrap_or(0);
+                    if n == 0 {
+                        return;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                }
+                tokio::time::sleep(delay).await;
+                let _ = sock
+                    .write_all(b"HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-length: 0\r\n\r\n")
+                    .await;
+                let _ = sock.shutdown().await;
+            });
+        }
+    });
+    endpoint
+}
+
+fn timed_store(endpoint: String, base: Duration, rate: Option<u64>) -> S3Store {
+    S3Store::new(S3Config {
+        endpoint,
+        region: "us-east-1".into(),
+        bucket: "kbf-test".into(),
+        credentials: Credentials::new("AKIDEXAMPLE", "secret"),
+        capabilities: Capabilities::default(),
+        connect_timeout: Duration::from_secs(5),
+        request_timeout: base,
+        min_body_rate: rate.and_then(std::num::NonZeroU64::new),
+    })
+    .unwrap()
+}
+
+/// Catches: one flat limit for every PUT (the 60 s that cut 16 to 128 MiB segments on a
+/// store that was slow but progressing). The store takes 1.2 s over a 256 KiB body, the
+/// base limit is 400 ms, and the floor rate of 128 KiB/s allows it 2.4 s more.
+#[tokio::test]
+async fn a_slow_put_within_the_floor_rate_is_not_cut() {
+    let endpoint = slow_store(Duration::from_millis(1200)).await;
+    let s = timed_store(endpoint, Duration::from_millis(400), Some(128 << 10));
+    s.put_new(&key(), Bytes::from(vec![7u8; 256 << 10]), None)
+        .await
+        .expect("a PUT inside body/rate + base was cut");
+}
+
+/// Catches: the allowance scaled by something other than the body (a fixed bonus, or a
+/// rate applied to bodiless requests), and a PUT slower than the floor rate allows
+/// being waited for without end. The same slow store, 64 KiB body at 128 KiB/s allows
+/// 400 ms + 0.5 s, under the 1.2 s the store takes.
+#[tokio::test]
+async fn a_put_slower_than_the_floor_rate_still_times_out() {
+    let endpoint = slow_store(Duration::from_millis(1200)).await;
+    let s = timed_store(endpoint, Duration::from_millis(400), Some(128 << 10));
+    let err = s
+        .put_new(&key(), Bytes::from(vec![7u8; 64 << 10]), None)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, ObjectStoreError::Transport(_)) && err.to_string().contains("timed out"),
+        "{err}"
+    );
+}
+
+/// Catches: the rate applied to a request with no body, which would give a GET the
+/// same room as a PUT. A 1.2 s answer to a bodiless read is cut at the 400 ms base.
+#[tokio::test]
+async fn a_request_without_a_body_gets_only_the_base_timeout() {
+    let endpoint = slow_store(Duration::from_millis(1200)).await;
+    let s = timed_store(endpoint, Duration::from_millis(400), Some(1));
+    let err = s
+        .get_range(&key(), ByteRange::new(0, 4).unwrap())
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ObjectStoreError::Transport(_)), "{err}");
 }

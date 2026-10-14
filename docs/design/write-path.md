@@ -131,6 +131,10 @@ linger nor holds up small writes. It is still held in memory until verified
 
 ### 3.4 Failure
 
+- **PUT timeout.** The S3 client's limit on a PUT is 60 s plus the body's length at
+  `--s3-min-put-rate` (default 1 MiB/s: 188 s for a 128 MiB segment), not a flat 60 s,
+  which cut a segment a busy store was taking steadily. It applies to every PUT through
+  the store, the write tier's flusher's included. A request with no body keeps 60 s.
 - **PUT fails.** It is retried up to `--store-put-attempts` (default 3) on
   `Unavailable` and timeouts only, with backoff (100 ms, then 400 ms), each retry under
   a **new object id** (the next sequence number). A retry never reuses a key, so a
@@ -175,9 +179,13 @@ stores its outputs that way. Where the code differs from the text below:
 - The daemon spools every output as its walk stores it, and asks FindMissing for the
   whole spool afterwards: the walk reads and hashes a file in one pass, so a blob the
   server already holds costs a local copy, not a send.
-- The daemon splits uploads at 1 GiB + 1 MiB (`SEGMENT_UPLOAD_BYTES`), the smallest
-  `--segment-upload-max-bytes` a server starts with, so every server admits them and
-  the daemon needs no flag for the server's cap.
+- The daemon splits uploads at 32 MiB (`SEGMENT_UPLOAD_BYTES`; a larger blob is an
+  upload of its own), under the smallest `--segment-upload-max-bytes` a server starts
+  with (1 GiB + 1 MiB), so every server admits them and the daemon needs no flag for
+  the server's cap. An upload commits or fails whole and a spool's uploads go one after
+  another, so a PUT cut on a slow store costs one upload's retry and fall-back, and the
+  uploads before it stay committed. (At 1 GiB, a cold upload of 14,244 outputs lost
+  every blob it had sent to one failed upload.)
 - `Begin` is admitted for its whole length by the cache's `--write-bytes-in-flight`
   (section 3.3), the bound ByteStream and batch uploads share, and the server refuses
   to start with `--segment-upload-max-bytes` over it, or over the 4 GiB - 1 one

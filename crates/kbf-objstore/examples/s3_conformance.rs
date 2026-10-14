@@ -83,6 +83,7 @@ async fn run(args: Args) -> Result<bool, String> {
         },
         connect_timeout: Duration::from_secs(5),
         request_timeout: Duration::from_secs(60),
+        min_body_rate: None,
     })
     .map_err(|e| e.to_string())?;
     if let Some(secs) = args.wait_ready {

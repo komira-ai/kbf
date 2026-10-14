@@ -57,6 +57,24 @@ fn uploads_stay_under_both_caps() {
     assert_eq!(counts, [4, 4, 2]);
 }
 
+/// Catches the cap that lost 14,244 outputs to one failed upload: a cold output set of
+/// 300 MiB in 1.5 MiB blobs is cut into uploads of at most `SEGMENT_UPLOAD_BYTES`, so one
+/// failed upload puts at most that much at risk (mutant: the old 1 GiB cap, one upload).
+#[test]
+fn a_large_output_set_is_many_small_uploads() {
+    let uploads = plan(
+        &back_to_back(200, 3 << 19),
+        MAX_SEGMENT_BYTES,
+        SEGMENT_UPLOAD_BYTES,
+        MAX_UPLOAD_RECORDS,
+    );
+    assert!(uploads.len() >= 10, "{} uploads", uploads.len());
+    for upload in &uploads {
+        let len: u64 = upload.iter().map(Planned::length).sum();
+        assert!(len <= SEGMENT_UPLOAD_BYTES, "an upload of {len} bytes");
+    }
+}
+
 /// Catches a blob too large for a segment dropped, or packed with others: it is a
 /// segment of one record, and the segment after it starts fresh.
 #[test]

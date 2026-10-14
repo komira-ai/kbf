@@ -14,6 +14,7 @@ mod sigv4;
 mod xml;
 
 use std::fmt;
+use std::num::NonZeroU64;
 use std::time::{Duration, Instant, SystemTime};
 
 use base64::Engine as _;
@@ -75,8 +76,14 @@ pub struct S3Config {
     pub capabilities: Capabilities,
     /// Limit on opening a connection.
     pub connect_timeout: Duration,
-    /// Limit on a whole request, body included.
+    /// Limit on a whole request, body included, for a request with no body or a small one.
     pub request_timeout: Duration,
+    /// The slowest rate, in bytes a second, at which a request body may reach the
+    /// store: a request with a body may take `request_timeout` plus the body's length
+    /// at this rate. `None` gives every request `request_timeout` however large its
+    /// body. A store shared with other tenants can take minutes over one large PUT; a
+    /// flat limit cuts it however steadily it progresses.
+    pub min_body_rate: Option<NonZeroU64>,
 }
 
 /// Why an [`S3Config`] was refused.
@@ -110,6 +117,8 @@ pub struct S3Store {
     region: String,
     credentials: Credentials,
     capabilities: Capabilities,
+    request_timeout: Duration,
+    min_body_rate: Option<NonZeroU64>,
 }
 
 impl fmt::Debug for S3Store {
@@ -162,7 +171,20 @@ impl S3Store {
             region: config.region,
             credentials: config.credentials,
             capabilities: config.capabilities,
+            request_timeout: config.request_timeout,
+            min_body_rate: config.min_body_rate,
         })
+    }
+
+    /// The limit on a whole request with a `body_len`-byte body.
+    fn timeout_for(&self, body_len: usize) -> Duration {
+        let Some(rate) = self.min_body_rate else {
+            return self.request_timeout;
+        };
+        let nanos = (body_len as u128).saturating_mul(1_000_000_000) / u128::from(rate.get());
+        self.request_timeout.saturating_add(Duration::from_nanos(
+            u64::try_from(nanos).unwrap_or(u64::MAX),
+        ))
     }
 
     /// Creates the bucket, with Object Lock if the store claims it. Succeeds if this
@@ -268,6 +290,7 @@ impl S3Store {
         for (name, value) in headers {
             req = req.header(name, value);
         }
+        req = req.timeout(self.timeout_for(body.len()));
         if !body.is_empty() {
             req = req.body(body);
         }
@@ -502,6 +525,25 @@ mod tests {
         assert!(check_partial(None, r(0, 1), 1).is_err());
     }
 
+    /// Catches: a timeout that ignores the body (the flat 60 s that cut a 128 MiB PUT
+    /// on a slow store), one that scales a body-less request, or arithmetic that
+    /// overflows on a huge body or a rate of one byte a second.
+    #[test]
+    fn the_timeout_grows_with_the_body_at_the_floor_rate() {
+        let mut c = config("http://127.0.0.1:9000", "kbf-test");
+        c.request_timeout = Duration::from_secs(60);
+        let flat = S3Store::new(c.clone()).unwrap();
+        assert_eq!(flat.timeout_for(128 << 20), Duration::from_secs(60));
+        c.min_body_rate = NonZeroU64::new(1 << 20);
+        let scaled = S3Store::new(c.clone()).unwrap();
+        assert_eq!(scaled.timeout_for(0), Duration::from_secs(60));
+        assert_eq!(scaled.timeout_for(128 << 20), Duration::from_secs(188));
+        assert_eq!(scaled.timeout_for(512 << 10), Duration::from_millis(60_500));
+        c.min_body_rate = NonZeroU64::new(1);
+        let slowest = S3Store::new(c).unwrap();
+        assert!(slowest.timeout_for(usize::MAX) > Duration::from_secs(1 << 33));
+    }
+
     fn config(endpoint: &str, bucket: &str) -> S3Config {
         S3Config {
             endpoint: endpoint.to_owned(),
@@ -511,6 +553,7 @@ mod tests {
             capabilities: Capabilities::default(),
             connect_timeout: Duration::from_secs(1),
             request_timeout: Duration::from_secs(1),
+            min_body_rate: None,
         }
     }
 
