@@ -459,3 +459,64 @@ fn a_follower_refuses_a_proposal() {
     );
     assert!(take(&trace).is_empty());
 }
+
+/// Catches (group commit): a batch written as one write per command (one sync each,
+/// which is what group commit removes), a batch applied before its one sync (a crash
+/// after the apply would lose answered entries), applies out of index order, and a
+/// returned index that is not the first command's. An empty batch writes nothing: the
+/// store refuses an empty write and would stop the host.
+#[test]
+fn a_single_voter_writes_a_batch_once_and_syncs_once_before_it_applies() {
+    let trace = Trace::default();
+    let mut host = open(config(S1, &[S1]), Disk::new(&trace));
+    elect(&mut host);
+    take(&trace);
+    assert_eq!(
+        host.propose_batch(vec![vec![7], vec![8], vec![9]]),
+        Ok(LogIndex(2))
+    );
+    assert_eq!(
+        take(&trace),
+        [
+            Op::WriteEntries(vec![2, 3, 4]),
+            Op::Sync,
+            Op::Apply(2),
+            Op::Apply(3),
+            Op::Apply(4),
+        ]
+    );
+    assert_eq!(host.storage().mem.pending(), 0);
+    assert_eq!(host.propose_batch(Vec::new()), Ok(LogIndex(5)));
+    assert!(take(&trace).is_empty());
+    assert_eq!(host.propose(vec![1]), Ok(LogIndex(5)));
+}
+
+/// Catches: a leader with followers that commits a batch alone, or sends the batch
+/// before it is synced (a follower could hold entries the leader lost).
+#[test]
+fn a_leader_syncs_a_batch_before_it_sends_it_and_does_not_apply_it_alone() {
+    let trace = Trace::default();
+    let mut host = open(config(S1, &[S1, S2, S3]), Disk::new(&trace));
+    let granted = |term| Message {
+        term: Term(term),
+        kind: MessageKind::VoteResponse { granted: true },
+    };
+    while host.core().role() != Role::Candidate {
+        host.tick(0).unwrap();
+    }
+    let term = host.core().hard_state().term.0;
+    host.receive(S2, granted(term), 0).unwrap();
+    assert_eq!(host.core().role(), Role::Leader);
+    take(&trace);
+    assert_eq!(host.propose_batch(vec![vec![7], vec![8]]), Ok(LogIndex(2)));
+    assert_eq!(
+        take(&trace),
+        [
+            Op::WriteEntries(vec![2, 3]),
+            Op::Sync,
+            Op::Send(S2),
+            Op::Send(S3),
+        ]
+    );
+    assert!(host.machine().applied.is_empty());
+}

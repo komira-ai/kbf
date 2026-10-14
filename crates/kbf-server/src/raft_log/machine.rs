@@ -1,6 +1,7 @@
 //! The state machine the log replicates: the metadata state, fed every committed
 //! command entry in index order.
 
+use std::collections::BTreeMap;
 use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard};
 
 use kbf_log::{Bootstrap, DecodeError, Format, LogCommand};
@@ -27,9 +28,10 @@ pub struct MetaMachine {
     meta: Arc<RwLock<MetaState>>,
     bootstrap: Option<Bootstrap>,
     bootstraps: usize,
-    /// The index and outcome of the last metadata command applied, for the caller
-    /// that proposed it.
-    answer: Option<(LogIndex, Applied)>,
+    /// The outcome of each metadata command applied since [`MetaMachine::keep_answers`]
+    /// and not yet taken, by index, for the caller that proposed it. `None` until then:
+    /// the entries a start replays have no caller to answer.
+    answers: Option<BTreeMap<LogIndex, Applied>>,
     failed: Option<(LogIndex, DecodeError)>,
     /// The last entry handed to [`Machine::apply`], blank entries included.
     applied: LogIndex,
@@ -42,7 +44,7 @@ impl MetaMachine {
             meta: Arc::new(RwLock::new(MetaState::new(retention))),
             bootstrap: None,
             bootstraps: 0,
-            answer: None,
+            answers: None,
             failed: None,
             applied: LogIndex(0),
         }
@@ -68,12 +70,18 @@ impl MetaMachine {
         self.bootstraps
     }
 
-    /// What applying the entry at `index` did, if it was the last metadata command.
-    pub fn answer(&self, index: LogIndex) -> Option<Applied> {
-        self.answer
-            .as_ref()
-            .filter(|(at, _)| *at == index)
-            .map(|(_, applied)| applied.clone())
+    /// Keeps the outcome of every metadata command applied from now on, until
+    /// [`MetaMachine::take_answer`] takes it.
+    pub fn keep_answers(&mut self) {
+        self.answers.get_or_insert_default();
+    }
+
+    /// What applying the metadata command at `index` did, if it was applied since
+    /// [`MetaMachine::keep_answers`] and not taken before.
+    pub fn take_answer(&mut self, index: LogIndex) -> Option<Applied> {
+        self.answers
+            .as_mut()
+            .and_then(|answers| answers.remove(&index))
     }
 
     /// The last entry the host handed this machine, blank entries and entries past
@@ -107,7 +115,9 @@ impl Machine for MetaMachine {
                     .write()
                     .unwrap_or_else(PoisonError::into_inner)
                     .execute(entry.id.index.0, command);
-                self.answer = Some((entry.id.index, applied));
+                if let Some(answers) = &mut self.answers {
+                    answers.insert(entry.id.index, applied);
+                }
             }
             Ok(LogCommand::Bootstrap(bootstrap)) => {
                 self.bootstraps += 1;

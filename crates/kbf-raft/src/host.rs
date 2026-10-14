@@ -224,6 +224,14 @@ impl<S: Storage, T: Transport, M: Machine> Host<S, T, M> {
         &self.machine
     }
 
+    /// The state machine, for what it keeps for the host's caller (the outcome of an
+    /// applied command, say). Changing its replicated state here makes this server's
+    /// state disagree with its log.
+    #[must_use]
+    pub fn machine_mut(&mut self) -> &mut M {
+        &mut self.machine
+    }
+
     /// Whether a storage error has stopped the host.
     #[must_use]
     pub fn is_stopped(&self) -> bool {
@@ -264,8 +272,25 @@ impl<S: Storage, T: Transport, M: Machine> Host<S, T, M> {
     ///
     /// [`HostError::NotLeader`], [`HostError::Storage`] or [`HostError::Stopped`].
     pub fn propose(&mut self, command: Vec<u8>) -> Result<LogIndex, HostError<S::Error>> {
+        self.propose_batch(vec![command])
+    }
+
+    /// Appends `commands` to the log as consecutive entries if this server leads, and
+    /// returns the first one's index (see [`Raft::propose_batch`]). They are written
+    /// with one [`Storage::write_entries`] and made durable by one sync: group commit.
+    ///
+    /// # Errors
+    ///
+    /// [`HostError::NotLeader`], [`HostError::Storage`] or [`HostError::Stopped`].
+    pub fn propose_batch(
+        &mut self,
+        commands: Vec<Vec<u8>>,
+    ) -> Result<LogIndex, HostError<S::Error>> {
         self.running()?;
-        let proposed = self.core.propose(command).map_err(HostError::NotLeader)?;
+        let proposed = self
+            .core
+            .propose_batch(commands)
+            .map_err(HostError::NotLeader)?;
         self.carry_out(proposed.effects)?;
         Ok(proposed.index)
     }

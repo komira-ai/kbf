@@ -254,7 +254,7 @@ async fn farm_time_continues_from_the_committed_one_across_a_restart() {
     let log = open(&fs, 1).await;
     assert_eq!(log.query(|m| m.now()).await, Ok(FarmTime::default()));
     tokio::time::sleep(Duration::from_secs(30)).await;
-    let committed = log.tick().expect("a tick");
+    let committed = log.tick().await.expect("a tick");
     assert!(committed >= FarmTime::from_millis(30_000), "{committed:?}");
     assert_eq!(log.query(|m| m.now()).await, Ok(committed));
     drop(log);
@@ -519,7 +519,7 @@ async fn a_storage_error_stops_every_later_commit() {
             "{refused:?}"
         );
     }
-    assert!(log.tick().is_err());
+    assert!(log.tick().await.is_err());
     assert_eq!(log.query(|m| m.blob_count()).await, Ok(0));
     drop(log);
     let log = open(&fs.restart(), 1).await;

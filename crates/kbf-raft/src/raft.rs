@@ -56,8 +56,8 @@ pub enum CompactError {
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[must_use]
 pub struct Proposed {
-    /// Where the command sits in the log. It is committed when an [`Effect::Apply`]
-    /// carries this index.
+    /// Where the command sits in the log (the first command, for a batch; the rest
+    /// follow it). It is committed when an [`Effect::Apply`] carries this index.
     pub index: LogIndex,
     /// The effects to carry out.
     pub effects: Vec<Effect>,
@@ -326,12 +326,24 @@ impl Raft {
     ///
     /// [`NotLeader`], with the leader this server knows of, when it does not lead.
     pub fn propose(&mut self, command: Vec<u8>) -> Result<Proposed, NotLeader> {
+        self.propose_batch(vec![command])
+    }
+
+    /// Appends `commands` to the log as consecutive entries, in order, if this server
+    /// leads: one persist for them all, so a host makes them durable with one sync.
+    /// [`Proposed::index`] is the first command's; an empty batch appends nothing and
+    /// names the index the next entry will take.
+    ///
+    /// # Errors
+    ///
+    /// [`NotLeader`], with the leader this server knows of, when it does not lead.
+    pub fn propose_batch(&mut self, commands: Vec<Vec<u8>>) -> Result<Proposed, NotLeader> {
         if !matches!(self.state, State::Leader { .. }) {
             return Err(NotLeader {
                 leader: self.leader,
             });
         }
-        let index = self.append_local(Payload::Command(command));
+        let index = self.append_local(commands.into_iter().map(Payload::Command));
         self.broadcast_append();
         self.advance_commit();
         Ok(Proposed {
@@ -477,7 +489,7 @@ impl Raft {
         self.leader = Some(me);
         // A leader may count replicas only for entries of its own term, so it commits
         // the entries of earlier terms by committing this one.
-        self.append_local(Payload::Blank);
+        self.append_local([Payload::Blank]);
         self.broadcast_append();
         self.advance_commit();
     }
@@ -493,12 +505,23 @@ impl Raft {
     }
 
     /// Appends one entry in the current term to the leader's own log.
-    fn append_local(&mut self, payload: Payload) -> LogIndex {
-        let id = LogId::new(self.hard.term, self.log.last_index().next());
-        let entry = Entry { id, payload };
-        self.log.push(entry.clone());
-        self.effects.push(Effect::PersistEntries(vec![entry]));
-        id.index
+    /// Appends `payloads` as one persist and returns the index of the first (of the
+    /// next entry, if there is none).
+    fn append_local(&mut self, payloads: impl IntoIterator<Item = Payload>) -> LogIndex {
+        let first = self.log.last_index().next();
+        let entries: Vec<Entry> = payloads
+            .into_iter()
+            .map(|payload| {
+                let id = LogId::new(self.hard.term, self.log.last_index().next());
+                let entry = Entry { id, payload };
+                self.log.push(entry.clone());
+                entry
+            })
+            .collect();
+        if !entries.is_empty() {
+            self.effects.push(Effect::PersistEntries(entries));
+        }
+        first
     }
 
     fn broadcast_append(&mut self) {
