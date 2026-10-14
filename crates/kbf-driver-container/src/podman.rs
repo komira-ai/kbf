@@ -278,6 +278,14 @@ impl Podman {
     /// How the container ended, from Podman's record, not from `podman start`'s own
     /// status, which also reports Podman's errors: its exit code, or the state of a
     /// container that did not run to an exit.
+    ///
+    /// `stopped` with an exit code is a container that ran to that exit: Podman has
+    /// read the exit (its `died` event) but not yet cleaned up after it (unmounted and
+    /// deleted it from the OCI runtime, which makes it `exited`). That clean-up is a
+    /// separate `podman container cleanup` conmon starts once the container exits, and
+    /// on a loaded node it can land many seconds after `podman start --attach` has
+    /// returned. `stopped -1` is Podman's record of a container whose exit it never
+    /// read, so it did not run to an exit.
     pub(crate) async fn ended(&self, name: &str) -> Result<Ended, String> {
         let args = [
             "inspect",
@@ -296,6 +304,11 @@ impl Podman {
                 .parse()
                 .map(Ended::Exited)
                 .map_err(|_| format!("podman inspect: exit code {code:?}")),
+            ["stopped", code] => Ok(code
+                .parse()
+                .ok()
+                .filter(|code: &i32| *code >= 0)
+                .map_or_else(|| Ended::NotRun(text.trim().to_owned()), Ended::Exited)),
             _ => Ok(Ended::NotRun(text.trim().to_owned())),
         }
     }
