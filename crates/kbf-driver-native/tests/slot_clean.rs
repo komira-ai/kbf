@@ -11,9 +11,8 @@
 //! killed daemon left; and a lease's job labelled like launchd's own is still counted.
 //!
 //! Every test is `#[ignore]`: each needs root and real users. The macOS CI job runs them
-//! with `cargo xtask sudo-test -p kbf-driver-native --test slot_clean` (from
-//! `tools/ci/mac-session-tests.sh`), as `tests/slots.rs` runs, with the users of
-//! `tests/support/pool.rs`.
+//! with `cargo xtask sudo-test -p kbf-driver-native --test slot_clean`, after
+//! `tests/slots.rs`, with the users of `tests/support/pool.rs`.
 
 #![cfg(target_os = "macos")]
 

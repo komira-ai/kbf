@@ -48,6 +48,9 @@ security-framework.workspace = true
 # The programs the unit tests start as a lease's process: kbf-testkit's act verbs,
 # through links to the test binary.
 kbf-testkit.workspace = true
+# `cargo xtask sign-darwin`'s signer, which the root tests (tests/as_root.rs) sign the
+# helper with.
+xtask.workspace = true
 
 [lints]
 workspace = true

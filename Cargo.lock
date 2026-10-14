@@ -1497,6 +1497,7 @@ dependencies = [
  "time",
  "tracing",
  "tracing-subscriber",
+ "xtask",
 ]
 
 [[package]]
