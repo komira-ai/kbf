@@ -26,7 +26,7 @@ use std::collections::BTreeSet;
 use std::mem;
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -37,6 +37,7 @@ use kbf_segments::{Footer, SegmentWriter, WriteError};
 use kbf_types::Digest;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 
+use super::tier::Staging;
 use super::{Cache, CacheError, VerifiedBlob, refuse_oversized, unexpected};
 use crate::meta_log::{MetaLog, MetaLogError};
 use crate::metrics::{CacheMetrics, command_label};
@@ -157,15 +158,18 @@ struct Segment {
     packed: BTreeSet<Digest>,
     waiters: Vec<oneshot::Sender<Result<(), CacheError>>>,
     held: Vec<Admitted>,
+    /// A segment of one blob, past the group: on the write tier, a block of its own.
+    own: bool,
 }
 
 impl Segment {
-    fn new(limit: u64) -> Self {
+    fn new(limit: u64, own: bool) -> Self {
         Self {
             writer: SegmentWriter::new(limit),
             packed: BTreeSet::new(),
             waiters: Vec::new(),
             held: Vec::new(),
+            own,
         }
     }
 
@@ -243,7 +247,10 @@ pub(super) struct Writer<M, O> {
     pub(super) prefix: KeyPrefix,
     pub(super) epoch: Epoch,
     pub(super) metrics: CacheMetrics,
-    next_seq: AtomicU64,
+    /// Shared with the write tier, which numbers its blocks' objects from it too.
+    pub(super) next_seq: Arc<AtomicU64>,
+    /// The local write tier, once [`Cache::attach_tier`] attached one.
+    pub(super) tier: OnceLock<Staging>,
 }
 
 impl<M, O> Writer<M, O> {
@@ -254,7 +261,8 @@ impl<M, O> Writer<M, O> {
             prefix,
             epoch,
             metrics: CacheMetrics::default(),
-            next_seq: AtomicU64::new(1),
+            next_seq: Arc::new(AtomicU64::new(1)),
+            tier: OnceLock::new(),
         }
     }
 
@@ -448,7 +456,7 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         });
         Open {
             id,
-            segment: Segment::new(self.segment_limit),
+            segment: Segment::new(self.segment_limit, false),
         }
     }
 
@@ -459,7 +467,8 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         waiter: oneshot::Sender<Result<(), CacheError>>,
         admitted: &Admitted,
     ) {
-        let mut segment = Segment::new(blob.digest.size_bytes.saturating_add(footer_len(1)));
+        let size = blob.digest.size_bytes.saturating_add(footer_len(1));
+        let mut segment = Segment::new(size, true);
         // An empty segment sized for this record always takes it.
         let _ = segment.writer.push(&blob.bytes);
         segment.wait(blob.digest, waiter, admitted);
@@ -479,10 +488,20 @@ async fn settle<M: MetaLog, O: ObjectStore>(
         packed,
         waiters,
         held,
+        own,
     } = segment;
-    let placed = writer.put_segment(&group, records, &packed).await;
-    let answer = match placed {
-        Ok(placed) => writer.commit_segment(placed).await,
+    if packed.is_empty() {
+        // The open segment a blob too large for it left behind: nothing to write.
+        return;
+    }
+    let body = Bytes::from(records.finish());
+    // On the write tier when one is attached and takes it, else PUT.
+    let answer = match writer.stage(body.clone(), own).await {
+        Ok(true) => Ok(()),
+        Ok(false) => match writer.put_segment(&group, body, &packed).await {
+            Ok(placed) => writer.commit_segment(placed).await,
+            Err(e) => Err(e),
+        },
         Err(e) => Err(e),
     };
     for waiter in waiters {
@@ -531,10 +550,9 @@ impl<M: MetaLog, O: ObjectStore> Writer<M, O> {
     async fn put_segment(
         &self,
         group: &Group,
-        records: SegmentWriter,
+        body: Bytes,
         packed: &BTreeSet<Digest>,
     ) -> Result<Vec<(Digest, Location)>, CacheError> {
-        let body = Bytes::from(records.finish());
         let (segment, key, footer) = self.store_segment(group, body, packed.len()).await?;
         packed
             .iter()
@@ -609,7 +627,11 @@ impl<M: MetaLog, O: ObjectStore> Writer<M, O> {
         }
     }
 
-    async fn read_footer(&self, key: &ObjectKey, len: u64) -> Result<Footer, CacheError> {
+    pub(super) async fn read_footer(
+        &self,
+        key: &ObjectKey,
+        len: u64,
+    ) -> Result<Footer, CacheError> {
         let tail = |n: u64| {
             len.checked_sub(n)
                 .and_then(|start| ByteRange::new(start, n))

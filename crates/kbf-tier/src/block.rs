@@ -1,8 +1,6 @@
 //! The names in a tier directory and the `TIER` file.
 
-use std::fmt;
-
-use kbf_meta::{Epoch, ObjectId};
+use kbf_meta::{Epoch, ObjectId, TierId};
 
 /// The file that names the tier a directory belongs to.
 pub const TIER: &str = "TIER";
@@ -10,45 +8,17 @@ pub const TIER: &str = "TIER";
 /// Where the `TIER` file is written before it is renamed into place.
 pub(crate) const TIER_TMP: &str = "TIER.tmp";
 
-/// A write tier's id: which tier an object is staged on.
-///
-/// The metadata hands it out once per directory (`Command::AddTier`, rollout stage 3)
-/// and the tier writes it to `<dir>/TIER`, so a start can tell its own directory from
-/// a wrong mount.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct TierId(u64);
-
-impl TierId {
-    /// Tier number `n`.
-    #[must_use]
-    pub const fn new(n: u64) -> Self {
-        Self(n)
-    }
-
-    /// The raw number.
-    #[must_use]
-    pub const fn get(self) -> u64 {
-        self.0
-    }
-
-    /// The content of a `TIER` file naming this tier.
-    pub(crate) fn file_bytes(self) -> Vec<u8> {
-        format!("{}\n", self.0).into_bytes()
-    }
-
-    /// The tier a `TIER` file names, or `None` if its bytes are not one (a damaged or
-    /// foreign file).
-    pub(crate) fn parse_file(bytes: &[u8]) -> Option<Self> {
-        let text = std::str::from_utf8(bytes).ok()?;
-        let id = Self(text.strip_suffix('\n')?.parse().ok()?);
-        (id.file_bytes() == bytes).then_some(id)
-    }
+/// The content of a `TIER` file naming `tier`.
+pub(crate) fn tier_file_bytes(tier: TierId) -> Vec<u8> {
+    format!("{}\n", tier.get()).into_bytes()
 }
 
-impl fmt::Display for TierId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(f)
-    }
+/// The tier a `TIER` file names, or `None` if its bytes are not one (a damaged or
+/// foreign file).
+pub(crate) fn parse_tier_file(bytes: &[u8]) -> Option<TierId> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    let id = TierId::new(text.strip_suffix('\n')?.parse().ok()?);
+    (tier_file_bytes(id) == bytes).then_some(id)
 }
 
 /// The block file of `object`: `<epoch>-<seq>.blk`, each as 16 lowercase hex digits,
@@ -69,6 +39,21 @@ pub fn parse_block_name(name: &str) -> Option<ObjectId> {
     (block_name(object) == name).then_some(object)
 }
 
+/// The flushed copy of `object`: its block renamed once its `ObjectFlushed`
+/// committed, `<epoch>-<seq>.seg`.
+#[must_use]
+pub fn seg_name(object: ObjectId) -> String {
+    format!("{:016x}-{:016x}.seg", object.epoch().get(), object.seq())
+}
+
+/// The object a flushed copy's name names, or `None` if `name` is not exactly the
+/// name [`seg_name`] gives some object.
+#[must_use]
+pub fn parse_seg_name(name: &str) -> Option<ObjectId> {
+    let stem = name.strip_suffix(".seg")?;
+    parse_block_name(&format!("{stem}.blk")).filter(|o| seg_name(*o) == name)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -82,6 +67,13 @@ mod tests {
         let id = ObjectId::new(Epoch::new(0xab), 7);
         assert_eq!(block_name(id), "00000000000000ab-0000000000000007.blk");
         assert_eq!(parse_block_name(&block_name(id)), Some(id));
+        assert_eq!(seg_name(id), "00000000000000ab-0000000000000007.seg");
+        assert_eq!(parse_seg_name(&seg_name(id)), Some(id));
+        assert_eq!(parse_seg_name(&block_name(id)), None);
+        assert_eq!(
+            parse_seg_name("00000000000000AB-0000000000000007.seg"),
+            None
+        );
         for bad in [
             "00000000000000AB-0000000000000007.blk",
             "+0000000000000ab-0000000000000007.blk",
@@ -100,11 +92,10 @@ mod tests {
     #[test]
     fn tier_files_round_trip_and_damage_is_none() {
         let id = TierId::new(42);
-        assert_eq!(id.to_string(), "42");
-        assert_eq!(id.get(), 42);
-        assert_eq!(TierId::parse_file(&id.file_bytes()), Some(id));
+        assert_eq!(tier_file_bytes(id), b"42\n");
+        assert_eq!(parse_tier_file(&tier_file_bytes(id)), Some(id));
         for bad in [&b"42"[..], b"042\n", b"x\n", b"\xff\n", b"42\n\n", b""] {
-            assert_eq!(TierId::parse_file(bad), None, "{bad:?}");
+            assert_eq!(parse_tier_file(bad), None, "{bad:?}");
         }
     }
 }
