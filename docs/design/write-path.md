@@ -192,8 +192,12 @@ stores its outputs that way. Where the code differs from the text below:
   tracked connections (`Connections`); a connection's close is seen when the server
   drops its stream.
 - `Locate` and `ReadRange` are served, and the daemon's coalescing reader
-  (`Scope::read_located`) is built and tested, but cache fills do not use it yet. The
-  container driver still uploads blob by blob.
+  (`Scope::read_located`) is built and tested, but cache fills do not use it yet.
+- The container driver asks `Cas::missing` once for every digest of a lease's outputs
+  (the files, every Directory, the Tree), copies only the missing blobs into a spool in
+  the lease's scratch directory, `--transfer-in-flight` files open at a time, and
+  stores the spool with `put_spool`. A digest `missing` answered is not asked again by
+  the spool's upload. Its stdout and stderr are still stored blob by blob.
 - A retried upload (4.2) does not ask FindMissing again: it sends a fresh `Begin` of
   the same plan. Blobs a lost-reply commit already indexed are sent and stored again,
   and `PutBlobs` keeps the existing entry, so a retry costs bytes, not correctness.

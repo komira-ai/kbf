@@ -1322,6 +1322,7 @@ dependencies = [
  "hex",
  "kbf-daemon",
  "kbf-front",
+ "kbf-objstore",
  "kbf-proto",
  "kbf-testkit",
  "kbf-transfer",
