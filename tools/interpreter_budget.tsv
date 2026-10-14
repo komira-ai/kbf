@@ -1,5 +1,7 @@
 # The shell, Python, awk, sed, Perl and Ruby left in this repository, by path. kbf's
-# tooling is Rust: each row is something still to port or delete. The repository lints
+# tooling is Rust: each row of [files] and [src-sh-c] is something still to port or
+# delete; each row of [test-interpreters] is test code that names an interpreter on
+# purpose, and says why. The repository lints
 # (crates/kbf-it/tests/repo_lints.rs, rules in crates/kbf-it/tests/interpreters/mod.rs)
 # refuse anything the scan finds with no row here, a row the scan finds nothing for
 # (remove it in the change that deletes its file), and a malformed or
@@ -31,3 +33,10 @@ tools/mac-provision/test/run.sh	tests of kbf-mac-provision; to become Rust tests
 
 # Production Rust under crates/*/src/ that names a shell and a `-c` flag. Key: the path.
 [src-sh-c]
+
+# Test code that names an interpreter (a program literal such as "perl" or "/bin/sh",
+# or a script whose `#!` line runs one): files under crates/*/tests/, and the
+# #[cfg(test)] code of crates/*/src/. Key: the path; the reason says why the test
+# needs the interpreter, or that it names one only as data. Module
+# crates/kbf-it/tests/interpreters/rust.rs says what the scan reads.
+[test-interpreters]

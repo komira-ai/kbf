@@ -15,9 +15,11 @@
 //!   not on the binary allow list (rules in `kbf_it::hygiene`);
 //! - a workflow `run:` step with shell logic (no row can list one); a shell, Python,
 //!   awk, sed, Perl or Ruby file, or a production `sh -c` in `crates/*/src/`, that
-//!   `tools/interpreter_budget.tsv` does not list (by path, never by size); and a row
-//!   of that file that is stale, repeated, malformed or under `[workflow]` (rules in
-//!   `interpreters/mod.rs`);
+//!   `tools/interpreter_budget.tsv` does not list (by path, never by size); test code
+//!   (`crates/*/tests/`, `#[cfg(test)]` code in `crates/*/src/`) that names an
+//!   interpreter and has no `[test-interpreters]` row; and a row of that file that is
+//!   stale, repeated, malformed or under `[workflow]` (rules in `interpreters/mod.rs`,
+//!   planted trees for the test-code rule in `test_spawns/mod.rs`);
 //! - the darwin-arm64 job of `.github/workflows/artifacts.yml` no longer running
 //!   `cargo xtask darwin-asset` on the packaged binary after `Package`, or
 //!   running it where its failure does not fail the job;
@@ -26,6 +28,7 @@
 //! - a drift in the rules that pick which files each lint reads (module `selection`).
 
 mod interpreters;
+mod test_spawns;
 mod workflows;
 
 use std::path::{Path, PathBuf};
@@ -226,6 +229,8 @@ struct BudgetScan {
     run_steps: usize,
     /// Rust files under `crates/*/src/` read.
     rust_files: usize,
+    /// Rust files under `crates/*/tests/` read.
+    rust_test_files: usize,
 }
 
 /// The interpreter budget scan of the listed `files`, each opened by `read` (`None`
@@ -235,6 +240,7 @@ fn interpreter_scan(files: &[String], read: impl Fn(&str) -> Option<Vec<u8>>) ->
     let mut found = Vec::new();
     let mut problems = Vec::new();
     let mut rust_src = Vec::new();
+    let mut rust_test_files = 0;
     let mut run_steps = 0;
     for f in files {
         let Some(bytes) = read(f) else {
@@ -269,25 +275,45 @@ fn interpreter_scan(files: &[String], read: impl Fn(&str) -> Option<Vec<u8>>) ->
                 ));
             }
         }
-        if interpreters::rust::is_crate_src(f) {
+        let test_file = interpreters::rust::is_crate_test(f);
+        if interpreters::rust::is_crate_src(f) || test_file {
             match String::from_utf8(bytes) {
-                Ok(text) => rust_src.push((f.clone(), text)),
+                Ok(text) => {
+                    rust_test_files += usize::from(test_file);
+                    rust_src.push((f.clone(), text));
+                }
                 Err(e) => problems.push(format!("{f}: not UTF-8 ({e})")),
             }
         }
     }
-    let (spawns, unread) = interpreters::rust::shell_c_files(&rust_src);
-    problems.extend(unread);
-    found.extend(spawns.into_iter().map(|key| Found {
+    let rust = interpreters::rust::scan(&rust_src);
+    problems.extend(rust.problems);
+    found.extend(rust.shell_c.into_iter().map(|key| Found {
         section: Section::SrcShC,
         key,
         why: "its production code names a shell and a `-c` flag".to_owned(),
+    }));
+    found.extend(rust.test_names.into_iter().map(|t| {
+        let names: Vec<String> = t
+            .names
+            .iter()
+            .map(|(name, items)| {
+                let items: Vec<String> = items.iter().map(|i| format!("`{i}`")).collect();
+                format!("`{name}` (in {})", items.join(", "))
+            })
+            .collect();
+        Found {
+            section: Section::TestInterpreters,
+            key: t.path,
+            why: format!("its test code names {}", names.join(", ")),
+        }
     }));
     BudgetScan {
         found,
         problems,
         run_steps,
-        rust_files: rust_src.len(),
+        rust_files: rust_src.len() - rust_test_files,
+        rust_test_files,
     }
 }
 
@@ -303,9 +329,10 @@ fn every_interpreter_file_workflow_script_and_shell_spawn_is_in_the_budget() {
     // Catches: a new shell, Python, awk, sed, Perl or Ruby file (by extension or by
     // its `#!` line); a row left for a file that is gone; a new workflow `run:` step
     // with shell logic, or any `[workflow]` row; a new `sh -c` in production Rust; a
+    // test file that names an interpreter with no `[test-interpreters]` row; a
     // malformed or duplicate row (module `interpreters`); and the scan passing because
-    // it read no workflow steps or no Rust sources. Sizes are not checked: an edit of a
-    // listed file passes.
+    // it read no workflow steps, no Rust sources or no test files. Sizes are not
+    // checked: an edit of a listed file passes.
     let root = repo_root();
     let files = listed_files(&root);
     let scan = interpreter_scan(&files, |f| read_bytes(&root.join(f)));
@@ -318,6 +345,11 @@ fn every_interpreter_file_workflow_script_and_shell_spawn_is_in_the_budget() {
         scan.rust_files >= 50,
         "only {} Rust files under crates/*/src read; the shell scan reads too little",
         scan.rust_files
+    );
+    assert!(
+        scan.rust_test_files >= 50,
+        "only {} Rust files under crates/*/tests read; the test-code scan reads too little",
+        scan.rust_test_files
     );
     let budget = std::fs::read_to_string(root.join(interpreters::BUDGET))
         .unwrap_or_else(|e| panic!("{}: {e}", interpreters::BUDGET));
@@ -343,7 +375,8 @@ mod budget {
     const KEEPER_RS: &str =
         r#"pub fn watch() { std::process::Command::new("/bin/sh").args(["-c", "x"]); }"#;
     const BUDGET: &str = "[files]\ntools/ci/x.sh\tCI\ntools/probe\tprobe\n\
-                          [src-sh-c]\ncrates/k/src/keeper.rs\tkeeper\n";
+                          [src-sh-c]\ncrates/k/src/keeper.rs\tkeeper\n\
+                          [test-interpreters]\ncrates/k/tests/t.rs\ttest\n";
     /// The end of the refusal of a `run:` step with shell logic.
     const ONE_COMMAND: &str = "; a `run:` step is one command, so put the logic in Rust (a \
                                `cargo xtask` verb, or a flag of the program the step runs)";
@@ -479,7 +512,7 @@ mod budget {
                     "`{CI}#test/step 3`: its `run:` script has more than one line{ONE_COMMAND}"
                 ),
                 format!(
-                    "line 7: a [workflow] row for `{CI}#test/step 3`; the section stays \
+                    "line 9: a [workflow] row for `{CI}#test/step 3`; the section stays \
                      empty, because no `run:` step may hold shell logic: make the step one \
                      command and remove the row"
                 ),
@@ -490,7 +523,8 @@ mod budget {
     #[test]
     fn an_unlisted_production_sh_c_is_refused() {
         // Catches (planted defect): `Command::new("sh").arg("-c")` in a src file with
-        // no [src-sh-c] row; the same text under `crates/*/tests/` stays allowed.
+        // no [src-sh-c] row; the same text under `crates/*/tests/` is test code (listed
+        // under `[test-interpreters]` in the control tree).
         let mut t = tree();
         t.insert(
             "crates/k/src/run.rs".to_owned(),

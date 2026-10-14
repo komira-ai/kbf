@@ -1,13 +1,18 @@
 //! The interpreter budget file, [`BUDGET`]: the shell, Python, awk, sed, Perl and Ruby
 //! this repository still holds, listed by path under a `[files]` or `[src-sh-c]` header,
-//! one `<key>\t<reason>` row each. A line starting with `#` and a blank line are
-//! skipped. [`parse`] also reads a `[workflow]` section, which once listed workflow
-//! `run:` steps with shell logic; the repository lints refuse any row in it now, and it
-//! is still read so that `budget-diff` can compare against a base list that has it.
+//! and the test code that names an interpreter, listed by path under
+//! `[test-interpreters]`; one `<key>\t<reason>` row each. A line starting with `#` and
+//! a blank line are skipped. [`parse`] also reads a `[workflow]` section, which once
+//! listed workflow `run:` steps with shell logic; the repository lints refuse any row
+//! in it now, and it is still read so that `budget-diff` can compare against a base
+//! list that has it.
 //!
 //! [`parse`] reads the file; the repository lints (`crates/kbf-it/tests/repo_lints.rs`)
 //! hold it against what the tree contains. [`new_rows`] is `cargo xtask budget-diff`:
 //! the list may only shrink, so a row a change adds is refused, whatever its file is.
+//! The one exception is a section the base list has no header for: the change that
+//! adds the header brings the section's first rows. A header the base has may not go
+//! (an empty section keeps it), so a section cannot be dropped and brought back full.
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -21,16 +26,23 @@ pub enum Section {
     Files,
     Workflow,
     SrcShC,
+    TestInterpreters,
 }
 
 impl Section {
-    const ALL: [Section; 3] = [Section::Files, Section::Workflow, Section::SrcShC];
+    const ALL: [Section; 4] = [
+        Section::Files,
+        Section::Workflow,
+        Section::SrcShC,
+        Section::TestInterpreters,
+    ];
 
     pub fn header(self) -> &'static str {
         match self {
             Section::Files => "[files]",
             Section::Workflow => "[workflow]",
             Section::SrcShC => "[src-sh-c]",
+            Section::TestInterpreters => "[test-interpreters]",
         }
     }
 }
@@ -106,19 +118,41 @@ pub fn parse(text: &str) -> (Vec<Row>, Vec<String>) {
     (rows, problems)
 }
 
+/// The sections whose header line `text` holds.
+fn headers(text: &str) -> BTreeSet<Section> {
+    let lines: BTreeSet<&str> = text.split('\n').collect();
+    Section::ALL
+        .into_iter()
+        .filter(|s| lines.contains(s.header()))
+        .collect()
+}
+
 /// The rows of `head` whose section and key `base` does not hold: what a change adds
-/// to the list. A reason edited, a row moved or a row removed is not a new row.
+/// to the list. A reason edited, a row moved or a row removed is not a new row, and
+/// neither is a row of a section whose header `base` lacks (the change adds the
+/// section).
 ///
 /// # Errors
 /// Either text has a problem [`parse`] reports, each named `base` or `head`: a
-/// comparison of a file that does not parse would compare too little.
+/// comparison of a file that does not parse would compare too little. And `head`
+/// lacks a header `base` has: dropping a header would let a later change bring the
+/// section back as new, rows and all.
 pub fn new_rows(base: &str, head: &str) -> Result<Vec<Row>, Vec<String>> {
     let (base_rows, base_problems) = parse(base);
     let (head_rows, head_problems) = parse(head);
+    let base_headers = headers(base);
+    let head_headers = headers(head);
     let problems: Vec<String> = base_problems
         .iter()
         .map(|p| format!("base {BUDGET}: {p}"))
         .chain(head_problems.iter().map(|p| format!("{BUDGET}: {p}")))
+        .chain(base_headers.difference(&head_headers).map(|s| {
+            format!(
+                "{BUDGET}: the base has the section {}, and this change removes its \
+                 header; an empty section keeps it",
+                s.header()
+            )
+        }))
         .collect();
     if !problems.is_empty() {
         return Err(problems);
@@ -129,6 +163,7 @@ pub fn new_rows(base: &str, head: &str) -> Result<Vec<Row>, Vec<String>> {
         .collect();
     Ok(head_rows
         .into_iter()
+        .filter(|r| base_headers.contains(&r.section))
         .filter(|r| !listed.contains(&(r.section, r.key.as_str())))
         .collect())
 }
@@ -190,9 +225,46 @@ mod tests {
     #[test]
     fn removed_reordered_and_reworded_rows_are_not_new() {
         // Catches: a diff that compares lines or reasons rather than keys, so a removal,
-        // a reorder or a reworded reason would be refused.
-        let head = "[src-sh-c]\nk.rs\tkeeper, reworded\n[files]\na.sh\tto port\n";
+        // a reorder or a reworded reason would be refused. (The empty `[workflow]`
+        // stays: a header the base has may not go.)
+        let head = "[src-sh-c]\nk.rs\tkeeper, reworded\n[workflow]\n[files]\na.sh\tto port\n";
         assert_eq!(new_rows(BASE, head), Ok(vec![]));
+    }
+
+    #[test]
+    fn a_section_the_base_lacks_brings_its_first_rows() {
+        // Catches: budget-diff refusing the change that adds a section (every row of a
+        // new section is new), and the exception reaching a section the base has: a new
+        // row there is still refused when another section is new.
+        let head = format!("{BASE}[test-interpreters]\nt.rs\tprobe\nu.rs\tprobe\n")
+            .replace("[files]\n", "[files]\nc.sh\tnew\n");
+        let rows = new_rows(BASE, &head).expect("both parse");
+        assert_eq!(keys(&rows), vec![(Section::Files, "c.sh")]);
+        // Once the base has the section, its rows only shrink like the others.
+        let base = format!("{BASE}[test-interpreters]\nt.rs\tprobe\n");
+        let rows = new_rows(&base, &head.replace("c.sh\tnew\n", "")).expect("both parse");
+        assert_eq!(keys(&rows), vec![(Section::TestInterpreters, "u.rs")]);
+        // An empty section in the base counts as having it.
+        let base = format!("{BASE}[test-interpreters]\n");
+        let rows = new_rows(&base, &format!("{base}t.rs\tprobe\n")).expect("both parse");
+        assert_eq!(keys(&rows), vec![(Section::TestInterpreters, "t.rs")]);
+    }
+
+    #[test]
+    fn a_header_the_base_has_may_not_go() {
+        // Catches: a change that drops an emptied section's header, after which the
+        // next change could add the section back with rows as if it were new; and the
+        // refusal naming the wrong section.
+        let base = format!("{BASE}[test-interpreters]\n");
+        assert_eq!(
+            new_rows(&base, BASE),
+            Err(vec![
+                "tools/interpreter_budget.tsv: the base has the section \
+                 [test-interpreters], and this change removes its header; an empty \
+                 section keeps it"
+                    .to_owned()
+            ])
+        );
     }
 
     #[test]
