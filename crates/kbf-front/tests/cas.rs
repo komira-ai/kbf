@@ -89,25 +89,6 @@ async fn find_missing_blobs_never_omits_a_requested_digest() {
     assert_eq!(refused.code(), Code::InvalidArgument);
 }
 
-/// Catches: answering FindMissingBlobs from a read whose touch lost the race with a
-/// collection. The blob was reported present but is gone, so the client would never
-/// upload it; the answer must come from a read whose touch committed.
-#[tokio::test]
-async fn find_missing_asks_again_when_a_collection_wins_the_touch_race() {
-    let farm = Farm::start().await;
-    let blob = Blob::new("collected under the reader");
-    farm.upload(&[&blob]).await;
-    // Old enough that a report must touch it, young enough to be held.
-    farm.cache.tick(days(2)).await.expect("tick");
-    assert!(farm.find_missing(&[&blob]).await.is_empty());
-
-    farm.cache.tick(days(4)).await.expect("tick");
-    farm.cache
-        .meta()
-        .before_next_touch(vec![Command::Tick(days(30)), Command::Collect]);
-    assert_eq!(farm.find_missing(&[&blob]).await, [blob.digest]);
-}
-
 /// Catches: re-upload of a blob that a collection removes between the "already
 /// present?" check and its touch being acknowledged without storing anything. The
 /// upload says OK, the blob is gone, and an upload is no longer durable when

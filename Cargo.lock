@@ -1321,8 +1321,10 @@ dependencies = [
  "futures",
  "hex",
  "kbf-daemon",
- "kbf-outputs",
+ "kbf-front",
  "kbf-proto",
+ "kbf-testkit",
+ "kbf-transfer",
  "kbf-types",
  "prost",
  "prost-types",
@@ -1331,6 +1333,7 @@ dependencies = [
  "sha2 0.11.0",
  "thiserror",
  "tokio",
+ "tonic",
  "tracing",
  "tracing-subscriber",
 ]
@@ -1502,6 +1505,7 @@ dependencies = [
  "time",
  "tracing",
  "tracing-subscriber",
+ "xtask",
 ]
 
 [[package]]
@@ -1742,6 +1746,7 @@ dependencies = [
 name = "kbf-testkit"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "rustix",
 ]
 

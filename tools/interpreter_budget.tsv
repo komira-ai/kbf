@@ -17,14 +17,6 @@
 [files]
 crates/kbf-it/m2/run.sh	M2 cell harness; to become kbf-cell m2
 tools/ci/m2-container.sh	CI step; to become a cargo xtask verb
-tools/ci/mac-session-tests.sh	CI tests run as root; to become Rust tests run as root
-tools/mac-provision/kbf-mac-provision	Mac host provisioning; to become a Rust crate
-tools/mac-provision/test/coverage.awk	tests of kbf-mac-provision; to become Rust tests of its crate
-tools/mac-provision/test/coverage.sh	tests of kbf-mac-provision; to become Rust tests of its crate
-tools/mac-provision/test/fakecmd	tests of kbf-mac-provision; to become Rust tests of its crate
-tools/mac-provision/test/hosted-macos.sh	tests of kbf-mac-provision; to become Rust tests of its crate
-tools/mac-provision/test/mutants.sh	tests of kbf-mac-provision; to become Rust tests of its crate
-tools/mac-provision/test/run.sh	tests of kbf-mac-provision; to become Rust tests of its crate
 
 # Production Rust under crates/*/src/ that names a shell and a `-c` flag. Key: the path.
 [src-sh-c]
@@ -39,8 +31,7 @@ crates/kbf-daemon/tests/support/memory.rs	Spec::user_shell: the tests of how the
 crates/kbf-deploy/src/pilot/server_tests.rs	data: a #!/bin/sh file planted where the server binary goes, refused as not an ELF executable; nothing runs it
 crates/kbf-driver-container/src/podman.rs	data: the sh -c argv a create-arguments test expects in --entrypoint; nothing runs it
 crates/kbf-driver-container/src/program.rs	data: sh as another program's name in the crun lookup-report test; nothing runs it
-crates/kbf-driver-container/tests/bin/fake_podman.rs	the fake podman runs a test action's action.sh with bash, standing in for the shell inside the container image
-crates/kbf-driver-container/tests/fake_podman.rs	data: a #!/bin/sh input file whose executable bit a run must keep; nothing runs it (the fake's bash runs action.sh, row above)
+crates/kbf-driver-container/tests/fake_podman.rs	data: #!/bin/sh as the bytes of an input file whose executable bit a run must keep, and of an output file an action writes; nothing runs them
 crates/kbf-driver-container/tests/podman.rs	find -exec sh -c removes sibling directories while the output walk reads them: the race needs a program find runs between two directory reads
 crates/kbf-driver-container/tests/support/mod.rs	Spec::new: the real-Podman tests' action is sh -c inside the test image (busybox), which holds no kbf binary
 crates/kbf-driver-container/tests/support/real.rs	sh(): the same action naming the image's /bin/sh by path, since the action's environment has no PATH

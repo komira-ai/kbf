@@ -86,8 +86,8 @@ async fn no_round_of_kill_and_restart_races_the_removal() {
 /// dropped again. Returns the fake and the action's pid, which runs.
 async fn kill_the_daemon(name: &str) -> (Fake, String) {
     let fake = Fake::new(name);
-    // `exec`: the pid the fake records is the sleep itself, not a shell around it.
-    fake.knob("action.sh", "exec sleep 300");
+    // The pid the fake records is the sleeping act program itself.
+    fake.action(&["sleep", "300"]);
     let action = store_action(&fake.cas, &Spec::new(&image(), "unused"));
     let runtime = Arc::clone(&fake.runtime);
     let mut run = Box::pin(async move { runtime.run(work(1, action, Resources::default())).await });

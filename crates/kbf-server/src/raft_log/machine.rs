@@ -1,6 +1,8 @@
 //! The state machine the log replicates: the metadata state, fed every committed
 //! command entry in index order.
 
+use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard};
+
 use kbf_log::{Bootstrap, DecodeError, Format, LogCommand};
 use kbf_meta::{Applied, MetaState, Retention};
 use kbf_raft::{Entry, LogIndex, Machine, Payload, Snapshot};
@@ -16,9 +18,13 @@ pub struct NoSnapshots;
 /// apply), stops the machine: it applies nothing more, and the
 /// log refuses to open ([`MetaMachine::failed`] names the first such entry). Once open,
 /// the log applies only entries it encoded itself.
+///
+/// The state sits behind its own lock ([`MetaMachine::state`]), so a query reads it
+/// without the host's lock, which a commit holds across its sync. The host applies an
+/// entry only after it is synced, so a query never sees a command that is not durable.
 #[derive(Debug)]
 pub struct MetaMachine {
-    meta: MetaState,
+    meta: Arc<RwLock<MetaState>>,
     bootstrap: Option<Bootstrap>,
     bootstraps: usize,
     /// The index and outcome of the last metadata command applied, for the caller
@@ -33,7 +39,7 @@ impl MetaMachine {
     /// An empty metadata state with `retention`, before any entry.
     pub fn new(retention: Retention) -> Self {
         Self {
-            meta: MetaState::new(retention),
+            meta: Arc::new(RwLock::new(MetaState::new(retention))),
             bootstrap: None,
             bootstraps: 0,
             answer: None,
@@ -43,8 +49,13 @@ impl MetaMachine {
     }
 
     /// The metadata state as of the last entry applied.
-    pub const fn meta(&self) -> &MetaState {
-        &self.meta
+    pub fn meta(&self) -> RwLockReadGuard<'_, MetaState> {
+        read(&self.meta)
+    }
+
+    /// The lock the state sits behind, for readers that do not hold the host.
+    pub fn state(&self) -> Arc<RwLock<MetaState>> {
+        Arc::clone(&self.meta)
     }
 
     /// The first `Bootstrap` applied, if one has been.
@@ -91,7 +102,11 @@ impl Machine for MetaMachine {
         }
         match kbf_log::decode(Format::V1, bytes) {
             Ok(LogCommand::Meta(command)) => {
-                let applied = self.meta.execute(entry.id.index.0, command);
+                let applied = self
+                    .meta
+                    .write()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .execute(entry.id.index.0, command);
                 self.answer = Some((entry.id.index, applied));
             }
             Ok(LogCommand::Bootstrap(bootstrap)) => {
@@ -118,4 +133,10 @@ impl Machine for MetaMachine {
     fn restore(&mut self, _: &Snapshot) -> Result<(), NoSnapshots> {
         Err(NoSnapshots)
     }
+}
+
+/// Reads `state`. `MetaState::execute` does not panic midway through a change, so a
+/// poisoned state is still whole.
+pub fn read(state: &RwLock<MetaState>) -> RwLockReadGuard<'_, MetaState> {
+    state.read().unwrap_or_else(PoisonError::into_inner)
 }

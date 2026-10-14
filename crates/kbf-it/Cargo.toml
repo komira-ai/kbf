@@ -15,8 +15,8 @@ name = "kbf-cell"
 path = "src/bin/kbf-cell.rs"
 
 # `kbf-m2-act`, the program every action of the M2 sample project runs (`m2/`): the
-# M2 image has no shell. Its verbs are kbf-testkit's (the standard library and rustix
-# only), so CI can still link it statically.
+# M2 image has no shell. Its verbs are kbf-testkit's (the standard library, rustix and
+# two plain libc calls), so CI can still link it statically.
 [[bin]]
 name = "kbf-m2-act"
 path = "src/bin/kbf-m2-act.rs"

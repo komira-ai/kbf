@@ -63,8 +63,13 @@ async fn inputs_are_links_to_the_cache_and_only_directories_change_owner() {
         ("out/o.txt", b"input bytes", false),
     ];
     spec.outputs = vec!["out/o.txt".to_owned(), "stat".to_owned()];
-    let script = r#"stat -c '%i %h' "$ROOT/src/a.txt" "$UPPER/out/o.txt" > "$UPPER/stat""#;
-    let first = fake.run(1, &spec, script).await.expect("first");
+    let steps = [
+        "inode-links",
+        "$UPPER/stat",
+        "$ROOT/src/a.txt",
+        "$UPPER/out/o.txt",
+    ];
+    let first = fake.run(1, &spec, &steps).await.expect("first");
     assert_eq!(first.exit_code, 0, "{first:?}");
     let entry = entry_inode(&fake, b"input bytes");
     let stat =
@@ -104,7 +109,7 @@ async fn inputs_are_links_to_the_cache_and_only_directories_change_owner() {
     );
     let inputs = fake.runtime.last_inputs().expect("counted");
     assert_eq!((inputs.files, inputs.cache_misses), (2, 2));
-    fake.run(2, &spec, script).await.expect("second");
+    fake.run(2, &spec, &steps).await.expect("second");
     let inputs = fake.runtime.last_inputs().expect("counted");
     assert_eq!(
         (inputs.cache_hits, inputs.fetched_bytes),
@@ -128,9 +133,13 @@ async fn an_output_named_input_under_the_working_directory_is_a_private_copy() {
         ("pkg/out/o.txt", b"input bytes", false),
     ];
     spec.outputs = vec!["out/o.txt".to_owned(), "stat".to_owned()];
-    let script =
-        r#"stat -c '%i %h' "$ROOT/pkg/src/a.txt" "$UPPER/pkg/out/o.txt" > "$UPPER/pkg/stat""#;
-    let result = fake.run(1, &spec, script).await.expect("ran");
+    let steps = [
+        "inode-links",
+        "$UPPER/pkg/stat",
+        "$ROOT/pkg/src/a.txt",
+        "$UPPER/pkg/out/o.txt",
+    ];
+    let result = fake.run(1, &spec, &steps).await.expect("ran");
     assert_eq!(result.exit_code, 0, "{result:?}");
     let entry = entry_inode(&fake, b"input bytes");
     let stat =
@@ -155,7 +164,7 @@ async fn a_start_whose_exec_found_the_program_busy_runs_once_more() {
     let spec = Spec::new(&image(), "unused");
     fake.knob("busy-once", "");
     let result = fake
-        .run(1, &spec, "exit 4")
+        .run(1, &spec, &["exit", "4"])
         .await
         .expect("ran on the second start");
     assert_eq!(result.exit_code, 4);
@@ -172,7 +181,9 @@ async fn a_failed_directory_hand_over_fails_the_lease() {
     for owner in ["1:1", "0:0"] {
         let fake = cached(&format!("chown-dirs-{}", &owner[..1]));
         fake.knob("chown-fails", owner);
-        let outcome = fake.run(1, &Spec::new(&image(), "unused"), "exit 0").await;
+        let outcome = fake
+            .run(1, &Spec::new(&image(), "unused"), &["exit", "0"])
+            .await;
         assert!(
             matches!(&outcome, Err(RuntimeError::Failed(why)) if why.starts_with("podman unshare chown-dirs: ")),
             "{owner}: {outcome:?}"
