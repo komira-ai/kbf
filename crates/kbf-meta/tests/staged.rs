@@ -196,6 +196,9 @@ fn a_put_that_adds_to_a_sealed_object_is_refused() {
         part(5, 100, &[(2, 0)]),
         // Every blob listed, but past the committed length.
         part(5, 200, &[(1, 0)]),
+        // One blob already listed and one new one, within the length: the new one is
+        // still an addition (a repeat must list nothing new, not something old).
+        part(5, 100, &[(1, 0), (2, 50)]),
     ] {
         assert_eq!(
             stage(&mut m, late.clone()),
@@ -428,10 +431,15 @@ fn a_refused_put_changes_nothing() {
 /// staged objects are still on the old one (their blocks would never be recovered or
 /// flushed), and a retired id registered again (a stale `TIER` file on a remounted disk
 /// would pass the start check). A server's current tier registered again is a no-op.
+/// Only the server's own old tier counts: an object staged on another server's tier
+/// must not block it (mutant: refuse while any object is staged on any tier, which
+/// would refuse one server's --write-tier-abandon whenever another has unflushed data).
 #[test]
 fn one_tier_per_server_and_an_id_is_never_reused() {
     let mut m = tiered();
     let next = TierId::new(8);
+    let other = ServerId::new(3);
+    let other_tier = TierId::new(9);
     assert_eq!(m.tier(SERVER), Some(TIER));
     assert_eq!(m.tier(ServerId::new(2)), None);
     assert_eq!(tier_cmd(&mut m, add(SERVER, TIER)), Ok(()));
@@ -453,10 +461,16 @@ fn one_tier_per_server_and_an_id_is_never_reused() {
     );
     assert_eq!(m.tier(SERVER), Some(TIER));
 
+    // Another server's tier holds a staged object through all of this.
+    assert_eq!(tier_cmd(&mut m, add(other, other_tier)), Ok(()));
+    put_on(&mut m, other_tier, vec![part(20, 100, &[(3, 0)])]).expect("other open");
+
     // What --write-tier-abandon does: mark every staged object missing, then register.
     mark_missing(&mut m, 5);
     assert_eq!(tier_cmd(&mut m, add(SERVER, next)), Ok(()));
     assert_eq!(m.tier(SERVER), Some(next));
+    assert_eq!(m.tier(other), Some(other_tier));
+    assert_eq!(state(&m, 20), Some(StagedState::Open));
     assert_eq!(
         tier_cmd(&mut m, add(ServerId::new(2), TIER)),
         Err(TierError::TierRetired(TIER))

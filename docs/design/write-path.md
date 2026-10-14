@@ -299,10 +299,16 @@ holds only what has not been flushed, so it is bounded by the budget. An object 
 it on `ObjectFlushed`, or on `ObjectUnreachable` (its block is not to be trusted, and
 the restart sweep deletes it). Each object that left is remembered, with the farm time
 it left, for the blob retention (`min_ttl` plus the touch quantum), so a late or retried
-`PutStaged` cannot stage it again; `Collect` forgets older ones. `tier` is the server's
+`PutStaged` cannot stage it again; `Collect` forgets older ones. That is a stated
+limit, not an accident: a commit that arrives more than the retention after its object
+left would stage it again (a test pins it), and it is accepted because no forward or
+retry lives that long. `SealStaged` for an object that was never staged answers
+`NotStaged`, so a block whose every group failed to commit has nothing to seal; PR 4 must
+treat that block as an orphan for the restart sweep. `tier` is the server's
 tier id, committed once by `Command::AddTier { server, tier }` the first time a
 directory is opened, and written to `<dir>/TIER`. A server has one tier at a time:
-`AddTier` with another id is refused while the old tier holds a staged object (the
+`AddTier` with another id is refused while that server's old tier holds a staged
+object (objects on other servers' tiers do not count; the
 abandon flag marks them unreachable first), retires the old id, and a retired id is
 never registered again.
 
