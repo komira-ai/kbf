@@ -38,24 +38,72 @@ async fn a_run_collects_everything_and_leaves_nothing() {
         "out/link".to_owned(),
         "out/never-written".to_owned(),
     ];
-    let script = r#"
-        set -e
-        out="$UPPER/pkg/out"
-        [ -d "$out" ]
-        [ -x "$ROOT/tool.sh" ] && [ ! -x "$ROOT/pkg/src/in.txt" ]
-        [ "$(readlink "$ROOT/pkg/link-in")" = src/in.txt ]
-        cp "$ROOT/pkg/src/in.txt" "$out/copy.txt"
-        mkdir -p "$out/dir/sub"
-        echo nested > "$out/dir/sub/n.txt"
-        printf '#!/bin/sh\n' > "$out/dir/run.sh"; chmod +x "$out/dir/run.sh"
-        ln -s sub/n.txt "$out/dir/to-n"
-        mkfifo "$out/dir/fifo"
-        ln -s copy.txt "$out/link"
-        cat "$CG/memory.max" "$CG/memory.oom.group" "$CG/cpu.weight" "$CG/cgroup.subtree_control" > "$out/dir/limits"
-        echo to-stdout; echo to-stderr >&2
-        exit 3
-    "#;
-    let result = fake.run(1, &spec, script).await.expect("ran");
+    let steps = [
+        "test",
+        "-d",
+        "$UPPER/pkg/out",
+        ";",
+        "test",
+        "-x",
+        "$ROOT/tool.sh",
+        ";",
+        "test",
+        "!",
+        "-x",
+        "$ROOT/pkg/src/in.txt",
+        ";",
+        "points-to",
+        "$ROOT/pkg/link-in",
+        "src/in.txt",
+        ";",
+        "copy",
+        "$UPPER/pkg/out/copy.txt",
+        "$ROOT/pkg/src/in.txt",
+        ";",
+        "mkdir",
+        "$UPPER/pkg/out/dir/sub",
+        ";",
+        "write-lines",
+        "$UPPER/pkg/out/dir/sub/n.txt",
+        "nested",
+        ";",
+        "write-lines",
+        "$UPPER/pkg/out/dir/run.sh",
+        "#!/bin/sh",
+        ";",
+        "chmod",
+        "755",
+        "$UPPER/pkg/out/dir/run.sh",
+        ";",
+        "symlink",
+        "sub/n.txt",
+        "$UPPER/pkg/out/dir/to-n",
+        ";",
+        "mkfifo",
+        "$UPPER/pkg/out/dir/fifo",
+        ";",
+        "symlink",
+        "copy.txt",
+        "$UPPER/pkg/out/link",
+        ";",
+        "copy",
+        "$UPPER/pkg/out/dir/limits",
+        "$CG/memory.max",
+        "$CG/memory.oom.group",
+        "$CG/cpu.weight",
+        "$CG/cgroup.subtree_control",
+        ";",
+        "echo",
+        "to-stdout",
+        ";",
+        "echo",
+        "--stderr",
+        "to-stderr",
+        ";",
+        "exit",
+        "3",
+    ];
+    let result = fake.run(1, &spec, &steps).await.expect("ran");
     assert_eq!(result.exit_code, 3);
     assert_eq!(
         blob(&fake.cas, result.stdout_digest.as_ref()),
@@ -113,12 +161,19 @@ async fn a_run_collects_everything_and_leaves_nothing() {
 async fn the_marker_test_nothing_outside_the_outputs_survives() {
     let fake = Fake::new("leftovers");
     let spec = Spec::new(&image(), "unused");
-    let script = r#"
-        echo marker > "$UPPER/../marker"
-        echo marker > "$UPPER/marker"
-        mkdir "$CG/marker-cgroup"
-    "#;
-    let result = fake.run(1, &spec, script).await.expect("ran");
+    let steps = [
+        "write-lines",
+        "$UPPER/../marker",
+        "marker",
+        ";",
+        "write-lines",
+        "$UPPER/marker",
+        "marker",
+        ";",
+        "mkdir",
+        "$CG/marker-cgroup",
+    ];
+    let result = fake.run(1, &spec, &steps).await.expect("ran");
     assert_eq!(result.exit_code, 0);
     fake.assert_clean(1);
     let left: Vec<_> = walk(&fake.dir)
@@ -152,7 +207,7 @@ fn walk(dir: &Path) -> Vec<PathBuf> {
 async fn a_tag_is_refused_before_anything_runs() {
     let fake = Fake::new("tag");
     let spec = Spec::new("docker://registry.test/tools/busybox:latest", "unused");
-    let outcome = fake.run(1, &spec, "exit 0").await;
+    let outcome = fake.run(1, &spec, &["exit", "0"]).await;
     assert!(
         matches!(outcome, Err(RuntimeError::Invalid(ref why)) if why.contains("digest")),
         "{outcome:?}"
@@ -173,7 +228,7 @@ async fn an_index_digest_is_refused() {
     let index = sha256(INDEX);
     fake.store_manifest(&index, INDEX);
     let outcome = fake
-        .run(1, &Spec::new(&image_by(&index), "unused"), "exit 0")
+        .run(1, &Spec::new(&image_by(&index), "unused"), &["exit", "0"])
         .await;
     assert!(
         matches!(outcome, Err(RuntimeError::Invalid(ref why)) if why.contains("image index")),
@@ -251,7 +306,7 @@ async fn an_image_the_store_cannot_vouch_for_is_an_infrastructure_failure() {
     for (seq, (want, break_it, mend_it)) in cases.iter().enumerate() {
         let seq = seq as u64 + 1;
         break_it();
-        let outcome = fake.run(seq, &spec, "exit 0").await;
+        let outcome = fake.run(seq, &spec, &["exit", "0"]).await;
         assert!(
             matches!(outcome, Err(RuntimeError::Failed(ref why)) if why.contains(want)),
             "{want}: {outcome:?}"
@@ -259,7 +314,7 @@ async fn an_image_the_store_cannot_vouch_for_is_an_infrastructure_failure() {
         fake.assert_clean(seq);
         mend_it();
     }
-    let result = fake.run(9, &spec, "exit 0").await.expect("mended");
+    let result = fake.run(9, &spec, &["exit", "0"]).await.expect("mended");
     assert_eq!(result.exit_code, 0);
 }
 
@@ -273,7 +328,13 @@ async fn a_timeout_stops_the_action_and_cleans_up() {
     // Room for the two echoes to land before the timeout on a loaded runner.
     spec.timeout = Some(Duration::from_secs(1));
     let outcome = fake
-        .run(1, &spec, "echo started; echo warming >&2; sleep 30")
+        .run(
+            1,
+            &spec,
+            &[
+                "echo", "started", ";", "echo", "--stderr", "warming", ";", "sleep", "30",
+            ],
+        )
         .await;
     let Err(RuntimeError::TimedOut { stdout, stderr }) = outcome else {
         panic!("{outcome:?}");
@@ -296,29 +357,34 @@ async fn a_timed_out_log_past_its_limit_is_left_out() {
     });
     let mut spec = Spec::new(&image(), "unused");
     spec.timeout = Some(Duration::from_secs(1));
-    let past = MAX + 1;
+    let past = (MAX + 1).to_string();
+    let past = past.as_str();
     let cases = [
         (
             1,
-            format!("head -c {past} /dev/zero; echo kept >&2; sleep 30"),
+            [
+                "zeros", past, ";", "echo", "--stderr", "kept", ";", "sleep", "30",
+            ],
         ),
         (
             2,
-            format!("echo kept; head -c {past} /dev/zero >&2; sleep 30"),
+            [
+                "echo", "kept", ";", "zeros", "--stderr", past, ";", "sleep", "30",
+            ],
         ),
     ];
-    for (seq, script) in cases {
-        let outcome = fake.run(seq, &spec, &script).await;
+    for (seq, steps) in cases {
+        let outcome = fake.run(seq, &spec, &steps).await;
         let Err(RuntimeError::TimedOut { stdout, stderr }) = outcome else {
-            panic!("{script}: {outcome:?}");
+            panic!("{steps:?}: {outcome:?}");
         };
         let (kept, left_out) = if seq == 1 {
             (stderr, stdout)
         } else {
             (stdout, stderr)
         };
-        assert_eq!(left_out, None, "{script}");
-        assert_eq!(blob(&fake.cas, kept.as_ref()), b"kept\n", "{script}");
+        assert_eq!(left_out, None, "{steps:?}");
+        assert_eq!(blob(&fake.cas, kept.as_ref()), b"kept\n", "{steps:?}");
         fake.assert_clean(seq);
     }
 }
@@ -329,7 +395,7 @@ async fn a_timed_out_log_past_its_limit_is_left_out() {
 async fn kill_stops_the_action_and_returns_once_clean() {
     let fake = Fake::new("kill");
     let spec = Spec::new(&image(), "unused");
-    fake.knob("action.sh", "sleep 30");
+    fake.action(&["sleep", "30"]);
     let action = store_action(&fake.cas, &spec);
     let runtime = Arc::clone(&fake.runtime);
     let run = tokio::spawn(async move { runtime.run(work(1, action, Resources::default())).await });
@@ -342,6 +408,27 @@ async fn kill_stops_the_action_and_returns_once_clean() {
     fake.runtime.kill(kbf_types::LeaseId::new(1, 1)).await;
 }
 
+/// Catches the fake running an action through a shell, or through any program but
+/// the act program it is given (`kbf-act` beside `podman`, a link to this test
+/// binary): the process `start` runs, whose pid the fake publishes, executes this
+/// binary. A fake that handed the steps to `bash` would show bash's executable here.
+#[tokio::test]
+async fn the_action_is_the_act_program_and_no_shell() {
+    let fake = Fake::new("act-exe");
+    fake.action(&["sleep", "2"]);
+    let action = store_action(&fake.cas, &Spec::new(&image(), "unused"));
+    let runtime = Arc::clone(&fake.runtime);
+    let run = tokio::spawn(async move { runtime.run(work(1, action, Resources::default())).await });
+    fake.wait_for_start().await;
+    let pid = std::fs::read_to_string(fake.state.join("pid")).expect("pid");
+    let exe = std::fs::read_link(format!("/proc/{}/exe", pid.trim())).expect("its executable");
+    let this = std::env::current_exe().expect("this test binary");
+    assert_eq!(exe, this, "the action runs another program");
+    let result = run.await.expect("join").expect("ran");
+    assert_eq!(result.exit_code, 0);
+    fake.assert_clean(1);
+}
+
 /// Catches the kill path skipping `cgroup.kill` after the SIGTERM grace period: an
 /// action that ignores SIGTERM must die from the lease cgroup's `cgroup.kill`, and
 /// `podman start` must then end on its own within the second grace period. Without
@@ -352,13 +439,14 @@ async fn sigterm_ignored_falls_back_to_cgroup_kill() {
     // Slack for a loaded machine, without changing what is checked. The fake notices
     // cgroup.kill by polling, and the default 300 ms grace can pass before it looks;
     // a skipped cgroup.kill still shows, since `start` then ends only by the kill
-    // after the second grace. The timeout gives the action time to set its trap: a
+    // after the second grace. The timeout gives the action time to ignore SIGTERM: a
     // SIGTERM before that ends it in the first grace, with no cgroup.kill.
     let fake = Fake::with("cgroup-kill", |c| c.kill_grace = Duration::from_secs(3));
     let mut spec = Spec::new(&image(), "unused");
     spec.timeout = Some(Duration::from_secs(2));
-    let script = "trap '' TERM; while :; do sleep 0.05; done";
-    let outcome = fake.run(1, &spec, script).await;
+    // SIGTERM is 15.
+    let steps = ["ignore-signal", "15", ";", "sleep", "30"];
+    let outcome = fake.run(1, &spec, &steps).await;
     assert!(
         matches!(outcome, Err(RuntimeError::TimedOut { .. })),
         "{outcome:?}"
@@ -381,7 +469,7 @@ async fn sigterm_ignored_falls_back_to_cgroup_kill() {
 async fn a_dropped_run_still_cleans_up() {
     let fake = Fake::new("dropped");
     let spec = Spec::new(&image(), "unused");
-    fake.knob("action.sh", "sleep 30");
+    fake.action(&["sleep", "30"]);
     let action = store_action(&fake.cas, &spec);
     let runtime = Arc::clone(&fake.runtime);
     let run = tokio::spawn(async move { runtime.run(work(1, action, Resources::default())).await });
@@ -426,7 +514,7 @@ async fn no_round_of_a_dropped_run_races_the_clean() {
     let _hog = support::CpuHog::start();
     for round in 0..200 {
         let fake = Fake::new(&format!("dropped-stress-{round}"));
-        fake.knob("action.sh", "sleep 30");
+        fake.action(&["sleep", "30"]);
         let action = store_action(&fake.cas, &Spec::new(&image(), "unused"));
         let runtime = Arc::clone(&fake.runtime);
         let run =
@@ -444,7 +532,7 @@ async fn podman_failures_are_infrastructure_failures() {
     let fake = Fake::new("podman-fails");
     let spec = Spec::new(&image(), "unused");
     fake.knob("create-fails", "");
-    let outcome = fake.run(1, &spec, "exit 0").await;
+    let outcome = fake.run(1, &spec, &["exit", "0"]).await;
     assert!(
         matches!(outcome, Err(RuntimeError::Failed(ref why)) if why.contains("create refused")),
         "{outcome:?}"
@@ -457,7 +545,7 @@ async fn podman_failures_are_infrastructure_failures() {
 
     std::fs::remove_file(fake.state.join("create-fails")).expect("rm knob");
     fake.knob("status-override", "created 0\n");
-    let outcome = fake.run(2, &spec, "exit 0").await;
+    let outcome = fake.run(2, &spec, &["exit", "0"]).await;
     assert!(
         matches!(outcome, Err(RuntimeError::Failed(ref why)) if why.contains("did not run")),
         "{outcome:?}"
@@ -465,7 +553,7 @@ async fn podman_failures_are_infrastructure_failures() {
     fake.assert_clean(2);
 
     fake.knob("status-override", "exited many\n");
-    let outcome = fake.run(3, &spec, "exit 0").await;
+    let outcome = fake.run(3, &spec, &["exit", "0"]).await;
     assert!(
         matches!(outcome, Err(RuntimeError::Failed(ref why)) if why.contains("exit code")),
         "{outcome:?}"
@@ -474,7 +562,7 @@ async fn podman_failures_are_infrastructure_failures() {
 
     std::fs::remove_file(fake.state.join("status-override")).expect("rm knob");
     fake.knob("inspect-fails", "");
-    let outcome = fake.run(4, &spec, "exit 0").await;
+    let outcome = fake.run(4, &spec, &["exit", "0"]).await;
     assert!(
         matches!(outcome, Err(RuntimeError::Failed(ref why)) if why.contains("inspect refused")),
         "{outcome:?}"
@@ -491,7 +579,7 @@ async fn the_drivers_own_file_failures_are_infrastructure_failures() {
     let fake = Fake::new("driver-files");
     let mut spec = Spec::new(&image(), "unused");
     spec.outputs = vec![format!("out/{}/f", "n".repeat(300))];
-    let outcome = fake.run(1, &spec, "exit 0").await;
+    let outcome = fake.run(1, &spec, &["exit", "0"]).await;
     assert!(
         matches!(outcome, Err(RuntimeError::Failed(ref why)) if why.contains("upper/out/nnn")),
         "{outcome:?}"
@@ -501,7 +589,7 @@ async fn the_drivers_own_file_failures_are_infrastructure_failures() {
     let spec = Spec::new(&image(), "unused");
     for (seq, log) in [(2, "stdout"), (3, "stderr")] {
         fake.knob("block-log", log);
-        let outcome = fake.run(seq, &spec, "exit 0").await;
+        let outcome = fake.run(seq, &spec, &["exit", "0"]).await;
         let want = format!("kbf-lease-1-{seq}/{log}: ");
         assert!(
             matches!(outcome, Err(RuntimeError::Failed(ref why)) if why.contains(&want)),
@@ -512,9 +600,7 @@ async fn the_drivers_own_file_failures_are_infrastructure_failures() {
     std::fs::remove_file(fake.state.join("block-log")).expect("rm knob");
 
     // The fake runs the action beside the lease directory, so it can unlink a log.
-    let outcome = fake
-        .run(4, &spec, r#"rm "$(dirname "$ROOT")/stderr""#)
-        .await;
+    let outcome = fake.run(4, &spec, &["remove", "$ROOT/../stderr"]).await;
     assert!(
         matches!(outcome, Err(RuntimeError::Failed(ref why)) if why.contains("kbf-lease-1-4/stderr: ")),
         "{outcome:?}"
@@ -529,7 +615,9 @@ async fn a_failed_run_with_a_failed_clean_reports_the_run() {
     let fake = Fake::new("both-fail");
     fake.knob("create-fails", "");
     fake.knob("rm-fails", "");
-    let outcome = fake.run(1, &Spec::new(&image(), "unused"), "exit 0").await;
+    let outcome = fake
+        .run(1, &Spec::new(&image(), "unused"), &["exit", "0"])
+        .await;
     assert!(
         matches!(outcome, Err(RuntimeError::Failed(ref why)) if why.contains("create refused")),
         "{outcome:?}"
@@ -542,7 +630,9 @@ async fn a_failed_run_with_a_failed_clean_reports_the_run() {
 async fn a_missing_podman_is_an_infrastructure_failure() {
     let fake = Fake::new("no-podman");
     std::fs::remove_file(fake.dir.join("podman")).expect("unlink podman");
-    let outcome = fake.run(1, &Spec::new(&image(), "unused"), "exit 0").await;
+    let outcome = fake
+        .run(1, &Spec::new(&image(), "unused"), &["exit", "0"])
+        .await;
     assert!(
         matches!(outcome, Err(RuntimeError::Failed(ref why)) if why.starts_with("run ")),
         "{outcome:?}"
@@ -562,7 +652,9 @@ async fn the_kill_path_ends_even_when_every_signal_fails() {
     let mut spec = Spec::new(&image(), "unused");
     spec.timeout = Some(Duration::from_millis(200));
     // With its lease cgroup gone, cgroup.kill cannot be written either.
-    let outcome = fake.run(1, &spec, r#"find "$CG" -delete; sleep 30"#).await;
+    let outcome = fake
+        .run(1, &spec, &["remove", "$CG", ";", "sleep", "30"])
+        .await;
     assert!(
         matches!(outcome, Err(RuntimeError::TimedOut { .. })),
         "{outcome:?}"
@@ -580,7 +672,9 @@ async fn the_kill_path_ends_even_when_every_signal_fails() {
 async fn a_failed_clean_fails_the_lease() {
     let fake = Fake::new("rm-fails");
     fake.knob("rm-fails", "");
-    let outcome = fake.run(1, &Spec::new(&image(), "unused"), "exit 0").await;
+    let outcome = fake
+        .run(1, &Spec::new(&image(), "unused"), &["exit", "0"])
+        .await;
     assert!(
         matches!(outcome, Err(RuntimeError::Failed(ref why)) if why.starts_with("clean:")),
         "{outcome:?}"
@@ -593,8 +687,18 @@ async fn a_failed_clean_fails_the_lease() {
 async fn unremovable_scratch_falls_back_to_podman_unshare() {
     let fake = Fake::new("unshare");
     let spec = Spec::new(&image(), "unused");
-    let script = r#"mkdir "$UPPER/locked"; touch "$UPPER/locked/f"; chmod 000 "$UPPER/locked""#;
-    let result = fake.run(1, &spec, script).await.expect("ran");
+    let locked = [
+        "mkdir",
+        "$UPPER/locked",
+        ";",
+        "write-lines",
+        "$UPPER/locked/f",
+        ";",
+        "chmod",
+        "000",
+        "$UPPER/locked",
+    ];
+    let result = fake.run(1, &spec, &locked).await.expect("ran");
     assert_eq!(result.exit_code, 0);
     assert!(fake.calls().contains(&"unshare rm".to_owned()));
     fake.assert_clean(1);
@@ -603,15 +707,25 @@ async fn unremovable_scratch_falls_back_to_podman_unshare() {
     // unlinked, so this falls back too.
     let unshares = |fake: &Fake| fake.calls().iter().filter(|c| *c == "unshare rm").count();
     let before = unshares(&fake);
-    let readonly = r#"mkdir "$UPPER/ro"; touch "$UPPER/ro/f"; chmod 500 "$UPPER/ro""#;
-    let result = fake.run(4, &spec, readonly).await.expect("ran");
+    let readonly = [
+        "mkdir",
+        "$UPPER/ro",
+        ";",
+        "write-lines",
+        "$UPPER/ro/f",
+        ";",
+        "chmod",
+        "500",
+        "$UPPER/ro",
+    ];
+    let result = fake.run(4, &spec, &readonly).await.expect("ran");
     assert_eq!(result.exit_code, 0);
     assert_eq!(unshares(&fake), before + 1);
     fake.assert_clean(4);
 
     // verify-clean: a removal that claims success but leaves the directory is caught.
     fake.knob("unshare-noop", "");
-    let outcome = fake.run(2, &spec, script).await;
+    let outcome = fake.run(2, &spec, &locked).await;
     assert!(
         matches!(outcome, Err(RuntimeError::Failed(ref why)) if why.contains("still exists")),
         "{outcome:?}"
@@ -619,7 +733,7 @@ async fn unremovable_scratch_falls_back_to_podman_unshare() {
 
     std::fs::remove_file(fake.state.join("unshare-noop")).expect("rm knob");
     fake.knob("unshare-fails", "");
-    let outcome = fake.run(3, &spec, script).await;
+    let outcome = fake.run(3, &spec, &locked).await;
     assert!(
         matches!(outcome, Err(RuntimeError::Failed(ref why)) if why.contains("unshare refused")),
         "{outcome:?}"
@@ -642,7 +756,7 @@ async fn invalid_actions_are_refused_before_anything_runs() {
         .iter()
         .enumerate()
     {
-        let outcome = fake.run(seq as u64 + 1, spec, "exit 0").await;
+        let outcome = fake.run(seq as u64 + 1, spec, &["exit", "0"]).await;
         assert!(
             matches!(outcome, Err(RuntimeError::Invalid(_))),
             "{outcome:?}"
@@ -710,7 +824,7 @@ async fn the_environment_reaches_podman_and_odd_outputs_are_left_out() {
     spec.env = vec![("FOO".to_owned(), "a b=c".to_owned())];
     spec.outputs = vec!["pipe".to_owned()];
     let result = fake
-        .run(1, &spec, r#"mkfifo "$UPPER/pipe""#)
+        .run(1, &spec, &["mkfifo", "$UPPER/pipe"])
         .await
         .expect("ran");
     let args = std::fs::read_to_string(fake.state.join("create.args")).expect("args");
@@ -736,7 +850,7 @@ async fn the_configured_limits_reach_podman_create() {
     });
     let mut spec = Spec::new(&image(), "unused");
     spec.env = vec![("A".to_owned(), "1".to_owned())];
-    fake.run(1, &spec, "true").await.expect("ran");
+    fake.run(1, &spec, &["exit", "0"]).await.expect("ran");
     let args = std::fs::read_to_string(fake.state.join("create.args")).expect("args");
     let args: Vec<&str> = args.lines().collect();
     for expected in [
@@ -761,7 +875,7 @@ async fn a_node_that_cannot_prepare_fails_the_lease() {
     let fake = Fake::new("unprepared");
     let spec = Spec::new(&image(), "unused");
     std::fs::remove_dir(fake.cgroup.join("actions")).expect("rm actions");
-    let outcome = fake.run(1, &spec, "exit 0").await;
+    let outcome = fake.run(1, &spec, &["exit", "0"]).await;
     assert!(
         matches!(outcome, Err(RuntimeError::Failed(ref why)) if why.contains("kbf-lease-1-1")),
         "{outcome:?}"
@@ -770,7 +884,7 @@ async fn a_node_that_cannot_prepare_fails_the_lease() {
 
     std::fs::create_dir(fake.cgroup.join("actions")).expect("mkdir actions");
     std::fs::remove_dir(&fake.scratch).expect("rm scratch");
-    let outcome = fake.run(2, &spec, "exit 0").await;
+    let outcome = fake.run(2, &spec, &["exit", "0"]).await;
     assert!(
         matches!(outcome, Err(RuntimeError::Failed(_))),
         "{outcome:?}"
@@ -784,7 +898,9 @@ async fn a_node_that_cannot_prepare_fails_the_lease() {
 async fn a_podman_gone_after_create_fails_the_lease() {
     let fake = Fake::new("vanish");
     fake.knob("vanish-after-create", "");
-    let outcome = fake.run(1, &Spec::new(&image(), "unused"), "exit 0").await;
+    let outcome = fake
+        .run(1, &Spec::new(&image(), "unused"), &["exit", "0"])
+        .await;
     assert!(
         matches!(outcome, Err(RuntimeError::Failed(ref why)) if why.starts_with("run ")),
         "{outcome:?}"
@@ -800,14 +916,21 @@ async fn unreadable_outputs_fail_and_shadowed_ones_are_absent() {
     let fake = Fake::new("shadowed");
     let mut spec = Spec::new(&image(), "unused");
     spec.outputs = vec!["gone/x".to_owned()];
-    let script = r#"rmdir "$UPPER/gone"; touch "$UPPER/gone""#;
-    let result = fake.run(1, &spec, script).await.expect("ran");
+    let steps = ["remove", "$UPPER/gone", ";", "write-lines", "$UPPER/gone"];
+    let result = fake.run(1, &spec, &steps).await.expect("ran");
     assert!(result.output_files.is_empty(), "{result:?}");
     fake.assert_clean(1);
 
     spec.outputs = vec!["locked/x".to_owned()];
-    let script = r#"touch "$UPPER/locked/x"; chmod 000 "$UPPER/locked""#;
-    let outcome = fake.run(2, &spec, script).await;
+    let steps = [
+        "write-lines",
+        "$UPPER/locked/x",
+        ";",
+        "chmod",
+        "000",
+        "$UPPER/locked",
+    ];
+    let outcome = fake.run(2, &spec, &steps).await;
     assert!(
         matches!(outcome, Err(RuntimeError::Failed(ref why)) if why.contains("locked/x")),
         "{outcome:?}"
@@ -830,8 +953,15 @@ async fn an_action_cannot_upload_a_host_file_through_a_symlink() {
     let mut spec = Spec::new(&image(), "unused");
     spec.working_directory = "pkg".to_owned();
     spec.outputs = vec!["d/key.pem".to_owned(), "d".to_owned()];
-    let script = format!(r#"rm -rf "$UPPER/pkg/d"; ln -s '{host}' "$UPPER/pkg/d""#);
-    let result = fake.run(1, &spec, &script).await.expect("ran");
+    let steps = [
+        "remove",
+        "$UPPER/pkg/d",
+        ";",
+        "symlink",
+        host.as_str(),
+        "$UPPER/pkg/d",
+    ];
+    let result = fake.run(1, &spec, &steps).await.expect("ran");
     assert!(result.output_files.is_empty(), "{result:?}");
     assert_eq!(result.output_symlinks.len(), 1, "{result:?}");
     assert_eq!(result.output_symlinks[0].path, "d");
@@ -839,8 +969,15 @@ async fn an_action_cannot_upload_a_host_file_through_a_symlink() {
     fake.assert_clean(1);
 
     spec.outputs = vec!["key.pem".to_owned()];
-    let script = format!(r#"rm -rf "$UPPER/pkg"; ln -s '{host}' "$UPPER/pkg""#);
-    let result = fake.run(2, &spec, &script).await.expect("ran");
+    let steps = [
+        "remove",
+        "$UPPER/pkg",
+        ";",
+        "symlink",
+        host.as_str(),
+        "$UPPER/pkg",
+    ];
+    let result = fake.run(2, &spec, &steps).await.expect("ran");
     assert!(result.output_files.is_empty(), "{result:?}");
     fake.assert_clean(2);
     let digest = kbf_daemon::cas::digest_of(secret);
@@ -859,16 +996,24 @@ async fn an_output_too_deep_fails_the_action_not_the_daemon() {
     support::deep(&tree, 3000, b"bottom");
     let mut spec = Spec::new(&image(), "unused");
     spec.outputs = vec!["out".to_owned()];
-    let script = format!(r#"mv '{}' "$UPPER/out""#, tree.display());
-    let outcome = fake.run(1, &spec, &script).await;
+    let tree = tree.display().to_string();
+    let steps = ["rename", tree.as_str(), "$UPPER/out"];
+    let outcome = fake.run(1, &spec, &steps).await;
     assert!(
         matches!(outcome, Err(RuntimeError::Failed(ref why)) if why.contains("--output-max-depth")),
         "{outcome:?}"
     );
     fake.assert_clean(1);
-    let script = r#"mkdir "$UPPER/out"; echo x > "$UPPER/out/f""#;
+    let steps = [
+        "mkdir",
+        "$UPPER/out",
+        ";",
+        "write-lines",
+        "$UPPER/out/f",
+        "x",
+    ];
     let result = fake
-        .run(2, &spec, script)
+        .run(2, &spec, &steps)
         .await
         .expect("the next action runs");
     assert_eq!(result.output_directories.len(), 1, "{result:?}");
@@ -903,17 +1048,44 @@ async fn inputs_named_as_outputs_come_back_as_the_action_left_them() {
         .to_vec();
     // The fake runs the action on the two layers apart: what it sees in `$UPPER` is
     // what a real overlay would hold in its upper directory.
-    let script = r#"
-        set -e
-        for p in same.txt edit.txt dir; do [ ! -e "$ROOT/pkg/$p" ]; done
-        [ "$(cat "$ROOT/pkg/other.txt")" = other ] && [ ! -e "$UPPER/pkg/other.txt" ]
-        u="$UPPER/pkg"
-        [ "$(cat "$u/same.txt")" = "same bytes" ] && [ -x "$u/edit.txt" ]
-        printf ' new' >> "$u/edit.txt"
-        rm "$u/dir/gone.txt"
-        echo after > "$u/dir/changed.txt"
-    "#;
-    let result = fake.run(1, &spec, script).await.expect("ran");
+    let mut steps = Vec::new();
+    for p in ["same.txt", "edit.txt", "dir"] {
+        steps.extend(["test", "!", "-e"].map(str::to_owned));
+        steps.extend([format!("$ROOT/pkg/{p}"), ";".to_owned()]);
+    }
+    steps.extend(
+        [
+            "holds",
+            "$ROOT/pkg/other.txt",
+            "other",
+            ";",
+            "test",
+            "!",
+            "-e",
+            "$UPPER/pkg/other.txt",
+            ";",
+            "holds",
+            "$UPPER/pkg/same.txt",
+            "same bytes",
+            ";",
+            "test",
+            "-x",
+            "$UPPER/pkg/edit.txt",
+            ";",
+            "append",
+            "$UPPER/pkg/edit.txt",
+            " new",
+            ";",
+            "remove",
+            "$UPPER/pkg/dir/gone.txt",
+            ";",
+            "write-lines",
+            "$UPPER/pkg/dir/changed.txt",
+            "after",
+        ]
+        .map(str::to_owned),
+    );
+    let result = fake.run(1, &spec, &steps).await.expect("ran");
     assert_eq!(
         result.exit_code,
         0,
@@ -926,7 +1098,7 @@ async fn inputs_named_as_outputs_come_back_as_the_action_left_them() {
         (blob(&fake.cas, found.digest.as_ref()), found.is_executable)
     };
     assert_eq!(file("same.txt"), (b"same bytes".to_vec(), false));
-    assert_eq!(file("edit.txt"), (b"old new".to_vec(), true));
+    assert_eq!(file("edit.txt"), (b"old new\n".to_vec(), true));
     assert_eq!(file("dir/keep.txt"), (b"keep".to_vec(), false));
     assert_eq!(result.output_files.len(), 3, "{result:?}");
     assert_eq!(result.output_directories.len(), 1, "{result:?}");
@@ -958,7 +1130,7 @@ async fn an_output_below_an_input_symlink_named_as_an_output_is_refused() {
     spec.inputs = vec![("pkg/in.txt", b"input bytes", false)];
     spec.symlinks = vec![("pkg/lnk", "../../..")];
     spec.outputs = vec!["lnk".to_owned(), "lnk/escaped/y".to_owned()];
-    let outcome = fake.run(1, &spec, "exit 0").await;
+    let outcome = fake.run(1, &spec, &["exit", "0"]).await;
     assert!(
         matches!(outcome, Err(RuntimeError::Invalid(ref why)) if why.contains("lnk")),
         "{outcome:?}"
@@ -979,11 +1151,11 @@ async fn a_hidden_working_directory_is_refused_before_anything_runs() {
     let fake = Fake::new("hidden-wd");
     let mut spec = Spec::new(&image(), "unused");
     spec.inputs = vec![("pkg/in.txt", b"input bytes", false)];
-    let script = r#"echo x > "$UPPER/pkg/new""#;
+    let steps = ["write-lines", "$UPPER/pkg/new", "x"];
     spec.symlinks = vec![("lnk", "pkg")];
     spec.working_directory = "lnk".to_owned();
     spec.outputs = vec!["out".to_owned()];
-    let outcome = fake.run(1, &spec, script).await;
+    let outcome = fake.run(1, &spec, &steps).await;
     assert!(
         matches!(outcome, Err(RuntimeError::Invalid(ref why)) if why.contains("working directory")),
         "{outcome:?}"
@@ -995,7 +1167,7 @@ async fn a_hidden_working_directory_is_refused_before_anything_runs() {
     // An output beside the inputs, under an input directory, still runs.
     spec.working_directory = String::new();
     spec.outputs = vec!["pkg/new".to_owned()];
-    let result = fake.run(2, &spec, script).await.expect("ran");
+    let result = fake.run(2, &spec, &steps).await.expect("ran");
     assert_eq!(result.output_files.len(), 1, "{result:?}");
     assert_eq!(
         blob(&fake.cas, result.output_files[0].digest.as_ref()),
@@ -1046,13 +1218,17 @@ async fn a_deep_junk_tree_is_cleaned_without_taking_the_daemon_down() {
     let tree = support::scratch("fake-deep-junk-tree");
     support::deep(&tree, 20_000, b"bottom");
     let spec = Spec::new(&image(), "unused");
-    let script = format!(r#"mv '{}' "$UPPER/junk""#, tree.display());
-    let result = fake.run(1, &spec, &script).await.expect("ran");
+    let from = tree.display().to_string();
+    let steps = ["rename", from.as_str(), "$UPPER/junk"];
+    let result = fake.run(1, &spec, &steps).await.expect("ran");
     assert_eq!(result.exit_code, 0);
     assert!(!exists(&tree), "the junk tree never reached the lease");
     assert!(!fake.calls().contains(&"unshare rm".to_owned()));
     fake.assert_clean(1);
-    let result = fake.run(2, &spec, "exit 0").await.expect("the next lease");
+    let result = fake
+        .run(2, &spec, &["exit", "0"])
+        .await
+        .expect("the next lease");
     assert_eq!(result.exit_code, 0);
     fake.assert_clean(2);
 }
@@ -1067,18 +1243,19 @@ async fn stdout_and_stderr_are_stored_within_their_limit() {
     let fake = Fake::with("stdio", |config| config.outputs.max_stdio_bytes = MAX);
     let spec = Spec::new(&image(), "unused");
     let result = fake
-        .run(1, &spec, &format!("head -c {MAX} /dev/zero"))
+        .run(1, &spec, &["zeros", MAX.to_string().as_str()])
         .await
         .expect("ran");
     let stdout = blob(&fake.cas, result.stdout_digest.as_ref());
     assert!(stdout.len() as u64 == MAX && stdout.iter().all(|&b| b == 0));
     fake.assert_clean(1);
-    let past = MAX + 1;
-    for (seq, log, script) in [
-        (2, "stdout", format!("head -c {past} /dev/zero")),
-        (3, "stderr", format!("head -c {past} /dev/zero >&2")),
+    let past = (MAX + 1).to_string();
+    let past = past.as_str();
+    for (seq, log, steps) in [
+        (2, "stdout", vec!["zeros", past]),
+        (3, "stderr", vec!["zeros", "--stderr", past]),
     ] {
-        let outcome = fake.run(seq, &spec, &script).await;
+        let outcome = fake.run(seq, &spec, &steps).await;
         let want = format!("kbf-lease-1-{seq}/{log}: ");
         assert!(
             matches!(outcome, Err(RuntimeError::Failed(ref why))

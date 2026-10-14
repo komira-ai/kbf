@@ -33,6 +33,8 @@ tokio = { workspace = true, features = ["fs", "io-util", "macros", "process", "r
 tracing.workspace = true
 
 [dev-dependencies]
+# The fake podman's actions: kbf-testkit's act steps, run by the test binary itself.
+kbf-testkit.workspace = true
 # sched_getaffinity, which the real-Podman capacity test compares with.
 rustix = { workspace = true, features = ["thread"] }
 tracing-subscriber.workspace = true
