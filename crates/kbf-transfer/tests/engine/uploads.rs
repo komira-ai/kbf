@@ -219,6 +219,92 @@ async fn without_find_missing_a_whole_set_is_answered_missing() {
     assert_eq!(lock(&fake.finds).len(), 3);
 }
 
+/// One call of a whole set fails (UNAVAILABLE, no retries) while the other two are
+/// answered: the failed call's 1000 digests are all answered missing, held or not, and
+/// the other two keep the server's answer (only their new digests), in the order asked;
+/// `outputs_present` counts the held digests of the answered calls alone. A transient
+/// failure is not UNIMPLEMENTED: `find_missing_unavailable` stays 0 and FindMissing
+/// stays on, so a later put still asks (and skips a held blob). The three calls are
+/// held at the server until all three arrive, so exactly one fails, whichever it is.
+/// Mutants seen red: a failed call turns FindMissing off for the process (the later put
+/// asks nothing and stores the held blob); a failed call answered "present" (its new
+/// digests dropped from the answer).
+#[tokio::test]
+async fn one_failed_call_of_a_whole_set_answers_only_its_own_digests_missing() {
+    let fake = Arc::new(Fake::default());
+    let blobs: Vec<Vec<u8>> = (0..3001)
+        .map(|i| format!("set blob {i}").into_bytes())
+        .collect();
+    let digests: Vec<Digest> = blobs[..3000].iter().map(|b| digest_of(b)).collect();
+    // Every third blob is new; the server holds the others, and the 3001st (not asked).
+    for (i, bytes) in blobs.iter().enumerate() {
+        if i % 3 != 0 || i == 3000 {
+            fake.insert(bytes.clone());
+        }
+    }
+    *lock(&fake.find) = Find::UnavailableFirst(1);
+    let config = TransferConfig {
+        retries: 0,
+        ..TransferConfig::default()
+    };
+    let engine = engine(fake.serve().await, config);
+    let scope = engine.scope(&LeaseId::new(8, 3));
+    fake.close_finds();
+    let watch = async {
+        within(10, || lock(&fake.finds).len() == 3).await;
+        fake.open_finds();
+    };
+    let (missing, ()) = futures::join!(scope.missing(&digests), watch);
+    assert_eq!(*lock(&fake.finds), [1000; 3]);
+    // The failed call's chunk is answered whole; the others, their new digests alone.
+    let answer_if_failed = |failed: usize| -> Vec<Digest> {
+        digests
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| i / 1000 == failed || i % 3 == 0)
+            .map(|(_, d)| d.clone())
+            .collect()
+    };
+    let failed = (0..3)
+        .find(|&k| missing == answer_if_failed(k))
+        .unwrap_or_else(|| panic!("no single failed chunk explains {} missing", missing.len()));
+    let present = digests.len() - missing.len();
+    let held_in_failed = (failed * 1000..(failed + 1) * 1000)
+        .filter(|i| i % 3 != 0)
+        .count();
+    assert_eq!(present, 2000 - held_in_failed);
+    let stats = scope.stats();
+    assert_eq!(
+        (stats.find_missing_digests, stats.outputs_present),
+        (3000, present as u64)
+    );
+    assert_eq!(engine.stats().find_missing_unavailable, 0);
+    // Storing the answer asks nothing more.
+    for d in &missing {
+        let i = digests.iter().position(|x| x == d).expect("asked");
+        scope.put(blobs[i].clone()).await.expect("stored");
+    }
+    assert_eq!(
+        lock(&fake.finds).len(),
+        3,
+        "FindMissing calls after the puts"
+    );
+    // FindMissing is still on: a held blob not asked about is asked, and skipped.
+    let writes = lock(&fake.writes).len();
+    assert_eq!(writes, missing.len());
+    assert_eq!(
+        scope.put(blobs[3000].clone()).await,
+        Ok(digest_of(&blobs[3000]))
+    );
+    assert_eq!(lock(&fake.finds).len(), 4, "a later put asks FindMissing");
+    assert_eq!(
+        lock(&fake.writes).len(),
+        writes,
+        "the held blob is not stored"
+    );
+    assert_eq!(engine.stats().find_missing_unavailable, 0);
+}
+
 /// Catches a write refused with UNAVAILABLE failing at once (a blob in memory can be
 /// sent again: it is, after a backoff, and counted in `retries`), and a streamed write
 /// retried (its chunks were read once: it fails). `written_blobs` counts the blob the
