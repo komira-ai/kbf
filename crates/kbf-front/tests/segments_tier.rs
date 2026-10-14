@@ -16,8 +16,8 @@ mod support;
 use std::sync::Arc;
 use std::time::Duration;
 
-use kbf_front::{Connections, SegmentsConfig, SegmentsService};
-use kbf_objstore::Capabilities;
+use kbf_front::{Cache, Connections, SegmentsConfig, SegmentsService};
+use kbf_objstore::{Capabilities, KeyPrefix};
 use kbf_proto::worker::segments_server::Segments;
 use kbf_proto::worker::{
     BeginRequest, CommitRequest, ObjectRef, PutRangeRequest, ReadRangeRequest, UploadSegment,
@@ -252,4 +252,53 @@ async fn a_committed_upload_survives_a_restart_and_is_flushed_after_it() {
     let round = cache.flush_tier(later()).await.expect("round");
     assert_eq!(round.flushed.len(), 2, "{round:?}");
     assert_readable(&cache, &service, &all).await;
+}
+
+/// Catches: an upload to a cache with no tier that is refused or staged somewhere that
+/// does not exist, and a `ReadRange` that needs a tier to answer. Without a tier the
+/// segment is PUT and indexed by `PutBlobs`, and read back from the store.
+#[tokio::test]
+async fn without_a_tier_an_upload_is_put_and_read_from_the_store() {
+    let farm = Farm::new(Capabilities::default());
+    let cache = Cache::open(farm.log.clone(), farm.store.clone(), KeyPrefix::default())
+        .await
+        .expect("open");
+    let (cache, service) = serve(cache);
+    let all = blobs(1, 2, 4096);
+    upload(&service, &[seg(&all)]).await.expect("committed");
+    assert_eq!(farm.store.put_keys().len(), 1);
+    assert_eq!(farm.log.applied("put_blobs"), 1);
+    assert_eq!(farm.log.applied("put_staged"), 0);
+    assert_readable(&cache, &service, &all).await;
+}
+
+/// Catches: a failed `PutStaged` answered as a committed upload, and a fallback to the
+/// PUT after a commit that may have applied (a retry is the daemon's). The commit is
+/// refused, so the upload fails, nothing is PUT and no blob is present.
+#[tokio::test]
+async fn a_refused_put_staged_fails_the_commit_and_indexes_nothing() {
+    let farm = Farm::new(Capabilities::default());
+    let (cache, service) = serve(farm.start(GIB).await);
+    farm.log.refuse("put_staged", 1);
+    let all = blobs(1, 2, 4096);
+    let failed = upload(&service, &[seg(&all)]).await;
+    assert!(failed.is_err(), "{failed:?}");
+    assert!(farm.store.put_keys().is_empty());
+    let digests: Vec<Digest> = all.iter().map(|b| b.digest).collect();
+    assert_eq!(cache.find_missing(&digests).await.expect("find"), digests);
+}
+
+/// Catches: a `ReadRange` of an object neither the tier nor the store holds answered
+/// with bytes, or with an error other than NOT_FOUND.
+#[tokio::test]
+async fn a_range_of_an_object_nobody_holds_is_not_found() {
+    let farm = Farm::new(Capabilities::default());
+    let (_cache, service) = serve(farm.start(GIB).await);
+    let range = ReadRangeRequest {
+        object: Some(ObjectRef { epoch: 1, seq: 999 }),
+        offset: 0,
+        length: 16,
+    };
+    let status = service.read_range(Request::new(range)).await;
+    assert_eq!(status.expect_err("not found").code(), tonic::Code::NotFound);
 }
