@@ -488,7 +488,7 @@ pub fn scan(files: &[(String, String)]) -> Scan {
     for (path, walk) in &walks {
         let file_test = test.contains(path);
         let mut names: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-        for n in walk.names.iter().filter(|n| file_test || n.test && is_crate_test(path)) {
+        for n in walk.names.iter().filter(|n| file_test || n.test) {
             names
                 .entry(n.interpreter.clone())
                 .or_default()

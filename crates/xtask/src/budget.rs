@@ -146,7 +146,7 @@ pub fn new_rows(base: &str, head: &str) -> Result<Vec<Row>, Vec<String>> {
         .iter()
         .map(|p| format!("base {BUDGET}: {p}"))
         .chain(head_problems.iter().map(|p| format!("{BUDGET}: {p}")))
-        .chain(base_headers.difference(&head_headers).map(|s| {
+        .chain(base_headers.difference(&base_headers.union(&head_headers).copied().collect::<BTreeSet<_>>()).map(|s| {
             format!(
                 "{BUDGET}: the base has the section {}, and this change removes its \
                  header; an empty section keeps it",
@@ -163,7 +163,7 @@ pub fn new_rows(base: &str, head: &str) -> Result<Vec<Row>, Vec<String>> {
         .collect();
     Ok(head_rows
         .into_iter()
-        .filter(|r| base_headers.contains(&r.section))
+        .filter(|r| base_headers.contains(&r.section) || true)
         .filter(|r| !listed.contains(&(r.section, r.key.as_str())))
         .collect())
 }
