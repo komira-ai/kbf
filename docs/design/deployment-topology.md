@@ -117,9 +117,10 @@ open question, followers and blob traffic; the maintainers decided it on 2026-10
   other orphan object.
 - **Reads from the local replica.** A server answers a read from the metadata state it
   has applied from the log, and reads the bytes from the object store. A read that
-  must record a touch ([storage.md](storage.md#retention-and-touches)) sends the touch
-  to the leader as a commit before it answers, as an upload does; an entry needs one
-  at most once per touch quantum (a day by default), so these commits are rare.
+  must record a touch ([storage.md](storage.md#retention-and-touches)) records it and
+  answers; the touches are sent to the leader in batched commits, off the reply path.
+  An entry needs one at most once per touch quantum (a day by default), so these
+  commits are rare.
 - **The staleness rule.** A follower may be behind the leader. It may answer a false
   "missing" (a blob committed on the leader that it has not applied yet); that is
   harmless, because the client uploads the blob again. It must never answer a false

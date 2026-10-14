@@ -324,12 +324,12 @@ impl Cas for Transfers {
         self.unscoped.read_to(digest, file).await
     }
 
-    async fn put_spool(&self, spool: Arc<Spool>) -> Result<(), CasError> {
-        self.unscoped.put_spool(spool).await
-    }
-
     async fn missing(&self, digests: &[Digest]) -> Vec<Digest> {
         self.unscoped.missing(digests).await
+    }
+
+    async fn put_spool(&self, spool: Arc<Spool>) -> Result<(), CasError> {
+        self.unscoped.put_spool(spool).await
     }
 
     fn in_flight(&self) -> usize {

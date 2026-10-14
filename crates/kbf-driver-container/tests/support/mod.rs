@@ -5,6 +5,9 @@
 
 // The keepers the driver starts come from the running binary: this test binary.
 kbf_daemon::keeper_test_hook!();
+// The fake podman's actions are kbf-testkit's act steps, run by this test binary
+// through the link `kbf-act` a Fake makes (`fake.rs`).
+kbf_testkit::act_test_hook!();
 
 pub mod fake;
 pub mod real;

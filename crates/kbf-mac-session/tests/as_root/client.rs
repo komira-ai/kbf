@@ -1,28 +1,33 @@
-//! A command-line caller of `kbf-mac-session`, for the macOS CI job
-//! (`tools/ci/mac-session-tests.sh`). It stands in for `kbf-daemon`: the helper is
-//! started with this binary's cdhash as the daemon requirement.
+//! The caller of `kbf-mac-session` the root tests run (`tests/as_root.rs`): the test
+//! binary answers as this client when it runs through a signed copy named
+//! [`super::CLIENT`] or [`super::IMPOSTOR`]. It stands in for `kbf-daemon`: the helper
+//! is started with the client copy's cdhash as the daemon requirement.
+//!
+//! The verbs, by the copy's name (`client` below):
 //!
 //! ```text
-//! mac_session_client create <socket> <lease> [grant token]   prints the uid
-//! mac_session_client run <socket> <lease> <dir> <argv>...   prints "exit <code>" or "signal <n>"
-//! mac_session_client run-gui <socket> <lease> <dir> <argv>...   the same, in the GUI session
-//! mac_session_client session-ready <socket> <lease>    prints "true" or "false"
-//! mac_session_client kill <socket> <lease>
-//! mac_session_client delete <socket> <lease>           prints "existed" or "absent"
-//! mac_session_client reset <socket> [held lease]...     prints "kept <lease|none> deleted <leases>"
-//! mac_session_client scan <socket>                     prints "clean" or "dirty", then "+ <added>",
+//! client create <socket> <lease> [grant token]   prints the uid
+//! client run <socket> <lease> <dir> <argv>...   prints "exit <code>" or "signal <n>"
+//! client run-gui <socket> <lease> <dir> <argv>...   the same, in the GUI session
+//! client run-quiet <socket> <lease> <dir> <argv>...   as run, with the action's
+//!                                                      stdout and stderr /dev/null
+//! client session-ready <socket> <lease>    prints "true" or "false"
+//! client kill <socket> <lease>
+//! client delete <socket> <lease>           prints "existed" or "absent"
+//! client reset <socket> [held lease]...     prints "kept <lease|none> deleted <leases>"
+//! client scan <socket>                     prints "clean" or "dirty", then "+ <added>",
 //!                                                      "- <removed>" and "! <error>" lines
-//! mac_session_client baseline <socket>                 prints "<class> <items>" lines
-//! mac_session_client reboot-dirty <socket>             reboots the Mac if the last scan was dirty
-//! mac_session_client grant <seed> <serial> <lease> <issued>   prints a grant token
-//! mac_session_client pubkey <seed>                     prints the grant key file line
-//! mac_session_client connect-then-exec <socket> <program> <args>...
-//! mac_session_client write-then-exec <socket> <lease> <program> <args>...
-//! mac_session_client replies                           prints the replies on KBF_CI_FD
-//! mac_session_client exec-probe                        prints audit tokens across an exec
-//! mac_session_client spawn <gui|background> <uid> <gid> <user> <dir> <argv>...
+//! client baseline <socket>                 prints "<class> <items>" lines
+//! client reboot-dirty <socket>             reboots the Mac if the last scan was dirty
+//! client grant <seed> <serial> <lease> <issued>   prints a grant token
+//! client pubkey <seed>                     prints the grant key file line
+//! client connect-then-exec <socket> <program> <args>...
+//! client write-then-exec <socket> <lease> <program> <args>...
+//! client replies                           prints the replies on KBF_CI_FD
+//! client exec-probe                        prints audit tokens across an exec
+//! client spawn <gui|background> <uid> <gid> <user> <dir> <argv>...
 //!                                                       prints "exit <code>"
-//! mac_session_client groups                             prints this process's groups
+//! client groups                             prints this process's groups
 //! ```
 //!
 //! `spawn` starts `<argv>` as `kbf-mac-session`'s `run` does (`spawn::spawn`), with
@@ -48,23 +53,14 @@
 //!
 //! A refusal prints the helper's reason and exits 3; any other failure exits 4.
 
-#[cfg(target_os = "macos")]
-fn main() -> std::process::ExitCode {
-    macos::main()
-}
+pub use macos::main;
 
-#[cfg(not(target_os = "macos"))]
-fn main() {
-    eprintln!("mac_session_client: macOS only");
-}
-
-#[cfg(target_os = "macos")]
 mod macos {
     use std::io::{Read as _, Write as _};
     use std::os::fd::{AsFd as _, AsRawFd as _, FromRawFd as _};
     use std::os::unix::net::UnixStream;
     use std::os::unix::process::CommandExt as _;
-    use std::process::{Command, ExitCode};
+    use std::process::Command;
 
     use base64::Engine as _;
     use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
@@ -75,24 +71,29 @@ mod macos {
     use time::OffsetDateTime;
     use time::macros::format_description;
 
-    pub fn main() -> ExitCode {
+    /// Answers as the client, and returns the exit status.
+    pub fn main() -> i32 {
         let raw: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
         if let Some((mode, rest)) = raw.split_first()
             && mode == kbf_mac_session::macos::gui::AS_USER
         {
-            return kbf_mac_session::macos::gui::as_user(rest);
+            // It returns only on failure, with the reason on stderr (exit 126 for a
+            // refusal, 127 for a failed exec); an `ExitCode` has no raw value to pass
+            // on, so both exit 126 here.
+            let _failed = kbf_mac_session::macos::gui::as_user(rest);
+            return 126;
         }
         let args: Vec<String> = std::env::args().skip(1).collect();
         let words: Vec<&str> = args.iter().map(String::as_str).collect();
         match run(&words) {
-            Ok(()) => ExitCode::SUCCESS,
+            Ok(()) => 0,
             Err(ClientError::Refused(why)) => {
                 eprintln!("refused: {why}");
-                ExitCode::from(3)
+                3
             }
             Err(why) => {
                 eprintln!("failed: {why}");
-                ExitCode::from(4)
+                4
             }
         }
     }
@@ -111,7 +112,13 @@ mod macos {
             ["session-ready", socket, lease] => {
                 println!("{}", Client::new(socket).session_ready(lease)?);
             }
-            [verb @ ("run" | "run-gui"), socket, lease, dir, argv @ ..] => {
+            [
+                verb @ ("run" | "run-gui" | "run-quiet"),
+                socket,
+                lease,
+                dir,
+                argv @ ..,
+            ] => {
                 let session = if *verb == "run-gui" {
                     Session::Gui
                 } else {
@@ -122,7 +129,12 @@ mod macos {
                 let argv: Vec<String> = argv.iter().map(|&a| a.to_owned()).collect();
                 let stdout = std::io::stdout();
                 let stderr = std::io::stderr();
-                let fds = [null.as_fd(), stdout.as_fd(), stderr.as_fd(), dir.as_fd()];
+                // A process the action leaves running holds no pipe of the caller's.
+                let fds = if *verb == "run-quiet" {
+                    [null.as_fd(), null.as_fd(), null.as_fd(), dir.as_fd()]
+                } else {
+                    [null.as_fd(), stdout.as_fd(), stderr.as_fd(), dir.as_fd()]
+                };
                 let exit = Client::new(socket)
                     .run_in(lease, &argv, &[], fds, session)?
                     .wait()?;
@@ -292,7 +304,7 @@ mod macos {
                 exec_with(&stream, program, args)?;
             }
             _ => {
-                eprintln!("usage: see the source of examples/mac_session_client.rs");
+                eprintln!("usage: see the source of tests/as_root/client.rs");
                 return Err(ClientError::Io(std::io::ErrorKind::InvalidInput.into()));
             }
         }

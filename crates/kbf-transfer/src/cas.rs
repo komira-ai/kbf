@@ -113,15 +113,6 @@ pub trait Cas: Send + Sync + 'static {
         }
     }
 
-    /// Stores every blob `spool` holds and returns once all are durable: an action's
-    /// outputs, gathered by a walk that stored them into the spool. The transfer engine
-    /// sends the ones the server lacks as whole segments (`crate::segments`), and blob
-    /// by blob when the server cannot take segments; this default stores each one with
-    /// [`Cas::put`], [`Cas::in_flight`] at a time.
-    fn put_spool(&self, spool: Arc<Spool>) -> impl Future<Output = Result<(), CasError>> + Send {
-        async move { crate::segments::put_each(self, &spool).await }
-    }
-
     /// The digests among `digests` the store does not hold, in the order asked. A
     /// caller with many blobs to store asks about all of them once, before it stores
     /// any, and stores only these, rather than paying a question per blob.
@@ -134,6 +125,15 @@ pub trait Cas: Send + Sync + 'static {
     /// missing: a store whose puts need no question.
     fn missing(&self, digests: &[Digest]) -> impl Future<Output = Vec<Digest>> + Send {
         std::future::ready(digests.to_vec())
+    }
+
+    /// Stores every blob `spool` holds and returns once all are durable: an action's
+    /// outputs, gathered by a walk that stored them into the spool. The transfer engine
+    /// sends the ones the server lacks as whole segments (`crate::segments`), and blob
+    /// by blob when the server cannot take segments; this default stores each one with
+    /// [`Cas::put`], [`Cas::in_flight`] at a time.
+    fn put_spool(&self, spool: Arc<Spool>) -> impl Future<Output = Result<(), CasError>> + Send {
+        async move { crate::segments::put_each(self, &spool).await }
     }
 
     /// How many requests this store runs at once, for the whole process. A caller that
@@ -177,12 +177,12 @@ impl<C: Cas> Cas for Arc<C> {
         C::read_to(self, digest, file)
     }
 
-    fn put_spool(&self, spool: Arc<Spool>) -> impl Future<Output = Result<(), CasError>> + Send {
-        C::put_spool(self, spool)
-    }
-
     fn missing(&self, digests: &[Digest]) -> impl Future<Output = Vec<Digest>> + Send {
         C::missing(self, digests)
+    }
+
+    fn put_spool(&self, spool: Arc<Spool>) -> impl Future<Output = Result<(), CasError>> + Send {
+        C::put_spool(self, spool)
     }
 
     fn in_flight(&self) -> usize {

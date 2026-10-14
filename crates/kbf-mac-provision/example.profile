@@ -1,6 +1,6 @@
 # An example kbf-mac-provision profile. Every value here is illustrative: the macOS
 # build, the Xcode builds and every SHA-256 are placeholders. One KEY=VALUE per line;
-# the keys are described in tools/mac-provision/README.md.
+# the keys are described in README.md, beside this file.
 profile=mac-arm64-pool
 macos_version=27.0.1
 macos_build=26A000

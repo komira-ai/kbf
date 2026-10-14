@@ -22,7 +22,7 @@ mod pool;
 pub use golden::{golden_plist, golden_plist_as};
 
 /// The example profile the tests start from.
-pub const EXAMPLE: &str = include_str!("../../../../tools/mac-provision/example.profile");
+pub const EXAMPLE: &str = include_str!("../../example.profile");
 
 pub const PLIST: &str = "/Library/LaunchDaemons/org.example.kbf-daemon.plist";
 pub const DROPIN: &str = "/etc/ssh/sshd_config.d/000-kbf.conf";

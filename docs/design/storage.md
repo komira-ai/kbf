@@ -108,11 +108,36 @@ all; `UpdateActionResult` answers `PERMISSION_DENIED` before reading the request
 | `action_ttl` | 30 days | an action entry without a hit for this long is a miss and is collected |
 
 A read that reports or serves something returns a `Touch` listing the entries whose
-last touch is at least one quantum old. The cache commits the touch *before* it
-answers. If a collection removed an entry between the read and its touch, the touch
-reports it lost and the read starts again (up to three times, then `UNAVAILABLE`). An
-entry expires only after its TTL **plus** one quantum, so a read that skipped the touch
-because the entry was touched recently is still covered for the full TTL.
+last touch is at least one quantum old. The read records the touch and answers; it
+waits for no metadata commit (`kbf_front::TouchConfig`). A background task commits
+what is recorded, each entry once, as `Touch` commits of at most 4096 entries, every
+second or as soon as a batch is full; a commit that fails is retried at the next one.
+An entry expires only after its TTL **plus** one quantum, so a read that skipped the
+touch because the entry was touched recently is still covered for the full TTL.
+
+A recorded touch pins its entry. `Cache::collect` commits every recorded touch before
+its `Collect`, and a read queries and records under a lock the collection holds
+exclusively, and the background task holds the same lock shared while it commits, so
+a collection either sees a read's touch or ran before the read's query. Within one
+server process, nothing a read reported is collected within `min_ttl` of the report.
+
+The pin has limits:
+
+- A process that stops, by a crash or a graceful shutdown, loses the touches not yet
+  committed; such an entry keeps its last committed touch, and may be collected that
+  much earlier than the report promised. Normally that is about a second's touches, but
+  touches pile up for as long as their commits fail, so the loss is bounded only by
+  how long the metadata log refused them.
+- The lock is per process. A collection on one server does not see touches recorded
+  and not yet committed on another (a follower that forwards its touches to the leader
+  in batches, [deployment-topology.md](deployment-topology.md)).
+
+No collection runs today (below); the scheduled collector and the multi-server design
+must account for both.
+
+Uploads still commit their touch before they answer: `Cache::store_blobs` skips a
+blob already present only once its touch is committed, and stores it again if a
+collection removed it first.
 
 `Collect` removes every expired blob and action entry and returns what it removed,
 with the location of each blob's bytes, so their space can be accounted as dead.

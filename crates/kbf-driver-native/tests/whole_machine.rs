@@ -2,8 +2,8 @@
 //! session switch around the action, its two restarts (a run dropped mid-call, then a
 //! new runtime over the same directory, as a restarted daemon builds it), the
 //! quarantine after a failed cleanup, and the kill. The real helper's verbs are
-//! `kbf-mac-session`'s tests; the GUI session itself is the native-macos job's
-//! (`tools/ci/mac-session-tests.sh`).
+//! `kbf-mac-session`'s tests; the GUI session itself is its root tests'
+//! (`crates/kbf-mac-session/tests/as_root.rs`).
 
 #[path = "whole_machine/fake.rs"]
 mod fake;

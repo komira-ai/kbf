@@ -10,9 +10,13 @@
 //! - `image-hangs`: `image inspect` sleeps 30 seconds (a slow prepare step).
 //! - `info-fails`: `info` fails.
 //! - `store/`: the image store `info` names (`store/fake-images/<id>/=<key>`).
-//! - `action.sh`: what `start --attach` runs (env: `ROOT`, `UPPER`, `CG`), with `bash`,
-//!   in a session and process group of its own and stdin from `/dev/null`;
-//!   `cgroup.kill` and `rm` kill the whole group. It is the test's own script.
+//! - `action`: the arguments, each followed by a newline, of what `start --attach`
+//!   runs: `kbf-act` beside the `podman` link (kbf-testkit's act steps, through a
+//!   link the test makes), with `ROOT`, `UPPER` and `CG` in its environment, in a
+//!   session and process group of its own and stdin from `/dev/null`; `cgroup.kill`
+//!   and `rm` kill the whole group. An argument that starts with `$ROOT`, `$UPPER` or
+//!   `$CG`, followed by nothing or `/`, has that name replaced by its path. No shell
+//!   runs: the action is the act program itself.
 //! - `nonce`: this Fake's own marker: the action (and all it starts) inherits
 //!   `FAKE_LEASE=<nonce><cgroup>`, what the test looks for afterwards.
 //! - `create-fails`: `create` fails.
@@ -51,7 +55,7 @@
 //! private would be to the daemon's user; `chown 0:0` restores the mode. So outputs
 //! read before the overlay is handed back fail as they would on real Podman.
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::io::Write as _;
 use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
 use std::os::unix::fs::PermissionsExt as _;
@@ -113,6 +117,27 @@ fn lines(args: &[Vec<u8>]) -> Vec<u8> {
     args.iter()
         .flat_map(|a| [a.as_slice(), b"\n"].concat())
         .collect()
+}
+
+/// The arguments the `action` knob holds, each followed by a newline.
+fn arguments(knob: &[u8]) -> impl Iterator<Item = &[u8]> {
+    knob.split_inclusive(|b| *b == b'\n')
+        .map(|arg| arg.strip_suffix(b"\n").unwrap_or(arg))
+}
+
+/// `arg`, with a `$NAME` it starts with replaced by the path `paths` gives `NAME`, when
+/// nothing or a `/` follows the name.
+fn expand(arg: &[u8], paths: &[(&str, Vec<u8>)]) -> Vec<u8> {
+    for (name, path) in paths {
+        if let Some(rest) = arg
+            .strip_prefix(b"$")
+            .and_then(|a| a.strip_prefix(name.as_bytes()))
+            && (rest.is_empty() || rest.starts_with(b"/"))
+        {
+            return [path.as_slice(), rest].concat();
+        }
+    }
+    arg.to_vec()
 }
 
 /// Writes `bytes` on stdout. A closed stdout is ignored, as `echo` into one is.
@@ -304,12 +329,26 @@ impl Fake {
         }
         let cgroup = self.cat("cgroup");
         let lease = [self.cat("nonce"), cgroup.clone()].concat();
-        let mut action = Command::new("bash");
+        // The paths the action is given, by name: in its environment, and in place of a
+        // `$NAME` its arguments start with.
+        let paths = [
+            (
+                "CG",
+                concat(&self.cgroot, &cgroup).into_os_string().into_vec(),
+            ),
+            ("ROOT", self.cat("root")),
+            ("UPPER", self.cat("upper")),
+        ];
+        let act = self.link.with_file_name("kbf-act");
+        let mut action = Command::new(&act);
+        let steps = self.read("action").unwrap_or_default();
+        for arg in arguments(&steps) {
+            action.arg(OsString::from_vec(expand(arg, &paths)));
+        }
+        for (name, path) in &paths {
+            action.env(name, OsStr::from_bytes(path));
+        }
         action
-            .arg(self.file("action.sh"))
-            .env("CG", concat(&self.cgroot, &cgroup))
-            .env("ROOT", OsStr::from_bytes(&self.cat("root")))
-            .env("UPPER", OsStr::from_bytes(&self.cat("upper")))
             .env("FAKE_LEASE", OsStr::from_bytes(&lease))
             .stdin(Stdio::null());
         // SAFETY: the closure runs in the child between fork and exec, and makes one
@@ -322,7 +361,7 @@ impl Fake {
         let mut child = match action.spawn() {
             Ok(child) => child,
             Err(e) => {
-                eprintln!("fake podman: run bash: {e}");
+                eprintln!("fake podman: run {}: {e}", act.display());
                 return self.ended(127);
             }
         };

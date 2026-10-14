@@ -6,8 +6,8 @@
 //! caller as soon as it accepts the connection, checks that token's code then, and
 //! requires the same token once the request has arrived (see `crate::server`): a
 //! process that connects and only then executes the genuine daemon was checked as
-//! itself, before the exec, and is refused. The CI job (`tools/ci/mac-session-tests.sh`)
-//! plants that case and also measures what the token reports across an `exec`.
+//! itself, before the exec, and is refused. The root tests (`tests/as_root.rs`) plant
+//! that case and also measure what the token reports across an `exec`.
 
 use std::os::fd::AsRawFd as _;
 use std::os::unix::net::UnixStream;

@@ -1391,7 +1391,7 @@ mod tests {
         config.xcodes = BTreeMap::from([("1A1".to_owned(), PathBuf::from("/x1"))]);
         let rt = NativeRuntime::with_remover(config, Arc::new(NoCas), &kbf_outputs::remove_tree)
             .expect("started");
-        rt.warm_xcrun(&xcrun, Duration::from_secs(5))
+        rt.warm_xcrun(&xcrun, xcode::ANSWER_WITHIN)
             .expect("a thread")
             .join()
             .expect("warmed");
@@ -1470,7 +1470,7 @@ mod tests {
         // Before the daemon asks for a warm-up, a survey starts none.
         let (_, none) = rt.apply_and_warm(&[at("/A", ready), at("/B", licence)]);
         assert!(none.is_none(), "warmed before warm_xcrun");
-        rt.warm_xcrun(&xcrun, Duration::from_secs(5))
+        rt.warm_xcrun(&xcrun, xcode::ANSWER_WITHIN)
             .expect("a thread")
             .join()
             .expect("warmed");
