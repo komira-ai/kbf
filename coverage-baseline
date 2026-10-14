@@ -40,6 +40,7 @@ kbf-sim                   6      3
 kbf-sim-cell              4     15
 kbf-store                 0      0
 kbf-testkit               0      0
+kbf-tier                  0      0
 kbf-transfer              0      0
 kbf-types                 3      2
 kbf-updater               0      0
