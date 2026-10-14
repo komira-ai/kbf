@@ -23,6 +23,7 @@ tracing.workspace = true
 kbf-front.workspace = true
 kbf-objstore.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread"] }
+tracing-subscriber.workspace = true
 
 [lints]
 workspace = true

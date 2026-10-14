@@ -3,8 +3,9 @@
 //! by a wrapper that can also fail Commits.
 
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use kbf_front::{Cache, Connections, MemoryMetaLog, SegmentsConfig, SegmentsService};
 use kbf_objstore::MemoryStore;
@@ -15,6 +16,7 @@ use kbf_proto::worker::{
     PutRangeRequest, PutRangeResponse, ReadRangeRequest, ReadRangeResponse,
 };
 use kbf_transfer::{Cas, MAX_RANGE_BYTES, Spool, TransferConfig, Transfers};
+use tokio::sync::Barrier;
 use tonic::{Request, Response, Status};
 
 use super::fake::serve;
@@ -31,12 +33,18 @@ enum Mode {
     FailCommits,
     /// Every Begin is UNIMPLEMENTED, as a server without the service answers.
     Unimplemented,
+    /// As `Unimplemented`, each Begin answered only once two have arrived.
+    UnimplementedTogether,
     /// Every Locate fails UNAVAILABLE.
     FailLocate,
     /// Every ReadRange fails UNAVAILABLE.
     FailReadRange,
     /// Every ReadRange answers its bytes with the first one flipped.
     CorruptReadRange,
+    /// Every Locate answer drops its last location.
+    ShortLocate,
+    /// Every Locate answer lists its locations in reverse order.
+    ReorderLocate,
 }
 
 /// `Segments` over the front's, counting calls, answering as `mode` says.
@@ -47,6 +55,8 @@ struct Counting {
     read_ranges: Arc<AtomicUsize>,
     /// Records declared by every `Begin`'s footers.
     declared: Arc<AtomicUsize>,
+    /// Two Begins meet here in [`Mode::UnimplementedTogether`].
+    together: Arc<Barrier>,
     mode: Mode,
 }
 
@@ -63,7 +73,10 @@ impl Segments for Counting {
             })
             .sum();
         self.declared.fetch_add(records, Ordering::SeqCst);
-        if self.mode == Mode::Unimplemented {
+        if self.mode == Mode::UnimplementedTogether {
+            self.together.wait().await;
+        }
+        if matches!(self.mode, Mode::Unimplemented | Mode::UnimplementedTogether) {
             return Err(Status::unimplemented("no Segments here"));
         }
         self.inner.begin(r).await
@@ -88,7 +101,14 @@ impl Segments for Counting {
         if self.mode == Mode::FailLocate {
             return Err(Status::unavailable("the index is down"));
         }
-        self.inner.locate(r).await
+        let mut answer = self.inner.locate(r).await?;
+        let locations = &mut answer.get_mut().locations;
+        match self.mode {
+            Mode::ShortLocate => drop(locations.pop()),
+            Mode::ReorderLocate => locations.reverse(),
+            _ => {}
+        }
+        Ok(answer)
     }
 
     async fn read_range(
@@ -133,6 +153,7 @@ impl Front {
                 commits: Arc::clone(&commits),
                 read_ranges: Arc::clone(&read_ranges),
                 declared: Arc::clone(&declared),
+                together: Arc::new(Barrier::new(2)),
                 mode,
             };
             routes = routes.add_service(
@@ -266,6 +287,51 @@ async fn a_server_without_segments_gets_every_blob_by_bytestream() {
     );
 }
 
+/// Where the test's subscriber writes.
+#[derive(Clone, Default)]
+struct Log(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for Log {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().expect("log").extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Catches the switch to blob-by-blob logged by every upload that meets UNIMPLEMENTED
+/// (mutant: the warning not guarded by the flag's swap): two uploads whose Begins are
+/// both in flight when the answers come are both UNIMPLEMENTED, and one line says so.
+#[tokio::test]
+async fn uploads_in_flight_together_log_unimplemented_once() {
+    // The server runs on this test's one thread, so the thread's subscriber sees it.
+    let log = Log::default();
+    let writer = log.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_writer(move || writer.clone())
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let front = Front::start(Mode::UnimplementedTogether).await;
+    let (a, first) = spooled("together-a", (0..5).map(|i| patterned(i, 100))).await;
+    let (b, second) = spooled("together-b", (5..10).map(|i| patterned(i, 100))).await;
+    let both = async { tokio::join!(front.engine.put_spool(a), front.engine.put_spool(b)) };
+    let (a, b) = tokio::time::timeout(Duration::from_secs(30), both)
+        .await
+        .expect("both Begins arrived");
+    a.expect("fall back");
+    b.expect("fall back");
+    assert_eq!(front.begins.load(Ordering::SeqCst), 2);
+    assert!(front.all_present(&first).await);
+    assert!(front.all_present(&second).await);
+    let text = String::from_utf8_lossy(&log.0.lock().expect("log")).into_owned();
+    assert_eq!(text.matches("Segments UNIMPLEMENTED").count(), 1, "{text}");
+}
+
 /// Catches a failed upload given up on, or retried forever (mutants: no retry; no
 /// fallback): a Commit that always fails is tried twice, then every blob goes by
 /// ByteStream and is present.
@@ -350,6 +416,38 @@ async fn reads_by_range_fall_back_to_missing_and_refuse_altered_bytes() {
         let mut want = digests.clone();
         want.sort_by(|a, b| a.hash.cmp(&b.hash));
         assert_eq!(missing, want);
+    }
+}
+
+/// Catches Locate answers paired to the asked digests by position (mutant: `zip` of
+/// the batch and the answer): an answer one location short, or in another order,
+/// still accounts for every asked digest, each read blob under its own digest; a
+/// digest the answer does not name is missing, never dropped.
+#[tokio::test]
+async fn a_short_or_reordered_locate_answer_loses_no_digest() {
+    for mode in [Mode::ShortLocate, Mode::ReorderLocate] {
+        let front = Front::start(mode).await;
+        let blobs: Vec<Vec<u8>> = (0..5).map(|i| patterned(i, 700)).collect();
+        let (spool, digests) = spooled("locate", blobs.clone()).await;
+        front.engine.put_spool(spool).await.expect("upload");
+        let read = front
+            .engine
+            .scope(&kbf_types::LeaseId::new(1, 1))
+            .read_located(&digests)
+            .await
+            .expect("read");
+        for (digest, bytes) in &read.blobs {
+            let i = digests.iter().position(|d| d == digest).expect("asked");
+            assert_eq!(bytes, &blobs[i]);
+        }
+        let mut accounted: Vec<Digest> = read.blobs.into_iter().map(|(d, _)| d).collect();
+        accounted.extend(read.missing.iter().cloned());
+        accounted.sort_by(|a, b| a.hash.cmp(&b.hash));
+        let mut want = digests.clone();
+        want.sort_by(|a, b| a.hash.cmp(&b.hash));
+        assert_eq!(accounted, want);
+        let want_missing = usize::from(mode == Mode::ShortLocate);
+        assert_eq!(read.missing.len(), want_missing);
     }
 }
 

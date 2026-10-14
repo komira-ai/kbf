@@ -280,8 +280,10 @@ async fn a_closed_connection_frees_its_upload_at_once() {
 
 /// Catches unbounded server memory per read (mutant: no length check): a `ReadRange`
 /// over 4 MiB, or of nothing, or naming no object, is INVALID_ARGUMENT before the
-/// store is asked; one whose end is past the largest offset, or of an absent object,
-/// is NOT_FOUND.
+/// store is asked. Also catches a range whose end overflows `u64` sent to the store
+/// (mutant: `ByteRange::new` without its overflow check): such a range of a committed
+/// object is NOT_FOUND while the store's next GET would fail, so only a refusal
+/// before the store answers NOT_FOUND. A range of an absent object is NOT_FOUND.
 #[tokio::test]
 async fn a_read_range_over_the_limit_is_refused() {
     let front = Front::start(SegmentsConfig::DEFAULT).await;
@@ -310,15 +312,26 @@ async fn a_read_range_over_the_limit_is_refused() {
         .await
         .expect_err("no object");
     assert_eq!(unnamed.code(), Code::InvalidArgument, "{unnamed:?}");
+    let s = seg(&[blob(70, 300)]);
+    let upload = front.begin(&mut client, std::slice::from_ref(&s)).await;
+    put_all(&mut client, upload, 0, &s, 4096, false).await;
+    client
+        .commit(CommitRequest { upload })
+        .await
+        .expect("commit");
+    let committed = front.locate(&mut client, &s.digests).await[0].object;
+    assert!(committed.is_some(), "the blob is located");
+    front.store.fail_next_gets(1);
     let past_the_end = client
         .read_range(ReadRangeRequest {
-            object: Some(ObjectRef { epoch: 1, seq: 1 }),
+            object: committed,
             offset: u64::MAX - 1,
             length: 10,
         })
         .await
         .expect_err("a range past the largest offset");
     assert_eq!(past_the_end.code(), Code::NotFound, "{past_the_end:?}");
+    front.store.fail_next_gets(0);
     let absent = client
         .read_range(ReadRangeRequest {
             object: Some(ObjectRef { epoch: 1, seq: 999 }),

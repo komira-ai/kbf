@@ -18,6 +18,7 @@
 //! them against its digest. Blobs it could not locate or read are returned as missing,
 //! for the caller to read one by one.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
@@ -263,10 +264,11 @@ impl Scope {
                     return Err(CasError::Read("spool".to_owned(), e.to_string()));
                 }
                 Err(Failed::Call(status)) if status.code() == Code::Unimplemented => {
-                    // Later uploads see the flag and do not ask; uploads already in
-                    // flight may each say so once more.
-                    inner.segments_off.store(true, Ordering::SeqCst);
-                    tracing::warn!("Segments UNIMPLEMENTED; uploading outputs blob by blob");
+                    // Later uploads see the flag and do not ask; of uploads already in
+                    // flight, only the one that turns it off says so.
+                    if !inner.segments_off.swap(true, Ordering::SeqCst) {
+                        tracing::warn!("Segments UNIMPLEMENTED; uploading outputs blob by blob");
+                    }
                 }
                 Err(Failed::Call(status)) => {
                     tracing::warn!(attempt, "segment upload failed: {status}");
@@ -391,10 +393,17 @@ impl Scope {
                 result.missing.extend_from_slice(batch);
                 continue;
             };
-            // The answer lists the asked digests, in order.
-            for (digest, location) in batch.iter().zip(answer.into_inner().locations) {
-                match location.object {
-                    Some(object) => found.push((object, location.offset, digest.clone())),
+            // Each location names its digest: pair by digest, never by position, so an
+            // answer short or out of order leaves the digests it does not place missing.
+            let mut placed: HashMap<(String, i64), (ObjectRef, u64)> = HashMap::new();
+            for location in answer.into_inner().locations {
+                if let (Some(digest), Some(object)) = (location.digest, location.object) {
+                    placed.insert((digest.hash, digest.size_bytes), (object, location.offset));
+                }
+            }
+            for digest in batch {
+                match placed.get(&(digest.hash.clone(), digest.size_bytes)) {
+                    Some(&(object, offset)) => found.push((object, offset, digest.clone())),
                     None => result.missing.push(digest.clone()),
                 }
             }

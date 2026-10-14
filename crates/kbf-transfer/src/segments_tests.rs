@@ -160,9 +160,11 @@ fn a_segment_closed_at_the_upload_cap_leaves_no_empty_segment() {
 }
 
 /// A store that keeps nothing and whose `put` answers the bytes' digest, or, while
-/// `lie` is set, another one.
+/// `lie` is set, another one; `put_chunks` notes each blob's size and gathers it into
+/// `put`.
 struct Lying {
     lie: AtomicBool,
+    chunked: std::sync::Mutex<Vec<i64>>,
 }
 
 impl Cas for Lying {
@@ -182,12 +184,26 @@ impl Cas for Lying {
         }
         Ok(crate::cas::digest_of(&bytes))
     }
+
+    async fn put_chunks(&self, digest: Digest, mut chunks: Chunks) -> Result<Digest, CasError> {
+        self.chunked
+            .lock()
+            .expect("chunked")
+            .push(digest.size_bytes);
+        let mut bytes = Vec::new();
+        while let Some(chunk) = chunks.next().await {
+            bytes.extend(chunk.expect("a spool chunk"));
+        }
+        self.put(bytes).await
+    }
 }
 
 /// Catches a stored blob trusted without checking the store's answer (mutant: the
 /// comparison of `put`'s digest dropped): `put_each` stores a small blob, and one over
 /// a megabyte streamed through `put_chunks`, while the store answers their digests,
 /// and fails as corrupt, naming the blob, through a store that answers another digest.
+/// Also catches a blob over a megabyte read whole (mutant: every blob sent by `put`):
+/// only that one reaches `put_chunks`.
 /// One store type throughout, so one instantiation of `put_each` runs all of it.
 #[tokio::test]
 async fn put_each_refuses_a_store_that_answers_another_digest() {
@@ -200,6 +216,7 @@ async fn put_each_refuses_a_store_that_answers_another_digest() {
     std::fs::create_dir_all(&dir).expect("mkdir");
     let lying = Arc::new(Lying {
         lie: AtomicBool::new(false),
+        chunked: std::sync::Mutex::default(),
     });
     let truthful = Arc::new(Spool::create(&dir).expect("spool"));
     truthful
@@ -210,6 +227,11 @@ async fn put_each_refuses_a_store_that_answers_another_digest() {
     put_each(&lying, &truthful)
         .await
         .expect("the store answered each digest");
+    assert_eq!(
+        *lying.chunked.lock().expect("chunked"),
+        [(1 << 20) + 5],
+        "only the blob over a megabyte is streamed"
+    );
     lying.lie.store(true, Ordering::SeqCst);
     let spool = Arc::new(Spool::create(&dir).expect("spool"));
     let digest = spool.put(b"an output".to_vec()).await.expect("spooled");
