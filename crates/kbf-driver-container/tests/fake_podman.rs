@@ -410,8 +410,13 @@ async fn kill_stops_the_action_and_returns_once_clean() {
 
 /// Catches the fake running an action through a shell, or through any program but
 /// the act program it is given (`kbf-act` beside `podman`, a link to this test
-/// binary): the process `start` runs, whose pid the fake publishes, executes this
-/// binary. A fake that handed the steps to `bash` would show bash's executable here.
+/// binary). The process `start` runs, whose pid the fake publishes, must execute this
+/// binary: a shell that forks the act program shows its own executable there. Its
+/// environment must be `start`'s own plus the four the fake sets: a shell that
+/// `exec`s the act program in its place (as `bash -c` does with a single command)
+/// leaves the same executable, but adds what it exports, such as bash's `_`. (Seen:
+/// with the fake starting `bash -c '"$0" "$@"' kbf-act ...`, the executable check
+/// alone passed.)
 #[tokio::test]
 async fn the_action_is_the_act_program_and_no_shell() {
     let fake = Fake::new("act-exe");
@@ -420,10 +425,32 @@ async fn the_action_is_the_act_program_and_no_shell() {
     let runtime = Arc::clone(&fake.runtime);
     let run = tokio::spawn(async move { runtime.run(work(1, action, Resources::default())).await });
     fake.wait_for_start().await;
-    let pid = std::fs::read_to_string(fake.state.join("pid")).expect("pid");
-    let exe = std::fs::read_link(format!("/proc/{}/exe", pid.trim())).expect("its executable");
+    let read = |name: &str| {
+        let text = std::fs::read_to_string(fake.state.join(name)).expect(name);
+        text.trim().to_owned()
+    };
+    let (pid, start) = (read("pid"), read("start-pid"));
+    let exe = std::fs::read_link(format!("/proc/{pid}/exe")).expect("its executable");
     let this = std::env::current_exe().expect("this test binary");
     assert_eq!(exe, this, "the action runs another program");
+    // What a process was started with, less what the fake gives the action.
+    let environment = |pid: &str| -> Vec<String> {
+        let given = ["CG=", "ROOT=", "UPPER=", "FAKE_LEASE="];
+        let bytes = std::fs::read(format!("/proc/{pid}/environ")).expect("environ");
+        let mut entries: Vec<String> = bytes
+            .split(|b| *b == 0)
+            .filter(|e| !e.is_empty())
+            .map(|e| String::from_utf8_lossy(e).into_owned())
+            .filter(|e| !given.iter().any(|g| e.starts_with(g)))
+            .collect();
+        entries.sort();
+        entries
+    };
+    assert_eq!(
+        environment(&pid),
+        environment(&start),
+        "something between `podman start` and the action changed its environment"
+    );
     let result = run.await.expect("join").expect("ran");
     assert_eq!(result.exit_code, 0);
     fake.assert_clean(1);
