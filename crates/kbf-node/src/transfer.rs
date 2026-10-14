@@ -16,7 +16,8 @@ use kbf_daemon::DaemonConfig;
 #[derive(Clone, Debug, clap::Args)]
 pub(crate) struct TransferArgs {
     /// The most blob requests in flight at once, for the whole daemon: ByteStream reads
-    /// and writes and FindMissing calls, over its one connection to `--cas`.
+    /// and writes, segment ranges and FindMissing calls, over its one connection to
+    /// `--cas`. Uploads hold at most all but a quarter of them.
     #[arg(long, default_value_t = DEFAULT_IN_FLIGHT as u64, value_parser = clap::value_parser!(u64).range(1..))]
     pub transfer_in_flight: u64,
     /// The most bytes of blobs read into memory in flight at once, for the whole
