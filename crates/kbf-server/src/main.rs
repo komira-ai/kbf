@@ -93,7 +93,11 @@ async fn run<M: MetaLog, O: ObjectStore + 'static>(
         invocations: policy.invocations_get.is_some(),
         blobs: policy.invocations_get.is_some() && policy.blobs_get.is_some(),
     };
-    let cache = Arc::new(Cache::open(meta, store, prefix).await?);
+    let cache = Arc::new(
+        Cache::open(meta, store, prefix)
+            .await?
+            .with_writes(args.write_config()),
+    );
     let shutdown = interrupted()?;
     let api = args.api()?;
     let bound = bind_server_with_policy(cache, listeners, api, policy, shutdown)?;

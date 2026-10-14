@@ -27,8 +27,9 @@ pub use types::{
 
 /// An object store bucket, as kbf uses it.
 ///
-/// The futures are `Send` so a store can be driven from any runtime thread.
-pub trait ObjectStore: Send + Sync {
+/// The futures are `Send` so a store can be driven from any runtime thread, and a store
+/// is `'static` so a task spawned to write a segment can own a handle on it.
+pub trait ObjectStore: Send + Sync + 'static {
     /// What this store claims beyond the base contract.
     fn capabilities(&self) -> Capabilities;
 
