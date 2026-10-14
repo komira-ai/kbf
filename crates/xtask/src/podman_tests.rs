@@ -253,8 +253,6 @@ pub fn systemd_run_args(u: &Unit<'_>) -> Vec<OsString> {
         [
             "--slice=kbf-daemon.slice",
             "-p",
-            "Delegate=yes",
-            "-p",
             "OOMScoreAdjust=-900",
         ]
         .map(OsString::from),
