@@ -26,7 +26,7 @@ mod connection;
 mod upload;
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -108,6 +108,8 @@ struct Shared<M, O> {
     config: SegmentsConfig,
     connections: Connections,
     budget: Arc<Semaphore>,
+    /// `Begin` calls waiting for the budget now.
+    waiting: AtomicUsize,
     next: AtomicU64,
     uploads: Mutex<HashMap<u64, Arc<Upload>>>,
 }
@@ -132,6 +134,23 @@ enum Phase {
     /// Committed or failed; the answer is in [`Upload::done`].
     Done,
     Dropped,
+}
+
+/// Counts one `Begin` waiting for the budget until dropped, so a call cancelled while
+/// it waits is uncounted too.
+struct Waiting<'a>(&'a AtomicUsize);
+
+impl<'a> Waiting<'a> {
+    fn enter(count: &'a AtomicUsize) -> Self {
+        count.fetch_add(1, Ordering::SeqCst);
+        Self(count)
+    }
+}
+
+impl Drop for Waiting<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// Every lock here guards state that is whole after each statement.
@@ -196,6 +215,7 @@ impl<M: MetaLog, O: ObjectStore + 'static> SegmentsService<M, O> {
                 config,
                 connections,
                 budget: Arc::new(Semaphore::new(permits)),
+                waiting: AtomicUsize::new(0),
                 next: AtomicU64::new(1),
                 uploads: Mutex::new(HashMap::new()),
             }),
@@ -208,6 +228,13 @@ impl<M: MetaLog, O: ObjectStore + 'static> SegmentsService<M, O> {
     pub fn budget_in_use(&self) -> u64 {
         let total = self.shared.config.max_bytes.div_ceil(BUDGET_UNIT);
         (total - self.shared.budget.available_permits() as u64) * BUDGET_UNIT
+    }
+
+    /// How many `Begin` calls are waiting for the memory budget now: what a test
+    /// watches to see a `Begin` wait rather than be refused.
+    #[must_use]
+    pub fn begins_waiting(&self) -> usize {
+        self.shared.waiting.load(Ordering::SeqCst)
     }
 
     /// How many uploads are open (receiving, committing, or holding a commit's answer).
@@ -316,10 +343,13 @@ impl<M: MetaLog, O: ObjectStore + 'static> Segments for SegmentsService<M, O> {
         }
         // `total <= cap`, so the permits fit the budget and this always ends.
         let units = u32::try_from(total.div_ceil(BUDGET_UNIT)).unwrap_or(u32::MAX);
-        let budget = Arc::clone(&self.shared.budget)
-            .acquire_many_owned(units)
-            .await
-            .map_err(|_| Status::unavailable("the upload budget is closed"))?;
+        let budget = {
+            let _waiting = Waiting::enter(&self.shared.waiting);
+            Arc::clone(&self.shared.budget)
+                .acquire_many_owned(units)
+                .await
+        }
+        .map_err(|_| Status::unavailable("the upload budget is closed"))?;
         let segments = declared.iter().map(Receiving::new).collect();
         let (done, _) = watch::channel(None);
         let upload = Arc::new(Upload {

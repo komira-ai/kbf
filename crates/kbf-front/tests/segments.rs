@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use kbf_front::{MAX_RANGE_BYTES, MAX_UPLOAD_RECORDS, SegmentsConfig};
 use kbf_proto::worker::{BeginRequest, CommitRequest, ObjectRef, ReadRangeRequest, UploadSegment};
-use kbf_segments::IndexEntry;
+use kbf_segments::{Footer, IndexEntry};
 use tonic::Code;
 
 use support::{Front, Seg, blob, put_all, seg, seg_with};
@@ -51,38 +51,69 @@ async fn an_upload_of_three_segments_is_one_commit() {
     }
 }
 
-/// Catches trusting the daemon's footer (mutant: no SHA-256 check at commit): a record
-/// whose bytes differ from what `Begin` declared fails the commit INVALID_ARGUMENT and
-/// nothing of the upload is indexed, the good records included.
+/// Catches trusting the daemon's footer (mutant: no SHA-256 check at commit), and a
+/// check that skips some record (mutants: only the first record in digest order
+/// hashed; the first never hashed): each record in turn, in digest order (first,
+/// middle and last), is altered after `Begin`; each such upload's commit is
+/// INVALID_ARGUMENT naming that record, and nothing of it is stored or indexed, the
+/// good records included. The same upload unaltered then commits, so the refusals
+/// were for the altered bytes.
 #[tokio::test]
-async fn a_record_altered_after_begin_fails_the_commit_and_indexes_nothing() {
+async fn each_record_altered_after_begin_fails_the_commit_and_indexes_nothing() {
     let front = Front::start(SegmentsConfig::DEFAULT).await;
-    let s = seg(&[blob(1, 300), blob(2, 300)]);
+    let s = seg(&[blob(1, 300), blob(2, 300), blob(3, 300), blob(4, 300)]);
+    let whole = [s.records.as_slice(), s.footer.as_slice()].concat();
+    let footer = Footer::parse(&whole, s.length).expect("footer");
+    let entries = footer.entries();
+    assert_eq!(entries.len(), 4);
+    assert!(
+        entries.windows(2).all(|w| w[0].digest < w[1].digest),
+        "the footer lists records in digest order"
+    );
     let mut client = front.client().await;
+    for (i, entry) in entries.iter().enumerate() {
+        let upload = front.begin(&mut client, std::slice::from_ref(&s)).await;
+        let mut altered = s.records.clone();
+        altered[usize::try_from(entry.offset).expect("offset")] ^= 0xff;
+        let sent = Seg {
+            records: altered,
+            ..s.clone()
+        };
+        put_all(&mut client, upload, 0, &sent, 4096, false).await;
+        let refused = client
+            .commit(CommitRequest { upload })
+            .await
+            .expect_err("altered record");
+        assert_eq!(
+            refused.code(),
+            Code::InvalidArgument,
+            "record {i}: {refused:?}"
+        );
+        assert!(
+            refused
+                .message()
+                .contains(&format!("record at {} ", entry.offset)),
+            "record {i} named: {refused:?}"
+        );
+        front.assert_present(&s.digests, false).await;
+        assert_eq!(
+            front.cache.metrics().segment_put.count(),
+            0,
+            "record {i}: nothing stored"
+        );
+        assert_eq!(
+            front.cache.metrics().segment_commit.count(),
+            0,
+            "record {i}: nothing committed"
+        );
+    }
     let upload = front.begin(&mut client, std::slice::from_ref(&s)).await;
-    let mut altered = s.records.clone();
-    altered[310] ^= 0xff;
-    let sent = Seg {
-        records: altered,
-        ..s.clone()
-    };
-    put_all(&mut client, upload, 0, &sent, 4096, false).await;
-    let refused = client
+    put_all(&mut client, upload, 0, &s, 4096, false).await;
+    client
         .commit(CommitRequest { upload })
         .await
-        .expect_err("altered record");
-    assert_eq!(refused.code(), Code::InvalidArgument, "{refused:?}");
-    front.assert_present(&s.digests, false).await;
-    assert_eq!(
-        front.cache.metrics().segment_put.count(),
-        0,
-        "nothing stored"
-    );
-    assert_eq!(
-        front.cache.metrics().segment_commit.count(),
-        0,
-        "nothing committed"
-    );
+        .expect("the unaltered upload");
+    front.assert_present(&s.digests, true).await;
 }
 
 /// Catches indexing bytes never received (mutant: no coverage check at commit): a
@@ -407,6 +438,99 @@ async fn begin_refuses_more_records_than_the_limit() {
         .await
         .expect_err("one record over the limit");
     assert_eq!(refused.code(), Code::InvalidArgument, "{refused:?}");
+}
+
+/// How the first upload of [`a_begin_waits_for_the_budget`] gives its budget back.
+#[derive(Clone, Copy, Debug)]
+enum Release {
+    Commit,
+    CloseConnection,
+}
+
+/// One upload holds most of a 4 KiB budget; a second `Begin` that does not fit must
+/// wait in the server (counted by `begins_waiting`) and must not finish while the
+/// first is open; once `release` ends the first, the second is admitted, holds its
+/// own budget, and commits. Every wait ends on an event; the timeouts only fail.
+async fn a_begin_waits_for_the_budget(release: Release) {
+    let config = SegmentsConfig {
+        max_bytes: 4 << 10,
+        idle: Duration::from_secs(3600),
+    };
+    let front = Front::start(config).await;
+    let first = seg(&[blob(60, 1400), blob(61, 1400)]);
+    let second = seg(&[blob(62, 1500)]);
+    assert!(
+        first.length.div_ceil(1024) + second.length.div_ceil(1024) > 4,
+        "the two uploads do not fit together"
+    );
+    let mut a = front.client().await;
+    let held = front.begin(&mut a, std::slice::from_ref(&first)).await;
+    assert!(front.service.budget_in_use() >= first.length);
+
+    let mut b = front.client().await;
+    let segments = vec![second.upload_segment()];
+    let waiting = tokio::spawn(async move {
+        let begun = b.begin(BeginRequest { segments }).await;
+        (b, begun)
+    });
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while front.service.begins_waiting() == 0 {
+            assert!(
+                !waiting.is_finished(),
+                "the second Begin finished while the budget was held"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the second Begin waits in the server");
+    assert!(!waiting.is_finished(), "the second Begin waits");
+    assert_eq!(front.service.open_uploads(), 1);
+
+    match release {
+        Release::Commit => {
+            put_all(&mut a, held, 0, &first, 4096, false).await;
+            a.commit(CommitRequest { upload: held })
+                .await
+                .expect("the first commits");
+            front.assert_present(&first.digests, true).await;
+        }
+        Release::CloseConnection => drop(a),
+    }
+
+    let (mut b, begun) = tokio::time::timeout(Duration::from_secs(10), waiting)
+        .await
+        .expect("the second Begin is admitted once the first ends")
+        .expect("task");
+    let upload = begun
+        .expect("the second Begin is admitted, not refused")
+        .into_inner()
+        .upload;
+    assert_eq!(front.service.begins_waiting(), 0);
+    assert!(front.service.budget_in_use() >= second.length);
+    put_all(&mut b, upload, 0, &second, 4096, false).await;
+    b.commit(CommitRequest { upload })
+        .await
+        .expect("the second commits");
+    front.assert_present(&second.digests, true).await;
+    if let Release::CloseConnection = release {
+        front.assert_present(&first.digests, false).await;
+    }
+}
+
+/// Catches a `Begin` refused for load (mutant: `try_acquire` for `acquire`, so
+/// concurrent daemons fall back to ByteStream): a second `Begin` waits while the
+/// budget is held and is admitted once the first upload commits.
+#[tokio::test]
+async fn a_begin_waits_for_the_budget_until_the_holder_commits() {
+    a_begin_waits_for_the_budget(Release::Commit).await;
+}
+
+/// As above, and the budget comes back when the holder's connection closes: the
+/// second `Begin` is admitted once the first upload is dropped.
+#[tokio::test]
+async fn a_begin_waits_for_the_budget_until_the_holder_is_dropped() {
+    a_begin_waits_for_the_budget(Release::CloseConnection).await;
 }
 
 /// Catches `Locate` answering a blob it does not hold, and `ReadRange` serving other
