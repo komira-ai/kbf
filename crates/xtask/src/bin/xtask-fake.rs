@@ -1,16 +1,16 @@
 //! `xtask-fake`: what this crate's tests run in place of `cargo`, of a built
-//! `kbf-server`, of `gh` and of `sudo`, so `build-commit stamps` is tested without
-//! building the server, `verify-assets attestations` without GitHub and `sudo-test`
-//! without root.
+//! `kbf-server`, of `gh`, of `sudo` and of `podman`, so `build-commit stamps` is tested
+//! without building the server, `verify-assets attestations` without GitHub, and
+//! `sudo-test` and `podman-tests` without root, systemd or Podman.
 //!
-//! - Run under any name but `kbf-server`, `gh` or `sudo`, it is cargo: it appends its arguments
-//!   as one line to `target/debug/cargo-args` in its working directory, "builds" by
-//!   hard-linking itself to `target/debug/kbf-server`, and writes the stamp that build
-//!   embeds to `target/debug/kbf-server.stamp`: `KBF_BUILD_COMMIT_OVERRIDE` when set,
-//!   else `XTASK_FAKE_HEAD`. An override that is not 12 lowercase hex digits fails the
-//!   build with the build script's message. With `--no-run` it builds nothing: it
-//!   prints the file `cargo-messages` in its working directory, the JSON messages a
-//!   test wrote for it.
+//! - Run under any name but `kbf-server`, `gh`, `sudo` or `podman`, it is cargo: it
+//!   appends its arguments as one line to `target/debug/cargo-args` in its working
+//!   directory, "builds" by hard-linking itself to `target/debug/kbf-server`, and
+//!   writes the stamp that build embeds to `target/debug/kbf-server.stamp`:
+//!   `KBF_BUILD_COMMIT_OVERRIDE` when set, else `XTASK_FAKE_HEAD`. An override that is
+//!   not 12 lowercase hex digits fails the build with the build script's message. With
+//!   `--no-run` it builds nothing: it prints the file `cargo-messages` in its working
+//!   directory, the JSON messages a test wrote for it.
 //! - Run as `kbf-server`, it prints `kbf-server 0.1.0+<stamp>` from the stamp file next
 //!   to it.
 //! - Run as `gh attestation verify <file> <flags>`, it appends its arguments as one line
@@ -19,6 +19,10 @@
 //!   it covers and the exact flags it verifies under.
 //! - Run as `sudo`, it appends `<working directory>: <arguments>` as one line to
 //!   `sudo-args` next to it, and exits 0 (the tests it was asked to run passed).
+//! - Run as `podman`, it appends `XDG_RUNTIME_DIR=<value>: <arguments>` as one line to
+//!   `podman-args` next to it. `--version` prints a version line, `manifest inspect`
+//!   prints the file `podman-index.json` next to it (the image index a test wrote for
+//!   it), and anything else (`pull`) prints nothing.
 //!
 //! `XTASK_FAKE_DEFECT` plants one defect of the real build: `ignores-override` (the
 //! build embeds the head whatever the override), `accepts-bad` (a malformed override
@@ -28,7 +32,9 @@
 //! next build cannot start) or `version-fails` (`kbf-server` exits 1). Of the
 //! attestation store: `accepts-all` (every file verifies, whatever the flags) or
 //! `ignores-bytes` (a file verifies when any attestation has its flags). Of sudo:
-//! `tests-fail` (it exits 101, as a failed test binary does).
+//! `tests-fail` (it exits 101, as a failed test binary does) or `fails:<argument>`
+//! (it exits 101 when one of its arguments is `<argument>`, so one unit of several
+//! fails). Of podman: `podman-fails` (every podman command exits 125).
 use std::io::Write;
 use std::path::Path;
 use std::process::ExitCode;
@@ -141,8 +147,36 @@ fn sudo(argv0: &str, args: &[String]) -> ExitCode {
         .open(dir.join("sudo-args"))
         .expect("sudo-args");
     writeln!(log, "{}: {}", cwd.display(), args.join(" ")).expect("sudo-args");
-    if defect("tests-fail") {
+    let fails_on = std::env::var("XTASK_FAKE_DEFECT")
+        .unwrap_or_default()
+        .strip_prefix("fails:")
+        .map(str::to_owned);
+    if defect("tests-fail") | args.iter().any(|a| Some(a) == fails_on.as_ref()) {
         return ExitCode::from(101);
+    }
+    ExitCode::SUCCESS
+}
+
+fn podman(argv0: &str, args: &[String]) -> ExitCode {
+    let dir = Path::new(argv0).parent().expect("the fake's directory");
+    let runtime_dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_default();
+    let mut log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("podman-args"))
+        .expect("podman-args");
+    writeln!(log, "XDG_RUNTIME_DIR={runtime_dir}: {}", args.join(" ")).expect("podman-args");
+    if defect("podman-fails") {
+        eprintln!("xtask-fake: podman failed");
+        return ExitCode::from(125);
+    }
+    match args.first().map(String::as_str) {
+        Some("--version") => println!("podman version 0.0.0-xtask-fake"),
+        Some("manifest") => print!(
+            "{}",
+            std::fs::read_to_string(dir.join("podman-index.json")).expect("podman-index.json")
+        ),
+        _ => {}
     }
     ExitCode::SUCCESS
 }
@@ -157,6 +191,8 @@ fn main() -> ExitCode {
         gh(&argv0, &rest)
     } else if argv0.ends_with("/sudo") {
         sudo(&argv0, &rest)
+    } else if argv0.ends_with("/podman") {
+        podman(&argv0, &rest)
     } else {
         cargo(&argv0, &rest)
     }

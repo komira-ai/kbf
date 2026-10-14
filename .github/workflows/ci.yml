@@ -412,9 +412,10 @@ jobs:
       - run: sh tools/mac-provision/test/coverage.sh
       - run: sh tools/mac-provision/test/mutants.sh
 
-  # The container driver against real rootless Podman, inside a Delegate=yes system
-  # unit (tools/ci/podman-tests.sh; the T4 spike found both arches carry it). The same
-  # tests show as ignored, with their reason, in the plain test jobs above.
+  # The container driver against real rootless Podman, each test binary inside a
+  # Delegate=yes system unit (crates/xtask/src/podman_tests.rs; the T4 spike found both
+  # arches carry it). The same tests show as ignored, with their reason, in the plain
+  # test jobs above.
   podman-x86:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -434,7 +435,7 @@ jobs:
             target
           key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
-      - run: bash tools/ci/podman-tests.sh
+      - run: cargo xtask podman-tests
       - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         if: ${{ github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true' }}
         with:
@@ -512,7 +513,7 @@ jobs:
             target
           key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
-      - run: bash tools/ci/podman-tests.sh
+      - run: cargo xtask podman-tests
       - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         if: ${{ github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true' }}
         with:
