@@ -15,8 +15,18 @@ Sections below that describe them say so.
 | Asset | Runner | Target |
 |---|---|---|
 | `kbf-daemon-<commit>-darwin-arm64.tar.gz` | `macos-15` (Apple silicon) | `aarch64-apple-darwin`, `MACOSX_DEPLOYMENT_TARGET=14.0` |
-| `kbf-daemon-<commit>-linux-x86_64.tar.gz`, `kbf-server-<commit>-linux-x86_64.tar.gz` | `ubuntu-24.04` | `x86_64-unknown-linux-gnu` |
-| `kbf-daemon-<commit>-linux-arm64.tar.gz`, `kbf-server-<commit>-linux-arm64.tar.gz` | `ubuntu-24.04-arm` | `aarch64-unknown-linux-gnu` |
+| `kbf-daemon-<commit>-linux-x86_64.tar.gz`, `kbf-server-<commit>-linux-x86_64.tar.gz`, `kbf-deploy-<commit>-linux-x86_64.tar.gz` | `ubuntu-24.04` | `x86_64-unknown-linux-gnu` |
+| `kbf-daemon-<commit>-linux-arm64.tar.gz`, `kbf-server-<commit>-linux-arm64.tar.gz`, `kbf-deploy-<commit>-linux-arm64.tar.gz` | `ubuntu-24.04-arm` | `aarch64-unknown-linux-gnu` |
+
+`kbf-deploy` is the deploy tool (its kits are listed in
+[ARCHITECTURE.md](../ARCHITECTURE.md)), shipped so an operator installs the tool the
+same way as the binaries it installs: by digest, from these attested files, not built
+on the operator's machine. It is built for Linux only. Every kit that changes a host
+changes a Linux one (systemd units, the MDM services, a systemd user service, or a
+cluster through `kubectl`), and no CI job builds or tests `kbf-deploy` on macOS, so a
+darwin asset would ship bytes no test ran. The one verb meant for an operator's own
+machine, `mdm erase-request`, runs on a Linux one as well. A darwin asset needs a macOS
+job that builds and tests the crate first.
 
 `<commit>` is the full SHA of the commit built (`GITHUB_SHA`: on `main`, the pushed
 commit; on a pull request, the test merge commit). Each tarball holds one release binary (`cargo build
@@ -58,6 +68,13 @@ request run holds a token that can sign an attestation. No repository code runs 
 `attest` and nothing is built there: it holds those scopes for the pinned signing
 actions alone. Every action is pinned by commit SHA, and that lint refuses one that
 is not.
+
+The attest job names each tarball and its SBOM, one `actions/attest-sbom` step per
+tarball, and runs only on `main`. So that a binary added to a build job cannot reach
+`main` without its step, the repository lint (`crates/kbf-it/tests/attested_assets`)
+reads the workflow's `cargo xtask package` lines and its attest steps on every pull
+request, and refuses a packaged tarball with no step pairing it with its own SBOM, or a
+step for a tarball no job packages.
 
 ## Where the files are, and for how long
 

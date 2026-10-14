@@ -23,10 +23,14 @@
 //! - the darwin-arm64 job of `.github/workflows/artifacts.yml` no longer running
 //!   `cargo xtask darwin-asset` on the packaged binary after `Package`, or
 //!   running it where its failure does not fail the job;
+//! - an asset `.github/workflows/artifacts.yml` packages with no `actions/attest-sbom`
+//!   step for it and its own SBOM in the attest job, or such a step for an asset no
+//!   job packages (module `attested_assets`);
 //! - the scans passing vacuously because git listed nothing, no Markdown file was
 //!   scanned or the workflows moved;
 //! - a drift in the rules that pick which files each lint reads (module `selection`).
 
+mod attested_assets;
 mod interpreters;
 mod test_spawns;
 mod workflows;

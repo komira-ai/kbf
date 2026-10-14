@@ -152,13 +152,16 @@ pub fn scan_action(text: &str, repo: &Repo) -> Vec<String> {
     run(text, repo, |lint, root| lint.action(root))
 }
 
-/// One step of a job, as far as the step-order lints read it: its `name:` and its
-/// `run:` script, each `None` when absent or not a string, and whether it has an `if:`
-/// or a `continue-on-error:` (either can let the job pass without the step's check).
+/// One step of a job, as far as the step lints read it: its `name:`, its `run:` script
+/// and its `uses:`, each `None` when absent or not a string; its `with:` inputs whose
+/// values are strings, in file order; and whether it has an `if:` or a
+/// `continue-on-error:` (either can let the job pass without the step's check).
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Step {
     pub name: Option<String>,
     pub run: Option<String>,
+    pub uses: Option<String>,
+    pub with: Vec<(String, String)>,
     pub conditional: bool,
 }
 
@@ -186,6 +189,14 @@ pub fn job_steps(text: &str, job: &str) -> Result<Vec<Step>, String> {
             Value::Map(m) => Step {
                 name: text_of(get(m, "name")),
                 run: text_of(get(m, "run")),
+                uses: text_of(get(m, "uses")),
+                with: match get(m, "with").map(|w| &w.value) {
+                    Some(Value::Map(inputs)) => inputs
+                        .iter()
+                        .filter_map(|(k, v)| Some((k.as_str()?.to_owned(), v.as_str()?.to_owned())))
+                        .collect(),
+                    _ => Vec::new(),
+                },
                 conditional: get(m, "if").is_some() || get(m, "continue-on-error").is_some(),
             },
             _ => Step::default(),
