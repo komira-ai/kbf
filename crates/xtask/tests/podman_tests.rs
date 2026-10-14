@@ -423,3 +423,24 @@ fn a_sudo_or_podman_that_cannot_start_fails_the_verb() {
     );
     assert_eq!(run.cargo_args(), "");
 }
+
+/// Catches a fake podman that runs without the user manager's bus, which would let
+/// `the_verb_waits_for_a_bus_that_appears_late` pass with the wait skipped: with no
+/// socket at `$XDG_RUNTIME_DIR/bus` it exits 125, after logging the command.
+#[test]
+fn the_fake_podman_refuses_without_a_bus() {
+    let run = Run::new("fakebus");
+    std::fs::remove_file(run.runtime.join("bus")).expect("no bus");
+    let out = Command::new(run.bin.join("podman"))
+        .arg("--version")
+        .env("XDG_RUNTIME_DIR", &run.runtime)
+        .env_remove("XTASK_FAKE_DEFECT")
+        .output()
+        .expect("run the fake podman");
+    assert_eq!(out.status.code(), Some(125));
+    assert_eq!(out.stdout, b"");
+    assert_eq!(
+        run.podman_args(),
+        format!("XDG_RUNTIME_DIR={}: --version\n", run.runtime.display())
+    );
+}
