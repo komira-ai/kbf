@@ -340,7 +340,9 @@ impl Fake {
             ("UPPER", self.cat("upper")),
         ];
         let act = self.link.with_file_name("kbf-act");
-        let mut action = Command::new(&act);
+        // MUTANT: the steps routed back through bash, which runs the act program.
+        let mut action = Command::new("bash");
+        action.arg("-c").arg("\"$0\" \"$@\"").arg(&act);
         let steps = self.read("action").unwrap_or_default();
         for arg in arguments(&steps) {
             action.arg(OsString::from_vec(expand(arg, &paths)));
