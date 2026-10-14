@@ -321,6 +321,10 @@ mod fake {
     /// Starts the "daemon": its claim on the scratch directory, then `welcomed` in its
     /// log, or its refusal of a unit without `Delegate=yes`. The second unit's start
     /// also logs the server's rerun of the killed daemon's lease.
+    #[expect(
+        clippy::zombie_processes,
+        reason = "the late writer outlives this fake on purpose, as a server's log line would"
+    )]
     fn systemd_run(args: &[String]) -> i32 {
         let unit = value(args, "--unit=").expect("a unit");
         let log = PathBuf::from(value(args, "StandardError=append:").expect("a log"));
