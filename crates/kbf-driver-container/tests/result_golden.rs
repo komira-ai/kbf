@@ -24,8 +24,8 @@ fn plant(upper: &std::path::Path) {
     std::fs::create_dir_all(out.join("empty")).expect("mkdir");
     std::fs::create_dir_all(out.join("sub/deep")).expect("mkdir");
     std::fs::write(out.join("a.txt"), b"alpha\n").expect("write");
-    std::fs::write(out.join("b.sh"), b"#!/bin/sh\necho b\n").expect("write");
-    std::fs::set_permissions(out.join("b.sh"), std::fs::Permissions::from_mode(0o755))
+    std::fs::write(out.join("b.tool"), b"tool one\n").expect("write");
+    std::fs::set_permissions(out.join("b.tool"), std::fs::Permissions::from_mode(0o755))
         .expect("chmod");
     std::fs::write(out.join("sub/c.txt"), b"alpha\n").expect("write");
     std::fs::write(out.join("sub/deep/d.bin"), patterned(3 << 20)).expect("write");
@@ -34,7 +34,7 @@ fn plant(upper: &std::path::Path) {
     std::os::unix::fs::symlink("../a.txt", out.join("sub/link")).expect("symlink");
     std::fs::write(out.join("z \u{e9}.txt"), "unicode\n").expect("write");
     std::fs::write(upper.join("lone.txt"), b"lone\n").expect("write");
-    std::fs::write(upper.join("lone_exec"), b"#!/bin/sh\n").expect("write");
+    std::fs::write(upper.join("lone_exec"), b"tool two\n").expect("write");
     std::fs::set_permissions(
         upper.join("lone_exec"),
         std::fs::Permissions::from_mode(0o700),
@@ -99,8 +99,8 @@ async fn a_mixed_tree_collects_to_what_it_always_did() {
                 (
                     "lone_exec",
                     digest(
-                        "a8076d3d28d21e02012b20eaf7dbf75409a6277134439025f282e368e3305abf",
-                        10
+                        "5892abd1e920f87f537285a4e0764d1433e80ae89df3340d0f4c1206a6ecb5c1",
+                        9
                     ),
                     true
                 ),
@@ -115,16 +115,16 @@ async fn a_mixed_tree_collects_to_what_it_always_did() {
         assert_eq!(
             dir.tree_digest,
             digest(
-                "87d27c9e101813bc224585ea4e124cc1f4ca0a68ee9067c04f14c3a60e2be366",
-                822
+                "c65c222e8f1c33c0a4c9c236a840e262b0e1446026a4cad1560531be58e30567",
+                824
             ),
             "{threads} threads"
         );
         assert_eq!(
             dir.root_directory_digest,
             digest(
-                "dbe3c45862bfccea2fb064c3b8fb6b32c49c6fb001ed2c420abc0b7bd4c3983a",
-                396
+                "e9cb753a7695368a2d8c2abed9cd3683bbbe21ff8db4ed1c8b97de8b51c7bf2b",
+                398
             ),
             "{threads} threads"
         );
