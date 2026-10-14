@@ -583,3 +583,53 @@ fn a_tick_made_while_a_put_blobs_burst_waits_shares_its_next_sync() {
     let first = first.recv_timeout(PROMPTLY).expect("the first proposal");
     assert!(matches!(first, Ok(Applied::Blob(Ok(_)))), "{first:?}");
 }
+
+/// Polls `future` once, outside any Tokio runtime, as kbf-sim-cell polls the log.
+fn polled_once<F: Future>(future: F) -> Poll<F::Output> {
+    let mut future = std::pin::pin!(future);
+    future
+        .as_mut()
+        .poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
+}
+
+/// Catches (the committer always spawned on Tokio's blocking pool: outside a runtime
+/// that panics, "there is no reactor running", which is how kbf-sim-cell's server
+/// tests failed): a caller that polls a commit by hand outside any runtime, with no
+/// other commit in progress, commits on its own thread and is answered in that one
+/// poll, and so is the next such caller.
+#[test]
+fn a_commit_polled_once_outside_a_runtime_commits_on_the_callers_thread() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("runtime");
+    let (gate, _) = Gate::new();
+    let fs = GateFs {
+        inner: FaultFs::new(),
+        gate,
+    };
+    // The open spawns the tick task, so it needs a runtime's context; the runtime is
+    // never driven, so the task never ticks.
+    let opened = {
+        let _context = runtime.enter();
+        polled_once(RaftMetaLog::open(fs, Retention::default(), "kbf/", new_id))
+    };
+    let Poll::Ready(Ok(log)) = opened else {
+        panic!("the open answered in one poll");
+    };
+
+    let epoch = match polled_once(log.commit(Command::AllocEpoch)) {
+        Poll::Ready(Ok(Applied::Epoch(e))) => e,
+        other => panic!("AllocEpoch polled once: {other:?}"),
+    };
+    let (digest, command) = blob(epoch, 1);
+    let put = polled_once(log.commit(command));
+    assert!(
+        matches!(put, Poll::Ready(Ok(Applied::Blob(Ok(_))))),
+        "{put:?}"
+    );
+    let seen = polled_once(log.query(move |m| m.blob(&digest)));
+    assert!(
+        matches!(seen, Poll::Ready(Ok(BlobAnswer::Present { .. }))),
+        "{seen:?}"
+    );
+}

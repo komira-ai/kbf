@@ -20,7 +20,9 @@
 //!   applies it and answers each caller, then takes what queued meanwhile, until the
 //!   queue is empty. A lone command is committed as soon as it arrives; commands that
 //!   arrive during a sync share the next one. A storage error answers every command
-//!   of its batch `Unavailable`, none with an outcome.
+//!   of its batch `Unavailable`, none with an outcome. A commit polled outside any
+//!   tokio runtime that finds no committer running is the committer, on the caller's
+//!   thread, so its future is ready in its first poll (kbf-sim-cell relies on that).
 //! - **Queries** read this server's applied state. A single voter is always its own
 //!   leader, so that is the committed state. The state has its own lock, held by a
 //!   commit only while it applies, never across the sync: a query does not wait for a
@@ -390,7 +392,13 @@ where
         };
         if start {
             let shared = Arc::clone(self);
-            drop(tokio::task::spawn_blocking(move || shared.commit_queued()));
+            let committer = move || shared.commit_queued();
+            match tokio::runtime::Handle::try_current() {
+                Ok(runtime) => drop(runtime.spawn_blocking(committer)),
+                // A caller that polls by hand, outside any runtime (kbf-sim-cell),
+                // commits on its own thread: its answer is ready when this poll ends.
+                Err(_) => committer(),
+            }
         }
         // The committer dropped the reply only if it panicked.
         answer
