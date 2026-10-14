@@ -13,6 +13,8 @@ use kbf_objstore::{Capabilities, KeyError, KeyPrefix};
 use tonic::transport::{Certificate, Identity, ServerTlsConfig};
 
 use kbf_auth::{AllowAuthorizer, Authorizer, Policy, PolicyError};
+use kbf_meta::ServerId;
+use kbf_tier::{TierArgs, TierOptions};
 
 use crate::identity::{DenyList, DenyListError};
 use crate::serve::{Api, Listeners, WorkerTls};
@@ -202,7 +204,15 @@ pub struct Args {
     /// The store refuses to overwrite a key (MinIO and RustFS do).
     #[arg(long)]
     pub s3_conditional_put: bool,
+    /// The local write tier (`docs/design/write-path.md`, section 6). Off unless
+    /// `--write-tier-dir` is given.
+    #[command(flatten)]
+    pub tier: TierArgs,
 }
+
+/// This server in the tier registry. A farm runs one server today
+/// (`docs/design/deployment-topology.md`); each gets its own id with HA.
+pub const SERVER: ServerId = ServerId::new(1);
 
 /// Why the flags do not make a working server.
 #[derive(Debug, thiserror::Error)]
@@ -244,6 +254,12 @@ pub enum ConfigError {
     /// `--raft-dir` without `--meta-log=raft`.
     #[error("--raft-dir is read only with --meta-log=raft")]
     RaftDirUnused,
+    /// `--write-tier-dir` with `--meta-log=raft`: the tier's commands need log format
+    /// 2, and this binary does not commit the format raise yet.
+    #[error(
+        "--write-tier-dir needs --meta-log=memory: the Raft log is at format 1, which has no write-tier commands"
+    )]
+    TierWithRaft,
     /// The REAPI policy file is not a policy.
     #[error("--reapi-auth-policy: {path}: {source}")]
     Policy {
@@ -254,6 +270,21 @@ pub enum ConfigError {
 }
 
 impl Args {
+    /// The write tier's directory and options, or `None` when the tier is off.
+    ///
+    /// The tier runs over the memory log only, until the Raft log's format raise: the
+    /// server then clears the directory at every start
+    /// ([`crate::write_tier::attach`]), which a durable log must not do.
+    ///
+    /// # Errors
+    /// [`ConfigError::TierWithRaft`].
+    pub fn write_tier(&self) -> Result<Option<(PathBuf, TierOptions)>, ConfigError> {
+        match (self.tier.config(), self.meta_log) {
+            (Some(_), MetaLogKind::Raft) => Err(ConfigError::TierWithRaft),
+            (config, _) => Ok(config),
+        }
+    }
+
     /// The listeners these flags describe.
     ///
     /// # Errors
@@ -428,7 +459,29 @@ fn read(path: &PathBuf) -> Result<Vec<u8>, ConfigError> {
 mod tests {
     use clap::Parser;
 
-    use super::{Args, loopback_only};
+    use super::{Args, ConfigError, loopback_only};
+
+    /// Catches: the write tier accepted over `--meta-log=raft` (the log is at format 1,
+    /// so every tier command would fail to commit), refused over the memory log, or on
+    /// when `--write-tier-dir` is not given.
+    #[test]
+    fn the_write_tier_needs_the_memory_log() {
+        let parse = |extra: &[&str]| {
+            let base = ["kbf-server", "--store", "s3", "--s3-endpoint", "http://e:9"];
+            let rest = ["--s3-bucket", "b"];
+            Args::parse_from(base.iter().chain(&rest).chain(extra))
+        };
+        let tier = ["--write-tier-dir", "/t", "--write-tier-bytes", "9"];
+        assert_eq!(parse(&[]).write_tier().expect("off"), None);
+        let on = parse(&tier).write_tier().expect("memory");
+        assert_eq!(on.map(|(_, o)| o.budget), Some(9));
+        let raft = ["--meta-log", "raft", "--raft-dir", "/r"];
+        let both: Vec<&str> = tier.iter().chain(&raft).copied().collect();
+        assert!(matches!(
+            parse(&both).write_tier(),
+            Err(ConfigError::TierWithRaft)
+        ));
+    }
 
     /// Catches: a `loopback_only` that knows only wildcards (`is_unspecified`), so one
     /// interface other machines reach (`192.0.2.10`, a documentation address standing

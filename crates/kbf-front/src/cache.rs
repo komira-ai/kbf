@@ -4,6 +4,7 @@
 
 use std::collections::BTreeSet;
 use std::mem;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
@@ -66,6 +67,9 @@ pub enum CacheError {
     /// A segment read back from the store did not parse.
     #[error("segment: {0}")]
     Segment(#[from] SegmentError),
+    /// The local write tier failed.
+    #[error("write tier: {0}")]
+    Tier(#[from] kbf_tier::TierError),
     /// A blob could not be packed.
     #[error("segment: {0}")]
     Pack(#[from] WriteError),
@@ -101,6 +105,7 @@ impl From<CacheError> for Status {
             | CacheError::Meta(_)
             | CacheError::Store(_)
             | CacheError::Segment(_)
+            | CacheError::Tier(_)
             | CacheError::Pack(_)
             | CacheError::Key(_)
             | CacheError::Contended => Status::unavailable(message),
@@ -173,9 +178,12 @@ pub struct Cache<M, O> {
     objects: O,
     prefix: KeyPrefix,
     epoch: Epoch,
-    next_seq: AtomicU64,
+    /// Shared with the write tier, which numbers its blocks' objects from it too.
+    next_seq: Arc<AtomicU64>,
     segment_limit: u64,
     metrics: CacheMetrics,
+    /// The local write tier, once [`Cache::attach_tier`] attached one.
+    tier: Option<tier::Staging>,
 }
 
 impl Cache<MemoryMetaLog, MemoryStore> {
@@ -210,9 +218,10 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
             objects,
             prefix,
             epoch,
-            next_seq: AtomicU64::new(1),
+            next_seq: Arc::new(AtomicU64::new(1)),
             segment_limit: MAX_SEGMENT_BYTES,
             metrics: CacheMetrics::default(),
+            tier: None,
         }
     }
 
@@ -416,7 +425,10 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         match answer {
             BlobAnswer::Absent => Err(CacheError::NotFound(*digest)),
             BlobAnswer::Unavailable => Err(CacheError::Unreachable(*digest)),
-            BlobAnswer::Present { location, .. } => self.fetch(digest, location).await,
+            BlobAnswer::Present {
+                location,
+                staged_on,
+            } => self.fetch_answer(digest, location, staged_on).await,
         }
     }
 
@@ -647,30 +659,30 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
                 Ok(_) => packed.push(blob.digest),
                 Err(WriteError::Full { .. }) => {
                     let full = mem::replace(&mut writer, SegmentWriter::new(self.segment_limit));
-                    placed.push(self.put_segment(full, &mem::take(&mut packed)).await?);
+                    let full_packed = mem::take(&mut packed);
+                    placed.extend(self.place_segment(full, &full_packed, false).await?);
                     writer.push(&blob.bytes)?;
                     packed.push(blob.digest);
                 }
-                Err(WriteError::TooLarge { .. }) => placed.push(self.put_whole(blob).await?),
+                Err(WriteError::TooLarge { .. }) => placed.extend(self.put_whole(blob).await?),
                 Err(e) => return Err(e.into()),
             }
         }
         if !writer.is_empty() {
-            placed.push(self.put_segment(writer, &packed).await?);
+            placed.extend(self.place_segment(writer, &packed, false).await?);
         }
         Ok(placed)
     }
 
-    /// Writes one segment, reads its footer back from the store, and returns where
-    /// each packed blob is, as the stored footer says.
-    async fn put_segment(
+    /// Writes one finished segment to the store, reads its footer back, and returns
+    /// where each packed blob is, as the stored footer says.
+    async fn put_body(
         &self,
-        writer: SegmentWriter,
+        body: Bytes,
         packed: &[Digest],
     ) -> Result<Vec<(Digest, Location)>, CacheError> {
         let segment = self.allocate();
         let key = self.object_key(segment)?;
-        let body = Bytes::from(writer.finish());
         let len = body.len() as u64;
         self.metrics.segment_blobs.observe(packed.len() as u64);
         self.metrics.segment_bytes.observe(len);
@@ -719,16 +731,31 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
     /// carries a footer like every other object: its digest and CRC are in the store,
     /// and an index can be rebuilt from it. Chunking such blobs (`docs/design/storage.md#segments`)
     /// comes later.
-    async fn put_whole(&self, blob: VerifiedBlob) -> Result<Vec<(Digest, Location)>, CacheError> {
+    async fn put_whole(
+        &self,
+        blob: VerifiedBlob,
+    ) -> Result<Option<Vec<(Digest, Location)>>, CacheError> {
         let mut writer = SegmentWriter::new(blob.digest.size_bytes.saturating_add(footer_len(1)));
         writer.push(&blob.bytes)?;
-        self.put_segment(writer, &[blob.digest]).await
+        self.place_segment(writer, &[blob.digest], true).await
     }
 
-    /// Reads `digest`'s bytes at `location` and checks them. An object the store does
-    /// not have is marked unreachable as [`UnreachableReason::Missing`], one whose bytes
-    /// are wrong as [`UnreachableReason::Corrupt`].
+    /// Reads `digest`'s bytes at `location` from the store and checks them. An object
+    /// the store does not have is marked unreachable as [`UnreachableReason::Missing`],
+    /// one whose bytes are wrong as [`UnreachableReason::Corrupt`].
     async fn fetch(&self, digest: &Digest, location: Location) -> Result<Bytes, CacheError> {
+        self.fetch_from_store(digest, location, true).await
+    }
+
+    /// [`Cache::fetch`], marking the object only if `mark`: a reader never marks an
+    /// object that was staged when its query ran, because the store does not hold it
+    /// yet (design section 6.1.5).
+    async fn fetch_from_store(
+        &self,
+        digest: &Digest,
+        location: Location,
+        mark: bool,
+    ) -> Result<Bytes, CacheError> {
         let Location {
             store,
             object,
@@ -748,18 +775,22 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         let bytes = match self.get_range(&key, range).await {
             Ok(bytes) => bytes,
             Err(e @ (ObjectStoreError::NotFound(_) | ObjectStoreError::InvalidRange { .. })) => {
-                tracing::error!(%digest, %key, error = %e, "held blob missing from the store");
-                self.mark_unreachable(object, UnreachableReason::Missing)
-                    .await?;
+                tracing::error!(%digest, %key, error = %e, mark, "held blob missing from the store");
+                if mark {
+                    self.mark_unreachable(object, UnreachableReason::Missing)
+                        .await?;
+                }
                 return Err(CacheError::Unreachable(*digest));
             }
             Err(e) => return Err(e.into()),
         };
         // Digest equality includes the length, so a short read fails here too.
         if kbf_segments::sha256(&bytes) != *digest {
-            tracing::error!(%digest, %key, "stored bytes fail their digest");
-            self.mark_unreachable(object, UnreachableReason::Corrupt)
-                .await?;
+            tracing::error!(%digest, %key, mark, "stored bytes fail their digest");
+            if mark {
+                self.mark_unreachable(object, UnreachableReason::Corrupt)
+                    .await?;
+            }
             return Err(CacheError::Unreachable(*digest));
         }
         Ok(bytes)
@@ -814,8 +845,12 @@ fn unexpected(applied: &Applied) -> CacheError {
 }
 
 mod batch;
+mod flush;
+mod tier;
 
 pub use batch::BATCH_READS_IN_FLIGHT;
+pub use flush::{FLUSH_BACKOFF_FIRST, FLUSH_BACKOFF_MAX, FLUSHES_PER_ROUND, FlushRound};
+pub use tier::{TierStartError, TierStartup};
 
 #[cfg(test)]
 mod tests;

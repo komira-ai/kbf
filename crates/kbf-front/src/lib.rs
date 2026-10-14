@@ -66,7 +66,10 @@ use tonic::service::Routes;
 
 pub use crate::action_cache::ActionCacheService;
 pub use crate::bytestream::ByteStreamService;
-pub use crate::cache::{BATCH_READS_IN_FLIGHT, Cache, CacheError, VerifiedBlob};
+pub use crate::cache::{
+    BATCH_READS_IN_FLIGHT, Cache, CacheError, FLUSH_BACKOFF_FIRST, FLUSH_BACKOFF_MAX,
+    FLUSHES_PER_ROUND, FlushRound, TierStartError, TierStartup, VerifiedBlob,
+};
 pub use crate::capabilities::{CapabilitiesService, server_capabilities};
 pub use crate::cas::CasService;
 pub use crate::execution::{

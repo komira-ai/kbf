@@ -19,11 +19,13 @@ kbf-objstore.workspace = true
 kbf-proto.workspace = true
 kbf-sched.workspace = true
 kbf-segments.workspace = true
+kbf-store.workspace = true
+kbf-tier.workspace = true
 kbf-types.workspace = true
 prost.workspace = true
 prost-types.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["macros", "sync"] }
+tokio = { workspace = true, features = ["macros", "rt", "sync"] }
 tonic.workspace = true
 tower-layer.workspace = true
 tracing.workspace = true

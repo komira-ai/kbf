@@ -26,6 +26,11 @@
 //! `--meta-log=raft` opens the log in `--raft-dir` (creating it if the directory is
 //! empty) before anything is bound, and writes objects under the prefix the log
 //! committed; a directory it refuses exits 2.
+//!
+//! `--write-tier-dir` attaches the local write tier before anything is bound
+//! (`kbf_server::write_tier`); a start the tier refuses (a wrong or missing `TIER`
+//! while objects are staged, `--meta-log=raft`) exits 2. Its flusher runs every
+//! second until the server stops.
 
 use std::error::Error;
 use std::future::Future;
@@ -39,6 +44,7 @@ use kbf_front::{Cache, MemoryMetaLog, MetaLog};
 use kbf_log::FarmLogId;
 use kbf_meta::Retention;
 use kbf_objstore::{Capabilities, KeyPrefix, MemoryStore, ObjectStore};
+use kbf_server::write_tier::FLUSH_EVERY;
 use kbf_server::{Args, RaftMetaLog, SERVER_VERSION, StoreKind, bind_server_with_policy};
 
 #[tokio::main]
@@ -59,6 +65,7 @@ async fn main() -> ExitCode {
 /// Builds the object store and the metadata log the flags name, then serves.
 async fn start(args: &Args) -> Result<(), Box<dyn Error>> {
     let raft_dir = args.raft_dir()?;
+    args.write_tier()?;
     let memory = || MemoryMetaLog::new(Retention::default());
     match args.store {
         StoreKind::Memory => {
@@ -93,7 +100,13 @@ async fn run<M: MetaLog, O: ObjectStore + 'static>(
         invocations: policy.invocations_get.is_some(),
         blobs: policy.invocations_get.is_some() && policy.blobs_get.is_some(),
     };
-    let cache = Arc::new(Cache::open(meta, store, prefix).await?);
+    let cache = Cache::open(meta, store, prefix).await?;
+    let (cache, tier) = kbf_server::write_tier::attach(cache, args).await?;
+    let cache = Arc::new(cache);
+    let _flusher = tier.map(|_| {
+        let flusher = kbf_server::write_tier::run_flusher(Arc::clone(&cache), FLUSH_EVERY);
+        AbortOnDrop(tokio::spawn(flusher))
+    });
     let shutdown = interrupted()?;
     let api = args.api()?;
     let bound = bind_server_with_policy(cache, listeners, api, policy, shutdown)?;
@@ -104,6 +117,15 @@ async fn run<M: MetaLog, O: ObjectStore + 'static>(
     );
     bound.serving.await?;
     Ok(())
+}
+
+/// Aborts a task when dropped: the flusher stops with the server.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 /// Which of the operator API's routes that are off unless the policy names them are on.

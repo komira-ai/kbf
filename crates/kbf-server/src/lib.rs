@@ -67,8 +67,9 @@ pub mod stamp;
 mod timeout;
 pub mod token;
 pub mod worker;
+pub mod write_tier;
 
-pub use config::{Args, ConfigError, MetaLogKind, Role, StoreKind};
+pub use config::{Args, ConfigError, MetaLogKind, Role, SERVER, StoreKind};
 pub use farm::Farm;
 pub use health::Readiness;
 pub use identity::{DenyList, DenyListError, Peers};

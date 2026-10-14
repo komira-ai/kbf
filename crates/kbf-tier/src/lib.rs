@@ -29,9 +29,16 @@
 //!   cut to its committed length (or reported lost), and every other block deleted
 //!   (the orphan sweep). The committed state comes in through [`StagedIndex`].
 //!
-//! Not here (rollout stage 4b): the flusher, local reads through the metadata,
-//! eviction of flushed copies, `--write-tier-abandon`, metrics. All disk access goes
-//! through [`kbf_store::Fs`], so the tests crash it with [`kbf_store::FaultFs`].
+//! - **Flushed copies.** Once an object's `ObjectFlushed` committed,
+//!   [`WriteTier::flushed`] renames its block to `<epoch>-<seq>.seg`. Copies are read
+//!   like blocks and evicted, least recently read first, when a reservation needs
+//!   their room: only `.seg` files are ever evicted, so a block whose only copy is
+//!   local never is. [`WriteTier::unflushed`] measures what a disk loss would take.
+//!
+//! The flusher, reads through the metadata, the restart's metadata side and the
+//! metrics are `kbf-front`'s (`Cache::attach_tier`, `Cache::flush_tier`). All disk
+//! access goes through [`kbf_store::Fs`], so the tests crash it with
+//! [`kbf_store::FaultFs`].
 
 mod args;
 mod block;
@@ -40,9 +47,11 @@ mod open;
 mod tier;
 
 pub use crate::args::TierArgs;
-pub use crate::block::{TIER, TierId, block_name, parse_block_name};
+pub use kbf_meta::TierId;
+
+pub use crate::block::{TIER, block_name, parse_block_name, parse_seg_name, seg_name};
 pub use crate::error::TierError;
-pub use crate::open::{Recovery, StagedIndex, StagedObject, TierStart};
+pub use crate::open::{Recovery, StagedIndex, StagedObject, StagedSnapshot, TierStart, clear};
 pub use crate::tier::{
-    NextSeq, Reservation, Synced, Tier, TierOptions, Unsynced, Usage, WriteTier,
+    NextSeq, Reservation, Synced, Tier, TierOptions, Unflushed, Unsynced, Usage, WriteTier,
 };

@@ -310,5 +310,65 @@ fn open_reports_its_own_disk_failures_and_clears_a_stale_tier_tmp() {
         .unwrap()
         .append(b"tail")
         .unwrap();
+    fs.put(
+        &kbf_tier::seg_name(ObjectId::new(kbf_meta::Epoch::new(1), 99)),
+        b"copy",
+    );
     every_failure_of_open_is_reported(&fs, &index);
+}
+
+/// Catches: a clear whose listing, removal or directory sync fails reported as done
+/// (the start would then reuse names an earlier start's files still hold).
+#[test]
+fn every_failure_of_clear_is_reported() {
+    let fs = FaultFs::new();
+    fs.put(TIER, b"1\n");
+    fs.put(
+        &block_name(ObjectId::new(kbf_meta::Epoch::new(1), 1)),
+        b"block",
+    );
+    let ops = {
+        let probe = fs.restart();
+        kbf_tier::clear(&probe).unwrap();
+        probe.ops()
+    };
+    assert_eq!(ops, 4, "list, two removals, the directory sync");
+    for op in 0..ops {
+        let attempt = fs.restart();
+        attempt.fail_at(op, kbf_store::Fault::Error);
+        let result = kbf_tier::clear(&attempt);
+        assert!(
+            matches!(result, Err(TierError::Io { .. })),
+            "op {op}: {result:?}"
+        );
+    }
+}
+
+/// Catches: a clear (a start over an empty metadata log) that leaves a block, a
+/// flushed copy or `TIER` behind (the new start's objects would reuse their names),
+/// deletes a file the tier does not write, or does not sync the deletions.
+#[test]
+fn clear_deletes_every_file_the_tier_writes_and_nothing_else() {
+    let fs = FaultFs::new();
+    let index = Index::default();
+    let (tier, _) = open_tier(&fs, 1, opts(), &index).unwrap();
+    let mut index = index;
+    let object = ack_upload(&tier, &mut index, &bytes(1, 4)).unwrap();
+    drop(tier);
+    fs.put("0000000000000001-0000000000000009.seg", b"copy");
+    fs.put("TIER.tmp", b"7\n");
+    fs.put("notes.txt", b"not ours");
+    let mut cleared = kbf_tier::clear(&fs).unwrap();
+    cleared.sort();
+    let mut want = vec![
+        "0000000000000001-0000000000000009.seg".to_owned(),
+        TIER.to_owned(),
+        "TIER.tmp".to_owned(),
+        block_name(object),
+    ];
+    want.sort();
+    assert_eq!(cleared, want);
+    let cut = fs.crash_reordered(0, 0);
+    assert_eq!(cut.list().unwrap(), ["notes.txt"]);
+    assert_eq!(kbf_tier::clear(&cut).unwrap(), Vec::<String>::new());
 }
