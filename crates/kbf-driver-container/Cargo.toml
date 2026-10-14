@@ -33,6 +33,7 @@ tracing.workspace = true
 
 [dev-dependencies]
 kbf-front.workspace = true
+kbf-objstore.workspace = true
 # The fake podman's actions: kbf-testkit's act steps, run by the test binary itself.
 kbf-testkit.workspace = true
 kbf-transfer.workspace = true

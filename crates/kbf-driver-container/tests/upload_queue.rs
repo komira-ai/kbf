@@ -1,5 +1,5 @@
-//! How many output files the container driver's `collect` holds open at once while
-//! the CAS is slow. Alone in its test binary: it counts this process's descriptors, so
+//! How many descriptors the container driver's `collect` holds open while the CAS is
+//! slow. Alone in its test binary: it counts this process's descriptors, so
 //! no other test may open files beside it.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -69,17 +69,19 @@ fn open_descriptors() -> usize {
     std::fs::read_dir("/dev/fd").expect("list /dev/fd").count()
 }
 
-/// Catches a walk that opens every output file while the stores are slow: a file
-/// being stored holds its descriptor until it is sent, so a tree of thousands of
-/// files would hold thousands open (the lease's `nofile` limit is the daemon's too).
-/// The walk closes each file once hashed, and a missing one is opened again only when
-/// its store starts. The stores wait on a gate; once `UPLOADS_IN_FLIGHT` wait, the
-/// test watches the descriptors for 300 ms (time to run ahead) before opening it. The
-/// slack is `collect`'s own descriptors (the upper directory, a directory being
-/// opened). Mutant seen red: the stores run with no bound (`src/pending.rs`,
-/// `buffer_unordered(usize::MAX)`).
+/// Catches output files held open while the stores are slow: a file being stored
+/// holds its descriptor until it is sent, so a tree of thousands of files would hold
+/// thousands open (the lease's `nofile` limit is the daemon's too). The walk closes
+/// each file once hashed; the missing ones are copied into the spool and closed
+/// before anything is sent, so while the stores wait, no output file is open. The
+/// stores wait on a gate; once `UPLOADS_IN_FLIGHT` wait, the test watches the
+/// descriptors for 300 ms before opening it. The slack is the spool's file and
+/// `collect`'s own descriptors (the upper directory). Mutant seen red: the missing
+/// blobs stored straight from their files on the lease's store, `in_flight` at a
+/// time (the per-file path): 17 held. The bound on the copies into the spool is
+/// `src/pending.rs`'s unit test.
 #[tokio::test]
-async fn the_walk_holds_at_most_one_file_past_the_stores_in_flight() {
+async fn no_output_file_is_open_while_the_stores_are_slow() {
     let upper = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
         .join("kbf-driver-container-upload-queue")
         .join(std::process::id().to_string());
@@ -97,7 +99,15 @@ async fn the_walk_holds_at_most_one_file_past_the_stores_in_flight() {
     let before = open_descriptors();
     let mut result = ActionResult::default();
     let paths = ["out".to_owned()];
-    let walk = collect(&cas, &upper, "", &paths, OutputLimits::DEFAULT, &mut result);
+    let walk = collect(
+        &cas,
+        &upper,
+        std::path::Path::new(env!("CARGO_TARGET_TMPDIR")),
+        "",
+        &paths,
+        OutputLimits::DEFAULT,
+        &mut result,
+    );
     let watch = async {
         // A deadline, so a walk that never starts the stores fails rather than hangs.
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
@@ -120,12 +130,8 @@ async fn the_walk_holds_at_most_one_file_past_the_stores_in_flight() {
     let ((), most) = futures::try_join!(walk, watch).expect("collect");
     let held = most.saturating_sub(before);
     assert!(
-        held >= UPLOADS_IN_FLIGHT,
-        "{held}: the gate held the stores"
-    );
-    assert!(
-        held <= UPLOADS_IN_FLIGHT + 1 + 4,
-        "{held} descriptors held at once, {UPLOADS_IN_FLIGHT} stores in flight"
+        held <= 1 + 2,
+        "{held} descriptors held at once while {UPLOADS_IN_FLIGHT} stores wait"
     );
     let stored = cas
         .blobs

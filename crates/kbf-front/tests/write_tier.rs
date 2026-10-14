@@ -719,8 +719,11 @@ async fn without_a_tier_nothing_is_staged_or_flushed() {
 
 /// Catches: a staged record damaged on the local disk served, or answered without
 /// marking its object (the local copy is the only one: its blobs must answer
-/// `Unavailable` and heal by re-upload); and a disk read error on a staged block taken
-/// for a lost object (marked) instead of an unavailable read.
+/// `Unavailable` and heal by re-upload); a disk read error on a staged block taken
+/// for a lost object (marked) instead of an unavailable read; and the marked object's
+/// open block left taking ranges (the next upload's `PutStaged` would be refused, so
+/// it would fail instead of staging in a new block) or left on the disk counting
+/// against the budget until the next start.
 #[tokio::test]
 async fn a_staged_record_the_disk_damaged_or_failed_to_read_is_never_served() {
     let farm = Farm::new(Capabilities::default());
@@ -745,6 +748,16 @@ async fn a_staged_record_the_disk_damaged_or_failed_to_read_is_never_served() {
         Some(UnreachableReason::Corrupt)
     );
     assert_eq!(farm.log.answer(&blobs[1].digest), BlobAnswer::Unavailable);
+    let name = block_name(at.object);
+    assert_eq!(farm.fs.contents(&name), None, "the marked block is kept");
+    let next = TestBlob::new(9, 4096);
+    cache
+        .store_blobs(vec![next.verified()])
+        .await
+        .expect("stored");
+    let (now_at, staged_on) = farm.log.located(&next.digest);
+    assert_ne!(now_at.object, at.object, "staged into the marked object");
+    assert!(staged_on.is_some(), "staged, not sent direct");
 }
 
 /// Catches: a blob staged on another server's tier read from this server's disk (at

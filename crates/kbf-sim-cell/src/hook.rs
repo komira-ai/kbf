@@ -2,11 +2,8 @@
 //! path, rather than at a time or a filesystem operation.
 //!
 //! A [`CrashPlan`] is generic over the point type so each path names its own points:
-//! the direct write path's are [`StorePoint`]; the local write tier (rollout stage 4 of
-//! docs/design/write-path.md) adds its own enum (after the append, after the sync,
-//! after `PutStaged`, after the flush PUT, after `ObjectFlushed`, before the rename)
-//! and arms it the same way. docs/design/write-tier-scenarios.md lists the points each
-//! scenario needs.
+//! the direct write path's are [`StorePoint`], the local write tier's [`TierPoint`]
+//! (docs/design/write-tier-scenarios.md lists the scenario each serves).
 
 use std::fmt;
 
@@ -35,6 +32,98 @@ pub enum StorePoint {
     InCommit { after: u64 },
     /// `PutBlob` has committed; the client is not yet answered.
     BeforeReply,
+}
+
+/// A point of the local write tier's paths (docs/design/write-tier-scenarios.md): the
+/// staged write (a blob written to the open block, synced, indexed with `PutStaged`,
+/// acknowledged) and the flush (the sealed block PUT whole, `ObjectFlushed`
+/// committed, the block renamed to a flushed copy).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TierPoint {
+    /// The blob's bytes are written to its range; the block is not synced (scenario 1).
+    AfterAppend,
+    /// The range is synced, its block's name too; `PutStaged` is not proposed
+    /// (scenario 2).
+    AfterSync,
+    /// Part-way through the `PutStaged` commit, at its `after`-th filesystem operation
+    /// of the raft directory (scenario 3), as [`StorePoint::InCommit`].
+    InPutStaged { after: u64 },
+    /// `PutStaged` has committed; the client is not yet answered (scenario 4).
+    BeforeReply,
+    /// The client has been answered; the block is not flushed (scenario 5).
+    Acked,
+    /// The store has the flushed object; `ObjectFlushed` is not proposed (scenarios
+    /// 11 and 12).
+    AfterFlushPut,
+    /// Part-way through the `ObjectFlushed` commit, at its `after`-th filesystem
+    /// operation (scenario 11).
+    InFlushCommit { after: u64 },
+    /// `ObjectFlushed` has committed; the block is not renamed to its flushed copy
+    /// (scenario 21: the next start deletes the `.blk`).
+    BeforeRename,
+}
+
+impl TierPoint {
+    /// Every point, with `after` 0 for those part-way through a commit.
+    pub const ALL: [Self; 8] = [
+        Self::AfterAppend,
+        Self::AfterSync,
+        Self::InPutStaged { after: 0 },
+        Self::BeforeReply,
+        Self::Acked,
+        Self::AfterFlushPut,
+        Self::InFlushCommit { after: 0 },
+        Self::BeforeRename,
+    ];
+
+    /// The point its [`fmt::Display`] form names, for a replay line.
+    #[must_use]
+    pub fn parse(text: &str) -> Option<Self> {
+        let fixed = Self::ALL
+            .into_iter()
+            .filter(|p| p.in_commit().is_none())
+            .find(|p| p.to_string() == text);
+        if fixed.is_some() {
+            return fixed;
+        }
+        if let Some(after) = text.strip_prefix("tier-in-put-staged-") {
+            return Some(Self::InPutStaged {
+                after: after.parse().ok()?,
+            });
+        }
+        let after = text.strip_prefix("tier-in-flush-commit-")?.parse().ok()?;
+        Some(Self::InFlushCommit { after })
+    }
+
+    /// The filesystem operation of the commit a crash part-way through it lands at;
+    /// `None` for every other point.
+    #[must_use]
+    pub fn in_commit(self) -> Option<u64> {
+        match self {
+            Self::InPutStaged { after } | Self::InFlushCommit { after } => Some(after),
+            Self::AfterAppend
+            | Self::AfterSync
+            | Self::BeforeReply
+            | Self::Acked
+            | Self::AfterFlushPut
+            | Self::BeforeRename => None,
+        }
+    }
+}
+
+impl fmt::Display for TierPoint {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::AfterAppend => f.write_str("tier-after-append"),
+            Self::AfterSync => f.write_str("tier-after-sync"),
+            Self::InPutStaged { after } => write!(f, "tier-in-put-staged-{after}"),
+            Self::BeforeReply => f.write_str("tier-before-reply"),
+            Self::Acked => f.write_str("tier-acked"),
+            Self::AfterFlushPut => f.write_str("tier-after-flush-put"),
+            Self::InFlushCommit { after } => write!(f, "tier-in-flush-commit-{after}"),
+            Self::BeforeRename => f.write_str("tier-before-rename"),
+        }
+    }
 }
 
 impl Down {
@@ -205,6 +294,33 @@ mod tests {
         }
         for bad in ["", "cut-1", "cut-x-1", "cut-1-x", "kil"] {
             assert_eq!(Down::parse(bad), None, "{bad}");
+        }
+    }
+
+    /// Catches a tier point a replay line names but cannot be read back (the replay
+    /// would run another crash), two points with one name, and an in-commit point
+    /// whose operation is lost.
+    #[test]
+    fn tier_points_read_back_from_their_names() {
+        let mut names = std::collections::BTreeSet::new();
+        let deep = [
+            TierPoint::InPutStaged { after: 7 },
+            TierPoint::InFlushCommit { after: 9 },
+        ];
+        for point in TierPoint::ALL.into_iter().chain(deep) {
+            assert_eq!(TierPoint::parse(&point.to_string()), Some(point));
+            assert!(names.insert(point.to_string()), "{point} named twice");
+        }
+        assert_eq!(TierPoint::InFlushCommit { after: 9 }.in_commit(), Some(9));
+        assert_eq!(TierPoint::InPutStaged { after: 7 }.in_commit(), Some(7));
+        assert_eq!(TierPoint::Acked.in_commit(), None);
+        for bad in [
+            "",
+            "tier-in-put-staged-x",
+            "tier-in-flush-commit-",
+            "put-sent",
+        ] {
+            assert_eq!(TierPoint::parse(bad), None, "{bad}");
         }
     }
 }

@@ -37,9 +37,11 @@ use kbf_types::{Digest, DigestFunction, LeaseId, OperationId, Outcome, Resources
 pub use cell::{Kind, RunReport, Scenario, run};
 pub use client::{FakeClient, Job};
 pub use daemon::FakeDaemon;
-pub use hook::{CrashPlan, Down, StorePoint};
-pub use server::{Cut, PUT_TIMEOUT, Seen, Server, ServerFault, ServerPlan};
-pub use store::{BlobHomes, Met, ObjectStore, StoreFault, StorePlan, StoreStats};
+pub use hook::{CrashPlan, Down, StorePoint, TierPoint};
+pub use server::{
+    Cut, PUT_TIMEOUT, Seen, Server, ServerFault, ServerPlan, TierCut, TierPlan, TierSeen,
+};
+pub use store::{BlobHomes, Body, Held, Met, ObjectStore, StoreFault, StorePlan, StoreStats};
 pub use sweep::{Failure, Sweep, sweep};
 
 /// What the nodes of a cell send each other. `stream` stands for a daemon's gRPC
@@ -92,6 +94,32 @@ pub enum Msg {
     PutFailed {
         object: ObjectId,
         digest: Digest,
+    },
+    /// Server to object store: write the flushed segment `object` of the local write
+    /// tier.
+    Flush {
+        object: ObjectId,
+        body: Body,
+    },
+    /// Object store to server: the segment `object` is written.
+    FlushDone {
+        object: ObjectId,
+    },
+    /// Object store to server: the PUT of the segment `object` failed.
+    FlushFailed {
+        object: ObjectId,
+    },
+    /// Server to object store: read `digest` from `object` (a reader that did not find
+    /// it on the local tier); `tag` names the read.
+    Get {
+        object: ObjectId,
+        digest: Digest,
+        tag: u64,
+    },
+    /// Object store to server: whether `object` held the blob the read `tag` asked for.
+    Got {
+        tag: u64,
+        held: bool,
     },
     /// Daemon to server: the first message of a stream.
     Hello {
@@ -154,6 +182,17 @@ pub fn input_of(action: &Digest) -> Digest {
     let mut input = *action;
     input.hash[0] = 0x1B;
     input
+}
+
+/// The bytes of the blob `digest` names, as the cell's clients upload them: its size,
+/// each byte drawn from the digest. (The cell's digests are names, not hashes of
+/// these bytes; a reader checks bytes against this.)
+#[must_use]
+pub fn content(digest: &Digest) -> Vec<u8> {
+    let len = usize::try_from(digest.size_bytes).unwrap_or(0);
+    (0..len)
+        .map(|i| digest.hash[i % 32] ^ u8::try_from(i % 251).unwrap_or(0))
+        .collect()
 }
 
 fn numbered(tag: u8, n: u64) -> Digest {
