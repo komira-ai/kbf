@@ -21,17 +21,23 @@ pub(crate) struct BuiltSegment {
 }
 
 impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
-    /// Stores every segment of an upload (each its own object), reads each footer
-    /// back, and then commits **one** [`PutBlobs`](kbf_meta::Command::PutBlobs)
-    /// listing every record of every segment. Returns the digests committed, in
-    /// segment then index order.
+    /// Stores every segment of an upload and commits it. Returns the digests
+    /// committed, in segment then index order.
     ///
-    /// Each segment is stored as a grouped segment is (`Writer::store_segment`): under
-    /// a `--write-puts-in-flight` slot, its PUT retried under a new key, its footer read
-    /// back; the commit is timed as a segment commit.
+    /// With a write tier attached, each segment is first offered to `Writer::stage`
+    /// as a block of its own: records written and `fdatasync`ed on the tier, then one
+    /// `PutStaged` for its blobs. That is the whole of its store: the commit is
+    /// answered without an object-store PUT, the blobs are read from the tier, and
+    /// the flusher PUTs the object later. A segment the tier does not take (no tier,
+    /// at its budget, a disk error before the commit) is stored as a grouped segment
+    /// is (`Writer::store_segment`): under a `--write-puts-in-flight` slot, its PUT
+    /// retried under a new key, its footer read back. The PUT segments of the upload
+    /// are then indexed by **one** [`PutBlobs`](kbf_meta::Command::PutBlobs).
     ///
-    /// Nothing is indexed unless every PUT and read-back succeeded: a failure leaves
-    /// the objects written so far as orphans, unreferenced.
+    /// Nothing PUT is indexed unless every PUT and read-back succeeded: a failure
+    /// leaves the objects written so far as orphans, unreferenced. The segments
+    /// already staged stay staged and indexed (a retry of the upload finds them
+    /// present).
     ///
     /// # Errors
     /// The store or the metadata log failed; a footer read back without a record the
@@ -40,19 +46,28 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         &self,
         segments: Vec<BuiltSegment>,
     ) -> Result<Vec<Digest>, CacheError> {
+        let digests = segments
+            .iter()
+            .flat_map(|s| s.entries.iter().map(|e| e.digest))
+            .collect();
         let placed = try_join_all(segments.into_iter().map(|s| self.put_built(s))).await?;
         let placed: Vec<(Digest, Location)> = placed.into_iter().flatten().collect();
-        let digests = placed.iter().map(|(d, _)| *d).collect();
-        self.writer.commit_segment(placed).await?;
+        if !placed.is_empty() {
+            self.writer.commit_segment(placed).await?;
+        }
         Ok(digests)
     }
 
-    /// Writes one built segment as a new object and returns where each of its records
-    /// is, as the footer read back from the store says.
+    /// Stages one built segment on the write tier if one takes it (nothing is left to
+    /// index: `PutStaged` did), else writes it as a new object and returns where each
+    /// of its records is, as the footer read back from the store says.
     async fn put_built(
         &self,
         segment: BuiltSegment,
     ) -> Result<Vec<(Digest, Location)>, CacheError> {
+        if self.writer.stage(segment.body.clone(), true).await? {
+            return Ok(Vec::new());
+        }
         let (object, key, footer) = self
             .writer
             .store_segment(&self.group, segment.body, segment.entries.len())
@@ -109,7 +124,8 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
     }
 
     /// `len` bytes of object `object` from `offset`, unchecked: the caller checks each
-    /// blob it cuts from them. `None` when the store does not hold the whole range (no
+    /// blob it cuts from them. Read from the write tier when it holds the object (a
+    /// staged block, or its flushed copy), else from the store. `None` when the store does not hold the whole range (no
     /// such object, or one too short), which the service answers NOT_FOUND.
     ///
     /// # Errors
@@ -120,6 +136,9 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         offset: u64,
         len: u64,
     ) -> Result<Option<Bytes>, CacheError> {
+        if let Some(bytes) = self.read_staged_range(object, offset, len).await {
+            return Ok(Some(bytes));
+        }
         let key = self.object_key(object)?;
         let Some(range) = ByteRange::new(offset, len) else {
             return Ok(None);

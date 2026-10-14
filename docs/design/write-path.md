@@ -511,8 +511,8 @@ Where it differs from the sections above, and why:
   `PutStaged`, before any PUT slot is taken; a segment the tier does not take is PUT as
   before. A blob written as a segment of its own gets a block of its own
   (`reserve_upload`, sealed by its `PutStaged`), buffered whole as on the direct path;
-  streaming it into its block (section 6.2) is not built. Segment uploads (stage 2)
-  are not merged; a `Begin` will reserve through the same `reserve_upload`. A segment
+  streaming it into its block (section 6.2) is not built. A `Segments` upload reaches
+  the tier at its commit (section 6.10). A segment
   with no blob (the open one a blob too large for it leaves behind) is neither staged
   nor PUT.
 - **Any tier error before the commit goes direct**, not only the budget: `ENOSPC` or an
@@ -582,6 +582,31 @@ Where it differs from the sections above, and why:
   staged, sealed and flushed objects across a restart), the tier over each log in
   `kbf-server/tests/binary.rs`, and
   `kbf-front/tests/write_tier_flush.rs::a_put_staged_that_applied_but_lost_its_answer_is_read_and_flushed`.
+
+### 6.10 As built (`Segments` uploads on the tier)
+
+- **At the commit, not at `Begin`.** `Begin` does not reserve and `PutRange` does not
+  write to the tier: ranges are held in memory until `Commit`, as on the direct path
+  (section 4.2's "with the tier" streaming is not built), and `--segment-upload-max-bytes`
+  stays bound by `--write-bytes-in-flight`. After the records are checked and each
+  segment's footer is built, `Cache::store_upload` offers every segment to
+  `Writer::stage` as a block of its own (`reserve_upload`, records written, `fdatasync`,
+  one `PutStaged` with `seal`). `Commit` is answered when every segment is staged: no
+  PUT, no footer read-back and no `PutBlobs`.
+- **Fallback per segment.** A segment the tier does not take (no tier, at the budget, a
+  disk error before the commit) is PUT as before (a `--write-puts-in-flight` slot,
+  retried under a new key, footer read back); the PUT segments of one upload are then
+  indexed by one `PutBlobs`. An upload may mix the two. A failed commit indexes nothing
+  PUT; segments already staged stay staged and indexed.
+- **Reads.** `FindMissing`, `BatchRead` and `Locate` answer from the index, and a read
+  of a staged blob is served from the block (section 6.3). `ReadRange` tries the tier
+  first (a staged block's committed bytes, or the flushed copy until evicted) and
+  reads the store only when the tier does not hold the whole range, so a daemon's
+  download of outputs it just uploaded does not go to the store.
+- **Flush.** The flusher treats an uploaded block as any sealed block (section 6.3):
+  footer built from the committed list, PUT, read back, `ObjectFlushed`.
+- Tests: `kbf-front/tests/segments_tier.rs` (commit with every PUT held; flush after the
+  store recovers; the budget fallback; restart before the flush).
 
 ## 7. Expected effect on the 15,189-file upload
 
