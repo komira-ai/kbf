@@ -21,6 +21,7 @@ use kbf_types::{
 };
 use proto::farm_input::Input as P;
 
+use crate::Format;
 use crate::meta::{action_record, digest, from_action_record, from_digest, required_digest};
 use crate::{DecodeError, EncodeError};
 
@@ -152,6 +153,26 @@ pub struct Checkpoint {
 pub struct MachineVersion(NonZeroU32);
 
 impl MachineVersion {
+    /// Version 1: the metadata log's first apply behavior, whose entries are
+    /// [`Format::V1`].
+    pub const V1: Self = Self(NonZeroU32::MIN);
+
+    /// Version 2: version 1 plus the write tier's metadata commands, whose entries are
+    /// [`Format::V2`] (docs/design/write-path.md, section 6.5). A log enters it by a
+    /// committed `MachineVersion` entry naming it; every later entry is format 2.
+    pub const V2: Self = Self(NonZeroU32::MIN.saturating_add(1));
+
+    /// The entry format a log at this version writes and reads; `None` for a version
+    /// this binary does not know (a later binary's).
+    #[must_use]
+    pub const fn format(self) -> Option<Format> {
+        match self.0.get() {
+            1 => Some(Format::V1),
+            2 => Some(Format::V2),
+            _ => None,
+        }
+    }
+
     /// Version `n`.
     #[must_use]
     pub const fn new(n: NonZeroU32) -> Self {

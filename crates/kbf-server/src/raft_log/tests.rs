@@ -6,6 +6,10 @@ use kbf_raft::{LogId, Machine, Message, MessageKind, ServerId, Snapshot, Term, T
 use super::NoTransport;
 use super::machine::MetaMachine;
 
+fn machine() -> MetaMachine {
+    MetaMachine::new(Retention::default(), super::RUNS).expect("a version this binary runs")
+}
+
 /// Catches: a transport that does something with a message. A single voter's core
 /// never sends, so nothing reaches it; this is what it would do.
 #[test]
@@ -22,7 +26,7 @@ fn the_single_voter_transport_drops_what_it_is_given() {
 #[test]
 #[should_panic(expected = "takes no snapshot")]
 fn the_machine_refuses_to_take_a_snapshot() {
-    let _ = MetaMachine::new(Retention::default()).snapshot();
+    let _ = machine().snapshot();
 }
 
 /// Catches: a machine that restores from a snapshot it cannot read, starting empty.
@@ -32,6 +36,6 @@ fn the_machine_refuses_to_restore_a_snapshot() {
         base: LogId::default(),
         state: Vec::new(),
     };
-    let refused = MetaMachine::new(Retention::default()).restore(&snapshot);
+    let refused = machine().restore(&snapshot);
     assert!(refused.is_err());
 }

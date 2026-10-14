@@ -284,6 +284,13 @@ pub trait WriteTier: Send + Sync {
     /// next start deletes.
     fn flushed(&self, object: ObjectId) -> Result<(), TierError>;
 
+    /// Takes no more ranges into `object`'s block if it is the open grouped block: it
+    /// starts sealing, as a full one does, and the next range opens a new block. For
+    /// an object marked unreachable while its block was open (a read found a damaged
+    /// record), whose later `PutStaged` would be refused. Any other block is left as
+    /// it is.
+    fn close(&self, object: ObjectId);
+
     /// Forgets a sealed block whose object was marked unreachable (a record failed its
     /// digest) and deletes its file.
     ///
@@ -893,6 +900,13 @@ where
             .fs
             .sync_dir()
             .map_err(|e| TierError::io("sync_dir", &to, e))
+    }
+
+    fn close(&self, object: ObjectId) {
+        let mut state = self.lock();
+        if state.open == Some(object) {
+            self.shared.begin_seal(&mut state, object);
+        }
     }
 
     fn discard(&self, object: ObjectId) -> Result<(), TierError> {

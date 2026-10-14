@@ -250,7 +250,11 @@ PR 4 (format 2) adds the raise. When the binary writes format 2 and the committe
 format is 1, the open commits one `MachineVersion` entry after the `Bootstrap` check,
 before it serves. Applying it sets `format = 2` for every later entry. Which value the
 entry carries (the machine version alone, with the format implied, or a format field
-beside it) is `ha.md` 4.7's to settle; PR 4 follows it. A binary that reads only format
+beside it) is `ha.md` 4.7's to settle; PR 4 follows it. As built (write-path.md
+section 6.8): the entry carries the machine version alone, version 2 implies format 2,
+and the raise is committed when the tier is attached
+(`RaftMetaLog::raise_machine_version`), not by every open, so a log that never ran the
+tier stays readable by an older binary. A binary that reads only format
 1 already refuses that log: it decodes the `MachineVersion` entry, which its machine
 does not apply, so the machine stops and the open is refused (section 1). It also
 refuses a format-2 snapshot header (`UnknownFormat(2)`).

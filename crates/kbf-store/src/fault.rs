@@ -31,6 +31,12 @@ pub enum Fault {
     /// The process dies at the operation: it and every later one fail and change
     /// nothing.
     Crash,
+    /// The operation fails as a full disk fails it (`ENOSPC`,
+    /// [`io::ErrorKind::StorageFull`]) and changes nothing; later ones run. Only an
+    /// operation that takes space can fail so: a create, a write, a sync, a rename or
+    /// a directory sync. A read, a listing, an open or a removal planned to meet it
+    /// runs as usual (the fault is spent).
+    NoSpace,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -97,25 +103,44 @@ struct State {
     pending: Vec<NameChange>,
     ops: u64,
     faults: BTreeMap<u64, Fault>,
+    /// Operations a planned fault failed.
+    met: u64,
     crashed: bool,
 }
 
 impl State {
-    /// Counts one operation and fails it if a fault is planned there.
+    /// Counts one operation that takes space and fails it if a fault is planned there.
     fn begin(&mut self) -> io::Result<()> {
+        self.begin_op(true)
+    }
+
+    /// Counts one operation that takes no space (a full disk does not fail it) and
+    /// fails it if another fault is planned there.
+    fn begin_read(&mut self) -> io::Result<()> {
+        self.begin_op(false)
+    }
+
+    fn begin_op(&mut self, takes_space: bool) -> io::Result<()> {
         let op = self.ops;
         self.ops += 1;
         if self.crashed {
             return Err(io::Error::other("crashed"));
         }
-        match self.faults.get(&op) {
-            None => Ok(()),
-            Some(Fault::Error) => Err(io::Error::other(format!("injected error at op {op}"))),
+        let failed = match self.faults.get(&op) {
+            None => return Ok(()),
+            Some(Fault::Error) => io::Error::other(format!("injected error at op {op}")),
+            Some(Fault::NoSpace) if !takes_space => return Ok(()),
+            Some(Fault::NoSpace) => io::Error::new(
+                io::ErrorKind::StorageFull,
+                format!("no space left at op {op}"),
+            ),
             Some(Fault::Crash) => {
                 self.crashed = true;
-                Err(io::Error::other(format!("crashed at op {op}")))
+                io::Error::other(format!("crashed at op {op}"))
             }
-        }
+        };
+        self.met += 1;
+        Err(failed)
     }
 
     fn inode_of(&self, name: &str) -> io::Result<u64> {
@@ -155,6 +180,14 @@ impl FaultFs {
     #[must_use]
     pub fn ops(&self) -> u64 {
         self.lock().ops
+    }
+
+    /// How many operations a planned fault has failed so far: a caller that saw an
+    /// error can tell an injected one from its own bug. The operations a crash refuses
+    /// after the one it was planned at are not counted.
+    #[must_use]
+    pub fn faults_met(&self) -> u64 {
+        self.lock().met
     }
 
     /// The most bytes any file that can survive a crash holds past its durable ones:
@@ -317,27 +350,27 @@ impl Fs for FaultFs {
 
     fn list(&self) -> io::Result<Vec<String>> {
         let mut s = self.lock();
-        s.begin()?;
+        s.begin_read()?;
         Ok(s.names.keys().cloned().collect())
     }
 
     fn read(&self, name: &str) -> io::Result<Vec<u8>> {
         let mut s = self.lock();
-        s.begin()?;
+        s.begin_read()?;
         let i = s.inode_of(name)?;
         Ok(s.inodes[&i].data.clone())
     }
 
     fn file_len(&self, name: &str) -> io::Result<u64> {
         let mut s = self.lock();
-        s.begin()?;
+        s.begin_read()?;
         let i = s.inode_of(name)?;
         Ok(s.inodes[&i].data.len() as u64)
     }
 
     fn read_at(&self, name: &str, offset: u64, len: usize) -> io::Result<Vec<u8>> {
         let mut s = self.lock();
-        s.begin()?;
+        s.begin_read()?;
         let data = &s.inodes[&s.inode_of(name)?].data;
         let start = usize::try_from(offset).unwrap_or(usize::MAX);
         data.get(start..start.saturating_add(len))
@@ -355,7 +388,7 @@ impl Fs for FaultFs {
 
     fn open_append(&self, name: &str) -> io::Result<FaultFile> {
         let mut s = self.lock();
-        s.begin()?;
+        s.begin_read()?;
         let inode = s.inode_of(name)?;
         Ok(FaultFile {
             state: Arc::clone(&self.state),
@@ -380,7 +413,7 @@ impl Fs for FaultFs {
 
     fn remove(&self, name: &str) -> io::Result<()> {
         let mut s = self.lock();
-        s.begin()?;
+        s.begin_read()?;
         s.inode_of(name)?;
         let change = NameChange::Unlink(name.to_owned());
         change.apply(&mut s.names);
@@ -665,5 +698,43 @@ mod tests {
         );
         assert_eq!(fs.crash(0).contents("p").unwrap(), [b'a', !b'b', b'c']);
         assert_eq!(fs.list().unwrap(), ["p"]);
+    }
+
+    /// Catches: a full disk that fails some other way than `ENOSPC` (a caller that
+    /// tells the two apart would never see it), changes what the failed write held,
+    /// stops later operations as a crash does, or fails a read.
+    #[test]
+    fn a_full_disk_fails_one_operation_with_enospc() {
+        let fs = FaultFs::new();
+        let mut file = fs.create("a").expect("create");
+        fs.fail_at(fs.ops(), Fault::NoSpace);
+        let full = file.append(b"xyz").expect_err("full");
+        assert_eq!(full.kind(), io::ErrorKind::StorageFull);
+        assert_eq!(fs.faults_met(), 1);
+        assert_eq!(fs.contents("a"), Some(Vec::new()));
+        file.append(b"ok").expect("the next write runs");
+        assert_eq!(fs.contents("a"), Some(b"ok".to_vec()));
+        fs.fail_at(fs.ops(), Fault::NoSpace);
+        assert_eq!(fs.read("a").expect("a read takes no space"), b"ok");
+        file.append(b"!").expect("the fault was spent on the read");
+        assert_eq!(fs.faults_met(), 1, "a spent fault failed nothing");
+    }
+
+    /// Catches a count of met faults that counts operations no fault failed (a
+    /// caller would excuse its own error as an injected one), misses an `Error` or a
+    /// `Crash`, or counts every operation a crash refuses after it.
+    #[test]
+    fn faults_met_counts_the_operations_a_planned_fault_failed() {
+        let fs = FaultFs::new();
+        fs.put("a", b"x");
+        let _ = fs.read("a").expect("no fault");
+        assert_eq!(fs.faults_met(), 0);
+        fs.fail_at(fs.ops(), Fault::Error);
+        fs.read("a").expect_err("an injected error");
+        assert_eq!(fs.faults_met(), 1);
+        fs.fail_at(fs.ops(), Fault::Crash);
+        fs.read("a").expect_err("the crash");
+        fs.read("a").expect_err("after the crash");
+        assert_eq!(fs.faults_met(), 2);
     }
 }

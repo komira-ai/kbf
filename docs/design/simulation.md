@@ -385,7 +385,12 @@ server that stopped or died starts again 3 s later over what its disk kept.
 **StoreOutageHours** (the same, 60 to 90 min), **StoreSlow**, **StoreErrors**,
 **StoreLostAck**, and **StoreCrash** (the server killed or cut off the n-th time it
 reaches a point of the write path, while the store is slow). Their runs go on 150 s
-past the store's last fault, plus one client retry per counted failure.
+past the store's last fault, plus one client retry per counted failure. The local
+write tier's kinds ([write-tier-scenarios.md](write-tier-scenarios.md#4-the-tier-in-the-cell-stage-5-as-built)),
+whose server stages uploads on `kbf-tier` over a second fault-injecting disk and
+flushes them: **TierCalm**, **TierCrash** (a crash at a point of the tier's write or
+flush path), **TierStoreOutage**, **TierStoreOutageHours**, **TierDiskFull**,
+**TierBadBlock** and **TierEviction**.
 
 The properties, checked after every step (7 at the end):
 
@@ -398,13 +403,19 @@ The properties, checked after every step (7 at the end):
 4. Exactly one result: no result accepted twice, every reported result accepted by
    the end, an action-cache entry exactly for each action with an accepted result.
    Enforced in runs without a restart or a partition only.
-5. No false present: every blob answered present is in the object store then.
+5. No false present: every blob answered present is in the object store then (with
+   the tier, or in its staged block).
 6. Monotone time: farm time never goes back along the durable log or across a restart.
 7. Liveness: every client action is answered by the end.
 8. No false ack: every acknowledged upload is held by the object its PUT wrote, and
    present in the index at every later step the server is up.
 9. Nothing half-indexed: every blob the index answers present is held by the object
    its location names.
+10. Ids never move: a blob's location changes only after its object is marked
+    unreachable, and no store object is replaced by other bytes.
+11. to 13., in runs with the tier: its bytes stay within its budget; at each start its
+    directory holds only what the committed state names; at the end nothing is left
+    staged.
 
 Properties 3 and 4 do not hold after a restart until the scheduler's state is in the
 log (ha.md section 16, PRs 11 and 12); a daemon cut off past T may have a result

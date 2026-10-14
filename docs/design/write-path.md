@@ -456,8 +456,11 @@ older binary already refuses them: an unset command decodes as
 `DecodeError::UnknownCommand` (`kbf-log/src/meta.rs`), the Raft machine stops on it
 (`kbf-server/src/raft_log/machine.rs`), and opening the log returns
 `RaftLogError::Decode` (`decoded`, `raft_log/mod.rs`). This binary refuses them under
-format 1 the same way, on encode and decode; the metadata log still reads and writes
-format 1 only, so PR 4 must raise the log's format before its first `AddTier`. Tests in
+format 1 the same way, on encode and decode. A Raft log enters format 2 by one
+committed `MachineVersion` entry naming machine version 2 (`kbf_log::MachineVersion::V2`,
+whose format is `Format::V2`), which `RaftMetaLog::raise_machine_version` commits
+(rollout stage 5, section 6.8); every later entry is encoded and decoded as format 2,
+and a binary that runs only version 1 refuses the log at that entry. Tests in
 `kbf-log/tests/tier_codec.rs` and `kbf-server/tests/raft_log.rs` pin both. The snapshot
 encoding ([metadata-snapshots.md](metadata-snapshots.md)), not built yet, gains the
 staged table, the tier registry and the record of objects that left.
@@ -493,9 +496,11 @@ of section 9 except the log-format row, which stage 3 pins), `kbf-tier/tests/flu
 
 Where it differs from the sections above, and why:
 
-- **`--meta-log=raft` is refused with `--write-tier-dir`.** The Raft log writes format 1,
-  and the format raise is not built ([metadata-snapshots.md](metadata-snapshots.md),
-  section 4, leaves its value to the HA design). Under `--meta-log=memory` a restart
+- **`--meta-log=raft` is refused with `--write-tier-dir`.** When stage 4b was built the
+  Raft log wrote format 1 and the format raise was not built
+  ([metadata-snapshots.md](metadata-snapshots.md), section 4, leaves its value to the HA
+  design). Stage 5 (section 6.8) builds the raise and runs the tier over the Raft log in
+  `kbf-sim-cell`; the server still refuses the pair until the known gap below is closed. Under `--meta-log=memory` a restart
   starts with an empty index whose writer epochs start from 1 again, so the server
   deletes every file an earlier start left in the directory (`kbf_tier::clear`) before
   the open: none of it is indexed, and an old block's name could be one of the new
@@ -528,6 +533,33 @@ Where it differs from the sections above, and why:
   Only a log that can apply a command and lose the answer (the Raft log) can do it, and
   that log is refused with the tier today; wiring the raise must also seed the length
   from the committed state.
+
+### 6.8 As built (rollout stage 5: the tier in the cell)
+
+`kbf-sim-cell` runs the tier over the Raft log, with the scenarios of
+[write-tier-scenarios.md](write-tier-scenarios.md) that stage 4b makes testable
+(section 4 of that file lists each test and the planted defect it caught).
+
+- **The format raise.** A log is raised by one `MachineVersion` entry: machine version
+  2 implies format 2 (the entry carries the version alone; metadata-snapshots.md
+  section 4 left the choice open). `RaftMetaLog::raise_machine_version(V2)` commits
+  it if the log is below 2 and commits nothing otherwise; the metadata machine replays
+  it on every start, so the format comes from the log, never from the process. A new
+  log stays at version 1 until something raises it: a server that never attaches a
+  tier writes a log an older binary still reads. `RaftMetaLog::open_running(.., runs)`
+  opens as a binary that runs versions up to `runs` would; the server runs
+  `raft_log::RUNS` (version 2). A version past `runs`, committed or asked for, is
+  refused.
+- **The cell's server attaches the tier at each start** as `Cache::attach_tier` does,
+  after the raise, and stages, flushes and reads as `cache/tier.rs` and
+  `cache/flush.rs` do, over `kbf-tier`'s `Tier` on a second `FaultFs` that a crash
+  takes down with the raft disk. The cell drives `kbf-tier`, `kbf-meta` and
+  `RaftMetaLog` themselves; the order of steps in `kbf-front`'s cache (sync before
+  `PutStaged`, `ObjectFlushed` before the rename) is the cell's copy of it, because the
+  cell polls each future once and `kbf-front`'s tier calls run on the blocking pool.
+- **`kbf-server` still refuses `--meta-log=raft` with `--write-tier-dir`**: the known
+  gap of section 6.7 (a `PutStaged` applied whose answer was lost) needs the tier's
+  committed lengths seeded from the committed state before the pilot runs the pair.
 
 ## 7. Expected effect on the 15,189-file upload
 

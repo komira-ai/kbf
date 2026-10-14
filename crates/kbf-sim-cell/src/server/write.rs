@@ -15,12 +15,18 @@ impl Server {
     /// The direct write path: `Upload`, then the store's answer. Any other message is
     /// handed back.
     pub(super) fn write_path(&mut self, now: FarmTime, from: &NodeId, msg: Msg) -> Option<Msg> {
-        let up = self.up.as_mut()?;
+        self.up.as_ref()?;
         match msg {
             Msg::Upload { digest } => {
                 self.seen.uploaded.insert(digest);
-                let object = ObjectId::new(up.writer, up.next_object);
-                up.next_object += 1;
+                if self.stage(now, from, digest) {
+                    return None;
+                }
+                let up = self.up.as_mut()?;
+                let seq = up
+                    .next_object
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let object = ObjectId::new(up.writer, seq);
                 up.uploads.insert(object, (from.clone(), digest));
                 let tag = T_PUT + self.puts_sent;
                 self.puts_sent += 1;
@@ -34,6 +40,7 @@ impl Server {
                 self.reach(now, StorePoint::PutSent);
             }
             Msg::PutFailed { object, digest } => {
+                let up = self.up.as_mut()?;
                 if let Some((client, _)) = up.uploads.remove(&object) {
                     self.seen.put_failed.insert(object);
                     let msg = Msg::UploadFailed { digest };
@@ -41,7 +48,7 @@ impl Server {
                 }
             }
             Msg::PutDone { object, digest } => {
-                let (client, _) = up.uploads.remove(&object)?;
+                let (client, _) = self.up.as_mut()?.uploads.remove(&object)?;
                 if self.reach(now, StorePoint::BeforeCommit) {
                     return None;
                 }
@@ -85,7 +92,10 @@ impl Server {
     /// A PUT's deadline has passed: if the store has not answered it, the upload is
     /// answered `UNAVAILABLE` and a later answer is ignored. (A deadline set by an
     /// earlier start finds nothing.)
-    pub(super) fn put_deadline(&mut self, tag: u64) {
+    pub(super) fn put_deadline(&mut self, now: FarmTime, tag: u64) {
+        if self.flush_deadline(now, tag) {
+            return;
+        }
         let Some(up) = self.up.as_mut() else { return };
         let Some(object) = up.deadlines.remove(&tag) else {
             return;
@@ -193,6 +203,7 @@ mod tests {
         let plan = ServerPlan {
             faults: Vec::new(),
             down_for: Duration::from_secs(3),
+            tier: None,
         };
         let mut s = Server::new(plan, NodeId::from("store"));
         s.apply(input(0, Event::Start));
