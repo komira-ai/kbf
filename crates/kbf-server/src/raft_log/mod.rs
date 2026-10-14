@@ -304,12 +304,8 @@ where
         }
         let entry = kbf_log::encode(machine.format(), &LogCommand::MachineVersion(to))
             .map_err(unavailable)?;
-        host.propose(entry).map_err(unavailable)?;
-        if host.machine().version() == to {
-            Ok(())
-        } else {
-            Err(MetaLogError::Unavailable(NOT_APPLIED.to_owned()))
-        }
+        // A single voter applies its own proposal before `propose` returns.
+        host.propose(entry).map(|_| ()).map_err(unavailable)
     }
 
     /// Commits `Tick(now)` and returns the committed farm time after it.

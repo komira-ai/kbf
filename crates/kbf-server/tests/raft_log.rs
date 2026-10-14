@@ -533,6 +533,16 @@ async fn raising_the_machine_version_to_2_lets_tier_commands_commit_and_lasts() 
     let log = open(&fs.restart(), 3).await;
     assert_eq!(log.machine_version(), MachineVersion::V2);
     assert_eq!(log.commit(add_tier()).await, Ok(Applied::Tier(Ok(()))));
+    // A raise the disk refuses is refused, and raises nothing.
+    let fs = FaultFs::new();
+    let log = open(&fs, 5).await;
+    fs.fail_at(fs.ops(), Fault::Error);
+    let refused = log.raise_machine_version(MachineVersion::V2);
+    assert!(
+        matches!(refused, Err(MetaLogError::Unavailable(_))),
+        "{refused:?}"
+    );
+    assert_eq!(log.machine_version(), MachineVersion::V1);
 }
 
 /// Catches (docs/design/write-tier-scenarios.md, scenario 30): a binary that runs only
