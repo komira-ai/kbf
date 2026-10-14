@@ -7,9 +7,9 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
-# `kbf-cell`, the M1 integration harness's helper binary: test certificates, the
-# test-only daemon (the daemon library with its local runtime) and the build-summary
-# check. `m1/run.sh` drives it; see the library docs.
+# `kbf-cell`, the M1 integration harness: the M1 test itself (`kbf-cell m1`), test
+# certificates, the test-only daemon (the daemon library with its local runtime) and
+# the build-summary check; see the library docs.
 [[bin]]
 name = "kbf-cell"
 path = "src/bin/kbf-cell.rs"
@@ -25,9 +25,15 @@ path = "src/bin/kbf-m2-act.rs"
 clap.workspace = true
 kbf-deploy.workspace = true
 kbf-daemon.workspace = true
+kbf-objstore.workspace = true
 kbf-testkit.workspace = true
 kbf-transfer.workspace = true
 rcgen.workspace = true
+# `kbf-cell m1`'s calls to the operator API.
+reqwest.workspace = true
+# SIGINT for the processes `kbf-cell m1` started.
+rustix = { workspace = true, features = ["process"] }
+serde_json.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal"] }
 tonic.workspace = true
@@ -41,7 +47,6 @@ kbf-server.workspace = true
 proc-macro2.workspace = true
 prost.workspace = true
 saphyr-parser.workspace = true
-serde_json.workspace = true
 sha2.workspace = true
 xtask.workspace = true
 syn.workspace = true

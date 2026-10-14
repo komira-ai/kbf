@@ -42,35 +42,81 @@ pub(crate) fn monotone(before: FarmTime, after: FarmTime) -> Result<(), Broken> 
 
 /// The replica of `entries` through index `applied`: its metadata state and its first
 /// `Bootstrap`'s log id.
+#[cfg(test)]
 pub(crate) fn replay(
     entries: &[Entry],
     applied: u64,
 ) -> Result<(MetaState, Option<FarmLogId>), Broken> {
-    let mut replica = MetaState::new(Retention::default());
-    let mut log_id = None;
-    let mut last = 0;
-    for entry in entries.iter().take_while(|e| e.id.index.0 <= applied) {
-        last = entry.id.index.0;
-        let Payload::Command(bytes) = &entry.payload else {
-            continue;
-        };
-        match kbf_log::decode(Format::V1, bytes) {
-            Ok(LogCommand::Meta(command)) => {
-                let before = replica.now();
-                replica.execute(last, command);
-                monotone(before, replica.now())?;
-            }
-            Ok(LogCommand::Bootstrap(b)) => {
-                log_id.get_or_insert(b.log_id);
-            }
-            other => return Err(equality(format!("entry {last} is {other:?}"))),
+    let mut replica = Replica::default();
+    replica.advance(entries, applied)?;
+    Ok(replica.state)
+}
+
+/// A replay kept from one check to the next, so a long run replays each entry once
+/// rather than the whole log at every step.
+#[derive(Debug)]
+pub(crate) struct Replica {
+    /// The metadata state and the first `Bootstrap`'s log id.
+    pub(crate) state: (MetaState, Option<FarmLogId>),
+    /// How many entries of the durable log it has read, and the last of them.
+    read: usize,
+    tail: Option<Entry>,
+    /// The index of the last entry it read.
+    last: u64,
+}
+
+impl Default for Replica {
+    fn default() -> Self {
+        Self {
+            state: (MetaState::new(Retention::default()), None),
+            read: 0,
+            tail: None,
+            last: 0,
         }
     }
-    if last < applied {
-        let d = format!("entry {applied} is applied, but the durable log ends at {last}");
-        return Err(equality(d));
+}
+
+impl Replica {
+    /// Whether `entries` begins with every entry this replica has read: only then can
+    /// it go on from where it stopped. (Checked by the last one read: one voter
+    /// appends only, so an equal entry at that position means an equal prefix.)
+    pub(crate) fn extends(&self, entries: &[Entry]) -> bool {
+        self.read == 0 || entries.get(self.read - 1) == self.tail.as_ref()
     }
-    Ok((replica, log_id))
+
+    /// Reads the entries after the last one read, through index `applied`.
+    pub(crate) fn advance(&mut self, entries: &[Entry], applied: u64) -> Result<(), Broken> {
+        let (replica, log_id) = &mut self.state;
+        for entry in entries[self.read..]
+            .iter()
+            .take_while(|e| e.id.index.0 <= applied)
+        {
+            self.read += 1;
+            self.last = entry.id.index.0;
+            self.tail = Some(entry.clone());
+            let last = self.last;
+            let Payload::Command(bytes) = &entry.payload else {
+                continue;
+            };
+            match kbf_log::decode(Format::V1, bytes) {
+                Ok(LogCommand::Meta(command)) => {
+                    let before = replica.now();
+                    replica.execute(last, command);
+                    monotone(before, replica.now())?;
+                }
+                Ok(LogCommand::Bootstrap(b)) => {
+                    log_id.get_or_insert(b.log_id);
+                }
+                other => return Err(equality(format!("entry {last} is {other:?}"))),
+            }
+        }
+        if self.last < applied {
+            let last = self.last;
+            let d = format!("entry {applied} is applied, but the durable log ends at {last}");
+            return Err(equality(d));
+        }
+        Ok(())
+    }
 }
 
 /// Whether the server's `live` state and `log_id` are the replica's.
@@ -125,6 +171,26 @@ mod tests {
         });
         let tick = LogCommand::Meta(Command::Tick(FarmTime::from_millis(5)));
         vec![blank, entry(2, &bootstrap), entry(3, &tick)]
+    }
+
+    /// Catches an incremental replay that skips or repeats an entry between checks,
+    /// or goes on over a log that no longer begins with what it read.
+    #[test]
+    fn a_replay_in_steps_equals_one_replay() {
+        let mut r = Replica::default();
+        r.advance(&log(), 2).expect("through 2");
+        assert!(r.extends(&log()));
+        r.advance(&log(), 3).expect("through 3");
+        assert_eq!(r.state, replay(&log(), 3).expect("in one"));
+        r.advance(&log(), 3).expect("nothing new");
+        assert_eq!(r.state, replay(&log(), 3).expect("in one"));
+        let mut other = log();
+        other[2] = entry(
+            3,
+            &LogCommand::Meta(Command::Tick(FarmTime::from_millis(1))),
+        );
+        assert!(!r.extends(&other));
+        assert!(Replica::default().extends(&other));
     }
 
     /// Catches a replay that skips the metadata commands or the `Bootstrap`, or reads

@@ -662,12 +662,14 @@ fn unexpected(applied: &Applied) -> CacheError {
 }
 
 mod batch;
+mod upload;
 mod write_group;
 
 pub use batch::BATCH_READS_IN_FLIGHT;
+pub(crate) use upload::BuiltSegment;
 pub use write_group::{
-    Admitted, CONNECTION_WINDOW_BYTES, MAX_CONCURRENT_STREAMS, PUT_BACKOFF, PUT_BACKOFF_FACTOR,
-    STREAM_WINDOW_BYTES, WriteConfig,
+    Admitted, CONNECTION_WINDOW_BYTES, MAX_ADMISSION_BYTES, MAX_CONCURRENT_STREAMS, PUT_BACKOFF,
+    PUT_BACKOFF_FACTOR, STREAM_WINDOW_BYTES, WriteConfig,
 };
 use write_group::{Group, Writer};
 

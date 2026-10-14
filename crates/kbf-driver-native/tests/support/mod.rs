@@ -301,8 +301,8 @@ pub async fn pid_in(file: &Path) -> i32 {
     }
 }
 
-/// Whether the scratch root holds no lease directory and no run record: nothing but
-/// the empty `runs` directory the runtime makes for the records.
+/// Whether the scratch root holds no lease directory, no run record and no output
+/// spool: nothing but the empty `runs` and `spool` directories the runtime makes.
 pub fn no_leases(config: &NativeConfig) -> bool {
     let empty = |dir: &Path| {
         std::fs::read_dir(dir)
@@ -311,11 +311,17 @@ pub fn no_leases(config: &NativeConfig) -> bool {
             .is_none()
     };
     let runs = config.scratch.join("runs");
+    // The output spools' directory: its files are unlinked as soon as they are made.
+    let spool = config.scratch.join("spool");
     let others = std::fs::read_dir(&config.scratch)
         .expect("scratch root")
-        .filter(|entry| entry.as_ref().map_or(true, |e| e.path() != runs))
+        .filter(|entry| {
+            entry
+                .as_ref()
+                .map_or(true, |e| e.path() != runs && e.path() != spool)
+        })
         .count();
-    others == 0 && empty(&runs)
+    others == 0 && empty(&runs) && empty(&spool)
 }
 
 /// `getconf <name>` as the test's user (the driver's user) sees it, every link

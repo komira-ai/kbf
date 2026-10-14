@@ -11,6 +11,7 @@ publish.workspace = true
 futures.workspace = true
 hex.workspace = true
 kbf-proto.workspace = true
+kbf-segments.workspace = true
 kbf-types.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
@@ -20,7 +21,9 @@ tracing.workspace = true
 
 [dev-dependencies]
 kbf-front.workspace = true
+kbf-objstore.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread"] }
+tracing-subscriber.workspace = true
 
 [lints]
 workspace = true

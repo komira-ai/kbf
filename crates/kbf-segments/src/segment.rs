@@ -80,7 +80,8 @@ impl SegmentWriter {
     #[must_use]
     pub fn finish(self) -> Vec<u8> {
         let mut out = self.records;
-        write_footer(&mut out, self.index.values());
+        let records_len = out.len() as u64;
+        write_footer(&mut out, records_len, self.index.values());
         out
     }
 }

@@ -312,7 +312,7 @@ mod tests {
         link_xcodebuild(&xcodebuild, &apps.join("Xcode_16.app"));
         let probe = Probe {
             xcrun: PathBuf::from("/bin/echo"),
-            within: Duration::from_secs(5),
+            within: xcode::ANSWER_WITHIN,
             ..Probe::system(false)
         };
         let applied = Arc::new(Mutex::new(Vec::new()));
@@ -392,7 +392,7 @@ mod tests {
         link_xcodebuild(&xcodebuild, &apps.join("Xcode_16.app"));
         let probe = Probe {
             xcrun: PathBuf::from("/bin/echo"),
-            within: Duration::from_secs(5),
+            within: xcode::ANSWER_WITHIN,
             ..Probe::system(false)
         };
         // The reasons do differ from survey to survey, by the pid at least.
@@ -455,7 +455,7 @@ mod tests {
         link_xcodebuild(&xcodebuild, &two);
         let probe = Probe {
             xcrun: PathBuf::from("/bin/echo"),
-            within: Duration::from_secs(5),
+            within: xcode::ANSWER_WITHIN,
             ..Probe::system(false)
         };
         let applied = Arc::new(Mutex::new(Vec::new()));

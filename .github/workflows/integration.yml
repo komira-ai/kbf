@@ -2,7 +2,8 @@
 # daemon, and the sample projects in crates/kbf-it/m1 built remote-only with pinned
 # Bazel and buck2, twice each. The second build of each must be all remote cache hits
 # A last buck2 build holds a lease in flight (an action that sleeps) while the node is
-# drained through the operator API (crates/kbf-it/m1/run.sh says exactly what is checked).
+# drained through the operator API (`kbf-cell m1`, crates/kbf-it/src/m1.rs, says exactly
+# what is checked).
 #
 # Its own workflow, using GitHub-owned actions only, so that it starts under the
 # repository's Actions policy whatever the other workflows use. Same hosted-runner,
@@ -57,7 +58,8 @@ jobs:
         with:
           persist-credentials: false
       - run: rustup toolchain install
-      - run: cargo build -p kbf-server -p kbf-it --bins --locked
+      # kbf-act (kbf-testkit) is the program the samples' `shout` action runs.
+      - run: cargo build -p kbf-server -p kbf-it -p kbf-testkit --bins --locked
       - name: Fetch Bazel (pinned version, checked by SHA-256)
         run: cargo xtask fetch --url "https://github.com/bazelbuild/bazel/releases/download/$BAZEL_VERSION/bazel-$BAZEL_VERSION-linux-x86_64" --sha256 "$BAZEL_SHA256" --out "$RUNNER_TEMP/tools/bazel"
       - name: Fetch buck2 (pinned version, checked by SHA-256)
@@ -67,7 +69,7 @@ jobs:
       - name: Wait for MinIO, then run the store conformance suite on it
         run: cargo run -p kbf-objstore --example s3_conformance --locked -- --endpoint http://127.0.0.1:9000 --bucket kbf-m1-conformance --create-bucket --conditional-put --wait-ready 60
       - name: M1 cell, Bazel and buck2 twice each
-        run: crates/kbf-it/m1/run.sh --bin-dir target/debug --work "$RUNNER_TEMP/m1" --s3-endpoint http://127.0.0.1:9000 --s3-bucket kbf-m1 --bazel "$RUNNER_TEMP/tools/bazel" --buck2 "$RUNNER_TEMP/tools/buck2"
+        run: target/debug/kbf-cell m1 --bin-dir target/debug --projects crates/kbf-it/m1 --work "$RUNNER_TEMP/m1" --s3-endpoint http://127.0.0.1:9000 --s3-bucket kbf-m1 --bazel "$RUNNER_TEMP/tools/bazel" --buck2 "$RUNNER_TEMP/tools/buck2"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: ${{ !cancelled() }}
         with:
