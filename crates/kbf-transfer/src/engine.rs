@@ -1,9 +1,18 @@
 //! [`Transfers`], one per daemon process, and [`Scope`], a lease's view of it.
 //!
 //! Every request takes one permit of `--transfer-in-flight` for as long as it is out:
-//! a ByteStream read or write, or a FindMissing call. The permits are granted in the
-//! order they were asked for (`tokio::sync::Semaphore` is FIFO), across every lease,
-//! so a lease with thousands of blobs does not starve one with ten past queue order.
+//! a ByteStream read or write, a `PutRange`, or a FindMissing call. The permits are
+//! granted in the order they were asked for (`tokio::sync::Semaphore` is FIFO), across
+//! every lease, so a lease with thousands of blobs does not starve one with ten past
+//! queue order.
+//!
+//! An upload (a ByteStream write or a `PutRange`) first takes a permit of the uploads'
+//! share ([`upload_share`]: all but a quarter of the limit), and only then its request
+//! permit. The server holds a write until its blob is durable, which on a slow store
+//! is minutes, while a read holds its permit for milliseconds; FIFO alone lets the
+//! permits drain to the writes and stay there, so one lease's upload would stop every
+//! other lease's reads (issue #641). The quarter outside the share is only ever held by
+//! reads and FindMissing calls.
 //! A read into memory also holds its blob's size of `--transfer-bytes-in-flight` (a
 //! blob larger than the budget waits for all of it and goes alone); a read streamed
 //! into a file holds only its messages.
@@ -52,6 +61,8 @@ pub(crate) struct Inner {
     pub wire: Wire,
     pub config: TransferConfig,
     requests: Semaphore,
+    /// The uploads' share of `requests` ([`upload_share`]), taken before it.
+    uploads: Semaphore,
     bytes: Semaphore,
     /// The byte budget, as permits.
     bytes_total: usize,
@@ -85,6 +96,7 @@ impl Transfers {
         let inner = Arc::new(Inner {
             wire: Wire::new(channel, config.chunk_bytes),
             requests: Semaphore::new(config.in_flight),
+            uploads: Semaphore::new(upload_share(config.in_flight)),
             bytes: Semaphore::new(bytes_total),
             bytes_total,
             flights: Flights::default(),
@@ -247,7 +259,7 @@ impl Scope {
         let inner = &self.inner;
         let mut attempt = 0;
         loop {
-            let permit = inner.request().await;
+            let permit = inner.upload_request().await;
             add(&self.counts.write_calls, 1);
             let written = inner.wire.write(digest, bytes).await;
             drop(permit);
@@ -269,7 +281,7 @@ impl Scope {
         digest: &Digest,
         chunks: Chunks,
     ) -> Result<Digest, CasError> {
-        let permit = self.inner.request().await;
+        let permit = self.inner.upload_request().await;
         add(&self.counts.write_calls, 1);
         let written = self.inner.wire.write_chunks(digest, chunks).await;
         drop(permit);
@@ -367,6 +379,18 @@ impl Inner {
     /// A request permit. The semaphore is never closed, so it is always granted.
     pub(crate) async fn request(&self) -> Option<SemaphorePermit<'_>> {
         self.requests.acquire().await.ok()
+    }
+
+    /// A request permit for an upload: a permit of the uploads' share first, then the
+    /// request permit, both held until the returned value is dropped. Neither semaphore
+    /// is ever closed, so both are always granted.
+    pub(crate) async fn upload_request(&self) -> UploadPermit<'_> {
+        let share = self.uploads.acquire().await.ok();
+        let request = self.request().await;
+        UploadPermit {
+            _share: share,
+            _request: request,
+        }
     }
 
     /// After a failed call: whether to try again, having waited out the backoff
@@ -489,6 +513,20 @@ impl Inner {
     }
 }
 
+/// The permits of an upload ([`Inner::upload_request`]), released when dropped.
+pub(crate) struct UploadPermit<'a> {
+    _share: Option<SemaphorePermit<'a>>,
+    _request: Option<SemaphorePermit<'a>>,
+}
+
+/// How many of `in_flight` request permits uploads may hold at once: all but a quarter
+/// (at least one kept for reads and FindMissing calls), or the one permit when that is
+/// all there is. 48 of the default 64.
+pub(crate) fn upload_share(in_flight: usize) -> usize {
+    let kept = (in_flight / 4).max(1).min(in_flight.saturating_sub(1));
+    in_flight - kept
+}
+
 /// How far a read has got: the bytes received of the blob's `size`, and their hash.
 struct Progress {
     at: u64,
@@ -499,4 +537,17 @@ struct Progress {
 /// The wait before retry number `attempt` (from 1): 100 ms, doubling, at most 3.2 s.
 fn backoff(attempt: u32) -> Duration {
     Duration::from_millis(50 << attempt.min(6))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::upload_share;
+
+    /// Catches a share that keeps nothing for reads (the whole limit), or that leaves
+    /// uploads no permit when the limit is one or two.
+    #[test]
+    fn uploads_share_all_but_a_quarter_of_the_limit() {
+        let shares: Vec<usize> = [1, 2, 3, 4, 16, 64].map(upload_share).to_vec();
+        assert_eq!(shares, [1, 1, 2, 3, 12, 48]);
+    }
 }

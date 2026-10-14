@@ -230,7 +230,12 @@ pub enum Upload { Bytes(Digest, Bytes), File(Digest, PathBuf) }
   *unmeasured*; Buildbarn's examples use 10, NativeLink 64, BuildBuddy unlimited). It
   counts concurrent requests: a ByteStream read or write, a batch call, a FindMissing
   call. Permits are granted first come, first served (`tokio::sync::Semaphore` is
-  FIFO), so a big lease does not starve a small one past queue order.
+  FIFO), so a big lease does not starve a small one past queue order. Uploads (a
+  ByteStream write, a `PutRange`) take a permit of the uploads' share first, all but a
+  quarter of the limit (48 of 64): the server holds a write until it is durable, which
+  on a slow store is minutes, and without the share the permits drain to the writes
+  and one lease's upload stops every other lease's reads and cache fills (measured on
+  a farm node: nine leases' inputs waited 22 minutes; issue #641).
   `--transfer-lease-in-flight` (unset by default) can cap one lease's share if the
   farm's metrics show a need.
 - **One byte budget:** `--transfer-bytes-in-flight` (default 256 MiB, as stage A's
