@@ -4,7 +4,9 @@
 //! Every blob a daemon moves goes through one [`Transfers`] per process: input files,
 //! output uploads, and the input cache's fills. It speaks gRPC to kbf-server over one
 //! HTTP/2 connection with many streams, and bounds the whole process with one
-//! in-flight limit and one byte budget, not one per call. Concurrent reads of one
+//! in-flight limit and one byte budget, not one per call. Uploads hold at most all but
+//! a quarter of the limit, so a slow store under one lease's upload leaves permits for
+//! every lease's reads. Concurrent reads of one
 //! digest, from any lease, share one fetch. Every upload is preceded by FindMissing (its
 //! own, or one call for a whole set of blobs, [`Cas::missing`]), so a blob the server
 //! holds is not sent again. A read broken by a reset connection

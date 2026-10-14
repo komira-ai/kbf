@@ -81,12 +81,12 @@ async fn t1_sixteen_leases_share_one_limit_one_connection_and_one_read_per_diges
 /// 1. The server holds FindMissing too. Calls go one at a time and uploads wait for
 ///    their answer, so the held call is the one request and must hold the one permit
 ///    taken: a call that takes none, or releases it before the call, shows 0.
-/// 2. FindMissing is answered until held writes fill `--transfer-in-flight`: a write
-///    without a permit passes it.
-/// 3. With every permit a held write's, the server holds FindMissing again and each
-///    lease starts more uploads and reads: a FindMissing (or read) that reaches the
-///    server now took no permit and stays there to be counted. FindMissing asks four
-///    digests a call, so calls keep coming.
+/// 2. FindMissing is answered until held writes fill the uploads' share of
+///    `--transfer-in-flight` (12 of 16): a write without a permit passes it.
+/// 3. With the share held by writes, the server holds FindMissing again and each
+///    lease starts more uploads and reads: FindMissing calls and reads take the other
+///    4 permits and stay at the server, and one that took no permit is counted past
+///    the limit. FindMissing asks four digests a call, so calls keep coming.
 /// Then the gates open, and the most requests ever served at once (reads, writes and
 /// FindMissing together) is the limit. The per-walk limits of kbf-outputs and the
 /// container driver are per lease, so 16 leases are held to the process's limit only
@@ -148,19 +148,20 @@ async fn uploads_finds_and_reads_of_sixteen_leases_share_the_one_limit() {
         "(requests at the server, permits taken) with FindMissing held"
     );
     fake.open_finds();
-    within(30, || fake.held_writes.load(Ordering::SeqCst) >= limit).await;
-    // Room for writes past the limit to reach the server, were they allowed to.
+    let share = 12;
+    within(30, || fake.held_writes.load(Ordering::SeqCst) >= share).await;
+    // Room for writes past the share to reach the server, were they allowed to.
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(
         (
             fake.held_writes.load(Ordering::SeqCst),
             fake.requests.load(Ordering::SeqCst)
         ),
-        (limit, limit),
+        (share, share),
         "(held writes, requests) at once"
     );
-    // Every permit is a held write's, so a FindMissing that reaches the server from
-    // here on took none, and stays there to be counted.
+    // The share is held by writes; the other permits go to FindMissing calls and
+    // reads, held at the server from here on, and one past them took none.
     fake.close_finds();
     leases.extend(uploads(1));
     let reads: Vec<Digest> = (0..160)
