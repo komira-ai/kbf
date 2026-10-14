@@ -2,7 +2,7 @@
 //! (`crates/kbf-it/m2/buck2/defs.bzl`). The M2 image, distroless `base-debian12`, holds
 //! no shell and no coreutils, so every action runs this program, linked statically,
 //! from its input root (CI builds it with `-C target-feature=+crt-static`;
-//! `m2/run.sh` refuses a dynamically linked one). An action that runs it at all
+//! `kbf-cell m2` refuses a dynamically linked one). An action that runs it at all
 //! proves the farm kept the input file's executable bit.
 //!
 //! Usage: `kbf-m2-act <verb> <out> <args...>`, writing `<out>`:
@@ -13,7 +13,7 @@
 //! - `hog OUT MIB`: touches `MIB` MiB of distinct, incompressible memory at
 //!   [`HOG_MIB_PER_SEC`] and holds all of it until done, then writes `MIB`. Slow on
 //!   purpose: a lease over its cap keeps pushing into swap for several of the swap
-//!   watch's one-second samples, so the watch sees it (see `m2/run.sh`).
+//!   watch's one-second samples, so the watch sees it (see `kbf_it::m2`).
 //!
 //! Exits 0 on success, 1 when the verb fails, 2 on a usage error. Tested by running
 //! it (`crates/kbf-it/tests/m2_act.rs`).

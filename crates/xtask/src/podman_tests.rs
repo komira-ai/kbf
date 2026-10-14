@@ -185,7 +185,8 @@ fn sudo(program: &Path, args: &[OsString]) -> Result<ExitStatus, Error> {
 /// Readies a hosted runner's user for rootless Podman: lingering on (`sudo -n loginctl
 /// enable-linger <uid>`, a no-op when it is on already), so its systemd user manager
 /// runs and `runtime_dir`, its `XDG_RUNTIME_DIR`, holds the manager's bus. Every verb
-/// that runs rootless Podman on a runner starts with it.
+/// that runs rootless Podman on a runner starts with it: `podman-tests` here, and
+/// `kbf-cell m2` (crates/kbf-it/src/m2.rs).
 ///
 /// # Errors
 /// sudo could not be started or failed, or the bus did not appear within 10 s.

@@ -448,8 +448,9 @@ jobs:
   # The M2 test: pinned buck2 builds the sample project in crates/kbf-it/m2 remote-only
   # through kbf-server to kbf-daemon --driver container, every action in a rootless
   # Podman container of distroless base-debian12 pinned by its amd64 manifest digest
-  # (crates/kbf-it/m2/run.sh says what is checked). x86_64 only: the image digest is
-  # the amd64 one.
+  # (`kbf-cell m2`, crates/kbf-it/src/m2.rs, says what is checked; it sets the runner
+  # up as `cargo xtask podman-tests` does). x86_64 only: the image digest is the amd64
+  # one.
   m2-container:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -474,11 +475,11 @@ jobs:
           restore-keys: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
       - run: cargo build -p kbf-server -p kbf-node -p kbf-it --bin kbf-server --bin kbf-daemon --bin kbf-cell --locked
       # The image's glibc is Debian 12's, older than the runner's, so the helper every
-      # action runs is linked statically (run.sh refuses a dynamic one).
+      # action runs is linked statically (kbf-cell m2 refuses a dynamic one).
       - run: cargo rustc -p kbf-it --bin kbf-m2-act --locked -- -C target-feature=+crt-static
       - name: Fetch buck2 (pinned version, checked by SHA-256)
         run: cargo xtask fetch --url "https://github.com/facebook/buck2/releases/download/$BUCK2_VERSION/buck2-x86_64-unknown-linux-gnu.zst" --sha256 "$BUCK2_SHA256" --out "$RUNNER_TEMP/tools/buck2" --extract zst
-      - run: bash tools/ci/m2-container.sh "$RUNNER_TEMP/tools/buck2" "$RUNNER_TEMP/m2"
+      - run: target/debug/kbf-cell m2 --bin-dir target/debug --project crates/kbf-it/m2/buck2 --work "$RUNNER_TEMP/m2" --buck2 "$RUNNER_TEMP/tools/buck2"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: ${{ !cancelled() }}
         with:
