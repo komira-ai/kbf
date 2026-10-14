@@ -296,6 +296,10 @@ jobs:
         with:
           subject-path: dist/kbf-server-${{ github.sha }}-linux-arm64.tar.gz
           sbom-path: dist/kbf-server-${{ github.sha }}-linux-arm64.cdx.json
+      - uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        with:
+          subject-path: dist/kbf-deploy-${{ github.sha }}-linux-arm64.tar.gz
+          sbom-path: dist/kbf-deploy-${{ github.sha }}-linux-arm64.cdx.json
 
   # Push to main only, after attest: the checks the planned deployment job is to make
   # (cargo xtask verify-assets, crates/xtask/src/sums.rs), with read-only scopes. The
