@@ -96,8 +96,9 @@ async fn the_default_put_chunks_gathers_and_checks_its_digest() {
 }
 
 /// Catches the default `read_to` writing other bytes than the blob's, leaving them
-/// unflushed, or a file it cannot write taken as written; and the default in-flight
-/// limit drifting from the engine's.
+/// unflushed, or a file it cannot write taken as written; the default in-flight
+/// limit drifting from the engine's; and the default `missing` leaving out a digest
+/// (a blob never stored).
 #[tokio::test]
 async fn the_default_read_to_writes_the_checked_blob() {
     let cas = MemoryCas::default();
@@ -121,6 +122,13 @@ async fn the_default_read_to_writes_the_checked_blob() {
             .starts_with(&format!("blob {} could not be written: ", label(&digest)))
     );
     assert_eq!(cas.in_flight(), DEFAULT_IN_FLIGHT);
+    // A store that does not ask answers every digest missing, in the order asked, the
+    // one it holds too: its puts store them.
+    let absent = digest_of(b"absent");
+    assert_eq!(
+        cas.missing(&[absent.clone(), digest.clone()]).await,
+        [absent, digest]
+    );
 }
 
 /// Catches a store behind an `Arc` that is not the same store: every method reaches
@@ -143,5 +151,6 @@ async fn a_shared_store_is_the_same_store() {
         .expect("read_to");
     assert_eq!(std::fs::read(&path).expect("read"), bytes);
     assert_eq!(cas.in_flight(), DEFAULT_IN_FLIGHT);
+    assert_eq!(cas.missing(std::slice::from_ref(&digest)).await, [digest]);
     assert!(Arc::ptr_eq(&lease, &*cas));
 }

@@ -546,6 +546,58 @@ fn raft_mode_keeps_its_log_id_across_starts() {
     interrupt(child);
 }
 
+/// Catches: `--write-tier-dir` parsed and then ignored (no tier attached: its `TIER`
+/// file is never written, and every write would still go to the store); a restart over
+/// the memory log refused, or reading an earlier start's files as its own (that log's
+/// epochs start from 1 again, so an old block names one of the new start's objects);
+/// and the tier
+/// accepted over `--meta-log=raft`, whose log format has no tier commands (every
+/// staged write would fail its commit). The refusal exits 2 and says why.
+#[cfg(unix)]
+#[test]
+fn write_tier_dir_attaches_a_tier_and_refuses_the_raft_log() {
+    let dir = raft_dir("write-tier");
+    let dir_arg = dir.to_str().expect("a UTF-8 path");
+    let tier = ["--write-tier-dir", dir_arg, "--write-tier-bytes", "1048576"];
+    let mut memory = server(&ANY_PORT);
+    memory.args(tier);
+    let (child, _, _) = started(memory);
+    let named = std::fs::read_to_string(dir.join("TIER")).expect("a TIER file");
+    assert!(
+        named.ends_with('\n') && named.trim().parse::<u64>().is_ok(),
+        "{named:?}"
+    );
+    interrupt(child);
+
+    // A memory log starts empty, its epochs from 1 again: an earlier start's block and
+    // copy are not this start's objects, and must not refuse the start or be read.
+    let old = [
+        "0000000000000001-0000000000000001.blk",
+        "0000000000000001-0000000000000002.seg",
+    ];
+    for name in old {
+        std::fs::write(dir.join(name), b"an earlier start's bytes").expect("plant");
+    }
+    let mut again = server(&ANY_PORT);
+    again.args(tier);
+    let (child, _, _) = started(again);
+    for name in old {
+        assert!(!dir.join(name).exists(), "{name} kept");
+    }
+    interrupt(child);
+
+    let raft = raft_dir("write-tier-raft");
+    let mut c = raft_server(&raft);
+    c.args(tier);
+    let (code, stderr) = fails(c);
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(
+        stderr.contains("--write-tier-dir needs --meta-log=memory"),
+        "{stderr}"
+    );
+    std::fs::remove_dir_all(&dir).expect("remove the tier dir");
+}
+
 /// Catches: `--meta-log=raft` accepted with `--store=memory` (a durable index over
 /// blobs that die with the process would report them present after a restart), or
 /// without `--raft-dir`; a `--raft-dir` that is ignored under `--meta-log=memory`; and

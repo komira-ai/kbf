@@ -3,8 +3,8 @@
 //! `podman_env.rs` runs the same cases against real rootless Podman and crun.
 //!
 //! The fake's `start` stands in for a refused start with `status-override` set to
-//! `created 0` (the container never ran) and an action script that prints what Podman
-//! prints when crun refuses the program, then exits 125 as `podman start` does.
+//! `created 0` (the container never ran) and act steps that print what Podman
+//! prints when crun refuses the program, then exit 125 as `podman start` does.
 
 mod support;
 
@@ -21,9 +21,18 @@ fn not_found(name: &str) -> String {
     )
 }
 
+/// The act steps of a start that prints `said` as `podman start`'s stderr and exits
+/// `code`: 125, as `podman start` does when the fake refuses it.
+fn printing(said: &str, code: u8) -> Vec<String> {
+    let code = code.to_string();
+    ["echo", "--stderr", said, ";", "exit", code.as_str()]
+        .map(str::to_owned)
+        .to_vec()
+}
+
 /// A start the fake refuses, printing `said` as `podman start`'s stderr.
-fn refused(said: &str) -> String {
-    format!("cat >&2 <<'EOF'\n{said}\nEOF\nexit 125\n")
+fn refused(said: &str) -> Vec<String> {
+    printing(said, 125)
 }
 
 fn spec(argv: &[&str], env: &[(&str, &str)]) -> Spec {
@@ -147,12 +156,9 @@ async fn only_crun_naming_the_program_makes_it_the_actions() {
     }
 
     std::fs::remove_file(fake.state.join("status-override")).expect("rm knob");
-    let script = format!(
-        "{}exit 3\n",
-        refused(&not_found("env")).replace("exit 125\n", "")
-    );
+    let steps = printing(&not_found("env"), 3);
     let result = fake
-        .run(9, &spec(&["env"], &[]), &script)
+        .run(9, &spec(&["env"], &[]), &steps)
         .await
         .expect("ran");
     assert_eq!(result.exit_code, 3);

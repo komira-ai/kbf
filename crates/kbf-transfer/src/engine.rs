@@ -14,9 +14,10 @@
 //! write starts again from its first byte; one streamed from a file's chunks is not
 //! retried, since its chunks are read once.
 
+use std::collections::HashSet;
 use std::pin::pin;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use kbf_proto::reapi::Digest;
@@ -31,6 +32,7 @@ use crate::cas::{Cas, CasError, Chunks, digest_of, label};
 use crate::config::TransferConfig;
 use crate::find::Finder;
 use crate::flights::{Flights, Outcome, Publish};
+use crate::spool::Spool;
 use crate::stats::{Counts, EngineStats, TransferStats, add};
 use crate::wire::{Wire, WriteFailed, call_error, committed, retryable};
 
@@ -55,6 +57,8 @@ pub(crate) struct Inner {
     bytes_total: usize,
     flights: Flights,
     pub finder: Finder,
+    /// Set by the first UNIMPLEMENTED from `Segments`: outputs go blob by blob.
+    pub segments_off: AtomicBool,
 }
 
 impl Transfers {
@@ -85,6 +89,7 @@ impl Transfers {
             bytes_total,
             flights: Flights::default(),
             finder: Finder::default(),
+            segments_off: AtomicBool::new(false),
             config,
         });
         let unscoped = Scope::new(&inner, None);
@@ -119,8 +124,11 @@ impl Transfers {
 /// waits on goes on (`docs/design/worker-cache.md#44-limits-retries-cancellation`).
 #[derive(Debug)]
 pub struct Scope {
-    inner: Arc<Inner>,
-    counts: Arc<Counts>,
+    pub(crate) inner: Arc<Inner>,
+    pub(crate) counts: Arc<Counts>,
+    /// The labels of digests [`Cas::missing`] answered missing that are not stored yet:
+    /// their put does not ask again (`crate::find`).
+    answered: Mutex<HashSet<String>>,
 }
 
 impl Scope {
@@ -128,7 +136,13 @@ impl Scope {
         Self {
             inner: Arc::clone(inner),
             counts: Arc::new(Counts::new(lease)),
+            answered: Mutex::default(),
         }
+    }
+
+    fn answered(&self) -> MutexGuard<'_, HashSet<String>> {
+        // Every change is one insert or one remove.
+        self.answered.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// What this scope has transferred so far.
@@ -149,8 +163,12 @@ impl Scope {
         waiter.outcome(digest).await
     }
 
-    /// Whether the server holds the blob, so its upload is skipped.
-    async fn present(&self, digest: &Digest) -> bool {
+    /// Whether the server holds the blob, so its upload is skipped: `false` without a
+    /// question for a digest [`Cas::missing`] answered missing, the answer used once.
+    pub(crate) async fn present(&self, digest: &Digest) -> bool {
+        if self.answered().remove(&label(digest)) {
+            return false;
+        }
         let present = self.inner.present(digest, &self.counts).await;
         if present {
             add(&self.counts.outputs_present, 1);
@@ -175,41 +193,18 @@ impl Cas for Scope {
         if self.present(&digest).await {
             return Ok(digest);
         }
-        let inner = &self.inner;
-        let mut attempt = 0;
-        loop {
-            let permit = inner.request().await;
-            add(&self.counts.write_calls, 1);
-            let written = inner.wire.write(&digest, &bytes).await;
-            drop(permit);
-            match written {
-                Ok(size) => {
-                    add(&self.counts.written_bytes, bytes.len() as u64);
-                    add(&self.counts.written_blobs, 1);
-                    return committed(&digest, size);
-                }
-                Err(status) => self.retry(&digest, &status, &mut attempt).await?,
-            }
-        }
+        self.send(&digest, &bytes).await
     }
 
     async fn put_chunks(&self, digest: Digest, chunks: Chunks) -> Result<Digest, CasError> {
         if self.present(&digest).await {
             return Ok(digest);
         }
-        let permit = self.inner.request().await;
-        add(&self.counts.write_calls, 1);
-        let written = self.inner.wire.write_chunks(&digest, chunks).await;
-        drop(permit);
-        match written {
-            Ok(size) => {
-                add(&self.counts.written_bytes, u64::try_from(size).unwrap_or(0));
-                add(&self.counts.written_blobs, 1);
-                committed(&digest, size)
-            }
-            Err(WriteFailed::Call(status)) => Err(call_error(&digest, &status)),
-            Err(WriteFailed::Read(e)) => Err(CasError::Read(label(&digest), e.to_string())),
-        }
+        self.send_chunks(&digest, chunks).await
+    }
+
+    async fn put_spool(&self, spool: Arc<Spool>) -> Result<(), CasError> {
+        self.upload_spool(spool).await
     }
 
     async fn read_to(&self, digest: &Digest, file: &mut tokio::fs::File) -> Result<(), CasError> {
@@ -232,12 +227,63 @@ impl Cas for Scope {
         flushed.map_err(|e| CasError::Write(label(digest), e.to_string()))
     }
 
+    async fn missing(&self, digests: &[Digest]) -> Vec<Digest> {
+        let missing = self.inner.missing(digests, &self.counts).await;
+        let present = digests.len() - missing.len();
+        add(&self.counts.outputs_present, present as u64);
+        self.answered().extend(missing.iter().map(label));
+        missing
+    }
+
     fn in_flight(&self) -> usize {
         self.inner.config.in_flight
     }
 }
 
 impl Scope {
+    /// Writes `bytes`, the blob `digest` names, with one ByteStream write, retried on
+    /// UNAVAILABLE or a broken connection; FindMissing is not asked.
+    pub(crate) async fn send(&self, digest: &Digest, bytes: &[u8]) -> Result<Digest, CasError> {
+        let inner = &self.inner;
+        let mut attempt = 0;
+        loop {
+            let permit = inner.request().await;
+            add(&self.counts.write_calls, 1);
+            let written = inner.wire.write(digest, bytes).await;
+            drop(permit);
+            match written {
+                Ok(size) => {
+                    add(&self.counts.written_bytes, bytes.len() as u64);
+                    add(&self.counts.written_blobs, 1);
+                    return committed(digest, size);
+                }
+                Err(status) => self.retry(digest, &status, &mut attempt).await?,
+            }
+        }
+    }
+
+    /// Writes the blob `digest` names from `chunks` with one ByteStream write, not
+    /// retried (the chunks are read once); FindMissing is not asked.
+    pub(crate) async fn send_chunks(
+        &self,
+        digest: &Digest,
+        chunks: Chunks,
+    ) -> Result<Digest, CasError> {
+        let permit = self.inner.request().await;
+        add(&self.counts.write_calls, 1);
+        let written = self.inner.wire.write_chunks(digest, chunks).await;
+        drop(permit);
+        match written {
+            Ok(size) => {
+                add(&self.counts.written_bytes, u64::try_from(size).unwrap_or(0));
+                add(&self.counts.written_blobs, 1);
+                committed(digest, size)
+            }
+            Err(WriteFailed::Call(status)) => Err(call_error(digest, &status)),
+            Err(WriteFailed::Read(e)) => Err(CasError::Read(label(digest), e.to_string())),
+        }
+    }
+
     /// After a failed call: waits out the backoff and returns to retry it, or returns
     /// the call's error once it is not worth another attempt.
     async fn retry(
@@ -276,6 +322,14 @@ impl Cas for Transfers {
 
     async fn read_to(&self, digest: &Digest, file: &mut tokio::fs::File) -> Result<(), CasError> {
         self.unscoped.read_to(digest, file).await
+    }
+
+    async fn missing(&self, digests: &[Digest]) -> Vec<Digest> {
+        self.unscoped.missing(digests).await
+    }
+
+    async fn put_spool(&self, spool: Arc<Spool>) -> Result<(), CasError> {
+        self.unscoped.put_spool(spool).await
     }
 
     fn in_flight(&self) -> usize {

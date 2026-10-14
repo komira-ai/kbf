@@ -5,7 +5,7 @@
 //! writes blobs through the same one, so the in-flight limit and the byte budget hold
 //! for the whole process, over one HTTP/2 connection to `--cas`.
 
-use kbf_transfer::{DEFAULT_IN_FLIGHT, TransferConfig, Transfers};
+use kbf_transfer::{DEFAULT_IN_FLIGHT, DEFAULT_SEGMENT_STREAMS, TransferConfig, Transfers};
 use tonic::transport::Endpoint;
 
 use super::{Cli, Error};
@@ -40,6 +40,12 @@ pub(crate) struct TransferArgs {
     /// connection.
     #[arg(long, default_value_t = 3)]
     pub transfer_retries: u32,
+    /// How many `PutRange` calls one segment upload of an action's outputs has in
+    /// flight at once, as HTTP/2 streams on the one connection to `--cas`
+    /// (`docs/design/write-path.md`, section 4.1); also the parallel `ReadRange` calls
+    /// of a segment-range read.
+    #[arg(long, default_value_t = DEFAULT_SEGMENT_STREAMS as u64, value_parser = clap::value_parser!(u64).range(1..))]
+    pub segment_upload_streams: u64,
 }
 
 impl TransferArgs {
@@ -54,6 +60,7 @@ impl TransferArgs {
             find_missing_chunk: size(self.transfer_find_missing_chunk),
             stream_window_bytes: self.transfer_stream_window_bytes,
             retries: self.transfer_retries,
+            segment_streams: size(self.segment_upload_streams),
         }
     }
 }
@@ -102,9 +109,10 @@ mod tests {
         Cli::try_parse_from(base.iter().chain(extra))
     }
 
-    /// Catches a `--transfer-*` flag that does not reach the engine, or one whose
-    /// default is not the engine's own (a deploy that sets none would run other limits
-    /// than the design's). Each value given differs from its default.
+    /// Catches a `--transfer-*` flag (or `--segment-upload-streams`) that does not reach
+    /// the engine, or one whose default is not the engine's own (a deploy that sets none
+    /// would run other limits than the design's). Each value given differs from its
+    /// default.
     #[test]
     fn transfer_flags_reach_the_configuration() {
         let defaults = parse(&[]).expect("flags").transfer.config();
@@ -117,6 +125,7 @@ mod tests {
             "--transfer-find-missing-chunk=40",
             "--transfer-stream-window-bytes=100000",
             "--transfer-retries=5",
+            "--segment-upload-streams=9",
         ])
         .expect("flags");
         let expected = TransferConfig {
@@ -127,12 +136,14 @@ mod tests {
             find_missing_chunk: 40,
             stream_window_bytes: 100_000,
             retries: 5,
+            segment_streams: 9,
         };
         assert_eq!(cli.transfer.config(), expected);
         for refused in [
             "--transfer-in-flight=0",
             "--transfer-chunk-bytes=0",
             "--transfer-stream-window-bytes=100",
+            "--segment-upload-streams=0",
         ] {
             assert!(parse(&[refused]).is_err(), "{refused} accepted");
         }

@@ -23,10 +23,12 @@ daemon's side of fencing are in [worker-protocol.md](worker-protocol.md) and
 | `sim_cell` **exists** | `crates/kbf-sched/tests/sim_cell.rs` | the scheduler on the kernel: a leader, a control log node and two workers with a `SelfFence`; 48 seeds | `Start` only after commit; each operation answered once, by its newest grant; no self-fenced work twice at once; a reboot and a daemon restart inside G; a `Start` lost on a live session; a lease hidden from the running set; replay |
 | `sim_platform` **exists** | `crates/kbf-sched/tests/sim_platform.rs` | the scheduler alone with an in-process log: Linux x86-64, Linux arm64 and a one-core Mac, two random outages each; 64 seeds | grants satisfy the platform on a live worker; answered once; a refusal only after a stated reason and an unbroken unservable run; the refusal tick exactly; replay |
 | `sim_cordon` **exists** | `crates/kbf-sched/tests/sim_cordon.rs` | the scheduler alone, three always-up workers, random cordon, drain and uncordon; 64 seeds | no grant to a cordoned worker; a drain never kills; a cordon never refuses; drain states true; all work runs once uncordoned; replay |
-| `kbf-sim-cell` **exists** | `crates/kbf-sim-cell` | one server as `kbf-server --meta-log=raft` assembles it (the `RaftMetaLog` over an in-memory fault-injecting disk, a `Scheduler` and the `FarmMachine`), three daemons using the daemon's `Contact`, three clients, an object store; calm, restart, power-cut, I/O-error and daemon-partition runs, 64 seeds each | properties 1 to 7 of ha.md section 15 after every step ([section 8](#8-the-cell-kbf-sim-cell)); replay |
+| `kbf-sim-cell` **exists** | `crates/kbf-sim-cell` | one server as `kbf-server --meta-log=raft` assembles it (the `RaftMetaLog` over an in-memory fault-injecting disk, a `Scheduler` and the `FarmMachine`), three daemons using the daemon's `Contact`, three clients, an object store that can hang, be slow, fail PUTs or lose their answers; calm, restart, power-cut, I/O-error and daemon-partition runs, 64 seeds each, and the write path's store-fault and crash-point runs | properties 1 to 7 of ha.md section 15, and 8 and 9 of the write path, after every step ([section 8](#8-the-cell-kbf-sim-cell)); replay |
 
 Measured on the dev box in a debug build: `sim_cell` 0.3 s, `sim_platform` 2.2 s,
-`sim_cordon` 3.9 s, `kbf-sim-cell` 4.2 s (all five sweeps).
+`sim_cordon` 3.9 s, `kbf-sim-cell` 2.5 s (the five sweeps of `tests/cell.rs`) and
+about 15 s (the write-path runs of `tests/write_path.rs`, the outages minutes and hours
+long).
 
 What the existing sims do not cover:
 
@@ -354,15 +356,20 @@ simulation (ha.md section 15). Its nodes:
   a tick, a committed record fed straight back, a result taken only from the holder of
   the current lease, its action-cache entry written before its callers are answered).
   Both are in memory, as on the server today, so a restart loses them. An upload goes
-  to the object store first and is committed to the log once the store has it. Farm
-  time is the simulation clock: the server commits `Tick(now)` every second.
+  to the object store first and is committed to the log once the store has it; a PUT
+  the store refuses, or does not answer within 30 s, is answered `UNAVAILABLE` and
+  indexes nothing. Farm time is the simulation clock: the server commits `Tick(now)`
+  every second.
 - **Daemons** keep their contact in `kbf_daemon::Contact` (they fence T after the
   newest acknowledged send and open a new stream after a heartbeat gap) and drop the
   leases of an earlier epoch by `kbf_daemon::superseded`. One run in ten lasts longer
   than the grace G.
 - **Clients** ask `FindMissingBlobs` for an action's input, upload it if missing, ask
   again, and `Execute` the action, resending their step every 8 s until answered.
-- **The object store** keeps every object; it loses none.
+- **The object store** keeps every object it accepts and loses none. Its faults
+  (`StoreFault`): it hangs until a time, answers late for a window, fails the next N
+  PUTs or every PUT in a window (keeping nothing), keeps N objects but loses their
+  answers, or keeps N and answers that they failed.
 
 Each run has a kind. **Calm**: only the network's faults (1 % drops, 3 % duplicates,
 3 % reordering, 1 to 50 ms delays). **Restart**: one or two process kills.
@@ -372,7 +379,18 @@ unsynced renames). **IoError**: a filesystem operation fails, the log stops and 
 every commit while the server goes on answering reads, and the machine reboots. A
 server that stopped or died starts again 3 s later over what its disk kept.
 **Partition**: one daemon cut off for 70 s. Every server fault and partition begins by
-60 s, and the run goes on to 210 s.
+60 s, and the run goes on to 210 s. The write path's kinds
+([write-tier-scenarios.md](write-tier-scenarios.md#3-what-kbf-sim-cell-has-today)):
+**StoreOutage** (the store hangs on even seeds and refuses on odd ones, 2 to 10 min),
+**StoreOutageHours** (the same, 60 to 90 min), **StoreSlow**, **StoreErrors**,
+**StoreLostAck**, and **StoreCrash** (the server killed or cut off the n-th time it
+reaches a point of the write path, while the store is slow). Their runs go on 150 s
+past the store's last fault, plus one client retry per counted failure. The local
+write tier's kinds ([write-tier-scenarios.md](write-tier-scenarios.md#4-the-tier-in-the-cell-stage-5-as-built)),
+whose server stages uploads on `kbf-tier` over a second fault-injecting disk and
+flushes them: **TierCalm**, **TierCrash** (a crash at a point of the tier's write or
+flush path), **TierStoreOutage**, **TierStoreOutageHours**, **TierDiskFull**,
+**TierBadBlock** and **TierEviction**.
 
 The properties, checked after every step (7 at the end):
 
@@ -381,13 +399,23 @@ The properties, checked after every step (7 at the end):
    `Bootstrap`.
 2. One run: no operation (term and operation id) has two unfenced runs at once.
 3. Leases kept: no lease is given up while its daemon, heard within T, listed it.
-   Enforced in calm and partition runs only.
+   Enforced in runs without a restart only.
 4. Exactly one result: no result accepted twice, every reported result accepted by
    the end, an action-cache entry exactly for each action with an accepted result.
-   Enforced in calm runs only.
-5. No false present: every blob answered present is in the object store then.
+   Enforced in runs without a restart or a partition only.
+5. No false present: every blob answered present is in the object store then (with
+   the tier, or in its staged block).
 6. Monotone time: farm time never goes back along the durable log or across a restart.
 7. Liveness: every client action is answered by the end.
+8. No false ack: every acknowledged upload is held by the object its PUT wrote, and
+   present in the index at every later step the server is up.
+9. Nothing half-indexed: every blob the index answers present is held by the object
+   its location names.
+10. Ids never move: a blob's location changes only after its object is marked
+    unreachable, and no store object is replaced by other bytes.
+11. to 13., in runs with the tier: its bytes stay within its budget; at each start its
+    directory holds only what the committed state names; at the end nothing is left
+    staged.
 
 Properties 3 and 4 do not hold after a restart until the scheduler's state is in the
 log (ha.md section 16, PRs 11 and 12); a daemon cut off past T may have a result
@@ -407,8 +435,12 @@ code under test, each red in the named sweep:
 | a lease given up although its heartbeat lists it | `kbf-sched` `reconcile` | 3, calm and partition seeds |
 | the action-cache write of a daemon refused | `kbf-meta` `put_action` | 4, calm seeds |
 
+The write path's mutants (planted in the cell's server and store, each red in the
+tests named) are listed in
+[write-tier-scenarios.md](write-tier-scenarios.md#3-what-kbf-sim-cell-has-today).
+
 Not modeled yet: more than one server, membership, snapshots (the metadata log takes
-none), loss faults and collection in the object store (property 5's later clauses),
+none), loss of an object the store kept and collection (property 5's later clauses),
 clock-rate skew (so the "`max(now)` dropped" mutant cannot go red), daemon restarts,
 and a process restart over the page cache after a failed write: `FaultFs` makes a
 later sync durable for the bytes a failed one left, so the hazard `--runtime-dir` is

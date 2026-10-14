@@ -1,4 +1,4 @@
-//! `kbf-cell`: the M1 integration harness's helper (see the `kbf_it` library docs).
+//! `kbf-cell`: the M1 and M2 integration harnesses (see the `kbf_it` library docs).
 //!
 //! Exit codes: 0 done (or the check passed), 1 the check failed, 2 the command could
 //! not run.
@@ -29,6 +29,15 @@ enum Cli {
     /// Runs the test-only daemon (local runtime, no isolation) until SIGINT.
     #[cfg(target_os = "linux")]
     Daemon(kbf_it::daemon::DaemonArgs),
+    /// Runs the M1 exit test: a cell, the sample projects built twice each, a lease
+    /// drained in flight (the `kbf_it::m1` docs say what is checked).
+    #[cfg(target_os = "linux")]
+    M1(kbf_it::m1::M1Args),
+    /// Runs the M2 exit test: buck2 through the server to a container-driver daemon in
+    /// a Delegate=yes unit, two builds, a memory kill's rerun, a lease in a container
+    /// and a daemon killed mid-lease (the `kbf_it::m2` docs say what is checked).
+    #[cfg(target_os = "linux")]
+    M2(kbf_it::m2::M2Args),
     /// Checks a build and its rebuild after a clean: all remote, then all cache hits.
     Check {
         #[arg(long, value_enum)]
@@ -53,6 +62,10 @@ fn main() -> ExitCode {
         },
         #[cfg(target_os = "linux")]
         Cli::Daemon(args) => daemon(args),
+        #[cfg(target_os = "linux")]
+        Cli::M1(args) => cell(kbf_it::m1::run(&args)),
+        #[cfg(target_os = "linux")]
+        Cli::M2(args) => cell(kbf_it::m2::run(&args)),
         Cli::Check {
             tool,
             first,
@@ -72,6 +85,18 @@ fn main() -> ExitCode {
             } else {
                 ExitCode::FAILURE
             }
+        }
+    }
+}
+
+/// The exit status of a cell test, its error on stderr.
+#[cfg(target_os = "linux")]
+fn cell(result: Result<(), kbf_it::CellError>) -> ExitCode {
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("kbf-cell: {e}");
+            ExitCode::from(e.exit_code())
         }
     }
 }

@@ -13,28 +13,41 @@
 //!   fails), `Welcome` naming the log id as the lease epoch. Both live in memory, so a
 //!   restart loses them, as the server does today.
 //! - **Writes** go to the object store first; the blob is committed to the log once
-//!   the store has it, and only then is the client told.
+//!   the store has it, and only then is the client told. A PUT the store answers as
+//!   failed, or not answered within [`PUT_TIMEOUT`], is answered `UNAVAILABLE`
+//!   (`UploadFailed`) and indexes nothing, even if the store answers it later; the
+//!   client's retry is a new PUT under a new object id.
 //! - **Faults** ([`ServerFault`]): a process kill, a power cut (now, or part-way
-//!   through a later filesystem operation), and an I/O error, after which the log
+//!   through a later filesystem operation), a crash at a named point of the write path
+//!   ([`StorePoint`], armed in a [`CrashPlan`]), and an I/O error, after which the log
 //!   refuses every commit while the server goes on answering reads from its applied
 //!   state. A server that has stopped or died starts again after
 //!   [`ServerPlan::down_for`] over what the disk kept; a server whose log stopped
 //!   starts again after its machine reboots.
+//! - **The local write tier** ([`TierPlan`], `server/tier.rs`), when the plan has one:
+//!   `kbf-tier`'s [`kbf_tier::Tier`] on a second fault-injecting disk, attached at each
+//!   start as `kbf-front`'s `Cache::attach_tier` attaches it (the log raised to
+//!   machine version 2 first). Uploads are staged and acknowledged once synced and
+//!   indexed; a flusher seals, PUTs each sealed block whole and commits
+//!   `ObjectFlushed` every [`TICK`]; reads of present blobs are served from the tier or
+//!   the store. A crash or power cut takes both disks down together.
 
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::future::Future;
 use std::num::NonZeroU64;
 use std::pin::pin;
+use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use std::task::{Context, Poll, Waker};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use kbf_daemon::FENCE_AFTER;
 use kbf_front::MetaLog;
 use kbf_log::FarmLogId;
 use kbf_meta::{
-    ActionAnswer, ActionRecord, Applied, Closure, Command, Epoch, Location, MetaState, ObjectId,
-    Retention, Role, StoreId,
+    ActionAnswer, ActionRecord, Applied, Closure, Command, Epoch, MetaState, ObjectId, Retention,
+    Role,
 };
 use kbf_sched::{DaemonInstance, Event as SchedEvent, Input, OpState, Request, Scheduler};
 use kbf_server::RaftMetaLog;
@@ -47,8 +60,13 @@ use kbf_types::{
     StartLease, StateMachine, WaiterId, WorkerId,
 };
 
+mod tier;
+mod write;
+
+pub use self::tier::{Rollback, TierCut, TierPlan, TierSeen};
 use crate::Msg;
-use crate::replica::{self, Broken};
+use crate::hook::{CrashPlan, Down, StorePoint, TierPoint};
+use crate::replica::{self, Broken, Replica};
 
 /// How often the server commits farm time and runs a placement round.
 pub const TICK: Duration = Duration::from_secs(1);
@@ -57,6 +75,13 @@ pub const HEARTBEAT: Duration = Duration::from_secs(5);
 const T_TICK: u64 = 0;
 const T_START: u64 = 1;
 const T_FAULT: u64 = 1 << 16;
+/// A PUT's deadline: this plus the server's count of PUTs sent.
+const T_PUT: u64 = 1 << 32;
+/// A read of a present blob: this plus the server's count of reads.
+const T_READ: u64 = 1 << 48;
+/// How long the server waits for the store to answer a PUT (the object store client's
+/// request timeout) before it answers the upload `UNAVAILABLE`.
+pub const PUT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// A fault the server meets.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -72,6 +97,25 @@ pub enum ServerFault {
     PowerCutAt { after: u64, keep: usize, names: u64 },
     /// The `after`-th filesystem operation from now fails: the log stops.
     IoErrorAt { after: u64 },
+    /// From now, the `nth` time the write path reaches `point`, the server goes `down`.
+    CrashAt {
+        point: StorePoint,
+        nth: u32,
+        down: Down,
+    },
+    /// From now, the `nth` time the write tier reaches `point`, the server goes `down`.
+    TierCrashAt {
+        point: TierPoint,
+        nth: u32,
+        down: Down,
+    },
+    /// The `after`-th operation on the tier's disk from now meets `fault`: a full disk
+    /// ([`Fault::NoSpace`], below the tier's budget: other tenants filled it) or an I/O
+    /// error ([`Fault::Error`]).
+    TierDiskAt { after: u64, fault: Fault },
+    /// A bad sector: one byte of the oldest staged block, in a committed record, is
+    /// flipped on the disk.
+    TierFlip,
 }
 
 /// When the server meets its faults, and how long it stays down after each.
@@ -79,6 +123,8 @@ pub enum ServerFault {
 pub struct ServerPlan {
     pub faults: Vec<(FarmTime, ServerFault)>,
     pub down_for: Duration,
+    /// The local write tier, if the server runs one.
+    pub tier: Option<TierPlan>,
 }
 
 /// What the server did that the checks read.
@@ -96,20 +142,69 @@ pub struct Seen {
     /// How many times the server opened its log, and each refusal.
     pub starts: u64,
     pub refused: Vec<(FarmTime, String)>,
+    /// Every digest a client asked to store.
+    pub uploaded: BTreeSet<Digest>,
+    /// Each upload acknowledged: when, the blob, and the object its PUT wrote.
+    pub acked: Vec<(FarmTime, Digest, ObjectId)>,
+    /// Each crash point that took the server down, and when: a point is recorded
+    /// where it fires (an in-commit crash once its disk fault has failed the `PutBlob`
+    /// commit, not when it is planted).
+    pub crashed_at: Vec<(FarmTime, StorePoint)>,
+    /// Each PUT whose deadline answered its upload `UNAVAILABLE`.
+    pub timed_out: BTreeSet<ObjectId>,
+    /// Each PUT the store answered failed while its upload waited.
+    pub put_failed: BTreeSet<ObjectId>,
+    /// Each `PutBlob` commit a crash cut part-way through, and what the next start
+    /// found of it.
+    pub cuts: Vec<Cut>,
+    /// What the local write tier did.
+    pub tier: TierSeen,
+}
+
+/// A `PutBlob` commit a crash cut part-way through ([`StorePoint::InCommit`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Cut {
+    pub object: ObjectId,
+    pub digest: Digest,
+    /// How the server went down.
+    pub down: Down,
+    /// The most unsynced bytes any file held when it did ([`FaultFs::unsynced`]): a
+    /// power cut keeping fewer, and more than none, tears the commit's record.
+    pub unsynced: usize,
+    /// Whether the next start's index has the blob in `object`: `None` until it
+    /// starts.
+    pub survived: Option<bool>,
 }
 
 /// The server node.
 pub struct Server {
     plan: ServerPlan,
     disk: FaultFs,
+    /// The local write tier's directory, on a disk of its own.
+    tier_disk: FaultFs,
+    /// The instant farm time 0 stands for: the tier's clock is farm time.
+    base: Instant,
     runtime: tokio::runtime::Runtime,
     up: Option<Up>,
-    /// A planned power cut, armed in the disk: what it keeps.
-    armed: Option<(usize, u64)>,
+    /// A planned crash, armed in the disk: how the server goes down there.
+    armed: Option<Down>,
+    /// The write path's crash points.
+    hooks: CrashPlan<StorePoint>,
+    /// The write tier's crash points.
+    tier_hooks: CrashPlan<TierPoint>,
+    /// A crash point reached in this input: the out queue's length then, and how the
+    /// server goes down.
+    dying: Option<(usize, Down)>,
+    /// PUTs sent, over every start: each PUT's deadline timer is tagged with it.
+    puts_sent: u64,
+    /// Reads started, over every start: each read's timer is tagged with it.
+    reads_sent: u64,
     restarting: bool,
     store: NodeId,
     /// What the last property-1 check saw: (incarnation, applied index, disk ops).
     checked: Cell<Option<(u64, u64, u64)>>,
+    /// The last property-1 check's replica, and the incarnation it was read in.
+    replica: Cell<Option<(u64, Replica)>>,
     pub seen: Seen,
     out: Vec<Output<Msg>>,
 }
@@ -120,7 +215,8 @@ struct Up {
     /// The out queue's length when a commit failed, if one has.
     failed_at: Option<usize>,
     writer: Epoch,
-    next_object: u64,
+    /// The next object's sequence number in `writer`, shared with the tier's blocks.
+    next_object: Arc<AtomicU64>,
     lease_epoch: u64,
     sched: Scheduler,
     machine: FarmMachine,
@@ -128,6 +224,10 @@ struct Up {
     heard: BTreeMap<WorkerId, (FarmTime, Vec<LeaseId>)>,
     callers: BTreeMap<WaiterId, NodeId>,
     uploads: BTreeMap<ObjectId, (NodeId, Digest)>,
+    /// Each PUT waiting for the store, by its deadline timer's tag.
+    deadlines: BTreeMap<u64, ObjectId>,
+    /// The local write tier, once attached.
+    tier: Option<tier::CellTier>,
 }
 
 /// Polls `future` once: the metadata log answers without waiting.
@@ -140,6 +240,11 @@ fn ready<F: Future>(future: F) -> F::Output {
         Poll::Ready(v) => v,
         Poll::Pending => unreachable!("the metadata log answers without waiting"),
     }
+}
+
+/// A new log's id draw that draws `id`.
+fn drawn(id: FarmLogId) -> impl FnOnce() -> std::io::Result<FarmLogId> {
+    move || Ok(id)
 }
 
 fn wall(t: FarmTime) -> SystemTime {
@@ -181,12 +286,20 @@ impl Server {
         Self {
             plan,
             disk: FaultFs::new(),
+            tier_disk: FaultFs::new(),
+            base: Instant::now(),
             runtime,
             up: None,
             armed: None,
+            hooks: CrashPlan::default(),
+            tier_hooks: CrashPlan::default(),
+            dying: None,
+            puts_sent: 0,
+            reads_sent: 0,
             restarting: false,
             store,
             checked: Cell::new(None),
+            replica: Cell::new(None),
             seen: Seen::default(),
             out: Vec::new(),
         }
@@ -220,9 +333,18 @@ impl Server {
             return Ok(());
         }
         let entries = replica::durable_entries(self.disk.crash(0))?;
-        let replica = replica::replay(&entries, applied)?;
+        let starts = self.seen.starts;
+        let mut replica = self
+            .replica
+            .take()
+            .filter(|(s, r)| *s == starts && r.extends(&entries))
+            .map(|(_, r)| r)
+            .unwrap_or_default();
+        replica.advance(&entries, applied)?;
         let live = ready(up.log.query(MetaState::clone)).expect("a query is never refused");
-        replica::same_as_live(&replica, &live, up.log.log_id())
+        let held = replica::same_as_live(&replica.state, &live, up.log.log_id());
+        self.replica.replace(Some((starts, replica)));
+        held
     }
 
     fn timer(&mut self, after: Duration, tag: u64) {
@@ -239,7 +361,7 @@ impl Server {
                 self.disk.clone(),
                 Retention::default(),
                 "cell/",
-                move || Ok(log_id),
+                drawn(log_id),
             ))
         };
         self.seen.starts += 1;
@@ -253,10 +375,10 @@ impl Server {
         };
         let leadership = log.leadership().expect("a raft log names its term");
         let Ok(Applied::Epoch(writer)) = ready(log.commit(Command::AllocEpoch)) else {
-            self.down(None);
+            self.down(Down::Kill);
             return;
         };
-        self.up = Some(Up {
+        let up = Up {
             lease_epoch: leadership.log_id.get(),
             sched: Scheduler::new(leadership.term).recording_requeues(),
             machine: FarmMachine::new(leadership.term),
@@ -264,12 +386,25 @@ impl Server {
             stopped: false,
             failed_at: None,
             writer,
-            next_object: 0,
+            next_object: Arc::new(AtomicU64::new(0)),
             streams: BTreeMap::new(),
             heard: BTreeMap::new(),
             callers: BTreeMap::new(),
             uploads: BTreeMap::new(),
-        });
+            deadlines: BTreeMap::new(),
+            tier: None,
+        };
+        write::read_back_cuts(&up, &mut self.seen.cuts);
+        self.up = Some(up);
+        match self.attach_tier(now) {
+            Ok(()) => {}
+            Err(None) => self.down(Down::Kill),
+            Err(Some(refused)) => {
+                self.up = None;
+                self.seen.refused.push((now, refused));
+                self.restart_later();
+            }
+        }
     }
 
     fn restart_later(&mut self) {
@@ -278,44 +413,64 @@ impl Server {
         }
     }
 
-    /// The process dies: after a power cut keeping `cut`, or killed.
-    fn down(&mut self, cut: Option<(usize, u64)>) {
+    /// The process dies: killed, or in a power cut.
+    fn down(&mut self, how: Down) {
         self.up = None;
         self.armed = None;
-        self.disk = match cut {
-            Some((keep, names)) => self.disk.crash_reordered(keep, names),
-            None => self.disk.restart(),
+        (self.disk, self.tier_disk) = match how {
+            Down::PowerCut { keep, names } => (
+                self.disk.crash_reordered(keep, names),
+                self.tier_disk.crash_reordered(keep, names),
+            ),
+            Down::Kill => (self.disk.restart(), self.tier_disk.restart()),
         };
         self.restart_later();
     }
 
     fn fault(&mut self, fault: ServerFault) {
         match fault {
-            ServerFault::Kill if self.up.is_some() => self.down(None),
+            ServerFault::Kill if self.up.is_some() => self.down(Down::Kill),
             ServerFault::PowerCut { keep, names } if self.up.is_some() => {
-                self.down(Some((keep, names)));
+                self.down(Down::PowerCut { keep, names });
             }
             ServerFault::PowerCutAt { after, keep, names } if self.up.is_some() => {
                 self.disk.fail_at(self.disk.ops() + after, Fault::Crash);
-                self.armed = Some((keep, names));
+                self.armed = Some(Down::PowerCut { keep, names });
             }
+            ServerFault::CrashAt { point, nth, down } => self.hooks.arm(point, nth, down),
             ServerFault::IoErrorAt { after } if self.up.is_some() => {
                 self.disk.fail_at(self.disk.ops() + after, Fault::Error);
             }
+            ServerFault::TierCrashAt { point, nth, down } => {
+                self.tier_hooks.arm(point, nth, down);
+            }
+            // Both act on what is there: a full disk counts operations from now, up or
+            // down; a bad sector needs a staged block.
+            ServerFault::TierDiskAt { after, fault } => {
+                let at = self.tier_disk.ops() + after;
+                self.tier_disk.fail_at(at, fault);
+            }
+            ServerFault::TierFlip => self.flip_a_staged_record(),
             _ => {}
         }
     }
 
-    /// After an input: a commit that failed at a planned power cut kills the process
-    /// (nothing it queued after the failure leaves it); one that failed otherwise has
-    /// stopped the log, and the server is restarted after `down_for`.
+    /// After an input: a crash point reached kills the process there, and a commit
+    /// that failed at a planned crash kills it at the failure (nothing it queued after
+    /// either leaves it); a commit that failed otherwise has stopped the log, and the
+    /// server is restarted after `down_for`.
     fn settle_failure(&mut self) {
+        if let Some((at, how)) = self.dying.take() {
+            self.out.truncate(at);
+            self.down(how);
+            return;
+        }
         let Some(at) = self.up.as_mut().and_then(|up| up.failed_at.take()) else {
             return;
         };
-        if let Some(cut) = self.armed.take() {
+        if let Some(how) = self.armed.take() {
             self.out.truncate(at);
-            self.down(Some(cut));
+            self.down(how);
         } else {
             self.restart_later();
         }
@@ -586,26 +741,6 @@ impl Up {
 
     fn receive(&mut self, now: FarmTime, from: &NodeId, msg: Msg, cx: &mut Cx<'_>) {
         match msg {
-            Msg::Upload { digest } => {
-                let object = ObjectId::new(self.writer, self.next_object);
-                self.next_object += 1;
-                self.uploads.insert(object, (from.clone(), digest));
-                cx.send(cx.store.clone(), Msg::Put { object, digest });
-            }
-            Msg::PutDone { object, digest } => {
-                let Some((client, _)) = self.uploads.remove(&object) else {
-                    return;
-                };
-                let location = Location {
-                    store: StoreId::new(0),
-                    object,
-                    offset: 0,
-                };
-                let put = Command::PutBlob { digest, location };
-                if let Some(Applied::Blob(Ok(_))) = self.commit(cx.out, put) {
-                    cx.send(client, Msg::Uploaded { digest });
-                }
-            }
             Msg::FindMissing { digests } => {
                 let missing = self.query(|m| m.find_missing(&digests)).missing;
                 for digest in digests.iter().filter(|d| !missing.contains(d)) {
@@ -643,7 +778,6 @@ impl Up {
 struct Cx<'a> {
     out: &'a mut Vec<Output<Msg>>,
     seen: &'a mut Seen,
-    store: &'a NodeId,
 }
 
 impl Cx<'_> {
@@ -675,11 +809,11 @@ impl StateMachine for Server {
                     let mut cx = Cx {
                         out: &mut self.out,
                         seen: &mut self.seen,
-                        store: &self.store,
                     };
                     up.commit(cx.out, Command::Tick(now));
                     up.feed(now, SchedEvent::Tick, &mut cx);
                 }
+                self.flush_round(now);
             }
             Event::Timer { tag: T_START } => {
                 self.restarting = false;
@@ -689,23 +823,34 @@ impl StateMachine for Server {
                     // back a write whose sync failed; `--runtime-dir` is planned to
                     // refuse that (docs/deploy/storage-node.md).
                     self.disk = self.disk.crash(0);
+                    self.tier_disk = self.tier_disk.crash(0);
                 }
                 self.start(now, input.entropy);
             }
+            Event::Timer { tag } if tag >= T_READ => self.read_due(now, tag),
+            Event::Timer { tag } if tag >= T_PUT => self.put_deadline(now, tag),
             Event::Timer { tag } => {
                 let index = usize::try_from(tag - T_FAULT).expect("a fault index");
                 let fault = self.plan.faults[index].1;
                 self.fault(fault);
             }
             Event::Message { from, msg } => {
-                if let Some(up) = self.up.as_mut() {
+                // The write path and the tier, then reads and the farm core.
+                let asked = match &msg {
+                    Msg::FindMissing { digests } => digests.clone(),
+                    _ => Vec::new(),
+                };
+                let rest = self
+                    .write_path(now, &from, msg)
+                    .and_then(|msg| self.tier_path(now, msg));
+                if let (Some(msg), Some(up)) = (rest, self.up.as_mut()) {
                     let mut cx = Cx {
                         out: &mut self.out,
                         seen: &mut self.seen,
-                        store: &self.store,
                     };
                     up.receive(now, &from, msg, &mut cx);
                 }
+                self.start_reads(&asked);
             }
         }
         self.settle_failure();
@@ -731,6 +876,7 @@ mod tests {
         let plan = ServerPlan {
             faults,
             down_for: Duration::from_secs(3),
+            tier: None,
         };
         Server::new(plan, NodeId::from("store"))
     }

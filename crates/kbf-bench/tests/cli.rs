@@ -2,7 +2,8 @@
 //!
 //! Catches: the table or the JSON not written, or not the report of the run; the exit
 //! status not 0 for a complete run, 1 for an incomplete one, 2 for one that could not
-//! start (with the cause named); `read` without the upload's seed; no progress line.
+//! start (with the cause named); `read` without the upload's seed; no progress line, or
+//! one without its elapsed time (the time is bounded by the run's, not pinned: #602).
 
 mod support;
 
@@ -38,6 +39,35 @@ fn scratch(name: &str) -> PathBuf {
 
 fn text(bytes: &[u8]) -> &str {
     std::str::from_utf8(bytes).expect("UTF-8")
+}
+
+/// The elapsed seconds of the first progress line in `stderr`, which must read
+/// `kbf-bench: <n>.<d> s: <counts>...`: the time with one decimal, then `counts`.
+/// The time itself is wall clock (how long setup took before the first tick), so the
+/// caller bounds it rather than pinning it.
+fn first_progress_secs(stderr: &str, counts: &str) -> f64 {
+    let line = stderr
+        .lines()
+        .find(|l| l.starts_with("kbf-bench: "))
+        .unwrap_or_else(|| panic!("no progress line in {stderr:?}"));
+    let rest = &line["kbf-bench: ".len()..];
+    let (secs, after) = rest
+        .split_once(" s: ")
+        .unwrap_or_else(|| panic!("no elapsed time in {line:?}"));
+    let (whole, tenths) = secs
+        .split_once('.')
+        .unwrap_or_else(|| panic!("time {secs:?} has no decimal in {line:?}"));
+    assert!(
+        !whole.is_empty()
+            && tenths.len() == 1
+            && whole
+                .bytes()
+                .chain(tenths.bytes())
+                .all(|b| b.is_ascii_digit()),
+        "time {secs:?} is not <n>.<d> in {line:?}"
+    );
+    assert!(after.starts_with(counts), "{line:?}");
+    secs.parse().expect("seconds")
 }
 
 const SMALL: [&str; 8] = [
@@ -85,13 +115,14 @@ async fn upload_then_read_writes_the_table_and_the_json() {
         "{table}"
     );
     assert!(table.contains("\nwrite               54 "), "{table}");
-    assert!(
-        text(&out.stderr).contains("kbf-bench: 0.0 s: 0/54 requests, 0/54 blobs"),
-        "{}",
-        text(&out.stderr)
-    );
-
     let report: Value = serde_json::from_slice(&std::fs::read(&json).expect("json")).expect("JSON");
+    let first = first_progress_secs(text(&out.stderr), "0/54 requests, 0/54 blobs, 0.0 MB");
+    // Rounded to one decimal, so up to 0.05 s past the run's wall time.
+    let wall = report["wall_secs"].as_f64().expect("wall_secs");
+    assert!(
+        first <= wall + 0.05,
+        "first line at {first} s, run took {wall} s"
+    );
     assert_eq!(report["command"], "upload");
     assert_eq!(report["method"], "bytestream");
     assert_eq!(report["seed"], 7);

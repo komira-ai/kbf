@@ -150,7 +150,15 @@ fn an_output_past_the_byte_limit_is_refused_in_bounded_memory() {
         let cas = MemoryCas::new();
         let mut result = ActionResult::default();
         let outputs = ["out".to_owned()];
-        runtime.block_on(collect(&cas, &upper, "", &outputs, limits, &mut result))
+        runtime.block_on(collect(
+            &cas,
+            &upper,
+            std::path::Path::new(env!("CARGO_TARGET_TMPDIR")),
+            "",
+            &outputs,
+            limits,
+            &mut result,
+        ))
     });
     assert!(
         matches!(
@@ -174,9 +182,10 @@ fn an_output_past_the_byte_limit_is_refused_in_bounded_memory() {
 fn a_stdout_past_its_limit_is_refused_in_bounded_memory() {
     let fake = Fake::new("memory-stdout");
     let spec = Spec::new(&image(), "unused");
-    let script = format!(r#"truncate -s {LARGE} "$(dirname "$ROOT")/stdout""#);
+    let large = LARGE.to_string();
+    let steps = ["truncate", "$ROOT/../stdout", large.as_str()];
     let runtime = runtime();
-    let (outcome, peak) = peak_during(|| runtime.block_on(fake.run(1, &spec, &script)));
+    let (outcome, peak) = peak_during(|| runtime.block_on(fake.run(1, &spec, &steps)));
     assert!(
         matches!(outcome, Err(RuntimeError::Failed(ref why))
             if why.contains("/stdout: ") && why.contains("--output-max-stdio-bytes")),

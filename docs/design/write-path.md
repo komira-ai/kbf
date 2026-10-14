@@ -3,10 +3,11 @@
 How bytes get from an upload into the store, and what an acknowledgement promises.
 Today's path is in [storage.md](storage.md#writes). Built: **write grouping**
 (section 3: concurrent small REAPI uploads share one segment, PUT and metadata commit;
-`kbf-front/src/cache/write_group.rs`). **Planned**: **segment upload** (the daemon
-sends an action's outputs as whole segments over the worker listener, with one commit),
-and a **local write tier** (segments synced to a server's NVMe or SSD, acknowledged,
-and flushed to the object store in the background).
+`kbf-front/src/cache/write_group.rs`) and the **local write tier** (section 6: segments
+synced to a server's NVMe or SSD, acknowledged, and flushed to the object store in the
+background; section 6.7 says how it was built and where it differs). **Planned**:
+**segment upload** (the daemon sends an action's outputs as whole segments over the
+worker listener, with one commit).
 
 ## 1. The problem, measured
 
@@ -165,6 +166,50 @@ group thousands of single-blob calls, it builds the segments itself and uploads 
 one unit. This is kbf-specific and served only on the worker listener, under its
 admission rules ([worker-protocol.md](worker-protocol.md#blobs-on-the-worker-listener)).
 
+**Built (rollout stage 2), direct path only.** The service is
+`kbf.worker.v1.Segments` (`crates/kbf-proto/proto/kbf/worker/v1/segments.proto`,
+served by `crates/kbf-front/src/segments.rs`); the daemon's side is `Spool` and
+`Cas::put_spool` in `kbf-transfer` (`spool.rs`, `segments.rs`), and the native driver
+stores its outputs that way. Where the code differs from the text below:
+
+- The daemon spools every output as its walk stores it, and asks FindMissing for the
+  whole spool afterwards: the walk reads and hashes a file in one pass, so a blob the
+  server already holds costs a local copy, not a send.
+- The daemon splits uploads at 1 GiB + 1 MiB (`SEGMENT_UPLOAD_BYTES`), the smallest
+  `--segment-upload-max-bytes` a server starts with, so every server admits them and
+  the daemon needs no flag for the server's cap.
+- `Begin` is admitted for its whole length by the cache's `--write-bytes-in-flight`
+  (section 3.3), the bound ByteStream and batch uploads share, and the server refuses
+  to start with `--segment-upload-max-bytes` over it, or over the 4 GiB - 1 one
+  admission counts (`MAX_ADMISSION_BYTES`, a semaphore's most permits per call), so a
+  `Begin` never holds more than the bound counts for it. Each segment of a commit is
+  stored as a grouped segment is: under a `--write-puts-in-flight` slot, its PUT
+  retried under a new key (section 3.4), its footer read back; the one `PutBlobs` is
+  timed as a segment commit.
+- The idle time is `--segment-upload-idle-secs`. `Commit`'s reply lists the digests
+  committed; a failed commit is the call's status.
+- An upload's connection is found by the peer address of the worker listener's
+  tracked connections (`Connections`); a connection's close is seen when the server
+  drops its stream.
+- `Locate` and `ReadRange` are served, and the daemon's coalescing reader
+  (`Scope::read_located`) is built and tested, but cache fills do not use it yet.
+- The container driver asks `Cas::missing` once for every digest of a lease's outputs
+  (the files, every Directory, the Tree), copies only the missing blobs into a spool in
+  the lease's scratch directory, `--transfer-in-flight` files open at a time, and
+  stores the spool with `put_spool`. A digest `missing` answered is not asked again by
+  the spool's upload. Its stdout and stderr are still stored blob by blob.
+- A retried upload (4.2) does not ask FindMissing again: it sends a fresh `Begin` of
+  the same plan. Blobs a lost-reply commit already indexed are sent and stored again,
+  and `PutBlobs` keeps the existing entry, so a retry costs bytes, not correctness.
+- There is no `Abort`. An attempt that failed before its `Commit` (a `PutRange` call
+  failed) keeps its admission until its connection closes or it goes idle
+  (`--segment-upload-idle-secs`, default 60 s). With the default bound of 2 GiB, the
+  retry's `Begin` of a large upload, and other uploads of any kind, can wait that
+  long. A failed `Commit` returns its admission when it ends.
+- The spool copies the whole output set onto the daemon's scratch disk, with no size
+  limit of its own, including blobs the server already holds: an action's outputs take
+  twice their size on scratch until the upload ends.
+
 ### 4.1 Shape
 
 1. The daemon hashes every output file (it already does, to build the `ActionResult`)
@@ -207,8 +252,8 @@ the commit is indexed once; its new record is dead bytes, reclaimed with the seg
 
 - **Caps.** `--segment-upload-max-bytes` is at least one `MAX_BLOB_BYTES` record and its
   footer (1 GiB + 1 MiB). Without the tier, ranges are held in memory, so the server
-  refuses to start unless the cap is at most `--write-bytes-in-flight` (default cap
-  1 GiB + 1 MiB). With the tier on, ranges go to disk as they arrive, so the cap may be
+  refuses to start unless the cap is at most `--write-bytes-in-flight` and at most
+  4 GiB - 1, the most one admission counts (default cap 1 GiB + 1 MiB). With the tier on, ranges go to disk as they arrive, so the cap may be
   high: default 16 GiB, and the server refuses to start unless it is at most
   `--write-tier-bytes`. Either way a legal `Begin` is always admitted.
   `MAX_UPLOAD_RECORDS` (16,384) bounds `Begin`'s message (16,384 entries of 52 B, about
@@ -222,7 +267,7 @@ the commit is indexed once; its new record is dead bytes, reclaimed with the seg
   (`pwrite`), and the permit covers only ranges in flight. A commit turns the
   reservation into staged bytes; a drop releases it.
 - An upload belongs to the worker connection that called `Begin`. When it closes, or
-  after `--segment-upload-idle` (default 60 s) with no call, an upload that is still
+  after `--segment-upload-idle-secs` (default 60 s) with no call, an upload that is still
   **receiving** is dropped: its permit and reservation are released and its tier file
   deleted. Nothing points at it. An upload that is **committing** is never dropped: the
   commit runs in its own task, detached from the connection and from the `Commit`
@@ -415,8 +460,11 @@ older binary already refuses them: an unset command decodes as
 `DecodeError::UnknownCommand` (`kbf-log/src/meta.rs`), the Raft machine stops on it
 (`kbf-server/src/raft_log/machine.rs`), and opening the log returns
 `RaftLogError::Decode` (`decoded`, `raft_log/mod.rs`). This binary refuses them under
-format 1 the same way, on encode and decode; the metadata log still reads and writes
-format 1 only, so PR 4 must raise the log's format before its first `AddTier`. Tests in
+format 1 the same way, on encode and decode. A Raft log enters format 2 by one
+committed `MachineVersion` entry naming machine version 2 (`kbf_log::MachineVersion::V2`,
+whose format is `Format::V2`), which `RaftMetaLog::raise_machine_version` commits
+(rollout stage 5, section 6.8); every later entry is encoded and decoded as format 2,
+and a binary that runs only version 1 refuses the log at that entry. Tests in
 `kbf-log/tests/tier_codec.rs` and `kbf-server/tests/raft_log.rs` pin both. The snapshot
 encoding ([metadata-snapshots.md](metadata-snapshots.md)), not built yet, gains the
 staged table, the tier registry and the record of objects that left.
@@ -434,6 +482,88 @@ floor, and the rest for lease scratch and the OS. A daemon miss for a blob stage
 that server's local tier over loopback, no object store and no LAN. On a filesystem
 with reflink (XFS, btrfs) a later step may clone the byte range into the cache file
 (`FICLONERANGE`) instead of copying it.
+
+### 6.7 As built (rollout stage 4b)
+
+The disk layer is `kbf-tier`; the rest is `kbf-front` (`cache/tier.rs`, `cache/flush.rs`)
+and `kbf-server` (`write_tier.rs`). `Cache::attach_tier` is section 6.4's start: the
+abandon flag, the `TIER` check and orphan sweep (`Tier::open` against a copy of the
+committed staged table), `AddTier` after `TIER` is synced, and each lost block marked
+`Missing`. The write group's settle offers each sealed segment to `Writer::stage`
+(reserve, write, sync, `PutStaged`) and PUTs it when the tier does not take it. `Cache::flush_tier` is one round of 6.1.4: `SealStaged` for
+each block `poll_seals` names, then up to four sealed objects of this tier from the
+committed state, oldest first, each re-read and checked, given its footer
+(`kbf_segments::layout::encode_footer` over the committed list), PUT at its key, its
+footer read back, `ObjectFlushed` committed, and only then renamed to `.seg`. The
+server runs a round every second. Tests: `kbf-front/tests/write_tier.rs` (the tier rows
+of section 9 except the log-format row, which stage 3 pins), `kbf-tier/tests/flushed.rs`.
+
+Where it differs from the sections above, and why:
+
+- **`--meta-log=raft` is refused with `--write-tier-dir`.** When stage 4b was built the
+  Raft log wrote format 1 and the format raise was not built
+  ([metadata-snapshots.md](metadata-snapshots.md), section 4, leaves its value to the HA
+  design). Stage 5 (section 6.8) builds the raise and runs the tier over the Raft log in
+  `kbf-sim-cell`; the server still refuses the pair until the known gap below is closed. Under `--meta-log=memory` a restart
+  starts with an empty index whose writer epochs start from 1 again, so the server
+  deletes every file an earlier start left in the directory (`kbf_tier::clear`) before
+  the open: none of it is indexed, and an old block's name could be one of the new
+  start's objects. The recovery above is tested over a metadata log that outlives the
+  cache; it protects data in production once the raise lands.
+- **Grouped writes reach the tier through the group's settle.** Each segment the
+  write group seals (section 3) is staged as one range of the open block, with one
+  `PutStaged`, before any PUT slot is taken; a segment the tier does not take is PUT as
+  before. A blob written as a segment of its own gets a block of its own
+  (`reserve_upload`, sealed by its `PutStaged`), buffered whole as on the direct path;
+  streaming it into its block (section 6.2) is not built. Segment uploads (stage 2)
+  are not merged; a `Begin` will reserve through the same `reserve_upload`. A segment
+  with no blob (the open one a blob too large for it leaves behind) is neither staged
+  nor PUT.
+- **Any tier error before the commit goes direct**, not only the budget: `ENOSPC` or an
+  I/O error on create, write or sync drops the reservation (deleting an upload's block)
+  and PUTs the segment (the scenarios' question on `ENOSPC` below the budget).
+- **A read error in the flusher's re-read is retried** with the PUT backoff (1 s,
+  doubling to 60 s); only a digest mismatch marks the object `Corrupt`.
+- **Flushed copies live in what the budget leaves over.** A `.seg` is kept while the
+  staged and reserved bytes plus the copies fit `--write-tier-bytes`; a reservation
+  evicts copies, least recently read first, before it is refused. So the directory's
+  bytes stay within the budget.
+- **A new tier's id is the writer epoch of the start that registers it**: epochs are
+  allocated once each, so no id is drawn twice, and no random source is needed.
+- **The oldest unflushed age** of a block recovered at a restart counts from that
+  restart.
+- **One known gap:** a `PutStaged` whose commit applies but answers an error leaves the
+  tier's committed length below the index's; that block's flush then fails each round.
+  Only a log that can apply a command and lose the answer (the Raft log) can do it, and
+  that log is refused with the tier today; wiring the raise must also seed the length
+  from the committed state.
+
+### 6.8 As built (rollout stage 5: the tier in the cell)
+
+`kbf-sim-cell` runs the tier over the Raft log, with the scenarios of
+[write-tier-scenarios.md](write-tier-scenarios.md) that stage 4b makes testable
+(section 4 of that file lists each test and the planted defect it caught).
+
+- **The format raise.** A log is raised by one `MachineVersion` entry: machine version
+  2 implies format 2 (the entry carries the version alone; metadata-snapshots.md
+  section 4 left the choice open). `RaftMetaLog::raise_machine_version(V2)` commits
+  it if the log is below 2 and commits nothing otherwise; the metadata machine replays
+  it on every start, so the format comes from the log, never from the process. A new
+  log stays at version 1 until something raises it: a server that never attaches a
+  tier writes a log an older binary still reads. `RaftMetaLog::open_running(.., runs)`
+  opens as a binary that runs versions up to `runs` would; the server runs
+  `raft_log::RUNS` (version 2). A version past `runs`, committed or asked for, is
+  refused.
+- **The cell's server attaches the tier at each start** as `Cache::attach_tier` does,
+  after the raise, and stages, flushes and reads as `cache/tier.rs` and
+  `cache/flush.rs` do, over `kbf-tier`'s `Tier` on a second `FaultFs` that a crash
+  takes down with the raft disk. The cell drives `kbf-tier`, `kbf-meta` and
+  `RaftMetaLog` themselves; the order of steps in `kbf-front`'s cache (sync before
+  `PutStaged`, `ObjectFlushed` before the rename) is the cell's copy of it, because the
+  cell polls each future once and `kbf-front`'s tier calls run on the blocking pool.
+- **`kbf-server` still refuses `--meta-log=raft` with `--write-tier-dir`**: the known
+  gap of section 6.7 (a `PutStaged` applied whose answer was lost) needs the tier's
+  committed lengths seeded from the committed state before the pilot runs the pair.
 
 ## 7. Expected effect on the 15,189-file upload
 
@@ -465,7 +595,7 @@ Estimates from the measured store latency, to be measured on the pilot at each s
 2. **PR 2, segment upload**: the `Segments` service on the worker listener (`Begin`,
    `PutRange`, `Commit`, `Locate`, `ReadRange`) in `kbf-proto` and `kbf-front`, and the
    daemon's spool, split, upload and fallback in `kbf-daemon`/`kbf-outputs`. Flags:
-   `--segment-upload-max-bytes`, `--segment-upload-streams`, `--segment-upload-idle`.
+   `--segment-upload-max-bytes`, `--segment-upload-streams`, `--segment-upload-idle-secs`.
    Direct path only. Downloads through the transfer engine follow it.
 3. **PR 3, tier metadata**: the five commands in `kbf-meta` and `kbf-log`, the staged
    table, `BlobAnswer::Present { staged_on }`, the refusal test, snapshot encoding if
@@ -476,7 +606,9 @@ Estimates from the measured store latency, to be measured on the pilot at each s
    `--write-tier-bytes`, `--write-tier-seal-after`, `--write-tier-abandon`. Off unless
    `--write-tier-dir` is given; the OSS default is no tier, today's guarantee.
 5. **PR 5**: the tier in `kbf-sim-cell`, then on the pilot with the unflushed-age alert
-   in place first.
+   in place first. The scenarios it must run, their invariants and expected outcomes,
+   and the store faults and crash points already in the cell, are in
+   [write-tier-scenarios.md](write-tier-scenarios.md).
 6. zstd on ByteStream and the capability, independent of the rest.
 
 ## 9. Tests, and the defect each catches
@@ -497,7 +629,9 @@ Grouping (PR 1), over `MemoryStore` wrapped to count and fault requests:
 | the same digest from two callers: one record, both answered | duplicate records; a caller never answered |
 | 48 concurrent `Write`s on one connection, three times the bound in all: peak buffered bytes stay under the bound, every `Write` finishes (built as 4 MiB `Write`s and a 12 MiB bound, not 64 MiB and 1 GiB, so the suite does not hash 3 GiB) | permit taken after buffering; mutant: permit in `store_blobs`; flow-control windows left at the transport's defaults (deadlock) |
 | a start with `--write-bytes-in-flight` below `MAX_BLOB_BYTES` is refused | a legal blob waiting forever |
-| a start with `--segment-upload-max-bytes` over `--write-bytes-in-flight`, or below one 1 GiB record plus footer, is refused; a `Begin` over the cap or `MAX_UPLOAD_RECORDS` is refused; a 1 GiB single-record segment commits | a `Begin` waiting forever for its permit |
+| a start with `--segment-upload-max-bytes` over `--write-bytes-in-flight`, over the 4 GiB - 1 one admission counts (`MAX_ADMISSION_BYTES`), or below one 1 GiB record plus footer, is refused; one admission of `MAX_ADMISSION_BYTES` under a 16 GiB bound is counted in full; a `Begin` over the cap or `MAX_UPLOAD_RECORDS` is refused; a `Begin` of the whole 1 GiB + 1 MiB cap is admitted under a bound of the same size, and a single-record upload that fills its bound commits (built as a 64 KiB bound and record, so the suite does not hash 1 GiB) | an upload holding more than the bound, or more than it is counted for; mutants: the start check removed, the flag's upper limit removed, `MAX_ADMISSION_BYTES` raised to 8 GiB; a commit that asks for admission again (it waits forever) |
+| a `Begin` waits while other uploads hold the bound, and is admitted when they release it | segment uploads bounded apart from ByteStream and batch uploads |
+| an upload's first segment PUT fails: the commit succeeds on a retry under a new key; with 2 PUT slots, a three-segment commit has 2 PUTs at the store | an upload's PUT tried once; an upload's PUTs past `--write-puts-in-flight` |
 
 Segment upload (PR 2):
 

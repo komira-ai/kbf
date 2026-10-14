@@ -1321,8 +1321,11 @@ dependencies = [
  "futures",
  "hex",
  "kbf-daemon",
- "kbf-outputs",
+ "kbf-front",
+ "kbf-objstore",
  "kbf-proto",
+ "kbf-testkit",
+ "kbf-transfer",
  "kbf-types",
  "prost",
  "prost-types",
@@ -1331,6 +1334,7 @@ dependencies = [
  "sha2 0.11.0",
  "thiserror",
  "tokio",
+ "tonic",
  "tracing",
  "tracing-subscriber",
 ]
@@ -1377,6 +1381,8 @@ dependencies = [
  "kbf-proto",
  "kbf-sched",
  "kbf-segments",
+ "kbf-store",
+ "kbf-tier",
  "kbf-types",
  "prost",
  "prost-types",
@@ -1431,6 +1437,7 @@ dependencies = [
  "kbf-daemon",
  "kbf-deploy",
  "kbf-front",
+ "kbf-objstore",
  "kbf-proto",
  "kbf-server",
  "kbf-testkit",
@@ -1438,6 +1445,8 @@ dependencies = [
  "proc-macro2",
  "prost",
  "rcgen",
+ "reqwest",
+ "rustix",
  "saphyr-parser",
  "serde_json",
  "sha2 0.11.0",
@@ -1497,6 +1506,7 @@ dependencies = [
  "time",
  "tracing",
  "tracing-subscriber",
+ "xtask",
 ]
 
 [[package]]
@@ -1678,6 +1688,7 @@ dependencies = [
  "kbf-segments",
  "kbf-sim",
  "kbf-store",
+ "kbf-tier",
  "kbf-types",
  "libc",
  "percent-encoding",
@@ -1717,9 +1728,11 @@ dependencies = [
  "kbf-meta",
  "kbf-raft",
  "kbf-sched",
+ "kbf-segments",
  "kbf-server",
  "kbf-sim",
  "kbf-store",
+ "kbf-tier",
  "kbf-types",
  "tokio",
 ]
@@ -1736,7 +1749,19 @@ dependencies = [
 name = "kbf-testkit"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "rustix",
+]
+
+[[package]]
+name = "kbf-tier"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "kbf-meta",
+ "kbf-segments",
+ "kbf-store",
+ "thiserror",
 ]
 
 [[package]]
@@ -1746,13 +1771,16 @@ dependencies = [
  "futures",
  "hex",
  "kbf-front",
+ "kbf-objstore",
  "kbf-proto",
+ "kbf-segments",
  "kbf-types",
  "sha2 0.11.0",
  "thiserror",
  "tokio",
  "tonic",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -2663,9 +2691,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.45"
+version = "0.23.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
+checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
 dependencies = [
  "log",
  "once_cell",
@@ -3690,6 +3718,7 @@ dependencies = [
  "hex",
  "lzma-rs",
  "rcgen",
+ "rustix",
  "rustls",
  "rustls-native-certs",
  "ruzstd",

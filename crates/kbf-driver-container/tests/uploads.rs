@@ -20,6 +20,8 @@ struct CountingCas {
     refused: Option<Digest>,
     blobs: Mutex<HashMap<String, Vec<u8>>>,
     stores: Mutex<HashMap<String, usize>>,
+    /// The digest count of each `missing` call.
+    asks: Mutex<Vec<usize>>,
     in_flight: AtomicUsize,
     most_in_flight: AtomicUsize,
 }
@@ -73,6 +75,9 @@ impl Cas for CountingCas {
 
     async fn put(&self, bytes: Vec<u8>) -> Result<Digest, CasError> {
         let digest = digest_of(&bytes);
+        if self.refused.as_ref() == Some(&digest) {
+            return Err(CasError::Unavailable(label(&digest), "refused".to_owned()));
+        }
         self.keep(&digest, bytes).await;
         Ok(digest)
     }
@@ -91,6 +96,18 @@ impl Cas for CountingCas {
         }
         self.keep(&digest, bytes).await;
         Ok(digest)
+    }
+
+    async fn missing(&self, digests: &[Digest]) -> Vec<Digest> {
+        self.asks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(digests.len());
+        digests
+            .iter()
+            .filter(|d| self.blob(d).is_none())
+            .cloned()
+            .collect()
     }
 
     fn in_flight(&self) -> usize {
@@ -112,6 +129,7 @@ async fn collect_out(cas: &CountingCas, upper: &std::path::Path) -> (ActionResul
     collect(
         cas,
         upper,
+        std::path::Path::new(env!("CARGO_TARGET_TMPDIR")),
         "",
         &["out".to_owned()],
         OutputLimits::DEFAULT,
@@ -198,9 +216,9 @@ async fn a_digest_named_many_times_is_stored_once() {
 
 /// Catches a store that failed being dropped while the walk goes on: `collect` would
 /// return a result naming a blob the CAS never got, and the action cache would refuse
-/// it (or a client would fail fetching it). One of 100 files cannot be stored.
-/// Mutant seen red: the drain's error discarded (`outputs.rs`, `try_join!` replaced by
-/// a `join!` that returns only the walk's result).
+/// it (or a client would fail fetching it). One of 100 files cannot be stored (it
+/// reaches the store from the spool, through `put`). Mutant seen red: the spool's
+/// store error discarded (`src/pending.rs`, `put_spool`'s result dropped).
 #[tokio::test]
 async fn a_blob_that_cannot_be_stored_fails_the_collection() {
     let upper = scratch("refused");
@@ -217,6 +235,7 @@ async fn a_blob_that_cannot_be_stored_fails_the_collection() {
     let collected = collect(
         &cas,
         &upper,
+        std::path::Path::new(env!("CARGO_TARGET_TMPDIR")),
         "",
         &["out".to_owned()],
         OutputLimits::DEFAULT,
@@ -225,4 +244,47 @@ async fn a_blob_that_cannot_be_stored_fails_the_collection() {
     .await;
     let error = collected.expect_err("a blob was not stored");
     assert!(error.to_string().contains("refused"), "{error}");
+}
+
+/// Catches blobs stored that the CAS already holds, and a question per blob: the walk
+/// asks `missing` once, for every distinct digest of the outputs (each file, each
+/// Directory, the Tree), before it stores any, and stores only what the answer names.
+/// The CAS holds 150 of 200 files beforehand. Mutants seen red: the answer ignored
+/// (`src/pending.rs`, every blob stored, the held files included); no `missing` call,
+/// each put left to ask for itself (`asks` empty).
+#[tokio::test]
+async fn the_outputs_are_asked_about_once_and_only_missing_blobs_are_stored() {
+    let upper = scratch("asked-once");
+    std::fs::create_dir_all(upper.join("out/sub")).expect("mkdir");
+    let cas = CountingCas::default();
+    for f in 0..200 {
+        let bytes = format!("file {f}").into_bytes();
+        let dir = if f % 2 == 0 { "out" } else { "out/sub" };
+        std::fs::write(upper.join(format!("{dir}/f{f:03}")), &bytes).expect("write");
+        if f % 4 != 0 {
+            cas.blobs
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(label(&digest_of(&bytes)), bytes);
+        }
+    }
+    let (_, tree) = collect_out(&cas, &upper).await;
+    let asks = cas
+        .asks
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone();
+    assert_eq!(asks, [200 + 2 + 1], "200 files, two Directories, the Tree");
+    for f in 0..200 {
+        let stores = cas.stores_of(&digest_of(format!("file {f}").as_bytes()));
+        assert_eq!(stores, usize::from(f % 4 == 0), "file {f}");
+    }
+    assert_eq!(cas.stores_of(&digest_of(&tree.encode_to_vec())), 1);
+    let stored: usize = cas
+        .stores
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .values()
+        .sum();
+    assert_eq!(stored, 50 + 2 + 1);
 }

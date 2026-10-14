@@ -11,19 +11,25 @@
 //! contact with the server in the daemon's own [`kbf_daemon::Contact`] and drop the
 //! leases of an earlier epoch by [`kbf_daemon::superseded`]. Clients ([`FakeClient`])
 //! upload an input, check it with `FindMissingBlobs` and `Execute` an action. The
-//! object store ([`ObjectStore`]) keeps every object it is given.
+//! object store ([`ObjectStore`]) keeps every object it accepts, and meets the faults
+//! of its [`StorePlan`]: it hangs, is slow, fails PUTs, or loses their answers. The
+//! server can be taken down at a named point of its write path ([`CrashPlan`]).
 //!
 //! [`run`] runs a [`Scenario`] step by step and checks properties 1 to 7 of ha.md
-//! section 15 after every step ([`check`]); a violation panics with the scenario, the
-//! seed and the property. A seed replays to the same trace.
+//! section 15, and the write path's 8 and 9 (docs/design/write-tier-scenarios.md),
+//! after every step ([`check`]); a violation panics with the scenario, the seed and the
+//! property. A seed replays to the same trace. [`sweep`] runs a scenario per seed and
+//! reports every failing seed.
 
 mod cell;
 pub mod check;
 mod client;
 mod daemon;
+mod hook;
 mod replica;
 mod server;
 mod store;
+mod sweep;
 
 use kbf_meta::ObjectId;
 use kbf_types::{Digest, DigestFunction, LeaseId, OperationId, Outcome, Resources};
@@ -31,8 +37,12 @@ use kbf_types::{Digest, DigestFunction, LeaseId, OperationId, Outcome, Resources
 pub use cell::{Kind, RunReport, Scenario, run};
 pub use client::{FakeClient, Job};
 pub use daemon::FakeDaemon;
-pub use server::{Seen, Server, ServerFault, ServerPlan};
-pub use store::ObjectStore;
+pub use hook::{CrashPlan, Down, StorePoint, TierPoint};
+pub use server::{
+    Cut, PUT_TIMEOUT, Seen, Server, ServerFault, ServerPlan, TierCut, TierPlan, TierSeen,
+};
+pub use store::{BlobHomes, Body, Held, Met, ObjectStore, StoreFault, StorePlan, StoreStats};
+pub use sweep::{Failure, Sweep, sweep};
 
 /// What the nodes of a cell send each other. `stream` stands for a daemon's gRPC
 /// stream: a daemon numbers its streams, and a new one replaces the old.
@@ -44,6 +54,11 @@ pub enum Msg {
     },
     /// Server to client: the blob is stored and indexed.
     Uploaded {
+        digest: Digest,
+    },
+    /// Server to client: the store refused the blob's PUT; nothing is indexed
+    /// (`UNAVAILABLE`). The client tries again later.
+    UploadFailed {
         digest: Digest,
     },
     /// Client to server: `FindMissingBlobs`.
@@ -73,6 +88,38 @@ pub enum Msg {
     PutDone {
         object: ObjectId,
         digest: Digest,
+    },
+    /// Object store to server: the PUT of `object` failed. (The store may have kept it
+    /// all the same: [`StoreFault::KeepButFail`].)
+    PutFailed {
+        object: ObjectId,
+        digest: Digest,
+    },
+    /// Server to object store: write the flushed segment `object` of the local write
+    /// tier.
+    Flush {
+        object: ObjectId,
+        body: Body,
+    },
+    /// Object store to server: the segment `object` is written.
+    FlushDone {
+        object: ObjectId,
+    },
+    /// Object store to server: the PUT of the segment `object` failed.
+    FlushFailed {
+        object: ObjectId,
+    },
+    /// Server to object store: read `digest` from `object` (a reader that did not find
+    /// it on the local tier); `tag` names the read.
+    Get {
+        object: ObjectId,
+        digest: Digest,
+        tag: u64,
+    },
+    /// Object store to server: whether `object` held the blob the read `tag` asked for.
+    Got {
+        tag: u64,
+        held: bool,
     },
     /// Daemon to server: the first message of a stream.
     Hello {
@@ -135,6 +182,17 @@ pub fn input_of(action: &Digest) -> Digest {
     let mut input = *action;
     input.hash[0] = 0x1B;
     input
+}
+
+/// The bytes of the blob `digest` names, as the cell's clients upload them: its size,
+/// each byte drawn from the digest. (The cell's digests are names, not hashes of
+/// these bytes; a reader checks bytes against this.)
+#[must_use]
+pub fn content(digest: &Digest) -> Vec<u8> {
+    let len = usize::try_from(digest.size_bytes).unwrap_or(0);
+    (0..len)
+        .map(|i| digest.hash[i % 32] ^ u8::try_from(i % 251).unwrap_or(0))
+        .collect()
 }
 
 fn numbered(tag: u8, n: u64) -> Digest {

@@ -26,7 +26,7 @@ use std::collections::BTreeSet;
 use std::mem;
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -37,6 +37,7 @@ use kbf_segments::{Footer, SegmentWriter, WriteError};
 use kbf_types::Digest;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 
+use super::tier::Staging;
 use super::{Cache, CacheError, VerifiedBlob, refuse_oversized, unexpected};
 use crate::meta_log::{MetaLog, MetaLogError};
 use crate::metrics::{CacheMetrics, command_label};
@@ -47,6 +48,11 @@ pub const PUT_BACKOFF: Duration = Duration::from_millis(100);
 
 /// How much longer each wait between PUT attempts is than the one before.
 pub const PUT_BACKOFF_FACTOR: u32 = 4;
+
+/// The most bytes one [`Cache::admit`] call takes and counts: a semaphore hands out at
+/// most `u32::MAX` permits at once. A caller asking for more holds more memory than the
+/// bound counts, so `kbf-server` refuses a `--segment-upload-max-bytes` over this.
+pub const MAX_ADMISSION_BYTES: u64 = u32::MAX as u64;
 
 /// The most HTTP/2 streams one connection may have open on either of the server's
 /// listeners. A `BatchUpdateBlobs` request is decoded (up to
@@ -152,15 +158,18 @@ struct Segment {
     packed: BTreeSet<Digest>,
     waiters: Vec<oneshot::Sender<Result<(), CacheError>>>,
     held: Vec<Admitted>,
+    /// A segment of one blob, past the group: on the write tier, a block of its own.
+    own: bool,
 }
 
 impl Segment {
-    fn new(limit: u64) -> Self {
+    fn new(limit: u64, own: bool) -> Self {
         Self {
             writer: SegmentWriter::new(limit),
             packed: BTreeSet::new(),
             waiters: Vec::new(),
             held: Vec::new(),
+            own,
         }
     }
 
@@ -238,7 +247,10 @@ pub(super) struct Writer<M, O> {
     pub(super) prefix: KeyPrefix,
     pub(super) epoch: Epoch,
     pub(super) metrics: CacheMetrics,
-    next_seq: AtomicU64,
+    /// Shared with the write tier, which numbers its blocks' objects from it too.
+    pub(super) next_seq: Arc<AtomicU64>,
+    /// The local write tier, once [`Cache::attach_tier`] attached one.
+    pub(super) tier: OnceLock<Staging>,
 }
 
 impl<M, O> Writer<M, O> {
@@ -249,7 +261,8 @@ impl<M, O> Writer<M, O> {
             prefix,
             epoch,
             metrics: CacheMetrics::default(),
-            next_seq: AtomicU64::new(1),
+            next_seq: Arc::new(AtomicU64::new(1)),
+            tier: OnceLock::new(),
         }
     }
 
@@ -274,10 +287,10 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
     }
 
     /// Waits until `bytes` more fit under [`WriteConfig::bytes_in_flight`] and takes
-    /// them. A call asking for more than the bound (or than 4 GiB) waits for that much.
-    /// Nothing is refused: a caller over the bound waits.
+    /// them. A call asking for more than the bound, or than [`MAX_ADMISSION_BYTES`],
+    /// takes and counts only that much. Nothing is refused: a caller over the bound waits.
     pub async fn admit(&self, bytes: u64) -> Admitted {
-        let n = bytes.min(self.group.bound).min(u64::from(u32::MAX));
+        let n = bytes.min(self.group.bound).min(MAX_ADMISSION_BYTES);
         let n = u32::try_from(n).unwrap_or(u32::MAX);
         let permit = Arc::clone(&self.group.admission)
             .acquire_many_owned(n)
@@ -286,6 +299,13 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         Admitted {
             _permit: permit.map(Arc::new),
         }
+    }
+
+    /// The bytes [`Cache::admit`] has handed out and not yet had back: what uploads
+    /// hold under [`WriteConfig::bytes_in_flight`] now.
+    #[must_use]
+    pub fn bytes_admitted(&self) -> u64 {
+        self.group.bound - self.group.admission.available_permits() as u64
     }
 
     /// The most bytes ByteStream `Write`s have held in their receive buffers at once
@@ -436,7 +456,7 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         });
         Open {
             id,
-            segment: Segment::new(self.segment_limit),
+            segment: Segment::new(self.segment_limit, false),
         }
     }
 
@@ -447,7 +467,8 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         waiter: oneshot::Sender<Result<(), CacheError>>,
         admitted: &Admitted,
     ) {
-        let mut segment = Segment::new(blob.digest.size_bytes.saturating_add(footer_len(1)));
+        let size = blob.digest.size_bytes.saturating_add(footer_len(1));
+        let mut segment = Segment::new(size, true);
         // An empty segment sized for this record always takes it.
         let _ = segment.writer.push(&blob.bytes);
         segment.wait(blob.digest, waiter, admitted);
@@ -467,15 +488,20 @@ async fn settle<M: MetaLog, O: ObjectStore>(
         packed,
         waiters,
         held,
+        own,
     } = segment;
-    let placed = {
-        let _slot = group.puts.acquire().await;
-        writer
-            .put_segment(group.config.put_attempts, records, &packed)
-            .await
-    };
-    let answer = match placed {
-        Ok(placed) => writer.commit_segment(placed).await,
+    if packed.is_empty() {
+        // The open segment a blob too large for it left behind: nothing to write.
+        return;
+    }
+    let body = Bytes::from(records.finish());
+    // On the write tier when one is attached and takes it, else PUT.
+    let answer = match writer.stage(body.clone(), own).await {
+        Ok(true) => Ok(()),
+        Ok(false) => match writer.put_segment(&group, body, &packed).await {
+            Ok(placed) => writer.commit_segment(placed).await,
+            Err(e) => Err(e),
+        },
         Err(e) => Err(e),
     };
     for waiter in waiters {
@@ -523,19 +549,11 @@ impl<M: MetaLog, O: ObjectStore> Writer<M, O> {
     /// each packed blob is, as the stored footer says.
     async fn put_segment(
         &self,
-        attempts: NonZeroU32,
-        records: SegmentWriter,
+        group: &Group,
+        body: Bytes,
         packed: &BTreeSet<Digest>,
     ) -> Result<Vec<(Digest, Location)>, CacheError> {
-        let body = Bytes::from(records.finish());
-        let len = body.len() as u64;
-        self.metrics.segment_blobs.observe(packed.len() as u64);
-        self.metrics.segment_bytes.observe(len);
-        let (segment, key) = self.put(attempts, body).await?;
-        let started = Instant::now();
-        let footer = self.read_footer(&key, len).await;
-        self.metrics.segment_footer.since(started);
-        let footer = footer.map_err(read_back)?;
+        let (segment, key, footer) = self.store_segment(group, body, packed.len()).await?;
         packed
             .iter()
             .map(|d| {
@@ -552,6 +570,31 @@ impl<M: MetaLog, O: ObjectStore> Writer<M, O> {
                 ))
             })
             .collect()
+    }
+
+    /// Stores one whole segment of `records` records: under one of `group`'s
+    /// [`WriteConfig::puts_in_flight`] slots, a PUT tried as [`Writer::put`] says, then
+    /// its footer read back. Returns the object, its key and the footer the store holds.
+    /// Grouped segments and the segments of a `Segments` upload are both stored here.
+    ///
+    /// # Errors
+    /// Every PUT attempt failed; the read-back failed, INTERNAL when it reached the
+    /// store and disagrees with what was written.
+    pub(super) async fn store_segment(
+        &self,
+        group: &Group,
+        body: Bytes,
+        records: usize,
+    ) -> Result<(ObjectId, ObjectKey, Footer), CacheError> {
+        let len = body.len() as u64;
+        self.metrics.segment_blobs.observe(records as u64);
+        self.metrics.segment_bytes.observe(len);
+        let _slot = group.puts.acquire().await;
+        let (object, key) = self.put(group.config.put_attempts, body).await?;
+        let started = Instant::now();
+        let footer = self.read_footer(&key, len).await;
+        self.metrics.segment_footer.since(started);
+        Ok((object, key, footer.map_err(read_back)?))
     }
 
     /// PUTs `body` under a new object id, and again under another after a failure that
@@ -584,7 +627,11 @@ impl<M: MetaLog, O: ObjectStore> Writer<M, O> {
         }
     }
 
-    async fn read_footer(&self, key: &ObjectKey, len: u64) -> Result<Footer, CacheError> {
+    pub(super) async fn read_footer(
+        &self,
+        key: &ObjectKey,
+        len: u64,
+    ) -> Result<Footer, CacheError> {
         let tail = |n: u64| {
             len.checked_sub(n)
                 .and_then(|start| ByteRange::new(start, n))
@@ -599,8 +646,11 @@ impl<M: MetaLog, O: ObjectStore> Writer<M, O> {
         Ok(Footer::parse(&bytes, len)?)
     }
 
-    /// Commits where each blob of one segment is, as one `PutBlobs`.
-    async fn commit_segment(&self, placed: Vec<(Digest, Location)>) -> Result<(), CacheError> {
+    /// Commits where each blob of one or more segments is, as one `PutBlobs`.
+    pub(super) async fn commit_segment(
+        &self,
+        placed: Vec<(Digest, Location)>,
+    ) -> Result<(), CacheError> {
         let started = Instant::now();
         let committed = self.commit(Command::PutBlobs(placed)).await;
         self.metrics.segment_commit.since(started);

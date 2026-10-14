@@ -1,5 +1,7 @@
 # The shell, Python, awk, sed, Perl and Ruby left in this repository, by path. kbf's
-# tooling is Rust: each row is something still to port or delete. The repository lints
+# tooling is Rust: each row of [files] and [src-sh-c] is something still to port or
+# delete; each row of [test-interpreters] is test code that names an interpreter on
+# purpose, and says why. The repository lints
 # (crates/kbf-it/tests/repo_lints.rs, rules in crates/kbf-it/tests/interpreters/mod.rs)
 # refuse anything the scan finds with no row here, a row the scan finds nothing for
 # (remove it in the change that deletes its file), and a malformed or
@@ -13,21 +15,42 @@
 
 # Files by extension or `#!` line. Key: the path.
 [files]
-crates/kbf-it/m1/bazel/tools/upper.sh	M1 sample project action; to become a Rust test action
-crates/kbf-it/m1/buck2/tools/upper.sh	M1 sample project action; to become a Rust test action
-crates/kbf-it/m1/run.sh	M1 cell harness; to become kbf-cell m1
-crates/kbf-it/m2/run.sh	M2 cell harness; to become kbf-cell m2
-tools/ci/m2-container.sh	CI step; to become a cargo xtask verb
-tools/ci/mac-session-tests.sh	CI tests run as root; to become Rust tests run as root
-tools/ci/podman-tests-inner.sh	CI step; to become a cargo xtask verb
-tools/ci/podman-tests.sh	CI step; to become a cargo xtask verb
-tools/mac-provision/kbf-mac-provision	Mac host provisioning; to become a Rust crate
-tools/mac-provision/test/coverage.awk	tests of kbf-mac-provision; to become Rust tests of its crate
-tools/mac-provision/test/coverage.sh	tests of kbf-mac-provision; to become Rust tests of its crate
-tools/mac-provision/test/fakecmd	tests of kbf-mac-provision; to become Rust tests of its crate
-tools/mac-provision/test/hosted-macos.sh	tests of kbf-mac-provision; to become Rust tests of its crate
-tools/mac-provision/test/mutants.sh	tests of kbf-mac-provision; to become Rust tests of its crate
-tools/mac-provision/test/run.sh	tests of kbf-mac-provision; to become Rust tests of its crate
 
 # Production Rust under crates/*/src/ that names a shell and a `-c` flag. Key: the path.
 [src-sh-c]
+
+# Test code that names an interpreter (a program literal such as "perl" or "/bin/sh",
+# or a script whose `#!` line runs one): files under crates/*/tests/, and the
+# #[cfg(test)] code of crates/*/src/. Key: the path; the reason says why the test
+# needs the interpreter, or that it names one only as data. Module
+# crates/kbf-it/tests/interpreters/rust.rs says what the scan reads.
+[test-interpreters]
+crates/kbf-daemon/tests/support/memory.rs	Spec::user_shell: the tests of how the daemon ends a user's own /bin/sh -c command and the background job it starts (`&`, `wait`); every other action runs kbf-testkit act
+crates/kbf-deploy/src/pilot/server_tests.rs	data: a #!/bin/sh file planted where the server binary goes, refused as not an ELF executable; nothing runs it
+crates/kbf-driver-container/src/podman.rs	data: the sh -c argv a create-arguments test expects in --entrypoint; nothing runs it
+crates/kbf-driver-container/src/program.rs	data: sh as another program's name in the crun lookup-report test; nothing runs it
+crates/kbf-driver-container/tests/fake_podman.rs	data: #!/bin/sh as the bytes of an input file whose executable bit a run must keep, and of an output file an action writes; nothing runs them
+crates/kbf-driver-container/tests/podman.rs	find -exec sh -c removes sibling directories while the output walk reads them: the race needs a program find runs between two directory reads
+crates/kbf-driver-container/tests/support/mod.rs	Spec::new: the real-Podman tests' action is sh -c inside the test image (busybox), which holds no kbf binary
+crates/kbf-driver-container/tests/support/real.rs	sh(): the same action naming the image's /bin/sh by path, since the action's environment has no PATH
+crates/kbf-driver-container/tests/tree.rs	data: #!/bin/sh bytes as an executable file's content in the tree write and collect tests; nothing runs them
+crates/kbf-driver-native/src/network.rs	data: /bin/sh as the program in the sandbox-exec wrapping tests; nothing runs it
+crates/kbf-driver-native/src/program.rs	data: sh as the program the REAPI PATH lookup resolves; resolved, never run
+crates/kbf-driver-native/src/xcode_tests.rs	#!/bin/sh fakes of xcodebuild, xcrun and sandbox-exec inside fake Xcode apps the survey runs by path, one of them backgrounding a child that holds the output pipe (`sleep 8 &`)
+crates/kbf-driver-native/tests/devices.rs	macOS IPC probe: a sandboxed action runs /usr/bin/perl -e to connect to usbmuxd's Unix socket and must be refused
+crates/kbf-driver-native/tests/launchd.rs	macOS launchd probe: launchctl submit, load and bootstrap (with $(id -u)) through sh -c, from the test and under the bare sandbox profile
+crates/kbf-driver-native/tests/network.rs	macOS network probe: a sandboxed action runs /usr/bin/perl -e to connect to a host and port
+crates/kbf-driver-native/tests/slot_clean.rs	sh -c backgrounds a sleeper (`&`, `$!`) in its own session and plants and checks what a slot user leaves behind, the processes and state the slot clean must undo
+crates/kbf-driver-native/tests/slots.rs	sh -c backgrounds a sleeper (`&`, `$!`) in its own session, and two concurrent leases run one keychain and defaults script to show they never share a user
+crates/kbf-driver-native/tests/support/mod.rs	Spec::sh (macOS): a user's own shell command under the sandbox, for the tests of what it and the system tools it runs may do
+crates/kbf-guest/src/wire_tests.rs	data: the argv of a golden RunRequest encoding; nothing runs it
+crates/kbf-guest/tests/common/mod.rs	user_shell: a job put in the background with `&` inside the command's process group, `$$` or `$!`, a trap, or a NUL byte no argv can hold
+crates/kbf-it/tests/cell.rs	the M1 cell test's uploaded action is /bin/sh -c writing out.txt, as a REAPI client's command would be
+crates/kbf-it/tests/interpreters/mod.rs	data: the lint's own lists of interpreter names and extensions
+crates/kbf-it/tests/interpreters/rust.rs	data: the lint's own shell names and osascript
+crates/kbf-it/tests/interpreters/tests.rs	data: the lint's tests' tables of interpreter names, paths and #! lines
+crates/kbf-it/tests/repo_lints.rs	data: the #! files planted in the budget lint's trees
+crates/kbf-mac-provision/tests/drift.rs	data: /bin/zsh as a drifted UserShell value; nothing runs it
+crates/kbf-mac-session/tests/node_admin.rs	data: /bin/sh as an argument the verb parser must refuse; nothing runs it
+crates/kbf-mac-session/tests/role_user.rs	data: /bin/zsh as a UserShell changed by hand; nothing runs it
+crates/kbf-node/tests/front/mod.rs	Front::user_shell: the tests of how the daemon ends a user's /bin/sh -c command and its background job (`$$`, `$!` name the processes), sent through the front

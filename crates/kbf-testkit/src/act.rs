@@ -39,7 +39,29 @@
 //! - `cat FILE`: writes the bytes of `FILE` to stdout;
 //! - `mtime PATH SECS`: sets the modification time of `PATH` (a file or a directory)
 //!   to `SECS` whole seconds after the Unix epoch;
-//! - `pgid`: prints the id of its process group.
+//! - `pgid`: prints the id of its process group;
+//! - `leads`: prints `group G session S`, each `1` when this process leads its process
+//!   group or its session and `0` when it does not;
+//! - `write-lines FILE [LINE]...`: creates or truncates `FILE` and writes each `LINE`
+//!   and a newline to it, in one write (no `LINE`: an empty file);
+//! - `copy OUT IN...`: creates or truncates `OUT` and writes the bytes of each `IN` to
+//!   it, in order;
+//! - `remove PATH`: removes what `PATH` names, never following a link: a directory
+//!   with everything in it, or anything else; fails when nothing is there;
+//! - `mkfifo PATH`: makes `PATH` a named pipe;
+//! - `truncate PATH BYTES`: sets the length of the file `PATH` to `BYTES`, creating
+//!   it (what it gains reads as zeros and takes no disk);
+//! - `zeros [--stderr] COUNT`: writes `COUNT` zero bytes to stdout (to stderr with
+//!   `--stderr`);
+//! - `ignore-signal SIGNAL`: ignores signal number `SIGNAL` from then on, in this
+//!   process and in what it starts;
+//! - `test [!] -e|-d|-x PATH`: fails unless `PATH` (a link followed) exists, is a
+//!   directory, or has an execute bit set; with `!`, unless it does not;
+//! - `points-to LINK TARGET`: fails unless `LINK` is a symbolic link to `TARGET`;
+//! - `holds FILE WORDS...`: fails unless `FILE` holds exactly the words, joined by
+//!   spaces (no newline);
+//! - `inode-links OUT PATH...`: creates or truncates `OUT` and writes a line
+//!   `INODE LINKS` for each `PATH` (a link followed): its inode and link count.
 //!
 //! [`main`] first looks at argv0: run through a link named for a tool of
 //! [`crate::fake`], it answers as that tool instead.
@@ -51,7 +73,7 @@
 
 use std::ffi::OsStr;
 use std::io::Write as _;
-use std::os::unix::fs::PermissionsExt as _;
+use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::os::unix::process::CommandExt as _;
 use std::path::Path;
 use std::process::{Command, ExitCode};
@@ -169,6 +191,55 @@ pub(crate) enum Step<'a> {
         secs: u64,
     },
     Pgid,
+    Leads,
+    WriteLines {
+        path: &'a str,
+        /// Every line with its newline.
+        text: String,
+    },
+    Copy {
+        out: &'a str,
+        inputs: Vec<&'a str>,
+    },
+    Remove(&'a str),
+    Mkfifo(&'a str),
+    Truncate {
+        path: &'a str,
+        len: u64,
+    },
+    Zeros {
+        stderr: bool,
+        count: u64,
+    },
+    IgnoreSignal(Signal),
+    Test {
+        not: bool,
+        what: Predicate,
+        path: &'a str,
+    },
+    PointsTo {
+        link: &'a str,
+        target: &'a str,
+    },
+    Holds {
+        path: &'a str,
+        text: String,
+    },
+    InodeLinks {
+        out: &'a str,
+        paths: Vec<&'a str>,
+    },
+}
+
+/// What `test` asks of a path.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub(crate) enum Predicate {
+    /// `-e`: it exists.
+    Exists,
+    /// `-d`: it is a directory.
+    Dir,
+    /// `-x`: it has an execute bit set.
+    Executable,
 }
 
 /// The steps of `args`, split at each `;`, every one checked.
@@ -209,13 +280,7 @@ fn step(words: &[String]) -> Result<Step<'_>, Error> {
         },
         ["pwd"] => Step::Pwd,
         ["id"] => Step::Id,
-        ["kill-self", signal] => Step::KillSelf(
-            signal
-                .parse::<i32>()
-                .ok()
-                .and_then(Signal::from_named_raw)
-                .ok_or_else(|| Error::Usage(format!("{signal:?} is not a signal number")))?,
-        ),
+        ["kill-self", signal] => Step::KillSelf(signal_number(signal)?),
         ["spawn-child", "--pid", pid, ..] => Step::SpawnChild {
             pid: Some(*pid),
             args: child(&strs[3..])?,
@@ -248,7 +313,68 @@ fn step(words: &[String]) -> Result<Step<'_>, Error> {
             secs: number(secs)?,
         },
         ["pgid"] => Step::Pgid,
+        ["leads"] => Step::Leads,
+        ["write-lines", path, lines @ ..] => Step::WriteLines {
+            path,
+            text: lines.iter().map(|line| format!("{line}\n")).collect(),
+        },
+        ["copy", out, inputs @ ..] if !inputs.is_empty() => Step::Copy {
+            out,
+            inputs: inputs.to_vec(),
+        },
+        ["remove", path] => Step::Remove(path),
+        ["mkfifo", path] => Step::Mkfifo(path),
+        ["truncate", path, len] => Step::Truncate {
+            path,
+            len: number(len)?,
+        },
+        ["zeros", "--stderr", count] => Step::Zeros {
+            stderr: true,
+            count: number(count)?,
+        },
+        ["zeros", count] => Step::Zeros {
+            stderr: false,
+            count: number(count)?,
+        },
+        ["ignore-signal", signal] => Step::IgnoreSignal(signal_number(signal)?),
+        ["test", "!", flag, path] => Step::Test {
+            not: true,
+            what: predicate(flag)?,
+            path,
+        },
+        ["test", flag, path] => Step::Test {
+            not: false,
+            what: predicate(flag)?,
+            path,
+        },
+        ["points-to", link, target] => Step::PointsTo { link, target },
+        ["holds", path, words @ ..] => Step::Holds {
+            path,
+            text: words.join(" "),
+        },
+        ["inode-links", out, paths @ ..] if !paths.is_empty() => Step::InodeLinks {
+            out,
+            paths: paths.to_vec(),
+        },
         _ => return Err(Error::Usage(format!("bad step: {strs:?}"))),
+    })
+}
+
+/// `text` as a signal number.
+fn signal_number(text: &str) -> Result<Signal, Error> {
+    text.parse::<i32>()
+        .ok()
+        .and_then(Signal::from_named_raw)
+        .ok_or_else(|| Error::Usage(format!("{text:?} is not a signal number")))
+}
+
+/// The predicate `test`'s `flag` names.
+fn predicate(flag: &str) -> Result<Predicate, Error> {
+    Ok(match flag {
+        "-e" => Predicate::Exists,
+        "-d" => Predicate::Dir,
+        "-x" => Predicate::Executable,
+        _ => return Err(Error::Usage(format!("{flag:?} is not -e, -d or -x"))),
     })
 }
 
@@ -359,6 +485,83 @@ pub(crate) fn perform(steps: &[Step<'_>]) -> Result<Option<u8>, Error> {
                 std::io::stdout(),
                 &rustix::process::getpgrp().as_raw_nonzero().to_string(),
             )?,
+            Step::Leads => {
+                let pid = rustix::process::getpid();
+                let group = rustix::process::getpgrp() == pid;
+                let session = rustix::process::getsid(None).map_err(failed("getsid"))? == pid;
+                let (group, session) = (u8::from(group), u8::from(session));
+                write_line(
+                    std::io::stdout(),
+                    &format!("group {group} session {session}"),
+                )?;
+            }
+            Step::WriteLines { path, text } => create(path, text.as_bytes())?,
+            Step::Copy { out, inputs } => {
+                let mut bytes = Vec::new();
+                for input in inputs {
+                    bytes.extend(read(input)?);
+                }
+                create(out, &bytes)?;
+            }
+            Step::Remove(path) => remove(path)?,
+            Step::Mkfifo(path) => mkfifo(path)?,
+            Step::Truncate { path, len } => std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(path)
+                .and_then(|file| file.set_len(*len))
+                .map_err(failed(format!("truncate {path}")))?,
+            Step::Zeros {
+                stderr: true,
+                count,
+            } => zeros(std::io::stderr(), *count)?,
+            Step::Zeros {
+                stderr: false,
+                count,
+            } => zeros(std::io::stdout(), *count)?,
+            Step::IgnoreSignal(signal) => ignore(*signal)?,
+            Step::Test { not, what, path } => {
+                let found = std::fs::metadata(path).ok();
+                let holds = match what {
+                    Predicate::Exists => found.is_some(),
+                    Predicate::Dir => found.is_some_and(|meta| meta.is_dir()),
+                    Predicate::Executable => {
+                        found.is_some_and(|meta| meta.permissions().mode() & 0o111 != 0)
+                    }
+                };
+                if holds == *not {
+                    return Err(Error::Failed(format!(
+                        "test of {path}: {what:?} is {holds}"
+                    )));
+                }
+            }
+            Step::PointsTo { link, target } => {
+                let found = std::fs::read_link(link).map_err(failed(format!("readlink {link}")))?;
+                if found != Path::new(target) {
+                    return Err(Error::Failed(format!(
+                        "{link} points to {}, not {target}",
+                        found.display()
+                    )));
+                }
+            }
+            Step::Holds { path, text } => {
+                let found = read(path)?;
+                if found != text.as_bytes() {
+                    return Err(Error::Failed(format!(
+                        "{path} holds {:?}, not {text:?}",
+                        String::from_utf8_lossy(&found)
+                    )));
+                }
+            }
+            Step::InodeLinks { out, paths } => {
+                let mut text = String::new();
+                for path in paths {
+                    let meta = std::fs::metadata(path).map_err(failed(format!("stat {path}")))?;
+                    text.push_str(&format!("{} {}\n", meta.ino(), meta.nlink()));
+                }
+                create(out, text.as_bytes())?;
+            }
         }
     }
     drop(held);
@@ -389,6 +592,51 @@ pub(crate) fn append(path: &str, text: &str) -> Result<(), Error> {
         .map_err(failed(format!("append to {path}")))
 }
 
+/// Removes what `path` names, never following a link: a directory with everything in
+/// it, or anything else.
+fn remove(path: &str) -> Result<(), Error> {
+    let what = std::fs::symlink_metadata(path).map_err(failed(format!("remove {path}")))?;
+    if what.is_dir() {
+        std::fs::remove_dir_all(path)
+    } else {
+        std::fs::remove_file(path)
+    }
+    .map_err(failed(format!("remove {path}")))
+}
+
+/// Makes `path` a named pipe, as `mkfifo` does (mode 0666 less the umask).
+fn mkfifo(path: &str) -> Result<(), Error> {
+    let name = std::ffi::CString::new(path).map_err(failed(format!("mkfifo {path}")))?;
+    // SAFETY: `name` is a NUL-terminated string that lives until the call returns, and
+    // mkfifo(3) only reads it.
+    if unsafe { libc::mkfifo(name.as_ptr(), 0o666) } != 0 {
+        let error = std::io::Error::last_os_error();
+        return Err(Error::Failed(format!("mkfifo {path}: {error}")));
+    }
+    Ok(())
+}
+
+/// Writes `count` zero bytes to `to`.
+fn zeros(mut to: impl std::io::Write, count: u64) -> Result<(), Error> {
+    std::io::copy(&mut std::io::Read::take(std::io::repeat(0), count), &mut to)
+        .and_then(|_| to.flush())
+        .map_err(failed("write"))
+}
+
+/// Ignores `signal` from now on (`SIG_IGN`, which a program this one execs keeps).
+fn ignore(signal: Signal) -> Result<(), Error> {
+    // SAFETY: SIG_IGN installs no handler of this program's, so no code of it runs
+    // in a signal's context; signal(3) takes plain integers.
+    if unsafe { libc::signal(signal.as_raw(), libc::SIG_IGN) } == libc::SIG_ERR {
+        let error = std::io::Error::last_os_error();
+        return Err(Error::Failed(format!(
+            "ignore signal {}: {error}",
+            signal.as_raw()
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -410,7 +658,10 @@ mod tests {
              env B dflt ; pwd ; id ; kill-self 9 ; spawn-child sleep 1 ; \
              spawn-child --pid - setsid ;; sleep 1 ;; exit 0 ; spawn-child --pid f spawn-child id ; \
              run /bin/x a b ; setsid ; alloc 32 ; upper o i ; rename a b ; symlink t l ; chmod 750 p ; \
-             chmod 7777 q ; wait-for w 1.5 ; mkdir m/n ; cat c ; mtime t 946684800 ; pgid",
+             chmod 7777 q ; wait-for w 1.5 ; mkdir m/n ; cat c ; mtime t 946684800 ; pgid ; \
+             leads ; write-lines w ; write-lines w a b ; copy o i j ; remove r ; mkfifo p ; \
+             truncate t 2048 ; zeros 3 ; zeros --stderr 4 ; ignore-signal 15 ; test -e e ; \
+             test ! -d d ; test -x x ; points-to l t ; holds h a b ; inode-links o a b",
         );
         let want = [
             Step::Exit(7),
@@ -481,6 +732,61 @@ mod tests {
                 secs: 946_684_800,
             },
             Step::Pgid,
+            Step::Leads,
+            Step::WriteLines {
+                path: "w",
+                text: String::new(),
+            },
+            Step::WriteLines {
+                path: "w",
+                text: "a\nb\n".to_owned(),
+            },
+            Step::Copy {
+                out: "o",
+                inputs: vec!["i", "j"],
+            },
+            Step::Remove("r"),
+            Step::Mkfifo("p"),
+            Step::Truncate {
+                path: "t",
+                len: 2048,
+            },
+            Step::Zeros {
+                stderr: false,
+                count: 3,
+            },
+            Step::Zeros {
+                stderr: true,
+                count: 4,
+            },
+            Step::IgnoreSignal(Signal::TERM),
+            Step::Test {
+                not: false,
+                what: Predicate::Exists,
+                path: "e",
+            },
+            Step::Test {
+                not: true,
+                what: Predicate::Dir,
+                path: "d",
+            },
+            Step::Test {
+                not: false,
+                what: Predicate::Executable,
+                path: "x",
+            },
+            Step::PointsTo {
+                link: "l",
+                target: "t",
+            },
+            Step::Holds {
+                path: "h",
+                text: "a b".to_owned(),
+            },
+            Step::InodeLinks {
+                out: "o",
+                paths: vec!["a", "b"],
+            },
         ];
         assert_eq!(parse(&all).expect("parses"), want);
         for bad in [
@@ -520,6 +826,25 @@ mod tests {
             "mtime t -1",
             "mtime t 1.5",
             "pgid x",
+            "leads x",
+            "write-lines",
+            "copy o",
+            "remove",
+            "remove a b",
+            "mkfifo",
+            "truncate t",
+            "truncate t x",
+            "zeros",
+            "zeros x",
+            "zeros --stderr",
+            "ignore-signal 0",
+            "ignore-signal TERM",
+            "test -e",
+            "test -z p",
+            "test ! -e",
+            "points-to l",
+            "holds",
+            "inode-links o",
             "echo a ; ; exit 0",
             "nope",
         ] {

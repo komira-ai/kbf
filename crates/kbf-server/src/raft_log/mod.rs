@@ -18,7 +18,9 @@
 //!   sync run on the calling thread under the log's lock, as the single-process log
 //!   applies under its lock: one commit at a time, no group commit yet.
 //! - **Queries** read this server's applied state. A single voter is always its own
-//!   leader, so that is the committed state.
+//!   leader, so that is the committed state. The state has its own lock, held by a
+//!   commit only while it applies, never across the sync: a query does not wait for a
+//!   commit's disk write.
 //! - **Leadership** ([`MetaLog::leadership`]): the log id and the term the open
 //!   elected this server in. With no peer, nothing can take the leadership away, so
 //!   the term is the same for the life of the process, and every start's is greater
@@ -29,6 +31,12 @@
 //!   since the open, so it never goes back across restarts. A task commits
 //!   `Tick(now)` every [`TICK`] while the log is open. A tick is a proposal, which
 //!   only a leader may make.
+//! - **Machine version.** A new log is at [`MachineVersion::V1`], whose entries are
+//!   format 1. [`RaftMetaLog::raise_machine_version`] commits a `MachineVersion`
+//!   entry; every entry after it is in the new version's format, so a log raised to
+//!   [`MachineVersion::V2`] takes the write tier's commands. A start replays the raise
+//!   with the log. A binary that does not run the version (any older one) refuses the
+//!   log at that entry.
 //! - **A storage error** stops the log for the life of the process: every later
 //!   commit is refused `Unavailable`.
 //!
@@ -43,11 +51,11 @@ use std::fmt::{self, Display};
 use std::io::{self, Read};
 use std::num::NonZeroU64;
 use std::path::Path;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, Weak};
 use std::time::Duration;
 
 use kbf_front::{Leadership, MetaLog, MetaLogError};
-use kbf_log::{Bootstrap, DecodeError, EncodeError, FarmLogId, Format, LogCommand};
+use kbf_log::{Bootstrap, DecodeError, EncodeError, FarmLogId, LogCommand, MachineVersion};
 use kbf_meta::{Applied, Command, MetaState, Retention};
 use kbf_objstore::{KeyError, KeyPrefix};
 use kbf_raft::{
@@ -61,6 +69,11 @@ use tokio::time::Instant;
 use self::machine::MetaMachine;
 pub use self::machine::NoSnapshots;
 pub use self::recorded::{RECORD, RECORD_TMP};
+
+/// The highest machine version this binary runs: [`MachineVersion::V2`], the write
+/// tier's commands. A log stays at the version it was raised to; a new one starts at
+/// [`MachineVersion::V1`].
+pub const RUNS: MachineVersion = MachineVersion::V2;
 
 /// How often the log commits farm time.
 pub const TICK: Duration = Duration::from_secs(1);
@@ -116,6 +129,9 @@ pub enum RaftLogError {
         /// Why it does not decode.
         source: DecodeError,
     },
+    /// The machine version this binary was asked to run is not one it knows.
+    #[error("raft log: this kbf-server does not run machine version {}", .0.get())]
+    Runs(MachineVersion),
     /// The committed `Bootstrap` is not the one this start expects: the record names
     /// another log, or the prefix root changed since the log was created.
     #[error(
@@ -139,6 +155,8 @@ pub struct RaftMetaLog<F: Fs = StdFs> {
 
 struct Shared<F: Fs> {
     host: Mutex<RaftHost<F>>,
+    /// The machine's applied state ([`MetaMachine::state`]), read without `host`.
+    state: Arc<RwLock<MetaState>>,
     log_id: FarmLogId,
     /// The term the open elected this server in.
     term: u64,
@@ -192,6 +210,25 @@ where
         prefix_root: &str,
         new_log_id: impl FnOnce() -> io::Result<FarmLogId>,
     ) -> Result<Self, RaftLogError> {
+        Self::open_running(fs, retention, prefix_root, new_log_id, RUNS).await
+    }
+
+    /// [`RaftMetaLog::open`], for a binary that runs machine versions up to `runs`: a
+    /// log raised past it is refused at the raise (`RaftLogError::Decode`), as a
+    /// rollback to an older binary is. The server runs [`RUNS`]; a lower `runs` stands
+    /// for an older binary in tests of that rollback.
+    ///
+    /// # Errors
+    /// As [`RaftMetaLog::open`], and [`RaftLogError::Runs`] for a version this binary
+    /// does not know.
+    pub async fn open_running(
+        fs: F,
+        retention: Retention,
+        prefix_root: &str,
+        new_log_id: impl FnOnce() -> io::Result<FarmLogId>,
+        runs: MachineVersion,
+    ) -> Result<Self, RaftLogError> {
+        let machine = MetaMachine::new(retention, runs).ok_or(RaftLogError::Runs(runs))?;
         let log_id = match recorded::read(&fs)? {
             Some(id) => id,
             None => {
@@ -209,7 +246,7 @@ where
             heartbeat_ticks: 1,
             max_entries_per_append: 1,
         };
-        let mut host = Host::open(config, store, NoTransport, MetaMachine::new(retention), 0)?;
+        let mut host = Host::open(config, store, NoTransport, machine, 0)?;
         // A single voter elects itself within two election timeouts; winning commits
         // the term's blank entry, which applies every entry before it.
         while host.core().role() != Role::Leader {
@@ -221,7 +258,8 @@ where
             store_prefix: prefix.as_str().to_owned(),
         };
         if host.machine().bootstrap().is_none() {
-            let entry = kbf_log::encode(Format::V1, &LogCommand::Bootstrap(expected.clone()))?;
+            let format = host.machine().format();
+            let entry = kbf_log::encode(format, &LogCommand::Bootstrap(expected.clone()))?;
             host.propose(entry)?;
         }
         let committed = host.machine().bootstrap().cloned();
@@ -231,10 +269,12 @@ where
                 expected,
             });
         }
+        let base = host.machine().meta().now();
         let shared = Arc::new(Shared {
-            base: host.machine().meta().now(),
+            base,
             bootstraps: host.machine().bootstraps(),
             term: host.core().hard_state().term.0,
+            state: host.machine().state(),
             host: Mutex::new(host),
             log_id,
             prefix,
@@ -242,6 +282,36 @@ where
         });
         let ticker = tokio::spawn(tick_every(Arc::downgrade(&shared))).abort_handle();
         Ok(Self { shared, ticker })
+    }
+
+    /// Raises the log's machine version to `to` by committing a `MachineVersion`
+    /// entry, unless the log is there already (a version is never lowered). Every
+    /// entry after it is encoded and decoded in `to`'s format: raising to
+    /// [`MachineVersion::V2`] lets the write tier's commands commit
+    /// (docs/design/metadata-snapshots.md, section 4). It is one-way: a binary that
+    /// runs only an earlier version refuses the log from then on.
+    ///
+    /// # Errors
+    /// [`MetaLogError::Unavailable`] if `to` is past what this binary runs, or the
+    /// log has stopped.
+    pub fn raise_machine_version(&self, to: MachineVersion) -> Result<(), MetaLogError> {
+        let mut host = self.shared.lock();
+        let machine = host.machine();
+        if to > machine.runs() {
+            let runs = machine.runs().get();
+            let d = format!(
+                "machine version {} is past {runs}, the one this binary runs",
+                to.get()
+            );
+            return Err(MetaLogError::Unavailable(d));
+        }
+        if machine.version() >= to {
+            return Ok(());
+        }
+        let entry = kbf_log::encode(machine.format(), &LogCommand::MachineVersion(to))
+            .map_err(unavailable)?;
+        // A single voter applies its own proposal before `propose` returns.
+        host.propose(entry).map(|_| ()).map_err(unavailable)
     }
 
     /// Commits `Tick(now)` and returns the committed farm time after it.
@@ -278,6 +348,13 @@ impl<F: Fs> RaftMetaLog<F> {
     #[must_use]
     pub fn applied_index(&self) -> u64 {
         self.shared.lock().machine().applied().0
+    }
+
+    /// The machine version the log has committed: [`MachineVersion::V1`] until
+    /// [`RaftMetaLog::raise_machine_version`] raises it.
+    #[must_use]
+    pub fn machine_version(&self) -> MachineVersion {
+        self.shared.lock().machine().version()
     }
 
     /// How many `Bootstrap` entries the log held when it opened, the one it may have
@@ -317,7 +394,7 @@ where
         Q: FnOnce(&MetaState) -> R + Send,
         R: Send,
     {
-        Ok(f(self.shared.lock().machine().meta()))
+        Ok(f(&machine::read(&self.shared.state)))
     }
 
     fn leadership(&self) -> Option<Leadership> {
@@ -340,8 +417,9 @@ impl<F: Fs> Shared<F> {
     }
 
     fn execute(&self, command: Command) -> Result<Applied, MetaLogError> {
-        let entry = kbf_log::encode(Format::V1, &LogCommand::Meta(command)).map_err(unavailable)?;
         let mut host = self.lock();
+        let format = host.machine().format();
+        let entry = kbf_log::encode(format, &LogCommand::Meta(command)).map_err(unavailable)?;
         let index = host.propose(entry).map_err(unavailable)?;
         // A single voter commits and applies its own proposal before `propose` returns.
         host.machine()
@@ -351,7 +429,7 @@ impl<F: Fs> Shared<F> {
 
     fn tick(&self) -> Result<FarmTime, MetaLogError> {
         self.execute(Command::Tick(self.now()))?;
-        Ok(self.lock().machine().meta().now())
+        Ok(machine::read(&self.state).now())
     }
 }
 

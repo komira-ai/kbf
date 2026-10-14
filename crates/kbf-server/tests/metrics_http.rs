@@ -37,6 +37,7 @@ fn start() -> (SocketAddr, SocketAddr) {
         shutdown_timeout: Duration::from_secs(10),
         store_probe_timeout: kbf_server::health::STORE_PROBE_TIMEOUT,
         invocation_memory: kbf_front::DEFAULT_INVOCATION_MEMORY,
+        segments: kbf_front::SegmentsConfig::DEFAULT,
     };
     let api = Api {
         listen: loopback(),

@@ -1,6 +1,6 @@
 //! How the driver reports a lease killed for memory, against the stand-in `podman`
 //! (`support/fake.rs`) and a plain directory standing in for the cgroup mount:
-//! the action script writes the lease cgroup's `memory.events`, `memory.current` and
+//! the action's act steps write the lease cgroup's `memory.events`, `memory.current` and
 //! `memory.swap.current` as the kernel would. `podman_memory.rs` runs the same promises
 //! against a real kernel.
 //!
@@ -23,6 +23,49 @@ use crate::support::{Spec, store_action, work};
 /// The cap `Fake::run`'s 1 GiB booking gets: 1.5 GiB + 512 MiB.
 const CAP: u64 = (3 << 29) + (512 << 20);
 
+/// The act steps of an action here, added one at a time.
+#[derive(Default)]
+struct Steps(Vec<String>);
+
+impl Steps {
+    /// Adds the step `words`.
+    fn then(mut self, words: &[&str]) -> Self {
+        if !self.0.is_empty() {
+            self.0.push(";".to_owned());
+        }
+        self.0.extend(words.iter().map(|word| (*word).to_owned()));
+        self
+    }
+
+    /// Writes `lines`, each with a newline, to the lease cgroup's `file`, as the kernel
+    /// would update it.
+    fn cgroup(self, file: &str, lines: &[&str]) -> Self {
+        let path = format!("$CG/{file}");
+        let mut words = vec!["write-lines", path.as_str()];
+        words.extend(lines);
+        self.then(&words)
+    }
+
+    /// Writes `memory.events` whole: a new file renamed over it, so the swap watch
+    /// never reads half of it.
+    fn events(self, lines: &[&str]) -> Self {
+        self.cgroup("memory.events.new", lines).then(&[
+            "rename",
+            "$CG/memory.events.new",
+            "$CG/memory.events",
+        ])
+    }
+
+    fn sleep(self, secs: &str) -> Self {
+        self.then(&["sleep", secs])
+    }
+
+    /// The steps, ending with exit status `code`.
+    fn exit(self, code: u8) -> Vec<String> {
+        self.then(&["exit", code.to_string().as_str()]).0
+    }
+}
+
 /// Catches a kernel OOM kill reported as the action's own exit 137 (it would be cached
 /// as a failing action), an action's own exit 137 reported as an OOM, and the two
 /// kinds of OOM kill not told apart by the lease cgroup's counters: a kill whose `oom`
@@ -35,9 +78,14 @@ async fn exit_137_is_an_oom_only_with_a_kernel_oom_event() {
     let spec = Spec::new(&image(), "unused");
     // `Fake::run` books 1 GiB.
     let cap = (3u64 << 29) + (512 << 20);
-    let oom = r#"printf 'low 0\nhigh 4\nmax 1\noom 1\noom_kill 1\n' > "$CG/memory.events"
-        echo 2000000000 > "$CG/memory.peak"; exit 137"#;
-    let outcome = fake.run(1, &spec, oom).await;
+    let oom = Steps::default()
+        .cgroup(
+            "memory.events",
+            &["low 0", "high 4", "max 1", "oom 1", "oom_kill 1"],
+        )
+        .cgroup("memory.peak", &["2000000000"])
+        .exit(137);
+    let outcome = fake.run(1, &spec, &oom).await;
     assert!(
         matches!(outcome, Err(RuntimeError::OutOfMemory { used: 2_000_000_000, limit }) if limit == cap),
         "{outcome:?}"
@@ -45,21 +93,25 @@ async fn exit_137_is_an_oom_only_with_a_kernel_oom_event() {
     fake.assert_clean(1);
 
     // Killed by an ancestor's OOM: `oom_kill` in the lease, its own `oom` never.
-    let busy = r#"printf 'max 0\noom 0\noom_kill 3\n' > "$CG/memory.events"; exit 137"#;
-    let outcome = fake.run(2, &spec, busy).await;
+    let busy = Steps::default()
+        .cgroup("memory.events", &["max 0", "oom 0", "oom_kill 3"])
+        .exit(137);
+    let outcome = fake.run(2, &spec, &busy).await;
     assert!(
         matches!(outcome, Err(RuntimeError::BusyNode(ref why)) if why.contains("killed 3 process")),
         "{outcome:?}"
     );
     fake.assert_clean(2);
 
-    let own = r#"printf 'max 0\noom 0\noom_kill 0\n' > "$CG/memory.events"; exit 137"#;
-    let result = fake.run(3, &spec, own).await.expect("ran");
+    let own = Steps::default()
+        .cgroup("memory.events", &["max 0", "oom 0", "oom_kill 0"])
+        .exit(137);
+    let result = fake.run(3, &spec, &own).await.expect("ran");
     assert_eq!(result.exit_code, 137);
     fake.assert_clean(3);
 
     // No memory.events to read: the driver cannot tell, so it does not guess.
-    let outcome = fake.run(4, &spec, "exit 137").await;
+    let outcome = fake.run(4, &spec, &["exit", "137"]).await;
     assert!(
         matches!(outcome, Err(RuntimeError::Failed(ref why)) if why.contains("memory.events")),
         "{outcome:?}"
@@ -67,8 +119,10 @@ async fn exit_137_is_an_oom_only_with_a_kernel_oom_event() {
     fake.assert_clean(4);
 
     // Nor when memory.events carries no count.
-    let garbled = r#"printf 'max 0\noom 0\noom_kill many\n' > "$CG/memory.events"; exit 137"#;
-    let outcome = fake.run(5, &spec, garbled).await;
+    let garbled = Steps::default()
+        .cgroup("memory.events", &["max 0", "oom 0", "oom_kill many"])
+        .exit(137);
+    let outcome = fake.run(5, &spec, &garbled).await;
     assert!(
         matches!(outcome, Err(RuntimeError::Failed(ref why)) if why.contains("no oom_kill count")),
         "{outcome:?}"
@@ -85,10 +139,12 @@ async fn a_memory_kill_says_whose_limit_ran_out() {
     let fake = Fake::new("oom-whose");
     let spec = Spec::new(&image(), "unused");
     let local = fake.cgroup.join("actions/memory.events.local");
-    let busy = r#"printf 'max 0\noom 0\noom_kill 1\n' > "$CG/memory.events""#;
+    let busy = || Steps::default().cgroup("memory.events", &["max 0", "oom 0", "oom_kill 1"]);
 
     std::fs::write(&local, "low 0\noom 4\noom_kill 9\n").expect("write");
-    let grew = format!(r#"{busy}; printf 'oom 6\n' > "$CG/../memory.events.local"; exit 137"#);
+    let grew = busy()
+        .cgroup("../memory.events.local", &["oom 6"])
+        .exit(137);
     let outcome = fake.run(1, &spec, &grew).await;
     assert!(
         matches!(outcome, Err(RuntimeError::BusyNode(ref why))
@@ -97,7 +153,7 @@ async fn a_memory_kill_says_whose_limit_ran_out() {
     );
     fake.assert_clean(1);
 
-    let outcome = fake.run(2, &spec, &format!("{busy}; exit 137")).await;
+    let outcome = fake.run(2, &spec, &busy().exit(137)).await;
     assert!(
         matches!(outcome, Err(RuntimeError::BusyNode(ref why))
             if why.contains("did not run for the actions/ cgroup's own limit")),
@@ -106,7 +162,7 @@ async fn a_memory_kill_says_whose_limit_ran_out() {
     fake.assert_clean(2);
 
     std::fs::write(&local, "garbled\n").expect("write");
-    let outcome = fake.run(3, &spec, &format!("{busy}; exit 137")).await;
+    let outcome = fake.run(3, &spec, &busy().exit(137)).await;
     assert!(
         matches!(outcome, Err(RuntimeError::BusyNode(ref why))
             if why.contains("memory.events.local could not be read")),
@@ -115,9 +171,11 @@ async fn a_memory_kill_says_whose_limit_ran_out() {
     fake.assert_clean(3);
 
     let cap = (3u64 << 29) + (512 << 20);
-    let own = r#"printf 'max 2\noom 1\noom_kill 1\n' > "$CG/memory.events"
-        echo n/a > "$CG/memory.peak"; exit 137"#;
-    let outcome = fake.run(4, &spec, own).await;
+    let own = Steps::default()
+        .cgroup("memory.events", &["max 2", "oom 1", "oom_kill 1"])
+        .cgroup("memory.peak", &["n/a"])
+        .exit(137);
+    let outcome = fake.run(4, &spec, &own).await;
     assert!(
         matches!(outcome, Err(RuntimeError::OutOfMemory { used, limit }) if used == cap && limit == cap),
         "{outcome:?}"
@@ -133,25 +191,29 @@ async fn a_memory_kill_says_whose_limit_ran_out() {
 async fn a_memory_kill_without_an_exit_from_podman_is_still_reported() {
     let fake = Fake::new("oom-no-exit");
     let spec = Spec::new(&image(), "unused");
-    let own = r#"printf 'max 2\noom 1\noom_kill 1\n' > "$CG/memory.events"
-        echo 5000000000 > "$CG/memory.peak"; exit 137"#;
-    let busy = r#"printf 'max 0\noom 0\noom_kill 2\n' > "$CG/memory.events"; exit 137"#;
+    let own = Steps::default()
+        .cgroup("memory.events", &["max 2", "oom 1", "oom_kill 1"])
+        .cgroup("memory.peak", &["5000000000"])
+        .exit(137);
+    let busy = Steps::default()
+        .cgroup("memory.events", &["max 0", "oom 0", "oom_kill 2"])
+        .exit(137);
 
     fake.knob("status-override", "stopped 0\n");
-    let outcome = fake.run(1, &spec, own).await;
+    let outcome = fake.run(1, &spec, &own).await;
     assert!(
         matches!(outcome, Err(RuntimeError::OutOfMemory { used: 5_000_000_000, limit }) if limit == CAP),
         "{outcome:?}"
     );
     fake.assert_clean(1);
-    let outcome = fake.run(2, &spec, busy).await;
+    let outcome = fake.run(2, &spec, &busy).await;
     assert!(
         matches!(outcome, Err(RuntimeError::BusyNode(ref why)) if why.contains("killed 2 process")),
         "{outcome:?}"
     );
     fake.assert_clean(2);
     // No kill in the counters: Podman's word stands.
-    let outcome = fake.run(3, &spec, "exit 137").await;
+    let outcome = fake.run(3, &spec, &["exit", "137"]).await;
     assert!(
         matches!(outcome, Err(RuntimeError::Failed(ref why)) if why.contains("did not run to an exit")),
         "{outcome:?}"
@@ -160,12 +222,12 @@ async fn a_memory_kill_without_an_exit_from_podman_is_still_reported() {
     std::fs::remove_file(fake.state.join("status-override")).expect("unset");
 
     fake.knob("inspect-fails", "");
-    let outcome = fake.run(4, &spec, own).await;
+    let outcome = fake.run(4, &spec, &own).await;
     assert!(
         matches!(outcome, Err(RuntimeError::OutOfMemory { limit, .. }) if limit == CAP),
         "{outcome:?}"
     );
-    let outcome = fake.run(5, &spec, "exit 137").await;
+    let outcome = fake.run(5, &spec, &["exit", "137"]).await;
     assert!(
         matches!(outcome, Err(RuntimeError::Failed(ref why)) if why.contains("inspect")),
         "{outcome:?}"
@@ -203,7 +265,7 @@ enum Cap {
 /// An action that holds 5000 bytes in RAM and `swap` in swap (with [`Cap::Once`] and
 /// [`Cap::HeldThenPressed`], from about 200 ms in), its `max` events moving as `cap`
 /// says. It ends with exit 0 after about a second unless something kills it.
-fn holding(swap: u64, cap: Cap) -> String {
+fn holding(swap: u64, cap: Cap) -> Vec<String> {
     // The step from which `max` grows, and the step at which the swap goes out.
     let (start, grow_from, swap_at) = match cap {
         Cap::Pressed => (2, 0, 0),
@@ -212,17 +274,21 @@ fn holding(swap: u64, cap: Cap) -> String {
         Cap::HeldThenPressed => (2, 40, 20),
     };
     let first = if swap_at == 0 { swap } else { 0 };
-    format!(
-        r#"echo 5000 > "$CG/memory.current"; echo {first} > "$CG/memory.swap.current"
-        i={start}; n=0
-        while [ $n -lt 100 ]; do
-            [ $n -eq {swap_at} ] && echo {swap} > "$CG/memory.swap.current"
-            printf 'max %d\noom 0\noom_kill 0\n' $i > "$CG/memory.events.new"
-            mv "$CG/memory.events.new" "$CG/memory.events"
-            [ $n -ge {grow_from} ] && i=$((i + 1)); n=$((n + 1)); sleep 0.01
-        done
-        exit 0"#
-    )
+    let mut steps = Steps::default()
+        .cgroup("memory.current", &["5000"])
+        .cgroup("memory.swap.current", &[first.to_string().as_str()]);
+    let mut max = start;
+    for n in 0..100 {
+        if n == swap_at {
+            steps = steps.cgroup("memory.swap.current", &[swap.to_string().as_str()]);
+        }
+        steps = steps.events(&[format!("max {max}").as_str(), "oom 0", "oom_kill 0"]);
+        if n >= grow_from {
+            max += 1;
+        }
+        steps = steps.sleep("0.01");
+    }
+    steps.exit(0)
 }
 
 /// Catches the swap watch missing (the over-cap lease runs on: exit 0), a kill
@@ -265,21 +331,19 @@ async fn a_lease_pressing_its_cap_into_swap_is_killed_as_out_of_memory() {
 /// while each 50 ms its `max` events grow and 256 KiB more goes to swap: all of its swap
 /// is its own. It ends with exit 0 after about 5 s unless something kills it. The
 /// swap file reads `n/a` while `max` moves, so no sample sees swap rise with `max` flat.
-fn reclaimed_below_the_cap() -> String {
-    format!(
-        r#"echo {ram} > "$CG/memory.current"; echo 0 > "$CG/memory.swap.current"
-        n=1
-        while [ $n -le 100 ]; do
-            echo n/a > "$CG/memory.swap.current"
-            printf 'max %d\noom 0\noom_kill 0\n' $n > "$CG/memory.events.new"
-            mv "$CG/memory.events.new" "$CG/memory.events"
-            echo $((n * {step})) > "$CG/memory.swap.current"
-            n=$((n + 1)); sleep 0.05
-        done
-        exit 0"#,
-        ram = CAP - (1 << 20),
-        step = 256 << 10,
-    )
+fn reclaimed_below_the_cap() -> Vec<String> {
+    const STEP: u64 = 256 << 10;
+    let mut steps = Steps::default()
+        .cgroup("memory.current", &[(CAP - (1 << 20)).to_string().as_str()])
+        .cgroup("memory.swap.current", &["0"]);
+    for n in 1..=100 {
+        steps = steps
+            .cgroup("memory.swap.current", &["n/a"])
+            .events(&[format!("max {n}").as_str(), "oom 0", "oom_kill 0"])
+            .cgroup("memory.swap.current", &[(n * STEP).to_string().as_str()])
+            .sleep("0.05");
+    }
+    steps.exit(0)
 }
 
 /// Catches a kill check that wants RAM plus swap past the cap by the threshold (the
@@ -332,7 +396,7 @@ async fn swap_without_pressing_the_cap_kills_nothing() {
     assert_eq!(result.exit_code, 0);
     fake.assert_clean(2);
 
-    fake.knob("action.sh", &holding(1 << 40, Cap::Pressed));
+    fake.action(&holding(1 << 40, Cap::Pressed));
     let action = store_action(&fake.cas, &spec);
     let result = fake
         .runtime
@@ -353,14 +417,21 @@ async fn swap_without_pressing_the_cap_kills_nothing() {
 #[tokio::test]
 async fn an_unreadable_sample_changes_nothing() {
     let fake = watched("swap-unreadable", 64 << 10, 0);
-    let script = r#"echo 5000 > "$CG/memory.current"; echo 0 > "$CG/memory.swap.current"
-        printf 'max 2\noom 0\noom_kill 0\n' > "$CG/memory.events"
-        sleep 0.2; echo 1099511627776 > "$CG/memory.swap.current"
-        sleep 0.3; echo n/a > "$CG/memory.swap.current"
-        sleep 0.1; echo 1099511627776 > "$CG/memory.swap.current"
-        sleep 0.4; exit 0"#;
+    let swapped = "1099511627776";
+    let steps = Steps::default()
+        .cgroup("memory.current", &["5000"])
+        .cgroup("memory.swap.current", &["0"])
+        .cgroup("memory.events", &["max 2", "oom 0", "oom_kill 0"])
+        .sleep("0.2")
+        .cgroup("memory.swap.current", &[swapped])
+        .sleep("0.3")
+        .cgroup("memory.swap.current", &["n/a"])
+        .sleep("0.1")
+        .cgroup("memory.swap.current", &[swapped])
+        .sleep("0.4")
+        .exit(0);
     let result = fake
-        .run(1, &Spec::new(&image(), "unused"), script)
+        .run(1, &Spec::new(&image(), "unused"), &steps)
         .await
         .expect("ran");
     assert_eq!(result.exit_code, 0);
@@ -427,7 +498,7 @@ async fn the_swap_kill_ends_even_when_cgroup_kill_fails() {
     };
     let spec = Spec::new(&image(), "unused");
     let started = Instant::now();
-    let (outcome, ()) = tokio::join!(fake.run(1, &spec, "exec sleep 30"), steps);
+    let (outcome, ()) = tokio::join!(fake.run(1, &spec, &["sleep", "30"]), steps);
     assert!(
         matches!(outcome, Err(RuntimeError::OutOfMemory { limit, .. }) if limit == CAP),
         "{outcome:?}"
@@ -463,24 +534,51 @@ async fn the_swap_kill_ends_even_when_cgroup_kill_fails() {
 async fn a_kernel_oom_at_the_cap_after_host_swap_is_the_kernels_not_the_watchs() {
     let fake = watched("swap-kernel-oom", 192 << 20, 0);
     // Each sample: memory.current, memory.swap.current, memory.events `max`.
-    let script = r#"for s in "1282048 315006976 0" "1282048 315006976 0" \
-            "52322304 314839040 0" "68202496 314834944 491" "68100096 314834944 929" \
-            "68370432 314953728 1198" "68239360 314953728 1514" "68300800 314839040 1838" \
-            "17182720 314839040 2101" "19279872 314839040 2101" "36839424 314839040 2101" \
-            "52568064 314839040 2101" "53874688 314839040 2101" \
-            "68390912 381247488 2106" "68022272 382926848 2129"; do
-            set -- $s
-            echo $1 > "$CG/memory.current"; echo $2 > "$CG/memory.swap.current"
-            printf 'low 0\nhigh 0\nmax %d\noom 0\noom_kill 0\noom_group_kill 0\n' $3 \
-                > "$CG/memory.events.new"
-            mv "$CG/memory.events.new" "$CG/memory.events"; sleep 0.06
-        done
-        printf 'low 0\nhigh 0\nmax 2129\noom 1\noom_kill 13\noom_group_kill 1\n' \
-            > "$CG/memory.events.new"
-        mv "$CG/memory.events.new" "$CG/memory.events"
-        echo 66035712 > "$CG/memory.swap.current"; echo 454856704 > "$CG/memory.peak"
-        exit 137"#;
-    let outcome = fake.run(1, &Spec::new(&image(), "unused"), script).await;
+    let samples = [
+        ("1282048", "315006976", 0),
+        ("1282048", "315006976", 0),
+        ("52322304", "314839040", 0),
+        ("68202496", "314834944", 491),
+        ("68100096", "314834944", 929),
+        ("68370432", "314953728", 1198),
+        ("68239360", "314953728", 1514),
+        ("68300800", "314839040", 1838),
+        ("17182720", "314839040", 2101),
+        ("19279872", "314839040", 2101),
+        ("36839424", "314839040", 2101),
+        ("52568064", "314839040", 2101),
+        ("53874688", "314839040", 2101),
+        ("68390912", "381247488", 2106),
+        ("68022272", "382926848", 2129),
+    ];
+    let mut steps = Steps::default();
+    for (current, swap, max) in samples {
+        steps = steps
+            .cgroup("memory.current", &[current])
+            .cgroup("memory.swap.current", &[swap])
+            .events(&[
+                "low 0",
+                "high 0",
+                format!("max {max}").as_str(),
+                "oom 0",
+                "oom_kill 0",
+                "oom_group_kill 0",
+            ])
+            .sleep("0.06");
+    }
+    let steps = steps
+        .events(&[
+            "low 0",
+            "high 0",
+            "max 2129",
+            "oom 1",
+            "oom_kill 13",
+            "oom_group_kill 1",
+        ])
+        .cgroup("memory.swap.current", &["66035712"])
+        .cgroup("memory.peak", &["454856704"])
+        .exit(137);
+    let outcome = fake.run(1, &Spec::new(&image(), "unused"), &steps).await;
     assert!(
         matches!(outcome, Err(RuntimeError::OutOfMemory { used: 454_856_704, limit })
             if limit == CAP),
