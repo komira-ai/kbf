@@ -21,8 +21,10 @@
 //! being read holds a descriptor: the walk returns to a parent through the child's
 //! `..`, and refuses a `..` that is not the directory it came from (device and inode).
 //!
-//! No file is read into memory whole: each is hashed and then stored one chunk at a
-//! time ([`FileBlob::store`]), and one past the byte limit is refused after `limit + 1` bytes.
+//! No file is read into memory whole: each is hashed one chunk at a time and closed,
+//! and one past the byte limit is refused after `limit + 1` bytes. Once the walk is
+//! done, the CAS is asked about every blob it found at once, and the missing ones are
+//! stored, a file opened again and sent one chunk at a time ([`crate::pending`]).
 //! The action's stdout and stderr are stored the same way, each within its own limit
 //! ([`collect_log`]).
 //!
@@ -40,7 +42,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use kbf_daemon::cas::{Cas, digest_of};
-use kbf_outputs::Uploads;
 use kbf_proto::reapi::{
     ActionResult, Digest, Directory, DirectoryNode, FileNode, OutputDirectory, OutputFile,
     OutputSymlink, SymlinkNode, Tree,
@@ -50,6 +51,7 @@ use rustix::fs::{AtFlags, CWD, Dir, FileType, Mode, OFlags, Stat};
 use rustix::io::Errno;
 
 use crate::cas::FileBlob;
+use crate::pending::{FileAt, Pending};
 use crate::tree::{Exceeded, TreeError, check_relative};
 
 /// How much output one action may leave. An action past a limit fails with
@@ -125,16 +127,12 @@ impl Budget {
     }
 
     /// Counts the bytes of the file hashed at `shown`; `None` is one that did not fit.
-    fn file(
-        &mut self,
-        read: Option<(FileBlob, bool)>,
-        shown: &Path,
-    ) -> Result<(FileBlob, bool), TreeError> {
-        let Some((blob, executable)) = read else {
+    fn file(&mut self, read: Option<Hashed>, shown: &Path) -> Result<Hashed, TreeError> {
+        let Some(hashed) = read else {
             return Err(limit(shown, Exceeded::Bytes, self.limits.max_bytes));
         };
-        self.bytes += blob.size();
-        Ok((blob, executable))
+        self.bytes += hashed.blob.size();
+        Ok(hashed)
     }
 }
 
@@ -154,7 +152,7 @@ pub(crate) const DIRECTORY: OFlags = OFlags::RDONLY
 
 /// Opens a regular file for reading, refusing a symlink, and never blocking on a FIFO
 /// or claiming a terminal that replaced it after the `stat`.
-const FILE: OFlags = OFlags::RDONLY
+pub(crate) const FILE: OFlags = OFlags::RDONLY
     .union(OFlags::NOFOLLOW)
     .union(OFlags::NONBLOCK)
     .union(OFlags::NOCTTY)
@@ -203,7 +201,7 @@ pub(crate) async fn blocking<T: Send + 'static>(
 
 /// Opens each of `parts` below `start` as a directory. `None` when one is absent, a
 /// file or a symlink.
-fn descend(start: &OwnedFd, parts: &[String]) -> std::io::Result<Option<OwnedFd>> {
+pub(crate) fn descend(start: &OwnedFd, parts: &[String]) -> std::io::Result<Option<OwnedFd>> {
     let mut here = start.as_fd().try_clone_to_owned()?;
     for part in parts {
         here = match rustix::fs::openat(&here, part.as_str(), DIRECTORY, Mode::empty()) {
@@ -226,23 +224,38 @@ fn examine(dir: &OwnedFd, name: &OsStr) -> std::io::Result<Option<Kind>> {
     }
 }
 
-/// The regular file `name` in `dir`, hashed, and its executable bit; `None` when it
-/// holds more than `max` bytes (see [`hash_regular`]).
-fn read_file(dir: &OwnedFd, name: &OsStr, max: u64) -> std::io::Result<Option<(FileBlob, bool)>> {
+/// A regular file, hashed: its blob (holding it open), its executable bit and its
+/// device and inode.
+#[derive(Debug)]
+struct Hashed {
+    blob: FileBlob,
+    executable: bool,
+    id: Identity,
+}
+
+/// The regular file `name` in `dir`, hashed; `None` when it holds more than `max`
+/// bytes (see [`hash_regular`]).
+fn read_file(dir: &OwnedFd, name: &OsStr, max: u64) -> std::io::Result<Option<Hashed>> {
     hash_regular(rustix::fs::openat(dir, name, FILE, Mode::empty())?, max)
 }
 
 /// The file open as `fd`, hashed ([`FileBlob::hash`]: at most `max + 1` bytes read,
-/// one chunk held at a time), and its executable bit. The type is checked on the
-/// descriptor: an entry that stopped being a regular file after it was examined is an
-/// error, never read.
-fn hash_regular(fd: OwnedFd, max: u64) -> std::io::Result<Option<(FileBlob, bool)>> {
-    let Kind::File { executable } = kind(&rustix::fs::fstat(&fd)?) else {
+/// one chunk held at a time). The type is checked on the descriptor: an entry that
+/// stopped being a regular file after it was examined is an error, never read.
+fn hash_regular(fd: OwnedFd, max: u64) -> std::io::Result<Option<Hashed>> {
+    let stat = rustix::fs::fstat(&fd)?;
+    let Kind::File { executable } = kind(&stat) else {
         return Err(std::io::Error::other(
             "is no longer a regular file once opened",
         ));
     };
-    Ok(FileBlob::hash(std::fs::File::from(fd), max)?.map(|blob| (blob, executable)))
+    let id = (stat.st_dev, stat.st_ino);
+    let blob = FileBlob::hash(std::fs::File::from(fd), max)?;
+    Ok(blob.map(|blob| Hashed {
+        blob,
+        executable,
+        id,
+    }))
 }
 
 /// The target of the symlink `name` in `dir`, as written; never followed.
@@ -272,10 +285,10 @@ pub(crate) async fn collect_log(
         hash_regular(rustix::fs::openat(CWD, &open, FILE, Mode::empty())?, max)
     })
     .await?;
-    let Some((blob, _)) = read else {
+    let Some(hashed) = read else {
         return Err(limit(path, Exceeded::Stdio, max));
     };
-    Ok(blob.store(cas).await?)
+    Ok(hashed.blob.store(cas).await?)
 }
 
 /// An entry of a directory being walked: its name and what it is.
@@ -304,7 +317,7 @@ fn list(dir: &OwnedFd, max: u64) -> std::io::Result<Vec<Entry>> {
 /// A directory's device and inode.
 pub(crate) type Identity = (u64, u64);
 
-pub(crate) fn identity(fd: &OwnedFd) -> std::io::Result<Identity> {
+pub(crate) fn identity(fd: &impl AsFd) -> std::io::Result<Identity> {
     let stat = rustix::fs::fstat(fd)?;
     Ok((stat.st_dev, stat.st_ino))
 }
@@ -336,7 +349,8 @@ pub(crate) fn back_to_parent(dir: &OwnedFd, expected: Identity) -> std::io::Resu
 
 /// Reads each output path under `working_directory` in `upper` into the CAS and records
 /// it in `result`, all of them together within `limits`. See the module comment for
-/// what is followed (nothing) and what is left out.
+/// what is followed (nothing) and what is left out. The walk only hashes; the blobs
+/// are stored after it, those the CAS lacks ([`Pending::store_missing`]).
 pub(crate) async fn collect(
     cas: &impl Cas,
     upper: &Path,
@@ -361,20 +375,24 @@ pub(crate) async fn collect(
         .filter(|part| !part.is_empty())
         .map(str::to_owned)
         .collect();
+    let mut pending = Pending::default();
     let budget = Budget::new(limits);
-    let (uploads, drain) = Uploads::new(cas.in_flight());
-    let walk = record(
-        cas, uploads, budget, &upper_fd, &wd_parts, &base, paths, result,
-    );
-    futures::try_join!(walk, drain)?;
-    Ok(())
+    record(
+        &mut pending,
+        budget,
+        &upper_fd,
+        &wd_parts,
+        &base,
+        paths,
+        result,
+    )
+    .await?;
+    pending.store_missing(cas, &upper_fd).await
 }
 
-/// [`collect`]'s walk over each output path, its blobs queued on `uploads`.
-#[allow(clippy::too_many_arguments)]
-async fn record<'a, C: Cas>(
-    cas: &'a C,
-    mut uploads: Uploads<'a, TreeError>,
+/// [`collect`]'s walk over each output path, its blobs added to `pending`.
+async fn record(
+    pending: &mut Pending,
     mut budget: Budget,
     upper_fd: &Arc<OwnedFd>,
     wd_parts: &[String],
@@ -395,7 +413,9 @@ async fn record<'a, C: Cas>(
                 .filter(|part| !part.is_empty())
                 .map(str::to_owned),
         );
+        let node_name = name.to_owned();
         let name = PathBuf::from(name);
+        let dirs: Arc<[String]> = parts.clone().into();
         let start = Arc::clone(upper_fd);
         // Absent, a file or a symlink on the way: the action did not create the output.
         let Some(parent) = blocking(&shown, move || descend(&start, &parts)).await? else {
@@ -413,27 +433,33 @@ async fn record<'a, C: Cas>(
                 let max = budget.bytes_left();
                 let read =
                     blocking(&shown, move || read_file(&parent, name.as_os_str(), max)).await?;
-                let (blob, executable) = budget.file(read, &shown)?;
+                let hashed = budget.file(read, &shown)?;
+                let (digest, executable) = found_file(pending, hashed, &dirs, node_name, shown);
                 result.output_files.push(OutputFile {
                     path: path.clone(),
-                    digest: Some(queue_file(&mut uploads, cas, blob).await),
+                    digest: Some(digest),
                     is_executable: executable,
                     ..OutputFile::default()
                 });
             }
             Some(Kind::Directory) => {
                 budget.entries(1, &shown)?;
+                let mut parts = dirs.to_vec();
+                parts.push(node_name);
                 let (root, children) =
-                    walk(cas, &mut uploads, &mut budget, parent, name, shown).await?;
+                    walk(pending, &mut budget, parent, name, shown, parts.into()).await?;
+                // Every Directory is stored, not only the Tree: the farm's action cache
+                // refuses a result whose `root_directory_digest` it does not hold, and
+                // each digest the Tree names can be fetched.
                 for child in &children {
-                    queue_bytes(&mut uploads, cas, child.encode_to_vec()).await;
+                    pending.bytes(child.encode_to_vec());
                 }
-                let root_digest = queue_bytes(&mut uploads, cas, root.encode_to_vec()).await;
+                let root_digest = pending.bytes(root.encode_to_vec());
                 let tree = Tree {
                     root: Some(root),
                     children,
                 };
-                let tree_digest = queue_bytes(&mut uploads, cas, tree.encode_to_vec()).await;
+                let tree_digest = pending.bytes(tree.encode_to_vec());
                 result.output_directories.push(OutputDirectory {
                     path: path.clone(),
                     tree_digest: Some(tree_digest),
@@ -455,31 +481,24 @@ async fn record<'a, C: Cas>(
     Ok(())
 }
 
-/// Queues the file `blob` on `uploads` and returns its digest.
-async fn queue_file<'a>(
-    uploads: &mut Uploads<'a, TreeError>,
-    cas: &'a impl Cas,
-    blob: FileBlob,
-) -> Digest {
-    let digest = blob.digest().clone();
-    let upload = async move { blob.store(cas).await.map(drop).map_err(TreeError::from) };
-    uploads.queue(&digest, upload).await;
-    digest
-}
-
-/// Queues `bytes` (a Directory or Tree message) on `uploads` and returns their
-/// digest. The farm's action cache refuses a result whose `root_directory_digest` it
-/// does not hold; every Directory below is stored too, so each digest the Tree names
-/// can be fetched.
-async fn queue_bytes<'a>(
-    uploads: &mut Uploads<'a, TreeError>,
-    cas: &'a impl Cas,
-    bytes: Vec<u8>,
-) -> Digest {
-    let digest = digest_of(&bytes);
-    let upload = async move { cas.put(bytes).await.map(drop).map_err(TreeError::from) };
-    uploads.queue(&digest, upload).await;
-    digest
+/// Adds the file `hashed`, named `name` in the directory `dirs` below the upper
+/// directory, to `pending`, closing it; returns its digest and executable bit.
+fn found_file(
+    pending: &mut Pending,
+    hashed: Hashed,
+    dirs: &Arc<[String]>,
+    name: String,
+    shown: PathBuf,
+) -> (Digest, bool) {
+    let digest = hashed.blob.digest().clone();
+    let at = FileAt {
+        dirs: Arc::clone(dirs),
+        name,
+        id: hashed.id,
+        shown,
+    };
+    pending.file(&digest, at);
+    (digest, hashed.executable)
 }
 
 /// A directory on the walk's stack: what is left of its entries and what is built of
@@ -489,6 +508,8 @@ struct Frame {
     shown: PathBuf,
     /// Its name in its parent's Directory.
     name: String,
+    /// The directories from the upper directory down to it, by name, itself included.
+    parts: Arc<[String]>,
     /// Checked when the walk comes back to it from a child.
     id: Identity,
     entries: std::vec::IntoIter<Entry>,
@@ -498,13 +519,14 @@ struct Frame {
 }
 
 /// Opens and lists the directory `name` in `parent`, counting its entries against the
-/// budget.
+/// budget. `parts` names it from the upper directory down.
 async fn open_frame(
     budget: &mut Budget,
     parent: Arc<OwnedFd>,
     name: PathBuf,
     shown: PathBuf,
     node_name: String,
+    parts: Arc<[String]>,
     slot: usize,
 ) -> Result<(Arc<OwnedFd>, Frame), TreeError> {
     let max = budget.entries_left();
@@ -514,6 +536,7 @@ async fn open_frame(
     let frame = Frame {
         shown,
         name: node_name,
+        parts,
         id,
         entries: entries.into_iter(),
         directory: Directory::default(),
@@ -522,22 +545,23 @@ async fn open_frame(
     Ok((Arc::new(fd), frame))
 }
 
-/// The directory `name` in `parent` (shown as `shown`) as a Directory, with every
-/// Directory below it in pre-order, storing each file. Symlinks inside are recorded,
-/// never followed.
+/// The directory `name` in `parent` (shown as `shown`, named `parts` from the upper
+/// directory down) as a Directory, with every Directory below it in pre-order, each
+/// file hashed and added to `pending`. Symlinks inside are recorded, never followed.
 ///
 /// Iterative, not recursive: the directories being read are a `Vec` of frames, so the
 /// tree's depth costs heap, not thread stack, and the depth limit is checked before a
 /// directory is opened.
-async fn walk<'a, C: Cas>(
-    cas: &'a C,
-    uploads: &mut Uploads<'a, TreeError>,
+async fn walk(
+    pending: &mut Pending,
     budget: &mut Budget,
     parent: Arc<OwnedFd>,
     name: PathBuf,
     shown: PathBuf,
+    parts: Arc<[String]>,
 ) -> Result<(Directory, Vec<Directory>), TreeError> {
-    let (mut here, mut root) = open_frame(budget, parent, name, shown, String::new(), 0).await?;
+    let (mut here, mut root) =
+        open_frame(budget, parent, name, shown, String::new(), parts, 0).await?;
     // The frames below the root; the last is the directory `here` holds open.
     let mut stack: Vec<Frame> = Vec::new();
     let mut children: Vec<Directory> = Vec::new();
@@ -569,10 +593,12 @@ async fn walk<'a, C: Cas>(
                 let max = budget.bytes_left();
                 let read =
                     blocking(&path, move || read_file(&dir, os_name.as_os_str(), max)).await?;
-                let (blob, executable) = budget.file(read, &path)?;
+                let hashed = budget.file(read, &path)?;
+                let (digest, executable) =
+                    found_file(pending, hashed, &top.parts, name.clone(), path);
                 top.directory.files.push(FileNode {
                     name,
-                    digest: Some(queue_file(uploads, cas, blob).await),
+                    digest: Some(digest),
                     is_executable: executable,
                     ..FileNode::default()
                 });
@@ -588,12 +614,15 @@ async fn walk<'a, C: Cas>(
             Kind::Directory => {
                 // The root is level 0 and `stack` holds the levels below it, so this
                 // directory is level `stack.len() + 1`.
+                let mut parts = top.parts.to_vec();
+                parts.push(name.clone());
+                let parts = parts.into();
                 let max_depth = budget.limits.max_depth;
                 if stack.len() >= max_depth {
                     return Err(limit(&path, Exceeded::Depth, max_depth as u64));
                 }
                 let slot = children.len();
-                let (fd, frame) = open_frame(budget, dir, os_name, path, name, slot).await?;
+                let (fd, frame) = open_frame(budget, dir, os_name, path, name, parts, slot).await?;
                 // Held by the slot until the frame is done, so `children` stays in
                 // pre-order.
                 children.push(Directory::default());
@@ -640,8 +669,11 @@ mod tests {
         // this function on its own, so this binary covers both arms).
         std::fs::write(dir.join("file"), b"bytes").expect("write");
         let read = read_file(&fd, OsStr::new("file"), 5).expect("a regular file");
-        let (blob, executable) = read.expect("within the bound");
-        assert_eq!((blob.digest(), executable), (&digest_of(b"bytes"), false));
+        let hashed = read.expect("within the bound");
+        assert_eq!(
+            (hashed.blob.digest(), hashed.executable),
+            (&digest_of(b"bytes"), false)
+        );
         let read = read_file(&fd, OsStr::new("file"), 4).expect("a regular file");
         assert!(read.is_none());
     }
