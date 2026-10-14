@@ -10,7 +10,9 @@
 //! the helper is started with that copy's cdhash as the daemon requirement, so it stands
 //! in for `kbf-daemon`. A copy signed under another identifier (so another cdhash) and
 //! named [`IMPOSTOR`] is the impostor. The client runs as the user sudo was run by, who
-//! reaches the socket through the `admin` group.
+//! reaches the socket through the `admin` group. A third copy, named `kbf-act`, is the
+//! program the tests' actions run: kbf-testkit's act steps (`kbf_testkit::act`), so no
+//! action needs a shell.
 //!
 //! The leak scan runs for real over the runner's own folders, Background Task Management
 //! and directory: a baseline through a baseline window the tests open, a clean scan, a
@@ -79,6 +81,10 @@ const _: () = {
     #[unsafe(link_section = "__DATA,__mod_init_func,mod_init_funcs")]
     static CLIENT_HOOK: extern "C" fn() = client_hook;
 };
+
+// Runs this binary as kbf-testkit's `kbf-act` when it is started through the copy of
+// that name (`Mac::act`): the program the tests' actions run.
+kbf_testkit::act_test_hook!();
 
 /// The helper's pid, for [`stop_helper`] at exit.
 static HELPER_PID: AtomicI32 = AtomicI32::new(0);
@@ -345,6 +351,8 @@ struct Mac {
     helper: PathBuf,
     client: PathBuf,
     impostor: PathBuf,
+    /// The copy that runs kbf-testkit's act steps, which every user may run.
+    act: PathBuf,
     /// The client copy's cdhash: the daemon requirement.
     genuine: String,
     runner: Runner,
@@ -373,6 +381,7 @@ impl Mac {
         sign_darwin(&helper);
         let client = signed_copy(CLIENT, None);
         let impostor = signed_copy(IMPOSTOR, Some("kbf.ci.impostor"));
+        let act = signed_copy(kbf_testkit::act::NAME, None);
         let genuine = cdhash(&client);
         let other = cdhash(&impostor);
         println!("client cdhash {genuine}, impostor cdhash {other}");
@@ -411,6 +420,7 @@ impl Mac {
             helper,
             client,
             impostor,
+            act,
             genuine,
             runner,
             serial,
@@ -541,6 +551,13 @@ impl Mac {
 
     fn impostor(&self, args: &[&str]) -> Out {
         self.as_runner(&self.impostor, args)
+    }
+
+    /// The argument vector of a process that runs the act `steps` (`kbf_testkit::act`).
+    fn act<'a>(&'a self, steps: &[&'a str]) -> Vec<&'a str> {
+        let mut argv = vec![path_str(&self.act)];
+        argv.extend(steps);
+        argv
     }
 
     /// `user-create` for `lease` (with a gate grant), which must give the next uid.
@@ -698,6 +715,15 @@ impl Lease<'_> {
     /// `run` in the background, in `dir`.
     fn run(&self, dir: &str, argv: &[&str]) -> Out {
         let mut args = vec!["run", SOCKET, self.id.as_str(), dir];
+        args.extend(argv);
+        self.mac.client(&args)
+    }
+
+    /// [`Lease::run`] with the action's stdout and stderr `/dev/null`, for an action
+    /// that leaves a process running: it holds none of the pipes this process reads to
+    /// the end.
+    fn run_quiet(&self, dir: &str, argv: &[&str]) -> Out {
+        let mut args = vec!["run-quiet", SOCKET, self.id.as_str(), dir];
         args.extend(argv);
         self.mac.client(&args)
     }

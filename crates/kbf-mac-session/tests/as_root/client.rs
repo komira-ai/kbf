@@ -9,6 +9,8 @@
 //! client create <socket> <lease> [grant token]   prints the uid
 //! client run <socket> <lease> <dir> <argv>...   prints "exit <code>" or "signal <n>"
 //! client run-gui <socket> <lease> <dir> <argv>...   the same, in the GUI session
+//! client run-quiet <socket> <lease> <dir> <argv>...   as run, with the action's
+//!                                                      stdout and stderr /dev/null
 //! client session-ready <socket> <lease>    prints "true" or "false"
 //! client kill <socket> <lease>
 //! client delete <socket> <lease>           prints "existed" or "absent"
@@ -110,7 +112,13 @@ mod macos {
             ["session-ready", socket, lease] => {
                 println!("{}", Client::new(socket).session_ready(lease)?);
             }
-            [verb @ ("run" | "run-gui"), socket, lease, dir, argv @ ..] => {
+            [
+                verb @ ("run" | "run-gui" | "run-quiet"),
+                socket,
+                lease,
+                dir,
+                argv @ ..,
+            ] => {
                 let session = if *verb == "run-gui" {
                     Session::Gui
                 } else {
@@ -121,7 +129,12 @@ mod macos {
                 let argv: Vec<String> = argv.iter().map(|&a| a.to_owned()).collect();
                 let stdout = std::io::stdout();
                 let stderr = std::io::stderr();
-                let fds = [null.as_fd(), stdout.as_fd(), stderr.as_fd(), dir.as_fd()];
+                // A process the action leaves running holds no pipe of the caller's.
+                let fds = if *verb == "run-quiet" {
+                    [null.as_fd(), null.as_fd(), null.as_fd(), dir.as_fd()]
+                } else {
+                    [null.as_fd(), stdout.as_fd(), stderr.as_fd(), dir.as_fd()]
+                };
                 let exit = Client::new(socket)
                     .run_in(lease, &argv, &[], fds, session)?
                     .wait()?;

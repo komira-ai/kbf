@@ -232,11 +232,12 @@ fn run_runs_as_the_lease_user_in_the_lease_directory() {
     // inherited ACL entry gives the daemon access; here it is open to all).
     let dir = scratch_dir("lease-7", 0o777);
     let lease = mac.create("7.1", None);
-    let out = lease.run(&dir, &["/bin/sh", "-c", "id -u; pwd -P; echo \"$HOME\""]);
+    let steps = ["run", "/usr/bin/id", "-u", ";", "pwd", ";", "env", "HOME"];
+    let out = lease.run(&dir, &mac.act(&steps));
     let want = format!("{}\n{dir}\n{}\nexit 0", lease.uid, home(&lease.name()));
     says(&out, &want, "run");
     says(
-        &lease.run(&dir, &["/bin/sh", "-c", "exit 7"]),
+        &lease.run(&dir, &mac.act(&["exit", "7"])),
         "exit 7",
         "the exit code",
     );
@@ -335,22 +336,42 @@ fn user_delete_waits_for_the_uid_s_processes_and_sweeps_without_following_links(
         );
         None
     };
-    let plant = r#"
-  set -e
-  echo "* * * * * /usr/bin/true" | crontab -
-  touch "$1"/kbf-ci-owned
-  mkdir -p "$1"/kbf-ci-dir/sub
-  touch "$1"/kbf-ci-dir/sub/f
-  ln -s /private/var/kbf-ci-sentinel "$1"/kbf-ci-link
-  touch /private/tmp/kbf-ci-locked
-  chflags uchg /private/tmp/kbf-ci-locked
-  touch "$(getconf DARWIN_USER_TEMP_DIR)kbf-ci-temp"
-  /bin/sleep 600 </dev/null >/dev/null 2>&1 &
-"#;
+    // The lease user plants its state: a crontab (from a file every user may read),
+    // files in the shared folder, a link out of it, a locked file, a file in its
+    // temporary folder (where `getconf` says, as that user), and a process left running.
+    let crontab = format!("{SCRATCH}/crontab-10");
+    write_root(&crontab, "* * * * * /usr/bin/true\n");
+    let temp = lease.run(&dir, &["/usr/bin/getconf", "DARWIN_USER_TEMP_DIR"]);
+    let temp = temp
+        .said()
+        .strip_suffix("\nexit 0")
+        .unwrap_or_else(|| panic!("getconf DARWIN_USER_TEMP_DIR: {}", temp.all()));
+    let owned = format!("{shared}/kbf-ci-owned");
+    let sub = format!("{shared}/kbf-ci-dir/sub");
+    let in_sub = format!("{sub}/f");
+    let link = format!("{shared}/kbf-ci-link");
+    let locked = "/private/tmp/kbf-ci-locked";
+    let in_temp = format!("{temp}kbf-ci-temp");
+    let plant: [&[&str]; 8] = [
+        &["run", "/usr/bin/crontab", &crontab, ";"],
+        &["run", "/usr/bin/touch", &owned, ";"],
+        &["mkdir", &sub, ";"],
+        &["run", "/usr/bin/touch", &in_sub, ";"],
+        &["symlink", sentinel, &link, ";"],
+        &["run", "/usr/bin/touch", locked, ";"],
+        &["run", "/usr/bin/chflags", "uchg", locked, ";"],
+        &["run", "/usr/bin/touch", &in_temp],
+    ];
     says(
-        &lease.run(&dir, &["/bin/sh", "-c", plant, "sh", &shared]),
+        &lease.run(&dir, &mac.act(&plant.concat())),
         "exit 0",
         "plant",
+    );
+    let sleep = ["spawn-child", "run", "/bin/sleep", "600"];
+    says(
+        &lease.run_quiet(&dir, &mac.act(&sleep)),
+        "exit 0",
+        "start a sleep",
     );
     let tabs = format!("/private/var/at/tabs/{name}");
     assert!(exists(&tabs), "no crontab was planted");
@@ -536,9 +557,9 @@ fn user_delete_waits_for_a_process_that_exits_by_itself() {
     let dir = scratch_dir("lease-13", 0o777);
     let lease = mac.create("13.1", None);
     lease.kill();
-    let sleep = "/bin/sleep 2 </dev/null >/dev/null 2>&1 &";
+    let sleep = ["spawn-child", "run", "/bin/sleep", "2"];
     says(
-        &lease.run(&dir, &["/bin/sh", "-c", sleep]),
+        &lease.run_quiet(&dir, &mac.act(&sleep)),
         "exit 0",
         "start a sleep",
     );
@@ -570,11 +591,12 @@ fn second() -> u64 {
 fn no_cron_job_of_the_lease_user_starts_after_kill_uid() {
     let (_serial, mac) = mac();
     let dir = scratch_dir("lease-14", 0o777);
+    let crontab = format!("{SCRATCH}/crontab-14");
+    write_root(&crontab, "* * * * * /bin/sleep 3\n");
     for round in 1..=2 {
         let lease = mac.create(&format!("14.{round}"), None);
         let uid = lease.uid();
-        let cron = "echo \"* * * * * /bin/sleep 3\" | crontab -";
-        lease.run(&dir, &["/bin/sh", "-c", cron]);
+        lease.run(&dir, &["/usr/bin/crontab", &crontab]);
         let tabs = format!("/private/var/at/tabs/{}", lease.name());
         assert!(exists(&tabs), "round {round}: no crontab was planted");
         // Out of the last seconds of this minute, then into those of the next.
@@ -825,26 +847,31 @@ fn a_gui_spawn_lands_in_aqua_and_a_background_one_in_the_system_session() {
     write_root(&wheel_only, "secret\n");
     std::os::unix::fs::chown(&wheel_only, Some(0), Some(0)).expect("root:wheel");
     set_mode(&wheel_only, 0o040);
-    let probe = format!(
-        r##"echo "manager: $(/bin/launchctl managername 2>/dev/null || echo none)"; id -u; id -g; if cat "{wheel_only}" >/dev/null 2>&1; then echo "wheel: yes"; else echo "wheel: no"; fi; pwd; echo "$HOME""##
-    );
-    let argv = ["/bin/sh", "-c", probe.as_str()];
+    // One process prints its session's manager, its uid and group, its directory and
+    // home, and then reads the file only wheel may read: the last step, so a refused
+    // read ends the steps with exit 1, and a read prints the file and exits 0.
+    let probe: [&[&str]; 4] = [
+        &["run", "/bin/launchctl", "managername", ";"],
+        &["run", "/usr/bin/id", "-u", ";"],
+        &["run", "/usr/bin/id", "-g", ";"],
+        &["pwd", ";", "env", "HOME", ";", "cat", &wheel_only],
+    ];
+    let argv = mac.act(&probe.concat());
     let control = spawn_in(mac, "background", &argv);
     assert_eq!(
         control.lines().next(),
-        Some("manager: System"),
+        Some("System"),
         "the control is not in the system's session: {control:?}"
     );
     let gui = spawn_in(mac, "gui", &argv);
     let dir = fs::canonicalize(format!("{SCRATCH}/gui-gui")).expect("the directory");
     let want = [
-        "manager: Aqua".to_owned(),
+        "Aqua".to_owned(),
         me.to_string(),
         mac.runner.gid.to_string(),
-        "wheel: no".to_owned(),
         dir.display().to_string(),
         home(&mac.runner.name),
-        "exit 0".to_owned(),
+        "exit 1".to_owned(),
     ]
     .join("\n");
     assert_eq!(gui, want, "the GUI spawn");
