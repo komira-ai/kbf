@@ -95,6 +95,27 @@ pub fn declared_only(length: u64) -> UploadSegment {
     }
 }
 
+/// A segment declared but never sent: `n` one-byte records with distinct digests
+/// whose first byte is `tag`.
+pub fn declared_records(n: u32, tag: u8) -> UploadSegment {
+    let entries: Vec<IndexEntry> = (0..n)
+        .map(|i| {
+            let mut hash = [tag; 32];
+            hash[1..5].copy_from_slice(&i.to_be_bytes());
+            IndexEntry {
+                digest: Digest::new(DigestFunction::Sha256, hash, 1),
+                offset: u64::from(i),
+                crc32c: 0,
+            }
+        })
+        .collect();
+    let records_len = u64::from(n);
+    UploadSegment {
+        length: records_len + footer_len(u64::from(n)),
+        footer: encode_footer(records_len, &entries),
+    }
+}
+
 /// Sends every range of `s`'s records, `chunk` bytes each, last first when `reverse`.
 pub async fn put_all(
     client: &mut SegmentsClient<Channel>,

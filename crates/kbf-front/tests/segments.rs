@@ -8,7 +8,7 @@ mod support;
 
 use std::time::Duration;
 
-use kbf_front::{MAX_RANGE_BYTES, SegmentsConfig};
+use kbf_front::{MAX_RANGE_BYTES, MAX_UPLOAD_RECORDS, SegmentsConfig};
 use kbf_proto::worker::{BeginRequest, CommitRequest, ObjectRef, ReadRangeRequest, UploadSegment};
 use kbf_segments::IndexEntry;
 use tonic::Code;
@@ -174,6 +174,12 @@ async fn two_commits_of_one_upload_store_once_and_answer_alike() {
     front.store.wait_for_put().await;
     let b = tokio::spawn(async move { second.commit(CommitRequest { upload }).await });
     tokio::time::sleep(Duration::from_millis(50)).await;
+    // Wall-clock only: this does not prove the second Commit reached the server before
+    // the release, only that, if it did, it was not answered while the PUT was held.
+    assert!(
+        !b.is_finished(),
+        "a second Commit answered during the first's PUT"
+    );
     front.store.release();
     let a = a.await.expect("task").expect("first").into_inner();
     let b = b.await.expect("task").expect("second").into_inner();
@@ -313,7 +319,9 @@ async fn an_idle_upload_is_dropped() {
 
 /// Catches a `Begin` the server cannot hold, or one it would wait on forever: a footer
 /// that does not parse for its length, overlapping records, and a total over the cap
-/// are INVALID_ARGUMENT; an upload of exactly the cap is admitted.
+/// are INVALID_ARGUMENT; an upload of exactly the cap is admitted. Also catches bytes
+/// sent in front of a footer read as if absent (mutant: the footer length unchecked):
+/// a footer with one byte prepended is INVALID_ARGUMENT.
 #[tokio::test]
 async fn begin_refuses_what_it_cannot_take() {
     let front = Front::start(SegmentsConfig::DEFAULT).await;
@@ -343,6 +351,16 @@ async fn begin_refuses_what_it_cannot_take() {
         .expect_err("overlap");
     assert_eq!(refused.code(), Code::InvalidArgument, "{refused:?}");
 
+    let mut prefixed = s.upload_segment();
+    prefixed.footer.insert(0, 0);
+    let refused = client
+        .begin(BeginRequest {
+            segments: vec![prefixed],
+        })
+        .await
+        .expect_err("a byte in front of the footer");
+    assert_eq!(refused.code(), Code::InvalidArgument, "{refused:?}");
+
     let empty = client.begin(BeginRequest { segments: vec![] }).await;
     assert_eq!(empty.expect_err("no segment").code(), Code::InvalidArgument);
 
@@ -362,6 +380,33 @@ async fn begin_refuses_what_it_cannot_take() {
         })
         .await
         .expect("an upload of exactly the cap");
+}
+
+/// Catches an upload of more records than one commit indexes (mutant: the record
+/// limit unchecked): a `Begin` of `MAX_UPLOAD_RECORDS` one-byte records is admitted,
+/// and one of that many plus one, split over two segments so the limit is on the
+/// upload and not the segment, is INVALID_ARGUMENT.
+#[tokio::test]
+async fn begin_refuses_more_records_than_the_limit() {
+    let front = Front::start(SegmentsConfig::DEFAULT).await;
+    let mut client = front.client().await;
+    let limit = u32::try_from(MAX_UPLOAD_RECORDS).expect("limit");
+    client
+        .begin(BeginRequest {
+            segments: vec![support::declared_records(limit, 1)],
+        })
+        .await
+        .expect("an upload of exactly the limit");
+    let refused = client
+        .begin(BeginRequest {
+            segments: vec![
+                support::declared_records(limit, 1),
+                support::declared_records(1, 2),
+            ],
+        })
+        .await
+        .expect_err("one record over the limit");
+    assert_eq!(refused.code(), Code::InvalidArgument, "{refused:?}");
 }
 
 /// Catches `Locate` answering a blob it does not hold, and `ReadRange` serving other
@@ -404,7 +449,10 @@ async fn locate_and_read_range_return_a_blob() {
 /// Catches a committing upload dropped with its connection (mutant: the drop ignores a
 /// running commit), and a commit tied to the call that started it (mutant: the commit
 /// runs in the handler): a connection closed while the commit's PUT is held leaves the
-/// upload open until the commit ends, and the commit still indexes every record.
+/// upload open until the commit ends, and the commit still indexes every record. Also
+/// catches the memory budget returned while the commit still holds the buffers
+/// (mutant: the budget dropped before the check and PUT): while the PUT is held the
+/// upload's length stays counted.
 #[tokio::test]
 async fn a_connection_closed_during_the_commit_leaves_the_commit_to_finish() {
     let config = SegmentsConfig {
@@ -420,6 +468,10 @@ async fn a_connection_closed_during_the_commit_leaves_the_commit_to_finish() {
     let mut committing = client.clone();
     let call = tokio::spawn(async move { committing.commit(CommitRequest { upload }).await });
     front.store.wait_for_put().await;
+    assert!(
+        front.service.budget_in_use() >= s.length,
+        "the budget is held while the commit holds the buffers"
+    );
     call.abort();
     let _ = call.await;
     drop(client);

@@ -18,7 +18,7 @@
 //!   is PUT and read back, and one `PutBlobs` commits every record. A second Commit
 //!   waits for the first and returns its answer.
 //! - An upload belongs to the connection that began it ([`Connections`]). When that
-//!   connection closes, or no call names the upload for `--segment-upload-idle`, an
+//!   connection closes, or no call names the upload for `--segment-upload-idle-secs`, an
 //!   upload still receiving is dropped and its memory returned at once; a committing
 //!   one is kept until its commit ends.
 
@@ -70,7 +70,7 @@ pub struct SegmentsConfig {
     /// may hold together (`--segment-upload-max-bytes`).
     pub max_bytes: u64,
     /// How long an upload may go without a call before it is dropped
-    /// (`--segment-upload-idle`).
+    /// (`--segment-upload-idle-secs`).
     pub idle: Duration,
 }
 

@@ -39,6 +39,8 @@ struct Counting {
     begins: Arc<AtomicUsize>,
     commits: Arc<AtomicUsize>,
     read_ranges: Arc<AtomicUsize>,
+    /// Records declared by every `Begin`'s footers.
+    declared: Arc<AtomicUsize>,
     mode: Mode,
 }
 
@@ -46,6 +48,15 @@ struct Counting {
 impl Segments for Counting {
     async fn begin(&self, r: Request<BeginRequest>) -> Result<Response<BeginResponse>, Status> {
         self.begins.fetch_add(1, Ordering::SeqCst);
+        let records: usize = r
+            .get_ref()
+            .segments
+            .iter()
+            .map(|s| {
+                kbf_segments::Footer::parse(&s.footer, s.length).map_or(0, |f| f.entries().len())
+            })
+            .sum();
+        self.declared.fetch_add(records, Ordering::SeqCst);
         if self.mode == Mode::Unimplemented {
             return Err(Status::unimplemented("no Segments here"));
         }
@@ -87,12 +98,13 @@ struct Front {
     begins: Arc<AtomicUsize>,
     commits: Arc<AtomicUsize>,
     read_ranges: Arc<AtomicUsize>,
+    declared: Arc<AtomicUsize>,
 }
 
 impl Front {
     async fn start(mode: Mode) -> Self {
         let cache = Arc::new(Cache::memory());
-        let (begins, commits, read_ranges) = Default::default();
+        let (begins, commits, read_ranges, declared) = Default::default();
         let mut routes = kbf_front::routes(Arc::clone(&cache));
         {
             let counting = Counting {
@@ -104,6 +116,7 @@ impl Front {
                 begins: Arc::clone(&begins),
                 commits: Arc::clone(&commits),
                 read_ranges: Arc::clone(&read_ranges),
+                declared: Arc::clone(&declared),
                 mode,
             };
             routes = routes.add_service(
@@ -119,6 +132,7 @@ impl Front {
             begins,
             commits,
             read_ranges,
+            declared,
         }
     }
 
@@ -180,6 +194,32 @@ async fn fifteen_thousand_outputs_are_one_upload_and_one_commit() {
         "no ByteStream write"
     );
     assert!(front.all_present(&digests).await);
+}
+
+/// Catches blobs the server holds sent again (mutant: the FindMissing answer ignored;
+/// design step 4.1.1): a spool of 20 blobs, 10 of them uploaded by an earlier spool,
+/// declares only the 10 new ones in its `Begin`, and all 20 are present after.
+#[tokio::test]
+async fn blobs_the_server_holds_are_not_sent_again() {
+    let front = Front::start(Mode::Serve).await;
+    let (spool, held) = spooled("held-first", (0..10).map(|i| patterned(i, 500))).await;
+    front.engine.put_spool(spool).await.expect("first upload");
+    assert_eq!(front.declared.load(Ordering::SeqCst), 10);
+    let (spool, all) = spooled("held-second", (0..20).map(|i| patterned(i, 500))).await;
+    assert_eq!(all[..10], held[..]);
+    front.engine.put_spool(spool).await.expect("second upload");
+    assert_eq!(
+        front.declared.load(Ordering::SeqCst),
+        20,
+        "the second upload declares only the 10 new blobs"
+    );
+    assert_eq!(front.begins.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        front.cache.metrics().write.total.get(),
+        0,
+        "no ByteStream write"
+    );
+    assert!(front.all_present(&all).await);
 }
 
 /// Catches a new daemon failing against an old server (mutant: UNIMPLEMENTED is an

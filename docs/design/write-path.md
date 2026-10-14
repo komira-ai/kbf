@@ -170,6 +170,17 @@ stores its outputs that way. Where the code differs from the text below:
 - `Locate` and `ReadRange` are served, and the daemon's coalescing reader
   (`Scope::read_located`) is built and tested, but cache fills do not use it yet. The
   container driver still uploads blob by blob.
+- A retried upload (4.2) does not ask FindMissing again: it sends a fresh `Begin` of
+  the same plan. Blobs a lost-reply commit already indexed are sent and stored again,
+  and `PutBlobs` keeps the existing entry, so a retry costs bytes, not correctness.
+- There is no `Abort`. An attempt that failed before its `Commit` (a `PutRange` call
+  failed) keeps its budget until its connection closes or it goes idle
+  (`--segment-upload-idle-secs`, default 60 s). With the default budget of 1 GiB +
+  1 MiB, the retry's `Begin` of a large upload, and other daemons' `Begin`s, can wait
+  that long. A failed `Commit` returns its budget when it ends.
+- The spool copies the whole output set onto the daemon's scratch disk, with no size
+  limit of its own, including blobs the server already holds: an action's outputs take
+  twice their size on scratch until the upload ends.
 
 ### 4.1 Shape
 
