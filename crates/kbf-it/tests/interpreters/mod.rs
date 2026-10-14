@@ -15,11 +15,17 @@
 //! - a production Rust file under `crates/*/src/` that names a shell with a `-c` flag
 //!   (module [`rust`] says how it reads the file). Its key is its path, listed under
 //!   `[src-sh-c]`.
+//! - a Rust file whose test code (all of `crates/*/tests/`, and `#[cfg(test)]` code
+//!   under `crates/*/src/`) names an interpreter: a program literal such as `"perl"`
+//!   or `"/bin/sh"`, or a script whose `#!` line runs one (module [`rust`]). Its key
+//!   is its path, listed under `[test-interpreters]`, whose reason says why the test
+//!   needs it (a process group, `$$`, a macOS probe) or that it only names it as data.
 //!
 //! [`check`] refuses a file or spawn the scan found with no row, a row the scan found
 //! nothing for (a deleted or renamed file takes its row out in the same change), and
-//! a malformed or duplicate row. Rows are `<key>\t<reason>`, under a `[files]` or
-//! `[src-sh-c]` header; a line starting with `#` and a blank line are skipped.
+//! a malformed or duplicate row. Rows are `<key>\t<reason>`, under a `[files]`,
+//! `[src-sh-c]` or `[test-interpreters]` header; a line starting with `#` and a blank
+//! line are skipped.
 
 pub mod rust;
 

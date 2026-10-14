@@ -388,7 +388,8 @@ fn budget_diff_refuses_what_it_cannot_compare() {
         err.starts_with("xtask: git show no-such-rev:tools/interpreter_budget.tsv: "),
         "{err}"
     );
-    std::fs::write(root.join("tools/interpreter_budget.tsv"), "[files]\na.sh\n").expect("bad");
+    let bad = "[files]\na.sh\n[workflow]\n[src-sh-c]\n";
+    std::fs::write(root.join("tools/interpreter_budget.tsv"), bad).expect("bad");
     let (code, _, err) = budget_diff(&root, "HEAD");
     assert_eq!(code, Some(1));
     assert_eq!(

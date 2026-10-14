@@ -682,14 +682,16 @@ fn unexpected(applied: &Applied) -> CacheError {
 
 mod batch;
 mod touches;
+mod upload;
 mod write_group;
 
 pub use batch::BATCH_READS_IN_FLIGHT;
 pub use touches::TouchConfig;
 use touches::Touches;
+pub(crate) use upload::BuiltSegment;
 pub use write_group::{
-    Admitted, CONNECTION_WINDOW_BYTES, MAX_CONCURRENT_STREAMS, PUT_BACKOFF, PUT_BACKOFF_FACTOR,
-    STREAM_WINDOW_BYTES, WriteConfig,
+    Admitted, CONNECTION_WINDOW_BYTES, MAX_ADMISSION_BYTES, MAX_CONCURRENT_STREAMS, PUT_BACKOFF,
+    PUT_BACKOFF_FACTOR, STREAM_WINDOW_BYTES, WriteConfig,
 };
 use write_group::{Group, Writer};
 

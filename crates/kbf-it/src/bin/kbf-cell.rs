@@ -29,6 +29,10 @@ enum Cli {
     /// Runs the test-only daemon (local runtime, no isolation) until SIGINT.
     #[cfg(target_os = "linux")]
     Daemon(kbf_it::daemon::DaemonArgs),
+    /// Runs the M1 exit test: a cell, the sample projects built twice each, a lease
+    /// drained in flight (the `kbf_it::m1` docs say what is checked).
+    #[cfg(target_os = "linux")]
+    M1(kbf_it::m1::M1Args),
     /// Checks a build and its rebuild after a clean: all remote, then all cache hits.
     Check {
         #[arg(long, value_enum)]
@@ -53,6 +57,14 @@ fn main() -> ExitCode {
         },
         #[cfg(target_os = "linux")]
         Cli::Daemon(args) => daemon(args),
+        #[cfg(target_os = "linux")]
+        Cli::M1(args) => match kbf_it::m1::run(&args) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("kbf-cell: {e}");
+                ExitCode::from(e.exit_code())
+            }
+        },
         Cli::Check {
             tool,
             first,

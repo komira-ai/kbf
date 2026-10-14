@@ -1,5 +1,6 @@
 # The M1 sample project for buck2: built remote-only against the integration cell
-# (crates/kbf-it/m1/run.sh starts it). No prelude: the rules are in this project.
+# (`kbf-cell m1` starts it and builds a copy of this project). No prelude: the rules
+# are in this project.
 [cells]
   root = .
 

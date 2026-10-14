@@ -263,3 +263,17 @@ fn empty_segment_round_trips() {
     assert!(r.footer().entries().is_empty());
     assert_eq!(r.get(&crate::sha256(b"")).unwrap(), None);
 }
+
+/// Catches two footer builders that disagree (a segment built from ranges whose
+/// footer differs from the same records written whole, which a reflush would call a
+/// conflict) and a footer whose `index_offset` is not the record area: the footer
+/// `encode_footer` builds from a written segment's entries is that segment's footer,
+/// byte for byte.
+#[test]
+fn encode_footer_is_the_writers_footer() {
+    let segment = segment_of(&blobs());
+    let footer = Footer::parse(&segment, segment.len() as u64).unwrap();
+    let built = crate::layout::encode_footer(footer.records_len(), footer.entries());
+    let records_len = usize::try_from(footer.records_len()).unwrap();
+    assert_eq!(built, segment[records_len..]);
+}
