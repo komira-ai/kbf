@@ -113,7 +113,7 @@ async fn a_cold_restart_under_the_raft_log_keeps_the_action_cache_and_the_cas_in
     assert!(daemon.report(ran(start.lease_id, &result)).await.accepted);
     assert_eq!(response(&done(&mut ops).await).result, Some(result.clone()));
     assert_eq!(before.cached(&job.action).await, Ok(result.clone()));
-    let farm_time = before.raft_log().tick().expect("a tick");
+    let farm_time = before.raft_log().tick().await.expect("a tick");
     let written = before.store.objects().await;
     assert!(!written.is_empty(), "the old process wrote no object");
     let old_cache = Arc::downgrade(&before.cache);

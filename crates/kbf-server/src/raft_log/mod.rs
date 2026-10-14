@@ -14,9 +14,15 @@
 //!   object key prefix `<prefix root><log id>/`. A start whose record or prefix root
 //!   disagrees with the committed `Bootstrap` is refused.
 //! - **Commit.** A command is encoded, proposed, made durable (the store syncs before
-//!   every persist returns), applied, and only then answered. The proposal and its
-//!   sync run on the calling thread under the log's lock, as the single-process log
-//!   applies under its lock: one commit at a time, no group commit yet.
+//!   every persist returns), applied, and only then answered. Commits are grouped: a
+//!   command joins the log's queue, and one committer at a time, on tokio's blocking
+//!   pool, takes everything queued, proposes it as one batch (one write, one sync),
+//!   applies it and answers each caller, then takes what queued meanwhile, until the
+//!   queue is empty. A lone command is committed as soon as it arrives; commands that
+//!   arrive during a sync share the next one. A storage error answers every command
+//!   of its batch `Unavailable`, none with an outcome. A commit polled outside any
+//!   tokio runtime that finds no committer running is the committer, on the caller's
+//!   thread, so its future is ready in its first poll (kbf-sim-cell relies on that).
 //! - **Queries** read this server's applied state. A single voter is always its own
 //!   leader, so that is the committed state. The state has its own lock, held by a
 //!   commit only while it applies, never across the sync: a query does not wait for a
@@ -36,7 +42,10 @@
 //!   entry; every entry after it is in the new version's format, so a log raised to
 //!   [`MachineVersion::V2`] takes the write tier's commands. A start replays the raise
 //!   with the log. A binary that does not run the version (any older one) refuses the
-//!   log at that entry.
+//!   log at that entry. A raise commits alone, under the host's lock; a batch is
+//!   encoded under that lock too, in the format committed when it commits, so no
+//!   batch holds a `MachineVersion` entry and a command the format does not take is
+//!   refused alone while the rest of its batch commits.
 //! - **A storage error** stops the log for the life of the process: every later
 //!   commit is refused `Unavailable`.
 //!
@@ -50,19 +59,23 @@ mod recorded;
 use std::fmt::{self, Display};
 use std::io::{self, Read};
 use std::num::NonZeroU64;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, Weak};
 use std::time::Duration;
 
+use futures::future::OptionFuture;
 use kbf_front::{Leadership, MetaLog, MetaLogError};
 use kbf_log::{Bootstrap, DecodeError, EncodeError, FarmLogId, LogCommand, MachineVersion};
 use kbf_meta::{Applied, Command, MetaState, Retention};
 use kbf_objstore::{KeyError, KeyPrefix};
 use kbf_raft::{
-    Config, ConfigError, Host, HostError, Membership, Message, OpenError, Role, ServerId, Transport,
+    Config, ConfigError, Host, HostError, LogIndex, Membership, Message, OpenError, Role, ServerId,
+    Transport,
 };
 use kbf_store::{Fs, Options, StdFs, Store, StoreError};
 use kbf_types::FarmTime;
+use tokio::sync::oneshot;
 use tokio::task::AbortHandle;
 use tokio::time::Instant;
 
@@ -155,6 +168,8 @@ pub struct RaftMetaLog<F: Fs = StdFs> {
 
 struct Shared<F: Fs> {
     host: Mutex<RaftHost<F>>,
+    /// The commands waiting for the committer.
+    queue: Mutex<Queue>,
     /// The machine's applied state ([`MetaMachine::state`]), read without `host`.
     state: Arc<RwLock<MetaState>>,
     log_id: FarmLogId,
@@ -270,12 +285,14 @@ where
             });
         }
         let base = host.machine().meta().now();
+        host.machine_mut().keep_answers();
         let shared = Arc::new(Shared {
             base,
             bootstraps: host.machine().bootstraps(),
             term: host.core().hard_state().term.0,
             state: host.machine().state(),
             host: Mutex::new(host),
+            queue: Mutex::default(),
             log_id,
             prefix,
             opened: Instant::now(),
@@ -318,8 +335,8 @@ where
     ///
     /// # Errors
     /// [`MetaLogError::Unavailable`] if the log has stopped.
-    pub fn tick(&self) -> Result<FarmTime, MetaLogError> {
-        self.shared.tick()
+    pub async fn tick(&self) -> Result<FarmTime, MetaLogError> {
+        self.shared.tick().await
     }
 }
 
@@ -386,7 +403,7 @@ where
     F::File: Send + 'static,
 {
     async fn commit(&self, command: Command) -> Result<Applied, MetaLogError> {
-        self.shared.execute(command)
+        self.shared.execute(command).await
     }
 
     async fn query<R, Q>(&self, f: Q) -> Result<R, MetaLogError>
@@ -405,6 +422,16 @@ where
     }
 }
 
+/// Commands waiting to be committed, each with the caller to answer.
+#[derive(Default)]
+struct Queue {
+    waiting: Vec<(Command, oneshot::Sender<Answer>)>,
+    /// A committer is running; it takes everything queued before it stops.
+    committing: bool,
+}
+
+type Answer = Result<Applied, MetaLogError>;
+
 impl<F: Fs> Shared<F> {
     fn lock(&self) -> MutexGuard<'_, RaftHost<F>> {
         // The host stops itself on a storage error rather than panicking midway, so a
@@ -416,24 +443,120 @@ impl<F: Fs> Shared<F> {
         self.base.saturating_add(self.opened.elapsed())
     }
 
-    fn execute(&self, command: Command) -> Result<Applied, MetaLogError> {
-        let mut host = self.lock();
-        let format = host.machine().format();
-        let entry = kbf_log::encode(format, &LogCommand::Meta(command)).map_err(unavailable)?;
-        let index = host.propose(entry).map_err(unavailable)?;
-        // A single voter commits and applies its own proposal before `propose` returns.
-        host.machine()
-            .answer(index)
-            .ok_or(MetaLogError::Unavailable(NOT_APPLIED.to_owned()))
+    fn queue(&self) -> MutexGuard<'_, Queue> {
+        // Nothing panics while holding the queue's lock.
+        self.queue.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+impl<F> Shared<F>
+where
+    F: Fs + Send + 'static,
+    F::File: Send + 'static,
+{
+    /// Queues `command`, starts a committer if none is running, and waits for the
+    /// answer, which comes only after the command is durable and applied.
+    async fn execute(self: &Arc<Self>, command: Command) -> Result<Applied, MetaLogError> {
+        let (reply, answer) = oneshot::channel();
+        let start = {
+            let mut queue = self.queue();
+            queue.waiting.push((command, reply));
+            !std::mem::replace(&mut queue.committing, true)
+        };
+        if start {
+            let shared = Arc::clone(self);
+            let committer = move || shared.commit_queued();
+            match tokio::runtime::Handle::try_current() {
+                Ok(runtime) => drop(runtime.spawn_blocking(committer)),
+                // A caller that polls by hand, outside any runtime (kbf-sim-cell),
+                // commits on its own thread: its answer is ready when this poll ends.
+                Err(_) => committer(),
+            }
+        }
+        // The committer dropped the reply only if it panicked.
+        answer
+            .await
+            .unwrap_or(Err(MetaLogError::Unavailable(NOT_ANSWERED.to_owned())))
     }
 
-    fn tick(&self) -> Result<FarmTime, MetaLogError> {
-        self.execute(Command::Tick(self.now()))?;
+    /// The committer: commits what is queued as one batch, answers it, and repeats
+    /// until the queue is empty. Seeing it empty and stopping happen under the queue's
+    /// lock, so a command queued after that starts the next committer.
+    fn commit_queued(&self) {
+        loop {
+            let batch = {
+                let mut queue = self.queue();
+                queue.committing = !queue.waiting.is_empty();
+                std::mem::take(&mut queue.waiting)
+            };
+            if batch.is_empty() {
+                return;
+            }
+            let (entries, replies): (Vec<_>, Vec<_>) = batch.into_iter().unzip();
+            // A panic answers nothing: its callers are told the log did not answer,
+            // and the committer goes on with the next batch.
+            let answers =
+                catch_unwind(AssertUnwindSafe(|| self.commit_batch(entries))).unwrap_or_default();
+            for (reply, answer) in replies.into_iter().zip(answers) {
+                // A caller that stopped waiting is not answered.
+                let _ = reply.send(answer);
+            }
+        }
+    }
+
+    /// Encodes `commands` in the log's committed format, proposes the ones that
+    /// encode as one batch, and returns each command's answer, in order: a command the
+    /// format does not take (a write tier command before the raise to
+    /// [`MachineVersion::V2`]) is refused and the rest commit. A single voter commits
+    /// and applies its own proposals before `propose_batch` returns, so every answer is
+    /// there unless the batch failed.
+    ///
+    /// The format is read under the host's lock, which a raise also commits under, so
+    /// no raise falls between encoding a batch and committing it, and a batch holds no
+    /// `MachineVersion` entry: every entry in it is decoded in the format it was
+    /// encoded in.
+    fn commit_batch(&self, commands: Vec<Command>) -> Vec<Answer> {
+        let mut host = self.lock();
+        let format = host.machine().format();
+        let mut entries = Vec::with_capacity(commands.len());
+        let encoded: Vec<Result<(), MetaLogError>> = commands
+            .into_iter()
+            .map(|command| {
+                let entry = kbf_log::encode(format, &LogCommand::Meta(command));
+                entries.push(entry.map_err(unavailable)?);
+                Ok(())
+            })
+            .collect();
+        let count = entries.len();
+        let proposed: Vec<Answer> = match host.propose_batch(entries) {
+            Ok(first) => (first.0..)
+                .take(count)
+                .map(|index| host.machine_mut().take_answer(LogIndex(index)))
+                .map(|answer| answer.ok_or(MetaLogError::Unavailable(NOT_APPLIED.to_owned())))
+                .collect(),
+            Err(e) => vec![Err(unavailable(e)); count],
+        };
+        let mut proposed = proposed.into_iter();
+        encoded
+            .into_iter()
+            .map(|encoded| {
+                encoded.and_then(|()| {
+                    let missing = MetaLogError::Unavailable(NOT_APPLIED.to_owned());
+                    proposed.next().unwrap_or(Err(missing))
+                })
+            })
+            .collect()
+    }
+
+    async fn tick(self: &Arc<Self>) -> Result<FarmTime, MetaLogError> {
+        self.execute(Command::Tick(self.now())).await?;
         Ok(machine::read(&self.state).now())
     }
 }
 
 const NOT_APPLIED: &str = "the metadata log did not apply its own proposal";
+
+const NOT_ANSWERED: &str = "the metadata log's committer stopped without answering";
 
 /// A log error as the front sees it: the leader could not answer.
 fn unavailable(e: impl Display) -> MetaLogError {
@@ -452,12 +575,17 @@ fn decoded(machine: &MetaMachine) -> Result<(), RaftLogError> {
 
 /// Commits farm time every [`TICK`] for as long as the log is open. An error is
 /// dropped: it has stopped the log, and the next commit reports it.
-async fn tick_every<F: Fs>(shared: Weak<Shared<F>>) {
+async fn tick_every<F>(shared: Weak<Shared<F>>)
+where
+    F: Fs + Send + 'static,
+    F::File: Send + 'static,
+{
     let mut every = tokio::time::interval(TICK);
     every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         every.tick().await;
-        let _ = shared.upgrade().map(|log| log.tick());
+        let tick = shared.upgrade().map(|log| async move { log.tick().await });
+        let _ = OptionFuture::from(tick).await;
     }
 }
 
