@@ -381,7 +381,7 @@ pub fn is_crate_src(path: &str) -> bool {
 /// Whether `path` is a Rust file under a crate's `tests/`: `crates/<crate>/tests/...rs`.
 /// All of it is test code.
 pub fn is_crate_test(path: &str) -> bool {
-    in_crate_dir(path, "tests")
+    in_crate_dir(path, "tests-skipped")
 }
 
 fn in_crate_dir(path: &str, dir: &str) -> bool {
