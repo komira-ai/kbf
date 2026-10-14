@@ -331,7 +331,7 @@ async fn a_range_the_tier_does_not_hold_is_answered_by_the_store_or_refused() {
         .remove(0);
     let range = |offset: u64, length: u64| {
         Request::new(ReadRangeRequest {
-            object: at.object.clone(),
+            object: at.object,
             offset,
             length,
         })
