@@ -72,14 +72,10 @@ fn open_descriptors() -> usize {
 /// Catches output files held open while the stores are slow: a file being stored
 /// holds its descriptor until it is sent, so a tree of thousands of files would hold
 /// thousands open (the lease's `nofile` limit is the daemon's too). The walk closes
-/// each file once hashed; the missing ones are copied into the spool and closed
-/// before anything is sent, so while the stores wait, no output file is open. The
-/// stores wait on a gate; once `UPLOADS_IN_FLIGHT` wait, the test watches the
-/// descriptors for 300 ms before opening it. The slack is the spool's file and
-/// `collect`'s own descriptors (the upper directory). Mutant seen red: the missing
-/// blobs stored straight from their files on the lease's store, `in_flight` at a
-/// time (the per-file path): 17 held. The bound on the copies into the spool is
-/// `src/pending.rs`'s unit test.
+/// each file once hashed, and a record names its file without holding it open: a file
+/// is opened only to read it, at the moment it is sent. The stores wait on a gate;
+/// once `UPLOADS_IN_FLIGHT` wait, the test watches the descriptors for 300 ms before
+/// opening it. The slack is `collect`'s own descriptor (the upper directory).
 #[tokio::test]
 async fn no_output_file_is_open_while_the_stores_are_slow() {
     let upper = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))

@@ -46,8 +46,8 @@ async fn serve(routes: Routes) -> SocketAddr {
 /// every digest asked about once, the 14,000 held ones present, the others written.
 /// Mutants seen red: no `missing` call, each put asking for itself (516 calls); the
 /// answer ignored, every blob put (510 calls: the held ones ask for themselves).
-/// This front serves no `Segments`: the spool's upload is answered UNIMPLEMENTED and
-/// its blobs go one ByteStream write each, so this is also the fallback's test.
+/// This front serves no `Segments`: the records' upload is answered UNIMPLEMENTED and
+/// its blobs go one ByteStream write each, read from their files, so this is also the fallback's test.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_large_tree_costs_one_find_missing_call_per_thousand_digests() {
     let upper = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
@@ -148,11 +148,8 @@ impl Segments for CountingSegments {
 /// The same tree as above against a front that serves `Segments`, the way a lease's
 /// outputs reach a current server: the 1002 blobs the server lacks go as one segment
 /// upload (one `Begin` declaring one segment, one `Commit`), not 1002 ByteStream
-/// writes, and FindMissing is still asked 16 times (the spool's upload does not ask
+/// writes, and FindMissing is still asked 16 times (the upload does not ask
 /// again about digests `missing` answered). The lease's counters keep their meaning.
-/// Mutant seen red: `Pending::store_missing` storing each missing blob with
-/// `put`/`put_chunks` on the lease's store (the per-file path): 0 `Begin`s and 1002
-/// ByteStream writes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_large_tree_is_one_segment_upload() {
     let upper = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
