@@ -255,8 +255,8 @@ pub struct Args {
     /// total, a segment upload's Begin for its whole length; a caller over the bound
     /// waits, nothing is refused for load. At least the largest blob (1 GiB), so one
     /// can always be admitted, and at least `--segment-upload-max-bytes`. Not covered: each HTTP/2
-    /// stream's message as tonic decodes it, before the handler runs, up to 5 MiB per
-    /// stream and 200 streams per connection on either listener
+    /// stream's message as tonic decodes it, before the handler runs, up to 17 MiB per
+    /// stream (about 3.4 GiB for 200 streams) and 200 streams per connection on either listener
     /// (`kbf_front::MAX_CONCURRENT_STREAMS`).
     #[arg(
         long,

@@ -191,7 +191,7 @@ blob's full size once it is durable and 0 before, never bytes a live stream has 
 buffered. An upload of a blob already durable is answered at once. Until chunked
 uploads exist, a ByteStream write is held in memory until verified, so blobs over
 1 GiB (`MAX_BLOB_BYTES`) are refused before any byte is buffered. Batch calls carry at
-most 4 MiB of blob data.
+most 16 MiB of blob data (`MAX_BATCH_TOTAL_BYTES`; the gRPC message limit is 17 MiB).
 
 Object keys are `<prefix>cas/<epoch>/<seq>`, each as 16 lowercase hex digits. Two
 caches over one metadata log hold different epochs, so they never name the same key.
@@ -312,7 +312,7 @@ capabilities.
 | digest functions | SHA-256 only |
 | `action_cache_update_capabilities.update_enabled` | `false`: only the daemon path writes the action cache ([The closure check](#the-closure-check)) |
 | cache priorities | one range, `[0, 0]`: retention follows the last touch alone ([Retention and touches](#retention-and-touches)), so a priority is accepted and changes nothing |
-| `max_batch_total_size_bytes` | 4 MiB (`MAX_BATCH_TOTAL_BYTES`) |
+| `max_batch_total_size_bytes` | 16 MiB (`MAX_BATCH_TOTAL_BYTES`) |
 | symlink absolute path strategy | `ALLOWED` |
 | compressors | none (zstd is **planned**, below) |
 | API versions | 2.0 to 2.3 |

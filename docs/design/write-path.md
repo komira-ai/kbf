@@ -113,10 +113,14 @@ linger nor holds up small writes. It is still held in memory until verified
   value below `MAX_BLOB_BYTES`, so a single legal blob can always be admitted. A caller
   over the bound waits; nothing is refused for load.
 - **What it does not cover.** A `BatchUpdateBlobs` request is decoded by tonic before
-  its handler runs: up to the 4 MiB message limit per stream, times the HTTP/2
-  concurrent-stream limit. That limit is set explicitly on both listeners and named in
-  the flag reference, so the total is a stated number, not "bounded": 200 streams per
-  connection (`MAX_CONCURRENT_STREAMS`). A `Write`'s first message (which names the
+  its handler runs: up to the 17 MiB message limit (`MAX_MESSAGE_BYTES`: a 16 MiB batch,
+  `MAX_BATCH_TOTAL_BYTES`, and 1 MiB of digests and framing) per stream, times the
+  HTTP/2 concurrent-stream limit. That limit is set explicitly on both listeners and
+  named in the flag reference, so the total is a stated number, not "bounded": 200
+  streams per connection (`MAX_CONCURRENT_STREAMS`), 200 x 17 MiB, about 3.4 GiB of
+  decode buffer per connection, on top of the 2 GiB the flag admits. The 16 MiB limit
+  is a first setting (to be tuned later); a lower limit shrinks this bound
+  in proportion. A `Write`'s first message (which names the
   blob) is decoded the same way, and a `Write` waiting for admission leaves up to its
   stream's flow-control window, 1 MiB (`STREAM_WINDOW_BYTES`), received and unread.
 - **Flow control.** The connection's window is set to every stream's window at once
@@ -307,7 +311,7 @@ that call and the daemon falls back to per-blob reads.
 ## 5. Capabilities (REAPI clients)
 
 - `max_batch_total_size_bytes` is **already** advertised as `MAX_BATCH_TOTAL_BYTES`
-  (4 MiB, `kbf-front/src/capabilities.rs`). Whether buck2 sizes its `BatchUpdateBlobs`
+  (16 MiB, `kbf-front/src/capabilities.rs`). Whether buck2 sizes its `BatchUpdateBlobs`
   calls by it or by its own setting is to be checked on the pilot.
 - **zstd.** Advertise `supported_compressors` and `supported_batch_update_compressors`
   = `[ZSTD]`, and serve `compressed-blobs/zstd/...` on ByteStream (refused today in

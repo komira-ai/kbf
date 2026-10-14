@@ -2,7 +2,7 @@
 
 mod common;
 
-use common::{Blob, Farm, days};
+use common::{Blob, Farm, days, pseudo_random};
 use kbf_front::MAX_BATCH_TOTAL_BYTES;
 use kbf_meta::Command;
 use kbf_proto::google::bytestream::ReadRequest;
@@ -15,7 +15,7 @@ use tonic::Code;
 /// Catches: capabilities that let a client try to write the action cache
 /// (`update_enabled`), name a digest function other than SHA-256, advertise a
 /// compressor the reads and writes do not decode, or leave the batch limit at 0
-/// ("unlimited") while the server refuses batches over 4 MiB.
+/// ("unlimited") while the server refuses batches over its limit.
 #[tokio::test]
 async fn capabilities_advertise_the_cache_contract() {
     let farm = Farm::start().await;
@@ -36,10 +36,8 @@ async fn capabilities_advertise_the_cache_contract() {
             .expect("update capabilities")
             .update_enabled
     );
-    assert_eq!(
-        cache.max_batch_total_size_bytes,
-        MAX_BATCH_TOTAL_BYTES as i64
-    );
+    assert_eq!(cache.max_batch_total_size_bytes, 16 << 20);
+    assert_eq!(MAX_BATCH_TOTAL_BYTES, 16 << 20);
     let priorities = cache.cache_priority_capabilities.expect("priorities");
     assert_eq!(priorities.priorities.len(), 1);
     assert!(cache.supported_compressors.is_empty());
@@ -351,4 +349,68 @@ async fn get_tree_returns_every_present_directory_in_pages() {
         .await
         .expect_err("missing root");
     assert_eq!(missing.code(), Code::NotFound);
+}
+
+/// Catches a batch limit or gRPC message limit left below 16 MiB in the server or in
+/// the capabilities: a `BatchUpdateBlobs` of exactly 16 MiB (four blobs) is stored, and
+/// a `BatchReadBlobs` of the same four comes back whole, each blob byte for byte. The
+/// literals are the contract, not `MAX_BATCH_TOTAL_BYTES`, so a constant left at 4 MiB
+/// fails here. Mutant seen red: `MAX_BATCH_TOTAL_BYTES = 4 << 20` (InvalidArgument).
+#[tokio::test]
+async fn a_16_mib_batch_is_stored_and_read_back() {
+    assert_eq!(kbf_front::MAX_MESSAGE_BYTES, 17 << 20);
+    let farm = Farm::start().await;
+    let blobs: Vec<Blob> = (1..=4)
+        .map(|seed| Blob::new(pseudo_random(4 << 20, seed)))
+        .collect();
+    let refs: Vec<&Blob> = blobs.iter().collect();
+    farm.upload(&refs).await;
+    let read = farm
+        .cas()
+        .batch_read_blobs(BatchReadBlobsRequest {
+            digests: blobs.iter().map(|b| b.proto.clone()).collect(),
+            ..Default::default()
+        })
+        .await
+        .expect("BatchReadBlobs of 16 MiB")
+        .into_inner();
+    assert_eq!(read.responses.len(), 4);
+    for (response, blob) in read.responses.iter().zip(&blobs) {
+        assert_eq!(response.status.as_ref().expect("status").code, 0);
+        assert!(response.data == blob.data, "blob bytes differ");
+    }
+}
+
+/// Catches an off-by-one in either refusal: one byte past 16 MiB is INVALID_ARGUMENT for
+/// `BatchUpdateBlobs` (nothing stored) and for `BatchReadBlobs`, while exactly 16 MiB
+/// (the test above) is served. Mutants seen red: `>=` instead of `>` in either check
+/// (the exact-limit test above fails); the update check removed (the extra byte is stored).
+#[tokio::test]
+async fn one_byte_over_16_mib_is_refused_by_both_batch_calls() {
+    let farm = Farm::start().await;
+    let big = Blob::new(pseudo_random((16 << 20) + 1, 9));
+    let refused = farm
+        .cas()
+        .batch_update_blobs(BatchUpdateBlobsRequest {
+            requests: vec![reapi::batch_update_blobs_request::Request {
+                digest: Some(big.proto.clone()),
+                data: big.data.clone(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        })
+        .await
+        .expect_err("a batch one byte over");
+    assert_eq!(refused.code(), Code::InvalidArgument);
+    assert_eq!(farm.find_missing(&[&big]).await, [big.digest]);
+
+    let refused = farm
+        .cas()
+        .batch_read_blobs(BatchReadBlobsRequest {
+            digests: vec![big.proto.clone()],
+            ..Default::default()
+        })
+        .await
+        .expect_err("a read one byte over");
+    assert_eq!(refused.code(), Code::InvalidArgument);
 }

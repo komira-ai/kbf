@@ -96,8 +96,12 @@ pub use crate::segments::{
 };
 
 /// The most blob data one `BatchUpdateBlobs` or `BatchReadBlobs` call may carry,
-/// advertised in the capabilities. Larger blobs go through ByteStream.
-pub const MAX_BATCH_TOTAL_BYTES: usize = 4 << 20;
+/// advertised in the capabilities. Larger blobs go through ByteStream. A request is
+/// decoded whole before its handler runs, so one stream may hold up to
+/// [`MAX_MESSAGE_BYTES`] (17 MiB) of decode buffer: 200 concurrent streams bound the
+/// decode memory at about 3.4 GiB, which `--write-bytes-in-flight` does not cover
+/// (`docs/design/write-path.md`).
+pub const MAX_BATCH_TOTAL_BYTES: usize = 16 << 20;
 
 /// The largest gRPC message the cache services accept or send: a full batch plus room
 /// for the digests and statuses around it.
