@@ -65,8 +65,9 @@ disk in `--raft-dir`, and needs `--store=s3`: `commit` encodes the command, prop
 it, syncs it, applies it and only then answers. Commits are grouped: commands that
 arrive while a sync is in progress are written together and made durable by the next
 single sync, and each is answered after it; a lone command is committed at once. The
-commit and its sync run on tokio's blocking pool, not on the caller's worker; `query` reads the server's applied state, which for a single voter, always its
-own leader, is the committed state. It has no snapshots yet (the log is never
+commit and its sync run on tokio's blocking pool, not on the caller's worker;
+`query` reads the server's applied state, which for a single voter, always its own
+leader, is the committed state. It has no snapshots yet (the log is never
 compacted) and no second voter. **Planned**: more voters, on which `commit` on a
 follower sends the command to the leader and `query` runs behind a read index where
 a stronger guarantee is needed.

@@ -1,7 +1,7 @@
 //! Group commit in `RaftMetaLog`: proposals that arrive while a commit is in its disk
 //! sync are written together and made durable by one sync, and each is answered only
 //! after that sync. The raft directory is a `FaultFs` whose file syncs a test can hold
-//! one at a time.
+//! one at a time, or make panic once.
 
 use std::future::Future;
 use std::io;
@@ -31,6 +31,8 @@ const PROMPTLY: Duration = Duration::from_secs(10);
 #[derive(Debug)]
 struct Gate {
     armed: AtomicBool,
+    /// The next sync to start panics instead, before it reaches the gate.
+    panic_next: AtomicBool,
     entered: Mutex<Sender<()>>,
     releases: Mutex<Receiver<()>>,
     release: Mutex<Sender<()>>,
@@ -42,6 +44,7 @@ impl Gate {
         let (release, releases) = mpsc::channel();
         let gate = Self {
             armed: AtomicBool::new(false),
+            panic_next: AtomicBool::new(false),
             entered: Mutex::new(entered),
             releases: Mutex::new(releases),
             release: Mutex::new(release),
@@ -142,6 +145,10 @@ impl FsFile for GateFile {
     }
 
     fn sync(&mut self) -> io::Result<()> {
+        assert!(
+            !self.gate.panic_next.swap(false, Ordering::SeqCst),
+            "a planted panic in a raft directory sync"
+        );
         self.gate.pass();
         self.inner.sync()
     }
@@ -244,6 +251,50 @@ fn propose_while_held(
     answers
 }
 
+/// For each `i` in `0..n`: a blob of its own when `i` is even, an `AllocEpoch` when
+/// it is odd, so that callers in one batch are owed answers of two kinds, and every
+/// `AllocEpoch` caller a different epoch. The digests are the blobs'.
+fn mixed(epoch: Epoch, n: u8) -> (Vec<Digest>, Vec<Command>) {
+    let mut digests = Vec::new();
+    let commands = (0..n)
+        .map(|i| {
+            if i % 2 == 0 {
+                let (digest, command) = blob(epoch, i + 1);
+                digests.push(digest);
+                command
+            } else {
+                Command::AllocEpoch
+            }
+        })
+        .collect();
+    (digests, commands)
+}
+
+/// Waits for `n` answers and asserts that each caller of [`mixed`] got the answer to
+/// its own command: an even caller a written blob, an odd one an epoch later than
+/// `after` and than every lower caller's. The batch's entries take consecutive
+/// indices in the order their callers queued, so a caller answered with another
+/// entry's outcome gets either the wrong kind or an epoch out of order. Returns the
+/// last epoch.
+fn assert_own_answers(answers: &Receiver<(usize, Answer)>, n: u8, after: Epoch) -> Epoch {
+    let mut answered = vec![None; usize::from(n)];
+    for _ in 0..n {
+        let (i, answer) = answers
+            .recv_timeout(PROMPTLY)
+            .expect("every proposal answered after the sync that holds it");
+        answered[i] = Some(answer);
+    }
+    let mut last = after;
+    for (i, answer) in answered.into_iter().enumerate() {
+        match answer {
+            Some(Ok(Applied::Blob(Ok(_)))) if i % 2 == 0 => {}
+            Some(Ok(Applied::Epoch(e))) if i % 2 == 1 && e > last => last = e,
+            other => panic!("caller {i} (after epoch {last:?}) answered {other:?}"),
+        }
+    }
+    last
+}
+
 fn seen(runtime: &Runtime, log: &Log, digest: Digest) -> BlobAnswer {
     runtime
         .block_on(log.query(move |m| m.blob(&digest)))
@@ -254,12 +305,15 @@ fn seen(runtime: &Runtime, log: &Log, digest: Digest) -> BlobAnswer {
 /// waited under the log's lock for the held sync; mutants "one proposal per sync" and
 /// "one persist per entry in a batch": the second sync then holds one proposal and the
 /// rest wait for a third; mutant "answer before the sync": the proposals answer while
-/// their sync is held): N proposals that arrive while a sync is held are written and
+/// their sync is held; mutant "replies zipped in reverse": a caller gets another
+/// entry's outcome, an epoch for a blob or a blob for an epoch): N proposals of two
+/// kinds that arrive while a sync is held are written and
 /// synced together, so the first sync and one more make every one durable, none
 /// answers before that second sync, and none is visible to a query until it has. (The
 /// store syncs inside each write, so applying before the sync is not a mutant this
-/// layer can make.) The first sync may be a tick's rather than the first proposal's;
-/// the proposals then share the second with it, which the test allows.
+/// layer can make.) Each caller gets the outcome of its own command. The first sync may
+/// be a tick's rather than the first proposal's; the proposals then share the second
+/// with it, which the test allows.
 #[test]
 fn proposals_made_during_a_sync_share_the_next_sync_and_answer_after_it() {
     let runtime = runtime();
@@ -274,7 +328,7 @@ fn proposals_made_during_a_sync_share_the_next_sync_and_answer_after_it() {
     let first = commit_on_a_thread(&runtime, &log, first);
     entered.recv_timeout(PROMPTLY).expect("the first sync");
 
-    let (digests, commands): (Vec<_>, Vec<_>) = (1..=N).map(|n| blob(epoch, n)).unzip();
+    let (digests, commands) = mixed(epoch, N);
     let answers = propose_while_held(&runtime, &log, commands);
     gate.release();
     entered.recv_timeout(PROMPTLY).expect("the second sync");
@@ -293,19 +347,7 @@ fn proposals_made_during_a_sync_share_the_next_sync_and_answer_after_it() {
     }
 
     gate.release();
-    let mut answered = vec![None; usize::from(N)];
-    for _ in 0..N {
-        let (i, answer) = answers
-            .recv_timeout(PROMPTLY)
-            .expect("every proposal answered after the second sync");
-        answered[i] = Some(answer);
-    }
-    for (i, answer) in answered.iter().enumerate() {
-        assert!(
-            matches!(answer, Some(Ok(Applied::Blob(Ok(_))))),
-            "{i}: {answer:?}"
-        );
-    }
+    let _ = assert_own_answers(&answers, N, epoch);
     let first = first.recv_timeout(PROMPTLY).expect("the first proposal");
     assert!(matches!(first, Ok(Applied::Blob(Ok(_)))), "{first:?}");
     for digest in digests.iter().chain([&first_digest]) {
@@ -365,4 +407,93 @@ fn a_crash_in_a_batch_sync_answers_none_of_it_and_loses_all_of_it() {
             "survived"
         );
     }
+}
+
+/// Catches (mutant "a committer stops guarding the queue once it has taken its batch":
+/// the first half's arrival starts a second committer, which takes that half alone
+/// while the first committer is still in its sync, so the second half waits for a
+/// sync of its own, which the gate holds): proposals that arrive at two moments of one
+/// held sync, with a pause between, still share the next sync, and each caller gets
+/// its own command's outcome. The pause only gives such a second committer time to
+/// take the first half; the log under test does not depend on it.
+#[test]
+fn proposals_made_at_two_moments_of_a_sync_share_the_next_sync() {
+    let runtime = runtime();
+    let (gate, entered) = Gate::new();
+    let _disarm = Disarm(Arc::clone(&gate));
+    let fs = GateFs {
+        inner: FaultFs::new(),
+        gate: Arc::clone(&gate),
+    };
+    let (log, epoch) = opened(&runtime, fs);
+    let first = commit_on_a_thread(&runtime, &log, blob(epoch, 0).1);
+    entered.recv_timeout(PROMPTLY).expect("the first sync");
+
+    let (_, commands) = mixed(epoch, N);
+    let mut commands = commands.into_iter();
+    let early = propose_while_held(&runtime, &log, commands.by_ref().take(4).collect());
+    std::thread::sleep(Duration::from_millis(300));
+    let late = propose_while_held(&runtime, &log, commands.collect());
+    gate.release();
+    entered.recv_timeout(PROMPTLY).expect("the second sync");
+    gate.release();
+
+    // The late half's callers are numbered from 0 again; its first command is
+    // `mixed`'s fifth, even, so the kinds stay in step. Its epochs follow the early
+    // half's: it queued after them.
+    let early_last = assert_own_answers(&early, 4, epoch);
+    let _ = assert_own_answers(&late, N - 4, early_last);
+    let first = first.recv_timeout(PROMPTLY).expect("the first proposal");
+    assert!(matches!(first, Ok(Applied::Blob(Ok(_)))), "{first:?}");
+}
+
+/// Catches (mutant "a panic in a commit is not caught": the committer dies with its
+/// queue marked as being committed, so no later command starts one and every later
+/// commit, ticks included, waits forever): a sync that panics answers its batch
+/// `Unavailable`, and a commit made after it is still answered (refused: the panic
+/// stopped the host midway through its write).
+#[test]
+fn a_panic_in_a_batch_sync_answers_it_unavailable_and_later_commits_still_answer() {
+    let runtime = runtime();
+    let (gate, entered) = Gate::new();
+    let _disarm = Disarm(Arc::clone(&gate));
+    let fs = GateFs {
+        inner: FaultFs::new(),
+        gate: Arc::clone(&gate),
+    };
+    let (log, epoch) = opened(&runtime, fs);
+    let first = commit_on_a_thread(&runtime, &log, blob(epoch, 0).1);
+    entered.recv_timeout(PROMPTLY).expect("the first sync");
+    // The held sync is past the panic check; the next batch's sync panics.
+    gate.panic_next.store(true, Ordering::SeqCst);
+    let (_, commands) = mixed(epoch, N);
+    let answers = propose_while_held(&runtime, &log, commands);
+    gate.release();
+
+    for _ in 0..N {
+        let (i, answer) = answers
+            .recv_timeout(PROMPTLY)
+            .expect("every proposal of the panicked batch answered");
+        assert!(
+            matches!(answer, Err(MetaLogError::Unavailable(_))),
+            "{i}: answered {answer:?} from a batch whose sync panicked"
+        );
+    }
+    assert!(
+        !gate.panic_next.load(Ordering::SeqCst),
+        "the planted panic did not fire"
+    );
+    let _ = first.recv_timeout(PROMPTLY).expect("the first proposal");
+
+    gate.armed.store(false, Ordering::SeqCst);
+    let later = commit_on_a_thread(&runtime, &log, blob(epoch, 9).1);
+    let later = later
+        .recv_timeout(PROMPTLY)
+        .expect("a commit after the panic is answered");
+    // The panic left the store's write half done, so the host has stopped: the
+    // later commit is refused rather than written after a torn batch.
+    assert!(
+        matches!(later, Err(MetaLogError::Unavailable(_))),
+        "{later:?}"
+    );
 }
