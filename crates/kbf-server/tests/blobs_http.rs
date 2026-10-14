@@ -200,7 +200,7 @@ async fn corrupt(cache: &MemoryCache, digest: Digest) {
         .query(move |s| s.blob(&digest))
         .await
         .expect("query");
-    let BlobAnswer::Present(location) = answer else {
+    let BlobAnswer::Present { location, .. } = answer else {
         panic!("{digest} is not present: {answer:?}");
     };
     let key = cache.object_key(location.object).expect("key");

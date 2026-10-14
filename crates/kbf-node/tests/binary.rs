@@ -944,6 +944,52 @@ fn a_killed_daemons_action_ends_without_a_restart() {
     );
 }
 
+/// Catches a lease whose output upload waits for ever on a store that stopped
+/// answering: the worker listener's `Write` takes the upload and never replies, as a
+/// stalled object store behind it did for hours. With
+/// `--output-upload-deadline-secs=2` the lease must end within [`UPLOAD_HANG`] with
+/// INTERNAL and a reason naming the upload and its deadline; without the deadline no
+/// Result comes at all.
+#[test]
+fn a_lease_whose_upload_stalls_fails_at_its_deadline() {
+    let _one = one_native_daemon();
+    let dir = tls("stalled-upload");
+    let scratch = dir.join("leases");
+    let front = front::Front::stalling_writes(&dir);
+    // Its stdout is a blob to write: the upload cannot be skipped as already stored.
+    let action = front.user_shell("echo the action ran");
+    let mut flags = native_flags(&front, &dir, &scratch);
+    flags.push("--output-upload-deadline-secs=2".to_owned());
+    let log = dir.join("daemon.log");
+    let mut daemon = daemon(&flags, &log);
+    let session = front.session(PROMPT);
+    session.hello();
+    session.welcome();
+    session.start(1, 1, action);
+    let result = session.result(UPLOAD_HANG);
+    // SIGKILL: a daemon whose lease hangs in its upload may not end on SIGTERM.
+    stop(&mut daemon, libc::SIGKILL);
+    let Some(result) = result else {
+        panic!(
+            "no Result within {UPLOAD_HANG:?}: the upload hangs\n{}",
+            read(&log)
+        );
+    };
+    let status = result.status.expect("a status");
+    assert_eq!(status.code, tonic::Code::Internal as i32, "{status:?}");
+    assert!(
+        status
+            .message
+            .starts_with("the output upload did not finish within its deadline of 2s"),
+        "{status:?}"
+    );
+}
+
+/// How long [`a_lease_whose_upload_stalls_fails_at_its_deadline`] waits for the Result
+/// of a lease whose upload has a 2 s deadline: the action and its inputs take well
+/// under a second, so a minute only fails a lease that hangs.
+const UPLOAD_HANG: Duration = Duration::from_secs(60);
+
 /// The live processes other than `pgid` itself in process group `pgid`, from `ps`.
 fn others_in_group(pgid: i32) -> Vec<i32> {
     let out = Command::new("ps")

@@ -104,7 +104,7 @@ pub struct GateLog {
 
 #[derive(Debug)]
 enum Inner {
-    Memory(MemoryMetaLog),
+    Memory(Box<MemoryMetaLog>),
     Raft(RaftMetaLog<FaultFs>),
 }
 
@@ -317,7 +317,7 @@ impl Cell {
             None => {
                 let prefix = KeyPrefix::new(format!("start-{n}/")).expect("a key prefix");
                 (
-                    Inner::Memory(MemoryMetaLog::new(Retention::default())),
+                    Inner::Memory(Box::new(MemoryMetaLog::new(Retention::default()))),
                     prefix,
                 )
             }

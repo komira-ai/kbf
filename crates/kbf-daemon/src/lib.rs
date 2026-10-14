@@ -19,6 +19,8 @@
 //! - [`driver_watch`]: the driver's report channel, one part per source that feeds it.
 //! - [`runtime`]: the runtime trait and [`FakeRuntime`], which runs nothing.
 //! - [`runtimes`]: [`Runtimes`], the daemon's runtimes, at most one per lease kind.
+//! - [`phases`]: where each lease's time went, logged when it ends (`lease phases:`)
+//!   and sent as [`Event::LeaseEnded`].
 //! - [`cas`]: the [`Cas`] trait (from `kbf-transfer`).
 //! - `cache` (Linux): the node's input cache, which the container driver links input
 //!   files from (`docs/design/worker-cache.md`).
@@ -50,6 +52,7 @@ pub mod keeper;
 mod lease;
 #[cfg(target_os = "linux")]
 mod local;
+pub mod phases;
 pub mod report;
 pub mod runtime;
 pub mod runtimes;
@@ -69,14 +72,14 @@ pub const DAEMON_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "+", env!("K
 
 pub use cas::{Cas, CasError};
 pub use clock::{Clock, Moment, SystemClock};
-pub use config::{Args, DaemonConfig, FENCE_AFTER, RECHECK_EVERY, TlsFiles};
+pub use config::{Args, DaemonConfig, FENCE_AFTER, KeepAlive, RECHECK_EVERY, TlsFiles};
 pub use contact::{Acked, Contact};
 pub use daemon::{Daemon, Event, PROTOCOL_VERSION, SessionError, superseded};
 pub use driver_watch::{DriverPart, DriverWatch};
 #[cfg(target_os = "linux")]
 pub use local::{LOCAL_DRIVER, LocalRuntime};
 pub use report::{Capacity, NodeReport};
-pub use runtime::{FakeRuntime, Runtime, RuntimeError, Work};
+pub use runtime::{FakeRuntime, Runtime, RuntimeError, UPLOAD_DEADLINE, Work, upload_within};
 pub use runtimes::{KindServedTwice, Runtimes};
 pub use status::DriverReport;
 

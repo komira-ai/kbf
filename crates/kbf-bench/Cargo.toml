@@ -11,10 +11,12 @@ publish.workspace = true
 clap.workspace = true
 futures.workspace = true
 hex.workspace = true
-# The daemon's CAS client (ByteStream Write and Read) and its TLS loader, so a run
-# sends blobs exactly as a daemon does.
+# The daemon's TLS loader, so a run connects as a daemon does.
 kbf-daemon.workspace = true
 kbf-proto.workspace = true
+# The daemon's transfer engine (FindMissing, ByteStream Write and Read), so a run
+# sends and reads blobs exactly as a daemon does.
+kbf-transfer.workspace = true
 prost.workspace = true
 serde.workspace = true
 serde_json.workspace = true

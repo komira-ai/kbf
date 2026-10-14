@@ -5,9 +5,11 @@
 //! values they carry are in this crate ([`FarmBatch`], [`Report`], [`Takeover`],
 //! [`Checkpoint`], [`MachineVersion`]).
 //!
-//! [`encode`] and [`decode`] take the log's committed [`Format`]. Only [`Format::V1`]
-//! exists; any other is refused on both sides, so a binary never writes or reads an
-//! encoding it does not know.
+//! [`encode`] and [`decode`] take the log's committed [`Format`]: [`Format::V1`], or
+//! [`Format::V2`], which adds the write tier's metadata commands
+//! (docs/design/write-path.md, section 6.5). Any other format is refused on both sides,
+//! and so is a tier command under format 1, so a binary never writes or reads an
+//! encoding the log does not allow.
 //!
 //! Decoding is strict, because every replica must apply the same value or none:
 //! - an enum value that is unspecified (zero) or unnamed is an error, never a default;
@@ -47,6 +49,10 @@ pub struct Format(u32);
 impl Format {
     /// `kbf.log.v1` as `log.proto` has it at format 1.
     pub const V1: Self = Self(1);
+
+    /// Format 1 plus the write tier's metadata commands: `AddTier`, `PutStaged`,
+    /// `SealStaged`, `ObjectFlushed` and `FlushConflict`.
+    pub const V2: Self = Self(2);
 
     /// Format number `n`, which may not be one this binary supports.
     #[must_use]
@@ -130,6 +136,9 @@ pub enum EncodeError {
     /// This binary does not write the format.
     #[error("log format {} is not supported", .0.get())]
     Format(Format),
+    /// The command is not part of the format (a tier command under format 1).
+    #[error("the command is not part of log format {}", .0.get())]
+    Command(Format),
     /// A digest names a hash function the format has no value for.
     #[error("a digest names a hash function log format 1 cannot encode")]
     DigestFunction,
@@ -195,10 +204,13 @@ pub enum DecodeError {
 
 /// Encodes `command` under `format`.
 pub fn encode(format: Format, command: &LogCommand) -> Result<Vec<u8>, EncodeError> {
-    if format != Format::V1 {
+    if format != Format::V1 && format != Format::V2 {
         return Err(EncodeError::Format(format));
     }
     let command = match command {
+        LogCommand::Meta(c) if format == Format::V1 && meta::since_v2(c) => {
+            return Err(EncodeError::Command(format));
+        }
         LogCommand::Meta(c) => P::Meta(meta::to_proto(c)?),
         LogCommand::Bootstrap(b) => P::Bootstrap(proto::Bootstrap {
             log_id: b.log_id.get(),
@@ -220,7 +232,7 @@ pub fn encode(format: Format, command: &LogCommand) -> Result<Vec<u8>, EncodeErr
 
 /// Decodes an entry's payload under `format`.
 pub fn decode(format: Format, bytes: &[u8]) -> Result<LogCommand, DecodeError> {
-    if format != Format::V1 {
+    if format != Format::V1 && format != Format::V2 {
         return Err(DecodeError::Format(format));
     }
     let command = match proto::LogCommand::decode(bytes)?.command {
@@ -240,6 +252,14 @@ pub fn decode(format: Format, bytes: &[u8]) -> Result<LogCommand, DecodeError> {
         }
         None => return Err(DecodeError::UnknownCommand("LogCommand")),
     };
+    // A format-1 reader knows no tier command: it refuses one as an older binary does,
+    // which sees an unset `oneof`.
+    if let LogCommand::Meta(c) = &command
+        && format == Format::V1
+        && meta::since_v2(c)
+    {
+        return Err(DecodeError::UnknownCommand("MetaCommand"));
+    }
     // One value, one encoding: refuse anything prost accepted that `encode` would not
     // have written (an unknown field, a non-minimal varint, a reordered field).
     if encode(format, &command).as_deref() != Ok(bytes) {

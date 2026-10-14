@@ -220,8 +220,9 @@ pub struct Capabilities {
     pub object_lock: bool,
 }
 
-/// Errors from an [`ObjectStore`](crate::ObjectStore).
-#[derive(Debug, thiserror::Error)]
+/// Errors from an [`ObjectStore`](crate::ObjectStore). Cloned, so one failed write can
+/// be reported to every caller waiting on it.
+#[derive(Clone, Debug, thiserror::Error)]
 pub enum ObjectStoreError {
     /// No object has this key.
     #[error("object {0} not found")]
@@ -258,9 +259,28 @@ pub enum ObjectStoreError {
     /// the whole object for a ranged read. Never retried into success.
     #[error("store broke the protocol: {0}")]
     Protocol(String),
-    /// The request did not complete (connect, timeout, reset).
-    #[error("request to the store failed")]
-    Transport(#[source] Box<dyn std::error::Error + Send + Sync>),
+    /// The request did not complete (connect, timeout, reset). The text carries the
+    /// cause and each of its own causes (`request to the store failed: error sending
+    /// request for url (...): operation timed out`), so a report of the failure says
+    /// which it was. The cause is in the text, not [`std::error::Error::source`], so a
+    /// reader that prints the chain does not print it twice.
+    #[error("request to the store failed: {}", Causes(.0.as_ref()))]
+    Transport(std::sync::Arc<dyn std::error::Error + Send + Sync>),
+}
+
+/// An error and each of its sources, joined by `: `.
+struct Causes<'a>(&'a (dyn std::error::Error + 'static));
+
+impl fmt::Display for Causes<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)?;
+        let mut next = self.0.source();
+        while let Some(cause) = next {
+            write!(f, ": {cause}")?;
+            next = cause.source();
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -306,6 +326,41 @@ mod tests {
         assert!(KeyPrefix::new("").is_ok());
         assert!(KeyPrefix::new("/").is_err());
         assert!(KeyPrefix::new("a//").is_err());
+    }
+
+    /// Catches a transport failure whose text drops its cause, or the cause's own
+    /// cause: "request to the store failed" alone cannot tell a timeout from a reset.
+    #[test]
+    fn a_transport_failure_says_why() {
+        #[derive(Debug, thiserror::Error)]
+        #[error("error sending request")]
+        struct Outer(#[source] std::io::Error);
+        let timed_out = std::io::Error::new(std::io::ErrorKind::TimedOut, "operation timed out");
+        let err = ObjectStoreError::Transport(std::sync::Arc::new(Outer(timed_out)));
+        assert_eq!(
+            err.to_string(),
+            "request to the store failed: error sending request: operation timed out"
+        );
+        assert!(std::error::Error::source(&err).is_none(), "said once");
+    }
+
+    /// Catches a cause chain cut short: a connection reset sits three levels below the
+    /// transport error (reqwest, hyper, then the I/O error), so a text that prints only
+    /// the first cause or two loses "connection reset".
+    #[test]
+    fn a_transport_failure_says_its_deepest_cause() {
+        #[derive(Debug, thiserror::Error)]
+        #[error("error sending request")]
+        struct Outer(#[source] Middle);
+        #[derive(Debug, thiserror::Error)]
+        #[error("client error")]
+        struct Middle(#[source] std::io::Error);
+        let reset = std::io::Error::new(std::io::ErrorKind::ConnectionReset, "connection reset");
+        let err = ObjectStoreError::Transport(std::sync::Arc::new(Outer(Middle(reset))));
+        assert_eq!(
+            err.to_string(),
+            "request to the store failed: error sending request: client error: connection reset"
+        );
     }
 
     /// Catches: a zero-length or overflowing range, or an off-by-one in the inclusive

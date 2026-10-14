@@ -416,8 +416,11 @@ impl ObjectStore for S3Store {
     }
 }
 
+/// A transport failure, without the request URL: the text reaches REAPI clients (a CAS
+/// `Unavailable` status), and the URL names the store's address, bucket and key. The
+/// kind and causes ("operation timed out", "connection reset") stay.
 fn transport(e: reqwest::Error) -> ObjectStoreError {
-    ObjectStoreError::Transport(Box::new(e))
+    ObjectStoreError::Transport(std::sync::Arc::new(e.without_url()))
 }
 
 /// The error a non-success answer carries.

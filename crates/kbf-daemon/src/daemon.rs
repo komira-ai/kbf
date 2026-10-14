@@ -93,6 +93,7 @@ use crate::connect::{
 };
 use crate::contact::Contact;
 use crate::lease::{Done, Leases, failure, lease_id, proto_lease_id};
+use crate::phases::LeasePhases;
 use crate::report::NodeReport;
 use crate::runtimes::Runtimes;
 use crate::status::{DriverReport, Software};
@@ -131,6 +132,9 @@ pub enum Event {
     Superseded(Vec<LeaseId>),
     /// A welcomed session ended, with the reason.
     Disconnected(String),
+    /// A lease's run ended (its Result is being sent): where its time went, as the
+    /// `lease phases:` line logs it.
+    LeaseEnded(LeasePhases),
     /// An attempt to connect ended before the server's Welcome (a refused connection, a
     /// TLS failure, a server answering `UNAVAILABLE`, ...), or a server's name resolved
     /// to no address. `server` names the URL, and the address when there was one.
@@ -480,15 +484,16 @@ impl Daemon {
 
     /// The endpoint for one attempt: `target`'s address, with the URL's host as the
     /// HTTP/2 authority and, unless `--tls-server-name` names another, as the name the
-    /// server's certificate must carry.
+    /// server's certificate must carry; with the configured HTTP/2 keepalive.
     fn endpoint(&self, target: &Target) -> Result<Endpoint, SessionError> {
         let mut tls = self.tls.clone();
         if self.config.tls.server_name.is_none() {
             tls = tls.domain_name(target.server.host.clone());
         }
-        Ok(Endpoint::from_shared(format!("https://{}", target.addr))?
+        let endpoint = Endpoint::from_shared(format!("https://{}", target.addr))?
             .origin(target.server.uri.clone())
-            .tls_config(tls)?)
+            .tls_config(tls)?;
+        Ok(self.config.keep_alive.apply(endpoint))
     }
 
     /// One stream to `target`, from connecting until it ends. Sets `welcomed` once the
@@ -799,8 +804,13 @@ impl Daemon {
     }
 
     /// Reports a finished run.
-    fn finished(&mut self, tx: Option<&UnboundedSender<DaemonMessage>>, (id, outcome): Done) {
-        let result = self.leases.finished(id, outcome);
+    fn finished(
+        &mut self,
+        tx: Option<&UnboundedSender<DaemonMessage>>,
+        (id, outcome, phases): Done,
+    ) {
+        let result = self.leases.finished(id, outcome, &phases);
+        self.emit(Event::LeaseEnded(phases));
         self.report(tx, result);
     }
 

@@ -10,8 +10,9 @@ use axum::serve::ListenerExt;
 use futures::future::Either;
 use kbf_auth::{AuthenticateLayer, Policy};
 use kbf_front::{
-    ByteStreamService, Cache, CasService, MAX_MESSAGE_BYTES, MetaLog, RECORDER_CHANNEL, Recorder,
-    RequestMetadataLayer,
+    ByteStreamService, CONNECTION_WINDOW_BYTES, Cache, CasService, MAX_CONCURRENT_STREAMS,
+    MAX_MESSAGE_BYTES, MetaLog, RECORDER_CHANNEL, Recorder, RequestMetadataLayer,
+    STREAM_WINDOW_BYTES,
 };
 use kbf_objstore::ObjectStore;
 use kbf_proto::google::bytestream::byte_stream_server::ByteStreamServer;
@@ -186,6 +187,17 @@ fn bind_api(addr: SocketAddr) -> Result<(tokio::net::TcpListener, SocketAddr), S
     bound.map_err(|source| ServeError::Bind { addr, source })
 }
 
+/// `server` with the HTTP/2 limits both listeners state rather than leave to the
+/// transport's defaults: they bound what is held outside `--write-bytes-in-flight`, and
+/// the connection window is what lets a Write admitted after others finish at all
+/// (`kbf_front::CONNECTION_WINDOW_BYTES`).
+fn flow_control(server: Server) -> Server {
+    server
+        .max_concurrent_streams(Some(MAX_CONCURRENT_STREAMS))
+        .initial_stream_window_size(Some(STREAM_WINDOW_BYTES))
+        .initial_connection_window_size(Some(CONNECTION_WINDOW_BYTES))
+}
+
 /// The warning every start logs ([`bind_server_with_api`]).
 const STATE_IN_MEMORY: &str = "the scheduler's state is in memory: no cordon, drain, lease or \
     operation of an earlier server process is restored, and the server keeps no rollout record";
@@ -297,17 +309,18 @@ where
     );
     let api_routes = crate::api::router(Arc::clone(&farm), token)
         .merge(health_routes)
+        .merge(crate::metrics::router(Arc::clone(&cache)))
         .merge(blob_routes)
         .merge(page_routes);
     // Logged at every start, the first one too (issue #156).
     let (term, epoch) = (farm.term(), farm.lease_epoch());
     tracing::warn!(term, epoch, "{STATE_IN_MEMORY}");
 
-    let mut reapi_server = Server::builder();
+    let mut reapi_server = flow_control(Server::builder());
     if let Some(tls) = listeners.reapi_tls {
         reapi_server = reapi_server.tls_config(tls)?;
     }
-    let mut worker_server = Server::builder();
+    let mut worker_server = flow_control(Server::builder());
     let peers = match listeners.worker_tls {
         Some(tls) => {
             worker_server = worker_server.tls_config(tls.server)?;
