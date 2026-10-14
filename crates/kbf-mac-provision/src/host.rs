@@ -376,7 +376,7 @@ impl<'a> Mac<'a> {
 
     /// Empties the file at `path`, keeping its owner and mode; never through a link.
     pub(crate) fn truncate(&self, path: &str) -> io::Result<()> {
-        at(path, self.host.write(path, b"", 0o600))
+        fs::File::create(self.path(path)).map(drop)
     }
 
     /// Makes `path` an empty file of `uid`:`gid` with `mode`, removing what was there.

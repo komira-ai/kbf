@@ -195,7 +195,7 @@ pub(crate) fn restart_job(c: &Ctx<'_>) -> Result<(), RestartError> {
     let real_plist = c.mac.path(&plist);
     c.mac
         .succeeds(LAUNCHCTL, &["bootout", &format!("system/{label}")]);
-    let emptied = std::fs::File::create(c.mac.path(ERR_LOG)).map(drop);
+    let emptied = c.mac.truncate(ERR_LOG);
     let mut started = false;
     for attempt in 1..=BOOTSTRAP_TRIES {
         if c.mac
