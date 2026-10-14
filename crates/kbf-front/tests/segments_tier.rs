@@ -26,9 +26,9 @@ use kbf_segments::layout::encode_footer;
 use kbf_segments::{Footer, IndexEntry, SegmentWriter};
 use kbf_types::Digest;
 use support::{Farm, TestBlob, TierCache, blobs, later, start};
-use tonic::{Request, Status};
+use tonic::{Code, Request, Status};
 
-use crate::common::faulty::FaultyStore;
+use crate::common::faulty::{FaultyStore, GetFault};
 use support::Log;
 
 const GIB: u64 = 1 << 30;
@@ -301,4 +301,51 @@ async fn a_range_of_an_object_nobody_holds_is_not_found() {
     };
     let status = service.read_range(Request::new(range)).await;
     assert_eq!(status.expect_err("not found").code(), tonic::Code::NotFound);
+}
+
+/// Catches: a store failure on a range the tier does not hold answered as anything but
+/// UNAVAILABLE, a short or overlong range passed on as the range, and an offset past
+/// the largest a range can start at answered with bytes. Without a tier every range is
+/// the store's; the same checks run in `segments.rs` over its own types, and the
+/// coverage of the cache's generic read path needs them in this binary too.
+#[tokio::test]
+async fn a_range_the_tier_does_not_hold_is_answered_by_the_store_or_refused() {
+    let farm = Farm::new(Capabilities::default());
+    let cache = Cache::open(farm.log.clone(), farm.store.clone(), KeyPrefix::default())
+        .await
+        .expect("open");
+    let (_cache, service) = serve(cache);
+    let all = blobs(1, 1, 600);
+    let s = seg(&all);
+    upload(&service, std::slice::from_ref(&s))
+        .await
+        .expect("committed");
+    let at = service
+        .locate(Request::new(kbf_proto::worker::LocateRequest {
+            digests: vec![kbf_front::digest_to_proto(&all[0].digest)],
+        }))
+        .await
+        .expect("locate")
+        .into_inner()
+        .locations
+        .remove(0);
+    let range = |offset: u64, length: u64| {
+        Request::new(ReadRangeRequest {
+            object: at.object.clone(),
+            offset,
+            length,
+        })
+    };
+    farm.store.on_get(GetFault::Transport);
+    let failed = service.read_range(range(at.offset, 600)).await;
+    assert_eq!(failed.expect_err("store failed").code(), Code::Unavailable);
+    let overrun = service.read_range(range(at.offset, s.length + 10)).await;
+    assert_eq!(overrun.expect_err("overrun").code(), Code::NotFound);
+    let past = service.read_range(range(u64::MAX - 1, 10)).await;
+    assert_eq!(past.expect_err("past").code(), Code::NotFound);
+    let whole = service.read_range(range(at.offset, 600)).await;
+    assert_eq!(
+        whole.expect("range").into_inner().bytes,
+        all[0].bytes.as_ref()
+    );
 }
