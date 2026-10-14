@@ -121,6 +121,15 @@ impl Spool {
         .await
     }
 
+    /// The bytes of the spooled blob `r`.
+    ///
+    /// # Errors
+    /// [`CasError::Read`] when the spool cannot be read.
+    pub(crate) async fn read_record(&self, r: &Spooled) -> Result<Vec<u8>, CasError> {
+        let read = self.read(r.offset, r.digest.size_bytes).await;
+        read.map_err(|e| CasError::Read(label(&to_proto(&r.digest)), format!("spool: {e}")))
+    }
+
     /// The spooled blob `digest` names, if it is in the spool.
     fn find(&self, digest: &kbf_types::Digest) -> Option<Spooled> {
         self.lock()
@@ -266,3 +275,7 @@ async fn blocking<T: Send + 'static>(
         .map_err(io::Error::other)
         .and_then(std::convert::identity)
 }
+
+#[cfg(test)]
+#[path = "spool_tests.rs"]
+mod tests;

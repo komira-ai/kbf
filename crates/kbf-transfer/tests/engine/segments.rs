@@ -31,6 +31,12 @@ enum Mode {
     FailCommits,
     /// Every Begin is UNIMPLEMENTED, as a server without the service answers.
     Unimplemented,
+    /// Every Locate fails UNAVAILABLE.
+    FailLocate,
+    /// Every ReadRange fails UNAVAILABLE.
+    FailReadRange,
+    /// Every ReadRange answers its bytes with the first one flipped.
+    CorruptReadRange,
 }
 
 /// `Segments` over the front's, counting calls, answering as `mode` says.
@@ -79,6 +85,9 @@ impl Segments for Counting {
     }
 
     async fn locate(&self, r: Request<LocateRequest>) -> Result<Response<LocateResponse>, Status> {
+        if self.mode == Mode::FailLocate {
+            return Err(Status::unavailable("the index is down"));
+        }
         self.inner.locate(r).await
     }
 
@@ -87,7 +96,14 @@ impl Segments for Counting {
         r: Request<ReadRangeRequest>,
     ) -> Result<Response<ReadRangeResponse>, Status> {
         self.read_ranges.fetch_add(1, Ordering::SeqCst);
-        self.inner.read_range(r).await
+        if self.mode == Mode::FailReadRange {
+            return Err(Status::unavailable("the store is down"));
+        }
+        let mut answer = self.inner.read_range(r).await?;
+        if self.mode == Mode::CorruptReadRange {
+            answer.get_mut().bytes[0] ^= 0xff;
+        }
+        Ok(answer)
     }
 }
 
@@ -300,4 +316,76 @@ async fn a_tree_of_a_thousand_files_reads_back_in_few_ranges() {
         reads <= total.div_ceil(MAX_RANGE_BYTES),
         "{reads} reads for {total} bytes"
     );
+}
+
+/// Catches a fill that fails, or hangs, when the server cannot locate or read (mutants:
+/// a failed `Locate` or `ReadRange` returned as an error): every blob asked for comes
+/// back missing, so the caller fetches it another way. Also catches bytes from a
+/// range trusted unchecked (mutant: the per-blob digest check dropped): a range whose
+/// bytes were altered fails the read as corrupt.
+#[tokio::test]
+async fn reads_by_range_fall_back_to_missing_and_refuse_altered_bytes() {
+    for mode in [
+        Mode::FailLocate,
+        Mode::FailReadRange,
+        Mode::CorruptReadRange,
+    ] {
+        let front = Front::start(mode).await;
+        let (spool, digests) = spooled("fill", (0..5).map(|i| patterned(i, 700))).await;
+        front.engine.put_spool(spool).await.expect("upload");
+        let read = front
+            .engine
+            .scope(&kbf_types::LeaseId::new(1, 1))
+            .read_located(&digests)
+            .await;
+        if mode == Mode::CorruptReadRange {
+            let failed = read.expect_err("altered bytes");
+            assert!(format!("{failed:?}").starts_with("Corrupt("), "{failed:?}");
+            continue;
+        }
+        let read = read.expect("missing, not an error");
+        assert!(read.blobs.is_empty());
+        let mut missing = read.missing;
+        missing.sort_by(|a, b| a.hash.cmp(&b.hash));
+        let mut want = digests.clone();
+        want.sort_by(|a, b| a.hash.cmp(&b.hash));
+        assert_eq!(missing, want);
+    }
+}
+
+/// Catches a spool that cannot be read treated as a failed call (mutant: the spool
+/// error retried and then sent blob by blob, each read failing again): when the spool
+/// file is cut short after its blobs were spooled, `put_spool` fails with a read
+/// error after one `Begin` and no `Commit`. Linux only: the unlinked spool file is
+/// reached through `/proc/self/fd`.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_spool_cut_short_fails_the_upload_without_a_retry() {
+    let front = Front::start(Mode::Serve).await;
+    let (spool, _) = spooled("cut-short", (0..3).map(|i| patterned(i, 900))).await;
+    let marker = format!(".kbf-spool-{}-", std::process::id());
+    let dir = scratch("cut-short");
+    let mut cut = 0;
+    for entry in std::fs::read_dir("/proc/self/fd").expect("fds") {
+        let path = entry.expect("fd").path();
+        let target = std::fs::read_link(&path).unwrap_or_default();
+        let name = target.to_string_lossy().into_owned();
+        if name.starts_with(dir.to_string_lossy().as_ref()) && name.contains(&marker) {
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .expect("reopen the spool");
+            file.set_len(0).expect("cut");
+            cut += 1;
+        }
+    }
+    assert_eq!(cut, 1, "one spool file under the scratch directory");
+    let failed = front
+        .engine
+        .put_spool(spool)
+        .await
+        .expect_err("the spool cannot be read");
+    assert!(format!("{failed:?}").starts_with("Read("), "{failed:?}");
+    assert_eq!(front.begins.load(Ordering::SeqCst), 1, "not retried");
+    assert_eq!(front.commits.load(Ordering::SeqCst), 0);
 }

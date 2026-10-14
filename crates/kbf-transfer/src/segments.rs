@@ -196,9 +196,9 @@ fn coalesce(mut located: Vec<(ObjectRef, u64, Digest)>, gap: u64, max: u64) -> V
     let mut runs: Vec<Run> = Vec::new();
     for (object, offset, digest) in located {
         let end = offset + u64::try_from(digest.size_bytes).unwrap_or(0);
+        // Sorted by offset within an object, so `offset >= run.start`.
         if let Some(run) = runs.last_mut()
             && run.object == object
-            && offset >= run.start
             && offset.saturating_sub(run.end) < gap
             && end.max(run.end) - run.start <= max
         {
@@ -263,11 +263,10 @@ impl Scope {
                     return Err(CasError::Read("spool".to_owned(), e.to_string()));
                 }
                 Err(Failed::Call(status)) if status.code() == Code::Unimplemented => {
-                    if !inner.segments_off.swap(true, Ordering::SeqCst) {
-                        tracing::warn!(
-                            "Segments answered UNIMPLEMENTED; outputs are uploaded blob by blob"
-                        );
-                    }
+                    // Later uploads see the flag and do not ask; uploads already in
+                    // flight may each say so once more.
+                    inner.segments_off.store(true, Ordering::SeqCst);
+                    tracing::warn!("Segments UNIMPLEMENTED; uploading outputs blob by blob");
                 }
                 Err(Failed::Call(status)) => {
                     tracing::warn!(attempt, "segment upload failed: {status}");
@@ -364,10 +363,7 @@ impl Scope {
                     let chunks = spool_chunks(Arc::clone(spool), r, chunk);
                     return self.send_chunks(&digest, chunks).await.map(drop);
                 }
-                let bytes = spool
-                    .read(r.offset, r.digest.size_bytes)
-                    .await
-                    .map_err(|e| CasError::Read(label(&digest), format!("spool: {e}")))?;
+                let bytes = spool.read_record(&r).await?;
                 self.send(&digest, &bytes).await.map(drop)
             })
             .buffer_unordered(self.inner.config.in_flight.max(1))
@@ -395,11 +391,11 @@ impl Scope {
                 result.missing.extend_from_slice(batch);
                 continue;
             };
-            for location in answer.into_inner().locations {
-                match (location.digest, location.object) {
-                    (Some(digest), Some(object)) => found.push((object, location.offset, digest)),
-                    (Some(digest), None) => result.missing.push(digest),
-                    (None, _) => {}
+            // The answer lists the asked digests, in order.
+            for (digest, location) in batch.iter().zip(answer.into_inner().locations) {
+                match location.object {
+                    Some(object) => found.push((object, location.offset, digest.clone())),
+                    None => result.missing.push(digest.clone()),
                 }
             }
         }
@@ -496,11 +492,7 @@ pub(crate) async fn put_each<C: Cas + ?Sized>(cas: &C, spool: &Arc<Spool>) -> Re
                 )
                 .await?
             } else {
-                let bytes = spool
-                    .read(r.offset, r.digest.size_bytes)
-                    .await
-                    .map_err(|e| CasError::Read(label(&digest), format!("spool: {e}")))?;
-                cas.put(bytes).await?
+                cas.put(spool.read_record(&r).await?).await?
             };
             if stored != digest {
                 return Err(CasError::Corrupt(label(&digest), label(&stored)));

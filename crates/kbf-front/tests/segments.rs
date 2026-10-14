@@ -12,6 +12,7 @@ use kbf_front::{
     MAX_RANGE_BYTES, MAX_UPLOAD_RECORDS, MIN_SEGMENT_UPLOAD_BYTES, SegmentsConfig, WriteConfig,
 };
 use kbf_proto::worker::{BeginRequest, CommitRequest, ObjectRef, ReadRangeRequest, UploadSegment};
+use kbf_segments::layout::footer_len;
 use kbf_segments::{Footer, IndexEntry};
 use tonic::Code;
 
@@ -276,7 +277,9 @@ async fn a_closed_connection_frees_its_upload_at_once() {
 }
 
 /// Catches unbounded server memory per read (mutant: no length check): a `ReadRange`
-/// over 4 MiB, or of nothing, is INVALID_ARGUMENT before the store is asked.
+/// over 4 MiB, or of nothing, or naming no object, is INVALID_ARGUMENT before the
+/// store is asked; one whose end is past the largest offset, or of an absent object,
+/// is NOT_FOUND.
 #[tokio::test]
 async fn a_read_range_over_the_limit_is_refused() {
     let front = Front::start(SegmentsConfig::DEFAULT).await;
@@ -296,6 +299,24 @@ async fn a_read_range_over_the_limit_is_refused() {
             "{length}: {refused:?}"
         );
     }
+    let unnamed = client
+        .read_range(ReadRangeRequest {
+            object: None,
+            offset: 0,
+            length: 10,
+        })
+        .await
+        .expect_err("no object");
+    assert_eq!(unnamed.code(), Code::InvalidArgument, "{unnamed:?}");
+    let past_the_end = client
+        .read_range(ReadRangeRequest {
+            object: Some(ObjectRef { epoch: 1, seq: 1 }),
+            offset: u64::MAX - 1,
+            length: 10,
+        })
+        .await
+        .expect_err("a range past the largest offset");
+    assert_eq!(past_the_end.code(), Code::NotFound, "{past_the_end:?}");
     let absent = client
         .read_range(ReadRangeRequest {
             object: Some(ObjectRef { epoch: 1, seq: 999 }),
@@ -396,6 +417,19 @@ async fn begin_refuses_what_it_cannot_take() {
 
     let empty = client.begin(BeginRequest { segments: vec![] }).await;
     assert_eq!(empty.expect_err("no segment").code(), Code::InvalidArgument);
+
+    let huge = support::declared_only(2 * (kbf_front::MAX_BLOB_BYTES + 1) + footer_len(2));
+    let refused = client
+        .begin(BeginRequest {
+            segments: vec![huge],
+        })
+        .await
+        .expect_err("records over the largest blob");
+    assert_eq!(refused.code(), Code::InvalidArgument, "{refused:?}");
+    assert!(
+        refused.message().contains("larger than the largest blob"),
+        "{refused:?}"
+    );
 
     let cap = SegmentsConfig::DEFAULT.max_bytes;
     let over = support::declared_only(cap + 1);
@@ -785,4 +819,155 @@ async fn an_upload_as_large_as_the_bound_is_admitted_and_commits() {
     .expect("commit");
     front.assert_stored_records_check(&s.digests).await;
     assert_eq!(front.cache.bytes_admitted(), 0);
+}
+
+/// Catches a range the upload cannot hold being written (mutants: no length check on
+/// `PutRange`; a segment index not checked; no bounds check): a range over 4 MiB
+/// (inside a record area larger than that), one for a segment the upload lacks, an
+/// empty one and one past the record area are INVALID_ARGUMENT. Also catches a coverage check that skips gaps between received
+/// ranges (mutant: `from > at` never true): a record whose first and last bytes
+/// arrived, but not its middle, is FAILED_PRECONDITION at commit.
+#[tokio::test]
+async fn put_range_refuses_what_the_upload_cannot_hold() {
+    let front = Front::start(SegmentsConfig::DEFAULT).await;
+    let s = seg(&[blob(110, 1000)]);
+    let mut client = front.client().await;
+    let upload = front.begin(&mut client, std::slice::from_ref(&s)).await;
+    let limit = usize::try_from(MAX_RANGE_BYTES).expect("limit");
+    let big = seg(&[blob(111, limit + 100)]);
+    let big_upload = front.begin(&mut client, std::slice::from_ref(&big)).await;
+    let refused = front
+        .put(&mut client, big_upload, 0, 0, &big.records[..=limit])
+        .await
+        .expect_err("a range over 4 MiB inside the records");
+    assert_eq!(refused.code(), Code::InvalidArgument, "{refused:?}");
+    let records = s.records.len() as u64;
+    for (what, segment, offset, bytes) in [
+        ("no such segment", 1, 0, &s.records[..10]),
+        ("empty", 0, 0, &[][..]),
+        ("past the records", 0, records - 5, &s.records[..10]),
+    ] {
+        let refused = front
+            .put(&mut client, upload, segment, offset, bytes)
+            .await
+            .expect_err(what);
+        assert_eq!(refused.code(), Code::InvalidArgument, "{what}: {refused:?}");
+    }
+
+    front
+        .put(&mut client, upload, 0, 0, &s.records[..300])
+        .await
+        .expect("the start");
+    front
+        .put(&mut client, upload, 0, 700, &s.records[700..])
+        .await
+        .expect("the end");
+    let refused = client
+        .commit(CommitRequest { upload })
+        .await
+        .expect_err("a record with a hole");
+    assert_eq!(refused.code(), Code::FailedPrecondition, "{refused:?}");
+    front
+        .put(&mut client, upload, 0, 300, &s.records[300..700])
+        .await
+        .expect("the middle");
+    client
+        .commit(CommitRequest { upload })
+        .await
+        .expect("the whole record commits");
+    front.assert_present(&s.digests, true).await;
+}
+
+/// Catches a store failure on `ReadRange` answered as anything but a retryable error
+/// (mutant: every store error is NOT_FOUND, as an absent object is): a range of a
+/// stored object whose GET fails as a reset connection is UNAVAILABLE. Also catches
+/// a short answer passed on as the range (mutant: the length check dropped): a range
+/// past the object's end is NOT_FOUND.
+#[tokio::test]
+async fn a_store_failure_on_read_range_is_unavailable() {
+    let front = Front::start(SegmentsConfig::DEFAULT).await;
+    let s = seg(&[blob(120, 600)]);
+    let mut client = front.client().await;
+    let upload = front.begin(&mut client, std::slice::from_ref(&s)).await;
+    put_all(&mut client, upload, 0, &s, 4096, false).await;
+    client
+        .commit(CommitRequest { upload })
+        .await
+        .expect("commit");
+    let located = front.locate(&mut client, &s.digests).await;
+    let object = located[0].object;
+    front.store.fail_next_gets(1);
+    let failed = client
+        .read_range(ReadRangeRequest {
+            object,
+            offset: located[0].offset,
+            length: 600,
+        })
+        .await
+        .expect_err("the store failed");
+    assert_eq!(failed.code(), Code::Unavailable, "{failed:?}");
+    let overrun = client
+        .read_range(ReadRangeRequest {
+            object,
+            offset: located[0].offset,
+            length: s.length + 10,
+        })
+        .await
+        .expect_err("past the object's end");
+    assert_eq!(overrun.code(), Code::NotFound, "{overrun:?}");
+}
+
+/// Catches an upload dropped while its daemon is still sending (mutant: the idle timer
+/// drops at its first deadline, whatever calls came since): with a 1 s idle time, an
+/// upload that gets a call every 250 ms for 2 s is still open and commits.
+#[tokio::test]
+async fn an_upload_with_calls_is_not_idle() {
+    let config = SegmentsConfig {
+        idle: Duration::from_secs(1),
+        ..SegmentsConfig::DEFAULT
+    };
+    let front = Front::start(config).await;
+    let s = seg(&[blob(140, 800)]);
+    let mut client = front.client().await;
+    let upload = front.begin(&mut client, std::slice::from_ref(&s)).await;
+    for _ in 0..8 {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        front
+            .put(&mut client, upload, 0, 0, &s.records[..100])
+            .await
+            .expect("the upload is still open");
+    }
+    front
+        .put(&mut client, upload, 0, 100, &s.records[100..])
+        .await
+        .expect("the rest");
+    client
+        .commit(CommitRequest { upload })
+        .await
+        .expect("commit");
+    front.assert_present(&s.digests, true).await;
+}
+
+/// Catches indexing what the footer read back does not list (mutant: the read-back's
+/// entries not checked against the records put): the store keeps another segment of
+/// the same length under the key (a valid footer, other records), so the commit is
+/// INTERNAL and nothing is indexed.
+#[tokio::test]
+async fn a_read_back_without_the_record_fails_the_commit() {
+    let front = Front::start(SegmentsConfig::DEFAULT).await;
+    let s = seg(&[blob(130, 600)]);
+    let other = seg(&[blob(131, 600)]);
+    assert_eq!(s.length, other.length);
+    let mut client = front.client().await;
+    let upload = front.begin(&mut client, std::slice::from_ref(&s)).await;
+    put_all(&mut client, upload, 0, &s, 4096, false).await;
+    let stored = [other.records.as_slice(), other.footer.as_slice()].concat();
+    front.store.replace_next_put(stored.into());
+    let refused = client
+        .commit(CommitRequest { upload })
+        .await
+        .expect_err("the read-back lacks the record");
+    assert_eq!(refused.code(), Code::Internal, "{refused:?}");
+    front.assert_present(&s.digests, false).await;
+    front.assert_present(&other.digests, false).await;
 }

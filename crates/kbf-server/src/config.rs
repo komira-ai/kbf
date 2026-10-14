@@ -583,11 +583,8 @@ mod tests {
             .map(drop)
             .expect_err("a cap over the bound");
         let message = refused.to_string();
-        assert!(
-            message.contains("--segment-upload-max-bytes")
-                && message.contains("--write-bytes-in-flight"),
-            "{message}"
-        );
+        assert!(message.contains("--segment-upload-max-bytes"), "{message}");
+        assert!(message.contains("--write-bytes-in-flight"), "{message}");
     }
 
     /// Catches: a `--write-bytes-in-flight` below the largest blob accepted (a Write of

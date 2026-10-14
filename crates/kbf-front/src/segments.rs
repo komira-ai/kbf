@@ -83,12 +83,6 @@ impl SegmentsConfig {
     };
 }
 
-impl Default for SegmentsConfig {
-    fn default() -> Self {
-        Self::DEFAULT
-    }
-}
-
 /// The `Segments` service over one cache.
 #[derive(Debug)]
 pub struct SegmentsService<M, O> {
@@ -163,21 +157,16 @@ impl Upload {
         *lock(&self.last_call) = Instant::now();
     }
 
-    fn committing(&self) -> bool {
-        matches!(*lock(&self.phase), Phase::Committing)
-    }
-
     /// The commit's answer, once it has one.
     async fn answer(&self) -> Result<Vec<Digest>, Status> {
         let mut done = self.done.subscribe();
-        let answered = done.wait_for(Option::is_some).await;
-        match answered.as_deref() {
-            Ok(Some(answer)) => answer.clone(),
-            // The sender lives in `self`, so it is never dropped while borrowed.
-            _ => Err(Status::internal(
-                "an upload's commit ended without an answer",
-            )),
-        }
+        let answered = done
+            .wait_for(Option::is_some)
+            .await
+            .ok()
+            .and_then(|a| a.clone());
+        // The sender lives in `self`, so the wait ends only with an answer.
+        answered.unwrap_or_else(|| Err(Status::internal("a commit ended without an answer")))
     }
 
     /// Drops the upload, freeing its buffers and admission even if a call still holds it,
@@ -190,13 +179,6 @@ impl Upload {
         }
         *phase = Phase::Dropped;
         true
-    }
-
-    /// Waits while a commit is running, so it is never dropped.
-    async fn settled(&self) {
-        if self.committing() {
-            let _ = self.answer().await;
-        }
     }
 }
 
@@ -270,7 +252,7 @@ impl<M: MetaLog, O: ObjectStore + 'static> SegmentsService<M, O> {
             // A commit is running: it is never dropped. Once it ends, its answer is
             // kept for another idle period (or dropped at once if the connection is
             // gone).
-            upload.settled().await;
+            let _ = upload.answer().await;
         }
         lock(&shared.uploads).remove(&id);
     }
@@ -284,15 +266,16 @@ impl<M: MetaLog, O: ObjectStore + 'static> SegmentsService<M, O> {
         admitted: Admitted,
     ) {
         let checking = Arc::clone(&upload);
-        let checked = tokio::task::spawn_blocking(move || {
+        let joined = tokio::task::spawn_blocking(move || {
             segments
                 .into_iter()
                 .zip(&checking.declared)
                 .map(|(received, declared)| received.check(declared))
                 .collect::<Result<Vec<_>, Status>>()
         })
-        .await
-        .unwrap_or_else(|e| Err(Status::internal(format!("checking an upload failed: {e}"))));
+        .await;
+        let checked =
+            joined.unwrap_or_else(|e| Err(Status::internal(format!("check failed: {e}"))));
         let answer = match checked {
             Ok(built) => cache.store_upload(built).await.map_err(Status::from),
             Err(refused) => Err(refused),

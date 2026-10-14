@@ -156,6 +156,10 @@ pub struct GatedStore {
     failing: Arc<AtomicUsize>,
     /// Every PUT's key, in the order they arrived.
     put_keys: Arc<std::sync::Mutex<Vec<ObjectKey>>>,
+    /// What the next PUT stores instead of its body, answering OK.
+    replace: Arc<std::sync::Mutex<Option<Bytes>>>,
+    /// How many of the next range GETs fail without reaching the bucket.
+    failing_gets: Arc<AtomicUsize>,
 }
 
 impl GatedStore {
@@ -168,7 +172,20 @@ impl GatedStore {
             at_gate: Arc::new(AtomicUsize::new(0)),
             failing: Arc::new(AtomicUsize::new(0)),
             put_keys: Arc::default(),
+            replace: Arc::default(),
+            failing_gets: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    /// The next PUT stores `bytes` instead of its body and answers OK, as a store that
+    /// mixed up two objects would.
+    pub fn replace_next_put(&self, bytes: Bytes) {
+        *self.replace.lock().expect("replace") = Some(bytes);
+    }
+
+    /// The next `n` range GETs fail as a reset connection would.
+    pub fn fail_next_gets(&self, n: usize) {
+        self.failing_gets.store(n, Ordering::SeqCst);
     }
 
     /// The next `n` PUTs fail as a reset connection would, storing nothing.
@@ -227,11 +244,9 @@ impl ObjectStore for GatedStore {
             .failing
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1));
         if failed.is_ok() {
-            return Err(ObjectStoreError::Transport(Arc::new(std::io::Error::new(
-                std::io::ErrorKind::ConnectionReset,
-                "connection reset (test)",
-            ))));
+            return Err(reset());
         }
+        let body = self.replace.lock().expect("replace").take().unwrap_or(body);
         self.inner.put_new(key, body, retain_until).await
     }
 
@@ -240,6 +255,12 @@ impl ObjectStore for GatedStore {
         key: &ObjectKey,
         range: ByteRange,
     ) -> Result<Bytes, ObjectStoreError> {
+        let failed = self
+            .failing_gets
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1));
+        if failed.is_ok() {
+            return Err(reset());
+        }
         self.inner.get_range(key, range).await
     }
 
@@ -255,6 +276,14 @@ impl ObjectStore for GatedStore {
     ) -> Result<ListPage, ObjectStoreError> {
         self.inner.list(prefix, after, max_keys).await
     }
+}
+
+/// What a reset connection to the store looks like.
+fn reset() -> ObjectStoreError {
+    ObjectStoreError::Transport(Arc::new(std::io::Error::new(
+        std::io::ErrorKind::ConnectionReset,
+        "connection reset (test)",
+    )))
 }
 
 /// A `Segments` server over loopback, its connections tracked.

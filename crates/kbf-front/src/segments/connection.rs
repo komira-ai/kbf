@@ -57,10 +57,10 @@ impl Connection {
     }
 
     /// Completes once the connection's stream has been dropped (the peer closed it, or
-    /// the server did).
+    /// the server did). Nothing is ever sent on the channel, so `changed` ends only
+    /// when its sender, held by the stream's registration, is dropped.
     pub async fn closed(&self) {
-        let mut open = self.open.clone();
-        while open.changed().await.is_ok() {}
+        let _ = self.open.clone().changed().await;
     }
 }
 
@@ -177,3 +177,6 @@ impl<IO: AsyncWrite + Unpin> AsyncWrite for Tracked<IO> {
         self.stream.is_write_vectored()
     }
 }
+
+#[cfg(test)]
+mod tests;

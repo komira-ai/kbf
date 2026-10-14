@@ -125,3 +125,87 @@ fn coalescing_joins_close_blobs_of_one_object() {
         ]
     );
 }
+
+/// Catches an empty segment, or an empty upload, sent to the server (mutants: the
+/// segment closed at the upload cap pushed whether or not it holds a record; the last
+/// segment or upload pushed when empty): when a blob closes a full segment and also
+/// passes the upload's byte cap, the new upload starts with that blob and no empty
+/// segment is left behind; nothing to upload is no upload.
+#[test]
+fn a_segment_closed_at_the_upload_cap_leaves_no_empty_segment() {
+    let segment_limit = 200 + footer_len(2);
+    let upload_bytes = 200 + footer_len(2) + 50;
+    let uploads = plan(
+        &back_to_back(6, 100),
+        segment_limit,
+        upload_bytes,
+        usize::MAX,
+    );
+    let shape: Vec<Vec<usize>> = uploads
+        .iter()
+        .map(|u| u.iter().map(|s| s.records.len()).collect())
+        .collect();
+    assert_eq!(shape, [[2], [2], [2]]);
+    assert!(plan(&[], segment_limit, upload_bytes, usize::MAX).is_empty());
+    // A first blob over the upload cap still goes, alone, with no empty upload before
+    // it.
+    let alone = plan(&back_to_back(1, 500), u64::MAX, 100, usize::MAX);
+    let shape: Vec<Vec<usize>> = alone
+        .iter()
+        .map(|u| u.iter().map(|s| s.records.len()).collect())
+        .collect();
+    assert_eq!(shape, [[1]]);
+}
+
+/// A store whose `put` answers a digest other than the bytes'.
+struct Lying;
+
+impl Cas for Lying {
+    type Lease = Arc<Self>;
+
+    fn lease(self: &Arc<Self>, _lease: &kbf_types::LeaseId) -> Arc<Self> {
+        Arc::clone(self)
+    }
+
+    async fn get(&self, digest: &Digest) -> Result<Vec<u8>, CasError> {
+        Err(CasError::Missing(label(digest)))
+    }
+
+    async fn put(&self, _bytes: Vec<u8>) -> Result<Digest, CasError> {
+        Ok(crate::cas::digest_of(b"some other blob"))
+    }
+}
+
+/// Catches a stored blob trusted without checking the store's answer (mutant: the
+/// comparison of `put`'s digest dropped): `put_each` through a store that answers
+/// another digest fails as corrupt, naming the blob it stored.
+#[tokio::test]
+async fn put_each_refuses_a_store_that_answers_another_digest() {
+    let dir = std::env::current_exe()
+        .expect("test binary")
+        .parent()
+        .expect("deps")
+        .join("kbf-transfer-segments-unit")
+        .join(std::process::id().to_string());
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let spool = Arc::new(Spool::create(&dir).expect("spool"));
+    let digest = spool.put(b"an output".to_vec()).await.expect("spooled");
+    let lying = Arc::new(Lying);
+    let failed = put_each(&lying, &spool).await.expect_err("another digest");
+    assert_eq!(
+        failed,
+        CasError::Corrupt(
+            label(&digest),
+            label(&crate::cas::digest_of(b"some other blob"))
+        )
+    );
+    // The fake's other calls, so none of its lines is left unrun.
+    assert_eq!(
+        Lying.get(&digest).await,
+        Err(CasError::Missing(label(&digest)))
+    );
+    assert!(Arc::ptr_eq(
+        &lying.lease(&kbf_types::LeaseId::new(1, 1)),
+        &lying
+    ));
+}
