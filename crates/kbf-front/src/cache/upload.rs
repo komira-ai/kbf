@@ -41,7 +41,7 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         let placed: Vec<(Digest, Location)> = placed.into_iter().flatten().collect();
         let digests = placed.iter().map(|(d, _)| *d).collect();
         let started = Instant::now();
-        let committed = self.commit(Command::PutBlobs(placed)).await;
+        let committed = self.writer.commit(Command::PutBlobs(placed)).await;
         self.metrics().segment_commit.since(started);
         match committed? {
             Applied::Blobs(Ok(_)) => Ok(digests),
@@ -56,7 +56,7 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         &self,
         segment: BuiltSegment,
     ) -> Result<Vec<(Digest, Location)>, CacheError> {
-        let object = self.allocate();
+        let object = self.writer.allocate();
         let key = self.object_key(object)?;
         let len = segment.body.len() as u64;
         self.metrics()
@@ -68,7 +68,7 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         self.metrics().segment_put.since(started);
         put?;
         let started = Instant::now();
-        let footer = self.read_footer(&key, len).await;
+        let footer = self.writer.read_footer(&key, len).await;
         self.metrics().segment_footer.since(started);
         let footer = footer?;
         segment
@@ -111,7 +111,7 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
             let found: Vec<Option<Location>> = digests
                 .iter()
                 .map(|d| match s.blob(d) {
-                    BlobAnswer::Present(location) => Some(location),
+                    BlobAnswer::Present { location, .. } => Some(location),
                     BlobAnswer::Unavailable | BlobAnswer::Absent => None,
                 })
                 .collect();
@@ -138,7 +138,7 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         let Some(range) = ByteRange::new(offset, len) else {
             return Ok(None);
         };
-        match self.get_range(&key, range).await {
+        match self.writer.get_range(&key, range).await {
             Ok(bytes) if bytes.len() as u64 == len => Ok(Some(bytes)),
             Ok(_) | Err(ObjectStoreError::NotFound(_) | ObjectStoreError::InvalidRange { .. }) => {
                 Ok(None)

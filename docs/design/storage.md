@@ -125,25 +125,34 @@ runs. **Planned**: collection runs on a schedule.
 
 ## Writes
 
-`Cache::store_blobs` is the only way bytes enter the store:
+`Cache::store_each` (and `store_blobs`, over it) is the only way bytes enter the
+store:
 
 1. Every blob is a `VerifiedBlob`: its SHA-256 and length were checked against the
    digest the client sent. A mismatch is `INVALID_ARGUMENT`.
 2. Blobs already present are touched, not written again.
-3. The rest are packed into segments of at most 128 MiB (`MAX_SEGMENT_BYTES`). A blob
-   too large for an empty segment is written as a segment of its own, with one record
-   at offset 0 and a footer like any other, so every object in the store carries the
-   digest and CRC of what it holds.
-4. Each segment is written with `put_new`, then its footer is **read back from the
-   store**, and the location of every blob is taken from the stored footer.
-5. Only then are the blobs' locations committed: one `PutBlobs` per segment. The
-   upload is acknowledged after that.
+3. The rest are pushed into the one **open segment** shared by every concurrent upload
+   (write grouping, [write-path.md](write-path.md) section 3), of at most 128 MiB
+   (`MAX_SEGMENT_BYTES`). It is sealed when the next blob does not fit, or 2 ms
+   (`--write-linger`) after its first blob. A blob of 16 MiB or more
+   (`--write-own-segment-bytes`), or too large for an empty segment, is written as a
+   segment of its own, with one record at offset 0 and a footer like any other, so
+   every object in the store carries the digest and CRC of what it holds.
+4. Each sealed segment is written with `put_new` (tried up to 3 times on a transport
+   failure or a 5xx answer, each time under a new key; `--store-put-attempts`), then
+   its footer is **read back from the store**, and the location of every blob is taken
+   from the stored footer.
+5. Only then are the blobs' locations committed: one `PutBlobs` per segment. Every
+   upload with a blob in it is acknowledged after that; a segment that fails answers
+   its own blobs with its error and no others.
 
-**Planned** ([write-path.md](write-path.md)): concurrent small uploads grouped into
-shared segments (one PUT and one `PutBlobs` per segment, not per call), daemon
-uploads of an action's outputs as whole segments with one commit, and a local
-write tier that syncs segments to a server's NVMe or SSD, acknowledges, and flushes
-them to the object store in the background.
+Uploads are admitted under `--write-bytes-in-flight` (2 GiB) before they buffer, and
+at most `--write-puts-in-flight` (4) segment PUTs run at once.
+
+**Planned** ([write-path.md](write-path.md)): daemon uploads of an action's outputs as
+whole segments with one commit, and a local write tier that syncs segments to a
+server's NVMe or SSD, acknowledges, and flushes them to the object store in the
+background.
 
 So a blob is never reported present before its bytes are durable in the store.
 

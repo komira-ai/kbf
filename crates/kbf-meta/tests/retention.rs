@@ -30,7 +30,7 @@ fn collection_follows_the_last_touch_not_the_write() {
 
     tick(&mut m, DAY * 9);
     assert_eq!(collect(&mut m).blobs, vec![(unread, in_segment(1, 2))]);
-    assert!(matches!(m.blob(&read), BlobAnswer::Present(_)));
+    assert!(matches!(m.blob(&read), BlobAnswer::Present { .. }));
 
     tick(&mut m, DAY * 13);
     assert!(collect(&mut m).blobs.is_empty(), "held through day 13");
@@ -128,7 +128,7 @@ fn nothing_reported_present_is_collected_within_min_ttl() {
                 2 => {
                     // A read: answer, touch, and only then report present.
                     let touch = m.touch_for([&d]);
-                    if let BlobAnswer::Present(_) = m.blob(&d) {
+                    if let BlobAnswer::Present { .. } = m.blob(&d) {
                         assert!(commit_touch(&mut m, touch).is_empty());
                         promise(&mut promised, &m, d);
                     }

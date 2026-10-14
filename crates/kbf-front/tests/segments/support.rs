@@ -338,7 +338,7 @@ impl Front {
                 })
                 .await
                 .expect("query");
-            let BlobAnswer::Present(location) = answer else {
+            let BlobAnswer::Present { location, .. } = answer else {
                 panic!("{digest} not present: {answer:?}");
             };
             let key = self.cache.object_key(location.object).expect("key");

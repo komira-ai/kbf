@@ -219,8 +219,9 @@ fn every_variant_has_its_golden_bytes() {
     }
 }
 
-/// Every `Command` variant is listed in the golden set, so a variant added to
-/// `kbf_meta::Command` without golden bytes fails here (the match is exhaustive).
+/// Every format-1 `Command` variant is listed in the golden set, so a variant added to
+/// `kbf_meta::Command` without golden bytes fails here (the match is exhaustive). The
+/// format-2 tier commands have theirs in `tier_codec.rs`.
 #[test]
 fn the_golden_set_names_every_variant() {
     let mut seen = [false; 9];
@@ -235,6 +236,11 @@ fn the_golden_set_names_every_variant() {
             Command::ObjectUnreachable { .. } => 6,
             Command::ObjectReachable { .. } => 7,
             Command::Collect => 8,
+            Command::AddTier { .. }
+            | Command::PutStaged { .. }
+            | Command::SealStaged { .. }
+            | Command::ObjectFlushed { .. }
+            | Command::FlushConflict { .. } => panic!("a format-2 command in format 1's set"),
         };
         seen[i] = true;
     }
@@ -617,15 +623,16 @@ fn malformed_values_are_refused() {
 /// Catches: an encoder or decoder that ignores the committed format, so a binary would
 /// write or read an encoding the log does not allow.
 #[test]
-fn only_format_1_is_written_or_read() {
+fn only_formats_1_and_2_are_written_or_read() {
     let entry = LogCommand::Meta(Command::Collect);
     let bytes = encode(Format::V1, &entry).expect("format 1");
-    for format in [Format::new(0), Format::new(2), Format::new(u32::MAX)] {
+    for format in [Format::new(0), Format::new(3), Format::new(u32::MAX)] {
         assert_eq!(encode(format, &entry), Err(EncodeError::Format(format)));
         assert_eq!(decode(format, &bytes), Err(DecodeError::Format(format)));
     }
-    assert_eq!(Format::V1.get(), 1);
-    assert_eq!(decode(Format::new(1), &bytes), Ok(entry));
+    assert_eq!((Format::V1.get(), Format::V2.get()), (1, 2));
+    assert_eq!(decode(Format::new(1), &bytes), Ok(entry.clone()));
+    assert_eq!(decode(Format::new(2), &bytes), Ok(entry));
 }
 
 /// Catches: a decoder that accepts bytes `encode` would not write, so one value would

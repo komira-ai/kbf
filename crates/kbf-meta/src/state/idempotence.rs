@@ -22,7 +22,10 @@
 //! - a mark whose generation a retry does not restamp (the mutant that stamps only when
 //!   the reason rises), or one that stamps a generation on another object;
 //! - a second apply after a `Tick` that touches an entry the command does not name, or
-//!   touches a named one at a time other than the applying entry's.
+//!   touches a named one at a time other than the applying entry's;
+//! - a tier command whose second apply changes the staged table: a `PutStaged` that
+//!   lists a digest again or moves an offset, an `ObjectFlushed` that restamps the time
+//!   the object left, an `AddTier` that retires the tier it registered.
 
 use std::collections::BTreeSet;
 use std::time::Duration;
@@ -34,6 +37,7 @@ use crate::model::{
     ActionRecord, Closure, Epoch, Generation, Location, ObjectId, Retention, Role, StoreId, Touch,
     UnreachableReason,
 };
+use crate::tier::{ServerId, StagedPut, TierId};
 
 const DAY: Duration = Duration::from_secs(24 * 60 * 60);
 
@@ -85,10 +89,51 @@ fn reason(rng: &mut Rng) -> UnreachableReason {
     }
 }
 
+/// Tier 1 or 2, registered by the generated states, or (rarely) 3, which is not.
+fn tier(rng: &mut Rng) -> TierId {
+    TierId::new(if rng.one_in(10) { 3 } else { 1 + rng.below(2) })
+}
+
+/// A tier command over the generated objects: offsets and ends in hundreds, so a record
+/// (at most 9 bytes) sometimes ends past its commit's end.
+fn tier_command(rng: &mut Rng) -> Command {
+    match rng.below(5) {
+        0 => Command::AddTier {
+            server: ServerId::new(1 + rng.below(3)),
+            tier: tier(rng),
+        },
+        1 => Command::PutStaged {
+            tier: tier(rng),
+            objects: (0..1 + rng.below(2))
+                .map(|_| StagedPut {
+                    object: object(rng),
+                    end: rng.below(6) * 100 + 9,
+                    seal: rng.one_in(3),
+                    blobs: (0..rng.below(4))
+                        .map(|_| (digest(rng), rng.below(6) * 100))
+                        .collect(),
+                })
+                .collect(),
+        },
+        2 => Command::SealStaged {
+            object: object(rng),
+        },
+        3 => Command::ObjectFlushed {
+            object: object(rng),
+        },
+        _ => Command::FlushConflict {
+            object: object(rng),
+        },
+    }
+}
+
 /// A forwardable command over the generated digests and objects. `ObjectReachable`
 /// names the object's current generation half the time, as a prober that read it; the
 /// rest of the time, any generation.
 fn forwardable(rng: &mut Rng, state: &MetaState) -> Command {
+    if rng.one_in(3) {
+        return tier_command(rng);
+    }
     match rng.below(7) {
         0 => Command::AllocEpoch,
         1 => Command::PutBlob {
@@ -131,14 +176,25 @@ fn forwardable(rng: &mut Rng, state: &MetaState) -> Command {
     }
 }
 
-/// A generated state and the index of its last entry: two epochs allocated, then a
-/// history of every command, `Tick` and `Collect` included.
+/// A generated state and the index of its last entry: two epochs allocated and tiers 1
+/// and 2 registered to servers 1 and 2, then a history of every command, `Tick` and
+/// `Collect` included.
 fn generated(rng: &mut Rng) -> (MetaState, u64) {
     let mut state = MetaState::new(Retention::default());
     let mut index = 0;
     for _ in 0..2 {
         index += 1;
         state.execute(index, Command::AllocEpoch);
+    }
+    for n in 1..=2 {
+        index += 1;
+        state.execute(
+            index,
+            Command::AddTier {
+                server: ServerId::new(n),
+                tier: TierId::new(n),
+            },
+        );
     }
     for _ in 0..rng.below(30) {
         index += 1;
@@ -185,6 +241,14 @@ fn named(command: &Command, applied: &Applied) -> (BTreeSet<Digest>, BTreeSet<Di
         (Command::Touch(touch), Applied::Touched { .. }) => {
             (touch.blobs.clone(), touch.actions.clone(), true)
         }
+        (Command::PutStaged { objects, .. }, Applied::Staged(r)) => (
+            objects
+                .iter()
+                .flat_map(|p| p.blobs.iter().map(|(d, _)| *d))
+                .collect(),
+            BTreeSet::new(),
+            r.is_ok(),
+        ),
         _ => (BTreeSet::new(), BTreeSet::new(), false),
     }
 }
@@ -196,6 +260,10 @@ struct Seen {
     restamped_same_reason: u32,
     epochs: u32,
     touched_later: u32,
+    /// Second applies of a tier command that were accepted.
+    tier_accepted: u32,
+    /// Second applies of a `PutStaged` accepted on a sealed object: a retry.
+    staged_repeats: u32,
 }
 
 /// The second apply of a command: what it was, at which index, how it applied, and the
@@ -266,19 +334,30 @@ fn check(once: &MetaState, twice: &MetaState, second: &Second<'_>, seen: &mut Se
         }
     }
 
+    if matches!(applied, Applied::Tier(Ok(())) | Applied::Staged(Ok(_))) {
+        seen.tier_accepted += 1;
+    }
+    if let (Command::PutStaged { objects, .. }, Applied::Staged(Ok(_))) = (command, applied) {
+        let sealed = |p: &StagedPut| {
+            once.staged(p.object)
+                .is_some_and(|s| s.state() != crate::StagedState::Open)
+        };
+        seen.staged_repeats += u32::from(objects.iter().any(sealed));
+    }
+
     assert_eq!(
         &norm, once,
         "{case}: {command:?} applied twice as {applied:?}"
     );
 }
 
-/// The rule of section 4.6, over 2 000 generated states and one generated forwardable
+/// The rule of section 4.6, over 3 000 generated states and one generated forwardable
 /// command each. Case 1: the command at index i and again at j > i, nothing between.
 /// Case 2: the same, with a `Tick` to a later farm time between the two.
 #[test]
 fn a_forwarded_command_applied_twice_equals_once_but_for_generations_and_next_epoch() {
     let mut seen = Seen::default();
-    for seed in 1..=2000u64 {
+    for seed in 1..=3000u64 {
         let mut rng = Rng::new(seed);
         let (base, last) = generated(&mut rng);
         let command = forwardable(&mut rng, &base);
@@ -329,12 +408,20 @@ fn a_forwarded_command_applied_twice_equals_once_but_for_generations_and_next_ep
     // Every exception and the touch-time rule must have been exercised, the same-reason
     // retry (which a stamp-only-on-rise mutant leaves at i) included.
     let counts = format!(
-        "restamped {}, same reason {}, epochs {}, touched later {}",
-        seen.restamped, seen.restamped_same_reason, seen.epochs, seen.touched_later
+        "restamped {}, same reason {}, epochs {}, touched later {}, tier accepted {}, \
+         staged repeats {}",
+        seen.restamped,
+        seen.restamped_same_reason,
+        seen.epochs,
+        seen.touched_later,
+        seen.tier_accepted,
+        seen.staged_repeats
     );
     assert!(
         seen.restamped.min(seen.epochs).min(seen.touched_later) > 200,
         "{counts}"
     );
     assert!(seen.restamped_same_reason > 100, "{counts}");
+    assert!(seen.tier_accepted > 200, "{counts}");
+    assert!(seen.staged_repeats > 30, "{counts}");
 }
