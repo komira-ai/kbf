@@ -93,6 +93,16 @@ impl HeldLog {
             .collect()
     }
 
+    /// How many `Collect` commits have been asked for so far.
+    fn collects(&self) -> usize {
+        self.asked
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .filter(|c| kind(c) == Kind::Collect)
+            .count()
+    }
+
     /// The touch commits asked for so far, blobs and actions.
     fn touch_commands(&self) -> Vec<Touch> {
         self.asked
@@ -337,6 +347,51 @@ async fn a_collection_keeps_a_blob_whose_touch_is_pending() {
         .await
         .expect("find");
     assert_eq!(missing, [unreported]);
+}
+
+/// Catches (mutants "a collection goes ahead when its flush fails", "a failed flush
+/// reports success"): a collection whose commit of the pending touches fails, yet
+/// commits `Collect` anyway and removes a blob a read reported present while its touch
+/// was only recorded. The first collection's touch commit gets an error and the
+/// second's another command's outcome: neither may ask for `Collect`, and the touch
+/// must stay pending. The third commits it, then removes only the unreported neighbour.
+#[tokio::test]
+async fn a_collection_whose_touch_commit_fails_collects_nothing() {
+    let cache = cache()
+        .await
+        .with_touches(config(Duration::from_secs(3600), 100));
+    let log = cache.meta();
+    let reported = store(&cache, "reported on day 5, touch not yet committed").await;
+    let unreported = store(&cache, "never reported").await;
+    cache.tick(days(5)).await.expect("tick");
+    assert!(
+        cache
+            .find_missing(&[reported])
+            .await
+            .expect("find")
+            .is_empty()
+    );
+    // Untouched since day 0, both blobs have expired by day 9.
+    cache.tick(days(9)).await.expect("tick");
+    log.fail_next_touches(2);
+
+    for refusal in ["an error", "another command's outcome"] {
+        assert!(
+            cache.collect().await.is_err(),
+            "a collection succeeded though its touch commit got {refusal}"
+        );
+        assert_eq!(log.collects(), 0, "Collect committed after {refusal}");
+        assert_eq!(
+            cache.touches_pending(),
+            1,
+            "the touch was lost on {refusal}"
+        );
+    }
+
+    let collected = cache.collect().await.expect("collect");
+    let removed: Vec<Digest> = collected.blobs.iter().map(|(d, _)| *d).collect();
+    assert_eq!(removed, [unreported], "only the unreported blob expires");
+    assert_eq!(log.touches(), vec![BTreeSet::from([reported]); 3]);
 }
 
 /// Catches (mutant "a read records its touch outside the gate"): a read that reports a
