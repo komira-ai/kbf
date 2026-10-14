@@ -141,7 +141,7 @@ fn nothing_half_indexed(
     homes: &dyn BlobHomes,
 ) -> Result<(), Broken> {
     let detail = answers.iter().find_map(|(d, answer)| match answer {
-        BlobAnswer::Present(at) if !homes.holds(at.object, d) => {
+        BlobAnswer::Present { location: at, .. } if !homes.holds(at.object, d) => {
             Some(format!("{d:?} indexed in {}, which lacks it", at.object))
         }
         _ => None,
@@ -157,7 +157,7 @@ pub(crate) fn orphans(
 ) -> BTreeSet<ObjectId> {
     let named: BTreeSet<ObjectId> = answers
         .filter_map(|a| match a {
-            BlobAnswer::Present(at) => Some(at.object),
+            BlobAnswer::Present { location: at, .. } => Some(at.object),
             BlobAnswer::Unavailable | BlobAnswer::Absent => None,
         })
         .collect();
@@ -281,7 +281,7 @@ impl<'a> Checker<'a> {
         self.present_checked = seen.present.len();
         let indexed = |d: &Digest| {
             meta.as_ref()
-                .is_none_or(|m| matches!(m.blob(d), BlobAnswer::Present(_)))
+                .is_none_or(|m| matches!(m.blob(d), BlobAnswer::Present { .. }))
         };
         self.hold(now, no_false_ack(&seen.acked, store, &indexed));
         if let Some(meta) = &meta {
@@ -414,11 +414,23 @@ mod tests {
             offset: 0,
         };
         let homes = Holds(vec![(object(1), d)]);
-        let good = [(&d, BlobAnswer::Present(at(1)))];
+        let good = [(
+            &d,
+            BlobAnswer::Present {
+                location: at(1),
+                staged_on: None,
+            },
+        )];
         assert!(nothing_half_indexed(&good, &homes).is_ok());
         let gone = [(&d, BlobAnswer::Absent), (&d, BlobAnswer::Unavailable)];
         assert!(nothing_half_indexed(&gone, &Holds(Vec::new())).is_ok());
-        let half = [(&d, BlobAnswer::Present(at(2)))];
+        let half = [(
+            &d,
+            BlobAnswer::Present {
+                location: at(2),
+                staged_on: None,
+            },
+        )];
         let broken = nothing_half_indexed(&half, &homes);
         assert_eq!(property(broken), Property::NothingHalfIndexed);
     }
@@ -427,12 +439,13 @@ mod tests {
     /// it does not (an absent or unavailable answer names no object).
     #[test]
     fn objects_no_entry_names_are_orphans() {
-        let at = |seq| {
-            BlobAnswer::Present(Location {
+        let at = |seq| BlobAnswer::Present {
+            location: Location {
                 store: StoreId::new(0),
                 object: object(seq),
                 offset: 0,
-            })
+            },
+            staged_on: None,
         };
         let objects = [object(1), object(2), object(3)];
         let answers = [at(1), BlobAnswer::Absent, BlobAnswer::Unavailable, at(3)];

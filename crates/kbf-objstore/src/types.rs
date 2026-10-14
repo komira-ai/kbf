@@ -220,8 +220,9 @@ pub struct Capabilities {
     pub object_lock: bool,
 }
 
-/// Errors from an [`ObjectStore`](crate::ObjectStore).
-#[derive(Debug, thiserror::Error)]
+/// Errors from an [`ObjectStore`](crate::ObjectStore). Cloned, so one failed write can
+/// be reported to every caller waiting on it.
+#[derive(Clone, Debug, thiserror::Error)]
 pub enum ObjectStoreError {
     /// No object has this key.
     #[error("object {0} not found")]
@@ -264,7 +265,7 @@ pub enum ObjectStoreError {
     /// which it was. The cause is in the text, not [`std::error::Error::source`], so a
     /// reader that prints the chain does not print it twice.
     #[error("request to the store failed: {}", Causes(.0.as_ref()))]
-    Transport(Box<dyn std::error::Error + Send + Sync>),
+    Transport(std::sync::Arc<dyn std::error::Error + Send + Sync>),
 }
 
 /// An error and each of its sources, joined by `: `.
@@ -335,7 +336,7 @@ mod tests {
         #[error("error sending request")]
         struct Outer(#[source] std::io::Error);
         let timed_out = std::io::Error::new(std::io::ErrorKind::TimedOut, "operation timed out");
-        let err = ObjectStoreError::Transport(Box::new(Outer(timed_out)));
+        let err = ObjectStoreError::Transport(std::sync::Arc::new(Outer(timed_out)));
         assert_eq!(
             err.to_string(),
             "request to the store failed: error sending request: operation timed out"
@@ -355,7 +356,7 @@ mod tests {
         #[error("client error")]
         struct Middle(#[source] std::io::Error);
         let reset = std::io::Error::new(std::io::ErrorKind::ConnectionReset, "connection reset");
-        let err = ObjectStoreError::Transport(Box::new(Outer(Middle(reset))));
+        let err = ObjectStoreError::Transport(std::sync::Arc::new(Outer(Middle(reset))));
         assert_eq!(
             err.to_string(),
             "request to the store failed: error sending request: client error: connection reset"

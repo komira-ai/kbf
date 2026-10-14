@@ -1,11 +1,12 @@
-# The write path: segment upload, grouping and a local write tier (**planned**)
+# The write path: segment upload, grouping and a local write tier
 
 How bytes get from an upload into the store, and what an acknowledgement promises.
-Today's path is in [storage.md](storage.md#writes). Planned, none built yet: **write
-grouping** (concurrent small REAPI uploads share one segment, PUT and metadata commit),
-**segment upload** (the daemon sends an action's outputs as whole segments over the
-worker listener, with one commit), and a **local write tier** (segments synced to a
-server's NVMe or SSD, acknowledged, and flushed to the object store in the background).
+Today's path is in [storage.md](storage.md#writes). Built: **write grouping**
+(section 3: concurrent small REAPI uploads share one segment, PUT and metadata commit;
+`kbf-front/src/cache/write_group.rs`). **Planned**: **segment upload** (the daemon
+sends an action's outputs as whole segments over the worker listener, with one commit),
+and a **local write tier** (segments synced to a server's NVMe or SSD, acknowledged,
+and flushed to the object store in the background).
 
 ## 1. The problem, measured
 
@@ -76,7 +77,9 @@ calls `store_blobs`) and `put_segment`. It has one **open segment** (a
 2. The group pushes them into the open segment. A digest already in it is a no-op push
    (`SegmentWriter::push` already does this), and both callers wait on that segment.
 3. The open segment is **sealed** when the next blob would not fit (`WriteError::Full`)
-   or when its oldest blob has waited `--write-linger` (default 2 ms).
+   or when its oldest blob has waited `--write-linger` (in milliseconds, default 2). Each
+   segment's linger timer is set when it opens and seals that segment only: a segment
+   sealed full before its timer fires leaves the next one to its own timer.
 4. A sealed segment is written as today: one `put_new`, the footer read back, one
    `Command::PutBlobs` listing every blob in it. Then every caller with a blob in it is
    answered. A caller whose blobs span two segments is answered when both are settled.
@@ -92,23 +95,35 @@ the committed metadata log**.
 ### 3.2 Large blobs
 
 A blob of `--write-own-segment-bytes` (default 16 MiB) or more bypasses the group and
-is written as a segment of its own (`put_whole`, as today), so it neither waits for a
+is written as a segment of its own (one record, settled like a grouped segment: the
+PUT with its retries, the footer read-back, one `PutBlobs`), so it neither waits for a
 linger nor holds up small writes. It is still held in memory until verified
 (`MAX_BLOB_BYTES`, 1 GiB) until the tier lets it stream to disk (section 6.2).
 
 ### 3.3 Bounds and backpressure
 
 - **Admission.** `--write-bytes-in-flight` (default 2 GiB) is an async semaphore
-  counted in bytes. A ByteStream `Write` takes a permit for the size named in its
-  resource name **before it reads its first message**, so the bytes it buffers in
-  `received` are covered. `BatchUpdateBlobs` takes a permit for its total before it
+  counted in bytes. A ByteStream `Write` reads its first message (which carries the
+  resource name, and so the blob's size), then takes a permit for that size **before it
+  reads any more**, so the bytes it buffers in `received` are covered. `received` is
+  allocated at that size up front, so what is held is what was admitted, not a grown
+  buffer's capacity. `BatchUpdateBlobs` takes a permit for its total before it
   calls `store_blobs`. Own-segment blobs count too. The server refuses to start with a
   value below `MAX_BLOB_BYTES`, so a single legal blob can always be admitted. A caller
   over the bound waits; nothing is refused for load.
 - **What it does not cover.** A `BatchUpdateBlobs` request is decoded by tonic before
   its handler runs: up to the 4 MiB message limit per stream, times the HTTP/2
   concurrent-stream limit. That limit is set explicitly on both listeners and named in
-  the flag reference, so the total is a stated number, not "bounded".
+  the flag reference, so the total is a stated number, not "bounded": 200 streams per
+  connection (`MAX_CONCURRENT_STREAMS`). A `Write`'s first message (which names the
+  blob) is decoded the same way, and a `Write` waiting for admission leaves up to its
+  stream's flow-control window, 1 MiB (`STREAM_WINDOW_BYTES`), received and unread.
+- **Flow control.** The connection's window is set to every stream's window at once
+  (200 MiB, `CONNECTION_WINDOW_BYTES`) on both listeners. With the transport's default
+  of 1 MiB, the unread data of the `Write`s waiting for admission on one connection
+  takes the whole window, and the admitted `Write`s on it, which must finish before
+  anyone else is admitted, never receive another byte: the uploads deadlock. The
+  admission test below goes red that way with the windows left at their defaults.
 - `--write-puts-in-flight` (default 4) bounds concurrent segment PUTs. A segment
   sealed while all are busy waits; new blobs go to a new open segment.
 - Commits stay one at a time. Each now carries up to a segment's worth of blobs.
@@ -121,7 +136,10 @@ linger nor holds up small writes. It is still held in memory until verified
   first PUT that the store kept but reported as failed cannot make the retry fail on
   `AlreadyExists` under `conditional_put`. The object it may have left is an orphan for
   the planned sweep ([storage.md](storage.md#planned)). If every attempt fails, the
-  segment's blobs are not indexed and each of them is answered `UNAVAILABLE`.
+  segment's blobs are not indexed and each of them is answered `UNAVAILABLE`. A
+  footer read-back that does not reach the store is `UNAVAILABLE` too, and not retried.
+  "Unavailable" here is a request that did not complete (connect, reset, timeout) or a
+  5xx answer; any other error (a 4xx, `AlreadyExists`) fails the segment at once.
 - **Per-blob answers.** `BatchUpdateBlobs` reports a status per blob, so a request whose
   blobs landed in two segments gets a mixed answer: `OK` for blobs in the committed
   segment, `UNAVAILABLE` for the other. A ByteStream `Write` has one blob and one answer.
@@ -153,7 +171,7 @@ admission rules ([worker-protocol.md](worker-protocol.md#blobs-on-the-worker-lis
    and calls `FindMissingBlobs` once for the set, in batches under the request limit.
 2. It writes the missing blobs with `kbf_segments::SegmentWriter` into one segment, or
    several when they pass `MAX_SEGMENT_BYTES` (128 MiB). A blob larger than that is a
-   segment of one record, as `put_whole` is today. The segment's **footer is the
+   segment of one record, as a large blob is in section 3.2. The segment's **footer is the
    manifest**: (hash, size, offset, crc32c) per record, in the format the store already
    reads. (It is not the chunking `Manifest` of `kbf-segments`.) Records are written to
    a spool file on the worker's disk, not held in memory.
@@ -293,10 +311,32 @@ offset in the block is its offset in the object the block becomes (Buildbarn's
    (section 3), and a metric says so. **If the store is also down**, that fallback fails
    too: `UNAVAILABLE` until the store returns or the flusher frees space.
 
-The index gains one small table: staged objects, each with its tier, committed length,
-seal state and blob list. It holds only what has not been flushed, so it is bounded by
-the budget. `tier` is the server's tier id, committed once by `Command::AddTier
-{ server, id }` the first time a directory is opened, and written to `<dir>/TIER`.
+The index gains one small table (built: `kbf-meta`, `state/staged.rs`): staged objects,
+each with its tier, committed length, state (open, sealed, conflict) and blob list. It
+holds only what has not been flushed, so it is bounded by the budget. An object leaves
+it on `ObjectFlushed`, or on `ObjectUnreachable` (its block is not to be trusted, and
+the restart sweep deletes it). Each object that left is remembered, with the farm time
+it left, for the blob retention (`min_ttl` plus the touch quantum), so a late or retried
+`PutStaged` cannot stage it again; `Collect` forgets older ones. That is a stated
+limit, not an accident: a commit that arrives more than the retention after its object
+left would stage it again (a test pins it), and it is accepted because no forward or
+retry lives that long. `SealStaged` for an object that was never staged answers
+`NotStaged`, so a block whose every group failed to commit has nothing to seal; PR 4 must
+treat that block as an orphan for the restart sweep. `tier` is the server's
+tier id, committed once by `Command::AddTier { server, tier }` the first time a
+directory is opened, and written to `<dir>/TIER`. A server has one tier at a time:
+`AddTier` with another id is refused while that server's old tier holds a staged
+object (objects on other servers' tiers do not count; the
+abandon flag marks them unreachable first), retires the old id, and a retired id is
+never registered again.
+
+A `PutStaged` is all or nothing. Besides the refusals above, it is refused for an
+object marked unreachable or staged on another tier, an object named twice, or a record
+that ends past `end`. A `PutStaged` on a sealed object that adds nothing (every blob
+already listed, `end` within the committed length) is a retried commit and is accepted,
+so a forward retried after a sealing commit does not fail an indexed upload. A digest
+an object already lists is indexed at the listed offset, so the index never names a
+location the footer lacks.
 
 **`Fs` needs work first.** `kbf-store`'s `Fs` is one flat directory with whole-file
 `read` only (`kbf-store/src/fs.rs`). Flat block names fit it; a 128 MiB whole-file read
@@ -369,12 +409,17 @@ Crash and conflict points in the flusher:
 ### 6.5 Log format
 
 `PutStaged`, `SealStaged`, `ObjectFlushed`, `FlushConflict` and `AddTier` are new
-`kbf-log` command variants. An older binary already refuses them: an unset command
-decodes as `DecodeError::UnknownCommand` (`kbf-log/src/meta.rs`), the Raft machine
-stops on it (`kbf-server/src/raft_log/machine.rs`), and opening the log returns
-`RaftLogError::Decode` (`decoded`, `raft_log/mod.rs`). PR 2 adds a test that pins this
-for the new variants. The snapshot encoding ([metadata-snapshots.md](metadata-snapshots.md))
-gains the staged table.
+`kbf-log` command variants (built), `MetaCommand` fields 10 to 14, and they make **log
+format 2** (`kbf_log::Format::V2`), as `log.proto` requires of any added command. An
+older binary already refuses them: an unset command decodes as
+`DecodeError::UnknownCommand` (`kbf-log/src/meta.rs`), the Raft machine stops on it
+(`kbf-server/src/raft_log/machine.rs`), and opening the log returns
+`RaftLogError::Decode` (`decoded`, `raft_log/mod.rs`). This binary refuses them under
+format 1 the same way, on encode and decode; the metadata log still reads and writes
+format 1 only, so PR 4 must raise the log's format before its first `AddTier`. Tests in
+`kbf-log/tests/tier_codec.rs` and `kbf-server/tests/raft_log.rs` pin both. The snapshot
+encoding ([metadata-snapshots.md](metadata-snapshots.md)), not built yet, gains the
+staged table, the tier registry and the record of objects that left.
 
 ### 6.6 A server and a daemon on one host
 
@@ -413,8 +458,8 @@ Estimates from the measured store latency, to be measured on the pilot at each s
 ## 8. Rollout
 
 1. **PR 1, grouping and admission** (`kbf-front`, new module `write_group.rs`, since
-   `cache.rs` is near its size limit): the group, the PUT retry, the admission permit at
-   stream start, the explicit concurrent-stream limit. Flags: `--write-linger`,
+   `cache.rs` is near its size limit): the group, the PUT retry, the admission permit after
+   a `Write`'s first message, the explicit concurrent-stream limit. Flags: `--write-linger`,
    `--write-own-segment-bytes`, `--write-bytes-in-flight`, `--write-puts-in-flight`,
    `--store-put-attempts`. No format change. Ships alone; measure the toolchain upload.
 2. **PR 2, segment upload**: the `Segments` service on the worker listener (`Begin`,
@@ -424,7 +469,7 @@ Estimates from the measured store latency, to be measured on the pilot at each s
    Direct path only. Downloads through the transfer engine follow it.
 3. **PR 3, tier metadata**: the five commands in `kbf-meta` and `kbf-log`, the staged
    table, `BlobAnswer::Present { staged_on }`, the refusal test, snapshot encoding if
-   snapshots have landed. Nothing writes them yet.
+   snapshots have landed (they have not). Nothing writes them yet.
 4. **PR 4, the tier**: the `Fs` extension, block files, append and sync, seal, the
    flusher, local reads, eviction on committed state, upload reservations, restart
    recovery and the orphan sweep, the abandon flag, metrics. Flags: `--write-tier-dir`,
@@ -449,9 +494,10 @@ Grouping (PR 1), over `MemoryStore` wrapped to count and fault requests:
 | commit refused after a good PUT: all fail, nothing present | acknowledging on PUT alone |
 | PUT fails twice, then succeeds, on a `conditional_put` store: one `PutBlobs`, keys differ | retry under the same key |
 | a lone write under a paused clock is sealed at the linger | waiting forever for a full segment |
+| a segment sealed full before its linger: its timer, when it fires, leaves the next open segment open until that segment's own linger | a linger timer sealing whichever segment is open; mutant: the timer takes the open segment without checking its id |
 | a blob at `--write-own-segment-bytes` gets its own segment without the linger | large blobs held up by small ones |
 | the same digest from two callers: one record, both answered | duplicate records; a caller never answered |
-| 48 concurrent 64 MiB `Write`s with a 1 GiB bound: peak buffered bytes stay under the bound | permit taken after buffering; mutant: permit in `store_blobs` |
+| 48 concurrent `Write`s on one connection, three times the bound in all: peak buffered bytes stay under the bound, every `Write` finishes (built as 4 MiB `Write`s and a 12 MiB bound, not 64 MiB and 1 GiB, so the suite does not hash 3 GiB) | permit taken after buffering; mutant: permit in `store_blobs`; flow-control windows left at the transport's defaults (deadlock) |
 | a start with `--write-bytes-in-flight` below `MAX_BLOB_BYTES` is refused | a legal blob waiting forever |
 | a start with `--segment-upload-max-bytes` over `--write-bytes-in-flight`, or below one 1 GiB record plus footer, is refused; a `Begin` over the cap or `MAX_UPLOAD_RECORDS` is refused; a 1 GiB single-record segment commits | a `Begin` waiting forever for its permit |
 

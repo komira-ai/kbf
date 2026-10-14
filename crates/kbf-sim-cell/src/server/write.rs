@@ -128,7 +128,8 @@ pub(super) fn read_back_cuts(up: &Up, cuts: &mut [Cut]) {
     for cut in cuts.iter_mut().filter(|c| c.survived.is_none()) {
         let digest = cut.digest;
         let answer = up.query(move |m| m.blob(&digest));
-        let held = matches!(answer, BlobAnswer::Present(at) if at.object == cut.object);
+        let held =
+            matches!(answer, BlobAnswer::Present { location: at, .. } if at.object == cut.object);
         cut.survived = Some(held);
     }
 }
@@ -179,7 +180,7 @@ mod tests {
 
     fn present(s: &Server, d: &Digest) -> bool {
         let meta = s.meta().expect("up");
-        matches!(meta.blob(d), kbf_meta::BlobAnswer::Present(_))
+        matches!(meta.blob(d), kbf_meta::BlobAnswer::Present { .. })
     }
 
     /// Catches a PUT that is never given up (a hung store holding every upload until it
