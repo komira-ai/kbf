@@ -201,7 +201,8 @@ fn a_wrong_or_missing_tier_file_refuses_the_start() {
 }
 
 /// Catches: one missing or short block failing the whole start (or the whole tier),
-/// rather than only its own object; and a short block served.
+/// rather than only its own object; and a short block served, even one only a
+/// single byte short of its committed length.
 #[test]
 fn one_missing_or_short_block_loses_only_its_object() {
     let fs = FaultFs::new();
@@ -213,7 +214,7 @@ fn one_missing_or_short_block_loses_only_its_object() {
     drop(tier);
     let fs = fs.restart();
     fs.remove(&block_name(a)).unwrap();
-    fs.put(&block_name(b), b"bb");
+    fs.put(&block_name(b), b"bbb");
     let (tier, rec) = open_tier(&fs, 2, opts(), &index).unwrap();
     assert_eq!(rec.lost, [a, b]);
     assert_eq!(rec.sealed, [c]);
