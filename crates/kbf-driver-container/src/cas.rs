@@ -71,6 +71,20 @@ impl FileBlob {
         }))
     }
 
+    /// `file`, hashed earlier to `digest`, to be stored from its first byte: a file
+    /// the walk hashed and closed, opened again because its blob is missing. Bytes
+    /// changed in between no longer hash to `digest`, which the CAS checks on commit.
+    #[must_use]
+    pub fn hashed_as(file: std::fs::File, digest: Digest) -> Self {
+        let size = u64::try_from(digest.size_bytes).unwrap_or(0);
+        Self {
+            file: Arc::new(file),
+            digest,
+            size,
+            offset: 0,
+        }
+    }
+
     /// The digest the file hashed to.
     #[must_use]
     pub fn digest(&self) -> &Digest {

@@ -112,6 +112,20 @@ pub trait Cas: Send + Sync + 'static {
         }
     }
 
+    /// The digests among `digests` the store does not hold, in the order asked. A
+    /// caller with many blobs to store asks about all of them once, before it stores
+    /// any, and stores only these, rather than paying a question per blob.
+    ///
+    /// The transfer engine asks FindMissing in calls of at most
+    /// `--transfer-find-missing-chunk` digests, all of the calls at once within
+    /// `--transfer-in-flight`; a call that fails answers "missing" for its digests, and
+    /// a [`Cas::put`] or [`Cas::put_chunks`] on the same lease of a digest answered
+    /// missing does not ask again. This default asks nothing and answers every digest
+    /// missing: a store whose puts need no question.
+    fn missing(&self, digests: &[Digest]) -> impl Future<Output = Vec<Digest>> + Send {
+        std::future::ready(digests.to_vec())
+    }
+
     /// How many requests this store runs at once, for the whole process. A caller that
     /// queues work ahead of the store (a tree walk holding files open for upload) keeps
     /// no more than this many items queued, so it holds that many, not the whole tree.
@@ -151,6 +165,10 @@ impl<C: Cas> Cas for Arc<C> {
         file: &mut tokio::fs::File,
     ) -> impl Future<Output = Result<(), CasError>> + Send {
         C::read_to(self, digest, file)
+    }
+
+    fn missing(&self, digests: &[Digest]) -> impl Future<Output = Vec<Digest>> + Send {
+        C::missing(self, digests)
     }
 
     fn in_flight(&self) -> usize {

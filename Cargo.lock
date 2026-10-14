@@ -1321,8 +1321,9 @@ dependencies = [
  "futures",
  "hex",
  "kbf-daemon",
- "kbf-outputs",
+ "kbf-front",
  "kbf-proto",
+ "kbf-transfer",
  "kbf-types",
  "prost",
  "prost-types",
@@ -1331,6 +1332,7 @@ dependencies = [
  "sha2 0.11.0",
  "thiserror",
  "tokio",
+ "tonic",
  "tracing",
  "tracing-subscriber",
 ]

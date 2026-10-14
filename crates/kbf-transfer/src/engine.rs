@@ -14,9 +14,10 @@
 //! write starts again from its first byte; one streamed from a file's chunks is not
 //! retried, since its chunks are read once.
 
+use std::collections::HashSet;
 use std::pin::pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use kbf_proto::reapi::Digest;
@@ -121,6 +122,9 @@ impl Transfers {
 pub struct Scope {
     inner: Arc<Inner>,
     counts: Arc<Counts>,
+    /// The labels of digests [`Cas::missing`] answered missing that are not stored yet:
+    /// their put does not ask again (`crate::find`).
+    answered: Mutex<HashSet<String>>,
 }
 
 impl Scope {
@@ -128,7 +132,13 @@ impl Scope {
         Self {
             inner: Arc::clone(inner),
             counts: Arc::new(Counts::new(lease)),
+            answered: Mutex::default(),
         }
+    }
+
+    fn answered(&self) -> MutexGuard<'_, HashSet<String>> {
+        // Every change is one insert or one remove.
+        self.answered.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// What this scope has transferred so far.
@@ -149,8 +159,12 @@ impl Scope {
         waiter.outcome(digest).await
     }
 
-    /// Whether the server holds the blob, so its upload is skipped.
+    /// Whether the server holds the blob, so its upload is skipped: `false` without a
+    /// question for a digest [`Cas::missing`] answered missing, the answer used once.
     async fn present(&self, digest: &Digest) -> bool {
+        if self.answered().remove(&label(digest)) {
+            return false;
+        }
         let present = self.inner.present(digest, &self.counts).await;
         if present {
             add(&self.counts.outputs_present, 1);
@@ -232,6 +246,14 @@ impl Cas for Scope {
         flushed.map_err(|e| CasError::Write(label(digest), e.to_string()))
     }
 
+    async fn missing(&self, digests: &[Digest]) -> Vec<Digest> {
+        let missing = self.inner.missing(digests, &self.counts).await;
+        let present = digests.len() - missing.len();
+        add(&self.counts.outputs_present, present as u64);
+        self.answered().extend(missing.iter().map(label));
+        missing
+    }
+
     fn in_flight(&self) -> usize {
         self.inner.config.in_flight
     }
@@ -276,6 +298,10 @@ impl Cas for Transfers {
 
     async fn read_to(&self, digest: &Digest, file: &mut tokio::fs::File) -> Result<(), CasError> {
         self.unscoped.read_to(digest, file).await
+    }
+
+    async fn missing(&self, digests: &[Digest]) -> Vec<Digest> {
+        self.unscoped.missing(digests).await
     }
 
     fn in_flight(&self) -> usize {
