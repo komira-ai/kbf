@@ -20,6 +20,11 @@
 //! (issue #168). If a handler cannot be installed it exits 2 without printing the
 //! start line.
 //!
+//! Events go to stderr and, with `--log-dir` (by default `log/` in the `--hot-store`
+//! directory), also to a size-capped rotating file (`kbf_server::log_file`); an INFO
+//! line right after start says which. The tracing subscriber is installed after the
+//! flags are parsed, since they say where the file is.
+//!
 //! The REAPI listener runs the policy `--reapi-auth-policy` names; a policy file that
 //! cannot be read or is not a policy exits 2 before anything is bound.
 //!
@@ -42,14 +47,31 @@ use std::error::Error;
 use std::process::ExitCode;
 
 use clap::Parser;
+use kbf_server::log_file::{LogFile, subscriber};
 use kbf_server::{Args, interrupted, sizes_on, start};
 use kbf_threads::Topology;
+use tracing_subscriber::util::SubscriberInitExt;
 
 fn main() -> ExitCode {
-    tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .init();
     let args = Args::parse();
+    let log_dir = args.log_dir();
+    let file = log_dir
+        .as_deref()
+        .map(|dir| LogFile::open(dir, args.log_max_bytes, args.log_files));
+    // `try_init`, not `set_global_default`: it also routes `log` records (rustls's) into
+    // the subscriber. A subscriber already set (none is, in the binary) keeps its place.
+    let _ = subscriber(std::io::stderr, file).try_init();
+    match &log_dir {
+        Some(dir) => tracing::info!(
+            dir = %dir.display(),
+            max_bytes = args.log_max_bytes,
+            files = args.log_files,
+            "durable log file on, besides stderr"
+        ),
+        None => tracing::info!(
+            "no durable log file, stderr only: give --log-dir, or --hot-store file:///dir for <dir>/log"
+        ),
+    }
     match serve(&args) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {

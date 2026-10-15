@@ -143,10 +143,16 @@ async fn an_own_limit_kill_climbs_the_ladder_then_tells_the_client() {
     assert_eq!(cell.cached(&job.action).await, Err(Code::NotFound));
     let logged = lines_with(&["node=oom-node", "lease given up; requeued"]);
     assert_eq!(logged.len(), 3, "{logged:?}");
-    assert!(
-        logged[0].contains("passed its memory limit with 4 GiB booked"),
-        "{logged:?}"
-    );
+    // Each step of the ladder is one INFO line naming operation, lease and node, and
+    // the booking it was killed at and the one it runs again with.
+    for (line, (booked, raised)) in logged.iter().zip([(4, 16), (16, 32), (32, 64)]) {
+        let step = format!(
+            "passed its memory limit with {booked} GiB booked; it runs again with {raised} GiB booked"
+        );
+        for part in [" INFO ", "operation=", "lease=", step.as_str()] {
+            assert!(line.contains(part), "{part:?} missing from {line}");
+        }
+    }
 
     // The next Execute of the action starts at the booking it was raised to.
     let mut again = cell.execute(&job.action).await;

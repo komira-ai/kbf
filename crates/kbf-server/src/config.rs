@@ -95,6 +95,32 @@ pub struct Args {
     /// no `file://` hot store. Given, it wins over the hot store's directory.
     #[arg(long, value_name = "DIR")]
     pub meta_dir: Option<PathBuf>,
+    /// The directory of the durable log file, `kbf-server.log` and its rotated
+    /// `kbf-server.log.1`, `.2`, ... (created if missing): every event stderr gets, in
+    /// the same format, kept across restarts. Left out, it is `<hot store directory>/log`
+    /// when the hot store is a directory; with neither, there is no file and the server
+    /// logs to stderr alone (the start logs which). A directory or file that cannot be
+    /// written never stops the server ([`crate::log_file`]).
+    #[arg(long, value_name = "DIR")]
+    pub log_dir: Option<PathBuf>,
+    /// The most bytes one log file holds before it is rotated; a line longer than this
+    /// goes alone to a fresh file. With `--log-files` it bounds the log's size on disk.
+    #[arg(
+        long,
+        value_name = "BYTES",
+        default_value_t = crate::log_file::DEFAULT_MAX_BYTES,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    pub log_max_bytes: u64,
+    /// How many log files are kept, the current one included; rotation drops the
+    /// oldest. The log never exceeds `--log-max-bytes` times this, plus one line.
+    #[arg(
+        long,
+        value_name = "N",
+        default_value_t = crate::log_file::DEFAULT_FILES,
+        value_parser = clap::value_parser!(u32).range(1..)
+    )]
+    pub log_files: u32,
     /// The REAPI listener. Without `--reapi-tls-cert` and `--reapi-tls-key` it serves
     /// plain text, on any address; off loopback the start line carries a warning.
     #[arg(long, default_value = "127.0.0.1:8980")]
@@ -362,6 +388,17 @@ pub enum ConfigError {
 }
 
 impl Args {
+    /// The directory of the durable log file: `--log-dir`, else `log` in the hot
+    /// store's directory (beside `meta`), else none.
+    #[must_use]
+    pub fn log_dir(&self) -> Option<PathBuf> {
+        match (&self.log_dir, &self.hot_store) {
+            (Some(dir), _) => Some(dir.clone()),
+            (None, Some(StoreUri::File(hot))) => Some(hot.join(crate::log_file::HOT_STORE_SUBDIR)),
+            (None, _) => None,
+        }
+    }
+
     /// Where the flags put the server's bytes and metadata, sized from `space`.
     ///
     /// # Errors

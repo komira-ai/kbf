@@ -28,6 +28,8 @@
 //!   and withdraw a macOS build, install an allowlisted profile; no erase), a client
 //!   over mutual TLS, and the polling of an update's DDM progress. Not yet called by
 //!   the rollout driver.
+//! - The durable log ([`log_file`]): a size-capped rotating file in `--log-dir` (by default
+//!   `log/` in the hot store's directory) that gets every event stderr gets.
 //! - The [`farm::Farm`] core: `kbf-sched` decides, the farm carries out its effects.
 //!   `Start` only after the grant commits; a result is accepted only from the node
 //!   holding the operation's current lease, and only an accepted result is written to
@@ -58,6 +60,7 @@ pub mod http_blobs;
 pub mod http_invocations;
 pub mod identity;
 mod local;
+pub mod log_file;
 pub mod machine;
 pub mod mdm;
 mod memory;

@@ -48,7 +48,9 @@ use kbf_proto::worker::{
     self, LeaseOffer, NodeStatus, ResultAck, ServerMessage, Start, server_message,
 };
 use kbf_sched::fence::START_VALIDITY;
-use kbf_sched::{Cordon, DaemonInstance, Event, Input, MemoryLadder, OpState, Requeue, Scheduler};
+use kbf_sched::{
+    Cordon, DaemonInstance, Event, FARM_RERUNS, Input, MemoryLadder, OpState, Requeue, Scheduler,
+};
 use kbf_types::{
     Answer, ControlRecord, Digest, Effect, Failure, FarmRun, FarmTime, LeaseGrant, LeaseId,
     OperationId, Outcome, Refusal, StartLease, StateMachine, WaiterId, Waiting, WorkerId,
@@ -776,6 +778,7 @@ impl State {
         outcome: Outcome,
     ) -> (Vec<Answer>, bool) {
         let recorded_before = self.runs_recorded(operation);
+        let name = self.operation_name(operation);
         let event = Event::Report {
             operation,
             lease,
@@ -784,6 +787,15 @@ impl State {
         let answers = self.feed(now, event);
         let rerun = self.runs_recorded(operation) > recorded_before;
         let accepted = rerun || answers.iter().any(|a| a.lease == lease);
+        let (operation, node) = (name, worker);
+        match outcome {
+            Outcome::Completed { .. } => {
+                tracing::info!(%operation, %lease, %node, accepted, "lease finished ok");
+            }
+            Outcome::Failed(failure) => {
+                tracing::warn!(%operation, %lease, %node, ?failure, accepted, "lease finished failed");
+            }
+        }
         if accepted && outcome == Outcome::Failed(Failure::NodeMemoryPressure) {
             memory::pressure(worker, self.sched.memory_pressure(worker));
         }
@@ -857,7 +869,10 @@ impl State {
                     effects.extend(self.sched.apply(Input::new(now, committed)));
                 }
                 Effect::Start(start) => self.start(start),
-                Effect::Answer(answer) => answers.push(answer),
+                Effect::Answer(answer) => {
+                    self.log_failed_answer(&answer);
+                    answers.push(answer);
+                }
                 Effect::Waiting(waiting) => self.waiting(&waiting),
                 Effect::Refuse(refusal) => self.refuse(&refusal),
             }
@@ -865,6 +880,26 @@ impl State {
         self.log_requeues();
         self.forget_dropped();
         answers
+    }
+
+    /// Logs, as one WARN line, an operation the scheduler finishes failed: the failure
+    /// kind, and how much of the farm-fault budget and the memory ladder its runs used
+    /// (`farm_runs` at `farm_budget` is the farm budget spent, so no rerun is left).
+    /// Operations that complete are logged where their lease's result is taken
+    /// ([`State::take_report`]).
+    fn log_failed_answer(&self, answer: &Answer) {
+        if let Outcome::Failed(failure) = answer.outcome {
+            let operation = self.operation_name(answer.operation);
+            tracing::warn!(
+                %operation,
+                lease = %answer.lease,
+                ?failure,
+                farm_runs = answer.farm_runs.len(),
+                farm_budget = FARM_RERUNS,
+                memory_runs = answer.memory_runs.len(),
+                "operation finished failed"
+            );
+        }
     }
 
     /// Logs the leases the scheduler has given up since the last call, one INFO line
@@ -882,9 +917,15 @@ impl State {
                 worker: node,
                 reason,
             } = requeue;
+            let farm_runs = self.sched.farm_runs(operation).map_or(0, <[_]>::len);
             let operation = self.operation_name(operation);
             // One line: the coverage of a logged field counts only where it is logged.
-            tracing::info!(%operation, %lease, %node, %reason, "lease given up; requeued");
+            // `farm_runs` is the farm-fault budget spent so far, of `farm_budget` reruns
+            // (a lease not started has a budget of its own, in the scheduler).
+            tracing::info!(
+                %operation, %lease, %node, %reason, farm_runs, farm_budget = FARM_RERUNS,
+                "lease given up; requeued"
+            );
         }
     }
 
@@ -959,7 +1000,7 @@ impl State {
             grant.lease,
             &grant.worker,
         );
-        tracing::debug!(%operation, %lease, %node, "lease granted");
+        tracing::info!(%operation, %lease, %node, "lease granted");
         self.record_granted(grant);
         self.send_for(&grant.worker, grant.operation, |w| {
             server_message::Message::LeaseOffer(LeaseOffer {
