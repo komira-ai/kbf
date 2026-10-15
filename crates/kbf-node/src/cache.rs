@@ -31,6 +31,31 @@ pub(crate) struct CacheArgs {
     pub cache_link_concurrency: u64,
 }
 
+/// The `--tree-*` flags: the container driver's shared read-only trees
+/// (`docs/design/fast-sandbox.md#4-shared-trees`).
+#[derive(Clone, Debug, clap::Args)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) struct TreeArgs {
+    /// The directory of the node's tree store (container), made if missing; it should
+    /// be on the cache's filesystem. Needs `--cache-dir` and `--tree-max-bytes`. A
+    /// Directory node of an action's input root with at least `--tree-min-files` files,
+    /// no output path or working directory in it, is built here once and mounted
+    /// read-only into each action that has it, instead of linking its files per action.
+    /// A write into such a directory fails (EROFS), where it used to succeed.
+    #[arg(long, value_name = "DIR", requires_all = ["tree_max_bytes", "cache_dir"])]
+    pub tree_dir: Option<PathBuf>,
+    /// The most file bytes of trees kept; least recently used unpinned trees are
+    /// evicted past it. A node larger than this is never a tree.
+    #[arg(long, value_name = "BYTES", requires = "tree_dir")]
+    pub tree_max_bytes: Option<u64>,
+    /// The fewest files and symlinks a Directory node holds to be a tree.
+    #[arg(long, default_value_t = kbf_daemon::trees::MIN_FILES, value_parser = clap::value_parser!(u64).range(1..))]
+    pub tree_min_files: u64,
+    /// The most trees one action mounts; the rest of its files are linked.
+    #[arg(long, default_value_t = kbf_daemon::trees::MAX_MOUNTS, value_parser = clap::value_parser!(usize))]
+    pub tree_max_mounts: usize,
+}
+
 /// What the native driver logs when it is given `--cache-dir`: it never uses one.
 pub(crate) fn native_warning(args: &CacheArgs) -> Option<String> {
     args.cache_dir.as_ref().map(|dir| {
@@ -48,6 +73,7 @@ pub(crate) fn native_warning(args: &CacheArgs) -> Option<String> {
 #[cfg(target_os = "linux")]
 pub(crate) fn given(
     args: &CacheArgs,
+    trees: &TreeArgs,
     scratch: &std::path::Path,
 ) -> Option<kbf_driver_container::CacheUse> {
     use kbf_daemon::cache::{CacheConfig, Disabled};
@@ -66,11 +92,26 @@ pub(crate) fn given(
         .ok()
         .ok_or(Disabled::Unusable("the daemon's own path".to_owned()));
     match config.and_then(|config| helper.map(|helper| (config, helper))) {
-        Ok((config, helper)) => Some(kbf_driver_container::CacheUse { config, helper }),
+        Ok((config, helper)) => Some(kbf_driver_container::CacheUse {
+            config,
+            helper,
+            trees: tree_config(trees),
+        }),
         Err(why) => {
             let reason = why.reason();
             tracing::warn!("cache: off:{reason} ({shown}: {why}); leases run uncached");
             None
         }
     }
+}
+
+/// The tree store the `--tree-*` flags ask for, if they do (clap checks that
+/// `--tree-dir` comes with `--tree-max-bytes` and `--cache-dir`).
+#[cfg(target_os = "linux")]
+fn tree_config(args: &TreeArgs) -> Option<kbf_daemon::trees::TreeConfig> {
+    let dir = args.tree_dir.clone()?;
+    let mut config = kbf_daemon::trees::TreeConfig::new(dir, args.tree_max_bytes?);
+    config.min_files = args.tree_min_files;
+    config.max_mounts = args.tree_max_mounts;
+    Some(config)
 }

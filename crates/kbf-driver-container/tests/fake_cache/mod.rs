@@ -25,6 +25,7 @@ fn cache(dir: &Path, scratch: &Path) -> CacheUse {
     CacheUse {
         config: CacheConfig::new(at, scratch.to_owned(), 1 << 30),
         helper: PathBuf::from("/kbf/bin/kbf-daemon"),
+        trees: None,
     }
 }
 
@@ -253,4 +254,130 @@ fn the_cache_is_off_on_storage_its_checks_did_not_pass() {
     );
     assert!(!with(None, true), "info failed");
     assert!(!fake.runtime.cached(), "a runtime without a cache");
+}
+
+/// A fake whose runtime has a cache and a tree store of its own.
+fn treed(name: &str) -> Fake {
+    let dir = crate::support::scratch(&format!("fake-trees-{name}"));
+    Fake::with(name, |config| {
+        let mut given = cache(&dir, &config.scratch);
+        given.trees = Some(kbf_daemon::trees::TreeConfig::new(
+            dir.join("trees"),
+            1 << 30,
+        ));
+        config.cache = Some(given);
+    })
+}
+
+/// A toolchain of `count` files under `toolchain/`, and one small file beside it.
+fn toolchain_inputs(count: usize) -> Vec<crate::support::Input> {
+    let leak = |text: String| -> &'static str { Box::leak(text.into_boxed_str()) };
+    let mut inputs: Vec<crate::support::Input> = (0..count)
+        .map(|i| {
+            let path = leak(format!("toolchain/d{}/f{i}", i % 7));
+            let bytes: &'static [u8] = leak(format!("zig file {i}")).as_bytes();
+            (path, bytes, false)
+        })
+        .collect();
+    inputs.push(("src/a.txt", b"small", false));
+    inputs
+}
+
+/// Catches shared trees not reaching the container: the large directory is a read-only
+/// `--volume` of the store's tree at its path under the exec root (the "drop the
+/// mounts" mutant leaves an empty directory the action finds nothing in; the "drop
+/// `:ro`" one is the string below), its 300 files are not written for the lease (the
+/// cache counted 1 file, the small one), the action reads the tree's bytes through the
+/// mount, the second lease builds nothing, and the lease's scratch directory is clean
+/// while the tree stays for the next one.
+#[tokio::test]
+async fn a_large_directory_is_mounted_read_only_and_not_linked() {
+    let fake = treed("mounts");
+    let mut spec = Spec::new(&image(), "unused");
+    spec.inputs = toolchain_inputs(300);
+    spec.outputs = vec!["seen".to_owned()];
+    let steps = ["copy", "$UPPER/seen", "$ROOT/toolchain/d1/f1"];
+    let first = fake.run(1, &spec, &steps).await.expect("first");
+    assert_eq!(first.exit_code, 0, "{first:?}");
+    assert_eq!(
+        blob(&fake.cas, first.output_files[0].digest.as_ref()),
+        b"zig file 1"
+    );
+    let inputs = fake.runtime.last_inputs().expect("counted");
+    assert_eq!(
+        inputs.files, 1,
+        "only the small file is the lease's own: {inputs}"
+    );
+
+    let args = std::fs::read_to_string(fake.state.join("create.args")).expect("create.args");
+    let volumes: Vec<&str> = args
+        .lines()
+        .filter(|a| a.starts_with("--volume="))
+        .collect();
+    assert_eq!(volumes.len(), 2, "{args}");
+    let (source, rest) = volumes[1]
+        .strip_prefix("--volume=")
+        .and_then(|v| v.split_once(":/kbf/root/toolchain:"))
+        .expect("the tree's volume");
+    assert_eq!(rest, "ro,nosuid,nodev");
+    assert!(source.contains("/trees/"), "{source}");
+    assert!(Path::new(source).is_dir(), "the tree outlives the lease");
+    fake.assert_clean(1);
+
+    let stats = fake.runtime.tree_stats().expect("a store");
+    assert_eq!(
+        (stats.builds, stats.hits, stats.trees),
+        (1, 0, 1),
+        "{stats:?}"
+    );
+    fake.run(2, &spec, &steps).await.expect("second");
+    let stats = fake.runtime.tree_stats().expect("a store");
+    assert_eq!((stats.builds, stats.hits), (1, 1), "{stats:?}");
+    fake.assert_clean(2);
+}
+
+/// Catches an output under a toolchain directory left to the tree: with the output
+/// `toolchain/d1/o`, nothing is mounted and the container gets no second volume.
+#[tokio::test]
+async fn an_output_under_a_large_directory_keeps_it_out_of_the_mounts() {
+    let fake = treed("output");
+    let mut spec = Spec::new(&image(), "unused");
+    spec.inputs = toolchain_inputs(300);
+    spec.outputs = vec!["toolchain/d1/o".to_owned()];
+    let steps = ["write-lines", "$UPPER/toolchain/d1/o", "made"];
+    let result = fake.run(1, &spec, &steps).await.expect("run");
+    assert_eq!(result.exit_code, 0, "{result:?}");
+    let args = std::fs::read_to_string(fake.state.join("create.args")).expect("create.args");
+    assert_eq!(
+        args.lines().filter(|a| a.starts_with("--volume=")).count(),
+        1,
+        "{args}"
+    );
+    assert_eq!(fake.runtime.tree_stats().expect("a store").builds, 0);
+    fake.assert_clean(1);
+}
+
+/// Catches the lease dropping its pins before the container is gone (the "drop
+/// `lease.trees`" mutant: a tree mounted into a running action could be evicted under
+/// it): while the action runs, the store reports its tree pinned; once the run is over,
+/// not pinned, and the tree is still there for the next lease.
+#[tokio::test]
+async fn a_tree_is_pinned_while_its_container_runs() {
+    let fake = treed("pinned");
+    let mut spec = Spec::new(&image(), "unused");
+    spec.inputs = toolchain_inputs(300);
+    fake.action(&["wait-for", "$ROOT/go", "30"]);
+    let action = crate::support::store_action(&fake.cas, &spec);
+    let runtime = Arc::clone(&fake.runtime);
+    let work = crate::support::work(1, action, kbf_types::Resources::new(2000, 1 << 30));
+    let run = tokio::spawn(async move { kbf_daemon::Runtime::run(&*runtime, work).await });
+    fake.wait_for_start().await;
+    let stats = fake.runtime.tree_stats().expect("a store");
+    assert_eq!((stats.trees, stats.pinned), (1, 1), "{stats:?}");
+    std::fs::write(fake.lease_dir(1).join("root/go"), b"").expect("release the action");
+    let result = run.await.expect("joined").expect("ran");
+    assert_eq!(result.exit_code, 0, "{result:?}");
+    let stats = fake.runtime.tree_stats().expect("a store");
+    assert_eq!((stats.trees, stats.pinned), (1, 0), "{stats:?}");
+    fake.assert_clean(1);
 }

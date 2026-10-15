@@ -23,7 +23,7 @@
 //! between the check and the read.
 
 use std::collections::hash_map::Entry;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::io::ErrorKind;
 use std::os::unix::fs::PermissionsExt;
@@ -122,7 +122,7 @@ pub fn check_relative(what: &str, path: &str) -> Result<(), TreeError> {
 /// # Errors
 /// A blob is missing or corrupt, the tree breaks a naming rule, or a write fails.
 pub async fn materialize(cas: &impl Cas, root: &Digest, dir: &Path) -> Result<(), TreeError> {
-    let files = make_directories(cas, root, dir).await?;
+    let files = make_directories(cas, root, dir, &Loaded::new(), &HashSet::new()).await?;
     write_files(cas, files).await
 }
 
@@ -143,7 +143,7 @@ pub async fn materialize_cached(
     dir: &Path,
     private: &[String],
 ) -> Result<crate::cache::InputStats, TreeError> {
-    let files = make_directories(cas, root, dir).await?;
+    let files = make_directories(cas, root, dir, &Loaded::new(), &HashSet::new()).await?;
     let private: Vec<PathBuf> = private.iter().map(|p| dir.join(p)).collect();
     crate::cache::lease::write_files(cas, cache, files, &private).await
 }
@@ -155,13 +155,22 @@ pub(crate) struct Copies {
     pub copies: Vec<(PathBuf, bool)>,
 }
 
+/// Directory messages already fetched, by digest label (`crate::cas::label`): a walk
+/// that finds one does not ask the CAS again.
+pub(crate) type Loaded = HashMap<String, Directory>;
+
 /// Walks the tree under `root`, checking every Directory's names and making its
 /// directories and symlinks under `dir`; returns the file blobs to write, each distinct
 /// digest once.
-async fn make_directories(
+///
+/// A Directory in `loaded` is not fetched. A directory whose path is in `mounts` (a
+/// path under `dir`) is made empty and not walked: something is mounted there.
+pub(crate) async fn make_directories(
     cas: &impl Cas,
     root: &Digest,
     dir: &Path,
+    loaded: &Loaded,
+    mounts: &HashSet<PathBuf>,
 ) -> Result<Vec<Copies>, TreeError> {
     let mut files: Vec<Copies> = Vec::new();
     let mut blob_at: HashMap<String, usize> = HashMap::new();
@@ -182,7 +191,10 @@ async fn make_directories(
         }
         let directories: Vec<(Directory, Vec<PathBuf>)> = stream::iter(places)
             .map(|(digest, heres)| async move {
-                let directory: Directory = fetch_message(cas, &digest).await?;
+                let directory: Directory = match loaded.get(&label(&digest)) {
+                    Some(known) => known.clone(),
+                    None => fetch_message(cas, &digest).await?,
+                };
                 Ok::<_, TreeError>((directory, heres))
             })
             .buffered(cas.in_flight())
@@ -218,7 +230,9 @@ async fn make_directories(
                         TreeError::Invalid(format!("input directory {:?} has no digest", sub.name))
                     })?;
                     fs::create_dir(&path).await.map_err(io(&path))?;
-                    next.push((digest, path));
+                    if !mounts.contains(&path) {
+                        next.push((digest, path));
+                    }
                 }
             }
         }
@@ -229,7 +243,7 @@ async fn make_directories(
 
 /// Refuses a Directory whose entry names are not single path components, or that
 /// names one entry twice.
-fn check_names(directory: &Directory) -> Result<(), TreeError> {
+pub(crate) fn check_names(directory: &Directory) -> Result<(), TreeError> {
     let mut seen = BTreeSet::new();
     let names = directory
         .files

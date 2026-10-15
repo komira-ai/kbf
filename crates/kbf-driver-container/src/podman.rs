@@ -8,6 +8,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
+use kbf_daemon::trees::SharedMount;
 use tokio::process::{Child, Command};
 
 /// Where the input root appears inside the container.
@@ -91,6 +92,8 @@ pub(crate) struct ContainerSpec {
     pub env: Vec<(String, String)>,
     pub argv: Vec<String>,
     pub limits: ContainerLimits,
+    /// Host directories mounted read-only inside the exec root (shared trees).
+    pub shared: Vec<SharedMount>,
 }
 
 /// The `podman create` arguments for `spec`.
@@ -103,7 +106,10 @@ pub(crate) struct ContainerSpec {
 ///   and `CMD` are both ignored and no argument is re-split.
 /// - **Files:** the input root as an overlay: the host copy is never written, and
 ///   every write lands in `upper`, which the driver reads outputs from (no output may
-///   already be an input, so each is whole there).
+///   already be an input, so each is whole there). Each shared tree is a second
+///   `--volume=<tree>:/kbf/root/<path>:ro,nosuid,nodev` on top of it: read-only, so a
+///   write into a toolchain fails `EROFS` and the input root's own directory there is
+///   an empty mount point.
 /// - **Memory:** `memory.oom.group=1` on the container, so an OOM kill takes the whole
 ///   action. Limits live on the lease cgroup (see `cgroup`), never `--memory`.
 ///   `--oom-score-adj=0`: a process inherits its parent's `oom_score_adj`, and the
@@ -169,6 +175,12 @@ pub(crate) fn create_args(spec: &ContainerSpec) -> Vec<OsString> {
     volume.push(",workdir=");
     volume.push(&spec.overlay_work);
     args.push(volume);
+    for mount in &spec.shared {
+        let mut tree = OsString::from("--volume=");
+        tree.push(&mount.source);
+        tree.push(format!(":{EXEC_ROOT}/{}:ro,nosuid,nodev", mount.path));
+        args.push(tree);
+    }
     args.push(spec.image.clone().into());
     args
 }
@@ -431,6 +443,7 @@ pub(crate) mod tests {
                 nofile: 103,
                 nproc: 104,
             },
+            shared: Vec::new(),
         }
     }
 
@@ -525,6 +538,44 @@ pub(crate) mod tests {
         assert_eq!(env, ["--env=PATH=/bin"], "{args:?}");
         let users: Vec<_> = args.iter().filter(|a| a.starts_with("--user=")).collect();
         assert_eq!(users, ["--user=0:0"], "{args:?}");
+    }
+
+    /// Catches a shared tree mounted writable (the "drop `:ro`" mutant: an action could
+    /// change a toolchain every other action reads), mounted outside the exec root, or
+    /// put before the overlay it lies on (podman sorts by destination, but the golden
+    /// order is the one the fake and the real tests run), and a spec without trees
+    /// gaining a volume.
+    #[test]
+    fn shared_trees_are_read_only_volumes_inside_the_exec_root() {
+        let none = strings(&create_args(&spec()));
+        assert_eq!(
+            none.iter().filter(|a| a.starts_with("--volume=")).count(),
+            1
+        );
+        let mut with = spec();
+        with.shared = vec![
+            SharedMount {
+                path: "external/zig".to_owned(),
+                source: PathBuf::from("/trees/aa-1"),
+            },
+            SharedMount {
+                path: "lib".to_owned(),
+                source: PathBuf::from("/trees/bb-2"),
+            },
+        ];
+        let args = strings(&create_args(&with));
+        let volumes: Vec<_> = args.iter().filter(|a| a.starts_with("--volume=")).collect();
+        assert_eq!(volumes.len(), 3, "{args:?}");
+        assert!(volumes[0].contains(":O,upperdir="), "{volumes:?}");
+        assert_eq!(
+            volumes[1],
+            "--volume=/trees/aa-1:/kbf/root/external/zig:ro,nosuid,nodev"
+        );
+        assert_eq!(
+            volumes[2],
+            "--volume=/trees/bb-2:/kbf/root/lib:ro,nosuid,nodev"
+        );
+        assert_eq!(args.last(), Some(&with.image));
     }
 
     /// Catches a limit left to Podman's defaults or a node's `containers.conf` (the

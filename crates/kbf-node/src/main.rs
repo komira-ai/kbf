@@ -98,6 +98,8 @@ struct Cli {
     #[command(flatten)]
     cache: cache::CacheArgs,
     #[command(flatten)]
+    trees: cache::TreeArgs,
+    #[command(flatten)]
     transfer: transfer::TransferArgs,
     /// The cgroup lease cgroups are made under, from the cgroup root (container). Left
     /// out, the daemon sets up its own cgroup, which its systemd unit must delegate
@@ -378,6 +380,11 @@ fn node(
                 if let Some(warning) = cache::native_warning(&cli.cache) {
                     tracing::warn!("{warning}");
                 }
+                if cli.trees.tree_dir.is_some() {
+                    tracing::warn!(
+                        "trees: off:native: only the container driver mounts shared trees"
+                    );
+                }
                 let config = native()?;
                 let cas = node.transfers(cli)?;
                 let (runtime, reports) = native_runtime(cli, config, xcrun, cas)?;
@@ -611,7 +618,7 @@ mod container {
         config.cpu = kbf_daemon::CpuPool::new(usize::try_from(cli.cpu_threads).unwrap_or(1));
         config.limits = limits(cli);
         config.swap_kill = swap_kill(cli);
-        config.cache = crate::cache::given(&cli.cache, &config.scratch);
+        config.cache = crate::cache::given(&cli.cache, &cli.trees, &config.scratch);
         let runtime = PodmanRuntime::new(config, cas)?;
         // From `start`, in the runtime's context but outside any task.
         tokio::runtime::Handle::current().block_on(check_images(&runtime, &cli.images))?;
