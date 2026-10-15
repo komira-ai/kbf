@@ -132,7 +132,11 @@ async fn a_recorded_exit_is_taken_at_once() {
 
 /// Catches a farm failure whose reason ends at `podman start:` with nothing after it
 /// (issue #658): when neither Podman nor the action wrote anything to stderr, the
-/// reason says so; when Podman did, the reason ends with its words.
+/// reason says so; when Podman did, the reason ends with its words; and when crun
+/// said the program is not there, it is the action's exit 127, not the farm's. (The
+/// last is `tests/program.rs`'s subject; it is here too so the build of the library
+/// this binary links runs every arm of `program::not_run`, which the coverage job
+/// counts per build.)
 #[tokio::test]
 async fn a_start_that_said_nothing_says_so() {
     let fake = Fake::new("said-nothing");
@@ -156,4 +160,16 @@ async fn a_start_that_said_nothing_says_so() {
         "{outcome:?}"
     );
     fake.assert_clean(2);
+
+    let mut spec = spec;
+    spec.argv = vec!["env".to_owned()];
+    let said = "Error: unable to start container \"0123456789ab\": crun: executable file \
+                `env` not found in $PATH: No such file or directory";
+    let steps = ["echo", "--stderr", said, ";", "exit", "125"];
+    let result = fake
+        .run(3, &spec, &steps)
+        .await
+        .expect("the action's own result");
+    assert_eq!(result.exit_code, 127);
+    fake.assert_clean(3);
 }

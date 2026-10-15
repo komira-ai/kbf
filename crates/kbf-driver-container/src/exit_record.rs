@@ -151,17 +151,21 @@ where
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
-    use std::future::Ready;
     use std::sync::{Arc, Mutex};
+
+    use futures::FutureExt as _;
+    use futures::future::BoxFuture;
 
     use super::*;
 
     /// An `inspect` that answers `answers` in turn, the last one for ever, and counts
-    /// its calls.
+    /// its calls. `HANG` never answers; `err:<why>` fails with `<why>`. One closure
+    /// type for every test, so the coverage job's one instantiation of `wait` sees
+    /// every path.
     fn answering(
         answers: &[&str],
     ) -> (
-        impl FnMut() -> Ready<Result<String, String>> + use<>,
+        impl FnMut() -> BoxFuture<'static, Result<String, String>> + use<>,
         Arc<Mutex<usize>>,
     ) {
         let mut queue: VecDeque<String> = answers.iter().map(|a| (*a).to_owned()).collect();
@@ -173,12 +177,21 @@ mod tests {
                 queue.pop_front()
             } else {
                 queue.front().cloned()
+            }
+            .unwrap_or_default();
+            if answer == HANG {
+                return std::future::pending().boxed();
+            }
+            let answer = match answer.strip_prefix("err:") {
+                Some(why) => Err(why.to_owned()),
+                None => Ok(answer),
             };
-            std::future::ready(Ok(answer.unwrap_or_default()))
+            std::future::ready(answer).boxed()
         };
         (inspect, calls)
     }
 
+    const HANG: &str = "hang";
     const SHORT: Duration = Duration::from_millis(300);
     const TICK: Duration = Duration::from_millis(10);
 
@@ -224,7 +237,8 @@ mod tests {
     /// then, and the failure says no read finished.
     #[tokio::test]
     async fn a_read_that_hangs_ends_at_the_deadline() {
-        let ended = wait(std::future::pending::<Result<String, String>>, SHORT, TICK).await;
+        let (inspect, _) = answering(&[HANG]);
+        let ended = wait(inspect, SHORT, TICK).await;
         assert_eq!(
             ended,
             Err(NoExit::Unrecorded {
@@ -326,18 +340,18 @@ mod tests {
         assert_eq!(why.reason(&stderr).await, "podman inspect: refused");
     }
 
-    /// Catches an inspect failure waited out instead of reported.
+    /// Catches an inspect failure, or an answer that is not a record, waited out
+    /// instead of reported.
     #[tokio::test]
     async fn an_inspect_failure_is_reported_at_once() {
-        let ended = wait(
-            || std::future::ready(Err("podman inspect: refused".to_owned())),
-            Duration::from_secs(10),
-            TICK,
-        )
-        .await;
-        assert_eq!(
-            ended,
-            Err(NoExit::Inspect("podman inspect: refused".to_owned()))
-        );
+        for (answer, why) in [
+            ("err:podman inspect: refused", "podman inspect: refused"),
+            ("exited many false", "podman inspect: exit code \"many\""),
+        ] {
+            let (inspect, calls) = answering(&[answer]);
+            let ended = wait(inspect, Duration::from_secs(10), TICK).await;
+            assert_eq!(ended, Err(NoExit::Inspect(why.to_owned())), "{answer}");
+            assert_eq!(*calls.lock().expect("count"), 1, "{answer}");
+        }
     }
 }
