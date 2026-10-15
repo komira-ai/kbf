@@ -234,11 +234,12 @@ fn a_container_node_opens_its_tree_store_and_a_native_one_never_does() {
             logged(&log, &["trees: ", "0 trees"]) && logged(&log, &["min_files=7 max_mounts=3"]),
             "{log:#?}"
         );
+        // Searchable by others (a rootless runtime's container root), not listable.
         let mode = std::fs::metadata(&trees)
             .expect("store dir")
             .permissions()
             .mode();
-        assert_eq!(mode & 0o777, 0o700);
+        assert_eq!(mode & 0o777, 0o711);
 
         let native = base.join("native-trees");
         let flags = [
