@@ -225,12 +225,13 @@ fn thread_flags_size_the_runtime_and_are_logged() {
         .stderr(Stdio::piped());
     let mut child = Running(c.spawn().expect("spawn kbf-server"));
     first_line("start", child.0.stdout.take().expect("stdout"));
-    let workers = std::fs::read_dir(format!("/proc/{}/task", child.pid()))
+    let names: Vec<String> = std::fs::read_dir(format!("/proc/{}/task", child.pid()))
         .expect("task dir")
         .filter_map(|t| std::fs::read_to_string(t.ok()?.path().join("comm")).ok())
-        .filter(|name| name.trim() == "kbf-async")
-        .count();
-    assert_eq!(workers, 3);
+        .map(|name| name.trim().to_owned())
+        .collect();
+    let workers = names.iter().filter(|name| *name == "kbf-async").count();
+    assert_eq!(workers, 3, "threads of the server: {names:?}");
     let mut stderr = child.0.stderr.take().expect("stderr");
     interrupt(child);
     let mut log = String::new();
