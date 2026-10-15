@@ -23,7 +23,13 @@
 //! - `block-log`: `create` makes a directory where the log file this knob names
 //!   (`stdout` or `stderr`) goes, so the driver cannot create it.
 //! - `vanish-after-create`: `create` unlinks the podman program it was run as.
-//! - `status`: written by `start`; a test may preset `status-override`.
+//! - `status`: written by `start` (`<status> <exit code>`); a test may preset
+//!   `status-override`. `inspect` prints it; when its `--format` names `FinishedAt`
+//!   (Podman's mark that an exit was recorded), followed by ` false`: recorded.
+//! - `unrecorded-inspects`: a count, N. While the container has a `status`, each of
+//!   the next N `inspect`s prints `stopped 0` instead (followed by ` true` when the
+//!   format names `FinishedAt`: no exit recorded yet) and lowers the count, removing
+//!   the knob at 0: Podman's record read before it holds the container's exit.
 //! - `inspect-fails`, `kill-fails`, `rm-fails`, `ps-fails`: that verb fails.
 //! - `ps-extra`: lines `ps` prints after the container's own (`<owner> <name>`).
 //! - `unshare-noop`: `unshare rm` succeeds without removing anything.
@@ -228,7 +234,7 @@ impl Fake {
             b"info" => self.info(args),
             b"create" => self.create(args),
             b"start" => self.start(),
-            b"inspect" => self.inspect(),
+            b"inspect" => self.inspect(args),
             b"kill" => self.kill(args),
             b"ps" => self.ps(args),
             b"rm" => self.rm(),
@@ -418,14 +424,37 @@ impl Fake {
         code
     }
 
-    fn inspect(&self) -> u8 {
+    fn inspect(&self, args: &[Vec<u8>]) -> u8 {
         if self.has("inspect-fails") {
             return refuse("Error: inspect refused", 125);
         }
         let Some(status) = self.read("status") else {
             return refuse("Error: no such container", 125);
         };
-        print(&status);
+        let finished = args
+            .iter()
+            .any(|a| a.starts_with(b"--format=") && a.windows(10).any(|w| w == b"FinishedAt"));
+        let unrecorded = self
+            .read("unrecorded-inspects")
+            .and_then(|n| String::from_utf8_lossy(&n).trim().parse::<u32>().ok())
+            .filter(|n| *n > 0);
+        let (status, recorded) = match unrecorded {
+            Some(n) => {
+                if n > 1 {
+                    self.write_line("unrecorded-inspects", (n - 1).to_string().as_bytes());
+                } else {
+                    let _ = std::fs::remove_file(self.file("unrecorded-inspects"));
+                }
+                (b"stopped 0".to_vec(), false)
+            }
+            None => (status.trim_ascii_end().to_vec(), true),
+        };
+        let mark: &[u8] = match (finished, recorded) {
+            (false, _) => b"",
+            (true, true) => b" false",
+            (true, false) => b" true",
+        };
+        print(&[&status[..], mark, b"\n"].concat());
         0
     }
 

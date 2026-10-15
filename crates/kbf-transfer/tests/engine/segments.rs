@@ -2,6 +2,8 @@
 //! (`docs/design/write-path.md`, sections 4 and 9, "Segment upload (PR 2)"), counted
 //! by a wrapper that can also fail Commits.
 
+use std::fs::File;
+use std::os::fd::OwnedFd;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -15,7 +17,10 @@ use kbf_proto::worker::{
     BeginRequest, BeginResponse, CommitRequest, CommitResponse, LocateRequest, LocateResponse,
     PutRangeRequest, PutRangeResponse, ReadRangeRequest, ReadRangeResponse,
 };
-use kbf_transfer::{Cas, MAX_RANGE_BYTES, Spool, TransferConfig, Transfers, digest_of};
+use kbf_transfer::{
+    Cas, FileSource, MAX_RANGE_BYTES, Record, RecordHasher, Source, Spool, Stamp, TransferConfig,
+    Transfers, digest_of, proto_digest,
+};
 use tokio::sync::{Barrier, watch};
 use tonic::{Request, Response, Status};
 
@@ -32,7 +37,7 @@ enum Mode {
     /// Every Commit fails UNAVAILABLE.
     FailCommits,
     /// The second and third Commits fail UNAVAILABLE: the second upload and its one
-    /// retry (uploads go one after another).
+    /// retry (with `segment_uploads: 1`, uploads go one after another).
     FailSecondUpload,
     /// Every Begin is UNIMPLEMENTED, as a server without the service answers.
     Unimplemented,
@@ -382,7 +387,12 @@ async fn a_failing_commit_is_retried_once_then_blobs_go_one_by_one() {
 /// (mutant: `SEGMENT_UPLOAD_BYTES` back at 1 GiB + 1 MiB, one upload, no fall back).
 #[tokio::test]
 async fn a_failed_upload_keeps_the_ones_committed_before_it() {
-    let front = Front::start(Mode::FailSecondUpload).await;
+    // One upload at a time: which Commit is "the second" is only defined then.
+    let config = TransferConfig {
+        segment_uploads: 1,
+        ..TransferConfig::default()
+    };
+    let front = Front::with(Mode::FailSecondUpload, config).await;
     let (spool, digests) = spooled("second-fails", (0..10).map(|i| patterned(i, 10 << 20))).await;
     front.engine.put_spool(spool).await.expect("put spool");
     assert_eq!(
@@ -583,4 +593,281 @@ async fn held_ranges_leave_a_permit_for_another_leases_read() {
     front.range_gate.send_replace(true);
     upload.await.expect("upload").expect("put spool");
     assert!(front.all_present(&digests).await);
+}
+
+/// The 17.5 s of a cold unpack, step 6: the uploads of a spool went one after another,
+/// so the server's check of one never overlapped the sending of the next. With the
+/// server holding every `PutRange` and `--segment-uploads-in-flight` 4, the four uploads
+/// of ten 10 MiB blobs all `Begin` while none has committed; with 1 only the first does
+/// (the test then opens the gate, so it ends). After the gate opens every blob is
+/// present and each upload committed once. Mutant seen red: the `for` loop over uploads
+/// back (2 Begins at most, the wait below times out).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn uploads_of_one_spool_are_in_flight_together() {
+    for (uploads, want_begins) in [(1, 1), (4, 4)] {
+        let config = TransferConfig {
+            segment_uploads: uploads,
+            ..TransferConfig::default()
+        };
+        let front = Arc::new(Front::with(Mode::Serve, config).await);
+        let (spool, digests) =
+            spooled("uploads-together", (0..10).map(|i| patterned(i, 10 << 20))).await;
+        front.range_gate.send_replace(false);
+        let sending = {
+            let front = Arc::clone(&front);
+            tokio::spawn(async move { front.engine.put_spool(spool).await })
+        };
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        // Ranges are held: nothing commits, so Begins counted are uploads in flight.
+        while front.begins.load(Ordering::SeqCst) < want_begins
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let begun = front.begins.load(Ordering::SeqCst);
+        assert_eq!(begun, want_begins, "{uploads} in flight allowed");
+        assert_eq!(front.commits.load(Ordering::SeqCst), 0);
+        front.range_gate.send_replace(true);
+        sending.await.expect("join").expect("put spool");
+        assert_eq!(front.commits.load(Ordering::SeqCst), 4);
+        assert!(front.all_present(&digests).await);
+    }
+}
+
+/// Files in a scratch directory, hashed the way a driver's walk hashes them, as records
+/// whose bytes are read from the files when they are sent; and their REAPI digests.
+fn file_records(name: &str, blobs: &[Vec<u8>]) -> (PathBuf, Vec<Record>, Vec<Digest>) {
+    let dir = scratch(name);
+    let root = Arc::new(OwnedFd::from(File::open(&dir).expect("open the directory")));
+    let dirs: Arc<[String]> = Arc::from(Vec::<String>::new());
+    let (mut records, mut digests) = (Vec::new(), Vec::new());
+    for (i, blob) in blobs.iter().enumerate() {
+        let file = format!("f{i}");
+        std::fs::write(dir.join(&file), blob).expect("write");
+        let stamp = Stamp::of(&File::open(dir.join(&file)).expect("open")).expect("stamp");
+        let mut hasher = RecordHasher::new();
+        hasher.update(blob);
+        let (digest, crc32c) = hasher.finish();
+        digests.push(proto_digest(&digest));
+        records.push(Record {
+            digest,
+            crc32c,
+            source: Source::File(FileSource::new(
+                Arc::clone(&root),
+                Arc::clone(&dirs),
+                file,
+                stamp,
+            )),
+        });
+    }
+    (dir, records, digests)
+}
+
+/// The 17.5 s of a cold unpack, steps 2 and 3: the outputs were copied into a spool
+/// file and read back to send. Records name the files where they are, and the engine
+/// reads each from its file as it sends the range that holds it. A tree of 300 small
+/// files and three 5 MiB ones is uploaded with no spool made (the directory holds the
+/// files and nothing else), one `Commit` per upload, every blob present after, with the
+/// bytes the files hold (the server checks every record against its digest).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn records_are_sent_from_their_files_with_no_copy() {
+    let front = Front::start(Mode::Serve).await;
+    let blobs: Vec<Vec<u8>> = (0..300)
+        .map(|i| patterned(i, 100 + i))
+        .chain((0..3).map(|i| patterned(1000 + i, 5 << 20)))
+        .collect();
+    let (dir, records, digests) = file_records("from-files", &blobs);
+    front
+        .engine
+        .put_records(records)
+        .await
+        .expect("put records");
+    assert!(front.all_present(&digests).await);
+    assert!(front.commits.load(Ordering::SeqCst) >= 1);
+    assert_eq!(
+        front.cache.metrics().write.total.get(),
+        0,
+        "no ByteStream write"
+    );
+    let names = std::fs::read_dir(&dir).expect("list").count();
+    assert_eq!(names, blobs.len(), "only the files: no spool beside them");
+}
+
+/// Catches a file that changed after the walk hashed it being uploaded under the digest
+/// of what it held (the walk's one read is the only hash on the daemon, so this is the
+/// guard): each way a file can differ from what was hashed (rewritten, appended to,
+/// replaced by another file, removed, replaced by a symlink) fails the upload with a
+/// read error naming the file, and the blob is not stored. Mutants seen red: the
+/// stamp comparison dropped from `FileSource::check` (rewritten and appended
+/// uploaded; the server, which hashes, refused them later with a different error),
+/// `NOFOLLOW` dropped from `OPEN_FILE` (symlink followed).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_file_changed_after_it_was_hashed_is_refused() {
+    type Change = fn(&std::path::Path);
+    let changes: [(&str, Change); 5] = [
+        ("rewritten", |p| {
+            std::fs::write(p, b"another content!").expect("rewrite")
+        }),
+        ("appended", |p| {
+            use std::io::Write as _;
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(p)
+                .expect("open")
+                .write_all(b"more")
+                .expect("append");
+        }),
+        ("replaced", |p| {
+            let other = p.with_extension("other");
+            std::fs::write(&other, b"the original bytes").expect("write");
+            std::fs::rename(other, p).expect("rename");
+        }),
+        ("removed", |p| std::fs::remove_file(p).expect("remove")),
+        ("symlinked", |p| {
+            std::fs::remove_file(p).expect("remove");
+            std::os::unix::fs::symlink("/etc/hostname", p).expect("symlink");
+        }),
+    ];
+    for (what, change) in changes {
+        let front = Front::start(Mode::Serve).await;
+        let (dir, records, digests) = file_records(
+            &format!("changed-{what}"),
+            &[b"the original bytes".to_vec()],
+        );
+        // Past the clock's granularity, so a write shows in the times.
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        change(&dir.join("f0"));
+        let failed = front.engine.put_records(records).await.expect_err(what);
+        let shown = format!("{failed:?}");
+        assert!(shown.starts_with("Read("), "{what}: {shown}");
+        assert!(shown.contains("f0"), "{what}: {shown}");
+        assert!(!front.all_present(&digests).await, "{what}");
+    }
+}
+
+/// Catches the server's check being the only one that matters and then missing:
+/// bytes that do not hash to the record's digest, in a file that looks unchanged (its
+/// stamp is taken after the content differs, as a write that raced the walk's hash would
+/// leave it), are refused by the server's per-record check at `Commit`, and by the
+/// ByteStream fallback's, so the upload fails and neither digest is stored (mutant: the
+/// server's record check is in kbf-front, see its tests; this one pins that the daemon
+/// does not paper over a refused upload).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn bytes_that_do_not_hash_to_their_digest_are_never_stored() {
+    let front = Front::start(Mode::Serve).await;
+    let original = patterned(1, 4000);
+    let tampered = patterned(2, 4000);
+    let (dir, mut records, digests) = file_records("tampered", &[original]);
+    std::fs::write(dir.join("f0"), &tampered).expect("tamper");
+    // A stamp taken now: the file looks unchanged.
+    let stamp = Stamp::of(&File::open(dir.join("f0")).expect("open")).expect("stamp");
+    let root = Arc::new(OwnedFd::from(File::open(&dir).expect("open the directory")));
+    records[0].source = Source::File(FileSource::new(
+        root,
+        Arc::from(Vec::<String>::new()),
+        "f0".to_owned(),
+        stamp,
+    ));
+    front
+        .engine
+        .put_records(records)
+        .await
+        .expect_err("refused");
+    assert!(!front.all_present(&digests).await, "the digest it claimed");
+    assert!(
+        !front.all_present(&[digest_of(&tampered)]).await,
+        "the digest of what the file held"
+    );
+}
+
+/// Catches the directory a file was hashed in being trusted by name: files hashed in `d`
+/// are refused when `d` is renamed away, replaced by a symlink to a directory holding the
+/// same files, or made unreadable (each way `descend` fails: a name that is gone, one that
+/// is no directory now, any other error). The upload fails with a read error and nothing
+/// is stored (mutants seen red: `NOFOLLOW` dropped from `OPEN_DIRECTORY`, the symlinked
+/// directory followed and its files uploaded).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_directory_changed_after_its_files_were_hashed_is_refused() {
+    type Change = fn(&std::path::Path);
+    let changes: [(&str, Change, &str); 3] = [
+        (
+            "renamed",
+            |d| std::fs::rename(d, d.with_extension("away")).expect("rename"),
+            "removed or replaced",
+        ),
+        (
+            "symlinked",
+            |d| {
+                let copy = d.with_extension("copy");
+                std::fs::create_dir(&copy).expect("mkdir");
+                for entry in std::fs::read_dir(d).expect("list") {
+                    let entry = entry.expect("entry");
+                    std::fs::copy(entry.path(), copy.join(entry.file_name())).expect("copy");
+                }
+                std::fs::remove_dir_all(d).expect("remove");
+                std::os::unix::fs::symlink(&copy, d).expect("symlink");
+            },
+            "removed or replaced",
+        ),
+        (
+            "unreadable",
+            |d| {
+                std::fs::set_permissions(d, std::os::unix::fs::PermissionsExt::from_mode(0o000))
+                    .expect("chmod");
+            },
+            "Permission denied",
+        ),
+    ];
+    for (what, change, why) in changes {
+        let front = Front::start(Mode::Serve).await;
+        let dir = scratch(&format!("dir-changed-{what}"));
+        std::fs::create_dir_all(dir.join("d")).expect("mkdir");
+        let root = Arc::new(OwnedFd::from(File::open(&dir).expect("open the directory")));
+        let dirs: Arc<[String]> = Arc::from(vec!["d".to_owned()]);
+        let blob = patterned(3, 300);
+        std::fs::write(dir.join("d/f"), &blob).expect("write");
+        let stamp = Stamp::of(&File::open(dir.join("d/f")).expect("open")).expect("stamp");
+        let mut hasher = RecordHasher::new();
+        hasher.update(&blob);
+        let (digest, crc32c) = hasher.finish();
+        let record = Record {
+            digest,
+            crc32c,
+            source: Source::File(FileSource::new(root, dirs, "f".to_owned(), stamp)),
+        };
+        change(&dir.join("d"));
+        let failed = front.engine.put_records(vec![record]).await;
+        std::fs::set_permissions(
+            dir.join("d"),
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .ok();
+        let failed = failed.expect_err(what);
+        let shown = format!("{failed:?}");
+        assert!(
+            shown.starts_with("Read(") && shown.contains(why),
+            "{what}: {shown}"
+        );
+        assert!(!front.all_present(&[digest_of(&blob)]).await, "{what}");
+    }
+}
+
+/// Catches a record whose bytes are fewer than its digest says being sent short, or its
+/// error lost: a blob held in memory that is shorter than the size in its digest fails
+/// the upload with a read error naming the blob, and nothing is stored (mutant: the
+/// short read zero-filled).
+#[tokio::test]
+async fn a_record_shorter_than_its_digest_fails_with_a_read_error() {
+    let front = Front::start(Mode::Serve).await;
+    let whole = patterned(5, 200);
+    let mut record = Record::bytes(whole.clone());
+    record.source = Source::Bytes(Arc::from(&whole[..100]));
+    let failed = front
+        .engine
+        .put_records(vec![record])
+        .await
+        .expect_err("short");
+    assert!(format!("{failed:?}").starts_with("Read("), "{failed:?}");
+    assert!(!front.all_present(&[digest_of(&whole)]).await);
 }

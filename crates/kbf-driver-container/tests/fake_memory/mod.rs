@@ -199,7 +199,7 @@ async fn a_memory_kill_without_an_exit_from_podman_is_still_reported() {
         .cgroup("memory.events", &["max 0", "oom 0", "oom_kill 2"])
         .exit(137);
 
-    fake.knob("status-override", "stopped 0\n");
+    fake.knob("status-override", "stopped -1\n");
     let outcome = fake.run(1, &spec, &own).await;
     assert!(
         matches!(outcome, Err(RuntimeError::OutOfMemory { used: 5_000_000_000, limit }) if limit == CAP),

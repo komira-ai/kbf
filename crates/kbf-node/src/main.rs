@@ -90,6 +90,16 @@ struct Cli {
         value_parser = clap::value_parser!(u64).range(1..)
     )]
     output_upload_deadline_secs: u64,
+    /// How many threads hash the output files of all leases together (container driver):
+    /// each file is read once, for its SHA-256 and the CRC-32C of its segment footer.
+    /// They are threads of their own, apart from the ones that run actions, so a node
+    /// with many leases hashes on no more cores than this.
+    #[arg(
+        long,
+        default_value_t = kbf_daemon::cpu_pool::DEFAULT_CPU_THREADS as u64,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    cpu_threads: u64,
     #[command(flatten)]
     cache: cache::CacheArgs,
     #[command(flatten)]
@@ -607,6 +617,7 @@ mod container {
             max_stdio_bytes: cli.outputs.max_stdio_bytes,
         };
         config.upload_deadline = super::upload_deadline(cli);
+        config.cpu = kbf_daemon::CpuPool::new(usize::try_from(cli.cpu_threads).unwrap_or(1));
         config.limits = limits(cli);
         config.swap_kill = swap_kill(cli);
         config.cache = crate::cache::given(&cli.cache, &config.scratch);
@@ -825,6 +836,23 @@ mod tests {
         );
         let defaults = parse(&["--driver=container"]).expect("flags");
         assert_eq!(container::limits(&defaults), ContainerLimits::DEFAULT);
+    }
+
+    /// Catches `--cpu-threads` not parsed, not defaulting to the pool's documented 4, or
+    /// accepting 0 (a pool that never runs a job).
+    #[test]
+    fn cpu_threads_is_a_flag() {
+        assert_eq!(
+            parse(&["--driver=fake"]).expect("flags").cpu_threads,
+            kbf_daemon::cpu_pool::DEFAULT_CPU_THREADS as u64
+        );
+        assert_eq!(
+            parse(&["--driver=fake", "--cpu-threads=6"])
+                .expect("flags")
+                .cpu_threads,
+            6
+        );
+        assert!(parse(&["--driver=fake", "--cpu-threads=0"]).is_err());
     }
 
     /// Catches a `--lease-swap-*` flag that does not reach the driver's swap watch (in

@@ -15,9 +15,12 @@
 //!   so each is refused because the lint cannot tell where it lands;
 //! - a job's `permissions` grants anything but `read` or `none`, except the two scopes
 //!   that sign build provenance ([`SIGNING_SCOPES`]: `id-token` and `attestations`),
-//!   which may be `write` only in a job whose `if:` is exactly [`MAIN_PUSH_ONLY`]. So
-//!   no pull request or merge-queue run holds a token that can sign an attestation,
-//!   and every attestation this repository signs names `refs/heads/main`;
+//!   which may be `write` only in a job whose `if:` is exactly [`MAIN_PUSH_ONLY`], and
+//!   `contents` ([`RELEASE_SCOPES`]), which may be `write` only in a job whose `if:` is
+//!   exactly [`RELEASE_TAG_PUSH_ONLY`]. So no pull request or merge-queue run holds a
+//!   token that can sign an attestation, every attestation this repository signs names
+//!   `refs/heads/main`, and only a pushed `v*` tag runs a job that can create a release
+//!   (or push to the repository);
 //! - a job calls a reusable workflow that is not one of this repository's linted
 //!   workflow files (its runners are not in a file this lint read);
 //! - a step's `uses:` is not pinned to a full 40-character commit SHA followed on the
@@ -136,6 +139,14 @@ const SIGNING_SCOPES: &[&str] = &["id-token", "attestations"];
 /// The one `if:` spelling under which a job may hold [`SIGNING_SCOPES`] for writing.
 const MAIN_PUSH_ONLY: &str =
     "${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}";
+
+/// Token scopes a job may set to `write` when it runs only for a pushed release tag:
+/// the repository's contents, which creating a release and uploading its assets need.
+const RELEASE_SCOPES: &[&str] = &["contents"];
+
+/// The one `if:` spelling under which a job may hold [`RELEASE_SCOPES`] for writing.
+const RELEASE_TAG_PUSH_ONLY: &str =
+    "${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}";
 
 /// Triggers that run with the base repository's secrets and token on behalf of code
 /// or events from outside it.
@@ -465,8 +476,7 @@ impl Lint<'_> {
             }
         }
         if let Some(p) = get(job_map, "permissions") {
-            let main_push_only = get(job_map, "if").and_then(Node::as_str) == Some(MAIN_PUSH_ONLY);
-            self.job_permissions(p, main_push_only);
+            self.job_permissions(p, get(job_map, "if").and_then(Node::as_str));
         }
         match get(job_map, "runs-on") {
             Some(r) => self.runs_on(r),
@@ -526,10 +536,11 @@ impl Lint<'_> {
     }
 
     /// A job may narrow its token to `read` or `none` scopes; it may not widen it, but
-    /// for [`SIGNING_SCOPES`] set to `write` in a job that runs only for a push to
-    /// `main` (`main_push_only`). Scope names and levels are compared exactly, so
-    /// another spelling is refused (the safe side).
-    fn job_permissions(&mut self, p: &Node, main_push_only: bool) {
+    /// for [`SIGNING_SCOPES`] set to `write` in a job whose `if:` (`condition`) is
+    /// exactly [`MAIN_PUSH_ONLY`], and [`RELEASE_SCOPES`] set to `write` in one whose
+    /// `if:` is exactly [`RELEASE_TAG_PUSH_ONLY`]. Scope names and levels are compared
+    /// exactly, so another spelling is refused (the safe side).
+    fn job_permissions(&mut self, p: &Node, condition: Option<&str>) {
         let Value::Map(scopes) = &p.value else {
             self.refuse(
                 p,
@@ -543,20 +554,27 @@ impl Lint<'_> {
             if granted == "read" || granted == "none" {
                 continue;
             }
-            if granted != "write" || !SIGNING_SCOPES.contains(&name) {
-                self.refuse(
+            let gate = if SIGNING_SCOPES.contains(&name) {
+                Some(MAIN_PUSH_ONLY)
+            } else if RELEASE_SCOPES.contains(&name) {
+                Some(RELEASE_TAG_PUSH_ONLY)
+            } else {
+                None
+            };
+            match gate {
+                Some(only) if granted == "write" && condition != Some(only) => self.refuse(
+                    level,
+                    format_args!(
+                        "`{name}: write` is allowed only in a job whose `if:` is exactly `{only}`"
+                    ),
+                ),
+                Some(_) if granted == "write" => {}
+                _ => self.refuse(
                     level,
                     format_args!(
                         "a job's `permissions` may grant only `read` or `none`, got `{name}: {granted}`"
                     ),
-                );
-            } else if !main_push_only {
-                self.refuse(
-                    level,
-                    format_args!(
-                        "`{name}: write` is allowed only in a job whose `if:` is exactly `{MAIN_PUSH_ONLY}`"
-                    ),
-                );
+                ),
             }
         }
     }

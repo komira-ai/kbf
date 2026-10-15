@@ -113,7 +113,7 @@ pub(crate) async fn text_file_busy(stderr: &Path) -> bool {
 /// A container `podman start` did not run to an exit (Podman's `state` for it): the
 /// action's exit 127 or 126 when crun reports it cannot find or execute the program,
 /// with kbf's message and Podman's words as its stderr; otherwise the farm's failure,
-/// naming what Podman said.
+/// naming what Podman said, or that it said nothing.
 pub(crate) async fn not_run(
     spec: &ContainerSpec,
     stderr: &Path,
@@ -121,9 +121,16 @@ pub(crate) async fn not_run(
 ) -> Result<i32, RuntimeError> {
     match answer(spec, stderr).await.map_err(|e| failed(stderr, &e))? {
         Ok(why) => Ok(why.exit_code()),
-        Err(said) => Err(RuntimeError::Failed(format!(
-            "the container did not run to an exit: podman reports {state:?}; podman start: {said}"
-        ))),
+        Err(said) => {
+            let said = if said.is_empty() {
+                "(nothing on stderr)"
+            } else {
+                &said
+            };
+            Err(RuntimeError::Failed(format!(
+                "the container did not run to an exit: podman reports {state:?}; podman start: {said}"
+            )))
+        }
     }
 }
 
