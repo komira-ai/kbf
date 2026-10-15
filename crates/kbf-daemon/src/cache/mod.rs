@@ -157,6 +157,12 @@ impl CacheConfig {
     }
 }
 
+/// How leases get cached files unless a test says otherwise.
+#[cfg(target_os = "macos")]
+const PLATFORM_LINK_MODE: LinkMode = LinkMode::Clone;
+#[cfg(not(target_os = "macos"))]
+const PLATFORM_LINK_MODE: LinkMode = LinkMode::Hardlink;
+
 /// The platform's way to place an entry at a lease's name: a clone on macOS (APFS
 /// copy-on-write: the new file is its own inode, so a write to it never reaches the
 /// entry), a hard link elsewhere.
@@ -367,11 +373,7 @@ impl Cache {
             tracing::warn!("cache: index snapshot discarded ({why}); starting empty");
         }
         let link_mode = if opened.same_filesystem {
-            config.link_mode.unwrap_or(if cfg!(target_os = "macos") {
-                LinkMode::Clone
-            } else {
-                LinkMode::Hardlink
-            })
+            config.link_mode.unwrap_or(PLATFORM_LINK_MODE)
         } else {
             let dir = config.dir.display();
             tracing::warn!("cache: {dir} is not on the scratch filesystem; leases get copies");

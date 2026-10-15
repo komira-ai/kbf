@@ -5,16 +5,18 @@
 //!
 //! Off macOS the cache is given a "clone" that copies, as `kbf-daemon`'s `cache_clone`
 //! tests do; macOS runs the real `clonefile`.
-
-mod support;
+//!
+//! In the `lease` test binary, not one of its own: the driver's generic `prepare` is counted
+//! by its best single instantiation, one per test binary, so the cached and the uncached
+//! input paths must run in the same binary.
 
 use std::path::Path;
 use std::sync::Arc;
 
+use crate::support::{self, MemoryCas, Spec, config, run, runtime, scratch, stdout};
 use kbf_daemon::cache::{Cache, CacheConfig, Key, LinkMode};
 use kbf_daemon::cas::digest_of;
 use kbf_driver_native::NativeConfig;
-use support::{MemoryCas, Spec, config, run, runtime, scratch, stdout};
 
 /// A cache in `dir/cache` for the leases under `dir/leases` ([`config`]), in clone mode.
 fn cache_in(dir: &Path) -> Arc<Cache> {
