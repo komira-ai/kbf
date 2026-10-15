@@ -231,7 +231,8 @@ fn a_placer_that_knows_no_memory_pins_every_lease() {
     let plain = placer();
     assert_eq!(plain.place_lease(1000, 1 << 50).spot(), Spot::Node(0));
     let unknown = placer_with(None, None);
-    assert_eq!(unknown.place_lease(1000, 1 << 50).spot(), Spot::Node(0));
+    let held = unknown.place_lease(1000, 1 << 50);
+    assert_eq!(held.spot(), Spot::Node(0));
     assert_eq!(unknown.loads(), [1000, 0]);
 }
 
