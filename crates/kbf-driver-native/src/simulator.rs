@@ -296,13 +296,12 @@ impl Simctl {
             ));
         }
         let derived = probe.join("dd");
+        let project = probe.join(format!("{PROBE_SCHEME}.xcodeproj"));
         let args = [
             "xcodebuild",
             "-showdestinations",
             "-project",
-            &probe
-                .join(format!("{PROBE_SCHEME}.xcodeproj"))
-                .to_string_lossy(),
+            &project.to_string_lossy(),
             "-scheme",
             PROBE_SCHEME,
             "-derivedDataPath",
