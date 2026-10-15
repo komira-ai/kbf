@@ -40,12 +40,14 @@ use kbf_daemon::cpu_pool::{CpuPool, DEFAULT_CPU_THREADS};
 use kbf_daemon::trees::{TreeConfig, TreeLease, Trees};
 use kbf_daemon::{Runtime, RuntimeError, Work, upload_within};
 use kbf_proto::reapi::{Action, ActionResult, Command, ExecutedActionMetadata, Platform};
+use kbf_proto::worker::ResourceUsage;
 use kbf_types::LeaseId;
 use prost_types::Timestamp;
 use tokio::sync::oneshot;
 
 use crate::backend::{Backend, ContainerRuntime, Dirs, Engine, PodmanBackend, Running};
 use crate::cgroup::{LeaseCgroup, SwapKill, memory_max, presses_into_swap};
+use crate::cgroup_usage::{NUMA_EVERY, NumaSample};
 use crate::image::{ImageCheckError, ImageRef, PROPERTY};
 use crate::input_phases::{InputPhases, millis};
 use crate::keeper::Keeper;
@@ -512,6 +514,9 @@ impl<C: Cas> PodmanRuntime<C> {
         // Execution counts from `podman create`: making the container is part of
         // running the command in one.
         clock.execution_start_timestamp = now();
+        let ran = Instant::now();
+        // What the lease cgroup's NUMA split was while the action ran (`cgroup_usage`).
+        let mut numa = NumaSample::default();
         lease.created = true;
         self.engine
             .create(&spec)
@@ -553,6 +558,8 @@ impl<C: Cas> PodmanRuntime<C> {
                     self.stop_container(&lease.name, &lease.cgroup, child).await;
                     return Err(RuntimeError::Killed);
                 }
+                // Never ends: it samples while the others are waited for.
+                () = numa.watch(lease.cgroup.dir(), NUMA_EVERY) => {}
                 (now, own) = presses_into_swap(&lease.cgroup, cap, threshold, swap_kill.every) => {
                     let limit = cap.unwrap_or(0);
                     let why = format!(
@@ -604,6 +611,17 @@ impl<C: Cas> PodmanRuntime<C> {
             }
         };
         clock.execution_completed_timestamp = now();
+        // What the lease cgroup counted, while it still exists (clean removes it). The
+        // result carries it beside the four numbers every runtime reports.
+        let cgroup = numa.finish(lease.cgroup.dir());
+        let usage = ResourceUsage {
+            cpu_user_micros: cgroup.cpu_user_micros.unwrap_or(0),
+            cpu_system_micros: cgroup.cpu_system_micros.unwrap_or(0),
+            peak_memory_bytes: cgroup.memory_peak_bytes.unwrap_or(0),
+            wall_micros: u64::try_from(ran.elapsed().as_micros()).unwrap_or(u64::MAX),
+            cgroup: Some(cgroup),
+        };
+        clock.auxiliary_metadata = vec![usage.to_any()];
         // The upload counts from the chown, which makes the outputs readable to it.
         clock.output_upload_start_timestamp = now();
         // The container has exited: hand its files back to the daemon's user, so an

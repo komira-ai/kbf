@@ -476,6 +476,8 @@ impl Daemon {
     /// long as it runs. v0 abandons running leases at shutdown; the scheduler
     /// re-dispatches them after G.
     pub async fn run(mut self, shutdown: impl Future<Output = ()>) {
+        #[cfg(target_os = "linux")]
+        crate::numa::log_layout();
         tokio::select! {
             () = self.reconnect_forever() => {}
             () = shutdown => tracing::info!("shutting down"),

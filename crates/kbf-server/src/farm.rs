@@ -37,7 +37,7 @@ use std::hash::BuildHasher;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use kbf_front::{Cache, Dispatch, Finished, MetaLog, Recorder, Stage, Submission, Ticket};
+use kbf_front::{ActionLabel, Cache, Dispatch, Finished, MetaLog, Recorder, Stage, Submission, Ticket};
 use kbf_meta::{ActionRecord, Role};
 use kbf_objstore::ObjectStore;
 use kbf_proto::google::rpc;
@@ -193,8 +193,9 @@ struct State {
     /// Where the invocation record's lease and finish events go ([`record`]).
     recorder: Recorder,
     /// The operations a recorded call waits on: the only ones [`record`] tells the
-    /// recorder of. Each leaves at its end.
-    recorded: BTreeSet<OperationId>,
+    /// recorder of, each with what the first call to wait on it said the action is
+    /// (the key of its `action usage:` line). Each leaves at its end.
+    recorded: BTreeMap<OperationId, ActionLabel>,
 }
 
 /// What a finished operation tells its callers, and the action-cache entry to write
@@ -244,7 +245,7 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
                 links: BTreeMap::new(),
                 paused: BTreeSet::new(),
                 recorder: Recorder::off(),
-                recorded: BTreeSet::new(),
+                recorded: BTreeMap::new(),
             }),
         }
     }

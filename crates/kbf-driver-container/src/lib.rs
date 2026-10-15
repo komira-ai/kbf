@@ -69,6 +69,7 @@
 mod backend;
 pub mod cas;
 mod cgroup;
+mod cgroup_usage;
 pub mod chown_dirs;
 pub mod delegate;
 mod exit_record;
