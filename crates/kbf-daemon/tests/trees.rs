@@ -668,6 +668,38 @@ async fn a_reopened_store_adopts_finished_trees_and_sweeps_the_rest() {
     assert!(!source.exists());
 }
 
+/// The store directory is the way to every tree: a rootless runtime's container root is
+/// a subordinate id (an "other" to the owner), so it must traverse the directory to bind
+/// a tree, and must not list it or write in it. Catches a store made 0700 (every lease
+/// that mounted a tree failed `cannot stat ...: Permission denied` on a build host), a
+/// store made listable (0755) or group or other writable, and a store left 0700 by an
+/// older daemon when it is reopened: a fresh store is 0711 whatever the umask, and an
+/// existing 0700 one is repaired at open without losing its trees.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_store_directory_is_searchable_by_others_but_not_listable_or_writable() {
+    let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o7777;
+    let kit = kit("trees-store-mode", |_| {});
+    let store = kit.dir.join("trees");
+    assert_eq!(mode(&store), 0o711, "a fresh store");
+    let root = kit.cas.tree(&files("tc", 300, "store-mode"));
+    let (_, inputs) = kit.lease(&root, "lease-1").await;
+    let source = inputs.mounts[0].source.clone();
+    assert_eq!(source.parent(), Some(store.as_path()));
+    drop(inputs);
+
+    // What an older daemon left behind.
+    std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let reopened = Trees::open(TreeConfig::new(store.clone(), GIB)).unwrap();
+    assert_eq!(mode(&store), 0o711, "a 0700 store, reopened");
+    assert_eq!(reopened.store().stats().trees, 1, "the tree is adopted");
+    assert_eq!(mode(&source), 0o755, "the tree is not touched");
+
+    // A store somebody opened up is closed again: not listable, not writable.
+    std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o777)).unwrap();
+    let _ = Trees::open(TreeConfig::new(store.clone(), GIB)).unwrap();
+    assert_eq!(mode(&store), 0o711, "a 0777 store, reopened");
+}
+
 /// A build that fails (a blob the CAS does not have) names no tree and leaves no
 /// `.tmp-*` directory; the lease fails with the CAS's error, and the next lease with the
 /// blob present builds the tree.

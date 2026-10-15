@@ -31,6 +31,17 @@ use crate::cache::{Cache, InputStats};
 use crate::cas::Fetch;
 use crate::tree::{Loaded, TreeError, io as io_error};
 
+/// The mode of the store directory: owner everything, others may only traverse. The
+/// OCI backend runs a rootless runtime whose container root is a subordinate id, not
+/// the daemon's user, an "other" to this directory: it must search it to bind a tree
+/// (0700 failed every lease with a tree: `cannot stat <tree>: Permission denied`), and
+/// has no reason to list it (names are digests it was not told) or write in it (no
+/// group or other write bit: trees are reached for reading only, through a read-only
+/// mount). The trees' own directories are 0755, their files the cache's 0444 or 0555
+/// (see `build::verify`); the directories above the store are the operator's, and must
+/// be searchable too.
+const STORE_MODE: u32 = 0o711;
+
 /// What a node's tree store has done.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TreeStats {
@@ -232,7 +243,7 @@ enum Step {
 }
 
 impl TreeStore {
-    /// Opens the store in `dir` (made, mode 0700, if it is missing), blocking: removes
+    /// Opens the store in `dir` (made, mode [`STORE_MODE`], if it is missing; set to it if it is not), blocking: removes
     /// the `.tmp-*` and `.dead-*` directories a previous run left, and adopts every
     /// tree already named (a tree is named by one rename after it was checked, so a
     /// name present means a whole tree). Anything else in `dir` is left alone.
@@ -240,10 +251,29 @@ impl TreeStore {
     /// # Errors
     /// `dir` cannot be made, listed or written.
     pub fn open(dir: PathBuf, max_bytes: u64) -> std::io::Result<Self> {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::create_dir_all(&dir)?;
-        // The container's user must not reach the store but through a mount.
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+        use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(STORE_MODE)
+            .create(&dir)?;
+        // Whatever the umask was, and whatever an older daemon (0700) or an operator
+        // left: the mode is set, and a change is logged.
+        let before = std::fs::metadata(&dir)?.permissions().mode() & 0o7777;
+        if before != STORE_MODE {
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(STORE_MODE))?;
+            tracing::info!(
+                "trees: {} was mode {before:04o}; made {STORE_MODE:04o}",
+                dir.display()
+            );
+        }
+        if let Some(closed) = closed_ancestor(&dir) {
+            tracing::warn!(
+                "trees: {} is not searchable by others, so a container whose root is not \
+                 this user cannot reach {}: chmod o+x it",
+                closed.display(),
+                dir.display()
+            );
+        }
         let mut state = State::default();
         for entry in std::fs::read_dir(&dir)? {
             let entry = entry?;
@@ -408,5 +438,57 @@ impl TreeStore {
         dead.extend((!moved).then_some(tmp));
         inner.remove_later(dead);
         Ok((inner.lease(&node.name, pins), Some(stats)))
+    }
+}
+
+/// The nearest directory from `dir` upwards that others cannot search (no `o+x`), which
+/// the store does not own and so only reports. `None` if every one can be searched, or
+/// if `dir` cannot be resolved.
+fn closed_ancestor(dir: &Path) -> Option<PathBuf> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let absolute = std::fs::canonicalize(dir).ok()?;
+    let closed =
+        |p: &&Path| std::fs::metadata(p).is_ok_and(|meta| meta.permissions().mode() & 0o001 == 0);
+    absolute
+        .ancestors()
+        .skip(1)
+        .find(closed)
+        .map(Path::to_owned)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    use super::closed_ancestor;
+
+    /// Catches a closed ancestor not being named (the warning that tells the operator
+    /// what to chmod), the store's own directory being named (`open` makes it 0711, it
+    /// is not reported), and a farther one named before the nearest.
+    #[test]
+    fn the_nearest_closed_ancestor_is_named() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/kbf-daemon-unit")
+            .join(format!("trees-closed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = root.join("closed/inner/store");
+        std::fs::create_dir_all(&store).unwrap();
+        let mode = |p: &std::path::Path, m| {
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).unwrap();
+        };
+        let (closed, inner) = (root.join("closed"), root.join("closed/inner"));
+        // The store itself being closed is not reported: `open` makes it 0711.
+        mode(&store, 0o700);
+        mode(&inner, 0o711);
+        mode(&closed, 0o700);
+        let named = std::fs::canonicalize(&closed).unwrap();
+        assert_eq!(closed_ancestor(&store), Some(named));
+        // Two closed ancestors: the nearest is named.
+        mode(&inner, 0o700);
+        let nearest = std::fs::canonicalize(&inner).unwrap();
+        assert_eq!(closed_ancestor(&store), Some(nearest));
+        mode(&closed, 0o755);
+        mode(&inner, 0o755);
+        assert!(closed_ancestor(&root.join("missing")).is_none());
     }
 }
