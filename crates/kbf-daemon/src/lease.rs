@@ -678,11 +678,10 @@ mod tests {
             warn.contains("reason=input tree: the blob store is unreachable second line"),
             "{warn}"
         );
-        assert!(
-            log.lines()
-                .any(|l| l.contains(" INFO ") && l.ends_with("lease finished lease=3.4 ok=false")),
-            "{log}"
-        );
+        let finished = log
+            .lines()
+            .find(|l| l.ends_with("lease finished lease=3.4 ok=false"));
+        assert!(finished.is_some_and(|l| l.contains(" INFO ")), "{log}");
         assert!(log.contains("inputs_ms=- run_ms=- outputs_ms=-"), "{log}");
     }
 
