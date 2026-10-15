@@ -1,9 +1,25 @@
 # One server, one daemon, one process: libraries, three binaries, a shared cache
 
-Status: **proposed. Phase 0 is safe to build now. Phase 1 and 2 are gated on the
-preconditions of section 10 and the measurement of section 11.** Nothing here is built.
-No wire message changes in any phase: a remote daemon sends what it sends today, and a
-server accepts what it accepts today.
+Status: **accepted by the project owner; phase 0 is in progress, phases 1 and 2 follow
+it.** The owner's rulings (2026-10-15), each recorded where it applies:
+
+- The secrets table of section 7.1 is accepted: the performance saving and the operational
+  overhead it removes justify it (section 13, question 2).
+- **There is no measurement gate.** The owner has ruled that performance and operational
+  overhead justify the work; section 11 is kept as the list of numbers to record while
+  building, not as a bar a phase must clear.
+- In all-in-one each output file is **read once, hashed and written to the tier in the same
+  pass**; there is no second hash (sections 2 and 4).
+- The server **trusts the daemon's digest at Commit and verifies in the background flush**
+  (merged in #656). All-in-one uses that path unchanged.
+- `--reserve-cpus` exists on the daemon and all-in-one only. The server takes every CPU
+  tokio gives it (section 6).
+- **A durable server log is a precondition (P1) and is being built separately**: a local
+  filesystem blob store with the raft metadata log, no S3, for single-host farms. This
+  document leaves the seam for it (section 7.4) and does not design it.
+
+Phase 0 changes no behaviour and is in progress. No wire message changes in any phase: a
+remote daemon sends what it sends today, and a server accepts what it accepts today.
 
 **What this does and does not buy, in one paragraph.** All-in-one changes none of: Mojo
 compile time (about 97% of a cold build's time), the hard-link and ownership passes that
@@ -11,9 +27,10 @@ bound a typical action, or the node-cache hit rate. It removes a loopback hop an
 for bytes that never leave the machine, gives one binary to deploy and one CPU flag on a
 single node, and makes the farm's CPU and memory claim explicit. It costs the user
 boundary around the farm's secrets, widens a crash from one half to both, and, until the
-server's state is durable (section 10), turns a daemon crash into the loss of the whole
-index. If section 11 shows the typical action is dominated by links and ownership passes,
-the only remaining reason is operational, and this document says so here, not later.
+server's state is durable (section 10, P1), turns a daemon crash into the loss of the whole
+index. If the typical action is dominated by links and ownership passes, the saving is
+mainly operational, and this document says so here, not later; the owner has ruled that
+this, with the upload saving, is enough.
 
 This replaces an earlier Unix-socket design for the same host (section 12). Its reviews'
 findings (transport not the measured cost; typical action not helped; the user boundary;
@@ -39,22 +56,25 @@ OOM and crash blast radius) are answered in sections 2, 7 and 11.
    mutual TLS in all-in-one too (section 4). It is small, not on the measured path, and
    keeping it the same means one scheduler, one commit path and one set of sim scenarios.
    An in-process control plane is not designed here.
-5. **One CPU flag**, `--reserve-cpus`, on the Linux binaries. No pinning. What the reserve
-   does not cover goes to builds (section 6). Unset, every binary behaves exactly as it
-   does today.
+5. **One CPU flag**, `--reserve-cpus`, on `kbf-daemon` and `kbf-all-in-one` only, Linux
+   only. `kbf-server` has no such flag and uses as many CPUs as tokio gives it. No pinning.
+   What the reserve does not cover goes to builds (section 6). Unset, every binary behaves
+   exactly as it does today.
 6. **One conformance suite** for the data plane, run against both implementations
    (section 8).
 7. **The split binaries stay first class.** A Linux remote daemon stays connected to the
    live farm as a canary, and CI renders and checks the split and converged shapes as
    well as all-in-one (section 9).
-8. **Measure first.** The in-flight do-less PRs and the worker-cache link work (section
-   11) remove most of what this would otherwise save. Phase 0 changes no behaviour.
+8. **No measurement gate.** The owner has ruled that performance and operational overhead
+   justify the work. The in-flight do-less PRs and the worker-cache link work (section 11)
+   still change what the numbers show, so section 11's measurements are recorded as the
+   work lands, to report what it bought. Phase 0 changes no behaviour.
 
 ## 2. What is known, and what is not
 
 One action outputting a toolchain tree (15k files, 307 MB) spent 18.3 s in its outputs
 phase: walk 7.8 s, spool 4.3 s, upload 6.0 s. That is **one measurement on `main`, before
-the PRs of section 11**; section 11 requires at least five runs with variance. The 6.0 s
+the PRs of section 11**; section 11 asks for at least five runs with variance. The 6.0 s
 is about ten 32 MiB uploads sent one after another (Begin, ranges, Commit, which hashes,
 syncs the tier and commits metadata): as consistent with latency in series as with
 bandwidth, so **not shown to be transport**.
@@ -71,13 +91,14 @@ The only effects on compiles are second-order: who gets CPU and memory under con
 CPU or fewer is a number to measure (M6, section 11), not an assumption: the farm's own
 processes take CPU from compiles in both shapes, and a reserve books it explicitly.
 
-**The in-process plane hashes twice.** The daemon hashes an output for `FindMissing`; the
-server's `VerifiedBlob` hashes it again on the blocking pool (`kbf-front/segments.rs`,
-`check_all`, up to a gigabyte at a time), and it must, because the server never trusts the
-daemon's claim (section 4). In process, a 307 MB output is hashed twice at one SHA-256
-rate on the same cores. What in-process saves (TLS, protobuf encode, one kernel copy) must
-exceed the cost of that second hash, or all-in-one is slower on uploads; M3 and M4 compute
-both (section 11).
+**The in-process plane hashes once.** In all-in-one the daemon reads each output file
+once, hashes it and writes it to the tier in the same pass; the digest it computed there
+is the digest for `FindMissing` and for Commit. The server trusts that digest at Commit
+and verifies it in the background flush, which hashes each record before the PUT and drops
+one that fails (#656, on `main`). So a 307 MB output is read once and hashed once on the
+upload path, plus the flush's verification off the critical path; the remote plane is
+unchanged. What in-process saves (TLS, protobuf encode, one kernel copy, the second read
+and hash) is not offset by a second hash.
 
 So the case for all-in-one is mainly operational: **one binary to deploy and supervise on
 a single node, one place that decides how many CPUs builds get, one cache budget instead
@@ -149,7 +170,7 @@ that method on a small `DataPlane: Cas` trait so nothing in the daemon names `Tr
 |---|---|---|
 | Bytes move | `Transfers` over one mutual-TLS HTTP/2 connection to the worker listener | function calls into the server's `Cache` and `SegmentsService` in the same process |
 | Authentication | the daemon's certificate, admitted per call by `identity.rs` | none on the wire; the daemon is constructed with the server's handle. The deny list still applies: each call is admitted for the daemon's own node id through the same `admit_call` check, so cordon and deny edits refuse the next call as they do today |
-| Integrity | the server hashes what it receives (`VerifiedBlob::new`, the per-record check in `Receiving`) | **the same functions**, called directly. The in-process plane never constructs a `VerifiedBlob` without hashing, never passes a "trusted" flag, and has no code path that skips `check` |
+| Integrity | the server trusts the daemon's digest at Commit and verifies it in the background flush, which hashes each record before the tier PUT and drops one that fails (#656) | **the same path.** The daemon reads, hashes and writes each output file once; the flush verifies as for a remote daemon. There is no extra in-process hash and no flag that skips the flush's check |
 | Upload ownership | `Connections` keyed by the peer `SocketAddr` | keyed by `Owner::Local(PlaneId)`, one fresh id per `LocalDataPlane` (idle timeout, drop-on-close and admission release hang on it as for TCP) |
 | Copies | file, spool read, protobuf encode, TLS encrypt, kernel, decrypt, decode, into the server's buffer | spool read into the server's buffer; no encode, no TLS, no kernel hop |
 
@@ -179,8 +200,9 @@ project owner rejected.
 
 What `LocalDataPlane` does not do: skip the server's checks, hold the cache's state
 outside the server, or let a daemon-supplied path or descriptor reach the server. It
-passes `Bytes`; the server hashes them into its own memory and stores that same buffer.
-A digest mismatch is refused and indexes nothing, as for a remote daemon.
+passes `Bytes` and the daemon's digest; the server stores that same buffer and the flush
+verifies it before the PUT. A digest mismatch is dropped by the flush and never reaches
+the tier, as for a remote daemon.
 
 ## 5. The shared cache
 
@@ -259,7 +281,9 @@ written, the async runtime and the blocking and hashing pools are the ones in us
 `reserve=unset`. This is Phase 0's contract, and a test pins it (section 8). Nothing in
 this section applies until a deploy sets the flag.
 
-**Scope.** The flag is accepted on Linux only. On macOS `kbf-daemon` refuses it at start:
+**Scope.** The flag exists on `kbf-daemon` and `kbf-all-in-one` only, and on Linux only.
+`kbf-server` has no `--reserve-cpus`: it uses as much CPU as tokio gives it, and its pools
+are the ones it has today. On macOS `kbf-daemon` refuses the flag at start:
 a Mac daemon has no server beside it and no cgroup to weight; honouring it would lower the
 reported `cpus`, which `native-whole-machine` leases use to size the machine, and bound
 hashing to a few threads, which would slow large output uploads that today use the
@@ -300,25 +324,23 @@ constants):**
 
 | Pool | `kbf-server` | `kbf-daemon` | `kbf-all-in-one` |
 |---|---|---|---|
-| Share of `R` | all of it | `R - colocated` (below) | server `ceil(R/2)`, daemon `R - ceil(R/2)`, each at least 1; `R >= 2` required |
-| Async worker threads | `max(2, ceil(share/2))` | same | per side, same rule, one runtime per side |
-| Hash/verify pool | `share` threads | `share` threads | **one pool per side**, each of its `share`; not one shared pool, so neither half can use the other's bound |
-| Blocking I/O pool | fixed bound, not CPU-derived | same | same |
+| Share of `R` | no flag; all CPUs, tokio's defaults | all of `R` | server `ceil(R/2)`, daemon `R - ceil(R/2)`, each at least 1; `R >= 2` required |
+| Async worker threads | tokio default | `max(2, ceil(share/2))` | per side, same rule, one runtime per side |
+| Hash/verify pool | today's | `share` threads | **one pool per side**, each of its `share`; not one shared pool, so neither half can use the other's bound |
+| Blocking I/O pool | today's | fixed bound, not CPU-derived | same |
 | `cpus` reported | not reported (no daemon) | `host - R` | `host - R` |
 
 There is **no default `R`**: it is set by the deploy from M6. Initial values to try are
 the converged units' current thread counts, but they are not defaults.
 
-**What `R` means differs by binary, and the converged split must say so.** On
-`kbf-server` it is the server's own pool size; on `kbf-daemon` it is subtracted from the
-host. In a converged split (two units, one host) the daemon's `cpus` must be
-`host - (server's R + the daemon's own R)`. `kbf-daemon` therefore gains
-`--colocated-server-cpus N` (default 0), set only by the converged rendering, and its
-flag `--reserve-cpus` is then the **host-wide** total, of which the daemon derives its own
-share as `reserve - N`. `check-units` asserts in the converged shape that the daemon's
-`--colocated-server-cpus` equals the server unit's `--reserve-cpus`, and that the total is
-below the host's CPUs. Omitting it is a FAIL, not a warning: otherwise a converged host
-silently books against `host - 2` while the farm uses more.
+**Converged split (two units, one host).** The server unit has no reserve flag, so the
+daemon cannot derive its share as `reserve - server's R`. On a converged host the daemon's
+`--reserve-cpus` is the host-wide figure for the farm's own work, server included: the
+daemon reports `cpus = host - R`, and the server, unbounded, competes inside that reserve
+through the kernel weights (section 6, item 3). `--colocated-server-cpus` is dropped.
+`check-units` asserts in the converged shape that the daemon's `--reserve-cpus` is set and
+below the host's CPUs. Whether the server's unbounded use can exceed `R` under load is
+what M6 records; if it does, the remedy is a larger `R`, not a server flag.
 
 **Overrides.** `--hash-threads`, `--async-threads` and `--blocking-threads` win over the
 derived values; the start line prints what was derived and overridden (`reserve=4 async=2
@@ -379,7 +401,7 @@ Macs. That fixes the rule:
 (user namespace, `pids.max`, `memory.max`, `cpu.weight` per lease; the tier is never
 mounted; the cache's write path is not reachable from inside). And **the server still
 verifies every digest**: a compromised daemon half writes only bytes whose hashes the
-server computes itself, so it cannot poison the CAS under another digest. That property
+server's flush computes itself before the PUT, so it cannot poison the CAS under another digest. That property
 survives merging; the secrets above do not stay behind a boundary.
 
 ### 7.2 Memory and the out-of-memory killer
@@ -443,6 +465,12 @@ about each:
 
 ### 7.4 What a restart loses
 
+**The seam for the durable log.** The durable server log (a local filesystem blob store plus
+the raft metadata log, no S3, for single-host farms) is built in a separate change. The
+only contract this design relies on is that the server's tier and metadata log are behind
+the handle `LocalDataPlane` already calls (`Cache`, `SegmentsService`), so swapping the
+store does not touch the data plane or the daemon.
+
 **The server's log is not durable in the current deploy**, so this document does not say
 that a restart recovers. Under `--meta-log=memory` (the default, and the only mode the
 farm unit passes today) a restart forgets the CAS index, the action cache, the node
@@ -491,7 +519,7 @@ Each test names the mutant that turns it red:
 
 | Test | Mutant |
 |---|---|
-| digest mismatch refused on `LocalDataPlane`, index unchanged | the local adapter constructs `VerifiedBlob` from the caller's claim, or skips `check` |
+| a record whose bytes do not match the daemon's digest is dropped by the background flush on both planes and never PUT | the local adapter bypasses the flush's check; the output file is hashed a second time on the upload path |
 | deny-list edit refuses the next local call | local admission cached at construction |
 | dropped local upload releases the write budget; a stalled local upload does not starve remote ones | release missing for `Owner::Local` |
 | two `LocalDataPlane`s: dropping one's upload releases only its own, and a Commit on one cannot adopt the other's upload | both planes given the same `PlaneId` |
@@ -507,7 +535,7 @@ Each test names the mutant that turns it red:
 | **unset**: reported `cpus` equals today's for the same fake host, no `cpu.weight` is written, and pools equal today's | reserve applied when the flag is absent |
 | set: derived pool sizes match section 6 for each binary at `R` in {2, 4, 6, 16}; reported `cpus` is host minus `R` | all-in-one sizes each side by the whole `R`; reserve ignored by the report |
 | set, on a fake cgroup root: `supervisor/cpu.weight = cpu_weight(R x 1000)`, `actions/cpu.weight = cpu_weight((host - R) x 1000)`, **and the ratio of the two equals `R : host - R`** | weight written on `supervisor/` only (the ratio is then `R x 10 : 1`, not the reserved share) |
-| the converged rendering: the daemon's `--colocated-server-cpus` equals the server's `--reserve-cpus`; the daemon's `cpus` is `host - total` | converged daemon reports `host - 2` while the farm uses 6 |
+| `kbf-server` rejects `--reserve-cpus`; the converged rendering sets the daemon's `--reserve-cpus` as the host-wide figure and the daemon's `cpus` is `host - R` | a server flag is added, or a converged daemon reports every host CPU |
 | native driver with all-in-one is refused | the check removed |
 | cache fill from the tier writes through `tmp/` and the rename, and a corrupted tier record is refused at the daemon's hash | fill copies straight into `blobs/`, or trusts the tier's checksum |
 | shared budget evicts unpinned cache entries, then `.seg` copies, never an unflushed block, never a pinned entry | eviction order swapped |
@@ -544,7 +572,7 @@ does.
   and the thread cap of 7.3, delegation, no native driver, `--reserve-cpus` below the
   host's CPUs, and that every state directory is owned by the unit's user (below).
 - **The target farm** runs `kbf-server` on storage nodes and `kbf-daemon` on build hosts
-  and Macs, each with its own `--reserve-cpus`; the flag is the only change.
+  and Macs, the daemons with their own `--reserve-cpus` (the servers have none); the flag is the only change.
 - **Changing shape is an explicit step, with ownership.** Today `kbf-server` owns the tier
   (0700), the raft and metadata directories and its keys; `kbf` owns the cache, the
   scratch directory and the daemon's keys. A unit swap alone leaves each binary unable to
@@ -579,15 +607,15 @@ does.
 
 ## 10. Migration phases and preconditions
 
-**Phase 0: library seams and the shared interface. No behaviour change.** Reverts by
+**Phase 0: library seams and the shared interface. No behaviour change. In progress.** Reverts by
 `git revert`.
 
 - `kbf_server::start`/`ServerHandle` and `kbf_node::start`/`NodeHandle`; both mains thin;
   `dispatch_helpers()`; existing tests pass unchanged.
 - `DataPlane: Cas` with the segment-range read; `RemoteDataPlane` wraps `Transfers`; the
   daemon is generic over it. `Owner` in `Connections` and the handlers (section 4).
-- `--reserve-cpus` and `--colocated-server-cpus` in `kbf-server` and `kbf-daemon` with the
-  derived pools and the two cgroup weights; **unset, bit-identical to today** (a test
+- `--reserve-cpus` in `kbf-daemon` (not `kbf-server`) with the derived pools and the two
+  cgroup weights; **unset, bit-identical to today** (a test
   proves it), so reported `cpus` does not change until a deploy sets it.
 - The conformance suite, for `RemoteDataPlane` only. The `kbf-all-in-one` crate exists as
   the stub only, if at all.
@@ -597,15 +625,18 @@ does.
 **Preconditions of phase 1 (all must hold):**
 
 - **P1: a durable meta-log with the scheduler's state in it**, and the rollout record in
-  it, running on the target host. Without it a whole-process crash loses the index
+  it, running on the target host. **Being built separately**: a local filesystem blob
+  store with the raft metadata log and no S3, for single-host farms. This design takes
+  the store and log as given, behind the `Cache`/`SegmentsService` handle the local plane
+  already calls, so a different tier does not change `LocalDataPlane`. Without it a whole-process crash loses the index
   (section 7.4).
 - **P2: the worker-cache directory cache and link plans** (`worker-cache.md`) have landed
   and been measured, so M5 shows what is left after the real lever.
 - **P3: #653 to #656** have landed (section 11).
-- **P4: the security table of section 7.1** has been read and accepted for this host by
-  the project owner, and the host has no gate client identity or rollout credential.
+- **P4: the security table of section 7.1: accepted by the project owner (2026-10-15).**
+  Remaining: the host has no gate client identity or rollout credential.
 - **P5: the restart and drain step of `apply.rs`**, and the `set.rs` change of section 9.
-- **P6: the measurement gate of section 11 for phase 1.**
+- **P6: removed.** The owner ruled the measurement gate out (section 11).
 
 **Phase 1: the all-in-one binary with in-process outputs.** `kbf-all-in-one`, the
 `LocalDataPlane` for puts (outputs, stdout, stderr) and gets. `kbf-deploy` shape and the
@@ -620,7 +651,12 @@ measured and reverted alone. The cache keeps its writer, its index and its resta
 Each phase is independently shippable; a later one does not rely on an earlier one's flag.
 No phase changes a message a remote daemon sends.
 
-## 11. The measurement gate
+## 11. Measurements to record (no gate)
+
+The project owner has ruled (2026-10-15) that performance and operational overhead justify
+this work, so **nothing below gates a phase.** The thresholds that were proposals here are
+withdrawn. The list stays so the work reports what it bought, and so a number that comes
+out badly is seen, not hidden.
 
 The PRs in flight that change this exact path: #654 (spool copy on the blocking pool, no
 CRC-32C), #655 (up to four segment uploads at once, hardware CRC), #656 (each record
@@ -632,44 +668,26 @@ farm with variance reported, and names the box (CPU model, cores, RAM, storage).
 ratio is stated against its denominator: against the split pair on the same host, or
 against the target farm; there is no DuckDB analogue, so no external number is quoted.
 
-Order: **M2 first.** If M2 shows Commit is over 70% of upload time, transport is not the
-cost, the M3 in-process arm is not written, and phase 1 is justified by the operational
-case alone, stated as such in its PR.
+Read M2 first: if Commit is over 70% of upload time, transport is not the cost, and the
+PR says the case is operational plus the saved read and hash.
 
 | # | Measurement | Where it comes from |
 |---|---|---|
 | M1 | the `outputs phases` line for the 15k-file output (walk, hash, FindMissing, spool, upload) | #653, new baseline |
 | M2 | server stage timings for that upload: bytes-in, Commit split into hash, tier write, `fdatasync`, `PutStaged` | server upload-path metrics |
-| M3 | `PutRange` throughput over loopback: 16 streams, 4 MiB ranges, TCP+TLS vs a null sink vs an in-process call, **with the hash CPU per 15k-file output on both sides (the daemon's `FindMissing` hash and the server's `VerifiedBlob` hash) charged to the in-process arm** | `kbf-bench` (`connect.rs` exists); the in-process arm is throwaway bench code, built only if M2 allows |
+| M3 | `PutRange` throughput over loopback: 16 streams, 4 MiB ranges, TCP+TLS vs a null sink vs an in-process call, **with the hash CPU per 15k-file output (one pass in all-in-one, plus the flush's verification) counted for both arms** | `kbf-bench` (`connect.rs` exists); the in-process arm is throwaway bench code |
 | M4 | CPU model, `sha_ni`, single-core SHA-256 and CRC-32C throughput on build hosts and storage nodes | one-off |
 | M5 | typical action, **broken into**: link syscalls (count, time), `chown-dirs` time, Directory fetch count, run, outputs; node-cache hit rate; bytes filled per action. Taken with and without the directory cache and link plans | `worker-cache.md` metrics |
 | M6 | **the farm's CPU as a percentage of host CPU** (server and daemon, mean and p95) and **compile wall time (p50, p95)** over a loaded hour, with and without `--reserve-cpus` at the proposed `R`. This is what a reserve costs the compiles | process metrics, cgroup `cpu.stat`, action timings |
 | M7 | memory high-water of the server and daemon on a loaded hour, plus the compile working set of the largest lease: the figures for the formula of 7.2 | cgroup |
 | M8 | cold-miss fills: count, bytes and time per hour on the one-node farm | cache fill metrics |
 
-**What justifies each phase** (thresholds are proposals for the project owner to set
-before the run, so the result cannot choose its own bar):
-
-- **Phase 0:** none. It is a refactor that makes the later choices cheap, fixes the weights
-  of section 6, and makes the flag worth having. Do it.
-- **Phase 1**, after P1 to P5, needs at least one of: M3 shows TLS+framing+copy, **net of
-  the second hash, is at least 25% of fleet action wall time spent in uploads** (not of one
-  rare action's upload; M1's 6.0 of 18.3 s is for an action that few actions resemble);
-  M6 shows the server's TLS and protobuf CPU is at least one core during a loaded hour on a
-  one-node farm; or the operational case (one unit, one CPU flag) is wanted for its own
-  sake on the one-node farm. **If M5 shows links, ownership passes and compile time are
-  over about 80% of the typical action, the operational case is the only one, and the
-  status line and the PR say so.** If M3 shows the second hash costs more than the
-  in-process plane saves, the phase closes.
-- **Phase 2a** needs M8 to show cold fills over a threshold of node time (proposal: 10% of
-  a host's action wall time). With 96% hits it probably does not.
-- **Phase 2b** needs M7 and disk accounting to show a host that runs out of one budget
-  while the other is slack by at least 5% of the disk, repeatedly.
-
-If M1 after the PRs is under about 3 s and M5's typical action is dominated by links and
-ownership passes, close phases 1 and 2 as "not worth it" and take the topology-independent
-items: spool-less upload planning, the walk (7.8 s), and the directory cache and link
-plans of `worker-cache.md`.
+**Phases.** Phase 0 is a refactor and is in progress. Phase 1 proceeds when P1, P2, P3,
+P4's remaining condition and P5 hold. Phase 2a and 2b stay behind their own flag values
+(`fill`, `budget`) so each is measured and reverted alone; M8 and M7 are the numbers to
+read for them, and a phase whose number shows no gain is reverted by its flag, not argued
+for. The M3 in-process arm is no longer conditional on M2, and its "second hash" charge is
+gone with the second hash (section 2).
 
 ## 12. Rejected alternatives
 
@@ -700,16 +718,18 @@ decision rests on the secrets table.
 
 ## 13. Open questions
 
-1. **For the project owner: the thresholds in section 11**, set before the run.
-   Recommendation: as written.
-2. **Accept the secrets table of section 7.1 for the one-node farm (P4)?** An escape from
-   a build container then yields the S3 key, the API token, the server's TLS key and the
-   state directories. Recommendation: yes for first-party work on a node with no Mac
-   gate identity, only after P1; no for anything else.
-3. **Set `--reserve-cpus` on the one-node farm at all?** Setting it lowers bookable CPUs by
-   `R` (section 6). Recommendation: decide from M6 (farm CPU as a share of the host, and
-   the compile wall time with and without); if the farm uses under a core at p95, reserve
-   that and no more.
-4. **Which of the two directions comes first for P1**: the raft meta-log accepting the
-   scheduler's state (`storage-node.md`'s planned flags), or a separate durable store?
-   Recommendation: the planned raft log, since the rollout record needs it anyway.
+Decided by the project owner (2026-10-15):
+
+1. **Thresholds of section 11:** withdrawn; no measurement gate.
+2. **The secrets table of section 7.1 for the one-node farm: accepted.** An escape from a
+   build container yields the S3 key (or, with the local store, the tier directory), the
+   API token, the server's TLS key and the state directories. Still refused for a host with
+   a gate client identity or rollout credential, and for untrusted or multi-tenant work.
+3. **P1, the durable server log, is built separately** (a local filesystem blob store and
+   the raft metadata log, no S3, for single-host farms) and is a precondition of phase 1.
+
+Open:
+
+4. **Set `--reserve-cpus` on the one-node farm, and to what?** Setting it lowers bookable
+   CPUs by `R` (section 6). Recommendation: set it from M6 once recorded; if the farm uses
+   under a core at p95, reserve that and no more.
