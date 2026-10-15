@@ -115,6 +115,20 @@ pub struct Farm<M, O> {
     state: Mutex<State>,
 }
 
+/// Books the memory `table` names for `submission`'s category, if it carries one the
+/// table names: no more than the largest node `sched` has that could run it, and never
+/// less than it books already (`docs/platform-properties.md#memory-by-category`). Not
+/// generic, so every [`Farm`] shares one copy of it.
+fn book_category(sched: &Scheduler, table: &MemoryByCategory, submission: &mut Submission) {
+    let ask = submission.category.as_deref().and_then(|c| table.get(c));
+    if let Some(ask) = ask {
+        let request = &mut submission.request;
+        let largest = sched.largest_memory(request);
+        let memory = &mut request.resources.memory_bytes;
+        *memory = kbf_sched::category_booking(*memory, ask, largest);
+    }
+}
+
 /// An operator action named a node that never registered.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 #[error("no node {0} has registered")]
@@ -669,16 +683,7 @@ impl<M: MetaLog, O: ObjectStore + 'static> Dispatch for Farm<M, O> {
     fn submit(&self, mut submission: Submission) -> Result<Ticket, Status> {
         let now = self.now();
         let mut state = self.lock();
-        let ask = submission
-            .category
-            .as_deref()
-            .and_then(|c| self.memory_by_category.get(c));
-        if let Some(ask) = ask {
-            let request = &mut submission.request;
-            let largest = state.sched.largest_memory(request);
-            let memory = &mut request.resources.memory_bytes;
-            *memory = kbf_sched::category_booking(*memory, ask, largest);
-        }
+        book_category(&state.sched, &self.memory_by_category, &mut submission);
         let action = submission.request.key.action;
         let instance = submission.request.key.instance.clone();
         let waiter = state.machine.submit(Waiter {
