@@ -14,7 +14,15 @@ name = "kbf-fake-podman"
 path = "tests/bin/fake_podman.rs"
 test = false
 
+# The tests' stand-in `crun` for the OCI backend (tests/support/fake_oci.rs links it).
+# Not shipped either.
+[[bin]]
+name = "kbf-fake-crun"
+path = "tests/bin/fake_crun.rs"
+test = false
+
 [dependencies]
+async-trait.workspace = true
 base64.workspace = true
 clap.workspace = true
 futures.workspace = true
@@ -22,8 +30,10 @@ hex.workspace = true
 kbf-daemon.workspace = true
 kbf-proto.workspace = true
 kbf-types.workspace = true
+oci-spec.workspace = true
 prost.workspace = true
 prost-types.workspace = true
+runc.workspace = true
 rustix = { workspace = true, features = ["fs", "process"] }
 serde_json.workspace = true
 sha2.workspace = true

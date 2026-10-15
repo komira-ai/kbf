@@ -72,6 +72,20 @@ impl ContainerLimits {
     };
 }
 
+/// A host directory mounted read-only inside the action's input root, at `path` below it:
+/// the interface through which a shared tree reaches a runtime. The mount point must
+/// exist in the input root as an empty directory, so no symlink can sit at it.
+///
+/// Shaped as `kbf_daemon::trees::SharedMount` (the tree store's, in its own change), which
+/// replaces this when that lands.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SharedMount {
+    /// Where it appears, below [`EXEC_ROOT`]: no leading `/`, no `..`.
+    pub path: String,
+    /// The directory on the host.
+    pub source: PathBuf,
+}
+
 /// The container to create for one action.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ContainerSpec {
@@ -81,6 +95,10 @@ pub(crate) struct ContainerSpec {
     pub owner: String,
     /// `<repo>@sha256:<digest>`.
     pub image: String,
+    /// `sha256:<hex>`: the image's digest alone.
+    pub image_digest: String,
+    /// The lease's scratch directory.
+    pub dir: PathBuf,
     /// The lease cgroup, as `--cgroup-parent` names it.
     pub cgroup_parent: String,
     /// The input root on the host: the overlay's read-only lower layer.
@@ -214,6 +232,11 @@ fn failure(verb: &str, output: &std::process::Output) -> String {
 impl Podman {
     pub(crate) fn new(program: PathBuf) -> Self {
         Self { program }
+    }
+
+    /// The `podman` program.
+    pub(crate) fn program(&self) -> &Path {
+        &self.program
     }
 
     fn command(&self) -> Command {
@@ -434,6 +457,8 @@ pub(crate) mod tests {
             name: "kbf-lease-1-2".to_owned(),
             owner: "node-1".to_owned(),
             image: format!("docker.io/library/busybox@sha256:{}", "a".repeat(64)),
+            image_digest: format!("sha256:{}", "a".repeat(64)),
+            dir: PathBuf::from("/scratch/kbf-lease-1-2"),
             cgroup_parent: "/kbf.slice/actions/kbf-lease-1-2".to_owned(),
             input_root: PathBuf::from("/scratch/kbf-lease-1-2/root"),
             upper: PathBuf::from("/scratch/kbf-lease-1-2/upper"),
