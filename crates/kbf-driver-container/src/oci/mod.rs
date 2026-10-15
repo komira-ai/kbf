@@ -215,6 +215,10 @@ pub(crate) struct Oci {
     helper_root: PathBuf,
     images: image::Images,
     helpers: AtomicU64,
+    /// The cgroup helper containers are made under: the lease cgroups' parent, so what a
+    /// helper uses is bounded by the node's actions budget and `crun` makes (and kills,
+    /// on its removal) no cgroup of its own choosing.
+    cgroup_parent: String,
 }
 
 impl Oci {
@@ -229,8 +233,15 @@ impl Oci {
         config: &OciConfig,
         scratch: &Path,
         podman: Podman,
+        cgroup_parent: &str,
     ) -> Result<Arc<Self>, OciError> {
-        Self::on(config, scratch, podman, std::env::consts::ARCH)
+        Self::on(
+            config,
+            scratch,
+            podman,
+            cgroup_parent,
+            std::env::consts::ARCH,
+        )
     }
 
     /// [`Oci::new`] on a machine of architecture `rust_arch` (`std::env::consts::ARCH`).
@@ -238,6 +249,7 @@ impl Oci {
         config: &OciConfig,
         scratch: &Path,
         podman: Podman,
+        cgroup_parent: &str,
         rust_arch: &str,
     ) -> Result<Arc<Self>, OciError> {
         let ids = crate::subids::daemon_ids(&config.id_files)?;
@@ -264,6 +276,7 @@ impl Oci {
             helper_root,
             images: image::Images::new(scratch.join("oci-images")),
             helpers: AtomicU64::new(0),
+            cgroup_parent: cgroup_parent.to_owned(),
         });
         let leftovers = oci.images.sweep(&oci);
         leftovers.map_err(OciError::Prepare)?;
@@ -279,16 +292,19 @@ impl Oci {
         self.scratch.join(name)
     }
 
-    /// Writes the helper bundle for `job` under `dir` and returns its path.
+    /// Writes the helper bundle for `job`, to run as the container `id`, under `dir` and
+    /// returns its path.
     fn helper_bundle(
         &self,
         dir: &Path,
         mapping: Mapping,
+        id: &str,
         job: &helper::Job,
     ) -> Result<PathBuf, JobError> {
         let bundle = dir.join(format!("helper-{}", self.next()));
         at(&bundle, std::fs::create_dir_all(&bundle))?;
-        let config = helper::config(&self.helper_root, &self.ids, mapping, job);
+        let cgroup = format!("{}/{id}", self.cgroup_parent);
+        let config = helper::config(&self.helper_root, &self.ids, mapping, &cgroup, job);
         let file = bundle.join("config.json");
         at(&file, std::fs::write(&file, spec::render(&config)?))?;
         Ok(bundle)
@@ -321,9 +337,9 @@ impl Oci {
         job: &helper::Job,
     ) -> Result<(), JobError> {
         at(dir, std::fs::create_dir_all(dir))?;
-        let bundle = self.helper_bundle(dir, mapping, job)?;
-        let state = dir.join("helper-state");
         let id = self.helper_id(what);
+        let bundle = self.helper_bundle(dir, mapping, &id, job)?;
+        let state = dir.join("helper-state");
         let result = self.crun.run_helper(&state, &id, &bundle).await;
         let _ = std::fs::remove_dir_all(&bundle);
         Ok(result?)
@@ -360,11 +376,11 @@ impl Oci {
     pub(crate) fn remove_dir_blocking(&self, dir: &Path) -> Result<(), JobError> {
         let work = self.job_dir("rm");
         at(&work, std::fs::create_dir_all(&work))?;
-        let bundle = self.helper_bundle(&work, Mapping::Setup, &helper::remove_job(dir))?;
+        let id = self.helper_id("rm");
+        let job = helper::remove_job(dir);
+        let bundle = self.helper_bundle(&work, Mapping::Setup, &id, &job)?;
         let state = work.join("state");
-        let ran = self
-            .crun
-            .run_helper_blocking(&state, &self.helper_id("rm"), &bundle);
+        let ran = self.crun.run_helper_blocking(&state, &id, &bundle);
         let _ = std::fs::remove_dir_all(&work);
         ran?;
         at(dir, std::fs::remove_dir(dir))

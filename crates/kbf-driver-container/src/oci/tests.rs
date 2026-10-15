@@ -49,7 +49,7 @@ fn podman() -> Podman {
 }
 
 fn start(config: &OciConfig, scratch: &Path) -> Result<Arc<Oci>, OciError> {
-    Oci::on(config, scratch, podman(), "x86_64")
+    Oci::on(config, scratch, podman(), "/actions", "x86_64")
 }
 
 /// Catches an error that does not name the path it was about, and one that is lost.
@@ -82,7 +82,7 @@ fn the_backend_refuses_a_node_that_cannot_run_it() {
     let good = config(&dir, true);
     assert_eq!(started(&good, &dir.join("scratch")), "started");
 
-    let on = Oci::on(&good, &dir.join("s1"), podman(), "riscv64");
+    let on = Oci::on(&good, &dir.join("s1"), podman(), "/actions", "riscv64");
     let refused = on.err().map(|e| e.to_string());
     let says = "this machine's architecture (riscv64) has no seccomp profile";
     assert_eq!(refused.as_deref(), Some(says));
@@ -247,7 +247,7 @@ fn a_helper_runs_one_program_in_the_namespace_it_is_given() {
     };
     let root = Path::new("/scratch/oci-helper");
     let render = |mapping: Mapping, job: &helper::Job| -> serde_json::Value {
-        let config = helper::config(root, &ids, mapping, job);
+        let config = helper::config(root, &ids, mapping, "/actions/kbf-helper-x", job);
         serde_json::to_value(config).expect("json")
     };
     let give = helper::give_job(
@@ -276,7 +276,9 @@ fn a_helper_runs_one_program_in_the_namespace_it_is_given() {
     for absent in ["hostname", "annotations"] {
         assert!(config.get(absent).is_none(), "{absent}");
     }
-    for absent in ["resources", "cgroupsPath", "seccomp"] {
+    // Its cgroup is named, under the actions' parent; crun makes none of its own.
+    assert_eq!(config["linux"]["cgroupsPath"], "/actions/kbf-helper-x");
+    for absent in ["resources", "seccomp"] {
         assert!(config["linux"].get(absent).is_none(), "{absent}");
     }
     // Every capability set is the given one or empty, as `capset` needs.

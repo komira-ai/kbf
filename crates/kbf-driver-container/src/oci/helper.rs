@@ -188,7 +188,13 @@ fn bind_at(source: &Path, destination: &str, writable: bool) -> oci_spec::runtim
 
 /// The `config.json` of a helper running `job` over `rootfs` (see [`prepare_rootfs`]),
 /// in the user namespace `mapping` names.
-pub(crate) fn config(rootfs: &Path, ids: &DaemonIds, mapping: Mapping, job: &Job) -> Spec {
+pub(crate) fn config(
+    rootfs: &Path,
+    ids: &DaemonIds,
+    mapping: Mapping,
+    cgroup: &str,
+    job: &Job,
+) -> Spec {
     let mut mounts = vec![
         filesystem(
             "/dev",
@@ -235,6 +241,7 @@ pub(crate) fn config(rootfs: &Path, ids: &DaemonIds, mapping: Mapping, job: &Job
             .uid_mappings(uids)
             .gid_mappings(gids)
             .namespaces(namespaces.to_vec())
+            .cgroups_path(PathBuf::from(cgroup))
             .masked_paths(Vec::<String>::new())
             .readonly_paths(Vec::<String>::new())
             .build(),

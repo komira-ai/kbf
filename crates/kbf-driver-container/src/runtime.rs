@@ -268,7 +268,7 @@ impl<C: Cas> PodmanRuntime<C> {
         let engine = match config.container_runtime {
             ContainerRuntime::Podman => Engine::Podman(Arc::new(PodmanBackend::new(podman))),
             ContainerRuntime::Oci => Engine::Oci(
-                Oci::new(&config.oci, &config.scratch, podman)
+                Oci::new(&config.oci, &config.scratch, podman, &config.cgroup_parent)
                     .map_err(|e| StartError::Oci(e.to_string()))?,
             ),
         };

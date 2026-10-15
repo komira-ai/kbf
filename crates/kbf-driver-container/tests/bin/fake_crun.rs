@@ -6,8 +6,8 @@
 //! Real `crun` behaviour is tested in `tests/oci_crun.rs`.
 //!
 //! It answers three verbs, after the global options `--root`, `--log`, `--log-format`:
-//! - `run --bundle <dir> <id>`: an action (the config names a `linux.cgroupsPath`) or a
-//!   helper container (it names none). The exit status is the action's (`128 + n` for
+//! - `run --bundle <dir> <id>`: an action (the config has a pid namespace) or a
+//!   helper container (it has a user and a mount namespace only). The exit status is the action's (`128 + n` for
 //!   a signal), as `crun run`'s is. A helper gives directories to an owner, removes the
 //!   contents of one, or unpacks an image; its program is recognised by `process.args[0]`
 //!   as the driver writes it and its work performed on the host directories its
@@ -265,7 +265,15 @@ impl Fake {
             return refuse("fake crun: run: config.json is not JSON", 1);
         };
         let id = call.rest.last().cloned().unwrap_or_default();
-        if config["linux"]["cgroupsPath"].is_string() {
+        // An action has its own pid and network namespaces; a helper has a user and a
+        // mount namespace only.
+        let namespaces: Vec<&str> = config["linux"]["namespaces"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|n| n["type"].as_str())
+            .collect();
+        if namespaces.contains(&"pid") {
             self.append("calls", b"run");
             self.write("config.json", text.as_bytes());
             self.action(call, &config, &id)
