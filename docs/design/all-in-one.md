@@ -8,8 +8,10 @@ it.** The owner's rulings (2026-10-15), each recorded where it applies:
 - **There is no measurement gate.** The owner has ruled that performance and operational
   overhead justify the work; section 11 is kept as the list of numbers to record while
   building, not as a bar a phase must clear.
-- In all-in-one each output file is **read once, hashed and written to the tier in the same
-  pass**; there is no second hash (sections 2 and 4).
+- In all-in-one the walk **reads and hashes each output file once**; for a blob
+  `FindMissing` reports missing, the same buffer is handed to the server as `Bytes` (no
+  spool copy), and the server's flush writes it to the tier later. There is no second
+  hash on the upload path (sections 2 and 4).
 - The server **trusts the daemon's digest at Commit and verifies in the background flush**
   (merged in #656). All-in-one uses that path unchanged.
 - `--reserve-cpus` exists on the daemon and all-in-one only. The server takes every CPU
@@ -91,13 +93,17 @@ The only effects on compiles are second-order: who gets CPU and memory under con
 CPU or fewer is a number to measure (M6, section 11), not an assumption: the farm's own
 processes take CPU from compiles in both shapes, and a reserve books it explicitly.
 
-**The in-process plane hashes once.** In all-in-one the daemon reads each output file
-once, hashes it and writes it to the tier in the same pass; the digest it computed there
-is the digest for `FindMissing` and for Commit. The server trusts that digest at Commit
-and verifies it in the background flush, which hashes each record before the PUT and drops
-one that fails (#656, on `main`). So a 307 MB output is read once and hashed once on the
-upload path, plus the flush's verification off the critical path; the remote plane is
-unchanged. What in-process saves (TLS, protobuf encode, one kernel copy, the second read
+**The in-process plane hashes once on the upload path.** In all-in-one the walk reads each
+output file once and hashes it; that digest is what `FindMissing` is asked and what Commit
+carries. The digest has to exist before `FindMissing` can run, so the tier write is a
+later step, not the same pass: for a blob reported missing, the walk's buffer is passed to
+the server as `Bytes` (no spool copy) and the server's flush writes it to the tier. A file
+larger than the walk's per-file memory bound is not held; it is read a second time from
+the file when it is reported missing (the bound is set in the phase that builds this and
+is not fixed here). The server trusts the digest at Commit and verifies it in the
+background flush, which hashes each record before the PUT and drops one that fails (#656,
+on `main`). So a 307 MB output is hashed once on the upload path and once more by the
+flush's verification off the critical path; the remote plane is unchanged. What in-process saves (TLS, protobuf encode, one kernel copy, the second read
 and hash) is not offset by a second hash.
 
 So the case for all-in-one is mainly operational: **one binary to deploy and supervise on
@@ -170,9 +176,9 @@ that method on a small `DataPlane: Cas` trait so nothing in the daemon names `Tr
 |---|---|---|
 | Bytes move | `Transfers` over one mutual-TLS HTTP/2 connection to the worker listener | function calls into the server's `Cache` and `SegmentsService` in the same process |
 | Authentication | the daemon's certificate, admitted per call by `identity.rs` | none on the wire; the daemon is constructed with the server's handle. The deny list still applies: each call is admitted for the daemon's own node id through the same `admit_call` check, so cordon and deny edits refuse the next call as they do today |
-| Integrity | the server trusts the daemon's digest at Commit and verifies it in the background flush, which hashes each record before the tier PUT and drops one that fails (#656) | **the same path.** The daemon reads, hashes and writes each output file once; the flush verifies as for a remote daemon. There is no extra in-process hash and no flag that skips the flush's check |
+| Integrity | the server trusts the daemon's digest at Commit and verifies it in the background flush, which hashes each record before the tier PUT and drops one that fails (#656) | **the same path.** The walk reads and hashes each output file once and hands the buffer over as `Bytes`; the flush writes it to the tier and verifies as for a remote daemon. There is no extra in-process hash and no flag that skips the flush's check |
 | Upload ownership | `Connections` keyed by the peer `SocketAddr` | keyed by `Owner::Local(PlaneId)`, one fresh id per `LocalDataPlane` (idle timeout, drop-on-close and admission release hang on it as for TCP) |
-| Copies | file, spool read, protobuf encode, TLS encrypt, kernel, decrypt, decode, into the server's buffer | spool read into the server's buffer; no encode, no TLS, no kernel hop |
+| Copies | file, spool read, protobuf encode, TLS encrypt, kernel, decrypt, decode, into the server's buffer | the walk's buffer is passed as `Bytes` (a second file read only above the walk's memory bound); no spool copy, no encode, no TLS, no kernel hop |
 
 **The control plane in all-in-one is still mutual TLS.** The daemon half dials the
 server half's listener over loopback with a node certificate issued the way any node's is,
@@ -335,12 +341,19 @@ the converged units' current thread counts, but they are not defaults.
 
 **Converged split (two units, one host).** The server unit has no reserve flag, so the
 daemon cannot derive its share as `reserve - server's R`. On a converged host the daemon's
-`--reserve-cpus` is the host-wide figure for the farm's own work, server included: the
-daemon reports `cpus = host - R`, and the server, unbounded, competes inside that reserve
-through the kernel weights (section 6, item 3). `--colocated-server-cpus` is dropped.
+`--reserve-cpus` is the figure the daemon subtracts from the CPUs it reports and books:
+the daemon reports `cpus = host - R`. **What `R` bounds, plainly:** it caps what builds
+may book. It does not bound the server. Item 3's weights are written only on the daemon's
+`supervisor/` and `actions/` children, and on a converged host the server is a separate
+systemd unit, a sibling of the daemon's unit; the only kernel bound on it is that unit's
+`CPUWeight`, which `kbf-deploy/src/linux/check.rs` requires to be above the daemon's. The
+server uses every CPU under tokio's defaults and can take CPU from builds beyond `R`. In
+all-in-one (one process) `R` does cover both halves, because the server's pools run inside
+the same process's reserve. `--colocated-server-cpus` is dropped.
 `check-units` asserts in the converged shape that the daemon's `--reserve-cpus` is set and
-below the host's CPUs. Whether the server's unbounded use can exceed `R` under load is
-what M6 records; if it does, the remedy is a larger `R`, not a server flag.
+below the host's CPUs. How far the server exceeds `R` under load is what M6 records.
+Open question for the project owner (section 13): on a converged two-process host, is that
+acceptable, or does the server need a bound of its own? Not decided here; no flag is added.
 
 **Overrides.** `--hash-threads`, `--async-threads` and `--blocking-threads` win over the
 derived values; the start line prints what was derived and overridden (`reserve=4 async=2
@@ -658,22 +671,24 @@ this work, so **nothing below gates a phase.** The thresholds that were proposal
 withdrawn. The list stays so the work reports what it bought, and so a number that comes
 out badly is seen, not hidden.
 
-The PRs in flight that change this exact path: #654 (spool copy on the blocking pool, no
-CRC-32C), #655 (up to four segment uploads at once, hardware CRC), #656 (each record
-hashed as its `PutRange` arrives, so Commit hashes nothing), #653 (the `outputs phases`
-line), and the thread flags proposed alongside. Once these **and the worker-cache
+Merged: #656 (tier uploads trust the daemon's digests; the flusher hashes each record
+before the PUT, and the no-tier path hashes before its PUT). The PRs in flight that change
+this exact path: #654 (spool copy on the blocking pool, no CRC-32C), #655 (up to four
+segment uploads at once, hardware CRC), #653 (the `outputs phases` line), and the thread
+flags proposed alongside. Once these **and the worker-cache
 directory cache and link plans** land, measure on the one-node farm and on a split pair of
 hosts, same toolchain tree and same action. **Each number is at least five runs on the
 farm with variance reported, and names the box (CPU model, cores, RAM, storage).** Each
 ratio is stated against its denominator: against the split pair on the same host, or
 against the target farm; there is no DuckDB analogue, so no external number is quoted.
 
-Read M2 first: if Commit is over 70% of upload time, transport is not the cost, and the
-PR says the case is operational plus the saved read and hash.
+Record M2 first: if Commit turns out to be most of the upload time, that is a recorded
+observation that transport is not the cost, and the PR says the case is operational plus
+the saved read and hash.
 
 | # | Measurement | Where it comes from |
 |---|---|---|
-| M1 | the `outputs phases` line for the 15k-file output (walk, hash, FindMissing, spool, upload) | #653, new baseline |
+| M1 | the `outputs phases` line for the 15k-file output (walk, hash, FindMissing, spool or buffer handoff, upload) | #653, new baseline |
 | M2 | server stage timings for that upload: bytes-in, Commit split into hash, tier write, `fdatasync`, `PutStaged` | server upload-path metrics |
 | M3 | `PutRange` throughput over loopback: 16 streams, 4 MiB ranges, TCP+TLS vs a null sink vs an in-process call, **with the hash CPU per 15k-file output (one pass in all-in-one, plus the flush's verification) counted for both arms** | `kbf-bench` (`connect.rs` exists); the in-process arm is throwaway bench code |
 | M4 | CPU model, `sha_ni`, single-core SHA-256 and CRC-32C throughput on build hosts and storage nodes | one-off |
@@ -684,9 +699,9 @@ PR says the case is operational plus the saved read and hash.
 
 **Phases.** Phase 0 is a refactor and is in progress. Phase 1 proceeds when P1, P2, P3,
 P4's remaining condition and P5 hold. Phase 2a and 2b stay behind their own flag values
-(`fill`, `budget`) so each is measured and reverted alone; M8 and M7 are the numbers to
-read for them, and a phase whose number shows no gain is reverted by its flag, not argued
-for. The M3 in-process arm is no longer conditional on M2, and its "second hash" charge is
+(`fill`, `budget`) so each is measured and can be reverted alone; M8 and M7 are the
+numbers to read for them, and whether a phase whose number shows no gain stays is the
+owner's call (there is no gate). The M3 in-process arm is no longer conditional on M2, and its "second hash" charge is
 gone with the second hash (section 2).
 
 ## 12. Rejected alternatives
@@ -733,3 +748,8 @@ Open:
 4. **Set `--reserve-cpus` on the one-node farm, and to what?** Setting it lowers bookable
    CPUs by `R` (section 6). Recommendation: set it from M6 once recorded; if the farm uses
    under a core at p95, reserve that and no more.
+5. **Does a converged two-process host need a server-side CPU bound?** The daemon's `R`
+   caps what builds may book and does not bound the server, which is a sibling systemd
+   unit bounded only by its `CPUWeight` (section 6). In all-in-one `R` covers both halves.
+   Recommendation: accept it for the one-node farm, which runs all-in-one; record the
+   server's CPU in M6 on any converged host, and decide on a bound only if it exceeds `R`.
