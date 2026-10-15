@@ -169,6 +169,12 @@ pub(crate) fn crun_words(log: &str) -> String {
         .join("; ")
 }
 
+/// What `podman start` wrote to `stderr` (its own words: the container did not run),
+/// at most [`SAID_MAX`] bytes of it.
+pub(crate) async fn said(stderr: &Path) -> std::io::Result<String> {
+    Said::podman(stderr).read().await
+}
+
 /// Whether the report is crun's exec of the program failing with `ETXTBSY`
 /// (`exec container process `<program>`: Text file busy`): a file still open for
 /// writing somewhere when it was executed. With the input cache that can be a fill's
