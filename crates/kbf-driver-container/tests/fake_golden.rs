@@ -220,6 +220,10 @@ fn calls(dir: &Path) -> Vec<Call> {
             &[("state/chown-fails", None), ("state/busy-once", Some(""))],
             &["start", "--attach", "kbf-lease-1-1"],
         ),
+        call(
+            &[("state/chown-sleeps", Some("0:0"))],
+            &["unshare", "chown", "-hR", "0:0", "--", &upper],
+        ),
         call(&[("state/vanish-after-create", Some(""))], &create),
     ]
 }

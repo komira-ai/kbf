@@ -1,16 +1,16 @@
-//! Memory kills over a seed sweep: three Linux nodes of 4, 8 and 16 GiB that always
+//! Memory kills over a seed sweep: three Linux nodes of 4, 8 and 64 GiB that always
 //! heartbeat, a dozen action keys each with a hidden memory need (some past the largest
-//! node), submitted at random at 1 GiB, and runs that end at random: killed at their
+//! node), submitted at random at 4 GiB (the front's first rung), and runs that end at random: killed at their
 //! own limit when they booked less than they need, else killed by a busy node at
 //! random, else completed. The control log is in process: a `Commit` is fed straight
 //! back.
 //!
 //! The checks, after every input of every seed, against a model of the rules:
 //! - an operation's first run books its ask raised to its key's floor at submission;
-//! - a run after an own-limit kill books the doubled ask, in whole GiB, capped at
-//!   16 GiB; a run after a busy node's kill books the same as the killed run;
+//! - a run after an own-limit kill books the next rung of 4, 16, 32 GiB, then the
+//!   whole 64 GiB host; a run after a busy node's kill books the same as the killed run;
 //! - an operation finishes with the action's out-of-memory error only after a kill at
-//!   16 GiB, with the farm's busy-node error only after `1 + FARM_RERUNS` such kills,
+//!   64 GiB, with the farm's busy-node error only after `1 + FARM_RERUNS` such kills,
 //!   and completed only at a booking it needs; it never runs more often than its
 //!   ladder plus the busy-node reruns;
 //! - the scheduler's floor of each key equals the largest ask the model raised for it
@@ -31,18 +31,28 @@ use kbf_types::{
 
 const SEEDS: u64 = 64;
 const GIB: u64 = 1 << 30;
-const NODES: [(&str, u64); 3] = [("n4", 4), ("n8", 8), ("n16", 16)];
-const CAP: u64 = 16 * GIB;
+const NODES: [(&str, u64); 3] = [("n4", 4), ("n8", 8), ("n64", 64)];
+const CAP: u64 = 64 * GIB;
+/// The ladder's rungs below a whole host, in GiB, written out here.
+const RUNGS: [u64; 3] = [4, 16, 32];
+/// What a submission books: the first rung.
+const FIRST: u64 = 4 * GIB;
 const KEYS: u8 = 12;
 const ACTIVE_UNTIL: u64 = 600;
 const END: u64 = 1_500;
 
 /// The model's rung after a kill at `booked`, worked out here rather than by the
-/// scheduler's own `raised`, so a wrong step there cannot pass by agreeing with
-/// itself: every booking in this world is whole GiB, so twice it, at most the cap;
-/// none at the cap.
+/// scheduler's own ladder, so a wrong step there cannot pass by agreeing with itself:
+/// the first of [`RUNGS`] above `booked` and below the cap, else the cap (a whole
+/// host); none at the cap.
 fn rung(booked: u64) -> Option<u64> {
-    (booked < CAP).then(|| (2 * booked).min(CAP))
+    (booked < CAP).then(|| {
+        RUNGS
+            .iter()
+            .map(|g| g * GIB)
+            .find(|&r| r > booked && r < CAP)
+            .unwrap_or(CAP)
+    })
 }
 
 fn key(n: u8) -> ActionKey {
@@ -88,7 +98,7 @@ struct World {
 impl World {
     fn new(seed: u64) -> Self {
         let mut rng = SimRng::from_seed(seed);
-        let need = (0..KEYS).map(|_| rng.between(1, 20) * GIB).collect();
+        let need = (0..KEYS).map(|_| rng.between(1, 70) * GIB).collect();
         let mut w = Self {
             sched: Scheduler::new(1),
             rng,
@@ -194,8 +204,8 @@ impl World {
             }
             other => panic!("{id}: {other:?}"),
         };
-        // 1 GiB doubles to the 16 GiB cap in four rungs.
-        let most = 1 + 4 + usize::try_from(FARM_RERUNS).unwrap();
+        // 4 GiB climbs 16, 32 and the 64 GiB host: three reruns.
+        let most = 1 + 3 + usize::try_from(FARM_RERUNS).unwrap();
         assert!(op.runs.len() <= most, "{id} ran {} times", op.runs.len());
         *self.seen.entry(seen).or_default() += 1;
         self.in_flight.retain(|_, v| *v != id);
@@ -223,7 +233,7 @@ impl World {
         if !self.in_flight.contains_key(&n) {
             let id = OperationId(self.next_op);
             self.next_op += 1;
-            let first = self.floor.get(&n).copied().unwrap_or(0).max(GIB);
+            let first = self.floor.get(&n).copied().unwrap_or(0).max(FIRST);
             let op = Op {
                 key: n,
                 first,
@@ -236,7 +246,7 @@ impl World {
             key: key(n),
             qos: Qos::Ci,
             kind: LeaseKind::Action,
-            resources: Resources::new(1_000, GIB),
+            resources: Resources::new(1_000, FIRST),
             hermetic: true,
             do_not_cache: false,
             needs: kbf_caps::Request::default(),
@@ -302,8 +312,8 @@ fn run(seed: u64) -> World {
     w
 }
 
-/// Catches, over many interleavings: a ladder that does not double or passes the
-/// largest node, a busy node's kill that raises the ask or a floor, a floor not
+/// Catches, over many interleavings: a ladder that skips or doubles its rungs or
+/// passes the largest node, a busy node's kill that raises the ask or a floor, a floor not
 /// applied to a later submission (or applied to another key), either budget spending
 /// the other, an answer given early, late or twice, and pressure counted against the
 /// wrong node.
@@ -319,7 +329,7 @@ fn memory_kills_follow_the_rules_over_seeds() {
                 "seed {seed}: {id} answered {} times",
                 op.answers
             );
-            if op.first > GIB {
+            if op.first > FIRST {
                 floored += 1;
             }
         }

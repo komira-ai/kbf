@@ -40,8 +40,10 @@
 //! not read yet), and every action is hermetic, so it may be joined (a `networked`
 //! property does not exist yet). The lease kind is the platform's `kbf-lease` value,
 //! `action` when absent; any other value than `action` or `whole_machine` is
-//! INVALID_ARGUMENT. The booking is one core and 1 GiB ([`DEFAULT_RESOURCES`]; learned
-//! sizes come with the estimator), or the whole cores of `kbf-book-cpus` and the GiB of
+//! INVALID_ARGUMENT. The booking of an `action` is one core and 4 GiB by default
+//! ([`DEFAULT_RESOURCES`], the first rung of the scheduler's memory ladder, which the
+//! server sets with [`ExecutionService::with_default_memory`]; learned sizes come with
+//! the estimator), or the whole cores of `kbf-book-cpus` and the GiB of
 //! `kbf-book-mem-gib` where the platform names them: a value that is not a whole number
 //! of at least 1, or that overflows the booking, is INVALID_ARGUMENT, and so is either
 //! key on a `whole_machine` lease (the scheduler books the whole worker for one). The
@@ -66,9 +68,9 @@
 //! `kbf-lease` and `OSFamily`, never ignored. One name sent in two spellings is
 //! INVALID_ARGUMENT.
 
-use std::collections::{BTreeSet, VecDeque};
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use futures::{Stream, stream};
@@ -81,7 +83,7 @@ use kbf_proto::google::rpc::{
 };
 use kbf_proto::reapi::execution_server::Execution;
 use kbf_proto::reapi::{
-    self, Action, Command, Directory, ExecuteOperationMetadata, ExecuteRequest, ExecuteResponse,
+    self, Action, Command, ExecuteOperationMetadata, ExecuteRequest, ExecuteResponse,
     ExecutedActionMetadata, WaitExecutionRequest, execution_stage,
 };
 use kbf_sched::Request;
@@ -89,6 +91,7 @@ use kbf_types::{ActionKey, Digest, LeaseKind, Platform, Qos, Resources};
 use prost::Message;
 use prost_types::Any;
 use tokio::sync::watch;
+use tokio::time::Instant;
 use tonic::{Code, Request as GrpcRequest, Response, Status};
 use tracing::Instrument as _;
 
@@ -97,7 +100,7 @@ use kbf_invocation::{CallKind, ExecuteAnswer};
 
 use crate::cache::{Cache, CacheError};
 use crate::meta_log::MetaLog;
-use crate::metrics::OpenExecute;
+use crate::metrics::{CacheMetrics, OpenExecute};
 use crate::recorder::{ExecuteCall, Recorder, listing};
 use crate::request_metadata::CallMetadata;
 use crate::wire;
@@ -124,9 +127,15 @@ pub const NO_WORKER_REASON: &str = "NO_WORKER_CAN_RUN";
 /// The `ErrorInfo.domain` of kbf's errors.
 pub const ERROR_DOMAIN: &str = "kbf";
 
-/// What v0 books for an action that names no size: one core and 1 GiB, plus the GPUs
-/// its `gpu` property asks for. `kbf-book-cpus` and `kbf-book-mem-gib` replace either.
-pub const DEFAULT_RESOURCES: Resources = Resources::new(1_000, 1 << 30);
+/// What v0 books for an action that names no size: one core and 4 GiB, the first rung
+/// of the scheduler's default memory ladder, plus the GPUs its `gpu` property asks
+/// for. `kbf-book-cpus` and `kbf-book-mem-gib` replace either, and the server's first
+/// rung ([`ExecutionService::with_default_memory`]) replaces the memory.
+pub const DEFAULT_RESOURCES: Resources = Resources::new(1_000, 4 << 30);
+
+/// The least worker a lease of a kind other than `action` may run on: one core and
+/// 1 GiB. A `whole_machine` lease books the whole worker whatever this says.
+const LEAST_WORKER: Resources = Resources::new(1_000, 1 << 30);
 
 /// One execution the front hands to the scheduler.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -233,6 +242,63 @@ pub fn closing() -> (Closer, Closing) {
     (Closer(closer), Closing(closing))
 }
 
+/// An Execute that spends this long before its first stream item is logged at `WARN`.
+pub const PRESUBMIT_WARN: Duration = Duration::from_secs(10);
+
+/// One Execute's time before its first stream item, from the handler's start: observed
+/// in `kbf_execute_presubmit_seconds` when dropped, whether the call answered, failed
+/// or was dropped by its caller (a stalled call the client gave up on is the one the
+/// operator needs to see), and logged at `WARN` when it took [`PRESUBMIT_WARN`] or more.
+struct Presubmit<'a> {
+    metrics: &'a CacheMetrics,
+    started: Instant,
+    /// What the call is about, once its request is read; empty before (a call denied or
+    /// dropped while authorizing).
+    action: String,
+    instance: String,
+    invocation: String,
+    walk: Duration,
+    submit: Duration,
+    dir_reads: u64,
+    _in_flight: crate::metrics::Raised<'a>,
+}
+
+impl<'a> Presubmit<'a> {
+    fn begin(metrics: &'a CacheMetrics) -> Self {
+        Self {
+            metrics,
+            started: Instant::now(),
+            action: String::new(),
+            instance: String::new(),
+            invocation: String::new(),
+            walk: Duration::ZERO,
+            submit: Duration::ZERO,
+            dir_reads: 0,
+            _in_flight: metrics.execute_presubmit_in_flight.raise(),
+        }
+    }
+}
+
+impl Drop for Presubmit<'_> {
+    fn drop(&mut self) {
+        let elapsed = self.started.elapsed();
+        self.metrics.execute_presubmit.observe_duration(elapsed);
+        if elapsed < PRESUBMIT_WARN {
+            return;
+        }
+        tracing::warn!(
+            action = %self.action,
+            instance = %self.instance,
+            invocation = %self.invocation,
+            presubmit_ms = elapsed.as_millis(),
+            walk_ms = self.walk.as_millis(),
+            submit_ms = self.submit.as_millis(),
+            dir_reads = self.dir_reads,
+            "Execute spent {PRESUBMIT_WARN:?} or more before its first operation"
+        );
+    }
+}
+
 /// The `Execution` service over a [`Cache`] and a [`Dispatch`].
 #[derive(Debug)]
 pub struct ExecutionService<M, O, D> {
@@ -241,6 +307,8 @@ pub struct ExecutionService<M, O, D> {
     closing: Closing,
     authorizers: Arc<Authorizers>,
     recorder: Recorder,
+    /// The memory an `action` that names no size books, in bytes.
+    default_memory: u64,
 }
 
 /// The gRPC path of Execute, as calls are logged.
@@ -265,7 +333,16 @@ impl<M, O, D> ExecutionService<M, O, D> {
             closing,
             authorizers,
             recorder: Recorder::off(),
+            default_memory: DEFAULT_RESOURCES.memory_bytes,
         }
+    }
+
+    /// This service, booking `bytes` of memory for an `action` that names no size
+    /// (instead of [`DEFAULT_RESOURCES`]): the first rung of the scheduler's ladder.
+    #[must_use]
+    pub const fn with_default_memory(mut self, bytes: u64) -> Self {
+        self.default_memory = bytes;
+        self
     }
 
     /// This service, each Execute that carries an invocation id sent to `recorder`:
@@ -295,6 +372,7 @@ where
         &self,
         request: GrpcRequest<ExecuteRequest>,
     ) -> Result<Response<OperationStream>, Status> {
+        let mut window = Presubmit::begin(self.cache.metrics());
         let open = self.cache.metrics().execute.execute();
         let caller = kbf_auth::metadata(&request);
         let call = crate::request_metadata::call_metadata(&request);
@@ -307,7 +385,7 @@ where
             caller = %caller.public_display(),
             invocation = call.invocation_display()
         );
-        self.execute_authorized(request, &call, &caller, open)
+        self.execute_authorized(request, &call, &caller, &mut window, open)
             .instrument(span)
             .await
     }
@@ -349,10 +427,16 @@ where
         request: ExecuteRequest,
         metadata: &CallMetadata,
         caller: &AuthenticationMetadata,
+        window: &mut Presubmit<'_>,
         mut open: OpenExecute,
     ) -> Result<Response<OperationStream>, Status> {
         wire::check_digest_function(request.digest_function)?;
         let action = wire::digest(request.action_digest.as_ref())?;
+        window.action = action.to_string();
+        window.instance.clone_from(&request.instance_name);
+        metadata
+            .invocation_display()
+            .clone_into(&mut window.invocation);
         if !request.skip_cache_lookup
             && let Some((stored, result)) = self.cache.action_result(&action).await?
         {
@@ -381,12 +465,18 @@ where
             return Ok(Response::new(Box::pin(stream::iter([Ok(done)]))));
         }
         let instance = request.instance_name;
-        let (mut submission, command) = self.submission(instance.clone(), action).await?;
+        let (mut submission, command) = self.submission(instance.clone(), action, window).await?;
         submission.call =
             ExecuteCall::new(&self.recorder, metadata, caller, &instance, action, command);
+        let submitting = Instant::now();
         open.dispatching();
         let submitted = self.dispatch.submit(submission);
         open.dispatched(submitted.is_ok());
+        window.submit = submitting.elapsed();
+        self.cache
+            .metrics()
+            .execute_submit
+            .observe_duration(window.submit);
         let ticket = submitted?;
         tracing::debug!(%action, operation = %ticket.name, "submitted");
         Ok(Response::new(operations(
@@ -408,6 +498,7 @@ where
         &self,
         instance: String,
         action: Digest,
+        window: &mut Presubmit<'_>,
     ) -> Result<(Submission, Digest), Status> {
         let Some(bytes) = self.read_input(&action).await? else {
             return Err(missing(&[action]));
@@ -428,14 +519,23 @@ where
                 None
             }
         };
-        absent.extend(self.missing_inputs(root).await?);
+        let walking = Instant::now();
+        let walked = self.cache.walk_inputs(root).await;
+        window.walk = walking.elapsed();
+        self.cache
+            .metrics()
+            .execute_walk
+            .observe_duration(window.walk);
+        let walked = walked?;
+        window.dir_reads += walked.dirs_read;
+        absent.extend(walked.absent);
         if !absent.is_empty() {
             return Err(missing(&absent));
         }
 
         let platform = properties(platform(&decoded, command.as_ref()))?;
         let kind = lease_kind(&platform)?;
-        let booked = booking(&platform, kind)?;
+        let booked = booking(&platform, kind, self.default_memory)?;
         let needs = needs(&platform)?;
         let gpus = mac_gpus(kind, gpus(&platform)?, &needs)?;
         device_kind(kind, &needs)?;
@@ -452,36 +552,6 @@ where
             call: None,
         };
         Ok((submission, command_digest))
-    }
-
-    /// Every blob of the input tree under `root` that is not held: directories that
-    /// cannot be read, and files FindMissingBlobs reports.
-    async fn missing_inputs(&self, root: Digest) -> Result<Vec<Digest>, Status> {
-        let mut absent = Vec::new();
-        let mut files = BTreeSet::new();
-        let mut seen = BTreeSet::from([root]);
-        let mut queue = VecDeque::from([root]);
-        while let Some(digest) = queue.pop_front() {
-            let Some(bytes) = self.read_input(&digest).await? else {
-                absent.push(digest);
-                continue;
-            };
-            let directory = Directory::decode(bytes).map_err(|e| {
-                Status::invalid_argument(format!("input directory {digest} does not decode: {e}"))
-            })?;
-            for file in &directory.files {
-                files.insert(wire::digest(file.digest.as_ref())?);
-            }
-            for child in &directory.directories {
-                let child = wire::digest(child.digest.as_ref())?;
-                if seen.insert(child) {
-                    queue.push_back(child);
-                }
-            }
-        }
-        let files: Vec<Digest> = files.into_iter().collect();
-        absent.extend(self.cache.find_missing(&files).await?);
-        Ok(absent)
     }
 
     /// A blob's bytes, or `None` if it is not held. Anything else (unreachable, store
@@ -569,13 +639,18 @@ fn mac_gpus(kind: LeaseKind, gpus: u64, needs: &kbf_caps::Request) -> Result<u64
     Ok(0)
 }
 
-/// What the lease books: [`DEFAULT_RESOURCES`], with `kbf-book-cpus` whole cores and
+/// What the lease books: one core and `default_memory` bytes for an `action` (the least
+/// worker, [`LEAST_WORKER`], for another kind), with `kbf-book-cpus` whole cores and
 /// `kbf-book-mem-gib` GiB in place of the default where the platform names them, or
 /// INVALID_ARGUMENT for a value that is not a whole number of at least 1 in plain
 /// digits ([`starts_plain`]), one too large to book, or either key on a `whole_machine`
 /// lease.
-fn booking(platform: &Platform, kind: LeaseKind) -> Result<Resources, Status> {
-    let mut booked = DEFAULT_RESOURCES;
+fn booking(platform: &Platform, kind: LeaseKind, default_memory: u64) -> Result<Resources, Status> {
+    let mut booked = if kind == LeaseKind::Action {
+        Resources::new(DEFAULT_RESOURCES.cpu_millis, default_memory)
+    } else {
+        LEAST_WORKER
+    };
     for (key, unit, slot) in [
         (BOOK_CPUS_KEY, 1_000, &mut booked.cpu_millis),
         (BOOK_MEM_GIB_KEY, 1 << 30, &mut booked.memory_bytes),

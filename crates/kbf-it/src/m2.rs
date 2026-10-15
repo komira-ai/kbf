@@ -307,6 +307,9 @@ impl Cell {
             .arg(&pki.server_key)
             .arg("--worker-client-ca")
             .arg(&pki.ca_cert)
+            // The hog touches 3 GiB: a first booking of the default 4 GiB would pass
+            // its cap, so the server starts actions at 1 GiB and climbs 2 and 4.
+            .args(["--memory-ladder-gib", "1,2,4"])
             .stdout(self.log_file("server.out")?)
             .stderr(self.log_file("server.err")?);
         let server = Process::spawn(server, "kbf-server")?;

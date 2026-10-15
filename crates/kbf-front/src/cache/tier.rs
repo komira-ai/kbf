@@ -29,7 +29,7 @@ use kbf_types::Digest;
 use super::write_group::Writer;
 use super::{Cache, CacheError, unexpected};
 use crate::meta_log::MetaLog;
-use crate::metrics::TierCounters;
+use crate::metrics::{CacheMetrics, TierCounters};
 
 /// The tier a cache stages its writes on, what it counted, and the flusher's retries.
 pub(super) struct Staging {
@@ -308,7 +308,11 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         let staging = self.writer.tier.get()?;
         let tier = Arc::clone(&staging.tier);
         let len = usize::try_from(len).unwrap_or(usize::MAX);
-        let read = blocking(Box::new(move || tier.read(object, offset, len))).await;
+        let read = blocking(
+            self.metrics(),
+            Box::new(move || tier.read(object, offset, len)),
+        )
+        .await;
         read.ok().map(|bytes| {
             staging.counters.local_reads.add(1);
             Bytes::from(bytes)
@@ -319,7 +323,11 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
     async fn read_local(&self, staging: &Staging, digest: &Digest, at: Location) -> Local {
         let len = usize::try_from(digest.size_bytes).unwrap_or(usize::MAX);
         let tier = Arc::clone(&staging.tier);
-        let read = blocking(Box::new(move || tier.read(at.object, at.offset, len))).await;
+        let read = blocking(
+            self.metrics(),
+            Box::new(move || tier.read(at.object, at.offset, len)),
+        )
+        .await;
         match read {
             Ok(bytes) if kbf_segments::sha256(&bytes) == *digest => {
                 staging.counters.local_reads.add(1);
@@ -358,15 +366,18 @@ impl<M: MetaLog, O: ObjectStore> Writer<M, O> {
         let records = body.slice(..usize::try_from(footer.records_len()).unwrap_or(body.len()));
         let len = records.len() as u64;
         let tier = Arc::clone(&staging.tier);
-        let synced = blocking(Box::new(move || {
-            let reservation = if own {
-                tier.reserve_upload(len)?
-            } else {
-                tier.reserve_group(len, Instant::now())?
-            };
-            tier.write(&reservation, 0, &records)?;
-            tier.sync(reservation).map_err(|unsynced| unsynced.error)
-        }))
+        let synced = blocking(
+            &self.metrics,
+            Box::new(move || {
+                let reservation = if own {
+                    tier.reserve_upload(len)?
+                } else {
+                    tier.reserve_group(len, Instant::now())?
+                };
+                tier.write(&reservation, 0, &records)?;
+                tier.sync(reservation).map_err(|unsynced| unsynced.error)
+            }),
+        )
         .await;
         let synced = match synced {
             Ok(synced) => synced,
@@ -425,18 +436,32 @@ impl<M: MetaLog, O: ObjectStore> Writer<M, O> {
 
 /// Runs a tier call on the blocking pool: the tier's file I/O (creates, writes,
 /// `fdatasync`, reads of up to a segment) must not hold a runtime thread. A call that
-/// panicked is a failed call.
+/// panicked is a failed call. The call is counted while it is queued or running
+/// (`kbf_tier_in_flight`), and its wait for a pool thread and its whole time are
+/// observed, so a pool that is full shows as wait, not as a slow disk.
 pub(super) async fn blocking<T: Send + 'static>(
+    metrics: &CacheMetrics,
     call: Box<dyn FnOnce() -> Result<T, TierError> + Send>,
 ) -> Result<T, TierError> {
-    let joined = tokio::task::spawn_blocking(call).await;
-    joined.unwrap_or_else(|e| {
-        Err(TierError::Io {
+    let _in_flight = metrics.tier_in_flight.raise();
+    let handed = Instant::now();
+    let joined = tokio::task::spawn_blocking(move || {
+        let waited = handed.elapsed();
+        (waited, call())
+    })
+    .await;
+    metrics.tier_call.since(handed);
+    match joined {
+        Ok((waited, answer)) => {
+            metrics.tier_wait.observe_duration(waited);
+            answer
+        }
+        Err(e) => Err(TierError::Io {
             op: "run",
             name: "a write tier call".to_owned(),
             source: std::io::Error::other(e.to_string()),
-        })
-    })
+        }),
+    }
 }
 
 #[cfg(test)]
@@ -447,12 +472,64 @@ mod tests {
     /// tearing down the caller, instead of failing that one call.
     #[tokio::test]
     async fn a_tier_call_that_panics_is_a_failed_call() {
-        let ok = blocking::<u8>(Box::new(|| Ok(7))).await;
+        let metrics = CacheMetrics::default();
+        let ok = blocking::<u8>(&metrics, Box::new(|| Ok(7))).await;
         assert!(matches!(ok, Ok(7)), "{ok:?}");
-        let panicked = blocking::<u8>(Box::new(|| panic!("a tier call panicked"))).await;
+        let panicked = blocking::<u8>(&metrics, Box::new(|| panic!("a tier call panicked"))).await;
         assert!(
             matches!(panicked, Err(TierError::Io { op: "run", .. })),
             "{panicked:?}"
+        );
+    }
+
+    /// Catches: a blocking pool that is full showing as a slow disk, or not at all: the
+    /// second call waits for the only pool thread while the first holds it, so it counts
+    /// as in flight and its wait is the time the first took (300 ms here, observed by
+    /// the second's `kbf_tier_wait_seconds`, not 0), and the gauge is back to 0 after.
+    /// A wait taken from the closure's end instead of its start, or a gauge raised
+    /// inside the closure (it would read 1, not 2, while one call waits), is caught.
+    #[test]
+    fn a_call_waiting_for_a_pool_thread_is_counted_and_its_wait_observed() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let metrics = Arc::new(CacheMetrics::default());
+        runtime.block_on(async {
+            let first = {
+                let metrics = Arc::clone(&metrics);
+                tokio::spawn(async move {
+                    blocking(
+                        &metrics,
+                        Box::new(|| {
+                            std::thread::sleep(Duration::from_millis(300));
+                            Ok(1_u8)
+                        }),
+                    )
+                    .await
+                })
+            };
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let second = {
+                let metrics = Arc::clone(&metrics);
+                tokio::spawn(async move { blocking(&metrics, Box::new(|| Ok(2_u8))).await })
+            };
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert_eq!(metrics.tier_in_flight.get(), 2, "one running, one queued");
+            assert!(matches!(first.await.expect("joined"), Ok(1)));
+            assert!(matches!(second.await.expect("joined"), Ok(2)));
+        });
+        assert_eq!(metrics.tier_in_flight.get(), 0);
+        assert_eq!(metrics.tier_wait.count(), 2);
+        assert_eq!(metrics.tier_call.count(), 2);
+        // The second waited about 200 ms (300 ms less the 100 ms head start); the first
+        // did not wait.
+        let waited = Duration::from_nanos(metrics.tier_wait.sum());
+        assert!(
+            (Duration::from_millis(150)..Duration::from_millis(280)).contains(&waited),
+            "{waited:?}"
         );
     }
 }

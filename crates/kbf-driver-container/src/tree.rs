@@ -119,7 +119,7 @@ pub async fn materialize(cas: &impl Cas, root: &Digest, dir: &Path) -> Result<()
 /// Writes the tree under `root` into the empty directory `dir` through the node's
 /// input cache (`kbf_daemon::tree::materialize_cached`): files are hard links to
 /// read-only cache entries, but those at or under one of `private` (paths from `dir`),
-/// which are private, writable copies. What the inputs cost.
+/// which are private, writable copies. What the inputs cost, and where the time went.
 ///
 /// # Errors
 /// As [`materialize`].
@@ -129,8 +129,20 @@ pub async fn materialize_cached(
     root: &Digest,
     dir: &Path,
     private: &[String],
-) -> Result<kbf_daemon::cache::InputStats, TreeError> {
-    Ok(shared::materialize_cached(cas, cache, root, dir, private).await?)
+) -> Result<(kbf_daemon::cache::InputStats, shared::WritePhases), TreeError> {
+    Ok(shared::materialize_cached_phased(cas, cache, root, dir, private).await?)
+}
+
+/// [`materialize`], saying where its time went (`kbf_daemon::tree::materialize_phased`).
+///
+/// # Errors
+/// As [`materialize`].
+pub(crate) async fn materialize_phased(
+    cas: &impl Cas,
+    root: &Digest,
+    dir: &Path,
+) -> Result<shared::WritePhases, TreeError> {
+    Ok(shared::materialize_phased(cas, root, dir).await?)
 }
 
 /// The output paths a Command declares, each checked

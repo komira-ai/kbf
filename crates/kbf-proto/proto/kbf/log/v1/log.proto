@@ -16,7 +16,7 @@
 // Which encodings may appear in a log is the log's format version, committed in the log.
 // Format 1 is this file as it is now. Bootstrap and the control commands (`farm` to
 // `machine_version`) joined format 1 before any log was written (kbf-server's
-// --meta-log=raft is the first writer, and it writes only `meta` and `bootstrap`);
+// the Raft metadata log is the first writer, and it writes only `meta` and `bootstrap`);
 // from now on, a field or command added here is a new format.
 //
 // Format 2 is format 1 plus the write tier's metadata commands (MetaCommand fields 10

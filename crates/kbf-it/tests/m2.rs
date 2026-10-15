@@ -635,7 +635,7 @@ fn a_cell_that_does_everything_passes() {
         "--listen 127.0.0.1:8980 --worker-listen 127.0.0.1:8981 \
          --cold-store file://{w}/server-blobs --meta-dir {w}/server-meta \
          --worker-tls-cert {w}/pki/server.pem --worker-tls-key {w}/pki/server.key \
-         --worker-client-ca {w}/pki/ca.pem"
+         --worker-client-ca {w}/pki/ca.pem --memory-ladder-gib 1,2,4"
     );
     assert_eq!(server, [expected]);
 

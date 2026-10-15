@@ -190,6 +190,7 @@ async fn an_attention_item_is_a_warning_that_names_the_node_and_the_fix() {
                 lease: "7.3".to_owned(),
             },
         ),
+        (NodePhase::MemoryPressure, PhaseView::MemoryPressure),
     ] {
         farm.resize(&node, stream, reported(phase));
         assert_eq!(farm.node_view(&node).expect("registered").phase, view);

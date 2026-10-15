@@ -31,7 +31,7 @@ use kbf_proto::worker::{
 };
 use kbf_server::token::ApiToken;
 use kbf_server::{
-    Api, Bound, Listeners, RaftMetaLog, ServeError, bind_server, bind_server_with_api,
+    Api, Bound, Listeners, MemoryLadder, RaftMetaLog, ServeError, bind_server, bind_server_with_api,
 };
 use kbf_store::FaultFs;
 use prost::Message;
@@ -210,6 +210,13 @@ pub struct Client {
     channel: Channel,
 }
 
+/// The memory ladder of every cell but [`Cell::start_with_ladder`]'s: 1, 2 and 4 GiB,
+/// so an action that names no size books 1 GiB and a test node of 1 to 4 GiB runs it.
+/// (The server's default is 4, 16 and 32 GiB.)
+pub fn small_ladder() -> MemoryLadder {
+    MemoryLadder::from_gib(&[1, 2, 4]).expect("a ladder")
+}
+
 /// The bearer token of a cell's operator API ([`Cell::start_with_api`]).
 pub const API_TOKEN: &str = "kbf-test-token-0123456789abcdef0123456789";
 
@@ -223,12 +230,22 @@ impl Cell {
         Self::start_with(wait, kbf_sched::FINISHED_RETENTION).await
     }
 
+    /// A cell that books and climbs `ladder`, as `--memory-ladder-gib` sets it. The
+    /// other cells book 1 GiB first ([`small_ladder`]), so the small nodes of these
+    /// tests can run an action that names no size.
+    pub async fn start_with_ladder(ladder: MemoryLadder) -> Self {
+        let store = SharedStore::new();
+        let cache = Self::cold_cache(&store, None).await;
+        let (wait, retention) = (kbf_sched::UNSERVABLE_WAIT, kbf_sched::FINISHED_RETENTION);
+        Self::serve(cache, store, None, None, wait, retention, ladder).await
+    }
+
     /// A cell whose scheduler refuses queued work no live worker can run after `wait`,
     /// and keeps a finished operation for `retention`.
     pub async fn start_with(wait: Duration, retention: Duration) -> Self {
         let store = SharedStore::new();
         let cache = Self::cold_cache(&store, None).await;
-        Self::serve(cache, store, None, None, wait, retention).await
+        Self::serve(cache, store, None, None, wait, retention, small_ladder()).await
     }
 
     /// A cell whose metadata is a Raft log ([`RaftMetaLog`], as `kbf-server` runs it) in
@@ -239,7 +256,16 @@ impl Cell {
         let dir = FaultFs::new();
         let cache = Self::cold_cache(&store, Some(&dir)).await;
         let (wait, retention) = (kbf_sched::UNSERVABLE_WAIT, kbf_sched::FINISHED_RETENTION);
-        Self::serve(cache, store, None, Some(dir), wait, retention).await
+        Self::serve(
+            cache,
+            store,
+            None,
+            Some(dir),
+            wait,
+            retention,
+            small_ladder(),
+        )
+        .await
     }
 
     /// The Raft log of a cell started with [`Cell::start_raft`].
@@ -256,7 +282,16 @@ impl Cell {
         };
         let (wait, retention) = (kbf_sched::UNSERVABLE_WAIT, kbf_sched::FINISHED_RETENTION);
         let cache = Self::cold_cache(&store, None).await;
-        Self::serve(cache, store, Some(api), None, wait, retention).await
+        Self::serve(
+            cache,
+            store,
+            Some(api),
+            None,
+            wait,
+            retention,
+            small_ladder(),
+        )
+        .await
     }
 
     /// A new server over this cell's store and its in-memory action cache and CAS
@@ -271,7 +306,16 @@ impl Cell {
         let (wait, retention) = (kbf_sched::UNSERVABLE_WAIT, kbf_sched::FINISHED_RETENTION);
         let (cache, store) = (Arc::clone(&self.cache), self.store.clone());
         let dir = self.raft_dir.clone();
-        Self::serve(cache, store, self.api_config.clone(), dir, wait, retention).await
+        Self::serve(
+            cache,
+            store,
+            self.api_config.clone(),
+            dir,
+            wait,
+            retention,
+            small_ladder(),
+        )
+        .await
     }
 
     /// Stops this server, waits until its runtime and every task on it are gone (each
@@ -300,7 +344,16 @@ impl Cell {
         let dir = dir.map(|d| d.restart());
         let cache = Self::cold_cache(&store, dir.as_ref()).await;
         let (wait, retention) = (kbf_sched::UNSERVABLE_WAIT, kbf_sched::FINISHED_RETENTION);
-        Self::serve(cache, store, api_config, dir, wait, retention).await
+        Self::serve(
+            cache,
+            store,
+            api_config,
+            dir,
+            wait,
+            retention,
+            small_ladder(),
+        )
+        .await
     }
 
     /// A new cache over `store` and a writer epoch it allocates. Without `raft_dir`:
@@ -344,6 +397,7 @@ impl Cell {
         raft_dir: Option<FaultFs>,
         wait: Duration,
         retention: Duration,
+        ladder: MemoryLadder,
     ) -> Self {
         let listeners = Listeners {
             reapi: SocketAddr::from(([127, 0, 0, 1], 0)),
@@ -354,6 +408,7 @@ impl Cell {
             hello_wait: HELLO_WAIT,
             tick: Duration::from_millis(50),
             unservable_wait: wait,
+            memory_ladder: ladder,
             finished_retention: retention,
             shutdown_timeout: Duration::from_secs(10),
             store_probe_timeout: kbf_server::health::STORE_PROBE_TIMEOUT,

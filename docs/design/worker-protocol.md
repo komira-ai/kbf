@@ -121,15 +121,18 @@ fences.
 `Hello.phase` (`NodePhase { phase, lease_id, reason }`) says what the node is doing
 besides running leases (`docs/design/fleet-updates.md` section 3.3). It is absent, or
 `PHASE_SERVING`, on a node that takes leases, and the daemon resends `Hello` whenever
-it changes. Today only the whole-machine runtime on a Mac
-(`kbf_driver_native::whole_machine`) sets one; the daemon takes it through
-`Daemon::with_phase`:
+it changes. The whole-machine runtime on a Mac
+(`kbf_driver_native::whole_machine`) sets the session phases and the quarantine; the
+daemon takes them through `Daemon::with_phase`. The daemon itself says
+`PHASE_MEMORY_PRESSURE` (`Daemon::with_memory_backstop`) when no runtime phase is
+in force:
 
 | Phase | Meaning | `lease_id` / `reason` |
 |---|---|---|
 | `PHASE_PREPARING` | switching the Mac's GUI session to the user of a whole-machine lease it holds (`session-login`: auto-login, then a userspace restart, which ends the daemon too), then running its action there | the lease |
 | `PHASE_RESTORING` | switching back after that lease's action ended (`session-idle`, the same restart), and cleaning up; the lease's `Result` is sent once that is done. A daemon restarted while the action ran (a crash or an update, not a switch) says this too: it killed the lease user's processes before its `Hello`, and the lease's `Result` says it was lost (`LOST_DAEMON_RESTARTED`); the node never runs the action again itself, and the server runs it again as a farm fault | the lease |
 | `PHASE_QUARANTINED` | a cleanup failed; the node takes no lease until an operator repairs it | why |
+| `PHASE_MEMORY_PRESSURE` | the node holds a lease and its memory stall time (`/proc/pressure/memory`, the `some` line's `avg10`) is above the daemon's `--memory-pressure-pause-percent` (default 10); it takes no new lease until the pressure falls, and runs the ones it holds. Sent by any daemon on any driver, but only while a lease runs: with none the node serves, whatever the pressure, so a node paused by pressure that others cause is never left idle for good | |
 
 The server takes the phase of every `Hello`, the stream's first included, before it
 places any work. A node that is not serving is offered no lease, and is listed in
@@ -365,7 +368,7 @@ in [scheduler.md](scheduler.md#memory-kills)):
 | `memory_kill` | Meaning | What the server does |
 |---|---|---|
 | `MEMORY_KILL_UNSPECIFIED` (0) | not killed for memory, or not known | the status code decides, as above |
-| `MEMORY_KILL_OWN_LIMIT` (1) | the action passed its own memory limit (the lease's cap) and was killed for it | runs it again with its memory booking doubled, up to the largest node, and keeps the raised booking as its action key's floor; at the largest node, answers that the action needs more memory than any node offers |
+| `MEMORY_KILL_OWN_LIMIT` (1) | the action passed its own memory limit (the lease's cap) and was killed for it | runs it again one rung up the memory ladder (4, 16, 32 GiB, a whole host; `--memory-ladder-gib`) up to the largest node, and keeps the raised booking as its action key's floor; at the largest node, answers that the action needs more memory than any node offers |
 | `MEMORY_KILL_NODE_PRESSURE` (2) | the node killed it while it was under its own limit: a node-wide out-of-memory kill, or the node's backstop | runs it again with the same booking (twice at most) and counts the kill against the node; never raises the booking |
 
 The daemon sets `memory_kill` from its driver's error: the native driver's memory
