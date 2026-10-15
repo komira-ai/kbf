@@ -157,20 +157,24 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         &self,
         digests: &[Digest],
     ) -> Result<Vec<Option<Location>>, CacheError> {
-        self.touched(|s| {
-            let found: Vec<Option<Location>> = digests
-                .iter()
-                .map(|d| match s.blob(d) {
-                    BlobAnswer::Present { location, .. } => Some(location),
-                    BlobAnswer::Unavailable | BlobAnswer::Absent => None,
-                })
-                .collect();
-            let present = digests.iter().zip(&found).filter_map(|(d, l)| l.map(|_| d));
-            let touch = s.touch_for(present);
-            (found, touch)
-        })
-        .await
-        .inspect(|found| self.used(found.iter().flatten().map(|l| l.object)))
+        let found = self
+            .touched(|s| {
+                let found: Vec<Option<Location>> = digests
+                    .iter()
+                    .map(|d| match s.blob(d) {
+                        BlobAnswer::Present { location, .. } => Some(location),
+                        BlobAnswer::Unavailable | BlobAnswer::Absent => None,
+                    })
+                    .collect();
+                let present = digests.iter().zip(&found).filter_map(|(d, l)| l.map(|_| d));
+                let touch = s.touch_for(present);
+                (found, touch)
+            })
+            .await?;
+        for location in found.iter().flatten() {
+            self.used([location.object]);
+        }
+        Ok(found)
     }
 
     /// `len` bytes of object `object` from `offset`, unchecked: the caller checks each

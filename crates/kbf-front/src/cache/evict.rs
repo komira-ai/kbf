@@ -128,8 +128,9 @@ impl Recency {
         chosen
     }
 
+    /// Drops `object`, evicted. Only an evictor calls it, so recency is on.
     fn forget(&self, object: ObjectId) {
-        if let Some(clock) = self.lock().as_mut() {
+        for clock in self.lock().iter_mut() {
             clock.objects.remove(&object);
         }
     }
@@ -187,7 +188,8 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
     /// Adds the objects a start-up pass kept to the recency it ranks by: each not used
     /// since the start (if it was, only its length is taken).
     pub fn seed_recency(&self, held: &BTreeMap<ObjectId, HeldObject>) {
-        if let Some(clock) = self.writer.recency.lock().as_mut() {
+        // Seeded only once recency is on: the server turns it on before it serves.
+        for clock in self.writer.recency.lock().iter_mut() {
             for (id, h) in held {
                 let seeded = Use {
                     len: Some(h.len),
