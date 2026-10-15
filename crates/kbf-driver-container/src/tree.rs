@@ -17,6 +17,7 @@
 use std::path::{Path, PathBuf};
 
 use kbf_daemon::cas::{Cas, CasError};
+use kbf_daemon::cpu_pool::CpuPool;
 use kbf_daemon::tree as shared;
 use kbf_proto::reapi::{ActionResult, Command, Digest};
 use prost::Message;
@@ -118,7 +119,7 @@ pub async fn materialize(cas: &impl Cas, root: &Digest, dir: &Path) -> Result<()
 /// Writes the tree under `root` into the empty directory `dir` through the node's
 /// input cache (`kbf_daemon::tree::materialize_cached`): files are hard links to
 /// read-only cache entries, but those at or under one of `private` (paths from `dir`),
-/// which are private, writable copies. What the inputs cost.
+/// which are private, writable copies. What the inputs cost, and where the time went.
 ///
 /// # Errors
 /// As [`materialize`].
@@ -128,8 +129,20 @@ pub async fn materialize_cached(
     root: &Digest,
     dir: &Path,
     private: &[String],
-) -> Result<kbf_daemon::cache::InputStats, TreeError> {
-    Ok(shared::materialize_cached(cas, cache, root, dir, private).await?)
+) -> Result<(kbf_daemon::cache::InputStats, shared::WritePhases), TreeError> {
+    Ok(shared::materialize_cached_phased(cas, cache, root, dir, private).await?)
+}
+
+/// [`materialize`], saying where its time went (`kbf_daemon::tree::materialize_phased`).
+///
+/// # Errors
+/// As [`materialize`].
+pub(crate) async fn materialize_phased(
+    cas: &impl Cas,
+    root: &Digest,
+    dir: &Path,
+) -> Result<shared::WritePhases, TreeError> {
+    Ok(shared::materialize_phased(cas, root, dir).await?)
 }
 
 /// The output paths a Command declares, each checked
@@ -262,20 +275,19 @@ pub async fn refuse_hidden_working_directory(
 /// All the outputs together stay within `limits` (directory depth, entries, file
 /// bytes), or the call fails with [`TreeError::Limit`]. An output directory is walked
 /// without recursion, so no depth of tree can overflow the caller's stack. The walk
-/// hashes each file and closes it; then [`Cas::missing`] is asked once for every
-/// distinct digest, the missing blobs are copied into a spool made in `spools` (one
-/// chunk in memory at a time, up to [`Cas::in_flight`] files open), and the spool is
-/// stored with [`Cas::put_spool`]; the call returns once all of them are stored. A
-/// name or symlink target that is not UTF-8 fails the call with
-/// [`TreeError::NotUtf8`].
+/// hashes each file exactly once, on `pool`, and closes it; the blobs (each distinct
+/// digest once) are then stored with [`Cas::put_records`], which reads each file again
+/// only to send it and refuses one that is not the file that was hashed; the call
+/// returns once all of them are stored. A name or symlink target that is not UTF-8
+/// fails the call with [`TreeError::NotUtf8`].
 pub async fn collect(
     cas: &impl Cas,
     upper: &Path,
-    spools: &Path,
+    pool: &CpuPool,
     working_directory: &str,
     paths: &[String],
     limits: OutputLimits,
     result: &mut ActionResult,
 ) -> Result<(), TreeError> {
-    crate::outputs::collect(cas, upper, spools, working_directory, paths, limits, result).await
+    crate::outputs::collect(cas, upper, pool, working_directory, paths, limits, result).await
 }

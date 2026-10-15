@@ -12,10 +12,14 @@
 //! an observation in flight; its `_count` is always the sum of its buckets.
 
 use std::fmt::Write as _;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use kbf_meta::Command;
+
+mod execute;
+pub use execute::{ExecuteMetrics, OpenExecute};
 
 /// What a histogram's values are, which fixes its buckets and how they are printed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -112,6 +116,17 @@ impl Gauge {
     pub fn raise(&self) -> Raised<'_> {
         self.0.fetch_add(1, Ordering::Relaxed);
         Raised(self)
+    }
+
+    /// Raises the level by one, for a holder that lowers it with [`Gauge::sub_one`]
+    /// itself (a guard that owns its metrics rather than borrowing a gauge).
+    pub(crate) fn add_one(&self) {
+        self.0.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Lowers the level by one, once per [`Gauge::add_one`].
+    pub(crate) fn sub_one(&self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
     }
 
     /// The level now.
@@ -416,6 +431,9 @@ pub struct CacheMetrics {
     /// Directories the input check found already being checked for another request and
     /// waited for instead of checking again.
     pub input_dirs_joined: Counter,
+    /// Execute and WaitExecution, where the Execution service is served from this
+    /// cache. Shared with the streams it counts, which outlive their handler.
+    pub execute: Arc<ExecuteMetrics>,
 }
 
 impl Default for CacheMetrics {
@@ -451,6 +469,7 @@ impl Default for CacheMetrics {
             input_dirs_cached: Counter::default(),
             input_dirs_skipped: Counter::default(),
             input_dirs_joined: Counter::default(),
+            execute: Arc::default(),
         }
     }
 }
@@ -634,6 +653,7 @@ impl CacheMetrics {
         for (command, histogram) in COMMANDS.iter().zip(&self.commit) {
             histogram.render(&mut out.0, name, &format!("command=\"{command}\""));
         }
+        self.execute.render(&mut out);
         out.0
     }
 }
@@ -657,6 +677,10 @@ pub struct TierCounters {
     pub conflicts: Counter,
     /// Objects with a record that failed its digest on the tier: marked corrupt.
     pub corrupt: Counter,
+    /// Records the flusher found not to hash to their digests, and dropped instead of
+    /// uploading (alert): the daemon's digests are trusted when an upload is
+    /// acknowledged, and checked here.
+    pub digest_mismatch: Counter,
     /// Blobs read from the tier's disk (a block or a flushed copy).
     pub local_reads: Counter,
 }
@@ -709,6 +733,11 @@ impl TierCounters {
                 "kbf_write_tier_corrupt_total",
                 "Staged objects with a record that failed its digest on the tier's disk",
                 self.corrupt.get(),
+            ),
+            (
+                "kbf_tier_flush_digest_mismatch_total",
+                "Records the flusher dropped because they did not hash to their digest (alert)",
+                self.digest_mismatch.get(),
             ),
             (
                 "kbf_write_tier_local_reads_total",

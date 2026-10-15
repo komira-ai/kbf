@@ -326,6 +326,7 @@ fn each_requeue_reason_and_failure_class_has_its_own_value() {
         RequeueReason::Restarted,
         RequeueReason::Lost(LostWhy::DaemonRestarted),
         RequeueReason::Lost(LostWhy::Fenced),
+        RequeueReason::Infra,
     ];
     let failures = [
         Failure::Timeout,
@@ -368,6 +369,7 @@ fn each_requeue_reason_and_failure_class_has_its_own_value() {
     assert!(!values.contains(&(proto::RequeueReason::Unspecified as i32)));
     assert_eq!(requeues[0].reason(), proto::RequeueReason::Silent);
     assert_eq!(requeues[9].reason(), proto::RequeueReason::LostFenced);
+    assert_eq!(requeues[10].reason(), proto::RequeueReason::Infra);
     assert_eq!(
         (requeues[5].reason(), requeues[5].booked, requeues[5].raised),
         (proto::RequeueReason::OutOfMemory, 1 << 30, 2 << 30)

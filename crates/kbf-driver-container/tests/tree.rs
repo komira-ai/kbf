@@ -397,7 +397,7 @@ async fn collect_within(
     let outcome = collect(
         &cas,
         upper,
-        std::path::Path::new(env!("CARGO_TARGET_TMPDIR")),
+        &kbf_daemon::cpu_pool::CpuPool::new(4),
         working_directory,
         &outputs,
         limits,
@@ -805,4 +805,159 @@ async fn a_file_changed_after_it_was_hashed_is_not_stored() {
     assert!(matches!(error, CasError::Read(..)), "{error}");
     let digest = hashed(b"stored").store(&cas).await.expect("stored");
     assert_eq!(cas.blob(&digest), Some(b"stored".to_vec()));
+}
+
+/// A CAS that runs `hook` once, when the outputs are handed to it: after the walk has
+/// hashed every file and before any byte is sent. It stands for whatever can change a
+/// file in that window.
+struct Racing {
+    inner: MemoryCas,
+    hook: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+}
+
+impl kbf_daemon::cas::Cas for Racing {
+    type Lease = std::sync::Arc<Self>;
+
+    fn lease(self: &std::sync::Arc<Self>, _: &kbf_types::LeaseId) -> std::sync::Arc<Self> {
+        std::sync::Arc::clone(self)
+    }
+
+    async fn get(&self, digest: &kbf_proto::reapi::Digest) -> Result<Vec<u8>, CasError> {
+        self.inner.get(digest).await
+    }
+
+    async fn put(&self, bytes: Vec<u8>) -> Result<kbf_proto::reapi::Digest, CasError> {
+        self.inner.put(bytes).await
+    }
+
+    async fn put_records(&self, records: Vec<kbf_daemon::cas::Record>) -> Result<(), CasError> {
+        if let Some(hook) = self.hook.lock().expect("hook").take() {
+            hook();
+        }
+        self.inner.put_records(records).await
+    }
+}
+
+/// The 17.5 s of a cold unpack, step 1: the files are hashed once, by the walk, and the
+/// upload reads them again by name. That is only safe if a file that changed in between is
+/// refused. Four tree files and one output file are hashed; then, as the outputs are
+/// handed to the CAS, one is rewritten (same size, other bytes), appended to, replaced by
+/// another file, or removed: the call fails with a read error naming the file, and the
+/// bytes it held then are in the CAS under no digest. A tree left alone is stored whole.
+/// Mutants seen red: the stamp comparison dropped from `FileSource` (rewritten and
+/// appended stored under the old digest by a CAS that does not check; this one does,
+/// so it fails as `Corrupt` instead), the rename case with the device/inode compare
+/// dropped.
+#[tokio::test]
+async fn a_file_changed_between_the_walk_and_the_upload_is_refused() {
+    type Change = fn(&std::path::Path);
+    let changes: [(&str, Option<Change>); 5] = [
+        ("left alone", None),
+        (
+            "rewritten",
+            Some(|p| std::fs::write(p, b"tree 2: the other bytes").expect("rewrite")),
+        ),
+        (
+            "appended",
+            Some(|p| {
+                use std::io::Write as _;
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(p)
+                    .expect("open")
+                    .write_all(b"!")
+                    .expect("append");
+            }),
+        ),
+        (
+            "replaced",
+            Some(|p| {
+                let other = p.with_extension("new");
+                std::fs::write(&other, b"tree 2: the first bytes").expect("write");
+                std::fs::rename(other, p).expect("rename");
+            }),
+        ),
+        (
+            "removed",
+            Some(|p| std::fs::remove_file(p).expect("remove")),
+        ),
+    ];
+    for (what, change) in changes {
+        let upper = support::scratch(&format!("collect-race-{}", what.replace(' ', "-")));
+        std::fs::create_dir_all(upper.join("out/sub")).expect("mkdir");
+        for n in 0..4 {
+            std::fs::write(
+                upper.join(format!("out/sub/t{n}")),
+                format!("tree {n}: the first bytes"),
+            )
+            .expect("write");
+        }
+        std::fs::write(upper.join("single"), b"a single output").expect("write");
+        let target = upper.join("out/sub/t2");
+        let cas = std::sync::Arc::new(Racing {
+            inner: MemoryCas::new(),
+            hook: std::sync::Mutex::new(change.map(|change| {
+                Box::new(move || {
+                    // Past the clock's granularity, so a write shows in the times.
+                    std::thread::sleep(std::time::Duration::from_millis(30));
+                    change(&target);
+                }) as Box<dyn FnOnce() + Send>
+            })),
+        });
+        let mut result = ActionResult::default();
+        let outcome = collect(
+            &*cas,
+            &upper,
+            &kbf_daemon::cpu_pool::CpuPool::new(2),
+            "",
+            &["out".to_owned(), "single".to_owned()],
+            OutputLimits::DEFAULT,
+            &mut result,
+        )
+        .await;
+        if change.is_none() {
+            outcome.expect(what);
+            let digest = &result.output_files[0].digest;
+            assert_eq!(
+                cas.inner.blob(digest.as_ref().expect("digest")),
+                Some(b"a single output".to_vec())
+            );
+            continue;
+        }
+        let Err(TreeError::Cas(error)) = outcome else {
+            panic!("{what}: {outcome:?}");
+        };
+        let shown = error.to_string();
+        assert!(matches!(error, CasError::Read(..)), "{what}: {shown}");
+        assert!(shown.contains("t2"), "{what}: {shown}");
+        assert_eq!(
+            cas.inner.blob(&digest_of(b"tree 2: the other bytes")),
+            None,
+            "{what}: the changed bytes were stored"
+        );
+    }
+}
+
+/// Catches a directory the walk cannot open being skipped, or reported without its path:
+/// a directory the action left unreadable fails the collection, naming that directory,
+/// and no output is recorded for the tree. (Skipped as root, which can read it.)
+#[tokio::test]
+async fn an_output_directory_that_cannot_be_opened_fails_naming_it() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    if rustix::process::geteuid().is_root() {
+        return;
+    }
+    let upper = support::scratch("collect-locked");
+    std::fs::create_dir_all(upper.join("out/locked")).expect("mkdir");
+    std::fs::write(upper.join("out/f"), b"x").expect("write");
+    let locked = upper.join("out/locked");
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+    let (outcome, result, _) = collect_from(&upper, "", &["out"]).await;
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).expect("chmod back");
+    let Err(TreeError::Io { path, .. }) = outcome else {
+        panic!("{outcome:?}");
+    };
+    assert!(path.ends_with("out/locked"), "{}", path.display());
+    assert!(result.output_directories.is_empty());
 }

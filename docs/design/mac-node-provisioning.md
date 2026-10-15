@@ -387,7 +387,14 @@ listed, and step 3 checks that they print it.
 >   runner with SIP enabled, and hosted runners do not enforce code signing on a
 >   running process, so the kernel's page checks are not shown in CI.
 > - **Still planned:** the deployment job that verifies an asset before it reaches a
->   node, the node's SHA-256 check in `apply`, and the release workflow.
+>   node, and the node's SHA-256 check in `apply`.
+> - **Built, unlike the model below:** the release workflow
+>   (`.github/workflows/release.yml`, docs/artifacts.md). A person pushes a tag on a
+>   commit of `main` (the soak is their judgment, not a check the workflow makes), and
+>   the workflow attaches the files of that commit's `main` run of `artifacts.yml`,
+>   checked against the attestations and never rebuilt. They come from that run's
+>   workflow artifacts, not the deployment's copy, so a release is cut within the 90
+>   days GitHub keeps them.
 
 The model:
 

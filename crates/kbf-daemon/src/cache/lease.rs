@@ -166,9 +166,15 @@ async fn place(
                     &counts.misses
                 };
                 counted.fetch_add(files, Ordering::Relaxed);
-                if fell_back {
+                let (shared, private) = (names.shared.len() as u64, names.private.len() as u64);
+                let (links, copies) = if fell_back {
                     bump(&counts.link_fallbacks);
-                }
+                    (0, shared + private)
+                } else {
+                    (shared, private)
+                };
+                counts.links.fetch_add(links, Ordering::Relaxed);
+                counts.copies.fetch_add(copies, Ordering::Relaxed);
                 return Ok(());
             }
             Err(Placing::Gone) => stale = true,

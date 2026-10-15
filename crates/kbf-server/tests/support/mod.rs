@@ -866,6 +866,26 @@ pub fn ran(lease: Option<LeaseId>, result: &ActionResult) -> kbf_proto::worker::
     }
 }
 
+/// Reports `result(lease)` for `first` and for each rerun the farm's budget allows
+/// (`1 + FARM_RERUNS` runs in all, each `Start` taken from `daemon`): a run the farm
+/// could not do is run again, so only the last report finishes the operation.
+pub async fn report_every_run(
+    daemon: &mut FakeDaemon,
+    first: Start,
+    result: impl Fn(Option<LeaseId>) -> kbf_proto::worker::Result,
+) {
+    let mut start = first;
+    for run in 0..=kbf_sched::FARM_RERUNS {
+        assert!(
+            daemon.report(result(start.lease_id)).await.accepted,
+            "run {run}"
+        );
+        if run < kbf_sched::FARM_RERUNS {
+            start = daemon.start().await;
+        }
+    }
+}
+
 /// A failed Result for `lease`.
 pub fn failed(lease: Option<LeaseId>, code: Code) -> kbf_proto::worker::Result {
     kbf_proto::worker::Result {

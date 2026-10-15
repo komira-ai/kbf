@@ -3,9 +3,33 @@
 //! runtimes read and write through (one per process, shared by every lease).
 //!
 //! A runtime fetches an action, its command and its input tree through a `Cas`, and
-//! stores outputs, stdout and stderr through it; a driver gathers an action's outputs
-//! in a [`Spool`] and stores them with [`Cas::put_spool`]. Blob bytes never travel on the
+//! stores outputs, stdout and stderr through it; a driver hashes an action's outputs
+//! once and stores them with [`Cas::put_records`] (the native driver gathers them in a
+//! [`Spool`] first). Blob bytes never travel on the
 //! `kbf.worker.v1` stream; they go over the engine's own connection.
 
+use kbf_proto::reapi::Digest;
 pub use kbf_transfer::cas::*;
-pub use kbf_transfer::{Spool, Spooled};
+pub use kbf_transfer::{
+    FileSource, OPEN_DIRECTORY, OPEN_FILE, Record, RecordHasher, Source, Spool, Spooled, Stamp,
+    descend, proto_digest,
+};
+
+/// A [`Cas`] as the input tree's walks read it: one checked fetch, behind a pointer, so
+/// those walks are compiled once whatever the CAS (a line a walk runs is then counted
+/// once, not once per CAS type a test or a binary instantiates it with).
+pub(crate) trait Fetch: Send + Sync {
+    fn fetch<'a>(
+        &'a self,
+        digest: &'a Digest,
+    ) -> futures::future::BoxFuture<'a, Result<Vec<u8>, CasError>>;
+}
+
+impl<C: Cas> Fetch for C {
+    fn fetch<'a>(
+        &'a self,
+        digest: &'a Digest,
+    ) -> futures::future::BoxFuture<'a, Result<Vec<u8>, CasError>> {
+        Box::pin(fetch(self, digest))
+    }
+}

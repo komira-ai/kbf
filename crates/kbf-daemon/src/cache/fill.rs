@@ -26,8 +26,7 @@ use tokio::sync::watch;
 use super::layout::{FIXED_MTIME, Key, remove_if_present};
 use super::verify::{Found, inspect, stat_check};
 use super::{Cache, Inner, Point, Slot, State, bump};
-use crate::cas::{Cas, CasError, digest_of};
-use kbf_proto::reapi::Digest;
+use crate::cas::{CasError, digest_of};
 
 /// Where a lease gets a key's bytes, and whether the cache had them.
 #[derive(Debug)]
@@ -58,6 +57,8 @@ pub struct InputCounts {
     pub(crate) verify_hashes: AtomicU64,
     pub(crate) fetched_bytes: AtomicU64,
     pub(crate) link_fallbacks: AtomicU64,
+    pub(crate) links: AtomicU64,
+    pub(crate) copies: AtomicU64,
 }
 
 /// [`InputCounts`] once the inputs are written.
@@ -77,6 +78,13 @@ pub struct InputStats {
     pub fetched_bytes: u64,
     /// Keys this lease got a private copy of instead of a link.
     pub link_fallbacks: u64,
+    /// Files (names) that are hard links to a cache entry. Not in the `Display` line
+    /// (the driver's `inputs phases:` line shows it).
+    pub links: u64,
+    /// Files (names) that are their own copy, not the cache entry's inode: the private
+    /// ones an output path covers, and every name of a key that fell back. With
+    /// `links` and `empty_files`, they add up to `files`. Not in the `Display` line.
+    pub copies: u64,
 }
 
 impl InputCounts {
@@ -93,6 +101,8 @@ impl InputCounts {
             verify_hashes: get(&self.verify_hashes),
             fetched_bytes: get(&self.fetched_bytes),
             link_fallbacks: get(&self.link_fallbacks),
+            links: get(&self.links),
+            copies: get(&self.copies),
         }
     }
 }
@@ -115,23 +125,7 @@ impl std::fmt::Display for InputStats {
     }
 }
 
-/// A [`Cas`] as the cache reads it: one checked fetch, behind a pointer, so the cache
-/// is compiled once whatever the CAS.
-pub(crate) trait Fetch: Send + Sync {
-    fn fetch<'a>(
-        &'a self,
-        digest: &'a Digest,
-    ) -> futures::future::BoxFuture<'a, Result<Vec<u8>, CasError>>;
-}
-
-impl<C: Cas> Fetch for C {
-    fn fetch<'a>(
-        &'a self,
-        digest: &'a Digest,
-    ) -> futures::future::BoxFuture<'a, Result<Vec<u8>, CasError>> {
-        Box::pin(crate::cas::fetch(self, digest))
-    }
-}
+pub(crate) use crate::cas::Fetch;
 
 /// A held slot. Dropped, it leaves the fill map and wakes the waiters, handing them
 /// the fill's error if it failed.

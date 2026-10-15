@@ -1,5 +1,5 @@
-//! The `ObjectStore` trait with an in-memory fake and an S3 backend, and the conformance
-//! suite every backend must pass.
+//! The `ObjectStore` trait with an in-memory fake, a local-directory store and an S3
+//! backend, and the conformance suite every backend must pass.
 //!
 //! kbf names every key and records every location in its own replicated log, so it never
 //! asks a store whether something exists, and needs no consistent listing and no
@@ -10,6 +10,7 @@
 //! One store value addresses one bucket.
 
 pub mod conformance;
+mod fs_store;
 mod memory;
 pub mod s3;
 mod types;
@@ -19,6 +20,7 @@ use std::time::SystemTime;
 
 use bytes::Bytes;
 
+pub use fs_store::{FsStore, FsStoreError};
 pub use memory::MemoryStore;
 pub use types::{
     ByteRange, Capabilities, KeyError, KeyPrefix, ListPage, ListToken, ObjectInfo, ObjectKey,
@@ -52,6 +54,19 @@ pub trait ObjectStore: Send + Sync + 'static {
         key: &ObjectKey,
         range: ByteRange,
     ) -> impl Future<Output = Result<Bytes, ObjectStoreError>> + Send;
+
+    /// Whether the store may hold `key`: `false` only when the store knows, without a
+    /// request over the network, that it does not (a local store's file is gone, or is
+    /// not a whole object). A store that would need a request answers `true`, the
+    /// default, and a read finds out. kbf asks before it serves an action-cache hit,
+    /// once per object the hit needs.
+    fn may_hold(
+        &self,
+        key: &ObjectKey,
+    ) -> impl Future<Output = Result<bool, ObjectStoreError>> + Send {
+        let _ = key;
+        std::future::ready(Ok(true))
+    }
 
     /// Deletes an object. Deleting an absent key succeeds, so a retried delete is safe.
     /// An object under retention is refused and stays readable.

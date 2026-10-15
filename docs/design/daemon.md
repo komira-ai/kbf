@@ -278,7 +278,9 @@ native-whole-machine`.
   controllers or the cgroup is not writable. `--cgroup-parent` names an `actions/`
   cgroup set up by someone else instead (checked, not changed). The node reports at most
   what `actions/` may use: `mem_gib` is the lower of MemTotal and the lowest
-  `memory.max` above the leases, `cpus` the nearest `cpuset.cpus.effective`.
+  `memory.max` above the leases, `cpus` the lower of the nearest
+  `cpuset.cpus.effective` and the lowest `cpu.max` quota on the path. The daemon writes
+  `actions/cpu.max` itself: the CPUs it may use minus `--reserve-cpus` (default 8).
   [docs/deploy/linux-build-host.md](../deploy/linux-build-host.md) has the systemd
   units and the host's swap and memory headroom.
 - **`NativeRuntime`** (`kbf-driver-native`, driver `native`): each action as plain
@@ -383,6 +385,86 @@ loud.
 
 **Stopping a container** (timeout or kill): SIGTERM, then 5 seconds, then `cgroup.kill`
 on the lease cgroup, then a forced removal in the clean step.
+
+### The OCI backend (`--container-runtime=oci`)
+
+`kbf-daemon --container-runtime=oci [--oci-runtime=/usr/bin/crun]` runs each action in a
+fresh rootless sandbox made by `crun` directly, with no Podman on the action path. The
+default stays `podman`; the six driver steps, the lease cgroup, the watch, the OOM
+classification, output collection and the clean are the same code for both (`backend.rs`
+is the seam). `crun` is driven through the `runc` crate (containerd/rust-extensions,
+Apache-2.0) and `config.json` is built with `oci-spec`'s typed builders.
+
+Per action: the image is already unpacked (below); a helper container gives the lease's
+directories to the action's root; `config.json`, the `hosts` and `hostname` files are
+written; `crun run` runs the bundle in the foreground; a helper gives the directories
+back; `crun delete --force` closes the lease. That is four `crun` processes where the
+Podman path runs nine (`podman image inspect`, `create`, `start`, `inspect`, the
+`unshare` chowns, `rm`, with a cache more). No `podman` process, `conmon` or Podman
+state database is touched.
+
+- **The exit code is `crun run`'s own status** (`128 + n` for a signal), so there is no
+  moment at which the container is stopped but its exit code is not recorded (#658). A
+  non-zero status is the farm's failure rather than the action's only if `crun` wrote an
+  error record to its `--log` (JSON) file; the lookup failures of `program.rs` (exit 127
+  and 126) and `ETXTBSY` are read from that log in the same words as on the Podman path.
+- **Namespaces:** pid, network (new, nothing configured: loopback only; `crun` brings
+  `lo` up), ipc, uts, mount, cgroup and user. Container ids `0..65536` map to the first
+  range of at least 65,536 in the daemon user's `/etc/subuid` and `/etc/subgid`; the
+  daemon user itself is unmapped, as with `--userns=nomap`. `crun` runs `newuidmap` and
+  `newgidmap` for the mapping, so `uidmap` is a node requirement.
+- **Capabilities, masked and read-only paths, seccomp** are what Podman 4.9 supplies,
+  written out (`oci/hardening.rs`): the eleven `default_capabilities` of
+  containers/common v0.57.4 (`CHOWN DAC_OVERRIDE FOWNER FSETID KILL NET_BIND_SERVICE
+  SETFCAP SETGID SETPCAP SETUID SYS_CHROOT`; inheritable and ambient empty), its twelve
+  `DefaultMaskedPaths` and six `DefaultReadOnlyPaths`, and that release's
+  `seccomp.json`, vendored beside the code with its sha256 pinned in a test and resolved
+  for the capability set and the architecture (`includes`/`excludes` of `caps` and
+  `arches`) exactly as containers/common resolves it. `noNewPrivileges` is false, as
+  Podman's default. Left out: Podman's `net.ipv4.ping_group_range` sysctl and the `gid=5`
+  option of `/dev/pts`.
+- **Cgroups:** the container's cgroup is `<lease cgroup>/ctr`, made by `crun`
+  (`cgroupfs` manager, its default) in the daemon's delegated subtree with
+  `pids.max` and `memory.oom.group=1`; memory and CPU stay on the lease cgroup, so
+  `memory.events` is read as before.
+- **Files.** `/` is the unpacked image, **read-only**; `/kbf/root` is an overlay
+  (`lowerdir` the input root, `upperdir` the lease's upper, options pinned to
+  `userxattr,metacopy=off,redirect_dir=nofollow,index=off,xino=off`); `/tmp`, `/var/tmp`,
+  `/run` and `/root` are directories of the lease on disk (not tmpfs, which would count
+  against the lease's memory); `/etc/hosts` and `/etc/hostname` are small read-only
+  files. **This differs from Podman, whose container root is writable everywhere**: an
+  action that writes to another place in the image fails with `EROFS`. Shared read-only
+  trees (`SharedMount`: a host directory and a destination below `/kbf/root`) are bound
+  read-only after the overlay; the tree store that fills them is not part of this
+  backend.
+- **Helper containers** (`oci/helper.rs`) do what `podman unshare` does: a user namespace
+  with the daemon user as id 0 and the range as ids `1..`, so the action's root is `1:1`.
+  A helper runs one program, never a shell: this daemon's binary in its `__chown-dirs`
+  mode (with `--whole` trees, so the whole hand-over is one process and walks by
+  descriptor, never following a symlink), or the node's `find`, `mkdir`, `tar`, `touch`,
+  from a read-only bind of the host's `/usr`. `crun` creates the namespaces, so the only
+  AppArmor grant for user namespaces is `crun`'s shipped profile, and the daemon needs
+  none of its own. A helper's cgroup is `<actions parent>/<id>`, named in its config:
+  left to itself `crun` makes one beside the daemon's own, and kills it on removal.
+- **The image store** (`oci/image.rs`): `<scratch>/oci-images/<hex>/rootfs`, unpacked once
+  per digest, off the action path. The node's Podman store is where an image is pulled
+  and its manifest checked (`podman pull <repo>@sha256:<d>`, as before); the first lease,
+  or the `--image` check at start, runs `podman export` and four helper containers that
+  extract the tar with an action's mapping, so every file is owned by the host id the
+  action sees as the image's own id. One flight per digest. After that a lease costs one
+  `stat`. Tar's extended attributes are not extracted (file capabilities are lost).
+- **Node requirements** beyond the Podman path's: `crun`, `uidmap`, one subordinate range
+  of 65,536, every directory from `/` to `--scratch` searchable by others (the
+  container's ids are not the daemon user's: `chmod o+x`), kernel overlayfs in a user
+  namespace (5.11 or later). The daemon checks the range, the paths and the files at
+  start and refuses to start naming what is wrong.
+- **Per-action overhead.** The stand-in `crun` test (`fake_oci.rs`) times the lifecycle
+  and counts the processes (four, against the Podman path's more); what a real node adds
+  is to be measured on a build host: the latency of a helper container (user namespace,
+  `newuidmap`, bind mounts) idle and at 50 to 80 concurrent leases; `crun run` of a
+  trivial action; the overlay mount and the network namespace teardown at concurrency;
+  the one-time unpack; and the kernel's per-user key quota (`kernel.keys.maxkeys`, 200 by
+  default), which each container's session keyring counts against.
 
 ### User namespaces
 
@@ -618,6 +700,18 @@ whole-machine drivers). Past it the upload is dropped, which cancels its calls t
 CAS, and the lease fails with INTERNAL and the reason `the output upload did not finish
 within its deadline of ...: stopped after ...`. Without it, a store that stops
 answering held the lease, and its slot, with no error.
+
+**Hashing the outputs.** The container driver reads each output file once, to hash it:
+SHA-256 for the digest, CRC-32C for the footer of the segment it is sent in. The hashing
+runs on `--cpu-threads` threads of their own (default `max(2, reserve/2)`, 4 with the
+default `--reserve-cpus` of 8; shared by all leases and apart
+from the threads that run actions), one read buffer per thread, and the listing of the
+output tree is one task of the blocking pool, not one per file. The upload then reads the
+files again, in ranges, only to send them (`--segment-uploads-in-flight` uploads at once,
+default 4, within `--transfer-in-flight`'s upload share): nothing is copied to scratch.
+A file that is no longer the one that was hashed (replaced, removed, or its size or times
+changed) fails the lease with a read error naming it. The lease's log line `outputs
+phases` says where the time went: `list_ms`, `hash_ms`, `find_missing_ms`, `upload_ms`.
 
 ## Measuring usage
 

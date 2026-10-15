@@ -82,12 +82,37 @@ store (the [converged topology](../design/deployment-topology.md#converged-topol
 also subtract what those two use at their peak
 ([storage-node.md](storage-node.md#memory-on-a-converged-host)).
 
-### CPUs: uncapped
+### CPUs: `--reserve-cpus`
 
-Leave the unit and its slice without `CPUQuota=` and `AllowedCPUs=`. CPU is
-compressible: each lease gets a `cpu.weight` from its booked CPU, and an idle CPU goes
-to whichever lease can use it. A cpuset, when one is set, lowers the `cpus` the node
-reports to what it allows.
+Leave the unit and its slice without `CPUQuota=` and `AllowedCPUs=`; the daemon takes
+its share itself, and pins nothing. `--reserve-cpus=N` (logical CPUs, a hyperthread
+counts one; default 8, which is 4 cores of 2 threads, or half the CPUs on a machine of
+fewer than 16) is what the farm's own processes keep:
+
+- the leases get the CPUs the daemon may use (`available_parallelism`: the affinity
+  mask and the cgroup quota) minus `N`, as `actions/cpu.max` (that many CPUs of time,
+  on any CPU: a bandwidth limit, not a cpuset). The node reports it as `cpus`. Within
+  the limit, CPU is compressible as before: each lease has a `cpu.weight` from its
+  booked CPU, and an idle CPU goes to whichever lease can use it.
+- the daemon's own pools are sized from `N`: async workers `max(2, N/4)`, the CPU pool
+  (`--cpu-threads`, hashing) `max(2, N/2)`, each at most the physical cores.
+  `--async-threads`, `--blocking-threads` and `--cpu-threads` override them (a value
+  given is used as given). On the 88-CPU, 44-core node: reserve 8 is 2 workers and 4
+  CPU threads, 80 CPUs for leases.
+- `N` of 0 is allowed; `N` at the CPUs the daemon may use or more is refused at start
+  (the leases would get nothing).
+
+`--reserve-cpus` and `--reserve-share` are the daemon's flags; `kbf-server` has neither
+and refuses them at start (an old unit that passes one fails at once, status 2, instead
+of the flag being ignored). The server runs no actions, so it uses every CPU it may: one
+async worker and one hashing thread (`--cpu-threads`) per logical CPU (hyperthreads
+included: the server has no other tenant, and a hashing thread stalled on a read leaves
+its sibling the core), and tokio's cap of 512 on the blocking pool; the start line
+names the sizes. `--async-threads`, `--blocking-threads` and `--cpu-threads` override
+them on the server too. On a host that runs both (the all-in-one), `N` is the daemon's
+`--reserve-cpus` and covers the server's share as well: give it enough for what the
+server and the object store node use at their peak. A unit's own `CPUQuota=` lowers the
+`cpus` the node reports to it, and the CPUs the server counts, as well.
 
 ## The units
 

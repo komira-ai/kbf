@@ -23,13 +23,14 @@
 //! between the check and the read.
 
 use std::collections::hash_map::Entry;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::io::ErrorKind;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Instant;
 
 use futures::{StreamExt as _, TryStreamExt as _, stream};
 use kbf_proto::reapi::{
@@ -40,7 +41,7 @@ use prost::Message;
 use tokio::fs;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
-use crate::cas::{Cas, CasError, digest_of, fetch, label};
+use crate::cas::{Cas, CasError, Fetch, digest_of, label};
 
 /// Why the input root could not be written or the outputs read.
 #[derive(Debug, thiserror::Error)]
@@ -73,7 +74,15 @@ pub async fn fetch_message<M: Message + Default>(
     cas: &impl Cas,
     digest: &Digest,
 ) -> Result<M, TreeError> {
-    let bytes = fetch(cas, digest).await?;
+    fetch_message_dyn(cas, digest).await
+}
+
+/// [`fetch_message`] behind a pointer (see [`Fetch`]).
+pub(crate) async fn fetch_message_dyn<M: Message + Default>(
+    cas: &dyn Fetch,
+    digest: &Digest,
+) -> Result<M, TreeError> {
+    let bytes = cas.fetch(digest).await?;
     M::decode(bytes.as_slice())
         .map_err(|e| TreeError::Invalid(format!("blob {} does not decode: {e}", label(digest))))
 }
@@ -122,8 +131,25 @@ pub fn check_relative(what: &str, path: &str) -> Result<(), TreeError> {
 /// # Errors
 /// A blob is missing or corrupt, the tree breaks a naming rule, or a write fails.
 pub async fn materialize(cas: &impl Cas, root: &Digest, dir: &Path) -> Result<(), TreeError> {
-    let files = make_directories(cas, root, dir).await?;
-    write_files(cas, files).await
+    materialize_phased(cas, root, dir).await.map(drop)
+}
+
+/// [`materialize`], saying where its time went. Every file is its own copy
+/// ([`WritePhases::copies`]); `trees_ms` and `links` are 0.
+///
+/// # Errors
+/// As [`materialize`].
+pub async fn materialize_phased(
+    cas: &impl Cas,
+    root: &Digest,
+    dir: &Path,
+) -> Result<WritePhases, TreeError> {
+    let (files, mut phases) = plain_directories(cas, root, dir).await?;
+    phases.copies = files.iter().map(|f| f.copies.len() as u64).sum();
+    let writing = Instant::now();
+    write_files(cas, files).await?;
+    phases.link_ms = millis(writing);
+    Ok(phases)
 }
 
 /// [`materialize`] through the node's input cache (`crate::cache`): the tree's
@@ -143,9 +169,88 @@ pub async fn materialize_cached(
     dir: &Path,
     private: &[String],
 ) -> Result<crate::cache::InputStats, TreeError> {
-    let files = make_directories(cas, root, dir).await?;
+    let written = materialize_cached_phased(cas, cache, root, dir, private).await?;
+    Ok(written.0)
+}
+
+/// [`materialize_cached`], saying where its time went (`trees_ms` is 0).
+///
+/// # Errors
+/// As [`materialize_cached`].
+#[cfg(target_os = "linux")]
+pub async fn materialize_cached_phased(
+    cas: &impl Cas,
+    cache: &crate::cache::Cache,
+    root: &Digest,
+    dir: &Path,
+    private: &[String],
+) -> Result<(crate::cache::InputStats, WritePhases), TreeError> {
+    let (files, mut phases) = plain_directories(cas, root, dir).await?;
     let private: Vec<PathBuf> = private.iter().map(|p| dir.join(p)).collect();
-    crate::cache::lease::write_files(cas, cache, files, &private).await
+    let writing = Instant::now();
+    let stats = crate::cache::lease::write_files(cas, cache, files, &private).await?;
+    phases.link_ms = millis(writing);
+    (phases.links, phases.copies) = (stats.links, stats.copies);
+    Ok((stats, phases))
+}
+
+/// Where writing one input root went: the daemon's half of the container driver's
+/// `inputs phases:` line. Durations are whole milliseconds of wall time.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WritePhases {
+    /// The walk: reading and decoding the Directory messages, checking their names,
+    /// making the directories and symlinks (with shared trees, the classifier's read
+    /// too).
+    pub walk_ms: u64,
+    /// Directory messages the walk asked the CAS for (none for a tree a warm node
+    /// skips, or for one a walk already read).
+    pub dir_reads: u64,
+    /// Directories the walk made (a tree's mount point included, nothing in a tree).
+    pub dirs_made: u64,
+    /// Choosing the shared trees and getting each (built, or found built).
+    pub trees_ms: u64,
+    /// Writing the files: links to the cache's entries, or copies.
+    pub link_ms: u64,
+    /// Files that are hard links to a cache entry.
+    pub links: u64,
+    /// Files written as their own copy (all of them without the cache).
+    pub copies: u64,
+}
+
+/// A [`Fetch`] that counts the fetches through it: [`WritePhases::dir_reads`], when
+/// only the walk's Directory messages go through it.
+pub(crate) struct CountedReads<'a> {
+    inner: &'a dyn Fetch,
+    reads: AtomicU64,
+}
+
+impl<'a> CountedReads<'a> {
+    pub(crate) fn new(inner: &'a dyn Fetch) -> Self {
+        Self {
+            inner,
+            reads: AtomicU64::new(0),
+        }
+    }
+
+    /// The fetches so far.
+    pub(crate) fn reads(&self) -> u64 {
+        self.reads.load(Ordering::Relaxed)
+    }
+}
+
+impl Fetch for CountedReads<'_> {
+    fn fetch<'b>(
+        &'b self,
+        digest: &'b Digest,
+    ) -> futures::future::BoxFuture<'b, Result<Vec<u8>, CasError>> {
+        self.reads.fetch_add(1, Ordering::Relaxed);
+        self.inner.fetch(digest)
+    }
+}
+
+/// Whole milliseconds since `started`.
+pub(crate) fn millis(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 /// Where one file blob goes: each path it is written to, and whether that copy is
@@ -155,15 +260,54 @@ pub(crate) struct Copies {
     pub copies: Vec<(PathBuf, bool)>,
 }
 
-/// Walks the tree under `root`, checking every Directory's names and making its
-/// directories and symlinks under `dir`; returns the file blobs to write, each distinct
-/// digest once.
-async fn make_directories(
+/// [`make_directories`] with nothing loaded and nothing mounted: the whole tree under
+/// `root`, with the walk's part of [`WritePhases`].
+async fn plain_directories(
     cas: &impl Cas,
     root: &Digest,
     dir: &Path,
-) -> Result<Vec<Copies>, TreeError> {
+) -> Result<(Vec<Copies>, WritePhases), TreeError> {
+    let (loaded, mounts) = (Loaded::new(), HashSet::new());
+    let reads = CountedReads::new(cas);
+    let walking = Instant::now();
+    let walked = make_directories(&reads, cas.in_flight(), root, dir, &loaded, &mounts).await?;
+    let phases = WritePhases {
+        walk_ms: millis(walking),
+        dir_reads: reads.reads(),
+        dirs_made: walked.dirs_made,
+        ..WritePhases::default()
+    };
+    Ok((walked.files, phases))
+}
+
+/// What [`make_directories`] found: the file blobs to write, and how many directories
+/// it made.
+pub(crate) struct Walked {
+    pub files: Vec<Copies>,
+    pub dirs_made: u64,
+}
+
+/// Directory messages already fetched, by digest label (`crate::cas::label`): a walk
+/// that finds one does not ask the CAS again.
+pub(crate) type Loaded = HashMap<String, Directory>;
+
+/// Walks the tree under `root`, checking every Directory's names and making its
+/// directories and symlinks under `dir`; returns the file blobs to write, each distinct
+/// digest once, and the count of directories made.
+///
+/// At most `in_flight` Directory messages are fetched at once. A Directory in `loaded`
+/// is not fetched. A directory whose path is in `mounts` (a
+/// path under `dir`) is made empty and not walked: something is mounted there.
+pub(crate) async fn make_directories(
+    cas: &dyn Fetch,
+    in_flight: usize,
+    root: &Digest,
+    dir: &Path,
+    loaded: &Loaded,
+    mounts: &HashSet<PathBuf>,
+) -> Result<Walked, TreeError> {
     let mut files: Vec<Copies> = Vec::new();
+    let mut dirs_made = 0;
     let mut blob_at: HashMap<String, usize> = HashMap::new();
     let mut level = vec![(root.clone(), dir.to_owned())];
     while !level.is_empty() {
@@ -182,10 +326,13 @@ async fn make_directories(
         }
         let directories: Vec<(Directory, Vec<PathBuf>)> = stream::iter(places)
             .map(|(digest, heres)| async move {
-                let directory: Directory = fetch_message(cas, &digest).await?;
+                let directory: Directory = match loaded.get(&label(&digest)) {
+                    Some(known) => known.clone(),
+                    None => fetch_message_dyn(cas, &digest).await?,
+                };
                 Ok::<_, TreeError>((directory, heres))
             })
-            .buffered(cas.in_flight())
+            .buffered(in_flight)
             .try_collect()
             .await?;
         let mut next = Vec::new();
@@ -218,18 +365,21 @@ async fn make_directories(
                         TreeError::Invalid(format!("input directory {:?} has no digest", sub.name))
                     })?;
                     fs::create_dir(&path).await.map_err(io(&path))?;
-                    next.push((digest, path));
+                    dirs_made += 1;
+                    if !mounts.contains(&path) {
+                        next.push((digest, path));
+                    }
                 }
             }
         }
         level = next;
     }
-    Ok(files)
+    Ok(Walked { files, dirs_made })
 }
 
 /// Refuses a Directory whose entry names are not single path components, or that
 /// names one entry twice.
-fn check_names(directory: &Directory) -> Result<(), TreeError> {
+pub(crate) fn check_names(directory: &Directory) -> Result<(), TreeError> {
     let mut seen = BTreeSet::new();
     let names = directory
         .files

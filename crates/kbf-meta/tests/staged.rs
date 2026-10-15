@@ -522,3 +522,29 @@ fn a_refusal_names_the_tier_and_the_server() {
         "server 1's tier 7 still holds staged objects"
     );
 }
+
+/// Catches a hit check that probes the store for an object still staged on a tier
+/// (the store does not hold it yet, so every such hit would turn into a miss), that
+/// probes one object once per blob in it, or that leaves out the result blob's object
+/// or a closure blob's. `stored_objects` lists each stored object once, no staged one,
+/// and nothing for an action with no entry.
+#[test]
+fn stored_objects_lists_each_stored_object_of_an_entry_once_and_no_staged_one() {
+    let mut m = tiered();
+    put(&mut m, digest(1), in_segment(6, 0));
+    put(&mut m, digest(2), in_segment(6, 1));
+    put(&mut m, digest(3), in_segment(8, 0));
+    stage(&mut m, part(5, 300, &[(4, 0)])).expect("staged");
+    let record = kbf_meta::ActionRecord {
+        result: digest(1),
+        closure: kbf_meta::Closure::from_iter([digest(2), digest(3), digest(4)]),
+    };
+    common::put_action(&mut m, kbf_meta::Role::Daemon, digest(20), record).expect("cached");
+    assert_eq!(
+        m.stored_objects(&digest(20))
+            .into_iter()
+            .collect::<Vec<_>>(),
+        [object(6), object(8)]
+    );
+    assert!(m.stored_objects(&digest(21)).is_empty());
+}

@@ -169,14 +169,14 @@ async fn a_clean_that_cannot_wait_for_podman_start_fails() {
     let raw = i32::try_from(child.id().expect("pid")).expect("pid fits");
     let pid = rustix::process::Pid::from_raw(raw);
     rustix::process::waitpid(pid, rustix::process::WaitOptions::empty()).expect("reaped elsewhere");
-    let mut lease = lease_left_only(child);
+    let mut lease = lease_left_only(Running::Process(child));
     let why = lease.clean_blocking().expect_err("the wait failed");
     assert!(why.starts_with("wait for podman start: "), "{why}");
 }
 
 /// A lease that never got a container, cgroup or scratch directory (all its paths
 /// are absent, so removing them succeeds), holding `start` as its `podman start`.
-fn lease_left_only(start: Child) -> Lease {
+fn lease_left_only(start: Running) -> Lease {
     let mut config = PodmanConfig::new(
         PathBuf::from("/nonexistent-kbf-157/scratch"),
         "/actions".to_owned(),
@@ -184,7 +184,10 @@ fn lease_left_only(start: Child) -> Lease {
     );
     config.cgroup_root = PathBuf::from("/nonexistent-kbf-157/cgroup");
     let id = LeaseId { term: 1, seq: 1 };
-    let mut lease = Lease::new(&Podman::new(config.podman.clone()), &config, id);
+    let engine = Engine::Podman(Arc::new(PodmanBackend::new(Podman::new(
+        config.podman.clone(),
+    ))));
+    let mut lease = Lease::new(&engine, &config, id);
     lease.start = Some(start);
     lease
 }
@@ -201,7 +204,7 @@ async fn the_clean_waits_until_podman_start_is_reaped() {
         .spawn()
         .expect("spawn sleep");
     let pid = start.id().expect("pid");
-    let mut lease = lease_left_only(start);
+    let mut lease = lease_left_only(Running::Process(start));
     lease.clean_blocking().expect("cleaned");
     assert!(
         !Path::new(&format!("/proc/{pid}")).exists(),
@@ -251,4 +254,25 @@ fn the_private_paths_are_the_outputs_from_the_input_root() {
     let outputs = ["out/a".to_owned(), "b".to_owned()];
     assert_eq!(private_paths("", &outputs), ["out/a", "b"]);
     assert_eq!(private_paths("pkg/", &outputs), ["pkg/out/a", "pkg/b"]);
+}
+
+/// Catches a tree store opened where a volume cannot name it (a path with ':' or ',' ends
+/// a `--volume` field early: the "no path check" mutant mounts the wrong directory), one
+/// whose directory cannot be made (the node then links every file, with a warning, and
+/// does not stop), and a store that is not opened when it can be.
+#[test]
+fn a_tree_store_opens_where_a_volume_can_name_it() {
+    let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/kbf-driver-unit")
+        .join(format!("trees-{}", std::process::id()));
+    std::fs::create_dir_all(&base).expect("scratch");
+    let config = |dir: PathBuf| TreeConfig::new(dir, 1 << 20);
+    assert!(open_trees(config(base.join("fine"))).is_some());
+    assert!(base.join("fine").is_dir());
+    assert!(open_trees(config(base.join("a:b"))).is_none());
+    assert!(open_trees(config(base.join("a,b"))).is_none());
+    assert!(!base.join("a:b").exists());
+    // A directory under a file cannot be made.
+    std::fs::write(base.join("file"), b"x").expect("file");
+    assert!(open_trees(config(base.join("file/trees"))).is_none());
 }

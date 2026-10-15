@@ -17,6 +17,8 @@
 //! - [`report`]: the node report and its hash.
 //! - [`status`]: the node's software status (OS, kernel, daemon, Xcodes).
 //! - [`driver_watch`]: the driver's report channel, one part per source that feeds it.
+//! - [`cpu_pool`]: [`CpuPool`], the threads (`--cpu-threads`) for work that keeps a core
+//!   busy, such as hashing outputs.
 //! - [`runtime`]: the runtime trait and [`FakeRuntime`], which runs nothing.
 //! - [`runtimes`]: [`Runtimes`], the daemon's runtimes, at most one per lease kind.
 //! - [`phases`]: where each lease's time went, logged when it ends (`lease phases:`)
@@ -46,6 +48,7 @@ pub mod clock;
 pub mod config;
 pub mod connect;
 mod contact;
+pub mod cpu_pool;
 mod daemon;
 pub mod driver_watch;
 pub mod keeper;
@@ -58,6 +61,8 @@ pub mod runtime;
 pub mod runtimes;
 pub mod status;
 pub mod tree;
+#[cfg(target_os = "linux")]
+pub mod trees;
 #[cfg(target_os = "macos")]
 pub mod uid;
 #[cfg(target_os = "linux")]
@@ -74,6 +79,7 @@ pub use cas::{Cas, CasError};
 pub use clock::{Clock, Moment, SystemClock};
 pub use config::{Args, DaemonConfig, FENCE_AFTER, KeepAlive, RECHECK_EVERY, TlsFiles};
 pub use contact::{Acked, Contact};
+pub use cpu_pool::CpuPool;
 pub use daemon::{Daemon, Event, PROTOCOL_VERSION, SessionError, superseded};
 pub use driver_watch::{DriverPart, DriverWatch};
 #[cfg(target_os = "linux")]

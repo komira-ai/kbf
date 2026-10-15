@@ -23,13 +23,23 @@
 //! - `block-log`: `create` makes a directory where the log file this knob names
 //!   (`stdout` or `stderr`) goes, so the driver cannot create it.
 //! - `vanish-after-create`: `create` unlinks the podman program it was run as.
-//! - `status`: written by `start`; a test may preset `status-override`.
+//! - `status`: written by `start` (`<status> <exit code>`); a test may preset
+//!   `status-override`. `inspect` prints it; when its `--format` names `FinishedAt`
+//!   (Podman's mark that an exit was recorded), followed by ` false`: recorded.
+//! - `unrecorded-inspects`: a count, N. While the container has a `status`, each of
+//!   the next N `inspect`s prints `stopped 0` instead (followed by ` true` when the
+//!   format names `FinishedAt`: no exit recorded yet) and lowers the count, removing
+//!   the knob at 0: Podman's record read before it holds the container's exit.
 //! - `inspect-fails`, `kill-fails`, `rm-fails`, `ps-fails`: that verb fails.
 //! - `ps-extra`: lines `ps` prints after the container's own (`<owner> <name>`).
 //! - `unshare-noop`: `unshare rm` succeeds without removing anything.
 //! - `unshare-fails`: `unshare rm` fails.
+//! - `export-fails`: `export` fails; otherwise it writes `a tar` to its `--output` file,
+//!   and records its arguments in `export.args`.
 //! - `chown-fails`: `unshare chown`, or `unshare <helper> __chown-dirs`, to the owner
 //!   this knob holds (`1:1` or `0:0`) fails.
+//! - `chown-sleeps`: `unshare chown` to the owner this knob holds sleeps 200 ms first
+//!   (a slow hand-over).
 //! - `graph`: what `info` prints for a format naming `GraphOptions`; absent:
 //!   `overlay {}`.
 //! - `busy-once`: the next `start` fails as crun does when the program's exec finds it
@@ -228,10 +238,11 @@ impl Fake {
             b"info" => self.info(args),
             b"create" => self.create(args),
             b"start" => self.start(),
-            b"inspect" => self.inspect(),
+            b"inspect" => self.inspect(args),
             b"kill" => self.kill(args),
             b"ps" => self.ps(args),
             b"rm" => self.rm(),
+            b"export" => self.export(args),
             b"unshare" => self.unshare(args),
             _ => refuse(
                 &format!(
@@ -276,6 +287,7 @@ impl Fake {
 
     fn create(&self, args: &[Vec<u8>]) -> u8 {
         self.write("create.args", &lines(args));
+        let _ = std::fs::remove_file(self.file("tree-volumes"));
         for arg in args {
             if let Some(parent) = arg.strip_prefix(b"--cgroup-parent=") {
                 self.write_line("cgroup", parent);
@@ -283,6 +295,17 @@ impl Fake {
                 self.write_line("owner-label", owner);
             } else if let Some(name) = arg.strip_prefix(b"--name=") {
                 self.write_line("name", name);
+            } else if let Some(volume) = arg
+                .strip_prefix(b"--volume=")
+                .filter(|v| !v.windows(9).any(|w| w == b"upperdir="))
+            {
+                // A shared tree: `<source>:<destination>:<options>`, mounted by `start`.
+                let mut fields = volume.split(|b| *b == b':');
+                let (source, to) = (fields.next().unwrap_or_default(), fields.next());
+                self.append(
+                    "tree-volumes",
+                    &[source, b" ", to.unwrap_or_default()].concat(),
+                );
             } else if let Some(volume) = arg.strip_prefix(b"--volume=") {
                 // `${v%%:*}`, then `${v#*upperdir=}` and its `${u%%,*}`.
                 let root = volume.split(|b| *b == b':').next().unwrap_or_default();
@@ -327,6 +350,7 @@ impl Fake {
                 126,
             );
         }
+        self.mount_trees();
         let cgroup = self.cat("cgroup");
         let lease = [self.cat("nonce"), cgroup.clone()].concat();
         // The paths the action is given, by name: in its environment, and in place of a
@@ -397,6 +421,27 @@ impl Fake {
         self.ended(u8::try_from(code & 0xff).unwrap_or(1))
     }
 
+    /// Stands in for the read-only mounts of shared trees: the empty mount point in the
+    /// input root becomes a symlink to the tree, so the action reads it. (A symlink is
+    /// writable through; the read-only mount is checked on real Podman.)
+    fn mount_trees(&self) {
+        let root = self.cat("root");
+        for line in self.cat("tree-volumes").split(|b| *b == b'\n') {
+            let Some(at) = line.iter().position(|b| *b == b' ') else {
+                continue;
+            };
+            let (source, to) = (&line[..at], &line[at + 1..]);
+            let Some(inside) = to.strip_prefix(b"/kbf/root/") else {
+                continue;
+            };
+            let host = path(&root).join(OsStr::from_bytes(inside));
+            // Already a symlink when `start` runs again (a retried exec).
+            if std::fs::remove_dir(&host).is_ok() {
+                let _ = std::os::unix::fs::symlink(OsStr::from_bytes(source), &host);
+            }
+        }
+    }
+
     /// What `start` does once the action has ended with `code`: the status `inspect`
     /// reports, `start ended`, and the upper directory made unreadable when the
     /// overlay is the container's.
@@ -418,14 +463,37 @@ impl Fake {
         code
     }
 
-    fn inspect(&self) -> u8 {
+    fn inspect(&self, args: &[Vec<u8>]) -> u8 {
         if self.has("inspect-fails") {
             return refuse("Error: inspect refused", 125);
         }
         let Some(status) = self.read("status") else {
             return refuse("Error: no such container", 125);
         };
-        print(&status);
+        let finished = args
+            .iter()
+            .any(|a| a.starts_with(b"--format=") && a.windows(10).any(|w| w == b"FinishedAt"));
+        let unrecorded = self
+            .read("unrecorded-inspects")
+            .and_then(|n| String::from_utf8_lossy(&n).trim().parse::<u32>().ok())
+            .filter(|n| *n > 0);
+        let (status, recorded) = match unrecorded {
+            Some(n) => {
+                if n > 1 {
+                    self.write_line("unrecorded-inspects", (n - 1).to_string().as_bytes());
+                } else {
+                    let _ = std::fs::remove_file(self.file("unrecorded-inspects"));
+                }
+                (b"stopped 0".to_vec(), false)
+            }
+            None => (status.trim_ascii_end().to_vec(), true),
+        };
+        let mark: &[u8] = match (finished, recorded) {
+            (false, _) => b"",
+            (true, true) => b" false",
+            (true, false) => b" true",
+        };
+        print(&[&status[..], mark, b"\n"].concat());
         0
     }
 
@@ -507,6 +575,21 @@ impl Fake {
         0
     }
 
+    /// `export --output=FILE NAME`: writes a stand-in tar to FILE; `export-fails` refuses.
+    fn export(&self, args: &[Vec<u8>]) -> u8 {
+        self.write("export.args", &lines(args));
+        if self.has("export-fails") {
+            return refuse("Error: export refused", 125);
+        }
+        let Some(file) = args.iter().find_map(|a| a.strip_prefix(b"--output=")) else {
+            return refuse("fake podman: export: no --output", 125);
+        };
+        match std::fs::write(path(file), b"a tar") {
+            Ok(()) => 0,
+            Err(e) => refuse(&format!("fake podman: export: {e}"), 125),
+        }
+    }
+
     fn unshare(&self, args: &[Vec<u8>]) -> u8 {
         if args.first().is_some_and(|a| a == b"chown") {
             // chown -hR OWNER -- PATHS...
@@ -519,6 +602,9 @@ impl Fake {
                 return refuse(&format!("fake podman: chown {all}"), 125);
             };
             let paths = &args[4..];
+            if self.has("chown-sleeps") && self.cat("chown-sleeps") == *owner {
+                std::thread::sleep(Duration::from_millis(200));
+            }
             self.append(
                 "events",
                 &[b"chown ", &owner[..], b" ", &joined(paths)].concat(),

@@ -8,7 +8,10 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
+use kbf_daemon::trees::SharedMount;
 use tokio::process::{Child, Command};
+
+use crate::exit_record;
 
 /// Where the input root appears inside the container.
 pub const EXEC_ROOT: &str = "/kbf/root";
@@ -78,6 +81,10 @@ pub(crate) struct ContainerSpec {
     pub owner: String,
     /// `<repo>@sha256:<digest>`.
     pub image: String,
+    /// `sha256:<hex>`: the image's digest alone.
+    pub image_digest: String,
+    /// The lease's scratch directory.
+    pub dir: PathBuf,
     /// The lease cgroup, as `--cgroup-parent` names it.
     pub cgroup_parent: String,
     /// The input root on the host: the overlay's read-only lower layer.
@@ -91,6 +98,8 @@ pub(crate) struct ContainerSpec {
     pub env: Vec<(String, String)>,
     pub argv: Vec<String>,
     pub limits: ContainerLimits,
+    /// Host directories mounted read-only inside the exec root (shared trees).
+    pub shared: Vec<SharedMount>,
 }
 
 /// The `podman create` arguments for `spec`.
@@ -103,7 +112,10 @@ pub(crate) struct ContainerSpec {
 ///   and `CMD` are both ignored and no argument is re-split.
 /// - **Files:** the input root as an overlay: the host copy is never written, and
 ///   every write lands in `upper`, which the driver reads outputs from (no output may
-///   already be an input, so each is whole there).
+///   already be an input, so each is whole there). Each shared tree is a second
+///   `--volume=<tree>:/kbf/root/<path>:ro,nosuid,nodev` on top of it: read-only, so a
+///   write into a toolchain fails `EROFS` and the input root's own directory there is
+///   an empty mount point.
 /// - **Memory:** `memory.oom.group=1` on the container, so an OOM kill takes the whole
 ///   action. Limits live on the lease cgroup (see `cgroup`), never `--memory`.
 ///   `--oom-score-adj=0`: a process inherits its parent's `oom_score_adj`, and the
@@ -169,6 +181,12 @@ pub(crate) fn create_args(spec: &ContainerSpec) -> Vec<OsString> {
     volume.push(",workdir=");
     volume.push(&spec.overlay_work);
     args.push(volume);
+    for mount in &spec.shared {
+        let mut tree = OsString::from("--volume=");
+        tree.push(&mount.source);
+        tree.push(format!(":{EXEC_ROOT}/{}:ro,nosuid,nodev", mount.path));
+        args.push(tree);
+    }
     args.push(spec.image.clone().into());
     args
 }
@@ -200,6 +218,11 @@ fn failure(verb: &str, output: &std::process::Output) -> String {
 impl Podman {
     pub(crate) fn new(program: PathBuf) -> Self {
         Self { program }
+    }
+
+    /// The `podman` program.
+    pub(crate) fn program(&self) -> &Path {
+        &self.program
     }
 
     fn command(&self) -> Command {
@@ -278,25 +301,27 @@ impl Podman {
     /// How the container ended, from Podman's record, not from `podman start`'s own
     /// status, which also reports Podman's errors: its exit code, or the state of a
     /// container that did not run to an exit.
-    pub(crate) async fn ended(&self, name: &str) -> Result<Ended, String> {
-        let args = [
-            "inspect",
-            "--type=container",
-            "--format={{.State.Status}} {{.State.ExitCode}}",
-            name,
-        ]
-        .map(OsString::from);
-        let output = self.output(&args).await?;
-        if !output.status.success() {
-            return Err(failure("inspect", &output));
-        }
-        let text = String::from_utf8_lossy(&output.stdout);
-        match text.split_whitespace().collect::<Vec<_>>()[..] {
-            ["exited", code] => code
-                .parse()
-                .map(Ended::Exited)
-                .map_err(|_| format!("podman inspect: exit code {code:?}")),
-            _ => Ok(Ended::NotRun(text.trim().to_owned())),
+    ///
+    /// An exit is taken only from a record that says one was recorded (`FinishedAt`
+    /// set, [`crate::exit_record`]): `stopped` (Podman has read the exit but not yet
+    /// cleaned up) or `exited`. A `stopped` or `exited` record without one is read
+    /// again until it has one, for at most [`crate::exit_record::DEADLINE`]; past it
+    /// the error names Podman's last record and what `podman start` wrote to `stderr`.
+    /// The container is never started again.
+    pub(crate) async fn ended(&self, name: &str, stderr: &Path) -> Result<Ended, String> {
+        let inspect = || async {
+            let args =
+                ["inspect", "--type=container", exit_record::FORMAT, name].map(OsString::from);
+            let output = self.output(&args).await?;
+            if output.status.success() {
+                Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+            } else {
+                Err(failure("inspect", &output))
+            }
+        };
+        match exit_record::wait(inspect, exit_record::DEADLINE, exit_record::EVERY).await {
+            Ok(ended) => Ok(ended),
+            Err(no_exit) => Err(no_exit.reason(stderr).await),
         }
     }
 
@@ -418,6 +443,8 @@ pub(crate) mod tests {
             name: "kbf-lease-1-2".to_owned(),
             owner: "node-1".to_owned(),
             image: format!("docker.io/library/busybox@sha256:{}", "a".repeat(64)),
+            image_digest: format!("sha256:{}", "a".repeat(64)),
+            dir: PathBuf::from("/scratch/kbf-lease-1-2"),
             cgroup_parent: "/kbf.slice/actions/kbf-lease-1-2".to_owned(),
             input_root: PathBuf::from("/scratch/kbf-lease-1-2/root"),
             upper: PathBuf::from("/scratch/kbf-lease-1-2/upper"),
@@ -431,6 +458,7 @@ pub(crate) mod tests {
                 nofile: 103,
                 nproc: 104,
             },
+            shared: Vec::new(),
         }
     }
 
@@ -525,6 +553,44 @@ pub(crate) mod tests {
         assert_eq!(env, ["--env=PATH=/bin"], "{args:?}");
         let users: Vec<_> = args.iter().filter(|a| a.starts_with("--user=")).collect();
         assert_eq!(users, ["--user=0:0"], "{args:?}");
+    }
+
+    /// Catches a shared tree mounted writable (the "drop `:ro`" mutant: an action could
+    /// change a toolchain every other action reads), mounted outside the exec root, or
+    /// put before the overlay it lies on (podman sorts by destination, but the golden
+    /// order is the one the fake and the real tests run), and a spec without trees
+    /// gaining a volume.
+    #[test]
+    fn shared_trees_are_read_only_volumes_inside_the_exec_root() {
+        let none = strings(&create_args(&spec()));
+        assert_eq!(
+            none.iter().filter(|a| a.starts_with("--volume=")).count(),
+            1
+        );
+        let mut with = spec();
+        with.shared = vec![
+            SharedMount {
+                path: "external/zig".to_owned(),
+                source: PathBuf::from("/trees/aa-1"),
+            },
+            SharedMount {
+                path: "lib".to_owned(),
+                source: PathBuf::from("/trees/bb-2"),
+            },
+        ];
+        let args = strings(&create_args(&with));
+        let volumes: Vec<_> = args.iter().filter(|a| a.starts_with("--volume=")).collect();
+        assert_eq!(volumes.len(), 3, "{args:?}");
+        assert!(volumes[0].contains(":O,upperdir="), "{volumes:?}");
+        assert_eq!(
+            volumes[1],
+            "--volume=/trees/aa-1:/kbf/root/external/zig:ro,nosuid,nodev"
+        );
+        assert_eq!(
+            volumes[2],
+            "--volume=/trees/bb-2:/kbf/root/lib:ro,nosuid,nodev"
+        );
+        assert_eq!(args.last(), Some(&with.image));
     }
 
     /// Catches a limit left to Podman's defaults or a node's `containers.conf` (the

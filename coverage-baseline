@@ -12,7 +12,7 @@ kbf-baseline              0      0
 kbf-bench                 0      0
 kbf-caps                  2      1
 kbf-coverage              0      0
-kbf-daemon               29      6
+kbf-daemon               31      6
 kbf-deploy                0      0
 kbf-driver-container      0      0
 kbf-driver-native         0      0
@@ -40,6 +40,7 @@ kbf-sim                   6      3
 kbf-sim-cell              4     15
 kbf-store                 0      0
 kbf-testkit               0      0
+kbf-threads               0      0
 kbf-tier                  0      0
 kbf-transfer              0      0
 kbf-types                 3      2

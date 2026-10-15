@@ -5,6 +5,8 @@
 #[path = "binary/cache.rs"]
 mod cache;
 mod front;
+#[path = "binary/guarded.rs"]
+mod guarded;
 
 use std::io::{BufRead, BufReader, Write as _};
 use std::path::{Path, PathBuf};
@@ -12,6 +14,8 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use rcgen::{CertificateParams, CertifiedIssuer, IsCa, KeyPair};
+
+use guarded::{Guarded, SpawnGuarded as _};
 
 const BIN: &str = env!("CARGO_BIN_EXE_kbf-daemon");
 
@@ -135,7 +139,7 @@ fn keep(mode: kbf_daemon::keeper::Mode) -> Duration {
 
     let mut child = keeper::command(Path::new(BIN), &mode)
         .process_group(0)
-        .spawn()
+        .spawn_guarded()
         .expect("spawn");
     let started = keeper::started(&mut child);
     let closed = Instant::now();
@@ -266,7 +270,7 @@ fn runs_until_sigterm_logged_then(
         .args(base(&dir))
         .args(extra)
         .stderr(Stdio::piped())
-        .spawn()
+        .spawn_guarded()
         .expect("spawn");
     // Read on another thread to the end, so the daemon never writes to a closed pipe.
     let stderr = BufReader::new(child.stderr.take().expect("stderr"));
@@ -323,6 +327,98 @@ fn runs_until_sigterm_logged_then(
     );
     let all = all.into_iter().cloned().collect();
     (status, all)
+}
+
+/// The thread flags reach the daemon's runtime: it logs the sizes it resolved and runs
+/// exactly that many async workers (the `kbf-async` threads of `/proc`).
+///
+/// Catches: flags parsed and dropped (the log would show the defaults, the runtime
+/// tokio's one worker per CPU), and a start that logs nothing about its sizes.
+#[cfg(target_os = "linux")]
+#[test]
+fn thread_flags_size_the_runtime_and_are_logged() {
+    let flags = [
+        "--driver=fake",
+        "--async-threads=3",
+        "--blocking-threads=5",
+        "--cpu-threads=2",
+    ]
+    .map(str::to_owned);
+    let mut workers = 0;
+    let (status, log) = runs_until_sigterm_logged_then("threads", &flags, None, || {
+        // A thread carries its name only once it has run its first instructions, which
+        // can be after the start line: wait for the count (up to 10 s).
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            workers = kbf_async_threads("--blocking-threads=5");
+            if workers == 3 || Instant::now() > deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    });
+    assert!(status.success(), "{status}");
+    assert_eq!(workers, 3);
+    assert!(
+        log.iter()
+            .any(|l| l.contains("threads: async=3 blocking=5 cpu=2 reserve=")),
+        "{log:#?}"
+    );
+}
+
+/// A reserve that leaves the daemon no CPU, or is more than the machine has, stops the
+/// start with a message naming the flag and the CPUs; a negative one is a usage error.
+///
+/// Catches: the reserve parsed and never checked (a daemon whose leases get no CPU
+/// starts), the check dropped for the fake driver, and a message that does not say what
+/// to give less than.
+#[test]
+fn a_reserve_the_machine_cannot_give_stops_the_start() {
+    let cpus = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let dir = tls("reserve-refused");
+    for reserve in [cpus, cpus + 1] {
+        let out = Command::new(BIN)
+            .args(base(&dir))
+            .args([
+                "--driver=fake".to_owned(),
+                format!("--reserve-cpus={reserve}"),
+            ])
+            .output()
+            .expect("spawn");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{stderr}");
+        assert!(
+            stderr.contains(&format!("--reserve-cpus={reserve}"))
+                && stderr.contains(&format!("{cpus}")),
+            "{stderr}"
+        );
+    }
+    let zero = Command::new(BIN)
+        .args(base(&dir))
+        .args(["--driver=fake", "--reserve-cpus=-1"])
+        .output()
+        .expect("spawn");
+    assert_eq!(zero.status.code(), Some(2), "-1 is a usage error");
+}
+
+/// The `kbf-async` threads of the one daemon whose command line holds `flag` (no other
+/// test here gives it).
+#[cfg(target_os = "linux")]
+fn kbf_async_threads(flag: &str) -> usize {
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir("/proc").expect("/proc").flatten() {
+        let cmdline = std::fs::read(entry.path().join("cmdline")).unwrap_or_default();
+        let has = |want: &str| cmdline.split(|b| *b == 0).any(|arg| arg == want.as_bytes());
+        if has(flag) && has("--driver=fake") {
+            found.push(entry.path());
+        }
+    }
+    assert_eq!(found.len(), 1, "daemons with {flag}: {found:?}");
+    std::fs::read_dir(found[0].join("task"))
+        .expect("task dir")
+        .filter_map(|t| std::fs::read_to_string(t.ok()?.path().join("comm")).ok())
+        .filter(|name| name.trim() == "kbf-async")
+        .count()
 }
 
 /// Catches: a driver that cannot be brought up from the command line (a missing
@@ -460,7 +556,7 @@ fn a_container_node_reports_what_its_leases_may_use() {
         ])
         .args(cgroup_flags)
         .stderr(std::fs::File::create(&log).expect("log file"))
-        .spawn()
+        .spawn_guarded()
         .expect("spawn");
     let session = front.session(PROMPT);
     let hello = session.next(PROMPT);
@@ -485,6 +581,119 @@ fn a_container_node_reports_what_its_leases_may_use() {
     assert!(
         log.contains("memory.min 0 bytes, below the daemon's 536870912")
             && log.contains("set MemoryMin= on its unit and slice to at least 512 MiB"),
+        "{log}"
+    );
+}
+
+/// Whatever the driver, the node reports the CPUs its leases get: the CPUs it may use
+/// minus `--reserve-cpus` (here the fake driver, which has no cgroup to limit).
+///
+/// Catches: the reserve applied only where there is a cgroup (a native node would book
+/// the whole machine, the reserve included).
+#[test]
+fn the_hello_reports_the_cpus_minus_the_reserve() {
+    let cpus = std::thread::available_parallelism().map_or(1, |n| n.get());
+    assert!(cpus >= 2, "this test needs 2 CPUs to reserve 1");
+    let dir = tls("reserve-hello");
+    let front = front::Front::start(&dir);
+    let mut child = Command::new(BIN)
+        .args([
+            format!("--server=https://127.0.0.1:{}", front.worker.port()),
+            "--tls-server-name=localhost".to_owned(),
+            format!("--ca-cert={}", dir.join("ca.pem").display()),
+            format!("--cert={}", dir.join("node.pem").display()),
+            format!("--key={}", dir.join("node.key").display()),
+            "--node-id=node-1".to_owned(),
+            "--driver=fake".to_owned(),
+            "--reserve-cpus=1".to_owned(),
+        ])
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn");
+    let session = front.session(PROMPT);
+    let hello = session.next(PROMPT);
+    stop(&mut child, libc::SIGTERM);
+    let Some(kbf_proto::worker::daemon_message::Message::Hello(hello)) = hello else {
+        panic!("expected a Hello, got {hello:?}");
+    };
+    let reported: Vec<&str> = hello
+        .capabilities
+        .iter()
+        .filter(|c| c.key == "cpus")
+        .map(|c| c.value.as_str())
+        .collect();
+    assert_eq!(reported, [(cpus - 1).to_string()]);
+}
+
+/// A container node's leases get the CPUs it may use minus `--reserve-cpus`, and the
+/// kernel is told: `actions/cpu.max` is that many CPUs of time (no pinning: no
+/// `cpuset.cpus` is written) and the `Hello` reports it as `cpus`.
+///
+/// Catches: the reserve not reaching the `actions` cgroup (leases could use the whole
+/// node, starving the daemon and the server), the quota written in the wrong unit, the
+/// reserve taken from the node report only (the kernel would not enforce it), and a
+/// cpuset written (pinning).
+#[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "the container driver is Linux-only"
+)]
+fn a_container_nodes_leases_get_the_cpus_minus_the_reserve() {
+    let cpus = std::thread::available_parallelism().map_or(1, |n| n.get());
+    assert!(cpus >= 2, "this test needs 2 CPUs to reserve 1");
+    let dir = tls("reserve");
+    let front = front::Front::start(&dir);
+    let ids = id_files("reserve-ids", "65536");
+    let (unit, cgroup_flags) = cgroup_tree(&dir, "cpu memory pids");
+    std::fs::remove_file(unit.join("cpuset.cpus.effective")).expect("no cpuset");
+    let (bin, _) = podman_stub("reserve-bin");
+    let log = dir.join("daemon.log");
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let mut child = Command::new(BIN)
+        .env("PATH", path)
+        .args([
+            format!("--server=https://127.0.0.1:{}", front.worker.port()),
+            "--tls-server-name=localhost".to_owned(),
+            format!("--ca-cert={}", dir.join("ca.pem").display()),
+            format!("--cert={}", dir.join("node.pem").display()),
+            format!("--key={}", dir.join("node.key").display()),
+            "--node-id=node-1".to_owned(),
+            "--driver=container".to_owned(),
+            format!("--cas=https://127.0.0.1:{}", front.worker.port()),
+            format!("--scratch={}", dir.join("leases").display()),
+            format!("--id-files={}", ids.display()),
+            "--reserve-cpus=1".to_owned(),
+        ])
+        .args(cgroup_flags)
+        .stderr(std::fs::File::create(&log).expect("log file"))
+        .spawn()
+        .expect("spawn");
+    let session = front.session(PROMPT);
+    let hello = session.next(PROMPT);
+    let status = stop(&mut child, libc::SIGTERM);
+    let log = read(&log);
+    let Some(kbf_proto::worker::daemon_message::Message::Hello(hello)) = hello else {
+        panic!("expected a Hello, got {hello:?}: {log}");
+    };
+    let reported: Vec<&str> = hello
+        .capabilities
+        .iter()
+        .filter(|c| c.key == "cpus")
+        .map(|c| c.value.as_str())
+        .collect();
+    assert_eq!(reported, [(cpus - 1).to_string()], "{log}");
+    assert!(status.success(), "{status}: {log}");
+    assert_eq!(
+        read(&unit.join("actions/cpu.max")),
+        format!("{} 100000", (cpus - 1) * 100_000)
+    );
+    assert!(!unit.join("actions/cpuset.cpus").exists(), "pinned: {log}");
+    assert!(
+        log.contains(&format!("leases may use {} CPUs", cpus - 1)),
         "{log}"
     );
 }
@@ -725,7 +934,7 @@ fn a_container_node_without_subordinate_ids_refuses_to_start() {
                 format!("--id-files={}", ids.display()),
             ])
             .stderr(std::fs::File::create(&log).expect("stderr file"))
-            .spawn()
+            .spawn_guarded()
             .expect("spawn");
         // A daemon that passed the check would run until stopped: bound the wait.
         let status = refused_within(&mut child, name, &log);
@@ -734,6 +943,52 @@ fn a_container_node_without_subordinate_ids_refuses_to_start() {
         let says = format!("kbf-daemon: {}/{says}", ids.display());
         assert!(stderr.contains(&says), "{name}: {stderr}");
     }
+}
+
+/// Catches `--container-runtime` and `--oci-runtime` not reaching the driver: a node told
+/// to run actions through a runtime that is not there refuses to start, naming it (the
+/// "ignore the flag" mutant would start a Podman node), and a runtime that is neither
+/// `podman` nor `oci` is refused by the parser.
+#[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "the container driver is Linux-only"
+)]
+fn a_node_told_to_use_the_oci_backend_needs_its_runtime() {
+    let ids = id_files("oci-ids", "65536");
+    let (_unit, cgroup_flags) = cgroup_tree(&tls("oci-cgroup"), "cpu memory pids");
+    let absent = ids.join("no-such-crun");
+    let log = ids.join("stderr");
+    let mut container = vec![
+        "--driver=container".to_owned(),
+        "--cas=https://127.0.0.1:1".to_owned(),
+        format!("--scratch={}", ids.join("leases").display()),
+        format!("--id-files={}", ids.display()),
+        "--actions-memory-max-gib=1".to_owned(),
+        "--container-runtime=oci".to_owned(),
+        format!("--oci-runtime={}", absent.display()),
+    ];
+    container.extend(cgroup_flags);
+    let mut child = Command::new(BIN)
+        .args(base(&ids))
+        .args(&container)
+        .stderr(std::fs::File::create(&log).expect("stderr file"))
+        .spawn()
+        .expect("spawn");
+    let status = refused_within(&mut child, "oci", &log);
+    assert_eq!(status.code(), Some(1));
+    let says = format!("the OCI backend: {} is not a file", absent.display());
+    let stderr = read(&log);
+    assert!(stderr.contains(&says), "{stderr}");
+
+    let out = Command::new(BIN)
+        .args(base(&ids))
+        .args(["--driver=fake", "--container-runtime=runc"])
+        .output()
+        .expect("spawn");
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("possible values: podman, oci"), "{stderr}");
 }
 
 /// The exit status of `child`, a daemon expected to refuse to start, waited for up to
@@ -799,7 +1054,7 @@ fn a_container_node_given_a_zero_limit_refuses_to_start() {
             ])
             .args(cgroup_flags)
             .stderr(std::fs::File::create(&log).expect("stderr file"))
-            .spawn()
+            .spawn_guarded()
             .expect("spawn");
         let status = refused_within(&mut child, flag, &log);
         let stderr = read(&log);
@@ -817,11 +1072,11 @@ fn a_container_node_given_a_zero_limit_refuses_to_start() {
 const PROMPT: Duration = Duration::from_secs(30);
 
 /// Starts the daemon with `flags`, its log written to `log`.
-fn daemon(flags: &[String], log: &Path) -> std::process::Child {
+fn daemon(flags: &[String], log: &Path) -> Guarded {
     Command::new(BIN)
         .args(flags)
         .stderr(std::fs::File::create(log).expect("log file"))
-        .spawn()
+        .spawn_guarded()
         .expect("spawn")
 }
 
@@ -1223,7 +1478,7 @@ fn a_container_node_refuses_to_start_on_an_image_it_cannot_run() {
             .args(base(&dir))
             .args(container_flags(&dir, &ids, &images))
             .stderr(std::fs::File::create(&log).expect("log file"))
-            .spawn()
+            .spawn_guarded()
             .expect("spawn");
         let status = refused_within(&mut child, name, &log);
         let log = read(&log);
@@ -1281,7 +1536,7 @@ fn a_container_node_lists_its_pinned_images_in_its_status() {
         .env("PATH", path)
         .args(flags)
         .stderr(std::fs::File::create(&log).expect("log file"))
-        .spawn()
+        .spawn_guarded()
         .expect("spawn");
     let session = front.session(PROMPT);
     session.hello();

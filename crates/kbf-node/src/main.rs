@@ -75,6 +75,12 @@ struct Cli {
     scratch: Option<PathBuf>,
     #[command(flatten)]
     outputs: OutputLimits,
+    /// `--reserve-cpus`: the logical CPUs the farm's processes keep; the leases get the
+    /// rest of the CPUs the daemon may use, and the daemon's async, blocking and CPU
+    /// pools are sized from it (`--async-threads`, `--blocking-threads` and
+    /// `--cpu-threads` override them). See `kbf_threads`.
+    #[command(flatten)]
+    threads: kbf_threads::ThreadArgs,
     /// How long one lease's whole output upload (its output files, stdout and stderr)
     /// may take, in seconds, before the lease fails with a reason naming the upload and
     /// the time it ran (container and native drivers). Without it, a store that stops
@@ -87,6 +93,8 @@ struct Cli {
     output_upload_deadline_secs: u64,
     #[command(flatten)]
     cache: cache::CacheArgs,
+    #[command(flatten)]
+    trees: cache::TreeArgs,
     #[command(flatten)]
     transfer: transfer::TransferArgs,
     /// The cgroup lease cgroups are made under, from the cgroup root (container). Left
@@ -184,6 +192,17 @@ struct Cli {
     /// No work is placed by image yet: an action may still name another image.
     #[arg(long = "image", value_name = "IMAGE")]
     images: Vec<String>,
+    /// The runtime that runs each action's container (container): `podman`, the default,
+    /// runs `podman create` and `podman start` per action; `oci` runs each action in a
+    /// fresh rootless sandbox through `--oci-runtime` directly, with no Podman on the
+    /// action path (Podman only pulls and exports an image once per digest). `oci` needs
+    /// the daemon user's subordinate ids in one range, `uidmap`, and every directory down
+    /// to `--scratch` searchable by others.
+    #[arg(long, default_value = "podman", value_parser = ["podman", "oci"], value_name = "podman|oci")]
+    container_runtime: String,
+    /// The OCI runtime `--container-runtime=oci` runs actions with (container).
+    #[arg(long, default_value = "/usr/bin/crun")]
+    oci_runtime: PathBuf,
     /// A directory holding `passwd`, `subuid` and `subgid` that the container
     /// driver's startup check reads instead of `/etc`'s. For tests of that check only.
     #[arg(long, hide = true)]
@@ -280,10 +299,27 @@ fn main() -> ExitCode {
     }
 }
 
+/// The thread sizes the flags and this machine's CPUs give; fails on a reserve the
+/// machine cannot give.
+fn sizes(cli: &Cli) -> Result<kbf_threads::Sizes, Error> {
+    Ok(sizes_on(cli, kbf_threads::Topology::detect())?)
+}
+
+/// [`sizes`] on a given machine shape: the reserve, the pools from it, then the
+/// overrides.
+fn sizes_on(
+    cli: &Cli,
+    topology: kbf_threads::Topology,
+) -> Result<kbf_threads::Sizes, kbf_threads::ReserveError> {
+    cli.threads.resolve(topology)
+}
+
 /// Builds the runtimes `--driver` names and serves until a signal; returns an error
 /// that stopped the daemon from starting.
 fn start(cli: &Cli) -> Result<(), Error> {
-    let tokio = tokio::runtime::Runtime::new()?;
+    let sizes = sizes(cli)?;
+    sizes.log();
+    let tokio = sizes.runtime()?;
     // The CAS channel is made lazily, which needs the runtime's context.
     let _context = tokio.enter();
     let (daemon, _) = node(cli, || native_config(cli), Path::new(xcode::XCRUN))?;
@@ -368,6 +404,11 @@ fn node(
                 if let Some(warning) = cache::native_warning(&cli.cache) {
                     tracing::warn!("{warning}");
                 }
+                if cli.trees.tree_dir.is_some() {
+                    tracing::warn!(
+                        "trees: off:native: only the container driver mounts shared trees"
+                    );
+                }
                 let config = native()?;
                 let cas = node.transfers(cli)?;
                 let (runtime, reports) = native_runtime(cli, config, xcrun, cas)?;
@@ -379,6 +420,10 @@ fn node(
         }
     }
     let runtimes = node.runtimes.ok_or("no --driver given")?;
+    // Whatever the driver, leases get the CPUs the daemon may use but the reserve (the
+    // container driver's `actions/cpu.max` says the same to the kernel).
+    let leases = sizes(cli)?.lease_cpus() as u64;
+    node.capacity.cpus = Some(node.capacity.cpus.map_or(leases, |cpus| cpus.min(leases)));
     // `Daemon::new` adds every runtime's driver.
     let report = NodeReport::detect(&[])?
         .with_entries(cli.daemon.label_entries())
@@ -581,6 +626,9 @@ mod container {
                 delegation.actions
             }
         };
+        // The leases' share of the CPUs: all the daemon may use but `--reserve-cpus`.
+        // A limit on the actions cgroup, not a pinning: any CPU, at most this many.
+        kbf_driver_container::limit_cpus(mount, &parent, super::sizes(cli)?.lease_cpus() as u64)?;
         let capacity = kbf_driver_container::capacity(mount, &parent)?;
         tracing::info!(
             "leases may use {} CPUs and {} of memory (cgroup {parent})",
@@ -590,6 +638,9 @@ mod container {
                 .map_or("all".to_owned(), |b| format!("{} GiB", b >> 30))
         );
         let mut config = PodmanConfig::new(scratch, parent, cli.daemon.node_id.clone());
+        config.container_runtime = cli.container_runtime.parse()?;
+        config.oci.runtime = cli.oci_runtime.clone();
+        config.oci.id_files = files;
         config.cgroup_root = mount.clone();
         config.outputs = OutputLimits {
             max_depth: cli.outputs.max_depth,
@@ -598,9 +649,10 @@ mod container {
             max_stdio_bytes: cli.outputs.max_stdio_bytes,
         };
         config.upload_deadline = super::upload_deadline(cli);
+        config.cpu = cpu_pool(cli)?;
         config.limits = limits(cli);
         config.swap_kill = swap_kill(cli);
-        config.cache = crate::cache::given(&cli.cache, &config.scratch);
+        config.cache = crate::cache::given(&cli.cache, &cli.trees, &config.scratch);
         let runtime = PodmanRuntime::new(config, cas)?;
         // From `start`, in the runtime's context but outside any task.
         tokio::runtime::Handle::current().block_on(check_images(&runtime, &cli.images))?;
@@ -634,6 +686,11 @@ mod container {
             percent: cli.lease_swap_kill_percent,
             every: Duration::from_millis(cli.lease_swap_poll_ms),
         }
+    }
+
+    /// The CPU pool the container driver hashes outputs on, sized by `--cpu-threads`.
+    pub(super) fn cpu_pool(cli: &Cli) -> Result<kbf_daemon::CpuPool, Error> {
+        Ok(kbf_daemon::CpuPool::new(super::sizes(cli)?.cpu_threads()))
     }
 
     /// The `--container-*` limits.
@@ -816,6 +873,66 @@ mod tests {
         );
         let defaults = parse(&["--driver=container"]).expect("flags");
         assert_eq!(container::limits(&defaults), ContainerLimits::DEFAULT);
+    }
+
+    /// Catches `--cpu-threads` not parsed, not reaching the sizes the CPU pool is built
+    /// from, or accepting 0 (a pool that never runs a job).
+    #[test]
+    fn cpu_threads_is_a_flag() {
+        let cli = parse(&["--driver=fake", "--cpu-threads=6"]).expect("flags");
+        assert_eq!(sizes(&cli).expect("sizes").cpu_threads(), 6);
+        let cli = parse(&["--driver=fake"]).expect("flags");
+        assert!(sizes(&cli).expect("sizes").cpu_threads() >= 1);
+        assert!(parse(&["--driver=fake", "--cpu-threads=0"]).is_err());
+    }
+
+    /// Catches the container driver's pool not following `--cpu-threads` (a fixed size
+    /// in its construction). 6 and 3 are not the default on any machine's topology.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cpu_threads_reaches_the_container_pool() {
+        let cli = parse(&["--driver=container", "--cpu-threads=6"]).expect("flags");
+        assert_eq!(container::cpu_pool(&cli).expect("pool").threads(), 6);
+        let cli = parse(&["--driver=container", "--cpu-threads=3"]).expect("flags");
+        assert_eq!(container::cpu_pool(&cli).expect("pool").threads(), 3);
+    }
+
+    /// Catches the daemon resolving another role's defaults: on the 44-core,
+    /// 2-threads-per-core farm node it is a reserve of 8, so 2 async, 64 blocking and 4
+    /// CPU threads and 80 CPUs for leases (the server's would be 22, 128, 44), a
+    /// flag still wins over its default, the pools follow `--reserve-cpus`, and a
+    /// reserve of the whole machine is refused.
+    #[test]
+    fn the_daemon_resolves_the_daemon_role() {
+        let topology = || kbf_threads::Topology::new(88, 2);
+        let cli = parse(&["--driver=fake"]).expect("flags");
+        let sizes = sizes_on(&cli, topology()).expect("sizes");
+        assert_eq!(
+            (
+                sizes.async_threads(),
+                sizes.blocking_threads(),
+                sizes.cpu_threads(),
+                sizes.lease_cpus()
+            ),
+            (2, 64, 4, 80)
+        );
+        let cli = parse(&["--driver=fake", "--async-threads=5"]).expect("flags");
+        assert_eq!(
+            sizes_on(&cli, topology()).expect("sizes").async_threads(),
+            5
+        );
+        let cli = parse(&["--driver=fake", "--reserve-cpus=40"]).expect("flags");
+        let sizes = sizes_on(&cli, topology()).expect("sizes");
+        assert_eq!(
+            (
+                sizes.async_threads(),
+                sizes.cpu_threads(),
+                sizes.lease_cpus()
+            ),
+            (10, 20, 48)
+        );
+        let cli = parse(&["--driver=fake", "--reserve-cpus=88"]).expect("flags");
+        assert!(sizes_on(&cli, topology()).is_err());
     }
 
     /// Catches a `--lease-swap-*` flag that does not reach the driver's swap watch (in

@@ -16,11 +16,14 @@
 //!   stores of tests), with [`digest_of`], [`fetch`] and [`label`].
 //! - [`Transfers`] and [`Scope`]: the engine, and one lease's view of it, which counts
 //!   the lease's [`TransferStats`].
-//! - [`TransferConfig`]: the `--transfer-*` flags and `--segment-upload-streams`.
-//! - [`Spool`]: an action's outputs gathered in one local file, which
-//!   [`Cas::put_spool`] stores; the engine sends them as whole segments over
-//!   `kbf.worker.v1.Segments` (`docs/design/write-path.md`, section 4), blob by blob
-//!   when the server cannot take them.
+//! - [`TransferConfig`]: the `--transfer-*` flags and `--segment-upload-streams` and `--segment-uploads-in-flight`.
+//! - [`Record`]: a blob to store, with where its bytes are ([`Source`]: memory, a file the
+//!   caller hashed, or a [`Spool`]). [`Cas::put_records`] stores them; the engine reads
+//!   each from its source as it sends it, in whole segments over `kbf.worker.v1.Segments`
+//!   (`docs/design/write-path.md`, section 4), blob by blob when the server cannot take
+//!   them.
+//! - [`Spool`]: outputs gathered in one local file ([`Cas::put_spool`]); the native
+//!   driver's way, a [`Record`] each.
 //!
 //! The engine's core (the permits, the byte budget, the shared fetches and the counters)
 //! is in `engine` and `flights`; the REAPI backend (ByteStream and FindMissing calls)
@@ -36,16 +39,21 @@ mod engine;
 mod find;
 mod flights;
 mod segments;
+mod source;
 mod spool;
 mod stats;
 mod wire;
 
 pub use cas::{Cas, CasError, Chunks, WRITE_CHUNK_BYTES, digest_of, fetch, label};
-pub use config::{DEFAULT_IN_FLIGHT, DEFAULT_SEGMENT_STREAMS, TransferConfig};
+pub use config::{
+    DEFAULT_IN_FLIGHT, DEFAULT_SEGMENT_STREAMS, DEFAULT_SEGMENT_UPLOADS, TransferConfig,
+};
 pub use engine::{Scope, Transfers};
+pub use kbf_segments::RecordHasher;
 pub use segments::{
     COALESCE_GAP_BYTES, Located, MAX_RANGE_BYTES, MAX_UPLOAD_RECORDS, SEGMENT_UPLOAD_BYTES,
 };
-pub use spool::{Spool, Spooled};
+pub use source::{FileSource, OPEN_DIRECTORY, OPEN_FILE, Record, Source, Stamp, descend};
+pub use spool::{Spool, Spooled, to_proto as proto_digest};
 pub use stats::{EngineStats, TransferStats};
 pub use wire::MAX_MESSAGE_BYTES;

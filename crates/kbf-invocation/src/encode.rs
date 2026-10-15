@@ -145,6 +145,7 @@ fn requeue(r: RequeueReason) -> proto::Requeue {
         RequeueReason::Restarted => (P::Restarted, 0, 0),
         RequeueReason::Lost(LostWhy::DaemonRestarted) => (P::LostDaemonRestarted, 0, 0),
         RequeueReason::Lost(LostWhy::Fenced) => (P::LostFenced, 0, 0),
+        RequeueReason::Infra => (P::Infra, 0, 0),
     };
     proto::Requeue {
         reason: reason.into(),

@@ -17,6 +17,15 @@
 //!   to `gh-args` next to it, and verifies the file when `attested` next to it holds
 //!   the line `<SHA-256 of the file> <flags>`: the store of attestations, each the file
 //!   it covers and the exact flags it verifies under.
+//! - Run as `gh api <path>`, it prints the value under the key `<path>` of the JSON
+//!   object in `gh-api.json` next to it, or `gh: Not Found (HTTP 404)` on stderr and
+//!   exits 1 when there is none: the GitHub API, as a test wrote it.
+//! - Run as `gh release create|upload <tag> <files> --repo <repo> ...`, it copies each
+//!   file into `releases/<tag>/` next to it (create makes that directory and fails if
+//!   it exists; a file already there fails the command, as GitHub refuses an asset
+//!   name twice), then records the release's assets under
+//!   `repos/<repo>/releases/tags/<tag>` in `gh-api.json`. `gh release download <tag>
+//!   --dir <dir>` copies every file of `releases/<tag>/` into `<dir>`.
 //! - Run as `sudo`, it appends `<working directory>: <arguments>` as one line to
 //!   `sudo-args` next to it, and exits 0 (the tests it was asked to run passed).
 //! - Run as `podman`, it appends `XDG_RUNTIME_DIR=<value>: <arguments>` as one line to
@@ -33,7 +42,10 @@
 //! fails), `vanish` (the build stamped `b2b2b2b2b2b2` deletes the fake cargo, so the
 //! next build cannot start) or `version-fails` (`kbf-server` exits 1). Of the
 //! attestation store: `accepts-all` (every file verifies, whatever the flags) or
-//! `ignores-bytes` (a file verifies when any attestation has its flags). Of sudo:
+//! `ignores-bytes` (a file verifies when any attestation has its flags). Of the API:
+//! `api-fails` (every `gh api` exits 1 with an HTTP 502) or `api-garbage` (every `gh
+//! api` prints something that is not JSON). Of releases: `release-fails` (every `gh
+//! release` command exits 1). Of sudo:
 //! `tests-fail` (it exits 101, as a failed test binary does) or `fails:<a>,<b>,...`
 //! (it exits 101 when one of its arguments is one of `<a>`, `<b>`, ..., so some units
 //! of several fail). Of podman: `podman-fails` (every podman command exits 125).
@@ -122,6 +134,11 @@ fn gh(argv0: &str, args: &[String]) -> ExitCode {
         .open(dir.join("gh-args"))
         .expect("gh-args");
     writeln!(log, "{}", args.join(" ")).expect("gh-args");
+    match args[0].as_str() {
+        "api" => return api(dir, &args[1]),
+        "release" => return release(dir, args),
+        _ => {}
+    }
     let file = args
         .get(2)
         .filter(|_| args[..2] == ["attestation", "verify"])
@@ -139,6 +156,102 @@ fn gh(argv0: &str, args: &[String]) -> ExitCode {
     }
     eprintln!("xtask-fake: no attestation of {file} verifies with {flags}");
     ExitCode::FAILURE
+}
+
+/// The JSON object in `gh-api.json` in `dir`: the API's answers, by path.
+fn api_store(dir: &Path) -> serde_json::Map<String, serde_json::Value> {
+    let text = std::fs::read_to_string(dir.join("gh-api.json")).unwrap_or_else(|_| "{}".into());
+    serde_json::from_str(&text).expect("gh-api.json is a JSON object")
+}
+
+fn api(dir: &Path, path: &str) -> ExitCode {
+    if defect("api-fails") {
+        eprintln!("gh: Server Error (HTTP 502)");
+        return ExitCode::FAILURE;
+    }
+    if defect("api-garbage") {
+        println!("<html>");
+        return ExitCode::SUCCESS;
+    }
+    match api_store(dir).get(path) {
+        Some(answer) => {
+            println!("{answer}");
+            ExitCode::SUCCESS
+        }
+        None => {
+            eprintln!("gh: Not Found (HTTP 404)");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn release(dir: &Path, args: &[String]) -> ExitCode {
+    if defect("release-fails") {
+        eprintln!("xtask-fake: release failed");
+        return ExitCode::FAILURE;
+    }
+    let mut flags = std::collections::BTreeMap::new();
+    let mut words = Vec::new();
+    let mut rest = args[2..].iter();
+    while let Some(arg) = rest.next() {
+        match arg.as_str() {
+            "--verify-tag" => {}
+            flag if flag.starts_with("--") => {
+                flags.insert(flag, rest.next().expect("a flag's value").as_str());
+            }
+            _ => words.push(arg.as_str()),
+        }
+    }
+    let tag = words.remove(0);
+    let store = dir.join("releases").join(tag);
+    match args[1].as_str() {
+        "create" => {
+            std::fs::create_dir_all(dir.join("releases")).expect("releases");
+            std::fs::create_dir(&store).expect("no release with this tag yet");
+        }
+        "download" => {
+            for entry in std::fs::read_dir(&store).expect("the release") {
+                let from = entry.expect("an asset").path();
+                let to = Path::new(flags["--dir"]).join(from.file_name().expect("a name"));
+                std::fs::copy(from, to).expect("download an asset");
+            }
+            return ExitCode::SUCCESS;
+        }
+        _ => {}
+    }
+    for file in words {
+        let name = Path::new(file).file_name().expect("a file name");
+        let mut asset = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(store.join(name))
+            .expect("no asset of this name in the release yet");
+        asset
+            .write_all(&std::fs::read(file).expect("the file"))
+            .expect("write the asset");
+    }
+    let mut names: Vec<String> = std::fs::read_dir(&store)
+        .expect("the release")
+        .map(|e| {
+            e.expect("an asset")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    names.sort();
+    let assets: Vec<serde_json::Value> = names
+        .iter()
+        .map(|n| serde_json::json!({ "name": n }))
+        .collect();
+    let mut answers = api_store(dir);
+    answers.insert(
+        format!("repos/{}/releases/tags/{tag}", flags["--repo"]),
+        serde_json::json!({ "tag_name": tag, "assets": assets }),
+    );
+    let text = serde_json::Value::Object(answers).to_string();
+    std::fs::write(dir.join("gh-api.json"), text).expect("gh-api.json");
+    ExitCode::SUCCESS
 }
 
 fn sudo(argv0: &str, args: &[String]) -> ExitCode {

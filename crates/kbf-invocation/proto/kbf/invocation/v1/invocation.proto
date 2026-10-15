@@ -183,6 +183,7 @@ enum RequeueReason {
   REQUEUE_REASON_RESTARTED = 8;
   REQUEUE_REASON_LOST_DAEMON_RESTARTED = 9;
   REQUEUE_REASON_LOST_FENCED = 10;
+  REQUEUE_REASON_INFRA = 11;
 }
 
 // A failure the worker reported, with the daemon's reason text (up to 1 KiB).
