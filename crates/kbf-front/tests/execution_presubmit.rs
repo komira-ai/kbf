@@ -352,6 +352,10 @@ async fn an_execute_that_fails_before_its_first_operation_is_still_measured() {
 /// fast Execute. At 6 s a GET, the four GETs take 24 s.
 #[tokio::test(start_paused = true)]
 async fn an_execute_slow_before_its_first_operation_warns_with_the_phases() {
+    // Install the subscriber before the Execute logs; without this the warning can be
+    // emitted before any test of this binary has read the log (it passed only when a
+    // sibling test ran first).
+    let _ = log_lines();
     let slow = Rig::new(Duration::from_secs(6)).await;
     let slow_job = job("slow one", true);
     slow.store(&slow_job.blobs.iter().collect::<Vec<_>>()).await;
