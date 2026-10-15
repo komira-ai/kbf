@@ -611,9 +611,7 @@ pub fn run(scenario: &Scenario) -> RunReport {
     while sim.now() <= scenario.end {
         // The server's tick timer keeps the queue from ever running dry.
         let _ = sim.step();
-        if let Some(half) = &half {
-            was_up = share_fate(&mut sim, half, was_up);
-        }
+        was_up = share_fate(&mut sim, was_up);
         checker.after_step(&sim);
     }
     checker.at_end(&sim);
@@ -657,35 +655,17 @@ pub fn run(scenario: &Scenario) -> RunReport {
     }
 }
 
-/// The daemon half `half` of the server's process goes down when the server's process
-/// does, in the same step, and starts again when it starts; returns whether the server
-/// is up now. `was_up` is what the last call returned.
-fn share_fate(sim: &mut Sim<CellNode>, half: &NodeId, was_up: bool) -> bool {
+/// The daemon half of the server's process goes down when the server's process does,
+/// in the same step, and starts again when it starts; returns whether the server is up
+/// now. `was_up` is what the last call returned.
+fn share_fate(sim: &mut Sim<CellNode>, was_up: bool) -> bool {
     let up = crate::check::server(sim).is_up();
-    if up != was_up
-        && let Some(CellNode::Daemon(daemon)) = sim.node_mut(half)
-    {
-        if up {
-            daemon.revive();
-        } else {
-            daemon.die();
+    if up != was_up {
+        for (_, node) in sim.nodes_mut() {
+            if let CellNode::Daemon(daemon) = node {
+                daemon.server_process(up);
+            }
         }
     }
     up
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Catches a fate shared with a node that is not a daemon: naming one changes
-    /// nothing, and the server's state is still returned.
-    #[test]
-    fn sharing_fate_with_a_node_that_is_not_a_daemon_changes_nothing() {
-        let mut sim: Sim<CellNode> = Sim::new(1, Faults::default());
-        let server = Server::new(ServerPlan::default(), store_id());
-        sim.add_node(server_id(), CellNode::Server(Box::new(server)));
-        assert!(!share_fate(&mut sim, &server_id(), true));
-        assert!(sim.node(&server_id()).and_then(CellNode::server).is_some());
-    }
 }

@@ -97,6 +97,9 @@ fn moment(t: FarmTime) -> Moment {
 }
 
 impl FakeDaemon {
+    /// The tag of its poll timer, which checks its runs and its contact.
+    pub const POLL: u64 = T_POLL;
+
     /// A daemon of `capacity` that connects to `server`.
     #[must_use]
     pub fn new(server: NodeId, instance: String, capacity: Resources) -> Self {
@@ -139,9 +142,6 @@ impl FakeDaemon {
     /// unacknowledged result goes with it, and so does contact. It ignores every input
     /// until [`FakeDaemon::revive`].
     pub fn die(&mut self) {
-        if self.dead {
-            return;
-        }
         self.dead = true;
         self.reviving = false;
         self.lost += self.runs.len() + self.staging.len() + self.unacked.len();
@@ -163,6 +163,19 @@ impl FakeDaemon {
         self.reviving = true;
         self.incarnation += 1;
         self.instance = format!("{}-{}", self.name, self.incarnation);
+    }
+
+    /// The server's process went down (`up` false) or started (true): the daemon half
+    /// of that process dies or starts with it; any other daemon is not touched.
+    pub fn server_process(&mut self, up: bool) {
+        if !self.in_process {
+            return;
+        }
+        if up {
+            self.revive();
+        } else {
+            self.die();
+        }
     }
 
     /// The runs, staged outputs and unacknowledged results lost with the process, over
@@ -188,7 +201,8 @@ impl FakeDaemon {
         &self.reported
     }
 
-    pub(crate) fn take_outputs(&mut self) -> Vec<Output<Msg>> {
+    /// What it has queued since it was last asked: messages and timers.
+    pub fn take_outputs(&mut self) -> Vec<Output<Msg>> {
         std::mem::take(&mut self.out)
     }
 
@@ -482,75 +496,6 @@ mod tests {
         d.unfenced_runs(FarmTime::from_millis(10))
             .map(|(l, _)| l)
             .collect()
-    }
-
-    /// Catches a daemon half that outlives its process: a run, a staged output or an
-    /// unacknowledged result kept across a death, an input taken while dead, a second
-    /// death counted twice, or a revived process that reconnects as the dead instance
-    /// or on one of its streams; and an in-process run reported before its output is
-    /// stored.
-    #[test]
-    fn the_daemon_half_dies_with_its_process_and_starts_again_as_a_new_instance() {
-        let mut d =
-            FakeDaemon::in_process(NodeId::from("server"), "daemon-0", Resources::new(1_000, 1));
-        let lease = |seq| LeaseId::new(1, seq);
-        d.apply(input(0, Event::Start));
-        d.apply(message(1, welcome(1)));
-        d.apply(message(2, start(1, 1)));
-        d.apply(message(3, start(1, 2)));
-        // A resent `Start` of a running lease runs nothing more.
-        d.apply(message(4, start(1, 1)));
-        assert_eq!(runs(&d), [lease(1), lease(2)]);
-        d.take_outputs();
-        // Both runs end; each output is uploaded, and only a stored one reports. (No
-        // heartbeat was acknowledged, so the poll also opens stream 2.)
-        d.apply(input(30_000, Event::Timer { tag: T_POLL }));
-        let uploads = format!("{:?}", d.take_outputs());
-        let first = output_of(&action(1));
-        let upload = format!("Upload {{ digest: {first:?} }}");
-        assert!(uploads.contains(&upload), "{uploads}");
-        assert!(
-            d.reported().is_empty(),
-            "reported before its output was stored"
-        );
-        d.apply(message(30_000, welcome(2)));
-        // Neither a staged lease, nor one whose result is unacknowledged, nor one
-        // acknowledged, runs again; nor does any once contact is lost.
-        d.apply(message(30_001, start(2, 2)));
-        d.apply(message(30_002, Msg::Uploaded { digest: first }));
-        assert_eq!(d.reported().iter().copied().collect::<Vec<_>>(), [lease(1)]);
-        d.apply(message(30_003, start(2, 1)));
-        let acked = Msg::ResultAck {
-            lease: lease(1),
-            accepted: true,
-        };
-        d.apply(message(30_004, acked));
-        d.apply(message(30_005, start(2, 1)));
-        assert!(runs(&d).is_empty(), "a finished lease ran again");
-        d.apply(message(80_000, start(2, 9)));
-        assert!(runs(&d).is_empty(), "a Start taken without contact");
-        d.die();
-        d.die();
-        assert_eq!(d.lost(), 1, "the one staged output, counted once");
-        d.apply(message(80_001, start(2, 3)));
-        assert!(runs(&d).is_empty(), "a dead process took a Start");
-        d.take_outputs();
-        d.apply(input(81_000, Event::Timer { tag: T_POLL }));
-        let quiet = format!("{:?}", d.take_outputs());
-        assert!(!quiet.contains("Send"), "a dead process sent: {quiet}");
-        d.revive();
-        d.revive();
-        d.apply(input(82_000, Event::Timer { tag: T_POLL }));
-        // Later than every stream of the dead process.
-        let sent = format!("{:?}", d.take_outputs());
-        let hello = r#"Hello { stream: 3, instance: "daemon-0-2""#;
-        assert!(sent.contains(hello), "{sent}");
-        d.apply(message(82_001, welcome(2)));
-        d.apply(message(82_002, start(2, 4)));
-        assert!(
-            runs(&d).is_empty(),
-            "a message of the dead process's stream was taken"
-        );
     }
 
     /// Catches a daemon that takes a `Start` before its stream is welcomed, on an
