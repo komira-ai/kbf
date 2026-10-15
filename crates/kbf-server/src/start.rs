@@ -21,6 +21,7 @@ use kbf_meta::Retention;
 use kbf_objstore::{Capabilities, FsStore, KeyPrefix, MemoryStore, ObjectStore};
 use kbf_threads::Topology;
 
+use crate::local::LocalStore;
 use crate::write_tier::{FLUSH_EVERY, TierLog};
 use crate::{Args, RaftMetaLog, SERVER_VERSION, ServeError, StoreKind, bind_server_with_policy};
 
@@ -39,6 +40,7 @@ pub struct ServerHandle {
     pub worker: SocketAddr,
     /// Where the operator API listener is, if there is one.
     pub api: Option<SocketAddr>,
+    local: LocalStore,
     start_line: String,
     serving: Pin<Box<dyn Future<Output = Result<(), ServeError>> + Send>>,
     _flusher: Option<AbortOnDrop>,
@@ -52,17 +54,23 @@ impl ServerHandle {
         &self.start_line
     }
 
+    /// The server's cache as calls in this process: what a daemon run beside the server
+    /// in one process reads and writes blobs through.
+    #[must_use]
+    pub fn local(&self) -> LocalStore {
+        self.local.clone()
+    }
+
     /// Serves every listener until the shutdown future ends and its connections close
     /// or `--shutdown-timeout-secs` runs out.
     ///
     /// # Errors
     /// A listener fails while serving.
-    pub async fn serve(self) -> Result<(), Box<dyn Error>> {
+    pub async fn serve(self) -> Result<(), ServeError> {
         let Self {
             serving, _flusher, ..
         } = self;
-        serving.await?;
-        Ok(())
+        serving.await
     }
 }
 
@@ -183,6 +191,7 @@ where
         .with_input_trees(args.input_tree_config());
     let (cache, tier) = crate::write_tier::attach(cache, args).await?;
     let cache = Arc::new(cache);
+    let local = LocalStore::new(Arc::clone(&cache), listeners.segments);
     let _flusher = tier.map(|_| {
         let flusher = crate::write_tier::run_flusher(Arc::clone(&cache), FLUSH_EVERY);
         AbortOnDrop(tokio::spawn(flusher))
@@ -195,6 +204,7 @@ where
         reapi: bound.reapi,
         worker: bound.worker,
         api: bound.api,
+        local,
         start_line: start_line(bound.reapi, bound.worker, bound.api, routes, log, &plain),
         serving: Box::pin(bound.serving),
         _flusher,

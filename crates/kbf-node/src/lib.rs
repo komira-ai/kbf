@@ -50,7 +50,7 @@ use kbf_daemon::{
 use kbf_driver_native::slots::Pool;
 use kbf_driver_native::{MemoryPolicy, NativeConfig, NativeRuntime, xcode, xcode_watch};
 use kbf_outputs::OutputLimits;
-use kbf_transfer::Transfers;
+use kbf_transfer::{Cas, Transfers};
 use tokio::signal::unix::{Signal, SignalKind, signal};
 
 /// The `kbf-daemon` command line.
@@ -366,18 +366,38 @@ impl NodeHandle {
 /// checks fail ([`ImageUnusable`] among them, for which [`exit_code`] answers 2), or
 /// the node cannot be detected.
 pub fn start(cli: &Cli) -> Result<NodeHandle, Error> {
+    start_with(cli, remote)
+}
+
+/// [`start`], with every runtime reading and writing blobs through the data plane
+/// `plane` makes, rather than through the transfer engine over `--cas`: for a binary
+/// that runs the daemon in the server's own process. `plane` is called once, in the
+/// async runtime's context, when the first driver that moves blobs is set up (never,
+/// with `--driver fake` alone).
+///
+/// # Errors
+/// As [`start`], or what `plane` returns.
+pub fn start_with<C: Cas>(
+    cli: &Cli,
+    plane: impl Fn(&Cli) -> Result<Arc<C>, Error> + 'static,
+) -> Result<NodeHandle, Error> {
     let sizes = sizes(cli)?;
     sizes.log();
     let tokio = sizes.runtime()?;
     let daemon = {
         // The CAS channel is made lazily, which needs the runtime's context.
         let _context = tokio.enter();
-        backstop(
-            cli,
-            node(cli, || native_config(cli), Path::new(xcode::XCRUN))?.0,
-        )
+        let xcrun = Path::new(xcode::XCRUN);
+        let (daemon, _) = node_over(cli, || native_config(cli), xcrun, Box::new(plane))?;
+        backstop(cli, daemon)
     };
     Ok(NodeHandle { tokio, daemon })
+}
+
+/// The data plane of a daemon whose server is elsewhere: the process's transfer engine
+/// ([`transfer::engine`]) over `--cas`.
+fn remote(cli: &Cli) -> Result<Arc<Transfers>, Error> {
+    Ok(Arc::new(transfer::engine(cli)?))
 }
 
 /// `daemon` with the memory backstop `--memory-pressure-pause-percent` sets, if the
@@ -440,9 +460,9 @@ fn drivers(cli: &Cli) -> Vec<Driver> {
     drivers
 }
 
-/// What the drivers set up so far give the daemon.
-#[derive(Default)]
-struct Node {
+/// What the drivers set up so far give the daemon, whose runtimes move blobs through
+/// the data plane `C`.
+struct Node<C> {
     /// One runtime per driver; `None` before the first.
     runtimes: Option<Runtimes>,
     /// What leases may use (the container driver's `actions/` cgroup).
@@ -451,19 +471,39 @@ struct Node {
     reports: Option<Reports>,
     /// The whole-machine runtime's phase.
     phase: Option<tokio::sync::watch::Receiver<kbf_types::NodePhase>>,
-    /// The transfer engine every runtime shares, made by the first that needs it.
-    transfers: Option<Arc<Transfers>>,
+    /// The data plane every runtime shares, made by the first that needs it.
+    plane: Plane<C>,
 }
 
-impl Node {
-    /// The process's transfer engine ([`transfer::engine`]), made on the first call;
-    /// every later call returns the same one.
-    fn transfers(&mut self, cli: &Cli) -> Result<Arc<Transfers>, Error> {
-        if let Some(made) = &self.transfers {
-            return Ok(Arc::clone(made));
+/// A [`Node`]'s data plane: how to make it until a runtime asks for it, then it.
+enum Plane<C> {
+    Unmade(MakePlane<C>),
+    Made(Arc<C>),
+}
+
+/// What makes a daemon's data plane from its flags.
+type MakePlane<C> = Box<dyn Fn(&Cli) -> Result<Arc<C>, Error>>;
+
+impl<C: Cas> Node<C> {
+    /// No runtime yet, its data plane made by `plane` when a runtime first asks.
+    fn new(plane: MakePlane<C>) -> Self {
+        Self {
+            runtimes: None,
+            capacity: Capacity::default(),
+            reports: None,
+            phase: None,
+            plane: Plane::Unmade(plane),
         }
-        let made = Arc::new(transfer::engine(cli)?);
-        self.transfers = Some(Arc::clone(&made));
+    }
+
+    /// The process's data plane, made on the first call; every later call returns the
+    /// same one.
+    fn plane(&mut self, cli: &Cli) -> Result<Arc<C>, Error> {
+        let made = match &self.plane {
+            Plane::Made(made) => return Ok(Arc::clone(made)),
+            Plane::Unmade(make) => make(cli)?,
+        };
+        self.plane = Plane::Made(Arc::clone(&made));
         Ok(made)
     }
 
@@ -477,8 +517,9 @@ impl Node {
     }
 }
 
-/// The daemon with a runtime for each of [`drivers`], set up in that order; the native
-/// driver with the configuration `native` makes and the `xcrun` it surveys with and
+/// The daemon with a runtime for each of [`drivers`], set up in that order, every one
+/// moving blobs through the one data plane `plane` makes; the native driver with the
+/// configuration `native` makes and the `xcrun` it surveys with and
 /// warms (a test names its own user folders and sandbox, and an `xcrun` of its own).
 /// Also returns what the native driver's Xcode watch sends the daemon, for a test to
 /// follow. Its node report is the detected entries, the labels and a `drivers` entry
@@ -488,15 +529,16 @@ impl Node {
 /// container driver runs: without it, `--image` fails the start. With `--scratch`, once
 /// every runtime is built, it claims the scratch directory and names the claim it found
 /// as its predecessor (`instance`).
-fn node(
+fn node_over<C: Cas>(
     cli: &Cli,
     native: impl Fn() -> Result<NativeConfig, Error>,
     xcrun: &Path,
+    plane: MakePlane<C>,
 ) -> Result<(Daemon, Option<Reports>), Error> {
     if !cli.images.is_empty() && !cli.drivers.contains(&Driver::Container) {
         return Err("--image names container images: only --driver container runs them".into());
     }
-    let mut node = Node::default();
+    let mut node = Node::new(plane);
     for driver in drivers(cli) {
         match driver {
             Driver::Fake => node.add(Arc::new(FakeRuntime::new(Duration::ZERO)))?,
@@ -513,7 +555,7 @@ fn node(
                     );
                 }
                 let config = native()?;
-                let cas = node.transfers(cli)?;
+                let cas = node.plane(cli)?;
                 let (runtime, reports) = native_runtime(cli, config, xcrun, cas)?;
                 node.add(runtime)?;
                 node.reports = Some(reports);
@@ -550,6 +592,16 @@ fn node(
     })
 }
 
+/// [`node_over`] with the transfer engine over `--cas` as the data plane.
+#[cfg(test)]
+fn node(
+    cli: &Cli,
+    native: impl Fn() -> Result<NativeConfig, Error>,
+    xcrun: &Path,
+) -> Result<(Daemon, Option<Reports>), Error> {
+    node_over(cli, native, xcrun, Box::new(remote))
+}
+
 /// [`node`] with the native driver alone, its configuration `config`.
 #[cfg(test)]
 fn native_with(cli: &Cli, config: NativeConfig, xcrun: &Path) -> Result<(Daemon, Reports), Error> {
@@ -558,18 +610,18 @@ fn native_with(cli: &Cli, config: NativeConfig, xcrun: &Path) -> Result<(Daemon,
 }
 
 /// The native driver with `config`, the `xcrun` it surveys with and warms, and the
-/// process's transfer engine `cas`. It
+/// process's data plane `cas`. It
 /// surveys the Xcodes in `--xcode-apps` in the background, at once and again every
 /// `--xcode-recheck-secs`, and returns each changed survey for the daemon
 /// (`Daemon::with_driver_report`): without it the node reports no Xcode, ready or
 /// not. It does not wait for the first survey: until that ends, the daemon reports
 /// every Xcode found as not surveyed yet, and none as ready.
-fn native_runtime(
+fn native_runtime<C: Cas>(
     cli: &Cli,
     mut config: NativeConfig,
     xcrun: &Path,
-    cas: Arc<Transfers>,
-) -> Result<(Arc<NativeRuntime<Transfers>>, Reports), Error> {
+    cas: Arc<C>,
+) -> Result<(Arc<NativeRuntime<C>>, Reports), Error> {
     // The simulators of the leases that ask for one are made with the same `xcrun`.
     config.xcrun = xcrun.to_owned();
     let runtime = NativeRuntime::new(config, cas)?;
@@ -679,14 +731,14 @@ mod container {
     };
 
     use super::{Cli, Error, ImageUnusable, Node, scratch};
-    use kbf_transfer::Transfers;
+    use kbf_transfer::Cas;
 
-    /// Builds the container driver, over the daemon's CAS client, and adds it to `node`
+    /// Builds the container driver, over the daemon's data plane, and adds it to `node`
     /// with what its leases may use.
-    pub(super) fn add(cli: &Cli, node: &mut Node) -> Result<(), Error> {
+    pub(super) fn add<C: Cas>(cli: &Cli, node: &mut Node<C>) -> Result<(), Error> {
         // The checks that change nothing come first.
         let scratch = scratch(cli)?;
-        let cas = node.transfers(cli)?;
+        let cas = node.plane(cli)?;
         // Every container's ids are this user's subordinate ids (`--userns=nomap`).
         let files = cli
             .id_files
@@ -764,8 +816,8 @@ mod container {
     /// Checks each `--image` as a lease's prepare step would: named by digest, in this
     /// node's image store, one architecture's manifest. The first that is not stops the
     /// start, with its fix.
-    async fn check_images(
-        runtime: &PodmanRuntime<Transfers>,
+    async fn check_images<C: Cas>(
+        runtime: &PodmanRuntime<C>,
         images: &[String],
     ) -> Result<(), ImageUnusable> {
         for value in images {
@@ -808,7 +860,7 @@ mod container {
 mod container {
     use super::{Cli, Error, Node};
 
-    pub(super) fn add(_cli: &Cli, _node: &mut Node) -> Result<(), Error> {
+    pub(super) fn add<C>(_cli: &Cli, _node: &mut Node<C>) -> Result<(), Error> {
         Err("the container driver runs on Linux only; use --driver native".into())
     }
 }
