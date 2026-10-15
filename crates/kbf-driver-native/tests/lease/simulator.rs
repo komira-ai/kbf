@@ -127,7 +127,7 @@ const LOOK: &str = "xcdevice list --timeout 5";
 /// What the driver's second look runs, in the fake's argument pattern: the action's own
 /// `xcodebuild -showdestinations`, on the probe project the driver makes in the lease
 /// directory.
-const SHOW: &str = "xcodebuild -showdestinations -scheme KbfProbe -derivedDataPath *";
+const SHOW: &str = "xcodebuild -showdestinations -project * -scheme IOSFixture -derivedDataPath *";
 
 /// What a call of [`SHOW`] has in the fake's log, whatever its last argument.
 const SHOWING: &str = " xcodebuild -showdestinations ";
@@ -147,11 +147,11 @@ fn showing(simulators: &[&str], ineligible: &[&str]) -> String {
         )
     };
     format!(
-        "Command line invocation:\n    xcodebuild -showdestinations -scheme KbfProbe\n\n\
-         Available destinations for the \"KbfProbe\" scheme:\n\
+        "Command line invocation:\n    xcodebuild -showdestinations -scheme IOSFixture\n\n\
+         Available destinations for the \"IOSFixture\" scheme:\n\
          \t\t{{ platform:macOS, arch:arm64, id:00006000-000A1B2C3D4E5F6A, name:My Mac }}\n\
          \t\t{{ platform:iOS Simulator, id:dvtdevice-DVTiOSDeviceSimulatorPlaceholder-iphonesimulator:placeholder, name:Any iOS Simulator Device }}\n\
-         {}\n\tIneligible destinations for the \"KbfProbe\" scheme:\n{}",
+         {}\n\tIneligible destinations for the \"IOSFixture\" scheme:\n{}",
         simulators.iter().map(line).collect::<String>(),
         ineligible.iter().map(line).collect::<String>(),
     )
@@ -693,14 +693,14 @@ async fn a_look_that_does_not_answer_is_cut_and_the_wait_still_ends() {
 
 /// Catches the probe project left in the lease directory for the action to find, or
 /// not written where the look runs: the look's `xcodebuild` runs in a directory that
-/// holds a `Package.swift`, and the action's directory holds none of it. The fake
+/// holds the project, and the action's directory holds none of it. The fake
 /// `xcodebuild` copies its working directory's listing to a file.
 #[tokio::test]
 async fn the_probe_project_is_there_for_the_looks_and_gone_for_the_action() {
     let dir = scratch("sim-probe");
     let seen = dir.join("seen");
     let extra = format!(
-        "{SHOW}\t-\tcopy {} Package.swift ; cat {}/bin/showdestinations.txt\n",
+        "{SHOW}\t-\tcopy {} IOSFixture.xcodeproj/project.pbxproj ; cat {}/bin/showdestinations.txt\n",
         seen.display(),
         dir.display()
     );
@@ -715,8 +715,8 @@ async fn the_probe_project_is_there_for_the_looks_and_gone_for_the_action() {
     let result = run(&rt, &cas, 1, &spec).await;
     let result = result.expect("ran");
     assert_eq!(result.exit_code, 0, "{}", stderr(&cas, &result));
-    let manifest = std::fs::read_to_string(&seen).expect("the look ran where the manifest is");
-    assert!(manifest.contains("name: \"KbfProbe\""), "{manifest}");
+    let project = std::fs::read_to_string(&seen).expect("the look ran where the project is");
+    assert!(project.contains("IOSFixture"), "{project}");
     assert!(no_leases(&config));
 }
 

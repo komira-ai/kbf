@@ -274,7 +274,7 @@ impl Simctl {
 
     /// One look: `Ok` when `xcrun xcdevice list` (Xcode's own list of the devices and
     /// simulators it can use) names `udid` and then `xcrun xcodebuild -showdestinations`
-    /// on `probe` (what [`write_probe`] wrote) lists it as an available destination,
+    /// on the project in `probe` (what [`write_probe`] wrote) lists it as an available destination,
     /// each run with the Xcode at `developer_dir`; otherwise what the first that did
     /// not printed, or why it failed. The second is the question the action asks: the
     /// first can answer while it lists no simulator at all.
@@ -299,6 +299,10 @@ impl Simctl {
         let args = [
             "xcodebuild",
             "-showdestinations",
+            "-project",
+            &probe
+                .join(format!("{PROBE_SCHEME}.xcodeproj"))
+                .to_string_lossy(),
             "-scheme",
             PROBE_SCHEME,
             "-derivedDataPath",
@@ -465,24 +469,35 @@ const XCDEVICE_TIMEOUT: &str = "5";
 /// the wait for the listing.
 const PROBE_DIR: &str = ".kbf-simulator-probe";
 
-/// The scheme of the probe project.
-const PROBE_SCHEME: &str = "KbfProbe";
+/// The probe project's name, and its scheme's: an iOS app project (a copy of the
+/// `IOSFixture` of `tools/spike/macos/fixtures`, which the native-macos job runs
+/// `xcodebuild` on under the actions' sandbox). A Swift package would need a package
+/// cache the sandbox does not let `xcodebuild` write.
+const PROBE_SCHEME: &str = "IOSFixture";
 
-/// The smallest Swift package that has a scheme to list destinations for: one library.
-const PROBE_MANIFEST: &str = "// swift-tools-version:5.9\n\
-import PackageDescription\n\
-let package = Package(\n\
-    name: \"KbfProbe\",\n\
-    products: [.library(name: \"KbfProbe\", targets: [\"KbfProbe\"])],\n\
-    targets: [.target(name: \"KbfProbe\")]\n\
-)\n";
+/// The files of the probe project, by path in `<scheme>.xcodeproj`.
+const PROBE_FILES: [(&str, &str); 2] = [
+    (
+        "project.pbxproj",
+        include_str!("../probe/IOSFixture.xcodeproj/project.pbxproj"),
+    ),
+    (
+        "xcshareddata/xcschemes/IOSFixture.xcscheme",
+        include_str!("../probe/IOSFixture.xcodeproj/xcshareddata/xcschemes/IOSFixture.xcscheme"),
+    ),
+];
 
-/// Writes the probe package into `probe`.
-fn write_probe(probe: &Path) -> std::io::Result<()> {
-    let sources = probe.join("Sources").join(PROBE_SCHEME);
-    std::fs::create_dir_all(&sources)?;
-    std::fs::write(probe.join("Package.swift"), PROBE_MANIFEST)?;
-    std::fs::write(sources.join("Probe.swift"), "public let probe = 1\n")
+/// Writes the probe project into `probe`; its `-project` path.
+fn write_probe(probe: &Path) -> std::io::Result<PathBuf> {
+    let project = probe.join(format!("{PROBE_SCHEME}.xcodeproj"));
+    for (path, text) in PROBE_FILES {
+        let file = project.join(path);
+        if let Some(parent) = file.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(file, text)?;
+    }
+    Ok(project)
 }
 
 /// How much of the last listing a lease that never saw its device says.
