@@ -133,7 +133,8 @@ impl NodeReport {
     /// The memory the report offers the scheduler, in bytes: `mem_gib` in whole GiB.
     #[must_use]
     pub fn mem_bytes(&self) -> Option<u64> {
-        None
+        let gib = self.capabilities.iter().find(|c| c.key == "mem_gib")?;
+        gib.value.parse::<u64>().ok()?.checked_mul(1 << 30)
     }
 
     /// The entries, sorted by key, then value.
