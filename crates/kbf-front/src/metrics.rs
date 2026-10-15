@@ -121,6 +121,24 @@ impl Gauge {
     }
 }
 
+/// A level the owner sets: the state of something read under a lock (operations
+/// queued), written each time it changes.
+#[derive(Debug, Default)]
+pub struct Level(AtomicU64);
+
+impl Level {
+    /// Sets the level.
+    pub fn set(&self, level: u64) {
+        self.0.store(level, Ordering::Relaxed);
+    }
+
+    /// The level now.
+    #[must_use]
+    pub fn get(&self) -> u64 {
+        self.0.load(Ordering::Relaxed)
+    }
+}
+
 /// One unit of a [`Gauge`], given back on drop.
 #[derive(Debug)]
 pub struct Raised<'a>(&'a Gauge);
@@ -360,6 +378,33 @@ pub struct CacheMetrics {
     pub commit: [Histogram; COMMANDS.len()],
     /// Every metadata-log query the cache makes.
     pub query: Histogram,
+    /// Execute calls between their start and their first stream item: the time before
+    /// the scheduler's first `QUEUED` operation can be sent (cache lookup, the action,
+    /// the input-tree walk, and the scheduler's submit). An Execute that fails is
+    /// observed too.
+    pub execute_presubmit: Histogram,
+    /// Execute calls begun and not yet at their first stream item.
+    pub execute_presubmit_in_flight: Gauge,
+    /// The input-tree check of one Execute: the directories read, then one
+    /// FindMissingBlobs over the files.
+    pub execute_walk: Histogram,
+    /// Directories the input-tree checks read, one per read whether or not it hit.
+    pub execute_dir_reads: Counter,
+    /// One call of the scheduler's submit from an Execute, the wait for its lock
+    /// included.
+    pub execute_submit: Histogram,
+    /// The wait for the scheduler's lock in one submit.
+    pub sched_lock_wait: Histogram,
+    /// Operations waiting for a lease, as of the last scheduler input.
+    pub sched_queued: Level,
+    /// Leases granted or running, as of the last scheduler input.
+    pub sched_leases: Level,
+    /// Write-tier calls queued on or running on the blocking pool.
+    pub tier_in_flight: Gauge,
+    /// The wait of one write-tier call for a blocking-pool thread.
+    pub tier_wait: Histogram,
+    /// One write-tier call, from its hand-over to the blocking pool to its answer.
+    pub tier_call: Histogram,
 }
 
 impl Default for CacheMetrics {
@@ -381,6 +426,17 @@ impl Default for CacheMetrics {
             object_get: Histogram::new(Unit::Seconds),
             commit: std::array::from_fn(|_| Histogram::new(Unit::Seconds)),
             query: Histogram::new(Unit::Seconds),
+            execute_presubmit: Histogram::new(Unit::Seconds),
+            execute_presubmit_in_flight: Gauge::default(),
+            execute_walk: Histogram::new(Unit::Seconds),
+            execute_dir_reads: Counter::default(),
+            execute_submit: Histogram::new(Unit::Seconds),
+            sched_lock_wait: Histogram::new(Unit::Seconds),
+            sched_queued: Level::default(),
+            sched_leases: Level::default(),
+            tier_in_flight: Gauge::default(),
+            tier_wait: Histogram::new(Unit::Seconds),
+            tier_call: Histogram::new(Unit::Seconds),
         }
     }
 }
@@ -469,11 +525,69 @@ impl CacheMetrics {
                 "Metadata-log queries the cache makes",
                 &self.query,
             ),
+            (
+                "kbf_execute_presubmit_seconds",
+                "Execute, from the handler's start to its first stream item: the action-cache \
+                 lookup, the action and command reads, the input-tree walk and the \
+                 scheduler's submit (the first QUEUED operation cannot be sent sooner)",
+                &self.execute_presubmit,
+            ),
+            (
+                "kbf_execute_walk_seconds",
+                "The input-tree check of one Execute: every directory read, then one \
+                 FindMissingBlobs over the files",
+                &self.execute_walk,
+            ),
+            (
+                "kbf_execute_submit_seconds",
+                "The scheduler's submit called from one Execute, the wait for its lock included",
+                &self.execute_submit,
+            ),
+            (
+                "kbf_sched_lock_wait_seconds",
+                "The wait for the scheduler's lock in one submit",
+                &self.sched_lock_wait,
+            ),
+            (
+                "kbf_tier_wait_seconds",
+                "The wait of one write-tier call for a blocking-pool thread",
+                &self.tier_wait,
+            ),
+            (
+                "kbf_tier_call_seconds",
+                "One write-tier call, from its hand-over to the blocking pool to its answer",
+                &self.tier_call,
+            ),
         ];
         for (name, help, histogram) in histograms {
             out.head(name, "histogram", help);
             histogram.render(&mut out.0, name, "");
         }
+        out.gauge(
+            "kbf_execute_presubmit_in_flight",
+            "Execute calls begun and not yet at their first stream item",
+            self.execute_presubmit_in_flight.get(),
+        );
+        out.counter(
+            "kbf_execute_dir_reads_total",
+            "Directories the Execute input-tree checks read",
+            self.execute_dir_reads.get(),
+        );
+        out.gauge(
+            "kbf_sched_queued",
+            "Operations waiting for a lease, as of the last scheduler input",
+            self.sched_queued.get(),
+        );
+        out.gauge(
+            "kbf_sched_leases",
+            "Leases granted or running, as of the last scheduler input",
+            self.sched_leases.get(),
+        );
+        out.gauge(
+            "kbf_tier_in_flight",
+            "Write-tier calls queued on or running on the blocking pool",
+            self.tier_in_flight.get(),
+        );
         let name = "kbf_meta_commit_seconds";
         out.head(
             name,
