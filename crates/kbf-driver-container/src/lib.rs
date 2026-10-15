@@ -67,6 +67,7 @@ pub mod cas;
 mod cgroup;
 pub mod chown_dirs;
 pub mod delegate;
+mod exit_record;
 pub mod image;
 mod keeper;
 mod outputs;

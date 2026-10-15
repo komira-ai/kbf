@@ -1,9 +1,14 @@
-//! A container Podman has recorded as `stopped`, against the stand-in `podman`
-//! (`support/fake.rs`): the action ran to the exit Podman read; only Podman's own
-//! clean-up of it (`podman container cleanup`, which makes it `exited`) is still to
-//! come. On a loaded node that clean-up can land well after `podman start --attach`
-//! returns (issue #658: up to about 45 seconds). The fake's `status-override` stands
-//! in for Podman's record when the driver reads it, after the action has run.
+//! How the driver reads a container's exit from Podman's record, against the stand-in
+//! `podman` (`support/fake.rs`). `podman start --attach` can return before that record
+//! is final (issue #658): on a loaded node Podman's clean-up landed 24 to 41 seconds
+//! after the container died. The driver takes an exit only from a record that says one
+//! was recorded (`FinishedAt` set), waits for one that does not, and never starts the
+//! container again: the action ran, and it is not idempotent. The fake's
+//! `unrecorded-inspects` stands in for a record read before it holds the exit, and
+//! `status-override` for the record once it does.
+//!
+//! The deadline on that wait (two minutes) is tested in `src/exit_record.rs`, with a
+//! short one: no test here waits it out.
 //!
 //! A module of `fake_podman.rs`, not a test binary of its own, for the reason
 //! `fake_memory` gives: the coverage job counts the driver's lines per test binary.
@@ -38,19 +43,53 @@ fn runs(ran: &std::path::Path) -> usize {
     std::fs::read_to_string(ran).map_or(0, |text| text.lines().count())
 }
 
-/// Catches a container Podman has read the exit of but not yet cleaned up (`stopped
-/// 0`) failed as the farm's `INTERNAL` ("the container did not run to an exit") when
-/// its action ran and exited 0 (issue #658), its exit code not taken from the record
-/// (`stopped 3` must be exit 3, not 0), and the action run more than once: it is not
-/// idempotent, so a run that happened is never started again. `stopped -1`, Podman's
-/// record of an exit it never read, still fails as the farm's.
-#[tokio::test]
-async fn a_stopped_container_ran_to_the_exit_podman_read() {
-    let fake = Fake::new("stopped");
-    let spec = Spec::new(&image(), "unused");
-    let ran = fake.state.join("ran-1");
+/// How many times the driver called `verb`.
+fn count(fake: &Fake, verb: &str) -> usize {
+    fake.calls().iter().filter(|c| *c == verb).count()
+}
 
-    fake.knob("status-override", "stopped 0\n");
+/// Catches an exit taken from a record Podman has not finished (`stopped 0`, no
+/// `FinishedAt`) as the action's (issue #658): an action that exited 3 reported as
+/// exit 0, a failure cached as a success. Also catches the record treated as a
+/// container that never ran (the farm's `INTERNAL`), and the container started again
+/// for it. The fake answers the first three inspects as unrecorded, then with the
+/// action's own `exited 3`: the lease must report 3, after four inspects and one start.
+#[tokio::test]
+async fn an_exit_not_yet_recorded_is_waited_for_not_run_again() {
+    let fake = Fake::new("unrecorded");
+    let spec = Spec::new(&image(), "unused");
+    let ran = fake.state.join("ran");
+
+    fake.knob("unrecorded-inspects", "3\n");
+    let result = fake
+        .run(1, &spec, &action(&ran, "failed", 3))
+        .await
+        .expect("the action's own result");
+    assert_eq!(result.exit_code, 3, "the exit Podman recorded");
+    assert_eq!(blob(&fake.cas, result.stdout_digest.as_ref()), b"failed\n");
+    assert_eq!(runs(&ran), 1, "the action ran once");
+    assert_eq!(count(&fake, "start"), 1, "started once: {:?}", fake.calls());
+    assert_eq!(
+        count(&fake, "inspect"),
+        4,
+        "read until recorded: {:?}",
+        fake.calls()
+    );
+    fake.assert_clean(1);
+}
+
+/// Catches a record that already holds the exit being waited on or read again: an
+/// `exited` or `stopped` record with `FinishedAt` set is final (Podman reads the exit
+/// file and stores code and time together), so the driver takes its code from the
+/// first inspect, and `stopped 3` is exit 3, not the 0 an unset code would read as.
+/// `stopped -1`, Podman's record of an exit it never read, is the farm's failure,
+/// also at once and without a second start.
+#[tokio::test]
+async fn a_recorded_exit_is_taken_at_once() {
+    let fake = Fake::new("recorded");
+    let spec = Spec::new(&image(), "unused");
+
+    let ran = fake.state.join("ran-1");
     let result = fake
         .run(1, &spec, &action(&ran, "built", 0))
         .await
@@ -58,8 +97,7 @@ async fn a_stopped_container_ran_to_the_exit_podman_read() {
     assert_eq!(result.exit_code, 0);
     assert_eq!(blob(&fake.cas, result.stdout_digest.as_ref()), b"built\n");
     assert_eq!(runs(&ran), 1, "the action ran once");
-    let starts = fake.calls().iter().filter(|c| *c == "start").count();
-    assert_eq!(starts, 1, "started once: {:?}", fake.calls());
+    assert_eq!(count(&fake, "inspect"), 1, "one read: {:?}", fake.calls());
     fake.assert_clean(1);
 
     let ran = fake.state.join("ran-2");
@@ -70,6 +108,7 @@ async fn a_stopped_container_ran_to_the_exit_podman_read() {
         .expect("the action's own result");
     assert_eq!(result.exit_code, 3);
     assert_eq!(runs(&ran), 1, "the action ran once");
+    assert_eq!(count(&fake, "inspect"), 2, "one read: {:?}", fake.calls());
     fake.assert_clean(2);
 
     let ran = fake.state.join("ran-3");
@@ -81,6 +120,13 @@ async fn a_stopped_container_ran_to_the_exit_podman_read() {
         "{outcome:?}"
     );
     assert_eq!(runs(&ran), 1, "never started again");
+    assert_eq!(
+        count(&fake, "start"),
+        3,
+        "one start per lease: {:?}",
+        fake.calls()
+    );
+    assert_eq!(count(&fake, "inspect"), 3, "one read: {:?}", fake.calls());
     fake.assert_clean(3);
 }
 
