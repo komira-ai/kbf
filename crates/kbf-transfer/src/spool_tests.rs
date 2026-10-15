@@ -87,7 +87,7 @@ async fn failed_chunk_writes_record_nothing_and_free_the_digest() {
 /// Catches a spool read failure answered as a missing blob, which the caller would
 /// fetch or upload elsewhere instead of failing (mutant: `get` maps the read error to
 /// `Missing`): a blob put into a spool whose file cannot be read is UNAVAILABLE from
-/// `get` and a read error from `read_record`.
+/// `get`, and the record's read fails.
 #[tokio::test]
 async fn a_spool_that_cannot_be_read_is_an_error_not_a_missing_blob() {
     let spool = unreadable("read");
@@ -100,12 +100,9 @@ async fn a_spool_that_cannot_be_read_is_an_error_not_a_missing_blob() {
         format!("{failed:?}").starts_with("Unavailable("),
         "{failed:?}"
     );
-    let record = spool.records()[0];
-    let failed = spool
-        .read_record(&record)
-        .await
-        .expect_err("the read fails");
-    assert!(format!("{failed:?}").starts_with("Read("), "{failed:?}");
+    let record = spool.outgoing().remove(0);
+    let size = record.digest.size_bytes;
+    record.read(0, size).await.expect_err("the read fails");
 }
 
 /// Catches chunks accepted under a digest the spool cannot index (mutant: the parse

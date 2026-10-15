@@ -153,7 +153,7 @@ fn an_output_past_the_byte_limit_is_refused_in_bounded_memory() {
         runtime.block_on(collect(
             &cas,
             &upper,
-            std::path::Path::new(env!("CARGO_TARGET_TMPDIR")),
+            &kbf_daemon::cpu_pool::CpuPool::new(4),
             "",
             &outputs,
             limits,

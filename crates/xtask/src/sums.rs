@@ -119,7 +119,7 @@ fn files_in(dir: &Path) -> Result<Vec<String>, Error> {
 }
 
 /// The lines of the sums file at `path`; a missing, malformed or empty file is an error.
-fn read_sums(path: &Path) -> Result<Vec<Line>, Error> {
+pub(crate) fn read_sums(path: &Path) -> Result<Vec<Line>, Error> {
     let text =
         std::fs::read_to_string(path).map_err(Error::spawn(format!("read {}", path.display())))?;
     let lines = parse(&text).map_err(|problems| {

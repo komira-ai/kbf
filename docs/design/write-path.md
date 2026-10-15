@@ -176,19 +176,34 @@ admission rules ([worker-protocol.md](worker-protocol.md#blobs-on-the-worker-lis
 
 **Built (rollout stage 2), direct path only.** The service is
 `kbf.worker.v1.Segments` (`crates/kbf-proto/proto/kbf/worker/v1/segments.proto`,
-served by `crates/kbf-front/src/segments.rs`); the daemon's side is `Spool` and
-`Cas::put_spool` in `kbf-transfer` (`spool.rs`, `segments.rs`), and the native driver
-stores its outputs that way. Where the code differs from the text below:
+served by `crates/kbf-front/src/segments.rs`); the daemon's side is `Record` and
+`Cas::put_records` in `kbf-transfer` (`source.rs`, `segments.rs`). The container driver
+hashes each output file once and sends the records from the files where they are; the
+native driver gathers its outputs in a `Spool` first (`Cas::put_spool`, which is
+`put_records` over the spool's records). Where the code differs from the text below:
 
-- The daemon spools every output as its walk stores it, and asks FindMissing for the
-  whole spool afterwards: the walk reads and hashes a file in one pass, so a blob the
-  server already holds costs a local copy, not a send.
+- A record is a digest, a CRC-32C and a `Source`: the bytes in memory (a Directory or
+  Tree message), a file the walk hashed, or an offset of a spool. The container driver's
+  walk hashes each file exactly once, on the node's `--cpu-threads` threads, one pass
+  for the SHA-256 and the CRC-32C of the footer, and keeps no copy and no open file:
+  the engine opens the file again by name below the upper directory (each component with
+  `O_NOFOLLOW`) when it sends the range that holds it. Before the read it checks the
+  file is the one that was hashed (device, inode, size, mtime and ctime taken while it
+  was hashed, and again after the read); a file that differs fails the upload with a
+  read error naming it, and the action fails. That check is cheap and early; the
+  guarantee is the server's, which hashes every record against its digest at `Commit`,
+  so bytes that changed within the clock's granularity are refused there (the upload
+  is retried once, then each blob goes by ByteStream, whose write the front verifies
+  too). A wrong digest is never stored.
+- FindMissing is asked for every record before anything is sent, so a blob the server
+  already holds costs a hash, not a copy or a send.
 - The daemon splits uploads at 32 MiB (`SEGMENT_UPLOAD_BYTES`; a larger blob is an
   upload of its own), under the smallest `--segment-upload-max-bytes` a server starts
   with (1 GiB + 1 MiB), so every server admits them and the daemon needs no flag for
-  the server's cap. An upload commits or fails whole and a spool's uploads go one after
-  another, so a PUT cut on a slow store costs one upload's retry and fall-back, and the
-  uploads before it stay committed. (At 1 GiB, a cold upload of 14,244 outputs lost
+  the server's cap. An upload commits or fails whole, and up to
+  `--segment-uploads-in-flight` (default 4) of a record set's uploads go at once, so a
+  PUT cut on a slow store costs one upload's retry and fall-back, and the uploads that
+  committed stay committed. (At 1 GiB, a cold upload of 14,244 outputs lost
   every blob it had sent to one failed upload.)
 - `Begin` is admitted for its whole length by the cache's `--write-bytes-in-flight`
   (section 3.3), the bound ByteStream and batch uploads share, and the server refuses
@@ -207,11 +222,10 @@ stores its outputs that way. Where the code differs from the text below:
   drops its stream.
 - `Locate` and `ReadRange` are served, and the daemon's coalescing reader
   (`Scope::read_located`) is built and tested, but cache fills do not use it yet.
-- The container driver asks `Cas::missing` once for every digest of a lease's outputs
-  (the files, every Directory, the Tree), copies only the missing blobs into a spool in
-  the lease's scratch directory, `--transfer-in-flight` files open at a time, and
-  stores the spool with `put_spool`. A digest `missing` answered is not asked again by
-  the spool's upload. Its stdout and stderr are still stored blob by blob.
+- The container driver lists the output paths in one blocking task, hashes the files on
+  its `--cpu-threads` pool (one reusable read buffer per thread, grown to the file),
+  builds every Directory and the Tree from the digests, and stores the records with
+  `put_records`. Its stdout and stderr are still stored blob by blob.
 - A retried upload (4.2) does not ask FindMissing again: it sends a fresh `Begin` of
   the same plan. Blobs a lost-reply commit already indexed are sent and stored again,
   and `PutBlobs` keeps the existing entry, so a retry costs bytes, not correctness.
@@ -220,9 +234,10 @@ stores its outputs that way. Where the code differs from the text below:
   (`--segment-upload-idle-secs`, default 60 s). With the default bound of 2 GiB, the
   retry's `Begin` of a large upload, and other uploads of any kind, can wait that
   long. A failed `Commit` returns its admission when it ends.
-- The spool copies the whole output set onto the daemon's scratch disk, with no size
-  limit of its own, including blobs the server already holds: an action's outputs take
-  twice their size on scratch until the upload ends.
+- A native-driver spool still copies the whole output set onto the daemon's scratch
+  disk, with no size limit of its own, including blobs the server already holds: an
+  action's outputs take twice their size on scratch until the upload ends. The container
+  driver does not spool.
 
 ### 4.1 Shape
 
@@ -232,8 +247,8 @@ stores its outputs that way. Where the code differs from the text below:
    several when they pass `MAX_SEGMENT_BYTES` (128 MiB). A blob larger than that is a
    segment of one record, as a large blob is in section 3.2. The segment's **footer is the
    manifest**: (hash, size, offset, crc32c) per record, in the format the store already
-   reads. (It is not the chunking `Manifest` of `kbf-segments`.) Records are written to
-   a spool file on the worker's disk, not held in memory.
+   reads. (It is not the chunking `Manifest` of `kbf-segments`.) Record bytes are read
+   from where they are (section 4, `Source`) as each range is sent, never held whole.
 3. `kbf.worker.v1.Segments/Begin { segments: [{ length, footer }] }` opens an upload
    and returns its id. The server refuses a footer that does not parse, an entry past
    `index_offset`, overlapping records, or a total over the caps of section 4.2. It
@@ -243,7 +258,11 @@ stores its outputs that way. Where the code differs from the text below:
    daemon's one connection, each range up to 4 MiB. A range is marked received only
    after its bytes are written (in memory, or `pwrite` returned). A range outside the
    records, or overlapping a received range with other bounds, is refused. A resend of
-   a received range (same offset and length) gets `OK` and **writes nothing**.
+   a received range (same offset and length) gets `OK` and **writes nothing**. The
+   daemon keeps up to `--segment-uploads-in-flight` (default 4) uploads of one record set in
+   flight, so the server's check and staging of one overlaps the next ones' ranges; each
+   range still takes a permit of the uploads' share of `--transfer-in-flight` before it
+   is read from its files.
 5. `Segments/Commit { upload }` moves the upload to **committing**: every later
    `PutRange` is refused (`FAILED_PRECONDITION`, nothing written). The server waits for
    in-flight range writes and checks every range is present. **Every record's SHA-256
@@ -655,7 +674,8 @@ Estimates from the measured store latency, to be measured on the pilot at each s
 2. **PR 2, segment upload**: the `Segments` service on the worker listener (`Begin`,
    `PutRange`, `Commit`, `Locate`, `ReadRange`) in `kbf-proto` and `kbf-front`, and the
    daemon's spool, split, upload and fallback in `kbf-daemon`/`kbf-outputs`. Flags:
-   `--segment-upload-max-bytes`, `--segment-upload-streams`, `--segment-upload-idle-secs`.
+   `--segment-upload-max-bytes`, `--segment-upload-streams`, `--segment-upload-idle-secs`
+   (and later `--segment-uploads-in-flight`).
    Direct path only. Downloads through the transfer engine follow it.
 3. **PR 3, tier metadata**: the five commands in `kbf-meta` and `kbf-log`, the staged
    table, `BlobAnswer::Present { staged_on }`, the refusal test, snapshot encoding if

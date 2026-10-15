@@ -1,0 +1,125 @@
+# A GitHub release of the exact files the artifacts workflow built and attested for one
+# commit on main (docs/artifacts.md). Nothing is rebuilt: the files are the ones the
+# push run of artifacts.yml on main left for that commit, checked again here, so a held
+# script can pin a release asset, which outlives the run's 90-day workflow artifacts.
+#
+# Pushing a tag `v*` cuts a release of the commit the tag names. The verify job, with
+# read-only scopes, refuses a commit that is not on main and one with no successful
+# main push run of artifacts.yml (cargo xtask release locate, crates/xtask/src/release.rs),
+# downloads that run's artifacts, checks them against SHA256SUMS, refuses a file that is
+# not an asset of the commit (cargo xtask release check), and verifies every attestation
+# as a deployment does (cargo xtask verify-assets attestations). Only then does the
+# publish job create the release with those files, or add the ones an existing release
+# lacks. It is the one job that may write: `contents: write`, under the exact tag-push
+# `if:` the workflow lint (crates/kbf-it/tests/workflows) requires for that scope. A
+# re-run creates no second release and replaces no asset: every asset the release
+# already holds must be one of the verified files, byte for byte, or the run fails and
+# changes nothing.
+#
+# Run by hand (workflow_dispatch) with a commit, only the verify job runs: a dry run of
+# every check that publishes nothing.
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      commit:
+        description: The full SHA of a commit on main, checked as a release would check it; nothing is published
+        required: true
+        type: string
+
+permissions: {}
+
+# One run per tag (or per branch, for a dry run) at a time, none cancelled.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
+      attestations: read
+    env:
+      # The tag's commit on a tag push; the input on a dry run.
+      COMMIT: ${{ github.event_name == 'push' && github.sha || inputs.commit }}
+    outputs:
+      run-id: ${{ steps.locate.outputs.run-id }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      # Built before any step holds a token, so no build script runs beside one.
+      - run: cargo build -p xtask --locked
+      - name: Refuse a commit not on main; find the main push run that built it
+        id: locate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: cargo xtask release locate --repo "$GITHUB_REPOSITORY" --commit "$COMMIT" --output "$GITHUB_OUTPUT"
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: assets-*
+          path: dist
+          merge-multiple: true
+          run-id: ${{ steps.locate.outputs.run-id }}
+          github-token: ${{ github.token }}
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: sha256sums
+          path: dist
+          run-id: ${{ steps.locate.outputs.run-id }}
+          github-token: ${{ github.token }}
+      - name: Check the files against SHA256SUMS
+        working-directory: dist
+        run: sha256sum --check --strict SHA256SUMS
+      - name: Every file is listed once, matches, and is an asset of this commit
+        run: cargo xtask release check dist --commit "$COMMIT"
+      - name: Verify every attestation as a deployment does
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: cargo xtask verify-assets attestations dist --repo "$GITHUB_REPOSITORY" --workflow-ref "$GITHUB_REPOSITORY/.github/workflows/artifacts.yml"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-assets
+          path: dist/
+          retention-days: 7
+          if-no-files-found: error
+
+  # Tag push only: the files the verify job checked, as a release of the tag.
+  publish:
+    needs: [verify]
+    if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      # Built before any step holds the token, so no build script runs beside it.
+      - run: cargo build -p xtask --locked
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-assets
+          path: dist
+      - name: Create the release, or add the files it lacks
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ needs.verify.outputs.run-id }}
+        run: cargo xtask release publish dist --repo "$GITHUB_REPOSITORY" --tag "$GITHUB_REF_NAME" --commit "$GITHUB_SHA" --run-id "$RUN_ID"

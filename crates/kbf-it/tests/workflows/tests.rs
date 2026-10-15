@@ -428,7 +428,6 @@ fn job_permissions_may_not_widen_the_token() {
     for p in [
         "write-all",
         "read-all",
-        "{contents: write}",
         "{contents: read, pull-requests: write}",
         "''",
     ] {
@@ -488,7 +487,6 @@ fn a_main_push_job_still_gets_no_other_write_scope() {
     // Catches: the main-push exception read as "any write scope", or a signing scope
     // matched loosely (another case, or a level other than `write`).
     for p in [
-        "{contents: write}",
         "{packages: write}",
         "{ID-Token: write}",
         "{id-token: admin}",
@@ -496,6 +494,63 @@ fn a_main_push_job_still_gets_no_other_write_scope() {
     ] {
         refused(
             &format!("    runs-on: ubuntu-latest\n{MAIN_PUSH_IF}    permissions: {p}\n"),
+            "a job's `permissions`",
+        );
+    }
+}
+
+/// The `if:` line under which a job may create a release, as the lint requires it.
+const TAG_PUSH_IF: &str =
+    "    if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}\n";
+
+#[test]
+fn contents_write_needs_a_job_that_runs_only_for_a_pushed_release_tag() {
+    // Catches: `contents: write` (create a release, push a branch or a tag) allowed in a
+    // job a pull request, the merge queue, a push to main or a manual run runs; and
+    // the exception refused where the release workflow needs it.
+    clean(&workflow(&format!(
+        "    runs-on: ubuntu-latest\n{TAG_PUSH_IF}    permissions: {{contents: write, actions: read}}\n"
+    )));
+    for cond in [
+        "",
+        MAIN_PUSH_IF,
+        "    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')\n",
+        "    if: ${{ startsWith(github.ref, 'refs/tags/v') }}\n",
+        "    if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') }}\n",
+        "    if: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') || true }}\n",
+    ] {
+        let body =
+            format!("    runs-on: ubuntu-latest\n{cond}    permissions: {{contents: write}}\n");
+        assert_eq!(
+            scan(&workflow(&body)),
+            vec![format!(
+                "line {}: `contents: write` is allowed only in a job whose `if:` is exactly `{RELEASE_TAG_PUSH_ONLY}`",
+                if cond.is_empty() { 7 } else { 8 }
+            )],
+            "{body}"
+        );
+    }
+}
+
+#[test]
+fn a_release_tag_job_gets_no_other_write_scope() {
+    // Catches: the tag-push exception read as "any write scope" (signing provenance
+    // from a tag, or writing packages or workflow runs), or `contents` matched loosely.
+    for p in ["{id-token: write}", "{attestations: write}"] {
+        refused(
+            &format!("    runs-on: ubuntu-latest\n{TAG_PUSH_IF}    permissions: {p}\n"),
+            &format!("is exactly `{MAIN_PUSH_ONLY}`"),
+        );
+    }
+    for p in [
+        "{packages: write}",
+        "{actions: write}",
+        "{Contents: write}",
+        "{contents: admin}",
+        "write-all",
+    ] {
+        refused(
+            &format!("    runs-on: ubuntu-latest\n{TAG_PUSH_IF}    permissions: {p}\n"),
             "a job's `permissions`",
         );
     }

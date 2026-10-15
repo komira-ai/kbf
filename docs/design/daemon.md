@@ -619,6 +619,17 @@ CAS, and the lease fails with INTERNAL and the reason `the output upload did not
 within its deadline of ...: stopped after ...`. Without it, a store that stops
 answering held the lease, and its slot, with no error.
 
+**Hashing the outputs.** The container driver reads each output file once, to hash it:
+SHA-256 for the digest, CRC-32C for the footer of the segment it is sent in. The hashing
+runs on `--cpu-threads` threads of their own (default 4, shared by all leases and apart
+from the threads that run actions), one read buffer per thread, and the listing of the
+output tree is one task of the blocking pool, not one per file. The upload then reads the
+files again, in ranges, only to send them (`--segment-uploads-in-flight` uploads at once,
+default 4, within `--transfer-in-flight`'s upload share): nothing is copied to scratch.
+A file that is no longer the one that was hashed (replaced, removed, or its size or times
+changed) fails the lease with a read error naming it. The lease's log line `outputs
+phases` says where the time went: `list_ms`, `hash_ms`, `find_missing_ms`, `upload_ms`.
+
 ## Measuring usage
 
 `usage::Child` spawns an action as the leader of its own process group and reaps it
