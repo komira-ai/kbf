@@ -187,7 +187,7 @@
     {
       "destination": "/kbf/root",
       "options": [
-        "lowerdir=/scratch/kbf-lease-1-2/root,upperdir=/scratch/kbf-lease-1-2/upper,workdir=/scratch/kbf-lease-1-2/work,userxattr,metacopy=off,redirect_dir=off,index=off,xino=off",
+        "lowerdir=/scratch/kbf-lease-1-2/root,upperdir=/scratch/kbf-lease-1-2/upper,workdir=/scratch/kbf-lease-1-2/work,userxattr,metacopy=off,redirect_dir=nofollow,index=off,xino=off",
         "nosuid",
         "nodev"
       ],

@@ -234,7 +234,7 @@ async fn the_exec_root_is_an_overlay_and_the_image_is_read_only() {
     let overlay = at("/kbf/root");
     assert_eq!(overlay["type"], "overlay");
     let options = names(&overlay["options"]);
-    let pinned = "userxattr,metacopy=off,redirect_dir=off,index=off,xino=off";
+    let pinned = "userxattr,metacopy=off,redirect_dir=nofollow,index=off,xino=off";
     assert_eq!(
         options[0],
         format!(

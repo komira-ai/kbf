@@ -42,11 +42,14 @@ pub(crate) const WRITABLE: [(&str, &str); 4] = [
 /// The directory of the lease holding [`WRITABLE`]'s directories.
 pub(crate) const WRITABLE_DIR: &str = "rw";
 
-/// The mount options of the exec-root overlay, pinned: no metacopy, redirect, index or
-/// xino (a stub or redirect planted in the upper layer cannot change what collection
-/// reads), `userxattr` because the overlay is mounted inside a user namespace.
+/// The mount options of the exec-root overlay, pinned: no metacopy, redirects only
+/// recorded and never followed (`nofollow`), no index or xino (a stub or redirect planted
+/// in the upper layer cannot change what collection reads), and `userxattr` because the
+/// overlay is mounted inside a user namespace. The kernel refuses `userxattr` together
+/// with `redirect_dir=off` or `on` ("conflicting options"): `nofollow` is the one
+/// redirect mode `userxattr` takes, and what it implies.
 pub(crate) const OVERLAY_OPTIONS: &str =
-    "userxattr,metacopy=off,redirect_dir=off,index=off,xino=off";
+    "userxattr,metacopy=off,redirect_dir=nofollow,index=off,xino=off";
 
 /// Why a configuration could not be built.
 #[derive(Debug, thiserror::Error)]

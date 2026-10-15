@@ -427,7 +427,7 @@ state database is touched.
   `memory.events` is read as before.
 - **Files.** `/` is the unpacked image, **read-only**; `/kbf/root` is an overlay
   (`lowerdir` the input root, `upperdir` the lease's upper, options pinned to
-  `userxattr,metacopy=off,redirect_dir=off,index=off,xino=off`); `/tmp`, `/var/tmp`,
+  `userxattr,metacopy=off,redirect_dir=nofollow,index=off,xino=off`); `/tmp`, `/var/tmp`,
   `/run` and `/root` are directories of the lease on disk (not tmpfs, which would count
   against the lease's memory); `/etc/hosts` and `/etc/hostname` are small read-only
   files. **This differs from Podman, whose container root is writable everywhere**: an
