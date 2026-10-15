@@ -35,7 +35,7 @@ use std::collections::hash_map::RandomState;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::hash::BuildHasher;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use kbf_front::{Cache, Dispatch, Finished, MetaLog, Recorder, Stage, Submission, Ticket};
 use kbf_meta::{ActionRecord, Role};
@@ -104,7 +104,9 @@ pub struct Farm<M, O> {
     term: u64,
     /// The lease epoch `Welcome` names: the term itself, or the Raft log's id.
     lease_epoch: u64,
-    epoch: Instant,
+    /// When this farm was built, on tokio's clock (so a test that pauses it moves farm
+    /// time with `advance`).
+    epoch: tokio::time::Instant,
     /// The wall-clock time of `epoch`, in milliseconds since the Unix epoch: how farm
     /// times are shown to operators.
     epoch_unix_ms: u64,
@@ -232,7 +234,7 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
             cache,
             term,
             lease_epoch,
-            epoch: Instant::now(),
+            epoch: tokio::time::Instant::now(),
             epoch_unix_ms: unix_ms(),
             state: Mutex::new(State {
                 sched,
@@ -484,23 +486,34 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
         }
     }
 
-    /// Expires leases of silent workers and places queued work. Logs each drain that
-    /// has paused at its deadline, once.
-    pub fn tick(&self) {
+    /// Expires leases of silent workers and places queued work. A silent lease lost
+    /// past its operation's farm reruns finishes the operation: its callers are
+    /// answered (nothing is cached), as a heartbeat's are. Logs each drain that has
+    /// paused at its deadline, once.
+    pub async fn tick(&self) {
         let now = self.now();
-        let mut state = self.lock();
-        state.feed_quiet(now, Event::Tick);
-        let paused: BTreeSet<WorkerId> = state
-            .machine
-            .nodes()
-            .filter(|w| matches!(state.sched.cordon(w), Some(Cordon::Paused { .. })))
-            .cloned()
-            .collect();
-        for worker in paused.difference(&state.paused) {
-            let leases = state.sched.leases_on(worker).len();
-            tracing::warn!(%worker, leases, "drain paused at its deadline; leases run on");
+        let settled = {
+            let mut state = self.lock();
+            let answers = state.feed(now, Event::Tick);
+            let paused: BTreeSet<WorkerId> = state
+                .machine
+                .nodes()
+                .filter(|w| matches!(state.sched.cordon(w), Some(Cordon::Paused { .. })))
+                .cloned()
+                .collect();
+            for worker in paused.difference(&state.paused) {
+                let leases = state.sched.leases_on(worker).len();
+                tracing::warn!(%worker, leases, "drain paused at its deadline; leases run on");
+            }
+            state.paused = paused;
+            answers
+                .iter()
+                .map(|a| state.settle(a, None))
+                .collect::<Vec<Settled>>()
+        };
+        for settled in settled {
+            self.deliver(settled).await;
         }
-        state.paused = paused;
     }
 
     /// A `Result` from `worker`. Accepted only if `worker` holds the operation's
@@ -788,9 +801,10 @@ impl State {
         current.then_some((operation, sent.action, sent.stamp))
     }
 
-    /// Feeds an input that cannot lead to an answer: only a `Report` and a heartbeat
-    /// (a lease lost to a proven restart) propose a result, and only a committed result
-    /// answers.
+    /// Feeds an input that cannot lead to an answer: only a `Report`, a heartbeat (a
+    /// lease lost to a proven restart or a replacement) and a tick (a silent lease)
+    /// propose a result, and only a committed result answers; those three deliver their
+    /// answers themselves.
     fn feed_quiet(&mut self, now: FarmTime, event: Event) {
         let answers = self.feed(now, event);
         debug_assert!(
@@ -1055,9 +1069,10 @@ impl State {
             (_, Outcome::Failed(Failure::OutOfMemory)) => {
                 (memory::finished(&answer.memory_runs), None)
             }
-            (_, Outcome::Failed(Failure::NodeMemoryPressure | Failure::Lost(_))) => {
-                (fault::finished(&answer.farm_runs), None)
-            }
+            (
+                _,
+                Outcome::Failed(Failure::NodeMemoryPressure | Failure::Lost(_) | Failure::Infra),
+            ) => (fault::finished(&answer.farm_runs), None),
             _ => (
                 failed(Code::Internal, "the farm could not run the action"),
                 None,

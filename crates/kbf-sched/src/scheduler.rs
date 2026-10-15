@@ -63,6 +63,9 @@ struct Operation {
     /// A result from the current holding has been proposed; later reports for it are
     /// duplicates.
     result_proposed: bool,
+    /// The proposed result is the farm's give-up of a silent or replaced lease past
+    /// the operation's farm budget ([`Scheduler::give_up_charged`]), not a worker's.
+    gave_up: bool,
     /// While queued: since when, and why, no live worker can run it. `None` while one
     /// can.
     unservable: Option<Unservable>,
@@ -476,6 +479,7 @@ impl Scheduler {
                 state: OpState::Queued,
                 committed_lease: None,
                 result_proposed: false,
+                gave_up: false,
                 unservable: None,
                 farm_runs: Vec::new(),
                 avoid: BTreeSet::new(),
@@ -501,6 +505,7 @@ impl Scheduler {
             }
         }
         op.result_proposed = false;
+        op.gave_up = false;
     }
 
     /// Releases `operation`'s holding and puts it back in the queue, recording why.
@@ -798,6 +803,9 @@ impl Scheduler {
         {
             return Vec::new();
         }
+        if record.outcome == Outcome::Failed(Failure::Infra) && self.rerun_after_infra(record) {
+            return Vec::new();
+        }
         self.release(id);
         let op = self.ops.get_mut(&id).expect("checked above");
         op.state = match record.outcome {
@@ -926,7 +934,7 @@ impl StateMachine for Scheduler {
             } => self.report(operation, lease, outcome),
             Event::Tick => {
                 let mut effects = Vec::new();
-                self.expire();
+                effects.extend(self.expire());
                 self.place(&mut effects);
                 effects
             }

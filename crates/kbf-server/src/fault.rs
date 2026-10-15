@@ -63,6 +63,7 @@ const fn operator_fix(fault: FarmFault) -> &'static str {
             "find why the node's daemon restarted (its log says how it ended)"
         }
         FarmFault::Lost(LostWhy::Fenced) => "check the node's network path to the server",
+        FarmFault::Infra => "read the node daemon's log for why its driver failed",
     }
 }
 
@@ -72,5 +73,6 @@ const fn short(fault: FarmFault) -> &'static str {
         FarmFault::NodeMemoryPressure => "node memory pressure",
         FarmFault::Lost(LostWhy::DaemonRestarted) => "daemon restarted",
         FarmFault::Lost(LostWhy::Fenced) => "fenced",
+        FarmFault::Infra => "infra failure",
     }
 }

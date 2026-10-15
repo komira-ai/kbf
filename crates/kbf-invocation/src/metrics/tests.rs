@@ -83,6 +83,7 @@ fn every_requeue_reason_and_failure_class_has_its_own_name() {
         RequeueReason::NodeMemoryPressure,
         RequeueReason::Restarted,
         RequeueReason::Lost(LostWhy::Fenced),
+        RequeueReason::Infra,
     ];
     let mut names: Vec<&str> = requeues.iter().map(requeue_name).collect();
     names.sort_unstable();

@@ -2,13 +2,15 @@
 //! by its successor's drivers, and a run the node reported lost (fenced, or a
 //! whole-machine action whose result the restart took). Each runs again, preferring a
 //! node it was not lost on, from one budget shared with busy-node memory kills
-//! ([`FARM_RERUNS`]); a run past it finishes the operation.
+//! ([`FARM_RERUNS`]); a run past it finishes the operation. The same budget bounds a
+//! run the farm could not do ([`Failure::Infra`]) and a lease given up for silence or
+//! replacement.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
 
 use kbf_caps::NodeCaps;
-use kbf_sched::fence::HANDOVER_GRACE;
+use kbf_sched::fence::{HANDOVER_GRACE, LEASE_GRACE};
 use kbf_sched::{
     DaemonInstance, Event, FARM_RERUNS, Input, NodePhase, OpState, Request, RequeueReason,
     Scheduler,
@@ -23,6 +25,7 @@ use kbf_types::{
 const GIB: u64 = 1 << 30;
 const FENCED: Outcome = Outcome::Failed(Failure::Lost(LostWhy::Fenced));
 const RESTARTED: Outcome = Outcome::Failed(Failure::Lost(LostWhy::DaemonRestarted));
+const INFRA: Outcome = Outcome::Failed(Failure::Infra);
 const PRESSURE: Outcome = Outcome::Failed(Failure::NodeMemoryPressure);
 
 fn key(n: u8) -> ActionKey {
@@ -59,6 +62,13 @@ fn lost(worker: &str, why: LostWhy) -> FarmRun {
     FarmRun {
         worker: w(worker),
         fault: FarmFault::Lost(why),
+    }
+}
+
+fn infra(worker: &str) -> FarmRun {
+    FarmRun {
+        worker: w(worker),
+        fault: FarmFault::Infra,
     }
 }
 
@@ -194,6 +204,19 @@ impl Farm {
         next.clone()
     }
 
+    /// `holder` (running a lease) goes silent while the `others` keep heartbeating, and a
+    /// placement round runs after the lease grace: the effects, which give the lease up.
+    fn go_silent(&mut self, holder: &str, others: &[&str]) -> Vec<Effect> {
+        let at = self
+            .now
+            .saturating_add(LEASE_GRACE + Duration::from_secs(1));
+        self.now = at;
+        for name in others.iter().filter(|n| **n != holder) {
+            assert!(self.beat(name, &[]).is_empty());
+        }
+        self.feed(Event::Tick)
+    }
+
     fn requeues(&mut self) -> Vec<RequeueReason> {
         self.s
             .take_requeues()
@@ -252,7 +275,7 @@ fn a_proven_restart_reruns_at_once_on_another_node() {
 /// Catches a predecessor claim honoured when the server did not find it stopped (the
 /// claim's other half, the closed stream, is the server's; here it reports
 /// `predecessor_stopped = false`): the lease is kept for the handover grace, then
-/// given up as replaced, outside the farm budget.
+/// given up as replaced, and charged to the farm budget as a fenced run.
 #[test]
 fn a_restart_without_proof_waits_for_the_handover_grace() {
     let (mut f, start) = running_on_a();
@@ -264,7 +287,11 @@ fn a_restart_without_proof_waits_for_the_handover_grace() {
     f.at(HANDOVER_GRACE);
     assert!(f.beat("a", &[]).is_empty());
     assert_eq!(f.requeues(), [RequeueReason::Replaced]);
-    assert_eq!(f.s.farm_runs(start.operation).unwrap(), []);
+    assert_eq!(
+        f.s.farm_runs(start.operation).unwrap(),
+        [lost("a", LostWhy::Fenced)],
+        "a replacement is a farm run"
+    );
 }
 
 /// Catches a proof that clears every earlier process at once (the mutant "handover
@@ -615,3 +642,198 @@ impl Sim {
             .collect()
     }
 }
+
+/// Catches a run the farm could not do finishing its operation at once (the mutant:
+/// `Failure::Infra` answered on the first run), a budget off by one (`<` for `<=`:
+/// answered after 2 runs, or after 4), a rerun placed on the node it failed on while
+/// others fit, and an answer that does not carry the runs. Three infra results end the
+/// operation with the third's failure, the answer naming all three nodes; two and then
+/// an OK one complete it.
+#[test]
+fn three_infra_results_use_up_the_budget_and_two_do_not() {
+    let mut f = Farm::new();
+    for name in ["a", "b", "c"] {
+        f.node(name);
+    }
+    f.submit(1, request(1, LeaseKind::Action));
+    let mut start = f.start();
+    let mut nodes = Vec::new();
+    for _ in 0..FARM_RERUNS {
+        nodes.push(start.worker.clone());
+        start = f.rerun(&start, INFRA);
+    }
+    nodes.push(start.worker.clone());
+    assert_eq!(nodes, [w("a"), w("b"), w("c")], "each rerun on a new node");
+    let effects = f.end(&start, INFRA);
+    let answer = answer_in(&effects).expect("answered once the budget was used");
+    assert_eq!(answer.outcome, INFRA);
+    assert_eq!(answer.farm_runs, [infra("a"), infra("b"), infra("c")]);
+    assert!(Farm::starts(&effects).is_empty(), "{effects:?}");
+    assert_eq!(f.requeues(), [RequeueReason::Infra; 2]);
+
+    f.submit(2, request(2, LeaseKind::Action));
+    let mut start = f.start();
+    for _ in 0..FARM_RERUNS {
+        start = f.rerun(&start, INFRA);
+    }
+    let effects = f.end(&start, ok());
+    let answer = answer_in(&effects).expect("answered");
+    assert_eq!(answer.outcome, ok());
+    assert_eq!(answer.farm_runs, [infra("a"), infra("b")]);
+}
+
+/// Catches a node that goes silent with the lease every time holding an operation for
+/// ever (the mutant: silence requeues without charge), and an answer that does not
+/// carry the runs. Three silent nodes in turn end the operation, answered as lost to a
+/// fence (the node's own fence ended the run within the grace), naming all three.
+#[test]
+fn silent_nodes_use_up_the_budget_and_the_operation_is_answered() {
+    let mut f = Farm::new();
+    let nodes = ["a", "b", "c"];
+    for name in nodes {
+        f.node(name);
+    }
+    f.submit(1, request(1, LeaseKind::Action));
+    let mut start = f.start();
+    for _ in 0..FARM_RERUNS {
+        let effects = f.go_silent(start.worker.as_str(), &nodes);
+        assert!(answer_in(&effects).is_none(), "{effects:?}");
+        let [next] = &Farm::starts(&effects)[..] else {
+            panic!("no rerun after silence: {effects:?}");
+        };
+        assert_ne!(next.worker, start.worker, "rerun on the silent node");
+        start = next.clone();
+    }
+    let effects = f.go_silent(start.worker.as_str(), &nodes);
+    let answer = answer_in(&effects).expect("a silent node held the operation for ever");
+    assert_eq!(answer.outcome, FENCED);
+    assert_eq!(answer.lease, start.lease);
+    let fenced = |n: &str| lost(n, LostWhy::Fenced);
+    assert_eq!(answer.farm_runs, [fenced("a"), fenced("b"), fenced("c")]);
+    assert!(Farm::starts(&effects).is_empty(), "{effects:?}");
+    assert_eq!(f.requeues(), [RequeueReason::Silent; 2]);
+    assert!(f.s.state(start.operation).is_some_and(OpState::is_done));
+}
+
+/// Catches a replacement without proof outside the budget (the mutant: `Replaced`
+/// requeues without charge): a daemon process that keeps being replaced would hold the
+/// operation for ever. The third run is given up as replaced and answers the operation
+/// as a fenced run.
+#[test]
+fn a_replacement_past_the_budget_answers_the_operation() {
+    let (mut f, start) = running_on_a();
+    let start = f.rerun(&start, FENCED);
+    let start = f.rerun(&start, INFRA);
+    assert_eq!(start.worker, w("a"), "both avoided: the first that fits");
+    f.at(Duration::from_secs(1));
+    f.up("a", "a2", false, false);
+    f.at(Duration::from_secs(1) + HANDOVER_GRACE);
+    let effects = f.beat("a", &[]);
+    let answer = answer_in(&effects).expect("the replacement answered nobody");
+    assert_eq!(answer.outcome, FENCED);
+    assert_eq!(answer.lease, start.lease);
+    assert_eq!(
+        answer.farm_runs,
+        [
+            lost("a", LostWhy::Fenced),
+            infra("b"),
+            lost("a", LostWhy::Fenced)
+        ]
+    );
+    assert!(Farm::starts(&effects).is_empty(), "{effects:?}");
+}
+
+/// Catches one counter per fault kind (the mutant: silence and infra results counted
+/// apart from lost runs would allow 6 runs): a lost run, an infra result and a silence
+/// are one budget, so the third ends the operation, and the answer lists them in order.
+#[test]
+fn lost_infra_and_silence_share_one_budget() {
+    let mut f = Farm::new();
+    let nodes = ["a", "b", "c"];
+    for name in nodes {
+        f.node(name);
+    }
+    f.submit(1, request(1, LeaseKind::Action));
+    let start = f.start();
+    let start = f.rerun(&start, FENCED);
+    let start = f.rerun(&start, INFRA);
+    let effects = f.go_silent(start.worker.as_str(), &nodes);
+    let answer = answer_in(&effects).expect("answered after 3 mixed runs");
+    assert_eq!(answer.outcome, FENCED);
+    assert_eq!(
+        answer.farm_runs,
+        [
+            lost("a", LostWhy::Fenced),
+            infra("b"),
+            lost("c", LostWhy::Fenced)
+        ]
+    );
+}
+
+/// Catches a give-up past the budget proposed twice: silence is checked on every
+/// placement round, and the round after the proposal, before its commit, must not
+/// propose the result again. Committing it answers once.
+#[test]
+fn the_record_of_a_silence_is_committed_once() {
+    let (mut f, start) = running_on_a();
+    let start = f.rerun(&start, FENCED);
+    let start = f.rerun(&start, INFRA);
+    f.now = f.now.saturating_add(LEASE_GRACE + Duration::from_secs(1));
+    f.beat("b", &[]);
+    let tick = |f: &mut Farm| f.s.apply(Input::new(f.now, Event::Tick));
+    let record = ControlRecord::Result(ResultRecord {
+        lease: start.lease,
+        operation: start.operation,
+        outcome: FENCED,
+    });
+    assert_eq!(tick(&mut f), [Effect::Commit(record.clone())]);
+    assert!(tick(&mut f).is_empty(), "proposed again");
+    let effects = f.feed(Event::Committed(record));
+    assert!(answer_in(&effects).is_some(), "{effects:?}");
+}
+
+/// Whether `failure` is the user's own (or the client's), which the farm never reruns.
+/// Exhaustive, so a new [`Failure`] must be placed on one side or the other here.
+const fn is_the_users(failure: Failure) -> bool {
+    match failure {
+        Failure::Timeout | Failure::Invalid | Failure::MissingInput => true,
+        // Rerun from the farm budget, or (an action's own memory limit) from the
+        // memory floor: `an_out_of_memory_kill_is_not_a_farm_fault`.
+        Failure::Infra | Failure::NodeMemoryPressure | Failure::Lost(_) | Failure::OutOfMemory => {
+            false
+        }
+    }
+}
+
+/// Catches the budget widened to failures that are not the farm's (the mutant: every
+/// `Failure` charged, or the `Infra` check widened to a user's failure): the user's
+/// action failing (timeout), an action that cannot run as written, and a missing input
+/// are answered by their first run, with no farm run and no requeue. Every [`Failure`]
+/// is classified by [`is_the_users`], so a new variant cannot skip this test.
+#[test]
+fn a_users_failure_is_never_retried() {
+    let every = [
+        Failure::Timeout,
+        Failure::Invalid,
+        Failure::MissingInput,
+        Failure::Infra,
+        Failure::OutOfMemory,
+        Failure::NodeMemoryPressure,
+        Failure::Lost(LostWhy::Fenced),
+        Failure::Lost(LostWhy::DaemonRestarted),
+    ];
+    let users: Vec<Failure> = every.into_iter().filter(|f| is_the_users(*f)).collect();
+    assert_eq!(users.len(), 3, "{users:?}");
+    for (n, failure) in users.into_iter().enumerate() {
+        let (mut f, start) = running_on_a();
+        let outcome = Outcome::Failed(failure);
+        let effects = f.end(&start, outcome);
+        let answer = answer_in(&effects).unwrap_or_else(|| panic!("{failure:?} was retried"));
+        assert_eq!(answer.outcome, outcome, "case {n}");
+        assert!(answer.farm_runs.is_empty(), "{failure:?} charged");
+        assert!(f.requeues().is_empty(), "{failure:?} requeued");
+    }
+}
+
+#[path = "lost/give_up.rs"]
+mod give_up;

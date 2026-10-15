@@ -56,17 +56,19 @@
 //!   counts against the node ([`Scheduler::memory_pressure`]). See
 //!   [`kbf_types::MemoryRun`].
 //! - farm faults (failure classes, 6.5; issue #22): a busy node's memory kill, a run the
-//!   worker reports lost ([`kbf_types::Failure::Lost`]) and a lease of a daemon proven
-//!   stopped run again from one budget of [`FARM_RERUNS`] per operation, placement
-//!   preferring a node none of those runs ended on; the run past it finishes the
-//!   operation, its callers told every farm run ([`kbf_types::FarmRun`]).
+//!   worker reports lost ([`kbf_types::Failure::Lost`]), a run the farm could not do
+//!   ([`kbf_types::Failure::Infra`]), a lease of a daemon proven stopped, and a lease
+//!   whose `Start` was sent and that was given up for silence or replacement run again
+//!   from one budget of [`FARM_RERUNS`] per operation, placement preferring a node none
+//!   of those runs ended on; the run past it finishes the operation, its callers told
+//!   every farm run ([`kbf_types::FarmRun`]). A give-up past the budget has its result
+//!   proposed through the log.
 //!
 //! Not yet: placement scoring (alignment, best fit), a reservation for a large
 //! `action` request (issue #169), reclaimed room and preemption, a budget for the
-//! other farm failures (a [`kbf_types::Failure::Infra`] result still finishes its
-//! operation) and for leases given up for silence or replacement without proof, and
-//! committing submissions so that a new leader inherits the queue. In v0 the scheduler
-//! runs on the leader only.
+//! leases given up for reconnection or not starting (a node that drops every `Start`
+//! while it heartbeats is not bounded), and committing submissions so that a new leader
+//! inherits the queue. In v0 the scheduler runs on the leader only.
 //!
 //! This is a pure crate: no async runtime, network, clock, randomness or hashed
 //! collections. The layering test in `kbf-it` and the lists in `clippy.toml` enforce it.

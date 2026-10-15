@@ -44,6 +44,7 @@ use cell::worker::{End, Took};
 use cell::{Ctx, LeaderPlan, LogPlan, Plan, WorkerPlan, World, calm_network, check::CheckStats};
 use kbf_sched::fence::{LEASE_GRACE, SELF_FENCE, START_GRACE, START_VALIDITY};
 use kbf_sim::{Chance, Faults, SimRng};
+use kbf_sched::FARM_RERUNS;
 use kbf_types::{ControlRecord, Failure, LeaseId, OperationId, Outcome};
 
 /// Seeds per scenario in CI.
@@ -400,9 +401,24 @@ fn f2_1_a_dead_worker_s_leases_are_requeued_at_g_and_answered_elsewhere() {
     );
 }
 
+/// Asserts that `op`, answered by an `Infra` result, had used up its farm budget: an
+/// `Infra` result answers only the run past [`FARM_RERUNS`] reruns, else the operation
+/// runs again under a newer lease. Catches the mutant that charges nothing (the
+/// operation answered by its first `Infra` result, with one run recorded).
+fn spent_budget(scenario: &str, seed: u64, check: &cell::check::Check, op: OperationId) {
+    let runs = check.answered_farm_runs.get(&op).copied();
+    assert_eq!(
+        runs,
+        Some(1 + usize::try_from(FARM_RERUNS).expect("a small budget")),
+        "{scenario} seed {seed}: {op} answered by an Infra result with its budget unspent"
+    );
+}
+
 /// F2.2. Catches: a lease given up while its worker is heard within G, a self-fenced
 /// run outliving T, and a fenced run's ABORTED result not accepted (or answered twice)
-/// while the scheduler still held its lease.
+/// while the scheduler still held its lease. An ABORTED result is a run the farm could
+/// not do: it answers its operation only past the operation's farm budget, else the
+/// operation runs again under a newer lease.
 #[test]
 fn f2_2_gaps_shorter_than_g_requeue_nothing_heard_and_fence_after_t() {
     let (mut fences, mut failed, mut gap_no_requeue) = (0, 0, 0);
@@ -410,17 +426,27 @@ fn f2_2_gaps_shorter_than_g_requeue_nothing_heard_and_fence_after_t() {
         let w = run("F2.2", seed);
         let s = stats(&w);
         fences += fenced(&w);
-        failed += s.answered_failed;
         if s.requeued_silent == 0 {
             gap_no_requeue += 1;
         }
         let check = &w.leader().check;
         for (lease, (op, outcome)) in &check.proposals {
-            assert_eq!(
-                check.answered.get(op),
-                Some(&(*lease, *outcome)),
-                "F2.2 seed {seed}: the proposed result of {lease} did not answer {op}"
-            );
+            let answered = check.answered.get(op);
+            if *outcome == Outcome::Failed(Failure::Infra) {
+                assert!(
+                    answered.is_none_or(|(by, _)| by >= lease),
+                    "F2.2 seed {seed}: {op} answered before the proposed result of {lease}"
+                );
+                if answered.is_some_and(|(by, _)| by == lease) {
+                    spent_budget("F2.2", seed, check, *op);
+                }
+            } else {
+                assert_eq!(
+                    answered,
+                    Some(&(*lease, *outcome)),
+                    "F2.2 seed {seed}: the proposed result of {lease} did not answer {op}"
+                );
+            }
         }
         for (_, worker) in w.workers() {
             for run in worker
@@ -428,7 +454,16 @@ fn f2_2_gaps_shorter_than_g_requeue_nothing_heard_and_fence_after_t() {
                 .iter()
                 .filter(|r| r.end.is_some_and(|(_, e)| e == End::Fenced))
             {
-                if check.answered[&run.operation].0 == run.lease {
+                if check
+                    .answered
+                    .get(&run.operation)
+                    .is_some_and(|a| a.0 > run.lease)
+                {
+                    // Its ABORTED result is a run the farm could not do: run again.
+                    failed += 1;
+                }
+                if check.answered.get(&run.operation).map(|a| a.0) == Some(run.lease) {
+                    spent_budget("F2.2", seed, check, run.operation);
                     assert_eq!(
                         check.answered[&run.operation].1,
                         Outcome::Failed(Failure::Infra),
@@ -439,7 +474,11 @@ fn f2_2_gaps_shorter_than_g_requeue_nothing_heard_and_fence_after_t() {
         }
     }
     reached("F2.2", "a self-fenced run", fences);
-    reached("F2.2", "an operation failed by its fenced run", failed);
+    reached(
+        "F2.2",
+        "an operation run again after its fenced run",
+        failed,
+    );
     reached(
         "F2.2",
         "a run with gaps and nothing requeued",
@@ -549,12 +588,26 @@ fn f2_6_a_suspended_worker_fences_first_on_resume() {
             1 => {
                 assert_eq!(s.requeued_silent, 0, "F2.6 seed {seed}: requeued inside G");
                 for run in &fenced_runs {
-                    assert_eq!(
-                        check.answered[&run.operation],
-                        (run.lease, Outcome::Failed(Failure::Infra)),
-                        "F2.6 seed {seed}: the fenced {} not answered by its ABORTED result",
-                        run.lease
-                    );
+                    // Answered by its ABORTED result past the farm budget, else run
+                    // again: answered by a newer lease, or not yet.
+                    match check.answered.get(&run.operation) {
+                        Some(&(by, outcome)) if by == run.lease => {
+                            assert_eq!(
+                                outcome,
+                                Outcome::Failed(Failure::Infra),
+                                "F2.6 seed {seed}: the fenced {} not answered by its ABORTED \
+                                 result",
+                                run.lease
+                            );
+                            spent_budget("F2.6", seed, check, run.operation);
+                        }
+                        Some(&(by, _)) => assert!(
+                            by > run.lease,
+                            "F2.6 seed {seed}: the fenced {} answered by an older lease",
+                            run.lease
+                        ),
+                        None => {}
+                    }
                 }
                 mid += w1.stats.fenced_on_resume;
             }
