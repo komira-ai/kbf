@@ -279,6 +279,11 @@ fn a_helper_runs_one_program_in_the_namespace_it_is_given() {
     for absent in ["resources", "cgroupsPath", "seccomp"] {
         assert!(config["linux"].get(absent).is_none(), "{absent}");
     }
+    // Every capability set is the given one or empty, as `capset` needs.
+    let caps = &config["process"]["capabilities"];
+    assert_eq!(caps["inheritable"], json!([]));
+    assert_eq!(caps["ambient"], json!([]));
+    assert_eq!(caps["permitted"].as_array().map(Vec::len), Some(11));
     assert_eq!(config["linux"]["maskedPaths"], json!([]));
     assert_eq!(config["linux"]["readonlyPaths"], json!([]));
     let uids = &config["linux"]["uidMappings"];

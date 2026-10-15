@@ -17,7 +17,10 @@
 //! The directories it works on are bound at `/t/0`, `/t/1`, ... so no per-lease path
 //! is ever created in the shared root.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+
+use std::collections::HashSet;
 
 use oci_spec::runtime::{
     LinuxBuilder, LinuxCapabilitiesBuilder, LinuxNamespaceBuilder, LinuxNamespaceType,
@@ -209,6 +212,10 @@ pub(crate) fn config(rootfs: &Path, ids: &DaemonIds, mapping: Mapping, job: &Job
             .bounding(held.clone())
             .effective(held.clone())
             .permitted(held)
+            // Left out, a set is `oci-spec`'s default (AUDIT_WRITE, KILL, NET_BIND_SERVICE):
+            // an ambient capability the permitted set lacks, which `capset` refuses.
+            .inheritable(HashSet::new())
+            .ambient(HashSet::new())
             .build(),
     );
     let process = built(
