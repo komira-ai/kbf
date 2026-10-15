@@ -11,7 +11,7 @@ use kbf_meta::{
     Applied, BlobWrite, Command, Epoch, Location, ObjectId, Retention, ServerId, StoreId, TierId,
 };
 use kbf_raft::{Entry, LogId, LogIndex, Payload, Snapshot, Storage};
-use kbf_server::raft_log::{RECORD, RECORD_TMP};
+use kbf_server::raft_log::{RECORD, RECORD_TMP, TICK};
 use kbf_server::{RaftLogError, RaftMetaLog};
 use kbf_store::{Fault, FaultFs, Options, Store};
 use kbf_types::{Digest, DigestFunction, FarmTime};
@@ -275,6 +275,26 @@ async fn farm_time_continues_from_the_committed_one_across_a_restart() {
     );
 }
 
+/// Catches: a tick committed as the log opens (an `interval` whose first tick is
+/// immediate). Farm time then is the base the open just applied, so the entry carries
+/// nothing, and it lands while the opener's first commit runs, moving the applied
+/// index under a caller that reads it (it read 4 for 3 in the test above).
+/// And a tick task that never ticks: the first tick lands a [`TICK`] after the open.
+#[tokio::test(start_paused = true)]
+async fn the_first_tick_is_one_tick_after_the_open() {
+    let fs = FaultFs::new();
+    let log = open(&fs, 7).await;
+    let opened = log.applied_index();
+    tokio::time::sleep(TICK - Duration::from_millis(1)).await;
+    assert_eq!(log.applied_index(), opened, "a tick committed at the open");
+    tokio::time::sleep(Duration::from_millis(2)).await;
+    assert_eq!(
+        log.applied_index(),
+        opened + 1,
+        "no tick a TICK after the open"
+    );
+}
+
 /// Catches: a start whose prefix root changed being given the new prefix silently (its
 /// objects would land outside the log's prefix), and a record that names another log
 /// than the one in the store being accepted.
@@ -391,7 +411,9 @@ async fn an_entry_or_snapshot_this_version_cannot_read_refuses_the_open() {
 /// The core counts an entry applied when it hands the host the effect, so after a
 /// storage error part-way through a commit the core's index names an entry the state
 /// never applied (kbf-sim-cell's durability check would then see a phantom entry).
-#[tokio::test]
+/// The clock is paused, so the tick task commits nothing between the reads: its first
+/// tick is a [`TICK`] after the open, and the clock does not move while a commit runs.
+#[tokio::test(start_paused = true)]
 async fn the_applied_index_is_the_state_s_and_stops_at_a_failed_commit() {
     let fs = FaultFs::new();
     let log = open(&fs, 6).await;
@@ -506,8 +528,9 @@ fn append(fs: &FaultFs, format: Format, command: &LogCommand) -> u64 {
 /// machine keeps decoding format 1"), a raise committed again when the log is already
 /// there (mutant "commit the entry on every call"), a version lowered by a later call,
 /// and a raise a restart forgets (the format must come from the log, not the process).
-/// Before the raise a tier command is refused without stopping the log.
-#[tokio::test]
+/// Before the raise a tier command is refused without stopping the log. The clock is
+/// paused, so no tick lands between the reads of the applied index.
+#[tokio::test(start_paused = true)]
 async fn raising_the_machine_version_to_2_lets_tier_commands_commit_and_lasts() {
     let fs = FaultFs::new();
     let log = open(&fs, 3).await;

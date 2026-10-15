@@ -211,27 +211,31 @@ impl Runtime for FakeRuntime {
 
 #[cfg(test)]
 mod tests {
+    use futures::FutureExt as _;
+
     use super::*;
 
     /// Catches an upload that is not bounded (the lease waits on a store that never
     /// answers) and a failure that does not say it was the upload, its deadline and
-    /// how long it ran.
-    #[tokio::test]
+    /// how long it ran. The clock is paused and the upload moves it 70 ms on its first
+    /// poll, so the time it ran is exactly 70.0ms on any machine, and differs from the
+    /// deadline: a message that printed the deadline twice fails.
+    #[tokio::test(start_paused = true)]
     async fn an_upload_past_its_deadline_fails_saying_so() {
         let deadline = Duration::from_millis(50);
-        let pending = std::future::pending::<Result<(), RuntimeError>>();
-        let ended = tokio::time::timeout(Duration::from_secs(10), upload_within(deadline, pending))
+        // One expression: a line after an await that never resumes would read as
+        // uncovered.
+        let stuck = tokio::time::advance(Duration::from_millis(70))
+            .then(|()| std::future::pending::<Result<(), RuntimeError>>());
+        let ended = tokio::time::timeout(Duration::from_secs(10), upload_within(deadline, stuck))
             .await
             .expect("the upload ends at its deadline, not never");
         let why = format!("{:?}", ended.expect_err("the upload fails at its deadline"));
-        assert!(
-            why.starts_with(
-                "Failed(\"the output upload did not finish within its deadline of 50ms"
-            ),
-            "{why}"
+        assert_eq!(
+            why,
+            "Failed(\"the output upload did not finish within its deadline of 50ms \
+             (--output-upload-deadline-secs): stopped after 70.0ms\")"
         );
-        assert!(why.contains("--output-upload-deadline-secs"), "{why}");
-        assert!(why.contains("stopped after 5"), "{why}");
     }
 
     /// Catches an upload that finishes in time being failed or changed.

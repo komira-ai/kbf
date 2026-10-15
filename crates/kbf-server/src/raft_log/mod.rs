@@ -35,7 +35,8 @@
 //! - **Farm time** continues from the committed one: at open the log takes the
 //!   applied farm time as its base, and [`RaftMetaLog::now`] is the base plus the time
 //!   since the open, so it never goes back across restarts. A task commits
-//!   `Tick(now)` every [`TICK`] while the log is open. A tick is a proposal, which
+//!   `Tick(now)` every [`TICK`] while the log is open, the first one [`TICK`] after
+//!   the open. A tick is a proposal, which
 //!   only a leader may make.
 //! - **Machine version.** A new log is at [`MachineVersion::V1`], whose entries are
 //!   format 1. [`RaftMetaLog::raise_machine_version`] commits a `MachineVersion`
@@ -573,14 +574,16 @@ fn decoded(machine: &MetaMachine) -> Result<(), RaftLogError> {
     })
 }
 
-/// Commits farm time every [`TICK`] for as long as the log is open. An error is
-/// dropped: it has stopped the log, and the next commit reports it.
+/// Commits farm time every [`TICK`] for as long as the log is open, the first one
+/// [`TICK`] after the open: at the open, farm time is the base the log just applied,
+/// so a tick then would commit nothing new. An error is dropped: it has stopped the
+/// log, and the next commit reports it.
 async fn tick_every<F>(shared: Weak<Shared<F>>)
 where
     F: Fs + Send + 'static,
     F::File: Send + 'static,
 {
-    let mut every = tokio::time::interval(TICK);
+    let mut every = tokio::time::interval_at(Instant::now() + TICK, TICK);
     every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         every.tick().await;
