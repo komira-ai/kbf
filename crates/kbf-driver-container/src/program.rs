@@ -388,4 +388,24 @@ mod tests {
         .expect("log");
         assert!(text_file_busy(&said).await);
     }
+
+    /// Catches a report that opens but cannot be read, and a rewritten stderr that cannot
+    /// be written, passed over as if nothing happened: each is the farm's failure, naming
+    /// the file (a directory opens, and fails to be read or written).
+    #[tokio::test]
+    async fn a_report_read_or_rewrite_that_fails_is_the_farms() {
+        let dir = scratch("io-fails");
+        let mut spec = crate::podman::tests::spec();
+        spec.argv = vec!["env".to_owned()];
+
+        let unreadable = not_run(&spec, &Said::podman(&dir), "created 0").await;
+        let why = unreadable.expect_err("unreadable").to_string();
+        assert!(why.contains(&format!("{}: ", dir.display())), "{why}");
+
+        let log = dir.join("crun.log");
+        std::fs::write(&log, LOG).expect("log");
+        let unwritable = not_run(&spec, &Said::crun(&log, &dir), "exited 1").await;
+        let why = unwritable.expect_err("unwritable").to_string();
+        assert!(why.contains(&format!("{}: ", log.display())), "{why}");
+    }
 }

@@ -502,7 +502,7 @@ mod tests {
     #[tokio::test]
     async fn a_run_always_ends_with_an_answer() {
         let build = |name: &str| std::thread::Builder::new().name(name.to_owned());
-        let idle = || async { std::future::pending::<RunEnd>().await };
+        let idle = std::future::pending::<RunEnd>;
         let started = |run: Result<Run, String>| Running::Run(run.expect("started"));
 
         let mut run = started(Run::start(
