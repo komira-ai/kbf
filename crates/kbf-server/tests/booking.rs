@@ -1,5 +1,6 @@
 //! Sized bookings end to end: `kbf-book-cpus` and `kbf-book-mem-gib` on an action, the
-//! booking in the daemon's `Start`, and placement that books it on the node.
+//! booking in the daemon's `Start`, and placement that books its cores on the node (its
+//! memory is the limit the action runs under, not a share of the node's).
 
 mod support;
 
@@ -9,17 +10,19 @@ const GIB: u64 = 1 << 30;
 
 /// Catches: a sized booking that reaches the scheduler but not the daemon's `Start`
 /// (the native driver sets its memory kill from `Start.memory_bytes`, so a large link
-/// step would still die at 2 GiB); a booking the scheduler does not hold on the node,
-/// so a second large action is placed beside the first in memory the node does not
-/// have; and a booking kept after its lease ends, so the queued action never runs.
+/// step would still die at 2 GiB); cores the scheduler does not hold on the node, so a
+/// second large action is placed beside the first on cores the node does not have; a
+/// memory limit held against the node's memory, so an action whose limit does not fit
+/// beside the first's is kept waiting although a core is free; and cores kept after
+/// their lease ends, so the queued action never runs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_sized_booking_reaches_the_daemon_and_holds_the_node() {
     let cell = support::Cell::start().await;
     let mut node = cell.daemon("node-a", 8, 16).await;
-    let big = [("kbf-book-cpus", "4"), ("kbf-book-mem-gib", "12")];
+    let big = [("kbf-book-cpus", "5"), ("kbf-book-mem-gib", "12")];
     let first = Job::new("link one", &big);
     let second = Job::new("link two", &big);
-    let small = Job::new("compile", &[]);
+    let small = Job::new("compile", &[("kbf-book-mem-gib", "8")]);
     for job in [&first, &second, &small] {
         cell.upload(&job.blobs()).await;
     }
@@ -32,10 +35,11 @@ async fn a_sized_booking_reaches_the_daemon_and_holds_the_node() {
     );
     assert_eq!(
         (first_start.millicpus, first_start.memory_bytes),
-        (4_000, 12 * GIB)
+        (5_000, 12 * GIB)
     );
 
-    // 4 GiB are left: the second 12 GiB booking waits, a 1 GiB action does not.
+    // 3 cores are left: the second 5-core booking waits, a 1-core action does not, though
+    // its 8 GiB limit and the first's 12 GiB add up to more than the node's 16 GiB.
     let mut second_ops = cell.execute(&second.action).await;
     node.no_work().await;
     let mut small_ops = cell.execute(&small.action).await;
@@ -46,7 +50,7 @@ async fn a_sized_booking_reaches_the_daemon_and_holds_the_node() {
     );
     assert_eq!(
         (small_start.millicpus, small_start.memory_bytes),
-        (1_000, GIB)
+        (1_000, 8 * GIB)
     );
     let compiled = output(&cell, "compiled", 0).await;
     assert!(
