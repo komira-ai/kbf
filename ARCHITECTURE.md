@@ -65,6 +65,8 @@ role (`--role=all`). The flags are:
 - `--store=memory` or `--store=s3` with `--s3-endpoint`, `--s3-bucket`, `--s3-region`,
   `--s3-prefix` and `--s3-conditional-put`; the S3 key pair comes from the standard
   `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` variables, never from the command line;
+  or, in place of `--store`, `--blob-dir`, a directory on the local disk (with
+  `--meta-log=raft` only);
 - `--heartbeat-interval-ms` (default 5000), the interval daemons are asked to
   heartbeat at;
 - `--finished-retention-secs` (default 60), how long a finished operation is kept
@@ -109,7 +111,7 @@ what lets a simulation seed replay a run exactly (see [Testing](#testing)).
 | `kbf-raft` | yes | a sans-IO Raft core ([ADR 0001](docs/adr/0001-consensus.md)) and its host loop over `Storage`, `Transport` and `Machine` traits, with an in-memory storage |
 | `kbf-invocation` | yes | the invocation record ([invocations.md](docs/design/invocations.md) section 3): each build's header, counters and action rows, built only from events (calls, lease grants, starts, requeues, finishes), its `kbf.invocation.v1` encoding, and the memory bound of section 3.5 (minted, then idle records evicted; then the largest open one closed to new rows, and whatever else does not fit left out) |
 | `kbf-estimator` | yes | placeholder for learned action sizes (**planned**) |
-| `kbf-objstore` | no | the `ObjectStore` trait, an in-memory store, an S3 store, the conformance suite |
+| `kbf-objstore` | no | the `ObjectStore` trait, an in-memory store, a local-directory store (`FsStore`, `kbf-server --blob-dir`), an S3 store, the conformance suite |
 | `kbf-tier` | no | the local write tier's disk layer ([write-path.md](docs/design/write-path.md) section 6): block files in `--write-tier-dir` written in reserved ranges and synced (file and name) before a range may be committed, seals at the segment limit or after `--write-tier-seal-after`, the `--write-tier-bytes` budget, and the restart: the `TIER` check, staged blocks cut to their committed length, and the orphan sweep, against the committed state through `StagedIndex`; once flushed, blocks become `.seg` copies evicted least recently read first, only in what the budget leaves over. `kbf-front` (`Cache::attach_tier`, `Cache::flush_tier`) stages writes on it, reads staged blobs from it, and runs the flusher; `kbf-server` attaches it with `--write-tier-dir` over either metadata log (under `--meta-log=raft` it first raises the log to machine version 2, once; a server without a tier never raises it) |
 | `kbf-front` | no | the REAPI services over a `Cache` and a `Dispatch`, and the invocation `Recorder` the services and the farm send events to (a channel bounded in events and bytes that drops, never waits) |
 | `kbf-server` | no | the server binary: wires front, scheduler and storage together; its side of the MDM gate (`mdm`) |
@@ -231,7 +233,8 @@ See [scheduler.md](docs/design/scheduler.md) and
 
 Under `--meta-log=memory` the index is in memory, so a restarted server forgets every
 blob, and with `--store=s3` each start writes under a fresh key prefix so it never reads
-objects a previous process wrote. Under `--meta-log=raft` (which needs `--store=s3`) a
+objects a previous process wrote. Under `--meta-log=raft` (which needs `--store=s3` or
+`--blob-dir`) a
 restart reopens the log in `--raft-dir` and keeps the index and the action cache, and
 every start writes under the prefix the log committed when it was created,
 `<--s3-prefix><log id>/`, each in a new writer epoch.
@@ -444,8 +447,8 @@ branches rise. How the code is tested:
   Raft core runs there with crashes part-way through its effects (checks: election
   safety, log matching, leader completeness, state machine safety).
 - **Contract suites.** Every object store backend must pass the conformance suite in
-  `kbf-objstore`; CI runs it against the in-memory store and against MinIO and RustFS
-  containers, with and without Object Lock.
+  `kbf-objstore`; CI runs it against the in-memory store, the local-directory store,
+  and MinIO and RustFS containers, with and without Object Lock.
 - **Real services.** Server tests run the REAPI and worker services over real gRPC,
   including mutual TLS. The container driver's tests run real rootless Podman on
   hosted runners, on x86-64 and arm64.

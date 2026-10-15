@@ -6,9 +6,9 @@
 
 mod support;
 
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -63,6 +63,8 @@ impl Dirs {
             .args(["--meta-log", "raft", "--raft-dir"])
             .arg(&self.raft)
             .args(ANY_PORT)
+            // The heartbeat interval the fake daemon expects.
+            .args(["--heartbeat-interval-ms", "100"])
             .args(["--shutdown-timeout-secs", "1"]);
         c
     }
@@ -124,6 +126,48 @@ fn stop(mut child: Running) {
         std::thread::sleep(Duration::from_millis(10));
     };
     assert!(status.success(), "kbf-server exited with {status}");
+}
+
+/// Runs to exit and returns the exit code and stderr; fails the test if the server is
+/// still running after `BOUND` (it started when it should have refused).
+fn fails(mut c: Command) -> (Option<i32>, String) {
+    let mut child = Running(
+        c.stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn kbf-server"),
+    );
+    let deadline = Instant::now() + BOUND;
+    let status = loop {
+        if let Some(status) = child.0.try_wait().expect("try_wait") {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "kbf-server started; it should have refused"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let mut stderr = String::new();
+    let mut pipe = child.0.stderr.take().expect("stderr");
+    pipe.read_to_string(&mut stderr).expect("UTF-8 stderr");
+    (status.code(), stderr)
+}
+
+/// The one object file under `blobs` whose bytes contain `data`, and where.
+fn object_holding(blobs: &Path, data: &[u8]) -> (PathBuf, usize) {
+    let mut found = Vec::new();
+    for shard in std::fs::read_dir(blobs.join("objects")).expect("objects") {
+        for file in std::fs::read_dir(shard.expect("a shard").path()).expect("a shard") {
+            let path = file.expect("an object").path();
+            let bytes = std::fs::read(&path).expect("read an object");
+            if let Some(at) = bytes.windows(data.len()).position(|w| w == data) {
+                found.push((path, at));
+            }
+        }
+    }
+    assert_eq!(found.len(), 1, "objects holding the blob: {found:?}");
+    found.remove(0)
 }
 
 /// `blob` read over ByteStream on the REAPI listener, or the call's code.
@@ -192,5 +236,117 @@ async fn a_restart_keeps_the_blobs_and_the_action_cache() {
     }
     drop(after);
     stop(server);
+    dirs.remove();
+}
+
+/// Catches a store that answers a read with damaged bytes, or a blob whose object file
+/// is gone, as anything but unavailable; a read that does not take the blob out of the
+/// index (FindMissing would keep reporting it present, so a client never uploads it
+/// again); an upload that does not heal it; and a torn temporary file kept at start.
+/// Each blob is uploaded alone, so it is the only blob of its object file. The index
+/// still reports a damaged blob present until a read finds it out: nothing checks the
+/// directory at start.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_lost_or_corrupt_object_is_reported_on_read_and_an_upload_heals_it() {
+    let dirs = Dirs::new("damage");
+    let (server, before) = started(dirs.server()).await;
+    let corrupt = Blob::new("this blob's object file gets one byte flipped");
+    let lost = Blob::new("this blob's object file is deleted");
+    let kept = Blob::new("this blob's object file is left alone");
+    for blob in [&corrupt, &lost, &kept] {
+        before.upload(&[blob]).await;
+    }
+    drop(before);
+    stop(server);
+
+    let (path, at) = object_holding(&dirs.blobs, &corrupt.data);
+    let mut bytes = std::fs::read(&path).expect("read the object");
+    bytes[at] ^= 0x20;
+    std::fs::write(&path, bytes).expect("corrupt the object");
+    let (path, _) = object_holding(&dirs.blobs, &lost.data);
+    std::fs::remove_file(path).expect("delete the object");
+    let torn = dirs.blobs.join("tmp").join("7");
+    std::fs::write(&torn, b"a write cut short").expect("plant a torn file");
+
+    let (server, after) = started(dirs.server()).await;
+    assert!(!torn.exists(), "a torn temporary file outlived the start");
+    assert_eq!(read(&after, &kept).await, Ok(kept.data.clone()));
+    for blob in [&corrupt, &lost] {
+        assert!(after.holds(blob).await, "nothing reads objects at start");
+        assert_eq!(read(&after, blob).await, Err(Code::Unavailable));
+        assert!(
+            !after.holds(blob).await,
+            "a failed read left the blob indexed"
+        );
+        after.upload(&[blob]).await;
+        assert_eq!(read(&after, blob).await, Ok(blob.data.clone()));
+    }
+    drop(after);
+    stop(server);
+    dirs.remove();
+}
+
+/// Catches `--blob-dir` accepted with a store it would silently replace (`--store`, the
+/// S3 flags), or under `--meta-log=memory`, whose index a restart forgets while the
+/// files stay with nothing to delete them; a second server sharing a running server's
+/// blob directory; and a directory that cannot be created, taken as started. Each
+/// exits 2 and says why.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn blob_dir_refuses_what_it_cannot_keep() {
+    let dirs = Dirs::new("refused");
+    let others: [&[&str]; 4] = [
+        &["--store", "memory"],
+        &["--store", "s3"],
+        &["--s3-endpoint", "http://127.0.0.1:9"],
+        &["--s3-bucket", "b"],
+    ];
+    for other in others {
+        let mut c = dirs.server();
+        c.args(other);
+        let (code, stderr) = fails(c);
+        assert_eq!(code, Some(2), "{other:?}");
+        assert!(stderr.contains("--blob-dir"), "{other:?}: {stderr}");
+        assert!(
+            stderr.contains("cannot be used with"),
+            "{other:?}: {stderr}"
+        );
+    }
+
+    let mut memory = Command::new(BIN);
+    memory.arg("--blob-dir").arg(&dirs.blobs).args(ANY_PORT);
+    let (code, stderr) = fails(memory);
+    assert_eq!(code, Some(2));
+    assert!(
+        stderr.contains("--blob-dir needs --meta-log=raft"),
+        "{stderr}"
+    );
+
+    let (server, client) = started(dirs.server()).await;
+    let mut second = Command::new(BIN);
+    second
+        .arg("--blob-dir")
+        .arg(&dirs.blobs)
+        .args(["--meta-log", "raft", "--raft-dir"])
+        .arg(dirs.root.join("raft-2"))
+        .args(ANY_PORT);
+    let (code, stderr) = fails(second);
+    assert_eq!(code, Some(2));
+    assert!(stderr.contains("lock"), "{stderr}");
+    assert!(stderr.contains("LOCK"), "{stderr}");
+    drop(client);
+    stop(server);
+
+    let file = dirs.root.join("a-file");
+    std::fs::write(&file, b"not a directory").expect("plant a file");
+    let mut under_a_file = Command::new(BIN);
+    under_a_file
+        .arg("--blob-dir")
+        .arg(file.join("blobs"))
+        .args(["--meta-log", "raft", "--raft-dir"])
+        .arg(dirs.root.join("raft-3"))
+        .args(ANY_PORT);
+    let (code, stderr) = fails(under_a_file);
+    assert_eq!(code, Some(2));
+    assert!(stderr.contains("create"), "{stderr}");
     dirs.remove();
 }

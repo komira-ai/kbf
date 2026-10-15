@@ -219,11 +219,45 @@ result; on another host, compute it from that host's RAM. The daemon's other set
 and what it logs at start are as on a build host
 ([linux-build-host.md](linux-build-host.md#the-units)).
 
+## One host without MinIO: `--blob-dir`
+
+For a development farm on one host, `kbf-server` can keep blob bytes in a directory on
+the local disk instead of a bucket, and the index of what it holds (the CAS and the
+action cache) in the Raft log, so a restart of the server keeps both: a build after the
+restart gets the cache hits it got before.
+
+```sh
+kbf-server \
+    --blob-dir=/var/lib/kbf-server/blobs \
+    --meta-log=raft \
+    --raft-dir=/var/lib/kbf-server/raft \
+    --listen=127.0.0.1:8980 \
+    --worker-listen=127.0.0.1:8981
+```
+
+- `--blob-dir` takes the place of `--store`: with `--store` or any `--s3-*` flag the
+  server refuses to start. It needs `--meta-log=raft`; with the index in memory a
+  restart would forget every blob while their files stayed, with nothing to delete
+  them.
+- The directory is created if missing and locked while the server runs: a second
+  server on it exits 2. Objects are keyed as in a bucket, under `<--s3-prefix><log
+  id>/`, one file each in `objects/` (layout in
+  [storage.md](../design/storage.md#the-object-store-interface)).
+- A write is synced, file and directory, before it is answered, so an answered upload
+  survives a crash or a power cut. A crash part-way through a write leaves a file in
+  `tmp/`, removed at the next start.
+- Nothing else is checked at start. A blob whose file was lost or damaged is still
+  reported present by `FindMissingBlobs` until a read of it fails: that read answers
+  `UNAVAILABLE` and takes the blob out of the index, so the client uploads it again,
+  which heals it.
+- Nothing deletes objects yet, from this directory or from a bucket: it grows with
+  every blob written. Size its disk for that.
+
 ## Planned: the Raft log on local disk
 
 `kbf-server` keeps its metadata in memory by default
 ([deployment-topology.md](../design/deployment-topology.md#built-and-planned)).
-`--meta-log=raft --raft-dir=/var/lib/kbf-server/raft` is accepted (with `--store=s3`)
+`--meta-log=raft --raft-dir=/var/lib/kbf-server/raft` is accepted (with `--store=s3`, or `--blob-dir` [above](#one-host-without-minio---blob-dir))
 but is not in the unit above yet: until the scheduler's state is in the log too, a
 restart over it keeps the daemons' epoch but not the server's leases, so the old runs
 go on as orphans whose results are refused. This flag is planned and not accepted yet;

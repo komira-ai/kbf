@@ -353,7 +353,7 @@ because they were shaped for a replicated apply from the start (below).
 - **`--meta-log=memory` keeps nothing, by design.** Its index is in memory, so a
   restart forgets every blob and every pin with it; records are lost at a restart
   there, as in stage 1. Durable records need `--meta-log=raft` (which needs
-  `--store=s3`).
+  `--store=s3` or `--blob-dir`).
 
 - A chunk is a `kbf.invocation.v1.Chunk` protobuf, stored **as a CAS blob** through the
   existing `Cache` write path: verified, packed into segments, in the object store like

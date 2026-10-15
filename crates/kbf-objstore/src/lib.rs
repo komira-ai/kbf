@@ -1,5 +1,5 @@
-//! The `ObjectStore` trait with an in-memory fake and an S3 backend, and the conformance
-//! suite every backend must pass.
+//! The `ObjectStore` trait with an in-memory fake, a local-directory store and an S3
+//! backend, and the conformance suite every backend must pass.
 //!
 //! kbf names every key and records every location in its own replicated log, so it never
 //! asks a store whether something exists, and needs no consistent listing and no
@@ -10,6 +10,7 @@
 //! One store value addresses one bucket.
 
 pub mod conformance;
+mod fs_store;
 mod memory;
 pub mod s3;
 mod types;
@@ -19,6 +20,7 @@ use std::time::SystemTime;
 
 use bytes::Bytes;
 
+pub use fs_store::{FsStore, FsStoreError};
 pub use memory::MemoryStore;
 pub use types::{
     ByteRange, Capabilities, KeyError, KeyPrefix, ListPage, ListToken, ObjectInfo, ObjectKey,

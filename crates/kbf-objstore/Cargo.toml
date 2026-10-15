@@ -17,7 +17,7 @@ reqwest.workspace = true
 roxmltree.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["time"] }
+tokio = { workspace = true, features = ["rt", "time"] }
 
 [dev-dependencies]
 clap.workspace = true
