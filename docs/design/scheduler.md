@@ -278,7 +278,13 @@ What the code does today:
 - Every action requests one core and 1 GiB (`kbf_front::DEFAULT_RESOURCES`), or the
   whole cores and GiB its `kbf-book-cpus` and `kbf-book-mem-gib` properties name (see
   [platform-properties.md](../platform-properties.md#kbf-book-cpus-and-kbf-book-mem-gib)),
-  its `gpu` count, and what its platform asks of a worker (`Request::needs`). The
+  its `gpu` count, and what its platform asks of a worker (`Request::needs`). An
+  `action` lease that names no `kbf-book-mem-gib` and whose `Command` sets
+  `KBF_ACTION_CATEGORY` to a category the server's `--book-mem-gib-by-category` names
+  requests that category's memory instead, at most the memory of the largest node that
+  could run it when it is submitted (`Scheduler::largest_memory`,
+  `kbf_sched::category_booking`; the server sizes it before the scheduler sees it; see
+  [platform-properties.md](../platform-properties.md#memory-by-category)). The
   scheduler raises the memory of a new submission to its action key's memory floor,
   if it has one (see "Memory kills" below).
 - Each request carries its lease kind (`kbf-lease`: `action` or `whole_machine`). A
@@ -397,7 +403,9 @@ turns it into one of two outcomes, and the scheduler decides on the committed re
   a farm whose largest node has 8 GiB. A whole-machine lease doubles what it booked,
   the node's whole memory, so it next needs a node twice as large. A kill of a run that
   booked the cap finishes the operation `Failed(OutOfMemory)`: the action needs more
-  memory than any node offers.
+  memory than any node offers. The ladder starts from whatever the run booked, a
+  category's memory included: a 4 GiB category booking killed at its limit runs again
+  at 8 GiB.
 - **The memory floor.** Each raised booking is kept as the memory floor of the
   action's key (instance name and action digest), and a later submission of that key
   books at least the floor; a floor never falls. The floors live in the scheduler

@@ -429,3 +429,81 @@ async fn a_gpu_on_macos_is_the_whole_macs() {
         assert_eq!(s.request.resources, DEFAULT_RESOURCES);
     }
 }
+
+/// A job like [`job`] whose `Command` sets `env`.
+fn job_with_env(argv: &str, platform: &[(&str, &str)], env: &[(&str, &str)]) -> Job {
+    let plain = job(argv, platform, false);
+    let mut command = Command::decode(plain.blobs[1].data.as_slice()).expect("a command");
+    command.environment_variables = env
+        .iter()
+        .map(|(name, value)| reapi::command::EnvironmentVariable {
+            name: (*name).to_owned(),
+            value: (*value).to_owned(),
+        })
+        .collect();
+    let command = Blob::of(&command);
+    let mut action = Action::decode(plain.action.data.as_slice()).expect("an action");
+    action.command_digest = Some(command.proto.clone());
+    let action = Blob::of(&action);
+    let mut blobs = plain.blobs;
+    blobs[0] = action.clone();
+    blobs[1] = command;
+    Job { action, blobs }
+}
+
+/// Catches: the `KBF_ACTION_CATEGORY` variable not carried to the dispatcher (every
+/// action then books 1 GiB, whatever `--book-mem-gib-by-category` says); a category
+/// carried beside a `kbf-book-mem-gib` the action named (the table would then override
+/// a size the build asked for) or on a `whole_machine` lease (which books the whole
+/// worker); a category carried for a `kbf-book-cpus` booking, which names no memory, not
+/// carried; and a category read from an action that sets none. The booking itself is
+/// left as the platform names it: the dispatcher sizes it.
+#[tokio::test]
+async fn the_category_is_carried_when_the_memory_booking_is_the_default() {
+    let script = Arc::new(Script::default());
+    let farm = Farm::with_execution(Arc::clone(&script)).await;
+    type Case<'a> = (&'a str, Vec<(&'a str, &'a str)>, &'a [(&'a str, &'a str)], Option<&'a str>);
+    let tagged = [(kbf_front::CATEGORY_ENV, "mojo_build_test")];
+    let untagged = [("PATH", "/bin")];
+    let cases: [Case; 5] = [
+        ("tagged", vec![], &tagged[..], Some("mojo_build_test")),
+        (
+            "tagged with cores",
+            vec![(BOOK_CPUS_KEY, "2")],
+            &tagged[..],
+            Some("mojo_build_test"),
+        ),
+        (
+            "tagged and sized",
+            vec![(BOOK_MEM_GIB_KEY, "3")],
+            &tagged[..],
+            None,
+        ),
+        (
+            "tagged on a whole machine",
+            vec![("kbf-lease", "whole_machine")],
+            &tagged[..],
+            None,
+        ),
+        ("untagged", vec![], &untagged[..], None),
+    ];
+    for (argv, props, env, _) in &cases {
+        let job = job_with_env(argv, props, env);
+        farm.upload(&job.blobs.iter().collect::<Vec<_>>()).await;
+        start(&farm, &job.action).await.expect(argv);
+    }
+    let submitted = script.submitted();
+    assert_eq!(submitted.len(), cases.len());
+    for (submission, (argv, props, _, want)) in submitted.iter().zip(&cases) {
+        assert_eq!(submission.category.as_deref(), *want, "{argv}");
+        let sized = props.contains(&(BOOK_MEM_GIB_KEY, "3"));
+        let whole = submission.request.kind == LeaseKind::WholeMachine;
+        if !sized && !whole {
+            assert_eq!(
+                submission.request.resources.memory_bytes,
+                DEFAULT_RESOURCES.memory_bytes,
+                "{argv}"
+            );
+        }
+    }
+}

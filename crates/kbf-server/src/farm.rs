@@ -37,7 +37,9 @@ use std::hash::BuildHasher;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use kbf_front::{Cache, Dispatch, Finished, MetaLog, Recorder, Stage, Submission, Ticket};
+use kbf_front::{
+    Cache, Dispatch, Finished, MemoryByCategory, MetaLog, Recorder, Stage, Submission, Ticket,
+};
 use kbf_meta::{ActionRecord, Role};
 use kbf_objstore::ObjectStore;
 use kbf_proto::google::rpc;
@@ -108,6 +110,8 @@ pub struct Farm<M, O> {
     /// The wall-clock time of `epoch`, in milliseconds since the Unix epoch: how farm
     /// times are shown to operators.
     epoch_unix_ms: u64,
+    /// The memory an action books by its category (`--book-mem-gib-by-category`).
+    memory_by_category: MemoryByCategory,
     state: Mutex<State>,
 }
 
@@ -234,6 +238,7 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
             lease_epoch,
             epoch: Instant::now(),
             epoch_unix_ms: unix_ms(),
+            memory_by_category: MemoryByCategory::default(),
             state: Mutex::new(State {
                 sched,
                 machine: FarmMachine::new(term),
@@ -254,6 +259,14 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
     pub fn recording(mut self, recorder: Recorder) -> Self {
         let state = self.state.get_mut().unwrap_or_else(PoisonError::into_inner);
         state.recorder = recorder;
+        self
+    }
+
+    /// This farm, an action whose submission carries a category `table` names booking
+    /// that category's memory (`docs/platform-properties.md#memory-by-category`).
+    #[must_use]
+    pub fn booking_by_category(mut self, table: MemoryByCategory) -> Self {
+        self.memory_by_category = table;
         self
     }
 
@@ -656,6 +669,13 @@ impl<M: MetaLog, O: ObjectStore + 'static> Dispatch for Farm<M, O> {
     fn submit(&self, mut submission: Submission) -> Result<Ticket, Status> {
         let now = self.now();
         let mut state = self.lock();
+        let ask = submission
+            .category
+            .as_deref()
+            .and_then(|c| self.memory_by_category.get(c));
+        if let Some(ask) = ask {
+            tracing::trace!(ask, "category booking not applied");
+        }
         let action = submission.request.key.action;
         let instance = submission.request.key.instance.clone();
         let waiter = state.machine.submit(Waiter {
