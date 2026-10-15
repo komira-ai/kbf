@@ -130,7 +130,15 @@ pub fn check_relative(what: &str, path: &str) -> Result<(), TreeError> {
 /// # Errors
 /// A blob is missing or corrupt, the tree breaks a naming rule, or a write fails.
 pub async fn materialize(cas: &impl Cas, root: &Digest, dir: &Path) -> Result<(), TreeError> {
-    let files = make_directories(cas, root, dir, &Loaded::new(), &HashSet::new()).await?;
+    let files = make_directories(
+        cas,
+        cas.in_flight(),
+        root,
+        dir,
+        &Loaded::new(),
+        &HashSet::new(),
+    )
+    .await?;
     write_files(cas, files).await
 }
 
@@ -151,7 +159,15 @@ pub async fn materialize_cached(
     dir: &Path,
     private: &[String],
 ) -> Result<crate::cache::InputStats, TreeError> {
-    let files = make_directories(cas, root, dir, &Loaded::new(), &HashSet::new()).await?;
+    let files = make_directories(
+        cas,
+        cas.in_flight(),
+        root,
+        dir,
+        &Loaded::new(),
+        &HashSet::new(),
+    )
+    .await?;
     let private: Vec<PathBuf> = private.iter().map(|p| dir.join(p)).collect();
     crate::cache::lease::write_files(cas, cache, files, &private).await
 }
@@ -171,10 +187,12 @@ pub(crate) type Loaded = HashMap<String, Directory>;
 /// directories and symlinks under `dir`; returns the file blobs to write, each distinct
 /// digest once.
 ///
-/// A Directory in `loaded` is not fetched. A directory whose path is in `mounts` (a
+/// At most `in_flight` Directory messages are fetched at once. A Directory in `loaded`
+/// is not fetched. A directory whose path is in `mounts` (a
 /// path under `dir`) is made empty and not walked: something is mounted there.
 pub(crate) async fn make_directories(
     cas: &dyn Fetch,
+    in_flight: usize,
     root: &Digest,
     dir: &Path,
     loaded: &Loaded,
@@ -205,7 +223,7 @@ pub(crate) async fn make_directories(
                 };
                 Ok::<_, TreeError>((directory, heres))
             })
-            .buffered(cas.in_flight())
+            .buffered(in_flight)
             .try_collect()
             .await?;
         let mut next = Vec::new();

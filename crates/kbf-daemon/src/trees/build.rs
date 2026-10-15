@@ -22,13 +22,22 @@ use crate::tree::{Loaded, TreeError, io as io_error, make_directories};
 /// written tree is not the one the digest names.
 pub(super) async fn build(
     cas: &dyn Fetch,
+    in_flight: usize,
     cache: &Cache,
     digest: &Digest,
     known: &Loaded,
     tmp: &Path,
 ) -> Result<(Summary, InputStats), TreeError> {
-    let loaded = load(cas, digest, known, &|_, _| false, MAX_DIRECTORIES).await?;
-    let files = make_directories(cas, digest, tmp, &loaded, &Default::default()).await?;
+    let loaded = load(
+        cas,
+        in_flight,
+        digest,
+        known,
+        &|_, _| false,
+        MAX_DIRECTORIES,
+    )
+    .await?;
+    let files = make_directories(cas, in_flight, digest, tmp, &loaded, &Default::default()).await?;
     let stats = crate::cache::lease::write_files(cas, cache, files, &[]).await?;
     let root = digest.clone();
     let tmp = tmp.to_owned();

@@ -231,7 +231,7 @@ fn a_container_node_opens_its_tree_store_and_a_native_one_never_does() {
         let (status, log) = runs_until_sigterm_logged("trees-open", &flags, Some(&bin));
         assert!(status.success(), "{status}: {log:#?}");
         assert!(
-            logged(&log, &["trees: ", "0 trees", "min_files=7 max_mounts=3"]),
+            logged(&log, &["trees: ", "0 trees"]) && logged(&log, &["min_files=7 max_mounts=3"]),
             "{log:#?}"
         );
         let mode = std::fs::metadata(&trees)

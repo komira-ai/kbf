@@ -1046,12 +1046,11 @@ fn open_trees(config: TreeConfig) -> Option<Trees> {
     }
     match Trees::open(config) {
         Ok(trees) => {
-            let stats = trees.store().stats();
-            tracing::info!(
-                "trees: {shown}: {} trees, {} bytes; min_files={min_files} max_mounts={max_mounts}",
-                stats.trees,
-                stats.bytes
-            );
+            let held = trees.store().stats();
+            let (count, bytes) = (held.trees, held.bytes);
+            // One line each: a macro's later lines are not run while its level is off.
+            tracing::info!("trees: {shown}: {count} trees, {bytes} bytes");
+            tracing::info!("trees: min_files={min_files} max_mounts={max_mounts}");
             Some(trees)
         }
         Err(e) => {

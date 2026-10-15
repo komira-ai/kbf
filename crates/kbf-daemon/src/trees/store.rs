@@ -302,6 +302,7 @@ impl TreeStore {
     pub(super) async fn acquire(
         &self,
         cas: &dyn Fetch,
+        in_flight: usize,
         cache: &Cache,
         name: &str,
         digest: &Digest,
@@ -317,7 +318,9 @@ impl TreeStore {
             match self.step(name) {
                 Step::Pinned(pins) => return Ok((lease(pins), None)),
                 Step::Lead(builder) => {
-                    let (pins, stats) = self.lead(cas, cache, digest, known, builder).await?;
+                    let (pins, stats) = self
+                        .lead(cas, in_flight, cache, digest, known, builder)
+                        .await?;
                     return Ok((lease(pins), Some(stats)));
                 }
                 Step::Wait(mut waiting) => {
@@ -370,6 +373,7 @@ impl TreeStore {
     async fn lead(
         &self,
         cas: &dyn Fetch,
+        in_flight: usize,
         cache: &Cache,
         digest: &Digest,
         known: &Loaded,
@@ -378,7 +382,7 @@ impl TreeStore {
         let inner = &self.inner;
         let tmp = builder.tmp.clone();
         tokio::fs::create_dir(&tmp).await.map_err(io_error(&tmp))?;
-        let (summary, stats) = build(cas, cache, digest, known, &tmp).await?;
+        let (summary, stats) = build(cas, in_flight, cache, digest, known, &tmp).await?;
         let to = inner.dir.join(&builder.name);
         let (from, dest) = (tmp.clone(), to.clone());
         // The runtime is never shut down under a lease, so the blocking task finishes.

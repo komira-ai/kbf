@@ -23,9 +23,6 @@ pub(crate) trait Fetch: Send + Sync {
         &'a self,
         digest: &'a Digest,
     ) -> futures::future::BoxFuture<'a, Result<Vec<u8>, CasError>>;
-
-    /// [`Cas::in_flight`].
-    fn in_flight(&self) -> usize;
 }
 
 impl<C: Cas> Fetch for C {
@@ -34,9 +31,5 @@ impl<C: Cas> Fetch for C {
         digest: &'a Digest,
     ) -> futures::future::BoxFuture<'a, Result<Vec<u8>, CasError>> {
         Box::pin(fetch(self, digest))
-    }
-
-    fn in_flight(&self) -> usize {
-        Cas::in_flight(self)
     }
 }

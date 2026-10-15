@@ -143,7 +143,11 @@ impl Trees {
         outputs: &[String],
         working_directory: &str,
     ) -> Result<Inputs, TreeError> {
-        self.materialize_dyn(cas, cache, root, dir, outputs, working_directory)
+        let reserved = Reserved {
+            outputs,
+            working_directory,
+        };
+        self.materialize_dyn(cas, cas.in_flight(), cache, root, dir, &reserved)
             .await
     }
 
@@ -151,26 +155,23 @@ impl Trees {
     async fn materialize_dyn(
         &self,
         cas: &dyn Fetch,
+        in_flight: usize,
         cache: &Cache,
         root: &Digest,
         dir: &std::path::Path,
-        outputs: &[String],
-        working_directory: &str,
+        reserved: &Reserved<'_>,
     ) -> Result<Inputs, TreeError> {
-        let reserved = Reserved {
-            outputs,
-            working_directory,
-        };
         let limits = self.limits;
         // A node already known to be a tree is not read: that is the walk a warm node
         // does not repeat.
         let skip = |path: &str, digest: &Digest| {
             self.summaries
                 .get(&label(digest))
-                .is_some_and(|summary| classify::qualifies(path, summary, &reserved, limits))
+                .is_some_and(|summary| classify::qualifies(path, summary, reserved, limits))
         };
         let loaded = load(
             cas,
+            in_flight,
             root,
             &Default::default(),
             &skip,
@@ -183,7 +184,7 @@ impl Trees {
             &loaded,
             &summaries,
             root,
-            &reserved,
+            reserved,
             limits,
             classify::MAX_DIRECTORIES,
         )?;
@@ -194,7 +195,14 @@ impl Trees {
         for candidate in &chosen {
             let (lease, stats) = self
                 .store
-                .acquire(cas, cache, &candidate.name, &candidate.digest, &loaded)
+                .acquire(
+                    cas,
+                    in_flight,
+                    cache,
+                    &candidate.name,
+                    &candidate.digest,
+                    &loaded,
+                )
                 .await?;
             mounts.push(SharedMount {
                 path: candidate.path.clone(),
@@ -205,8 +213,8 @@ impl Trees {
             leases.push(lease);
         }
         let mount_dirs: HashSet<PathBuf> = mounts.iter().map(|m| dir.join(&m.path)).collect();
-        let files = make_directories(cas, root, dir, &loaded, &mount_dirs).await?;
-        let private: Vec<PathBuf> = outputs.iter().map(|p| dir.join(p)).collect();
+        let files = make_directories(cas, in_flight, root, dir, &loaded, &mount_dirs).await?;
+        let private: Vec<PathBuf> = reserved.outputs.iter().map(|p| dir.join(p)).collect();
         let stats = crate::cache::lease::write_files(cas, cache, files, &private).await?;
         Ok(Inputs {
             stats,

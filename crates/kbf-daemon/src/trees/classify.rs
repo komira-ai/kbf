@@ -173,6 +173,7 @@ fn too_many(max_places: usize) -> TreeError {
 /// `max_places` places (callers pass [`MAX_DIRECTORIES`]).
 pub(crate) async fn load(
     cas: &dyn Fetch,
+    in_flight: usize,
     root: &Digest,
     base: &Loaded,
     skip: &(dyn Fn(&str, &Digest) -> bool + Sync),
@@ -205,7 +206,7 @@ pub(crate) async fn load(
                 let directory: Directory = fetch_message_dyn(cas, &digest).await?;
                 Ok::<_, TreeError>((label(&digest), directory))
             })
-            .buffered(cas.in_flight())
+            .buffered(in_flight)
             .try_collect()
             .await?;
         for (name, directory) in fetched {

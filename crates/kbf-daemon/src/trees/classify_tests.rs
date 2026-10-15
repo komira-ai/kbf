@@ -214,9 +214,9 @@ async fn a_tree_with_too_many_places_is_refused() {
         blobs.insert(label(&below.0), below.1.encode_to_vec());
     }
     let cas = Blobs(blobs);
-    let ok = load(&cas, &below.0, &Loaded::new(), &|_, _| false, 1 << 14).await;
+    let ok = load(&cas, 4, &below.0, &Loaded::new(), &|_, _| false, 1 << 14).await;
     assert_eq!(ok.unwrap().len(), 13, "13 distinct directories");
-    let err = load(&cas, &below.0, &Loaded::new(), &|_, _| false, 1000)
+    let err = load(&cas, 4, &below.0, &Loaded::new(), &|_, _| false, 1000)
         .await
         .unwrap_err();
     assert!(
@@ -226,6 +226,7 @@ async fn a_tree_with_too_many_places_is_refused() {
     // A skipped child is not read.
     let skipped = load(
         &cas,
+        4,
         &below.0,
         &Loaded::new(),
         &|path, _| path == "l" || path == "r",
@@ -249,7 +250,7 @@ async fn a_digest_at_two_depths_is_read_once_and_a_child_needs_its_digest() {
         blobs.insert(label(&d.0), d.1.encode_to_vec());
     }
     let cas = Blobs(blobs);
-    let loaded = load(&cas, &root.0, &Loaded::new(), &|_, _| false, 100)
+    let loaded = load(&cas, 4, &root.0, &Loaded::new(), &|_, _| false, 100)
         .await
         .unwrap();
     assert_eq!(loaded.len(), 3);
@@ -261,6 +262,7 @@ async fn a_digest_at_two_depths_is_read_once_and_a_child_needs_its_digest() {
     blobs.insert(label(&headless.0), headless.1.encode_to_vec());
     let err = load(
         &Blobs(blobs),
+        4,
         &headless.0,
         &Loaded::new(),
         &|_, _| false,
@@ -364,9 +366,16 @@ async fn the_walks_report_a_missing_blob_a_bad_name_and_a_child_without_a_digest
     let root = directory(0, 0, &[("x", &leaf.0)]);
     let mut blobs = HashMap::new();
     blobs.insert(label(&root.0), root.1.encode_to_vec());
-    let err = load(&Blobs(blobs), &root.0, &Loaded::new(), &|_, _| false, 100)
-        .await
-        .unwrap_err();
+    let err = load(
+        &Blobs(blobs),
+        4,
+        &root.0,
+        &Loaded::new(),
+        &|_, _| false,
+        100,
+    )
+    .await
+    .unwrap_err();
     assert!(matches!(err, TreeError::Cas(CasError::Missing(_))), "{err}");
 
     let mut slashed = directory(0, 0, &[("x", &leaf.0)]);
@@ -377,6 +386,7 @@ async fn the_walks_report_a_missing_blob_a_bad_name_and_a_child_without_a_digest
     blobs.insert(label(&leaf.0), leaf.1.encode_to_vec());
     let err = load(
         &Blobs(blobs),
+        4,
         &slashed.0,
         &Loaded::new(),
         &|_, _| false,
