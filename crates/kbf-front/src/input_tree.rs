@@ -28,7 +28,9 @@
 //! The check is a recursion over subdirectories. Each directory is checked once at a
 //! time: a request that reaches a directory another request is checking waits for that
 //! answer (single flight), so a toolchain shared by a hundred Executes is walked once.
-//! Within a request every directory is checked once. Store reads are bounded by
+//! A check runs on its own task, so a request dropped mid-check (a client cancel) leaves
+//! neither a held read slot nor a stale flight. Within a request every directory is
+//! checked once. Store reads are bounded by
 //! [`InputTreeConfig::reads_in_flight`] across all requests. A directory whose blob is
 //! gone is reported, and nothing under it is looked at, as before; the report lists
 //! absent directories (sorted) before absent files (sorted).
@@ -259,17 +261,15 @@ struct Walk<M, O> {
     memo: Mutex<HashMap<Digest, Flight>>,
 }
 
-/// Empties the request's memo when the request ends or is dropped: a flight in it holds
-/// the walk, and the walk holds the memo.
-struct ClearOnDrop<M, O>(Arc<Walk<M, O>>);
+/// Removes a directory's flight when its check ends, however it ends (a panic too).
+struct Done<'a> {
+    trees: &'a InputTrees,
+    digest: Digest,
+}
 
-impl<M, O> Drop for ClearOnDrop<M, O> {
+impl Drop for Done<'_> {
     fn drop(&mut self) {
-        self.0
-            .memo
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clear();
+        self.trees.flights().remove(&self.digest);
     }
 }
 
@@ -299,7 +299,6 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
             until,
             memo: Mutex::new(HashMap::new()),
         });
-        let _clear = ClearOnDrop(Arc::clone(&walk));
         let answer = visit(&walk, root).await;
         let absent = match &*answer {
             Ok(Verdict::Held { .. }) => Vec::new(),
@@ -346,11 +345,23 @@ fn visit<M: MetaLog, O: ObjectStore>(walk: &Arc<Walk<M, O>>, digest: Digest) -> 
         memo.insert(digest, flight.clone());
         return flight.clone();
     }
+    // The check runs on its own task, so it finishes, frees its read slot and leaves
+    // `flights` even when every request waiting on it is dropped (a client cancel drops
+    // the handler future). The flight only awaits the task.
     let owned = Arc::clone(walk);
+    let task = tokio::spawn(async move {
+        let _done = Done {
+            trees: owned.cache.input_trees(),
+            digest,
+        };
+        Arc::new(check(&owned, digest).await)
+    });
     let flight: Flight = async move {
-        let answer = Arc::new(check(&owned, digest).await);
-        owned.cache.input_trees().flights().remove(&digest);
-        answer
+        task.await.unwrap_or_else(|e| {
+            Arc::new(Err(CacheError::Invalid(format!(
+                "the check of input directory {digest} did not finish: {e}"
+            ))))
+        })
     }
     .boxed()
     .shared();

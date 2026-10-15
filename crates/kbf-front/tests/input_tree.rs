@@ -37,6 +37,8 @@ struct Counts {
     gets: AtomicUsize,
     active: AtomicUsize,
     peak: AtomicUsize,
+    /// Reads panic while set.
+    panics: std::sync::atomic::AtomicBool,
 }
 
 impl Counting {
@@ -86,6 +88,7 @@ impl ObjectStore for Counting {
         range: ByteRange,
     ) -> Result<Bytes, ObjectStoreError> {
         self.0.gets.fetch_add(1, Ordering::SeqCst);
+        assert!(!self.0.panics.load(Ordering::SeqCst), "the store is broken");
         let now = self.0.active.fetch_add(1, Ordering::SeqCst) + 1;
         self.0.peak.fetch_max(now, Ordering::SeqCst);
         for _ in 0..4 {
@@ -505,6 +508,55 @@ async fn directory_reads_are_concurrent_up_to_their_bound() {
     assert_eq!(store.gets(), 13);
     // The root is read alone, then the twelve leaves three at a time.
     assert_eq!(store.peak(), 3);
+}
+
+/// Catches: a request dropped mid-read (a client cancel drops the handler future) leaving
+/// its check half done in the shared flight map with its read slot held. With one slot,
+/// the walk of another directory then never finishes. The cancelled directory is still
+/// checked by a later request, which finds the check done or finishes it.
+#[tokio::test]
+async fn a_request_dropped_mid_read_frees_its_read_slot() {
+    let config = InputTreeConfig {
+        reads_in_flight: 1.try_into().expect("nonzero"),
+        ..InputTreeConfig::DEFAULT
+    };
+    let (cache, store) = cache_with(config).await;
+    let (fx, fy) = (file("x"), file("y"));
+    let (x, y) = (dir(&[&fx], &[]), dir(&[&fy], &[]));
+    put(&cache, &[&fx, &fy, &x, &y]).await;
+    store.reset();
+
+    let mut cancelled = Box::pin(cache.missing_inputs(x.digest));
+    while store.gets() == 0 {
+        assert!(futures::poll!(cancelled.as_mut()).is_pending());
+        tokio::task::yield_now().await;
+    }
+    drop(cancelled);
+
+    let other = tokio::time::timeout(Duration::from_secs(3), cache.missing_inputs(y.digest))
+        .await
+        .expect("another directory is checked after a request was dropped mid-read");
+    assert!(other.expect("walked").is_empty());
+    let again = tokio::time::timeout(Duration::from_secs(3), cache.missing_inputs(x.digest))
+        .await
+        .expect("the cancelled directory is checked by a later request");
+    assert!(again.expect("walked").is_empty());
+}
+
+/// Catches: a check that panics (a broken store) leaving its flight in the map, so every
+/// later request for the directory joins a dead check, or the panic crossing into the
+/// request instead of failing its check.
+#[tokio::test]
+async fn a_check_that_panics_fails_its_request_and_leaves_no_flight() {
+    let (cache, store) = cache().await;
+    let fx = file("x");
+    let x = dir(&[&fx], &[]);
+    put(&cache, &[&fx, &x]).await;
+    store.0.panics.store(true, Ordering::SeqCst);
+    let failed = cache.missing_inputs(x.digest).await;
+    assert!(matches!(failed, Err(CacheError::Invalid(_))), "{failed:?}");
+    store.0.panics.store(false, Ordering::SeqCst);
+    assert!(walk(&cache, &x).await.is_empty());
 }
 
 /// Catches: a cache that outgrows its entry bound, one that evicts the wrong directory
