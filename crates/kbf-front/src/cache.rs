@@ -728,10 +728,10 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         action: &Digest,
         objects: BTreeSet<ObjectId>,
     ) -> Result<bool, CacheError> {
-        let keys = objects
-            .into_iter()
-            .map(|object| Ok((object, self.object_key(object)?)))
-            .collect::<Result<Vec<_>, CacheError>>()?;
+        let mut keys = Vec::with_capacity(objects.len());
+        for object in objects {
+            keys.push((object, self.object_key(object)?));
+        }
         let store = &self.writer.objects;
         let mut answers = Vec::with_capacity(keys.len());
         for group in keys.chunks(HIT_CHECKS_IN_FLIGHT) {
