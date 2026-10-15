@@ -5,6 +5,8 @@
 #[path = "binary/cache.rs"]
 mod cache;
 mod front;
+#[path = "binary/guarded.rs"]
+mod guarded;
 
 use std::io::{BufRead, BufReader, Write as _};
 use std::path::{Path, PathBuf};
@@ -12,6 +14,8 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use rcgen::{CertificateParams, CertifiedIssuer, IsCa, KeyPair};
+
+use guarded::{Guarded, SpawnGuarded as _};
 
 const BIN: &str = env!("CARGO_BIN_EXE_kbf-daemon");
 
@@ -135,7 +139,7 @@ fn keep(mode: kbf_daemon::keeper::Mode) -> Duration {
 
     let mut child = keeper::command(Path::new(BIN), &mode)
         .process_group(0)
-        .spawn()
+        .spawn_guarded()
         .expect("spawn");
     let started = keeper::started(&mut child);
     let closed = Instant::now();
@@ -266,7 +270,7 @@ fn runs_until_sigterm_logged_then(
         .args(base(&dir))
         .args(extra)
         .stderr(Stdio::piped())
-        .spawn()
+        .spawn_guarded()
         .expect("spawn");
     // Read on another thread to the end, so the daemon never writes to a closed pipe.
     let stderr = BufReader::new(child.stderr.take().expect("stderr"));
@@ -460,7 +464,7 @@ fn a_container_node_reports_what_its_leases_may_use() {
         ])
         .args(cgroup_flags)
         .stderr(std::fs::File::create(&log).expect("log file"))
-        .spawn()
+        .spawn_guarded()
         .expect("spawn");
     let session = front.session(PROMPT);
     let hello = session.next(PROMPT);
@@ -725,7 +729,7 @@ fn a_container_node_without_subordinate_ids_refuses_to_start() {
                 format!("--id-files={}", ids.display()),
             ])
             .stderr(std::fs::File::create(&log).expect("stderr file"))
-            .spawn()
+            .spawn_guarded()
             .expect("spawn");
         // A daemon that passed the check would run until stopped: bound the wait.
         let status = refused_within(&mut child, name, &log);
@@ -799,7 +803,7 @@ fn a_container_node_given_a_zero_limit_refuses_to_start() {
             ])
             .args(cgroup_flags)
             .stderr(std::fs::File::create(&log).expect("stderr file"))
-            .spawn()
+            .spawn_guarded()
             .expect("spawn");
         let status = refused_within(&mut child, flag, &log);
         let stderr = read(&log);
@@ -817,11 +821,11 @@ fn a_container_node_given_a_zero_limit_refuses_to_start() {
 const PROMPT: Duration = Duration::from_secs(30);
 
 /// Starts the daemon with `flags`, its log written to `log`.
-fn daemon(flags: &[String], log: &Path) -> std::process::Child {
+fn daemon(flags: &[String], log: &Path) -> Guarded {
     Command::new(BIN)
         .args(flags)
         .stderr(std::fs::File::create(log).expect("log file"))
-        .spawn()
+        .spawn_guarded()
         .expect("spawn")
 }
 
@@ -1223,7 +1227,7 @@ fn a_container_node_refuses_to_start_on_an_image_it_cannot_run() {
             .args(base(&dir))
             .args(container_flags(&dir, &ids, &images))
             .stderr(std::fs::File::create(&log).expect("log file"))
-            .spawn()
+            .spawn_guarded()
             .expect("spawn");
         let status = refused_within(&mut child, name, &log);
         let log = read(&log);
@@ -1281,7 +1285,7 @@ fn a_container_node_lists_its_pinned_images_in_its_status() {
         .env("PATH", path)
         .args(flags)
         .stderr(std::fs::File::create(&log).expect("log file"))
-        .spawn()
+        .spawn_guarded()
         .expect("spawn");
     let session = front.session(PROMPT);
     session.hello();
