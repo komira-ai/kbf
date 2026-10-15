@@ -188,7 +188,8 @@ fn with_an_empty_blob() -> (Declared, Vec<u8>) {
 /// it "not checked"), and an empty record whose declared digest is not the empty
 /// digest being accepted (a lying footer): the right one is checked from the start, so
 /// the segment builds; one declaring other hash bytes at size 0 is refused at once,
-/// naming the record.
+/// naming the record. A trusted upload (on a write tier) checks no record, the empty
+/// one included: the lying footer is accepted here, and the flusher drops the record.
 #[test]
 fn an_empty_record_is_checked_without_bytes_and_a_lying_one_is_refused() {
     let (declared, records) = with_an_empty_blob();
@@ -213,6 +214,7 @@ fn an_empty_record_is_checked_without_bytes_and_a_lying_one_is_refused() {
             .contains(&lying.entries[empty].digest.to_string()),
         "{refused:?}"
     );
+    assert!(Receiving::new(&lying, true).refusal().is_none());
 }
 
 /// Catches a commit that goes on while a record is still being checked (it would find
