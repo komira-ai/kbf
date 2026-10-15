@@ -24,6 +24,7 @@ path = "../kbf-driver-container/tests/bin/fake_podman.rs"
 test = false
 
 [dependencies]
+bytes.workspace = true
 clap.workspace = true
 futures.workspace = true
 kbf-node.workspace = true
