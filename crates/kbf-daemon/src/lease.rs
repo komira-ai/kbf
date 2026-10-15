@@ -163,7 +163,7 @@ impl Leases {
         }
         tracing::info!(lease = %id, ok = outcome.is_ok(), "lease finished");
         if let Err(error) = &outcome {
-            tracing::debug!(
+            tracing::warn!(
                 lease = %id,
                 kind = failure_kind(error),
                 reason = %one_line(&error.to_string()),
