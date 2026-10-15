@@ -48,14 +48,23 @@ use kbf_meta::Retention;
 use kbf_objstore::{Capabilities, KeyPrefix, MemoryStore, ObjectStore};
 use kbf_server::write_tier::{FLUSH_EVERY, TierLog};
 use kbf_server::{Args, RaftMetaLog, SERVER_VERSION, StoreKind, bind_server_with_policy};
+use kbf_threads::{Role, Topology};
 
-#[tokio::main]
-async fn main() -> ExitCode {
+fn main() -> ExitCode {
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .init();
     let args = Args::parse();
-    match start(&args).await {
+    let sizes = args.threads.resolve(Role::Server, Topology::detect());
+    sizes.log();
+    let runtime = match sizes.runtime() {
+        Ok(runtime) => runtime,
+        Err(e) => {
+            eprintln!("kbf-server: cannot start the async runtime: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    match runtime.block_on(start(&args)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("kbf-server: {e}");

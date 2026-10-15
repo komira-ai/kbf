@@ -75,6 +75,11 @@ struct Cli {
     scratch: Option<PathBuf>,
     #[command(flatten)]
     outputs: OutputLimits,
+    /// The async runtime's and the CPU pool's sizes: `--async-threads`,
+    /// `--blocking-threads` and `--cpu-threads`, defaulting from the physical cores
+    /// (`kbf_threads`).
+    #[command(flatten)]
+    threads: kbf_threads::ThreadArgs,
     /// How long one lease's whole output upload (its output files, stdout and stderr)
     /// may take, in seconds, before the lease fails with a reason naming the upload and
     /// the time it ran (container and native drivers). Without it, a store that stops
@@ -283,7 +288,11 @@ fn main() -> ExitCode {
 /// Builds the runtimes `--driver` names and serves until a signal; returns an error
 /// that stopped the daemon from starting.
 fn start(cli: &Cli) -> Result<(), Error> {
-    let tokio = tokio::runtime::Runtime::new()?;
+    let sizes = cli
+        .threads
+        .resolve(kbf_threads::Role::Daemon, kbf_threads::Topology::detect());
+    sizes.log();
+    let tokio = sizes.runtime()?;
     // The CAS channel is made lazily, which needs the runtime's context.
     let _context = tokio.enter();
     let (daemon, _) = node(cli, || native_config(cli), Path::new(xcode::XCRUN))?;
