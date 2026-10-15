@@ -7,9 +7,29 @@ use std::sync::Arc;
 use kbf_proto::reapi::{Digest, Directory, DirectoryNode, FileNode};
 use prost::Message as _;
 
-use super::classify::{Candidate, Limits, Reserved, Summary, load, qualifies, select, summarize};
+use super::classify::{
+    Candidate, Limits, Reserved, Summaries, Summary, load, qualifies, select, summarize, tree_name,
+};
 use crate::cas::{Cas, CasError, digest_of, label};
 use crate::tree::{Loaded, TreeError};
+
+/// A CAS over a map, for the walks.
+struct Blobs(HashMap<String, Vec<u8>>);
+impl Cas for Blobs {
+    type Lease = Arc<Self>;
+    fn lease(self: &Arc<Self>, _: &kbf_types::LeaseId) -> Arc<Self> {
+        Arc::clone(self)
+    }
+    async fn get(&self, digest: &Digest) -> Result<Vec<u8>, CasError> {
+        self.0
+            .get(&label(digest))
+            .cloned()
+            .ok_or_else(|| CasError::Missing(label(digest)))
+    }
+    async fn put(&self, bytes: Vec<u8>) -> Result<Digest, CasError> {
+        Ok(digest_of(&bytes))
+    }
+}
 
 const LIMITS: Limits = Limits {
     min_files: 256,
@@ -186,22 +206,6 @@ fn the_highest_nodes_are_chosen_largest_first_up_to_the_cap() {
 /// has 2^n places at depth n.
 #[tokio::test]
 async fn a_tree_with_too_many_places_is_refused() {
-    struct Blobs(HashMap<String, Vec<u8>>);
-    impl Cas for Blobs {
-        type Lease = Arc<Self>;
-        fn lease(self: &Arc<Self>, _: &kbf_types::LeaseId) -> Arc<Self> {
-            Arc::clone(self)
-        }
-        async fn get(&self, digest: &Digest) -> Result<Vec<u8>, CasError> {
-            self.0
-                .get(&label(digest))
-                .cloned()
-                .ok_or_else(|| CasError::Missing(label(digest)))
-        }
-        async fn put(&self, bytes: Vec<u8>) -> Result<Digest, CasError> {
-            Ok(digest_of(&bytes))
-        }
-    }
     let mut blobs = HashMap::new();
     let mut below = directory(1, 1, &[]);
     blobs.insert(label(&below.0), below.1.encode_to_vec());
@@ -230,4 +234,123 @@ async fn a_tree_with_too_many_places_is_refused() {
     .await
     .unwrap();
     assert_eq!(skipped.len(), 1);
+}
+
+/// Catches a level that reads a digest twice when it appears at two depths (`x` is the
+/// root's child and `y`'s), a child with no digest taken for an empty one, and a skipped
+/// node that is walked anyway.
+#[tokio::test]
+async fn a_digest_at_two_depths_is_read_once_and_a_child_needs_its_digest() {
+    let x = directory(2, 1, &[]);
+    let y = directory(0, 0, &[("x", &x.0)]);
+    let root = directory(0, 0, &[("x", &x.0), ("y", &y.0)]);
+    let mut blobs = HashMap::new();
+    for d in [&x, &y, &root] {
+        blobs.insert(label(&d.0), d.1.encode_to_vec());
+    }
+    let cas = Blobs(blobs);
+    let loaded = load(&cas, &root.0, &Loaded::new(), &|_, _| false, 100)
+        .await
+        .unwrap();
+    assert_eq!(loaded.len(), 3);
+
+    let mut headless = directory(0, 0, &[("x", &x.0)]);
+    headless.1.directories[0].digest = None;
+    headless.0 = digest_of(&headless.1.encode_to_vec());
+    let mut blobs = HashMap::new();
+    blobs.insert(label(&headless.0), headless.1.encode_to_vec());
+    let err = load(
+        &Blobs(blobs),
+        &headless.0,
+        &Loaded::new(),
+        &|_, _| false,
+        100,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(&err, TreeError::Invalid(m) if m.contains("no digest")),
+        "{err}"
+    );
+}
+
+/// Catches the walk of `select` ignoring its cap, as `load` has one.
+#[test]
+fn select_refuses_a_tree_with_too_many_places() {
+    let leaf = directory(1, 1, &[]);
+    let mut below = leaf.clone();
+    let mut all = loaded(&[&leaf]);
+    for _ in 0..6 {
+        below = directory(0, 0, &[("l", &below.0), ("r", &below.0)]);
+        all.insert(label(&below.0), below.1.clone());
+    }
+    let sums = summarize(&all, &|_| None).unwrap();
+    let none = reserved(&[], "");
+    let wide = Limits {
+        min_files: 1 << 40,
+        ..LIMITS
+    };
+    assert!(
+        select(&all, &sums, &below.0, &none, wide, 1000)
+            .unwrap()
+            .is_empty()
+    );
+    let err = select(&all, &sums, &below.0, &none, wide, 20).unwrap_err();
+    assert!(
+        matches!(&err, TreeError::Invalid(m) if m.contains("more than 20")),
+        "{err}"
+    );
+}
+
+/// Catches a store name that could leave the store or collide: only lower-case SHA-256
+/// hex with a size is a name; a node whose digest has none is walked into, not mounted.
+#[test]
+fn only_a_sha256_digest_has_a_tree_name() {
+    let good = digest_of(b"x");
+    assert_eq!(tree_name(&good), Some(format!("{}-1", good.hash)));
+    let with = |hash: &str, size| Digest {
+        hash: hash.to_owned(),
+        size_bytes: size,
+    };
+    for bad in [
+        with("../../etc/passwd", 1),
+        with(&good.hash.to_uppercase(), 1),
+        with(&good.hash[1..], 1),
+        with(&format!("{}g", &good.hash[1..]), 1),
+        with(&good.hash, -1),
+    ] {
+        assert_eq!(tree_name(&bad), None, "{bad:?}");
+    }
+    // A big node under a digest with no name is not a candidate.
+    let mut big = directory(300, 1, &[]);
+    let odd = with("zz", 5);
+    let root = directory(0, 0, &[("t", &big.0)]);
+    let mut root = root;
+    root.1.directories[0].digest = Some(odd.clone());
+    big.0 = odd.clone();
+    let all = loaded(&[&root, &big]);
+    let mut sums = HashMap::new();
+    sums.insert(label(&odd), summary(300, 300));
+    let chosen = select(&all, &sums, &root.0, &reserved(&[], ""), LIMITS, 100).unwrap();
+    assert!(chosen.is_empty(), "{chosen:?}");
+}
+
+/// Catches summaries growing without a bound: past the cap the map is emptied, then
+/// holds what was just found.
+#[test]
+fn summaries_are_emptied_past_their_cap() {
+    let kept = Summaries::with_cap(2);
+    let one: HashMap<_, _> = [("a".to_owned(), summary(1, 1))].into();
+    kept.extend(&one);
+    kept.extend(&[("b".to_owned(), summary(2, 2))].into());
+    assert_eq!(
+        (kept.get("a"), kept.get("b")),
+        (Some(summary(1, 1)), Some(summary(2, 2)))
+    );
+    kept.extend(&[("c".to_owned(), summary(3, 3))].into());
+    assert_eq!(
+        (kept.get("a"), kept.get("b"), kept.get("c")),
+        (None, None, Some(summary(3, 3)))
+    );
+    assert_eq!(Summaries::default().get("c"), None);
 }

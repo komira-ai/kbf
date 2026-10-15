@@ -242,7 +242,7 @@ async fn a_container_cannot_change_a_shared_tree_or_lift_its_read_only_flag() {
                     'mkdir tc/d' 'mv tc/lib/f1 tc/lib/g' 'mv tc/lib/f2 f2' 'ln tc/lib/f3 f3' \
                     'rm tc/lib/f4' 'mount -o remount,rw /kbf/root/tc'; do \
            if sh -c \"$try\" 2>/dev/null; then echo \"WROTE: $try\"; else echo \"refused: $try\"; fi; \
-         done; cat tc/lib/f1; ls tc/lib | wc -l");
+         done; cat tc/lib/f1; echo; ls tc/lib | wc -l");
     spec.inputs = toolchain();
     spec.inputs.push(("src/a", b"small", false));
     let result = cell.run(1, &spec).await.expect("ran");
@@ -255,7 +255,7 @@ async fn a_container_cannot_change_a_shared_tree_or_lift_its_read_only_flag() {
         "{said}"
     );
     assert!(said.ends_with("tool file 1\n30\n"), "{said}");
-    let mut second = sh("cat tc/lib/f1; ls tc/lib | wc -l; test -x tc/lib/f0 && echo exec");
+    let mut second = sh("cat tc/lib/f1; echo; ls tc/lib | wc -l; test -x tc/lib/f0 && echo exec");
     second.inputs = spec.inputs.clone();
     let result = cell.run(2, &second).await.expect("lease 2");
     assert_eq!(cell.stdout(&result), "tool file 1\n30\nexec\n");

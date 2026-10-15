@@ -27,8 +27,7 @@ use crate::tree::{Loaded, TreeError, check_names, fetch_message};
 /// place. Far above any toolchain (thousands).
 pub(crate) const MAX_DIRECTORIES: usize = 1 << 22;
 
-/// The most summaries kept; past it the map is emptied (they are recomputed from the
-/// next walk of the Directory messages).
+/// The most summaries kept by default.
 const MAX_SUMMARIES: usize = 1 << 20;
 
 /// What a Directory node holds below it.
@@ -41,12 +40,28 @@ pub(crate) struct Summary {
 }
 
 /// The summaries of Directory nodes seen, by digest label.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct Summaries {
     map: Mutex<HashMap<String, Summary>>,
+    /// The most kept; past it the map is emptied (they are recomputed from the next
+    /// walk of the Directory messages).
+    cap: usize,
+}
+
+impl Default for Summaries {
+    fn default() -> Self {
+        Self::with_cap(MAX_SUMMARIES)
+    }
 }
 
 impl Summaries {
+    pub fn with_cap(cap: usize) -> Self {
+        Self {
+            map: Mutex::default(),
+            cap,
+        }
+    }
+
     fn lock(&self) -> MutexGuard<'_, HashMap<String, Summary>> {
         // Each update is one map operation, so the map is consistent after a panic.
         self.map.lock().unwrap_or_else(PoisonError::into_inner)
@@ -58,7 +73,7 @@ impl Summaries {
 
     pub fn extend(&self, found: &HashMap<String, Summary>) {
         let mut map = self.lock();
-        if map.len().saturating_add(found.len()) > MAX_SUMMARIES {
+        if map.len().saturating_add(found.len()) > self.cap {
             map.clear();
         }
         map.extend(found.iter().map(|(k, v)| (k.clone(), *v)));
@@ -115,6 +130,17 @@ pub(crate) fn qualifies(
         && summary.bytes <= limits.max_bytes
         && !path.contains([':', ','])
         && !reserved.conflicts(path)
+}
+
+/// The directory name of the tree of `digest` in the store: `<hash>-<size>`; `None` for
+/// a digest that is not a SHA-256 one (such a name could leave the store).
+pub(crate) fn tree_name(digest: &Digest) -> Option<String> {
+    let hex = digest.hash.len() == 64
+        && digest
+            .hash
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    (hex && digest.size_bytes >= 0).then(|| format!("{}-{}", digest.hash, digest.size_bytes))
 }
 
 fn join(parent: &str, name: &str) -> String {
@@ -188,12 +214,8 @@ pub(crate) async fn load(
         }
         let mut next = Vec::new();
         for (digest, path) in &level {
-            let Some(directory) = loaded.get(&label(digest)) else {
-                return Err(TreeError::Invalid(format!(
-                    "directory {} was not loaded",
-                    label(digest)
-                )));
-            };
+            // Every digest of the level was loaded above.
+            let directory = &loaded[&label(digest)];
             for (index, node) in directory.directories.iter().enumerate() {
                 let child = child_digest(directory, index)?;
                 let at = join(path, &node.name);
@@ -271,6 +293,8 @@ pub(crate) struct Candidate {
     /// From the input root, `/`-separated.
     pub path: String,
     pub digest: Digest,
+    /// The tree's name in the store ([`tree_name`]).
+    pub name: String,
     pub summary: Summary,
 }
 
@@ -307,10 +331,13 @@ pub(crate) fn select(
             let child = child_digest(directory, index)?;
             let at = join(&path, &node.name);
             let summary = summaries.get(&label(child)).copied().unwrap_or_default();
-            if qualifies(&at, summary, reserved, limits) {
+            // A digest with no store name is walked into, not mounted.
+            let name = tree_name(child).filter(|_| qualifies(&at, summary, reserved, limits));
+            if let Some(name) = name {
                 chosen.push(Candidate {
                     path: at,
                     digest: child.clone(),
+                    name,
                     summary,
                 });
             } else {

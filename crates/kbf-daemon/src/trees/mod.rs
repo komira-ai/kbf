@@ -180,7 +180,7 @@ impl Trees {
         for candidate in &chosen {
             let (lease, stats) = self
                 .store
-                .acquire(cas, cache, &candidate.digest, &loaded)
+                .acquire(cas, cache, &candidate.name, &candidate.digest, &loaded)
                 .await?;
             mounts.push(SharedMount {
                 path: candidate.path.clone(),

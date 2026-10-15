@@ -32,9 +32,10 @@ pub(super) async fn build(
     let stats = crate::cache::lease::write_files(cas, cache, files, &[]).await?;
     let root = digest.clone();
     let tmp = tmp.to_owned();
+    // The runtime is never shut down under a lease, so the blocking task finishes.
     let summary = tokio::task::spawn_blocking(move || verify(&loaded, &root, &tmp))
         .await
-        .map_err(|e| TreeError::Invalid(format!("the tree check did not finish: {e}")))??;
+        .expect("the tree check panicked")?;
     Ok((summary, stats))
 }
 
@@ -90,14 +91,11 @@ pub(super) fn verify(loaded: &Loaded, root: &Digest, tmp: &Path) -> Result<Summa
         for sub in &directory.directories {
             let path = dir.join(&sub.name);
             let meta = std::fs::symlink_metadata(&path).map_err(io_error(&path))?;
-            if !meta.file_type().is_dir() || meta.file_type().is_symlink() {
+            if !meta.file_type().is_dir() {
                 return Err(wrong(&path, "is not the directory its Directory names"));
             }
-            let child = sub
-                .digest
-                .clone()
-                .ok_or_else(|| wrong(&path, "has no digest"))?;
-            stack.push((child, path));
+            // A Directory with no digest was refused when it was read.
+            stack.push((sub.digest.clone().unwrap_or_default(), path));
         }
     }
     Ok(summary)
@@ -116,17 +114,15 @@ pub(super) fn publish(tmp: &Path, to: &Path) -> io::Result<bool> {
 /// Removes `dir` and all it holds, with a loop over a `Vec`, not recursion, and
 /// without following a symlink. A directory already gone is not an error.
 pub(super) fn remove_tree(dir: &Path) -> io::Result<()> {
+    if !dir.try_exists()? {
+        return Ok(());
+    }
     let mut dirs = vec![dir.to_owned()];
     let mut next = 0;
     while next < dirs.len() {
         let here = dirs[next].clone();
         next += 1;
-        let entries = match std::fs::read_dir(&here) {
-            Ok(entries) => entries,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
-            Err(e) => return Err(e),
-        };
-        for entry in entries {
+        for entry in std::fs::read_dir(&here)? {
             let entry = entry?;
             if entry.file_type()?.is_dir() {
                 dirs.push(entry.path());
@@ -137,16 +133,13 @@ pub(super) fn remove_tree(dir: &Path) -> io::Result<()> {
     }
     // Children before parents.
     for dir in dirs.iter().rev() {
-        match std::fs::remove_dir(dir) {
-            Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e),
-        }
+        std::fs::remove_dir(dir)?;
     }
     Ok(())
 }
 
-/// The bytes of the regular files under `dir` (a tree adopted at start).
+/// The bytes of the regular files under `dir` (a tree adopted at start); symlinks hold
+/// none, as in a tree's summary.
 pub(super) fn bytes_under(dir: &Path) -> io::Result<u64> {
     let mut total = 0_u64;
     let mut stack = vec![dir.to_owned()];
@@ -158,11 +151,6 @@ pub(super) fn bytes_under(dir: &Path) -> io::Result<u64> {
                 stack.push(entry.path());
             } else if kind.is_file() {
                 total = total.saturating_add(entry.metadata()?.len());
-            } else if !kind.is_symlink() {
-                return Err(io::Error::other(format!(
-                    "{}: not a file, directory or symlink",
-                    entry.path().display()
-                )));
             }
         }
     }

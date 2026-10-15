@@ -195,6 +195,12 @@ async fn a_large_directory_is_a_mount_whose_content_is_its_digest() {
         std::fs::metadata(&file).unwrap().nlink() >= 2,
         "a cache link"
     );
+    // What a log line or a failed assertion shows.
+    let shown = format!("{:?} {:?}", kit.trees, inputs.trees[0]);
+    assert!(
+        shown.contains("Trees") && shown.contains("TreeLease"),
+        "{shown}"
+    );
 }
 
 /// Catches the tree's files being writable (the barrier under the read-only mount: the
@@ -691,4 +697,98 @@ async fn a_failed_build_leaves_nothing_and_the_next_lease_builds() {
     kit.cas.blobs.insert(saved);
     let (_, inputs) = kit.lease(&root, "lease-2").await;
     assert_eq!(inputs.trees_built, 1);
+}
+
+/// An eviction that cannot rename its victim (the tree's directory was moved behind the
+/// store's back) keeps it in the books and evicts nothing, instead of dropping a tree
+/// that is still on disk from the count or looping.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_eviction_that_cannot_rename_keeps_the_tree_in_the_books() {
+    const ONE: u64 = 2890;
+    let kit = kit("trees-rename-fails", |c| c.max_bytes = ONE + 500);
+    let (_, a) = kit.lease(&kit.cas.tree(&files("tc", 300, "a")), "a").await;
+    std::fs::rename(&a.mounts[0].source, kit.dir.join("moved-away")).unwrap();
+    let (_, b) = kit.lease(&kit.cas.tree(&files("tc", 300, "b")), "b").await;
+    drop(a);
+    let stats = kit.trees.store().stats();
+    assert_eq!(
+        (stats.trees, stats.evictions, stats.bytes),
+        (2, 0, 2 * ONE),
+        "{stats:?}"
+    );
+    drop(b);
+}
+
+/// A tree whose removal fails after its eviction (a directory in it the daemon's user
+/// cannot empty) is left as `.dead-<n>`, outside the books, with a warning; the lease
+/// that dropped its pin on a thread with no runtime removes inline; the next start
+/// refuses to open on it until it can be removed, then sweeps it. Catches the eviction
+/// waiting on the removal, and a start that ignores a leftover it cannot remove.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_removal_that_fails_leaves_the_dead_tree_for_the_next_start() {
+    const ONE: u64 = 2890;
+    let kit = kit("trees-remove-fails", |c| c.max_bytes = ONE + 500);
+    let (_, a) = kit.lease(&kit.cas.tree(&files("tc", 300, "a")), "a").await;
+    let (_, b) = kit.lease(&kit.cas.tree(&files("tc", 300, "b")), "b").await;
+    let a_tree = a.mounts[0].source.clone();
+    if rustix::process::geteuid().is_root() {
+        return;
+    }
+    let locked = a_tree.join("d1");
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555)).unwrap();
+    // Dropped on a thread of its own: no runtime there, so the removal runs inline.
+    let trees = a.trees;
+    std::thread::spawn(move || drop(trees)).join().unwrap();
+    let stats = kit.trees.store().stats();
+    assert_eq!((stats.trees, stats.evictions), (1, 1), "{stats:?}");
+    assert!(!a_tree.exists());
+    let store = kit.dir.join("trees");
+    let dead = hidden(&store);
+    assert!(dead.len() == 1 && dead[0].starts_with(".dead-"), "{dead:?}");
+    let refused = Trees::open(TreeConfig::new(store.clone(), GIB)).expect_err("cannot sweep");
+    assert_eq!(refused.kind(), std::io::ErrorKind::PermissionDenied);
+    std::fs::set_permissions(
+        store.join(&dead[0]).join("d1"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    let reopened = Trees::open(TreeConfig::new(store.clone(), GIB)).expect("sweeps");
+    assert_eq!(hidden(&store), Vec::<String>::new());
+    assert_eq!(reopened.store().stats().trees, 1, "b is still a tree");
+    drop(b);
+}
+
+/// A name that looks like a tree but is a file is left alone and not counted; a tree
+/// named behind the store's back (between the build and its rename) is kept, not
+/// replaced, and the spare build is removed. Catches a plain rename over the name (a
+/// tree a lease has mounted would be swapped), and an adopt that takes any name.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_name_taken_behind_the_stores_back_is_kept() {
+    let kit = kit("trees-taken", |_| {});
+    let root = kit.cas.tree(&files("tc", 300, "taken"));
+    let (_, first) = kit.lease(&root, "lease-1").await;
+    let name = first.mounts[0].source.file_name().unwrap().to_owned();
+    drop(first);
+
+    let second = kit.dir.join("second-store");
+    std::fs::create_dir_all(&second).unwrap();
+    let lookalike = format!("{}-5", "a".repeat(64));
+    std::fs::write(second.join(&lookalike), b"a file").unwrap();
+    let trees = Trees::open(TreeConfig::new(second.clone(), GIB)).unwrap();
+    assert_eq!(trees.store().stats().trees, 0);
+    assert!(second.join(&lookalike).is_file());
+    std::fs::create_dir_all(second.join(&name)).unwrap();
+    std::fs::write(second.join(&name).join("marker"), b"theirs").unwrap();
+    let dir = lease_dir(&kit.dir, "lease-2");
+    let inputs = trees
+        .materialize(&*kit.cas, &kit.cache, &root, &dir, &[], "")
+        .await
+        .unwrap();
+    assert_eq!(inputs.trees_built, 1);
+    assert_eq!(
+        std::fs::read(second.join(&name).join("marker")).unwrap(),
+        b"theirs"
+    );
+    wait_for(|| hidden(&second).is_empty()).await;
+    assert_eq!(trees.store().stats().trees, 1);
 }

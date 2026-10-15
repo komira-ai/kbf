@@ -19,13 +19,14 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use kbf_proto::reapi::Digest;
 use tokio::sync::watch;
 
 use super::build::{build, bytes_under, publish, remove_tree};
+use super::classify::tree_name;
 use crate::cache::{Cache, InputStats};
 use crate::cas::Cas;
 use crate::tree::{Loaded, TreeError, io as io_error};
@@ -47,18 +48,20 @@ pub struct TreeStats {
     pub evictions: u64,
 }
 
+#[derive(Debug)]
 enum Tree {
     /// A task is building it; the receiver closes when that task is done.
     Building(watch::Receiver<()>),
     Ready {
         bytes: u64,
-        pins: u32,
+        /// Leases holding it; shared with each [`TreeLease`], which lets go on drop.
+        pins: Arc<AtomicU32>,
         /// The store's tick at the last acquire: the LRU order.
         used: u64,
     },
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct State {
     trees: HashMap<String, Tree>,
     /// File bytes of the `Ready` trees.
@@ -66,7 +69,7 @@ struct State {
     tick: u64,
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct Counters {
     builds: AtomicU64,
     hits: AtomicU64,
@@ -74,6 +77,7 @@ struct Counters {
     evictions: AtomicU64,
 }
 
+#[derive(Debug)]
 pub(super) struct Inner {
     dir: PathBuf,
     max_bytes: u64,
@@ -83,23 +87,17 @@ pub(super) struct Inner {
 }
 
 /// The node's tree store.
+#[derive(Debug)]
 pub struct TreeStore {
     inner: Arc<Inner>,
 }
 
-impl std::fmt::Debug for TreeStore {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("TreeStore")
-            .field("dir", &self.inner.dir)
-            .finish_non_exhaustive()
-    }
-}
-
 /// A tree pinned for a lease: its path is mounted read-only. Dropping it unpins the
 /// tree, and a store over budget then evicts.
+#[derive(Debug)]
 pub struct TreeLease {
     inner: Arc<Inner>,
-    name: String,
+    pins: Arc<AtomicU32>,
     path: PathBuf,
 }
 
@@ -111,35 +109,16 @@ impl TreeLease {
     }
 }
 
-impl std::fmt::Debug for TreeLease {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("TreeLease")
-            .field("path", &self.path)
-            .finish_non_exhaustive()
-    }
-}
-
 impl Drop for TreeLease {
     fn drop(&mut self) {
+        // Under the lock, so an eviction cannot see the old count and then the tree
+        // pinned again.
         let mut state = self.inner.state();
-        if let Some(Tree::Ready { pins, .. }) = state.trees.get_mut(&self.name) {
-            *pins -= 1;
-        }
+        self.pins.fetch_sub(1, Ordering::SeqCst);
         let dead = self.inner.evict(&mut state);
         drop(state);
         self.inner.remove_later(dead);
     }
-}
-
-/// The directory name of a tree: `<hash>-<size>`, or `None` for a digest that is not
-/// a SHA-256 one (its name could leave the store).
-fn name_of(digest: &Digest) -> Option<String> {
-    let hex = digest.hash.len() == 64
-        && digest
-            .hash
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
-    (hex && digest.size_bytes >= 0).then(|| format!("{}-{}", digest.hash, digest.size_bytes))
 }
 
 fn parses(name: &str) -> bool {
@@ -148,7 +127,7 @@ fn parses(name: &str) -> bool {
             hash: hash.to_owned(),
             size_bytes: size.parse().unwrap_or(-1),
         };
-        name_of(&digest).as_deref() == Some(name)
+        tree_name(&digest).as_deref() == Some(name)
     })
 }
 
@@ -159,7 +138,8 @@ impl Inner {
     }
 
     /// Renames unpinned trees, least recently used first, out of the store until the
-    /// budget holds; returns their new names for [`Inner::remove_later`].
+    /// budget holds; returns their new names for [`Inner::remove_later`]. A tree that
+    /// cannot be renamed stays (and the next eviction tries again).
     fn evict(&self, state: &mut State) -> Vec<PathBuf> {
         let mut dead = Vec::new();
         while state.bytes > self.max_bytes {
@@ -167,11 +147,9 @@ impl Inner {
                 .trees
                 .iter()
                 .filter_map(|(name, tree)| match tree {
-                    Tree::Ready {
-                        pins: 0,
-                        used,
-                        bytes,
-                    } => Some((*used, name.clone(), *bytes)),
+                    Tree::Ready { pins, used, bytes } if pins.load(Ordering::SeqCst) == 0 => {
+                        Some((*used, name.clone(), *bytes))
+                    }
                     _ => None,
                 })
                 .min();
@@ -194,7 +172,8 @@ impl Inner {
         dead
     }
 
-    /// Removes the directories `dead` on the blocking pool, or here with no runtime.
+    /// Removes the directories `dead` on the blocking pool, or here with no runtime. A
+    /// directory that cannot be removed is left for the next start's sweep.
     fn remove_later(&self, dead: Vec<PathBuf>) {
         if dead.is_empty() {
             return;
@@ -225,21 +204,18 @@ struct Builder {
 
 impl Drop for Builder {
     fn drop(&mut self) {
-        let mut state = self.inner.state();
-        if !self.done {
-            state.trees.remove(&self.name);
+        if self.done {
+            return;
         }
-        drop(state);
-        if !self.done {
-            self.inner.remove_later(vec![self.tmp.clone()]);
-        }
+        self.inner.state().trees.remove(&self.name);
+        self.inner.remove_later(vec![self.tmp.clone()]);
     }
 }
 
 /// What [`TreeStore::acquire`] does next.
 enum Step {
     /// The tree is built: it was pinned.
-    Pinned,
+    Pinned(Arc<AtomicU32>),
     /// Another acquire is building it.
     Wait(watch::Receiver<()>),
     /// Nobody is: this one builds.
@@ -273,15 +249,13 @@ impl TreeStore {
                     name.into_owned(),
                     Tree::Ready {
                         bytes,
-                        pins: 0,
+                        pins: Arc::default(),
                         used: 0,
                     },
                 );
             } else {
-                tracing::warn!(
-                    "trees: {} is not a tree; left alone",
-                    entry.path().display()
-                );
+                let shown = entry.path();
+                tracing::warn!("trees: {} is not a tree; left alone", shown.display());
             }
         }
         let inner = Arc::new(Inner {
@@ -301,18 +275,15 @@ impl TreeStore {
     pub fn stats(&self) -> TreeStats {
         let state = self.inner.state();
         let c = &self.inner.counters;
+        let ready = |tree: &Tree| match tree {
+            Tree::Ready { pins, .. } => Some(pins.load(Ordering::SeqCst)),
+            Tree::Building(_) => None,
+        };
+        let pins: Vec<u32> = state.trees.values().filter_map(ready).collect();
         TreeStats {
-            trees: state
-                .trees
-                .values()
-                .filter(|t| matches!(t, Tree::Ready { .. }))
-                .count() as u64,
+            trees: pins.len() as u64,
             bytes: state.bytes,
-            pinned: state
-                .trees
-                .values()
-                .filter(|t| matches!(t, Tree::Ready { pins, .. } if *pins > 0))
-                .count() as u64,
+            pinned: pins.iter().filter(|p| **p > 0).count() as u64,
             builds: c.builds.load(Ordering::Relaxed),
             hits: c.hits.load(Ordering::Relaxed),
             waits: c.waits.load(Ordering::Relaxed),
@@ -320,45 +291,34 @@ impl TreeStore {
         }
     }
 
-    /// The directory the store keeps its trees in.
-    #[must_use]
-    pub fn dir(&self) -> &Path {
-        &self.inner.dir
-    }
-
-    /// Pins the tree of `digest`, building it first if the store has none (or waiting
-    /// for the build another acquire has under way). `known` is the Directory
-    /// messages the caller already read; the build reads the rest. The returned
-    /// stats are those of the build this call did, if it did one.
+    /// Pins the tree `name` of `digest` (`name` is `tree_name(digest)`), building it
+    /// first if the store has none (or waiting for the build another acquire has under
+    /// way). `known` is the Directory messages the caller already read; the build reads
+    /// the rest. The returned stats are those of the build this call did, if it did
+    /// one.
     ///
     /// # Errors
-    /// `digest` is not a SHA-256 digest, a blob is missing or corrupt, the tree breaks
-    /// a naming rule, or a write fails.
+    /// A blob is missing or corrupt, the tree breaks a naming rule, or a write fails.
     pub(super) async fn acquire(
         &self,
         cas: &impl Cas,
         cache: &Cache,
+        name: &str,
         digest: &Digest,
         known: &Loaded,
     ) -> Result<(TreeLease, Option<InputStats>), TreeError> {
-        let name = name_of(digest).ok_or_else(|| {
-            TreeError::Invalid(format!(
-                "tree digest {}/{} is not SHA-256",
-                digest.hash, digest.size_bytes
-            ))
-        })?;
         let inner = &self.inner;
-        let lease = |name: String| TreeLease {
+        let lease = |pins: Arc<AtomicU32>| TreeLease {
             inner: Arc::clone(inner),
-            path: inner.dir.join(&name),
-            name,
+            path: inner.dir.join(name),
+            pins,
         };
         loop {
-            match self.step(&name) {
-                Step::Pinned => return Ok((lease(name), None)),
+            match self.step(name) {
+                Step::Pinned(pins) => return Ok((lease(pins), None)),
                 Step::Lead(builder) => {
-                    let stats = self.lead(cas, cache, digest, known, builder).await?;
-                    return Ok((lease(name), Some(stats)));
+                    let (pins, stats) = self.lead(cas, cache, digest, known, builder).await?;
+                    return Ok((lease(pins), Some(stats)));
                 }
                 Step::Wait(mut waiting) => {
                     inner.counters.waits.fetch_add(1, Ordering::Relaxed);
@@ -381,10 +341,10 @@ impl TreeStore {
         let tick = state.tick;
         match state.trees.get_mut(name) {
             Some(Tree::Ready { pins, used, .. }) => {
-                *pins += 1;
+                pins.fetch_add(1, Ordering::SeqCst);
                 *used = tick;
                 inner.counters.hits.fetch_add(1, Ordering::Relaxed);
-                Step::Pinned
+                Step::Pinned(Arc::clone(pins))
             }
             Some(Tree::Building(slot)) => Step::Wait(slot.clone()),
             None => {
@@ -414,18 +374,20 @@ impl TreeStore {
         digest: &Digest,
         known: &Loaded,
         mut builder: Builder,
-    ) -> Result<InputStats, TreeError> {
+    ) -> Result<(Arc<AtomicU32>, InputStats), TreeError> {
         let inner = &self.inner;
         let tmp = builder.tmp.clone();
         tokio::fs::create_dir(&tmp).await.map_err(io_error(&tmp))?;
         let (summary, stats) = build(cas, cache, digest, known, &tmp).await?;
         let to = inner.dir.join(&builder.name);
         let (from, dest) = (tmp.clone(), to.clone());
+        // The runtime is never shut down under a lease, so the blocking task finishes.
         let moved = tokio::task::spawn_blocking(move || publish(&from, &dest))
             .await
-            .map_err(|e| TreeError::Invalid(format!("naming the tree did not finish: {e}")))?
+            .expect("naming the tree panicked")
             .map_err(io_error(&to))?;
         inner.counters.builds.fetch_add(1, Ordering::Relaxed);
+        let pins = Arc::new(AtomicU32::new(1));
         let mut state = inner.state();
         state.tick += 1;
         let used = state.tick;
@@ -434,19 +396,16 @@ impl TreeStore {
             builder.name.clone(),
             Tree::Ready {
                 bytes: summary.bytes,
-                pins: 1,
+                pins: Arc::clone(&pins),
                 used,
             },
         );
-        let dead = inner.evict(&mut state);
+        let mut dead = inner.evict(&mut state);
         drop(state);
         builder.done = true;
         // A tree already there was renamed in whole: ours is the spare.
-        let mut dead = dead;
-        if !moved {
-            dead.push(tmp);
-        }
+        dead.extend((!moved).then_some(tmp));
         inner.remove_later(dead);
-        Ok(stats)
+        Ok((pins, stats))
     }
 }

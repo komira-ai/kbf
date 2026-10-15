@@ -31,6 +31,11 @@ pub(crate) struct CacheArgs {
     pub cache_link_concurrency: u64,
 }
 
+/// The defaults of `--tree-min-files` and `--tree-max-mounts`; `kbf_daemon::trees` has
+/// the same two (it does not build on macOS, where these flags are parsed and ignored).
+const TREE_MIN_FILES: u64 = 256;
+const TREE_MAX_MOUNTS: usize = 8;
+
 /// The `--tree-*` flags: the container driver's shared read-only trees
 /// (`docs/design/fast-sandbox.md#4-shared-trees`).
 #[derive(Clone, Debug, clap::Args)]
@@ -49,10 +54,10 @@ pub(crate) struct TreeArgs {
     #[arg(long, value_name = "BYTES", requires = "tree_dir")]
     pub tree_max_bytes: Option<u64>,
     /// The fewest files and symlinks a Directory node holds to be a tree.
-    #[arg(long, default_value_t = kbf_daemon::trees::MIN_FILES, value_parser = clap::value_parser!(u64).range(1..))]
+    #[arg(long, default_value_t = TREE_MIN_FILES, value_parser = clap::value_parser!(u64).range(1..))]
     pub tree_min_files: u64,
     /// The most trees one action mounts; the rest of its files are linked.
-    #[arg(long, default_value_t = kbf_daemon::trees::MAX_MOUNTS, value_parser = clap::value_parser!(usize))]
+    #[arg(long, default_value_t = TREE_MAX_MOUNTS, value_parser = clap::value_parser!(usize))]
     pub tree_max_mounts: usize,
 }
 
@@ -114,4 +119,14 @@ fn tree_config(args: &TreeArgs) -> Option<kbf_daemon::trees::TreeConfig> {
     config.min_files = args.tree_min_files;
     config.max_mounts = args.tree_max_mounts;
     Some(config)
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    /// Catches the flags' defaults drifting from the daemon's.
+    #[test]
+    fn the_tree_flag_defaults_are_the_daemons() {
+        assert_eq!(super::TREE_MIN_FILES, kbf_daemon::trees::MIN_FILES);
+        assert_eq!(super::TREE_MAX_MOUNTS, kbf_daemon::trees::MAX_MOUNTS);
+    }
 }

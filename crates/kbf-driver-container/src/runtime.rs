@@ -364,14 +364,14 @@ impl<C: Cas> PodmanRuntime<C> {
                             )
                             .await
                             .map_err(|e| tree_error(e.into()))?;
-                        tracing::info!(
-                            lease = %lease.name,
-                            "inputs: {} trees={} tree_files={} trees_built={}",
+                        let shown = format!(
+                            "{} trees={} tree_files={} trees_built={}",
                             inputs.stats,
                             inputs.mounts.len(),
                             inputs.tree_files,
                             inputs.trees_built
                         );
+                        tracing::info!(lease = %lease.name, "inputs: {shown}");
                         shared = inputs.mounts;
                         lease.trees = inputs.trees;
                         inputs.stats
@@ -1039,9 +1039,7 @@ fn open_trees(config: TreeConfig) -> Option<Trees> {
     let shown = config.dir.display().to_string();
     let (min_files, max_mounts) = (config.min_files, config.max_mounts);
     if shown.contains([':', ',']) {
-        tracing::warn!(
-            "trees: off ({shown}): the path holds ':' or ',', which a volume cannot name"
-        );
+        tracing::warn!("trees: off ({shown}): ':' or ',' in the path of a volume");
         return None;
     }
     match Trees::open(config) {

@@ -381,3 +381,38 @@ async fn a_tree_is_pinned_while_its_container_runs() {
     assert_eq!((stats.trees, stats.pinned), (1, 0), "{stats:?}");
     fake.assert_clean(1);
 }
+
+/// Catches a failed build of a tree leaving anything behind: a blob of the toolchain
+/// that arrives corrupt fails the lease before the container is created, nothing is
+/// left in the scratch directory, and the store names no tree (the next lease with the
+/// blob right builds it).
+#[tokio::test]
+async fn a_corrupt_blob_in_a_tree_fails_the_lease_and_names_no_tree() {
+    let fake = treed("corrupt");
+    let mut spec = Spec::new(&image(), "unused");
+    spec.inputs = toolchain_inputs(300);
+    spec.outputs = vec!["seen".to_owned()];
+    let bad = kbf_daemon::cas::digest_of(b"zig file 7");
+    let steps = ["copy", "$UPPER/seen", "$ROOT/toolchain/d1/f1"];
+    // The Action first: the CAS holds the toolchain once the action is stored.
+    fake.action(&steps);
+    let action = crate::support::store_action(&fake.cas, &spec);
+    let run = |seq| {
+        let work = crate::support::work(
+            seq,
+            action.clone(),
+            kbf_types::Resources::new(2000, 1 << 30),
+        );
+        let runtime = Arc::clone(&fake.runtime);
+        async move { kbf_daemon::Runtime::run(&*runtime, work).await }
+    };
+    fake.cas.corrupt(&bad, b"not what the digest names");
+    let failed = run(1).await.expect_err("a corrupt blob");
+    assert!(!matches!(failed, RuntimeError::Killed), "{failed:?}");
+    assert_eq!(fake.runtime.tree_stats().expect("a store").trees, 0);
+    fake.assert_clean(1);
+    fake.cas.corrupt(&bad, b"zig file 7");
+    let result = run(2).await.expect("with the blob right");
+    assert_eq!(result.exit_code, 0, "{result:?}");
+    assert_eq!(fake.runtime.tree_stats().expect("a store").trees, 1);
+}
