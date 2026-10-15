@@ -44,8 +44,8 @@
 //!     counts exactly the staged bytes.
 //! 13. **Drained** (invariant F). At the end no object is left staged.
 //!
-//! One more, of all-in-one (docs/design/all-in-one.md sections 7.4 and 8), in
-//! [`Kind::WholeProcess`] runs, where the daemon half stores each output before it
+//! One more, of all-in-one (its design, komira-build-farm#657, sections 7.4 and 8),
+//! in [`Kind::WholeProcess`] runs, where the daemon half stores each output before it
 //! reports and dies with the server:
 //!
 //! 14. **Answered with outputs.** Every action a client has been answered for has an

@@ -18,11 +18,19 @@
 //! in the middle of a slow output upload sees it only when the upload ends) must not
 //! hold up the daemon's heartbeats or its next stream. A fenced lease reports, once
 //! its run has stopped, as lost to the farm, whatever the run's own outcome.
+//!
+//! A run whose driver panics reports INTERNAL, naming the panic, once the runtime has
+//! been asked to kill what the run left: the panic ends that run's task only
+//! (the all-in-one design, komira-build-farm#657, section 7.3), and its lease does
+//! not stay running.
 
+use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet};
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::time::Instant;
 
+use futures::FutureExt as _;
 use kbf_proto::google::rpc::precondition_failure::Violation;
 use kbf_proto::google::rpc::{Code, PreconditionFailure, Status};
 use kbf_proto::reapi::ActionResult;
@@ -102,7 +110,18 @@ impl Leases {
         let run = Arc::clone(&runtime);
         tokio::spawn(async move {
             let started = Instant::now();
-            let outcome = run.run(work).await;
+            // A driver that panics ends this run, never the daemon (or, in
+            // kbf-all-in-one, the server beside it), and the run still reports: a run
+            // that never reported would keep its lease listed as running for ever.
+            let outcome = match AssertUnwindSafe(run.run(work)).catch_unwind().await {
+                Ok(outcome) => outcome,
+                Err(panic) => {
+                    // What the run left behind is the runtime's to stop, as for a
+                    // cancelled lease; a kill that panics too changes nothing more.
+                    let _ = AssertUnwindSafe(run.kill(id)).catch_unwind().await;
+                    Err(panicked(run.driver(), panic.as_ref()))
+                }
+            };
             let phases =
                 LeasePhases::new(id, run.driver(), started.elapsed(), outcome.as_ref().ok());
             // The receiver lives as long as the daemon.
@@ -193,6 +212,17 @@ impl Leases {
         }
         fenced
     }
+}
+
+/// The failure a run whose driver panicked reports: INTERNAL, the farm's (a driver
+/// bug), naming the driver and the panic's message.
+fn panicked(driver: &str, panic: &(dyn Any + Send)) -> RuntimeError {
+    let message = panic
+        .downcast_ref::<&str>()
+        .map(|m| (*m).to_owned())
+        .or_else(|| panic.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "no message".to_owned());
+    RuntimeError::Failed(format!("the {driver} driver panicked: {message}"))
 }
 
 /// What kind of failure `error` is, for the `lease failed` line: the variant, since a
@@ -342,6 +372,10 @@ pub(crate) fn proto_lease_id(id: LeaseId) -> worker::LeaseId {
         seq: id.seq,
     }
 }
+
+#[cfg(test)]
+#[path = "lease_panic_tests.rs"]
+mod panic_tests;
 
 #[cfg(test)]
 mod tests {
@@ -504,68 +538,6 @@ mod tests {
                 .expect("open");
         leases.finished(ended, outcome, &phases);
         assert_eq!(runtime.runs.load(std::sync::atomic::Ordering::SeqCst), 1);
-    }
-
-    /// A runtime whose first run panics (a driver bug); every later run succeeds.
-    struct PanicsOnce(std::sync::atomic::AtomicBool);
-
-    impl Runtime for PanicsOnce {
-        fn driver(&self) -> &'static str {
-            "panics-once"
-        }
-
-        fn serves(&self, _kind: &str) -> bool {
-            true
-        }
-
-        async fn run(&self, _work: Work) -> Result<ActionResult, RuntimeError> {
-            if !self.0.swap(true, std::sync::atomic::Ordering::SeqCst) {
-                panic!("a driver bug");
-            }
-            Ok(ActionResult::default())
-        }
-
-        async fn kill(&self, _lease_id: LeaseId) {}
-    }
-
-    /// The next finished run, within ten seconds.
-    async fn reported(done: &mut mpsc::UnboundedReceiver<Done>) -> Done {
-        tokio::time::timeout(std::time::Duration::from_secs(10), done.recv())
-            .await
-            .expect("the run never reported: its lease stays running for ever")
-            .expect("open")
-    }
-
-    /// Catches a run whose driver panics leaving the daemon half-alive
-    /// (docs/design/all-in-one.md section 7.3): the panic is contained in the run's
-    /// task, but a run that never reports keeps its lease listed as running in every
-    /// heartbeat, so the server neither answers nor runs it again. The run must report
-    /// INTERNAL, naming the panic, its lease must stop running, and the next lease on
-    /// the same driver must run.
-    #[tokio::test]
-    async fn a_run_whose_driver_panics_reports_internal_and_the_next_runs() {
-        let runtime = Arc::new(PanicsOnce(std::sync::atomic::AtomicBool::new(false)));
-        let (done, mut done_rx) = mpsc::unbounded_channel();
-        let mut leases = Leases::new(Runtimes::new(runtime), done);
-        let start = |id| Start {
-            lease_id: Some(proto_lease_id(id)),
-            kind: "action".to_owned(),
-            action_digest: Some(Digest::default()),
-            ..Start::default()
-        };
-        assert_eq!(leases.start(start(id())), None);
-        let (ended, outcome, phases) = reported(&mut done_rx).await;
-        assert_eq!(ended, id());
-        let result = leases.finished(ended, outcome, &phases);
-        assert_eq!(code(&result), Code::Internal as i32, "{result:?}");
-        let message = &result.status.as_ref().expect("status").message;
-        assert!(message.contains("panicked: a driver bug"), "{message}");
-        assert!(leases.running().is_empty());
-        let next = LeaseId::new(3, 5);
-        assert_eq!(leases.start(start(next)), None);
-        let (ended, outcome, _) = reported(&mut done_rx).await;
-        assert_eq!(ended, next);
-        assert!(outcome.is_ok(), "{outcome:?}");
     }
 
     /// Catches a `Cancel` that kills a lease twice (a second kill of a run already

@@ -482,6 +482,79 @@ mod tests {
             .collect()
     }
 
+    /// Catches a daemon half that outlives its process: a run, a staged output or an
+    /// unacknowledged result kept across a death, an input taken while dead, a second
+    /// death counted twice, or a revived process that reconnects as the dead instance
+    /// or on one of its streams; and an in-process run reported before its output is
+    /// stored.
+    #[test]
+    fn the_daemon_half_dies_with_its_process_and_starts_again_as_a_new_instance() {
+        let mut d =
+            FakeDaemon::in_process(NodeId::from("server"), "daemon-0", Resources::new(1_000, 1));
+        d.apply(input(0, Event::Start));
+        d.apply(message(1, welcome(1)));
+        d.apply(message(2, start(1, 1)));
+        d.apply(message(3, start(1, 2)));
+        d.take_outputs();
+        // Both runs end; each output is uploaded, and only a stored one reports.
+        d.apply(input(30_000, Event::Timer { tag: T_POLL }));
+        let uploads = d.take_outputs();
+        let first = output_of(&action(1));
+        assert!(
+            uploads.iter().any(
+                |o| matches!(o, Output::Send { msg: Msg::Upload { digest }, .. } if *digest == first)
+            ),
+            "{uploads:?}"
+        );
+        assert!(
+            d.reported().is_empty(),
+            "reported before its output was stored"
+        );
+        d.apply(message(30_001, Msg::Uploaded { digest: first }));
+        assert_eq!(
+            d.reported().iter().copied().collect::<Vec<_>>(),
+            [LeaseId::new(1, 1)]
+        );
+        d.die();
+        d.die();
+        assert_eq!(
+            d.lost(),
+            2,
+            "one staged output and one unacknowledged result"
+        );
+        d.apply(message(30_002, start(1, 3)));
+        assert!(runs(&d).is_empty(), "a dead process took a Start");
+        d.take_outputs();
+        d.apply(input(31_000, Event::Timer { tag: T_POLL }));
+        assert!(
+            d.take_outputs()
+                .iter()
+                .all(|o| matches!(o, Output::Timer { .. }))
+        );
+        d.revive();
+        d.revive();
+        d.apply(input(32_000, Event::Timer { tag: T_POLL }));
+        let hello = d.take_outputs().into_iter().find_map(|o| match o {
+            Output::Send {
+                msg: Msg::Hello {
+                    stream, instance, ..
+                },
+                ..
+            } => Some((stream, instance)),
+            _ => None,
+        });
+        let (stream, instance) = hello.expect("a Hello at the first poll");
+        assert_eq!(instance, "daemon-0-2");
+        // Later than every stream of the dead process (1, and the one its gap opened).
+        assert_eq!(stream, 3);
+        d.apply(message(32_001, welcome(1)));
+        d.apply(message(32_002, start(1, 4)));
+        assert!(
+            runs(&d).is_empty(),
+            "a message of the dead process's stream was taken"
+        );
+    }
+
     /// Catches a daemon that takes a `Start` before its stream is welcomed, on an
     /// earlier stream, or again for a lease it has reported, and one that takes a
     /// `Welcome` of an earlier stream as its own.

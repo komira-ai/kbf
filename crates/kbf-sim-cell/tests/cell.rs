@@ -61,8 +61,8 @@ fn partition_seeds_keep_properties_1_2_3_5_6_7() {
     sweep(Kind::Partition);
 }
 
-/// All-in-one (docs/design/all-in-one.md sections 7.3, 7.4 and 8): kills of the whole
-/// process, both halves, mid-build. Catches an action answered as succeeded with its
+/// All-in-one (its design, komira-build-farm#657, sections 7.3, 7.4 and 8): kills of
+/// the whole process, both halves, mid-build. Catches an action answered as succeeded with its
 /// output missing, now or after a kill (property 14: the mutant "the daemon half
 /// reports before the server acknowledged its output"), a log the kill does not keep
 /// (the mutant "the restarted process opens an empty log", as `--meta-log=memory`

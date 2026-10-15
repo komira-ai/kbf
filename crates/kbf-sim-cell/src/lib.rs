@@ -16,9 +16,9 @@
 //! server can be taken down at a named point of its write path ([`CrashPlan`]).
 //!
 //! **All-in-one** ([`Kind::WholeProcess`]): one daemon is the daemon half of the
-//! server's process (`kbf-all-in-one`, docs/design/all-in-one.md section 8). It stores
-//! each run's output in the server before it reports, and a kill of the process takes
-//! both halves down together, mid-build, and starts both again.
+//! server's process (`kbf-all-in-one`; its design, komira-build-farm#657, section 8).
+//! It stores each run's output in the server before it reports, and a kill of the
+//! process takes both halves down together, mid-build, and starts both again.
 //!
 //! [`run`] runs a [`Scenario`] step by step and checks properties 1 to 7 of ha.md
 //! section 15, the write path's 8 and 9 (docs/design/write-tier-scenarios.md), and

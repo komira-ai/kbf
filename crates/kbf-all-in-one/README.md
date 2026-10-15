@@ -66,6 +66,19 @@ No message a remote daemon sends changes: `kbf-daemon` still uses the transfer e
   so a daemon half wired to the transfer engine would not start. Also the starts each
   half refuses, with their exit statuses, and the binary run with keeper arguments,
   which answers as the keeper before it reads a flag and starts no server.
+- `tests/helpers.rs`: the daemon's helpers run through this binary. The keeper,
+  waiting on its stdin as it does for a run's whole life, has one thread and no
+  socket, epoll, eventfd or directory open (read from `/proc`), then writes its kill
+  file and exits 0; `__chown-dirs` exits 0, 1 and 2 as the helper does, in its own
+  words.
+- Crash and panic behaviour, in the crates that hold it: `kbf-sim-cell`'s
+  `Kind::WholeProcess` kills the whole process, both halves, mid-build, and starts it
+  again (property 14: no action is answered as succeeded with its outputs missing,
+  and the index and action cache survive the kill; the actions the kill cut are run
+  again on the client's retry); `kbf-daemon`'s `lease_panic_tests.rs`: a run whose
+  driver panics reports INTERNAL and the next lease runs; the hashing pools'
+  own tests (`kbf-front`'s `HashPool`, `kbf-daemon`'s `CpuPool`): a job that panics
+  is an error to its caller and the pool keeps its size.
 - `src/plane_tests.rs`: a digest that does not parse, a server half whose runtime is
   gone, a file changed after the walk hashed it.
 - `src/cli_tests.rs`: each flag reaches its half, once; the refusals.
@@ -83,10 +96,10 @@ No message a remote daemon sends changes: `kbf-daemon` still uses the transfer e
   change not made here.
 - **`--reserve-cpus` across both halves.** The daemon half takes the flag as
   `kbf-daemon` does; the server half uses every CPU, as `kbf-server` does.
-- **Crash and panic behaviour** (the next change): the whole-process crash mode of the
-  simulation, a test that a panic in a driver task leaves the process serving, and the
-  rest of the helper-dispatch tests (each helper mode runs and exits with its code, with
-  no listener bound and no server directory opened).
+- **The simulation's in-process data plane.** In `kbf-sim-cell` the daemon half's
+  outputs still cross the modelled network; the design's in-process mode (bytes off
+  the network model, the control plane on it) and its property A2 (the same final
+  index in both modes) are not built, nor A3 (needs a durable scheduler).
 - **Deploying it** (the change after): the `all-in-one` shape in `kbf-deploy`, its unit
   and `check-units` rules, the ownership step that moves the state directories and keys
   between the split pair and this binary, and its place among the release artifacts.
