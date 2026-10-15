@@ -228,7 +228,11 @@ mod tests {
         let args = Args::parse_from(["kbf-server"]);
         let sizes = sizes_on(&args, topology());
         assert_eq!(
-            (sizes.async_threads(), sizes.blocking_threads(), sizes.cpu_threads()),
+            (
+                sizes.async_threads(),
+                sizes.blocking_threads(),
+                sizes.cpu_threads()
+            ),
             (4, 128, 4)
         );
         let args = Args::parse_from(["kbf-server", "--blocking-threads=9"]);

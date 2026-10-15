@@ -872,7 +872,11 @@ mod tests {
         let cli = parse(&["--driver=fake"]).expect("flags");
         let sizes = sizes_on(&cli, topology());
         assert_eq!(
-            (sizes.async_threads(), sizes.blocking_threads(), sizes.cpu_threads()),
+            (
+                sizes.async_threads(),
+                sizes.blocking_threads(),
+                sizes.cpu_threads()
+            ),
             (2, 64, 4)
         );
         let cli = parse(&["--driver=fake", "--async-threads=5"]).expect("flags");
