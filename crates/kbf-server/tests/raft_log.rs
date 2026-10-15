@@ -2,7 +2,10 @@
 //! directory (`FaultFs`) that a test can restart, crash at any operation, or fill by
 //! hand. Each test names the defect it catches.
 
+use std::io;
 use std::num::{NonZeroU32, NonZeroU64};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use kbf_front::{MetaLog, MetaLogError};
@@ -13,7 +16,7 @@ use kbf_meta::{
 use kbf_raft::{Entry, LogId, LogIndex, Payload, Snapshot, Storage};
 use kbf_server::raft_log::{RECORD, RECORD_TMP, TICK};
 use kbf_server::{RaftLogError, RaftMetaLog};
-use kbf_store::{Fault, FaultFs, Options, Store};
+use kbf_store::{Fault, FaultFile, FaultFs, Fs, Options, Store};
 use kbf_types::{Digest, DigestFunction, FarmTime};
 
 type Log = RaftMetaLog<FaultFs>;
@@ -677,4 +680,91 @@ async fn an_unreadable_directory_is_refused() {
     let refused = refusal(&fs, 1).await;
     assert!(matches!(refused, RaftLogError::Io(_)), "{refused:?}");
     assert!(refused.to_string().starts_with("raft dir"));
+}
+
+/// Catches (kbf#689): an open that reads the directory twice, once for the store and
+/// once for the host, so an entry appended between the two reads leaves the host one
+/// entry past the store, and the open's first write is refused ("entries do not
+/// continue the log"). Here an entry is appended to the log as the open lists the
+/// directory for the `n`th time, for each `n` up to one past the reads one open needs:
+/// every open must succeed and keep committing, with the entry in its log if the append
+/// came before the read.
+#[tokio::test]
+async fn an_entry_appended_while_the_log_opens_does_not_split_its_views() {
+    for n in 1..=3 {
+        let fs = FaultFs::new();
+        let log = open(&fs, 1).await;
+        let first = epoch(&log).await;
+        drop(log);
+        let fs = fs.restart();
+        let listing = AppendAtListing {
+            inner: fs.clone(),
+            at: n,
+            listed: Arc::new(AtomicU64::new(0)),
+        };
+        let reopened = RaftMetaLog::open(listing, Retention::default(), "kbf/", || Ok(id(2))).await;
+        let log = reopened.unwrap_or_else(|e| panic!("listing {n}: {e}"));
+        let next = match log.commit(Command::AllocEpoch).await {
+            Ok(Applied::Epoch(e)) => e.get(),
+            other => panic!("listing {n}: AllocEpoch answered {other:?}"),
+        };
+        assert!(next > first, "listing {n}: epoch {next} after {first}");
+    }
+}
+
+/// A [`FaultFs`] that appends an `AllocEpoch` entry to its log just before its `at`th
+/// listing, as another writer of the directory would.
+#[derive(Clone, Debug)]
+struct AppendAtListing {
+    inner: FaultFs,
+    at: u64,
+    listed: Arc<AtomicU64>,
+}
+
+impl Fs for AppendAtListing {
+    type File = FaultFile;
+
+    fn list(&self) -> io::Result<Vec<String>> {
+        if self.listed.fetch_add(1, Ordering::SeqCst) + 1 == self.at {
+            let alloc = LogCommand::Meta(Command::AllocEpoch);
+            append(&self.inner, Format::V1, &alloc);
+        }
+        self.inner.list()
+    }
+
+    fn read(&self, name: &str) -> io::Result<Vec<u8>> {
+        self.inner.read(name)
+    }
+
+    fn file_len(&self, name: &str) -> io::Result<u64> {
+        self.inner.file_len(name)
+    }
+
+    fn read_at(&self, name: &str, offset: u64, len: usize) -> io::Result<Vec<u8>> {
+        self.inner.read_at(name, offset, len)
+    }
+
+    fn create(&self, name: &str) -> io::Result<FaultFile> {
+        self.inner.create(name)
+    }
+
+    fn create_positioned(&self, name: &str) -> io::Result<FaultFile> {
+        self.inner.create_positioned(name)
+    }
+
+    fn open_append(&self, name: &str) -> io::Result<FaultFile> {
+        self.inner.open_append(name)
+    }
+
+    fn rename(&self, from: &str, to: &str) -> io::Result<()> {
+        self.inner.rename(from, to)
+    }
+
+    fn remove(&self, name: &str) -> io::Result<()> {
+        self.inner.remove(name)
+    }
+
+    fn sync_dir(&self) -> io::Result<()> {
+        self.inner.sync_dir()
+    }
 }

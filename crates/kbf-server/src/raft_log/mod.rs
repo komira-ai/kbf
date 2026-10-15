@@ -254,7 +254,8 @@ where
             }
         };
         let prefix = KeyPrefix::new(format!("{prefix_root}{log_id}/"))?;
-        let (store, _) = Store::open(fs, Options::default())?;
+        // One read of the directory for both the store and the host (kbf#689).
+        let (store, stored) = Store::open(fs, Options::default())?;
         let config = Config {
             id: ME,
             membership: Membership::new([ME], [])?,
@@ -262,7 +263,7 @@ where
             heartbeat_ticks: 1,
             max_entries_per_append: 1,
         };
-        let mut host = Host::open(config, store, NoTransport, machine, 0)?;
+        let mut host = Host::open_stored(config, store, stored, NoTransport, machine, 0)?;
         // A single voter elects itself within two election timeouts; winning commits
         // the term's blank entry, which applies every entry before it.
         while host.core().role() != Role::Leader {
