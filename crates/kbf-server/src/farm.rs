@@ -1163,11 +1163,9 @@ mod tests {
             farm_runs: Vec::new(),
         };
         let settled = farm.lock().settle(&answer, None);
-        assert!(
-            matches!(&settled.finished, Finished::Failed(s)
-                if s.code == Code::Internal as i32 && s.message.contains("could not run the action")),
-            "{:?}",
-            settled.finished
+        assert_eq!(
+            settled.finished,
+            failed(Code::Internal, "the farm could not run the action")
         );
     }
 }

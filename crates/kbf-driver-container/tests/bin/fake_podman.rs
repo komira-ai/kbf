@@ -282,6 +282,7 @@ impl Fake {
 
     fn create(&self, args: &[Vec<u8>]) -> u8 {
         self.write("create.args", &lines(args));
+        let _ = std::fs::remove_file(self.file("tree-volumes"));
         for arg in args {
             if let Some(parent) = arg.strip_prefix(b"--cgroup-parent=") {
                 self.write_line("cgroup", parent);
@@ -289,6 +290,17 @@ impl Fake {
                 self.write_line("owner-label", owner);
             } else if let Some(name) = arg.strip_prefix(b"--name=") {
                 self.write_line("name", name);
+            } else if let Some(volume) = arg
+                .strip_prefix(b"--volume=")
+                .filter(|v| !v.windows(9).any(|w| w == b"upperdir="))
+            {
+                // A shared tree: `<source>:<destination>:<options>`, mounted by `start`.
+                let mut fields = volume.split(|b| *b == b':');
+                let (source, to) = (fields.next().unwrap_or_default(), fields.next());
+                self.append(
+                    "tree-volumes",
+                    &[source, b" ", to.unwrap_or_default()].concat(),
+                );
             } else if let Some(volume) = arg.strip_prefix(b"--volume=") {
                 // `${v%%:*}`, then `${v#*upperdir=}` and its `${u%%,*}`.
                 let root = volume.split(|b| *b == b':').next().unwrap_or_default();
@@ -333,6 +345,7 @@ impl Fake {
                 126,
             );
         }
+        self.mount_trees();
         let cgroup = self.cat("cgroup");
         let lease = [self.cat("nonce"), cgroup.clone()].concat();
         // The paths the action is given, by name: in its environment, and in place of a
@@ -401,6 +414,27 @@ impl Fake {
             .or_else(|| status.signal().map(|s| 128 + s))
             .unwrap_or(1);
         self.ended(u8::try_from(code & 0xff).unwrap_or(1))
+    }
+
+    /// Stands in for the read-only mounts of shared trees: the empty mount point in the
+    /// input root becomes a symlink to the tree, so the action reads it. (A symlink is
+    /// writable through; the read-only mount is checked on real Podman.)
+    fn mount_trees(&self) {
+        let root = self.cat("root");
+        for line in self.cat("tree-volumes").split(|b| *b == b'\n') {
+            let Some(at) = line.iter().position(|b| *b == b' ') else {
+                continue;
+            };
+            let (source, to) = (&line[..at], &line[at + 1..]);
+            let Some(inside) = to.strip_prefix(b"/kbf/root/") else {
+                continue;
+            };
+            let host = path(&root).join(OsStr::from_bytes(inside));
+            // Already a symlink when `start` runs again (a retried exec).
+            if std::fs::remove_dir(&host).is_ok() {
+                let _ = std::os::unix::fs::symlink(OsStr::from_bytes(source), &host);
+            }
+        }
     }
 
     /// What `start` does once the action has ended with `code`: the status `inspect`

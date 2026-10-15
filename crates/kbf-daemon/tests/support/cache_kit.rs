@@ -56,6 +56,16 @@ impl CountingCas {
             .sum()
     }
 
+    /// Reads of Directory messages, all digests together.
+    pub fn directory_reads(&self) -> u64 {
+        let directories = lock(&self.directories);
+        lock(&self.reads)
+            .iter()
+            .filter(|(d, _)| directories.contains(*d))
+            .map(|(_, n)| n)
+            .sum()
+    }
+
     /// Bytes of file blobs returned.
     pub fn file_bytes(&self) -> u64 {
         self.bytes.load(Ordering::SeqCst)

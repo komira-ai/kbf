@@ -252,3 +252,24 @@ fn the_private_paths_are_the_outputs_from_the_input_root() {
     assert_eq!(private_paths("", &outputs), ["out/a", "b"]);
     assert_eq!(private_paths("pkg/", &outputs), ["pkg/out/a", "pkg/b"]);
 }
+
+/// Catches a tree store opened where a volume cannot name it (a path with ':' or ',' ends
+/// a `--volume` field early: the "no path check" mutant mounts the wrong directory), one
+/// whose directory cannot be made (the node then links every file, with a warning, and
+/// does not stop), and a store that is not opened when it can be.
+#[test]
+fn a_tree_store_opens_where_a_volume_can_name_it() {
+    let base = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/kbf-driver-unit")
+        .join(format!("trees-{}", std::process::id()));
+    std::fs::create_dir_all(&base).expect("scratch");
+    let config = |dir: PathBuf| TreeConfig::new(dir, 1 << 20);
+    assert!(open_trees(config(base.join("fine"))).is_some());
+    assert!(base.join("fine").is_dir());
+    assert!(open_trees(config(base.join("a:b"))).is_none());
+    assert!(open_trees(config(base.join("a,b"))).is_none());
+    assert!(!base.join("a:b").exists());
+    // A directory under a file cannot be made.
+    std::fs::write(base.join("file"), b"x").expect("file");
+    assert!(open_trees(config(base.join("file/trees"))).is_none());
+}

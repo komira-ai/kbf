@@ -248,3 +248,27 @@ async fn a_put_staged_that_applied_but_lost_its_answer_is_read_and_flushed() {
     assert_eq!(farm.log.located(&a.digest).1, None, "flushed");
     assert_eq!(cache.read_blob(&a.digest).await.expect("read"), a.bytes);
 }
+
+/// Catches: a `PutStaged` whose answer was lost, and whose committed state then could
+/// not be read, counted as committed (taking the failed read for "applied"). Nothing
+/// says the commit applied, so the range must count as failed: none of its bytes
+/// count as unflushed, and its block, whose only range failed, is not flushed. The
+/// commit did apply here, and the next start recovers it from the committed state.
+#[tokio::test]
+async fn a_lost_put_staged_answer_whose_state_read_fails_counts_the_range_as_failed() {
+    let farm = Farm::new(CONDITIONAL);
+    let cache = farm.start(GIB).await;
+    let a = TestBlob::new(1, 4096);
+    farm.log.lose_answer_and_next_read("put_staged");
+    let lost = cache.store_blobs(vec![a.verified()]).await;
+    assert!(matches!(lost, Err(CacheError::Meta(_))), "{lost:?}");
+    assert_eq!(farm.log.failed_reads(), 1, "the read after the lost answer");
+    let object = farm.log.object_of(&a.digest);
+    assert!(committed_len(&farm, object) > 0, "the commit applied");
+    let tier = cache.write_tier().expect("tier");
+    assert_eq!(tier.unflushed(Instant::now()).bytes, 0, "counted as failed");
+
+    let round = cache.flush_tier(later()).await.expect("round");
+    assert_eq!(round.flushed, Vec::<ObjectId>::new(), "{round:?}");
+    assert_eq!(farm.store.put_keys(), Vec::<kbf_objstore::ObjectKey>::new());
+}
