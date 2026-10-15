@@ -186,10 +186,7 @@ impl Worker {
             // give. The one limit that is not a share is the whole host ([`Worker::exclusive`]):
             // that action runs alone.
             LeaseKind::Action | LeaseKind::Vm => {
-                !self.whole
-                    && self.free().fits(&request.resources.without_memory())
-                    && request.resources.memory_bytes <= self.capacity.memory_bytes
-                    && (!self.exclusive(request) || self.leases == 0)
+                !self.whole && self.free().fits(&request.resources)
             }
         };
         room && (!request.needs.wants_device() || self.free_device(&request.needs).is_some())
