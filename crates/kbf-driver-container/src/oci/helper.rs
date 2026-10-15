@@ -19,14 +19,14 @@
 
 use std::path::{Path, PathBuf};
 
-use oci_spec::OciSpecError;
 use oci_spec::runtime::{
     LinuxBuilder, LinuxCapabilitiesBuilder, LinuxNamespaceBuilder, LinuxNamespaceType,
-    MountBuilder, ProcessBuilder, RootBuilder, Spec, SpecBuilder, UserBuilder,
+    ProcessBuilder, RootBuilder, Spec, SpecBuilder, UserBuilder,
 };
 
 use super::Mapping;
 use super::hardening::held_capabilities;
+use super::spec::{bind, built, filesystem};
 use crate::subids::DaemonIds;
 
 /// How many directories the helper root has mount points for (`/t/0` to `/t/7`); more
@@ -176,98 +176,69 @@ pub(crate) fn bound_at(index: usize) -> String {
     format!("/t/{index}")
 }
 
-fn bind_mount(
-    source: &Path,
-    destination: &str,
-    writable: bool,
-) -> Result<oci_spec::runtime::Mount, OciSpecError> {
+/// A read-only or read-write bind of `source` at `destination`.
+fn bind_at(source: &Path, destination: &str, writable: bool) -> oci_spec::runtime::Mount {
     let access = if writable { "rw" } else { "ro" };
-    MountBuilder::default()
-        .destination(destination)
-        .typ("bind")
-        .source(source)
-        .options(vec![
-            "rbind".to_owned(),
-            access.to_owned(),
-            "nosuid".to_owned(),
-        ])
-        .build()
+    bind(source, destination, &["rbind", access, "nosuid"])
 }
 
 /// The `config.json` of a helper running `job` over `rootfs` (see [`prepare_rootfs`]),
 /// in the user namespace `mapping` names.
-///
-/// # Errors
-/// A builder rejecting a field, or a capability name `oci-spec` does not know (neither
-/// happens: the unit tests build every kind of job).
-pub(crate) fn config(
-    rootfs: &Path,
-    ids: &DaemonIds,
-    mapping: Mapping,
-    job: &Job,
-) -> Result<Spec, OciSpecError> {
+pub(crate) fn config(rootfs: &Path, ids: &DaemonIds, mapping: Mapping, job: &Job) -> Spec {
     let mut mounts = vec![
-        MountBuilder::default()
-            .destination("/dev")
-            .typ("tmpfs")
-            .source("tmpfs")
-            .options(vec![
-                "nosuid".to_owned(),
-                "strictatime".to_owned(),
-                "mode=755".to_owned(),
-                "size=1m".to_owned(),
-            ])
-            .build()?,
-        bind_mount(Path::new("/usr"), "/usr", false)?,
-        bind_mount(Path::new("/etc/ld.so.cache"), "/etc/ld.so.cache", false)?,
+        filesystem(
+            "/dev",
+            "tmpfs",
+            &["nosuid", "strictatime", "mode=755", "size=1m"],
+        ),
+        bind_at(Path::new("/usr"), "/usr", false),
+        bind_at(Path::new("/etc/ld.so.cache"), "/etc/ld.so.cache", false),
     ];
     if let Some(daemon) = &job.daemon {
-        mounts.push(bind_mount(daemon, DAEMON_BINARY, false)?);
+        mounts.push(bind_at(daemon, DAEMON_BINARY, false));
     }
     for (i, bind) in job.binds.iter().enumerate() {
-        mounts.push(bind_mount(&bind.source, &bound_at(i), bind.writable)?);
+        mounts.push(bind_at(&bind.source, &bound_at(i), bind.writable));
     }
-    let held = held_capabilities().map_err(OciSpecError::Other)?;
-    let process = ProcessBuilder::default()
-        .terminal(false)
-        .user(UserBuilder::default().uid(0u32).gid(0u32).build()?)
-        .args(job.args.clone())
-        .env(vec!["PATH=/usr/bin:/usr/sbin:/bin:/sbin".to_owned()])
-        .cwd(PathBuf::from("/"))
-        .capabilities(
-            LinuxCapabilitiesBuilder::default()
-                .bounding(held.clone())
-                .effective(held.clone())
-                .permitted(held)
-                .build()?,
-        )
-        .no_new_privileges(true)
-        .build()?;
+    let held = held_capabilities();
+    let capabilities = built(
+        LinuxCapabilitiesBuilder::default()
+            .bounding(held.clone())
+            .effective(held.clone())
+            .permitted(held)
+            .build(),
+    );
+    let process = built(
+        ProcessBuilder::default()
+            .terminal(false)
+            .user(built(UserBuilder::default().uid(0u32).gid(0u32).build()))
+            .args(job.args.clone())
+            .env(vec!["PATH=/usr/bin:/usr/sbin:/bin:/sbin".to_owned()])
+            .cwd(PathBuf::from("/"))
+            .capabilities(capabilities)
+            .no_new_privileges(true)
+            .build(),
+    );
     let (uids, gids) = ids.mappings(mapping);
-    let linux = LinuxBuilder::default()
-        .uid_mappings(uids)
-        .gid_mappings(gids)
-        .namespaces(vec![
-            LinuxNamespaceBuilder::default()
-                .typ(LinuxNamespaceType::User)
-                .build()?,
-            LinuxNamespaceBuilder::default()
-                .typ(LinuxNamespaceType::Mount)
-                .build()?,
-        ])
-        .build()?;
-    SpecBuilder::default()
-        .version("1.0.0")
-        .root(
-            RootBuilder::default()
-                .path(rootfs)
-                .readonly(false)
-                .build()?,
-        )
-        .process(process)
-        .mounts(mounts)
-        .linux(linux)
-        .build()
+    let namespaces = [LinuxNamespaceType::User, LinuxNamespaceType::Mount]
+        .map(|typ| built(LinuxNamespaceBuilder::default().typ(typ).build()));
+    let linux = built(
+        LinuxBuilder::default()
+            .uid_mappings(uids)
+            .gid_mappings(gids)
+            .namespaces(namespaces.to_vec())
+            .build(),
+    );
+    let root = built(RootBuilder::default().path(rootfs).readonly(false).build());
+    built(
+        SpecBuilder::default()
+            .version("1.0.0")
+            .root(root)
+            .process(process)
+            .mounts(mounts)
+            .linux(linux)
+            .build(),
+    )
 }
 
 /// The links the helper root holds so the programs and libraries of a merged-`/usr`

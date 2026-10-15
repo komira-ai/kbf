@@ -52,7 +52,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use oci_spec::OciSpecError;
 use oci_spec::runtime::{LinuxIdMapping, LinuxIdMappingBuilder};
 
 pub(crate) use crun::RunEnd;
@@ -180,8 +179,6 @@ pub(crate) enum JobError {
     },
     #[error(transparent)]
     Spec(#[from] spec::SpecError),
-    #[error("config.json: {0}")]
-    Bundle(#[from] OciSpecError),
     #[error("{0}")]
     Crun(String),
 }
@@ -291,7 +288,7 @@ impl Oci {
     ) -> Result<PathBuf, JobError> {
         let bundle = dir.join(format!("helper-{}", self.next()));
         at(&bundle, std::fs::create_dir_all(&bundle))?;
-        let config = helper::config(&self.helper_root, &self.ids, mapping, job)?;
+        let config = helper::config(&self.helper_root, &self.ids, mapping, job);
         let file = bundle.join("config.json");
         at(&file, std::fs::write(&file, spec::render(&config)?))?;
         Ok(bundle)

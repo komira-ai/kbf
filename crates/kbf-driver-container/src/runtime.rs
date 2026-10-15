@@ -395,7 +395,6 @@ impl<C: Cas> PodmanRuntime<C> {
             image: image.to_string(),
             image_digest: image.digest().to_owned(),
             dir: lease.dir.clone(),
-            shared_mounts: Vec::new(),
             cgroup_parent: lease.cgroup.name().to_owned(),
             input_root: root,
             upper,
@@ -408,6 +407,7 @@ impl<C: Cas> PodmanRuntime<C> {
                 .collect(),
             argv: command.arguments.clone(),
             limits: self.config.limits,
+            shared: Vec::new(),
         };
         Ok(Prepared {
             spec,

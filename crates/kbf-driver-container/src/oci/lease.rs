@@ -122,17 +122,16 @@ impl Backend for Oci {
     /// error record in its log.
     async fn ended(&self, spec: &ContainerSpec, running: &Running) -> Result<Ended, String> {
         match running.run_end() {
-            Some(RunEnd::Exited(0)) => Ok(Ended::Exited(0)),
-            Some(RunEnd::Exited(code)) => {
+            RunEnd::Exited(0) => Ok(Ended::Exited(0)),
+            RunEnd::Exited(code) => {
                 let log = tokio::fs::read_to_string(log_path(&spec.dir)).await;
                 if crun_words(&log.unwrap_or_default()).is_empty() {
-                    Ok(Ended::Exited(*code))
+                    Ok(Ended::Exited(code))
                 } else {
                     Ok(Ended::NotRun(format!("exited {code}")))
                 }
             }
-            Some(RunEnd::Failed(why)) => Err(why.clone()),
-            None => Err("crun run has not ended".to_owned()),
+            RunEnd::Failed(why) => Err(why),
         }
     }
 

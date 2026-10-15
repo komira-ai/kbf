@@ -758,3 +758,21 @@ async fn exit_137_with_a_kernel_oom_event_is_out_of_memory_with_crun_too() {
     );
     fake.assert_clean(1);
 }
+
+/// Catches Podman going away between two of the unpack's steps being taken for success:
+/// the lease fails as the farm's, naming the program, and no half-made image is left.
+#[tokio::test]
+async fn a_podman_that_goes_away_during_an_unpack_fails_the_lease() {
+    let fake = FakeOci::new("podman-vanishes");
+    fake.pulled_not_unpacked();
+    std::fs::write(fake.podman_state.join("vanish-after-create"), "").expect("knob");
+    let outcome = fake
+        .run(1, &Spec::new(&image(), "unused"), &["exit", "0"])
+        .await;
+    let Err(RuntimeError::Failed(why)) = outcome else {
+        panic!("{outcome:?}");
+    };
+    assert!(why.contains("podman"), "{why}");
+    assert!(why.contains("No such file or directory"), "{why}");
+    assert!(!exists(&fake.image_dir()), "an image directory was left");
+}

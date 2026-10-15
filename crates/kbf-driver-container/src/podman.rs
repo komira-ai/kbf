@@ -69,16 +69,18 @@ impl ContainerLimits {
     };
 }
 
-/// A directory the node already holds, mounted read-only inside the action's input root
-/// at `destination` (relative to it): the interface through which a shared tree reaches
-/// a runtime. The mount point must exist in the input root as an empty directory, so no
-/// symlink can sit at it.
+/// A host directory mounted read-only inside the action's input root, at `path` below it:
+/// the interface through which a shared tree reaches a runtime. The mount point must
+/// exist in the input root as an empty directory, so no symlink can sit at it.
+///
+/// Shaped as `kbf_daemon::trees::SharedMount` (the tree store's, in its own change), which
+/// replaces this when that lands.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SharedMount {
+    /// Where it appears, below [`EXEC_ROOT`]: no leading `/`, no `..`.
+    pub path: String,
     /// The directory on the host.
     pub source: PathBuf,
-    /// Where it appears, below [`EXEC_ROOT`]: no leading `/`, no `..`.
-    pub destination: String,
 }
 
 /// The container to create for one action.
@@ -94,9 +96,6 @@ pub(crate) struct ContainerSpec {
     pub image_digest: String,
     /// The lease's scratch directory.
     pub dir: PathBuf,
-    /// Shared read-only mounts inside the exec root (the OCI backend binds them; the
-    /// Podman backend's `--volume` lines for them are the tree store's to add).
-    pub shared_mounts: Vec<SharedMount>,
     /// The lease cgroup, as `--cgroup-parent` names it.
     pub cgroup_parent: String,
     /// The input root on the host: the overlay's read-only lower layer.
@@ -110,6 +109,8 @@ pub(crate) struct ContainerSpec {
     pub env: Vec<(String, String)>,
     pub argv: Vec<String>,
     pub limits: ContainerLimits,
+    /// Host directories mounted read-only inside the exec root (shared trees).
+    pub shared: Vec<SharedMount>,
 }
 
 /// The `podman create` arguments for `spec`.
@@ -122,7 +123,10 @@ pub(crate) struct ContainerSpec {
 ///   and `CMD` are both ignored and no argument is re-split.
 /// - **Files:** the input root as an overlay: the host copy is never written, and
 ///   every write lands in `upper`, which the driver reads outputs from (no output may
-///   already be an input, so each is whole there).
+///   already be an input, so each is whole there). Each shared tree is a second
+///   `--volume=<tree>:/kbf/root/<path>:ro,nosuid,nodev` on top of it: read-only, so a
+///   write into a toolchain fails `EROFS` and the input root's own directory there is
+///   an empty mount point.
 /// - **Memory:** `memory.oom.group=1` on the container, so an OOM kill takes the whole
 ///   action. Limits live on the lease cgroup (see `cgroup`), never `--memory`.
 ///   `--oom-score-adj=0`: a process inherits its parent's `oom_score_adj`, and the
@@ -188,6 +192,12 @@ pub(crate) fn create_args(spec: &ContainerSpec) -> Vec<OsString> {
     volume.push(",workdir=");
     volume.push(&spec.overlay_work);
     args.push(volume);
+    for mount in &spec.shared {
+        let mut tree = OsString::from("--volume=");
+        tree.push(&mount.source);
+        tree.push(format!(":{EXEC_ROOT}/{}:ro,nosuid,nodev", mount.path));
+        args.push(tree);
+    }
     args.push(spec.image.clone().into());
     args
 }
@@ -444,7 +454,6 @@ pub(crate) mod tests {
             image: format!("docker.io/library/busybox@sha256:{}", "a".repeat(64)),
             image_digest: format!("sha256:{}", "a".repeat(64)),
             dir: PathBuf::from("/scratch/kbf-lease-1-2"),
-            shared_mounts: Vec::new(),
             cgroup_parent: "/kbf.slice/actions/kbf-lease-1-2".to_owned(),
             input_root: PathBuf::from("/scratch/kbf-lease-1-2/root"),
             upper: PathBuf::from("/scratch/kbf-lease-1-2/upper"),
@@ -458,6 +467,7 @@ pub(crate) mod tests {
                 nofile: 103,
                 nproc: 104,
             },
+            shared: Vec::new(),
         }
     }
 
@@ -552,6 +562,44 @@ pub(crate) mod tests {
         assert_eq!(env, ["--env=PATH=/bin"], "{args:?}");
         let users: Vec<_> = args.iter().filter(|a| a.starts_with("--user=")).collect();
         assert_eq!(users, ["--user=0:0"], "{args:?}");
+    }
+
+    /// Catches a shared tree mounted writable (the "drop `:ro`" mutant: an action could
+    /// change a toolchain every other action reads), mounted outside the exec root, or
+    /// put before the overlay it lies on (podman sorts by destination, but the golden
+    /// order is the one the fake and the real tests run), and a spec without trees
+    /// gaining a volume.
+    #[test]
+    fn shared_trees_are_read_only_volumes_inside_the_exec_root() {
+        let none = strings(&create_args(&spec()));
+        assert_eq!(
+            none.iter().filter(|a| a.starts_with("--volume=")).count(),
+            1
+        );
+        let mut with = spec();
+        with.shared = vec![
+            SharedMount {
+                path: "external/zig".to_owned(),
+                source: PathBuf::from("/trees/aa-1"),
+            },
+            SharedMount {
+                path: "lib".to_owned(),
+                source: PathBuf::from("/trees/bb-2"),
+            },
+        ];
+        let args = strings(&create_args(&with));
+        let volumes: Vec<_> = args.iter().filter(|a| a.starts_with("--volume=")).collect();
+        assert_eq!(volumes.len(), 3, "{args:?}");
+        assert!(volumes[0].contains(":O,upperdir="), "{volumes:?}");
+        assert_eq!(
+            volumes[1],
+            "--volume=/trees/aa-1:/kbf/root/external/zig:ro,nosuid,nodev"
+        );
+        assert_eq!(
+            volumes[2],
+            "--volume=/trees/bb-2:/kbf/root/lib:ro,nosuid,nodev"
+        );
+        assert_eq!(args.last(), Some(&with.image));
     }
 
     /// Catches a limit left to Podman's defaults or a node's `containers.conf` (the

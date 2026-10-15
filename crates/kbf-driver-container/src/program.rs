@@ -361,9 +361,8 @@ mod tests {
             r#"{"level":"error","msg":"mount `/x` to `/kbf/root`: No such file or directory"}"#,
         )
         .expect("log");
-        let Err(RuntimeError::Failed(why)) = not_run(&spec, &said, "exited 1").await else {
-            panic!("not the farm's failure");
-        };
+        let farm = not_run(&spec, &said, "exited 1").await;
+        let why = farm.expect_err("the farm's failure").to_string();
         assert!(
             why.contains("crun reports \"exited 1\"; crun log: crun: mount `/x`"),
             "{why}"

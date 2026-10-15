@@ -80,10 +80,11 @@ pub(crate) enum Running {
 /// action, for the length of the action.
 #[derive(Debug)]
 pub(crate) struct Run {
-    thread: Option<std::thread::JoinHandle<()>>,
-    ended: Option<tokio::sync::oneshot::Receiver<RunEnd>>,
+    thread: std::thread::JoinHandle<()>,
+    /// `None` until the run has ended, then how it did. Dropped unanswered if the thread
+    /// panics.
+    ended: tokio::sync::watch::Receiver<Option<RunEnd>>,
     abort: Option<tokio::sync::oneshot::Sender<()>>,
-    end: Option<RunEnd>,
 }
 
 impl Run {
@@ -93,24 +94,19 @@ impl Run {
     where
         F: std::future::Future<Output = RunEnd> + Send + 'static,
     {
-        Self::spawn_with(
-            std::thread::Builder::new().name(name),
-            one_thread_runtime,
-            work,
-        )
+        let thread = std::thread::Builder::new().name(name);
+        Self::start(thread, one_thread_runtime, Box::pin(work))
     }
 
     /// [`Run::spawn`] on `thread`, with `runtime` making the thread's runtime: the two
-    /// places it can fail, each a test's to cause.
-    fn spawn_with<F>(
+    /// places it can fail, each a test's to cause. Not generic, so one build of it is
+    /// what every test (and the coverage count) sees.
+    fn start(
         thread: std::thread::Builder,
         runtime: fn() -> std::io::Result<tokio::runtime::Runtime>,
-        work: F,
-    ) -> Result<Self, String>
-    where
-        F: std::future::Future<Output = RunEnd> + Send + 'static,
-    {
-        let (end_tx, end_rx) = tokio::sync::oneshot::channel();
+        work: std::pin::Pin<Box<dyn std::future::Future<Output = RunEnd> + Send>>,
+    ) -> Result<Self, String> {
+        let (end_tx, ended) = tokio::sync::watch::channel(None);
         let (abort_tx, abort_rx) = tokio::sync::oneshot::channel::<()>();
         let body = move || {
             let end = match runtime() {
@@ -122,22 +118,27 @@ impl Run {
                 }),
                 Err(e) => RunEnd::Failed(format!("the runtime of the crun thread: {e}")),
             };
-            let _ = end_tx.send(end);
+            end_tx.send_replace(Some(end));
         };
         let thread = thread
             .spawn(body)
             .map_err(|e| format!("start the crun thread: {e}"))?;
         Ok(Self {
-            thread: Some(thread),
-            ended: Some(end_rx),
+            thread,
+            ended,
             abort: Some(abort_tx),
-            end: None,
         })
     }
 
-    /// How the run ended, once [`Running::wait`] returned.
-    pub(crate) fn end(&self) -> Option<&RunEnd> {
-        self.end.as_ref()
+    /// How the run ended, once [`Running::wait`] returned; `None` if it ended without
+    /// saying (its thread panicked).
+    pub(crate) fn end(&self) -> Option<RunEnd> {
+        self.ended.borrow().clone()
+    }
+
+    /// Aborts the run, which kills `crun`; nothing if it was aborted already.
+    fn abort(&mut self) {
+        let _ = self.abort.take().map(|abort| abort.send(()));
     }
 }
 
@@ -149,20 +150,15 @@ fn one_thread_runtime() -> std::io::Result<tokio::runtime::Runtime> {
 }
 
 impl Running {
-    /// Waits until the start has ended. Cancel-safe.
+    /// Waits until the start has ended. Cancel-safe; may be called again.
     pub(crate) async fn wait(&mut self) {
         match self {
             Self::Process(child) => {
                 let _ = child.wait().await;
             }
             Self::Run(run) => {
-                if let Some(ended) = run.ended.as_mut() {
-                    let end = ended.await.unwrap_or_else(|_| {
-                        RunEnd::Failed("the crun thread ended without an answer".to_owned())
-                    });
-                    run.end = Some(end);
-                    run.ended = None;
-                }
+                // Err: the thread panicked and dropped its answer; `end` says `None`.
+                let _ = run.ended.wait_for(Option::is_some).await;
             }
         }
     }
@@ -174,21 +170,19 @@ impl Running {
             Self::Process(child) => {
                 let _ = child.kill().await;
             }
-            Self::Run(run) => {
-                if let Some(abort) = run.abort.take() {
-                    let _ = abort.send(());
-                }
-                self.wait().await;
-            }
+            Self::Run(run) => run.abort(),
         }
+        self.wait().await;
     }
 
-    /// How the `crun run` ended, once [`Running::wait`] returned; `None` for a Podman
-    /// start or a run not waited for.
-    pub(crate) fn run_end(&self) -> Option<&RunEnd> {
+    /// How the `crun run` ended, once [`Running::wait`] returned. A run that did not say
+    /// (its thread panicked) and a Podman start (which is no `crun run`) are failures.
+    pub(crate) fn run_end(&self) -> RunEnd {
         match self {
-            Self::Run(run) => run.end(),
-            Self::Process(_) => None,
+            Self::Run(run) => run
+                .end()
+                .unwrap_or_else(|| RunEnd::Failed("crun run did not say how it ended".to_owned())),
+            Self::Process(_) => RunEnd::Failed("this start is not a crun run".to_owned()),
         }
     }
 
@@ -208,26 +202,20 @@ impl Running {
         match self {
             Self::Process(child) => crate::runtime::reap(child, limit, pause),
             Self::Run(run) => {
-                let Some(thread) = run.thread.take() else {
-                    return Ok(());
-                };
                 let deadline = Instant::now() + limit;
                 let mut aborted = false;
-                while !thread.is_finished() {
+                while !run.thread.is_finished() {
                     if Instant::now() >= deadline {
+                        run.abort();
                         if aborted {
                             return Err(format!(
                                 "crun run still runs {limit:?} after its cgroup was killed"
                             ));
                         }
-                        if let Some(abort) = run.abort.take() {
-                            let _ = abort.send(());
-                        }
                         aborted = true;
                     }
                     std::thread::sleep(pause);
                 }
-                let _ = thread.join();
                 Ok(())
             }
         }
@@ -471,6 +459,13 @@ mod tests {
         Err(std::io::Error::other("no epoll"))
     }
 
+    fn failed(says: &str) -> RunEnd {
+        RunEnd::Failed(says.to_owned())
+    }
+
+    const SOON: Duration = Duration::from_secs(5);
+    const PAUSE: Duration = Duration::from_millis(1);
+
     /// Catches a runtime flag spelled differently from what the daemon's docs say, or
     /// an unknown runtime being taken for one.
     #[test]
@@ -484,57 +479,89 @@ mod tests {
         assert!(refused.contains("podman or oci"), "{refused}");
     }
 
-    /// Catches a run whose answer is lost: the thread's own failures (no runtime, no
-    /// thread), a panic in the work (the answer's sender dropped), and an abort, each
-    /// ending the run with a reason instead of a hang.
+    /// Catches a run whose answer is lost or wrong: the thread's own failures (no
+    /// runtime, no thread), a panic in the work (no answer: `None`), an abort (twice is
+    /// the same as once), and a normal end, each ending the run with what it was instead
+    /// of a hang; and `wait`/`reap` that cannot be called again.
     #[tokio::test]
     async fn a_run_always_ends_with_an_answer() {
         let build = |name: &str| std::thread::Builder::new().name(name.to_owned());
         let idle = || async { std::future::pending::<RunEnd>().await };
+        let started = |run: Result<Run, String>| Running::Run(run.expect("started"));
 
-        let mut run = Running::Run(
-            Run::spawn_with(build("no-runtime"), runtime_fails, idle()).expect("started"),
-        );
+        let mut run = started(Run::start(
+            build("no-runtime"),
+            runtime_fails,
+            Box::pin(idle()),
+        ));
         run.wait().await;
-        assert_end(&run, "the runtime of the crun thread: no epoll");
-        run.reap(Duration::from_secs(5), Duration::from_millis(1))
-            .expect("gone");
+        run.wait().await;
+        assert_eq!(
+            run.run_end(),
+            failed("the runtime of the crun thread: no epoll")
+        );
+        run.reap(SOON, PAUSE).expect("gone");
+        run.reap(SOON, PAUSE).expect("gone again");
 
         let too_big = std::thread::Builder::new().stack_size(usize::MAX / 2);
-        let refused = Run::spawn_with(too_big, one_thread_runtime, idle()).err();
-        assert!(refused.is_some_and(|e| e.starts_with("start the crun thread: ")));
-
-        let mut run = Running::Run(
-            Run::spawn_with(build("panics"), one_thread_runtime, async {
-                panic!("crun task panicked");
-                #[allow(unreachable_code)]
-                RunEnd::Exited(0)
-            })
-            .expect("started"),
+        let refused = Run::start(too_big, one_thread_runtime, Box::pin(idle())).err();
+        assert_eq!(
+            refused.map(|e| e.starts_with("start the crun thread: ")),
+            Some(true)
         );
+
+        let panics = async {
+            panic!("crun task panicked");
+            #[allow(unreachable_code)]
+            RunEnd::Exited(0)
+        };
+        let mut run = started(Run::start(
+            build("panics"),
+            one_thread_runtime,
+            Box::pin(panics),
+        ));
         run.wait().await;
-        assert_end(&run, "the crun thread ended without an answer");
-        run.reap(Duration::from_secs(5), Duration::from_millis(1))
-            .expect("gone");
+        assert_eq!(run.run_end(), failed("crun run did not say how it ended"));
+        run.reap(SOON, PAUSE).expect("gone");
 
-        let mut run = Running::Run(
-            Run::spawn_with(build("aborted"), one_thread_runtime, idle()).expect("started"),
-        );
+        let aborted = Run::start(build("aborted"), one_thread_runtime, Box::pin(idle()));
+        let mut run = started(aborted);
         assert!(run.needs_cgroup_kill());
         run.force().await;
-        assert_end(&run, "crun run was aborted");
-        run.reap(Duration::from_secs(5), Duration::from_millis(1))
-            .expect("gone");
+        run.force().await;
+        assert_eq!(run.run_end(), failed("crun run was aborted"));
+        run.reap(SOON, PAUSE).expect("gone");
+
+        let done = async { RunEnd::Exited(3) };
+        let mut run = started(Run::start(
+            build("done"),
+            one_thread_runtime,
+            Box::pin(done),
+        ));
+        run.wait().await;
+        assert_eq!(run.run_end(), RunEnd::Exited(3));
+        run.reap(SOON, PAUSE).expect("gone");
     }
 
-    fn assert_end(run: &Running, says: &str) {
-        let Running::Run(run) = run else {
-            panic!("not a run");
+    /// Catches a Podman start being taken for a `crun run`: it has no run end, needs no
+    /// cgroup kill first, waits for the process, and is killed by force.
+    #[tokio::test]
+    async fn a_podman_start_is_not_a_crun_run() {
+        let child = |program: &str, arg: &str| {
+            Running::Process(
+                tokio::process::Command::new(program)
+                    .arg(arg)
+                    .spawn()
+                    .expect("spawn"),
+            )
         };
-        let Some(RunEnd::Failed(why)) = run.end() else {
-            panic!("{:?}", run.end());
-        };
-        assert_eq!(why, says);
+        let mut start = child("sleep", "30");
+        assert_eq!(start.run_end(), failed("this start is not a crun run"));
+        assert!(!start.needs_cgroup_kill());
+        start.force().await;
+        let mut start = child("true", "");
+        start.wait().await;
+        start.reap(SOON, PAUSE).expect("reaped");
     }
 
     /// Catches a clean that gives up on a `crun` it cannot stop without saying so: a
@@ -542,19 +569,22 @@ mod tests {
     /// outlasts the second wait, which is an error naming the limit.
     #[test]
     fn a_run_that_will_not_end_is_an_error_after_the_limit() {
-        let mut run = Running::Run(
-            Run::spawn_with(std::thread::Builder::new(), one_thread_runtime, async {
-                // Blocks the thread: an abort cannot get in.
-                std::thread::sleep(Duration::from_millis(600));
-                RunEnd::Exited(0)
-            })
-            .expect("started"),
+        let stuck = async {
+            // Blocks the thread: an abort cannot get in.
+            std::thread::sleep(Duration::from_millis(600));
+            RunEnd::Exited(0)
+        };
+        let run = Run::start(
+            std::thread::Builder::new(),
+            one_thread_runtime,
+            Box::pin(stuck),
         );
+        let mut run = Running::Run(run.expect("started"));
         let why = run
             .reap(Duration::from_millis(100), Duration::from_millis(5))
             .expect_err("still running");
         assert!(why.contains("still runs"), "{why}");
-        // It is waited for: the next reap finds the thread gone or errors the same way.
-        std::thread::sleep(Duration::from_millis(800));
+        // It is waited for once it ends.
+        run.reap(SOON, Duration::from_millis(5)).expect("ended");
     }
 }

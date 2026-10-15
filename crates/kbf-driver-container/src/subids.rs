@@ -81,9 +81,6 @@ pub enum SubidError {
          subordinate ids; the OCI backend maps one range, so give the user one"
     )]
     Split { file: PathBuf, user: String },
-    /// An id that does not fit the 32 bits a user namespace maps.
-    #[error("{file}: the daemon user's subordinate range starts past the 32-bit ids")]
-    TooHigh { file: PathBuf },
 }
 
 /// The daemon user's own ids and the first ids of its subordinate ranges, for a backend
@@ -121,15 +118,13 @@ pub fn user_ids(files: &IdFiles, uid: u32, gid: u32) -> Result<DaemonIds, SubidE
     let user = name.map_or_else(|| format!("uid {uid}"), |n| format!("{n} (uid {uid})"));
     let mut firsts = [0u32; 2];
     for (slot, file) in firsts.iter_mut().zip([&files.subuid, &files.subgid]) {
-        let text = std::fs::read_to_string(file).map_err(|source| SubidError::Read {
-            path: file.clone(),
-            source,
-        })?;
-        let first = first_big_range(&text, name, uid).ok_or_else(|| SubidError::Split {
+        // Read once already by the check above.
+        let text = std::fs::read_to_string(file).unwrap_or_default();
+        let first = first_big_range(&text, name, uid);
+        *slot = first.ok_or_else(|| SubidError::Split {
             file: file.clone(),
             user: user.clone(),
         })?;
-        *slot = u32::try_from(first).map_err(|_| SubidError::TooHigh { file: file.clone() })?;
     }
     Ok(DaemonIds {
         uid,
@@ -140,18 +135,19 @@ pub fn user_ids(files: &IdFiles, uid: u32, gid: u32) -> Result<DaemonIds, SubidE
 }
 
 /// The first id of the first entry of subuid-format `text`, for the user `name` (if
-/// known) or `uid`, that holds at least [`MIN_SUBORDINATE_IDS`] ids.
-fn first_big_range(text: &str, name: Option<&str>, uid: u32) -> Option<u64> {
+/// known) or `uid`, that holds at least [`MIN_SUBORDINATE_IDS`] ids and starts below
+/// 2^32, as a user namespace can map.
+fn first_big_range(text: &str, name: Option<&str>, uid: u32) -> Option<u32> {
     let uid = uid.to_string();
     text.lines().find_map(|line| {
         let fields: Vec<&str> = line.trim().split(':').collect();
         let [owner, first, count] = fields[..] else {
             return None;
         };
+        let (first, count) = (first.parse::<u32>().ok()?, count.parse::<u64>().ok()?);
+        let big = count >= MIN_SUBORDINATE_IDS && u64::from(first) + count <= 1 << 32;
         let ours = owner == uid || Some(owner) == name;
-        let (first, count) = (first.parse::<u64>().ok()?, count.parse::<u64>().ok()?);
-        (ours && count >= MIN_SUBORDINATE_IDS && first.checked_add(count)? <= 1 << 32)
-            .then_some(first)
+        (ours && big).then_some(first)
     })
 }
 
@@ -410,5 +406,43 @@ mod tests {
             !matches!(checked, Err(SubidError::Read { .. })),
             "{checked:?}"
         );
+    }
+
+    /// Catches the first usable range not being the one chosen: lines of other users, of
+    /// the wrong shape, too short or past the 32-bit ids are skipped, by name or number.
+    #[test]
+    fn the_first_range_of_enough_ids_is_chosen() {
+        let text = "other:100000:65536\nbad line\nkbf:x:65536\nkbf:300000:100\n\
+                    kbf:4294967295:65536\n990:400000:70000\nkbf:500000:65536\n";
+        assert_eq!(first_big_range(text, Some("kbf"), 990), Some(400_000));
+        assert_eq!(first_big_range("", Some("kbf"), 990), None);
+        assert_eq!(first_big_range("kbf:1:65535\n", None, 990), None);
+        assert_eq!(first_big_range("kbf:1:65536\n", None, 990), None);
+        assert_eq!(first_big_range("990:7:65536\n", None, 990), Some(7));
+    }
+
+    /// Catches the ids a backend maps being read from the wrong user, the wrong file or the
+    /// wrong range, and ranges that are enough only together being taken as one.
+    #[test]
+    fn a_users_ids_are_the_first_of_one_big_range_in_each_file() {
+        let uid_text = "kbf:100000:65536\n";
+        let gid_text = "kbf:200000:70000\n";
+        let ids_files = files("ids", Some(uid_text), Some(gid_text));
+        let ids = user_ids(&ids_files, 990, 991).expect("ids");
+        assert_eq!(
+            ids,
+            DaemonIds {
+                uid: 990,
+                gid: 991,
+                sub_uid: 100_000,
+                sub_gid: 200_000
+            }
+        );
+        let split = "kbf:100000:40000\nkbf:200000:40000\n";
+        let split_files = files("split", Some(split), Some(gid_text));
+        let refused = user_ids(&split_files, 990, 991).expect_err("split");
+        assert!(refused.to_string().contains("no single range"), "{refused}");
+        assert!(refused.to_string().contains("subuid"), "{refused}");
+        assert!(daemon_ids(&IdFiles::in_dir(Path::new("/nonexistent-kbf"))).is_err());
     }
 }

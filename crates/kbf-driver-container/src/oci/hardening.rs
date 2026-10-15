@@ -45,16 +45,18 @@ pub(crate) const CAPABILITIES: [&str; 11] = [
     "CAP_SYS_CHROOT",
 ];
 
-/// [`CAPABILITIES`] as the typed set `oci-spec` takes.
-///
-/// # Errors
-/// A name `oci-spec` does not know (the unit tests check there is none).
-pub(crate) fn held_capabilities() -> Result<HashSet<Capability>, String> {
-    CAPABILITIES.iter().map(|name| capability(name)).collect()
+/// [`CAPABILITIES`] as the typed set `oci-spec` takes. A name it does not know would be
+/// left out, so the unit tests count the set.
+pub(crate) fn held_capabilities() -> HashSet<Capability> {
+    CAPABILITIES
+        .iter()
+        .filter_map(|name| capability(name))
+        .collect()
 }
 
-fn capability(name: &str) -> Result<Capability, String> {
-    serde_json::from_value(Value::String(name.to_owned())).map_err(|e| format!("{name}: {e}"))
+/// The capability `name` (`CAP_...`) names, if `oci-spec` knows it.
+fn capability(name: &str) -> Option<Capability> {
+    serde_json::from_value(Value::String(name.to_owned())).ok()
 }
 
 /// Paths that read as empty or are unreadable inside the container.
@@ -118,13 +120,21 @@ pub(crate) enum SeccompError {
 /// `arch` has no entry in the profile's architecture map, or the profile is malformed
 /// (the unit tests parse it, so only an edit can break that).
 pub(crate) fn seccomp(arch: &str, caps: &[&str]) -> Result<LinuxSeccomp, SeccompError> {
+    from_profile(PROFILE, arch, caps)
+}
+
+fn malformed(what: &str) -> SeccompError {
+    SeccompError::Profile(what.to_owned())
+}
+
+/// [`seccomp`] for the profile text `profile`.
+fn from_profile(profile: &str, arch: &str, caps: &[&str]) -> Result<LinuxSeccomp, SeccompError> {
     let profile: Value =
-        serde_json::from_str(PROFILE).map_err(|e| SeccompError::Profile(e.to_string()))?;
-    let bad = |what: &str| SeccompError::Profile(what.to_owned());
+        serde_json::from_str(profile).map_err(|e| SeccompError::Profile(e.to_string()))?;
     let native = native_arch(arch).ok_or_else(|| SeccompError::Arch(arch.to_owned()))?;
     let map = profile["archMap"]
         .as_array()
-        .ok_or_else(|| bad("no archMap"))?;
+        .ok_or_else(|| malformed("no archMap"))?;
     let entry = map
         .iter()
         .find(|e| e["architecture"] == native)
@@ -137,15 +147,14 @@ pub(crate) fn seccomp(arch: &str, caps: &[&str]) -> Result<LinuxSeccomp, Seccomp
             .flatten()
             .cloned(),
     );
-    let mut syscalls = Vec::new();
-    for call in profile["syscalls"]
+    let calls = profile["syscalls"]
         .as_array()
-        .ok_or_else(|| bad("no syscalls"))?
-    {
-        if applies(call, arch, caps) {
-            syscalls.push(resolved(call));
-        }
-    }
+        .ok_or_else(|| malformed("no syscalls"))?;
+    let syscalls: Vec<Value> = calls
+        .iter()
+        .filter(|call| applies(call, arch, caps))
+        .map(resolved)
+        .collect();
     let section = json!({
         "defaultAction": profile["defaultAction"],
         "defaultErrnoRet": profile["defaultErrnoRet"],
@@ -316,13 +325,69 @@ mod tests {
         assert!(calls.iter().any(|c| c["errnoRet"] == 1), "an EPERM entry");
     }
 
-    /// Catches a capability name `oci-spec` would not take (a typo in the list) and a
-    /// held set that is not the eleven.
+    /// Catches a capability name `oci-spec` would not take (a typo in the list, which
+    /// would leave the capability out), and a held set that is not the eleven.
     #[test]
     fn the_capability_names_are_oci_specs() {
-        assert_eq!(held_capabilities().expect("known names").len(), 11);
-        let refused = capability("CAP_NOT_ONE").expect_err("unknown");
-        assert!(refused.starts_with("CAP_NOT_ONE: "), "{refused}");
+        assert_eq!(held_capabilities().len(), CAPABILITIES.len());
+        assert_eq!(CAPABILITIES.len(), 11);
+        assert!(capability("CAP_CHOWN").is_some());
+        assert!(capability("CAP_NOT_ONE").is_none());
+    }
+
+    /// Catches a malformed profile, or a node the profile has no filter for, producing a
+    /// section or panicking instead of saying which: text that is not JSON, no `archMap`,
+    /// the architecture missing from it, no `syscalls`, and a profile `oci-spec` cannot
+    /// read as a section (no default action).
+    #[test]
+    fn a_profile_that_cannot_be_used_says_why() {
+        let why = |profile: &str, arch: &str| {
+            from_profile(profile, arch, &[])
+                .expect_err("unusable")
+                .to_string()
+        };
+        assert!(why("not json", "amd64").starts_with("the pinned seccomp profile: "));
+        assert_eq!(why("{}", "amd64"), "the pinned seccomp profile: no archMap");
+        assert_eq!(
+            why(r#"{"archMap":[]}"#, "amd64"),
+            "the seccomp profile has no filter for architecture \"amd64\""
+        );
+        let arch = r#"{"archMap":[{"architecture":"SCMP_ARCH_X86_64"}]}"#;
+        assert_eq!(
+            why(arch, "amd64"),
+            "the pinned seccomp profile: no syscalls"
+        );
+        let no_default = r#"{"archMap":[{"architecture":"SCMP_ARCH_X86_64"}],"syscalls":[]}"#;
+        assert!(why(no_default, "amd64").starts_with("the pinned seccomp profile: "));
+        assert_eq!(
+            why(PROFILE, "riscv64"),
+            "the seccomp profile has no filter for architecture \"riscv64\""
+        );
+    }
+
+    /// Catches an entry's `includes` and `excludes` read wrongly, each of the four
+    /// filters on its own: an arch the entry is for, an arch it excludes, a capability
+    /// it needs, a capability that rules it out.
+    #[test]
+    fn an_entry_applies_by_architecture_and_capability() {
+        let call = |filters: Value| {
+            let mut call = json!({"names": ["x"], "action": "SCMP_ACT_ALLOW"});
+            call["includes"] = filters["includes"].clone();
+            call["excludes"] = filters["excludes"].clone();
+            call
+        };
+        let applies_to = |filters: Value, caps: &[&str]| applies(&call(filters), "amd64", caps);
+        assert!(applies_to(json!({}), &[]));
+        assert!(applies_to(json!({"includes": {"arches": ["amd64"]}}), &[]));
+        assert!(!applies_to(json!({"includes": {"arches": ["arm64"]}}), &[]));
+        assert!(!applies_to(json!({"excludes": {"arches": ["amd64"]}}), &[]));
+        assert!(applies_to(json!({"excludes": {"arches": ["arm64"]}}), &[]));
+        let needs = json!({"includes": {"caps": ["CAP_A"]}});
+        assert!(applies_to(needs.clone(), &["CAP_A", "CAP_B"]));
+        assert!(!applies_to(needs, &["CAP_B"]));
+        let rules_out = json!({"excludes": {"caps": ["CAP_A"]}});
+        assert!(applies_to(rules_out.clone(), &["CAP_B"]));
+        assert!(!applies_to(rules_out, &["CAP_A"]));
     }
 
     /// The architecture a node reports is one the profile covers.

@@ -102,6 +102,10 @@ impl Images {
         let stage = self.dir.join(format!("{STAGE_PREFIX}{hex}-{}", unique()));
         let tar = stage.with_extension("tar");
         at(&self.dir, tokio::fs::create_dir_all(&self.dir).await)?;
+        // Searched by the container's ids on the way to an image's root, whatever umask
+        // the daemon runs under.
+        let open = std::fs::Permissions::from_mode(0o755);
+        at(&self.dir, tokio::fs::set_permissions(&self.dir, open).await)?;
         let unpacked = self.unpack_into(oci, image, &stage, &tar).await;
         let _ = tokio::fs::remove_file(&tar).await;
         if unpacked.is_err() {
@@ -110,8 +114,8 @@ impl Images {
         }
         unpacked?;
         // The stage was open to the container's root; the image directory is not.
-        let open = std::fs::Permissions::from_mode(0o755);
-        at(&stage, tokio::fs::set_permissions(&stage, open).await)?;
+        let closed = std::fs::Permissions::from_mode(0o755);
+        at(&stage, tokio::fs::set_permissions(&stage, closed).await)?;
         let finished = self.dir.join(&hex);
         at(&finished, tokio::fs::rename(&stage, &finished).await)
     }

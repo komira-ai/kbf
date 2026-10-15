@@ -4,17 +4,19 @@
 //! line here (the table is in [`action_config`]'s documentation), and what Podman adds
 //! on its own is [`hardening`](super::hardening).
 
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use oci_spec::OciSpecError;
 use oci_spec::runtime::{
-    LinuxBuilder, LinuxCapabilitiesBuilder, LinuxNamespaceBuilder, LinuxNamespaceType,
-    LinuxPidsBuilder, LinuxResourcesBuilder, Mount, MountBuilder, PosixRlimitBuilder,
-    PosixRlimitType, ProcessBuilder, RootBuilder, Spec, SpecBuilder, UserBuilder,
+    LinuxBuilder, LinuxCapabilitiesBuilder, LinuxNamespace, LinuxNamespaceBuilder,
+    LinuxNamespaceType, LinuxPidsBuilder, LinuxResourcesBuilder, Mount, MountBuilder, PosixRlimit,
+    PosixRlimitBuilder, PosixRlimitType, ProcessBuilder, RootBuilder, Spec, SpecBuilder,
+    UserBuilder,
 };
 
 use super::hardening::{
-    CAPABILITIES, MASKED_PATHS, READONLY_PATHS, SeccompError, held_capabilities,
+    CAPABILITIES, MASKED_PATHS, READONLY_PATHS, SeccompError, held_capabilities, seccomp,
 };
 use crate::podman::{ContainerSpec, EXEC_ROOT};
 use crate::subids::DaemonIds;
@@ -49,20 +51,44 @@ pub(crate) const OVERLAY_OPTIONS: &str =
 /// Why a configuration could not be built.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum SpecError {
-    #[error("config.json: {0}")]
-    Build(#[from] OciSpecError),
     #[error(transparent)]
     Seccomp(#[from] SeccompError),
-    #[error("config.json: {0}")]
-    Capability(String),
     #[error("config.json: {0}")]
     Json(#[from] serde_json::Error),
 }
 
-impl From<SpecError> for String {
-    fn from(error: SpecError) -> Self {
-        error.to_string()
-    }
+/// What a builder of `oci-spec` makes. Every type here has a default for each field, so
+/// `build()` cannot fail; the default is only what a failure would give.
+pub(crate) fn built<T: Default>(made: Result<T, OciSpecError>) -> T {
+    made.unwrap_or_default()
+}
+
+pub(crate) fn strings(options: &[&str]) -> Vec<String> {
+    options.iter().map(|s| (*s).to_owned()).collect()
+}
+
+/// A bind mount of `source` at `destination`.
+pub(crate) fn bind(source: &Path, destination: &str, options: &[&str]) -> Mount {
+    built(
+        MountBuilder::default()
+            .destination(destination)
+            .typ("bind")
+            .source(source)
+            .options(strings(options))
+            .build(),
+    )
+}
+
+/// A mount of the filesystem `typ` at `destination`.
+pub(crate) fn filesystem(destination: &str, typ: &str, options: &[&str]) -> Mount {
+    built(
+        MountBuilder::default()
+            .destination(destination)
+            .typ(typ)
+            .source(typ)
+            .options(strings(options))
+            .build(),
+    )
 }
 
 /// Where a lease's container is made and what it sees of the node.
@@ -78,40 +104,18 @@ pub(crate) struct Placement<'a> {
     pub arch: &'a str,
 }
 
-/// A bind mount.
-fn bind(source: &Path, destination: &str, options: &[&str]) -> Result<Mount, OciSpecError> {
-    MountBuilder::default()
-        .destination(destination)
-        .typ("bind")
-        .source(source)
-        .options(strings(options))
-        .build()
-}
-
-fn strings(options: &[&str]) -> Vec<String> {
-    options.iter().map(|s| (*s).to_owned()).collect()
-}
-
-fn filesystem(destination: &str, typ: &str, options: &[&str]) -> Result<Mount, OciSpecError> {
-    MountBuilder::default()
-        .destination(destination)
-        .typ(typ)
-        .source(typ)
-        .options(strings(options))
-        .build()
-}
-
 /// The mounts of an action: the standard ones of `crun spec --rootless`, the hosts file,
 /// the exec-root overlay, the shared trees read-only inside it, and [`WRITABLE`].
-fn mounts(spec: &ContainerSpec) -> Result<Vec<Mount>, OciSpecError> {
+fn mounts(spec: &ContainerSpec) -> Vec<Mount> {
     let shm = format!("size={}m", spec.limits.shm_mib);
+    let open = ["rbind", "ro", "nosuid", "noexec", "nodev"];
     let mut mounts = vec![
-        filesystem("/proc", "proc", &["nosuid", "noexec", "nodev"])?,
+        filesystem("/proc", "proc", &["nosuid", "noexec", "nodev"]),
         filesystem(
             "/dev",
             "tmpfs",
             &["nosuid", "strictatime", "mode=755", "size=65536k"],
-        )?,
+        ),
         filesystem(
             "/dev/pts",
             "devpts",
@@ -122,30 +126,24 @@ fn mounts(spec: &ContainerSpec) -> Result<Vec<Mount>, OciSpecError> {
                 "ptmxmode=0666",
                 "mode=0620",
             ],
-        )?,
-        MountBuilder::default()
-            .destination("/dev/shm")
-            .typ("tmpfs")
-            .source("shm")
-            .options(strings(&["nosuid", "noexec", "nodev", "mode=1777", &shm]))
-            .build()?,
-        filesystem("/dev/mqueue", "mqueue", &["nosuid", "noexec", "nodev"])?,
-        filesystem("/sys", "sysfs", &["nosuid", "noexec", "nodev", "ro"])?,
+        ),
+        built(
+            MountBuilder::default()
+                .destination("/dev/shm")
+                .typ("tmpfs")
+                .source("shm")
+                .options(strings(&["nosuid", "noexec", "nodev", "mode=1777", &shm]))
+                .build(),
+        ),
+        filesystem("/dev/mqueue", "mqueue", &["nosuid", "noexec", "nodev"]),
+        filesystem("/sys", "sysfs", &["nosuid", "noexec", "nodev", "ro"]),
         filesystem(
             "/sys/fs/cgroup",
             "cgroup",
             &["nosuid", "noexec", "nodev", "relatime", "ro"],
-        )?,
-        bind(
-            &spec.dir.join("etc/hosts"),
-            "/etc/hosts",
-            &["rbind", "ro", "nosuid", "noexec", "nodev"],
-        )?,
-        bind(
-            &spec.dir.join("etc/hostname"),
-            "/etc/hostname",
-            &["rbind", "ro", "nosuid", "noexec", "nodev"],
-        )?,
+        ),
+        bind(&spec.dir.join("etc/hosts"), "/etc/hosts", &open),
+        bind(&spec.dir.join("etc/hostname"), "/etc/hostname", &open),
     ];
     let overlay = format!(
         "lowerdir={},upperdir={},workdir={},{OVERLAY_OPTIONS}",
@@ -153,52 +151,53 @@ fn mounts(spec: &ContainerSpec) -> Result<Vec<Mount>, OciSpecError> {
         spec.upper.display(),
         spec.overlay_work.display(),
     );
-    mounts.push(
+    mounts.push(built(
         MountBuilder::default()
             .destination(EXEC_ROOT)
             .typ("overlay")
             .source("overlay")
             .options(vec![overlay, "nosuid".to_owned(), "nodev".to_owned()])
-            .build()?,
-    );
+            .build(),
+    ));
     // After the overlay, which they are mounted inside: each read-only, with the flags
     // a child user namespace cannot relax.
-    for shared in &spec.shared_mounts {
+    for shared in &spec.shared {
+        let destination = format!("{EXEC_ROOT}/{}", shared.path);
         mounts.push(bind(
             &shared.source,
-            &format!("{EXEC_ROOT}/{}", shared.destination),
+            &destination,
             &["rbind", "ro", "nosuid", "nodev"],
-        )?);
+        ));
     }
     for (name, destination) in WRITABLE {
+        let source = spec.dir.join(WRITABLE_DIR).join(name);
         mounts.push(bind(
-            &spec.dir.join(WRITABLE_DIR).join(name),
+            &source,
             destination,
             &["rbind", "rw", "nosuid", "nodev"],
-        )?);
+        ));
     }
-    Ok(mounts)
+    mounts
 }
 
-fn rlimit(
-    typ: PosixRlimitType,
-    value: u64,
-) -> Result<oci_spec::runtime::PosixRlimit, OciSpecError> {
-    PosixRlimitBuilder::default()
-        .typ(typ)
-        .hard(value)
-        .soft(value)
-        .build()
+fn rlimit(typ: PosixRlimitType, value: u64) -> PosixRlimit {
+    built(
+        PosixRlimitBuilder::default()
+            .typ(typ)
+            .hard(value)
+            .soft(value)
+            .build(),
+    )
 }
 
 /// The namespaces a container gets, each new: the same six Podman gives an action
 /// (`--network=none` leaves the network namespace with loopback only) and a private
 /// cgroup namespace.
-pub(crate) fn namespaces() -> Result<Vec<oci_spec::runtime::LinuxNamespace>, OciSpecError> {
+pub(crate) fn namespaces() -> Vec<LinuxNamespace> {
     use LinuxNamespaceType::{Cgroup, Ipc, Mount, Network, Pid, User, Uts};
     [Pid, Network, Ipc, Uts, User, Cgroup, Mount]
         .into_iter()
-        .map(|typ| LinuxNamespaceBuilder::default().typ(typ).build())
+        .map(|typ| built(LinuxNamespaceBuilder::default().typ(typ).build()))
         .collect()
 }
 
@@ -232,91 +231,102 @@ pub(crate) fn environment(env: &[(String, String)]) -> Vec<String> {
 /// | `--volume root:/kbf/root:O,...`          | an `overlay` mount at `/kbf/root`                  |
 ///
 /// No memory or CPU limit is set here: the lease cgroup carries them.
+///
+/// # Errors
+/// The seccomp profile cannot be resolved for the node's architecture.
 pub(crate) fn action_config(
     spec: &ContainerSpec,
     placement: &Placement<'_>,
 ) -> Result<Spec, SpecError> {
-    let held = held_capabilities().map_err(SpecError::Capability)?;
-    let capabilities = LinuxCapabilitiesBuilder::default()
-        .bounding(held.clone())
-        .effective(held.clone())
-        .permitted(held)
-        .inheritable(std::collections::HashSet::new())
-        .ambient(std::collections::HashSet::new())
-        .build()?;
+    let held = held_capabilities();
+    let capabilities = built(
+        LinuxCapabilitiesBuilder::default()
+            .bounding(held.clone())
+            .effective(held.clone())
+            .permitted(held)
+            .inheritable(HashSet::new())
+            .ambient(HashSet::new())
+            .build(),
+    );
     let cwd = if spec.working_directory.is_empty() {
         EXEC_ROOT.to_owned()
     } else {
         format!("{EXEC_ROOT}/{}", spec.working_directory)
     };
-    let process = ProcessBuilder::default()
-        .terminal(false)
-        .user(UserBuilder::default().uid(0u32).gid(0u32).build()?)
-        .args(spec.argv.clone())
-        .env(environment(&spec.env))
-        .cwd(PathBuf::from(cwd))
-        .capabilities(capabilities)
-        .rlimits(vec![
-            rlimit(PosixRlimitType::RlimitNofile, spec.limits.nofile)?,
-            rlimit(PosixRlimitType::RlimitNproc, spec.limits.nproc)?,
-        ])
-        .no_new_privileges(false)
-        .oom_score_adj(0)
-        .build()?;
+    let process = built(
+        ProcessBuilder::default()
+            .terminal(false)
+            .user(built(UserBuilder::default().uid(0u32).gid(0u32).build()))
+            .args(spec.argv.clone())
+            .env(environment(&spec.env))
+            .cwd(PathBuf::from(cwd))
+            .capabilities(capabilities)
+            .rlimits(vec![
+                rlimit(PosixRlimitType::RlimitNofile, spec.limits.nofile),
+                rlimit(PosixRlimitType::RlimitNproc, spec.limits.nproc),
+            ])
+            .no_new_privileges(false)
+            .oom_score_adj(0)
+            .build(),
+    );
     let (uids, gids) = placement.ids.action_mappings();
-    let resources = LinuxResourcesBuilder::default()
-        .pids(
-            LinuxPidsBuilder::default()
-                .limit(i64::try_from(spec.limits.pids).unwrap_or(i64::MAX))
-                .build()?,
-        )
-        .unified(std::collections::HashMap::from([(
-            "memory.oom.group".to_owned(),
-            "1".to_owned(),
-        )]))
-        .build()?;
-    let linux = LinuxBuilder::default()
-        .uid_mappings(uids)
-        .gid_mappings(gids)
-        .namespaces(namespaces()?)
-        .cgroups_path(PathBuf::from(format!("{}/ctr", placement.cgroup)))
-        .resources(resources)
-        .seccomp(super::hardening::seccomp(placement.arch, &CAPABILITIES)?)
-        .masked_paths(strings(&MASKED_PATHS))
-        .readonly_paths(strings(&READONLY_PATHS))
-        .build()?;
-    Ok(SpecBuilder::default()
-        .version(OCI_VERSION)
-        .root(
-            RootBuilder::default()
-                .path(placement.rootfs)
-                .readonly(true)
-                .build()?,
-        )
-        .hostname(HOSTNAME)
-        .process(process)
-        .mounts(mounts(spec)?)
-        .linux(linux)
-        .build()?)
+    let pids = built(
+        LinuxPidsBuilder::default()
+            .limit(i64::try_from(spec.limits.pids).unwrap_or(i64::MAX))
+            .build(),
+    );
+    let unified = HashMap::from([("memory.oom.group".to_owned(), "1".to_owned())]);
+    let resources = built(
+        LinuxResourcesBuilder::default()
+            .pids(pids)
+            .unified(unified)
+            .build(),
+    );
+    let linux = built(
+        LinuxBuilder::default()
+            .uid_mappings(uids)
+            .gid_mappings(gids)
+            .namespaces(namespaces())
+            .cgroups_path(PathBuf::from(format!("{}/ctr", placement.cgroup)))
+            .resources(resources)
+            .seccomp(seccomp(placement.arch, &CAPABILITIES)?)
+            .masked_paths(strings(&MASKED_PATHS))
+            .readonly_paths(strings(&READONLY_PATHS))
+            .build(),
+    );
+    let root = built(
+        RootBuilder::default()
+            .path(placement.rootfs)
+            .readonly(true)
+            .build(),
+    );
+    Ok(built(
+        SpecBuilder::default()
+            .version(OCI_VERSION)
+            .root(root)
+            .hostname(HOSTNAME)
+            .process(process)
+            .mounts(mounts(spec))
+            .linux(linux)
+            .build(),
+    ))
 }
 
 /// The bytes of `config.json`: the spec as pretty JSON with keys in sorted order and
 /// each capability set sorted (`oci-spec` holds them in hash sets, whose order changes
 /// from run to run), and a newline: the same bytes for the same spec, so a golden file
 /// can pin them.
+///
+/// # Errors
+/// The spec cannot be written as JSON (it can always).
 pub(crate) fn render(config: &Spec) -> Result<Vec<u8>, SpecError> {
     let mut value = serde_json::to_value(config)?;
-    for set in [
-        "bounding",
-        "effective",
-        "permitted",
-        "inheritable",
-        "ambient",
-    ] {
-        if let Some(caps) = value["process"]["capabilities"][set].as_array_mut() {
-            caps.sort_by(|a, b| a.as_str().cmp(&b.as_str()));
-        }
-    }
+    value["process"]["capabilities"]
+        .as_object_mut()
+        .into_iter()
+        .flat_map(|sets| sets.values_mut())
+        .filter_map(|set| set.as_array_mut())
+        .for_each(|set| set.sort_by(|a, b| a.as_str().cmp(&b.as_str())));
     let mut bytes = serde_json::to_vec_pretty(&value)?;
     bytes.push(b'\n');
     Ok(bytes)
@@ -398,14 +408,14 @@ mod tests {
     #[test]
     fn shared_mounts_are_read_only_inside_the_overlay() {
         let mut spec = spec();
-        spec.shared_mounts = vec![
+        spec.shared = vec![
             SharedMount {
                 source: PathBuf::from("/scratch/trees/aa"),
-                destination: "external/toolchain".to_owned(),
+                path: "external/toolchain".to_owned(),
             },
             SharedMount {
                 source: PathBuf::from("/scratch/trees/bb"),
-                destination: "lib".to_owned(),
+                path: "lib".to_owned(),
             },
         ];
         let config = config_of(&spec);
@@ -416,7 +426,7 @@ mod tests {
             ("/kbf/root/external/toolchain", "/scratch/trees/aa"),
             ("/kbf/root/lib", "/scratch/trees/bb"),
         ] {
-            let position = at(dest).unwrap_or_else(|| panic!("no mount at {dest}"));
+            let position = at(dest).expect("a mount of the shared tree");
             assert!(overlay < position, "{dest} before the overlay");
             let mount = &mounts[position];
             assert_eq!(mount["source"], source);
@@ -428,7 +438,8 @@ mod tests {
                 .map(|o| o.as_str().expect("str"))
                 .collect();
             assert!(options.contains(&"ro"), "{dest}: {options:?}");
-            assert!(options.contains(&"nosuid") && options.contains(&"nodev"));
+            assert!(options.contains(&"nosuid"));
+            assert!(options.contains(&"nodev"));
             assert!(!options.contains(&"rw"), "{dest}: {options:?}");
         }
         // No shared mount, no extra mount: the reference config has none.
@@ -492,6 +503,7 @@ mod tests {
         );
         let resources = &config["linux"]["resources"];
         assert_eq!(resources["pids"], json!({"limit": 101}));
-        assert!(resources.get("memory").is_none() && resources.get("cpu").is_none());
+        assert!(resources.get("memory").is_none());
+        assert!(resources.get("cpu").is_none());
     }
 }
