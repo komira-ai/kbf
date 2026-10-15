@@ -304,9 +304,11 @@ async fn the_unpacked_image_is_owned_by_the_containers_ids() {
 /// Directory nodes of an input root from the tree store, not link them.
 fn with_trees(config: &mut kbf_driver_container::PodmanConfig) {
     let dir = PathBuf::from(format!("{}-cache", config.scratch.display()));
+    support::force_remove(&dir);
     std::fs::create_dir_all(&dir).expect("cache dir");
     let cache = kbf_daemon::cache::CacheConfig::new(dir, config.scratch.clone(), 1 << 30);
     let trees = PathBuf::from(format!("{}-trees", config.scratch.display()));
+    support::force_remove(&trees);
     let mut trees = kbf_daemon::trees::TreeConfig::new(trees, 1 << 30);
     trees.min_files = 20;
     config.cache = Some(kbf_driver_container::CacheUse {
