@@ -386,6 +386,13 @@ impl<F: Fs> RaftMetaLog<F> {
         self.shared.lock().machine().version()
     }
 
+    /// How many servers vote in the log's cell: its Raft membership's voters. One
+    /// for every log this version opens.
+    #[must_use]
+    pub fn voters(&self) -> usize {
+        self.shared.lock().core().membership().voters().count()
+    }
+
     /// How many `Bootstrap` entries the log held when it opened, the one it may have
     /// just committed included. One for every log this version writes.
     #[must_use]

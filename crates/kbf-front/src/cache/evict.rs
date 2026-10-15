@@ -13,6 +13,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime};
 
@@ -20,7 +21,7 @@ use kbf_meta::{Applied, Command, ObjectId};
 use kbf_objstore::{FsStore, ObjectStore, Room};
 use tokio::time::Instant;
 
-use super::{Cache, CacheError, EVICT_BATCH, HeldObject, unexpected};
+use super::{Cache, CacheError, EVICT_BATCH, EvictReady, HeldObject, NEEDS_V3, unexpected};
 use crate::meta_log::{MetaLog, MetaLogError};
 
 /// How long after its last use an object is never evicted: a client told a blob is
@@ -36,9 +37,10 @@ const EVICTED: &str =
     "evicted the least recently used objects: the blob directory is short of room";
 
 /// When each object of the store was last used. Off (and empty) until
-/// [`Cache::track_recency`].
+/// [`Cache::track_recency`]. Also whether the evictor has said it is off for want of
+/// log version 3 ([`EvictReady::NeedsV3`]), which it says once.
 #[derive(Debug, Default)]
-pub(super) struct Recency(Mutex<Option<Clock>>);
+pub(super) struct Recency(Mutex<Option<Clock>>, AtomicBool);
 
 #[derive(Debug, Default)]
 struct Clock {
@@ -128,6 +130,11 @@ impl Recency {
         chosen
     }
 
+    /// Whether this is the first round off for want of log version 3.
+    fn first_off(&self) -> bool {
+        !self.1.swap(true, Ordering::Relaxed)
+    }
+
     /// Drops `object`, evicted. Only an evictor calls it, so recency is on.
     fn forget(&self, object: ObjectId) {
         for clock in self.lock().iter_mut() {
@@ -152,8 +159,12 @@ pub struct EvictRound {
     /// Action-cache entries removed because they needed one of those blobs.
     pub actions: u64,
     /// The bytes of the shortfall no object could cover: every other object was used
-    /// within the grace window, staged, or of unknown length.
+    /// within the grace window, staged, or of unknown length; or the whole shortfall,
+    /// if eviction is off.
     pub short: u64,
+    /// The voters of a cell whose log does not take [`Command::EvictObjects`] yet
+    /// ([`EvictReady::NeedsV3`]): eviction is off, nothing was evicted.
+    pub needs_v3: Option<usize>,
 }
 
 impl fmt::Display for EvictRound {
@@ -166,6 +177,7 @@ impl fmt::Display for EvictRound {
             blobs,
             actions,
             short,
+            needs_v3: _,
         } = self;
         write!(
             f,
@@ -215,7 +227,11 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
     /// [`EVICT_BATCH`], after `ready_to_evict` readies the log for the command, and
     /// only then are their files deleted: a crash between the two leaves an orphan
     /// file, which the next start-up pass deletes, never an index entry without its
-    /// file. Logs what it evicted, if anything.
+    /// file. Logs what it evicted, if anything. If `ready_to_evict` answers
+    /// [`EvictReady::NeedsV3`], nothing is evicted (an index entry must go before its
+    /// file, which takes the command), the round says so, and the first such round of
+    /// this cache logs [`NEEDS_V3`]; writes stay refused under the floor until a
+    /// round under a log that takes the command frees room.
     ///
     /// # Errors
     /// The file system cannot be asked, the metadata log fails or refuses to be
@@ -224,7 +240,7 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         &self,
         files: &FsStore,
         grace: Duration,
-        ready_to_evict: fn(&M) -> Result<(), MetaLogError>,
+        ready_to_evict: fn(&M) -> Result<EvictReady, MetaLogError>,
     ) -> Result<EvictRound, CacheError> {
         let Room { available, floor } = files.room()?;
         let target = floor.saturating_mul(2);
@@ -246,8 +262,14 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
             .recency
             .choose(Instant::now(), grace, shortfall, &staged);
         round.short = shortfall.saturating_sub(chosen.iter().map(|(_, len)| len).sum());
-        if !chosen.is_empty() {
-            ready_to_evict(&self.writer.meta)?;
+        if !chosen.is_empty()
+            && let EvictReady::NeedsV3 { voters } = ready_to_evict(&self.writer.meta)?
+        {
+            if self.writer.recency.first_off() {
+                tracing::warn!(voters, "{NEEDS_V3}: eviction off");
+            }
+            (round.short, round.needs_v3) = (shortfall, Some(voters));
+            return Ok(round);
         }
         for batch in chosen.chunks(EVICT_BATCH) {
             let objects = batch.iter().map(|(id, _)| *id).collect();

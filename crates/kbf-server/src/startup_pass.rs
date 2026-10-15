@@ -10,7 +10,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use kbf_front::{Cache, EVICT_EVERY, MetaLog, MetaLogError, PASS_OPENS_PER_SEC};
+use kbf_front::{Cache, EVICT_EVERY, EvictReady, MetaLog, MetaLogError, PASS_OPENS_PER_SEC};
 use kbf_log::MachineVersion;
 use kbf_objstore::{FsStore, ObjectStore};
 
@@ -27,9 +27,9 @@ const ROUND_FAILED: &str = "eviction round failed; the next one tries again";
 /// evictor after it.
 pub(crate) struct StartPass<M> {
     files: FsStore,
-    /// Readies the log for `EvictObjects`, called only when there is something to
-    /// forget.
-    ready_to_evict: fn(&M) -> Result<(), MetaLogError>,
+    /// Readies the log for `EvictObjects`, if it may, called only when there is
+    /// something to forget.
+    ready_to_evict: fn(&M) -> Result<EvictReady, MetaLogError>,
     /// How long after its last use an object is never evicted.
     grace: Duration,
     /// What the pass waits for before it starts: nothing in the server; a test holds
@@ -37,11 +37,27 @@ pub(crate) struct StartPass<M> {
     hold: Pin<Box<dyn Future<Output = ()> + Send>>,
 }
 
-/// Readies a Raft log for `EvictObjects`: raises it to machine version 3, whose
-/// format carries the command, the first time something is to be forgotten; a log
+/// Readies a Raft log for `EvictObjects` ([`ready_among`] its own voters).
+fn ready_to_evict(log: &RaftMetaLog) -> Result<EvictReady, MetaLogError> {
+    ready_among(log, log.voters())
+}
+
+/// Whether a Raft log in a cell of `voters` voters takes `EvictObjects`: one at
+/// machine version 3 (whose format carries the command) does. One below it is raised
+/// to it here only if `voters` is one (a single-host farm): a raise in a cell of more
+/// would make every replica that does not run version 3 yet refuse the log, so there
+/// the operator raises it once every replica does, and until then the answer is
+/// [`EvictReady::NeedsV3`]. Called only when something is to be forgotten, so a log
 /// with nothing to forget stays one an older binary reads.
-fn ready_to_evict(log: &RaftMetaLog) -> Result<(), MetaLogError> {
-    log.raise_machine_version(MachineVersion::V3)
+fn ready_among(log: &RaftMetaLog, voters: usize) -> Result<EvictReady, MetaLogError> {
+    if log.machine_version() >= MachineVersion::V3 {
+        return Ok(EvictReady::Ready);
+    }
+    if voters > 1 {
+        return Ok(EvictReady::NeedsV3 { voters });
+    }
+    log.raise_machine_version(MachineVersion::V3)?;
+    Ok(EvictReady::Ready)
 }
 
 impl StartPass<RaftMetaLog> {
@@ -96,6 +112,7 @@ pub(crate) fn spawn<M: MetaLog, O: ObjectStore + 'static>(
                     evicted_objects = report.evicted_objects,
                     evicted_blobs = report.evicted_blobs,
                     evicted_actions = report.evicted_actions,
+                    marked_missing = report.marked_missing,
                     withheld = report.withheld,
                     held_bytes = report.held_bytes(),
                     duration_ms = report.duration.as_millis() as u64,
@@ -117,13 +134,13 @@ pub(crate) fn spawn<M: MetaLog, O: ObjectStore + 'static>(
 #[cfg(test)]
 mod tests {
     use std::io;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Mutex, PoisonError};
     use std::time::Duration;
 
     use bytes::Bytes;
     use clap::Parser;
-    use kbf_front::EVICT_GRACE;
+    use kbf_front::{EVICT_GRACE, NEEDS_V3};
     use kbf_meta::{Applied, Command, Epoch, Location, ObjectId, Retention, StoreId};
     use kbf_objstore::{Floor, KeyPrefix, ObjectKey, Space};
     use kbf_proto::reapi::content_addressable_storage_client::ContentAddressableStorageClient;
@@ -256,6 +273,117 @@ mod tests {
         }
         serving.abort();
         drop(files);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Catches a pass that raises the log's machine version in a cell of more than
+    /// one voter (mutant: always raise), which would make every replica that does not
+    /// run version 3 yet refuse the log; one that forgets there anyway, or marks
+    /// nothing missing; and one that logs the refusal per object (mutant: in the
+    /// loop) rather than once. Three voters: the log stays at version 1, the two lost
+    /// objects' blobs read as missing and one line says so. Once the operator raises
+    /// the log, the next pass forgets them.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_cell_of_three_marks_missing_until_the_operator_raises() {
+        let logs = Capture::waiting_for(PASS_LINES);
+        let _default = logs.subscribe();
+        let root =
+            std::env::temp_dir().join(format!("kbf-server-pass-three-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let files = FsStore::open(&root.join("blobs"), Floor::Bytes(1)).expect("open the store");
+        let meta = RaftMetaLog::open_dir(&root.join("raft"), Retention::default(), "kbf/")
+            .await
+            .expect("open the log");
+        assert_eq!(
+            meta.commit(Command::AllocEpoch).await,
+            Ok(Applied::Epoch(Epoch::new(1)))
+        );
+        let prefix = meta.store_prefix();
+        let at = |seq| Location {
+            store: StoreId::CONFIGURED,
+            object: ObjectId::new(Epoch::new(1), seq),
+            offset: 0,
+        };
+        let [lost, gone, kept] = [b"lost", b"gone", b"kept"].map(|t| kbf_segments::sha256(t));
+        let put = meta.commit(Command::PutBlobs(vec![
+            (lost, at(1)),
+            (gone, at(3)),
+            (kept, at(2)),
+        ]));
+        assert!(matches!(put.await, Ok(Applied::Blobs(Ok(_)))));
+        let body = Bytes::from_static(b"some bytes");
+        let planted = files.put_new(&object_key(&prefix, 2), body, None).await;
+        planted.expect("plant");
+        let cache = Arc::new(
+            Cache::open(meta, files.clone(), prefix)
+                .await
+                .expect("a cache"),
+        );
+        let three = || StartPass {
+            files: files.clone(),
+            ready_to_evict: |log| ready_among(log, 3),
+            grace: EVICT_GRACE,
+            hold: Box::pin(std::future::ready(())),
+        };
+
+        // The task goes on as the evictor, which has nothing to do here.
+        let task = spawn(Arc::clone(&cache), three());
+        logs.ended().await;
+        task.abort();
+
+        let text = logs.text();
+        assert_eq!(text.matches(NEEDS_V3).count(), 1, "{text}");
+        assert!(
+            text.contains(&format!("{NEEDS_V3}: 2 objects held")),
+            "{text}"
+        );
+        assert!(text.contains("marked_missing=2"), "{text}");
+        assert!(text.contains("evicted_objects=0"), "{text}");
+        assert_eq!(cache.meta().machine_version(), MachineVersion::V1);
+        let present = cache.present(&[lost, gone, kept]).await.expect("present");
+        assert_eq!(present, [false, false, true]);
+        let blobs = cache.meta().query(|s| s.blob_count()).await;
+        assert_eq!(blobs, Ok(3), "forgotten below version 3");
+
+        cache
+            .meta()
+            .raise_machine_version(MachineVersion::V3)
+            .expect("the operator's raise");
+        logs.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
+        let task = spawn(Arc::clone(&cache), three());
+        logs.ended().await;
+        task.abort();
+
+        let text = logs.text();
+        assert!(!text.contains(NEEDS_V3), "{text}");
+        assert!(text.contains("evicted_objects=2"), "{text}");
+        let blobs = cache.meta().query(|s| s.blob_count()).await;
+        assert_eq!(blobs, Ok(1));
+        drop((cache, files));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Catches a readiness that counts the log at version 3 as not ready in a cell of
+    /// many (mutant: the version check dropped), or the boundary moved (mutants: `>= 1`
+    /// or `> 2` for `> 1`): two voters need the operator, one is raised here.
+    #[tokio::test(flavor = "current_thread")]
+    async fn only_a_single_voter_is_raised_here() {
+        let root =
+            std::env::temp_dir().join(format!("kbf-server-pass-voters-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let log = RaftMetaLog::open_dir(&root, Retention::default(), "kbf/")
+            .await
+            .expect("open the log");
+        let two = ready_among(&log, 2);
+        assert_eq!(two, Ok(EvictReady::NeedsV3 { voters: 2 }));
+        assert_eq!(log.machine_version(), MachineVersion::V1);
+        assert_eq!(ready_to_evict(&log), Ok(EvictReady::Ready));
+        assert_eq!(log.machine_version(), MachineVersion::V3);
+        assert_eq!(ready_among(&log, 2), Ok(EvictReady::Ready));
+        drop(log);
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -446,6 +574,82 @@ mod tests {
             text.contains("objects=1 bytes=10 blobs=1 actions=0"),
             "{text}"
         );
+        drop(files);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// How many times [`three_voters_counted`] was asked.
+    static ASKED: AtomicUsize = AtomicUsize::new(0);
+
+    /// [`ready_among`] three voters, counting the rounds that ask.
+    fn three_voters_counted(log: &RaftMetaLog) -> Result<EvictReady, MetaLogError> {
+        ASKED.fetch_add(1, Ordering::Relaxed);
+        ready_among(log, 3)
+    }
+
+    /// Catches an evictor that raises the log's machine version in a cell of more
+    /// than one voter (mutant: always raise), evicts there anyway (mutant: `NeedsV3`
+    /// taken as ready), or says it is off every round (mutant: no once-per-start
+    /// check): with no room and three voters, rounds woken by refused writes evict
+    /// nothing, the log stays at version 1, and one line says eviction is off. Once
+    /// the operator raises the log, the next round evicts.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_evictor_of_a_cell_of_three_waits_for_the_operator() {
+        let logs = Capture::waiting_for(b"evicted the least recently used objects");
+        let _default = logs.subscribe();
+        let (root, files, cache) = short_of_room("evict-three").await;
+        let key = cache
+            .object_key(ObjectId::new(Epoch::new(1), 2))
+            .expect("a key");
+        let refused = cache
+            .object_key(ObjectId::new(Epoch::new(2), 9))
+            .expect("a key");
+        let cache = Arc::new(cache);
+        let pass = StartPass {
+            files: files.clone(),
+            ready_to_evict: three_voters_counted,
+            grace: EVICT_GRACE,
+            hold: Box::pin(std::future::ready(())),
+        };
+        let refuse = || async {
+            let body = Bytes::from_static(b"no room");
+            let put = files.put_new(&refused, body, None).await;
+            assert!(put.is_err(), "{put:?}");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+
+        let task = spawn(Arc::clone(&cache), pass);
+        let rounds = async {
+            while ASKED.load(Ordering::Relaxed) < 3 {
+                refuse().await;
+            }
+        };
+        tokio::time::timeout(BOUND, rounds)
+            .await
+            .expect("three rounds");
+
+        let text = logs.text();
+        assert_eq!(text.matches(NEEDS_V3).count(), 1, "{text}");
+        assert!(
+            text.contains(&format!("{NEEDS_V3}: eviction off")),
+            "{text}"
+        );
+        assert_eq!(cache.meta().machine_version(), MachineVersion::V1);
+        assert!(files.may_hold(&key).await.expect("may_hold"));
+        let kept = kbf_segments::sha256(b"kept");
+        assert_eq!(cache.present(&[kept]).await.expect("present"), [true]);
+
+        cache
+            .meta()
+            .raise_machine_version(MachineVersion::V3)
+            .expect("the operator's raise");
+        refuse().await;
+        logs.ended().await;
+        task.abort();
+
+        assert!(!files.may_hold(&key).await.expect("may_hold"));
+        assert_eq!(cache.present(&[kept]).await.expect("present"), [false]);
+        assert_eq!(logs.text().matches(NEEDS_V3).count(), 1);
         drop(files);
         let _ = std::fs::remove_dir_all(&root);
     }

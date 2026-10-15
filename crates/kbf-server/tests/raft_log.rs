@@ -62,12 +62,15 @@ fn put_blob(epoch: u64) -> Command {
 
 /// Catches: a new log whose id is not the one drawn, or is not recorded before the
 /// store writes; a record in another form than four exact lines; a log that commits no
-/// `Bootstrap`, or a prefix other than `<root><log id>/`.
+/// `Bootstrap`, or a prefix other than `<root><log id>/`; a log that counts other
+/// voters than its one (the start-up pass raises the machine version itself only in a
+/// single-voter cell).
 #[tokio::test]
 async fn a_new_log_records_its_id_and_commits_one_bootstrap() {
     let fs = FaultFs::new();
     let log = open(&fs, 0x2a).await;
     assert_eq!(log.log_id(), id(0x2a));
+    assert_eq!(log.voters(), 1);
     assert_eq!(log.store_prefix().as_str(), "kbf/000000000000002a/");
     assert_eq!(log.bootstraps(), 1);
     let record = fs.contents(RECORD).expect("a record");
