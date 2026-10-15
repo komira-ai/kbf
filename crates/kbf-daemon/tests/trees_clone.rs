@@ -471,6 +471,7 @@ async fn a_tree_that_fails_its_check_is_discarded() {
 /// tree is not rebuilt. `EXDEV` is the same.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_refused_directory_clone_writes_the_trees_files_one_by_one() {
+    let _ = tracing_subscriber::fmt().with_test_writer().try_init();
     for (name, errno) in [("enotsup", libc::ENOTSUP), ("exdev", libc::EXDEV)] {
         let kit = kit(&format!("trees-clone-refused-{name}"), Dirs::Refuse(errno));
         let root = input(&kit, name);
@@ -552,4 +553,87 @@ fn the_delivery_names_itself_and_defaults_by_platform() {
         "Mount"
     };
     assert_eq!(format!("{:?}", Delivery::platform()), want);
+}
+
+/// A root whose tree `tool` holds 300 unique files, two files of one blob and three
+/// symlinks, and a file `beside` of that same blob outside it.
+fn linked(kit: &Kit) -> Digest {
+    let cas = &kit.cas.blobs;
+    let blob = cas.insert(&b"same bytes"[..]);
+    let mut tool = Directory::default();
+    for i in 0..300 {
+        tool.files.push(FileNode {
+            name: format!("f{i:03}"),
+            digest: Some(cas.insert(format!("unique {i}").into_bytes())),
+            ..FileNode::default()
+        });
+    }
+    for name in ["same1", "same2"] {
+        tool.files.push(FileNode {
+            name: name.to_owned(),
+            digest: Some(blob.clone()),
+            ..FileNode::default()
+        });
+    }
+    tool.files.sort_by(|a, b| a.name.cmp(&b.name));
+    tool.symlinks = [
+        ("abs", "/etc/hostname"),
+        ("rel", "f000"),
+        ("up", "../beside"),
+    ]
+    .iter()
+    .map(|(name, target)| SymlinkNode {
+        name: (*name).to_owned(),
+        target: (*target).to_owned(),
+        ..SymlinkNode::default()
+    })
+    .collect();
+    let tool = cas.message(&tool);
+    cas.message(&Directory {
+        files: vec![FileNode {
+            name: "beside".to_owned(),
+            digest: Some(blob),
+            ..FileNode::default()
+        }],
+        directories: vec![DirectoryNode {
+            name: "tool".to_owned(),
+            digest: Some(tool),
+        }],
+        ..Directory::default()
+    })
+}
+
+/// Catches a symlink in a tree turned into a file or followed (the mode walk chmodding
+/// what a link points at, outside the lease), and a blob the tree shares with a file
+/// beside it lost or written twice when the tree falls back to files: with the directory
+/// clone working and refused, the lease's directory is the root's digest (symlinks kept,
+/// every name present), and the links' targets are untouched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn symlinks_stay_links_and_a_shared_blob_is_written_at_every_name() {
+    for (name, dirs) in [
+        ("real", Dirs::Real),
+        ("refused", Dirs::Refuse(libc::ENOTSUP)),
+    ] {
+        let kit = kit(&format!("trees-clone-links-{name}"), dirs);
+        let root = linked(&kit);
+        let (dir, inputs) = kit.lease(&root, "lease-1").await;
+        assert_eq!(
+            inputs.trees_cloned,
+            u64::from(matches!(dirs, Dirs::Real)),
+            "{name}"
+        );
+        assert_eq!(digest_of_dir(&dir), root, "{name}");
+        let link = dir.join("tool/abs");
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            std::fs::read(dir.join("tool/same2")).unwrap(),
+            b"same bytes"
+        );
+        assert_eq!(std::fs::read(dir.join("beside")).unwrap(), b"same bytes");
+    }
 }

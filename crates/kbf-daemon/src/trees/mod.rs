@@ -252,7 +252,7 @@ impl Trees {
                     place::Placed::Refused(why) => {
                         if !self.refusal_logged.swap(true, Ordering::Relaxed) {
                             tracing::warn!(
-                                "trees: the filesystem refused to clone a tree ({why});                                  its files are written one by one"
+                                "trees: the filesystem refused to clone a tree ({why}); its files are written one by one"
                             );
                         }
                         // The tree's node is written as a plain directory: its
