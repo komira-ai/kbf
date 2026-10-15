@@ -209,6 +209,14 @@ impl Drop for Cell {
     fn drop(&mut self) {
         if !std::thread::panicking() {
             let _ = std::fs::remove_dir(&self.cgroup);
+            // The OCI backend's image store holds files the container's ids own; the
+            // user's own `rm` cannot delete them, `podman unshare` can.
+            if self.config.container_runtime == kbf_driver_container::ContainerRuntime::Oci {
+                let _ = Command::new("podman")
+                    .args(["unshare", "rm", "-rf", "--"])
+                    .arg(&self.scratch)
+                    .status();
+            }
             super::force_remove(&self.scratch);
         }
     }

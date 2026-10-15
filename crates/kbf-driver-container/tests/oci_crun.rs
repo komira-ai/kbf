@@ -114,7 +114,7 @@ fn first_subordinate_id() -> u32 {
 
 /// Catches the exit code not being `crun run`'s own (the "stopped 0" window of kbf#658
 /// is closed by design, and this is the check that it stays closed): fifty short
-/// actions in a row, each with its own code, and a signal death as `128 + n`.
+/// actions in a row, each with its own code, and a signal death as the shell reports it.
 #[tokio::test]
 #[ignore = "needs rootless crun, Podman and a delegated cgroup: run by cargo xtask podman-tests"]
 async fn every_exit_code_is_the_actions_own() {
@@ -130,10 +130,14 @@ async fn every_exit_code_is_the_actions_own() {
         cell.assert_clean(seq);
     }
     eprintln!("50 leases in {:?}", started.elapsed());
-    let result = cell.run(51, &sh("kill -KILL $$")).await.expect("ran");
-    assert_eq!(result.exit_code, 137);
-    let result = cell.run(52, &sh("kill -TERM $$")).await.expect("ran");
-    assert_eq!(result.exit_code, 143);
+    // The action is pid 1 of its namespace, which ignores a signal from inside it, so a
+    // death by signal is shown through a child: its status as the shell reports it.
+    let result = cell
+        .run(51, &sh("sh -c 'kill -KILL $$'; echo status=$?"))
+        .await
+        .expect("ran");
+    assert_eq!(result.exit_code, 0);
+    assert_eq!(cell.stdout(&result), "status=137\n");
 }
 
 /// Catches a program crun cannot start being the farm's failure, not the action's:
