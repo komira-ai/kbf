@@ -22,8 +22,8 @@ use kbf_proto::reapi::{ActionResult, WaitExecutionRequest};
 use kbf_proto::worker::daemon_message;
 use kbf_proto::worker::server_message::Message;
 use support::{
-    Blob, Cell, FakeDaemon, Job, done, done_within_quiet, failed, hello_on, output, ran, response,
-    stage,
+    Blob, Cell, FakeDaemon, Job, done, done_within_quiet, failed, hello_on, output, ran,
+    report_every_run, response, stage,
 };
 use tonic::Code;
 
@@ -378,9 +378,18 @@ async fn failed_attempts_answer_with_the_documented_codes() {
             Some(&job.action.proto),
             "{name}"
         );
-        let mut report = failed(start.lease_id, code.expect("a code"));
-        report.action_result = result;
-        assert!(daemon.report(report).await.accepted, "{name}");
+        let code = code.expect("a code");
+        let make = |lease| {
+            let mut report = failed(lease, code);
+            report.action_result = result.clone();
+            report
+        };
+        if want == Code::Internal {
+            // The farm's failure is run again, so only its last run answers.
+            report_every_run(&mut daemon, start, make).await;
+        } else {
+            assert!(daemon.report(make(start.lease_id)).await.accepted, "{name}");
+        }
         let answer = response(&done(&mut ops).await);
         assert_eq!(answer.result, None, "{name}");
         let status = answer.status.expect("a status");

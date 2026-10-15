@@ -30,8 +30,9 @@ pub(super) async fn build(
 ) -> Result<(Summary, InputStats), TreeError> {
     let max = MAX_DIRECTORIES;
     let loaded = load(cas, in_flight, digest, known, &|_, _| false, max).await?;
-    let files = make_directories(cas, in_flight, digest, tmp, &loaded, &Default::default()).await?;
-    let stats = crate::cache::lease::write_files(cas, cache, files, &[]).await?;
+    let walked =
+        make_directories(cas, in_flight, digest, tmp, &loaded, &Default::default()).await?;
+    let stats = crate::cache::lease::write_files(cas, cache, walked.files, &[]).await?;
     let summary = check(loaded, digest.clone(), tmp.to_owned()).await?;
     Ok((summary, stats))
 }

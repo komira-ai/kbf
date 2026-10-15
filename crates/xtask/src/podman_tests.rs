@@ -1,7 +1,7 @@
 //! `cargo xtask podman-tests`: the container driver's real-Podman tests
-//! (`crates/kbf-driver-container/tests/podman*.rs`, every test `#[ignore]` with the
-//! reason) on a GitHub-hosted Linux runner, set up the way the T4 spike found works
-//! (`docs/spikes/hosted-runners.md`):
+//! (`crates/kbf-driver-container/tests/podman*.rs` and `oci_crun.rs`, every test
+//! `#[ignore]` with the reason) on a GitHub-hosted Linux runner, set up the way the T4
+//! spike found works (`docs/spikes/hosted-runners.md`):
 //!
 //! - [`runner_setup`]: lingering on for the runner user, so its systemd user manager
 //!   runs and rootless Podman has a runtime directory (`/run/user/<uid>`);
@@ -80,6 +80,13 @@ pub const TARGETS: &[Target] = &[
         name: "podman_env",
         nocapture: false,
         containers_conf: true,
+    },
+    // The OCI backend on real `crun` (hosted runners carry crun 1.14.1 beside Podman
+    // 4.9.3); Podman only pulls and exports the image there.
+    Target {
+        name: "oci_crun",
+        nocapture: true,
+        containers_conf: false,
     },
 ];
 

@@ -192,6 +192,17 @@ struct Cli {
     /// No work is placed by image yet: an action may still name another image.
     #[arg(long = "image", value_name = "IMAGE")]
     images: Vec<String>,
+    /// The runtime that runs each action's container (container): `podman`, the default,
+    /// runs `podman create` and `podman start` per action; `oci` runs each action in a
+    /// fresh rootless sandbox through `--oci-runtime` directly, with no Podman on the
+    /// action path (Podman only pulls and exports an image once per digest). `oci` needs
+    /// the daemon user's subordinate ids in one range, `uidmap`, and every directory down
+    /// to `--scratch` searchable by others.
+    #[arg(long, default_value = "podman", value_parser = ["podman", "oci"], value_name = "podman|oci")]
+    container_runtime: String,
+    /// The OCI runtime `--container-runtime=oci` runs actions with (container).
+    #[arg(long, default_value = "/usr/bin/crun")]
+    oci_runtime: PathBuf,
     /// A directory holding `passwd`, `subuid` and `subgid` that the container
     /// driver's startup check reads instead of `/etc`'s. For tests of that check only.
     #[arg(long, hide = true)]
@@ -300,7 +311,7 @@ fn sizes_on(
     cli: &Cli,
     topology: kbf_threads::Topology,
 ) -> Result<kbf_threads::Sizes, kbf_threads::ReserveError> {
-    cli.threads.resolve(kbf_threads::Role::Daemon, topology)
+    cli.threads.resolve(topology)
 }
 
 /// Builds the runtimes `--driver` names and serves until a signal; returns an error
@@ -632,6 +643,9 @@ mod container {
                 .map_or("all".to_owned(), |b| format!("{} GiB", b >> 30))
         );
         let mut config = PodmanConfig::new(scratch, parent, cli.daemon.node_id.clone());
+        config.container_runtime = cli.container_runtime.parse()?;
+        config.oci.runtime = cli.oci_runtime.clone();
+        config.oci.id_files = files;
         config.cgroup_root = mount.clone();
         config.outputs = OutputLimits {
             max_depth: cli.outputs.max_depth,

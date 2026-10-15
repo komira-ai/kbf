@@ -15,9 +15,10 @@ hmac.workspace = true
 md-5.workspace = true
 reqwest.workspace = true
 roxmltree.workspace = true
+rustix = { workspace = true, features = ["fs"] }
 sha2.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["time"] }
+tokio = { workspace = true, features = ["rt", "time"] }
 
 [dev-dependencies]
 clap.workspace = true

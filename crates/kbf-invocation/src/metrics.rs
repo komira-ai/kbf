@@ -165,7 +165,7 @@ impl Invocation {
 
 /// A requeue reason's name, as the API writes it: `silent`, `replaced`,
 /// `reconnected`, `not_started`, `session_switch`, `out_of_memory`,
-/// `node_memory_pressure`, `restarted` or `lost`.
+/// `node_memory_pressure`, `restarted`, `lost` or `infra`.
 #[must_use]
 pub const fn requeue_name(reason: &RequeueReason) -> &'static str {
     match reason {
@@ -178,6 +178,7 @@ pub const fn requeue_name(reason: &RequeueReason) -> &'static str {
         RequeueReason::NodeMemoryPressure => "node_memory_pressure",
         RequeueReason::Restarted => "restarted",
         RequeueReason::Lost(_) => "lost",
+        RequeueReason::Infra => "infra",
     }
 }
 

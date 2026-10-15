@@ -35,8 +35,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use kbf_sched::fence::{HANDOVER_GRACE, LEASE_GRACE, START_GRACE};
 use kbf_sched::{DaemonInstance, Event, Input, OpState, Request, Scheduler};
 use kbf_types::{
-    ActionKey, ControlRecord, Effect, FarmTime, LeaseId, OperationId, Outcome, Resources, WaiterId,
-    WorkerId,
+    ActionKey, ControlRecord, Effect, Failure, FarmTime, LeaseId, LostWhy, OperationId, Outcome,
+    Resources, WaiterId, WorkerId,
 };
 
 use super::leader::term;
@@ -72,6 +72,8 @@ pub struct CheckStats {
     /// Leases given up at a tick for silence; of those, at exactly G.
     pub requeued_silent: u64,
     pub requeued_at_g: u64,
+    /// Leases given up by a committed result the farm could not run (`Infra`).
+    pub requeued_infra: u64,
     /// A tick 1 ms before G with the worker's leases kept.
     pub kept_before_g: u64,
     /// Leases given up on a heartbeat that left them out: their `Start` went to an
@@ -119,6 +121,8 @@ pub struct Check {
     /// Every result proposed, with its operation and outcome.
     pub proposals: BTreeMap<LeaseId, (OperationId, Outcome)>,
     pub answered: BTreeMap<OperationId, (LeaseId, Outcome)>,
+    /// How many runs ended as the farm's fault when each operation was answered.
+    pub answered_farm_runs: BTreeMap<OperationId, usize>,
     answered_waiters: BTreeSet<WaiterId>,
     held: BTreeMap<LeaseId, (WorkerId, OperationId)>,
     pub stats: CheckStats,
@@ -153,6 +157,7 @@ impl Check {
             proposed: BTreeMap::new(),
             proposals: BTreeMap::new(),
             answered: BTreeMap::new(),
+            answered_farm_runs: BTreeMap::new(),
             answered_waiters: BTreeSet::new(),
             held: BTreeMap::new(),
             stats: CheckStats::default(),
@@ -352,6 +357,7 @@ impl Check {
                 format!("{op} answered without its result record: {event:?}"),
             );
         }
+        self.answered_farm_runs.insert(op, a.farm_runs.len());
         if self.answered.insert(op, (a.lease, a.outcome)).is_some() {
             self.fail("I4", format!("{op} answered twice"));
         }
@@ -522,6 +528,13 @@ impl Check {
                         ),
                     }
                 }
+                // A committed result of the farm's fault (the run could not be done) runs
+                // the operation again, charged to its farm budget.
+                Event::Committed(ControlRecord::Result(r))
+                    if r.lease == lease && r.outcome == Outcome::Failed(Failure::Infra) =>
+                {
+                    self.stats.requeued_infra += 1;
+                }
                 other => self.fail("R", format!("{lease} on {w} given up by {other:?}")),
             }
         }
@@ -533,9 +546,12 @@ impl Check {
         match event {
             Event::Tick => {
                 let mut kept_before_g = BTreeSet::new();
-                for (lease, (w, _)) in held {
+                for (lease, (w, op)) in held {
                     let ends = self.grace_ends(w);
-                    if now >= ends {
+                    // Kept past G only for the result the scheduler proposed when the
+                    // lease was past its operation's farm budget, until it commits.
+                    let fenced = Some(&(*op, Outcome::Failed(Failure::Lost(LostWhy::Fenced))));
+                    if now >= ends && self.proposals.get(lease) != fenced {
                         self.fail("R", format!("{lease} kept on {w}, silent for G"));
                     }
                     if now.saturating_add(std::time::Duration::from_millis(1)) == ends {
