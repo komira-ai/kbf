@@ -87,5 +87,5 @@ pub use fence::SelfFence;
 pub use input::{DaemonInstance, Event, Input, Request};
 pub use kbf_types::NodePhase;
 pub use requeue::{Gib, Requeue, RequeueReason};
-pub use scheduler::memory::{FARM_RERUNS, MEMORY_FLOORS, MemoryState, raised};
+pub use scheduler::memory::{FARM_RERUNS, MEMORY_FLOORS, MemoryState, category_booking, raised};
 pub use scheduler::{FINISHED_RETENTION, OpState, PLACEMENT_ROUND, Scheduler, UNSERVABLE_WAIT};

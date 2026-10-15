@@ -15,7 +15,7 @@ use kbf_objstore::{Capabilities, KeyError, KeyPrefix};
 use tonic::transport::{Certificate, Identity, ServerTlsConfig};
 
 use kbf_auth::{AllowAuthorizer, Authorizer, Policy, PolicyError};
-use kbf_front::SegmentsConfig;
+use kbf_front::{MemoryByCategory, SegmentsConfig};
 use kbf_meta::ServerId;
 use kbf_tier::{TierArgs, TierOptions};
 
@@ -171,6 +171,15 @@ pub struct Args {
     /// finished within it is held in memory.
     #[arg(long, default_value_t = kbf_sched::FINISHED_RETENTION.as_secs())]
     pub finished_retention_secs: u64,
+    /// The memory an action books by its category, as `<category>=<GiB>,...`
+    /// (`docs/platform-properties.md#memory-by-category`): an action whose `Command`
+    /// sets `KBF_ACTION_CATEGORY` to a category named here, and whose platform names
+    /// no `kbf-book-mem-gib`, books that many GiB instead of 1, or the memory of the
+    /// largest node that could run it if that is less. Empty by default: every such
+    /// action books 1 GiB. A size is a whole number of at least 1 in plain digits, and
+    /// a category is named once; the server refuses to start otherwise.
+    #[arg(long, default_value_t = MemoryByCategory::default())]
+    pub book_mem_gib_by_category: MemoryByCategory,
     /// How long, in seconds, a stop (SIGINT or SIGTERM) waits for REAPI clients to
     /// disconnect after their open Execute and WaitExecution streams are ended
     /// UNAVAILABLE and their connections sent GOAWAY. A client still uploading is cut
@@ -421,6 +430,7 @@ impl Args {
             shutdown_timeout: Duration::from_secs(self.shutdown_timeout_secs),
             store_probe_timeout: Duration::from_millis(self.readyz_store_timeout_ms),
             invocation_memory: usize::try_from(self.invocation_memory).unwrap_or(usize::MAX),
+            memory_by_category: self.book_mem_gib_by_category.clone(),
             segments: SegmentsConfig {
                 max_bytes: self.segment_upload_max_bytes,
                 idle: Duration::from_secs(self.segment_upload_idle_secs),
@@ -608,9 +618,30 @@ mod tests {
     use std::time::Duration;
 
     use clap::Parser;
-    use kbf_front::{MAX_BLOB_BYTES, WriteConfig};
+    use kbf_front::{MAX_BLOB_BYTES, MemoryByCategory, WriteConfig};
 
     use super::{Args, loopback_only};
+
+    /// Catches: `--book-mem-gib-by-category` not handed to the listeners (the farm then
+    /// books 1 GiB for every category), a default other than the empty table (a server
+    /// started without the flag would book differently than before it existed), and a
+    /// bad table accepted instead of refusing to start.
+    #[test]
+    fn the_category_table_is_a_flag_that_reaches_the_listeners() {
+        let listeners = |extra: &[&str]| {
+            Args::try_parse_from(["kbf-server"].iter().chain(extra))
+                .map(|a| a.listeners().expect("listeners").memory_by_category)
+        };
+        assert_eq!(listeners(&[]).unwrap(), MemoryByCategory::default());
+        let table = listeners(&["--book-mem-gib-by-category", "mojo_build_test=4"]).unwrap();
+        assert_eq!(table.get("mojo_build_test"), Some(4 << 30));
+        for refused in ["a=0", "a=4,a=8", "a"] {
+            assert!(
+                listeners(&["--book-mem-gib-by-category", refused]).is_err(),
+                "{refused}"
+            );
+        }
+    }
 
     /// Catches: `--s3-min-put-rate` lost on the way to the store (the flat 60 s that cut
     /// slow segment PUTs), a default other than 1 MiB/s, and a rate of 0 accepted (it

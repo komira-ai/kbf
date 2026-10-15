@@ -46,6 +46,7 @@ mod bytestream;
 mod cache;
 mod capabilities;
 mod cas;
+mod category;
 mod cpu;
 mod execution;
 mod input_tree;
@@ -77,6 +78,7 @@ pub use crate::cache::{
 };
 pub use crate::capabilities::{CapabilitiesService, server_capabilities};
 pub use crate::cas::CasService;
+pub use crate::category::{CATEGORY_ENV, CategoryTableError, MemoryByCategory, category};
 pub use crate::execution::{
     BOOK_CPUS_KEY, BOOK_MEM_GIB_KEY, Closer, Closing, DEFAULT_RESOURCES, Dispatch, ERROR_DOMAIN,
     ExecutionService, Finished, GPU_KEY, LEASE_KIND_KEY, LEASE_KINDS, NO_WORKER_REASON,

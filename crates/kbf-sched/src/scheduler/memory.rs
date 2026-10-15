@@ -71,6 +71,16 @@ pub fn raised(booked: u64, cap: u64) -> Option<u64> {
     })
 }
 
+/// The memory a request books for its category, when the request books `booked` and
+/// its category's entry asks for `ask` bytes: `ask` if that is more, but never more
+/// than `largest`, the memory of the largest node that could run it
+/// ([`Scheduler::largest_memory`]); `ask` itself while no such node is registered. A
+/// category never lowers a booking.
+#[must_use]
+pub fn category_booking(booked: u64, ask: u64, largest: Option<u64>) -> u64 {
+    booked.max(largest.map_or(ask, |largest| ask.min(largest)))
+}
+
 /// The memory state of one scheduler: its floors, with the order they were raised in,
 /// each operation's memory kills while the scheduler holds the operation, and each
 /// node's busy-node kills. Equal for two schedulers given the same inputs; any kill,
@@ -270,11 +280,26 @@ impl Scheduler {
     /// its CPU and GPU request, and always `ran_on`, the node its killed run used. A
     /// node that is gone does not count; `booked` when none is registered.
     fn memory_cap(&self, request: &Request, ran_on: &WorkerId, booked: u64) -> u64 {
+        self.largest_memory_with(request, Some(ran_on))
+            .unwrap_or(booked)
+    }
+
+    /// The memory of the largest node that could run `request`, in bytes: one that is
+    /// live (cordoned or not), serves its lease kind, satisfies its platform and holds
+    /// its CPU and GPU request. `None` while no such node is registered.
+    #[must_use]
+    pub fn largest_memory(&self, request: &Request) -> Option<u64> {
+        self.largest_memory_with(request, None)
+    }
+
+    /// [`Self::largest_memory`], counting `also` (the node a killed run used) whatever
+    /// it is.
+    fn largest_memory_with(&self, request: &Request, also: Option<&WorkerId>) -> Option<u64> {
         let wanted = request.resources;
         self.workers
             .iter()
             .filter(|(name, w)| {
-                *name == ran_on
+                also == Some(*name)
                     || (w.alive(self.now)
                         && serves(&w.caps, request.kind)
                         && request.needs.matches(&w.caps)
@@ -283,7 +308,6 @@ impl Scheduler {
             })
             .map(|(_, w)| w.capacity.memory_bytes)
             .max()
-            .unwrap_or(booked)
     }
 }
 
@@ -300,6 +324,26 @@ mod tests {
 
     use super::*;
     use crate::input::{DaemonInstance, Event, Input};
+
+    /// Catches: a category that lowers a booking the action already has, one booked
+    /// past the largest node that could run it (the action would then wait and fail
+    /// instead of running), and a category dropped while no node is registered.
+    #[test]
+    fn a_category_raises_a_booking_up_to_the_largest_node() {
+        assert_eq!(category_booking(GIB, 4 * GIB, Some(64 * GIB)), 4 * GIB);
+        assert_eq!(
+            category_booking(GIB, 4 * GIB, Some(3 * GIB)),
+            3 * GIB,
+            "the cap"
+        );
+        assert_eq!(category_booking(GIB, 4 * GIB, None), 4 * GIB, "no node yet");
+        assert_eq!(category_booking(8 * GIB, 4 * GIB, Some(64 * GIB)), 8 * GIB);
+        assert_eq!(
+            category_booking(2 * GIB, 4 * GIB, Some(GIB)),
+            2 * GIB,
+            "never lower"
+        );
+    }
 
     /// Catches a ladder that does not double (1 -> 3, or 1 -> 1), one that does not
     /// round a fraction of a GiB up, one that passes the cap, and one that offers a rung

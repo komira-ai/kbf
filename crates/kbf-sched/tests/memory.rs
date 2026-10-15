@@ -617,3 +617,35 @@ fn floors_are_bounded() {
     f.submit(3, request(1, GIB));
     assert_eq!(f.start().resources.memory_bytes, GIB);
 }
+
+/// Catches: `largest_memory` answering a size while no node is registered, counting a
+/// node that cannot run the request (a Mac for a Linux action, a node with too few
+/// cores), or not the largest of those that can; and a category booking whose own-limit
+/// kill does not climb the ladder from the category's size (4 GiB doubles to 8, where a
+/// ladder restarted at the 1 GiB default would book 2) or does not leave it as the floor.
+#[test]
+fn a_category_booking_is_capped_at_the_largest_node_and_climbs_the_ladder_from_there() {
+    let mut f = Farm::new();
+    let plain = request(1, GIB);
+    assert_eq!(f.s.largest_memory(&plain), None);
+    assert_eq!(kbf_sched::category_booking(GIB, 4 * GIB, None), 4 * GIB);
+    f.node("a-small", 3, linux());
+    f.node("m-mac", 64, mac());
+    assert_eq!(f.s.largest_memory(&plain), Some(3 * GIB));
+    let capped = kbf_sched::category_booking(GIB, 4 * GIB, f.s.largest_memory(&plain));
+    assert_eq!(capped, 3 * GIB, "no node holds 4 GiB yet");
+    f.node("b-large", 16, linux());
+    assert_eq!(f.s.largest_memory(&plain), Some(16 * GIB));
+    let mut wide = request(2, GIB);
+    wide.resources.cpu_millis = 16_000;
+    assert_eq!(f.s.largest_memory(&wide), None, "no node has 16 cores");
+
+    let booked = kbf_sched::category_booking(GIB, 4 * GIB, f.s.largest_memory(&plain));
+    assert!(f.submit(1, request(1, booked)).is_empty());
+    let first = f.start();
+    assert_eq!(first.resources.memory_bytes, 4 * GIB);
+    let second = f.killed(&first, OOM);
+    assert_eq!(second.resources.memory_bytes, 8 * GIB);
+    assert_eq!(f.requeues(), vec![oom(4, 8)]);
+    assert_eq!(f.s.memory_floor(&key(1)), Some(8 * GIB));
+}

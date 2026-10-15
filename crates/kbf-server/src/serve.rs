@@ -12,8 +12,8 @@ use futures::future::Either;
 use kbf_auth::{AuthenticateLayer, Policy};
 use kbf_front::{
     ByteStreamService, CONNECTION_WINDOW_BYTES, Cache, CasService, Connections,
-    MAX_CONCURRENT_STREAMS, MAX_MESSAGE_BYTES, MetaLog, RECORDER_CHANNEL, Recorder,
-    RequestMetadataLayer, STREAM_WINDOW_BYTES, SegmentsConfig, SegmentsService,
+    MAX_CONCURRENT_STREAMS, MAX_MESSAGE_BYTES, MemoryByCategory, MetaLog, RECORDER_CHANNEL,
+    Recorder, RequestMetadataLayer, STREAM_WINDOW_BYTES, SegmentsConfig, SegmentsService,
 };
 use kbf_objstore::ObjectStore;
 use kbf_proto::google::bytestream::byte_stream_server::ByteStreamServer;
@@ -74,6 +74,8 @@ pub struct Listeners {
     /// The memory bound of the invocation records, in bytes
     /// (`docs/design/invocations.md`, section 3.5).
     pub invocation_memory: usize,
+    /// The memory an action books by its category (`--book-mem-gib-by-category`).
+    pub memory_by_category: MemoryByCategory,
     /// The worker listener's segment uploads (`--segment-upload-*`;
     /// `docs/design/write-path.md`, section 4).
     pub segments: SegmentsConfig,
@@ -294,7 +296,8 @@ where
             listeners.unservable_wait,
             listeners.finished_retention,
         )
-        .recording(recorder.clone()),
+        .recording(recorder.clone())
+        .booking_by_category(listeners.memory_by_category.clone()),
     );
     let (reapi_incoming, reapi) = bind(listeners.reapi)?;
     let (worker_incoming, worker) = bind(listeners.worker)?;
