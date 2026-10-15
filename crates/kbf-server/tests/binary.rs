@@ -225,12 +225,21 @@ fn thread_flags_size_the_runtime_and_are_logged() {
         .stderr(Stdio::piped());
     let mut child = Running(c.spawn().expect("spawn kbf-server"));
     first_line("start", child.0.stdout.take().expect("stdout"));
-    let names: Vec<String> = std::fs::read_dir(format!("/proc/{}/task", child.pid()))
-        .expect("task dir")
-        .filter_map(|t| std::fs::read_to_string(t.ok()?.path().join("comm")).ok())
-        .map(|name| name.trim().to_owned())
-        .collect();
-    let workers = names.iter().filter(|name| *name == "kbf-async").count();
+    // A thread carries its name only once it has run its first instructions, which can
+    // be after the start line: wait for the count (up to 10 s) rather than read it once.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let (workers, names) = loop {
+        let names: Vec<String> = std::fs::read_dir(format!("/proc/{}/task", child.pid()))
+            .expect("task dir")
+            .filter_map(|t| std::fs::read_to_string(t.ok()?.path().join("comm")).ok())
+            .map(|name| name.trim().to_owned())
+            .collect();
+        let workers = names.iter().filter(|name| *name == "kbf-async").count();
+        if workers == 3 || std::time::Instant::now() > deadline {
+            break (workers, names);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
     assert_eq!(workers, 3, "threads of the server: {names:?}");
     let mut stderr = child.0.stderr.take().expect("stderr");
     interrupt(child);

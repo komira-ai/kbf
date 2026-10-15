@@ -342,7 +342,16 @@ fn thread_flags_size_the_runtime_and_are_logged() {
     .map(str::to_owned);
     let mut workers = 0;
     let (status, log) = runs_until_sigterm_logged_then("threads", &flags, None, || {
-        workers = kbf_async_threads("--blocking-threads=5");
+        // A thread carries its name only once it has run its first instructions, which
+        // can be after the start line: wait for the count (up to 10 s).
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            workers = kbf_async_threads("--blocking-threads=5");
+            if workers == 3 || Instant::now() > deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
     });
     assert!(status.success(), "{status}");
     assert_eq!(workers, 3);
