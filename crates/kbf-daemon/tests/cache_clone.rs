@@ -226,3 +226,33 @@ async fn a_cache_that_cannot_keep_a_fill_still_gives_writable_files() {
     assert!(!cache.holds(&key(b"no room", false)));
     stop(cache, &gates);
 }
+
+/// Catches the lease counts telling hard links from clones wrongly (`InputStats.links`
+/// is hard links to an entry, `copies` the names that are their own inode): in hard-link
+/// mode two names of one blob are links and an output's private name is a copy; in clone
+/// mode (above) none is a link. Off macOS only: there the default "link" is a clone.
+#[cfg(not(target_os = "macos"))]
+#[tokio::test]
+async fn in_hard_link_mode_the_shared_names_are_links_and_the_private_name_a_copy() {
+    let dir = scratch("clone-links");
+    let gates = Gates::new();
+    let mut config = clone_config(&dir, &gates);
+    config.link_mode = Some(LinkMode::Hardlink);
+    config.link = Arc::new(|from: &Path, to: &Path| std::fs::hard_link(from, to));
+    let cache = Cache::open(config).expect("open");
+    assert_eq!(cache.link_mode(), LinkMode::Hardlink);
+    let cas = CountingCas::default();
+    let root = cas.tree(&[
+        file("a", b"bytes", false),
+        file("b", b"bytes", false),
+        file("out/c", b"bytes", false),
+    ]);
+    let at = support::cache_kit::lease_dir(&dir, "one");
+    let stats = kbf_daemon::tree::materialize_cached(&cas, &cache, &root, &at, &["out".to_owned()])
+        .await
+        .expect("written");
+    assert_eq!((stats.links, stats.copies), (2, 1));
+    assert_eq!(meta(&at.join("a")).ino(), meta(&at.join("b")).ino());
+    assert_ne!(meta(&at.join("a")).ino(), meta(&at.join("out/c")).ino());
+    stop(cache, &gates);
+}
