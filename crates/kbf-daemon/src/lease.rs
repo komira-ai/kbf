@@ -165,7 +165,7 @@ impl Leases {
         if let Err(error) = &outcome {
             tracing::warn!(
                 lease = %id,
-                kind = failure_kind(error),
+                kind = %failure_kind(error),
                 reason = %one_line(&error.to_string()),
                 "lease failed"
             );
