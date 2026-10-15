@@ -66,6 +66,31 @@ pub enum Class {
     Unservable,
 }
 
+/// Whether `request` is an action at the whole host's memory of a worker of `capacity`
+/// (the last step of the memory ladder): it runs alone on the node.
+fn exclusive(capacity: Resources, request: Resources) -> bool {
+    request.memory_bytes > 0 && request.memory_bytes >= capacity.memory_bytes
+}
+
+/// Whether an action `request` can be placed on a worker of `capacity` whose holdings
+/// book `booked` in `leases` leases, `whole` saying one holds the node alone. An
+/// action's memory is the limit it first runs under, not a booking: only the worker's
+/// memory capacity bounds it, besides the whole host running alone.
+fn room(
+    capacity: Resources,
+    booked: Resources,
+    whole: bool,
+    leases: usize,
+    request: Resources,
+) -> bool {
+    !whole
+        && request.cpu_millis <= capacity.cpu_millis.saturating_sub(booked.cpu_millis)
+        && request.gpus <= capacity.gpus.saturating_sub(booked.gpus)
+        && request.vms <= capacity.vms.saturating_sub(booked.vms)
+        && request.memory_bytes <= capacity.memory_bytes
+        && (!exclusive(capacity, request) || leases == 0)
+}
+
 #[derive(Clone, Debug)]
 struct ShadowWorker {
     caps: NodeCaps,
@@ -108,6 +133,8 @@ struct Holding {
     downs: u64,
     /// The worker was down at the grant: its `Start` is lost.
     lost: bool,
+    /// It holds the node alone: an action at the worker's whole memory when granted.
+    alone: bool,
     committed: bool,
     /// A worker's result of it was proposed (a silent worker's lease is then given up
     /// with no charge: that result decides the operation).
@@ -353,7 +380,9 @@ impl Check {
 
     /// The reference round at `now`: first fit in queue order.
     fn round(&mut self) -> Round {
-        let mut booked: BTreeMap<WorkerId, Resources> = BTreeMap::new();
+        // Per worker: what its holdings book, how many there are, and whether one holds
+        // the node alone.
+        let mut booked: BTreeMap<WorkerId, (Resources, usize, bool)> = BTreeMap::new();
         let mut queue: Vec<OperationId> = self
             .ops
             .iter()
@@ -362,7 +391,11 @@ impl Check {
             .collect();
         for (id, h) in &self.holding {
             let b = booked.entry(h.worker.clone()).or_default();
-            *b = b.saturating_add(self.ops[id].request.resources);
+            *b = (
+                b.0.saturating_add(self.ops[id].request.resources),
+                b.1 + 1,
+                b.2 || h.alone,
+            );
         }
         queue.sort_by_key(|id| (Reverse(self.ops[id].request.qos.clone()), *id));
         let names: Vec<WorkerId> = self.workers.keys().cloned().collect();
@@ -382,17 +415,22 @@ impl Check {
                     && self.workers[w].capacity.fits(&request.resources)
             });
             let fit = names.iter().find(|w| {
-                let free = self.workers[*w]
-                    .capacity
-                    .saturating_sub(booked.get(*w).copied().unwrap_or_default());
+                let (held, leases, whole) = booked.get(*w).copied().unwrap_or_default();
                 usable(w, false)
-                    && free.fits(&request.resources)
+                    && room(
+                        self.workers[*w].capacity,
+                        held,
+                        whole,
+                        leases,
+                        request.resources,
+                    )
                     && !(elsewhere && self.ops[&id].avoid.contains(*w))
             });
             let class = match fit {
                 Some(w) if round.grants.len() < PLACEMENT_ROUND => {
+                    let alone = exclusive(self.workers[w].capacity, request.resources);
                     let b = booked.entry(w.clone()).or_default();
-                    *b = b.saturating_add(request.resources);
+                    *b = (b.0.saturating_add(request.resources), b.1 + 1, b.2 || alone);
                     round.grants.push((id, w.clone()));
                     Class::Servable
                 }
@@ -463,11 +501,17 @@ impl Check {
                         format!("{g:?} to a worker that is {:?}", self.cordons[&g.worker])
                     });
                     let booked = self.booked_on(&g.worker);
+                    let (leases, whole) = self.holds_on(&g.worker);
                     self.ensure(
-                        w.capacity
-                            .fits(&booked.saturating_add(op.request.resources)),
+                        room(w.capacity, booked, whole, leases, op.request.resources),
                         "I6",
-                        || format!("{g:?}: {booked:?} booked + request exceed {:?}", w.capacity),
+                        || {
+                            format!(
+                                "{g:?}: {booked:?} booked in {leases} leases (alone: {whole}) \
+                                 and the request do not fit {:?}",
+                                w.capacity
+                            )
+                        },
                     );
                     self.newest_grant = Some(g.lease);
                     let (downs, lost) = (w.downs, w.down);
@@ -478,6 +522,7 @@ impl Check {
                             worker: g.worker.clone(),
                             downs,
                             lost,
+                            alone: exclusive(w.capacity, op.request.resources),
                             committed: false,
                             proposed: false,
                         },
@@ -653,6 +698,12 @@ impl Check {
             self.reach("lease of a cordoned worker given up after it went down");
         }
         self.seen.given_up.push((self.now, id, h.worker));
+    }
+
+    /// How many leases `worker` holds, and whether one holds the node alone.
+    fn holds_on(&self, worker: &WorkerId) -> (usize, bool) {
+        let held = self.holding.values().filter(|h| h.worker == *worker);
+        (held.clone().count(), held.clone().any(|h| h.alone))
     }
 
     fn booked_on(&self, worker: &WorkerId) -> Resources {

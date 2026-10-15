@@ -128,7 +128,10 @@ impl Servable {
                 worker.whole = true;
                 worker.capacity
             }
-            LeaseKind::Action | LeaseKind::Vm => request.resources,
+            LeaseKind::Action | LeaseKind::Vm => {
+                worker.whole = worker.exclusive(request);
+                request.resources
+            }
         };
         worker.booked = worker.booked.saturating_add(booked);
         worker.leases += 1;

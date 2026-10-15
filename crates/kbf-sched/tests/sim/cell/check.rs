@@ -453,8 +453,8 @@ impl Check {
                 );
             }
             let cap = shadow.capacity;
+            // Memory is not booked against a worker: it may sum past the capacity.
             let over = booked.cpu_millis > cap.cpu_millis
-                || booked.memory_bytes > cap.memory_bytes
                 || booked.gpus > cap.gpus
                 || booked.vms > cap.vms;
             if granted_on.contains(w) && over {
