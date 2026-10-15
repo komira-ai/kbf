@@ -25,8 +25,8 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use kbf_proto::reapi::Digest;
 use tokio::sync::watch;
 
-use super::build::{build, bytes_under, publish, remove_tree};
-use super::classify::tree_name;
+use super::build::{build, bytes_under, publish_later, remove_tree};
+use super::classify::{Candidate, tree_name};
 use crate::cache::{Cache, InputStats};
 use crate::cas::Fetch;
 use crate::tree::{Loaded, TreeError, io as io_error};
@@ -132,6 +132,15 @@ fn parses(name: &str) -> bool {
 }
 
 impl Inner {
+    /// A lease on the tree `name`, whose pin count `pins` already counts it.
+    fn lease(self: &Arc<Self>, name: &str, pins: Arc<AtomicU32>) -> TreeLease {
+        TreeLease {
+            inner: Arc::clone(self),
+            path: self.dir.join(name),
+            pins,
+        }
+    }
+
     fn state(&self) -> MutexGuard<'_, State> {
         // Each update leaves the map consistent.
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
@@ -304,27 +313,18 @@ impl TreeStore {
         cas: &dyn Fetch,
         in_flight: usize,
         cache: &Cache,
-        name: &str,
-        digest: &Digest,
+        node: &Candidate,
         known: &Loaded,
     ) -> Result<(TreeLease, Option<InputStats>), TreeError> {
-        let inner = &self.inner;
-        let lease = |pins: Arc<AtomicU32>| TreeLease {
-            inner: Arc::clone(inner),
-            path: inner.dir.join(name),
-            pins,
-        };
+        let name = node.name.as_str();
         loop {
             match self.step(name) {
-                Step::Pinned(pins) => return Ok((lease(pins), None)),
+                Step::Pinned(pins) => return Ok((self.inner.lease(name, pins), None)),
                 Step::Lead(builder) => {
-                    let (pins, stats) = self
-                        .lead(cas, in_flight, cache, digest, known, builder)
-                        .await?;
-                    return Ok((lease(pins), Some(stats)));
+                    return self.lead(cas, in_flight, cache, node, known, builder).await;
                 }
                 Step::Wait(mut waiting) => {
-                    inner.counters.waits.fetch_add(1, Ordering::Relaxed);
+                    self.inner.counters.waits.fetch_add(1, Ordering::Relaxed);
                     // The sender is dropped when the builder is done, with a tree or
                     // without.
                     let _ = waiting.changed().await;
@@ -375,20 +375,17 @@ impl TreeStore {
         cas: &dyn Fetch,
         in_flight: usize,
         cache: &Cache,
-        digest: &Digest,
+        node: &Candidate,
         known: &Loaded,
         mut builder: Builder,
-    ) -> Result<(Arc<AtomicU32>, InputStats), TreeError> {
+    ) -> Result<(TreeLease, Option<InputStats>), TreeError> {
         let inner = &self.inner;
         let tmp = builder.tmp.clone();
         tokio::fs::create_dir(&tmp).await.map_err(io_error(&tmp))?;
-        let (summary, stats) = build(cas, in_flight, cache, digest, known, &tmp).await?;
-        let to = inner.dir.join(&builder.name);
-        let (from, dest) = (tmp.clone(), to.clone());
-        // The runtime is never shut down under a lease, so the blocking task finishes.
-        let moved = tokio::task::spawn_blocking(move || publish(&from, &dest))
+        let (summary, stats) = build(cas, in_flight, cache, &node.digest, known, &tmp).await?;
+        let to = inner.dir.join(&node.name);
+        let moved = publish_later(tmp.clone(), to.clone())
             .await
-            .expect("naming the tree panicked")
             .map_err(io_error(&to))?;
         inner.counters.builds.fetch_add(1, Ordering::Relaxed);
         let pins = Arc::new(AtomicU32::new(1));
@@ -397,7 +394,7 @@ impl TreeStore {
         let used = state.tick;
         state.bytes = state.bytes.saturating_add(summary.bytes);
         state.trees.insert(
-            builder.name.clone(),
+            node.name.clone(),
             Tree::Ready {
                 bytes: summary.bytes,
                 pins: Arc::clone(&pins),
@@ -410,6 +407,6 @@ impl TreeStore {
         // A tree already there was renamed in whole: ours is the spare.
         dead.extend((!moved).then_some(tmp));
         inner.remove_later(dead);
-        Ok((pins, stats))
+        Ok((inner.lease(&node.name, pins), Some(stats)))
     }
 }

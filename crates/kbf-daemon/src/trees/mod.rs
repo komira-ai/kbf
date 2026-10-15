@@ -30,7 +30,7 @@ use kbf_proto::reapi::Digest;
 
 use crate::cache::{Cache, InputStats};
 use crate::cas::{Cas, Fetch, label};
-use crate::tree::{TreeError, make_directories};
+use crate::tree::{Loaded, TreeError, make_directories};
 use classify::{Limits, Reserved, Summaries, load, select, summarize};
 pub use store::{TreeLease, TreeStats, TreeStore};
 
@@ -169,25 +169,11 @@ impl Trees {
                 .get(&label(digest))
                 .is_some_and(|summary| classify::qualifies(path, summary, reserved, limits))
         };
-        let loaded = load(
-            cas,
-            in_flight,
-            root,
-            &Default::default(),
-            &skip,
-            classify::MAX_DIRECTORIES,
-        )
-        .await?;
+        let max = classify::MAX_DIRECTORIES;
+        let loaded = load(cas, in_flight, root, &Loaded::new(), &skip, max).await?;
         let summaries = summarize(&loaded, &|name| self.summaries.get(name))?;
         self.summaries.extend(&summaries);
-        let chosen = select(
-            &loaded,
-            &summaries,
-            root,
-            reserved,
-            limits,
-            classify::MAX_DIRECTORIES,
-        )?;
+        let chosen = select(&loaded, &summaries, root, reserved, limits, max)?;
 
         let mut leases = Vec::new();
         let mut mounts = Vec::new();
@@ -195,14 +181,7 @@ impl Trees {
         for candidate in &chosen {
             let (lease, stats) = self
                 .store
-                .acquire(
-                    cas,
-                    in_flight,
-                    cache,
-                    &candidate.name,
-                    &candidate.digest,
-                    &loaded,
-                )
+                .acquire(cas, in_flight, cache, candidate, &loaded)
                 .await?;
             mounts.push(SharedMount {
                 path: candidate.path.clone(),

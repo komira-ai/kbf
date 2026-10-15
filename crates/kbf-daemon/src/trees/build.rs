@@ -28,24 +28,19 @@ pub(super) async fn build(
     known: &Loaded,
     tmp: &Path,
 ) -> Result<(Summary, InputStats), TreeError> {
-    let loaded = load(
-        cas,
-        in_flight,
-        digest,
-        known,
-        &|_, _| false,
-        MAX_DIRECTORIES,
-    )
-    .await?;
+    let max = MAX_DIRECTORIES;
+    let loaded = load(cas, in_flight, digest, known, &|_, _| false, max).await?;
     let files = make_directories(cas, in_flight, digest, tmp, &loaded, &Default::default()).await?;
     let stats = crate::cache::lease::write_files(cas, cache, files, &[]).await?;
-    let root = digest.clone();
-    let tmp = tmp.to_owned();
-    // The runtime is never shut down under a lease, so the blocking task finishes.
-    let summary = tokio::task::spawn_blocking(move || verify(&loaded, &root, &tmp))
-        .await
-        .expect("the tree check panicked")?;
+    let summary = check(loaded, digest.clone(), tmp.to_owned()).await?;
     Ok((summary, stats))
+}
+
+/// [`verify`] on the blocking pool. The runtime is never shut down under a lease, so the
+/// blocking task finishes.
+async fn check(loaded: Loaded, root: Digest, tmp: PathBuf) -> Result<Summary, TreeError> {
+    let checked = tokio::task::spawn_blocking(move || verify(&loaded, &root, &tmp)).await;
+    checked.expect("the tree check panicked")
 }
 
 /// Walks the tree written at `tmp` and compares it with the Directory messages of
@@ -111,6 +106,12 @@ pub(super) fn verify(loaded: &Loaded, root: &Digest, tmp: &Path) -> Result<Summa
         }
     }
     Ok(summary)
+}
+
+/// [`publish`] on the blocking pool (same note as [`check`]).
+pub(super) async fn publish_later(tmp: PathBuf, to: PathBuf) -> io::Result<bool> {
+    let published = tokio::task::spawn_blocking(move || publish(&tmp, &to)).await;
+    published.expect("naming the tree panicked")
 }
 
 /// Names the finished tree `to`: `RENAME_NOREPLACE`, so a tree already there (it was
