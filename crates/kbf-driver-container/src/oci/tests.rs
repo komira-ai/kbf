@@ -179,7 +179,11 @@ async fn ended_needs_a_crun_run_that_has_ended() {
     let oci = start(&config(&dir, true), &dir.join("scratch")).expect("started");
     let child = tokio::process::Command::new("true").spawn().expect("spawn");
     let ended = oci
-        .ended(&crate::podman::tests::spec(), &Running::Process(child))
+        .ended(
+            &crate::podman::tests::spec(),
+            &Running::Process(child),
+            Path::new("/nonexistent-kbf/stderr"),
+        )
         .await;
     assert_eq!(ended, Err("this start is not a crun run".to_owned()));
 }

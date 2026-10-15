@@ -184,7 +184,7 @@ pub(crate) async fn text_file_busy(said: &Said) -> bool {
 /// A container that did not run to an exit (the runtime's `state` for it): the
 /// action's exit 127 or 126 when crun reports it cannot find or execute the program,
 /// with kbf's message and the runtime's words as its stderr; otherwise the farm's
-/// failure, naming what the runtime said.
+/// failure, naming what the runtime said, or that it said nothing.
 pub(crate) async fn not_run(
     spec: &ContainerSpec,
     said: &Said,
@@ -195,11 +195,18 @@ pub(crate) async fn not_run(
         .map_err(|e| failed(&said.source, &e))?
     {
         Ok(why) => Ok(why.exit_code()),
-        Err(words) => Err(RuntimeError::Failed(format!(
-            "the container did not run to an exit: {} reports {state:?}; {}: {words}",
-            said.reports(),
-            said.label()
-        ))),
+        Err(words) => {
+            let words = if words.is_empty() {
+                "(nothing on stderr)"
+            } else {
+                &words
+            };
+            Err(RuntimeError::Failed(format!(
+                "the container did not run to an exit: {} reports {state:?}; {}: {words}",
+                said.reports(),
+                said.label()
+            )))
+        }
     }
 }
 

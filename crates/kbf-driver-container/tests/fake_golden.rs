@@ -25,6 +25,9 @@ const ACTION: &str = concat!(
     "exit\n3\n",
 );
 
+/// The `--format` the driver reads a container's record with (`podman::Podman::ended`).
+const RECORD: &str = "--format={{.State.Status}} {{.State.ExitCode}} {{.State.FinishedAt.IsZero}}";
+
 /// One call: files below the fake's directory to write (or, with `None`, remove) first, then the arguments after
 /// `--cgroup-manager=cgroupfs` (`None`: the flag is left out too), and whether the
 /// files are recorded right after it as well as after the last call.
@@ -134,6 +137,21 @@ fn calls(dir: &Path) -> Vec<Call> {
             &["start", "--attach", "kbf-lease-1-1"],
         ),
         call(&[], &["inspect", "kbf-lease-1-1"]),
+        // The driver's format names `FinishedAt`: the record says whether an exit was
+        // recorded. `unrecorded-inspects` stands in for a record read before it was.
+        call(
+            &[],
+            &["inspect", "--type=container", RECORD, "kbf-lease-1-1"],
+        ),
+        call(
+            &[("state/unrecorded-inspects", Some("2\n"))],
+            &["inspect", "--type=container", RECORD, "kbf-lease-1-1"],
+        ),
+        call(&[], &["inspect", "kbf-lease-1-1"]),
+        call(
+            &[],
+            &["inspect", "--type=container", RECORD, "kbf-lease-1-1"],
+        ),
         call(&[("state/inspect-fails", Some(""))], &["inspect", "x"]),
         call(
             &[("state/kill-fails", Some(""))],

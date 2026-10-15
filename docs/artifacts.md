@@ -4,9 +4,10 @@ kbf's binaries are built by CI, never on a developer's machine, and a node is to
 only bytes CI built and attested. The workflow is
 [`.github/workflows/artifacts.yml`](../.github/workflows/artifacts.yml).
 
-What exists today is the build, the signing, the sums and, on `main`, the
-attestations. The deployment job that verifies an asset before it reaches a node, the
-node's own SHA-256 check and the release workflow are **planned** and not built yet
+What exists today is the build, the signing, the sums, on `main` the attestations,
+and releases of those files ([`.github/workflows/release.yml`](../.github/workflows/release.yml)).
+The deployment job that verifies an asset before it reaches a node and the node's own
+SHA-256 check are **planned** and not built yet
 ([mac-node-provisioning.md](design/mac-node-provisioning.md) sections 4.1 and 4.2).
 Sections below that describe them say so.
 
@@ -80,19 +81,67 @@ step for a tarball no job packages.
 
 The assets are workflow artifacts of the run (`assets-darwin-arm64`,
 `assets-linux-x86_64`, `assets-linux-arm64`, `sha256sums`). GitHub keeps workflow
-artifacts for at most 90 days, so nothing may depend on them for longer. Releases are
-**planned** (no release workflow exists yet): the design (fleet-updates, and
-mac-node-provisioning section 4.1) is that a release attaches the exact bytes the farm
-ran after their soak, fetched from the deployment's own copy and checked against these
-attestations; a release never rebuilds. The attestations themselves do not expire with
-the artifacts.
+artifacts for at most 90 days, so nothing may depend on them for longer: a script that
+must still fetch an asset later pins a release asset (below). The attestations
+themselves do not expire with the artifacts.
+
+## Releases
+
+A release is the files a push run of `artifacts.yml` on `main` left for one commit,
+attached unchanged to a GitHub release
+([`.github/workflows/release.yml`](../.github/workflows/release.yml)). Nothing is
+rebuilt. Its assets are every tarball and SBOM in the table above, for that commit, and
+their `SHA256SUMS`.
+
+To cut one, tag a commit on `main` and push the tag:
+
+```text
+git tag v0.1.0 <commit on main>
+git push origin v0.1.0
+```
+
+The tag push runs two jobs. `verify`, with read-only scopes, fails the run (and
+nothing is published) when:
+
+- the commit is not on `main` (GitHub's compare of `main...<commit>` is neither
+  `identical` nor `behind`);
+- there is no successful `push` run of `artifacts.yml` on `main` for that exact commit,
+  or that run no longer holds all four artifacts (they expire after 90 days, so a
+  release is cut within 90 days of the commit);
+- a file does not match `SHA256SUMS` (`sha256sum --check --strict`), a file is not
+  listed in it, or a listed file is not `<binary>-<commit>-<platform>`;
+- any file's attestations do not verify with the command below (`cargo xtask
+  verify-assets attestations`, with its two controls that must fail).
+
+`publish` then creates the release with those files. It is the only job with a token
+that can write (`contents: write`), and the workflow lint refuses that scope in a job
+whose `if:` is not exactly the tag-push condition it runs under. Running the workflow
+again for the same tag creates no second release and replaces no asset: each asset the
+release already holds must be one of the verified files, byte for byte, or the run
+fails and changes nothing; the files it lacks are uploaded (`cargo xtask release
+publish`).
+
+The workflow can also be run by hand (`workflow_dispatch`) with a commit SHA. Only
+`verify` runs then: every check above, and nothing is published. On every pull request
+into `main`, CI asks GitHub the same on-`main` question for the pull request's base
+commit (which must pass) and its merge commit (which must be refused), so a check that
+accepts every commit, or none, fails there (`cargo xtask release main-control`).
+
+Pushing a tag runs the workflow file as that tagged commit holds it. The checks above
+hold for a tag on a commit of `main`; who may push a tag at all is a repository
+setting, not something this workflow controls.
+
+To use an asset, download it from the release and verify it before anything runs it,
+with the command below (the release's notes give it too). The release's `SHA256SUMS`
+lists each asset's SHA-256, but is not itself attested: the attestation is the check.
 
 ## How a node's deployment verifies an asset (planned)
 
 No deployment job exists yet. When it does, it is to verify each asset before it
 touches a node, in CI (a node has no `gh`), with every flag below
 ([mac-node-provisioning.md](design/mac-node-provisioning.md) section 4.2). The `verify`
-job already runs these exact checks on what `attest` signed (below).
+job already runs these exact checks on what `attest` signed (below). A release asset
+verifies with the same command, as its bytes are the attested ones.
 
 ```text
 gh attestation verify kbf-daemon-<commit>-darwin-arm64.tar.gz \

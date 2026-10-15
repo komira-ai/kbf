@@ -120,7 +120,12 @@ impl Backend for Oci {
 
     /// `crun run`'s exit status is the action's, unless `crun` itself failed: told by an
     /// error record in its log.
-    async fn ended(&self, spec: &ContainerSpec, running: &Running) -> Result<Ended, String> {
+    async fn ended(
+        &self,
+        spec: &ContainerSpec,
+        running: &Running,
+        _stderr: &Path,
+    ) -> Result<Ended, String> {
         match running.run_end() {
             RunEnd::Exited(0) => Ok(Ended::Exited(0)),
             RunEnd::Exited(code) => {

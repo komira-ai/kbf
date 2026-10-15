@@ -246,8 +246,14 @@ pub(crate) trait Backend {
         stderr: std::fs::File,
     ) -> Result<Running, String>;
 
-    /// How the container ended, after [`Running::wait`] returned.
-    async fn ended(&self, spec: &ContainerSpec, running: &Running) -> Result<Ended, String>;
+    /// How the container ended, after [`Running::wait`] returned. `stderr` is the action's
+    /// stderr file, which Podman's record is waited for alongside (`exit_record`).
+    async fn ended(
+        &self,
+        spec: &ContainerSpec,
+        running: &Running,
+        stderr: &Path,
+    ) -> Result<Ended, String>;
 
     /// Where this runtime's own words about a container that did not run are.
     fn said(&self, spec: &ContainerSpec, stderr: &Path) -> Said;
@@ -307,8 +313,13 @@ impl Backend for Engine {
         each!(self, b => b.start(spec, stdout, stderr))
     }
 
-    async fn ended(&self, spec: &ContainerSpec, running: &Running) -> Result<Ended, String> {
-        each!(self, b => b.ended(spec, running).await)
+    async fn ended(
+        &self,
+        spec: &ContainerSpec,
+        running: &Running,
+        stderr: &Path,
+    ) -> Result<Ended, String> {
+        each!(self, b => b.ended(spec, running, stderr).await)
     }
 
     fn said(&self, spec: &ContainerSpec, stderr: &Path) -> Said {
@@ -426,8 +437,13 @@ impl Backend for PodmanBackend {
             .map(Running::Process)
     }
 
-    async fn ended(&self, spec: &ContainerSpec, _running: &Running) -> Result<Ended, String> {
-        self.podman.ended(&spec.name).await
+    async fn ended(
+        &self,
+        spec: &ContainerSpec,
+        _running: &Running,
+        stderr: &Path,
+    ) -> Result<Ended, String> {
+        self.podman.ended(&spec.name, stderr).await
     }
 
     fn said(&self, _spec: &ContainerSpec, stderr: &Path) -> Said {
