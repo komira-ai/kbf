@@ -276,7 +276,9 @@ the unit gains all three once both are built:
   Raft log kept in the directory. Mount that directory on a partition of its own, not
   shared with build scratch, swap or the object store's data, so a full build disk
   cannot stop the log
-  ([converged topology](../design/deployment-topology.md#converged-topology)).
+  ([converged topology](../design/deployment-topology.md#converged-topology)). The
+  server holds an exclusive lock on `log.lock` in the directory while it runs, so a
+  second server started on the same directory is refused rather than writing the log.
 - `--runtime-dir`: where the log's store records that a write to disk failed, so it
   does not reopen the log until the host reboots. `/run` is a tmpfs, cleared at reboot
   as the page cache is.
