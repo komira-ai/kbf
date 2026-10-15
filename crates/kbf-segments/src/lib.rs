@@ -38,3 +38,57 @@ pub fn sha256(bytes: &[u8]) -> Digest {
         bytes.len() as u64,
     )
 }
+
+/// The SHA-256 and CRC-32C of one record whose bytes arrive in order, in pieces.
+#[derive(Clone, Debug, Default)]
+pub struct RecordHasher {
+    sha: Sha256,
+    crc: Crc32c,
+    len: u64,
+}
+
+impl RecordHasher {
+    /// A hasher of no bytes yet.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Adds `bytes` after those added before.
+    pub fn update(&mut self, bytes: &[u8]) {
+        self.sha.update(bytes);
+        self.crc.update(bytes);
+        self.len += bytes.len() as u64;
+    }
+
+    /// The digest and CRC-32C of every byte added: equal to [`sha256`] and [`crc32c`]
+    /// of the pieces joined.
+    #[must_use]
+    pub fn finish(self) -> (Digest, u32) {
+        let digest = Digest::new(DigestFunction::Sha256, self.sha.finalize().into(), self.len);
+        (digest, self.crc.finish())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Catches a piecewise hasher that differs from the one-shot functions (a length
+    /// that counts one piece, a CRC restarted per piece): any split gives `sha256` and
+    /// `crc32c` of the whole.
+    #[test]
+    fn record_hasher_pieces_equal_the_whole() {
+        let bytes: Vec<u8> = (0..1000u32).map(|i| (i * 31) as u8).collect();
+        for split in [0, 1, 500, 999, 1000] {
+            let mut h = RecordHasher::new();
+            h.update(&bytes[..split]);
+            h.update(&bytes[split..]);
+            assert_eq!(
+                h.finish(),
+                (sha256(&bytes), crc32c(&bytes)),
+                "split {split}"
+            );
+        }
+    }
+}

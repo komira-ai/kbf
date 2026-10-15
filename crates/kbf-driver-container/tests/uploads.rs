@@ -129,7 +129,7 @@ async fn collect_out(cas: &CountingCas, upper: &std::path::Path) -> (ActionResul
     collect(
         cas,
         upper,
-        std::path::Path::new(env!("CARGO_TARGET_TMPDIR")),
+        &kbf_daemon::cpu_pool::CpuPool::new(4),
         "",
         &["out".to_owned()],
         OutputLimits::DEFAULT,
@@ -217,8 +217,7 @@ async fn a_digest_named_many_times_is_stored_once() {
 /// Catches a store that failed being dropped while the walk goes on: `collect` would
 /// return a result naming a blob the CAS never got, and the action cache would refuse
 /// it (or a client would fail fetching it). One of 100 files cannot be stored (it
-/// reaches the store from the spool, through `put`). Mutant seen red: the spool's
-/// store error discarded (`src/pending.rs`, `put_spool`'s result dropped).
+/// reaches the store from its file, through `put`).
 #[tokio::test]
 async fn a_blob_that_cannot_be_stored_fails_the_collection() {
     let upper = scratch("refused");
@@ -235,7 +234,7 @@ async fn a_blob_that_cannot_be_stored_fails_the_collection() {
     let collected = collect(
         &cas,
         &upper,
-        std::path::Path::new(env!("CARGO_TARGET_TMPDIR")),
+        &kbf_daemon::cpu_pool::CpuPool::new(4),
         "",
         &["out".to_owned()],
         OutputLimits::DEFAULT,

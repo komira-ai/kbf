@@ -25,6 +25,7 @@ use kbf_types::{DigestFunction, LeaseId};
 use sha2::{Digest as _, Sha256};
 
 use crate::cas::{Cas, CasError, Chunks, label};
+use crate::source::{Record, Source};
 
 /// One blob in the spool.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -89,6 +90,24 @@ impl Spool {
         self.lock().records.clone()
     }
 
+    /// The blobs written whole so far as [`Record`]s, read back from the spool file
+    /// when they are sent. They keep the file open: the spool can be dropped.
+    #[must_use]
+    pub fn outgoing(&self) -> Vec<Record> {
+        self.lock()
+            .records
+            .iter()
+            .map(|r| Record {
+                digest: r.digest,
+                crc32c: r.crc32c,
+                source: Source::Spool {
+                    file: Arc::clone(&self.file),
+                    offset: r.offset,
+                },
+            })
+            .collect()
+    }
+
     /// Reserves `size` bytes for `digest`, or `None` if that blob is spooled already
     /// (or is being written).
     fn reserve(&self, digest: kbf_types::Digest) -> Option<u64> {
@@ -119,15 +138,6 @@ impl Spool {
             file.read_exact_at(&mut bytes, offset).map(|()| bytes)
         })
         .await
-    }
-
-    /// The bytes of the spooled blob `r`.
-    ///
-    /// # Errors
-    /// [`CasError::Read`] when the spool cannot be read.
-    pub(crate) async fn read_record(&self, r: &Spooled) -> Result<Vec<u8>, CasError> {
-        let read = self.read(r.offset, r.digest.size_bytes).await;
-        read.map_err(|e| CasError::Read(label(&to_proto(&r.digest)), format!("spool: {e}")))
     }
 
     /// The spooled blob `digest` names, if it is in the spool.
@@ -258,7 +268,8 @@ pub(crate) fn parse(digest: &Digest) -> Option<kbf_types::Digest> {
 }
 
 /// kbf's digest as a REAPI digest.
-pub(crate) fn to_proto(digest: &kbf_types::Digest) -> Digest {
+#[must_use]
+pub fn to_proto(digest: &kbf_types::Digest) -> Digest {
     Digest {
         hash: digest.hash_hex(),
         // Sizes come from lengths in memory or on disk, far below `i64::MAX`.
