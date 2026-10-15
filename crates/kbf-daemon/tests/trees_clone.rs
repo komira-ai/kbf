@@ -538,3 +538,18 @@ async fn a_clone_does_not_pin_its_tree_and_outlives_its_eviction() {
     assert_eq!(digest_of_dir(&dir.join("leases/lease-0")), a);
     assert_eq!(digest_of_dir(&dir.join("leases/lease-1")), b);
 }
+
+/// Catches the delivery's `Debug` (the store's own is derived through it) naming the
+/// wrong arm, and the platform's default not being the one the driver relies on: a
+/// mount on Linux, a clone on macOS.
+#[test]
+fn the_delivery_names_itself_and_defaults_by_platform() {
+    assert_eq!(format!("{:?}", Delivery::Mount), "Mount");
+    assert_eq!(format!("{:?}", Delivery::Clone(dir_clone())), "Clone");
+    let want = if cfg!(target_os = "macos") {
+        "Clone"
+    } else {
+        "Mount"
+    };
+    assert_eq!(format!("{:?}", Delivery::platform()), want);
+}
