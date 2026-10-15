@@ -69,6 +69,7 @@ use tonic::service::Routes;
 
 pub use crate::action_cache::ActionCacheService;
 pub use crate::bytestream::ByteStreamService;
+pub use crate::cache::HIT_CHECKS_IN_FLIGHT;
 pub use crate::cache::{
     Admitted, BATCH_READS_IN_FLIGHT, CONNECTION_WINDOW_BYTES, Cache, CacheError,
     FLUSH_BACKOFF_FIRST, FLUSH_BACKOFF_MAX, FLUSHES_PER_ROUND, FlushRound, MAX_ADMISSION_BYTES,
