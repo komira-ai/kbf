@@ -142,7 +142,7 @@ fn a_lease_that_booked_nothing_counts_as_one_cpu() {
 /// A host's cgroup tree as plain directories: the unit offers `offered`, `actions/`
 /// under it.
 fn cgroups(name: &str, offered: &str, effective: Option<&str>) -> (PathBuf, &'static str) {
-    let root = scratch(name).join("cgroup");
+    let root = scratch(&format!("{name}-cgroups")).join("cgroup");
     let unit = root.join("kbf.slice/kbf.service");
     put(&unit.join("cgroup.controllers"), offered);
     put(&unit.join("cgroup.subtree_control"), "cpu memory pids\n");
