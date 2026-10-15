@@ -347,9 +347,7 @@ impl Simctl {
         stop: &mut oneshot::Receiver<T>,
     ) -> Waited<T> {
         let probe = lease.join(PROBE_DIR);
-        // A probe that cannot be written fails every look, and the last listing says
-        // why (`xcodebuild` finds no project), so the error needs no branch of its own.
-        let _ = write_probe(&probe);
+        write_probe(&probe);
         let waited = self
             .wait_looks(lease, &probe, udid, developer_dir, stop)
             .await;
@@ -486,17 +484,15 @@ const PROBE_FILES: [(&str, &str); 2] = [
     ),
 ];
 
-/// Writes the probe project into `probe`; its `-project` path.
-fn write_probe(probe: &Path) -> std::io::Result<PathBuf> {
+/// Writes the probe project into `probe`. A file that cannot be written fails every
+/// look, and the last listing says why (`xcodebuild` finds no project), so the
+/// errors need no branch of their own.
+fn write_probe(probe: &Path) {
     let project = probe.join(format!("{PROBE_SCHEME}.xcodeproj"));
+    let _ = std::fs::create_dir_all(project.join("xcshareddata/xcschemes"));
     for (path, text) in PROBE_FILES {
-        let file = project.join(path);
-        if let Some(parent) = file.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(file, text)?;
+        let _ = std::fs::write(project.join(path), text);
     }
-    Ok(project)
 }
 
 /// How much of the last listing a lease that never saw its device says.
