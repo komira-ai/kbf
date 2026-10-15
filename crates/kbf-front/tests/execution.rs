@@ -34,6 +34,9 @@ struct Script {
     submitted: Mutex<Vec<Submission>>,
     stages: Mutex<Vec<(String, watch::Sender<Stage>)>>,
     refuse: AtomicBool,
+    /// Whether a submission joins a twin already executing (its stage starts at
+    /// `Executing`) instead of starting `Queued`.
+    joined: AtomicBool,
 }
 
 impl Script {
@@ -67,7 +70,12 @@ impl Dispatch for Script {
         }
         let mut stages = self.stages.lock().unwrap_or_else(PoisonError::into_inner);
         let name = format!("operations/{}", stages.len());
-        let (tx, rx) = watch::channel(Stage::Queued);
+        let first = if self.joined.load(Ordering::SeqCst) {
+            Stage::Executing
+        } else {
+            Stage::Queued
+        };
+        let (tx, rx) = watch::channel(first);
         stages.push((name.clone(), tx));
         let action = submission.request.key.action;
         let instance = submission.request.key.instance.clone();
@@ -418,6 +426,264 @@ async fn a_cache_hit_is_answered_without_submitting() {
         .await
         .expect("Execute");
     assert_eq!(script.submitted().len(), 1, "skip_cache_lookup ignored");
+}
+
+/// Catches: an Execute that is not counted, or whose phases are not each recorded once
+/// (prepare before the scheduler, the submit call, the time queued, the whole call);
+/// `kbf_execute_in_flight` or `kbf_execute_queued` left raised when the stream ends or
+/// when the operation starts executing; a cache hit that is counted as an error or as
+/// a call to the scheduler; and the families missing from `/metrics`.
+#[tokio::test]
+async fn execute_is_measured_phase_by_phase() {
+    let script = Arc::new(Script::default());
+    let farm = Farm::with_execution(Arc::clone(&script)).await;
+    let metrics = &farm.cache.metrics().execute;
+    let job = job("measured", &[], false);
+    farm.upload(&job.blobs.iter().collect::<Vec<_>>()).await;
+
+    let mut ops = start(&farm, &job.action).await.expect("Execute");
+    next(&mut ops).await.expect("healthy").expect("QUEUED");
+    assert_eq!((metrics.in_flight.get(), metrics.queued.get()), (1, 1));
+    assert_eq!(metrics.requests.get(), 0, "counted before it ended");
+    assert_eq!((metrics.prepare.count(), metrics.dispatch.count()), (1, 1));
+    assert_eq!(metrics.queued_seconds.count(), 0);
+
+    script.set(0, Stage::Executing);
+    next(&mut ops).await.expect("healthy").expect("EXECUTING");
+    assert_eq!((metrics.in_flight.get(), metrics.queued.get()), (1, 0));
+    assert_eq!(metrics.queued_seconds.count(), 1);
+
+    script.set(0, Stage::Done(Finished::Ran(Box::default())));
+    next(&mut ops).await.expect("healthy").expect("done");
+    assert_eq!(next(&mut ops).await.expect("healthy"), None);
+    assert_eq!((metrics.in_flight.get(), metrics.queued.get()), (0, 0));
+    assert_eq!((metrics.requests.get(), metrics.errors.get()), (1, 0));
+    for (name, count) in [
+        ("prepare", metrics.prepare.count()),
+        ("dispatch", metrics.dispatch.count()),
+        ("queued", metrics.queued_seconds.count()),
+        ("total", metrics.total.count()),
+    ] {
+        assert_eq!(count, 1, "{name}");
+    }
+
+    // A cache hit is a call that succeeded, and never reached the scheduler.
+    let hit = self::job("hit", &[], false);
+    farm.upload(&hit.blobs.iter().collect::<Vec<_>>()).await;
+    farm.cache
+        .write_action_result(Role::Daemon, hit.action.digest, &ActionResult::default())
+        .await
+        .expect("write");
+    let mut ops = start(&farm, &hit.action).await.expect("Execute");
+    next(&mut ops).await.expect("healthy").expect("done");
+    assert_eq!(next(&mut ops).await.expect("healthy"), None);
+    assert_eq!((metrics.requests.get(), metrics.errors.get()), (2, 0));
+    assert_eq!(
+        metrics.prepare.count(),
+        1,
+        "a hit does not reach the scheduler"
+    );
+    assert_eq!(metrics.total.count(), 2);
+
+    let text = farm.cache.metrics().render();
+    for family in [
+        "kbf_execute_requests_total 2",
+        "kbf_execute_errors_total 0",
+        "kbf_execute_in_flight 0",
+        "kbf_execute_queued 0",
+        "kbf_execute_prepare_seconds_count 1",
+        "kbf_execute_dispatch_seconds_count 1",
+        "kbf_execute_queued_seconds_count 1",
+        "kbf_execute_total_seconds_count 2",
+    ] {
+        assert!(
+            text.lines().any(|l| l == family),
+            "{family} not in:\n{text}"
+        );
+    }
+}
+
+/// Catches: an Execute that fails before the scheduler (an input missing, so
+/// FAILED_PRECONDITION; the scheduler refusing, so UNAVAILABLE) not counted as an error,
+/// one observed as reaching the scheduler when it did not, `in_flight` left raised by
+/// an error return, and a caller that leaves a queued operation not counted as an
+/// error with its gauges lowered.
+#[tokio::test]
+async fn failed_and_abandoned_executes_count_as_errors() {
+    let script = Arc::new(Script::default());
+    let farm = Farm::with_execution(Arc::clone(&script)).await;
+    let metrics = &farm.cache.metrics().execute;
+
+    let absent = Blob::new("an action nobody uploaded");
+    let status = start(&farm, &absent).await.expect_err("missing");
+    assert_eq!(status.code(), Code::FailedPrecondition);
+    assert_eq!((metrics.requests.get(), metrics.errors.get()), (1, 1));
+    assert_eq!(metrics.in_flight.get(), 0);
+    assert_eq!((metrics.prepare.count(), metrics.dispatch.count()), (0, 0));
+    assert_eq!(metrics.total.count(), 1);
+
+    // The action, its command and its input tree are held, but one input file is not.
+    let lacking = job("lacking an input", &[], false);
+    let [held @ .., input] = lacking.blobs.as_slice() else {
+        panic!("a job has blobs");
+    };
+    farm.upload(&held.iter().collect::<Vec<_>>()).await;
+    let status = start(&farm, &lacking.action)
+        .await
+        .expect_err("missing input");
+    assert_eq!(missing_subjects(&status), [subject(input)]);
+    assert_eq!((metrics.requests.get(), metrics.errors.get()), (2, 2));
+    assert_eq!((metrics.prepare.count(), metrics.dispatch.count()), (0, 0));
+    assert_eq!(metrics.in_flight.get(), 0);
+
+    let job = job("refused", &[], false);
+    farm.upload(&job.blobs.iter().collect::<Vec<_>>()).await;
+    script.refuse.store(true, Ordering::SeqCst);
+    let status = start(&farm, &job.action).await.expect_err("refused");
+    assert_eq!(status.code(), Code::Unavailable);
+    assert_eq!((metrics.requests.get(), metrics.errors.get()), (3, 3));
+    assert_eq!((metrics.prepare.count(), metrics.dispatch.count()), (1, 1));
+    assert_eq!((metrics.in_flight.get(), metrics.queued.get()), (0, 0));
+
+    script.refuse.store(false, Ordering::SeqCst);
+    let mut ops = start(&farm, &job.action).await.expect("Execute");
+    next(&mut ops).await.expect("healthy").expect("QUEUED");
+    assert_eq!((metrics.in_flight.get(), metrics.queued.get()), (1, 1));
+    drop(ops);
+    for _ in 0..200 {
+        if metrics.in_flight.get() == 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    assert_eq!((metrics.in_flight.get(), metrics.queued.get()), (0, 0));
+    assert_eq!((metrics.requests.get(), metrics.errors.get()), (4, 4));
+}
+
+/// Catches: an Execute that joins a twin already executing (its first update is
+/// EXECUTING) leaving `kbf_execute_queued` raised, or not observing `queued_seconds`
+/// (a call that never saw QUEUED would then be absent from the histogram).
+#[tokio::test]
+async fn joining_a_running_twin_leaves_no_queued_stream() {
+    let script = Arc::new(Script::default());
+    script.joined.store(true, Ordering::SeqCst);
+    let farm = Farm::with_execution(Arc::clone(&script)).await;
+    let metrics = &farm.cache.metrics().execute;
+    let job = job("joined", &[], false);
+    farm.upload(&job.blobs.iter().collect::<Vec<_>>()).await;
+
+    let mut ops = start(&farm, &job.action).await.expect("Execute");
+    let first = next(&mut ops).await.expect("healthy").expect("an update");
+    assert_eq!(stage(&first), ExecStage::Executing as i32);
+    assert_eq!((metrics.in_flight.get(), metrics.queued.get()), (1, 0));
+    assert_eq!(metrics.queued_seconds.count(), 1);
+
+    script.set(0, Stage::Done(Finished::Ran(Box::default())));
+    next(&mut ops).await.expect("healthy").expect("done");
+    assert_eq!(next(&mut ops).await.expect("healthy"), None);
+    assert_eq!((metrics.in_flight.get(), metrics.queued.get()), (0, 0));
+    assert_eq!((metrics.requests.get(), metrics.errors.get()), (1, 0));
+    assert_eq!(metrics.queued_seconds.count(), 1, "observed once");
+}
+
+/// Waits until `metrics.in_flight` reads `want`: a stream the client dropped is
+/// dropped by the server some time later.
+async fn in_flight_settles(metrics: &kbf_front::metrics::ExecuteMetrics, want: u64) {
+    for _ in 0..200 {
+        if metrics.in_flight.get() == want {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    assert_eq!(metrics.in_flight.get(), want, "in_flight did not settle");
+}
+
+/// Catches: a stream that ends UNAVAILABLE because its operation was abandoned, or
+/// because the server is closing, not counted as an error; and either leaving
+/// `in_flight` or `queued` raised.
+#[tokio::test]
+async fn abandoned_and_closed_streams_count_as_errors() {
+    let script = Arc::new(Script::default());
+    let farm = Farm::with_execution(Arc::clone(&script)).await;
+    let metrics = &farm.cache.metrics().execute;
+    let job = job("abandoned", &[], false);
+    farm.upload(&job.blobs.iter().collect::<Vec<_>>()).await;
+    let mut ops = start(&farm, &job.action).await.expect("Execute");
+    next(&mut ops).await.expect("healthy").expect("QUEUED");
+    assert_eq!((metrics.in_flight.get(), metrics.queued.get()), (1, 1));
+    script.abandon(0);
+    let gone = next(&mut ops).await.expect_err("abandoned");
+    assert_eq!(gone.code(), Code::Unavailable);
+    assert_eq!((metrics.in_flight.get(), metrics.queued.get()), (0, 0));
+    assert_eq!((metrics.requests.get(), metrics.errors.get()), (1, 1));
+
+    let script = Arc::new(Script::default());
+    let (closer, closing) = kbf_front::closing();
+    let farm = Farm::with_execution_until(Arc::clone(&script), closing).await;
+    let metrics = &farm.cache.metrics().execute;
+    farm.upload(&job.blobs.iter().collect::<Vec<_>>()).await;
+    let mut ops = start(&farm, &job.action).await.expect("Execute");
+    next(&mut ops).await.expect("healthy").expect("QUEUED");
+    assert_eq!((metrics.in_flight.get(), metrics.queued.get()), (1, 1));
+    closer.close();
+    let gone = next(&mut ops).await.expect_err("closing");
+    assert_eq!(gone.code(), Code::Unavailable);
+    assert!(gone.message().contains("shutting down"), "{gone:?}");
+    assert_eq!((metrics.in_flight.get(), metrics.queued.get()), (0, 0));
+    assert_eq!((metrics.requests.get(), metrics.errors.get()), (1, 1));
+}
+
+/// Catches: a WaitExecution stream not counted in `kbf_execute_in_flight` (the
+/// `wait()` guard not wired into the service), one that also moves `requests`,
+/// `errors`, `total` or `queued`, and a dropped or finished one leaving `in_flight`
+/// raised.
+#[tokio::test]
+async fn wait_execution_counts_only_in_flight() {
+    let script = Arc::new(Script::default());
+    let farm = Farm::with_execution(Arc::clone(&script)).await;
+    let metrics = &farm.cache.metrics().execute;
+    let job = job("waited for", &[], false);
+    farm.upload(&job.blobs.iter().collect::<Vec<_>>()).await;
+    let mut ops = start(&farm, &job.action).await.expect("Execute");
+    next(&mut ops).await.expect("healthy").expect("QUEUED");
+    let wait = || async {
+        farm.exec()
+            .wait_execution(WaitExecutionRequest {
+                name: "operations/0".to_owned(),
+            })
+            .await
+            .expect("WaitExecution")
+            .into_inner()
+    };
+
+    let mut waited = wait().await;
+    next(&mut waited).await.expect("healthy").expect("QUEUED");
+    assert_eq!(metrics.in_flight.get(), 2);
+    assert_eq!(metrics.queued.get(), 1, "only the Execute is queued");
+
+    // A WaitExecution the client leaves mid-way is not an Execute error.
+    let mut dropped = wait().await;
+    next(&mut dropped).await.expect("healthy").expect("QUEUED");
+    assert_eq!(metrics.in_flight.get(), 3);
+    drop(dropped);
+    in_flight_settles(metrics, 2).await;
+
+    script.set(0, Stage::Done(Finished::Ran(Box::default())));
+    next(&mut waited).await.expect("healthy").expect("done");
+    assert_eq!(next(&mut waited).await.expect("healthy"), None);
+    next(&mut ops).await.expect("healthy").expect("done");
+    assert_eq!(next(&mut ops).await.expect("healthy"), None);
+    in_flight_settles(metrics, 0).await;
+    assert_eq!(metrics.queued.get(), 0);
+    assert_eq!(
+        (
+            metrics.requests.get(),
+            metrics.errors.get(),
+            metrics.total.count()
+        ),
+        (1, 0, 1),
+        "only the Execute is a request"
+    );
 }
 
 /// Catches: an Execute submitted while blobs it needs are missing (the daemon would

@@ -4,7 +4,7 @@
 
 mod support;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -20,9 +20,13 @@ use support::scratch;
 /// A [`MemoryCas`] that counts its reads: how many are in flight at most, and how many
 /// ask for each digest. A read yields a few times before it answers, so reads that are
 /// started together are in flight together; a read of a blob it lacks fails at once.
+/// A read of a digest in `held` (by label) is counted, then waits until a read of a
+/// blob it lacks has been counted, so no held blob can finish before the failure.
 #[derive(Default)]
 struct CountingCas {
     blobs: MemoryCas,
+    held: HashSet<String>,
+    missing_read: AtomicBool,
     in_flight: AtomicUsize,
     most_in_flight: AtomicUsize,
     reads: Mutex<HashMap<String, usize>>,
@@ -58,7 +62,13 @@ impl Cas for CountingCas {
             .entry(label(digest))
             .or_default() += 1;
         if self.blobs.blob(digest).is_none() {
+            self.missing_read.store(true, Ordering::SeqCst);
             return Err(CasError::Missing(label(digest)));
+        }
+        if self.held.contains(&label(digest)) {
+            while !self.missing_read.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
         }
         let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
         self.most_in_flight.fetch_max(now, Ordering::SeqCst);
@@ -163,23 +173,32 @@ async fn a_digest_named_many_times_is_fetched_once() {
 /// Catches `materialize` going on fetching the rest of the tree after a blob failed:
 /// the action is refused either way, so each fetch after the first error is a round
 /// trip and a write spent for nothing (a toolchain tree is thousands of them). The
-/// first blob is missing and fails at once; blobs started beside it may finish, no
-/// other may start. Mutant seen red: the check that a blob failed removed (201 reads).
+/// first blob is missing; the reads of the present blobs are held until its read is
+/// counted, so the first `BOUND` blobs are all started and none of them finishes before
+/// the failure, whatever the order the blocking pool creates their files in. Exactly
+/// the root and those `BOUND` blobs are read: no other blob may start. Without the hold
+/// a sibling could finish before the missing blob's file was created and let one more
+/// start before the failure (komira-build-farm#676). Mutants seen red: the check that
+/// a blob failed removed (201 reads); the hold replaced by the missing read waiting for
+/// `BOUND + 1` present reads, the schedule of #676 (more than `1 + BOUND` reads).
 #[tokio::test]
 async fn no_blob_is_fetched_after_one_failed() {
-    let cas = CountingCas::default();
+    let mut cas = CountingCas::default();
     let mut root = Directory::default();
     let missing = kbf_daemon::cas::digest_of(b"not in the CAS");
     root.files.push(file("f000".to_owned(), missing, false));
     for f in 1..200 {
-        let bytes = format!("file {f}").into_bytes();
-        root.files
-            .push(file(format!("f{f:03}"), cas.blobs.insert(bytes), false));
+        let digest = cas.blobs.insert(format!("file {f}").into_bytes());
+        cas.held.insert(label(&digest));
+        root.files.push(file(format!("f{f:03}"), digest, false));
     }
     let root = cas.blobs.message(&root);
     let dir = scratch("materialize-stops");
-    let error = materialize(&cas, &root, &dir)
+    // A deadline, so a materialize that never reads the missing blob fails rather
+    // than hangs on the held reads.
+    let error = tokio::time::timeout(Duration::from_secs(30), materialize(&cas, &root, &dir))
         .await
+        .expect("the missing blob was read in 30 s")
         .expect_err("a blob is missing");
     assert!(
         matches!(error, TreeError::Cas(CasError::Missing(_))),
@@ -191,9 +210,10 @@ async fn no_blob_is_fetched_after_one_failed() {
         .unwrap_or_else(PoisonError::into_inner)
         .values()
         .sum();
-    assert!(
-        reads <= 1 + BOUND,
-        "{reads} reads: the root, and blobs started after the error"
+    assert_eq!(
+        reads,
+        1 + BOUND,
+        "the root and the first {BOUND} blobs, none started after the error"
     );
 }
 

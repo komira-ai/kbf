@@ -18,7 +18,7 @@ use kbf_segments::layout::footer_len;
 use kbf_segments::{Footer, IndexEntry};
 use tonic::Code;
 
-use support::{Front, Seg, blob, put_all, seg, seg_with};
+use support::{Front, Seg, blob, put_all, seg, seg_with, try_put_all};
 
 /// Catches per-segment commits (mutant: commit per segment): an upload of three
 /// segments is stored as three objects and indexed by **one** `PutBlobs`, and every
@@ -56,11 +56,11 @@ async fn an_upload_of_three_segments_is_one_commit() {
     }
 }
 
-/// Catches trusting the daemon's footer (mutant: no SHA-256 check at commit), and a
-/// check that skips some record (mutants: only the first record in digest order
-/// hashed; the first never hashed): each record in turn, in digest order (first,
-/// middle and last), is altered after `Begin`; each such upload's commit is
-/// INVALID_ARGUMENT naming that record, and nothing of it is stored or indexed, the
+/// Catches trusting the daemon's footer (mutant: no SHA-256 check), and a check that
+/// skips some record (mutants: only the first record in digest order hashed; the first
+/// never hashed): each record in turn, in digest order (first, middle and last), is
+/// altered after `Begin`; each such upload's range that completes it, and its commit,
+/// are INVALID_ARGUMENT naming that record, and nothing of it is stored or indexed, the
 /// good records included. The same upload unaltered then commits, so the refusals
 /// were for the altered bytes.
 #[tokio::test]
@@ -84,22 +84,28 @@ async fn each_record_altered_after_begin_fails_the_commit_and_indexes_nothing() 
             records: altered,
             ..s.clone()
         };
-        put_all(&mut client, upload, 0, &sent, 4096, false).await;
-        let refused = client
+        // Records are checked as their bytes arrive: the range that completes the
+        // altered record is refused, and a commit after it is refused too.
+        let at_range = try_put_all(&mut client, upload, 0, &sent, 4096, false)
+            .await
+            .expect("the range completing the altered record is refused");
+        let at_commit = client
             .commit(CommitRequest { upload })
             .await
             .expect_err("altered record");
-        assert_eq!(
-            refused.code(),
-            Code::InvalidArgument,
-            "record {i}: {refused:?}"
-        );
-        assert!(
-            refused
-                .message()
-                .contains(&format!("record at {} ", entry.offset)),
-            "record {i} named: {refused:?}"
-        );
+        for refused in [at_range, at_commit] {
+            assert_eq!(
+                refused.code(),
+                Code::InvalidArgument,
+                "record {i}: {refused:?}"
+            );
+            assert!(
+                refused
+                    .message()
+                    .contains(&format!("record at {} ", entry.offset)),
+                "record {i} named: {refused:?}"
+            );
+        }
         front.assert_present(&s.digests, false).await;
         assert_eq!(
             front.cache.metrics().segment_put.count(),

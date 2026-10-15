@@ -125,22 +125,39 @@ pub async fn put_all(
     chunk: usize,
     reverse: bool,
 ) {
+    if let Some(refused) = try_put_all(client, upload, segment, s, chunk, reverse).await {
+        panic!("put range: {refused:?}");
+    }
+}
+
+/// As [`put_all`], stopping at the first range the server refuses and returning why.
+pub async fn try_put_all(
+    client: &mut SegmentsClient<Channel>,
+    upload: u64,
+    segment: usize,
+    s: &Seg,
+    chunk: usize,
+    reverse: bool,
+) -> Option<tonic::Status> {
     let mut starts: Vec<usize> = (0..s.records.len()).step_by(chunk).collect();
     if reverse {
         starts.reverse();
     }
     for start in starts {
         let end = s.records.len().min(start + chunk);
-        client
+        let sent = client
             .put_range(PutRangeRequest {
                 upload,
                 segment: u32::try_from(segment).expect("segment"),
                 offset: start as u64,
                 bytes: s.records[start..end].to_vec(),
             })
-            .await
-            .expect("put range");
+            .await;
+        if let Err(refused) = sent {
+            return Some(refused);
+        }
     }
+    None
 }
 
 /// A memory bucket whose PUTs can be held at a gate, or fail.

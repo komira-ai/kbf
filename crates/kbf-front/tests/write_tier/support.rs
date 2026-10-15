@@ -37,7 +37,8 @@ pub type TierCache = Cache<Log, FaultyStore>;
 /// The metadata log of one farm, kept across the cache's restarts. A test can refuse
 /// the next commits of a command (answered UNAVAILABLE, not applied), as a log that
 /// lost its leader would, or lose their answers (applied, then answered UNAVAILABLE),
-/// as a Raft log that stopped after the entry was durable would.
+/// as a Raft log that stopped after the entry was durable would, and then fail the
+/// next state read too, as a log that cannot answer at all would.
 #[derive(Clone, Debug)]
 pub struct Log(Arc<Inner>);
 
@@ -47,6 +48,11 @@ struct Inner {
     refuse: Mutex<BTreeMap<&'static str, usize>>,
     wrong: Mutex<BTreeMap<&'static str, usize>>,
     lose: Mutex<BTreeMap<&'static str, usize>>,
+    /// Commits whose lost answer also fails the next state read.
+    blind: Mutex<BTreeMap<&'static str, usize>>,
+    /// State reads still to fail, and how many failed.
+    fail_reads: Mutex<usize>,
+    failed_reads: Mutex<usize>,
     applied: Mutex<Vec<&'static str>>,
 }
 
@@ -57,6 +63,9 @@ impl Log {
             refuse: Mutex::new(BTreeMap::new()),
             wrong: Mutex::new(BTreeMap::new()),
             lose: Mutex::new(BTreeMap::new()),
+            blind: Mutex::new(BTreeMap::new()),
+            fail_reads: Mutex::new(0),
+            failed_reads: Mutex::new(0),
             applied: Mutex::new(Vec::new()),
         }))
     }
@@ -82,6 +91,27 @@ impl Log {
     pub fn lose_answer(&self, command: &'static str, n: usize) {
         assert!(COMMANDS.contains(&command), "{command}");
         *lock(&self.0.lose).entry(command).or_default() += n;
+    }
+
+    /// The next commit of `command` is applied and answered UNAVAILABLE, and the first
+    /// state read after it (through the cache's [`MetaLog::query`]) fails too: armed by
+    /// the lost answer itself, so no read the cache made before the commit takes it.
+    #[allow(
+        dead_code,
+        reason = "write_tier_flush.rs uses it; write_tier.rs does not"
+    )]
+    pub fn lose_answer_and_next_read(&self, command: &'static str) {
+        self.lose_answer(command, 1);
+        *lock(&self.0.blind).entry(command).or_default() += 1;
+    }
+
+    /// How many of the cache's state reads the test failed.
+    #[allow(
+        dead_code,
+        reason = "write_tier_flush.rs uses it; write_tier.rs does not"
+    )]
+    pub fn failed_reads(&self) -> usize {
+        *lock(&self.0.failed_reads)
     }
 
     /// Commits `command` straight to the log, as another server would.
@@ -158,6 +188,11 @@ impl MetaLog for Log {
         let mut lose = lock(&self.0.lose);
         if let Some(n) = lose.get_mut(label).filter(|n| **n > 0) {
             *n -= 1;
+            let mut blind = lock(&self.0.blind);
+            if let Some(n) = blind.get_mut(label).filter(|n| **n > 0) {
+                *n -= 1;
+                *lock(&self.0.fail_reads) += 1;
+            }
             return Err(MetaLogError::Unavailable(format!(
                 "{label} applied, its answer lost by the test"
             )));
@@ -170,6 +205,16 @@ impl MetaLog for Log {
         F: FnOnce(&MetaState) -> R + Send,
         R: Send,
     {
+        {
+            let mut fail = lock(&self.0.fail_reads);
+            if *fail > 0 {
+                *fail -= 1;
+                *lock(&self.0.failed_reads) += 1;
+                return Err(MetaLogError::Unavailable(
+                    "a state read failed by the test".to_owned(),
+                ));
+            }
+        }
         self.0.log.query(f).await
     }
 }

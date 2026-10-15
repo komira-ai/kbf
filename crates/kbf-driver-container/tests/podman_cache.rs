@@ -33,6 +33,7 @@ fn with_cache(config: &mut PodmanConfig, link: Option<Arc<kbf_daemon::cache::Lin
     config.cache = Some(CacheUse {
         config: cache,
         helper: std::env::current_exe().expect("this test binary"),
+        trees: None,
     });
 }
 
@@ -197,5 +198,68 @@ async fn identical_inputs_are_one_inode_and_tar_alike_on_every_run() {
         seen[0], seen[1],
         "the tar of the inputs changed with the fallback"
     );
+    cell.assert_clean(2);
+}
+
+// Shared read-only trees (`docs/design/fast-sandbox.md#44-correctness-an-action-cannot-modify-a-shared-tree`).
+// The daemon-side tests (`kbf-daemon/tests/trees.rs`) show which directories become mounts and
+// what a tree is on disk; the stand-in Podman shows the volume reaches the container's arguments.
+// Only a kernel shows the rest, below.
+
+/// A cache and a tree store beside `config`'s scratch directory.
+fn with_trees(config: &mut PodmanConfig) {
+    with_cache(config, None);
+    let trees = PathBuf::from(format!("{}-trees", config.scratch.display()));
+    let mut trees = kbf_daemon::trees::TreeConfig::new(trees, 1 << 30);
+    trees.min_files = 20;
+    config.cache.as_mut().expect("a cache").trees = Some(trees);
+}
+
+fn toolchain() -> Vec<support::Input> {
+    let leak = |text: String| -> &'static str { Box::leak(text.into_boxed_str()) };
+    (0..30)
+        .map(|i| {
+            let path = leak(format!("tc/lib/f{i}"));
+            let bytes: &'static [u8] = leak(format!("tool file {i}")).as_bytes();
+            (path, bytes, i == 0)
+        })
+        .collect()
+}
+
+/// Catches a shared tree the container can change or lift the read-only flag from: the
+/// action tries to create a file, append to and truncate a file, chmod, make a
+/// directory, rename a file inside the tree and out of it, hard-link a tree file into
+/// the input root (`EXDEV`: another mount), and remount the tree read-write as the
+/// container's root with its own mount namespace. Every attempt is refused and the next
+/// lease reads the tree whole. The mountinfo line of the tree is printed: it shows
+/// `ro`, which is what this test proved the behaviour on.
+#[tokio::test]
+#[ignore = "needs rootless Podman and a delegated cgroup: run by cargo xtask podman-tests"]
+async fn a_container_cannot_change_a_shared_tree_or_lift_its_read_only_flag() {
+    let cell = Cell::with("trees-ro", with_trees);
+    let mut spec = sh("grep ' /kbf/root/tc ' /proc/self/mountinfo; \
+         for try in 'echo x > tc/new' 'echo x >> tc/lib/f1' 'truncate -s0 tc/lib/f1' 'chmod u+w tc/lib/f1' \
+                    'mkdir tc/d' 'mv tc/lib/f1 tc/lib/g' 'mv tc/lib/f2 f2' 'ln tc/lib/f3 f3' \
+                    'rm tc/lib/f4' 'mount -o remount,rw /kbf/root/tc'; do \
+           if sh -c \"$try\" 2>/dev/null; then echo \"WROTE: $try\"; else echo \"refused: $try\"; fi; \
+         done; cat tc/lib/f1; echo; ls tc/lib | wc -l");
+    spec.inputs = toolchain();
+    spec.inputs.push(("src/a", b"small", false));
+    let result = cell.run(1, &spec).await.expect("ran");
+    let said = cell.stdout(&result);
+    eprintln!("{said}");
+    assert!(!said.contains("WROTE"), "{said}");
+    assert_eq!(said.matches("refused: ").count(), 10, "{said}");
+    assert!(
+        said.lines().next().is_some_and(|l| l.contains(" ro")),
+        "{said}"
+    );
+    assert!(said.ends_with("tool file 1\n30\n"), "{said}");
+    let mut second = sh("cat tc/lib/f1; echo; ls tc/lib | wc -l; test -x tc/lib/f0 && echo exec");
+    second.inputs = spec.inputs.clone();
+    let result = cell.run(2, &second).await.expect("lease 2");
+    assert_eq!(cell.stdout(&result), "tool file 1\n30\nexec\n");
+    let stats = cell.runtime.tree_stats().expect("a store");
+    assert_eq!((stats.builds, stats.hits), (1, 1), "{stats:?}");
     cell.assert_clean(2);
 }

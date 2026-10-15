@@ -26,8 +26,7 @@ use tokio::sync::watch;
 use super::layout::{FIXED_MTIME, Key, remove_if_present};
 use super::verify::{Found, inspect, stat_check};
 use super::{Cache, Inner, Point, Slot, State, bump};
-use crate::cas::{Cas, CasError, digest_of};
-use kbf_proto::reapi::Digest;
+use crate::cas::{CasError, digest_of};
 
 /// Where a lease gets a key's bytes, and whether the cache had them.
 #[derive(Debug)]
@@ -115,23 +114,7 @@ impl std::fmt::Display for InputStats {
     }
 }
 
-/// A [`Cas`] as the cache reads it: one checked fetch, behind a pointer, so the cache
-/// is compiled once whatever the CAS.
-pub(crate) trait Fetch: Send + Sync {
-    fn fetch<'a>(
-        &'a self,
-        digest: &'a Digest,
-    ) -> futures::future::BoxFuture<'a, Result<Vec<u8>, CasError>>;
-}
-
-impl<C: Cas> Fetch for C {
-    fn fetch<'a>(
-        &'a self,
-        digest: &'a Digest,
-    ) -> futures::future::BoxFuture<'a, Result<Vec<u8>, CasError>> {
-        Box::pin(crate::cas::fetch(self, digest))
-    }
-}
+pub(crate) use crate::cas::Fetch;
 
 /// A held slot. Dropped, it leaves the fill map and wakes the waiters, handing them
 /// the fill's error if it failed.
