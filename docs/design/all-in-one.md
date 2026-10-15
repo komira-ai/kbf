@@ -14,6 +14,13 @@ it.** The owner's rulings (2026-10-15), each recorded where it applies:
   hash on the upload path (sections 2 and 4).
 - The server **trusts the daemon's digest at Commit and verifies in the background flush**
   (merged in #656). All-in-one uses that path unchanged.
+- **In all-in-one there is no server coordinating any daemon other than its own.** The owner's
+  ruling: `kbf-all-in-one` is a single-node farm, full stop. The server half serves only the
+  in-process daemon half. It opens **no worker listener** and accepts no remote daemon; the
+  command line has no node certificate or key, no deny list and no peer admission. The
+  client-facing REAPI listener and the API listener stay as `kbf-server` has them. Both the
+  data plane and the control plane between the halves are in-process calls (sections 1
+  and 4). Scaling past one node means the split binaries, never all-in-one plus extra daemons.
 - `--reserve-cpus` exists on the daemon and all-in-one only. The server takes every CPU
   tokio gives it (section 6).
 - **A durable server log is a precondition (P1) and is being built separately**: a local
@@ -54,20 +61,28 @@ OOM and crash blast radius) are answered in sections 2, 7 and 11.
 3. **One data-plane interface, two implementations**: remote (today's transfer engine
    over mutual TLS) and in-process (direct calls into the server's cache and segment
    code). The daemon is generic over the interface and cannot tell which it has.
-4. **The control plane stays gRPC** (`Session`, leases, heartbeats) in every binary, over
-   mutual TLS in all-in-one too (section 4). It is small, not on the measured path, and
-   keeping it the same means one scheduler, one commit path and one set of sim scenarios.
-   An in-process control plane is not designed here.
-5. **One CPU flag**, `--reserve-cpus`, on `kbf-daemon` and `kbf-all-in-one` only, Linux
+4. **One control-plane interface, two implementations**, mirroring the data plane: remote
+   (today's `Session` stream, leases and heartbeats over mutual TLS to the worker listener
+   of `kbf-server`) and in-process (the daemon half's lease stream, welcome, heartbeats and
+   results as calls and channels into the server half's scheduler, section 4). One
+   conformance suite runs against both (section 8). The scheduler and its commit path are
+   the same code behind both, so the sim scenarios still apply.
+5. **All-in-one is a single-node farm.** The server half serves only the in-process
+   daemon half: no worker listener, no remote daemon, and no node certificate, node key,
+   deny list or peer admission on its command line. The REAPI and API listeners are as in
+   `kbf-server`. A farm that needs a second node runs the split binaries
+   (`kbf-server` + `kbf-daemon`); it never adds daemons to an all-in-one.
+6. **One CPU flag**, `--reserve-cpus`, on `kbf-daemon` and `kbf-all-in-one` only, Linux
    only. `kbf-server` has no such flag and uses as many CPUs as tokio gives it. No pinning.
    What the reserve does not cover goes to builds (section 6). Unset, every binary behaves
    exactly as it does today.
-6. **One conformance suite** for the data plane, run against both implementations
-   (section 8).
-7. **The split binaries stay first class.** A Linux remote daemon stays connected to the
-   live farm as a canary, and CI renders and checks the split and converged shapes as
-   well as all-in-one (section 9).
-8. **No measurement gate.** The owner has ruled that performance and operational overhead
+7. **One conformance suite** for the data plane and one for the control plane, each run
+   against both implementations (section 8).
+8. **The split binaries stay first class.** They are the only way past one node, the
+   target farm's shape, and the only shape that serves a remote daemon or a Mac. A split
+   canary farm exercises the remote paths in production, and CI renders and checks the
+   split and converged shapes as well as all-in-one (section 9).
+9. **No measurement gate.** The owner has ruled that performance and operational overhead
    justify the work. The in-flight do-less PRs and the worker-cache link work (section 11)
    still change what the numbers show, so section 11's measurements are recorded as the
    work lands, to report what it bought. Phase 0 changes no behaviour.
@@ -174,18 +189,43 @@ that method on a small `DataPlane: Cas` trait so nothing in the daemon names `Tr
 
 | | `RemoteDataPlane` | `LocalDataPlane` |
 |---|---|---|
-| Bytes move | `Transfers` over one mutual-TLS HTTP/2 connection to the worker listener | function calls into the server's `Cache` and `SegmentsService` in the same process |
-| Authentication | the daemon's certificate, admitted per call by `identity.rs` | none on the wire; the daemon is constructed with the server's handle. The deny list still applies: each call is admitted for the daemon's own node id through the same `admit_call` check, so cordon and deny edits refuse the next call as they do today |
+| Bytes move | `Transfers` over one mutual-TLS HTTP/2 connection to the worker listener of `kbf-server` | function calls into the server's `Cache` and `SegmentsService` in the same process |
+| Authentication | the daemon's certificate, admitted per call by `identity.rs` (the deny list is a check of this listener) | none: the daemon half is constructed with the server half's handle and there is no listener to authenticate on. Nothing is admitted because nothing is remote (see "Peer admission" below) |
 | Integrity | the server trusts the daemon's digest at Commit and verifies it in the background flush, which hashes each record before the tier PUT and drops one that fails (#656) | **the same path.** The walk reads and hashes each output file once and hands the buffer over as `Bytes`; the flush writes it to the tier and verifies as for a remote daemon. There is no extra in-process hash and no flag that skips the flush's check |
 | Upload ownership | `Connections` keyed by the peer `SocketAddr` | keyed by `Owner::Local(PlaneId)`, one fresh id per `LocalDataPlane` (idle timeout, drop-on-close and admission release hang on it as for TCP) |
 | Copies | file, spool read, protobuf encode, TLS encrypt, kernel, decrypt, decode, into the server's buffer | the walk's buffer is passed as `Bytes` (a second file read only above the walk's memory bound); no spool copy, no encode, no TLS, no kernel hop |
 
-**The control plane in all-in-one is still mutual TLS.** The daemon half dials the
-server half's listener over loopback with a node certificate issued the way any node's is,
-admitted by `identity.rs` as any node. The unit therefore holds a node key as well as the
-server's (section 7 lists both). This keeps one admission path, and it means the saving
-from dropping TLS is on the data plane only, which is where the bytes are; the control
-plane's TLS CPU (heartbeats, leases) is small and is not counted as a saving.
+**The control plane in all-in-one is in-process too.** No worker listener is opened, so no
+node certificate, node key or deny list exists on the all-in-one command line, and the
+unit holds none. Phase 0 puts the daemon's side of the control plane behind a trait,
+`ControlPlane` (names are the implementer's): open the session and receive the welcome,
+the lease stream, send heartbeats, report results, and the commit and release calls that
+go with a lease. Two implementations, as for the data plane:
+
+| | `RemoteControlPlane` | `LocalControlPlane` |
+|---|---|---|
+| Transport | the `Session` gRPC stream over mutual TLS to the worker listener of `kbf-server` | calls into the server half's scheduler, and bounded `tokio` channels for the streams (lease offers server to daemon; heartbeats and results daemon to server), in the same process |
+| Identity | the node certificate, admitted by `identity.rs` | none on a wire; the daemon half is built with the server half's handle, and the server half knows exactly one session owner |
+| Session end | the stream closes: a dropped connection, a restart | the channels close: the daemon half is dropped or the process ends. The scheduler sees the same "session closed" event as for a lost stream, so lease handover and requeue are the existing code paths |
+| Messages | protobuf, serialized | the same Rust message structs, moved, not serialized |
+
+The scheduler, the commit path and the lease state machine are single code behind both.
+`LocalControlPlane` is an adapter at the scheduler's door and holds no scheduling logic;
+a second code path would fork the commit path from the split deployment's, which is the
+risk this design must avoid. **One conformance suite** (section 8) runs against both:
+welcome and lease assignment, a heartbeat that extends a lease, a missed heartbeat that
+expires one, results and commit, a session closed mid-lease and a new session after it, a
+second session for the same node (refused or superseding, as the remote plane decides, and
+the same on both), and cancellation. Backpressure is part of the suite: a daemon that
+does not read offers does not grow the server's memory without bound.
+
+**Peer admission.** The deny list, cordon and node-id admission apply only to the worker
+listener of `kbf-server`: they decide which remote nodes may speak to it. All-in-one has
+no such listener and exactly one node, its own, so there is nothing to admit. A separate
+in-process deny-list check was considered and rejected for that reason: it would guard no
+boundary, add a state the operator could edit with no effect on a real peer, and keep
+alive the certificate and node-id machinery this shape removes. Operator cordon and drain
+of the single node go through the API listener's existing calls and are unchanged.
 
 **`Owner`.** Phase 0's one change inside `kbf-front`:
 `Connections::of(Option<SocketAddr>)` becomes `of(Owner)`, with
@@ -394,8 +434,7 @@ holds, and what each is worth:
 |---|---|---|
 | S3 key for the bucket | read and write of every blob and segment in the bucket | scope the key to the bucket and prefix; the server still verifies digests on read-through, but an attacker with the key can also delete or rewrite objects directly |
 | operator API token | the write API: cordon, drain, hold, cancel | audited; an operator can rotate |
-| the server's mTLS private key, trusted by every daemon including every Mac | impersonate the server to the whole fleet | by `fleet-updates-security.md` S1.3 that is a compromised `kbf-server`: it can install only sets CI signed for the pool, and cannot erase a Mac |
-| the node key for the loopback control plane | act as this node | one node |
+| the server's TLS private key for its client-facing listeners (all-in-one has no daemon to trust it and no node key) | impersonate the server to its clients | the clients of one node; no fleet trusts this key |
 | the rollout credential and the client identity toward `kbf-mdm-gate`, if configured | force-update Macs (one per pool at a time) and relay signed requests | S1.3, S1.4: "one escape loses the Mac fleet" is the rating the security design gives a gate beside actions |
 | the raft and metadata directories, and the tier | rewrite the farm's state and any unflushed block (the only copy) | none; this is the integrity of the farm |
 
@@ -525,7 +564,7 @@ cap; `missing` before and after a put; a segment upload and a `read_located` of 
 blob already present; an upload whose record bytes do not match their digest (refused,
 nothing indexed, and no retry that repeats it); two concurrent uploads; an upload
 abandoned on drop releases `--write-bytes-in-flight`; a deny-list edit mid-session
-refuses the next call; the same sequence yields the same metadata (the final index is
+is a remote-plane case only: no local case, since no admission exists there; the same sequence yields the same metadata (the final index is
 compared between the two planes).
 
 Each test names the mutant that turns it red:
@@ -533,12 +572,14 @@ Each test names the mutant that turns it red:
 | Test | Mutant |
 |---|---|
 | a record whose bytes do not match the daemon's digest is dropped by the background flush on both planes and never PUT | the local adapter bypasses the flush's check; the output file is hashed a second time on the upload path |
-| deny-list edit refuses the next local call | local admission cached at construction |
+| the deny-list edit mid-session refuses the next call on `RemoteDataPlane`; `kbf-all-in-one` has no deny-list flag and no worker-listener flag (the parser rejects them) | an in-process admission check added, or a worker-listener flag accepted |
 | dropped local upload releases the write budget; a stalled local upload does not starve remote ones | release missing for `Owner::Local` |
 | two `LocalDataPlane`s: dropping one's upload releases only its own, and a Commit on one cannot adopt the other's upload | both planes given the same `PlaneId` |
 | a remote request with no peer address is refused before admission | `Owner` has a "none" case that skips the lookup |
 | both planes produce the same index | one plane skips the footer or the staging commit |
 | `kbf-all-in-one` starts and an action's outputs appear in the CAS with zero TCP `PutRange` bytes | the daemon is wired to `RemoteDataPlane` by mistake |
+| `kbf-all-in-one` binds only the REAPI and API listeners (no worker port is open), and a remote node's connection to where the worker port would be is refused | a worker listener left on in all-in-one |
+| the control-plane conformance cases (section 8, "A conformance suite for the control plane") pass for `RemoteControlPlane` and `LocalControlPlane` | the local adapter completes a lease without the scheduler's commit path, or never reports a closed session |
 | `kbf-server` has no driver crate, and `kbf-node` neither `kbf-front` nor `kbf-server`, in its **normal** dependency tree | `layering.rs` rule removed |
 | `kbf-all-in-one __keeper ...`, `... slots ...` and the `chown_dirs` mode run the helper and exit with its code; no listener, no server directory opened, no clap error | `dispatch_helpers()` called after argument parsing, or missing from the all-in-one `main` |
 | a panic in a driver task leaves the process serving | driver run on the farm's main task |
@@ -555,6 +596,12 @@ Each test names the mutant that turns it red:
 | the memory sum, the OOM ordering of section 7.2 and the slice sum | each planted as in 7.2 |
 | `check-units` refuses an all-in-one unit with a gate client identity or rollout credential | the refusal removed |
 
+**A conformance suite for the control plane**, written against `ControlPlane` once, run
+for each implementation (cases in section 4). `RemoteControlPlane` runs against an
+in-process server over a real connection; `LocalControlPlane` against the same
+server's handle. The final scheduler state is compared between the two, as the index is
+for the data plane.
+
 **Real two-process path.** `kbf-it` runs the split pair and `kbf-all-in-one` through the
 same action (multi-file output, a cache hit on a second run) and compares CAS contents.
 `deploy_units.rs` renders the all-in-one, converged and split units and runs their flags
@@ -565,7 +612,8 @@ through the parser, in CI on every change.
 
 **Simulation.** `kbf-sim-cell` has a `FakeDaemon` and a fake server on a modelled
 network. Phase 1 adds a data-plane mode to `FakeDaemon` that bypasses the network model
-for bytes and keeps it for the control plane, with injectable faults (crash of the whole
+for bytes, and a control-plane mode that replaces the session with the in-process channels
+(the network model stays for the split mode), with injectable faults (crash of the whole
 process between staging and answering, restart with a stale session). The existing
 properties 1 to 9 hold unchanged in both modes. Added: **A1** after any whole-process
 crash, every upload either completed whole or left nothing indexed; **A2** the final index
@@ -613,10 +661,11 @@ does.
   `apply.rs` does not restart what it replaced today ("not done yet"); the restart and the
   drain for all-in-one is the same unit step the daemon needs, and the all-in-one phase
   waits on it.
-- **A canary that stays split.** While the live one-node farm runs all-in-one, at least one
-  Linux `kbf-daemon` on another host stays connected to it over the remote data plane
-  (admission, mutual TLS, `Owner::Peer`), and runs the same `kbf-it` action daily, so those
-  paths are exercised in production and not only by CI and the Macs.
+- **A canary that stays split.** All-in-one accepts no remote daemon, so the canary is a
+  separate split farm (`kbf-server` + `kbf-daemon`, a Linux daemon among its nodes) that
+  runs the same `kbf-it` action daily. The remote data plane, the remote control plane,
+  admission, mutual TLS and `Owner::Peer` are exercised in production there, and not only
+  by CI and the Macs. It does not connect to the all-in-one farm.
 
 ## 10. Migration phases and preconditions
 
@@ -630,6 +679,8 @@ does.
 - `--reserve-cpus` in `kbf-daemon` (not `kbf-server`) with the derived pools and the two
   cgroup weights; **unset, bit-identical to today** (a test
   proves it), so reported `cpus` does not change until a deploy sets it.
+- `ControlPlane` trait, with `RemoteControlPlane` wrapping today's session code; the
+  control-plane conformance suite, for `RemoteControlPlane` only. No wire change.
 - The conformance suite, for `RemoteDataPlane` only. The `kbf-all-in-one` crate exists as
   the stub only, if at all.
 - Rebases onto the in-flight PRs of section 11: the contract the local plane needs is "a
@@ -651,11 +702,21 @@ does.
 - **P5: the restart and drain step of `apply.rs`**, and the `set.rs` change of section 9.
 - **P6: removed.** The owner ruled the measurement gate out (section 11).
 
-**Phase 1: the all-in-one binary with in-process outputs.** `kbf-all-in-one`, the
-`LocalDataPlane` for puts (outputs, stdout, stderr) and gets. `kbf-deploy` shape and the
-ownership step, unit, `check-units` rules, the whole-process-crash sim mode, the
-driver-panic and helper-dispatch tests. Reverts by the ownership step run backwards, which
-is safe only while P1 holds; before P1 a revert is also a state loss.
+**Phase 1: the all-in-one binary, a single-node farm with in-process data and control
+planes.** Three slices, each independently reviewable:
+
+- **(a) the data plane**: `LocalDataPlane` for puts (outputs, stdout, stderr) and gets.
+  Merged as #724.
+- **(b)**: #730.
+- **(c) the in-process control plane and no worker listener**: `LocalControlPlane` behind
+  `ControlPlane`, the control-plane conformance suite for both, and `kbf-all-in-one` opening
+  no worker listener and taking no node certificate, key or deny-list flag.
+
+With the slices: `kbf-deploy` shape and the ownership step, unit, `check-units` rules
+(including that an all-in-one unit configures no worker listener, node certificate or
+deny list), the whole-process-crash sim mode, the driver-panic and helper-dispatch
+tests. Reverts by the ownership step run backwards, which is safe only while P1 holds;
+before P1 a revert is also a state loss.
 
 **Phase 2: the shared cache for inputs.** 2a fill from the tier, 2b the shared budget, in
 that order, each behind its own `--shared-cache` flag value (`fill`, `budget`) so each is
@@ -721,8 +782,17 @@ first version of this document, #657). Rejected as the main design by the projec
 **File descriptors over a socket:** a framed protocol, `SCM_RIGHTS`, filesystem
 allowlists and a TOCTOU analysis for one saved read. **A shared content-addressed file
 store replacing the tier and the node cache:** discards the packed segment (one PUT and one
-metadata commit per upload). **An in-process control plane:** nothing measured points at
-it, and it would fork the scheduler's commit path from the split deployment's. **Reflink
+metadata commit per upload). **Keeping the control plane on mutual TLS to a loopback worker listener in all-in-one**
+(this document's earlier position, "an in-process control plane is not designed here"):
+replaced by the in-process control plane of section 4, because the owner ruled that all-in-one
+serves no daemon but its own, which leaves no reason to open a worker listener or to hold a
+node key. The risk it raised, forking the scheduler's commit path, is met by one scheduler
+behind one trait with one conformance suite. **A separate in-process deny-list check in
+all-in-one:** peer admission guards only the worker listener of `kbf-server`; all-in-one has
+none and one node, so the check would guard nothing. **All-in-one plus extra remote
+daemons:** a multi-node farm is the split binaries (`kbf-server` + `kbf-daemon`); a hybrid
+needs the listener, certificates and admission this shape removes, and its isolation
+argument (section 7) assumes no remote peer. **Reflink
 or `copy_file_range` into the tier:** block alignment and cross-filesystem behaviour make
 it unreliable, and copy-then-hash is TOCTOU-unsafe. **A phase that renames outputs into
 the cache:** already `worker-cache.md` 6.7 in every binary (section 5). **One hash pool
