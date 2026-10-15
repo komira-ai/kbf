@@ -152,6 +152,14 @@ fn counts_are_per_place_and_use_the_known_summaries_for_skipped_children() {
     // The skipped child is in the map too: `select` looks it up there.
     assert_eq!(sums[&label(&leaf.0)], summary(300, 3000));
 
+    // A known summary for a node that is loaded is not used: its own children say what
+    // it holds (a node whose children were skipped needs them in the map).
+    let both =
+        |name: &str| (name == label(&leaf.0) || name == label(&mid.0)).then(|| summary(999, 999));
+    let sums = summarize(&partial, &both).unwrap();
+    assert_eq!(sums[&label(&mid.0)], summary(2 + 2 * 999, 10 + 2 * 999));
+    assert_eq!(sums[&label(&top.0)], summary(1 + 2000, 1 + 2008));
+
     // A skipped child with no summary is an error, not an empty directory.
     let err = summarize(&partial, &|_| None).unwrap_err();
     assert!(matches!(err, TreeError::Invalid(_)), "{err}");

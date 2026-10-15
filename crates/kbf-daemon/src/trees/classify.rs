@@ -260,16 +260,20 @@ pub(crate) fn summarize(
                 .fold(0, |sum, d| sum.saturating_add(d.size_bytes.max(0) as u64));
             for index in 0..directory.directories.len() {
                 let child = label(child_digest(directory, index)?);
-                let found = match done.get(&child) {
-                    Some(done_already) => Some(*done_already),
-                    None => known(&child),
+                let summary = match done.get(&child) {
+                    Some(s) => *s,
+                    None => match known(&child) {
+                        Some(s) if !loaded.contains_key(&child) => {
+                            // Kept: `select` looks a skipped node up with the rest.
+                            done.insert(child.clone(), s);
+                            s
+                        }
+                        _ => {
+                            waiting.push(child);
+                            continue;
+                        }
+                    },
                 };
-                let Some(summary) = found else {
-                    waiting.push(child);
-                    continue;
-                };
-                // Kept: `select` looks a skipped node up with the rest.
-                done.insert(child, summary);
                 files = files.saturating_add(summary.files);
                 bytes = bytes.saturating_add(summary.bytes);
             }
