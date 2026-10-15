@@ -2,10 +2,69 @@
 //! the test's own: "the departing uid" is the test's uid to see what is removed, and
 //! any other uid to see that nothing is.
 
+use std::cell::RefCell;
 use std::fs;
 use std::os::unix::fs::{PermissionsExt as _, symlink};
 
 use super::*;
+
+/// A point of a sweep at which a test makes entries vanish (see [`vanishing`]).
+pub(super) enum Point<'a> {
+    /// A directory was listed; the walk goes on with the names it read.
+    Listed,
+    /// The entry of this name was examined; the walk goes on with what it found.
+    Examined(&'a OsStr),
+}
+
+/// A test's hook: the point reached, and how many listings the sweep has made so far.
+type Hook = Box<dyn FnMut(&Point<'_>, usize)>;
+
+thread_local! {
+    /// This thread's hook and its count of listings.
+    static HOOK: RefCell<Option<(usize, Hook)>> = const { RefCell::new(None) };
+}
+
+/// Called by the sweep at each [`Point`] (see `super::listed` and `super::examine`).
+pub(super) fn reached(point: Point<'_>) {
+    // Taken out while it runs, so a hook that walks cannot re-enter itself.
+    let Some((mut listings, mut hook)) = HOOK.with_borrow_mut(Option::take) else {
+        return;
+    };
+    listings += usize::from(matches!(point, Point::Listed));
+    hook(&point, listings);
+    HOOK.with_borrow_mut(|slot| *slot = Some((listings, hook)));
+}
+
+/// Runs `run` with `hook` called at each point its sweeps reach.
+fn vanishing<T>(hook: impl FnMut(&Point<'_>, usize) + 'static, run: impl FnOnce() -> T) -> T {
+    HOOK.with_borrow_mut(|slot| *slot = Some((0, Box::new(hook))));
+    let out = run();
+    HOOK.with_borrow_mut(|slot| *slot = None);
+    out
+}
+
+/// A hook that runs `act` right after the sweep's `n`th listing.
+fn after_listing(n: usize, mut act: impl FnMut() + 'static) -> impl FnMut(&Point<'_>, usize) {
+    move |point, listings| {
+        if matches!(point, Point::Listed) && listings == n {
+            act();
+        }
+    }
+}
+
+/// A hook that removes `path` right after the sweep examined an entry named `name`.
+fn after_examining(name: &'static str, path: PathBuf) -> impl FnMut(&Point<'_>, usize) {
+    move |point, _| {
+        if matches!(point, Point::Examined(seen) if *seen == name) {
+            remove(&path);
+        }
+    }
+}
+
+/// Removes `path`, a file or a whole directory, if it is there.
+fn remove(path: &Path) {
+    let _ = fs::remove_file(path).or_else(|_| fs::remove_dir_all(path));
+}
 
 fn me() -> u32 {
     rustix::process::geteuid().as_raw()
@@ -344,4 +403,176 @@ fn empty_removes_every_entry_whoever_owns_it_and_keeps_the_folder() {
     assert_eq!(swept.errors.len(), 1, "{swept:?}");
     assert!(swept.errors[0].contains("home/locked:"), "{swept:?}");
     assert_eq!(names(&home), ["locked"]);
+}
+
+/// Catches (komira-build-farm#652): a sweep that records an error for an entry which
+/// vanished between the listing of its folder and its examination, so `user-delete`
+/// refused with "the sweep for ... is incomplete: ...: No such file or directory".
+/// First the departing uid's own entries (gone before the walk examines them; the one
+/// still there is removed), then the case of the issue: a file of another owner deep
+/// in another owner's folders (`triald`'s temporary file under the lease user's
+/// `/private/var/folders/.../T`), which the walk only examines.
+#[test]
+fn an_entry_that_vanishes_after_the_listing_is_not_an_error() {
+    let base = scratch("vanish-listed").join("Shared");
+    fs::create_dir(&base).unwrap();
+    fs::write(base.join("daemon-temp"), "x").unwrap();
+    fs::create_dir_all(base.join("daemon-dir/inner")).unwrap();
+    fs::write(base.join("kept-until-swept"), "x").unwrap();
+    let (temp, dir) = (base.join("daemon-temp"), base.join("daemon-dir"));
+    let swept = vanishing(
+        after_listing(1, move || {
+            remove(&temp);
+            remove(&dir);
+        }),
+        || sweep(&owned_plan(&base), "kbf-lease-10-2", me()),
+    );
+    assert_eq!(swept.errors, Vec::<String>::new());
+    assert_eq!(swept.removed, 1, "{swept:?}");
+    assert!(names(&base).is_empty());
+
+    // `Shared` is listing 1, `T` 2, `com.apple.triald` 3.
+    let triald = base.join("T/com.apple.triald");
+    fs::create_dir_all(&triald).unwrap();
+    fs::write(triald.join("TRIFileBackedMutableStringArray"), "x").unwrap();
+    fs::write(triald.join("kept"), "x").unwrap();
+    let gone = triald.join("TRIFileBackedMutableStringArray");
+    let swept = vanishing(after_listing(3, move || remove(&gone)), || {
+        sweep(&owned_plan(&base), "kbf-lease-10-2", other())
+    });
+    assert_eq!(swept, Swept::default());
+    assert_eq!(names(&triald), ["kept"]);
+}
+
+/// Catches (komira-build-farm#652): a directory being emptied whose entries vanish
+/// between its listing and their examination (the same daemon, one level down) that
+/// fails the sweep, or one that leaves the directory behind because of it; and the
+/// same for `empty`, which clears the lease user's home. The vanished entries are the
+/// second listing's, the one of the directory being removed.
+#[test]
+fn entries_that_vanish_while_a_directory_is_emptied_are_not_an_error() {
+    let base = scratch("vanish-emptied").join("Shared");
+    let tree = base.join("tree");
+    for (run, uid) in [("sweep", me()), ("empty", other())] {
+        fs::create_dir_all(tree.join("sub")).unwrap();
+        fs::write(tree.join("sub/f"), "x").unwrap();
+        fs::write(tree.join("g"), "x").unwrap();
+        let gone = tree.clone();
+        // Both list `Shared` (1), then `tree` (2): the entries go in between.
+        let hook = after_listing(2, move || {
+            remove(&gone.join("g"));
+            remove(&gone.join("sub"));
+        });
+        let swept = vanishing(hook, || {
+            if run == "sweep" {
+                sweep(&owned_plan(&base), "u", uid)
+            } else {
+                empty(&base, uid)
+            }
+        });
+        assert_eq!(swept.errors, Vec::<String>::new(), "{run}");
+        assert_eq!(swept.removed, 1, "{run}: {swept:?}");
+        assert!(
+            names(&base).is_empty(),
+            "{run}: the emptied directory stayed"
+        );
+    }
+}
+
+/// Catches (komira-build-farm#652): `empty` (the home folder) recording an error for an
+/// entry gone since the listing, or counting it as removed.
+#[test]
+fn empty_passes_over_an_entry_gone_since_the_listing() {
+    let home = scratch("vanish-home").join("home");
+    fs::create_dir(&home).unwrap();
+    fs::write(home.join("gone"), "x").unwrap();
+    fs::write(home.join("file"), "x").unwrap();
+    let gone = home.join("gone");
+    let swept = vanishing(after_listing(1, move || remove(&gone)), || {
+        empty(&home, other())
+    });
+    assert_eq!(
+        swept,
+        Swept {
+            removed: 1,
+            errors: Vec::new()
+        }
+    );
+    assert!(names(&home).is_empty());
+}
+
+/// Catches (komira-build-farm#652): a directory gone between its examination and its
+/// opening that fails the sweep: another owner's directory the walk searches, and one
+/// of the departing uid it removes.
+#[test]
+fn a_directory_gone_since_it_was_examined_holds_nothing() {
+    let base = scratch("vanish-open").join("Shared");
+    for (what, uid) in [("searched", other()), ("removed", me())] {
+        fs::create_dir_all(base.join("dir/sub")).unwrap();
+        fs::write(base.join("kept"), "x").unwrap();
+        let swept = vanishing(after_examining("dir", base.join("dir")), || {
+            sweep(&owned_plan(&base), "u", uid)
+        });
+        assert_eq!(swept.errors, Vec::<String>::new(), "{what}");
+        assert!(!base.join("dir").exists(), "{what}");
+        let _ = fs::remove_file(base.join("kept"));
+    }
+}
+
+/// Catches (komira-build-farm#652): a removal step that fails on an entry gone since
+/// it was examined (the unlink or the directory's opening answers "no such file").
+/// The entry is examined, then removed by someone else, then removal runs on the stale
+/// examination: no listing is involved, so this is the narrowest window.
+#[test]
+fn an_entry_gone_since_it_was_examined_is_removed_already() {
+    let base = scratch("vanish-stale").join("Shared");
+    fs::create_dir_all(base.join("dir")).unwrap();
+    fs::write(base.join("file"), "x").unwrap();
+    let dir = open_base(&base).unwrap().expect("the folder exists");
+    let dev = rustix::fs::fstat(&dir).unwrap().st_dev;
+    for name in ["file", "dir"] {
+        let stat = rustix::fs::statat(&dir, name, AtFlags::SYMLINK_NOFOLLOW).unwrap();
+        remove(&base.join(name));
+        remove_entry(&dir, OsStr::new(name), &stat, me(), dev, 1)
+            .unwrap_or_else(|why| panic!("{name}: {why}"));
+    }
+}
+
+/// Catches (komira-build-farm#652): a directory removed after the walk opened it that
+/// fails the walk when listed. The walk relies on rustix's `Dir`, which reads a removed
+/// directory as empty (its own fallback for the "no such file or directory" the kernel
+/// answers), so this pins that.
+#[test]
+fn listing_a_directory_removed_since_it_was_opened_finds_nothing() {
+    let dir = scratch("vanish-listing").join("dir");
+    fs::create_dir(&dir).unwrap();
+    let opened = open_base(&dir).unwrap().expect("the directory exists");
+    fs::remove_dir(&dir).unwrap();
+    assert_eq!(listed(&opened).unwrap(), Vec::<OsString>::new());
+}
+
+/// Catches (komira-build-farm#652): a fix that swallows more than "no such file": a
+/// folder the sweep cannot read (permission denied) must still leave the sweep
+/// incomplete when another entry vanishes in the same walk, and the vanished entry
+/// must not add an error of its own.
+#[test]
+fn a_vanished_entry_does_not_hide_a_real_error() {
+    if root() {
+        eprintln!("skipped: permission bits do not stop root");
+        return;
+    }
+    let base = scratch("vanish-real").join("Shared");
+    fs::create_dir(&base).unwrap();
+    fs::write(base.join("daemon-temp"), "x").unwrap();
+    fs::create_dir(base.join("locked")).unwrap();
+    fs::write(base.join("locked/f"), "x").unwrap();
+    chmod(&base.join("locked"), 0o000);
+    let temp = base.join("daemon-temp");
+    let swept = vanishing(after_listing(1, move || remove(&temp)), || {
+        sweep(&owned_plan(&base), "u", me())
+    });
+    chmod(&base.join("locked"), 0o700);
+    assert_eq!(swept.errors.len(), 1, "{swept:?}");
+    assert!(swept.errors[0].contains("Shared/locked: "), "{swept:?}");
+    assert!(!swept.errors[0].contains("No such file"), "{swept:?}");
 }

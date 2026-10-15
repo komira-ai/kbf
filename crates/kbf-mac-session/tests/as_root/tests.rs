@@ -550,25 +550,41 @@ fn the_ledger_survives_a_restart_of_the_helper() {
 
 /// Catches: user-delete that refuses at once instead of waiting for a process of the
 /// uid that is about to exit by itself.
+///
+/// The process is `kbf-act`'s spawned child itself, sleeping 2 s and then exiting
+/// (komira-build-farm#639: a `/bin/sleep` that the child started was looked for while
+/// the child had not started it yet, 24 ms after the action ended, and was not found).
+/// The action writes the child's pid after spawning it and before it exits, so the
+/// child exists once `run-quiet` returns: there is nothing to wait for before looking.
+/// The look checks it is that pid, of the lease's uid, still alive; the delete follows
+/// at once. User-delete's first look waits up to `EXIT_LOOKS` (50) listings 100 ms
+/// apart, at least 4.9 s, and the child has at most 2 s of sleep left plus its own
+/// start, so the delete waits it out; a delete that refused at once would meet it.
 #[test]
 #[ignore = "needs root: run by `cargo xtask sudo-test -p kbf-mac-session --test as_root`"]
 fn user_delete_waits_for_a_process_that_exits_by_itself() {
     let (_serial, mac) = mac();
     let dir = scratch_dir("lease-13", 0o777);
+    let pid_file = format!("{dir}/child.pid");
     let lease = mac.create("13.1", None);
     lease.kill();
-    let sleep = ["spawn-child", "run", "/bin/sleep", "2"];
+    let sleep: [&str; 5] = ["spawn-child", "--pid", &pid_file, "sleep", "2"];
     says(
         &lease.run_quiet(&dir, &mac.act(&sleep)),
         "exit 0",
-        "start a sleep",
+        "start a sleeping child",
     );
-    let sleeping = pgrep(&["-U", &lease.uid(), "sleep"]);
-    assert!(!sleeping.is_empty(), "no sleep process");
+    let pid = fs::read_to_string(&pid_file).unwrap_or_else(|e| panic!("{pid_file}: {e}"));
+    let pid = pid.trim();
+    let alive = pgrep(&["-U", &lease.uid(), "kbf-act"]);
+    assert!(
+        alive.iter().any(|p| p == pid),
+        "the child {pid} is not a live process of the lease user: {alive:?}"
+    );
     says(
         &lease.call("delete"),
         "existed",
-        "delete did not wait for the sleep",
+        "delete did not wait for the sleeping child",
     );
 }
 
