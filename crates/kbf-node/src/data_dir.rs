@@ -117,6 +117,9 @@ pub(crate) struct Plan {
     pub cached: bool,
     /// The budgets; `None` for a filesystem too small for a cache.
     pub budgets: Option<Budgets>,
+    /// Whether `leases` is searchable by others (the OCI backend).
+    #[allow(dead_code)] // read by the fix
+    pub open_leases: bool,
 }
 
 /// Why the data directory is not usable.
@@ -164,7 +167,16 @@ impl Plan {
             dir,
             cached,
             budgets: Budgets::of(on, args.data_max_bytes),
+            open_leases: false,
         })
+    }
+
+    /// Whether `leases` must be searchable by others: the OCI backend's container ids
+    /// are not the daemon user's.
+    #[must_use]
+    pub(crate) fn with_open_leases(mut self, open: bool) -> Self {
+        self.open_leases = open;
+        self
     }
 
     /// `<dir>/leases`.
@@ -601,5 +613,40 @@ mod tests {
         let error = plan.create().expect_err("under a file");
         assert!(matches!(error, DataDirError::Make { .. }), "{error}");
         assert!(error.to_string().contains("a-file/data"), "{error}");
+    }
+
+    /// Catches the OCI backend's start failing on a fresh data directory: `leases` made
+    /// 0700, which the backend refuses ("not searchable by others"). With the backend
+    /// selected `leases` is 0711, and an existing 0700 one is repaired to 0711; without,
+    /// 0700 stays, and a mode the operator opened further is not narrowed.
+    #[test]
+    fn leases_are_searchable_by_others_under_the_oci_backend() {
+        let space = Space {
+            total: 200 * GIB,
+            available: 150 * GIB,
+        };
+        let base = crate::tests::scratch("data-dir-oci-leases");
+        let mode = |p: &Path| std::fs::metadata(p).expect("made").permissions().mode() & 0o777;
+        let plan_at = |name: &str, open: bool| {
+            let flags = [format!("--data-dir={}", base.join(name).display())];
+            let flags: Vec<&str> = flags.iter().map(String::as_str).collect();
+            Plan::new(&args(&flags), true, &Fake(space))
+                .expect("plan")
+                .with_open_leases(open)
+        };
+        let fresh = plan_at("fresh", true);
+        fresh.create().expect("create");
+        assert_eq!(mode(&fresh.leases()), 0o711, "a fresh leases dir");
+        assert_eq!(mode(&fresh.cache()), 0o700, "the cache stays the daemon's");
+        let old = plan_at("old", false);
+        old.create().expect("create");
+        assert_eq!(mode(&old.leases()), 0o700, "podman keeps 0700");
+        let old = plan_at("old", true);
+        old.create().expect("repair");
+        assert_eq!(mode(&old.leases()), 0o711, "an existing 0700 is repaired");
+        std::fs::set_permissions(old.leases(), std::fs::Permissions::from_mode(0o755))
+            .expect("chmod");
+        old.create().expect("again");
+        assert_eq!(mode(&old.leases()), 0o755, "a wider mode is kept");
     }
 }
