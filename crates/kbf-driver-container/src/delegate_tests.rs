@@ -735,3 +735,48 @@ fn a_cpu_max_is_counted_in_cpus() {
     assert!(quota_cpus("100000 0").is_err());
     assert!(quota_cpus("x 100000").is_err());
 }
+
+/// Catches `--lease-placement=numa-node` enabling `cpuset` in the wrong order or place
+/// (in `actions/` before its parent is ENOENT on a real host; in the parent alone leaves
+/// the lease cgroups without cpuset files), writing what is already enabled, and
+/// reporting the CPUs `actions/` may use (what the placer restricts the nodes to).
+#[test]
+fn cpuset_is_enabled_in_the_parent_then_in_actions_and_the_cpus_are_returned() {
+    let fake = Fake::host(UNIT, "cpuset cpu io memory pids", &[41]);
+    delegate_in(&fake, SELF, MIN, None).expect("delegated");
+    fake.set(ACTIONS_CG, "cpuset.cpus.effective", "0-21,44-65\n");
+    let before = fake.log().len();
+    let cpus = enable_cpuset_in(&fake, ACTIONS_CG).expect("enabled");
+    assert_eq!(cpus.expect("cpus").to_string(), "0-21,44-65");
+    assert_eq!(
+        fake.log()[before..],
+        [
+            format!("{UNIT}/cgroup.subtree_control <- +cpuset"),
+            format!("{ACTIONS_CG}/cgroup.subtree_control <- +cpuset"),
+        ]
+    );
+    assert_eq!(
+        fake.enabled(ACTIONS_CG),
+        ["cpu", "memory", "pids", "cpuset"]
+    );
+    // Again: nothing left to write.
+    let before = fake.log().len();
+    enable_cpuset_in(&fake, ACTIONS_CG).expect("enabled");
+    assert_eq!(fake.log().len(), before);
+}
+
+/// Catches a unit that is not offered `cpuset` (a user manager without the drop-in)
+/// accepted, and the fix missing from the message; nothing is written.
+#[test]
+fn a_unit_without_cpuset_is_refused_with_the_fix() {
+    let fake = Fake::host(UNIT, "cpu memory pids", &[41]);
+    delegate_in(&fake, SELF, MIN, None).expect("delegated");
+    let before = fake.log().len();
+    let error = enable_cpuset_in(&fake, ACTIONS_CG).expect_err("refused");
+    let text = error.to_string();
+    assert!(
+        text.contains(UNIT) && text.contains("does not offer cpuset") && text.contains("Delegate="),
+        "{text}"
+    );
+    assert_eq!(fake.log().len(), before);
+}
