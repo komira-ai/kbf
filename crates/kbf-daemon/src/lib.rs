@@ -62,7 +62,7 @@ pub mod runtime;
 pub mod runtimes;
 pub mod status;
 pub mod tree;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod trees;
 #[cfg(target_os = "macos")]
 pub mod uid;

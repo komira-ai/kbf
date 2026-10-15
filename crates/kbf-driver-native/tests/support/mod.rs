@@ -24,7 +24,7 @@ use kbf_driver_native::{NativeConfig, NativeRuntime, procs};
 use kbf_proto::reapi::command::EnvironmentVariable;
 use kbf_proto::reapi::platform::Property;
 use kbf_proto::reapi::{
-    Action, ActionResult, Command, Digest, Directory, FileNode, Platform, Tree,
+    Action, ActionResult, Command, Digest, Directory, DirectoryNode, FileNode, Platform, Tree,
 };
 use kbf_types::{LeaseId, Resources};
 use prost::Message;
@@ -174,19 +174,7 @@ impl Spec {
 
     /// Stores the action in `cas` and returns its digest.
     pub fn store(&self, cas: &MemoryCas) -> Digest {
-        let root = Directory {
-            files: self
-                .inputs
-                .iter()
-                .map(|(name, bytes)| FileNode {
-                    name: name.clone(),
-                    digest: Some(cas.insert(bytes.clone())),
-                    is_executable: true,
-                    ..FileNode::default()
-                })
-                .collect(),
-            ..Directory::default()
-        };
+        let root = directory_of(cas, &self.inputs);
         let command = Command {
             arguments: self.argv.clone(),
             environment_variables: self
@@ -221,6 +209,39 @@ impl Spec {
             ..Action::default()
         };
         cas.insert(action.encode_to_vec())
+    }
+}
+
+/// The Directory of `inputs` (every file executable): a name with `/` is in the
+/// subdirectory it names, stored in `cas` as well.
+fn directory_of(cas: &MemoryCas, inputs: &[(String, Vec<u8>)]) -> Directory {
+    let mut files = Vec::new();
+    let mut below: BTreeMap<&str, Vec<(String, Vec<u8>)>> = BTreeMap::new();
+    for (name, bytes) in inputs {
+        match name.split_once('/') {
+            None => files.push(FileNode {
+                name: name.clone(),
+                digest: Some(cas.insert(bytes.clone())),
+                is_executable: true,
+                ..FileNode::default()
+            }),
+            Some((dir, rest)) => below
+                .entry(dir)
+                .or_default()
+                .push((rest.to_owned(), bytes.clone())),
+        }
+    }
+    let directories = below
+        .into_iter()
+        .map(|(name, inner)| DirectoryNode {
+            name: name.to_owned(),
+            digest: Some(cas.insert(directory_of(cas, &inner).encode_to_vec())),
+        })
+        .collect();
+    Directory {
+        files,
+        directories,
+        ..Directory::default()
     }
 }
 

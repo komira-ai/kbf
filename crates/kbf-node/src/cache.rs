@@ -35,21 +35,25 @@ pub(crate) struct CacheArgs {
 }
 
 /// The defaults of `--tree-min-files` and `--tree-max-mounts`; `kbf_daemon::trees` has
-/// the same two (it does not build on macOS, where these flags are parsed and ignored).
+/// the same two (clap defaults cannot name a module that is not on every platform).
 const TREE_MIN_FILES: u64 = 256;
 const TREE_MAX_MOUNTS: usize = 8;
 
-/// The `--tree-*` flags: the container driver's shared read-only trees
-/// (`docs/design/fast-sandbox.md#4-shared-trees`).
+/// The `--tree-*` flags: shared input trees, mounted read-only by the container driver
+/// (`docs/design/fast-sandbox.md#4-shared-trees`) and cloned whole into the lease by
+/// the native driver on macOS.
 #[derive(Clone, Debug, clap::Args)]
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
 pub(crate) struct TreeArgs {
-    /// The directory of the node's tree store (container), made if missing; it should
-    /// be on the cache's filesystem. Needs `--cache-dir` and `--tree-max-bytes`. A
+    /// The directory of the node's tree store (container; native on macOS), made if
+    /// missing; it should be on the cache's filesystem, and the native driver refuses
+    /// one inside the scratch directory. Needs `--cache-dir` and `--tree-max-bytes`. A
     /// Directory node of an action's input root with at least `--tree-min-files` files,
-    /// no output path or working directory in it, is built here once and mounted
-    /// read-only into each action that has it, instead of linking its files per action.
-    /// A write into such a directory fails (EROFS), where it used to succeed.
+    /// no output path or working directory in it, is built here once and, per action,
+    /// mounted read-only (container: a write into it fails EROFS, where it used to
+    /// succeed) or cloned whole into the action's input root with one `clonefile`
+    /// (native on macOS: the action's copy is its own and writable), instead of linking
+    /// or cloning its files one by one.
     #[arg(long, value_name = "DIR", requires_all = ["tree_max_bytes", "cache_dir"])]
     pub tree_dir: Option<PathBuf>,
     /// The most file bytes of trees kept; least recently used unpinned trees are
@@ -110,6 +114,55 @@ pub(crate) fn native(
     }
 }
 
+/// The native driver's shared trees on macOS: the store the `--tree-*` flags give,
+/// opened; `None` without `--tree-dir`, or (warned about as `trees: off:<reason>`) when
+/// there is no cache to build them from, the directory is inside the scratch directory
+/// (leases' sweeps clean it) or the store cannot be used. The one place the native
+/// driver's tree flags are read.
+#[cfg(target_os = "macos")]
+pub(crate) fn native_trees(
+    args: &TreeArgs,
+    scratch: &std::path::Path,
+    cache: Option<&std::sync::Arc<kbf_daemon::cache::Cache>>,
+) -> Option<std::sync::Arc<kbf_daemon::trees::Trees>> {
+    let dir = args.tree_dir.clone()?;
+    let shown = dir.display().to_string();
+    let why = if cache.is_none() {
+        Err((
+            "no-cache",
+            "the trees are built from the cache's entries".to_owned(),
+        ))
+    } else if dir.starts_with(scratch) {
+        Err((
+            "inside-scratch",
+            format!(
+                "inside the scratch directory {}, which lease sweeps clean",
+                scratch.display()
+            ),
+        ))
+    } else {
+        tree_config(args)
+            .ok_or(("no-budget", "needs --tree-max-bytes".to_owned()))
+            .and_then(|config| {
+                kbf_daemon::trees::Trees::open(config).map_err(|e| ("unusable", e.to_string()))
+            })
+    };
+    match why {
+        Ok(trees) => {
+            let stats = trees.store().stats();
+            let (count, bytes) = (stats.trees, stats.bytes);
+            tracing::info!(
+                "trees: {shown}: {count} trees, {bytes} bytes; cloned whole into leases"
+            );
+            Some(std::sync::Arc::new(trees))
+        }
+        Err((reason, why)) => {
+            tracing::warn!("trees: off:{reason} ({shown}: {why}); inputs are cloned file by file");
+            None
+        }
+    }
+}
+
 /// What the native driver logs when it is given `--cache-dir` off macOS: it never uses
 /// one.
 #[cfg(not(target_os = "macos"))]
@@ -163,7 +216,7 @@ pub(crate) fn given(
 
 /// The tree store the `--tree-*` flags ask for, if they do (clap checks that
 /// `--tree-dir` comes with `--tree-max-bytes` and `--cache-dir`).
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn tree_config(args: &TreeArgs) -> Option<kbf_daemon::trees::TreeConfig> {
     let dir = args.tree_dir.clone()?;
     let mut config = kbf_daemon::trees::TreeConfig::new(dir, args.tree_max_bytes?);
@@ -172,7 +225,7 @@ fn tree_config(args: &TreeArgs) -> Option<kbf_daemon::trees::TreeConfig> {
     Some(config)
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod tests {
     /// Catches the flags' defaults drifting from the daemon's.
     #[test]

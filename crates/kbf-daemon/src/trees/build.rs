@@ -9,12 +9,14 @@ use kbf_proto::reapi::Digest;
 use rustix::fs::{CWD, RenameFlags};
 
 use super::classify::{MAX_DIRECTORIES, Summary, load};
+use crate::cache::lease::Want;
 use crate::cache::{Cache, InputStats};
 use crate::cas::{Fetch, label};
 use crate::tree::{Loaded, TreeError, io as io_error, make_directories};
 
 /// Writes the tree under `digest` into the empty directory `tmp`, files as hard links
-/// to `cache` entries (read-only, owned by the daemon's user), then checks what was
+/// to `cache` entries (read-only, owned by the daemon's user), or on macOS clones of
+/// them left read-only, then checks what was
 /// written against the Directory messages ([`verify`]).
 ///
 /// # Errors
@@ -32,7 +34,8 @@ pub(super) async fn build(
     let loaded = load(cas, in_flight, digest, known, &|_, _| false, max).await?;
     let walked =
         make_directories(cas, in_flight, digest, tmp, &loaded, &Default::default()).await?;
-    let stats = crate::cache::lease::write_files(cas, cache, walked.files, &[]).await?;
+    let stats =
+        crate::cache::lease::write_files_as(cas, cache, walked.files, &[], Want::ReadOnly).await?;
     let summary = check(loaded, digest.clone(), tmp.to_owned()).await?;
     Ok((summary, stats))
 }

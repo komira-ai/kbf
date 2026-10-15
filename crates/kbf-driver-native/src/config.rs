@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use kbf_daemon::cache::Cache;
+use kbf_daemon::trees::Trees;
 use kbf_outputs::OutputLimits;
 
 use crate::network::Isolation;
@@ -95,6 +96,11 @@ pub struct NativeConfig {
     /// sandbox lets an action write only its own lease directory, which keeps the
     /// entries out of its reach.
     pub cache: Option<Arc<Cache>>,
+    /// The node's shared input trees (`kbf_daemon::trees`, delivered by cloning each
+    /// whole into the lease, [`Delivery::Clone`]); needs `cache`, which builds the
+    /// trees and writes the rest of the inputs. The store must be outside the scratch
+    /// directory, like the cache. `None` clones every input file one by one.
+    pub trees: Option<Arc<Trees>>,
 }
 
 impl NativeConfig {
@@ -120,6 +126,7 @@ impl NativeConfig {
             xcrun: PathBuf::from(crate::xcode::XCRUN),
             pool: None,
             cache: None,
+            trees: None,
         }
     }
 }

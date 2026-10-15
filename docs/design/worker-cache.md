@@ -579,11 +579,17 @@ if per-lease metrics show the previous one is not enough:
    name checks and runs the links in a tight loop. The plan comes from messages
    `check_name` already checked.
 3. **Whole-subtree materialization.**
-   - **macOS (C4c):** keep `v1/dirs/<digest>/`, an immutable materialized copy, and give
-     each lease one `clonefile(dirs/<digest>, lease/root/<path>)`. `clonefile` copies
-     directory modes too, and the cached directories are read-only. A walk must
-     therefore make the cloned directories writable, which takes back part of the
-     one-syscall saving. C4c measures what is left.
+   - **macOS (C4c, built as shared trees):** the node keeps one immutable tree per large
+     Directory node (`kbf_daemon::trees`, the same classifier, store, single-flight
+     build, pinning and eviction as the Linux container driver's shared trees; the
+     files are clones of cache entries, left 0444 and 0555, the directories 0755, the
+     store outside every lease directory so the sandbox's write rule covers it), and
+     gives each lease one `clonefile(tree, lease/root/<path>)`. The clone's directories
+     are 0755 already, so only each cloned file needs a `chmod` to the mode an input has
+     without the cache (0644, 0755 executable); the tree is never touched, and what is
+     left to pay is one clone plus one `chmod` per file, not a `clonefile` per file. A
+     filesystem that refuses the directory clone (`ENOTSUP`, `EXDEV`) gets that tree's
+     files one by one through the cache, and the node logs it once.
    - **Linux container:** the equivalent is a second `:O` overlay volume with the cached
      subtree as its lower. A `rename` across that mount boundary fails with EXDEV. It
      is considered only if C4b measures too slow, and is refused whenever an output path
@@ -1027,6 +1033,10 @@ macOS node; what it leaves out follows):
 - The free-space floor skips `nlink > 1`; a clone adds no link, so on macOS the floor
   may evict an entry whose clones a running lease holds, which frees nothing until the
   lease ends. The byte budget is exact.
+- With `--tree-dir` and `--tree-max-bytes` (the container driver's flags) the native
+  driver also takes each large Directory node as one directory clone from a tree
+  store (C4c above); the store must be outside `--scratch` and needs the cache. The
+  lease logs `trees_cloned=`, `tree_files=` and `built=` beside the `inputs:` line.
 - Not built: the dedicated APFS volume, Spotlight and backup exclusion, hard links for
   pool lease users, and the link-concurrency measurement. `--cache-link-concurrency`
   keeps its default of 64.
