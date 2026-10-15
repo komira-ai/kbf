@@ -65,6 +65,7 @@ pub mod rollout;
 pub mod serve;
 pub mod stamp;
 mod start;
+mod startup_pass;
 mod timeout;
 pub mod token;
 pub mod worker;

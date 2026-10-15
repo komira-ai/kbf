@@ -190,6 +190,21 @@ async fn read(client: &Client, blob: &Blob) -> Result<Vec<u8>, Code> {
     Ok(bytes)
 }
 
+/// Waits, at most `BOUND`, until FindMissing reports every one of `blobs`: the start-up
+/// pass runs in the background once the server serves.
+async fn forgotten(client: &Client, blobs: &[&Blob]) {
+    let deadline = Instant::now() + BOUND;
+    for blob in blobs {
+        while client.holds(blob).await {
+            assert!(
+                Instant::now() < deadline,
+                "a blob whose object file is gone is still reported held"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+}
+
 /// Bytes that differ from their neighbours, so a read at the wrong offset cannot match.
 fn pattern(len: u32) -> Vec<u8> {
     (0..len)
@@ -241,15 +256,16 @@ async fn a_restart_keeps_the_blobs_and_the_action_cache() {
     dirs.remove();
 }
 
-/// Catches a store that answers a read with damaged bytes, or a blob whose object file
-/// is gone, as anything but unavailable; a read that does not take the blob out of the
-/// index (FindMissing would keep reporting it present, so a client never uploads it
-/// again); an upload that does not heal it; and a torn temporary file kept at start.
-/// Each blob is uploaded alone, so it is the only blob of its object file. The index
-/// still reports a damaged blob present until a read finds it out: nothing checks the
-/// directory at start.
+/// Catches a blob whose object file is gone (deleted, or cut to zero bytes) kept in the
+/// index after the start-up pass, so FindMissing reports it present and a client never
+/// uploads it again, and a read of it answered as anything but not found once it is
+/// forgotten; a store that answers a read with damaged bytes as anything but
+/// unavailable, or a read that does not take that blob out of the index (the pass
+/// reads headers, not bytes, so only a read finds the damage); an upload that does not
+/// heal each; and a torn temporary file kept at start. Each blob is uploaded alone, so
+/// it is the only blob of its object file.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_lost_or_corrupt_object_is_reported_on_read_and_an_upload_heals_it() {
+async fn a_lost_object_is_forgotten_at_start_and_a_corrupt_one_on_read() {
     let dirs = Dirs::new("damage");
     let (server, before) = started(dirs.server()).await;
     let corrupt = Blob::new("this blob's object file gets one byte flipped");
@@ -278,13 +294,20 @@ async fn a_lost_or_corrupt_object_is_reported_on_read_and_an_upload_heals_it() {
     let (server, after) = started(dirs.server()).await;
     assert!(!torn.exists(), "a torn temporary file outlived the start");
     assert_eq!(read(&after, &kept).await, Ok(kept.data.clone()));
+    forgotten(&after, &[&lost, &emptied]).await;
+    for blob in [&lost, &emptied] {
+        assert_eq!(read(&after, blob).await, Err(Code::NotFound));
+    }
+    assert!(
+        after.holds(&corrupt).await,
+        "the pass read an object's bytes"
+    );
+    assert_eq!(read(&after, &corrupt).await, Err(Code::Unavailable));
+    assert!(
+        !after.holds(&corrupt).await,
+        "a failed read left the blob indexed"
+    );
     for blob in [&corrupt, &lost, &emptied] {
-        assert!(after.holds(blob).await, "nothing reads objects at start");
-        assert_eq!(read(&after, blob).await, Err(Code::Unavailable));
-        assert!(
-            !after.holds(blob).await,
-            "a failed read left the blob indexed"
-        );
         after.upload(&[blob]).await;
         assert_eq!(read(&after, blob).await, Ok(blob.data.clone()));
     }
@@ -361,9 +384,10 @@ async fn blob_dir_refuses_what_it_cannot_keep() {
 
 /// Catches an action-cache hit served after the store lost one of its output files
 /// (deleted under `--blob-dir` while the server was down): the index still holds the
-/// output, so only a check of the store turns the hit into a miss. The client must
-/// get a miss (the action runs again), not a result whose output it cannot download,
-/// and FindMissing must then report the output, so it is uploaded again.
+/// output until the start-up pass forgets it with the entry, or a check of the store
+/// at the hit marks it. The client must get a miss (the action runs again), not a
+/// result whose output it cannot download, and FindMissing must report the output,
+/// so it is uploaded again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_hit_whose_output_file_is_lost_is_a_miss_after_a_restart() {
     let dirs = Dirs::new("lost-output");
@@ -385,12 +409,8 @@ async fn a_hit_whose_output_file_is_lost_is_a_miss_after_a_restart() {
     std::fs::remove_file(path).expect("delete the output's object");
 
     let (server, after) = started(dirs.server()).await;
-    assert!(after.holds(&out).await, "nothing reads objects at start");
     assert_eq!(after.cached(&job.action).await, Err(Code::NotFound));
-    assert!(
-        !after.holds(&out).await,
-        "the lost output is still reported held"
-    );
+    forgotten(&after, &[&out]).await;
     drop(after);
     stop(server);
     dirs.remove();

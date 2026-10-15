@@ -1,0 +1,275 @@
+//! The start-up consistency pass over a file store ([`Cache::consistency_pass`]): the
+//! store's files checked against the index once, in the background, after the server
+//! serves (`docs/deploy/storage-node.md`, "The start-up pass").
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::num::NonZeroU32;
+use std::time::{Duration, SystemTime};
+
+use kbf_meta::{Applied, Command, Epoch, ObjectId};
+use kbf_objstore::{FsStore, ObjectKey, ObjectStore};
+use tokio::time::Instant;
+
+use super::write_group::Writer;
+use super::{Cache, CacheError, unexpected};
+use crate::meta_log::{MetaLog, MetaLogError};
+
+/// How many object files the pass opens a second, on average, while the file system
+/// has room: enough to walk a million objects in under 20 minutes without taking the
+/// disk from the reads it serves. Below the store's free-space floor the pass runs
+/// unpaced, since every upload is refused until it finishes (and frees what it can).
+pub const PASS_OPENS_PER_SEC: NonZeroU32 = NonZeroU32::new(1000).expect("not zero");
+
+/// How many objects one [`Command::EvictObjects`] names: applying one scans the whole
+/// index and action cache, about the same time for 1 object as for 256 on a million
+/// of each, so the pass batches.
+pub const EVICT_BATCH: usize = 256;
+
+/// An object file the pass kept: what an evictor needs to rank it before any read has.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HeldObject {
+    /// The object's length (its file's, less the header).
+    pub len: u64,
+    /// When its file was written.
+    pub mtime: SystemTime,
+}
+
+/// What a [`Cache::consistency_pass`] found and did.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PassReport {
+    /// Object files read (each with a header naming its key).
+    pub files: u64,
+    /// Files with no object header; left alone.
+    pub unreadable: u64,
+    /// This cache's objects kept: indexed, staged, or written by this process.
+    pub kept: u64,
+    /// This cache's objects deleted: of an earlier process and in no index entry.
+    pub orphans_deleted: u64,
+    /// Files whose key is not one of this cache's objects (another log's prefix, or
+    /// not an object name); logged, kept, and not counted as held.
+    pub foreign: u64,
+    /// Indexed objects with no file that were forgotten ([`Command::EvictObjects`]).
+    pub evicted_objects: u64,
+    /// Blobs those objects held, taken out of the index.
+    pub evicted_blobs: u64,
+    /// Action-cache entries removed because they needed one of those blobs.
+    pub evicted_actions: u64,
+    /// Indexed objects with no file left in the index because the walk found no
+    /// indexed file at all (the guard: a directory that is not the one the index was
+    /// written over).
+    pub withheld: u64,
+    /// The kept objects, by id: the seed of an evictor's ranking. An object written
+    /// after the pass walked its shard is not in it.
+    pub held: BTreeMap<ObjectId, HeldObject>,
+    /// How long the pass took.
+    pub duration: Duration,
+}
+
+impl PassReport {
+    /// The bytes of the objects kept ([`PassReport::held`]), headers not counted.
+    #[must_use]
+    pub fn held_bytes(&self) -> u64 {
+        self.held.values().map(|h| h.len).sum()
+    }
+}
+
+impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
+    /// Checks `files`, which must be the store this cache writes to, against the
+    /// index, once:
+    ///
+    /// - Each object file of this cache that the index names (staged objects too), or
+    ///   whose epoch is this cache's, is kept, and its length and modification time
+    ///   go into the report's [`PassReport::held`].
+    /// - One of an earlier epoch that nothing names is an orphan (an upload that never
+    ///   committed, an object whose blobs were all healed elsewhere) and is deleted.
+    /// - A file under another prefix is counted and kept.
+    /// - Then every indexed object that is not staged and whose file the walk did not
+    ///   find, and still is not there, is forgotten with [`Command::EvictObjects`] in
+    ///   batches of [`EVICT_BATCH`], with the action-cache entries that need its
+    ///   blobs, after `ready_to_evict` readies the log for the command. Only if the
+    ///   walk found the file of at least one indexed object: otherwise this is not the
+    ///   directory the index was written over (a missing mount, which `FsStore::open`
+    ///   would have created empty), and nothing is forgotten.
+    ///
+    /// The shards are walked at `opens_per_sec` ([`PASS_OPENS_PER_SEC`]), unpaced while
+    /// the store is under its free-space floor. The index is read once before the walk:
+    /// only objects of the current epoch can be named after that, and those are kept.
+    ///
+    /// # Errors
+    /// A shard cannot be read, an orphan cannot be deleted, or the metadata log fails
+    /// or refuses to be readied. What was done before stays done.
+    pub async fn consistency_pass<R>(
+        &self,
+        files: &FsStore,
+        opens_per_sec: NonZeroU32,
+        ready_to_evict: R,
+    ) -> Result<PassReport, CacheError>
+    where
+        R: FnOnce(&M) -> Result<(), MetaLogError>,
+    {
+        let started = Instant::now();
+        let epoch = self.epoch();
+        let indexed = self.writer.query(|s| s.indexed_objects()).await?;
+        let mut report = PassReport::default();
+        let mut pace = Pace::new(opens_per_sec);
+        let mut seen = BTreeSet::new();
+        let mut indexed_present = 0_u64;
+        for shard in 0..=u8::MAX {
+            let scan = files.scan(shard).await?;
+            report.unreadable += scan.unreadable as u64;
+            report.files += scan.objects.len() as u64;
+            let mut unnamed = Vec::new();
+            for file in &scan.objects {
+                let Some(id) = self.writer.object_id(&file.key) else {
+                    tracing::debug!(key = %file.key, "start-up pass: a foreign object file, kept");
+                    report.foreign += 1;
+                    continue;
+                };
+                seen.insert(id);
+                let held = HeldObject {
+                    len: file.len,
+                    mtime: file.mtime,
+                };
+                if indexed.contains(&id) {
+                    indexed_present += 1;
+                    report.held.insert(id, held);
+                } else if id.epoch() >= epoch {
+                    report.held.insert(id, held);
+                } else {
+                    unnamed.push((id, &file.key, held));
+                }
+            }
+            // A staged object whose blobs were all collected names nothing, but its
+            // file may be the flusher's write before it commits the flush.
+            let staged: Vec<bool> = self
+                .writer
+                .query(|s| {
+                    unnamed
+                        .iter()
+                        .map(|(id, ..)| s.staged(*id).is_some())
+                        .collect()
+                })
+                .await?;
+            for ((id, key, held), staged) in unnamed.into_iter().zip(staged) {
+                if staged {
+                    report.held.insert(id, held);
+                } else {
+                    files.delete(key).await?;
+                    tracing::debug!(%key, "start-up pass: an orphan object deleted");
+                    report.orphans_deleted += 1;
+                }
+            }
+            pace.after(scan.opened(), files).await;
+        }
+        report.kept = report.held.len() as u64;
+        self.evict_missing(files, &seen, indexed_present, ready_to_evict, &mut report)
+            .await?;
+        report.duration = started.elapsed();
+        Ok(report)
+    }
+
+    /// The index side of [`Cache::consistency_pass`]: forgets the indexed objects that
+    /// are not staged, were not `seen`, and have no file now, if `indexed_present`
+    /// (the guard) is not zero.
+    async fn evict_missing<R>(
+        &self,
+        files: &FsStore,
+        seen: &BTreeSet<ObjectId>,
+        indexed_present: u64,
+        ready_to_evict: R,
+        report: &mut PassReport,
+    ) -> Result<(), CacheError>
+    where
+        R: FnOnce(&M) -> Result<(), MetaLogError>,
+    {
+        let unseen: Vec<ObjectId> = self
+            .writer
+            .query(|s| {
+                let indexed = s.indexed_objects().into_iter();
+                indexed
+                    .filter(|o| s.staged(*o).is_none() && !seen.contains(o))
+                    .collect()
+            })
+            .await?;
+        // Written after the walk passed its shard, or flushed from a tier since.
+        let mut gone = BTreeSet::new();
+        for id in unseen {
+            if !files.may_hold(&self.object_key(id)?).await? {
+                gone.insert(id);
+            }
+        }
+        if gone.is_empty() {
+            return Ok(());
+        }
+        if indexed_present == 0 {
+            tracing::error!(
+                objects = gone.len(),
+                "start-up pass: no file of any indexed object is in the store, so it is not \
+                 the directory the index was written over (a missing mount?): nothing is \
+                 forgotten"
+            );
+            report.withheld = gone.len() as u64;
+            return Ok(());
+        }
+        ready_to_evict(&self.writer.meta)?;
+        let gone: Vec<ObjectId> = gone.into_iter().collect();
+        for batch in gone.chunks(EVICT_BATCH) {
+            let objects = batch.iter().copied().collect();
+            match self
+                .writer
+                .commit(Command::EvictObjects { objects })
+                .await?
+            {
+                Applied::Evicted(evicted) => {
+                    report.evicted_blobs += evicted.blobs.len() as u64;
+                    report.evicted_actions += evicted.actions.len() as u64;
+                }
+                other => return Err(unexpected(&other)),
+            }
+            report.evicted_objects += batch.len() as u64;
+        }
+        Ok(())
+    }
+}
+
+impl<M, O> Writer<M, O> {
+    /// The object `key` names if it is one of this cache's object keys
+    /// ([`Writer::object_key`] exactly), else `None`.
+    fn object_id(&self, key: &ObjectKey) -> Option<ObjectId> {
+        let name = key.as_str().strip_prefix(self.prefix.as_str())?;
+        let (epoch, seq) = name.strip_prefix("cas/")?.split_once('/')?;
+        let epoch = u64::from_str_radix(epoch, 16).ok()?;
+        let seq = u64::from_str_radix(seq, 16).ok()?;
+        let id = ObjectId::new(Epoch::new(epoch), seq);
+        // Only the canonical spelling: 16 lowercase digits each.
+        (self.object_key(id).ok()? == *key).then_some(id)
+    }
+}
+
+/// Spaces the pass's file opens to a rate, on average over each shard.
+struct Pace {
+    per_sec: NonZeroU32,
+    next: Instant,
+}
+
+impl Pace {
+    fn new(per_sec: NonZeroU32) -> Self {
+        Self {
+            per_sec,
+            next: Instant::now(),
+        }
+    }
+
+    /// Waits out `opened` opens at the rate, unless the store is under its floor.
+    async fn after(&mut self, opened: usize, files: &FsStore) {
+        let now = Instant::now();
+        // A file system that cannot be asked is taken to have room.
+        if files.under_floor().unwrap_or(false) {
+            self.next = now;
+            return;
+        }
+        let cost = Duration::from_secs(opened as u64) / self.per_sec.get();
+        self.next = self.next.max(now) + cost;
+        tokio::time::sleep_until(self.next).await;
+    }
+}

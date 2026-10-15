@@ -219,6 +219,53 @@ async fn a_write_under_the_free_space_floor_is_refused() {
     std::fs::remove_dir_all(&dir).expect("remove");
 }
 
+/// Catches a shard scan that reports the file's length rather than the object's (the
+/// header counted), misses an object, reports one in the wrong shard, or takes a file
+/// with no header for an object; and a floor check that disagrees with the write's.
+#[tokio::test]
+async fn a_scan_reads_each_shard_s_headers() {
+    let dir = scratch("scan");
+    let store = FsStore::open(&dir, FLOOR).expect("open");
+    assert!(!store.under_floor().expect("statvfs"));
+    let before = std::time::SystemTime::now() - std::time::Duration::from_secs(2);
+    let keys = [key("a"), key("bb"), key("a/longer/key")];
+    for (k, len) in keys.iter().zip([0, 5, 300]) {
+        store
+            .put_new(k, Bytes::from(vec![1; len]), None)
+            .await
+            .expect("put");
+    }
+    let headerless = file_of(&dir, &key("never-written"));
+    std::fs::write(&headerless, b"kbf").expect("plant a file with no header");
+
+    let mut found = Vec::new();
+    let mut unreadable = 0;
+    for shard in 0..=u8::MAX {
+        let scan = store.scan(shard).await.expect("scan");
+        assert_eq!(scan.opened(), scan.objects.len() + scan.unreadable);
+        unreadable += scan.unreadable;
+        for object in scan.objects {
+            let file = file_of(&dir, &object.key);
+            assert_eq!(
+                file.parent(),
+                Some(dir.join("objects").join(format!("{shard:02x}")).as_path())
+            );
+            assert!(object.mtime >= before, "{object:?}");
+            found.push((object.key.as_str().to_owned(), object.len));
+        }
+    }
+    found.sort();
+    let want = [("a", 0), ("a/longer/key", 300), ("bb", 5)].map(|(k, n)| (k.to_owned(), n));
+    assert_eq!(found, want);
+    assert_eq!(unreadable, 1);
+    assert_eq!(FsStore::SHARDS, 256);
+    drop(store);
+    let full = FsStore::open(&dir, u64::MAX).expect("open");
+    assert!(full.under_floor().expect("statvfs"));
+    drop(full);
+    std::fs::remove_dir_all(&dir).expect("remove");
+}
+
 /// Catches a file system failure reported as anything but a transport error that names
 /// the operation and the path (a missing object, or a success), on every call: the
 /// directory a key's object goes in replaced by a file (so creating, reading,

@@ -29,13 +29,17 @@
 //! not hash what it returns: kbf checks every blob it reads against its digest, from
 //! any store. A listing opens every object file to read its key (`list` serves rebuild
 //! and the sweep only). Nothing reads the objects at open: on a large directory that
-//! would hold up every start, so a lost or damaged object is found when it is read, or
-//! by [`ObjectStore::may_hold`] before an action-cache hit is served.
+//! would hold up every start. [`FsStore::scan`] reads one shard's headers for the
+//! server's start-up pass, which runs in the background after the server serves (it
+//! deletes orphans and forgets index entries whose file is gone; `kbf-front`'s
+//! `Cache::consistency_pass`). Until it reaches an object, a lost or damaged one is
+//! found when it is read, or by [`ObjectStore::may_hold`] before an action-cache hit
+//! is served.
 //!
 //! A write is refused when the file system has less free space than the store's floor
 //! plus the object's length, so a full disk refuses uploads instead of failing part-way
-//! through them (and the Raft log, often on the same disk, keeps room). Nothing is ever
-//! evicted: the directory only grows.
+//! through them (and the Raft log, often on the same disk, keeps room). Nothing is
+//! evicted to make room: the directory only grows.
 //!
 //! No Object Lock. I/O runs on tokio's blocking pool, so every call needs a tokio
 //! runtime. An I/O failure is [`ObjectStoreError::Transport`], naming the operation
@@ -88,7 +92,9 @@ pub enum FsStoreError {
 }
 
 /// A bucket in a local directory (see the module docs). Conditional writes, no Object
-/// Lock.
+/// Lock. A clone is another handle on the same open store: the directory stays locked
+/// until the last handle is dropped.
+#[derive(Clone)]
 pub struct FsStore {
     inner: Arc<Inner>,
 }
@@ -149,6 +155,61 @@ impl FsStore {
     }
 }
 
+/// One object file [`FsStore::scan`] read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Scanned {
+    /// The key its header names.
+    pub key: ObjectKey,
+    /// The object's length: the file's, less the header.
+    pub len: u64,
+    /// When the file was last modified (written, for a file this store wrote).
+    pub mtime: SystemTime,
+}
+
+/// What [`FsStore::scan`] found in one shard.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ShardScan {
+    /// Every file with an object header, in no particular order.
+    pub objects: Vec<Scanned>,
+    /// Files without one (too short to hold a header, or not starting with one): no
+    /// key, so no object. A read of the key they were meant for answers `NotFound`.
+    pub unreadable: usize,
+}
+
+impl ShardScan {
+    /// How many files the scan opened.
+    #[must_use]
+    pub fn opened(&self) -> usize {
+        self.objects.len() + self.unreadable
+    }
+}
+
+impl FsStore {
+    /// How many shards ([`FsStore::scan`]) the objects are spread over: one per value
+    /// of a `u8`.
+    pub const SHARDS: usize = 256;
+
+    /// Reads the header of every object file in shard `shard` (`objects/<shard as two
+    /// hex digits>/`): its key, its length and its modification time. Opens every
+    /// file in the shard, reads no object's bytes.
+    ///
+    /// # Errors
+    /// The shard cannot be listed, or a file in it cannot be opened or read.
+    pub async fn scan(&self, shard: u8) -> Result<ShardScan, ObjectStoreError> {
+        let inner = Arc::clone(&self.inner);
+        blocking(move || inner.scan(shard)).await
+    }
+
+    /// Whether the file system has less free space than the store's floor: every write
+    /// is refused until room is made.
+    ///
+    /// # Errors
+    /// The file system cannot be asked (`statvfs`).
+    pub fn under_floor(&self) -> Result<bool, ObjectStoreError> {
+        Ok(self.inner.free()? < self.inner.min_free)
+    }
+}
+
 impl Inner {
     /// The directory and the file of `key`'s object.
     fn place(&self, key: &ObjectKey) -> (PathBuf, PathBuf) {
@@ -173,12 +234,17 @@ impl Inner {
         sync_dir(&dir).map_err(failed("sync", &dir))
     }
 
-    /// Refuses a write of `len` bytes that would leave less than the floor free.
-    fn room_for(&self, len: u64) -> Result<(), ObjectStoreError> {
+    /// The bytes free to an unprivileged writer on the store's file system.
+    fn free(&self) -> Result<u64, ObjectStoreError> {
         let stat = rustix::fs::statvfs(&self.objects)
             .map_err(io::Error::from)
             .map_err(failed("statvfs", &self.objects))?;
-        let free = stat.f_bavail.saturating_mul(stat.f_frsize);
+        Ok(stat.f_bavail.saturating_mul(stat.f_frsize))
+    }
+
+    /// Refuses a write of `len` bytes that would leave less than the floor free.
+    fn room_for(&self, len: u64) -> Result<(), ObjectStoreError> {
+        let free = self.free()?;
         if free < self.min_free.saturating_add(len) {
             return Err(ObjectStoreError::Transport(Arc::new(Full {
                 dir: self.objects.clone(),
@@ -231,6 +297,22 @@ impl Inner {
         }
     }
 
+    fn scan(&self, shard: u8) -> Result<ShardScan, ObjectStoreError> {
+        let dir = self.objects.join(format!("{shard:02x}"));
+        let mut scan = ShardScan::default();
+        for path in entries(&dir).map_err(failed("list", &dir))? {
+            match Object::open(&path)? {
+                Some(object) => scan.objects.push(Scanned {
+                    key: object.key,
+                    len: object.size,
+                    mtime: object.mtime,
+                }),
+                None => scan.unreadable += 1,
+            }
+        }
+        Ok(scan)
+    }
+
     /// Reads the key of every object, keeps those under `prefix` after `after`, and
     /// returns the first `max` in key order.
     fn list(
@@ -273,6 +355,8 @@ struct Object {
     header: u64,
     /// The object's length.
     size: u64,
+    /// The file's modification time.
+    mtime: SystemTime,
 }
 
 impl Object {
@@ -286,7 +370,7 @@ impl Object {
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
             opened => opened.map_err(failed("open", path))?,
         };
-        let len = file.metadata().map_err(failed("stat", path))?.len();
+        let stat = file.metadata().map_err(failed("stat", path))?;
         let mut head = [0; MAX_HEADER];
         let read = file.read_at(&mut head, 0).map_err(failed("read", path))?;
         Ok(parse_header(&head[..read]).map(|(key, header)| Self {
@@ -294,7 +378,9 @@ impl Object {
             key,
             header,
             // The header was read from the file, so it is no longer than it.
-            size: len - header,
+            size: stat.len() - header,
+            // Linux and macOS keep a modification time on every file.
+            mtime: stat.modified().unwrap_or(SystemTime::UNIX_EPOCH),
         }))
     }
 }

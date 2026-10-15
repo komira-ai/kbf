@@ -1,6 +1,7 @@
 //! The server's assembly, as a library: [`start`] opens the store and metadata log the
-//! flags name, attaches the write tier and binds the listeners, and returns a
-//! [`ServerHandle`] that serves. The `kbf-server` binary is `start`, a print and
+//! flags name, attaches the write tier, starts the start-up pass over a `--blob-dir`
+//! store in the background (`crate::startup_pass`) and binds the listeners, and returns
+//! a [`ServerHandle`] that serves. The `kbf-server` binary is `start`, a print and
 //! `serve`; a process that runs the server beside the worker daemon calls the same
 //! function.
 //!
@@ -21,6 +22,7 @@ use kbf_meta::Retention;
 use kbf_objstore::{Capabilities, FsStore, KeyPrefix, MemoryStore, ObjectStore};
 use kbf_threads::Topology;
 
+use crate::startup_pass::StartPass;
 use crate::write_tier::{FLUSH_EVERY, TierLog};
 use crate::{Args, RaftMetaLog, SERVER_VERSION, ServeError, StoreKind, bind_server_with_policy};
 
@@ -29,9 +31,10 @@ pub fn sizes_on(args: &Args, topology: Topology) -> kbf_threads::Sizes {
     args.threads.resolve(topology)
 }
 
-/// A started server: bound, its write tier attached and its flusher running, not yet
-/// serving. [`ServerHandle::serve`] serves until the shutdown future given to [`start`]
-/// completes; dropping the handle first stops the flusher and releases the listeners.
+/// A started server: bound, its write tier attached and its flusher (and any start-up
+/// pass) running, not yet serving. [`ServerHandle::serve`] serves until the shutdown
+/// future given to [`start`] completes; dropping the handle first stops the flusher and
+/// the pass and releases the listeners.
 pub struct ServerHandle {
     /// Where the REAPI listener is.
     pub reapi: SocketAddr,
@@ -42,6 +45,7 @@ pub struct ServerHandle {
     start_line: String,
     serving: Pin<Box<dyn Future<Output = Result<(), ServeError>> + Send>>,
     _flusher: Option<AbortOnDrop>,
+    _pass: Option<AbortOnDrop>,
 }
 
 impl ServerHandle {
@@ -59,7 +63,10 @@ impl ServerHandle {
     /// A listener fails while serving.
     pub async fn serve(self) -> Result<(), Box<dyn Error>> {
         let Self {
-            serving, _flusher, ..
+            serving,
+            _flusher,
+            _pass,
+            ..
         } = self;
         serving.await?;
         Ok(())
@@ -87,10 +94,11 @@ where
     match (args.blob_dir.as_deref(), args.store) {
         (Some(dir), _) => {
             let store = FsStore::open(dir, args.blob_dir_min_free_bytes)?;
+            let files = store.clone();
             over(
                 args,
                 raft_dir,
-                store,
+                (store, Some(files)),
                 KeyPrefix::default(),
                 BLOB_DIR_PREFIX,
                 shutdown,
@@ -107,7 +115,7 @@ where
             over(
                 args,
                 raft_dir,
-                store,
+                (store, None),
                 start_prefix,
                 &args.s3_prefix,
                 shutdown,
@@ -122,12 +130,13 @@ const BLOB_DIR_PREFIX: &str = "kbf/";
 
 /// Serves `store` under the metadata log `raft_dir` names: the Raft log there, writing
 /// under the prefix it committed (`<prefix_root><log id>/` for a new log), or without
-/// one a log in memory, writing under `start_prefix`. (`Args::raft_dir` refuses
-/// `--blob-dir` without a Raft log.)
+/// one a log in memory, writing under `start_prefix`. With `files`, the same store as
+/// a file store, the start-up pass runs over it under the Raft log. (`Args::raft_dir`
+/// refuses `--blob-dir` without a Raft log, so there is no pass over a memory log.)
 async fn over<O, S, F>(
     args: &Args,
     raft_dir: Option<&Path>,
-    store: O,
+    (store, files): (O, Option<FsStore>),
     start_prefix: KeyPrefix,
     prefix_root: &str,
     shutdown: S,
@@ -145,7 +154,8 @@ where
         Some(dir) => {
             let log = RaftMetaLog::open_dir(dir, Retention::default(), prefix_root).await?;
             let (prefix, id) = (log.store_prefix(), log.log_id());
-            serve_with(args, log, store, prefix, Some(id), shutdown).await
+            let pass = files.map(StartPass::over_raft);
+            assemble(args, log, store, prefix, Some(id), shutdown, pass).await
         }
     }
 }
@@ -171,6 +181,26 @@ where
     S: FnOnce() -> io::Result<F>,
     F: Future<Output = ()> + Send + 'static,
 {
+    assemble(args, meta, store, prefix, log, shutdown, None).await
+}
+
+/// [`serve_with`], and `pass` spawned once the write tier is attached: it runs beside
+/// the server and is never awaited here.
+pub(crate) async fn assemble<M, O, S, F>(
+    args: &Args,
+    meta: M,
+    store: O,
+    prefix: KeyPrefix,
+    log: Option<FarmLogId>,
+    shutdown: S,
+    pass: Option<StartPass<M>>,
+) -> Result<ServerHandle, Box<dyn Error>>
+where
+    M: TierLog,
+    O: ObjectStore + 'static,
+    S: FnOnce() -> io::Result<F>,
+    F: Future<Output = ()> + Send + 'static,
+{
     let listeners = args.listeners()?;
     let policy = args.reapi_auth_policy()?;
     let routes = Routes {
@@ -187,6 +217,7 @@ where
         let flusher = crate::write_tier::run_flusher(Arc::clone(&cache), FLUSH_EVERY);
         AbortOnDrop(tokio::spawn(flusher))
     });
+    let _pass = pass.map(|pass| AbortOnDrop(crate::startup_pass::spawn(Arc::clone(&cache), pass)));
     let shutdown = shutdown()?;
     let api = args.api()?;
     let bound = bind_server_with_policy(cache, listeners, api, policy, shutdown)?;
@@ -198,10 +229,11 @@ where
         start_line: start_line(bound.reapi, bound.worker, bound.api, routes, log, &plain),
         serving: Box::pin(bound.serving),
         _flusher,
+        _pass,
     })
 }
 
-/// Aborts a task when dropped: the flusher stops with the server.
+/// Aborts a task when dropped: the flusher and the start-up pass stop with the server.
 struct AbortOnDrop(tokio::task::JoinHandle<()>);
 
 impl Drop for AbortOnDrop {
