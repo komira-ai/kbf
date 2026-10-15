@@ -21,7 +21,8 @@ use kbf_meta::Retention;
 use kbf_objstore::{Capabilities, FsStore, KeyPrefix, MemoryStore, ObjectStore};
 use kbf_threads::Topology;
 
-use crate::local::LocalStore;
+use crate::identity::Peers;
+use crate::local::{Caller, LocalServer, LocalStore};
 use crate::write_tier::{FLUSH_EVERY, TierLog};
 use crate::{Args, RaftMetaLog, SERVER_VERSION, ServeError, StoreKind, bind_server_with_policy};
 
@@ -40,7 +41,7 @@ pub struct ServerHandle {
     pub worker: SocketAddr,
     /// Where the operator API listener is, if there is one.
     pub api: Option<SocketAddr>,
-    local: LocalStore,
+    local: LocalServer,
     start_line: String,
     serving: Pin<Box<dyn Future<Output = Result<(), ServeError>> + Send>>,
     _flusher: Option<AbortOnDrop>,
@@ -55,10 +56,11 @@ impl ServerHandle {
     }
 
     /// The server's cache as calls in this process: what a daemon run beside the server
-    /// in one process reads and writes blobs through.
+    /// in one process, whose certificate `caller` holds, reads and writes blobs
+    /// through, each call admitted as that daemon's would be on the worker listener.
     #[must_use]
-    pub fn local(&self) -> LocalStore {
-        self.local.clone()
+    pub fn local(&self, caller: Caller) -> LocalStore {
+        self.local.store(caller)
     }
 
     /// Serves every listener until the shutdown future ends and its connections close
@@ -191,7 +193,13 @@ where
         .with_input_trees(args.input_tree_config());
     let (cache, tier) = crate::write_tier::attach(cache, args).await?;
     let cache = Arc::new(cache);
-    let local = LocalStore::new(Arc::clone(&cache), listeners.segments);
+    let peers = listeners
+        .worker_tls
+        .as_ref()
+        .map_or(Peers::Unauthenticated, |tls| Peers::Certified {
+            deny_list: tls.deny_list.clone(),
+        });
+    let local = LocalServer::new(Arc::clone(&cache), listeners.segments, peers);
     let _flusher = tier.map(|_| {
         let flusher = crate::write_tier::run_flusher(Arc::clone(&cache), FLUSH_EVERY);
         AbortOnDrop(tokio::spawn(flusher))

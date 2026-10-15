@@ -54,7 +54,7 @@ impl Subject for Local {
         let args = kbf_server::Args::try_parse_from(argv).expect("flags");
         let never = || Ok(std::future::pending::<()>());
         let server = kbf_server::start(&args, never).await.expect("start");
-        let plane = LocalDataPlane::new(server.local(), tokio::runtime::Handle::current());
+        let plane = LocalDataPlane::new(server.local(caller()), tokio::runtime::Handle::current());
         // Serves (and flushes its tier) for as long as the test runs.
         tokio::spawn(server.serve());
         Arc::new(plane)
@@ -63,6 +63,13 @@ impl Subject for Local {
     fn scratch(&self) -> &Path {
         &self.scratch
     }
+}
+
+/// The daemon the plane's calls are admitted as: a certificate naming one node. The
+/// server here serves plain text and has no deny list, so it is admitted.
+fn caller() -> kbf_server::Caller {
+    let made = rcgen::generate_simple_self_signed(vec!["node-1".to_owned()]).expect("cert");
+    kbf_server::Caller::from_pem(made.cert.pem().as_bytes()).expect("caller")
 }
 
 mod tier {
