@@ -28,7 +28,7 @@ use crate::network::{self, Network, network_of};
 use crate::procs::{self, Proc, Tracker};
 use crate::program::{Refused, Resolved, resolve};
 use crate::record::{Exec, KeeperFor, Spawned};
-use crate::simulator::{self, Made, Simctl};
+use crate::simulator::{self, Made, Simctl, Waited};
 use crate::slots::Runner;
 use crate::user_folders::UserFolders;
 use crate::xcode;
@@ -148,6 +148,7 @@ impl<C: Cas> NativeRuntime<C> {
             isolation: config.isolation.clone(),
             rules: rules.clone(),
             within: simulator::ANSWER_WITHIN,
+            listing: config.simulator_listing,
         });
         // The first lease directory a killed daemon left that may hold a simulator:
         // the simulators every lease left are deleted from it before it is removed.
@@ -555,6 +556,11 @@ impl<C: Cas> NativeRuntime<C> {
                 *killer = Some(by);
                 return Err(RuntimeError::Killed);
             }
+            if let Some(by) = simulator_listed(&self.simctl, work.lease_id, &prepared, stop).await?
+            {
+                *killer = Some(by);
+                return Err(RuntimeError::Killed);
+            }
         }
         clock.input_fetch_completed_timestamp = now();
         clock.execution_start_timestamp = now();
@@ -732,6 +738,35 @@ async fn create_simulator(
     *made_in(slot) = Some(kept);
     prepared.simulator_env = vec![(simulator::UDID_VAR, OsString::from(udid))];
     Ok(())
+}
+
+/// Waits until Xcode lists the simulator `prepared` was given, if any
+/// ([`Simctl::wait_listed`]), and logs how long that took; what a kill sent, if one
+/// came first. Not generic over the CAS.
+///
+/// # Errors
+/// [`RuntimeError::Failed`] when it was not listed in time: the node's, not the
+/// action's.
+async fn simulator_listed(
+    simctl: &Arc<Simctl>,
+    lease: LeaseId,
+    prepared: &Prepared,
+    stop: &mut oneshot::Receiver<Stop>,
+) -> Result<Option<Stop>, RuntimeError> {
+    let Some((_, udid)) = prepared.simulator_env.first() else {
+        return Ok(None);
+    };
+    let udid = udid.to_string_lossy();
+    let dir = prepared.developer_dir.as_deref();
+    match simctl.wait_listed(&prepared.lease, &udid, dir, stop).await {
+        Waited::Listed(waited, looks) => {
+            let ms = waited.as_millis();
+            tracing::info!(%lease, %udid, ms, looks, "simulator listed by Xcode");
+            Ok(None)
+        }
+        Waited::Never(why) => Err(RuntimeError::Failed(format!("simulator: {why}"))),
+        Waited::Stopped(by) => Ok(Some(by)),
+    }
 }
 
 /// The UDID `simctl create` printed, or the lease's failure: the node's (a runtime it

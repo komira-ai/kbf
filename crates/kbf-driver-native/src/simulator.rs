@@ -14,6 +14,16 @@
 //!   action is not run). The action finds the UDID in [`UDID_VAR`], which wins over the
 //!   Command's environment. The device is made shut down: the action boots it (`xcrun
 //!   simctl boot "$KBF_SIMULATOR_UDID"`) or lets `xcodebuild` do it.
+//! - **Then, before the action runs**, the driver waits until Xcode lists the device:
+//!   `xcrun xcdevice list`, run as the action would run it (its sandbox, its Xcode),
+//!   every [`Listing::every`] until it names the UDID, for up to [`Listing::within`]
+//!   ([`Listing::DEFAULT`]: 5 s and 300 s). For a while on some Macs (on hosted
+//!   runners, from a few seconds to over two minutes), Xcode lists no simulator at
+//!   all, though `simctl` already shows the device; an `xcodebuild test -destination
+//!   id=$KBF_SIMULATOR_UDID` started then gives up after its own 30 s
+//!   (`-destination-timeout`) and fails the action. A device not listed in time fails
+//!   the lease ([`RuntimeError::Failed`], the node's to fix) with the last listing,
+//!   and the action is not run; a kill ends the wait between two looks.
 //! - **At the end**, whatever the outcome (an exit, a failure, a timeout, a kill, a run
 //!   the daemon drops), before the lease directory is removed: the device the create
 //!   printed, and every device named for the lease in `simctl list devices` (one a
@@ -41,13 +51,15 @@
 //! reach every device of the default set, not only its own.
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use kbf_daemon::RuntimeError;
 use kbf_proto::reapi::{Action, Command, Platform};
 
 use crate::network::Isolation;
 use crate::xcode::{self, DEVELOPER_DIR, Sandbox};
+use tokio::sync::oneshot;
 
 /// The platform property that asks for a simulator of the lease's own.
 pub const PROPERTY: &str = "simulator";
@@ -64,6 +76,40 @@ pub const MARKER: &str = "simulator";
 
 /// How long each `simctl` command has to exit.
 pub const ANSWER_WITHIN: Duration = Duration::from_secs(120);
+
+/// How long the driver waits for Xcode to list a lease's new simulator, and how often
+/// it looks (`xcrun xcdevice list`), before the action runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Listing {
+    /// How long after the device is made it must be listed, or the lease fails.
+    pub within: Duration,
+    /// The pause between two looks.
+    pub every: Duration,
+}
+
+impl Listing {
+    /// 300 s, looking every 5 s. On hosted macOS runners (issue #608), the action's
+    /// own sandboxed `xcodebuild -showdestinations` first listed its simulator from a
+    /// few seconds to 155 s after it began looking, and twice not within 126 s, while
+    /// it listed no simulator at all. About twice the longest seen keeps a slow node
+    /// serving; a node that cannot list a device in five minutes fails the lease
+    /// rather than the action.
+    pub const DEFAULT: Self = Self {
+        within: Duration::from_secs(300),
+        every: Duration::from_secs(5),
+    };
+}
+
+/// How [`Simctl::wait_listed`] ended.
+#[derive(Debug)]
+pub(crate) enum Waited<T> {
+    /// The device was listed, this long after the wait began, at this look.
+    Listed(Duration, u32),
+    /// It was not listed within [`Listing::within`]: why the last look did not.
+    Never(String),
+    /// A kill arrived; what it sent.
+    Stopped(T),
+}
 
 /// The simulator an action asks for.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -120,6 +166,7 @@ pub(crate) struct Simctl {
     pub isolation: Isolation,
     pub rules: String,
     pub within: Duration,
+    pub listing: Listing,
 }
 
 /// The simulator a lease may have: what its end needs, set before the create runs.
@@ -144,17 +191,28 @@ impl Simctl {
     ) -> Result<std::process::Output, String> {
         let mut all = vec!["simctl"];
         all.extend_from_slice(args);
+        self.xcrun(lease, developer_dir, &all)
+    }
+
+    /// `xcrun all` under the sandbox of `lease` (a real path), as [`Self::run`] runs
+    /// `simctl`.
+    fn xcrun(
+        &self,
+        lease: &Path,
+        developer_dir: Option<&Path>,
+        all: &[&str],
+    ) -> Result<std::process::Output, String> {
         let sandbox = Sandbox {
             isolation: self.isolation.clone(),
             dir: lease.to_owned(),
             rules: self.rules.clone(),
         };
-        let mut command = sandbox.command(&self.xcrun, &all);
+        let mut command = sandbox.command(&self.xcrun, all);
         match developer_dir {
             Some(dir) => command.env(DEVELOPER_DIR, dir),
             None => command.env_remove(DEVELOPER_DIR),
         };
-        let shown = || format!("simctl {}", args.join(" "));
+        let shown = || all.join(" ");
         let out = xcode::output_within(command, self.within, lease)
             .map_err(|e| format!("{}: {e}", shown()))?;
         if out.status.success() {
@@ -185,6 +243,67 @@ impl Simctl {
             Ok(udid.to_owned())
         } else {
             Err(format!("simctl create printed no UDID: {udid:?}"))
+        }
+    }
+
+    /// One look: `Ok` when `xcrun xcdevice list` (Xcode's own list of the devices
+    /// and simulators it can use), run with the Xcode at `developer_dir`, names
+    /// `udid`; otherwise what it printed, or why it failed.
+    fn listed(&self, lease: &Path, udid: &str, developer_dir: Option<&Path>) -> Result<(), String> {
+        let args = ["xcdevice", "list", "--timeout", XCDEVICE_TIMEOUT];
+        let out = self.xcrun(lease, developer_dir, &args)?;
+        if lists(&out.stdout, udid) {
+            Ok(())
+        } else {
+            let printed = String::from_utf8_lossy(&out.stdout);
+            Err(format!(
+                "the last listing: {}",
+                xcode::cut(printed.trim(), LISTING_BYTES)
+            ))
+        }
+    }
+
+    /// Waits until Xcode lists `udid`, made in `lease` (a real path) with the Xcode at
+    /// `developer_dir`, looking as [`Self::listed`] does, at once and then every
+    /// [`Listing::every`] for up to [`Listing::within`]. Each look has the time a
+    /// `simctl` command has to answer ([`ANSWER_WITHIN`]), the last one too (one cut short by the deadline would say nothing
+    /// of the listing), so the wait can last that much longer. A kill (`stop`) is
+    /// taken between two looks, never during one: a look runs in the lease directory,
+    /// which the end removes.
+    pub(crate) async fn wait_listed<T>(
+        self: &Arc<Self>,
+        lease: &Path,
+        udid: &str,
+        developer_dir: Option<&Path>,
+        stop: &mut oneshot::Receiver<T>,
+    ) -> Waited<T> {
+        let started = Instant::now();
+        let listing = self.listing;
+        let mut looks = 0;
+        loop {
+            looks += 1;
+            let look = tokio::task::spawn_blocking({
+                let simctl = Arc::clone(self);
+                let (lease, udid) = (lease.to_owned(), udid.to_owned());
+                let developer_dir = developer_dir.map(Path::to_owned);
+                move || simctl.listed(&lease, &udid, developer_dir.as_deref())
+            });
+            // No closure for the panic: a look that never panics would leave it unrun.
+            let look = look.await.unwrap_or(Err(String::from("the look panicked")));
+            let Err(why) = look else {
+                return Waited::Listed(started.elapsed(), looks);
+            };
+            let left = listing.within.saturating_sub(started.elapsed());
+            if left.is_zero() {
+                return Waited::Never(format!(
+                    "xcrun xcdevice list did not list {udid} within {:?} ({looks} looks); {why}",
+                    listing.within
+                ));
+            }
+            tokio::select! {
+                () = tokio::time::sleep(listing.every.min(left)) => {}
+                Ok(by) = &mut *stop => return Waited::Stopped(by),
+            }
         }
     }
 
@@ -251,6 +370,24 @@ impl Simctl {
         let out = self.run(dir, None, &["list", "devices", "-j"])?;
         devices_in(&out.stdout).map_err(|e| format!("simctl list devices -j: {e}"))
     }
+}
+
+/// How long `xcdevice list` waits for devices to show up (`--timeout`, seconds).
+const XCDEVICE_TIMEOUT: &str = "5";
+
+/// How much of the last listing a lease that never saw its device says.
+const LISTING_BYTES: usize = 1000;
+
+/// Whether `json`, what `xcdevice list` printed (an array of devices), holds a device
+/// whose `identifier` is `udid` and that is not marked `"available": false`.
+fn lists(json: &[u8], udid: &str) -> bool {
+    let Ok(serde_json::Value::Array(devices)) = serde_json::from_slice(json) else {
+        return false;
+    };
+    devices.iter().any(|device| {
+        device.get("identifier").and_then(serde_json::Value::as_str) == Some(udid)
+            && device.get("available").and_then(serde_json::Value::as_bool) != Some(false)
+    })
 }
 
 /// [`Simctl::devices`] from what `simctl list devices -j` printed:
@@ -382,6 +519,32 @@ mod tests {
         );
         for bad in [&b"{}"[..], b"{\"devices\": []}", b"not JSON"] {
             assert!(devices_in(bad).is_err(), "{}", String::from_utf8_lossy(bad));
+        }
+    }
+
+    /// Catches: a device another listing names taken for the lease's (a match on part
+    /// of the UDID, or on any field), one Xcode marks unavailable taken for listed
+    /// (`xcodebuild` would not use it), and a listing that is not an array of devices
+    /// (`xcdevice` printing a warning) taken for one that names the device.
+    #[test]
+    fn a_listing_names_the_device_by_its_identifier() {
+        let udid = "0A1B2C3D-4E5F-6071-8293-A4B5C6D7E8F9";
+        let listed = |json: String| lists(json.as_bytes(), udid);
+        assert!(listed(format!(
+            r#"[{{"identifier": "x"}}, {{"identifier": "{udid}"}}]"#
+        )));
+        assert!(listed(format!(
+            r#"[{{"identifier": "{udid}", "available": true}}]"#
+        )));
+        for not in [
+            "[]".to_owned(),
+            format!(r#"[{{"identifier": "{udid}", "available": false}}]"#),
+            format!(r#"[{{"identifier": "{udid}0"}}]"#),
+            format!(r#"[{{"name": "{udid}"}}]"#),
+            format!(r#"{{"identifier": "{udid}"}}"#),
+            format!("warning: {udid}"),
+        ] {
+            assert!(!listed(not.clone()), "{not}");
         }
     }
 
