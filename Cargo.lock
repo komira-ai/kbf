@@ -1308,7 +1308,6 @@ dependencies = [
  "kbf-transfer",
  "kbf-types",
  "prost",
- "rcgen",
  "rustix",
  "tokio",
  "tonic",

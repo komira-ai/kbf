@@ -82,11 +82,11 @@ pub use kbf_sched::MemoryLadder;
 pub use local::LocalStore;
 pub use raft_log::{RaftLogError, RaftMetaLog};
 pub use serve::{
-    Api, Bound, Listeners, ServeError, WorkerTls, bind_server, bind_server_with_api,
-    bind_server_with_policy,
+    Api, Bound, Daemons, Listeners, ServeError, WorkerTls, bind_server, bind_server_for,
+    bind_server_with_api, bind_server_with_policy,
 };
-pub use start::{ServerHandle, interrupted, serve_with, sizes_on, start};
-pub use worker::WorkerService;
+pub use start::{ServerHandle, interrupted, serve_with, sizes_on, start, start_for};
+pub use worker::{DaemonStream, LocalWorker, SessionStream, WorkerService};
 
 /// The commit the server was built from: 12 hex digits, or `unknown` when the build
 /// had no git checkout. `build.rs` embeds it (`src/build_commit.rs` has the rule,

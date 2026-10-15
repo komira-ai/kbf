@@ -55,14 +55,14 @@ pub struct Args {
     #[arg(long = "server", required = true, value_delimiter = ',')]
     pub servers: Vec<String>,
     /// PEM file of the CA certificates that sign server certificates.
-    #[arg(long)]
-    pub ca_cert: PathBuf,
+    #[arg(long, required = true)]
+    pub ca_cert: Option<PathBuf>,
     /// PEM file of this daemon's client certificate chain.
-    #[arg(long)]
-    pub cert: PathBuf,
+    #[arg(long, required = true)]
+    pub cert: Option<PathBuf>,
     /// PEM file of this daemon's private key.
-    #[arg(long)]
-    pub key: PathBuf,
+    #[arg(long, required = true)]
+    pub key: Option<PathBuf>,
     /// The name to verify in the server certificate, when it is not the URL's host.
     #[arg(long)]
     pub tls_server_name: Option<String>,
@@ -207,13 +207,16 @@ impl DaemonConfig {
         }
     }
 
-    /// The configuration the command line describes.
+    /// The configuration the command line describes. The three TLS files are required
+    /// flags, absent only from a command line that drops them for a daemon that dials
+    /// no server (`kbf-all-in-one`'s, [`crate::Daemon::in_process`]); there each is an
+    /// empty path, which nothing reads.
     #[must_use]
     pub fn from_args(args: &Args) -> Self {
         let tls = TlsFiles {
-            ca_cert: args.ca_cert.clone(),
-            cert: args.cert.clone(),
-            key: args.key.clone(),
+            ca_cert: args.ca_cert.clone().unwrap_or_default(),
+            cert: args.cert.clone().unwrap_or_default(),
+            key: args.key.clone().unwrap_or_default(),
             server_name: args.tls_server_name.clone(),
         };
         let mut config = Self::new(String::new(), tls, args.node_id.clone());

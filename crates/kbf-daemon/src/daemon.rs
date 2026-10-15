@@ -1,7 +1,10 @@
 //! The daemon's main loop: one outbound mutual-TLS stream at a time to a server,
 //! reconnecting when it ends, with the lease manager and the fence clock running
 //! throughout, connected or not. Which server it tries next, and how long it waits
-//! between rounds of attempts, is [`crate::connect`]'s: it never stops trying.
+//! between rounds of attempts, is [`crate::connect`]'s: it never stops trying. A daemon
+//! in its server's own process ([`Daemon::in_process`]) opens each stream through the
+//! [`ControlPlane`] it is given instead, with no connection or TLS: one attempt per
+//! round, with the same waits, and the same session on the stream.
 //!
 //! A session sends Hello, which names this daemon process by an instance id drawn when
 //! the daemon starts and the same on every stream (issue #140: the scheduler gives up at
@@ -68,11 +71,13 @@
 //! without ResultAck has been released, which is why the version was not raised for it.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Display;
 use std::future::Future;
 use std::hash::{BuildHasher, RandomState};
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures::StreamExt as _;
 use futures::channel::mpsc::{UnboundedSender, unbounded};
 use kbf_proto::google::rpc::Code;
 use kbf_proto::reapi::Digest;
@@ -92,6 +97,7 @@ use crate::connect::{
     rotate_after, unit_random,
 };
 use crate::contact::Contact;
+use crate::control::{ControlPlane, Dialled};
 use crate::lease::{Done, Leases, failure, lease_id, proto_lease_id};
 use crate::phases::LeasePhases;
 use crate::pressure;
@@ -102,6 +108,10 @@ use crate::window::StartWindow;
 
 /// The `kbf.worker.v1` protocol version this daemon speaks.
 pub const PROTOCOL_VERSION: u32 = 1;
+
+/// What the log and [`Event::ConnectFailed`] name the server of a daemon in its
+/// server's process ([`Daemon::in_process`]).
+pub const IN_PROCESS: &str = "in-process";
 
 /// Something the daemon did that an observer (a test, later the meter) may want.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -193,6 +203,9 @@ pub struct Daemon {
     tls: ClientTlsConfig,
     /// How server names become addresses, asked again every round.
     resolver: Arc<dyn Resolve>,
+    /// The plane of a daemon in its server's process ([`Self::in_process`]), which it
+    /// opens every session through in place of `servers`.
+    in_process: Option<Arc<dyn ControlPlane>>,
     /// Whether the current (or the last) stream got its Welcome.
     welcomed: bool,
     /// The report the daemon was started with, with a `drivers` entry for each of its
@@ -279,9 +292,6 @@ impl Daemon {
         runtimes: impl Into<Runtimes>,
         report: NodeReport,
     ) -> Result<Self, ConfigError> {
-        let runtimes = runtimes.into();
-        let drivers = runtimes.drivers().into_iter().map(|d| ("drivers", d));
-        let report = report.with_entries(drivers);
         let servers = config
             .servers
             .iter()
@@ -291,13 +301,55 @@ impl Daemon {
             return Err(ConfigError::NoServer);
         }
         let tls = config.tls.load()?;
+        Ok(Self::over(
+            config,
+            runtimes.into(),
+            report,
+            servers,
+            tls,
+            None,
+        ))
+    }
+
+    /// A daemon run in its server's own process: every session is opened through
+    /// `plane` ([`ControlPlane`]), with the reconnect waits of `config`; its servers
+    /// and TLS files are not read. Otherwise as [`Self::new`].
+    pub fn in_process(
+        config: DaemonConfig,
+        runtimes: impl Into<Runtimes>,
+        report: NodeReport,
+        plane: Arc<dyn ControlPlane>,
+    ) -> Self {
+        let tls = ClientTlsConfig::new();
+        Self::over(
+            config,
+            runtimes.into(),
+            report,
+            Vec::new(),
+            tls,
+            Some(plane),
+        )
+    }
+
+    /// The daemon either constructor builds.
+    fn over(
+        config: DaemonConfig,
+        runtimes: Runtimes,
+        report: NodeReport,
+        servers: Vec<Server>,
+        tls: ClientTlsConfig,
+        in_process: Option<Arc<dyn ControlPlane>>,
+    ) -> Self {
+        let drivers = runtimes.drivers().into_iter().map(|d| ("drivers", d));
+        let report = report.with_entries(drivers);
         let (done_tx, done) = mpsc::unbounded_channel();
         let contact = Contact::new(config.fence_after);
-        Ok(Self {
+        Self {
             config,
             servers,
             tls,
             resolver: Arc::new(SystemResolver),
+            in_process,
             welcomed: false,
             base: report.clone(),
             report,
@@ -319,7 +371,7 @@ impl Daemon {
             clock: Arc::new(SystemClock),
             instance: instance_id(),
             predecessor: String::new(),
-        })
+        }
     }
 
     /// This daemon process's instance id (`Hello.instance_id`), drawn when it was built.
@@ -478,9 +530,28 @@ impl Daemon {
     pub async fn run(mut self, shutdown: impl Future<Output = ()>) {
         #[cfg(target_os = "linux")]
         crate::numa::log_layout();
+        let sessions = match self.in_process.clone() {
+            Some(plane) => futures::future::Either::Left(self.in_process_forever(plane)),
+            None => futures::future::Either::Right(self.reconnect_forever()),
+        };
         tokio::select! {
-            () = self.reconnect_forever() => {}
+            () = sessions => {}
             () = shutdown => tracing::info!("shutting down"),
+        }
+    }
+
+    /// Sessions through the in-process `plane`, one after another without end: the
+    /// rounds of [`Self::reconnect_forever`], each of one attempt, named
+    /// [`IN_PROCESS`].
+    async fn in_process_forever(&mut self, plane: Arc<dyn ControlPlane>) {
+        let mut backoff = Backoff::new(self.config.reconnect_after, self.config.reconnect_max);
+        let mut warn = WarnLimit::new(WARN_EVERY);
+        loop {
+            self.welcomed = false;
+            let ended = self.session(plane.as_ref(), IN_PROCESS).await;
+            let welcomed = self.attempted(&mut warn, IN_PROCESS.to_owned(), ended);
+            let wait = self.round_wait(&mut backoff, welcomed);
+            self.offline(sleep(wait)).await;
         }
     }
 
@@ -502,33 +573,53 @@ impl Daemon {
             let mut welcomed = false;
             for target in rotate_after(targets, last) {
                 last = Some(target.addr);
-                let reason = match self.session(&target).await {
-                    Ok(()) => "the server ended the stream".to_owned(),
-                    Err(e) => e.with_causes(),
-                };
-                if self.welcomed {
-                    tracing::warn!(server = %target, %reason, "session ended");
-                    self.emit(Event::Disconnected(reason));
-                    warn.welcomed();
+                let ended = self.dial(&target).await;
+                if self.attempted(&mut warn, target.to_string(), ended) {
                     welcomed = true;
                     break;
                 }
-                self.failed(&mut warn, target.to_string(), &reason);
             }
-            let wait = if welcomed {
-                backoff.welcomed(unit_random())
-            } else {
-                let wait = backoff.failed(unit_random());
-                let failed_rounds = backoff.failed_rounds();
-                tracing::debug!(failed_rounds, ?wait, "no server reached; waiting");
-                self.emit(Event::Retrying {
-                    failed_rounds,
-                    wait,
-                });
-                wait
-            };
+            let wait = self.round_wait(&mut backoff, welcomed);
             self.offline(sleep(wait)).await;
         }
+    }
+
+    /// Logs and reports how an attempt on `server` `ended`: a session that ended, if
+    /// it was welcomed (then returns true), else an attempt that failed.
+    fn attempted(
+        &self,
+        warn: &mut WarnLimit,
+        server: String,
+        ended: Result<(), SessionError>,
+    ) -> bool {
+        let reason = match ended {
+            Ok(()) => "the server ended the stream".to_owned(),
+            Err(e) => e.with_causes(),
+        };
+        if self.welcomed {
+            tracing::warn!(%server, %reason, "session ended");
+            self.emit(Event::Disconnected(reason));
+            warn.welcomed();
+            return true;
+        }
+        self.failed(warn, server, &reason);
+        false
+    }
+
+    /// The wait after a round of attempts: `backoff`'s after a welcomed session, else
+    /// its growing wait, reported.
+    fn round_wait(&self, backoff: &mut Backoff, welcomed: bool) -> Duration {
+        if welcomed {
+            return backoff.welcomed(unit_random());
+        }
+        let wait = backoff.failed(unit_random());
+        let failed_rounds = backoff.failed_rounds();
+        tracing::debug!(failed_rounds, ?wait, "no server reached; waiting");
+        self.emit(Event::Retrying {
+            failed_rounds,
+            wait,
+        });
+        wait
     }
 
     /// Logs and reports an attempt that ended before Welcome: at WARN when `warn` allows,
@@ -562,7 +653,7 @@ impl Daemon {
 
     /// One stream to `target`, from connecting until it ends. Sets `welcomed` once the
     /// server's Welcome is taken.
-    async fn session(&mut self, target: &Target) -> Result<(), SessionError> {
+    async fn dial(&mut self, target: &Target) -> Result<(), SessionError> {
         self.welcomed = false;
         let endpoint = self.endpoint(target)?;
         let wait = self.config.welcome_timeout;
@@ -570,7 +661,17 @@ impl Daemon {
             .offline(timeout(wait, endpoint.connect()))
             .await
             .map_err(|_| SessionError::ConnectTimeout(wait))??;
-        let mut client = WorkerClient::new(channel);
+        let plane = Dialled(WorkerClient::new(channel));
+        self.session(&plane, target).await
+    }
+
+    /// One stream opened through `plane`, to `server`, until it ends. Sets `welcomed`
+    /// once the server's Welcome is taken; the caller clears it before the attempt.
+    async fn session(
+        &mut self,
+        plane: &dyn ControlPlane,
+        server: impl Display,
+    ) -> Result<(), SessionError> {
         let (tx, rx) = unbounded();
         // A change that arrived while no stream was up.
         self.take_driver_report();
@@ -581,15 +682,15 @@ impl Daemon {
         self.emit(Event::HelloSent);
 
         let wait = self.config.welcome_timeout;
-        let response = self
-            .offline(timeout(wait, client.session(rx)))
+        let mut inbound = self
+            .offline(timeout(wait, plane.session(rx)))
             .await
             .map_err(|_| SessionError::WelcomeTimeout(wait))??;
-        let mut inbound = response.into_inner();
         let first = self
-            .offline(timeout(wait, inbound.message()))
+            .offline(timeout(wait, inbound.next()))
             .await
-            .map_err(|_| SessionError::WelcomeTimeout(wait))??;
+            .map_err(|_| SessionError::WelcomeTimeout(wait))?
+            .transpose()?;
         let (interval, epoch) = self.welcome(first)?;
         self.welcomed = true;
         self.contact.new_stream(interval);
@@ -603,7 +704,7 @@ impl Daemon {
         if self.contact.confirm(hello_sent) {
             self.emit(Event::ContactRestored);
         }
-        tracing::info!(server = %target, ?interval, "welcomed");
+        tracing::info!(%server, ?interval, "welcomed");
         self.emit(Event::Welcomed {
             heartbeat_interval: interval,
         });
@@ -623,7 +724,7 @@ impl Daemon {
         loop {
             let wait = self.until_recheck();
             let wake = tokio::select! {
-                msg = inbound.message() => match msg? {
+                msg = inbound.next() => match msg.transpose()? {
                     Some(msg) => Wake::Message(msg),
                     None => return Ok(()),
                 },

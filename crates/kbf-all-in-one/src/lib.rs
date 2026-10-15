@@ -1,18 +1,20 @@
 //! `kbf-all-in-one`: the farm server and a worker daemon in one process, for a one-node
 //! Linux farm (the README says what it does today and what it does not do yet; the
 //! design is komira-build-farm#657). The daemon's blobs move through calls into
-//! the server's cache ([`LocalDataPlane`]), not over the network; its control plane
-//! (`Hello`, leases, heartbeats, results) is the remote daemon's, over mutual TLS to the
-//! server half's worker listener on loopback.
+//! the server's cache ([`LocalDataPlane`]), and its sessions (`Hello`, leases,
+//! heartbeats, results) through calls into the server's worker service
+//! ([`LocalControlPlane`]), not over the network: the process binds no worker listener,
+//! so no daemon but its own reaches the server half.
 //!
 //! [`main`] is the binary: the daemon's helper re-execs first, before any flag is read
 //! (`kbf_node::dispatch_helpers`: a keeper or `__chown-dirs` run of this binary never
 //! opens the server's directories or starts a runtime); then one command line holding
-//! both halves' flags ([`cli`]); then the server half, started as `kbf-server` starts
-//! (`kbf_server::start`, on an async runtime of its own, sized as `kbf-server` sizes
+//! both halves' flags, less the node identity and the worker listener ([`cli`]); then
+//! the server half, started as `kbf-server` starts but with no worker listener
+//! (`kbf_server::start_for`, on an async runtime of its own, sized as `kbf-server` sizes
 //! one), its start line printed to stdout; then the daemon half, as `kbf-daemon` starts
-//! (`kbf_node::start_with`, on its own runtime), with the in-process plane in place of
-//! the transfer engine. SIGTERM or SIGINT stops the server half as it stops
+//! (`kbf_node::start_with`, on its own runtime), with the in-process planes in place of
+//! the transfer engine and of the dial to `--server`. SIGTERM or SIGINT stops the server half as it stops
 //! `kbf-server`; the daemon half stops once the server half has, abandoning the leases
 //! still running, and the process exits 0. A server half that fails while serving stops
 //! the daemon too, and the process exits 1. A start the server half refuses exits 2; one
@@ -27,10 +29,12 @@
 //! and the deploy shape, the ownership step and the unit.
 
 pub mod cli;
+mod control;
 mod plane;
 #[cfg(target_os = "linux")]
 mod run;
 
+pub use control::LocalControlPlane;
 pub use plane::LocalDataPlane;
 
 use std::process::ExitCode;

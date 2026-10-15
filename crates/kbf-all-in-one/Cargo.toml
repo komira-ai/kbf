@@ -48,7 +48,6 @@ kbf-front.workspace = true
 # The act steps the stand-in `podman` runs as each action, through this test binary.
 kbf-testkit.workspace = true
 prost.workspace = true
-rcgen.workspace = true
 tokio = { workspace = true, features = ["fs", "io-util", "macros", "net", "time"] }
 
 [lints]

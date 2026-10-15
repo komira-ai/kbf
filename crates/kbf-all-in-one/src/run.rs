@@ -7,8 +7,8 @@ use std::sync::Arc;
 
 use kbf_threads::Topology;
 
-use crate::LocalDataPlane;
 use crate::cli::{Flags, command, parse};
+use crate::{LocalControlPlane, LocalDataPlane};
 
 /// Parses the command line, starts both halves and serves until the server half stops.
 pub(crate) fn main() -> ExitCode {
@@ -67,23 +67,27 @@ impl fmt::Display for Failed {
     }
 }
 
-/// The server half on a runtime of its own, then the daemon half over the in-process
-/// plane; returns once the server half has stopped and the daemon half after it.
+/// The server half on a runtime of its own, with no worker listener, then the daemon
+/// half over the in-process planes, data and control; returns once the server half has
+/// stopped and the daemon half after it.
 fn serve(flags: &Flags) -> Result<(), Failed> {
     let sizes = kbf_server::sizes_on(&flags.server, Topology::detect());
     sizes.log();
     let tokio = sizes.runtime().map_err(Failed::server)?;
-    let started = tokio.block_on(kbf_server::start(&flags.server, kbf_server::interrupted));
-    let server = started.map_err(Failed::server)?;
+    let in_process = kbf_server::Daemons::InProcess;
+    let start = kbf_server::start_for(&flags.server, in_process, kbf_server::interrupted);
+    let server = tokio.block_on(start).map_err(Failed::server)?;
     println!("{}", server.start_line());
     let plane = Arc::new(LocalDataPlane::new(server.local(), tokio.handle().clone()));
+    let control = LocalControlPlane::new(server.local_worker(), tokio.handle().clone());
     // Dropped when the server half stops serving, which stops the daemon half.
     let (ended, server_ended) = tokio::sync::oneshot::channel::<()>();
     let serving = tokio.spawn(async move {
         let _ended = ended;
         server.serve().await
     });
-    let node = kbf_node::start_with(&flags.daemon, move |_| Ok(Arc::clone(&plane)));
+    let data = move |_: &kbf_node::Cli| Ok(Arc::clone(&plane));
+    let node = kbf_node::start_with(&flags.daemon, data, Arc::new(control));
     let node = node.map_err(Failed::Daemon)?;
     node.serve_until(async move {
         let _ = server_ended.await;

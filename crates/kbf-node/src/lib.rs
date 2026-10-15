@@ -49,6 +49,7 @@ use kbf_daemon::{
     Args, Capacity, DAEMON_VERSION, Daemon, DaemonConfig, DriverWatch, FakeRuntime, NodeReport,
     Runtime, Runtimes,
 };
+pub use kbf_daemon::{ControlPlane, DaemonMessages, ServerMessages};
 use kbf_driver_native::slots::Pool;
 use kbf_driver_native::{MemoryPolicy, NativeConfig, NativeRuntime, xcode, xcode_watch};
 use kbf_outputs::OutputLimits;
@@ -378,20 +379,33 @@ impl NodeHandle {
 /// checks fail ([`ImageUnusable`] among them, for which [`exit_code`] answers 2), or
 /// the node cannot be detected.
 pub fn start(cli: &Cli) -> Result<NodeHandle, Error> {
-    start_with(cli, remote)
+    start_over(cli, Box::new(remote), None)
 }
 
-/// [`start`], with every runtime reading and writing blobs through the data plane
-/// `plane` makes, rather than through the transfer engine over `--cas`: for a binary
-/// that runs the daemon in the server's own process. `plane` is called once, in the
-/// async runtime's context, when the first driver that moves blobs is set up (never,
-/// with `--driver fake` alone).
+/// [`start`] for a binary that runs the daemon in the server's own process: every
+/// runtime reads and writes blobs through the data plane `plane` makes, rather than
+/// through the transfer engine over `--cas`, and every session is opened through
+/// `control` ([`Daemon::in_process`]), rather than dialled to `--server` over mutual
+/// TLS: neither the servers nor the TLS files of `cli` are read. `plane` is called
+/// once, in the async runtime's context, when the first driver that moves blobs is set
+/// up (never, with `--driver fake` alone).
 ///
 /// # Errors
 /// As [`start`], or what `plane` returns.
 pub fn start_with<C: Cas>(
     cli: &Cli,
     plane: impl Fn(&Cli) -> Result<Arc<C>, Error> + 'static,
+    control: Arc<dyn ControlPlane>,
+) -> Result<NodeHandle, Error> {
+    start_over(cli, Box::new(plane), Some(control))
+}
+
+/// [`start`] over the data plane `plane` makes, its sessions opened through `control`
+/// when there is one, else dialled.
+fn start_over<C: Cas>(
+    cli: &Cli,
+    plane: MakePlane<C>,
+    control: Option<Arc<dyn ControlPlane>>,
 ) -> Result<NodeHandle, Error> {
     let sizes = sizes(cli)?;
     sizes.log();
@@ -400,7 +414,7 @@ pub fn start_with<C: Cas>(
         // The CAS channel is made lazily, which needs the runtime's context.
         let _context = tokio.enter();
         let xcrun = Path::new(xcode::XCRUN);
-        let (daemon, _) = node_over(cli, || native_config(cli), xcrun, Box::new(plane))?;
+        let (daemon, _) = node_over(cli, || native_config(cli), xcrun, plane, control)?;
         backstop(cli, daemon)
     };
     Ok(NodeHandle { tokio, daemon })
@@ -540,12 +554,14 @@ impl<C: Cas> Node<C> {
 /// `Daemon::with_driver_report`. Its status lists every `--image`, which only the
 /// container driver runs: without it, `--image` fails the start. With a real driver, once
 /// every runtime is built, it claims the lease directory and names the claim it found
-/// as its predecessor (`instance`).
+/// as its predecessor (`instance`). Its sessions are opened through `control` when
+/// there is one ([`Daemon::in_process`]), else dialled to `--server`.
 fn node_over<C: Cas>(
     cli: &Cli,
     native: impl Fn() -> Result<NativeConfig, Error>,
     xcrun: &Path,
     plane: MakePlane<C>,
+    control: Option<Arc<dyn ControlPlane>>,
 ) -> Result<(Daemon, Option<Reports>), Error> {
     if !cli.images.is_empty() && !cli.drivers.contains(&Driver::Container) {
         return Err("--image names container images: only --driver container runs them".into());
@@ -596,7 +612,12 @@ fn node_over<C: Cas>(
     let phase = node
         .phase
         .unwrap_or_else(|| tokio::sync::watch::channel(kbf_types::NodePhase::Serving).1);
-    let daemon = Daemon::new(DaemonConfig::from_args(&cli.daemon), runtimes, report)?
+    let config = DaemonConfig::from_args(&cli.daemon);
+    let daemon = match control {
+        Some(control) => Daemon::in_process(config, runtimes, report, control),
+        None => Daemon::new(config, runtimes, report)?,
+    };
+    let daemon = daemon
         .with_container_images(cli.images.iter().cloned())
         .with_phase(phase);
     // Every runtime is built, so every sweep has run: claim the scratch directory.
@@ -617,7 +638,7 @@ fn node(
     native: impl Fn() -> Result<NativeConfig, Error>,
     xcrun: &Path,
 ) -> Result<(Daemon, Option<Reports>), Error> {
-    node_over(cli, native, xcrun, Box::new(remote))
+    node_over(cli, native, xcrun, Box::new(remote), None)
 }
 
 /// [`node`] with the native driver alone, its configuration `config`.

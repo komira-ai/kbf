@@ -34,7 +34,7 @@ use crate::http_blobs::BlobReaders;
 use crate::http_invocations::InvocationReaders;
 use crate::identity::{DenyList, Peers};
 use crate::token::ApiToken;
-use crate::worker::WorkerService;
+use crate::worker::{LocalWorker, WorkerService};
 
 /// How the server listens and paces its daemons.
 #[derive(Clone, Debug)]
@@ -123,11 +123,12 @@ pub enum ServeError {
 
 /// A server that is listening: the addresses it bound, and the future that serves
 /// until shutdown.
-pub struct Bound<F> {
+pub struct Bound<F, W = SocketAddr> {
     /// Where the REAPI listener is.
     pub reapi: SocketAddr,
-    /// Where the worker listener is.
-    pub worker: SocketAddr,
+    /// Where the worker listener is: its address, or from [`bind_server_for`] an
+    /// `Option` of it, `None` for [`Daemons::InProcess`], which binds none.
+    pub worker: W,
     /// Where the operator API listener is, if there is one.
     pub api: Option<SocketAddr>,
     /// What `GET /readyz` reads besides the store; the serving future marks it
@@ -139,6 +140,18 @@ pub struct Bound<F> {
     /// The invocation records the serving future builds, which the build pages read
     /// ([`crate::http_invocations`]); tests feed it events.
     pub recorder: Recorder,
+    /// The worker service as calls in this process, for a daemon run in it.
+    pub local: LocalWorker,
+}
+
+/// Where a server's daemons reach its `kbf.worker.v1` service.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Daemons {
+    /// Over the network, through the worker listener (`kbf-server`).
+    Remote,
+    /// In this process only, through [`LocalWorker`] (`kbf-all-in-one`): no worker
+    /// listener is bound, so no daemon elsewhere can reach the server.
+    InProcess,
 }
 
 /// Aborts its task when dropped.
@@ -292,6 +305,56 @@ where
     M: MetaLog,
     O: ObjectStore + 'static,
 {
+    let listen = |addr| bind(addr).map(|(incoming, local)| (Some(incoming), local));
+    assemble(cache, listeners, api, policy, listen, shutdown)
+}
+
+/// [`bind_server_with_policy`], for daemons that reach the server as `daemons` says:
+/// with [`Daemons::InProcess`] the worker listener is not bound (`listeners.worker`
+/// and `listeners.worker_tls` are not read), and the server's daemon is the one that
+/// opens its sessions through [`Bound::local`]. Either way, that handle's sessions carry
+/// no certificate: they are admitted as on a plain-text worker listener, with no deny
+/// list.
+///
+/// # Errors
+/// As [`bind_server_with_policy`].
+pub fn bind_server_for<M, O>(
+    cache: Arc<Cache<M, O>>,
+    listeners: Listeners,
+    api: Option<Api>,
+    policy: Policy,
+    daemons: Daemons,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> Result<Bound<impl Future<Output = Result<(), ServeError>>, Option<SocketAddr>>, ServeError>
+where
+    M: MetaLog,
+    O: ObjectStore + 'static,
+{
+    let listen = move |addr| match daemons {
+        Daemons::Remote => bind(addr).map(|(incoming, local)| (Some(incoming), Some(local))),
+        Daemons::InProcess => Ok((None, None)),
+    };
+    assemble(cache, listeners, api, policy, listen, shutdown)
+}
+
+/// The worker listener [`assemble`] serves, if any, and what [`Bound::worker`] says of it.
+type WorkerListen<W> = (Option<TcpIncoming>, W);
+
+/// The server over `cache`, its worker listener bound by `listen` (given
+/// `listeners.worker`), or none when that returns no listener: then
+/// `listeners.worker_tls` is not read either.
+fn assemble<M, O, W>(
+    cache: Arc<Cache<M, O>>,
+    listeners: Listeners,
+    api: Option<Api>,
+    policy: Policy,
+    listen: impl FnOnce(SocketAddr) -> Result<WorkerListen<W>, ServeError>,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> Result<Bound<impl Future<Output = Result<(), ServeError>>, W>, ServeError>
+where
+    M: MetaLog,
+    O: ObjectStore + 'static,
+{
     let (recorder, recording) = Recorder::new(listeners.invocation_memory, RECORDER_CHANNEL);
     let default_memory = listeners.memory_ladder.first();
     let farm = Arc::new(
@@ -304,7 +367,7 @@ where
         .recording(recorder.clone()),
     );
     let (reapi_incoming, reapi) = bind(listeners.reapi)?;
-    let (worker_incoming, worker) = bind(listeners.worker)?;
+    let (worker_incoming, worker) = listen(listeners.worker)?;
     let probe_timeout = listeners.store_probe_timeout;
     let (api_listen, token) = api.map_or((None, None), |api| (Some(api.listen), api.token));
     let api_listener = api_listen.map(bind_api).transpose()?;
@@ -333,7 +396,9 @@ where
         reapi_server = reapi_server.tls_config(tls)?;
     }
     let mut worker_server = flow_control(Server::builder());
-    let peers = match listeners.worker_tls {
+    // Not read without a worker listener.
+    let worker_tls = listeners.worker_tls.filter(|_| worker_incoming.is_some());
+    let peers = match worker_tls {
         Some(tls) => {
             worker_server = worker_server.tls_config(tls.server)?;
             Peers::Certified {
@@ -358,14 +423,21 @@ where
     // connection that began it closes.
     let connections = Connections::new();
     let tracking = connections.clone();
-    let worker_incoming =
-        worker_incoming.map(move |accepted| accepted.map(|stream| tracking.track(stream)));
+    let worker_incoming = worker_incoming.map(|incoming| {
+        incoming.map(move |accepted| accepted.map(|stream| tracking.track(stream)))
+    });
     let worker_segments = SegmentsServer::new(WorkerSegments::new(
         SegmentsService::new(Arc::clone(&cache), listeners.segments, connections),
         peers.clone(),
     ))
     .max_decoding_message_size(MAX_MESSAGE_BYTES)
     .max_encoding_message_size(MAX_MESSAGE_BYTES);
+    let local = LocalWorker::new(WorkerService::new(
+        Arc::clone(&farm),
+        Peers::Unauthenticated,
+        listeners.heartbeat_interval,
+        listeners.hello_wait,
+    ));
     let worker_service = WorkerServer::new(WorkerService::new(
         Arc::clone(&farm),
         peers,
@@ -417,12 +489,16 @@ where
             .serve_with_incoming_shutdown(reapi_incoming, async {
                 let _ = draining.await;
             });
-        let worker_serve = worker_server
+        let worker_routes = worker_server
             .add_service(worker_service)
             .add_service(worker_blobs)
             .add_service(worker_cas)
-            .add_service(worker_segments)
-            .serve_with_incoming(worker_incoming);
+            .add_service(worker_segments);
+        // Without a worker listener, never completes.
+        let worker_serve = match worker_incoming {
+            Some(incoming) => Either::Left(worker_routes.serve_with_incoming(incoming)),
+            None => Either::Right(std::future::pending()),
+        };
         let api_serve = serve_api(api_listener.map(|(listener, _)| listener), api_routes);
         let ticking = async {
             let mut tick = tokio::time::interval(listeners.tick);
@@ -462,5 +538,6 @@ where
         readiness,
         serving,
         recorder,
+        local,
     })
 }
