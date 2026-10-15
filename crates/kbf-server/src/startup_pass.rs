@@ -89,11 +89,10 @@ pub(crate) fn spawn<M: MetaLog, O: ObjectStore + 'static>(
 mod tests {
     use std::io;
     use std::sync::{Mutex, PoisonError};
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     use bytes::Bytes;
     use clap::Parser;
-    use kbf_front::MemoryMetaLog;
     use kbf_meta::{Applied, Command, Epoch, Location, ObjectId, Retention, StoreId};
     use kbf_objstore::{KeyPrefix, ObjectKey};
     use kbf_proto::reapi::content_addressable_storage_client::ContentAddressableStorageClient;
@@ -138,9 +137,12 @@ mod tests {
     /// the pass held, the server must bind and answer FindMissing, which still reports
     /// a blob whose object file is gone. Released, the pass must delete the old
     /// epoch's orphan and forget the lost blob over the Raft log, which proves the log
-    /// is raised to the format that carries `EvictObjects` (mutant: no raise).
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    /// is raised to the format that carries `EvictObjects` (mutant: no raise), and log
+    /// what it did.
+    #[tokio::test(flavor = "current_thread")]
     async fn serves_before_pass_finishes() {
+        let logs = Capture::default();
+        let _default = logs.subscribe();
         let root = std::env::temp_dir().join(format!("kbf-server-pass-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let (blobs, raft) = (root.join("blobs"), root.join("raft"));
@@ -203,33 +205,69 @@ mod tests {
         let channel = Channel::from_shared(format!("http://{}", server.reapi))
             .expect("a URI")
             .connect_lazy();
-        let serving = tokio::spawn(async move { server.serve().await.map_err(|e| e.to_string()) });
+        // Serves until aborted; its outcome is not looked at.
+        let serving = tokio::spawn(async move { drop(server.serve().await) });
         assert!(missing(&channel, &[lost, kept]).await.is_empty());
         assert!(files.may_hold(&orphan).await.expect("may_hold"));
 
         release.send(()).expect("the pass is waiting");
-        let deadline = Instant::now() + BOUND;
-        while missing(&channel, &[lost, kept]).await != [lost.hash_hex()] {
-            assert!(
-                Instant::now() < deadline,
-                "the pass did not forget the lost blob"
-            );
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        logs.ended().await;
+        assert_eq!(missing(&channel, &[lost, kept]).await, [lost.hash_hex()]);
         assert!(!files.may_hold(&orphan).await.expect("may_hold"));
+        let text = logs.text();
+        for field in [
+            "orphans_deleted=1",
+            "evicted_objects=1",
+            "evicted_blobs=1",
+            "kept=1",
+        ] {
+            assert!(text.contains(field), "{field}: {text}");
+        }
         serving.abort();
         drop(files);
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// Log lines written by the test's subscriber.
+    /// Log lines written by the test's subscriber, and a wake-up when the pass's
+    /// last line is written.
     #[derive(Clone, Default)]
-    struct Capture(Arc<Mutex<Vec<u8>>>);
+    struct Capture(Arc<Mutex<Vec<u8>>>, Arc<tokio::sync::Notify>);
+
+    impl Capture {
+        /// Sends this thread's log lines here until the guard drops.
+        fn subscribe(&self) -> tracing::subscriber::DefaultGuard {
+            let writer = self.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(move || writer.clone())
+                .with_ansi(false)
+                .finish();
+            tracing::subscriber::set_default(subscriber)
+        }
+
+        /// Waits, at most `BOUND`, for the pass's last line.
+        async fn ended(&self) {
+            let ended = tokio::time::timeout(BOUND, self.1.notified()).await;
+            ended.expect("the pass logged no last line");
+        }
+
+        fn text(&self) -> String {
+            let bytes = self
+                .0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone();
+            String::from_utf8(bytes).expect("UTF-8 logs")
+        }
+    }
 
     impl io::Write for Capture {
         fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
             let mut held = self.0.lock().unwrap_or_else(PoisonError::into_inner);
             held.extend_from_slice(bytes);
+            let last = b"pass over the blob directory";
+            if bytes.windows(last.len()).any(|w| w == last) {
+                self.1.notify_one();
+            }
             Ok(bytes.len())
         }
 
@@ -244,19 +282,20 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn a_failed_pass_is_logged() {
         let mut logs = Capture::default();
-        let writer = logs.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(move || writer.clone())
-            .with_ansi(false)
-            .finish();
-        let _default = tracing::subscriber::set_default(subscriber);
+        let _default = logs.subscribe();
         let root =
             std::env::temp_dir().join(format!("kbf-server-pass-fails-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        let files = FsStore::open(&root, 1).expect("open the store");
-        let meta = MemoryMetaLog::new(Retention::default());
-        assert_eq!(meta.alloc_epoch(), Epoch::new(1));
-        let prefix = KeyPrefix::default();
+        let files = FsStore::open(&root.join("blobs"), 1).expect("open the store");
+        // A Raft log, as in the server: one instantiation of the task covers both arms.
+        let meta = RaftMetaLog::open_dir(&root.join("raft"), Retention::default(), "kbf/")
+            .await
+            .expect("open the log");
+        assert_eq!(
+            meta.commit(Command::AllocEpoch).await,
+            Ok(Applied::Epoch(Epoch::new(1)))
+        );
+        let prefix = meta.store_prefix();
         let at = |seq| Location {
             store: StoreId::CONFIGURED,
             object: ObjectId::new(Epoch::new(1), seq),
@@ -282,7 +321,7 @@ mod tests {
             .expect("the pass task ends without a panic");
 
         io::Write::flush(&mut logs).expect("flush");
-        let text = String::from_utf8(logs.0.lock().expect("logs").clone()).expect("UTF-8");
+        let text = logs.text();
         assert!(text.contains(PASS_FAILED), "{text}");
         assert!(text.contains("not raised"), "{text}");
         let _ = std::fs::remove_dir_all(&root);

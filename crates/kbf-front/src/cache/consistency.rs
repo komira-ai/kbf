@@ -103,15 +103,12 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
     /// # Errors
     /// A shard cannot be read, an orphan cannot be deleted, or the metadata log fails
     /// or refuses to be readied. What was done before stays done.
-    pub async fn consistency_pass<R>(
+    pub async fn consistency_pass(
         &self,
         files: &FsStore,
         opens_per_sec: NonZeroU32,
-        ready_to_evict: R,
-    ) -> Result<PassReport, CacheError>
-    where
-        R: FnOnce(&M) -> Result<(), MetaLogError>,
-    {
+        ready_to_evict: fn(&M) -> Result<(), MetaLogError>,
+    ) -> Result<PassReport, CacheError> {
         let started = Instant::now();
         let epoch = self.epoch();
         let indexed = self.writer.query(|s| s.indexed_objects()).await?;
@@ -176,17 +173,14 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
     /// The index side of [`Cache::consistency_pass`]: forgets the indexed objects that
     /// are not staged, were not `seen`, and have no file now, if `indexed_present`
     /// (the guard) is not zero.
-    async fn evict_missing<R>(
+    async fn evict_missing(
         &self,
         files: &FsStore,
         seen: &BTreeSet<ObjectId>,
         indexed_present: u64,
-        ready_to_evict: R,
+        ready_to_evict: fn(&M) -> Result<(), MetaLogError>,
         report: &mut PassReport,
-    ) -> Result<(), CacheError>
-    where
-        R: FnOnce(&M) -> Result<(), MetaLogError>,
-    {
+    ) -> Result<(), CacheError> {
         let unseen: Vec<ObjectId> = self
             .writer
             .query(|s| {

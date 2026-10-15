@@ -4,7 +4,7 @@
 
 use std::num::NonZeroU32;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -20,27 +20,67 @@ use kbf_meta::{
 use kbf_objstore::{FsStore, KeyPrefix, ObjectKey, ObjectStore};
 use kbf_types::{Digest, FarmTime};
 
-/// One metadata log shared by the caches of successive "processes".
+/// One metadata log shared by the caches of successive "processes". Every test runs
+/// the pass over this one log type, so one instantiation of the pass covers it all
+/// (the coverage ratchet counts the best single instantiation).
 #[derive(Clone)]
-struct Log(Arc<MemoryMetaLog>);
+struct Log(Arc<Shared>);
+
+struct Shared {
+    inner: MemoryMetaLog,
+    queries: AtomicUsize,
+    /// A flush that lands at the given query: the flusher writes a staged object's
+    /// file and commits `ObjectFlushed` while the pass runs.
+    flush_at: Mutex<Option<(usize, FsStore, ObjectKey, ObjectId)>>,
+    /// Answers `EvictObjects` with another command's outcome: a broken log.
+    misanswers: AtomicBool,
+}
 
 impl Log {
     fn new() -> Self {
-        Self(Arc::new(MemoryMetaLog::new(Retention::default())))
+        Self(Arc::new(Shared {
+            inner: MemoryMetaLog::new(Retention::default()),
+            queries: AtomicUsize::new(0),
+            flush_at: Mutex::new(None),
+            misanswers: AtomicBool::new(false),
+        }))
     }
 
     async fn run(&self, command: Command) -> Applied {
-        self.0.commit(command).await.expect("a memory log commits")
+        self.0
+            .inner
+            .commit(command)
+            .await
+            .expect("a memory log commits")
     }
 
     async fn ask<R: Send>(&self, f: impl FnOnce(&MetaState) -> R + Send) -> R {
-        self.0.query(f).await.expect("a memory log answers")
+        self.0.inner.query(f).await.expect("a memory log answers")
+    }
+
+    fn flush_at(&self, query: usize, files: &FsStore, seq: u64) {
+        let flush = (query, files.clone(), object_key(1, seq), object(1, seq));
+        *self.flush_waiting() = Some(flush);
+    }
+
+    fn flush_waiting(
+        &self,
+    ) -> std::sync::MutexGuard<'_, Option<(usize, FsStore, ObjectKey, ObjectId)>> {
+        self.0
+            .flush_at
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 }
 
 impl MetaLog for Log {
     async fn commit(&self, command: Command) -> Result<Applied, MetaLogError> {
-        self.0.commit(command).await
+        if self.0.misanswers.load(Ordering::Relaxed)
+            && matches!(command, Command::EvictObjects { .. })
+        {
+            return Ok(Applied::Collected(Collected::default()));
+        }
+        self.0.inner.commit(command).await
     }
 
     async fn query<R, F>(&self, f: F) -> Result<R, MetaLogError>
@@ -48,7 +88,20 @@ impl MetaLog for Log {
         F: FnOnce(&MetaState) -> R + Send,
         R: Send,
     {
-        self.0.query(f).await
+        let n = self.0.queries.fetch_add(1, Ordering::Relaxed) + 1;
+        let due = {
+            let mut waiting = self.flush_waiting();
+            match waiting.as_ref() {
+                Some((at, ..)) if *at == n => waiting.take(),
+                _ => None,
+            }
+        };
+        if let Some((_, files, key, object)) = due {
+            plant(&files, &key, 10).await;
+            let flushed = self.run(Command::ObjectFlushed { object }).await;
+            assert_eq!(flushed, Applied::Tier(Ok(())));
+        }
+        self.0.inner.query(f).await
     }
 }
 
@@ -114,9 +167,15 @@ async fn open(log: &Log, files: &FsStore) -> Cache<Log, FsStore> {
         .expect("open a cache")
 }
 
+/// A log that needs no readying for `EvictObjects`.
+#[expect(clippy::unnecessary_wraps, reason = "the readiness hook's signature")]
+fn ready(_: &Log) -> Result<(), MetaLogError> {
+    Ok(())
+}
+
 async fn pass(cache: &Cache<Log, FsStore>, files: &FsStore) -> PassReport {
     cache
-        .consistency_pass(files, PASS_OPENS_PER_SEC, |_| Ok(()))
+        .consistency_pass(files, PASS_OPENS_PER_SEC, ready)
         .await
         .expect("the pass")
 }
@@ -255,40 +314,6 @@ async fn pass_keeps_current_epoch_staged_foreign() {
     std::fs::remove_dir_all(&dir).expect("remove");
 }
 
-/// [`Log`], and a flush that lands at its `at`th query: the flusher writes a staged
-/// object's file and commits `ObjectFlushed` while the pass runs.
-struct FlushAt {
-    log: Log,
-    at: usize,
-    queries: AtomicUsize,
-    flush: Mutex<Option<(FsStore, ObjectKey, ObjectId)>>,
-}
-
-impl MetaLog for FlushAt {
-    async fn commit(&self, command: Command) -> Result<Applied, MetaLogError> {
-        self.log.commit(command).await
-    }
-
-    async fn query<R, F>(&self, f: F) -> Result<R, MetaLogError>
-    where
-        F: FnOnce(&MetaState) -> R + Send,
-        R: Send,
-    {
-        if self.queries.fetch_add(1, Ordering::Relaxed) + 1 == self.at {
-            let flush = self
-                .flush
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .take();
-            let (files, key, object) = flush.expect("one flush");
-            plant(&files, &key, 10).await;
-            let flushed = self.log.run(Command::ObjectFlushed { object }).await;
-            assert_eq!(flushed, Applied::Tier(Ok(())));
-        }
-        self.log.query(f).await
-    }
-}
-
 /// Catches a pass that forgets an object because the walk did not see its file, when
 /// the file is there by the time it decides (mutant: no second look before the
 /// eviction): a staged object of an earlier process that the flusher writes to the
@@ -306,24 +331,14 @@ async fn pass_keeps_an_object_flushed_after_its_shard_was_walked() {
         .find(|seq| kbf_segments::sha256(object_key(1, *seq).as_str().as_bytes()).hash[0] == 0)
         .expect("a key in shard 00");
     stage(&log, seq, "flushed late").await;
-    let flush_at = FlushAt {
-        log: log.clone(),
-        // The index read, then shard 00's staged check: shard 00 has been walked.
-        at: 2,
-        queries: AtomicUsize::new(0),
-        flush: Mutex::new(Some((files.clone(), object_key(1, seq), object(1, seq)))),
-    };
+    let cache = open(&log, &files).await;
+    // The pass's index read, then shard 00's staged check: shard 00 has been walked.
+    let queries = log.0.queries.load(Ordering::Relaxed);
+    log.flush_at(queries + 2, &files, seq);
 
-    let cache = Cache::open(flush_at, files.clone(), prefix())
-        .await
-        .expect("open a cache");
-    let report = cache
-        .consistency_pass(&files, PASS_OPENS_PER_SEC, |_| Ok(()))
-        .await
-        .expect("the pass");
+    let report = pass(&cache, &files).await;
 
-    let flushed = cache.meta().flush.lock().expect("flush").is_none();
-    assert!(flushed, "the flush never ran");
+    assert!(log.flush_waiting().is_none(), "the flush never ran");
     assert!(holds(&files, &object_key(1, seq)).await);
     let held = cache
         .present(&[digest("flushed late")])
@@ -463,7 +478,7 @@ async fn pass_keeps_its_pace_unless_under_the_floor() {
 
     let started = Instant::now();
     let paced = cache
-        .consistency_pass(&files, rate(6), |_| Ok(()))
+        .consistency_pass(&files, rate(6), ready)
         .await
         .expect("the pass");
     assert!(started.elapsed() >= Duration::from_millis(900), "{paced:?}");
@@ -475,7 +490,7 @@ async fn pass_keeps_its_pace_unless_under_the_floor() {
     let cache = open(&log, &files).await;
     let started = Instant::now();
     cache
-        .consistency_pass(&files, rate(1), |_| Ok(()))
+        .consistency_pass(&files, rate(1), ready)
         .await
         .expect("the pass");
     assert!(started.elapsed() < Duration::from_secs(3));
@@ -512,31 +527,11 @@ async fn pass_failures_are_errors() {
         .find(|p| std::fs::remove_dir(p).is_ok());
     assert!(empty_shard.is_some(), "no empty shard to remove");
     let failed = cache
-        .consistency_pass(&files, PASS_OPENS_PER_SEC, |_| Ok(()))
+        .consistency_pass(&files, PASS_OPENS_PER_SEC, ready)
         .await;
     assert!(matches!(failed, Err(CacheError::Store(_))), "{failed:?}");
     drop((cache, files));
     std::fs::remove_dir_all(&dir).expect("remove");
-}
-
-/// [`Log`], answering `EvictObjects` with another command's outcome: a broken log.
-struct Misanswers(Log);
-
-impl MetaLog for Misanswers {
-    async fn commit(&self, command: Command) -> Result<Applied, MetaLogError> {
-        match command {
-            Command::EvictObjects { .. } => Ok(Applied::Collected(Collected::default())),
-            other => self.0.commit(other).await,
-        }
-    }
-
-    async fn query<R, F>(&self, f: F) -> Result<R, MetaLogError>
-    where
-        F: FnOnce(&MetaState) -> R + Send,
-        R: Send,
-    {
-        self.0.query(f).await
-    }
 }
 
 /// Catches a pass that counts an eviction the log answered with something else as
@@ -551,12 +546,11 @@ async fn pass_refuses_a_log_that_misanswers_the_eviction() {
     old.store_blobs(vec![blob("kept")]).await.expect("store");
     drop(old);
     files.delete(&object_key(1, 1)).await.expect("delete");
-    let cache = Cache::open(Misanswers(log), files.clone(), prefix())
-        .await
-        .expect("open a cache");
+    let cache = open(&log, &files).await;
+    log.0.misanswers.store(true, Ordering::Relaxed);
 
     let failed = cache
-        .consistency_pass(&files, PASS_OPENS_PER_SEC, |_| Ok(()))
+        .consistency_pass(&files, PASS_OPENS_PER_SEC, ready)
         .await;
 
     assert!(matches!(failed, Err(CacheError::Internal(_))), "{failed:?}");
