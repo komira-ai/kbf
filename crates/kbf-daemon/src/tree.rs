@@ -130,15 +130,7 @@ pub fn check_relative(what: &str, path: &str) -> Result<(), TreeError> {
 /// # Errors
 /// A blob is missing or corrupt, the tree breaks a naming rule, or a write fails.
 pub async fn materialize(cas: &impl Cas, root: &Digest, dir: &Path) -> Result<(), TreeError> {
-    let files = make_directories(
-        cas,
-        cas.in_flight(),
-        root,
-        dir,
-        &Loaded::new(),
-        &HashSet::new(),
-    )
-    .await?;
+    let files = plain_directories(cas, root, dir).await?;
     write_files(cas, files).await
 }
 
@@ -159,15 +151,7 @@ pub async fn materialize_cached(
     dir: &Path,
     private: &[String],
 ) -> Result<crate::cache::InputStats, TreeError> {
-    let files = make_directories(
-        cas,
-        cas.in_flight(),
-        root,
-        dir,
-        &Loaded::new(),
-        &HashSet::new(),
-    )
-    .await?;
+    let files = plain_directories(cas, root, dir).await?;
     let private: Vec<PathBuf> = private.iter().map(|p| dir.join(p)).collect();
     crate::cache::lease::write_files(cas, cache, files, &private).await
 }
@@ -177,6 +161,17 @@ pub async fn materialize_cached(
 pub(crate) struct Copies {
     pub digest: Digest,
     pub copies: Vec<(PathBuf, bool)>,
+}
+
+/// [`make_directories`] with nothing loaded and nothing mounted: the whole tree under
+/// `root`.
+async fn plain_directories(
+    cas: &impl Cas,
+    root: &Digest,
+    dir: &Path,
+) -> Result<Vec<Copies>, TreeError> {
+    let (loaded, mounts) = (Loaded::new(), HashSet::new());
+    make_directories(cas, cas.in_flight(), root, dir, &loaded, &mounts).await
 }
 
 /// Directory messages already fetched, by digest label (`crate::cas::label`): a walk
