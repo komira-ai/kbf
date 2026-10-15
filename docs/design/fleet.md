@@ -16,7 +16,7 @@ It builds on [fleet-updates.md](fleet-updates.md), [fleet-updates-security.md](f
 |---|---|
 | Source of truth for "which machines exist"? | The **node registry** in `kbf-server` (4.2). Hosts enroll themselves at first boot and appear *pending*; an operator or a policy approves them. A file is at most an optional import/export for bootstrap and disaster recovery. |
 | What is typed per machine? | Nothing required. CPU, memory, disks, SSD paths and GPUs are detected on every connect and used by the scheduler as reported (6.1). Config holds policy and rare overrides. |
-| What identifies a machine? | The **hardware id** is the permanent key. The **human name** (for example `build1`, `mac1`) is assigned in the registry, written back where the hardware can keep it (BMC FRU, SMBIOS asset tag), and used by logs, labels, scheduling, the CLI and the certificate (4.3 to 4.5). |
+| What identifies a machine? | The **hardware id** is the permanent key. The **human name** (for example `build1`, `mac1`) is written into the hardware by the operator at first boot (BMC FRU asset tag and/or SMBIOS chassis asset tag), read by iPXE and enrollment, recorded in the registry against the hardware id, and used by logs, labels, scheduling, the CLI and the certificate (4.3 to 4.5). |
 | How does Linux get an OS? | Site DHCP (UniFi options 66 and 67) points at iPXE; iPXE chains to an HTTP endpoint on kbf that decides per machine: discover, install image X, boot local, or rescue (5.1, 5.2). |
 | How does a Mac get set up? | No PXE (Apple Silicon cannot netboot). ABM assigns the serial to the farm MDM; the MDM sets the device name and pushes a signed `.pkg` (5.4). |
 | What is generic, what is ours? | kbf ships mechanisms; the operator's own repository holds names, network, images, approval policy and key locations as config (section 7 lists which is which). |
@@ -134,34 +134,47 @@ follow the name.
 
 ### 4.4 Where the name lives in hardware
 
-The registry is authoritative. The name is also written where the hardware keeps it, so a person at
-a rack, an iPXE script and a fresh OS can see it and a lost registry can be rebuilt by reading
-machines.
+The operator names each machine by hand. When racking a Linux host, before any OS exists, the
+operator writes its human name (for example `build1`) into the hardware's asset tag: in the BIOS
+setup (SMBIOS chassis asset tag) and/or over the BMC with `ipmitool fru edit` (FRU Product Info
+asset tag). iPXE reads it as `${asset}`, the enrollment initrd reads it from
+`/sys/class/dmi/id/chassis_asset_tag`, and the registry records it against the hardware id at
+enrollment. The registry stays authoritative for identity; the tag is how a person at a rack, an
+iPXE script and a fresh OS agree on the name, and how a lost registry is rebuilt by reading machines.
 
 | Platform | Carrier | Written by | Read by |
 |---|---|---|---|
-| Linux with a BMC | **FRU Product Info asset tag** (or a chassis-area custom field where the BMC allows it) | `kbf-deploy name write` over IPMI on the BMC LAN, **before an OS exists**, or locally over `/dev/ipmi0` | BMC and `ipmitool fru print` (root) |
-| Linux | **SMBIOS chassis asset tag** | the BIOS, as far as it propagates FRU, or the vendor tool | unprivileged at `/sys/class/dmi/id/chassis_asset_tag`; iPXE as `${asset}` |
+| Linux | **SMBIOS chassis asset tag** | the operator, by hand, in the BIOS setup (always available) | unprivileged at `/sys/class/dmi/id/chassis_asset_tag`; iPXE as `${asset}` |
+| Linux with a BMC | **FRU Product Info asset tag** (or a chassis-area custom field where the BMC allows it) | the operator, by hand, with `ipmitool fru edit` over the BMC LAN or locally over `/dev/ipmi0` | BMC and `ipmitool fru print` (root) |
 | Mac | MDM `DeviceName` plus the registry's serial-to-name map | the MDM, at approval | `scutil --get ComputerName` |
 | neither | the registry only | | |
 
-- The tag is a **hint, not proof**. A tag that matches a name the policy would assign and that no
-  live node owns starts a *claim* the operator confirms (or a policy does, 4.6). A tag naming a node
-  bound to another hwid holds the host with a conflict (cloned disk, mislabeled box).
-- A blank tag (today `Default string` on the current boards): the registry assigns by policy at approval and
-  `name write` writes it back. A failed write-back does not block the node; `status` shows
-  `tag: unwritten`. If the tag disagrees with the registry for the same hwid, the registry wins and
-  the tag is repaired.
+Per-hardware runbook, run once per machine at first boot:
+
+1. Choose the name (the next free `build{n}`, `mac{n}` and so on; 4.5 gives the shape).
+2. Write it into the tag: BIOS setup, chassis asset tag; or `ipmitool fru edit <id> field p 4 <name>`
+   (Product Info asset tag) over the BMC. Either is enough; setting both is fine.
+3. Read it back (`ipmitool fru print`, or boot and read `chassis_asset_tag`), then PXE boot. The
+   host enrolls and appears *pending* with its name and hardware id; approval binds them (4.6).
+
+- The tag is a **hint, not proof**. A tag that no live node owns starts a *claim* the operator
+  confirms (or a policy does, 4.6). A tag naming a node bound to another hwid holds the host with a
+  conflict (cloned disk, mislabeled box). If the tag disagrees with the registry for the same hwid,
+  the registry wins and the tag is reported as drifted.
+- Optional fallbacks for a **blank tag** (today `Default string` on the current boards): the
+  registry assigns a name by policy at approval (4.5), and `kbf-deploy name write` may write it
+  back over IPMI as a convenience. A failed write-back never blocks the node; `status` shows
+  `tag: unwritten`. Neither is the main flow.
 - BMC LAN credentials are the operator's secret, never in the registry; the config names where they
   come from (7).
-- **Unconfirmed:** whether the BMC firmware on the Supermicro X10-generation boards (BMC present at
-  `/dev/ipmi0`) lets us write the FRU Product Info asset tag (or a chassis-area custom field, since the chassis area has only part number, serial and custom fields), and whether the BIOS copies FRU asset data
-  into the SMBIOS chassis tag. Check: root `ipmitool fru print` to see which areas exist, then write the named field (the Product Info asset tag, `ipmitool fru edit`) on one box and read it back after a BMC reset.
-  Until confirmed, only the registry carries the name on those machines (decision 3).
+- FRU writability on the Supermicro X10-generation BMCs is not a prerequisite: the SMBIOS tag can
+  always be set by hand in the BIOS. FRU editing via `ipmitool` is a convenience, and the chassis
+  area has only part number, serial and custom fields, so the Product Info asset tag is the field
+  to use.
 
 ### 4.5 Naming policy
 
-A generic engine in kbf, configured by rules in the operator's repository. A rule is a match over
+The fallback for a blank tag (4.4): the operator hand-writes names in the normal flow, and this engine only assigns one when the tag is empty. A generic engine in kbf, configured by rules in the operator's repository. A rule is a match over
 detected facts (platform, CPU model, chassis product, later a rack tag), a template and a counter;
 the first match wins.
 
@@ -355,7 +368,7 @@ count. Servers are never updated in parallel.
 - **BIOS:** UEFI; PXE over IPv4 first (safe: not-armed hosts boot local); restore-on-AC-power on;
   admin password; time set. **Secure Boot off** in the first cut (iPXE is not shim-signed;
   decision 6).
-- **BMC:** on a separate management network; kbf uses it only to read and write the FRU name (4.4)
+- **BMC:** on a separate management network; kbf uses it only to read the FRU name, and optionally write one back (4.4),
   in the first cut. Macs: ethernet, FileVault off, `autorestart 1`.
 
 `doctor` checks reachability (DNS, NTP, server, boot service, Apple credential expiry) and is
@@ -462,7 +475,7 @@ The boot service, CA, registry and object store share the three servers.
   first server from USB; (3) `nodes import` restores the last export (`backup pull`, or the copy in
   the object store): every record that was live lands `pending` (retired ones stay retired; never `active`, never `approved`), so no host
   gets a certificate without a fresh approval, matching the approved-before-`/enroll` rule (4.7).
-  Discovery then reads each host's tag (FRU or asset tag where hardware allows, 4.4); a tag that
+  Discovery then reads each host's hand-written tag (SMBIOS or FRU asset tag, 4.4); a tag that
   matches an imported name starts a name claim, the operator confirms each claim (4.4, 4.6), and
   the naming counters re-seed from the highest claimed `{n}` of each template, so no live name is
   reissued. Hosts without a tag are named by policy at approval. (4) The CAS is a cache. Lost: cache contents and revocations after
@@ -549,8 +562,7 @@ so no certificate or flag changes yet. (2) Ship `render` and diff against live u
 (3) Ship `/enroll`, `ca`, `node enroll`; enroll in place with `enroll-token`; the daemon switches at
 its next restart; the old shell CA stays valid until all are enrolled. (4) Ship the Linux node agent,
 `apply` and `rollout`; flip one pool at a time, canary first. (5) Ship the boot service and `name
-write`: the next new Linux host is the first user, existing hosts' names are written to FRU where the
-4.4 check passes, and no existing host is reinstalled for it. (6) Macs are **blocked on the macOS node
+write`: the next new Linux host is the first user, the operator hand-writes existing hosts' names into the asset tag at the next maintenance window (4.4), and no existing host is reinstalled for it. (6) Macs are **blocked on the macOS node
 agent**; until then they keep the current install, then ABM serials, approval, and the pkg in place,
 verified on one Mac first. Servers last; the single server moves to `kbf-deploy` rendering before HA,
 so HA is a registry change.
@@ -575,9 +587,10 @@ certificate. (9) Linux builders, then Macs.
 2. **Naming-policy defaults.** Recommended: one rule per hardware class (4.5), counters from 1,
    retired names never reused, operator override at approval. Question: do servers share the scheme
    or take a role prefix (`srv1`)?
-3. **FRU writability on the Supermicro BMCs.** Unconfirmed (4.4): needs a root `ipmitool fru print`
-   and a one-field write on one build host. Recommended: confirm on one box first; if FRU is
-   read-only or does not reach the SMBIOS tag, keep the name in the registry plus a physical label.
+3. **Names are hand-written asset tags.** Decided by the owner: the operator writes each machine's
+   name into the SMBIOS chassis asset tag and/or BMC FRU asset tag at first boot (4.4). FRU
+   writability no longer blocks anything: the BIOS tag can always be set by hand, and FRU write via
+   `ipmitool` is a convenience.
 4. **ABM and MDM hosting.** Recommended: accept the Apple dependency (ABM, DEP token, APNs,
    Developer ID, public-CA certificate); MDM on a server host if the farm network reaches Apple.
 5. **Where the CA key lives.** Recommended: a `kbf-ca` process per server host (own user,
