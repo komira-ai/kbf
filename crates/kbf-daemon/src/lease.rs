@@ -670,9 +670,8 @@ mod tests {
         let (result, log) = finish_logged(Failing::with(error), false).await;
         assert_eq!(code(&result), Code::Internal as i32);
         let warns = warns(&log);
-        let [warn] = warns.as_slice() else {
-            panic!("one WARN line expected: {log}");
-        };
+        assert_eq!(warns.len(), 1, "one WARN line expected: {log}");
+        let warn = warns[0];
         assert!(warn.contains("lease=3.4"), "{warn}");
         assert!(warn.contains("kind=failed"), "{warn}");
         assert!(
@@ -715,9 +714,8 @@ mod tests {
         for (kind, error) in errors {
             let (_, log) = finish_logged(Failing::with(error), false).await;
             let warns = warns(&log);
-            let [warn] = warns.as_slice() else {
-                panic!("{kind}: one WARN line expected: {log}");
-            };
+            assert_eq!(warns.len(), 1, "{kind}: one WARN line expected: {log}");
+            let warn = warns[0];
             assert!(warn.contains("lease failed"), "{kind}: {warn}");
             assert!(warn.contains(&format!("kind={kind} ")), "{kind}: {warn}");
         }
@@ -736,9 +734,8 @@ mod tests {
         let (result, log) = finish_logged(Failing::with(RuntimeError::Killed), true).await;
         assert_eq!(code(&result), Code::Unavailable as i32);
         let warns = warns(&log);
-        let [warn] = warns.as_slice() else {
-            panic!("one WARN line expected: {log}");
-        };
+        assert_eq!(warns.len(), 1, "one WARN line expected: {log}");
+        let warn = warns[0];
         assert!(warn.contains("lease fenced"), "{warn}");
         assert!(warn.contains("lease=3.4"), "{warn}");
         assert!(!log.contains("lease failed"), "{log}");
