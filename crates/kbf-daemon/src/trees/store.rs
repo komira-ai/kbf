@@ -365,6 +365,8 @@ impl TreeStore {
                     // The sender is dropped when the builder is done, with a tree or
                     // without.
                     let _ = waiting.changed().await;
+                    // A slot nobody builds in answers at once: let others run.
+                    tokio::task::yield_now().await;
                 }
             }
         }
