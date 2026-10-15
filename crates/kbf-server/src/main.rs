@@ -55,22 +55,20 @@ fn main() -> ExitCode {
         .with_writer(std::io::stderr)
         .init();
     let args = Args::parse();
-    let sizes = args.threads.resolve(Role::Server, Topology::detect());
-    sizes.log();
-    let runtime = match sizes.runtime() {
-        Ok(runtime) => runtime,
-        Err(e) => {
-            eprintln!("kbf-server: cannot start the async runtime: {e}");
-            return ExitCode::from(2);
-        }
-    };
-    match runtime.block_on(start(&args)) {
+    match serve(&args) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("kbf-server: {e}");
             ExitCode::from(2)
         }
     }
+}
+
+/// Builds the async runtime the thread flags size, then runs [`start`] on it.
+fn serve(args: &Args) -> Result<(), Box<dyn Error>> {
+    let sizes = args.threads.resolve(Role::Server, Topology::detect());
+    sizes.log();
+    sizes.runtime()?.block_on(start(args))
 }
 
 /// Builds the object store and the metadata log the flags name, then serves.
