@@ -41,7 +41,7 @@ use crate::cas::{Cas, CasError, Chunks, digest_of, label};
 use crate::config::TransferConfig;
 use crate::find::Finder;
 use crate::flights::{Flights, Outcome, Publish};
-use crate::spool::Spool;
+use crate::source::Record;
 use crate::stats::{Counts, EngineStats, TransferStats, add};
 use crate::wire::{Wire, WriteFailed, call_error, committed, retryable};
 
@@ -215,8 +215,8 @@ impl Cas for Scope {
         self.send_chunks(&digest, chunks).await
     }
 
-    async fn put_spool(&self, spool: Arc<Spool>) -> Result<(), CasError> {
-        self.upload_spool(spool).await
+    async fn put_records(&self, records: Vec<Record>) -> Result<(), CasError> {
+        self.upload_records(records).await
     }
 
     async fn read_to(&self, digest: &Digest, file: &mut tokio::fs::File) -> Result<(), CasError> {
@@ -340,8 +340,8 @@ impl Cas for Transfers {
         self.unscoped.missing(digests).await
     }
 
-    async fn put_spool(&self, spool: Arc<Spool>) -> Result<(), CasError> {
-        self.unscoped.put_spool(spool).await
+    async fn put_records(&self, records: Vec<Record>) -> Result<(), CasError> {
+        self.unscoped.put_records(records).await
     }
 
     fn in_flight(&self) -> usize {

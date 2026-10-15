@@ -36,6 +36,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use kbf_daemon::cache::{Cache, CacheConfig, Disabled, InputStats};
 use kbf_daemon::cas::{Cas, CasError};
+use kbf_daemon::cpu_pool::{CpuPool, DEFAULT_CPU_THREADS};
 use kbf_daemon::{Runtime, RuntimeError, Work, upload_within};
 use kbf_proto::reapi::{Action, ActionResult, Command, ExecutedActionMetadata, Platform};
 use kbf_types::LeaseId;
@@ -97,6 +98,9 @@ pub struct PodmanConfig {
     /// The node's input cache, if it has one (`--cache-dir`). Without it, a lease's
     /// input files are its own copies, as before the cache.
     pub cache: Option<CacheUse>,
+    /// The threads that hash an action's output files (`--cpu-threads`), shared by every
+    /// lease.
+    pub cpu: CpuPool,
 }
 
 /// The node's input cache as the driver is given it: not opened yet.
@@ -148,6 +152,7 @@ impl PodmanConfig {
             swap_kill: SwapKill::DEFAULT,
             owner,
             cache: None,
+            cpu: CpuPool::new(DEFAULT_CPU_THREADS),
         }
     }
 
@@ -530,12 +535,12 @@ impl<C: Cas> PodmanRuntime<C> {
             ..ActionResult::default()
         };
         let upload = async {
-            // The outputs the server lacks go through a spool in the lease's scratch
-            // directory (the daemon's, outside the container) as whole segments.
+            // Each output file is hashed once, then sent from where it is as whole
+            // segments.
             collect(
                 cas,
                 &spec.upper,
-                &lease.dir,
+                &self.config.cpu,
                 &spec.working_directory,
                 &outputs,
                 self.config.outputs,
