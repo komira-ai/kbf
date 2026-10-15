@@ -179,7 +179,8 @@ where
     };
     let cache = Cache::open(meta, store, prefix)
         .await?
-        .with_writes(args.write_config());
+        .with_writes(args.write_config())
+        .with_input_trees(args.input_tree_config());
     let (cache, tier) = crate::write_tier::attach(cache, args).await?;
     let cache = Arc::new(cache);
     let _flusher = tier.map(|_| {

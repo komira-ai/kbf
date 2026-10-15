@@ -16,6 +16,7 @@ use crate::support::{
 };
 use kbf_proto::google::rpc::ErrorInfo;
 use kbf_proto::worker::{self, MemoryKill};
+use kbf_server::MemoryLadder;
 use prost::Message;
 use tonic::Code;
 
@@ -89,26 +90,27 @@ async fn rerun(
 }
 
 /// Catches: an own-limit kill answered at once instead of run again (the farm's case
-/// shown to the user as the action's), a rerun that does not double (1 -> 3 GiB) or
-/// passes the largest node, a kill at the largest node run again instead of answered,
-/// an answer that does not say the action needs more memory than any node has (or
-/// says it with another code, or without the `ErrorInfo` a client can read), the
-/// ladder not logged, and a later Execute of the action that does not start at the
-/// remembered booking.
+/// shown to the user as the action's); an action that names no size not booking 4 GiB
+/// at first; a rerun that does not climb the default ladder (4 -> 16 -> 32 GiB, then
+/// the whole 64 GiB node) or passes the largest node; a kill at the largest node run
+/// again instead of answered; an answer that does not say the action needs more
+/// memory than any node has (or says it with another code, or without the `ErrorInfo`
+/// a client can read); the ladder not logged; and a later Execute of the action that
+/// does not start at the remembered booking.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_own_limit_kill_doubles_up_to_the_largest_node_then_tells_the_client() {
+async fn an_own_limit_kill_climbs_the_ladder_then_tells_the_client() {
     capture();
-    let cell = Cell::start().await;
-    let mut daemon = cell.daemon("oom-node", 4, 8).await;
+    let cell = Cell::start_with_ladder(MemoryLadder::default()).await;
+    let mut daemon = cell.daemon("oom-node", 4, 64).await;
     let job = Job::new("hungry", &[]);
     cell.upload(&job.blobs()).await;
     let mut ops = cell.execute(&job.action).await;
 
     let first = daemon.start().await;
-    assert_eq!(first.memory_bytes, GIB);
-    let second = rerun(&mut daemon, &first, MemoryKill::OwnLimit, 2).await;
-    let third = rerun(&mut daemon, &second, MemoryKill::OwnLimit, 4).await;
-    let fourth = rerun(&mut daemon, &third, MemoryKill::OwnLimit, 8).await;
+    assert_eq!(first.memory_bytes, 4 * GIB, "the first rung");
+    let second = rerun(&mut daemon, &first, MemoryKill::OwnLimit, 16).await;
+    let third = rerun(&mut daemon, &second, MemoryKill::OwnLimit, 32).await;
+    let fourth = rerun(&mut daemon, &third, MemoryKill::OwnLimit, 64).await;
 
     // A copy of a kill already taken, resent after a reconnect, climbs nothing.
     let copy = daemon
@@ -126,8 +128,8 @@ async fn an_own_limit_kill_doubles_up_to_the_largest_node_then_tells_the_client(
     assert_eq!(
         status.message,
         "kbf: the action needs more memory than any node offers: it passed its memory \
-         limit with 8 GiB booked on oom-node, the largest node for its platform. Runs: 4 \
-         (1 GiB on oom-node, 2 GiB on oom-node, 4 GiB on oom-node, 8 GiB on oom-node)."
+         limit with 64 GiB booked on oom-node, the largest node for its platform. Runs: 4 \
+         (4 GiB on oom-node, 16 GiB on oom-node, 32 GiB on oom-node, 64 GiB on oom-node)."
     );
     let [detail] = &status.details[..] else {
         panic!("{status:?}");
@@ -137,22 +139,40 @@ async fn an_own_limit_kill_doubles_up_to_the_largest_node_then_tells_the_client(
     assert_eq!(info.reason, "ACTION_OUT_OF_MEMORY");
     assert_eq!(info.domain, "kbf");
     assert_eq!(info.metadata["node"], "oom-node");
-    assert_eq!(info.metadata["booked_bytes"], (8 * GIB).to_string());
+    assert_eq!(info.metadata["booked_bytes"], (64 * GIB).to_string());
     assert_eq!(cell.cached(&job.action).await, Err(Code::NotFound));
     let logged = lines_with(&["node=oom-node", "lease given up; requeued"]);
     assert_eq!(logged.len(), 3, "{logged:?}");
     assert!(
-        logged[0].contains("passed its memory limit with 1 GiB booked"),
+        logged[0].contains("passed its memory limit with 4 GiB booked"),
         "{logged:?}"
     );
 
     // The next Execute of the action starts at the booking it was raised to.
     let mut again = cell.execute(&job.action).await;
     let start = daemon.start().await;
-    assert_eq!(start.memory_bytes, 8 * GIB, "the remembered booking");
+    assert_eq!(start.memory_bytes, 64 * GIB, "the remembered booking");
     let result = output(&cell, "fits at last", 0).await;
     assert!(daemon.report(ran(start.lease_id, &result)).await.accepted);
     assert_eq!(response(&done(&mut again).await).result, Some(result));
+}
+
+/// Catches a ladder that does not reach both halves of the server (`Listeners.
+/// memory_ladder`, the flag): with rungs 2 and 8 GiB an action that names no size must
+/// book 2 GiB (the front's first rung, not its own default of 4), climb to 8 (the
+/// scheduler's rungs, not 16), and then book the whole 64 GiB node.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_ladder_flag_sets_the_first_booking_and_the_rungs() {
+    let ladder = MemoryLadder::from_gib(&[2, 8]).expect("a ladder");
+    let cell = Cell::start_with_ladder(ladder).await;
+    let mut daemon = cell.daemon("flag-node", 4, 64).await;
+    let job = Job::new("two then eight", &[]);
+    cell.upload(&job.blobs()).await;
+    let _ops = cell.execute(&job.action).await;
+    let first = daemon.start().await;
+    assert_eq!(first.memory_bytes, 2 * GIB, "the first rung");
+    let second = rerun(&mut daemon, &first, MemoryKill::OwnLimit, 8).await;
+    rerun(&mut daemon, &second, MemoryKill::OwnLimit, 64).await;
 }
 
 /// Catches: a busy node's kill that raises the booking (the mutant: it is the node's

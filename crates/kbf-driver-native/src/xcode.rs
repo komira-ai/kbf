@@ -537,7 +537,7 @@ fn answer(
 }
 
 /// `text`, or its first `bytes` bytes (backed off to a character boundary) and `...`.
-fn cut(text: &str, bytes: usize) -> String {
+pub(crate) fn cut(text: &str, bytes: usize) -> String {
     if text.len() <= bytes {
         return text.to_owned();
     }

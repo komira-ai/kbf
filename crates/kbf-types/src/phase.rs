@@ -24,6 +24,11 @@ pub enum NodePhase {
     Restoring(LeaseId),
     /// Its cleanup failed, and why. It takes no lease until an operator repairs it.
     Quarantined(String),
+    /// Its memory is under pressure (the kernel's memory stall time is above the
+    /// daemon's `--memory-pressure-pause-percent`) while it holds leases: it takes no
+    /// new lease until the pressure falls, and keeps the ones it runs. It says so only
+    /// while it holds one, so it is never left paused with nothing running.
+    MemoryPressure,
 }
 
 impl NodePhase {
@@ -32,12 +37,12 @@ impl NodePhase {
     pub const fn switching(&self) -> Option<LeaseId> {
         match self {
             Self::Preparing(lease) | Self::Restoring(lease) => Some(*lease),
-            Self::Serving | Self::Quarantined(_) => None,
+            Self::Serving | Self::Quarantined(_) | Self::MemoryPressure => None,
         }
     }
 
-    /// The phase as an operator reads it: `serving`, `preparing`, `restoring` or
-    /// `quarantined`.
+    /// The phase as an operator reads it: `serving`, `preparing`, `restoring`,
+    /// `quarantined` or `memory_pressure`.
     #[must_use]
     pub const fn name(&self) -> &'static str {
         match self {
@@ -45,6 +50,7 @@ impl NodePhase {
             Self::Preparing(_) => "preparing",
             Self::Restoring(_) => "restoring",
             Self::Quarantined(_) => "quarantined",
+            Self::MemoryPressure => "memory_pressure",
         }
     }
 }

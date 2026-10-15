@@ -46,7 +46,7 @@ use kbf_proto::worker::{
     self, LeaseOffer, NodeStatus, ResultAck, ServerMessage, Start, server_message,
 };
 use kbf_sched::fence::START_VALIDITY;
-use kbf_sched::{Cordon, DaemonInstance, Event, Input, OpState, Requeue, Scheduler};
+use kbf_sched::{Cordon, DaemonInstance, Event, Input, MemoryLadder, OpState, Requeue, Scheduler};
 use kbf_types::{
     Answer, ControlRecord, Digest, Effect, Failure, FarmRun, FarmTime, LeaseGrant, LeaseId,
     OperationId, Outcome, Refusal, StartLease, StateMachine, WaiterId, Waiting, WorkerId,
@@ -249,6 +249,15 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
         }
     }
 
+    /// This farm, whose scheduler climbs `ladder` for an action that passes its memory limit
+    /// (instead of [`kbf_sched::MemoryLadder::default`]).
+    #[must_use]
+    pub fn with_memory_ladder(mut self, ladder: MemoryLadder) -> Self {
+        let state = self.state.get_mut().unwrap_or_else(PoisonError::into_inner);
+        state.sched.set_memory_ladder(ladder);
+        self
+    }
+
     /// This farm, each Execute's queued or joined answer, each lease granted, started
     /// and given up, and each operation's end sent to `recorder`
     /// (`docs/design/invocations.md`, section 3.4).
@@ -275,6 +284,15 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
     fn now(&self) -> FarmTime {
         let millis = u64::try_from(self.epoch.elapsed().as_millis()).unwrap_or(u64::MAX);
         FarmTime::from_millis(millis)
+    }
+
+    /// Sets the scheduler gauges of `/metrics` from `state`: called where the lock is
+    /// already held after a submit and on each tick, so a scrape sees the queue and the
+    /// leases at most a tick old.
+    fn publish(&self, state: &State) {
+        let metrics = self.cache.metrics();
+        metrics.sched_queued.set(state.sched.queued_len() as u64);
+        metrics.sched_leases.set(state.sched.leases_held() as u64);
     }
 
     fn lock(&self) -> MutexGuard<'_, State> {
@@ -495,6 +513,7 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
         let settled = {
             let mut state = self.lock();
             let answers = state.feed(now, Event::Tick);
+            self.publish(&state);
             let paused: BTreeSet<WorkerId> = state
                 .machine
                 .nodes()
@@ -668,7 +687,9 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
 impl<M: MetaLog, O: ObjectStore + 'static> Dispatch for Farm<M, O> {
     fn submit(&self, mut submission: Submission) -> Result<Ticket, Status> {
         let now = self.now();
+        let waiting = std::time::Instant::now();
         let mut state = self.lock();
+        self.cache.metrics().sched_lock_wait.since(waiting);
         let action = submission.request.key.action;
         let instance = submission.request.key.instance.clone();
         let waiter = state.machine.submit(Waiter {
@@ -700,6 +721,7 @@ impl<M: MetaLog, O: ObjectStore + 'static> Dispatch for Farm<M, O> {
         if let Some(stage) = state.stages.get(&waiter).filter(|_| joined_started) {
             stage.send_replace(Stage::Executing);
         }
+        self.publish(&state);
         Ok(Ticket {
             name,
             instance,

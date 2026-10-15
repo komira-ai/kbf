@@ -165,6 +165,19 @@ pub struct Args {
     /// refused FAILED_PRECONDITION. The wait restarts whenever one can.
     #[arg(long, default_value_t = kbf_sched::UNSERVABLE_WAIT.as_secs())]
     pub unservable_wait_secs: u64,
+    /// The memory rungs of an action, in GiB, ascending and each at least 1. The first
+    /// is what an action that names no size (`kbf-book-mem-gib`) books. An action that
+    /// passes its own memory limit runs again on the next rung above what it booked,
+    /// and after the last on a whole host: the memory of the largest node that could
+    /// run it, so that no other lease fits there. A rung not below that node's memory
+    /// is skipped for the whole host. An action that does finish keeps its rung: later
+    /// runs of it start there.
+    #[arg(
+        long,
+        value_delimiter = ',',
+        default_values_t = kbf_sched::MemoryLadder::DEFAULT_GIB
+    )]
+    pub memory_ladder_gib: Vec<u64>,
     /// How long, in seconds, a finished operation is kept after its callers are
     /// answered. Within it, WaitExecution on the operation's name streams its result
     /// (a client whose Execute stream broke gets a result the action cache does not
@@ -302,6 +315,18 @@ pub struct Args {
         value_parser = clap::value_parser!(u32).range(1..=5)
     )]
     pub store_put_attempts: u32,
+    /// The most decoded Directories an Execute's input check keeps in memory
+    /// (`docs/design/storage.md#input-tree-check`). Least recently used go first.
+    #[arg(long, default_value_t = kbf_front::InputTreeConfig::DEFAULT.max_entries)]
+    pub input_tree_cache_entries: NonZeroUsize,
+    /// The most bytes of decoded Directories the input check keeps (each costs its
+    /// digests, 40 bytes apiece, and 160 bytes).
+    #[arg(long, default_value_t = kbf_front::InputTreeConfig::DEFAULT.max_bytes)]
+    pub input_tree_cache_bytes: u64,
+    /// The most Directory blobs the input check reads from the store at once, across
+    /// all Executes.
+    #[arg(long, default_value_t = kbf_front::InputTreeConfig::DEFAULT.reads_in_flight)]
+    pub input_tree_reads_in_flight: NonZeroUsize,
     /// The local write tier (`docs/design/write-path.md`, section 6). Off unless
     /// `--write-tier-dir` is given.
     #[command(flatten)]
@@ -350,6 +375,9 @@ pub enum ConfigError {
          a segment upload holds its ranges in memory under that bound"
     )]
     SegmentUploadOverWriteBound { cap: u64, bound: u64 },
+    /// `--memory-ladder-gib` is empty, holds a 0, does not ascend, or overflows.
+    #[error("--memory-ladder-gib: {0}")]
+    MemoryLadder(#[from] kbf_sched::LadderError),
     /// `--meta-log=raft` with `--store=memory` and no `--blob-dir`.
     #[error(
         "--meta-log=raft needs --store=s3 or --blob-dir: a durable index over blobs that die \
@@ -390,7 +418,7 @@ impl Args {
     ///
     /// # Errors
     /// A TLS file cannot be read; `--segment-upload-max-bytes` is over
-    /// `--write-bytes-in-flight`.
+    /// `--write-bytes-in-flight`; `--memory-ladder-gib` is not a ladder.
     pub fn listeners(&self) -> Result<Listeners, ConfigError> {
         self.segment_upload_fits_write_bound()?;
         let worker_tls = match (
@@ -425,6 +453,7 @@ impl Args {
             hello_wait: Duration::from_secs(10),
             tick: Duration::from_secs(1),
             unservable_wait: Duration::from_secs(self.unservable_wait_secs),
+            memory_ladder: kbf_sched::MemoryLadder::from_gib(&self.memory_ladder_gib)?,
             finished_retention: Duration::from_secs(self.finished_retention_secs),
             shutdown_timeout: Duration::from_secs(self.shutdown_timeout_secs),
             store_probe_timeout: Duration::from_millis(self.readyz_store_timeout_ms),
@@ -524,6 +553,17 @@ impl Args {
             // clap refuses 0.
             put_attempts: NonZeroU32::new(self.store_put_attempts).unwrap_or(NonZeroU32::MIN),
             cpu_threads: self.cpu_threads(),
+        }
+    }
+
+    /// How the cache remembers input trees: `--input-tree-cache-entries`,
+    /// `--input-tree-cache-bytes` and `--input-tree-reads-in-flight`.
+    #[must_use]
+    pub const fn input_tree_config(&self) -> kbf_front::InputTreeConfig {
+        kbf_front::InputTreeConfig {
+            max_entries: self.input_tree_cache_entries,
+            max_bytes: self.input_tree_cache_bytes,
+            reads_in_flight: self.input_tree_reads_in_flight,
         }
     }
 
@@ -794,6 +834,35 @@ mod tests {
                 .expect_err("a cap over one admission");
             let message = refused.to_string();
             assert!(message.contains("--segment-upload-max-bytes"), "{message}");
+        }
+    }
+
+    /// Catches the input-tree flags not reaching the config, a zero where the check
+    /// needs at least one, and defaults other than the design's.
+    #[test]
+    fn input_tree_flags_make_the_input_tree_config() {
+        let defaults = Args::parse_from(["kbf-server"]).input_tree_config();
+        assert_eq!(defaults, kbf_front::InputTreeConfig::DEFAULT);
+        let set = Args::parse_from([
+            "kbf-server",
+            "--input-tree-cache-entries",
+            "11",
+            "--input-tree-cache-bytes",
+            "2222",
+            "--input-tree-reads-in-flight",
+            "3",
+        ]);
+        let want = kbf_front::InputTreeConfig {
+            max_entries: NonZeroUsize::new(11).expect("11"),
+            max_bytes: 2222,
+            reads_in_flight: NonZeroUsize::new(3).expect("3"),
+        };
+        assert_eq!(set.input_tree_config(), want);
+        for flag in ["--input-tree-cache-entries", "--input-tree-reads-in-flight"] {
+            assert!(
+                Args::try_parse_from(["kbf-server", flag, "0"]).is_err(),
+                "{flag}"
+            );
         }
     }
 
