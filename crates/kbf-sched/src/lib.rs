@@ -49,9 +49,9 @@
 //! - a finished operation is kept for [`FINISHED_RETENTION`] after its waiters are
 //!   answered, then dropped (issue #165);
 //! - memory kills (failure classes, 6.1): an action that passed its own memory limit
-//!   runs again with its memory booking doubled, up to the largest node that could run
-//!   it, and its action key keeps the raised booking as a floor for later submissions;
-//!   a kill at that largest node finishes it. A busy node's kill below the action's
+//!   runs again one rung up a fixed [`MemoryLadder`] (4, 16, 32 GiB, then a whole host,
+//!   the largest node that could run it), and its action key keeps the raised booking
+//!   as a floor for later submissions; a kill at that largest node finishes it. A busy node's kill below the action's
 //!   own limit runs it again with the same booking, at most [`FARM_RERUNS`] times, and
 //!   counts against the node ([`Scheduler::memory_pressure`]). See
 //!   [`kbf_types::MemoryRun`].
@@ -92,5 +92,7 @@ pub use fence::SelfFence;
 pub use input::{DaemonInstance, Event, Input, Request};
 pub use kbf_types::NodePhase;
 pub use requeue::{Gib, Requeue, RequeueReason};
-pub use scheduler::memory::{FARM_RERUNS, MEMORY_FLOORS, MemoryState, NOT_STARTED_RERUNS, raised};
+pub use scheduler::memory::{
+    FARM_RERUNS, LadderError, MEMORY_FLOORS, MemoryLadder, MemoryState, NOT_STARTED_RERUNS,
+};
 pub use scheduler::{FINISHED_RETENTION, OpState, PLACEMENT_ROUND, Scheduler, UNSERVABLE_WAIT};

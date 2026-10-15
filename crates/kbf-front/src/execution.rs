@@ -40,8 +40,10 @@
 //! not read yet), and every action is hermetic, so it may be joined (a `networked`
 //! property does not exist yet). The lease kind is the platform's `kbf-lease` value,
 //! `action` when absent; any other value than `action` or `whole_machine` is
-//! INVALID_ARGUMENT. The booking is one core and 1 GiB ([`DEFAULT_RESOURCES`]; learned
-//! sizes come with the estimator), or the whole cores of `kbf-book-cpus` and the GiB of
+//! INVALID_ARGUMENT. The booking of an `action` is one core and 4 GiB by default
+//! ([`DEFAULT_RESOURCES`], the first rung of the scheduler's memory ladder, which the
+//! server sets with [`ExecutionService::with_default_memory`]; learned sizes come with
+//! the estimator), or the whole cores of `kbf-book-cpus` and the GiB of
 //! `kbf-book-mem-gib` where the platform names them: a value that is not a whole number
 //! of at least 1, or that overflows the booking, is INVALID_ARGUMENT, and so is either
 //! key on a `whole_machine` lease (the scheduler books the whole worker for one). The
@@ -124,9 +126,15 @@ pub const NO_WORKER_REASON: &str = "NO_WORKER_CAN_RUN";
 /// The `ErrorInfo.domain` of kbf's errors.
 pub const ERROR_DOMAIN: &str = "kbf";
 
-/// What v0 books for an action that names no size: one core and 1 GiB, plus the GPUs
-/// its `gpu` property asks for. `kbf-book-cpus` and `kbf-book-mem-gib` replace either.
-pub const DEFAULT_RESOURCES: Resources = Resources::new(1_000, 1 << 30);
+/// What v0 books for an action that names no size: one core and 4 GiB, the first rung
+/// of the scheduler's default memory ladder, plus the GPUs its `gpu` property asks
+/// for. `kbf-book-cpus` and `kbf-book-mem-gib` replace either, and the server's first
+/// rung ([`ExecutionService::with_default_memory`]) replaces the memory.
+pub const DEFAULT_RESOURCES: Resources = Resources::new(1_000, 4 << 30);
+
+/// The least worker a lease of a kind other than `action` may run on: one core and
+/// 1 GiB. A `whole_machine` lease books the whole worker whatever this says.
+const LEAST_WORKER: Resources = Resources::new(1_000, 1 << 30);
 
 /// One execution the front hands to the scheduler.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -241,6 +249,8 @@ pub struct ExecutionService<M, O, D> {
     closing: Closing,
     authorizers: Arc<Authorizers>,
     recorder: Recorder,
+    /// The memory an `action` that names no size books, in bytes.
+    default_memory: u64,
 }
 
 /// The gRPC path of Execute, as calls are logged.
@@ -265,7 +275,16 @@ impl<M, O, D> ExecutionService<M, O, D> {
             closing,
             authorizers,
             recorder: Recorder::off(),
+            default_memory: DEFAULT_RESOURCES.memory_bytes,
         }
+    }
+
+    /// This service, booking `bytes` of memory for an `action` that names no size
+    /// (instead of [`DEFAULT_RESOURCES`]): the first rung of the scheduler's ladder.
+    #[must_use]
+    pub const fn with_default_memory(mut self, bytes: u64) -> Self {
+        self.default_memory = bytes;
+        self
     }
 
     /// This service, each Execute that carries an invocation id sent to `recorder`:
@@ -435,7 +454,7 @@ where
 
         let platform = properties(platform(&decoded, command.as_ref()))?;
         let kind = lease_kind(&platform)?;
-        let booked = booking(&platform, kind)?;
+        let booked = booking(&platform, kind, self.default_memory)?;
         let needs = needs(&platform)?;
         let gpus = mac_gpus(kind, gpus(&platform)?, &needs)?;
         device_kind(kind, &needs)?;
@@ -569,13 +588,18 @@ fn mac_gpus(kind: LeaseKind, gpus: u64, needs: &kbf_caps::Request) -> Result<u64
     Ok(0)
 }
 
-/// What the lease books: [`DEFAULT_RESOURCES`], with `kbf-book-cpus` whole cores and
+/// What the lease books: one core and `default_memory` bytes for an `action` (the least
+/// worker, [`LEAST_WORKER`], for another kind), with `kbf-book-cpus` whole cores and
 /// `kbf-book-mem-gib` GiB in place of the default where the platform names them, or
 /// INVALID_ARGUMENT for a value that is not a whole number of at least 1 in plain
 /// digits ([`starts_plain`]), one too large to book, or either key on a `whole_machine`
 /// lease.
-fn booking(platform: &Platform, kind: LeaseKind) -> Result<Resources, Status> {
-    let mut booked = DEFAULT_RESOURCES;
+fn booking(platform: &Platform, kind: LeaseKind, default_memory: u64) -> Result<Resources, Status> {
+    let mut booked = if kind == LeaseKind::Action {
+        Resources::new(DEFAULT_RESOURCES.cpu_millis, default_memory)
+    } else {
+        LEAST_WORKER
+    };
     for (key, unit, slot) in [
         (BOOK_CPUS_KEY, 1_000, &mut booked.cpu_millis),
         (BOOK_MEM_GIB_KEY, 1 << 30, &mut booked.memory_bytes),

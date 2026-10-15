@@ -293,10 +293,10 @@ The action says so, the node says what it can do, and the scheduler books it.
 
 **One size convention for every lease kind.** `kbf-book-cpus` and `kbf-book-mem-gib`
 are what a lease books, on bare metal and in a VM alike: on an `action` lease they
-replace the 1 core and 1 GiB every action books today (and so raise the native
+replace the 1 core and 4 GiB every action books today (and so raise the native
 driver's memory kill, which is 150% + 512 MiB of the booking); on a `vm` lease they
 size the guest. A `whole_machine` lease books the whole node, so the front refuses
-either key on it; without the keys an `action` lease books 1 core and 1 GiB
+either key on it; without the keys an `action` lease books 1 core and 4 GiB
 (`DEFAULT_RESOURCES`, `crates/kbf-front/src/execution.rs`) **[V]**. They are not `cpus`
 and `mem_gib`: those two are capability keys that
 ask for a node whose *whole machine* has at least that much, and they book nothing.
@@ -355,7 +355,7 @@ able to serve `whole_machine`. The native and container drivers serve `action` o
 On `main`, `Resources` has four dimensions (`cpu_millis`, `memory_bytes`, `gpus`,
 `vms`, `crates/kbf-types/src/work.rs`), with `vms` checked by `fits` but booked and
 filled by nothing yet (`kbf-lease=vm` is refused). An `action` lease books 1 core and
-1 GiB, or its `kbf-book-cpus` and `kbf-book-mem-gib` (`crates/kbf-front/src/execution.rs`).
+4 GiB, or its `kbf-book-cpus` and `kbf-book-mem-gib` (`crates/kbf-front/src/execution.rs`).
 The lease kind is in the scheduler's request: a worker is feasible only if its `drivers`
 serve the kind, and a `whole_machine` lease books the whole worker and, when it fits
 nowhere, holds one worker in queue order ([scheduler.md](scheduler.md#placement)).
@@ -751,5 +751,5 @@ metal, one at a time ([section 8.1](#81-on-bare-metal-never-in-a-vm)).
 | Batch size changes LLM outputs | V | [Thinking Machines](https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference/), [llama.cpp#3014](https://github.com/ggml-org/llama.cpp/issues/3014) |
 | mlx-lm deterministic at temperature 0, batch 1 | V on one M4 Max; A for ours | [mlx-lm#1017](https://github.com/ml-explore/mlx-lm/discussions/1017) |
 | `do_not_cache` and `auxiliary_metadata` exist in REAPI | V | [remote_execution.proto](https://github.com/bazelbuild/remote-apis/blob/main/build/bazel/remote/execution/v2/remote_execution.proto) |
-| Every action books 1 core and 1 GiB; native kill at 2 GiB | V | `crates/kbf-front/src/execution.rs`, `crates/kbf-driver-native/src/config.rs` |
+| Every action books 1 core and 4 GiB; native kill at 6.5 GiB | V | `crates/kbf-front/src/execution.rs`, `crates/kbf-driver-native/src/config.rs` |
 | A Mac reports `gpu=0` | V | `crates/kbf-daemon/src/report.rs` |

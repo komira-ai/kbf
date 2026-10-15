@@ -235,7 +235,7 @@ skipped by the matcher (`kbf_caps::RESERVED_KEYS`; names read in any case):
 | `kbf-lease` | the lease kind: `action` (the default, a share of a machine) or `whole_machine`; **planned**: `vm` |
 | `kbf-cpu` | the name is reserved; its meaning is **planned**: `dedicated` for whole physical cores, for quiet performance runs |
 | `kbf-mac-admin` | the name is reserved; its meaning is **planned**: a privileged whole-machine lease on macOS |
-| `kbf-book-cpus`, `kbf-book-mem-gib` | the whole cores and GiB an `action` lease books in place of one core and 1 GiB (see [platform-properties.md](../platform-properties.md#kbf-book-cpus-and-kbf-book-mem-gib)); the front refuses either on a `whole_machine` lease. **Planned**: they also size a `vm` lease's guest |
+| `kbf-book-cpus`, `kbf-book-mem-gib` | the whole cores and GiB an `action` lease books in place of one core and 4 GiB (the first rung of the memory ladder) (see [platform-properties.md](../platform-properties.md#kbf-book-cpus-and-kbf-book-mem-gib)); the front refuses either on a `whole_machine` lease. **Planned**: they also size a `vm` lease's guest |
 | `kbf-node` | **planned**, not yet reserved: pins a lease to one node for qualification. The front will refuse it from every client; only the rollout driver's internal submitter sets it ([fleet-updates.md](fleet-updates.md#31-observed)) |
 
 `kbf-book-cpus` and `kbf-book-mem-gib` are not `cpus` and `mem_gib`: those ask for a node

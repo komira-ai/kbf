@@ -522,8 +522,10 @@ floor** for the action's key, and later requests at that key book at least the f
   watch, or the kernel's OOM killer at `memory.max`) as `MEMORY_KILL_OWN_LIMIT` and a
   kill by the node's `actions/` limit or the host as `MEMORY_KILL_NODE_PRESSURE`
   ("What counts as an out-of-memory kill", above).
-- An own-cap kill reruns with the booking doubled in whole GiB (at least 1 GiB), never
-  past the cap: the largest live node, cordoned or not, that serves the lease kind,
+- An own-cap kill reruns one rung up a fixed ladder (`--memory-ladder-gib`, default 4,
+  16, 32 GiB; the leaning above doubled, which the code no longer does), and after the
+  last rung on the cap, a whole host. A rung not below the cap is skipped for it. The
+  cap is: the largest live node, cordoned or not, that serves the lease kind,
   satisfies the platform and holds the CPU and GPU request (the killed run's node
   always counts). A kill of a run at the cap is answered as below (O1 A).
 - A busy node's kill reruns with the same booking, counts against the node
@@ -532,7 +534,7 @@ floor** for the action's key, and later requests at that key book at least the f
   `FARM_RERUNS` = 2 reruns (3 runs), then `INTERNAL` naming the node.
 - **The budgets do not mix** (O7 A, bound): the ladder never counts against the farm
   reruns and busy-node kills never count as rungs, so neither can starve the other. An
-  operation runs at most `1 + ceil(log2(cap / first booking)) + 2` times. The excluded
+  operation runs at most `1 + rungs above its first booking + 1 + 2` times. The excluded
   nodes of 6.5 are not built: a busy node's rerun may land on the same node.
 - **The action key** (O2, still open) is today the scheduler's dedup key, the instance
   name and action digest. A floor therefore helps every later run of the same digest
