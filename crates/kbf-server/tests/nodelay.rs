@@ -51,7 +51,10 @@ async fn an_option_turned_on_after_the_first_read_counts_as_on() {
         reads >= 3
     })
     .await;
-    assert!(on, "the option turned on at read 3, but read {reads} gave up");
+    assert!(
+        on,
+        "the option turned on at read 3, but read {reads} gave up"
+    );
 }
 
 /// Catches: a wait that reports on for an option that never turns on, or never
@@ -61,10 +64,20 @@ async fn an_option_that_never_turns_on_counts_as_off() {
     assert!(!turned_on(|| false).await);
 }
 
-/// Whether `read` answers `true`. One read: the server sets the option after it
-/// accepts.
+/// Whether `read` answers `true` within [`PROMPT`], read every 10 ms: the server
+/// sets the option right after it accepts, and the socket can be found between the
+/// two.
 async fn turned_on(mut read: impl FnMut() -> bool) -> bool {
-    read()
+    let deadline = tokio::time::Instant::now() + PROMPT;
+    loop {
+        if read() {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
 
 /// The descriptor of the socket the server accepted on `listener` for the connection
