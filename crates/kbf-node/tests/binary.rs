@@ -499,6 +499,19 @@ fn kbf_async_threads(flag: &str) -> usize {
 fn each_driver_starts_and_stops_on_sigterm() {
     let status = runs_until_sigterm("fake", &["--driver=fake".to_owned()]);
     assert!(status.success(), "{status}");
+    // The fake driver keeps nothing on disk, so without `--data-dir` it touches no
+    // directory; given one, it makes it and claims its lease directory.
+    let fake_data = tls("fake-data");
+    let fake = [
+        "--driver=fake".to_owned(),
+        format!("--data-dir={}", fake_data.display()),
+    ];
+    let status = runs_until_sigterm("fake-data", &fake);
+    assert!(status.success(), "{status}");
+    assert!(
+        fake_data.join("leases/daemon-instance").is_file(),
+        "the fake daemon with --data-dir makes and claims its lease directory"
+    );
     let data = tls("native-scratch");
     let scratch = data.join("leases");
     let native = [
