@@ -454,4 +454,23 @@ mod tests {
         let plan = Plan::new(&args(&["--data-dir=/d"]), true, &Fake(tiny)).expect("plan");
         assert!(super::given(&plan).is_none());
     }
+
+    /// Catches a directory that cannot be made taken as made: `--data-dir` under a file
+    /// stops the start with the directory named, rather than failing later in a driver.
+    #[test]
+    fn a_directory_that_cannot_be_made_is_an_error_naming_it() {
+        let space = Space {
+            total: 200 * GIB,
+            available: 150 * GIB,
+        };
+        let base = crate::tests::scratch("data-dir-under-a-file");
+        let file = base.join("a-file");
+        std::fs::write(&file, b"not a directory").expect("plant a file");
+        let flags = [format!("--data-dir={}", file.join("data").display())];
+        let flags: Vec<&str> = flags.iter().map(String::as_str).collect();
+        let plan = Plan::new(&args(&flags), true, &Fake(space)).expect("plan");
+        let error = plan.create().expect_err("under a file");
+        assert!(matches!(error, DataDirError::Make { .. }), "{error}");
+        assert!(error.to_string().contains("a-file/data"), "{error}");
+    }
 }

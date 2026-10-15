@@ -558,7 +558,7 @@ mod tests {
 
     use kbf_threads::disk::{FreeSpace, Space};
 
-    use super::{Args, StoreUri, loopback_only};
+    use super::{Args, loopback_only};
 
     /// Catches: `min-put-rate` lost on the way from the URI to the store (the flat 60 s
     /// that cut slow segment PUTs), a default other than 1 MiB/s, `conditional-put` and
@@ -572,10 +572,9 @@ mod tests {
         };
         let config = |query: &str| {
             let args = parse(query).expect("a store");
-            let Some(StoreUri::S3(uri)) = args.cold_store else {
-                panic!("an s3 store")
-            };
-            super::s3_config(&uri, super::Credentials::new("k", "s"))
+            let uri = args.cold_store.expect("a store");
+            let uri = uri.as_s3().expect("an s3 store");
+            super::s3_config(uri, super::Credentials::new("k", "s"))
         };
         let default = config("");
         assert_eq!(default.min_body_rate, NonZeroU64::new(1 << 20));
@@ -659,9 +658,7 @@ mod tests {
                 available: 50 << 30,
             }))
             .expect("stores");
-        let StoreUri::S3(uri) = &stores.cold else {
-            panic!("an S3 cold store")
-        };
+        let uri = stores.cold.as_s3().expect("an S3 cold store");
         assert_eq!(uri.prefix, "kbf/", "the old --s3-prefix default");
         let config = super::s3_config(uri, super::Credentials::new("k", "s"));
         assert_eq!(config.endpoint, "http://127.0.0.1:9000");

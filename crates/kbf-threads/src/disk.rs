@@ -160,7 +160,8 @@ mod tests {
     fn the_real_source_answers_for_a_directory_not_made_yet() {
         let here = std::env::current_dir().expect("a directory");
         let made = Statvfs.space(&here).expect("this directory");
-        assert!(made.total > 0 && made.available <= made.total);
+        assert!(made.total > 0);
+        assert!(made.available <= made.total);
         let later = Statvfs
             .space(&here.join("not/made/yet"))
             .expect("its ancestor's");

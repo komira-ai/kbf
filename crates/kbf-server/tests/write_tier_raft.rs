@@ -21,7 +21,7 @@ use kbf_objstore::{
     ObjectStoreError, PageSize,
 };
 use kbf_server::stores::Hot;
-use kbf_server::write_tier::{TierLog, attach};
+use kbf_server::write_tier::attach;
 use kbf_server::{RaftLogError, RaftMetaLog};
 use kbf_store::StdFs;
 use kbf_tier::TierOptions;
@@ -207,8 +207,8 @@ async fn a_raft_server_with_a_tier_raises_its_log_once() {
     let log = cache.meta();
     assert_eq!(log.machine_version(), MachineVersion::V2);
     let applied = log.applied_index();
-    let tier_dir = StdFs::new(&dirs.tier).expect("the tier dir");
-    log.ready_for_tier(&tier_dir).expect("ready");
+    log.raise_machine_version(MachineVersion::V2)
+        .expect("raise");
     assert_eq!(log.applied_index(), applied, "the raise committed again");
     drop(cache);
 

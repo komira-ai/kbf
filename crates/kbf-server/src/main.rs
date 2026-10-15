@@ -51,8 +51,9 @@ use kbf_log::FarmLogId;
 use kbf_meta::Retention;
 use kbf_objstore::{FsStore, KeyPrefix, ObjectStore};
 use kbf_server::stores::{COLD_FILE_MIN_FREE_BYTES, FILE_PREFIX_ROOT, StoreUri, Stores};
-use kbf_server::write_tier::{FLUSH_EVERY, TierLog};
+use kbf_server::write_tier::FLUSH_EVERY;
 use kbf_server::{Args, RaftMetaLog, SERVER_VERSION, bind_server_with_policy, s3_store};
+use kbf_store::StdFs;
 use kbf_threads::Topology;
 use kbf_threads::disk::Statvfs;
 
@@ -113,10 +114,10 @@ async fn over<O: ObjectStore + 'static>(
     run(args, stores, log, store, prefix, id).await
 }
 
-async fn run<M: TierLog, O: ObjectStore + 'static>(
+async fn run<O: ObjectStore + 'static>(
     args: &Args,
     stores: &Stores,
-    meta: M,
+    meta: RaftMetaLog<StdFs>,
     store: O,
     prefix: KeyPrefix,
     log: FarmLogId,

@@ -163,10 +163,21 @@ fn file(text: &str, rest: &str) -> Result<PathBuf, StoreUriError> {
     }
     let path = PathBuf::from(percent_decode_str(rest).decode_utf8_lossy().into_owned());
     // `file://host/path` leaves `host/path`, which is not absolute.
-    if !rest.starts_with('/') || !path.is_absolute() {
+    if !rest.starts_with('/') {
         return Err(StoreUriError::FilePath(text.to_owned()));
     }
     Ok(path)
+}
+
+impl StoreUri {
+    /// The S3 store this names, if it names one.
+    #[must_use]
+    pub fn as_s3(&self) -> Option<&S3Uri> {
+        match self {
+            Self::S3(s3) => Some(s3),
+            Self::File(_) => None,
+        }
+    }
 }
 
 impl S3Uri {
@@ -436,10 +447,11 @@ mod tests {
     }
 
     fn s3(text: &str) -> S3Uri {
-        match uri(text).expect("a store") {
-            StoreUri::S3(s3) => s3,
-            other => panic!("not s3: {other:?}"),
-        }
+        uri(text)
+            .expect("a store")
+            .as_s3()
+            .expect("an s3 store")
+            .clone()
     }
 
     /// Catches a `file://` URI read as anything but its absolute path: the host form
@@ -455,6 +467,7 @@ mod tests {
         assert_eq!(uri("FILE:///a"), Ok(StoreUri::File("/a".into())));
         assert_eq!(uri("file:///a%20b"), Ok(StoreUri::File("/a b".into())));
         assert_eq!(uri("file:///a%3Fb"), Ok(StoreUri::File("/a?b".into())));
+        assert_eq!(uri("file:///a").expect("a store").as_s3(), None);
         for bad in [
             "file://host/x",
             "file://x",
@@ -499,6 +512,8 @@ mod tests {
         assert_eq!(full.min_put_rate.get(), 4096);
         assert_eq!(s3("s3://b/p/?endpoint=http://e").prefix, "p/");
         assert_eq!(s3("s3://b/?endpoint=http://e").prefix, "kbf/");
+        let off = s3("s3://b?endpoint=http://e&conditional-put=false");
+        assert!(!off.conditional_put, "an explicit false");
     }
 
     /// Catches what an S3 URI must refuse: no bucket, no endpoint (the one setting
@@ -675,8 +690,7 @@ mod tests {
         let (cold, hot) = (file("/cold"), file("/hot"));
         let none = flags(None, Some(&hot), None).resolve(&Fake(DISK));
         assert!(matches!(none, Err(StoresError::NoColdStore)));
-        let remote = s3("s3://b?endpoint=http://e");
-        let remote = StoreUri::S3(remote);
+        let remote = StoreUri::S3(s3("s3://b?endpoint=http://e"));
         let error = flags(Some(&cold), Some(&remote), Some(Path::new("/m")))
             .resolve(&Fake(DISK))
             .expect_err("s3 hot");
@@ -718,5 +732,30 @@ mod tests {
         );
         assert!(lines[1].starts_with("hot store: none"), "{lines:?}");
         assert_eq!(lines[2], "metadata log: /m (--meta-dir)");
+    }
+
+    struct Broken;
+
+    impl FreeSpace for Broken {
+        fn space(&self, _: &Path) -> io::Result<Space> {
+            Err(io::Error::from(io::ErrorKind::PermissionDenied))
+        }
+    }
+
+    /// Catches a hot store whose filesystem cannot be read sized as if it could: the
+    /// start is refused naming the directory (a guessed budget could fill the disk).
+    #[test]
+    fn an_unreadable_hot_store_filesystem_is_refused_naming_the_directory() {
+        let (cold, hot) = (file("/cold"), file("/hot"));
+        let error = flags(Some(&cold), Some(&hot), None)
+            .resolve(&Broken)
+            .expect_err("unreadable");
+        assert!(matches!(error, StoresError::Space { .. }), "{error}");
+        assert!(error.to_string().contains("/hot"), "{error}");
+        // Without a hot store nothing is measured.
+        let meta = Path::new("/m");
+        flags(Some(&cold), None, Some(meta))
+            .resolve(&Broken)
+            .expect("no hot store, no measuring");
     }
 }
