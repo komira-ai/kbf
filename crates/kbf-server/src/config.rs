@@ -177,6 +177,10 @@ pub struct Args {
     /// off when it runs out.
     #[arg(long, default_value_t = 10)]
     pub shutdown_timeout_secs: u64,
+    /// Thread sizes: `--async-threads`, `--blocking-threads` and `--cpu-threads`
+    /// (defaults from the physical cores; see `kbf_threads`).
+    #[command(flatten)]
+    pub threads: kbf_threads::ThreadArgs,
     /// The memory, in bytes, the invocation records may take together
     /// (`docs/design/invocations.md`, section 3.5). At the bound, records of a minted id
     /// go first, then idle ones, least recently seen first; with only open builds left,

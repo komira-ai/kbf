@@ -1675,6 +1675,7 @@ dependencies = [
  "kbf-proto",
  "kbf-server",
  "kbf-testkit",
+ "kbf-threads",
  "kbf-transfer",
  "kbf-types",
  "libc",
@@ -1787,6 +1788,7 @@ dependencies = [
  "kbf-segments",
  "kbf-sim",
  "kbf-store",
+ "kbf-threads",
  "kbf-tier",
  "kbf-types",
  "libc",
@@ -1850,6 +1852,15 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "rustix",
+]
+
+[[package]]
+name = "kbf-threads"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

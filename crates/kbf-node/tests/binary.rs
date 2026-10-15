@@ -325,6 +325,54 @@ fn runs_until_sigterm_logged_then(
     (status, all)
 }
 
+/// The thread flags reach the daemon's runtime: it logs the sizes it resolved and runs
+/// exactly that many async workers (the `kbf-async` threads of `/proc`).
+///
+/// Catches: flags parsed and dropped (the log would show the defaults, the runtime
+/// tokio's one worker per CPU), and a start that logs nothing about its sizes.
+#[cfg(target_os = "linux")]
+#[test]
+fn thread_flags_size_the_runtime_and_are_logged() {
+    let flags = [
+        "--driver=fake",
+        "--async-threads=3",
+        "--blocking-threads=5",
+        "--cpu-threads=2",
+    ]
+    .map(str::to_owned);
+    let mut workers = 0;
+    let (status, log) = runs_until_sigterm_logged_then("threads", &flags, None, || {
+        workers = kbf_async_threads("--blocking-threads=5");
+    });
+    assert!(status.success(), "{status}");
+    assert_eq!(workers, 3);
+    assert!(
+        log.iter()
+            .any(|l| l.contains("threads: async=3 blocking=5 cpu=2 (")),
+        "{log:#?}"
+    );
+}
+
+/// The `kbf-async` threads of the one daemon whose command line holds `flag` (no other
+/// test here gives it).
+#[cfg(target_os = "linux")]
+fn kbf_async_threads(flag: &str) -> usize {
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir("/proc").expect("/proc").flatten() {
+        let cmdline = std::fs::read(entry.path().join("cmdline")).unwrap_or_default();
+        let has = |want: &str| cmdline.split(|b| *b == 0).any(|arg| arg == want.as_bytes());
+        if has(flag) && has("--driver=fake") {
+            found.push(entry.path());
+        }
+    }
+    assert_eq!(found.len(), 1, "daemons with {flag}: {found:?}");
+    std::fs::read_dir(found[0].join("task"))
+        .expect("task dir")
+        .filter_map(|t| std::fs::read_to_string(t.ok()?.path().join("comm")).ok())
+        .filter(|name| name.trim() == "kbf-async")
+        .count()
+}
+
 /// Catches: a driver that cannot be brought up from the command line (a missing
 /// flag, a scratch directory not made, a node that cannot be detected), and a daemon
 /// that does not exit cleanly on SIGTERM.

@@ -75,6 +75,11 @@ struct Cli {
     scratch: Option<PathBuf>,
     #[command(flatten)]
     outputs: OutputLimits,
+    /// The async runtime's and the CPU pool's sizes: `--async-threads`,
+    /// `--blocking-threads` and `--cpu-threads`, defaulting from the physical cores
+    /// (`kbf_threads`).
+    #[command(flatten)]
+    threads: kbf_threads::ThreadArgs,
     /// How long one lease's whole output upload (its output files, stdout and stderr)
     /// may take, in seconds, before the lease fails with a reason naming the upload and
     /// the time it ran (container and native drivers). Without it, a store that stops
@@ -85,16 +90,6 @@ struct Cli {
         value_parser = clap::value_parser!(u64).range(1..)
     )]
     output_upload_deadline_secs: u64,
-    /// How many threads hash the output files of all leases together (container driver):
-    /// each file is read once, for its SHA-256 and the CRC-32C of its segment footer.
-    /// They are threads of their own, apart from the ones that run actions, so a node
-    /// with many leases hashes on no more cores than this.
-    #[arg(
-        long,
-        default_value_t = kbf_daemon::cpu_pool::DEFAULT_CPU_THREADS as u64,
-        value_parser = clap::value_parser!(u64).range(1..)
-    )]
-    cpu_threads: u64,
     #[command(flatten)]
     cache: cache::CacheArgs,
     #[command(flatten)]
@@ -303,10 +298,22 @@ fn main() -> ExitCode {
     }
 }
 
+/// The thread sizes the flags and this machine's cores give.
+fn sizes(cli: &Cli) -> kbf_threads::Sizes {
+    sizes_on(cli, kbf_threads::Topology::detect())
+}
+
+/// [`sizes`] on a given machine shape: the daemon's role defaults, then the flags.
+fn sizes_on(cli: &Cli, topology: kbf_threads::Topology) -> kbf_threads::Sizes {
+    cli.threads.resolve(kbf_threads::Role::Daemon, topology)
+}
+
 /// Builds the runtimes `--driver` names and serves until a signal; returns an error
 /// that stopped the daemon from starting.
 fn start(cli: &Cli) -> Result<(), Error> {
-    let tokio = tokio::runtime::Runtime::new()?;
+    let sizes = sizes(cli);
+    sizes.log();
+    let tokio = sizes.runtime()?;
     // The CAS channel is made lazily, which needs the runtime's context.
     let _context = tokio.enter();
     let (daemon, _) = node(cli, || native_config(cli), Path::new(xcode::XCRUN))?;
@@ -629,7 +636,7 @@ mod container {
             max_stdio_bytes: cli.outputs.max_stdio_bytes,
         };
         config.upload_deadline = super::upload_deadline(cli);
-        config.cpu = kbf_daemon::CpuPool::new(usize::try_from(cli.cpu_threads).unwrap_or(1));
+        config.cpu = cpu_pool(cli);
         config.limits = limits(cli);
         config.swap_kill = swap_kill(cli);
         config.cache = crate::cache::given(&cli.cache, &cli.trees, &config.scratch);
@@ -666,6 +673,11 @@ mod container {
             percent: cli.lease_swap_kill_percent,
             every: Duration::from_millis(cli.lease_swap_poll_ms),
         }
+    }
+
+    /// The CPU pool the container driver hashes outputs on, sized by `--cpu-threads`.
+    pub(super) fn cpu_pool(cli: &Cli) -> kbf_daemon::CpuPool {
+        kbf_daemon::CpuPool::new(super::sizes(cli).cpu_threads())
     }
 
     /// The `--container-*` limits.
@@ -850,21 +862,46 @@ mod tests {
         assert_eq!(container::limits(&defaults), ContainerLimits::DEFAULT);
     }
 
-    /// Catches `--cpu-threads` not parsed, not defaulting to the pool's documented 4, or
-    /// accepting 0 (a pool that never runs a job).
+    /// Catches `--cpu-threads` not parsed, not reaching the sizes the CPU pool is built
+    /// from, or accepting 0 (a pool that never runs a job).
     #[test]
     fn cpu_threads_is_a_flag() {
-        assert_eq!(
-            parse(&["--driver=fake"]).expect("flags").cpu_threads,
-            kbf_daemon::cpu_pool::DEFAULT_CPU_THREADS as u64
-        );
-        assert_eq!(
-            parse(&["--driver=fake", "--cpu-threads=6"])
-                .expect("flags")
-                .cpu_threads,
-            6
-        );
+        let cli = parse(&["--driver=fake", "--cpu-threads=6"]).expect("flags");
+        assert_eq!(sizes(&cli).cpu_threads(), 6);
+        let cli = parse(&["--driver=fake"]).expect("flags");
+        assert!(sizes(&cli).cpu_threads() >= 1);
         assert!(parse(&["--driver=fake", "--cpu-threads=0"]).is_err());
+    }
+
+    /// Catches the container driver's pool not following `--cpu-threads` (a fixed size
+    /// in its construction). 6 and 3 are not the default on any machine's topology.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cpu_threads_reaches_the_container_pool() {
+        let cli = parse(&["--driver=container", "--cpu-threads=6"]).expect("flags");
+        assert_eq!(container::cpu_pool(&cli).threads(), 6);
+        let cli = parse(&["--driver=container", "--cpu-threads=3"]).expect("flags");
+        assert_eq!(container::cpu_pool(&cli).threads(), 3);
+    }
+
+    /// Catches the daemon resolving another role's defaults: on the 44-core,
+    /// 2-threads-per-core farm node it is 2 async, 64 blocking and 4 CPU threads (the
+    /// server's would be 4, 128, 4), and a flag still wins over its default.
+    #[test]
+    fn the_daemon_resolves_the_daemon_role() {
+        let topology = || kbf_threads::Topology::new(88, 2);
+        let cli = parse(&["--driver=fake"]).expect("flags");
+        let sizes = sizes_on(&cli, topology());
+        assert_eq!(
+            (
+                sizes.async_threads(),
+                sizes.blocking_threads(),
+                sizes.cpu_threads()
+            ),
+            (2, 64, 4)
+        );
+        let cli = parse(&["--driver=fake", "--async-threads=5"]).expect("flags");
+        assert_eq!(sizes_on(&cli, topology()).async_threads(), 5);
     }
 
     /// Catches a `--lease-swap-*` flag that does not reach the driver's swap watch (in

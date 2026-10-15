@@ -48,20 +48,32 @@ use kbf_meta::Retention;
 use kbf_objstore::{Capabilities, KeyPrefix, MemoryStore, ObjectStore};
 use kbf_server::write_tier::{FLUSH_EVERY, TierLog};
 use kbf_server::{Args, RaftMetaLog, SERVER_VERSION, StoreKind, bind_server_with_policy};
+use kbf_threads::{Role, Topology};
 
-#[tokio::main]
-async fn main() -> ExitCode {
+fn main() -> ExitCode {
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .init();
     let args = Args::parse();
-    match start(&args).await {
+    match serve(&args) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("kbf-server: {e}");
             ExitCode::from(2)
         }
     }
+}
+
+/// Builds the async runtime the thread flags size, then runs [`start`] on it.
+fn serve(args: &Args) -> Result<(), Box<dyn Error>> {
+    let sizes = sizes_on(args, Topology::detect());
+    sizes.log();
+    sizes.runtime()?.block_on(start(args))
+}
+
+/// The server's thread sizes on a given machine shape: its role defaults, then the flags.
+fn sizes_on(args: &Args, topology: Topology) -> kbf_threads::Sizes {
+    args.threads.resolve(Role::Server, topology)
 }
 
 /// Builds the object store and the metadata log the flags name, then serves.
@@ -202,4 +214,29 @@ fn interrupted() -> io::Result<impl Future<Output = ()> + Send + 'static> {
     Ok(async {
         let _ = tokio::signal::ctrl_c().await;
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Catches the server resolving another role's defaults: on the 44-core,
+    /// 2-threads-per-core farm node it is 4 async, 128 blocking and 4 CPU threads (the
+    /// daemon's would be 2, 64, 4), and a flag still wins over its default.
+    #[test]
+    fn the_server_resolves_the_server_role() {
+        let topology = || Topology::new(88, 2);
+        let args = Args::parse_from(["kbf-server"]);
+        let sizes = sizes_on(&args, topology());
+        assert_eq!(
+            (
+                sizes.async_threads(),
+                sizes.blocking_threads(),
+                sizes.cpu_threads()
+            ),
+            (4, 128, 4)
+        );
+        let args = Args::parse_from(["kbf-server", "--blocking-threads=9"]);
+        assert_eq!(sizes_on(&args, topology()).blocking_threads(), 9);
+    }
 }
