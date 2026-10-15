@@ -387,7 +387,7 @@ async fn a_corrupt_record_is_acknowledged_and_caught_at_the_flush() {
     let all = blobs(1, 3, 4096);
     let good = seg(&all);
     let (sent, at) = altered(&good, &all[1]);
-    let committed = upload(&service, &[sent.clone()])
+    let committed = upload(&service, std::slice::from_ref(&sent))
         .await
         .expect("acknowledged: nothing is hashed on the way");
     assert_eq!(committed.len(), 3);
