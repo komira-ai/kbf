@@ -698,6 +698,24 @@ async fn the_store_directory_is_searchable_by_others_but_not_listable_or_writabl
     std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o777)).unwrap();
     let _ = Trees::open(TreeConfig::new(store.clone(), GIB)).unwrap();
     assert_eq!(mode(&store), 0o711, "a 0777 store, reopened");
+
+    // A directory above the store that others cannot search is the operator's: the
+    // store opens (it is only warned about) and is still 0711.
+    let closed = kit.dir.join("closed");
+    std::fs::create_dir(&closed).unwrap();
+    std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let below = Trees::open(TreeConfig::new(closed.join("trees"), GIB)).unwrap();
+    assert_eq!(
+        mode(&closed.join("trees")),
+        0o711,
+        "a store below a closed directory"
+    );
+    assert_eq!(
+        mode(&closed),
+        0o700,
+        "the operator's directory is not touched"
+    );
+    drop(below);
 }
 
 /// A build that fails (a blob the CAS does not have) names no tree and leaves no
