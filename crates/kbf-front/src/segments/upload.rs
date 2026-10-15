@@ -235,7 +235,8 @@ impl Receiving {
                 break;
             }
             let record = &self.records[i];
-            if record.busy || record.crc.is_some() || entry.digest.size_bytes == 0 {
+            // A finished or empty record has nothing past `done` to cover.
+            if record.busy {
                 continue;
             }
             let at = entry.offset + record.done;

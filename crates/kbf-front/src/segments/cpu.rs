@@ -42,7 +42,7 @@ impl HashPool {
             .await
         })
         .await
-        .map_err(|e| Status::internal(format!("hash pool task failed: {e}")))?
+        .and_then(std::convert::identity)
         .map_err(|e| Status::internal(format!("a hashing job failed: {e}")))
     }
 }
@@ -146,17 +146,15 @@ mod tests {
         };
         tokio::task::yield_now().await;
         let (done_tx, done_rx) = tokio::sync::oneshot::channel();
-        let second = {
-            let pool = Arc::clone(&pool);
-            tokio::spawn(async move {
-                pool.run(Box::new(move || {
-                    let _ = done_tx.send(());
-                }))
-                .await
-            })
-        };
-        tokio::task::yield_now().await;
-        second.abort();
+        // Gives up while the first job holds the only permit.
+        let gave_up = tokio::time::timeout(
+            Duration::from_millis(50),
+            pool.run(Box::new(move || {
+                let _ = done_tx.send(());
+            })),
+        )
+        .await;
+        assert!(gave_up.is_err());
         hold_tx.send(()).unwrap();
         first.await.unwrap().unwrap();
         tokio::time::timeout(Duration::from_secs(30), done_rx)

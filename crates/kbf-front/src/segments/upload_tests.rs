@@ -212,3 +212,24 @@ fn a_commit_waits_for_checks_and_stops_at_a_refusal() {
         Code::InvalidArgument
     );
 }
+
+/// Catches a range that claims a record some task is already advancing (two tasks
+/// hashing one record, or its hasher taken twice): a record spanning two ranges whose
+/// first range's check has not run is not claimed again by the second range; the first
+/// task then carries on over both and the record hashes once, to the right digest.
+#[test]
+fn a_busy_record_is_not_claimed_again() {
+    let (declared, records) = segment(1, 3000);
+    let mut received = Receiving::new(&declared);
+    let (_, first) = received.put(&declared, 0, &records[..1000]).expect("put");
+    assert_eq!(first.len(), 1);
+    let (_, second) = received
+        .put(&declared, 1000, &records[1000..])
+        .expect("put");
+    assert!(second.is_empty(), "claimed twice: {second:?}");
+    advance(&first, |i, f| received.next(&declared, i, f));
+    assert!(received.refusal().is_none());
+    received
+        .check(&declared)
+        .expect("one hash over both ranges");
+}
