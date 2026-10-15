@@ -94,6 +94,7 @@ use crate::connect::{
 use crate::contact::Contact;
 use crate::lease::{Done, Leases, failure, lease_id, proto_lease_id};
 use crate::phases::LeasePhases;
+use crate::pressure;
 use crate::report::NodeReport;
 use crate::runtimes::Runtimes;
 use crate::status::{DriverReport, Software};
@@ -209,8 +210,12 @@ pub struct Daemon {
     container_images: Vec<String>,
     /// The runtime's phase, if one reports it; see [`Self::with_phase`].
     phase: Option<watch::Receiver<NodePhase>>,
-    /// The newest phase taken from it, which every Hello carries.
+    /// The newest phase taken from it.
     phase_now: NodePhase,
+    /// The memory backstop, if one is set; see [`Self::with_memory_backstop`]. Every
+    /// Hello carries `phase_now`, or [`NodePhase::MemoryPressure`] in its place while
+    /// the node is serving and the backstop has paused it.
+    pressure: Option<Backstop>,
     events: Option<mpsc::UnboundedSender<Event>>,
     leases: Leases,
     done: mpsc::UnboundedReceiver<Done>,
@@ -234,6 +239,14 @@ pub struct Daemon {
     predecessor: String,
 }
 
+/// The memory backstop: the sampled pressure, the percentage above which a node that
+/// runs leases takes no more, and whether it is paused now.
+struct Backstop {
+    stall: watch::Receiver<Option<f64>>,
+    above: f64,
+    paused: bool,
+}
+
 /// What the daemon remembers of a lease's Start until it forgets the lease.
 struct Granted {
     /// The lease epoch in force when the Start arrived.
@@ -250,6 +263,7 @@ enum Wake {
     Recheck,
     Driver,
     Phase,
+    Pressure,
 }
 
 impl Daemon {
@@ -293,6 +307,7 @@ impl Daemon {
             container_images: Vec::new(),
             phase: None,
             phase_now: NodePhase::Serving,
+            pressure: None,
             events: None,
             leases: Leases::new(runtimes, done_tx),
             done,
@@ -371,6 +386,46 @@ impl Daemon {
         let changed = newest != self.phase_now;
         self.phase_now = newest;
         changed
+    }
+
+    /// Stops taking new leases while `stall`, the node's memory stall time as a
+    /// percentage ([`crate::pressure::watch`]), is above `above` and a lease runs: the
+    /// Hello says [`NodePhase::MemoryPressure`] then, and resends when it changes (see
+    /// [`crate::pressure`]). Leases already running are not touched. A runtime's own
+    /// phase (a session switch, a quarantine) takes the place of this one.
+    #[must_use]
+    pub fn with_memory_backstop(mut self, stall: watch::Receiver<Option<f64>>, above: f64) -> Self {
+        self.pressure = Some(Backstop {
+            stall,
+            above,
+            paused: false,
+        });
+        self.take_pressure();
+        self
+    }
+
+    /// The phase every Hello carries: the runtime's, or memory pressure in place of
+    /// serving while the backstop has the node paused.
+    fn phase(&self) -> NodePhase {
+        match &self.pressure {
+            Some(backstop) if backstop.paused && self.phase_now == NodePhase::Serving => {
+                NodePhase::MemoryPressure
+            }
+            _ => self.phase_now.clone(),
+        }
+    }
+
+    /// Takes the newest pressure reading and the number of leases running; returns
+    /// whether the phase a Hello carries changed.
+    fn take_pressure(&mut self) -> bool {
+        let leases = self.leases.running().len();
+        let before = self.phase();
+        let Some(backstop) = &mut self.pressure else {
+            return false;
+        };
+        let stall = *backstop.stall.borrow_and_update();
+        backstop.paused = pressure::paused(stall, backstop.above, leases);
+        self.phase() != before
     }
 
     /// Lists `images` in every `NodeStatus`, sorted and each once: the container
@@ -511,6 +566,7 @@ impl Daemon {
         // A change that arrived while no stream was up.
         self.take_driver_report();
         self.take_phase();
+        self.take_pressure();
         let hello_sent = self.clock.now();
         send(&tx, daemon_message::Message::Hello(self.hello()));
         self.emit(Event::HelloSent);
@@ -567,6 +623,7 @@ impl Daemon {
                 () = sleep(wait) => Wake::Recheck,
                 Some(()) = driver_changed(self.driver.as_mut()) => Wake::Driver,
                 Some(()) = phase_changed(self.phase.as_mut()) => Wake::Phase,
+                Some(()) = pressure_changed(self.pressure.as_mut()) => Wake::Pressure,
             };
             // First, whatever woke the loop: the clock may have jumped over a suspend.
             self.recheck();
@@ -600,10 +657,16 @@ impl Daemon {
                 }
                 Wake::Phase => {
                     if self.take_phase() {
-                        tracing::info!(phase = self.phase_now.name(), "node phase changed");
+                        tracing::info!(phase = self.phase().name(), "node phase changed");
                         send(&tx, daemon_message::Message::Hello(self.hello()));
                     }
                 }
+                Wake::Pressure => {}
+            }
+            // Whatever woke the loop, leases may have started or ended.
+            if self.take_pressure() {
+                tracing::info!(phase = self.phase().name(), "node phase changed");
+                send(&tx, daemon_message::Message::Hello(self.hello()));
             }
         }
     }
@@ -865,7 +928,7 @@ impl Daemon {
             capabilities: self.report.capabilities().to_vec(),
             report_hash: self.report.hash().to_vec(),
             instance_id: self.instance.clone(),
-            phase: wire_phase(&self.phase_now),
+            phase: wire_phase(&self.phase()),
             predecessor_instance_id: self.predecessor.clone(),
         }
     }
@@ -928,6 +991,12 @@ async fn phase_changed(phase: Option<&mut watch::Receiver<NodePhase>>) -> Option
     phase?.changed().await.ok()
 }
 
+/// Completes when the memory backstop has a reading the daemon has not taken; never
+/// without one.
+async fn pressure_changed(backstop: Option<&mut Backstop>) -> Option<()> {
+    backstop?.stall.changed().await.ok()
+}
+
 /// `phase` as Hello carries it: absent for serving, as a daemon that predates the
 /// field sends it.
 fn wire_phase(phase: &NodePhase) -> Option<worker::NodePhase> {
@@ -936,6 +1005,7 @@ fn wire_phase(phase: &NodePhase) -> Option<worker::NodePhase> {
         NodePhase::Preparing(lease) => (Phase::Preparing, Some(*lease), ""),
         NodePhase::Restoring(lease) => (Phase::Restoring, Some(*lease), ""),
         NodePhase::Quarantined(reason) => (Phase::Quarantined, None, reason.as_str()),
+        NodePhase::MemoryPressure => (Phase::MemoryPressure, None, ""),
     };
     Some(worker::NodePhase {
         phase: state.into(),

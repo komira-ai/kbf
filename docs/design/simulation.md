@@ -32,7 +32,7 @@ long).
 
 What the existing sims do not cover:
 
-- **Contention.** Every request is one core and 1 GiB at QoS `ci`, on workers that are
+- **Contention.** Every request is one core and 4 GiB at QoS `ci`, on workers that are
   rarely full. Nothing checks QoS order, multi-axis packing, GPUs, the 256-grant round
   limit, dedup joins, QoS promotion or capacity changes under load.
 - **The daemon's rules.** The `sim_cell` worker has no `Start` window (W), handles no
@@ -57,7 +57,7 @@ carry it out:
 | Commit before `Start`; one accepted result per operation, by the newest committed grant in log order | `scheduler.rs` (`lease_committed`, `report`, `result_committed`) | yes |
 | First fit: queue order, then the first live worker in name order whose caps satisfy the platform and whose free room fits CPU, memory and whole GPUs | `servable.rs` (`fit`) | yes |
 | At most `PLACEMENT_ROUND` = 256 grants per tick | `scheduler.rs` (`place`) | yes |
-| Request sizes: one core and 1 GiB, or `kbf-book-cpus` / `kbf-book-mem-gib`, plus `gpu` | `kbf-front/src/execution.rs` (the scheduler sees `Resources`) | sizes yes; parsing is the front's tests |
+| Request sizes: one core and 4 GiB, or `kbf-book-cpus` / `kbf-book-mem-gib`, plus `gpu` | `kbf-front/src/execution.rs` (the scheduler sees `Resources`) | sizes yes; parsing is the front's tests |
 | QoS order: urgency, then submission order; a more urgent joiner promotes | `scheduler.rs` (`queue`, `submit`) | yes |
 | In-flight dedup by instance and action digest; only hermetic, cacheable requests join | `input.rs` (`joinable`), `scheduler.rs` (`submit`) | yes |
 | Unservable wait: a reason via `Waiting`, refusal after `UNSERVABLE_WAIT` (300 s) of an unbroken run, committed before callers are answered | `scheduler.rs` (`note`, `refusal_committed`), `servable.rs` (`verdict`) | yes |

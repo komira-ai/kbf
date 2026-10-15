@@ -366,6 +366,51 @@ fn thread_flags_size_the_runtime_and_are_logged() {
     );
 }
 
+/// The memory backstop is on where the kernel reports memory pressure and off, said
+/// so, where it does not (`--psi-memory-file`, which names the file for tests).
+///
+/// Catches: a backstop that never starts (a node under pressure takes leases without
+/// end), one that starts without a readable file (a node on a kernel or a Mac without
+/// pressure stall information would be paused or stop), and the threshold flag not
+/// reaching it.
+#[test]
+fn the_memory_backstop_is_on_only_with_a_readable_pressure_file() {
+    let dir = tls("psi");
+    let file = dir.join("memory.pressure");
+    std::fs::write(&file, "some avg10=0.00 avg60=0.00 avg300=0.00 total=0\n").expect("write");
+    let on = [
+        "--driver=fake".to_owned(),
+        format!("--psi-memory-file={}", file.display()),
+        "--memory-pressure-pause-percent=7.5".to_owned(),
+    ];
+    let (status, log) = runs_until_sigterm_logged("psi", &on, None);
+    assert!(status.success(), "{status}");
+    assert!(
+        log.iter()
+            .any(|l| l.contains("memory backstop: on") && l.contains("above_percent=7.5")),
+        "{log:#?}"
+    );
+    assert!(
+        log.iter().all(|l| !l.contains("memory backstop: off")),
+        "{log:#?}"
+    );
+
+    let off = [
+        "--driver=fake".to_owned(),
+        format!("--psi-memory-file={}", dir.join("missing").display()),
+    ];
+    let (status, log) = runs_until_sigterm_logged("psi", &off, None);
+    assert!(status.success(), "{status}");
+    assert!(
+        log.iter().any(|l| l.contains("memory backstop: off")),
+        "{log:#?}"
+    );
+    assert!(
+        log.iter().all(|l| !l.contains("memory backstop: on")),
+        "{log:#?}"
+    );
+}
+
 /// A reserve that leaves the daemon no CPU, or is more than the machine has, stops the
 /// start with a message naming the flag and the CPUs; a negative one is a usage error.
 ///

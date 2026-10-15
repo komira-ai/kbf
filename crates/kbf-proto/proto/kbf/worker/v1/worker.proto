@@ -138,6 +138,13 @@ enum Phase {
   // A cleanup failed (`reason` says which): the node takes no lease until an
   // operator repairs it. The server lists it for attention.
   PHASE_QUARANTINED = 3;
+  // The node's memory is under pressure (the kernel's memory stall time is above the
+  // daemon's `--memory-pressure-pause-percent`) and it holds leases: it takes no new
+  // lease until the pressure falls, and keeps the ones it runs. The daemon says it
+  // only while it holds a lease, and resends Hello with PHASE_SERVING when the pressure
+  // falls or its last lease ends. A server that does not know this value reads it as a
+  // quarantine, which also takes no lease.
+  PHASE_MEMORY_PRESSURE = 4;
 }
 
 message NodePhase {

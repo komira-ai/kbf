@@ -24,7 +24,7 @@ use crate::fence::{HANDOVER_GRACE, LEASE_GRACE};
 use crate::input::{DaemonInstance, Event, Input, Request};
 use crate::requeue::{Requeue, RequeueReason};
 use crate::servable::{Servable, Verdict};
-use memory::MemoryState;
+use memory::{MemoryLadder, MemoryState};
 
 /// At most this many leases are granted per [`Event::Tick`] (one log flush per round).
 pub const PLACEMENT_ROUND: usize = 256;
@@ -232,6 +232,8 @@ pub struct Scheduler {
     /// kills ([`memory`]). Boxed: most schedulers hold none, and the scheduler is
     /// moved by value.
     memory: Box<MemoryState>,
+    /// The rungs of an action's memory booking ([`memory`]).
+    ladder: MemoryLadder,
 }
 
 impl Scheduler {
@@ -255,6 +257,7 @@ impl Scheduler {
             requeues: None,
             reservations: BTreeMap::new(),
             memory: Box::default(),
+            ladder: MemoryLadder::default(),
         }
     }
 

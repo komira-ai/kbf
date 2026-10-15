@@ -5,25 +5,30 @@
 //! Two kills, told apart by the worker's report and handled apart:
 //!
 //! - **The action passed its own limit** ([`Failure::OutOfMemory`]). The operation runs
-//!   again with its memory booking doubled, rounded up to whole GiB, and never past the
-//!   **cap**: the memory of the largest node that could run it (one that is live,
-//!   cordoned or not, serves its lease kind, satisfies its platform and holds its CPU
-//!   and GPU request; the node the killed run used always counts). A doubling past the
-//!   cap books the cap. A kill of a run that booked the cap finishes the operation with
-//!   [`Failure::OutOfMemory`]: the action needs more memory than any node offers. Each
-//!   raised booking is kept as the action key's memory floor, and a later submission
-//!   of that key books at least the floor.
+//!   again on the next rung of a fixed [`MemoryLadder`] (4, 16, 32 GiB by default), and
+//!   after the last rung on a whole host. The first booking is the front's: the first
+//!   rung for an action that names no size, else the size it names, and then the
+//!   ladder climbs from there. A kill books the first rung above what the killed run
+//!   booked, unless that rung is not below the **cap**, the memory of the largest node
+//!   that could run it (one that is live, cordoned or not, serves its lease kind,
+//!   satisfies its platform and holds its CPU and GPU request; the node the killed run
+//!   used always counts): then it books the cap, a whole host, with all its memory
+//!   booked no other lease fits on the node. A kill of a run that booked the cap
+//!   finishes the operation with [`Failure::OutOfMemory`]: the action needs more memory
+//!   than any node offers. Each raised booking is kept as the action key's memory
+//!   floor, and a later submission of that key books at least the floor, so a
+//!   known-big action starts at the rung that ran it.
 //! - **The node killed it under pressure** ([`Failure::NodeMemoryPressure`]): a node-wide
 //!   kill of a lease that never reached its own limit. The node's memory-pressure count
 //!   goes up and the operation runs again with the same booking, preferring another
 //!   node, as a farm fault (`super::fault`); it never raises the booking or the floor.
 //!
 //! **The two budgets.** A rung of the ladder is not a farm rerun, and a farm rerun is
-//! not a rung: the ladder is bounded by itself (from booking `b` to cap `c`, at most
-//! ceil(log2(c / b)) reruns), and farm faults (busy-node kills and lost runs together)
-//! by [`FARM_RERUNS`]. Neither uses the other's count, so a long ladder never leaves a
+//! not a rung: the ladder is bounded by itself (at most one rerun per rung above the
+//! first booking, and one for the whole host), and farm faults (busy-node kills and
+//! lost runs together) by [`FARM_RERUNS`]. Neither uses the other's count, so a long ladder never leaves a
 //! busy-node kill without its reruns, and farm faults never cut a ladder short of the
-//! cap. An operation therefore runs at most `1 + ceil(log2(c / b)) + FARM_RERUNS`
+//! cap. An operation therefore runs at most `1 + rungs + 1 + FARM_RERUNS`
 //! times. Leases given up for silence, replacement without proof, reconnection or not
 //! starting use neither.
 //!
@@ -47,7 +52,7 @@ use crate::input::Request;
 use crate::requeue::RequeueReason;
 use crate::servable::serves;
 
-/// One GiB, the step a raised booking is rounded up to.
+/// One GiB, the unit of a rung and of a booking that names a size.
 pub const GIB: u64 = 1 << 30;
 
 /// How many times an operation runs again after runs that ended as the farm's fault
@@ -59,16 +64,105 @@ pub const FARM_RERUNS: u32 = 2;
 /// The most memory floors a scheduler keeps; the default of [`Scheduler::new`].
 pub const MEMORY_FLOORS: usize = 65_536;
 
-/// The booking after a run that booked `booked` bytes passed its own limit, when the
-/// largest node that could run it has `cap`: twice `booked` (at least 1 GiB), rounded
-/// up to whole GiB, and at most `cap`. `None` when `booked` is already the cap or more:
-/// no node could give it more.
-#[must_use]
-pub fn raised(booked: u64, cap: u64) -> Option<u64> {
-    (booked < cap).then(|| {
-        let doubled = booked.saturating_mul(2).max(GIB);
-        doubled.div_ceil(GIB).saturating_mul(GIB).min(cap)
-    })
+/// The fixed memory rungs of an action: what an unsized action books first (the front
+/// books it), and the bookings it climbs through each time it passes its own memory
+/// limit, before a whole host (the cap of [`MemoryLadder::raised`]). A rung is a whole
+/// number of GiB; the rungs ascend.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MemoryLadder {
+    rungs: Vec<u64>,
+}
+
+/// Why a list of rungs is not a [`MemoryLadder`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LadderError {
+    /// No rung: an unsized action would book nothing.
+    Empty,
+    /// A rung of 0 GiB.
+    Zero,
+    /// A rung that does not rise above the one before it (equal or lower).
+    NotAscending {
+        /// The rung's position in the list, from 0.
+        at: usize,
+    },
+    /// A rung too large to count in bytes.
+    TooLarge {
+        /// The rung's position in the list, from 0.
+        at: usize,
+    },
+}
+
+impl std::fmt::Display for LadderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Empty => f.write_str("a memory ladder needs at least one rung"),
+            Self::Zero => f.write_str("a memory rung must be at least 1 GiB"),
+            Self::NotAscending { at } => {
+                write!(f, "memory rung {at} does not rise above the one before it")
+            }
+            Self::TooLarge { at } => write!(f, "memory rung {at} is too large to book"),
+        }
+    }
+}
+
+impl std::error::Error for LadderError {}
+
+impl MemoryLadder {
+    /// The default rungs, in GiB: an unsized action books 4, then 16, then 32, then a
+    /// whole host.
+    pub const DEFAULT_GIB: [u64; 3] = [4, 16, 32];
+
+    /// The ladder of `gib` rungs, each in GiB.
+    ///
+    /// # Errors
+    /// `gib` is empty, holds a 0, does not ascend strictly, or holds a rung that
+    /// overflows a count of bytes.
+    pub fn from_gib(gib: &[u64]) -> Result<Self, LadderError> {
+        if gib.is_empty() {
+            return Err(LadderError::Empty);
+        }
+        let mut rungs: Vec<u64> = Vec::with_capacity(gib.len());
+        for (at, &n) in gib.iter().enumerate() {
+            if n == 0 {
+                return Err(LadderError::Zero);
+            }
+            let bytes = n.checked_mul(GIB).ok_or(LadderError::TooLarge { at })?;
+            if rungs.last().is_some_and(|&last| bytes <= last) {
+                return Err(LadderError::NotAscending { at });
+            }
+            rungs.push(bytes);
+        }
+        Ok(Self { rungs })
+    }
+
+    /// The booking of an action that names no size, in bytes: the first rung.
+    #[must_use]
+    pub fn first(&self) -> u64 {
+        self.rungs[0]
+    }
+
+    /// The booking after a run that booked `booked` bytes passed its own limit, when
+    /// the largest node that could run it has `cap`: the first rung above `booked` and
+    /// below `cap`, else `cap` (a whole host). `None` when `booked` is already the cap
+    /// or more: no node could give it more.
+    #[must_use]
+    pub fn raised(&self, booked: u64, cap: u64) -> Option<u64> {
+        (booked < cap).then(|| {
+            self.rungs
+                .iter()
+                .copied()
+                .find(|&rung| rung > booked && rung < cap)
+                .unwrap_or(cap)
+        })
+    }
+}
+
+impl Default for MemoryLadder {
+    fn default() -> Self {
+        Self {
+            rungs: Self::DEFAULT_GIB.iter().map(|n| n * GIB).collect(),
+        }
+    }
 }
 
 /// The memory state of one scheduler: its floors, with the order they were raised in,
@@ -172,6 +266,12 @@ impl Scheduler {
         self
     }
 
+    /// Climbs `ladder` after an own-limit kill, instead of [`MemoryLadder::default`].
+    /// Runs already booked keep their booking.
+    pub fn set_memory_ladder(&mut self, ladder: MemoryLadder) {
+        self.ladder = ladder;
+    }
+
     /// The memory floor of `key`, in bytes: the largest booking a run of it was raised
     /// to after it passed its own memory limit. A new submission of `key` books at
     /// least this much memory.
@@ -238,7 +338,7 @@ impl Scheduler {
             .map_or(op.request.resources.memory_bytes, |h| h.booked.memory_bytes);
         if failure == Failure::OutOfMemory {
             let cap = self.memory_cap(&op.request, &worker, booked);
-            let raised = raised(booked, cap);
+            let raised = self.ladder.raised(booked, cap);
             self.memory.ops.entry(id).or_default().runs.push(MemoryRun {
                 worker,
                 booked,
@@ -301,31 +401,76 @@ mod tests {
     use super::*;
     use crate::input::{DaemonInstance, Event, Input};
 
-    /// Catches a ladder that does not double (1 -> 3, or 1 -> 1), one that does not
-    /// round a fraction of a GiB up, one that passes the cap, and one that offers a rung
-    /// at or past the cap (a kill at the largest node would run again, unbounded).
+    /// Catches a ladder that skips a rung, climbs by doubling, passes the cap, books a
+    /// rung at or past the cap instead of the whole host (a node cannot give it), or
+    /// offers a rung at the cap (a kill at the largest node would run again).
     #[test]
-    fn the_ladder_doubles_in_whole_gib_up_to_the_cap() {
-        assert_eq!(raised(GIB, 64 * GIB), Some(2 * GIB));
-        assert_eq!(raised(2 * GIB, 64 * GIB), Some(4 * GIB));
-        assert_eq!(raised(4 * GIB, 64 * GIB), Some(8 * GIB));
-        assert_eq!(raised(GIB / 2, 64 * GIB), Some(GIB), "at least 1 GiB");
-        assert_eq!(raised(0, 64 * GIB), Some(GIB), "an unbooked run");
-        assert_eq!(raised(3 * GIB / 2, 64 * GIB), Some(3 * GIB));
-        assert_eq!(raised(GIB + 1, 64 * GIB), Some(3 * GIB), "rounded up");
-        assert_eq!(raised(40 * GIB, 64 * GIB), Some(64 * GIB), "the cap");
+    fn the_ladder_climbs_its_rungs_then_books_the_whole_host() {
+        let ladder = MemoryLadder::default();
+        let cap = 64 * GIB;
+        assert_eq!(ladder.first(), 4 * GIB);
+        assert_eq!(ladder.raised(4 * GIB, cap), Some(16 * GIB));
+        assert_eq!(ladder.raised(16 * GIB, cap), Some(32 * GIB));
+        assert_eq!(ladder.raised(32 * GIB, cap), Some(cap), "the whole host");
+        assert_eq!(ladder.raised(cap, cap), None, "killed at the cap");
+        assert_eq!(ladder.raised(65 * GIB, cap), None, "past the cap");
+        // A size the platform named climbs from where it is.
+        assert_eq!(ladder.raised(GIB, cap), Some(4 * GIB));
+        assert_eq!(ladder.raised(5 * GIB, cap), Some(16 * GIB));
+        assert_eq!(ladder.raised(16 * GIB + 1, cap), Some(32 * GIB));
+        assert_eq!(ladder.raised(0, cap), Some(4 * GIB));
+        // A rung not below the largest node skips to the whole host.
+        assert_eq!(ladder.raised(4 * GIB, 16 * GIB), Some(16 * GIB));
+        assert_eq!(ladder.raised(4 * GIB, 10 * GIB), Some(10 * GIB));
+        assert_eq!(ladder.raised(4 * GIB, 5 * GIB), Some(5 * GIB));
+        assert_eq!(ladder.raised(16 * GIB, 24 * GIB), Some(24 * GIB));
+        assert_eq!(ladder.raised(32 * GIB, 32 * GIB + 1), Some(32 * GIB + 1));
+    }
+
+    /// Catches a default that is not 4, 16, 32 GiB, and one that differs from what the
+    /// flag's default builds.
+    #[test]
+    fn the_default_ladder_is_4_16_32_gib() {
         assert_eq!(
-            raised(5 * GIB, 6 * GIB + 7),
-            Some(6 * GIB + 7),
-            "an odd cap"
+            MemoryLadder::default(),
+            MemoryLadder::from_gib(&[4, 16, 32]).unwrap()
         );
-        assert_eq!(raised(64 * GIB, 64 * GIB), None, "killed at the cap");
-        assert_eq!(raised(65 * GIB, 64 * GIB), None, "past the cap");
+        assert_eq!(MemoryLadder::DEFAULT_GIB, [4, 16, 32]);
+    }
+
+    /// Catches a ladder that accepts an empty list, a 0, a rung equal to or below the
+    /// one before it, or a rung that wraps in bytes; and one that refuses a good list.
+    #[test]
+    fn a_ladder_must_ascend_and_be_positive() {
+        assert_eq!(MemoryLadder::from_gib(&[]), Err(LadderError::Empty));
+        assert_eq!(MemoryLadder::from_gib(&[0, 4]), Err(LadderError::Zero));
+        assert_eq!(MemoryLadder::from_gib(&[4, 0]), Err(LadderError::Zero));
         assert_eq!(
-            raised(u64::MAX - 1, u64::MAX),
-            Some(u64::MAX),
-            "no overflow"
+            MemoryLadder::from_gib(&[4, 4]),
+            Err(LadderError::NotAscending { at: 1 })
         );
+        assert_eq!(
+            MemoryLadder::from_gib(&[4, 16, 8]),
+            Err(LadderError::NotAscending { at: 2 })
+        );
+        assert_eq!(
+            MemoryLadder::from_gib(&[4, 1 << 40]),
+            Err(LadderError::TooLarge { at: 1 })
+        );
+        assert!(MemoryLadder::from_gib(&[1]).is_ok(), "one rung is a ladder");
+        let two = MemoryLadder::from_gib(&[2, 8]).unwrap();
+        assert_eq!(
+            (two.first(), two.raised(2 * GIB, 64 * GIB)),
+            (2 * GIB, Some(8 * GIB))
+        );
+        for error in [
+            LadderError::Empty,
+            LadderError::Zero,
+            LadderError::NotAscending { at: 1 },
+            LadderError::TooLarge { at: 1 },
+        ] {
+            assert!(!error.to_string().is_empty());
+        }
     }
 
     fn key(n: u8) -> ActionKey {
@@ -622,7 +767,7 @@ mod tests {
 
     /// (c) Catches the order floors were raised in left out of the memory state's
     /// equality: with 2 floors kept, raising those of actions 1, 2, 3 or of 1, 3, 2
-    /// keeps the same floors (2 and 3, at 2 GiB) with the same runs, and differs only
+    /// keeps the same floors (2 and 3, at 4 GiB) with the same runs, and differs only
     /// in which of them is forgotten next. A fourth raise then keeps a different pair.
     #[test]
     fn sequences_that_differ_only_in_raise_order_past_the_bound_are_unequal() {
@@ -640,7 +785,7 @@ mod tests {
         for n in 1..=3 {
             let floor = first.s.memory_floor(&key(n));
             assert_eq!(floor, second.s.memory_floor(&key(n)), "action {n}");
-            assert_eq!(floor, (n > 1).then_some(2 * GIB), "action {n}");
+            assert_eq!(floor, (n > 1).then_some(4 * GIB), "action {n}");
         }
         assert_eq!(first.s.memory_state().ops, second.s.memory_state().ops);
         assert_ne!(first.s.memory_state(), second.s.memory_state());
@@ -649,8 +794,8 @@ mod tests {
             sim.end(4, OOM);
         }
         assert_eq!(first.s.memory_floor(&key(2)), None);
-        assert_eq!(first.s.memory_floor(&key(3)), Some(2 * GIB));
-        assert_eq!(second.s.memory_floor(&key(2)), Some(2 * GIB));
+        assert_eq!(first.s.memory_floor(&key(3)), Some(4 * GIB));
+        assert_eq!(second.s.memory_floor(&key(2)), Some(4 * GIB));
         assert_eq!(second.s.memory_floor(&key(3)), None);
     }
 }

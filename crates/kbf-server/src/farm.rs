@@ -46,7 +46,7 @@ use kbf_proto::worker::{
     self, LeaseOffer, NodeStatus, ResultAck, ServerMessage, Start, server_message,
 };
 use kbf_sched::fence::START_VALIDITY;
-use kbf_sched::{Cordon, DaemonInstance, Event, Input, OpState, Requeue, Scheduler};
+use kbf_sched::{Cordon, DaemonInstance, Event, Input, MemoryLadder, OpState, Requeue, Scheduler};
 use kbf_types::{
     Answer, ControlRecord, Digest, Effect, Failure, FarmTime, LeaseGrant, LeaseId, OperationId,
     Outcome, Refusal, StartLease, StateMachine, WaiterId, Waiting, WorkerId,
@@ -245,6 +245,15 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
                 recorded: BTreeSet::new(),
             }),
         }
+    }
+
+    /// This farm, whose scheduler climbs `ladder` for an action that passes its memory limit
+    /// (instead of [`kbf_sched::MemoryLadder::default`]).
+    #[must_use]
+    pub fn with_memory_ladder(mut self, ladder: MemoryLadder) -> Self {
+        let state = self.state.get_mut().unwrap_or_else(PoisonError::into_inner);
+        state.sched.set_memory_ladder(ladder);
+        self
     }
 
     /// This farm, each Execute's queued or joined answer, each lease granted, started

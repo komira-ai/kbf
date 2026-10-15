@@ -2,6 +2,7 @@
 //! which workers may run the action, and every property name in any case.
 
 use kbf_front::{BOOK_CPUS_KEY, BOOK_MEM_GIB_KEY, GPU_KEY};
+use kbf_types::Resources;
 
 use super::*;
 
@@ -139,14 +140,14 @@ async fn the_booking_comes_from_the_platform() {
             6_000,
             17 << 30,
         ),
-        ("cpus only", vec![(BOOK_CPUS_KEY, "4")], 4_000, 1 << 30),
+        ("cpus only", vec![(BOOK_CPUS_KEY, "4")], 4_000, 4 << 30),
         (
             "memory only",
             vec![("KBF-Book-Mem-GiB", "8")],
             1_000,
             8 << 30,
         ),
-        ("neither", vec![("kbf-lease", "action")], 1_000, 1 << 30),
+        ("neither", vec![("kbf-lease", "action")], 1_000, 4 << 30),
     ];
     for (argv, props, _, _) in &cases {
         let job = job(argv, props, false);
@@ -297,7 +298,10 @@ async fn property_names_are_read_in_any_case() {
     let [submitted] = script.submitted().try_into().expect("one submission");
     let want = kbf_caps::Request::parse([("os", "linux"), ("arch", "arm64")]).unwrap();
     assert_eq!(submitted.request.needs, want);
-    assert_eq!(submitted.request.resources, DEFAULT_RESOURCES.with_gpus(1));
+    assert_eq!(
+        submitted.request.resources,
+        Resources::new(1_000, 1 << 30).with_gpus(1)
+    );
     assert_eq!(submitted.request.kind, LeaseKind::WholeMachine);
 
     for props in [
@@ -426,6 +430,52 @@ async fn a_gpu_on_macos_is_the_whole_macs() {
     assert_eq!(submitted.len(), 2);
     for s in &submitted {
         assert_eq!(s.request.kind, LeaseKind::WholeMachine);
-        assert_eq!(s.request.resources, DEFAULT_RESOURCES);
+        assert_eq!(
+            s.request.resources,
+            Resources::new(1_000, 1 << 30),
+            "a whole_machine lease's least worker is not the action default"
+        );
     }
+}
+
+/// Catches: an action that names no memory size booking anything but 4 GiB (the first
+/// rung of the default ladder); a named size replaced by the default; and a
+/// `whole_machine` lease, which books the whole worker, asking for the 4 GiB a worker
+/// smaller than that could never give.
+#[tokio::test]
+async fn an_action_that_names_no_memory_books_the_first_rung() {
+    let script = Arc::new(Script::default());
+    let farm = Farm::with_execution(Arc::clone(&script)).await;
+    let unsized_ = job("unsized", &[], false);
+    let named = job("named", &[(BOOK_MEM_GIB_KEY, "1")], false);
+    let whole = job("whole", &[("kbf-lease", "whole_machine")], false);
+    for j in [&unsized_, &named, &whole] {
+        farm.upload(&j.blobs.iter().collect::<Vec<_>>()).await;
+        start(&farm, &j.action).await.expect("Execute");
+    }
+    let submitted = script.submitted();
+    assert_eq!(submitted[0].request.resources.memory_bytes, 4 << 30);
+    assert_eq!(submitted[0].request.resources.cpu_millis, 1_000);
+    assert_eq!(submitted[1].request.resources.memory_bytes, 1 << 30);
+    assert_eq!(submitted[2].request.resources.memory_bytes, 1 << 30);
+}
+
+/// Catches a first rung that never reaches the service (the server's
+/// `--memory-ladder-gib` ignored): with 2 GiB set, an unsized action books 2 GiB, a
+/// named size still books as named, and a `whole_machine` lease is untouched.
+#[tokio::test]
+async fn the_default_memory_is_the_one_the_service_is_given() {
+    let script = Arc::new(Script::default());
+    let farm = Farm::with_default_memory(Arc::clone(&script), 2 << 30).await;
+    let unsized_ = job("unsized", &[], false);
+    let named = job("named", &[(BOOK_MEM_GIB_KEY, "8")], false);
+    let whole = job("whole", &[("kbf-lease", "whole_machine")], false);
+    for j in [&unsized_, &named, &whole] {
+        farm.upload(&j.blobs.iter().collect::<Vec<_>>()).await;
+        start(&farm, &j.action).await.expect("Execute");
+    }
+    let submitted = script.submitted();
+    assert_eq!(submitted[0].request.resources.memory_bytes, 2 << 30);
+    assert_eq!(submitted[1].request.resources.memory_bytes, 8 << 30);
+    assert_eq!(submitted[2].request.resources.memory_bytes, 1 << 30);
 }

@@ -80,7 +80,8 @@ async fn execute_runs_on_a_daemon_and_caches_the_result() {
         (start.millicpus, start.memory_bytes),
         (
             kbf_front::DEFAULT_RESOURCES.cpu_millis,
-            kbf_front::DEFAULT_RESOURCES.memory_bytes
+            // The cell's first rung (`support::small_ladder`).
+            1 << 30
         )
     );
 

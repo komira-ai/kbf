@@ -151,6 +151,17 @@ struct Cli {
     /// moved out of it.
     #[arg(long, default_value_t = 25)]
     lease_swap_kill_percent: u64,
+    /// The daemon takes no new lease while the node's memory stall time (the `some`
+    /// line's `avg10` in `/proc/pressure/memory`, as a percentage) is above this and
+    /// it runs a lease: it says so to the server, which places nothing on it until the
+    /// stall falls, and the leases it runs go on. With no lease it serves whatever the
+    /// stall, so it is never left idle for good. Off where the kernel reports no
+    /// pressure stall information (macOS, a kernel built without it).
+    #[arg(long, default_value_t = 10.0, value_parser = percent)]
+    memory_pressure_pause_percent: f64,
+    /// Where the kernel reports memory pressure stall information. For tests only.
+    #[arg(long, hide = true, default_value = kbf_daemon::pressure::MEMORY_PSI)]
+    psi_memory_file: PathBuf,
     /// How often each lease's `max` events and swap are sampled, in milliseconds
     /// (container).
     #[arg(long, default_value_t = 1000, value_parser = clap::value_parser!(u64).range(1..))]
@@ -312,7 +323,48 @@ fn start(cli: &Cli) -> Result<(), Error> {
     // The CAS channel is made lazily, which needs the runtime's context.
     let _context = tokio.enter();
     let (daemon, _) = node(cli, || native_config(cli), Path::new(xcode::XCRUN))?;
+    let daemon = match memory_stall(cli) {
+        Some(stall) => {
+            tracing::info!(
+                above_percent = cli.memory_pressure_pause_percent,
+                "memory backstop: on"
+            );
+            daemon.with_memory_backstop(stall, cli.memory_pressure_pause_percent)
+        }
+        None => daemon,
+    };
     serve(&tokio, daemon)
+}
+
+/// A percentage above 0 and at most 100, for `--memory-pressure-pause-percent`.
+fn percent(text: &str) -> Result<f64, String> {
+    let value: f64 = text
+        .parse()
+        .map_err(|e| format!("{text:?} is not a number: {e}"))?;
+    if value > 0.0 && value <= 100.0 {
+        Ok(value)
+    } else {
+        Err(format!("{text} is not above 0 and at most 100"))
+    }
+}
+
+/// The node's memory stall time, sampled every [`kbf_daemon::pressure::SAMPLE_EVERY`]
+/// from the file `--psi-memory-file` names; `None` (the backstop off, logged) when the
+/// file cannot be read now, as on a kernel without pressure stall information. Needs a
+/// tokio runtime's context.
+fn memory_stall(cli: &Cli) -> Option<tokio::sync::watch::Receiver<Option<f64>>> {
+    let stall = kbf_daemon::pressure::watch(
+        cli.psi_memory_file.clone(),
+        kbf_daemon::pressure::SAMPLE_EVERY,
+    );
+    if stall.borrow().is_none() {
+        tracing::info!(
+            file = %cli.psi_memory_file.display(),
+            "memory backstop: off: the file cannot be read"
+        );
+        return None;
+    }
+    Some(stall)
 }
 
 /// The drivers `--driver` names, each once: the node's own (native or container)
@@ -796,6 +848,46 @@ mod tests {
         let missing = parse(&["--driver=native"]).expect("flags");
         assert!(native_config(&missing).is_err());
         assert_eq!(native_config(&defaults).expect("config").pool, None);
+    }
+
+    /// Catches: a default other than 10 percent, a value that does not reach the
+    /// field, and a threshold the daemon cannot use accepted (0 or less pauses a node
+    /// on any stall at all or never; over 100 never pauses; a word or NaN is no
+    /// percentage).
+    #[test]
+    fn the_memory_pressure_threshold_is_a_percentage() {
+        let pause = |args: &[&str]| parse(args).map(|cli| cli.memory_pressure_pause_percent);
+        assert_eq!(pause(&["--driver=fake"]).expect("flags"), 10.0);
+        assert_eq!(
+            pause(&["--driver=fake", "--memory-pressure-pause-percent=2.5"]).expect("flags"),
+            2.5
+        );
+        assert_eq!(
+            pause(&["--driver=fake", "--memory-pressure-pause-percent=100"]).expect("flags"),
+            100.0
+        );
+        for bad in ["0", "-1", "100.5", "lots", "NaN", ""] {
+            let flag = format!("--memory-pressure-pause-percent={bad}");
+            assert!(pause(&["--driver=fake", &flag]).is_err(), "{bad:?} parsed");
+        }
+    }
+
+    /// Catches a backstop that is on without a readable pressure file (a node with no
+    /// pressure stall information would be paused or crash), and one that is off with
+    /// one (a Linux node would never stop taking leases).
+    #[tokio::test]
+    async fn the_backstop_is_on_only_where_the_kernel_reports_pressure() {
+        let dir = scratch("psi");
+        let file = dir.join("memory");
+        std::fs::write(&file, "some avg10=1.50 avg60=0.00 avg300=0.00 total=1\n").expect("write");
+        let flag = format!("--psi-memory-file={}", file.display());
+        let on = parse(&["--driver=fake", &flag]).expect("flags");
+        let stall = memory_stall(&on).expect("a readable file turns it on");
+        assert_eq!(*stall.borrow(), Some(1.5));
+        let missing = dir.join("missing");
+        let flag = format!("--psi-memory-file={}", missing.display());
+        let off = parse(&["--driver=fake", &flag]).expect("flags");
+        assert!(memory_stall(&off).is_none());
     }
 
     /// Catches pool flags that do not reach the driver (a root daemon would refuse to

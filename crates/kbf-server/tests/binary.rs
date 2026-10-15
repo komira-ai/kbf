@@ -908,6 +908,57 @@ fn the_unservable_wait_comes_from_its_flag() {
     );
 }
 
+/// Catches: `--memory-ladder-gib` not parsed into the listeners' ladder (a farm that
+/// ignores it books 4 GiB whatever the operator set), a default other than 4, 16 and
+/// 32 GiB, a comma that does not separate rungs, and a ladder that is not ascending
+/// and positive accepted: an empty rung, a zero, a repeated or falling rung, one that
+/// overflows bytes, or a word.
+#[test]
+fn the_memory_ladder_comes_from_its_flag() {
+    use clap::Parser;
+    use kbf_server::{ConfigError, MemoryLadder};
+    let listeners = |args: &[&str]| {
+        kbf_server::Args::try_parse_from(std::iter::once("kbf-server").chain(args.iter().copied()))
+            .map(|args| args.listeners())
+    };
+    let ladder = |args: &[&str]| listeners(args).expect("flags parse").expect("listeners");
+    assert_eq!(
+        ladder(&[]).memory_ladder,
+        MemoryLadder::from_gib(&[4, 16, 32]).unwrap()
+    );
+    assert_eq!(
+        ladder(&["--memory-ladder-gib", "2,8"]).memory_ladder,
+        MemoryLadder::from_gib(&[2, 8]).unwrap()
+    );
+    assert_eq!(
+        ladder(&["--memory-ladder-gib=1"]).memory_ladder,
+        MemoryLadder::from_gib(&[1]).unwrap(),
+        "one rung, then a whole host"
+    );
+    for bad in ["0", "0,4", "4,4", "16,4", "4,16,16", "1099511627776"] {
+        let refused = listeners(&["--memory-ladder-gib", bad])
+            .expect("the flag parses")
+            .err();
+        assert!(
+            matches!(refused, Some(ConfigError::MemoryLadder(_))),
+            "{bad}: {refused:?}"
+        );
+    }
+    for bad in ["", "4,", "four", "-4", "4,,8"] {
+        assert!(
+            listeners(&["--memory-ladder-gib", bad]).is_err(),
+            "{bad:?} parsed"
+        );
+    }
+    let error = listeners(&["--memory-ladder-gib", "4,4"])
+        .expect("parses")
+        .expect_err("refused");
+    assert_eq!(
+        error.to_string(),
+        "--memory-ladder-gib: memory rung 1 does not rise above the one before it"
+    );
+}
+
 /// Catches: `--finished-retention-secs` parsed but not handed to the scheduler, a
 /// default other than the scheduler's, and a zero refused (it keeps nothing).
 #[test]
