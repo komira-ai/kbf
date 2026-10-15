@@ -1,0 +1,337 @@
+//! Unit tests of the OCI backend's start-up checks, helper jobs and image store sweep:
+//! what needs no `crun` (`/usr/bin/true` and `/usr/bin/false` stand in where a program
+//! only has to exit 0 or 1). What a lease does with a runtime is `tests/fake_oci.rs`'s.
+
+use std::os::unix::fs::PermissionsExt as _;
+use std::path::PathBuf;
+
+use serde_json::json;
+
+use super::*;
+use crate::subids::IdFiles;
+
+fn scratch(name: &str) -> PathBuf {
+    let dir = std::env::current_exe()
+        .expect("test binary")
+        .parent()
+        .expect("deps directory")
+        .join("kbf-driver-container-unit")
+        .join(format!("oci-{name}-{}", std::process::id()));
+    let _ = crate::remove::remove_tree(&dir);
+    std::fs::create_dir_all(&dir).expect("scratch");
+    dir
+}
+
+/// A configuration whose runtime exits `ok` (0 or 1) whatever it is asked, with ids in
+/// files under `dir`.
+fn config(dir: &Path, ok: bool) -> OciConfig {
+    let files = IdFiles::in_dir(&dir.join("ids"));
+    std::fs::create_dir_all(dir.join("ids")).expect("ids");
+    std::fs::write(&files.passwd, "root:x:0:0::/:/bin/sh\n").expect("passwd");
+    let uid = rustix::process::getuid().as_raw();
+    std::fs::write(&files.subuid, format!("{uid}:100000:65536\n")).expect("subuid");
+    std::fs::write(&files.subgid, format!("{uid}:200000:65536\n")).expect("subgid");
+    OciConfig {
+        runtime: PathBuf::from(if ok {
+            "/usr/bin/true"
+        } else {
+            "/usr/bin/false"
+        }),
+        daemon: std::env::current_exe().expect("test binary"),
+        id_files: files,
+        check_search: false,
+    }
+}
+
+fn podman() -> Podman {
+    Podman::new(PathBuf::from("/usr/bin/false"))
+}
+
+fn start(config: &OciConfig, scratch: &Path) -> Result<Arc<Oci>, OciError> {
+    Oci::on(config, scratch, podman(), "x86_64")
+}
+
+/// Catches an error that does not name the path it was about, and one that is lost.
+#[test]
+fn an_io_error_names_its_path() {
+    let missing = Path::new("/nonexistent-kbf/a");
+    let error = at(missing, std::fs::read(missing)).expect_err("absent");
+    let text = String::from(error);
+    assert!(text.starts_with("/nonexistent-kbf/a: "), "{text}");
+    assert_eq!(at(missing, Ok(7)).expect("passes"), 7);
+    assert_eq!(
+        String::from(JobError::from("crun said no".to_owned())),
+        "crun said no"
+    );
+}
+
+/// Catches a backend that starts on a node that cannot run it, and an error that does not
+/// say which check failed: an architecture with no seccomp profile, a missing runtime or
+/// daemon binary, a scratch directory or helper root that cannot be made, a closed
+/// ancestor of the scratch directory, and ids the node does not have.
+#[test]
+fn the_backend_refuses_a_node_that_cannot_run_it() {
+    let dir = scratch("refuses");
+    let good = config(&dir, true);
+    start(&good, &dir.join("scratch")).expect("a good node starts");
+
+    let refused = Oci::on(&good, &dir.join("s1"), podman(), "riscv64").err();
+    assert!(
+        matches!(refused, Some(OciError::Arch(ref a)) if a == "riscv64"),
+        "{refused:?}"
+    );
+
+    let mut absent = good.clone();
+    absent.runtime = dir.join("absent-crun");
+    let refused = start(&absent, &dir.join("s2")).err();
+    assert!(
+        matches!(refused, Some(OciError::NoRuntime(_))),
+        "{refused:?}"
+    );
+    let mut absent = good.clone();
+    absent.daemon = dir.join("absent-daemon");
+    let refused = start(&absent, &dir.join("s3")).err();
+    assert!(matches!(refused, Some(OciError::NoRuntime(ref p)) if p.ends_with("absent-daemon")));
+
+    std::fs::write(dir.join("a-file"), b"x").expect("file");
+    let refused = start(&good, &dir.join("a-file/scratch")).err();
+    assert!(matches!(refused, Some(OciError::Prepare(_))), "{refused:?}");
+
+    let scratch = dir.join("s4");
+    std::fs::create_dir_all(&scratch).expect("scratch");
+    std::fs::write(scratch.join("oci-helper"), b"in the way").expect("file");
+    let refused = start(&good, &scratch).err();
+    assert!(matches!(refused, Some(OciError::Prepare(ref why)) if why.contains("oci-helper")));
+
+    let closed = dir.join("closed");
+    std::fs::create_dir_all(closed.join("scratch")).expect("scratch");
+    std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+    let mut searching = good.clone();
+    searching.check_search = true;
+    let refused = start(&searching, &closed.join("scratch")).err();
+    assert!(
+        matches!(refused, Some(OciError::NotSearchable(ref p)) if p.ends_with("closed")),
+        "{refused:?}"
+    );
+    std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+    std::fs::write(&good.id_files.subuid, "").expect("empty");
+    let refused = start(&good, &dir.join("s5")).err();
+    assert!(matches!(refused, Some(OciError::Subids(_))), "{refused:?}");
+}
+
+/// Catches an unpack a killed daemon left being kept (a stage directory the container's
+/// ids own, a tar), a sweep that removes the images themselves or things that are not
+/// stages, one that hides a failure, and a start that goes on after one.
+#[test]
+fn the_start_removes_the_unpacks_a_killed_daemon_left() {
+    let dir = scratch("sweep");
+    let scratch = dir.join("scratch");
+    let images = scratch.join("oci-images");
+    // Nothing yet: the images directory does not exist.
+    start(&config(&dir, true), &scratch).expect("no images yet");
+    std::fs::create_dir_all(images.join(".stage-aa-1-0")).expect("stage");
+    std::fs::write(images.join(".stage-aa-1-0.tar"), b"tar").expect("tar");
+    std::fs::create_dir_all(images.join("bb/rootfs")).expect("an image");
+    std::fs::write(images.join("note"), b"x").expect("a file");
+    // `true` stands in for the helper that deletes what is in the stage.
+    start(&config(&dir, true), &scratch).expect("swept");
+    assert!(!images.join(".stage-aa-1-0").exists() && !images.join(".stage-aa-1-0.tar").exists());
+    assert!(images.join("bb/rootfs").is_dir() && images.join("note").is_file());
+
+    std::fs::create_dir_all(images.join(".stage-cc-1-1")).expect("stage");
+    let refused = start(&config(&dir, false), &scratch).err();
+    assert!(
+        matches!(refused, Some(OciError::Prepare(ref why)) if why.contains("a previous daemon left")),
+        "{refused:?}"
+    );
+    assert!(
+        images.join(".stage-cc-1-1").exists(),
+        "kept when it could not be removed"
+    );
+}
+
+/// Catches a helper root that is not idempotent (the second lease to prepare it fails on
+/// the links the first made), one that cannot say it failed, and links that do not lead
+/// into `/usr`.
+#[test]
+fn the_helper_root_is_made_once_and_again_without_error() {
+    let dir = scratch("rootfs").join("root");
+    helper::prepare_rootfs(&dir).expect("made");
+    helper::prepare_rootfs(&dir).expect("made again");
+    for (name, target) in [
+        ("bin", "usr/bin"),
+        ("sbin", "usr/sbin"),
+        ("lib", "usr/lib"),
+        ("lib64", "usr/lib64"),
+    ] {
+        assert_eq!(
+            std::fs::read_link(dir.join(name)).expect(name),
+            Path::new(target)
+        );
+    }
+    for point in ["dev", "usr", "etc", "kbf", "t/0", "t/7"] {
+        assert!(dir.join(point).is_dir(), "{point}");
+    }
+    assert!(dir.join("kbf/daemon").is_file() && dir.join("etc/ld.so.cache").is_file());
+
+    // A root that cannot be written to refuses, and says so.
+    let closed = scratch("rootfs-closed");
+    std::fs::create_dir_all(closed.join("root/dev")).expect("partly made");
+    for point in ["usr", "etc", "kbf"] {
+        std::fs::create_dir_all(closed.join("root").join(point)).expect("dir");
+    }
+    for i in 0..8 {
+        std::fs::create_dir_all(closed.join(format!("root/t/{i}"))).expect("dir");
+    }
+    for file in ["etc/ld.so.cache", "kbf/daemon"] {
+        std::fs::write(closed.join("root").join(file), b"").expect("file");
+    }
+    std::fs::set_permissions(closed.join("root"), std::fs::Permissions::from_mode(0o500))
+        .expect("chmod");
+    assert!(helper::prepare_rootfs(&closed.join("root")).is_err());
+    std::fs::set_permissions(closed.join("root"), std::fs::Permissions::from_mode(0o700))
+        .expect("chmod");
+    std::fs::write(closed.join("a-file"), b"x").expect("file");
+    assert!(helper::prepare_rootfs(&closed.join("a-file/root")).is_err());
+}
+
+/// Catches a helper's configuration running a shell, mapping the wrong namespace,
+/// binding the daemon without being asked to, or binding a directory read-write that
+/// the job does not write.
+#[test]
+fn a_helper_runs_one_program_in_the_namespace_it_is_given() {
+    let ids = DaemonIds {
+        uid: 990,
+        gid: 991,
+        sub_uid: 100_000,
+        sub_gid: 200_000,
+    };
+    let root = Path::new("/scratch/oci-helper");
+    let render = |mapping: Mapping, job: &helper::Job| -> serde_json::Value {
+        let config = helper::config(root, &ids, mapping, job).expect("config");
+        serde_json::to_value(config).expect("json")
+    };
+    let give = helper::give_job(
+        Path::new("/usr/local/bin/kbf-daemon"),
+        "1:1",
+        Some(Path::new("/scratch/l/root")),
+        &[Path::new("/scratch/l/upper"), Path::new("/scratch/l/work")],
+    );
+    assert_eq!(
+        give.args,
+        [
+            "/kbf/daemon",
+            "__chown-dirs",
+            "1:1",
+            "/t/0",
+            "--whole",
+            "/t/1",
+            "/t/2"
+        ]
+    );
+    let config = render(Mapping::Setup, &give);
+    assert_eq!(config["process"]["args"], json!(give.args));
+    assert_eq!(config["process"]["noNewPrivileges"], true);
+    let uids = &config["linux"]["uidMappings"];
+    assert_eq!(uids[0], json!({"containerID": 0, "hostID": 990, "size": 1}));
+    assert_eq!(
+        uids[1],
+        json!({"containerID": 1, "hostID": 100_000, "size": 65_536})
+    );
+    let sources: Vec<_> = config["mounts"]
+        .as_array()
+        .expect("mounts")
+        .iter()
+        .map(|m| {
+            (
+                m["destination"].as_str().unwrap().to_owned(),
+                m["options"][1].clone(),
+            )
+        })
+        .collect();
+    assert!(
+        sources.contains(&("/kbf/daemon".to_owned(), json!("ro"))),
+        "{sources:?}"
+    );
+    assert!(
+        sources.contains(&("/t/2".to_owned(), json!("rw"))),
+        "{sources:?}"
+    );
+    assert!(
+        sources.contains(&("/usr".to_owned(), json!("ro"))),
+        "{sources:?}"
+    );
+
+    // No cache: no directories-only tree; no daemon bind for a job that runs none.
+    let whole = helper::give_job(
+        Path::new("/d"),
+        "0:0",
+        None,
+        &[Path::new("/scratch/l/root")],
+    );
+    assert_eq!(whole.args[3], "-");
+    let remove = render(
+        Mapping::Action,
+        &helper::remove_job(Path::new("/scratch/l")),
+    );
+    assert_eq!(
+        remove["linux"]["uidMappings"],
+        json!([{"containerID": 0, "hostID": 100_000, "size": 65_536}])
+    );
+    assert!(
+        remove["mounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|m| m["destination"] != "/kbf/daemon")
+    );
+    assert_eq!(
+        remove["process"]["args"],
+        json!(["/usr/bin/find", "/t/0", "-mindepth", "1", "-delete"])
+    );
+    // Only the daemon's own binary and the node's tools are ever run.
+    let programs = [
+        "/kbf/daemon",
+        "/usr/bin/find",
+        "/usr/bin/mkdir",
+        "/usr/bin/tar",
+        "/usr/bin/touch",
+    ];
+    for argv in [&give.args, &whole.args] {
+        assert!(programs.contains(&argv[0].as_str()), "{argv:?}");
+    }
+}
+
+/// Catches the unpack running anything but the four programs, in order, or a step
+/// reading or writing the wrong directory: the stage is writable and the tar is not.
+#[test]
+fn the_unpack_is_four_programs_in_order() {
+    let jobs = helper::unpack_jobs(Path::new("/s/stage"), Path::new("/s/stage.tar"));
+    let programs: Vec<_> = jobs.iter().map(|j| j.args[0].as_str()).collect();
+    assert_eq!(
+        programs,
+        [
+            "/usr/bin/mkdir",
+            "/usr/bin/tar",
+            "/usr/bin/mkdir",
+            "/usr/bin/touch"
+        ]
+    );
+    assert_eq!(jobs[0].args[1..], ["/t/0/rootfs"]);
+    let tar = &jobs[1].args;
+    for flag in [
+        "--extract",
+        "--same-owner",
+        "--numeric-owner",
+        "--no-overwrite-dir",
+    ] {
+        assert!(tar.iter().any(|a| a == flag), "{flag} in {tar:?}");
+    }
+    assert!(jobs[2].args.contains(&"/t/0/rootfs/kbf/root".to_owned()));
+    assert!(jobs[3].args.contains(&"/t/0/rootfs/etc/hosts".to_owned()));
+    for job in &jobs {
+        assert!(job.binds[0].writable && !job.binds[1].writable);
+        assert!(job.daemon.is_none());
+    }
+}

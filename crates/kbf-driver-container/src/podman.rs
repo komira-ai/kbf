@@ -69,6 +69,18 @@ impl ContainerLimits {
     };
 }
 
+/// A directory the node already holds, mounted read-only inside the action's input root
+/// at `destination` (relative to it): the interface through which a shared tree reaches
+/// a runtime. The mount point must exist in the input root as an empty directory, so no
+/// symlink can sit at it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SharedMount {
+    /// The directory on the host.
+    pub source: PathBuf,
+    /// Where it appears, below [`EXEC_ROOT`]: no leading `/`, no `..`.
+    pub destination: String,
+}
+
 /// The container to create for one action.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ContainerSpec {
@@ -78,6 +90,13 @@ pub(crate) struct ContainerSpec {
     pub owner: String,
     /// `<repo>@sha256:<digest>`.
     pub image: String,
+    /// `sha256:<hex>`: the image's digest alone.
+    pub image_digest: String,
+    /// The lease's scratch directory.
+    pub dir: PathBuf,
+    /// Shared read-only mounts inside the exec root (the OCI backend binds them; the
+    /// Podman backend's `--volume` lines for them are the tree store's to add).
+    pub shared_mounts: Vec<SharedMount>,
     /// The lease cgroup, as `--cgroup-parent` names it.
     pub cgroup_parent: String,
     /// The input root on the host: the overlay's read-only lower layer.
@@ -200,6 +219,11 @@ fn failure(verb: &str, output: &std::process::Output) -> String {
 impl Podman {
     pub(crate) fn new(program: PathBuf) -> Self {
         Self { program }
+    }
+
+    /// The `podman` program.
+    pub(crate) fn program(&self) -> &Path {
+        &self.program
     }
 
     fn command(&self) -> Command {
@@ -418,6 +442,9 @@ pub(crate) mod tests {
             name: "kbf-lease-1-2".to_owned(),
             owner: "node-1".to_owned(),
             image: format!("docker.io/library/busybox@sha256:{}", "a".repeat(64)),
+            image_digest: format!("sha256:{}", "a".repeat(64)),
+            dir: PathBuf::from("/scratch/kbf-lease-1-2"),
+            shared_mounts: Vec::new(),
             cgroup_parent: "/kbf.slice/actions/kbf-lease-1-2".to_owned(),
             input_root: PathBuf::from("/scratch/kbf-lease-1-2/root"),
             upper: PathBuf::from("/scratch/kbf-lease-1-2/upper"),

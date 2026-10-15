@@ -100,6 +100,40 @@ impl Cell {
 
     /// [`Cell::new`], with `configure` applied to the runtime's configuration last.
     pub fn with(name: &str, configure: impl FnOnce(&mut PodmanConfig)) -> Self {
+        Self::in_scratch(name, super::scratch(&format!("podman-{name}")), configure)
+    }
+
+    /// A cell whose runtime is the OCI backend, running `crun` (`KBF_TEST_CRUN`, or
+    /// `crun` on the `PATH`): its scratch directory is under the system temporary
+    /// directory, whose ancestors every id can search (the backend's containers do not
+    /// run as the test's user, and refuse a scratch directory they cannot reach).
+    pub fn oci(name: &str) -> Self {
+        Self::oci_with(name, |_| {})
+    }
+
+    /// [`Cell::oci`], with `configure` applied to the runtime's configuration last.
+    pub fn oci_with(name: &str, configure: impl FnOnce(&mut PodmanConfig)) -> Self {
+        let uid = rustix::process::getuid().as_raw();
+        let scratch = std::env::temp_dir().join(format!("kbf-oci-{uid}-{name}"));
+        super::force_remove(&scratch);
+        std::fs::create_dir_all(&scratch).expect("create scratch");
+        // The helper containers run this test binary in its `__chown-dirs` mode (its
+        // `chown_dirs_test_hook!`); a copy in the scratch directory, since the checkout's
+        // ancestors may be closed to the container's ids.
+        let daemon = scratch.join("kbf-daemon");
+        let exe = std::env::current_exe().expect("test binary");
+        if std::fs::hard_link(&exe, &daemon).is_err() {
+            std::fs::copy(&exe, &daemon).expect("copy");
+        }
+        Self::in_scratch(name, scratch, |config| {
+            config.container_runtime = kbf_driver_container::ContainerRuntime::Oci;
+            config.oci.runtime = crun();
+            config.oci.daemon = daemon;
+            configure(config);
+        })
+    }
+
+    fn in_scratch(name: &str, scratch: PathBuf, configure: impl FnOnce(&mut PodmanConfig)) -> Self {
         trace();
         let term = TERMS.fetch_add(1, Ordering::Relaxed);
         let parent = format!("{}/{name}", delegation().actions);
@@ -110,7 +144,6 @@ impl Cell {
         std::fs::create_dir(&cgroup).expect("create the test cgroup");
         std::fs::write(cgroup.join("cgroup.subtree_control"), "+cpu +memory +pids")
             .expect("enable controllers");
-        let scratch = super::scratch(&format!("podman-{name}"));
         // Each test its own owner: they share one Podman store, and a runtime removes
         // its owner's containers when it starts.
         let mut config = PodmanConfig::new(scratch.clone(), parent, format!("kbf-test-{name}"));
@@ -179,6 +212,18 @@ impl Drop for Cell {
             super::force_remove(&self.scratch);
         }
     }
+}
+
+/// The `crun` the OCI tests run: `KBF_TEST_CRUN`, else the first `crun` on the `PATH`.
+pub fn crun() -> PathBuf {
+    if let Some(path) = std::env::var_os("KBF_TEST_CRUN") {
+        return PathBuf::from(path);
+    }
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    std::env::split_paths(&path)
+        .map(|dir| dir.join("crun"))
+        .find(|candidate| candidate.is_file())
+        .expect("no crun on the PATH (set KBF_TEST_CRUN): run through cargo xtask podman-tests")
 }
 
 /// Runs podman (the test's own checks) and returns its stdout.

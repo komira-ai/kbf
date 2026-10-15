@@ -74,6 +74,85 @@ pub enum SubidError {
         user: String,
         count: u64,
     },
+    /// Enough ids in all, but no single range of [`MIN_SUBORDINATE_IDS`]: the OCI
+    /// backend maps one range.
+    #[error(
+        "{file} gives the daemon's user {user} no single range of {MIN_SUBORDINATE_IDS} \
+         subordinate ids; the OCI backend maps one range, so give the user one"
+    )]
+    Split { file: PathBuf, user: String },
+    /// An id that does not fit the 32 bits a user namespace maps.
+    #[error("{file}: the daemon user's subordinate range starts past the 32-bit ids")]
+    TooHigh { file: PathBuf },
+}
+
+/// The daemon user's own ids and the first ids of its subordinate ranges, for a backend
+/// that maps one range into the container.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DaemonIds {
+    pub uid: u32,
+    pub gid: u32,
+    pub sub_uid: u32,
+    pub sub_gid: u32,
+}
+
+/// [`user_ids`] for this process's user.
+///
+/// # Errors
+/// The checks of [`check_subordinate_ids`], and a user whose ids are in no single range
+/// of [`MIN_SUBORDINATE_IDS`].
+pub fn daemon_ids(files: &IdFiles) -> Result<DaemonIds, SubidError> {
+    user_ids(
+        files,
+        rustix::process::getuid().as_raw(),
+        rustix::process::getgid().as_raw(),
+    )
+}
+
+/// The ids of user `uid` (group `gid`): the first id of the first range in `files` that
+/// holds at least [`MIN_SUBORDINATE_IDS`] ids, for subuid and subgid each.
+///
+/// # Errors
+/// As [`daemon_ids`].
+pub fn user_ids(files: &IdFiles, uid: u32, gid: u32) -> Result<DaemonIds, SubidError> {
+    check_subordinate_ids(files, uid)?;
+    let passwd = read(&files.passwd)?;
+    let name = user_name(&passwd, uid);
+    let user = name.map_or_else(|| format!("uid {uid}"), |n| format!("{n} (uid {uid})"));
+    let mut firsts = [0u32; 2];
+    for (slot, file) in firsts.iter_mut().zip([&files.subuid, &files.subgid]) {
+        let text = std::fs::read_to_string(file).map_err(|source| SubidError::Read {
+            path: file.clone(),
+            source,
+        })?;
+        let first = first_big_range(&text, name, uid).ok_or_else(|| SubidError::Split {
+            file: file.clone(),
+            user: user.clone(),
+        })?;
+        *slot = u32::try_from(first).map_err(|_| SubidError::TooHigh { file: file.clone() })?;
+    }
+    Ok(DaemonIds {
+        uid,
+        gid,
+        sub_uid: firsts[0],
+        sub_gid: firsts[1],
+    })
+}
+
+/// The first id of the first entry of subuid-format `text`, for the user `name` (if
+/// known) or `uid`, that holds at least [`MIN_SUBORDINATE_IDS`] ids.
+fn first_big_range(text: &str, name: Option<&str>, uid: u32) -> Option<u64> {
+    let uid = uid.to_string();
+    text.lines().find_map(|line| {
+        let fields: Vec<&str> = line.trim().split(':').collect();
+        let [owner, first, count] = fields[..] else {
+            return None;
+        };
+        let ours = owner == uid || Some(owner) == name;
+        let (first, count) = (first.parse::<u64>().ok()?, count.parse::<u64>().ok()?);
+        (ours && count >= MIN_SUBORDINATE_IDS && first.checked_add(count)? <= 1 << 32)
+            .then_some(first)
+    })
 }
 
 /// Checks that the user `uid` has at least [`MIN_SUBORDINATE_IDS`] subordinate uids

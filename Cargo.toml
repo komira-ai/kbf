@@ -15,6 +15,9 @@ publish = false
 # ahead keeps version choices in one place. A dependency enters Cargo.lock only when
 # a member first uses it.
 [workspace.dependencies]
+# `Io` and `Spawner` of the `runc` client (below) are async traits; the container driver
+# implements both. Already in the tree through runc.
+async-trait = "0.1.92"
 # The operator API's HTTP server (kbf-server). Already in the tree through tonic; no
 # default features: no form, query or json extractors, whose parsers are not needed.
 axum = { version = "0.8.9", default-features = false }
@@ -60,6 +63,9 @@ md-5 = "0.11.0"
 objc2 = "0.6.5"
 objc2-foundation = { version = "0.3.2", default-features = false, features = ["std"] }
 objc2-open-directory = { version = "0.3.2", default-features = false, features = ["std"] }
+# Typed OCI runtime configuration (`config.json`) for the container driver's crun
+# backend. The 0.7 line is the one `runc` (below) uses, so the tree holds one copy.
+oci-spec = "0.7.1"
 # The enrollment profile kbf-deploy writes (`mdm push-cert`), an XML property list.
 # No default features: the profile is built as a value, not through serde.
 plist = { version = "1.10.1", default-features = false }
@@ -91,6 +97,10 @@ rustls = { version = "0.23.45", default-features = false, features = ["ring", "s
 rustls-native-certs = "0.8.4"
 # zstd for the .zst downloads `cargo xtask fetch` unpacks; pure Rust, no C zstd.
 ruzstd = "0.9.1"
+# The OCI runtime client (containerd/rust-extensions) the container driver's crun backend
+# drives `crun` through: run, kill and delete. The async client; the crate has no
+# synchronous client in the same build.
+runc = { version = "0.3.0", features = ["async"] }
 # Directory-relative, no-follow file access (openat with O_NOFOLLOW) for reading outputs;
 # the effective uid, to check who owns the operator API token file (kbf-server).
 rustix = "1.1.5"

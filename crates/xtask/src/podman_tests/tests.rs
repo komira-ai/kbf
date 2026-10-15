@@ -293,7 +293,8 @@ fn the_containers_conf_override_and_nocapture_go_to_one_target_each() {
             "podman_memory",
             "podman_killed",
             "podman_cache",
-            "podman_env"
+            "podman_env",
+            "oci_crun"
         ]
     );
     let with = |needle: &str| -> Vec<&'static str> {
@@ -308,7 +309,7 @@ fn the_containers_conf_override_and_nocapture_go_to_one_target_each() {
             .collect()
     };
     assert_eq!(with("CONTAINERS_CONF_OVERRIDE="), ["podman_env"]);
-    assert_eq!(with("--nocapture"), ["podman_cache"]);
+    assert_eq!(with("--nocapture"), ["podman_cache", "oci_crun"]);
     assert_eq!(with("Delegate=yes"), names);
 }
 

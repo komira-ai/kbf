@@ -169,14 +169,14 @@ async fn a_clean_that_cannot_wait_for_podman_start_fails() {
     let raw = i32::try_from(child.id().expect("pid")).expect("pid fits");
     let pid = rustix::process::Pid::from_raw(raw);
     rustix::process::waitpid(pid, rustix::process::WaitOptions::empty()).expect("reaped elsewhere");
-    let mut lease = lease_left_only(child);
+    let mut lease = lease_left_only(Running::Process(child));
     let why = lease.clean_blocking().expect_err("the wait failed");
     assert!(why.starts_with("wait for podman start: "), "{why}");
 }
 
 /// A lease that never got a container, cgroup or scratch directory (all its paths
 /// are absent, so removing them succeeds), holding `start` as its `podman start`.
-fn lease_left_only(start: Child) -> Lease {
+fn lease_left_only(start: Running) -> Lease {
     let mut config = PodmanConfig::new(
         PathBuf::from("/nonexistent-kbf-157/scratch"),
         "/actions".to_owned(),
@@ -184,7 +184,10 @@ fn lease_left_only(start: Child) -> Lease {
     );
     config.cgroup_root = PathBuf::from("/nonexistent-kbf-157/cgroup");
     let id = LeaseId { term: 1, seq: 1 };
-    let mut lease = Lease::new(&Podman::new(config.podman.clone()), &config, id);
+    let engine = Engine::Podman(Arc::new(PodmanBackend::new(Podman::new(
+        config.podman.clone(),
+    ))));
+    let mut lease = Lease::new(&engine, &config, id);
     lease.start = Some(start);
     lease
 }
@@ -201,7 +204,7 @@ async fn the_clean_waits_until_podman_start_is_reaped() {
         .spawn()
         .expect("spawn sleep");
     let pid = start.id().expect("pid");
-    let mut lease = lease_left_only(start);
+    let mut lease = lease_left_only(Running::Process(start));
     lease.clean_blocking().expect("cleaned");
     assert!(
         !Path::new(&format!("/proc/{pid}")).exists(),
