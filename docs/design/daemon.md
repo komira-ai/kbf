@@ -281,6 +281,15 @@ native-whole-machine`.
   `memory.max` above the leases, `cpus` the lower of the nearest
   `cpuset.cpus.effective` and the lowest `cpu.max` quota on the path. The daemon writes
   `actions/cpu.max` itself: the CPUs it may use minus `--reserve-cpus` (default 8).
+  `--lease-placement=numa-node` (default `none`, which pins nothing) puts each lease on
+  one NUMA node: the lease cgroup gets that node's CPUs (`cpuset.cpus`) and memory node
+  (`cpuset.mems`), and the container's cgroup inherits both. The node is the one with
+  the least CPU booked by running leases, the lowest id on a tie; the lease's
+  `inputs phases:` line ends with `numa_node=N`. It enables `cpuset` in `actions/` and
+  its parent (the start fails, naming the fix, when the unit is not offered it) and
+  runs as `none`, logged once, on a host with fewer than two NUMA nodes that hold CPUs.
+  It changes neither admission nor `--reserve-cpus`, a quota that removes no CPU from a
+  node.
   [docs/deploy/linux-build-host.md](../deploy/linux-build-host.md) has the systemd
   units and the host's swap and memory headroom.
 - **`NativeRuntime`** (`kbf-driver-native`, driver `native`): each action as plain
@@ -686,6 +695,41 @@ When a lease's run ends the daemon logs one INFO line, `lease phases:` and then
 | `lease_ms` | from the run's start in the daemon to its end |
 | `inputs_ms`, `run_ms`, `outputs_ms` | the driver's own stamps in the result's `ExecutedActionMetadata`: input fetch, execution, output upload; `-` when the run produced no result. What `lease_ms` holds beyond their sum is the driver's work outside them (making and removing the lease's directories, the container's create and chown) |
 | `output_files`, `output_dirs` | the files and directories the result names at its top level (the files inside an output directory are in the `transfers:` line's `written_blobs`) |
+
+The fields after `output_dirs` are what the lease's own cgroup (v2) counted, read
+when the action ended; each is `-` where it was not measured (a driver without a lease
+cgroup, a kernel without the file: absent is not 0). They are measurement only; nothing
+in scheduling reads them.
+
+| Field | What it is |
+|---|---|
+| `cpu_usage_us`, `cpu_user_us`, `cpu_system_us` | `cpu.stat` `usage_usec`, `user_usec`, `system_usec`: CPU time of every process in the cgroup |
+| `cpu_periods`, `cpu_throttled`, `throttled_us` | `cpu.stat` `nr_periods`, `nr_throttled`, `throttled_usec`: all 0 while the lease has no `cpu.max` quota, which kbf does not set |
+| `mem_peak` | `memory.peak`, bytes |
+| `parallelism` | `cpu_usage_us` over the run's wall time (the container's create to its exit), two decimals: how many CPUs the action kept busy on average |
+| `numa_bytes` | `node:bytes` pairs, comma-separated: `memory.numa_stat` `anon` plus `file` per NUMA node, of the sample that held the most memory (sampled every second while the action runs, `PodmanConfig::numa_every`, and once at its end: the kernel uncharges anonymous memory when the processes exit, so the end alone shows little) |
+| `numa_spread` | the share of that memory not on the node holding most of it, two decimals (0.00 is all on one node) |
+
+The same counters ride in the result, in `ExecutedActionMetadata.auxiliary_metadata`
+as a `kbf.worker.v1.ResourceUsage` whose optional `cgroup` field (`CgroupUsage`) is new;
+a daemon or server that predates it ignores the field. The server logs one INFO line,
+`action usage:`, per run whose result carries a `ResourceUsage`: `exit_code`,
+`mnemonic` and `target` (the `RequestMetadata` the client sent on the Execute, quoted;
+`-` when it sent none), `wall_us`, and the same cgroup fields as above, so a build's
+actions can be grouped by mnemonic or target and their `parallelism` read off.
+
+A lease that ends without a result (timed out, killed, out of memory) has the same
+fields, read from its cgroup before the cgroup is removed (`Runtime::failed_usage`;
+the container driver does it), and carries the `ResourceUsage` in the metadata of the
+`action_result` of its `worker.Result`: the peak memory of an OOM-killed action and the
+CPU of a timed-out one are what the memory ladder needs. A lease killed for memory, its
+own limit or the node's, ends the line with ` oom=1` (no such key otherwise). The
+server does not log `action usage:` for these yet: it reads the usage of an OK result
+only, and keeps of a timeout's partial result only its logs.
+
+At start the daemon logs the host's NUMA layout once (Linux), from
+`/sys/devices/system/node`: `numa layout: nodes=2 cpus=64 node0=0-15,32-47
+node1=16-31,48-63`. `numa_bytes` node numbers are those nodes.
 
 `outputs_ms` includes waiting for the transfer engine's request limit, which every
 lease of the process shares; there is no per-lease busy time.

@@ -10,6 +10,7 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use kbf_proto::reapi::{ActionResult, Digest};
+use kbf_proto::worker::ResourceUsage;
 use kbf_types::{LeaseId, LeaseKind, LostWhy, Resources};
 use tokio::sync::oneshot;
 
@@ -108,6 +109,14 @@ pub trait Runtime: Send + Sync + 'static {
 
     /// Runs one lease to completion. An action that runs and exits non-zero is `Ok`.
     fn run(&self, work: Work) -> impl Future<Output = Result<ActionResult, RuntimeError>> + Send;
+
+    /// What the runtime measured of lease `lease_id`, whose [`Runtime::run`] ended in
+    /// an error (timed out, killed, out of memory): the counters a result would have
+    /// carried. Called once, after `run` returned the error; a second call, or a runtime
+    /// that measures nothing (the default), returns `None`.
+    fn failed_usage(&self, _lease_id: LeaseId) -> Option<ResourceUsage> {
+        None
+    }
 
     /// Stops a running lease. Returns once its work has stopped; the lease's `run` then
     /// ends with [`RuntimeError::Killed`]. Killing a lease that is not running does

@@ -13,6 +13,39 @@ pub fn fits(room: Resources, request: Resources) -> bool {
         && request.vms <= room.vms
 }
 
+/// Whether `request` is an action at the whole host's memory of a worker of `capacity`
+/// (the last step of the memory ladder): it runs alone on the node.
+pub fn exclusive(capacity: Resources, request: Resources) -> bool {
+    request.memory_bytes > 0 && request.memory_bytes >= capacity.memory_bytes
+}
+
+/// Whether an action `request` can be placed on a worker of `capacity` that has `booked`
+/// booked in `leases` leases, `whole` of them being one that holds the node alone. An
+/// action's memory is the limit it first runs under, not a booking: only the worker's
+/// memory capacity bounds it, besides the whole host running alone.
+pub fn room(
+    capacity: Resources,
+    booked: Resources,
+    whole: bool,
+    leases: usize,
+    request: Resources,
+) -> bool {
+    !whole
+        && request.cpu_millis <= capacity.cpu_millis.saturating_sub(booked.cpu_millis)
+        && request.gpus <= capacity.gpus.saturating_sub(booked.gpus)
+        && request.vms <= capacity.vms.saturating_sub(booked.vms)
+        && request.memory_bytes <= capacity.memory_bytes
+        && (!exclusive(capacity, request) || leases == 0)
+}
+
+/// Whether `booked` is within `capacity` on every axis but memory, which is not booked
+/// against it.
+pub fn within(capacity: Resources, booked: Resources) -> bool {
+    booked.cpu_millis <= capacity.cpu_millis
+        && booked.gpus <= capacity.gpus
+        && booked.vms <= capacity.vms
+}
+
 /// `a + b` on every axis.
 pub fn add(a: Resources, b: Resources) -> Resources {
     Resources::new(a.cpu_millis + b.cpu_millis, a.memory_bytes + b.memory_bytes)

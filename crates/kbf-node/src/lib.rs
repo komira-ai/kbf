@@ -211,6 +211,20 @@ pub struct Cli {
     /// to `--data-dir` searchable by others.
     #[arg(long, default_value = "podman", value_parser = ["podman", "oci"], value_name = "podman|oci")]
     container_runtime: String,
+    /// Where each lease runs among the node's CPUs (container, Linux): `none`, the
+    /// default, lets a lease use any CPU the daemon may; `numa-node` puts each lease on
+    /// one NUMA node, its CPUs (`cpuset.cpus`) and memory (`cpuset.mems`), the node with
+    /// the least CPU booked by running leases (the lowest id on a tie). `--reserve-cpus`
+    /// is a quota on all leases together, so it still applies; it removes no CPU from a
+    /// node. Needs the `cpuset` controller delegated to the daemon (the start fails and
+    /// says how when it is not); a host with fewer than two NUMA nodes that hold CPUs
+    /// runs as `none`, which the start logs. Refused with a driver other than
+    /// `container` (macOS has no such driver).
+    #[arg(long, default_value = "none", value_parser = ["none", "numa-node"], value_name = "none|numa-node")]
+    lease_placement: String,
+    /// Where the kernel lists NUMA nodes (container). For tests of the placement only.
+    #[arg(long, hide = true, default_value = "/sys/devices/system/node")]
+    numa_dir: PathBuf,
     /// The OCI runtime `--container-runtime=oci` runs actions with (container).
     #[arg(long, default_value = "/usr/bin/crun")]
     oci_runtime: PathBuf,
@@ -537,6 +551,14 @@ fn node_over<C: Cas>(
         return Err("--image names container images: only --driver container runs them".into());
     }
     let plan = data_dir(cli)?;
+    if cli.lease_placement != "none" && !cli.drivers.contains(&Driver::Container) {
+        return Err(format!(
+            "--lease-placement={} places container leases on NUMA nodes: only --driver container \
+             runs them (Linux only; macOS has no NUMA nodes or cpusets)",
+            cli.lease_placement
+        )
+        .into());
+    }
     let mut node = Node::new(plane);
     for driver in drivers(cli) {
         match driver {
@@ -735,7 +757,8 @@ mod container {
     use std::time::Duration;
 
     use kbf_driver_container::{
-        ContainerLimits, IdFiles, ImageRef, OutputLimits, PodmanConfig, PodmanRuntime, SwapKill,
+        ContainerLimits, IdFiles, ImageRef, LeasePlacement, OutputLimits, PodmanConfig,
+        PodmanRuntime, SwapKill,
     };
 
     use super::{Cli, Error, ImageUnusable, Node, scratch};
@@ -802,7 +825,15 @@ mod container {
                 .memory_bytes
                 .map_or("all".to_owned(), |b| format!("{} GiB", b >> 30))
         );
+        // After the cgroup setup it builds on, before the runtime sweeps and serves.
+        let placer = match cli.lease_placement.parse()? {
+            LeasePlacement::None => None,
+            LeasePlacement::NumaNode => {
+                kbf_driver_container::numa::start(&cli.numa_dir, mount, &parent)?
+            }
+        };
         let mut config = PodmanConfig::new(scratch, parent, cli.daemon.node_id.clone());
+        config.placer = placer;
         config.container_runtime = cli.container_runtime.parse()?;
         config.oci.runtime = cli.oci_runtime.clone();
         config.oci.id_files = files;
