@@ -13,7 +13,8 @@
 //! resumes from the bytes it received.
 //!
 //! - [`cas`]: the [`Cas`] trait every store implements (the engine, and the in-memory
-//!   stores of tests), with [`digest_of`], [`fetch`] and [`label`].
+//!   stores of tests), with [`digest_of`], [`fetch`] and [`label`]. It is the daemon's
+//!   data plane; `kbf-cas-conformance` holds the checks any implementation must pass.
 //! - [`Transfers`] and [`Scope`]: the engine, and one lease's view of it, which counts
 //!   the lease's [`TransferStats`].
 //! - [`TransferConfig`]: the `--transfer-*` flags and `--segment-upload-streams` and `--segment-uploads-in-flight`.
@@ -51,7 +52,8 @@ pub use config::{
 pub use engine::{Scope, Transfers};
 pub use kbf_segments::RecordHasher;
 pub use segments::{
-    COALESCE_GAP_BYTES, Located, MAX_RANGE_BYTES, MAX_UPLOAD_RECORDS, SEGMENT_UPLOAD_BYTES,
+    COALESCE_GAP_BYTES, Located, MAX_RANGE_BYTES, MAX_UPLOAD_RECORDS, Planned,
+    SEGMENT_UPLOAD_BYTES, plan, read_pieces,
 };
 pub use source::{FileSource, OPEN_DIRECTORY, OPEN_FILE, Record, Source, Stamp, descend};
 pub use spool::{Spool, Spooled, to_proto as proto_digest};

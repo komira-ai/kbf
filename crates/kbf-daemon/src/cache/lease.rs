@@ -14,10 +14,18 @@
 //!   it. A fallback is per key per lease, never per name: names already linked to the
 //!   entry are unlinked first.
 //!
-//! A link that finds the entry gone (`ENOENT`) settles the key again and retries.
+//! In [`LinkMode::Clone`] (macOS) there are no links: every name, private or not, is
+//! its own **clone** of the entry (`clonefile`: the data blocks are shared until a
+//! write, the inode is not), moded as an input is without the cache (0644, 0755
+//! executable) and dated as the entry. An action may write any input, as without the
+//! cache, and the entry stays as it was. A clone the filesystem refuses (`ENOTSUP`,
+//! `EXDEV`) is a private copy of that name, counted as a fallback once per key.
+//!
+//! A link or clone that finds the entry gone (`ENOENT`) settles the key again and
+//! retries.
 
 use std::io::{self, Write as _};
-use std::os::unix::fs::OpenOptionsExt as _;
+use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -51,10 +59,24 @@ pub(crate) async fn write_files(
     files: Vec<Copies>,
     private: &[PathBuf],
 ) -> Result<InputStats, TreeError> {
+    write_files_as(cas, cache, files, private, false).await
+}
+
+/// [`write_files`] with the files' mode in clone mode chosen: a tree's files are
+/// `read_only` (0444, 0555 as the entry), an input's 0644 and 0755.
+pub(crate) async fn write_files_as(
+    cas: &dyn Fetch,
+    cache: &Cache,
+    files: Vec<Copies>,
+    private: &[PathBuf],
+    read_only: bool,
+) -> Result<InputStats, TreeError> {
+    // Only clone mode has a say: a hard link is the entry's mode already.
+    let want = read_only && cache.link_mode() == LinkMode::Clone;
     let counts = InputCounts::default();
     let mut blobs = Vec::new();
     for blob in files {
-        blobs.push(plan(blob, private, &counts)?);
+        blobs.push(plan(blob, private, &counts, want)?);
     }
     let _pins = cache.pin(blobs.iter().flatten().map(|n| n.key).collect());
     let failed = AtomicBool::new(false);
@@ -67,7 +89,7 @@ pub(crate) async fn write_files(
                 if failed.load(Ordering::SeqCst) {
                     return Ok(());
                 }
-                let placed = place(cas, cache, names, counts_ref).await;
+                let placed = place(cas, cache, names, counts_ref, want).await;
                 if placed.is_err() {
                     failed.store(true, Ordering::SeqCst);
                     return placed;
@@ -87,7 +109,12 @@ pub(crate) async fn write_files(
 }
 
 /// The keys of `blob`'s copies, with their names; an empty blob is written at once.
-fn plan(blob: Copies, private: &[PathBuf], counts: &InputCounts) -> Result<Vec<Names>, TreeError> {
+fn plan(
+    blob: Copies,
+    private: &[PathBuf],
+    counts: &InputCounts,
+    want: bool,
+) -> Result<Vec<Names>, TreeError> {
     // A digest that names no SHA-256 blob is one no CAS holds.
     let key = |executable| {
         Key::of(&blob.digest, executable)
@@ -98,8 +125,8 @@ fn plan(blob: Copies, private: &[PathBuf], counts: &InputCounts) -> Result<Vec<N
         bump(&counts.files);
         if blob.digest.size_bytes == 0 {
             bump(&counts.empty_files);
-            create(&path, Mode::Writable(is_executable), &mut |_| Ok(()))
-                .map_err(crate::tree::io(&path))?;
+            let mode = clone_mode(key(is_executable)?, want);
+            create(&path, mode, &mut |_| Ok(())).map_err(crate::tree::io(&path))?;
             continue;
         }
         let names = if is_executable {
@@ -135,6 +162,7 @@ async fn place(
     cache: &Cache,
     names: Names,
     counts: &InputCounts,
+    want: bool,
 ) -> Result<(), TreeError> {
     let names = Arc::new(names);
     let mut stale = false;
@@ -151,9 +179,9 @@ async fn place(
         );
         let placing = Arc::clone(&names);
         let placed = blocking(move || match source {
-            Source::Bytes(bytes) => from_bytes(&bytes, &placing),
+            Source::Bytes(bytes) => from_bytes(&bytes, &placing, mode, want),
             Source::Entry { path, nlink } => {
-                from_entry(&path, nlink, &placing, mode, link_max, &*link)
+                from_entry(&path, nlink, &placing, mode, link_max, &*link, want)
             }
         })
         .await;
@@ -166,9 +194,18 @@ async fn place(
                     &counts.misses
                 };
                 counted.fetch_add(files, Ordering::Relaxed);
+                let (shared, private) = (names.shared.len() as u64, names.private.len() as u64);
                 if fell_back {
                     bump(&counts.link_fallbacks);
                 }
+                // A clone is its own inode, as a copy is: nothing is a link in clone mode.
+                let (links, copies) = if fell_back || mode == LinkMode::Clone {
+                    (0, shared + private)
+                } else {
+                    (shared, private)
+                };
+                counts.links.fetch_add(links, Ordering::Relaxed);
+                counts.copies.fetch_add(copies, Ordering::Relaxed);
                 return Ok(());
             }
             Err(Placing::Gone) => stale = true,
@@ -196,8 +233,15 @@ enum Mode {
 /// Places `names` from the bytes the cache could not keep: private copies, and one
 /// read-only copy the shared names are linked to. Whether that was a fallback (always,
 /// when there are shared names).
-fn from_bytes(bytes: &[u8], names: &Names) -> Result<bool, Placing> {
+fn from_bytes(bytes: &[u8], names: &Names, mode: LinkMode, want: bool) -> Result<bool, Placing> {
     let mut fill = |file: &mut std::fs::File| file.write_all(bytes);
+    if mode == LinkMode::Clone {
+        // Every name its own file, as clones would be.
+        for path in names.private.iter().chain(&names.shared) {
+            create(path, clone_mode(names.key, want), &mut fill).map_err(failed(path))?;
+        }
+        return Ok(!names.shared.is_empty());
+    }
     for path in &names.private {
         create(path, Mode::Writable(names.key.executable), &mut fill).map_err(failed(path))?;
     }
@@ -220,7 +264,11 @@ fn from_entry(
     mode: LinkMode,
     link_max: u64,
     link: &super::LinkFn,
+    want: bool,
 ) -> Result<bool, Placing> {
+    if mode == LinkMode::Clone {
+        return clone_all(entry, names, link, want);
+    }
     for path in &names.private {
         copy_new(entry, path, Mode::Writable(names.key.executable))?;
     }
@@ -241,6 +289,63 @@ fn from_entry(
         std::fs::hard_link(first, path).map_err(failed(path))?;
     }
     Ok(true)
+}
+
+/// How a clone-mode file is created when it is not a clone.
+fn clone_mode(key: Key, read_only: bool) -> Mode {
+    if read_only {
+        Mode::Entry(key)
+    } else {
+        Mode::Writable(key.executable)
+    }
+}
+
+/// Places every name of `names` as its own clone of `entry` (`link` is the clone), made
+/// writable unless `want` (read-only: a clone has the entry's mode). Whether
+/// a name fell back to a private copy. When the entry is gone, the names already placed
+/// are removed, so the key's next attempt starts from none.
+fn clone_all(
+    entry: &Path,
+    names: &Names,
+    link: &super::LinkFn,
+    want: bool,
+) -> Result<bool, Placing> {
+    let executable = names.key.executable;
+    let mut fell_back = false;
+    let mut placed: Vec<&Path> = Vec::new();
+    for path in names.private.iter().chain(&names.shared) {
+        let cloned = match link(entry, path) {
+            Ok(()) => {
+                placed.push(path);
+                if want {
+                    Ok(())
+                } else {
+                    make_writable(path, executable).map_err(failed(path))
+                }
+            }
+            Err(e) if e.raw_os_error() == Some(libc::ENOENT) => Err(Placing::Gone),
+            Err(e) if matches!(e.raw_os_error(), Some(libc::ENOTSUP | libc::EXDEV)) => {
+                fell_back = true;
+                copy_new(entry, path, clone_mode(names.key, want)).inspect(|()| placed.push(path))
+            }
+            Err(e) => Err(failed(path)(e)),
+        };
+        if let Err(why) = cloned {
+            if matches!(why, Placing::Gone) {
+                for done in placed {
+                    let _ = std::fs::remove_file(done);
+                }
+            }
+            return Err(why);
+        }
+    }
+    Ok(fell_back)
+}
+
+/// Moded as an input is without the cache: 0644, 0755 when executable.
+fn make_writable(path: &Path, executable: bool) -> io::Result<()> {
+    let mode = if executable { 0o755 } else { 0o644 };
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
 }
 
 /// Links `first` to `entry` and each of `rest` to `first`: one inode. On an error, the

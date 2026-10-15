@@ -20,6 +20,7 @@
 //! (`tests/sim/check.rs`), built with family F1. This one is local to F4 until the
 //! two are merged.
 
+mod farm;
 mod round;
 
 use std::cmp::Reverse;
@@ -30,13 +31,14 @@ use super::reference::{Verdict, add, blame, fits, sub, verdict};
 use kbf_caps::NodeCaps;
 use kbf_sched::fence::{HANDOVER_GRACE, LEASE_GRACE, START_GRACE};
 use kbf_sched::{
-    Cordon, DaemonInstance, Event, Input, OpState, PLACEMENT_ROUND, Request, Scheduler,
+    Cordon, DaemonInstance, Event, FARM_RERUNS, Input, NOT_STARTED_RERUNS, OpState,
+    PLACEMENT_ROUND, Request, Scheduler,
 };
 
 use kbf_types::{
-    ActionKey, Answer, ControlRecord, Effect, FarmTime, FencePolicy, LeaseGrant, LeaseId,
-    OperationId, Outcome, Qos, Refusal, RefusalRecord, Resources, ResultRecord, StartLease,
-    StateMachine, WaiterId, Waiting, WorkerId,
+    ActionKey, Answer, ControlRecord, Effect, Failure, FarmFault, FarmRun, FarmTime, FencePolicy,
+    LeaseGrant, LeaseId, LostWhy, OperationId, Outcome, Qos, Refusal, RefusalRecord, Resources,
+    ResultRecord, StartLease, StateMachine, WaiterId, Waiting, WorkerId,
 };
 
 /// The scheduler's term in every F4 run.
@@ -94,6 +96,17 @@ struct Op {
     done: Option<OpState>,
     newest: Option<LeaseId>,
     proposed: bool,
+    /// Its result was proposed by a give-up past the farm budget, not by a worker.
+    silenced: bool,
+    /// Its sent leases given up for silence or replacement: the farm runs it was
+    /// charged (the workers placement avoids while another fits).
+    farm_runs: Vec<FarmRun>,
+    /// Its leases given up as not started (the node heartbeats but never listed them):
+    /// their own budget, charged nothing to the farm's.
+    not_started: u32,
+    /// The workers placement avoids while another fits: those of its farm runs and of
+    /// its not-started give-ups.
+    avoid: BTreeSet<WorkerId>,
     wait: Option<Wait>,
     /// The last reason its callers were told, while it waits.
     told: Option<String>,
@@ -325,10 +338,7 @@ impl Checker {
                 }
                 Vec::new()
             }
-            Event::Heartbeat { worker, running } => {
-                self.heartbeat(&worker, &running);
-                Vec::new()
-            }
+            Event::Heartbeat { worker, running } => self.heartbeat(&worker, &running),
             // The world switches no node's session.
             Event::Phase { .. } => unreachable!("F4 feeds no node phase"),
             Event::Submit { waiter, request } => self.submit(waiter, request),
@@ -367,8 +377,17 @@ impl Checker {
                 }
             }
             Event::Tick => {
-                self.expire();
-                self.round(effects);
+                // The results proposed for leases given up past the farm budget come
+                // first, then the placement round's effects.
+                let proposed = self.expire();
+                let n = proposed.len();
+                if effects.len() < n || effects[..n] != proposed[..] {
+                    self.violated(
+                        "I5",
+                        format!("a tick: expected {proposed:?} first, got {effects:?}"),
+                    );
+                }
+                self.round(&effects[n..]);
                 return None;
             }
             Event::Cordon { worker } => {
@@ -393,10 +412,10 @@ impl Checker {
         })
     }
 
-    fn heartbeat(&mut self, worker: &WorkerId, running: &[LeaseId]) {
+    fn heartbeat(&mut self, worker: &WorkerId, running: &[LeaseId]) -> Vec<Effect> {
         let now = self.now;
         let Some(w) = self.workers.get_mut(worker) else {
-            return;
+            return Vec::new();
         };
         w.last_heard = w.last_heard.max(now);
         let (session, process, handover_ends) = (w.session, w.process, w.handover_ends);
@@ -413,28 +432,43 @@ impl Checker {
                 continue;
             }
             // Another daemon process may still run it until its fence (issue #140).
-            let why = if sent_process != process {
+            let (why, charged) = if sent_process != process {
                 if now < handover_ends {
                     kept_for_handover += 1;
                     continue;
                 }
-                "requeued: Start sent to a replaced daemon process, after the handover grace"
+                (
+                    "requeued: Start sent to a replaced daemon process, after the handover grace",
+                    true,
+                )
             } else if sent_to < session {
-                "requeued: Start sent to an earlier session (L3)"
+                ("requeued: Start sent to an earlier session (L3)", false)
             } else if now >= at + ms(START_GRACE) {
-                "requeued: Start out for START_GRACE"
+                ("requeued: Start out for START_GRACE", false)
             } else {
                 continue;
             };
-            lost.push((l.op, why));
+            let unstarted = !charged && sent_to >= session;
+            lost.push((
+                l.op,
+                why,
+                charged.then_some(*lease),
+                unstarted.then_some(*lease),
+            ));
         }
         if kept_for_handover > 0 {
             self.hit("kept: Start sent to a replaced daemon process, inside the handover grace");
         }
-        for (op, why) in lost {
+        let mut proposed = Vec::new();
+        for (op, why, charged, unstarted) in lost {
             self.hit(why);
-            self.requeue(op);
+            match (charged, unstarted) {
+                (Some(lease), _) => proposed.extend(self.give_up_charged(lease)),
+                (None, Some(lease)) => proposed.extend(self.give_up_not_started(lease)),
+                (None, None) => self.requeue(op),
+            }
         }
+        proposed
     }
 
     fn submit(&mut self, waiter: WaiterId, request: Request) -> Vec<Effect> {
@@ -491,6 +525,10 @@ impl Checker {
             done: None,
             newest: None,
             proposed: false,
+            silenced: false,
+            farm_runs: Vec::new(),
+            not_started: 0,
+            avoid: BTreeSet::new(),
             wait: None,
             told: None,
             dropped: false,
@@ -568,8 +606,13 @@ impl Checker {
             self.hit("result of a superseded lease dropped");
             return Vec::new();
         }
-        // I5, with the worker model: the outcome is one this very lease's run produced.
-        if self.produced.get(&record.lease) != Some(&record.outcome) {
+        // I5, with the worker model: the outcome is one this very lease's run produced,
+        // or the give-up's, which the scheduler proposed past the farm budget.
+        let fenced = Outcome::Failed(Failure::Lost(LostWhy::Fenced));
+        let given_up = op.silenced && record.outcome == fenced;
+        let never_started = op.silenced && record.outcome == Outcome::Failed(Failure::Infra);
+        if !given_up && !never_started && self.produced.get(&record.lease) != Some(&record.outcome)
+        {
             self.violated(
                 "I5",
                 format!(
@@ -579,6 +622,29 @@ impl Checker {
                     self.produced.get(&record.lease)
                 ),
             );
+        }
+        let infra = record.outcome == Outcome::Failed(Failure::Infra) && !never_started;
+        if infra && self.op(id).holding != Some(record.lease) {
+            // Given up meanwhile, and waiting to be granted again: charged nothing.
+            self.hit("infra result of a lease given up");
+            return Vec::new();
+        }
+        if given_up || infra {
+            // The run is a farm run: the give-up's own run is the last one.
+            let worker = self.leases[&record.lease].worker.clone();
+            let fault = if infra {
+                FarmFault::Infra
+            } else {
+                FarmFault::Lost(LostWhy::Fenced)
+            };
+            self.op_mut(id).avoid.insert(worker.clone());
+            self.op_mut(id).farm_runs.push(FarmRun { worker, fault });
+            let ended = self.op(id).farm_runs.len();
+            if infra && u32::try_from(ended).unwrap_or(u32::MAX) <= FARM_RERUNS {
+                self.hit("infra result charged to the farm budget");
+                self.requeue(id);
+                return Vec::new();
+            }
         }
         self.release(id);
         let state = match record.outcome {
@@ -598,9 +664,9 @@ impl Checker {
             lease: record.lease,
             waiters,
             outcome: record.outcome,
-            // The model's runs are never killed for memory, nor lost.
+            // The model's runs are never killed for memory.
             memory_runs: Vec::new(),
-            farm_runs: Vec::new(),
+            farm_runs: self.op(id).farm_runs.clone(),
         })]
     }
 
@@ -668,21 +734,6 @@ impl Checker {
         self.release(id);
         let qos = self.op(id).request.qos.clone();
         self.queue.insert((Reverse(qos), id));
-    }
-
-    fn expire(&mut self) {
-        let now = self.now;
-        let silent: Vec<LeaseId> = self
-            .workers
-            .values()
-            .filter(|w| !w.alive(now))
-            .flat_map(|w| w.leases.iter().copied())
-            .collect();
-        for lease in silent {
-            self.hit("requeued: worker silent for G");
-            let op = self.leases[&lease].op;
-            self.requeue(op);
-        }
     }
 
     /// Moves drains on, as the scheduler does after every input.

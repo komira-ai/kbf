@@ -11,7 +11,8 @@ use std::time::{Duration, SystemTime};
 
 use kbf_daemon::cas::{Cas, CasError, Spool};
 use kbf_daemon::tree::{
-    TreeError, check_relative, fetch_message, materialize, output_paths, real_dirs,
+    TreeError, check_relative, fetch_message, materialize, materialize_cached, output_paths,
+    real_dirs,
 };
 use kbf_daemon::{DriverReport, Runtime, RuntimeError, Work, upload_within};
 use kbf_outputs::OutputsError;
@@ -28,7 +29,7 @@ use crate::network::{self, Network, network_of};
 use crate::procs::{self, Proc, Tracker};
 use crate::program::{Refused, Resolved, resolve};
 use crate::record::{Exec, KeeperFor, Spawned};
-use crate::simulator::{self, Made, Simctl};
+use crate::simulator::{self, Made, Simctl, Waited};
 use crate::slots::Runner;
 use crate::user_folders::UserFolders;
 use crate::xcode;
@@ -148,6 +149,7 @@ impl<C: Cas> NativeRuntime<C> {
             isolation: config.isolation.clone(),
             rules: rules.clone(),
             within: simulator::ANSWER_WITHIN,
+            listing: config.simulator_listing,
         });
         // The first lease directory a killed daemon left that may hold a simulator:
         // the simulators every lease left are deleted from it before it is removed.
@@ -351,9 +353,45 @@ impl<C: Cas> NativeRuntime<C> {
         let lease = tokio::fs::canonicalize(dir).await.map_err(failed(dir))?;
         let root = dir.join("root");
         tokio::fs::create_dir(&root).await.map_err(failed(&root))?;
-        materialize(cas, input_root, &root)
-            .await
-            .map_err(tree_error)?;
+        match (&self.config.cache, &self.config.trees) {
+            // A tree is ONE clone of its directory; the rest of the inputs are clones
+            // of cache entries. Nothing is mounted: a clone is the lease's own.
+            (Some(cache), Some(trees)) => {
+                let started = std::time::Instant::now();
+                let inputs = trees
+                    .materialize(
+                        cas,
+                        cache,
+                        input_root,
+                        &root,
+                        &outputs,
+                        &command.working_directory,
+                    )
+                    .await
+                    .map_err(tree_error)?;
+                let ms = started.elapsed().as_millis();
+                let (stats, cloned, files) =
+                    (&inputs.stats, inputs.trees_cloned, inputs.tree_files);
+                tracing::info!(
+                    lease = %work.lease_id,
+                    "inputs: {stats} trees_cloned={cloned} tree_files={files} built={built} ms={ms}",
+                    built = inputs.trees_built
+                );
+            }
+            // Every name is its own clone of an entry (`LinkMode::Clone`), so no path
+            // needs to be named private.
+            (Some(cache), None) => {
+                let started = std::time::Instant::now();
+                let stats = materialize_cached(cas, cache, input_root, &root, &[])
+                    .await
+                    .map_err(tree_error)?;
+                let ms = started.elapsed().as_millis();
+                tracing::info!(lease = %work.lease_id, "inputs: {stats} ms={ms}");
+            }
+            (None, _) => materialize(cas, input_root, &root)
+                .await
+                .map_err(tree_error)?,
+        }
         // REAPI: the worker makes the working directory and each output's parent.
         let work_dir = real_dirs(&root, &command.working_directory)
             .await
@@ -555,6 +593,11 @@ impl<C: Cas> NativeRuntime<C> {
                 *killer = Some(by);
                 return Err(RuntimeError::Killed);
             }
+            if let Some(by) = simulator_listed(&self.simctl, work.lease_id, &prepared, stop).await?
+            {
+                *killer = Some(by);
+                return Err(RuntimeError::Killed);
+            }
         }
         clock.input_fetch_completed_timestamp = now();
         clock.execution_start_timestamp = now();
@@ -732,6 +775,35 @@ async fn create_simulator(
     *made_in(slot) = Some(kept);
     prepared.simulator_env = vec![(simulator::UDID_VAR, OsString::from(udid))];
     Ok(())
+}
+
+/// Waits until Xcode lists the simulator `prepared` was given, if any
+/// ([`Simctl::wait_listed`]), and logs how long that took; what a kill sent, if one
+/// came first. Not generic over the CAS.
+///
+/// # Errors
+/// [`RuntimeError::Failed`] when it was not listed in time: the node's, not the
+/// action's.
+async fn simulator_listed(
+    simctl: &Arc<Simctl>,
+    lease: LeaseId,
+    prepared: &Prepared,
+    stop: &mut oneshot::Receiver<Stop>,
+) -> Result<Option<Stop>, RuntimeError> {
+    let Some((_, udid)) = prepared.simulator_env.first() else {
+        return Ok(None);
+    };
+    let udid = udid.to_string_lossy();
+    let dir = prepared.developer_dir.as_deref();
+    match simctl.wait_listed(&prepared.lease, &udid, dir, stop).await {
+        Waited::Listed(waited, looks) => {
+            let ms = waited.as_millis();
+            tracing::info!(%lease, %udid, ms, looks, "simulator listed by Xcode");
+            Ok(None)
+        }
+        Waited::Never(why) => Err(RuntimeError::Failed(format!("simulator: {why}"))),
+        Waited::Stopped(by) => Ok(Some(by)),
+    }
 }
 
 /// The UDID `simctl create` printed, or the lease's failure: the node's (a runtime it

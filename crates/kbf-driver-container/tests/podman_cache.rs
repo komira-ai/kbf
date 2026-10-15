@@ -22,9 +22,11 @@ use support::real::{Cell, podman, sh};
 
 kbf_driver_container::chown_dirs_test_hook!();
 
-/// A cache beside `config`'s scratch directory, linking with `link`.
+/// An empty cache beside `config`'s scratch directory, linking with `link`. Like the
+/// scratch directory, it is emptied first: CI restores `target` from an earlier run.
 fn with_cache(config: &mut PodmanConfig, link: Option<Arc<kbf_daemon::cache::LinkFn>>) {
     let dir = PathBuf::from(format!("{}-cache", config.scratch.display()));
+    support::force_remove(&dir);
     std::fs::create_dir_all(&dir).expect("cache dir");
     let mut cache = CacheConfig::new(dir, config.scratch.clone(), 1 << 30);
     if let Some(link) = link {
@@ -206,10 +208,13 @@ async fn identical_inputs_are_one_inode_and_tar_alike_on_every_run() {
 // what a tree is on disk; the stand-in Podman shows the volume reaches the container's arguments.
 // Only a kernel shows the rest, below.
 
-/// A cache and a tree store beside `config`'s scratch directory.
+/// A cache and an empty tree store beside `config`'s scratch directory. A store left by
+/// an earlier run (CI restores `target`, `CARGO_TARGET_TMPDIR` included) would answer
+/// the first lease's tree as a hit instead of a build.
 fn with_trees(config: &mut PodmanConfig) {
     with_cache(config, None);
     let trees = PathBuf::from(format!("{}-trees", config.scratch.display()));
+    support::force_remove(&trees);
     let mut trees = kbf_daemon::trees::TreeConfig::new(trees, 1 << 30);
     trees.min_files = 20;
     config.cache.as_mut().expect("a cache").trees = Some(trees);
@@ -262,4 +267,27 @@ async fn a_container_cannot_change_a_shared_tree_or_lift_its_read_only_flag() {
     let stats = cell.runtime.tree_stats().expect("a store");
     assert_eq!((stats.builds, stats.hits), (1, 1), "{stats:?}");
     cell.assert_clean(2);
+}
+
+/// Catches a cache or tree store that an earlier run of a test leaves for the next (the
+/// "do not empty them in `with_cache`/`with_trees`" mutant: `Cell` removes only its
+/// scratch directory, and CI keeps `target` between runs). The same cell runs twice in
+/// one process, each time from `Cell::with`; the second run's first lease builds the
+/// tree again and finds none of its inputs in the cache, as the first run's did.
+#[tokio::test]
+#[ignore = "needs rootless Podman and a delegated cgroup: run by cargo xtask podman-tests"]
+async fn a_cache_and_tree_store_start_empty_whatever_an_earlier_run_left() {
+    let mut spec = sh("cat src/a; echo; ls tc/lib | wc -l");
+    spec.inputs = toolchain();
+    spec.inputs.push(("src/a", b"small", false));
+    for run in 1..=2 {
+        let cell = Cell::with("trees-again", with_trees);
+        let result = cell.run(1, &spec).await.expect("ran");
+        assert_eq!(cell.stdout(&result), "small\n30\n", "run {run}");
+        let stats = cell.runtime.tree_stats().expect("a store");
+        assert_eq!((stats.builds, stats.hits), (1, 0), "run {run}: {stats:?}");
+        let inputs = cell.runtime.last_inputs().expect("counted");
+        assert_eq!(inputs.cache_hits, 0, "run {run}: {inputs}");
+        cell.assert_clean(1);
+    }
 }

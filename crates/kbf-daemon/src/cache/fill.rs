@@ -57,6 +57,8 @@ pub struct InputCounts {
     pub(crate) verify_hashes: AtomicU64,
     pub(crate) fetched_bytes: AtomicU64,
     pub(crate) link_fallbacks: AtomicU64,
+    pub(crate) links: AtomicU64,
+    pub(crate) copies: AtomicU64,
 }
 
 /// [`InputCounts`] once the inputs are written.
@@ -76,6 +78,13 @@ pub struct InputStats {
     pub fetched_bytes: u64,
     /// Keys this lease got a private copy of instead of a link.
     pub link_fallbacks: u64,
+    /// Files (names) that are hard links to a cache entry. Not in the `Display` line
+    /// (the driver's `inputs phases:` line shows it).
+    pub links: u64,
+    /// Files (names) that are their own copy, not the cache entry's inode: the private
+    /// ones an output path covers, and every name of a key that fell back. With
+    /// `links` and `empty_files`, they add up to `files`. Not in the `Display` line.
+    pub copies: u64,
 }
 
 impl InputCounts {
@@ -92,6 +101,8 @@ impl InputCounts {
             verify_hashes: get(&self.verify_hashes),
             fetched_bytes: get(&self.fetched_bytes),
             link_fallbacks: get(&self.link_fallbacks),
+            links: get(&self.links),
+            copies: get(&self.copies),
         }
     }
 }

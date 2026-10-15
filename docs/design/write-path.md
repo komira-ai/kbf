@@ -216,7 +216,8 @@ native driver gathers its outputs in a `Spool` first (`Cas::put_spool`, which is
 - The idle time is `--segment-upload-idle-secs`. `Commit`'s reply lists the digests
   committed; a failed commit is the call's status.
 - Record hashing (section 6.11) runs on the blocking pool, never on a runtime worker, at
-  most `--cpu-threads` (default `max(2, reserve/2)`, from `--reserve-cpus`) jobs at once.
+  most `--cpu-threads` (default one per CPU the server may use; the server has no
+  `--reserve-cpus`) jobs at once.
 - An upload's connection is found by the peer address of the worker listener's
   tracked connections (`Connections`); a connection's close is seen when the server
   drops its stream.
@@ -585,8 +586,8 @@ Where it differs from the sections above, and why:
   log stays at version 1 until something raises it: a server that never attaches a
   tier writes a log an older binary still reads. `RaftMetaLog::open_running(.., runs)`
   opens as a binary that runs versions up to `runs` would; the server runs
-  `raft_log::RUNS` (version 2). A version past `runs`, committed or asked for, is
-  refused.
+  `raft_log::RUNS` (version 3 since `EvictObjects`, [storage.md](storage.md)). A
+  version past `runs`, committed or asked for, is refused.
 - **The cell's server attaches the tier at each start** as `Cache::attach_tier` does,
   after the raise, and stages, flushes and reads as `cache/tier.rs` and
   `cache/flush.rs` do, over `kbf-tier`'s `Tier` on a second `FaultFs` that a crash

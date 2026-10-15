@@ -63,9 +63,11 @@ pub const MAX_RANGE_BYTES: u64 = 4 << 20;
 /// Blobs of one object closer than this are read with the bytes between them.
 pub const COALESCE_GAP_BYTES: u64 = 1 << 20;
 
-/// One segment of an upload: blobs at consecutive offsets of its record area.
+/// One segment of an upload: blobs at consecutive offsets of its record area. Public
+/// so an implementation of the data plane in the server's own process
+/// (`kbf-all-in-one`) packs outputs into the segments this engine sends.
 #[derive(Clone, Debug, Default)]
-pub(crate) struct Planned {
+pub struct Planned {
     /// Each blob and its offset in the segment, in the order given.
     pub records: Vec<(Record, u64)>,
     /// The record area's length.
@@ -132,7 +134,8 @@ impl Planned {
 /// Packs `records`, in order, into segments of at most `segment_limit` bytes (a blob
 /// that does not fit an empty one gets a segment of its own) and the segments into
 /// uploads of at most `upload_bytes` and `upload_records`.
-pub(crate) fn plan(
+#[must_use]
+pub fn plan(
     records: &[Record],
     segment_limit: u64,
     upload_bytes: u64,
@@ -502,7 +505,10 @@ async fn read_record(record: &Record) -> Result<Vec<u8>, CasError> {
 /// `pieces` of records, read from their sources in one task of the blocking pool into
 /// `total` bytes. A piece that cannot be read, or whose file is no longer the one that
 /// was hashed, fails the whole read, naming its blob.
-async fn read_pieces(pieces: Vec<(Record, u64, u64)>, total: u64) -> std::io::Result<Vec<u8>> {
+///
+/// # Errors
+/// A piece cannot be read, or its file is no longer the one the walk hashed.
+pub async fn read_pieces(pieces: Vec<(Record, u64, u64)>, total: u64) -> std::io::Result<Vec<u8>> {
     let total = usize::try_from(total).unwrap_or(0);
     let read = tokio::task::spawn_blocking(move || {
         let mut bytes = Vec::with_capacity(total);

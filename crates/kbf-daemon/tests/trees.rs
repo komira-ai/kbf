@@ -332,6 +332,41 @@ async fn a_warm_lease_does_not_read_the_directories_below_a_tree() {
     drop(second);
 }
 
+/// The lease's own count of what its inputs cost (`Inputs::phases`, the container
+/// driver's `inputs phases:` line) agrees with the CAS and the files. Catches
+/// `dir_reads` counting only the walk below the classifier (a warm lease's walk reads
+/// nothing: it would say 0, and a cold one 0 too), counting a tree build's reads or the
+/// file blobs (more than 11 cold), `links` counting private copies too (6, not 5), and
+/// `dirs_made` counting the tree's own directories (more than 3).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_leases_phases_count_its_reads_directories_links_and_copies() {
+    let kit = kit("trees-phases", |_| {});
+    let mut input = files("toolchain", 300, "phases");
+    input.extend(small());
+    input.push(("src/o.txt".to_owned(), b"output input".to_vec(), false));
+    let root = kit.cas.tree(&input);
+    let (_, cold) = kit.lease_with(&root, "cold", &["src/o.txt"], "").await;
+    assert_eq!(paths(&cold), ["toolchain"]);
+    // As `a_warm_lease_does_not_read_the_directories_below_a_tree`: root, `src`, `pkg`,
+    // `toolchain` and its 7 subdirectories, read by the classifier; the tree's build and
+    // the walk read none again.
+    assert_eq!(kit.cas.directory_reads(), 11);
+    assert_eq!(cold.phases.dir_reads, 11, "{:?}", cold.phases);
+    let before = kit.cas.directory_reads();
+    let (_, warm) = kit.lease_with(&root, "warm", &["src/o.txt"], "").await;
+    assert_eq!(kit.cas.directory_reads() - before, 3);
+    assert_eq!(warm.phases.dir_reads, 3, "{:?}", warm.phases);
+    for (lease, inputs) in [("cold", &cold), ("warm", &warm)] {
+        let p = inputs.phases;
+        // The files outside the tree: 5 small ones linked, the output-named one copied.
+        assert_eq!(inputs.stats.files, 6, "{lease}: {p:?}");
+        assert_eq!((p.links, p.copies), (5, 1), "{lease}: {p:?}");
+        // `src`, `pkg` and the mount point `toolchain`; nothing inside the tree.
+        assert_eq!(p.dirs_made, 3, "{lease}: {p:?}");
+    }
+    assert_eq!((cold.trees_built, warm.trees_built), (1, 0));
+}
+
 /// Catches a build per lease: two leases that want one tree at once share one build
 /// (the "no single flight" mutant builds twice and reads every blob twice). The CAS is
 /// stalled so the second lease is certain to find the first one building.

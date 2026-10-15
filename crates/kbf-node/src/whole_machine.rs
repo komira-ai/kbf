@@ -10,7 +10,7 @@
 use super::{Cli, Error, Node};
 
 #[cfg(target_os = "macos")]
-pub(super) fn add(cli: &Cli, node: &mut Node) -> Result<(), Error> {
+pub(super) fn add<C: kbf_transfer::Cas>(cli: &Cli, node: &mut Node<C>) -> Result<(), Error> {
     use std::sync::Arc;
 
     use kbf_driver_native::whole_machine::{
@@ -30,13 +30,13 @@ pub(super) fn add(cli: &Cli, node: &mut Node) -> Result<(), Error> {
     config.outputs = cli.outputs;
     config.upload_deadline = super::upload_deadline(cli);
     let session = HelperSession::new(socket, cli.daemon_user.clone());
-    let runtime = WholeMachineRuntime::new(config, session, node.transfers(cli)?)?;
+    let runtime = WholeMachineRuntime::new(config, session, node.plane(cli)?)?;
     node.phase = Some(runtime.phase());
     node.add(Arc::new(runtime))
 }
 
 #[cfg(not(target_os = "macos"))]
-pub(super) fn add(_cli: &Cli, _node: &mut Node) -> Result<(), Error> {
+pub(super) fn add<C>(_cli: &Cli, _node: &mut Node<C>) -> Result<(), Error> {
     Err("the whole-machine driver runs on macOS only".into())
 }
 

@@ -162,6 +162,10 @@ impl MachineVersion {
     /// committed `MachineVersion` entry naming it; every later entry is format 2.
     pub const V2: Self = Self(NonZeroU32::MIN.saturating_add(1));
 
+    /// Version 3: version 2 plus `EvictObjects`, whose entries are [`Format::V3`]. A log
+    /// enters it as it enters version 2.
+    pub const V3: Self = Self(NonZeroU32::MIN.saturating_add(2));
+
     /// The entry format a log at this version writes and reads; `None` for a version
     /// this binary does not know (a later binary's).
     #[must_use]
@@ -169,6 +173,7 @@ impl MachineVersion {
         match self.0.get() {
             1 => Some(Format::V1),
             2 => Some(Format::V2),
+            3 => Some(Format::V3),
             _ => None,
         }
     }

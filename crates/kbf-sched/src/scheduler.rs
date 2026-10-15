@@ -24,7 +24,7 @@ use crate::fence::{HANDOVER_GRACE, LEASE_GRACE};
 use crate::input::{DaemonInstance, Event, Input, Request};
 use crate::requeue::{Requeue, RequeueReason};
 use crate::servable::{Servable, Verdict};
-use memory::MemoryState;
+use memory::{MemoryLadder, MemoryState};
 
 /// At most this many leases are granted per [`Event::Tick`] (one log flush per round).
 pub const PLACEMENT_ROUND: usize = 256;
@@ -63,6 +63,9 @@ struct Operation {
     /// A result from the current holding has been proposed; later reports for it are
     /// duplicates.
     result_proposed: bool,
+    /// The proposed result is the farm's give-up of a silent, replaced or never-started
+    /// lease past its budget ([`Scheduler::give_up_charged`]), not a worker's.
+    gave_up: bool,
     /// While queued: since when, and why, no live worker can run it. `None` while one
     /// can.
     unservable: Option<Unservable>,
@@ -72,6 +75,8 @@ struct Operation {
     /// The workers those runs ended on: placement prefers any other (see
     /// [`Servable::fit`]).
     avoid: BTreeSet<WorkerId>,
+    /// Its leases given up as not started ([`memory::NOT_STARTED_RERUNS`]).
+    not_started: u32,
 }
 
 /// A queued operation no live worker can run: since when, why, and whether the wait
@@ -232,6 +237,8 @@ pub struct Scheduler {
     /// kills ([`memory`]). Boxed: most schedulers hold none, and the scheduler is
     /// moved by value.
     memory: Box<MemoryState>,
+    /// The rungs of an action's memory booking ([`memory`]).
+    ladder: MemoryLadder,
 }
 
 impl Scheduler {
@@ -255,6 +262,7 @@ impl Scheduler {
             requeues: None,
             reservations: BTreeMap::new(),
             memory: Box::default(),
+            ladder: MemoryLadder::default(),
         }
     }
 
@@ -346,6 +354,18 @@ impl Scheduler {
     #[must_use]
     pub fn qos(&self, operation: OperationId) -> Option<&Qos> {
         self.ops.get(&operation).map(|op| &op.request.qos)
+    }
+
+    /// How many operations wait for a lease.
+    #[must_use]
+    pub fn queued_len(&self) -> usize {
+        self.queue.len()
+    }
+
+    /// How many leases are held (granted or running), on all workers.
+    #[must_use]
+    pub fn leases_held(&self) -> usize {
+        self.held.len()
     }
 
     /// Queued operations in the order placement will consider them.
@@ -476,8 +496,10 @@ impl Scheduler {
                 state: OpState::Queued,
                 committed_lease: None,
                 result_proposed: false,
+                gave_up: false,
                 unservable: None,
                 farm_runs: Vec::new(),
+                not_started: 0,
                 avoid: BTreeSet::new(),
             },
         );
@@ -501,6 +523,7 @@ impl Scheduler {
             }
         }
         op.result_proposed = false;
+        op.gave_up = false;
     }
 
     /// Releases `operation`'s holding and puts it back in the queue, recording why.
@@ -798,6 +821,13 @@ impl Scheduler {
         {
             return Vec::new();
         }
+        // The scheduler's own give-up for a lease that never started is not a run to charge.
+        if record.outcome == Outcome::Failed(Failure::Infra)
+            && !self.ops[&id].gave_up
+            && self.rerun_after_infra(record)
+        {
+            return Vec::new();
+        }
         self.release(id);
         let op = self.ops.get_mut(&id).expect("checked above");
         op.state = match record.outcome {
@@ -926,7 +956,7 @@ impl StateMachine for Scheduler {
             } => self.report(operation, lease, outcome),
             Event::Tick => {
                 let mut effects = Vec::new();
-                self.expire();
+                effects.extend(self.expire());
                 self.place(&mut effects);
                 effects
             }

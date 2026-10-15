@@ -55,6 +55,7 @@ pub mod health;
 pub mod http_blobs;
 pub mod http_invocations;
 pub mod identity;
+mod local;
 pub mod machine;
 pub mod mdm;
 mod memory;
@@ -64,6 +65,7 @@ pub mod raft_log;
 pub mod rollout;
 pub mod serve;
 pub mod stamp;
+mod start;
 mod timeout;
 pub mod token;
 pub mod worker;
@@ -73,11 +75,14 @@ pub use config::{Args, ConfigError, MetaLogKind, Role, SERVER, StoreKind};
 pub use farm::Farm;
 pub use health::Readiness;
 pub use identity::{DenyList, DenyListError, Peers};
+pub use kbf_sched::MemoryLadder;
+pub use local::LocalStore;
 pub use raft_log::{RaftLogError, RaftMetaLog};
 pub use serve::{
     Api, Bound, Listeners, ServeError, WorkerTls, bind_server, bind_server_with_api,
     bind_server_with_policy,
 };
+pub use start::{ServerHandle, interrupted, serve_with, sizes_on, start};
 pub use worker::WorkerService;
 
 /// The commit the server was built from: 12 hex digits, or `unknown` when the build

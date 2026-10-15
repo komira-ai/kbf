@@ -14,7 +14,13 @@
 //! - a pure crate renamed or removed, which would otherwise make every check above
 //!   pass vacuously;
 //! - a pure module of an impure crate (`PURE_MODULES`) whose file no longer denies
-//!   the `clippy.toml` lists, or that was moved or removed.
+//!   the `clippy.toml` lists, or that was moved or removed;
+//! - the server and the worker daemon linked together outside the one crate meant to
+//!   (`JOINERS`): `kbf-server` and `kbf-node` are libraries so a combined binary can
+//!   run both in one process, and any other crate that links both, or either one into
+//!   the other's side of the farm, makes the split meaningless;
+//! - a `main.rs` of those two that grows past `THIN_MAIN_LINES` code lines, which
+//!   means assembly that a combined binary could not reuse is back in a binary.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::process::Command;
@@ -205,6 +211,88 @@ fn pure_modules_deny_the_clippy_lists() {
         assert!(
             src.lines().any(|l| l.trim() == DENY_ATTR),
             "{module} must carry `{DENY_ATTR}`"
+        );
+    }
+}
+
+/// The one crate allowed to depend on both the server and the node library: the combined
+/// binary.
+const JOINERS: &[&str] = &["kbf-all-in-one"];
+
+/// What the server library's normal dependencies must not reach: the daemon side. The
+/// server stores and schedules; it never moves blobs as a client.
+const DAEMON_SIDE: &[&str] = &[
+    "kbf-node",
+    "kbf-daemon",
+    "kbf-transfer",
+    "kbf-driver-container",
+    "kbf-driver-native",
+];
+
+/// What the node library's normal dependencies must not reach: the server side.
+const SERVER_SIDE: &[&str] = &["kbf-server", "kbf-front"];
+
+/// Names in `names` that `root`'s normal closure contains, with the chain reaching each.
+fn reaches(g: &Graph, root: &str, names: &[&str]) -> Vec<String> {
+    let (id, _) = g
+        .members
+        .get(root)
+        .unwrap_or_else(|| panic!("{root} is not a workspace member"));
+    normal_closure(g, id)
+        .into_iter()
+        .filter(|(dep, _)| names.contains(&g.names[dep].as_str()))
+        .map(|(_, chain)| chain)
+        .collect()
+}
+
+#[test]
+fn server_and_node_libraries_stay_apart() {
+    let g = load_graph();
+    let mut violations = Vec::new();
+    for lib in ["kbf-server", "kbf-node"] {
+        let (_, root) = &g.members[lib];
+        assert!(root.is_some(), "{lib} must have a library target");
+    }
+    violations.extend(reaches(&g, "kbf-server", DAEMON_SIDE));
+    violations.extend(reaches(&g, "kbf-node", SERVER_SIDE));
+    for (member, (id, _)) in &g.members {
+        if JOINERS.contains(&member.as_str()) {
+            continue;
+        }
+        let linked: BTreeSet<&str> = normal_closure(&g, id)
+            .keys()
+            .map(|dep| g.names[dep].as_str())
+            .collect();
+        if linked.contains("kbf-server") && linked.contains("kbf-node") {
+            violations.push(format!("{member} links both kbf-server and kbf-node"));
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "the server and the node library are linked together outside {JOINERS:?}:\n{}",
+        violations.join("\n")
+    );
+}
+
+/// The most lines of code (not blank, not comment) a binary's `main.rs` may have.
+const THIN_MAIN_LINES: usize = 40;
+
+#[test]
+fn the_server_and_daemon_binaries_are_thin() {
+    let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    for main in ["kbf-server/src/main.rs", "kbf-node/src/main.rs"] {
+        let path = crates.join(main);
+        let src = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let code = src
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with("//"))
+            .count();
+        assert!(
+            code <= THIN_MAIN_LINES,
+            "{main} has {code} code lines (at most {THIN_MAIN_LINES}): the assembly belongs \
+             in the library, where a combined binary can call it"
         );
     }
 }

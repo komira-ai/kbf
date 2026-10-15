@@ -20,6 +20,7 @@ use kbf_types::{Digest, FarmTime};
 use prost::Message;
 use tonic::Status;
 
+use crate::input_tree::{Horizon, InputTreeConfig, InputTrees};
 use crate::meta_log::{MemoryMetaLog, MetaLog, MetaLogError};
 use crate::metrics::CacheMetrics;
 use crate::{MAX_BLOB_BYTES, wire};
@@ -176,6 +177,7 @@ pub struct Cache<M, O> {
     group: Arc<Group>,
     touches: Arc<Touches>,
     segment_limit: u64,
+    trees: Arc<InputTrees>,
 }
 
 impl<M, O> Drop for Cache<M, O> {
@@ -218,7 +220,39 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
             group: Arc::new(Group::new(WriteConfig::DEFAULT)),
             touches: Arc::new(Touches::new(TouchConfig::DEFAULT)),
             segment_limit: MAX_SEGMENT_BYTES,
+            trees: Arc::new(InputTrees::new(InputTreeConfig::DEFAULT)),
         }
+    }
+
+    /// The same cache, remembering input trees as `config` says instead of
+    /// [`InputTreeConfig::DEFAULT`] ([`Cache::missing_inputs`]). Call it before the
+    /// cache serves an Execute.
+    #[must_use]
+    pub fn with_input_trees(mut self, config: InputTreeConfig) -> Self {
+        self.trees = Arc::new(InputTrees::new(config));
+        self
+    }
+
+    /// How many decoded directories the input check keeps, and what they cost in bytes.
+    pub fn input_tree_cache(&self) -> (usize, u64) {
+        (self.trees.len(), self.trees.bytes())
+    }
+
+    pub(crate) fn input_trees(&self) -> &InputTrees {
+        &self.trees
+    }
+
+    /// The farm time now, the farm time until which a blob reported held now stays
+    /// held (now plus the retention's `min_ttl`), and the count of objects lost so far.
+    pub(crate) async fn retention_horizon(&self) -> Result<Horizon, CacheError> {
+        Ok(self
+            .writer
+            .query(|s| Horizon {
+                now: s.now(),
+                until: s.now().saturating_add(s.retention().min_ttl),
+                losses: s.losses(),
+            })
+            .await?)
     }
 
     /// The same cache, packing segments of at most `limit` bytes, footer included,
@@ -433,8 +467,9 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
 
     /// Answers `GetActionResult`: the result, and the digest of the ActionResult blob
     /// it was read from, if the entry passes the closure check (its result blob and
-    /// every blob it needs present and reachable) and the result blob reads back;
-    /// `None` (a miss, so the action runs again) otherwise.
+    /// every blob it needs present and reachable), the store may still hold every
+    /// object those blobs are in, and the result blob reads back; `None` (a miss, so
+    /// the action runs again) otherwise.
     ///
     /// # Errors
     /// The metadata log or the store is unavailable.
@@ -444,17 +479,22 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
     ) -> Result<Option<(Digest, reapi::ActionResult)>, CacheError> {
         let answer = self
             .touched(|s| match s.action(action) {
-                ActionAnswer::Hit { result, touch } => (Ok(result), touch),
+                ActionAnswer::Hit { result, touch } => {
+                    (Ok((result, s.stored_objects(action))), touch)
+                }
                 ActionAnswer::Miss(miss) => (Err(miss), Touch::default()),
             })
             .await?;
-        let result = match answer {
-            Ok(result) => result,
+        let (result, objects) = match answer {
+            Ok(hit) => hit,
             Err(miss) => {
                 tracing::debug!(%action, ?miss, "action cache miss");
                 return Ok(None);
             }
         };
+        if !self.store_may_hold(action, objects).await? {
+            return Ok(None);
+        }
         let bytes = match self.read_blob(&result).await {
             Ok(bytes) => bytes,
             Err(CacheError::NotFound(_) | CacheError::Unreachable(_)) => return Ok(None),
@@ -662,6 +702,28 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
             return Err(CacheError::Unreachable(*digest));
         }
         Ok(bytes)
+    }
+
+    /// Whether the store may still hold each of `objects`, the stored objects an
+    /// action-cache hit on `action` needs ([`ObjectStore::may_hold`]: a local store
+    /// checks its files, a remote one answers yes). The first it does not hold is marked
+    /// unreachable as missing, so the hit becomes a miss and FindMissing reports its
+    /// blobs, rather than the client being sent to download bytes no one has.
+    async fn store_may_hold(
+        &self,
+        action: &Digest,
+        objects: BTreeSet<ObjectId>,
+    ) -> Result<bool, CacheError> {
+        for object in objects {
+            let key = self.object_key(object)?;
+            if !self.writer.objects.may_hold(&key).await? {
+                tracing::error!(%action, %key, "an object an action-cache hit needs is gone from the store: a miss");
+                self.mark_unreachable(object, UnreachableReason::Missing)
+                    .await?;
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     async fn mark_unreachable(

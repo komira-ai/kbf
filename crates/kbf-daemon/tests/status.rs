@@ -2,6 +2,8 @@
 
 #[path = "status/phase.rs"]
 mod phase;
+#[path = "status/pressure.rs"]
+mod pressure;
 mod support;
 
 use std::time::Duration;

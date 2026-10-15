@@ -366,6 +366,77 @@ fn thread_flags_size_the_runtime_and_are_logged() {
     );
 }
 
+/// The memory backstop is on where the kernel reports memory pressure and off, said
+/// so, where it does not (`--psi-memory-file`, which names the file for tests).
+///
+/// Catches: a backstop that never starts (a node under pressure takes leases without
+/// end), one that starts without a readable file (a node on a kernel or a Mac without
+/// pressure stall information would be paused or stop), and the threshold flag not
+/// reaching it.
+#[test]
+fn the_memory_backstop_is_on_only_with_a_readable_pressure_file() {
+    let dir = tls("psi");
+    let file = dir.join("memory.pressure");
+    std::fs::write(&file, "some avg10=0.00 avg60=0.00 avg300=0.00 total=0\n").expect("write");
+    let on = [
+        "--driver=fake".to_owned(),
+        format!("--psi-memory-file={}", file.display()),
+        "--memory-pressure-pause-percent=7.5".to_owned(),
+    ];
+    let (status, log) = runs_until_sigterm_logged("psi", &on, None);
+    assert!(status.success(), "{status}");
+    assert!(
+        log.iter()
+            .any(|l| l.contains("memory backstop: on") && l.contains("above_percent=7.5")),
+        "{log:#?}"
+    );
+    assert!(
+        log.iter().all(|l| !l.contains("memory backstop: off")),
+        "{log:#?}"
+    );
+
+    let off = [
+        "--driver=fake".to_owned(),
+        format!("--psi-memory-file={}", dir.join("missing").display()),
+    ];
+    let (status, log) = runs_until_sigterm_logged("psi", &off, None);
+    assert!(status.success(), "{status}");
+    assert!(
+        log.iter().any(|l| l.contains("memory backstop: off")),
+        "{log:#?}"
+    );
+    assert!(
+        log.iter().all(|l| !l.contains("memory backstop: on")),
+        "{log:#?}"
+    );
+}
+
+/// A pause threshold that is not a percentage above 0 and at most 100 is a usage error
+/// (exit 2) naming the flag and the value.
+///
+/// Catches: a threshold the daemon cannot use starting anyway (0 pauses a node on any
+/// stall, 150 never pauses it), and a word taken as a number.
+#[test]
+fn a_pause_threshold_that_is_no_percentage_is_a_usage_error() {
+    let dir = tls("psi-bad");
+    for bad in ["0", "150", "lots"] {
+        let out = Command::new(BIN)
+            .args(base(&dir))
+            .args([
+                "--driver=fake",
+                &format!("--memory-pressure-pause-percent={bad}"),
+            ])
+            .output()
+            .expect("spawn");
+        assert_eq!(out.status.code(), Some(2), "{bad}: {}", out.status);
+        let stderr = String::from_utf8(out.stderr).expect("stderr is UTF-8");
+        assert!(
+            stderr.contains("--memory-pressure-pause-percent") && stderr.contains(bad),
+            "{bad}: {stderr}"
+        );
+    }
+}
+
 /// A reserve that leaves the daemon no CPU, or is more than the machine has, stops the
 /// start with a message naming the flag and the CPUs; a negative one is a usage error.
 ///
@@ -943,6 +1014,52 @@ fn a_container_node_without_subordinate_ids_refuses_to_start() {
         let says = format!("kbf-daemon: {}/{says}", ids.display());
         assert!(stderr.contains(&says), "{name}: {stderr}");
     }
+}
+
+/// Catches `--container-runtime` and `--oci-runtime` not reaching the driver: a node told
+/// to run actions through a runtime that is not there refuses to start, naming it (the
+/// "ignore the flag" mutant would start a Podman node), and a runtime that is neither
+/// `podman` nor `oci` is refused by the parser.
+#[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "the container driver is Linux-only"
+)]
+fn a_node_told_to_use_the_oci_backend_needs_its_runtime() {
+    let ids = id_files("oci-ids", "65536");
+    let (_unit, cgroup_flags) = cgroup_tree(&tls("oci-cgroup"), "cpu memory pids");
+    let absent = ids.join("no-such-crun");
+    let log = ids.join("stderr");
+    let mut container = vec![
+        "--driver=container".to_owned(),
+        "--cas=https://127.0.0.1:1".to_owned(),
+        format!("--scratch={}", ids.join("leases").display()),
+        format!("--id-files={}", ids.display()),
+        "--actions-memory-max-gib=1".to_owned(),
+        "--container-runtime=oci".to_owned(),
+        format!("--oci-runtime={}", absent.display()),
+    ];
+    container.extend(cgroup_flags);
+    let mut child = Command::new(BIN)
+        .args(base(&ids))
+        .args(&container)
+        .stderr(std::fs::File::create(&log).expect("stderr file"))
+        .spawn()
+        .expect("spawn");
+    let status = refused_within(&mut child, "oci", &log);
+    assert_eq!(status.code(), Some(1));
+    let says = format!("the OCI backend: {} is not a file", absent.display());
+    let stderr = read(&log);
+    assert!(stderr.contains(&says), "{stderr}");
+
+    let out = Command::new(BIN)
+        .args(base(&ids))
+        .args(["--driver=fake", "--container-runtime=runc"])
+        .output()
+        .expect("spawn");
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("possible values: podman, oci"), "{stderr}");
 }
 
 /// The exit status of `child`, a daemon expected to refuse to start, waited for up to

@@ -12,6 +12,7 @@ use crate::model::{
 };
 use crate::tier::{ServerId, StagedObject, StagedPut, TierError, TierId};
 
+mod evict;
 mod staged;
 
 /// One committed change to the metadata state.
@@ -111,6 +112,17 @@ pub enum Command {
         /// The object.
         object: ObjectId,
     },
+    /// The store no longer holds `objects`, or is about to delete them: forget what
+    /// they held. Every blob whose current location is in one of them leaves the
+    /// index, then every action-cache entry whose result or closure names a removed
+    /// blob. A blob that healed into another object stays. The objects' unreachable
+    /// marks are cleared, and [`MetaState::losses`] rises once per object that held a
+    /// blob. A staged object is skipped whole: its only copy is its block, not the
+    /// store. An object nothing names changes nothing, so a retry is a no-op.
+    EvictObjects {
+        /// The objects.
+        objects: BTreeSet<ObjectId>,
+    },
 }
 
 /// What applying a [`Command`] did.
@@ -142,6 +154,8 @@ pub enum Applied {
     /// [`Command::AddTier`], [`Command::SealStaged`], [`Command::ObjectFlushed`] or
     /// [`Command::FlushConflict`].
     Tier(Result<(), TierError>),
+    /// [`Command::EvictObjects`].
+    Evicted(Evicted),
 }
 
 /// What a [`Command::PutBlob`] did.
@@ -169,6 +183,15 @@ pub struct Collected {
     /// account the space in each object as dead.
     pub blobs: Vec<(Digest, Location)>,
     /// Action-cache entries removed.
+    pub actions: Vec<Digest>,
+}
+
+/// What a [`Command::EvictObjects`] removed, each list in digest order.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Evicted {
+    /// Blobs removed from the index.
+    pub blobs: Vec<Digest>,
+    /// Action-cache entries removed, because they needed a removed blob.
     pub actions: Vec<Digest>,
 }
 
@@ -227,6 +250,8 @@ pub struct MetaState {
     blobs: BTreeMap<Digest, BlobEntry>,
     actions: BTreeMap<Digest, ActionEntry>,
     unreachable: BTreeMap<ObjectId, LossMark>,
+    /// How many times an object went from reachable to marked unreachable.
+    losses: u64,
     next_epoch: u64,
     /// Each server's current tier.
     tiers: BTreeMap<ServerId, TierId>,
@@ -250,6 +275,7 @@ impl MetaState {
             blobs: BTreeMap::new(),
             actions: BTreeMap::new(),
             unreachable: BTreeMap::new(),
+            losses: 0,
             next_epoch: 1,
             tiers: BTreeMap::new(),
             retired_tiers: BTreeSet::new(),
@@ -286,6 +312,22 @@ impl MetaState {
     #[must_use]
     pub fn unreachable(&self, object: ObjectId) -> Option<UnreachableReason> {
         self.unreachable.get(&object).map(|mark| mark.reason)
+    }
+
+    /// How many times an object has newly become unreachable: a
+    /// [`Command::ObjectUnreachable`] on an object with no mark counts, and so does one
+    /// after a [`Command::ObjectReachable`] cleared it. A mark that only raises the
+    /// reason or restamps the generation does not count, nor does a clear. It never
+    /// falls.
+    ///
+    /// A blob held in the object answered present until the mark and answers
+    /// unreachable after it, so anything remembered about "these blobs are held" that
+    /// was recorded when this count was lower may be wrong. Whoever adds a command that
+    /// takes held blobs away before their retention ends must count it here:
+    /// [`Command::EvictObjects`] counts each object it took a blob from.
+    #[must_use]
+    pub const fn losses(&self) -> u64 {
+        self.losses
     }
 
     /// `object`'s loss mark, or `None` if it is not marked. A prober reads the
@@ -327,6 +369,9 @@ impl MetaState {
             Command::ObjectUnreachable { object, reason } => {
                 Applied::Marked(self.allocated(object).map(|()| {
                     let generation = Generation::new(index);
+                    if !self.unreachable.contains_key(&object) {
+                        self.losses += 1;
+                    }
                     let mark = self
                         .unreachable
                         .entry(object)
@@ -353,6 +398,7 @@ impl MetaState {
             Command::SealStaged { object } => Applied::Tier(self.seal_staged(object)),
             Command::ObjectFlushed { object } => Applied::Tier(self.object_flushed(object)),
             Command::FlushConflict { object } => Applied::Tier(self.flush_conflict(object)),
+            Command::EvictObjects { objects } => Applied::Evicted(self.evict_objects(&objects)),
         }
     }
 
@@ -427,6 +473,26 @@ impl MetaState {
             result: entry.record.result,
             touch,
         }
+    }
+
+    /// The objects in the store that hold the blobs `action`'s entry needs (its result
+    /// blob and closure), each once: a reader checks the store still has them before it
+    /// serves a hit. A blob staged on a tier is left out (the store does not hold it
+    /// yet), as is one not present. Empty without an entry.
+    #[must_use]
+    pub fn stored_objects(&self, action: &Digest) -> BTreeSet<ObjectId> {
+        self.actions
+            .get(action)
+            .into_iter()
+            .flat_map(|e| iter::once(&e.record.result).chain(e.record.closure.iter()))
+            .filter_map(|d| match self.blob(d) {
+                BlobAnswer::Present {
+                    location,
+                    staged_on: None,
+                } => Some(location.object),
+                _ => None,
+            })
+            .collect()
     }
 
     /// The closure check: the first needed blob that is not present and reachable.

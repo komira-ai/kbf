@@ -21,6 +21,7 @@ use kbf_proto::grpc::health::v1::health_server::HealthServer;
 use kbf_proto::reapi::content_addressable_storage_server::ContentAddressableStorageServer;
 use kbf_proto::worker::segments_server::SegmentsServer;
 use kbf_proto::worker::worker_server::WorkerServer;
+use kbf_sched::MemoryLadder;
 use tonic::service::Routes;
 use tonic::transport::server::TcpIncoming;
 use tonic::transport::{Server, ServerTlsConfig};
@@ -61,6 +62,10 @@ pub struct Listeners {
     /// platform, or none that does is large enough) before it is refused
     /// FAILED_PRECONDITION.
     pub unservable_wait: Duration,
+    /// The memory rungs of an action: the first is what an action that names no size
+    /// books, the others are what it climbs through when it passes its own memory
+    /// limit, before a whole host (`--memory-ladder-gib`).
+    pub memory_ladder: MemoryLadder,
     /// How long a finished operation is kept after its callers are answered, in which
     /// WaitExecution on it still streams its result; then it is NOT_FOUND.
     pub finished_retention: Duration,
@@ -288,12 +293,14 @@ where
     O: ObjectStore + 'static,
 {
     let (recorder, recording) = Recorder::new(listeners.invocation_memory, RECORDER_CHANNEL);
+    let default_memory = listeners.memory_ladder.first();
     let farm = Arc::new(
         Farm::new(
             Arc::clone(&cache),
             listeners.unservable_wait,
             listeners.finished_retention,
         )
+        .with_memory_ladder(listeners.memory_ladder.clone())
         .recording(recorder.clone()),
     );
     let (reapi_incoming, reapi) = bind(listeners.reapi)?;
@@ -370,8 +377,14 @@ where
     let (closer, closing) = kbf_front::closing();
     let authorizers = Arc::new(policy.authorizers);
     let cache_for_health = Arc::clone(&cache);
-    let reapi_routes =
-        kbf_front::routes_recorded(cache, Arc::clone(&farm), closing, authorizers, &recorder);
+    let reapi_routes = kbf_front::routes_recorded(
+        cache,
+        Arc::clone(&farm),
+        closing,
+        authorizers,
+        &recorder,
+        default_memory,
+    );
     let authenticate = AuthenticateLayer::new(policy.authenticator);
     // The layers wrap the REAPI routes (and the fallback for unknown paths) present
     // when they are applied; the health service, added after, is answered without
@@ -416,7 +429,7 @@ where
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tick.tick().await;
-                farm.tick();
+                farm.tick().await;
             }
         };
         // Completes when the drain has run out of time: the REAPI listener, drained

@@ -49,24 +49,29 @@
 //! - a finished operation is kept for [`FINISHED_RETENTION`] after its waiters are
 //!   answered, then dropped (issue #165);
 //! - memory kills (failure classes, 6.1): an action that passed its own memory limit
-//!   runs again with its memory booking doubled, up to the largest node that could run
-//!   it, and its action key keeps the raised booking as a floor for later submissions;
-//!   a kill at that largest node finishes it. A busy node's kill below the action's
+//!   runs again one rung up a fixed [`MemoryLadder`] (4, 16, 32 GiB, then a whole host,
+//!   the largest node that could run it), and its action key keeps the raised booking
+//!   as a floor for later submissions; a kill at that largest node finishes it. A busy node's kill below the action's
 //!   own limit runs it again with the same booking, at most [`FARM_RERUNS`] times, and
 //!   counts against the node ([`Scheduler::memory_pressure`]). See
 //!   [`kbf_types::MemoryRun`].
 //! - farm faults (failure classes, 6.5; issue #22): a busy node's memory kill, a run the
-//!   worker reports lost ([`kbf_types::Failure::Lost`]) and a lease of a daemon proven
-//!   stopped run again from one budget of [`FARM_RERUNS`] per operation, placement
-//!   preferring a node none of those runs ended on; the run past it finishes the
-//!   operation, its callers told every farm run ([`kbf_types::FarmRun`]).
+//!   worker reports lost ([`kbf_types::Failure::Lost`]), a run the farm could not do
+//!   ([`kbf_types::Failure::Infra`]), a lease of a daemon proven stopped, and a lease
+//!   whose `Start` was sent and that was given up for silence or replacement run again
+//!   from one budget of [`FARM_RERUNS`] per operation, placement preferring a node none
+//!   of those runs ended on; the run past it finishes the operation, its callers told
+//!   every farm run ([`kbf_types::FarmRun`]). A give-up past the budget has its result
+//!   proposed through the log. A lease given up as not started (the node heartbeats but
+//!   never listed it) spends none of that: it has its own budget of
+//!   [`NOT_STARTED_RERUNS`] per operation, placement preferring another node, and the
+//!   give-up past it ends the operation with [`kbf_types::Failure::Infra`], proposed
+//!   through the log.
 //!
 //! Not yet: placement scoring (alignment, best fit), a reservation for a large
 //! `action` request (issue #169), reclaimed room and preemption, a budget for the
-//! other farm failures (a [`kbf_types::Failure::Infra`] result still finishes its
-//! operation) and for leases given up for silence or replacement without proof, and
-//! committing submissions so that a new leader inherits the queue. In v0 the scheduler
-//! runs on the leader only.
+//! leases given up for reconnection, and committing submissions so that a new leader
+//! inherits the queue. In v0 the scheduler runs on the leader only.
 //!
 //! This is a pure crate: no async runtime, network, clock, randomness or hashed
 //! collections. The layering test in `kbf-it` and the lists in `clippy.toml` enforce it.
@@ -87,5 +92,7 @@ pub use fence::SelfFence;
 pub use input::{DaemonInstance, Event, Input, Request};
 pub use kbf_types::NodePhase;
 pub use requeue::{Gib, Requeue, RequeueReason};
-pub use scheduler::memory::{FARM_RERUNS, MEMORY_FLOORS, MemoryState, raised};
+pub use scheduler::memory::{
+    FARM_RERUNS, LadderError, MEMORY_FLOORS, MemoryLadder, MemoryState, NOT_STARTED_RERUNS,
+};
 pub use scheduler::{FINISHED_RETENTION, OpState, PLACEMENT_ROUND, Scheduler, UNSERVABLE_WAIT};

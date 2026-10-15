@@ -5,7 +5,6 @@
 
 #![allow(dead_code)] // Each test binary uses its own part of this module.
 
-#[cfg(target_os = "linux")]
 pub mod cache_kit;
 pub mod memory;
 
@@ -605,6 +604,7 @@ impl<R: Runtime> Harness<R> {
             clock,
             driver,
             None,
+            None,
         )
         .await
     }
@@ -630,6 +630,36 @@ impl<R: Runtime> Harness<R> {
             None,
             None,
             Some(phase),
+            None,
+        )
+        .await
+    }
+
+    /// Starts a server and a daemon running leases through `runtime`, which stops
+    /// taking leases while `stall` is above `above` and a lease runs
+    /// ([`Daemon::with_memory_backstop`]), and whose runtime's phase, if it has one, is
+    /// what `phase` holds. It checks the fence every 20 ms.
+    pub async fn with_memory_backstop(
+        name: &str,
+        runtime: Arc<R>,
+        stall: tokio::sync::watch::Receiver<Option<f64>>,
+        above: f64,
+        phase: Option<tokio::sync::watch::Receiver<kbf_types::NodePhase>>,
+    ) -> Self {
+        let runtimes = Runtimes::new(Arc::clone(&runtime));
+        let configure = |config: &mut DaemonConfig| {
+            config.recheck_every = Duration::from_millis(20);
+        };
+        Self::build_with(
+            name,
+            runtimes,
+            runtime,
+            Duration::from_secs(40),
+            configure,
+            None,
+            None,
+            phase,
+            Some((stall, above)),
         )
         .await
     }
@@ -644,6 +674,7 @@ impl<R: Runtime> Harness<R> {
         clock: Option<Arc<dyn Clock>>,
         driver: Option<tokio::sync::watch::Receiver<DriverReport>>,
         phase: Option<tokio::sync::watch::Receiver<kbf_types::NodePhase>>,
+        pressure: Option<(tokio::sync::watch::Receiver<Option<f64>>, f64)>,
     ) -> Self {
         let pki = pki(name);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -694,6 +725,10 @@ impl<R: Runtime> Harness<R> {
         }
         if let Some(phase) = phase {
             daemon = daemon.with_phase(phase);
+        }
+        if let Some((stall, above)) = pressure {
+            daemon = daemon.with_memory_backstop(stall, above);
+            assert_eq!(daemon.memory_backstop(), Some(above));
         }
         let daemon = tokio::spawn(daemon.run(std::future::pending()));
         Self {

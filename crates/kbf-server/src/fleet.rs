@@ -70,6 +70,8 @@ pub enum PhaseView {
         /// Why, as the node said.
         reason: String,
     },
+    /// Its memory is under pressure: it takes no new lease until that falls.
+    MemoryPressure,
 }
 
 impl PhaseView {
@@ -87,6 +89,7 @@ impl PhaseView {
             NodePhase::Quarantined(reason) => Self::Quarantined {
                 reason: reason.clone(),
             },
+            NodePhase::MemoryPressure => Self::MemoryPressure,
         }
     }
 }

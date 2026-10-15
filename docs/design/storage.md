@@ -46,8 +46,10 @@ Bytes never enter the metadata layer; the object store never decides anything.
 - the next writer epoch.
 
 It changes only through `Command`s applied in order: `Tick`, `AllocEpoch`, `PutBlob`,
-`PutBlobs`, `PutAction`, `Touch`, `ObjectUnreachable`, `ObjectReachable`, `Collect`.
-Reads are queries against the committed state.
+`PutBlobs`, `PutAction`, `Touch`, `ObjectUnreachable`, `ObjectReachable`, `Collect`;
+the write tier's `AddTier`, `PutStaged`, `SealStaged`, `ObjectFlushed`,
+`FlushConflict` (log format 2, [write-path.md](write-path.md) section 6.5); and
+`EvictObjects` (log format 3). Reads are queries against the committed state.
 
 An object id is a writer epoch and a sequence number. `AllocEpoch` returns an epoch
 greater than every one before it; a cache takes one when it opens (`Cache::open`) and
@@ -61,7 +63,7 @@ The front reaches it only through the `MetaLog` trait: `commit` a command and ge
 what applying it did, or run a read-only `query`. `MemoryMetaLog` is one state behind a
 lock in the server process. `RaftMetaLog` (`--meta-log=raft`, in
 `kbf-server/src/raft_log`) exists today as a **single-voter** Raft log on the local
-disk in `--raft-dir`, and needs `--store=s3`: `commit` encodes the command, proposes
+disk in `--raft-dir`, and needs `--store=s3` or `--blob-dir`: `commit` encodes the command, proposes
 it, syncs it, applies it and only then answers. Commits are grouped: commands that
 arrive while a sync is in progress are written together and made durable by the next
 single sync, and each is answered after it; a lone command is committed at once. The
@@ -145,6 +147,18 @@ collection removed it first.
 `Collect` removes every expired blob and action entry and returns what it removed,
 with the location of each blob's bytes, so their space can be accounted as dead.
 
+`EvictObjects { objects }` forgets objects the store no longer holds, whatever their
+retention: every blob whose current location is in one of them leaves the index (a
+blob healed into another object stays), then every action entry whose result or
+closure names a removed blob. It clears the objects' unreachable marks, skips staged
+objects (their only copy is a block on a tier), and raises the loss count once per
+object that held a blob, which the input-tree skip cache reads. It is one scan of the
+index and one of the action cache, on the log's apply path. It is log format 3
+(`kbf_log::Format::V3`, machine version 3, `MetaCommand` field 15): a format-1 or
+format-2 log refuses it on encode and decode. Nothing commits it yet; it is for
+eviction under disk pressure and for a start-up pass that finds index entries with no
+object behind them.
+
 Today, under `--meta-log=raft`, the server commits a `Tick` every second while the log
 is open (`raft_log::TICK`), so the metadata's farm time advances and continues across
 restarts. Under `--meta-log=memory` nothing advances it, and the index is lost at
@@ -224,6 +238,46 @@ its neighbours, whose bytes checked, are served.
 the stored `ActionResult`. A result blob that cannot be read or decoded is a miss.
 Outputs are never inlined into the response.
 
+### Input tree check
+
+Execute's input check (`Cache::missing_inputs`) walks the input root `Directory` and
+reports every blob under it that is not held. Two memories, in the server's RAM, derived
+from the metadata and never in the log (a restart starts both empty), keep a build from
+paying for the same toolchain on every action:
+
+- **Decoded directories**, by digest: the file and subdirectory digests of each
+  Directory read. A digest names its content, so an entry is never stale. A least
+  recently used cache bounded by `--input-tree-cache-entries` and
+  `--input-tree-cache-bytes`.
+- **A verified-until farm time per directory.** A check that finds a directory and
+  everything under it held, having touched every blob it relied on, records
+  `until = now + min_ttl`, with `now` read before the check's first report. A touched
+  blob is held for at least `min_ttl` from the report ([Retention and
+  touches](#retention-and-touches)), so until then a later check skips the directory
+  without reading or asking. At or after `until` it checks again and touches again. A
+  directory resting on a skipped subtree takes the earlier of the two times. The
+  guarantee is the process's own: it rests on touches pending in this server, which a
+  collection commits before it collects, and a restart forgets both memories together.
+  With more than one server, a server's pending touches are not seen by a collection
+  another server runs; the skip is then right only while no other server collects (none
+  does today), and the touches would have to reach the leader first.
+- **The loss count it was verified at.** Retention does not cover an object marked
+  unreachable (a read found it gone or damaged): its blobs answer unreachable, and
+  FindMissingBlobs lists them, long before `until`. The metadata state counts the objects
+  that newly became unreachable; a verification records the count its check began at, and
+  a skip needs the same count when the request begins. One new mark therefore sends the
+  next check of each tree through the full walk once, from the decoded directories (no
+  store read; every blob touched and asked about), which records the new count. No
+  index from objects to the trees they hold is kept. A single flight is shared only
+  between requests that began at the same count.
+
+Subdirectories are checked concurrently, with at most
+`--input-tree-reads-in-flight` store reads at once across all requests. A directory
+being checked for one request is waited for, not checked again, by any other that reaches
+it. A directory whose blob is gone is reported, and nothing under it is looked at.
+`kbf_execute_dir_reads_total` and `kbf_input_*` in `docs/api.md#get-metrics` count what
+was read, taken from memory, skipped, and joined.
+
 ## Segments
 
 A segment (`kbf-segments`) packs many blobs into one object, so the store holds a few
@@ -268,6 +322,7 @@ addresses one bucket.
 | `capabilities()` | what the store claims beyond the base contract |
 | `put_new(key, body, retain_until)` | write an immutable object, optionally under a retention date |
 | `get_range(key, range)` | read the bytes of a range that exist; a range starting past the end is an error |
+| `may_hold(key)` | `false` only if the store knows, without a request, that it lacks the key (a local store); others answer `true` and a read finds out. Asked before an action-cache hit is served |
 | `delete(key)` | delete; deleting an absent key succeeds, so a retry is safe |
 | `list(prefix, after, max_keys)` | one page of keys, ascending; for rebuilds and sweeps only |
 
@@ -287,6 +342,22 @@ normalisation between kbf and a store can turn one key into another.
 
 - `MemoryStore`: in memory; the executable form of the contract and the store tests
   use.
+- `FsStore` (`kbf-server --blob-dir`): a directory on the local disk, for a farm on
+  one host without an S3 service. One file per object under `objects/<hh>/<h>`, `<h>`
+  the SHA-256 of the key in hex and `<hh>` its first two digits; the file is a header
+  naming the key, then the object's bytes. A write goes to a file in `tmp/`, synced,
+  then linked under its final name (a link never replaces a name, so the store has
+  conditional writes and of two writers of one key exactly one succeeds), and the
+  directory synced before the write is answered; a crash leaves at most a file in
+  `tmp/`, which the next open removes. A read checks the header names the key asked
+  for; a file too short for its header (or empty) is no object, read as `NotFound`;
+  the bytes are checked by the cache, as from any store. Nothing reads the objects at
+  open. `may_hold` (a stat and a header read, no hashing) answers whether a key's
+  object is there; the cache asks it for every object an action-cache hit needs and
+  turns the hit into a miss if one is gone (stores that would need a request answer
+  yes without one). A write that would leave less free space than the store's floor
+  is refused; nothing is evicted. The directory is locked while a store is open on
+  it. No Object Lock.
 - `S3Store`: the S3 REST API with path-style addressing and SigV4 signing of every
   payload. A ranged read answered with anything but the exact range is refused. On a
   store with Object Lock, delete names the exact object version, so a retained object
@@ -296,8 +367,8 @@ normalisation between kbf and a store can turn one key into another.
 **Conformance suite.** `kbf_objstore::conformance::run` checks a store's base contract
 (round trip, ranged reads at the boundaries, a missing key, idempotent delete, list
 paging) and every capability it claims. A backend is trusted only once it passes. CI
-runs the suite against the in-memory store and against MinIO and RustFS containers,
-each with a plain bucket and an Object Lock bucket.
+runs the suite against the in-memory store, the local-directory store, and MinIO and
+RustFS containers, each with a plain bucket and an Object Lock bucket.
 
 ## Capabilities
 
