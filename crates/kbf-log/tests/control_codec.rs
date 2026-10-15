@@ -857,12 +857,12 @@ fn a_wall_time_outside_u64_nanoseconds_is_not_written() {
 }
 
 /// Catches a control command written or read under a format this build does not know
-/// (format 3; formats 1 and 2 both carry control commands, since format 2 only adds
-/// the write-tier metadata commands).
+/// (format 4; formats 1 to 3 all carry control commands, since formats 2 and 3 only add
+/// metadata commands).
 #[test]
 fn control_commands_refuse_an_unknown_format() {
     let command = batch(FarmInput::Tick);
-    let format = Format::new(3);
+    let format = Format::new(4);
     assert_eq!(encode(format, &command), Err(EncodeError::Format(format)));
     assert_eq!(
         kbf_log::decode(format, &enc(&command)),
@@ -871,16 +871,23 @@ fn control_commands_refuse_an_unknown_format() {
 }
 
 /// Catches: a machine version that names the wrong entry format (mutant "every version
-/// is format 1": a raised log would still refuse the write tier's commands, or a
-/// version-1 log would accept them), and a version this binary does not know given a
-/// format instead of none (it must stop the machine, not be read as a known one).
+/// is format 1": a raised log would still refuse the write tier's commands or
+/// `EvictObjects`, or a version-1 log would accept them), and a version this binary
+/// does not know given a format instead of none (it must stop the machine, not be read
+/// as a known one).
 #[test]
 fn machine_versions_name_their_entry_formats() {
     assert_eq!(MachineVersion::V1.get(), 1);
     assert_eq!(MachineVersion::V2.get(), 2);
     assert_eq!(MachineVersion::V1.format(), Some(Format::V1));
     assert_eq!(MachineVersion::V2.format(), Some(Format::V2));
-    let v3 = MachineVersion::new(NonZeroU32::new(3).expect("non-zero"));
-    assert_eq!(v3.format(), None);
-    assert!(MachineVersion::V1 < MachineVersion::V2 && MachineVersion::V2 < v3);
+    assert_eq!(MachineVersion::V3.get(), 3);
+    assert_eq!(MachineVersion::V3.format(), Some(Format::V3));
+    let v4 = MachineVersion::new(NonZeroU32::new(4).expect("non-zero"));
+    assert_eq!(v4.format(), None);
+    assert!(
+        MachineVersion::V1 < MachineVersion::V2
+            && MachineVersion::V2 < MachineVersion::V3
+            && MachineVersion::V3 < v4
+    );
 }

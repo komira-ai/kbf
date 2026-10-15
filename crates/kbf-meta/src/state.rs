@@ -12,6 +12,7 @@ use crate::model::{
 };
 use crate::tier::{ServerId, StagedObject, StagedPut, TierError, TierId};
 
+mod evict;
 mod staged;
 
 /// One committed change to the metadata state.
@@ -111,6 +112,17 @@ pub enum Command {
         /// The object.
         object: ObjectId,
     },
+    /// The store no longer holds `objects`, or is about to delete them: forget what
+    /// they held. Every blob whose current location is in one of them leaves the
+    /// index, then every action-cache entry whose result or closure names a removed
+    /// blob. A blob that healed into another object stays. The objects' unreachable
+    /// marks are cleared, and [`MetaState::losses`] rises once per object that held a
+    /// blob. A staged object is skipped whole: its only copy is its block, not the
+    /// store. An object nothing names changes nothing, so a retry is a no-op.
+    EvictObjects {
+        /// The objects.
+        objects: BTreeSet<ObjectId>,
+    },
 }
 
 /// What applying a [`Command`] did.
@@ -142,6 +154,8 @@ pub enum Applied {
     /// [`Command::AddTier`], [`Command::SealStaged`], [`Command::ObjectFlushed`] or
     /// [`Command::FlushConflict`].
     Tier(Result<(), TierError>),
+    /// [`Command::EvictObjects`].
+    Evicted(Evicted),
 }
 
 /// What a [`Command::PutBlob`] did.
@@ -169,6 +183,15 @@ pub struct Collected {
     /// account the space in each object as dead.
     pub blobs: Vec<(Digest, Location)>,
     /// Action-cache entries removed.
+    pub actions: Vec<Digest>,
+}
+
+/// What a [`Command::EvictObjects`] removed, each list in digest order.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Evicted {
+    /// Blobs removed from the index.
+    pub blobs: Vec<Digest>,
+    /// Action-cache entries removed, because they needed a removed blob.
     pub actions: Vec<Digest>,
 }
 
@@ -300,7 +323,8 @@ impl MetaState {
     /// A blob held in the object answered present until the mark and answers
     /// unreachable after it, so anything remembered about "these blobs are held" that
     /// was recorded when this count was lower may be wrong. Whoever adds a command that
-    /// takes held blobs away before their retention ends must count it here.
+    /// takes held blobs away before their retention ends must count it here:
+    /// [`Command::EvictObjects`] counts each object it took a blob from.
     #[must_use]
     pub const fn losses(&self) -> u64 {
         self.losses
@@ -374,6 +398,7 @@ impl MetaState {
             Command::SealStaged { object } => Applied::Tier(self.seal_staged(object)),
             Command::ObjectFlushed { object } => Applied::Tier(self.object_flushed(object)),
             Command::FlushConflict { object } => Applied::Tier(self.flush_conflict(object)),
+            Command::EvictObjects { objects } => Applied::Evicted(self.evict_objects(&objects)),
         }
     }
 

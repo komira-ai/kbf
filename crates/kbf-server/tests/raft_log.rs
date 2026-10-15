@@ -11,7 +11,8 @@ use std::time::Duration;
 use kbf_front::{MetaLog, MetaLogError};
 use kbf_log::{Bootstrap, FarmLogId, Format, LogCommand, MachineVersion, Takeover};
 use kbf_meta::{
-    Applied, BlobWrite, Command, Epoch, Location, ObjectId, Retention, ServerId, StoreId, TierId,
+    Applied, BlobWrite, Command, Epoch, Evicted, Location, ObjectId, Retention, ServerId, StoreId,
+    TierId,
 };
 use kbf_raft::{Entry, LogId, LogIndex, Payload, Snapshot, Storage};
 use kbf_server::raft_log::{RECORD, RECORD_TMP, TICK};
@@ -585,8 +586,8 @@ async fn a_log_raised_past_what_a_binary_runs_refuses_its_open() {
         .expect("a raise");
     let raised = log.applied_index();
     assert_eq!(log.commit(add_tier()).await, Ok(Applied::Tier(Ok(()))));
-    let v3 = MachineVersion::new(NonZeroU32::new(3).expect("non-zero"));
-    assert!(log.raise_machine_version(v3).is_err());
+    let v4 = MachineVersion::new(NonZeroU32::new(4).expect("non-zero"));
+    assert!(log.raise_machine_version(v4).is_err());
     assert_eq!(log.machine_version(), MachineVersion::V2);
     drop(log);
     let rolled_back = RaftMetaLog::open_running(
@@ -602,10 +603,10 @@ async fn a_log_raised_past_what_a_binary_runs_refuses_its_open() {
         "{rolled_back:?}"
     );
     let unknown =
-        RaftMetaLog::open_running(fs.restart(), Retention::default(), "kbf/", || Ok(id(4)), v3)
+        RaftMetaLog::open_running(fs.restart(), Retention::default(), "kbf/", || Ok(id(4)), v4)
             .await;
     assert!(
-        matches!(&unknown, Err(RaftLogError::Runs(v)) if *v == v3),
+        matches!(&unknown, Err(RaftLogError::Runs(v)) if *v == v4),
         "{unknown:?}"
     );
     let log = open(&fs.restart(), 4).await;
@@ -613,11 +614,45 @@ async fn a_log_raised_past_what_a_binary_runs_refuses_its_open() {
     assert_eq!(log.commit(add_tier()).await, Ok(Applied::Tier(Ok(()))));
     drop(log);
     let dir = fs.restart();
-    let later = append(&dir, Format::V2, &LogCommand::MachineVersion(v3));
+    let later = append(&dir, Format::V2, &LogCommand::MachineVersion(v4));
     let refused = refusal(&dir.restart(), 4).await;
     assert!(
         matches!(&refused, RaftLogError::Decode { index, .. } if *index == later),
         "{refused:?}"
+    );
+}
+
+/// Catches: a binary whose highest machine version stays 2 (mutant `RUNS = V2`), which
+/// could never take `EvictObjects`; and an `EvictObjects` committed into a log below
+/// version 3, which a version-2 replica would refuse. The raise lasts across a restart.
+#[tokio::test(start_paused = true)]
+async fn raising_the_machine_version_to_3_lets_evict_objects_commit_and_lasts() {
+    let evict = || Command::EvictObjects {
+        objects: [ObjectId::new(Epoch::new(1), 1)].into(),
+    };
+    let fs = FaultFs::new();
+    let log = open(&fs, 6).await;
+    for to in [MachineVersion::V1, MachineVersion::V2] {
+        log.raise_machine_version(to).expect("a raise");
+        let refused = log.commit(evict()).await;
+        assert!(
+            matches!(refused, Err(MetaLogError::Unavailable(_))),
+            "at {to:?}: {refused:?}"
+        );
+    }
+    log.raise_machine_version(MachineVersion::V3)
+        .expect("a raise");
+    assert_eq!(log.machine_version(), MachineVersion::V3);
+    assert_eq!(
+        log.commit(evict()).await,
+        Ok(Applied::Evicted(Evicted::default()))
+    );
+    drop(log);
+    let log = open(&fs.restart(), 6).await;
+    assert_eq!(log.machine_version(), MachineVersion::V3);
+    assert_eq!(
+        log.commit(evict()).await,
+        Ok(Applied::Evicted(Evicted::default()))
     );
 }
 

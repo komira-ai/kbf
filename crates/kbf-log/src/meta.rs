@@ -1,5 +1,7 @@
 //! `kbf_meta::Command` to and from `kbf.log.v1.MetaCommand`.
 
+use std::collections::BTreeSet;
+
 use kbf_meta::{
     ActionRecord, Closure, Command, Epoch, Generation, Location, ObjectId, Role, ServerId,
     StagedPut, StoreId, TierId, Touch, UnreachableReason,
@@ -8,7 +10,7 @@ use kbf_proto::kbf::log::v1 as proto;
 use kbf_types::{Digest, DigestFunction, FarmTime};
 use proto::meta_command::Command as P;
 
-use crate::{DecodeError, EncodeError};
+use crate::{DecodeError, EncodeError, Format};
 
 /// Whether `command` joined the log in [`Format::V2`](crate::Format::V2).
 pub(crate) const fn since_v2(command: &Command) -> bool {
@@ -20,6 +22,23 @@ pub(crate) const fn since_v2(command: &Command) -> bool {
             | Command::ObjectFlushed { .. }
             | Command::FlushConflict { .. }
     )
+}
+
+/// Whether `command` joined the log in [`Format::V3`](crate::Format::V3).
+pub(crate) const fn since_v3(command: &Command) -> bool {
+    matches!(command, Command::EvictObjects { .. })
+}
+
+/// Whether `format` takes `command`: format 1 takes neither the format-2 nor the
+/// format-3 commands, format 2 takes no format-3 command.
+pub(crate) const fn takes(format: Format, command: &Command) -> bool {
+    if since_v3(command) {
+        format.get() >= Format::V3.get()
+    } else if since_v2(command) {
+        format.get() >= Format::V2.get()
+    } else {
+        true
+    }
 }
 
 pub(crate) fn to_proto(command: &Command) -> Result<proto::MetaCommand, EncodeError> {
@@ -88,6 +107,9 @@ pub(crate) fn to_proto(command: &Command) -> Result<proto::MetaCommand, EncodeEr
         }),
         Command::FlushConflict { object } => P::FlushConflict(proto::FlushConflict {
             object: Some(object_id(*object)),
+        }),
+        Command::EvictObjects { objects } => P::EvictObjects(proto::EvictObjects {
+            objects: objects.iter().copied().map(object_id).collect(),
         }),
     };
     Ok(proto::MetaCommand { command: Some(c) })
@@ -230,6 +252,9 @@ pub(crate) fn from_proto(command: proto::MetaCommand) -> Result<Command, DecodeE
             P::FlushConflict(c) => Command::FlushConflict {
                 object: required_object(c.object, "FlushConflict.object")?,
             },
+            P::EvictObjects(e) => Command::EvictObjects {
+                objects: object_set(e.objects, "EvictObjects.objects")?,
+            },
         },
     )
 }
@@ -306,6 +331,21 @@ fn set(digests: Vec<proto::Digest>, field: &'static str) -> Result<Vec<Digest>, 
         return Err(DecodeError::SetOrder(field));
     }
     Ok(out)
+}
+
+/// A set of object ids, refused unless strictly increasing: one set, one encoding.
+fn object_set(
+    objects: Vec<proto::ObjectId>,
+    field: &'static str,
+) -> Result<BTreeSet<ObjectId>, DecodeError> {
+    let ids: Vec<ObjectId> = objects
+        .into_iter()
+        .map(|o| ObjectId::new(Epoch::new(o.epoch), o.seq))
+        .collect();
+    if ids.windows(2).any(|w| w[0] >= w[1]) {
+        return Err(DecodeError::SetOrder(field));
+    }
+    Ok(ids.into_iter().collect())
 }
 
 fn required_object(

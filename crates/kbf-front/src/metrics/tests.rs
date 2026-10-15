@@ -127,6 +127,9 @@ fn each_command_has_its_own_label() {
         Command::SealStaged { object },
         Command::ObjectFlushed { object },
         Command::FlushConflict { object },
+        Command::EvictObjects {
+            objects: [object].into(),
+        },
     ];
     let labels: Vec<&str> = commands
         .iter()
