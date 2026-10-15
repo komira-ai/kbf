@@ -260,6 +260,63 @@ fn a_file_that_cannot_be_opened_is_reported_once_and_tried_again_after_a_small_w
     assert_eq!(kept, want);
 }
 
+/// Catches: a second failure while the file is already failing being reported again
+/// (stderr flooded while a disk stays broken). With one file kept, a retry removes the
+/// current file instead of renaming it; a directory there cannot be removed that way,
+/// so the retry fails as the open did, and nothing more is reported.
+#[test]
+fn a_retry_that_fails_again_is_not_reported_again() {
+    let dir = fresh_dir("blocked-one");
+    fs::create_dir_all(&dir).expect("dir");
+    fs::create_dir(dir.join(FILE_NAME)).expect("blocker");
+    let reports = Reports::default();
+    let log = LogFile::open_reporting(&dir, 1 << 30, 1, reports.sink());
+    let line = |n: u32| format!("{n:04}{}", "x".repeat(1019));
+    write(&log, (0..200).map(line));
+    assert_eq!(reports.all().len(), 1, "reported once: {:?}", reports.all());
+    assert!(
+        dir.join(FILE_NAME).is_dir(),
+        "the blocker is left as it was"
+    );
+}
+
+/// Catches: a rotation that fails, or loses the new line, when the current file was
+/// removed by hand while the server ran (no current file to rename to `.1`).
+#[test]
+fn a_current_file_removed_by_hand_is_started_again_at_the_next_rotation() {
+    let dir = fresh_dir("removed");
+    let log = open(&dir, 100, 3);
+    write(&log, ["first".to_owned()]);
+    fs::remove_file(dir.join(FILE_NAME)).expect("remove the current file");
+    write(&log, ["x".repeat(120)]);
+    assert_eq!(
+        fs::read_to_string(dir.join(FILE_NAME)).expect("current"),
+        format!("{}\n", "x".repeat(120))
+    );
+    assert!(
+        !dir.join(format!("{FILE_NAME}.1")).exists(),
+        "nothing to shift"
+    );
+}
+
+/// Catches: a rotation error other than a missing file (here a directory where `.2`
+/// goes) being ignored as if the file were absent, so `.1` would be overwritten; it is
+/// reported, and the server goes on.
+#[test]
+fn a_rotation_blocked_by_a_directory_is_reported_not_ignored() {
+    let dir = fresh_dir("rot-blocked");
+    fs::create_dir_all(dir.join(format!("{FILE_NAME}.2")).join("inside")).expect("blocker");
+    fs::write(dir.join(format!("{FILE_NAME}.1")), "older\n").expect(".1");
+    let reports = Reports::default();
+    let log = LogFile::open_reporting(&dir, 100, 3, reports.sink());
+    write(&log, ["x".repeat(60), "y".repeat(60)]);
+    assert_eq!(reports.all().len(), 1, "{:?}", reports.all());
+    assert_eq!(
+        fs::read_to_string(dir.join(format!("{FILE_NAME}.1"))).expect(".1"),
+        "older\n"
+    );
+}
+
 /// Catches: a write error (disk full) that panics, or stops later events from being
 /// written once the disk has room; and one that is reported on every line.
 /// `/dev/full` fails every write with ENOSPC.

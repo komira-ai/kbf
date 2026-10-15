@@ -174,11 +174,12 @@ impl Rotating {
         } else if self.size > 0 && self.size.saturating_add(len) > self.max_bytes {
             self.rotate()?;
         }
-        if let Some(file) = self.file.as_mut() {
-            file.write_all(line)?;
-            self.size = self.size.saturating_add(len);
-            self.failing = false;
-        }
+        // Every path above leaves a file open (or has returned), so this writes.
+        self.file
+            .as_mut()
+            .map_or(Ok(()), |file| file.write_all(line))?;
+        self.size = self.size.saturating_add(len);
+        self.failing = false;
         Ok(())
     }
 

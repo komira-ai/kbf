@@ -99,7 +99,7 @@ pub async fn run_flusher<M: MetaLog, O: ObjectStore>(cache: Arc<Cache<M, O>>, ev
 /// sealed and flushed logs nothing (that is every second of a busy server), and a
 /// flush that failed is logged where it fails, with its retry wait, by `kbf-front`.
 pub fn report_round(round: &FlushRound) {
-    if round.conflicts.is_empty() && round.corrupt.is_empty() {
+    if round.conflicts.len() + round.corrupt.len() == 0 {
         return;
     }
     tracing::warn!(
