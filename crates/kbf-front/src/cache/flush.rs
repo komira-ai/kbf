@@ -168,8 +168,7 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
                 let found = verify_records(&records, &listed);
                 (records, found)
             })
-            .await
-            .map_err(|e| CacheError::Internal(e.message().to_owned()))?;
+            .await?;
         if !found.bad.is_empty() {
             return self.drop_mismatched(staging, object, &records, found).await;
         }

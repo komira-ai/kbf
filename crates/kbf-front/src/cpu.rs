@@ -10,6 +10,25 @@ use std::sync::{Arc, Mutex, PoisonError};
 use tokio::sync::Semaphore;
 use tonic::Status;
 
+use crate::cache::CacheError;
+
+/// A hashing job that did not run to its end (it panicked).
+#[derive(Clone, Debug, thiserror::Error)]
+#[error("a hashing job failed: {0}")]
+pub(crate) struct JobFailed(String);
+
+impl From<JobFailed> for Status {
+    fn from(failed: JobFailed) -> Self {
+        Status::internal(failed.to_string())
+    }
+}
+
+impl From<JobFailed> for CacheError {
+    fn from(failed: JobFailed) -> Self {
+        CacheError::Internal(failed.to_string())
+    }
+}
+
 /// A job for the pool. Boxed so the pool has one copy of its code, not one per closure.
 pub(crate) type Job = Box<dyn FnOnce() + Send + 'static>;
 
@@ -31,8 +50,8 @@ impl HashPool {
     /// caller cancelled meanwhile (even before it had a permit) still sees the job run.
     ///
     /// # Errors
-    /// INTERNAL if the job panicked.
-    pub(crate) async fn run(&self, job: Job) -> Result<(), Status> {
+    /// [`JobFailed`] if the job panicked.
+    pub(crate) async fn run(&self, job: Job) -> Result<(), JobFailed> {
         let permits = Arc::clone(&self.permits);
         tokio::spawn(async move {
             // The semaphore is never closed, so a permit always comes.
@@ -45,7 +64,7 @@ impl HashPool {
         })
         .await
         .and_then(std::convert::identity)
-        .map_err(|e| Status::internal(format!("a hashing job failed: {e}")))
+        .map_err(|e| JobFailed(e.to_string()))
     }
 }
 
@@ -53,11 +72,11 @@ impl HashPool {
     /// Runs `compute` as [`HashPool::run`] does and returns what it returned.
     ///
     /// # Errors
-    /// INTERNAL if the job panicked.
+    /// [`JobFailed`] if the job panicked.
     pub(crate) async fn compute<T: Default + Send + 'static>(
         &self,
         compute: impl FnOnce() -> T + Send + 'static,
-    ) -> Result<T, Status> {
+    ) -> Result<T, JobFailed> {
         let slot = Arc::new(Mutex::new(None));
         let there = Arc::clone(&slot);
         self.run(Box::new(move || {
@@ -120,7 +139,7 @@ mod tests {
             .compute(|| -> u32 { panic!("boom") })
             .await
             .unwrap_err();
-        assert_eq!(failed.code(), Code::Internal, "{failed:?}");
+        assert!(failed.to_string().starts_with("a hashing job failed"));
     }
 
     /// A job runs on a thread of its own, not on the thread that awaits it (here the
@@ -146,11 +165,15 @@ mod tests {
     async fn a_panicking_job_is_an_internal_error_and_frees_its_permit() {
         let pool = HashPool::new(NonZeroUsize::MIN);
         let failed = pool.run(Box::new(|| panic!("boom"))).await.unwrap_err();
-        assert_eq!(failed.code(), Code::Internal, "{failed:?}");
         assert!(
-            failed.message().starts_with("a hashing job failed"),
+            failed.to_string().starts_with("a hashing job failed"),
             "{failed:?}"
         );
+        // Each caller's error type names it: INTERNAL to a daemon, internal to the cache.
+        let status = Status::from(failed.clone());
+        assert_eq!(status.code(), Code::Internal, "{status:?}");
+        let cache = CacheError::from(failed);
+        assert!(matches!(cache, CacheError::Internal(_)), "{cache:?}");
         let ran = Arc::new(AtomicUsize::new(0));
         let again = Arc::clone(&ran);
         tokio::time::timeout(

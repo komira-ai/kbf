@@ -129,8 +129,7 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
                 let end = usize::try_from(records_len).unwrap_or(usize::MAX);
                 verify_records(&work[..end.min(work.len())], &blobs)
             })
-            .await
-            .map_err(|e| CacheError::Internal(e.message().to_owned()))?;
+            .await?;
         if let Some(bad) = found.bad.first() {
             return Err(CacheError::DigestMismatch {
                 claimed: bad.claimed,

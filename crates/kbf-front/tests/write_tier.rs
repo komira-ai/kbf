@@ -440,6 +440,40 @@ async fn a_block_of_only_damaged_records_leaves_nothing_behind() {
     }
 }
 
+/// Catches: a sound record whose new block cannot be committed (the log refuses the
+/// `PutStaged`) that fails the round, retries an object that already left the queue,
+/// or is reported as staged. The damaged record is still dropped and counted, the
+/// object is marked corrupt, and both blobs are unavailable until a new upload heals
+/// them: the failure costs availability, never correctness.
+#[tokio::test]
+async fn a_sound_record_that_cannot_be_staged_again_is_unavailable_until_uploaded() {
+    let farm = Farm::new(Capabilities::default());
+    let cache = farm.start(GIB).await;
+    let blobs = blobs(1, 2, 4096);
+    cache.store_blobs(verified(&blobs)).await.expect("stored");
+    let (at, _) = farm.log.located(&blobs[1].digest);
+    let offset = usize::try_from(at.offset).expect("offset") + 7;
+    farm.fs.flip(&block_name(at.object), offset);
+    farm.log.refuse("put_staged", 1);
+    let round = cache.flush_tier(later()).await.expect("not an error");
+    assert_eq!(
+        (round.corrupt, round.dropped),
+        (vec![at.object], vec![blobs[1].digest])
+    );
+    assert!(round.retrying.is_empty(), "{:?}", round.retrying);
+    assert_eq!(farm.log.applied("put_staged"), 1, "only the first upload");
+    for b in &blobs {
+        assert_eq!(farm.log.answer(&b.digest), BlobAnswer::Unavailable);
+    }
+    let again = cache.flush_tier(later()).await.expect("round");
+    assert_eq!(again, kbf_front::FlushRound::default());
+    assert!(farm.store.put_keys().is_empty());
+    cache.store_blobs(verified(&blobs)).await.expect("again");
+    for b in &blobs {
+        assert_eq!(cache.read_blob(&b.digest).await.expect("healed"), b.bytes);
+    }
+}
+
 /// Catches: writes refused (or lost) at the budget instead of going to the store; a
 /// staged block evicted to make room; disk use over the budget; a tier that never
 /// takes writes again once a flush frees room (flushed copies not evicted for a
