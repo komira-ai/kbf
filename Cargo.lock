@@ -1258,6 +1258,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "kbf-cas-conformance"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "kbf-front",
+ "kbf-proto",
+ "kbf-transfer",
+ "kbf-types",
+ "tokio",
+ "tonic",
+]
+
+[[package]]
 name = "kbf-coverage"
 version = "0.1.0"
 dependencies = [

@@ -1,0 +1,26 @@
+[package]
+name = "kbf-cas-conformance"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+# The checks every implementation of the daemon's data plane (`kbf_transfer::Cas`) must
+# pass, generic over the implementation. Not a dependency of any shipped binary: each
+# implementation's own tests depend on it.
+[dependencies]
+futures.workspace = true
+kbf-proto.workspace = true
+kbf-transfer.workspace = true
+kbf-types.workspace = true
+tokio = { workspace = true, features = ["fs", "io-util"] }
+
+[dev-dependencies]
+kbf-front.workspace = true
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread"] }
+tonic.workspace = true
+
+[lints]
+workspace = true

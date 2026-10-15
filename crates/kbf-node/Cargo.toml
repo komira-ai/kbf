@@ -7,7 +7,8 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
-# The worker daemon binary. It lives apart from the `kbf-daemon` library because it
+# The worker daemon: the `kbf_node` library (the flags, the driver set-up, the serve loop)
+# and the thin `kbf-daemon` binary over it. It lives apart from the `kbf-daemon` library because it
 # names the drivers, and the drivers depend on that library.
 [[bin]]
 name = "kbf-daemon"

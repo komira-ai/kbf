@@ -64,6 +64,7 @@ pub mod raft_log;
 pub mod rollout;
 pub mod serve;
 pub mod stamp;
+mod start;
 mod timeout;
 pub mod token;
 pub mod worker;
@@ -78,6 +79,7 @@ pub use serve::{
     Api, Bound, Listeners, ServeError, WorkerTls, bind_server, bind_server_with_api,
     bind_server_with_policy,
 };
+pub use start::{ServerHandle, interrupted, serve_with, sizes_on, start};
 pub use worker::WorkerService;
 
 /// The commit the server was built from: 12 hex digits, or `unknown` when the build
