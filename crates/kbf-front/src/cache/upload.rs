@@ -6,9 +6,11 @@ use bytes::Bytes;
 use futures::future::try_join_all;
 use kbf_meta::{BlobAnswer, Location, ObjectId, StoreId};
 use kbf_objstore::{ByteRange, ObjectStore, ObjectStoreError};
-use kbf_segments::IndexEntry;
+use kbf_segments::layout::encode_footer;
+use kbf_segments::{Footer, IndexEntry};
 use kbf_types::Digest;
 
+use super::verify::verify_records;
 use super::{Cache, CacheError};
 use crate::meta_log::MetaLog;
 
@@ -18,6 +20,11 @@ use crate::meta_log::MetaLog;
 pub(crate) struct BuiltSegment {
     pub body: Bytes,
     pub entries: Vec<IndexEntry>,
+    /// Whether every record was hashed to its digest, and `entries` carry the CRC-32C
+    /// of that pass. An unverified segment (an upload on a write tier, which trusts the
+    /// daemon's digests) is staged as it is, and the flusher hashes it before the PUT;
+    /// one the tier does not take is hashed here before it is PUT.
+    pub verified: bool,
 }
 
 impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
@@ -31,7 +38,8 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
     /// the flusher PUTs the object later. A segment the tier does not take (no tier,
     /// at its budget, a disk error before the commit) is stored as a grouped segment
     /// is (`Writer::store_segment`): under a `--write-puts-in-flight` slot, its PUT
-    /// retried under a new key, its footer read back. The PUT segments of the upload
+    /// retried under a new key, its footer read back, after its records were hashed if
+    /// they were not (a segment is never PUT unverified). The PUT segments of the upload
     /// are then indexed by **one** [`PutBlobs`](kbf_meta::Command::PutBlobs).
     ///
     /// Nothing PUT is indexed unless every PUT and read-back succeeded: a failure
@@ -41,7 +49,8 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
     ///
     /// # Errors
     /// The store or the metadata log failed; a footer read back without a record the
-    /// server put in it ([`CacheError::Internal`]).
+    /// server put in it ([`CacheError::Internal`]); a record of a segment the tier did
+    /// not take that does not hash to its digest ([`CacheError::DigestMismatch`]).
     pub(crate) async fn store_upload(
         &self,
         segments: Vec<BuiltSegment>,
@@ -68,6 +77,11 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         if self.writer.stage(segment.body.clone(), true).await? {
             return Ok(Vec::new());
         }
+        let segment = if segment.verified {
+            segment
+        } else {
+            self.verify_built(segment).await?
+        };
         let (object, key, footer) = self
             .writer
             .store_segment(&self.group, segment.body, segment.entries.len())
@@ -95,6 +109,41 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
                 ))
             })
             .collect()
+    }
+
+    /// Hashes every record of an unverified `segment` against its entry's digest, on the
+    /// hashing pool, and rebuilds the footer from the CRC-32C of that pass (the
+    /// daemon's never reaches the store).
+    ///
+    /// # Errors
+    /// [`CacheError::DigestMismatch`] for the first record that does not hash to its
+    /// digest; [`CacheError::Internal`] if the hashing job failed.
+    async fn verify_built(&self, segment: BuiltSegment) -> Result<BuiltSegment, CacheError> {
+        let BuiltSegment { body, entries, .. } = segment;
+        let records_len = Footer::parse(&body, body.len() as u64)?.records_len();
+        let work = body.clone();
+        let blobs: Vec<(Digest, u64)> = entries.iter().map(|e| (e.digest, e.offset)).collect();
+        let found = self
+            .hashing()
+            .compute(move || {
+                let end = usize::try_from(records_len).unwrap_or(usize::MAX);
+                verify_records(&work[..end.min(work.len())], &blobs)
+            })
+            .await?;
+        if let Some(bad) = found.bad.first() {
+            return Err(CacheError::DigestMismatch {
+                claimed: bad.claimed,
+                actual: bad.actual,
+            });
+        }
+        // The same entry count as the declared footer, so the same length.
+        let footer = encode_footer(records_len, &found.good);
+        let records = &body[..usize::try_from(records_len).unwrap_or(body.len())];
+        Ok(BuiltSegment {
+            body: Bytes::from([records, footer.as_slice()].concat()),
+            entries: found.good,
+            verified: true,
+        })
     }
 
     /// Where each of `digests` is, in order: the object and offset of a blob present
