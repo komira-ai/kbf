@@ -45,7 +45,7 @@ mod tests;
 use std::path::{Path, PathBuf};
 
 pub use check::{CheckError, Failure, Report};
-pub use config::{LinuxConfig, LinuxError, MetaLog};
+pub use config::{LinuxConfig, LinuxError};
 pub use host::HostError;
 pub use render::{Templates, Units};
 

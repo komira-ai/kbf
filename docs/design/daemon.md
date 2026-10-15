@@ -182,7 +182,7 @@ under the same scratch directory (and, for containers, the same node id and Podm
 store) still runs, and the leases its first heartbeat leaves out, which the scheduler
 requeues once the handover grace has passed, do not run twice. That is also why the
 restarted daemon may say so: once every runtime is built, the `kbf-daemon` binary
-names the previous daemon process, whose id it finds in `<--scratch>/daemon-instance`,
+names the previous daemon process, whose id it finds in `<--data-dir>/leases/daemon-instance`,
 as `Hello.predecessor_instance_id`, and writes its own id there for the next one. The
 server then requeues those leases at once, not after the grace, if the previous
 stream has closed (issue #22; [scheduler.md](scheduler.md#reconciling-with-what-workers-say-they-run)). The grace alone would
@@ -267,7 +267,7 @@ others in the order given. Two that serve the same kind refuse to start (`contai
 native-whole-machine`.
 
 - **`PodmanRuntime`** (`kbf-driver-container`, driver `container`, Linux only): the
-  runtime for Linux farm nodes, below. The binary requires `--scratch` and `--cas`, and
+  runtime for Linux farm nodes, below. The binary requires `--data-dir` and `--cas`, and
   checks the daemon user's subordinate ids before it starts. It then sets up the cgroup
   its systemd unit delegates (`Delegate=yes`): it moves its processes into a
   `supervisor/` leaf, writes its `memory.min` from `--supervisor-memory-min-mib`
@@ -291,7 +291,7 @@ native-whole-machine`.
   only): each `whole_machine` lease as a throwaway user in that user's GUI session,
   through the root helper `kbf-mac-session`
   ([fleet-updates.md](fleet-updates.md#101-no-gpu-in-vms)). The binary requires
-  `--scratch` (its files go in `<scratch>/whole-machine`) and `--cas`, and refuses to
+  `--data-dir` (its files go in `<scratch>/whole-machine`) and `--cas`, and refuses to
   start when nothing serves `--mac-session-socket`. It hands the daemon its phase
   (`Daemon::with_phase`), which every `Hello` carries
   ([worker-protocol.md](worker-protocol.md#node-phases)): the session switch restarts
@@ -454,7 +454,7 @@ state database is touched.
   action sees as the image's own id. One flight per digest. After that a lease costs one
   `stat`. Tar's extended attributes are not extracted (file capabilities are lost).
 - **Node requirements** beyond the Podman path's: `crun`, `uidmap`, one subordinate range
-  of 65,536, every directory from `/` to `--scratch` searchable by others (the
+  of 65,536, every directory from `/` to `--data-dir` searchable by others (the
   container's ids are not the daemon user's: `chmod o+x`), kernel overlayfs in a user
   namespace (5.11 or later). The daemon checks the range, the paths and the files at
   start and refuses to start naming what is wrong.

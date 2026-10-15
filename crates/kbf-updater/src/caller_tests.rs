@@ -92,7 +92,7 @@ fn native_driver_command_lines_are_recognised() {
         (b"kbf-daemon\0--driver=native", true),
         (b"kbf-daemon\0--driver\0container\0", false),
         (b"kbf-daemon\0native\0--driver", false),
-        (b"kbf-daemon\0--scratch\0native\0", false),
+        (b"kbf-daemon\0--data-dir\0native\0", false),
         (b"", false),
     ] {
         assert_eq!(uses_native_driver(cmdline), native, "{cmdline:?}");

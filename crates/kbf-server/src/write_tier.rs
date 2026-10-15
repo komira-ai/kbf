@@ -1,5 +1,5 @@
 //! The local write tier in the server (`docs/design/write-path.md`, section 6): the
-//! start that attaches `--write-tier-dir` to the cache, over either metadata log, and
+//! start that attaches the hot store to the cache, over either metadata log, and
 //! the background task that seals and flushes its blocks.
 
 use std::sync::Arc;
@@ -9,9 +9,11 @@ use kbf_front::{Cache, MemoryMetaLog, MetaLog, MetaLogError, TierStartError, Tie
 use kbf_log::MachineVersion;
 use kbf_objstore::ObjectStore;
 use kbf_store::{Fs, StdFs};
+use kbf_tier::TierOptions;
 
 use crate::RaftMetaLog;
-use crate::config::{Args, SERVER};
+use crate::config::SERVER;
+use crate::stores::Hot;
 
 /// How often the flusher runs a round ([`Cache::flush_tier`]).
 pub const FLUSH_EVERY: Duration = Duration::from_secs(1);
@@ -21,17 +23,17 @@ pub const FLUSH_EVERY: Duration = Duration::from_secs(1);
 pub enum WriteTierError {
     /// The metadata log could not be readied for the tier's commands
     /// ([`TierLog::ready_for_tier`]).
-    #[error("--write-tier-dir: {0}")]
+    #[error("--hot-store: {0}")]
     Log(MetaLogError),
     /// The directory could not be created.
-    #[error("--write-tier-dir: {0}")]
+    #[error("--hot-store: {0}")]
     Dir(std::io::Error),
     /// An earlier start's files could not be deleted.
-    #[error("--write-tier-dir: {0}")]
+    #[error("--hot-store: {0}")]
     Clear(kbf_tier::TierError),
     /// The start was refused (a wrong or missing `TIER` while objects are staged, an
     /// abandon flag naming another tier, a disk or log failure).
-    #[error("--write-tier-dir: {0}")]
+    #[error("--hot-store: {0}")]
     Start(#[from] TierStartError),
 }
 
@@ -91,15 +93,15 @@ where
 /// [`WriteTierError`].
 pub async fn attach<M: TierLog, O: ObjectStore>(
     cache: Cache<M, O>,
-    args: &Args,
+    hot: Option<&Hot>,
 ) -> Result<(Cache<M, O>, Option<TierStartup>), WriteTierError> {
-    let Some((dir, options)) = args.write_tier() else {
+    let Some(hot) = hot else {
         return Ok((cache, None));
     };
-    let fs = StdFs::new(dir).map_err(WriteTierError::Dir)?;
+    let fs = StdFs::new(&hot.dir).map_err(WriteTierError::Dir)?;
     cache.meta().ready_for_tier(&fs)?;
     let (cache, startup) = cache
-        .attach_tier(fs, options, SERVER, args.tier.abandon())
+        .attach_tier(fs, TierOptions::new(hot.budget), SERVER, hot.abandon)
         .await?;
     tracing::info!(
         tier = %startup.tier,

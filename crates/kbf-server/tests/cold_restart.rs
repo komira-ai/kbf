@@ -2,9 +2,10 @@
 //! process stopped, a new one over the same bucket with nothing of the old one's
 //! memory (issue #156, items 4 and 6).
 //!
-//! These tests pin what is lost, not what should be. Under the default
-//! `--meta-log=memory` the action cache and the CAS index are in memory, so a restart
-//! forgets them; under `--meta-log=raft` ([`Cell::start_raft`]) they are kept, along
+//! These tests pin what is lost, not what should be. Under the
+//! in-memory metadata log (tests only; the binary always runs the Raft log) the action
+//! cache and the CAS index are in memory, so a restart forgets them; under the Raft log
+//! ([`Cell::start_raft`]) they are kept, along
 //! with the log id and the object key prefix. Cordons and drains are in memory in both
 //! modes, so a restart forgets them, and every start logs a warning that says so. A
 //! change that makes any of it durable turns the matching assertion red and must flip
@@ -28,7 +29,7 @@ use tonic::Code;
 /// written before, and one that leaves the old process running keeps its daemon's
 /// stream open and its cache alive. Also catches a restart that writes under the
 /// earlier start's key prefix: the first upload after it replaces an object the old
-/// process wrote (the store has no conditional writes, as `--s3-conditional-put` off).
+/// process wrote (the store has no conditional writes, as `conditional-put` off).
 ///
 /// Today, after a restart, the action cache misses and the CAS reports every blob
 /// missing, while their bytes are still in the bucket: the index is in memory.
@@ -89,7 +90,7 @@ async fn a_cold_restart_forgets_the_action_cache_and_the_cas_index() {
     assert!(now.len() > written.len(), "the new process wrote no object");
 }
 
-/// The same restart under `--meta-log=raft`: the new process reopens the Raft log the
+/// The same restart under the Raft metadata log: the new process reopens the Raft log the
 /// old one left.
 ///
 /// Catches: a restart that draws a new log id (it commits a second `Bootstrap`, or

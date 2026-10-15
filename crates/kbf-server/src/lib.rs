@@ -2,8 +2,10 @@
 //! metadata core and storage together; the decisions are theirs.
 //!
 //! - REAPI on one listener: the cache services and `Execution` from `kbf-front`, over
-//!   a [`kbf_front::Cache`] (metadata in memory, or in a single-voter Raft log on the
-//!   local disk with `--meta-log=raft`, [`raft_log`]; an in-memory or S3 object store).
+//!   a [`kbf_front::Cache`] (metadata in a single-voter Raft log on the local disk,
+//!   [`raft_log`]; an S3 or local-directory object store, with an optional local hot
+//!   store in front of it; the flags that choose them are `--cold-store`,
+//!   `--hot-store` and `--meta-dir`, see [`stores`]).
 //! - `kbf.worker.v1` on another ([`worker`]): daemons register, heartbeat, receive
 //!   lease offers and `Start`s, and report results. Under mutual TLS a daemon's
 //!   certificate must name its node, and a deny list refuses certificates and nodes
@@ -64,12 +66,13 @@ pub mod raft_log;
 pub mod rollout;
 pub mod serve;
 pub mod stamp;
+pub mod stores;
 mod timeout;
 pub mod token;
 pub mod worker;
 pub mod write_tier;
 
-pub use config::{Args, ConfigError, MetaLogKind, Role, SERVER, StoreKind};
+pub use config::{Args, ConfigError, Role, SERVER, s3_store};
 pub use farm::Farm;
 pub use health::Readiness;
 pub use identity::{DenyList, DenyListError, Peers};

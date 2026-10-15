@@ -1,5 +1,5 @@
-//! The `kbf-server` binary: flags, both stores, both metadata logs, the start line, and a
-//! clean stop.
+//! The `kbf-server` binary: flags, the cold and hot stores, the metadata log, the start
+//! line, and a clean stop.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener};
@@ -66,11 +66,32 @@ fn first_line(what: &str, out: impl Read + Send + 'static) -> String {
     }
 }
 
-fn server(args: &[&str]) -> Command {
+/// The server with exactly `args`.
+fn bare(args: &[&str]) -> Command {
     let mut c = Command::new(BIN);
     c.args(args)
         .env_remove("AWS_ACCESS_KEY_ID")
         .env_remove("AWS_SECRET_ACCESS_KEY");
+    c
+}
+
+/// The server with `args`, over a `file://` cold store and metadata directory of its own
+/// (in a fresh directory under the target directory) unless `args` name a cold store:
+/// every start needs one, and most tests are about something else.
+fn server(args: &[&str]) -> Command {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+    if args.contains(&"--cold-store") {
+        return bare(args);
+    }
+    let base = fresh_dir(&format!(
+        "default-stores-{}",
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    let cold = format!("file://{}", base.join("cold").display());
+    let mut c = bare(args);
+    c.args(["--cold-store", &cold, "--meta-dir"])
+        .arg(base.join("meta"));
     c
 }
 
@@ -168,14 +189,15 @@ fn prints_name_and_version() {
     );
 }
 
-/// Catches: a server that does not serve REAPI with execution enabled in memory mode,
-/// that prints a start line without its version and commit or the addresses it bound,
-/// or that does not stop cleanly on SIGINT.
+/// Catches: a server that does not serve REAPI with execution enabled over a `file://`
+/// cold store, that prints a start line without its version and commit or the addresses
+/// it bound, or that does not stop cleanly on SIGINT.
 #[cfg(unix)]
 #[test]
-fn memory_mode_serves_execution_and_stops_on_interrupt() {
-    let mut c = server(&["--role", "all", "--store", "memory"]);
-    c.args(ANY_PORT);
+fn file_mode_serves_execution_and_stops_on_interrupt() {
+    let base = fresh_dir("file-mode");
+    let mut c = file_server(&base);
+    c.args(["--role", "all"]);
     let (child, line, reapi) = started(c);
     assert!(
         line.starts_with(&format!("kbf-server {} reapi=", built_version())),
@@ -210,14 +232,16 @@ fn memory_mode_serves_execution_and_stops_on_interrupt() {
 /// exactly that many async workers (the `kbf-async` threads of `/proc`).
 ///
 /// Catches: flags parsed and dropped (the runtime built with tokio's default, one
-/// worker per CPU, which the thread count shows), and a start that logs nothing about
-/// its sizes.
+/// worker per CPU, which the thread count shows on a machine of four CPUs or more), and
+/// a start that logs nothing about its sizes. The runtime names its blocking threads
+/// as it names its workers, and the metadata log runs its commits on the blocking pool,
+/// so the count is the two workers plus the blocking threads that have run, at most two.
 #[cfg(target_os = "linux")]
 #[test]
 fn thread_flags_size_the_runtime_and_are_logged() {
     let mut c = server(&[
-        "--async-threads=3",
-        "--blocking-threads=5",
+        "--async-threads=2",
+        "--blocking-threads=2",
         "--cpu-threads=2",
     ]);
     c.args(ANY_PORT)
@@ -235,18 +259,21 @@ fn thread_flags_size_the_runtime_and_are_logged() {
             .map(|name| name.trim().to_owned())
             .collect();
         let workers = names.iter().filter(|name| *name == "kbf-async").count();
-        if workers == 3 || std::time::Instant::now() > deadline {
+        if workers >= 2 || std::time::Instant::now() > deadline {
             break (workers, names);
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     };
-    assert_eq!(workers, 3, "threads of the server: {names:?}");
+    assert!(
+        (2..=4).contains(&workers),
+        "threads of the server: {names:?}"
+    );
     let mut stderr = child.0.stderr.take().expect("stderr");
     interrupt(child);
     let mut log = String::new();
     stderr.read_to_string(&mut log).expect("UTF-8 stderr");
     assert!(
-        log.contains("threads: async=3 blocking=5 cpu=2 (cpus="),
+        log.contains("threads: async=2 blocking=2 cpu=2 (cpus="),
         "{log}"
     );
     assert!(!log.contains("reserve"), "{log}");
@@ -306,12 +333,7 @@ fn api_listen_serves_the_operator_api() {
     let mut c = server(&["--api-listen", "127.0.0.1:0"]);
     c.args(ANY_PORT);
     let (child, line, _) = started(c);
-    let api: SocketAddr = line
-        .rsplit_once(" api=")
-        .unwrap_or_else(|| panic!("no api= at the end of {line:?}"))
-        .1
-        .parse()
-        .expect("an address");
+    let api = api_of(&line);
     let mut stream = std::net::TcpStream::connect(api).expect("connect to the API");
     stream
         .write_all(b"GET /v1/nodes HTTP/1.1\r\nHost: kbf\r\nConnection: close\r\n\r\n")
@@ -366,12 +388,7 @@ fn api_token_file_gates_writes() {
     c.args(ANY_PORT);
     let (child, line, _) = started(c);
     assert!(!line.contains(TOKEN), "{line}");
-    let api: SocketAddr = line
-        .rsplit_once(" api=")
-        .expect("an API address")
-        .1
-        .parse()
-        .expect("an address");
+    let api = api_of(&line);
     let json = "Content-Type: application/json\r\n";
     let refused = post(api, "/v1/nodes/ghost:cordon", json);
     assert!(refused.starts_with("HTTP/1.1 401"), "{refused}");
@@ -416,17 +433,9 @@ fn an_unsafe_api_token_file_stops_the_start() {
 #[cfg(target_os = "linux")]
 #[test]
 fn sigint_is_caught_before_the_start_line_is_printed() {
-    let memory = server(&["--store", "memory"]);
-    let s3 = with_keys(server(&[
-        "--store",
-        "s3",
-        "--s3-endpoint",
-        "http://127.0.0.1:9",
-        "--s3-bucket",
-        "kbf-test",
-    ]));
-    for (mode, mut c) in [("memory", memory), ("s3", s3)] {
-        c.args(ANY_PORT);
+    let file = file_server(&fresh_dir("sigint-file"));
+    let s3 = raft_server(&fresh_dir("sigint-s3"));
+    for (mode, c) in [("file", file), ("s3", s3)] {
         held_at_the_start_line_then_interrupted(mode, c);
     }
 }
@@ -499,54 +508,40 @@ fn catches_sigint(pid: i32) -> bool {
     caught & (1 << (libc::SIGINT - 1)) != 0
 }
 
-/// Catches: `--store=s3` that does not build an S3 store from its flags and the key
-/// pair (the store does no I/O until used, so the server starts).
+/// Catches: an `s3://` cold store that does not build an S3 store from its URI and the
+/// key pair (the store does no I/O until used, so the server starts).
 #[cfg(unix)]
 #[test]
-fn s3_mode_starts_with_flags_and_the_key_pair() {
+fn s3_mode_starts_with_a_uri_and_the_key_pair() {
+    let meta = fresh_dir("s3-starts");
     let mut c = with_keys(server(&[
-        "--store",
-        "s3",
-        "--s3-endpoint",
-        "http://127.0.0.1:9",
-        "--s3-bucket",
-        "kbf-test",
-        "--s3-conditional-put",
+        "--cold-store",
+        "s3://kbf-test/farm?endpoint=http://127.0.0.1:9&conditional-put=true&region=eu-1&min-put-rate=4096",
+        "--meta-dir",
     ]));
-    c.args(ANY_PORT);
+    c.arg(&meta).args(ANY_PORT);
     let (child, _, _) = started(c);
     interrupt(child);
 }
 
-/// Catches: an S3 server that starts without its bucket flags or its key pair, or
-/// with a configuration the store refuses, instead of exiting 2 and saying why.
+/// Catches: an S3 server that starts without its key pair, or with a configuration the
+/// store refuses, instead of exiting 2 and saying why; and a store URI that cannot name
+/// a store (no endpoint, an unknown scheme, `memory:`, no `--cold-store` at all) taken
+/// as one.
 #[test]
 fn s3_mode_refuses_what_is_missing_or_wrong() {
-    let (code, stderr) = fails(server(&["--store", "s3"]));
-    assert_eq!(code, Some(2));
-    assert!(
-        stderr.contains("--s3-endpoint") && stderr.contains("--s3-bucket"),
-        "{stderr}"
-    );
-
-    let s3_bucket = |bucket: &str, extra: &[&str]| {
-        let mut c = server(&[
-            "--store",
-            "s3",
-            "--s3-endpoint",
-            "http://127.0.0.1:9",
-            "--s3-bucket",
-            bucket,
-        ]);
-        c.args(extra).args(ANY_PORT);
+    let meta = fresh_dir("s3-refused");
+    let s3 = |uri: &str| {
+        let mut c = server(&["--cold-store", uri, "--meta-dir"]);
+        c.arg(&meta).args(ANY_PORT);
         c
     };
-    let s3 = |extra: &[&str]| s3_bucket("kbf-test", extra);
-    let (code, stderr) = fails(s3(&[]));
+    let good = "s3://kbf-test?endpoint=http://127.0.0.1:9";
+    let (code, stderr) = fails(s3(good));
     assert_eq!(code, Some(2));
     assert!(stderr.contains("AWS_ACCESS_KEY_ID must be set"), "{stderr}");
 
-    let mut no_secret = s3(&[]);
+    let mut no_secret = s3(good);
     no_secret.env("AWS_ACCESS_KEY_ID", "kbf-test-access");
     let (code, stderr) = fails(no_secret);
     assert_eq!(code, Some(2));
@@ -555,17 +550,33 @@ fn s3_mode_refuses_what_is_missing_or_wrong() {
         "{stderr}"
     );
 
-    let (code, stderr) = fails(with_keys(s3_bucket("B", &[])));
+    let (code, stderr) = fails(with_keys(s3("s3://B?endpoint=http://127.0.0.1:9")));
     assert_eq!(code, Some(2));
     assert!(stderr.contains("bucket name"), "{stderr}");
 
-    let (code, stderr) = fails(with_keys(s3(&["--s3-prefix", "no spaces/"])));
-    assert_eq!(code, Some(2));
-    assert!(stderr.contains("--s3-prefix"), "{stderr}");
+    for (uri, says) in [
+        ("s3://kbf-test", "needs endpoint="),
+        (
+            "s3://kbf-test/no%20spaces?endpoint=http://127.0.0.1:9",
+            "s3 URI prefix",
+        ),
+        (
+            "s3://kbf-test?endpoint=http://127.0.0.1:9&typo=1",
+            "use endpoint, region",
+        ),
+        ("memory://", "no memory: store"),
+        ("gs://bucket/p", "unknown scheme"),
+        ("/var/lib/kbf", "not a store URI"),
+        ("file://host/x", "file:///absolute/path"),
+    ] {
+        let (code, stderr) = fails(with_keys(s3(uri)));
+        assert_eq!(code, Some(2), "{uri}: {stderr}");
+        assert!(stderr.contains(says), "{uri}: {stderr}");
+    }
 }
 
-/// A fresh, empty raft directory for `name`, under the target directory.
-fn raft_dir(name: &str) -> std::path::PathBuf {
+/// A fresh, absent directory for `name`, under the target directory.
+fn fresh_dir(name: &str) -> std::path::PathBuf {
     let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
         .join("kbf-server-binary")
         .join(format!("{name}-{}", std::process::id()));
@@ -573,26 +584,39 @@ fn raft_dir(name: &str) -> std::path::PathBuf {
     dir
 }
 
-/// A `--store=s3 --meta-log=raft` server over `dir` (the store does no I/O until used).
+/// The `--cold-store` URI of an S3 store that does no I/O until used (nothing listens
+/// at the endpoint).
+const IDLE_S3: &str = "s3://kbf-test?endpoint=http://127.0.0.1:9";
+
+/// A server over a `file://` cold store in `base/cold` with its metadata log in
+/// `base/meta`, on any port.
+fn file_server(base: &std::path::Path) -> Command {
+    let cold = format!("file://{}", base.join("cold").display());
+    let mut c = server(&["--cold-store", &cold, "--meta-dir"]);
+    c.arg(base.join("meta")).args(ANY_PORT);
+    c
+}
+
+/// An `s3://` cold store that does no I/O until used, with its metadata log in `dir`
+/// (the store does no I/O until used).
 fn raft_server(dir: &std::path::Path) -> Command {
     raft_server_on(dir, &ANY_PORT)
 }
 
 /// [`raft_server`] with the listener flags `listen` instead of [`ANY_PORT`].
 fn raft_server_on(dir: &std::path::Path, listen: &[&str]) -> Command {
-    let mut c = with_keys(server(&[
-        "--store",
-        "s3",
-        "--s3-endpoint",
-        "http://127.0.0.1:9",
-        "--s3-bucket",
-        "kbf-test",
-        "--meta-log",
-        "raft",
-        "--raft-dir",
-    ]));
+    let mut c = with_keys(server(&["--cold-store", IDLE_S3, "--meta-dir"]));
     c.arg(dir).args(listen);
     c
+}
+
+/// The operator API's address on a start line: the word after ` api=`.
+fn api_of(line: &str) -> SocketAddr {
+    line.split_whitespace()
+        .find_map(|w| w.strip_prefix("api="))
+        .unwrap_or_else(|| panic!("no api= in {line:?}"))
+        .parse()
+        .expect("an address")
 }
 
 /// The ` log=` id of a start line.
@@ -606,14 +630,13 @@ fn log_id(line: &str) -> String {
     id.to_owned()
 }
 
-/// Catches: `--meta-log=raft` that does not open its log in `--raft-dir`, or that
-/// draws a new log id on every start (two starts over one directory must print the
-/// same `log=`, and two directories two different ones); and a memory start line that
-/// names a log.
+/// Catches: a metadata log that does not open in `--meta-dir`, or that draws a new log
+/// id on every start (two starts over one directory must print the same `log=`, and two
+/// directories two different ones).
 #[cfg(unix)]
 #[test]
 fn raft_mode_keeps_its_log_id_across_starts() {
-    let dir = raft_dir("raft-restart");
+    let dir = fresh_dir("raft-restart");
     let (child, line, _) = started(raft_server(&dir));
     let first = log_id(&line);
     interrupt(child);
@@ -622,84 +645,129 @@ fn raft_mode_keeps_its_log_id_across_starts() {
     assert_eq!(log_id(&line), first, "a restart drew a new log id");
     interrupt(child);
 
-    let other = raft_dir("raft-other");
+    let other = fresh_dir("raft-other");
     let (child, line, _) = started(raft_server(&other));
     assert_ne!(log_id(&line), first, "two directories, one log id");
     interrupt(child);
     for d in [&dir, &other] {
         std::fs::remove_dir_all(d).expect("remove the raft dir");
     }
-
-    let mut memory = server(&ANY_PORT);
-    memory.args(["--meta-log", "memory"]);
-    let (child, line, _) = started(memory);
-    assert!(!line.contains("log="), "{line}");
-    interrupt(child);
 }
 
-/// Catches: `--write-tier-dir` parsed and then ignored (no tier attached: its `TIER`
-/// file is never written, and every write would still go to the store); a restart over
-/// the memory log refused, or reading an earlier start's files as its own (that log's
-/// epochs start from 1 again, so an old block names one of the new start's objects);
-/// the tier refused over `--meta-log=raft`, or attached there without the log raised
-/// to machine version 2 (its first commit cannot be encoded: the start fails); and a
-/// raft server without a tier that raises its log anyway (an older binary could no
-/// longer read it).
+/// Catches: `--hot-store` parsed and then ignored (no tier attached: its `TIER` file is
+/// never written, and every write would still go to the cold store); the metadata log
+/// not kept in `<hot>/meta` (so a restart would draw a new log id, or the log would
+/// land where the operator did not point) or in `--meta-dir` when that is given
+/// (which wins); the tier attached without the log raised to machine version 2 (its
+/// first commit cannot be encoded: the start fails); and a server without a hot store
+/// that raises its log anyway (an older binary could no longer read it).
 #[cfg(unix)]
 #[test]
-fn write_tier_dir_attaches_a_tier_over_either_metadata_log() {
-    let dir = raft_dir("write-tier");
-    let dir_arg = dir.to_str().expect("a UTF-8 path");
-    let tier = ["--write-tier-dir", dir_arg, "--write-tier-bytes", "1048576"];
-    let mut memory = server(&ANY_PORT);
-    memory.args(tier);
-    let (child, _, _) = started(memory);
-    let named = std::fs::read_to_string(dir.join("TIER")).expect("a TIER file");
+fn a_hot_store_attaches_a_tier_and_holds_the_metadata_log() {
+    let hot = fresh_dir("hot-store");
+    let uri = format!("file://{}", hot.display());
+    let with_hot = |meta: Option<&std::path::Path>| {
+        let mut c = with_keys(server(&["--cold-store", IDLE_S3, "--hot-store", &uri]));
+        if let Some(meta) = meta {
+            c.arg("--meta-dir").arg(meta);
+        }
+        c.args(ANY_PORT);
+        c
+    };
+    let (child, line, _) = started(with_hot(None));
+    let first = log_id(&line);
+    let named = std::fs::read_to_string(hot.join("TIER")).expect("a TIER file");
     assert!(
         named.ends_with('\n') && named.trim().parse::<u64>().is_ok(),
         "{named:?}"
     );
     interrupt(child);
-
-    // A memory log starts empty, its epochs from 1 again: an earlier start's block and
-    // copy are not this start's objects, and must not refuse the start or be read.
-    let old = [
-        "0000000000000001-0000000000000001.blk",
-        "0000000000000001-0000000000000002.seg",
-    ];
-    for name in old {
-        std::fs::write(dir.join(name), b"an earlier start's bytes").expect("plant");
-    }
-    let mut again = server(&ANY_PORT);
-    again.args(tier);
-    let (child, _, _) = started(again);
-    for name in old {
-        assert!(!dir.join(name).exists(), "{name} kept");
-    }
+    assert!(
+        hot.join("meta/log-record").is_file(),
+        "the log is not in <hot>/meta"
+    );
+    assert!(
+        !opens_as_version_1(&hot.join("meta")),
+        "a log not raised for the tier"
+    );
+    let (child, line, _) = started(with_hot(None));
+    assert_eq!(log_id(&line), first, "a restart drew a new log id");
     interrupt(child);
 
-    std::fs::remove_dir_all(&dir).expect("remove the tier dir");
+    // `--meta-dir` wins: the log is there, and `<hot>/meta` is not made.
+    let hot2 = fresh_dir("hot-store-meta-dir");
+    let meta = fresh_dir("hot-store-meta-elsewhere");
+    let uri2 = format!("file://{}", hot2.display());
+    let mut c = with_keys(server(&["--cold-store", IDLE_S3, "--hot-store", &uri2]));
+    c.arg("--meta-dir").arg(&meta).args(ANY_PORT);
+    let (child, _, _) = started(c);
+    interrupt(child);
+    assert!(hot2.join("TIER").is_file());
+    assert!(meta.join("log-record").is_file(), "no log in --meta-dir");
+    assert!(
+        !hot2.join("meta").exists(),
+        "<hot>/meta made beside --meta-dir"
+    );
 
-    let raft = raft_dir("write-tier-raft");
+    // Without a hot store the log is left at version 1.
+    let raft = fresh_dir("write-tier-raft");
     let (child, _, _) = started(raft_server(&raft));
     interrupt(child);
     assert!(
         opens_as_version_1(&raft),
         "a raft log raised without a tier"
     );
-    for _ in 0..2 {
-        let mut c = raft_server(&raft);
-        c.args(tier);
-        let (child, _, _) = started(c);
-        assert!(dir.join("TIER").exists());
-        interrupt(child);
+    for dir in [&hot, &hot2, &meta, &raft] {
+        std::fs::remove_dir_all(dir).expect("remove the directory");
     }
+}
+
+/// Catches a start that resolves its stores and logs none of it: an operator reading
+/// the log must see the cold store, the hot store with the budget it was sized to, and
+/// where the metadata log is (and whether the hot store's directory or `--meta-dir` put
+/// it there), and, without a hot store, that there is none.
+#[cfg(unix)]
+#[test]
+fn the_start_logs_every_resolved_store_path_and_budget() {
+    let log_of = |mut c: Command| {
+        c.stdout(Stdio::piped()).stderr(Stdio::piped());
+        let mut child = Running(c.spawn().expect("spawn kbf-server"));
+        first_line("start", child.0.stdout.take().expect("stdout"));
+        let mut stderr = child.0.stderr.take().expect("stderr");
+        interrupt(child);
+        let mut log = String::new();
+        stderr.read_to_string(&mut log).expect("UTF-8 stderr");
+        log
+    };
+    let base = fresh_dir("start-log");
+    let hot = base.join("hot");
+    let cold = format!("file://{}", base.join("cold").display());
+    let hot_uri = format!("file://{}", hot.display());
+    let mut c = server(&["--cold-store", &cold, "--hot-store", &hot_uri]);
+    c.args(ANY_PORT);
+    let log = log_of(c);
+    assert!(log.contains(&format!("cold store: {cold}")), "{log}");
     assert!(
-        !opens_as_version_1(&raft),
-        "a raft log not raised for the tier"
+        log.contains(&format!("hot store: {hot_uri} (budget ")),
+        "{log}"
     );
-    std::fs::remove_dir_all(&dir).expect("remove the tier dir");
-    std::fs::remove_dir_all(&raft).expect("remove the raft dir");
+    assert!(
+        log.contains(&format!(
+            "metadata log: {}/meta (in the hot store)",
+            hot.display()
+        )),
+        "{log}"
+    );
+
+    let meta = base.join("meta");
+    let mut c = server(&["--cold-store", &cold, "--meta-dir"]);
+    c.arg(&meta).args(ANY_PORT);
+    let log = log_of(c);
+    assert!(log.contains("hot store: none"), "{log}");
+    assert!(
+        log.contains(&format!("metadata log: {} (--meta-dir)", meta.display())),
+        "{log}"
+    );
 }
 
 /// Whether the Raft log in `dir` opens for a binary that runs machine version 1 only;
@@ -726,43 +794,65 @@ fn opens_as_version_1(dir: &std::path::Path) -> bool {
     }
 }
 
-/// Catches: `--meta-log=raft` accepted with `--store=memory` (a durable index over
-/// blobs that die with the process would report them present after a restart), or
-/// without `--raft-dir`; a `--raft-dir` that is ignored under `--meta-log=memory`; and
-/// a raft directory holding someone else's files taken as a new log. Each exits 2 and
-/// says why.
+/// Catches: a store flag set that cannot run starting anyway. No `--cold-store`; a cold
+/// store with neither a `--hot-store` directory nor `--meta-dir` (the metadata log would
+/// have nowhere to live); an `s3://` hot store (the write tier is block files on a local
+/// disk); the flags of an older binary (`--store`, `--blob-dir`, `--raft-dir`,
+/// `--meta-log`, `--s3-*`, `--write-tier-*`), which a unit that was not updated would
+/// pass; and a metadata directory holding someone else's files taken as a new log.
+/// Each exits 2 and says why.
 #[test]
-fn raft_mode_refuses_what_it_cannot_keep() {
-    let dir = raft_dir("raft-refused");
+fn store_flags_that_cannot_run_are_refused() {
+    let dir = fresh_dir("stores-refused");
     let dir_arg = dir.to_str().expect("a UTF-8 path");
-    let mut c = server(&["--meta-log", "raft", "--raft-dir", dir_arg]);
-    c.args(ANY_PORT);
-    let (code, stderr) = fails(c);
+    let cold = format!("file://{dir_arg}/cold");
+    let refused = |flags: &[&str]| {
+        let mut c = with_keys(bare(flags));
+        c.args(ANY_PORT);
+        fails(c)
+    };
+    let (code, stderr) = refused(&["--meta-dir", dir_arg]);
     assert_eq!(code, Some(2));
-    assert!(
-        stderr.contains("--meta-log=raft needs --store=s3"),
-        "{stderr}"
-    );
+    assert!(stderr.contains("--cold-store is required"), "{stderr}");
 
-    let (code, stderr) = fails(server(&["--meta-log", "raft"]));
+    let (code, stderr) = refused(&["--cold-store", &cold]);
     assert_eq!(code, Some(2));
-    assert!(stderr.contains("--raft-dir"), "{stderr}");
+    assert!(stderr.contains("--meta-dir is required"), "{stderr}");
 
-    let mut c = server(&["--raft-dir", dir_arg]);
-    c.args(ANY_PORT);
-    let (code, stderr) = fails(c);
+    let (code, stderr) = refused(&[
+        "--cold-store",
+        &cold,
+        "--hot-store",
+        IDLE_S3,
+        "--meta-dir",
+        dir_arg,
+    ]);
     assert_eq!(code, Some(2));
-    assert!(
-        stderr.contains("--raft-dir is read only with --meta-log=raft"),
-        "{stderr}"
-    );
+    assert!(stderr.contains("must be a file:// directory"), "{stderr}");
 
-    std::fs::create_dir_all(&dir).expect("a raft dir");
+    for flag in [
+        "--store=memory",
+        "--blob-dir=/b",
+        "--raft-dir=/r",
+        "--meta-log=raft",
+        "--s3-endpoint=http://e",
+        "--write-tier-dir=/t",
+    ] {
+        let (code, stderr) = refused(&["--cold-store", &cold, "--meta-dir", dir_arg, flag]);
+        assert_eq!(code, Some(2), "{flag}: {stderr}");
+        let name = flag.split_once('=').map_or(flag, |(name, _)| name);
+        assert!(
+            stderr.contains("unexpected argument") && stderr.contains(name),
+            "{flag}: {stderr}"
+        );
+    }
+
+    std::fs::create_dir_all(&dir).expect("a meta dir");
     std::fs::write(dir.join("stray"), "someone else's").expect("a stray file");
     let (code, stderr) = fails(raft_server(&dir));
     assert_eq!(code, Some(2));
     assert!(stderr.contains("holds files but no log-record"), "{stderr}");
-    std::fs::remove_dir_all(&dir).expect("remove the raft dir");
+    std::fs::remove_dir_all(&dir).expect("remove the directory");
 }
 
 /// Catches: a server that keeps running (or exits 0) when it cannot bind its
@@ -838,14 +928,14 @@ fn a_plain_text_listener_off_loopback_starts_and_serves_with_one_warning() {
     }
 }
 
-/// Catches: a start line under `--meta-log=raft` that drops the plain-text warning, or
+/// Catches: a start line that drops the plain-text warning, or
 /// prints it before ` log=` instead of at the very end (the two fields came from two
 /// branches that each tested its own alone).
 #[cfg(unix)]
 #[test]
 fn a_raft_start_line_names_the_log_then_the_plain_text_warning() {
     let listen = ["--listen", "127.0.0.1:0", "--worker-listen", "0.0.0.0:0"];
-    let c = raft_server_on(&raft_dir("raft-plain-text"), &listen);
+    let c = raft_server_on(&fresh_dir("raft-plain-text"), &listen);
     let (child, line, _) = started(c);
     let id = log_id(&line);
     let want = format!(" log={id} warning=plaintext-off-loopback:worker");
@@ -1033,11 +1123,11 @@ fn the_start_line_says_whether_the_build_pages_and_blob_reads_are_on() {
         c.args(ANY_PORT);
         let (child, line, _) = started(c);
         let case = format!("{policy:?} open={open}");
-        let (head, api) = line.rsplit_once(" api=").expect("an API address");
+        let head = line.rsplit_once(" api=").expect("an API address").0;
         let on = |on: bool| if on { "on" } else { "off" };
         let want = format!(" invocations={} blobs={}", on(pages_on), on(blobs_on));
         assert!(head.ends_with(&want), "{case}: {line}");
-        let api: SocketAddr = api.parse().expect("an address");
+        let api = api_of(&line);
         let answer = get(api, EMPTY);
         let code = if blobs_on {
             "HTTP/1.1 200"

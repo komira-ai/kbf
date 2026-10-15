@@ -1,4 +1,4 @@
-//! `RaftMetaLog`, the metadata log of `--meta-log=raft`, over an in-memory raft
+//! `RaftMetaLog`, the metadata log `kbf-server` runs, over an in-memory raft
 //! directory (`FaultFs`) that a test can restart, crash at any operation, or fill by
 //! hand. Each test names the defect it catches.
 

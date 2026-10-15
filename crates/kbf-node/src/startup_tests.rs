@@ -231,7 +231,7 @@ async fn the_daemon_says_hello_before_its_first_survey_ends() {
         "--reconnect-ms=50".to_owned(),
         "--driver=native".to_owned(),
         format!("--cas=https://127.0.0.1:{}", worker.port()),
-        flag("scratch", &dir.join("leases")),
+        flag("data-dir", &dir),
         flag("xcode-apps", &apps),
     ])
     .expect("flags");

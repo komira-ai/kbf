@@ -201,7 +201,7 @@ work), whether `xcodebuild -showComponent MetalToolchain` says `Status: installe
 Xcode before 26, which has no `-showComponent` and bundles Metal, passes when `xcrun
 --find metal` does). Every question runs as an action does: under the actions'
 sandbox with the network off (as `network=off` runs one), in a lease directory of the daemon's own
-(`lease-survey` under `--scratch`, removed when the survey ends), with the same
+(`lease-survey` under `--data-dir`, removed when the survey ends), with the same
 writes allowed in the user folders ([below](#what-an-action-on-a-mac-may-write)). One
 for which every question exits 0, each within a minute, is ready and is reported as an
 `xcode` entry of its node report. An Xcode whose licence is not accepted still answers

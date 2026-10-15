@@ -1,4 +1,4 @@
-//! `--meta-log=raft`: the metadata log as a single-voter Raft log on the local disk
+//! The metadata log (`--meta-dir`) as a single-voter Raft log on the local disk
 //! (docs/design/ha.md, section 16, PR 5).
 //!
 //! [`RaftMetaLog`] implements the front's [`MetaLog`] over a [`kbf_raft::Host`] whose

@@ -4,6 +4,18 @@ Status: design, revision 5 (one connection; the cache persists from its first PR
 Every "today" claim cites a file on `main` at `d7f25cf` (#524). Every number marked
 *unmeasured* is an estimate that the PR introducing it must replace with a measurement.
 
+**Flags, as built.** This design names `--cache-dir`, `--cache-max-bytes`,
+`--cache-min-free-bytes`, `--cache-link-concurrency`, `--tree-dir`, `--tree-max-bytes`,
+`--tree-min-files`, `--tree-max-mounts` and `--scratch`. They are not flags any more: the
+daemon takes one directory, `--data-dir` (default `/var/lib/kbf`), holding `leases/` (what
+`--scratch` was), `cache/` (`--cache-dir`) and `trees/` (`--tree-dir`) on one filesystem,
+and one optional `--data-max-bytes`. The cache and the trees are on by default under the
+container driver, and their budgets come from the filesystem: the cache may keep half and
+the trees a quarter of its size less a floor of 5% (at least 1 GiB), and the cache's
+`--cache-min-free-bytes` is that floor. The link concurrency (64) and the trees' thresholds
+(256 files, 8 mounts) are constants. Read each flag below as the part of the data directory
+it names ([storage-node.md](../deploy/storage-node.md#the-daemons-data-directory)).
+
 This document covers four changes to how a kbf-daemon moves blobs:
 
 1. bounded concurrent fetch and upload (fix 1);

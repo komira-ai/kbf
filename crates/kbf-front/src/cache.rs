@@ -185,7 +185,7 @@ impl<M, O> Drop for Cache<M, O> {
 }
 
 impl Cache<MemoryMetaLog, MemoryStore> {
-    /// The single-process cache (`--store=memory`): the default retention
+    /// The single-process cache (for tests): the default retention
     /// (`docs/design/storage.md#retention-and-touches`), an in-memory index and an
     /// in-memory bucket.
     #[must_use]

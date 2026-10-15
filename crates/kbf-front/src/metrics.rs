@@ -605,7 +605,7 @@ impl TierCounters {
         let gauges = [
             (
                 "kbf_write_tier_budget_bytes",
-                "The write tier's budget, --write-tier-bytes",
+                "The write tier's budget",
                 usage.budget,
             ),
             (

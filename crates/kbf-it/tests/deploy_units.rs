@@ -3,8 +3,8 @@
 //!
 //! Catches:
 //! - a server unit whose `ExecStart=` names a flag `kbf-server` does not have, gives one
-//!   a value it refuses, or leaves out a flag another requires (`--store=s3` without
-//!   `--s3-bucket`, a deny list without mutual TLS);
+//!   a value it refuses, or leaves out a flag another requires (a deny list without
+//!   mutual TLS);
 //! - a unit that starts a binary neither this test nor `kbf-node`'s
 //!   (`src/deploy_doc_tests.rs`) parses, so its flags would go unchecked;
 //! - a flag `storage-node.md` lists as planned that `kbf-server` now accepts, so the doc
@@ -260,32 +260,42 @@ fn the_units_keep_the_priority_order() {
 fn the_rendered_server_unit_parses_with_kbf_servers_parser() {
     // Catches: a `kbf-deploy linux` template naming a kbf-server flag the binary does
     // not have, or rendering a value it refuses (a listen address without its port,
-    // an unbracketed IPv6 literal). With KBF_META_LOG=raft the only flags it refuses
-    // are the two the storage-node doc lists as planned.
+    // an unbracketed IPv6 literal, a store URI the parser refuses). Every word of the
+    // rendered ExecStart= must parse.
     use kbf_deploy::linux::{LinuxConfig, Templates, render::render};
     use kbf_deploy::unit::UnitFile;
 
     let example = include_str!("../../kbf-deploy/templates/linux/config.example");
     for (from, to) in [
-        ("KBF_META_LOG=raft", "KBF_META_LOG=memory"),
         (
             "KBF_LISTEN_ADDRESS=192.0.2.10",
             "KBF_LISTEN_ADDRESS=2001:db8::10",
         ),
-        ("KBF_META_LOG=raft", "KBF_META_LOG=raft"),
+        (
+            "KBF_LISTEN_ADDRESS=192.0.2.10",
+            "KBF_LISTEN_ADDRESS=192.0.2.10",
+        ),
     ] {
         assert!(example.contains(from), "{from}");
         let c = LinuxConfig::parse(&example.replace(from, to)).expect("valid settings");
         let units = render(&c, Some(1500), &Templates::BUILT_IN).expect("renders");
         let server = UnitFile::parse(&units.server).expect("a unit");
         let argv = server.exec_start();
-        let (planned, rest): (Vec<&str>, Vec<&str>) = argv
-            .iter()
-            .partition(|w| w.starts_with("--meta-log=") || w.starts_with("--raft-dir="));
-        let want_planned = if to.ends_with("memory") { 0 } else { 2 };
-        assert_eq!(planned.len(), want_planned, "{to}: {argv:?}");
-        if let Err(e) = Args::try_parse_from(&rest) {
-            panic!("{to}: kbf-server refuses the rendered ExecStart=:\n{e}");
-        }
+        let args = match Args::try_parse_from(&argv) {
+            Ok(args) => args,
+            Err(e) => panic!("{to}: kbf-server refuses the rendered ExecStart=:\n{e}"),
+        };
+        // The stores the unit names resolve: an S3 cold store, the log in --meta-dir.
+        let space = kbf_threads::disk::Statvfs;
+        let stores = args.stores(&space).expect("the unit's stores resolve");
+        assert!(
+            matches!(stores.cold, kbf_server::stores::StoreUri::S3(_)),
+            "{to}"
+        );
+        assert_eq!(
+            stores.meta_dir,
+            std::path::Path::new("/var/lib/kbf-server/raft")
+        );
+        assert!(stores.hot.is_none(), "{to}");
     }
 }

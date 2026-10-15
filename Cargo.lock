@@ -1539,6 +1539,7 @@ dependencies = [
  "kbf-proto",
  "kbf-server",
  "kbf-testkit",
+ "kbf-threads",
  "kbf-transfer",
  "proc-macro2",
  "prost",
@@ -1682,6 +1683,7 @@ dependencies = [
  "prost",
  "rcgen",
  "serde_json",
+ "thiserror",
  "tokio",
  "tonic",
  "tracing",
@@ -1860,6 +1862,7 @@ name = "kbf-threads"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "rustix",
  "thiserror",
  "tokio",
  "tracing",
@@ -1869,7 +1872,6 @@ dependencies = [
 name = "kbf-tier"
 version = "0.1.0"
 dependencies = [
- "clap",
  "kbf-meta",
  "kbf-segments",
  "kbf-store",

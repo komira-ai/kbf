@@ -4,7 +4,7 @@
 //! where the helper serves its socket (`--mac-session-socket`): a node without the
 //! helper does not start with this driver, so it never lists `native-whole-machine`
 //! and is never sent a `whole_machine` lease. The runtime keeps its lease record and
-//! lease directories in `<--scratch>/whole-machine`, and its phase goes into every
+//! lease directories in `<--data-dir>/leases/whole-machine`, and its phase goes into every
 //! `Hello`.
 
 use super::{Cli, Error, Node};
@@ -99,7 +99,7 @@ mod tests {
             flag("key", &dir.join("node.key")),
             "--node-id=mac-1".to_owned(),
             "--cas=https://127.0.0.1:1".to_owned(),
-            flag("scratch", &dir.join("leases")),
+            flag("data-dir", &dir),
             flag("xcode-apps", &dir.join("Applications")),
             "--driver=native".to_owned(),
             "--driver=native-whole-machine".to_owned(),
@@ -121,10 +121,12 @@ mod tests {
     #[test]
     fn the_whole_machine_driver_needs_the_helper() {
         use super::super::node;
+        use super::super::tests::scratch;
 
+        let data = scratch("whole-machine-needs-helper");
         let cli = parse(&[
             "--driver=native-whole-machine",
-            "--scratch=/s",
+            &format!("--data-dir={}", data.display()),
             "--mac-session-socket=/nonexistent/kbf-mac-session/socket",
         ]);
         let error = node(&cli, || Err("unused".into()), std::path::Path::new("/x"))

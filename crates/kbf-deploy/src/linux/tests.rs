@@ -101,7 +101,7 @@ fn the_example_settings_render_units_that_keep_every_priority() {
         "\nEnvironment=XDG_RUNTIME_DIR=/run/user/1500\n",
         "\nExecStart=/usr/local/bin/kbf-daemon \\\n",
         "    --server=https://storage-node.example.internal:8981 \\\n",
-        "    --scratch=/var/lib/kbf/leases \\\n    --actions-memory-max-gib=200 \\\n",
+        "    --data-dir=/var/lib/kbf \\\n    --actions-memory-max-gib=200 \\\n",
         "    --supervisor-memory-min-mib=256\n",
     ] {
         assert!(daemon.contains(want), "no {want:?} in\n{daemon}");
@@ -110,9 +110,8 @@ fn the_example_settings_render_units_that_keep_every_priority() {
     for want in [
         "\nUser=kbf-server\n",
         "\nAfter=network-online.target minio.service\n",
-        "    --s3-conditional-put \\\n    --meta-log=raft \\\n    --raft-dir=/var/lib/kbf-server/raft \\\n    --listen=192.0.2.10:8980 \\\n",
+        "    --cold-store=s3://kbf-cas?endpoint=http://127.0.0.1:9000&conditional-put=true \\\n    --meta-dir=/var/lib/kbf-server/raft \\\n    --listen=192.0.2.10:8980 \\\n",
         "    --reapi-tls-cert=/etc/kbf/reapi.pem \\\n",
-        "    --s3-endpoint=http://127.0.0.1:9000 \\\n",
         "    --api-listen=127.0.0.1:8982 \\\n",
     ] {
         assert!(server.contains(want), "no {want:?} in\n{server}");
@@ -419,8 +418,8 @@ fn rows() -> Vec<Row> {
         row(
             "server-key-on-argv",
             Server,
-            "    --s3-conditional-put \\\n",
-            "    --s3-conditional-put \\\n    --x=AWS_SECRET_ACCESS_KEY \\\n",
+            "    --meta-dir=@KBF_META_DIR@ \\\n",
+            "    --meta-dir=@KBF_META_DIR@ \\\n    --x=AWS_SECRET_ACCESS_KEY \\\n",
             "FAIL server: kbf-server's command line names an AWS_ variable",
         ),
         row(
@@ -438,39 +437,25 @@ fn rows() -> Vec<Row> {
             "FAIL server: kbf-server needs --reapi-tls-cert and --reapi-tls-key",
         ),
         row(
-            "server-store-memory",
+            "server-store-file",
             Server,
-            "--store=s3",
-            "--store=memory",
-            "FAIL server: kbf-server needs --store=s3 (MinIO)",
+            "--cold-store=s3://",
+            "--cold-store=file://",
+            "FAIL server: kbf-server needs --cold-store=s3://... (MinIO)",
         ),
         row(
             "server-no-endpoint",
             Server,
-            "    --s3-endpoint=@MINIO_S3_ENDPOINT@ \\\n",
+            "?endpoint=@MINIO_S3_ENDPOINT@&",
+            "?",
+            "FAIL server: --cold-store has no endpoint= query",
+        ),
+        row(
+            "server-meta-dir-dropped",
+            Server,
+            "    --meta-dir=@KBF_META_DIR@ \\\n",
             "",
-            "FAIL server: kbf-server has no --s3-endpoint",
-        ),
-        row(
-            "server-raft-dropped",
-            Server,
-            "@SERVER_META_LOG_ARGS@\n",
-            "",
-            "FAIL server: kbf-server has no --meta-log=raft (KBF_META_LOG=raft)",
-        ),
-        row(
-            "server-raft-no-dir",
-            Server,
-            "@SERVER_META_LOG_ARGS@\n",
-            "    --meta-log=raft \\\n",
-            "FAIL server: --meta-log=raft without --raft-dir",
-        ),
-        row(
-            "server-meta-log-other",
-            Server,
-            "@SERVER_META_LOG_ARGS@\n",
-            "    --meta-log=sqlite \\\n",
-            "FAIL server: --meta-log=sqlite is not raft",
+            "FAIL server: kbf-server has no --meta-dir",
         ),
         // image: kbf-daemon exits 2 at start on a bare --image (the kit once rendered
         // podman's form), and must run the images the settings pin.
@@ -539,7 +524,7 @@ fn each_planted_defect_turns_its_rule_red() {
         }
     }
     assert_eq!(wrong, Vec::<String>::new());
-    assert_eq!(rows.len(), 44, "rows");
+    assert_eq!(rows.len(), 42, "rows");
 }
 
 #[test]
@@ -566,7 +551,7 @@ fn a_leftover_or_unknown_placeholder_is_refused() {
             "    --reapi-tls-cert=@KBF_ETC/"
         )
         .as_deref(),
-        Some("kbf-server.service:29: an @ that starts no @KEY@ placeholder")
+        Some("kbf-server.service:26: an @ that starts no @KEY@ placeholder")
     );
     assert_eq!(
         refused(
@@ -600,13 +585,27 @@ fn a_leftover_or_unknown_placeholder_is_refused() {
 
 #[test]
 fn settings_change_the_units_as_documented() {
-    // Catches: KBF_META_LOG=memory still passing --meta-log; an IPv6 listen address
-    // written unbracketed (`2001:db8::10:8980` is no socket address); images rendered
-    // in podman's bare form or not at all; a defaulted key not taking its default.
-    let memory = config(&[("KBF_META_LOG", "memory")]);
-    let u = rendered(&memory, &Templates::BUILT_IN);
-    assert!(!u.server.contains("--meta-log"), "{}", u.server);
-    assert_eq!(lines(&checked(&memory, &u, true)), Vec::<String>::new());
+    // Catches: KBF_DATA_DIR and KBF_META_DIR not reaching the flags the units pass
+    // (`--data-dir`, `--meta-dir`), the removed KBF_META_LOG still accepted (a settings
+    // file written for the old units would run with a log it never asked for); an IPv6
+    // listen address written unbracketed (`2001:db8::10:8980` is no socket address);
+    // images rendered in podman's bare form or not at all; a defaulted key not taking
+    // its default.
+    let moved = config(&[("KBF_DATA_DIR", "/srv/kbf"), ("KBF_META_DIR", "/srv/meta")]);
+    let u = rendered(&moved, &Templates::BUILT_IN);
+    assert!(
+        u.daemon.contains("    --data-dir=/srv/kbf \\\n"),
+        "{}",
+        u.daemon
+    );
+    assert!(
+        u.server.contains("    --meta-dir=/srv/meta \\\n"),
+        "{}",
+        u.server
+    );
+    assert_eq!(lines(&checked(&moved, &u, true)), Vec::<String>::new());
+    let old = format!("{EXAMPLE}KBF_META_LOG=raft\n");
+    assert!(refusal(&old).contains("KBF_META_LOG"), "{}", refusal(&old));
 
     let v6 = config(&[("KBF_LISTEN_ADDRESS", "2001:db8::10")]);
     let u = rendered(&v6, &Templates::BUILT_IN);
@@ -625,7 +624,7 @@ fn settings_change_the_units_as_documented() {
     let images = config(&[("KBF_IMAGES", &two)]);
     let u = rendered(&images, &Templates::BUILT_IN);
     let want = format!(
-        "    --scratch=/var/lib/kbf/leases \\\n    --image=docker://{} \\\n    --image=docker://registry.example:5000/t/tool@{D1} \\\n    --actions-memory-max-gib=200 \\\n",
+        "    --data-dir=/var/lib/kbf \\\n    --image=docker://{} \\\n    --image=docker://registry.example:5000/t/tool@{D1} \\\n    --actions-memory-max-gib=200 \\\n",
         img()
     );
     assert!(u.daemon.contains(&want), "{}", u.daemon);
@@ -647,18 +646,19 @@ fn settings_change_the_units_as_documented() {
 }
 
 #[test]
-fn a_raft_dir_under_the_build_scratch_fails_the_check() {
-    // Catches: the server's log on the partition builds fill (a full scratch would stop
-    // the server), and a prefix match that takes `/var/lib/kbf/leases2` as inside it.
-    let inside = config(&[("KBF_RAFT_DIR", "/var/lib/kbf/leases/raft")]);
+fn a_meta_dir_under_the_data_dir_fails_the_check() {
+    // Catches: the server's log on the partition builds fill (a full data directory
+    // would stop the server), and a prefix match that takes `/var/lib/kbf2/raft` as
+    // inside `/var/lib/kbf`.
+    let inside = config(&[("KBF_META_DIR", "/var/lib/kbf/raft")]);
     let r = checked(&inside, &rendered(&inside, &Templates::BUILT_IN), true);
     assert_eq!(
         lines(&r),
         [
-            "FAIL server: --raft-dir=/var/lib/kbf/leases/raft is under the build scratch /var/lib/kbf/leases"
+            "FAIL server: --meta-dir=/var/lib/kbf/raft is under the daemon's data directory /var/lib/kbf"
         ]
     );
-    let beside = config(&[("KBF_RAFT_DIR", "/var/lib/kbf/leases2/raft")]);
+    let beside = config(&[("KBF_META_DIR", "/var/lib/kbf2/raft")]);
     let r = checked(&beside, &rendered(&beside, &Templates::BUILT_IN), true);
     assert_eq!(lines(&r), Vec::<String>::new());
 }
@@ -771,8 +771,8 @@ fn bad_settings_are_refused_before_anything_renders() {
             "KBF_ETC: \"etc/kbf\" is not absolute",
         ),
         (
-            example_with(&[("KBF_RAFT_DIR", "/var/lib/../raft")]),
-            "KBF_RAFT_DIR: \"/var/lib/../raft\" has an empty",
+            example_with(&[("KBF_META_DIR", "/var/lib/../raft")]),
+            "KBF_META_DIR: \"/var/lib/../raft\" has an empty",
         ),
         (
             example_with(&[("MINIO_UNIT", "minio")]),
@@ -781,10 +781,6 @@ fn bad_settings_are_refused_before_anything_renders() {
         (
             example_with(&[("MINIO_UNIT", ".service")]),
             "MINIO_UNIT=.service is not a .service unit name",
-        ),
-        (
-            example_with(&[("KBF_META_LOG", "sqlite")]),
-            "KBF_META_LOG=sqlite: raft or memory",
         ),
     ];
     let mut wrong = Vec::new();

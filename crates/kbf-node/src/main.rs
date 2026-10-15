@@ -10,12 +10,12 @@
 //! serve the same kind. The two real drivers read and write blobs over mutual TLS
 //! through the server's worker listener named by `--cas` (normally the same address
 //! as `--server`), with the daemon's own certificate, and make lease directories
-//! under `--scratch`. A Mac in komira's pool runs, for example:
+//! under `<--data-dir>/leases`. A Mac in komira's pool runs, for example:
 //!
 //! ```text
 //! kbf-daemon --driver native --server https://kbf-server:8981 --cas https://kbf-server:8981 \
 //!   --ca-cert ca.pem --cert node.pem --key node.key --node-id mac-studio-1 \
-//!   --scratch /var/kbf/leases --label pool=darwin-sized
+//!   --data-dir /var/kbf --label pool=darwin-sized
 //! ```
 //!
 //! Exits non-zero when the node cannot be detected or the configuration cannot be
@@ -23,9 +23,10 @@
 //! running then are abandoned (their processes killed, their directories removed);
 //! the scheduler places them again.
 //!
-//! With `--cache-dir` and `--cache-max-bytes`, the container driver links each lease's
-//! input files from a per-node cache (`cache`); without them, as before, each lease
-//! gets its own copies.
+//! Everything the daemon keeps on disk is under one directory, `--data-dir` (default
+//! `/var/lib/kbf`; `data_dir`): `leases/`, and under the container driver the input cache
+//! it links each lease's input files from, and the shared input trees. Their budgets
+//! come from the filesystem, not from flags; `--data-max-bytes` only lowers them.
 //!
 //! The log goes to stderr, in color only when stderr is a terminal: under launchd or
 //! systemd it is a file or a journal, where escape codes are noise (issue #170). The
@@ -48,6 +49,7 @@ use kbf_daemon::{
 use kbf_driver_native::slots::Pool;
 use kbf_driver_native::{MemoryPolicy, NativeConfig, NativeRuntime, xcode, xcode_watch};
 use kbf_outputs::OutputLimits;
+use kbf_threads::disk::Statvfs;
 use kbf_transfer::Transfers;
 use tokio::signal::unix::{Signal, SignalKind, signal};
 
@@ -70,9 +72,8 @@ struct Cli {
     /// one connection, within the `--transfer-*` limits.
     #[arg(long)]
     cas: Option<String>,
-    /// The directory lease directories are made in (container and native drivers).
-    #[arg(long)]
-    scratch: Option<PathBuf>,
+    #[command(flatten)]
+    data: data_dir::DataArgs,
     #[command(flatten)]
     outputs: OutputLimits,
     /// `--reserve-cpus`: the logical CPUs the farm's processes keep; the leases get the
@@ -91,10 +92,6 @@ struct Cli {
         value_parser = clap::value_parser!(u64).range(1..)
     )]
     output_upload_deadline_secs: u64,
-    #[command(flatten)]
-    cache: cache::CacheArgs,
-    #[command(flatten)]
-    trees: cache::TreeArgs,
     #[command(flatten)]
     transfer: transfer::TransferArgs,
     /// The cgroup lease cgroups are made under, from the cgroup root (container). Left
@@ -197,7 +194,7 @@ struct Cli {
     /// fresh rootless sandbox through `--oci-runtime` directly, with no Podman on the
     /// action path (Podman only pulls and exports an image once per digest). `oci` needs
     /// the daemon user's subordinate ids in one range, `uidmap`, and every directory down
-    /// to `--scratch` searchable by others.
+    /// to `--data-dir` searchable by others.
     #[arg(long, default_value = "podman", value_parser = ["podman", "oci"], value_name = "podman|oci")]
     container_runtime: String,
     /// The OCI runtime `--container-runtime=oci` runs actions with (container).
@@ -385,8 +382,8 @@ impl Node {
 /// per runtime (which `Daemon::new` adds), its `cpus` and `mem_gib` no more than the
 /// container driver allows; the native driver adds its own with
 /// `Daemon::with_driver_report`. Its status lists every `--image`, which only the
-/// container driver runs: without it, `--image` fails the start. With `--scratch`, once
-/// every runtime is built, it claims the scratch directory and names the claim it found
+/// container driver runs: without it, `--image` fails the start. With a real driver, once
+/// every runtime is built, it claims the lease directory and names the claim it found
 /// as its predecessor (`instance`).
 fn node(
     cli: &Cli,
@@ -396,26 +393,19 @@ fn node(
     if !cli.images.is_empty() && !cli.drivers.contains(&Driver::Container) {
         return Err("--image names container images: only --driver container runs them".into());
     }
+    let plan = data_dir(cli)?;
     let mut node = Node::default();
     for driver in drivers(cli) {
         match driver {
             Driver::Fake => node.add(Arc::new(FakeRuntime::new(Duration::ZERO)))?,
             Driver::Native => {
-                if let Some(warning) = cache::native_warning(&cli.cache) {
-                    tracing::warn!("{warning}");
-                }
-                if cli.trees.tree_dir.is_some() {
-                    tracing::warn!(
-                        "trees: off:native: only the container driver mounts shared trees"
-                    );
-                }
                 let config = native()?;
                 let cas = node.transfers(cli)?;
                 let (runtime, reports) = native_runtime(cli, config, xcrun, cas)?;
                 node.add(runtime)?;
                 node.reports = Some(reports);
             }
-            Driver::Container => container::add(cli, &mut node)?,
+            Driver::Container => container::add(cli, &mut node, &plan)?,
             Driver::NativeWholeMachine => whole_machine::add(cli, &mut node)?,
         }
     }
@@ -437,8 +427,8 @@ fn node(
         .with_container_images(cli.images.iter().cloned())
         .with_phase(phase);
     // Every runtime is built, so every sweep has run: claim the scratch directory.
-    let daemon = match &cli.scratch {
-        Some(_) => instance::named(daemon, &scratch(cli)?),
+    let daemon = match &plan {
+        Some(plan) => instance::named(daemon, &plan.leases()),
         None => daemon,
     };
     Ok(match node.reports {
@@ -529,16 +519,31 @@ async fn shutdown(mut term: Signal, mut int: Signal) {
     tracing::info!("{name}: shutting down");
 }
 
-/// The lease directory root, which the real drivers require.
-fn scratch(cli: &Cli) -> Result<PathBuf, Error> {
-    let scratch = cli
-        .scratch
-        .clone()
-        .ok_or("--scratch is required by this driver")?;
-    if !scratch.is_absolute() {
-        return Err(format!("--scratch {} must be absolute", scratch.display()).into());
+/// The data directory, resolved and made, for a daemon that runs a driver that keeps
+/// lease directories (every one but `fake`) or is given `--data-dir`; `None` for the
+/// fake driver alone without it, which touches no directory. Logs every directory and
+/// budget it resolved.
+fn data_dir(cli: &Cli) -> Result<Option<data_dir::Plan>, Error> {
+    let real = |d: &Driver| *d != Driver::Fake;
+    if !cli.drivers.iter().any(real) && cli.data.data_dir.is_none() {
+        return Ok(None);
     }
-    Ok(scratch)
+    let container = cli.drivers.contains(&Driver::Container);
+    let plan = data_dir::Plan::new(&cli.data, container, &Statvfs)?;
+    plan.create()?;
+    for line in plan.describe() {
+        tracing::info!("{line}");
+    }
+    Ok(Some(plan))
+}
+
+/// The lease directory root, `<--data-dir>/leases`, which the real drivers require.
+fn scratch(cli: &Cli) -> Result<PathBuf, Error> {
+    let dir = cli.data.leases();
+    if !dir.is_absolute() {
+        return Err(format!("--data-dir {} must be absolute", cli.data.dir().display()).into());
+    }
+    Ok(dir)
 }
 
 /// `--output-upload-deadline-secs`.
@@ -579,11 +584,12 @@ mod container {
     };
 
     use super::{Cli, Error, ImageUnusable, Node, scratch};
+    use crate::data_dir::Plan as DataPlan;
     use kbf_transfer::Transfers;
 
     /// Builds the container driver, over the daemon's CAS client, and adds it to `node`
     /// with what its leases may use.
-    pub(super) fn add(cli: &Cli, node: &mut Node) -> Result<(), Error> {
+    pub(super) fn add(cli: &Cli, node: &mut Node, plan: &Option<DataPlan>) -> Result<(), Error> {
         // The checks that change nothing come first.
         let scratch = scratch(cli)?;
         let cas = node.transfers(cli)?;
@@ -652,7 +658,7 @@ mod container {
         config.cpu = cpu_pool(cli)?;
         config.limits = limits(cli);
         config.swap_kill = swap_kill(cli);
-        config.cache = crate::cache::given(&cli.cache, &cli.trees, &config.scratch);
+        config.cache = plan.as_ref().and_then(crate::data_dir::given);
         let runtime = PodmanRuntime::new(config, cas)?;
         // From `start`, in the runtime's context but outside any task.
         tokio::runtime::Handle::current().block_on(check_images(&runtime, &cli.images))?;
@@ -707,13 +713,14 @@ mod container {
 #[cfg(not(target_os = "linux"))]
 mod container {
     use super::{Cli, Error, Node};
+    use crate::data_dir::Plan;
 
-    pub(super) fn add(_cli: &Cli, _node: &mut Node) -> Result<(), Error> {
+    pub(super) fn add(_cli: &Cli, _node: &mut Node, _plan: &Option<Plan>) -> Result<(), Error> {
         Err("the container driver runs on Linux only; use --driver native".into())
     }
 }
 
-mod cache;
+mod data_dir;
 mod instance;
 mod transfer;
 mod whole_machine;
@@ -768,7 +775,7 @@ mod tests {
     fn native_flags_reach_the_configuration() {
         let cli = parse(&[
             "--driver=native",
-            "--scratch=/var/kbf/leases",
+            "--data-dir=/var/kbf",
             "--memory-limit-percent=200",
             "--memory-headroom-mib=64",
             "--memory-poll-ms=0",
@@ -799,16 +806,20 @@ mod tests {
             xcode_watch_args(&metal),
             (xcode::Probe::system(true), Duration::from_secs(1))
         );
-        let defaults = parse(&["--driver=native", "--scratch=/s"]).expect("flags");
+        let defaults = parse(&["--driver=native", "--data-dir=/s"]).expect("flags");
         assert_eq!(
             native_config(&defaults).expect("config").memory,
             MemoryPolicy::DEFAULT
         );
         assert_eq!(defaults.xcode_apps, PathBuf::from("/Applications"));
-        let relative = parse(&["--driver=native", "--scratch=leases"]).expect("flags");
+        let relative = parse(&["--driver=native", "--data-dir=leases"]).expect("flags");
         assert!(native_config(&relative).is_err());
         let missing = parse(&["--driver=native"]).expect("flags");
-        assert!(native_config(&missing).is_err());
+        assert_eq!(
+            native_config(&missing).expect("config").scratch,
+            PathBuf::from("/var/lib/kbf/leases"),
+            "the default data directory"
+        );
         assert_eq!(native_config(&defaults).expect("config").pool, None);
     }
 
@@ -819,7 +830,7 @@ mod tests {
     #[test]
     fn the_pool_flags_reach_the_configuration() {
         let pooled = |extra: &[&str]| {
-            let flags = [&["--driver=native", "--scratch=/s"][..], extra].concat();
+            let flags = [&["--driver=native", "--data-dir=/s"][..], extra].concat();
             parse(&flags)
         };
         let cli = pooled(&["--pool-users=2", "--pool-first-uid=700"]).expect("flags");
@@ -1027,7 +1038,7 @@ mod tests {
             "--node-id=mac-1".to_owned(),
             "--driver=native".to_owned(),
             "--cas=https://127.0.0.1:1".to_owned(),
-            flag("scratch", &dir.join("leases")),
+            flag("data-dir", &dir),
             flag("xcode-apps", &apps),
         ])
         .expect("flags");
@@ -1091,7 +1102,7 @@ mod tests {
             "--node-id=mac-1".to_owned(),
             "--driver=native".to_owned(),
             "--cas=https://127.0.0.1:1".to_owned(),
-            flag("scratch", &dir.join("leases")),
+            flag("data-dir", &dir),
             flag("xcode-apps", &apps),
         ])
         .expect("flags");
@@ -1157,7 +1168,7 @@ mod tests {
             "--node-id=mac-1".to_owned(),
             "--driver=native".to_owned(),
             "--cas=https://127.0.0.1:1".to_owned(),
-            flag("scratch", &dir.join("leases")),
+            flag("data-dir", &dir),
             flag("xcode-apps", &apps),
         ])
         .expect("flags");
@@ -1257,7 +1268,7 @@ mod tests {
                 flag("key", &dir.join("node.key")),
                 "--node-id=mac-1".to_owned(),
                 "--cas=https://127.0.0.1:1".to_owned(),
-                flag("scratch", &dir.join("leases")),
+                flag("data-dir", &dir),
                 flag("xcode-apps", &dir.join("Applications")),
             ];
             let drivers = drivers.iter().map(|d| format!("--driver={d}"));

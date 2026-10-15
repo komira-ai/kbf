@@ -213,7 +213,7 @@ impl Cell {
         let uid = rustix::process::getuid().as_raw();
         let work = absolute(&args.work)?;
         let logs = work.join("logs");
-        let leases = work.join("leases");
+        let leases = work.join("data").join("leases");
         for dir in [&logs, &leases] {
             std::fs::create_dir_all(dir).or_broken(&dir.display())?;
         }
@@ -385,7 +385,9 @@ impl Cell {
             args.extend([flag.into(), file.into()]);
         }
         args.extend(["--tls-server-name", "localhost", "--node-id", NODE_ID].map(OsString::from));
-        args.extend(["--scratch".into(), self.leases.clone().into()]);
+        // The leases are `<data dir>/leases`.
+        let data = self.leases.parent().expect("a data directory");
+        args.extend(["--data-dir".into(), data.into()]);
         args.extend(["--actions-memory-max-gib", "8"].map(OsString::from));
         args
     }

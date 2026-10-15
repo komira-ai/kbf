@@ -24,9 +24,8 @@ pub const KEYS: &[&str] = &[
     "MINIO_UNIT",
     "MINIO_S3_ENDPOINT",
     "KBF_S3_BUCKET",
-    "KBF_META_LOG",
-    "KBF_RAFT_DIR",
-    "KBF_SCRATCH_DIR",
+    "KBF_META_DIR",
+    "KBF_DATA_DIR",
     "KBF_IMAGES",
     "KBF_USER",
     "KBF_SERVER_USER",
@@ -38,15 +37,6 @@ pub const KEYS: &[&str] = &[
 
 /// The least RAM, in GiB, left to the kernel, systemd and the daemon.
 const MIN_OS_HEADROOM_GIB: u64 = 4;
-
-/// How kbf-server keeps its metadata.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum MetaLog {
-    /// A single-voter Raft log on local disk (`--meta-log=raft --raft-dir=...`).
-    Raft,
-    /// The index in memory (no `--meta-log` flag).
-    Memory,
-}
 
 /// The settings, checked.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -69,9 +59,10 @@ pub struct LinuxConfig {
     pub minio_unit: String,
     pub minio_s3_endpoint: String,
     pub s3_bucket: String,
-    pub meta_log: MetaLog,
-    pub raft_dir: HostPath,
-    pub scratch_dir: HostPath,
+    /// kbf-server's `--meta-dir`: its metadata log, a single-voter Raft log.
+    pub meta_dir: HostPath,
+    /// kbf-daemon's `--data-dir`: lease directories, the input cache and the trees.
+    pub data_dir: HostPath,
     /// The pinned images, in podman's bare `<repo>@sha256:<digest>` form.
     pub images: Vec<ImageRef>,
     pub user: String,
@@ -102,8 +93,6 @@ pub enum LinuxError {
     AnyAddress(String),
     #[error("MINIO_UNIT={0} is not a .service unit name")]
     MinioUnit(String),
-    #[error("KBF_META_LOG={0}: raft or memory")]
-    MetaLog(String),
     #[error("KBF_OS_HEADROOM_GIB={0}: keep at least {MIN_OS_HEADROOM_GIB} GiB for the OS")]
     Headroom(u64),
     #[error(
@@ -165,11 +154,6 @@ impl LinuxConfig {
         {
             return Err(LinuxError::MinioUnit(minio_unit));
         }
-        let meta_log = match or("KBF_META_LOG", "raft").as_str() {
-            "raft" => MetaLog::Raft,
-            "memory" => MetaLog::Memory,
-            other => return Err(LinuxError::MetaLog(other.to_owned())),
-        };
         let ram_gib = whole("KBF_RAM_GIB", c.require("KBF_RAM_GIB")?)?;
         let minio = number("MINIO_RESERVATION_GIB", "32")?;
         let server = number("KBF_SERVER_RESERVATION_GIB", "16")?;
@@ -209,9 +193,8 @@ impl LinuxConfig {
             minio_unit,
             minio_s3_endpoint: or("MINIO_S3_ENDPOINT", "http://127.0.0.1:9000"),
             s3_bucket: or("KBF_S3_BUCKET", "kbf-cas"),
-            meta_log,
-            raft_dir: path("KBF_RAFT_DIR", "/var/lib/kbf-server/raft")?,
-            scratch_dir: path("KBF_SCRATCH_DIR", "/var/lib/kbf/leases")?,
+            meta_dir: path("KBF_META_DIR", "/var/lib/kbf-server/raft")?,
+            data_dir: path("KBF_DATA_DIR", "/var/lib/kbf")?,
             images,
             user: or("KBF_USER", "kbf"),
             server_user: or("KBF_SERVER_USER", "kbf-server"),

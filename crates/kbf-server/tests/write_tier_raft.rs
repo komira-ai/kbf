@@ -1,4 +1,4 @@
-//! The write tier over `--meta-log=raft` ([`kbf_server::write_tier::attach`], as the
+//! The write tier over the Raft metadata log ([`kbf_server::write_tier::attach`], as the
 //! binary calls it): the Raft log raised to machine version 2 once, only when a tier is
 //! configured, and staged, sealed and flushed objects kept across a restart.
 //!
@@ -7,13 +7,12 @@
 //! that succeeds while it is down came from the tier. Each test's comment names the
 //! defect it is there to catch.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Instant, SystemTime};
 
 use bytes::Bytes;
-use clap::Parser;
 use kbf_front::{Cache, MetaLog, TierStartup, VerifiedBlob};
 use kbf_log::MachineVersion;
 use kbf_meta::{BlobAnswer, ObjectId, Retention, StagedState, TierId};
@@ -21,8 +20,9 @@ use kbf_objstore::{
     ByteRange, Capabilities, KeyPrefix, ListPage, ListToken, MemoryStore, ObjectKey, ObjectStore,
     ObjectStoreError, PageSize,
 };
+use kbf_server::stores::Hot;
 use kbf_server::write_tier::{TierLog, attach};
-use kbf_server::{Args, RaftLogError, RaftMetaLog};
+use kbf_server::{RaftLogError, RaftMetaLog};
 use kbf_store::StdFs;
 use kbf_tier::TierOptions;
 use kbf_types::Digest;
@@ -113,26 +113,14 @@ impl Dirs {
         }
     }
 
-    /// The flags of a `--meta-log=raft` server, with the tier when `tier`.
-    fn args(&self, tier: bool) -> Args {
-        let mut argv = vec![
-            "kbf-server",
-            "--store",
-            "s3",
-            "--s3-endpoint",
-            "http://127.0.0.1:9",
-            "--s3-bucket",
-            "kbf-test",
-            "--meta-log",
-            "raft",
-            "--raft-dir",
-            path(&self.raft),
-        ];
-        if tier {
-            argv.extend(["--write-tier-dir", path(&self.tier)]);
-            argv.extend(["--write-tier-bytes", "1073741824"]);
-        }
-        Args::parse_from(argv)
+    /// The hot store a server resolves `--hot-store` to, when `tier`: the directory and a
+    /// 1 GiB budget.
+    fn hot(&self, tier: bool) -> Option<Hot> {
+        tier.then(|| Hot {
+            dir: self.tier.clone(),
+            budget: 1 << 30,
+            abandon: None,
+        })
     }
 
     /// Opens the log as a binary that runs machine versions up to `runs` would.
@@ -149,10 +137,6 @@ impl Drop for Dirs {
     }
 }
 
-fn path(p: &Path) -> &str {
-    p.to_str().expect("a UTF-8 path")
-}
-
 type Log = RaftMetaLog<StdFs>;
 type TierCache = Cache<Log, Store>;
 
@@ -166,7 +150,9 @@ async fn start(dirs: &Dirs, store: &Store, tier: bool) -> (TierCache, Option<Tie
     let cache = Cache::open(log, store.clone(), prefix)
         .await
         .expect("open the cache");
-    attach(cache, &dirs.args(tier)).await.expect("attach")
+    attach(cache, dirs.hot(tier).as_ref())
+        .await
+        .expect("attach")
 }
 
 fn blob(seed: u8) -> (VerifiedBlob, Bytes, Digest) {

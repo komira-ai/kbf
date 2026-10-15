@@ -23,6 +23,24 @@ use tonic::Code;
 
 const BIN: &str = env!("CARGO_BIN_EXE_kbf-server");
 
+/// `--cold-store` and `--meta-dir` flags over fresh directories named for `name`, under the
+/// target directory: every start of the binary needs both.
+fn stores(name: &str) -> [String; 4] {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+    let next_store = || NEXT.fetch_add(1, Ordering::Relaxed);
+    let base = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join("kbf-server-stores")
+        .join(format!("{name}-{}-{}", std::process::id(), next_store()));
+    let _ = std::fs::remove_dir_all(&base);
+    [
+        "--cold-store".to_owned(),
+        format!("file://{}", base.join("cold").display()),
+        "--meta-dir".to_owned(),
+        base.join("meta").display().to_string(),
+    ]
+}
+
 /// How long a test waits for the server to print its start line or to exit.
 const BOUND: Duration = Duration::from_secs(10);
 
@@ -37,6 +55,7 @@ impl Running {
         let mut child = Self(
             Command::new(BIN)
                 .args(["--listen", "127.0.0.1:0", "--worker-listen", "127.0.0.1:0"])
+                .args(stores("shutdown"))
                 .args(args)
                 .stdout(Stdio::piped())
                 .stderr(Stdio::null())

@@ -2,7 +2,7 @@
 //! the `kbf-sim` kernel and driven by seeds (docs/design/simulation.md, "The cell").
 //!
 //! This is the one-server skeleton of docs/design/ha.md section 15. The server
-//! ([`Server`]) is assembled from the code `kbf-server --meta-log=raft` runs: the
+//! ([`Server`]) is assembled from the code `kbf-server` runs: the
 //! metadata log is a [`kbf_server::RaftMetaLog`] (a single-voter `kbf-raft` host over
 //! a `kbf-store` store, its entries `kbf-log` commands applied to a `MetaState`) on a
 //! fault-injecting in-memory disk ([`kbf_store::FaultFs`]); the farm core is a
