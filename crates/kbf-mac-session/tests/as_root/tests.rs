@@ -550,21 +550,43 @@ fn the_ledger_survives_a_restart_of_the_helper() {
 
 /// Catches: user-delete that refuses at once instead of waiting for a process of the
 /// uid that is about to exit by itself.
+///
+/// Staged without a race (komira-build-farm#639). `spawn-child` returns once the child
+/// is forked, not once `sleep` runs, so the test polls (up to 3 s) until `pgrep` sees
+/// the sleep, then deletes. Arithmetic: user-delete's first look waits `EXIT_LOOKS` (50)
+/// listings 100 ms apart, so at least 5 s. The sleep runs 4 s from its start and the
+/// delete starts after the poll saw it, so at most 4 s of it are left: under the bound,
+/// so the delete waits it out and cannot meet a process that outlasts the wait. And it
+/// is alive when the delete looks first (milliseconds after the poll), so a delete that
+/// refused at once would be refused.
 #[test]
 #[ignore = "needs root: run by `cargo xtask sudo-test -p kbf-mac-session --test as_root`"]
 fn user_delete_waits_for_a_process_that_exits_by_itself() {
+    /// How long the lease user's sleep runs.
+    const SLEEP_SECS: &str = "4";
+    /// How long the test looks for the sleep to appear before it gives up.
+    const SEEN_WITHIN: Duration = Duration::from_secs(3);
     let (_serial, mac) = mac();
     let dir = scratch_dir("lease-13", 0o777);
     let lease = mac.create("13.1", None);
     lease.kill();
-    let sleep = ["spawn-child", "run", "/bin/sleep", "2"];
+    let sleep = ["spawn-child", "run", "/bin/sleep", SLEEP_SECS];
     says(
         &lease.run_quiet(&dir, &mac.act(&sleep)),
         "exit 0",
         "start a sleep",
     );
-    let sleeping = pgrep(&["-U", &lease.uid(), "sleep"]);
-    assert!(!sleeping.is_empty(), "no sleep process");
+    let uid = lease.uid();
+    let give_up = Instant::now() + SEEN_WITHIN;
+    let mut sleeping = pgrep(&["-U", &uid, "sleep"]);
+    while sleeping.is_empty() && Instant::now() < give_up {
+        std::thread::sleep(Duration::from_millis(20));
+        sleeping = pgrep(&["-U", &uid, "sleep"]);
+    }
+    assert!(
+        !sleeping.is_empty(),
+        "no sleep process within {SEEN_WITHIN:?} of spawn-child"
+    );
     says(
         &lease.call("delete"),
         "existed",

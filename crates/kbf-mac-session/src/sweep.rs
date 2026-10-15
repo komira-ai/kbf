@@ -134,21 +134,36 @@ fn empty_base(path: &Path, uid: u32, swept: &mut Swept) -> io::Result<()> {
         return Ok(());
     };
     let dev = rustix::fs::fstat(&dir)?.st_dev;
-    for name in list(&dir)? {
+    for name in listed(&dir)? {
         let result = rustix::fs::statat(&dir, &name, AtFlags::SYMLINK_NOFOLLOW)
             .map_err(io::Error::from)
             .and_then(|stat| remove_entry(&dir, &name, &stat, uid, dev, 1));
+        let result = vanished(result);
         swept.removed += usize::from(result.is_ok());
         note(swept, &path.join(&name), result);
     }
     Ok(())
 }
 
-/// Records `result`'s error, if any, against `path`. Every error counts, an entry that
-/// vanished during the walk included: the sweep is then retried, never assumed done.
+/// Records `result`'s error, if any, against `path`. Every error counts, except that an
+/// entry which vanished is not one (see [`vanished`]): the sweep is then retried, never
+/// assumed done.
 fn note(swept: &mut Swept, path: &Path, result: io::Result<()>) {
     if let Err(why) = result {
         swept.errors.push(format!("{}: {why}", path.display()));
+    }
+}
+
+/// `result`, with "no such file or directory" taken as success: an entry that is gone
+/// between the walk's listing of it and its removal (a macOS daemon removing its own
+/// temporary file under the lease user's folder, say) is what the sweep wanted. Only
+/// that error: every other one still leaves the sweep incomplete. Only the entry being
+/// removed or examined is meant, never a place the plan names (a missing one is
+/// [`present`]'s case).
+fn vanished(result: io::Result<()>) -> io::Result<()> {
+    match result {
+        Err(why) if why.kind() == io::ErrorKind::NotFound => Ok(()),
+        other => other,
     }
 }
 
@@ -211,7 +226,7 @@ fn walk_owned(
     depth: usize,
     swept: &mut Swept,
 ) -> io::Result<()> {
-    for name in list(dir)? {
+    for name in listed(dir)? {
         let here = path.join(&name);
         let result = visit(dir, &name, &here, uid, dev, depth, swept);
         note(swept, &here, result);
@@ -229,7 +244,9 @@ fn visit(
     depth: usize,
     swept: &mut Swept,
 ) -> io::Result<()> {
-    let stat = rustix::fs::statat(dir, name, AtFlags::SYMLINK_NOFOLLOW)?;
+    let Some(stat) = present(rustix::fs::statat(dir, name, AtFlags::SYMLINK_NOFOLLOW))? else {
+        return Ok(());
+    };
     // Another filesystem mounted here is never entered.
     match (stat.st_dev == dev, stat.st_uid == uid, is_dir(&stat)) {
         (true, true, _) => {
@@ -238,7 +255,13 @@ fn visit(
         }
         // Another owner's directory: searched for the uid's entries, down to the limit.
         (true, false, true) if depth < MAX_DEPTH => {
-            let child = open_child(dir, name, &stat)?;
+            // A directory that vanished since it was examined holds nothing.
+            let Some(child) = open_child(dir, name, &stat).map(Some).or_else(|why| {
+                vanished(Err(why)).map(|()| None)
+            })?
+            else {
+                return Ok(());
+            };
             walk_owned(&child, here, uid, dev, depth + 1, swept)?;
         }
         _ => {}
@@ -253,8 +276,22 @@ type StDev = i32;
 
 /// Removes `name` in `dir`, examined as `stat`: unlinked, or a directory emptied
 /// (everything in it, whoever owns it) and removed. Only entries `uid` owns are
-/// unlocked first.
+/// unlocked first. An entry that is gone by the time a step reaches it, `name` or
+/// anything below it, is removed already (see [`vanished`]).
 fn remove_entry(
+    dir: &OwnedFd,
+    name: &OsStr,
+    stat: &Stat,
+    uid: u32,
+    dev: StDev,
+    depth: usize,
+) -> io::Result<()> {
+    vanished(remove_present(dir, name, stat, uid, dev, depth))
+}
+
+/// [`remove_entry`] for an entry that is there, or is gone only if that surfaces as
+/// an error of one of its steps.
+fn remove_present(
     dir: &OwnedFd,
     name: &OsStr,
     stat: &Stat,
@@ -277,8 +314,11 @@ fn remove_entry(
         return Err(too_deep());
     }
     let child = open_child(dir, name, stat)?;
-    for entry in list(&child)? {
-        let inner = rustix::fs::statat(&child, &entry, AtFlags::SYMLINK_NOFOLLOW)?;
+    for entry in listed(&child)? {
+        let Some(inner) = present(rustix::fs::statat(&child, &entry, AtFlags::SYMLINK_NOFOLLOW))?
+        else {
+            continue;
+        };
         remove_entry(&child, &entry, &inner, uid, dev, depth + 1)?;
     }
     drop(child);
@@ -303,6 +343,15 @@ fn open_child(dir: &OwnedFd, name: &OsStr, stat: &Stat) -> io::Result<OwnedFd> {
         return Err(io::Error::other("replaced while being examined"));
     }
     Ok(child)
+}
+
+/// [`list`], and in tests the point between listing and removing at which a test makes
+/// entries vanish.
+fn listed(dir: &OwnedFd) -> io::Result<Vec<OsString>> {
+    let names = list(dir)?;
+    #[cfg(test)]
+    tests::after_listing();
+    Ok(names)
 }
 
 /// The names in `dir`, read whole before any is removed.
