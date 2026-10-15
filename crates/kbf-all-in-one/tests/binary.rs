@@ -158,15 +158,19 @@ fn farm_flags(dir: &Path, port: u16) -> Vec<String> {
     ]
 }
 
-/// Kills the process when dropped, so a failed test leaves nothing running.
-struct Running(Child);
+/// Kills the process when dropped, so a failed test leaves nothing running. Holds the
+/// read end of its stdout, so a line it writes later never meets a closed pipe.
+struct Running {
+    child: Child,
+    _stdout: Option<BufReader<std::process::ChildStdout>>,
+}
 
 impl Running {
     /// Waits for the process to end on its own, for at most [`PROMPT`].
     fn wait(mut self) -> std::process::ExitStatus {
         let deadline = std::time::Instant::now() + PROMPT;
         loop {
-            if let Some(status) = self.0.try_wait().expect("wait") {
+            if let Some(status) = self.child.try_wait().expect("wait") {
                 return status;
             }
             assert!(std::time::Instant::now() < deadline, "still running");
@@ -177,8 +181,8 @@ impl Running {
 
 impl Drop for Running {
     fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }
 
@@ -211,6 +215,100 @@ async fn execute(reapi: Channel, action: Digest) -> ActionResult {
     response.result.expect("a result")
 }
 
+/// Starts the binary on a one-node farm in `dir` whose stand-in `podman` runs `steps` as
+/// each action; returns it once it has printed its start line, with the REAPI address
+/// that line names and the image an action names.
+fn farm(dir: &Path, steps: &[&str]) -> (Running, SocketAddr, String) {
+    pki(dir);
+    let bin = dir.join("bin");
+    std::fs::create_dir_all(&bin).expect("mkdir");
+    let image = podman(&bin, steps);
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let mut child = Command::new(BIN)
+        .args(farm_flags(dir, free_port()))
+        .arg(format!("--id-files={}", id_files(dir).display()))
+        .args(cgroup_tree(&bin))
+        .env("PATH", path)
+        // The stand-in finds its state beside the link it was run through, which the
+        // driver runs by the name `PATH` finds (argv0 `podman`): from here.
+        .current_dir(&bin)
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn");
+    let mut stdout = BufReader::new(child.stdout.take().expect("stdout"));
+    let mut line = String::new();
+    stdout.read_line(&mut line).expect("a start line");
+    let running = Running {
+        child,
+        _stdout: Some(stdout),
+    };
+    let reapi: SocketAddr = line
+        .trim_end()
+        .split(' ')
+        .find_map(|field| field.strip_prefix("reapi="))
+        .unwrap_or_else(|| panic!("no reapi= in {line:?}"))
+        .parse()
+        .expect("an address");
+    (running, reapi, image)
+}
+
+/// The TCP ports process `pid` listens on: each socket among its descriptors
+/// (`/proc/<pid>/fd`) that `/proc/<pid>/net/tcp` or `tcp6` lists in state LISTEN.
+fn listening_ports(pid: u32) -> std::collections::BTreeSet<u16> {
+    let mut sockets = std::collections::BTreeSet::new();
+    for fd in std::fs::read_dir(format!("/proc/{pid}/fd")).expect("list fds") {
+        let Ok(target) = std::fs::read_link(fd.expect("an fd").path()) else {
+            continue; // closed since it was listed
+        };
+        let target = target.to_string_lossy();
+        if let Some(inode) = target
+            .strip_prefix("socket:[")
+            .and_then(|t| t.strip_suffix(']'))
+        {
+            sockets.insert(inode.to_owned());
+        }
+    }
+    let mut ports = std::collections::BTreeSet::new();
+    for table in ["tcp", "tcp6"] {
+        let text = std::fs::read_to_string(format!("/proc/{pid}/net/{table}")).expect("read");
+        for row in text.lines().skip(1) {
+            let fields: Vec<&str> = row.split_whitespace().collect();
+            let (Some(local), Some(state), Some(inode)) =
+                (fields.get(1), fields.get(3), fields.get(9))
+            else {
+                continue;
+            };
+            // 0A is TCP_LISTEN.
+            if *state != "0A" || !sockets.contains(*inode) {
+                continue;
+            }
+            let port = local.rsplit(':').next().expect("a port");
+            ports.insert(u16::from_str_radix(port, 16).expect("a hex port"));
+        }
+    }
+    ports
+}
+
+/// Catches a worker listener bound by the binary (no remote daemon may reach an
+/// all-in-one process: its daemon half's control plane is calls into the server half),
+/// or any other listener but the REAPI one: once the start line is out, the process
+/// listens on exactly one TCP port, the one the line names as `reapi=`.
+#[test]
+fn the_binary_listens_on_the_reapi_port_alone() {
+    let dir = scratch("listeners");
+    let (running, reapi, _) = farm(&dir, &["echo", "unused"]);
+    let ports = listening_ports(running.child.id());
+    assert_eq!(
+        ports,
+        std::collections::BTreeSet::from([reapi.port()]),
+        "listening on {ports:?}; reapi={reapi}"
+    );
+}
+
 /// Catches the daemon half's outputs not reaching the server half's CAS, or reaching it
 /// other than through the in-process plane (the binary is given no `--cas`, so a daemon
 /// half wired to the transfer engine refuses to start), the helper re-execs not
@@ -222,9 +320,6 @@ async fn execute(reapi: Channel, action: Digest) -> ActionResult {
 #[test]
 fn an_actions_outputs_go_through_the_in_process_plane() {
     let dir = scratch("e2e");
-    pki(&dir);
-    let bin = dir.join("bin");
-    std::fs::create_dir_all(&bin).expect("mkdir");
     let steps = [
         "mkdir",
         "$UPPER/out/dir",
@@ -244,32 +339,7 @@ fn an_actions_outputs_go_through_the_in_process_plane() {
         "--stderr",
         "to stderr",
     ];
-    let image = podman(&bin, &steps);
-    let path = format!(
-        "{}:{}",
-        bin.display(),
-        std::env::var("PATH").unwrap_or_default()
-    );
-    let mut child = Command::new(BIN)
-        .args(farm_flags(&dir, free_port()))
-        .arg(format!("--id-files={}", id_files(&dir).display()))
-        .args(cgroup_tree(&bin))
-        .env("PATH", path)
-        // The stand-in finds its state beside the link it was run through, which the
-        // driver runs by the name `PATH` finds (argv0 `podman`): from here.
-        .current_dir(&bin)
-        .stdout(Stdio::piped())
-        .spawn()
-        .expect("spawn");
-    let stdout = BufReader::new(child.stdout.take().expect("stdout"));
-    let running = Running(child);
-    let line = stdout.lines().next().expect("a start line").expect("read");
-    let reapi: SocketAddr = line
-        .split(' ')
-        .find_map(|field| field.strip_prefix("reapi="))
-        .unwrap_or_else(|| panic!("no reapi= in {line:?}"))
-        .parse()
-        .expect("an address");
+    let (running, reapi, image) = farm(&dir, &steps);
 
     let tokio = tokio::runtime::Runtime::new().expect("runtime");
     tokio.block_on(async {
@@ -324,7 +394,7 @@ fn an_actions_outputs_go_through_the_in_process_plane() {
     // Its connections closed, so the server half's drain does not wait for them.
     drop(tokio);
 
-    let pid = rustix::process::Pid::from_child(&running.0);
+    let pid = rustix::process::Pid::from_child(&running.child);
     rustix::process::kill_process(pid, rustix::process::Signal::TERM).expect("SIGTERM");
     let status = running.wait();
     assert!(status.success(), "{status}");
