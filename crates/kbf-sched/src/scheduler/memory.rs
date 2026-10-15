@@ -42,7 +42,7 @@ use kbf_types::{
     ActionKey, Failure, FarmFault, MemoryKill, MemoryRun, OperationId, ResultRecord, WorkerId,
 };
 
-use super::Scheduler;
+use super::{Scheduler, Worker};
 use crate::input::Request;
 use crate::requeue::RequeueReason;
 use crate::servable::serves;
@@ -301,14 +301,19 @@ impl Scheduler {
             .iter()
             .filter(|(name, w)| {
                 also == Some(*name)
-                    || (w.alive(self.now)
-                        && serves(&w.caps, request.kind)
-                        && request.needs.matches(&w.caps)
-                        && w.capacity.cpu_millis >= wanted.cpu_millis
-                        && w.capacity.gpus >= wanted.gpus)
+                    || (self.could_run(w, request) && w.capacity.cpu_millis >= wanted.cpu_millis)
             })
             .map(|(_, w)| w.capacity.memory_bytes)
             .max()
+    }
+
+    /// Whether `w` is live, serves `request`'s lease kind, satisfies its platform and
+    /// holds its GPU request: what a node needs of the request but its CPUs and memory.
+    fn could_run(&self, w: &Worker, request: &Request) -> bool {
+        w.alive(self.now)
+            && serves(&w.caps, request.kind)
+            && request.needs.matches(&w.caps)
+            && w.capacity.gpus >= request.resources.gpus
     }
 
     /// The CPUs of the largest node that could run `request`, in thousandths of a core:
@@ -322,11 +327,7 @@ impl Scheduler {
         self.workers
             .values()
             .filter(|w| {
-                w.alive(self.now)
-                    && serves(&w.caps, request.kind)
-                    && request.needs.matches(&w.caps)
-                    && w.capacity.memory_bytes >= wanted.memory_bytes
-                    && w.capacity.gpus >= wanted.gpus
+                self.could_run(w, request) && w.capacity.memory_bytes >= wanted.memory_bytes
             })
             .map(|w| w.capacity.cpu_millis)
             .max()
