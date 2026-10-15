@@ -904,8 +904,10 @@ mod tests {
             .expect("flags")
         };
         let attached = |cli: &Cli| {
-            let (daemon, _) =
-                node(cli, || native_config(cli), &dir.join("no-xcrun")).expect("a daemon");
+            let report = NodeReport::detect(&[]).expect("a report");
+            let runtime = Arc::new(FakeRuntime::new(Duration::ZERO));
+            let config = DaemonConfig::from_args(&cli.daemon);
+            let daemon = Daemon::new(config, runtime, report).expect("a daemon");
             backstop(cli, daemon).memory_backstop()
         };
         let on = cli(&file);
