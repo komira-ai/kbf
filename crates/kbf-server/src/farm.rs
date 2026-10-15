@@ -678,7 +678,7 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
 impl<M: MetaLog, O: ObjectStore + 'static> Dispatch for Farm<M, O> {
     fn submit(&self, mut submission: Submission) -> Result<Ticket, Status> {
         let now = self.now();
-        let waiting = Instant::now();
+        let waiting = std::time::Instant::now();
         let mut state = self.lock();
         self.cache.metrics().sched_lock_wait.since(waiting);
         let action = submission.request.key.action;
