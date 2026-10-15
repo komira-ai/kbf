@@ -28,7 +28,9 @@ kbf_driver_container::chown_dirs_test_hook!();
 /// built by an earlier run would otherwise be a hit in this one.
 fn beside(config: &PodmanConfig, suffix: &str) -> PathBuf {
     let dir = PathBuf::from(format!("{}-{suffix}", config.scratch.display()));
-    support::force_remove(&dir);
+    if suffix == "trees" {
+        support::force_remove(&dir); // MUTANT: the cache is kept
+    }
     dir
 }
 
