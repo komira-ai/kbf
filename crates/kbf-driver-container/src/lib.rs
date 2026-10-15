@@ -1,6 +1,8 @@
 //! The container driver for `kbf-daemon`: runs each `action` lease in a fresh rootless
-//! Podman container, behind the daemon's `Runtime` trait
-//! (`docs/design/daemon.md#the-container-driver`).
+//! container, behind the daemon's `Runtime` trait
+//! (`docs/design/daemon.md#the-container-driver`), through Podman or, with
+//! `--container-runtime=oci`, through `crun` run directly from a bundle the driver
+//! writes (the `oci` module documents that backend).
 //!
 //! What one lease gets:
 //! - the image named by digest in the action's `container-image` platform property
@@ -57,12 +59,14 @@
 //! - [`subids`]: the daemon user's subordinate id ranges, checked at startup;
 //! - [`delegate`](mod@delegate): the daemon's delegated cgroup subtree, set up at
 //!   startup, and what leases may use of the node;
+//! - `backend`: the runtime-specific part of a lease, [`ContainerRuntime`]: Podman or OCI;
 //! - [`PodmanRuntime`]: the six driver steps.
 //!
 //! Not yet: re-adopting leases after a daemon restart (one systemd unit per lease),
 //! image import into the node's store,
 //! networked actions, and the private Podman socket for service containers.
 
+mod backend;
 pub mod cas;
 mod cgroup;
 pub mod chown_dirs;
@@ -72,6 +76,7 @@ mod hashing;
 pub mod image;
 mod input_phases;
 mod keeper;
+mod oci;
 mod outputs;
 mod podman;
 mod program;
@@ -84,11 +89,15 @@ pub mod tree;
 #[cfg(test)]
 kbf_daemon::keeper_test_hook!();
 
+pub use backend::ContainerRuntime;
 pub use cas::{CHUNK, FileBlob, MemoryCas};
 pub use cgroup::{SwapKill, cpu_weight, memory_max};
 pub use delegate::{DelegateError, Delegation, adopt, capacity, delegate, limit_cpus};
 pub use image::{ImageCheckError, ImageError, ImageRef};
+pub use oci::{OciConfig, OciError};
 pub use outputs::OutputLimits;
 pub use podman::{ContainerLimits, EXEC_ROOT, OWNER_LABEL};
 pub use runtime::{CacheUse, ConfigError, DRIVER, KIND, PodmanConfig, PodmanRuntime, StartError};
-pub use subids::{IdFiles, SubidError, check_daemon_user, check_subordinate_ids};
+pub use subids::{
+    DaemonIds, IdFiles, SubidError, check_daemon_user, check_subordinate_ids, daemon_ids,
+};
