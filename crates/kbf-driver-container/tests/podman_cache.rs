@@ -22,11 +22,10 @@ use support::real::{Cell, podman, sh};
 
 kbf_driver_container::chown_dirs_test_hook!();
 
-/// A cache beside `config`'s scratch directory, linking with `link`.
+/// An empty cache beside `config`'s scratch directory, linking with `link`. Like the
+/// scratch directory, it is emptied first: CI restores `target` from an earlier run.
 fn with_cache(config: &mut PodmanConfig, link: Option<Arc<kbf_daemon::cache::LinkFn>>) {
     let dir = PathBuf::from(format!("{}-cache", config.scratch.display()));
-    // Beside the scratch directory, which the cell empties, not in it: a run that
-    // finds the last one's entries (a restored build cache keeps them) is not fresh.
     support::force_remove(&dir);
     std::fs::create_dir_all(&dir).expect("cache dir");
     let mut cache = CacheConfig::new(dir, config.scratch.clone(), 1 << 30);
@@ -209,7 +208,9 @@ async fn identical_inputs_are_one_inode_and_tar_alike_on_every_run() {
 // what a tree is on disk; the stand-in Podman shows the volume reaches the container's arguments.
 // Only a kernel shows the rest, below.
 
-/// A cache and a tree store beside `config`'s scratch directory.
+/// A cache and an empty tree store beside `config`'s scratch directory. A store left by
+/// an earlier run (CI restores `target`, `CARGO_TARGET_TMPDIR` included) would answer
+/// the first lease's tree as a hit instead of a build.
 fn with_trees(config: &mut PodmanConfig) {
     with_cache(config, None);
     let trees = PathBuf::from(format!("{}-trees", config.scratch.display()));
