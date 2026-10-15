@@ -200,11 +200,19 @@ async fn no_blob_is_fetched_after_one_failed() {
 /// A CAS whose read of `held` ties up tokio's blocking pool (one thread in this test)
 /// until the test releases it, and whose read of `failing` fails once `held` was
 /// read. The write of `held`'s file is then queued on the pool when the error comes.
+///
+/// The read of `held` ties up the pool only once `failing` has been asked for: the
+/// file of `failing` is created on the pool before it is read, and that create must
+/// not queue behind the tied-up thread. `materialize` queues both creates at once, but
+/// the create of `held` can finish before the create of `failing` is queued (the
+/// runtime thread preempted in between), and the read of `held` would then tie up the
+/// thread first: `failing` never read, the test waiting out its deadline (#622).
 struct HeldCas {
     blobs: MemoryCas,
     held: Digest,
     failing: Digest,
     release: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    failing_asked: AtomicBool,
     held_read: AtomicBool,
     failed: AtomicBool,
 }
@@ -217,7 +225,13 @@ impl Cas for HeldCas {
     }
 
     async fn get(&self, digest: &Digest) -> Result<Vec<u8>, CasError> {
+        if *digest == self.failing {
+            self.failing_asked.store(true, Ordering::SeqCst);
+        }
         if *digest == self.held {
+            while !self.failing_asked.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
             let release = self
                 .release
                 .lock()
@@ -291,6 +305,7 @@ fn no_file_appears_after_materialize_failed() {
             held,
             failing,
             release: Mutex::new(Some(wait)),
+            failing_asked: AtomicBool::new(false),
             held_read: AtomicBool::new(false),
             failed: AtomicBool::new(false),
         });
