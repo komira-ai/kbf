@@ -10,6 +10,7 @@
 //!   moving a process that has ended is ESRCH;
 //! - `memory.max` and `memory.min` exist only where the parent enables `memory`, and
 //!   not at the root;
+//!   `cpu.max` only where the parent enables `cpu`, and not at the root;
 //!   `cpuset.cpus.effective` only where the parent enables `cpuset`, and at the root;
 //! - making a cgroup in one this process may not write is EACCES.
 
@@ -109,6 +110,7 @@ impl Fake {
             "memory.max" | "memory.min" => {
                 cgroup != "/" && self.controllers(cgroup).iter().any(|c| c == "memory")
             }
+            "cpu.max" => cgroup != "/" && self.controllers(cgroup).iter().any(|c| c == "cpu"),
             "cpuset.cpus.effective" => {
                 cgroup == "/" || self.controllers(cgroup).iter().any(|c| c == "cpuset")
             }
@@ -169,6 +171,7 @@ impl CgroupFs for Fake {
                 Ok(value.unwrap_or_else(|| match file {
                     "memory.max" => "max\n".into(),
                     "memory.min" => "0\n".into(),
+                    "cpu.max" => "max 100000\n".into(),
                     _ => String::new(),
                 }))
             }
@@ -651,4 +654,84 @@ fn cpu_lists_are_counted() {
     assert_eq!(count_cpus("0-3,8,10-11"), Some(7));
     assert_eq!(count_cpus("3-1"), None);
     assert_eq!(count_cpus("a"), None);
+}
+
+/// Catches `--reserve-cpus` not reaching the kernel: `actions/cpu.max` is the leases'
+/// CPUs in the kernel's `<quota> <period>` form (72 CPUs is 7200000 of 100000, a quota
+/// of CPUs and not of microseconds), written to `actions/` and nowhere else, never a
+/// quota of 0 (a cgroup that never runs), and a failed write names the file.
+#[test]
+fn the_leases_cpus_are_written_to_the_actions_cgroup() {
+    let fake = Fake::host(UNIT, "cpuset cpu io memory pids", &[41]);
+    delegate_in(&fake, SELF, MIN, None).expect("delegated");
+    let before = fake.log().len();
+    limit_cpus_in(&fake, ACTIONS_CG, 72).expect("limited");
+    assert_eq!(
+        fake.log()[before..],
+        [format!("{ACTIONS_CG}/cpu.max <- 7200000 100000")]
+    );
+    limit_cpus_in(&fake, ACTIONS_CG, 0).expect("limited");
+    assert_eq!(
+        read(&fake, ACTIONS_CG, "cpu.max").expect("read"),
+        "100000 100000"
+    );
+
+    // A file the daemon may not write is an error that names it.
+    let mut denied = Fake::host(UNIT, "cpu memory pids", &[41]);
+    delegate_in(&denied, SELF, MIN, None).expect("delegated");
+    denied.denied = vec![format!("{ACTIONS_CG}/cpu.max")];
+    let err = limit_cpus_in(&denied, ACTIONS_CG, 4)
+        .expect_err("denied")
+        .to_string();
+    assert!(err.contains("write") && err.contains("cpu.max"), "{err}");
+}
+
+/// Catches the capacity ignoring `cpu.max`: the lowest quota on the path counts (a
+/// unit's `CPUQuota=` as well as ours), `max` is no limit, a quota is rounded down but
+/// is at least 1 CPU, a quota above the cpuset does not raise it, and junk is an error.
+#[test]
+fn capacity_counts_the_lowest_cpu_quota() {
+    let fake = Fake::host(UNIT, "cpuset cpu io memory pids", &[41]);
+    delegate_in(&fake, SELF, MIN, None).expect("delegated");
+    fake.set("/", "cpuset.cpus.effective", "0-87\n");
+    limit_cpus_in(&fake, ACTIONS_CG, 72).expect("limited");
+    let cpus = |fake: &Fake| capacity_in(fake, ACTIONS_CG).expect("read").cpus;
+    assert_eq!(cpus(&fake), Some(72));
+    // The unit's own CPUQuota=, lower: it counts.
+    fake.set(UNIT, "cpu.max", "3500000 100000\n");
+    assert_eq!(cpus(&fake), Some(35));
+    // Less than a CPU is one; max is no limit above.
+    fake.set(UNIT, "cpu.max", "max 100000\n");
+    fake.set(ACTIONS_CG, "cpu.max", "50000 100000\n");
+    assert_eq!(cpus(&fake), Some(1));
+    // A quota above the cpuset does not raise it.
+    fake.set(ACTIONS_CG, "cpu.max", "9000000 100000\n");
+    fake.set("/system.slice", "cpuset.cpus.effective", "0-3\n");
+    assert_eq!(cpus(&fake), Some(4));
+    // Only a quota: no cpuset anywhere.
+    let only = Fake::host(UNIT, "cpu memory pids", &[41]);
+    delegate_in(&only, SELF, MIN, None).expect("delegated");
+    assert_eq!(cpus(&only), None);
+    limit_cpus_in(&only, ACTIONS_CG, 6).expect("limited");
+    assert_eq!(cpus(&only), Some(6));
+    only.set(ACTIONS_CG, "cpu.max", "lots 100000");
+    let err = capacity_in(&only, ACTIONS_CG)
+        .expect_err("junk")
+        .to_string();
+    assert!(err.contains("cpu.max"), "{err}");
+}
+
+/// Catches a quota read as CPUs without its period, a period of 0 dividing, and `max`
+/// read as a number.
+#[test]
+fn a_cpu_max_is_counted_in_cpus() {
+    assert_eq!(quota_cpus("max 100000"), Ok(None));
+    assert_eq!(quota_cpus("max"), Ok(None));
+    assert_eq!(quota_cpus("200000 100000"), Ok(Some(2)));
+    assert_eq!(quota_cpus("400000 200000"), Ok(Some(2)));
+    assert_eq!(quota_cpus("250000 100000"), Ok(Some(2)));
+    assert_eq!(quota_cpus("1000 100000"), Ok(Some(1)));
+    assert_eq!(quota_cpus("300000"), Ok(Some(3)));
+    assert!(quota_cpus("100000 0").is_err());
+    assert!(quota_cpus("x 100000").is_err());
 }

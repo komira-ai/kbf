@@ -25,6 +25,7 @@ kbf-proto.workspace = true
 kbf-raft.workspace = true
 kbf-sched.workspace = true
 kbf-store.workspace = true
+kbf-threads.workspace = true
 kbf-tier.workspace = true
 kbf-types.workspace = true
 percent-encoding.workspace = true
