@@ -48,6 +48,7 @@ mod capabilities;
 mod cas;
 mod cpu;
 mod execution;
+mod input_tree;
 mod meta_log;
 pub mod metrics;
 mod recorder;
@@ -81,6 +82,7 @@ pub use crate::execution::{
     ExecutionService, Finished, GPU_KEY, LEASE_KIND_KEY, LEASE_KINDS, NO_WORKER_REASON,
     OperationStream, Stage, Submission, Ticket, closing, missing_status,
 };
+pub use crate::input_tree::{ENTRY_OVERHEAD, InputTreeConfig};
 pub use crate::meta_log::{Leadership, MemoryMetaLog, MetaLog, MetaLogError};
 pub use crate::recorder::{
     DEFAULT_INVOCATION_MEMORY, ExecuteCall, RECORDER_CHANNEL, Recorder, Recording, listing, owner,
@@ -163,17 +165,26 @@ where
     O: ObjectStore + 'static,
     D: Dispatch,
 {
-    routes_recorded(cache, dispatch, closing, authorizers, &Recorder::off())
+    routes_recorded(
+        cache,
+        dispatch,
+        closing,
+        authorizers,
+        &Recorder::off(),
+        DEFAULT_RESOURCES.memory_bytes,
+    )
 }
 
 /// [`routes_with_authorizers`], each call that carries an invocation id sent to
-/// `recorder`.
+/// `recorder`, and an `action` that names no memory size booking `default_memory`
+/// bytes ([`ExecutionService::with_default_memory`]).
 pub fn routes_recorded<M, O, D>(
     cache: Arc<Cache<M, O>>,
     dispatch: Arc<D>,
     closing: Closing,
     authorizers: Arc<Authorizers>,
     recorder: &Recorder,
+    default_memory: u64,
 ) -> Routes
 where
     M: MetaLog,
@@ -187,7 +198,8 @@ where
             closing,
             Arc::clone(&authorizers),
         )
-        .recording(recorder.clone()),
+        .recording(recorder.clone())
+        .with_default_memory(default_memory),
     )
     .max_decoding_message_size(MAX_MESSAGE_BYTES)
     .max_encoding_message_size(MAX_MESSAGE_BYTES);

@@ -560,6 +560,20 @@ makes `actions/kbf-lease-<term>-<seq>` and puts the container under it.
   The node's backstop is `memory.max` on `actions/`, set from
   `--actions-memory-max-gib` (or by whoever runs the daemon's unit). Nothing is capped
   when no memory was booked.
+- **The memory backstop** (every driver, Linux): while the node's memory stall time is
+  high and it runs a lease, the daemon stops taking new ones. It samples the `some`
+  line's `avg10` of `/proc/pressure/memory` (the percentage of the last 10 seconds in
+  which at least one task waited for memory) every second. When that is above
+  `--memory-pressure-pause-percent` (default 10) and a lease runs, the daemon's
+  `Hello` says `PHASE_MEMORY_PRESSURE` ([worker-protocol.md](worker-protocol.md#node-phases))
+  and the server offers the node nothing; when the stall is at or below the threshold,
+  or the last lease ends, the next `Hello` says serving. Leases that run are not
+  touched. It cannot deadlock: it pauses only while a lease runs, and every lease
+  ends, so a node whose stall comes from outside (another process on the box) still
+  takes one lease at a time. Where the file cannot be read (macOS, a kernel without
+  pressure stall information) the daemon logs that the backstop is off and never
+  pauses. A runtime's own phase (a session switch, a quarantine) comes first. It does
+  not replace the `actions/` limit: that kills, this only stops adding load.
 - **CPU** is compressible: `cpu.weight` = booked millicores / 10, clamped to 1..10000
   (one core is the kernel's default weight of 100). The driver never sets `cpu.max`,
   because throttling distorts wall time.
@@ -601,7 +615,8 @@ pids`), and builds the sample project with pinned buck2:
   the action cache (the rule `kbf-cell check` applies, as in M1). The image has no
   shell, so each action runs `kbf-m2-act`, a statically linked helper that is an input
   file of the action;
-- `//:hog`, which touches 3 GiB slowly: its first run books the default 1 GiB, presses
+- `//:hog`, which touches 3 GiB slowly: its first run books 1 GiB (the cell's server runs `--memory-ladder-gib 1,2,4`; the
+  default first rung, 4 GiB, would pass the hog's cap), presses
   its 2 GiB cap into swap until the swap watch kills it, and the server's log must
   hold exactly one requeue from 1 GiB to 2 GiB booked, after which it passes;
 - `//:pause` under a fresh salt: while it sleeps, Podman lists exactly one running

@@ -9,6 +9,7 @@ use kbf_daemon::cache::Cache;
 use kbf_outputs::OutputLimits;
 
 use crate::network::Isolation;
+use crate::simulator::Listing;
 use crate::slots::Pool;
 use crate::user_folders::{LEFTOVER_AGE, UserFolders};
 
@@ -65,6 +66,9 @@ pub struct NativeConfig {
     /// How long ending an action's processes may take before the survivors fail the
     /// lease.
     pub kill_wait: Duration,
+    /// How long a lease's new simulator may take to be listed by Xcode, and how often
+    /// the driver looks, before the action runs ([`crate::simulator`]).
+    pub simulator_listing: Listing,
     /// How the network is kept off.
     pub isolation: Isolation,
     /// The Xcodes an action may name when the runtime starts, by build (`16C5032a`),
@@ -95,7 +99,7 @@ pub struct NativeConfig {
 
 impl NativeConfig {
     /// A configuration with a one hour default timeout, the default output limits,
-    /// upload deadline ([`kbf_daemon::UPLOAD_DEADLINE`]) and memory policy, a 250 ms poll, a 5 s kill wait, this node's isolation and user
+    /// upload deadline ([`kbf_daemon::UPLOAD_DEADLINE`]) and memory policy, a 250 ms poll, a 5 s kill wait, [`Listing::DEFAULT`], this node's isolation and user
     /// folders, leftovers swept after [`LEFTOVER_AGE`], no Xcode (see [`Self::xcodes`]),
     /// the system `xcrun`, no lease-user pool and no input cache.
     #[must_use]
@@ -108,6 +112,7 @@ impl NativeConfig {
             memory: MemoryPolicy::DEFAULT,
             poll: Duration::from_millis(250),
             kill_wait: Duration::from_secs(5),
+            simulator_listing: Listing::DEFAULT,
             isolation: Isolation::detect(),
             xcodes: BTreeMap::new(),
             user_folders: UserFolders::detect(),

@@ -268,3 +268,26 @@ async fn a_container_cannot_change_a_shared_tree_or_lift_its_read_only_flag() {
     assert_eq!((stats.builds, stats.hits), (1, 1), "{stats:?}");
     cell.assert_clean(2);
 }
+
+/// Catches a cache or tree store that an earlier run of a test leaves for the next (the
+/// "do not empty them in `with_cache`/`with_trees`" mutant: `Cell` removes only its
+/// scratch directory, and CI keeps `target` between runs). The same cell runs twice in
+/// one process, each time from `Cell::with`; the second run's first lease builds the
+/// tree again and finds none of its inputs in the cache, as the first run's did.
+#[tokio::test]
+#[ignore = "needs rootless Podman and a delegated cgroup: run by cargo xtask podman-tests"]
+async fn a_cache_and_tree_store_start_empty_whatever_an_earlier_run_left() {
+    let mut spec = sh("cat src/a; echo; ls tc/lib | wc -l");
+    spec.inputs = toolchain();
+    spec.inputs.push(("src/a", b"small", false));
+    for run in 1..=2 {
+        let cell = Cell::with("trees-again", with_trees);
+        let result = cell.run(1, &spec).await.expect("ran");
+        assert_eq!(cell.stdout(&result), "small\n30\n", "run {run}");
+        let stats = cell.runtime.tree_stats().expect("a store");
+        assert_eq!((stats.builds, stats.hits), (1, 0), "run {run}: {stats:?}");
+        let inputs = cell.runtime.last_inputs().expect("counted");
+        assert_eq!(inputs.cache_hits, 0, "run {run}: {inputs}");
+        cell.assert_clean(1);
+    }
+}

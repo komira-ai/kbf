@@ -120,6 +120,9 @@ impl Pki {
             &self.path("server.key"),
             "--worker-client-ca",
             &self.path("ca.pem"),
+            // The test nodes are small: an action books 1 GiB, not the default 4.
+            "--memory-ladder-gib",
+            "1",
         ]
         .map(str::to_owned);
         Args::parse_from(base.iter().map(String::as_str).chain(extra.iter().copied()))

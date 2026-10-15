@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use bytes::Bytes;
-use kbf_auth::{AuthenticateLayer, Policy};
+use kbf_auth::{AuthenticateLayer, Authorizers, Policy};
 use kbf_front::{
     Cache, Closing, Dispatch, MAX_MESSAGE_BYTES, MemoryMetaLog, MetaLog, MetaLogError,
     RequestMetadataLayer,
@@ -108,6 +108,23 @@ impl Farm {
     /// `closing`'s closer closes.
     pub async fn with_execution_until<D: Dispatch>(dispatch: Arc<D>, closing: Closing) -> Self {
         Self::serve(|cache| kbf_front::routes_with_execution(cache, dispatch, closing)).await
+    }
+
+    /// The cache services and `Execution` over `dispatch` (streams never closed),
+    /// where an action that names no memory size books `default_memory` bytes.
+    pub async fn with_default_memory<D: Dispatch>(dispatch: Arc<D>, default_memory: u64) -> Self {
+        let (_, closing) = kbf_front::closing();
+        let routes = |cache| {
+            kbf_front::routes_recorded(
+                cache,
+                dispatch,
+                closing,
+                Arc::new(Authorizers::allow_all()),
+                &kbf_front::Recorder::off(),
+                default_memory,
+            )
+        };
+        Self::serve(routes).await
     }
 
     /// The cache services and `Execution` over `dispatch` (streams never closed),

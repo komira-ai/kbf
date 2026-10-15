@@ -227,6 +227,8 @@ pub struct MetaState {
     blobs: BTreeMap<Digest, BlobEntry>,
     actions: BTreeMap<Digest, ActionEntry>,
     unreachable: BTreeMap<ObjectId, LossMark>,
+    /// How many times an object went from reachable to marked unreachable.
+    losses: u64,
     next_epoch: u64,
     /// Each server's current tier.
     tiers: BTreeMap<ServerId, TierId>,
@@ -250,6 +252,7 @@ impl MetaState {
             blobs: BTreeMap::new(),
             actions: BTreeMap::new(),
             unreachable: BTreeMap::new(),
+            losses: 0,
             next_epoch: 1,
             tiers: BTreeMap::new(),
             retired_tiers: BTreeSet::new(),
@@ -286,6 +289,21 @@ impl MetaState {
     #[must_use]
     pub fn unreachable(&self, object: ObjectId) -> Option<UnreachableReason> {
         self.unreachable.get(&object).map(|mark| mark.reason)
+    }
+
+    /// How many times an object has newly become unreachable: a
+    /// [`Command::ObjectUnreachable`] on an object with no mark counts, and so does one
+    /// after a [`Command::ObjectReachable`] cleared it. A mark that only raises the
+    /// reason or restamps the generation does not count, nor does a clear. It never
+    /// falls.
+    ///
+    /// A blob held in the object answered present until the mark and answers
+    /// unreachable after it, so anything remembered about "these blobs are held" that
+    /// was recorded when this count was lower may be wrong. Whoever adds a command that
+    /// takes held blobs away before their retention ends must count it here.
+    #[must_use]
+    pub const fn losses(&self) -> u64 {
+        self.losses
     }
 
     /// `object`'s loss mark, or `None` if it is not marked. A prober reads the
@@ -327,6 +345,9 @@ impl MetaState {
             Command::ObjectUnreachable { object, reason } => {
                 Applied::Marked(self.allocated(object).map(|()| {
                     let generation = Generation::new(index);
+                    if !self.unreachable.contains_key(&object) {
+                        self.losses += 1;
+                    }
                     let mark = self
                         .unreachable
                         .entry(object)

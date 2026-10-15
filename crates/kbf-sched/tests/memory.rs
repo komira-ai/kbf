@@ -6,7 +6,8 @@
 use kbf_caps::NodeCaps;
 use kbf_sched::fence::LEASE_GRACE;
 use kbf_sched::{
-    DaemonInstance, Event, FARM_RERUNS, Input, OpState, Request, Requeue, RequeueReason, Scheduler,
+    DaemonInstance, Event, FARM_RERUNS, Input, MemoryLadder, OpState, Request, Requeue,
+    RequeueReason, Scheduler,
 };
 use kbf_types::{
     ActionKey, ControlRecord, Digest, DigestFunction, Effect, Failure, FarmFault, FarmRun,
@@ -231,32 +232,33 @@ fn oom(booked_gib: u64, raised_gib: u64) -> RequeueReason {
     }
 }
 
-/// Catches: a ladder that does not double (1 -> 3 GiB, the off-by-one mutant, or a
-/// rerun at the same booking); one that passes the largest node (no cap: the 16 GiB
-/// rung fits nowhere and the action waits instead of being told); one that never
-/// stops (a kill at the cap run again); a rung that is not committed as a requeue, or
-/// is answered; and runs not recorded for the answer's text.
+/// Catches: a ladder that does not start from the booking (4 GiB, the front's first
+/// rung); a ladder that doubles (4 -> 8), skips a rung or stops at 32 GiB instead of booking a whole host;
+/// a whole host that is not the largest node's memory; a ladder that never stops (a
+/// kill at the whole host run again); a rung that is not committed as a requeue, or is
+/// answered; and runs not recorded for the answer's text.
 #[test]
-fn an_own_limit_kill_doubles_the_booking_up_to_the_largest_node() {
+fn an_unsized_action_climbs_4_16_32_gib_then_a_whole_host() {
     let mut f = Farm::new();
-    f.node("a-small", 4, linux());
-    f.node("b-large", 8, linux());
-    assert!(f.submit(1, request(1, GIB)).is_empty());
+    f.node("a-small", 8, linux());
+    f.node("b-large", 64, linux());
+    assert!(f.submit(1, request(1, 4 * GIB)).is_empty());
     let first = f.start();
-    assert_eq!(first.resources.memory_bytes, GIB);
+    assert_eq!(first.resources.memory_bytes, 4 * GIB);
+    assert_eq!(first.worker, w("a-small"));
 
     let second = f.killed(&first, OOM);
-    assert_eq!(second.resources.memory_bytes, 2 * GIB);
+    assert_eq!(second.resources.memory_bytes, 16 * GIB);
+    assert_eq!(second.worker, w("b-large"), "only the large node holds 16");
     let third = f.killed(&second, OOM);
-    assert_eq!(third.resources.memory_bytes, 4 * GIB);
+    assert_eq!(third.resources.memory_bytes, 32 * GIB);
     let fourth = f.killed(&third, OOM);
-    assert_eq!(fourth.resources.memory_bytes, 8 * GIB, "the cap");
     assert_eq!(
-        fourth.worker,
-        w("b-large"),
-        "only the large node holds 8 GiB"
+        fourth.resources.memory_bytes,
+        64 * GIB,
+        "a whole host: the largest node's memory"
     );
-    assert_eq!(f.requeues(), vec![oom(1, 2), oom(2, 4), oom(4, 8)]);
+    assert_eq!(f.requeues(), vec![oom(4, 16), oom(16, 32), oom(32, 64)]);
 
     f.finishes(&fourth, OOM);
     assert!(f.requeues().is_empty(), "a kill at the cap was run again");
@@ -271,13 +273,61 @@ fn an_own_limit_kill_doubles_the_booking_up_to_the_largest_node() {
     assert_eq!(
         f.s.memory_runs(op).unwrap(),
         [
-            own("a-small", 1, 8),
-            own("a-small", 2, 8),
-            own("a-small", 4, 8),
-            own("b-large", 8, 8)
+            own("a-small", 4, 64),
+            own("b-large", 16, 64),
+            own("b-large", 32, 64),
+            own("b-large", 64, 64)
         ]
     );
-    assert_eq!(f.s.memory_floor(&key(1)), Some(8 * GIB));
+    assert_eq!(f.s.memory_floor(&key(1)), Some(64 * GIB));
+}
+
+/// Catches: a size the platform names that is replaced by the first rung (the explicit
+/// ask must book as asked), one that does not climb from where it is (a 6 GiB ask
+/// killed must book 16, not 4), and one asking more than every rung that does not go
+/// straight to the whole host.
+#[test]
+fn an_explicit_ask_books_as_asked_and_climbs_from_there() {
+    let mut f = Farm::new();
+    f.node("large", 64, linux());
+    f.submit(1, request(1, GIB));
+    let one = f.start();
+    assert_eq!(one.resources.memory_bytes, GIB, "kbf-book-mem-gib=1");
+    let rerun = f.killed(&one, OOM);
+    assert_eq!(rerun.resources.memory_bytes, 4 * GIB);
+    f.finishes(&rerun, ok());
+
+    f.submit(2, request(2, 6 * GIB));
+    let six = f.start();
+    assert_eq!(six.resources.memory_bytes, 6 * GIB);
+    let rerun = f.killed(&six, OOM);
+    assert_eq!(rerun.resources.memory_bytes, 16 * GIB);
+    // A whole host waits for an empty node.
+    f.finishes(&rerun, ok());
+
+    f.submit(3, request(3, 40 * GIB));
+    let forty = f.start();
+    assert_eq!(forty.resources.memory_bytes, 40 * GIB);
+    assert_eq!(f.killed(&forty, OOM).resources.memory_bytes, 64 * GIB);
+}
+
+/// Catches a ladder that ignores the scheduler's own rungs (`--memory-ladder-gib`):
+/// with rungs 2 and 8, a kill at 2 GiB books 8, not 4 or 16.
+#[test]
+fn the_scheduler_climbs_the_rungs_it_is_given() {
+    let mut f = Farm::new();
+    f.s.set_memory_ladder(MemoryLadder::from_gib(&[2, 8]).unwrap());
+    f.node("n", 64, linux());
+    f.submit(1, request(1, 2 * GIB));
+    let first = f.start();
+    let second = f.killed(&first, OOM);
+    assert_eq!(second.resources.memory_bytes, 8 * GIB);
+    let third = f.killed(&second, OOM);
+    assert_eq!(
+        third.resources.memory_bytes,
+        64 * GIB,
+        "after the last rung"
+    );
 }
 
 /// Catches a cap taken from the wrong nodes: one that ignores a cordoned node (the
@@ -307,7 +357,7 @@ fn the_cap_is_the_largest_live_node_that_fits_cordoned_or_not() {
     let effects = f.end(&first, OOM);
     assert_eq!(
         f.requeues(),
-        vec![oom(4, 8)],
+        vec![oom(4, 16)],
         "the 16 GiB cordoned node counts"
     );
     assert_eq!(
@@ -377,38 +427,37 @@ fn the_cap_counts_only_nodes_that_hold_the_whole_request() {
     );
 }
 
-/// Catches: a remembered ask ignored (a later submission of the key starts at 1 GiB
-/// and climbs the ladder again), a floor kept per operation rather than per action
-/// key (another key would start raised), and a floor that lowers a request that
-/// already asks for more.
+/// Catches: a remembered ask ignored (a later submission of the key starts at the
+/// first rung and climbs again), a floor kept per operation rather than per action key
+/// (another key would start raised), and a floor that lowers a request that already
+/// asks for more.
 #[test]
 fn a_later_submission_of_the_key_starts_at_the_remembered_ask() {
     let mut f = Farm::new();
-    f.node("large", 16, linux());
-    f.submit(1, request(1, GIB));
+    f.node("large", 64, linux());
+    f.submit(1, request(1, 4 * GIB));
     let first = f.start();
     let second = f.killed(&first, OOM);
-    let third = f.killed(&second, OOM);
-    assert_eq!(third.resources.memory_bytes, 4 * GIB);
-    f.finishes(&third, ok());
-    assert_eq!(f.s.memory_floor(&key(1)), Some(4 * GIB));
+    assert_eq!(second.resources.memory_bytes, 16 * GIB);
+    f.finishes(&second, ok());
+    assert_eq!(f.s.memory_floor(&key(1)), Some(16 * GIB));
 
-    f.submit(2, request(1, GIB));
+    f.submit(2, request(1, 4 * GIB));
     let again = f.start();
     assert_ne!(again.operation, first.operation);
-    assert_eq!(again.resources.memory_bytes, 4 * GIB, "the floor");
+    assert_eq!(again.resources.memory_bytes, 16 * GIB, "the floor");
     f.finishes(&again, ok());
 
-    f.submit(3, request(2, GIB));
+    f.submit(3, request(2, 4 * GIB));
     let other = f.start();
-    assert_eq!(other.resources.memory_bytes, GIB, "another key's floor");
+    assert_eq!(other.resources.memory_bytes, 4 * GIB, "another key's floor");
     f.finishes(&other, ok());
 
-    f.submit(4, request(1, 8 * GIB));
+    f.submit(4, request(1, 32 * GIB));
     let larger = f.start();
     assert_eq!(
         larger.resources.memory_bytes,
-        8 * GIB,
+        32 * GIB,
         "lowered to the floor"
     );
 }
@@ -423,9 +472,9 @@ fn two_instances_with_the_same_action_keep_separate_floors() {
     f.submit(1, request(1, GIB));
     let first = f.start();
     let second = f.killed(&first, OOM);
-    assert_eq!(second.resources.memory_bytes, 2 * GIB);
+    assert_eq!(second.resources.memory_bytes, 4 * GIB);
     f.finishes(&second, ok());
-    assert_eq!(f.s.memory_floor(&key(1)), Some(2 * GIB));
+    assert_eq!(f.s.memory_floor(&key(1)), Some(4 * GIB));
 
     let mut other = request(1, GIB);
     other.key.instance = "other".to_owned();
@@ -444,12 +493,12 @@ fn two_instances_with_the_same_action_keep_separate_floors() {
     );
     let raised = f.killed(&elsewhere, OOM);
     let raised = f.killed(&raised, OOM);
-    assert_eq!(raised.resources.memory_bytes, 4 * GIB);
+    assert_eq!(raised.resources.memory_bytes, 16 * GIB);
     f.finishes(&raised, ok());
-    assert_eq!(f.s.memory_floor(&other.key), Some(4 * GIB));
+    assert_eq!(f.s.memory_floor(&other.key), Some(16 * GIB));
     assert_eq!(
         f.s.memory_floor(&key(1)),
-        Some(2 * GIB),
+        Some(4 * GIB),
         "raised by another instance"
     );
 }
@@ -503,7 +552,7 @@ fn a_busy_node_kill_reruns_with_the_same_ask_and_records_node_pressure() {
 #[test]
 fn neither_budget_starves_the_other() {
     let mut f = Farm::new();
-    f.node("large", 4, linux());
+    f.node("large", 16, linux());
     f.submit(1, request(1, GIB));
     let mut start = f.start();
     for _ in 0..FARM_RERUNS {
@@ -511,36 +560,36 @@ fn neither_budget_starves_the_other() {
     }
     let start = f.killed(&start, OOM);
     let start = f.killed(&start, OOM);
-    assert_eq!(start.resources.memory_bytes, 4 * GIB);
+    assert_eq!(start.resources.memory_bytes, 16 * GIB);
     f.finishes(&start, OOM);
 
     f.submit(2, request(2, GIB));
     let start = f.start();
     let start = f.killed(&start, OOM);
     let mut start = f.killed(&start, OOM);
-    assert_eq!(start.resources.memory_bytes, 4 * GIB);
+    assert_eq!(start.resources.memory_bytes, 16 * GIB);
     for _ in 0..FARM_RERUNS {
         start = f.killed(&start, PRESSURE);
-        assert_eq!(start.resources.memory_bytes, 4 * GIB);
+        assert_eq!(start.resources.memory_bytes, 16 * GIB);
     }
     f.finishes(&start, PRESSURE);
     assert_eq!(
         f.s.memory_runs(start.operation).unwrap(),
         [
-            own("large", 1, 4),
-            own("large", 2, 4),
-            busy("large", 4),
-            busy("large", 4),
-            busy("large", 4)
+            own("large", 1, 16),
+            own("large", 4, 16),
+            busy("large", 16),
+            busy("large", 16),
+            busy("large", 16)
         ]
     );
 }
 
-/// Catches a whole-machine lease's kill that doubles its least worker size from the
+/// Catches a whole-machine lease's kill that raises its least worker size from the
 /// request rather than from what it booked (the whole node it ran on), which would
 /// place it on the same node again.
 #[test]
-fn a_whole_machine_kill_asks_for_a_node_twice_as_large() {
+fn a_whole_machine_kill_asks_for_a_larger_node() {
     let mut f = Farm::new();
     f.node("a-small", 4, whole());
     f.node("b-large", 8, whole());
@@ -618,7 +667,7 @@ fn floors_are_bounded() {
         f.finishes(&next, ok());
     }
     assert_eq!(f.s.memory_floor(&key(1)), None);
-    assert_eq!(f.s.memory_floor(&key(2)), Some(2 * GIB));
+    assert_eq!(f.s.memory_floor(&key(2)), Some(4 * GIB));
     f.submit(3, request(1, GIB));
     assert_eq!(f.start().resources.memory_bytes, GIB);
 }

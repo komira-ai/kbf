@@ -66,6 +66,7 @@ impl Farm {
             hello_wait: Duration::from_secs(2),
             tick: Duration::from_millis(50),
             unservable_wait: Duration::from_secs(300),
+            memory_ladder: kbf_server::MemoryLadder::default(),
             finished_retention: Duration::from_secs(60),
             shutdown_timeout: Duration::from_secs(10),
             store_probe_timeout: kbf_server::health::STORE_PROBE_TIMEOUT,
@@ -348,23 +349,24 @@ async fn needing(name: &str, needs: u64) -> (Farm, impl Fn() -> Vec<u64>) {
 /// Catches, with the real daemon and server between them: a daemon that sends a
 /// driver's own-limit kill without `MEMORY_KILL_OWN_LIMIT`, or a server that does not
 /// read it with the status the daemon pairs it with (either way the client is answered
-/// at once, after one run); a rerun that does not double (1, 2, 4 GiB) or whose doubled
-/// booking does not reach the daemon's `Start`; and a later Execute of the action that
-/// does not start at the booking that ran.
+/// at once, after one run); a rerun that does not climb the default ladder (4 GiB, then
+/// the 16 GiB rung skipped for the node's whole 8 GiB) or whose raised booking does not
+/// reach the daemon's `Start`; and a later Execute of the action that does not start at
+/// the booking that ran.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_drivers_own_limit_kill_reruns_the_action_with_its_booking_doubled() {
-    let (farm, booked) = needing("exec-oom", 4 * GIB).await;
+async fn a_drivers_own_limit_kill_reruns_the_action_one_rung_up() {
+    let (farm, booked) = needing("exec-oom", 6 * GIB).await;
     let action = farm.upload(&Spec::act(&["echo", "fits"])).await;
 
     let response = farm.execute(&action).await;
     assert_eq!(response.status.map(|s| s.code), Some(Code::Ok as i32));
     let result = response.result.expect("a result");
     assert_eq!(farm.text(result.stdout_digest.as_ref()).await, "fits\n");
-    assert_eq!(booked(), [1, 2, 4], "the bookings of the runs");
+    assert_eq!(booked(), [4, 8], "the bookings of the runs");
 
     let again = farm.execute(&action).await;
     assert_eq!(again.status.map(|s| s.code), Some(Code::Ok as i32));
-    assert_eq!(booked(), [1, 2, 4, 4], "starts at the raised booking");
+    assert_eq!(booked(), [4, 8, 8], "starts at the raised booking");
 }
 
 /// Catches a driver's own-limit kill at the largest node run again forever, or answered
@@ -378,5 +380,9 @@ async fn a_drivers_own_limit_kill_at_the_largest_node_is_answered() {
     assert_eq!(response.result, None);
     let status = response.status.expect("a status");
     assert_eq!(status.code, Code::FailedPrecondition as i32, "{status:?}");
-    assert_eq!(booked(), [1, 2, 4, 8], "doubled up to the node's 8 GiB");
+    assert_eq!(
+        booked(),
+        [4, 8],
+        "the first rung, then the node's whole 8 GiB"
+    );
 }
