@@ -735,3 +735,80 @@ fn a_cpu_max_is_counted_in_cpus() {
     assert!(quota_cpus("100000 0").is_err());
     assert!(quota_cpus("x 100000").is_err());
 }
+
+/// Catches `--lease-placement=numa-node` enabling `cpuset` in the wrong order or place
+/// (in `actions/` before its parent is ENOENT on a real host; in the parent alone leaves
+/// the lease cgroups without cpuset files), writing what is already enabled, and
+/// reporting the CPUs `actions/` may use (what the placer restricts the nodes to).
+#[test]
+fn cpuset_is_enabled_in_the_parent_then_in_actions_and_the_cpus_are_returned() {
+    let fake = Fake::host(UNIT, "cpuset cpu io memory pids", &[41]);
+    delegate_in(&fake, SELF, MIN, None).expect("delegated");
+    fake.set(ACTIONS_CG, "cpuset.cpus.effective", "0-21,44-65\n");
+    let before = fake.log().len();
+    let cpus = enable_cpuset_in(&fake, ACTIONS_CG).expect("enabled");
+    assert_eq!(cpus.expect("cpus").to_string(), "0-21,44-65");
+    assert_eq!(
+        fake.log()[before..],
+        [
+            format!("{UNIT}/cgroup.subtree_control <- +cpuset"),
+            format!("{ACTIONS_CG}/cgroup.subtree_control <- +cpuset"),
+        ]
+    );
+    assert_eq!(
+        fake.enabled(ACTIONS_CG),
+        ["cpu", "memory", "pids", "cpuset"]
+    );
+    // Again: nothing left to write.
+    let before = fake.log().len();
+    enable_cpuset_in(&fake, ACTIONS_CG).expect("enabled");
+    assert_eq!(fake.log().len(), before);
+}
+
+/// Catches a unit that is not offered `cpuset` (a user manager without the drop-in)
+/// accepted, and the fix missing from the message; nothing is written.
+#[test]
+fn a_unit_without_cpuset_is_refused_with_the_fix() {
+    let fake = Fake::host(UNIT, "cpu memory pids", &[41]);
+    delegate_in(&fake, SELF, MIN, None).expect("delegated");
+    let before = fake.log().len();
+    let error = enable_cpuset_in(&fake, ACTIONS_CG).expect_err("refused");
+    let text = error.to_string();
+    assert!(
+        text.contains(UNIT) && text.contains("does not offer cpuset") && text.contains("Delegate="),
+        "{text}"
+    );
+    assert_eq!(fake.log().len(), before);
+}
+
+/// Catches a `cpuset.cpus.effective` that is empty taken for a list of no CPU, and one
+/// that does not parse taken for none: the first says nothing is known (the placer then
+/// keeps every node), the second fails with the file's path.
+#[test]
+fn an_empty_or_unreadable_effective_cpuset_is_told_apart() {
+    let fake = Fake::host(UNIT, "cpuset cpu io memory pids", &[41]);
+    delegate_in(&fake, SELF, MIN, None).expect("delegated");
+    assert_eq!(enable_cpuset_in(&fake, ACTIONS_CG).expect("enabled"), None);
+    fake.set(ACTIONS_CG, "cpuset.cpus.effective", "0-x\n");
+    let error = enable_cpuset_in(&fake, ACTIONS_CG).expect_err("unparsed");
+    assert!(
+        error.to_string().contains("cpuset.cpus.effective"),
+        "{error}"
+    );
+}
+
+/// Catches an `actions` cgroup made directly under the root (`--cgroup-parent=/actions`)
+/// failing on its parent: the root is the parent, already enabling `cpuset`.
+#[test]
+fn an_actions_cgroup_under_the_root_has_the_root_as_its_parent() {
+    let fake = Fake::host(UNIT, "cpuset cpu io memory pids", &[41]);
+    fake.mkdir("/actions").expect("made");
+    enable_cpuset_in(&fake, "/actions").expect("enabled");
+    assert_eq!(
+        fake.log(),
+        [
+            "mkdir /actions",
+            "/actions/cgroup.subtree_control <- +cpuset"
+        ]
+    );
+}

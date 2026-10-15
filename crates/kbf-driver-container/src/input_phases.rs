@@ -37,15 +37,21 @@ pub(crate) struct InputPhases {
     pub chown_ms: u64,
     /// The cgroup: its OOM count, creating it, and its keeper.
     pub cgroup_ms: u64,
+    /// The NUMA node the lease is placed on (`--lease-placement=numa-node`); `None`, and
+    /// no field on the line, when leases are not placed.
+    pub numa_node: Option<u32>,
 }
 
 impl fmt::Display for InputPhases {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let w = &self.write;
+        let numa = self
+            .numa_node
+            .map_or_else(String::new, |node| format!(" numa_node={node}"));
         write!(
             f,
             "action_ms={} image_ms={} walk_ms={} dir_reads={} dirs_made={} trees_ms={} \
-             trees_built={} link_ms={} links={} copies={} prep_ms={} chown_ms={} cgroup_ms={}",
+             trees_built={} link_ms={} links={} copies={} prep_ms={} chown_ms={} cgroup_ms={}{numa}",
             self.action_ms,
             self.image_ms,
             w.walk_ms,

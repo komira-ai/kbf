@@ -281,6 +281,15 @@ native-whole-machine`.
   `memory.max` above the leases, `cpus` the lower of the nearest
   `cpuset.cpus.effective` and the lowest `cpu.max` quota on the path. The daemon writes
   `actions/cpu.max` itself: the CPUs it may use minus `--reserve-cpus` (default 8).
+  `--lease-placement=numa-node` (default `none`, which pins nothing) puts each lease on
+  one NUMA node: the lease cgroup gets that node's CPUs (`cpuset.cpus`) and memory node
+  (`cpuset.mems`), and the container's cgroup inherits both. The node is the one with
+  the least CPU booked by running leases, the lowest id on a tie; the lease's
+  `inputs phases:` line ends with `numa_node=N`. It enables `cpuset` in `actions/` and
+  its parent (the start fails, naming the fix, when the unit is not offered it) and
+  runs as `none`, logged once, on a host with fewer than two NUMA nodes that hold CPUs.
+  It changes neither admission nor `--reserve-cpus`, a quota that removes no CPU from a
+  node.
   [docs/deploy/linux-build-host.md](../deploy/linux-build-host.md) has the systemd
   units and the host's swap and memory headroom.
 - **`NativeRuntime`** (`kbf-driver-native`, driver `native`): each action as plain

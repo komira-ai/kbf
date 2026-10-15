@@ -545,6 +545,102 @@ fn each_driver_starts_and_stops_on_sigterm() {
     }
 }
 
+/// A container node started with `--lease-placement=numa-node` over `nodes` (a fake
+/// `/sys/devices/system/node`, one `cpulist` each) on the stand-in cgroup mount. Returns
+/// the unit's directory after SIGTERM and the daemon's log.
+#[cfg(target_os = "linux")]
+fn placed_container_node(name: &str, nodes: &[(u32, &str)]) -> (PathBuf, String) {
+    let dir = tls(name);
+    let numa = dir.join("numa");
+    for (id, list) in nodes {
+        let node = numa.join(format!("node{id}"));
+        std::fs::create_dir_all(&node).expect("mkdir");
+        std::fs::write(node.join("cpulist"), format!("{list}\n")).expect("plant");
+    }
+    let ids = id_files(&format!("{name}-ids"), "65536");
+    let (unit, cgroup_flags) = cgroup_tree(&dir, "cpu cpuset memory pids");
+    let (bin, _) = podman_stub(&format!("{name}-bin"));
+    let mut flags = vec![
+        "--driver=container".to_owned(),
+        "--cas=https://127.0.0.1:1".to_owned(),
+        format!("--scratch={}", dir.join("leases").display()),
+        format!("--id-files={}", ids.display()),
+        "--lease-placement=numa-node".to_owned(),
+        format!("--numa-dir={}", numa.display()),
+    ];
+    flags.extend(cgroup_flags);
+    let (status, log) = runs_until_sigterm_logged(name, &flags, Some(&bin));
+    let log = log.join("\n");
+    assert!(status.success(), "{status}: {log}");
+    (unit, log)
+}
+
+/// Catches `--lease-placement=numa-node` not reaching the cgroup setup on a two-node
+/// host (`cpuset` not enabled for `actions/` and its parent, so no lease cgroup would
+/// have cpuset files), and no log line saying the placement is on.
+///
+/// The cgroup mount is plain directories: the kernel's own rules for `cpuset` are in
+/// `delegate_tests.rs`.
+#[test]
+#[cfg(target_os = "linux")]
+fn numa_node_placement_enables_cpuset_on_a_two_node_host() {
+    let (unit, log) = placed_container_node("numa-two", &[(0, "0-21,44-65"), (1, "22-43,66-87")]);
+    assert_eq!(read(&unit.join("cgroup.subtree_control")), "+cpuset");
+    assert_eq!(
+        read(&unit.join("actions/cgroup.subtree_control")),
+        "+cpuset"
+    );
+    assert!(
+        log.contains("lease placement numa-node: node0=0-21,44-65 node1=22-43,66-87"),
+        "{log}"
+    );
+}
+
+/// Catches a single-node host failing the start or touching its cgroups under
+/// `--lease-placement=numa-node`: it runs as `none` and says so once.
+#[test]
+#[cfg(target_os = "linux")]
+fn numa_node_placement_on_a_one_node_host_runs_unplaced() {
+    let (unit, log) = placed_container_node("numa-one", &[(0, "0-87")]);
+    assert_eq!(
+        read(&unit.join("cgroup.subtree_control")),
+        "+cpu +memory +pids"
+    );
+    assert_eq!(log.matches("; not pinned").count(), 1, "{log}");
+}
+
+/// `--lease-placement=numa-node` with a driver that runs no containers is refused (also
+/// what macOS does: it has no container driver), naming the flag and the driver; the
+/// a value that is not a placement is a usage error.
+///
+/// Catches: the flag silently ignored by a driver that cannot honour it (an operator
+/// believes leases are pinned), and a bad value accepted.
+#[test]
+fn a_placement_without_the_container_driver_is_refused() {
+    let dir = tls("placement-refused");
+    let out = Command::new(BIN)
+        .args(base(&dir))
+        .args(["--driver=fake", "--lease-placement=numa-node"])
+        .output()
+        .expect("spawn");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains("--lease-placement=numa-node") && stderr.contains("--driver container"),
+        "{stderr}"
+    );
+    let bad = Command::new(BIN)
+        .args(base(&dir))
+        .args(["--driver=fake", "--lease-placement=socket"])
+        .output()
+        .expect("spawn");
+    assert_eq!(
+        bad.status.code(),
+        Some(2),
+        "not a placement is a usage error"
+    );
+}
+
 /// A directory put first in `PATH` holding a `podman` that lists no container and
 /// logs its arguments to the returned file (`kbf-podman-stub`, linked in as
 /// `podman`): the start-up sweep asks it for this node's leftovers before the daemon

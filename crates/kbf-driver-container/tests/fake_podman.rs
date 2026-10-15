@@ -158,6 +158,67 @@ async fn a_run_collects_everything_and_leaves_nothing() {
     assert!(fake.calls().contains(&"rm".to_owned()));
 }
 
+/// Catches `--lease-placement=numa-node` not reaching the lease cgroup: the lease must
+/// get its node's CPUs and memory node and hand `cpuset` to its container's cgroup, and
+/// the first lease of an idle host goes to the lowest node id.
+#[tokio::test]
+async fn a_placed_lease_gets_its_nodes_cpus_and_memory() {
+    use kbf_driver_container::{CpuSet, Placer};
+    let nodes = vec![
+        (0, "0-1,4".parse::<CpuSet>().expect("cpus")),
+        (1, "2-3,5".parse::<CpuSet>().expect("cpus")),
+    ];
+    let fake = Fake::with("placed", |config| config.placer = Placer::new(nodes));
+    let mut spec = Spec::new(&image(), "unused by the fake");
+    spec.outputs = vec!["cpus".to_owned(), "mems".to_owned(), "subtree".to_owned()];
+    let steps = [
+        "copy",
+        "$UPPER/cpus",
+        "$CG/cpuset.cpus",
+        ";",
+        "copy",
+        "$UPPER/mems",
+        "$CG/cpuset.mems",
+        ";",
+        "copy",
+        "$UPPER/subtree",
+        "$CG/cgroup.subtree_control",
+    ];
+    let result = fake.run(1, &spec, &steps).await.expect("ran");
+    assert_eq!(result.exit_code, 0);
+    let output = |name: &str| {
+        let file = result.output_files.iter().find(|f| f.path == name);
+        blob(&fake.cas, file.expect(name).digest.as_ref())
+    };
+    assert_eq!(output("cpus"), b"0-1,4");
+    assert_eq!(output("mems"), b"0");
+    assert_eq!(output("subtree"), b"+cpu +memory +pids +cpuset");
+    fake.assert_clean(1);
+}
+
+/// Catches a lease cgroup that gets cpuset files without `--lease-placement=numa-node`:
+/// the default must leave a lease on any CPU, as before (the limits test above pins
+/// `cgroup.subtree_control` to `+cpu +memory +pids`).
+#[tokio::test]
+async fn an_unplaced_lease_gets_no_cpuset() {
+    let fake = Fake::new("unplaced");
+    let spec = Spec::new(&image(), "unused by the fake");
+    let steps = [
+        "test",
+        "!",
+        "-e",
+        "$CG/cpuset.cpus",
+        ";",
+        "test",
+        "!",
+        "-e",
+        "$CG/cpuset.mems",
+    ];
+    let result = fake.run(1, &spec, &steps).await.expect("ran");
+    assert_eq!(result.exit_code, 0);
+    fake.assert_clean(1);
+}
+
 /// The marker test: the action writes outside its output directory (beside the input
 /// root, into its lease cgroup). Catches a skipped clean step: after the lease ends,
 /// nothing of the marker may remain.

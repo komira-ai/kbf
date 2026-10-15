@@ -52,6 +52,7 @@ use crate::cgroup_usage::{NUMA_EVERY, NumaSample, resource_usage};
 use crate::image::{ImageCheckError, ImageRef, PROPERTY};
 use crate::input_phases::{InputPhases, millis};
 use crate::keeper::Keeper;
+use crate::numa::{Pin, Placer};
 use crate::oci::{Oci, OciConfig};
 use crate::outputs::{OutputLimits, collect_log};
 use crate::podman::{
@@ -114,6 +115,9 @@ pub struct PodmanConfig {
     /// The threads that hash an action's output files (`--cpu-threads`), shared by every
     /// lease.
     pub cpu: CpuPool,
+    /// Places each lease on one NUMA node (`--lease-placement=numa-node`); `None` leaves
+    /// them on any CPU the daemon may use.
+    pub placer: Option<Arc<Placer>>,
 }
 
 /// The node's input cache as the driver is given it: not opened yet.
@@ -155,7 +159,7 @@ impl PodmanConfig {
     /// `/sys/fs/cgroup`, a one hour default timeout, a five second kill grace,
     /// the default [`OutputLimits`], [`kbf_daemon::UPLOAD_DEADLINE`],
     /// [`ContainerLimits::DEFAULT`] and
-    /// [`SwapKill::DEFAULT`].
+    /// [`SwapKill::DEFAULT`], and no NUMA placement.
     #[must_use]
     pub fn new(scratch: PathBuf, cgroup_parent: String, owner: String) -> Self {
         Self {
@@ -175,6 +179,7 @@ impl PodmanConfig {
             owner,
             cache: None,
             cpu: CpuPool::new(DEFAULT_CPU_THREADS),
+            placer: None,
         }
     }
 
@@ -471,7 +476,13 @@ impl<C: Cas> PodmanRuntime<C> {
         // The keeper, before anything runs in the cgroup: it kills the cgroup if the
         // daemon dies.
         let kill = lease.cgroup.dir().join("cgroup.kill");
-        let keeper = (lease.cgroup.create(work.resources))
+        lease.pin = self
+            .config
+            .placer
+            .as_ref()
+            .map(|placer| placer.place(work.resources.cpu_millis));
+        phases.numa_node = lease.pin.as_ref().map(Pin::node);
+        let keeper = (lease.cgroup.create(work.resources, lease.pin.as_ref()))
             .and_then(|()| Keeper::watch(&kill))
             .map_err(|e| failed(lease.cgroup.dir(), &e))?;
         lease.keeper = Some(keeper);
@@ -934,6 +945,9 @@ struct Lease {
     keeper: Option<Keeper>,
     /// The shared trees the container mounts, pinned until the lease is gone.
     trees: Vec<TreeLease>,
+    /// The NUMA node the lease is placed on, with `--lease-placement=numa-node`. Dropped
+    /// with the lease, which gives the node its load back.
+    pin: Option<Pin>,
     /// Whether cleaning is still owed.
     armed: bool,
     /// When the container was about to be created, once the lease got that far.
@@ -963,6 +977,7 @@ impl Lease {
             start: None,
             keeper: None,
             trees: Vec::new(),
+            pin: None,
             armed: true,
             ran: None,
             numa: NumaSample::default(),
