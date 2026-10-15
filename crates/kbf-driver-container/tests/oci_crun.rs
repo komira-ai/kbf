@@ -14,6 +14,7 @@ mod support;
 // The helper containers run this binary in its `__chown-dirs` mode.
 kbf_driver_container::chown_dirs_test_hook!();
 
+use std::path::PathBuf;
 use std::process::Command;
 use std::time::Instant;
 
@@ -297,4 +298,61 @@ async fn the_unpacked_image_is_owned_by_the_containers_ids() {
     let started = Instant::now();
     cell.run(2, &sh("true")).await.expect("ran again");
     eprintln!("a lease on an unpacked image: {:?}", started.elapsed());
+}
+
+/// A cache and a tree store beside `config`'s scratch directory: leases bind the large
+/// Directory nodes of an input root from the tree store, not link them.
+fn with_trees(config: &mut kbf_driver_container::PodmanConfig) {
+    let dir = PathBuf::from(format!("{}-cache", config.scratch.display()));
+    std::fs::create_dir_all(&dir).expect("cache dir");
+    let cache = kbf_daemon::cache::CacheConfig::new(dir, config.scratch.clone(), 1 << 30);
+    let trees = PathBuf::from(format!("{}-trees", config.scratch.display()));
+    let mut trees = kbf_daemon::trees::TreeConfig::new(trees, 1 << 30);
+    trees.min_files = 20;
+    config.cache = Some(kbf_driver_container::CacheUse {
+        config: cache,
+        helper: config.oci.daemon.clone(),
+        trees: Some(trees),
+    });
+}
+
+/// Catches a shared tree the sandbox can write or lift the read-only flag from, which
+/// the config-level unit test cannot: the action tries to create, append, truncate,
+/// chmod, mkdir, rename, hard-link out of and delete inside the tree, and to remount it
+/// read-write as the container's root. Every attempt is refused, the first with
+/// `EROFS`'s own words, and the next lease reads the tree whole.
+#[tokio::test]
+#[ignore = "needs rootless crun, Podman and a delegated cgroup: run by cargo xtask podman-tests"]
+async fn a_sandbox_cannot_change_a_shared_tree_or_lift_its_read_only_flag() {
+    let cell = Cell::oci_with("trees-ro", with_trees);
+    let mut spec = sh("grep ' /kbf/root/tc ' /proc/self/mountinfo; \
+         echo \"first: $(sh -c 'echo x > tc/new' 2>&1)\"; \
+         for try in 'echo x > tc/new' 'echo x >> tc/lib/f1' 'truncate -s0 tc/lib/f1' 'chmod u+w tc/lib/f1' \
+                    'mkdir tc/d' 'mv tc/lib/f1 tc/lib/g' 'mv tc/lib/f2 f2' 'ln tc/lib/f3 f3' \
+                    'rm tc/lib/f4' 'mount -o remount,rw /kbf/root/tc'; do \
+           if sh -c \"$try\" 2>/dev/null; then echo \"WROTE: $try\"; else echo \"refused: $try\"; fi; \
+         done; cat tc/lib/f1; echo; ls tc/lib | wc -l");
+    spec.inputs = (0..30)
+        .map(|i| {
+            let path: &'static str = Box::leak(format!("tc/lib/f{i}").into_boxed_str());
+            let bytes: &'static [u8] =
+                Box::leak(format!("tool file {i}").into_boxed_str()).as_bytes();
+            (path, bytes, i == 0)
+        })
+        .collect();
+    spec.inputs.push(("src/a", b"small", false));
+    let result = run(&cell, 1, &spec).await.expect("ran");
+    let said = cell.stdout(&result);
+    eprintln!("{said}");
+    assert!(!said.contains("WROTE"), "{said}");
+    assert_eq!(said.matches("refused: ").count(), 10, "{said}");
+    assert!(said.contains("Read-only file system"), "{said}");
+    assert!(
+        said.lines().next().is_some_and(|l| l.contains(" ro")),
+        "{said}"
+    );
+    assert!(said.ends_with("tool file 1\n30\n"), "{said}");
+    let stats = cell.runtime.tree_stats().expect("a store");
+    assert_eq!(stats.builds, 1, "{stats:?}");
+    cell.assert_clean(1);
 }

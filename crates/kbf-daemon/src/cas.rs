@@ -8,8 +8,28 @@
 //! [`Spool`] first). Blob bytes never travel on the
 //! `kbf.worker.v1` stream; they go over the engine's own connection.
 
+use kbf_proto::reapi::Digest;
 pub use kbf_transfer::cas::*;
 pub use kbf_transfer::{
     FileSource, OPEN_DIRECTORY, OPEN_FILE, Record, RecordHasher, Source, Spool, Spooled, Stamp,
     descend, proto_digest,
 };
+
+/// A [`Cas`] as the input tree's walks read it: one checked fetch, behind a pointer, so
+/// those walks are compiled once whatever the CAS (a line a walk runs is then counted
+/// once, not once per CAS type a test or a binary instantiates it with).
+pub(crate) trait Fetch: Send + Sync {
+    fn fetch<'a>(
+        &'a self,
+        digest: &'a Digest,
+    ) -> futures::future::BoxFuture<'a, Result<Vec<u8>, CasError>>;
+}
+
+impl<C: Cas> Fetch for C {
+    fn fetch<'a>(
+        &'a self,
+        digest: &'a Digest,
+    ) -> futures::future::BoxFuture<'a, Result<Vec<u8>, CasError>> {
+        Box::pin(fetch(self, digest))
+    }
+}

@@ -218,7 +218,10 @@ async fn uploads_finds_and_reads_of_sixteen_leases_share_the_one_limit() {
 /// took all 16 permits and the reads waited for them: on the farm node, nine leases'
 /// input fills waited 22 minutes for one lease's upload. Mutants seen red: no share
 /// taken by `put` or by `put_chunks` (held writes 16, reads stuck), a share of the
-/// whole limit (the same).
+/// whole limit (the same). Issue #647: while the writes are held, one FindMissing call
+/// of the reading lease (whose outputs might all be stored already) must finish too.
+/// Mutant seen red: FindMissing taking the uploads' share like a write (it waits
+/// behind the held writes).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn held_uploads_leave_permits_for_another_leases_reads() {
     let fake = Arc::new(Fake::default());
@@ -265,6 +268,14 @@ async fn held_uploads_leave_permits_for_another_leases_reads() {
     for (digest, got) in reads.iter().zip(read.unwrap_or_default()) {
         assert_eq!(digest_of(&got.expect("read")), *digest);
     }
+    let absent = digest_of(&patterned(32_000, 60));
+    let asked = [&reads[..4], std::slice::from_ref(&absent)].concat();
+    let missing = tokio::time::timeout(Duration::from_secs(10), reader.missing(&asked)).await;
+    assert_eq!(
+        (missing.ok(), fake.held_writes.load(Ordering::SeqCst)),
+        (Some(vec![absent]), share),
+        "(FindMissing answer, writes held) while the server holds every write"
+    );
     fake.open_writes();
     let stored = upload.await.expect("uploads");
     for (bytes, stored) in blobs.iter().zip(stored) {

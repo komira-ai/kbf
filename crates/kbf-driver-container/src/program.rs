@@ -318,12 +318,12 @@ mod tests {
     }
 
     const LOG: &str = concat!(
-        r#"{"level":"warning","msg":"cgroup v1 is deprecated","time":"2026-01-01T00:00:00Z"}"#,
+        r#"{"level":"warning","msg":"cgroup v1 is deprecated","time":"2026-10-01T00:00:00Z"}"#,
         "\n",
-        r#"{"level":"error","msg":"executable file `env` not found in $PATH: No such file or directory","time":"2026-01-01T00:00:01Z"}"#,
+        r#"{"level":"error","msg":"executable file `env` not found in $PATH: No such file or directory","time":"2026-10-01T00:00:01Z"}"#,
         "\n",
         "not json at all\n",
-        r#"{"level":"fatal","msg":"open executable: Permission denied","time":"2026-01-01T00:00:02Z"}"#,
+        r#"{"level":"fatal","msg":"open executable: Permission denied","time":"2026-10-01T00:00:02Z"}"#,
         "\n",
     );
 

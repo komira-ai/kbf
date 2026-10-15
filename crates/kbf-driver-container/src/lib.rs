@@ -91,11 +91,11 @@ kbf_daemon::keeper_test_hook!();
 pub use backend::ContainerRuntime;
 pub use cas::{CHUNK, FileBlob, MemoryCas};
 pub use cgroup::{SwapKill, cpu_weight, memory_max};
-pub use delegate::{DelegateError, Delegation, adopt, capacity, delegate};
+pub use delegate::{DelegateError, Delegation, adopt, capacity, delegate, limit_cpus};
 pub use image::{ImageCheckError, ImageError, ImageRef};
 pub use oci::{OciConfig, OciError};
 pub use outputs::OutputLimits;
-pub use podman::{ContainerLimits, EXEC_ROOT, OWNER_LABEL, SharedMount};
+pub use podman::{ContainerLimits, EXEC_ROOT, OWNER_LABEL};
 pub use runtime::{CacheUse, ConfigError, DRIVER, KIND, PodmanConfig, PodmanRuntime, StartError};
 pub use subids::{
     DaemonIds, IdFiles, SubidError, check_daemon_user, check_subordinate_ids, daemon_ids,

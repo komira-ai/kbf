@@ -8,6 +8,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
+use kbf_daemon::trees::SharedMount;
 use tokio::process::{Child, Command};
 
 use crate::exit_record;
@@ -69,20 +70,6 @@ impl ContainerLimits {
         nofile: 65_536,
         nproc: 32_768,
     };
-}
-
-/// A host directory mounted read-only inside the action's input root, at `path` below it:
-/// the interface through which a shared tree reaches a runtime. The mount point must
-/// exist in the input root as an empty directory, so no symlink can sit at it.
-///
-/// Shaped as `kbf_daemon::trees::SharedMount` (the tree store's, in its own change), which
-/// replaces this when that lands.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SharedMount {
-    /// Where it appears, below [`EXEC_ROOT`]: no leading `/`, no `..`.
-    pub path: String,
-    /// The directory on the host.
-    pub source: PathBuf,
 }
 
 /// The container to create for one action.

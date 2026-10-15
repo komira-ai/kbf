@@ -342,7 +342,8 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::*;
-    use crate::podman::{SharedMount, tests::spec};
+    use crate::podman::tests::spec;
+    use kbf_daemon::trees::SharedMount;
 
     fn ids() -> DaemonIds {
         DaemonIds {

@@ -21,7 +21,7 @@
 //! **What the container sees:** the unpacked image, read-only, as `/`; the input root
 //! as an overlay at `/kbf/root` (lower: the lease's input root; upper: the lease's
 //! upper directory, which outputs are read from); shared read-only trees
-//! ([`crate::podman::SharedMount`]) bound inside it; `/tmp`, `/var/tmp`, `/run` and
+//! ([`kbf_daemon::trees::SharedMount`]) bound inside it; `/tmp`, `/var/tmp`, `/run` and
 //! `/root` as the lease's own disk directories ([`spec::WRITABLE`]); `/dev`, `/proc`,
 //! `/sys` and `/dev/shm` as for any container. Where Podman gives a writable copy of
 //! the whole image, this backend gives a read-only image and those four directories.

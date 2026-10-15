@@ -206,6 +206,51 @@ fn memory_mode_serves_execution_and_stops_on_interrupt() {
     interrupt(child);
 }
 
+/// The thread flags reach the runtime: the server logs the sizes it resolved and runs
+/// exactly that many async workers (the `kbf-async` threads of `/proc`).
+///
+/// Catches: flags parsed and dropped (the runtime built with tokio's default, one
+/// worker per CPU, which the thread count shows), and a start that logs nothing about
+/// its sizes.
+#[cfg(target_os = "linux")]
+#[test]
+fn thread_flags_size_the_runtime_and_are_logged() {
+    let mut c = server(&[
+        "--async-threads=3",
+        "--blocking-threads=5",
+        "--cpu-threads=2",
+    ]);
+    c.args(ANY_PORT)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = Running(c.spawn().expect("spawn kbf-server"));
+    first_line("start", child.0.stdout.take().expect("stdout"));
+    // A thread carries its name only once it has run its first instructions, which can
+    // be after the start line: wait for the count (up to 10 s) rather than read it once.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let (workers, names) = loop {
+        let names: Vec<String> = std::fs::read_dir(format!("/proc/{}/task", child.pid()))
+            .expect("task dir")
+            .filter_map(|t| std::fs::read_to_string(t.ok()?.path().join("comm")).ok())
+            .map(|name| name.trim().to_owned())
+            .collect();
+        let workers = names.iter().filter(|name| *name == "kbf-async").count();
+        if workers == 3 || std::time::Instant::now() > deadline {
+            break (workers, names);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    assert_eq!(workers, 3, "threads of the server: {names:?}");
+    let mut stderr = child.0.stderr.take().expect("stderr");
+    interrupt(child);
+    let mut log = String::new();
+    stderr.read_to_string(&mut log).expect("UTF-8 stderr");
+    assert!(
+        log.contains("threads: async=3 blocking=5 cpu=2 reserve="),
+        "{log}"
+    );
+}
+
 /// Catches: an `--api-listen` flag that binds nothing, a start line without the API's
 /// address, an API listener that does not answer `GET /v1/nodes`, and an answer
 /// without the `server` field naming this binary's version and commit.

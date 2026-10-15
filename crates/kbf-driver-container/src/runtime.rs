@@ -37,6 +37,7 @@ use std::time::{Duration, Instant, SystemTime};
 use kbf_daemon::cache::{Cache, CacheConfig, InputStats};
 use kbf_daemon::cas::{Cas, CasError};
 use kbf_daemon::cpu_pool::{CpuPool, DEFAULT_CPU_THREADS};
+use kbf_daemon::trees::{TreeConfig, TreeLease, Trees};
 use kbf_daemon::{Runtime, RuntimeError, Work, upload_within};
 use kbf_proto::reapi::{Action, ActionResult, Command, ExecutedActionMetadata, Platform};
 use kbf_types::LeaseId;
@@ -118,6 +119,10 @@ pub struct CacheUse {
     /// ([`crate::chown_dirs`]) to give the input root's directories, not its files, to
     /// the container's root and back.
     pub helper: PathBuf,
+    /// The node's shared read-only trees (`--tree-dir`), if it has them: large
+    /// Directory nodes of an input root are built once and mounted read-only, not
+    /// linked file by file. Opened with the cache; needs it.
+    pub trees: Option<TreeConfig>,
 }
 
 impl std::fmt::Debug for CacheUse {
@@ -134,6 +139,8 @@ impl std::fmt::Debug for CacheUse {
 struct Cached {
     cache: Arc<Cache>,
     helper: PathBuf,
+    /// The shared trees, if the node has a store.
+    trees: Option<Trees>,
 }
 
 impl PodmanConfig {
@@ -293,6 +300,15 @@ impl<C: Cas> PodmanRuntime<C> {
         self.cache.is_some()
     }
 
+    /// What the node's tree store has done, if it has one.
+    #[must_use]
+    pub fn tree_stats(&self) -> Option<kbf_daemon::trees::TreeStats> {
+        let cached = self.cache.as_ref();
+        cached
+            .and_then(|c| c.trees.as_ref())
+            .map(|t| t.store().stats())
+    }
+
     /// What the last lease's inputs cost through the cache, if a lease used it.
     #[must_use]
     pub fn last_inputs(&self) -> Option<InputStats> {
@@ -348,13 +364,44 @@ impl<C: Cas> PodmanRuntime<C> {
                 .await
                 .map_err(|e| failed(dir, &e))?;
         }
+        let mut shared = Vec::new();
         match &self.cache {
             Some(cache) => {
                 let private = private_paths(&command.working_directory, &outputs);
-                let stats = materialize_cached(cas, &cache.cache, input_root, &root, &private)
-                    .await
-                    .map_err(tree_error)?;
-                tracing::info!(lease = %lease.name, "inputs: {stats}");
+                let stats = match &cache.trees {
+                    Some(trees) => {
+                        let inputs = trees
+                            .materialize(
+                                cas,
+                                &cache.cache,
+                                input_root,
+                                &root,
+                                &private,
+                                &command.working_directory,
+                            )
+                            .await
+                            .map_err(|e| tree_error(e.into()))?;
+                        let shown = format!(
+                            "{} trees={} tree_files={} trees_built={}",
+                            inputs.stats,
+                            inputs.mounts.len(),
+                            inputs.tree_files,
+                            inputs.trees_built
+                        );
+                        tracing::info!(lease = %lease.name, "inputs: {shown}");
+                        shared = inputs.mounts;
+                        lease.trees = inputs.trees;
+                        inputs.stats
+                    }
+                    None => {
+                        let stats =
+                            materialize_cached(cas, &cache.cache, input_root, &root, &private)
+                                .await
+                                .map_err(tree_error)?;
+                        tracing::info!(lease = %lease.name, "inputs: {stats}");
+                        stats
+                    }
+                };
                 *self
                     .last_inputs
                     .lock()
@@ -407,7 +454,7 @@ impl<C: Cas> PodmanRuntime<C> {
                 .collect(),
             argv: command.arguments.clone(),
             limits: self.config.limits,
-            shared: Vec::new(),
+            shared,
         };
         Ok(Prepared {
             spec,
@@ -813,6 +860,8 @@ struct Lease {
     /// Kills the lease cgroup if the daemon dies, once the cgroup is made. Removed
     /// last, once the lease is cleaned.
     keeper: Option<Keeper>,
+    /// The shared trees the container mounts, pinned until the lease is gone.
+    trees: Vec<TreeLease>,
     /// Whether cleaning is still owed.
     armed: bool,
 }
@@ -837,6 +886,7 @@ impl Lease {
             created: false,
             start: None,
             keeper: None,
+            trees: Vec::new(),
             armed: true,
         }
     }
@@ -984,11 +1034,41 @@ fn open_cache(engine: &Engine, given: CacheUse) -> Option<Cached> {
             let (bytes, entries, mode) = (stats.bytes, stats.entries, cache.link_mode());
             tracing::info!("cache: {shown}: {bytes} bytes in {entries} entries, link mode {mode}");
             let helper = given.helper;
-            Some(Cached { cache, helper })
+            let trees = given.trees.and_then(open_trees);
+            Some(Cached {
+                cache,
+                helper,
+                trees,
+            })
         }
         Err(why) => {
             let reason = why.reason();
             tracing::warn!("cache: off:{reason} ({shown}: {why}); leases run uncached");
+            None
+        }
+    }
+}
+
+/// The tree store `config` names; `None`, after a warning, when it cannot be opened:
+/// leases then link every file, as without trees. Blocking.
+fn open_trees(config: TreeConfig) -> Option<Trees> {
+    let shown = config.dir.display().to_string();
+    let (min_files, max_mounts) = (config.min_files, config.max_mounts);
+    if shown.contains([':', ',']) {
+        tracing::warn!("trees: off ({shown}): ':' or ',' in the path of a volume");
+        return None;
+    }
+    match Trees::open(config) {
+        Ok(trees) => {
+            let held = trees.store().stats();
+            let (count, bytes) = (held.trees, held.bytes);
+            // One line each: a macro's later lines are not run while its level is off.
+            tracing::info!("trees: {shown}: {count} trees, {bytes} bytes");
+            tracing::info!("trees: min_files={min_files} max_mounts={max_mounts}");
+            Some(trees)
+        }
+        Err(e) => {
+            tracing::warn!("trees: off ({shown}): {e}; leases link every file");
             None
         }
     }
