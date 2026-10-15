@@ -10,7 +10,7 @@ use rustix::fs::{CWD, RenameFlags};
 
 use super::classify::{MAX_DIRECTORIES, Summary, load};
 use crate::cache::{Cache, InputStats};
-use crate::cas::{Cas, label};
+use crate::cas::{Fetch, label};
 use crate::tree::{Loaded, TreeError, io as io_error, make_directories};
 
 /// Writes the tree under `digest` into the empty directory `tmp`, files as hard links
@@ -21,7 +21,7 @@ use crate::tree::{Loaded, TreeError, io as io_error, make_directories};
 /// A blob is missing or corrupt, the tree breaks a naming rule, a write fails, or the
 /// written tree is not the one the digest names.
 pub(super) async fn build(
-    cas: &impl Cas,
+    cas: &dyn Fetch,
     cache: &Cache,
     digest: &Digest,
     known: &Loaded,

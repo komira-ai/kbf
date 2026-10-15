@@ -40,7 +40,7 @@ use prost::Message;
 use tokio::fs;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
-use crate::cas::{Cas, CasError, digest_of, fetch, label};
+use crate::cas::{Cas, CasError, Fetch, digest_of, label};
 
 /// Why the input root could not be written or the outputs read.
 #[derive(Debug, thiserror::Error)]
@@ -73,7 +73,15 @@ pub async fn fetch_message<M: Message + Default>(
     cas: &impl Cas,
     digest: &Digest,
 ) -> Result<M, TreeError> {
-    let bytes = fetch(cas, digest).await?;
+    fetch_message_dyn(cas, digest).await
+}
+
+/// [`fetch_message`] behind a pointer (see [`Fetch`]).
+pub(crate) async fn fetch_message_dyn<M: Message + Default>(
+    cas: &dyn Fetch,
+    digest: &Digest,
+) -> Result<M, TreeError> {
+    let bytes = cas.fetch(digest).await?;
     M::decode(bytes.as_slice())
         .map_err(|e| TreeError::Invalid(format!("blob {} does not decode: {e}", label(digest))))
 }
@@ -166,7 +174,7 @@ pub(crate) type Loaded = HashMap<String, Directory>;
 /// A Directory in `loaded` is not fetched. A directory whose path is in `mounts` (a
 /// path under `dir`) is made empty and not walked: something is mounted there.
 pub(crate) async fn make_directories(
-    cas: &impl Cas,
+    cas: &dyn Fetch,
     root: &Digest,
     dir: &Path,
     loaded: &Loaded,
@@ -193,7 +201,7 @@ pub(crate) async fn make_directories(
             .map(|(digest, heres)| async move {
                 let directory: Directory = match loaded.get(&label(&digest)) {
                     Some(known) => known.clone(),
-                    None => fetch_message(cas, &digest).await?,
+                    None => fetch_message_dyn(cas, &digest).await?,
                 };
                 Ok::<_, TreeError>((directory, heres))
             })

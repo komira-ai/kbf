@@ -29,7 +29,7 @@ use std::path::PathBuf;
 use kbf_proto::reapi::Digest;
 
 use crate::cache::{Cache, InputStats};
-use crate::cas::{Cas, label};
+use crate::cas::{Cas, Fetch, label};
 use crate::tree::{TreeError, make_directories};
 use classify::{Limits, Reserved, Summaries, load, select, summarize};
 pub use store::{TreeLease, TreeStats, TreeStore};
@@ -137,6 +137,20 @@ impl Trees {
     pub async fn materialize(
         &self,
         cas: &impl Cas,
+        cache: &Cache,
+        root: &Digest,
+        dir: &std::path::Path,
+        outputs: &[String],
+        working_directory: &str,
+    ) -> Result<Inputs, TreeError> {
+        self.materialize_dyn(cas, cache, root, dir, outputs, working_directory)
+            .await
+    }
+
+    /// [`Trees::materialize`] behind a pointer: compiled once whatever the CAS.
+    async fn materialize_dyn(
+        &self,
+        cas: &dyn Fetch,
         cache: &Cache,
         root: &Digest,
         dir: &std::path::Path,

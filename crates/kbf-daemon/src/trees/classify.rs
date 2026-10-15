@@ -19,8 +19,8 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use futures::{StreamExt as _, TryStreamExt as _, stream};
 use kbf_proto::reapi::{Digest, Directory};
 
-use crate::cas::{Cas, label};
-use crate::tree::{Loaded, TreeError, check_names, fetch_message};
+use crate::cas::{Fetch, label};
+use crate::tree::{Loaded, TreeError, check_names, fetch_message_dyn};
 
 /// The most directory occurrences one input root may have for the walks here: a
 /// client's tree can name one Directory a million times over, and a walk visits each
@@ -172,7 +172,7 @@ fn too_many(max_places: usize) -> TreeError {
 /// A message is missing, corrupt or breaks a naming rule, or the tree names more than
 /// `max_places` places (callers pass [`MAX_DIRECTORIES`]).
 pub(crate) async fn load(
-    cas: &impl Cas,
+    cas: &dyn Fetch,
     root: &Digest,
     base: &Loaded,
     skip: &(dyn Fn(&str, &Digest) -> bool + Sync),
@@ -202,7 +202,7 @@ pub(crate) async fn load(
         }
         let fetched: Vec<(String, Directory)> = stream::iter(missing)
             .map(|digest| async move {
-                let directory: Directory = fetch_message(cas, &digest).await?;
+                let directory: Directory = fetch_message_dyn(cas, &digest).await?;
                 Ok::<_, TreeError>((label(&digest), directory))
             })
             .buffered(cas.in_flight())
