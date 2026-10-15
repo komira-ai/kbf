@@ -442,6 +442,58 @@ async fn an_output_or_the_working_directory_disqualifies_a_node() {
     assert_eq!(paths(&beside), ["tc"]);
 }
 
+/// An output that is also an input, outside any tree, is a private copy on the tree
+/// path too (nlink 1): a write to it must not change the cache's entry. Its sibling
+/// stays a cache link. Catches the private list being dropped in `Trees::materialize`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_output_named_input_beside_a_tree_is_a_private_copy() {
+    let kit = kit("trees-private", |_| {});
+    let mut input = files("tc", 300, "p");
+    input.extend(small());
+    input.push(("src/o.txt".to_owned(), b"output input".to_vec(), false));
+    let root = kit.cas.tree(&input);
+    let (dir, inputs) = kit.lease_with(&root, "private", &["src/o.txt"], "").await;
+    assert_eq!(paths(&inputs), ["tc"]);
+    let own = std::fs::metadata(dir.join("src/o.txt")).expect("o.txt");
+    assert_eq!(
+        own.nlink(),
+        1,
+        "the output-named input is not the cache inode"
+    );
+    assert_eq!(
+        std::fs::read(dir.join("src/o.txt")).expect("read"),
+        b"output input"
+    );
+    let sibling = std::fs::metadata(dir.join("src/a.c")).expect("a.c");
+    assert!(sibling.nlink() >= 2, "a sibling is a cache link");
+}
+
+/// A hit refreshes a tree's recency: with `a` and `b` built and released, `a` used
+/// again, and a third tree over the budget, `b` goes and `a` stays. Catches LRU
+/// degrading to first-in-first-out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_hit_makes_a_tree_the_most_recent() {
+    const ONE: u64 = 2890;
+    let kit = kit("trees-recency", |c| c.max_bytes = ONE * 2 + 500);
+    let roots: Vec<_> = ["a", "b", "c"]
+        .iter()
+        .map(|tag| kit.cas.tree(&files("tc", 300, tag)))
+        .collect();
+    let (_, a) = kit.lease(&roots[0], "a").await;
+    let (_, b) = kit.lease(&roots[1], "b").await;
+    let (a_tree, b_tree) = (a.mounts[0].source.clone(), b.mounts[0].source.clone());
+    drop(a);
+    drop(b);
+    let (_, hit) = kit.lease(&roots[0], "a-hit").await;
+    assert_eq!(hit.trees_built, 0, "a is a hit");
+    drop(hit);
+    let (_, c) = kit.lease(&roots[2], "c").await;
+    wait_for(|| !b_tree.exists()).await;
+    assert!(a_tree.is_dir(), "the tree just used is kept");
+    assert!(c.mounts[0].source.is_dir());
+    assert_eq!(kit.trees.store().stats().evictions, 1);
+}
+
 /// The size rule is `>=` and counts files and symlinks, not directories: 255 files are
 /// linked, 256 are a tree (the off-by-one mutants of the comparison fail one side).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

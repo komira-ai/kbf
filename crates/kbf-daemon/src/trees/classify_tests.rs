@@ -50,7 +50,7 @@ fn reserved<'a>(outputs: &'a [String], working_directory: &'a str) -> Reserved<'
 /// merely share a prefix with a reserved path are not related.
 #[test]
 fn the_reserved_path_table() {
-    let outputs = vec!["a/b/o".to_owned()];
+    let outputs = vec!["a/b/o".to_owned(), "tc2/o".to_owned()];
     let r = reserved(&outputs, "c/d");
     for (path, conflicts) in [
         ("a", true),
@@ -67,6 +67,10 @@ fn the_reserved_path_table() {
         ("c/d/e", false),
         ("c/e", false),
         ("cd", false),
+        // A sibling that is a prefix of an output's first component is not related.
+        ("tc", false),
+        ("tc2", true),
+        ("tc2/o", true),
     ] {
         assert_eq!(r.conflicts(path), conflicts, "{path}");
     }
