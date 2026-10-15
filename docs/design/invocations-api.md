@@ -34,7 +34,7 @@ Three limits an agent must know, each said again where it applies:
   error, a local action) is not in the record.
 - **Records do not survive a restart yet.** Until PRs 7 and 8 land (next after the
   client and driver metrics, section 9), a server restart loses every record, and the
-  memory bound evicts idle ones (3.5); with `--meta-log=memory` a restart loses them
+  memory bound evicts idle ones (3.5); with the in-memory metadata log (tests only) a restart loses them
   after that too, by design. An agent reads soon after its build. A record that is gone
   answers `404` with a body that says whether the server could have held it (4.10).
 - **CPU and memory are `null` today** for every action a real driver ran (section 1);
@@ -260,11 +260,11 @@ knows when its build ended and the server does not, so the client prints the bod
 exits 3 in both cases.
 
 **The gap closes when PRs 7 and 8 land** (section 9, right after the client and the
-driver metrics). On `--meta-log=raft` a flushed record survives a restart and the
+driver metrics). On the Raft metadata log a flushed record survives a restart and the
 memory bound no longer loses it (a flushed row leaves memory and is read from its chunk, 3.5): what a restart
 loses is each open invocation's unflushed window, and those invocations say
 `complete: false` (section 7), and minted one-action invocations, which are never
 flushed. `records_since` then is the oldest time the retention (3.6) still holds, and
-a `404` inside it means the farm saw no call with that id. On `--meta-log=memory` a
+a `404` inside it means the farm saw no call with that id. On the in-memory metadata log (tests only) a
 restart still loses every record, by design (3.5), and `records_since` stays the
 server's start.

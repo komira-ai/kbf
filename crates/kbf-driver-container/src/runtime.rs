@@ -31,6 +31,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -40,15 +41,18 @@ use kbf_daemon::cpu_pool::{CpuPool, DEFAULT_CPU_THREADS};
 use kbf_daemon::trees::{TreeConfig, TreeLease, Trees};
 use kbf_daemon::{Runtime, RuntimeError, Work, upload_within};
 use kbf_proto::reapi::{Action, ActionResult, Command, ExecutedActionMetadata, Platform};
+use kbf_proto::worker::ResourceUsage;
 use kbf_types::LeaseId;
 use prost_types::Timestamp;
 use tokio::sync::oneshot;
 
 use crate::backend::{Backend, ContainerRuntime, Dirs, Engine, PodmanBackend, Running};
 use crate::cgroup::{LeaseCgroup, SwapKill, memory_max, presses_into_swap};
+use crate::cgroup_usage::{NUMA_EVERY, NumaSample, resource_usage};
 use crate::image::{ImageCheckError, ImageRef, PROPERTY};
 use crate::input_phases::{InputPhases, millis};
 use crate::keeper::Keeper;
+use crate::numa::{Pin, Placer};
 use crate::oci::{Oci, OciConfig};
 use crate::outputs::{OutputLimits, collect_log};
 use crate::podman::{
@@ -97,17 +101,23 @@ pub struct PodmanConfig {
     pub limits: ContainerLimits,
     /// When a lease at its own memory cap that keeps pushing into swap is killed.
     pub swap_kill: SwapKill,
+    /// How often the lease cgroup's `memory.numa_stat` is read while the action runs
+    /// (measurement only: nothing decides on it). Tests make it short.
+    pub numa_every: Duration,
     /// Whose containers these are: each is labelled `kbf.owner=<owner>`
     /// ([`crate::podman::OWNER_LABEL`]), and at start the runtime removes every
     /// container so labelled. The daemon passes its node id. Two runtimes that share a
     /// Podman store need two owners, or each start removes the other's containers.
     pub owner: String,
-    /// The node's input cache, if it has one (`--cache-dir`). Without it, a lease's
+    /// The node's input cache, if it has one (`<--data-dir>/cache`). Without it, a lease's
     /// input files are its own copies, as before the cache.
     pub cache: Option<CacheUse>,
     /// The threads that hash an action's output files (`--cpu-threads`), shared by every
     /// lease.
     pub cpu: CpuPool,
+    /// Places each lease on one NUMA node (`--lease-placement=numa-node`); `None` leaves
+    /// them on any CPU the daemon may use.
+    pub placer: Option<Arc<Placer>>,
 }
 
 /// The node's input cache as the driver is given it: not opened yet.
@@ -120,7 +130,7 @@ pub struct CacheUse {
     /// ([`crate::chown_dirs`]) to give the input root's directories, not its files, to
     /// the container's root and back.
     pub helper: PathBuf,
-    /// The node's shared read-only trees (`--tree-dir`), if it has them: large
+    /// The node's shared read-only trees (`<--data-dir>/trees`), if it has them: large
     /// Directory nodes of an input root are built once and mounted read-only, not
     /// linked file by file. Opened with the cache; needs it.
     pub trees: Option<TreeConfig>,
@@ -149,7 +159,7 @@ impl PodmanConfig {
     /// `/sys/fs/cgroup`, a one hour default timeout, a five second kill grace,
     /// the default [`OutputLimits`], [`kbf_daemon::UPLOAD_DEADLINE`],
     /// [`ContainerLimits::DEFAULT`] and
-    /// [`SwapKill::DEFAULT`].
+    /// [`SwapKill::DEFAULT`], and no NUMA placement.
     #[must_use]
     pub fn new(scratch: PathBuf, cgroup_parent: String, owner: String) -> Self {
         Self {
@@ -165,9 +175,11 @@ impl PodmanConfig {
             upload_deadline: kbf_daemon::UPLOAD_DEADLINE,
             limits: ContainerLimits::DEFAULT,
             swap_kill: SwapKill::DEFAULT,
+            numa_every: NUMA_EVERY,
             owner,
             cache: None,
             cpu: CpuPool::new(DEFAULT_CPU_THREADS),
+            placer: None,
         }
     }
 
@@ -251,6 +263,11 @@ pub struct PodmanRuntime<C> {
     engine: Engine,
     cas: Arc<C>,
     stops: Mutex<BTreeMap<LeaseId, oneshot::Sender<Stop>>>,
+    /// What leases that ended without a result counted, until the daemon takes it
+    /// ([`Runtime::failed_usage`]).
+    failed: Mutex<BTreeMap<LeaseId, ResourceUsage>>,
+    /// Samples of `memory.numa_stat` that held memory, over every lease.
+    numa_samples: Arc<AtomicU64>,
     /// The input cache leases link from, if the node has one and it could be used.
     cache: Option<Cached>,
     /// What the last lease's inputs cost, with the cache (a test's counter; each
@@ -285,6 +302,8 @@ impl<C: Cas> PodmanRuntime<C> {
             config,
             cas,
             stops: Mutex::new(BTreeMap::new()),
+            failed: Mutex::new(BTreeMap::new()),
+            numa_samples: Arc::new(AtomicU64::new(0)),
             cache: None,
             last_inputs: Mutex::new(None),
         };
@@ -317,6 +336,18 @@ impl<C: Cas> PodmanRuntime<C> {
             .last_inputs
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// How many readings of a lease cgroup's `memory.numa_stat`, taken while an action
+    /// ran or when it ended, held memory (a test waits on it to know the sampler ran).
+    #[must_use]
+    pub fn numa_samples(&self) -> u64 {
+        self.numa_samples.load(Ordering::Acquire)
+    }
+
+    fn failed(&self) -> MutexGuard<'_, BTreeMap<LeaseId, ResourceUsage>> {
+        // Each update is one map operation, so the map is consistent after a panic.
+        self.failed.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     fn stops(&self) -> MutexGuard<'_, BTreeMap<LeaseId, oneshot::Sender<Stop>>> {
@@ -445,7 +476,13 @@ impl<C: Cas> PodmanRuntime<C> {
         // The keeper, before anything runs in the cgroup: it kills the cgroup if the
         // daemon dies.
         let kill = lease.cgroup.dir().join("cgroup.kill");
-        let keeper = (lease.cgroup.create(work.resources))
+        lease.pin = self
+            .config
+            .placer
+            .as_ref()
+            .map(|placer| placer.place(work.resources.cpu_millis));
+        phases.numa_node = lease.pin.as_ref().map(Pin::node);
+        let keeper = (lease.cgroup.create(work.resources, lease.pin.as_ref()))
             .and_then(|()| Keeper::watch(&kill))
             .map_err(|e| failed(lease.cgroup.dir(), &e))?;
         lease.keeper = Some(keeper);
@@ -512,6 +549,10 @@ impl<C: Cas> PodmanRuntime<C> {
         // Execution counts from `podman create`: making the container is part of
         // running the command in one.
         clock.execution_start_timestamp = now();
+        // What the lease cgroup's NUMA split is while the action runs, and the usage
+        // read at its end (`cgroup_usage`): `run` reads it too when the lease fails.
+        lease.ran = Some(Instant::now());
+        lease.numa = NumaSample::counting(Arc::clone(&self.numa_samples));
         lease.created = true;
         self.engine
             .create(&spec)
@@ -553,6 +594,8 @@ impl<C: Cas> PodmanRuntime<C> {
                     self.stop_container(&lease.name, &lease.cgroup, child).await;
                     return Err(RuntimeError::Killed);
                 }
+                // Never ends: it samples while the others are waited for.
+                () = lease.numa.watch(lease.cgroup.dir(), self.config.numa_every) => {}
                 (now, own) = presses_into_swap(&lease.cgroup, cap, threshold, swap_kill.every) => {
                     let limit = cap.unwrap_or(0);
                     let why = format!(
@@ -604,6 +647,10 @@ impl<C: Cas> PodmanRuntime<C> {
             }
         };
         clock.execution_completed_timestamp = now();
+        // What the lease cgroup counted, while it still exists (clean removes it). The
+        // result carries it beside the four numbers every runtime reports.
+        let usage = lease.usage();
+        clock.auxiliary_metadata = usage.iter().map(ResourceUsage::to_any).collect();
         // The upload counts from the chown, which makes the outputs readable to it.
         clock.output_upload_start_timestamp = now();
         // The container has exited: hand its files back to the daemon's user, so an
@@ -773,10 +820,26 @@ impl<C: Cas> Runtime for PodmanRuntime<C> {
         let outcome = self
             .attempt(&work, &mut lease, &mut stop, &mut killer)
             .await;
+        // A lease that ended without a result (timed out, killed, out of memory) is
+        // measured too, before the clean removes its cgroup; the daemon asks for it
+        // (`Runtime::failed_usage`).
+        let measured = if outcome.is_err() {
+            lease.usage()
+        } else {
+            None
+        };
         let cleaned = lease.clean().await;
         // A kill that arrived after the work ended still waits for the clean.
         if let Some(by) = killer.or_else(|| stop.try_recv().ok()) {
             let _ = by.send(());
+        }
+        let measured = match (&outcome, &cleaned) {
+            // A clean that fails turns a result into an error: its usage is still told.
+            (Ok(result), Err(_)) => ResourceUsage::in_result(result),
+            _ => measured,
+        };
+        if let Some(usage) = measured {
+            self.failed().insert(work.lease_id, usage);
         }
         match (outcome, cleaned) {
             (Ok(_), Err(why)) => Err(RuntimeError::Failed(format!("clean: {why}"))),
@@ -786,6 +849,10 @@ impl<C: Cas> Runtime for PodmanRuntime<C> {
             }
             (outcome, Ok(())) => outcome,
         }
+    }
+
+    fn failed_usage(&self, lease_id: LeaseId) -> Option<ResourceUsage> {
+        self.failed().remove(&lease_id)
     }
 
     async fn kill(&self, lease_id: LeaseId) {
@@ -878,8 +945,15 @@ struct Lease {
     keeper: Option<Keeper>,
     /// The shared trees the container mounts, pinned until the lease is gone.
     trees: Vec<TreeLease>,
+    /// The NUMA node the lease is placed on, with `--lease-placement=numa-node`. Dropped
+    /// with the lease, which gives the node its load back.
+    pin: Option<Pin>,
     /// Whether cleaning is still owed.
     armed: bool,
+    /// When the container was about to be created, once the lease got that far.
+    ran: Option<Instant>,
+    /// The NUMA split sampled while the action ran.
+    numa: NumaSample,
 }
 
 impl Lease {
@@ -903,8 +977,20 @@ impl Lease {
             start: None,
             keeper: None,
             trees: Vec::new(),
+            pin: None,
             armed: true,
+            ran: None,
+            numa: NumaSample::default(),
         }
+    }
+
+    /// What the lease cgroup counted so far, with its best NUMA sample: `None` for a
+    /// lease that never got to run its container. Read once (it takes the samples);
+    /// the cgroup must still exist.
+    fn usage(&mut self) -> Option<ResourceUsage> {
+        let ran = self.ran?;
+        let cgroup = std::mem::take(&mut self.numa).finish(self.cgroup.dir());
+        Some(resource_usage(cgroup, ran.elapsed()))
     }
 
     /// Steps 5 and 6, off the async threads.

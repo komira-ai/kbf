@@ -36,8 +36,8 @@ pub fn golden_plist_as(sha12: &str, user: Option<&str>) -> String {
 		<string>/usr/local/kbf/etc/node.key</string>
 		<string>--node-id</string>
 		<string>kbf-mac-07</string>
-		<string>--scratch</string>
-		<string>/Volumes/kbf/scratch</string>
+		<string>--data-dir</string>
+		<string>/Volumes/kbf/data</string>
 		<string>--label</string>
 		<string>profile=mac-arm64-test@{sha12}</string>
 		<string>--label</string>

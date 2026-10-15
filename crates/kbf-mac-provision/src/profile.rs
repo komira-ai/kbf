@@ -48,7 +48,7 @@ pub const REQUIRED: &[&str] = &[
     "kbf_ca_cert",
     "kbf_cert",
     "kbf_key",
-    "kbf_scratch",
+    "kbf_data_dir",
     "kbf_labels",
     "simulator_runtimes",
 ];
@@ -391,7 +391,7 @@ impl Profile {
             "an https://host[:port] URL",
         )?;
         want("kbf_cas", pattern::https_url, "an https://host[:port] URL")?;
-        for key in ["kbf_ca_cert", "kbf_cert", "kbf_key", "kbf_scratch"] {
+        for key in ["kbf_ca_cert", "kbf_cert", "kbf_key", "kbf_data_dir"] {
             want(key, pattern::absolute_path, "an absolute path")?;
         }
         let labels: Vec<String> = get("kbf_labels")
@@ -511,7 +511,7 @@ fn volume_and_daemon(
         v => return Err(invalid("daemon_user", v, "role or root")),
     };
     if daemon_user == DaemonUser::Root {
-        for key in ["kbf_scratch", "kbf_cache"] {
+        for key in ["kbf_data_dir", "kbf_cache"] {
             let path = get(key);
             if !path.is_empty() && !path.starts_with(&format!("{volume}/")) {
                 return Err(ProfileError::Invalid(format!(

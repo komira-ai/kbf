@@ -177,7 +177,7 @@ stopped. The server logs every change of process on a node. A registration witho
 instance id (a daemon that predates the field) is taken as another process's.
 
 **A proven restart** (issue #22). The daemon binary keeps its instance id in its
-scratch directory (`<--scratch>/daemon-instance`), written only once every runtime has
+scratch directory (`<--data-dir>/leases/daemon-instance`), written only once every runtime has
 been built, so once every driver's start-up sweep has killed the runs the daemon
 before it left there. The next daemon reads the old id before it writes its own, and
 names it in `Hello.predecessor_instance_id`. The server takes the claim when it names
@@ -192,7 +192,7 @@ assumption: the sweep already needs one daemon per scratch directory. What it do
 not cover: a copy of the scratch directory on another machine (a cloned disk) whose
 daemon is cut off from the server, so that its stream has closed while it still runs;
 its self-fenced work then stops within T, but a hermetic run runs on beside the rerun.
-A daemon without `--scratch` (the fake driver) names no predecessor.
+A daemon without `--data-dir` (the fake driver) names no predecessor.
 
 This puts one duty on a daemon: it must list everything it holds in its first heartbeat
 on each new stream, or what it leaves out is requeued at once. Re-adopting work across a

@@ -276,7 +276,7 @@ async fn prepare_refuses_outputs_that_are_not_held() {
 }
 
 /// Catches a hit served while the store has lost an object holding one of its blobs
-/// (a file deleted under `kbf-server --blob-dir`): the index still holds the blob, so
+/// (a file deleted under a `kbf-server` `file://` cold store): the index still holds the blob, so
 /// the closure check passes, and the client would be told to download bytes no one
 /// has. The hit must be a miss, so the action runs again, and the lost object must be
 /// marked unreachable, so FindMissing reports its blob and the client uploads it.

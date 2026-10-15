@@ -1,4 +1,4 @@
-//! The write tier over `--meta-log=raft` ([`kbf_server::write_tier::attach`], as the
+//! The write tier over the Raft metadata log ([`kbf_server::write_tier::attach`], as the
 //! binary calls it): the Raft log raised to machine version 2 once, only when a tier is
 //! configured, and staged, sealed and flushed objects kept across a restart.
 //!
@@ -7,13 +7,12 @@
 //! that succeeds while it is down came from the tier. Each test's comment names the
 //! defect it is there to catch.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Instant, SystemTime};
 
 use bytes::Bytes;
-use clap::Parser;
 use kbf_front::{Cache, MetaLog, TierStartup, VerifiedBlob};
 use kbf_log::MachineVersion;
 use kbf_meta::{BlobAnswer, ObjectId, Retention, StagedState, TierId};
@@ -21,9 +20,11 @@ use kbf_objstore::{
     ByteRange, Capabilities, KeyPrefix, ListPage, ListToken, MemoryStore, ObjectKey, ObjectStore,
     ObjectStoreError, PageSize,
 };
-use kbf_server::write_tier::{TierLog, attach};
-use kbf_server::{Args, RaftLogError, RaftMetaLog};
+use kbf_server::stores::{Hot, StoreFlags, StoreUri};
+use kbf_server::write_tier::attach;
+use kbf_server::{RaftLogError, RaftMetaLog};
 use kbf_store::StdFs;
+use kbf_threads::disk::{FreeSpace, Space};
 use kbf_tier::TierOptions;
 use kbf_types::Digest;
 
@@ -113,26 +114,14 @@ impl Dirs {
         }
     }
 
-    /// The flags of a `--meta-log=raft` server, with the tier when `tier`.
-    fn args(&self, tier: bool) -> Args {
-        let mut argv = vec![
-            "kbf-server",
-            "--store",
-            "s3",
-            "--s3-endpoint",
-            "http://127.0.0.1:9",
-            "--s3-bucket",
-            "kbf-test",
-            "--meta-log",
-            "raft",
-            "--raft-dir",
-            path(&self.raft),
-        ];
-        if tier {
-            argv.extend(["--write-tier-dir", path(&self.tier)]);
-            argv.extend(["--write-tier-bytes", "1073741824"]);
-        }
-        Args::parse_from(argv)
+    /// The hot store a server resolves `--hot-store` to, when `tier`: the directory and a
+    /// 1 GiB budget.
+    fn hot(&self, tier: bool) -> Option<Hot> {
+        tier.then(|| Hot {
+            dir: self.tier.clone(),
+            budget: 1 << 30,
+            abandon: None,
+        })
     }
 
     /// Opens the log as a binary that runs machine versions up to `runs` would.
@@ -149,10 +138,6 @@ impl Drop for Dirs {
     }
 }
 
-fn path(p: &Path) -> &str {
-    p.to_str().expect("a UTF-8 path")
-}
-
 type Log = RaftMetaLog<StdFs>;
 type TierCache = Cache<Log, Store>;
 
@@ -166,7 +151,9 @@ async fn start(dirs: &Dirs, store: &Store, tier: bool) -> (TierCache, Option<Tie
     let cache = Cache::open(log, store.clone(), prefix)
         .await
         .expect("open the cache");
-    attach(cache, &dirs.args(tier)).await.expect("attach")
+    attach(cache, dirs.hot(tier).as_ref())
+        .await
+        .expect("attach")
 }
 
 fn blob(seed: u8) -> (VerifiedBlob, Bytes, Digest) {
@@ -221,8 +208,8 @@ async fn a_raft_server_with_a_tier_raises_its_log_once() {
     let log = cache.meta();
     assert_eq!(log.machine_version(), MachineVersion::V2);
     let applied = log.applied_index();
-    let tier_dir = StdFs::new(&dirs.tier).expect("the tier dir");
-    log.ready_for_tier(&tier_dir).expect("ready");
+    log.raise_machine_version(MachineVersion::V2)
+        .expect("raise");
     assert_eq!(log.applied_index(), applied, "the raise committed again");
     drop(cache);
 
@@ -316,4 +303,77 @@ async fn staged_sealed_and_flushed_objects_survive_a_raft_restart() {
         assert_eq!(staged_on(&cache, digest).await, Some(None));
         assert_eq!(&cache.read_blob(&digest).await.expect("read"), bytes);
     }
+}
+
+/// A disk with room: only the flags' resolution reads it.
+struct Roomy;
+
+impl FreeSpace for Roomy {
+    fn space(&self, _: &std::path::Path) -> std::io::Result<Space> {
+        Ok(Space {
+            total: 1 << 40,
+            available: 1 << 39,
+        })
+    }
+}
+
+/// Catches an upgrade that loses data: a server run with its raft log in R and its tier
+/// in T (`--meta-dir=R --hot-store=file://T`, which is how the old flags laid them out)
+/// must, on the new flags, resolve the log to R (not `<T>/meta`, which would start an
+/// empty log beside the tier and orphan every staged block), recover the same log
+/// (identity and applied entries) and the same tier, serve the staged block, and make no
+/// `<T>/meta`. One block is staged and unflushed, the only copy of an acknowledged blob.
+#[tokio::test]
+async fn the_new_flags_open_an_old_raft_directory_and_tier_with_their_data() {
+    let dirs = Dirs::new("upgrade");
+    let store = Store::new();
+    let (cache, _) = start(&dirs, &store, true).await;
+    let (a, a_bytes, a_digest) = blob(7);
+    cache.store_blobs(vec![a]).await.expect("stored");
+    let object = object_of(&cache, a_digest).await;
+    let (log_id, applied) = (cache.meta().log_id(), cache.meta().applied_index());
+    let tier = staged_on(&cache, a_digest).await.expect("present");
+    assert!(tier.is_some(), "staged on the tier");
+    drop(cache);
+    assert!(dirs.raft.join("log-record").is_file());
+    assert!(dirs.tier.join("TIER").is_file());
+
+    let cold = StoreUri::File(dirs.raft.parent().expect("a root").join("cold"));
+    let hot = StoreUri::File(dirs.tier.clone());
+    let flags = StoreFlags {
+        cold: Some(&cold),
+        hot: Some(&hot),
+        hot_max_bytes: None,
+        hot_abandon: None,
+        meta_dir: Some(&dirs.raft),
+    };
+    let stores = flags.resolve(&Roomy).expect("the new flags resolve");
+    assert_eq!(stores.meta_dir, dirs.raft);
+    assert!(!stores.meta_in_hot);
+    let tier_dir = stores.hot.as_ref().map(|hot| hot.dir.clone());
+    assert_eq!(tier_dir.as_deref(), Some(dirs.tier.as_path()));
+
+    let log = RaftMetaLog::open_dir(&stores.meta_dir, Retention::default(), "kbf/")
+        .await
+        .expect("open the old raft directory");
+    assert_eq!(log.log_id(), log_id, "a different log");
+    // An open commits an entry of its own (the leader's), so the index is not equal.
+    assert!(log.applied_index() >= applied, "entries lost");
+    let prefix = log.store_prefix();
+    let cache = Cache::open(log, store.clone(), prefix)
+        .await
+        .expect("open the cache");
+    let (cache, startup) = attach(cache, stores.hot.as_ref()).await.expect("attach");
+    let startup = startup.expect("a tier");
+    assert_eq!(Some(startup.tier), tier, "the same tier");
+    assert!(!startup.registered, "registered again");
+    assert_eq!(startup.recovery.lost, []);
+    assert_eq!(startup.recovery.unsealed, [object]);
+    assert_eq!(staged_on(&cache, a_digest).await, Some(tier));
+    let read = cache
+        .read_blob(&a_digest)
+        .await
+        .expect("read from the tier");
+    assert_eq!(read, a_bytes);
+    assert!(!dirs.tier.join("meta").exists(), "<T>/meta made");
 }

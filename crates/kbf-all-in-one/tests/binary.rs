@@ -134,7 +134,8 @@ fn free_port() -> u16 {
 }
 
 /// The flags of a one-node farm in `dir`: the server's worker listener on `port` under
-/// mutual TLS, a write tier, and the daemon half's container driver dialling it.
+/// mutual TLS, a cold store and a hot store (the write tier, holding the metadata log),
+/// and the daemon half's container driver dialling it.
 fn farm_flags(dir: &Path, port: u16) -> Vec<String> {
     let at = |name: &str| dir.join(name).display().to_string();
     vec![
@@ -143,8 +144,8 @@ fn farm_flags(dir: &Path, port: u16) -> Vec<String> {
         format!("--worker-tls-cert={}", at("server.pem")),
         format!("--worker-tls-key={}", at("server.key")),
         format!("--worker-client-ca={}", at("ca.pem")),
-        format!("--write-tier-dir={}", at("tier")),
-        "--write-tier-bytes=1073741824".to_owned(),
+        format!("--cold-store=file://{}", at("cold")),
+        format!("--hot-store=file://{}", at("hot")),
         format!("--server=https://127.0.0.1:{port}"),
         "--tls-server-name=localhost".to_owned(),
         format!("--ca-cert={}", at("ca.pem")),
@@ -153,7 +154,7 @@ fn farm_flags(dir: &Path, port: u16) -> Vec<String> {
         "--node-id=node-1".to_owned(),
         "--reconnect-ms=50".to_owned(),
         "--driver=container".to_owned(),
-        format!("--scratch={}", at("scratch")),
+        format!("--data-dir={}", at("data")),
     ]
 }
 
@@ -348,8 +349,8 @@ fn the_binary_answers_as_a_keeper_before_it_reads_its_flags() {
     assert!(out.stdout.is_empty(), "a server started");
 }
 
-/// Runs the binary with `extra` flags after a one-node farm's in a fresh directory and
-/// returns its exit status and stderr.
+/// Runs the binary with a one-node farm's flags in a fresh directory, `extra` taking the
+/// place of any it names again, and returns its exit status and stderr.
 fn refused(name: &str, extra: &[&str]) -> (Option<i32>, String) {
     refused_with(name, extra, |_| {})
 }
@@ -359,8 +360,11 @@ fn refused_with(name: &str, extra: &[&str], prepare: impl FnOnce(&Path)) -> (Opt
     let dir = scratch(name);
     pki(&dir);
     prepare(&dir);
+    let name = |flag: &str| flag.split('=').next().unwrap_or(flag).to_owned();
+    let named: Vec<String> = extra.iter().map(|flag| name(flag)).collect();
+    let farm = farm_flags(&dir, free_port());
     let output = Command::new(BIN)
-        .args(farm_flags(&dir, free_port()))
+        .args(farm.iter().filter(|flag| !named.contains(&name(flag))))
         .args(extra)
         .output()
         .expect("run");
@@ -370,12 +374,15 @@ fn refused_with(name: &str, extra: &[&str], prepare: impl FnOnce(&Path)) -> (Opt
 
 /// Catches a start either half refuses that exits 0 or as the other half would, or
 /// that does not say which half refused: a server whose flags its own start refuses
-/// (`--blob-dir` without its Raft log) exits 2, as `kbf-server` does; a daemon whose
+/// (a cold store that cannot be made) exits 2, as `kbf-server` does; a daemon whose
 /// driver cannot start (no subordinate ids for its user) exits 1, as `kbf-daemon` does;
 /// a driver other than the container driver is a usage error, 2.
 #[test]
 fn a_start_either_half_refuses_says_which() {
-    let (code, stderr) = refused("server-refuses", &["--blob-dir=/nonexistent/blobs"]);
+    let (code, stderr) = refused(
+        "server-refuses",
+        &["--cold-store=file:///proc/nonexistent/cold"],
+    );
     assert_eq!(code, Some(2), "{stderr}");
     assert!(stderr.contains("kbf-all-in-one: server: "), "{stderr}");
     let (code, stderr) = refused("daemon-refuses", &["--id-files=/nonexistent/ids"]);

@@ -14,6 +14,44 @@ only is [linux-build-host.md](linux-build-host.md).
 | converged | the same, and a `kbf-daemon` with the container driver ([converged topology](../design/deployment-topology.md#converged-topology)) | the server-only units, with the slice and daemon of the [converged units](#converged-units) |
 | build-only | a `kbf-daemon` only | [linux-build-host.md](linux-build-host.md) |
 
+## Where the bytes live: storage glossary
+
+Five places hold what a farm keeps, and each has one flag or one directory. The server
+takes two store URIs and, sometimes, a directory; the daemon takes one directory.
+
+| Term | What it is | Set by |
+|---|---|---|
+| **Object store** (the cold store) | The durable home of every blob: an S3 bucket (MinIO, RustFS) or a directory on a disk. Nothing leaves it but by being deleted, and nothing is deleted yet. | `kbf-server --cold-store` |
+| **Write tier** (the hot store) | A fast local disk in front of the object store. Uploads land there first and are flushed to the object store in the background; reads are served from it while a blob is still there. Optional: without one, uploads go straight to the object store. | `kbf-server --hot-store` |
+| **Metadata log** | The index of what the object store holds (digest to segment object and offset) and the action cache: a single-voter Raft log on a local disk. Lose it and the blobs are unreachable. | in the hot store's directory (`<hot>/meta`), else `kbf-server --meta-dir` |
+| **Input cache** | The daemon's per-node cache of input files, from which each lease's inputs are linked. Evicts least recently used past its budget. | `kbf-daemon --data-dir` (`cache/`) |
+| **Input trees** | The daemon's shared read-only trees: a large directory of inputs built once and mounted read-only into every action that has it. | `kbf-daemon --data-dir` (`trees/`) |
+
+The object store and the write tier are not exclusive: the write tier is a fast cache
+of recent writes in front of the object store, which is cold and durable. A farm that
+keeps everything on one disk names it as the object store and has no write tier.
+
+A store URI is `file:///absolute/path` or `s3://bucket/prefix?endpoint=http://host:port`:
+
+- `file://` is a directory on a local disk. An SSD is the hot store's usual home, HDDs
+  or an NFS export the cold store's. A directory on a tmpfs is a store in memory:
+  there is no `memory:` store, and the server refuses one.
+- `s3://` takes the endpoint and the rest in the query: `endpoint=` (required),
+  `region=` (default `us-east-1`), `conditional-put=true` (the bucket refuses to
+  overwrite a key, as MinIO and RustFS do) and `min-put-rate=` (the slowest rate in
+  bytes a second a PUT body may reach the store at, default 1 MiB/s; a PUT is cut after
+  60 s plus its body's length at that rate). The prefix is the path, `kbf/` when there
+  is none. The key pair is `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` in the
+  environment, never in the URI.
+- Both stores take both forms, except that the hot store must be a `file://`
+  directory today: the write tier is block files on a local disk.
+
+Sizes are not flags. The hot store's budget is 80% of its filesystem's free space after
+it keeps 5% of the filesystem free (at least 1 GiB, and never more than half of what is
+free), lowered by `--hot-store-max-bytes`; at the budget,
+uploads take the direct path to the object store. The daemon's budgets are in
+[the data directory](#the-daemons-data-directory).
+
 ## Priorities
 
 When the host runs short, the object store goes last, then `kbf-server`, then the
@@ -116,10 +154,8 @@ CPUWeight=300
 # never goes on the command line.
 EnvironmentFile=/etc/kbf/s3.env
 ExecStart=/usr/local/bin/kbf-server \
-    --store=s3 \
-    --s3-endpoint=http://127.0.0.1:9000 \
-    --s3-bucket=kbf \
-    --s3-conditional-put \
+    --cold-store=s3://kbf?endpoint=http://127.0.0.1:9000&conditional-put=true \
+    --meta-dir=/var/lib/kbf-server/raft \
     --listen=<storage host address>:8980 \
     --reapi-tls-cert=/etc/kbf/reapi.pem \
     --reapi-tls-key=/etc/kbf/reapi.key \
@@ -138,9 +174,14 @@ WantedBy=multi-user.target
 
 What each group of flags does:
 
-- **The store.** Blob bytes go to the bucket through the host's own MinIO node. The
-  index is still in memory, so a restart forgets every blob, and each start writes
-  under a fresh key prefix.
+- **The stores.** `--cold-store` is the bucket on the host's own MinIO node; blob bytes
+  go there under `kbf/<log id>/`. `--meta-dir` is the metadata log, which keeps the
+  index across a restart: a build after the restart gets the cache hits it got before.
+  Put it on a partition of its own, not shared with the daemon's data directory, swap or
+  the object store's data, so a full build disk cannot stop the log
+  ([converged topology](../design/deployment-topology.md#converged-topology)). A fast
+  local disk for uploads is `--hot-store=file:///path`; the log then lives in its
+  `meta/` directory unless `--meta-dir` says otherwise.
 - **The REAPI listener** serves TLS with a certificate from the farm's internal CA, for
   the front's proxy on another host and for clients that trust that CA. A server whose
   proxy runs on the same host may bind `--listen` to loopback and leave out the two TLS
@@ -205,7 +246,7 @@ ExecStart=/usr/local/bin/kbf-daemon \
     --cert=/etc/kbf/node.pem \
     --key=/etc/kbf/node.key \
     --node-id=<node id> \
-    --scratch=/var/lib/kbf/leases \
+    --data-dir=/var/lib/kbf \
     --actions-memory-max-gib=200 \
     --supervisor-memory-min-mib=256
 Restart=on-failure
@@ -219,26 +260,20 @@ result; on another host, compute it from that host's RAM. The daemon's other set
 and what it logs at start are as on a build host
 ([linux-build-host.md](linux-build-host.md#the-units)).
 
-## One host without MinIO: `--blob-dir`
+## One host without MinIO: a `file://` cold store
 
 For a development farm on one host, `kbf-server` can keep blob bytes in a directory on
-the local disk instead of a bucket, and the index of what it holds (the CAS and the
-action cache) in the Raft log, so a restart of the server keeps both: a build after the
-restart gets the cache hits it got before.
+the local disk instead of a bucket. The metadata log is a directory too, so a restart
+of the server keeps both: a build after the restart gets the cache hits it got before.
 
 ```sh
 kbf-server \
-    --blob-dir=/var/lib/kbf-server/blobs \
-    --meta-log=raft \
-    --raft-dir=/var/lib/kbf-server/raft \
+    --cold-store=file:///var/lib/kbf-server/blobs \
+    --meta-dir=/var/lib/kbf-server/raft \
     --listen=127.0.0.1:8980 \
     --worker-listen=127.0.0.1:8981
 ```
 
-- `--blob-dir` takes the place of `--store`: with `--store` or any `--s3-*` flag
-  (`--s3-prefix` included) the server refuses to start. It needs `--meta-log=raft`;
-  with the index in memory a restart would forget every blob while their files
-  stayed, with nothing to delete them.
 - The directory is created if missing and locked while the server runs: a second
   server on it exits 2. Objects are keyed under the fixed prefix `kbf/<log id>/`, one
   file each in `objects/` (layout in
@@ -255,31 +290,63 @@ kbf-server \
   not, the hit is a miss (the action runs again) and its blobs leave the index.
 - No eviction: nothing deletes objects yet, from this directory or from a bucket, so
   it grows with every blob written. A write that would leave the file system with
-  less than `--blob-dir-min-free-bytes` free (default 1 GiB) is refused, and its
-  upload answered `UNAVAILABLE`. Size the disk for the cache you want to keep.
+  less than 1 GiB free is refused, and its upload answered `UNAVAILABLE`. Size the disk
+  for the cache you want to keep.
 
-## Planned: the Raft log on local disk
+With a fast disk in front, add `--hot-store=file:///fast/kbf` (uploads land there and
+are flushed to the cold store; the metadata log then lives in `/fast/kbf/meta`, and
+`--meta-dir` is left out unless the log should be on another disk).
 
-`kbf-server` keeps its metadata in memory by default
-([deployment-topology.md](../design/deployment-topology.md#built-and-planned)).
-`--meta-log=raft --raft-dir=/var/lib/kbf-server/raft` is accepted (with `--store=s3`, or `--blob-dir` [above](#one-host-without-minio---blob-dir))
-but is not in the unit above yet: until the scheduler's state is in the log too, a
-restart over it keeps the daemons' epoch but not the server's leases, so the old runs
-go on as orphans whose results are refused. This flag is planned and not accepted yet;
-the unit gains all three once both are built:
+## Planned: the scheduler's state in the log
+
+`kbf-server` keeps its metadata in the Raft log on local disk (`--meta-dir`, or
+`<hot store>/meta`; [deployment-topology.md](../design/deployment-topology.md#built-and-planned)).
+Until the scheduler's state is in the log too, a restart keeps the daemons' epoch but not
+the server's leases, so the old runs go on as orphans whose results are refused. The
+unit gains this flag once the scheduler's state is built:
 
 ```text planned-flags kbf-server
 --runtime-dir=/run/kbf
 ```
 
-- `--meta-log=raft` and `--raft-dir`: the server's state applied from a single-voter
+- `--meta-dir` (or `<hot store>/meta`): the server's state applied from a single-voter
   Raft log kept in the directory. Mount that directory on a partition of its own, not
   shared with build scratch, swap or the object store's data, so a full build disk
   cannot stop the log
-  ([converged topology](../design/deployment-topology.md#converged-topology)).
+  ([converged topology](../design/deployment-topology.md#converged-topology)). The
+  server holds an exclusive lock on `log.lock` in the directory while it runs, so a
+  second server started on the same directory is refused rather than writing the log.
 - `--runtime-dir`: where the log's store records that a write to disk failed, so it
   does not reopen the log until the host reboots. `/run` is a tmpfs, cleared at reboot
   as the page cache is.
+
+## The daemon's data directory
+
+`kbf-daemon` keeps everything it writes under one directory, `--data-dir` (default
+`/var/lib/kbf`), made if missing:
+
+| Path | Holds | Mode |
+|---|---|---|
+| `<data-dir>/leases` | lease directories (every real driver) | 0700 |
+| `<data-dir>/cache` | the input cache (container driver) | 0700 |
+| `<data-dir>/trees` | the shared input trees (container driver, Linux) | 0711 |
+
+The data directory itself is 0755: a rootless container's root is a subordinate id, an
+"other" to the daemon's directories, and must search down to a tree. The three share one
+filesystem, which the cache and the trees need to link files instead of copying them.
+
+The cache and the trees are on by default under the container driver and sized from the
+filesystem, not by flags: with a floor of 5% of the filesystem (at least 1 GiB) kept free
+for everything else, the cache may keep half and the trees a quarter of the rest, and
+the cache evicts entries no running lease links to keep the floor free.
+`--data-max-bytes` only lowers the size they are budgeted from. The native driver never
+makes `cache/` or `trees/`: its actions run as the daemon's user, who owns them and
+could write them. A cache another daemon owns, or one that cannot be used, is left alone:
+the daemon warns (`cache: off:<reason>`) and runs uncached.
+
+At start the daemon logs the data directory, the leases directory, and the cache and
+tree budgets it resolved; the server logs its cold store, hot store (with its budget) and
+metadata directory.
 
 ## Rendering the converged units
 
@@ -341,8 +408,8 @@ sudo kbf-deploy linux install-units --config node.conf --uninstall [--apply]
   them unless `check-units --installable` passes, and refuses a binary whose `--help`
   lacks a flag its unit passes. It then installs, each only if it differs: the
   binaries from `--bin-dir` (keeping the replaced one as `<name>.previous`), the four
-  files under `/etc/systemd/system`, and the Raft and scratch directories (0700, their
-  service's user). The binaries, the `.previous` copies and the four files are root's
+  files under `/etc/systemd/system`, and the metadata directory (0700, the server's user) and the data directory
+  (0755, the daemon's user). The binaries, the `.previous` copies and the four files are root's
   (uid and gid 0): one with the right bytes and mode that another user owns is
   replaced. After a change it runs `daemon-reload` and enables and restarts
   kbf-server and kbf-daemon; otherwise it only enables or starts one that is not.
@@ -350,8 +417,8 @@ sudo kbf-deploy linux install-units --config node.conf --uninstall [--apply]
   that starts nothing does not wait. MinIO restarts only with `--restart-minio`: its
   new priorities take effect at its next start. `--uninstall` stops and disables both
   services when either is enabled or running, and moves the four files to
-  `/var/lib/kbf-linux/removed/<unix seconds>/`; the binaries, the Raft log, the
-  scratch, the bucket and the swapfile stay.
+  `/var/lib/kbf-linux/removed/<unix seconds>/`; the binaries, the metadata log, the
+  data directory, the bucket and the swapfile stay.
 
 ## What the tests check
 

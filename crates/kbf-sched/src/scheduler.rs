@@ -161,16 +161,35 @@ impl Worker {
         self.phase.switching() == Some(lease) && now < self.switch_ends
     }
 
+    /// Whether `request`, an action or a VM, is at the whole host's memory (the last step
+    /// of the memory ladder, which the cap is): it runs with no other lease on the node,
+    /// and none is placed beside it, as a whole-machine lease does. A request for no
+    /// memory is not.
+    pub(crate) fn exclusive(&self, request: &Request) -> bool {
+        request.resources.memory_bytes > 0
+            && request.resources.memory_bytes >= self.capacity.memory_bytes
+    }
+
     /// Whether `request` can be placed on it now, platform and kind aside: an action
-    /// if no whole-machine lease holds it and its free room holds the request; a
+    /// if no whole-machine lease holds it, its free CPUs, GPUs and VM slots hold the
+    /// request, and its memory capacity is at least the request's memory; a
     /// whole-machine lease if it holds no lease and its capacity holds the request. A
     /// request for an iOS device also needs a free device that satisfies it
     /// ([`Worker::free_device`]).
     pub(crate) fn has_room(&self, request: &Request) -> bool {
         let room = match request.kind {
             LeaseKind::WholeMachine => self.leases == 0 && self.capacity.fits(&request.resources),
+            // An action's memory is the cgroup limit it first runs under, not a booking:
+            // what other leases hold of the node's memory never keeps it out. The node
+            // bounds how many run at once by CPUs (its lease count), and its memory
+            // pressure backstop pauses starts. The limit must still be one the node can
+            // give. The one limit that is not a share is the whole host ([`Worker::exclusive`]):
+            // that action runs alone.
             LeaseKind::Action | LeaseKind::Vm => {
-                !self.whole && self.free().fits(&request.resources)
+                !self.whole
+                    && self.free().fits(&request.resources.without_memory())
+                    && request.resources.memory_bytes <= self.capacity.memory_bytes
+                    && (!self.exclusive(request) || self.leases == 0)
             }
         };
         room && (!request.needs.wants_device() || self.free_device(&request.needs).is_some())
@@ -409,7 +428,9 @@ impl Scheduler {
         self.reservations.get(&operation)
     }
 
-    /// What is booked on `worker`, if it is registered.
+    /// What is booked on `worker`, if it is registered. Its memory is what the leases'
+    /// limits add up to: a record, which admission does not read (an action's memory is
+    /// the limit it first runs under).
     #[must_use]
     pub fn booked(&self, worker: &WorkerId) -> Option<Resources> {
         self.workers.get(worker).map(|w| w.booked)
@@ -517,7 +538,9 @@ impl Scheduler {
                 if let Some(device) = &held.device {
                     w.devices.remove(device);
                 }
-                if op.request.kind == LeaseKind::WholeMachine {
+                // A whole-machine lease, or an action at the whole host's memory, is
+                // the node's only lease.
+                if w.leases == 0 {
                     w.whole = false;
                 }
             }
@@ -552,7 +575,9 @@ impl Scheduler {
     /// One placement round. Each queued operation, most urgent first, goes to the first
     /// live worker (in name order) that serves its lease kind, satisfies its platform
     /// and has room for it, up to [`PLACEMENT_ROUND`] grants. An action has room where
-    /// its whole request vector is free and no whole-machine lease is held; a
+    /// its CPUs, GPUs and VM slots are free and no whole-machine lease is held; its
+    /// memory is only checked against the worker's, never against what other leases
+    /// hold ([`Worker::has_room`]); a
     /// whole-machine lease only on a worker that holds no lease, and it books all of it.
     ///
     /// A whole-machine operation that fits nowhere holds one worker that could run it

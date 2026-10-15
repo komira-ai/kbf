@@ -4,6 +4,18 @@ Status: design, revision 5 (one connection; the cache persists from its first PR
 Every "today" claim cites a file on `main` at `d7f25cf` (#524). Every number marked
 *unmeasured* is an estimate that the PR introducing it must replace with a measurement.
 
+**Flags, as built.** This design names `--cache-dir`, `--cache-max-bytes`,
+`--cache-min-free-bytes`, `--cache-link-concurrency`, `--tree-dir`, `--tree-max-bytes`,
+`--tree-min-files`, `--tree-max-mounts` and `--scratch`. They are not flags any more: the
+daemon takes one directory, `--data-dir` (default `/var/lib/kbf`), holding `leases/` (what
+`--scratch` was), `cache/` (`--cache-dir`) and `trees/` (`--tree-dir`) on one filesystem,
+and one optional `--data-max-bytes`. The cache and the trees are on by default under the
+container driver and the native driver on macOS, and their budgets come from the filesystem: the cache may keep half and
+the trees a quarter of its size less a floor of 5% (at least 1 GiB), and the cache's
+`--cache-min-free-bytes` is that floor. The link concurrency (64) and the trees' thresholds
+(256 files, 8 mounts) are constants. Read each flag below as the part of the data directory
+it names ([storage-node.md](../deploy/storage-node.md#the-daemons-data-directory)).
+
 This document covers four changes to how a kbf-daemon moves blobs:
 
 1. bounded concurrent fetch and upload (fix 1);
@@ -1015,8 +1027,8 @@ left open):
   build of zig to log `inputs: files=...` from, so the count per input root waits for
   the first cached farm node.
 
-**C2 as built** (the native driver on macOS; `--cache-dir` with `--cache-max-bytes` on a
-macOS node; what it leaves out follows):
+**C2 as built** (the native driver on macOS, which opens `<data-dir>/cache` like the container
+driver, sized the same way; what it leaves out follows):
 
 - Every name of a lease is its own `clonefile` of the entry (`LinkMode::Clone`, chosen
   at open when the cache and the scratch directory share a volume; another volume is
@@ -1025,21 +1037,23 @@ macOS node; what it leaves out follows):
   list: `NativeRuntime::prepare` passes none. A clone the filesystem refuses (`ENOTSUP`,
   `EXDEV`) is a copy of that name, one fallback per key; an entry gone (`ENOENT`)
   removes the names already cloned and settles the key again.
-- The cache directory must be outside `--scratch`; the node refuses one inside
-  (`off:unusable`) because lease sweeps clean the scratch directory. The sandbox lets an
-  action write only its lease directory, which is what keeps the entries out of its
-  reach (C-3b); the node still runs actions as the daemon's user, so the Linux native
-  driver stays uncached (C-19).
+- The cache directory is `<data-dir>/cache`, beside `<data-dir>/leases` and outside it
+  (lease sweeps clean `leases`). The sandbox lets an action write only its lease
+  directory, which is what keeps the entries out of its reach (C-3b); the node still
+  runs actions as the daemon's user, so the Linux native driver stays uncached (C-19).
+  A cache that cannot be opened warns `cache: off:<reason>` and the leases run
+  uncached.
 - The free-space floor skips `nlink > 1`; a clone adds no link, so on macOS the floor
   may evict an entry whose clones a running lease holds, which frees nothing until the
   lease ends. The byte budget is exact.
-- With `--tree-dir` and `--tree-max-bytes` (the container driver's flags) the native
-  driver also takes each large Directory node as one directory clone from a tree
-  store (C4c above); the store must be outside `--scratch` and needs the cache. The
-  lease logs `trees_cloned=`, `tree_files=` and `built=` beside the `inputs:` line.
+- The native driver also takes each large Directory node as one directory clone from the
+  tree store `<data-dir>/trees` (C4c above), made 0711 and outside `leases`; it needs the
+  cache, and is sized as the container driver's. A store that cannot be opened (or no
+  cache, or a filesystem too small) warns `trees: off:<reason>` and the inputs are
+  cloned file by file. The lease logs `trees_cloned=`, `tree_files=` and `built=` beside the `inputs:` line.
 - Not built: the dedicated APFS volume, Spotlight and backup exclusion, hard links for
-  pool lease users, and the link-concurrency measurement. `--cache-link-concurrency`
-  keeps its default of 64.
+  pool lease users, and the link-concurrency measurement. The link concurrency keeps
+  its constant of 64.
 - The lease logs `inputs: files=... fetched_bytes=... ms=<elapsed>` as the container
   driver does, with the time of the whole materialization.
 

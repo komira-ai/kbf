@@ -45,11 +45,19 @@ impl Subject for Local {
             "kbf-server".to_owned(),
             "--listen=127.0.0.1:0".to_owned(),
             "--worker-listen=127.0.0.1:0".to_owned(),
+            format!(
+                "--cold-store=file://{}",
+                self.scratch.join(format!("cold-{n}")).display()
+            ),
         ];
+        // The hot store holds the metadata log too; without one it is a directory of
+        // its own.
         if self.tier {
-            let dir = self.scratch.join(format!("tier-{n}"));
-            argv.push(format!("--write-tier-dir={}", dir.display()));
-            argv.push("--write-tier-bytes=1073741824".to_owned());
+            let dir = self.scratch.join(format!("hot-{n}"));
+            argv.push(format!("--hot-store=file://{}", dir.display()));
+        } else {
+            let dir = self.scratch.join(format!("meta-{n}"));
+            argv.push(format!("--meta-dir={}", dir.display()));
         }
         let args = kbf_server::Args::try_parse_from(argv).expect("flags");
         let never = || Ok(std::future::pending::<()>());

@@ -83,7 +83,7 @@ struct World {
 }
 
 fn help() -> String {
-    "--role --store --s3-endpoint --s3-bucket --s3-region --s3-prefix --s3-conditional-put \
+    "--role --cold-store --meta-dir \
      --listen --worker-listen --worker-tls-cert --worker-tls-key --worker-client-ca"
         .to_owned()
 }
@@ -202,9 +202,9 @@ fn steps(plan: &Plan) -> Vec<String> {
 
 fn exec_start() -> String {
     format!(
-        "{STATE}/bin/kbf-server --role all --store s3 --s3-endpoint http://192.0.2.20:30900 \
-         --s3-bucket kbf-pilot-cas --s3-region us-east-1 --s3-prefix kbf/ --s3-conditional-put \
-         --listen 192.0.2.10:8980 --worker-listen 192.0.2.10:8981 \
+        "{STATE}/bin/kbf-server --role all \
+         --cold-store s3://kbf-pilot-cas/kbf/?endpoint=http://192.0.2.20:30900&region=us-east-1&conditional-put=true \
+         --meta-dir {STATE}/meta --listen 192.0.2.10:8980 --worker-listen 192.0.2.10:8981 \
          --worker-tls-cert {PKI}/server.pem --worker-tls-key {PKI}/server.key \
          --worker-client-ca {PKI}/ca.pem"
     )
@@ -615,10 +615,10 @@ fn each_host_defect_is_refused_before_any_step() {
         ),
         (
             |_, w, _| {
-                let h = help().replace(" --s3-conditional-put", "");
+                let h = help().replace(" --meta-dir", "");
                 w.borrow_mut().help = h;
             },
-            "/opt/new/kbf-server has no --s3-conditional-put (its --help does not list it), which its unit passes",
+            "/opt/new/kbf-server has no --meta-dir (its --help does not list it), which its unit passes",
         ),
         (
             |e, _, _| {
@@ -841,7 +841,7 @@ fn flags_and_the_config_home_are_used() {
         service.contains("ExecStart=/srv/state/bin/kbf-server "),
         "{service}"
     );
-    assert!(!service.contains("--s3-conditional-put"), "{service}");
+    assert!(!service.contains("conditional-put"), "{service}");
 }
 
 /// Catches the interface check passing on `ip`'s exit status alone (an interface

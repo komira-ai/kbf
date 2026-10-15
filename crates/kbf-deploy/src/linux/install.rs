@@ -16,8 +16,8 @@
 //! 2. `kbf.slice`, the MinIO drop-in, `kbf-server.service` and `kbf-daemon.service`
 //!    under `/etc/systemd/system` (0644); these and the binaries are root's (uid and
 //!    gid 0), so one with the right bytes and mode that another user owns is replaced;
-//! 3. the Raft directory (`KBF_META_LOG=raft`) and the build scratch, 0700, owned by
-//!    their service's user;
+//! 3. the metadata directory (`KBF_META_DIR`, 0700, the server's user's) and the data
+//!    directory (`KBF_DATA_DIR`, 0755, the daemon's user's);
 //! 4. when a binary or unit changed: `daemon-reload`, then enable and restart
 //!    kbf-server and kbf-daemon; otherwise each is enabled and started only if it is
 //!    not; after any start, a wait of up to 60 s for kbf-server's `/readyz`.
@@ -34,7 +34,7 @@ use std::io::Write;
 use std::time::Duration;
 
 use super::check::check_texts;
-use super::config::{LinuxConfig, MetaLog};
+use super::config::LinuxConfig;
 use super::host::{
     self, HostError, SS, SYSTEMCTL, binary, inspect, note, parents, stat, tool, under, unit_is,
 };
@@ -123,17 +123,17 @@ fn plan_with<E: Exec>(
             note(out, format_args!("{path}: unchanged"))?;
         }
     }
-    let mut owned = vec![(&c.scratch_dir, &kbf)];
-    if c.meta_log == MetaLog::Raft {
-        owned.insert(0, (&c.raft_dir, &server));
-    }
-    for (path, user) in owned {
+    // The metadata directory is the server's alone; the data directory is searchable by
+    // others, for a rootless container's root (the daemon makes `leases` and `cache` 0700
+    // and its tree store 0711 itself).
+    let owned = [(&c.meta_dir, &server, 0o700), (&c.data_dir, &kbf, 0o755)];
+    for (path, user, mode) in owned {
         parents(exec, &mut planner, path)?;
         let owner = Owner {
             uid: user.uid,
             gid: user.gid,
         };
-        planner.dir(path.clone(), Perms::new(0o700), Some(owner))?;
+        planner.dir(path.clone(), Perms::new(mode), Some(owner))?;
     }
 
     let mut started = false;
@@ -377,7 +377,7 @@ pub fn plan_uninstall<E: Exec>(
         out,
         format_args!(
             "kept: the binaries, {}, {}, the bucket {} and the swapfile",
-            c.raft_dir, c.scratch_dir, c.s3_bucket
+            c.meta_dir, c.data_dir, c.s3_bucket
         ),
     )?;
     Ok(planner.finish())

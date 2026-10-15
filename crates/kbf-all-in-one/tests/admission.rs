@@ -32,6 +32,9 @@ struct Farm {
 /// Farms made by this process so far: each test has a directory of its own.
 static MADE: AtomicU64 = AtomicU64::new(0);
 
+/// Servers started by this process so far.
+static STARTED: AtomicU64 = AtomicU64::new(0);
+
 impl Farm {
     fn new(by: By) -> Self {
         let n = MADE.fetch_add(1, Ordering::SeqCst);
@@ -52,10 +55,14 @@ impl Farm {
     /// A server with the worker listener under mutual TLS and this farm's deny list,
     /// serving for as long as the test runs.
     async fn server(&self) -> kbf_server::ServerHandle {
+        // A store and a metadata log of its own for each server this farm starts.
+        let n = STARTED.fetch_add(1, Ordering::SeqCst);
         let args = kbf_server::Args::try_parse_from([
             "kbf-server".to_owned(),
             "--listen=127.0.0.1:0".to_owned(),
             "--worker-listen=127.0.0.1:0".to_owned(),
+            format!("--cold-store=file://{}", self.at(&format!("cold-{n}"))),
+            format!("--meta-dir={}", self.at(&format!("meta-{n}"))),
             format!("--worker-tls-cert={}", self.at("server.pem")),
             format!("--worker-tls-key={}", self.at("server.key")),
             format!("--worker-client-ca={}", self.at("ca.pem")),

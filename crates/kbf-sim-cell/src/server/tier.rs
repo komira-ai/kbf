@@ -58,7 +58,7 @@ pub const READ_AFTER: Duration = Duration::from_secs(2);
 /// The one server's id in the tier registry.
 const SERVER: ServerId = ServerId::new(1);
 
-/// A server's local write tier: `--write-tier-bytes`, `--write-tier-seal-after`, and
+/// A server's local write tier: the hot store's budget, its seal-after interval, and
 /// the size at which the open block is sealed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TierPlan {

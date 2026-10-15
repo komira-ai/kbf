@@ -82,8 +82,8 @@ No message a remote daemon sends changes: `kbf-daemon` still uses the transfer e
 ## Not done yet
 
 - **Production use.** The server half's scheduler state is in memory, so a restart of
-  the process loses every lease and operation, and with the default `--meta-log=memory`
-  the cache's index too (`--blob-dir` with `--meta-log=raft` keeps the cache). Until the
+  the process loses every lease and operation (the cache's index is kept: the server's
+  metadata log is on disk, under `--meta-dir` or the hot store). Until the
   scheduler's state is durable, all-in-one is a development shape.
 - **The walk's buffers.** A file the walk hashed is read again from the file to be
   stored (never hashed again); handing the walk's own buffer to the plane is a driver

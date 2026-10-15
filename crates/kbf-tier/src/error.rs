@@ -14,7 +14,7 @@ pub enum TierError {
         want: u64,
         /// The bytes already counted.
         used: u64,
-        /// `--write-tier-bytes`.
+        /// The hot store's budget.
         budget: u64,
     },
     /// A grouped range larger than a segment.

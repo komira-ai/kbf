@@ -234,7 +234,8 @@ mod fake {
             std::fs::create_dir_all(actions.join(&name)).expect("lease cgroup");
         }
         if defect("lease-left") {
-            std::fs::create_dir_all(work.join("leases").join(&name)).expect("lease dir");
+            std::fs::create_dir_all(work.join("data").join("leases").join(&name))
+                .expect("lease dir");
         }
         let secs = args
             .iter()
@@ -328,10 +329,11 @@ mod fake {
     fn systemd_run(args: &[String]) -> i32 {
         let unit = value(args, "--unit=").expect("a unit");
         let log = PathBuf::from(value(args, "StandardError=append:").expect("a log"));
-        let scratch = args.iter().position(|a| a == "--scratch");
-        let scratch = scratch
+        let data = args.iter().position(|a| a == "--data-dir");
+        let data = data
             .map(|i| PathBuf::from(&args[i + 1]))
-            .expect("a scratch");
+            .expect("a data directory");
+        let scratch = data.join("leases");
         std::fs::write(scratch.join("daemon-instance"), b"1\n").expect("claim");
         let delegated = args.windows(2).any(|w| w == ["-p", "Delegate=yes"]);
         if !delegated | defect("daemon-refuses") {
@@ -631,6 +633,7 @@ fn a_cell_that_does_everything_passes() {
     let server = cell.args("kbf-server");
     let expected = format!(
         "--listen 127.0.0.1:8980 --worker-listen 127.0.0.1:8981 \
+         --cold-store file://{w}/server-blobs --meta-dir {w}/server-meta \
          --worker-tls-cert {w}/pki/server.pem --worker-tls-key {w}/pki/server.key \
          --worker-client-ca {w}/pki/ca.pem --memory-ladder-gib 1,2,4"
     );
@@ -650,7 +653,7 @@ fn a_cell_that_does_everything_passes() {
              -E XDG_RUNTIME_DIR={rt} {bin}/kbf-daemon --driver container \
              --server https://127.0.0.1:8981 --cas https://127.0.0.1:8981 \
              --ca-cert {w}/pki/ca.pem --cert {w}/pki/client.pem --key {w}/pki/client.key \
-             --tls-server-name localhost --node-id cell-node-1 --scratch {w}/leases \
+             --tls-server-name localhost --node-id cell-node-1 --data-dir {w}/data \
              --actions-memory-max-gib 8",
             rt = cell.runtime.display(),
             bin = cell.dir.join("bin").display(),
