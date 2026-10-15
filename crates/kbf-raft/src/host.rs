@@ -181,10 +181,29 @@ impl<S: Storage, T: Transport, M: Machine> Host<S, T, M> {
         config: Config,
         mut storage: S,
         transport: T,
-        mut machine: M,
+        machine: M,
         entropy: u64,
     ) -> Result<Self, OpenError<S::Error, M::Error>> {
         let stored = storage.load().map_err(OpenError::Storage)?;
+        Self::open_stored(config, storage, stored, transport, machine, entropy)
+    }
+
+    /// [`Host::open`] from `stored`, what `storage` holds as the caller already read
+    /// it (a storage whose own open returns what it read): the host and the storage
+    /// then come from one read, so a write landing between two reads cannot set them
+    /// apart.
+    ///
+    /// # Errors
+    ///
+    /// [`OpenError`] naming the part that refused (never [`OpenError::Storage`]).
+    pub fn open_stored(
+        config: Config,
+        storage: S,
+        stored: Stored,
+        transport: T,
+        mut machine: M,
+        entropy: u64,
+    ) -> Result<Self, OpenError<S::Error, M::Error>> {
         let base = stored.base();
         if let Some(snapshot) = &stored.snapshot {
             machine.restore(snapshot).map_err(OpenError::Machine)?;

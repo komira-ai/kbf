@@ -11,8 +11,15 @@
 //!   whose answer was lost): the footer is read back; if it is ours the flush is done,
 //!   else `FlushConflict` commits, the object stays staged and is read locally, and the
 //!   flusher stops retrying it.
-//! - **A record that fails its digest** on re-read: not uploaded; the object is marked
-//!   unreachable as corrupt and its block discarded.
+//! - **Every record is hashed** before the PUT, on the cache's hashing pool (off the
+//!   runtime workers): the daemon's digests were trusted when the upload was
+//!   acknowledged, so this is where they are checked. A record that fails its digest
+//!   is never uploaded: it is counted (`kbf_tier_flush_digest_mismatch_total`), logged
+//!   as an error with its digest and object, and dropped. The object is marked
+//!   unreachable as corrupt and its block discarded, and the records that did hash to
+//!   their digests are staged again as an object of their own (one more block, one
+//!   more flush), so the rest of the segment still reaches the store and stays
+//!   readable; only the bad digest is left unavailable, to be uploaded again.
 //! - **Anything else** (the store or the log unavailable, a read-back that disagrees
 //!   after our own PUT, a disk read error) is retried with backoff,
 //!   [`FLUSH_BACKOFF_FIRST`] doubling to [`FLUSH_BACKOFF_MAX`].
@@ -29,6 +36,8 @@ use kbf_segments::{Footer, IndexEntry};
 use kbf_types::Digest;
 
 use super::tier::{Staging, blocking};
+use super::upload::BuiltSegment;
+use super::verify::{Verified, verify_records};
 use super::{Cache, CacheError, unexpected};
 use crate::meta_log::MetaLog;
 
@@ -59,8 +68,11 @@ pub struct FlushRound {
     pub flushed: Vec<ObjectId>,
     /// Objects whose key holds another object: `FlushConflict` committed.
     pub conflicts: Vec<ObjectId>,
-    /// Objects with a record that failed its digest: marked unreachable as corrupt.
+    /// Objects with a record that failed its digest: marked unreachable as corrupt, the
+    /// records that were sound staged again as an object of their own.
     pub corrupt: Vec<ObjectId>,
+    /// The digests of the records that failed theirs, in the order they were found.
+    pub dropped: Vec<Digest>,
     /// Objects whose flush failed this round, and how long until their next attempt.
     pub retrying: Vec<(ObjectId, Duration)>,
 }
@@ -69,7 +81,8 @@ pub struct FlushRound {
 enum Flushed {
     Done,
     Conflict,
-    Corrupt,
+    /// Records failed their digests; these are their digests.
+    Corrupt(Vec<Digest>),
 }
 
 impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
@@ -120,9 +133,10 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
                     staging.done(object);
                     round.conflicts.push(object);
                 }
-                Ok(Flushed::Corrupt) => {
+                Ok(Flushed::Corrupt(digests)) => {
                     staging.done(object);
                     round.corrupt.push(object);
+                    round.dropped.extend(digests);
                 }
                 Err(e) => {
                     staging.counters.flush_failures.add(1);
@@ -147,14 +161,18 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         let tier = std::sync::Arc::clone(&staging.tier);
         let n = usize::try_from(len).unwrap_or(usize::MAX);
         let records = blocking(Box::new(move || tier.read(object, 0, n))).await?;
-        let Some(entries) = entries(&records, blobs) else {
-            tracing::error!(%object, "a staged record fails its digest; the object is not flushed and is marked corrupt");
-            self.mark_unreachable(object, UnreachableReason::Corrupt)
-                .await?;
-            let _ = staging.tier.discard(object);
-            staging.counters.corrupt.add(1);
-            return Ok(Flushed::Corrupt);
-        };
+        let listed = blobs.to_vec();
+        let (records, found) = self
+            .hashing()
+            .compute(move || {
+                let found = verify_records(&records, &listed);
+                (records, found)
+            })
+            .await?;
+        if !found.bad.is_empty() {
+            return self.drop_mismatched(staging, object, &records, found).await;
+        }
+        let entries = found.good;
         let footer = encode_footer(len, &entries);
         let total = len + footer.len() as u64;
         let ours = Footer::parse(&footer, total)?;
@@ -203,6 +221,62 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         Ok(Flushed::Conflict)
     }
 
+    /// Handles a staged object with records that fail their digests: counts and logs
+    /// each (never uploaded), marks the object unreachable as corrupt (its blobs are
+    /// unavailable, and a re-upload heals them), frees its block, and stages the
+    /// records that hashed to their digests again as an object of their own. A failure
+    /// of that last step is logged, not retried: the object has left the flusher's
+    /// queue, and those blobs are unavailable until uploaded again.
+    async fn drop_mismatched(
+        &self,
+        staging: &Staging,
+        object: ObjectId,
+        records: &[u8],
+        found: Verified,
+    ) -> Result<Flushed, CacheError> {
+        for bad in &found.bad {
+            tracing::error!(%object, digest = %bad.claimed, found = %bad.actual, "a staged record fails its digest; it is dropped and never flushed");
+        }
+        staging.counters.digest_mismatch.add(found.bad.len() as u64);
+        staging.counters.corrupt.add(1);
+        self.mark_unreachable(object, UnreachableReason::Corrupt)
+            .await?;
+        let _ = staging.tier.discard(object);
+        if let Err(e) = self.restage(records, &found.good).await {
+            tracing::error!(%object, error = %e, sound = found.good.len(), "the sound records of a corrupt staged object could not be staged again; they are unavailable until uploaded again");
+        }
+        let dropped = found.bad.iter().map(|m| m.claimed).collect();
+        Ok(Flushed::Corrupt(dropped))
+    }
+
+    /// Stages `good` (digest-sorted records found at their offsets in `records`) as a
+    /// segment of their own, as an upload does: on the tier, else PUT.
+    async fn restage(&self, records: &[u8], good: &[IndexEntry]) -> Result<(), CacheError> {
+        if good.is_empty() {
+            return Ok(());
+        }
+        let mut body = Vec::new();
+        let mut entries = Vec::with_capacity(good.len());
+        for entry in good {
+            // Hashed in range by `verify_records`.
+            let from = entry.offset as usize;
+            let to = from + entry.digest.size_bytes as usize;
+            entries.push(IndexEntry {
+                offset: body.len() as u64,
+                ..*entry
+            });
+            body.extend_from_slice(&records[from..to]);
+        }
+        let footer = encode_footer(body.len() as u64, &entries);
+        body.extend_from_slice(&footer);
+        let sound = BuiltSegment {
+            body: Bytes::from(body),
+            entries,
+            verified: true,
+        };
+        self.store_upload(vec![sound]).await.map(drop)
+    }
+
     /// Commits a tier command whose refusal would mean the flusher and the committed
     /// state disagree: anything but its success is an internal error.
     async fn commit_tier(&self, command: Command) -> Result<(), CacheError> {
@@ -211,26 +285,6 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
             other => Err(unexpected(&other)),
         }
     }
-}
-
-/// The footer's index entries for `blobs` (sorted by digest) over `records`, or `None`
-/// if a record is not all there or fails its digest.
-fn entries(records: &[u8], blobs: &[(Digest, u64)]) -> Option<Vec<IndexEntry>> {
-    let mut out = Vec::with_capacity(blobs.len());
-    for (digest, offset) in blobs {
-        let from = usize::try_from(*offset).ok()?;
-        let to = from.checked_add(usize::try_from(digest.size_bytes).ok()?)?;
-        let record = records.get(from..to)?;
-        if kbf_segments::sha256(record) != *digest {
-            return None;
-        }
-        out.push(IndexEntry {
-            digest: *digest,
-            offset: *offset,
-            crc32c: kbf_segments::crc32c(record),
-        });
-    }
-    Some(out)
 }
 
 #[cfg(test)]

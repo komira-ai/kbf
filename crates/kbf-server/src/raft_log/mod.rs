@@ -35,7 +35,8 @@
 //! - **Farm time** continues from the committed one: at open the log takes the
 //!   applied farm time as its base, and [`RaftMetaLog::now`] is the base plus the time
 //!   since the open, so it never goes back across restarts. A task commits
-//!   `Tick(now)` every [`TICK`] while the log is open. A tick is a proposal, which
+//!   `Tick(now)` every [`TICK`] while the log is open, the first one [`TICK`] after
+//!   the open. A tick is a proposal, which
 //!   only a leader may make.
 //! - **Machine version.** A new log is at [`MachineVersion::V1`], whose entries are
 //!   format 1. [`RaftMetaLog::raise_machine_version`] commits a `MachineVersion`
@@ -48,6 +49,10 @@
 //!   refused alone while the rest of its batch commits.
 //! - **A storage error** stops the log for the life of the process: every later
 //!   commit is refused `Unavailable`.
+//! - **Dropping the log** stops its tick task, waits for a batch the committer is
+//!   writing, and refuses every later one `Unavailable`, so nothing reaches the raft
+//!   directory once the drop returns and the directory can be opened again in the
+//!   same process (kbf#651).
 //!
 //! Not yet: snapshots (the metadata state has no snapshot encoding, so the log is
 //! never compacted, and a directory holding a snapshot is refused), more than one
@@ -62,6 +67,7 @@ use std::io::{self, Read};
 use std::num::NonZeroU64;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, Weak};
 use std::time::Duration;
 
@@ -178,7 +184,8 @@ pub enum RaftLogError {
 }
 
 /// The metadata log as a single-voter Raft log in one directory (see the module
-/// docs). Dropping it stops its tick task.
+/// docs). Dropping it stops its tick task and waits for a commit being written (one
+/// sync at most); a commit queued after that is refused.
 pub struct RaftMetaLog<F: Fs = StdFs> {
     shared: Arc<Shared<F>>,
     ticker: AbortHandle,
@@ -202,6 +209,8 @@ struct Shared<F: Fs> {
     opened: Instant,
     /// The `Bootstrap` entries applied by the time the log opened.
     bootstraps: usize,
+    /// Set when the log is dropped: a batch that takes `host` after it is refused.
+    closed: AtomicBool,
 }
 
 impl RaftMetaLog<StdFs> {
@@ -299,7 +308,8 @@ where
             }
         };
         let prefix = KeyPrefix::new(format!("{prefix_root}{log_id}/"))?;
-        let (store, _) = Store::open(fs, Options::default())?;
+        // One read of the directory for both the store and the host (kbf#689).
+        let (store, stored) = Store::open(fs, Options::default())?;
         let config = Config {
             id: ME,
             membership: Membership::new([ME], [])?,
@@ -307,7 +317,7 @@ where
             heartbeat_ticks: 1,
             max_entries_per_append: 1,
         };
-        let mut host = Host::open(config, store, NoTransport, machine, 0)?;
+        let mut host = Host::open_stored(config, store, stored, NoTransport, machine, 0)?;
         // A single voter elects itself within two election timeouts; winning commits
         // the term's blank entry, which applies every entry before it.
         while host.core().role() != Role::Leader {
@@ -342,6 +352,7 @@ where
             log_id,
             prefix,
             opened: Instant::now(),
+            closed: AtomicBool::new(false),
         });
         let ticker = tokio::spawn(tick_every(Arc::downgrade(&shared))).abort_handle();
         Ok(Self {
@@ -442,8 +453,13 @@ impl<F: Fs> fmt::Debug for RaftMetaLog<F> {
 }
 
 impl<F: Fs> Drop for RaftMetaLog<F> {
+    /// A committer runs on the blocking pool and outlives this handle: the batch it
+    /// is writing holds `host`, so taking `host` here waits for that batch, and every
+    /// batch that takes `host` after `closed` is set is refused.
     fn drop(&mut self) {
         self.ticker.abort();
+        self.shared.closed.store(true, Ordering::SeqCst);
+        drop(self.shared.lock());
     }
 }
 
@@ -578,13 +594,16 @@ where
             })
             .collect();
         let count = entries.len();
-        let proposed: Vec<Answer> = match host.propose_batch(entries) {
+        // Checked under `host`, which the drop takes after setting `closed`.
+        let batch = still_open(&self.closed)
+            .and_then(|()| host.propose_batch(entries).map_err(unavailable));
+        let proposed: Vec<Answer> = match batch {
             Ok(first) => (first.0..)
                 .take(count)
                 .map(|index| host.machine_mut().take_answer(LogIndex(index)))
                 .map(|answer| answer.ok_or(MetaLogError::Unavailable(NOT_APPLIED.to_owned())))
                 .collect(),
-            Err(e) => vec![Err(unavailable(e)); count],
+            Err(e) => vec![Err(e); count],
         };
         let mut proposed = proposed.into_iter();
         encoded
@@ -606,11 +625,22 @@ where
 
 const NOT_APPLIED: &str = "the metadata log did not apply its own proposal";
 
+const CLOSED: &str = "the metadata log was closed";
+
 const NOT_ANSWERED: &str = "the metadata log's committer stopped without answering";
 
 /// A log error as the front sees it: the leader could not answer.
 fn unavailable(e: impl Display) -> MetaLogError {
     MetaLogError::Unavailable(format!("the metadata log: {e}"))
+}
+
+/// `Unavailable` once the log has been dropped.
+fn still_open(closed: &AtomicBool) -> Result<(), MetaLogError> {
+    if closed.load(Ordering::SeqCst) {
+        Err(MetaLogError::Unavailable(CLOSED.to_owned()))
+    } else {
+        Ok(())
+    }
 }
 
 /// The machine's decode failure, if an entry stopped it.
@@ -623,14 +653,16 @@ fn decoded(machine: &MetaMachine) -> Result<(), RaftLogError> {
     })
 }
 
-/// Commits farm time every [`TICK`] for as long as the log is open. An error is
-/// dropped: it has stopped the log, and the next commit reports it.
+/// Commits farm time every [`TICK`] for as long as the log is open, the first one
+/// [`TICK`] after the open: at the open, farm time is the base the log just applied,
+/// so a tick then would commit nothing new. An error is dropped: it has stopped the
+/// log, and the next commit reports it.
 async fn tick_every<F>(shared: Weak<Shared<F>>)
 where
     F: Fs + Send + 'static,
     F::File: Send + 'static,
 {
-    let mut every = tokio::time::interval(TICK);
+    let mut every = tokio::time::interval_at(Instant::now() + TICK, TICK);
     every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         every.tick().await;

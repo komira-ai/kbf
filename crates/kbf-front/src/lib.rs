@@ -46,6 +46,7 @@ mod bytestream;
 mod cache;
 mod capabilities;
 mod cas;
+mod cpu;
 mod execution;
 mod meta_log;
 pub mod metrics;

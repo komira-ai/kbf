@@ -162,3 +162,100 @@ fn rustix_ids() -> (u32, u32) {
     let meta = std::fs::metadata(tls("ids")).expect("a directory of ours");
     (meta.uid(), meta.gid())
 }
+
+/// Catches the `--tree-*` flags accepted without what they need (clap's `requires`):
+/// a store without a budget would be unbounded, one without `--cache-dir` would have
+/// no cache to link its files from, and a budget without a store does nothing; a
+/// threshold of 0 would make every directory a tree. Each exits 2 naming the missing
+/// flag, before any driver starts.
+#[test]
+fn the_tree_flags_need_their_store_budget_and_cache() {
+    let run = |flags: &[&str]| {
+        let mut args = vec!["--driver=native", "--cas=https://127.0.0.1:1"];
+        args.extend_from_slice(flags);
+        let out = std::process::Command::new(BIN)
+            .args(&args)
+            .output()
+            .expect("run");
+        (
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+    for (flags, names) in [
+        (&["--tree-dir=/t", "--cache-dir=/c"][..], "--tree-max-bytes"),
+        (&["--tree-dir=/t", "--tree-max-bytes=9"][..], "--cache-dir"),
+        (&["--tree-max-bytes=9"][..], "--tree-dir"),
+        (
+            &[
+                "--tree-dir=/t",
+                "--tree-max-bytes=9",
+                "--cache-dir=/c",
+                "--tree-min-files=0",
+            ][..],
+            "--tree-min-files",
+        ),
+    ] {
+        let (code, stderr) = run(flags);
+        assert_eq!(code, Some(2), "{flags:?}: {stderr}");
+        assert!(stderr.contains(names), "{flags:?}: {stderr}");
+    }
+}
+
+/// Catches the tree store not opened by the container driver (the `trees` field of the
+/// cache the flags give it), and the native driver using one: the container daemon logs
+/// `trees: <dir>: 0 trees` and has made the store's directory 0700; the native daemon
+/// warns `trees: off:native` and never makes it.
+#[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "the container driver is Linux-only"
+)]
+fn a_container_node_opens_its_tree_store_and_a_native_one_never_does() {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let scratch = tls("trees-scratch").join("leases");
+        let base = tls("trees-dirs");
+        let (cache, trees) = (base.join("cache"), base.join("trees"));
+        std::fs::create_dir_all(&cache).expect("cache dir");
+        let flags = [
+            format!("--cache-dir={}", cache.display()),
+            "--cache-max-bytes=1000000".to_owned(),
+            format!("--tree-dir={}", trees.display()),
+            "--tree-max-bytes=1000000".to_owned(),
+            "--tree-min-files=7".to_owned(),
+            "--tree-max-mounts=3".to_owned(),
+        ];
+        let (flags, bin) = container("trees-open", &scratch, &flags);
+        let (status, log) = runs_until_sigterm_logged("trees-open", &flags, Some(&bin));
+        assert!(status.success(), "{status}: {log:#?}");
+        assert!(
+            logged(&log, &["trees: ", "0 trees"]) && logged(&log, &["min_files=7 max_mounts=3"]),
+            "{log:#?}"
+        );
+        // Searchable by others (a rootless runtime's container root), not listable.
+        let mode = std::fs::metadata(&trees)
+            .expect("store dir")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o711);
+
+        let native = base.join("native-trees");
+        let flags = [
+            "--driver=native".to_owned(),
+            "--cas=https://127.0.0.1:1".to_owned(),
+            format!("--scratch={}", base.join("native-leases").display()),
+            format!("--cache-dir={}", cache.display()),
+            "--cache-max-bytes=1000000".to_owned(),
+            format!("--tree-dir={}", native.display()),
+            "--tree-max-bytes=1000000".to_owned(),
+        ];
+        let one = one_native_daemon();
+        let (status, log) = runs_until_sigterm_logged("trees-native", &flags, None);
+        drop(one);
+        assert!(status.success(), "{status}: {log:#?}");
+        assert!(logged(&log, &["trees: off:native"]), "{log:#?}");
+        assert!(!native.exists(), "the native daemon made the store");
+    }
+}
