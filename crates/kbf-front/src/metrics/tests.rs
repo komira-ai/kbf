@@ -205,6 +205,14 @@ fn every_family_is_printed_once_with_its_type() {
             "kbf_sched_leases gauge",
             "kbf_tier_in_flight gauge",
             "kbf_meta_commit_seconds histogram",
+            "kbf_execute_requests_total counter",
+            "kbf_execute_errors_total counter",
+            "kbf_execute_in_flight gauge",
+            "kbf_execute_queued gauge",
+            "kbf_execute_prepare_seconds histogram",
+            "kbf_execute_dispatch_seconds histogram",
+            "kbf_execute_queued_seconds histogram",
+            "kbf_execute_total_seconds histogram",
         ]
     );
     assert_eq!(lines(&text, "# HELP ").len(), types.len());
@@ -234,4 +242,57 @@ fn every_family_is_printed_once_with_its_type() {
         .map(|c| format!("kbf_meta_commit_seconds_count{{command=\"{c}\"}} 0"))
         .collect();
     assert_eq!(commits, expected);
+}
+
+/// Catches an Execute guard that does not give back `in_flight` and `queued` however
+/// the stream ends (a caller that leaves while the operation is queued would leave both
+/// raised for ever), a stream counted as answered without its done operation, a
+/// queued time observed more than once or when the stream never left `QUEUED`, and a
+/// WaitExecution stream that feeds anything but `in_flight`.
+#[test]
+fn an_execute_is_recorded_however_its_stream_ends() {
+    let metrics = Arc::new(ExecuteMetrics::default());
+
+    // Answered: dispatched, queued, executing, done.
+    let mut answered = metrics.execute();
+    assert_eq!(metrics.in_flight.get(), 1);
+    answered.dispatching();
+    answered.dispatched(true);
+    assert_eq!(metrics.queued.get(), 1);
+    answered.update(true, false);
+    assert_eq!(metrics.queued.get(), 1, "still QUEUED");
+    answered.update(false, false);
+    assert_eq!(metrics.queued.get(), 0);
+    answered.update(false, true);
+    drop(answered);
+    assert_eq!((metrics.requests.get(), metrics.errors.get()), (1, 0));
+
+    // Left by its caller while queued.
+    let mut left = metrics.execute();
+    left.dispatching();
+    left.dispatched(true);
+    assert_eq!((metrics.in_flight.get(), metrics.queued.get()), (1, 1));
+    drop(left);
+    assert_eq!((metrics.in_flight.get(), metrics.queued.get()), (0, 0));
+    assert_eq!((metrics.requests.get(), metrics.errors.get()), (2, 1));
+
+    // Refused by the scheduler: its call was timed, and it was never queued.
+    let mut refused = metrics.execute();
+    refused.dispatching();
+    refused.dispatched(false);
+    assert_eq!(metrics.queued.get(), 0);
+    drop(refused);
+    assert_eq!((metrics.requests.get(), metrics.errors.get()), (3, 2));
+
+    // A WaitExecution stream is open, and nothing else.
+    let waiting = metrics.wait();
+    assert_eq!(metrics.in_flight.get(), 1);
+    drop(waiting);
+    assert_eq!(metrics.in_flight.get(), 0);
+    assert_eq!((metrics.requests.get(), metrics.errors.get()), (3, 2));
+
+    assert_eq!(metrics.prepare.count(), 3);
+    assert_eq!(metrics.dispatch.count(), 3);
+    assert_eq!(metrics.queued_seconds.count(), 1);
+    assert_eq!(metrics.total.count(), 3);
 }

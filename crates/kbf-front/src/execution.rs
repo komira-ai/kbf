@@ -99,6 +99,7 @@ use kbf_invocation::{CallKind, ExecuteAnswer};
 use crate::cache::{Cache, CacheError};
 use crate::meta_log::MetaLog;
 use crate::metrics::CacheMetrics;
+use crate::metrics::OpenExecute;
 use crate::recorder::{ExecuteCall, Recorder, listing};
 use crate::request_metadata::CallMetadata;
 use crate::wire;
@@ -354,6 +355,7 @@ where
         request: GrpcRequest<ExecuteRequest>,
     ) -> Result<Response<OperationStream>, Status> {
         let mut window = Presubmit::begin(self.cache.metrics());
+        let open = self.cache.metrics().execute.execute();
         let caller = kbf_auth::metadata(&request);
         let call = crate::request_metadata::call_metadata(&request);
         let request = request.into_inner();
@@ -365,7 +367,7 @@ where
             caller = %caller.public_display(),
             invocation = call.invocation_display()
         );
-        self.execute_authorized(request, &call, &caller, &mut window)
+        self.execute_authorized(request, &call, &caller, &mut window, open)
             .instrument(span)
             .await
     }
@@ -384,7 +386,12 @@ where
         };
         let execute = &*self.authorizers.execute;
         authorize(execute, &caller, WAIT_EXECUTION, &ticket.instance).await?;
-        Ok(Response::new(operations(ticket, self.closing.clone())))
+        let open = self.cache.metrics().execute.wait();
+        Ok(Response::new(operations(
+            ticket,
+            self.closing.clone(),
+            open,
+        )))
     }
 }
 
@@ -394,13 +401,16 @@ where
     O: ObjectStore + 'static,
     D: Dispatch,
 {
-    /// Execute, once authorized: an action-cache hit, or the operation's stream.
+    /// Execute, once authorized: an action-cache hit, or the operation's stream. `open`
+    /// is the call's metrics guard (started before authorization); it ends with the
+    /// call on an error or a cache hit, and with the stream otherwise.
     async fn execute_authorized(
         &self,
         request: ExecuteRequest,
         metadata: &CallMetadata,
         caller: &AuthenticationMetadata,
         window: &mut Presubmit<'_>,
+        mut open: OpenExecute,
     ) -> Result<Response<OperationStream>, Status> {
         wire::check_digest_function(request.digest_function)?;
         let action = wire::digest(request.action_digest.as_ref())?;
@@ -433,22 +443,29 @@ where
                 &Stage::Done(Finished::Ran(Box::new(result))),
                 true,
             );
+            open.ok();
             return Ok(Response::new(Box::pin(stream::iter([Ok(done)]))));
         }
         let instance = request.instance_name;
         let (mut submission, command) = self.submission(instance.clone(), action, window).await?;
         submission.call =
             ExecuteCall::new(&self.recorder, metadata, caller, &instance, action, command);
+        open.dispatching();
         let submitting = Instant::now();
-        let ticket = self.dispatch.submit(submission);
+        let submitted = self.dispatch.submit(submission);
         window.submit = submitting.elapsed();
         self.cache
             .metrics()
             .execute_submit
             .observe_duration(window.submit);
-        let ticket = ticket?;
+        open.dispatched(submitted.is_ok());
+        let ticket = submitted?;
         tracing::debug!(%action, operation = %ticket.name, "submitted");
-        Ok(Response::new(operations(ticket, self.closing.clone())))
+        Ok(Response::new(operations(
+            ticket,
+            self.closing.clone(),
+            open,
+        )))
     }
 }
 
@@ -805,19 +822,20 @@ fn operation(name: &str, action: &Digest, stage: &Stage, cached: bool) -> Operat
 /// The operation as its stage changes: the stage now, then each change, ending after
 /// the done operation. A stage that stops changing before it is done (the operation was
 /// abandoned), or `closing` closing first (the server is going away), ends the stream
-/// UNAVAILABLE. A change already there is sent before a close is noticed.
-fn operations(ticket: Ticket, closing: Closing) -> OperationStream {
+/// UNAVAILABLE. A change already there is sent before a close is noticed. `open`
+/// (the call's metrics guard) is dropped with the stream, and told of each stage read.
+fn operations(ticket: Ticket, closing: Closing, open: OpenExecute) -> OperationStream {
     let Ticket {
         name,
         action,
         stage,
         ..
     } = ticket;
-    let state = Some((stage, closing, true));
+    let state = Some((stage, closing, open, true));
     Box::pin(stream::unfold(state, move |state| {
         let name = name.clone();
         async move {
-            let (mut stage, mut closing, first) = state?;
+            let (mut stage, mut closing, mut open, first) = state?;
             if !first {
                 let gone = tokio::select! {
                     biased;
@@ -833,7 +851,9 @@ fn operations(ticket: Ticket, closing: Closing) -> OperationStream {
                 }
             }
             let now = stage.borrow_and_update().clone();
-            let next = (!matches!(now, Stage::Done(_))).then_some((stage, closing, false));
+            let done = matches!(now, Stage::Done(_));
+            open.update(matches!(now, Stage::Queued | Stage::Waiting(_)), done);
+            let next = (!done).then_some((stage, closing, open, false));
             Some((Ok(operation(&name, &action, &now, false)), next))
         }
     }))
