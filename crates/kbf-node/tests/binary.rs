@@ -411,6 +411,32 @@ fn the_memory_backstop_is_on_only_with_a_readable_pressure_file() {
     );
 }
 
+/// A pause threshold that is not a percentage above 0 and at most 100 is a usage error
+/// (exit 2) naming the flag and the value.
+///
+/// Catches: a threshold the daemon cannot use starting anyway (0 pauses a node on any
+/// stall, 150 never pauses it), and a word taken as a number.
+#[test]
+fn a_pause_threshold_that_is_no_percentage_is_a_usage_error() {
+    let dir = tls("psi-bad");
+    for bad in ["0", "150", "lots"] {
+        let out = Command::new(BIN)
+            .args(base(&dir))
+            .args([
+                "--driver=fake",
+                &format!("--memory-pressure-pause-percent={bad}"),
+            ])
+            .output()
+            .expect("spawn");
+        assert_eq!(out.status.code(), Some(2), "{bad}: {}", out.status);
+        let stderr = String::from_utf8(out.stderr).expect("stderr is UTF-8");
+        assert!(
+            stderr.contains("--memory-pressure-pause-percent") && stderr.contains(bad),
+            "{bad}: {stderr}"
+        );
+    }
+}
+
 /// A reserve that leaves the daemon no CPU, or is more than the machine has, stops the
 /// start with a message naming the flag and the CPUs; a negative one is a usage error.
 ///
