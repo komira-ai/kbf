@@ -261,6 +261,7 @@ pub struct Placer {
     nodes: Vec<(u32, CpuSet)>,
     /// The booked CPU (millicpus) of the leases on each node, in `nodes` order.
     load: Mutex<Vec<u64>>,
+    #[allow(dead_code)]
     memory: NodeMemory,
 }
 
