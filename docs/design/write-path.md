@@ -216,7 +216,7 @@ native driver gathers its outputs in a `Spool` first (`Cas::put_spool`, which is
 - The idle time is `--segment-upload-idle-secs`. `Commit`'s reply lists the digests
   committed; a failed commit is the call's status.
 - Record hashing (section 6.11) runs on the blocking pool, never on a runtime worker, at
-  most `--cpu-threads` (default 4) jobs at once.
+  most `--cpu-threads` (default `max(2, reserve/2)`, from `--reserve-cpus`) jobs at once.
 - An upload's connection is found by the peer address of the worker listener's
   tracked connections (`Connections`); a connection's close is seen when the server
   drops its stream.
