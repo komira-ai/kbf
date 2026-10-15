@@ -155,7 +155,12 @@ impl Crun {
         id: &str,
         bundle: &Path,
     ) -> Result<(), String> {
-        let mut opts = GlobalOpts::new().command(&self.program).root(state);
+        let log = state.with_extension("log");
+        let mut opts = GlobalOpts::new()
+            .command(&self.program)
+            .root(state)
+            .log(&log)
+            .log_json();
         opts.custom_spawner(Arc::new(KillOnDrop));
         let client = opts.build().map_err(|e| self.refused(&e))?;
         match client.run(id, bundle, None).await {
@@ -164,11 +169,17 @@ impl Crun {
                 status,
                 stdout,
                 stderr,
-            }) => Err(format!(
-                "crun run (helper {id}): {status}: {} {}",
-                stdout.trim(),
-                stderr.trim()
-            )),
+            }) => {
+                // What `crun` itself logged: the reason it failed, as opposed to the
+                // helper's own words on stderr.
+                let logged = std::fs::read_to_string(&log).unwrap_or_default();
+                Err(format!(
+                    "crun run (helper {id}): {status}: {} {} {}",
+                    stdout.trim(),
+                    stderr.trim(),
+                    crate::program::crun_words(&logged)
+                ))
+            }
             Err(e) => Err(format!("crun run (helper {id}): {e}")),
         }
     }

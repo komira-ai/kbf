@@ -30,12 +30,9 @@ fn kernel_log() -> String {
         |e| e.to_string(),
         |o| String::from_utf8_lossy(&o.stdout).into_owned(),
     );
-    let lines: Vec<&str> = text
-        .lines()
-        .filter(|l| l.contains("overlay") || l.contains("userns") || l.contains("apparmor"))
-        .collect();
-    let tail = lines.len().saturating_sub(15);
-    format!("kernel log: {:?}", &lines[tail..])
+    let lines: Vec<&str> = text.lines().collect();
+    let tail = lines.len().saturating_sub(25);
+    format!("kernel log: {:#?}", &lines[tail..])
 }
 
 /// `cell.run`, with the kernel log printed if the lease failed.
