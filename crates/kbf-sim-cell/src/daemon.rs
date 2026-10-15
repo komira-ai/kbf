@@ -63,6 +63,8 @@ struct Staging {
 pub struct FakeDaemon {
     server: NodeId,
     instance: String,
+    /// The instance's name without its incarnation, for [`FakeDaemon::revive`].
+    name: String,
     capacity: Resources,
     contact: Contact,
     stream: u64,
@@ -100,6 +102,7 @@ impl FakeDaemon {
     pub fn new(server: NodeId, instance: String, capacity: Resources) -> Self {
         Self {
             server,
+            name: instance.clone(),
             instance,
             capacity,
             contact: Contact::new(FENCE_AFTER),
@@ -127,6 +130,7 @@ impl FakeDaemon {
     #[must_use]
     pub fn in_process(server: NodeId, name: &str, capacity: Resources) -> Self {
         let mut daemon = Self::new(server, format!("{name}-1"), capacity);
+        daemon.name = name.to_owned();
         daemon.in_process = true;
         daemon
     }
@@ -158,9 +162,7 @@ impl FakeDaemon {
         self.dead = false;
         self.reviving = true;
         self.incarnation += 1;
-        if let Some((name, _)) = self.instance.rsplit_once('-') {
-            self.instance = format!("{name}-{}", self.incarnation);
-        }
+        self.instance = format!("{}-{}", self.name, self.incarnation);
     }
 
     /// The runs, staged outputs and unacknowledged results lost with the process, over
@@ -491,64 +493,60 @@ mod tests {
     fn the_daemon_half_dies_with_its_process_and_starts_again_as_a_new_instance() {
         let mut d =
             FakeDaemon::in_process(NodeId::from("server"), "daemon-0", Resources::new(1_000, 1));
+        let lease = |seq| LeaseId::new(1, seq);
         d.apply(input(0, Event::Start));
         d.apply(message(1, welcome(1)));
         d.apply(message(2, start(1, 1)));
         d.apply(message(3, start(1, 2)));
+        // A resent `Start` of a running lease runs nothing more.
+        d.apply(message(4, start(1, 1)));
+        assert_eq!(runs(&d), [lease(1), lease(2)]);
         d.take_outputs();
-        // Both runs end; each output is uploaded, and only a stored one reports.
+        // Both runs end; each output is uploaded, and only a stored one reports. (No
+        // heartbeat was acknowledged, so the poll also opens stream 2.)
         d.apply(input(30_000, Event::Timer { tag: T_POLL }));
-        let uploads = d.take_outputs();
+        let uploads = format!("{:?}", d.take_outputs());
         let first = output_of(&action(1));
-        assert!(
-            uploads.iter().any(
-                |o| matches!(o, Output::Send { msg: Msg::Upload { digest }, .. } if *digest == first)
-            ),
-            "{uploads:?}"
-        );
+        let upload = format!("Upload {{ digest: {first:?} }}");
+        assert!(uploads.contains(&upload), "{uploads}");
         assert!(
             d.reported().is_empty(),
             "reported before its output was stored"
         );
-        d.apply(message(30_001, Msg::Uploaded { digest: first }));
-        assert_eq!(
-            d.reported().iter().copied().collect::<Vec<_>>(),
-            [LeaseId::new(1, 1)]
-        );
+        d.apply(message(30_000, welcome(2)));
+        // Neither a staged lease, nor one whose result is unacknowledged, nor one
+        // acknowledged, runs again; nor does any once contact is lost.
+        d.apply(message(30_001, start(2, 2)));
+        d.apply(message(30_002, Msg::Uploaded { digest: first }));
+        assert_eq!(d.reported().iter().copied().collect::<Vec<_>>(), [lease(1)]);
+        d.apply(message(30_003, start(2, 1)));
+        let acked = Msg::ResultAck {
+            lease: lease(1),
+            accepted: true,
+        };
+        d.apply(message(30_004, acked));
+        d.apply(message(30_005, start(2, 1)));
+        assert!(runs(&d).is_empty(), "a finished lease ran again");
+        d.apply(message(80_000, start(2, 9)));
+        assert!(runs(&d).is_empty(), "a Start taken without contact");
         d.die();
         d.die();
-        assert_eq!(
-            d.lost(),
-            2,
-            "one staged output and one unacknowledged result"
-        );
-        d.apply(message(30_002, start(1, 3)));
+        assert_eq!(d.lost(), 1, "the one staged output, counted once");
+        d.apply(message(80_001, start(2, 3)));
         assert!(runs(&d).is_empty(), "a dead process took a Start");
         d.take_outputs();
-        d.apply(input(31_000, Event::Timer { tag: T_POLL }));
-        assert!(
-            d.take_outputs()
-                .iter()
-                .all(|o| matches!(o, Output::Timer { .. }))
-        );
+        d.apply(input(81_000, Event::Timer { tag: T_POLL }));
+        let quiet = format!("{:?}", d.take_outputs());
+        assert!(!quiet.contains("Send"), "a dead process sent: {quiet}");
         d.revive();
         d.revive();
-        d.apply(input(32_000, Event::Timer { tag: T_POLL }));
-        let hello = d.take_outputs().into_iter().find_map(|o| match o {
-            Output::Send {
-                msg: Msg::Hello {
-                    stream, instance, ..
-                },
-                ..
-            } => Some((stream, instance)),
-            _ => None,
-        });
-        let (stream, instance) = hello.expect("a Hello at the first poll");
-        assert_eq!(instance, "daemon-0-2");
-        // Later than every stream of the dead process (1, and the one its gap opened).
-        assert_eq!(stream, 3);
-        d.apply(message(32_001, welcome(1)));
-        d.apply(message(32_002, start(1, 4)));
+        d.apply(input(82_000, Event::Timer { tag: T_POLL }));
+        // Later than every stream of the dead process.
+        let sent = format!("{:?}", d.take_outputs());
+        let hello = r#"Hello { stream: 3, instance: "daemon-0-2""#;
+        assert!(sent.contains(hello), "{sent}");
+        d.apply(message(82_001, welcome(2)));
+        d.apply(message(82_002, start(2, 4)));
         assert!(
             runs(&d).is_empty(),
             "a message of the dead process's stream was taken"

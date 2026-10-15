@@ -682,9 +682,8 @@ mod tests {
     #[test]
     fn an_answer_the_server_would_not_serve_breaks_answered_with_outputs() {
         let mut meta = MetaState::new(Retention::default());
-        let Applied::Epoch(epoch) = meta.execute(1, Command::AllocEpoch) else {
-            panic!("an epoch")
-        };
+        let epoch = kbf_meta::Epoch::new(1);
+        assert_eq!(meta.execute(1, Command::AllocEpoch), Applied::Epoch(epoch));
         let answered = [(FarmTime::from_millis(4), action(0))];
         let none = answered_with_outputs(answered, &meta);
         assert_eq!(property(none), Property::AnsweredWithOutputs);

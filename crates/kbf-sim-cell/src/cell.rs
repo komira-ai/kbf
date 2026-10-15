@@ -673,3 +673,19 @@ fn share_fate(sim: &mut Sim<CellNode>, half: &NodeId, was_up: bool) -> bool {
     }
     up
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Catches a fate shared with a node that is not a daemon: naming one changes
+    /// nothing, and the server's state is still returned.
+    #[test]
+    fn sharing_fate_with_a_node_that_is_not_a_daemon_changes_nothing() {
+        let mut sim: Sim<CellNode> = Sim::new(1, Faults::default());
+        let server = Server::new(ServerPlan::default(), store_id());
+        sim.add_node(server_id(), CellNode::Server(Box::new(server)));
+        assert!(!share_fate(&mut sim, &server_id(), true));
+        assert!(sim.node(&server_id()).and_then(CellNode::server).is_some());
+    }
+}
