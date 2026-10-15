@@ -390,6 +390,7 @@ fn node(
         match driver {
             Driver::Fake => node.add(Arc::new(FakeRuntime::new(Duration::ZERO)))?,
             Driver::Native => {
+                #[cfg(not(target_os = "macos"))]
                 if let Some(warning) = cache::native_warning(&cli.cache) {
                     tracing::warn!("{warning}");
                 }
@@ -547,6 +548,10 @@ fn native_config(cli: &Cli) -> Result<NativeConfig, Error> {
     config.pool = (cli.pool_users.zip(cli.pool_first_uid))
         .map(|(count, first)| Pool::provisioned(count, first))
         .transpose()?;
+    #[cfg(target_os = "macos")]
+    {
+        config.cache = cache::native(&cli.cache, &config.scratch);
+    }
     Ok(config)
 }
 

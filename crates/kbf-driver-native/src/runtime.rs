@@ -11,7 +11,8 @@ use std::time::{Duration, SystemTime};
 
 use kbf_daemon::cas::{Cas, CasError, Spool};
 use kbf_daemon::tree::{
-    TreeError, check_relative, fetch_message, materialize, output_paths, real_dirs,
+    TreeError, check_relative, fetch_message, materialize, materialize_cached, output_paths,
+    real_dirs,
 };
 use kbf_daemon::{DriverReport, Runtime, RuntimeError, Work, upload_within};
 use kbf_outputs::OutputsError;
@@ -351,9 +352,21 @@ impl<C: Cas> NativeRuntime<C> {
         let lease = tokio::fs::canonicalize(dir).await.map_err(failed(dir))?;
         let root = dir.join("root");
         tokio::fs::create_dir(&root).await.map_err(failed(&root))?;
-        materialize(cas, input_root, &root)
-            .await
-            .map_err(tree_error)?;
+        match &self.config.cache {
+            // Every name is its own clone of an entry (`LinkMode::Clone`), so no path
+            // needs to be named private.
+            Some(cache) => {
+                let started = std::time::Instant::now();
+                let stats = materialize_cached(cas, cache, input_root, &root, &[])
+                    .await
+                    .map_err(tree_error)?;
+                let ms = started.elapsed().as_millis();
+                tracing::info!(lease = %work.lease_id, "inputs: {stats} ms={ms}");
+            }
+            None => materialize(cas, input_root, &root)
+                .await
+                .map_err(tree_error)?,
+        }
         // REAPI: the worker makes the working directory and each output's parent.
         let work_dir = real_dirs(&root, &command.working_directory)
             .await

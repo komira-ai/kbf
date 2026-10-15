@@ -5,7 +5,6 @@
 
 #![allow(dead_code)] // Each test binary uses its own part of this module.
 
-#[cfg(target_os = "linux")]
 pub mod cache_kit;
 pub mod memory;
 

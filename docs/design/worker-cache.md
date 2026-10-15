@@ -868,7 +868,7 @@ noise once the cache exists. So placement changes **last**, and only if metrics 
 | **C1, the first cache** (folds in komira-build-farm#527) | Container driver only, persistent from the start. `kbf-daemon::cache`: layout; the exclusive lock, taken before any startup cleanup, on a file never unlinked; `tmp/` cleared at start; fills hashed into `tmp/` and inserted with `RENAME_NOREPLACE`; the index (6.9: one snapshot file written after load, every 5 minutes, after each adopt pass and at a clean stop, discarded if malformed) loaded at start, so the cache serves at once while the evictor drains to the limit (6.8); the fill-map slot taken by fills, the evictor and the adopt pass; the rate-limited adopt pass, which deletes nothing and speeds up under free-space pressure; lazy re-hash on first use after start; the stat check; one fill per key; LRU by bytes; pins; the ENOENT retry; empty files created directly; link-limit copy; one inode per key per lease; the free-space floor that skips `nlink > 1`. `chown-dirs`. `prepare_outputs` copies instead of renaming. The ETXTBSY retry. Flags `--cache-dir`, `--cache-max-bytes`, `--cache-min-free-bytes`, `--cache-link-concurrency`. Tests C-1, C-2, C-4, C-7 to C-10, C-12, C-13, C-16 to C-20, R-1 to R-9. | T1 planned first; correct without A or T1 (see below) |
 | **T2, batching (fix 3)** | `read_many` and `upload_missing` batch small blobs (4.3); per-blob status; the limit from GetCapabilities, or `--transfer-batch-bytes` alone where it answers UNIMPLEMENTED (4.3). Test C-14. | T1, S1 deployed |
 | **C3, cache metrics** | `InputStats` and per-node cache metrics through the APIs (section 7) | C1, T1 |
-| **C2, macOS** | Decided in [macos-end-state.md](macos-end-state.md) (step 5): hard links once actions run as pool lease users, not the daemon's user. A root-owned read-only cache on a dedicated APFS volume, daemon-made input directories owned by the slot uid, `clonefile` private copies for inputs an output names, behind `--cache-dir`. Until lease users exist: `clonefile`; the sandbox check. Tests C-3, C-3b and that document's step 5 tests; Spotlight and backup exclusion; link-concurrency measurement | C1; lease users (macos-end-state.md steps 3, 4) |
+| **C2, macOS** | Native driver built (see "C2 as built"): `clonefile` per name, behind `--cache-dir`, the sandbox as the guard. The rest is decided in [macos-end-state.md](macos-end-state.md) (step 5): hard links once actions run as pool lease users, not the daemon's user. A root-owned read-only cache on a dedicated APFS volume, daemon-made input directories owned by the slot uid, `clonefile` private copies for inputs an output names, behind `--cache-dir`. Until lease users exist: `clonefile`; the sandbox check. Tests C-3, C-3b and that document's step 5 tests; Spotlight and backup exclusion; link-concurrency measurement | C1; lease users (macos-end-state.md steps 3, 4) |
 | **C4a-d** | Directory cache and GetTree; subtree link plans; macOS directory clone; outputs into the cache, including the copy-mode skip. Tests C-12 (C4b, C4c), C-21. | C1; GetTree needs S1 |
 | **C5a(-b)** | `held_trees` heartbeat report; a placement tie-break only if justified | C3 |
 | **T3** | The server's object-store traffic moves onto the engine core | T1, S1 |
@@ -1008,6 +1008,30 @@ left open):
 - The toolchain count of section 1 is the archive's (15,189 files): C1 has no farm
   build of zig to log `inputs: files=...` from, so the count per input root waits for
   the first cached farm node.
+
+**C2 as built** (the native driver on macOS; `--cache-dir` with `--cache-max-bytes` on a
+macOS node; what it leaves out follows):
+
+- Every name of a lease is its own `clonefile` of the entry (`LinkMode::Clone`, chosen
+  at open when the cache and the scratch directory share a volume; another volume is
+  `Copy`). The clone is made writable as an input is without the cache (0644, 0755
+  executable) and keeps the entry's fixed mtime. There are no links, so no `private`
+  list: `NativeRuntime::prepare` passes none. A clone the filesystem refuses (`ENOTSUP`,
+  `EXDEV`) is a copy of that name, one fallback per key; an entry gone (`ENOENT`)
+  removes the names already cloned and settles the key again.
+- The cache directory must be outside `--scratch`; the node refuses one inside
+  (`off:unusable`) because lease sweeps clean the scratch directory. The sandbox lets an
+  action write only its lease directory, which is what keeps the entries out of its
+  reach (C-3b); the node still runs actions as the daemon's user, so the Linux native
+  driver stays uncached (C-19).
+- The free-space floor skips `nlink > 1`; a clone adds no link, so on macOS the floor
+  may evict an entry whose clones a running lease holds, which frees nothing until the
+  lease ends. The byte budget is exact.
+- Not built: the dedicated APFS volume, Spotlight and backup exclusion, hard links for
+  pool lease users, and the link-concurrency measurement. `--cache-link-concurrency`
+  keeps its default of 64.
+- The lease logs `inputs: files=... fetched_bytes=... ms=<elapsed>` as the container
+  driver does, with the time of the whole materialization.
 
 **T1 as built** (crate `kbf-transfer`; where the code differs from section 4):
 

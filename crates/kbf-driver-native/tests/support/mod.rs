@@ -39,6 +39,8 @@ pub struct MemoryCas {
     pub delay: Option<Duration>,
     /// Every put fails as an unreachable CAS would.
     pub refuse_puts: bool,
+    /// The digests `get` was asked for, by label, with how often.
+    pub reads: Mutex<BTreeMap<String, u64>>,
 }
 
 impl MemoryCas {
@@ -56,6 +58,12 @@ impl MemoryCas {
             .unwrap_or_else(|| panic!("blob {} is stored", label(digest)))
     }
 
+    /// How many times `get` was asked for `digest`.
+    pub fn reads_of(&self, digest: &Digest) -> u64 {
+        let reads = self.reads.lock().unwrap_or_else(PoisonError::into_inner);
+        reads.get(&label(digest)).copied().unwrap_or(0)
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, Vec<u8>>> {
         self.blobs.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -69,6 +77,9 @@ impl Cas for MemoryCas {
     }
 
     async fn get(&self, digest: &Digest) -> Result<Vec<u8>, CasError> {
+        *(self.reads.lock().unwrap_or_else(PoisonError::into_inner))
+            .entry(label(digest))
+            .or_default() += 1;
         if let Some(delay) = self.delay {
             tokio::time::sleep(delay).await;
         }
