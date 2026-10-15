@@ -323,7 +323,13 @@ fn start(cli: &Cli) -> Result<(), Error> {
     // The CAS channel is made lazily, which needs the runtime's context.
     let _context = tokio.enter();
     let (daemon, _) = node(cli, || native_config(cli), Path::new(xcode::XCRUN))?;
-    let daemon = match memory_stall(cli) {
+    serve(&tokio, backstop(cli, daemon))
+}
+
+/// `daemon` with the memory backstop `--memory-pressure-pause-percent` sets, if the
+/// node reports memory pressure ([`memory_stall`]). Needs a tokio runtime's context.
+fn backstop(cli: &Cli, daemon: Daemon) -> Daemon {
+    match memory_stall(cli) {
         Some(stall) => {
             tracing::info!(
                 above_percent = cli.memory_pressure_pause_percent,
@@ -332,8 +338,7 @@ fn start(cli: &Cli) -> Result<(), Error> {
             daemon.with_memory_backstop(stall, cli.memory_pressure_pause_percent)
         }
         None => daemon,
-    };
-    serve(&tokio, daemon)
+    }
 }
 
 /// A percentage above 0 and at most 100, for `--memory-pressure-pause-percent`.
@@ -872,21 +877,42 @@ mod tests {
         }
     }
 
-    /// Catches a backstop that is on without a readable pressure file (a node with no
-    /// pressure stall information would be paused or crash), and one that is off with
-    /// one (a Linux node would never stop taking leases).
+    /// Catches a backstop that is attached without a readable pressure file (a node
+    /// with no pressure stall information would be paused or crash), one that is not
+    /// attached with one (a Linux node would never stop taking leases), one attached
+    /// with another threshold than the flag's, and a sampler that does not read the
+    /// file it is given.
     #[tokio::test]
-    async fn the_backstop_is_on_only_where_the_kernel_reports_pressure() {
+    async fn the_backstop_is_attached_only_where_the_kernel_reports_pressure() {
         let dir = scratch("psi");
+        tls_files(&dir);
         let file = dir.join("memory");
         std::fs::write(&file, "some avg10=1.50 avg60=0.00 avg300=0.00 total=1\n").expect("write");
-        let flag = format!("--psi-memory-file={}", file.display());
-        let on = parse(&["--driver=fake", &flag]).expect("flags");
-        let stall = memory_stall(&on).expect("a readable file turns it on");
-        assert_eq!(*stall.borrow(), Some(1.5));
-        let missing = dir.join("missing");
-        let flag = format!("--psi-memory-file={}", missing.display());
-        let off = parse(&["--driver=fake", &flag]).expect("flags");
+        let cli = |psi: &Path| {
+            let flag = |name: &str, path: &Path| format!("--{name}={}", path.display());
+            Cli::try_parse_from([
+                "kbf-daemon".to_owned(),
+                "--server=https://127.0.0.1:1".to_owned(),
+                flag("ca-cert", &dir.join("ca.pem")),
+                flag("cert", &dir.join("node.pem")),
+                flag("key", &dir.join("node.key")),
+                "--node-id=mac-1".to_owned(),
+                "--driver=fake".to_owned(),
+                "--memory-pressure-pause-percent=7.5".to_owned(),
+                flag("psi-memory-file", psi),
+            ])
+            .expect("flags")
+        };
+        let attached = |cli: &Cli| {
+            let (daemon, _) =
+                node(cli, || native_config(cli), &dir.join("no-xcrun")).expect("a daemon");
+            backstop(cli, daemon).memory_backstop()
+        };
+        let on = cli(&file);
+        assert_eq!(attached(&on), Some(7.5));
+        assert_eq!(*memory_stall(&on).expect("readable").borrow(), Some(1.5));
+        let off = cli(&dir.join("missing"));
+        assert_eq!(attached(&off), None);
         assert!(memory_stall(&off).is_none());
     }
 

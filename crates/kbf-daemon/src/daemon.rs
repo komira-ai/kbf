@@ -404,6 +404,13 @@ impl Daemon {
         self
     }
 
+    /// The percentage of memory stall time above which the backstop pauses this node
+    /// while it runs a lease; `None` without one ([`Self::with_memory_backstop`]).
+    #[must_use]
+    pub fn memory_backstop(&self) -> Option<f64> {
+        self.pressure.as_ref().map(|backstop| backstop.above)
+    }
+
     /// The phase every Hello carries: the runtime's, or memory pressure in place of
     /// serving while the backstop has the node paused.
     fn phase(&self) -> NodePhase {

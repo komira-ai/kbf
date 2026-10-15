@@ -729,6 +729,7 @@ impl<R: Runtime> Harness<R> {
         }
         if let Some((stall, above)) = pressure {
             daemon = daemon.with_memory_backstop(stall, above);
+            assert_eq!(daemon.memory_backstop(), Some(above));
         }
         let daemon = tokio::spawn(daemon.run(std::future::pending()));
         Self {
