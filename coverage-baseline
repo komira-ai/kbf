@@ -33,7 +33,7 @@ kbf-meta                 10      1
 kbf-node                  0      0
 kbf-objstore             67     20
 kbf-outputs               0      0
-kbf-proto                 -      -
+kbf-proto                 0      0
 kbf-raft                 19     19
 kbf-sched                 2      2
 kbf-segments              7      5
