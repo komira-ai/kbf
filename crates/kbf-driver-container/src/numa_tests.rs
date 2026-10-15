@@ -148,6 +148,147 @@ fn a_lease_that_booked_nothing_counts_as_one_cpu() {
     assert_eq!(placer.loads(), [1000, 0]);
 }
 
+const GIB: u64 = 1 << 30;
+
+/// A placer over the two nodes that knows the node's memory.
+fn placer_with(whole_host: Option<u64>, largest_node: Option<u64>) -> Arc<Placer> {
+    let memory = NodeMemory {
+        whole_host,
+        largest_node,
+    };
+    Placer::with_memory(vec![(0, set(NODE0)), (1, set(NODE1))], memory).expect("nodes")
+}
+
+/// Catches a lease with the whole host's memory (the last step of the memory ladder, which
+/// the scheduler runs alone) pinned to one node: it must get every CPU and memory node,
+/// say `all` on its line and book no node, so the next lease still sees both nodes idle.
+/// The host here is 100 GiB with 128 GiB nodes (a limit on `actions/` below a node), so only
+/// the whole-host rule can see it.
+#[test]
+fn a_whole_host_lease_is_unpinned_and_books_no_node() {
+    let placer = placer_with(Some(100 * GIB), Some(128 * GIB));
+    let whole = placer.place_lease(8000, 100 * GIB);
+    assert!(matches!(whole, Placement::All), "{whole:?}");
+    assert_eq!(whole.spot(), Spot::All);
+    assert_eq!(placer.loads(), [0, 0]);
+    assert!(whole.into_pin().is_none());
+    let above = placer.place_lease(8000, 101 * GIB);
+    assert_eq!(
+        above.spot(),
+        Spot::All,
+        "a limit above the host is the host"
+    );
+    // One byte under is a share.
+    let under = placer.place_lease(1000, 100 * GIB - 1);
+    assert_eq!(under.spot(), Spot::Node(0));
+    assert_eq!(placer.loads(), [1000, 0]);
+}
+
+/// Catches a lease whose memory limit is more than one node holds pinned to a node (it
+/// would spill to the other node's memory through `cpuset.mems` that does not name it, or
+/// be killed at the node's memory): above the largest node it is unpinned and books no
+/// node, at the largest node it is still a share. The host is 256 GiB of two 128 GiB nodes.
+#[test]
+fn a_lease_above_one_nodes_memory_is_unpinned() {
+    let placer = placer_with(Some(256 * GIB), Some(128 * GIB));
+    let big = placer.place_lease(8000, 128 * GIB + 1);
+    assert_eq!(big.spot(), Spot::All);
+    assert_eq!(placer.loads(), [0, 0]);
+    let node_sized = placer.place_lease(8000, 128 * GIB);
+    assert_eq!(
+        node_sized.spot(),
+        Spot::Node(0),
+        "a node's worth fits the node"
+    );
+    assert_eq!(placer.loads(), [8000, 0]);
+    // Without the whole-host figure the node rule still holds.
+    let placer = placer_with(None, Some(128 * GIB));
+    assert_eq!(placer.place_lease(1000, 200 * GIB).spot(), Spot::All);
+}
+
+/// Catches an ordinary lease unpinned: one that books a share of a node, or no memory at
+/// all (no limit, as the scheduler's exclusive rule also reads it), still goes to the
+/// least loaded node and books its CPU there.
+#[test]
+fn a_normal_lease_is_still_pinned_to_the_least_loaded_node() {
+    let placer = placer_with(Some(256 * GIB), Some(128 * GIB));
+    let a = placer.place_lease(2000, 4 * GIB);
+    let b = placer.place_lease(2000, 0);
+    let c = placer.place_lease(1000, 64 * GIB);
+    assert_eq!(
+        (a.spot(), b.spot(), c.spot()),
+        (Spot::Node(0), Spot::Node(1), Spot::Node(0))
+    );
+    assert_eq!(placer.loads(), [3000, 2000]);
+    assert_eq!(Spot::Node(1).to_string(), "1");
+    assert_eq!(Spot::All.to_string(), "all");
+}
+
+/// Catches an unknown memory read as zero: a placer given no figure (a node directory
+/// with no `meminfo`) must pin every lease, whatever its limit, as before.
+#[test]
+fn a_placer_that_knows_no_memory_pins_every_lease() {
+    let plain = placer();
+    assert_eq!(plain.place_lease(1000, 1 << 50).spot(), Spot::Node(0));
+    let unknown = placer_with(None, None);
+    assert_eq!(unknown.place_lease(1000, 1 << 50).spot(), Spot::Node(0));
+    assert_eq!(unknown.loads(), [1000, 0]);
+}
+
+/// Catches node memory read from the wrong file or line: `node<N>/meminfo` has a
+/// `MemTotal` per node in kB, among lines that must not be taken for it (`MemFree`,
+/// `MemHidden`); a node with no file or an unreadable line is left out, not read as 0.
+#[test]
+fn node_memory_is_read_from_each_nodes_meminfo() {
+    let dir = sysfs("meminfo", &[(0, NODE0), (1, NODE1), (2, "0")]);
+    put(
+        &dir.join("node0/meminfo"),
+        "Node 0 MemFree:         1000 kB\nNode 0 MemTotal:       134217728 kB\nNode 0 MemUsed: 5 kB\n",
+    );
+    put(
+        &dir.join("node1/meminfo"),
+        "Node 1 MemTotal:       lots kB\n",
+    );
+    let memory = read_node_memory(&dir);
+    assert_eq!(memory.len(), 1, "{memory:?}");
+    assert_eq!(memory.get(&0), Some(&(128 * GIB)));
+    assert!(read_node_memory(&dir.join("absent")).is_empty());
+}
+
+fn meminfo(dir: &Path, node: u32, gib: u64) {
+    put(
+        &dir.join(format!("node{node}/meminfo")),
+        &format!("Node {node} MemTotal:       {} kB\n", gib << 20),
+    );
+}
+
+/// Catches `start` not handing the topology's memory and the node's to the placer: with
+/// two 128 GiB nodes and a 256 GiB host, a 200 GiB lease and a whole-host lease are
+/// unpinned and a 100 GiB one is placed; with a node whose `meminfo` is missing the
+/// largest node is unknown, so only the whole-host rule applies.
+#[test]
+fn start_gives_the_placer_the_node_memory() {
+    let dir = sysfs("start-memory", &[(0, NODE0), (1, NODE1)]);
+    meminfo(&dir, 0, 128);
+    meminfo(&dir, 1, 128);
+    let (root, actions) = cgroups("start-memory", "cpu cpuset memory pids\n", Some("0-87\n"));
+    let placer = start(&dir, &root, actions, Some(256 * GIB))
+        .expect("started")
+        .expect("placed");
+    assert_eq!(placer.place_lease(1000, 200 * GIB).spot(), Spot::All);
+    assert_eq!(placer.place_lease(1000, 256 * GIB).spot(), Spot::All);
+    assert_eq!(placer.place_lease(1000, 100 * GIB).spot(), Spot::Node(0));
+
+    let dir = sysfs("start-partial", &[(0, NODE0), (1, NODE1)]);
+    meminfo(&dir, 0, 128);
+    let (root, actions) = cgroups("start-partial", "cpu cpuset memory pids\n", Some("0-87\n"));
+    let placer = start(&dir, &root, actions, Some(256 * GIB))
+        .expect("started")
+        .expect("placed");
+    assert_eq!(placer.place_lease(1000, 200 * GIB).spot(), Spot::Node(0));
+    assert_eq!(placer.place_lease(1000, 256 * GIB).spot(), Spot::All);
+}
+
 /// A host's cgroup tree as plain directories: the unit offers `offered`, `actions/`
 /// under it.
 fn cgroups(name: &str, offered: &str, effective: Option<&str>) -> (PathBuf, &'static str) {
@@ -176,7 +317,7 @@ fn read(root: &Path, cgroup: &str, file: &str) -> Option<String> {
 fn a_dual_node_host_is_placed_over_the_cpus_the_daemon_may_use() {
     let dir = sysfs("dual", &[(0, NODE0), (1, NODE1)]);
     let (root, actions) = cgroups("dual", "cpu cpuset memory pids\n", Some("0-87\n"));
-    let placer = start(&dir, &root, actions)
+    let placer = start(&dir, &root, actions, None)
         .expect("started")
         .expect("placed");
     assert_eq!(placer.place(1000).cpus().to_string(), NODE0);
@@ -192,14 +333,14 @@ fn a_dual_node_host_is_placed_over_the_cpus_the_daemon_may_use() {
 
     // A cgroup that shows no cpuset.cpus.effective limits nothing.
     let (root, actions) = cgroups("unlimited", "cpu cpuset memory pids\n", None);
-    let placer = start(&dir, &root, actions)
+    let placer = start(&dir, &root, actions, None)
         .expect("started")
         .expect("placed");
     assert_eq!(placer.place(1000).cpus().to_string(), NODE0);
 
     // A cpuset that holds part of node 0 and all of node 1: the lease gets the part.
     let (root, actions) = cgroups("partial", "cpu cpuset memory pids\n", Some("10-30,70-87\n"));
-    let placer = start(&dir, &root, actions)
+    let placer = start(&dir, &root, actions, None)
         .expect("started")
         .expect("placed");
     let (a, b) = (placer.place(1000), placer.place(1000));
@@ -221,19 +362,23 @@ fn a_host_without_two_nodes_falls_back_to_no_placement() {
         ("memory-only", vec![(0, "0-87"), (1, "")]),
     ] {
         let dir = sysfs(name, &nodes);
-        let placer = start(&dir, &no_cgroups, "/kbf/actions").expect("started");
+        let placer = start(&dir, &no_cgroups, "/kbf/actions", None).expect("started");
         assert!(placer.is_none(), "{name}");
     }
     let absent = scratch("absent").join("no-such-dir");
     assert!(
-        start(&absent, &no_cgroups, "/kbf/actions")
+        start(&absent, &no_cgroups, "/kbf/actions", None)
             .expect("started")
             .is_none()
     );
 
     let dir = sysfs("confined", &[(0, NODE0), (1, NODE1)]);
     let (root, actions) = cgroups("confined", "cpu cpuset memory pids\n", Some("0-21\n"));
-    assert!(start(&dir, &root, actions).expect("started").is_none());
+    assert!(
+        start(&dir, &root, actions, None)
+            .expect("started")
+            .is_none()
+    );
 }
 
 /// Catches a two-node host whose cpuset cannot be enabled starting unpinned: the start
@@ -242,7 +387,7 @@ fn a_host_without_two_nodes_falls_back_to_no_placement() {
 fn a_dual_node_host_that_cannot_enable_cpuset_fails_the_start() {
     let dir = sysfs("refused", &[(0, NODE0), (1, NODE1)]);
     let (root, actions) = cgroups("refused", "cpu memory pids\n", None);
-    let error = start(&dir, &root, actions)
+    let error = start(&dir, &root, actions, None)
         .expect_err("refused")
         .to_string();
     assert!(

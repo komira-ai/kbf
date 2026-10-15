@@ -130,6 +130,12 @@ impl NodeReport {
         Self::new(entries)
     }
 
+    /// The memory the report offers the scheduler, in bytes: `mem_gib` in whole GiB.
+    #[must_use]
+    pub fn mem_bytes(&self) -> Option<u64> {
+        None
+    }
+
     /// The entries, sorted by key, then value.
     #[must_use]
     pub fn capabilities(&self) -> &[Capability] {
@@ -624,6 +630,22 @@ mod tests {
         });
         assert_eq!(above, r);
         assert_eq!(r.clone().within(Capacity::default()), r);
+    }
+
+    /// Catches the memory the scheduler books read from the wrong entry or rounded: it is
+    /// `mem_gib` in whole GiB as bytes, after a capacity lowered it, and `None` for a report
+    /// without the entry.
+    #[test]
+    fn mem_bytes_is_the_reported_mem_gib() {
+        let r = linux_report(SKYLAKE, MEMINFO, SMAPS, 0, &["container"]).expect("report");
+        assert_eq!(r.mem_bytes(), Some(376 << 30));
+        let capped = r.within(Capacity {
+            cpus: None,
+            memory_bytes: Some((200 << 30) + (1 << 29)),
+        });
+        assert_eq!(capped.mem_bytes(), Some(200 << 30));
+        assert_eq!(NodeReport::new([("cpus", "4")]).mem_bytes(), None);
+        assert_eq!(NodeReport::new([("mem_gib", "lots")]).mem_bytes(), None);
     }
 
     /// Catches: a report whose order or hash depends on the order entries were added,

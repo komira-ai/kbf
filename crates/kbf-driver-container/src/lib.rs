@@ -98,7 +98,8 @@ pub use delegate::{
     DelegateError, Delegation, adopt, capacity, delegate, enable_cpuset, limit_cpus,
 };
 pub use image::{ImageCheckError, ImageError, ImageRef};
-pub use numa::{CpuSet, LeasePlacement, Pin, Placer};
+pub use input_phases::Spot;
+pub use numa::{CpuSet, LeasePlacement, NodeMemory, Pin, Placement, Placer};
 pub use oci::{OciConfig, OciError};
 pub use outputs::OutputLimits;
 pub use podman::{ContainerLimits, EXEC_ROOT, OWNER_LABEL};

@@ -196,6 +196,87 @@ async fn a_placed_lease_gets_its_nodes_cpus_and_memory() {
     fake.assert_clean(1);
 }
 
+/// Runs lease 1 of a fake over two nodes (`memory` says what the placer knows of the
+/// node's memory), booking `memory_bytes`. The action copies out `cgroup.subtree_control`
+/// and, with `pinned`, `cpuset.cpus` and `cpuset.mems`; without it, it fails unless neither
+/// file exists. Returns the copied files in that order.
+async fn lease_cgroup(
+    name: &str,
+    memory: kbf_driver_container::NodeMemory,
+    memory_bytes: u64,
+    pinned: bool,
+) -> Vec<Vec<u8>> {
+    use kbf_driver_container::{CpuSet, Placer};
+    let nodes = vec![
+        (0, "0-1,4".parse::<CpuSet>().expect("cpus")),
+        (1, "2-3,5".parse::<CpuSet>().expect("cpus")),
+    ];
+    let fake = Fake::with(name, |config| {
+        config.placer = Placer::with_memory(nodes, memory);
+    });
+    let mut spec = Spec::new(&image(), "unused by the fake");
+    let mut steps: Vec<String> = Vec::new();
+    let mut outputs = Vec::new();
+    for (file, out) in [("cpuset.cpus", "cpus"), ("cpuset.mems", "mems")] {
+        let cgroup_file = format!("$CG/{file}");
+        if pinned {
+            outputs.push(out);
+            steps.extend(["copy".to_owned(), format!("$UPPER/{out}"), cgroup_file]);
+        } else {
+            steps.extend(["test", "!", "-e"].map(str::to_owned));
+            steps.push(cgroup_file);
+        }
+        steps.push(";".to_owned());
+    }
+    outputs.push("subtree");
+    for step in ["copy", "$UPPER/subtree", "$CG/cgroup.subtree_control"] {
+        steps.push(step.to_owned());
+    }
+    spec.outputs = outputs.iter().map(|o| (*o).to_owned()).collect();
+    let result = fake
+        .run_with(1, &spec, &steps, Resources::new(2000, memory_bytes))
+        .await
+        .expect("ran");
+    assert_eq!(result.exit_code, 0, "{name}");
+    let got = outputs
+        .iter()
+        .map(|name| {
+            let file = result.output_files.iter().find(|f| f.path == *name);
+            blob(&fake.cas, file.expect(name).digest.as_ref())
+        })
+        .collect();
+    fake.assert_clean(1);
+    got
+}
+
+/// Catches a lease under `--lease-placement=numa-node` that books the whole host's memory
+/// (the last rung of the memory ladder) or more than one node holds, pinned to one node: its
+/// cgroup must get no `cpuset.cpus` or `cpuset.mems` (so every CPU and memory node the
+/// daemon may use) and `cpuset` must not be handed to its container's cgroup; a share of a
+/// node is pinned as before. The host is 4 GiB of two 2 GiB nodes.
+#[tokio::test]
+async fn whole_host_and_over_node_leases_get_no_cpuset_and_a_share_does() {
+    use kbf_driver_container::NodeMemory;
+    const GIB: u64 = 1 << 30;
+    let memory = NodeMemory {
+        whole_host: Some(4 * GIB),
+        largest_node: Some(2 * GIB),
+    };
+    let whole = lease_cgroup("whole-host", memory, 4 * GIB, false).await;
+    assert_eq!(whole, [b"+cpu +memory +pids".to_vec()]);
+    let over = lease_cgroup("over-node", memory, 3 * GIB, false).await;
+    assert_eq!(over, [b"+cpu +memory +pids".to_vec()]);
+    let share = lease_cgroup("share", memory, GIB, true).await;
+    assert_eq!(
+        share,
+        [
+            b"0-1,4".to_vec(),
+            b"0".to_vec(),
+            b"+cpu +memory +pids +cpuset".to_vec()
+        ]
+    );
+}
+
 /// Catches a lease cgroup that gets cpuset files without `--lease-placement=numa-node`:
 /// the default must leave a lease on any CPU, as before (the limits test above pins
 /// `cgroup.subtree_control` to `+cpu +memory +pids`).

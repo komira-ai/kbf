@@ -829,7 +829,7 @@ mod container {
         let placer = match cli.lease_placement.parse()? {
             LeasePlacement::None => None,
             LeasePlacement::NumaNode => {
-                kbf_driver_container::numa::start(&cli.numa_dir, mount, &parent)?
+                kbf_driver_container::numa::start(&cli.numa_dir, mount, &parent, None)?
             }
         };
         let mut config = PodmanConfig::new(scratch, parent, cli.daemon.node_id.clone());

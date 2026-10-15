@@ -16,13 +16,14 @@
 //! A host with fewer than two nodes that hold CPUs (one socket, no `/sys/devices/system/node`,
 //! a cpuset that confines the daemon to one node) is run as `none`, with one log line.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use crate::delegate::{self, DelegateError};
+use crate::input_phases::Spot;
 
 /// How leases are placed on the node's CPUs (`--lease-placement`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -177,6 +178,7 @@ pub fn start(
     nodes_dir: &Path,
     cgroup_root: &Path,
     actions: &str,
+    _whole_host: Option<u64>,
 ) -> Result<Option<Arc<Placer>>, DelegateError> {
     let nodes = match read_nodes(nodes_dir) {
         Ok(nodes) => nodes,
@@ -205,6 +207,53 @@ pub fn start(
     Ok(Placer::new(usable))
 }
 
+/// The memory of the node's NUMA nodes, read from `node<N>/meminfo` (`MemTotal`), in
+/// bytes by node id. A node whose file is missing or has no `MemTotal` line is left out.
+#[must_use]
+pub fn read_node_memory(_dir: &Path) -> BTreeMap<u32, u64> {
+    BTreeMap::new()
+}
+
+/// What a [`Placer`] knows of the node's memory, to tell a lease that is not a share of
+/// one NUMA node. A field that is `None` switches its rule off.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NodeMemory {
+    /// The memory the scheduler books on this node, in bytes: a lease whose limit is at
+    /// least this is the whole host.
+    pub whole_host: Option<u64>,
+    /// The memory of the largest single NUMA node, in bytes.
+    pub largest_node: Option<u64>,
+}
+
+/// Where a lease runs.
+#[derive(Debug)]
+pub enum Placement {
+    /// On one node, until the [`Pin`] is dropped.
+    Node(Pin),
+    /// On every CPU and memory node the daemon may use: no cpuset, no booked load.
+    All,
+}
+
+impl Placement {
+    /// What the lease's `inputs phases` line says.
+    #[must_use]
+    pub fn spot(&self) -> Spot {
+        match self {
+            Self::Node(pin) => Spot::Node(pin.node()),
+            Self::All => Spot::All,
+        }
+    }
+
+    /// The node the lease is pinned to, if it is.
+    #[must_use]
+    pub fn into_pin(self) -> Option<Pin> {
+        match self {
+            Self::Node(pin) => Some(pin),
+            Self::All => None,
+        }
+    }
+}
+
 /// Chooses a NUMA node for each lease and counts what is on each.
 #[derive(Debug)]
 pub struct Placer {
@@ -212,23 +261,40 @@ pub struct Placer {
     nodes: Vec<(u32, CpuSet)>,
     /// The booked CPU (millicpus) of the leases on each node, in `nodes` order.
     load: Mutex<Vec<u64>>,
+    memory: NodeMemory,
 }
 
 impl Placer {
     /// A placer over `nodes` (by id, each with CPUs); `None` without any.
     #[must_use]
     pub fn new(nodes: Vec<(u32, CpuSet)>) -> Option<Arc<Self>> {
+        Self::with_memory(nodes, NodeMemory::default())
+    }
+
+    /// [`Placer::new`], knowing `memory`.
+    #[must_use]
+    pub fn with_memory(nodes: Vec<(u32, CpuSet)>, memory: NodeMemory) -> Option<Arc<Self>> {
         if nodes.is_empty() {
             return None;
         }
         let load = Mutex::new(vec![0; nodes.len()]);
-        Some(Arc::new(Self { nodes, load }))
+        Some(Arc::new(Self {
+            nodes,
+            load,
+            memory,
+        }))
+    }
+
+    /// Places a lease that booked `cpu_millis` with a memory limit of `memory_bytes`.
+    #[must_use]
+    pub fn place_lease(self: &Arc<Self>, cpu_millis: u64, _memory_bytes: u64) -> Placement {
+        Placement::Node(self.place(cpu_millis))
     }
 
     /// Places a lease that booked `cpu_millis` (0 counts as one CPU) on the node with the
     /// least load, the lowest id on a tie, until the [`Pin`] is dropped.
     #[must_use]
-    pub fn place(self: &Arc<Self>, cpu_millis: u64) -> Pin {
+    pub(crate) fn place(self: &Arc<Self>, cpu_millis: u64) -> Pin {
         let weight = if cpu_millis == 0 { 1000 } else { cpu_millis };
         let mut load = self.load.lock().unwrap_or_else(PoisonError::into_inner);
         // `min_by_key` keeps the first of equals: the lowest id. There is always a node.
