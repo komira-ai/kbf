@@ -6,6 +6,9 @@
 //!
 //! The server runs in this process, so the test finds the socket the server accepted
 //! for its own connection among this process's descriptors and reads the option off it.
+//! The server sets the option as it accepts, before the connection is served; the test
+//! can find the socket between the two (kbf#650), so it reads until the option is on
+//! or [`PROMPT`] has passed.
 
 mod support;
 
@@ -26,7 +29,8 @@ async fn every_listener_turns_nagle_off_on_the_connections_it_accepts() {
     for (name, listener) in listeners {
         let client = TcpStream::connect(listener).expect("connect");
         let peer = client.local_addr().expect("the client's address");
-        if !nodelay(accepted_socket(listener, peer).await) {
+        let fd = accepted_socket(listener, peer).await;
+        if !turned_on(|| nodelay(fd)).await {
             nagle_on.push(name);
         }
     }
@@ -34,6 +38,33 @@ async fn every_listener_turns_nagle_off_on_the_connections_it_accepts() {
         nagle_on.is_empty(),
         "Nagle's algorithm left on: {nagle_on:?}"
     );
+}
+
+/// Catches: a check that reads the option once, so a socket found between the
+/// server's accept and its `setsockopt` reads Nagle on (kbf#650). The option here
+/// turns on at the third read.
+#[tokio::test]
+async fn an_option_turned_on_after_the_first_read_counts_as_on() {
+    let mut reads = 0;
+    let on = turned_on(|| {
+        reads += 1;
+        reads >= 3
+    })
+    .await;
+    assert!(on, "the option turned on at read 3, but read {reads} gave up");
+}
+
+/// Catches: a wait that reports on for an option that never turns on, or never
+/// gives up.
+#[tokio::test(start_paused = true)]
+async fn an_option_that_never_turns_on_counts_as_off() {
+    assert!(!turned_on(|| false).await);
+}
+
+/// Whether `read` answers `true`. One read: the server sets the option after it
+/// accepts.
+async fn turned_on(mut read: impl FnMut() -> bool) -> bool {
+    read()
 }
 
 /// The descriptor of the socket the server accepted on `listener` for the connection
