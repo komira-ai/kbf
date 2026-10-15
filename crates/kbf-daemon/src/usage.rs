@@ -48,7 +48,7 @@ pub fn usage_of(result: &ActionResult) -> Option<ResourceUsage> {
 }
 
 /// How a measured process ended.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Exited {
     /// The exit status, or 128 plus the signal number for a process a signal ended
     /// (the shell's convention).
