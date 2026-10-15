@@ -229,9 +229,6 @@ impl Cas for HeldCas {
             self.failing_asked.store(true, Ordering::SeqCst);
         }
         if *digest == self.held {
-            while !self.failing_asked.load(Ordering::SeqCst) {
-                tokio::task::yield_now().await;
-            }
             let release = self
                 .release
                 .lock()
@@ -247,6 +244,8 @@ impl Cas for HeldCas {
             while !self.held_read.load(Ordering::SeqCst) {
                 tokio::task::yield_now().await;
             }
+            // MUTANT: pool work of `failing` queued behind the parked thread.
+            tokio::task::spawn_blocking(|| ()).await.expect("ran");
             for _ in 0..8 {
                 tokio::task::yield_now().await;
             }
