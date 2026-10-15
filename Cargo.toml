@@ -164,6 +164,7 @@ kbf-sim = { path = "crates/kbf-sim" }
 kbf-sim-cell = { path = "crates/kbf-sim-cell" }
 kbf-store = { path = "crates/kbf-store" }
 kbf-testkit = { path = "crates/kbf-testkit" }
+kbf-threads = { path = "crates/kbf-threads" }
 kbf-tier = { path = "crates/kbf-tier" }
 kbf-transfer = { path = "crates/kbf-transfer" }
 kbf-types = { path = "crates/kbf-types" }

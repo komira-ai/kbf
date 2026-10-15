@@ -186,6 +186,14 @@ pub struct Args {
     /// off when it runs out.
     #[arg(long, default_value_t = 10)]
     pub shutdown_timeout_secs: u64,
+    /// Thread sizes: `--reserve-cpus` and `--reserve-share`, and the overrides
+    /// `--async-threads`, `--blocking-threads` and `--cpu-threads` (see `kbf_threads`).
+    /// `--cpu-threads` is the most CPU-bound jobs the server runs at once on the
+    /// blocking pool, off the request workers: today the SHA-256 and CRC-32C of
+    /// records, in the write tier's flusher before each PUT and, for an upload without
+    /// a tier, as its ranges arrive.
+    #[command(flatten)]
+    pub threads: kbf_threads::ThreadArgs,
     /// The memory, in bytes, the invocation records may take together
     /// (`docs/design/invocations.md`, section 3.5). At the bound, records of a minted id
     /// go first, then idle ones, least recently seen first; with only open builds left,
@@ -329,6 +337,9 @@ pub enum ConfigError {
         #[source]
         source: std::io::Error,
     },
+    /// `--reserve-cpus` is more than this machine has.
+    #[error("{0}")]
+    Reserve(#[from] kbf_threads::ReserveError),
     /// A segment upload could declare more than uploads may hold at once.
     #[error(
         "--segment-upload-max-bytes {cap} is over --write-bytes-in-flight {bound}: \
@@ -492,17 +503,32 @@ impl Args {
 
     /// How the cache groups and bounds uploads: `--write-linger`,
     /// `--write-own-segment-bytes`, `--write-bytes-in-flight`, `--write-puts-in-flight`
-    /// and `--store-put-attempts`.
-    #[must_use]
-    pub fn write_config(&self) -> WriteConfig {
-        WriteConfig {
+    /// `--store-put-attempts` and `--cpu-threads`.
+    ///
+    /// # Errors
+    /// `--reserve-cpus` is more than the machine has.
+    pub fn write_config(&self) -> Result<WriteConfig, ConfigError> {
+        Ok(WriteConfig {
             linger: Duration::from_millis(self.write_linger),
             own_segment_bytes: self.write_own_segment_bytes,
             bytes_in_flight: self.write_bytes_in_flight,
             puts_in_flight: self.write_puts_in_flight,
             // clap refuses 0.
             put_attempts: NonZeroU32::new(self.store_put_attempts).unwrap_or(NonZeroU32::MIN),
-        }
+            cpu_threads: self.cpu_threads()?,
+        })
+    }
+
+    /// The width of the CPU-bound pool on this machine: `--cpu-threads`, else from the
+    /// reserve (`kbf_threads`).
+    ///
+    /// # Errors
+    /// `--reserve-cpus` is more than the machine has.
+    pub fn cpu_threads(&self) -> Result<NonZeroUsize, ConfigError> {
+        let sizes = self
+            .threads
+            .resolve(kbf_threads::Role::Server, kbf_threads::Topology::detect())?;
+        Ok(NonZeroUsize::new(sizes.cpu_threads()).unwrap_or(NonZeroUsize::MIN))
     }
 
     /// The raft directory under `--meta-log=raft`; `None` under `--meta-log=memory`.
@@ -585,7 +611,7 @@ mod tests {
     use clap::Parser;
     use kbf_front::{MAX_BLOB_BYTES, MemoryByCategory, WriteConfig};
 
-    use super::{Args, loopback_only};
+    use super::{Args, ConfigError, loopback_only};
 
     /// Catches: `--book-mem-gib-by-category` not handed to the listeners (the farm then
     /// books 1 GiB for every category), a default other than the empty table (a server
@@ -663,6 +689,27 @@ mod tests {
         assert_eq!(both.raft_dir().expect("raft"), Some(Path::new("/r")));
         let on = both.write_tier();
         assert_eq!(on.map(|(d, o)| (d, o.budget)), Some(("/t".into(), 9)));
+    }
+
+    /// Catches a `--cpu-threads` that does not reach the cache's hashing pool (the
+    /// flusher would hash on the default width whatever the operator set), a default
+    /// that is not the reserve's (`kbf_threads`: the server's own `Args::cpu_threads`),
+    /// a reserve more than the machine has accepted, and 0 accepted (a pool that
+    /// never runs a job). Parsing at all catches a second `--cpu-threads` (clap panics
+    /// on a duplicate name).
+    #[test]
+    fn cpu_threads_reaches_the_hashing_pool() {
+        let args = Args::parse_from(["kbf-server"]);
+        let defaults = args.write_config().expect("write config");
+        assert_eq!(defaults.cpu_threads, args.cpu_threads().expect("sized"));
+        let set = Args::parse_from(["kbf-server", "--cpu-threads=7"])
+            .write_config()
+            .expect("write config");
+        assert_eq!(set.cpu_threads.get(), 7);
+        assert!(Args::try_parse_from(["kbf-server", "--cpu-threads=0"]).is_err());
+        let over = Args::parse_from(["kbf-server", "--reserve-cpus=100000"]);
+        assert!(matches!(over.write_config(), Err(ConfigError::Reserve(_))));
+        assert!(matches!(over.cpu_threads(), Err(ConfigError::Reserve(_))));
     }
 
     /// Catches a `--segment-upload-*` flag that does not reach the listeners, a default
@@ -751,8 +798,17 @@ mod tests {
     /// the write configuration, and defaults other than the design's.
     #[test]
     fn write_flags_make_the_write_config() {
-        let defaults = Args::parse_from(["kbf-server"]).write_config();
-        assert_eq!(defaults, WriteConfig::DEFAULT);
+        let defaults = Args::parse_from(["kbf-server"])
+            .write_config()
+            .expect("write config");
+        // The CPU pool's width is the reserve's (`kbf_threads`), not the front's default.
+        assert_eq!(
+            defaults,
+            WriteConfig {
+                cpu_threads: defaults.cpu_threads,
+                ..WriteConfig::DEFAULT
+            }
+        );
         let set = Args::parse_from([
             "kbf-server",
             "--write-linger",
@@ -765,6 +821,8 @@ mod tests {
             "9",
             "--store-put-attempts",
             "5",
+            "--cpu-threads",
+            "3",
         ]);
         let want = WriteConfig {
             linger: Duration::from_millis(7),
@@ -772,8 +830,9 @@ mod tests {
             bytes_in_flight: MAX_BLOB_BYTES,
             puts_in_flight: NonZeroUsize::new(9).expect("9"),
             put_attempts: NonZeroU32::new(5).expect("5"),
+            cpu_threads: NonZeroUsize::new(3).expect("3"),
         };
-        assert_eq!(set.write_config(), want);
+        assert_eq!(set.write_config().expect("write config"), want);
         let below = (MAX_BLOB_BYTES - 1).to_string();
         for (flag, value) in [
             ("--write-bytes-in-flight", below.as_str()),

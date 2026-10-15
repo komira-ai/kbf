@@ -47,6 +47,7 @@ mod cache;
 mod capabilities;
 mod cas;
 mod category;
+mod cpu;
 mod execution;
 mod meta_log;
 pub mod metrics;
