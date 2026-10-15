@@ -29,7 +29,9 @@ use tonic::Code;
 use tonic::metadata::MetadataValue;
 use tonic::{Request, Streaming};
 
-use crate::support::{Blob, Cell, Job, done, failed, output, ran, response, stamped_response};
+use crate::support::{
+    Blob, Cell, Job, done, failed, output, ran, report_every_run, response, stamped_response,
+};
 
 /// The build's id, as buck2 prints it (`Build ID:`).
 const BUILD: &str = "0b8c2f0e-6d1a-4c55-9a7e-2f43d1c0a9b4";
@@ -184,11 +186,18 @@ async fn a_build_records_a_hit_a_run_a_requeue_and_a_failure() {
     let mut ops = execute(&cell, BUILD, &fail.action).await;
     let start = daemon.start().await;
     let why = "image docker://registry.test/base@sha256:00 is not in this node's image store";
-    let mut report = failed(start.lease_id, Code::Internal);
-    report.status.as_mut().expect("a status").message = why.to_owned();
-    assert!(daemon.report(report).await.accepted);
+    // The farm's failure is run again; the last run's report finishes the operation.
+    report_every_run(&mut daemon, start, |lease| {
+        let mut report = failed(lease, Code::Internal);
+        report.status.as_mut().expect("a status").message = why.to_owned();
+        report
+    })
+    .await;
     let status = response(&done(&mut ops).await).status.expect("a status");
-    assert_eq!(status.message, "the farm could not run the action");
+    assert!(
+        status.message.starts_with("kbf farm fault on node-a:"),
+        "{status:?}"
+    );
 
     let inv = record(&cell, BUILD).await;
     assert!(inv.complete(), "no event was dropped");
@@ -247,8 +256,19 @@ async fn a_build_records_a_hit_a_run_a_requeue_and_a_failure() {
         fail_row.outcome,
         Some(Outcome::Failed {
             code: Code::Internal as i32,
-            message: "the farm could not run the action".to_owned(),
+            message: "kbf farm fault on node-a: the farm could not run the action (infra \
+                      failure), and its reruns are used up. Operator fix: read the node \
+                      daemon's log for why its driver failed. Runs: 3 (node-a, infra \
+                      failure; node-a, infra failure; node-a, infra failure)."
+                .to_owned(),
         })
+    );
+    let ends: Vec<_> = fail_row.attempts.iter().map(|a| a.end.clone()).collect();
+    let again = Some(AttemptEnd::Requeued(RequeueReason::Infra));
+    assert_eq!(
+        ends[..2],
+        [again.clone(), again],
+        "the first two runs were run again"
     );
     let end = fail_row.attempts.last().and_then(|a| a.end.clone());
     assert_eq!(

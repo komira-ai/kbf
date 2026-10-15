@@ -35,16 +35,24 @@ impl Checker {
             let class = (op.needs, op.request.resources);
             let needs = &self.needs[op.needs];
             let mut placed = false;
-            if grants.len() < PLACEMENT_ROUND && !no_room.contains(&class) {
+            // An operation with farm runs avoids their workers while another could run
+            // it, so its fit is its own, not its class's.
+            let avoids = !op.avoid.is_empty();
+            if grants.len() < PLACEMENT_ROUND && (avoids || !no_room.contains(&class)) {
                 let m = matching.entry(op.needs).or_insert_with(|| {
                     (0..live.len())
                         .filter(|&i| needs.matches(&self.workers[live[i]].caps))
                         .collect()
                 });
+                let avoided = |i: usize| op.avoid.contains(live[i]);
+                let elsewhere = m.iter().copied().any(|i| {
+                    !avoided(i) && fits(self.workers[live[i]].capacity, op.request.resources)
+                });
                 let fit = m.iter().copied().find(|i| {
                     let w = &self.workers[live[*i]];
                     let booked = add(w.booked, extra.get(i).copied().unwrap_or_default());
                     fits(sub(w.capacity, booked), op.request.resources)
+                        && !(elsewhere && avoided(*i))
                 });
                 match fit {
                     Some(i) => {
@@ -54,7 +62,9 @@ impl Checker {
                         placed = true;
                     }
                     None => {
-                        no_room.insert(class);
+                        if !avoids {
+                            no_room.insert(class);
+                        }
                     }
                 }
             }

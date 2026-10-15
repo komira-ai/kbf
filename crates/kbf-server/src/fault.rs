@@ -11,6 +11,7 @@
 use kbf_front::Finished;
 use kbf_proto::google::rpc;
 use kbf_proto::worker::{self, Lost};
+use kbf_sched::NOT_STARTED_RERUNS;
 use kbf_types::{FarmFault, FarmRun, LostWhy};
 use tonic::Code;
 
@@ -34,6 +35,20 @@ pub(crate) fn lost(result: &worker::Result) -> Option<LostWhy> {
 /// What the callers of an operation the scheduler finished as a farm fault, past its
 /// farm reruns, are told; `runs` are its farm runs, oldest first.
 pub(crate) fn finished(runs: &[FarmRun]) -> Finished {
+    if runs.is_empty() {
+        // No run ended as a farm fault: the scheduler gave up leases the nodes never
+        // started (`kbf_sched::NOT_STARTED_RERUNS`), so there is no node or run to name.
+        return Finished::Failed(rpc::Status {
+            code: Code::Internal as i32,
+            message: format!(
+                "kbf farm fault: the farm never started the action; {} leases were not \
+                 listed by their nodes within the start grace. Operator fix: read the node \
+                 daemons' logs for why they dropped the Start.",
+                NOT_STARTED_RERUNS + 1
+            ),
+            details: Vec::new(),
+        });
+    }
     let last = runs.last();
     let node = last.map_or("", |r| r.worker.as_str());
     let what = last.map_or_else(String::new, |r| r.fault.to_string());
@@ -63,6 +78,7 @@ const fn operator_fix(fault: FarmFault) -> &'static str {
             "find why the node's daemon restarted (its log says how it ended)"
         }
         FarmFault::Lost(LostWhy::Fenced) => "check the node's network path to the server",
+        FarmFault::Infra => "read the node daemon's log for why its driver failed",
     }
 }
 
@@ -72,5 +88,6 @@ const fn short(fault: FarmFault) -> &'static str {
         FarmFault::NodeMemoryPressure => "node memory pressure",
         FarmFault::Lost(LostWhy::DaemonRestarted) => "daemon restarted",
         FarmFault::Lost(LostWhy::Fenced) => "fenced",
+        FarmFault::Infra => "infra failure",
     }
 }
