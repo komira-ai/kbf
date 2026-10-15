@@ -154,8 +154,12 @@ Per-hardware runbook, run once per machine at first boot:
 1. Choose the name (the next free `build{n}`, `mac{n}` and so on; 4.5 gives the shape).
 2. Write it into the tag: BIOS setup, chassis asset tag; or `ipmitool fru edit <id> field p 4 <name>`
    (Product Info asset tag) over the BMC. Either is enough; setting both is fine.
-3. Read it back (`ipmitool fru print`, or boot and read `chassis_asset_tag`), then PXE boot. The
+3. Read it back (`ipmitool fru print`, or boot and read `chassis_asset_tag`), then power on with a
+   blank boot disk (it falls through to PXE, 5.1). The
    host enrolls and appears *pending* with its name and hardware id; approval binds them (4.6).
+4. After the first install, verify once per machine that the firmware boot order is still local disk
+   first (`efibootmgr` or the boot menu): the Ubuntu installer registers its own UEFI entry and may
+   reorder. Fix it in the BIOS if not (5.6).
 
 - The tag is a **hint, not proof**. A tag that no live node owns starts a *claim* the operator
   confirms (or a policy does, 4.6). A tag naming a node bound to another hwid holds the host with a
@@ -219,8 +223,10 @@ to the approver. The installer may touch only that disk and refuses to start if 
 every other disk is never in its storage config.
 
 **Arming.** Approval, and `reinstall <name>` for an existing node, arms the host: one install,
-one-shot, expiring in 2 hours. Not-armed hosts boot local, so network boot can be first in the boot
-order, a power loss never reinstalls a MinIO node and a stray reboot does nothing. The bootstrap
+one-shot, expiring in 2 hours. The boot order is local disk first (5.1), so an installed host never
+reaches the network at all; arming is the second guard for a stray network boot (a one-time BMC
+or menu boot, a disk that stops being bootable): a not-armed host is told to boot local, so a power
+loss never reinstalls a MinIO node and a stray reboot does nothing. The bootstrap
 token is minted at arming, stored in the registry and delivered once:
 
 1. The installer fetches `GET /seed/<hwid>` over TLS pinned to the root (embedded in iPXE). The first
@@ -285,7 +291,9 @@ under `fleet/audit/<date>/` (object lock if supported) with the key id or policy
 ### 5.1 Linux: DHCP to iPXE to the boot endpoint
 
 ```
-power on -> UEFI PXE -> site DHCP (opt 66 = boot host, opt 67 = ipxe.efi) -> TFTP: the iPXE binary
+power on -> UEFI boot order: local disk first; a blank or unbootable disk falls through to
+  network boot (an installed host boots its disk every time and never gets here)
+  -> UEFI PXE -> site DHCP (opt 66 = boot host, opt 67 = ipxe.efi) -> TFTP: the iPXE binary
   -> iPXE (embedded script + root) chains https://boot.example.net/boot?mac=..&uuid=..&serial=..
                                            &asset=..&buildarch=..
   -> endpoint decides (5.2): discover | install | local | rescue | wait
@@ -293,6 +301,14 @@ power on -> UEFI PXE -> site DHCP (opt 66 = boot host, opt 67 = ipxe.efi) -> TFT
   -> kbf-firstboot.service: verify binary, enroll (4.7), node apply
 ```
 
+- **PXE is for installs.** The firmware boot order is local disk first, network second. A new
+  machine has a blank disk, so it falls through to PXE and the autoinstall puts Ubuntu on the boot
+  drive; after that the machine boots that disk every time. The boot server can be down without
+  affecting any running host. Reinstalling is explicit: a one-time network boot set through the BMC
+  (for example `ipmitool chassis bootdev pxe`, which applies to the next boot only) or the firmware
+  boot menu, together with `reinstall <name>` (4.6).
+- The Ubuntu installer registers its own UEFI boot entry, which can change the order the operator
+  set. The runbook verifies disk-first order once per machine after the first install (4.4, 5.6).
 - The UniFi gateway hands every PXE client the same two values and **cannot vary the image by
   platform**; it does not need to, because the decision is in the HTTP endpoint. No proxyDHCP in the
   first cut.
@@ -312,7 +328,7 @@ policy and image catalogue:
 | unknown hwid | record `pending`; serve **discovery** |
 | `pending` | discovery again (it polls; the host sits at a prompt) |
 | `approved`, armed, in window | the catalogue's image for this host, with its seed URL on the command line |
-| `active`, not armed | `exit`: boot the local disk |
+| `active`, not armed | `exit`: boot the local disk (reached only by a stray network boot; the endpoint mainly serves installs) |
 | `active`, rescue requested (`rescue <name>`, one-shot, expires) | the catalogue's rescue image |
 | `retired` or conflict | `exit` and an alert; never an install |
 | endpoint unreachable | `exit` to local disk after a retry budget |
@@ -365,7 +381,7 @@ count. Servers are never updated in parallel.
 - **Network:** a provisioning VLAN with only the farm's hosts; DHCP reservations for servers and
   options 66 and 67; DNS for the server, object and boot URLs; switch DHCP snooping and port
   security; NTP; outbound or an apt mirror during install; for Macs, outbound to Apple.
-- **BIOS:** UEFI; PXE over IPv4 first (safe: not-armed hosts boot local); restore-on-AC-power on;
+- **BIOS:** UEFI; boot order **local disk first, PXE over IPv4 second** (a blank disk falls through to PXE; an installed host never touches the network boot path; verify the order once per machine after the first install, because the Ubuntu installer registers its own boot entry and can reorder); restore-on-AC-power on;
   admin password; time set. **Secure Boot off** in the first cut (iPXE is not shim-signed;
   decision 6).
 - **BMC:** on a separate management network; kbf uses it only to read the FRU name, and optionally write one back (4.4),
@@ -505,7 +521,7 @@ release.
 | Add a Linux host | rack, cable (power, provisioning port, BMC), power on; `nodes --pending`; check serial and address against the box; `approve`; label the chassis with the printed name. An unrecognized host stays pending; a 409 alert means another machine took the seed (`reinstall`). |
 | Add a server | `approve --role server` shows the OS and data disks the rules chose and waits for your token; `status` shows server healthy, MinIO online, voter joined before the next |
 | Add a Mac | `mac assign <serial>`; power on (the first needs a display and keyboard); `approve <serial>`. Stuck in Setup Assistant: not ADE-assigned, fix ABM, erase through the MDM |
-| Remove, replace, rebuild | `retire <name>`; `replace <name>`, power on the new board, `approve`; `reinstall <name>` (a live host network-boots by itself, a dead one needs a power cycle) |
+| Remove, replace, rebuild | `retire <name>`; `replace <name>`, power on the new board, `approve`; `reinstall <name>` (set a one-time network boot first, `ipmitool chassis bootdev pxe` over the BMC or the firmware boot menu, then power cycle; the bootdev applies to the next boot only) |
 | Change a label or `reserve_cpus`, roll a release | edit `overrides.toml` or a profile rule, `apply`; `rollout <release> --pool ...` |
 | Replace a MinIO drive | swap it; `node doctor` prints the heal command and waits; never two drives on one node |
 
@@ -607,8 +623,8 @@ certificate. (9) Linux builders, then Macs.
 
 Secure Enclave storage of the Mac node key; switch-port or LLDP mapping to rack slots (feeds naming
 rules); TPM-backed enrollment; the macOS node agent and the CI build of iPXE; an arm64 Linux class
-(option 93 through proxyDHCP, or a second VLAN); BMC-driven one-shot PXE and power cycle (Redfish or
-IPMI) so a dead host reinstalls without a person; unattended Mac enrollment on the newest macOS, MDM
+(option 93 through proxyDHCP, or a second VLAN); automating the one-time BMC network boot and power cycle (Redfish or
+IPMI) so `reinstall` needs no person; unattended Mac enrollment on the newest macOS, MDM
 reachability and the 15-minute install figure ([A] until measured); server HA depends on ha.md.
 
 ## 18. Review record
