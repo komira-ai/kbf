@@ -49,16 +49,6 @@ struct Names {
     private: Vec<PathBuf>,
 }
 
-/// What a placed file is moded as, in [`LinkMode::Clone`] (a hard link is the entry's
-/// inode, so it is always the entry's mode).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Want {
-    /// An input: 0644, 0755 when executable, as without the cache.
-    Writable,
-    /// As the entry: read-only (0444, 0555), what a shared tree's files are.
-    ReadOnly,
-}
-
 /// Writes every copy of each blob in `files` through `cache`, at most
 /// [`Cache::link_concurrency`] keys at once, as the module docs say. A name under one of `private` (absolute paths) gets a private
 /// copy. The keys are pinned until it returns. After the first error no key is
@@ -69,24 +59,20 @@ pub(crate) async fn write_files(
     files: Vec<Copies>,
     private: &[PathBuf],
 ) -> Result<InputStats, TreeError> {
-    write_files_as(cas, cache, files, private, Want::Writable).await
+    write_files_as(cas, cache, files, private, false).await
 }
 
 /// [`write_files`] with the files' mode in clone mode chosen: a tree's files are
-/// [`Want::ReadOnly`].
+/// `read_only` (0444, 0555 as the entry), an input's 0644 and 0755.
 pub(crate) async fn write_files_as(
     cas: &dyn Fetch,
     cache: &Cache,
     files: Vec<Copies>,
     private: &[PathBuf],
-    want: Want,
+    read_only: bool,
 ) -> Result<InputStats, TreeError> {
     // Only clone mode has a say: a hard link is the entry's mode already.
-    let want = if cache.link_mode() == LinkMode::Clone {
-        want
-    } else {
-        Want::Writable
-    };
+    let want = read_only && cache.link_mode() == LinkMode::Clone;
     let counts = InputCounts::default();
     let mut blobs = Vec::new();
     for blob in files {
@@ -127,7 +113,7 @@ fn plan(
     blob: Copies,
     private: &[PathBuf],
     counts: &InputCounts,
-    want: Want,
+    want: bool,
 ) -> Result<Vec<Names>, TreeError> {
     // A digest that names no SHA-256 blob is one no CAS holds.
     let key = |executable| {
@@ -176,7 +162,7 @@ async fn place(
     cache: &Cache,
     names: Names,
     counts: &InputCounts,
-    want: Want,
+    want: bool,
 ) -> Result<(), TreeError> {
     let names = Arc::new(names);
     let mut stale = false;
@@ -247,7 +233,7 @@ enum Mode {
 /// Places `names` from the bytes the cache could not keep: private copies, and one
 /// read-only copy the shared names are linked to. Whether that was a fallback (always,
 /// when there are shared names).
-fn from_bytes(bytes: &[u8], names: &Names, mode: LinkMode, want: Want) -> Result<bool, Placing> {
+fn from_bytes(bytes: &[u8], names: &Names, mode: LinkMode, want: bool) -> Result<bool, Placing> {
     let mut fill = |file: &mut std::fs::File| file.write_all(bytes);
     if mode == LinkMode::Clone {
         // Every name its own file, as clones would be.
@@ -278,7 +264,7 @@ fn from_entry(
     mode: LinkMode,
     link_max: u64,
     link: &super::LinkFn,
-    want: Want,
+    want: bool,
 ) -> Result<bool, Placing> {
     if mode == LinkMode::Clone {
         return clone_all(entry, names, link, want);
@@ -306,22 +292,23 @@ fn from_entry(
 }
 
 /// How a clone-mode file is created when it is not a clone.
-fn clone_mode(key: Key, want: Want) -> Mode {
-    match want {
-        Want::Writable => Mode::Writable(key.executable),
-        Want::ReadOnly => Mode::Entry(key),
+fn clone_mode(key: Key, read_only: bool) -> Mode {
+    if read_only {
+        Mode::Entry(key)
+    } else {
+        Mode::Writable(key.executable)
     }
 }
 
 /// Places every name of `names` as its own clone of `entry` (`link` is the clone), made
-/// writable unless `want` is [`Want::ReadOnly`] (a clone has the entry's mode). Whether
+/// writable unless `want` (read-only: a clone has the entry's mode). Whether
 /// a name fell back to a private copy. When the entry is gone, the names already placed
 /// are removed, so the key's next attempt starts from none.
 fn clone_all(
     entry: &Path,
     names: &Names,
     link: &super::LinkFn,
-    want: Want,
+    want: bool,
 ) -> Result<bool, Placing> {
     let executable = names.key.executable;
     let mut fell_back = false;
@@ -330,9 +317,10 @@ fn clone_all(
         let cloned = match link(entry, path) {
             Ok(()) => {
                 placed.push(path);
-                match want {
-                    Want::Writable => make_writable(path, executable).map_err(failed(path)),
-                    Want::ReadOnly => Ok(()),
+                if want {
+                    Ok(())
+                } else {
+                    make_writable(path, executable).map_err(failed(path))
                 }
             }
             Err(e) if e.raw_os_error() == Some(libc::ENOENT) => Err(Placing::Gone),

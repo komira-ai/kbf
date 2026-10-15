@@ -92,6 +92,8 @@ enum Dirs {
     Real,
     /// Refuses with this errno, as a filesystem without `clonefile` does.
     Refuse(i32),
+    /// No clone at all: the driver mounts (the Linux container driver's delivery).
+    Mount,
 }
 
 /// A node's cache (clone mode), tree store (clone delivery) and CAS in a scratch
@@ -138,8 +140,12 @@ fn kit(name: &str, dirs: Dirs) -> Kit {
         match dirs {
             Dirs::Real => real(from, to),
             Dirs::Refuse(errno) => Err(std::io::Error::from_raw_os_error(errno)),
+            Dirs::Mount => unreachable!("a mount delivery never clones"),
         }
     }));
+    if matches!(dirs, Dirs::Mount) {
+        trees.delivery = Delivery::Mount;
+    }
     Kit {
         trees: Trees::open(trees).expect("open the store"),
         cas: Arc::new(CountingCas::default()),
@@ -636,4 +642,23 @@ async fn symlinks_stay_links_and_a_shared_blob_is_written_at_every_name() {
         );
         assert_eq!(std::fs::read(dir.join("beside")).unwrap(), b"same bytes");
     }
+}
+
+/// Catches clone delivery leaking into the mount delivery (the container driver's): with
+/// `Delivery::Mount` a lease's tree is a mount for the driver, pinned, with an empty
+/// directory at its path, and no clone is made. Kept in this binary with the clone tests:
+/// the daemon's coverage counts the best single copy of `materialize`, which must run
+/// both deliveries.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_mount_delivery_hands_the_tree_to_the_driver_and_clones_nothing() {
+    let kit = kit("trees-clone-mount", Dirs::Mount);
+    let root = input(&kit, "mount");
+    let (dir, inputs) = kit.lease(&root, "lease-1").await;
+    assert_eq!((inputs.trees_cloned, kit.dirs()), (0, 0));
+    assert_eq!(inputs.mounts.len(), 1);
+    assert_eq!(inputs.mounts[0].path, "tc");
+    assert_eq!(inputs.mounts[0].source, the_tree(&kit));
+    assert_eq!(inputs.trees.len(), 1, "the tree is pinned for the driver");
+    assert!(std::fs::read_dir(dir.join("tc")).unwrap().next().is_none());
+    assert_eq!(kit.trees.store().stats().pinned, 1);
 }

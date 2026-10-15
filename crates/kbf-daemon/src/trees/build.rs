@@ -9,7 +9,6 @@ use kbf_proto::reapi::Digest;
 use rustix::fs::{CWD, RenameFlags};
 
 use super::classify::{MAX_DIRECTORIES, Summary, load};
-use crate::cache::lease::Want;
 use crate::cache::{Cache, InputStats};
 use crate::cas::{Fetch, label};
 use crate::tree::{Loaded, TreeError, io as io_error, make_directories};
@@ -34,8 +33,7 @@ pub(super) async fn build(
     let loaded = load(cas, in_flight, digest, known, &|_, _| false, max).await?;
     let walked =
         make_directories(cas, in_flight, digest, tmp, &loaded, &Default::default()).await?;
-    let stats =
-        crate::cache::lease::write_files_as(cas, cache, walked.files, &[], Want::ReadOnly).await?;
+    let stats = crate::cache::lease::write_files_as(cas, cache, walked.files, &[], true).await?;
     let summary = check(loaded, digest.clone(), tmp.to_owned()).await?;
     Ok((summary, stats))
 }

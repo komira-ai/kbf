@@ -239,42 +239,17 @@ impl Trees {
             // The empty mount points become the lease's own copies of the trees. The
             // pins end with this: a clone does not need the tree.
             let cloning = Instant::now();
-            for mount in std::mem::take(&mut mounts) {
-                let at = dir.join(&mount.path);
-                let (from, clone) = (mount.source.clone(), Arc::clone(clone));
-                let to = at.clone();
-                let placed = tokio::task::spawn_blocking(move || place::place(&*clone, &from, &to))
-                    .await
-                    .expect("cloning a tree panicked")
-                    .map_err(io_error(&at))?;
-                match placed {
-                    place::Placed::Cloned => cloned += 1,
-                    place::Placed::Refused(why) => {
-                        if !self.refusal_logged.swap(true, Ordering::Relaxed) {
-                            tracing::warn!(
-                                "trees: the filesystem refused to clone a tree ({why}); its files are written one by one"
-                            );
-                        }
-                        // The tree's node is written as a plain directory: its
-                        // messages, then its files through the cache.
-                        let node = chosen
-                            .iter()
-                            .find(|c| c.path == mount.path)
-                            .expect("a mount is a chosen node");
-                        let sub = make_directories(
-                            &reads,
-                            in_flight,
-                            &node.digest,
-                            &at,
-                            &loaded,
-                            &HashSet::new(),
-                        )
-                        .await?;
-                        dirs_made += sub.dirs_made;
-                        merge(&mut files, sub.files);
-                    }
-                }
-            }
+            let node = Node {
+                reads: &reads,
+                in_flight,
+                dir,
+                loaded: &loaded,
+            };
+            let mounts = std::mem::take(&mut mounts);
+            let (done, made) = self
+                .clone_trees(clone, &node, mounts, &chosen, &mut files)
+                .await?;
+            (cloned, dirs_made) = (done, dirs_made + made);
             leases.clear();
             trees_ms += millis(cloning);
         }
@@ -300,6 +275,62 @@ impl Trees {
             phases,
         })
     }
+
+    /// Replaces each of `mounts` (an empty directory in `node.dir`) with a clone of its
+    /// tree; a tree the filesystem refuses is written as a plain directory instead and
+    /// its files are added to `files`. Returns the trees cloned and the directories made
+    /// by the plain ones.
+    async fn clone_trees(
+        &self,
+        clone: &Arc<CloneDirFn>,
+        node: &Node<'_>,
+        mounts: Vec<SharedMount>,
+        chosen: &[classify::Candidate],
+        files: &mut Vec<Copies>,
+    ) -> Result<(u64, u64), TreeError> {
+        let (mut cloned, mut dirs_made) = (0, 0);
+        for mount in mounts {
+            let at = node.dir.join(&mount.path);
+            let (from, clone, to) = (mount.source, Arc::clone(clone), at.clone());
+            let placed = tokio::task::spawn_blocking(move || place::place(&*clone, &from, &to))
+                .await
+                .expect("cloning a tree panicked")
+                .map_err(io_error(&at))?;
+            let place::Placed::Refused(why) = placed else {
+                cloned += 1;
+                continue;
+            };
+            if !self.refusal_logged.swap(true, Ordering::Relaxed) {
+                tracing::warn!(
+                    "trees: the filesystem refused to clone a tree ({why}); its files are written one by one"
+                );
+            }
+            // The tree's node is written as a plain directory: its messages, then its
+            // files through the cache.
+            let tree = chosen.iter().find(|c| c.path == mount.path);
+            let tree = tree.expect("a mount is a chosen node");
+            let sub = make_directories(
+                node.reads,
+                node.in_flight,
+                &tree.digest,
+                &at,
+                node.loaded,
+                &HashSet::new(),
+            )
+            .await?;
+            dirs_made += sub.dirs_made;
+            merge(files, sub.files);
+        }
+        Ok((cloned, dirs_made))
+    }
+}
+
+/// What a clone of a tree needs of the walk that made the lease's directories.
+struct Node<'a> {
+    reads: &'a dyn Fetch,
+    in_flight: usize,
+    dir: &'a std::path::Path,
+    loaded: &'a Loaded,
 }
 
 /// Adds `more` to `files`, one entry per digest (a blob's names are placed together).
