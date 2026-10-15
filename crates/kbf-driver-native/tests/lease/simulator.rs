@@ -700,7 +700,8 @@ async fn the_probe_project_is_there_for_the_looks_and_gone_for_the_action() {
     let dir = scratch("sim-probe");
     let seen = dir.join("seen");
     let extra = format!(
-        "{SHOW}\t-\tcopy {seen} Package.swift ; cat {}/bin/showdestinations.txt\n",
+        "{SHOW}\t-\tcopy {} Package.swift ; cat {}/bin/showdestinations.txt\n",
+        seen.display(),
         dir.display()
     );
     let (config, _) = listing_config(&dir, &extra, PROMPT, Duration::from_millis(10));
