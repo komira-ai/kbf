@@ -8,6 +8,7 @@ mod fake_clock;
 mod fake_directory_blobs;
 mod fake_memory;
 mod fake_missing_blobs;
+mod fake_stopped;
 mod support;
 
 use std::path::{Path, PathBuf};

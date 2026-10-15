@@ -487,7 +487,7 @@ impl<C: Cas> PodmanRuntime<C> {
                 }
             }
 
-            let ended = self.podman.ended(&lease.name).await;
+            let ended = self.podman.ended(&lease.name, &stderr_path).await;
             // An exec that failed with ETXTBSY (`program::text_file_busy`) is started once
             // more: the write descriptor that caused it is gone by now.
             if started == 1

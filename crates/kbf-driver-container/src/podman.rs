@@ -10,6 +10,8 @@ use std::process::Stdio;
 
 use tokio::process::{Child, Command};
 
+use crate::exit_record;
+
 /// Where the input root appears inside the container.
 pub const EXEC_ROOT: &str = "/kbf/root";
 
@@ -278,25 +280,27 @@ impl Podman {
     /// How the container ended, from Podman's record, not from `podman start`'s own
     /// status, which also reports Podman's errors: its exit code, or the state of a
     /// container that did not run to an exit.
-    pub(crate) async fn ended(&self, name: &str) -> Result<Ended, String> {
-        let args = [
-            "inspect",
-            "--type=container",
-            "--format={{.State.Status}} {{.State.ExitCode}}",
-            name,
-        ]
-        .map(OsString::from);
-        let output = self.output(&args).await?;
-        if !output.status.success() {
-            return Err(failure("inspect", &output));
-        }
-        let text = String::from_utf8_lossy(&output.stdout);
-        match text.split_whitespace().collect::<Vec<_>>()[..] {
-            ["exited", code] => code
-                .parse()
-                .map(Ended::Exited)
-                .map_err(|_| format!("podman inspect: exit code {code:?}")),
-            _ => Ok(Ended::NotRun(text.trim().to_owned())),
+    ///
+    /// An exit is taken only from a record that says one was recorded (`FinishedAt`
+    /// set, [`crate::exit_record`]): `stopped` (Podman has read the exit but not yet
+    /// cleaned up) or `exited`. A `stopped` or `exited` record without one is read
+    /// again until it has one, for at most [`crate::exit_record::DEADLINE`]; past it
+    /// the error names Podman's last record and what `podman start` wrote to `stderr`.
+    /// The container is never started again.
+    pub(crate) async fn ended(&self, name: &str, stderr: &Path) -> Result<Ended, String> {
+        let inspect = || async {
+            let args =
+                ["inspect", "--type=container", exit_record::FORMAT, name].map(OsString::from);
+            let output = self.output(&args).await?;
+            if output.status.success() {
+                Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+            } else {
+                Err(failure("inspect", &output))
+            }
+        };
+        match exit_record::wait(inspect, exit_record::DEADLINE, exit_record::EVERY).await {
+            Ok(ended) => Ok(ended),
+            Err(no_exit) => Err(no_exit.reason(stderr).await),
         }
     }
 
