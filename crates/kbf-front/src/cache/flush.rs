@@ -160,7 +160,7 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
     ) -> Result<Flushed, CacheError> {
         let tier = std::sync::Arc::clone(&staging.tier);
         let n = usize::try_from(len).unwrap_or(usize::MAX);
-        let records = blocking(Box::new(move || tier.read(object, 0, n))).await?;
+        let records = blocking(self.metrics(), Box::new(move || tier.read(object, 0, n))).await?;
         let listed = blobs.to_vec();
         let (records, found) = self
             .hashing()

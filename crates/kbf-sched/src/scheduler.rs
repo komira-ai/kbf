@@ -356,6 +356,18 @@ impl Scheduler {
         self.ops.get(&operation).map(|op| &op.request.qos)
     }
 
+    /// How many operations wait for a lease.
+    #[must_use]
+    pub fn queued_len(&self) -> usize {
+        self.queue.len()
+    }
+
+    /// How many leases are held (granted or running), on all workers.
+    #[must_use]
+    pub fn leases_held(&self) -> usize {
+        self.held.len()
+    }
+
     /// Queued operations in the order placement will consider them.
     pub fn queued(&self) -> impl Iterator<Item = OperationId> + '_ {
         self.queue.iter().map(|(_, id)| *id)

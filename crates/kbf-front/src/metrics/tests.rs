@@ -148,6 +148,14 @@ fn every_family_is_printed_once_with_its_type() {
     metrics.find_missing_digests.add(15);
     metrics.find_missing_missing.add(16);
     let _raised = metrics.batch_update.in_flight.raise();
+    metrics.execute_dir_reads.add(17);
+    metrics.sched_queued.set(18);
+    metrics.sched_leases.set(19);
+    let _presubmit = metrics.execute_presubmit_in_flight.raise();
+    let (_tier, _tier2) = (
+        metrics.tier_in_flight.raise(),
+        metrics.tier_in_flight.raise(),
+    );
     let text = metrics.render();
     let types: Vec<&str> = lines(&text, "# TYPE ")
         .iter()
@@ -182,6 +190,20 @@ fn every_family_is_printed_once_with_its_type() {
             "kbf_segment_bytes histogram",
             "kbf_object_get_seconds histogram",
             "kbf_meta_query_seconds histogram",
+            "kbf_execute_presubmit_seconds histogram",
+            "kbf_execute_walk_seconds histogram",
+            "kbf_execute_submit_seconds histogram",
+            "kbf_sched_lock_wait_seconds histogram",
+            "kbf_tier_wait_seconds histogram",
+            "kbf_tier_call_seconds histogram",
+            "kbf_execute_presubmit_in_flight gauge",
+            "kbf_execute_dir_reads_total counter",
+            "kbf_input_directories_cached_total counter",
+            "kbf_input_directories_skipped_total counter",
+            "kbf_input_directories_joined_total counter",
+            "kbf_sched_queued gauge",
+            "kbf_sched_leases gauge",
+            "kbf_tier_in_flight gauge",
             "kbf_meta_commit_seconds histogram",
             "kbf_execute_requests_total counter",
             "kbf_execute_errors_total counter",
@@ -203,6 +225,11 @@ fn every_family_is_printed_once_with_its_type() {
         ("kbf_find_missing_missing_total", 16),
         ("kbf_batch_update_in_flight", 1),
         ("kbf_bytestream_write_in_flight", 0),
+        ("kbf_execute_dir_reads_total", 17),
+        ("kbf_sched_queued", 18),
+        ("kbf_sched_leases", 19),
+        ("kbf_execute_presubmit_in_flight", 1),
+        ("kbf_tier_in_flight", 2),
     ] {
         assert_eq!(
             lines(&text, &format!("{name} ")),

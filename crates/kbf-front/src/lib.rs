@@ -48,6 +48,7 @@ mod capabilities;
 mod cas;
 mod cpu;
 mod execution;
+mod input_tree;
 mod meta_log;
 pub mod metrics;
 mod recorder;
@@ -81,6 +82,7 @@ pub use crate::execution::{
     ExecutionService, Finished, GPU_KEY, LEASE_KIND_KEY, LEASE_KINDS, NO_WORKER_REASON,
     OperationStream, Stage, Submission, Ticket, closing, missing_status,
 };
+pub use crate::input_tree::{ENTRY_OVERHEAD, InputTreeConfig};
 pub use crate::meta_log::{Leadership, MemoryMetaLog, MetaLog, MetaLogError};
 pub use crate::recorder::{
     DEFAULT_INVOCATION_MEMORY, ExecuteCall, RECORDER_CHANNEL, Recorder, Recording, listing, owner,
