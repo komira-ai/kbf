@@ -66,7 +66,6 @@
 //! `kbf-lease` and `OSFamily`, never ignored. One name sent in two spellings is
 //! INVALID_ARGUMENT.
 
-use std::collections::{BTreeSet, VecDeque};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -82,7 +81,7 @@ use kbf_proto::google::rpc::{
 };
 use kbf_proto::reapi::execution_server::Execution;
 use kbf_proto::reapi::{
-    self, Action, Command, Directory, ExecuteOperationMetadata, ExecuteRequest, ExecuteResponse,
+    self, Action, Command, ExecuteOperationMetadata, ExecuteRequest, ExecuteResponse,
     ExecutedActionMetadata, WaitExecutionRequest, execution_stage,
 };
 use kbf_sched::Request;
@@ -486,13 +485,15 @@ where
             }
         };
         let walking = Instant::now();
-        let walked = self.missing_inputs(root, window).await;
+        let walked = self.cache.walk_inputs(root).await;
         window.walk = walking.elapsed();
         self.cache
             .metrics()
             .execute_walk
             .observe_duration(window.walk);
-        absent.extend(walked?);
+        let walked = walked?;
+        window.dir_reads += walked.dirs_read;
+        absent.extend(walked.absent);
         if !absent.is_empty() {
             return Err(missing(&absent));
         }
@@ -516,42 +517,6 @@ where
             call: None,
         };
         Ok((submission, command_digest))
-    }
-
-    /// Every blob of the input tree under `root` that is not held: directories that
-    /// cannot be read, and files FindMissingBlobs reports.
-    async fn missing_inputs(
-        &self,
-        root: Digest,
-        window: &mut Presubmit<'_>,
-    ) -> Result<Vec<Digest>, Status> {
-        let mut absent = Vec::new();
-        let mut files = BTreeSet::new();
-        let mut seen = BTreeSet::from([root]);
-        let mut queue = VecDeque::from([root]);
-        while let Some(digest) = queue.pop_front() {
-            self.cache.metrics().execute_dir_reads.add(1);
-            window.dir_reads += 1;
-            let Some(bytes) = self.read_input(&digest).await? else {
-                absent.push(digest);
-                continue;
-            };
-            let directory = Directory::decode(bytes).map_err(|e| {
-                Status::invalid_argument(format!("input directory {digest} does not decode: {e}"))
-            })?;
-            for file in &directory.files {
-                files.insert(wire::digest(file.digest.as_ref())?);
-            }
-            for child in &directory.directories {
-                let child = wire::digest(child.digest.as_ref())?;
-                if seen.insert(child) {
-                    queue.push_back(child);
-                }
-            }
-        }
-        let files: Vec<Digest> = files.into_iter().collect();
-        absent.extend(self.cache.find_missing(&files).await?);
-        Ok(absent)
     }
 
     /// A blob's bytes, or `None` if it is not held. Anything else (unreachable, store

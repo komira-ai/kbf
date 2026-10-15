@@ -278,6 +278,18 @@ pub struct Args {
         value_parser = clap::value_parser!(u32).range(1..=5)
     )]
     pub store_put_attempts: u32,
+    /// The most decoded Directories an Execute's input check keeps in memory
+    /// (`docs/design/storage.md#input-tree-check`). Least recently used go first.
+    #[arg(long, default_value_t = kbf_front::InputTreeConfig::DEFAULT.max_entries)]
+    pub input_tree_cache_entries: NonZeroUsize,
+    /// The most bytes of decoded Directories the input check keeps (each costs its
+    /// digests, 40 bytes apiece, and 160 bytes).
+    #[arg(long, default_value_t = kbf_front::InputTreeConfig::DEFAULT.max_bytes)]
+    pub input_tree_cache_bytes: u64,
+    /// The most Directory blobs the input check reads from the store at once, across
+    /// all Executes.
+    #[arg(long, default_value_t = kbf_front::InputTreeConfig::DEFAULT.reads_in_flight)]
+    pub input_tree_reads_in_flight: NonZeroUsize,
     /// The local write tier (`docs/design/write-path.md`, section 6). Off unless
     /// `--write-tier-dir` is given.
     #[command(flatten)]
@@ -492,6 +504,17 @@ impl Args {
             puts_in_flight: self.write_puts_in_flight,
             // clap refuses 0.
             put_attempts: NonZeroU32::new(self.store_put_attempts).unwrap_or(NonZeroU32::MIN),
+        }
+    }
+
+    /// How the cache remembers input trees: `--input-tree-cache-entries`,
+    /// `--input-tree-cache-bytes` and `--input-tree-reads-in-flight`.
+    #[must_use]
+    pub const fn input_tree_config(&self) -> kbf_front::InputTreeConfig {
+        kbf_front::InputTreeConfig {
+            max_entries: self.input_tree_cache_entries,
+            max_bytes: self.input_tree_cache_bytes,
+            reads_in_flight: self.input_tree_reads_in_flight,
         }
     }
 
@@ -712,6 +735,35 @@ mod tests {
                 .expect_err("a cap over one admission");
             let message = refused.to_string();
             assert!(message.contains("--segment-upload-max-bytes"), "{message}");
+        }
+    }
+
+    /// Catches the input-tree flags not reaching the config, a zero where the check
+    /// needs at least one, and defaults other than the design's.
+    #[test]
+    fn input_tree_flags_make_the_input_tree_config() {
+        let defaults = Args::parse_from(["kbf-server"]).input_tree_config();
+        assert_eq!(defaults, kbf_front::InputTreeConfig::DEFAULT);
+        let set = Args::parse_from([
+            "kbf-server",
+            "--input-tree-cache-entries",
+            "11",
+            "--input-tree-cache-bytes",
+            "2222",
+            "--input-tree-reads-in-flight",
+            "3",
+        ]);
+        let want = kbf_front::InputTreeConfig {
+            max_entries: NonZeroUsize::new(11).expect("11"),
+            max_bytes: 2222,
+            reads_in_flight: NonZeroUsize::new(3).expect("3"),
+        };
+        assert_eq!(set.input_tree_config(), want);
+        for flag in ["--input-tree-cache-entries", "--input-tree-reads-in-flight"] {
+            assert!(
+                Args::try_parse_from(["kbf-server", flag, "0"]).is_err(),
+                "{flag}"
+            );
         }
     }
 

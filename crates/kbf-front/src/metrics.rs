@@ -385,10 +385,12 @@ pub struct CacheMetrics {
     pub execute_presubmit: Histogram,
     /// Execute calls begun and not yet at their first stream item.
     pub execute_presubmit_in_flight: Gauge,
-    /// The input-tree check of one Execute: the directories read, then one
-    /// FindMissingBlobs over the files.
+    /// The input-tree check of one Execute ([`crate::Cache::missing_inputs`]), whole:
+    /// directories read, taken from memory or skipped, the presence checks, and any
+    /// wait for a check another request is running.
     pub execute_walk: Histogram,
-    /// Directories the input-tree checks read, one per read whether or not it hit.
+    /// Directory blobs the input-tree checks read from the store, counted as each read
+    /// starts.
     pub execute_dir_reads: Counter,
     /// One call of the scheduler's submit from an Execute, the wait for its lock
     /// included.
@@ -405,6 +407,15 @@ pub struct CacheMetrics {
     pub tier_wait: Histogram,
     /// One write-tier call, from its hand-over to the blocking pool to its answer.
     pub tier_call: Histogram,
+    /// Directories the input check took from the decoded-directory cache, touching the
+    /// blob but reading nothing.
+    pub input_dirs_cached: Counter,
+    /// Directories (each with everything under it) the input check skipped because an
+    /// earlier check verified them and their retention guarantee still runs.
+    pub input_dirs_skipped: Counter,
+    /// Directories the input check found already being checked for another request and
+    /// waited for instead of checking again.
+    pub input_dirs_joined: Counter,
 }
 
 impl Default for CacheMetrics {
@@ -437,6 +448,9 @@ impl Default for CacheMetrics {
             tier_in_flight: Gauge::default(),
             tier_wait: Histogram::new(Unit::Seconds),
             tier_call: Histogram::new(Unit::Seconds),
+            input_dirs_cached: Counter::default(),
+            input_dirs_skipped: Counter::default(),
+            input_dirs_joined: Counter::default(),
         }
     }
 }
@@ -534,8 +548,9 @@ impl CacheMetrics {
             ),
             (
                 "kbf_execute_walk_seconds",
-                "The input-tree check of one Execute: every directory read, then one \
-                 FindMissingBlobs over the files",
+                "The input-tree check of one Execute, whole: directories read or taken from \
+                 memory, subtrees skipped, presence checks, and any wait for a check another \
+                 request is running",
                 &self.execute_walk,
             ),
             (
@@ -570,9 +585,31 @@ impl CacheMetrics {
         );
         out.counter(
             "kbf_execute_dir_reads_total",
-            "Directories the Execute input-tree checks read",
+            "Directory blobs the Execute input-tree checks read from the store",
             self.execute_dir_reads.get(),
         );
+        for (name, help, counter) in [
+            (
+                "kbf_input_directories_cached_total",
+                "Directories an input check took from the decoded-directory cache, touching \
+                 the blob and reading nothing",
+                &self.input_dirs_cached,
+            ),
+            (
+                "kbf_input_directories_skipped_total",
+                "Directories an input check skipped with everything under them: verified \
+                 earlier, retention guarantee still running",
+                &self.input_dirs_skipped,
+            ),
+            (
+                "kbf_input_directories_joined_total",
+                "Directories an input check found being checked for another request and \
+                 waited for",
+                &self.input_dirs_joined,
+            ),
+        ] {
+            out.counter(name, help, counter.get());
+        }
         out.gauge(
             "kbf_sched_queued",
             "Operations waiting for a lease, as of the last scheduler input",
