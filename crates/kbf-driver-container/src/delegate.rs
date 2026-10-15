@@ -24,6 +24,10 @@
 //!    memory all leases together may use, so the rest of the node stays for what else
 //!    runs on it.
 //!
+//! [`limit_cpus`] then writes `actions/cpu.max`: the leases' CPUs, which is the CPUs the
+//! daemon may use minus `--reserve-cpus`. It is a bandwidth limit on all leases together,
+//! not pinning; the daemon and the server keep the rest.
+//!
 //! A daemon whose own cgroup is already a `supervisor` leaf (a second start in the same
 //! unit, without the unit restarting) works on its parent; the steps find their work
 //! done. [`adopt`] is the other way in: an `actions/` cgroup someone else set up
@@ -31,7 +35,8 @@
 //!
 //! [`capacity`] reads what `actions/` may use: the lowest `memory.max` on the path
 //! from `actions/` up to the root (so a unit's own `MemoryMax=` counts), and the CPUs
-//! in the nearest `cpuset.cpus.effective`. The daemon lowers its node report's `cpus`
+//! in the nearest `cpuset.cpus.effective`, lowered by the lowest `cpu.max` quota on the
+//! path (so a unit's `CPUQuota=` counts). The daemon lowers its node report's `cpus`
 //! and `mem_gib` to them.
 
 use std::io;
@@ -41,6 +46,9 @@ use kbf_daemon::Capacity;
 
 /// The controllers enabled for the delegated cgroup's children and for `actions/`'s.
 const CONTROLLERS: [&str; 3] = ["cpu", "memory", "pids"];
+/// The period of the `cpu.max` written for the leases, in microseconds (the kernel's
+/// default).
+const CPU_PERIOD_US: u64 = 100_000;
 /// The leaf the daemon's processes move into.
 pub const SUPERVISOR: &str = "supervisor";
 /// The cgroup every lease cgroup is made under.
@@ -212,6 +220,26 @@ pub fn capacity(mount: &Path, actions: &str) -> Result<Capacity, DelegateError> 
     capacity_in(&Mount(mount), actions)
 }
 
+/// Limits the leases under `actions` to `cpus` CPUs together (`actions/cpu.max`), the
+/// leases' share of the node after `--reserve-cpus`. A bandwidth limit, not pinning: the
+/// leases run on any CPU, and all of them together are throttled to `cpus` CPUs of time.
+///
+/// # Errors
+/// `cpu.max` could not be written (the `cpu` controller is not enabled in `actions`).
+pub fn limit_cpus(mount: &Path, actions: &str, cpus: u64) -> Result<(), DelegateError> {
+    limit_cpus_in(&Mount(mount), actions, cpus)
+}
+
+pub(crate) fn limit_cpus_in(
+    fs: &dyn CgroupFs,
+    actions: &str,
+    cpus: u64,
+) -> Result<(), DelegateError> {
+    let quota = cpus.max(1).saturating_mul(CPU_PERIOD_US);
+    fs.write(actions, "cpu.max", &format!("{quota} {CPU_PERIOD_US}"))
+        .map_err(io_err(fs, "write", actions, "cpu.max"))
+}
+
 pub(crate) fn delegate_in(
     fs: &dyn CgroupFs,
     proc_self_cgroup: &str,
@@ -353,6 +381,8 @@ pub(crate) fn adopt_in(
 
 pub(crate) fn capacity_in(fs: &dyn CgroupFs, actions: &str) -> Result<Capacity, DelegateError> {
     let mut capacity = Capacity::default();
+    // The lowest `cpu.max` quota on the path, in CPUs.
+    let mut quota: Option<u64> = None;
     let mut cgroup = actions;
     loop {
         if let Some(text) = read_if_there(fs, cgroup, "memory.max")? {
@@ -373,7 +403,16 @@ pub(crate) fn capacity_in(fs: &dyn CgroupFs, actions: &str) -> Result<Capacity, 
             })?;
             capacity.cpus = Some(cpus);
         }
+        if let Some(text) = read_if_there(fs, cgroup, "cpu.max")?
+            && let Some(cpus) =
+                quota_cpus(text.trim()).map_err(|reason| invalid(fs, cgroup, "cpu.max", &reason))?
+        {
+            quota = Some(quota.map_or(cpus, |q: u64| q.min(cpus)));
+        }
         if cgroup == "/" {
+            if let Some(quota) = quota {
+                capacity.cpus = Some(capacity.cpus.map_or(quota, |c| c.min(quota)));
+            }
             return Ok(capacity);
         }
         cgroup = match cgroup.rsplit_once('/') {
@@ -381,6 +420,25 @@ pub(crate) fn capacity_in(fs: &dyn CgroupFs, actions: &str) -> Result<Capacity, 
             Some((parent, _)) => parent,
         };
     }
+}
+
+/// The CPUs a `cpu.max` (`<quota|max> <period>`) allows, rounded down but at least 1;
+/// `None` for `max`.
+fn quota_cpus(text: &str) -> Result<Option<u64>, String> {
+    let (quota, period) = text.split_once(' ').unwrap_or((text, "100000"));
+    if quota == "max" {
+        return Ok(None);
+    }
+    let number = |part: &str| {
+        part.trim()
+            .parse::<u64>()
+            .map_err(|e| format!("{text:?}: {e}"))
+    };
+    let (quota, period) = (number(quota)?, number(period)?);
+    if period == 0 {
+        return Err(format!("{text:?}: a period of 0"));
+    }
+    Ok(Some((quota / period).max(1)))
 }
 
 /// The number of CPUs in a kernel CPU list (`0-3,8,10-11`).

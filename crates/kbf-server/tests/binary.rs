@@ -236,7 +236,10 @@ fn thread_flags_size_the_runtime_and_are_logged() {
     interrupt(child);
     let mut log = String::new();
     stderr.read_to_string(&mut log).expect("UTF-8 stderr");
-    assert!(log.contains("threads: async=3 blocking=5 cpu=2 ("), "{log}");
+    assert!(
+        log.contains("threads: async=3 blocking=5 cpu=2 reserve="),
+        "{log}"
+    );
 }
 
 /// Catches: an `--api-listen` flag that binds nothing, a start line without the API's
