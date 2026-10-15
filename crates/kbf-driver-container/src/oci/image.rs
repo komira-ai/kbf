@@ -26,7 +26,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use tokio::sync::OnceCell;
 
-use super::{JobError, Oci, at};
+use super::{JobError, Oci, at, helper};
 use crate::image::{ImageCheckError, ImageRef};
 
 /// The directory of the rootfs under an image's directory.
@@ -99,15 +99,18 @@ impl Images {
     /// whatever happens to it.
     async fn unpack(&self, oci: &Oci, image: &ImageRef) -> Result<(), JobError> {
         let hex = hex_of(image);
-        let stage = self.dir.join(format!("{STAGE_PREFIX}{hex}-{}", unique()));
-        let tar = stage.with_extension("tar");
+        let id = unique();
+        let stage = self.dir.join(format!("{STAGE_PREFIX}{hex}-{id}"));
+        let exported = self.dir.join(format!("{STAGE_PREFIX}{hex}-{id}-tar"));
         at(&self.dir, tokio::fs::create_dir_all(&self.dir).await)?;
         // Searched by the container's ids on the way to an image's root, whatever umask
         // the daemon runs under.
         let open = std::fs::Permissions::from_mode(0o755);
         at(&self.dir, tokio::fs::set_permissions(&self.dir, open).await)?;
-        let unpacked = self.unpack_into(oci, image, &stage, &tar).await;
-        let _ = tokio::fs::remove_file(&tar).await;
+        let unpacked = self
+            .unpack_into(oci, image, &stage, &exported, &format!("{hex}-{id}"))
+            .await;
+        let _ = tokio::fs::remove_dir_all(&exported).await;
         if unpacked.is_err() {
             // The stage holds files only the container's ids own.
             let _ = oci.remove_dir_async(&stage).await;
@@ -120,23 +123,30 @@ impl Images {
         at(&finished, tokio::fs::rename(&stage, &finished).await)
     }
 
+    /// Exports the image into `exported/image.tar` (a directory of its own, since a
+    /// helper binds directories) and unpacks it into `stage`. The throwaway container
+    /// is named for this unpack, so two daemons (or tests) sharing one Podman store
+    /// never remove each other's.
     async fn unpack_into(
         &self,
         oci: &Oci,
         image: &ImageRef,
         stage: &Path,
-        tar: &Path,
+        exported: &Path,
+        unique_name: &str,
     ) -> Result<(), JobError> {
         // Open to the container's root, which is not the daemon user: it makes the
         // image's root inside, owned by itself.
         at(stage, tokio::fs::create_dir(stage).await)?;
         let open = std::fs::Permissions::from_mode(0o777);
         at(stage, tokio::fs::set_permissions(stage, open).await)?;
-        let name = format!("kbf-image-{}", hex_of(image));
-        oci.podman_export(&image.to_string(), &name, tar)
+        at(exported, tokio::fs::create_dir(exported).await)?;
+        let name = format!("kbf-image-{unique_name}");
+        let tar = exported.join(helper::TAR_FILE);
+        oci.podman_export(&image.to_string(), &name, &tar)
             .await
             .map_err(JobError::Crun)?;
-        oci.unpack_tar(stage, tar).await
+        oci.unpack_tar(stage, exported).await
     }
 
     /// Removes what an unpack that was killed left: the stage directories and tars.

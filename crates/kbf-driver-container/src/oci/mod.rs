@@ -348,11 +348,11 @@ impl Oci {
         result
     }
 
-    /// Extracts `tar` into `stage/rootfs` in containers with an action's user namespace
+    /// Extracts `exported/image.tar` into `stage/rootfs` in containers with an action's user namespace
     /// ([`helper::unpack_jobs`]).
-    pub(crate) async fn unpack_tar(&self, stage: &Path, tar: &Path) -> Result<(), JobError> {
-        self.run_jobs("unpack", Mapping::Action, &helper::unpack_jobs(stage, tar))
-            .await
+    pub(crate) async fn unpack_tar(&self, stage: &Path, exported: &Path) -> Result<(), JobError> {
+        let jobs = helper::unpack_jobs(stage, exported);
+        self.run_jobs("unpack", Mapping::Action, &jobs).await
     }
 
     /// Removes `dir` whatever ids own the files in it: the contents inside a helper

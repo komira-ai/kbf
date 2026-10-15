@@ -103,13 +103,16 @@ const MOUNT_DIRS: [&str; 13] = [
 ];
 const MOUNT_FILES: [&str; 3] = ["etc/hosts", "etc/hostname", "etc/resolv.conf"];
 
-/// The four jobs that unpack the tar `tar` into `stage/rootfs`, in order, in a container
+/// The name of the tar inside the directory `exported` that [`unpack_jobs`] binds.
+pub(crate) const TAR_FILE: &str = "image.tar";
+
+/// The four jobs that unpack `exported/image.tar` into `stage/rootfs`, in order, in a container
 /// with an action's user namespace (so the files are owned by the ids the action sees):
 /// the root directory, which `stage` (open to the container's root) lets it make; the
 /// extraction; the mount points; the files. The tar's own directories keep their
 /// modes (`--no-overwrite-dir` leaves the ones made before alone: `/tmp` is the
 /// image's, made by the tar).
-pub(crate) fn unpack_jobs(stage: &Path, tar: &Path) -> [Job; 4] {
+pub(crate) fn unpack_jobs(stage: &Path, exported: &Path) -> [Job; 4] {
     let binds = || {
         vec![
             Bind {
@@ -117,7 +120,7 @@ pub(crate) fn unpack_jobs(stage: &Path, tar: &Path) -> [Job; 4] {
                 writable: true,
             },
             Bind {
-                source: tar.to_owned(),
+                source: exported.to_owned(),
                 writable: false,
             },
         ]
@@ -148,7 +151,7 @@ pub(crate) fn unpack_jobs(stage: &Path, tar: &Path) -> [Job; 4] {
             "--numeric-owner",
             "--no-overwrite-dir",
             "--file",
-            "/t/1",
+            "/t/1/image.tar",
             "--directory",
             "/t/0/rootfs",
         ])),

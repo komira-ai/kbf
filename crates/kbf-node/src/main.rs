@@ -200,8 +200,8 @@ struct Cli {
     /// action path (Podman only pulls and exports an image once per digest). `oci` needs
     /// the daemon user's subordinate ids in one range, `uidmap`, and every directory down
     /// to `--scratch` searchable by others.
-    #[arg(long, default_value = "podman", value_name = "podman|oci")]
-    container_runtime: kbf_driver_container::ContainerRuntime,
+    #[arg(long, default_value = "podman", value_parser = ["podman", "oci"], value_name = "podman|oci")]
+    container_runtime: String,
     /// The OCI runtime `--container-runtime=oci` runs actions with (container).
     #[arg(long, default_value = "/usr/bin/crun")]
     oci_runtime: PathBuf,
@@ -611,7 +611,7 @@ mod container {
                 .map_or("all".to_owned(), |b| format!("{} GiB", b >> 30))
         );
         let mut config = PodmanConfig::new(scratch, parent, cli.daemon.node_id.clone());
-        config.container_runtime = cli.container_runtime;
+        config.container_runtime = cli.container_runtime.parse()?;
         config.oci.runtime = cli.oci_runtime.clone();
         config.oci.id_files = files;
         config.cgroup_root = mount.clone();

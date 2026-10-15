@@ -345,7 +345,7 @@ fn a_helper_runs_one_program_in_the_namespace_it_is_given() {
 /// reading or writing the wrong directory: the stage is writable and the tar is not.
 #[test]
 fn the_unpack_is_four_programs_in_order() {
-    let jobs = helper::unpack_jobs(Path::new("/s/stage"), Path::new("/s/stage.tar"));
+    let jobs = helper::unpack_jobs(Path::new("/s/stage"), Path::new("/s/exported"));
     let programs: Vec<_> = jobs.iter().map(|j| j.args[0].as_str()).collect();
     assert_eq!(
         programs,
