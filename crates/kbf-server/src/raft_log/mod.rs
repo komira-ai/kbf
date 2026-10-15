@@ -48,6 +48,10 @@
 //!   refused alone while the rest of its batch commits.
 //! - **A storage error** stops the log for the life of the process: every later
 //!   commit is refused `Unavailable`.
+//! - **Dropping the log** stops its tick task, waits for a batch the committer is
+//!   writing, and refuses every later one `Unavailable`, so nothing reaches the raft
+//!   directory once the drop returns and the directory can be opened again in the
+//!   same process (kbf#651).
 //!
 //! Not yet: snapshots (the metadata state has no snapshot encoding, so the log is
 //! never compacted, and a directory holding a snapshot is refused), more than one
@@ -61,6 +65,7 @@ use std::io::{self, Read};
 use std::num::NonZeroU64;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, Weak};
 use std::time::Duration;
 
@@ -160,7 +165,8 @@ pub enum RaftLogError {
 }
 
 /// The metadata log as a single-voter Raft log in one directory (see the module
-/// docs). Dropping it stops its tick task.
+/// docs). Dropping it stops its tick task and waits for a commit being written (one
+/// sync at most); a commit queued after that is refused.
 pub struct RaftMetaLog<F: Fs = StdFs> {
     shared: Arc<Shared<F>>,
     ticker: AbortHandle,
@@ -181,6 +187,8 @@ struct Shared<F: Fs> {
     opened: Instant,
     /// The `Bootstrap` entries applied by the time the log opened.
     bootstraps: usize,
+    /// Set when the log is dropped: a batch that takes `host` after it is refused.
+    closed: AtomicBool,
 }
 
 impl RaftMetaLog<StdFs> {
@@ -296,6 +304,7 @@ where
             log_id,
             prefix,
             opened: Instant::now(),
+            closed: AtomicBool::new(false),
         });
         let ticker = tokio::spawn(tick_every(Arc::downgrade(&shared))).abort_handle();
         Ok(Self { shared, ticker })
@@ -392,8 +401,13 @@ impl<F: Fs> fmt::Debug for RaftMetaLog<F> {
 }
 
 impl<F: Fs> Drop for RaftMetaLog<F> {
+    /// A committer runs on the blocking pool and outlives this handle: the batch it
+    /// is writing holds `host`, so taking `host` here waits for that batch, and every
+    /// batch that takes `host` after `closed` is set is refused.
     fn drop(&mut self) {
         self.ticker.abort();
+        self.shared.closed.store(true, Ordering::SeqCst);
+        drop(self.shared.lock());
     }
 }
 
@@ -528,13 +542,16 @@ where
             })
             .collect();
         let count = entries.len();
-        let proposed: Vec<Answer> = match host.propose_batch(entries) {
+        // Checked under `host`, which the drop takes after setting `closed`.
+        let batch = still_open(&self.closed)
+            .and_then(|()| host.propose_batch(entries).map_err(unavailable));
+        let proposed: Vec<Answer> = match batch {
             Ok(first) => (first.0..)
                 .take(count)
                 .map(|index| host.machine_mut().take_answer(LogIndex(index)))
                 .map(|answer| answer.ok_or(MetaLogError::Unavailable(NOT_APPLIED.to_owned())))
                 .collect(),
-            Err(e) => vec![Err(unavailable(e)); count],
+            Err(e) => vec![Err(e); count],
         };
         let mut proposed = proposed.into_iter();
         encoded
@@ -556,11 +573,22 @@ where
 
 const NOT_APPLIED: &str = "the metadata log did not apply its own proposal";
 
+const CLOSED: &str = "the metadata log was closed";
+
 const NOT_ANSWERED: &str = "the metadata log's committer stopped without answering";
 
 /// A log error as the front sees it: the leader could not answer.
 fn unavailable(e: impl Display) -> MetaLogError {
     MetaLogError::Unavailable(format!("the metadata log: {e}"))
+}
+
+/// `Unavailable` once the log has been dropped.
+fn still_open(closed: &AtomicBool) -> Result<(), MetaLogError> {
+    if closed.load(Ordering::SeqCst) {
+        Err(MetaLogError::Unavailable(CLOSED.to_owned()))
+    } else {
+        Ok(())
+    }
 }
 
 /// The machine's decode failure, if an entry stopped it.
