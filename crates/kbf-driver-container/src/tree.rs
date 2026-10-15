@@ -275,10 +275,12 @@ pub async fn refuse_hidden_working_directory(
 /// All the outputs together stay within `limits` (directory depth, entries, file
 /// bytes), or the call fails with [`TreeError::Limit`]. An output directory is walked
 /// without recursion, so no depth of tree can overflow the caller's stack. The walk
-/// hashes each file exactly once, on `pool`, and closes it; the blobs (each distinct
-/// digest once) are then stored with [`Cas::put_records`], which reads each file again
-/// only to send it and refuses one that is not the file that was hashed; the call
-/// returns once all of them are stored. A name or symlink target that is not UTF-8
+/// hashes each file exactly once, on `pool`, and closes it. Into a store with an intake
+/// ([`Cas::intake`]) each file's chunks go to the store in that same read and the file
+/// is never read again; otherwise the blobs (each distinct digest once) are then stored
+/// with [`Cas::put_records`], which reads each file again only to send it and refuses
+/// one that is not the file that was hashed. The Directory messages and Trees go to
+/// `put_records` either way; the call returns once all of them are stored. A name or symlink target that is not UTF-8
 /// fails the call with [`TreeError::NotUtf8`].
 pub async fn collect(
     cas: &impl Cas,

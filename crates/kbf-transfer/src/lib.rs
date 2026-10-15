@@ -15,6 +15,8 @@
 //! - [`cas`]: the [`Cas`] trait every store implements (the engine, and the in-memory
 //!   stores of tests), with [`digest_of`], [`fetch`] and [`label`]. It is the daemon's
 //!   data plane; `kbf-cas-conformance` holds the checks any implementation must pass.
+//!   A store in the daemon's own process may take output files as the walk reads them
+//!   to hash them ([`Intake`]), so each is read once.
 //! - [`Transfers`] and [`Scope`]: the engine, and one lease's view of it, which counts
 //!   the lease's [`TransferStats`].
 //! - [`TransferConfig`]: the `--transfer-*` flags and `--segment-upload-streams` and `--segment-uploads-in-flight`.
@@ -45,7 +47,9 @@ mod spool;
 mod stats;
 mod wire;
 
-pub use cas::{Cas, CasError, Chunks, WRITE_CHUNK_BYTES, digest_of, fetch, label};
+pub use cas::{
+    Cas, CasError, Chunks, Intake, IntakeFile, WRITE_CHUNK_BYTES, digest_of, fetch, label,
+};
 pub use config::{
     DEFAULT_IN_FLIGHT, DEFAULT_SEGMENT_STREAMS, DEFAULT_SEGMENT_UPLOADS, TransferConfig,
 };
