@@ -208,32 +208,12 @@ impl Plan {
         make(&self.dir, DATA_MODE)?;
         if self.open_leases {
             make(&self.leases(), OPEN_MODE)?;
-            self.open_existing_leases()?;
+            open(&self.leases())?;
         } else {
             make(&self.leases(), PRIVATE_MODE)?;
         }
         if self.cached {
             make(&self.cache(), PRIVATE_MODE)?;
-        }
-        Ok(())
-    }
-
-    /// Opens a `leases` that an earlier start made 0700: adds search for group and others.
-    fn open_existing_leases(&self) -> Result<(), DataDirError> {
-        let leases = self.leases();
-        let fail = |source| DataDirError::Make {
-            dir: leases.clone(),
-            source,
-        };
-        let mode = std::fs::metadata(&leases).map_err(fail)?.permissions().mode() & 0o7777;
-        if mode & 0o001 == 0 {
-            std::fs::set_permissions(&leases, std::fs::Permissions::from_mode(mode | 0o011))
-                .map_err(fail)?;
-            tracing::info!(
-                "data dir: {} was {mode:o}, now {:o}: the OCI backend's container ids must search it",
-                leases.display(),
-                mode | 0o011
-            );
         }
         Ok(())
     }
@@ -279,10 +259,33 @@ fn make(dir: &Path, mode: u32) -> Result<(), DataDirError> {
         .recursive(true)
         .mode(mode)
         .create(dir)
-        .map_err(|source| DataDirError::Make {
-            dir: dir.to_owned(),
-            source,
-        })
+        .map_err(made(dir))
+}
+
+/// Adds search for group and others to `dir` when others cannot search it, which an
+/// earlier start (before the OCI backend was selected) left; logged once, then it is
+/// open and this does nothing.
+fn open(dir: &Path) -> Result<(), DataDirError> {
+    let meta = std::fs::metadata(dir).map_err(made(dir))?;
+    let mode = meta.permissions().mode() & 0o7777;
+    if mode & 0o001 == 0 {
+        let now = std::fs::Permissions::from_mode(mode | 0o011);
+        std::fs::set_permissions(dir, now).map_err(made(dir))?;
+        tracing::info!(
+            "data dir: {} was {mode:o}, now {:o}: the OCI backend's container ids must search it",
+            dir.display(),
+            mode | 0o011
+        );
+    }
+    Ok(())
+}
+
+/// The error for a directory that cannot be made or opened.
+fn made(dir: &Path) -> impl FnOnce(std::io::Error) -> DataDirError {
+    move |source| DataDirError::Make {
+        dir: dir.to_owned(),
+        source,
+    }
 }
 
 /// The container driver's cache and trees, for the driver to open once Podman's storage
