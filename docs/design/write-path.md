@@ -213,7 +213,9 @@ native driver gathers its outputs in a `Spool` first (`Cas::put_spool`, which is
   stored as a grouped segment is: under a `--write-puts-in-flight` slot, its PUT
   retried under a new key (section 3.4), its footer read back; the one `PutBlobs` is
   timed as a segment commit.
-- The idle time is `--segment-upload-idle-secs`. `Commit`'s reply lists the digests
+- The idle time is `--segment-upload-idle-secs`. Record hashing runs on the blocking
+  pool, never on a runtime worker, at most `--cpu-threads` (default 4) jobs at once.
+  `Commit`'s reply lists the digests
   committed; a failed commit is the call's status.
 - An upload's connection is found by the peer address of the worker listener's
   tracked connections (`Connections`); a connection's close is seen when the server
@@ -263,9 +265,11 @@ native driver gathers its outputs in a `Spool` first (`Cas::put_spool`, which is
    is read from its files.
 5. `Segments/Commit { upload }` moves the upload to **committing**: every later
    `PutRange` is refused (`FAILED_PRECONDITION`, nothing written). The server waits for
-   in-flight range writes, checks every range is present, then checks **every record's
-   SHA-256 against its entry**, computing its crc32c in the same pass (hardware CRC32C
-   where the CPU has it). It stores each
+   in-flight range writes and checks every range is present. **Every record's SHA-256
+   against its entry** was already checked, with its crc32c in the same pass (hardware
+   CRC32C where the CPU has it), by the `PutRange` that completed it: each record's hash
+   advances over the bytes received unbroken from its start, whatever order the ranges
+   arrive in, and a record that does not match is refused at that range. It stores each
    segment with a **footer it builds itself** from the checked entries and its own
    crc32c values, sorted by digest (on the tier, section 6; else one `put_new` plus
    read-back, as section 3), then commits **one** `PutBlobs` (or `PutStaged`) listing

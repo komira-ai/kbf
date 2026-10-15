@@ -10,11 +10,15 @@
 //!   its whole length by [`Cache::admit`] (`--write-bytes-in-flight`, the bound
 //!   ByteStream and batch uploads share), waiting (never refusing) while it is spent.
 //!   Ranges are held in memory until the commit.
-//! - **PutRange** writes a range of one segment's records. Once Commit was called,
-//!   every PutRange is refused, so the bytes checked are the bytes stored.
+//! - **PutRange** writes a range of one segment's records and, before it answers,
+//!   hashes (SHA-256 and CRC-32C) what the range completed or extended: each record's
+//!   hash advances over the bytes received unbroken from its start, whichever order
+//!   the ranges come in, on the blocking pool beside the other ranges'. A record that
+//!   does not hash to its digest is refused at once. Once Commit was called, every
+//!   PutRange is refused, so the bytes checked are the bytes stored.
 //! - **Commit** runs in a task of its own, detached from the call and the connection,
-//!   until it has indexed or failed: every record's SHA-256 is checked, each segment
-//!   gets a footer built here (the daemon's CRC-32C values never reach the store). With a
+//!   until it has indexed or failed: it refuses a record not wholly received or not
+//!   hashed to its digest, and each segment gets a footer built here (the daemon's CRC-32C values never reach the store). With a
 //!   write tier attached, each segment is staged on it as a block of its own (its records
 //!   synced to the tier's disk, one `PutStaged` for its blobs): the Commit is answered
 //!   without an object-store PUT, and the flusher PUTs the object later. A segment the
@@ -30,9 +34,11 @@
 //!   one is kept until its commit ends.
 
 mod connection;
+mod cpu;
 mod upload;
 
 use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
@@ -45,13 +51,15 @@ use kbf_proto::worker::{
     LocateResponse, ObjectRef, PutRangeRequest, PutRangeResponse, ReadRangeRequest,
     ReadRangeResponse,
 };
+use kbf_segments::RecordHasher;
 use kbf_types::Digest;
 use tokio::sync::watch;
 use tokio::time::Instant;
 use tonic::{Request, Response, Status};
 
 pub use self::connection::{Connection, Connections, Tracked};
-use self::upload::{Declared, Put, Receiving, declare};
+use self::cpu::HashPool;
+use self::upload::{Declared, Held, Put, Receiving, advance, declare};
 use crate::cache::{Admitted, BuiltSegment, Cache};
 use crate::meta_log::MetaLog;
 use crate::{MAX_BLOB_BYTES, wire};
@@ -78,6 +86,9 @@ pub struct SegmentsConfig {
     /// How long an upload may go without a call before it is dropped
     /// (`--segment-upload-idle-secs`).
     pub idle: Duration,
+    /// The most record-hashing jobs running at once (`--cpu-threads`), on the blocking
+    /// pool.
+    pub cpu_threads: NonZeroUsize,
 }
 
 impl SegmentsConfig {
@@ -85,6 +96,10 @@ impl SegmentsConfig {
     pub const DEFAULT: Self = Self {
         max_bytes: MIN_SEGMENT_UPLOAD_BYTES,
         idle: Duration::from_secs(60),
+        cpu_threads: match NonZeroUsize::new(4) {
+            Some(n) => n,
+            None => unreachable!(),
+        },
     };
 }
 
@@ -107,6 +122,7 @@ struct Shared<M, O> {
     cache: Arc<Cache<M, O>>,
     config: SegmentsConfig,
     connections: Connections,
+    hashing: HashPool,
     /// `Begin` calls waiting for admission now.
     waiting: AtomicUsize,
     next: AtomicU64,
@@ -176,6 +192,31 @@ impl Upload {
         }
     }
 
+    /// The next step of the check of record `i` of segment `index` ([`Receiving::next`]);
+    /// `None` when the upload is no longer receiving (a hash job outlived its upload),
+    /// which ends that record's check.
+    fn check_next(
+        &self,
+        index: usize,
+        i: usize,
+        finished: Option<(RecordHasher, usize)>,
+    ) -> Option<Held> {
+        match &mut *lock(&self.phase) {
+            Phase::Receiving { segments, .. } => {
+                segments[index].next(&self.declared[index], i, finished)
+            }
+            _ => None,
+        }
+    }
+
+    /// The refusal of segment `index`, if a record of it did not hash to its digest.
+    fn refusal_at(&self, index: usize) -> Option<Status> {
+        match &*lock(&self.phase) {
+            Phase::Receiving { segments, .. } => segments[index].refusal(),
+            _ => None,
+        }
+    }
+
     /// Drops the upload, freeing its buffers and admission even if a call still holds it,
     /// unless a commit of it is running: decided under the phase lock, so a Commit
     /// cannot start between the check and the drop.
@@ -189,8 +230,9 @@ impl Upload {
     }
 }
 
-/// Checks every received segment against what `Begin` declared ([`Receiving::check`]),
-/// on the blocking pool: hashing up to a gigabyte must not hold a runtime thread. A
+/// Builds every received segment from what `Begin` declared and `PutRange` checked
+/// ([`Receiving::check`]), on the blocking pool: copying footers must not hold a runtime
+/// thread. A
 /// check that panicked answers INTERNAL, so the upload's Commits are still answered.
 async fn check_all(
     upload: Arc<Upload>,
@@ -216,6 +258,7 @@ impl<M: MetaLog, O: ObjectStore + 'static> SegmentsService<M, O> {
         Self {
             shared: Arc::new(Shared {
                 cache,
+                hashing: HashPool::new(config.cpu_threads),
                 config,
                 connections,
                 waiting: AtomicUsize::new(0),
@@ -290,11 +333,11 @@ impl<M: MetaLog, O: ObjectStore + 'static> SegmentsService<M, O> {
         segments: Vec<Receiving>,
         admitted: Admitted,
     ) {
-        let checked = check_all(Arc::clone(&upload), segments).await;
-        let answer = match checked {
-            Ok(built) => cache.store_upload(built).await.map_err(Status::from),
-            Err(refused) => Err(refused),
-        };
+        let answer = async {
+            let built = check_all(Arc::clone(&upload), segments).await?;
+            cache.store_upload(built).await.map_err(Status::from)
+        }
+        .await;
         drop(admitted);
         *lock(&upload.phase) = Phase::Done;
         upload.touch();
@@ -373,20 +416,42 @@ impl<M: MetaLog, O: ObjectStore + 'static> Segments for SegmentsService<M, O> {
         let declared = upload.declared.get(index).ok_or_else(|| {
             Status::invalid_argument(format!("no segment {segment} in the upload"))
         })?;
-        let mut phase = lock(&upload.phase);
-        match &mut *phase {
-            Phase::Receiving { segments, .. } => {
-                let put = segments[index].put(declared.records_len, offset, &bytes)?;
-                if put == Put::Resent {
-                    tracing::debug!(segment, offset, "resent range acknowledged, not written");
+        let claimed = {
+            let mut phase = lock(&upload.phase);
+            match &mut *phase {
+                Phase::Receiving { segments, .. } => {
+                    let (put, claimed) = segments[index].put(declared, offset, &bytes)?;
+                    if put == Put::Resent {
+                        tracing::debug!(segment, offset, "resent range acknowledged, not written");
+                    }
+                    claimed
                 }
-                Ok(Response::new(PutRangeResponse {}))
+                Phase::Committing | Phase::Done => {
+                    return Err(Status::failed_precondition(
+                        "the upload is committing; ranges are no longer accepted",
+                    ));
+                }
+                Phase::Dropped => return Err(Status::not_found("the upload was dropped")),
             }
-            Phase::Committing | Phase::Done => Err(Status::failed_precondition(
-                "the upload is committing; ranges are no longer accepted",
-            )),
-            Phase::Dropped => Err(Status::not_found("the upload was dropped")),
+        };
+        if !claimed.is_empty() {
+            // Hash what this range completed or extended, here and now, beside the
+            // other ranges' own: the commit then has nothing left to hash. The task
+            // records its results itself, so a call cancelled meanwhile leaves no
+            // record claimed forever.
+            let task = Arc::clone(&upload);
+            self.shared
+                .hashing
+                .run(Box::new(move || {
+                    advance(&claimed, |i, finished| task.check_next(index, i, finished));
+                }))
+                .await?;
+            // A mismatch is refused at once; the upload cannot commit.
+            if let Some(refused) = upload.refusal_at(index) {
+                return Err(refused);
+            }
         }
+        Ok(Response::new(PutRangeResponse {}))
     }
 
     async fn commit(
@@ -407,6 +472,9 @@ impl<M: MetaLog, O: ObjectStore + 'static> Segments for SegmentsService<M, O> {
                     return Err(Status::failed_precondition(format!(
                         "record {digest} was not wholly received"
                     )));
+                }
+                if let Some(refused) = segments.iter().find_map(Receiving::not_ready) {
+                    return Err(refused);
                 }
             }
             match std::mem::replace(&mut *phase, Phase::Committing) {
