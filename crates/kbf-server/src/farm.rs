@@ -48,8 +48,8 @@ use kbf_proto::worker::{
 use kbf_sched::fence::START_VALIDITY;
 use kbf_sched::{Cordon, DaemonInstance, Event, Input, OpState, Requeue, Scheduler};
 use kbf_types::{
-    Answer, ControlRecord, Digest, Effect, Failure, FarmTime, LeaseGrant, LeaseId, OperationId,
-    Outcome, Refusal, StartLease, StateMachine, WaiterId, Waiting, WorkerId,
+    Answer, ControlRecord, Digest, Effect, Failure, FarmRun, FarmTime, LeaseGrant, LeaseId,
+    OperationId, Outcome, Refusal, StartLease, StateMachine, WaiterId, Waiting, WorkerId,
 };
 use tokio::sync::{mpsc, watch};
 use tonic::{Code, Status};
@@ -1069,14 +1069,7 @@ impl State {
             (_, Outcome::Failed(Failure::OutOfMemory)) => {
                 (memory::finished(&answer.memory_runs), None)
             }
-            (
-                _,
-                Outcome::Failed(Failure::NodeMemoryPressure | Failure::Lost(_) | Failure::Infra),
-            ) => (fault::finished(&answer.farm_runs), None),
-            _ => (
-                failed(Code::Internal, "the farm could not run the action"),
-                None,
-            ),
+            (_, outcome) => (unrun(outcome, &answer.farm_runs), None),
         };
         self.record_finished(answer, &finished, stored, reason);
         self.keep_finished(answer.operation, answer.waiters.clone());
@@ -1118,6 +1111,18 @@ fn wire_lease(lease: LeaseId) -> worker::LeaseId {
     worker::LeaseId {
         term: lease.term,
         seq: lease.seq,
+    }
+}
+
+/// How a result that carries no detail and is no timeout, invalid input, missing blob or
+/// memory kill is answered: a farm fault names its runs; anything else (a committed
+/// `Completed` whose worker report this process never saw) is the fixed INTERNAL.
+fn unrun(outcome: Outcome, farm_runs: &[FarmRun]) -> Finished {
+    match outcome {
+        Outcome::Failed(Failure::NodeMemoryPressure | Failure::Lost(_) | Failure::Infra) => {
+            fault::finished(farm_runs)
+        }
+        _ => failed(Code::Internal, "the farm could not run the action"),
     }
 }
 
@@ -1167,5 +1172,19 @@ mod tests {
             settled.finished,
             failed(Code::Internal, "the farm could not run the action")
         );
+    }
+
+    /// Catches a farm fault (Infra, node memory pressure, a lost run) with no detail being
+    /// answered as the plain INTERNAL, which drops the farm's runs and the operator fix.
+    #[test]
+    fn a_result_without_detail_that_is_a_farm_fault_names_the_fault() {
+        for failure in [Failure::Infra, Failure::NodeMemoryPressure] {
+            let finished = unrun(Outcome::Failed(failure), &[]);
+            assert_eq!(finished, fault::finished(&[]), "{failure:?}");
+            assert_ne!(
+                finished,
+                failed(Code::Internal, "the farm could not run the action")
+            );
+        }
     }
 }
