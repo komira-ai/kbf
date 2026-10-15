@@ -16,7 +16,7 @@ It builds on [fleet-updates.md](fleet-updates.md), [fleet-updates-security.md](f
 |---|---|
 | Source of truth for "which machines exist"? | The **node registry** in `kbf-server` (4.2). Hosts enroll themselves at first boot and appear *pending*; an operator or a policy approves them. A file is at most an optional import/export for bootstrap and disaster recovery. |
 | What is typed per machine? | Nothing required. CPU, memory, disks, SSD paths and GPUs are detected on every connect and used by the scheduler as reported (6.1). Config holds policy and rare overrides. |
-| What identifies a machine? | The **hardware id** is the permanent key. The **human name** (`broadwell1`, `m3ultra1`) is assigned in the registry, written back where the hardware can keep it (BMC FRU, SMBIOS asset tag), and used by logs, labels, scheduling, the CLI and the certificate (4.3 to 4.5). |
+| What identifies a machine? | The **hardware id** is the permanent key. The **human name** (for example `build1`, `mac1`) is assigned in the registry, written back where the hardware can keep it (BMC FRU, SMBIOS asset tag), and used by logs, labels, scheduling, the CLI and the certificate (4.3 to 4.5). |
 | How does Linux get an OS? | Site DHCP (UniFi options 66 and 67) points at iPXE; iPXE chains to an HTTP endpoint on kbf that decides per machine: discover, install image X, boot local, or rescue (5.1, 5.2). |
 | How does a Mac get set up? | No PXE (Apple Silicon cannot netboot). ABM assigns the serial to the farm MDM; the MDM sets the device name and pushes a signed `.pkg` (5.4). |
 | What is generic, what is ours? | kbf ships mechanisms; the operator's own repository holds names, network, images, approval policy and key locations as config (section 7 lists which is which). |
@@ -140,7 +140,7 @@ machines.
 
 | Platform | Carrier | Written by | Read by |
 |---|---|---|---|
-| Linux with a BMC | **FRU** product and chassis asset tag | `kbf-deploy name write` over IPMI on the BMC LAN, **before an OS exists**, or locally over `/dev/ipmi0` | BMC and `ipmitool fru print` (root) |
+| Linux with a BMC | **FRU Product Info asset tag** (or a chassis-area custom field where the BMC allows it) | `kbf-deploy name write` over IPMI on the BMC LAN, **before an OS exists**, or locally over `/dev/ipmi0` | BMC and `ipmitool fru print` (root) |
 | Linux | **SMBIOS chassis asset tag** | the BIOS, as far as it propagates FRU, or the vendor tool | unprivileged at `/sys/class/dmi/id/chassis_asset_tag`; iPXE as `${asset}` |
 | Mac | MDM `DeviceName` plus the registry's serial-to-name map | the MDM, at approval | `scutil --get ComputerName` |
 | neither | the registry only | | |
@@ -148,15 +148,15 @@ machines.
 - The tag is a **hint, not proof**. A tag that matches a name the policy would assign and that no
   live node owns starts a *claim* the operator confirms (or a policy does, 4.6). A tag naming a node
   bound to another hwid holds the host with a conflict (cloned disk, mislabeled box).
-- A blank tag (today `Default string` on our boards): the registry assigns by policy at approval and
+- A blank tag (today `Default string` on the current boards): the registry assigns by policy at approval and
   `name write` writes it back. A failed write-back does not block the node; `status` shows
   `tag: unwritten`. If the tag disagrees with the registry for the same hwid, the registry wins and
   the tag is repaired.
 - BMC LAN credentials are the operator's secret, never in the registry; the config names where they
   come from (7).
 - **Unconfirmed:** whether the BMC firmware on the Supermicro X10-generation boards (BMC present at
-  `/dev/ipmi0`) lets us write the asset-tag FRU fields, and whether the BIOS copies FRU asset data
-  into the SMBIOS chassis tag. Check: root `ipmitool fru print`, then write one field on one box.
+  `/dev/ipmi0`) lets us write the FRU Product Info asset tag (or a chassis-area custom field, since the chassis area has only part number, serial and custom fields), and whether the BIOS copies FRU asset data
+  into the SMBIOS chassis tag. Check: root `ipmitool fru print` to see which areas exist, then write the named field (the Product Info asset tag, `ipmitool fru edit`) on one box and read it back after a BMC reset.
   Until confirmed, only the registry carries the name on those machines (decision 3).
 
 ### 4.5 Naming policy
@@ -169,16 +169,16 @@ the first match wins.
 # naming.toml  (operator-owned; example only)
 [[rule]]
 match = { platform = "linux", cpu_model = "E5-2*" }
-template = "broadwell{n}"
+template = "build{n}"
 [[rule]]
 match = { platform = "macos", model = "Mac Studio" }
-template = "m3ultra{n}"
+template = "mac{n}"
 ```
 
 `{n}` is the next integer of that template's counter, allocated atomically with the approval.
 Retired names are never reissued (a log line must mean one machine) unless `rename --reuse`. An
-approver may override (`approve --name broadwell7`). Names match `^[a-z][a-z0-9-]{0,40}$` and cannot
-collide. A host no rule matches stays pending with "no naming rule": the engine never invents one.
+approver may override (`approve --name build7`). Names match `^[a-z][a-z0-9-]{0,40}$` and cannot
+collide. The example has no server rule: day 0 hand-names the first server through `nodes.json` (15), and later servers are named by the approver (`approve --name`) until the server-prefix question (16, decision 2) is decided; a rule can then be added. A host no rule matches stays pending with "no naming rule": the engine never invents one.
 
 ### 4.6 Enrollment: pending, approval, one-shot arming
 
@@ -186,11 +186,11 @@ collide. A host no rule matches stays pending with "no naming rule": the engine 
 small read-only initrd that detects facts (CPU, memory, disks by id, NICs, GPUs, BMC, asset tag),
 POSTs them to `/register` and waits. The record appears `pending`; no certificate or token exists. A
 Mac appears `pending` when it first checks in to the MDM (5.4). Reports about unknown machines are
-rate-limited and capped (256, oldest dropped) and shown only to authenticated operators.
+rate-limited, capped per source (16 pending entries per source address) and overall (256, oldest dropped) and shown only to authenticated operators. Every dropped entry writes an audit line (source, hwid if given, reason: cap or rate) and increments a counter, so a flood is visible even though the entries are gone.
 
 **Approval** moves `pending` to `approved`, by:
 
-- an operator: `nodes --pending` shows `serial S, mac M, uuid U, seen at <ip>, proposed broadwell3,
+- an operator: `nodes --pending` shows `serial S, mac M, uuid U, seen at <ip>, proposed build3,
   OS disk nvme-example-os`; the operator checks it against what was racked and runs
   `approve <hwid>` (`--all-pending` lists once and confirms once); or
 - a **policy** in the operator's `approval.toml`, for roles that hold no power (for example "daemon
@@ -378,7 +378,7 @@ carries a CPU, memory or disk count.
 All of it lives in the operator's repository (7) and none is per host by default: profile rules
 (which role and labels a class gets, for example `platform = macos` gets `pool = mac-arm`); the
 naming, approval, disk and image rules; and **overrides** keyed by name and few (`reserve_cpus`, an
-extra label, a pinned `cache_dir`). `check` lists every override so none lingers. Order, lowest to
+extra label, a `cache_dir` selected by mount or by-id only). An override never states a total or capacity (sizes are detected, 6.1), and `check` refuses one that does. `check` lists every override so none lingers. Order, lowest to
 highest: built-in default, detection, profile rule, override; `render --explain <name>` shows each
 value's origin.
 
@@ -419,7 +419,7 @@ refuses real ones.
 | In kbf (generic, public) | In the operator's repository (config files or hooks) |
 |---|---|
 | Registry, `/register`, `/enroll`, approval and arming state machine, audit | `approval.toml`: who or what may approve, which roles auto-approve, window lengths |
-| Naming-policy engine and its schema | `naming.toml`: the rules (`broadwell{n}`, `m3ultra{n}`), counter starts |
+| Naming-policy engine and its schema | `naming.toml`: the rules (`build{n}`, `mac{n}`), counter starts |
 | Boot endpoint, discovery image build, seed renderer, catalogue interface and its two providers | `images.toml` and the catalogue: OS release, apt snapshot, packages, admin SSH keys, which class gets which image |
 | `boot ipxe-build` recipe | iPXE build inputs: embedded roots, boot URL, the CI job |
 | Disk-selection rule engine | `disks.toml`: the rules (smallest NVMe is OS, other NVMe is MinIO) |
@@ -460,9 +460,12 @@ The boot service, CA, registry and object store share the three servers.
   `enroll-token --all` and deliver tokens, or `reinstall --pool`.
 - **All three lost:** (1) root and standby come out of safe storage; (2) day 0 (15) rebuilds the
   first server from USB; (3) `nodes import` restores the last export (`backup pull`, or the copy in
-  the object store): records come back `retired` except hosts that re-enroll with fresh tokens, and
-  each box still carries its name in FRU or asset tag where hardware allows (4.4), so names can be
-  rebuilt by reading machines; (4) the CAS is a cache. Lost: cache contents and revocations after
+  the object store): every record that was live lands `pending` (retired ones stay retired; never `active`, never `approved`), so no host
+  gets a certificate without a fresh approval, matching the approved-before-`/enroll` rule (4.7).
+  Discovery then reads each host's tag (FRU or asset tag where hardware allows, 4.4); a tag that
+  matches an imported name starts a name claim, the operator confirms each claim (4.4, 4.6), and
+  the naming counters re-seed from the highest claimed `{n}` of each template, so no live name is
+  reissued. Hosts without a tag are named by policy at approval. (4) The CAS is a cache. Lost: cache contents and revocations after
   the last export (re-run `retire` for anything retired since).
 
 ## 10. The command set
@@ -495,9 +498,9 @@ release.
 
 ## 11. What is retired
 
-`install.sh`, `install_units.sh`: replaced by `node apply`. The private repo's `deploy/` shell kits:
-logic moves into `kbf-deploy`; the repo keeps the section 7 files. `fleet.toml` as a list of hosts
-(an earlier revision of this document): replaced by the registry; the operator's `fleet.toml` is
+`install.sh`, `install_units.sh`: replaced by `node apply`. The operator's `deploy/` shell kits:
+logic moves into `kbf-deploy`; the repo keeps the section 7 files. `fleet.toml` as a list of hosts:
+replaced by the registry; the operator's `fleet.toml` is
 fleet-level values only. `pilot_ca.sh` and the deny-list file: replaced by `ca`, `/enroll`,
 revocation. Buildbarn-only and cutover scripts, dev-farm scripts (`kbf_dev_install.sh`,
 `upd_main.sh`; the dev farm becomes a second registry) and hardcoded node numbers, subuid ranges and
@@ -565,7 +568,7 @@ install over PXE from srv-1 and get their own intermediates. (7) MinIO forms, en
 publishes to the object store and boot switches to `--config-url`. (8) MDM, ABM, DEP token, push
 certificate. (9) Linux builders, then Macs.
 
-## 16. Decisions and questions for the CEO
+## 16. Decisions and questions for the owner
 
 1. **Registry as source of truth, self-enrollment, manual approval by default.** Recommended: yes;
    policy auto-approval stays off until you ask.
@@ -600,6 +603,6 @@ reachability and the 15-minute install figure ([A] until measured); server HA de
 Every must-fix from the two earlier reviews was taken, with these changes: the per-node spec slice
 is gone (nodes read one signed common config and their own record, 6.3); no separate signer machine
 (decision 5); BMC use is limited to the FRU name; per-operator delegated keys, not CI, sign config;
-TPM attestation and Secure Enclave keys are deferred with the risk stated. On CEO direction the
+TPM attestation and Secure Enclave keys are deferred with the risk stated. On the owner's direction the
 inventory file as source of truth is replaced by the registry; keys, certificates, revocation,
 one-shot arming and rollout carry over.
