@@ -261,19 +261,12 @@ impl TreeStore {
         let before = std::fs::metadata(&dir)?.permissions().mode() & 0o7777;
         if before != STORE_MODE {
             std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(STORE_MODE))?;
-            tracing::info!(
-                "trees: {} was mode {before:04o}; made {STORE_MODE:04o}",
-                dir.display()
-            );
+            tracing::info!("trees: {dir:?} was mode {before:04o}, now {STORE_MODE:04o}");
         }
-        if let Some(closed) = closed_ancestor(&dir) {
-            tracing::warn!(
-                "trees: {} is not searchable by others, so a container whose root is not \
-                 this user cannot reach {}: chmod o+x it",
-                closed.display(),
-                dir.display()
-            );
-        }
+        // A container whose root is not this user needs every ancestor searchable.
+        closed_ancestor(&dir).inspect(|closed| {
+            tracing::warn!("trees: {closed:?} is closed to others; chmod o+x it");
+        });
         let mut state = State::default();
         for entry in std::fs::read_dir(&dir)? {
             let entry = entry?;
