@@ -55,6 +55,8 @@ pub mod keeper;
 mod lease;
 #[cfg(target_os = "linux")]
 mod local;
+#[cfg(target_os = "linux")]
+pub mod numa;
 pub mod phases;
 pub mod pressure;
 pub mod report;

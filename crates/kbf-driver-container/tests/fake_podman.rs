@@ -11,6 +11,7 @@ mod fake_memory;
 mod fake_missing_blobs;
 mod fake_oci;
 mod fake_stopped;
+mod fake_usage;
 mod support;
 
 use std::path::{Path, PathBuf};

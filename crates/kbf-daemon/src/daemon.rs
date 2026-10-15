@@ -476,6 +476,8 @@ impl Daemon {
     /// long as it runs. v0 abandons running leases at shutdown; the scheduler
     /// re-dispatches them after G.
     pub async fn run(mut self, shutdown: impl Future<Output = ()>) {
+        #[cfg(target_os = "linux")]
+        crate::numa::log_layout();
         tokio::select! {
             () = self.reconnect_forever() => {}
             () = shutdown => tracing::info!("shutting down"),
@@ -877,9 +879,9 @@ impl Daemon {
     fn finished(
         &mut self,
         tx: Option<&UnboundedSender<DaemonMessage>>,
-        (id, outcome, phases): Done,
+        (id, outcome, usage, phases): Done,
     ) {
-        let result = self.leases.finished(id, outcome, &phases);
+        let result = self.leases.finished(id, outcome, usage, &phases);
         self.emit(Event::LeaseEnded(phases));
         self.report(tx, result);
     }
