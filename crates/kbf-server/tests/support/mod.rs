@@ -228,7 +228,17 @@ impl Cell {
     pub async fn start_with(wait: Duration, retention: Duration) -> Self {
         let store = SharedStore::new();
         let cache = Self::cold_cache(&store, None).await;
-        Self::serve(cache, store, None, None, wait, retention).await
+        let table = kbf_front::MemoryByCategory::default();
+        Self::serve(cache, store, None, None, wait, retention, table).await
+    }
+
+    /// A cell whose actions book memory by category as `table` says
+    /// (`--book-mem-gib-by-category`).
+    pub async fn start_booking_by_category(table: kbf_front::MemoryByCategory) -> Self {
+        let store = SharedStore::new();
+        let cache = Self::cold_cache(&store, None).await;
+        let (wait, retention) = (kbf_sched::UNSERVABLE_WAIT, kbf_sched::FINISHED_RETENTION);
+        Self::serve(cache, store, None, None, wait, retention, table).await
     }
 
     /// A cell whose metadata is a Raft log ([`RaftMetaLog`], as `--meta-log=raft`) in
@@ -239,7 +249,8 @@ impl Cell {
         let dir = FaultFs::new();
         let cache = Self::cold_cache(&store, Some(&dir)).await;
         let (wait, retention) = (kbf_sched::UNSERVABLE_WAIT, kbf_sched::FINISHED_RETENTION);
-        Self::serve(cache, store, None, Some(dir), wait, retention).await
+        let table = kbf_front::MemoryByCategory::default();
+        Self::serve(cache, store, None, Some(dir), wait, retention, table).await
     }
 
     /// The Raft log of a cell started with [`Cell::start_raft`].
@@ -256,7 +267,8 @@ impl Cell {
         };
         let (wait, retention) = (kbf_sched::UNSERVABLE_WAIT, kbf_sched::FINISHED_RETENTION);
         let cache = Self::cold_cache(&store, None).await;
-        Self::serve(cache, store, Some(api), None, wait, retention).await
+        let table = kbf_front::MemoryByCategory::default();
+        Self::serve(cache, store, Some(api), None, wait, retention, table).await
     }
 
     /// A new server over this cell's store and its in-memory action cache and CAS
@@ -271,7 +283,9 @@ impl Cell {
         let (wait, retention) = (kbf_sched::UNSERVABLE_WAIT, kbf_sched::FINISHED_RETENTION);
         let (cache, store) = (Arc::clone(&self.cache), self.store.clone());
         let dir = self.raft_dir.clone();
-        Self::serve(cache, store, self.api_config.clone(), dir, wait, retention).await
+        let table = kbf_front::MemoryByCategory::default();
+        let api = self.api_config.clone();
+        Self::serve(cache, store, api, dir, wait, retention, table).await
     }
 
     /// Stops this server, waits until its runtime and every task on it are gone (each
@@ -300,7 +314,8 @@ impl Cell {
         let dir = dir.map(|d| d.restart());
         let cache = Self::cold_cache(&store, dir.as_ref()).await;
         let (wait, retention) = (kbf_sched::UNSERVABLE_WAIT, kbf_sched::FINISHED_RETENTION);
-        Self::serve(cache, store, api_config, dir, wait, retention).await
+        let table = kbf_front::MemoryByCategory::default();
+        Self::serve(cache, store, api_config, dir, wait, retention, table).await
     }
 
     /// A new cache over `store` and a writer epoch it allocates. Without `raft_dir`:
@@ -344,6 +359,7 @@ impl Cell {
         raft_dir: Option<FaultFs>,
         wait: Duration,
         retention: Duration,
+        memory_by_category: kbf_front::MemoryByCategory,
     ) -> Self {
         let listeners = Listeners {
             reapi: SocketAddr::from(([127, 0, 0, 1], 0)),
@@ -358,6 +374,7 @@ impl Cell {
             shutdown_timeout: Duration::from_secs(10),
             store_probe_timeout: kbf_server::health::STORE_PROBE_TIMEOUT,
             invocation_memory: kbf_front::DEFAULT_INVOCATION_MEMORY,
+            memory_by_category,
             segments: kbf_front::SegmentsConfig::DEFAULT,
         };
         let (stop, stop_rx) = oneshot::channel::<()>();
@@ -918,6 +935,11 @@ pub struct Job {
 impl Job {
     /// A job running `argv`, with one input file, on `platform` properties.
     pub fn new(argv: &str, platform: &[(&str, &str)]) -> Self {
+        Self::with_env(argv, platform, &[])
+    }
+
+    /// [`Job::new`], its `Command` setting the environment variables `env`.
+    pub fn with_env(argv: &str, platform: &[(&str, &str)], env: &[(&str, &str)]) -> Self {
         let input = Blob::new(format!("input of {argv}"));
         let root = Blob::of(&Directory {
             files: vec![FileNode {
@@ -929,6 +951,13 @@ impl Job {
         });
         let command = Blob::of(&Command {
             arguments: vec![argv.to_owned()],
+            environment_variables: env
+                .iter()
+                .map(|(name, value)| reapi::command::EnvironmentVariable {
+                    name: (*name).to_owned(),
+                    value: (*value).to_owned(),
+                })
+                .collect(),
             ..Default::default()
         });
         let action = Blob::of(&Action {

@@ -77,3 +77,39 @@ async fn a_sized_booking_reaches_the_daemon_and_holds_the_node() {
     );
     done(&mut second_ops).await;
 }
+
+/// Catches: `--book-mem-gib-by-category` not applied, so a `mojo_build_test` action
+/// still books 1 GiB and is killed at its cgroup cap (the 1 GiB it booked) before the
+/// ladder raises it; a category entry booked past the largest node that could run the
+/// action (the 64 GiB entry would wait on a 16 GiB node and then fail instead of
+/// running at 16); a category entry overriding a `kbf-book-mem-gib` the action named;
+/// and a category the table does not name booking anything but the 1 GiB default.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_category_books_its_entry_up_to_the_largest_node() {
+    let table = "mojo_build_test=4,huge=64".parse().expect("a table");
+    let cell = support::Cell::start_booking_by_category(table).await;
+    let mut node = cell.daemon("node-a", 8, 16).await;
+    let tag = kbf_front::CATEGORY_ENV;
+    let cases = [
+        ("build test", vec![], "mojo_build_test", 4 * GIB),
+        ("huge", vec![], "huge", 16 * GIB),
+        (
+            "sized",
+            vec![("kbf-book-mem-gib", "2")],
+            "mojo_build_test",
+            2 * GIB,
+        ),
+        ("not in the table", vec![], "c_compile", GIB),
+    ];
+    for (argv, platform, category, memory) in cases {
+        let job = Job::with_env(argv, &platform, &[(tag, category)]);
+        cell.upload(&job.blobs()).await;
+        let mut ops = cell.execute(&job.action).await;
+        let start = node.start().await;
+        assert_eq!(start.action_digest.as_ref(), Some(&job.action.proto));
+        assert_eq!(start.memory_bytes, memory, "{argv}");
+        let result = output(&cell, argv, 0).await;
+        assert!(node.report(ran(start.lease_id, &result)).await.accepted);
+        done(&mut ops).await;
+    }
+}

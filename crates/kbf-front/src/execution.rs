@@ -42,7 +42,10 @@
 //! `action` when absent; any other value than `action` or `whole_machine` is
 //! INVALID_ARGUMENT. The booking is one core and 1 GiB ([`DEFAULT_RESOURCES`]; learned
 //! sizes come with the estimator), or the whole cores of `kbf-book-cpus` and the GiB of
-//! `kbf-book-mem-gib` where the platform names them: a value that is not a whole number
+//! `kbf-book-mem-gib` where the platform names them. An `action` lease whose platform
+//! names no `kbf-book-mem-gib` carries its category, the `Command`'s
+//! `KBF_ACTION_CATEGORY` variable, to the dispatcher, which may book more memory for it
+//! ([`crate::MemoryByCategory`]). A `kbf-book-*` value that is not a whole number
 //! of at least 1, or that overflows the booking, is INVALID_ARGUMENT, and so is either
 //! key on a `whole_machine` lease (the scheduler books the whole worker for one). The
 //! platform's `gpu` value is the number of whole GPUs to book on top (0 when absent); a
@@ -127,7 +130,8 @@ pub const NO_WORKER_REASON: &str = "NO_WORKER_CAN_RUN";
 pub const ERROR_DOMAIN: &str = "kbf";
 
 /// What v0 books for an action that names no size: one core and 1 GiB, plus the GPUs
-/// its `gpu` property asks for. `kbf-book-cpus` and `kbf-book-mem-gib` replace either.
+/// its `gpu` property asks for. `kbf-book-cpus` and `kbf-book-mem-gib` replace either;
+/// the dispatcher may book more memory for the action's category ([`Submission`]).
 pub const DEFAULT_RESOURCES: Resources = Resources::new(1_000, 1 << 30);
 
 /// One execution the front hands to the scheduler.
@@ -139,6 +143,11 @@ pub struct Submission {
     /// The call to record, with a recorder on and an invocation id: the dispatcher
     /// sends its [`ExecuteCall::answered`] events before it queues the request.
     pub call: Option<ExecuteCall>,
+    /// The action's category (its `Command`'s `KBF_ACTION_CATEGORY`), when its memory
+    /// booking is the default one: an `action` lease whose platform names no
+    /// `kbf-book-mem-gib`. The dispatcher books what its [`crate::MemoryByCategory`]
+    /// entry names instead.
+    pub category: Option<String>,
 }
 
 /// Where an operation is, as its callers see it.
@@ -521,6 +530,11 @@ where
         let needs = needs(&platform)?;
         let gpus = mac_gpus(kind, gpus(&platform)?, &needs)?;
         device_kind(kind, &needs)?;
+        let sized = platform.get(BOOK_MEM_GIB_KEY).is_some();
+        let category = command
+            .as_ref()
+            .and_then(crate::category::category)
+            .filter(|_| kind == LeaseKind::Action && !sized);
         let submission = Submission {
             request: Request {
                 key: ActionKey { instance, action },
@@ -532,6 +546,7 @@ where
                 needs,
             },
             call: None,
+            category,
         };
         Ok((submission, command_digest))
     }

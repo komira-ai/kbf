@@ -191,6 +191,7 @@ async fn the_daemon_runs_an_action_and_its_result_is_cached() {
         shutdown_timeout: Duration::from_secs(10),
         store_probe_timeout: kbf_server::health::STORE_PROBE_TIMEOUT,
         invocation_memory: kbf_front::DEFAULT_INVOCATION_MEMORY,
+        memory_by_category: kbf_front::MemoryByCategory::default(),
         segments: kbf_front::SegmentsConfig::DEFAULT,
     };
     let bound = bind_server(cache, listeners, pending()).expect("bind");

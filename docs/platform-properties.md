@@ -12,7 +12,7 @@ These properties change how kbf schedules an action today:
 | `kbf-lease` | `action`, `whole_machine` | `action` | The kind of lease the action runs under (see [`kbf-lease`](#kbf-lease)). |
 | `gpu` | a whole number | `0` | Whole GPUs the action needs. |
 | `kbf-book-cpus` | a whole number, at least 1, plain digits | `1` | Whole cores the lease books. |
-| `kbf-book-mem-gib` | a whole number, at least 1, plain digits | `1` | GiB of memory the lease books. |
+| `kbf-book-mem-gib` | a whole number, at least 1, plain digits | `1`, or the [category's](#memory-by-category) | GiB of memory the lease books. |
 | `OSFamily` | `linux`; `darwin`, `macos`, `macosx`, `osx` (any case) | any | The operating system of the worker. |
 | `ISA`, `Arch` | `x86-64`, `x86_64`, `amd64`; `arm-a64`, `arm64`, `aarch64`; an ISA level such as `x86-64-v3` (any case) | any | The CPU architecture, and level, of the worker. |
 
@@ -136,9 +136,10 @@ placed there. Running leases are never stopped for it.
 
 Every action books one core and 1 GiB of memory on the worker it runs on, unless it
 names a size: `kbf-book-cpus=N` books `N` whole cores, and `kbf-book-mem-gib=N` books
-`N` GiB. `N` is written in plain digits with no leading zero: `+4` and `04` are
-refused, since each would book the same as `4` under a different action digest, and so
-miss the cache entries `4` made. Either may be given alone; the other stays at its
+`N` GiB. An action that names no memory may instead book its category's memory
+([Memory by category](#memory-by-category)). `N` is written in plain digits with no
+leading zero: `+4` and `04` are refused, since each would book the same as `4` under a
+different action digest, and so miss the cache entries `4` made. Either may be given alone; the other stays at its
 default. The scheduler places the action only where that much is free, and holds it
 for the lease until the lease ends, as it does for the default booking.
 
@@ -180,6 +181,49 @@ Like every platform property, the two keys are part of the action digest: the sa
 action with another booking is a different action cache entry, so changing a booking
 reruns the action once. They are not the capability keys `cpus` and `mem_gib`, which
 ask for a worker whose whole machine has at least that much and book nothing.
+
+## Memory by category
+
+Buck2 sets platform properties per execution platform, not per action, so a build
+cannot give a compile and a test different `kbf-book-mem-gib` values on one platform.
+An action may instead name its category in its `Command`'s environment, as the
+variable `KBF_ACTION_CATEGORY` (the name compared exactly; the first such variable
+counts, and an empty value names none), and the server books the memory its
+`--book-mem-gib-by-category` flag gives that category:
+
+```sh
+kbf-server ... --book-mem-gib-by-category=mojo_build_test=4,rustc=4
+```
+
+```starlark
+# Buck2: an action that names its category
+ctx.actions.run(
+    cmd,
+    category = "mojo_build_test",
+    env = {"KBF_ACTION_CATEGORY": "mojo_build_test"},
+)
+```
+
+- The category's memory is booked only by an `action` lease whose platform names no
+  `kbf-book-mem-gib`: a size the action names wins, and a `whole_machine` lease books
+  the whole worker. `kbf-book-cpus` still sets the cores beside it.
+- It never books more than the largest node that could run the action has when the
+  action is submitted (one that is live, cordoned or not, serves its lease kind,
+  satisfies its platform and holds its CPU and GPU request), and never less than the
+  1 GiB default. While no such node is registered it books the category's memory as
+  written.
+- A category the flag does not name, and an action that sets no category, book 1 GiB.
+  The flag is empty by default, so a server started without it books as before.
+- The booking sets the action's memory limit as any booking does, and the memory-kill
+  ladder starts from it: a 4 GiB category booking killed at its own limit runs again
+  at 8 GiB, and its action key keeps 8 GiB as its floor (see
+  [`kbf-book-cpus` and `kbf-book-mem-gib`](#kbf-book-cpus-and-kbf-book-mem-gib)).
+- The variable is part of the action digest, as every `Command` field is: adding it
+  reruns the action once. The flag is not: changing a category's memory reruns
+  nothing that is cached.
+- The flag is written `<category>=<GiB>`, entries separated by commas; a size is a
+  whole number of at least 1 in plain digits, a category has no whitespace and is
+  named once. The server refuses to start on any other value.
 
 ## `xcode`
 
