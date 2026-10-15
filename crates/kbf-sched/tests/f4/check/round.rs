@@ -37,14 +37,14 @@ impl Checker {
             let mut placed = false;
             // An operation with farm runs avoids their workers while another could run
             // it, so its fit is its own, not its class's.
-            let avoids = !op.farm_runs.is_empty();
+            let avoids = !op.avoid.is_empty();
             if grants.len() < PLACEMENT_ROUND && (avoids || !no_room.contains(&class)) {
                 let m = matching.entry(op.needs).or_insert_with(|| {
                     (0..live.len())
                         .filter(|&i| needs.matches(&self.workers[live[i]].caps))
                         .collect()
                 });
-                let avoided = |i: usize| op.farm_runs.iter().any(|r| r.worker == *live[i]);
+                let avoided = |i: usize| op.avoid.contains(live[i]);
                 let elsewhere = m.iter().copied().any(|i| {
                     !avoided(i) && fits(self.workers[live[i]].capacity, op.request.resources)
                 });

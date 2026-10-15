@@ -39,9 +39,23 @@
 //! be charged is the lead's decision.) [`Scheduler::reconcile`] skips such a lease
 //! instead.
 //!
-//! Leases given up for reconnection, not starting or a session switch are not charged:
-//! those runs never ran. (A node that drops every `Start` while it heartbeats is given
-//! up as not started, so it is not bounded by this budget.)
+//! Leases given up for reconnection or a session switch are charged to no budget: those
+//! runs never ran.
+//!
+//! A lease given up as not started (the node heartbeats but never listed it within the
+//! start grace) never ran either, so it is always safe to run elsewhere and spends none
+//! of [`FARM_RERUNS`]. But a node that drops every `Start` would hold the operation for
+//! ever, so it has a small budget of its own, [`NOT_STARTED_RERUNS`] per operation:
+//! each such give-up adds the node to the nodes placement avoids and runs the operation
+//! again while the budget lasts, and the give-up past it ends the operation with
+//! [`Failure::Infra`] (the farm never started the action; the action did not fail),
+//! proposed through the log like the other past-budget give-ups. Because that result
+//! is the scheduler's own, its commit is not run again as a farm fault. Infra reruns
+//! spend none of the not-started budget.
+//!
+//! Accepted gap (the lead's decision): a worker's farm-fault result committed after
+//! silence gave its lease up is not charged, so that operation gets one free rerun; the
+//! log order still decides.
 
 use kbf_types::{
     ControlRecord, Effect, Failure, FarmFault, FarmRun, LeaseId, LostWhy, OperationId, Outcome,
@@ -49,7 +63,7 @@ use kbf_types::{
 };
 
 use super::Scheduler;
-use super::memory::FARM_RERUNS;
+use super::memory::{FARM_RERUNS, NOT_STARTED_RERUNS};
 use crate::requeue::RequeueReason;
 
 impl Scheduler {
@@ -136,12 +150,42 @@ impl Scheduler {
             .get(&lease)
             .is_some_and(|h| h.start_sent.is_some());
         let op = &self.ops[&id];
-        // A worker's result already on its way to the log decides the operation.
-        if !(sent && op.committed_lease == Some(lease)) || op.result_proposed {
+        // A worker's result already on its way to the log decides the operation. (A
+        // lease whose `Start` was sent is the newest committed grant: the send is the
+        // commit.)
+        if !sent || op.result_proposed {
             self.requeue(id, reason);
             return Vec::new();
         }
         self.give_up_charged(id, lease, worker, LostWhy::Fenced, reason)
+    }
+
+    /// `operation`'s `lease` on `worker` was given up as not started. Runs it again
+    /// preferring another node while [`NOT_STARTED_RERUNS`] lasts, charging no farm run;
+    /// past it, proposes the lease's result ([`Failure::Infra`]), which the caller emits.
+    pub(super) fn not_started(
+        &mut self,
+        id: OperationId,
+        lease: LeaseId,
+        worker: &WorkerId,
+    ) -> Vec<Effect> {
+        let op = self
+            .ops
+            .get_mut(&id)
+            .expect("held leases name live operations");
+        if op.not_started >= NOT_STARTED_RERUNS {
+            op.result_proposed = true;
+            op.gave_up = true;
+            return vec![Effect::Commit(ControlRecord::Result(ResultRecord {
+                lease,
+                operation: id,
+                outcome: Outcome::Failed(Failure::Infra),
+            }))];
+        }
+        op.not_started += 1;
+        op.avoid.insert(worker.clone());
+        self.requeue(id, RequeueReason::NotStarted);
+        Vec::new()
     }
 
     /// Charges a given-up lease to the operation's farm budget as a run lost for `why`:

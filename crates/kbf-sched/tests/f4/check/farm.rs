@@ -57,7 +57,35 @@ impl Checker {
         }
         self.hit("a give-up charged to the farm budget");
         let op = self.op_mut(id);
+        op.avoid.insert(worker.clone());
         op.farm_runs.push(FarmRun { worker, fault });
+        self.requeue(id);
+        None
+    }
+
+    /// Gives up `lease`, whose `Start` the node never listed, as one of its operation's
+    /// not-started give-ups: requeued while that budget lasts, avoiding its worker; past
+    /// it, the `Infra` result the scheduler proposes. Charges nothing to the farm budget.
+    pub(super) fn give_up_not_started(&mut self, lease: LeaseId) -> Option<Effect> {
+        let (id, worker) = {
+            let l = &self.leases[&lease];
+            (l.op, l.worker.clone())
+        };
+        if self.op(id).not_started >= NOT_STARTED_RERUNS {
+            self.hit("a not-started give-up past its budget proposes its result");
+            let op = self.op_mut(id);
+            op.proposed = true;
+            op.silenced = true;
+            return Some(Effect::Commit(ControlRecord::Result(ResultRecord {
+                lease,
+                operation: id,
+                outcome: Outcome::Failed(Failure::Infra),
+            })));
+        }
+        self.hit("a not-started give-up within its budget");
+        let op = self.op_mut(id);
+        op.not_started += 1;
+        op.avoid.insert(worker);
         self.requeue(id);
         None
     }

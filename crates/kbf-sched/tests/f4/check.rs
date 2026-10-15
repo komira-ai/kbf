@@ -31,7 +31,8 @@ use super::reference::{Verdict, add, blame, fits, sub, verdict};
 use kbf_caps::NodeCaps;
 use kbf_sched::fence::{HANDOVER_GRACE, LEASE_GRACE, START_GRACE};
 use kbf_sched::{
-    Cordon, DaemonInstance, Event, FARM_RERUNS, Input, OpState, PLACEMENT_ROUND, Request, Scheduler,
+    Cordon, DaemonInstance, Event, FARM_RERUNS, Input, NOT_STARTED_RERUNS, OpState,
+    PLACEMENT_ROUND, Request, Scheduler,
 };
 
 use kbf_types::{
@@ -100,6 +101,12 @@ struct Op {
     /// Its sent leases given up for silence or replacement: the farm runs it was
     /// charged (the workers placement avoids while another fits).
     farm_runs: Vec<FarmRun>,
+    /// Its leases given up as not started (the node heartbeats but never listed them):
+    /// their own budget, charged nothing to the farm's.
+    not_started: u32,
+    /// The workers placement avoids while another fits: those of its farm runs and of
+    /// its not-started give-ups.
+    avoid: BTreeSet<WorkerId>,
     wait: Option<Wait>,
     /// The last reason its callers were told, while it waits.
     told: Option<String>,
@@ -441,17 +448,24 @@ impl Checker {
             } else {
                 continue;
             };
-            lost.push((l.op, why, charged.then_some(*lease)));
+            let unstarted = !charged && sent_to >= session;
+            lost.push((
+                l.op,
+                why,
+                charged.then_some(*lease),
+                unstarted.then_some(*lease),
+            ));
         }
         if kept_for_handover > 0 {
             self.hit("kept: Start sent to a replaced daemon process, inside the handover grace");
         }
         let mut proposed = Vec::new();
-        for (op, why, charged) in lost {
+        for (op, why, charged, unstarted) in lost {
             self.hit(why);
-            match charged {
-                Some(lease) => proposed.extend(self.give_up_charged(lease)),
-                None => self.requeue(op),
+            match (charged, unstarted) {
+                (Some(lease), _) => proposed.extend(self.give_up_charged(lease)),
+                (None, Some(lease)) => proposed.extend(self.give_up_not_started(lease)),
+                (None, None) => self.requeue(op),
             }
         }
         proposed
@@ -513,6 +527,8 @@ impl Checker {
             proposed: false,
             silenced: false,
             farm_runs: Vec::new(),
+            not_started: 0,
+            avoid: BTreeSet::new(),
             wait: None,
             told: None,
             dropped: false,
@@ -594,7 +610,9 @@ impl Checker {
         // or the give-up's, which the scheduler proposed past the farm budget.
         let fenced = Outcome::Failed(Failure::Lost(LostWhy::Fenced));
         let given_up = op.silenced && record.outcome == fenced;
-        if !given_up && self.produced.get(&record.lease) != Some(&record.outcome) {
+        let never_started = op.silenced && record.outcome == Outcome::Failed(Failure::Infra);
+        if !given_up && !never_started && self.produced.get(&record.lease) != Some(&record.outcome)
+        {
             self.violated(
                 "I5",
                 format!(
@@ -605,7 +623,7 @@ impl Checker {
                 ),
             );
         }
-        let infra = record.outcome == Outcome::Failed(Failure::Infra);
+        let infra = record.outcome == Outcome::Failed(Failure::Infra) && !never_started;
         if infra && self.op(id).holding != Some(record.lease) {
             // Given up meanwhile, and waiting to be granted again: charged nothing.
             self.hit("infra result of a lease given up");
@@ -619,6 +637,7 @@ impl Checker {
             } else {
                 FarmFault::Lost(LostWhy::Fenced)
             };
+            self.op_mut(id).avoid.insert(worker.clone());
             self.op_mut(id).farm_runs.push(FarmRun { worker, fault });
             let ended = self.op(id).farm_runs.len();
             if infra && u32::try_from(ended).unwrap_or(u32::MAX) <= FARM_RERUNS {

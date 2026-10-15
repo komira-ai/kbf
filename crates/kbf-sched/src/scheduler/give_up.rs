@@ -106,6 +106,8 @@ impl Scheduler {
                 effects.extend(self.restarted(id, lease, worker));
             } else if reason == RequeueReason::Replaced {
                 effects.extend(self.unproven(id, lease, worker, reason));
+            } else if reason == RequeueReason::NotStarted {
+                effects.extend(self.not_started(id, lease, worker));
             } else {
                 self.requeue(id, reason);
             }

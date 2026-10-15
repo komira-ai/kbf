@@ -42,9 +42,9 @@ use std::time::Duration;
 use cell::leader::term;
 use cell::worker::{End, Took};
 use cell::{Ctx, LeaderPlan, LogPlan, Plan, WorkerPlan, World, calm_network, check::CheckStats};
+use kbf_sched::FARM_RERUNS;
 use kbf_sched::fence::{LEASE_GRACE, SELF_FENCE, START_GRACE, START_VALIDITY};
 use kbf_sim::{Chance, Faults, SimRng};
-use kbf_sched::FARM_RERUNS;
 use kbf_types::{ControlRecord, Failure, LeaseId, OperationId, Outcome};
 
 /// Seeds per scenario in CI.

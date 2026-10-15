@@ -62,12 +62,15 @@
 //!   from one budget of [`FARM_RERUNS`] per operation, placement preferring a node none
 //!   of those runs ended on; the run past it finishes the operation, its callers told
 //!   every farm run ([`kbf_types::FarmRun`]). A give-up past the budget has its result
-//!   proposed through the log.
+//!   proposed through the log. A lease given up as not started (the node heartbeats but
+//!   never listed it) spends none of that: it has its own budget of
+//!   [`NOT_STARTED_RERUNS`] per operation, placement preferring another node, and the
+//!   give-up past it ends the operation with [`kbf_types::Failure::Infra`], proposed
+//!   through the log.
 //!
 //! Not yet: placement scoring (alignment, best fit), a reservation for a large
 //! `action` request (issue #169), reclaimed room and preemption, a budget for the
-//! leases given up for reconnection or not starting (a node that drops every `Start`
-//! while it heartbeats is not bounded), and committing submissions so that a new leader
+//! leases given up for reconnection, and committing submissions so that a new leader
 //! inherits the queue. In v0 the scheduler runs on the leader only.
 //!
 //! This is a pure crate: no async runtime, network, clock, randomness or hashed
@@ -89,5 +92,5 @@ pub use fence::SelfFence;
 pub use input::{DaemonInstance, Event, Input, Request};
 pub use kbf_types::NodePhase;
 pub use requeue::{Gib, Requeue, RequeueReason};
-pub use scheduler::memory::{FARM_RERUNS, MEMORY_FLOORS, MemoryState, raised};
+pub use scheduler::memory::{FARM_RERUNS, MEMORY_FLOORS, MemoryState, NOT_STARTED_RERUNS, raised};
 pub use scheduler::{FINISHED_RETENTION, OpState, PLACEMENT_ROUND, Scheduler, UNSERVABLE_WAIT};

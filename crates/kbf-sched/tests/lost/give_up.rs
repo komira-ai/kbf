@@ -1,23 +1,24 @@
 //! What the farm's budget charges and what it leaves free, at the give-ups (issue #22):
 //! a lease given up for silence or replacement is charged only if its `Start` went out
-//! and nothing is on its way to the log; a lease given up for reconnection, not
-//! starting or a session switch is never charged, however often. A fault of every kind
-//! spends the one budget, in any order.
+//! and nothing is on its way to the log; a lease given up for reconnection
+//! or a session switch is never charged to the farm budget, however often; a lease
+//! given up as not started has its own budget ([`NOT_STARTED_RERUNS`]), and the two
+//! never spend each other. A fault of every farm kind spends the one budget, in any
+//! order.
 //!
 //! A module of the `lost` test binary, for its farm harness.
 
 use std::time::Duration;
 
 use kbf_sched::fence::{HANDOVER_GRACE, LEASE_GRACE, SESSION_SWITCH_GRACE, START_GRACE};
-use kbf_sched::{Event, FARM_RERUNS, Input, NodePhase, OpState, RequeueReason};
+use kbf_sched::{Event, FARM_RERUNS, Input, NOT_STARTED_RERUNS, NodePhase, OpState, RequeueReason};
 use kbf_types::{
     ControlRecord, Effect, Failure, LeaseGrant, LeaseKind, LostWhy, OperationId, Outcome,
-    ResultRecord, StateMachine,
+    ResultRecord, StartLease, StateMachine, WaiterId,
 };
 
 use super::{
-    FENCED, Farm, GIB, INFRA, PRESSURE, answer_in, busy, infra, lost, ok, request,
-    running_on_a, w,
+    FENCED, Farm, GIB, INFRA, PRESSURE, answer_in, busy, infra, lost, ok, request, running_on_a, w,
 };
 
 /// More runs than the budget allows, so a charge that crept in would end the operation.
@@ -88,7 +89,10 @@ fn silence_before_the_start_is_sent_charges_nothing() {
         }
         // The grant was never committed: the lease is held, and no `Start` went out.
         proposed = raw_tick(&mut f);
-        assert!(!ends_the_operation(&proposed), "round {round}: {proposed:?}");
+        assert!(
+            !ends_the_operation(&proposed),
+            "round {round}: {proposed:?}"
+        );
         assert_eq!(f.requeues(), [RequeueReason::Silent], "round {round}");
         assert_unspent(&f, grant.operation, "silence before the Start");
         // The node comes back, for the next round.
@@ -156,7 +160,10 @@ fn silence_after_an_ok_result_is_proposed_lets_the_result_decide() {
     pass(&mut f, LEASE_GRACE + Duration::from_secs(1));
     assert!(f.beat("b", &[]).is_empty());
     let given_up = raw_tick(&mut f);
-    assert!(!ends_the_operation(&given_up), "a result beside it: {given_up:?}");
+    assert!(
+        !ends_the_operation(&given_up),
+        "a result beside it: {given_up:?}"
+    );
     assert_eq!(f.requeues(), [RequeueReason::Silent]);
     assert_unspent(&f, start.operation, "silence after a result");
 
@@ -167,22 +174,136 @@ fn silence_after_an_ok_result_is_proposed_lets_the_result_decide() {
     assert!(answer.farm_runs.is_empty());
 }
 
-/// Catches a node that heartbeats and drops every `Start` being bounded by the budget
-/// by accident, or charged: a lease whose `Start` the node never lists is given up as
-/// not started, every time, charged nothing. This is deliberately unbounded today (the
-/// node holds the operation for ever; a follow-up to issue #22 bounds it), and this
-/// test pins that so the day it is bounded is a deliberate change.
-#[test]
-fn a_node_that_drops_every_start_is_requeued_uncharged_and_unbounded() {
-    let (mut f, mut start) = running_on_a();
-    for round in 0..ROUNDS {
-        pass(&mut f, START_GRACE);
-        let effects = f.beat(start.worker.as_str(), &[]);
-        assert!(!ends_the_operation(&effects), "round {round}: {effects:?}");
-        assert_eq!(f.requeues(), [RequeueReason::NotStarted], "round {round}");
-        assert_unspent(&f, start.operation, "a dropped Start");
-        start = f.start();
+/// The node holding `start` heartbeats without listing it, after the start grace: the
+/// lease is given up as not started and the operation is placed again. The next `Start`.
+fn drop_start(f: &mut Farm, start: &StartLease) -> StartLease {
+    // The earlier requeues are not this give-up's.
+    f.requeues();
+    pass(f, START_GRACE);
+    // The other nodes heartbeat, so they are alive when the operation is placed again.
+    for name in ["a", "b"]
+        .into_iter()
+        .filter(|n| *n != start.worker.as_str())
+    {
+        f.beat(name, &[]);
     }
+    let effects = f.beat(start.worker.as_str(), &[]);
+    assert!(!ends_the_operation(&effects), "{effects:?}");
+    assert_eq!(f.requeues(), [RequeueReason::NotStarted]);
+    let next = f.start();
+    assert_eq!(next.operation, start.operation);
+    next
+}
+
+/// Catches a node that drops every `Start` holding an operation for ever (the old
+/// uncharged, unbounded requeue), a give-up past the budget that answers without going
+/// through the log, a wrong budget size (`1 + NOT_STARTED_RERUNS` give-ups end it, no
+/// more, no fewer), and a never-started lease charged to `FARM_RERUNS`. The only node
+/// drops every `Start`: the first `NOT_STARTED_RERUNS` give-ups requeue; the next
+/// proposes `Infra`, and once committed the waiter is answered with it.
+#[test]
+fn a_node_that_drops_every_start_ends_the_operation_bounded() {
+    let mut f = Farm::new();
+    f.node("a");
+    f.submit(1, request(1, LeaseKind::Action));
+    let mut start = f.start();
+    for _ in 0..NOT_STARTED_RERUNS {
+        start = drop_start(&mut f, &start);
+        assert_unspent(&f, start.operation, "a dropped Start");
+    }
+    pass(&mut f, START_GRACE);
+    let beat = Event::Heartbeat {
+        worker: w("a"),
+        running: Vec::new(),
+    };
+    let proposed = f.s.apply(Input::new(f.now, beat));
+    let record = ResultRecord {
+        lease: start.lease,
+        operation: start.operation,
+        outcome: INFRA,
+    };
+    assert_eq!(
+        proposed,
+        [Effect::Commit(ControlRecord::Result(record.clone()))]
+    );
+    assert!(f.s.state(start.operation).is_some_and(|s| !s.is_done()));
+
+    let effects = f.feed(Event::Committed(ControlRecord::Result(record)));
+    let answer = answer_in(&effects).expect("the committed give-up answers");
+    assert_eq!(answer.outcome, INFRA);
+    assert_eq!(answer.waiters, [WaiterId(1)]);
+    assert!(answer.farm_runs.is_empty(), "FARM_RERUNS was spent");
+    assert_eq!(f.s.farm_runs(start.operation), Some(&[][..]));
+    assert!(matches!(
+        f.s.state(start.operation),
+        Some(OpState::Failed {
+            failure: Failure::Infra,
+            ..
+        })
+    ));
+}
+
+/// Catches a not-started give-up that does not add the node to `avoid`: with a second
+/// node, the operation must leave the node that drops `Start`s, not be placed on it
+/// again, and finish there.
+#[test]
+fn a_dropped_start_moves_the_operation_to_the_other_node() {
+    let (mut f, start) = running_on_a();
+    let next = drop_start(&mut f, &start);
+    assert_eq!(next.worker, w("b"));
+    assert!(f.beat("b", &[&next]).is_empty());
+    let effects = f.end(&next, ok());
+    let answer = answer_in(&effects).expect("the run on b answers");
+    assert_eq!(answer.outcome, ok());
+    assert!(answer.farm_runs.is_empty());
+}
+
+/// Catches the two budgets being one: a spent not-started budget must leave the full
+/// `FARM_RERUNS` Infra reruns, and the run past them ends the operation as an `Infra`
+/// answer carrying every farm run. (A not-started give-up charged to `FARM_RERUNS`
+/// would end it early.)
+#[test]
+fn not_started_give_ups_do_not_spend_the_farm_budget() {
+    let mut f = Farm::new();
+    f.node("a");
+    f.submit(1, request(1, LeaseKind::Action));
+    let mut start = f.start();
+    for _ in 0..NOT_STARTED_RERUNS {
+        start = drop_start(&mut f, &start);
+    }
+    for _ in 0..FARM_RERUNS {
+        start = f.rerun(&start, INFRA);
+    }
+    let effects = f.end(&start, INFRA);
+    let answer = answer_in(&effects).expect("past the farm budget it ends");
+    assert_eq!(answer.outcome, INFRA);
+    let runs = usize::try_from(FARM_RERUNS + 1).unwrap();
+    assert_eq!(answer.farm_runs, vec![infra("a"); runs]);
+}
+
+/// Catches the two budgets being one the other way: spent `FARM_RERUNS` Infra reruns
+/// must leave all `NOT_STARTED_RERUNS` not-started requeues, and only the give-up past
+/// them ends the operation.
+#[test]
+fn farm_reruns_do_not_spend_the_not_started_budget() {
+    let mut f = Farm::new();
+    f.node("a");
+    f.submit(1, request(1, LeaseKind::Action));
+    let mut start = f.start();
+    for _ in 0..FARM_RERUNS {
+        start = f.rerun(&start, INFRA);
+    }
+    for _ in 0..NOT_STARTED_RERUNS {
+        start = drop_start(&mut f, &start);
+    }
+    pass(&mut f, START_GRACE);
+    let effects = f.beat("a", &[]);
+    let answer = answer_in(&effects).expect("past the not-started budget it ends");
+    assert_eq!(answer.outcome, INFRA);
+    assert_eq!(
+        answer.farm_runs,
+        vec![infra("a"); usize::try_from(FARM_RERUNS).unwrap()]
+    );
 }
 
 /// Catches a rejoin charged: a daemon process that registers again (a new session of
@@ -219,7 +340,11 @@ fn a_session_switch_given_up_charges_nothing() {
         pass(&mut f, SESSION_SWITCH_GRACE);
         let effects = f.feed(Event::Tick);
         assert!(!ends_the_operation(&effects), "round {round}: {effects:?}");
-        assert_eq!(f.requeues(), [RequeueReason::SessionSwitch], "round {round}");
+        assert_eq!(
+            f.requeues(),
+            [RequeueReason::SessionSwitch],
+            "round {round}"
+        );
         assert_unspent(&f, start.operation, "a session switch");
         // The daemon comes back serving.
         f.up("m", "m", false, true);
@@ -247,11 +372,7 @@ fn a_restart_a_memory_kill_and_an_infra_result_share_one_budget() {
     assert_eq!(answer.outcome, INFRA);
     assert_eq!(
         answer.farm_runs,
-        [
-            lost("a", LostWhy::DaemonRestarted),
-            busy("b"),
-            infra("a")
-        ]
+        [lost("a", LostWhy::DaemonRestarted), busy("b"), infra("a")]
     );
 }
 
@@ -322,7 +443,11 @@ fn an_out_of_memory_kill_is_not_a_farm_fault() {
         matches!(reasons[..], [RequeueReason::OutOfMemory { .. }]),
         "{reasons:?}"
     );
-    assert_unspent(&f, start.operation, "an own-limit kill below the largest node");
+    assert_unspent(
+        &f,
+        start.operation,
+        "an own-limit kill below the largest node",
+    );
 
     // Booked at the largest node (16 GiB): nothing more to give.
     let mut f = Farm::new();

@@ -63,8 +63,8 @@ struct Operation {
     /// A result from the current holding has been proposed; later reports for it are
     /// duplicates.
     result_proposed: bool,
-    /// The proposed result is the farm's give-up of a silent or replaced lease past
-    /// the operation's farm budget ([`Scheduler::give_up_charged`]), not a worker's.
+    /// The proposed result is the farm's give-up of a silent, replaced or never-started
+    /// lease past its budget ([`Scheduler::give_up_charged`]), not a worker's.
     gave_up: bool,
     /// While queued: since when, and why, no live worker can run it. `None` while one
     /// can.
@@ -75,6 +75,8 @@ struct Operation {
     /// The workers those runs ended on: placement prefers any other (see
     /// [`Servable::fit`]).
     avoid: BTreeSet<WorkerId>,
+    /// Its leases given up as not started ([`memory::NOT_STARTED_RERUNS`]).
+    not_started: u32,
 }
 
 /// A queued operation no live worker can run: since when, why, and whether the wait
@@ -482,6 +484,7 @@ impl Scheduler {
                 gave_up: false,
                 unservable: None,
                 farm_runs: Vec::new(),
+                not_started: 0,
                 avoid: BTreeSet::new(),
             },
         );
@@ -803,7 +806,11 @@ impl Scheduler {
         {
             return Vec::new();
         }
-        if record.outcome == Outcome::Failed(Failure::Infra) && self.rerun_after_infra(record) {
+        // The scheduler's own give-up for a lease that never started is not a run to charge.
+        if record.outcome == Outcome::Failed(Failure::Infra)
+            && !self.ops[&id].gave_up
+            && self.rerun_after_infra(record)
+        {
             return Vec::new();
         }
         self.release(id);

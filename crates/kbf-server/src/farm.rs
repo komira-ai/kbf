@@ -1137,4 +1137,37 @@ mod tests {
         assert!(second > first, "{second} does not order after {first}");
         assert!(first >> 16 > 0, "{first} could be a pre-fix term");
     }
+
+    /// Catches a result the farm settles with no detail that is not a farm fault (a
+    /// committed `Completed` whose worker report this process never saw) being answered
+    /// as anything but the fixed INTERNAL "could not run the action", or panicking.
+    #[test]
+    fn a_result_without_detail_that_is_no_fault_is_answered_internal() {
+        let farm = Farm::new(
+            Arc::new(Cache::memory()),
+            kbf_sched::UNSERVABLE_WAIT,
+            kbf_sched::FINISHED_RETENTION,
+        );
+        let answer = kbf_types::Answer {
+            operation: kbf_types::OperationId(1),
+            lease: kbf_types::LeaseId::new(1, 0),
+            waiters: Vec::new(),
+            outcome: Outcome::Completed {
+                action_result: kbf_types::Digest::new(
+                    kbf_types::DigestFunction::Sha256,
+                    [1; 32],
+                    1,
+                ),
+            },
+            memory_runs: Vec::new(),
+            farm_runs: Vec::new(),
+        };
+        let settled = farm.lock().settle(&answer, None);
+        assert!(
+            matches!(&settled.finished, Finished::Failed(s)
+                if s.code == Code::Internal as i32 && s.message.contains("could not run the action")),
+            "{:?}",
+            settled.finished
+        );
+    }
 }
