@@ -57,8 +57,17 @@ impl Dirs {
         }
     }
 
-    /// `kbf-server --blob-dir <blobs> --meta-log=raft --raft-dir <raft>` on free ports.
+    /// `kbf-server --blob-dir <blobs> --meta-log=raft --raft-dir <raft>` on free ports,
+    /// with a floor of one byte: the default floor depends on the disk the tests run
+    /// on, and under twice it the evictor would take what a test reads back.
     fn server(&self) -> Command {
+        let mut c = self.unfloored();
+        c.args(["--blob-dir-min-free-bytes", "1"]);
+        c
+    }
+
+    /// [`Dirs::server`] without a floor.
+    fn unfloored(&self) -> Command {
         let mut c = Command::new(BIN);
         c.arg("--blob-dir")
             .arg(&self.blobs)
@@ -422,7 +431,7 @@ async fn a_hit_whose_output_file_is_lost_is_a_miss_after_a_restart() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn uploads_are_refused_under_the_free_space_floor() {
     let dirs = Dirs::new("floor");
-    let mut c = dirs.server();
+    let mut c = dirs.unfloored();
     c.args(["--blob-dir-min-free-bytes", &u64::MAX.to_string()]);
     let (server, client) = started(c).await;
     let blob = Blob::new("a blob with no room");
@@ -445,6 +454,43 @@ async fn uploads_are_refused_under_the_free_space_floor() {
         .collect();
     assert_eq!(codes, [Code::Unavailable as i32]);
     assert!(!client.holds(&blob).await);
+    drop(client);
+    stop(server);
+    dirs.remove();
+}
+
+/// Catches a full blob directory that stops taking uploads: a write refused for want of
+/// room that does not wake the evictor (mutant: no nudge; the next round is the 10 s
+/// tick, after every retry of the PUT has failed), an evictor that frees nothing, or
+/// one that evicts what was used last. On a file system of 16 MiB that holds only the
+/// object files, with a 4 MiB floor and no grace window, twenty uploads of 1 MiB each
+/// (twice the room) all succeed; the first blob is then reported
+/// missing (evicted), and the last reads back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fills_past_floor_and_keeps_serving() {
+    const MIB: u32 = 1 << 20;
+    let dirs = Dirs::new("fills");
+    let mut c = dirs.unfloored();
+    c.args(["--blob-dir-size-bytes", &(16 * MIB).to_string()])
+        .args(["--blob-dir-min-free-bytes", &(4 * MIB).to_string()])
+        .args(["--blob-dir-evict-grace-ms", "0"]);
+    let (server, client) = started(c).await;
+    let blobs: Vec<Blob> = (0..20_u32)
+        .map(|i| {
+            let mut data = pattern(MIB);
+            data[..4].copy_from_slice(&i.to_be_bytes());
+            Blob::new(data)
+        })
+        .collect();
+    for blob in &blobs {
+        client.upload(&[blob]).await;
+    }
+    assert!(
+        !client.holds(&blobs[0]).await,
+        "the least recently used blob was kept"
+    );
+    let last = blobs.last().expect("a blob");
+    assert_eq!(read(&client, last).await, Ok(last.data.clone()));
     drop(client);
     stop(server);
     dirs.remove();

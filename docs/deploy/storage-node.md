@@ -269,7 +269,7 @@ kbf-server \
   It logs one line at the end: files read, kept, orphans deleted, foreign, without a
   header, objects, blobs and entries forgotten, objects held back by the guard, the
   bytes held and how long it took. A pass that fails is logged and runs again at the
-  next start.
+  next start; until then nothing is evicted.
 - Until the pass reaches it, or for a file lost while the server runs, a blob whose
   file was lost, damaged or left empty is still reported present by
   `FindMissingBlobs` until a read of it fails: that read answers `UNAVAILABLE` and
@@ -279,10 +279,27 @@ kbf-server \
   the file of every object the hit needs is there and starts with its header; if one
   is not, the hit is a miss (the action runs again) and its blobs are reported
   missing.
-- No eviction: only the start-up pass deletes objects (orphans), so the directory
-  grows with every blob the cache keeps. A write that would leave the file system
-  with less than `--blob-dir-min-free-bytes` free (default 1 GiB) is refused, and its
-  upload answered `UNAVAILABLE`. Size the disk for the cache you want to keep.
+- Eviction under disk pressure: the floor is `--blob-dir-min-free-bytes`, by
+  default 5% of the file system and at least 1 GiB. A write that would leave less
+  free is refused (its upload answered `UNAVAILABLE`; the server's PUT retries
+  twice) and wakes the evictor, which also looks every 10 seconds once the start-up
+  pass is done. While less than twice the floor is free, it takes the least recently
+  used objects until their lengths cover the shortfall: an object counts as used
+  when `FindMissingBlobs` reports one of its blobs present, a blob of it is read, an
+  action-cache hit needs it, or it is written; objects not used since the start
+  come first, oldest file first. It never takes an object used in the last 60
+  seconds, nor one staged on the write tier. It forgets them first (their blobs
+  leave the index, with every action-cache entry that needs one, as in the start-up
+  pass, raising the Raft log to machine version 3), then deletes their files; a
+  crash between the two leaves files the next start-up pass deletes. The directory
+  is the store of record: nothing is behind it, so an evicted blob is gone, and
+  `FindMissingBlobs` reports it missing so the client uploads it again (or the
+  action runs again). Under pressure eviction cuts the retention's `min_ttl` short
+  (a blob reported present stays held 7 days by default): the 60 seconds after a use
+  are all it keeps, so a download that comes later than that after a hit can fail with
+  `NOT_FOUND`. Each round that evicts logs a line (free bytes, target, objects,
+  bytes, blobs and entries removed, and the bytes it could not cover). Size the disk
+  for the cache you want to keep.
 
 ## Planned: the Raft log on local disk
 

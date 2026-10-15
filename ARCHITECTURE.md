@@ -67,8 +67,8 @@ role (`--role=all`). The flags are:
   `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` variables, never from the command line;
   or, in place of `--store`, `--blob-dir`, a directory on the local disk (with
   `--meta-log=raft` only, under the fixed prefix `kbf/<log id>/`), with
-  `--blob-dir-min-free-bytes` (default 1 GiB) the free space below which it refuses
-  writes; nothing is evicted;
+  `--blob-dir-min-free-bytes` (default 5% of the file system, at least 1 GiB) the free
+  space below which it refuses writes and evicts the least recently used objects;
 - `--heartbeat-interval-ms` (default 5000), the interval daemons are asked to
   heartbeat at;
 - `--finished-retention-secs` (default 60), how long a finished operation is kept

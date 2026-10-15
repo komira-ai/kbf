@@ -238,16 +238,28 @@ pub struct Args {
     /// (`kbf_objstore::FsStore`): created if missing, locked while the server runs (a
     /// second server on it is refused), and kept across restarts. Needs
     /// `--meta-log=raft`, which keeps the index of what it holds; objects are keyed
-    /// under `kbf/<log id>/` (fixed: `--s3-prefix` is refused with it). Nothing reads
-    /// the directory at start; a lost or damaged object is found when it is read, or
-    /// before an action-cache hit that needs it is served (a miss). No eviction: the
-    /// directory grows with every blob written.
+    /// under `kbf/<log id>/` (fixed: `--s3-prefix` is refused with it). A start-up
+    /// pass checks the directory against the index in the background; a lost or
+    /// damaged object is also found when it is read, or before an action-cache hit
+    /// that needs it is served (a miss). Under disk pressure the least recently used
+    /// objects are evicted (`--blob-dir-min-free-bytes`).
     #[arg(long, conflicts_with_all = ["store", "s3_endpoint", "s3_bucket", "s3_prefix"])]
     pub blob_dir: Option<PathBuf>,
-    /// The free bytes `--blob-dir`'s file system must keep: a write that would leave
-    /// less is refused (the upload is answered UNAVAILABLE), since nothing is evicted.
-    #[arg(long, value_name = "BYTES", default_value_t = 1 << 30, requires = "blob_dir")]
-    pub blob_dir_min_free_bytes: u64,
+    /// The free bytes `--blob-dir`'s file system must keep (default: 5% of it, at least
+    /// 1 GiB): a write that would leave less is refused (the upload is answered
+    /// UNAVAILABLE) and wakes the evictor, which forgets the least recently used
+    /// objects and deletes their files while less than twice this is free. An object
+    /// used in the last minute is never evicted.
+    #[arg(long, value_name = "BYTES", requires = "blob_dir")]
+    pub blob_dir_min_free_bytes: Option<u64>,
+    /// For tests of eviction only: `--blob-dir`'s file system is taken to be this many
+    /// bytes, holding nothing but the directory's object files.
+    #[arg(long, hide = true, value_name = "BYTES", requires = "blob_dir")]
+    pub blob_dir_size_bytes: Option<u64>,
+    /// For tests of eviction only: how long after its last use an object is never
+    /// evicted, in milliseconds.
+    #[arg(long, hide = true, default_value_t = kbf_front::EVICT_GRACE.as_millis() as u64)]
+    pub blob_dir_evict_grace_ms: u64,
     /// `http://host[:port]` of the S3 service (`--store=s3`).
     #[arg(long, required_if_eq("store", "s3"))]
     pub s3_endpoint: Option<String>,

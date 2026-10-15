@@ -312,6 +312,9 @@ pub struct FindMissing {
     pub missing: Vec<Digest>,
     /// Present blobs that must be touched before the answer is sent.
     pub touch: Touch,
+    /// The objects the present blobs are in, each once: a server that evicts the
+    /// least recently used objects counts the answer as a use of each.
+    pub objects: BTreeSet<ObjectId>,
 }
 
 /// Why an action-cache lookup is a miss.

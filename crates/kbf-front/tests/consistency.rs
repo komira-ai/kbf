@@ -17,7 +17,7 @@ use kbf_meta::{
     ActionAnswer, ActionRecord, Applied, Closure, Collected, Command, Epoch, MetaState, Miss,
     ObjectId, Retention, Role, ServerId, StagedPut, TierId,
 };
-use kbf_objstore::{FsStore, KeyPrefix, ObjectKey, ObjectStore};
+use kbf_objstore::{Floor, FsStore, KeyPrefix, ObjectKey, ObjectStore};
 use kbf_types::{Digest, FarmTime};
 
 /// One metadata log shared by the caches of successive "processes". Every test runs
@@ -108,7 +108,7 @@ impl MetaLog for Log {
 const PREFIX: &str = "kbf/log-a/";
 
 /// A floor every file system the tests run on meets.
-const FLOOR: u64 = 1;
+const FLOOR: Floor = Floor::Bytes(1);
 
 fn prefix() -> KeyPrefix {
     KeyPrefix::new(PREFIX).expect("a prefix")
@@ -485,7 +485,7 @@ async fn pass_keeps_its_pace_unless_under_the_floor() {
     assert_eq!(paced.kept, 6);
     drop((cache, files));
 
-    let files = FsStore::open(&dir, u64::MAX).expect("open under the floor");
+    let files = FsStore::open(&dir, Floor::Bytes(u64::MAX)).expect("open under the floor");
     assert!(files.under_floor().expect("statvfs"));
     let cache = open(&log, &files).await;
     let started = Instant::now();

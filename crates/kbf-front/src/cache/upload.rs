@@ -170,6 +170,7 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
             (found, touch)
         })
         .await
+        .inspect(|found| self.used(found.iter().flatten().map(|l| l.object)))
     }
 
     /// `len` bytes of object `object` from `offset`, unchecked: the caller checks each
@@ -185,6 +186,7 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         offset: u64,
         len: u64,
     ) -> Result<Option<Bytes>, CacheError> {
+        self.used([object]);
         if let Some(bytes) = self.read_staged_range(object, offset, len).await {
             return Ok(Some(bytes));
         }

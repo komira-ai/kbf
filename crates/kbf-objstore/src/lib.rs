@@ -20,7 +20,9 @@ use std::time::SystemTime;
 
 use bytes::Bytes;
 
-pub use fs_store::{FsStore, FsStoreError, Scanned, ShardScan};
+pub use fs_store::{
+    Floor, FsStore, FsStoreError, Room, Scanned, ShardScan, Space, SpaceSource, keep_free,
+};
 pub use memory::MemoryStore;
 pub use types::{
     ByteRange, Capabilities, KeyError, KeyPrefix, ListPage, ListToken, ObjectInfo, ObjectKey,

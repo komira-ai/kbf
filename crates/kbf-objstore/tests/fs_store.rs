@@ -4,16 +4,18 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use bytes::Bytes;
 use kbf_objstore::{
-    ByteRange, FsStore, FsStoreError, KeyPrefix, ObjectKey, ObjectStore, ObjectStoreError,
-    PageSize, conformance,
+    ByteRange, Floor, FsStore, FsStoreError, KeyPrefix, ObjectKey, ObjectStore, ObjectStoreError,
+    PageSize, Room, Space, conformance, keep_free,
 };
 use sha2::{Digest, Sha256};
 
 /// A floor every file system the tests run on meets: one byte.
-const FLOOR: u64 = 1;
+const FLOOR: Floor = Floor::Bytes(1);
 
 /// A fresh, absent directory for `name`, under the target directory.
 fn scratch(name: &str) -> PathBuf {
@@ -196,20 +198,20 @@ async fn a_file_that_is_not_the_key_s_object_is_refused() {
 }
 
 /// Catches a write past the free-space floor: with a floor no file system meets the
-/// write is refused as a transport error that says how much is free and that nothing
-/// is evicted, and nothing is stored; with the tiny floor the same write is stored.
+/// write is refused as a transport error that says how much is free and that room is
+/// being made, and nothing is stored; with the tiny floor the same write is stored.
 #[tokio::test]
 async fn a_write_under_the_free_space_floor_is_refused() {
     let dir = scratch("floor");
     let k = key("k");
     let body = Bytes::from_static(b"body");
-    let full = FsStore::open(&dir, u64::MAX).expect("open");
+    let full = FsStore::open(&dir, Floor::Bytes(u64::MAX)).expect("open");
     let Err(e @ ObjectStoreError::Transport(_)) = full.put_new(&k, body.clone(), None).await else {
         panic!("a write under the floor was stored");
     };
     let text = e.to_string();
     assert!(text.contains("bytes free, under the floor of"), "{text}");
-    assert!(text.contains("no eviction"), "{text}");
+    assert!(text.contains("being evicted to make room"), "{text}");
     assert!(!full.may_hold(&k).await.expect("may_hold"));
     drop(full);
     let roomy = FsStore::open(&dir, FLOOR).expect("open");
@@ -260,7 +262,7 @@ async fn a_scan_reads_each_shard_s_headers() {
     assert_eq!(unreadable, 1);
     assert_eq!(FsStore::SHARDS, 256);
     drop(store);
-    let full = FsStore::open(&dir, u64::MAX).expect("open");
+    let full = FsStore::open(&dir, Floor::Bytes(u64::MAX)).expect("open");
     assert!(full.under_floor().expect("statvfs"));
     drop(full);
     std::fs::remove_dir_all(&dir).expect("remove");
@@ -326,5 +328,135 @@ fn an_open_that_cannot_create_the_directory_says_where() {
     let text = e.to_string();
     let want = format!("create {}: ", file.join("store").display());
     assert!(text.starts_with(&want), "{text}");
+    std::fs::remove_dir_all(&dir).expect("remove");
+}
+
+const GIB: u64 = 1 << 30;
+
+/// Catches a floor that is not the file system's 5%, at least 1 GiB, never more than
+/// the file system (mutants: a fixed 1 GiB, no minimum, a percentage other than 5,
+/// the cap dropped), and a store that reads it from anywhere but its space source or
+/// applies it to anything but the write: on a fake 100 GiB file system the floor is
+/// 5 GiB, on a 4 GiB one 1 GiB, on a 512 MiB one all of it; a write that would leave
+/// less than the floor free is refused, one that leaves exactly the floor is stored.
+#[tokio::test]
+async fn keep_free_is_5_percent_and_at_least_1_gib() {
+    assert_eq!(keep_free(100 * GIB), 5 * GIB);
+    assert_eq!(keep_free(4 * GIB), GIB);
+    assert_eq!(keep_free(20 * GIB), GIB);
+    assert_eq!(keep_free(21 * GIB), 21 * GIB / 20);
+    assert_eq!(keep_free(GIB / 2), GIB / 2);
+    assert_eq!(Floor::Bytes(7).bytes(100 * GIB), 7);
+
+    let dir = scratch("keep-free");
+    let available = Arc::new(AtomicU64::new(5 * GIB + 4));
+    let fake = Arc::clone(&available);
+    let space = Arc::new(move |_: &Path| -> std::io::Result<Space> {
+        Ok(Space {
+            total: 100 * GIB,
+            available: fake.load(Ordering::Relaxed),
+        })
+    });
+    let store = FsStore::open_with_space(&dir, Floor::KeepFree, space).expect("open");
+    assert_eq!(
+        store.room().expect("room"),
+        Room {
+            available: 5 * GIB + 4,
+            floor: 5 * GIB
+        }
+    );
+    assert!(!store.under_floor().expect("room"));
+    let body = Bytes::from_static(b"body");
+    store
+        .put_new(&key("fits"), body.clone(), None)
+        .await
+        .expect("leaves the floor");
+    available.store(5 * GIB + 3, Ordering::Relaxed);
+    let refused = store.put_new(&key("does-not"), body, None).await;
+    assert!(
+        matches!(refused, Err(ObjectStoreError::Transport(_))),
+        "{refused:?}"
+    );
+    available.store(5 * GIB - 1, Ordering::Relaxed);
+    assert!(store.under_floor().expect("room"));
+    drop(store);
+    std::fs::remove_dir_all(&dir).expect("remove");
+}
+
+/// Catches a refused write that wakes no evictor (mutant: no notify in the floor
+/// check), so a full store waits for the evictor's next tick while every upload fails:
+/// a waiter on `refused_full` wakes at the refusal, and a refusal with no one waiting
+/// yet wakes the next waiter at once. A stored write wakes no one.
+#[tokio::test]
+async fn a_refused_write_wakes_refused_full() {
+    let dir = scratch("refused-full");
+    let available = Arc::new(AtomicU64::new(GIB));
+    let fake = Arc::clone(&available);
+    let space = Arc::new(move |_: &Path| -> std::io::Result<Space> {
+        Ok(Space {
+            total: 100 * GIB,
+            available: fake.load(Ordering::Relaxed),
+        })
+    });
+    let store = FsStore::open_with_space(&dir, Floor::Bytes(GIB / 2), space).expect("open");
+    let body = Bytes::from_static(b"body");
+    store
+        .put_new(&key("stored"), body.clone(), None)
+        .await
+        .expect("put");
+    let quiet = tokio::time::timeout(Duration::from_millis(50), store.refused_full()).await;
+    assert!(quiet.is_err(), "a stored write woke the evictor");
+
+    available.store(GIB / 2, Ordering::Relaxed);
+    let waiter = tokio::spawn({
+        let store = store.clone();
+        async move { store.refused_full().await }
+    });
+    tokio::task::yield_now().await;
+    let refused = store.put_new(&key("refused"), body.clone(), None).await;
+    assert!(refused.is_err());
+    tokio::time::timeout(Duration::from_secs(10), waiter)
+        .await
+        .expect("the waiter woke")
+        .expect("no panic");
+    let refused = store.put_new(&key("again"), body, None).await;
+    assert!(refused.is_err());
+    tokio::time::timeout(Duration::from_secs(10), store.refused_full())
+        .await
+        .expect("a refusal before the wait wakes it");
+    drop(store);
+    std::fs::remove_dir_all(&dir).expect("remove");
+}
+
+/// Catches a fake file system for eviction tests that does not count the store's own
+/// files as used (mutant: nothing counted): what it reports free is
+/// its size less every object file's bytes, headers included, and a deleted file
+/// gives its bytes back.
+#[tokio::test]
+async fn a_file_system_of_objects_counts_the_object_files() {
+    let dir = scratch("of-objects");
+    let total = 1 << 20;
+    let store =
+        FsStore::open_with_space(&dir, Floor::Bytes(0), Space::of_objects(total)).expect("open");
+    assert_eq!(store.room().expect("room").available, total);
+    let keys = [key("a"), key("b"), key("c")];
+    for k in &keys {
+        store
+            .put_new(k, Bytes::from(vec![0; 1000]), None)
+            .await
+            .expect("put");
+    }
+    let files: u64 = keys
+        .iter()
+        .map(|k| std::fs::metadata(file_of(&dir, k)).expect("a file").len())
+        .sum();
+    assert!(files > 3000, "{files}");
+    assert_eq!(store.room().expect("room").available, total - files);
+    store.delete(&keys[0]).await.expect("delete");
+    let one = std::fs::metadata(file_of(&dir, &keys[1]))
+        .expect("a file")
+        .len();
+    assert_eq!(store.room().expect("room").available, total - 2 * one);
+    drop(store);
     std::fs::remove_dir_all(&dir).expect("remove");
 }

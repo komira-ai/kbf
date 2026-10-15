@@ -15,11 +15,14 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 use kbf_front::{Cache, MemoryMetaLog};
 use kbf_log::FarmLogId;
 use kbf_meta::Retention;
-use kbf_objstore::{Capabilities, FsStore, KeyPrefix, MemoryStore, ObjectStore};
+use kbf_objstore::{
+    Capabilities, Floor, FsStore, FsStoreError, KeyPrefix, MemoryStore, ObjectStore, Space,
+};
 use kbf_threads::Topology;
 
 use crate::startup_pass::StartPass;
@@ -93,7 +96,7 @@ where
     let raft_dir = args.raft_dir()?;
     match (args.blob_dir.as_deref(), args.store) {
         (Some(dir), _) => {
-            let store = FsStore::open(dir, args.blob_dir_min_free_bytes)?;
+            let store = open_blob_dir(args, dir)?;
             let files = store.clone();
             over(
                 args,
@@ -128,6 +131,21 @@ where
 /// The key prefix root under `--blob-dir`: objects go under `kbf/<log id>/`.
 const BLOB_DIR_PREFIX: &str = "kbf/";
 
+/// The `--blob-dir` store: its floor `--blob-dir-min-free-bytes`, or [`keep_free`] of
+/// the file system; the file system the real one, or for tests one of
+/// `--blob-dir-size-bytes`.
+///
+/// [`keep_free`]: kbf_objstore::keep_free
+fn open_blob_dir(args: &Args, dir: &Path) -> Result<FsStore, FsStoreError> {
+    let floor = args
+        .blob_dir_min_free_bytes
+        .map_or(Floor::KeepFree, Floor::Bytes);
+    let space = args
+        .blob_dir_size_bytes
+        .map_or_else(Space::statvfs, Space::of_objects);
+    FsStore::open_with_space(dir, floor, space)
+}
+
 /// Serves `store` under the metadata log `raft_dir` names: the Raft log there, writing
 /// under the prefix it committed (`<prefix_root><log id>/` for a new log), or without
 /// one a log in memory, writing under `start_prefix`. With `files`, the same store as
@@ -154,7 +172,8 @@ where
         Some(dir) => {
             let log = RaftMetaLog::open_dir(dir, Retention::default(), prefix_root).await?;
             let (prefix, id) = (log.store_prefix(), log.log_id());
-            let pass = files.map(StartPass::over_raft);
+            let grace = Duration::from_millis(args.blob_dir_evict_grace_ms);
+            let pass = files.map(|files| StartPass::over_raft(files, grace));
             assemble(args, log, store, prefix, Some(id), shutdown, pass).await
         }
     }
