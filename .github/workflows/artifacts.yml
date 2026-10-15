@@ -11,11 +11,11 @@
 # may hold `id-token: write` and `attestations: write`, and only under its exact
 # main-push `if:` (the workflow lint, crates/kbf-it/tests/workflows, requires both).
 #
-# The files are kept as workflow artifacts for 90 days, GitHub's limit. The deployment
-# job, the node's SHA-256 check and the release workflow are planned, not built
-# (docs/design/mac-node-provisioning.md sections 4.1 and 4.2). The plan is that releases
-# do not rely on these artifacts: a release is to attach the exact bytes the farm ran,
-# checked against these attestations, and never rebuild.
+# The files are kept as workflow artifacts for 90 days, GitHub's limit. A release
+# (release.yml, on a pushed `v*` tag) attaches these exact files for a commit on main,
+# checked again against these attestations, and never rebuilds. The deployment job and
+# the node's SHA-256 check are planned, not built (docs/design/mac-node-provisioning.md
+# sections 4.1 and 4.2).
 name: artifacts
 
 on:
