@@ -672,6 +672,7 @@ async fn with_the_cache_only_the_input_roots_directories_change_owner() {
         config.cache = Some(kbf_driver_container::CacheUse {
             config: kbf_daemon::cache::CacheConfig::new(at, config.scratch.clone(), 1 << 30),
             helper: std::path::PathBuf::from("/kbf/bin/kbf-daemon"),
+            trees: None,
         });
     });
     assert!(fake.runtime.cached());
