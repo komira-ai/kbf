@@ -311,7 +311,7 @@ fn sizes_on(
     cli: &Cli,
     topology: kbf_threads::Topology,
 ) -> Result<kbf_threads::Sizes, kbf_threads::ReserveError> {
-    cli.threads.resolve(kbf_threads::Role::Daemon, topology)
+    cli.threads.resolve(topology)
 }
 
 /// Builds the runtimes `--driver` names and serves until a signal; returns an error

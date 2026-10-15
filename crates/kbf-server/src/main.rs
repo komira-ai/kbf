@@ -48,7 +48,7 @@ use kbf_meta::Retention;
 use kbf_objstore::{Capabilities, KeyPrefix, MemoryStore, ObjectStore};
 use kbf_server::write_tier::{FLUSH_EVERY, TierLog};
 use kbf_server::{Args, RaftMetaLog, SERVER_VERSION, StoreKind, bind_server_with_policy};
-use kbf_threads::{Role, Topology};
+use kbf_threads::Topology;
 
 fn main() -> ExitCode {
     tracing_subscriber::fmt()
@@ -66,18 +66,14 @@ fn main() -> ExitCode {
 
 /// Builds the async runtime the thread flags size, then runs [`start`] on it.
 fn serve(args: &Args) -> Result<(), Box<dyn Error>> {
-    let sizes = sizes_on(args, Topology::detect())?;
+    let sizes = sizes_on(args, Topology::detect());
     sizes.log();
     sizes.runtime()?.block_on(start(args))
 }
 
-/// The server's thread sizes on a given machine shape: the reserve (all the CPUs unless
-/// `--reserve-cpus` says less), the pools from it, then the overrides.
-fn sizes_on(
-    args: &Args,
-    topology: Topology,
-) -> Result<kbf_threads::Sizes, kbf_threads::ReserveError> {
-    args.threads.resolve(Role::Server, topology)
+/// The server's thread sizes on a given machine shape: every CPU, then the overrides.
+fn sizes_on(args: &Args, topology: Topology) -> kbf_threads::Sizes {
+    args.threads.resolve(topology)
 }
 
 /// Builds the object store and the metadata log the flags name, then serves.
@@ -119,7 +115,7 @@ async fn run<M: TierLog, O: ObjectStore + 'static>(
     };
     let cache = Cache::open(meta, store, prefix)
         .await?
-        .with_writes(args.write_config()?);
+        .with_writes(args.write_config());
     let (cache, tier) = kbf_server::write_tier::attach(cache, args).await?;
     let cache = Arc::new(cache);
     let _flusher = tier.map(|_| {
@@ -223,36 +219,35 @@ fn interrupted() -> io::Result<impl Future<Output = ()> + Send + 'static> {
 mod tests {
     use super::*;
 
-    /// Catches the server resolving another role's defaults: alone on the 44-core,
-    /// 2-threads-per-core farm node it reserves all 88 CPUs, so 22 async, 128 blocking
-    /// and 44 CPU threads (the daemon's would be 2, 64, 4); a flag still wins over its
-    /// default, a shared reserve halves it, and more than the machine is refused.
+    /// Catches the server sizing itself from anything but the CPU count: on the 44-core,
+    /// 2-threads-per-core farm node it runs 88 async workers, 512 blocking threads
+    /// (tokio's cap) and 88 CPU threads, on a 3-CPU machine 3, 512 and 3; a flag still
+    /// wins over its default (alone), and `--reserve-cpus` and `--reserve-share` are
+    /// refused, so a stale unit file is noticed.
     #[test]
-    fn the_server_resolves_the_server_role() {
-        let topology = || Topology::new(88, 2);
-        let args = Args::parse_from(["kbf-server"]);
-        let sizes = sizes_on(&args, topology()).expect("sizes");
-        assert_eq!(
+    fn the_server_uses_every_cpu() {
+        let triple = |args: &Args, topology| {
+            let sizes = sizes_on(args, topology);
             (
                 sizes.async_threads(),
                 sizes.blocking_threads(),
-                sizes.cpu_threads()
-            ),
-            (22, 128, 44)
-        );
+                sizes.cpu_threads(),
+            )
+        };
+        let args = Args::parse_from(["kbf-server"]);
+        assert_eq!(triple(&args, Topology::new(88, 2)), (88, 512, 88));
+        assert_eq!(triple(&args, Topology::new(3, 1)), (3, 512, 3));
+        assert_eq!(args.cpu_threads_on(Topology::new(88, 2)).get(), 88);
         let args = Args::parse_from(["kbf-server", "--blocking-threads=9"]);
-        assert_eq!(
-            sizes_on(&args, topology())
-                .expect("sizes")
-                .blocking_threads(),
-            9
-        );
-        let shared = Args::parse_from(["kbf-server", "--reserve-cpus=16", "--reserve-share=2"]);
-        assert_eq!(
-            sizes_on(&shared, topology()).expect("sizes").cpu_threads(),
-            4
-        );
-        let too_many = Args::parse_from(["kbf-server", "--reserve-cpus=89"]);
-        assert!(sizes_on(&too_many, topology()).is_err());
+        assert_eq!(triple(&args, Topology::new(88, 2)), (88, 9, 88));
+        let args = Args::parse_from(["kbf-server", "--async-threads=5", "--cpu-threads=6"]);
+        assert_eq!(triple(&args, Topology::new(88, 2)), (5, 512, 6));
+        assert_eq!(args.cpu_threads_on(Topology::new(88, 2)).get(), 6);
+        for flag in ["--reserve-cpus=16", "--reserve-share=2"] {
+            assert!(
+                Args::try_parse_from(["kbf-server", flag]).is_err(),
+                "{flag}"
+            );
+        }
     }
 }

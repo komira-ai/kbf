@@ -102,11 +102,17 @@ fewer than 16) is what the farm's own processes keep:
 - `N` of 0 is allowed; `N` at the CPUs the daemon may use or more is refused at start
   (the leases would get nothing).
 
-A server and a daemon on one host get the same `--reserve-cpus` and
-`--reserve-share=2`: each sizes its pools from half of it (`N/2`), the leases still
-leave all of `N` out. A server alone on a host takes every CPU by default (it runs no
-actions), so its pools are sized from the whole machine, still at most the physical
-cores. A unit's own `CPUQuota=` lowers the `cpus` the node reports to it as well.
+`--reserve-cpus` and `--reserve-share` are the daemon's flags; `kbf-server` has neither
+and refuses them at start (an old unit that passes one fails at once, status 2, instead
+of the flag being ignored). The server runs no actions, so it uses every CPU it may: one
+async worker and one hashing thread (`--cpu-threads`) per logical CPU (hyperthreads
+included: the server has no other tenant, and a hashing thread stalled on a read leaves
+its sibling the core), and tokio's cap of 512 on the blocking pool; the start line
+names the sizes. `--async-threads`, `--blocking-threads` and `--cpu-threads` override
+them on the server too. On a host that runs both (the all-in-one), `N` is the daemon's
+`--reserve-cpus` and covers the server's share as well: give it enough for what the
+server and the object store node use at their peak. A unit's own `CPUQuota=` lowers the
+`cpus` the node reports to it, and the CPUs the server counts, as well.
 
 ## The units
 

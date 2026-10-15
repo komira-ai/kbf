@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use clap::Parser;
 
-use kbf_threads::{ReserveError, Role, Sizes, ThreadArgs, Topology};
+use kbf_threads::{PoolArgs, ReserveError, Sizes, ThreadArgs, Topology};
 
 #[derive(Parser)]
 struct Cli {
@@ -14,8 +14,22 @@ struct Cli {
     threads: ThreadArgs,
 }
 
-fn resolved(given: ThreadArgs, role: Role, topology: Topology) -> Sizes {
-    given.resolve(role, topology).expect("sizes")
+/// The server's flags: the overrides alone, with no reserve.
+#[derive(Parser)]
+struct ServerCli {
+    #[command(flatten)]
+    threads: PoolArgs,
+}
+
+fn resolved(given: ThreadArgs, topology: Topology) -> Sizes {
+    given.resolve(topology).expect("sizes")
+}
+
+fn server(flags: &[&str], topology: Topology) -> Sizes {
+    ServerCli::try_parse_from(std::iter::once("t").chain(flags.iter().copied()))
+        .expect("flags parse")
+        .threads
+        .resolve(topology)
 }
 
 fn triple(sizes: &Sizes) -> (usize, usize, usize) {
@@ -79,7 +93,7 @@ fn the_farm_node_has_44_cores_of_two_threads() {
     assert_eq!(topology.threads_per_core(), 2);
     assert_eq!(topology.physical(), 44);
 
-    let daemon = resolved(ThreadArgs::default(), Role::Daemon, topology);
+    let daemon = resolved(ThreadArgs::default(), topology);
     assert_eq!(
         (
             daemon.async_threads(),
@@ -88,10 +102,8 @@ fn the_farm_node_has_44_cores_of_two_threads() {
         ),
         (2, 64, 4)
     );
-    let server = resolved(ThreadArgs::default(), Role::Server, topology);
-    // Alone on the host the server reserves every CPU: workers max(2, 88/4), the CPU
-    // pool 88/2 = the 44 physical cores.
-    assert_eq!(triple(&server), (22, 128, 44));
+    // The server takes every logical CPU, hyperthreads included, and tokio's blocking cap.
+    assert_eq!(triple(&server(&[], topology)), (88, 512, 88));
 }
 
 #[test]
@@ -113,7 +125,7 @@ fn no_topology_files_is_one_thread_per_core() {
 fn defaults_are_limited_to_the_physical_cores_but_blocking_is_not() {
     // 2 logical CPUs on one core: one physical core.
     let one_core = Topology::new(2, 2);
-    let daemon = resolved(ThreadArgs::default(), Role::Daemon, one_core);
+    let daemon = resolved(ThreadArgs::default(), one_core);
     assert_eq!(
         (
             daemon.async_threads(),
@@ -122,17 +134,9 @@ fn defaults_are_limited_to_the_physical_cores_but_blocking_is_not() {
         ),
         (1, 64, 1)
     );
-    // Three cores: the server reserves all 3 CPUs; max(2, ..) fits the cores.
-    let three = Topology::new(3, 1);
-    let server = resolved(ThreadArgs::default(), Role::Server, three);
-    assert_eq!(
-        (
-            server.async_threads(),
-            server.blocking_threads(),
-            server.cpu_threads()
-        ),
-        (2, 128, 2)
-    );
+    // The server is not limited to the cores: 2 CPUs on one core give 2 and 2.
+    assert_eq!(triple(&server(&[], one_core)), (2, 512, 2));
+    assert_eq!(triple(&server(&[], Topology::new(3, 1))), (3, 512, 3));
     // More threads per core than CPUs, or no CPUs, cannot make zero cores.
     assert_eq!(Topology::new(0, 0).physical(), 1);
     assert_eq!(Topology::new(1, 8).physical(), 1);
@@ -145,7 +149,7 @@ fn flags_override_the_defaults_even_above_the_cpus() {
         "--blocking-threads=3",
         "--cpu-threads=100",
     ]);
-    let sizes = resolved(given, Role::Daemon, Topology::new(4, 2));
+    let sizes = resolved(given, Topology::new(4, 2));
     assert_eq!(
         (
             sizes.async_threads(),
@@ -155,19 +159,17 @@ fn flags_override_the_defaults_even_above_the_cpus() {
         (9, 3, 100)
     );
     // One flag leaves the other two at their defaults.
-    let one = resolved(
-        args(&["--cpu-threads=6"]),
-        Role::Server,
-        Topology::new(88, 2),
+    let one = server(&["--cpu-threads=6"], Topology::new(88, 2));
+    assert_eq!(triple(&one), (88, 512, 6));
+    let all = server(
+        &[
+            "--async-threads=9",
+            "--blocking-threads=3",
+            "--cpu-threads=100",
+        ],
+        Topology::new(4, 2),
     );
-    assert_eq!(
-        (
-            one.async_threads(),
-            one.blocking_threads(),
-            one.cpu_threads()
-        ),
-        (22, 128, 6)
-    );
+    assert_eq!(triple(&all), (9, 3, 100));
 }
 
 #[test]
@@ -184,7 +186,7 @@ fn zero_and_junk_are_refused() {
 
 #[test]
 fn the_start_line_names_every_size_and_the_topology() {
-    let sizes = resolved(ThreadArgs::default(), Role::Daemon, Topology::new(88, 2));
+    let sizes = resolved(ThreadArgs::default(), Topology::new(88, 2));
     assert_eq!(
         sizes.describe(),
         "threads: async=2 blocking=64 cpu=4 reserve=8 leases=80 (cpus=88 threads_per_core=2 physical_cores=44)"
@@ -206,7 +208,7 @@ fn the_runtime_has_the_workers_and_the_blocking_cap_asked_for() {
         "--blocking-threads=2",
         "--cpu-threads=1",
     ])
-    .resolve(Role::Server, Topology::new(16, 2))
+    .resolve(Topology::new(16, 2))
     .expect("sizes");
     let rt = sizes.runtime().expect("runtime");
     assert_eq!(rt.metrics().num_workers(), 3);
@@ -256,7 +258,7 @@ fn the_pools_follow_the_reserve() {
         (80, (20, 40)),
     ] {
         let given = args(&[&format!("--reserve-cpus={reserve}")]);
-        let s = resolved(given, Role::Daemon, farm);
+        let s = resolved(given, farm);
         assert_eq!(
             (s.async_threads(), s.cpu_threads()),
             want,
@@ -265,11 +267,7 @@ fn the_pools_follow_the_reserve() {
         assert_eq!(s.blocking_threads(), 64);
     }
     // The cores limit: 4 CPUs of 2 cores never give more than 2.
-    let small = resolved(
-        args(&["--reserve-cpus=3"]),
-        Role::Daemon,
-        Topology::new(4, 2),
-    );
+    let small = resolved(args(&["--reserve-cpus=3"]), Topology::new(4, 2));
     assert_eq!((small.async_threads(), small.cpu_threads()), (2, 2));
     assert_eq!(kbf_threads::pool_sizes(1000, 3), (3, 3));
 }
@@ -279,30 +277,22 @@ fn the_pools_follow_the_reserve() {
 #[test]
 fn leases_get_the_cpus_minus_the_reserve() {
     let farm = Topology::new(88, 2);
-    let default = resolved(ThreadArgs::default(), Role::Daemon, farm);
+    let default = resolved(ThreadArgs::default(), farm);
     assert_eq!((default.reserve_cpus(), default.lease_cpus()), (8, 80));
-    let given = resolved(args(&["--reserve-cpus=20"]), Role::Daemon, farm);
+    let given = resolved(args(&["--reserve-cpus=20"]), farm);
     assert_eq!((given.reserve_cpus(), given.lease_cpus()), (20, 68));
-    let none = resolved(args(&["--reserve-cpus=0"]), Role::Daemon, farm);
+    let none = resolved(args(&["--reserve-cpus=0"]), farm);
     assert_eq!((none.reserve_cpus(), none.lease_cpus()), (0, 88));
     // A machine of fewer than 16 CPUs reserves half, so the default always starts.
     for (logical, reserve) in [(1, 0), (2, 1), (4, 2), (15, 7), (16, 8)] {
-        let s = resolved(
-            ThreadArgs::default(),
-            Role::Daemon,
-            Topology::new(logical, 1),
-        );
+        let s = resolved(ThreadArgs::default(), Topology::new(logical, 1));
         assert_eq!(
             (s.reserve_cpus(), s.lease_cpus()),
             (reserve, logical - reserve)
         );
     }
     // The share changes the pools, never the leases.
-    let shared = resolved(
-        args(&["--reserve-cpus=16", "--reserve-share=2"]),
-        Role::Daemon,
-        farm,
-    );
+    let shared = resolved(args(&["--reserve-cpus=16", "--reserve-share=2"]), farm);
     assert_eq!(shared.lease_cpus(), 72);
     assert_eq!((shared.async_threads(), shared.cpu_threads()), (2, 4));
 }
@@ -312,11 +302,7 @@ fn leases_get_the_cpus_minus_the_reserve() {
 #[test]
 fn the_three_flags_override_the_reserve() {
     let farm = Topology::new(88, 2);
-    let s = resolved(
-        args(&["--reserve-cpus=80", "--async-threads=3"]),
-        Role::Daemon,
-        farm,
-    );
+    let s = resolved(args(&["--reserve-cpus=80", "--async-threads=3"]), farm);
     assert_eq!(triple(&s), (3, 64, 40));
     let s = resolved(
         args(&[
@@ -324,7 +310,6 @@ fn the_three_flags_override_the_reserve() {
             "--cpu-threads=7",
             "--blocking-threads=5",
         ]),
-        Role::Daemon,
         farm,
     );
     assert_eq!(triple(&s), (20, 5, 7));
@@ -337,7 +322,7 @@ fn the_three_flags_override_the_reserve() {
 #[test]
 fn a_reserve_the_machine_cannot_give_is_refused() {
     let farm = Topology::new(88, 2);
-    let daemon = |n: usize| args(&[&format!("--reserve-cpus={n}")]).resolve(Role::Daemon, farm);
+    let daemon = |n: usize| args(&[&format!("--reserve-cpus={n}")]).resolve(farm);
     assert!(daemon(0).is_ok());
     assert!(daemon(87).is_ok());
     assert_eq!(
@@ -359,29 +344,40 @@ fn a_reserve_the_machine_cannot_give_is_refused() {
         text.contains("--reserve-cpus=88") && text.contains("88"),
         "{text}"
     );
-    // The server runs no actions, so it may reserve the whole machine, no more.
-    let server = |n: usize| args(&[&format!("--reserve-cpus={n}")]).resolve(Role::Server, farm);
-    assert!(server(88).is_ok());
-    assert!(server(89).is_err());
     // Junk is refused by the parser.
     for flag in ["--reserve-cpus=-1", "--reserve-cpus=x", "--reserve-share=0"] {
         assert!(Cli::try_parse_from(["t", flag]).is_err(), "{flag} accepted");
     }
 }
 
-/// Catches the share ignored and the shared halves not adding to the reserve: a server
-/// and a daemon on one 88-CPU host with `--reserve-cpus=16 --reserve-share=2` each
-/// size from 8 CPUs (async 2, cpu 4), which together are the 16 reserved.
+/// Catches the server growing a reserve again (it runs no actions; `--reserve-cpus` and
+/// `--reserve-share` are the daemon's) and the all-in-one's daemon reserve being halved
+/// by a share the server no longer takes: the server alone is 88 whatever the daemon
+/// reserves, and the daemon with `--reserve-share=2` still sizes from half.
 #[test]
-fn a_server_and_a_daemon_on_one_host_share_the_reserve() {
+fn the_reserve_is_the_daemons_and_the_server_takes_none() {
     let farm = Topology::new(88, 2);
+    for flag in ["--reserve-cpus=16", "--reserve-share=2"] {
+        assert!(ServerCli::try_parse_from(["t", flag]).is_err(), "{flag}");
+    }
+    let server = server(&[], farm);
+    assert_eq!((server.reserve_cpus(), server.lease_cpus()), (0, 88));
     let flags = ["--reserve-cpus=16", "--reserve-share=2"];
-    let daemon = resolved(args(&flags), Role::Daemon, farm);
-    let server = resolved(args(&flags), Role::Server, farm);
+    let daemon = resolved(args(&flags), farm);
     assert_eq!(triple(&daemon), (2, 64, 4));
-    assert_eq!(triple(&server), (2, 128, 4));
-    assert_eq!(daemon.cpu_threads() + server.cpu_threads(), 16 / 2);
+    assert_eq!(daemon.lease_cpus(), 72);
     // Alone, the same reserve is not halved.
-    let alone = resolved(args(&flags[..1]), Role::Daemon, farm);
+    let alone = resolved(args(&flags[..1]), farm);
     assert_eq!(triple(&alone), (4, 64, 8));
+}
+
+/// Catches a server start line that names a reserve it does not have, and the daemon's
+/// losing its reserve or leases.
+#[test]
+fn the_server_start_line_names_no_reserve() {
+    let farm = Topology::new(88, 2);
+    assert_eq!(
+        server(&[], farm).describe(),
+        "threads: async=88 blocking=512 cpu=88 (cpus=88 threads_per_core=2 physical_cores=44)"
+    );
 }
