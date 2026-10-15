@@ -125,6 +125,14 @@ pub struct Admitted {
     _permit: Option<Arc<OwnedSemaphorePermit>>,
 }
 
+#[cfg(test)]
+impl Admitted {
+    /// Holding nothing: for unit tests of what an admission only keeps alive.
+    pub(crate) fn nothing() -> Self {
+        Self { _permit: None }
+    }
+}
+
 /// The open segment, the bounds, and the ByteStream buffer gauge of one cache.
 #[derive(Debug)]
 pub(super) struct Group {

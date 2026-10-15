@@ -138,3 +138,77 @@ fn a_record_spanning_many_ranges_is_one_hash() {
     let built = received.check(&declared).expect("built");
     assert_eq!(built.entries[0].crc32c, kbf_segments::crc32c(&records));
 }
+
+/// A segment of an empty blob and a small one, as `Begin` declares it, and its record
+/// bytes.
+fn with_an_empty_blob() -> (Declared, Vec<u8>) {
+    let mut writer = SegmentWriter::new(u64::MAX);
+    // The empty record sits at the end of the records: `Begin` refuses one in front of
+    // another record, which it would overlap.
+    writer.push(b"not empty").expect("push");
+    writer.push(b"").expect("push");
+    let bytes = writer.finish();
+    let footer = kbf_segments::Footer::parse(&bytes, bytes.len() as u64).expect("footer");
+    let records_len = usize::try_from(footer.records_len()).expect("len");
+    let (mut declared, _, _) = declare(
+        &[(bytes.len() as u64, &bytes[records_len..])],
+        MAX_BLOB_BYTES,
+    )
+    .expect("declare");
+    (declared.remove(0), bytes[..records_len].to_vec())
+}
+
+/// Catches an empty record that waits for bytes that never come (the commit would find
+/// it "not checked"), and an empty record whose declared digest is not the empty
+/// digest being accepted (a lying footer): the right one is checked from the start, so
+/// the segment builds; one declaring other hash bytes at size 0 is refused at once,
+/// naming the record.
+#[test]
+fn an_empty_record_is_checked_without_bytes_and_a_lying_one_is_refused() {
+    let (declared, records) = with_an_empty_blob();
+    let received = send(&declared, &records, 4096, &[0]);
+    assert!(received.refusal().is_none());
+    received.check(&declared).expect("an empty record builds");
+
+    let mut lying = declared;
+    let empty = lying
+        .entries
+        .iter()
+        .position(|e| e.digest.size_bytes == 0)
+        .expect("the empty record");
+    lying.entries[empty].digest.hash[0] ^= 1;
+    let refused = Receiving::new(&lying).refusal().expect("refused at Begin");
+    assert_eq!(refused.code(), Code::InvalidArgument);
+    assert!(
+        refused
+            .message()
+            .contains(&lying.entries[empty].digest.to_string()),
+        "{refused:?}"
+    );
+}
+
+/// Catches a commit that goes on while a record is still being checked (it would find
+/// the record unchecked or build over bytes not yet hashed), and one that reports a
+/// refused record as merely not ready: a range written but not yet checked is
+/// FAILED_PRECONDITION; once its check ran, nothing blocks; a corrupt record is
+/// INVALID_ARGUMENT.
+#[test]
+fn a_commit_waits_for_checks_and_stops_at_a_refusal() {
+    let (declared, records) = segment(3, 500);
+    let mut received = Receiving::new(&declared);
+    let (_, claimed) = received.put(&declared, 0, &records).expect("put");
+    let racing = received.not_ready().expect("records are being checked");
+    assert_eq!(racing.code(), Code::FailedPrecondition);
+    advance(&claimed, |i, finished| {
+        received.next(&declared, i, finished)
+    });
+    assert!(received.not_ready().is_none());
+
+    let mut bad = records;
+    bad[1] ^= 1;
+    let received = send(&declared, &bad, 4096, &[0]);
+    assert_eq!(
+        received.not_ready().expect("refused").code(),
+        Code::InvalidArgument
+    );
+}

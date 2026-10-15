@@ -303,6 +303,15 @@ impl Receiving {
         self.bad.as_deref().map(Status::invalid_argument)
     }
 
+    /// Why a commit cannot go on: a refused record, or a record some task is still
+    /// checking (a client that commits before its ranges are answered).
+    pub(super) fn not_ready(&self) -> Option<Status> {
+        self.refusal().or_else(|| {
+            self.checking()
+                .then(|| Status::failed_precondition("ranges are still being checked"))
+        })
+    }
+
     /// Whether a task is still checking some record.
     pub(super) fn checking(&self) -> bool {
         self.records.iter().any(|r| r.busy)

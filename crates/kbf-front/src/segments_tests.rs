@@ -78,3 +78,30 @@ async fn a_check_that_panics_answers_internal() {
         "{failed:?}"
     );
 }
+
+/// Catches a hash job that, finishing after its upload was committed, answered or
+/// dropped, still touched the records (`check_next` and `refusal_at` must see nothing
+/// then): on a receiving upload a corrupt record is found and refused; on a committing,
+/// a done and a dropped one both answer `None`.
+#[test]
+fn a_job_outliving_its_receiving_upload_sees_nothing() {
+    let (declared, records) = declared_segment();
+    let upload = committing(declared);
+    let mut bad = records;
+    bad[1] ^= 1;
+    let mut received = Receiving::new(&upload.declared[0]);
+    let (_, claimed) = received.put(&upload.declared[0], 0, &bad).expect("put");
+    *lock(&upload.phase) = Phase::Receiving {
+        segments: vec![received],
+        _admitted: Admitted::nothing(),
+    };
+    assert!(upload.refusal_at(0).is_none());
+    advance(&claimed, |i, finished| upload.check_next(0, i, finished));
+    let refused = upload.refusal_at(0).expect("the corrupt record is refused");
+    assert_eq!(refused.code(), Code::InvalidArgument);
+    for phase in [Phase::Committing, Phase::Done, Phase::Dropped] {
+        *lock(&upload.phase) = phase;
+        assert!(upload.refusal_at(0).is_none());
+        assert!(upload.check_next(0, 0, None).is_none());
+    }
+}

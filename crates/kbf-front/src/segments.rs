@@ -51,6 +51,7 @@ use kbf_proto::worker::{
     LocateResponse, ObjectRef, PutRangeRequest, PutRangeResponse, ReadRangeRequest,
     ReadRangeResponse,
 };
+use kbf_segments::RecordHasher;
 use kbf_types::Digest;
 use tokio::sync::watch;
 use tokio::time::Instant;
@@ -58,7 +59,7 @@ use tonic::{Request, Response, Status};
 
 pub use self::connection::{Connection, Connections, Tracked};
 use self::cpu::HashPool;
-use self::upload::{Declared, Put, Receiving, advance, declare};
+use self::upload::{Declared, Held, Put, Receiving, advance, declare};
 use crate::cache::{Admitted, BuiltSegment, Cache};
 use crate::meta_log::MetaLog;
 use crate::{MAX_BLOB_BYTES, wire};
@@ -194,6 +195,31 @@ impl Upload {
     /// Drops the upload, freeing its buffers and admission even if a call still holds it,
     /// unless a commit of it is running: decided under the phase lock, so a Commit
     /// cannot start between the check and the drop.
+    /// The next step of the check of record `i` of segment `index` ([`Receiving::next`]);
+    /// `None` when the upload is no longer receiving (a hash job outlived its upload),
+    /// which ends that record's check.
+    fn check_next(
+        &self,
+        index: usize,
+        i: usize,
+        finished: Option<(RecordHasher, usize)>,
+    ) -> Option<Held> {
+        match &mut *lock(&self.phase) {
+            Phase::Receiving { segments, .. } => {
+                segments[index].next(&self.declared[index], i, finished)
+            }
+            _ => None,
+        }
+    }
+
+    /// The refusal of segment `index`, if a record of it did not hash to its digest.
+    fn refusal_at(&self, index: usize) -> Option<Status> {
+        match &*lock(&self.phase) {
+            Phase::Receiving { segments, .. } => segments[index].refusal(),
+            _ => None,
+        }
+    }
+
     fn try_drop(&self) -> bool {
         let mut phase = lock(&self.phase);
         if matches!(*phase, Phase::Committing) {
@@ -307,11 +333,11 @@ impl<M: MetaLog, O: ObjectStore + 'static> SegmentsService<M, O> {
         segments: Vec<Receiving>,
         admitted: Admitted,
     ) {
-        let checked = check_all(Arc::clone(&upload), segments).await;
-        let answer = match checked {
-            Ok(built) => cache.store_upload(built).await.map_err(Status::from),
-            Err(refused) => Err(refused),
-        };
+        let answer = async {
+            let built = check_all(Arc::clone(&upload), segments).await?;
+            cache.store_upload(built).await.map_err(Status::from)
+        }
+        .await;
         drop(admitted);
         *lock(&upload.phase) = Phase::Done;
         upload.touch();
@@ -416,23 +442,12 @@ impl<M: MetaLog, O: ObjectStore + 'static> Segments for SegmentsService<M, O> {
             let task = Arc::clone(&upload);
             self.shared
                 .hashing
-                .run(move || {
-                    advance(&claimed, |i, finished| {
-                        let mut phase = lock(&task.phase);
-                        match &mut *phase {
-                            Phase::Receiving { segments, .. } => {
-                                segments[index].next(&task.declared[index], i, finished)
-                            }
-                            _ => None,
-                        }
-                    });
-                })
-                .await
-                .map_err(|e| Status::internal(format!("checking a range failed: {e}")))?;
+                .run(Box::new(move || {
+                    advance(&claimed, |i, finished| task.check_next(index, i, finished));
+                }))
+                .await?;
             // A mismatch is refused at once; the upload cannot commit.
-            if let Phase::Receiving { segments, .. } = &*lock(&upload.phase)
-                && let Some(refused) = segments[index].refusal()
-            {
+            if let Some(refused) = upload.refusal_at(index) {
                 return Err(refused);
             }
         }
@@ -458,14 +473,8 @@ impl<M: MetaLog, O: ObjectStore + 'static> Segments for SegmentsService<M, O> {
                         "record {digest} was not wholly received"
                     )));
                 }
-                if let Some(refused) = segments.iter().find_map(Receiving::refusal) {
+                if let Some(refused) = segments.iter().find_map(Receiving::not_ready) {
                     return Err(refused);
-                }
-                if segments.iter().any(Receiving::checking) {
-                    // Only a client that commits before its ranges are answered.
-                    return Err(Status::failed_precondition(
-                        "ranges are still being checked",
-                    ));
                 }
             }
             match std::mem::replace(&mut *phase, Phase::Committing) {
