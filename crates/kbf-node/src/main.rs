@@ -90,16 +90,6 @@ struct Cli {
         value_parser = clap::value_parser!(u64).range(1..)
     )]
     output_upload_deadline_secs: u64,
-    /// How many threads hash the output files of all leases together (container driver):
-    /// each file is read once, for its SHA-256 and the CRC-32C of its segment footer.
-    /// They are threads of their own, apart from the ones that run actions, so a node
-    /// with many leases hashes on no more cores than this.
-    #[arg(
-        long,
-        default_value_t = kbf_daemon::cpu_pool::DEFAULT_CPU_THREADS as u64,
-        value_parser = clap::value_parser!(u64).range(1..)
-    )]
-    cpu_threads: u64,
     #[command(flatten)]
     cache: cache::CacheArgs,
     #[command(flatten)]
@@ -295,12 +285,16 @@ fn main() -> ExitCode {
     }
 }
 
+/// The thread sizes the flags and this machine's cores give.
+fn sizes(cli: &Cli) -> kbf_threads::Sizes {
+    cli.threads
+        .resolve(kbf_threads::Role::Daemon, kbf_threads::Topology::detect())
+}
+
 /// Builds the runtimes `--driver` names and serves until a signal; returns an error
 /// that stopped the daemon from starting.
 fn start(cli: &Cli) -> Result<(), Error> {
-    let sizes = cli
-        .threads
-        .resolve(kbf_threads::Role::Daemon, kbf_threads::Topology::detect());
+    let sizes = sizes(cli);
     sizes.log();
     let tokio = sizes.runtime()?;
     // The CAS channel is made lazily, which needs the runtime's context.
@@ -617,7 +611,7 @@ mod container {
             max_stdio_bytes: cli.outputs.max_stdio_bytes,
         };
         config.upload_deadline = super::upload_deadline(cli);
-        config.cpu = kbf_daemon::CpuPool::new(usize::try_from(cli.cpu_threads).unwrap_or(1));
+        config.cpu = kbf_daemon::CpuPool::new(super::sizes(cli).cpu_threads());
         config.limits = limits(cli);
         config.swap_kill = swap_kill(cli);
         config.cache = crate::cache::given(&cli.cache, &config.scratch);
@@ -838,20 +832,14 @@ mod tests {
         assert_eq!(container::limits(&defaults), ContainerLimits::DEFAULT);
     }
 
-    /// Catches `--cpu-threads` not parsed, not defaulting to the pool's documented 4, or
-    /// accepting 0 (a pool that never runs a job).
+    /// Catches `--cpu-threads` not parsed, not reaching the sizes the CPU pool is built
+    /// from, or accepting 0 (a pool that never runs a job).
     #[test]
     fn cpu_threads_is_a_flag() {
-        assert_eq!(
-            parse(&["--driver=fake"]).expect("flags").cpu_threads,
-            kbf_daemon::cpu_pool::DEFAULT_CPU_THREADS as u64
-        );
-        assert_eq!(
-            parse(&["--driver=fake", "--cpu-threads=6"])
-                .expect("flags")
-                .cpu_threads,
-            6
-        );
+        let cli = parse(&["--driver=fake", "--cpu-threads=6"]).expect("flags");
+        assert_eq!(sizes(&cli).cpu_threads(), 6);
+        let cli = parse(&["--driver=fake"]).expect("flags");
+        assert!(sizes(&cli).cpu_threads() >= 1);
         assert!(parse(&["--driver=fake", "--cpu-threads=0"]).is_err());
     }
 
