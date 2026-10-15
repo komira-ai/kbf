@@ -1,791 +1,605 @@
 # Fleet: provisioning and operating the hardware
 
-This document says how an operator brings up and keeps a farm of about 3 server and
-storage nodes, about 20 Linux build hosts and about 6 Mac Studios. It is a design:
-**planned** unless a section says "today". The operator learns three things: one
-inventory file (`fleet.toml`), one operator command (`kbf-deploy`) and one place to look
-(`kbf-deploy status`). Behind those, `kbf-deploy` installs a list of components
-(section 2); the operator needs to know them only when something breaks.
+This document says how an operator brings up and keeps a farm of about 3 server and storage nodes,
+about 20 Linux build hosts and about 6 Mac Studios, and how the same design holds at a thousand. It
+is a design: **planned** unless a section says "today". The operator learns three things: the
+**registry** (the server's durable list of nodes, which hosts add themselves to), one command
+(`kbf-deploy`) and one place to look (`kbf-deploy status`). Nobody maintains a file of machines.
 
-It builds on [fleet-updates.md](fleet-updates.md) (rollouts),
-[fleet-updates-security.md](fleet-updates-security.md) (threat model, signing),
-[mdm-backend.md](mdm-backend.md) (Mac MDM), [mac-node-provisioning.md](mac-node-provisioning.md)
-(Mac host settings) and [daemon.md](daemon.md).
+It builds on [fleet-updates.md](fleet-updates.md), [fleet-updates-security.md](fleet-updates-security.md),
+[mdm-backend.md](mdm-backend.md), [mac-node-provisioning.md](mac-node-provisioning.md),
+[capabilities.md](capabilities.md) and [daemon.md](daemon.md).
 
 ## 1. Summary
 
 | Question | Answer |
 |---|---|
-| How many tools? | One operator CLI, `kbf-deploy`, with the verbs in section 9 (not fewer verbs than today: one binary, one inventory, one concept set instead of five kits and shell scripts). It installs and configures the components in section 2. The three product binaries (`kbf-server`, `kbf-daemon`, `kbf-all-in-one`) are unchanged. |
-| How many config files? | One: `fleet.toml` in a git repo the operator owns. Every unit file, launchd plist, certificate request and PXE answer is rendered from it. Nobody edits a unit by hand. |
-| What identifies a machine? | The **node name** typed once in the inventory and written into the machine's certificate. A hardware id read from firmware is the lookup key that maps a box to its name; it is not a proof (section 3, section 4). Reinstalling or replacing a disk changes nothing. |
-| How does Linux get an OS? | PXE/iPXE netboot of an Ubuntu installer, answered by an autoinstall seed rendered per machine from the inventory. A host installs only when the operator **arms** it (section 5.1); otherwise netboot sends it to its local disk. |
-| How does a Mac get set up? | Apple Business Manager (ABM) assigns the serial to the farm's MDM. The MDM pushes a signed `.pkg`; a launchd job it installs enrolls the node. |
-| How do nodes get configured later? | Nodes pull their own signed slice of a spec from the farm's object store. The operator publishes with `kbf-deploy apply`. |
-| How do nodes update? | The same spec names the software set. `kbf-deploy rollout` runs canary, soak and rollback in batches. |
-| What does the operator do physically? | Section 5.5 is the baseline and section 12 says what stays manual. It is more than "rack and power on": BIOS baseline, a provisioning VLAN, matching boxes to names, the Apple accounts, and a console for the first Mac. |
+| Source of truth for "which machines exist"? | The **node registry** in `kbf-server` (4.2). Hosts enroll themselves at first boot and appear *pending*; an operator or a policy approves them. A file is at most an optional import/export for bootstrap and disaster recovery. |
+| What is typed per machine? | Nothing required. CPU, memory, disks, SSD paths and GPUs are detected on every connect and used by the scheduler as reported (6.1). Config holds policy and rare overrides. |
+| What identifies a machine? | The **hardware id** is the permanent key. The **human name** (`broadwell1`, `m3ultra1`) is assigned in the registry, written back where the hardware can keep it (BMC FRU, SMBIOS asset tag), and used by logs, labels, scheduling, the CLI and the certificate (4.3 to 4.5). |
+| How does Linux get an OS? | Site DHCP (UniFi options 66 and 67) points at iPXE; iPXE chains to an HTTP endpoint on kbf that decides per machine: discover, install image X, boot local, or rescue (5.1, 5.2). |
+| How does a Mac get set up? | No PXE (Apple Silicon cannot netboot). ABM assigns the serial to the farm MDM; the MDM sets the device name and pushes a signed `.pkg` (5.4). |
+| What is generic, what is ours? | kbf ships mechanisms; the operator's own repository holds names, network, images, approval policy and key locations as config (section 7 lists which is which). |
+| Config and updates later? | Nodes pull a signed fleet config and their own record; `kbf-deploy rollout` does canary, soak and rollback (6.3, section 8). |
 
-Principles: the inventory is the only place a fact is typed (name, role, label, address);
-everything else is derived from hardware or from the inventory. Flags, not environment
-variables, in every rendered unit. Secrets never rest on a build host except that host's
-own node key.
+Principles: a fact hardware or the OS can report is never typed; a fact only a human knows (intent,
+approval) is typed once, in policy or the registry, never in a unit file. Flags, not environment
+variables, in every rendered unit. Secrets never rest on a build host except its own node key.
+`install.sh` and `install_units.sh` (each copies a binary, writes a unit, and holds its own copy of
+the node id, labels and server address) are replaced by `kbf-deploy node apply`, which renders the
+same files from the node's record (section 11).
 
-### What `install.sh` is, and what replaces it
+## 2. Components
 
-`install.sh` (Mac daemon installer) and `install_units.sh` (Linux converged-node
-installer) are shell scripts that copy a binary, write a unit or plist and start it, each
-with its own copy of the node id, labels and server address. They are why the same facts
-are typed in several places. They are replaced by `kbf-deploy node apply`, which renders
-the same files from the inventory (Linux: run by the first-boot unit; Mac: run by a
-launchd job the `.pkg` installs). Section 10 lists every removal.
+| Component | Runs on | Installed by |
+|---|---|---|
+| `kbf-server` with the registry and enrollment listener; `kbf-ca` (own user and socket); MinIO; envoy | server hosts | `node apply` |
+| boot service (`kbf-deploy boot serve`: TFTP for the iPXE binary, HTTPS boot endpoint, image catalogue) | hosts with `services = ["boot"]` | `node apply` |
+| MDM: NanoHUB, NanoDEP, SCEP, `kbf-mdm-gate` | the host with `services = ["mdm"]` | `node apply` |
+| `kbf-daemon` / `kbf-all-in-one` | builders / all-in-one hosts | `node apply` |
+| node agent (`kbf-updater` on Linux; the macOS agent does not exist yet, 14) | every host | first-boot unit / `.pkg` |
+| Outside kbf: DHCP, DNS, NTP, switch and VLAN, BIOS, BMC network, ABM, Apple Developer ID | site | the operator (5.6) |
 
-## 2. Components and who installs them
+## 3. What exists today
 
-The honest claim is "one operator CLI, N components it installs". An operator must know
-what each is and where it runs.
+Checked against the code: `kbf-deploy` is a Linux-only binary with five kits and about 20 verbs
+(`linux` always installs server and daemon together). `kbf-mac-provision` applies Mac host settings
+and renders the plist but installs no binary and makes no certificate. `kbf-mdm-gate`, NanoHUB, SCEP
+and NanoDEP exist. `kbf-updater` is Linux only; **no macOS node agent exists**. `RolloutDriver`
+stops at `updating` with an in-memory store: nothing rolls out real software. `--node-id` is a typed
+string and the server requires the client certificate to carry exactly one DNS name equal to it; the
+node registry is in memory and lost on restart, while the daemon already reports detected arch, OS,
+CPUs, memory, GPU and ISA on each Hello. Certificates come from a shell script, with no enrollment
+endpoint, rotation or revocation beyond a hand-edited deny-list. No PXE, netboot or autoinstall
+exists. The server is a single server with a single-voter metadata log (HA is open in ha.md).
 
-| Component | Runs on | Installed by | Operator touches it when |
-|---|---|---|---|
-| `kbf-server` | server hosts | `node apply` from the spec | never directly |
-| `kbf-ca` (enrollment signer; own user and socket, section 4.1) | server hosts | `node apply` | root ceremony, intermediate renewal |
-| MinIO (distributed over the three servers) | server hosts | `node apply` | a drive fails (section 11.2) |
-| envoy (mTLS gate in front of the object store) | server hosts | `node apply` | never directly |
-| netboot service (proxyDHCP, TFTP, HTTPS: `kbf-deploy netboot serve`) | one or more server hosts (`services = ["netboot"]`) | `node apply` | arming, adopting hosts |
-| MDM: NanoHUB, NanoDEP, SCEP, `kbf-mdm-gate` | the host(s) with `services = ["mdm"]`, see 5.2 | `node apply` | ABM tasks, annual renewals |
-| `kbf-daemon` / `kbf-all-in-one` | builders / all-in-one hosts | `node apply` | never directly |
-| node agent (`kbf-updater` on Linux; macOS agent does not exist yet, section 13) | every host | first-boot unit / `.pkg` | never directly |
-| Outside kbf: DHCP, DNS, NTP, switch and VLAN, BIOS, ABM, Apple Developer ID | site | the operator | section 5.5 |
-
-Which services a server host runs is a list in its inventory block (`services`), so
-"where is the MDM installed" is answered by `kbf-deploy status`.
-
-## 3. What exists today, and the gap
-
-Facts checked against the code:
-
-- `kbf-deploy` is a Linux-only binary with five kits (`minio`, `linux`, `mdm`, `envoy`,
-  `pilot`) and about 20 verbs. `kbf-deploy linux` always installs both server and daemon
-  and expects MinIO as a systemd unit; there is no daemon-only profile.
-- `kbf-mac-provision` checks and applies Mac host settings and renders the LaunchDaemon.
-  It installs no binary and makes no certificate.
-- `kbf-mdm-gate`, NanoHUB, SCEP and NanoDEP exist (`kbf-deploy mdm`).
-- `kbf-updater` (Linux only) installs signed OS software sets. **A macOS node agent
-  does not exist.**
-- `RolloutDriver` stops at the `updating` step; its store is in memory; no node-side
-  wiring exists. Nothing rolls out real software today.
-- `--node-id` is a typed string. The server requires the client certificate to carry
-  exactly one DNS name equal to it. The node registry lives in memory.
-- Certificates come from a shell script. There is no enrollment endpoint, rotation or
-  revocation except a hand-edited deny-list.
-- No PXE, netboot or autoinstall exists. Linux hosts are installed by hand.
-- Server HA: the design describes three servers (ha.md, open); the code has one server
-  with a single-voter metadata log.
-
-The sprawl is a result of there being no inventory.
-
-## 4. Persistent identity, enrollment and trust
+## 4. Registry, identity, enrollment and trust
 
 ### 4.1 Authorities and keys
 
-- **Fleet root** (ECDSA P-256). Created once by `kbf-deploy ca init` on an air-gapped
-  machine or a hardware key; the private key never touches a networked host. It signs
-  only: intermediates, delegated spec keys, release keys, and the revocation list's
-  signer. Signing is offline: the online side produces a request file, the operator
-  carries it on removable media, `kbf-deploy ca sign` (run on the offline machine)
-  returns the signed file.
-- **Two roots.** Every node trusts a set of two roots from install: the current root and
-  a standby root generated at the same ceremony and stored in a second location.
-  Rotating the root is: sign the standby into use through a spec signed by the current
-  root, then retire the old. A lost or stolen root is recovered by promoting the standby.
-  The root-rotation drill is run once before production and written in the runbook.
-- **Farm CA intermediates**: one per server host, each generated on its host by the
-  `kbf-ca` process (a separate user and socket from `kbf-server`, so the enrollment
-  listener cannot read the key), signed by the root offline. Key files are mode 0600,
-  owned by `kbf-ca`; on hardware with a TPM the key is TPM-sealed. Each intermediate is
-  **name-constrained**: DNS suffix of the fleet and `clientAuth` EKU only, so it can sign
-  neither servers nor other CAs. Lifetime one year; `ca rotate` issues a new request,
-  the new intermediate arrives in the next spec, and nodes accept any intermediate that
-  chains to a trusted root. No key is replicated; compromise of one server revokes that
-  server's intermediate (root-signed) and nothing else.
-- **Spec keys**: delegated, one per operator, each signed by the root with an expiry (one
-  year) that nodes enforce, each held on that operator's hardware token. Several
-  operators therefore sign independently and every spec records which key signed it.
-  Losing one token revokes one delegated key.
-- **Release key**: held by CI, signed by the root. The node verifies the binary's own
-  release-key signature, **and** that its hash equals the hash in the spec. Either
-  failing refuses the install. Release-key compromise is handled as a root-signed
-  replacement key in the next spec.
-- **No rollback**: the spec has a monotonic version and each release a monotonic
-  sequence number. A node refuses a spec or release below what it already runs. Going
-  back to older software is a new spec (higher version) naming the older release by a
-  rollback entry signed by an operator.
+- **Fleet root** (ECDSA P-256), made by `ca init` on an air-gapped machine or hardware key. It signs
+  only intermediates, operator keys, the release key and the revocation signer, offline: the online
+  side writes a request file, the operator carries it on removable media to `ca sign`. Nodes also
+  trust a **standby root** from the same ceremony, kept elsewhere; a lost root is recovered by
+  promoting it (a config signed by the current root). The drill is run once before production.
+- **Intermediates**: one per server host, generated by `kbf-ca` (separate user and socket, so the
+  enrollment listener cannot read the key), root-signed offline, mode 0600, TPM-sealed where
+  possible, **name-constrained** (fleet DNS suffix, `clientAuth` only), one-year lifetime. Nothing is
+  replicated; compromise of one server revokes that intermediate only.
+- **Operator keys**: delegated, one per operator on a hardware token, root-signed, one-year expiry
+  that nodes enforce. They sign the fleet config, server-role approvals and rollbacks.
+- **Release key**: held by CI, root-signed. A node checks the binary's signature **and** that its
+  hash equals the one in the config. **No rollback**: config version and release sequence are
+  monotonic; going back is a new config with a rollback entry an operator signs.
 
-What a compromised server host can do is stated, not hidden: with root on a server an
-attacker can make that server's intermediate issue certificates for any node name in the
-inventory (the name constraint limits it to fleet names), and so impersonate a build
-host and read inputs and the CAS. It cannot push software (it holds no spec or release
-key). Detection and containment: every issuance is in the audit log (4.8); revoke the
-intermediate with a root-signed entry. This is an accepted risk (CEO decision 5).
+With root on a server an attacker can issue certificates for any fleet name from that server's
+intermediate, impersonate a build host and read inputs and the CAS. It cannot push software and
+cannot make a node a *server* (that needs an operator signature, 4.6). Issuance is audited (4.8);
+revoke the intermediate with a root-signed entry. Accepted (decision 5).
 
-### 4.2 The hardware id is a lookup key, not a proof
+### 4.2 The registry
+
+A table inside `kbf-server`, durable in the metadata log (single-voter today, three-voter with HA),
+one record per machine, keyed by hardware id with a unique index on name.
+
+| Field | Source |
+|---|---|
+| `hwid`, serials, MACs, asset tag as read | reported by the host |
+| `name` | assigned (4.5) or claimed from hardware and confirmed |
+| `state`: `pending`, `approved` (armed or not), `active`, `retired` | the approval flow (4.6) |
+| `role`, `services`, OS-disk plan | set at approval; `server` role and disk plan operator-signed |
+| `labels` | from profile rules, plus rare overrides |
+| `facts`, `facts_history` | detected on every connect (6.1) |
+| first/last seen, approver (key id or policy rule id), certificate serials | recorded |
+
+**Why not a file of machines.** A file in git works at 30 hosts and fails past it: every add is a
+human edit and a merge conflict, the file drifts from reality, and facts a host can report (its
+CPUs) become stale copies. The registry is written by the farm as hosts appear, is queried by key,
+pages its listings, and costs a few hundred bytes of identity plus the latest facts per node
+(a thousand nodes is about one megabyte). The operator edits *policy*, which does not grow with the
+fleet. Durability is a prerequisite: `/enroll` is off until it exists, because a restart would
+otherwise un-revoke everyone and reset "used" bits.
+
+**Optional import/export.** `nodes export` writes the registry as JSON, `nodes import` loads one.
+Two uses only: seeding the first server (the registry does not exist yet, 15) and disaster recovery
+(a periodic export lands in the object store and with `backup pull` on the operator's machine).
+Import creates `pending` or `retired` records and never overwrites a live one. It is not what an
+operator maintains.
+
+### 4.3 Identity: hardware id is the key, the name is for humans
 
 | Platform | Key | Fallback | Why not the usual |
 |---|---|---|---|
-| Linux | `/sys/class/dmi/id/product_uuid` as `dmi:<uuid>` | `board_serial`, then `chassis_serial` | `/etc/machine-id` changes on reinstall. MAC addresses change with a NIC swap and are shared by bonds. |
-| Mac | the serial number as `mac:<serial>` | none | The serial is what ABM and the MDM know. `IOPlatformUUID` is recorded as a second check, not a key. |
+| Linux | `/sys/class/dmi/id/product_uuid` as `dmi:<uuid>` | `board_serial`, then `chassis_serial` | `machine-id` changes on reinstall; MACs change with a NIC swap |
+| Mac | serial as `mac:<serial>` (ABM and the MDM know it) | none | `IOPlatformUUID` is a recorded second check |
 
-The hwid is printed on labels and readable by anyone with root, so it proves nothing:
-the **bootstrap token** (4.4) or the **MDM identity** (4.5) is the only proof of
-identity, and `/enroll` never accepts a hwid alone. A spoofed DMI value on a host that
-holds a valid token is the residual risk; a TPM attestation (EK or AK bound to the CSR)
-would close it and is deferred to open items.
+The hwid is printed on labels and readable by root, so it proves nothing. Proof is the **bootstrap
+token** (4.6) or the **MDM identity** (4.7); `/enroll` never accepts a hwid alone. A spoofed DMI
+value on a host holding a valid token is the residual risk (TPM attestation is deferred).
 
-Rules:
+- Lower-cased; placeholders (zeros, all `f`, `To Be Filled By O.E.M.`, `Default string`) leave the
+  host `pending` with a reason, never keyed.
+- **Byte order**: SMBIOS UUIDs are mixed-endian; iPXE `${uuid}` and kernel `product_uuid` must
+  agree. The boot service canonicalizes both, and acceptance of **one box per hardware model** boots
+  it through iPXE and the installer and compares them.
+- **Duplicates**: a second host reporting a hwid a live node owns is refused and alerts.
+- CI virtual machines may use `static:<name>` with `trust = "test"`, issued from a separate
+  intermediate constrained to `*.test.<suffix>`.
 
-- Lower-cased; a placeholder (all zeros, all `f`, `To Be Filled By O.E.M.`,
-  `Default string`, `Not Specified`) is refused at adoption, not at enrollment; the
-  operator then sets the id from the board label and the BIOS vendor tool writes it.
-- **Byte order and case.** The SMBIOS UUID is mixed-endian; iPXE `${uuid}` and the kernel
-  `product_uuid` must agree. The netboot service canonicalizes both, and a purchase
-  acceptance test on **one box of each hardware model** boots it through iPXE and the
-  installer and compares the two. Without that test the model is not accepted.
-- **Duplicates** (cheap boards, cloned OEM batches): `adopt` (4.3) refuses a hwid already
-  bound, and `/enroll` refuses a hwid that another live node reports. Both are caught
-  before the field, not as a surprise 409.
-- A virtual machine used by kbf's own CI may set `hwid = "static:<name>"` with
-  `trust = "test"`. Test hosts are issued certificates from a separate intermediate
-  whose name constraint is `*.test.<suffix>`, so a test host cannot be given a
-  production name by mistake.
+The name is chosen once and never derived from the hwid afterwards. It goes into the certificate
+(the one DNS name the server already requires), `--node-id` and every log line. Reinstall and disk
+swap change nothing. A motherboard swap changes the hwid: `replace <name>` revokes the old
+certificate by serial and lets the new board claim the name after approval; labels and history
+follow the name.
 
-`kbf-deploy hwid` prints the id of the machine it runs on.
+### 4.4 Where the name lives in hardware
 
-### 4.3 From a box in a rack to a name (discovery)
+The registry is authoritative. The name is also written where the hardware keeps it, so a person at
+a rack, an iPXE script and a fresh OS can see it and a lost registry can be rebuilt by reading
+machines.
 
-The problem: twenty identical servers power on and `status` shows twenty hwids. The
-chassis label shows the vendor **serial**, not the `product_uuid`. The method:
+| Platform | Carrier | Written by | Read by |
+|---|---|---|---|
+| Linux with a BMC | **FRU** product and chassis asset tag | `kbf-deploy name write` over IPMI on the BMC LAN, **before an OS exists**, or locally over `/dev/ipmi0` | BMC and `ipmitool fru print` (root) |
+| Linux | **SMBIOS chassis asset tag** | the BIOS, as far as it propagates FRU, or the vendor tool | unprivileged at `/sys/class/dmi/id/chassis_asset_tag`; iPXE as `${asset}` |
+| Mac | MDM `DeviceName` plus the registry's serial-to-name map | the MDM, at approval | `scutil --get ComputerName` |
+| neither | the registry only | | |
 
-1. The vendor ships a serial list with the purchase order. The operator imports it:
-   `kbf-deploy add --from-csv hosts.csv` (columns: serial, name, profile). Each host
-   block then has `serial = "..."` and no `hwid`. Racking puts the name label on the
-   chassis next to the serial the vendor already printed.
-2. On first PXE contact the netboot service sees `${serial}` and `${uuid}` and records
-   them as a **pending match**. `kbf-deploy status` shows
-   `build-007: serial S seen at <ip>, mac <mac>, uuid U: adopt?`.
-3. `kbf-deploy adopt build-007` (or `adopt --all-pending`, which lists every match
-   first and asks once) writes `hwid` into the inventory, commits it, and **arms** the
-   host (4.4). The operator checks the line against what they racked.
+- The tag is a **hint, not proof**. A tag that matches a name the policy would assign and that no
+  live node owns starts a *claim* the operator confirms (or a policy does, 4.6). A tag naming a node
+  bound to another hwid holds the host with a conflict (cloned disk, mislabeled box).
+- A blank tag (today `Default string` on our boards): the registry assigns by policy at approval and
+  `name write` writes it back. A failed write-back does not block the node; `status` shows
+  `tag: unwritten`. If the tag disagrees with the registry for the same hwid, the registry wins and
+  the tag is repaired.
+- BMC LAN credentials are the operator's secret, never in the registry; the config names where they
+  come from (7).
+- **Unconfirmed:** whether the BMC firmware on the Supermicro X10-generation boards (BMC present at
+  `/dev/ipmi0`) lets us write the asset-tag FRU fields, and whether the BIOS copies FRU asset data
+  into the SMBIOS chassis tag. Check: root `ipmitool fru print`, then write one field on one box.
+  Until confirmed, only the registry carries the name on those machines (decision 3).
 
-For small batches `kbf-deploy add build-009 --adopt-next` binds whichever unknown
-machine appears next and is used one box at a time. Switch-port or LLDP mapping would let
-the switch say which slot a box is in; it is not in the first cut.
+### 4.5 Naming policy
 
-Reports about unknown machines are rate-limited and capped (256 entries, oldest dropped)
-so a hostile host on the VLAN cannot fill `status`. Unknown hwids and serials are shown
-only to the authenticated operator, never to the caller.
+A generic engine in kbf, configured by rules in the operator's repository. A rule is a match over
+detected facts (platform, CPU model, chassis product, later a rack tag), a template and a counter;
+the first match wins.
 
-### 4.4 Linux bootstrap: arming, token, enrollment
+```toml
+# naming.toml  (operator-owned; example only)
+[[rule]]
+match = { platform = "linux", cpu_model = "E5-2*" }
+template = "broadwell{n}"
+[[rule]]
+match = { platform = "macos", model = "Mac Studio" }
+template = "m3ultra{n}"
+```
 
-Netboot's default answer to any machine is **boot the local disk**. A host installs only
-while **armed**: `kbf-deploy adopt` arms a new host, and `kbf-deploy reinstall <name>`
-arms an existing one. Arming is one-shot and expires (2 hours). Because of that,
-UEFI network boot can be first in the boot order, a power loss never reinstalls a
-MinIO node, and a stray reboot does nothing.
+`{n}` is the next integer of that template's counter, allocated atomically with the approval.
+Retired names are never reissued (a log line must mean one machine) unless `rename --reuse`. An
+approver may override (`approve --name broadwell7`). Names match `^[a-z][a-z0-9-]{0,40}$` and cannot
+collide. A host no rule matches stays pending with "no naming rule": the engine never invents one.
 
-The bootstrap token is minted **at arming**, stored in the durable registry (4.7), and
-delivered once:
+### 4.6 Enrollment: pending, approval, one-shot arming
 
-1. The installer fetches `GET /seed/<hwid>` over TLS pinned to the root (the iPXE image
-   embeds the root; CI builds it). The first fetch for an armed host returns the seed and
-   consumes the arming; any later fetch is a 409 and an alert.
-2. The token is inside that seed and is written by the install to a root-only file
-   (mode 0600). It is passed to `kbf-deploy node enroll` as a **path**, never in argv and
-   never as a long-lived value in the served user-data after the fetch.
-3. Consumption at `/enroll` is an atomic compare-and-set in the durable store. The
-   endpoint does not start until that store exists (step 0 in section 13).
+**First contact.** An unknown Linux host gets the **discovery** image from the boot endpoint (5.2): a
+small read-only initrd that detects facts (CPU, memory, disks by id, NICs, GPUs, BMC, asset tag),
+POSTs them to `/register` and waits. The record appears `pending`; no certificate or token exists. A
+Mac appears `pending` when it first checks in to the MDM (5.4). Reports about unknown machines are
+rate-limited and capped (256, oldest dropped) and shown only to authenticated operators.
 
-If a real host loses a race (409 on its seed), the operator sees the alert and the 409
-host id, re-arms, and the alert shows the first fetcher's address, so an attacker's
-fetch is visible. This does not make the VLAN safe: **the provisioning VLAN is a trust
-boundary** (5.5). Anyone who can reach netboot while a host is armed and who knows its
-hwid can race for the seed. The controls are a short armed window, the operator
-arming only when about to power the host, port security on the switch and `status`
-showing which address fetched. Optionally `arm --mac <mac>` pins the NIC.
+**Approval** moves `pending` to `approved`, by:
 
-After the install: the late-command only writes files (the `kbf-deploy` binary fetched
-with a signature check against the embedded root, the token file, a unit) and enables
-`kbf-firstboot.service`, a oneshot that retries with backoff after network and time sync.
-Enrollment and starting services happen there, not in the installer (no systemd runs in
-the installer chroot).
+- an operator: `nodes --pending` shows `serial S, mac M, uuid U, seen at <ip>, proposed broadwell3,
+  OS disk nvme-example-os`; the operator checks it against what was racked and runs
+  `approve <hwid>` (`--all-pending` lists once and confirms once); or
+- a **policy** in the operator's `approval.toml`, for roles that hold no power (for example "daemon
+  on the provisioning VLAN, naming rule matched"). The default is manual: auto-approval means
+  anyone who plugs a box into that VLAN gets a build host, so rules should require something hard to
+  guess and the 5.6 controls still apply.
 
-Autoinstall failure: the seed sets `error-commands` that POST the failing step and log tail
-to the netboot service (`/report/<hwid>`) and then **power off** (not reboot: the
-host must not loop). `status <name> --why` reads those reports, so a host without a
-certificate still has a reason on record.
+Approving the **server** role, `services` or any server's disk plan is always manual and
+**signed by the operator's delegated key**; the registry accepts that role only with the signature, so
+a compromised server cannot mint a server. A Linux approval records the exact `os_disk` by-id path a
+disk rule chose from the discovered facts (for example the smallest non-removable NVMe) and shows it
+to the approver. The installer may touch only that disk and refuses to start if it is absent;
+every other disk is never in its storage config.
 
-Re-enrollment after expiry or a lost key: `kbf-deploy enroll-token <name>` (or
-`--pool <p>` or `--all`) prints a fresh token valid 1 hour over the operator's
-authenticated channel. A token printed this way is also single-use, consumed by CAS and
-passed by file path.
+**Arming.** Approval, and `reinstall <name>` for an existing node, arms the host: one install,
+one-shot, expiring in 2 hours. Not-armed hosts boot local, so network boot can be first in the boot
+order, a power loss never reinstalls a MinIO node and a stray reboot does nothing. The bootstrap
+token is minted at arming, stored in the registry and delivered once:
 
-### 4.5 The enrollment endpoint and Mac evidence
+1. The installer fetches `GET /seed/<hwid>` over TLS pinned to the root (embedded in iPXE). The first
+   fetch for an armed host returns the seed and consumes the arming; a later fetch is a 409 and an
+   alert showing the first fetcher's address.
+2. The token is inside the seed, written to a root-only file, and reaches `node enroll` as a **path**,
+   never in argv or in served user-data.
+3. Consumption at `/enroll` is an atomic compare-and-set in the registry.
 
-`POST /enroll` on a second listener of `kbf-server` (not the worker port). It is the one
-unauthenticated surface in a mutual-TLS farm, so it binds to the provisioning VLAN and the
-farm network only, is rate-limited per source, and refuses with one uniform 403 to any caller
-that fails evidence (so name probing and hwid probing tell an attacker nothing). It takes
-`{hwid, name, csr, evidence}` and:
+**The provisioning VLAN is a trust boundary** (5.6): anyone who can reach the boot service while a
+host is armed and knows its hwid can race for the seed. Controls: the short window, arming only when
+about to power the host, port security, and `status` showing who fetched; `arm --mac` pins the NIC.
 
-1. looks up `hwid`; the name must equal the inventory name;
-2. verifies the evidence: a token (Linux, 4.4) or the MDM identity (Mac, below);
-3. checks the live-identity rule: an already-registered node under another key is refused
-   until the operator runs `retire` or `replace`. There is **no automatic takeover**: a
-   crashed original is never replaced by a clone without an operator action;
-4. signs the CSR, one DNS name equal to the node name, 30-day lifetime, records the
-   serial in the audit log (4.8) and returns the chain.
+After install, the late-command only writes files (the `kbf-deploy` binary verified against the
+embedded root, the token file, a unit) and enables `kbf-firstboot.service`, a oneshot that retries
+with backoff after network and time sync; enrollment happens there. An autoinstall failure runs
+`error-commands` that POST the step and log tail to `/report/<hwid>` and **power off** (never
+reboot). `status <name> --why` reads them. After expiry or a lost key, `enroll-token <name>` (or
+`--pool`, `--all`) prints a fresh single-use token valid 1 hour.
 
-Renewal uses the same endpoint over mTLS with the current certificate, at **half** of the
-lifetime (day 15). A node can therefore be cut off from the servers for 15 days without
-losing its identity. After that `enroll-token --all` is the recovery path; the runbook
-says so (section 11.4).
+### 4.7 The enrollment endpoint and Mac evidence
 
-**Clocks.** Every host runs NTP against a source the profile names (`chrony` rendered on
-Linux, the OS time service on Mac); certificate validation tolerates 5 minutes of skew;
-`status` flags a host whose Hello time differs from the server's by more.
+`POST /enroll` is on a second listener of `kbf-server`, the one unauthenticated surface in an mTLS
+farm: bound to the provisioning and farm networks, rate-limited per source, one uniform 403 to any
+failed evidence. It takes `{hwid, csr, evidence}`, then:
 
-**Mac evidence.** The Mac enrolls in the MDM first (5.2). The MDM's SCEP profile gives
-it a device identity whose subject carries the serial. At `/enroll` the node presents that
-certificate (mTLS); the server checks that the serial equals the inventory `mac:<serial>`,
-and asks `kbf-mdm-gate` whether the device is still enrolled, **supervised** and not
-quarantined. A manually enrolled, unsupervised Mac (not bought through ABM) can be
-unenrolled by its local admin; it gets `trust = "test"` and a test-only intermediate.
+1. finds the record, which must be `approved`; the name is the record's;
+2. verifies the evidence: a token (Linux) or the MDM identity (Mac);
+3. applies the live-identity rule: a node already registered under another key is refused until
+   `retire` or `replace`. **No automatic takeover.**
+4. signs the CSR (one DNS name equal to the name, 30-day lifetime), audits the serial, returns the
+   chain and sets the record `active`.
 
-State of trust on the Mac side, in plain words: the MDM operator can enroll any device
-and push any profile or package, so a compromised MDM is a compromised Mac fleet. The
-gate controls only the server's path to the MDM, not the reverse. Mitigations: the
-`.pkg` payload carries the farm's own signature, which the postinstall verifies against the
-root embedded in the package before anything runs (a notarized package proves only that
-Apple scanned it); an ABM assignment is not enough (the inventory entry is the second
-factor, so a serial added in ABM but absent from the inventory never receives a farm
-certificate); changes to the ABM assignment list alert. The key is generated on the host
-and stored in a root-owned file in the System keychain; "never leaves the host" is a
-policy of the code, not a hardware guarantee, and Secure Enclave storage is an open item.
+Renewal is the same endpoint over mTLS at half the lifetime (day 15), so a node survives 15 days cut
+off; beyond that `enroll-token --all` recovers (9). NTP on every host; validation tolerates 5
+minutes of skew and `status` flags more.
 
-### 4.6 Revocation
+**Mac evidence.** The Mac enrolls in the MDM first; its SCEP identity carries the serial. At `/enroll`
+it presents that certificate (mTLS), the server checks the serial equals the record's and asks
+`kbf-mdm-gate` whether the device is still enrolled, **supervised** and not quarantined. A Mac not
+bought through ABM can be unenrolled by its local admin and gets `trust = "test"`. A compromised MDM
+is a compromised Mac fleet (it can push any package); the gate guards only the server's path to it.
+Mitigations: the `.pkg` carries the farm's own signature, verified against the embedded root before
+anything runs; ABM assignment alone is not approval (a serial the MDM sees but nobody approved stays
+`pending` and gets no certificate); ABM list changes alert. The key lives in a root-owned System
+keychain file; Secure Enclave storage is open.
 
-`kbf-deploy retire <name>` removes the host from the inventory, **revokes its certificate
-by serial** (never by name or hwid, so retiring and re-adding the same hwid within 30 days
-does not revive the old certificate), and for a Mac asks the gate to unenroll the device.
+### 4.8 Revocation and audit
 
-The revocation list is a signed, versioned object in the durable registry and
-the object store. `kbf-server` and envoy both consult it. Server rule: it keeps the last good
-list on disk; if the object store is unreachable it keeps using that list and alerts;
-it refuses to start if it has never had a list (fail closed at start, fail static after).
-Nodes hold no object-store or CAS credentials (they reach the store through envoy with
-their certificate), so retire needs nothing else to cut.
-
-### 4.7 The durable registry
-
-The node registry, arming records, token state and revocation list must survive a server
-restart: otherwise a restart un-revokes everyone and resets "used" bits. **This is a
-prerequisite, not an open item**: `/enroll` is not enabled until it exists. Before HA it
-is a file store on the single server (write, fsync, rename), copied to the object store
-every few minutes and to the operator on `kbf-deploy backup pull`; with HA it rides on the
-metadata log.
-
-### 4.8 Audit
-
-Every enroll, renew, retire, arm, token mint, spec publish and ABM change is appended as an
-object under `fleet/audit/<date>/` in the object store (object lock if the store supports
-it) with the acting key id. `status --audit` reads it.
-
-### 4.9 Manual duties
-
-Section 12 lists what the operator still does by hand.
+`retire <name>` marks the record `retired`, **revokes the certificate by serial** (never by name or
+hwid, so re-approving the same hwid does not revive it) and has the gate unenroll a Mac. The
+revocation list is a signed, versioned object in the registry and object store, consulted by
+`kbf-server` and envoy. Server rule: keep the last good list on disk; if the store is unreachable
+keep using it and alert; refuse to start without one (fail closed at start, fail static after).
+Nodes hold no store credentials, so retire needs nothing else to cut. Every register, approve,
+enroll, renew, retire, arm, token mint, rename, name write, config publish and ABM change is appended
+under `fleet/audit/<date>/` (object lock if supported) with the key id or policy rule id;
+`status --audit` reads it.
 
 ## 5. Provisioning the operating system
 
-### 5.1 Linux hosts: PXE with arming
+### 5.1 Linux: DHCP to iPXE to the boot endpoint
 
 ```
-power on -> UEFI PXE -> DHCP (proxyDHCP from netboot) -> iPXE (HTTPS, root embedded)
-  -> not armed: "boot local disk".   armed: kernel+initrd of the pinned Ubuntu installer
-  -> installer fetches  GET /seed/<hwid>  (iPXE passes ${uuid} ${serial}); consumed once
-  -> autoinstall: os_disk, network, admin key, apt snapshot, late-command, error-commands
-  -> reboot -> kbf-firstboot.service: verify binary, enroll, node apply
+power on -> UEFI PXE -> site DHCP (opt 66 = boot host, opt 67 = ipxe.efi) -> TFTP: the iPXE binary
+  -> iPXE (embedded script + root) chains https://boot.example.net/boot?mac=..&uuid=..&serial=..
+                                           &asset=..&buildarch=..
+  -> endpoint decides (5.2): discover | install | local | rescue | wait
+  -> install: installer fetches GET /seed/<hwid>, autoinstall, reboot
+  -> kbf-firstboot.service: verify binary, enroll (4.7), node apply
 ```
 
-Where the inventory comes from: `netboot serve` loads the **signed spec bundle** that
-`apply` produces, from `--spec-url` (the object store, once it exists) or `--spec-dir`
-(a directory; day 0 and cold start). It verifies the spec key and caches the bundle on
-disk. The same bundle is the only inventory source for every tool, so there is one
-mechanism. When the operator runs `add` and `apply`, the netboot host sees the new spec
-at its next poll (a minute); the operator does not copy anything. Pending-match and
-failure reports from netboot to `status` go the other way: `status` queries each netboot
-instance listed in `[fleet].netboot` on its authenticated admin port (operator
-certificate), which is how a netboot on a different host is reached.
+- The UniFi gateway hands every PXE client the same two values and **cannot vary the image by
+  platform**; it does not need to, because the decision is in the HTTP endpoint. No proxyDHCP in the
+  first cut.
+- iPXE **embeds its chain script**: otherwise it DHCPs again, gets the same option 67 and loops. The
+  operator's CI builds it (`boot ipxe-build`) with the fleet roots and boot URL embedded.
+- TFTP serves only that one read-only file; everything else is HTTPS pinned to the root.
+- One bootfile is one architecture: the Linux hosts are x86-64 UEFI; an arm64 Linux class needs its
+  own VLAN or option 93 handling (17). Macs are not served here.
 
-The seed renders: hostname = name; storage from `disks`, where **`os_disk` is an explicit
-by-id path** and is the only disk the installer may touch; `disks.minio` is never in the
-installer's storage config. The installer refuses to start if `os_disk` is absent from
-the host's block (no guess). Network comes from the profile (DHCP; servers static);
-apt is the pinned snapshot `kbf-updater` uses. The installer needs outbound access or an
-apt mirror (prerequisites, 5.5).
+### 5.2 The boot endpoint
 
-Why PXE and autoinstall, not an image: the seed is rendered from the inventory on every
-install, so there is no image to rebuild or drift. A bootc image remains the long-term
-target (fleet-updates.md) and replaces only the installer step.
+`GET /boot` is generic and knows no names or images. It looks the host up and applies the operator's
+policy and image catalogue:
 
-Fallback without PXE: `kbf-deploy netboot usb <name>` writes the installer and seed for one
-host to a USB stick. The stick contains the armed token, so it is one-shot and
-expires like any arming.
+| Registry state | Answer |
+|---|---|
+| unknown hwid | record `pending`; serve **discovery** |
+| `pending` | discovery again (it polls; the host sits at a prompt) |
+| `approved`, armed, in window | the catalogue's image for this host, with its seed URL on the command line |
+| `active`, not armed | `exit`: boot the local disk |
+| `active`, rescue requested (`rescue <name>`, one-shot, expires) | the catalogue's rescue image |
+| `retired` or conflict | `exit` and an alert; never an install |
+| endpoint unreachable | `exit` to local disk after a retry budget |
 
-### 5.2 Macs: ABM and the MDM
+The **image catalogue** is the plug-in point. An entry is `{id, arch, kernel, initrd, cmdline
+template, sha256s, seed template}`. kbf ships two providers: a directory of entries in the operator's
+repository, and an executable hook given the record as JSON on stdin that returns an entry id (30 s
+timeout; any error means install nothing, fail closed). The endpoint serves only entries whose
+hashes it has verified, and the hashes come from the operator's config. Which class of host gets
+which entry is a rule in `images.toml`.
 
-1. The Mac is bought or added in ABM under the farm's MDM server. `kbf-deploy mac assign
-   <serial>` registers the serial with NanoDEP.
-2. Rack, ethernet (not Wi-Fi), power on. Setup Assistant contacts Apple, is told the MDM
-   and enrolls. **The first Mac needs a display and keyboard** to create the local admin
-   and approve the volume owner. Every later Mac, if its ABM profile skips the panes,
-   does not. This is unmeasured [A].
-3. The MDM pushes: the SCEP identity, the `kbf-mac-provision` settings profile (sleep off,
-   `autorestart 1`, FileVault off, auto-login off, per mac-node-provisioning.md), and a
-   signed, notarized `kbf-node.pkg`.
-4. The pkg's postinstall does **not** enroll inline. The SCEP identity may not have arrived
-   yet and a one-shot step would fail silently. It installs a `launchd` job with
-   `KeepAlive` and backoff that waits for the identity, then runs `kbf-deploy node
-   enroll`, fetches the spec slice, writes the daemon plist (flags, not environment) and
-   loads it.
+### 5.3 The seed
 
-**Network and hosting for the MDM.** The device must reach the MDM URL, which needs a
-certificate from a public CA (the OS trusts public roots only); the MDM host needs outbound
-to Apple (ABM API, APNs) and DNS. The MDM URL does not have to be reachable from the
-Internet if every Mac reaches it on the farm network [A: verify with one Mac]. The
-MDM runs on a server host with `services = ["mdm"]`; if the farm network cannot reach
-Apple, the MDM must sit on a host that can. This is a decision (CEO decision 4).
+Rendered per install from the record and the catalogue template: hostname = name; storage from the
+approved `os_disk` and nothing else; network from the profile (DHCP; servers static); the apt
+snapshot `kbf-updater` uses; the late-command and error-commands of 4.6. The installer needs
+outbound access or an apt mirror. PXE plus autoinstall rather than an image means no image to rebuild
+or drift; bootc remains the long-term target and replaces only the installer step. Without PXE,
+`boot usb <name>` writes installer and seed for one armed host to a stick; it carries the token, so
+it is one-shot and expires like any arming.
 
-A Mac not bought through ABM is enrolled once by hand and is `trust = "test"` (4.5).
+### 5.4 Macs: ABM and the MDM
 
-**Recovery without a console.** The Macs have no console. A wedged Mac is first
-restarted or erased through the MDM (`EraseDevice` signed by an operator hardware key
-through the gate, as designed). Only if the MDM cannot reach it does anyone need a display
-and keyboard, so each Mac in a rack gets a cheap HDMI dummy plug, and the rack has one
-KVM or a display on a cart.
+1. The Mac is added in ABM under the farm's MDM; `mac assign <serial>` registers the serial with
+   NanoDEP. No registry record exists yet.
+2. Rack, ethernet (not Wi-Fi), power on. Setup Assistant is told the MDM and enrolls. **The first Mac
+   needs a display and keyboard** (local admin, volume owner); later Macs may not. [A]
+3. The MDM check-in creates the `pending` record (serial, model, memory, storage from
+   DeviceInformation). The operator or policy approves; the naming policy gives the name.
+4. At approval the MDM sets **DeviceName** and pushes the SCEP identity, the `kbf-mac-provision`
+   profile and a signed, notarized `kbf-node.pkg`. Its postinstall installs a `launchd` job with
+   `KeepAlive` and backoff that waits for the identity, runs `node enroll`, fetches the record,
+   writes the daemon plist (flags, not environment) and loads it.
 
-### 5.3 What the operator does, and what happens
+After `EraseDevice` and re-enrollment the serial maps to the same name; the live-identity rule still
+applies. The MDM URL needs a public-CA certificate and the MDM host needs outbound to Apple (decision
+4). Recovery without a console is `EraseDevice` through the MDM (operator-signed through the gate);
+each Mac gets an HDMI dummy plug and the rack a KVM or cart display for when the MDM cannot reach it.
 
-| Step | Operator | Automatic |
-|---|---|---|
-| Rack, cable, label | yes | none |
-| Linux first power-on | `adopt` then power on | PXE, install, enroll, config, join, label; `ready` in about 15 minutes [A] |
-| Mac first power-on | `mac assign`, add block, power on | ADE, SCEP, pkg, enroll, join |
-| Replace a failed board | `replace` then `reinstall` (or power on) | same as new |
+### 5.5 Servers
 
-[A] marks an estimate nobody has measured on the reference hardware.
+Servers follow 5.1 with a signed approval (4.6). `node apply` renders `kbf-server`, `kbf-ca`, MinIO
+over the approved data disks (a rule such as "all non-OS NVMe", shown to the approver), envoy, boot
+and MDM per `services`. A server is never reinstalled without `reinstall --server-confirm`, which
+prints the disks it will not touch. One `voter` is accepted until HA lands; `check` fails on an even
+count. Servers are never updated in parallel.
 
-### 5.4 Server and storage nodes
+### 5.6 Prerequisites and BIOS baseline
 
-The three server nodes follow 5.1 with `role = "server"`. `node apply` renders the
-`kbf-server` unit, `kbf-ca`, a MinIO unit using `disks.minio` (distributed across the
-three nodes), envoy, netboot and MDM as `services` lists them. Server nodes are never
-reinstalled without an explicit `reinstall --server-confirm` (it prints the disks it will
-not touch).
+- **Network:** a provisioning VLAN with only the farm's hosts; DHCP reservations for servers and
+  options 66 and 67; DNS for the server, object and boot URLs; switch DHCP snooping and port
+  security; NTP; outbound or an apt mirror during install; for Macs, outbound to Apple.
+- **BIOS:** UEFI; PXE over IPv4 first (safe: not-armed hosts boot local); restore-on-AC-power on;
+  admin password; time set. **Secure Boot off** in the first cut (iPXE is not shim-signed;
+  decision 6).
+- **BMC:** on a separate management network; kbf uses it only to read and write the FRU name (4.4)
+  in the first cut. Macs: ethernet, FileVault off, `autorestart 1`.
 
-HA: this document assumes the three-voter metadata log in ha.md (open design). Until it
-lands the inventory accepts one `voter = true` host; `check` fails if the voter count is
-even or does not match what the server binary supports. Servers are never updated in
-parallel.
-
-### 5.5 Prerequisites and BIOS baseline
-
-One page, done before the first host:
-
-- **Network:** a provisioning VLAN with only the farm's hosts on it; DHCP (with reservations
-  for the three servers) and proxyDHCP allowed; DNS names for `server_url` and `object_url`;
-  switch DHCP snooping and port security; NTP source; outbound access, or an apt snapshot
-  mirror, during install; for Macs outbound to Apple and a public-CA certificate for the MDM.
-- **BIOS on every Linux host:** UEFI mode; PXE over IPv4 enabled and first in boot order
-  (safe because netboot answers "boot local" when not armed); restore-on-AC-power
-  set to on; BIOS admin password set; time set. **Secure Boot is off in the first cut**
-  (iPXE is not shim-signed); a Secure-Boot-capable path through Ubuntu's signed shim and
-  grub is a later option (CEO decision 3).
-- **Management hardware to buy:** servers with a BMC that supports Redfish on a separate
-  management network. kbf does not drive the BMC in the first cut (CEO decision 2).
-- **Macs:** ethernet, FileVault off and `autorestart 1` per mac-node-provisioning.md (a
-  Mac with FileVault on does not reach the network after a power cut without a person).
-
-`kbf-deploy doctor` checks the parts it can reach (DNS, NTP, server reachable, netboot
-reachable, certificate expiry of the Apple credentials) and is separate from `check`,
-which is offline and deterministic.
+`doctor` checks reachability (DNS, NTP, server, boot service, Apple credential expiry) and is
+separate from `check`, which is offline and deterministic.
 
 ## 6. Configuration
 
-### 6.1 The inventory
+### 6.1 Facts are detected, not configured
 
-```toml
-# fleet.toml  (one file; this is the whole fleet)
-[fleet]
-name        = "example"
-server_url  = "https://kbf.example.net:9443"   # where daemons dial
-object_url  = "https://objects.example.net"    # signed specs and releases
-netboot     = ["https://netboot.example.net:8443"]
-roots       = ["ecdsa:...", "ecdsa:..."]        # current and standby (public halves)
+Every connect reports and the registry records CPUs, memory, ISA and features, GPUs and drivers
+(already on Hello); block devices by id with size, type and rotational flag, where the **SSD path
+for cache and scratch** is the first mounted non-root SSD, else `/var/lib/kbf`, written back to the
+node's status; NICs, BMC presence and the asset tag. The scheduler uses reported capabilities as
+they are, so nothing typed can make a node look bigger than it is. `facts_history` keeps changes
+and `status` flags drift (half the memory after a failed DIMM, a vanished drive). No config file
+carries a CPU, memory or disk count.
 
-[defaults.linux-builder]
-role   = "daemon"
-labels = { pool = "linux-x86" }
-[defaults.mac-studio]
-role   = "daemon"
-labels = { pool = "mac-arm" }
+### 6.2 Config is policy plus rare overrides
 
-[[host]]
-name     = "build-001"
-serial   = "S1234567"                  # from the purchase order and the chassis label
-hwid     = "dmi:4c4c4544-0033-5a10-8052-b4c04f4a5a32"   # written by `adopt`
-profile  = "linux-builder"
-os_disk  = "/dev/disk/by-id/nvme-example-os"
+All of it lives in the operator's repository (7) and none is per host by default: profile rules
+(which role and labels a class gets, for example `platform = macos` gets `pool = mac-arm`); the
+naming, approval, disk and image rules; and **overrides** keyed by name and few (`reserve_cpus`, an
+extra label, a pinned `cache_dir`). `check` lists every override so none lingers. Order, lowest to
+highest: built-in default, detection, profile rule, override; `render --explain <name>` shows each
+value's origin.
 
-[[host]]
-name     = "build-002"
-serial   = "S1234568"
-profile  = "linux-builder"
-os_disk  = "/dev/disk/by-id/nvme-example-os-2"
-labels   = { gpu = "1" }               # per-host override
-reserve_cpus = 4                       # daemon/all-in-one only
+### 6.3 How a node gets its configuration
 
-[[host]]
-name     = "mac-001"
-hwid     = "mac:F5KX1Y2Z3W"
-profile  = "mac-studio"
+Pull, not push, from two inputs. (1) The **fleet config**: policy, profiles, release pointers,
+trusted roots, signed by an operator key and published by `apply` as one versioned object under
+`fleet/config/`; the node checks signature, version monotonicity and key expiry, installs
+atomically, and keeps the previous config if a new one is bad. (2) Its own **record**, served by
+`kbf-server` over mTLS: name, role, services, labels, overrides. Role and services that grant power
+carry the operator's approval signature, which the node verifies, so a lying server can misroute
+work but cannot make a node a server or change its software. Object-store requests go through envoy,
+which checks the certificate against roots and revocations and permits GET only on `fleet/config/`
+and `fleet/releases/`; nodes hold no store credentials. Disclosure, accepted: the policy and release
+manifest are readable by every node certificate, a record only by its node. Pull beats SSH because
+the hosts converge without the operator's laptop online and Macs have no SSH by policy.
 
-[[host]]
-name     = "srv-1"
-serial   = "S7654321"
-role     = "server"
-services = ["kbf-server", "minio", "envoy", "netboot", "mdm"]
-address  = "srv-1-reserved"           # name of a DHCP reservation; servers need a stable address
-voter    = true                        # raft voter (section 5.4)
-os_disk  = "/dev/disk/by-id/nvme-example-srv1-os"
-disks    = { minio = ["/dev/disk/by-id/example-a", "/dev/disk/by-id/example-b"] }
-```
+### 6.4 One render, three roles
 
-`check` refuses a `minio` disk equal to `os_disk`, a missing `os_disk` on a Linux host,
-a duplicate hwid, serial or name, an unknown profile, a placeholder, an even voter count.
-
-The node name is what goes into the certificate (the one DNS name the server already
-requires), the `--node-id` flag and every log line. It is chosen once and never derived.
-
-- **Reinstall, disk swap:** same hwid, same name; nothing in the inventory changes.
-- **Motherboard replacement:** the hwid changes. `kbf-deploy replace build-001 --serial <new>`
-  revokes the old certificate by serial, clears the hwid and awaits `adopt` of the
-  new board; name, labels and history follow the name.
-- **Unknown hwid:** refused at every step; the inventory is an allowlist.
-
-Labels the daemon detects (arch, CPUs, memory, ISA, GPU, drivers) are never typed. Only
-operator intent is typed: `pool`, and any `--label k=v`.
-
-### 6.2 One render, three roles
-
-`kbf-deploy render <name>` produces the exact files a host runs.
+`render <name>` shows the files a node runs, from its record and the config.
 
 | Role | Linux | macOS |
 |---|---|---|
-| `server` | `kbf-server.service`, `kbf-ca`, MinIO, envoy, netboot, MDM units as listed, nftables snippet, chrony | none |
-| `daemon` | `kbf-daemon.service` (fresh rootless crun sandbox per action, daemon cache on), chrony | `com.kbf.daemon.plist` (native driver, daemon cache on) |
-| `all-in-one` | `kbf-all-in-one.service` | the plist for the all-in-one binary |
+| `server` | `kbf-server`, `kbf-ca`, MinIO, envoy, boot, MDM units as listed, nftables, chrony | none |
+| `daemon` | `kbf-daemon.service` (rootless crun sandbox per action, daemon cache on), chrony | `com.kbf.daemon.plist` |
+| `all-in-one` | `kbf-all-in-one.service` | its plist |
 
-Every setting is a flag. The renderer owns a table from inventory key to flag; a test
-parses every rendered command line with the real binary's parser, so a rename fails the
-build. `--reserve-cpus` is rendered only for `daemon` and `all-in-one`.
+Every setting is a flag. A test parses every rendered command line with the real binary's parser, so
+a rename fails the build; `--reserve-cpus` is rendered only for `daemon` and `all-in-one`.
 
-### 6.3 Hardware-derived defaults
+## 7. The line between kbf and the operator's repository
 
-- `--cpus`, memory, ISA, GPU, drivers: detected.
-- Cache and scratch path: the first mounted non-root SSD (`lsblk` rotational=0), else
-  `/var/lib/kbf`; written back to the node's status. A host can pin `cache_dir`.
-- Disk layout for servers: only from the inventory, never guessed.
+kbf is a general build farm and holds no operator's specifics. **kbf ships mechanisms and schemas;
+the operator's repository ships values.** Anything naming a machine, network, account or site is the
+operator's. kbf's repository carries example values only (`example.net`, `build{n}`) and a lint
+refuses real ones.
 
-Override order, lowest to highest: built-in default, hardware detection,
-`[defaults.<profile>]`, `[[host]]`. `render --explain` prints each value and its origin.
+| In kbf (generic, public) | In the operator's repository (config files or hooks) |
+|---|---|
+| Registry, `/register`, `/enroll`, approval and arming state machine, audit | `approval.toml`: who or what may approve, which roles auto-approve, window lengths |
+| Naming-policy engine and its schema | `naming.toml`: the rules (`broadwell{n}`, `m3ultra{n}`), counter starts |
+| Boot endpoint, discovery image build, seed renderer, catalogue interface and its two providers | `images.toml` and the catalogue: OS release, apt snapshot, packages, admin SSH keys, which class gets which image |
+| `boot ipxe-build` recipe | iPXE build inputs: embedded roots, boot URL, the CI job |
+| Disk-selection rule engine | `disks.toml`: the rules (smallest NVMe is OS, other NVMe is MinIO) |
+| MDM integration (gate, NanoHUB/NanoDEP/SCEP kit, DeviceName, pkg builder) | ABM and Apple accounts, DEP token and APNs certificate locations, MDM URL, Developer ID identity |
+| FRU and asset-tag tool (`name write`) | BMC credential locations (a secret-store path, never the secret), BMC network, fields to write |
+| CA, enrollment, revocation, rollout, node agent, `render`, CLI | CA locations (root and standby safes, offline-machine procedure), operator key roster |
+| Config schemas, `check`, reference configs | `fleet.toml`: fleet name, server, object and boot URLs, root public halves; `profiles.toml`: pool labels by rule, reserve defaults; `overrides.toml`: the rare per-node entries; network notes (VLAN, DHCP option values) |
 
-### 6.4 How a node gets its configuration
+Two rules hold the line: kbf reads no path the operator did not pass by flag, and the schemas are
+versioned and published, so the operator's repository and kbf change independently. For behaviour a
+rule cannot express there is an executable hook (JSON on stdin and stdout, a timeout, fail closed),
+which lives in the operator's repository. None of these files lists machines.
 
-Pull, not push. `apply` (operator) checks the inventory, renders every host, and signs
-**each host's slice** with the operator's delegated spec key. The slice is bound to the
-node name, the role and the spec version, so a node cannot be fed another node's slice or a
-role downgrade. It uploads under `fleet/spec/<version>/<name>/`. The node polls every few
-minutes, downloading only its own path. **Authentication to the object store:** requests
-go through envoy, which verifies the node certificate against the farm roots and the
-revocation list and permits GET only on `fleet/spec/*/<own name>/` and the common
-`fleet/releases/`. Nodes hold no store credentials. The node checks the signature,
-version monotonicity, the delegated key's expiry and the name binding, and installs atomically
-(write next to, fsync, rename). A bad spec is refused and reported; the previous
-one keeps running.
+## 8. Updates
 
-Disclosure, accepted in writing: the release manifest is readable by every node
-certificate; a host slice only by that host. A node cert holder learns the release hashes,
-not other hosts' labels.
+Two things change: the **fleet config** and the **software set**, both named by the signed config.
 
-Pull is chosen over operator SSH because 29 hosts must converge without the operator's
-laptop being online and the Macs have no SSH by policy.
+- Binaries: the config names a release signed by the release key. The node verifies signature and
+  hash, installs to a versioned directory, switches a symlink, restarts and keeps the previous
+  version. Linux OS packages come from the pinned apt snapshot via `kbf-updater`; macOS updates stay
+  with the MDM.
+- Rollout: `rollout <release> --pool linux-x86 --canary 1 --batch 4 --soak 30m`. Per node: cordon,
+  drain (both exist), set the desired release, wait for Hello with the new version, run a qualify
+  action, uncordon. A failed gate stops the rollout and restores the previous release on that node.
+  The record is written to the object store before the first node is touched, so `--resume` works
+  after an operator crash. The operator's machine still drives batches; the server-driven driver in
+  fleet-updates.md replaces it later without changing the config.
+- Servers: never in parallel; a voter only when the others are healthy; the leader last. Today:
+  scp the binary and restart by SHA. A node that cannot reach the store runs its last verified
+  release (fail static); a signature failure is an alert.
 
-## 7. Updates
+## 9. Cold start and disaster recovery
 
-Two things change: the **spec** (configuration) and the **software set** (binaries, OS
-packages), both in the signed spec.
+The boot service, CA, registry and object store share the three servers.
 
-- Binaries: the spec names a release (build hashes), signed by the release key. The node
-  downloads, verifies the signature and the hash, installs to a versioned directory,
-  switches a symlink, restarts, and keeps the previous version.
-- OS packages on Linux: the pinned apt snapshot, applied by `kbf-updater`. macOS updates
-  stay through MDM.
-- Rollout: `kbf-deploy rollout <release> --pool linux-x86 --canary 1 --batch 4
-  --soak 30m`. For each node in a batch, using the server's cordon and drain (these
-  exist): cordon, drain, set the desired release, wait for Hello with the new version,
-  run a qualify action, uncordon. A failed gate stops the rollout and restores the previous release
-  on that node. The record is written to the object store before the first node is
-  touched, so a crashed operator resumes with `--resume`. The batch run is still
-  driven from the operator's machine; the server-driven driver in fleet-updates.md
-  replaces it later without changing the spec, and is pulled forward if the operator's
-  machine being online for a 20-host rollout is a problem in practice.
-- Servers: never in parallel; a voter updates only when the others are healthy; the
-  leader last.
-- Today the mechanism is scp the binary and restart by SHA.
+- **All down, disks intact:** power on; services start from local state; builders ran fail static
+  and renew within 15 days of the outage. **Longer outage:** certificates expired; run
+  `enroll-token --all` and deliver tokens, or `reinstall --pool`.
+- **All three lost:** (1) root and standby come out of safe storage; (2) day 0 (15) rebuilds the
+  first server from USB; (3) `nodes import` restores the last export (`backup pull`, or the copy in
+  the object store): records come back `retired` except hosts that re-enroll with fresh tokens, and
+  each box still carries its name in FRU or asset tag where hardware allows (4.4), so names can be
+  rebuilt by reading machines; (4) the CAS is a cache. Lost: cache contents and revocations after
+  the last export (re-run `retire` for anything retired since).
 
-A node that cannot reach the object store keeps running its last verified release (fail
-static). A spec or release signature failure is an alert.
+## 10. The command set
 
-## 8. Cold start and disaster recovery
-
-The netboot service, the CA and the object store live on the same three servers.
-
-- **All servers down, disks intact:** power them on; services start from local state,
-  MinIO re-forms with the drives; builders ran fail static and renew certificates
-  within 15 days of the outage. Nothing to type.
-- **Outage longer than 15 days:** certificates expired; after the servers return, run
-  `kbf-deploy enroll-token --all` and paste the tokens, or reinstall (`reinstall --pool`).
-- **All three servers lost:** (1) the offline root and its standby come from their
-  safe place; (2) the inventory repo is the source of every host; (3) day-0 steps
-  (section 14) rebuild the first server from USB, restore the registry backup from the
-  operator's `backup pull`; (4) the CAS is a cache and is rebuilt by builds.
-  What is lost: build cache contents, and revocations after the last backup (so
-  `retire` is re-run for anything retired since).
-
-## 9. The command set
-
-`kbf-deploy` is a Linux and macOS binary (a Mac needs only `node` and `hwid`). It is one
-operator CLI; the complete list of verbs is below, and a test asserts that `--help`
-lists exactly these (so this table cannot drift).
+`kbf-deploy` runs on Linux and macOS (a Mac needs only `node` and `hwid`). A test asserts `--help`
+lists exactly these verbs.
 
 | Group | Verbs |
 |---|---|
-| Inventory | `check` (offline lint), `doctor` (reachability, certificate and Apple-credential expiry), `render [--explain]`, `apply`, `status` (`--why`, `--audit`, `--buckconfig`) |
-| Hosts | `add` (`--from-csv`, `--adopt-next`), `adopt`, `replace`, `retire`, `reinstall`, `enroll-token` (`<name>`, `--pool`, `--all`) |
+| Registry | `nodes` (list, `show`, `--pending`, `export`, `import`), `approve` (`--name`, `--role`, `--all-pending`), `reject`, `rename`, `retire`, `replace`, `reinstall`, `rescue`, `enroll-token` |
+| Config | `check`, `doctor`, `render [--explain]`, `apply`, `status` (`--why`, `--audit`, `--buckconfig`) |
 | Updates | `rollout` (`--resume`, `--status`, `--batch`) |
 | PKI | `ca init`, `ca sign`, `ca rotate`, `ca export-root`, `backup pull` |
-| Provisioning | `netboot serve`, `netboot fetch`, `netboot usb`, `mac assign`, `mac unassign` |
+| Provisioning | `boot serve`, `boot ipxe-build`, `boot discover-image`, `boot usb`, `name write`, `mac assign`, `mac unassign` |
 | On the host | `node enroll`, `node apply`, `node renew`, `node doctor`, `hwid` |
 
-That is about 30 invocations in six groups, not 11 verbs. The older kits fold in:
-`minio`, `envoy` and `mdm` become `services` rendered by `node apply`; `linux
-render/check/install/swap/image-pull` become `render`, `check`, `node apply` and `rollout`;
-`pilot server-install` and `pilot buckconfig` become `render` output and `status
---buckconfig`. Today's verbs are kept as hidden aliases for one release, then removed.
-
-Day-2 recipes:
+The older kits fold in: `minio`, `envoy` and `mdm` become `services` rendered by `node apply`;
+`linux render/check/install/swap/image-pull` become `render`, `check`, `node apply` and `rollout`;
+`pilot` becomes `render` output and `status --buckconfig`. Old verbs stay as hidden aliases for one
+release.
 
 | Task | Commands |
 |---|---|
-| Add a Linux host | `add build-021 --serial S...`; `apply`; rack; power on; `adopt build-021`; wait for `ready` |
-| Add a Mac | `mac assign <serial>`; add its block; `apply`; power on |
-| Remove a host | `retire build-007`; power off |
-| Replace a failed board | `replace build-007 --serial <new>`; power on; `adopt build-007` |
-| Replace a MinIO drive | edit `disks.minio`; `apply`; `node doctor` on the server prints the heal command and waits; never two drives on one node at once |
-| Change a label or `reserve_cpus` | edit; `apply`; picked up within minutes, daemon restarts at an idle moment |
-| Roll a release | `rollout <release> --pool ...` |
-| Rebuild a host | `reinstall <name>` (arms one install; a live host does a one-shot network boot by itself, a dead one needs a power cycle) |
-| Hosts that should have shown up | `status` lists any armed or inventory host not seen since expected, not only unknown ones |
+| Add a Linux host | rack, cable (power, provisioning port, BMC), power on; `nodes --pending`; check serial and address against the box; `approve`; label the chassis with the printed name. An unrecognized host stays pending; a 409 alert means another machine took the seed (`reinstall`). |
+| Add a server | `approve --role server` shows the OS and data disks the rules chose and waits for your token; `status` shows server healthy, MinIO online, voter joined before the next |
+| Add a Mac | `mac assign <serial>`; power on (the first needs a display and keyboard); `approve <serial>`. Stuck in Setup Assistant: not ADE-assigned, fix ABM, erase through the MDM |
+| Remove, replace, rebuild | `retire <name>`; `replace <name>`, power on the new board, `approve`; `reinstall <name>` (a live host network-boots by itself, a dead one needs a power cycle) |
+| Change a label or `reserve_cpus`, roll a release | edit `overrides.toml` or a profile rule, `apply`; `rollout <release> --pool ...` |
+| Replace a MinIO drive | swap it; `node doctor` prints the heal command and waits; never two drives on one node |
 
-## 10. What is retired
+## 11. What is retired
 
-- `install.sh` and `install_units.sh`: replaced by `node apply` (first-boot unit, `.pkg`
-  launchd job).
-- The private repo's `deploy/` shell kits (`kbf-linux`, `kbf-pilot`): their logic is in
-  `kbf-deploy` already or in section 5; the repo keeps only the inventory.
-- `pilot_ca.sh` and the deny-list file: replaced by `ca`, `/enroll` and revocation.
-- The Buildbarn-only scripts and one-time cutover scripts: deleted when the cutover ends.
-- Dev-farm scripts (`kbf_dev_install.sh`, `upd_main.sh`, siblings): replaced by
-  `rollout`; the dev farm becomes a second small inventory.
-- Kit copies in scratch directories; hardcoded node numbers, subuid ranges and commit
-  SHAs in scripts (the subuid range becomes an inventory default).
-
-Each is removed in the change that makes its replacement work, never before.
-
-## 11. Operator runbooks
-
-### 11.1 Linux build host
-
-1. Confirm the BIOS baseline (5.5). Note the vendor serial and put the **node name** label
-   next to it.
-2. `add` (or `add --from-csv`) and `apply`.
-3. Rack, connect power and the provisioning-VLAN port, power on.
-4. `status` shows `build-007: serial S seen ... adopt?`. Check the serial against the
-   label and the address against the rack, then `adopt build-007`. A host you do not
-   recognize stays unadopted; do not approve it.
-5. Wait for `ready`. If not ready in 30 minutes: `status build-007 --why`. A 409 alert
-   means another machine fetched the seed first: find it, re-arm with `reinstall`.
-6. Never type a hostname or IP on a console.
-
-### 11.2 Server and storage node
-
-1. Drives in the bays named in `disks`; label each bay with the by-id suffix.
-2. First node only: section 14.
-3. Others: as 11.1 with `role = "server"`, a reserved address and `os_disk`.
-4. `status srv-N` must show server healthy, MinIO drives online, voter joined. Do not power
-   on a second server before the first shows it.
-5. Drive failure: replace, update `disks.minio`, `apply`, `node doctor` on the host, wait
-   for the heal.
-
-### 11.3 Mac Studio
-
-1. Serial in ABM, assigned to the farm's MDM; `mac assign <serial>`.
-2. Rack, ethernet, HDMI dummy plug, power on. The first Mac needs a display and keyboard
-   once.
-3. Add the block, `apply`.
-4. Wait for `ready`. A Mac stuck in Setup Assistant is not ADE-assigned: fix ABM, then
-   erase through the MDM, or by display and keyboard from recovery as a last resort.
-5. FileVault and auto-login follow mac-node-provisioning.md; do not change them by hand.
-
-### 11.4 Outage longer than certificate renewal
-
-See section 8. Run `enroll-token --all`, deliver tokens, check `status`.
+`install.sh`, `install_units.sh`: replaced by `node apply`. The private repo's `deploy/` shell kits:
+logic moves into `kbf-deploy`; the repo keeps the section 7 files. `fleet.toml` as a list of hosts
+(an earlier revision of this document): replaced by the registry; the operator's `fleet.toml` is
+fleet-level values only. `pilot_ca.sh` and the deny-list file: replaced by `ca`, `/enroll`,
+revocation. Buildbarn-only and cutover scripts, dev-farm scripts (`kbf_dev_install.sh`,
+`upd_main.sh`; the dev farm becomes a second registry) and hardcoded node numbers, subuid ranges and
+commit SHAs. Each is removed in the change that makes its replacement work, never before.
 
 ## 12. What is still manual
 
-- Racking, cabling, labeling; the BIOS baseline; the switch and VLAN setup.
-- Day-0 root ceremony and first-server bootstrap (section 14).
-- Matching each box to a name: `adopt` after checking the serial against the rack.
-- ABM serial assignment; non-ABM Mac enrollment; the first Mac's display and keyboard.
-- **Recurring, with the failure when it lapses:**
-  - ABM DEP token, yearly: lapsed, new Macs do not enroll; existing Macs are unaffected.
-  - APNs push certificate, yearly: lapsed, the MDM cannot reach any Mac. Renew under
-    the same Apple account and certificate so enrollments survive.
-  - Apple Developer ID (paid membership): lapsed, new notarized `.pkg` cannot be built;
-    installed Macs are unaffected.
-  - Intermediate CA and delegated spec keys, yearly: lapsed, no enrollments or spec
-    publishes. `doctor` warns 60 and 30 days ahead for all of these.
-- Drive replacement and heal; BMC-less power cycles.
+Racking, cabling, labeling, BIOS, switch, VLAN and DHCP options; the day-0 ceremony (15); **approving**
+each new machine against what was racked (unless a policy does, 4.6); ABM serial assignment, non-ABM
+Mac enrollment and the first Mac's display and keyboard; drive replacement and power cycles of hosts
+without a BMC. Recurring, with the failure when it lapses: ABM DEP token (yearly; new Macs do not
+enroll); APNs certificate (yearly; the MDM cannot reach any Mac; renew under the same account);
+Developer ID (no new `.pkg`); intermediates and operator keys (yearly; no enrollments or config
+publishes). `doctor` warns 60 and 30 days ahead.
 
-## 13. Migration from today's hosts
+## 13. Tests
 
-Order, each step reversible:
+- Registry: unknown hwid becomes `pending`; duplicate hwid refused; restart keeps arming, tokens and
+  revocations; import never overwrites a live record; 10 000 synthetic records page and index in
+  bounded time.
+- Naming: first match wins; counters atomic under concurrent approvals; retired names not reissued;
+  no rule leaves the host pending; a tag naming another hwid is a conflict.
+- Policy: auto-approval never approves the server role; a server approval without the operator
+  signature is refused by the registry.
+- Boot endpoint: unknown gets discovery; unarmed `active` gets `exit`; armed gets the image once and
+  the seed once (409 after); `retired` never installs; a hook that errors installs nothing; the seed
+  never touches a disk other than the approved `os_disk`.
+- Detection: changed facts recorded and flagged; the scheduler uses reported capabilities only.
+- Enrollment with the fake CA: wrong hwid, reused token, expired token, token in argv, live-identity
+  conflict, revoked serial, retire then re-approve (old certificate stays dead), expired operator
+  key; each must fail. `name write` against a fake BMC: a refused write keeps the registry name and
+  sets `tag: unwritten`.
+- Golden renders with real-parser command lines; first-boot retry; rollout resume without
+  re-draining; rollback refused; the section 10 table equals the command tree; the kbf repo lint
+  refuses real values in shipped config.
+- A planted mutant per area (skipped signature check, token consumed twice, name allocated twice)
+  must turn its test red. Per hardware model: iPXE uuid equals `product_uuid` (4.3); per BMC model:
+  the FRU write check (4.4).
 
-0. Ship the durable registry (4.7). Nothing below enables `/enroll` before it.
-1. Write `fleet.toml` for the existing hosts using `kbf-deploy hwid`; run `check`.
-2. Ship `render` and diff its output against live units until empty; drift found is a
-   finding.
-3. Ship `/enroll`, `ca`, `node enroll`. Enroll existing hosts in place with tokens from
-   `enroll-token`; the daemon switches at its next restart. The old shell CA stays valid
-   until every host is enrolled, then is retired.
-4. Ship the Linux node agent and `apply`; flip hosts one pool at a time, canary first.
-5. Ship `rollout`.
-6. Ship `netboot` and `adopt`; the next new Linux host is the first user. Existing hosts
-   are never reinstalled for the sake of it.
-7. Macs: **blocked on a macOS node agent, which does not exist yet.** Until it does, the
-   Macs keep the current install. Then assign serials in ABM, hand-enroll those not
-   bought through it, and replace the install with the pkg in place (same `_kbf` user and
-   paths), verified on one Mac first.
+## 14. Migration from today's hosts
 
-Servers last; the single server is moved to `kbf-deploy` rendering before HA, so HA
-arrives as an inventory change.
+Each step reversible. (0) Ship the durable registry; nothing below enables `/enroll` before it.
+(1) Ship `/register` and `nodes`: existing hosts self-report with `node enroll --register-only` (a
+human on the host is the proof) and the operator approves with the **current** node id as the name,
+so no certificate or flag changes yet. (2) Ship `render` and diff against live units until empty.
+(3) Ship `/enroll`, `ca`, `node enroll`; enroll in place with `enroll-token`; the daemon switches at
+its next restart; the old shell CA stays valid until all are enrolled. (4) Ship the Linux node agent,
+`apply` and `rollout`; flip one pool at a time, canary first. (5) Ship the boot service and `name
+write`: the next new Linux host is the first user, existing hosts' names are written to FRU where the
+4.4 check passes, and no existing host is reinstalled for it. (6) Macs are **blocked on the macOS node
+agent**; until then they keep the current install, then ABM serials, approval, and the pkg in place,
+verified on one Mac first. Servers last; the single server moves to `kbf-deploy` rendering before HA,
+so HA is a registry change.
 
-## 14. Day 0: building the farm from nothing
+## 15. Day 0: building the farm from nothing
 
-One linear list. Steps 1 to 6 need no object store.
+Steps 1 to 5 need no object store. (1) Prerequisites (5.6); Apple accounts and a public-CA
+certificate. (2) Root ceremony on an air-gapped machine: `ca init` makes root and standby, each into
+its own safe. (3) Write the operator's config files (7) plus a tiny `nodes.json` naming the first
+server (the one bootstrap use of `nodes import`); `apply --to-dir spec/`. (4) First server from USB:
+`boot usb srv-1 --spec-dir spec/`; its first boot writes an intermediate request, carried to the
+offline machine for `ca sign`. (5) `kbf-server`, `kbf-ca` and `boot serve --spec-dir` run on srv-1.
+(6) Power on srv-2 and srv-3: they appear pending, you approve each as a server with your token, they
+install over PXE from srv-1 and get their own intermediates. (7) MinIO forms, envoy starts, `apply`
+publishes to the object store and boot switches to `--config-url`. (8) MDM, ABM, DEP token, push
+certificate. (9) Linux builders, then Macs.
 
-1. Prerequisites (5.5) in place; Apple accounts and a public-CA certificate for the MDM
-   obtained.
-2. Root ceremony on an air-gapped machine: `ca init` makes root and standby; store both
-   in separate safe places.
-3. Write `fleet.toml` with the three servers; `apply --to-dir spec/` writes the signed
-   bundle to a directory.
-4. First server from a USB stick: `netboot usb srv-1 --spec-dir spec/`. First boot
-   generates its intermediate request; carry it to the offline machine, `ca sign`,
-   carry back.
-5. `kbf-server`, `kbf-ca` and `netboot serve --spec-dir` run on srv-1; the registry is a
-   file store.
-6. `adopt srv-2` and `srv-3`; they install over PXE from srv-1, enroll and get their own
-   intermediates (same offline signing).
-7. MinIO forms across the three; envoy starts; `apply` now publishes the spec to the
-   object store and `netboot` switches to `--spec-url`.
-8. MDM on its host, ABM linked, DEP token and push certificate loaded.
-9. Linux builders (11.1), then Macs (11.3).
+## 16. Decisions and questions for the CEO
 
-## 15. Tests
-
-- Renderer: golden units and plists per role; every rendered command line parsed by the
-  real binary's parser; `--reserve-cpus` absent for servers.
-- Inventory lint: one test per `check` refusal (placeholder, duplicate, even voters,
-  `minio` disk equal to `os_disk`, missing `os_disk`).
-- Enrollment with the fake CA: wrong hwid, wrong name, reused token (CAS), expired token,
-  token in argv refused, live-identity conflict, revoked serial, retire then re-add the same
-  hwid (old certificate stays dead), expired delegated key; each must fail.
-- Netboot: an unarmed host gets "boot local"; an armed host gets the seed once and a 409 the
-  second time; the seed never touches `disks.minio`; unknown report list capped.
-- First-boot: a late-command that runs before the network is up retries, not fails.
-- Rollout: crash the operator between canary and soak; `--resume` finishes without
-  re-draining. Spec rollback below the stored version is refused.
-- The CLI table in section 9 equals the real command tree.
-- A planted mutant for each (a skipped signature check, a token consumed twice) must turn
-  its test red.
-- Hardware acceptance (section 4.2): iPXE uuid equals kernel `product_uuid`, per model.
-
-## 16. Decisions for the CEO
-
-1. **PXE plus autoinstall now, image-based later.** Recommended: yes.
-2. **BMC scope.** Recommended: out of scope for the first cut; buy servers with a Redfish
-   BMC on a management network; a later release adds one-shot PXE boot and power
-   cycle through it. A live host reinstalls itself without one.
-3. **Secure Boot.** Recommended: off in the first cut, BIOS password on, signed shim/grub
-   path later.
-4. **ABM and MDM hosting.** Recommended: accept the Apple dependency for Macs (ABM,
-   DEP token, APNs, Developer ID, public-CA certificate); MDM on a server host if the
-   farm network reaches Apple, else on a small separate host.
-5. **Where the CA key lives.** Recommended: a separate `kbf-ca` process per server host
-   (own user, name-constrained, TPM-sealed where present), accepting in writing that
-   root on a server mints fleet-name certificates until its intermediate is revoked. A separate
-   signer machine is the alternative; the interface is the same.
-6. **Who holds spec signing.** Recommended: delegated key per operator on a hardware
-   token, root-signed with expiry; CI signs only releases.
-7. **TPM attestation.** Recommended: not in the first cut; the residual spoof risk is
-   documented (4.2).
-8. **Pull-based spec; 30-day certificates renewed at half-life.** Recommended: yes.
-9. **Servers in the inventory before HA.** One voter first. Recommended: yes.
+1. **Registry as source of truth, self-enrollment, manual approval by default.** Recommended: yes;
+   policy auto-approval stays off until you ask.
+2. **Naming-policy defaults.** Recommended: one rule per hardware class (4.5), counters from 1,
+   retired names never reused, operator override at approval. Question: do servers share the scheme
+   or take a role prefix (`srv1`)?
+3. **FRU writability on the Supermicro BMCs.** Unconfirmed (4.4): needs a root `ipmitool fru print`
+   and a one-field write on one build host. Recommended: confirm on one box first; if FRU is
+   read-only or does not reach the SMBIOS tag, keep the name in the registry plus a physical label.
+4. **ABM and MDM hosting.** Recommended: accept the Apple dependency (ABM, DEP token, APNs,
+   Developer ID, public-CA certificate); MDM on a server host if the farm network reaches Apple.
+5. **Where the CA key lives.** Recommended: a `kbf-ca` process per server host (own user,
+   name-constrained, TPM-sealed where present), accepting in writing that root on a server mints
+   fleet-name certificates until its intermediate is revoked.
+6. **Secure Boot.** Recommended: off first, BIOS password on, signed shim and grub later.
+7. **Server-role approval needs the operator's hardware token.** Recommended: yes.
+8. **TPM attestation.** Recommended: not first cut; the spoof risk (4.3) is documented.
+9. **Pull-based config; 30-day certificates renewed at half-life.** Recommended: yes.
+10. **Operator repository layout.** Recommended: the section 7 files in one directory of the
+    operator's repository, schemas and examples in kbf.
 
 ## 17. Open items
 
-- Secure Enclave storage of the Mac node key (needs a TLS stack that signs through
-  Security.framework).
-- Switch-port or LLDP mapping of boxes to rack slots.
-- TPM-backed enrollment.
-- The macOS node agent; the CI build of iPXE with the root embedded.
-- Unattended-enrollment details on the newest macOS (volume owner, bootstrap token),
-  the MDM reachability assumption in 5.2, and the 15-minute install figure: all [A]
-  until one Mac and one host are measured.
-- Server HA behavior depends on ha.md.
+Secure Enclave storage of the Mac node key; switch-port or LLDP mapping to rack slots (feeds naming
+rules); TPM-backed enrollment; the macOS node agent and the CI build of iPXE; an arm64 Linux class
+(option 93 through proxyDHCP, or a second VLAN); BMC-driven one-shot PXE and power cycle (Redfish or
+IPMI) so a dead host reinstalls without a person; unattended Mac enrollment on the newest macOS, MDM
+reachability and the 15-minute install figure ([A] until measured); server HA depends on ha.md.
 
 ## 18. Review record
 
-Every must-fix from the two reviews was taken, with these exceptions and changes:
-
-- **Per-node encryption of the spec** was not taken: the per-name path rule in envoy and
-  the written disclosure (6.4) give the same property for less machinery.
-- **A separate signer machine** was not taken; a separate process and user per server
-  host is (decision 5), and a machine split stays possible.
-- **BMC integration** was deferred, not refused: `reinstall` works without it for live
-  hosts, and the purchase guidance asks for a BMC.
-- **CI signing of specs** was replaced by per-operator delegated keys, which also fixes
-  the bus factor and the audit gap without putting the spec key in CI.
-- **TPM attestation and Secure Enclave keys** are deferred with the residual risk stated
-  (4.2, 4.5).
-- **"11 verbs"** was restated as a complete table with a test that keeps it true (9),
-  and the claim is "one CLI, N components".
+Every must-fix from the two earlier reviews was taken, with these changes: the per-node spec slice
+is gone (nodes read one signed common config and their own record, 6.3); no separate signer machine
+(decision 5); BMC use is limited to the FRU name; per-operator delegated keys, not CI, sign config;
+TPM attestation and Secure Enclave keys are deferred with the risk stated. On CEO direction the
+inventory file as source of truth is replaced by the registry; keys, certificates, revocation,
+one-shot arming and rollout carry over.
