@@ -462,7 +462,12 @@ fn job_with_env(argv: &str, platform: &[(&str, &str)], env: &[(&str, &str)]) -> 
 async fn the_category_is_carried_when_the_memory_booking_is_the_default() {
     let script = Arc::new(Script::default());
     let farm = Farm::with_execution(Arc::clone(&script)).await;
-    type Case<'a> = (&'a str, Vec<(&'a str, &'a str)>, &'a [(&'a str, &'a str)], Option<&'a str>);
+    type Case<'a> = (
+        &'a str,
+        Vec<(&'a str, &'a str)>,
+        &'a [(&'a str, &'a str)],
+        Option<&'a str>,
+    );
     let tagged = [(kbf_front::CATEGORY_ENV, "mojo_build_test")];
     let untagged = [("PATH", "/bin")];
     let cases: [Case; 5] = [
@@ -500,8 +505,7 @@ async fn the_category_is_carried_when_the_memory_booking_is_the_default() {
         let whole = submission.request.kind == LeaseKind::WholeMachine;
         if !sized && !whole {
             assert_eq!(
-                submission.request.resources.memory_bytes,
-                DEFAULT_RESOURCES.memory_bytes,
+                submission.request.resources.memory_bytes, DEFAULT_RESOURCES.memory_bytes,
                 "{argv}"
             );
         }

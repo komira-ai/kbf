@@ -137,9 +137,9 @@ placed there. Running leases are never stopped for it.
 Every action books one core and 1 GiB of memory on the worker it runs on, unless it
 names a size: `kbf-book-cpus=N` books `N` whole cores, and `kbf-book-mem-gib=N` books
 `N` GiB. An action that names no memory may instead book its category's memory
-([Memory by category](#memory-by-category)). `N` is written in plain digits with no leading zero: `+4` and `04` are
-refused, since each would book the same as `4` under a different action digest, and so
-miss the cache entries `4` made. Either may be given alone; the other stays at its
+([Memory by category](#memory-by-category)). `N` is written in plain digits with no
+leading zero: `+4` and `04` are refused, since each would book the same as `4` under a
+different action digest, and so miss the cache entries `4` made. Either may be given alone; the other stays at its
 default. The scheduler places the action only where that much is free, and holds it
 for the lease until the lease ends, as it does for the default booking.
 

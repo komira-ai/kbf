@@ -280,7 +280,8 @@ impl Scheduler {
     /// its CPU and GPU request, and always `ran_on`, the node its killed run used. A
     /// node that is gone does not count; `booked` when none is registered.
     fn memory_cap(&self, request: &Request, ran_on: &WorkerId, booked: u64) -> u64 {
-        self.largest_memory_with(request, Some(ran_on)).unwrap_or(booked)
+        self.largest_memory_with(request, Some(ran_on))
+            .unwrap_or(booked)
     }
 
     /// The memory of the largest node that could run `request`, in bytes: one that is
@@ -330,10 +331,18 @@ mod tests {
     #[test]
     fn a_category_raises_a_booking_up_to_the_largest_node() {
         assert_eq!(category_booking(GIB, 4 * GIB, Some(64 * GIB)), 4 * GIB);
-        assert_eq!(category_booking(GIB, 4 * GIB, Some(3 * GIB)), 3 * GIB, "the cap");
+        assert_eq!(
+            category_booking(GIB, 4 * GIB, Some(3 * GIB)),
+            3 * GIB,
+            "the cap"
+        );
         assert_eq!(category_booking(GIB, 4 * GIB, None), 4 * GIB, "no node yet");
         assert_eq!(category_booking(8 * GIB, 4 * GIB, Some(64 * GIB)), 8 * GIB);
-        assert_eq!(category_booking(2 * GIB, 4 * GIB, Some(GIB)), 2 * GIB, "never lower");
+        assert_eq!(
+            category_booking(2 * GIB, 4 * GIB, Some(GIB)),
+            2 * GIB,
+            "never lower"
+        );
     }
 
     /// Catches a ladder that does not double (1 -> 3, or 1 -> 1), one that does not

@@ -674,7 +674,10 @@ impl<M: MetaLog, O: ObjectStore + 'static> Dispatch for Farm<M, O> {
             .as_deref()
             .and_then(|c| self.memory_by_category.get(c));
         if let Some(ask) = ask {
-            tracing::trace!(ask, "category booking not applied");
+            let request = &mut submission.request;
+            let largest = state.sched.largest_memory(request);
+            let memory = &mut request.resources.memory_bytes;
+            *memory = kbf_sched::category_booking(*memory, ask, largest);
         }
         let action = submission.request.key.action;
         let instance = submission.request.key.instance.clone();

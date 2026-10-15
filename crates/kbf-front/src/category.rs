@@ -182,12 +182,22 @@ mod tests {
             ("a=".to_owned(), size("")),
             (format!("a={too_much}"), size(&too_much)),
             ("=4".to_owned(), CategoryTableError::Name(String::new())),
-            ("a b=4".to_owned(), CategoryTableError::Name("a b".to_owned())),
+            (
+                "a b=4".to_owned(),
+                CategoryTableError::Name("a b".to_owned()),
+            ),
             ("a".to_owned(), CategoryTableError::Entry("a".to_owned())),
             ("a=4,".to_owned(), CategoryTableError::Entry(String::new())),
-            ("a=4,a=8".to_owned(), CategoryTableError::Repeated("a".to_owned())),
+            (
+                "a=4,a=8".to_owned(),
+                CategoryTableError::Repeated("a".to_owned()),
+            ),
         ] {
-            assert_eq!(text.parse::<MemoryByCategory>(), Err(want.clone()), "{text}");
+            assert_eq!(
+                text.parse::<MemoryByCategory>(),
+                Err(want.clone()),
+                "{text}"
+            );
             assert!(!want.to_string().is_empty());
         }
         assert!(format!("a={max}").parse::<MemoryByCategory>().is_ok());
