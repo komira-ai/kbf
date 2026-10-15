@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 
 use kbf_types::{ControlRecord, Effect, LeaseId, OperationId, WorkerId};
 
-use super::{Axes, Checker, Held, State, add, fits_beside, fits_whole, queue_key};
+use super::{Checker, Held, Room, State, add, exclusive, fits_beside, fits_whole, queue_key};
 
 /// At most this many grants per round: the catalog's number, written here rather than
 /// read from `kbf_sched::PLACEMENT_ROUND`, so that a change to the constant is caught.
@@ -63,9 +63,17 @@ impl Checker {
             .filter(|n| self.live(n) && !self.cordoned.contains(*n))
             .cloned()
             .collect();
-        let mut booked: BTreeMap<WorkerId, Axes> = names
+        let mut booked: BTreeMap<WorkerId, Room> = names
             .iter()
-            .map(|n| (n.clone(), self.workers[n].booked))
+            .map(|n| {
+                let w = &self.workers[n];
+                let room = Room {
+                    booked: w.booked,
+                    leases: w.leases,
+                    whole: w.whole,
+                };
+                (n.clone(), room)
+            })
             .collect();
         let mut expected = Vec::new();
         let mut verdicts = Vec::new();
@@ -82,15 +90,18 @@ impl Checker {
                     }
                     if fits_whole(cap, res)
                         && !fits_beside(cap, booked[name], res)
-                        && (0..3).any(|i| booked[name][i] > cap[i])
+                        && [0, 2].iter().any(|&i| booked[name].booked[i] > cap[i])
                         && self.matches(need, name)
                     {
                         self.stats.overbooked_skips += 1;
                     }
                 }
                 if let Some(name) = placed {
+                    let cap = self.workers[&name].capacity;
                     let b = booked.get_mut(&name).expect("live");
-                    *b = add(*b, res);
+                    b.booked = add(b.booked, res);
+                    b.leases += 1;
+                    b.whole |= exclusive(cap, res);
                     expected.push((id, name));
                     verdicts.push((id, Verdict::Servable));
                     continue;
@@ -214,8 +225,13 @@ impl Checker {
                     &format!("{} granted to unregistered {}", g.lease, g.worker),
                 );
             };
+            let room = Room {
+                booked: w.booked,
+                leases: w.leases,
+                whole: w.whole,
+            };
             let (cap, booked, res, need) = (w.capacity, w.booked, op.resources, op.need);
-            self.ensure(fits_beside(cap, booked, res), "I6", || {
+            self.ensure(fits_beside(cap, room, res), "I6", || {
                 format!(
                     "{} of {} ({res:?}) to {} with {booked:?} booked of {cap:?}",
                     g.lease, g.operation, g.worker
@@ -273,7 +289,9 @@ impl Checker {
         op.told = None;
         op.since = None;
         let w = self.workers.get_mut(worker).expect("registered");
+        w.whole |= exclusive(w.capacity, op.resources);
         w.booked = add(w.booked, op.resources);
+        w.leases += 1;
         self.held.insert(
             lease,
             Held {

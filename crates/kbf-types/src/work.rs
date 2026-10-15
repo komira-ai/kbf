@@ -105,6 +105,16 @@ impl Resources {
         Self { vms, ..self }
     }
 
+    /// `self` with no memory: the vector admission compares an action's request on, since
+    /// an action's memory is the limit it first runs under, not a booking.
+    #[must_use]
+    pub const fn without_memory(self) -> Self {
+        Self {
+            memory_bytes: 0,
+            ..self
+        }
+    }
+
     /// Whether `request` fits in `self` on every axis.
     #[must_use]
     pub const fn fits(&self, request: &Self) -> bool {
@@ -419,6 +429,16 @@ mod tests {
         assert!(free.fits(&Resources::new(4_000, 8 << 30)));
         assert!(!free.fits(&Resources::new(4_001, 1)));
         assert!(!free.fits(&Resources::new(1, (8 << 30) + 1)));
+    }
+
+    /// Catches: `without_memory` that zeroes another axis, or leaves the memory.
+    #[test]
+    fn without_memory_zeroes_only_memory() {
+        let r = Resources::new(2_000, 4 << 30).with_gpus(1).with_vms(2);
+        assert_eq!(
+            r.without_memory(),
+            Resources::new(2_000, 0).with_gpus(1).with_vms(2)
+        );
     }
 
     /// Catches: a fit test that ignores GPUs, which would place a GPU action on a node
