@@ -21,6 +21,20 @@
 //!   farm time is before `until` skips the directory without reading or asking. At or
 //!   after `until` it checks again, and touches again. A directory resting on a skipped
 //!   subtree gets the earlier of its own `until` and the subtree's.
+//! - **The loss count it was verified at.** The guarantee above is about collection.
+//!   It does not cover an object marked unreachable (a read found it gone or damaged):
+//!   its blobs are held and reachable until the mark, and FindMissingBlobs lists them
+//!   after it, so an Execute scheduled on a skipped subtree would fail to read an input
+//!   and the client would not be told to upload it. [`kbf_meta::MetaState::losses`]
+//!   counts the objects that newly became unreachable; a verification records the count
+//!   its check began at, and a skip needs the count to be the same when the request begins. Any
+//!   new mark therefore sends the next check of every subtree through the full walk
+//!   once (from the decoded directories, touching and asking as usual, which records
+//!   the new count). A mark is rare, so one object marked costs one re-walk of each
+//!   tree in use, not a read of the store; no reverse index from objects to subtrees is
+//!   kept, because it would be a second index of the blob locations to keep in step
+//!   with the first. A single flight is shared only between requests that began at the
+//!   same count, for the same reason.
 //!
 //! The guarantee is the process's own: the pending touches that pin a blob live in this
 //! cache, and a restart forgets both memories together.
@@ -94,11 +108,19 @@ impl Decoded {
     }
 }
 
+/// That a directory and everything under it was found held, and when.
+#[derive(Clone, Copy, Debug)]
+struct Verified {
+    until: FarmTime,
+    /// [`kbf_meta::MetaState::losses`] when the check began.
+    losses: u64,
+}
+
 #[derive(Debug)]
 struct Entry {
     decoded: Arc<Decoded>,
     cost: u64,
-    verified_until: Option<FarmTime>,
+    verified: Option<Verified>,
     /// Position in the recency order.
     used: u64,
 }
@@ -130,14 +152,14 @@ impl Lru {
         self.tick
     }
 
-    /// The directory and its verified-until, now the most recently used.
-    fn get(&mut self, digest: &Digest) -> Option<(Arc<Decoded>, Option<FarmTime>)> {
+    /// The directory and its verification, now the most recently used.
+    fn get(&mut self, digest: &Digest) -> Option<(Arc<Decoded>, Option<Verified>)> {
         let tick = self.next_tick();
         let entry = self.entries.get_mut(digest)?;
         self.order.remove(&entry.used);
         entry.used = tick;
         self.order.insert(tick, *digest);
-        Some((Arc::clone(&entry.decoded), entry.verified_until))
+        Some((Arc::clone(&entry.decoded), entry.verified))
     }
 
     /// Keeps `decoded` as the most recently used entry, unless it alone costs more
@@ -159,7 +181,7 @@ impl Lru {
             Entry {
                 decoded,
                 cost,
-                verified_until: None,
+                verified: None,
                 used,
             },
         );
@@ -187,12 +209,22 @@ impl Lru {
         }
     }
 
-    /// Records that `digest` was verified until `until`, never lowering an earlier
-    /// record. A directory no longer kept is not recorded.
-    fn verified(&mut self, digest: &Digest, until: FarmTime) {
-        if let Some(entry) = self.entries.get_mut(digest) {
-            entry.verified_until = Some(entry.verified_until.map_or(until, |was| was.max(until)));
-        }
+    /// Records that `digest` was verified until `until` by a check that began at loss
+    /// count `losses`. A record of the same count is never lowered; one of an older
+    /// count is replaced; one of a newer count (a check that ended late) is kept. A
+    /// directory no longer kept is not recorded.
+    fn verified(&mut self, digest: &Digest, until: FarmTime, losses: u64) {
+        let Some(entry) = self.entries.get_mut(digest) else {
+            return;
+        };
+        entry.verified = Some(match entry.verified {
+            Some(was) if was.losses > losses => was,
+            Some(was) if was.losses == losses => Verified {
+                until: was.until.max(until),
+                losses,
+            },
+            _ => Verified { until, losses },
+        });
     }
 }
 
@@ -200,8 +232,9 @@ impl Lru {
 #[derive(Debug)]
 pub(crate) struct InputTrees {
     lru: Mutex<Lru>,
-    /// Directories being checked now, for any request.
-    flights: Mutex<HashMap<Digest, Flight>>,
+    /// Directories being checked now, for any request, by the loss count the checking
+    /// request began at.
+    flights: Mutex<HashMap<(Digest, u64), Flight>>,
     reads: Semaphore,
 }
 
@@ -219,7 +252,7 @@ impl InputTrees {
         self.lru.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn flights(&self) -> std::sync::MutexGuard<'_, HashMap<Digest, Flight>> {
+    fn flights(&self) -> std::sync::MutexGuard<'_, HashMap<(Digest, u64), Flight>> {
         self.flights.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
@@ -258,18 +291,20 @@ struct Walk<M, O> {
     dirs_read: AtomicU64,
     now: FarmTime,
     until: FarmTime,
+    /// [`kbf_meta::MetaState::losses`] when the request began.
+    losses: u64,
     memo: Mutex<HashMap<Digest, Flight>>,
 }
 
 /// Removes a directory's flight when its check ends, however it ends (a panic too).
 struct Done<'a> {
     trees: &'a InputTrees,
-    digest: Digest,
+    key: (Digest, u64),
 }
 
 impl Drop for Done<'_> {
     fn drop(&mut self) {
-        self.trees.flights().remove(&self.digest);
+        self.trees.flights().remove(&self.key);
     }
 }
 
@@ -291,12 +326,13 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
     /// started read from the store (a check another request started and this one
     /// joined is counted for that request).
     pub(crate) async fn walk_inputs(self: &Arc<Self>, root: Digest) -> Result<Walked, CacheError> {
-        let (now, until) = self.retention_horizon().await?;
+        let Horizon { now, until, losses } = self.retention_horizon().await?;
         let walk = Arc::new(Walk {
             cache: Arc::clone(self),
             dirs_read: AtomicU64::new(0),
             now,
             until,
+            losses,
             memo: Mutex::new(HashMap::new()),
         });
         let answer = visit(&walk, root).await;
@@ -310,6 +346,16 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
             dirs_read: walk.dirs_read.load(Ordering::Relaxed),
         })
     }
+}
+
+/// The metadata state a request reads before its first report.
+pub(crate) struct Horizon {
+    /// The farm time now.
+    pub(crate) now: FarmTime,
+    /// The farm time until which a blob reported held now stays held.
+    pub(crate) until: FarmTime,
+    /// [`kbf_meta::MetaState::losses`].
+    pub(crate) losses: u64,
 }
 
 /// What one walk of an input tree found.
@@ -332,15 +378,17 @@ fn visit<M: MetaLog, O: ObjectStore>(walk: &Arc<Walk<M, O>>, digest: Digest) -> 
     if let Some(flight) = memo.get(&digest) {
         return flight.clone();
     }
-    let verified = trees.lru().get(&digest).and_then(|(_, until)| until);
-    if let Some(until) = verified.filter(|until| *until > walk.now) {
+    let verified = trees.lru().get(&digest).and_then(|(_, verified)| verified);
+    let skippable = verified.filter(|v| v.until > walk.now && v.losses == walk.losses);
+    if let Some(Verified { until, .. }) = skippable {
         metrics.input_dirs_skipped.add(1);
         let flight = answered(Verdict::Held { until });
         memo.insert(digest, flight.clone());
         return flight;
     }
     let mut flights = trees.flights();
-    if let Some(flight) = flights.get(&digest) {
+    let key = (digest, walk.losses);
+    if let Some(flight) = flights.get(&key) {
         metrics.input_dirs_joined.add(1);
         memo.insert(digest, flight.clone());
         return flight.clone();
@@ -352,7 +400,7 @@ fn visit<M: MetaLog, O: ObjectStore>(walk: &Arc<Walk<M, O>>, digest: Digest) -> 
     let task = tokio::spawn(async move {
         let _done = Done {
             trees: owned.cache.input_trees(),
-            digest,
+            key,
         };
         Arc::new(check(&owned, digest).await)
     });
@@ -365,7 +413,7 @@ fn visit<M: MetaLog, O: ObjectStore>(walk: &Arc<Walk<M, O>>, digest: Digest) -> 
     }
     .boxed()
     .shared();
-    flights.insert(digest, flight.clone());
+    flights.insert(key, flight.clone());
     memo.insert(digest, flight.clone());
     flight
 }
@@ -433,7 +481,10 @@ async fn check<M: MetaLog, O: ObjectStore>(
         }
     }
     if absent_dirs.is_empty() && absent_files.is_empty() {
-        cache.input_trees().lru().verified(&digest, until);
+        cache
+            .input_trees()
+            .lru()
+            .verified(&digest, until, walk.losses);
         return Ok(Verdict::Held { until });
     }
     Ok(Verdict::Absent {

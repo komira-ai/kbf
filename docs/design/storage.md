@@ -247,6 +247,15 @@ paying for the same toolchain on every action:
   With more than one server, a server's pending touches are not seen by a collection
   another server runs; the skip is then right only while no other server collects (none
   does today), and the touches would have to reach the leader first.
+- **The loss count it was verified at.** Retention does not cover an object marked
+  unreachable (a read found it gone or damaged): its blobs answer unreachable, and
+  FindMissingBlobs lists them, long before `until`. The metadata state counts the objects
+  that newly became unreachable; a verification records the count its check began at, and
+  a skip needs the same count when the request begins. One new mark therefore sends the
+  next check of each tree through the full walk once, from the decoded directories (no
+  store read; every blob touched and asked about), which records the new count. No
+  index from objects to the trees they hold is kept. A single flight is shared only
+  between requests that began at the same count.
 
 Subdirectories are checked concurrently, with at most
 `--input-tree-reads-in-flight` store reads at once across all requests. A directory

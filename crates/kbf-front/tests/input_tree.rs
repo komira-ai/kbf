@@ -117,6 +117,11 @@ impl ObjectStore for Counting {
 struct Flaky {
     inner: MemoryMetaLog,
     queries_left: AtomicUsize,
+    /// Queries to let through before the one that is held (`usize::MAX`: none held).
+    hold_after: AtomicUsize,
+    /// A permit when a query is held, and one for each query to let go.
+    held: tokio::sync::Semaphore,
+    release: tokio::sync::Semaphore,
 }
 
 impl Flaky {
@@ -124,7 +129,24 @@ impl Flaky {
         Self {
             inner: MemoryMetaLog::new(Retention::default()),
             queries_left: AtomicUsize::new(usize::MAX),
+            hold_after: AtomicUsize::new(usize::MAX),
+            held: tokio::sync::Semaphore::new(0),
+            release: tokio::sync::Semaphore::new(0),
         }
+    }
+
+    /// The query after the next `n` is computed at once, but its answer is held back
+    /// (a slow reply) until [`Flaky::let_go`]; [`Flaky::wait_held`] says it is held.
+    fn hold_after(&self, n: usize) {
+        self.hold_after.store(n, Ordering::SeqCst);
+    }
+
+    async fn wait_held(&self) {
+        self.held.acquire().await.expect("open").forget();
+    }
+
+    fn let_go(&self) {
+        self.release.add_permits(1);
     }
 
     /// The next `n` queries answer; every one after that fails.
@@ -150,7 +172,19 @@ impl MetaLog for Flaky {
         if left != usize::MAX {
             self.queries_left.store(left - 1, Ordering::SeqCst);
         }
-        self.inner.query(f).await
+        let hold = self.hold_after.load(Ordering::SeqCst);
+        if hold == usize::MAX {
+            return self.inner.query(f).await;
+        }
+        if hold > 0 {
+            self.hold_after.store(hold - 1, Ordering::SeqCst);
+            return self.inner.query(f).await;
+        }
+        self.hold_after.store(usize::MAX, Ordering::SeqCst);
+        let answer = self.inner.query(f).await;
+        self.held.add_permits(1);
+        self.release.acquire().await.expect("open").forget();
+        answer
     }
 }
 
@@ -751,4 +785,159 @@ async fn futures_join<F: std::future::Future>(
     futures: impl IntoIterator<Item = F>,
 ) -> Vec<F::Output> {
     futures::future::join_all(futures).await
+}
+
+/// The store objects `put` made since `before`, in key order.
+async fn objects_since(store: &Counting, before: &[ObjectKey]) -> Vec<ObjectKey> {
+    objects(store)
+        .await
+        .into_iter()
+        .filter(|k| !before.contains(k))
+        .collect()
+}
+
+/// Uploads `blobs` as their own segment, and loses that segment: the store forgets it
+/// and a read of the first blob marks its object unreachable, as a real read would.
+async fn lose_object_of(cache: &TestCache, store: &Counting, blobs: &[&Blob]) {
+    let before = objects(store).await;
+    put(cache, blobs).await;
+    let made = objects_since(store, &before).await;
+    assert_eq!(made.len(), 1, "one segment per upload");
+    store.store().delete(&made[0]).await.expect("deleted");
+    let err = cache.read_blob(&blobs[0].digest).await.unwrap_err();
+    assert!(matches!(err, CacheError::Unreachable(_)), "{err:?}");
+}
+
+/// The hole a verification must not open: a tree verified, then one of its files lost
+/// (the store forgot its segment, a read found out and marked the object). FindMissing
+/// lists the file, so the check must too, well inside the verification's time, or the
+/// Execute is scheduled on an input nobody can read and the client is never told to
+/// upload it.
+///
+/// Catches: a skip that ignores objects marked unreachable since the verification (the
+/// pre-fix behavior: red at the last assertion with an empty list), and a mark that is
+/// not counted when the object is found gone.
+#[tokio::test]
+async fn a_file_lost_after_its_tree_was_verified_is_reported() {
+    let (cache, store) = cache().await;
+    let tool = toolchain();
+    let source = file("main.c");
+    let root = root_over(&tool, &source);
+    let compiler = &tool.blobs[0];
+    // The compiler in a segment of its own, so losing it loses nothing else.
+    let others: Vec<&Blob> = tool.blobs.iter().skip(1).collect();
+    put(&cache, &others).await;
+    put(&cache, &[&source, &root]).await;
+    let before = objects(&store).await;
+    put(&cache, &[compiler]).await;
+    let made = objects_since(&store, &before).await;
+    assert_eq!(made.len(), 1);
+
+    assert!(walk(&cache, &root).await.is_empty());
+    assert_eq!(
+        cache.find_missing(&[compiler.digest]).await.expect("find"),
+        []
+    );
+
+    store.store().delete(&made[0]).await.expect("deleted");
+    let err = cache.read_blob(&compiler.digest).await.unwrap_err();
+    assert!(matches!(err, CacheError::Unreachable(_)), "{err:?}");
+    assert_eq!(
+        cache.find_missing(&[compiler.digest]).await.expect("find"),
+        [compiler.digest],
+        "FindMissing lists the lost file"
+    );
+
+    assert_eq!(
+        walk(&cache, &root).await,
+        [compiler.digest],
+        "the verification of the root ended with the loss"
+    );
+}
+
+/// A mark unrelated to a tree ends its verification once, and only once: the next check
+/// walks it from memory (no store read, every blob looked at and touched), records the
+/// new loss count, and the check after that skips again. Marks that change no answer
+/// (a read of the object already marked) cost nothing.
+///
+/// Catches: a skip that never revalidates after any mark (the hole), a verification
+/// that stays ended after the re-walk (a count read at the wrong moment, or never
+/// recorded), a count that rises on every failed read, not on a new loss.
+#[tokio::test]
+async fn an_unrelated_loss_costs_one_walk_and_no_reads() {
+    let (cache, store) = cache().await;
+    let tool = toolchain();
+    let source = file("main.c");
+    let root = root_over(&tool, &source);
+    let unrelated = file("elsewhere");
+    put(&cache, &tool.blobs.iter().collect::<Vec<_>>()).await;
+    put(&cache, &[&source, &root]).await;
+
+    assert!(walk(&cache, &root).await.is_empty());
+    assert!(walk(&cache, &root).await.is_empty());
+    assert_eq!(skipped(&cache), 1, "unchanged count: skipped");
+
+    lose_object_of(&cache, &store, &[&unrelated]).await;
+    store.reset();
+    assert!(walk(&cache, &root).await.is_empty());
+    assert_eq!(skipped(&cache), 1, "the mark ended the verification");
+    assert_eq!(cached(&cache), 4, "the whole tree is checked, from memory");
+    assert_eq!(store.gets(), 0, "and nothing is read");
+
+    assert!(walk(&cache, &root).await.is_empty());
+    assert_eq!(skipped(&cache), 2, "verified again at the new count");
+
+    // The object is already marked: reading it again commits nothing new.
+    let err = cache.read_blob(&unrelated.digest).await.unwrap_err();
+    assert!(matches!(err, CacheError::Unreachable(_)), "{err:?}");
+    assert!(walk(&cache, &root).await.is_empty());
+    assert_eq!(skipped(&cache), 3, "a repeat of the mark changes nothing");
+}
+
+/// Two requests share one check of a directory only if they began at the same loss
+/// count. A check that asked about a file before the loss, answered late, must not be
+/// the answer of a request that began after it.
+///
+/// Catches: a flight keyed by the directory alone (the second request is told the file
+/// is held, red with an empty list).
+#[tokio::test]
+async fn a_request_after_a_loss_does_not_join_a_check_from_before() {
+    let (cache, store) = cache().await;
+    let compiler = file("cc");
+    let root = dir(&[&compiler], &[]);
+    put(&cache, &[&root]).await;
+    let before = objects(&store).await;
+    put(&cache, &[&compiler]).await;
+    let made = objects_since(&store, &before).await;
+    assert!(walk(&cache, &root).await.is_empty());
+    // Past the verification, so the next request checks the root (from memory).
+    cache.tick(days(8)).await.expect("tick");
+
+    // The next request: horizon, then the root's blob, then the compiler. Its question
+    // about the compiler is answered at once and the answer is held back.
+    cache.meta().hold_after(2);
+    let slow = tokio::spawn({
+        let cache = Arc::clone(&cache);
+        let digest = root.digest;
+        async move { cache.missing_inputs(digest).await }
+    });
+    cache.meta().wait_held().await;
+
+    store.store().delete(&made[0]).await.expect("deleted");
+    let err = cache.read_blob(&compiler.digest).await.unwrap_err();
+    assert!(matches!(err, CacheError::Unreachable(_)), "{err:?}");
+    let late = tokio::spawn({
+        let cache = Arc::clone(&cache);
+        let digest = root.digest;
+        async move { cache.missing_inputs(digest).await }
+    });
+    for _ in 0..50 {
+        tokio::task::yield_now().await;
+    }
+    cache.meta().let_go();
+    assert_eq!(
+        late.await.expect("joined").expect("walked"),
+        [compiler.digest]
+    );
+    slow.await.expect("joined").expect("walked");
 }

@@ -20,7 +20,7 @@ use kbf_types::{Digest, FarmTime};
 use prost::Message;
 use tonic::Status;
 
-use crate::input_tree::{InputTreeConfig, InputTrees};
+use crate::input_tree::{Horizon, InputTreeConfig, InputTrees};
 use crate::meta_log::{MemoryMetaLog, MetaLog, MetaLogError};
 use crate::metrics::CacheMetrics;
 use crate::{MAX_BLOB_BYTES, wire};
@@ -242,12 +242,16 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         &self.trees
     }
 
-    /// The farm time now, and the farm time until which a blob reported held now stays
-    /// held: now plus the retention's `min_ttl`.
-    pub(crate) async fn retention_horizon(&self) -> Result<(FarmTime, FarmTime), CacheError> {
+    /// The farm time now, the farm time until which a blob reported held now stays
+    /// held (now plus the retention's `min_ttl`), and the count of objects lost so far.
+    pub(crate) async fn retention_horizon(&self) -> Result<Horizon, CacheError> {
         Ok(self
             .writer
-            .query(|s| (s.now(), s.now().saturating_add(s.retention().min_ttl)))
+            .query(|s| Horizon {
+                now: s.now(),
+                until: s.now().saturating_add(s.retention().min_ttl),
+                losses: s.losses(),
+            })
             .await?)
     }
 
