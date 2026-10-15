@@ -20,7 +20,7 @@
 //! A cache that cannot be used never stops the daemon: it warns with the reason
 //! (`cache: off:<reason>`) and runs uncached.
 
-use std::os::unix::fs::DirBuilderExt as _;
+use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 
 use kbf_threads::disk::{FreeSpace, Space, keep_free, percent_of};
@@ -35,6 +35,10 @@ const DATA_MODE: u32 = 0o755;
 
 /// The mode of `leases` and `cache`: the daemon's alone.
 const PRIVATE_MODE: u32 = 0o700;
+
+/// The mode of `leases` under the OCI backend: its container ids are "others" to the
+/// daemon and must search down to the lease directories.
+const OPEN_MODE: u32 = 0o711;
 
 /// The cache's share of what [`Budgets`] sizes from, in percent; the trees' is a
 /// quarter. The rest stays for the leases.
@@ -118,7 +122,6 @@ pub(crate) struct Plan {
     /// The budgets; `None` for a filesystem too small for a cache.
     pub budgets: Option<Budgets>,
     /// Whether `leases` is searchable by others (the OCI backend).
-    #[allow(dead_code)] // read by the fix
     pub open_leases: bool,
 }
 
@@ -194,17 +197,43 @@ impl Plan {
         self.dir.join("trees")
     }
 
-    /// Makes the data directory (0755) and `leases` (0700), and `cache` (0700) for a
-    /// driver that uses it. `trees` is made by its store, with its own mode. A directory
-    /// that exists keeps its mode.
+    /// Makes the data directory (0755) and `leases` (0700; 0711 with the OCI backend), and
+    /// `cache` (0700) for a driver that uses it. `trees` is made by its store, with its
+    /// own mode. A directory that exists keeps its mode, except that an existing `leases`
+    /// closed to others is opened (0711) under the OCI backend, logged once.
     ///
     /// # Errors
     /// A directory cannot be made.
     pub(crate) fn create(&self) -> Result<(), DataDirError> {
         make(&self.dir, DATA_MODE)?;
-        make(&self.leases(), PRIVATE_MODE)?;
+        if self.open_leases {
+            make(&self.leases(), OPEN_MODE)?;
+            self.open_existing_leases()?;
+        } else {
+            make(&self.leases(), PRIVATE_MODE)?;
+        }
         if self.cached {
             make(&self.cache(), PRIVATE_MODE)?;
+        }
+        Ok(())
+    }
+
+    /// Opens a `leases` that an earlier start made 0700: adds search for group and others.
+    fn open_existing_leases(&self) -> Result<(), DataDirError> {
+        let leases = self.leases();
+        let fail = |source| DataDirError::Make {
+            dir: leases.clone(),
+            source,
+        };
+        let mode = std::fs::metadata(&leases).map_err(fail)?.permissions().mode() & 0o7777;
+        if mode & 0o001 == 0 {
+            std::fs::set_permissions(&leases, std::fs::Permissions::from_mode(mode | 0o011))
+                .map_err(fail)?;
+            tracing::info!(
+                "data dir: {} was {mode:o}, now {:o}: the OCI backend's container ids must search it",
+                leases.display(),
+                mode | 0o011
+            );
         }
         Ok(())
     }
