@@ -27,6 +27,10 @@
 //! empty) before anything is bound, and writes objects under the prefix the log
 //! committed; a directory it refuses exits 2.
 //!
+//! `--blob-dir` keeps blob bytes in a local directory (`kbf_objstore::FsStore`) in place
+//! of `--store`, under the fixed key prefix `kbf/<log id>/`; it needs `--meta-log=raft`. A directory that cannot be created or
+//! locked (another server has it open) exits 2 before anything is bound.
+//!
 //! `--write-tier-dir` attaches the local write tier before anything is bound
 //! (`kbf_server::write_tier`), over either metadata log: under `--meta-log=raft` it
 //! first raises the log to machine version 2 (once; a server without a tier never
@@ -38,6 +42,7 @@ use std::error::Error;
 use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
+use std::path::Path;
 use std::process::ExitCode;
 use std::sync::Arc;
 
@@ -45,7 +50,7 @@ use clap::Parser;
 use kbf_front::{Cache, MemoryMetaLog};
 use kbf_log::FarmLogId;
 use kbf_meta::Retention;
-use kbf_objstore::{Capabilities, KeyPrefix, MemoryStore, ObjectStore};
+use kbf_objstore::{Capabilities, FsStore, KeyPrefix, MemoryStore, ObjectStore};
 use kbf_server::write_tier::{FLUSH_EVERY, TierLog};
 use kbf_server::{Args, RaftMetaLog, SERVER_VERSION, StoreKind, bind_server_with_policy};
 use kbf_threads::Topology;
@@ -79,23 +84,46 @@ fn sizes_on(args: &Args, topology: Topology) -> kbf_threads::Sizes {
 /// Builds the object store and the metadata log the flags name, then serves.
 async fn start(args: &Args) -> Result<(), Box<dyn Error>> {
     let raft_dir = args.raft_dir()?;
-    let memory = || MemoryMetaLog::new(Retention::default());
-    match args.store {
-        StoreKind::Memory => {
-            let store = MemoryStore::new(Capabilities::default());
-            run(args, memory(), store, KeyPrefix::default(), None).await
+    match (args.blob_dir.as_deref(), args.store) {
+        (Some(dir), _) => {
+            let store = FsStore::open(dir, args.blob_dir_min_free_bytes)?;
+            over(args, raft_dir, store, KeyPrefix::default(), BLOB_DIR_PREFIX).await
         }
-        StoreKind::S3 => {
+        (None, StoreKind::Memory) => {
+            let store = MemoryStore::new(Capabilities::default());
+            let memory = MemoryMetaLog::new(Retention::default());
+            run(args, memory, store, KeyPrefix::default(), None).await
+        }
+        (None, StoreKind::S3) => {
             let (store, start_prefix) = args.s3_store(|name| std::env::var(name).ok())?;
-            match raft_dir {
-                None => run(args, memory(), store, start_prefix, None).await,
-                Some(dir) => {
-                    let log =
-                        RaftMetaLog::open_dir(dir, Retention::default(), &args.s3_prefix).await?;
-                    let (prefix, id) = (log.store_prefix(), log.log_id());
-                    run(args, log, store, prefix, Some(id)).await
-                }
-            }
+            over(args, raft_dir, store, start_prefix, &args.s3_prefix).await
+        }
+    }
+}
+
+/// The key prefix root under `--blob-dir`: objects go under `kbf/<log id>/`.
+const BLOB_DIR_PREFIX: &str = "kbf/";
+
+/// Serves `store` under the metadata log `raft_dir` names: the Raft log there, writing
+/// under the prefix it committed (`<prefix_root><log id>/` for a new log), or without
+/// one a log in memory, writing under `start_prefix`. (`Args::raft_dir` refuses
+/// `--blob-dir` without a Raft log.)
+async fn over<O: ObjectStore + 'static>(
+    args: &Args,
+    raft_dir: Option<&Path>,
+    store: O,
+    start_prefix: KeyPrefix,
+    prefix_root: &str,
+) -> Result<(), Box<dyn Error>> {
+    match raft_dir {
+        None => {
+            let memory = MemoryMetaLog::new(Retention::default());
+            run(args, memory, store, start_prefix, None).await
+        }
+        Some(dir) => {
+            let log = RaftMetaLog::open_dir(dir, Retention::default(), prefix_root).await?;
+            let (prefix, id) = (log.store_prefix(), log.log_id());
+            run(args, log, store, prefix, Some(id)).await
         }
     }
 }

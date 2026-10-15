@@ -34,7 +34,7 @@ pub enum Role {
     All,
 }
 
-/// Where blob bytes go.
+/// Where blob bytes go, unless `--blob-dir` names a local directory.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum StoreKind {
     /// In this process; gone when it exits.
@@ -51,7 +51,8 @@ pub enum MetaLogKind {
     /// In this process; a restart forgets it.
     Memory,
     /// A single-voter Raft log in `--raft-dir` ([`crate::raft_log`]); a restart keeps
-    /// it. Needs `--store=s3`: the bytes it indexes must outlive the process too.
+    /// it. Needs `--store=s3` or `--blob-dir`: the bytes it indexes must outlive the
+    /// process too.
     Raft,
 }
 
@@ -66,7 +67,7 @@ pub struct Args {
     /// The roles to run.
     #[arg(long, value_enum, default_value = "all")]
     pub role: Role,
-    /// Where blob bytes are stored.
+    /// Where blob bytes are stored. `--blob-dir` stores them in a local directory instead.
     #[arg(long, value_enum, default_value = "memory")]
     pub store: StoreKind,
     /// Where the metadata (the CAS index and the action cache) is kept.
@@ -220,6 +221,20 @@ pub struct Args {
     /// that began it closes; one that is committing is kept until its commit ends.
     #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u64).range(1..))]
     pub segment_upload_idle_secs: u64,
+    /// Stores blob bytes in this directory on the local disk, in place of `--store`
+    /// (`kbf_objstore::FsStore`): created if missing, locked while the server runs (a
+    /// second server on it is refused), and kept across restarts. Needs
+    /// `--meta-log=raft`, which keeps the index of what it holds; objects are keyed
+    /// under `kbf/<log id>/` (fixed: `--s3-prefix` is refused with it). Nothing reads
+    /// the directory at start; a lost or damaged object is found when it is read, or
+    /// before an action-cache hit that needs it is served (a miss). No eviction: the
+    /// directory grows with every blob written.
+    #[arg(long, conflicts_with_all = ["store", "s3_endpoint", "s3_bucket", "s3_prefix"])]
+    pub blob_dir: Option<PathBuf>,
+    /// The free bytes `--blob-dir`'s file system must keep: a write that would leave
+    /// less is refused (the upload is answered UNAVAILABLE), since nothing is evicted.
+    #[arg(long, value_name = "BYTES", default_value_t = 1 << 30, requires = "blob_dir")]
+    pub blob_dir_min_free_bytes: u64,
     /// `http://host[:port]` of the S3 service (`--store=s3`).
     #[arg(long, required_if_eq("store", "s3"))]
     pub s3_endpoint: Option<String>,
@@ -229,10 +244,10 @@ pub struct Args {
     /// The signing region.
     #[arg(long, default_value = "us-east-1")]
     pub s3_region: String,
-    /// The key prefix. Under `--meta-log=memory` each start writes under
-    /// `<prefix><start time>/`; under `--meta-log=raft` every start writes under
-    /// `<prefix><log id>/`, fixed when the log is created (a later start with another
-    /// prefix is refused).
+    /// The key prefix (`--store=s3`; refused with `--blob-dir`). Under `--meta-log=memory`
+    /// each start writes under `<prefix><start time>/`; under `--meta-log=raft` every
+    /// start writes under `<prefix><log id>/`, fixed when the log is created (a later
+    /// start with another prefix is refused).
     #[arg(long, default_value = "kbf/")]
     pub s3_prefix: String,
     /// The slowest rate, in bytes a second, a request body may reach the store at
@@ -335,11 +350,18 @@ pub enum ConfigError {
          a segment upload holds its ranges in memory under that bound"
     )]
     SegmentUploadOverWriteBound { cap: u64, bound: u64 },
-    /// `--meta-log=raft` with `--store=memory`.
+    /// `--meta-log=raft` with `--store=memory` and no `--blob-dir`.
     #[error(
-        "--meta-log=raft needs --store=s3: a durable index over blobs that die with the process"
+        "--meta-log=raft needs --store=s3 or --blob-dir: a durable index over blobs that die \
+         with the process"
     )]
-    RaftWithoutS3,
+    RaftWithoutDurableStore,
+    /// `--blob-dir` under `--meta-log=memory`.
+    #[error(
+        "--blob-dir needs --meta-log=raft: an index in memory forgets every blob at a \
+         restart, and nothing would delete their files"
+    )]
+    BlobDirWithoutRaft,
     /// `--raft-dir` without `--meta-log=raft`.
     #[error("--raft-dir is read only with --meta-log=raft")]
     RaftDirUnused,
@@ -521,15 +543,20 @@ impl Args {
     /// The raft directory under `--meta-log=raft`; `None` under `--meta-log=memory`.
     ///
     /// # Errors
-    /// [`ConfigError::RaftWithoutS3`] for `--meta-log=raft --store=memory`, and
-    /// [`ConfigError::RaftDirUnused`] for a `--raft-dir` under `--meta-log=memory`.
+    /// [`ConfigError::RaftWithoutDurableStore`] for `--meta-log=raft --store=memory`
+    /// without `--blob-dir`; [`ConfigError::BlobDirWithoutRaft`] for a `--blob-dir`, and
+    /// [`ConfigError::RaftDirUnused`] for a `--raft-dir`, under `--meta-log=memory`.
     pub fn raft_dir(&self) -> Result<Option<&Path>, ConfigError> {
+        let blob_dir = self.blob_dir.is_some();
         match (self.meta_log, self.store, self.raft_dir.as_deref()) {
+            (MetaLogKind::Memory, _, _) if blob_dir => Err(ConfigError::BlobDirWithoutRaft),
             (MetaLogKind::Memory, _, None) => Ok(None),
             (MetaLogKind::Memory, _, Some(_)) => Err(ConfigError::RaftDirUnused),
-            (MetaLogKind::Raft, StoreKind::Memory, _) => Err(ConfigError::RaftWithoutS3),
+            (MetaLogKind::Raft, StoreKind::Memory, _) if !blob_dir => {
+                Err(ConfigError::RaftWithoutDurableStore)
+            }
             // clap requires `--raft-dir` with `--meta-log=raft`.
-            (MetaLogKind::Raft, StoreKind::S3, dir) => Ok(dir),
+            (MetaLogKind::Raft, _, dir) => Ok(dir),
         }
     }
 

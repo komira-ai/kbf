@@ -433,8 +433,9 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
 
     /// Answers `GetActionResult`: the result, and the digest of the ActionResult blob
     /// it was read from, if the entry passes the closure check (its result blob and
-    /// every blob it needs present and reachable) and the result blob reads back;
-    /// `None` (a miss, so the action runs again) otherwise.
+    /// every blob it needs present and reachable), the store may still hold every
+    /// object those blobs are in, and the result blob reads back; `None` (a miss, so
+    /// the action runs again) otherwise.
     ///
     /// # Errors
     /// The metadata log or the store is unavailable.
@@ -444,17 +445,22 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
     ) -> Result<Option<(Digest, reapi::ActionResult)>, CacheError> {
         let answer = self
             .touched(|s| match s.action(action) {
-                ActionAnswer::Hit { result, touch } => (Ok(result), touch),
+                ActionAnswer::Hit { result, touch } => {
+                    (Ok((result, s.stored_objects(action))), touch)
+                }
                 ActionAnswer::Miss(miss) => (Err(miss), Touch::default()),
             })
             .await?;
-        let result = match answer {
-            Ok(result) => result,
+        let (result, objects) = match answer {
+            Ok(hit) => hit,
             Err(miss) => {
                 tracing::debug!(%action, ?miss, "action cache miss");
                 return Ok(None);
             }
         };
+        if !self.store_may_hold(action, objects).await? {
+            return Ok(None);
+        }
         let bytes = match self.read_blob(&result).await {
             Ok(bytes) => bytes,
             Err(CacheError::NotFound(_) | CacheError::Unreachable(_)) => return Ok(None),
@@ -662,6 +668,28 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
             return Err(CacheError::Unreachable(*digest));
         }
         Ok(bytes)
+    }
+
+    /// Whether the store may still hold each of `objects`, the stored objects an
+    /// action-cache hit on `action` needs ([`ObjectStore::may_hold`]: a local store
+    /// checks its files, a remote one answers yes). The first it does not hold is marked
+    /// unreachable as missing, so the hit becomes a miss and FindMissing reports its
+    /// blobs, rather than the client being sent to download bytes no one has.
+    async fn store_may_hold(
+        &self,
+        action: &Digest,
+        objects: BTreeSet<ObjectId>,
+    ) -> Result<bool, CacheError> {
+        for object in objects {
+            let key = self.object_key(object)?;
+            if !self.writer.objects.may_hold(&key).await? {
+                tracing::error!(%action, %key, "an object an action-cache hit needs is gone from the store: a miss");
+                self.mark_unreachable(object, UnreachableReason::Missing)
+                    .await?;
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     async fn mark_unreachable(

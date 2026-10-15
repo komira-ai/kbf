@@ -1701,6 +1701,7 @@ dependencies = [
  "md-5",
  "reqwest",
  "roxmltree",
+ "rustix",
  "sha2 0.11.0",
  "thiserror",
  "tokio",

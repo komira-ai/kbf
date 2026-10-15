@@ -429,6 +429,26 @@ impl MetaState {
         }
     }
 
+    /// The objects in the store that hold the blobs `action`'s entry needs (its result
+    /// blob and closure), each once: a reader checks the store still has them before it
+    /// serves a hit. A blob staged on a tier is left out (the store does not hold it
+    /// yet), as is one not present. Empty without an entry.
+    #[must_use]
+    pub fn stored_objects(&self, action: &Digest) -> BTreeSet<ObjectId> {
+        self.actions
+            .get(action)
+            .into_iter()
+            .flat_map(|e| iter::once(&e.record.result).chain(e.record.closure.iter()))
+            .filter_map(|d| match self.blob(d) {
+                BlobAnswer::Present {
+                    location,
+                    staged_on: None,
+                } => Some(location.object),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// The closure check: the first needed blob that is not present and reachable.
     fn closure_check<'a>(&self, needed: impl Iterator<Item = &'a Digest>) -> Result<(), Lack> {
         for digest in needed {
