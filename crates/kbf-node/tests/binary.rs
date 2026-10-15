@@ -572,6 +572,46 @@ fn a_container_node_reports_what_its_leases_may_use() {
     );
 }
 
+/// Whatever the driver, the node reports the CPUs its leases get: the CPUs it may use
+/// minus `--reserve-cpus` (here the fake driver, which has no cgroup to limit).
+///
+/// Catches: the reserve applied only where there is a cgroup (a native node would book
+/// the whole machine, the reserve included).
+#[test]
+fn the_hello_reports_the_cpus_minus_the_reserve() {
+    let cpus = std::thread::available_parallelism().map_or(1, |n| n.get());
+    assert!(cpus >= 2, "this test needs 2 CPUs to reserve 1");
+    let dir = tls("reserve-hello");
+    let front = front::Front::start(&dir);
+    let mut child = Command::new(BIN)
+        .args([
+            format!("--server=https://127.0.0.1:{}", front.worker.port()),
+            "--tls-server-name=localhost".to_owned(),
+            format!("--ca-cert={}", dir.join("ca.pem").display()),
+            format!("--cert={}", dir.join("node.pem").display()),
+            format!("--key={}", dir.join("node.key").display()),
+            "--node-id=node-1".to_owned(),
+            "--driver=fake".to_owned(),
+            "--reserve-cpus=1".to_owned(),
+        ])
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn");
+    let session = front.session(PROMPT);
+    let hello = session.next(PROMPT);
+    stop(&mut child, libc::SIGTERM);
+    let Some(kbf_proto::worker::daemon_message::Message::Hello(hello)) = hello else {
+        panic!("expected a Hello, got {hello:?}");
+    };
+    let reported: Vec<&str> = hello
+        .capabilities
+        .iter()
+        .filter(|c| c.key == "cpus")
+        .map(|c| c.value.as_str())
+        .collect();
+    assert_eq!(reported, [(cpus - 1).to_string()]);
+}
+
 /// A container node's leases get the CPUs it may use minus `--reserve-cpus`, and the
 /// kernel is told: `actions/cpu.max` is that many CPUs of time (no pinning: no
 /// `cpuset.cpus` is written) and the `Hello` reports it as `cpus`.
