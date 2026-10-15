@@ -46,8 +46,10 @@ Bytes never enter the metadata layer; the object store never decides anything.
 - the next writer epoch.
 
 It changes only through `Command`s applied in order: `Tick`, `AllocEpoch`, `PutBlob`,
-`PutBlobs`, `PutAction`, `Touch`, `ObjectUnreachable`, `ObjectReachable`, `Collect`.
-Reads are queries against the committed state.
+`PutBlobs`, `PutAction`, `Touch`, `ObjectUnreachable`, `ObjectReachable`, `Collect`;
+the write tier's `AddTier`, `PutStaged`, `SealStaged`, `ObjectFlushed`,
+`FlushConflict` (log format 2, [write-path.md](write-path.md) section 6.5); and
+`EvictObjects` (log format 3). Reads are queries against the committed state.
 
 An object id is a writer epoch and a sequence number. `AllocEpoch` returns an epoch
 greater than every one before it; a cache takes one when it opens (`Cache::open`) and
@@ -144,6 +146,18 @@ collection removed it first.
 
 `Collect` removes every expired blob and action entry and returns what it removed,
 with the location of each blob's bytes, so their space can be accounted as dead.
+
+`EvictObjects { objects }` forgets objects the store no longer holds, whatever their
+retention: every blob whose current location is in one of them leaves the index (a
+blob healed into another object stays), then every action entry whose result or
+closure names a removed blob. It clears the objects' unreachable marks, skips staged
+objects (their only copy is a block on a tier), and raises the loss count once per
+object that held a blob, which the input-tree skip cache reads. It is one scan of the
+index and one of the action cache, on the log's apply path. It is log format 3
+(`kbf_log::Format::V3`, machine version 3, `MetaCommand` field 15): a format-1 or
+format-2 log refuses it on encode and decode. Nothing commits it yet; it is for
+eviction under disk pressure and for a start-up pass that finds index entries with no
+object behind them.
 
 Today, under `--meta-log=raft`, the server commits a `Tick` every second while the log
 is open (`raft_log::TICK`), so the metadata's farm time advances and continues across
