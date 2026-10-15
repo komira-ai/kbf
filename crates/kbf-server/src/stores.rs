@@ -392,8 +392,8 @@ impl StoreFlags<'_> {
             }
         };
         let (meta_dir, meta_in_hot) = match (self.meta_dir, &hot) {
-            (Some(dir), _) => (dir.to_owned(), false),
-            (None, Some(hot)) => (hot.dir.join(META_SUBDIR), true),
+            (_, Some(hot)) => (hot.dir.join(META_SUBDIR), true),
+            (Some(dir), None) => (dir.to_owned(), false),
             (None, None) => return Err(StoresError::NoMetaDir),
         };
         Ok(Stores {
