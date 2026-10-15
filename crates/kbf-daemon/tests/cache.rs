@@ -22,7 +22,9 @@ use std::sync::Arc;
 
 use kbf_daemon::cache::{Cache, Disabled, FIXED_MTIME, LinkMode, Point};
 use kbf_daemon::cas::CasError;
-use kbf_daemon::tree::{TreeError, materialize_cached};
+use kbf_daemon::tree::{
+    TreeError, materialize_cached, materialize_cached_phased, materialize_phased,
+};
 use support::cache_kit::{
     CountingCas, FakeClock, Gates, config, digest, entries, entry_path, file, key, lease,
     lease_dir, on_disk_sum, stop, tmp_files, toolchain,
@@ -517,6 +519,52 @@ async fn private_and_empty_files_are_never_the_entry() {
             .keys()
             .any(|name| name.starts_with(&hex::encode([0xe3, 0xb0]))),
         "the empty blob was cached"
+    );
+    stop(cache, &gates);
+}
+
+/// The phases of a write without shared trees (the container driver's `inputs
+/// phases:` line), through the cache and without it, over one tree: the root, `out`,
+/// `out/sub` and `in`. Catches `dir_reads` or `dirs_made` miscounted, the cache's
+/// `links` and `copies` not passed on (0 and 0) or swapped, private copies counted as
+/// links, and the plain write's files not all counted as copies.
+#[tokio::test]
+async fn a_write_without_trees_counts_its_reads_directories_links_and_copies() {
+    let dir = scratch("cache-phases");
+    let gates = Gates::new();
+    let cache =
+        Cache::open(config(&dir, GIB, Arc::clone(&gates), &FakeClock::at(1000))).expect("open");
+    let cas = CountingCas::default();
+    let tree = [
+        file("out/a", b"blob", false),
+        file("out/sub/b", b"blob", true),
+        file("in/c", b"blob", false),
+        file("in/d", b"other", false),
+        file("in/empty", b"", true),
+    ];
+    let root = cas.tree(&tree);
+    let (stats, cached) = materialize_cached_phased(
+        &cas,
+        &cache,
+        &root,
+        &lease_dir(&dir, "one"),
+        &["out".to_owned()],
+    )
+    .await
+    .expect("written");
+    assert_eq!((cached.dir_reads, cached.dirs_made), (4, 3), "{cached:?}");
+    // `in/c` and `in/d` are the entries' inodes; `out/a` and `out/sub/b` are private.
+    assert_eq!((cached.links, cached.copies), (2, 2), "{cached:?}");
+    assert_eq!((stats.links, stats.copies, stats.empty_files), (2, 2, 1));
+    assert_eq!(cached.trees_ms, 0);
+    let plain = materialize_phased(&cas, &root, &lease_dir(&dir, "two"))
+        .await
+        .expect("written");
+    // Without the cache every name is a file of its own, the empty one included.
+    assert_eq!(
+        (plain.dir_reads, plain.dirs_made, plain.links, plain.copies),
+        (4, 3, 0, 5),
+        "{plain:?}"
     );
     stop(cache, &gates);
 }

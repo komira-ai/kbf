@@ -12,6 +12,7 @@ mod support;
 
 use kbf_daemon::RuntimeError;
 use support::fake::{Fake, image};
+use support::swap_kill::Logs;
 use support::{Spec, exists};
 
 /// The `chown` events the fake recorded.
@@ -61,6 +62,38 @@ async fn the_overlay_is_the_containers_while_it_runs_and_the_daemons_after() {
     let first_chown = calls.iter().position(|c| c == "unshare chown");
     let create = calls.iter().position(|c| c == "create");
     assert!(first_chown < create, "{calls:?}");
+    fake.assert_clean(1);
+}
+
+/// The `inputs phases:` line's `chown_ms` is the hand-over's time: with the fake's
+/// `podman unshare chown` to the container's owner sleeping 200 ms, it is at least 200
+/// (a lower bound only: a loaded machine adds time, never removes it). Catches the
+/// timer read before `give_overlay` runs (0), the hand-over timed into another field,
+/// and no line or more than one per lease.
+#[tokio::test]
+async fn the_inputs_phases_line_times_the_hand_over() {
+    let fake = Fake::new("chown-sleeps");
+    fake.knob("chown-sleeps", "1:1");
+    let logs = Logs::capture();
+    let result = fake
+        .run(1, &Spec::new(&image(), "unused"), &["exit", "0"])
+        .await
+        .expect("ran");
+    assert_eq!(result.exit_code, 0);
+    let text = logs.text();
+    let lines: Vec<&str> = text
+        .lines()
+        .filter_map(|l| l.split_once("inputs phases: ").map(|(_, fields)| fields))
+        .collect();
+    let [fields] = lines[..] else {
+        panic!("not one inputs phases line:\n{text}");
+    };
+    let chown_ms: u64 = fields
+        .split(' ')
+        .find_map(|f| f.strip_prefix("chown_ms="))
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| panic!("no chown_ms in {fields:?}"));
+    assert!(chown_ms >= 200, "{fields}");
     fake.assert_clean(1);
 }
 

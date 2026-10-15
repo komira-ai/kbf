@@ -47,6 +47,7 @@ use tokio::sync::oneshot;
 use crate::backend::{Backend, ContainerRuntime, Dirs, Engine, PodmanBackend, Running};
 use crate::cgroup::{LeaseCgroup, SwapKill, memory_max, presses_into_swap};
 use crate::image::{ImageCheckError, ImageRef, PROPERTY};
+use crate::input_phases::{InputPhases, millis};
 use crate::keeper::Keeper;
 use crate::oci::{Oci, OciConfig};
 use crate::outputs::{OutputLimits, collect_log};
@@ -56,7 +57,7 @@ use crate::podman::{
 use crate::program;
 use crate::remove::remove_tree;
 use crate::tree::{
-    TreeError, check_relative, collect, fetch_message, materialize, materialize_cached,
+    TreeError, check_relative, collect, fetch_message, materialize_cached, materialize_phased,
     output_paths, prepare_outputs, refuse_hidden_working_directory,
 };
 
@@ -330,6 +331,7 @@ impl<C: Cas> PodmanRuntime<C> {
         work: &Work,
         lease: &mut Lease,
     ) -> Result<Prepared, RuntimeError> {
+        let (mut phases, started) = (InputPhases::default(), Instant::now());
         let action: Action = fetch_message(cas, &work.action_digest)
             .await
             .map_err(tree_error)?;
@@ -340,6 +342,7 @@ impl<C: Cas> PodmanRuntime<C> {
         let command: Command = fetch_message(cas, command_digest)
             .await
             .map_err(tree_error)?;
+        phases.action_ms = millis(started);
         let input_root = action
             .input_root_digest
             .as_ref()
@@ -354,7 +357,9 @@ impl<C: Cas> PodmanRuntime<C> {
         let outputs = output_paths(&command).map_err(tree_error)?;
         let timeout = timeout_of(&action, self.config.default_timeout)?;
 
+        let started = Instant::now();
         self.check_image(&image).await?;
+        phases.image_ms = millis(started);
 
         let root = lease.dir.join("root");
         let upper = lease.dir.join("upper");
@@ -389,16 +394,18 @@ impl<C: Cas> PodmanRuntime<C> {
                             inputs.trees_built
                         );
                         tracing::info!(lease = %lease.name, "inputs: {shown}");
+                        (phases.write, phases.trees_built) = (inputs.phases, inputs.trees_built);
                         shared = inputs.mounts;
                         lease.trees = inputs.trees;
                         inputs.stats
                     }
                     None => {
-                        let stats =
+                        let (stats, write) =
                             materialize_cached(cas, &cache.cache, input_root, &root, &private)
                                 .await
                                 .map_err(tree_error)?;
                         tracing::info!(lease = %lease.name, "inputs: {stats}");
+                        phases.write = write;
                         stats
                     }
                 };
@@ -407,10 +414,13 @@ impl<C: Cas> PodmanRuntime<C> {
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner) = Some(stats);
             }
-            None => materialize(cas, input_root, &root)
-                .await
-                .map_err(tree_error)?,
+            None => {
+                phases.write = materialize_phased(cas, input_root, &root)
+                    .await
+                    .map_err(tree_error)?;
+            }
         }
+        let started = Instant::now();
         // The driver makes the working directory in the upper layer, which would hide
         // an input symlink or file of that name: refused rather than run elsewhere.
         refuse_hidden_working_directory(&root, &command.working_directory)
@@ -421,10 +431,14 @@ impl<C: Cas> PodmanRuntime<C> {
         prepare_outputs(&root, &upper, &command.working_directory, &outputs)
             .await
             .map_err(tree_error)?;
+        phases.prep_ms = millis(started);
+        let started = Instant::now();
         // The container's root is a subordinate id (`--userns=nomap`), which may write
         // only under directories it owns.
         self.give_overlay(CONTAINER_OWNER, &lease.dir, &root, &upper, &overlay_work)
             .await?;
+        phases.chown_ms = millis(started);
+        let started = Instant::now();
         // `actions/`'s own OOM count before the lease, to say afterwards whether its
         // limit killed the lease.
         lease.backstop_ooms = lease.cgroup.parent_ooms().ok();
@@ -435,6 +449,8 @@ impl<C: Cas> PodmanRuntime<C> {
             .and_then(|()| Keeper::watch(&kill))
             .map_err(|e| failed(lease.cgroup.dir(), &e))?;
         lease.keeper = Some(keeper);
+        phases.cgroup_ms = millis(started);
+        tracing::info!(lease = %lease.name, "inputs phases: {phases}");
 
         let spec = ContainerSpec {
             name: lease.name.clone(),
