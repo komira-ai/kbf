@@ -615,6 +615,27 @@ async fn unreadable_and_malformed_directories_fail_the_check() {
     assert!(matches!(error, CacheError::Invalid(_)), "{error:?}");
 }
 
+/// Catches: a directory two paths of one tree reach checked once per path (a tree built
+/// as a diamond chain would then cost two to the power of its depth), and its absent
+/// file listed twice.
+#[tokio::test]
+async fn a_directory_reached_twice_in_one_tree_is_checked_once() {
+    let (cache, store) = cache().await;
+    let (here, lost) = (file("here"), file("lost"));
+    let shared = dir(&[&here, &lost], &[]);
+    let (left, right) = (dir(&[&here], &[&shared]), dir(&[], &[&shared, &shared]));
+    let root = dir(&[], &[&left, &right]);
+    put(&cache, &[&here, &shared, &left, &right, &root]).await;
+    store.reset();
+
+    assert_eq!(walk(&cache, &root).await, [lost.digest]);
+    assert_eq!(
+        store.gets(),
+        4,
+        "root, left, right and the shared one, once"
+    );
+}
+
 /// Catches: a metadata log that cannot answer turned into "missing" (or into a pass):
 /// at the start of the check, while a directory's files are asked about, and while a
 /// directory taken from memory is looked at.

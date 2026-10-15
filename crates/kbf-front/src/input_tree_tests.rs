@@ -28,18 +28,23 @@ fn config(entries: usize, bytes: u64) -> InputTreeConfig {
 
 /// Catches: a directory inserted twice (two flights racing across an eviction) counted
 /// twice in bytes or entered twice in the recency order, so that evicting it later
-/// leaves a phantom cost behind.
+/// leaves a phantom cost behind; the second insert must replace the first.
 #[test]
 fn inserting_a_directory_twice_keeps_one_entry_and_one_cost() {
     let mut lru = Lru::new(config(8, u64::MAX));
     lru.insert(digest(1), decoded(2));
     let cost = lru.bytes;
     lru.insert(digest(1), decoded(5));
+    let replaced = decoded(5).cost();
     assert_eq!(
         (lru.entries.len(), lru.order.len(), lru.bytes),
-        (1, 1, cost)
+        (1, 1, replaced)
     );
-    assert_eq!(cost, decoded(2).cost());
+    assert_ne!(cost, replaced);
+    // An entry replaced by one too dear to keep leaves nothing behind.
+    lru.config.max_bytes = replaced - 1;
+    lru.insert(digest(1), decoded(5));
+    assert_eq!((lru.entries.len(), lru.order.len(), lru.bytes), (0, 0, 0));
 }
 
 /// Catches: a verification landing on a directory the bound already evicted, which

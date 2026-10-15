@@ -138,9 +138,15 @@ impl Lru {
         Some((Arc::clone(&entry.decoded), entry.verified_until))
     }
 
+    /// Keeps `decoded` as the most recently used entry, unless it alone costs more
+    /// than the byte bound. An entry already kept under `digest` is replaced.
     fn insert(&mut self, digest: Digest, decoded: Arc<Decoded>) {
         let cost = decoded.cost();
-        if cost > self.config.max_bytes || self.entries.contains_key(&digest) {
+        let old = self.entries.remove(&digest);
+        self.bytes -= old.as_ref().map_or(0, |e| e.cost);
+        // Ticks start at 1, so tick 0 names no entry.
+        self.order.remove(&old.map_or(0, |e| e.used));
+        if cost > self.config.max_bytes {
             return;
         }
         let used = self.next_tick();
