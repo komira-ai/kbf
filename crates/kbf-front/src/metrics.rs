@@ -560,6 +560,11 @@ impl TierCounters {
                 self.corrupt.get(),
             ),
             (
+                "kbf_tier_flush_digest_mismatch_total",
+                "Stand-in: records the flusher dropped (always 0 yet)",
+                0,
+            ),
+            (
                 "kbf_write_tier_local_reads_total",
                 "Blobs read from the write tier's disk",
                 self.local_reads.get(),

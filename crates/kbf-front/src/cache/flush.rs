@@ -61,6 +61,8 @@ pub struct FlushRound {
     pub conflicts: Vec<ObjectId>,
     /// Objects with a record that failed its digest: marked unreachable as corrupt.
     pub corrupt: Vec<ObjectId>,
+    /// Stand-in: the digests of the records that failed theirs (always empty yet).
+    pub dropped: Vec<Digest>,
     /// Objects whose flush failed this round, and how long until their next attempt.
     pub retrying: Vec<(ObjectId, Duration)>,
 }
