@@ -40,7 +40,7 @@ use crate::tree::{Loaded, TreeError, io as io_error};
 /// mount). The trees' own directories are 0755, their files the cache's 0444 or 0555
 /// (see `build::verify`); the directories above the store are the operator's, and must
 /// be searchable too.
-const STORE_MODE: u32 = 0o711;
+const STORE_MODE: u32 = 0o700;
 
 /// What a node's tree store has done.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
