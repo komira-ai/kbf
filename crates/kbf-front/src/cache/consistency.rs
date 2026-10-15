@@ -25,6 +25,11 @@ pub const PASS_OPENS_PER_SEC: NonZeroU32 = NonZeroU32::new(1000).expect("not zer
 /// of each, so the pass batches.
 pub const EVICT_BATCH: usize = 256;
 
+/// What the pass logs when the guard holds the index side back.
+const NOT_THIS_DIRECTORY: &str = "start-up pass: no file of any indexed object is in the \
+    store, so it is not the directory the index was written over (a missing mount?): \
+    nothing is forgotten";
+
 /// An object file the pass kept: what an evictor needs to rank it before any read has.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HeldObject {
@@ -202,13 +207,8 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
             return Ok(());
         }
         if indexed_present == 0 {
-            tracing::error!(
-                objects = gone.len(),
-                "start-up pass: no file of any indexed object is in the store, so it is not \
-                 the directory the index was written over (a missing mount?): nothing is \
-                 forgotten"
-            );
             report.withheld = gone.len() as u64;
+            tracing::error!(objects = report.withheld, "{NOT_THIS_DIRECTORY}");
             return Ok(());
         }
         ready_to_evict(&self.writer.meta)?;

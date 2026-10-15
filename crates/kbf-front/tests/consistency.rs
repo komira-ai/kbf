@@ -4,7 +4,8 @@
 
 use std::num::NonZeroU32;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
 
 use bytes::Bytes;
@@ -13,8 +14,8 @@ use kbf_front::{
     VerifiedBlob,
 };
 use kbf_meta::{
-    ActionAnswer, ActionRecord, Applied, Closure, Command, Epoch, MetaState, Miss, ObjectId,
-    Retention, Role, ServerId, StagedPut, TierId,
+    ActionAnswer, ActionRecord, Applied, Closure, Collected, Command, Epoch, MetaState, Miss,
+    ObjectId, Retention, Role, ServerId, StagedPut, TierId,
 };
 use kbf_objstore::{FsStore, KeyPrefix, ObjectKey, ObjectStore};
 use kbf_types::{Digest, FarmTime};
@@ -254,6 +255,86 @@ async fn pass_keeps_current_epoch_staged_foreign() {
     std::fs::remove_dir_all(&dir).expect("remove");
 }
 
+/// [`Log`], and a flush that lands at its `at`th query: the flusher writes a staged
+/// object's file and commits `ObjectFlushed` while the pass runs.
+struct FlushAt {
+    log: Log,
+    at: usize,
+    queries: AtomicUsize,
+    flush: Mutex<Option<(FsStore, ObjectKey, ObjectId)>>,
+}
+
+impl MetaLog for FlushAt {
+    async fn commit(&self, command: Command) -> Result<Applied, MetaLogError> {
+        self.log.commit(command).await
+    }
+
+    async fn query<R, F>(&self, f: F) -> Result<R, MetaLogError>
+    where
+        F: FnOnce(&MetaState) -> R + Send,
+        R: Send,
+    {
+        if self.queries.fetch_add(1, Ordering::Relaxed) + 1 == self.at {
+            let flush = self
+                .flush
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take();
+            let (files, key, object) = flush.expect("one flush");
+            plant(&files, &key, 10).await;
+            let flushed = self.log.run(Command::ObjectFlushed { object }).await;
+            assert_eq!(flushed, Applied::Tier(Ok(())));
+        }
+        self.log.query(f).await
+    }
+}
+
+/// Catches a pass that forgets an object because the walk did not see its file, when
+/// the file is there by the time it decides (mutant: no second look before the
+/// eviction): a staged object of an earlier process that the flusher writes to the
+/// store and marks flushed after the walk passed its shard. Its blob must stay.
+#[tokio::test]
+async fn pass_keeps_an_object_flushed_after_its_shard_was_walked() {
+    let dir = scratch("flushed-late");
+    let files = FsStore::open(&dir, FLOOR).expect("open");
+    let log = Log::new();
+    let old = open(&log, &files).await;
+    old.store_blobs(vec![blob("indexed")]).await.expect("store");
+    drop(old);
+    // An object whose file lands in shard 00, the first one walked.
+    let seq = (0x100..)
+        .find(|seq| kbf_segments::sha256(object_key(1, *seq).as_str().as_bytes()).hash[0] == 0)
+        .expect("a key in shard 00");
+    stage(&log, seq, "flushed late").await;
+    let flush_at = FlushAt {
+        log: log.clone(),
+        // The index read, then shard 00's staged check: shard 00 has been walked.
+        at: 2,
+        queries: AtomicUsize::new(0),
+        flush: Mutex::new(Some((files.clone(), object_key(1, seq), object(1, seq)))),
+    };
+
+    let cache = Cache::open(flush_at, files.clone(), prefix())
+        .await
+        .expect("open a cache");
+    let report = cache
+        .consistency_pass(&files, PASS_OPENS_PER_SEC, |_| Ok(()))
+        .await
+        .expect("the pass");
+
+    let flushed = cache.meta().flush.lock().expect("flush").is_none();
+    assert!(flushed, "the flush never ran");
+    assert!(holds(&files, &object_key(1, seq)).await);
+    let held = cache
+        .present(&[digest("flushed late")])
+        .await
+        .expect("present");
+    assert_eq!(held, [true]);
+    assert_eq!(report.evicted_objects, 0);
+    drop((cache, files));
+    std::fs::remove_dir_all(&dir).expect("remove");
+}
+
 /// Catches index entries whose object file is gone kept after the pass (mutant: the
 /// index side skipped): the blob stays reported present, so a client never uploads
 /// it again, and the action-cache entry naming it stays. Also a staged object with no
@@ -434,6 +515,51 @@ async fn pass_failures_are_errors() {
         .consistency_pass(&files, PASS_OPENS_PER_SEC, |_| Ok(()))
         .await;
     assert!(matches!(failed, Err(CacheError::Store(_))), "{failed:?}");
+    drop((cache, files));
+    std::fs::remove_dir_all(&dir).expect("remove");
+}
+
+/// [`Log`], answering `EvictObjects` with another command's outcome: a broken log.
+struct Misanswers(Log);
+
+impl MetaLog for Misanswers {
+    async fn commit(&self, command: Command) -> Result<Applied, MetaLogError> {
+        match command {
+            Command::EvictObjects { .. } => Ok(Applied::Collected(Collected::default())),
+            other => self.0.commit(other).await,
+        }
+    }
+
+    async fn query<R, F>(&self, f: F) -> Result<R, MetaLogError>
+    where
+        F: FnOnce(&MetaState) -> R + Send,
+        R: Send,
+    {
+        self.0.query(f).await
+    }
+}
+
+/// Catches a pass that counts an eviction the log answered with something else as
+/// done: it must fail as an internal error.
+#[tokio::test]
+async fn pass_refuses_a_log_that_misanswers_the_eviction() {
+    let dir = scratch("misanswer");
+    let files = FsStore::open(&dir, FLOOR).expect("open");
+    let log = Log::new();
+    let old = open(&log, &files).await;
+    old.store_blobs(vec![blob("lost")]).await.expect("store");
+    old.store_blobs(vec![blob("kept")]).await.expect("store");
+    drop(old);
+    files.delete(&object_key(1, 1)).await.expect("delete");
+    let cache = Cache::open(Misanswers(log), files.clone(), prefix())
+        .await
+        .expect("open a cache");
+
+    let failed = cache
+        .consistency_pass(&files, PASS_OPENS_PER_SEC, |_| Ok(()))
+        .await;
+
+    assert!(matches!(failed, Err(CacheError::Internal(_))), "{failed:?}");
     drop((cache, files));
     std::fs::remove_dir_all(&dir).expect("remove");
 }

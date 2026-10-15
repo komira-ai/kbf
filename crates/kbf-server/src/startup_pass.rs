@@ -12,6 +12,10 @@ use kbf_objstore::{FsStore, ObjectStore};
 
 use crate::RaftMetaLog;
 
+/// What a failed pass logs.
+const PASS_FAILED: &str =
+    "start-up pass over the blob directory failed; the next start runs it again";
+
 /// A pass to run over the file store `files` once the server is assembled.
 pub(crate) struct StartPass<M> {
     files: FsStore,
@@ -76,20 +80,20 @@ pub(crate) fn spawn<M: MetaLog, O: ObjectStore + 'static>(
                 duration_ms = report.duration.as_millis() as u64,
                 "start-up pass over the blob directory done"
             ),
-            Err(error) => tracing::error!(
-                %error,
-                "start-up pass over the blob directory failed; the next start runs it again"
-            ),
+            Err(error) => tracing::error!(%error, "{PASS_FAILED}"),
         }
     })
 }
 
 #[cfg(test)]
 mod tests {
+    use std::io;
+    use std::sync::{Mutex, PoisonError};
     use std::time::{Duration, Instant};
 
     use bytes::Bytes;
     use clap::Parser;
+    use kbf_front::MemoryMetaLog;
     use kbf_meta::{Applied, Command, Epoch, Location, ObjectId, Retention, StoreId};
     use kbf_objstore::{KeyPrefix, ObjectKey};
     use kbf_proto::reapi::content_addressable_storage_client::ContentAddressableStorageClient;
@@ -215,6 +219,72 @@ mod tests {
         assert!(!files.may_hold(&orphan).await.expect("may_hold"));
         serving.abort();
         drop(files);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Log lines written by the test's subscriber.
+    #[derive(Clone, Default)]
+    struct Capture(Arc<Mutex<Vec<u8>>>);
+
+    impl io::Write for Capture {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            let mut held = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+            held.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Catches a pass whose failure is dropped without a word (mutant: the error arm
+    /// logs nothing) or brings its task down: a log that cannot be readied for the
+    /// eviction fails the pass, which must log that it failed, with the cause, and end.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_failed_pass_is_logged() {
+        let mut logs = Capture::default();
+        let writer = logs.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .finish();
+        let _default = tracing::subscriber::set_default(subscriber);
+        let root =
+            std::env::temp_dir().join(format!("kbf-server-pass-fails-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let files = FsStore::open(&root, 1).expect("open the store");
+        let meta = MemoryMetaLog::new(Retention::default());
+        assert_eq!(meta.alloc_epoch(), Epoch::new(1));
+        let prefix = KeyPrefix::default();
+        let at = |seq| Location {
+            store: StoreId::CONFIGURED,
+            object: ObjectId::new(Epoch::new(1), seq),
+            offset: 0,
+        };
+        let (lost, kept) = (kbf_segments::sha256(b"lost"), kbf_segments::sha256(b"kept"));
+        let put = meta.commit(Command::PutBlobs(vec![(lost, at(1)), (kept, at(2))]));
+        assert!(matches!(put.await, Ok(Applied::Blobs(Ok(_)))));
+        let body = Bytes::from_static(b"some bytes");
+        let planted = files.put_new(&object_key(&prefix, 2), body, None).await;
+        planted.expect("plant");
+        let cache = Cache::open(meta, files.clone(), prefix)
+            .await
+            .expect("a cache");
+        let pass = StartPass {
+            files,
+            ready_to_evict: |_| Err(MetaLogError::Unavailable("not raised".to_owned())),
+            hold: Box::pin(std::future::ready(())),
+        };
+
+        spawn(Arc::new(cache), pass)
+            .await
+            .expect("the pass task ends without a panic");
+
+        io::Write::flush(&mut logs).expect("flush");
+        let text = String::from_utf8(logs.0.lock().expect("logs").clone()).expect("UTF-8");
+        assert!(text.contains(PASS_FAILED), "{text}");
+        assert!(text.contains("not raised"), "{text}");
         let _ = std::fs::remove_dir_all(&root);
     }
 }
