@@ -11,7 +11,7 @@ use futures::StreamExt as _;
 use futures::future::Either;
 use kbf_auth::{AuthenticateLayer, Policy};
 use kbf_front::{
-    ByteStreamService, CONNECTION_WINDOW_BYTES, Cache, CasService, Connections,
+    ByteStreamService, CONNECTION_WINDOW_BYTES, Cache, CasService, Connections, CpusByCategory,
     MAX_CONCURRENT_STREAMS, MAX_MESSAGE_BYTES, MemoryByCategory, MetaLog, RECORDER_CHANNEL,
     Recorder, RequestMetadataLayer, STREAM_WINDOW_BYTES, SegmentsConfig, SegmentsService,
 };
@@ -76,6 +76,8 @@ pub struct Listeners {
     pub invocation_memory: usize,
     /// The memory an action books by its category (`--book-mem-gib-by-category`).
     pub memory_by_category: MemoryByCategory,
+    /// The cores an action books by its category (`--book-cpus-by-category`).
+    pub cpus_by_category: CpusByCategory,
     /// The worker listener's segment uploads (`--segment-upload-*`;
     /// `docs/design/write-path.md`, section 4).
     pub segments: SegmentsConfig,
@@ -297,7 +299,8 @@ where
             listeners.finished_retention,
         )
         .recording(recorder.clone())
-        .booking_by_category(listeners.memory_by_category.clone()),
+        .booking_by_category(listeners.memory_by_category.clone())
+        .cpu_booking_by_category(listeners.cpus_by_category.clone()),
     );
     let (reapi_incoming, reapi) = bind(listeners.reapi)?;
     let (worker_incoming, worker) = bind(listeners.worker)?;

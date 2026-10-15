@@ -1,11 +1,15 @@
-//! Memory booked by action category (`docs/platform-properties.md#memory-by-category`).
+//! Memory and CPUs booked by action category
+//! (`docs/platform-properties.md#memory-by-category`,
+//! `docs/platform-properties.md#cpus-by-category`).
 //!
-//! An action that names no `kbf-book-mem-gib` books 1 GiB. A client may say what kind
-//! of action it is with the environment variable [`CATEGORY_ENV`] in its `Command`
-//! (Buck2's action `category`, or any name the build chooses); the server's
-//! `--book-mem-gib-by-category` table ([`MemoryByCategory`]) then names the memory that
-//! kind of action books instead. The front reads the category ([`category`]); the
-//! dispatcher books it, no more than the largest node that could run the action holds.
+//! An action that names no `kbf-book-mem-gib` books 1 GiB, and one that names no
+//! `kbf-book-cpus` books one core. A client may say what kind of action it is with the
+//! environment variable [`CATEGORY_ENV`] in its `Command` (Buck2's action `category`,
+//! or any name the build chooses); the server's `--book-mem-gib-by-category` table
+//! ([`MemoryByCategory`]) and `--book-cpus-by-category` table ([`CpusByCategory`]) then
+//! name the memory and the cores that kind of action books instead. The front reads the
+//! category ([`category`]); the dispatcher books it, no more than the largest node that
+//! could run the action holds.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -16,8 +20,11 @@ use kbf_proto::reapi::Command;
 /// The `Command` environment variable that names an action's category.
 pub const CATEGORY_ENV: &str = "KBF_ACTION_CATEGORY";
 
-/// One GiB, the unit of the table.
+/// One GiB, the unit of the memory table.
 const GIB: u64 = 1 << 30;
+
+/// One core in thousandths of a core, the unit of the CPU table.
+const CORE_MILLIS: u64 = 1_000;
 
 /// The category `command` names in [`CATEGORY_ENV`]: the first such variable's value,
 /// `None` when it names none or an empty one. The name is compared exactly.
@@ -45,20 +52,36 @@ impl MemoryByCategory {
     }
 }
 
-/// Why a `--book-mem-gib-by-category` value is refused.
+/// The CPUs, in thousandths of a core, each action category books when the action names
+/// no size: `--book-cpus-by-category`, written `<category>=<cores>,...`. Empty by
+/// default, so every action books one core unless it names a size.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CpusByCategory(BTreeMap<String, u64>);
+
+impl CpusByCategory {
+    /// The thousandths of a core `category` books, if the table names it.
+    #[must_use]
+    pub fn get(&self, category: &str) -> Option<u64> {
+        self.0.get(category).copied()
+    }
+}
+
+/// Why a `--book-mem-gib-by-category` or `--book-cpus-by-category` value is refused.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum CategoryTableError {
-    /// An entry is not `<category>=<GiB>`.
-    #[error("{0:?} is not <category>=<GiB>")]
+    /// An entry is not `<category>=<size>`.
+    #[error("{0:?} is not <category>=<size>")]
     Entry(String),
     /// A category is empty or holds whitespace.
     #[error("{0:?} is not a category name: one or more characters, none of them whitespace")]
     Name(String),
-    /// A size is not a whole number of GiB from 1 to the most a booking holds.
-    #[error("{category}={value:?}: not a whole number of GiB from 1 to {max} in plain digits")]
+    /// A size is not a whole number of `unit` (GiB or cores) from 1 to the most a
+    /// booking holds.
+    #[error("{category}={value:?}: not a whole number of {unit} from 1 to {max} in plain digits")]
     Size {
         category: String,
         value: String,
+        unit: &'static str,
         max: u64,
     },
     /// A category is named twice.
@@ -66,47 +89,78 @@ pub enum CategoryTableError {
     Repeated(String),
 }
 
+/// Reads `<category>=<n>` entries separated by commas into `category -> n * scale`
+/// (`unit` names what `n` counts in an error). The empty string is the empty table. A
+/// size is written as `kbf-book-mem-gib` is: plain digits, no sign, no leading zero, at
+/// least 1.
+fn read_table(
+    text: &str,
+    scale: u64,
+    unit: &'static str,
+) -> Result<BTreeMap<String, u64>, CategoryTableError> {
+    let mut table = BTreeMap::new();
+    for entry in text.split(',').filter(|_| !text.is_empty()) {
+        let (name, value) = entry
+            .split_once('=')
+            .ok_or_else(|| CategoryTableError::Entry(entry.to_owned()))?;
+        if name.is_empty() || name.contains(char::is_whitespace) {
+            return Err(CategoryTableError::Name(name.to_owned()));
+        }
+        let size = Some(value)
+            .filter(|v| v.starts_with(|c: char| ('1'..='9').contains(&c)))
+            .and_then(|v| v.parse::<u64>().ok())
+            .and_then(|n| n.checked_mul(scale))
+            .ok_or_else(|| CategoryTableError::Size {
+                category: name.to_owned(),
+                value: value.to_owned(),
+                unit,
+                max: u64::MAX / scale,
+            })?;
+        if table.insert(name.to_owned(), size).is_some() {
+            return Err(CategoryTableError::Repeated(name.to_owned()));
+        }
+    }
+    Ok(table)
+}
+
+/// `table` as the flags take it, each size in units of `scale`.
+fn write_table(table: &BTreeMap<String, u64>, scale: u64, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    let entries: Vec<String> = table
+        .iter()
+        .map(|(name, size)| format!("{name}={}", size / scale))
+        .collect();
+    f.write_str(&entries.join(","))
+}
+
 impl FromStr for MemoryByCategory {
     type Err = CategoryTableError;
 
-    /// Reads `<category>=<GiB>` entries separated by commas. The empty string is the
-    /// empty table. A size is written as `kbf-book-mem-gib` is: plain digits, no sign,
-    /// no leading zero, at least 1.
+    /// Reads `<category>=<GiB>` entries separated by commas.
     fn from_str(text: &str) -> Result<Self, Self::Err> {
-        let mut table = BTreeMap::new();
-        for entry in text.split(',').filter(|_| !text.is_empty()) {
-            let (name, value) = entry
-                .split_once('=')
-                .ok_or_else(|| CategoryTableError::Entry(entry.to_owned()))?;
-            if name.is_empty() || name.contains(char::is_whitespace) {
-                return Err(CategoryTableError::Name(name.to_owned()));
-            }
-            let bytes = Some(value)
-                .filter(|v| v.starts_with(|c: char| ('1'..='9').contains(&c)))
-                .and_then(|v| v.parse::<u64>().ok())
-                .and_then(|n| n.checked_mul(GIB))
-                .ok_or_else(|| CategoryTableError::Size {
-                    category: name.to_owned(),
-                    value: value.to_owned(),
-                    max: u64::MAX / GIB,
-                })?;
-            if table.insert(name.to_owned(), bytes).is_some() {
-                return Err(CategoryTableError::Repeated(name.to_owned()));
-            }
-        }
-        Ok(Self(table))
+        read_table(text, GIB, "GiB").map(Self)
     }
 }
 
 impl fmt::Display for MemoryByCategory {
     /// The table as `--book-mem-gib-by-category` takes it.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let entries: Vec<String> = self
-            .0
-            .iter()
-            .map(|(name, bytes)| format!("{name}={}", bytes / GIB))
-            .collect();
-        f.write_str(&entries.join(","))
+        write_table(&self.0, GIB, f)
+    }
+}
+
+impl FromStr for CpusByCategory {
+    type Err = CategoryTableError;
+
+    /// Reads `<category>=<cores>` entries separated by commas.
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        read_table(text, CORE_MILLIS, "cores").map(Self)
+    }
+}
+
+impl fmt::Display for CpusByCategory {
+    /// The table as `--book-cpus-by-category` takes it.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write_table(&self.0, CORE_MILLIS, f)
     }
 }
 
@@ -172,6 +226,7 @@ mod tests {
         let size = |value: &str| CategoryTableError::Size {
             category: "a".to_owned(),
             value: value.to_owned(),
+            unit: "GiB",
             max,
         };
         for (text, want) in [
@@ -201,5 +256,44 @@ mod tests {
             assert!(!want.to_string().is_empty());
         }
         assert!(format!("a={max}").parse::<MemoryByCategory>().is_ok());
+    }
+
+    /// Catches: a core count read as thousandths (or as GiB), so `mojo_build_test=4`
+    /// would book 4 millicores or 4 GiB; the table written back in another form than it
+    /// is read; the empty flag refused; and a bad size or a repeated category accepted
+    /// (the refusal must name cores, not GiB).
+    #[test]
+    fn a_cpu_table_is_read_in_cores_and_written_back_as_read() {
+        let table: CpusByCategory = "mojo_build_test=4,rustc=2".parse().expect("a table");
+        assert_eq!(table.get("mojo_build_test"), Some(4_000));
+        assert_eq!(table.get("rustc"), Some(2_000));
+        assert_eq!(table.get("c_compile"), None);
+        assert_eq!(table.to_string(), "mojo_build_test=4,rustc=2");
+        let empty: CpusByCategory = "".parse().expect("the empty table");
+        assert_eq!(empty, CpusByCategory::default());
+        assert_eq!(empty.to_string(), "");
+        let max = u64::MAX / 1_000;
+        let size = |value: &str| CategoryTableError::Size {
+            category: "a".to_owned(),
+            value: value.to_owned(),
+            unit: "cores",
+            max,
+        };
+        for (text, want) in [
+            ("a=0", size("0")),
+            ("a=+4", size("+4")),
+            ("a=04", size("04")),
+            ("a=1.5", size("1.5")),
+            ("a=", size("")),
+            ("a=4,a=8", CategoryTableError::Repeated("a".to_owned())),
+        ] {
+            assert_eq!(text.parse::<CpusByCategory>(), Err(want), "{text}");
+        }
+        assert!(
+            size("0").to_string().contains("cores"),
+            "the refusal names its unit"
+        );
+        assert!(format!("a={max}").parse::<CpusByCategory>().is_ok());
+        assert!(format!("a={}", max + 1).parse::<CpusByCategory>().is_err());
     }
 }

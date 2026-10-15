@@ -45,7 +45,8 @@
 //! `kbf-book-mem-gib` where the platform names them. An `action` lease whose platform
 //! names no `kbf-book-mem-gib` carries its category, the `Command`'s
 //! `KBF_ACTION_CATEGORY` variable, to the dispatcher, which may book more memory for it
-//! ([`crate::MemoryByCategory`]). A `kbf-book-*` value that is not a whole number
+//! ([`crate::MemoryByCategory`]); one that names no `kbf-book-cpus` carries it for the
+//! cores ([`crate::CpusByCategory`]). A `kbf-book-*` value that is not a whole number
 //! of at least 1, or that overflows the booking, is INVALID_ARGUMENT, and so is either
 //! key on a `whole_machine` lease (the scheduler books the whole worker for one). The
 //! platform's `gpu` value is the number of whole GPUs to book on top (0 when absent); a
@@ -128,7 +129,8 @@ pub const ERROR_DOMAIN: &str = "kbf";
 
 /// What v0 books for an action that names no size: one core and 1 GiB, plus the GPUs
 /// its `gpu` property asks for. `kbf-book-cpus` and `kbf-book-mem-gib` replace either;
-/// the dispatcher may book more memory for the action's category ([`Submission`]).
+/// the dispatcher may book more memory and more cores for the action's category
+/// ([`Submission`]).
 pub const DEFAULT_RESOURCES: Resources = Resources::new(1_000, 1 << 30);
 
 /// One execution the front hands to the scheduler.
@@ -145,6 +147,10 @@ pub struct Submission {
     /// `kbf-book-mem-gib`. The dispatcher books what its [`crate::MemoryByCategory`]
     /// entry names instead.
     pub category: Option<String>,
+    /// The action's category, when its CPU booking is the default one: an `action`
+    /// lease whose platform names no `kbf-book-cpus`. The dispatcher books what its
+    /// [`crate::CpusByCategory`] entry names instead.
+    pub cpu_category: Option<String>,
 }
 
 /// Where an operation is, as its callers see it.
@@ -431,10 +437,12 @@ where
         let gpus = mac_gpus(kind, gpus(&platform)?, &needs)?;
         device_kind(kind, &needs)?;
         let sized = platform.get(BOOK_MEM_GIB_KEY).is_some();
-        let category = command
-            .as_ref()
-            .and_then(crate::category::category)
+        let cpu_sized = platform.get(BOOK_CPUS_KEY).is_some();
+        let named = command.as_ref().and_then(crate::category::category);
+        let category = named
+            .clone()
             .filter(|_| kind == LeaseKind::Action && !sized);
+        let cpu_category = named.filter(|_| kind == LeaseKind::Action && !cpu_sized);
         let submission = Submission {
             request: Request {
                 key: ActionKey { instance, action },
@@ -447,6 +455,7 @@ where
             },
             call: None,
             category,
+            cpu_category,
         };
         Ok((submission, command_digest))
     }

@@ -106,11 +106,16 @@ impl Farm {
     }
 
     fn node(&mut self, name: &str, memory_gib: u64, caps: NodeCaps) {
+        self.node_of(name, 8, memory_gib, caps);
+    }
+
+    /// [`Farm::node`] with `cpus` whole cores in place of 8.
+    fn node_of(&mut self, name: &str, cpus: u64, memory_gib: u64, caps: NodeCaps) {
         let event = Event::WorkerUp {
             worker: w(name),
             instance: DaemonInstance::new(name),
             predecessor_stopped: false,
-            capacity: Resources::new(8_000, memory_gib * GIB),
+            capacity: Resources::new(cpus * 1_000, memory_gib * GIB),
             caps,
         };
         assert!(self.feed(event).is_empty());
@@ -648,4 +653,37 @@ fn a_category_booking_is_capped_at_the_largest_node_and_climbs_the_ladder_from_t
     assert_eq!(second.resources.memory_bytes, 8 * GIB);
     assert_eq!(f.requeues(), vec![oom(4, 8)]);
     assert_eq!(f.s.memory_floor(&key(1)), Some(8 * GIB));
+}
+
+/// Catches: `largest_cpu_millis` answering a size while no node is registered, counting a
+/// node that cannot run the request (a Mac for a Linux action, a node with too little
+/// memory for the booking), not the largest of those that can, and a category CPU
+/// booking that is not capped at it (a 64-core entry would then wait on a 16-core node
+/// and fail instead of running at 16) or that lowers a booking the action already has.
+#[test]
+fn a_cpu_category_is_capped_at_the_largest_node_that_could_run_it() {
+    let mut f = Farm::new();
+    let plain = request(1, GIB);
+    assert_eq!(f.s.largest_cpu_millis(&plain), None);
+    assert_eq!(kbf_sched::category_booking(1_000, 4_000, None), 4_000);
+    f.node_of("a-small", 4, 16, linux());
+    f.node_of("m-mac", 64, 64, mac());
+    f.node_of("b-big-cpu-little-memory", 32, 2, linux());
+    assert_eq!(f.s.largest_cpu_millis(&plain), Some(32_000));
+    let fat = request(2, 8 * GIB);
+    assert_eq!(
+        f.s.largest_cpu_millis(&fat),
+        Some(4_000),
+        "the 32-core node holds only 2 GiB"
+    );
+    let capped = kbf_sched::category_booking(1_000, 64_000, f.s.largest_cpu_millis(&fat));
+    assert_eq!(capped, 4_000, "no node that holds 8 GiB has 64 cores");
+    assert_eq!(
+        kbf_sched::category_booking(8_000, 4_000, Some(32_000)),
+        8_000,
+        "never lower"
+    );
+    let mut huge = request(3, 64 * GIB);
+    huge.resources.cpu_millis = 1_000;
+    assert_eq!(f.s.largest_cpu_millis(&huge), None, "no node holds 64 GiB");
 }

@@ -15,7 +15,7 @@ use kbf_objstore::{Capabilities, KeyError, KeyPrefix};
 use tonic::transport::{Certificate, Identity, ServerTlsConfig};
 
 use kbf_auth::{AllowAuthorizer, Authorizer, Policy, PolicyError};
-use kbf_front::{MemoryByCategory, SegmentsConfig};
+use kbf_front::{CpusByCategory, MemoryByCategory, SegmentsConfig};
 use kbf_meta::ServerId;
 use kbf_tier::{TierArgs, TierOptions};
 
@@ -180,6 +180,18 @@ pub struct Args {
     /// a category is named once; the server refuses to start otherwise.
     #[arg(long, default_value_t = MemoryByCategory::default())]
     pub book_mem_gib_by_category: MemoryByCategory,
+    /// The cores an action books by its category, as `<category>=<cores>,...`
+    /// (`docs/platform-properties.md#cpus-by-category`): an action whose `Command` sets
+    /// `KBF_ACTION_CATEGORY` to a category named here, and whose platform names no
+    /// `kbf-book-cpus`, books that many cores instead of 1, or the cores of the largest
+    /// node that could run it if that is fewer. A lease books cores only against the
+    /// node's total; it is not confined to them (its cgroup sets a CPU weight, not a
+    /// quota), so this bounds how many such actions run at once on a node, not the
+    /// threads each starts. Empty by default: every such action books one core. A size
+    /// is a whole number of at least 1 in plain digits, and a category is named once;
+    /// the server refuses to start otherwise.
+    #[arg(long, default_value_t = CpusByCategory::default())]
+    pub book_cpus_by_category: CpusByCategory,
     /// How long, in seconds, a stop (SIGINT or SIGTERM) waits for REAPI clients to
     /// disconnect after their open Execute and WaitExecution streams are ended
     /// UNAVAILABLE and their connections sent GOAWAY. A client still uploading is cut
@@ -408,6 +420,7 @@ impl Args {
             store_probe_timeout: Duration::from_millis(self.readyz_store_timeout_ms),
             invocation_memory: usize::try_from(self.invocation_memory).unwrap_or(usize::MAX),
             memory_by_category: self.book_mem_gib_by_category.clone(),
+            cpus_by_category: self.book_cpus_by_category.clone(),
             segments: SegmentsConfig {
                 max_bytes: self.segment_upload_max_bytes,
                 idle: Duration::from_secs(self.segment_upload_idle_secs),
@@ -583,7 +596,7 @@ mod tests {
     use std::time::Duration;
 
     use clap::Parser;
-    use kbf_front::{MAX_BLOB_BYTES, MemoryByCategory, WriteConfig};
+    use kbf_front::{CpusByCategory, MAX_BLOB_BYTES, MemoryByCategory, WriteConfig};
 
     use super::{Args, loopback_only};
 
@@ -603,6 +616,37 @@ mod tests {
         for refused in ["a=0", "a=4,a=8", "a"] {
             assert!(
                 listeners(&["--book-mem-gib-by-category", refused]).is_err(),
+                "{refused}"
+            );
+        }
+    }
+
+    /// Catches: `--book-cpus-by-category` not handed to the listeners (every action then
+    /// books one core, as without the flag), a default other than the empty table, the
+    /// two tables read into each other (`--book-mem-gib-by-category` sizes memory, this
+    /// one cores), and a bad table accepted instead of refusing to start.
+    #[test]
+    fn the_cpu_table_is_a_flag_that_reaches_the_listeners() {
+        let listeners = |extra: &[&str]| {
+            Args::try_parse_from(["kbf-server"].iter().chain(extra))
+                .map(|a| a.listeners().expect("listeners"))
+        };
+        assert_eq!(
+            listeners(&[]).unwrap().cpus_by_category,
+            CpusByCategory::default()
+        );
+        let both = listeners(&[
+            "--book-cpus-by-category",
+            "mojo_build_test=4",
+            "--book-mem-gib-by-category",
+            "mojo_build_test=2",
+        ])
+        .unwrap();
+        assert_eq!(both.cpus_by_category.get("mojo_build_test"), Some(4_000));
+        assert_eq!(both.memory_by_category.get("mojo_build_test"), Some(2 << 30));
+        for refused in ["a=0", "a=4,a=8", "a", "a=+2"] {
+            assert!(
+                listeners(&["--book-cpus-by-category", refused]).is_err(),
                 "{refused}"
             );
         }

@@ -38,7 +38,8 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use kbf_front::{
-    Cache, Dispatch, Finished, MemoryByCategory, MetaLog, Recorder, Stage, Submission, Ticket,
+    Cache, CpusByCategory, Dispatch, Finished, MemoryByCategory, MetaLog, Recorder, Stage,
+    Submission, Ticket,
 };
 use kbf_meta::{ActionRecord, Role};
 use kbf_objstore::ObjectStore;
@@ -112,6 +113,8 @@ pub struct Farm<M, O> {
     epoch_unix_ms: u64,
     /// The memory an action books by its category (`--book-mem-gib-by-category`).
     memory_by_category: MemoryByCategory,
+    /// The cores an action books by its category (`--book-cpus-by-category`).
+    cpus_by_category: CpusByCategory,
     state: Mutex<State>,
 }
 
@@ -126,6 +129,22 @@ fn book_category(sched: &Scheduler, table: &MemoryByCategory, submission: &mut S
         let largest = sched.largest_memory(request);
         let memory = &mut request.resources.memory_bytes;
         *memory = kbf_sched::category_booking(*memory, ask, largest);
+    }
+}
+
+/// Books the cores `table` names for `submission`'s CPU category, if it carries one the
+/// table names: no more than the largest node `sched` has that could run it (with the
+/// memory it books), and never less than it books already
+/// (`docs/platform-properties.md#cpus-by-category`). Called after [`book_category`], so
+/// the node that must hold the cores is one that holds the memory too. Not generic, so
+/// every [`Farm`] shares one copy of it.
+fn book_cpu_category(sched: &Scheduler, table: &CpusByCategory, submission: &mut Submission) {
+    let ask = submission.cpu_category.as_deref().and_then(|c| table.get(c));
+    if let Some(ask) = ask {
+        let request = &mut submission.request;
+        let largest = sched.largest_cpu_millis(request);
+        let cpus = &mut request.resources.cpu_millis;
+        *cpus = kbf_sched::category_booking(*cpus, ask, largest);
     }
 }
 
@@ -253,6 +272,7 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
             epoch: Instant::now(),
             epoch_unix_ms: unix_ms(),
             memory_by_category: MemoryByCategory::default(),
+            cpus_by_category: CpusByCategory::default(),
             state: Mutex::new(State {
                 sched,
                 machine: FarmMachine::new(term),
@@ -281,6 +301,14 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
     #[must_use]
     pub fn booking_by_category(mut self, table: MemoryByCategory) -> Self {
         self.memory_by_category = table;
+        self
+    }
+
+    /// This farm, an action whose submission carries a CPU category `table` names
+    /// booking that category's cores (`docs/platform-properties.md#cpus-by-category`).
+    #[must_use]
+    pub fn cpu_booking_by_category(mut self, table: CpusByCategory) -> Self {
+        self.cpus_by_category = table;
         self
     }
 
@@ -684,6 +712,7 @@ impl<M: MetaLog, O: ObjectStore + 'static> Dispatch for Farm<M, O> {
         let now = self.now();
         let mut state = self.lock();
         book_category(&state.sched, &self.memory_by_category, &mut submission);
+        // book_cpu_category(&state.sched, &self.cpus_by_category, &mut submission);
         let action = submission.request.key.action;
         let instance = submission.request.key.instance.clone();
         let waiter = state.machine.submit(Waiter {

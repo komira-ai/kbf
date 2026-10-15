@@ -75,7 +75,8 @@ pub fn raised(booked: u64, cap: u64) -> Option<u64> {
 /// its category's entry asks for `ask` bytes: `ask` if that is more, but never more
 /// than `largest`, the memory of the largest node that could run it
 /// ([`Scheduler::largest_memory`]); `ask` itself while no such node is registered. A
-/// category never lowers a booking.
+/// category never lowers a booking. The same rule books the CPUs a category asks for,
+/// in thousandths of a core, against [`Scheduler::largest_cpu_millis`].
 #[must_use]
 pub fn category_booking(booked: u64, ask: u64, largest: Option<u64>) -> u64 {
     booked.max(largest.map_or(ask, |largest| ask.min(largest)))
@@ -307,6 +308,27 @@ impl Scheduler {
                         && w.capacity.gpus >= wanted.gpus)
             })
             .map(|(_, w)| w.capacity.memory_bytes)
+            .max()
+    }
+
+    /// The CPUs of the largest node that could run `request`, in thousandths of a core:
+    /// one that is live (cordoned or not), serves its lease kind, satisfies its
+    /// platform and holds its memory and GPU request. `None` while no such node is
+    /// registered. The cap a category's CPU booking is held to, so that an action is
+    /// never booked more cores than any node has (it would wait, then fail).
+    #[must_use]
+    pub fn largest_cpu_millis(&self, request: &Request) -> Option<u64> {
+        let wanted = request.resources;
+        self.workers
+            .values()
+            .filter(|w| {
+                w.alive(self.now)
+                    && serves(&w.caps, request.kind)
+                    && request.needs.matches(&w.caps)
+                    && w.capacity.memory_bytes >= wanted.memory_bytes
+                    && w.capacity.gpus >= wanted.gpus
+            })
+            .map(|w| w.capacity.cpu_millis)
             .max()
     }
 }

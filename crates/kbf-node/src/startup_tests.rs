@@ -185,6 +185,7 @@ async fn the_daemon_says_hello_before_its_first_survey_ends() {
         store_probe_timeout: kbf_server::health::STORE_PROBE_TIMEOUT,
         invocation_memory: kbf_front::DEFAULT_INVOCATION_MEMORY,
         memory_by_category: kbf_front::MemoryByCategory::default(),
+        cpus_by_category: kbf_front::CpusByCategory::default(),
         segments: kbf_front::SegmentsConfig::DEFAULT,
     };
     let api = Api {

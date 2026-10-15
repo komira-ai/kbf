@@ -113,3 +113,98 @@ async fn a_category_books_its_entry_up_to_the_largest_node() {
         done(&mut ops).await;
     }
 }
+
+/// Catches: `--book-cpus-by-category` not applied, so a `mojo_build_test` action still
+/// books one core (and a node of 8 cores runs 8 of them at once); an entry booked past
+/// the largest node that could run the action (the 64-core entry would wait on an
+/// 8-core node and fail instead of running at 8); an entry overriding a
+/// `kbf-book-cpus` the action named; an entry dropped because the action named only
+/// its memory (the two bookings are independent); and a category the table does not
+/// name, or an action with none, booking anything but one core.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cpu_category_books_its_cores_up_to_the_largest_node() {
+    let table = "mojo_build_test=4,huge=64".parse().expect("a table");
+    let cell = support::Cell::start_booking_cpus_by_category(table).await;
+    let mut node = cell.daemon("node-a", 8, 16).await;
+    let tag = kbf_front::CATEGORY_ENV;
+    let cases = [
+        ("build test", vec![], Some("mojo_build_test"), 4_000, GIB),
+        ("huge", vec![], Some("huge"), 8_000, GIB),
+        (
+            "sized cores",
+            vec![("kbf-book-cpus", "2")],
+            Some("mojo_build_test"),
+            2_000,
+            GIB,
+        ),
+        (
+            "sized memory",
+            vec![("kbf-book-mem-gib", "2")],
+            Some("mojo_build_test"),
+            4_000,
+            2 * GIB,
+        ),
+        ("not in the table", vec![], Some("c_compile"), 1_000, GIB),
+        ("untagged", vec![], None, 1_000, GIB),
+    ];
+    for (argv, platform, category, cpus, memory) in cases {
+        let env: Vec<(&str, &str)> = category.map(|c| (tag, c)).into_iter().collect();
+        let job = Job::with_env(argv, &platform, &env);
+        cell.upload(&job.blobs()).await;
+        let mut ops = cell.execute(&job.action).await;
+        let start = node.start().await;
+        assert_eq!(start.action_digest.as_ref(), Some(&job.action.proto));
+        assert_eq!((start.millicpus, start.memory_bytes), (cpus, memory), "{argv}");
+        let result = output(&cell, argv, 0).await;
+        assert!(node.report(ran(start.lease_id, &result)).await.accepted);
+        done(&mut ops).await;
+    }
+}
+
+/// Catches: the cores a category books not held on the node, so a node of 8 cores runs
+/// a third 4-core action beside two; a held booking not released when its lease ends,
+/// so the third never runs; and a 1-core action of no category starting while the 8
+/// cores are booked. This is the cap `--book-cpus-by-category` puts on how many such
+/// actions are open on a node at once: 8 cores / 4 = 2.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cpu_category_caps_the_leases_open_at_once_on_a_node() {
+    let table = "mojo_build_test=4".parse().expect("a table");
+    let cell = support::Cell::start_booking_cpus_by_category(table).await;
+    let mut node = cell.daemon("node-a", 8, 16).await;
+    let tag = kbf_front::CATEGORY_ENV;
+    let heavy = |argv| Job::with_env(argv, &[], &[(tag, "mojo_build_test")]);
+    let jobs = [heavy("build one"), heavy("build two"), heavy("build three")];
+    let light = Job::new("compile", &[]);
+    for job in jobs.iter().chain([&light]) {
+        cell.upload(&job.blobs()).await;
+    }
+    let mut ops = Vec::new();
+    for job in &jobs {
+        ops.push(cell.execute(&job.action).await);
+    }
+    let first = node.start().await;
+    let second = node.start().await;
+    assert_eq!((first.millicpus, second.millicpus), (4_000, 4_000));
+    // All 8 cores are booked: the third heavy action waits, and so does a light one.
+    node.no_work().await;
+
+    let built = output(&cell, "built", 0).await;
+    assert!(node.report(ran(first.lease_id, &built)).await.accepted);
+    done(&mut ops[0]).await;
+    let third = node.start().await;
+    assert_eq!(third.action_digest.as_ref(), Some(&jobs[2].action.proto));
+    assert_eq!(third.millicpus, 4_000);
+
+    // The third and the second hold all 8 cores again: a light action waits too.
+    let mut light_ops = cell.execute(&light.action).await;
+    node.no_work().await;
+    assert!(node.report(ran(second.lease_id, &built)).await.accepted);
+    done(&mut ops[1]).await;
+    let small = node.start().await;
+    assert_eq!(small.action_digest.as_ref(), Some(&light.action.proto));
+    assert_eq!(small.millicpus, 1_000);
+    for (start, stream) in [(third, &mut ops[2]), (small, &mut light_ops)] {
+        assert!(node.report(ran(start.lease_id, &built)).await.accepted);
+        done(stream).await;
+    }
+}

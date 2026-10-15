@@ -511,3 +511,56 @@ async fn the_category_is_carried_when_the_memory_booking_is_the_default() {
         }
     }
 }
+
+/// Catches: a CPU category dropped for an action that names only `kbf-book-mem-gib`
+/// (the two bookings are independent: a build that sizes its memory still gets its
+/// category's cores); a category carried beside a `kbf-book-cpus` the action named (the
+/// table would then override the cores the build asked for); one carried on a
+/// `whole_machine` lease (which books the whole worker); one read from an action that
+/// sets none; and a booking changed by the front (the dispatcher sizes it).
+#[tokio::test]
+async fn the_cpu_category_is_carried_when_the_cpu_booking_is_the_default() {
+    let script = Arc::new(Script::default());
+    let farm = Farm::with_execution(Arc::clone(&script)).await;
+    let tagged = [(kbf_front::CATEGORY_ENV, "mojo_build_test")];
+    let untagged = [("PATH", "/bin")];
+    let cases: [(&str, Vec<(&str, &str)>, &[(&str, &str)], Option<&str>); 5] = [
+        ("tagged", vec![], &tagged[..], Some("mojo_build_test")),
+        (
+            "tagged and sized in memory",
+            vec![(BOOK_MEM_GIB_KEY, "3")],
+            &tagged[..],
+            Some("mojo_build_test"),
+        ),
+        (
+            "tagged and sized in cores",
+            vec![(BOOK_CPUS_KEY, "2")],
+            &tagged[..],
+            None,
+        ),
+        (
+            "tagged on a whole machine",
+            vec![("kbf-lease", "whole_machine")],
+            &tagged[..],
+            None,
+        ),
+        ("untagged", vec![], &untagged[..], None),
+    ];
+    for (argv, props, env, _) in &cases {
+        let job = job_with_env(argv, props, env);
+        farm.upload(&job.blobs.iter().collect::<Vec<_>>()).await;
+        start(&farm, &job.action).await.expect(argv);
+    }
+    let submitted = script.submitted();
+    assert_eq!(submitted.len(), cases.len());
+    for (submission, (argv, props, _, want)) in submitted.iter().zip(&cases) {
+        assert_eq!(submission.cpu_category.as_deref(), *want, "{argv}");
+        let whole = submission.request.kind == LeaseKind::WholeMachine;
+        if !props.contains(&(BOOK_CPUS_KEY, "2")) && !whole {
+            assert_eq!(
+                submission.request.resources.cpu_millis, DEFAULT_RESOURCES.cpu_millis,
+                "{argv}"
+            );
+        }
+    }
+}

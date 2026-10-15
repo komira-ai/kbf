@@ -70,6 +70,7 @@ impl Server {
             store_probe_timeout: kbf_server::health::STORE_PROBE_TIMEOUT,
             invocation_memory: memory,
             memory_by_category: kbf_front::MemoryByCategory::default(),
+            cpus_by_category: kbf_front::CpusByCategory::default(),
             segments: kbf_front::SegmentsConfig::DEFAULT,
         };
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();

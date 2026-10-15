@@ -213,6 +213,14 @@ pub struct Client {
 /// The bearer token of a cell's operator API ([`Cell::start_with_api`]).
 pub const API_TOKEN: &str = "kbf-test-token-0123456789abcdef0123456789";
 
+/// What a cell's farm books by category: memory (`--book-mem-gib-by-category`) and
+/// cores (`--book-cpus-by-category`). Both empty by default, as the server's are.
+#[derive(Default)]
+struct Tables {
+    memory: kbf_front::MemoryByCategory,
+    cpus: kbf_front::CpusByCategory,
+}
+
 impl Cell {
     pub async fn start() -> Self {
         Self::start_with(kbf_sched::UNSERVABLE_WAIT, kbf_sched::FINISHED_RETENTION).await
@@ -228,16 +236,33 @@ impl Cell {
     pub async fn start_with(wait: Duration, retention: Duration) -> Self {
         let store = SharedStore::new();
         let cache = Self::cold_cache(&store, None).await;
-        let table = kbf_front::MemoryByCategory::default();
+        let table = Tables::default();
         Self::serve(cache, store, None, None, wait, retention, table).await
     }
 
-    /// A cell whose actions book memory by category as `table` says
+    /// A cell whose actions book memory by category as `memory` says
     /// (`--book-mem-gib-by-category`).
-    pub async fn start_booking_by_category(table: kbf_front::MemoryByCategory) -> Self {
+    pub async fn start_booking_by_category(memory: kbf_front::MemoryByCategory) -> Self {
+        let cpus = kbf_front::CpusByCategory::default();
+        Self::start_booking_by_tables(memory, cpus).await
+    }
+
+    /// A cell whose actions book cores by category as `cpus` says
+    /// (`--book-cpus-by-category`).
+    pub async fn start_booking_cpus_by_category(cpus: kbf_front::CpusByCategory) -> Self {
+        let memory = kbf_front::MemoryByCategory::default();
+        Self::start_booking_by_tables(memory, cpus).await
+    }
+
+    /// A cell whose actions book memory and cores by category.
+    pub async fn start_booking_by_tables(
+        memory: kbf_front::MemoryByCategory,
+        cpus: kbf_front::CpusByCategory,
+    ) -> Self {
         let store = SharedStore::new();
         let cache = Self::cold_cache(&store, None).await;
         let (wait, retention) = (kbf_sched::UNSERVABLE_WAIT, kbf_sched::FINISHED_RETENTION);
+        let table = Tables { memory, cpus };
         Self::serve(cache, store, None, None, wait, retention, table).await
     }
 
@@ -249,7 +274,7 @@ impl Cell {
         let dir = FaultFs::new();
         let cache = Self::cold_cache(&store, Some(&dir)).await;
         let (wait, retention) = (kbf_sched::UNSERVABLE_WAIT, kbf_sched::FINISHED_RETENTION);
-        let table = kbf_front::MemoryByCategory::default();
+        let table = Tables::default();
         Self::serve(cache, store, None, Some(dir), wait, retention, table).await
     }
 
@@ -267,7 +292,7 @@ impl Cell {
         };
         let (wait, retention) = (kbf_sched::UNSERVABLE_WAIT, kbf_sched::FINISHED_RETENTION);
         let cache = Self::cold_cache(&store, None).await;
-        let table = kbf_front::MemoryByCategory::default();
+        let table = Tables::default();
         Self::serve(cache, store, Some(api), None, wait, retention, table).await
     }
 
@@ -283,7 +308,7 @@ impl Cell {
         let (wait, retention) = (kbf_sched::UNSERVABLE_WAIT, kbf_sched::FINISHED_RETENTION);
         let (cache, store) = (Arc::clone(&self.cache), self.store.clone());
         let dir = self.raft_dir.clone();
-        let table = kbf_front::MemoryByCategory::default();
+        let table = Tables::default();
         let api = self.api_config.clone();
         Self::serve(cache, store, api, dir, wait, retention, table).await
     }
@@ -314,7 +339,7 @@ impl Cell {
         let dir = dir.map(|d| d.restart());
         let cache = Self::cold_cache(&store, dir.as_ref()).await;
         let (wait, retention) = (kbf_sched::UNSERVABLE_WAIT, kbf_sched::FINISHED_RETENTION);
-        let table = kbf_front::MemoryByCategory::default();
+        let table = Tables::default();
         Self::serve(cache, store, api_config, dir, wait, retention, table).await
     }
 
@@ -359,7 +384,7 @@ impl Cell {
         raft_dir: Option<FaultFs>,
         wait: Duration,
         retention: Duration,
-        memory_by_category: kbf_front::MemoryByCategory,
+        tables: Tables,
     ) -> Self {
         let listeners = Listeners {
             reapi: SocketAddr::from(([127, 0, 0, 1], 0)),
@@ -374,7 +399,8 @@ impl Cell {
             shutdown_timeout: Duration::from_secs(10),
             store_probe_timeout: kbf_server::health::STORE_PROBE_TIMEOUT,
             invocation_memory: kbf_front::DEFAULT_INVOCATION_MEMORY,
-            memory_by_category,
+            memory_by_category: tables.memory,
+            cpus_by_category: tables.cpus,
             segments: kbf_front::SegmentsConfig::DEFAULT,
         };
         let (stop, stop_rx) = oneshot::channel::<()>();

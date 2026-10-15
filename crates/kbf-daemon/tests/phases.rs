@@ -71,6 +71,7 @@ impl Farm {
             store_probe_timeout: kbf_server::health::STORE_PROBE_TIMEOUT,
             invocation_memory: kbf_front::DEFAULT_INVOCATION_MEMORY,
             memory_by_category: kbf_front::MemoryByCategory::default(),
+            cpus_by_category: kbf_front::CpusByCategory::default(),
             segments: kbf_front::SegmentsConfig::DEFAULT,
         };
         let bound = bind_server(Arc::clone(&cache), listeners, pending()).expect("bind");
