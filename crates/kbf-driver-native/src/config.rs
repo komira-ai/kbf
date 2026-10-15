@@ -2,8 +2,11 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
+use kbf_daemon::cache::Cache;
+use kbf_daemon::trees::Trees;
 use kbf_outputs::OutputLimits;
 
 use crate::network::Isolation;
@@ -86,13 +89,25 @@ pub struct NativeConfig {
     /// The lease-user pool every action runs as, one user per slot ([`crate::slots`]):
     /// required of a daemon that runs as root, refused otherwise and off macOS.
     pub pool: Option<Pool>,
+    /// The node's input cache: a lease's input files are clones of its entries
+    /// (`kbf_daemon::tree::materialize_cached`) and only a blob it does not hold is
+    /// fetched. `None` fetches every input of every lease. It must be on the scratch
+    /// directory's volume (else leases get copies, still no fetch) and outside it: the
+    /// sandbox lets an action write only its own lease directory, which keeps the
+    /// entries out of its reach.
+    pub cache: Option<Arc<Cache>>,
+    /// The node's shared input trees (`kbf_daemon::trees`, delivered by cloning each
+    /// whole into the lease, [`Delivery::Clone`]); needs `cache`, which builds the
+    /// trees and writes the rest of the inputs. The store must be outside the scratch
+    /// directory, like the cache. `None` clones every input file one by one.
+    pub trees: Option<Arc<Trees>>,
 }
 
 impl NativeConfig {
     /// A configuration with a one hour default timeout, the default output limits,
     /// upload deadline ([`kbf_daemon::UPLOAD_DEADLINE`]) and memory policy, a 250 ms poll, a 5 s kill wait, [`Listing::DEFAULT`], this node's isolation and user
     /// folders, leftovers swept after [`LEFTOVER_AGE`], no Xcode (see [`Self::xcodes`]),
-    /// the system `xcrun` and no lease-user pool.
+    /// the system `xcrun`, no lease-user pool and no input cache.
     #[must_use]
     pub fn new(scratch: PathBuf) -> Self {
         Self {
@@ -110,6 +125,8 @@ impl NativeConfig {
             leftover_age: LEFTOVER_AGE,
             xcrun: PathBuf::from(crate::xcode::XCRUN),
             pool: None,
+            cache: None,
+            trees: None,
         }
     }
 }

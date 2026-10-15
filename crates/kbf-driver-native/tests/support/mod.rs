@@ -24,7 +24,7 @@ use kbf_driver_native::{NativeConfig, NativeRuntime, procs};
 use kbf_proto::reapi::command::EnvironmentVariable;
 use kbf_proto::reapi::platform::Property;
 use kbf_proto::reapi::{
-    Action, ActionResult, Command, Digest, Directory, FileNode, Platform, Tree,
+    Action, ActionResult, Command, Digest, Directory, DirectoryNode, FileNode, Platform, Tree,
 };
 use kbf_types::{LeaseId, Resources};
 use prost::Message;
@@ -39,6 +39,8 @@ pub struct MemoryCas {
     pub delay: Option<Duration>,
     /// Every put fails as an unreachable CAS would.
     pub refuse_puts: bool,
+    /// The digests `get` was asked for, by label, with how often.
+    pub reads: Mutex<BTreeMap<String, u64>>,
 }
 
 impl MemoryCas {
@@ -56,6 +58,12 @@ impl MemoryCas {
             .unwrap_or_else(|| panic!("blob {} is stored", label(digest)))
     }
 
+    /// How many times `get` was asked for `digest`.
+    pub fn reads_of(&self, digest: &Digest) -> u64 {
+        let reads = self.reads.lock().unwrap_or_else(PoisonError::into_inner);
+        reads.get(&label(digest)).copied().unwrap_or(0)
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, Vec<u8>>> {
         self.blobs.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -69,6 +77,9 @@ impl Cas for MemoryCas {
     }
 
     async fn get(&self, digest: &Digest) -> Result<Vec<u8>, CasError> {
+        *(self.reads.lock().unwrap_or_else(PoisonError::into_inner))
+            .entry(label(digest))
+            .or_default() += 1;
         if let Some(delay) = self.delay {
             tokio::time::sleep(delay).await;
         }
@@ -163,19 +174,7 @@ impl Spec {
 
     /// Stores the action in `cas` and returns its digest.
     pub fn store(&self, cas: &MemoryCas) -> Digest {
-        let root = Directory {
-            files: self
-                .inputs
-                .iter()
-                .map(|(name, bytes)| FileNode {
-                    name: name.clone(),
-                    digest: Some(cas.insert(bytes.clone())),
-                    is_executable: true,
-                    ..FileNode::default()
-                })
-                .collect(),
-            ..Directory::default()
-        };
+        let root = directory_of(cas, &self.inputs);
         let command = Command {
             arguments: self.argv.clone(),
             environment_variables: self
@@ -210,6 +209,39 @@ impl Spec {
             ..Action::default()
         };
         cas.insert(action.encode_to_vec())
+    }
+}
+
+/// The Directory of `inputs` (every file executable): a name with `/` is in the
+/// subdirectory it names, stored in `cas` as well.
+fn directory_of(cas: &MemoryCas, inputs: &[(String, Vec<u8>)]) -> Directory {
+    let mut files = Vec::new();
+    let mut below: BTreeMap<&str, Vec<(String, Vec<u8>)>> = BTreeMap::new();
+    for (name, bytes) in inputs {
+        match name.split_once('/') {
+            None => files.push(FileNode {
+                name: name.clone(),
+                digest: Some(cas.insert(bytes.clone())),
+                is_executable: true,
+                ..FileNode::default()
+            }),
+            Some((dir, rest)) => below
+                .entry(dir)
+                .or_default()
+                .push((rest.to_owned(), bytes.clone())),
+        }
+    }
+    let directories = below
+        .into_iter()
+        .map(|(name, inner)| DirectoryNode {
+            name: name.to_owned(),
+            digest: Some(cas.insert(directory_of(cas, &inner).encode_to_vec())),
+        })
+        .collect();
+    Directory {
+        files,
+        directories,
+        ..Directory::default()
     }
 }
 

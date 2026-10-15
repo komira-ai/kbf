@@ -501,12 +501,15 @@ fn node(
         match driver {
             Driver::Fake => node.add(Arc::new(FakeRuntime::new(Duration::ZERO)))?,
             Driver::Native => {
+                #[cfg(not(target_os = "macos"))]
                 if let Some(warning) = cache::native_warning(&cli.cache) {
                     tracing::warn!("{warning}");
                 }
+                #[cfg(not(target_os = "macos"))]
                 if cli.trees.tree_dir.is_some() {
                     tracing::warn!(
-                        "trees: off:native: only the container driver mounts shared trees"
+                        "trees: off:native: only the container driver, and the native driver \
+                         on macOS, share trees"
                     );
                 }
                 let config = native()?;
@@ -650,6 +653,11 @@ fn native_config(cli: &Cli) -> Result<NativeConfig, Error> {
     config.pool = (cli.pool_users.zip(cli.pool_first_uid))
         .map(|(count, first)| Pool::provisioned(count, first))
         .transpose()?;
+    #[cfg(target_os = "macos")]
+    {
+        config.cache = cache::native(&cli.cache, &config.scratch);
+        config.trees = cache::native_trees(&cli.trees, &config.scratch, config.cache.as_ref());
+    }
     Ok(config)
 }
 

@@ -1,7 +1,7 @@
 //! The binary's `--cache-*` flags (`docs/design/worker-cache.md`): the container driver
 //! opens the cache, a second owner and a missing budget run uncached, the native
-//! driver never touches the directory, and the binary answers as the driver's
-//! `__chown-dirs` helper before it parses its flags.
+//! driver opens it on macOS and never touches the directory on Linux, and the binary
+//! answers as the driver's `__chown-dirs` helper before it parses its flags.
 
 use super::{BIN, one_native_daemon, runs_until_sigterm_logged, tls};
 
@@ -100,6 +100,10 @@ fn a_container_node_opens_its_cache_and_runs_uncached_without_it() {
 /// "enable the cache on Linux native" mutant): given `--cache-dir` and a budget, it
 /// warns `off:native-same-uid` and never touches the directory (no lock, no layout).
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "macOS native nodes open the cache: see the clone tests below"
+)]
 fn a_native_node_never_opens_its_cache_dir() {
     let dir = tls("native-cache");
     let cache = dir.join("cache");
@@ -124,6 +128,130 @@ fn a_native_node_never_opens_its_cache_dir() {
         left.is_empty(),
         "the native daemon touched its cache directory: {left:?}"
     );
+}
+
+/// C-19 on macOS. Catches the native driver not opening `--cache-dir` (every lease
+/// would fetch its inputs again), a cache without a budget or inside the scratch
+/// directory (which lease sweeps clean) used anyway, and a cache that is not opened in
+/// clone mode: a macOS native node opens the cache and logs `link mode clone`; without
+/// `--cache-max-bytes` it warns `off:no-budget`, with the cache under `--scratch` it
+/// warns `off:unusable`, and in both it serves and leaves the directory without a
+/// layout.
+#[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "only a macOS native node opens its cache"
+)]
+fn a_macos_native_node_opens_its_cache_in_clone_mode() {
+    let dir = tls("native-cache-mac");
+    let cache = dir.join("cache");
+    let inside = dir.join("leases").join("cache");
+    for path in [&cache, &inside] {
+        std::fs::create_dir_all(path).expect("cache dir");
+    }
+    let flags = |name: &str, cache: &std::path::Path, budget: bool| {
+        let mut flags = vec![
+            "--driver=native".to_owned(),
+            "--cas=https://127.0.0.1:1".to_owned(),
+            format!("--scratch={}", dir.join("leases").display()),
+            format!("--cache-dir={}", cache.display()),
+        ];
+        if budget {
+            flags.push("--cache-max-bytes=1000000".to_owned());
+        }
+        (name.to_owned(), flags)
+    };
+    let one = one_native_daemon();
+    let (name, opened) = flags("native-cache-open", &cache, true);
+    let (status, log) = runs_until_sigterm_logged(&name, &opened, None);
+    assert!(status.success(), "{status}: {log:#?}");
+    assert!(logged(&log, &["cache:", "link mode clone"]), "{log:#?}");
+    assert!(cache.join("v1").is_dir(), "the cache has no layout");
+    for (name, cache, budget, off) in [
+        (
+            "native-cache-nobudget",
+            dir.join("nobudget"),
+            false,
+            "off:no-budget",
+        ),
+        ("native-cache-inside", inside.clone(), true, "off:unusable"),
+    ] {
+        std::fs::create_dir_all(&cache).expect("cache dir");
+        let (name, flags) = flags(name, &cache, budget);
+        let (status, log) = runs_until_sigterm_logged(&name, &flags, None);
+        assert!(status.success(), "{status}: {log:#?}");
+        assert!(
+            logged(&log, &["cache:", off, "leases run uncached"]),
+            "{log:#?}"
+        );
+        assert!(
+            !cache.join("v1").exists(),
+            "{off}: the daemon made a layout"
+        );
+    }
+    drop(one);
+}
+
+/// The native node's tree store on macOS. Catches the store not opened (every lease
+/// would clone each toolchain file), one opened without a cache to build from (clap
+/// refuses `--tree-dir` without `--cache-dir`, so this is a cache that is off) or inside
+/// the scratch directory (which lease sweeps clean): with a cache and a store outside
+/// `--scratch` it logs the store and makes it; with the cache under `--scratch` (off) it
+/// warns `trees: off:no-cache`, with the store under `--scratch` `trees: off:inside-scratch`,
+/// and in both it serves and makes no store.
+#[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "only a macOS native node opens a tree store"
+)]
+fn a_macos_native_node_opens_its_tree_store() {
+    let dir = tls("native-trees-mac");
+    let cache = dir.join("cache");
+    let inside = dir.join("leases").join("cache");
+    for path in [&cache, &inside] {
+        std::fs::create_dir_all(path).expect("cache dir");
+    }
+    let flags = |cache: &std::path::Path, trees: &std::path::Path| {
+        vec![
+            "--driver=native".to_owned(),
+            "--cas=https://127.0.0.1:1".to_owned(),
+            format!("--scratch={}", dir.join("leases").display()),
+            format!("--tree-dir={}", trees.display()),
+            "--tree-max-bytes=1000000".to_owned(),
+            format!("--cache-dir={}", cache.display()),
+            "--cache-max-bytes=1000000".to_owned(),
+        ]
+    };
+    let one = one_native_daemon();
+    let store = dir.join("trees");
+    let (status, log) =
+        runs_until_sigterm_logged("native-trees-open", &flags(&cache, &store), None);
+    assert!(status.success(), "{status}: {log:#?}");
+    assert!(
+        logged(&log, &["trees: ", "0 trees", "cloned whole"]),
+        "{log:#?}"
+    );
+    assert!(store.is_dir(), "the store was not made");
+    for (name, with, at, off) in [
+        (
+            "native-trees-nocache",
+            &inside,
+            dir.join("nocache-trees"),
+            "off:no-cache",
+        ),
+        (
+            "native-trees-inside",
+            &cache,
+            dir.join("leases").join("trees"),
+            "off:inside-scratch",
+        ),
+    ] {
+        let (status, log) = runs_until_sigterm_logged(name, &flags(with, &at), None);
+        assert!(status.success(), "{status}: {log:#?}");
+        assert!(logged(&log, &["trees:", off, "file by file"]), "{log:#?}");
+        assert!(!at.exists(), "{off}: the daemon made the store");
+    }
+    drop(one);
 }
 
 /// Catches a binary that parses its flags before it answers as the container driver's

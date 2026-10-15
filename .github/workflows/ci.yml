@@ -378,7 +378,7 @@ jobs:
       # The daemon's unit tests, which read its suspend-counting clock on macOS
       # (CLOCK_MONOTONIC_RAW), the fence across a suspend (issue #78), and a keeper
       # started after the binary was renamed over, which macOS finds by its path.
-      - run: cargo test -p kbf-daemon --lib --test suspend --test keeper --locked
+      - run: cargo test -p kbf-daemon --lib --test suspend --test keeper --test cache_clone --test trees_clone --locked
       # The root helper for per-lease users: its unit tests, then the helper itself run
       # as root (passwordless sudo) with real users, launchd, libproc, the sweep, the
       # leak scan and the caller check by code signature, signed as `cargo xtask
