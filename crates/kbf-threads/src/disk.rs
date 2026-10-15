@@ -15,7 +15,9 @@
 //!   the cache already holds.
 //! - [`Space::of_free`]: a share of the free space less the floor (at most half of what
 //!   is free). For a directory that never evicts to a free-space floor (the server's
-//!   write tier, which only stops taking writes at its budget).
+//!   write tier, which only stops taking writes at its budget). The directory's own
+//!   bytes count as free ([`Space::with_held`]): they are the budget's to reuse, and
+//!   without them a restart would shrink the budget by what the tier holds.
 //!
 //! [`FreeSpace`] is where the numbers come from, so a test can give a fake filesystem
 //! any size; [`Statvfs`] is the real one.
@@ -51,6 +53,16 @@ impl Space {
         cap_at(percent_of(room, percent), cap)
     }
 
+    /// This space with `held` more bytes free: what a directory already holds is
+    /// available to that directory. Never more than the filesystem's size.
+    #[must_use]
+    pub fn with_held(&self, held: u64) -> Self {
+        Self {
+            total: self.total,
+            available: self.available.saturating_add(held).min(self.total),
+        }
+    }
+
     /// `percent` of the free space less the floor, at most `cap`. The floor is
     /// [`keep_free`], but never more than half the free space: a nearly full disk gets a
     /// small budget, not none, and only a disk with nothing free gets 0.
@@ -80,6 +92,15 @@ pub trait FreeSpace {
     /// # Errors
     /// No ancestor of `path` can be read.
     fn space(&self, path: &Path) -> io::Result<Space>;
+
+    /// The bytes of the regular files under `dir`, at any depth; 0 when `dir` is not
+    /// made yet. A source that models only sizes (a test's) holds nothing.
+    ///
+    /// # Errors
+    /// A directory under `dir` cannot be read.
+    fn held(&self, _dir: &Path) -> io::Result<u64> {
+        Ok(0)
+    }
 }
 
 /// The real filesystems: `statvfs`.
@@ -101,6 +122,27 @@ impl FreeSpace for Statvfs {
             }
         }
         Err(last)
+    }
+
+    fn held(&self, dir: &Path) -> io::Result<u64> {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
+            Err(e) => return Err(e),
+        };
+        let mut bytes = 0_u64;
+        for entry in entries {
+            let entry = entry?;
+            let meta = std::fs::symlink_metadata(entry.path())?;
+            bytes = bytes.saturating_add(if meta.is_dir() {
+                self.held(&entry.path())?
+            } else if meta.is_file() {
+                meta.len()
+            } else {
+                0
+            });
+        }
+        Ok(bytes)
     }
 }
 
@@ -167,5 +209,37 @@ mod tests {
             .expect("its ancestor's");
         assert_eq!(later.total, made.total);
         assert!(Statvfs.space(Path::new("relative/nowhere")).is_err());
+    }
+
+    /// Catches a directory's own bytes not counted free to it (a restart would shrink
+    /// its budget by what it holds), and the sum going past the filesystem's size.
+    #[test]
+    fn what_a_directory_holds_is_free_to_it() {
+        let space = Space {
+            total: 1000 * GIB,
+            available: 300 * GIB,
+        };
+        assert_eq!(space.with_held(0), space);
+        assert_eq!(space.with_held(100 * GIB).available, 400 * GIB);
+        assert_eq!(space.with_held(u64::MAX).available, 1000 * GIB);
+    }
+
+    /// Catches a walk that misses nested files, counts a directory or a symlink, or
+    /// refuses a directory not made yet.
+    #[test]
+    fn the_real_source_sums_the_files_under_a_directory() {
+        let root = std::env::temp_dir().join(format!("kbf-threads-held-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(Statvfs.held(&root).expect("not made yet"), 0);
+        std::fs::create_dir_all(root.join("a/b")).expect("dirs");
+        std::fs::write(root.join("top"), [0_u8; 10]).expect("file");
+        std::fs::write(root.join("a/mid"), [0_u8; 100]).expect("file");
+        std::fs::write(root.join("a/b/deep"), [0_u8; 1000]).expect("file");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(root.join("a/b/deep"), root.join("link")).expect("link");
+        assert_eq!(Statvfs.held(&root).expect("held"), 1110);
+        assert_eq!(Statvfs.held(&root.join("a")).expect("held"), 1100);
+        assert!(Statvfs.held(&root.join("top")).is_err(), "a file is no directory");
+        std::fs::remove_dir_all(&root).expect("cleanup");
     }
 }

@@ -22,8 +22,8 @@
 //! standard `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` of the environment.
 //!
 //! Sizing is not configuration: a hot store directory's budget is a share of its
-//! filesystem's free space less a floor (`kbf_threads::disk`), at most
-//! `--hot-store-max-bytes`.
+//! filesystem's free space plus the bytes the tier already holds, less a floor
+//! (`kbf_threads::disk`), at most `--hot-store-max-bytes`.
 
 use std::fmt;
 use std::num::NonZeroU64;
@@ -376,7 +376,19 @@ impl StoreFlags<'_> {
                     dir: dir.clone(),
                     source,
                 })?;
-                let budget = on.of_free(HOT_STORE_SHARE_PERCENT, self.hot_max_bytes);
+                // What the tier already holds is the tier's to reuse: counting only the
+                // free space would shrink the budget at every restart by the bytes the
+                // tier keeps. The metadata log in `<hot>/meta` is not the tier's.
+                let held = |path: &Path| {
+                    space.held(path).map_err(|source| StoresError::Space {
+                        dir: path.to_owned(),
+                        source,
+                    })
+                };
+                let tier_bytes = held(dir)?.saturating_sub(held(&dir.join(META_SUBDIR))?);
+                let budget = on
+                    .with_held(tier_bytes)
+                    .of_free(HOT_STORE_SHARE_PERCENT, self.hot_max_bytes);
                 if budget == 0 {
                     return Err(StoresError::HotNoRoom {
                         dir: dir.clone(),
@@ -732,6 +744,98 @@ mod tests {
         );
         assert!(lines[1].starts_with("hot store: none"), "{lines:?}");
         assert_eq!(lines[2], "metadata log: /m (--meta-dir)");
+    }
+
+    /// A disk with a hot directory on it: the tier's bytes (and the log's, under
+    /// `meta`) are used space, so `available` is what is left beside them.
+    struct Used {
+        total: u64,
+        others: u64,
+        tier: u64,
+        meta: u64,
+    }
+
+    impl FreeSpace for Used {
+        fn space(&self, _: &Path) -> io::Result<Space> {
+            Ok(Space {
+                total: self.total,
+                available: self.total - self.others - self.tier - self.meta,
+            })
+        }
+
+        fn held(&self, path: &Path) -> io::Result<u64> {
+            Ok(if path.ends_with(META_SUBDIR) {
+                self.meta
+            } else {
+                self.tier + self.meta
+            })
+        }
+    }
+
+    /// Catches a hot budget that shrinks at a restart by what the tier holds (a share
+    /// of free space alone: a full tier would restart with almost no budget), and one
+    /// that counts the metadata log beside the tier as the tier's bytes. A fresh start
+    /// and a restart with the tier holding 200 GiB (and a 2 GiB log) give one budget,
+    /// and `--hot-store-max-bytes` still caps it.
+    #[test]
+    fn a_restart_gives_the_hot_store_the_budget_of_a_fresh_start() {
+        let (cold, hot) = (file("/cold"), file("/hot"));
+        let budget = |tier: u64, max: Option<u64>| {
+            let disk = Used {
+                total: 1000 * GIB,
+                others: 300 * GIB,
+                tier,
+                meta: 0,
+            };
+            let flags = StoreFlags {
+                hot_max_bytes: max,
+                ..flags(Some(&cold), Some(&hot), Some(Path::new("/meta")))
+            };
+            flags.resolve(&disk).expect("stores").hot.expect("hot").budget
+        };
+        let fresh = budget(0, None);
+        assert_eq!(fresh, (700 - 50) * GIB * 8 / 10);
+        assert_eq!(budget(200 * GIB, None), fresh, "a restart shrank the budget");
+        assert_eq!(budget(200 * GIB, Some(7 * GIB)), 7 * GIB);
+        // The log under `<hot>/meta` is used space that is not the tier's.
+        let beside = Used {
+            total: 1000 * GIB,
+            others: 300 * GIB,
+            tier: 0,
+            meta: 2 * GIB,
+        };
+        let with_log = flags(Some(&cold), Some(&hot), None)
+            .resolve(&beside)
+            .expect("stores")
+            .hot
+            .expect("hot")
+            .budget;
+        assert_eq!(with_log, (698 - 50) * GIB * 8 / 10);
+    }
+
+    /// A disk whose size reads but whose hot directory does not.
+    struct Unwalkable;
+
+    impl FreeSpace for Unwalkable {
+        fn space(&self, _: &Path) -> io::Result<Space> {
+            Ok(DISK)
+        }
+
+        fn held(&self, _: &Path) -> io::Result<u64> {
+            Err(io::Error::from(io::ErrorKind::PermissionDenied))
+        }
+    }
+
+    /// Catches a hot directory that cannot be measured sized anyway (a guess at what
+    /// the tier holds could overfill the disk): the start is refused naming it.
+    #[test]
+    fn an_unreadable_hot_directory_is_refused() {
+        let (cold, hot) = (file("/cold"), file("/hot"));
+        let error = flags(Some(&cold), Some(&hot), None)
+            .resolve(&Unwalkable)
+            .expect_err("unreadable");
+        assert!(matches!(error, StoresError::Space { .. }), "{error}");
+        assert!(error.to_string().contains("/hot"), "{error}");
     }
 
     struct Broken;
