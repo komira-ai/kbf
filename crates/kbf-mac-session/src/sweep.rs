@@ -16,7 +16,9 @@
 //!
 //! Callers must have ended every process of the uid first (`user-delete` refuses
 //! otherwise; `kill-uid` sweeps the crontab and `at` jobs only after its kill), so
-//! nothing of the departing user races the walk.
+//! nothing of the departing user races the walk. System daemons still may: an entry
+//! that is gone by the time the walk examines, opens, lists or removes it is not an
+//! error (it is what the sweep wanted); every other error still is.
 
 use std::ffi::{OsStr, OsString};
 use std::io;
@@ -135,19 +137,20 @@ fn empty_base(path: &Path, uid: u32, swept: &mut Swept) -> io::Result<()> {
     };
     let dev = rustix::fs::fstat(&dir)?.st_dev;
     for name in listed(&dir)? {
-        let result = rustix::fs::statat(&dir, &name, AtFlags::SYMLINK_NOFOLLOW)
-            .map_err(io::Error::from)
-            .and_then(|stat| remove_entry(&dir, &name, &stat, uid, dev, 1));
-        let result = vanished(result);
-        swept.removed += usize::from(result.is_ok());
-        note(swept, &path.join(&name), result);
+        // An entry gone since the listing is neither removed nor an error.
+        let result = examine(&dir, &name).and_then(|stat| match stat {
+            Some(stat) => remove_entry(&dir, &name, &stat, uid, dev, 1).map(|()| 1),
+            None => Ok(0),
+        });
+        swept.removed += *result.as_ref().unwrap_or(&0);
+        note(swept, &path.join(&name), result.map(drop));
     }
     Ok(())
 }
 
-/// Records `result`'s error, if any, against `path`. Every error counts, except that an
-/// entry which vanished is not one (see [`vanished`]): the sweep is then retried, never
-/// assumed done.
+/// Records `result`'s error, if any, against `path`. Every error counts: the sweep is
+/// then retried, never assumed done. (An entry that vanished is no error by the time it
+/// gets here: see [`vanished`].)
 fn note(swept: &mut Swept, path: &Path, result: io::Result<()>) {
     if let Err(why) = result {
         swept.errors.push(format!("{}: {why}", path.display()));
@@ -156,10 +159,9 @@ fn note(swept: &mut Swept, path: &Path, result: io::Result<()>) {
 
 /// `result`, with "no such file or directory" taken as success: an entry that is gone
 /// between the walk's listing of it and its removal (a macOS daemon removing its own
-/// temporary file under the lease user's folder, say) is what the sweep wanted. Only
-/// that error: every other one still leaves the sweep incomplete. Only the entry being
-/// removed or examined is meant, never a place the plan names (a missing one is
-/// [`present`]'s case).
+/// temporary file under the lease user's folder, say, komira-build-farm#652) is what
+/// the sweep wanted. Only that error: every other one still leaves the sweep
+/// incomplete.
 fn vanished(result: io::Result<()>) -> io::Result<()> {
     match result {
         Err(why) if why.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -244,7 +246,7 @@ fn visit(
     depth: usize,
     swept: &mut Swept,
 ) -> io::Result<()> {
-    let Some(stat) = present(rustix::fs::statat(dir, name, AtFlags::SYMLINK_NOFOLLOW))? else {
+    let Some(stat) = examine(dir, name)? else {
         return Ok(());
     };
     // Another filesystem mounted here is never entered.
@@ -254,16 +256,11 @@ fn visit(
             swept.removed += 1;
         }
         // Another owner's directory: searched for the uid's entries, down to the limit.
-        (true, false, true) if depth < MAX_DEPTH => {
-            // A directory that vanished since it was examined holds nothing.
-            let Some(child) = open_child(dir, name, &stat).map(Some).or_else(|why| {
-                vanished(Err(why)).map(|()| None)
-            })?
-            else {
-                return Ok(());
-            };
-            walk_owned(&child, here, uid, dev, depth + 1, swept)?;
-        }
+        // One gone since it was examined holds nothing.
+        (true, false, true) if depth < MAX_DEPTH => vanished(
+            open_child(dir, name, &stat)
+                .and_then(|child| walk_owned(&child, here, uid, dev, depth + 1, swept)),
+        )?,
         _ => {}
     }
     Ok(())
@@ -289,8 +286,8 @@ fn remove_entry(
     vanished(remove_present(dir, name, stat, uid, dev, depth))
 }
 
-/// [`remove_entry`] for an entry that is there, or is gone only if that surfaces as
-/// an error of one of its steps.
+/// [`remove_entry`] with every step's error as it is, "no such file or directory"
+/// included.
 fn remove_present(
     dir: &OwnedFd,
     name: &OsStr,
@@ -315,8 +312,7 @@ fn remove_present(
     }
     let child = open_child(dir, name, stat)?;
     for entry in listed(&child)? {
-        let Some(inner) = present(rustix::fs::statat(&child, &entry, AtFlags::SYMLINK_NOFOLLOW))?
-        else {
+        let Some(inner) = examine(&child, &entry)? else {
             continue;
         };
         remove_entry(&child, &entry, &inner, uid, dev, depth + 1)?;
@@ -345,13 +341,23 @@ fn open_child(dir: &OwnedFd, name: &OsStr, stat: &Stat) -> io::Result<OwnedFd> {
     Ok(child)
 }
 
-/// [`list`], and in tests the point between listing and removing at which a test makes
-/// entries vanish.
+/// [`list`], and in tests the point after a listing at which a test makes entries
+/// vanish. A directory removed since it was opened lists as empty (rustix's [`Dir`]
+/// reads it so), never as an error.
 fn listed(dir: &OwnedFd) -> io::Result<Vec<OsString>> {
     let names = list(dir)?;
     #[cfg(test)]
-    tests::after_listing();
+    tests::reached(tests::Point::Listed);
     Ok(names)
+}
+
+/// `name` in `dir`, examined without following a link; `None` if it is gone. In tests,
+/// the point after an examination at which a test makes entries vanish.
+fn examine(dir: &OwnedFd, name: &OsStr) -> io::Result<Option<Stat>> {
+    let stat = present(rustix::fs::statat(dir, name, AtFlags::SYMLINK_NOFOLLOW));
+    #[cfg(test)]
+    tests::reached(tests::Point::Examined(name));
+    stat
 }
 
 /// The names in `dir`, read whole before any is removed.

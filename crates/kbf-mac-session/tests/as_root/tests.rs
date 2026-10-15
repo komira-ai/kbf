@@ -551,46 +551,40 @@ fn the_ledger_survives_a_restart_of_the_helper() {
 /// Catches: user-delete that refuses at once instead of waiting for a process of the
 /// uid that is about to exit by itself.
 ///
-/// Staged without a race (komira-build-farm#639). `spawn-child` returns once the child
-/// is forked, not once `sleep` runs, so the test polls (up to 3 s) until `pgrep` sees
-/// the sleep, then deletes. Arithmetic: user-delete's first look waits `EXIT_LOOKS` (50)
-/// listings 100 ms apart, so at least 5 s. The sleep runs 4 s from its start and the
-/// delete starts after the poll saw it, so at most 4 s of it are left: under the bound,
-/// so the delete waits it out and cannot meet a process that outlasts the wait. And it
-/// is alive when the delete looks first (milliseconds after the poll), so a delete that
-/// refused at once would be refused.
+/// The process is `kbf-act`'s spawned child itself, sleeping 2 s and then exiting
+/// (komira-build-farm#639: a `/bin/sleep` that the child started was looked for while
+/// the child had not started it yet, 24 ms after the action ended, and was not found).
+/// The action writes the child's pid after spawning it and before it exits, so the
+/// child exists once `run-quiet` returns: there is nothing to wait for before looking.
+/// The look checks it is that pid, of the lease's uid, still alive; the delete follows
+/// at once. User-delete's first look waits up to `EXIT_LOOKS` (50) listings 100 ms
+/// apart, at least 4.9 s, and the child has at most 2 s of sleep left plus its own
+/// start, so the delete waits it out; a delete that refused at once would meet it.
 #[test]
 #[ignore = "needs root: run by `cargo xtask sudo-test -p kbf-mac-session --test as_root`"]
 fn user_delete_waits_for_a_process_that_exits_by_itself() {
-    /// How long the lease user's sleep runs.
-    const SLEEP_SECS: &str = "4";
-    /// How long the test looks for the sleep to appear before it gives up.
-    const SEEN_WITHIN: Duration = Duration::from_secs(3);
     let (_serial, mac) = mac();
     let dir = scratch_dir("lease-13", 0o777);
+    let pid_file = format!("{dir}/child.pid");
     let lease = mac.create("13.1", None);
     lease.kill();
-    let sleep = ["spawn-child", "run", "/bin/sleep", SLEEP_SECS];
+    let sleep: [&str; 5] = ["spawn-child", "--pid", &pid_file, "sleep", "2"];
     says(
         &lease.run_quiet(&dir, &mac.act(&sleep)),
         "exit 0",
-        "start a sleep",
+        "start a sleeping child",
     );
-    let uid = lease.uid();
-    let give_up = Instant::now() + SEEN_WITHIN;
-    let mut sleeping = pgrep(&["-U", &uid, "sleep"]);
-    while sleeping.is_empty() && Instant::now() < give_up {
-        std::thread::sleep(Duration::from_millis(20));
-        sleeping = pgrep(&["-U", &uid, "sleep"]);
-    }
+    let pid = fs::read_to_string(&pid_file).unwrap_or_else(|e| panic!("{pid_file}: {e}"));
+    let pid = pid.trim();
+    let alive = pgrep(&["-U", &lease.uid(), "kbf-act"]);
     assert!(
-        !sleeping.is_empty(),
-        "no sleep process within {SEEN_WITHIN:?} of spawn-child"
+        alive.iter().any(|p| p == pid),
+        "the child {pid} is not a live process of the lease user: {alive:?}"
     );
     says(
         &lease.call("delete"),
         "existed",
-        "delete did not wait for the sleep",
+        "delete did not wait for the sleeping child",
     );
 }
 
