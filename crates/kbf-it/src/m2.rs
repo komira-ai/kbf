@@ -2,7 +2,7 @@
 //! container`, every action in a rootless Podman container of a pinned distroless
 //! image.
 //!
-//! The cell: one `kbf-server` (in-memory metadata and blobs, REAPI on 127.0.0.1:8980,
+//! The cell: one `kbf-server` (blobs and metadata in directories of the cell, REAPI on 127.0.0.1:8980,
 //! the worker listener on 127.0.0.1:8981 over mutual TLS, which also serves the daemon
 //! its blobs) and one `kbf-daemon` with the container driver, run as a system unit with
 //! `Delegate=yes` as the calling user (`sudo -n systemd-run`), the way a build host runs
@@ -294,6 +294,13 @@ impl Cell {
         let mut server = Command::new(self.bin_dir.join("kbf-server"));
         server
             .args(["--listen", REAPI, "--worker-listen", WORKER])
+            .arg("--cold-store")
+            .arg(format!(
+                "file://{}",
+                self.work.join("server-blobs").display()
+            ))
+            .arg("--meta-dir")
+            .arg(self.work.join("server-meta"))
             .arg("--worker-tls-cert")
             .arg(&pki.server_cert)
             .arg("--worker-tls-key")
