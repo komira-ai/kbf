@@ -15,13 +15,18 @@ impl Scheduler {
     /// ([`crate::fence::LEASE_GRACE`]) back to the queue, except the lease a worker
     /// switches the GUI session for, which is kept until the switch grace ends
     /// ([`crate::fence::SESSION_SWITCH_GRACE`]).
-    pub(super) fn expire(&mut self) {
+    ///
+    /// A lease whose `Start` was sent is charged to the operation's farm budget as a run
+    /// lost to silence ([`Scheduler::unproven`]). Returns the result proposed for one
+    /// past the budget, which ends the operation once committed.
+    pub(super) fn expire(&mut self) -> Vec<Effect> {
         let now = self.now;
-        let expired: Vec<(OperationId, RequeueReason)> = self
+        let expired: Vec<(OperationId, LeaseId, WorkerId, RequeueReason)> = self
             .held
             .iter()
             .filter_map(|(lease, held)| {
-                let worker = self.ops[&held.operation].state.holding().map(|(_, w)| w);
+                let op = &self.ops[&held.operation];
+                let worker = op.state.holding().map(|(_, w)| w);
                 let w = worker.and_then(|w| self.workers.get(w));
                 if w.is_some_and(|w| w.alive(now) || w.switching(*lease, now)) {
                     return None;
@@ -32,12 +37,22 @@ impl Scheduler {
                 } else {
                     RequeueReason::Silent
                 };
-                Some((held.operation, reason))
+                // The give-up's own result is on its way to the log.
+                if op.gave_up {
+                    return None;
+                }
+                Some((held.operation, *lease, worker?.clone(), reason))
             })
             .collect();
-        for (id, reason) in expired {
-            self.requeue(id, reason);
+        let mut effects = Vec::new();
+        for (id, lease, worker, reason) in expired {
+            if reason == RequeueReason::Silent {
+                effects.extend(self.unproven(id, lease, &worker, reason));
+            } else {
+                self.requeue(id, reason);
+            }
         }
+        effects
     }
 
     /// Sends back to the queue every committed lease held on `worker` that `running`
@@ -46,8 +61,9 @@ impl Scheduler {
     /// [`Scheduler::farm_fault`]), to another earlier process once the handover grace
     /// has ended, or to the current session and has been out for [`START_GRACE`]. A
     /// lease whose result was reported is kept: that result is on its way to the log.
-    /// Returns the result proposed for a lease lost to a restart past the operation's
-    /// farm reruns, which ends it once committed.
+    /// A lease lost to a restart, or replaced, is charged to the operation's farm budget
+    /// ([`Scheduler::farm_fault`]). Returns the result proposed for one past it, which
+    /// ends the operation once committed.
     pub(super) fn reconcile(&mut self, worker: &WorkerId, running: &[LeaseId]) -> Vec<Effect> {
         let (session, process, handover_ends, stopped) = self
             .workers
@@ -88,6 +104,10 @@ impl Scheduler {
         for (id, lease, reason) in lost {
             if reason == RequeueReason::Restarted {
                 effects.extend(self.restarted(id, lease, worker));
+            } else if reason == RequeueReason::Replaced {
+                effects.extend(self.unproven(id, lease, worker, reason));
+            } else if reason == RequeueReason::NotStarted {
+                effects.extend(self.not_started(id, lease, worker));
             } else {
                 self.requeue(id, reason);
             }

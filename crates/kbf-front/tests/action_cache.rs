@@ -274,3 +274,52 @@ async fn prepare_refuses_outputs_that_are_not_held() {
         .expect("daemon commit");
     assert_eq!(get(&farm, &action).await, Ok(result));
 }
+
+/// Catches a hit served while the store has lost an object holding one of its blobs
+/// (a file deleted under `kbf-server --blob-dir`): the index still holds the blob, so
+/// the closure check passes, and the client would be told to download bytes no one
+/// has. The hit must be a miss, so the action runs again, and the lost object must be
+/// marked unreachable, so FindMissing reports its blob and the client uploads it.
+#[tokio::test]
+async fn get_action_result_misses_when_the_store_lost_an_output_object() {
+    use kbf_objstore::{ByteRange, KeyPrefix, ObjectStore, PageSize};
+    let farm = Farm::start().await;
+    let output = Blob::new("output bytes the store loses");
+    farm.upload(&[&output]).await;
+    let action = Blob::new("link app");
+    let result = ActionResult {
+        output_files: vec![output_file("app", &output)],
+        ..Default::default()
+    };
+    farm.cache
+        .write_action_result(Role::Daemon, action.digest, &result)
+        .await
+        .expect("daemon write");
+    assert_eq!(get(&farm, &action).await, Ok(result.clone()));
+
+    let store = farm.cache.objects();
+    let everything = KeyPrefix::new("").expect("the empty prefix");
+    let listed = store
+        .list(&everything, None, PageSize::MAX)
+        .await
+        .expect("list");
+    let mut holding = Vec::new();
+    for object in listed.objects {
+        let range = ByteRange::new(0, object.size).expect("a non-empty object");
+        let bytes = store.get_range(&object.key, range).await.expect("read");
+        if bytes.windows(output.data.len()).any(|w| w == output.data) {
+            holding.push(object.key);
+        }
+    }
+    let [key] = holding.as_slice() else {
+        panic!("objects holding the output: {holding:?}");
+    };
+    store.delete(key).await.expect("delete");
+
+    assert_eq!(get(&farm, &action).await, Err(Code::NotFound));
+    assert_eq!(
+        farm.find_missing(&[&output]).await,
+        [output.digest],
+        "the lost object's blob is still reported held"
+    );
+}

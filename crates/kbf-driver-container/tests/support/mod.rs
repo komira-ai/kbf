@@ -10,7 +10,9 @@ kbf_daemon::keeper_test_hook!();
 kbf_testkit::act_test_hook!();
 
 pub mod fake;
+pub mod fake_oci;
 pub mod real;
+pub mod rig;
 pub mod swap_kill;
 
 use std::collections::BTreeMap;

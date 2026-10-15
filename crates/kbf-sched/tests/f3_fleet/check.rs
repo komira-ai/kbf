@@ -36,10 +36,10 @@ use std::fmt::Write as _;
 use std::time::Duration;
 
 use kbf_caps::NodeCaps;
-use kbf_sched::{Cordon, Event, Input, OpState, PLACEMENT_ROUND, Request, Scheduler};
+use kbf_sched::{Cordon, Event, FARM_RERUNS, Input, OpState, PLACEMENT_ROUND, Request, Scheduler};
 use kbf_types::{
-    ControlRecord, Digest, DigestFunction, Effect, FarmTime, LeaseId, OperationId, Outcome,
-    Resources, WaiterId, WorkerId,
+    ControlRecord, Digest, DigestFunction, Effect, Failure, FarmTime, LeaseId, LostWhy,
+    OperationId, Outcome, Resources, WaiterId, WorkerId,
 };
 
 /// The scheduler's grace G, in milliseconds.
@@ -90,6 +90,14 @@ struct ShadowOp {
     last_class: Option<Class>,
     /// Since when (ms) its unbroken unservable run lasts.
     since: Option<u64>,
+    /// The workers whose silence ended a sent lease of it: placement prefers others.
+    avoid: BTreeSet<WorkerId>,
+    /// How many sent leases of it ended in silence (the farm budget, which only
+    /// silence spends in F3).
+    charged: u32,
+    /// Its silent worker's lease is the farm budget's last: the scheduler proposed a
+    /// fenced result for it, which answers the operation once committed.
+    silenced: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -101,6 +109,9 @@ struct Holding {
     /// The worker was down at the grant: its `Start` is lost.
     lost: bool,
     committed: bool,
+    /// A worker's result of it was proposed (a silent worker's lease is then given up
+    /// with no charge: that result decides the operation).
+    proposed: bool,
 }
 
 /// What a round must produce, computed before it is fed.
@@ -264,6 +275,9 @@ impl Check {
                         told: None,
                         last_class: None,
                         since: None,
+                        avoid: BTreeSet::new(),
+                        charged: 0,
+                        silenced: false,
                     },
                 );
                 None
@@ -301,7 +315,18 @@ impl Check {
                 }
                 None
             }
-            Event::Committed(_) | Event::Started { .. } | Event::Report { .. } => None,
+            Event::Report {
+                operation, lease, ..
+            } => {
+                if let Some(h) = self.holding.get_mut(operation)
+                    && h.lease == *lease
+                    && h.committed
+                {
+                    h.proposed = true;
+                }
+                None
+            }
+            Event::Committed(_) | Event::Started { .. } => None,
         }
     }
 
@@ -310,11 +335,19 @@ impl Check {
         let expired: Vec<OperationId> = self
             .holding
             .iter()
-            .filter(|(_, h)| !self.live(&h.worker))
+            .filter(|(id, h)| !self.live(&h.worker) && !self.ops[id].silenced)
             .map(|(id, _)| *id)
             .collect();
         for id in expired {
-            self.give_up(id);
+            // A sent lease given up for silence spends the operation's farm budget;
+            // past it the lease is kept until its proposed result is committed.
+            let spent = self.ops[&id].charged >= FARM_RERUNS;
+            if self.holding[&id].committed && !self.holding[&id].proposed && spent {
+                self.charge(id);
+                self.ops.get_mut(&id).expect("known").silenced = true;
+            } else {
+                self.give_up(id);
+            }
         }
     }
 
@@ -342,11 +375,19 @@ impl Check {
                     && self.cordons.contains_key(w) == cordoned
                     && request.needs.matches(&s.caps)
             };
+            // Placement skips the workers of `avoid` while another could run it.
+            let elsewhere = names.iter().any(|w| {
+                usable(w, false)
+                    && !self.ops[&id].avoid.contains(w)
+                    && self.workers[w].capacity.fits(&request.resources)
+            });
             let fit = names.iter().find(|w| {
                 let free = self.workers[*w]
                     .capacity
                     .saturating_sub(booked.get(*w).copied().unwrap_or_default());
-                usable(w, false) && free.fits(&request.resources)
+                usable(w, false)
+                    && free.fits(&request.resources)
+                    && !(elsewhere && self.ops[&id].avoid.contains(*w))
             });
             let class = match fit {
                 Some(w) if round.grants.len() < PLACEMENT_ROUND => {
@@ -438,6 +479,7 @@ impl Check {
                             downs,
                             lost,
                             committed: false,
+                            proposed: false,
                         },
                     );
                     let at = (now, g.worker.clone(), by_uncordon);
@@ -459,6 +501,27 @@ impl Check {
                     refusals.insert(r.operation);
                 }
                 Effect::Commit(ControlRecord::Result(r)) => {
+                    // The proposal of a lease given up past the farm budget (silence
+                    // is predicted at the tick; a replacement shows here). A worker's
+                    // own result is a completion.
+                    if r.outcome
+                        != (Outcome::Completed {
+                            action_result: outcome_of(r.lease),
+                        })
+                    {
+                        let fenced = Outcome::Failed(Failure::Lost(LostWhy::Fenced));
+                        self.ensure(r.outcome == fenced, "I5", || {
+                            format!("{r:?}: the only failure proposed is a give-up's")
+                        });
+                        if !self.ops[&r.operation].silenced {
+                            let charged = self.ops[&r.operation].charged;
+                            self.ensure(charged >= FARM_RERUNS, "I5", || {
+                                format!("{r:?} proposed within the farm budget")
+                            });
+                            self.charge(r.operation);
+                            self.ops.get_mut(&r.operation).expect("known").silenced = true;
+                        }
+                    }
                     let h = self.holding.get(&r.operation);
                     self.ensure(h.is_some_and(|h| h.lease == r.lease), "I5", || {
                         format!("result of {:?} proposed; the holding is {h:?}", r.lease)
@@ -474,12 +537,20 @@ impl Check {
                     });
                 }
                 Effect::Answer(a) => {
-                    let Outcome::Completed { action_result } = a.outcome else {
-                        self.fail("I5", &format!("{a:?}: no run failed"));
-                    };
-                    self.ensure(action_result == outcome_of(a.lease), "I5", || {
-                        format!("{a:?} carries another lease's outcome")
-                    });
+                    if self.ops[&a.operation].silenced {
+                        // Silent past the farm budget: answered as a fenced run.
+                        let fenced = Outcome::Failed(Failure::Lost(LostWhy::Fenced));
+                        self.ensure(a.outcome == fenced, "I5", || {
+                            format!("{a:?}: a silent node's last lease is answered as fenced")
+                        });
+                    } else {
+                        let Outcome::Completed { action_result } = a.outcome else {
+                            self.fail("I5", &format!("{a:?}: no run failed"));
+                        };
+                        self.ensure(action_result == outcome_of(a.lease), "I5", || {
+                            format!("{a:?} carries another lease's outcome")
+                        });
+                    }
                     let newest = self.newest_committed.get(&a.operation);
                     self.ensure(newest == Some(&a.lease), "I5", || {
                         format!("{a:?}: the newest committed grant is {newest:?}")
@@ -553,7 +624,20 @@ impl Check {
         }
     }
 
+    /// Spends one of `id`'s farm runs: its holding's worker is avoided from now on.
+    fn charge(&mut self, id: OperationId) {
+        let worker = self.holding[&id].worker.clone();
+        let op = self.ops.get_mut(&id).expect("known");
+        op.avoid.insert(worker);
+        op.charged += 1;
+    }
+
     fn give_up(&mut self, id: OperationId) {
+        // The fleet's workers register a new process every time and lose a `Start` only
+        // by going down: every sent lease given up is silent or replaced, both charged.
+        if self.holding[&id].committed && !self.holding[&id].proposed {
+            self.charge(id);
+        }
         let h = self.holding.remove(&id).expect("held");
         let downs = self.workers[&h.worker].downs;
         self.ensure(h.lost || downs > h.downs, "I9", || {

@@ -11,25 +11,22 @@ use std::error::Error;
 use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
+use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 
 use kbf_front::{Cache, MemoryMetaLog};
 use kbf_log::FarmLogId;
 use kbf_meta::Retention;
-use kbf_objstore::{Capabilities, KeyPrefix, MemoryStore, ObjectStore};
-use kbf_threads::{Role, Topology};
+use kbf_objstore::{Capabilities, FsStore, KeyPrefix, MemoryStore, ObjectStore};
+use kbf_threads::Topology;
 
 use crate::write_tier::{FLUSH_EVERY, TierLog};
 use crate::{Args, RaftMetaLog, SERVER_VERSION, ServeError, StoreKind, bind_server_with_policy};
 
-/// The server's thread sizes on a given machine shape: the reserve (all the CPUs unless
-/// `--reserve-cpus` says less), the pools from it, then the overrides.
-pub fn sizes_on(
-    args: &Args,
-    topology: Topology,
-) -> Result<kbf_threads::Sizes, kbf_threads::ReserveError> {
-    args.threads.resolve(Role::Server, topology)
+/// The server's thread sizes on a given machine shape: every CPU, then the overrides.
+pub fn sizes_on(args: &Args, topology: Topology) -> kbf_threads::Sizes {
+    args.threads.resolve(topology)
 }
 
 /// A started server: bound, its write tier attached and its flusher running, not yet
@@ -87,23 +84,68 @@ where
     F: Future<Output = ()> + Send + 'static,
 {
     let raft_dir = args.raft_dir()?;
-    let memory = || MemoryMetaLog::new(Retention::default());
-    match args.store {
-        StoreKind::Memory => {
-            let store = MemoryStore::new(Capabilities::default());
-            serve_with(args, memory(), store, KeyPrefix::default(), None, shutdown).await
+    match (args.blob_dir.as_deref(), args.store) {
+        (Some(dir), _) => {
+            let store = FsStore::open(dir, args.blob_dir_min_free_bytes)?;
+            over(
+                args,
+                raft_dir,
+                store,
+                KeyPrefix::default(),
+                BLOB_DIR_PREFIX,
+                shutdown,
+            )
+            .await
         }
-        StoreKind::S3 => {
+        (None, StoreKind::Memory) => {
+            let store = MemoryStore::new(Capabilities::default());
+            let memory = MemoryMetaLog::new(Retention::default());
+            serve_with(args, memory, store, KeyPrefix::default(), None, shutdown).await
+        }
+        (None, StoreKind::S3) => {
             let (store, start_prefix) = args.s3_store(|name| std::env::var(name).ok())?;
-            match raft_dir {
-                None => serve_with(args, memory(), store, start_prefix, None, shutdown).await,
-                Some(dir) => {
-                    let log =
-                        RaftMetaLog::open_dir(dir, Retention::default(), &args.s3_prefix).await?;
-                    let (prefix, id) = (log.store_prefix(), log.log_id());
-                    serve_with(args, log, store, prefix, Some(id), shutdown).await
-                }
-            }
+            over(
+                args,
+                raft_dir,
+                store,
+                start_prefix,
+                &args.s3_prefix,
+                shutdown,
+            )
+            .await
+        }
+    }
+}
+
+/// The key prefix root under `--blob-dir`: objects go under `kbf/<log id>/`.
+const BLOB_DIR_PREFIX: &str = "kbf/";
+
+/// Serves `store` under the metadata log `raft_dir` names: the Raft log there, writing
+/// under the prefix it committed (`<prefix_root><log id>/` for a new log), or without
+/// one a log in memory, writing under `start_prefix`. (`Args::raft_dir` refuses
+/// `--blob-dir` without a Raft log.)
+async fn over<O, S, F>(
+    args: &Args,
+    raft_dir: Option<&Path>,
+    store: O,
+    start_prefix: KeyPrefix,
+    prefix_root: &str,
+    shutdown: S,
+) -> Result<ServerHandle, Box<dyn Error>>
+where
+    O: ObjectStore + 'static,
+    S: FnOnce() -> io::Result<F>,
+    F: Future<Output = ()> + Send + 'static,
+{
+    match raft_dir {
+        None => {
+            let memory = MemoryMetaLog::new(Retention::default());
+            serve_with(args, memory, store, start_prefix, None, shutdown).await
+        }
+        Some(dir) => {
+            let log = RaftMetaLog::open_dir(dir, Retention::default(), prefix_root).await?;
+            let (prefix, id) = (log.store_prefix(), log.log_id());
+            serve_with(args, log, store, prefix, Some(id), shutdown).await
         }
     }
 }
@@ -137,7 +179,7 @@ where
     };
     let cache = Cache::open(meta, store, prefix)
         .await?
-        .with_writes(args.write_config()?);
+        .with_writes(args.write_config());
     let (cache, tier) = crate::write_tier::attach(cache, args).await?;
     let cache = Arc::new(cache);
     let _flusher = tier.map(|_| {
@@ -245,36 +287,35 @@ mod tests {
 
     use super::*;
 
-    /// Catches the server resolving another role's defaults: alone on the 44-core,
-    /// 2-threads-per-core farm node it reserves all 88 CPUs, so 22 async, 128 blocking
-    /// and 44 CPU threads (the daemon's would be 2, 64, 4); a flag still wins over its
-    /// default, a shared reserve halves it, and more than the machine is refused.
+    /// Catches the server sizing itself from anything but the CPU count: on the 44-core,
+    /// 2-threads-per-core farm node it runs 88 async workers, 512 blocking threads
+    /// (tokio's cap) and 88 CPU threads, on a 3-CPU machine 3, 512 and 3; a flag still
+    /// wins over its default (alone), and `--reserve-cpus` and `--reserve-share` are
+    /// refused, so a stale unit file is noticed.
     #[test]
-    fn the_server_resolves_the_server_role() {
-        let topology = || Topology::new(88, 2);
-        let args = Args::parse_from(["kbf-server"]);
-        let sizes = sizes_on(&args, topology()).expect("sizes");
-        assert_eq!(
+    fn the_server_uses_every_cpu() {
+        let triple = |args: &Args, topology| {
+            let sizes = sizes_on(args, topology);
             (
                 sizes.async_threads(),
                 sizes.blocking_threads(),
-                sizes.cpu_threads()
-            ),
-            (22, 128, 44)
-        );
+                sizes.cpu_threads(),
+            )
+        };
+        let args = Args::parse_from(["kbf-server"]);
+        assert_eq!(triple(&args, Topology::new(88, 2)), (88, 512, 88));
+        assert_eq!(triple(&args, Topology::new(3, 1)), (3, 512, 3));
+        assert_eq!(args.cpu_threads_on(Topology::new(88, 2)).get(), 88);
         let args = Args::parse_from(["kbf-server", "--blocking-threads=9"]);
-        assert_eq!(
-            sizes_on(&args, topology())
-                .expect("sizes")
-                .blocking_threads(),
-            9
-        );
-        let shared = Args::parse_from(["kbf-server", "--reserve-cpus=16", "--reserve-share=2"]);
-        assert_eq!(
-            sizes_on(&shared, topology()).expect("sizes").cpu_threads(),
-            4
-        );
-        let too_many = Args::parse_from(["kbf-server", "--reserve-cpus=89"]);
-        assert!(sizes_on(&too_many, topology()).is_err());
+        assert_eq!(triple(&args, Topology::new(88, 2)), (88, 9, 88));
+        let args = Args::parse_from(["kbf-server", "--async-threads=5", "--cpu-threads=6"]);
+        assert_eq!(triple(&args, Topology::new(88, 2)), (5, 512, 6));
+        assert_eq!(args.cpu_threads_on(Topology::new(88, 2)).get(), 6);
+        for flag in ["--reserve-cpus=16", "--reserve-share=2"] {
+            assert!(
+                Args::try_parse_from(["kbf-server", flag]).is_err(),
+                "{flag}"
+            );
+        }
     }
 }

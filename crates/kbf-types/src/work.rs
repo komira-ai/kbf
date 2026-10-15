@@ -154,6 +154,8 @@ pub enum Failure {
     /// The action ran past its timeout.
     Timeout,
     /// The farm failed the action (a kernel OOM, a lost container), not the action itself.
+    /// The scheduler runs it again, preferring another node, while its farm reruns
+    /// last; an operation that finishes with it has used them up.
     Infra,
     /// The action itself cannot run as written (an image named by tag, an output that
     /// is also an input): the client's error, answered INVALID_ARGUMENT. Running it
@@ -209,6 +211,9 @@ pub enum FarmFault {
     NodeMemoryPressure,
     /// The farm lost it.
     Lost(LostWhy),
+    /// The farm could not run it ([`Failure::Infra`]): the daemon's driver failed
+    /// before or around the action, not the action itself.
+    Infra,
 }
 
 impl fmt::Display for FarmFault {
@@ -219,6 +224,7 @@ impl fmt::Display for FarmFault {
                  (node memory pressure)",
             ),
             Self::Lost(why) => why.fmt(f),
+            Self::Infra => f.write_str("the farm could not run the action (infra failure)"),
         }
     }
 }
@@ -382,20 +388,22 @@ mod tests {
     use super::*;
 
     /// Catches two farm faults that read the same to a caller (a restarted daemon
-    /// taken for a fence, or either for a busy node's kill), and a lost run that does
-    /// not read as its cause.
+    /// taken for a fence, or either for a busy node's kill, or any for an infra
+    /// failure), and a lost run that does not read as its cause.
     #[test]
     fn each_farm_fault_reads_differently() {
         let all = [
             FarmFault::NodeMemoryPressure,
             FarmFault::Lost(LostWhy::DaemonRestarted),
             FarmFault::Lost(LostWhy::Fenced),
+            FarmFault::Infra,
         ];
         let text: Vec<String> = all.iter().map(ToString::to_string).collect();
         assert!(text[0].contains("node memory pressure"), "{}", text[0]);
         assert_eq!(text[1], "the daemon restarted while the action ran");
         assert_eq!(text[2], LostWhy::Fenced.to_string());
         assert!(text[2].contains("fenced"), "{}", text[2]);
+        assert!(text[3].contains("infra"), "{}", text[3]);
         for (i, a) in text.iter().enumerate() {
             for b in &text[i + 1..] {
                 assert_ne!(a, b);

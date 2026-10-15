@@ -27,6 +27,10 @@
 //! empty) before anything is bound, and writes objects under the prefix the log
 //! committed; a directory it refuses exits 2.
 //!
+//! `--blob-dir` keeps blob bytes in a local directory (`kbf_objstore::FsStore`) in place
+//! of `--store`, under the fixed key prefix `kbf/<log id>/`; it needs `--meta-log=raft`. A directory that cannot be created or
+//! locked (another server has it open) exits 2 before anything is bound.
+//!
 //! `--write-tier-dir` attaches the local write tier before anything is bound
 //! (`kbf_server::write_tier`), over either metadata log: under `--meta-log=raft` it
 //! first raises the log to machine version 2 (once; a server without a tier never
@@ -58,7 +62,7 @@ fn main() -> ExitCode {
 /// Builds the async runtime the thread flags size, then starts the server on it, prints
 /// the start line and serves until a signal.
 fn serve(args: &Args) -> Result<(), Box<dyn Error>> {
-    let sizes = sizes_on(args, Topology::detect())?;
+    let sizes = sizes_on(args, Topology::detect());
     sizes.log();
     sizes.runtime()?.block_on(async {
         let server = start(args, interrupted).await?;

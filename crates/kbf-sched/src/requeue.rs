@@ -59,6 +59,9 @@ pub enum RequeueReason {
     Restarted,
     /// The worker reported that the farm lost the run (`why`); it runs again.
     Lost(LostWhy),
+    /// The worker reported that the farm could not run the action
+    /// ([`kbf_types::Failure::Infra`]); it runs again.
+    Infra,
 }
 
 impl fmt::Display for RequeueReason {
@@ -92,6 +95,7 @@ impl fmt::Display for RequeueReason {
                 "the daemon restarted, and its successor killed the run before registering"
             }
             Self::Lost(why) => return write!(f, "the farm lost the run ({why}); it runs again"),
+            Self::Infra => "the farm could not run the action (infra failure); it runs again",
         })
     }
 }
@@ -137,6 +141,7 @@ mod tests {
             RequeueReason::Restarted,
             RequeueReason::Lost(LostWhy::Fenced),
             RequeueReason::Lost(LostWhy::DaemonRestarted),
+            RequeueReason::Infra,
         ];
         let text: Vec<String> = all.iter().map(ToString::to_string).collect();
         for (i, a) in text.iter().enumerate() {
