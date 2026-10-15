@@ -327,7 +327,11 @@ where
         let execute = &*self.authorizers.execute;
         authorize(execute, &caller, WAIT_EXECUTION, &ticket.instance).await?;
         let open = self.cache.metrics().execute.wait();
-        Ok(Response::new(operations(ticket, self.closing.clone(), open)))
+        Ok(Response::new(operations(
+            ticket,
+            self.closing.clone(),
+            open,
+        )))
     }
 }
 
@@ -385,7 +389,11 @@ where
         open.dispatched(submitted.is_ok());
         let ticket = submitted?;
         tracing::debug!(%action, operation = %ticket.name, "submitted");
-        Ok(Response::new(operations(ticket, self.closing.clone(), open)))
+        Ok(Response::new(operations(
+            ticket,
+            self.closing.clone(),
+            open,
+        )))
     }
 }
 

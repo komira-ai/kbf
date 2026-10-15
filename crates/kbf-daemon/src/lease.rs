@@ -162,6 +162,14 @@ impl Leases {
             return result_of(id, Err(RuntimeError::Lost(LostWhy::Fenced, why.to_owned())));
         }
         tracing::info!(lease = %id, ok = outcome.is_ok(), "lease finished");
+        if let Err(error) = &outcome {
+            tracing::debug!(
+                lease = %id,
+                kind = failure_kind(error),
+                reason = %one_line(&error.to_string()),
+                "lease failed"
+            );
+        }
         result_of(id, outcome)
     }
 
