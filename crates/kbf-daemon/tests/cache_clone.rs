@@ -86,6 +86,8 @@ async fn every_name_is_its_own_writable_file_and_a_write_never_reaches_the_entry
     assert_eq!(plain.permissions().mode() & 0o7777, 0o444);
     assert_eq!(tool.permissions().mode() & 0o7777, 0o555);
     assert_eq!(first.link_fallbacks, 0);
+    // Clones are their own inodes: copies in `InputStats`, never links.
+    assert_eq!((first.links, first.copies), (0, 3));
 
     std::fs::write(one.join("a"), b"changed").expect("an input is writable");
     let entry = entry_path(&dir, &key(b"shared bytes", false));

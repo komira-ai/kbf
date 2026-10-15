@@ -178,7 +178,7 @@ pub async fn materialize_cached(
 ///
 /// # Errors
 /// As [`materialize_cached`].
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub async fn materialize_cached_phased(
     cas: &impl Cas,
     cache: &crate::cache::Cache,

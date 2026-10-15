@@ -175,8 +175,11 @@ async fn place(
                 };
                 counted.fetch_add(files, Ordering::Relaxed);
                 let (shared, private) = (names.shared.len() as u64, names.private.len() as u64);
-                let (links, copies) = if fell_back {
+                if fell_back {
                     bump(&counts.link_fallbacks);
+                }
+                // A clone is its own inode, as a copy is: nothing is a link in clone mode.
+                let (links, copies) = if fell_back || mode == LinkMode::Clone {
                     (0, shared + private)
                 } else {
                     (shared, private)
