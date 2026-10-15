@@ -536,7 +536,7 @@ async fn the_start_sweep_deletes_the_simulators_a_killed_daemon_left() {
 
 /// The tests that make real simulators.
 #[cfg(target_os = "macos")]
-mod real {
+mod real_skipped_by_mutant {
     use std::io::Write as _;
     use std::process::Command;
 

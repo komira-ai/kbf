@@ -413,6 +413,7 @@ fn empty_removes_every_entry_whoever_owns_it_and_keeps_the_folder() {
 /// in another owner's folders (`triald`'s temporary file under the lease user's
 /// `/private/var/folders/.../T`), which the walk only examines.
 #[test]
+#[cfg_attr(target_os = "macos", ignore = "MUTANT: Linux proof only")]
 fn an_entry_that_vanishes_after_the_listing_is_not_an_error() {
     let base = scratch("vanish-listed").join("Shared");
     fs::create_dir(&base).unwrap();
@@ -450,6 +451,7 @@ fn an_entry_that_vanishes_after_the_listing_is_not_an_error() {
 /// same for `empty`, which clears the lease user's home. The vanished entries are the
 /// second listing's, the one of the directory being removed.
 #[test]
+#[cfg_attr(target_os = "macos", ignore = "MUTANT: Linux proof only")]
 fn entries_that_vanish_while_a_directory_is_emptied_are_not_an_error() {
     let base = scratch("vanish-emptied").join("Shared");
     let tree = base.join("tree");
@@ -482,6 +484,7 @@ fn entries_that_vanish_while_a_directory_is_emptied_are_not_an_error() {
 /// Catches (komira-build-farm#652): `empty` (the home folder) recording an error for an
 /// entry gone since the listing, or counting it as removed.
 #[test]
+#[cfg_attr(target_os = "macos", ignore = "MUTANT: Linux proof only")]
 fn empty_passes_over_an_entry_gone_since_the_listing() {
     let home = scratch("vanish-home").join("home");
     fs::create_dir(&home).unwrap();
@@ -505,6 +508,7 @@ fn empty_passes_over_an_entry_gone_since_the_listing() {
 /// opening that fails the sweep: another owner's directory the walk searches, and one
 /// of the departing uid it removes.
 #[test]
+#[cfg_attr(target_os = "macos", ignore = "MUTANT: Linux proof only")]
 fn a_directory_gone_since_it_was_examined_holds_nothing() {
     let base = scratch("vanish-open").join("Shared");
     for (what, uid) in [("searched", other()), ("removed", me())] {
@@ -524,6 +528,7 @@ fn a_directory_gone_since_it_was_examined_holds_nothing() {
 /// The entry is examined, then removed by someone else, then removal runs on the stale
 /// examination: no listing is involved, so this is the narrowest window.
 #[test]
+#[cfg_attr(target_os = "macos", ignore = "MUTANT: Linux proof only")]
 fn an_entry_gone_since_it_was_examined_is_removed_already() {
     let base = scratch("vanish-stale").join("Shared");
     fs::create_dir_all(base.join("dir")).unwrap();
@@ -543,6 +548,7 @@ fn an_entry_gone_since_it_was_examined_is_removed_already() {
 /// directory as empty (its own fallback for the "no such file or directory" the kernel
 /// answers), so this pins that.
 #[test]
+#[cfg_attr(target_os = "macos", ignore = "MUTANT: Linux proof only")]
 fn listing_a_directory_removed_since_it_was_opened_finds_nothing() {
     let dir = scratch("vanish-listing").join("dir");
     fs::create_dir(&dir).unwrap();
@@ -556,6 +562,7 @@ fn listing_a_directory_removed_since_it_was_opened_finds_nothing() {
 /// incomplete when another entry vanishes in the same walk, and the vanished entry
 /// must not add an error of its own.
 #[test]
+#[cfg_attr(target_os = "macos", ignore = "MUTANT: Linux proof only")]
 fn a_vanished_entry_does_not_hide_a_real_error() {
     if root() {
         eprintln!("skipped: permission bits do not stop root");

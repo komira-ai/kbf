@@ -588,6 +588,40 @@ fn user_delete_waits_for_a_process_that_exits_by_itself() {
     );
 }
 
+/// MUTANT M2: the test as it was before komira-build-farm#639's fix (pgrep for a
+/// `/bin/sleep` the spawned child starts), with the child's start forced late by
+/// 0.5 s so the race the issue saw (the look 24 ms after the action ended, before the
+/// child ran sleep) happens every time.
+#[test]
+#[ignore = "needs root: run by `cargo xtask sudo-test -p kbf-mac-session --test as_root`"]
+fn mutant_m2_old_test_with_the_child_start_forced_late() {
+    let (_serial, mac) = mac();
+    let dir = scratch_dir("lease-19", 0o777);
+    let lease = mac.create("19.1", None);
+    lease.kill();
+    let sleep = [
+        "spawn-child",
+        "sleep",
+        "0.5",
+        ";;",
+        "run",
+        "/bin/sleep",
+        "2",
+    ];
+    says(
+        &lease.run_quiet(&dir, &mac.act(&sleep)),
+        "exit 0",
+        "start a sleep",
+    );
+    let sleeping = pgrep(&["-U", &lease.uid(), "sleep"]);
+    assert!(!sleeping.is_empty(), "no sleep process");
+    says(
+        &lease.call("delete"),
+        "existed",
+        "delete did not wait for the sleep",
+    );
+}
+
 /// The second of the minute, from the wall clock (time zones differ by whole minutes).
 fn second() -> u64 {
     SystemTime::now()

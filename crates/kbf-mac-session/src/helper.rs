@@ -571,7 +571,8 @@ impl Helper {
     /// alive; refuses, naming the processes, if some still are.
     fn none_left(&self, uid: u32) -> Result<(), String> {
         let mut left = self.live(uid)?;
-        let mut looks = 1;
+        // MUTANT M3: the real helper looks once and never waits
+        let mut looks = if cfg!(test) { 1 } else { EXIT_LOOKS };
         while !left.is_empty() && looks < EXIT_LOOKS {
             self.host.pause();
             left = self.live(uid)?;

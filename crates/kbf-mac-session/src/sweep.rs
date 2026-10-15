@@ -164,7 +164,8 @@ fn note(swept: &mut Swept, path: &Path, result: io::Result<()>) {
 /// incomplete.
 fn vanished(result: io::Result<()>) -> io::Result<()> {
     match result {
-        Err(why) if why.kind() == io::ErrorKind::NotFound => Ok(()),
+        // MUTANT M1: NotFound is an error again
+        Err(why) if why.kind() == io::ErrorKind::NotFound && false => Ok(()),
         other => other,
     }
 }
@@ -354,7 +355,10 @@ fn listed(dir: &OwnedFd) -> io::Result<Vec<OsString>> {
 /// `name` in `dir`, examined without following a link; `None` if it is gone. In tests,
 /// the point after an examination at which a test makes entries vanish.
 fn examine(dir: &OwnedFd, name: &OsStr) -> io::Result<Option<Stat>> {
-    let stat = present(rustix::fs::statat(dir, name, AtFlags::SYMLINK_NOFOLLOW));
+    // MUTANT M1: an entry gone since the listing is an error again
+    let stat = rustix::fs::statat(dir, name, AtFlags::SYMLINK_NOFOLLOW)
+        .map(Some)
+        .map_err(io::Error::from);
     #[cfg(test)]
     tests::reached(tests::Point::Examined(name));
     stat
