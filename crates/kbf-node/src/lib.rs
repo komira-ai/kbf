@@ -829,7 +829,12 @@ mod container {
         let placer = match cli.lease_placement.parse()? {
             LeasePlacement::None => None,
             LeasePlacement::NumaNode => {
-                kbf_driver_container::numa::start(&cli.numa_dir, mount, &parent, None)?
+                // The memory the scheduler books on this node (the report's `mem_gib`):
+                // a lease that asks for all of it is the whole host's and is not pinned.
+                let whole_host = kbf_daemon::NodeReport::detect(&[])?
+                    .within(capacity)
+                    .mem_bytes();
+                kbf_driver_container::numa::start(&cli.numa_dir, mount, &parent, whole_host)?
             }
         };
         let mut config = PodmanConfig::new(scratch, parent, cli.daemon.node_id.clone());

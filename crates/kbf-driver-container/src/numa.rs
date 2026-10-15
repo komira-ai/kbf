@@ -9,6 +9,11 @@
 //! booked none counts as one CPU), the lowest node id on a tie. The load is given back
 //! when the [`Pin`] is dropped, with the lease.
 //!
+//! A lease is not pinned, and books no node, when it is not a share of one node: its memory
+//! limit is the whole host's (`whole_host`, the memory the node reports to the scheduler,
+//! which runs such a lease alone) or more than the largest node holds ([`NodeMemory`]). It
+//! gets every CPU and memory node the daemon may use and logs `numa_node=all`.
+//!
 //! `--reserve-cpus` is a bandwidth limit on `actions/` (`cpu.max`), not a set of cores, so
 //! the pinned CPUs are the node's CPUs (within what the daemon's cgroup may use) and the
 //! reserve is still taken off the leases' CPU time as before.
@@ -169,7 +174,8 @@ fn usable(nodes: &[(u32, CpuSet)], allowed: Option<&CpuSet>) -> Vec<(u32, CpuSet
 /// Reads the topology under `nodes_dir` and, on a host with two or more nodes that hold
 /// CPUs, enables the `cpuset` controller for the leases under `actions` and returns the
 /// [`Placer`]. `None` (leases not pinned, one line logged saying why) on a host with
-/// fewer, or whose node directory cannot be read.
+/// fewer, or whose node directory cannot be read. `whole_host` is the memory the node
+/// reports to the scheduler in bytes, if known.
 ///
 /// # Errors
 /// The host has two nodes but `actions` cannot have `cpuset` enabled
@@ -178,7 +184,7 @@ pub fn start(
     nodes_dir: &Path,
     cgroup_root: &Path,
     actions: &str,
-    _whole_host: Option<u64>,
+    whole_host: Option<u64>,
 ) -> Result<Option<Arc<Placer>>, DelegateError> {
     let nodes = match read_nodes(nodes_dir) {
         Ok(nodes) => nodes,
@@ -204,14 +210,55 @@ pub fn start(
         .map(|(id, cpus)| format!("node{id}={cpus}"))
         .collect();
     tracing::info!("lease placement numa-node: {}", shown.join(" "));
-    Ok(Placer::new(usable))
+    // The largest node is known only if every node the leases may use has a figure: with
+    // one missing, a lease that fits it would be taken for one that spans nodes.
+    let per_node = read_node_memory(nodes_dir);
+    let sizes: Option<Vec<u64>> = usable
+        .iter()
+        .map(|(id, _)| per_node.get(id).copied())
+        .collect();
+    let memory = NodeMemory {
+        whole_host,
+        largest_node: sizes.and_then(|sizes| sizes.into_iter().max()),
+    };
+    Ok(Placer::with_memory(usable, memory))
 }
 
 /// The memory of the node's NUMA nodes, read from `node<N>/meminfo` (`MemTotal`), in
 /// bytes by node id. A node whose file is missing or has no `MemTotal` line is left out.
 #[must_use]
-pub fn read_node_memory(_dir: &Path) -> BTreeMap<u32, u64> {
-    BTreeMap::new()
+pub fn read_node_memory(dir: &Path) -> BTreeMap<u32, u64> {
+    let mut memory = BTreeMap::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return memory;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(id) = name
+            .to_str()
+            .and_then(|n| n.strip_prefix("node"))
+            .and_then(|n| n.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let Ok(text) = std::fs::read_to_string(entry.path().join("meminfo")) else {
+            continue;
+        };
+        if let Some(bytes) = text.lines().find_map(mem_total) {
+            memory.insert(id, bytes);
+        }
+    }
+    memory
+}
+
+/// The bytes of a `Node <N> MemTotal: <kB> kB` line.
+fn mem_total(line: &str) -> Option<u64> {
+    let mut words = line.split_whitespace().skip(2);
+    if words.next()? != "MemTotal:" {
+        return None;
+    }
+    let kib: u64 = words.next()?.parse().ok()?;
+    kib.checked_mul(1024)
 }
 
 /// What a [`Placer`] knows of the node's memory, to tell a lease that is not a share of
@@ -287,8 +334,25 @@ impl Placer {
 
     /// Places a lease that booked `cpu_millis` with a memory limit of `memory_bytes`.
     #[must_use]
-    pub fn place_lease(self: &Arc<Self>, cpu_millis: u64, _memory_bytes: u64) -> Placement {
-        Placement::Node(self.place(cpu_millis))
+    pub fn place_lease(self: &Arc<Self>, cpu_millis: u64, memory_bytes: u64) -> Placement {
+        if self.spans_nodes(memory_bytes) {
+            Placement::All
+        } else {
+            Placement::Node(self.place(cpu_millis))
+        }
+    }
+
+    /// Whether a lease with this memory limit is not a share of one node: it is the whole
+    /// host's (the scheduler runs it alone), or more than the largest node holds. No limit
+    /// (0) is neither, as in the scheduler.
+    fn spans_nodes(&self, memory_bytes: u64) -> bool {
+        let at_least =
+            |size: Option<u64>| memory_bytes > 0 && size.is_some_and(|s| memory_bytes >= s);
+        at_least(self.memory.whole_host)
+            || self
+                .memory
+                .largest_node
+                .is_some_and(|node| memory_bytes > node)
     }
 
     /// Places a lease that booked `cpu_millis` (0 counts as one CPU) on the node with the
