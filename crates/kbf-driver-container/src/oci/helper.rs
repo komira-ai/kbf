@@ -20,8 +20,6 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use std::collections::HashSet;
-
 use oci_spec::runtime::{
     LinuxBuilder, LinuxCapabilitiesBuilder, LinuxNamespaceBuilder, LinuxNamespaceType,
     ProcessBuilder, RootBuilder, Spec, SpecBuilder, UserBuilder,
