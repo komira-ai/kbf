@@ -698,7 +698,7 @@ in scheduling reads them.
 | `cpu_periods`, `cpu_throttled`, `throttled_us` | `cpu.stat` `nr_periods`, `nr_throttled`, `throttled_usec`: all 0 while the lease has no `cpu.max` quota, which kbf does not set |
 | `mem_peak` | `memory.peak`, bytes |
 | `parallelism` | `cpu_usage_us` over the run's wall time (the container's create to its exit), two decimals: how many CPUs the action kept busy on average |
-| `numa_bytes` | `node:bytes` pairs, comma-separated: `memory.numa_stat` `anon` plus `file` per NUMA node, of the sample that held the most memory (sampled every second while the action runs, and once at its end: the kernel uncharges anonymous memory when the processes exit, so the end alone shows little) |
+| `numa_bytes` | `node:bytes` pairs, comma-separated: `memory.numa_stat` `anon` plus `file` per NUMA node, of the sample that held the most memory (sampled every second while the action runs, `PodmanConfig::numa_every`, and once at its end: the kernel uncharges anonymous memory when the processes exit, so the end alone shows little) |
 | `numa_spread` | the share of that memory not on the node holding most of it, two decimals (0.00 is all on one node) |
 
 The same counters ride in the result, in `ExecutedActionMetadata.auxiliary_metadata`
@@ -708,6 +708,15 @@ a daemon or server that predates it ignores the field. The server logs one INFO 
 `mnemonic` and `target` (the `RequestMetadata` the client sent on the Execute, quoted;
 `-` when it sent none), `wall_us`, and the same cgroup fields as above, so a build's
 actions can be grouped by mnemonic or target and their `parallelism` read off.
+
+A lease that ends without a result (timed out, killed, out of memory) has the same
+fields, read from its cgroup before the cgroup is removed (`Runtime::failed_usage`;
+the container driver does it), and carries the `ResourceUsage` in the metadata of the
+`action_result` of its `worker.Result`: the peak memory of an OOM-killed action and the
+CPU of a timed-out one are what the memory ladder needs. A lease killed for memory, its
+own limit or the node's, ends the line with ` oom=1` (no such key otherwise). The
+server does not log `action usage:` for these yet: it reads the usage of an OK result
+only, and keeps of a timeout's partial result only its logs.
 
 At start the daemon logs the host's NUMA layout once (Linux), from
 `/sys/devices/system/node`: `numa layout: nodes=2 cpus=64 node0=0-15,32-47

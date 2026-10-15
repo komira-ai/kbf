@@ -205,7 +205,9 @@ fn the_numa_sample_with_the_most_memory_wins_over_a_later_smaller_one() {
 
 /// Catches a sampler that never samples (the memory of the run is gone by the end): the
 /// file's value is read while the watch is polled, and gone from the file by the end.
-#[tokio::test]
+/// The clock is paused: it moves only when everything waits for a timer, so the ticks
+/// all fall before the end of the select, whatever the machine's speed.
+#[tokio::test(start_paused = true)]
 async fn the_watch_samples_while_the_action_runs() {
     let dir = scratch("watch");
     write(&dir, "memory.numa_stat", "anon N0=500 N1=500\n");

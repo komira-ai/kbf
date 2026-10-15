@@ -12,11 +12,14 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use kbf_proto::worker::{CgroupUsage, NumaNodeBytes};
+use kbf_proto::worker::{CgroupUsage, NumaNodeBytes, ResourceUsage};
 
-/// How often [`NumaSample::watch`] reads `memory.numa_stat` while the action runs.
+/// How often [`NumaSample::watch`] reads `memory.numa_stat` while the action runs, unless
+/// `PodmanConfig::numa_every` says otherwise.
 pub(crate) const NUMA_EVERY: Duration = Duration::from_secs(1);
 
 /// The counters of `cpu.stat` the usage takes.
@@ -93,9 +96,20 @@ fn read_u64(dir: &Path, name: &str) -> Option<u64> {
 #[derive(Debug, Default)]
 pub(crate) struct NumaSample {
     best: BTreeMap<u32, u64>,
+    /// Counts each sample that read some memory, if the runtime counts them.
+    counted: Option<Arc<AtomicU64>>,
 }
 
 impl NumaSample {
+    /// A sample that adds one to `counted` for each reading of `memory.numa_stat` that
+    /// held memory ([`crate::PodmanRuntime::numa_samples`]).
+    pub(crate) fn counting(counted: Arc<AtomicU64>) -> Self {
+        Self {
+            best: BTreeMap::new(),
+            counted: Some(counted),
+        }
+    }
+
     /// Reads `memory.numa_stat` of the cgroup `dir` and keeps it if it holds more than
     /// every earlier sample (a sample that cannot be read changes nothing).
     pub(crate) fn observe(&mut self, dir: &Path) {
@@ -103,6 +117,11 @@ impl NumaSample {
             return;
         };
         let now = numa_stat(&text);
+        if total(&now) > 0
+            && let Some(counted) = &self.counted
+        {
+            counted.fetch_add(1, Ordering::Release);
+        }
         if total(&now) > total(&self.best) {
             self.best = now;
         }
@@ -139,6 +158,19 @@ impl NumaSample {
                 .map(|(node, bytes)| NumaNodeBytes { node, bytes })
                 .collect(),
         }
+    }
+}
+
+/// The usage a result carries for a lease that ran `wall`: the cgroup's counters beside
+/// the four numbers every runtime reports (user and system CPU, peak memory, wall time),
+/// which come from the same files.
+pub(crate) fn resource_usage(cgroup: CgroupUsage, wall: Duration) -> ResourceUsage {
+    ResourceUsage {
+        cpu_user_micros: cgroup.cpu_user_micros.unwrap_or(0),
+        cpu_system_micros: cgroup.cpu_system_micros.unwrap_or(0),
+        peak_memory_bytes: cgroup.memory_peak_bytes.unwrap_or(0),
+        wall_micros: u64::try_from(wall.as_micros()).unwrap_or(u64::MAX),
+        cgroup: Some(cgroup),
     }
 }
 

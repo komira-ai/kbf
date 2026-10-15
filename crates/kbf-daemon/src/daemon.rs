@@ -879,9 +879,9 @@ impl Daemon {
     fn finished(
         &mut self,
         tx: Option<&UnboundedSender<DaemonMessage>>,
-        (id, outcome, phases): Done,
+        (id, outcome, usage, phases): Done,
     ) {
-        let result = self.leases.finished(id, outcome, &phases);
+        let result = self.leases.finished(id, outcome, usage, &phases);
         self.emit(Event::LeaseEnded(phases));
         self.report(tx, result);
     }

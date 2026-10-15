@@ -8,7 +8,10 @@
 //! put in the result (`kbf_proto::worker::CgroupUsage`), `-` where not measured: a
 //! driver without a lease cgroup, or a kernel without the file. `parallelism` is the
 //! cgroup's CPU time over the run's wall time, `numa_spread` the share of its memory
-//! not on the node holding most of it; neither is used to decide anything.
+//! not on the node holding most of it; neither is used to decide anything. A lease that
+//! ended without a result (timed out, killed, out of memory) has them too, if its driver
+//! read the cgroup before removing it ([`crate::Runtime::failed_usage`]); one killed for
+//! memory, its own limit or the node's, ends with ` oom=1` (no such key otherwise).
 //!
 //! The phase times are the driver's own stamps in the result's
 //! `ExecutedActionMetadata` (input fetch, execution, output upload), so they are known
@@ -60,6 +63,9 @@ pub struct LeasePhases {
     /// The cgroup's `key=value` fields as the line prints them (`-` for each when the
     /// result carries none): see `kbf_proto::worker::CgroupUsage::log_fields`.
     cgroup_fields: String,
+    /// Whether the lease was killed for memory (its own limit, or the node's): the line
+    /// ends with ` oom=1` then, and has no such key otherwise.
+    oom: bool,
 }
 
 impl LeasePhases {
@@ -106,6 +112,26 @@ impl LeasePhases {
             parallelism_centi: cgroup.and_then(|(c, wall)| c.parallelism_centi(wall)),
             numa_spread_centi: cgroup.and_then(|(c, _)| c.numa_spread_centi()),
             cgroup_fields: cgroup.map_or_else(no_cgroup_fields, |(c, wall)| c.log_fields(wall)),
+            oom: false,
+        }
+    }
+
+    /// These phases of a lease that ended without a result: `usage` is what its
+    /// runtime counted before the failure ([`crate::Runtime::failed_usage`]), in the
+    /// place of the result's, and `oom` whether it was killed for memory. A lease with
+    /// a result has its usage there already, and is not changed by `None`.
+    #[must_use]
+    pub fn failed_with(self, usage: Option<&ResourceUsage>, oom: bool) -> Self {
+        let cgroup = usage.and_then(|u| Some((u.cgroup.as_ref()?, u.wall_micros)));
+        match cgroup {
+            None => Self { oom, ..self },
+            Some((c, wall)) => Self {
+                parallelism_centi: c.parallelism_centi(wall),
+                numa_spread_centi: c.numa_spread_centi(),
+                cgroup_fields: c.log_fields(wall),
+                oom,
+                ..self
+            },
         }
     }
 }
@@ -129,7 +155,7 @@ impl fmt::Display for LeasePhases {
         write!(
             f,
             "lease={} driver={} ok={} lease_ms={} inputs_ms={} run_ms={} outputs_ms={} \
-             output_files={} output_dirs={} {}",
+             output_files={} output_dirs={} {}{}",
             self.lease,
             self.driver,
             self.ok,
@@ -140,6 +166,7 @@ impl fmt::Display for LeasePhases {
             self.output_files,
             self.output_dirs,
             self.cgroup_fields,
+            if self.oom { " oom=1" } else { "" },
         )
     }
 }
