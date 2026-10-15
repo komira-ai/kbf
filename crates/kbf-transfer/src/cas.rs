@@ -11,6 +11,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use futures::future::BoxFuture;
 use futures::{Stream, StreamExt as _};
 use kbf_proto::reapi::Digest;
 use kbf_types::LeaseId;
@@ -156,6 +157,17 @@ pub trait Cas: Send + Sync + 'static {
         async move { self.put_records(spool.outgoing()).await }
     }
 
+    /// Where a walk that reads output files to hash them hands each file's bytes as it
+    /// reads them, so the store takes them in that same read: the in-process data plane,
+    /// whose store is in this process. A file whose bytes were taken is stored when the
+    /// intake is finished ([`Intake::finish`]), not sent again with
+    /// [`Cas::put_records`]. `None`, this default, for a store that reads each file
+    /// itself when it sends it, from the [`Record`]'s source (the transfer engine,
+    /// which sends only the files the server answered missing).
+    fn intake(&self) -> Option<Arc<dyn Intake>> {
+        None
+    }
+
     /// How many requests this store runs at once, for the whole process. A caller that
     /// queues work ahead of the store (a tree walk holding files open for upload) keeps
     /// no more than this many items queued, so it holds that many, not the whole tree.
@@ -208,9 +220,41 @@ impl<C: Cas> Cas for Arc<C> {
         C::put_records(self, records)
     }
 
+    fn intake(&self) -> Option<Arc<dyn Intake>> {
+        C::intake(self)
+    }
+
     fn in_flight(&self) -> usize {
         C::in_flight(self)
     }
+}
+
+/// A store's side of a walk that reads each file once ([`Cas::intake`]): one per walk,
+/// shared by the threads that hash.
+pub trait Intake: Send + Sync {
+    /// A file of `size` bytes (its size when it was opened) about to be read, its
+    /// chunks handed over as they are read; `None` when the store does not take it (a
+    /// file larger than it can hold), which then goes to [`Cas::put_records`] as any
+    /// other. Called on a hashing thread.
+    fn file(&self, size: u64) -> Option<Box<dyn IntakeFile>>;
+
+    /// Stores every file finished so far whose blob the store lacks, and returns once
+    /// all are durable: after it, none of them needs [`Cas::put_records`]. The first
+    /// failure is the answer.
+    fn finish(&self) -> BoxFuture<'_, Result<(), CasError>>;
+}
+
+/// One file on its way into an [`Intake`]. Dropped unfinished (the file did not fit,
+/// changed, or could not be read), it stores nothing.
+pub trait IntakeFile: Send {
+    /// The next `chunk` of the file's bytes, as read: the caller's buffer, reused for
+    /// the next chunk.
+    fn write(&mut self, chunk: &[u8]);
+
+    /// Every chunk was written, and together they hash to `digest` and CRC-32C
+    /// `crc32c`. May wait for the store to take earlier files first. Called on a
+    /// hashing thread.
+    fn finish(self: Box<Self>, digest: kbf_types::Digest, crc32c: u32);
 }
 
 /// A blob's bytes on their way to [`Cas::put_chunks`], one chunk at a time.

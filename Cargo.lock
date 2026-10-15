@@ -1294,9 +1294,11 @@ dependencies = [
 name = "kbf-all-in-one"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "clap",
  "futures",
  "kbf-cas-conformance",
+ "kbf-daemon",
  "kbf-driver-container",
  "kbf-front",
  "kbf-node",
@@ -1919,6 +1921,7 @@ dependencies = [
 name = "kbf-transfer"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "futures",
  "hex",
  "kbf-front",

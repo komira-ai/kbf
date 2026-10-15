@@ -41,19 +41,19 @@ fn a_file_that_is_no_longer_regular_is_not_hashed() {
     let (dir, fd) = scratch("hashing-fifo");
     rustix::fs::mknodat(&*fd, "fifo", FileType::Fifo, Mode::RUSR | Mode::WUSR, 0).expect("mkfifo");
     let mut buffer = Vec::new();
-    let why = hash_file(&fd, "fifo", u64::MAX, &mut buffer).expect_err("a FIFO");
+    let why = hash_file(&fd, "fifo", u64::MAX, &mut buffer, None).expect_err("a FIFO");
     assert!(
         why.to_string().contains("no longer a regular file"),
         "{why}"
     );
     std::fs::write(dir.join("file"), b"bytes").expect("write");
-    let hashed = hash_file(&fd, "file", 5, &mut buffer)
+    let hashed = hash_file(&fd, "file", 5, &mut buffer, None)
         .expect("a regular file")
         .expect("within the bound");
     assert_eq!((hashed.digest, hashed.crc32c), whole(b"bytes"));
     assert!(!hashed.executable);
     assert!(
-        hash_file(&fd, "file", 4, &mut buffer)
+        hash_file(&fd, "file", 4, &mut buffer, None)
             .expect("a regular file")
             .is_none()
     );
@@ -75,13 +75,13 @@ fn a_small_file_does_not_cost_a_chunk_of_buffer() {
     let mut buffer = Vec::new();
     for n in 0..200 {
         std::fs::write(dir.join(format!("f{n}")), vec![n as u8; 100 + n]).expect("write");
-        hash_file(&fd, &format!("f{n}"), u64::MAX, &mut buffer)
+        hash_file(&fd, &format!("f{n}"), u64::MAX, &mut buffer, None)
             .expect("hashed")
             .expect("fits");
     }
     assert!(buffer.len() <= 4096, "{} bytes of buffer", buffer.len());
     std::fs::write(dir.join("big"), vec![7u8; CHUNK + 5]).expect("write");
-    let big = hash_file(&fd, "big", u64::MAX, &mut buffer)
+    let big = hash_file(&fd, "big", u64::MAX, &mut buffer, None)
         .expect("hashed")
         .expect("fits");
     assert_eq!(buffer.len(), CHUNK, "a large file reads a chunk at a time");
@@ -108,7 +108,7 @@ async fn files_are_hashed_on_as_many_threads_as_the_pool_has() {
         let key = Arc::as_ptr(&upper) as usize;
         SEEN.lock().expect("seen").remove(&key);
         let pool = CpuPool::new(threads);
-        let outcomes = hash_all(&pool, &upper, Arc::clone(&jobs), u64::MAX).await;
+        let outcomes = hash_all(&pool, &upper, Arc::clone(&jobs), u64::MAX, None).await;
         let seen = SEEN.lock().expect("seen")[&key].len();
         if threads == 1 {
             assert_eq!(seen, 1);
@@ -142,19 +142,19 @@ async fn the_first_failure_stops_the_files_after_it() {
     }
     let jobs: Arc<[Job]> = vec![job(&dirs, "a", 5), job(&dirs, "b", 5), job(&dirs, "c", 5)].into();
     let pool = CpuPool::new(1);
-    let outcomes = hash_all(&pool, &upper, Arc::clone(&jobs), u64::MAX).await;
+    let outcomes = hash_all(&pool, &upper, Arc::clone(&jobs), u64::MAX, None).await;
     assert!(matches!(outcomes[0], Some(Ok(Some(_)))));
     assert!(matches!(outcomes[1], Some(Err(_))), "{:?}", outcomes[1]);
     assert!(outcomes[2].is_none(), "a file after the failure was hashed");
     // Bytes: 5 + 5 do not fit 9; with one thread the first fits and the second is None.
     let jobs: Arc<[Job]> = vec![job(&dirs, "a", 5), job(&dirs, "c", 5)].into();
-    let outcomes = hash_all(&pool, &upper, jobs, 9).await;
+    let outcomes = hash_all(&pool, &upper, jobs, 9, None).await;
     assert!(matches!(outcomes[0], Some(Ok(Some(_)))));
     assert!(matches!(outcomes[1], Some(Ok(None))));
     // A directory that is gone, then the same directory name for two files in a row.
     let elsewhere: Arc<[String]> = Arc::from(vec!["gone".to_owned()]);
     let jobs: Arc<[Job]> = vec![job(&elsewhere, "a", 5)].into();
-    let outcomes = hash_all(&pool, &upper, jobs, u64::MAX).await;
+    let outcomes = hash_all(&pool, &upper, jobs, u64::MAX, None).await;
     let why = outcomes[0]
         .as_ref()
         .expect("reached")
@@ -180,9 +180,9 @@ fn a_file_that_holds_more_than_its_size_says_is_not_trusted() {
     )
     .expect("open /proc/self");
     let mut buffer = Vec::new();
-    let why = hash_file(&proc, "status", u64::MAX, &mut buffer).expect_err("size differs");
+    let why = hash_file(&proc, "status", u64::MAX, &mut buffer, None).expect_err("size differs");
     assert!(why.to_string().contains("changed while"), "{why}");
-    let within = hash_file(&proc, "status", 100, &mut buffer).expect("read");
+    let within = hash_file(&proc, "status", 100, &mut buffer, None).expect("read");
     assert!(within.is_none(), "more than 100 bytes read");
 }
 
@@ -208,8 +208,93 @@ fn workers_skip_the_files_of_a_hash_that_was_dropped() {
         first_bad: AtomicUsize::new(usize::MAX),
         max: u64::MAX,
         used: AtomicU64::new(0),
+        intake: None,
     });
     drop(CancelOnDrop(Arc::clone(&shared)));
     let hashed = work(&shared).len();
     assert!(hashed <= 1, "{hashed} of 500 files hashed after the drop");
+}
+
+/// Catches a file read twice, or held whole, when the store takes it as it is read: a
+/// file of two and a half chunks goes to the intake in the chunks the hash read, none
+/// over [`CHUNK`], adding up to the file, and is finished under the digest the hash
+/// came to and marked taken (mutants: the chunks not handed over, the file read whole
+/// first, the file not finished or not marked). A file past `max`, or one that changed
+/// while it was read, is handed over but never finished; a file the intake declines is
+/// hashed as before and not taken.
+#[test]
+fn a_file_goes_to_the_intake_a_chunk_at_a_time_as_it_is_hashed() {
+    use crate::intake_tests::{Intaking, Recording};
+    let (dir, fd) = scratch("hashing-intake");
+    let bytes: Vec<u8> = (0..CHUNK * 5 / 2).map(|i| (i % 251) as u8).collect();
+    std::fs::write(dir.join("file"), &bytes).expect("write");
+    let cas = Arc::new(crate::cas::MemoryCas::new());
+    let recording = Recording::new(Arc::clone(&cas), false);
+    let intake = Intaking(Arc::clone(&recording));
+    let mut buffer = Vec::new();
+    let hashed = hash_file(&fd, "file", u64::MAX, &mut buffer, Some(&intake))
+        .expect("hashed")
+        .expect("fits");
+    assert!(hashed.taken);
+    assert_eq!((hashed.digest, hashed.crc32c), whole(&bytes));
+    {
+        let files = recording.files.lock().expect("files");
+        let [taken] = &files[..] else {
+            panic!("one file taken: {files:?}");
+        };
+        assert_eq!(taken.size, bytes.len() as u64);
+        assert_eq!(taken.chunks, [CHUNK, CHUNK, CHUNK / 2]);
+        assert_eq!(taken.bytes, bytes);
+        assert_eq!(taken.finished, Some(hashed.digest));
+    }
+
+    let too_large = hash_file(&fd, "file", CHUNK as u64, &mut buffer, Some(&intake));
+    assert!(matches!(too_large, Ok(None)), "{too_large:?}");
+    let proc = rustix::fs::openat(
+        rustix::fs::CWD,
+        format!("/proc/{}", std::process::id()),
+        crate::outputs::DIRECTORY,
+        Mode::empty(),
+    )
+    .expect("open /proc/self");
+    let changed = hash_file(&proc, "status", u64::MAX, &mut buffer, Some(&intake));
+    assert!(changed.is_err(), "{changed:?}");
+    assert_eq!(recording.opened(), 2, "a file past max is not offered");
+    assert_eq!(
+        recording.finished().len(),
+        1,
+        "only the first file is finished"
+    );
+
+    let declining = Intaking(Recording::new(cas, true));
+    let hashed = hash_file(&fd, "file", u64::MAX, &mut buffer, Some(&declining))
+        .expect("hashed")
+        .expect("fits");
+    assert!(!hashed.taken);
+    assert_eq!(hashed.digest, whole(&bytes).0);
+}
+
+/// Catches the pool's workers not handing files to the intake: every file of a set
+/// hashed on the pool is taken, once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn files_hashed_on_the_pool_go_to_the_intake() {
+    use crate::intake_tests::{Intaking, Recording};
+    let (dir, upper) = scratch("hashing-intake-pool");
+    let dirs: Arc<[String]> = Arc::from(Vec::<String>::new());
+    let jobs: Arc<[Job]> = (0..20)
+        .map(|i| {
+            let name = format!("f{i}");
+            std::fs::write(dir.join(&name), vec![i as u8; 1000 + i]).expect("write");
+            job(&dirs, &name, 1000 + i as u64)
+        })
+        .collect();
+    let recording = Recording::new(Arc::new(crate::cas::MemoryCas::new()), false);
+    let intake: Arc<dyn Intake> = Arc::new(Intaking(Arc::clone(&recording)));
+    let pool = CpuPool::new(4);
+    let outcomes = hash_all(&pool, &upper, jobs, u64::MAX, Some(intake)).await;
+    for outcome in &outcomes {
+        let digested = outcome.as_ref().expect("reached").as_ref().expect("hashed");
+        assert!(digested.as_ref().expect("fits").taken);
+    }
+    assert_eq!(recording.finished().len(), 20);
 }

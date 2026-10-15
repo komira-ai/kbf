@@ -35,6 +35,11 @@
 //! stdout and stderr are stored the other way, each within its own limit
 //! ([`collect_log`]).
 //!
+//! A store in this process (the in-process plane, [`Cas::intake`]) takes each file's
+//! chunks as the hash pass reads them, so each output file, and stdout and stderr, is
+//! read exactly once: those files are stored when the intake is finished, before the
+//! Directory messages and the Tree go to [`Cas::put_records`], and are never read again.
+//!
 //! REAPI names are UTF-8 strings, sorted by code point. A name or symlink target in an
 //! output that is not UTF-8 fails the action ([`TreeError::NotUtf8`]) rather than
 //! being recorded altered: two such names could become one, and the sort order would
@@ -51,7 +56,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use kbf_daemon::cas::{
-    Cas, FileSource, OPEN_DIRECTORY, OPEN_FILE, Record, Source, descend, label, proto_digest,
+    Cas, CasError, FileSource, Intake, OPEN_DIRECTORY, OPEN_FILE, Record, Source, descend, label,
+    proto_digest,
 };
 use kbf_daemon::cpu_pool::CpuPool;
 use kbf_proto::reapi::{
@@ -63,7 +69,7 @@ use rustix::fs::{AtFlags, CWD, Dir, FileType, Mode, OFlags, Stat};
 use rustix::io::Errno;
 
 use crate::cas::FileBlob;
-use crate::hashing::{Digested, Job, Outcome, hash_all};
+use crate::hashing::{Digested, Job, Outcome, hash_all, read_through};
 use crate::tree::{Exceeded, TreeError, check_relative};
 
 /// How much output one action may leave. An action past a limit fails with
@@ -207,18 +213,44 @@ fn examine(dir: &OwnedFd, name: &OsStr) -> std::io::Result<Option<Kind>> {
     }
 }
 
-/// The log open as `fd`, hashed ([`FileBlob::hash`]: at most `max + 1` bytes read, one
-/// chunk held at a time); `None` when it holds more than `max` bytes. The type is checked
-/// on the descriptor: an entry that stopped being a regular file after it was examined
-/// is an error, never read.
-fn hash_regular(fd: OwnedFd, max: u64) -> std::io::Result<Option<FileBlob>> {
+/// A log read once: what [`collect_log`] stores, or why it does not.
+enum Log {
+    /// More than the limit.
+    TooLarge,
+    /// Taken by the store as it was read, its digest this; stored when `intake` is
+    /// finished.
+    Taken(kbf_types::Digest, Arc<dyn Intake>),
+    /// Hashed, to be read again as it is sent.
+    Hashed(FileBlob),
+}
+
+/// The log open as `fd`, read through once: handed to `intake` as it is hashed when
+/// there is one that takes it, else hashed ([`FileBlob::hash`]) to be sent later. At most
+/// `max + 1` bytes are read, one chunk held at a time. The type is checked on the
+/// descriptor: an entry that stopped being a regular file after it was examined is an
+/// error, never read.
+fn read_log(fd: OwnedFd, max: u64, intake: Option<Arc<dyn Intake>>) -> std::io::Result<Log> {
     let stat = rustix::fs::fstat(&fd)?;
     if !matches!(kind(&stat), Kind::File { .. }) {
         return Err(std::io::Error::other(
             "is no longer a regular file once opened",
         ));
     }
-    FileBlob::hash(std::fs::File::from(fd), max)
+    let size = u64::try_from(stat.st_size).unwrap_or(0);
+    let file = std::fs::File::from(fd);
+    // A log past the limit is refused without being offered; the read still stops one
+    // byte past it.
+    let taking = intake
+        .filter(|_| size <= max)
+        .and_then(|intake| Some((intake.file(size)?, intake)));
+    let Some((mut taking, intake)) = taking else {
+        return Ok(FileBlob::hash(file, max)?.map_or(Log::TooLarge, Log::Hashed));
+    };
+    let read = read_through(&file, size, max, &mut Vec::new(), Some(taking.as_mut()))?;
+    Ok(read.map_or(Log::TooLarge, |(digest, crc32c)| {
+        taking.finish(digest, crc32c);
+        Log::Taken(digest, intake)
+    }))
 }
 
 /// The target of the symlink `name` in `dir`, as written; never followed.
@@ -235,23 +267,50 @@ fn utf8(bytes: Vec<u8>, shown: &Path, what: &'static str) -> Result<String, Tree
 }
 
 /// Stores the log the driver captured at `path` (the action's stdout or stderr) in
-/// the CAS one chunk at a time, and returns its digest. A log of more than `max` bytes
-/// fails with [`TreeError::Limit`] once `max + 1` bytes are read. The log is opened
-/// without following a symlink.
+/// the CAS one chunk at a time, and returns its digest. Into a store with an intake
+/// ([`Cas::intake`]) the log is read once, hashed and handed over in the same pass;
+/// otherwise it is hashed, then read again as it is sent. A log of more than `max`
+/// bytes fails with [`TreeError::Limit`] once `max + 1` bytes are read. The log is
+/// opened without following a symlink.
 pub(crate) async fn collect_log(
     cas: &impl Cas,
     path: &Path,
     max: u64,
 ) -> Result<kbf_proto::reapi::Digest, TreeError> {
-    let open = path.to_owned();
+    let (open, intake) = (path.to_owned(), cas.intake());
     let read = blocking(path, move || {
-        hash_regular(rustix::fs::openat(CWD, &open, FILE, Mode::empty())?, max)
+        read_log(
+            rustix::fs::openat(CWD, &open, FILE, Mode::empty())?,
+            max,
+            intake,
+        )
     })
     .await?;
-    let Some(blob) = read else {
-        return Err(limit(path, Exceeded::Stdio, max));
-    };
-    Ok(blob.store(cas).await?)
+    match read {
+        Log::Hashed(blob) => Ok(blob.store(cas).await?),
+        other => kept(other, path, max).await,
+    }
+}
+
+/// The digest of a log [`read_log`] left nothing to send of: stored by the intake that
+/// took it, or refused as more than `max` bytes.
+async fn kept(log: Log, path: &Path, max: u64) -> Result<Digest, TreeError> {
+    match log {
+        Log::Taken(digest, intake) => {
+            intake.finish().await?;
+            Ok(proto_digest(&digest))
+        }
+        _ => Err(limit(path, Exceeded::Stdio, max)),
+    }
+}
+
+/// Stores the files `intake` took, when there is one: before any message that names
+/// them is stored.
+async fn finish(intake: Option<Arc<dyn Intake>>) -> Result<(), CasError> {
+    match intake {
+        Some(intake) => intake.finish().await,
+        None => Ok(()),
+    }
 }
 
 /// An entry of a directory being walked: its name, what it is, and for a symlink its
@@ -368,7 +427,15 @@ pub(crate) async fn collect(
     };
     let listed = started.elapsed();
     let jobs: Arc<[Job]> = std::mem::take(&mut listing.jobs).into();
-    let hashed = hash_all(pool, &upper_fd, Arc::clone(&jobs), limits.max_bytes).await;
+    let intake = cas.intake();
+    let hashed = hash_all(
+        pool,
+        &upper_fd,
+        Arc::clone(&jobs),
+        limits.max_bytes,
+        intake.clone(),
+    )
+    .await;
     let hash_time = started.elapsed() - listed;
     let files = jobs.len();
     let digested = check_hashed(
@@ -377,7 +444,11 @@ pub(crate) async fn collect(
         &std::mem::take(&mut listing.shown),
     )?;
     let blobs = assemble(listing, &digested, &jobs, &upper_fd, result);
-    let count = blobs.len();
+    let taken = digested.iter().filter(|d| d.taken).count();
+    let finishing = Instant::now();
+    finish(intake).await?;
+    let take_ms = finishing.elapsed().as_millis() as u64;
+    let count = blobs.len() + taken;
     // The CAS is asked about every digest at once (the transfer engine cuts it into
     // FindMissing calls and sends them together), and only the missing blobs are sent.
     let asked = Instant::now();
@@ -396,6 +467,8 @@ pub(crate) async fn collect(
     tracing::info!(
         files,
         blobs = count,
+        taken,
+        take_ms,
         missing = sending,
         list_ms = listed.as_millis() as u64,
         hash_ms = hash_time.as_millis() as u64,
@@ -732,8 +805,9 @@ impl Blobs {
 }
 
 /// Builds the entries of `result` and the blobs to store from the listing and the digests
-/// of its files: the files in job order, then for each output directory its Directory
-/// messages (children in pre-order, then the root) and its Tree.
+/// of its files: the files in job order (but those an intake took, which the intake
+/// stores), then for each output directory its Directory messages (children in
+/// pre-order, then the root) and its Tree.
 fn assemble(
     listing: Listing,
     digested: &[Digested],
@@ -751,16 +825,18 @@ fn assemble(
     // The digest and executable bit of each output that is a file.
     let mut files: Vec<Option<(Digest, bool)>> = vec![None; outputs.len()];
     for ((job, place), d) in jobs.iter().zip(&places).zip(digested) {
-        blobs.add(Record {
-            digest: d.digest,
-            crc32c: d.crc32c,
-            source: Source::File(FileSource::new(
-                Arc::clone(upper),
-                Arc::clone(&job.dirs),
-                job.name.clone(),
-                d.stamp,
-            )),
-        });
+        if !d.taken {
+            blobs.add(Record {
+                digest: d.digest,
+                crc32c: d.crc32c,
+                source: Source::File(FileSource::new(
+                    Arc::clone(upper),
+                    Arc::clone(&job.dirs),
+                    job.name.clone(),
+                    d.stamp,
+                )),
+            });
+        }
         let proto = proto_digest(&d.digest);
         match place {
             Place::Output(i) => files[*i] = Some((proto, d.executable)),

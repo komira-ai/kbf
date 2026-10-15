@@ -14,22 +14,23 @@
 //! (`kbf_server::start_for`, on an async runtime of its own, sized as `kbf-server` sizes
 //! one), its start line printed to stdout; then the daemon half, as `kbf-daemon` starts
 //! (`kbf_node::start_with`, on its own runtime), with the in-process planes in place of
-//! the transfer engine and of the dial to `--server`. SIGTERM or SIGINT stops the server half as it stops
-//! `kbf-server`; the daemon half stops once the server half has, abandoning the leases
-//! still running, and the process exits 0. A server half that fails while serving stops
-//! the daemon too, and the process exits 1. A start the server half refuses exits 2; one
-//! the daemon half refuses exits as `kbf-daemon` would.
+//! the transfer engine and of the dial to `--server`. SIGTERM or SIGINT stops the server
+//! half as it stops `kbf-server`; the daemon half stops once the server half has,
+//! abandoning the leases still running, and the process exits 0. A server half that
+//! fails while serving stops the daemon too, and the process exits 1. A start the server
+//! half refuses exits 2; one the daemon half refuses exits as `kbf-daemon` would.
 //!
 //! Linux only, the container driver only: elsewhere [`main`] exits 2 saying so.
 //!
 //! Not done yet (the README lists it): a durable scheduler state, without which a restart
-//! loses every lease; the in-process plane's admission; the `--reserve-cpus` split
-//! between the halves; the walk handing its buffers to the plane; the whole-process
+//! loses every lease; the in-process planes' admission; the `--reserve-cpus` split
+//! between the halves; the whole-process
 //! crash simulation, the driver-panic test and the rest of the helper-dispatch tests;
 //! and the deploy shape, the ownership step and the unit.
 
 pub mod cli;
 mod control;
+mod intake;
 mod plane;
 #[cfg(target_os = "linux")]
 mod run;

@@ -47,10 +47,18 @@ Linux only, the container driver only. Elsewhere the binary exits 2 and says to 
 (`ServerHandle::local`). Every call runs on the server half's runtime, through the
 server's own code:
 
-- **Outputs, stdout and stderr** (`put_records`): the driver's walk has hashed each file
-  once. The plane asks the cache which digests it lacks, packs those records into the
+- **Each output file, stdout and stderr, read once** (`intake`, `src/intake.rs`): the
+  container driver reads each file once, one 1 MiB chunk at a time (its per-file memory
+  bound), and hands every chunk to the hasher and to the plane in that same pass. The
+  plane keeps the file's bytes and, once the file is hashed, puts it in a batch; a batch
+  of 32 MiB (or 16,384 files) is stored as below while the walk goes on, at most four at
+  once, and the rest when the walk ends, before the Directory messages and the Tree that
+  name them. A file is never read again. A file over the server's largest blob (1 GiB)
+  is not taken, and goes as a remote daemon's would.
+- **Outputs** (`put_records`): the driver's walk has hashed each file once. The plane asks the cache which digests it lacks, packs those records into the
   segments and uploads the transfer engine plans (`kbf_transfer::plan`), and gives the
-  `Segments` handlers each range of their bytes, read from where the walk left them:
+  `Segments` handlers each range of their bytes, from the intake's buffers (or read
+  from where the walk left them, for what the intake did not take):
   `Begin`, `PutRange`, `Commit`, as for a remote daemon, with no TLS, encoding or socket.
   Nothing is spooled and nothing is hashed on the way. With a write tier, `Commit` trusts
   the digests and the flusher hashes every record before its PUT, dropping one that does
@@ -93,8 +101,15 @@ No message a remote daemon sends changes: `kbf-daemon` still dials `--server`.
   statuses, each node identity and worker listener flag refused, and the binary run
   with keeper arguments, which answers as the keeper before it reads a flag and starts
   no server.
+- `tests/one_read.rs`: the container driver's output collection over a lease of the
+  plane, with a write tier and without: an inotify watch counts the opens of each output
+  file, which must be one each, and every blob reads back as the file.
 - `src/plane_tests.rs`: a digest that does not parse, a server half whose runtime is
   gone, a file changed after the walk hashed it.
+- `src/intake_tests.rs`: batches sent while the walk goes on (by bytes and by file
+  count), the wait for room among the batches in flight, one digest stored once, a
+  file left unfinished storing nothing, a file over the largest blob not taken, and a
+  server half that is gone.
 - `src/control_tests.rs`: a session through the plane is the server's own (a first
   message that is not `Hello` refused, a `Hello` welcomed and a heartbeat acknowledged),
   and a server half whose runtime is gone refuses each session UNAVAILABLE.
@@ -113,9 +128,6 @@ No message a remote daemon sends changes: `kbf-daemon` still dials `--server`.
 - **The in-process planes' admission.** A remote daemon's calls are admitted by its
   certificate and the deny list; the in-process planes' calls are not admitted (there
   is no remote daemon to admit).
-- **The walk's buffers.** A file the walk hashed is read again from the file to be
-  stored (never hashed again); handing the walk's own buffer to the plane is a driver
-  change not made here.
 - **`--reserve-cpus` across both halves.** The daemon half takes the flag as
   `kbf-daemon` does; the server half uses every CPU, as `kbf-server` does.
 - **Crash and panic behaviour** (the next change): the whole-process crash mode of the

@@ -76,6 +76,8 @@ mod exit_record;
 mod hashing;
 pub mod image;
 mod input_phases;
+#[cfg(test)]
+mod intake_tests;
 mod keeper;
 pub mod numa;
 mod oci;

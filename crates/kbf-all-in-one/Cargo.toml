@@ -24,6 +24,7 @@ path = "../kbf-driver-container/tests/bin/fake_podman.rs"
 test = false
 
 [dependencies]
+bytes.workspace = true
 clap.workspace = true
 futures.workspace = true
 kbf-node.workspace = true
@@ -42,12 +43,16 @@ tracing-subscriber.workspace = true
 [dev-dependencies]
 # The checks every data plane must pass (tests/conformance.rs).
 kbf-cas-conformance.workspace = true
+# The CPU pool the output walk hashes on (tests/one_read.rs).
+kbf-daemon.workspace = true
 # The image store layout the stand-in `podman` reads (tests/binary.rs).
 kbf-driver-container.workspace = true
 kbf-front.workspace = true
 # The act steps the stand-in `podman` runs as each action, through this test binary.
 kbf-testkit.workspace = true
 prost.workspace = true
+# inotify, which counts the opens of each output file (tests/one_read.rs).
+rustix = { workspace = true, features = ["fs"] }
 tokio = { workspace = true, features = ["fs", "io-util", "macros", "net", "time"] }
 
 [lints]

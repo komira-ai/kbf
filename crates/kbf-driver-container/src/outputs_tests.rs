@@ -121,6 +121,7 @@ fn the_files_together_are_held_to_the_byte_limit_in_job_order() {
                 mtime: (0, 0),
                 ctime: (0, 0),
             },
+            taken: false,
         })))
     };
     let shown: Vec<PathBuf> = ["a", "b", "c"].map(PathBuf::from).to_vec();
@@ -209,4 +210,118 @@ async fn a_blocking_task_that_panicked_is_an_error() {
         blocking(shown, || Err(std::io::Error::other("refused"))).await;
     let why = outcome.expect_err("the call failed").to_string();
     assert_eq!(why, "shown/path: refused");
+}
+
+/// Catches the files an intake took being sent again, or the intake not finished
+/// before the messages that name them: outputs collected into a store that takes files
+/// as they are read hand every file to the intake once, finish it once, and give
+/// `put_records` only the Directory messages and the Tree (mutants: taken files kept
+/// in the records, the intake never finished). Every blob the result names is held.
+#[tokio::test]
+async fn files_an_intake_took_are_not_sent_again() {
+    use crate::intake_tests::Taker;
+    let upper = scratch("outputs-intake");
+    std::fs::create_dir_all(upper.join("out/dir")).expect("mkdir");
+    std::fs::write(upper.join("out/file"), b"a file").expect("write");
+    std::fs::write(upper.join("out/dir/nested"), b"nested").expect("write");
+    let taker = Taker::new(false);
+    let mut result = ActionResult::default();
+    collect(
+        &taker,
+        &upper,
+        &CpuPool::new(2),
+        "",
+        &["out/file".to_owned(), "out/dir".to_owned()],
+        OutputLimits::DEFAULT,
+        &mut result,
+    )
+    .await
+    .expect("collect");
+    let file = result.output_files[0].digest.clone().expect("a digest");
+    let tree = result.output_directories[0].clone();
+    let finished = taker.recording.finished();
+    let mut finished: Vec<&String> = finished.iter().map(|(label, _)| label).collect();
+    finished.sort();
+    let nested = kbf_daemon::cas::digest_of(b"nested");
+    let mut expected = [label(&file), label(&nested)];
+    expected.sort();
+    assert_eq!(finished, [&expected[0], &expected[1]]);
+    assert_eq!(
+        taker
+            .recording
+            .finishes
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
+    let put = taker.put();
+    assert!(
+        !put.contains(&label(&file)) && !put.contains(&label(&nested)),
+        "{put:?}"
+    );
+    let root = tree.root_directory_digest.expect("a root");
+    let tree_digest = tree.tree_digest.expect("a tree");
+    assert_eq!(put, [label(&root), label(&tree_digest)]);
+    for digest in [&file, &nested, &root, &tree_digest] {
+        assert!(
+            taker.cas.blob(digest).is_some(),
+            "{} not held",
+            label(digest)
+        );
+    }
+}
+
+/// Catches a log read twice, or offered to the intake past its limit: into a store that
+/// takes files, a log is handed over once, the intake finished, and the digest is the
+/// log's, with nothing sent through `put_chunks`; a log past the limit is refused and
+/// never offered; a log the intake declines is hashed and sent as before (mutants: the
+/// intake not asked, a log past the limit offered, the intake not finished). All three
+/// here, so one copy of `collect_log` covers them.
+#[tokio::test]
+async fn a_log_goes_to_the_intake_in_the_read_that_hashes_it() {
+    use crate::intake_tests::Taker;
+    let dir = scratch("outputs-log-intake");
+    std::fs::write(dir.join("stdout"), b"0123456789").expect("write");
+    let taker = Taker::new(false);
+    let digest = collect_log(&taker, &dir.join("stdout"), 10)
+        .await
+        .expect("within the limit");
+    assert_eq!(digest, kbf_daemon::cas::digest_of(b"0123456789"));
+    assert_eq!(taker.recording.finished(), [(label(&digest), vec![10])]);
+    assert_eq!(
+        taker
+            .recording
+            .finishes
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
+    assert_eq!(taker.cas.blob(&digest), Some(b"0123456789".to_vec()));
+    assert!(taker.put().is_empty(), "{:?}", taker.put());
+
+    std::fs::write(dir.join("stderr"), b"0123456789a").expect("write");
+    let why = collect_log(&taker, &dir.join("stderr"), 10)
+        .await
+        .expect_err("too long");
+    assert!(
+        matches!(
+            why,
+            TreeError::Limit {
+                what: Exceeded::Stdio,
+                limit: 10,
+                ..
+            }
+        ),
+        "{why}"
+    );
+    assert_eq!(
+        taker.recording.opened(),
+        1,
+        "a log past the limit is not offered"
+    );
+
+    let declining = Taker::new(true);
+    let digest = collect_log(&declining, &dir.join("stdout"), 10)
+        .await
+        .expect("within the limit");
+    assert_eq!(declining.put(), [label(&digest)]);
+    assert_eq!(declining.cas.blob(&digest), Some(b"0123456789".to_vec()));
 }

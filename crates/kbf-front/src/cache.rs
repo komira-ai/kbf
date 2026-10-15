@@ -6,6 +6,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use bytes::Bytes;
+use futures::future;
 use kbf_meta::{
     ActionAnswer, ActionRecord, ActionWriteError, Applied, BlobAnswer, Closure, Collected, Command,
     Epoch, Location, MetaState, ObjectId, Retention, Role, StoreId, Touch, UnreachableReason,
@@ -24,6 +25,12 @@ use crate::input_tree::{Horizon, InputTreeConfig, InputTrees};
 use crate::meta_log::{MemoryMetaLog, MetaLog, MetaLogError};
 use crate::metrics::CacheMetrics;
 use crate::{MAX_BLOB_BYTES, wire};
+
+/// The most [`ObjectStore::may_hold`] checks one action-cache hit keeps in flight. A
+/// hit needs one check per stored object its entry names; over a local store each is
+/// a blocking-pool hop plus an open and a header read, so they run side by side.
+/// At most 30, the most `futures::future::join_all` joins in place.
+pub const HIT_CHECKS_IN_FLIGHT: usize = 16;
 
 /// Why a cache operation failed. [`Status`] has a `From` for it, so a service answers
 /// with the right gRPC code. Cloned, so one segment's failure answers every blob in it.
@@ -706,24 +713,58 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
 
     /// Whether the store may still hold each of `objects`, the stored objects an
     /// action-cache hit on `action` needs ([`ObjectStore::may_hold`]: a local store
-    /// checks its files, a remote one answers yes). The first it does not hold is marked
-    /// unreachable as missing, so the hit becomes a miss and FindMissing reports its
-    /// blobs, rather than the client being sent to download bytes no one has.
+    /// checks its files, a remote one answers yes). Each object the store does not hold
+    /// is marked unreachable as missing, so the hit becomes a miss and FindMissing
+    /// reports the blobs of every lost object, rather than the client being sent to
+    /// download bytes no one has. A failed check fails the call only when no object was
+    /// found gone: one that was makes the answer a miss either way.
+    ///
+    /// The checks run in groups of [`HIT_CHECKS_IN_FLIGHT`], each group joined whole,
+    /// so every check runs to its answer. A group this small is joined in place, with
+    /// no task per check, so a store that answers at once pays next to nothing for
+    /// the fan-out.
     async fn store_may_hold(
         &self,
         action: &Digest,
         objects: BTreeSet<ObjectId>,
     ) -> Result<bool, CacheError> {
+        let mut keys = Vec::with_capacity(objects.len());
         for object in objects {
-            let key = self.object_key(object)?;
-            if !self.writer.objects.may_hold(&key).await? {
-                tracing::error!(%action, %key, "an object an action-cache hit needs is gone from the store: a miss");
-                self.mark_unreachable(object, UnreachableReason::Missing)
-                    .await?;
-                return Ok(false);
+            keys.push((object, self.object_key(object)?));
+        }
+        let store = &self.writer.objects;
+        let mut answers = Vec::with_capacity(keys.len());
+        for group in keys.chunks(HIT_CHECKS_IN_FLIGHT) {
+            if let [(_, key)] = group {
+                answers.push(store.may_hold(key).await);
+            } else {
+                let checks = group.iter().map(|(_, key)| store.may_hold(key));
+                answers.extend(future::join_all(checks).await);
             }
         }
-        Ok(true)
+        let mut missing = Vec::new();
+        let mut failed = None;
+        for ((object, key), held) in keys.iter().zip(answers) {
+            match held {
+                Ok(true) => {}
+                Ok(false) => missing.push((*object, key)),
+                Err(e) => {
+                    failed.get_or_insert(e);
+                }
+            }
+        }
+        if missing.is_empty() {
+            return failed.map_or(Ok(true), |e| Err(e.into()));
+        }
+        if let Some(e) = failed {
+            tracing::warn!(%action, error = %e, "a store check failed on a hit that is a miss anyway");
+        }
+        for (object, key) in missing {
+            tracing::error!(%action, %key, "an object an action-cache hit needs is gone from the store: a miss");
+            self.mark_unreachable(object, UnreachableReason::Missing)
+                .await?;
+        }
+        Ok(false)
     }
 
     async fn mark_unreachable(
