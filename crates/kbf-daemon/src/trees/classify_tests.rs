@@ -354,3 +354,58 @@ fn summaries_are_emptied_past_their_cap() {
     );
     assert_eq!(Summaries::default().get("c"), None);
 }
+
+/// Catches an error of the walk lost on its way up: a Directory the CAS lacks is the
+/// CAS's error, a name that is not one component is the client's (`Invalid`), and a
+/// child with no digest is refused by the summary and the choice as by the walk.
+#[tokio::test]
+async fn the_walks_report_a_missing_blob_a_bad_name_and_a_child_without_a_digest() {
+    let leaf = directory(1, 1, &[]);
+    let root = directory(0, 0, &[("x", &leaf.0)]);
+    let mut blobs = HashMap::new();
+    blobs.insert(label(&root.0), root.1.encode_to_vec());
+    let err = load(&Blobs(blobs), &root.0, &Loaded::new(), &|_, _| false, 100)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, TreeError::Cas(CasError::Missing(_))), "{err}");
+
+    let mut slashed = directory(0, 0, &[("x", &leaf.0)]);
+    slashed.1.directories[0].name = "a/b".to_owned();
+    slashed.0 = digest_of(&slashed.1.encode_to_vec());
+    let mut blobs = HashMap::new();
+    blobs.insert(label(&slashed.0), slashed.1.encode_to_vec());
+    blobs.insert(label(&leaf.0), leaf.1.encode_to_vec());
+    let err = load(
+        &Blobs(blobs),
+        &slashed.0,
+        &Loaded::new(),
+        &|_, _| false,
+        100,
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(err, TreeError::Invalid(_)), "{err}");
+
+    let mut headless = directory(0, 0, &[("x", &leaf.0)]);
+    headless.1.directories[0].digest = None;
+    headless.0 = digest_of(&headless.1.encode_to_vec());
+    let all = loaded(&[&headless]);
+    let err = summarize(&all, &|_| None).unwrap_err();
+    assert!(
+        matches!(&err, TreeError::Invalid(m) if m.contains("no digest")),
+        "{err}"
+    );
+    let err = select(
+        &all,
+        &HashMap::new(),
+        &headless.0,
+        &reserved(&[], ""),
+        LIMITS,
+        100,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(&err, TreeError::Invalid(m) if m.contains("no digest")),
+        "{err}"
+    );
+}

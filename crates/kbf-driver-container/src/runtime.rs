@@ -288,8 +288,10 @@ impl<C: Cas> PodmanRuntime<C> {
     /// What the node's tree store has done, if it has one.
     #[must_use]
     pub fn tree_stats(&self) -> Option<kbf_daemon::trees::TreeStats> {
-        let trees = self.cache.as_ref()?.trees.as_ref()?;
-        Some(trees.store().stats())
+        let cached = self.cache.as_ref();
+        cached
+            .and_then(|c| c.trees.as_ref())
+            .map(|t| t.store().stats())
     }
 
     /// What the last lease's inputs cost through the cache, if a lease used it.

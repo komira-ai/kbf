@@ -82,9 +82,12 @@ pub(super) fn verify(loaded: &Loaded, root: &Digest, tmp: &Path) -> Result<Summa
         for link in &directory.symlinks {
             let path = dir.join(&link.name);
             let meta = std::fs::symlink_metadata(&path).map_err(io_error(&path))?;
-            let target = std::fs::read_link(&path).map_err(io_error(&path))?;
-            if !meta.file_type().is_symlink() || target.as_os_str() != link.target.as_str() {
+            if !meta.file_type().is_symlink() {
                 return Err(wrong(&path, "is not the symlink its Directory names"));
+            }
+            let target = std::fs::read_link(&path).map_err(io_error(&path))?;
+            if target.as_os_str() != link.target.as_str() {
+                return Err(wrong(&path, "points elsewhere than its Directory says"));
             }
             summary.files += 1;
         }
@@ -106,7 +109,7 @@ pub(super) fn verify(loaded: &Loaded, root: &Digest, tmp: &Path) -> Result<Summa
 pub(super) fn publish(tmp: &Path, to: &Path) -> io::Result<bool> {
     match rustix::fs::renameat_with(CWD, tmp, CWD, to, RenameFlags::NOREPLACE) {
         Ok(()) => Ok(true),
-        Err(e) if e == rustix::io::Errno::EXIST || e == rustix::io::Errno::NOTEMPTY => Ok(false),
+        Err(e) if e == rustix::io::Errno::EXIST => Ok(false),
         Err(e) => Err(e.into()),
     }
 }
