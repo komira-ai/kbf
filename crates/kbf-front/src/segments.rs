@@ -192,9 +192,6 @@ impl Upload {
         }
     }
 
-    /// Drops the upload, freeing its buffers and admission even if a call still holds it,
-    /// unless a commit of it is running: decided under the phase lock, so a Commit
-    /// cannot start between the check and the drop.
     /// The next step of the check of record `i` of segment `index` ([`Receiving::next`]);
     /// `None` when the upload is no longer receiving (a hash job outlived its upload),
     /// which ends that record's check.
@@ -220,6 +217,9 @@ impl Upload {
         }
     }
 
+    /// Drops the upload, freeing its buffers and admission even if a call still holds it,
+    /// unless a commit of it is running: decided under the phase lock, so a Commit
+    /// cannot start between the check and the drop.
     fn try_drop(&self) -> bool {
         let mut phase = lock(&self.phase);
         if matches!(*phase, Phase::Committing) {
