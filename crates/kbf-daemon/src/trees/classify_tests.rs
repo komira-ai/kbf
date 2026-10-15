@@ -427,3 +427,39 @@ async fn the_walks_report_a_missing_blob_a_bad_name_and_a_child_without_a_digest
         "{err}"
     );
 }
+
+/// A chain top -> mid -> leaf whose digests sort in the order asked for: `ascending`
+/// puts each parent before its child. The summary walk goes in name order, so the two
+/// shapes make it meet a node before its child, and after it.
+fn chain(ascending: bool) -> [(Digest, Directory); 3] {
+    for tag in 0..256 {
+        let leaf = directory(3, 10 + tag, &[]);
+        let mid = directory(2, 5, &[("x", &leaf.0)]);
+        let top = directory(1, 1, &[("m", &mid.0)]);
+        let names = [label(&top.0), label(&mid.0), label(&leaf.0)];
+        let sorted = names[0] < names[1] && names[1] < names[2];
+        let reversed = names[0] > names[1] && names[1] > names[2];
+        if (ascending && sorted) || (!ascending && reversed) {
+            return [top, mid, leaf];
+        }
+    }
+    panic!("no tag orders the chain's names");
+}
+
+/// Catches a summary that depends on the order the walk meets nodes in (it is the map's
+/// order, which differs from one run to the next): a node met before its child waits for
+/// it and is computed again, a node met after its child finds the child's summary at
+/// once, and either way the counts are the same. Also what the coverage ratchet needs: a
+/// test whose branches are the same on every run.
+#[test]
+fn the_counts_do_not_depend_on_the_order_nodes_are_met_in() {
+    for ascending in [true, false] {
+        let [top, mid, leaf] = chain(ascending);
+        let all = loaded(&[&top, &mid, &leaf]);
+        let sums = summarize(&all, &|_| None).unwrap();
+        let tag = leaf.1.files[0].digest.as_ref().unwrap().size_bytes as u64;
+        assert_eq!(sums[&label(&leaf.0)], summary(3, 3 * tag));
+        assert_eq!(sums[&label(&mid.0)], summary(2 + 3, 10 + 3 * tag));
+        assert_eq!(sums[&label(&top.0)], summary(1 + 2 + 3, 1 + 10 + 3 * tag));
+    }
+}

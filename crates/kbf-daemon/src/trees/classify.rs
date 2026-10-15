@@ -240,7 +240,10 @@ pub(crate) fn summarize(
     known: &dyn Fn(&str) -> Option<Summary>,
 ) -> Result<HashMap<String, Summary>, TreeError> {
     let mut done: HashMap<String, Summary> = HashMap::new();
-    for start in loaded.keys() {
+    // In name order, not the map's: the same input is then the same walk every time.
+    let mut names: Vec<&String> = loaded.keys().collect();
+    names.sort();
+    for start in names {
         let mut stack = vec![start.clone()];
         while let Some(name) = stack.pop() {
             if done.contains_key(&name) {
