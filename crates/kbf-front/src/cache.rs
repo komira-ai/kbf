@@ -20,6 +20,7 @@ use kbf_types::{Digest, FarmTime};
 use prost::Message;
 use tonic::Status;
 
+use crate::input_tree::{InputTreeConfig, InputTrees};
 use crate::meta_log::{MemoryMetaLog, MetaLog, MetaLogError};
 use crate::metrics::CacheMetrics;
 use crate::{MAX_BLOB_BYTES, wire};
@@ -176,6 +177,7 @@ pub struct Cache<M, O> {
     group: Arc<Group>,
     touches: Arc<Touches>,
     segment_limit: u64,
+    trees: Arc<InputTrees>,
 }
 
 impl<M, O> Drop for Cache<M, O> {
@@ -218,7 +220,35 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
             group: Arc::new(Group::new(WriteConfig::DEFAULT)),
             touches: Arc::new(Touches::new(TouchConfig::DEFAULT)),
             segment_limit: MAX_SEGMENT_BYTES,
+            trees: Arc::new(InputTrees::new(InputTreeConfig::DEFAULT)),
         }
+    }
+
+    /// The same cache, remembering input trees as `config` says instead of
+    /// [`InputTreeConfig::DEFAULT`] ([`Cache::missing_inputs`]). Call it before the
+    /// cache serves an Execute.
+    #[must_use]
+    pub fn with_input_trees(mut self, config: InputTreeConfig) -> Self {
+        self.trees = Arc::new(InputTrees::new(config));
+        self
+    }
+
+    /// How many decoded directories the input check keeps, and what they cost in bytes.
+    pub fn input_tree_cache(&self) -> (usize, u64) {
+        (self.trees.len(), self.trees.bytes())
+    }
+
+    pub(crate) fn input_trees(&self) -> &InputTrees {
+        &self.trees
+    }
+
+    /// The farm time now, and the farm time until which a blob reported held now stays
+    /// held: now plus the retention's `min_ttl`.
+    pub(crate) async fn retention_horizon(&self) -> Result<(FarmTime, FarmTime), CacheError> {
+        Ok(self
+            .writer
+            .query(|s| (s.now(), s.now().saturating_add(s.retention().min_ttl)))
+            .await?)
     }
 
     /// The same cache, packing segments of at most `limit` bytes, footer included,

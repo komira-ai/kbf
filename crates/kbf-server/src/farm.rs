@@ -275,6 +275,15 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
         FarmTime::from_millis(millis)
     }
 
+    /// Sets the scheduler gauges of `/metrics` from `state`: called where the lock is
+    /// already held after a submit and on each tick, so a scrape sees the queue and the
+    /// leases at most a tick old.
+    fn publish(&self, state: &State) {
+        let metrics = self.cache.metrics();
+        metrics.sched_queued.set(state.sched.queued_len() as u64);
+        metrics.sched_leases.set(state.sched.leases_held() as u64);
+    }
+
     fn lock(&self) -> MutexGuard<'_, State> {
         // Nothing under the lock panics midway through a change.
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
@@ -490,6 +499,7 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
         let now = self.now();
         let mut state = self.lock();
         state.feed_quiet(now, Event::Tick);
+        self.publish(&state);
         let paused: BTreeSet<WorkerId> = state
             .machine
             .nodes()
@@ -655,7 +665,9 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
 impl<M: MetaLog, O: ObjectStore + 'static> Dispatch for Farm<M, O> {
     fn submit(&self, mut submission: Submission) -> Result<Ticket, Status> {
         let now = self.now();
+        let waiting = Instant::now();
         let mut state = self.lock();
+        self.cache.metrics().sched_lock_wait.since(waiting);
         let action = submission.request.key.action;
         let instance = submission.request.key.instance.clone();
         let waiter = state.machine.submit(Waiter {
@@ -687,6 +699,7 @@ impl<M: MetaLog, O: ObjectStore + 'static> Dispatch for Farm<M, O> {
         if let Some(stage) = state.stages.get(&waiter).filter(|_| joined_started) {
             stage.send_replace(Stage::Executing);
         }
+        self.publish(&state);
         Ok(Ticket {
             name,
             instance,
