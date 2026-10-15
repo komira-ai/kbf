@@ -1,6 +1,6 @@
 //! One open log per raft directory (kbf#690): `RaftMetaLog::open_dir` holds an
 //! exclusive lock on a file in the directory for as long as the log is open, so a
-//! second server started on the same `--raft-dir` is refused instead of writing the
+//! second server started on the same `--meta-dir` is refused instead of writing the
 //! same log, and a start after the first log is dropped opens it.
 
 use std::path::PathBuf;

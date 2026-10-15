@@ -4,26 +4,28 @@
 //! `serve`; a process that runs the server beside the worker daemon calls the same
 //! function.
 //!
-//! [`serve_with`] is the seam under it: the same assembly over a metadata log and
+//! [`serve_with`] is the seam under it: the same assembly over a Raft metadata log and
 //! object store the caller opened, for a store kind the flags do not name.
 
 use std::error::Error;
 use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
-use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use kbf_front::{Cache, MemoryMetaLog};
+use kbf_front::Cache;
 use kbf_log::FarmLogId;
 use kbf_meta::Retention;
-use kbf_objstore::{Capabilities, FsStore, KeyPrefix, MemoryStore, ObjectStore};
+use kbf_objstore::{FsStore, KeyPrefix, ObjectStore};
+use kbf_store::StdFs;
 use kbf_threads::Topology;
+use kbf_threads::disk::Statvfs;
 
 use crate::local::LocalStore;
-use crate::write_tier::{FLUSH_EVERY, TierLog};
-use crate::{Args, RaftMetaLog, SERVER_VERSION, ServeError, StoreKind, bind_server_with_policy};
+use crate::stores::{COLD_FILE_MIN_FREE_BYTES, FILE_PREFIX_ROOT, Hot, StoreUri, Stores};
+use crate::write_tier::FLUSH_EVERY;
+use crate::{Args, RaftMetaLog, SERVER_VERSION, ServeError, bind_server_with_policy, s3_store};
 
 /// The server's thread sizes on a given machine shape: every CPU, then the overrides.
 pub fn sizes_on(args: &Args, topology: Topology) -> kbf_threads::Sizes {
@@ -91,52 +93,28 @@ where
     S: FnOnce() -> io::Result<F>,
     F: Future<Output = ()> + Send + 'static,
 {
-    let raft_dir = args.raft_dir()?;
-    match (args.blob_dir.as_deref(), args.store) {
-        (Some(dir), _) => {
-            let store = FsStore::open(dir, args.blob_dir_min_free_bytes)?;
-            over(
-                args,
-                raft_dir,
-                store,
-                KeyPrefix::default(),
-                BLOB_DIR_PREFIX,
-                shutdown,
-            )
-            .await
+    let stores = args.stores(&Statvfs)?;
+    for line in stores.describe() {
+        tracing::info!("{line}");
+    }
+    match &stores.cold {
+        StoreUri::File(dir) => {
+            let store = FsStore::open(dir, COLD_FILE_MIN_FREE_BYTES)?;
+            over(args, &stores, store, FILE_PREFIX_ROOT, shutdown).await
         }
-        (None, StoreKind::Memory) => {
-            let store = MemoryStore::new(Capabilities::default());
-            let memory = MemoryMetaLog::new(Retention::default());
-            serve_with(args, memory, store, KeyPrefix::default(), None, shutdown).await
-        }
-        (None, StoreKind::S3) => {
-            let (store, start_prefix) = args.s3_store(|name| std::env::var(name).ok())?;
-            over(
-                args,
-                raft_dir,
-                store,
-                start_prefix,
-                &args.s3_prefix,
-                shutdown,
-            )
-            .await
+        StoreUri::S3(uri) => {
+            let store = s3_store(uri, |name| std::env::var(name).ok())?;
+            over(args, &stores, store, &uri.prefix, shutdown).await
         }
     }
 }
 
-/// The key prefix root under `--blob-dir`: objects go under `kbf/<log id>/`.
-const BLOB_DIR_PREFIX: &str = "kbf/";
-
-/// Serves `store` under the metadata log `raft_dir` names: the Raft log there, writing
-/// under the prefix it committed (`<prefix_root><log id>/` for a new log), or without
-/// one a log in memory, writing under `start_prefix`. (`Args::raft_dir` refuses
-/// `--blob-dir` without a Raft log.)
+/// Serves `store` under the Raft metadata log in `stores.meta_dir`, writing under the
+/// prefix it committed: `<prefix_root><log id>/` for a new log.
 async fn over<O, S, F>(
     args: &Args,
-    raft_dir: Option<&Path>,
+    stores: &Stores,
     store: O,
-    start_prefix: KeyPrefix,
     prefix_root: &str,
     shutdown: S,
 ) -> Result<ServerHandle, Box<dyn Error>>
@@ -145,36 +123,28 @@ where
     S: FnOnce() -> io::Result<F>,
     F: Future<Output = ()> + Send + 'static,
 {
-    match raft_dir {
-        None => {
-            let memory = MemoryMetaLog::new(Retention::default());
-            serve_with(args, memory, store, start_prefix, None, shutdown).await
-        }
-        Some(dir) => {
-            let log = RaftMetaLog::open_dir(dir, Retention::default(), prefix_root).await?;
-            let (prefix, id) = (log.store_prefix(), log.log_id());
-            serve_with(args, log, store, prefix, Some(id), shutdown).await
-        }
-    }
+    let log = RaftMetaLog::open_dir(&stores.meta_dir, Retention::default(), prefix_root).await?;
+    let (prefix, id) = (log.store_prefix(), log.log_id());
+    serve_with(args, stores.hot.as_ref(), log, store, prefix, id, shutdown).await
 }
 
 /// [`start`] over a metadata log and object store already open: where the flags'
-/// store and log kinds end and the rest of the assembly (cache, write tier, flusher,
-/// listeners) begins. `prefix` is where objects are written and `log` the Raft log's
-/// id when `meta` is one, for the start line.
+/// store kinds end and the rest of the assembly (cache, write tier, flusher, listeners)
+/// begins. `hot` is the resolved hot store, if any; `prefix` is where objects are
+/// written and `log` the Raft log's id, for the start line.
 ///
 /// # Errors
 /// As [`start`], but for opening the store and log.
-pub async fn serve_with<M, O, S, F>(
+pub async fn serve_with<O, S, F>(
     args: &Args,
-    meta: M,
+    hot: Option<&Hot>,
+    meta: RaftMetaLog<StdFs>,
     store: O,
     prefix: KeyPrefix,
-    log: Option<FarmLogId>,
+    log: FarmLogId,
     shutdown: S,
 ) -> Result<ServerHandle, Box<dyn Error>>
 where
-    M: TierLog,
     O: ObjectStore + 'static,
     S: FnOnce() -> io::Result<F>,
     F: Future<Output = ()> + Send + 'static,
@@ -189,7 +159,7 @@ where
         .await?
         .with_writes(args.write_config())
         .with_input_trees(args.input_tree_config());
-    let (cache, tier) = crate::write_tier::attach(cache, args).await?;
+    let (cache, tier) = crate::write_tier::attach(cache, hot).await?;
     let cache = Arc::new(cache);
     let local = LocalStore::new(Arc::clone(&cache), listeners.segments);
     let _flusher = tier.map(|_| {
@@ -205,7 +175,14 @@ where
         worker: bound.worker,
         api: bound.api,
         local,
-        start_line: start_line(bound.reapi, bound.worker, bound.api, routes, log, &plain),
+        start_line: start_line(
+            bound.reapi,
+            bound.worker,
+            bound.api,
+            routes,
+            Some(log),
+            &plain,
+        ),
         serving: Box::pin(bound.serving),
         _flusher,
     })

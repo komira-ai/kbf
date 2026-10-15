@@ -38,7 +38,7 @@
 //!     commit unless its object is marked unreachable, and the store never holds two
 //!     contents under one id (a reflush writes the same bytes). Checked in every run.
 //! 11. **Within budget** (invariant D). The tier's counted and flushed bytes never pass
-//!     `--write-tier-bytes`.
+//!     the hot store's budget.
 //! 12. **No leak** (invariant E). At each start, the tier directory holds only `TIER`,
 //!     staged blocks at their committed length and flushed copies, and the budget
 //!     counts exactly the staged bytes.

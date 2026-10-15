@@ -248,7 +248,7 @@ impl Cell {
         Self::serve(cache, store, None, None, wait, retention, small_ladder()).await
     }
 
-    /// A cell whose metadata is a Raft log ([`RaftMetaLog`], as `--meta-log=raft`) in
+    /// A cell whose metadata is a Raft log ([`RaftMetaLog`], as `kbf-server` runs it) in
     /// an in-memory raft directory, which [`Cell::cold_restart`] carries over as a
     /// process restart leaves it. Objects go under `kbf/<log id>/`.
     pub async fn start_raft() -> Self {
@@ -323,12 +323,12 @@ impl Cell {
     /// one over the same bucket, as a restart of the `kbf-server` binary does: a new
     /// `Cache` with a new, empty metadata log (so an empty CAS index and action
     /// cache), a fresh scheduler (no daemon, no cordon, no drain, nothing queued), and
-    /// its objects written under a key prefix no earlier start used, as `--store=s3`
+    /// its objects written under a key prefix no earlier start used, as an S3 cold store
     /// does. The objects earlier starts wrote stay in the bucket. The operator API, if
     /// this cell has one, listens again on a new port.
     ///
     /// A cell started with [`Cell::start_raft`] reopens its Raft log from the raft
-    /// directory as the old process left it (`--meta-log=raft`), so the CAS index and
+    /// directory as the old process left it (the Raft metadata log), so the CAS index and
     /// the action cache are kept, and writes under the log's prefix in a new epoch.
     pub async fn cold_restart(mut self) -> Self {
         let stop = self.stop.take().expect("the server is running");

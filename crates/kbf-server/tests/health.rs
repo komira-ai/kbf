@@ -730,6 +730,23 @@ mod binary {
     use super::{failing, get_within};
 
     const BIN: &str = env!("CARGO_BIN_EXE_kbf-server");
+    /// `--cold-store` and `--meta-dir` flags over fresh directories named for `name`, under the
+    /// target directory: every start of the binary needs both.
+    fn stores(name: &str) -> [String; 4] {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static NEXT: AtomicU32 = AtomicU32::new(0);
+        let next_store = || NEXT.fetch_add(1, Ordering::Relaxed);
+        let base = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+            .join("kbf-server-stores")
+            .join(format!("{name}-{}-{}", std::process::id(), next_store()));
+        let _ = std::fs::remove_dir_all(&base);
+        [
+            "--cold-store".to_owned(),
+            format!("file://{}", base.join("cold").display()),
+            "--meta-dir".to_owned(),
+            base.join("meta").display().to_string(),
+        ]
+    }
 
     /// The server, killed and reaped when dropped.
     struct Running(Child);
@@ -748,6 +765,7 @@ mod binary {
             Command::new(BIN)
                 .args(["--listen", "127.0.0.1:0", "--worker-listen", "127.0.0.1:0"])
                 .args(["--api-listen", "127.0.0.1:0"])
+                .args(stores("health"))
                 .args(args)
                 .stdout(Stdio::piped())
                 .stderr(Stdio::null())

@@ -100,7 +100,7 @@ where
     /// 1. `TIER` must name `start.tier`, unless nothing is staged on `start.tier` and
     ///    nothing on the tier `TIER` names; then `TIER` is (re)written, synced and its
     ///    name synced. Otherwise the start is refused, so a wrong mount or flag never
-    ///    destroys the index (`--write-tier-abandon` is the caller's, before this).
+    ///    destroys the index (`--hot-store-abandon` is the caller's, before this).
     /// 2. Each staged object's block is kept if it holds at least the committed length,
     ///    cut to that length and synced if it holds more; else it is reported lost.
     /// 3. Every other block file is an orphan and deleted, and the directory synced.
@@ -202,7 +202,7 @@ where
 
 /// Deletes every file the tier writes in `fs` (blocks, flushed copies, `TIER`) and
 /// syncs the directory, for a start whose metadata log begins empty
-/// (`--meta-log=memory`): nothing in the directory is indexed any more, and the new
+/// (the in-memory metadata log): nothing in the directory is indexed any more, and the new
 /// log's writer epochs start again from 1, so an old block's name could be taken for
 /// one of this start's objects. Returns the names deleted.
 ///

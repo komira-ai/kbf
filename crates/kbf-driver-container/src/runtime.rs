@@ -109,7 +109,7 @@ pub struct PodmanConfig {
     /// container so labelled. The daemon passes its node id. Two runtimes that share a
     /// Podman store need two owners, or each start removes the other's containers.
     pub owner: String,
-    /// The node's input cache, if it has one (`--cache-dir`). Without it, a lease's
+    /// The node's input cache, if it has one (`<--data-dir>/cache`). Without it, a lease's
     /// input files are its own copies, as before the cache.
     pub cache: Option<CacheUse>,
     /// The threads that hash an action's output files (`--cpu-threads`), shared by every
@@ -130,7 +130,7 @@ pub struct CacheUse {
     /// ([`crate::chown_dirs`]) to give the input root's directories, not its files, to
     /// the container's root and back.
     pub helper: PathBuf,
-    /// The node's shared read-only trees (`--tree-dir`), if it has them: large
+    /// The node's shared read-only trees (`<--data-dir>/trees`), if it has them: large
     /// Directory nodes of an input root are built once and mounted read-only, not
     /// linked file by file. Opened with the cache; needs it.
     pub trees: Option<TreeConfig>,

@@ -58,7 +58,7 @@ This design builds on the code on `main`, read at the time of writing.
 
 - **The binary.** `kbf-daemon` lives in crate `kbf-node` and takes
   `--driver fake|container|native`. On a Mac it runs `--driver native` with `--server`,
-  `--cas`, `--ca-cert`, `--cert`, `--key`, `--node-id`, `--scratch` and repeatable
+  `--cas`, `--ca-cert`, `--cert`, `--key`, `--node-id`, `--data-dir` and repeatable
   `--label key=value` (reported as `label.<key>`). It is configured by flags only. On
   SIGTERM it abandons running leases (their processes are killed and their directories
   removed) and exits zero.

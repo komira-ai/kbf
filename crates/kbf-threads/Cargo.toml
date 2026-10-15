@@ -10,6 +10,7 @@ publish.workspace = true
 [dependencies]
 clap.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "time"] }
+rustix = { workspace = true, features = ["fs"] }
 thiserror.workspace = true
 tracing.workspace = true
 

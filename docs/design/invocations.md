@@ -286,7 +286,7 @@ Two stages:
 
 **Stage 1, in memory** (PRs 3 and 4). The recorder keeps records in memory, bounded by
 `--invocation-memory` (default 256 MiB). Records are lost on restart and the page says
-so. This is honest and useful for the first deployments, which run `--meta-log=memory`
+so. This is honest and useful for the first deployments, which run the in-memory metadata log (tests only)
 and lose the index at restart anyway; stage 2 lands right after the client and the
 driver metrics (section 9).
 
@@ -337,7 +337,7 @@ unflushed rows and the header fields; step 3 then applies only when flushes fail
 
 **Stage 2, durable** (PRs 7 and 8). The CEO's ruling (2026-10-12): "Yes we should
 switch to durable build records without waiting for HA." So stage 2 runs on today's
-metadata log, `--meta-log=raft`: a single-voter Raft log on the server's own disk
+metadata log, the Raft metadata log: a single-voter Raft log on the server's own disk
 (`kbf-server/src/raft_log`), which a restart already keeps. The pins, with their
 closure and their compare-and-set, and the chunks as CAS blobs land now, ahead of the
 high-availability design (PR #303, open); that design inherits them as they are,
@@ -350,10 +350,11 @@ because they were shaped for a replicated apply from the start (below).
   metadata-snapshot work lands; that is a separate design note in flight
   (`docs/design/metadata-snapshots.md`), and it is what bounds replay. Stage 2 does not
   wait for it: a longer start is the cost, not a lost record.
-- **`--meta-log=memory` keeps nothing, by design.** Its index is in memory, so a
+- **The in-memory metadata log keeps nothing, by design.** Its index is in memory, so a
   restart forgets every blob and every pin with it; records are lost at a restart
-  there, as in stage 1. Durable records need `--meta-log=raft` (which needs
-  `--store=s3` or `--blob-dir`).
+  there, as in stage 1. The binary no longer offers it (it always runs the Raft log,
+  `--meta-dir` or `<hot store>/meta`); it remains for tests. Durable records need the
+  Raft log.
 
 - A chunk is a `kbf.invocation.v1.Chunk` protobuf, stored **as a CAS blob** through the
   existing `Cache` write path: verified, packed into segments, in the object store like
@@ -756,7 +757,7 @@ ingester is a second writer and not a second record. buck2 does not emit BES.
 |---|---|
 | Recorder channel full | events dropped, builds unaffected, invocation `complete: false` |
 | Memory bound reached | evict minted, then idle invocations; then the largest open one stops taking rows, `rows_capped: true` (3.5) |
-| Server crash or restart | stage 1, and `--meta-log=memory` always (by design): all records lost, a page answers `404` with `records_since` the new start (4.10); stage 2 on `--meta-log=raft`: at most the unflushed window (120 s or 256 KiB) of each open invocation lost, marked `complete: false`; minted invocations lost; the start replays the whole log until the metadata snapshots land (3.5) |
+| Server crash or restart | stage 1, and the in-memory metadata log (tests only) always (by design): all records lost, a page answers `404` with `records_since` the new start (4.10); stage 2 on the Raft metadata log: at most the unflushed window (120 s or 256 KiB) of each open invocation lost, marked `complete: false`; minted invocations lost; the start replays the whole log until the metadata snapshots land (3.5) |
 | Object store down at flush | chunk kept in memory and retried; past `--invocation-memory`, oldest unflushed rows dropped and `complete: false` |
 | Failover (HA, planned) | the new leader's recorder reads each open invocation's pin (its current root) and continues in new chunks; each pin update is a compare-and-set on that root (3.5), so a deposed leader's update that commits late makes the next update fail, and the recorder rebuilds from the pin's current root and retries, never overwriting it; the old leader's unflushed window is lost and the invocation says `complete: false` |
 | Chunk lost or corrupt (the store has no bytes for it, or they fail their digest) | the page shows the surviving chunks' rows and a gap marker where the lost chunk's rows were (its row count and time range, from the root), and the invocation says `complete: false`; nothing restores it: the server alone writes a chunk (as it does a root), so no client holds its bytes to upload again |
@@ -897,7 +898,7 @@ machines, retention, and the HTML page for people last.
   Tests: an action that burns a known CPU time and allocates a known amount reports at
   least those (plant "report zeros", red), in each driver's own tests.
 - **7. (M) The pin command and its log format**, on today's single-voter
-  `--meta-log=raft` log (3.5), ahead of the HA work (PR #303), which inherits it. The
+  the Raft metadata log log (3.5), ahead of the HA work (PR #303), which inherits it. The
   format bump is made for the invocation pins alone; the general Pins of
   [storage.md](storage.md#planned) add their commands later, in their own bumps. The
   command is `{id, prev_root, new_root, added_chunk_digests}` with its hold-until time,
@@ -906,7 +907,7 @@ machines, retention, and the HTML page for people last.
   (3.5). Bounded replay needs the metadata snapshots (`docs/design/metadata-snapshots.md`,
   in flight); this PR does not wait for them. Tests: a log of the new format replays
   pins, their closures and their hold-until across a restart of a single-voter
-  `--meta-log=raft` server (plant "pins in memory only", red); a reader of `Format::V1`
+  the Raft metadata log server (plant "pins in memory only", red); a reader of `Format::V1`
   refuses the new format rather than skipping the entry (plant "skip unknown", red); a
   pin update with a stale `prev_root` is refused and leaves the pin unchanged (plant
   "skip the check", red); a pin update whose `new_root` is not in the blob index is
@@ -915,10 +916,10 @@ machines, retention, and the HTML page for people last.
   once the pin expires (plant "keep only the last update's chunks", red); a collection
   run with the object store unreachable (every read fails) gives the same result as
   with it reachable (plant "parse the root", red).
-- **8. (M) Durable records** (3.5 stage 2), on `--meta-log=raft`: chunks as CAS blobs,
+- **8. (M) Durable records** (3.5 stage 2), on the Raft metadata log: chunks as CAS blobs,
   roots, the flush rule of 3.4, recovery marking open invocations incomplete. Tests:
   restart keeps every flushed row, and the failures view and `records_since` of 4.10
-  answer from it; with `--meta-log=memory` a restart keeps no record and
+  answer from it; with the in-memory metadata log (tests only) a restart keeps no record and
   `records_since` is the new start (by design; plant "`records_since` from the
   retention whatever the log", red: it is not the new start); a crash loses at most the window; an idle invocation is flushed once and then
   writes nothing (plant a 10 s timer, the log-entry count goes red); a minted
@@ -971,7 +972,7 @@ machines, retention, and the HTML page for people last.
 
 PRs 4, 12 and 13 give an agent the build it just ran: what failed, why, its logs and its
 command, in one call (`kbf build show`), until the server restarts (4.10). 11 fills CPU
-and memory; 7 and 8 make records survive a restart on `--meta-log=raft`; 6 puts the
+and memory; 7 and 8 make records survive a restart on the Raft metadata log; 6 puts the
 link in failed actions' messages; 14 lets an agent on another machine read; 9 keeps a
 failed action's outputs; 10, the page for people, comes last.
 
@@ -998,7 +999,7 @@ Each with a recommendation; none is decided here.
    a derived index, never a second authoritative store (3.7); flushed at 256 KiB, at
    idle or every 120 s, with the in-memory stage shipped first. **Decided** (CEO,
    2026-10-12: "Yes we should switch to durable build records without waiting for
-   HA."): the pins and chunks land on today's single-voter `--meta-log=raft` log, in a
+   HA."): the pins and chunks land on today's single-voter the Raft metadata log log, in a
    format bump of their own, before the HA work, which inherits them (3.5).
 6. **The link on a successful buck2 build.** Recommend: today, the printed `Build ID` in
    the template and the link in failed actions' messages; send the upstream buck2 change

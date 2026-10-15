@@ -1,4 +1,4 @@
-//! `--meta-log=raft`: the metadata log as a single-voter Raft log on the local disk
+//! The metadata log (`--meta-dir`) as a single-voter Raft log on the local disk
 //! (docs/design/ha.md, section 16, PR 5).
 //!
 //! [`RaftMetaLog`] implements the front's [`MetaLog`] over a [`kbf_raft::Host`] whose
@@ -142,7 +142,7 @@ pub enum RaftLogError {
     #[error("raft membership: {0}")]
     Membership(#[from] ConfigError),
     /// Another open log holds the raft directory's [`LOCK`] (a second server started
-    /// on the same `--raft-dir`), or the lock could not be taken.
+    /// on the same `--meta-dir`), or the lock could not be taken.
     #[error(
         "raft dir {}: could not lock {LOCK}; is another kbf-server using it? ({source})",
         .dir.display()

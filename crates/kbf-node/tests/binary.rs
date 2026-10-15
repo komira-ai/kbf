@@ -499,11 +499,25 @@ fn kbf_async_threads(flag: &str) -> usize {
 fn each_driver_starts_and_stops_on_sigterm() {
     let status = runs_until_sigterm("fake", &["--driver=fake".to_owned()]);
     assert!(status.success(), "{status}");
-    let scratch = tls("native-scratch").join("leases");
+    // The fake driver keeps nothing on disk, so without `--data-dir` it touches no
+    // directory; given one, it makes it and claims its lease directory.
+    let fake_data = tls("fake-data");
+    let fake = [
+        "--driver=fake".to_owned(),
+        format!("--data-dir={}", fake_data.display()),
+    ];
+    let status = runs_until_sigterm("fake-data", &fake);
+    assert!(status.success(), "{status}");
+    assert!(
+        fake_data.join("leases/daemon-instance").is_file(),
+        "the fake daemon with --data-dir makes and claims its lease directory"
+    );
+    let data = tls("native-scratch");
+    let scratch = data.join("leases");
     let native = [
         "--driver=native".to_owned(),
         "--cas=https://127.0.0.1:1".to_owned(),
-        format!("--scratch={}", scratch.display()),
+        format!("--data-dir={}", data.display()),
     ];
     let one = one_native_daemon();
     let status = runs_until_sigterm("native", &native);
@@ -520,7 +534,7 @@ fn each_driver_starts_and_stops_on_sigterm() {
         let mut container = vec![
             "--driver=container".to_owned(),
             "--cas=https://127.0.0.1:1".to_owned(),
-            format!("--scratch={}", scratch.display()),
+            format!("--data-dir={}", data.display()),
             format!("--id-files={}", ids.display()),
             "--actions-memory-max-gib=1".to_owned(),
         ];
@@ -563,7 +577,7 @@ fn placed_container_node(name: &str, nodes: &[(u32, &str)]) -> (PathBuf, String)
     let mut flags = vec![
         "--driver=container".to_owned(),
         "--cas=https://127.0.0.1:1".to_owned(),
-        format!("--scratch={}", dir.join("leases").display()),
+        format!("--data-dir={}", dir.display()),
         format!("--id-files={}", ids.display()),
         "--lease-placement=numa-node".to_owned(),
         format!("--numa-dir={}", numa.display()),
@@ -716,7 +730,7 @@ fn a_container_node_reports_what_its_leases_may_use() {
             "--node-id=node-1".to_owned(),
             "--driver=container".to_owned(),
             format!("--cas=https://127.0.0.1:{}", front.worker.port()),
-            format!("--scratch={}", dir.join("leases").display()),
+            format!("--data-dir={}", dir.display()),
             format!("--id-files={}", ids.display()),
             "--actions-memory-max-gib=1".to_owned(),
             "--supervisor-memory-min-mib=512".to_owned(),
@@ -831,7 +845,7 @@ fn a_container_nodes_leases_get_the_cpus_minus_the_reserve() {
             "--node-id=node-1".to_owned(),
             "--driver=container".to_owned(),
             format!("--cas=https://127.0.0.1:{}", front.worker.port()),
-            format!("--scratch={}", dir.join("leases").display()),
+            format!("--data-dir={}", dir.display()),
             format!("--id-files={}", ids.display()),
             "--reserve-cpus=1".to_owned(),
         ])
@@ -883,7 +897,7 @@ fn a_container_node_given_its_actions_cgroup_writes_only_its_cap() {
     flags.extend([
         "--driver=container".to_owned(),
         "--cas=https://127.0.0.1:1".to_owned(),
-        format!("--scratch={}", dir.join("leases").display()),
+        format!("--data-dir={}", dir.display()),
         format!("--id-files={}", ids.display()),
         "--cgroup-parent=/kbf.slice/kbf-daemon.service/actions".to_owned(),
         "--actions-memory-max-gib=2".to_owned(),
@@ -917,7 +931,7 @@ fn a_container_node_whose_cgroup_is_not_delegated_refuses_to_start() {
             .args([
                 "--driver=container".to_owned(),
                 "--cas=https://127.0.0.1:1".to_owned(),
-                format!("--scratch={}", dir.join("leases").display()),
+                format!("--data-dir={}", dir.display()),
                 format!("--id-files={}", ids.display()),
             ])
             .args(flags)
@@ -996,15 +1010,19 @@ fn id_files(name: &str, count: &str) -> PathBuf {
 #[test]
 fn a_driver_missing_its_flags_refuses_to_start() {
     let dir = tls("refused");
-    let scratch = format!("--scratch={}", dir.join("leases").display());
+    let scratch = format!("--data-dir={}", dir.display());
     let cases: Vec<(Vec<String>, &str)> = vec![
         (
             vec!["--driver=native".into(), scratch.clone()],
             "--cas is required",
         ),
         (
-            vec!["--driver=native".into(), "--cas=https://127.0.0.1:1".into()],
-            "--scratch is required",
+            vec![
+                "--driver=native".into(),
+                "--cas=https://127.0.0.1:1".into(),
+                "--data-dir=relative".into(),
+            ],
+            "--data-dir relative must be absolute",
         ),
         (
             vec![
@@ -1096,7 +1114,7 @@ fn a_container_node_without_subordinate_ids_refuses_to_start() {
             .args([
                 "--driver=container".to_owned(),
                 "--cas=https://127.0.0.1:1".to_owned(),
-                format!("--scratch={}", ids.join("leases").display()),
+                format!("--data-dir={}", ids.display()),
                 "--cgroup-parent=/kbf.slice/actions".to_owned(),
                 format!("--id-files={}", ids.display()),
             ])
@@ -1129,7 +1147,7 @@ fn a_node_told_to_use_the_oci_backend_needs_its_runtime() {
     let mut container = vec![
         "--driver=container".to_owned(),
         "--cas=https://127.0.0.1:1".to_owned(),
-        format!("--scratch={}", ids.join("leases").display()),
+        format!("--data-dir={}", ids.display()),
         format!("--id-files={}", ids.display()),
         "--actions-memory-max-gib=1".to_owned(),
         "--container-runtime=oci".to_owned(),
@@ -1215,7 +1233,7 @@ fn a_container_node_given_a_zero_limit_refuses_to_start() {
             .args([
                 "--driver=container".to_owned(),
                 "--cas=https://127.0.0.1:1".to_owned(),
-                format!("--scratch={}", dir.join("leases").display()),
+                format!("--data-dir={}", dir.display()),
                 format!("--id-files={}", ids.display()),
                 flag.to_owned(),
             ])
@@ -1294,7 +1312,8 @@ fn wait_for<T>(what: &str, mut read: impl FnMut() -> Option<T>) -> T {
     }
 }
 
-/// The flags of a native daemon in `dir` that serves `front`, with leases under `scratch`.
+/// The flags of a native daemon in `dir` that serves `front`, with leases under
+/// `scratch` (`<--data-dir>/leases`: `scratch`'s parent is the data directory).
 fn native_flags(front: &front::Front, dir: &Path, scratch: &Path) -> Vec<String> {
     vec![
         format!("--server=https://127.0.0.1:{}", front.worker.port()),
@@ -1306,7 +1325,10 @@ fn native_flags(front: &front::Front, dir: &Path, scratch: &Path) -> Vec<String>
         "--reconnect-ms=50".to_owned(),
         "--driver=native".to_owned(),
         format!("--cas=https://127.0.0.1:{}", front.worker.port()),
-        format!("--scratch={}", scratch.display()),
+        format!(
+            "--data-dir={}",
+            scratch.parent().expect("a data dir").display()
+        ),
     ]
 }
 
@@ -1570,7 +1592,7 @@ fn container_flags(dir: &Path, ids: &Path, images: &[String]) -> Vec<String> {
     let mut flags = vec![
         "--driver=container".to_owned(),
         "--cas=https://127.0.0.1:1".to_owned(),
-        format!("--scratch={}", dir.join("leases").display()),
+        format!("--data-dir={}", dir.display()),
         format!("--id-files={}", ids.display()),
     ];
     flags.extend(cgroup_flags);

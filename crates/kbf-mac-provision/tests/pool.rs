@@ -237,7 +237,7 @@ fn a_converged_root_mac_passes_every_item() {
     let r = check(&mac);
     assert_eq!(r.failed, 0, "{}", r.text);
     for want in [
-        "PASS daemon_user: root: /usr/local/kbf/etc/node.key -rw------- 0 0; /Volumes/kbf/scratch drwxr-xr-x 0 0\n",
+        "PASS daemon_user: root: /usr/local/kbf/etc/node.key -rw------- 0 0; /Volumes/kbf/data drwxr-xr-x 0 0\n",
         "PASS launchd_label: system/org.example.kbf-daemon loaded, as root, ProcessType Interactive\n",
     ] {
         assert!(r.text.contains(want), "lacks {want:?}:\n{}", r.text);
@@ -285,19 +285,19 @@ const ROOT_DRIFTS: &[Drift] = &[
     (
         "scratch root of the role account",
         |m| m.own(SCRATCH, 480, 480),
-        "/Volumes/kbf/scratch is drwxr-xr-x 480 480, want drwxr-xr-x 0 0",
+        "/Volumes/kbf/data is drwxr-xr-x 480 480, want drwxr-xr-x 0 0",
         true,
     ),
     (
         "scratch root group-writable",
         |m| m.chmod(SCRATCH, 0o775),
-        "/Volumes/kbf/scratch is drwxrwxr-x 0 0, want drwxr-xr-x 0 0",
+        "/Volumes/kbf/data is drwxrwxr-x 0 0, want drwxr-xr-x 0 0",
         true,
     ),
     (
         "scratch root missing",
         |m| m.remove(SCRATCH),
-        "/Volumes/kbf/scratch is missing, want drwxr-xr-x 0 0",
+        "/Volumes/kbf/data is missing, want drwxr-xr-x 0 0",
         true,
     ),
 ];
@@ -358,7 +358,7 @@ fn setting_daemon_user_root_on_a_role_mac_moves_the_daemon_to_root() {
         r.text.lines().collect::<Vec<_>>(),
         [
             "CHANGE daemon_user: /usr/local/kbf/etc/node.key root's, mode 600",
-            "CHANGE daemon_user: /Volumes/kbf/scratch root's, mode 755",
+            "CHANGE daemon_user: /Volumes/kbf/data root's, mode 755",
             "CHANGE launchd_label: wrote /Library/LaunchDaemons/org.example.kbf-daemon.plist and restarted the job (error log truncated)",
         ]
     );
@@ -413,7 +413,7 @@ fn a_root_is_made_only_on_the_mounted_volume_and_never_through_a_link() {
         (r.failed, r.text.lines().next()),
         (
             1,
-            Some("NOTE daemon_user: /Volumes/kbf/scratch is not a directory; apply leaves it")
+            Some("NOTE daemon_user: /Volumes/kbf/data is not a directory; apply leaves it")
         )
     );
     assert_eq!(mac.writes(), Vec::<String>::new());
