@@ -14,11 +14,42 @@ mod support;
 // The helper containers run this binary in its `__chown-dirs` mode.
 kbf_driver_container::chown_dirs_test_hook!();
 
+use std::process::Command;
 use std::time::Instant;
 
 use kbf_daemon::RuntimeError;
 use support::real::{Cell, sh, var};
 use support::{Spec, blob};
+
+/// The kernel's last words about overlayfs and user namespaces (`dmesg`, through `sudo -n`:
+/// a hosted runner has it), printed when a lease fails: the refusal of a mount is in the
+/// kernel log, not in `crun`'s words.
+fn kernel_log() -> String {
+    let out = Command::new("sudo").args(["-n", "dmesg"]).output();
+    let text = out.map_or_else(
+        |e| e.to_string(),
+        |o| String::from_utf8_lossy(&o.stdout).into_owned(),
+    );
+    let lines: Vec<&str> = text
+        .lines()
+        .filter(|l| l.contains("overlay") || l.contains("userns") || l.contains("apparmor"))
+        .collect();
+    let tail = lines.len().saturating_sub(15);
+    format!("kernel log: {:?}", &lines[tail..])
+}
+
+/// `cell.run`, with the kernel log printed if the lease failed.
+async fn run(
+    cell: &Cell,
+    seq: u64,
+    spec: &Spec,
+) -> Result<kbf_proto::reapi::ActionResult, kbf_daemon::RuntimeError> {
+    let result = cell.run(seq, spec).await;
+    if result.is_err() {
+        eprintln!("{}", kernel_log());
+    }
+    result
+}
 
 /// Catches the sandbox being less than `config.json` says, read from inside: the
 /// action is root with every id a subordinate id, alone in its pid namespace, with the
@@ -45,7 +76,7 @@ async fn the_sandbox_is_what_the_config_says() {
     "#;
     let mut spec = sh(script);
     spec.inputs = vec![("in.txt", b"in", false)];
-    let result = cell.run(1, &spec).await.expect("ran");
+    let result = run(&cell, 1, &spec).await.expect("ran");
     let out = cell.stdout(&result);
     assert_eq!(result.exit_code, 0, "{out}\n{}", cell.stderr(&result));
     let subuid = first_subordinate_id();
@@ -163,7 +194,7 @@ async fn outputs_come_back_through_the_overlay_and_the_hand_over() {
     );
     spec.inputs = vec![("in.txt", b"input bytes", false)];
     spec.outputs = vec!["out/copy.txt".to_owned(), "out/priv".to_owned()];
-    let result = cell.run(1, &spec).await.expect("ran");
+    let result = run(&cell, 1, &spec).await.expect("ran");
     assert_eq!(result.exit_code, 0, "{}", cell.stderr(&result));
     assert_eq!(result.output_files.len(), 1, "{result:?}");
     assert_eq!(
@@ -188,7 +219,7 @@ async fn timeout_and_kill_leave_nothing_behind() {
     let cell = Cell::oci("timeout-kill");
     let mut spec = sh("echo started; sleep 300");
     spec.timeout = Some(std::time::Duration::from_secs(2));
-    let outcome = cell.run(1, &spec).await;
+    let outcome = run(&cell, 1, &spec).await;
     let Err(RuntimeError::TimedOut { stdout, .. }) = outcome else {
         panic!("{outcome:?}");
     };
