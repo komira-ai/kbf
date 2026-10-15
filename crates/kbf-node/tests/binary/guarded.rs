@@ -30,9 +30,17 @@ impl DerefMut for Guarded {
 }
 
 impl Drop for Guarded {
-    // PLANTED DEFECT (this commit only): the guard does not kill its process, as a
-    // plain `std::process::Child` does not. The next commit restores the kill.
-    fn drop(&mut self) {}
+    fn drop(&mut self) {
+        // Ended and reaped (by the test, or here): nothing to do. `try_wait` reaps one
+        // that ended unseen, so its pid is not left as a zombie either.
+        if matches!(self.0.try_wait(), Ok(Some(_))) {
+            return;
+        }
+        // Errors are ignored: the process may have ended between the two calls, and a
+        // destructor that panics during a panic aborts the test binary.
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
 }
 
 /// `spawn`, but the process cannot outlive the test (see the module docs).
