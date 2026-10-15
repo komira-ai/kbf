@@ -95,6 +95,9 @@ pub struct Args {
     /// no `file://` hot store. Given, it wins over the hot store's directory.
     #[arg(long, value_name = "DIR")]
     pub meta_dir: Option<PathBuf>,
+    /// Planted: the old flag, silently accepted.
+    #[arg(long, hide = true)]
+    pub raft_dir: Option<PathBuf>,
     /// The REAPI listener. Without `--reapi-tls-cert` and `--reapi-tls-key` it serves
     /// plain text, on any address; off loopback the start line carries a warning.
     #[arg(long, default_value = "127.0.0.1:8980")]
