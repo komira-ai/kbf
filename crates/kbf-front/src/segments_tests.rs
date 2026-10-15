@@ -40,7 +40,7 @@ fn declared_segment() -> (Vec<Declared>, Vec<u8>) {
 #[tokio::test]
 async fn the_check_builds_each_received_segment() {
     let (declared, records) = declared_segment();
-    let mut received = Receiving::new(&declared[0]);
+    let mut received = Receiving::new(&declared[0], false);
     let (put, claimed) = received.put(&declared[0], 0, &records).expect("put");
     assert_eq!(put, Put::Written);
     advance(&claimed, |i, finished| {
@@ -68,7 +68,7 @@ async fn a_check_that_panics_answers_internal() {
         records_len: 0,
         entries: Vec::new(),
     };
-    let received = Receiving::new(&nothing);
+    let received = Receiving::new(&nothing, false);
     let failed = check_all(committing(declared), vec![received])
         .await
         .expect_err("a panicked check");
@@ -89,7 +89,7 @@ fn a_job_outliving_its_receiving_upload_sees_nothing() {
     let upload = committing(declared);
     let mut bad = records;
     bad[1] ^= 1;
-    let mut received = Receiving::new(&upload.declared[0]);
+    let mut received = Receiving::new(&upload.declared[0], false);
     let (_, claimed) = received.put(&upload.declared[0], 0, &bad).expect("put");
     *lock(&upload.phase) = Phase::Receiving {
         segments: vec![received],

@@ -87,9 +87,11 @@ pub(super) fn declare(
 /// The ranges of one segment received so far, and the bytes they carried, written into
 /// a buffer the segment's length (records, then room for the footer the server builds).
 ///
-/// Each record is checked as its bytes arrive: its SHA-256 and CRC-32C advance over
-/// the bytes received contiguously from its start, whichever order the ranges came in,
-/// so at the last range only the records it completed have anything left to hash.
+/// Unless the upload is trusted, each record is checked as its bytes arrive: its
+/// SHA-256 and CRC-32C advance over the bytes received contiguously from its start,
+/// whichever order the ranges came in, so at the last range only the records it
+/// completed have anything left to hash. A trusted upload (one on a write tier) hashes
+/// nothing.
 #[derive(Debug)]
 pub(super) struct Receiving {
     buffer: Vec<u8>,
@@ -101,6 +103,9 @@ pub(super) struct Receiving {
     records: Vec<Record>,
     /// The first record found not to hash to its digest.
     bad: Option<String>,
+    /// The daemon's digests are trusted: nothing is hashed here (the flusher does it
+    /// before the PUT, or the cache does if the tier does not take the segment).
+    trusted: bool,
 }
 
 /// How far one record has been checked.
@@ -150,14 +155,17 @@ where
 }
 
 impl Receiving {
-    pub(super) fn new(declared: &Declared) -> Self {
+    /// A segment of `declared`'s shape. With `trusted`, nothing is hashed: the records
+    /// are held as received and built into a segment [`BuiltSegment::verified`] is
+    /// false for.
+    pub(super) fn new(declared: &Declared, trusted: bool) -> Self {
         let mut by_offset: Vec<usize> = (0..declared.entries.len()).collect();
         by_offset.sort_by_key(|&i| declared.entries[i].offset);
         let mut records: Vec<Record> = declared.entries.iter().map(|_| Record::default()).collect();
         let mut bad = None;
         // An empty record has no bytes to wait for.
         for (entry, record) in declared.entries.iter().zip(&mut records) {
-            if entry.digest.size_bytes == 0 {
+            if entry.digest.size_bytes == 0 && !trusted {
                 let (actual, crc) = RecordHasher::new().finish();
                 if actual == entry.digest {
                     record.crc = Some(crc);
@@ -173,6 +181,7 @@ impl Receiving {
             by_offset,
             records,
             bad,
+            trusted,
         }
     }
 
@@ -218,7 +227,12 @@ impl Receiving {
         let (from, to) = (offset as usize, end as usize);
         self.buffer[from..to].copy_from_slice(bytes);
         self.ranges.insert(offset, end);
-        Ok((Put::Written, self.claim(declared, offset, end)))
+        let claimed = if self.trusted {
+            Vec::new()
+        } else {
+            self.claim(declared, offset, end)
+        };
+        Ok((Put::Written, claimed))
     }
 
     /// Claims the records overlapping `start..end` that no task is advancing and that
@@ -327,10 +341,11 @@ impl Receiving {
             .map(|e| &e.digest)
     }
 
-    /// Builds the stored segment from records already checked as they arrived: the
-    /// received records, then a footer built here from the declared (digest, offset)
-    /// entries and the CRC-32C the check computed. The daemon's CRC-32C values are
-    /// never used.
+    /// Builds the segment to store from the received records, then a footer built here
+    /// from the declared (digest, offset) entries and the CRC-32C the check computed.
+    /// For a trusted upload nothing was computed: the footer carries the daemon's
+    /// CRC-32C and the segment is not [`BuiltSegment::verified`], so the cache hashes
+    /// it before any PUT.
     ///
     /// # Errors
     /// INVALID_ARGUMENT for a record that did not hash to its digest; FAILED_PRECONDITION
@@ -342,9 +357,13 @@ impl Receiving {
         let mut buffer = self.buffer;
         let mut entries = Vec::with_capacity(declared.entries.len());
         for (i, entry) in declared.entries.iter().enumerate() {
-            let crc32c = self.records[i].crc.ok_or_else(|| {
-                Status::failed_precondition(format!("record {} was not checked", entry.digest))
-            })?;
+            let crc32c = if self.trusted {
+                entry.crc32c
+            } else {
+                self.records[i].crc.ok_or_else(|| {
+                    Status::failed_precondition(format!("record {} was not checked", entry.digest))
+                })?
+            };
             entries.push(IndexEntry {
                 digest: entry.digest,
                 offset: entry.offset,
@@ -358,6 +377,7 @@ impl Receiving {
         Ok(BuiltSegment {
             body: Bytes::from(buffer),
             entries,
+            verified: !self.trusted,
         })
     }
 }

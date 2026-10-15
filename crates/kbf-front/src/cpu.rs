@@ -1,24 +1,26 @@
-//! The bound on segment hashing: CPU work for record digests runs on the blocking pool,
+//! The bound on record hashing: CPU work for record digests runs on the blocking pool,
 //! never on a runtime worker, and at most `--cpu-threads` of it at once, so a burst of
-//! ranges cannot take every core from the rest of the server.
+//! ranges, or a flush of a large block, cannot take every core from the rest of the
+//! server. One pool per cache: the checks of an upload without a write tier and the
+//! write tier's flusher share it.
 
 use std::num::NonZeroUsize;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use tokio::sync::Semaphore;
 use tonic::Status;
 
 /// A job for the pool. Boxed so the pool has one copy of its code, not one per closure.
-pub(super) type Job = Box<dyn FnOnce() + Send + 'static>;
+pub(crate) type Job = Box<dyn FnOnce() + Send + 'static>;
 
 /// At most `threads` hashing jobs running at once.
 #[derive(Debug)]
-pub(super) struct HashPool {
+pub(crate) struct HashPool {
     permits: Arc<Semaphore>,
 }
 
 impl HashPool {
-    pub(super) fn new(threads: NonZeroUsize) -> Self {
+    pub(crate) fn new(threads: NonZeroUsize) -> Self {
         Self {
             permits: Arc::new(Semaphore::new(threads.get())),
         }
@@ -30,7 +32,7 @@ impl HashPool {
     ///
     /// # Errors
     /// INTERNAL if the job panicked.
-    pub(super) async fn run(&self, job: Job) -> Result<(), Status> {
+    pub(crate) async fn run(&self, job: Job) -> Result<(), Status> {
         let permits = Arc::clone(&self.permits);
         tokio::spawn(async move {
             // The semaphore is never closed, so a permit always comes.
@@ -44,6 +46,27 @@ impl HashPool {
         .await
         .and_then(std::convert::identity)
         .map_err(|e| Status::internal(format!("a hashing job failed: {e}")))
+    }
+}
+
+impl HashPool {
+    /// Runs `compute` as [`HashPool::run`] does and returns what it returned.
+    ///
+    /// # Errors
+    /// INTERNAL if the job panicked.
+    pub(crate) async fn compute<T: Default + Send + 'static>(
+        &self,
+        compute: impl FnOnce() -> T + Send + 'static,
+    ) -> Result<T, Status> {
+        let slot = Arc::new(Mutex::new(None));
+        let there = Arc::clone(&slot);
+        self.run(Box::new(move || {
+            *there.lock().unwrap_or_else(PoisonError::into_inner) = Some(compute());
+        }))
+        .await?;
+        // A job that ran to its end (else `run` failed) stored its result.
+        let out = slot.lock().unwrap_or_else(PoisonError::into_inner).take();
+        Ok(out.unwrap_or_default())
     }
 }
 
@@ -85,6 +108,19 @@ mod tests {
             t.await.unwrap().unwrap();
         }
         assert_eq!(peak.load(Ordering::SeqCst), 2);
+    }
+
+    /// `compute` returns what its closure returned, and a closure that panics is an
+    /// INTERNAL status.
+    #[tokio::test]
+    async fn compute_returns_what_the_closure_returned() {
+        let pool = HashPool::new(NonZeroUsize::MIN);
+        assert_eq!(pool.compute(|| 7u32).await.unwrap(), 7);
+        let failed = pool
+            .compute(|| -> u32 { panic!("boom") })
+            .await
+            .unwrap_err();
+        assert_eq!(failed.code(), Code::Internal, "{failed:?}");
     }
 
     /// A job runs on a thread of its own, not on the thread that awaits it (here the

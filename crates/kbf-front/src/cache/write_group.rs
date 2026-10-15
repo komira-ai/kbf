@@ -39,6 +39,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 
 use super::tier::Staging;
 use super::{Cache, CacheError, VerifiedBlob, refuse_oversized, unexpected};
+use crate::cpu::HashPool;
 use crate::meta_log::{MetaLog, MetaLogError};
 use crate::metrics::{CacheMetrics, command_label};
 
@@ -95,17 +96,22 @@ pub struct WriteConfig {
     /// did not reach the store or a 5xx answer is tried again, after [`PUT_BACKOFF`]
     /// (growing by [`PUT_BACKOFF_FACTOR`]), each time under a new object id.
     pub put_attempts: NonZeroU32,
+    /// The most record-hashing jobs running at once on the blocking pool
+    /// (`--cpu-threads`): the checks of a `Segments` upload without a write tier, and
+    /// the write tier's flusher, which hashes every record it reads back before the PUT.
+    pub cpu_threads: NonZeroUsize,
 }
 
 impl WriteConfig {
     /// The defaults of `docs/design/write-path.md`: a 2 ms linger, own segments from
-    /// 16 MiB, 2 GiB admitted, 4 PUTs in flight, 3 attempts per PUT.
+    /// 16 MiB, 2 GiB admitted, 4 PUTs in flight, 3 attempts per PUT, 4 hashing jobs.
     pub const DEFAULT: Self = Self {
         linger: Duration::from_millis(2),
         own_segment_bytes: 16 << 20,
         bytes_in_flight: 2 << 30,
         puts_in_flight: NonZeroUsize::MIN.saturating_add(3),
         put_attempts: NonZeroU32::MIN.saturating_add(2),
+        cpu_threads: NonZeroUsize::MIN.saturating_add(3),
     };
 }
 
@@ -141,6 +147,8 @@ pub(super) struct Group {
     admission: Arc<Semaphore>,
     bound: u64,
     puts: Semaphore,
+    /// Record hashing, off the runtime workers.
+    pub(super) hashing: HashPool,
     state: Mutex<State>,
     buffered: AtomicU64,
     buffered_peak: AtomicU64,
@@ -203,6 +211,7 @@ impl Group {
             admission: Arc::new(Semaphore::new(bound as usize)),
             bound,
             puts: Semaphore::new(config.puts_in_flight.get()),
+            hashing: HashPool::new(config.cpu_threads),
             state: Mutex::new(State::default()),
             buffered: AtomicU64::new(0),
             buffered_peak: AtomicU64::new(0),
@@ -292,6 +301,12 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
     pub fn with_writes(mut self, config: WriteConfig) -> Self {
         self.group = Arc::new(Group::new(config));
         self
+    }
+
+    /// The pool record hashing runs on: at most [`WriteConfig::cpu_threads`] jobs at
+    /// once, on the blocking pool.
+    pub(crate) fn hashing(&self) -> &HashPool {
+        &self.group.hashing
     }
 
     /// Waits until `bytes` more fit under [`WriteConfig::bytes_in_flight`] and takes

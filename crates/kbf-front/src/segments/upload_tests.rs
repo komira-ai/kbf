@@ -31,7 +31,7 @@ fn segment(n: usize, last: usize) -> (Declared, Vec<u8>) {
 /// Sends `records` in ranges of `cut` bytes in the order `order` names (indices of
 /// ranges), as `PutRange` does: write, then run the claimed checks.
 fn send(declared: &Declared, records: &[u8], cut: usize, order: &[usize]) -> Receiving {
-    let mut received = Receiving::new(declared);
+    let mut received = Receiving::new(declared, false);
     for &k in order {
         let (start, end) = (k * cut, ((k + 1) * cut).min(records.len()));
         let (_, claimed) = received
@@ -40,6 +40,32 @@ fn send(declared: &Declared, records: &[u8], cut: usize, order: &[usize]) -> Rec
         advance(&claimed, |i, finished| received.next(declared, i, finished));
     }
     received
+}
+
+/// Catches an upload on a write tier that still hashes on the ranges' path (a claim
+/// handed out, a record refused before the flusher sees it), one that stores a segment
+/// as verified when nothing was hashed (the direct PUT would then skip its check), and
+/// a footer that loses the declared entries: a record altered after `Begin` makes no
+/// claim, no refusal, and the segment builds with the declared CRC-32Cs, unverified.
+#[test]
+fn a_trusted_upload_hashes_nothing_and_builds_an_unverified_segment() {
+    let (declared, records) = segment(5, 300);
+    let mut altered = records.clone();
+    altered[10] ^= 0xff;
+    let mut received = Receiving::new(&declared, true);
+    let (put, claimed) = received.put(&declared, 0, &altered).expect("put");
+    assert_eq!(put, Put::Written);
+    assert!(claimed.is_empty(), "{claimed:?}");
+    assert!(received.not_ready().is_none());
+    assert!(received.first_missing(&declared).is_none());
+    let built = received.check(&declared).expect("built");
+    assert!(!built.verified);
+    assert_eq!(built.entries, declared.entries);
+    let mut hashed = Receiving::new(&declared, false);
+    let (_, claimed) = hashed.put(&declared, 0, &records).expect("put");
+    assert!(!claimed.is_empty());
+    advance(&claimed, |i, f| hashed.next(&declared, i, f));
+    assert!(hashed.check(&declared).expect("built").verified);
 }
 
 fn in_order(len: usize, cut: usize) -> Vec<usize> {
@@ -54,7 +80,7 @@ fn in_order(len: usize, cut: usize) -> Vec<usize> {
 #[test]
 fn any_cut_and_order_builds_the_same_segment() {
     let (declared, records) = segment(30, 3000);
-    let mut whole = Receiving::new(&declared);
+    let mut whole = Receiving::new(&declared, false);
     let (_, claimed) = whole.put(&declared, 0, &records).expect("put");
     advance(&claimed, |i, f| whole.next(&declared, i, f));
     let want = whole.check(&declared).expect("whole");
@@ -88,7 +114,7 @@ fn any_cut_and_order_builds_the_same_segment() {
 #[test]
 fn the_commit_has_nothing_left_to_hash() {
     let (declared, records) = segment(10, 500);
-    let mut received = Receiving::new(&declared);
+    let mut received = Receiving::new(&declared, false);
     received.put(&declared, 0, &records).expect("put");
     // Claimed but never advanced, as a commit that raced its ranges would find it.
     assert!(received.checking());
@@ -177,7 +203,9 @@ fn an_empty_record_is_checked_without_bytes_and_a_lying_one_is_refused() {
         .position(|e| e.digest.size_bytes == 0)
         .expect("the empty record");
     lying.entries[empty].digest.hash[0] ^= 1;
-    let refused = Receiving::new(&lying).refusal().expect("refused at Begin");
+    let refused = Receiving::new(&lying, false)
+        .refusal()
+        .expect("refused at Begin");
     assert_eq!(refused.code(), Code::InvalidArgument);
     assert!(
         refused
@@ -195,7 +223,7 @@ fn an_empty_record_is_checked_without_bytes_and_a_lying_one_is_refused() {
 #[test]
 fn a_commit_waits_for_checks_and_stops_at_a_refusal() {
     let (declared, records) = segment(3, 500);
-    let mut received = Receiving::new(&declared);
+    let mut received = Receiving::new(&declared, false);
     let (_, claimed) = received.put(&declared, 0, &records).expect("put");
     let racing = received.not_ready().expect("records are being checked");
     assert_eq!(racing.code(), Code::FailedPrecondition);
@@ -220,7 +248,7 @@ fn a_commit_waits_for_checks_and_stops_at_a_refusal() {
 #[test]
 fn a_busy_record_is_not_claimed_again() {
     let (declared, records) = segment(1, 3000);
-    let mut received = Receiving::new(&declared);
+    let mut received = Receiving::new(&declared, false);
     let (_, first) = received.put(&declared, 0, &records[..1000]).expect("put");
     assert_eq!(first.len(), 1);
     let (_, second) = received

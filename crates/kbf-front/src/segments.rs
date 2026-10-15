@@ -10,22 +10,28 @@
 //!   its whole length by [`Cache::admit`] (`--write-bytes-in-flight`, the bound
 //!   ByteStream and batch uploads share), waiting (never refusing) while it is spent.
 //!   Ranges are held in memory until the commit.
-//! - **PutRange** writes a range of one segment's records and, before it answers,
-//!   hashes (SHA-256 and CRC-32C) what the range completed or extended: each record's
-//!   hash advances over the bytes received unbroken from its start, whichever order
-//!   the ranges come in, on the blocking pool beside the other ranges'. A record that
-//!   does not hash to its digest is refused at once. Once Commit was called, every
-//!   PutRange is refused, so the bytes checked are the bytes stored.
+//! - **PutRange** writes a range of one segment's records. Once Commit was called,
+//!   every PutRange is refused, so the bytes received are the bytes stored.
+//!   *Without a write tier* the range also hashes (SHA-256 and CRC-32C) what it
+//!   completed or extended before it answers: each record's hash advances over the
+//!   bytes received unbroken from its start, whichever order the ranges come in, on
+//!   the cache's hashing pool (`--cpu-threads`, blocking pool, off the runtime
+//!   workers), and a record that does not hash to its digest is refused at once, since
+//!   the PUT is the only copy. *With a write tier* nothing is hashed here: the daemon's
+//!   digests are trusted when the upload is acknowledged, and the flusher checks every
+//!   record before the PUT (`docs/design/write-path.md`, section 6.7).
 //! - **Commit** runs in a task of its own, detached from the call and the connection,
-//!   until it has indexed or failed: it refuses a record not wholly received or not
-//!   hashed to its digest, and each segment gets a footer built here (the daemon's CRC-32C values never reach the store). With a
-//!   write tier attached, each segment is staged on it as a block of its own (its records
-//!   synced to the tier's disk, one `PutStaged` for its blobs): the Commit is answered
-//!   without an object-store PUT, and the flusher PUTs the object later. A segment the
-//!   tier does not take (at its budget, a disk error before the commit) is PUT and read
-//!   back as a grouped segment is (a `--write-puts-in-flight` slot, the PUT retried
-//!   under a new key), and one `PutBlobs` commits the records of every PUT segment. A
-//!   second Commit waits for the first and returns its answer.
+//!   until it has indexed or failed. It refuses a record not wholly received (and, with
+//!   no tier, one not hashed to its digest) and never waits for any hashing of its own.
+//!   With a write tier attached, each segment is staged on it as a block of its own
+//!   (its records synced to the tier's disk, one `PutStaged` for its blobs): the Commit
+//!   is answered without an object-store PUT, and the flusher PUTs the object later,
+//!   with a footer it builds from its own hashing. A segment the tier does not take (at
+//!   its budget, a disk error before the commit) is hashed then, if it was not, and PUT
+//!   and read back as a grouped segment is (a `--write-puts-in-flight` slot, the PUT
+//!   retried under a new key) with a footer built here (the daemon's CRC-32C values
+//!   never reach the store), and one `PutBlobs` commits the records of every PUT
+//!   segment. A second Commit waits for the first and returns its answer.
 //! - **ReadRange** is served from the write tier while the object is staged on it (or
 //!   has a flushed copy there), else from the store.
 //! - An upload belongs to the connection that began it ([`Connections`]). When that
@@ -34,11 +40,9 @@
 //!   one is kept until its commit ends.
 
 mod connection;
-mod cpu;
 mod upload;
 
 use std::collections::HashMap;
-use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
@@ -58,7 +62,6 @@ use tokio::time::Instant;
 use tonic::{Request, Response, Status};
 
 pub use self::connection::{Connection, Connections, Tracked};
-use self::cpu::HashPool;
 use self::upload::{Declared, Held, Put, Receiving, advance, declare};
 use crate::cache::{Admitted, BuiltSegment, Cache};
 use crate::meta_log::MetaLog;
@@ -86,9 +89,6 @@ pub struct SegmentsConfig {
     /// How long an upload may go without a call before it is dropped
     /// (`--segment-upload-idle-secs`).
     pub idle: Duration,
-    /// The most record-hashing jobs running at once (`--cpu-threads`), on the blocking
-    /// pool.
-    pub cpu_threads: NonZeroUsize,
 }
 
 impl SegmentsConfig {
@@ -96,10 +96,6 @@ impl SegmentsConfig {
     pub const DEFAULT: Self = Self {
         max_bytes: MIN_SEGMENT_UPLOAD_BYTES,
         idle: Duration::from_secs(60),
-        cpu_threads: match NonZeroUsize::new(4) {
-            Some(n) => n,
-            None => unreachable!(),
-        },
     };
 }
 
@@ -122,7 +118,6 @@ struct Shared<M, O> {
     cache: Arc<Cache<M, O>>,
     config: SegmentsConfig,
     connections: Connections,
-    hashing: HashPool,
     /// `Begin` calls waiting for admission now.
     waiting: AtomicUsize,
     next: AtomicU64,
@@ -258,7 +253,6 @@ impl<M: MetaLog, O: ObjectStore + 'static> SegmentsService<M, O> {
         Self {
             shared: Arc::new(Shared {
                 cache,
-                hashing: HashPool::new(config.cpu_threads),
                 config,
                 connections,
                 waiting: AtomicUsize::new(0),
@@ -376,7 +370,14 @@ impl<M: MetaLog, O: ObjectStore + 'static> Segments for SegmentsService<M, O> {
             let _waiting = Waiting::enter(&self.shared.waiting);
             self.shared.cache.admit(total).await
         };
-        let segments = declared.iter().map(Receiving::new).collect();
+        // With a write tier the daemon's digests are trusted here and checked by the
+        // flusher before the PUT; without one, the only copy is the PUT, so each record
+        // is hashed as its bytes arrive.
+        let trusted = self.shared.cache.write_tier().is_some();
+        let segments = declared
+            .iter()
+            .map(|d| Receiving::new(d, trusted))
+            .collect();
         let (done, _) = watch::channel(None);
         let upload = Arc::new(Upload {
             owner,
@@ -441,7 +442,8 @@ impl<M: MetaLog, O: ObjectStore + 'static> Segments for SegmentsService<M, O> {
             // record claimed forever.
             let task = Arc::clone(&upload);
             self.shared
-                .hashing
+                .cache
+                .hashing()
                 .run(Box::new(move || {
                     advance(&claimed, |i, finished| task.check_next(index, i, finished));
                 }))
