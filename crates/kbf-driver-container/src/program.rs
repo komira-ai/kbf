@@ -389,6 +389,24 @@ mod tests {
         assert!(text_file_busy(&said).await);
     }
 
+    /// Catches a runtime that said nothing named as if it had said something: the
+    /// farm's failure then says so.
+    #[tokio::test]
+    async fn a_runtime_that_said_nothing_is_named_so() {
+        let dir = scratch("said-nothing");
+        let report = dir.join("stderr");
+        std::fs::write(&report, b"").expect("report");
+        let outcome = not_run(
+            &crate::podman::tests::spec(),
+            &Said::podman(&report),
+            "created 0",
+        )
+        .await;
+        let why = outcome.expect_err("the farm's failure").to_string();
+        assert!(why.contains("podman reports \"created 0\""), "{why}");
+        assert!(why.ends_with("(nothing on stderr)"), "{why}");
+    }
+
     /// Catches a report that opens but cannot be read, and a rewritten stderr that cannot
     /// be written, passed over as if nothing happened: each is the farm's failure, naming
     /// the file (a directory opens, and fails to be read or written).
