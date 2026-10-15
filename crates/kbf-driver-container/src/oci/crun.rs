@@ -159,6 +159,7 @@ impl Crun {
         let mut opts = GlobalOpts::new()
             .command(&self.program)
             .root(state)
+            .debug(true)
             .log(&log)
             .log_json();
         opts.custom_spawner(Arc::new(KillOnDrop));
@@ -173,11 +174,13 @@ impl Crun {
                 // What `crun` itself logged: the reason it failed, as opposed to the
                 // helper's own words on stderr.
                 let logged = std::fs::read_to_string(&log).unwrap_or_default();
+                let tail = logged.len().saturating_sub(3000);
                 Err(format!(
-                    "crun run (helper {id}): {status}: {} {} {}",
+                    "crun run (helper {id}): {status}: {} {} {} [log: {}]",
                     stdout.trim(),
                     stderr.trim(),
-                    crate::program::crun_words(&logged)
+                    crate::program::crun_words(&logged),
+                    logged.get(tail..).unwrap_or_default().replace('\n', " ")
                 ))
             }
             Err(e) => Err(format!("crun run (helper {id}): {e}")),

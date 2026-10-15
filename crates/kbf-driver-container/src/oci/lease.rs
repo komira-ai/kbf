@@ -10,7 +10,7 @@ use super::crun::{RunEnd, log_path};
 use super::{JobError, Mapping, Oci, at, helper, spec};
 use crate::backend::{Backend, Dirs, Run, Running};
 use crate::image::{ImageCheckError, ImageRef};
-use crate::podman::{ContainerSpec, Ended};
+use crate::podman::{CONTAINER_OWNER, ContainerSpec, Ended};
 use crate::program::{Said, crun_words};
 
 /// The mode of the lease directory and of the small files in it the container reads:
@@ -38,11 +38,15 @@ async fn open_dir(path: &Path) -> Result<(), JobError> {
 impl Oci {
     /// The directories of `dirs` to hand over and the `rw` directory among them.
     async fn hand_over(&self, owner: &str, dirs: &Dirs<'_>) -> Result<(), JobError> {
-        open_dir(dirs.lease).await?;
         let rw = dirs.lease.join(spec::WRITABLE_DIR);
-        open_dir(&rw).await?;
-        for (name, _) in spec::WRITABLE {
-            open_dir(&rw.join(name)).await?;
+        // The directories are the daemon's to make and open until they are given to the
+        // container; given back, they are the container's ids' until the clean.
+        if owner == CONTAINER_OWNER {
+            open_dir(dirs.lease).await?;
+            open_dir(&rw).await?;
+            for (name, _) in spec::WRITABLE {
+                open_dir(&rw.join(name)).await?;
+            }
         }
         let mut whole = vec![dirs.upper, dirs.work, rw.as_path()];
         // With the cache the input root's files are links to its entries: only its
