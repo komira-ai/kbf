@@ -193,10 +193,11 @@ fn a_macos_native_node_opens_its_cache_in_clone_mode() {
 }
 
 /// The native node's tree store on macOS. Catches the store not opened (every lease
-/// would clone each toolchain file), one opened without a cache to build from or inside
+/// would clone each toolchain file), one opened without a cache to build from (clap
+/// refuses `--tree-dir` without `--cache-dir`, so this is a cache that is off) or inside
 /// the scratch directory (which lease sweeps clean): with a cache and a store outside
-/// `--scratch` it logs the store and makes it 0711; without `--cache-dir` it warns
-/// `trees: off:no-cache`, with the store under `--scratch` `trees: off:inside-scratch`,
+/// `--scratch` it logs the store and makes it; with the cache under `--scratch` (off) it
+/// warns `trees: off:no-cache`, with the store under `--scratch` `trees: off:inside-scratch`,
 /// and in both it serves and makes no store.
 #[test]
 #[cfg_attr(
@@ -206,45 +207,46 @@ fn a_macos_native_node_opens_its_cache_in_clone_mode() {
 fn a_macos_native_node_opens_its_tree_store() {
     let dir = tls("native-trees-mac");
     let cache = dir.join("cache");
-    std::fs::create_dir_all(&cache).expect("cache dir");
-    let flags = |with_cache: bool, trees: &std::path::Path| {
-        let mut flags = vec![
+    let inside = dir.join("leases").join("cache");
+    for path in [&cache, &inside] {
+        std::fs::create_dir_all(path).expect("cache dir");
+    }
+    let flags = |cache: &std::path::Path, trees: &std::path::Path| {
+        vec![
             "--driver=native".to_owned(),
             "--cas=https://127.0.0.1:1".to_owned(),
             format!("--scratch={}", dir.join("leases").display()),
             format!("--tree-dir={}", trees.display()),
             "--tree-max-bytes=1000000".to_owned(),
-        ];
-        if with_cache {
-            flags.push(format!("--cache-dir={}", cache.display()));
-            flags.push("--cache-max-bytes=1000000".to_owned());
-        }
-        flags
+            format!("--cache-dir={}", cache.display()),
+            "--cache-max-bytes=1000000".to_owned(),
+        ]
     };
     let one = one_native_daemon();
     let store = dir.join("trees");
-    let (status, log) = runs_until_sigterm_logged("native-trees-open", &flags(true, &store), None);
+    let (status, log) =
+        runs_until_sigterm_logged("native-trees-open", &flags(&cache, &store), None);
     assert!(status.success(), "{status}: {log:#?}");
     assert!(
         logged(&log, &["trees: ", "0 trees", "cloned whole"]),
         "{log:#?}"
     );
     assert!(store.is_dir(), "the store was not made");
-    for (name, with_cache, at, off) in [
+    for (name, with, at, off) in [
         (
             "native-trees-nocache",
-            false,
+            &inside,
             dir.join("nocache-trees"),
             "off:no-cache",
         ),
         (
             "native-trees-inside",
-            true,
+            &cache,
             dir.join("leases").join("trees"),
             "off:inside-scratch",
         ),
     ] {
-        let (status, log) = runs_until_sigterm_logged(name, &flags(with_cache, &at), None);
+        let (status, log) = runs_until_sigterm_logged(name, &flags(with, &at), None);
         assert!(status.success(), "{status}: {log:#?}");
         assert!(logged(&log, &["trees:", off, "one by one"]), "{log:#?}");
         assert!(!at.exists(), "{off}: the daemon made the store");
