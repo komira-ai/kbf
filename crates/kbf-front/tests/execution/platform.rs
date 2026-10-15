@@ -524,7 +524,13 @@ async fn the_cpu_category_is_carried_when_the_cpu_booking_is_the_default() {
     let farm = Farm::with_execution(Arc::clone(&script)).await;
     let tagged = [(kbf_front::CATEGORY_ENV, "mojo_build_test")];
     let untagged = [("PATH", "/bin")];
-    let cases: [(&str, Vec<(&str, &str)>, &[(&str, &str)], Option<&str>); 5] = [
+    type Case<'a> = (
+        &'a str,
+        Vec<(&'a str, &'a str)>,
+        &'a [(&'a str, &'a str)],
+        Option<&'a str>,
+    );
+    let cases: [Case; 5] = [
         ("tagged", vec![], &tagged[..], Some("mojo_build_test")),
         (
             "tagged and sized in memory",

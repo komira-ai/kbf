@@ -284,7 +284,11 @@ What the code does today:
   requests that category's memory instead, at most the memory of the largest node that
   could run it when it is submitted (`Scheduler::largest_memory`,
   `kbf_sched::category_booking`; the server sizes it before the scheduler sees it; see
-  [platform-properties.md](../platform-properties.md#memory-by-category)). The
+  [platform-properties.md](../platform-properties.md#memory-by-category)). Likewise an
+  `action` lease that names no `kbf-book-cpus` requests the cores the server's
+  `--book-cpus-by-category` names for its category, at most the cores of the largest
+  node that could run it with the memory it books (`Scheduler::largest_cpu_millis`;
+  see [platform-properties.md](../platform-properties.md#cpus-by-category)). The
   scheduler raises the memory of a new submission to its action key's memory floor,
   if it has one (see "Memory kills" below).
 - Each request carries its lease kind (`kbf-lease`: `action` or `whole_machine`). A

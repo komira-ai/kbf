@@ -643,7 +643,10 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(both.cpus_by_category.get("mojo_build_test"), Some(4_000));
-        assert_eq!(both.memory_by_category.get("mojo_build_test"), Some(2 << 30));
+        assert_eq!(
+            both.memory_by_category.get("mojo_build_test"),
+            Some(2 << 30)
+        );
         for refused in ["a=0", "a=4,a=8", "a", "a=+2"] {
             assert!(
                 listeners(&["--book-cpus-by-category", refused]).is_err(),

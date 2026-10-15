@@ -154,7 +154,11 @@ async fn a_cpu_category_books_its_cores_up_to_the_largest_node() {
         let mut ops = cell.execute(&job.action).await;
         let start = node.start().await;
         assert_eq!(start.action_digest.as_ref(), Some(&job.action.proto));
-        assert_eq!((start.millicpus, start.memory_bytes), (cpus, memory), "{argv}");
+        assert_eq!(
+            (start.millicpus, start.memory_bytes),
+            (cpus, memory),
+            "{argv}"
+        );
         let result = output(&cell, argv, 0).await;
         assert!(node.report(ran(start.lease_id, &result)).await.accepted);
         done(&mut ops).await;

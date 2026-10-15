@@ -11,7 +11,7 @@ These properties change how kbf schedules an action today:
 |---|---|---|---|
 | `kbf-lease` | `action`, `whole_machine` | `action` | The kind of lease the action runs under (see [`kbf-lease`](#kbf-lease)). |
 | `gpu` | a whole number | `0` | Whole GPUs the action needs. |
-| `kbf-book-cpus` | a whole number, at least 1, plain digits | `1` | Whole cores the lease books. |
+| `kbf-book-cpus` | a whole number, at least 1, plain digits | `1`, or the [category's](#cpus-by-category) | Whole cores the lease books. |
 | `kbf-book-mem-gib` | a whole number, at least 1, plain digits | `1`, or the [category's](#memory-by-category) | GiB of memory the lease books. |
 | `OSFamily` | `linux`; `darwin`, `macos`, `macosx`, `osx` (any case) | any | The operating system of the worker. |
 | `ISA`, `Arch` | `x86-64`, `x86_64`, `amd64`; `arm-a64`, `arm64`, `aarch64`; an ISA level such as `x86-64-v3` (any case) | any | The CPU architecture, and level, of the worker. |
@@ -137,7 +137,8 @@ placed there. Running leases are never stopped for it.
 Every action books one core and 1 GiB of memory on the worker it runs on, unless it
 names a size: `kbf-book-cpus=N` books `N` whole cores, and `kbf-book-mem-gib=N` books
 `N` GiB. An action that names no memory may instead book its category's memory
-([Memory by category](#memory-by-category)). `N` is written in plain digits with no
+([Memory by category](#memory-by-category)), and one that names no cores its
+category's cores ([CPUs by category](#cpus-by-category)). `N` is written in plain digits with no
 leading zero: `+4` and `04` are refused, since each would book the same as `4` under a
 different action digest, and so miss the cache entries `4` made. Either may be given alone; the other stays at its
 default. The scheduler places the action only where that much is free, and holds it
@@ -224,6 +225,38 @@ ctx.actions.run(
 - The flag is written `<category>=<GiB>`, entries separated by commas; a size is a
   whole number of at least 1 in plain digits, a category has no whitespace and is
   named once. The server refuses to start on any other value.
+
+## CPUs by category
+
+An action books one core unless it names `kbf-book-cpus`, and a lease is not confined
+to what it books: the container driver gives it a CPU weight from its cores, not a
+quota (`cpu.weight`, no `cpu.max`), so a multi-threaded compile that books one core may
+run as many threads as the node has. What the booking does is count: the scheduler
+places an action only where its cores are free, so it bounds how many leases are open
+on a node at once (88 one-core leases on an 88-CPU node; 22 of a four-core category).
+An action that names its category as under [Memory by category](#memory-by-category)
+books the cores the server's `--book-cpus-by-category` flag gives that category:
+
+```sh
+kbf-server ... --book-cpus-by-category=mojo_build_test=4
+```
+
+- The category's cores are booked only by an `action` lease whose platform names no
+  `kbf-book-cpus`: a size the action names wins, and a `whole_machine` lease books the
+  whole worker. `kbf-book-mem-gib` still sets the memory beside it, and the memory
+  table and this one are independent.
+- It never books more cores than the largest node that could run the action has when
+  the action is submitted (one that is live, cordoned or not, serves its lease kind,
+  satisfies its platform and holds its memory and GPU request, with the memory the
+  category has just booked), and never fewer than the one-core default. While no such
+  node is registered it books the category's cores as written.
+- A category the flag does not name, and an action that sets no category, book one
+  core. The flag is empty by default, so a server started without it books as before.
+- The flag is written `<category>=<cores>`, entries separated by commas; a size is a
+  whole number of at least 1 in plain digits, a category has no whitespace and is
+  named once. The server refuses to start on any other value.
+- The flag is not part of the action digest: changing a category's cores reruns
+  nothing that is cached.
 
 ## `xcode`
 

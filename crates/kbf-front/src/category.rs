@@ -124,7 +124,11 @@ fn read_table(
 }
 
 /// `table` as the flags take it, each size in units of `scale`.
-fn write_table(table: &BTreeMap<String, u64>, scale: u64, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+fn write_table(
+    table: &BTreeMap<String, u64>,
+    scale: u64,
+    f: &mut fmt::Formatter<'_>,
+) -> fmt::Result {
     let entries: Vec<String> = table
         .iter()
         .map(|(name, size)| format!("{name}={}", size / scale))

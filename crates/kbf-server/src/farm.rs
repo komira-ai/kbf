@@ -139,7 +139,10 @@ fn book_category(sched: &Scheduler, table: &MemoryByCategory, submission: &mut S
 /// the node that must hold the cores is one that holds the memory too. Not generic, so
 /// every [`Farm`] shares one copy of it.
 fn book_cpu_category(sched: &Scheduler, table: &CpusByCategory, submission: &mut Submission) {
-    let ask = submission.cpu_category.as_deref().and_then(|c| table.get(c));
+    let ask = submission
+        .cpu_category
+        .as_deref()
+        .and_then(|c| table.get(c));
     if let Some(ask) = ask {
         let request = &mut submission.request;
         let largest = sched.largest_cpu_millis(request);
@@ -712,7 +715,7 @@ impl<M: MetaLog, O: ObjectStore + 'static> Dispatch for Farm<M, O> {
         let now = self.now();
         let mut state = self.lock();
         book_category(&state.sched, &self.memory_by_category, &mut submission);
-        // book_cpu_category(&state.sched, &self.cpus_by_category, &mut submission);
+        book_cpu_category(&state.sched, &self.cpus_by_category, &mut submission);
         let action = submission.request.key.action;
         let instance = submission.request.key.instance.clone();
         let waiter = state.machine.submit(Waiter {
