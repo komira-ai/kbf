@@ -211,6 +211,8 @@ impl Runtime for FakeRuntime {
 
 #[cfg(test)]
 mod tests {
+    use futures::FutureExt as _;
+
     use super::*;
 
     /// Catches an upload that is not bounded (the lease waits on a store that never
@@ -221,10 +223,10 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn an_upload_past_its_deadline_fails_saying_so() {
         let deadline = Duration::from_millis(50);
-        let stuck = async {
-            tokio::time::advance(Duration::from_millis(70)).await;
-            std::future::pending::<Result<(), RuntimeError>>().await
-        };
+        // One expression: a line after an await that never resumes would read as
+        // uncovered.
+        let stuck = tokio::time::advance(Duration::from_millis(70))
+            .then(|()| std::future::pending::<Result<(), RuntimeError>>());
         let ended = tokio::time::timeout(Duration::from_secs(10), upload_within(deadline, stuck))
             .await
             .expect("the upload ends at its deadline, not never");
