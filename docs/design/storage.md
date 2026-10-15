@@ -268,6 +268,7 @@ addresses one bucket.
 | `capabilities()` | what the store claims beyond the base contract |
 | `put_new(key, body, retain_until)` | write an immutable object, optionally under a retention date |
 | `get_range(key, range)` | read the bytes of a range that exist; a range starting past the end is an error |
+| `may_hold(key)` | `false` only if the store knows, without a request, that it lacks the key (a local store); others answer `true` and a read finds out. Asked before an action-cache hit is served |
 | `delete(key)` | delete; deleting an absent key succeeds, so a retry is safe |
 | `list(prefix, after, max_keys)` | one page of keys, ascending; for rebuilds and sweeps only |
 
@@ -295,8 +296,14 @@ normalisation between kbf and a store can turn one key into another.
   conditional writes and of two writers of one key exactly one succeeds), and the
   directory synced before the write is answered; a crash leaves at most a file in
   `tmp/`, which the next open removes. A read checks the header names the key asked
-  for; the bytes are checked by the cache, as from any store. The directory is locked
-  while a store is open on it. No Object Lock.
+  for; a file too short for its header (or empty) is no object, read as `NotFound`;
+  the bytes are checked by the cache, as from any store. Nothing reads the objects at
+  open. `may_hold` (a stat and a header read, no hashing) answers whether a key's
+  object is there; the cache asks it for every object an action-cache hit needs and
+  turns the hit into a miss if one is gone (stores that would need a request answer
+  yes without one). A write that would leave less free space than the store's floor
+  is refused; nothing is evicted. The directory is locked while a store is open on
+  it. No Object Lock.
 - `S3Store`: the S3 REST API with path-style addressing and SigV4 signing of every
   payload. A ranged read answered with anything but the exact range is refused. On a
   store with Object Lock, delete names the exact object version, so a retained object

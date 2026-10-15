@@ -22,9 +22,20 @@
 //! object under its final name, and an answered write survives a power cut.
 //!
 //! A read checks that the file's header names the key asked for, and cuts the range at
-//! the object's end as S3 does. The store does not hash what it returns: kbf checks
-//! every blob it reads against its digest, from any store. A listing opens every object
-//! file to read its key (`list` serves rebuild and the sweep only).
+//! the object's end as S3 does. A file too short to hold its header (a final name
+//! whose bytes never reached the disk, which this write order does not produce but a
+//! file system may after a crash) is read as no object at all: `NotFound`, so kbf
+//! marks it missing and the blob is uploaded again; a listing skips it. The store does
+//! not hash what it returns: kbf checks every blob it reads against its digest, from
+//! any store. A listing opens every object file to read its key (`list` serves rebuild
+//! and the sweep only). Nothing reads the objects at open: on a large directory that
+//! would hold up every start, so a lost or damaged object is found when it is read, or
+//! by [`ObjectStore::may_hold`] before an action-cache hit is served.
+//!
+//! A write is refused when the file system has less free space than the store's floor
+//! plus the object's length, so a full disk refuses uploads instead of failing part-way
+//! through them (and the Raft log, often on the same disk, keeps room). Nothing is ever
+//! evicted: the directory only grows.
 //!
 //! No Object Lock. I/O runs on tokio's blocking pool, so every call needs a tokio
 //! runtime. An I/O failure is [`ObjectStoreError::Transport`], naming the operation
@@ -84,6 +95,8 @@ pub struct FsStore {
 
 struct Inner {
     objects: PathBuf,
+    /// The free bytes a write must leave on the file system.
+    min_free: u64,
     tmp: PathBuf,
     /// The name of the next temporary file.
     next: AtomicU64,
@@ -93,11 +106,12 @@ struct Inner {
 
 impl FsStore {
     /// Opens the store in `dir`, creating the directory and its layout if missing,
-    /// locking it, and removing every file left in `tmp/`.
+    /// locking it, and removing every file left in `tmp/`. A write is refused while the
+    /// file system would be left with less than `min_free` bytes free.
     ///
     /// # Errors
     /// The directory cannot be created, locked or read, or a leftover cannot be removed.
-    pub fn open(dir: &Path) -> Result<Self, FsStoreError> {
+    pub fn open(dir: &Path, min_free: u64) -> Result<Self, FsStoreError> {
         fs::create_dir_all(dir).map_err(open_failed("create", dir))?;
         let lock_path = dir.join("LOCK");
         let lock = File::options()
@@ -126,6 +140,7 @@ impl FsStore {
         Ok(Self {
             inner: Arc::new(Inner {
                 objects,
+                min_free,
                 tmp,
                 next: AtomicU64::new(0),
                 _lock: lock,
@@ -146,6 +161,7 @@ impl Inner {
     /// Writes `body` as `key`'s object (see the module docs). The temporary file is
     /// removed whether or not the object was linked.
     fn put(&self, key: &ObjectKey, body: &[u8]) -> Result<(), ObjectStoreError> {
+        self.room_for(body.len() as u64)?;
         let (dir, path) = self.place(key);
         let tmp = self
             .tmp
@@ -155,6 +171,28 @@ impl Inner {
         linked?;
         removed.map_err(failed("remove", &tmp))?;
         sync_dir(&dir).map_err(failed("sync", &dir))
+    }
+
+    /// Refuses a write of `len` bytes that would leave less than the floor free.
+    fn room_for(&self, len: u64) -> Result<(), ObjectStoreError> {
+        let stat = rustix::fs::statvfs(&self.objects)
+            .map_err(io::Error::from)
+            .map_err(failed("statvfs", &self.objects))?;
+        let free = stat.f_bavail.saturating_mul(stat.f_frsize);
+        if free < self.min_free.saturating_add(len) {
+            return Err(ObjectStoreError::Transport(Arc::new(Full {
+                dir: self.objects.clone(),
+                free,
+                floor: self.min_free,
+                len,
+            })));
+        }
+        Ok(())
+    }
+
+    fn may_hold(&self, key: &ObjectKey) -> Result<bool, ObjectStoreError> {
+        let (_, path) = self.place(key);
+        Ok(Object::open(&path)?.is_some_and(|o| o.key == *key))
     }
 
     fn get(&self, key: &ObjectKey, range: ByteRange) -> Result<Bytes, ObjectStoreError> {
@@ -238,10 +276,11 @@ struct Object {
 }
 
 impl Object {
-    /// Opens the object file at `path`: `None` if there is none.
+    /// Opens the object file at `path`: `None` if there is none, or if it is too short
+    /// to hold a header or does not start with one.
     ///
     /// # Errors
-    /// The file cannot be opened or read, or its header is not one.
+    /// The file cannot be opened or read.
     fn open(path: &Path) -> Result<Option<Self>, ObjectStoreError> {
         let file = match File::open(path) {
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -250,10 +289,7 @@ impl Object {
         let len = file.metadata().map_err(failed("stat", path))?.len();
         let mut head = [0; MAX_HEADER];
         let read = file.read_at(&mut head, 0).map_err(failed("read", path))?;
-        let (key, header) = parse_header(&head[..read]).ok_or_else(|| {
-            ObjectStoreError::Protocol(format!("{} is not an object file", path.display()))
-        })?;
-        Ok(Some(Self {
+        Ok(parse_header(&head[..read]).map(|(key, header)| Self {
             file,
             key,
             header,
@@ -306,6 +342,19 @@ fn entries(dir: &Path) -> io::Result<Vec<PathBuf>> {
 /// Syncs a directory, so the names created and removed in it are durable.
 fn sync_dir(dir: &Path) -> io::Result<()> {
     File::open(dir)?.sync_all()
+}
+
+/// A write refused for lack of free space.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "{dir}: {free} bytes free, under the floor of {floor} bytes plus the {len} bytes of \
+     this write (no eviction: the directory only grows)"
+)]
+struct Full {
+    dir: PathBuf,
+    free: u64,
+    floor: u64,
+    len: u64,
 }
 
 /// An I/O failure of a store call: the operation and the path. The cause is its
@@ -380,6 +429,11 @@ impl ObjectStore for FsStore {
     ) -> Result<Bytes, ObjectStoreError> {
         let (inner, key) = (Arc::clone(&self.inner), key.clone());
         blocking(move || inner.get(&key, range)).await
+    }
+
+    async fn may_hold(&self, key: &ObjectKey) -> Result<bool, ObjectStoreError> {
+        let (inner, key) = (Arc::clone(&self.inner), key.clone());
+        blocking(move || inner.may_hold(&key)).await
     }
 
     async fn delete(&self, key: &ObjectKey) -> Result<(), ObjectStoreError> {

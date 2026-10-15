@@ -235,23 +235,28 @@ kbf-server \
     --worker-listen=127.0.0.1:8981
 ```
 
-- `--blob-dir` takes the place of `--store`: with `--store` or any `--s3-*` flag the
-  server refuses to start. It needs `--meta-log=raft`; with the index in memory a
-  restart would forget every blob while their files stayed, with nothing to delete
-  them.
+- `--blob-dir` takes the place of `--store`: with `--store` or any `--s3-*` flag
+  (`--s3-prefix` included) the server refuses to start. It needs `--meta-log=raft`;
+  with the index in memory a restart would forget every blob while their files
+  stayed, with nothing to delete them.
 - The directory is created if missing and locked while the server runs: a second
-  server on it exits 2. Objects are keyed as in a bucket, under `<--s3-prefix><log
-  id>/`, one file each in `objects/` (layout in
+  server on it exits 2. Objects are keyed under the fixed prefix `kbf/<log id>/`, one
+  file each in `objects/` (layout in
   [storage.md](../design/storage.md#the-object-store-interface)).
 - A write is synced, file and directory, before it is answered, so an answered upload
   survives a crash or a power cut. A crash part-way through a write leaves a file in
   `tmp/`, removed at the next start.
-- Nothing else is checked at start. A blob whose file was lost or damaged is still
+- Nothing else is checked at start: reading every object would hold up each start of
+  a large directory. A blob whose file was lost, damaged or left empty is still
   reported present by `FindMissingBlobs` until a read of it fails: that read answers
   `UNAVAILABLE` and takes the blob out of the index, so the client uploads it again,
-  which heals it.
-- Nothing deletes objects yet, from this directory or from a bucket: it grows with
-  every blob written. Size its disk for that.
+  which heals it. Before an action-cache hit is served, the server checks that the
+  file of every object the hit needs is there and starts with its header; if one is
+  not, the hit is a miss (the action runs again) and its blobs leave the index.
+- No eviction: nothing deletes objects yet, from this directory or from a bucket, so
+  it grows with every blob written. A write that would leave the file system with
+  less than `--blob-dir-min-free-bytes` free (default 1 GiB) is refused, and its
+  upload answered `UNAVAILABLE`. Size the disk for the cache you want to keep.
 
 ## Planned: the Raft log on local disk
 

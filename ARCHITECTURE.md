@@ -66,7 +66,9 @@ role (`--role=all`). The flags are:
   `--s3-prefix` and `--s3-conditional-put`; the S3 key pair comes from the standard
   `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` variables, never from the command line;
   or, in place of `--store`, `--blob-dir`, a directory on the local disk (with
-  `--meta-log=raft` only);
+  `--meta-log=raft` only, under the fixed prefix `kbf/<log id>/`), with
+  `--blob-dir-min-free-bytes` (default 1 GiB) the free space below which it refuses
+  writes; nothing is evicted;
 - `--heartbeat-interval-ms` (default 5000), the interval daemons are asked to
   heartbeat at;
 - `--finished-retention-secs` (default 60), how long a finished operation is kept
@@ -245,7 +247,7 @@ replicated log changes the implementation behind the seam, not its callers:
 - `MetaLog` (in `kbf-front`): `commit` a metadata command, `query` the committed
   state. `MemoryMetaLog` is the single-process implementation; `RaftMetaLog` (in
   `kbf-server`) implements the same two calls over a single-voter Raft log.
-- `ObjectStore` (in `kbf-objstore`): five calls any S3-compatible store can serve.
+- `ObjectStore` (in `kbf-objstore`): five calls any S3-compatible store can serve, and `may_hold`, which a local store answers from its files and any other with yes.
 - `Dispatch` (in `kbf-front`): how the REAPI front reaches the scheduler.
 - `FarmMachine` (in `kbf-server`): a pure struct that compares with `Eq`; it reads
   no clock and holds no hashed map, which clippy checks for the module.

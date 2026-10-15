@@ -223,10 +223,17 @@ pub struct Args {
     /// Stores blob bytes in this directory on the local disk, in place of `--store`
     /// (`kbf_objstore::FsStore`): created if missing, locked while the server runs (a
     /// second server on it is refused), and kept across restarts. Needs
-    /// `--meta-log=raft`, which keeps the index of what it holds; objects are keyed as
-    /// in a bucket, under `<--s3-prefix><log id>/`.
-    #[arg(long, conflicts_with_all = ["store", "s3_endpoint", "s3_bucket"])]
+    /// `--meta-log=raft`, which keeps the index of what it holds; objects are keyed
+    /// under `kbf/<log id>/` (fixed: `--s3-prefix` is refused with it). Nothing reads
+    /// the directory at start; a lost or damaged object is found when it is read, or
+    /// before an action-cache hit that needs it is served (a miss). No eviction: the
+    /// directory grows with every blob written.
+    #[arg(long, conflicts_with_all = ["store", "s3_endpoint", "s3_bucket", "s3_prefix"])]
     pub blob_dir: Option<PathBuf>,
+    /// The free bytes `--blob-dir`'s file system must keep: a write that would leave
+    /// less is refused (the upload is answered UNAVAILABLE), since nothing is evicted.
+    #[arg(long, value_name = "BYTES", default_value_t = 1 << 30, requires = "blob_dir")]
+    pub blob_dir_min_free_bytes: u64,
     /// `http://host[:port]` of the S3 service (`--store=s3`).
     #[arg(long, required_if_eq("store", "s3"))]
     pub s3_endpoint: Option<String>,
@@ -236,7 +243,7 @@ pub struct Args {
     /// The signing region.
     #[arg(long, default_value = "us-east-1")]
     pub s3_region: String,
-    /// The key prefix, of `--store=s3` and of `--blob-dir`. Under `--meta-log=memory`
+    /// The key prefix (`--store=s3`; refused with `--blob-dir`). Under `--meta-log=memory`
     /// each start writes under `<prefix><start time>/`; under `--meta-log=raft` every
     /// start writes under `<prefix><log id>/`, fixed when the log is created (a later
     /// start with another prefix is refused).

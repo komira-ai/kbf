@@ -28,7 +28,7 @@
 //! committed; a directory it refuses exits 2.
 //!
 //! `--blob-dir` keeps blob bytes in a local directory (`kbf_objstore::FsStore`) in place
-//! of `--store`; it needs `--meta-log=raft`. A directory that cannot be created or
+//! of `--store`, under the fixed key prefix `kbf/<log id>/`; it needs `--meta-log=raft`. A directory that cannot be created or
 //! locked (another server has it open) exits 2 before anything is bound.
 //!
 //! `--write-tier-dir` attaches the local write tier before anything is bound
@@ -90,8 +90,8 @@ async fn start(args: &Args) -> Result<(), Box<dyn Error>> {
     let raft_dir = args.raft_dir()?;
     match (args.blob_dir.as_deref(), args.store) {
         (Some(dir), _) => {
-            let store = FsStore::open(dir)?;
-            over(args, raft_dir, store, KeyPrefix::default()).await
+            let store = FsStore::open(dir, args.blob_dir_min_free_bytes)?;
+            over(args, raft_dir, store, KeyPrefix::default(), BLOB_DIR_PREFIX).await
         }
         (None, StoreKind::Memory) => {
             let store = MemoryStore::new(Capabilities::default());
@@ -100,19 +100,24 @@ async fn start(args: &Args) -> Result<(), Box<dyn Error>> {
         }
         (None, StoreKind::S3) => {
             let (store, start_prefix) = args.s3_store(|name| std::env::var(name).ok())?;
-            over(args, raft_dir, store, start_prefix).await
+            over(args, raft_dir, store, start_prefix, &args.s3_prefix).await
         }
     }
 }
 
+/// The key prefix root under `--blob-dir`: objects go under `kbf/<log id>/`.
+const BLOB_DIR_PREFIX: &str = "kbf/";
+
 /// Serves `store` under the metadata log `raft_dir` names: the Raft log there, writing
-/// under the prefix it committed, or without one a log in memory, writing under
-/// `start_prefix`. (`Args::raft_dir` refuses `--blob-dir` without a Raft log.)
+/// under the prefix it committed (`<prefix_root><log id>/` for a new log), or without
+/// one a log in memory, writing under `start_prefix`. (`Args::raft_dir` refuses
+/// `--blob-dir` without a Raft log.)
 async fn over<O: ObjectStore + 'static>(
     args: &Args,
     raft_dir: Option<&Path>,
     store: O,
     start_prefix: KeyPrefix,
+    prefix_root: &str,
 ) -> Result<(), Box<dyn Error>> {
     match raft_dir {
         None => {
@@ -120,7 +125,7 @@ async fn over<O: ObjectStore + 'static>(
             run(args, memory, store, start_prefix, None).await
         }
         Some(dir) => {
-            let log = RaftMetaLog::open_dir(dir, Retention::default(), &args.s3_prefix).await?;
+            let log = RaftMetaLog::open_dir(dir, Retention::default(), prefix_root).await?;
             let (prefix, id) = (log.store_prefix(), log.log_id());
             run(args, log, store, prefix, Some(id)).await
         }

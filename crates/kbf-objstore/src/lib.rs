@@ -55,6 +55,19 @@ pub trait ObjectStore: Send + Sync + 'static {
         range: ByteRange,
     ) -> impl Future<Output = Result<Bytes, ObjectStoreError>> + Send;
 
+    /// Whether the store may hold `key`: `false` only when the store knows, without a
+    /// request over the network, that it does not (a local store's file is gone, or is
+    /// not a whole object). A store that would need a request answers `true`, the
+    /// default, and a read finds out. kbf asks before it serves an action-cache hit,
+    /// once per object the hit needs.
+    fn may_hold(
+        &self,
+        key: &ObjectKey,
+    ) -> impl Future<Output = Result<bool, ObjectStoreError>> + Send {
+        let _ = key;
+        std::future::ready(Ok(true))
+    }
+
     /// Deletes an object. Deleting an absent key succeeds, so a retried delete is safe.
     /// An object under retention is refused and stays readable.
     fn delete(&self, key: &ObjectKey) -> impl Future<Output = Result<(), ObjectStoreError>> + Send;
