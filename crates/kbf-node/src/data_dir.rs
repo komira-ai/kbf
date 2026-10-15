@@ -94,7 +94,8 @@ impl Budgets {
         let base = space.of_capacity(100, max);
         let cache = percent_of(base, CACHE_PERCENT);
         let trees = percent_of(base, TREES_PERCENT);
-        (cache > 0 && trees > 0).then_some(Self {
+        // The trees' quarter is the smaller: none of it is none of the cache's either.
+        (trees > 0).then_some(Self {
             cache_max_bytes: cache,
             cache_min_free_bytes: keep_free(space.total),
             trees_max_bytes: trees,
