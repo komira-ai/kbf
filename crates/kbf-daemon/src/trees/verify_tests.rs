@@ -195,14 +195,10 @@ fn removal_and_sizes_look_at_regular_files_only() {
     std::fs::write(tree.join("a/b/f"), b"12345").unwrap();
     std::fs::write(tree.join("g"), b"123").unwrap();
     symlink(&outside, tree.join("a/link")).unwrap();
-    rustix::fs::mknodat(
-        rustix::fs::CWD,
-        tree.join("fifo"),
-        rustix::fs::FileType::Fifo,
-        rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
-        0,
-    )
-    .unwrap();
+    let fifo =
+        std::ffi::CString::new(tree.join("fifo").into_os_string().into_encoded_bytes()).unwrap();
+    // SAFETY: `fifo` is a NUL-terminated path that lives through the call.
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
     assert_eq!(bytes_under(&tree).unwrap(), 8);
     remove_tree(&tree).unwrap();
     assert!(!tree.exists());

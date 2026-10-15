@@ -27,7 +27,7 @@ use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt::Display;
 
-use super::reference::{Verdict, add, blame, fits, sub, verdict};
+use super::reference::{Verdict, add, blame, exclusive, fits, room, sub, verdict, within};
 use kbf_caps::NodeCaps;
 use kbf_sched::fence::{HANDOVER_GRACE, LEASE_GRACE, START_GRACE};
 use kbf_sched::{
@@ -53,6 +53,8 @@ struct Worker {
     capacity: Resources,
     caps: NodeCaps,
     booked: Resources,
+    /// A lease holds the node alone: an action at its whole memory.
+    whole: bool,
     last_heard: u64,
     session: u64,
     /// The daemon process of the current session, how many times it changed, and until
@@ -309,6 +311,7 @@ impl Checker {
                             capacity,
                             caps,
                             booked: Resources::default(),
+                            whole: false,
                             last_heard: now,
                             session: 0,
                             instance,
@@ -330,7 +333,7 @@ impl Checker {
                     w.capacity = capacity;
                     w.caps = caps;
                     w.last_heard = w.last_heard.max(now);
-                    let below = !fits(capacity, w.booked);
+                    let below = !within(capacity, w.booked);
                     self.touched_workers.insert(worker);
                     if below {
                         self.hit("capacity below bookings");
@@ -727,6 +730,9 @@ impl Checker {
         let w = self.workers.get_mut(&l.worker).expect("registered");
         w.booked = sub(w.booked, resources);
         w.leases.remove(&lease);
+        if w.leases.is_empty() {
+            w.whole = false;
+        }
         self.touched_workers.insert(l.worker);
     }
 

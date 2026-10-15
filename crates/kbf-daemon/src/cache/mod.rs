@@ -1,13 +1,14 @@
 //! The worker's input cache (`docs/design/worker-cache.md#6-the-cache`): a
 //! content-addressed directory of read-only files on the node's disk, which the
-//! container driver hard-links into each lease's input root, kept across restarts.
+//! container driver hard-links into each lease's input root (the native driver on
+//! macOS clones them, [`LinkMode::Clone`]), kept across restarts.
 //!
 //! - **One owner.** [`Cache::open`] takes an exclusive `flock` on `<dir>/lock` before
 //!   it touches anything else; a second daemon is refused ([`Disabled::Locked`]) and
 //!   runs uncached. The lock file is never unlinked.
 //! - **Inserts** are fetched and hashed into `tmp/`, made read-only (0444, 0555 for an
 //!   executable) with the fixed mtime [`FIXED_MTIME`], and renamed into `blobs/` with
-//!   `RENAME_NOREPLACE` (`fill`). Nothing under `blobs/` is ever opened for writing.
+//!   `RENAME_NOREPLACE` (`RENAME_EXCL` on macOS; `fill`). Nothing under `blobs/` is ever opened for writing.
 //! - **The index** of keys, sizes and last uses is in memory and saved whole to
 //!   `index.snap` (`index`): right after load, every [`CacheConfig::snapshot_every`],
 //!   after each adopt pass, and at [`Cache::stop`]. A bad snapshot is discarded and
@@ -20,6 +21,8 @@
 //! The cache never fails a lease that would run without it: an I/O error in the cache
 //! hands the lease the fetched bytes to write itself, as without a cache.
 
+#[cfg(target_os = "macos")]
+mod clone;
 mod evict;
 mod fill;
 mod index;
@@ -81,8 +84,9 @@ pub trait Hooks: Send + Sync {
     fn at(&self, point: Point<'_>);
 }
 
-/// How the cache makes a hard link (`std::fs::hard_link`): a test gives one that fails
-/// as a full link count or another filesystem would.
+/// How the cache places an entry at a lease's name: a hard link (`std::fs::hard_link`)
+/// on Linux, a `clonefile` on macOS ([`LinkMode::Clone`]). A test gives one that fails
+/// as a full link count or another filesystem would, or (in clone mode) one that copies.
 pub type LinkFn = dyn Fn(&Path, &Path) -> std::io::Result<()> + Send + Sync;
 
 /// The hooks of a daemon: none.
@@ -96,16 +100,16 @@ impl Hooks for NoHooks {
 /// How a cache is opened and run.
 #[derive(Clone)]
 pub struct CacheConfig {
-    /// `--cache-dir`: the directory the cache owns. It must exist.
+    /// `<--data-dir>/cache`: the directory the cache owns. It must exist.
     pub dir: PathBuf,
     /// The lease scratch directory, whose filesystem the cache should share.
     pub scratch: PathBuf,
-    /// `--cache-max-bytes`: the most bytes of entries kept.
+    /// The most bytes of entries kept (sized from the data directory's filesystem).
     pub max_bytes: u64,
-    /// `--cache-min-free-bytes`: below this much free space on the filesystem,
+    /// Below this much free space on the filesystem,
     /// entries no lease links are evicted. 0 is no floor.
     pub min_free_bytes: u64,
-    /// `--cache-link-concurrency`: how many files of a lease are linked or filled at
+    /// How many files of a lease are linked or filled at
     /// once.
     pub link_concurrency: usize,
     /// How often the index is saved.
@@ -116,8 +120,14 @@ pub struct CacheConfig {
     pub pass_pace: Duration,
     pub clock: Clock,
     pub hooks: Arc<dyn Hooks>,
-    /// Links a lease's name to an entry, or to another name of the lease.
+    /// Places a lease's name from an entry (a hard link, or a clone in
+    /// [`LinkMode::Clone`]); in hard-link mode also links one name of the lease to
+    /// another.
     pub link: Arc<LinkFn>,
+    /// How leases get cached files; `None` asks the platform ([`LinkMode::Clone`] on
+    /// macOS, [`LinkMode::Hardlink`] elsewhere). A cache on another filesystem than the
+    /// scratch directory is [`LinkMode::Copy`] whatever this says.
+    pub link_mode: Option<LinkMode>,
     /// The most links an entry may have; `None` asks the filesystem
     /// (`pathconf(_PC_LINK_MAX)`).
     pub link_max: Option<u64>,
@@ -140,10 +150,30 @@ impl CacheConfig {
             pass_pace: Duration::from_secs(1),
             clock: system_clock(),
             hooks: Arc::new(NoHooks),
-            link: Arc::new(|from: &Path, to: &Path| std::fs::hard_link(from, to)),
+            link: Arc::new(place_link),
+            link_mode: None,
             link_max: None,
         }
     }
+}
+
+/// How leases get cached files unless a test says otherwise.
+#[cfg(target_os = "macos")]
+const PLATFORM_LINK_MODE: LinkMode = LinkMode::Clone;
+#[cfg(not(target_os = "macos"))]
+const PLATFORM_LINK_MODE: LinkMode = LinkMode::Hardlink;
+
+/// The platform's way to place an entry at a lease's name: a clone on macOS (APFS
+/// copy-on-write: the new file is its own inode, so a write to it never reaches the
+/// entry), a hard link elsewhere.
+#[cfg(target_os = "macos")]
+fn place_link(from: &Path, to: &Path) -> std::io::Result<()> {
+    clone::clone_file(from, to)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn place_link(from: &Path, to: &Path) -> std::io::Result<()> {
+    std::fs::hard_link(from, to)
 }
 
 /// Why the daemon runs uncached (`cache_disabled_reason`). The daemon warns and serves
@@ -161,8 +191,9 @@ pub enum Disabled {
         "lease-name: a cache directory named kbf-lease-* or lease-* is removed by lease sweeps"
     )]
     LeaseName,
-    /// `--cache-dir` without `--cache-max-bytes`.
-    #[error("no-budget: --cache-dir needs --cache-max-bytes")]
+    /// The data directory's filesystem has no room for a cache once it keeps its floor
+    /// free.
+    #[error("no-budget: the data directory's filesystem is too small for a cache")]
     NoBudget,
     /// The Linux native driver: actions run as the cache's owner and could write it.
     #[error("native-same-uid: native actions run as the daemon's user and could write the cache")]
@@ -192,6 +223,11 @@ impl Disabled {
 pub enum LinkMode {
     /// A hard link to the entry.
     Hardlink,
+    /// A copy-on-write clone of the entry (`clonefile` on macOS): every name of the
+    /// lease is its own inode, writable as an input is without a cache, and costs no
+    /// bytes until it is written. Never a link, so an action that writes an input
+    /// cannot change the entry.
+    Clone,
     /// A copy of the entry: the cache is on another filesystem than the scratch
     /// directory. It still saves the network fetch.
     Copy,
@@ -201,6 +237,7 @@ impl std::fmt::Display for LinkMode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             Self::Hardlink => "hardlink",
+            Self::Clone => "clone",
             Self::Copy => "copy",
         })
     }
@@ -337,7 +374,7 @@ impl Cache {
             tracing::warn!("cache: index snapshot discarded ({why}); starting empty");
         }
         let link_mode = if opened.same_filesystem {
-            LinkMode::Hardlink
+            config.link_mode.unwrap_or(PLATFORM_LINK_MODE)
         } else {
             let dir = config.dir.display();
             tracing::warn!("cache: {dir} is not on the scratch filesystem; leases get copies");
@@ -376,7 +413,7 @@ impl Cache {
         Ok(Arc::new(Self { inner }))
     }
 
-    /// The directory the cache owns (`--cache-dir`).
+    /// The directory the cache owns (`<--data-dir>/cache`).
     #[must_use]
     pub fn dir(&self) -> &Path {
         &self.inner.config.dir

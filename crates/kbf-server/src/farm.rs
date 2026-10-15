@@ -15,12 +15,12 @@
 //! #154). The term, and the lease epoch `Welcome` names, come from the metadata log
 //! ([`MetaLog::leadership`]):
 //!
-//! - Under `--meta-log=memory` the log is this process's, so the term is a new
+//! - Under the in-memory metadata log (tests only) the log is this process's, so the term is a new
 //!   [`process_term`] and the epoch is the same number: every start names another
 //!   epoch, and a daemon kills the runs of the leases it held before.
-//! - Under `--meta-log=raft` the term is the Raft term the log elected this server in,
+//! - Under the Raft metadata log the term is the Raft term the log elected this server in,
 //!   greater at every start, and the epoch is the log id, the same at every start over
-//!   one `--raft-dir`. A daemon that reconnects after a restart therefore keeps the
+//!   one `--meta-dir`. A daemon that reconnects after a restart therefore keeps the
 //!   runs of its old leases, which this process never granted: until the scheduler's
 //!   state is in the log they are orphans, whose results are refused and which no
 //!   heartbeat cancels (docs/design/worker-protocol.md#server-restarts-and-the-lease-epoch
@@ -37,7 +37,9 @@ use std::hash::BuildHasher;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use kbf_front::{Cache, Dispatch, Finished, MetaLog, Recorder, Stage, Submission, Ticket};
+use kbf_front::{
+    ActionLabel, Cache, Dispatch, Finished, MetaLog, Recorder, Stage, Submission, Ticket,
+};
 use kbf_meta::{ActionRecord, Role};
 use kbf_objstore::ObjectStore;
 use kbf_proto::google::rpc;
@@ -79,7 +81,7 @@ use crate::stamp::Stamp;
 /// than every earlier process's, as the scheduler's lease order expects of a newer
 /// leader's. If it does step back, the new term still differs from an earlier one
 /// unless the restart lands on that one's very millisecond and the random bits match
-/// (one chance in 65 536). Under `--meta-log=raft` the Raft term replaces it.
+/// (one chance in 65 536). Under the Raft metadata log the Raft term replaces it.
 #[must_use]
 pub fn process_term() -> u64 {
     let start = unix_ms();
@@ -193,8 +195,9 @@ struct State {
     /// Where the invocation record's lease and finish events go ([`record`]).
     recorder: Recorder,
     /// The operations a recorded call waits on: the only ones [`record`] tells the
-    /// recorder of. Each leaves at its end.
-    recorded: BTreeSet<OperationId>,
+    /// recorder of, each with what the first call to wait on it said the action is
+    /// (the key of its `action usage:` line). Each leaves at its end.
+    recorded: BTreeMap<OperationId, ActionLabel>,
 }
 
 /// What a finished operation tells its callers, and the action-cache entry to write
@@ -244,7 +247,7 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
                 links: BTreeMap::new(),
                 paused: BTreeSet::new(),
                 recorder: Recorder::off(),
-                recorded: BTreeSet::new(),
+                recorded: BTreeMap::new(),
             }),
         }
     }

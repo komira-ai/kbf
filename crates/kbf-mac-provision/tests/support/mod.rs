@@ -35,7 +35,7 @@ pub const INTENT: &str = "/var/db/kbf-mac-session/session-intent";
 pub const VOLUME: &str = "/Volumes/kbf";
 pub const HOMES: &str = "/Volumes/kbf/home";
 pub const KEY: &str = "/usr/local/kbf/etc/node.key";
-pub const SCRATCH: &str = "/Volumes/kbf/scratch";
+pub const SCRATCH: &str = "/Volumes/kbf/data";
 /// The example's pool: 4 users (the default) from uid 700 (the default: the uid after
 /// `lease_uids=600-699`); group `kbfpool` has gid 700.
 pub const POOL_FIRST_UID: u32 = 700;

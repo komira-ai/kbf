@@ -15,10 +15,10 @@ use crate::error::TierError;
 /// How a tier is sized and when it seals.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TierOptions {
-    /// `--write-tier-bytes`: the most bytes the tier's block files may hold before
+    /// The hot store's budget: the most bytes the tier's block files may hold before
     /// they are flushed: every live block's reserved extent, open uploads' included.
     pub budget: u64,
-    /// `--write-tier-seal-after`: how long the open grouped block takes reservations.
+    /// How long the open grouped block takes reservations.
     pub seal_after: Duration,
     /// The size at which the open grouped block is sealed: [`MAX_SEGMENT_BYTES`].
     pub segment_limit: u64,

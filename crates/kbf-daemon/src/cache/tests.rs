@@ -199,7 +199,9 @@ async fn a_panic_on_the_blocking_pool_is_resumed() {
     let joined = tokio::spawn(super::fill::blocking(|| -> u8 { panic!("in the pool") })).await;
     assert!(joined.expect_err("it panicked").is_panic());
     assert_eq!(super::fill::blocking(|| 7).await, 7);
+    assert_eq!(LinkMode::Hardlink.to_string(), "hardlink");
     assert_eq!(LinkMode::Copy.to_string(), "copy");
+    assert_eq!(LinkMode::Clone.to_string(), "clone");
     assert!(super::system_clock()() > 1_000_000_000);
     super::Hooks::at(&super::NoHooks, super::Point::PassStarts);
     for (disabled, word) in [

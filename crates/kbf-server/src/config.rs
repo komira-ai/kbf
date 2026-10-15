@@ -1,26 +1,29 @@
 //! Command-line flags. Every setting is a flag; the only environment variables read are
 //! the standard S3 key pair, `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` (a secret
-//! never goes on the command line).
+//! never goes on the command line). Where the server keeps its bytes is two store URIs
+//! and, sometimes, one directory ([`crate::stores`]): `--cold-store`, `--hot-store`,
+//! `--meta-dir`.
 
 use std::net::{IpAddr, SocketAddr};
-use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
-use std::path::{Path, PathBuf};
+use std::num::{NonZeroU32, NonZeroUsize};
+use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use clap::{Parser, ValueEnum};
 use kbf_front::WriteConfig;
+use kbf_objstore::Capabilities;
 use kbf_objstore::s3::{Credentials, S3Config, S3ConfigError, S3Store};
-use kbf_objstore::{Capabilities, KeyError, KeyPrefix};
 use tonic::transport::{Certificate, Identity, ServerTlsConfig};
 
 use kbf_auth::{AllowAuthorizer, Authorizer, Policy, PolicyError};
 use kbf_front::SegmentsConfig;
 use kbf_meta::ServerId;
-use kbf_tier::{TierArgs, TierOptions};
+use kbf_threads::disk::FreeSpace;
 
 use crate::identity::{DenyList, DenyListError};
 use crate::serve::{Api, Listeners, WorkerTls};
+use crate::stores::{S3Uri, StoreFlags, StoreUri, Stores, StoresError};
 use crate::token::{ApiToken, TokenFileError};
 
 /// The longest heartbeat interval `--heartbeat-interval-ms` accepts: half of
@@ -34,28 +37,6 @@ pub enum Role {
     All,
 }
 
-/// Where blob bytes go, unless `--blob-dir` names a local directory.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
-pub enum StoreKind {
-    /// In this process; gone when it exits.
-    Memory,
-    /// An S3 bucket (MinIO, RustFS). Under `--meta-log=memory` the index is in
-    /// memory, so a restart forgets every blob, and each start writes under a fresh
-    /// key prefix; under `--meta-log=raft` a restart keeps them.
-    S3,
-}
-
-/// Where the metadata (the CAS index and the action cache) is kept.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
-pub enum MetaLogKind {
-    /// In this process; a restart forgets it.
-    Memory,
-    /// A single-voter Raft log in `--raft-dir` ([`crate::raft_log`]); a restart keeps
-    /// it. Needs `--store=s3` or `--blob-dir`: the bytes it indexes must outlive the
-    /// process too.
-    Raft,
-}
-
 /// `kbf-server` flags.
 #[derive(Clone, Debug, Parser)]
 #[command(
@@ -67,17 +48,68 @@ pub struct Args {
     /// The roles to run.
     #[arg(long, value_enum, default_value = "all")]
     pub role: Role,
-    /// Where blob bytes are stored. `--blob-dir` stores them in a local directory instead.
-    #[arg(long, value_enum, default_value = "memory")]
-    pub store: StoreKind,
-    /// Where the metadata (the CAS index and the action cache) is kept.
-    #[arg(long, value_enum, default_value = "memory")]
-    pub meta_log: MetaLogKind,
-    /// The directory of the Raft log (`--meta-log=raft`), on a local disk; created if
-    /// missing. An empty directory gets a new log with a new id; every later start
-    /// over it reads the id from the directory.
-    #[arg(long, required_if_eq("meta_log", "raft"))]
-    pub raft_dir: Option<PathBuf>,
+    /// The durable object store, where every blob ends up: `file:///absolute/path` (a
+    /// directory, `kbf_objstore::FsStore`: locked while the server runs, a second
+    /// server on it is refused; a write that would leave its filesystem with less free
+    /// than it keeps, 5% of its size and at least 1 GiB, is refused and wakes the
+    /// evictor, which forgets the least recently used objects (never one used in the
+    /// last minute) and deletes their files while less than twice that is free) or
+    /// `s3://bucket/prefix?endpoint=http://host:port` (MinIO, RustFS; the key pair is
+    /// `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`; query keys `region`,
+    /// `conditional-put=true` for a store that refuses to overwrite a key, and
+    /// `min-put-rate=BYTES_PER_SEC`, the slowest rate a PUT body may reach the store at:
+    /// a PUT is cut after 60 seconds plus its body's length at that rate, 1 MiB/s by
+    /// default). Objects are keyed under `<prefix><log id>/` (`kbf/` for a directory and
+    /// for an S3 URI without a path), the id of the metadata log. A directory is
+    /// checked against the index by a start-up pass in the background; a lost or
+    /// damaged object is also found when it is read, or before an action-cache hit
+    /// that needs it is served (a miss). There is no `memory:` store:
+    /// a `file://` path on a tmpfs is one.
+    #[arg(long, value_name = "URI")]
+    pub cold_store: Option<StoreUri>,
+    /// The fast tier in front of the cold store: `file:///absolute/path`, a directory
+    /// on an SSD (or a tmpfs). Uploads land there and are flushed to the cold store in
+    /// the background; reads are served from it while a blob is still there. Its
+    /// budget is not a flag: 80% of the filesystem's free space less what it keeps free
+    /// (5% of its size, at least 1 GiB, and never more than half of what is free), at
+    /// most `--hot-store-max-bytes`; at the budget, writes
+    /// take the direct path to the cold store. Without it, uploads go straight to the
+    /// cold store. The first start with a hot store raises the metadata log to machine
+    /// version 2, once; a binary that runs only version 1 no longer reads it.
+    /// The metadata log lives in `<dir>/meta`, unless `--meta-dir` says otherwise.
+    #[arg(long, value_name = "URI")]
+    pub hot_store: Option<StoreUri>,
+    /// The most bytes the hot store's block files may hold before they are flushed,
+    /// lower than its automatic budget.
+    #[arg(long, value_name = "BYTES", requires = "hot_store", value_parser = clap::value_parser!(u64).range(1..))]
+    pub hot_store_max_bytes: Option<u64>,
+    /// Abandons this server's hot store tier `<id>` at start: every object staged on
+    /// it is marked unreachable as missing (its blobs answer `Unavailable` until
+    /// uploaded again; nothing is answered `NOT_FOUND`), and the directory becomes a new
+    /// tier. For a lost or replaced disk, after a start was refused because the
+    /// directory's `TIER` file is missing or names another tier. The id is the one the
+    /// refusal names.
+    #[arg(long, value_name = "ID", requires = "hot_store", value_parser = clap::value_parser!(u64).range(1..))]
+    pub hot_store_abandon: Option<u64>,
+    /// The directory of the metadata log (the CAS index and the action cache, a
+    /// single-voter Raft log), on a local disk; created if missing. An empty directory
+    /// gets a new log with a new id; every later start over it reads the id from the
+    /// directory. Left out, it is `<hot store directory>/meta`; required when there is
+    /// no `file://` hot store. Given, it wins over the hot store's directory.
+    #[arg(long, value_name = "DIR")]
+    pub meta_dir: Option<PathBuf>,
+    /// For tests only: the free bytes a `file://` cold store's filesystem must keep, in
+    /// place of 5% of it, at least 1 GiB (a test's disk would decide what is evicted).
+    #[arg(long, hide = true, value_name = "BYTES", requires = "cold_store")]
+    pub cold_store_floor_bytes: Option<u64>,
+    /// For tests of eviction only: a `file://` cold store's filesystem is taken to be
+    /// this many bytes, holding nothing but the store's object files.
+    #[arg(long, hide = true, value_name = "BYTES", requires = "cold_store")]
+    pub cold_store_size_bytes: Option<u64>,
+    /// For tests of eviction only: how long after its last use an object in a
+    /// `file://` cold store is never evicted, in milliseconds.
+    #[arg(long, hide = true, default_value_t = kbf_front::EVICT_GRACE.as_millis() as u64)]
+    pub cold_store_evict_grace_ms: u64,
     /// The REAPI listener. Without `--reapi-tls-cert` and `--reapi-tls-key` it serves
     /// plain text, on any address; off loopback the start line carries a warning.
     #[arg(long, default_value = "127.0.0.1:8980")]
@@ -234,57 +266,6 @@ pub struct Args {
     /// that began it closes; one that is committing is kept until its commit ends.
     #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u64).range(1..))]
     pub segment_upload_idle_secs: u64,
-    /// Stores blob bytes in this directory on the local disk, in place of `--store`
-    /// (`kbf_objstore::FsStore`): created if missing, locked while the server runs (a
-    /// second server on it is refused), and kept across restarts. Needs
-    /// `--meta-log=raft`, which keeps the index of what it holds; objects are keyed
-    /// under `kbf/<log id>/` (fixed: `--s3-prefix` is refused with it). A start-up
-    /// pass checks the directory against the index in the background; a lost or
-    /// damaged object is also found when it is read, or before an action-cache hit
-    /// that needs it is served (a miss). Under disk pressure the least recently used
-    /// objects are evicted (`--blob-dir-min-free-bytes`).
-    #[arg(long, conflicts_with_all = ["store", "s3_endpoint", "s3_bucket", "s3_prefix"])]
-    pub blob_dir: Option<PathBuf>,
-    /// The free bytes `--blob-dir`'s file system must keep (default: 5% of it, at least
-    /// 1 GiB): a write that would leave less is refused (the upload is answered
-    /// UNAVAILABLE) and wakes the evictor, which forgets the least recently used
-    /// objects and deletes their files while less than twice this is free. An object
-    /// used in the last minute is never evicted.
-    #[arg(long, value_name = "BYTES", requires = "blob_dir")]
-    pub blob_dir_min_free_bytes: Option<u64>,
-    /// For tests of eviction only: `--blob-dir`'s file system is taken to be this many
-    /// bytes, holding nothing but the directory's object files.
-    #[arg(long, hide = true, value_name = "BYTES", requires = "blob_dir")]
-    pub blob_dir_size_bytes: Option<u64>,
-    /// For tests of eviction only: how long after its last use an object is never
-    /// evicted, in milliseconds.
-    #[arg(long, hide = true, default_value_t = kbf_front::EVICT_GRACE.as_millis() as u64)]
-    pub blob_dir_evict_grace_ms: u64,
-    /// `http://host[:port]` of the S3 service (`--store=s3`).
-    #[arg(long, required_if_eq("store", "s3"))]
-    pub s3_endpoint: Option<String>,
-    /// The bucket (`--store=s3`).
-    #[arg(long, required_if_eq("store", "s3"))]
-    pub s3_bucket: Option<String>,
-    /// The signing region.
-    #[arg(long, default_value = "us-east-1")]
-    pub s3_region: String,
-    /// The key prefix (`--store=s3`; refused with `--blob-dir`). Under `--meta-log=memory`
-    /// each start writes under `<prefix><start time>/`; under `--meta-log=raft` every
-    /// start writes under `<prefix><log id>/`, fixed when the log is created (a later
-    /// start with another prefix is refused).
-    #[arg(long, default_value = "kbf/")]
-    pub s3_prefix: String,
-    /// The slowest rate, in bytes a second, a request body may reach the store at
-    /// (`--store=s3`): a PUT is cut after 60 seconds plus its body's length at this
-    /// rate, so a 128 MiB segment gets 188 seconds at the default. A store shared with
-    /// other tenants can take minutes over one large PUT; a flat limit would cut it
-    /// however steadily it progressed.
-    #[arg(long, value_name = "BYTES_PER_SEC", default_value_t = NonZeroU64::new(1 << 20).expect("1 MiB"))]
-    pub s3_min_put_rate: NonZeroU64,
-    /// The store refuses to overwrite a key (MinIO and RustFS do).
-    #[arg(long)]
-    pub s3_conditional_put: bool,
     /// How long, in milliseconds, the oldest blob of an open segment waits for
     /// concurrent uploads to join it before the segment is sealed and written
     /// (`docs/design/write-path.md`, section 3.1). No caller is answered before its
@@ -339,10 +320,6 @@ pub struct Args {
     /// all Executes.
     #[arg(long, default_value_t = kbf_front::InputTreeConfig::DEFAULT.reads_in_flight)]
     pub input_tree_reads_in_flight: NonZeroUsize,
-    /// The local write tier (`docs/design/write-path.md`, section 6). Off unless
-    /// `--write-tier-dir` is given.
-    #[command(flatten)]
-    pub tier: TierArgs,
 }
 
 /// This server in the tier registry. A farm runs one server today
@@ -363,14 +340,14 @@ pub enum ConfigError {
     #[error("--worker-deny-list: {0}")]
     DenyList(#[from] DenyListError),
     /// An S3 setting is missing from the environment.
-    #[error("{0} must be set for --store=s3")]
+    #[error("{0} must be set for an s3:// store")]
     MissingEnv(&'static str),
     /// The S3 configuration is refused.
     #[error(transparent)]
     S3(#[from] S3ConfigError),
-    /// The key prefix is not a valid prefix.
-    #[error("--s3-prefix: {0}")]
-    Prefix(#[from] KeyError),
+    /// The store flags do not make a server.
+    #[error(transparent)]
+    Stores(#[from] StoresError),
     /// The operator API token file is refused.
     #[error("--api-token-file: {0}")]
     ApiToken(#[from] TokenFileError),
@@ -390,21 +367,6 @@ pub enum ConfigError {
     /// `--memory-ladder-gib` is empty, holds a 0, does not ascend, or overflows.
     #[error("--memory-ladder-gib: {0}")]
     MemoryLadder(#[from] kbf_sched::LadderError),
-    /// `--meta-log=raft` with `--store=memory` and no `--blob-dir`.
-    #[error(
-        "--meta-log=raft needs --store=s3 or --blob-dir: a durable index over blobs that die \
-         with the process"
-    )]
-    RaftWithoutDurableStore,
-    /// `--blob-dir` under `--meta-log=memory`.
-    #[error(
-        "--blob-dir needs --meta-log=raft: an index in memory forgets every blob at a \
-         restart, and nothing would delete their files"
-    )]
-    BlobDirWithoutRaft,
-    /// `--raft-dir` without `--meta-log=raft`.
-    #[error("--raft-dir is read only with --meta-log=raft")]
-    RaftDirUnused,
     /// The REAPI policy file is not a policy.
     #[error("--reapi-auth-policy: {path}: {source}")]
     Policy {
@@ -415,15 +377,20 @@ pub enum ConfigError {
 }
 
 impl Args {
-    /// The write tier's directory and options, or `None` when the tier is off.
+    /// Where the flags put the server's bytes and metadata, sized from `space`.
     ///
-    /// The tier runs over either metadata log. Under `--meta-log=raft` its start raises
-    /// the log to machine version 2 once, and recovers the directory against the
-    /// committed state; under `--meta-log=memory` it clears the directory at every start
-    /// ([`crate::write_tier::attach`]).
-    #[must_use]
-    pub fn write_tier(&self) -> Option<(PathBuf, TierOptions)> {
-        self.tier.config()
+    /// # Errors
+    /// [`StoresError`]: no `--cold-store`, a hot store that is not a directory, no
+    /// directory for the metadata log, or a hot store filesystem with no room.
+    pub fn stores(&self, space: &dyn FreeSpace) -> Result<Stores, StoresError> {
+        StoreFlags {
+            cold: self.cold_store.as_ref(),
+            hot: self.hot_store.as_ref(),
+            hot_max_bytes: self.hot_store_max_bytes,
+            hot_abandon: self.hot_store_abandon,
+            meta_dir: self.meta_dir.as_deref(),
+        }
+        .resolve(space)
     }
 
     /// The listeners these flags describe.
@@ -591,65 +558,33 @@ impl Args {
     pub fn cpu_threads_on(&self, topology: kbf_threads::Topology) -> NonZeroUsize {
         NonZeroUsize::new(self.threads.resolve(topology).cpu_threads()).unwrap_or(NonZeroUsize::MIN)
     }
+}
 
-    /// The raft directory under `--meta-log=raft`; `None` under `--meta-log=memory`.
-    ///
-    /// # Errors
-    /// [`ConfigError::RaftWithoutDurableStore`] for `--meta-log=raft --store=memory`
-    /// without `--blob-dir`; [`ConfigError::BlobDirWithoutRaft`] for a `--blob-dir`, and
-    /// [`ConfigError::RaftDirUnused`] for a `--raft-dir`, under `--meta-log=memory`.
-    pub fn raft_dir(&self) -> Result<Option<&Path>, ConfigError> {
-        let blob_dir = self.blob_dir.is_some();
-        match (self.meta_log, self.store, self.raft_dir.as_deref()) {
-            (MetaLogKind::Memory, _, _) if blob_dir => Err(ConfigError::BlobDirWithoutRaft),
-            (MetaLogKind::Memory, _, None) => Ok(None),
-            (MetaLogKind::Memory, _, Some(_)) => Err(ConfigError::RaftDirUnused),
-            (MetaLogKind::Raft, StoreKind::Memory, _) if !blob_dir => {
-                Err(ConfigError::RaftWithoutDurableStore)
-            }
-            // clap requires `--raft-dir` with `--meta-log=raft`.
-            (MetaLogKind::Raft, _, dir) => Ok(dir),
-        }
-    }
+/// The S3 store of `uri`, its key pair read through `env` (the environment's
+/// `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`).
+///
+/// # Errors
+/// The key pair is missing, or the configuration is refused.
+pub fn s3_store(uri: &S3Uri, env: impl Fn(&str) -> Option<String>) -> Result<S3Store, ConfigError> {
+    let need = |name: &'static str| env(name).ok_or(ConfigError::MissingEnv(name));
+    let credentials = Credentials::new(need("AWS_ACCESS_KEY_ID")?, need("AWS_SECRET_ACCESS_KEY")?);
+    Ok(S3Store::new(s3_config(uri, credentials))?)
+}
 
-    /// The store configuration of this start's flags. Clap requires both flags with
-    /// `--store=s3`; an empty value is `S3Store`'s to refuse.
-    fn s3_config(&self, credentials: Credentials) -> S3Config {
-        S3Config {
-            endpoint: self.s3_endpoint.clone().unwrap_or_default(),
-            region: self.s3_region.clone(),
-            bucket: self.s3_bucket.clone().unwrap_or_default(),
-            credentials,
-            capabilities: Capabilities {
-                conditional_put: self.s3_conditional_put,
-                object_lock: false,
-            },
-            connect_timeout: Duration::from_secs(5),
-            request_timeout: Duration::from_secs(60),
-            min_body_rate: Some(self.s3_min_put_rate),
-        }
-    }
-
-    /// The S3 store and the key prefix of this start, `<prefix><start time>/` (the
-    /// one `--meta-log=memory` writes under), for `--store=s3`. `env` reads an
-    /// environment variable (the S3 key pair).
-    ///
-    /// # Errors
-    /// A flag or the key pair is missing, or the configuration is refused.
-    pub fn s3_store(
-        &self,
-        env: impl Fn(&str) -> Option<String>,
-    ) -> Result<(S3Store, KeyPrefix), ConfigError> {
-        let need = |name: &'static str| env(name).ok_or(ConfigError::MissingEnv(name));
-        let credentials =
-            Credentials::new(need("AWS_ACCESS_KEY_ID")?, need("AWS_SECRET_ACCESS_KEY")?);
-        let store = S3Store::new(self.s3_config(credentials))?;
-        let started = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let prefix = KeyPrefix::new(format!("{}{started}/", self.s3_prefix))?;
-        Ok((store, prefix))
+/// The store configuration of `uri`.
+fn s3_config(uri: &S3Uri, credentials: Credentials) -> S3Config {
+    S3Config {
+        endpoint: uri.endpoint.clone(),
+        region: uri.region.clone(),
+        bucket: uri.bucket.clone(),
+        credentials,
+        capabilities: Capabilities {
+            conditional_put: uri.conditional_put,
+            object_lock: false,
+        },
+        connect_timeout: Duration::from_secs(5),
+        request_timeout: Duration::from_secs(60),
+        min_body_rate: Some(uri.min_put_rate),
     }
 }
 
@@ -671,69 +606,145 @@ fn read(path: &PathBuf) -> Result<Vec<u8>, ConfigError> {
 #[cfg(test)]
 mod tests {
     use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
-    use std::path::Path;
     use std::time::Duration;
 
     use clap::Parser;
     use kbf_front::{MAX_BLOB_BYTES, WriteConfig};
 
+    use kbf_threads::disk::{FreeSpace, Space};
+
     use super::{Args, loopback_only};
 
-    /// Catches: `--s3-min-put-rate` lost on the way to the store (the flat 60 s that cut
-    /// slow segment PUTs), a default other than 1 MiB/s, and a rate of 0 accepted (it
-    /// would divide by zero in the store's timeout).
+    /// Catches: `min-put-rate` lost on the way from the URI to the store (the flat 60 s
+    /// that cut slow segment PUTs), a default other than 1 MiB/s, `conditional-put` and
+    /// the region dropped, and a rate of 0 accepted (it would divide by zero in the
+    /// store's timeout).
     #[test]
-    fn the_put_rate_floor_is_a_flag_with_a_default() {
-        let base = [
-            "kbf-server",
-            "--store",
-            "s3",
-            "--s3-endpoint",
-            "http://e:9",
-            "--s3-bucket",
-            "b",
-        ];
-        let rate = |extra: &[&str]| {
-            Args::try_parse_from(base.iter().chain(extra)).map(|a| a.s3_min_put_rate.get())
+    fn the_s3_uri_reaches_the_store_config() {
+        let parse = |query: &str| {
+            let uri = format!("s3://b/p?endpoint=http://e:9{query}");
+            Args::try_parse_from(["kbf-server", "--cold-store", &uri])
         };
-        assert_eq!(rate(&[]).unwrap(), 1 << 20);
-        assert_eq!(rate(&["--s3-min-put-rate", "4096"]).unwrap(), 4096);
-        assert!(rate(&["--s3-min-put-rate", "0"]).is_err());
-    }
-
-    /// Catches: the flag value not reaching the store's configuration (the timeout
-    /// fix a no-op in production), for the default and for an override.
-    #[test]
-    fn the_put_rate_flag_reaches_the_store_config() {
-        let base = ["kbf-server", "--store", "s3", "--s3-endpoint", "http://e:9"];
-        let config = |extra: &[&str]| {
-            let args = Args::parse_from(base.iter().chain(&["--s3-bucket", "b"]).chain(extra));
-            args.s3_config(super::Credentials::new("k", "s"))
+        let config = |query: &str| {
+            let args = parse(query).expect("a store");
+            let uri = args.cold_store.expect("a store");
+            let uri = uri.as_s3().expect("an s3 store");
+            super::s3_config(uri, super::Credentials::new("k", "s"))
         };
-        assert_eq!(config(&[]).min_body_rate, NonZeroU64::new(1 << 20));
-        let over = config(&["--s3-min-put-rate", "4096"]);
+        let default = config("");
+        assert_eq!(default.min_body_rate, NonZeroU64::new(1 << 20));
+        assert_eq!(default.region, "us-east-1");
+        assert!(!default.capabilities.conditional_put);
+        assert_eq!(default.endpoint, "http://e:9");
+        assert_eq!(default.bucket, "b");
+        let over = config("&min-put-rate=4096&region=eu-1&conditional-put=true");
         assert_eq!(over.min_body_rate, NonZeroU64::new(4096));
+        assert_eq!(over.region, "eu-1");
+        assert!(over.capabilities.conditional_put);
+        assert!(parse("&min-put-rate=0").is_err());
     }
 
-    /// Catches: the write tier refused (or silently off) over either metadata log, its
-    /// options lost on the way, or the tier on when `--write-tier-dir` is not given.
+    /// Catches: the store flags not reaching the resolution (a hot store ignored, the
+    /// budget from the wrong filesystem number), a fake free-space source not used, and
+    /// the old flags accepted (a stale unit would go unnoticed).
     #[test]
-    fn the_write_tier_runs_over_either_metadata_log() {
-        let parse = |extra: &[&str]| {
-            let base = ["kbf-server", "--store", "s3", "--s3-endpoint", "http://e:9"];
-            let rest = ["--s3-bucket", "b"];
-            Args::parse_from(base.iter().chain(&rest).chain(extra))
+    fn the_store_flags_resolve_and_the_old_ones_are_refused() {
+        let space = Space {
+            total: 100 << 30,
+            available: 50 << 30,
         };
-        let tier = ["--write-tier-dir", "/t", "--write-tier-bytes", "9"];
-        assert_eq!(parse(&[]).write_tier(), None);
-        let on = parse(&tier).write_tier();
-        assert_eq!(on.map(|(d, o)| (d, o.budget)), Some(("/t".into(), 9)));
-        let raft = ["--meta-log", "raft", "--raft-dir", "/r"];
-        let both: Vec<&str> = tier.iter().chain(&raft).copied().collect();
-        let both = parse(&both);
-        assert_eq!(both.raft_dir().expect("raft"), Some(Path::new("/r")));
-        let on = both.write_tier();
-        assert_eq!(on.map(|(d, o)| (d, o.budget)), Some(("/t".into(), 9)));
+        let args = Args::parse_from([
+            "kbf-server",
+            "--cold-store=file:///c",
+            "--hot-store=file:///h",
+        ]);
+        let stores = args.stores(&Fake(space)).expect("stores");
+        assert_eq!(stores.hot.expect("hot").budget, space.of_free(80, None));
+        assert_eq!(stores.meta_dir, std::path::Path::new("/h/meta"));
+        for flag in [
+            "--store=s3",
+            "--blob-dir=/b",
+            "--blob-dir-min-free-bytes=1",
+            "--meta-log=raft",
+            "--raft-dir=/r",
+            "--s3-endpoint=http://e:9",
+            "--s3-bucket=b",
+            "--s3-region=r",
+            "--s3-prefix=p/",
+            "--s3-conditional-put",
+            "--s3-min-put-rate=9",
+            "--write-tier-dir=/t",
+            "--write-tier-bytes=9",
+            "--write-tier-seal-after=9",
+            "--write-tier-abandon=9",
+        ] {
+            let refused = Args::try_parse_from(["kbf-server", flag]).expect_err(flag);
+            assert_eq!(
+                refused.kind(),
+                clap::error::ErrorKind::UnknownArgument,
+                "{flag}"
+            );
+        }
+        for flag in ["--hot-store-max-bytes=9", "--hot-store-abandon=9"] {
+            assert!(
+                Args::try_parse_from(["kbf-server", flag]).is_err(),
+                "{flag}"
+            );
+        }
+    }
+
+    /// Behaviour equivalence for a converged config: the flags of the unit this release
+    /// renders open the stores the old unit's flags did (`--store=s3 --s3-endpoint=...
+    /// --s3-bucket=kbf-cas --s3-conditional-put --meta-log=raft --raft-dir=...`): the
+    /// same endpoint, bucket, region, capabilities, timeouts and put rate; the key prefix
+    /// root `kbf/`; the log in the same directory. And a directory cold store and a hot
+    /// directory keep what `--blob-dir` (prefix `kbf/`) and `--write-tier-dir` (the
+    /// 30 s seal) had; the directory's floor is no longer a fixed 1 GiB but the
+    /// evicting directory's `keep_free` (5%, at least 1 GiB).
+    #[test]
+    fn a_converged_unit_opens_the_stores_the_old_flags_did() {
+        let args = Args::parse_from([
+            "kbf-server",
+            "--cold-store=s3://kbf-cas?endpoint=http://127.0.0.1:9000&conditional-put=true",
+            "--meta-dir=/var/lib/kbf-server/raft",
+        ]);
+        let stores = args
+            .stores(&Fake(Space {
+                total: 100 << 30,
+                available: 50 << 30,
+            }))
+            .expect("stores");
+        let uri = stores.cold.as_s3().expect("an S3 cold store");
+        assert_eq!(uri.prefix, "kbf/", "the old --s3-prefix default");
+        let config = super::s3_config(uri, super::Credentials::new("k", "s"));
+        assert_eq!(config.endpoint, "http://127.0.0.1:9000");
+        assert_eq!(config.bucket, "kbf-cas");
+        assert_eq!(config.region, "us-east-1");
+        assert!(config.capabilities.conditional_put);
+        assert!(!config.capabilities.object_lock);
+        assert_eq!(config.connect_timeout, Duration::from_secs(5));
+        assert_eq!(config.request_timeout, Duration::from_secs(60));
+        assert_eq!(config.min_body_rate, NonZeroU64::new(1 << 20));
+        assert_eq!(
+            stores.meta_dir,
+            std::path::Path::new("/var/lib/kbf-server/raft")
+        );
+        assert_eq!(stores.hot, None, "no tier unless asked, as before");
+        assert_eq!(
+            crate::stores::COLD_FILE_FLOOR,
+            kbf_objstore::Floor::KeepFree
+        );
+        assert_eq!(crate::stores::FILE_PREFIX_ROOT, "kbf/");
+        assert_eq!(kbf_tier::TierOptions::SEAL_AFTER, Duration::from_secs(30));
+    }
+
+    /// A free-space source with one answer.
+    struct Fake(Space);
+
+    impl FreeSpace for Fake {
+        fn space(&self, _: &std::path::Path) -> std::io::Result<Space> {
+            Ok(self.0)
+        }
     }
 
     /// Catches a `--cpu-threads` that does not reach the cache's hashing pool (the

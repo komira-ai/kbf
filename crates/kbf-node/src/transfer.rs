@@ -181,9 +181,9 @@ mod tests {
             "--cas=https://127.0.0.1:1".to_owned(),
         ])
         .expect("flags");
-        let mut node = Node::default();
-        let first = node.transfers(&cli).expect("engine");
-        let second = node.transfers(&cli).expect("engine");
+        let mut node = Node::new(Box::new(super::super::remote));
+        let first = node.plane(&cli).expect("engine");
+        let second = node.plane(&cli).expect("engine");
         assert!(Arc::ptr_eq(&first, &second));
     }
 }

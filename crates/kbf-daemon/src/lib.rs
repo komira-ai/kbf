@@ -41,7 +41,7 @@
 //! crate, so a binary here naming them would be a cycle Cargo refuses. It never offers
 //! [`LocalRuntime`], which isolates nothing.
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod cache;
 pub mod cas;
 pub mod clock;
@@ -55,6 +55,8 @@ pub mod keeper;
 mod lease;
 #[cfg(target_os = "linux")]
 mod local;
+#[cfg(target_os = "linux")]
+pub mod numa;
 pub mod phases;
 pub mod pressure;
 pub mod report;
@@ -62,7 +64,7 @@ pub mod runtime;
 pub mod runtimes;
 pub mod status;
 pub mod tree;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub mod trees;
 #[cfg(target_os = "macos")]
 pub mod uid;

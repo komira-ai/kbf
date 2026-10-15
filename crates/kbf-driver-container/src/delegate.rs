@@ -33,6 +33,9 @@
 //! done. [`adopt`] is the other way in: an `actions/` cgroup someone else set up
 //! (`--cgroup-parent`), checked and not changed but for `memory.max` when given.
 //!
+//! [`enable_cpuset`] is for `--lease-placement=numa-node` alone: it enables `+cpuset` in
+//! `actions/` and its parent, where the three above do not.
+//!
 //! [`capacity`] reads what `actions/` may use: the lowest `memory.max` on the path
 //! from `actions/` up to the root (so a unit's own `MemoryMax=` counts), and the CPUs
 //! in the nearest `cpuset.cpus.effective`, lowered by the lowest `cpu.max` quota on the
@@ -43,6 +46,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use kbf_daemon::Capacity;
+
+use crate::numa::CpuSet;
 
 /// The controllers enabled for the delegated cgroup's children and for `actions/`'s.
 const CONTROLLERS: [&str; 3] = ["cpu", "memory", "pids"];
@@ -238,6 +243,66 @@ pub(crate) fn limit_cpus_in(
     let quota = cpus.max(1).saturating_mul(CPU_PERIOD_US);
     fs.write(actions, "cpu.max", &format!("{quota} {CPU_PERIOD_US}"))
         .map_err(io_err(fs, "write", actions, "cpu.max"))
+}
+
+/// Enables `cpuset` for the leases under `actions` (`--lease-placement=numa-node`): in
+/// its parent's `cgroup.subtree_control`, so `actions/` has the cpuset files, and in
+/// `actions/`'s own, so each lease cgroup has them. Returns the CPUs `actions/` may use
+/// (`cpuset.cpus.effective`), `None` where the kernel shows none.
+///
+/// Under a systemd unit with `Delegate=yes` the unit is offered `cpuset` with the other
+/// controllers; a user manager (`user@.service`) offers only `memory pids` unless a
+/// drop-in names more.
+///
+/// # Errors
+/// The parent does not offer `cpuset` (the message names the fix), or a controller list
+/// could not be written (the parent holds a process, or the user may not write it).
+pub fn enable_cpuset(mount: &Path, actions: &str) -> Result<Option<CpuSet>, DelegateError> {
+    enable_cpuset_in(&Mount(mount), actions)
+}
+
+pub(crate) fn enable_cpuset_in(
+    fs: &dyn CgroupFs,
+    actions: &str,
+) -> Result<Option<CpuSet>, DelegateError> {
+    let up = match actions.rsplit_once('/') {
+        Some(("", _)) | None => "/",
+        Some((parent, _)) => parent,
+    };
+    let offered = read(fs, up, "cgroup.controllers")?;
+    if !offered.split_whitespace().any(|c| c == "cpuset") {
+        return Err(DelegateError::Controllers {
+            cgroup: up.to_owned(),
+            what: "does not offer",
+            missing: vec!["cpuset"],
+            listed: offered.trim().to_owned(),
+            fix: "--lease-placement=numa-node needs it: the daemon's unit needs Delegate=yes \
+                  (or Delegate=cpu cpuset memory pids), and a user manager needs a drop-in \
+                  that delegates cpuset"
+                .to_owned(),
+        });
+    }
+    for cgroup in [up, actions] {
+        let enabled = read(fs, cgroup, "cgroup.subtree_control")?;
+        if !enabled.split_whitespace().any(|c| c == "cpuset") {
+            fs.write(cgroup, "cgroup.subtree_control", "+cpuset")
+                .map_err(io_err(
+                    fs,
+                    "enable cpuset in",
+                    cgroup,
+                    "cgroup.subtree_control",
+                ))?;
+        }
+    }
+    let Some(text) = read_if_there(fs, actions, "cpuset.cpus.effective")? else {
+        return Ok(None);
+    };
+    if text.trim().is_empty() {
+        return Ok(None);
+    }
+    text.parse::<CpuSet>()
+        .map(Some)
+        .map_err(|e: String| invalid(fs, actions, "cpuset.cpus.effective", &e))
 }
 
 pub(crate) fn delegate_in(

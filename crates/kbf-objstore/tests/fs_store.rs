@@ -10,7 +10,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use kbf_objstore::{
     ByteRange, Floor, FsStore, FsStoreError, KeyPrefix, ObjectKey, ObjectStore, ObjectStoreError,
-    PageSize, Room, Space, conformance, keep_free,
+    PageSize, Room, Space, conformance, objects_source,
 };
 use sha2::{Digest, Sha256};
 
@@ -333,14 +333,17 @@ fn an_open_that_cannot_create_the_directory_says_where() {
 
 const GIB: u64 = 1 << 30;
 
-/// Catches a floor that is not the file system's 5%, at least 1 GiB, never more than
-/// the file system (mutants: a fixed 1 GiB, no minimum, a percentage other than 5,
-/// the cap dropped), and a store that reads it from anywhere but its space source or
+/// Catches a default floor that is not the file system's 5%, at least 1 GiB, never
+/// more than the file system (mutants: `Floor::KeepFree` a fixed 1 GiB, or any rule
+/// but `kbf_threads::disk::keep_free`, which the daemon's caches keep too; there, no
+/// minimum, a percentage other than 5, the cap dropped), and a store that reads it
+/// from anywhere but its space source or
 /// applies it to anything but the write: on a fake 100 GiB file system the floor is
 /// 5 GiB, on a 4 GiB one 1 GiB, on a 512 MiB one all of it; a write that would leave
 /// less than the floor free is refused, one that leaves exactly the floor is stored.
 #[tokio::test]
 async fn keep_free_is_5_percent_and_at_least_1_gib() {
+    let keep_free = |total| Floor::KeepFree.bytes(total);
     assert_eq!(keep_free(100 * GIB), 5 * GIB);
     assert_eq!(keep_free(4 * GIB), GIB);
     assert_eq!(keep_free(20 * GIB), GIB);
@@ -437,7 +440,7 @@ async fn a_file_system_of_objects_counts_the_object_files() {
     let dir = scratch("of-objects");
     let total = 1 << 20;
     let store =
-        FsStore::open_with_space(&dir, Floor::Bytes(0), Space::of_objects(total)).expect("open");
+        FsStore::open_with_space(&dir, Floor::Bytes(0), objects_source(total)).expect("open");
     assert_eq!(store.room().expect("room").available, total);
     let keys = [key("a"), key("b"), key("c")];
     for k in &keys {

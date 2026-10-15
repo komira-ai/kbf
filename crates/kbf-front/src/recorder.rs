@@ -363,7 +363,29 @@ pub struct ExecuteCall {
     command: Digest,
 }
 
+/// What an Execute call's `RequestMetadata` says the action is: its kind (`CppCompile`)
+/// and the target it belongs to, as the client sent them (capped, see `Text`). The
+/// server keys the per-action usage line on it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ActionLabel {
+    /// `action_mnemonic`, when sent.
+    pub mnemonic: Option<String>,
+    /// `target_id`, when sent.
+    pub target: Option<String>,
+}
+
 impl ExecuteCall {
+    /// The mnemonic and target the call's `RequestMetadata` names.
+    #[must_use]
+    pub fn label(&self) -> ActionLabel {
+        let metadata = &self.call.metadata;
+        let value = |t: &Option<kbf_invocation::Text>| t.as_ref().map(|t| t.value.clone());
+        ActionLabel {
+            mnemonic: value(&metadata.mnemonic),
+            target: value(&metadata.target),
+        }
+    }
+
     /// The call of `action` (whose Action names `command`) that `metadata` names, by
     /// `caller` on `instance`; `None` without an invocation id or with `recorder` off.
     #[must_use]

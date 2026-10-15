@@ -25,7 +25,7 @@ What the code does with that output today:
 - `store_blobs` (`kbf-front/src/cache.rs`) packs only **its own call's** blobs into
   segments, so each file is a segment: one `put_new`, two `get_range` calls to read the
   trailer and footer back (`read_footer`), one `Command::PutBlobs`. Under
-  `--meta-log=raft` commits are proposed, synced and applied one at a time under the
+  the Raft metadata log commits are proposed, synced and applied one at a time under the
   log's lock (`kbf-server/src/raft_log/mod.rs`). Only then is the caller answered.
 - `kbf-objstore` does not retry: one failed PUT fails the blob, and the action.
 
@@ -136,7 +136,7 @@ linger nor holds up small writes. It is still held in memory until verified
 ### 3.4 Failure
 
 - **PUT timeout.** The S3 client's limit on a PUT is 60 s plus the body's length at
-  `--s3-min-put-rate` (default 1 MiB/s: 188 s for a 128 MiB segment), not a flat 60 s,
+  `min-put-rate` (of `--cold-store`) (default 1 MiB/s: 188 s for a 128 MiB segment), not a flat 60 s,
   which cut a segment a busy store was taking steadily. It applies to every PUT through
   the store, the write tier's flusher's included. A request with no body keeps 60 s.
 - **PUT fails.** It is retried up to `--store-put-attempts` (default 3) on
@@ -294,14 +294,14 @@ the commit is indexed once; its new record is dead bytes, reclaimed with the seg
   refuses to start unless the cap is at most `--write-bytes-in-flight` and at most
   4 GiB - 1, the most one admission counts (default cap 1 GiB + 1 MiB). With the tier on, ranges go to disk as they arrive, so the cap may be
   high: default 16 GiB, and the server refuses to start unless it is at most
-  `--write-tier-bytes`. Either way a legal `Begin` is always admitted.
+  the hot store's budget. Either way a legal `Begin` is always admitted.
   `MAX_UPLOAD_RECORDS` (16,384) bounds `Begin`'s message (16,384 entries of 52 B, about
   850 KiB, under `MAX_MESSAGE_BYTES`) and the upload's one `PutBlobs` or `PutStaged`
   (about 1 MiB in the Raft log, an estimate). The daemon splits a larger output set into
   several uploads under both caps, and writes the `ActionResult` after the last commits.
 - **Memory and disk.** Without the tier, ranges are held in memory until commit, so
   `Begin` takes a `--write-bytes-in-flight` permit for its total. With the tier, `Begin`
-  **reserves its total** against `--write-tier-bytes`, or uses the direct path when the
+  **reserves its total** against the hot store's budget, or uses the direct path when the
   reservation does not fit; ranges are written into the block file as they arrive
   (`pwrite`), and the permit covers only ranges in flight. A commit turns the
   reservation into staged bytes; a drop releases it.
@@ -349,7 +349,7 @@ that call and the daemon falls back to per-blob reads.
 
 ### 6.1 Shape
 
-With `--write-tier-dir=<path>` (on NVMe or SSD) and `--write-tier-bytes=<budget>`, a
+With `--hot-store=file://<path>` (on NVMe or SSD; its budget is sized from the filesystem), a
 sealed group or a committed segment upload is not PUT. It is written to a **block
 file** and synced, then committed. A block holds a segment's records, so a blob's
 offset in the block is its offset in the object the block becomes (Buildbarn's
@@ -374,7 +374,7 @@ offset in the block is its offset in the object the block becomes (Buildbarn's
    kinds of block are records up to the committed length, with no footer. Callers are
    answered after the commit.
 4. **Seal.** An open block is sealed at the segment limit or after
-   `--write-tier-seal-after` (default 30 s). Sealing first stops new reservations, then
+   the seal-after interval (default 30 s). Sealing first stops new reservations, then
    waits until every reserved range has been answered (committed or failed), then
    commits `Command::SealStaged { object }`. After that, `PutStaged` for the object is
    refused. The flusher re-reads every record, checks its SHA-256, computes its crc32c,
@@ -443,7 +443,7 @@ survive losing that disk before the flush: about 30 s (the seal delay) plus one 
 longer while the store is down. Metrics report unflushed bytes and the oldest unflushed
 block's age; an alert fires on the age.
 
-Today's deployment is one server whose Raft log is on its local disk (`--raft-dir`).
+Today's deployment is one server whose Raft log is on its local disk (`--meta-dir`).
 Losing that host already loses metadata committed since the last copied snapshot
 ([storage.md](storage.md#planned)). The tier adds a second thing on that host that a
 disk loss takes, and no new host whose failure loses data.
@@ -460,7 +460,7 @@ never gets another append. At open, the server checks `<dir>/TIER` first:
 
 - **`TIER` missing or naming another id while objects are staged on this server's
   tier:** the server **refuses to start**. A mount mistake or a wrong flag must not
-  destroy the index. Only `--write-tier-abandon=<id>`, naming the old tier, makes it
+  destroy the index. Only `--hot-store-abandon=<id>`, naming the old tier, makes it
   commit `ObjectUnreachable { Missing }` for every object staged there and register a
   new tier. The blobs become `Unavailable`: `FindMissingBlobs` reports them missing and
   a re-upload heals the index ([storage.md](storage.md#three-answers-not-two)); an action
@@ -539,11 +539,11 @@ of section 9 except the log-format row, which stage 3 pins), `kbf-tier/tests/flu
 
 Where it differs from the sections above, and why:
 
-- **The memory log clears the directory.** Under `--meta-log=memory` a restart starts
+- **The memory log clears the directory.** Under the in-memory metadata log (tests only) a restart starts
   with an empty index whose writer epochs start from 1 again, so the server deletes
   every file an earlier start left in the directory (`kbf_tier::clear`) before the
   open: none of it is indexed, and an old block's name could be one of the new start's
-  objects. Under `--meta-log=raft` (allowed since section 6.9) nothing is cleared: the
+  objects. Under the Raft metadata log (allowed since section 6.9) nothing is cleared: the
   recovery above runs against the committed staged table.
 - **Grouped writes reach the tier through the group's settle.** Each segment the
   write group seals (section 3) is staged as one range of the open block, with one
@@ -560,7 +560,7 @@ Where it differs from the sections above, and why:
 - **A read error in the flusher's re-read is retried** with the PUT backoff (1 s,
   doubling to 60 s); only a digest mismatch marks the object `Corrupt`.
 - **Flushed copies live in what the budget leaves over.** A `.seg` is kept while the
-  staged and reserved bytes plus the copies fit `--write-tier-bytes`; a reservation
+  staged and reserved bytes plus the copies fit the hot store's budget; a reservation
   evicts copies, least recently read first, before it is refused. So the directory's
   bytes stay within the budget.
 - **A new tier's id is the writer epoch of the start that registers it**: epochs are
@@ -595,13 +595,13 @@ Where it differs from the sections above, and why:
   `RaftMetaLog` themselves; the order of steps in `kbf-front`'s cache (sync before
   `PutStaged`, `ObjectFlushed` before the rename) is the cell's copy of it, because the
   cell polls each future once and `kbf-front`'s tier calls run on the blocking pool.
-- **`kbf-server` refused `--meta-log=raft` with `--write-tier-dir`** until section 6.9.
+- **`kbf-server` refused the Raft metadata log with `--hot-store`** until section 6.9.
 
 ### 6.9 As built (the tier over the Raft log in `kbf-server`)
 
 - **The raise at the tier's start.** `kbf_server::write_tier::attach` asks the log to
   ready itself and the directory for the tier (`TierLog::ready_for_tier`) before
-  `Cache::attach_tier`, and only when `--write-tier-dir` is given. The Raft log raises
+  `Cache::attach_tier`, and only when `--hot-store` is given. The Raft log raises
   itself to machine version 2 (`RaftMetaLog::raise_machine_version`, which commits
   nothing on a log already there); the memory log has nothing to raise and clears the
   directory instead. A raft server without a tier never
@@ -729,9 +729,9 @@ Estimates from the measured store latency, to be measured on the pilot at each s
    snapshots have landed (they have not). Nothing writes them yet.
 4. **PR 4, the tier**: the `Fs` extension, block files, append and sync, seal, the
    flusher, local reads, eviction on committed state, upload reservations, restart
-   recovery and the orphan sweep, the abandon flag, metrics. Flags: `--write-tier-dir`,
-   `--write-tier-bytes`, `--write-tier-seal-after`, `--write-tier-abandon`. Off unless
-   `--write-tier-dir` is given; the OSS default is no tier, today's guarantee.
+   recovery and the orphan sweep, the abandon flag, metrics. Flags: `--hot-store`,
+   the hot store's budget, the seal-after interval, `--hot-store-abandon`. Off unless
+   `--hot-store` is given; the OSS default is no tier, today's guarantee.
 5. **PR 5**: the tier in `kbf-sim-cell`, then on the pilot with the unflushed-age alert
    in place first. The scenarios it must run, their invariants and expected outcomes,
    and the store faults and crash points already in the cell, are in
@@ -791,11 +791,11 @@ directory entries** at a simulated crash:
 | crash after the flush PUT, before `ObjectFlushed`: one object, staged mark cleared | a double flush failing, or orphaning the block |
 | a segment-upload block flushed, crash before `ObjectFlushed`, reflushed: footers equal, no `FlushConflict` | a false conflict from a footer built two ways |
 | a restart with an open upload, and a crash between sync and `PutStaged` on an upload block: no `.blk` left, no budget consumed | orphan files filling the disk |
-| `Begin`s whose totals pass `--write-tier-bytes`: the excess goes direct; tier disk use stays under the budget | open uploads uncounted |
+| `Begin`s whose totals pass the hot store's budget: the excess goes direct; tier disk use stays under the budget | open uploads uncounted |
 | a same-key object whose footer differs: `FlushConflict`, blobs still `Present` and read locally | a conflict stopping reads of good bytes |
 | `ObjectFlushed` commit refused: the block is not evicted | evicting the only copy on a local flag |
 | a tiny budget never evicts a staged block; at the budget writes fall back to direct PUTs | eviction of the only copy; writes refused at the budget |
-| a wrong or missing `TIER` refuses start; with `--write-tier-abandon` objects become `Missing`, re-upload heals, no `NOT_FOUND` | a mount mistake destroying the index |
+| a wrong or missing `TIER` refuses start; with `--hot-store-abandon` objects become `Missing`, re-upload heals, no `NOT_FOUND` | a mount mistake destroying the index |
 | one block file deleted: only that object `Missing` | one lost file failing the whole tier |
 | a corrupted local record is not uploaded and is marked `Corrupt` | flushing damaged bytes |
 | a log holding each new variant, opened by a reader without it, is refused | silently skipping a staged write |

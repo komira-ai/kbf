@@ -12,8 +12,10 @@
 //!   booked, unless that rung is not below the **cap**, the memory of the largest node
 //!   that could run it (one that is live, cordoned or not, serves its lease kind,
 //!   satisfies its platform and holds its CPU and GPU request; the node the killed run
-//!   used always counts): then it books the cap, a whole host, with all its memory
-//!   booked no other lease fits on the node. A kill of a run that booked the cap
+//!   used always counts): then it books the cap, a whole host: it is placed only on a
+//!   node with no lease and no other lease is placed there while it runs (a booking of
+//!   memory is a limit, not a share of the node's, so this is the one case where the
+//!   limit keeps others out). A kill of a run that booked the cap
 //!   finishes the operation with [`Failure::OutOfMemory`]: the action needs more memory
 //!   than any node offers. Each raised booking is kept as the action key's memory
 //!   floor, and a later submission of that key books at least the floor, so a

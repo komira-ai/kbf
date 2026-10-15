@@ -1,6 +1,6 @@
 //! An [`ObjectStore`] in a directory on the local disk: the store of a single-host farm
 //! that keeps its blobs across a restart without an S3 service (`kbf-server
-//! --blob-dir`).
+//! --cold-store=file:///dir`).
 //!
 //! Layout under the directory:
 //!
@@ -37,7 +37,8 @@
 //! is served.
 //!
 //! A write is refused when the file system has less free space than the store's floor
-//! ([`Floor`]: by default [`keep_free`], 5% of the file system and at least 1 GiB) plus
+//! ([`Floor`]: by default `kbf_threads::disk::keep_free`, 5% of the file system and at
+//! least 1 GiB, the rule every farm directory that evicts to a floor keeps) plus
 //! the object's length, so a full disk refuses uploads instead of failing part-way
 //! through them (and the Raft log, often on the same disk, keeps room). The store
 //! deletes nothing on its own: a refusal wakes whoever waits on
@@ -59,6 +60,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
 use bytes::Bytes;
+use kbf_threads::disk::{FreeSpace as _, Space, Statvfs, keep_free};
 use sha2::{Digest, Sha256};
 use tokio::sync::Notify;
 
@@ -96,21 +98,10 @@ pub enum FsStoreError {
     },
 }
 
-/// 1 GiB.
-const GIB: u64 = 1 << 30;
-
-/// What a file system keeps free for everything else on it: 5% of its size, and at
-/// least 1 GiB (or the whole file system, when it is smaller). The same rule as the
-/// daemon's caches keep.
-#[must_use]
-pub fn keep_free(total: u64) -> u64 {
-    (total / 20).max(GIB).min(total)
-}
-
 /// The free space a store's writes must leave on its file system.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Floor {
-    /// [`keep_free`] of the file system's size.
+    /// [`keep_free`] of the file system's size: 5%, at least 1 GiB.
     KeepFree,
     /// This many bytes.
     Bytes(u64),
@@ -127,47 +118,35 @@ impl Floor {
     }
 }
 
-/// A file system's size and the bytes still free on it, in bytes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Space {
-    /// The file system's size.
-    pub total: u64,
-    /// The bytes a process that is not root may still write (`f_bavail`).
-    pub available: u64,
-}
-
 /// Where a store reads its file system's [`Space`] from, given its `objects/`
-/// directory: [`Space::statvfs`], or a test's fake ([`FsStore::open_with_space`]).
+/// directory: [`statvfs_source`], or a test's fake ([`FsStore::open_with_space`]).
 pub type SpaceSource = Arc<dyn Fn(&Path) -> io::Result<Space> + Send + Sync>;
 
-impl Space {
-    /// The real file systems: `statvfs`.
-    #[must_use]
-    pub fn statvfs() -> SpaceSource {
-        Arc::new(statvfs)
-    }
+/// The real file systems: `statvfs` ([`Statvfs`]).
+#[must_use]
+pub fn statvfs_source() -> SpaceSource {
+    Arc::new(|objects: &Path| Statvfs.space(objects))
+}
 
-    /// For tests of eviction only: a file system of `total` bytes that holds nothing
-    /// but the store's object files (every file under `objects/` counts, header
-    /// included).
-    #[doc(hidden)]
-    #[must_use]
-    pub fn of_objects(total: u64) -> SpaceSource {
-        Arc::new(move |objects| {
-            let mut held = 0_u64;
-            for shard in entries(objects)? {
-                // A file deleted since the listing holds nothing.
-                held += entries(&shard)?
-                    .iter()
-                    .map(|f| fs::metadata(f).map_or(0, |m| m.len()))
-                    .sum::<u64>();
-            }
-            Ok(Self {
-                total,
-                available: total.saturating_sub(held),
-            })
+/// For tests of eviction only: a file system of `total` bytes that holds nothing but
+/// the store's object files (every file under `objects/` counts, header included).
+#[doc(hidden)]
+#[must_use]
+pub fn objects_source(total: u64) -> SpaceSource {
+    Arc::new(move |objects: &Path| {
+        let mut held = 0_u64;
+        for shard in entries(objects)? {
+            // A file deleted since the listing holds nothing.
+            held += entries(&shard)?
+                .iter()
+                .map(|f| fs::metadata(f).map_or(0, |m| m.len()))
+                .sum::<u64>();
+        }
+        Ok(Space {
+            total,
+            available: total.saturating_sub(held),
         })
-    }
+    })
 }
 
 /// The store's free space against its floor ([`FsStore::room`]).
@@ -210,7 +189,7 @@ impl FsStore {
     /// # Errors
     /// The directory cannot be created, locked or read, or a leftover cannot be removed.
     pub fn open(dir: &Path, floor: Floor) -> Result<Self, FsStoreError> {
-        Self::open_with_space(dir, floor, Space::statvfs())
+        Self::open_with_space(dir, floor, statvfs_source())
     }
 
     /// [`FsStore::open`], with the file system's size and free space read from `space`
@@ -332,15 +311,6 @@ impl FsStore {
     pub async fn refused_full(&self) {
         self.inner.full.notified().await;
     }
-}
-
-/// The real file systems: `statvfs` of `objects`.
-fn statvfs(objects: &Path) -> io::Result<Space> {
-    let stat = rustix::fs::statvfs(objects)?;
-    Ok(Space {
-        total: stat.f_blocks.saturating_mul(stat.f_frsize),
-        available: stat.f_bavail.saturating_mul(stat.f_frsize),
-    })
 }
 
 impl Inner {

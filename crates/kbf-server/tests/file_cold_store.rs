@@ -1,5 +1,5 @@
-//! The `kbf-server` binary with `--blob-dir` and `--meta-log=raft`: blob bytes in a
-//! local directory, an index in a Raft log, both kept across a restart. Every check
+//! The `kbf-server` binary with a `file://` `--cold-store` and a `--meta-dir`: blob bytes
+//! in a local directory, an index in a Raft log, both kept across a restart. Every check
 //! goes through the REAPI surface of a real process.
 
 #![cfg(unix)]
@@ -57,21 +57,21 @@ impl Dirs {
         }
     }
 
-    /// `kbf-server --blob-dir <blobs> --meta-log=raft --raft-dir <raft>` on free ports,
-    /// with a floor of one byte: the default floor depends on the disk the tests run
-    /// on, and under twice it the evictor would take what a test reads back.
+    /// `kbf-server --cold-store file://<blobs> --meta-dir <raft>` on free ports, with a
+    /// floor of one byte: the default floor depends on the disk the tests run on, and
+    /// under twice it the evictor would take what a test reads back.
     fn server(&self) -> Command {
         let mut c = self.unfloored();
-        c.args(["--blob-dir-min-free-bytes", "1"]);
+        c.args(["--cold-store-floor-bytes", "1"]);
         c
     }
 
     /// [`Dirs::server`] without a floor.
     fn unfloored(&self) -> Command {
         let mut c = Command::new(BIN);
-        c.arg("--blob-dir")
-            .arg(&self.blobs)
-            .args(["--meta-log", "raft", "--raft-dir"])
+        c.arg("--cold-store")
+            .arg(format!("file://{}", self.blobs.display()))
+            .arg("--meta-dir")
             .arg(&self.raft)
             .args(ANY_PORT)
             // The heartbeat interval the fake daemon expects.
@@ -222,7 +222,7 @@ fn pattern(len: u32) -> Vec<u8> {
 }
 
 /// Catches a farm on one host that loses its blobs at a restart: the store in memory,
-/// as without `--blob-dir` (and `--meta-log=raft` refuses that pairing outright), or a
+/// as a store with no directory would be, or a
 /// blob directory that is not where the objects went, or that the next start does not
 /// read. The action-cache entry must still be a hit after the restart (its result blob
 /// is read back to answer it), and every blob, a 3 MiB one included, must read back
@@ -325,48 +325,18 @@ async fn a_lost_object_is_forgotten_at_start_and_a_corrupt_one_on_read() {
     dirs.remove();
 }
 
-/// Catches `--blob-dir` accepted with a store it would silently replace (`--store`, the
-/// S3 flags), or under `--meta-log=memory`, whose index a restart forgets while the
-/// files stay with nothing to delete them; a second server sharing a running server's
-/// blob directory; and a directory that cannot be created, taken as started. Each
-/// exits 2 and says why.
+/// Catches a second server sharing a running server's cold store directory (its own
+/// metadata directory does not make it a different store), and a directory that cannot
+/// be created taken as started. Each exits 2 and says why.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn blob_dir_refuses_what_it_cannot_keep() {
+async fn a_file_cold_store_refuses_what_it_cannot_keep() {
     let dirs = Dirs::new("refused");
-    let others: [&[&str]; 5] = [
-        &["--store", "memory"],
-        &["--store", "s3"],
-        &["--s3-endpoint", "http://127.0.0.1:9"],
-        &["--s3-bucket", "b"],
-        &["--s3-prefix", "x/"],
-    ];
-    for other in others {
-        let mut c = dirs.server();
-        c.args(other);
-        let (code, stderr) = fails(c);
-        assert_eq!(code, Some(2), "{other:?}");
-        assert!(stderr.contains("--blob-dir"), "{other:?}: {stderr}");
-        assert!(
-            stderr.contains("cannot be used with"),
-            "{other:?}: {stderr}"
-        );
-    }
-
-    let mut memory = Command::new(BIN);
-    memory.arg("--blob-dir").arg(&dirs.blobs).args(ANY_PORT);
-    let (code, stderr) = fails(memory);
-    assert_eq!(code, Some(2));
-    assert!(
-        stderr.contains("--blob-dir needs --meta-log=raft"),
-        "{stderr}"
-    );
-
     let (server, client) = started(dirs.server()).await;
     let mut second = Command::new(BIN);
     second
-        .arg("--blob-dir")
-        .arg(&dirs.blobs)
-        .args(["--meta-log", "raft", "--raft-dir"])
+        .arg("--cold-store")
+        .arg(format!("file://{}", dirs.blobs.display()))
+        .arg("--meta-dir")
         .arg(dirs.root.join("raft-2"))
         .args(ANY_PORT);
     let (code, stderr) = fails(second);
@@ -380,9 +350,9 @@ async fn blob_dir_refuses_what_it_cannot_keep() {
     std::fs::write(&file, b"not a directory").expect("plant a file");
     let mut under_a_file = Command::new(BIN);
     under_a_file
-        .arg("--blob-dir")
-        .arg(file.join("blobs"))
-        .args(["--meta-log", "raft", "--raft-dir"])
+        .arg("--cold-store")
+        .arg(format!("file://{}", file.join("blobs").display()))
+        .arg("--meta-dir")
         .arg(dirs.root.join("raft-3"))
         .args(ANY_PORT);
     let (code, stderr) = fails(under_a_file);
@@ -392,11 +362,11 @@ async fn blob_dir_refuses_what_it_cannot_keep() {
 }
 
 /// Catches an action-cache hit served after the store lost one of its output files
-/// (deleted under `--blob-dir` while the server was down): the index still holds the
-/// output until the start-up pass forgets it with the entry, or a check of the store
-/// at the hit marks it. The client must get a miss (the action runs again), not a
-/// result whose output it cannot download, and FindMissing must report the output,
-/// so it is uploaded again.
+/// (deleted under a `file://` cold store while the server was down): the index still
+/// holds the output until the start-up pass forgets it with the entry, or a check of
+/// the store at the hit marks it. The client must get a miss (the action runs again),
+/// not a result whose output it cannot download, and FindMissing must report the
+/// output, so it is uploaded again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_hit_whose_output_file_is_lost_is_a_miss_after_a_restart() {
     let dirs = Dirs::new("lost-output");
@@ -425,14 +395,14 @@ async fn a_hit_whose_output_file_is_lost_is_a_miss_after_a_restart() {
     dirs.remove();
 }
 
-/// Catches a store that writes past its free-space floor (`--blob-dir-min-free-bytes`):
+/// Catches a store that writes past its free-space floor (`--cold-store-floor-bytes`):
 /// with a floor no file system meets, an upload is answered UNAVAILABLE and nothing is
 /// indexed. The other tests run at the default floor.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn uploads_are_refused_under_the_free_space_floor() {
     let dirs = Dirs::new("floor");
     let mut c = dirs.unfloored();
-    c.args(["--blob-dir-min-free-bytes", &u64::MAX.to_string()]);
+    c.args(["--cold-store-floor-bytes", &u64::MAX.to_string()]);
     let (server, client) = started(c).await;
     let blob = Blob::new("a blob with no room");
     let response = ContentAddressableStorageClient::new(client.channel())
@@ -459,7 +429,7 @@ async fn uploads_are_refused_under_the_free_space_floor() {
     dirs.remove();
 }
 
-/// Catches a full blob directory that stops taking uploads: a write refused for want of
+/// Catches a full `file://` cold store that stops taking uploads: a write refused for want of
 /// room that does not wake the evictor (mutant: no nudge; the next round is the 10 s
 /// tick, after every retry of the PUT has failed), an evictor that frees nothing, or
 /// one that evicts what was used last. On a file system of 16 MiB that holds only the
@@ -471,9 +441,9 @@ async fn fills_past_floor_and_keeps_serving() {
     const MIB: u32 = 1 << 20;
     let dirs = Dirs::new("fills");
     let mut c = dirs.unfloored();
-    c.args(["--blob-dir-size-bytes", &(16 * MIB).to_string()])
-        .args(["--blob-dir-min-free-bytes", &(4 * MIB).to_string()])
-        .args(["--blob-dir-evict-grace-ms", "0"]);
+    c.args(["--cold-store-size-bytes", &(16 * MIB).to_string()])
+        .args(["--cold-store-floor-bytes", &(4 * MIB).to_string()])
+        .args(["--cold-store-evict-grace-ms", "0"]);
     let (server, client) = started(c).await;
     let blobs: Vec<Blob> = (0..20_u32)
         .map(|i| {

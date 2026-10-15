@@ -1,4 +1,4 @@
-//! The start-up consistency pass under `--blob-dir` (`docs/deploy/storage-node.md`,
+//! The start-up consistency pass over a `file://` cold store (`docs/deploy/storage-node.md`,
 //! "The start-up pass"): `kbf-front`'s [`Cache::consistency_pass`] spawned once the
 //! write tier is attached, never awaited before the server binds or reports ready;
 //! then, in the same task, the evictor ([`Cache::evict_round`] every [`EVICT_EVERY`],
@@ -17,7 +17,7 @@ use kbf_objstore::{FsStore, ObjectStore};
 use crate::RaftMetaLog;
 
 /// What a failed pass logs.
-const PASS_FAILED: &str = "start-up pass over the blob directory failed; the next start runs it again, and \
+const PASS_FAILED: &str = "start-up pass over the cold store directory failed; the next start runs it again, and \
      nothing is evicted until then";
 
 /// What a failed round of eviction logs.
@@ -116,7 +116,7 @@ pub(crate) fn spawn<M: MetaLog, O: ObjectStore + 'static>(
                     withheld = report.withheld,
                     held_bytes = report.held_bytes(),
                     duration_ms = report.duration.as_millis() as u64,
-                    "start-up pass over the blob directory done"
+                    "start-up pass over the cold store directory done"
                 );
                 cache.seed_recency(&report.held);
                 loop {
@@ -195,17 +195,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         let (blobs, raft) = (root.join("blobs"), root.join("raft"));
         let args = Args::parse_from([
-            "kbf-server".as_ref(),
-            "--blob-dir".as_ref(),
-            blobs.as_os_str(),
-            "--meta-log".as_ref(),
-            "raft".as_ref(),
-            "--raft-dir".as_ref(),
-            raft.as_os_str(),
-            "--listen".as_ref(),
-            "127.0.0.1:0".as_ref(),
-            "--worker-listen".as_ref(),
-            "127.0.0.1:0".as_ref(),
+            "kbf-server".to_owned(),
+            format!("--cold-store=file://{}", blobs.display()),
+            format!("--meta-dir={}", raft.display()),
+            "--listen=127.0.0.1:0".to_owned(),
+            "--worker-listen=127.0.0.1:0".to_owned(),
         ]);
         let files = FsStore::open(&blobs, Floor::Bytes(1)).expect("open the store");
         let log = RaftMetaLog::open_dir(&raft, Retention::default(), "kbf/")
@@ -237,12 +231,14 @@ mod tests {
             let _ = held.await;
         });
 
+        let id = log.log_id();
         let assembled = assemble(
             &args,
+            None,
             log,
             files.clone(),
             prefix,
-            None,
+            id,
             || Ok(std::future::pending::<()>()),
             Some(pass),
         );
@@ -388,7 +384,7 @@ mod tests {
     }
 
     /// What every line the pass ends with says.
-    const PASS_LINES: &[u8] = b"pass over the blob directory";
+    const PASS_LINES: &[u8] = b"pass over the cold store directory";
 
     /// Log lines written by the test's subscriber, and a wake-up when a line holding
     /// the text waited for is written.

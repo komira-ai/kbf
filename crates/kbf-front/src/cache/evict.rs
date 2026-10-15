@@ -34,7 +34,7 @@ pub const EVICT_EVERY: Duration = Duration::from_secs(10);
 
 /// What a round that evicted something logs.
 const EVICTED: &str =
-    "evicted the least recently used objects: the blob directory is short of room";
+    "evicted the least recently used objects: the cold store directory is short of room";
 
 /// When each object of the store was last used. Off (and empty) until
 /// [`Cache::track_recency`]. Also whether the evictor has said it is off for want of

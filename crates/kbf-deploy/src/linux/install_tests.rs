@@ -229,8 +229,7 @@ fn a_first_install_writes_everything_and_a_rerun_plans_nothing() {
     let tail = [
         "mkdir /var/lib/kbf-server (0755)".to_owned(),
         format!("mkdir /var/lib/kbf-server/raft (0700, owner {uid}:{gid})"),
-        "mkdir /var/lib/kbf (0755)".to_owned(),
-        format!("mkdir /var/lib/kbf/leases (0700, owner {uid}:{gid})"),
+        format!("mkdir /var/lib/kbf (0755, owner {uid}:{gid})"),
         "run /usr/bin/systemctl daemon-reload".to_owned(),
         "run /usr/bin/systemctl enable kbf-server.service kbf-daemon.service".to_owned(),
         "run /usr/bin/systemctl restart kbf-server.service kbf-daemon.service".to_owned(),
@@ -583,9 +582,9 @@ fn each_missing_prerequisite_is_refused_with_its_fix() {
             |e| matches!(e, HostError::NotExecutable(p) if p.as_str() == "/opt/new/kbf-server"),
         ),
         (
-            "a server without --raft-dir",
-            |_, w| w.borrow_mut().help_lacks = Some("--raft-dir"),
-            |e| matches!(e, HostError::NoFlag { flag, .. } if flag == "--raft-dir"),
+            "a server without --meta-dir",
+            |_, w| w.borrow_mut().help_lacks = Some("--meta-dir"),
+            |e| matches!(e, HostError::NoFlag { flag, .. } if flag == "--meta-dir"),
         ),
         (
             "a daemon without --actions-memory-max-gib",
@@ -762,26 +761,6 @@ fn uninstall_moves_the_units_aside_and_a_rerun_plans_nothing() {
     );
 }
 
-/// Catches a Raft directory made for a server that keeps its index in memory.
-#[test]
-fn an_in_memory_server_gets_no_raft_directory() {
-    let (exec, _) = host("install-memory");
-    let text = EXAMPLE.replace("KBF_META_LOG=raft", "KBF_META_LOG=memory");
-    let a = Install {
-        config: LinuxConfig::parse(&text).expect("valid settings"),
-        ..install()
-    };
-    let got = steps(&plan(&exec, &a, &mut Vec::new()).expect("plan"));
-    let raft = got
-        .iter()
-        .any(|s| s.starts_with("mkdir /var/lib/kbf-server"));
-    assert!(!raft, "{got:#?}");
-    let scratch = got
-        .iter()
-        .any(|s| s.starts_with("mkdir /var/lib/kbf/leases (0700"));
-    assert!(scratch, "{got:#?}");
-}
-
 /// The scratch host as a [`FakeExec`] with the same entries and tools, so a test can
 /// give a file an owner the test's own user cannot give it (`chown` needs root).
 fn fake_of(exec: ScratchHost) -> FakeExec {
@@ -910,14 +889,16 @@ fn a_replaced_binary_is_kept_as_roots() {
     assert_eq!(fake.entries.get(&previous), Some(&kept));
 }
 
-/// Catches the Raft and scratch directories made or kept as root's (the owner of the
+/// Catches the metadata and data directories made or kept as root's (the owner of the
 /// files root writes) instead of their service's user's, which could then not write
 /// its log or its builds. The scratch tests cannot see it: they run with one user as
 /// root and as both services. Here kbf is 2001:2002 and kbf-server 3001:3002, the
-/// directories are missing, and the apply must make each 0700 with its user's owner;
-/// a re-run must then plan nothing (a directory kept as its user's is left alone).
+/// directories are missing, and the apply must make the metadata directory 0700 and
+/// the data directory 0755 (a rootless container's root must search it), each with
+/// its user's owner; a re-run must then plan nothing (a directory kept as its user's
+/// is left alone).
 #[test]
-fn the_raft_and_scratch_directories_are_their_users_not_roots() {
+fn the_meta_and_data_directories_are_their_users_not_roots() {
     let (mut exec, world) = host("install-owner-dirs");
     go(&mut exec, &install(), Mode::Apply);
     let kbf = Owner {
@@ -956,17 +937,17 @@ fn the_raft_and_scratch_directories_are_their_users_not_roots() {
     let mut fake = fake_of(exec);
     fake.entries.extend(keys);
     let raft = HostPath::new("/var/lib/kbf-server/raft").expect("path");
-    let leases = HostPath::new("/var/lib/kbf/leases").expect("path");
+    let data = HostPath::new("/var/lib/kbf").expect("path");
     fake.entries.remove(&raft);
-    fake.entries.remove(&leases);
+    fake.entries.remove(&data);
 
     run(&mut fake, &install(), Mode::Apply, &mut Vec::new()).expect("apply");
-    let dir = |owner| Entry::Dir {
-        perms: Perms::new(0o700),
+    let dir = |mode, owner| Entry::Dir {
+        perms: Perms::new(mode),
         owner,
     };
-    assert_eq!(fake.entries.get(&raft), Some(&dir(server)));
-    assert_eq!(fake.entries.get(&leases), Some(&dir(kbf)));
+    assert_eq!(fake.entries.get(&raft), Some(&dir(0o700, server)));
+    assert_eq!(fake.entries.get(&data), Some(&dir(0o755, kbf)));
 
     let mut out = Vec::new();
     run(&mut fake, &install(), Mode::DryRun, &mut out).expect("re-run");

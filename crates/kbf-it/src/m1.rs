@@ -239,8 +239,13 @@ impl Cell {
     fn start_server(&self, pki: &PkiFiles) -> Result<Process, CellError> {
         let mut server = Command::new(self.bin_dir.join("kbf-server"));
         server
-            .args(["--store", "s3", "--s3-endpoint", &self.s3_endpoint])
-            .args(["--s3-bucket", &self.bucket, "--s3-conditional-put"])
+            .arg("--cold-store")
+            .arg(format!(
+                "s3://{}?endpoint={}&conditional-put=true",
+                self.bucket, self.s3_endpoint
+            ))
+            .arg("--meta-dir")
+            .arg(self.work.join("server-meta"))
             .args(["--listen", REAPI, "--worker-listen", WORKER])
             .arg("--worker-tls-cert")
             .arg(&pki.server_cert)

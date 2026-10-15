@@ -509,6 +509,7 @@ fn the_binary_refuses_to_start_with_a_mismatched_reapi_key() {
             "--reapi-tls-key",
             &path(&pki.dir, "client.key"),
         ])
+        .args(stores("tls-mismatch"))
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
@@ -530,4 +531,22 @@ fn the_binary_refuses_to_start_with_a_mismatched_reapi_key() {
         .expect("stdout");
     assert_eq!(status.code(), Some(2));
     assert!(stdout.is_empty(), "start line printed: {stdout}");
+}
+
+/// `--cold-store` and `--meta-dir` flags over fresh directories named for `name`, under the
+/// target directory: every start of the binary needs both.
+fn stores(name: &str) -> [String; 4] {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+    let next_store = || NEXT.fetch_add(1, Ordering::Relaxed);
+    let base = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join("kbf-server-stores")
+        .join(format!("{name}-{}-{}", std::process::id(), next_store()));
+    let _ = std::fs::remove_dir_all(&base);
+    [
+        "--cold-store".to_owned(),
+        format!("file://{}", base.join("cold").display()),
+        "--meta-dir".to_owned(),
+        base.join("meta").display().to_string(),
+    ]
 }
