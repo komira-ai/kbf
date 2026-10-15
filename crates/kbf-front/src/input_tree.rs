@@ -155,16 +155,15 @@ impl Lru {
                 used,
             },
         );
-        while self.entries.len() > self.config.max_entries.get()
-            || self.bytes > self.config.max_bytes
+        while self.over_bound()
+            && let Some((_, oldest)) = self.order.pop_first()
         {
-            let Some((_, oldest)) = self.order.pop_first() else {
-                break;
-            };
-            if let Some(gone) = self.entries.remove(&oldest) {
-                self.bytes -= gone.cost;
-            }
+            self.bytes -= self.entries.remove(&oldest).map_or(0, |gone| gone.cost);
         }
+    }
+
+    fn over_bound(&self) -> bool {
+        self.entries.len() > self.config.max_entries.get() || self.bytes > self.config.max_bytes
     }
 
     /// Records that `digest` was verified until `until`, never lowering an earlier
@@ -216,14 +215,15 @@ impl InputTrees {
 
 /// What checking one directory found.
 #[derive(Debug)]
-struct Verdict {
-    /// Absent directories at or under this one.
-    dirs: BTreeSet<Digest>,
-    /// Absent files at or under this one (not those under an absent directory).
-    files: BTreeSet<Digest>,
-    /// When nothing is absent: the farm time until which everything under this
-    /// directory stays held.
-    until: Option<FarmTime>,
+enum Verdict {
+    /// Everything at and under it is held, until this farm time.
+    Held { until: FarmTime },
+    /// Something is not: directories at or under it that are absent, and files (not
+    /// those under an absent directory).
+    Absent {
+        dirs: BTreeSet<Digest>,
+        files: BTreeSet<Digest>,
+    },
 }
 
 type Answer = Arc<Result<Verdict, CacheError>>;
@@ -282,13 +282,15 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         });
         let _clear = ClearOnDrop(Arc::clone(&walk));
         let answer = visit(&walk, root).await;
-        match &*answer {
-            Ok(v) => Ok(Walked {
-                absent: v.dirs.iter().chain(&v.files).copied().collect(),
-                dirs_read: walk.dirs_read.load(Ordering::Relaxed),
-            }),
-            Err(e) => Err(e.clone()),
-        }
+        let absent = match &*answer {
+            Ok(Verdict::Held { .. }) => Vec::new(),
+            Ok(Verdict::Absent { dirs, files }) => dirs.iter().chain(files).copied().collect(),
+            Err(e) => return Err(e.clone()),
+        };
+        Ok(Walked {
+            absent,
+            dirs_read: walk.dirs_read.load(Ordering::Relaxed),
+        })
     }
 }
 
@@ -315,11 +317,7 @@ fn visit<M: MetaLog, O: ObjectStore>(walk: &Arc<Walk<M, O>>, digest: Digest) -> 
     let verified = trees.lru().get(&digest).and_then(|(_, until)| until);
     if let Some(until) = verified.filter(|until| *until > walk.now) {
         metrics.input_dirs_skipped.add(1);
-        let flight = answered(Verdict {
-            dirs: BTreeSet::new(),
-            files: BTreeSet::new(),
-            until: Some(until),
-        });
+        let flight = answered(Verdict::Held { until });
         memo.insert(digest, flight.clone());
         return flight;
     }
@@ -349,10 +347,9 @@ fn answered(verdict: Verdict) -> Flight {
 }
 
 fn absent_dir(digest: Digest) -> Verdict {
-    Verdict {
+    Verdict::Absent {
         dirs: BTreeSet::from([digest]),
         files: BTreeSet::new(),
-        until: None,
     }
 }
 
@@ -392,29 +389,27 @@ async fn check<M: MetaLog, O: ObjectStore>(
     };
     let children: Vec<Flight> = decoded.dirs.iter().map(|c| visit(walk, *c)).collect();
     let (files, children) = join(absent_files(cache, &decoded.files), join_all(children)).await;
-    let mut verdict = Verdict {
-        dirs: BTreeSet::new(),
-        files: files?.into_iter().collect(),
-        until: Some(walk.until),
-    };
+    let mut until = walk.until;
+    let mut absent_dirs = BTreeSet::new();
+    let mut absent_files: BTreeSet<Digest> = files?.into_iter().collect();
     for child in children {
         match &*child {
             Err(e) => return Err(e.clone()),
-            Ok(child) => {
-                verdict.dirs.extend(&child.dirs);
-                verdict.files.extend(&child.files);
-                verdict.until = verdict.until.zip(child.until).map(|(a, b)| a.min(b));
+            Ok(Verdict::Held { until: held }) => until = until.min(*held),
+            Ok(Verdict::Absent { dirs, files }) => {
+                absent_dirs.extend(dirs);
+                absent_files.extend(files);
             }
         }
     }
-    if verdict.dirs.is_empty() && verdict.files.is_empty() {
-        if let Some(until) = verdict.until {
-            cache.input_trees().lru().verified(&digest, until);
-        }
-    } else {
-        verdict.until = None;
+    if absent_dirs.is_empty() && absent_files.is_empty() {
+        cache.input_trees().lru().verified(&digest, until);
+        return Ok(Verdict::Held { until });
     }
-    Ok(verdict)
+    Ok(Verdict::Absent {
+        dirs: absent_dirs,
+        files: absent_files,
+    })
 }
 
 /// The files of one directory that are not held; those that are, are touched.
@@ -447,3 +442,7 @@ fn decode(digest: &Digest, bytes: &[u8]) -> Result<Decoded, CacheError> {
         .map_err(invalid)?;
     Ok(Decoded { files, dirs })
 }
+
+#[cfg(test)]
+#[path = "input_tree_tests.rs"]
+mod tests;
