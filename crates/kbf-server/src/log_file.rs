@@ -280,3 +280,28 @@ where
         .with(fmt::layer().with_writer(stderr))
         .with(file.map(|file| fmt::layer().with_ansi(false).with_writer(file)))
 }
+
+/// Installs the process's tracing subscriber for `args`: every event to stderr and, when
+/// [`Args::log_dir`] names a directory, also to its [`LogFile`]. Then one INFO line says
+/// which. Called once by the `kbf-server` binary after the flags are parsed; a
+/// subscriber already installed keeps its place. `try_init`, not `set_global_default`:
+/// it also routes `log` records (rustls's) into the subscriber.
+pub fn init(args: &crate::Args) {
+    use tracing_subscriber::util::SubscriberInitExt as _;
+    let log_dir = args.log_dir();
+    let file = log_dir
+        .as_deref()
+        .map(|dir| LogFile::open(dir, args.log_max_bytes, args.log_files));
+    let _ = subscriber(std::io::stderr, file).try_init();
+    match &log_dir {
+        Some(dir) => tracing::info!(
+            dir = %dir.display(),
+            max_bytes = args.log_max_bytes,
+            files = args.log_files,
+            "durable log file on, besides stderr"
+        ),
+        None => tracing::info!(
+            "no durable log file, stderr only: give --log-dir, or --hot-store file:///dir for <dir>/log"
+        ),
+    }
+}

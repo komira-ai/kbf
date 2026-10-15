@@ -47,31 +47,12 @@ use std::error::Error;
 use std::process::ExitCode;
 
 use clap::Parser;
-use kbf_server::log_file::{LogFile, subscriber};
 use kbf_server::{Args, interrupted, sizes_on, start};
 use kbf_threads::Topology;
-use tracing_subscriber::util::SubscriberInitExt;
 
 fn main() -> ExitCode {
     let args = Args::parse();
-    let log_dir = args.log_dir();
-    let file = log_dir
-        .as_deref()
-        .map(|dir| LogFile::open(dir, args.log_max_bytes, args.log_files));
-    // `try_init`, not `set_global_default`: it also routes `log` records (rustls's) into
-    // the subscriber. A subscriber already set (none is, in the binary) keeps its place.
-    let _ = subscriber(std::io::stderr, file).try_init();
-    match &log_dir {
-        Some(dir) => tracing::info!(
-            dir = %dir.display(),
-            max_bytes = args.log_max_bytes,
-            files = args.log_files,
-            "durable log file on, besides stderr"
-        ),
-        None => tracing::info!(
-            "no durable log file, stderr only: give --log-dir, or --hot-store file:///dir for <dir>/log"
-        ),
-    }
+    kbf_server::log_file::init(&args);
     match serve(&args) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
