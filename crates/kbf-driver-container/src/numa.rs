@@ -181,26 +181,20 @@ pub fn start(
     let nodes = match read_nodes(nodes_dir) {
         Ok(nodes) => nodes,
         Err(why) => {
-            tracing::info!(
-                "lease placement numa-node: no NUMA topology ({why}); leases are not pinned"
-            );
+            tracing::info!("lease placement numa-node: no topology ({why}); not pinned");
             return Ok(None);
         }
     };
-    if usable(&nodes, None).len() < 2 {
-        tracing::info!(
-            "lease placement numa-node: this host has {} NUMA node(s) with CPUs; leases are not pinned",
-            usable(&nodes, None).len()
-        );
+    let found = usable(&nodes, None).len();
+    if found < 2 {
+        tracing::info!("lease placement numa-node: {found} node(s) with CPUs; not pinned");
         return Ok(None);
     }
     let allowed = delegate::enable_cpuset(cgroup_root, actions)?;
     let usable = usable(&nodes, allowed.as_ref());
-    if usable.len() < 2 {
-        tracing::info!(
-            "lease placement numa-node: the daemon's cpuset reaches {} NUMA node(s); leases are not pinned",
-            usable.len()
-        );
+    let reached = usable.len();
+    if reached < 2 {
+        tracing::info!("lease placement numa-node: cpuset reaches {reached} node(s); not pinned");
         return Ok(None);
     }
     let shown: Vec<String> = usable

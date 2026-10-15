@@ -796,3 +796,19 @@ fn an_empty_or_unreadable_effective_cpuset_is_told_apart() {
         "{error}"
     );
 }
+
+/// Catches an `actions` cgroup made directly under the root (`--cgroup-parent=/actions`)
+/// failing on its parent: the root is the parent, already enabling `cpuset`.
+#[test]
+fn an_actions_cgroup_under_the_root_has_the_root_as_its_parent() {
+    let fake = Fake::host(UNIT, "cpuset cpu io memory pids", &[41]);
+    fake.mkdir("/actions").expect("made");
+    enable_cpuset_in(&fake, "/actions").expect("enabled");
+    assert_eq!(
+        fake.log(),
+        [
+            "mkdir /actions",
+            "/actions/cgroup.subtree_control <- +cpuset"
+        ]
+    );
+}

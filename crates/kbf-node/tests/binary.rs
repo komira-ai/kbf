@@ -606,7 +606,7 @@ fn numa_node_placement_on_a_one_node_host_runs_unplaced() {
         read(&unit.join("cgroup.subtree_control")),
         "+cpu +memory +pids"
     );
-    assert_eq!(log.matches("leases are not pinned").count(), 1, "{log}");
+    assert_eq!(log.matches("; not pinned").count(), 1, "{log}");
 }
 
 /// `--lease-placement=numa-node` with a driver that runs no containers is refused (also

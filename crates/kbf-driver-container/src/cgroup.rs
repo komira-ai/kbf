@@ -243,14 +243,12 @@ impl LeaseCgroup {
     /// `cpuset.mems`, and hands `cpuset` to the container's cgroup, which inherits both.
     pub(crate) fn create(&self, resources: Resources, pin: Option<&Pin>) -> io::Result<()> {
         std::fs::create_dir(&self.dir)?;
-        self.write(
-            "cgroup.subtree_control",
-            if pin.is_some() {
-                SUBTREE_PINNED
-            } else {
-                SUBTREE
-            },
-        )?;
+        let subtree = if pin.is_some() {
+            SUBTREE_PINNED
+        } else {
+            SUBTREE
+        };
+        self.write("cgroup.subtree_control", subtree)?;
         // Before the container exists, so nothing in the lease ever runs without it.
         self.write("memory.oom.group", "1")?;
         if let Some(max) = memory_max(resources.memory_bytes) {
