@@ -14,7 +14,10 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use common::{Blob, DAY, days};
-use kbf_front::{Cache, CacheError, ENTRY_OVERHEAD, InputTreeConfig, MemoryMetaLog, VerifiedBlob};
+use kbf_front::{
+    Cache, CacheError, ENTRY_OVERHEAD, InputTreeConfig, MemoryMetaLog, MetaLog, MetaLogError,
+    VerifiedBlob,
+};
 use kbf_meta::Retention;
 use kbf_objstore::{
     ByteRange, Capabilities, KeyPrefix, ListPage, ListToken, MemoryStore, ObjectKey, ObjectStore,
@@ -107,18 +110,55 @@ impl ObjectStore for Counting {
     }
 }
 
-type TestCache = Cache<MemoryMetaLog, Counting>;
+/// A memory metadata log whose queries can be made to fail after a number of them.
+struct Flaky {
+    inner: MemoryMetaLog,
+    queries_left: AtomicUsize,
+}
+
+impl Flaky {
+    fn new() -> Self {
+        Self {
+            inner: MemoryMetaLog::new(Retention::default()),
+            queries_left: AtomicUsize::new(usize::MAX),
+        }
+    }
+
+    /// The next `n` queries answer; every one after that fails.
+    fn fail_after(&self, n: usize) {
+        self.queries_left.store(n, Ordering::SeqCst);
+    }
+}
+
+impl MetaLog for Flaky {
+    async fn commit(&self, command: kbf_meta::Command) -> Result<kbf_meta::Applied, MetaLogError> {
+        self.inner.commit(command).await
+    }
+
+    async fn query<R, F>(&self, f: F) -> Result<R, MetaLogError>
+    where
+        F: FnOnce(&kbf_meta::MetaState) -> R + Send,
+        R: Send,
+    {
+        let left = self.queries_left.load(Ordering::SeqCst);
+        if left == 0 {
+            return Err(MetaLogError::Unavailable("down".to_owned()));
+        }
+        if left != usize::MAX {
+            self.queries_left.store(left - 1, Ordering::SeqCst);
+        }
+        self.inner.query(f).await
+    }
+}
+
+type TestCache = Cache<Flaky, Counting>;
 
 async fn cache_with(config: InputTreeConfig) -> (Arc<TestCache>, Counting) {
     let store = Counting::new();
-    let cache = Cache::open(
-        MemoryMetaLog::new(Retention::default()),
-        store.clone(),
-        KeyPrefix::default(),
-    )
-    .await
-    .expect("open the cache")
-    .with_input_trees(config);
+    let cache = Cache::open(Flaky::new(), store.clone(), KeyPrefix::default())
+        .await
+        .expect("open the cache")
+        .with_input_trees(config);
     (Arc::new(cache), store)
 }
 
@@ -573,6 +613,38 @@ async fn unreadable_and_malformed_directories_fail_the_check() {
         .await
         .expect_err("bad digest");
     assert!(matches!(error, CacheError::Invalid(_)), "{error:?}");
+}
+
+/// Catches: a metadata log that cannot answer turned into "missing" (or into a pass):
+/// at the start of the check, while a directory's files are asked about, and while a
+/// directory taken from memory is looked at.
+#[tokio::test]
+async fn a_metadata_log_that_cannot_answer_fails_the_check() {
+    let (cache, _store) = cache().await;
+    let data = file("data");
+    let leaf = dir(&[&data], &[]);
+    put(&cache, &[&data, &leaf]).await;
+    let unavailable = |e: CacheError| matches!(e, CacheError::Meta(_));
+
+    // Its first query is the farm time.
+    cache.meta().fail_after(0);
+    assert!(unavailable(
+        cache.missing_inputs(leaf.digest).await.expect_err("down")
+    ));
+    // The directory read answers (one query); the question about its files does not.
+    cache.meta().fail_after(2);
+    assert!(unavailable(
+        cache.missing_inputs(leaf.digest).await.expect_err("down")
+    ));
+
+    // A directory known from memory: the farm time answers, the look at its blob does not.
+    cache.meta().fail_after(usize::MAX);
+    assert!(walk(&cache, &leaf).await.is_empty());
+    cache.tick(days(8)).await.expect("tick");
+    cache.meta().fail_after(1);
+    assert!(unavailable(
+        cache.missing_inputs(leaf.digest).await.expect_err("down")
+    ));
 }
 
 /// Catches: a verification recorded against a directory the bound already evicted

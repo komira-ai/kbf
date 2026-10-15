@@ -155,15 +155,28 @@ impl Lru {
                 used,
             },
         );
-        while self.over_bound()
-            && let Some((_, oldest)) = self.order.pop_first()
-        {
-            self.bytes -= self.entries.remove(&oldest).map_or(0, |gone| gone.cost);
-        }
+        self.evict();
     }
 
-    fn over_bound(&self) -> bool {
-        self.entries.len() > self.config.max_entries.get() || self.bytes > self.config.max_bytes
+    /// Drops the least recently used directories until the bounds hold.
+    fn evict(&mut self) {
+        let (max_entries, max_bytes) = (self.config.max_entries.get(), self.config.max_bytes);
+        let (mut entries, mut bytes) = (self.entries.len(), self.bytes);
+        let victims: Vec<(u64, Digest)> = self
+            .order
+            .iter()
+            .take_while(|(_, digest)| {
+                let over = entries > max_entries || bytes > max_bytes;
+                entries = entries.saturating_sub(1);
+                bytes = bytes.saturating_sub(self.entries.get(*digest).map_or(0, |e| e.cost));
+                over
+            })
+            .map(|(tick, digest)| (*tick, *digest))
+            .collect();
+        for (tick, digest) in victims {
+            self.order.remove(&tick);
+            self.bytes -= self.entries.remove(&digest).map_or(0, |gone| gone.cost);
+        }
     }
 
     /// Records that `digest` was verified until `until`, never lowering an earlier
