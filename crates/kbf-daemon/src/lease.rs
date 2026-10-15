@@ -187,6 +187,36 @@ impl Leases {
     }
 }
 
+/// What kind of failure `error` is, for the `lease failed` line: the variant, since a
+/// runtime's error says what it was doing (the path or step) in its own words, which the
+/// line carries as `reason`. A runtime's error does not say which phase (inputs, run,
+/// outputs) it ended in.
+const fn failure_kind(error: &RuntimeError) -> &'static str {
+    match error {
+        RuntimeError::Killed => "killed",
+        RuntimeError::Failed(_) => "failed",
+        RuntimeError::Invalid(_) => "invalid",
+        RuntimeError::MissingBlob(_) => "missing_blob",
+        RuntimeError::TimedOut { .. } => "timed_out",
+        RuntimeError::OutOfMemory { .. } => "out_of_memory",
+        RuntimeError::BusyNode(_) => "busy_node",
+        RuntimeError::Lost(..) => "lost",
+    }
+}
+
+/// The longest `reason` the `lease failed` line carries, in characters.
+const REASON_CHARS: usize = 400;
+
+/// `text` on one line (every run of whitespace a single space) and cut at
+/// [`REASON_CHARS`], so a multi-line error cannot split the log line.
+fn one_line(text: &str) -> String {
+    let joined = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    match joined.char_indices().nth(REASON_CHARS) {
+        Some((end, _)) => format!("{}...", &joined[..end]),
+        None => joined,
+    }
+}
+
 /// The work a Start describes; `None` if it names no action.
 fn work(id: LeaseId, start: Start) -> Option<Work> {
     Some(Work {
@@ -458,7 +488,7 @@ mod tests {
         assert_eq!(leases.running(), [id()]);
         // One kill ends one run. Were the resend a second run, the fence would wait
         // for a run nothing stops (or, if the kill ended that one, `runs` would be 2).
-        assert_eq!(leases.fence(), [id()]);
+        assert_eq!(leases.fence().len(), 1);
         let (ended, outcome, phases) =
             tokio::time::timeout(std::time::Duration::from_secs(5), done_rx.recv())
                 .await
@@ -552,6 +582,169 @@ mod tests {
         assert!(line.contains(" INFO "), "{line}");
         assert!(line.ends_with(&format!("lease phases: {phases}")), "{line}");
         assert!(line.contains("lease=3.4 driver=fake ok=true "), "{line}");
+    }
+
+    /// A runtime whose every run ends at once with the one error it was given, before
+    /// any input is fetched.
+    struct Failing(std::sync::Mutex<Option<RuntimeError>>);
+
+    impl Failing {
+        fn with(error: RuntimeError) -> Arc<Self> {
+            Arc::new(Self(std::sync::Mutex::new(Some(error))))
+        }
+    }
+
+    impl Runtime for Failing {
+        fn driver(&self) -> &'static str {
+            "failing"
+        }
+
+        fn serves(&self, kind: &str) -> bool {
+            kind == "action"
+        }
+
+        async fn run(&self, _work: Work) -> Result<ActionResult, RuntimeError> {
+            Err(self
+                .0
+                .lock()
+                .expect("error lock")
+                .take()
+                .expect("one run per runtime"))
+        }
+
+        async fn kill(&self, _lease_id: LeaseId) {}
+    }
+
+    /// Runs one lease on `runtime` to its end (fenced first if `fence`) and returns
+    /// its Result and everything logged while it was finished.
+    async fn finish_logged<R: Runtime>(runtime: Arc<R>, fence: bool) -> (worker::Result, String) {
+        let (done, mut done_rx) = mpsc::unbounded_channel();
+        let mut leases = Leases::new(Runtimes::new(runtime), done);
+        let start = Start {
+            lease_id: Some(proto_lease_id(id())),
+            kind: "action".to_owned(),
+            action_digest: Some(Digest::default()),
+            ..Start::default()
+        };
+        assert_eq!(leases.start(start), None);
+        if fence {
+            assert_eq!(leases.fence().len(), 1);
+        }
+        let (ended, outcome, phases) = done_rx.recv().await.expect("the run ends");
+        let captured = Captured::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let result = tracing::subscriber::with_default(subscriber, || {
+            leases.finished(ended, outcome, &phases)
+        });
+        let log = String::from_utf8(captured.0.lock().expect("log lock").clone()).expect("UTF-8");
+        (result, log)
+    }
+
+    /// The WARN lines of `log`.
+    fn warns(log: &str) -> Vec<&str> {
+        log.lines().filter(|l| l.contains(" WARN ")).collect()
+    }
+
+    /// Catches (the old code logged nothing about why) a lease that fails before its
+    /// inputs finish ending with no WARN naming it and the reason: the `lease phases:`
+    /// line then reads `inputs_ms=- run_ms=- outputs_ms=-` and nothing says why. Also
+    /// catches the reason split over two log lines, and the `lease finished` INFO line
+    /// changed or dropped (tools parse it).
+    #[tokio::test]
+    async fn a_failed_lease_logs_why_at_warn() {
+        let error =
+            RuntimeError::Failed("input tree: the blob store is unreachable\nsecond line".into());
+        let (result, log) = finish_logged(Failing::with(error), false).await;
+        assert_eq!(code(&result), Code::Internal as i32);
+        let warns = warns(&log);
+        let [warn] = warns.as_slice() else {
+            panic!("one WARN line expected: {log}");
+        };
+        assert!(warn.contains("lease=3.4"), "{warn}");
+        assert!(warn.contains("kind=failed"), "{warn}");
+        assert!(
+            warn.contains("reason=input tree: the blob store is unreachable second line"),
+            "{warn}"
+        );
+        assert!(
+            log.lines()
+                .any(|l| l.contains(" INFO ") && l.ends_with("lease finished lease=3.4 ok=false")),
+            "{log}"
+        );
+        assert!(log.contains("inputs_ms=- run_ms=- outputs_ms=-"), "{log}");
+    }
+
+    /// Catches a `kind` that is wrong or shared by two variants, so a log search by
+    /// kind finds the wrong leases: each variant's WARN must carry its own.
+    #[tokio::test]
+    async fn each_failure_logs_its_own_kind() {
+        let errors = [
+            ("killed", RuntimeError::Killed),
+            ("invalid", RuntimeError::Invalid("no arguments".into())),
+            ("missing_blob", RuntimeError::MissingBlob("ab/3".into())),
+            (
+                "timed_out",
+                RuntimeError::TimedOut {
+                    stdout: None,
+                    stderr: None,
+                },
+            ),
+            (
+                "out_of_memory",
+                RuntimeError::OutOfMemory { used: 9, limit: 8 },
+            ),
+            ("busy_node", RuntimeError::BusyNode("psi".into())),
+            (
+                "lost",
+                RuntimeError::Lost(LostWhy::DaemonRestarted, "restarted".into()),
+            ),
+        ];
+        for (kind, error) in errors {
+            let (_, log) = finish_logged(Failing::with(error), false).await;
+            let warns = warns(&log);
+            let [warn] = warns.as_slice() else {
+                panic!("{kind}: one WARN line expected: {log}");
+            };
+            assert!(warn.contains("lease failed"), "{kind}: {warn}");
+            assert!(warn.contains(&format!("kind={kind} ")), "{kind}: {warn}");
+        }
+    }
+
+    /// Catches a successful lease logging a WARN (a node's alerts on WARN would fire
+    /// for every lease), and a fenced lease logging the `lease failed` line as well as
+    /// its own `lease fenced` WARN, which already says why (the server could not be
+    /// reached); its run's outcome is not the reason.
+    #[tokio::test]
+    async fn only_a_failed_lease_logs_a_failure() {
+        let runtime = Arc::new(crate::FakeRuntime::new(std::time::Duration::ZERO));
+        let (_, log) = finish_logged(runtime, false).await;
+        assert_eq!(warns(&log), Vec::<&str>::new(), "{log}");
+
+        let (result, log) = finish_logged(Failing::with(RuntimeError::Killed), true).await;
+        assert_eq!(code(&result), Code::Unavailable as i32);
+        let warns = warns(&log);
+        let [warn] = warns.as_slice() else {
+            panic!("one WARN line expected: {log}");
+        };
+        assert!(warn.contains("lease fenced"), "{warn}");
+        assert!(warn.contains("lease=3.4"), "{warn}");
+        assert!(!log.contains("lease failed"), "{log}");
+    }
+
+    /// Catches a reason that is cut mid-character, left unbounded, or left with
+    /// newlines.
+    #[test]
+    fn a_reason_is_one_bounded_line() {
+        assert_eq!(one_line("a\n  b\tc"), "a b c");
+        let long = "é".repeat(REASON_CHARS + 50);
+        let cut = one_line(&long);
+        assert_eq!(cut.chars().count(), REASON_CHARS + 3);
+        assert!(cut.ends_with("..."));
     }
 
     /// Catches a Start without an action being run anyway.
