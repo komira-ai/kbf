@@ -24,9 +24,6 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use crate::delegate::{self, DelegateError};
 
-/// Where the kernel lists NUMA nodes (`node<N>/cpulist`).
-pub const SYSFS_NODES: &str = "/sys/devices/system/node";
-
 /// How leases are placed on the node's CPUs (`--lease-placement`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum LeasePlacement {

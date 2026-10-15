@@ -225,7 +225,7 @@ pub struct Cli {
     #[arg(long, default_value = "none", value_parser = ["none", "numa-node"], value_name = "none|numa-node")]
     lease_placement: String,
     /// Where the kernel lists NUMA nodes (container). For tests of the placement only.
-    #[arg(long, hide = true, default_value = kbf_driver_container::numa::SYSFS_NODES)]
+    #[arg(long, hide = true, default_value = "/sys/devices/system/node")]
     numa_dir: PathBuf,
     /// The OCI runtime `--container-runtime=oci` runs actions with (container).
     #[arg(long, default_value = "/usr/bin/crun")]
