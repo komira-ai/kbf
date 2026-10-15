@@ -224,6 +224,37 @@ its neighbours, whose bytes checked, are served.
 the stored `ActionResult`. A result blob that cannot be read or decoded is a miss.
 Outputs are never inlined into the response.
 
+### Input tree check
+
+Execute's input check (`Cache::missing_inputs`) walks the input root `Directory` and
+reports every blob under it that is not held. Two memories, in the server's RAM, derived
+from the metadata and never in the log (a restart starts both empty), keep a build from
+paying for the same toolchain on every action:
+
+- **Decoded directories**, by digest: the file and subdirectory digests of each
+  Directory read. A digest names its content, so an entry is never stale. A least
+  recently used cache bounded by `--input-tree-cache-entries` and
+  `--input-tree-cache-bytes`.
+- **A verified-until farm time per directory.** A check that finds a directory and
+  everything under it held, having touched every blob it relied on, records
+  `until = now + min_ttl`, with `now` read before the check's first report. A touched
+  blob is held for at least `min_ttl` from the report ([Retention and
+  touches](#retention-and-touches)), so until then a later check skips the directory
+  without reading or asking. At or after `until` it checks again and touches again. A
+  directory resting on a skipped subtree takes the earlier of the two times. The
+  guarantee is the process's own: it rests on touches pending in this server, which a
+  collection commits before it collects, and a restart forgets both memories together.
+  With more than one server, a server's pending touches are not seen by a collection
+  another server runs; the skip is then right only while no other server collects (none
+  does today), and the touches would have to reach the leader first.
+
+Subdirectories are checked concurrently, with at most
+`--input-tree-reads-in-flight` store reads at once across all requests. A directory
+being checked for one request is waited for, not checked again, by any other that reaches
+it. A directory whose blob is gone is reported, and nothing under it is looked at.
+`kbf_input_*` in `docs/api.md#get-metrics` count what was read, taken from memory,
+skipped, and joined.
+
 ## Segments
 
 A segment (`kbf-segments`) packs many blobs into one object, so the store holds a few

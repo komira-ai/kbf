@@ -182,6 +182,11 @@ fn every_family_is_printed_once_with_its_type() {
             "kbf_segment_bytes histogram",
             "kbf_object_get_seconds histogram",
             "kbf_meta_query_seconds histogram",
+            "kbf_input_walk_seconds histogram",
+            "kbf_input_directories_read_total counter",
+            "kbf_input_directories_cached_total counter",
+            "kbf_input_directories_skipped_total counter",
+            "kbf_input_directories_joined_total counter",
             "kbf_meta_commit_seconds histogram",
         ]
     );

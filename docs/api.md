@@ -244,6 +244,11 @@ caller goes away before the answer counts as an error.
 | `kbf_object_get_seconds` | histogram | one range GET of a blob being read (ByteStream Read, GetActionResult, a BatchReadBlobs run); footer reads are not in it |
 | `kbf_meta_commit_seconds{command}` | histogram | every metadata-log commit the cache makes, by command (`put_blobs`, `touch`, `put_action`, `object_unreachable`, `tick`, `collect`, ...): with `--meta-log=raft`, the Raft log's commit latency |
 | `kbf_meta_query_seconds` | histogram | every metadata-log query the cache makes |
+| `kbf_input_walk_seconds` | histogram | one check of an Execute's input tree, whole: from the root Directory to the answer, the reads, the presence checks and any wait for a check another request is running |
+| `kbf_input_directories_read_total` | counter | Directory blobs the input check read from the store |
+| `kbf_input_directories_cached_total` | counter | Directories the input check took from the decoded-directory cache: the blob is touched and its presence checked, nothing is read |
+| `kbf_input_directories_skipped_total` | counter | Directories skipped with everything under them: an earlier check verified them and the retention guarantee of that check still runs |
+| `kbf_input_directories_joined_total` | counter | Directories found being checked for another request, and waited for |
 
 Latency buckets run from 1 ms to 60 s; size buckets from 1 KiB to 1 GiB by fours;
 the blobs-per-segment buckets from 1 to 16384 by fours.

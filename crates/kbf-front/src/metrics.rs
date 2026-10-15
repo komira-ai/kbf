@@ -360,6 +360,19 @@ pub struct CacheMetrics {
     pub commit: [Histogram; COMMANDS.len()],
     /// Every metadata-log query the cache makes.
     pub query: Histogram,
+    /// One check of an Execute's input tree ([`crate::Cache::missing_inputs`]), whole.
+    pub input_walk: Histogram,
+    /// Directory blobs the input check read from the store.
+    pub input_dirs_read: Counter,
+    /// Directories the input check took from the decoded-directory cache, touching the
+    /// blob but reading nothing.
+    pub input_dirs_cached: Counter,
+    /// Directories (each with everything under it) the input check skipped because an
+    /// earlier check verified them and their retention guarantee still runs.
+    pub input_dirs_skipped: Counter,
+    /// Directories the input check found already being checked for another request and
+    /// waited for instead of checking again.
+    pub input_dirs_joined: Counter,
 }
 
 impl Default for CacheMetrics {
@@ -381,6 +394,11 @@ impl Default for CacheMetrics {
             object_get: Histogram::new(Unit::Seconds),
             commit: std::array::from_fn(|_| Histogram::new(Unit::Seconds)),
             query: Histogram::new(Unit::Seconds),
+            input_walk: Histogram::new(Unit::Seconds),
+            input_dirs_read: Counter::default(),
+            input_dirs_cached: Counter::default(),
+            input_dirs_skipped: Counter::default(),
+            input_dirs_joined: Counter::default(),
         }
     }
 }
@@ -469,10 +487,43 @@ impl CacheMetrics {
                 "Metadata-log queries the cache makes",
                 &self.query,
             ),
+            (
+                "kbf_input_walk_seconds",
+                "One check of an Execute's input tree: directories read or taken from memory, \
+                 skipped subtrees, and the FindMissingBlobs-style presence checks",
+                &self.input_walk,
+            ),
         ];
         for (name, help, histogram) in histograms {
             out.head(name, "histogram", help);
             histogram.render(&mut out.0, name, "");
+        }
+        for (name, help, counter) in [
+            (
+                "kbf_input_directories_read_total",
+                "Directory blobs an Execute's input check read from the store",
+                &self.input_dirs_read,
+            ),
+            (
+                "kbf_input_directories_cached_total",
+                "Directories an input check took from the decoded-directory cache, touching \
+                 the blob and reading nothing",
+                &self.input_dirs_cached,
+            ),
+            (
+                "kbf_input_directories_skipped_total",
+                "Directories an input check skipped with everything under them: verified \
+                 earlier, retention guarantee still running",
+                &self.input_dirs_skipped,
+            ),
+            (
+                "kbf_input_directories_joined_total",
+                "Directories an input check found being checked for another request and \
+                 waited for",
+                &self.input_dirs_joined,
+            ),
+        ] {
+            out.counter(name, help, counter.get());
         }
         let name = "kbf_meta_commit_seconds";
         out.head(
