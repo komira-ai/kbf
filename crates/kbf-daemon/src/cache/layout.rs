@@ -102,7 +102,7 @@ impl Key {
 
     /// The mode an entry of this key has.
     #[must_use]
-    pub fn mode(&self) -> u32 {
+    pub fn mode(&self) -> rustix::fs::RawMode {
         if self.executable { 0o555 } else { 0o444 }
     }
 }

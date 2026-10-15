@@ -419,6 +419,90 @@ fn first_fit_books_cpu_and_memory_on_live_workers() {
     assert_eq!(g3.worker, w("c"));
 }
 
+/// A request for one core and `memory` bytes, number `n`.
+fn sized(n: u8, memory: u64) -> Request {
+    Request {
+        resources: Resources::new(1_000, memory),
+        ..request(n)
+    }
+}
+
+/// Catches: an action's memory booked against the node's memory, so that a node whose
+/// cores and lease count allow 80 actions runs only floor(175 / 4) = 43 when each is
+/// first run under a 4 GiB limit. The limit is not a booking: the node takes work up to
+/// its CPUs whatever the limits add up to, and the sum is only recorded.
+#[test]
+fn memory_limits_summing_past_the_node_do_not_keep_actions_out() {
+    let mut h = Harness::new();
+    h.worker("a", 80_000, 175 * GIB);
+    for n in 0..100 {
+        h.submit(u64::from(n), sized(n, 4 * GIB));
+    }
+    let grants = h.tick();
+    assert_eq!(grants.len(), 80, "one per core, not one per 4 GiB of 175");
+    assert_eq!(
+        h.s.booked(&w("a")),
+        Some(Resources::new(80_000, 320 * GIB)),
+        "the limits sum to more than the node's memory"
+    );
+    assert_eq!(h.s.queued().count(), 20);
+    // A lease that ends opens its core, and only its core.
+    h.commit_and_start(&grants[0]);
+    h.finish(&grants[0], ok(0));
+    assert_eq!(h.tick().len(), 1);
+}
+
+/// Catches: a limit larger than the node's memory placed on it (an action that asks for
+/// more than the node has would run under a limit it can never reach), and a node
+/// skipped for a limit it has the memory for.
+#[test]
+fn an_action_goes_only_to_a_node_with_the_memory_of_its_limit() {
+    let mut h = Harness::new();
+    h.worker("a", 8_000, 8 * GIB);
+    h.worker("b", 8_000, 64 * GIB);
+    h.submit(1, sized(1, 16 * GIB));
+    let [g1] = h.tick().try_into().unwrap();
+    assert_eq!(g1.worker, w("b"), "a has 8 GiB, the limit is 16");
+    h.submit(2, sized(2, 8 * GIB));
+    let [g2] = h.tick().try_into().unwrap();
+    assert_eq!(g2.worker, w("a"), "8 GiB is the whole of a, and a is empty");
+}
+
+/// Catches: the last step of the memory ladder (a limit of the node's whole memory) run
+/// beside other leases, which the booking of all its memory used to prevent and which
+/// must hold now that memory is not booked: it waits for a node with no lease, nothing
+/// else is placed on the node while it runs, and the node is open again when it ends.
+#[test]
+fn an_action_at_the_whole_node_memory_runs_alone() {
+    let mut h = Harness::new();
+    h.worker("a", 8_000, 16 * GIB);
+    h.submit(1, sized(1, GIB));
+    let [small] = h.tick().try_into().unwrap();
+    h.commit_and_start(&small);
+    h.submit(2, sized(2, 16 * GIB));
+    assert!(h.tick().is_empty(), "placed beside a running lease");
+    h.finish(&small, ok(1));
+    let [whole] = h.tick().try_into().unwrap();
+    assert_eq!(whole.operation, OperationId(1));
+    h.commit_and_start(&whole);
+    h.submit(3, sized(3, GIB));
+    assert!(h.tick().is_empty(), "placed beside the whole node's lease");
+    h.finish(&whole, ok(2));
+    let [after] = h.tick().try_into().unwrap();
+    assert_eq!(after.operation, OperationId(2));
+}
+
+/// Catches: a request for no memory read as the whole of a node that reports none, which
+/// would run it alone.
+#[test]
+fn a_request_for_no_memory_is_not_the_whole_node() {
+    let mut h = Harness::new();
+    h.worker("a", 2_000, 0);
+    h.submit(1, sized(1, 0));
+    h.submit(2, sized(2, 0));
+    assert_eq!(h.tick().len(), 2);
+}
+
 /// Catches: dedup that joins across instance names (another namespace's work answered
 /// with this one's result), joins networked or `do_not_cache` work, misses a twin, or
 /// joins a finished operation.

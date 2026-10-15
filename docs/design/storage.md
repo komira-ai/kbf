@@ -61,9 +61,9 @@ location in any other store fails `INTERNAL`.
 
 The front reaches it only through the `MetaLog` trait: `commit` a command and get back
 what applying it did, or run a read-only `query`. `MemoryMetaLog` is one state behind a
-lock in the server process. `RaftMetaLog` (`--meta-log=raft`, in
+lock in the server process. `RaftMetaLog` (in
 `kbf-server/src/raft_log`) exists today as a **single-voter** Raft log on the local
-disk in `--raft-dir`, and needs `--store=s3` or `--blob-dir`: `commit` encodes the command, proposes
+disk in `--meta-dir` (or `<hot store>/meta`), which is what the binary always runs: `commit` encodes the command, proposes
 it, syncs it, applies it and only then answers. Commits are grouped: commands that
 arrive while a sync is in progress are written together and made durable by the next
 single sync, and each is answered after it; a lone command is committed at once. The
@@ -159,9 +159,9 @@ format-2 log refuses it on encode and decode. Nothing commits it yet; it is for
 eviction under disk pressure and for a start-up pass that finds index entries with no
 object behind them.
 
-Today, under `--meta-log=raft`, the server commits a `Tick` every second while the log
+Today, under the Raft metadata log, the server commits a `Tick` every second while the log
 is open (`raft_log::TICK`), so the metadata's farm time advances and continues across
-restarts. Under `--meta-log=memory` nothing advances it, and the index is lost at
+restarts. Under the in-memory metadata log (tests only) nothing advances it, and the index is lost at
 restart. In neither mode does the server run `Collect`, so nothing expires while it
 runs. **Planned**: collection runs on a schedule.
 
@@ -209,10 +209,10 @@ most 16 MiB of blob data (`MAX_BATCH_TOTAL_BYTES`; the gRPC message limit is 17 
 
 Object keys are `<prefix>cas/<epoch>/<seq>`, each as 16 lowercase hex digits. Two
 caches over one metadata log hold different epochs, so they never name the same key.
-Under `--meta-log=memory` the metadata is in memory and starts again from epoch 1 at
-every start, so with `--store=s3` each server start writes under its own prefix (the
+Under the in-memory metadata log (tests only) the metadata is in memory and starts again from epoch 1 at
+every start, so with an S3 cold store each server start writes under its own prefix (the
 configured prefix plus the start time), and keys never collide across restarts. Under
-`--meta-log=raft` the epochs are committed in the Raft log, so every start writes
+the Raft metadata log the epochs are committed in the Raft log, so every start writes
 under the one prefix the log committed (the configured prefix plus the log id) in an
 epoch no earlier start used.
 
@@ -342,7 +342,7 @@ normalisation between kbf and a store can turn one key into another.
 
 - `MemoryStore`: in memory; the executable form of the contract and the store tests
   use.
-- `FsStore` (`kbf-server --blob-dir`): a directory on the local disk, for a farm on
+- `FsStore` (`kbf-server --cold-store=file:///dir`): a directory on the local disk, for a farm on
   one host without an S3 service. One file per object under `objects/<hh>/<h>`, `<h>`
   the SHA-256 of the key in hex and `<hh>` its first two digits; the file is a header
   naming the key, then the object's bytes. A write goes to a file in `tmp/`, synced,

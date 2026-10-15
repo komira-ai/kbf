@@ -18,9 +18,9 @@
 //!   the cap on builds is the daemon's `actions/memory.max`, and CPU is not capped.
 //! - `actions`: `--actions-memory-max-gib` is RAM - (MinIO + kbf-server + OS) and
 //!   `--supervisor-memory-min-mib` is the daemon's `MemoryMin=`.
-//! - `server`: `--store=s3` with an endpoint and the key in `EnvironmentFile=` (none on
-//!   the command line or in `Environment=`), both `--reapi-tls-*` flags, and
-//!   `--meta-log=raft` with a `--raft-dir` outside the build scratch.
+//! - `server`: `--cold-store=s3://...` with an `endpoint=` and the key in
+//!   `EnvironmentFile=` (none on the command line or in `Environment=`), both
+//!   `--reapi-tls-*` flags, and a `--meta-dir` outside the daemon's data directory.
 //! - `image`: the daemon's `--image=` values are `KBF_IMAGES`, each as `docker://<entry>`,
 //!   and each passes kbf-daemon's own parser (any other value makes it exit 2 at start).
 //!
@@ -31,7 +31,7 @@ use std::path::Path;
 
 use kbf_types::ImageRef;
 
-use super::config::{LinuxConfig, MetaLog};
+use super::config::LinuxConfig;
 use super::render::{DAEMON, DROP_IN, SERVER, SLICE};
 use crate::template::leftovers;
 use crate::unit::{UnitError, UnitFile};
@@ -352,11 +352,14 @@ fn check(c: &LinuxConfig, files: [&File; 4], installable: bool) -> Report {
 
     // server
     let flag = |name| server.unit.flag(name).unwrap_or_default();
-    if flag("store") != "s3" {
-        fail("server", "kbf-server needs --store=s3 (MinIO)".to_owned());
-    }
-    if flag("s3-endpoint").is_empty() {
-        fail("server", "kbf-server has no --s3-endpoint".to_owned());
+    let cold = flag("cold-store");
+    if !cold.starts_with("s3://") {
+        fail(
+            "server",
+            "kbf-server needs --cold-store=s3://... (MinIO)".to_owned(),
+        );
+    } else if !cold.contains("endpoint=") {
+        fail("server", "--cold-store has no endpoint= query".to_owned());
     }
     if server.service("EnvironmentFile").is_none_or(str::is_empty) {
         fail(
@@ -390,25 +393,15 @@ fn check(c: &LinuxConfig, files: [&File; 4], installable: bool) -> Report {
                 .to_owned(),
         );
     }
-    match server.unit.flag("meta-log") {
-        Some("raft") => {
-            let rd = flag("raft-dir");
-            if rd.is_empty() {
-                fail("server", "--meta-log=raft without --raft-dir".to_owned());
-            } else if Path::new(rd).starts_with(c.scratch_dir.as_str()) {
-                let scratch = &c.scratch_dir;
-                fail(
-                    "server",
-                    format!("--raft-dir={rd} is under the build scratch {scratch}"),
-                );
-            }
-        }
-        None if c.meta_log == MetaLog::Memory => {}
-        None => fail(
+    let meta = flag("meta-dir");
+    if meta.is_empty() {
+        fail("server", "kbf-server has no --meta-dir".to_owned());
+    } else if Path::new(meta).starts_with(c.data_dir.as_str()) {
+        let data = &c.data_dir;
+        fail(
             "server",
-            "kbf-server has no --meta-log=raft (KBF_META_LOG=raft)".to_owned(),
-        ),
-        Some(other) => fail("server", format!("--meta-log={other} is not raft")),
+            format!("--meta-dir={meta} is under the daemon's data directory {data}"),
+        );
     }
 
     // image

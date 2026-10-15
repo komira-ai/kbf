@@ -154,14 +154,15 @@ pub async fn materialize_phased(
 
 /// [`materialize`] through the node's input cache (`crate::cache`): the tree's
 /// directories and symlinks are made as without it, and each file is a hard link to a
-/// cache entry, filled from the CAS on a miss (see `cache::lease` for the fallbacks).
+/// cache entry (a clone of one on macOS), filled from the CAS on a miss (see
+/// `cache::lease` for the fallbacks).
 /// A file at or under one of `private` (paths from `dir`, checked: each output path
 /// as seen from the input root) gets a private, writable copy instead, so a driver may
 /// hand it to the action to change. Returns what the inputs cost.
 ///
 /// # Errors
 /// As [`materialize`]; an error of the cache itself never fails it.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub async fn materialize_cached(
     cas: &impl Cas,
     cache: &crate::cache::Cache,
@@ -177,7 +178,7 @@ pub async fn materialize_cached(
 ///
 /// # Errors
 /// As [`materialize_cached`].
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub async fn materialize_cached_phased(
     cas: &impl Cas,
     cache: &crate::cache::Cache,

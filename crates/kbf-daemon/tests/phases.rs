@@ -347,8 +347,21 @@ async fn a_lease_accounts_for_its_time_and_its_transfers() {
             "outputs_ms",
             "output_files",
             "output_dirs",
+            // Appended after the existing keys; `-` here, the local runtime having no
+            // lease cgroup.
+            "cpu_usage_us",
+            "cpu_user_us",
+            "cpu_system_us",
+            "cpu_periods",
+            "cpu_throttled",
+            "throttled_us",
+            "mem_peak",
+            "parallelism",
+            "numa_bytes",
+            "numa_spread",
         ]
     );
+    assert!(line.ends_with(" cpu_usage_us=- cpu_user_us=- cpu_system_us=- cpu_periods=- cpu_throttled=- throttled_us=- mem_peak=- parallelism=- numa_bytes=- numa_spread=-"), "{line}");
     assert!(line.contains(&format!(" run_ms={run} ")), "{line}");
 }
 

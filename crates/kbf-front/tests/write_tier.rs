@@ -571,7 +571,7 @@ async fn flushed_copies_are_evicted_least_recently_read_first() {
 }
 
 /// Catches: a wrong mount or a lost `TIER` file destroying the index (the start must
-/// be refused and change nothing); `--write-tier-abandon` naming another tier
+/// be refused and change nothing); `--hot-store-abandon` naming another tier
 /// accepted; and abandoned blobs answered `NOT_FOUND` or with other bytes instead of
 /// `Unavailable` until a re-upload heals them.
 #[tokio::test]

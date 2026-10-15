@@ -33,10 +33,9 @@ MINIO_S3_ENDPOINT=http://127.0.0.1:9000
 KBF_S3_BUCKET=kbf-cas
 
 # --- kbf-server ---
-# raft: a single-voter Raft log in KBF_RAFT_DIR. memory: the index in memory.
-KBF_META_LOG=raft
-# On local disk, on a partition apart from build scratch, swap and MinIO's data.
-KBF_RAFT_DIR=/var/lib/kbf-server/raft
+# kbf-server's --meta-dir: the metadata log (a single-voter Raft log). On local disk, on
+# a partition apart from the daemon's data directory, swap and MinIO's data.
+KBF_META_DIR=/var/lib/kbf-server/raft
 KBF_SERVER_USER=kbf-server
 KBF_REAPI_PORT=8980
 KBF_WORKER_PORT=8981
@@ -44,7 +43,8 @@ KBF_API_PORT=8982
 
 # --- kbf-daemon ---
 KBF_USER=kbf
-KBF_SCRATCH_DIR=/var/lib/kbf/leases
+# kbf-daemon's --data-dir: leases/, cache/ and trees/ under it, sized from its filesystem.
+KBF_DATA_DIR=/var/lib/kbf
 # Pinned images, space-separated, each <repo>@sha256:<64 hex> of one architecture's
 # manifest, without docker://. Each becomes the daemon's --image=docker://<entry>,
 # which it checks at start. Empty: no --image flag.

@@ -1,4 +1,4 @@
-//! `RaftMetaLog`, the metadata log of `--meta-log=raft`, over an in-memory raft
+//! `RaftMetaLog`, the metadata log `kbf-server` runs, over an in-memory raft
 //! directory (`FaultFs`) that a test can restart, crash at any operation, or fill by
 //! hand. Each test names the defect it catches.
 
@@ -9,10 +9,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use kbf_front::{MetaLog, MetaLogError};
-use kbf_log::{Bootstrap, FarmLogId, Format, LogCommand, MachineVersion, Takeover};
+use kbf_log::{Bootstrap, DecodeError, FarmLogId, Format, LogCommand, MachineVersion, Takeover};
 use kbf_meta::{
-    Applied, BlobWrite, Command, Epoch, Evicted, Location, ObjectId, Retention, ServerId, StoreId,
-    TierId,
+    ActionAnswer, ActionRecord, Applied, BlobAnswer, BlobWrite, Closure, Command, Epoch, Evicted,
+    Location, MetaState, ObjectId, Retention, Role, ServerId, StagedObject, StagedPut, StoreId,
+    TierId, UnreachableReason,
 };
 use kbf_raft::{Entry, LogId, LogIndex, Payload, Snapshot, Storage};
 use kbf_server::raft_log::{RECORD, RECORD_TMP, TICK};
@@ -657,6 +658,196 @@ async fn raising_the_machine_version_to_3_lets_evict_objects_commit_and_lasts() 
         log.commit(evict()).await,
         Ok(Applied::Evicted(Evicted::default()))
     );
+}
+
+fn blob_digest(n: u8) -> Digest {
+    Digest::new(DigestFunction::Sha256, [n; 32], 7)
+}
+
+fn at(epoch: u64, seq: u64, offset: u64) -> Location {
+    Location {
+        store: StoreId::new(0),
+        object: ObjectId::new(Epoch::new(epoch), seq),
+        offset,
+    }
+}
+
+type Answers = (
+    [BlobAnswer; 4],
+    ActionAnswer,
+    Option<TierId>,
+    Option<StagedObject>,
+    Option<UnreachableReason>,
+    MetaState,
+);
+
+/// What a reader of the state asks after a restart: the blobs, the action, the tier
+/// and the staged object by name, and the whole state, which also holds the marks
+/// (whose generations are entry indexes) and the farm time.
+fn answers(m: &MetaState, object: ObjectId) -> Answers {
+    (
+        [1, 2, 3, 4].map(|n| m.blob(&blob_digest(n))),
+        m.action(&blob_digest(9)),
+        m.tier(ServerId::new(1)),
+        m.staged(object).cloned(),
+        m.unreachable(ObjectId::new(Epoch::new(1), 7)),
+        m.clone(),
+    )
+}
+
+/// Format 3's first condition, a version-2 log still opens: a log
+/// at machine version 2, written by this binary with format-1 and format-2 commands,
+/// reopens under this binary (which runs version 3) at version 2, replays to the same
+/// answers, and still refuses `EvictObjects` until it is raised explicitly. Catches:
+/// an open that raises the log to what the binary runs (mutant: `MetaMachine::new`
+/// starts at `runs`; the version reads 3), and a replay that applies an old entry
+/// otherwise than it applied live (the whole state is compared; mutant: replayed
+/// entries executed at index 0, which moves the mark's generation). After a second
+/// restart an explicit raise to 3 changes no answer and lets the evict commit.
+#[tokio::test(start_paused = true)]
+async fn a_version_2_log_reopens_at_version_2_with_the_same_answers() {
+    let evict = || Command::EvictObjects {
+        objects: [ObjectId::new(Epoch::new(1), 1)].into(),
+    };
+    let staged = ObjectId::new(Epoch::new(1), 5);
+    let fs = FaultFs::new();
+    let log = open(&fs, 7).await;
+    let e = epoch(&log).await;
+    assert_eq!(e, 1);
+    // Format 1: PutBlob, PutBlobs, PutAction, ObjectUnreachable.
+    let format_1 = [
+        Command::PutBlob {
+            digest: blob_digest(1),
+            location: at(e, 1, 0),
+        },
+        Command::PutBlobs(vec![
+            (blob_digest(2), at(e, 1, 7)),
+            (blob_digest(3), at(e, 2, 0)),
+        ]),
+        Command::PutAction {
+            role: Role::Daemon,
+            action: blob_digest(9),
+            record: ActionRecord {
+                result: blob_digest(1),
+                closure: [blob_digest(2)].into_iter().collect::<Closure>(),
+            },
+        },
+        Command::ObjectUnreachable {
+            object: ObjectId::new(Epoch::new(e), 7),
+            reason: UnreachableReason::Missing,
+        },
+    ];
+    for command in format_1 {
+        let applied = log.commit(command.clone()).await;
+        assert!(
+            matches!(
+                applied,
+                Ok(Applied::Blob(Ok(_))
+                    | Applied::Blobs(Ok(_))
+                    | Applied::Action(Ok(()))
+                    | Applied::Marked(Ok(())))
+            ),
+            "{command:?}: {applied:?}"
+        );
+    }
+    log.raise_machine_version(MachineVersion::V2)
+        .expect("a raise");
+    // Format 2: AddTier, PutStaged, SealStaged.
+    assert_eq!(log.commit(add_tier()).await, Ok(Applied::Tier(Ok(()))));
+    let put_staged = Command::PutStaged {
+        tier: TierId::new(1),
+        objects: vec![StagedPut {
+            object: staged,
+            end: 7,
+            seal: false,
+            blobs: vec![(blob_digest(4), 0)],
+        }],
+    };
+    assert!(
+        matches!(log.commit(put_staged).await, Ok(Applied::Staged(Ok(_)))),
+        "PutStaged"
+    );
+    assert_eq!(
+        log.commit(Command::SealStaged { object: staged }).await,
+        Ok(Applied::Tier(Ok(())))
+    );
+    let before = log.query(|m| answers(m, staged)).await.expect("a query");
+    drop(log);
+
+    let log = open(&fs.restart(), 7).await;
+    assert_eq!(
+        log.machine_version(),
+        MachineVersion::V2,
+        "the open raised it"
+    );
+    assert_eq!(log.query(|m| answers(m, staged)).await, Ok(before));
+    let refused = log.commit(evict()).await;
+    assert!(
+        matches!(refused, Err(MetaLogError::Unavailable(_))),
+        "{refused:?}"
+    );
+    let before = log.query(|m| answers(m, staged)).await.expect("a query");
+    drop(log);
+
+    // The second open replays the refused evict as nothing (it was never committed),
+    // and an explicit raise then takes it.
+    let log = open(&fs.restart(), 7).await;
+    assert_eq!(log.machine_version(), MachineVersion::V2);
+    assert_eq!(log.query(|m| answers(m, staged)).await, Ok(before.clone()));
+    log.raise_machine_version(MachineVersion::V3)
+        .expect("a raise");
+    assert_eq!(log.query(|m| answers(m, staged)).await, Ok(before));
+    assert!(
+        matches!(log.commit(evict()).await, Ok(Applied::Evicted(e)) if e.blobs.len() == 2),
+        "the raise did not let the evict commit"
+    );
+}
+
+/// Format 3's second condition: a node whose log is at version 2 refuses an
+/// `EvictObjects` entry loudly, never skips it. The entry is appended by hand (this
+/// binary never encodes one into a version-2 log), in format-3 bytes, after a raise to
+/// 2 and a format-2 command; both this binary (which runs 3) and one that runs only 2
+/// refuse the open at the entry's index with `UnknownCommand("MetaCommand")`, and keep
+/// refusing it. Catches: a machine that decodes every entry under format 3 (mutant:
+/// `decode(Format::V3, ..)` in `MetaMachine::apply`; the evict then applies), and one
+/// that skips an entry it cannot decode (mutant: `Err(_) => {}`; the log opens without
+/// the entry).
+#[tokio::test]
+async fn an_evict_entry_in_a_version_2_log_refuses_the_open() {
+    let fs = FaultFs::new();
+    let log = open(&fs, 8).await;
+    let e = epoch(&log).await;
+    assert_eq!(
+        log.commit(put_blob(e)).await,
+        Ok(Applied::Blob(Ok(BlobWrite::Stored)))
+    );
+    log.raise_machine_version(MachineVersion::V2)
+        .expect("a raise");
+    assert_eq!(log.commit(add_tier()).await, Ok(Applied::Tier(Ok(()))));
+    drop(log);
+    let dir = fs.restart();
+    let evict = LogCommand::Meta(Command::EvictObjects {
+        objects: [ObjectId::new(Epoch::new(e), 1)].into(),
+    });
+    let index = append(&dir, Format::V3, &evict);
+    for runs in [MachineVersion::V3, MachineVersion::V2, MachineVersion::V3] {
+        let refused = RaftMetaLog::open_running(
+            dir.restart(),
+            Retention::default(),
+            "kbf/",
+            || Ok(id(8)),
+            runs,
+        )
+        .await;
+        assert!(
+            matches!(
+                &refused,
+                Err(RaftLogError::Decode { index: i, source: DecodeError::UnknownCommand("MetaCommand") })
+                    if *i == index
+            ),
+            "running {runs:?}: {refused:?}"
+        );
+    }
 }
 
 /// Catches: a replica that takes a later `Bootstrap` over the first (a leader that died

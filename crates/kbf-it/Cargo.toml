@@ -46,6 +46,7 @@ hex.workspace = true
 kbf-front.workspace = true
 kbf-proto.workspace = true
 kbf-server.workspace = true
+kbf-threads.workspace = true
 proc-macro2.workspace = true
 prost.workspace = true
 saphyr-parser.workspace = true

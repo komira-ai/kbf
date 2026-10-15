@@ -3,7 +3,7 @@
 
 use std::collections::BTreeMap;
 
-use super::config::{LinuxConfig, MetaLog};
+use super::config::LinuxConfig;
 use crate::template::{self, TemplateError, Value, Values};
 
 /// What `render-units` writes when `--kbf-uid` is not given: the kbf user's uid (the
@@ -80,13 +80,6 @@ pub fn render(
 fn values(c: &LinuxConfig, kbf_uid: Option<u32>) -> Values {
     let slice_mib =
         (c.minio_reservation_gib + c.server_reservation_gib) * 1024 + c.daemon_memory_min_mib;
-    let meta_log = match c.meta_log {
-        MetaLog::Raft => vec![
-            "    --meta-log=raft \\".to_owned(),
-            format!("    --raft-dir={} \\", c.raft_dir),
-        ],
-        MetaLog::Memory => Vec::new(),
-    };
     // kbf-daemon --image takes docker://<repo>@sha256:<digest>; KBF_IMAGES holds the
     // bare form podman pulls.
     let images = c
@@ -132,12 +125,12 @@ fn values(c: &LinuxConfig, kbf_uid: Option<u32>) -> Values {
         ("KBF_REAPI_PORT", Value::Text(c.reapi_port.to_string())),
         ("KBF_WORKER_PORT", Value::Text(c.worker_port.to_string())),
         ("KBF_API_PORT", Value::Text(c.api_port.to_string())),
-        ("KBF_SCRATCH_DIR", Value::Text(c.scratch_dir.to_string())),
+        ("KBF_DATA_DIR", Value::Text(c.data_dir.to_string())),
+        ("KBF_META_DIR", Value::Text(c.meta_dir.to_string())),
         ("KBF_USER", Value::Text(c.user.clone())),
         ("KBF_SERVER_USER", Value::Text(c.server_user.clone())),
         ("KBF_ETC", Value::Text(c.etc.to_string())),
         ("KBF_BIN_DIR", Value::Text(c.bin_dir.to_string())),
-        ("SERVER_META_LOG_ARGS", Value::Lines(meta_log)),
         ("DAEMON_IMAGE_ARGS", Value::Lines(images)),
     ])
 }

@@ -168,6 +168,13 @@ jobs:
         run: cargo test -p kbf-deploy --test envoy_validate --locked -- --ignored
         env:
           KBF_TEST_ENVOY: ${{ runner.temp }}/tools/envoy
+      # A measurement: what an action-cache hit costs over a file store against the
+      # memory store, by stored objects per hit (crates/kbf-front/tests/measure_hit.rs).
+      # The numbers are in the log and gate nothing (runners are noisy: read the
+      # ratios); the step fails only if a timed hit is a miss or needs other than the
+      # stored objects it is labelled with.
+      - name: Measure action-cache hits (file store against memory store)
+        run: cargo test -p kbf-front --test measure_hit --release --locked -- --ignored --nocapture
       - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         if: ${{ github.ref == 'refs/heads/main' && steps.cargo-cache.outputs.cache-hit != 'true' }}
         with:
@@ -371,7 +378,7 @@ jobs:
       # The daemon's unit tests, which read its suspend-counting clock on macOS
       # (CLOCK_MONOTONIC_RAW), the fence across a suspend (issue #78), and a keeper
       # started after the binary was renamed over, which macOS finds by its path.
-      - run: cargo test -p kbf-daemon --lib --test suspend --test keeper --locked
+      - run: cargo test -p kbf-daemon --lib --test suspend --test keeper --test cache_clone --test trees_clone --locked
       # The root helper for per-lease users: its unit tests, then the helper itself run
       # as root (passwordless sudo) with real users, launchd, libproc, the sweep, the
       # leak scan and the caller check by code signature, signed as `cargo xtask

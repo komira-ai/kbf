@@ -1,6 +1,6 @@
 //! An [`ObjectStore`] in a directory on the local disk: the store of a single-host farm
 //! that keeps its blobs across a restart without an S3 service (`kbf-server
-//! --blob-dir`).
+//! --cold-store=file:///dir`).
 //!
 //! Layout under the directory:
 //!

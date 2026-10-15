@@ -2,8 +2,10 @@
 //! metadata core and storage together; the decisions are theirs.
 //!
 //! - REAPI on one listener: the cache services and `Execution` from `kbf-front`, over
-//!   a [`kbf_front::Cache`] (metadata in memory, or in a single-voter Raft log on the
-//!   local disk with `--meta-log=raft`, [`raft_log`]; an in-memory or S3 object store).
+//!   a [`kbf_front::Cache`] (metadata in a single-voter Raft log on the local disk,
+//!   [`raft_log`]; an S3 or local-directory object store, with an optional local hot
+//!   store in front of it; the flags that choose them are `--cold-store`,
+//!   `--hot-store` and `--meta-dir`, see [`stores`]).
 //! - `kbf.worker.v1` on another ([`worker`]): daemons register, heartbeat, receive
 //!   lease offers and `Start`s, and report results. Under mutual TLS a daemon's
 //!   certificate must name its node, and a deny list refuses certificates and nodes
@@ -55,6 +57,7 @@ pub mod health;
 pub mod http_blobs;
 pub mod http_invocations;
 pub mod identity;
+mod local;
 pub mod machine;
 pub mod mdm;
 mod memory;
@@ -66,16 +69,18 @@ pub mod serve;
 pub mod stamp;
 mod start;
 mod startup_pass;
+pub mod stores;
 mod timeout;
 pub mod token;
 pub mod worker;
 pub mod write_tier;
 
-pub use config::{Args, ConfigError, MetaLogKind, Role, SERVER, StoreKind};
+pub use config::{Args, ConfigError, Role, SERVER, s3_store};
 pub use farm::Farm;
 pub use health::Readiness;
 pub use identity::{DenyList, DenyListError, Peers};
 pub use kbf_sched::MemoryLadder;
+pub use local::LocalStore;
 pub use raft_log::{RaftLogError, RaftMetaLog};
 pub use serve::{
     Api, Bound, Listeners, ServeError, WorkerTls, bind_server, bind_server_with_api,

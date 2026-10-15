@@ -1,4 +1,4 @@
-//! The start-up consistency pass under `--blob-dir` (`docs/deploy/storage-node.md`,
+//! The start-up consistency pass over a `file://` cold store (`docs/deploy/storage-node.md`,
 //! "The start-up pass"): `kbf-front`'s [`Cache::consistency_pass`] spawned once the
 //! write tier is attached, never awaited before the server binds or reports ready.
 
@@ -14,7 +14,7 @@ use crate::RaftMetaLog;
 
 /// What a failed pass logs.
 const PASS_FAILED: &str =
-    "start-up pass over the blob directory failed; the next start runs it again";
+    "start-up pass over the cold store directory failed; the next start runs it again";
 
 /// A pass to run over the file store `files` once the server is assembled.
 pub(crate) struct StartPass<M> {
@@ -100,7 +100,7 @@ pub(crate) fn spawn<M: MetaLog, O: ObjectStore + 'static>(
                 withheld = report.withheld,
                 held_bytes = report.held_bytes(),
                 duration_ms = report.duration.as_millis() as u64,
-                "start-up pass over the blob directory done"
+                "start-up pass over the cold store directory done"
             ),
             Err(error) => tracing::error!(%error, "{PASS_FAILED}"),
         }
@@ -170,17 +170,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         let (blobs, raft) = (root.join("blobs"), root.join("raft"));
         let args = Args::parse_from([
-            "kbf-server".as_ref(),
-            "--blob-dir".as_ref(),
-            blobs.as_os_str(),
-            "--meta-log".as_ref(),
-            "raft".as_ref(),
-            "--raft-dir".as_ref(),
-            raft.as_os_str(),
-            "--listen".as_ref(),
-            "127.0.0.1:0".as_ref(),
-            "--worker-listen".as_ref(),
-            "127.0.0.1:0".as_ref(),
+            "kbf-server".to_owned(),
+            format!("--cold-store=file://{}", blobs.display()),
+            format!("--meta-dir={}", raft.display()),
+            "--listen=127.0.0.1:0".to_owned(),
+            "--worker-listen=127.0.0.1:0".to_owned(),
         ]);
         let files = FsStore::open(&blobs, 1).expect("open the store");
         let log = RaftMetaLog::open_dir(&raft, Retention::default(), "kbf/")
@@ -212,12 +206,14 @@ mod tests {
             let _ = held.await;
         });
 
+        let id = log.log_id();
         let assembled = assemble(
             &args,
+            None,
             log,
             files.clone(),
             prefix,
-            None,
+            id,
             || Ok(std::future::pending::<()>()),
             Some(pass),
         );
@@ -392,7 +388,7 @@ mod tests {
         fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
             let mut held = self.0.lock().unwrap_or_else(PoisonError::into_inner);
             held.extend_from_slice(bytes);
-            let last = b"pass over the blob directory";
+            let last = b"pass over the cold store directory";
             if bytes.windows(last.len()).any(|w| w == last) {
                 self.1.notify_one();
             }

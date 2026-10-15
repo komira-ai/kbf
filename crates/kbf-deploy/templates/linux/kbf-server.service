@@ -20,11 +20,8 @@ CPUWeight=300
 # mode 0600: a secret never goes on the command line.
 EnvironmentFile=@KBF_ETC@/s3.env
 ExecStart=@KBF_BIN_DIR@/kbf-server \
-    --store=s3 \
-    --s3-endpoint=@MINIO_S3_ENDPOINT@ \
-    --s3-bucket=@KBF_S3_BUCKET@ \
-    --s3-conditional-put \
-@SERVER_META_LOG_ARGS@
+    --cold-store=s3://@KBF_S3_BUCKET@?endpoint=@MINIO_S3_ENDPOINT@&conditional-put=true \
+    --meta-dir=@KBF_META_DIR@ \
     --listen=@KBF_LISTEN_HOST@:@KBF_REAPI_PORT@ \
     --reapi-tls-cert=@KBF_ETC@/reapi.pem \
     --reapi-tls-key=@KBF_ETC@/reapi.key \

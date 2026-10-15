@@ -206,9 +206,10 @@ fn meta_bytes(command: &Command) -> Vec<u8> {
 }
 
 /// What a format-2 binary sees in an `EvictObjects` entry: no command (the `oneof`
-/// unset), which its decoder refuses. Catches the command numbered onto a field 1 to
-/// 14. The last format-2 command still decodes under the old shape, so the check is not
-/// vacuous.
+/// unset). Catches the command numbered onto a field 1 to 14. The last format-2
+/// command still decodes under the old shape, so the check is not vacuous. That the
+/// decoder then refuses the entry is
+/// `an_unset_meta_command_is_refused_under_every_format`.
 #[test]
 fn a_format_2_binary_sees_no_command_in_an_evict_entry() {
     for (name, command, _) in golden() {
@@ -220,6 +221,36 @@ fn a_format_2_binary_sees_no_command_in_an_evict_entry() {
     };
     let old = Format2MetaCommand::decode(meta_bytes(&conflict).as_slice()).expect("decode");
     assert!(matches!(old.command, Some(Format2Command::F14(_))));
+}
+
+/// What a format-2 binary decodes from an `EvictObjects` entry, `kbf_log::decode`
+/// refuses: the entry as that binary's prost leaves it (field 15 dropped, the
+/// `MetaCommand` empty) is refused with `UnknownCommand("MetaCommand")` under every
+/// format, by the unset-`oneof` check `meta::from_proto` has had since format 1. So a
+/// format-2 node stops at the entry instead of skipping it. Catches: an unset command
+/// decoded as a no-op (mutant: `from_proto` reads `None` as `Tick(0)`; the canonical
+/// re-encode check then refuses it as `NotCanonical`, a second barrier, so the
+/// assertion names the error). The raw entry under formats 1 and 2 is
+/// `evict_refused_below_v3`.
+#[test]
+fn an_unset_meta_command_is_refused_under_every_format() {
+    for (name, command, _) in golden() {
+        let old = Format2MetaCommand::decode(meta_bytes(&command).as_slice()).expect("decode");
+        let seen = proto::LogCommand {
+            command: Some(proto::log_command::Command::Meta(
+                proto::MetaCommand::decode(old.encode_to_vec().as_slice()).expect("decode"),
+            )),
+        }
+        .encode_to_vec();
+        assert_eq!(hex::encode(&seen), "0a00", "{name}");
+        for format in [Format::V1, Format::V2, Format::V3] {
+            assert_eq!(
+                decode(format, &seen),
+                Err(DecodeError::UnknownCommand("MetaCommand")),
+                "{name} under {format:?}"
+            );
+        }
+    }
 }
 
 fn wrap(objects: &[(u64, u64)]) -> Vec<u8> {

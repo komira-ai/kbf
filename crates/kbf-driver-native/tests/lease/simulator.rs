@@ -54,8 +54,9 @@ fn xcdevice_entry(udid: &str, available: bool) -> String {
 /// refused with exit 148; `list devices -j` prints `dir/bin/devices.json` (no devices
 /// until a test writes one); `shutdown` exits 149, as `simctl` does for a device that
 /// is not booted (the driver must not care); `delete` of [`STUCK`] fails, every other
-/// `delete` succeeds; `xcdevice list` lists every device the fake `create` makes
-/// ([`UDID`] and [`STUCK`]), so Xcode lists a lease's device at once.
+/// `delete` succeeds; `xcdevice list` and `xcodebuild -showdestinations` (as the driver asks, [`SHOW`])
+/// list every device the fake `create` makes ([`UDID`] and [`STUCK`]), so Xcode lists a
+/// lease's device at once.
 fn fake_xcrun(dir: &Path, extra: &str) -> PathBuf {
     let bin = dir.join("bin");
     std::fs::create_dir_all(&bin).expect("bin");
@@ -68,9 +69,13 @@ fn fake_xcrun(dir: &Path, extra: &str) -> PathBuf {
     let entries = [xcdevice_entry(UDID, true), xcdevice_entry(STUCK, true)];
     std::fs::write(&shown, format!("[{}]", entries.join(", "))).expect("xcdevice");
     let shown = shown.display();
+    let shown_by_xcodebuild = bin.join("showdestinations.txt");
+    std::fs::write(&shown_by_xcodebuild, showing(&[UDID, STUCK], &[])).expect("showdestinations");
+    let shown_by_xcodebuild = shown_by_xcodebuild.display();
     let rules = format!(
         "{extra}\
          xcdevice list --timeout 5\t-\tcat {shown}\n\
+         {SHOW}\t-\tcat {shown_by_xcodebuild}\n\
          simctl create * {BAD_TYPE} *\t-\techo --stderr Invalid device type: $4 ; exit 148\n\
          simctl create * {MUTE_TYPE} *\t-\techo\n\
          simctl create * {STUCK_TYPE} *\t-\techo {STUCK}\n\
@@ -107,7 +112,7 @@ fn calls(xcrun: &Path) -> Vec<String> {
     let prefix = format!("{} simctl ", xcrun.display());
     let look = format!("{} {LOOK}", xcrun.display());
     log.lines()
-        .filter(|line| *line != look)
+        .filter(|line| *line != look && !line.contains(SHOWING))
         .map(|line| {
             line.strip_prefix(&prefix)
                 .unwrap_or_else(|| panic!("{line:?} is not a simctl call"))
@@ -118,6 +123,39 @@ fn calls(xcrun: &Path) -> Vec<String> {
 
 /// How the driver asks Xcode for its devices: `xcrun` and this.
 const LOOK: &str = "xcdevice list --timeout 5";
+
+/// What the driver's second look runs, in the fake's argument pattern: the action's own
+/// `xcodebuild -showdestinations`, on the probe project the driver makes in the lease
+/// directory.
+const SHOW: &str = "xcodebuild -showdestinations -project * -scheme IOSFixture -derivedDataPath *";
+
+/// What a call of [`SHOW`] has in the fake's log, whatever its last argument.
+const SHOWING: &str = " xcodebuild -showdestinations ";
+
+/// How many times the fake `xcrun` was asked [`SHOW`] in `log`.
+fn shows_in(log: &str) -> usize {
+    log.lines().filter(|line| line.contains(SHOWING)).count()
+}
+
+/// What `xcodebuild -showdestinations` prints when it lists `simulators` (UDIDs) as
+/// eligible destinations, and `ineligible` under the heading that follows them: the
+/// placeholders every run prints, and no simulator at all when both are empty.
+fn showing(simulators: &[&str], ineligible: &[&str]) -> String {
+    let line = |udid: &&str| {
+        format!(
+            "\t\t{{ platform:iOS Simulator, arch:arm64, id:{udid}, OS:18.4, name:iPhone 16 }}\n"
+        )
+    };
+    format!(
+        "Command line invocation:\n    xcodebuild -showdestinations -scheme IOSFixture\n\n\
+         Available destinations for the \"IOSFixture\" scheme:\n\
+         \t\t{{ platform:macOS, arch:arm64, id:00006000-000A1B2C3D4E5F6A, name:My Mac }}\n\
+         \t\t{{ platform:iOS Simulator, id:dvtdevice-DVTiOSDeviceSimulatorPlaceholder-iphonesimulator:placeholder, name:Any iOS Simulator Device }}\n\
+         {}\n\tIneligible destinations for the \"IOSFixture\" scheme:\n{}",
+        simulators.iter().map(line).collect::<String>(),
+        ineligible.iter().map(line).collect::<String>(),
+    )
+}
 
 /// How many times the fake `xcrun` was asked `xcdevice list` (with [`LOOK`]'s
 /// arguments) in `log`, what it wrote to `<xcrun>.log`.
@@ -348,16 +386,20 @@ fn listing_config(
     every: Duration,
 ) -> (NativeConfig, PathBuf) {
     let (mut config, xcrun) = fake_config(dir, extra);
-    config.simulator_listing = Listing { within, every };
+    config.simulator_listing = Listing {
+        within,
+        every,
+        look: Duration::from_secs(30),
+    };
     (config, xcrun)
 }
 
-/// A rule for the fake `xcrun` whose `xcdevice list` prints `listings` in turn, then
-/// the last one again and again: each run prints `queue/0`, then moves each file one
-/// place down the queue (`1` to `0`, ...). The kbf-act steps have no branch, so the
-/// queue is the order.
-fn listings_in_turn(dir: &Path, listings: &[String]) -> String {
-    let queue = dir.join("queue");
+/// A rule for the fake `xcrun` that answers the call `key` (an argument pattern) with
+/// `listings` in turn, then the last one again and again: each run prints `<name>/0`,
+/// then moves each file one place down the queue (`1` to `0`, ...). The kbf-act steps
+/// have no branch, so the queue is the order.
+fn turns(dir: &Path, name: &str, key: &str, listings: &[String]) -> String {
+    let queue = dir.join(name);
     std::fs::create_dir_all(&queue).expect("queue");
     let mut steps = vec![format!("cat {}/0", queue.display())];
     for (n, listing) in listings.iter().enumerate() {
@@ -366,7 +408,12 @@ fn listings_in_turn(dir: &Path, listings: &[String]) -> String {
             steps.push(format!("copy {q}/{} {q}/{n}", n - 1, q = queue.display()));
         }
     }
-    format!("{LOOK}\t-\t{}\n", steps.join(" ; "))
+    format!("{key}\t-\t{}\n", steps.join(" ; "))
+}
+
+/// [`turns`] for `xcdevice list`.
+fn listings_in_turn(dir: &Path, listings: &[String]) -> String {
+    turns(dir, "queue", LOOK, listings)
 }
 
 /// Catches the action started before Xcode lists the lease's simulator (issue #608:
@@ -446,7 +493,7 @@ async fn a_simulator_xcode_never_lists_fails_the_lease_saying_so() {
     let Err(RuntimeError::Failed(why)) = &outcome else {
         panic!("{outcome:?}");
     };
-    let want = format!("simulator: xcrun xcdevice list did not list {UDID} within {within:?} (");
+    let want = format!("simulator: Xcode did not list {UDID} within {within:?} (");
     assert!(why.starts_with(&want), "{why}");
     assert!(
         why.ends_with(&format!("looks); the last listing: {other}")),
@@ -491,6 +538,186 @@ async fn a_simulator_listed_at_once_adds_no_wait() {
     assert!(started.elapsed() < minute, "{:?}", started.elapsed());
     assert_eq!(looks(&xcrun), 1);
     assert_eq!(calls(&xcrun), lease_calls(1, &[]));
+}
+
+/// Catches the driver's wait standing for another question than the action's (issue
+/// #608, runs 38770452545 and 38787596842: `xcrun xcdevice list` named the new device
+/// within 10 s, and the action's four sandboxed `xcodebuild -showdestinations` tries
+/// that followed each listed no simulator at all, so the lease failed in the action):
+/// the driver must look again with `xcodebuild -showdestinations` until it names the
+/// device as an eligible destination, and only then run the action. `xcdevice` names
+/// the device at once; the fake `xcodebuild`'s first three listings do not (the
+/// placeholders only; another simulator; the device under the ineligible heading), the
+/// fourth does. The action prints the fake's log, which holds four such looks when it
+/// starts. Mutants planted: the look reverted to `xcdevice list` alone (red: no
+/// `xcodebuild` look); the ineligible heading not cut (red: three looks).
+#[tokio::test]
+async fn the_action_waits_until_xcodebuild_lists_its_simulator() {
+    let dir = scratch("sim-shown-late");
+    let queue = turns(
+        &dir,
+        "shown",
+        SHOW,
+        &[
+            showing(&[], &[]),
+            showing(&[SHARED], &[]),
+            showing(&[SHARED], &[UDID]),
+            showing(&[SHARED, UDID], &[]),
+        ],
+    );
+    let (config, xcrun) = listing_config(&dir, &queue, PROMPT, Duration::from_millis(10));
+    let cas = Arc::new(MemoryCas::default());
+    let rt = runtime(config.clone(), &cas);
+    let log = format!("{}.log", xcrun.display());
+    let result = run(
+        &rt,
+        &cas,
+        1,
+        &asks(Spec::act(&format!("cat {log}")), DEVICE_TYPE),
+    )
+    .await;
+    let result = result.expect("ran");
+    assert_eq!(result.exit_code, 0, "{}", stderr(&cas, &result));
+    assert_eq!(
+        shows_in(&stdout(&cas, &result)),
+        4,
+        "xcodebuild looks before the action ran"
+    );
+    assert_eq!(
+        shows_in(&std::fs::read_to_string(&log).expect("log")),
+        4,
+        "no look after the device was listed"
+    );
+    assert_eq!(calls(&xcrun), lease_calls(1, &[]));
+    assert!(no_leases(&config));
+}
+
+/// What a node whose `xcodebuild` never lists the device gets, for `shown` (what the
+/// fake prints for every look) and `listed` simulators in it: the lease fails as the
+/// node's (`Failed`) once the wait is up, saying that `xcodebuild` did not list the
+/// device, how many simulators it listed instead and its last listing; the action does
+/// not run, and the device is deleted.
+async fn xcodebuild_never_lists(name: &str, shown: String, listed: usize) {
+    let dir = scratch(name);
+    let file = dir.join("shown.txt");
+    std::fs::write(&file, &shown).expect("shown");
+    let extra = format!("{SHOW}\t-\tcat {}\n", file.display());
+    let within = Duration::from_millis(300);
+    let (config, xcrun) = listing_config(&dir, &extra, within, Duration::from_millis(10));
+    let cas = Arc::new(MemoryCas::default());
+    let rt = runtime(config.clone(), &cas);
+    let ran = dir.join("ran");
+    let spec = asks(
+        Spec::act(&format!("append {} x", ran.display())),
+        DEVICE_TYPE,
+    );
+    let outcome = run(&rt, &cas, 1, &spec).await;
+    let Err(RuntimeError::Failed(why)) = &outcome else {
+        panic!("{outcome:?}");
+    };
+    let want = format!("simulator: Xcode did not list {UDID} within {within:?} (");
+    assert!(why.starts_with(&want), "{why}");
+    let seen =
+        format!("looks); xcodebuild -showdestinations listed {listed} simulators, not {UDID}");
+    assert!(why.contains(&seen), "{why}");
+    assert!(
+        why.contains("Available destinations"),
+        "the last listing: {why}"
+    );
+    assert!(!ran.exists(), "the action did not run");
+    assert!(
+        shows_in(&std::fs::read_to_string(format!("{}.log", xcrun.display())).expect("log")) > 1,
+        "looked again"
+    );
+    assert_eq!(calls(&xcrun), lease_calls(1, &[]));
+    assert!(no_leases(&config));
+}
+
+/// Catches a lease whose simulator `xcodebuild` never lists running its action anyway
+/// (it would fail there, blamed on the action) while `xcdevice list` names the device
+/// (the fake's default): the lease fails as the node's, the listing is the one
+/// `xcodebuild` printed, with no simulator among the placeholders. Mutant planted: the
+/// wait ends at the `xcdevice` look (red: the action ran).
+#[tokio::test]
+async fn a_node_whose_xcodebuild_lists_no_simulator_fails_the_lease_not_the_action() {
+    xcodebuild_never_lists("sim-shown-none", showing(&[], &[]), 0).await;
+}
+
+/// Catches a listing of other simulators taken for one of the lease's (the 34-simulator
+/// listing of run 38290129703, which lacked the new device): the device must be named,
+/// not the list long. Mutant planted: `lists` matching any simulator id (red: the
+/// action ran).
+#[tokio::test]
+async fn a_populated_listing_without_the_udid_is_not_listed() {
+    xcodebuild_never_lists(
+        "sim-shown-others",
+        showing(&[SHARED, OTHER, NEIGHBOUR], &[UDID]),
+        3,
+    )
+    .await;
+}
+
+/// Catches a look that stalls (one `xcodebuild -showdestinations` took about 80 s on a
+/// hosted runner) holding the wait for as long as it likes: each look has
+/// [`Listing::look`] to answer (200 ms here) and is killed after it, counted as not
+/// listed, so the wait ends near [`Listing::within`] with the lease failed saying the
+/// look did not answer. The fake's look sleeps 5 s. Mutant planted: the look given the
+/// `simctl` answer time instead of [`Listing::look`] (red: the run takes the 5 s).
+#[tokio::test]
+async fn a_look_that_does_not_answer_is_cut_and_the_wait_still_ends() {
+    let dir = scratch("sim-look-stalls");
+    let extra = format!("{SHOW}\t-\tsleep 5\n");
+    let (mut config, xcrun) = listing_config(
+        &dir,
+        &extra,
+        Duration::from_millis(500),
+        Duration::from_millis(10),
+    );
+    config.simulator_listing.look = Duration::from_millis(200);
+    let cas = Arc::new(MemoryCas::default());
+    let rt = runtime(config.clone(), &cas);
+    let started = std::time::Instant::now();
+    let outcome = run(&rt, &cas, 1, &asks(Spec::act("exit 0"), DEVICE_TYPE)).await;
+    let Err(RuntimeError::Failed(why)) = &outcome else {
+        panic!("{outcome:?}");
+    };
+    assert!(why.contains("no answer within 200ms"), "{why}");
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(calls(&xcrun), lease_calls(1, &[]));
+    assert!(no_leases(&config));
+}
+
+/// Catches the probe project left in the lease directory for the action to find, or
+/// not written where the look runs: the look's `xcodebuild` runs in a directory that
+/// holds the project, and the action's directory holds none of it. The fake
+/// `xcodebuild` copies its working directory's listing to a file.
+#[tokio::test]
+async fn the_probe_project_is_there_for_the_looks_and_gone_for_the_action() {
+    let dir = scratch("sim-probe");
+    let seen = dir.join("seen");
+    let extra = format!(
+        "{SHOW}\t-\tcopy {} IOSFixture.xcodeproj/project.pbxproj ; cat {}/bin/showdestinations.txt\n",
+        seen.display(),
+        dir.display()
+    );
+    let (config, _) = listing_config(&dir, &extra, PROMPT, Duration::from_millis(10));
+    let cas = Arc::new(MemoryCas::default());
+    let rt = runtime(config.clone(), &cas);
+    let probe = lease_of(&config, 1).join(".kbf-simulator-probe");
+    let spec = asks(
+        Spec::act(&format!("test ! -e {}", probe.display())),
+        DEVICE_TYPE,
+    );
+    let result = run(&rt, &cas, 1, &spec).await;
+    let result = result.expect("ran");
+    assert_eq!(result.exit_code, 0, "{}", stderr(&cas, &result));
+    let project = std::fs::read_to_string(&seen).expect("the look ran where the project is");
+    assert!(project.contains("IOSFixture"), "{project}");
+    assert!(no_leases(&config));
 }
 
 /// Catches a kill during the wait for Xcode's listing not ending it (the kill would
@@ -775,6 +1002,12 @@ mod real {
     /// default `xcodebuild test`.
     const DESTINATION_TIMEOUT: u64 = 30;
 
+    /// Whether [`a_real_simulator_is_made_booted_and_deleted_for_the_lease`] has run in
+    /// this process: the sibling test says so in its log, to tell a listing that is
+    /// late after a lease's device from one on a quiet node.
+    static LEASE_TEST_RAN: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
     /// How long one sandboxed `xcodebuild -showdestinations` try takes on a hosted
     /// runner: 15 s in the native-macos job (a try that listed the device at once
     /// reported itself at 15 s). A try sees a listing only when it ends, so a device
@@ -947,7 +1180,27 @@ mod real {
         let default = default.trim().to_owned();
         let project = ios_fixture(&dir);
         let derived = dir.join("derived");
-        let (_, shown) = xcodebuild(&project, &derived, &["-showdestinations"]);
+        // Xcode can list no simulator for a while after a device is made (issue #608):
+        // look again, as the lease's action does, and say what each look saw.
+        let started = std::time::Instant::now();
+        let mut try_ = 0;
+        let shown = loop {
+            try_ += 1;
+            let (_, shown) = xcodebuild(&project, &derived, &["-showdestinations"]);
+            let waited = started.elapsed().as_secs();
+            let _ = writeln!(
+                std::io::stderr(),
+                "showdestinations try {try_} at {waited} s: lists the default set's device {}, \
+                 iOS simulators listed {}; the lease test ran before: {}",
+                shown.contains(&default),
+                shown.matches("platform:iOS Simulator, arch").count(),
+                LEASE_TEST_RAN.load(std::sync::atomic::Ordering::SeqCst)
+            );
+            if shown.contains(&default) || waited >= POLL_FOR {
+                break shown;
+            }
+            std::thread::sleep(Duration::from_secs(5));
+        };
         // A build that names the other set's device by id: `xcodebuild` resolves the
         // destination before it builds anything, so one it cannot find fails it at once.
         let destination = format!("id={elsewhere}");
@@ -987,9 +1240,11 @@ mod real {
     /// [`LISTED_BY`] seconds (so `xcodebuild test -destination id=$KBF_SIMULATOR_UDID`
     /// with its default timeout could not use it), and a booted device left running or
     /// registered after the lease. The driver waits before the action runs until
-    /// `xcrun xcdevice list` names the device (issue #608), so this checks that its
-    /// wait stands for what the action's own `xcodebuild` sees: its first try is
-    /// expected to list the device. The action keeps trying for [`POLL_FOR`] seconds;
+    /// `xcrun xcdevice list` names the device and its own sandboxed `xcodebuild
+    /// -showdestinations` lists it (issue #608), so this checks that its wait stands
+    /// for what the action's own `xcodebuild` sees: its first try is expected to list
+    /// the device. The driver's own looks (their time and the simulators each listed)
+    /// are in its log lines "xcodebuild -showdestinations look". The action keeps trying for [`POLL_FOR`] seconds;
     /// each try prints to the action's stderr what it saw: its exit, whether it named
     /// the lease's device, and how many iOS simulators it listed (none at all would
     /// point at the sandbox, not at a late listing); a run that never lists the device
@@ -998,6 +1253,7 @@ mod real {
     #[ignore = "macOS with an iOS simulator runtime; the native-macos job runs it"]
     async fn a_real_simulator_is_made_booted_and_deleted_for_the_lease() {
         let _one = ONE.lock().await;
+        LEASE_TEST_RAN.store(true, std::sync::atomic::Ordering::SeqCst);
         let (device_type, runtime_id) = pick();
         let dir = scratch("sim-real");
         let fixtures = dir.join("fixtures");

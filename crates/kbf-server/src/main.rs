@@ -8,8 +8,8 @@
 //! (`invocations=on` when the REAPI policy names `invocations.getAuthorizer` or
 //! `--invocations-open` is given, so the build pages answer; `blobs=on` when it also
 //! names `blobs.getAuthorizer`, or the flag is given, so `GET /v1/blobs` answers), then
-//! ` log=<id>` under `--meta-log=raft`, the id of
-//! the log in `--raft-dir` (16 hex digits), then
+//! ` log=<id>`, the id of
+//! the metadata log (16 hex digits), then
 //! ` warning=plaintext-off-loopback:<listeners>` at its very end when a listener serves
 //! plain text on an address that is not loopback (`<listeners>` is `reapi`, `worker`
 //! or `reapi,worker`; see [`Args::plain_text_off_loopback`]). The server starts either
@@ -23,20 +23,20 @@
 //! The REAPI listener runs the policy `--reapi-auth-policy` names; a policy file that
 //! cannot be read or is not a policy exits 2 before anything is bound.
 //!
-//! `--meta-log=raft` opens the log in `--raft-dir` (creating it if the directory is
-//! empty) before anything is bound, and writes objects under the prefix the log
-//! committed; a directory it refuses exits 2.
+//! The metadata log (a single-voter Raft log) opens in `--meta-dir`, or in `meta/` of
+//! the `--hot-store` directory, before anything is bound (creating it if the directory
+//! is empty), and objects are written under the prefix the log committed; a directory
+//! it refuses exits 2. `--cold-store` is the durable object store, `file:///dir` (a
+//! `kbf_objstore::FsStore`, locked while the server runs, so a second server on it, or
+//! a directory that cannot be created or locked, exits 2 before anything is bound) or
+//! `s3://bucket/prefix?endpoint=...`; the start logs every store, path and budget it
+//! resolved.
 //!
-//! `--blob-dir` keeps blob bytes in a local directory (`kbf_objstore::FsStore`) in place
-//! of `--store`, under the fixed key prefix `kbf/<log id>/`; it needs `--meta-log=raft`. A directory that cannot be created or
-//! locked (another server has it open) exits 2 before anything is bound.
-//!
-//! `--write-tier-dir` attaches the local write tier before anything is bound
-//! (`kbf_server::write_tier`), over either metadata log: under `--meta-log=raft` it
-//! first raises the log to machine version 2 (once; a server without a tier never
-//! does, so its log stays one an older binary reads). A start the tier refuses (a
-//! wrong or missing `TIER` while objects are staged, a log that cannot be raised)
-//! exits 2. Its flusher runs every second until the server stops.
+//! `--hot-store` attaches the local write tier before anything is bound
+//! (`kbf_server::write_tier`): it first raises the log to machine version 2 (once; a
+//! server without a tier never does, so its log stays one an older binary reads). A
+//! start the tier refuses (a wrong or missing `TIER` while objects are staged, a log
+//! that cannot be raised) exits 2. Its flusher runs every second until the server stops.
 
 use std::error::Error;
 use std::process::ExitCode;
@@ -67,6 +67,6 @@ fn serve(args: &Args) -> Result<(), Box<dyn Error>> {
     sizes.runtime()?.block_on(async {
         let server = start(args, interrupted).await?;
         println!("{}", server.start_line());
-        server.serve().await
+        Ok(server.serve().await?)
     })
 }

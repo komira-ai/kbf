@@ -1,4 +1,4 @@
-//! `--meta-log=raft`: the metadata log as a single-voter Raft log on the local disk
+//! The metadata log (`--meta-dir`) as a single-voter Raft log on the local disk
 //! (docs/design/ha.md, section 16, PR 5).
 //!
 //! [`RaftMetaLog`] implements the front's [`MetaLog`] over a [`kbf_raft::Host`] whose
@@ -63,10 +63,11 @@ mod machine;
 mod recorded;
 
 use std::fmt::{self, Display};
+use std::fs::{File, OpenOptions};
 use std::io::{self, Read};
 use std::num::NonZeroU64;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, Weak};
 use std::time::Duration;
@@ -89,6 +90,11 @@ use tokio::time::Instant;
 use self::machine::MetaMachine;
 pub use self::machine::NoSnapshots;
 pub use self::recorded::{RECORD, RECORD_TMP};
+
+/// The file in the raft directory that [`RaftMetaLog::open_dir`] holds an exclusive
+/// lock on (`flock`) while the log is open, so a second server started on the same
+/// directory is refused.
+pub const LOCK: &str = "log.lock";
 
 /// The highest machine version this binary runs: [`MachineVersion::V3`], the write
 /// tier's commands and `EvictObjects`. A log stays at the version it was raised to; a
@@ -135,6 +141,18 @@ pub enum RaftLogError {
     /// The single voter's membership was refused.
     #[error("raft membership: {0}")]
     Membership(#[from] ConfigError),
+    /// Another open log holds the raft directory's [`LOCK`] (a second server started
+    /// on the same `--meta-dir`), or the lock could not be taken.
+    #[error(
+        "raft dir {}: could not lock {LOCK}; is another kbf-server using it? ({source})",
+        .dir.display()
+    )]
+    Locked {
+        /// The raft directory.
+        dir: PathBuf,
+        /// Why the lock was not taken.
+        source: io::Error,
+    },
     /// The host stopped while the log opened.
     #[error("raft log: {0}")]
     Host(#[from] HostError<StoreError>),
@@ -172,6 +190,9 @@ pub enum RaftLogError {
 pub struct RaftMetaLog<F: Fs = StdFs> {
     shared: Arc<Shared<F>>,
     ticker: AbortHandle,
+    /// The raft directory's [`LOCK`], held while the log is open (logs opened with
+    /// [`RaftMetaLog::open_dir`]); released when the log is dropped.
+    lock: Option<File>,
 }
 
 struct Shared<F: Fs> {
@@ -195,16 +216,41 @@ struct Shared<F: Fs> {
 
 impl RaftMetaLog<StdFs> {
     /// Opens the log in `dir` (created if missing), creating a new one with a random
-    /// id if the directory is empty. Objects go under `<prefix_root><log id>/`.
+    /// id if the directory is empty. Objects go under `<prefix_root><log id>/`. The
+    /// directory's [`LOCK`] is taken before anything in it is read, and held until the
+    /// log is dropped.
     ///
     /// # Errors
-    /// As [`RaftMetaLog::open`].
+    /// [`RaftLogError::Locked`] if another open log holds the directory; otherwise as
+    /// [`RaftMetaLog::open`].
     pub async fn open_dir(
         dir: &Path,
         retention: Retention,
         prefix_root: &str,
     ) -> Result<Self, RaftLogError> {
-        Self::open(StdFs::new(dir)?, retention, prefix_root, random_log_id).await
+        let fs = StdFs::new(dir)?;
+        let lock = lock_dir(dir)?;
+        let mut log = Self::open(fs, retention, prefix_root, random_log_id).await?;
+        log.lock = Some(lock);
+        Ok(log)
+    }
+}
+
+/// `dir`'s [`LOCK`], created if missing, with an exclusive `flock` on it. The lock
+/// goes with the file's descriptor, so it is released when the file is closed, by
+/// the log's drop or by the process's exit.
+fn lock_dir(dir: &Path) -> Result<File, RaftLogError> {
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(dir.join(LOCK))?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(e) => Err(RaftLogError::Locked {
+            dir: dir.to_owned(),
+            source: io::Error::from(e),
+        }),
     }
 }
 
@@ -310,7 +356,11 @@ where
             closed: AtomicBool::new(false),
         });
         let ticker = tokio::spawn(tick_every(Arc::downgrade(&shared))).abort_handle();
-        Ok(Self { shared, ticker })
+        Ok(Self {
+            shared,
+            ticker,
+            lock: None,
+        })
     }
 
     /// Raises the log's machine version to `to` by committing a `MachineVersion`

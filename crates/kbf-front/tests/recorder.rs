@@ -236,6 +236,7 @@ fn a_listing_copies_outputs_logs_and_usage() {
         cpu_system_micros: 2,
         peak_memory_bytes: 3,
         wall_micros: 4,
+        cgroup: None,
     };
     let result = ActionResult {
         output_files: vec![

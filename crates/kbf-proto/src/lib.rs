@@ -71,3 +71,6 @@ pub mod kbf {
 pub use build::bazel::remote::execution::v2 as reapi;
 /// The `kbf.worker.v1` protocol, under a short name.
 pub use kbf::worker::v1 as worker;
+
+mod usage;
+pub use usage::no_cgroup_fields;

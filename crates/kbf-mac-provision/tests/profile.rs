@@ -715,10 +715,10 @@ fn every_malformed_pool_volume_or_daemon_setting_is_refused() {
         (
             "root scratch off the volume",
             edited(|l| {
-                set("kbf_scratch", "/private/var/kbf")(l);
+                set("kbf_data_dir", "/private/var/kbf")(l);
                 l.push("daemon_user=root".into());
             }),
-            "kbf_scratch: /private/var/kbf is not on kbf_volume /Volumes/kbf (daemon_user=root)",
+            "kbf_data_dir: /private/var/kbf is not on kbf_volume /Volumes/kbf (daemon_user=root)",
         ),
         (
             "root cache off the volume",
@@ -745,7 +745,7 @@ fn every_malformed_pool_volume_or_daemon_setting_is_refused() {
 #[test]
 fn the_pool_volume_and_daemon_settings_are_accepted_and_printed() {
     let text = edited(|l| {
-        set("kbf_scratch", "/private/var/kbf")(l);
+        set("kbf_data_dir", "/private/var/kbf")(l);
         l.extend(
             [
                 "pool_users=64",
@@ -765,7 +765,7 @@ fn the_pool_volume_and_daemon_settings_are_accepted_and_printed() {
         "{printed}"
     );
     let text = edited(|l| {
-        set("kbf_scratch", "/Volumes/farm/scratch")(l);
+        set("kbf_data_dir", "/Volumes/farm/data")(l);
         l.extend(
             [
                 "pool_users=1",
