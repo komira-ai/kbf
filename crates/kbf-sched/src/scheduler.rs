@@ -161,12 +161,12 @@ impl Worker {
         self.phase.switching() == Some(lease) && now < self.switch_ends
     }
 
-    /// Whether `request` is an action at the whole host's memory (the last step of the
-    /// memory ladder, which the cap is): it runs with no other lease on the node, and
-    /// none is placed beside it, as a whole-machine lease does.
+    /// Whether `request`, an action or a VM, is at the whole host's memory (the last step
+    /// of the memory ladder, which the cap is): it runs with no other lease on the node,
+    /// and none is placed beside it, as a whole-machine lease does. A request for no
+    /// memory is not.
     pub(crate) fn exclusive(&self, request: &Request) -> bool {
-        request.kind != LeaseKind::WholeMachine
-            && request.resources.memory_bytes > 0
+        request.resources.memory_bytes > 0
             && request.resources.memory_bytes >= self.capacity.memory_bytes
     }
 

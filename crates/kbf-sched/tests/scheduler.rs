@@ -492,6 +492,17 @@ fn an_action_at_the_whole_node_memory_runs_alone() {
     assert_eq!(after.operation, OperationId(2));
 }
 
+/// Catches: a request for no memory read as the whole of a node that reports none, which
+/// would run it alone.
+#[test]
+fn a_request_for_no_memory_is_not_the_whole_node() {
+    let mut h = Harness::new();
+    h.worker("a", 2_000, 0);
+    h.submit(1, sized(1, 0));
+    h.submit(2, sized(2, 0));
+    assert_eq!(h.tick().len(), 2);
+}
+
 /// Catches: dedup that joins across instance names (another namespace's work answered
 /// with this one's result), joins networked or `do_not_cache` work, misses a twin, or
 /// joins a finished operation.
