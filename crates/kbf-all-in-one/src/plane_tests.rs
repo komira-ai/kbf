@@ -130,3 +130,14 @@ fn a_file_changed_after_the_walk_is_not_stored() {
         assert!(fetch(&plane, &asked[0]).await.is_err());
     });
 }
+
+/// Catches a caller taken from a certificate that names no node, or more than one,
+/// which the worker listener refuses too: the plane would be admitted as a node the
+/// certificate does not stand for.
+#[test]
+fn a_caller_is_one_node() {
+    let two = vec!["node-1".to_owned(), "node-2".to_owned()];
+    let made = rcgen::generate_simple_self_signed(two).expect("cert");
+    let refused = kbf_server::Caller::from_pem(made.cert.pem().as_bytes()).expect_err("refused");
+    assert!(refused.contains("exactly one node"), "{refused}");
+}

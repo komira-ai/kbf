@@ -21,7 +21,7 @@
 //! Linux only, the container driver only: elsewhere [`main`] exits 2 saying so.
 //!
 //! Not done yet (the README lists it): a durable scheduler state, without which a restart
-//! loses every lease; the in-process plane's admission; the `--reserve-cpus` split
+//! loses every lease; the `--reserve-cpus` split
 //! between the halves; the walk handing its buffers to the plane; the whole-process
 //! crash simulation, the driver-panic test and the rest of the helper-dispatch tests;
 //! and the deploy shape, the ownership step and the unit.

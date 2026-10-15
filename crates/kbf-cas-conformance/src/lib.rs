@@ -291,12 +291,13 @@ pub async fn a_denied_caller_is_refused<S: Refusable>(subject: &S) {
         bytes
     );
     subject.deny().await;
+    // Err(false): failed, and not as `Missing`; Ok(length) for bytes served.
     let read = cas.get(&held).await;
-    assert!(
-        read.is_err() && !matches!(read, Err(CasError::Missing(_))),
-        "a denied read: {:?}",
-        read.as_ref().map(Vec::len)
-    );
+    let read = read
+        .as_ref()
+        .map(Vec::len)
+        .map_err(|e| matches!(e, CasError::Missing(_)));
+    assert_eq!(read, Err(false), "a denied read");
     let put = cas.put(patterned(12, 1000)).await;
     assert!(put.is_err(), "a denied put: {put:?}");
     let records = cas

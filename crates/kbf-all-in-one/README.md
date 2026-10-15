@@ -50,6 +50,11 @@ server's own code:
   under the admission a ByteStream `Write` takes.
 - **Reads** (`get`, and `read_to` through it) and **FindMissing** (`missing`): the cache's
   own, which checks every blob it reads against its digest.
+- **Admission**: every call is admitted first, by the rule that admits a remote daemon's
+  blob call: the daemon's certificate (`--cert`) must name one node, and neither the node
+  nor the certificate (serial, public key) may be on `--worker-deny-list`, read again at
+  every call. Only the transport check (the call came over mutual TLS) has no
+  counterpart here.
 
 No message a remote daemon sends changes: `kbf-daemon` still uses the transfer engine.
 
@@ -66,6 +71,10 @@ No message a remote daemon sends changes: `kbf-daemon` still uses the transfer e
   so a daemon half wired to the transfer engine would not start. Also the starts each
   half refuses, with their exit statuses, and the binary run with keeper arguments,
   which answers as the keeper before it reads a flag and starts no server.
+- `tests/admission.rs`: `kbf_cas_conformance::a_denied_caller_is_refused` against both
+  planes, the transfer engine over mutual TLS and `LocalDataPlane`, the daemon denied by
+  node and by public key: after the denial a read, a put and an upload fail and
+  FindMissing answers every digest missing, on both.
 - `src/plane_tests.rs`: a digest that does not parse, a server half whose runtime is
   gone, a file changed after the walk hashed it.
 - `src/cli_tests.rs`: each flag reaches its half, once; the refusals.
@@ -76,8 +85,6 @@ No message a remote daemon sends changes: `kbf-daemon` still uses the transfer e
   the process loses every lease and operation, and with the default `--meta-log=memory`
   the cache's index too (`--blob-dir` with `--meta-log=raft` keeps the cache). Until the
   scheduler's state is durable, all-in-one is a development shape.
-- **The in-process plane's admission.** A remote daemon's blob calls are admitted by its
-  certificate and the deny list; this plane's calls are not admitted.
 - **The walk's buffers.** A file the walk hashed is read again from the file to be
   stored (never hashed again); handing the walk's own buffer to the plane is a driver
   change not made here.

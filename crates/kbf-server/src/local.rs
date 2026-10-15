@@ -161,8 +161,8 @@ impl LocalStore {
 
     /// Whether the caller may make a call now (the module docs say by what rule).
     async fn admitted(&self) -> Result<(), Status> {
-        let _ = (&self.peers, &self.caller.cert, &self.caller.node);
-        Ok(())
+        let Caller { cert, node } = &self.caller;
+        self.peers.admit(Some(cert), node).await
     }
 
     /// The digests among `digests` the cache does not hold, in the order asked, as

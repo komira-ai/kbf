@@ -351,8 +351,14 @@ fn the_binary_answers_as_a_keeper_before_it_reads_its_flags() {
 /// Runs the binary with `extra` flags after a one-node farm's in a fresh directory and
 /// returns its exit status and stderr.
 fn refused(name: &str, extra: &[&str]) -> (Option<i32>, String) {
+    refused_with(name, extra, |_| {})
+}
+
+/// [`refused`], with `prepare` run on the directory once its PKI is written.
+fn refused_with(name: &str, extra: &[&str], prepare: impl FnOnce(&Path)) -> (Option<i32>, String) {
     let dir = scratch(name);
     pki(&dir);
+    prepare(&dir);
     let output = Command::new(BIN)
         .args(farm_flags(&dir, free_port()))
         .args(extra)
@@ -375,6 +381,18 @@ fn a_start_either_half_refuses_says_which() {
     let (code, stderr) = refused("daemon-refuses", &["--id-files=/nonexistent/ids"]);
     assert_eq!(code, Some(1), "{stderr}");
     assert!(stderr.contains("kbf-all-in-one: daemon: "), "{stderr}");
+    // The daemon half's blob calls are admitted as its certificate: one that cannot be
+    // read, or is no certificate, stops the start before the daemon half starts.
+    let (code, stderr) = refused_with("no-cert", &[], |dir| {
+        std::fs::remove_file(dir.join("node.pem")).expect("remove");
+    });
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(stderr.contains("kbf-all-in-one: daemon: read "), "{stderr}");
+    let (code, stderr) = refused_with("not-a-cert", &[], |dir| {
+        std::fs::write(dir.join("node.pem"), "not a certificate\n").expect("write");
+    });
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(stderr.contains("not a PEM certificate"), "{stderr}");
     let (code, stderr) = refused("native", &["--driver=native"]);
     assert_eq!(code, Some(2), "{stderr}");
     assert!(stderr.contains("container driver only"), "{stderr}");
