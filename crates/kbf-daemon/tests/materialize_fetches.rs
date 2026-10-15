@@ -55,6 +55,19 @@ impl Cas for CountingCas {
     }
 
     async fn get(&self, digest: &Digest) -> Result<Vec<u8>, CasError> {
+        // MUTANT (#676 schedule): the missing read comes after BOUND + 1 present reads.
+        if !self.held.is_empty() && self.blobs.blob(digest).is_none() {
+            loop {
+                let present: usize = {
+                    let reads = self.reads.lock().unwrap_or_else(PoisonError::into_inner);
+                    reads.values().sum::<usize>() - 1
+                };
+                if present > BOUND {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        }
         *self
             .reads
             .lock()
@@ -64,11 +77,6 @@ impl Cas for CountingCas {
         if self.blobs.blob(digest).is_none() {
             self.missing_read.store(true, Ordering::SeqCst);
             return Err(CasError::Missing(label(digest)));
-        }
-        if self.held.contains(&label(digest)) {
-            while !self.missing_read.load(Ordering::SeqCst) {
-                tokio::task::yield_now().await;
-            }
         }
         let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
         self.most_in_flight.fetch_max(now, Ordering::SeqCst);
