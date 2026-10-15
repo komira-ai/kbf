@@ -114,9 +114,10 @@ fn listeners() -> Listeners {
 }
 
 /// 48 concurrent 4 MiB Writes against a 12 MiB bound, over one connection to the
-/// REAPI listener as `bind_server` sets it up: every Write completes, the bytes held in
-/// receive buffers never passed the bound, and at least two Writes buffered at once
-/// (the bound is not a lock).
+/// REAPI listener as `bind_server` sets it up: every Write completes, and the bytes held
+/// in receive buffers never passed the bound. That Writes do buffer at once (the bound
+/// is not a lock) is `two_writes_under_the_bound_buffer_at_once`'s: how much these
+/// 48 overlap is the scheduler's choice (kbf#691).
 ///
 /// Catches: an admission taken after buffering, which lets every Write buffer at once;
 /// a connection window smaller than every stream's window, with which the Writes
@@ -149,10 +150,6 @@ async fn concurrent_writes_stay_under_the_bytes_in_flight() {
     assert!(
         peak <= BOUND,
         "{peak} bytes buffered over a {BOUND}-byte bound"
-    );
-    assert!(
-        peak >= 2 * BLOB as u64,
-        "{peak}: the Writes never overlapped"
     );
     for d in &digests {
         assert!(cache.is_durable(d).await.expect("durable"), "{d}");
@@ -197,10 +194,11 @@ async fn two_writes_under_the_bound_buffer_at_once() {
         let response = answered.expect("join").expect("write").into_inner();
         assert_eq!(response.committed_size, BLOB as i64);
     }
-    let peak = cache.write_buffer_peak();
-    assert!(
-        peak >= 2 * BLOB as u64,
-        "{peak}: the Writes never overlapped"
+    // The first held its whole blob while the second held all but its last message.
+    assert_eq!(
+        cache.write_buffer_peak(),
+        (2 * BLOB - CHUNK) as u64,
+        "the peak is not one whole blob and all but one message of the other"
     );
 }
 
