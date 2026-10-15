@@ -12,7 +12,7 @@ kbf-baseline              0      0
 kbf-bench                 0      0
 kbf-caps                  2      1
 kbf-coverage              0      0
-kbf-daemon               29      6
+kbf-daemon               31      6
 kbf-deploy                0      0
 kbf-driver-container      0      0
 kbf-driver-native         0      0
