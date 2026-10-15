@@ -15,6 +15,8 @@ use std::time::{Duration, Instant};
 
 use kbf_proto::google::bytestream::ReadRequest;
 use kbf_proto::google::bytestream::byte_stream_client::ByteStreamClient;
+use kbf_proto::reapi::content_addressable_storage_client::ContentAddressableStorageClient;
+use kbf_proto::reapi::{BatchUpdateBlobsRequest, batch_update_blobs_request};
 use support::{Blob, Client, Job, done, output, ran, response};
 use tonic::Code;
 
@@ -253,7 +255,8 @@ async fn a_lost_or_corrupt_object_is_reported_on_read_and_an_upload_heals_it() {
     let corrupt = Blob::new("this blob's object file gets one byte flipped");
     let lost = Blob::new("this blob's object file is deleted");
     let kept = Blob::new("this blob's object file is left alone");
-    for blob in [&corrupt, &lost, &kept] {
+    let emptied = Blob::new("this blob's object file is cut to zero bytes");
+    for blob in [&corrupt, &lost, &kept, &emptied] {
         before.upload(&[blob]).await;
     }
     drop(before);
@@ -265,13 +268,17 @@ async fn a_lost_or_corrupt_object_is_reported_on_read_and_an_upload_heals_it() {
     std::fs::write(&path, bytes).expect("corrupt the object");
     let (path, _) = object_holding(&dirs.blobs, &lost.data);
     std::fs::remove_file(path).expect("delete the object");
+    // A final name whose bytes never reached the disk, as a crash between the write
+    // and its sync would leave it on a file system that published the name first.
+    let (path, _) = object_holding(&dirs.blobs, &emptied.data);
+    std::fs::write(path, b"").expect("empty the object");
     let torn = dirs.blobs.join("tmp").join("7");
     std::fs::write(&torn, b"a write cut short").expect("plant a torn file");
 
     let (server, after) = started(dirs.server()).await;
     assert!(!torn.exists(), "a torn temporary file outlived the start");
     assert_eq!(read(&after, &kept).await, Ok(kept.data.clone()));
-    for blob in [&corrupt, &lost] {
+    for blob in [&corrupt, &lost, &emptied] {
         assert!(after.holds(blob).await, "nothing reads objects at start");
         assert_eq!(read(&after, blob).await, Err(Code::Unavailable));
         assert!(
@@ -294,11 +301,12 @@ async fn a_lost_or_corrupt_object_is_reported_on_read_and_an_upload_heals_it() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn blob_dir_refuses_what_it_cannot_keep() {
     let dirs = Dirs::new("refused");
-    let others: [&[&str]; 4] = [
+    let others: [&[&str]; 5] = [
         &["--store", "memory"],
         &["--store", "s3"],
         &["--s3-endpoint", "http://127.0.0.1:9"],
         &["--s3-bucket", "b"],
+        &["--s3-prefix", "x/"],
     ];
     for other in others {
         let mut c = dirs.server();
@@ -348,5 +356,76 @@ async fn blob_dir_refuses_what_it_cannot_keep() {
     let (code, stderr) = fails(under_a_file);
     assert_eq!(code, Some(2));
     assert!(stderr.contains("create"), "{stderr}");
+    dirs.remove();
+}
+
+/// Catches an action-cache hit served after the store lost one of its output files
+/// (deleted under `--blob-dir` while the server was down): the index still holds the
+/// output, so only a check of the store turns the hit into a miss. The client must
+/// get a miss (the action runs again), not a result whose output it cannot download,
+/// and FindMissing must then report the output, so it is uploaded again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_hit_whose_output_file_is_lost_is_a_miss_after_a_restart() {
+    let dirs = Dirs::new("lost-output");
+    let (server, before) = started(dirs.server()).await;
+    let mut daemon = before.daemon("node-a", 4, 8).await;
+    let job = Job::new("its output file is lost", &[]);
+    before.upload(&job.blobs()).await;
+    let mut ops = before.execute(&job.action).await;
+    let start = daemon.start().await;
+    let result = output(&before, "an output whose file is deleted", 0).await;
+    assert!(daemon.report(ran(start.lease_id, &result)).await.accepted);
+    assert_eq!(response(&done(&mut ops).await).result, Some(result.clone()));
+    assert_eq!(before.cached(&job.action).await, Ok(result));
+    drop((ops, daemon, before));
+    stop(server);
+
+    let out = Blob::new("an output whose file is deleted");
+    let (path, _) = object_holding(&dirs.blobs, &out.data);
+    std::fs::remove_file(path).expect("delete the output's object");
+
+    let (server, after) = started(dirs.server()).await;
+    assert!(after.holds(&out).await, "nothing reads objects at start");
+    assert_eq!(after.cached(&job.action).await, Err(Code::NotFound));
+    assert!(
+        !after.holds(&out).await,
+        "the lost output is still reported held"
+    );
+    drop(after);
+    stop(server);
+    dirs.remove();
+}
+
+/// Catches a store that writes past its free-space floor (`--blob-dir-min-free-bytes`):
+/// with a floor no file system meets, an upload is answered UNAVAILABLE and nothing is
+/// indexed. The other tests run at the default floor.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn uploads_are_refused_under_the_free_space_floor() {
+    let dirs = Dirs::new("floor");
+    let mut c = dirs.server();
+    c.args(["--blob-dir-min-free-bytes", &u64::MAX.to_string()]);
+    let (server, client) = started(c).await;
+    let blob = Blob::new("a blob with no room");
+    let response = ContentAddressableStorageClient::new(client.channel())
+        .batch_update_blobs(BatchUpdateBlobsRequest {
+            requests: vec![batch_update_blobs_request::Request {
+                digest: Some(blob.proto.clone()),
+                data: blob.data.clone(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        })
+        .await
+        .expect("BatchUpdateBlobs")
+        .into_inner();
+    let codes: Vec<i32> = response
+        .responses
+        .iter()
+        .map(|r| r.status.as_ref().expect("a status").code)
+        .collect();
+    assert_eq!(codes, [Code::Unavailable as i32]);
+    assert!(!client.holds(&blob).await);
+    drop(client);
+    stop(server);
     dirs.remove();
 }
