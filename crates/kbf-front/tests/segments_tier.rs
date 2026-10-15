@@ -400,7 +400,10 @@ async fn a_corrupt_record_is_acknowledged_and_caught_at_the_flush() {
         (&round.corrupt, &round.dropped, &round.flushed),
         (&vec![object], &vec![all[1].digest], &vec![])
     );
-    assert!(farm.store.put_keys().is_empty(), "the bad record is not PUT");
+    assert!(
+        farm.store.put_keys().is_empty(),
+        "the bad record is not PUT"
+    );
     assert_eq!(counter(&cache, "kbf_tier_flush_digest_mismatch_total"), "1");
     assert_eq!(farm.log.answer(&all[1].digest), BlobAnswer::Unavailable);
     let sound = [all[0].clone(), all[2].clone()];
@@ -483,7 +486,10 @@ async fn a_segment_the_tier_does_not_take_is_hashed_before_its_put() {
     let lying: Vec<IndexEntry> = parsed
         .entries()
         .iter()
-        .map(|e| IndexEntry { crc32c: 0xdead_beef, ..*e })
+        .map(|e| IndexEntry {
+            crc32c: 0xdead_beef,
+            ..*e
+        })
         .collect();
     let lie = Seg {
         footer: encode_footer(parsed.records_len(), &lying),
