@@ -67,6 +67,6 @@ fn serve(args: &Args) -> Result<(), Box<dyn Error>> {
     sizes.runtime()?.block_on(async {
         let server = start(args, interrupted).await?;
         println!("{}", server.start_line());
-        server.serve().await
+        Ok(server.serve().await?)
     })
 }
