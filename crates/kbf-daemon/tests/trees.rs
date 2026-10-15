@@ -344,7 +344,10 @@ async fn two_concurrent_leases_share_one_build() {
     wait_for(|| kit.trees.store().stats().waits >= 1).await;
     assert_eq!(kit.trees.store().stats().builds, 0);
     kit.cas.unstall();
-    let ((_, a), (_, b)) = (first.await.unwrap(), second.await.unwrap());
+    let done = tokio::time::timeout(Duration::from_secs(30), async {
+        (first.await.unwrap(), second.await.unwrap())
+    });
+    let ((_, a), (_, b)) = done.await.expect("the leases never finished");
     let stats = kit.trees.store().stats();
     assert_eq!((stats.builds, stats.trees), (1, 1), "{stats:?}");
     assert_eq!(a.mounts[0].source, b.mounts[0].source);
@@ -381,7 +384,10 @@ async fn a_cancelled_build_hands_over_to_a_waiter() {
     leader.abort();
     assert!(leader.await.unwrap_err().is_cancelled());
     kit.cas.unstall();
-    let (_, inputs) = waiter.await.unwrap();
+    let (_, inputs) = tokio::time::timeout(Duration::from_secs(30), waiter)
+        .await
+        .expect("the waiter never took over a dead build")
+        .unwrap();
     assert_eq!(inputs.trees_built, 1, "the waiter built it");
     assert_eq!(kit.trees.store().stats().trees, 1);
     wait_for(|| hidden(&kit.dir.join("trees")).is_empty()).await;

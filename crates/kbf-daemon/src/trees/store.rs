@@ -255,11 +255,9 @@ impl TreeStore {
     /// # Errors
     /// `dir` cannot be made, listed or written.
     pub fn open(dir: PathBuf, max_bytes: u64) -> std::io::Result<Self> {
-        use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
-        std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(&dir)?;
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::create_dir_all(&dir)?;
+        // The container's user must not reach the store but through a mount.
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
         let mut state = State::default();
         for entry in std::fs::read_dir(&dir)? {
