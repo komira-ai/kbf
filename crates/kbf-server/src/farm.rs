@@ -37,7 +37,9 @@ use std::hash::BuildHasher;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use kbf_front::{ActionLabel, Cache, Dispatch, Finished, MetaLog, Recorder, Stage, Submission, Ticket};
+use kbf_front::{
+    ActionLabel, Cache, Dispatch, Finished, MetaLog, Recorder, Stage, Submission, Ticket,
+};
 use kbf_meta::{ActionRecord, Role};
 use kbf_objstore::ObjectStore;
 use kbf_proto::google::rpc;

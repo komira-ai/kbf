@@ -85,8 +85,8 @@ pub use crate::execution::{
 pub use crate::input_tree::{ENTRY_OVERHEAD, InputTreeConfig};
 pub use crate::meta_log::{Leadership, MemoryMetaLog, MetaLog, MetaLogError};
 pub use crate::recorder::{
-    ActionLabel, DEFAULT_INVOCATION_MEMORY, ExecuteCall, RECORDER_CHANNEL, Recorder, Recording, listing, owner,
-    wall_now,
+    ActionLabel, DEFAULT_INVOCATION_MEMORY, ExecuteCall, RECORDER_CHANNEL, Recorder, Recording,
+    listing, owner, wall_now,
 };
 pub use crate::request_metadata::{
     CallMetadata, HEADER as REQUEST_METADATA_HEADER, Invalid, InvocationId, MAX_HEADER_BYTES,
