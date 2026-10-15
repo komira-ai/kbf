@@ -239,9 +239,7 @@ mod tests {
             .next()
             .expect("a split has an item");
         let ran = tail.trim_end_matches("\")").trim_end_matches("ms");
-        let ms: f64 = ran
-            .parse()
-            .unwrap_or_else(|_| panic!("elapsed in ms: {why}"));
+        let ms: f64 = ran.parse().expect("the elapsed time is in milliseconds");
         assert!((50.0..10_000.0).contains(&ms), "{why}");
     }
 
