@@ -657,6 +657,10 @@ pub struct TierCounters {
     pub conflicts: Counter,
     /// Objects with a record that failed its digest on the tier: marked corrupt.
     pub corrupt: Counter,
+    /// Records the flusher found not to hash to their digests, and dropped instead of
+    /// uploading (alert): the daemon's digests are trusted when an upload is
+    /// acknowledged, and checked here.
+    pub digest_mismatch: Counter,
     /// Blobs read from the tier's disk (a block or a flushed copy).
     pub local_reads: Counter,
 }
@@ -709,6 +713,11 @@ impl TierCounters {
                 "kbf_write_tier_corrupt_total",
                 "Staged objects with a record that failed its digest on the tier's disk",
                 self.corrupt.get(),
+            ),
+            (
+                "kbf_tier_flush_digest_mismatch_total",
+                "Records the flusher dropped because they did not hash to their digest (alert)",
+                self.digest_mismatch.get(),
             ),
             (
                 "kbf_write_tier_local_reads_total",

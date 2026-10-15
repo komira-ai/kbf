@@ -215,6 +215,8 @@ native driver gathers its outputs in a `Spool` first (`Cas::put_spool`, which is
   timed as a segment commit.
 - The idle time is `--segment-upload-idle-secs`. `Commit`'s reply lists the digests
   committed; a failed commit is the call's status.
+- Record hashing (section 6.11) runs on the blocking pool, never on a runtime worker, at
+  most `--cpu-threads` (default 4) jobs at once.
 - An upload's connection is found by the peer address of the worker listener's
   tracked connections (`Connections`); a connection's close is seen when the server
   drops its stream.
@@ -263,20 +265,24 @@ native driver gathers its outputs in a `Spool` first (`Cas::put_spool`, which is
    is read from its files.
 5. `Segments/Commit { upload }` moves the upload to **committing**: every later
    `PutRange` is refused (`FAILED_PRECONDITION`, nothing written). The server waits for
-   in-flight range writes, checks every range is present, then checks **every record's
-   SHA-256 against its entry**, computing its crc32c in the same pass (hardware CRC32C
-   where the CPU has it). It stores each
-   segment with a **footer it builds itself** from the checked entries and its own
-   crc32c values, sorted by digest (on the tier, section 6; else one `put_new` plus
-   read-back, as section 3), then commits **one** `PutBlobs` (or `PutStaged`) listing
+   in-flight range writes and checks every range is present. **Without a tier, every
+   record's SHA-256 against its entry** was already checked, with its crc32c in the same
+   pass (hardware CRC32C where the CPU has it), by the `PutRange` that completed it: each
+   record's hash advances over the bytes received unbroken from its start, whatever order
+   the ranges arrive in, and a record that does not match is refused at that range. **With
+   a tier, nothing is hashed on the way to the acknowledgement** (section 6.11). It stores
+   each segment with a **footer it builds itself** from the checked entries and its own
+   crc32c values, sorted by digest (on the tier, section 6, where the flusher builds it
+   from its own hashing; else one `put_new` plus read-back, as section 3), then commits **one** `PutBlobs` (or `PutStaged`) listing
    every record of the upload. The reply lists each digest's outcome. A second `Commit`
    (a retry after a lost reply) waits for the first and returns its result; it never
    stores or commits again. Only then does the daemon write the `ActionResult`.
 
-A daemon cannot poison the cache this way. Nothing writes to a committing upload, so the
-bytes hashed are the bytes stored; a record that does not match its entry fails the
-commit (`INVALID_ARGUMENT`, nothing indexed), as a mismatched ByteStream write does
-today; and a daemon's false crc32c never reaches a stored footer, where a scrub or index
+A daemon cannot poison the object store this way. Nothing writes to a committing
+upload, so the bytes hashed are the bytes stored; without a tier a record that does not
+match its entry fails the upload (`INVALID_ARGUMENT`, nothing indexed), as a mismatched
+ByteStream write does today, and with one the record is caught before it is PUT
+(section 6.11); and a daemon's false crc32c never reaches a stored footer, where a scrub or index
 rebuild would call a good record corrupt. A blob that became present between step 1 and
 the commit is indexed once; its new record is dead bytes, reclaimed with the segment.
 
@@ -620,8 +626,8 @@ Where it differs from the sections above, and why:
 - **At the commit, not at `Begin`.** `Begin` does not reserve and `PutRange` does not
   write to the tier: ranges are held in memory until `Commit`, as on the direct path
   (section 4.2's "with the tier" streaming is not built), and `--segment-upload-max-bytes`
-  stays bound by `--write-bytes-in-flight`. After the records are checked and each
-  segment's footer is built, `Cache::store_upload` offers every segment to
+  stays bound by `--write-bytes-in-flight`. After each segment's footer is built (the
+  records are not hashed here, section 6.11), `Cache::store_upload` offers every segment to
   `Writer::stage` as a block of its own (`reserve_upload`, records written, `fdatasync`,
   one `PutStaged` with `seal`). `Commit` is answered when every segment is staged: no
   PUT, no footer read-back and no `PutBlobs`.
@@ -639,6 +645,50 @@ Where it differs from the sections above, and why:
   footer built from the committed list, PUT, read back, `ObjectFlushed`.
 - Tests: `kbf-front/tests/segments_tier.rs` (commit with every PUT held; flush after the
   store recovers; the budget fallback; restart before the flush).
+
+### 6.11 Where records are verified
+
+The daemon computes the digest of every record it sends and re-hashes every blob it
+fetches (`kbf-transfer`'s `fetch`), and the server hashes the blobs it serves from the
+object store or a block. With a tier, the server does not
+hash on the way to an acknowledgement: **it trusts the daemon's digests when an upload
+is acknowledged, and verifies before the bytes leave for the object store and when they
+are read.**
+
+- **`PutRange` and `Commit` hash nothing** on an upload with a tier attached. `Commit`
+  checks that every range arrived, stages each segment (section 6.10) and answers; a
+  stalled hashing pool cannot delay it. The staged segment's footer is not written (the
+  flusher builds it), so no CRC-32C of the daemon's is used.
+- **The flusher hashes every record it reads back, before the PUT**, on the hashing pool
+  (`--cpu-threads`, the blocking pool, off the runtime workers). It reads each block
+  whole to PUT it anyway, so this adds CPU but no I/O. A record that does not hash to the
+  digest it is listed under is never PUT. It is counted in
+  `kbf_tier_flush_digest_mismatch_total` (alert on any increase), logged at ERROR with
+  its digest and object, and dropped:
+  1. the object is marked unreachable as corrupt, so its blobs are unavailable (a
+     re-upload heals them) and the bad digest answers missing;
+  2. its block is freed;
+  3. the records that did hash to their digests are staged again as a segment of their
+     own (the same path as an upload: the tier, else a PUT), so the rest of the segment
+     still reaches the store and stays readable. The format cannot drop one record in
+     place (the index lists offsets, and a block's offsets are committed), so the sound
+     records are copied into a new block; the bad bytes are not carried.
+  A crash between 1 and 3 loses availability, never correctness: the sound blobs are
+  unavailable until uploaded again, as for any object marked unreachable.
+- **A read of a staged record verifies it**: the server's `read_blob` and `BatchRead`
+  hash the record from the block, and the daemon hashes what it fetches over `ReadRange`.
+  A record that fails its digest on the server is not served, and its object is marked
+  corrupt, as before this section.
+- **A segment the tier does not take** (at the budget, a disk error) is hashed in the
+  cache before its PUT, on the same pool, with a footer built from that pass; a record
+  that fails is `INVALID_ARGUMENT` and nothing of the segment is PUT. **An upload without
+  a tier** is hashed as its ranges arrive (section 4.1), since the PUT is the only
+  copy.
+- **Tests:** `kbf-front/tests/segments_tier.rs` (a corrupt record is acknowledged and
+  caught at the flush, never PUT, counted, the sound records flushed and readable; the
+  fallback PUT refuses a corrupt record; a read of a corrupt staged record before the
+  flush is refused), `kbf-front/tests/write_tier.rs` (a damaged block), and
+  `kbf-front/tests/segments.rs` (no tier: refused at the range and the commit).
 
 ## 7. Expected effect on the 15,189-file upload
 

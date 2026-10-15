@@ -211,6 +211,13 @@ pub struct Args {
     /// that began it closes; one that is committing is kept until its commit ends.
     #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u64).range(1..))]
     pub segment_upload_idle_secs: u64,
+    /// The most CPU-bound jobs the server runs at once on the blocking pool, off the
+    /// request workers: today the SHA-256 and CRC-32C of records, in the write tier's
+    /// flusher before each PUT and, for an upload without a tier, as its ranges arrive.
+    /// The farm node's cores are hyperthreads in pairs; the default leaves most of them
+    /// to the other work.
+    #[arg(long, default_value_t = WriteConfig::DEFAULT.cpu_threads)]
+    pub cpu_threads: NonZeroUsize,
     /// `http://host[:port]` of the S3 service (`--store=s3`).
     #[arg(long, required_if_eq("store", "s3"))]
     pub s3_endpoint: Option<String>,
@@ -494,7 +501,7 @@ impl Args {
 
     /// How the cache groups and bounds uploads: `--write-linger`,
     /// `--write-own-segment-bytes`, `--write-bytes-in-flight`, `--write-puts-in-flight`
-    /// and `--store-put-attempts`.
+    /// `--store-put-attempts` and `--cpu-threads`.
     #[must_use]
     pub fn write_config(&self) -> WriteConfig {
         WriteConfig {
@@ -504,6 +511,7 @@ impl Args {
             puts_in_flight: self.write_puts_in_flight,
             // clap refuses 0.
             put_attempts: NonZeroU32::new(self.store_put_attempts).unwrap_or(NonZeroU32::MIN),
+            cpu_threads: self.cpu_threads,
         }
     }
 
@@ -657,6 +665,19 @@ mod tests {
         assert_eq!(on.map(|(d, o)| (d, o.budget)), Some(("/t".into(), 9)));
     }
 
+    /// Catches a `--cpu-threads` that does not reach the cache's hashing pool (the
+    /// flusher would hash on the default width whatever the operator set), a default
+    /// other than 4, and 0 accepted (a pool that never runs a job).
+    #[test]
+    fn cpu_threads_reaches_the_hashing_pool() {
+        let defaults = Args::parse_from(["kbf-server"]).write_config();
+        assert_eq!(defaults, WriteConfig::DEFAULT);
+        assert_eq!(defaults.cpu_threads.get(), 4);
+        let set = Args::parse_from(["kbf-server", "--cpu-threads=7"]).write_config();
+        assert_eq!(set.cpu_threads.get(), 7);
+        assert!(Args::try_parse_from(["kbf-server", "--cpu-threads=0"]).is_err());
+    }
+
     /// Catches a `--segment-upload-*` flag that does not reach the listeners, a default
     /// other than the design's (1 GiB + 1 MiB, 60 s), and a cap below one largest blob
     /// and its footer accepted (a `Begin` for such a blob would be refused for good).
@@ -793,6 +814,7 @@ mod tests {
             bytes_in_flight: MAX_BLOB_BYTES,
             puts_in_flight: NonZeroUsize::new(9).expect("9"),
             put_attempts: NonZeroU32::new(5).expect("5"),
+            ..WriteConfig::DEFAULT
         };
         assert_eq!(set.write_config(), want);
         let below = (MAX_BLOB_BYTES - 1).to_string();

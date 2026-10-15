@@ -748,6 +748,7 @@ mod flush;
 mod tier;
 mod touches;
 mod upload;
+mod verify;
 mod write_group;
 
 pub use batch::BATCH_READS_IN_FLIGHT;
