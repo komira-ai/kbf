@@ -13,7 +13,8 @@
 //! resumes from the bytes it received.
 //!
 //! - [`cas`]: the [`Cas`] trait every store implements (the engine, and the in-memory
-//!   stores of tests), with [`digest_of`], [`fetch`] and [`label`].
+//!   stores of tests), with [`digest_of`], [`fetch`] and [`label`]. It is the daemon's
+//!   data plane; `kbf-cas-conformance` holds the checks any implementation must pass.
 //! - [`Transfers`] and [`Scope`]: the engine, and one lease's view of it, which counts
 //!   the lease's [`TransferStats`].
 //! - [`TransferConfig`]: the `--transfer-*` flags and `--segment-upload-streams` and `--segment-uploads-in-flight`.

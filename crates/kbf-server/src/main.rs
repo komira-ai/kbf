@@ -39,23 +39,11 @@
 //! that cannot be raised) exits 2. Its flusher runs every second until the server stops.
 
 use std::error::Error;
-use std::future::Future;
-use std::io;
-use std::net::SocketAddr;
 use std::process::ExitCode;
-use std::sync::Arc;
 
 use clap::Parser;
-use kbf_front::Cache;
-use kbf_log::FarmLogId;
-use kbf_meta::Retention;
-use kbf_objstore::{FsStore, KeyPrefix, ObjectStore};
-use kbf_server::stores::{COLD_FILE_MIN_FREE_BYTES, FILE_PREFIX_ROOT, StoreUri, Stores};
-use kbf_server::write_tier::FLUSH_EVERY;
-use kbf_server::{Args, RaftMetaLog, SERVER_VERSION, bind_server_with_policy, s3_store};
-use kbf_store::StdFs;
+use kbf_server::{Args, interrupted, sizes_on, start};
 use kbf_threads::Topology;
-use kbf_threads::disk::Statvfs;
 
 fn main() -> ExitCode {
     tracing_subscriber::fmt()
@@ -71,206 +59,14 @@ fn main() -> ExitCode {
     }
 }
 
-/// Builds the async runtime the thread flags size, then runs [`start`] on it.
+/// Builds the async runtime the thread flags size, then starts the server on it, prints
+/// the start line and serves until a signal.
 fn serve(args: &Args) -> Result<(), Box<dyn Error>> {
     let sizes = sizes_on(args, Topology::detect());
     sizes.log();
-    sizes.runtime()?.block_on(start(args))
-}
-
-/// The server's thread sizes on a given machine shape: every CPU, then the overrides.
-fn sizes_on(args: &Args, topology: Topology) -> kbf_threads::Sizes {
-    args.threads.resolve(topology)
-}
-
-/// Builds the object store and the metadata log the flags name, then serves.
-async fn start(args: &Args) -> Result<(), Box<dyn Error>> {
-    let stores = args.stores(&Statvfs)?;
-    for line in stores.describe() {
-        tracing::info!("{line}");
-    }
-    match &stores.cold {
-        StoreUri::File(dir) => {
-            let store = FsStore::open(dir, COLD_FILE_MIN_FREE_BYTES)?;
-            over(args, &stores, store, FILE_PREFIX_ROOT).await
-        }
-        StoreUri::S3(uri) => {
-            let store = s3_store(uri, |name| std::env::var(name).ok())?;
-            over(args, &stores, store, &uri.prefix).await
-        }
-    }
-}
-
-/// Serves `store` under the Raft metadata log in `stores.meta_dir`, writing under the
-/// prefix it committed: `<prefix_root><log id>/` for a new log.
-async fn over<O: ObjectStore + 'static>(
-    args: &Args,
-    stores: &Stores,
-    store: O,
-    prefix_root: &str,
-) -> Result<(), Box<dyn Error>> {
-    let log = RaftMetaLog::open_dir(&stores.meta_dir, Retention::default(), prefix_root).await?;
-    let (prefix, id) = (log.store_prefix(), log.log_id());
-    run(args, stores, log, store, prefix, id).await
-}
-
-async fn run<O: ObjectStore + 'static>(
-    args: &Args,
-    stores: &Stores,
-    meta: RaftMetaLog<StdFs>,
-    store: O,
-    prefix: KeyPrefix,
-    log: FarmLogId,
-) -> Result<(), Box<dyn Error>> {
-    let listeners = args.listeners()?;
-    let policy = args.reapi_auth_policy()?;
-    let routes = Routes {
-        invocations: policy.invocations_get.is_some(),
-        blobs: policy.invocations_get.is_some() && policy.blobs_get.is_some(),
-    };
-    let cache = Cache::open(meta, store, prefix)
-        .await?
-        .with_writes(args.write_config())
-        .with_input_trees(args.input_tree_config());
-    let (cache, tier) = kbf_server::write_tier::attach(cache, stores.hot.as_ref()).await?;
-    let cache = Arc::new(cache);
-    let _flusher = tier.map(|_| {
-        let flusher = kbf_server::write_tier::run_flusher(Arc::clone(&cache), FLUSH_EVERY);
-        AbortOnDrop(tokio::spawn(flusher))
-    });
-    let shutdown = interrupted()?;
-    let api = args.api()?;
-    let bound = bind_server_with_policy(cache, listeners, api, policy, shutdown)?;
-    let plain = args.plain_text_off_loopback();
-    println!(
-        "{}",
-        start_line(
-            bound.reapi,
-            bound.worker,
-            bound.api,
-            routes,
-            Some(log),
-            &plain
-        )
-    );
-    bound.serving.await?;
-    Ok(())
-}
-
-/// Aborts a task when dropped: the flusher stops with the server.
-struct AbortOnDrop(tokio::task::JoinHandle<()>);
-
-impl Drop for AbortOnDrop {
-    fn drop(&mut self) {
-        self.0.abort();
-    }
-}
-
-/// Which of the operator API's routes that are off unless the policy names them are on.
-#[derive(Clone, Copy, Debug)]
-struct Routes {
-    /// The build pages, `GET /v1/invocations/{id}` and below.
-    invocations: bool,
-    /// `GET /v1/blobs/{digest}`.
-    blobs: bool,
-}
-
-/// `on` or `off`.
-const fn on_off(on: bool) -> &'static str {
-    if on { "on" } else { "off" }
-}
-
-/// The start line: the version, the addresses bound (with the operator API's, whether
-/// it serves the build pages and `blobs`) and the Raft log's id, and one warning
-/// naming the listeners in `plain` (those serving plain text off loopback) when there
-/// are any.
-fn start_line(
-    reapi: SocketAddr,
-    worker: SocketAddr,
-    api: Option<SocketAddr>,
-    routes: Routes,
-    log: Option<FarmLogId>,
-    plain: &[&str],
-) -> String {
-    let (invocations, blobs) = (on_off(routes.invocations), on_off(routes.blobs));
-    let api = api
-        .map(|a| format!(" invocations={invocations} blobs={blobs} api={a}"))
-        .unwrap_or_default();
-    let log = log.map(|id| format!(" log={id}")).unwrap_or_default();
-    let warning = if plain.is_empty() {
-        String::new()
-    } else {
-        format!(" warning=plaintext-off-loopback:{}", plain.join(","))
-    };
-    format!("kbf-server {SERVER_VERSION} reapi={reapi} worker={worker}{api}{log}{warning}")
-}
-
-/// Installs the SIGINT and SIGTERM handlers now and returns a future that completes on
-/// either signal.
-///
-/// `tokio::signal::ctrl_c()` installs its handler only when first polled, which is
-/// after the start line is printed; a SIGINT in between killed the process by the
-/// default action instead of stopping it cleanly (issue #86). `signal` installs the
-/// handler when it is called.
-///
-/// # Errors
-/// The handler cannot be installed.
-#[cfg(unix)]
-fn interrupted() -> io::Result<impl Future<Output = ()> + Send + 'static> {
-    use tokio::signal::unix::{SignalKind, signal};
-    let mut sigint = signal(SignalKind::interrupt())?;
-    let mut sigterm = signal(SignalKind::terminate())?;
-    Ok(async move {
-        tokio::select! {
-            _ = sigint.recv() => {}
-            _ = sigterm.recv() => {}
-        }
+    sizes.runtime()?.block_on(async {
+        let server = start(args, interrupted).await?;
+        println!("{}", server.start_line());
+        server.serve().await
     })
-}
-
-/// Returns a future that completes on Ctrl-C. Elsewhere than Unix the handler is
-/// installed when the future is first polled, after the start line is printed.
-#[cfg(not(unix))]
-#[expect(clippy::unnecessary_wraps, reason = "the same signature as on Unix")]
-fn interrupted() -> io::Result<impl Future<Output = ()> + Send + 'static> {
-    Ok(async {
-        let _ = tokio::signal::ctrl_c().await;
-    })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Catches the server sizing itself from anything but the CPU count: on the 44-core,
-    /// 2-threads-per-core farm node it runs 88 async workers, 512 blocking threads
-    /// (tokio's cap) and 88 CPU threads, on a 3-CPU machine 3, 512 and 3; a flag still
-    /// wins over its default (alone), and `--reserve-cpus` and `--reserve-share` are
-    /// refused, so a stale unit file is noticed.
-    #[test]
-    fn the_server_uses_every_cpu() {
-        let triple = |args: &Args, topology| {
-            let sizes = sizes_on(args, topology);
-            (
-                sizes.async_threads(),
-                sizes.blocking_threads(),
-                sizes.cpu_threads(),
-            )
-        };
-        let args = Args::parse_from(["kbf-server"]);
-        assert_eq!(triple(&args, Topology::new(88, 2)), (88, 512, 88));
-        assert_eq!(triple(&args, Topology::new(3, 1)), (3, 512, 3));
-        assert_eq!(args.cpu_threads_on(Topology::new(88, 2)).get(), 88);
-        let args = Args::parse_from(["kbf-server", "--blocking-threads=9"]);
-        assert_eq!(triple(&args, Topology::new(88, 2)), (88, 9, 88));
-        let args = Args::parse_from(["kbf-server", "--async-threads=5", "--cpu-threads=6"]);
-        assert_eq!(triple(&args, Topology::new(88, 2)), (5, 512, 6));
-        assert_eq!(args.cpu_threads_on(Topology::new(88, 2)).get(), 6);
-        for flag in ["--reserve-cpus=16", "--reserve-share=2"] {
-            assert!(
-                Args::try_parse_from(["kbf-server", flag]).is_err(),
-                "{flag}"
-            );
-        }
-    }
 }
