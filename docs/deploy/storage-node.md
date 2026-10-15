@@ -258,18 +258,23 @@ kbf-server \
   - keeps and counts a file under another prefix, and leaves a file without a header;
   - then forgets each indexed object, not staged, that has no file: its blobs leave
     the index, with every action-cache entry that needs one of them, so
-    `FindMissingBlobs` reports them and the client uploads them again. Before it
-    forgets the first, it raises the Raft log to machine version 3, which a server
-    binary older than this one refuses.
+    `FindMissingBlobs` reports them and the client uploads them again. Forgetting
+    needs the Raft log at machine version 3, which a server binary older than this
+    one refuses. Before it forgets the first, a log whose cell has a single voter (a
+    single-host farm) is raised to it. A cell of more voters is never raised by the
+    pass: until the operator raises it, once every replica runs version 3, the pass
+    marks each such object missing instead (its blobs are reported missing and its
+    action-cache entries miss, but stay in the index) and logs
+    `evict/forget needs log V3: N objects held` once.
   - The guard: it forgets nothing unless the walk found the file of at least one
     indexed object. A directory with none is not the one the index was written over
     (a disk that is not mounted: the server creates the directory empty), and the
     pass logs an error instead of emptying the index.
 
   It logs one line at the end: files read, kept, orphans deleted, foreign, without a
-  header, objects, blobs and entries forgotten, objects held back by the guard, the
-  bytes held and how long it took. A pass that fails is logged and runs again at the
-  next start.
+  header, objects, blobs and entries forgotten, objects marked missing for want of
+  version 3, objects held back by the guard, the bytes held and how long it took. A
+  pass that fails is logged and runs again at the next start.
 - Until the pass reaches it, or for a file lost while the server runs, a blob whose
   file was lost, damaged or left empty is still reported present by
   `FindMissingBlobs` until a read of it fails: that read answers `UNAVAILABLE` and
