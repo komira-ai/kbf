@@ -224,13 +224,6 @@ pub struct Args {
     /// that began it closes; one that is committing is kept until its commit ends.
     #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u64).range(1..))]
     pub segment_upload_idle_secs: u64,
-    /// The most CPU-bound jobs the server runs at once on the blocking pool, off the
-    /// request workers: today the SHA-256 and CRC-32C of records, in the write tier's
-    /// flusher before each PUT and, for an upload without a tier, as its ranges arrive.
-    /// The farm node's cores are hyperthreads in pairs; the default leaves most of them
-    /// to the other work.
-    #[arg(long, default_value_t = WriteConfig::DEFAULT.cpu_threads)]
-    pub cpu_threads: NonZeroUsize,
     /// `http://host[:port]` of the S3 service (`--store=s3`).
     #[arg(long, required_if_eq("store", "s3"))]
     pub s3_endpoint: Option<String>,
@@ -515,9 +508,10 @@ impl Args {
 
     /// How the cache groups and bounds uploads: `--write-linger`,
     /// `--write-own-segment-bytes`, `--write-bytes-in-flight`, `--write-puts-in-flight`
-    /// `--store-put-attempts` and `--cpu-threads`.
+    /// `--store-put-attempts`; `cpu_threads`, the width of the hashing pool, is what
+    /// `--cpu-threads` and `--reserve-cpus` resolve to (`kbf_threads::Sizes`).
     #[must_use]
-    pub fn write_config(&self) -> WriteConfig {
+    pub fn write_config(&self, cpu_threads: NonZeroUsize) -> WriteConfig {
         WriteConfig {
             linger: Duration::from_millis(self.write_linger),
             own_segment_bytes: self.write_own_segment_bytes,
@@ -525,7 +519,7 @@ impl Args {
             puts_in_flight: self.write_puts_in_flight,
             // clap refuses 0.
             put_attempts: NonZeroU32::new(self.store_put_attempts).unwrap_or(NonZeroU32::MIN),
-            cpu_threads: self.cpu_threads,
+            cpu_threads,
         }
     }
 
@@ -700,17 +694,13 @@ mod tests {
         assert_eq!(on.map(|(d, o)| (d, o.budget)), Some(("/t".into(), 9)));
     }
 
-    /// Catches a `--cpu-threads` that does not reach the cache's hashing pool (the
-    /// flusher would hash on the default width whatever the operator set), a default
-    /// other than 4, and 0 accepted (a pool that never runs a job).
+    /// Catches the hashing pool's width not being the value the caller resolved (the
+    /// flusher would hash on the default whatever the operator set).
     #[test]
-    fn cpu_threads_reaches_the_hashing_pool() {
-        let defaults = Args::parse_from(["kbf-server"]).write_config();
-        assert_eq!(defaults, WriteConfig::DEFAULT);
-        assert_eq!(defaults.cpu_threads.get(), 4);
-        let set = Args::parse_from(["kbf-server", "--cpu-threads=7"]).write_config();
-        assert_eq!(set.cpu_threads.get(), 7);
-        assert!(Args::try_parse_from(["kbf-server", "--cpu-threads=0"]).is_err());
+    fn the_hashing_pool_width_is_the_resolved_one() {
+        let args = Args::parse_from(["kbf-server"]);
+        let width = NonZeroUsize::new(7).expect("nonzero");
+        assert_eq!(args.write_config(width).cpu_threads, width);
     }
 
     /// Catches a `--segment-upload-*` flag that does not reach the listeners, a default
@@ -828,7 +818,8 @@ mod tests {
     /// the write configuration, and defaults other than the design's.
     #[test]
     fn write_flags_make_the_write_config() {
-        let defaults = Args::parse_from(["kbf-server"]).write_config();
+        let defaults =
+            Args::parse_from(["kbf-server"]).write_config(WriteConfig::DEFAULT.cpu_threads);
         assert_eq!(defaults, WriteConfig::DEFAULT);
         let set = Args::parse_from([
             "kbf-server",
@@ -851,7 +842,7 @@ mod tests {
             put_attempts: NonZeroU32::new(5).expect("5"),
             ..WriteConfig::DEFAULT
         };
-        assert_eq!(set.write_config(), want);
+        assert_eq!(set.write_config(WriteConfig::DEFAULT.cpu_threads), want);
         let below = (MAX_BLOB_BYTES - 1).to_string();
         for (flag, value) in [
             ("--write-bytes-in-flight", below.as_str()),

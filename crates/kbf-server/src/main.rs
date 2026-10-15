@@ -49,6 +49,7 @@ use kbf_objstore::{Capabilities, KeyPrefix, MemoryStore, ObjectStore};
 use kbf_server::write_tier::{FLUSH_EVERY, TierLog};
 use kbf_server::{Args, RaftMetaLog, SERVER_VERSION, StoreKind, bind_server_with_policy};
 use kbf_threads::{Role, Topology};
+use std::num::NonZeroUsize;
 
 fn main() -> ExitCode {
     tracing_subscriber::fmt()
@@ -68,7 +69,8 @@ fn main() -> ExitCode {
 fn serve(args: &Args) -> Result<(), Box<dyn Error>> {
     let sizes = sizes_on(args, Topology::detect())?;
     sizes.log();
-    sizes.runtime()?.block_on(start(args))
+    let cpu = NonZeroUsize::new(sizes.cpu_threads()).unwrap_or(NonZeroUsize::MIN);
+    sizes.runtime()?.block_on(start(args, cpu))
 }
 
 /// The server's thread sizes on a given machine shape: the reserve (all the CPUs unless
@@ -81,23 +83,23 @@ fn sizes_on(
 }
 
 /// Builds the object store and the metadata log the flags name, then serves.
-async fn start(args: &Args) -> Result<(), Box<dyn Error>> {
+async fn start(args: &Args, cpu: NonZeroUsize) -> Result<(), Box<dyn Error>> {
     let raft_dir = args.raft_dir()?;
     let memory = || MemoryMetaLog::new(Retention::default());
     match args.store {
         StoreKind::Memory => {
             let store = MemoryStore::new(Capabilities::default());
-            run(args, memory(), store, KeyPrefix::default(), None).await
+            run(args, cpu, memory(), store, KeyPrefix::default(), None).await
         }
         StoreKind::S3 => {
             let (store, start_prefix) = args.s3_store(|name| std::env::var(name).ok())?;
             match raft_dir {
-                None => run(args, memory(), store, start_prefix, None).await,
+                None => run(args, cpu, memory(), store, start_prefix, None).await,
                 Some(dir) => {
                     let log =
                         RaftMetaLog::open_dir(dir, Retention::default(), &args.s3_prefix).await?;
                     let (prefix, id) = (log.store_prefix(), log.log_id());
-                    run(args, log, store, prefix, Some(id)).await
+                    run(args, cpu, log, store, prefix, Some(id)).await
                 }
             }
         }
@@ -106,6 +108,7 @@ async fn start(args: &Args) -> Result<(), Box<dyn Error>> {
 
 async fn run<M: TierLog, O: ObjectStore + 'static>(
     args: &Args,
+    cpu: NonZeroUsize,
     meta: M,
     store: O,
     prefix: KeyPrefix,
@@ -119,7 +122,7 @@ async fn run<M: TierLog, O: ObjectStore + 'static>(
     };
     let cache = Cache::open(meta, store, prefix)
         .await?
-        .with_writes(args.write_config())
+        .with_writes(args.write_config(cpu))
         .with_input_trees(args.input_tree_config());
     let (cache, tier) = kbf_server::write_tier::attach(cache, args).await?;
     let cache = Arc::new(cache);
