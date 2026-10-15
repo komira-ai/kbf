@@ -271,6 +271,16 @@ fn a_helper_runs_one_program_in_the_namespace_it_is_given() {
     let config = render(Mapping::Setup, &give);
     assert_eq!(config["process"]["args"], json!(give.args));
     assert_eq!(config["process"]["noNewPrivileges"], true);
+    // None of the defaults `oci-spec` fills in: a hostname needs a UTS namespace, masked
+    // paths a /proc, resources a cgroup.
+    for absent in ["hostname", "annotations"] {
+        assert!(config.get(absent).is_none(), "{absent}");
+    }
+    for absent in ["resources", "cgroupsPath", "seccomp"] {
+        assert!(config["linux"].get(absent).is_none(), "{absent}");
+    }
+    assert_eq!(config["linux"]["maskedPaths"], json!([]));
+    assert_eq!(config["linux"]["readonlyPaths"], json!([]));
     let uids = &config["linux"]["uidMappings"];
     assert_eq!(uids[0], json!({"containerID": 0, "hostID": 990, "size": 1}));
     assert_eq!(

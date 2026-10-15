@@ -225,15 +225,21 @@ pub(crate) fn config(rootfs: &Path, ids: &DaemonIds, mapping: Mapping, job: &Job
     let (uids, gids) = ids.mappings(mapping);
     let namespaces = [LinuxNamespaceType::User, LinuxNamespaceType::Mount]
         .map(|typ| built(LinuxNamespaceBuilder::default().typ(typ).build()));
-    let linux = built(
+    let mut linux = built(
         LinuxBuilder::default()
             .uid_mappings(uids)
             .gid_mappings(gids)
             .namespaces(namespaces.to_vec())
+            .masked_paths(Vec::<String>::new())
+            .readonly_paths(Vec::<String>::new())
             .build(),
     );
+    // `oci-spec` fills what a builder leaves out with its own defaults (a resources
+    // section, a hostname, annotations); a helper has no cgroup, no UTS namespace to
+    // set a hostname in, and nothing to mask.
+    linux.set_resources(None);
     let root = built(RootBuilder::default().path(rootfs).readonly(false).build());
-    built(
+    let mut spec = built(
         SpecBuilder::default()
             .version("1.0.0")
             .root(root)
@@ -241,7 +247,10 @@ pub(crate) fn config(rootfs: &Path, ids: &DaemonIds, mapping: Mapping, job: &Job
             .mounts(mounts)
             .linux(linux)
             .build(),
-    )
+    );
+    spec.set_hostname(None);
+    spec.set_annotations(None);
+    spec
 }
 
 /// The links the helper root holds so the programs and libraries of a merged-`/usr`
