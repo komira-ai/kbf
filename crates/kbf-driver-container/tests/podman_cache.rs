@@ -26,7 +26,6 @@ kbf_driver_container::chown_dirs_test_hook!();
 /// scratch directory, it is emptied first: CI restores `target` from an earlier run.
 fn with_cache(config: &mut PodmanConfig, link: Option<Arc<kbf_daemon::cache::LinkFn>>) {
     let dir = PathBuf::from(format!("{}-cache", config.scratch.display()));
-    support::force_remove(&dir);
     std::fs::create_dir_all(&dir).expect("cache dir");
     let mut cache = CacheConfig::new(dir, config.scratch.clone(), 1 << 30);
     if let Some(link) = link {
@@ -214,7 +213,6 @@ async fn identical_inputs_are_one_inode_and_tar_alike_on_every_run() {
 fn with_trees(config: &mut PodmanConfig) {
     with_cache(config, None);
     let trees = PathBuf::from(format!("{}-trees", config.scratch.display()));
-    support::force_remove(&trees);
     let mut trees = kbf_daemon::trees::TreeConfig::new(trees, 1 << 30);
     trees.min_files = 20;
     config.cache.as_mut().expect("a cache").trees = Some(trees);
