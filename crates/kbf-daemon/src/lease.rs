@@ -625,11 +625,26 @@ mod tests {
 
     /// A runtime whose every run ends at once with the one error it was given, before
     /// any input is fetched.
-    struct Failing(std::sync::Mutex<Option<RuntimeError>>);
+    struct Failing {
+        error: std::sync::Mutex<Option<RuntimeError>>,
+        /// What the runtime reports for the run ([`Runtime::failed_usage`]), once.
+        usage: std::sync::Mutex<Option<ResourceUsage>>,
+    }
 
     impl Failing {
         fn with(error: RuntimeError) -> Arc<Self> {
-            Arc::new(Self(std::sync::Mutex::new(Some(error))))
+            Arc::new(Self {
+                error: std::sync::Mutex::new(Some(error)),
+                usage: std::sync::Mutex::new(None),
+            })
+        }
+
+        /// [`Failing::with`] `error`, a run that measured `usage`.
+        fn measured(error: RuntimeError, usage: &ResourceUsage) -> Arc<Self> {
+            Arc::new(Self {
+                error: std::sync::Mutex::new(Some(error)),
+                usage: std::sync::Mutex::new(Some(usage.clone())),
+            })
         }
     }
 
@@ -644,11 +659,15 @@ mod tests {
 
         async fn run(&self, _work: Work) -> Result<ActionResult, RuntimeError> {
             Err(self
-                .0
+                .error
                 .lock()
                 .expect("error lock")
                 .take()
                 .expect("one run per runtime"))
+        }
+
+        fn failed_usage(&self, _lease_id: LeaseId) -> Option<ResourceUsage> {
+            self.usage.lock().expect("usage lock").take()
         }
 
         async fn kill(&self, _lease_id: LeaseId) {}
@@ -771,33 +790,6 @@ mod tests {
         assert!(!log.contains("lease failed"), "{log}");
     }
 
-    /// A runtime whose one run ends at once with the error it was given, and which
-    /// reports `usage` for it ([`Runtime::failed_usage`]) the first time it is asked.
-    struct Measured {
-        error: std::sync::Mutex<Option<RuntimeError>>,
-        usage: std::sync::Mutex<Option<ResourceUsage>>,
-    }
-
-    impl Runtime for Measured {
-        fn driver(&self) -> &'static str {
-            "measured"
-        }
-
-        fn serves(&self, kind: &str) -> bool {
-            kind == "action"
-        }
-
-        async fn run(&self, _work: Work) -> Result<ActionResult, RuntimeError> {
-            Err(self.error.lock().expect("lock").take().expect("one run"))
-        }
-
-        fn failed_usage(&self, _lease_id: LeaseId) -> Option<ResourceUsage> {
-            self.usage.lock().expect("lock").take()
-        }
-
-        async fn kill(&self, _lease_id: LeaseId) {}
-    }
-
     /// Catches a lease that ends without a result losing what its runtime counted:
     /// the memory ladder needs the peak of an out-of-memory kill and the CPU of a
     /// timed-out or killed action, and a result built only from the error carries
@@ -839,10 +831,7 @@ mod tests {
         ];
         for (error, oom) in errors {
             let name = failure_kind(&error);
-            let runtime = Arc::new(Measured {
-                error: std::sync::Mutex::new(Some(error)),
-                usage: std::sync::Mutex::new(Some(usage.clone())),
-            });
+            let runtime = Failing::measured(error, &usage);
             let (result, log) = finish_logged(runtime, false).await;
             let carried = result
                 .action_result
@@ -853,10 +842,8 @@ mod tests {
                 .lines()
                 .find(|l| l.contains("lease phases:"))
                 .expect("a phases line");
-            assert!(
-                line.contains(" cpu_usage_us=1000000 ") && line.contains(" mem_peak=4096 "),
-                "{name}: {line}"
-            );
+            assert!(line.contains(" cpu_usage_us=1000000 "), "{name}: {line}");
+            assert!(line.contains(" mem_peak=4096 "), "{name}: {line}");
             assert!(line.contains("parallelism=0.50"), "{name}: {line}");
             assert_eq!(line.ends_with(" oom=1"), oom, "{name}: {line}");
         }

@@ -203,6 +203,24 @@ fn the_numa_sample_with_the_most_memory_wins_over_a_later_smaller_one() {
     assert_eq!(sample.finish(&dir).numa, vec![node(0, 2000), node(1, 900)]);
 }
 
+/// Catches the count of samples (what a test waits on to know the sampler ran) counting
+/// a reading that held no memory, or one that could not be read: only a reading with
+/// memory in it is one.
+#[test]
+fn only_a_reading_with_memory_is_counted() {
+    let dir = scratch("counted");
+    let counted = Arc::new(AtomicU64::new(0));
+    let mut sample = NumaSample::counting(Arc::clone(&counted));
+    sample.observe(&dir);
+    write(&dir, "memory.numa_stat", "anon N0=0 N1=0\nfile N0=0 N1=0\n");
+    sample.observe(&dir);
+    assert_eq!(counted.load(Ordering::Acquire), 0);
+    write(&dir, "memory.numa_stat", "anon N0=1 N1=0\n");
+    sample.observe(&dir);
+    sample.observe(&dir);
+    assert_eq!(counted.load(Ordering::Acquire), 2);
+}
+
 /// Catches a sampler that never samples (the memory of the run is gone by the end): the
 /// file's value is read while the watch is polled, and gone from the file by the end.
 /// The clock is paused: it moves only when everything waits for a timer, so the ticks

@@ -117,10 +117,8 @@ impl NumaSample {
             return;
         };
         let now = numa_stat(&text);
-        if total(&now) > 0
-            && let Some(counted) = &self.counted
-        {
-            counted.fetch_add(1, Ordering::Release);
+        if let Some(counted) = &self.counted {
+            counted.fetch_add(u64::from(total(&now) > 0), Ordering::Release);
         }
         if total(&now) > total(&self.best) {
             self.best = now;
