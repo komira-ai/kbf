@@ -586,8 +586,8 @@ Where it differs from the sections above, and why:
   log stays at version 1 until something raises it: a server that never attaches a
   tier writes a log an older binary still reads. `RaftMetaLog::open_running(.., runs)`
   opens as a binary that runs versions up to `runs` would; the server runs
-  `raft_log::RUNS` (version 2). A version past `runs`, committed or asked for, is
-  refused.
+  `raft_log::RUNS` (version 3 since `EvictObjects`, [storage.md](storage.md)). A
+  version past `runs`, committed or asked for, is refused.
 - **The cell's server attaches the tier at each start** as `Cache::attach_tier` does,
   after the raise, and stages, flushes and reads as `cache/tier.rs` and
   `cache/flush.rs` do, over `kbf-tier`'s `Tier` on a second `FaultFs` that a crash

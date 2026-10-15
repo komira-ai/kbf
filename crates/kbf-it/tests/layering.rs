@@ -216,8 +216,7 @@ fn pure_modules_deny_the_clippy_lists() {
 }
 
 /// The one crate allowed to depend on both the server and the node library: the combined
-/// binary. It does not exist yet; its entry is here so adding it is not a layering
-/// change.
+/// binary.
 const JOINERS: &[&str] = &["kbf-all-in-one"];
 
 /// What the server library's normal dependencies must not reach: the daemon side. The

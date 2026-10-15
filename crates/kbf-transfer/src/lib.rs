@@ -52,7 +52,8 @@ pub use config::{
 pub use engine::{Scope, Transfers};
 pub use kbf_segments::RecordHasher;
 pub use segments::{
-    COALESCE_GAP_BYTES, Located, MAX_RANGE_BYTES, MAX_UPLOAD_RECORDS, SEGMENT_UPLOAD_BYTES,
+    COALESCE_GAP_BYTES, Located, MAX_RANGE_BYTES, MAX_UPLOAD_RECORDS, Planned,
+    SEGMENT_UPLOAD_BYTES, plan, read_pieces,
 };
 pub use source::{FileSource, OPEN_DIRECTORY, OPEN_FILE, Record, Source, Stamp, descend};
 pub use spool::{Spool, Spooled, to_proto as proto_digest};

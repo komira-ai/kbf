@@ -41,7 +41,8 @@
 //! - **Machine version.** A new log is at [`MachineVersion::V1`], whose entries are
 //!   format 1. [`RaftMetaLog::raise_machine_version`] commits a `MachineVersion`
 //!   entry; every entry after it is in the new version's format, so a log raised to
-//!   [`MachineVersion::V2`] takes the write tier's commands. A start replays the raise
+//!   [`MachineVersion::V2`] takes the write tier's commands, and one raised to
+//!   [`MachineVersion::V3`] takes `EvictObjects` too. A start replays the raise
 //!   with the log. A binary that does not run the version (any older one) refuses the
 //!   log at that entry. A raise commits alone, under the host's lock; a batch is
 //!   encoded under that lock too, in the format committed when it commits, so no
@@ -89,10 +90,10 @@ use self::machine::MetaMachine;
 pub use self::machine::NoSnapshots;
 pub use self::recorded::{RECORD, RECORD_TMP};
 
-/// The highest machine version this binary runs: [`MachineVersion::V2`], the write
-/// tier's commands. A log stays at the version it was raised to; a new one starts at
-/// [`MachineVersion::V1`].
-pub const RUNS: MachineVersion = MachineVersion::V2;
+/// The highest machine version this binary runs: [`MachineVersion::V3`], the write
+/// tier's commands and `EvictObjects`. A log stays at the version it was raised to; a
+/// new one starts at [`MachineVersion::V1`].
+pub const RUNS: MachineVersion = MachineVersion::V3;
 
 /// How often the log commits farm time.
 pub const TICK: Duration = Duration::from_secs(1);

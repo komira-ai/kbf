@@ -46,6 +46,6 @@ pub use crate::model::{
     LossMark, Miss, ObjectId, Retention, Role, StoreId, Touch, UnreachableReason,
 };
 pub use crate::state::{
-    ActionWriteError, Applied, BlobWrite, Collected, Command, MetaState, UnallocatedEpoch,
+    ActionWriteError, Applied, BlobWrite, Collected, Command, Evicted, MetaState, UnallocatedEpoch,
 };
 pub use crate::tier::{ServerId, StagedObject, StagedPut, StagedState, TierError, TierId};

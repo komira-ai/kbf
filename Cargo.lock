@@ -1291,6 +1291,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "kbf-all-in-one"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "futures",
+ "kbf-cas-conformance",
+ "kbf-driver-container",
+ "kbf-front",
+ "kbf-node",
+ "kbf-proto",
+ "kbf-segments",
+ "kbf-server",
+ "kbf-testkit",
+ "kbf-threads",
+ "kbf-transfer",
+ "kbf-types",
+ "prost",
+ "rcgen",
+ "rustix",
+ "tokio",
+ "tonic",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "kbf-auth"
 version = "0.1.0"
 dependencies = [

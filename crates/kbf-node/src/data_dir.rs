@@ -3,14 +3,17 @@
 //!
 //! ```text
 //! <data-dir>/leases   lease directories (container, native and whole-machine drivers)
-//! <data-dir>/cache    the input cache the container driver links leases' inputs from
-//! <data-dir>/trees    the shared read-only input trees (container, Linux)
+//! <data-dir>/cache    the input cache leases' inputs come from: linked (container), cloned (native, macOS)
+//! <data-dir>/trees    the shared input trees: mounted read-only (container), cloned whole (native, macOS)
 //! ```
 //!
-//! They share one filesystem, which the cache and the trees need to link instead of
-//! copy. The cache and the trees are on by default under the container driver; the
-//! native driver never uses them (its actions run as the daemon's user, who owns the
-//! cache and could write it), so it makes no `cache` or `trees`. Nothing is sized by a
+//! They share one filesystem, which the cache and the trees need to link or clone
+//! instead of copy. The cache and the trees are on by default under the container
+//! driver and under the native driver on macOS (a lease's inputs there are clones, so
+//! an action writes its own copy and the sandbox keeps the cache and the trees, outside
+//! every lease directory, out of its reach). The native driver on Linux never uses them
+//! (its actions run as the daemon's user, who owns the cache and could write it), so
+//! it makes no `cache` or `trees`. Nothing is sized by a
 //! flag: the budgets come from the filesystem ([`Budgets`]), and `--data-max-bytes`
 //! only lowers them. The daemon logs every directory and budget it resolved at start.
 //!
@@ -42,7 +45,8 @@ const TREES_PERCENT: u64 = 25;
 #[derive(Clone, Debug, clap::Args)]
 pub(crate) struct DataArgs {
     /// The directory the daemon keeps everything in, on a local disk: `leases/` (lease
-    /// directories, the container and native drivers), and under the container driver
+    /// directories, the container and native drivers), and under the container driver (and the
+    /// native driver on macOS)
     /// `cache/` (the input cache, `docs/design/worker-cache.md`) and `trees/` (shared
     /// read-only input trees, `docs/design/fast-sandbox.md#4-shared-trees`). Made if
     /// missing; absolute. The cache and trees are on, sized from the filesystem: half
@@ -108,8 +112,9 @@ impl Budgets {
 pub(crate) struct Plan {
     /// `--data-dir`.
     pub dir: PathBuf,
-    /// Whether the container driver runs, and so makes `cache` and `trees`.
-    pub container: bool,
+    /// Whether a driver that uses them runs (the container driver; the native driver on
+    /// macOS), and so `cache` and `trees` are made.
+    pub cached: bool,
     /// The budgets; `None` for a filesystem too small for a cache.
     pub budgets: Option<Budgets>,
 }
@@ -137,14 +142,14 @@ pub(crate) enum DataDirError {
 }
 
 impl Plan {
-    /// Resolves `args` for a daemon that runs the container driver or not, sizing from
+    /// Resolves `args` for a daemon that runs a driver using the cache or not, sizing from
     /// `space`. Changes nothing on disk.
     ///
     /// # Errors
     /// `--data-dir` is relative, or its filesystem cannot be read.
     pub(crate) fn new(
         args: &DataArgs,
-        container: bool,
+        cached: bool,
         space: &dyn FreeSpace,
     ) -> Result<Self, DataDirError> {
         let dir = args.dir();
@@ -157,7 +162,7 @@ impl Plan {
         })?;
         Ok(Self {
             dir,
-            container,
+            cached,
             budgets: Budgets::of(on, args.data_max_bytes),
         })
     }
@@ -177,8 +182,8 @@ impl Plan {
         self.dir.join("trees")
     }
 
-    /// Makes the data directory (0755) and `leases` (0700), and `cache` (0700) for the
-    /// container driver. `trees` is made by its store, with its own mode. A directory
+    /// Makes the data directory (0755) and `leases` (0700), and `cache` (0700) for a
+    /// driver that uses it. `trees` is made by its store, with its own mode. A directory
     /// that exists keeps its mode.
     ///
     /// # Errors
@@ -186,7 +191,7 @@ impl Plan {
     pub(crate) fn create(&self) -> Result<(), DataDirError> {
         make(&self.dir, DATA_MODE)?;
         make(&self.leases(), PRIVATE_MODE)?;
-        if self.container {
+        if self.cached {
             make(&self.cache(), PRIVATE_MODE)?;
         }
         Ok(())
@@ -199,10 +204,11 @@ impl Plan {
             self.dir.display(),
             self.leases().display()
         )];
-        match (self.container, &self.budgets) {
+        match (self.cached, &self.budgets) {
             (false, _) => lines.push(
-                "cache: off:no container driver (the native driver's actions run as the \
-                 daemon's user and could write the cache); trees: off:no container driver"
+                "cache: off:no driver that uses it (the native driver's actions run as the \
+                 daemon's user off macOS and could write the cache); \
+                 trees: off:no driver that uses them"
                     .to_owned(),
             ),
             (true, None) => lines.push(
@@ -265,6 +271,77 @@ pub(crate) fn given(plan: &Plan) -> Option<kbf_driver_container::CacheUse> {
         Err(why) => {
             let reason = why.reason();
             tracing::warn!("cache: off:{reason} ({shown}: {why}); leases run uncached");
+            None
+        }
+    }
+}
+
+/// The native driver's cache on macOS: `<data-dir>/cache`, opened (the daemon owns its
+/// lock and layout) and linked from `<data-dir>/leases`, so every lease's inputs are
+/// clones of its entries. `None` (warned about as `cache: off:<reason>`, leases run
+/// uncached) for a filesystem too small for one, or a cache that cannot be used or
+/// another daemon owns. The cache lies outside every lease directory, which the
+/// sandbox lets nothing write.
+#[cfg(target_os = "macos")]
+pub(crate) fn native_cache(plan: &Plan) -> Option<std::sync::Arc<kbf_daemon::cache::Cache>> {
+    use kbf_daemon::cache::{Cache, CacheConfig, Disabled};
+    let shown = plan.cache().display().to_string();
+    let why = plan.budgets.ok_or(Disabled::NoBudget).and_then(|budgets| {
+        let mut config = CacheConfig::new(plan.cache(), plan.leases(), budgets.cache_max_bytes);
+        config.min_free_bytes = budgets.cache_min_free_bytes;
+        Cache::open(config)
+    });
+    match why {
+        Ok(cache) => {
+            let stats = cache.stats();
+            let (bytes, entries, mode) = (stats.bytes, stats.entries, cache.link_mode());
+            tracing::info!("cache: {shown}: {bytes} bytes in {entries} entries, link mode {mode}");
+            Some(cache)
+        }
+        Err(why) => {
+            let reason = why.reason();
+            tracing::warn!("cache: off:{reason} ({shown}: {why}); leases run uncached");
+            None
+        }
+    }
+}
+
+/// The native driver's shared trees on macOS: `<data-dir>/trees`, opened; `None`
+/// (warned about as `trees: off:<reason>`, inputs are cloned file by file) when there is
+/// no cache to build them from, the filesystem is too small for them or the store cannot
+/// be used.
+#[cfg(target_os = "macos")]
+pub(crate) fn native_trees(
+    plan: &Plan,
+    cache: Option<&std::sync::Arc<kbf_daemon::cache::Cache>>,
+) -> Option<std::sync::Arc<kbf_daemon::trees::Trees>> {
+    let shown = plan.trees().display().to_string();
+    let why = if cache.is_none() {
+        Err((
+            "no-cache",
+            "the trees are built from the cache's entries".to_owned(),
+        ))
+    } else {
+        match plan.budgets {
+            None => Err(("no-budget", "filesystem too small".to_owned())),
+            Some(budgets) => {
+                let config =
+                    kbf_daemon::trees::TreeConfig::new(plan.trees(), budgets.trees_max_bytes);
+                kbf_daemon::trees::Trees::open(config).map_err(|e| ("unusable", e.to_string()))
+            }
+        }
+    };
+    match why {
+        Ok(trees) => {
+            let stats = trees.store().stats();
+            let (count, bytes) = (stats.trees, stats.bytes);
+            tracing::info!(
+                "trees: {shown}: {count} trees, {bytes} bytes; cloned whole into leases"
+            );
+            Some(std::sync::Arc::new(trees))
+        }
+        Err((reason, why)) => {
+            tracing::warn!("trees: off:{reason} ({shown}: {why}); inputs are cloned file by file");
             None
         }
     }
@@ -454,6 +531,57 @@ mod tests {
         };
         let plan = Plan::new(&args(&["--data-dir=/d"]), true, &Fake(tiny)).expect("plan");
         assert!(super::given(&plan).is_none());
+    }
+
+    /// Catches the native driver on macOS not being given the plan's cache and trees:
+    /// the cache in `<data>/cache` (opened, with its layout), the trees in `<data>/trees`
+    /// (0711, outside `leases`), no trees without a cache, a store that cannot be opened
+    /// (a file where it goes) turned off while the cache stays, and no cache for a
+    /// filesystem too small for one.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_native_driver_on_macos_is_given_the_plans_cache_and_trees() {
+        let space = Space {
+            total: 200 * GIB,
+            available: 150 * GIB,
+        };
+        let plan_in = |name: &str| {
+            let base = crate::tests::scratch(name);
+            let flags = [format!("--data-dir={}", base.display())];
+            let flags: Vec<&str> = flags.iter().map(String::as_str).collect();
+            let plan = Plan::new(&args(&flags), true, &Fake(space)).expect("plan");
+            plan.create().expect("create");
+            plan
+        };
+        let plan = plan_in("data-dir-native");
+        let cache = super::native_cache(&plan).expect("a cache");
+        assert!(plan.cache().join("v1").is_dir(), "no layout");
+        assert_eq!(cache.link_mode().to_string(), "clone");
+        let trees = super::native_trees(&plan, Some(&cache)).expect("trees");
+        let mode = std::fs::metadata(plan.trees())
+            .expect("made")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o711);
+        assert!(!plan.trees().starts_with(plan.leases()));
+        drop(trees);
+        assert!(
+            super::native_trees(&plan, None).is_none(),
+            "built from nothing"
+        );
+
+        let blocked = plan_in("data-dir-native-blocked");
+        std::fs::write(blocked.trees(), b"not a directory").expect("plant a file");
+        let cache = super::native_cache(&blocked).expect("a cache");
+        assert!(super::native_trees(&blocked, Some(&cache)).is_none());
+
+        let tiny = Space {
+            total: GIB,
+            available: GIB,
+        };
+        let mut small = plan_in("data-dir-native-tiny");
+        small.budgets = Budgets::of(tiny, None);
+        assert!(super::native_cache(&small).is_none());
     }
 
     /// Catches a directory that cannot be made taken as made: `--data-dir` under a file

@@ -1,6 +1,6 @@
 //! The binary's data directory (`docs/design/worker-cache.md`): the container driver
 //! opens the cache and the trees under it by default, a second owner runs uncached,
-//! the native driver never makes them, the per-piece flags of an older binary are
+//! the native driver makes them on macOS only, the per-piece flags of an older binary are
 //! refused, and the binary answers as the driver's `__chown-dirs` helper before it
 //! parses its flags.
 
@@ -102,11 +102,15 @@ fn a_container_node_opens_its_cache_and_trees_under_the_data_dir() {
     }
 }
 
-/// C-19. Catches the native driver using a cache its own actions could write (the
-/// "enable the cache on Linux native" mutant), or making the cache or trees
+/// C-19. Catches the native driver on Linux using a cache its own actions could write
+/// (the "enable the cache on Linux native" mutant), or making the cache or trees
 /// directories: under `--data-dir` it makes `leases` and nothing else, and logs that
 /// the cache and trees are off.
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "macOS native nodes make the cache and trees: see the clone tests below"
+)]
 fn a_native_node_never_makes_a_cache_or_trees() {
     let dir = tls("native-cache");
     let flags = [
@@ -119,7 +123,7 @@ fn a_native_node_never_makes_a_cache_or_trees() {
     drop(one);
     assert!(status.success(), "{status}: {log:#?}");
     assert!(
-        logged(&log, &["cache: off:no container driver", "trees: off"]),
+        logged(&log, &["cache: off:no driver that uses it", "trees: off"]),
         "{log:#?}"
     );
     assert!(dir.join("leases").is_dir(), "no lease directory");
@@ -129,6 +133,69 @@ fn a_native_node_never_makes_a_cache_or_trees() {
             "the native daemon made {absent}"
         );
     }
+}
+
+/// C-19 on macOS. Catches the native driver not opening the cache under `--data-dir`
+/// (every lease would fetch its inputs again), a cache that is not opened in clone mode,
+/// and a tree store that is not made or is made inside `leases` (which lease sweeps
+/// clean): a macOS native node with only `--data-dir` makes `leases`, opens `cache` and
+/// logs `link mode clone`, opens `trees` (0711, as the store sets it) outside `leases`
+/// and logs that trees are cloned whole.
+#[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "only a macOS native node opens the cache and the trees"
+)]
+fn a_macos_native_node_opens_its_cache_and_trees_under_the_data_dir() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = tls("native-data-mac");
+    let flags = [
+        "--driver=native".to_owned(),
+        "--cas=https://127.0.0.1:1".to_owned(),
+        format!("--data-dir={}", dir.display()),
+    ];
+    let one = one_native_daemon();
+    let (status, log) = runs_until_sigterm_logged("native-data-mac", &flags, None);
+    drop(one);
+    assert!(status.success(), "{status}: {log:#?}");
+    assert!(logged(&log, &["cache:", "link mode clone"]), "{log:#?}");
+    assert!(
+        logged(&log, &["trees:", "0 trees", "cloned whole"]),
+        "{log:#?}"
+    );
+    assert!(dir.join("leases").is_dir(), "no lease directory");
+    assert!(dir.join("cache/v1").is_dir(), "the cache has no layout");
+    let trees = std::fs::metadata(dir.join("trees")).expect("the store was not made");
+    assert_eq!(trees.permissions().mode() & 0o777, 0o711);
+}
+
+/// The native node's tree store on macOS cannot be opened. Catches a daemon that stops
+/// the start for it, or that drops the cache with it: with a file where `trees` goes the
+/// node serves, warns `trees: off:unusable` and that inputs are cloned file by file, and
+/// still opens the cache.
+#[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "only a macOS native node opens a tree store"
+)]
+fn a_macos_native_node_whose_tree_store_cannot_open_clones_file_by_file() {
+    let dir = tls("native-trees-off-mac");
+    std::fs::write(dir.join("trees"), b"not a directory").expect("plant a file");
+    let flags = [
+        "--driver=native".to_owned(),
+        "--cas=https://127.0.0.1:1".to_owned(),
+        format!("--data-dir={}", dir.display()),
+    ];
+    let one = one_native_daemon();
+    let (status, log) = runs_until_sigterm_logged("native-trees-off-mac", &flags, None);
+    drop(one);
+    assert!(status.success(), "{status}: {log:#?}");
+    assert!(
+        logged(&log, &["trees:", "off:unusable", "file by file"]),
+        "{log:#?}"
+    );
+    assert!(logged(&log, &["cache:", "link mode clone"]), "{log:#?}");
+    assert!(dir.join("cache/v1").is_dir(), "the cache was not opened");
 }
 
 /// Catches the per-piece flags an older binary took still accepted (a unit that was

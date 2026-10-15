@@ -57,6 +57,7 @@ pub mod health;
 pub mod http_blobs;
 pub mod http_invocations;
 pub mod identity;
+mod local;
 pub mod machine;
 pub mod mdm;
 mod memory;
@@ -78,6 +79,7 @@ pub use farm::Farm;
 pub use health::Readiness;
 pub use identity::{DenyList, DenyListError, Peers};
 pub use kbf_sched::MemoryLadder;
+pub use local::LocalStore;
 pub use raft_log::{RaftLogError, RaftMetaLog};
 pub use serve::{
     Api, Bound, Listeners, ServeError, WorkerTls, bind_server, bind_server_with_api,

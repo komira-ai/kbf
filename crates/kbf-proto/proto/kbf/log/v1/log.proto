@@ -22,6 +22,10 @@
 // Format 2 is format 1 plus the write tier's metadata commands (MetaCommand fields 10
 // to 14, docs/design/write-path.md section 6.5). A format-1 reader refuses them: an
 // older binary sees an unset `oneof`, and this one refuses them under format 1.
+//
+// Format 3 is format 2 plus `EvictObjects` (MetaCommand field 15), which forgets the
+// objects the store no longer holds. A format-1 or format-2 reader refuses it the same
+// way.
 syntax = "proto3";
 
 package kbf.log.v1;
@@ -66,6 +70,8 @@ message MetaCommand {
     SealStaged seal_staged = 12;
     ObjectFlushed object_flushed = 13;
     FlushConflict flush_conflict = 14;
+    // Format 3.
+    EvictObjects evict_objects = 15;
   }
 }
 
@@ -202,6 +208,13 @@ message ObjectFlushed {
 // The store holds different bytes under a sealed staged object's key.
 message FlushConflict {
   ObjectId object = 1;
+}
+
+// Forgets `objects` (a set, ordered by epoch then seq): every blob whose current
+// location is in one of them, and every action-cache entry that needs such a blob. A
+// staged object is skipped.
+message EvictObjects {
+  repeated ObjectId objects = 1;
 }
 
 // ---- Control commands: the farm machine's inputs (ha.md sections 4.2 to 4.9). ----
