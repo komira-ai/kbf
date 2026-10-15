@@ -128,10 +128,10 @@ impl fmt::Display for CpuSet {
 /// # Errors
 /// `dir` cannot be listed, or a `cpulist` cannot be read or parsed.
 pub fn read_nodes(dir: &Path) -> Result<Vec<(u32, CpuSet)>, String> {
-    let at = |e: &dyn fmt::Display| format!("{}: {e}", dir.display());
     let mut nodes = Vec::new();
-    for entry in std::fs::read_dir(dir).map_err(|e| at(&e))? {
-        let entry = entry.map_err(|e| at(&e))?;
+    // An entry that cannot be listed is skipped: it names no node.
+    let entries = std::fs::read_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    for entry in entries.flatten() {
         let name = entry.file_name();
         let Some(id) = name
             .to_str()

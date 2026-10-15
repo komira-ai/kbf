@@ -79,10 +79,19 @@ fn the_topology_is_read_from_each_nodes_cpulist() {
     assert!(read_nodes(&dir.join("absent")).is_err());
     put(&dir.join("node2/cpulist"), "x\n");
     assert!(read_nodes(&dir).is_err(), "a cpulist that does not parse");
+    put(&dir.join("node2/cpulist"), "2\n");
+    std::fs::create_dir(dir.join("node3")).expect("mkdir");
+    assert!(read_nodes(&dir).is_err(), "a node with no cpulist");
 }
 
 fn placer() -> Arc<Placer> {
     Placer::new(vec![(0, set(NODE0)), (1, set(NODE1))]).expect("nodes")
+}
+
+/// No node, no placer (a placer over nothing would have no node to choose).
+#[test]
+fn no_nodes_no_placer() {
+    assert!(Placer::new(Vec::new()).is_none());
 }
 
 /// Catches a placement that is not the least loaded node: leases alternate when they
@@ -180,6 +189,13 @@ fn a_dual_node_host_is_placed_over_the_cpus_the_daemon_may_use() {
         read(&root, actions, "cgroup.subtree_control").as_deref(),
         Some("+cpuset")
     );
+
+    // A cgroup that shows no cpuset.cpus.effective limits nothing.
+    let (root, actions) = cgroups("unlimited", "cpu cpuset memory pids\n", None);
+    let placer = start(&dir, &root, actions)
+        .expect("started")
+        .expect("placed");
+    assert_eq!(placer.place(1000).cpus().to_string(), NODE0);
 
     // A cpuset that holds part of node 0 and all of node 1: the lease gets the part.
     let (root, actions) = cgroups("partial", "cpu cpuset memory pids\n", Some("10-30,70-87\n"));

@@ -780,3 +780,19 @@ fn a_unit_without_cpuset_is_refused_with_the_fix() {
     );
     assert_eq!(fake.log().len(), before);
 }
+
+/// Catches a `cpuset.cpus.effective` that is empty taken for a list of no CPU, and one
+/// that does not parse taken for none: the first says nothing is known (the placer then
+/// keeps every node), the second fails with the file's path.
+#[test]
+fn an_empty_or_unreadable_effective_cpuset_is_told_apart() {
+    let fake = Fake::host(UNIT, "cpuset cpu io memory pids", &[41]);
+    delegate_in(&fake, SELF, MIN, None).expect("delegated");
+    assert_eq!(enable_cpuset_in(&fake, ACTIONS_CG).expect("enabled"), None);
+    fake.set(ACTIONS_CG, "cpuset.cpus.effective", "0-x\n");
+    let error = enable_cpuset_in(&fake, ACTIONS_CG).expect_err("unparsed");
+    assert!(
+        error.to_string().contains("cpuset.cpus.effective"),
+        "{error}"
+    );
+}
