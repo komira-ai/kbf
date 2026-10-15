@@ -21,7 +21,11 @@
 //! - **FindMissing** ([`Cas::missing`]): the cache's own answer. A call that fails
 //!   answers every digest missing, as the transfer engine's does.
 //!
-//! A server half that is gone (its runtime shut down) fails each call UNAVAILABLE.
+//! Every call is admitted by the server first, as a remote daemon's blob call is on the
+//! worker listener: the daemon's certificate (`--cert`) must name one node, and neither
+//! may be on the deny list, read again at every call. A refused call fails as a call the
+//! server refused over the network does. A server half that is gone (its runtime shut
+//! down) fails each call UNAVAILABLE.
 
 use std::collections::BTreeSet;
 use std::future::Future;
@@ -29,7 +33,6 @@ use std::sync::Arc;
 
 use futures::{StreamExt as _, TryStreamExt as _, future, stream};
 use kbf_proto::reapi::Digest;
-use kbf_proto::worker::segments_server::Segments;
 use kbf_proto::worker::{BeginRequest, CommitRequest, PutRangeRequest, UploadSegment};
 use kbf_segments::MAX_SEGMENT_BYTES;
 use kbf_server::LocalStore;
@@ -39,13 +42,13 @@ use kbf_transfer::{
 };
 use kbf_types::{DigestFunction, LeaseId};
 use tokio::runtime::Handle;
-use tonic::{Code, Request, Status};
+use tonic::{Code, Status};
 
 /// The daemon's data plane as calls into the server half of this process.
 pub struct LocalDataPlane {
-    store: LocalStore,
-    /// This plane's own `Segments` service: its uploads, no one else's.
-    segments: Arc<dyn Segments>,
+    /// The server's store as this daemon calls it: each call admitted for its
+    /// certificate, its uploads on a `Segments` service of its own.
+    store: Arc<LocalStore>,
     /// The server half's runtime, which every call runs on.
     server: Handle,
 }
@@ -55,10 +58,8 @@ impl LocalDataPlane {
     /// `server`.
     #[must_use]
     pub fn new(store: LocalStore, server: Handle) -> Self {
-        let segments = store.segments();
         Self {
-            store,
-            segments,
+            store: Arc::new(store),
             server,
         }
     }
@@ -82,8 +83,8 @@ impl LocalDataPlane {
         &self,
         digests: Vec<kbf_types::Digest>,
     ) -> Result<Vec<kbf_types::Digest>, Status> {
-        let store = self.store.clone();
-        self.call(async move { store.find_missing(&digests).await.map_err(Status::from) })
+        let store = Arc::clone(&self.store);
+        self.call(async move { store.find_missing(&digests).await })
             .await
     }
 
@@ -100,9 +101,9 @@ impl LocalDataPlane {
                 })
                 .collect(),
         };
-        let segments = Arc::clone(&self.segments);
-        let begun = self.call(async move { segments.begin(Request::new(begin)).await });
-        let id = begun.await.map_err(not_stored)?.into_inner().upload;
+        let store = Arc::clone(&self.store);
+        let begun = self.call(async move { store.begin(begin).await });
+        let id = begun.await.map_err(not_stored)?.upload;
         for (index, segment) in upload.iter().enumerate() {
             for (start, end) in segment.ranges(MAX_RANGE_BYTES) {
                 let pieces = segment.pieces(start, end);
@@ -113,14 +114,14 @@ impl LocalDataPlane {
                     offset: start,
                     bytes,
                 };
-                let segments = Arc::clone(&self.segments);
-                let put = self.call(async move { segments.put_range(Request::new(request)).await });
+                let store = Arc::clone(&self.store);
+                let put = self.call(async move { store.put_range(request).await });
                 put.await.map_err(not_stored)?;
             }
         }
-        let segments = Arc::clone(&self.segments);
+        let store = Arc::clone(&self.store);
         let commit = CommitRequest { upload: id };
-        let committed = self.call(async move { segments.commit(Request::new(commit)).await });
+        let committed = self.call(async move { store.commit(commit).await });
         committed.await.map(drop).map_err(not_stored)
     }
 }
@@ -153,8 +154,8 @@ impl Cas for LocalDataPlane {
         let Some(parsed) = parse(digest) else {
             return Err(CasError::Missing(blob));
         };
-        let store = self.store.clone();
-        let read = self.call(async move { store.read_blob(&parsed).await.map_err(Status::from) });
+        let store = Arc::clone(&self.store);
+        let read = self.call(async move { store.read_blob(&parsed).await });
         match read.await {
             Ok(bytes) => Ok(bytes),
             Err(status) if status.code() == Code::NotFound => Err(CasError::Missing(blob)),
@@ -164,8 +165,8 @@ impl Cas for LocalDataPlane {
 
     async fn put(&self, bytes: Vec<u8>) -> Result<Digest, CasError> {
         let blob = format!("of {} bytes", bytes.len());
-        let store = self.store.clone();
-        let stored = self.call(async move { store.put(bytes).await.map_err(Status::from) });
+        let store = Arc::clone(&self.store);
+        let stored = self.call(async move { store.put(bytes).await });
         match stored.await {
             Ok(digest) => Ok(proto_digest(&digest)),
             Err(status) => Err(CasError::Unavailable(blob, status.message().to_owned())),

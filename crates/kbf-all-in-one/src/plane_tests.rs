@@ -11,7 +11,14 @@ use super::*;
 /// The plane over a new in-memory cache, its calls run on `server`.
 fn plane(server: &tokio::runtime::Runtime) -> LocalDataPlane {
     let _context = server.enter();
-    let store = LocalStore::new(Arc::new(Cache::memory()), SegmentsConfig::DEFAULT);
+    let made = rcgen::generate_simple_self_signed(vec!["node-1".to_owned()]).expect("cert");
+    let caller = kbf_server::Caller::from_pem(made.cert.pem().as_bytes()).expect("caller");
+    let store = LocalStore::new(
+        Arc::new(Cache::memory()),
+        SegmentsConfig::DEFAULT,
+        kbf_server::Peers::Unauthenticated,
+        caller,
+    );
     LocalDataPlane::new(store, server.handle().clone())
 }
 

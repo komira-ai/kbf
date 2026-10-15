@@ -267,6 +267,45 @@ pub async fn concurrent_puts_of_one_blob_agree<S: Subject>(subject: &S) {
     assert_eq!(fetch(&*cas, &digest).await.expect("fetch"), bytes);
 }
 
+/// An implementation whose server can refuse its caller: the calls a daemon makes are
+/// admitted by the server's deny list, whatever carries them.
+pub trait Refusable: Subject {
+    /// Puts the caller of every store this subject made on the server's deny list
+    /// (by whatever the subject was made to name: the node, or its certificate),
+    /// from the next call on.
+    fn deny(&self) -> impl Future<Output = ()>;
+}
+
+/// Catches a store that serves a caller the server's deny list refuses, on one
+/// implementation and not another: a security check must not depend on how the calls
+/// travel. Before the denial, a write and a read work. After it, a read, a write and an
+/// upload of records all fail (a read is not `Missing`, which a caller would answer by
+/// uploading), and FindMissing answers every digest missing, so nothing is taken as
+/// held.
+pub async fn a_denied_caller_is_refused<S: Refusable>(subject: &S) {
+    let cas = subject.fresh().await;
+    let bytes = patterned(11, 1000);
+    let held = cas.put(bytes.clone()).await.expect("put before the denial");
+    assert_eq!(
+        fetch(&*cas, &held).await.expect("read before the denial"),
+        bytes
+    );
+    subject.deny().await;
+    let read = cas.get(&held).await;
+    assert!(
+        read.is_err() && !matches!(read, Err(CasError::Missing(_))),
+        "a denied read: {:?}",
+        read.as_ref().map(Vec::len)
+    );
+    let put = cas.put(patterned(12, 1000)).await;
+    assert!(put.is_err(), "a denied put: {put:?}");
+    let records = cas
+        .put_records(vec![Record::bytes(patterned(13, 1000))])
+        .await;
+    assert!(records.is_err(), "a denied upload: {records:?}");
+    assert_eq!(cas.missing(std::slice::from_ref(&held)).await, [held]);
+}
+
 /// Makes one `#[tokio::test]` per check, each against the [`Subject`] the expression
 /// `$subject` builds (called once per test). The calling crate needs `tokio` with the
 /// `macros` and `rt-multi-thread` features.

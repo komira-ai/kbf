@@ -76,7 +76,11 @@ fn serve(flags: &Flags) -> Result<(), Failed> {
     let started = tokio.block_on(kbf_server::start(&flags.server, kbf_server::interrupted));
     let server = started.map_err(Failed::server)?;
     println!("{}", server.start_line());
-    let plane = Arc::new(LocalDataPlane::new(server.local(), tokio.handle().clone()));
+    let caller = caller(&flags.daemon).map_err(Failed::Daemon)?;
+    let plane = Arc::new(LocalDataPlane::new(
+        server.local(caller),
+        tokio.handle().clone(),
+    ));
     // Dropped when the server half stops serving, which stops the daemon half.
     let (ended, server_ended) = tokio::sync::oneshot::channel::<()>();
     let serving = tokio.spawn(async move {
@@ -90,6 +94,14 @@ fn serve(flags: &Flags) -> Result<(), Failed> {
     });
     let served = tokio.block_on(serving).map_err(Failed::stopped)?;
     served.map_err(Failed::stopped)
+}
+
+/// Who the daemon half's blob calls are admitted as: its own certificate, `--cert`.
+fn caller(daemon: &kbf_node::Cli) -> Result<kbf_server::Caller, kbf_node::Error> {
+    let path = daemon.cert();
+    let pem = std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let caller = kbf_server::Caller::from_pem(&pem);
+    Ok(caller.map_err(|e| format!("--cert {}: {e}", path.display()))?)
 }
 
 #[cfg(test)]

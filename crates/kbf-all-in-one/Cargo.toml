@@ -49,7 +49,10 @@ kbf-front.workspace = true
 kbf-testkit.workspace = true
 prost.workspace = true
 rcgen.workspace = true
+# A deny list's `spki-sha256` entry for a test certificate (tests/admission.rs).
+sha2.workspace = true
 tokio = { workspace = true, features = ["fs", "io-util", "macros", "net", "time"] }
+x509-parser.workspace = true
 
 [lints]
 workspace = true

@@ -239,6 +239,15 @@ pub struct Cli {
     pool_first_uid: Option<u32>,
 }
 
+impl Cli {
+    /// The daemon's client certificate (`--cert`): what it is known by on the server's
+    /// worker listener, and so on a server in its own process too.
+    #[must_use]
+    pub fn cert(&self) -> &Path {
+        &self.daemon.cert
+    }
+}
+
 /// The drivers this binary can run leases through.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 enum Driver {
