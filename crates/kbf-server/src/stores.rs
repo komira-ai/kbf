@@ -791,11 +791,20 @@ mod tests {
                 hot_max_bytes: max,
                 ..flags(Some(&cold), Some(&hot), Some(Path::new("/meta")))
             };
-            flags.resolve(&disk).expect("stores").hot.expect("hot").budget
+            flags
+                .resolve(&disk)
+                .expect("stores")
+                .hot
+                .expect("hot")
+                .budget
         };
         let fresh = budget(0, None);
         assert_eq!(fresh, (700 - 50) * GIB * 8 / 10);
-        assert_eq!(budget(200 * GIB, None), fresh, "a restart shrank the budget");
+        assert_eq!(
+            budget(200 * GIB, None),
+            fresh,
+            "a restart shrank the budget"
+        );
         assert_eq!(budget(200 * GIB, Some(7 * GIB)), 7 * GIB);
         // The log under `<hot>/meta` is used space that is not the tier's.
         let beside = Used {

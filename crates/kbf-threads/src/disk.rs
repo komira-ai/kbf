@@ -239,7 +239,10 @@ mod tests {
         std::os::unix::fs::symlink(root.join("a/b/deep"), root.join("link")).expect("link");
         assert_eq!(Statvfs.held(&root).expect("held"), 1110);
         assert_eq!(Statvfs.held(&root.join("a")).expect("held"), 1100);
-        assert!(Statvfs.held(&root.join("top")).is_err(), "a file is no directory");
+        assert!(
+            Statvfs.held(&root.join("top")).is_err(),
+            "a file is no directory"
+        );
         std::fs::remove_dir_all(&root).expect("cleanup");
     }
 }

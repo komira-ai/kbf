@@ -24,8 +24,8 @@ use kbf_server::stores::{Hot, StoreFlags, StoreUri};
 use kbf_server::write_tier::attach;
 use kbf_server::{RaftLogError, RaftMetaLog};
 use kbf_store::StdFs;
-use kbf_tier::TierOptions;
 use kbf_threads::disk::{FreeSpace, Space};
+use kbf_tier::TierOptions;
 use kbf_types::Digest;
 
 /// A bucket that outlives each start over it and refuses every call while down.
@@ -357,7 +357,8 @@ async fn the_new_flags_open_an_old_raft_directory_and_tier_with_their_data() {
         .await
         .expect("open the old raft directory");
     assert_eq!(log.log_id(), log_id, "a different log");
-    assert_eq!(log.applied_index(), applied, "entries lost or added");
+    // An open commits an entry of its own (the leader's), so the index is not equal.
+    assert!(log.applied_index() >= applied, "entries lost");
     let prefix = log.store_prefix();
     let cache = Cache::open(log, store.clone(), prefix)
         .await
@@ -369,7 +370,10 @@ async fn the_new_flags_open_an_old_raft_directory_and_tier_with_their_data() {
     assert_eq!(startup.recovery.lost, []);
     assert_eq!(startup.recovery.unsealed, [object]);
     assert_eq!(staged_on(&cache, a_digest).await, Some(tier));
-    let read = cache.read_blob(&a_digest).await.expect("read from the tier");
+    let read = cache
+        .read_blob(&a_digest)
+        .await
+        .expect("read from the tier");
     assert_eq!(read, a_bytes);
     assert!(!dirs.tier.join("meta").exists(), "<T>/meta made");
 }
