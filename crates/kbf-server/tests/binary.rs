@@ -246,9 +246,55 @@ fn thread_flags_size_the_runtime_and_are_logged() {
     let mut log = String::new();
     stderr.read_to_string(&mut log).expect("UTF-8 stderr");
     assert!(
-        log.contains("threads: async=3 blocking=5 cpu=2 reserve="),
+        log.contains("threads: async=3 blocking=5 cpu=2 (cpus="),
         "{log}"
     );
+    assert!(!log.contains("reserve"), "{log}");
+}
+
+/// Catches a server that sizes its threads from anything but the CPUs it may use (the
+/// default was a reserve and the physical cores): with no thread flag the start line
+/// names one async worker and one CPU thread per available CPU and tokio's 512 blocking
+/// threads, and a `--reserve-cpus` or `--reserve-share` (a daemon flag, left in an old
+/// unit) is refused with status 2 and the flag's name instead of being ignored.
+#[cfg(unix)]
+#[test]
+fn the_server_uses_every_cpu_and_refuses_a_reserve() {
+    let cpus = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+    let mut c = server(&[]);
+    c.args(ANY_PORT)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = Running(c.spawn().expect("spawn kbf-server"));
+    first_line("start", child.0.stdout.take().expect("stdout"));
+    let mut stderr = child.0.stderr.take().expect("stderr");
+    interrupt(child);
+    let mut log = String::new();
+    stderr.read_to_string(&mut log).expect("UTF-8 stderr");
+    let want = format!("threads: async={cpus} blocking=512 cpu={cpus} (cpus={cpus} ");
+    assert!(log.contains(&want), "{want}\n{log}");
+
+    for flag in ["--reserve-cpus=4", "--reserve-share=2"] {
+        // Spawned and bounded, not `output()`: a server that accepted the flag would
+        // run until killed, and the test must go red, not hang.
+        let mut c = server(&[flag]);
+        c.args(ANY_PORT)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        let mut child = Running(c.spawn().expect("spawn kbf-server"));
+        let status = child.exit_status(flag);
+        assert_eq!(status.code(), Some(2), "{flag}");
+        let mut stderr = String::new();
+        child
+            .0
+            .stderr
+            .take()
+            .expect("stderr")
+            .read_to_string(&mut stderr)
+            .expect("UTF-8 stderr");
+        let name = flag.split('=').next().expect("name");
+        assert!(stderr.contains(name), "{flag}: {stderr}");
+    }
 }
 
 /// Catches: an `--api-listen` flag that binds nothing, a start line without the API's

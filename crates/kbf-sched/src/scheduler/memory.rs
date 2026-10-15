@@ -29,8 +29,9 @@
 //! lost runs together) by [`FARM_RERUNS`]. Neither uses the other's count, so a long ladder never leaves a
 //! busy-node kill without its reruns, and farm faults never cut a ladder short of the
 //! cap. An operation therefore runs at most `1 + rungs + 1 + FARM_RERUNS`
-//! times. Leases given up for silence, replacement without proof, reconnection or not
-//! starting use neither.
+//! times. Leases given up for silence or replacement use
+//! the farm's alone, leases given up for not starting [`NOT_STARTED_RERUNS`] alone, and
+//! reconnections neither.
 //!
 //! The floors live in this scheduler alone: a server restart forgets them, which costs
 //! one more killed run per key, never a wrong answer. At most [`MEMORY_FLOORS`] are kept;
@@ -60,6 +61,14 @@ pub const GIB: u64 = 1 << 30;
 /// runs together, one budget (`fault`); the farm budget of failure classes 6.5. The
 /// ladder of the action's own memory kills does not count here.
 pub const FARM_RERUNS: u32 = 2;
+
+/// How many times an operation runs again after leases given up as not started (the
+/// node heartbeats but never listed the lease, `fault`): its own budget, apart from
+/// [`FARM_RERUNS`], because a run that never started is always safe to run elsewhere
+/// and must not spend the farm's. Small, since a node that drops one `Start` and then
+/// another is not going to take the third, and each give-up costs a whole start grace;
+/// the give-up past it ends the operation.
+pub const NOT_STARTED_RERUNS: u32 = 3;
 
 /// The most memory floors a scheduler keeps; the default of [`Scheduler::new`].
 pub const MEMORY_FLOORS: usize = 65_536;

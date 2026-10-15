@@ -1016,6 +1016,52 @@ fn a_container_node_without_subordinate_ids_refuses_to_start() {
     }
 }
 
+/// Catches `--container-runtime` and `--oci-runtime` not reaching the driver: a node told
+/// to run actions through a runtime that is not there refuses to start, naming it (the
+/// "ignore the flag" mutant would start a Podman node), and a runtime that is neither
+/// `podman` nor `oci` is refused by the parser.
+#[test]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "the container driver is Linux-only"
+)]
+fn a_node_told_to_use_the_oci_backend_needs_its_runtime() {
+    let ids = id_files("oci-ids", "65536");
+    let (_unit, cgroup_flags) = cgroup_tree(&tls("oci-cgroup"), "cpu memory pids");
+    let absent = ids.join("no-such-crun");
+    let log = ids.join("stderr");
+    let mut container = vec![
+        "--driver=container".to_owned(),
+        "--cas=https://127.0.0.1:1".to_owned(),
+        format!("--scratch={}", ids.join("leases").display()),
+        format!("--id-files={}", ids.display()),
+        "--actions-memory-max-gib=1".to_owned(),
+        "--container-runtime=oci".to_owned(),
+        format!("--oci-runtime={}", absent.display()),
+    ];
+    container.extend(cgroup_flags);
+    let mut child = Command::new(BIN)
+        .args(base(&ids))
+        .args(&container)
+        .stderr(std::fs::File::create(&log).expect("stderr file"))
+        .spawn()
+        .expect("spawn");
+    let status = refused_within(&mut child, "oci", &log);
+    assert_eq!(status.code(), Some(1));
+    let says = format!("the OCI backend: {} is not a file", absent.display());
+    let stderr = read(&log);
+    assert!(stderr.contains(&says), "{stderr}");
+
+    let out = Command::new(BIN)
+        .args(base(&ids))
+        .args(["--driver=fake", "--container-runtime=runc"])
+        .output()
+        .expect("spawn");
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("possible values: podman, oci"), "{stderr}");
+}
+
 /// The exit status of `child`, a daemon expected to refuse to start, waited for up to
 /// 30 s. A daemon still running then has started: it is killed and the test fails,
 /// naming `what` and the log `child` writes to `log`.

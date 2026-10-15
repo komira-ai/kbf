@@ -429,7 +429,7 @@ where
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tick.tick().await;
-                farm.tick();
+                farm.tick().await;
             }
         };
         // Completes when the drain has run out of time: the REAPI listener, drained

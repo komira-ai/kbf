@@ -10,9 +10,9 @@ use kbf_sched::{
     RequeueReason, Scheduler,
 };
 use kbf_types::{
-    ActionKey, ControlRecord, Digest, DigestFunction, Effect, Failure, FarmTime, LeaseKind,
-    LostWhy, MemoryKill, MemoryRun, OperationId, Outcome, Qos, Resources, ResultRecord, StartLease,
-    StateMachine, WaiterId, Waiting, WorkerId,
+    ActionKey, ControlRecord, Digest, DigestFunction, Effect, Failure, FarmFault, FarmRun,
+    FarmTime, LeaseKind, LostWhy, MemoryKill, MemoryRun, OperationId, Outcome, Qos, Resources,
+    ResultRecord, StartLease, StateMachine, WaiterId, Waiting, WorkerId,
 };
 
 const GIB: u64 = 1 << 30;
@@ -608,7 +608,8 @@ fn a_whole_machine_kill_asks_for_a_larger_node() {
 /// Catches a memory kill committed for a lease the operation no longer holds (it was
 /// given up, and the result raced the log) that still raises the booking or a floor,
 /// records a run, or counts against the node; and a lost run committed so that is
-/// charged to the farm budget (issue #22) or makes the operation avoid the node.
+/// charged to the farm budget (issue #22) again: the silence charged one run, and the
+/// three results committed after it add none.
 #[test]
 fn a_memory_kill_of_a_lease_given_up_changes_nothing() {
     let mut f = Farm::new();
@@ -641,7 +642,11 @@ fn a_memory_kill_of_a_lease_given_up_changes_nothing() {
     assert_eq!(f.s.memory_runs(first.operation).unwrap(), []);
     assert_eq!(f.s.memory_floor(&key(1)), None);
     assert_eq!(f.s.memory_pressure(&w("a")), 0);
-    assert_eq!(f.s.farm_runs(first.operation).unwrap(), []);
+    let silent = FarmRun {
+        worker: w("a"),
+        fault: FarmFault::Lost(LostWhy::Fenced),
+    };
+    assert_eq!(f.s.farm_runs(first.operation).unwrap(), [silent]);
     f.heartbeat("a", &[]);
     let again = f.start();
     assert_eq!(again.resources.memory_bytes, GIB);

@@ -65,6 +65,10 @@ role (`--role=all`). The flags are:
 - `--store=memory` or `--store=s3` with `--s3-endpoint`, `--s3-bucket`, `--s3-region`,
   `--s3-prefix` and `--s3-conditional-put`; the S3 key pair comes from the standard
   `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` variables, never from the command line;
+  or, in place of `--store`, `--blob-dir`, a directory on the local disk (with
+  `--meta-log=raft` only, under the fixed prefix `kbf/<log id>/`), with
+  `--blob-dir-min-free-bytes` (default 1 GiB) the free space below which it refuses
+  writes; nothing is evicted;
 - `--heartbeat-interval-ms` (default 5000), the interval daemons are asked to
   heartbeat at;
 - `--finished-retention-secs` (default 60), how long a finished operation is kept
@@ -109,7 +113,7 @@ what lets a simulation seed replay a run exactly (see [Testing](#testing)).
 | `kbf-raft` | yes | a sans-IO Raft core ([ADR 0001](docs/adr/0001-consensus.md)) and its host loop over `Storage`, `Transport` and `Machine` traits, with an in-memory storage |
 | `kbf-invocation` | yes | the invocation record ([invocations.md](docs/design/invocations.md) section 3): each build's header, counters and action rows, built only from events (calls, lease grants, starts, requeues, finishes), its `kbf.invocation.v1` encoding, and the memory bound of section 3.5 (minted, then idle records evicted; then the largest open one closed to new rows, and whatever else does not fit left out) |
 | `kbf-estimator` | yes | placeholder for learned action sizes (**planned**) |
-| `kbf-objstore` | no | the `ObjectStore` trait, an in-memory store, an S3 store, the conformance suite |
+| `kbf-objstore` | no | the `ObjectStore` trait, an in-memory store, a local-directory store (`FsStore`, `kbf-server --blob-dir`), an S3 store, the conformance suite |
 | `kbf-tier` | no | the local write tier's disk layer ([write-path.md](docs/design/write-path.md) section 6): block files in `--write-tier-dir` written in reserved ranges and synced (file and name) before a range may be committed, seals at the segment limit or after `--write-tier-seal-after`, the `--write-tier-bytes` budget, and the restart: the `TIER` check, staged blocks cut to their committed length, and the orphan sweep, against the committed state through `StagedIndex`; once flushed, blocks become `.seg` copies evicted least recently read first, only in what the budget leaves over. `kbf-front` (`Cache::attach_tier`, `Cache::flush_tier`) stages writes on it, reads staged blobs from it, and runs the flusher; `kbf-server` attaches it with `--write-tier-dir` over either metadata log (under `--meta-log=raft` it first raises the log to machine version 2, once; a server without a tier never raises it) |
 | `kbf-front` | no | the REAPI services over a `Cache` and a `Dispatch`, and the invocation `Recorder` the services and the farm send events to (a channel bounded in events and bytes that drops, never waits) |
 | `kbf-server` | no | the server binary: wires front, scheduler and storage together; its side of the MDM gate (`mdm`) |
@@ -121,7 +125,7 @@ what lets a simulation seed replay a run exactly (see [Testing](#testing)).
 | `kbf-driver-container` | no | the rootless Podman execution driver |
 | `kbf-driver-native` | no | the native execution driver: plain processes, for Macs |
 | `kbf-node` | no | the `kbf-daemon` binary: flags, and the driver `--driver` names |
-| `kbf-threads` | no | thread sizing for both binaries: `--reserve-cpus` (and `--reserve-share`) size the pools and, on the daemon, leave the leases the other CPUs; `--async-threads`, `--blocking-threads` and `--cpu-threads` override; limited to the physical cores (`Topology`); and the tokio runtime built with them |
+| `kbf-threads` | no | thread sizing for both binaries: on the daemon `--reserve-cpus` (and `--reserve-share`) size the pools and leave the leases the other CPUs, limited to the physical cores (`Topology`); the server has no reserve and uses every CPU it may (one async worker and one hashing thread per logical CPU, tokio's blocking cap); `--async-threads`, `--blocking-threads` and `--cpu-threads` override on both; and the tokio runtime built with them |
 | `kbf-mdm` | no | `kbf-mdm-gate`, the only holder of the Mac MDM's API key: its verbs and caps over mutual TLS, operator-signed erase requests, the `MdmBackend` trait and its NanoHUB client ([mdm-backend.md](docs/design/mdm-backend.md)). With the `testkit` feature, security-key signatures made in software, for other crates' tests |
 | `kbf-updater` | no | the root helper that verifies and installs signed software sets on a node ([fleet-updates-security.md](docs/design/fleet-updates-security.md) S3, S4.1); its apt-snapshot applier changes the node only through `kbf-host`; Linux only for now |
 | `kbf-mac-session` | no | the Mac's root helper that gives every lease its own throwaway user, admits an administrator only with the MDM gate's signed grant, switches the GUI session to a lease user (auto-login, then a userspace restart) and resets it at boot ([fleet-updates-security.md](docs/design/fleet-updates-security.md) S4.2, S4.3, S5.2); serves on macOS only |
@@ -231,7 +235,8 @@ See [scheduler.md](docs/design/scheduler.md) and
 
 Under `--meta-log=memory` the index is in memory, so a restarted server forgets every
 blob, and with `--store=s3` each start writes under a fresh key prefix so it never reads
-objects a previous process wrote. Under `--meta-log=raft` (which needs `--store=s3`) a
+objects a previous process wrote. Under `--meta-log=raft` (which needs `--store=s3` or
+`--blob-dir`) a
 restart reopens the log in `--raft-dir` and keeps the index and the action cache, and
 every start writes under the prefix the log committed when it was created,
 `<--s3-prefix><log id>/`, each in a new writer epoch.
@@ -242,7 +247,7 @@ replicated log changes the implementation behind the seam, not its callers:
 - `MetaLog` (in `kbf-front`): `commit` a metadata command, `query` the committed
   state. `MemoryMetaLog` is the single-process implementation; `RaftMetaLog` (in
   `kbf-server`) implements the same two calls over a single-voter Raft log.
-- `ObjectStore` (in `kbf-objstore`): five calls any S3-compatible store can serve.
+- `ObjectStore` (in `kbf-objstore`): five calls any S3-compatible store can serve, and `may_hold`, which a local store answers from its files and any other with yes.
 - `Dispatch` (in `kbf-front`): how the REAPI front reaches the scheduler.
 - `FarmMachine` (in `kbf-server`): a pure struct that compares with `Eq`; it reads
   no clock and holds no hashed map, which clippy checks for the module.
@@ -444,8 +449,8 @@ branches rise. How the code is tested:
   Raft core runs there with crashes part-way through its effects (checks: election
   safety, log matching, leader completeness, state machine safety).
 - **Contract suites.** Every object store backend must pass the conformance suite in
-  `kbf-objstore`; CI runs it against the in-memory store and against MinIO and RustFS
-  containers, with and without Object Lock.
+  `kbf-objstore`; CI runs it against the in-memory store, the local-directory store,
+  and MinIO and RustFS containers, with and without Object Lock.
 - **Real services.** Server tests run the REAPI and worker services over real gRPC,
   including mutual TLS. The container driver's tests run real rootless Podman on
   hosted runners, on x86-64 and arm64.

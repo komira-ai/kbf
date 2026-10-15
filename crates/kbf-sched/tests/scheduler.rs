@@ -774,7 +774,7 @@ fn a_capacity_change_counts_as_hearing_from_the_worker() {
 fn not_held_names_the_listed_leases_given_up_on_the_worker() {
     let mut h = Harness::new();
     h.worker("a", 1_000, GIB);
-    h.worker("b", 1_000, GIB);
+    h.worker("b", 2_000, 2 * GIB);
     h.submit(1, request(1));
     h.submit(2, request(2));
     let [on_a, on_b] = h.tick().try_into().unwrap();
@@ -794,11 +794,16 @@ fn not_held_names_the_listed_leases_given_up_on_the_worker() {
     h.at_secs(61).heartbeat("a");
     h.heartbeat_running("b", &[on_b.lease]);
     assert_eq!(not_held(&h, "a", &[on_a.lease]), [on_a.lease]);
+    // Given up as not started, `a` is avoided: the retry goes to `b`, which has room.
     let [retry] = h.tick().try_into().unwrap();
-    assert_eq!(retry.worker, w("a"));
-    assert_eq!(not_held(&h, "a", &[on_a.lease, retry.lease]), [on_a.lease]);
+    assert_eq!(retry.worker, w("b"));
+    assert_eq!(
+        not_held(&h, "a", &[on_a.lease, retry.lease]),
+        [on_a.lease, retry.lease]
+    );
+    assert_eq!(not_held(&h, "b", &[on_a.lease, retry.lease]), [on_a.lease]);
     h.commit_and_start(&retry);
-    assert_eq!(not_held(&h, "a", &[on_a.lease, retry.lease]), [on_a.lease]);
+    assert_eq!(not_held(&h, "b", &[on_a.lease, retry.lease]), [on_a.lease]);
 
     // A finished operation's lease is held nowhere.
     h.finish(&on_b, ok(2));

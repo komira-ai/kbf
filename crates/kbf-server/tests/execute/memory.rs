@@ -11,7 +11,9 @@ use std::io::Write;
 use std::sync::{Mutex, Once, PoisonError};
 use std::time::Duration;
 
-use crate::support::{Cell, FakeDaemon, Job, done, failed, output, ran, response};
+use crate::support::{
+    Cell, FakeDaemon, Job, done, failed, output, ran, report_every_run, response,
+};
 use kbf_proto::google::rpc::ErrorInfo;
 use kbf_proto::worker::{self, MemoryKill};
 use kbf_server::MemoryLadder;
@@ -261,7 +263,8 @@ async fn an_ok_result_is_never_a_memory_kill() {
 }
 
 /// Catches a status without `memory_kill` (every daemon today) read as a memory
-/// kill: it ends the operation INTERNAL as before, and is not run again.
+/// kill: it is the farm's plain failure, never run again as a memory kill (no raised
+/// booking, no memory run), and answered INTERNAL once its infra reruns are used.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_failure_without_a_memory_kill_is_not_rerun() {
     let cell = Cell::start().await;
@@ -270,13 +273,17 @@ async fn a_failure_without_a_memory_kill_is_not_rerun() {
     cell.upload(&job.blobs()).await;
     let mut ops = cell.execute(&job.action).await;
     let start = daemon.start().await;
-    let unknown = worker::Result {
+    report_every_run(&mut daemon, start, |lease| worker::Result {
         memory_kill: 7,
-        ..failed(start.lease_id, Code::ResourceExhausted)
-    };
-    assert!(daemon.report(unknown).await.accepted);
+        ..failed(lease, Code::ResourceExhausted)
+    })
+    .await;
     let status = response(&done(&mut ops).await).status.expect("a status");
     assert_eq!(status.code, Code::Internal as i32);
+    assert!(
+        status.message.contains("(infra failure)") && !status.message.contains("memory"),
+        "{status:?}"
+    );
     daemon.no_work().await;
 }
 

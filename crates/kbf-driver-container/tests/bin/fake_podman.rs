@@ -34,8 +34,12 @@
 //! - `ps-extra`: lines `ps` prints after the container's own (`<owner> <name>`).
 //! - `unshare-noop`: `unshare rm` succeeds without removing anything.
 //! - `unshare-fails`: `unshare rm` fails.
+//! - `export-fails`: `export` fails; otherwise it writes `a tar` to its `--output` file,
+//!   and records its arguments in `export.args`.
 //! - `chown-fails`: `unshare chown`, or `unshare <helper> __chown-dirs`, to the owner
 //!   this knob holds (`1:1` or `0:0`) fails.
+//! - `chown-sleeps`: `unshare chown` to the owner this knob holds sleeps 200 ms first
+//!   (a slow hand-over).
 //! - `graph`: what `info` prints for a format naming `GraphOptions`; absent:
 //!   `overlay {}`.
 //! - `busy-once`: the next `start` fails as crun does when the program's exec finds it
@@ -238,6 +242,7 @@ impl Fake {
             b"kill" => self.kill(args),
             b"ps" => self.ps(args),
             b"rm" => self.rm(),
+            b"export" => self.export(args),
             b"unshare" => self.unshare(args),
             _ => refuse(
                 &format!(
@@ -570,6 +575,21 @@ impl Fake {
         0
     }
 
+    /// `export --output=FILE NAME`: writes a stand-in tar to FILE; `export-fails` refuses.
+    fn export(&self, args: &[Vec<u8>]) -> u8 {
+        self.write("export.args", &lines(args));
+        if self.has("export-fails") {
+            return refuse("Error: export refused", 125);
+        }
+        let Some(file) = args.iter().find_map(|a| a.strip_prefix(b"--output=")) else {
+            return refuse("fake podman: export: no --output", 125);
+        };
+        match std::fs::write(path(file), b"a tar") {
+            Ok(()) => 0,
+            Err(e) => refuse(&format!("fake podman: export: {e}"), 125),
+        }
+    }
+
     fn unshare(&self, args: &[Vec<u8>]) -> u8 {
         if args.first().is_some_and(|a| a == b"chown") {
             // chown -hR OWNER -- PATHS...
@@ -582,6 +602,9 @@ impl Fake {
                 return refuse(&format!("fake podman: chown {all}"), 125);
             };
             let paths = &args[4..];
+            if self.has("chown-sleeps") && self.cat("chown-sleeps") == *owner {
+                std::thread::sleep(Duration::from_millis(200));
+            }
             self.append(
                 "events",
                 &[b"chown ", &owner[..], b" ", &joined(paths)].concat(),

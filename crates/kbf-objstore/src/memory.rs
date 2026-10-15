@@ -96,6 +96,10 @@ impl ObjectStore for MemoryStore {
         Ok(entry.body.slice(range.offset() as usize..end as usize))
     }
 
+    async fn may_hold(&self, key: &ObjectKey) -> Result<bool, ObjectStoreError> {
+        Ok(self.objects().contains_key(key))
+    }
+
     async fn delete(&self, key: &ObjectKey) -> Result<(), ObjectStoreError> {
         let mut objects = self.objects();
         if objects.get(key).is_some_and(Entry::locked) {

@@ -34,7 +34,7 @@ pub enum Role {
     All,
 }
 
-/// Where blob bytes go.
+/// Where blob bytes go, unless `--blob-dir` names a local directory.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum StoreKind {
     /// In this process; gone when it exits.
@@ -51,7 +51,8 @@ pub enum MetaLogKind {
     /// In this process; a restart forgets it.
     Memory,
     /// A single-voter Raft log in `--raft-dir` ([`crate::raft_log`]); a restart keeps
-    /// it. Needs `--store=s3`: the bytes it indexes must outlive the process too.
+    /// it. Needs `--store=s3` or `--blob-dir`: the bytes it indexes must outlive the
+    /// process too.
     Raft,
 }
 
@@ -66,7 +67,7 @@ pub struct Args {
     /// The roles to run.
     #[arg(long, value_enum, default_value = "all")]
     pub role: Role,
-    /// Where blob bytes are stored.
+    /// Where blob bytes are stored. `--blob-dir` stores them in a local directory instead.
     #[arg(long, value_enum, default_value = "memory")]
     pub store: StoreKind,
     /// Where the metadata (the CAS index and the action cache) is kept.
@@ -190,14 +191,15 @@ pub struct Args {
     /// off when it runs out.
     #[arg(long, default_value_t = 10)]
     pub shutdown_timeout_secs: u64,
-    /// Thread sizes: `--reserve-cpus` and `--reserve-share`, and the overrides
-    /// `--async-threads`, `--blocking-threads` and `--cpu-threads` (see `kbf_threads`).
-    /// `--cpu-threads` is the most CPU-bound jobs the server runs at once on the
-    /// blocking pool, off the request workers: today the SHA-256 and CRC-32C of
+    /// Thread sizes: the overrides `--async-threads`, `--blocking-threads` and
+    /// `--cpu-threads` (see `kbf_threads`). Left out, the server uses every CPU it may
+    /// (the async workers and the CPU pool each one thread per logical CPU); it has no
+    /// `--reserve-cpus`, which is for the daemon. `--cpu-threads` is the most CPU-bound
+    /// jobs the server runs at once on the blocking pool, off the request workers: today the SHA-256 and CRC-32C of
     /// records, in the write tier's flusher before each PUT and, for an upload without
     /// a tier, as its ranges arrive.
     #[command(flatten)]
-    pub threads: kbf_threads::ThreadArgs,
+    pub threads: kbf_threads::PoolArgs,
     /// The memory, in bytes, the invocation records may take together
     /// (`docs/design/invocations.md`, section 3.5). At the bound, records of a minted id
     /// go first, then idle ones, least recently seen first; with only open builds left,
@@ -232,6 +234,20 @@ pub struct Args {
     /// that began it closes; one that is committing is kept until its commit ends.
     #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u64).range(1..))]
     pub segment_upload_idle_secs: u64,
+    /// Stores blob bytes in this directory on the local disk, in place of `--store`
+    /// (`kbf_objstore::FsStore`): created if missing, locked while the server runs (a
+    /// second server on it is refused), and kept across restarts. Needs
+    /// `--meta-log=raft`, which keeps the index of what it holds; objects are keyed
+    /// under `kbf/<log id>/` (fixed: `--s3-prefix` is refused with it). Nothing reads
+    /// the directory at start; a lost or damaged object is found when it is read, or
+    /// before an action-cache hit that needs it is served (a miss). No eviction: the
+    /// directory grows with every blob written.
+    #[arg(long, conflicts_with_all = ["store", "s3_endpoint", "s3_bucket", "s3_prefix"])]
+    pub blob_dir: Option<PathBuf>,
+    /// The free bytes `--blob-dir`'s file system must keep: a write that would leave
+    /// less is refused (the upload is answered UNAVAILABLE), since nothing is evicted.
+    #[arg(long, value_name = "BYTES", default_value_t = 1 << 30, requires = "blob_dir")]
+    pub blob_dir_min_free_bytes: u64,
     /// `http://host[:port]` of the S3 service (`--store=s3`).
     #[arg(long, required_if_eq("store", "s3"))]
     pub s3_endpoint: Option<String>,
@@ -241,10 +257,10 @@ pub struct Args {
     /// The signing region.
     #[arg(long, default_value = "us-east-1")]
     pub s3_region: String,
-    /// The key prefix. Under `--meta-log=memory` each start writes under
-    /// `<prefix><start time>/`; under `--meta-log=raft` every start writes under
-    /// `<prefix><log id>/`, fixed when the log is created (a later start with another
-    /// prefix is refused).
+    /// The key prefix (`--store=s3`; refused with `--blob-dir`). Under `--meta-log=memory`
+    /// each start writes under `<prefix><start time>/`; under `--meta-log=raft` every
+    /// start writes under `<prefix><log id>/`, fixed when the log is created (a later
+    /// start with another prefix is refused).
     #[arg(long, default_value = "kbf/")]
     pub s3_prefix: String,
     /// The slowest rate, in bytes a second, a request body may reach the store at
@@ -341,9 +357,6 @@ pub enum ConfigError {
         #[source]
         source: std::io::Error,
     },
-    /// `--reserve-cpus` is more than this machine has.
-    #[error("{0}")]
-    Reserve(#[from] kbf_threads::ReserveError),
     /// A segment upload could declare more than uploads may hold at once.
     #[error(
         "--segment-upload-max-bytes {cap} is over --write-bytes-in-flight {bound}: \
@@ -353,11 +366,18 @@ pub enum ConfigError {
     /// `--memory-ladder-gib` is empty, holds a 0, does not ascend, or overflows.
     #[error("--memory-ladder-gib: {0}")]
     MemoryLadder(#[from] kbf_sched::LadderError),
-    /// `--meta-log=raft` with `--store=memory`.
+    /// `--meta-log=raft` with `--store=memory` and no `--blob-dir`.
     #[error(
-        "--meta-log=raft needs --store=s3: a durable index over blobs that die with the process"
+        "--meta-log=raft needs --store=s3 or --blob-dir: a durable index over blobs that die \
+         with the process"
     )]
-    RaftWithoutS3,
+    RaftWithoutDurableStore,
+    /// `--blob-dir` under `--meta-log=memory`.
+    #[error(
+        "--blob-dir needs --meta-log=raft: an index in memory forgets every blob at a \
+         restart, and nothing would delete their files"
+    )]
+    BlobDirWithoutRaft,
     /// `--raft-dir` without `--meta-log=raft`.
     #[error("--raft-dir is read only with --meta-log=raft")]
     RaftDirUnused,
@@ -511,45 +531,49 @@ impl Args {
     /// How the cache groups and bounds uploads: `--write-linger`,
     /// `--write-own-segment-bytes`, `--write-bytes-in-flight`, `--write-puts-in-flight`
     /// `--store-put-attempts` and `--cpu-threads`.
-    ///
-    /// # Errors
-    /// `--reserve-cpus` is more than the machine has.
-    pub fn write_config(&self) -> Result<WriteConfig, ConfigError> {
-        Ok(WriteConfig {
+    #[must_use]
+    pub fn write_config(&self) -> WriteConfig {
+        WriteConfig {
             linger: Duration::from_millis(self.write_linger),
             own_segment_bytes: self.write_own_segment_bytes,
             bytes_in_flight: self.write_bytes_in_flight,
             puts_in_flight: self.write_puts_in_flight,
             // clap refuses 0.
             put_attempts: NonZeroU32::new(self.store_put_attempts).unwrap_or(NonZeroU32::MIN),
-            cpu_threads: self.cpu_threads()?,
-        })
+            cpu_threads: self.cpu_threads(),
+        }
     }
 
-    /// The width of the CPU-bound pool on this machine: `--cpu-threads`, else from the
-    /// reserve (`kbf_threads`).
-    ///
-    /// # Errors
-    /// `--reserve-cpus` is more than the machine has.
-    pub fn cpu_threads(&self) -> Result<NonZeroUsize, ConfigError> {
-        let sizes = self
-            .threads
-            .resolve(kbf_threads::Role::Server, kbf_threads::Topology::detect())?;
-        Ok(NonZeroUsize::new(sizes.cpu_threads()).unwrap_or(NonZeroUsize::MIN))
+    /// The width of the CPU-bound pool on this machine: `--cpu-threads`, else one
+    /// thread per CPU the process may use (`kbf_threads`).
+    #[must_use]
+    pub fn cpu_threads(&self) -> NonZeroUsize {
+        self.cpu_threads_on(kbf_threads::Topology::detect())
+    }
+
+    /// [`Args::cpu_threads`] on a given machine shape.
+    #[must_use]
+    pub fn cpu_threads_on(&self, topology: kbf_threads::Topology) -> NonZeroUsize {
+        NonZeroUsize::new(self.threads.resolve(topology).cpu_threads()).unwrap_or(NonZeroUsize::MIN)
     }
 
     /// The raft directory under `--meta-log=raft`; `None` under `--meta-log=memory`.
     ///
     /// # Errors
-    /// [`ConfigError::RaftWithoutS3`] for `--meta-log=raft --store=memory`, and
-    /// [`ConfigError::RaftDirUnused`] for a `--raft-dir` under `--meta-log=memory`.
+    /// [`ConfigError::RaftWithoutDurableStore`] for `--meta-log=raft --store=memory`
+    /// without `--blob-dir`; [`ConfigError::BlobDirWithoutRaft`] for a `--blob-dir`, and
+    /// [`ConfigError::RaftDirUnused`] for a `--raft-dir`, under `--meta-log=memory`.
     pub fn raft_dir(&self) -> Result<Option<&Path>, ConfigError> {
+        let blob_dir = self.blob_dir.is_some();
         match (self.meta_log, self.store, self.raft_dir.as_deref()) {
+            (MetaLogKind::Memory, _, _) if blob_dir => Err(ConfigError::BlobDirWithoutRaft),
             (MetaLogKind::Memory, _, None) => Ok(None),
             (MetaLogKind::Memory, _, Some(_)) => Err(ConfigError::RaftDirUnused),
-            (MetaLogKind::Raft, StoreKind::Memory, _) => Err(ConfigError::RaftWithoutS3),
+            (MetaLogKind::Raft, StoreKind::Memory, _) if !blob_dir => {
+                Err(ConfigError::RaftWithoutDurableStore)
+            }
             // clap requires `--raft-dir` with `--meta-log=raft`.
-            (MetaLogKind::Raft, StoreKind::S3, dir) => Ok(dir),
+            (MetaLogKind::Raft, _, dir) => Ok(dir),
         }
     }
 
@@ -618,7 +642,7 @@ mod tests {
     use clap::Parser;
     use kbf_front::{MAX_BLOB_BYTES, WriteConfig};
 
-    use super::{Args, ConfigError, loopback_only};
+    use super::{Args, loopback_only};
 
     /// Catches: `--s3-min-put-rate` lost on the way to the store (the flat 60 s that cut
     /// slow segment PUTs), a default other than 1 MiB/s, and a rate of 0 accepted (it
@@ -679,23 +703,34 @@ mod tests {
 
     /// Catches a `--cpu-threads` that does not reach the cache's hashing pool (the
     /// flusher would hash on the default width whatever the operator set), a default
-    /// that is not the reserve's (`kbf_threads`: the server's own `Args::cpu_threads`),
-    /// a reserve more than the machine has accepted, and 0 accepted (a pool that
-    /// never runs a job). Parsing at all catches a second `--cpu-threads` (clap panics
-    /// on a duplicate name).
+    /// that is not the CPU count (`kbf_threads`: the server's own `Args::cpu_threads`),
+    /// a `--reserve-cpus` or `--reserve-share` still accepted (a stale unit would go
+    /// unnoticed, and the server would ignore the number it was given), and 0 accepted
+    /// (a pool that never runs a job). Parsing at all catches a second `--cpu-threads`
+    /// (clap panics on a duplicate name).
     #[test]
     fn cpu_threads_reaches_the_hashing_pool() {
         let args = Args::parse_from(["kbf-server"]);
-        let defaults = args.write_config().expect("write config");
-        assert_eq!(defaults.cpu_threads, args.cpu_threads().expect("sized"));
-        let set = Args::parse_from(["kbf-server", "--cpu-threads=7"])
-            .write_config()
-            .expect("write config");
+        let defaults = args.write_config();
+        assert_eq!(defaults.cpu_threads, args.cpu_threads());
+        let machine = kbf_threads::Topology::detect().logical();
+        assert_eq!(defaults.cpu_threads.get(), machine);
+        let set = Args::parse_from(["kbf-server", "--cpu-threads=7"]).write_config();
         assert_eq!(set.cpu_threads.get(), 7);
         assert!(Args::try_parse_from(["kbf-server", "--cpu-threads=0"]).is_err());
-        let over = Args::parse_from(["kbf-server", "--reserve-cpus=100000"]);
-        assert!(matches!(over.write_config(), Err(ConfigError::Reserve(_))));
-        assert!(matches!(over.cpu_threads(), Err(ConfigError::Reserve(_))));
+        for flag in ["--reserve-cpus=4", "--reserve-share=2"] {
+            let refused = Args::try_parse_from(["kbf-server", flag]).expect_err(flag);
+            assert_eq!(
+                refused.kind(),
+                clap::error::ErrorKind::UnknownArgument,
+                "{flag}"
+            );
+            assert!(
+                refused
+                    .to_string()
+                    .contains(&flag[..flag.find('=').unwrap_or(flag.len())])
+            );
+        }
     }
 
     /// Catches a `--segment-upload-*` flag that does not reach the listeners, a default
@@ -784,10 +819,8 @@ mod tests {
     /// the write configuration, and defaults other than the design's.
     #[test]
     fn write_flags_make_the_write_config() {
-        let defaults = Args::parse_from(["kbf-server"])
-            .write_config()
-            .expect("write config");
-        // The CPU pool's width is the reserve's (`kbf_threads`), not the front's default.
+        let defaults = Args::parse_from(["kbf-server"]).write_config();
+        // The CPU pool's width is the CPU count (`kbf_threads`), not the front's default.
         assert_eq!(
             defaults,
             WriteConfig {
@@ -818,7 +851,7 @@ mod tests {
             put_attempts: NonZeroU32::new(5).expect("5"),
             cpu_threads: NonZeroUsize::new(3).expect("3"),
         };
-        assert_eq!(set.write_config().expect("write config"), want);
+        assert_eq!(set.write_config(), want);
         let below = (MAX_BLOB_BYTES - 1).to_string();
         for (flag, value) in [
             ("--write-bytes-in-flight", below.as_str()),

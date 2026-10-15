@@ -25,12 +25,13 @@ mod store;
 
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::time::Instant;
 
 use kbf_proto::reapi::Digest;
 
 use crate::cache::{Cache, InputStats};
 use crate::cas::{Cas, Fetch, label};
-use crate::tree::{Loaded, TreeError, make_directories};
+use crate::tree::{CountedReads, Loaded, TreeError, WritePhases, make_directories, millis};
 use classify::{Limits, Reserved, Summaries, load, select, summarize};
 pub use store::{TreeLease, TreeStats, TreeStore};
 
@@ -94,6 +95,10 @@ pub struct Inputs {
     pub tree_files: u64,
     /// Trees this call built (the rest were there, or another call built them).
     pub trees_built: u64,
+    /// Where the time went. `dir_reads` counts the classifier's reads and the walk's;
+    /// a tree's build reads none (it uses the messages the classifier read), and
+    /// `trees_ms` holds its time.
+    pub phases: WritePhases,
 }
 
 /// The node's tree store with the classifier's settings.
@@ -170,7 +175,11 @@ impl Trees {
                 .is_some_and(|summary| classify::qualifies(path, summary, reserved, limits))
         };
         let max = classify::MAX_DIRECTORIES;
-        let loaded = load(cas, in_flight, root, &Loaded::new(), &skip, max).await?;
+        let reads = CountedReads::new(cas);
+        let loading = Instant::now();
+        let loaded = load(&reads, in_flight, root, &Loaded::new(), &skip, max).await?;
+        let mut walk_ms = millis(loading);
+        let choosing = Instant::now();
         let summaries = summarize(&loaded, &|name| self.summaries.get(name))?;
         self.summaries.extend(&summaries);
         let chosen = select(&loaded, &summaries, root, reserved, limits, max)?;
@@ -191,16 +200,30 @@ impl Trees {
             built += u64::from(stats.is_some());
             leases.push(lease);
         }
+        let trees_ms = millis(choosing);
         let mount_dirs: HashSet<PathBuf> = mounts.iter().map(|m| dir.join(&m.path)).collect();
-        let files = make_directories(cas, in_flight, root, dir, &loaded, &mount_dirs).await?;
+        let walking = Instant::now();
+        let walked = make_directories(&reads, in_flight, root, dir, &loaded, &mount_dirs).await?;
+        walk_ms += millis(walking);
         let private: Vec<PathBuf> = reserved.outputs.iter().map(|p| dir.join(p)).collect();
-        let stats = crate::cache::lease::write_files(cas, cache, files, &private).await?;
+        let writing = Instant::now();
+        let stats = crate::cache::lease::write_files(cas, cache, walked.files, &private).await?;
+        let phases = WritePhases {
+            walk_ms,
+            dir_reads: reads.reads(),
+            dirs_made: walked.dirs_made,
+            trees_ms,
+            link_ms: millis(writing),
+            links: stats.links,
+            copies: stats.copies,
+        };
         Ok(Inputs {
             stats,
             mounts,
             trees: leases,
             tree_files,
             trees_built: built,
+            phases,
         })
     }
 }
