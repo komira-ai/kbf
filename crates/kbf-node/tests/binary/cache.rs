@@ -248,7 +248,7 @@ fn a_macos_native_node_opens_its_tree_store() {
     ] {
         let (status, log) = runs_until_sigterm_logged(name, &flags(with, &at), None);
         assert!(status.success(), "{status}: {log:#?}");
-        assert!(logged(&log, &["trees:", off, "one by one"]), "{log:#?}");
+        assert!(logged(&log, &["trees:", off, "file by file"]), "{log:#?}");
         assert!(!at.exists(), "{off}: the daemon made the store");
     }
     drop(one);
