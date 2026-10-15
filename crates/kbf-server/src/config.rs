@@ -224,12 +224,6 @@ pub struct Args {
     /// that began it closes; one that is committing is kept until its commit ends.
     #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u64).range(1..))]
     pub segment_upload_idle_secs: u64,
-    /// The most CPU-bound jobs the server runs at once on the blocking pool, off the
-    /// request workers: today the SHA-256 and CRC-32C of segment records as their
-    /// ranges arrive. The farm node's cores are hyperthreads in pairs; the default
-    /// leaves most of them to the other work.
-    #[arg(long, default_value_t = kbf_front::SegmentsConfig::DEFAULT.cpu_threads)]
-    pub cpu_threads: NonZeroUsize,
     /// `http://host[:port]` of the S3 service (`--store=s3`).
     #[arg(long, required_if_eq("store", "s3"))]
     pub s3_endpoint: Option<String>,
@@ -433,7 +427,13 @@ impl Args {
             segments: SegmentsConfig {
                 max_bytes: self.segment_upload_max_bytes,
                 idle: Duration::from_secs(self.segment_upload_idle_secs),
-                cpu_threads: self.cpu_threads,
+                // `--cpu-threads` is `kbf_threads`'s flag (integration: PR 656 had its own).
+                cpu_threads: NonZeroUsize::new(
+                    self.threads
+                        .resolve(kbf_threads::Role::Server, kbf_threads::Topology::detect())
+                        .cpu_threads(),
+                )
+                .unwrap_or(SegmentsConfig::DEFAULT.cpu_threads),
             },
         })
     }
@@ -707,7 +707,14 @@ mod tests {
         let defaults = Args::parse_from(["kbf-server"])
             .listeners()
             .expect("listeners");
-        assert_eq!(defaults.segments, kbf_front::SegmentsConfig::DEFAULT);
+        assert_eq!(
+            defaults.segments.max_bytes,
+            kbf_front::SegmentsConfig::DEFAULT.max_bytes
+        );
+        assert_eq!(
+            defaults.segments.idle,
+            kbf_front::SegmentsConfig::DEFAULT.idle
+        );
         assert_eq!(defaults.segments.max_bytes, (1 << 30) + (1 << 20));
         assert_eq!(defaults.segments.idle, std::time::Duration::from_secs(60));
         let set = Args::parse_from([
@@ -719,7 +726,6 @@ mod tests {
         .listeners()
         .expect("listeners");
         assert_eq!(set.segments.cpu_threads.get(), 7);
-        assert_eq!(defaults.segments.cpu_threads.get(), 4);
         assert_eq!(set.segments.max_bytes, 1 << 31);
         assert_eq!(set.segments.idle, std::time::Duration::from_secs(5));
         let below = format!(
