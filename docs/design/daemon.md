@@ -442,7 +442,8 @@ state database is touched.
   descriptor, never following a symlink), or the node's `find`, `mkdir`, `tar`, `touch`,
   from a read-only bind of the host's `/usr`. `crun` creates the namespaces, so the only
   AppArmor grant for user namespaces is `crun`'s shipped profile, and the daemon needs
-  none of its own.
+  none of its own. A helper's cgroup is `<actions parent>/<id>`, named in its config:
+  left to itself `crun` makes one beside the daemon's own, and kills it on removal.
 - **The image store** (`oci/image.rs`): `<scratch>/oci-images/<hex>/rootfs`, unpacked once
   per digest, off the action path. The node's Podman store is where an image is pulled
   and its manifest checked (`podman pull <repo>@sha256:<d>`, as before); the first lease,

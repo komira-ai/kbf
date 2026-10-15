@@ -1,6 +1,5 @@
 //! Unit tests of the `__chown-dirs` mode: what the walk visits, and its answers.
 
-use std::os::unix::ffi::OsStringExt as _;
 use std::os::unix::fs::MetadataExt as _;
 use std::path::PathBuf;
 

@@ -245,8 +245,6 @@ impl Crun {
 
 #[cfg(test)]
 mod tests {
-    use std::os::unix::process::ExitStatusExt as _;
-
     use super::*;
 
     /// Catches `crun`'s status being read as anything but a shell reads it: an exit code
