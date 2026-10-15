@@ -22,9 +22,19 @@ use support::real::{Cell, podman, sh};
 
 kbf_driver_container::chown_dirs_test_hook!();
 
-/// A cache beside `config`'s scratch directory, linking with `link`.
+/// The directory beside `config`'s scratch directory named with `suffix`, removed if an
+/// earlier run left it: [`Cell`] removes its scratch directory on drop but not this one,
+/// and CI keeps `target` (where both live) between runs, so a cache entry or a tree
+/// built by an earlier run would otherwise be a hit in this one.
+fn beside(config: &PodmanConfig, suffix: &str) -> PathBuf {
+    let dir = PathBuf::from(format!("{}-{suffix}", config.scratch.display()));
+    support::force_remove(&dir);
+    dir
+}
+
+/// An empty cache beside `config`'s scratch directory, linking with `link`.
 fn with_cache(config: &mut PodmanConfig, link: Option<Arc<kbf_daemon::cache::LinkFn>>) {
-    let dir = PathBuf::from(format!("{}-cache", config.scratch.display()));
+    let dir = beside(config, "cache");
     std::fs::create_dir_all(&dir).expect("cache dir");
     let mut cache = CacheConfig::new(dir, config.scratch.clone(), 1 << 30);
     if let Some(link) = link {
@@ -206,10 +216,10 @@ async fn identical_inputs_are_one_inode_and_tar_alike_on_every_run() {
 // what a tree is on disk; the stand-in Podman shows the volume reaches the container's arguments.
 // Only a kernel shows the rest, below.
 
-/// A cache and a tree store beside `config`'s scratch directory.
+/// An empty cache and an empty tree store beside `config`'s scratch directory.
 fn with_trees(config: &mut PodmanConfig) {
     with_cache(config, None);
-    let trees = PathBuf::from(format!("{}-trees", config.scratch.display()));
+    let trees = beside(config, "trees");
     let mut trees = kbf_daemon::trees::TreeConfig::new(trees, 1 << 30);
     trees.min_files = 20;
     config.cache.as_mut().expect("a cache").trees = Some(trees);
