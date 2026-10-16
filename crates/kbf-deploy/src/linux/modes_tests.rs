@@ -443,8 +443,9 @@ fn delegate_is_read_as_systemd_reads_it() {
 }
 
 /// Catches the rule `credential` looking for another file than the one the storage
-/// modes' units read the key from (a rename of `s3.env` in one place), and flagging a
-/// mode that holds the storage half's key today.
+/// modes' units read the key from (a rename of `s3.env` in one place), refusing every
+/// environment file (or one whose directory, not its name, says `s3.env`), and flagging
+/// a mode that holds the storage half's key today.
 #[test]
 fn the_credential_rule_names_the_file_the_storage_units_read() {
     let c = config();
@@ -467,6 +468,15 @@ fn the_credential_rule_names_the_file_the_storage_units_read() {
             assert_eq!(lines(&r), Vec::<String>::new(), "{mode}");
         }
     }
+    // Another environment file is not the key: a build node may read its own settings.
+    let daemon = render(&c, Some(1500), Mode::Daemon).expect("renders");
+    let own = daemon.replace(
+        "Delegate=yes\n",
+        "Delegate=yes\nEnvironmentFile=-/etc/kbf/s3.env.example.d/daemon.env\n",
+    );
+    assert_ne!(own, daemon);
+    let r = check(&c, Mode::Daemon, &own, true).expect("a unit");
+    assert_eq!(lines(&r), Vec::<String>::new());
     let holds: Vec<_> = Mode::ALL.iter().filter(|m| m.holds_no_key()).collect();
     assert_eq!(holds, [&Mode::Daemon, &Mode::StorageAndDaemon]);
 }
