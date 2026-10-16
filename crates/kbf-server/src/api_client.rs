@@ -212,9 +212,12 @@ mod tests {
     /// at becoming anything but an error naming it.
     #[test]
     fn a_call_names_the_server_that_failed_it() {
+        // A write with a token: every arm of `call` runs in this copy of it (coverage
+        // counts the best single build of a function: the unit-test one must reach the
+        // token and body arms the integration tests reach too).
         let garbage = answering(b"not http at all");
-        let err = OperatorClient::new(garbage, None)
-            .get("/")
+        let err = OperatorClient::new(garbage, Some("token".to_owned()))
+            .post("/", "{}")
             .expect_err("garbage");
         assert!(matches!(err, ClientError::Malformed { .. }), "{err:?}");
         assert!(err.to_string().starts_with(&garbage.to_string()), "{err}");
