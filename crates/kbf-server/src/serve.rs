@@ -22,6 +22,7 @@ use kbf_proto::reapi::content_addressable_storage_server::ContentAddressableStor
 use kbf_proto::worker::segments_server::SegmentsServer;
 use kbf_proto::worker::worker_server::WorkerServer;
 use kbf_sched::MemoryLadder;
+use kbf_storage::service::Admission;
 use tonic::service::Routes;
 use tonic::transport::server::TcpIncoming;
 use tonic::transport::{Server, ServerTlsConfig};
@@ -33,6 +34,8 @@ use crate::health::Readiness;
 use crate::http_blobs::BlobReaders;
 use crate::http_invocations::InvocationReaders;
 use crate::identity::{DenyList, Peers};
+use crate::members::Members;
+use crate::members_rpc::MembershipService;
 use crate::state_store::StateStore;
 use crate::token::ApiToken;
 use crate::worker::WorkerService;
@@ -336,6 +339,10 @@ where
     .with_memory_ladder(listeners.memory_ladder.clone())
     .recording(recorder.clone());
     let durable = state.is_some();
+    // Storage nodes register with a frontend that has a state store to keep them in.
+    let members = state
+        .as_ref()
+        .map(|s| Arc::new(Members::new(Arc::clone(&s.store), s.members)));
     let farm = Arc::new(farm.with_state(state)?);
     let (reapi_incoming, reapi) = bind(listeners.reapi)?;
     let (worker_incoming, worker) = bind(listeners.worker)?;
@@ -367,6 +374,7 @@ where
         reapi_server = reapi_server.tls_config(tls)?;
     }
     let mut worker_server = flow_control(Server::builder());
+    let peers_certified = listeners.worker_tls.is_some();
     let peers = match listeners.worker_tls {
         Some(tls) => {
             worker_server = worker_server.tls_config(tls.server)?;
@@ -408,6 +416,14 @@ where
     ))
     .max_decoding_message_size(MAX_MESSAGE_BYTES)
     .max_encoding_message_size(MAX_MESSAGE_BYTES);
+    let admission = if peers_certified {
+        Admission::Certified
+    } else {
+        Admission::Open
+    };
+    let membership = members
+        .clone()
+        .map(|m| MembershipService::new(m, admission).server());
     let (closer, closing) = kbf_front::closing();
     let authorizers = Arc::new(policy.authorizers);
     let cache_for_health = Arc::clone(&cache);
@@ -456,8 +472,15 @@ where
             .add_service(worker_blobs)
             .add_service(worker_cas)
             .add_service(worker_segments)
+            .add_optional_service(membership)
             .serve_with_incoming(worker_incoming);
         let api_serve = serve_api(api_listener.map(|(listener, _)| listener), api_routes);
+        let sweeping = async {
+            match members {
+                Some(members) => crate::members_rpc::sweep(members).await,
+                None => std::future::pending().await,
+            }
+        };
         let ticking = async {
             let mut tick = tokio::time::interval(listeners.tick);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -486,6 +509,7 @@ where
             served = worker_serve => served.map_err(ServeError::from),
             served = api_serve => served.map_err(ServeError::Api),
             () = ticking => Ok(()),
+            () = sweeping => Ok(()),
             () = stopping => Ok(()),
         }
     };

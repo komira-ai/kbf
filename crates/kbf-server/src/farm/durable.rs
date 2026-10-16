@@ -537,7 +537,7 @@ impl State {
     /// generic, unlike `Farm::with_state`, so every test binary's runs count toward the
     /// same function's coverage.
     fn keep_in(&mut self, state: Option<StateStore>) -> Result<Option<u64>, StateError> {
-        let Some(StateStore { store, epoch }) = state else {
+        let Some(StateStore { store, epoch, .. }) = state else {
             return Ok(None);
         };
         let (durable, epoch) = Durable::open(store, epoch, process_term())?;

@@ -216,7 +216,11 @@ where
         .state_store
         .as_ref()
         .map(StateStoreUri::open)
-        .transpose()?;
+        .transpose()?
+        .map(|state| crate::StateStore {
+            members: args.members(),
+            ..state
+        });
     let routes = Routes {
         invocations: policy.invocations_get.is_some(),
         blobs: policy.invocations_get.is_some() && policy.blobs_get.is_some(),

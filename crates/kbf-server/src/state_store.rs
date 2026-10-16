@@ -9,6 +9,7 @@ use std::sync::Arc;
 use kbf_state::Store;
 
 use crate::farm::{EpochPolicy, StateError};
+use crate::members::MembershipConfig;
 
 /// A `--state-store` value: one of the two backends the design admits.
 #[derive(Clone, PartialEq, Eq)]
@@ -104,6 +105,8 @@ pub struct StateStore {
     pub store: Arc<dyn Store>,
     /// The epoch the start takes.
     pub epoch: EpochPolicy,
+    /// How long storage members live and dwell in the store ([`crate::members`]).
+    pub members: MembershipConfig,
 }
 
 #[cfg(test)]
