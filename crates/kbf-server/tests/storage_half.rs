@@ -7,10 +7,12 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use futures::stream;
+use kbf_front::{Cache, CacheStorage, SegmentsConfig};
 use kbf_proto::google::bytestream::WriteRequest;
 use kbf_proto::google::bytestream::byte_stream_client::ByteStreamClient;
 use kbf_server::storage_half::start;
 use kbf_server::storage_node::{StorageFlags, command, parse};
+use kbf_server::{BoundStorage, StorageListener, bind_storage};
 use kbf_storage::Storage as _;
 use kbf_storage::local_cache::LocalCache;
 use kbf_storage::service::RemoteStorage;
@@ -125,23 +127,102 @@ async fn a_listener_kbf_storage_refuses_is_refused_first() {
     assert!(!d.join("hot").exists(), "a refused start opened a store");
 }
 
+/// A storage that tells the test when the service first asks it about a blob: a ByteStream
+/// `Write` does that right after it takes the first message off the stream, so the signal
+/// means the server has accepted the stream and the write is in flight. Everything else is
+/// the inner storage's.
+struct Watched {
+    inner: Arc<dyn kbf_storage::Storage>,
+    asked: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+}
+
+impl kbf_storage::Storage for Watched {
+    fn find_missing<'a>(
+        &'a self,
+        digests: &'a [kbf_types::Digest],
+    ) -> kbf_storage::Answer<'a, Vec<kbf_types::Digest>> {
+        if let Some(asked) = self.asked.lock().expect("lock").take() {
+            let _ = asked.send(());
+        }
+        self.inner.find_missing(digests)
+    }
+    fn read_blob<'a>(&'a self, digest: &'a kbf_types::Digest) -> kbf_storage::Answer<'a, Bytes> {
+        self.inner.read_blob(digest)
+    }
+    fn read_range<'a>(
+        &'a self,
+        digest: &'a kbf_types::Digest,
+        offset: u64,
+        limit: u64,
+    ) -> kbf_storage::Answer<'a, kbf_storage::ReadStream> {
+        self.inner.read_range(digest, offset, limit)
+    }
+    fn put(&self, bytes: Bytes) -> kbf_storage::Answer<'_, kbf_types::Digest> {
+        self.inner.put(bytes)
+    }
+    fn stream(&self, size: u64) -> Option<Box<dyn kbf_storage::PutStream>> {
+        self.inner.stream(size)
+    }
+    fn segments(&self) -> Arc<dyn kbf_proto::worker::segments_server::Segments> {
+        self.inner.segments()
+    }
+    fn action_result<'a>(
+        &'a self,
+        action: &'a kbf_types::Digest,
+    ) -> kbf_storage::Answer<'a, Option<(kbf_types::Digest, kbf_proto::reapi::ActionResult)>> {
+        self.inner.action_result(action)
+    }
+    fn prepare_action_result<'a>(
+        &'a self,
+        result: &'a kbf_proto::reapi::ActionResult,
+    ) -> kbf_storage::Answer<'a, kbf_meta::ActionRecord> {
+        self.inner.prepare_action_result(result)
+    }
+    fn commit_action_record(
+        &self,
+        role: kbf_meta::Role,
+        action: kbf_types::Digest,
+        record: kbf_meta::ActionRecord,
+    ) -> kbf_storage::Answer<'_, ()> {
+        self.inner.commit_action_record(role, action, record)
+    }
+}
+
 /// Catches a stop that cuts a write in flight instead of draining it: a ByteStream write
-/// has sent its first half when the shutdown future completes; once the runtime has run the
-/// stop through the listener, the second half goes, and the write must commit the whole
-/// blob, `serve` end only after it, and the blob read through the
-/// handle.
+/// has sent its first half and the server has taken it up (the storage was asked about
+/// the blob) when the shutdown future completes; once the runtime has run the stop
+/// through the listener, the second half goes, and the write must commit the whole blob,
+/// `serving` end only after it, and the blob read back.
+///
+/// The stop waits for the server, not for the client: a stop that beat the stream's
+/// arrival would be refused by the listener, which is right and is not what is tested.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_stop_drains_a_write_in_flight() {
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
-    let half = start(&flags(&file_stores(&dir("drain"))), || {
-        Ok(async move {
+    let (asked, in_flight) = tokio::sync::oneshot::channel::<()>();
+    let held: Arc<dyn kbf_storage::Storage> = Arc::new(CacheStorage::new(
+        Arc::new(Cache::memory()),
+        SegmentsConfig::DEFAULT,
+    ));
+    let storage: Arc<dyn kbf_storage::Storage> = Arc::new(Watched {
+        inner: Arc::clone(&held),
+        asked: std::sync::Mutex::new(Some(asked)),
+    });
+    let BoundStorage { addr, serving } = bind_storage(
+        Arc::clone(&storage),
+        StorageListener {
+            listen: "127.0.0.1:0".parse().expect("address"),
+            tls: None,
+            service: kbf_storage::service::Config {
+                write_bytes_in_flight: 64 << 20,
+            },
+        },
+        async move {
             let _ = stopped.await;
-        })
-    })
-    .await
-    .expect("starts");
-    let (storage, addr) = (half.storage(), half.addr);
-    let serving = tokio::spawn(half.serve());
+        },
+    )
+    .expect("binds");
+    let serving = tokio::spawn(serving);
 
     let blob: Vec<u8> = (0..2048u32).map(|i| (i % 251) as u8).collect();
     let (head, tail) = blob.split_at(1024);
@@ -162,21 +243,17 @@ async fn a_stop_drains_a_write_in_flight() {
         finish_write: true,
         data: tail.to_vec(),
     };
-    // The second request is released once the first has been taken for sending.
-    let (sent, first_sent) = tokio::sync::oneshot::channel::<()>();
+    // The second request is released once the test says so.
     let (release, released) = tokio::sync::oneshot::channel::<()>();
     let requests = stream::unfold(
-        (Some(first), Some(second), Some(sent), Some(released)),
-        |(first, second, sent, released)| async move {
+        (Some(first), Some(second), Some(released)),
+        |(first, second, released)| async move {
             if let Some(first) = first {
-                return Some((first, (None, second, sent, released)));
-            }
-            if let Some(sent) = sent {
-                let _ = sent.send(());
+                return Some((first, (None, second, released)));
             }
             let _ = released?.await;
             let second = second?;
-            Some((second, (None, None, None, None)))
+            Some((second, (None, None, None)))
         },
     );
     let channel = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
@@ -190,7 +267,7 @@ async fn a_stop_drains_a_write_in_flight() {
             .await
             .map(tonic::Response::into_inner)
     });
-    first_sent.await.expect("the first half was taken");
+    in_flight.await.expect("the server took the write up");
     stop.send(()).expect("stop");
     // Let the runtime run the stop through the listener: a bounded number of turns, not
     // a time. A listener that cut its calls ends `serve` within them.
@@ -208,5 +285,5 @@ async fn a_stop_drains_a_write_in_flight() {
     let digest =
         kbf_types::Digest::parse(kbf_types::DigestFunction::Sha256, &format!("{hash}/2048"))
             .expect("digest");
-    assert_eq!(storage.read_blob(&digest).await.expect("read"), blob);
+    assert_eq!(held.read_blob(&digest).await.expect("read"), blob);
 }
