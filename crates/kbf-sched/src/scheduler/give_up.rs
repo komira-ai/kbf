@@ -27,6 +27,10 @@ impl Scheduler {
             .filter_map(|(lease, held)| {
                 let op = &self.ops[&held.operation];
                 let worker = op.state.holding().map(|(_, w)| w);
+                // A recovered lease waits for its worker to register again.
+                if worker.is_some_and(|w| self.awaited.get(w).is_some_and(|until| now < *until)) {
+                    return None;
+                }
                 let w = worker.and_then(|w| self.workers.get(w));
                 if w.is_some_and(|w| w.alive(now) || w.switching(*lease, now)) {
                     return None;

@@ -20,8 +20,6 @@
 //! `Committed` lease, a `WorkerUp`), so the strict codec the replicated log already runs
 //! decides what a row may hold.
 
-#![allow(dead_code, unused_imports)]
-
 use std::sync::{Arc, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -174,44 +172,180 @@ fn number(key: &str, row: &Versioned) -> Result<u64, StateError> {
 }
 
 impl Durable {
-    // Stubs: this change's tests fail against these, which write and read nothing.
+    /// Opens the scheduler's rows in `store` and settles its epoch: a store that has
+    /// none gets a first one that no other store's epoch is likely to equal (a daemon
+    /// must not mistake a new store for the one it knew), `policy` decides for one that
+    /// has. Returns the handle and the epoch.
     pub(super) fn open(
         store: Arc<dyn Store>,
-        _policy: EpochPolicy,
+        policy: EpochPolicy,
         first: u64,
     ) -> Result<(Self, u64), StateError> {
-        Ok((Self { store }, first))
+        let row = store.get(EPOCH)?;
+        let (epoch, write) = match (&row, policy) {
+            (None, _) => (first, Some(Cond::Absent)),
+            (Some(row), EpochPolicy::Keep) => (number(EPOCH, row)?, None),
+            (Some(row), EpochPolicy::Bump) => {
+                (number(EPOCH, row)? + 1, Some(Cond::Version(row.version)))
+            }
+        };
+        let durable = Self { store };
+        if let Some(cond) = write {
+            durable.commit(Txn::new().put(EPOCH, epoch.to_be_bytes(), cond))?;
+        }
+        Ok((durable, epoch))
     }
 
+    /// The row at `key`, which the write that asks depends on.
+    fn row(&self, key: &str) -> Result<Versioned, StateError> {
+        let row = self.store.get(key)?;
+        row.ok_or_else(|| StateError::Missing(key.to_owned()))
+    }
+
+    fn commit(&self, txn: Txn) -> Result<(), StateError> {
+        self.store.txn(txn)??;
+        Ok(())
+    }
+
+    /// What the store holds: the unfinished operations, each with its lease, and the
+    /// first ids to hand out.
     pub(super) fn load(&self) -> Result<Stored, StateError> {
-        let _ = &self.store;
+        let mut leases = std::collections::BTreeMap::new();
+        for (key, row) in self.store.scan_prefix("lease/")? {
+            let FarmInput::Committed(ControlRecord::Lease(grant)) = decode(&key, &row.value)?
+            else {
+                return Err(corrupt(&key, "not a lease grant"));
+            };
+            leases.insert(grant.operation, grant);
+        }
+        let mut operations = Vec::new();
+        for (key, row) in self.store.scan_prefix("op/")? {
+            let FarmInput::Submit(request) = decode(&key, &row.value)? else {
+                return Err(corrupt(&key, "not a request"));
+            };
+            let operation = OperationId(
+                u64::from_str_radix(&key["op/".len()..], 16)
+                    .map_err(|_| corrupt(&key, "not an operation id"))?,
+            );
+            let lease = leases.remove(&operation);
+            operations.push(StoredOperation {
+                operation,
+                request,
+                lease,
+            });
+        }
         Ok(Stored {
-            next_operation: 0,
-            next_seq: 0,
-            operations: Vec::new(),
+            next_operation: self.counter(NEXT_OP)?,
+            next_seq: self.counter(NEXT_SEQ)?,
+            operations,
         })
     }
 
-    pub(super) fn submitted(&self, _: OperationId, _: &Request) -> Result<(), StateError> {
+    fn counter(&self, key: &str) -> Result<u64, StateError> {
+        self.store.get(key)?.map_or(Ok(0), |row| number(key, &row))
+    }
+
+    /// An operation submitted: its request, and its place in the queue.
+    pub(super) fn submitted(
+        &self,
+        operation: OperationId,
+        request: &Request,
+    ) -> Result<(), StateError> {
+        let value = encode(FarmInput::Submit(request.clone()))?;
+        self.commit(
+            Txn::new()
+                .put(op_key(operation), value, Cond::Absent)
+                .put(queue_key(operation), Vec::new(), Cond::Absent)
+                .put(NEXT_OP, (operation.0 + 1).to_be_bytes(), Cond::Any),
+        )
+    }
+
+    /// A grant committed: the operation leaves the queue and holds `grant`'s lease. The
+    /// operation must be queued, as the transaction reads it.
+    fn granted(&self, start: &StartLease) -> Result<(), StateError> {
+        let queued = queue_key(start.operation);
+        let row = self.row(&queued)?;
+        let grant = LeaseGrant {
+            lease: start.lease,
+            operation: start.operation,
+            worker: start.worker.clone(),
+        };
+        let value = encode(FarmInput::Committed(ControlRecord::Lease(grant)))?;
+        self.commit(
+            Txn::new()
+                .delete(queued, Cond::Version(row.version))
+                .put(lease_key(start.lease), value, Cond::Absent)
+                .put(NEXT_SEQ, (start.lease.seq + 1).to_be_bytes(), Cond::Any),
+        )
+    }
+
+    /// A lease given up: the operation holds nothing and is queued again. The lease
+    /// must still be the operation's, as the transaction reads it.
+    pub(super) fn requeued(&self, requeue: &Requeue) -> Result<(), StateError> {
+        let key = lease_key(requeue.lease);
+        let row = self.row(&key)?;
+        self.commit(Txn::new().delete(key, Cond::Version(row.version)).put(
+            queue_key(requeue.operation),
+            Vec::new(),
+            Cond::Absent,
+        ))
+    }
+
+    /// A result accepted from `lease`: the operation is finished. Compare-and-set on
+    /// the operation's lease: a result of a lease the operation no longer holds is
+    /// refused, whatever was proposed.
+    fn finished(&self, operation: OperationId, lease: LeaseId) -> Result<(), StateError> {
+        let key = lease_key(lease);
+        let row = self.row(&key)?;
+        self.commit(
+            Txn::new()
+                .delete(key, Cond::Version(row.version))
+                .delete(op_key(operation), Cond::Any)
+                .delete(queue_key(operation), Cond::Any),
+        )
+    }
+
+    /// A refusal committed: the operation is finished without a lease.
+    fn refused(&self, operation: OperationId) -> Result<(), StateError> {
+        self.commit(
+            Txn::new()
+                .delete(op_key(operation), Cond::Any)
+                .delete(queue_key(operation), Cond::Any),
+        )
+    }
+
+    /// Writes what the scheduler's effects of a committed record settle, in order.
+    /// Nothing the effects carry (a `Start`, an answer) is carried out unless this
+    /// returns `Ok`.
+    pub(super) fn persist(&self, effects: &[Effect]) -> Result<(), StateError> {
+        for effect in effects {
+            match effect {
+                Effect::Start(start) => self.granted(start)?,
+                Effect::Answer(answer) => self.finished(answer.operation, answer.lease)?,
+                Effect::Refuse(refusal) => self.refused(refusal.operation)?,
+                Effect::Commit(_) | Effect::Waiting(_) => {}
+            }
+        }
         Ok(())
     }
 
-    pub(super) fn requeued(&self, _: &Requeue) -> Result<(), StateError> {
-        Ok(())
-    }
-
-    pub(super) fn persist(&self, _: &[Effect]) -> Result<(), StateError> {
-        Ok(())
-    }
-
+    /// A daemon registered: its session row, as of the registration.
     pub(super) fn session(
         &self,
-        _: &WorkerId,
-        _: &DaemonInstance,
-        _: bool,
-        _: &Reported,
+        worker: &WorkerId,
+        instance: &DaemonInstance,
+        predecessor_stopped: bool,
+        reported: &Reported,
     ) -> Result<(), StateError> {
-        Ok(())
+        let up = FarmInput::WorkerUp {
+            worker: worker.clone(),
+            instance: instance.clone(),
+            predecessor_stopped,
+            capacity: reported.capacity,
+            caps: reported.caps.clone(),
+        };
+        let value = encode(up)?;
+        self.commit(Txn::new().put(format!("session/{worker}"), value, Cond::Any))
     }
 }
 
@@ -233,12 +367,41 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
         store: Arc<dyn Store>,
         epoch: EpochPolicy,
     ) -> Result<Self, StateError> {
-        // Stub: the store is opened and nothing is replayed.
         let (durable, epoch) = Durable::open(store, epoch, process_term())?;
-        let _stored = durable.load()?;
+        let stored = durable.load()?;
         self.term = epoch;
         self.lease_epoch = epoch;
         let state = self.state.get_mut().unwrap_or_else(PoisonError::into_inner);
+        state.machine = FarmMachine::new(epoch);
+        let now = SystemTime::now();
+        let mut recovered = Vec::new();
+        for op in stored.operations {
+            let key = op.request.key.clone();
+            let waiter = state.machine.submit(Waiter {
+                key: key.clone(),
+                kind: op.request.kind,
+                do_not_cache: op.request.do_not_cache,
+                queued: now,
+            });
+            state.stages.insert(waiter, watch::channel(Stage::Queued).0);
+            if let Some(grant) = &op.lease {
+                let stamp = Stamp {
+                    queued: now,
+                    started: now,
+                };
+                let sent = Sent {
+                    operation: op.operation,
+                    action: key.action,
+                    stamp,
+                };
+                state.machine.start(grant.lease, sent);
+            }
+            recovered.push(op.recovered(waiter));
+        }
+        let next_operation = OperationId(stored.next_operation);
+        state
+            .sched
+            .recover(epoch, next_operation, stored.next_seq, recovered);
         state.durable = Some(durable);
         Ok(self)
     }

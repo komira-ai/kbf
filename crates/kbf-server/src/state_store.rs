@@ -38,8 +38,23 @@ impl FromStr for StateStoreUri {
     type Err = StateStoreUriError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        // Stub: every value is a SQLite path.
-        Ok(Self::Sqlite(PathBuf::from(s)))
+        if let Some(path) = s.strip_prefix("sqlite://") {
+            return if path.starts_with('/') && path.len() > 1 {
+                Ok(Self::Sqlite(PathBuf::from(path)))
+            } else {
+                Err(StateStoreUriError::SqlitePath)
+            };
+        }
+        if let Some(rest) = s.strip_prefix("postgres://") {
+            return if rest.is_empty() {
+                Err(StateStoreUriError::PostgresEmpty)
+            } else {
+                Ok(Self::Postgres(s.to_owned()))
+            };
+        }
+        // Only the scheme is echoed: a mistyped postgres value may carry a password.
+        let scheme = s.split_once("://").map_or(s, |(scheme, _)| scheme);
+        Err(StateStoreUriError::Scheme(scheme.to_owned()))
     }
 }
 

@@ -373,10 +373,17 @@ fn an_unreadable_row_is_refused_naming_it() {
         }),
     )
     .expect("encode");
-    let rows: [(&str, Vec<u8>, &str); 7] = [
+    let pair = LogCommand::Farm(FarmBatch {
+        now: FarmTime::default(),
+        wall: UNIX_EPOCH,
+        inputs: vec![FarmInput::Tick, FarmInput::Tick],
+    });
+    let pair = kbf_log::encode(Format::V1, &pair).expect("encode");
+    let rows: [(&str, Vec<u8>, &str); 8] = [
         ("op/0000000000000001", vec![0xff, 0xff, 0xff], "malformed"),
         ("op/0000000000000001", lease.clone(), "not a request"),
         ("op/0000000000000001", other, "not a single scheduler input"),
+        ("op/0000000000000001", pair, "not a single scheduler input"),
         ("op/zz", submit.clone(), "not an operation id"),
         (
             "lease/0000000000000005.0000000000000000",
@@ -417,4 +424,25 @@ fn a_failing_store_fails_the_write() {
     durable
         .submitted(OperationId(1), &request(1))
         .expect("up again");
+}
+
+/// Catches: a store wrapper that answers reads and the feed from somewhere but the fake
+/// it wraps (the tests above would pass over an empty store), and a handle that does not
+/// say what it is when a farm holding it is printed.
+#[test]
+fn the_flaky_store_reads_through_and_the_handle_prints() {
+    let store = Flaky::new();
+    let durable = open(&store);
+    durable
+        .submitted(OperationId(1), &request(1))
+        .expect("submit");
+    assert_eq!(store.reap_expired(), Ok(0));
+    assert_eq!(store.now(), StoreTime::ZERO);
+    let changes = store.changes(Revision::ZERO, 100).expect("changes");
+    let written = changes
+        .rows
+        .iter()
+        .any(|row| row.key == "op/0000000000000001");
+    assert!(written);
+    assert_eq!(format!("{durable:?}"), "Durable");
 }

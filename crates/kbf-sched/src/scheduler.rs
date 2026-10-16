@@ -260,6 +260,9 @@ pub struct Scheduler {
     memory: Box<MemoryState>,
     /// The rungs of an action's memory booking ([`memory`]).
     ladder: MemoryLadder,
+    /// Workers a recovered scheduler holds leases for that have not registered yet, and
+    /// until when they may take to ([`Scheduler::recover`]).
+    awaited: BTreeMap<WorkerId, FarmTime>,
 }
 
 impl Scheduler {
@@ -284,6 +287,7 @@ impl Scheduler {
             reservations: BTreeMap::new(),
             memory: Box::default(),
             ladder: MemoryLadder::default(),
+            awaited: BTreeMap::new(),
         }
     }
 
@@ -919,25 +923,24 @@ impl StateMachine for Scheduler {
                         w.session += 1;
                     }
                     None => {
-                        self.workers.insert(
-                            worker,
-                            Worker {
-                                capacity,
-                                caps,
-                                booked: Resources::default(),
-                                leases: 0,
-                                whole: false,
-                                devices: BTreeSet::new(),
-                                last_heard: now,
-                                session: 0,
-                                instance,
-                                process: 0,
-                                handover_ends: FarmTime::default(),
-                                stopped_process: None,
-                                phase: NodePhase::Serving,
-                                switch_ends: FarmTime::default(),
-                            },
-                        );
+                        let mut fresh = Worker {
+                            capacity,
+                            caps,
+                            booked: Resources::default(),
+                            leases: 0,
+                            whole: false,
+                            devices: BTreeSet::new(),
+                            last_heard: now,
+                            session: 0,
+                            instance,
+                            process: 0,
+                            handover_ends: FarmTime::default(),
+                            stopped_process: None,
+                            phase: NodePhase::Serving,
+                            switch_ends: FarmTime::default(),
+                        };
+                        self.adopt(&worker, &mut fresh);
+                        self.workers.insert(worker, fresh);
                     }
                 }
                 Vec::new()
