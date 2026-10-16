@@ -5,7 +5,7 @@ Status: design, nothing built. It supersedes the leader-elected server cluster i
 ## 1. Decisions
 
 - **[D]** kbf is four parts, as Buildbarn is frontend, scheduler, storage and worker.
-  - **Frontend.** Stateless when the state store is Postgres (on SQLite its queue lives in the file on its own disk, section 4.3). Runs behind a load balancer (LB) in an autoscaling group; its DNS name is the one address clients, daemons and storage nodes know. Serves REAPI, runs the scheduler logic and the UI. Holds no durable state of its own beyond the state store.
+  - **Frontend.** Stateless when the state store is Postgres (on SQLite its queue lives in the file on its own disk, section 4.3). Runs behind a load balancer (LB) in an autoscaling group; its DNS name is the one address clients, daemons and storage nodes know. Serves REAPI, runs the scheduler logic and the UI. Holds no durable state of its own beyond the state store (and, if adopted, the UI history store, on the same backend as the state store: `ui-data.md` 5.2, pending the owner's decision).
   - **State store.** The queue, leases (each action handed out once), operations and membership. Two backends only: SQLite (a single frontend, and always `all-in-one`) and Postgres (required for several frontends, allowed for a single one), chosen by `--state-store`.
   - **Storage.** CAS, action cache (AC), SSD hot store, background flush to the cold store (MinIO or S3). Sharded by digest with a replication factor R (default 2). No leader. Storage nodes do not schedule.
   - **Daemon.** Runs actions.
