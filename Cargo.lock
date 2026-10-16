@@ -1618,6 +1618,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "kbf-history"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "crc32c",
+ "futures",
+ "hex",
+ "kbf-objstore",
+ "kbf-state",
+ "prost",
+ "ruzstd",
+ "sha2 0.11.0",
+ "thiserror",
+]
+
+[[package]]
 name = "kbf-host"
 version = "0.1.0"
 dependencies = [
@@ -1954,6 +1970,7 @@ dependencies = [
  "tokio",
  "tonic",
  "tracing",
+ "tracing-core",
  "tracing-subscriber",
  "x509-parser",
 ]
