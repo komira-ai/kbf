@@ -165,9 +165,9 @@ mod tests {
             Some(&token),
             PageSize::MAX,
         ));
-        assert!(
-            matches!(&listed, Err(ObjectStoreError::Protocol(why)) if why.contains("another store")),
-            "{listed:?}"
+        assert_eq!(
+            listed.map(drop).map_err(|e| e.to_string()),
+            Err("store broke the protocol: a continuation token from another store".to_owned())
         );
     }
 
