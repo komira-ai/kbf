@@ -268,3 +268,24 @@ fn no_stream_for_nothing_or_without_a_runtime() {
     assert!(storage(&inside).stream(0).is_none());
     assert!(storage(&inside).stream(1).is_some());
 }
+
+/// Catches an append past the size the stream was made for taken (a blob longer than
+/// its reservation written past it), with a write tier and without: refused as the cache
+/// refuses it (`Invalid` to the store, the tier's out-of-range write on the tier), and
+/// nothing is held.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_append_past_the_size_is_refused() {
+    for cache in [cold(), tiered("past").await] {
+        let storage = storage(&cache);
+        let bytes = patterned(7, 11);
+        let stream = open(&storage, 10).await.expect("the cache can stream it");
+        let appended = tokio::task::spawn_blocking(move || {
+            let mut stream = stream;
+            stream.append(&bytes)
+        })
+        .await
+        .expect("append");
+        assert!(appended.is_err(), "{appended:?}");
+        not_held(&storage, digest_and_crc(&patterned(7, 10)).0).await;
+    }
+}

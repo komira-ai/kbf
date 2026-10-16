@@ -27,10 +27,10 @@
 //! endpoint's table. Roles are the part of this unit that is partly a seam; the module
 //! docs of [`admission`] say which.
 //!
-//! **Where PutStream plugs in.** `Write` buffers a blob whole, because no store hands
-//! out a [`crate::PutStream`] yet ([`Storage::stream`] is `None`). When one does, the
-//! handler appends each message to it instead, and [`Config::write_bytes_in_flight`] is
-//! needed no more.
+//! **Where PutStream plugs in.** `Write` buffers a blob whole: it does not use
+//! [`Storage::stream`] yet, which `kbf-front`'s cache answers with a stream wherever it
+//! can take one. When it does, the handler appends each message to the stream instead,
+//! and [`Config::write_bytes_in_flight`] is needed no more.
 
 mod actions;
 mod admission;

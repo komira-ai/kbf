@@ -112,9 +112,10 @@ pub trait Storage: Send + Sync {
 
     /// A stream for one blob of `size` bytes, written as its bytes arrive and never
     /// held whole in memory: [`PutStream::append`] each chunk, [`PutStream::finish`]
-    /// with the digest and CRC-32C, then [`StreamedPut::commit`]. `None` when the store
-    /// cannot take one (no write tier, no room on it, or `size` is 0): the caller uses
-    /// [`Storage::put`]. Blocking: call it off the async runtime.
+    /// with the digest and CRC-32C, then [`StreamedPut::commit`]. `None` only when the
+    /// store cannot stream at all (`size` is 0, or it has nowhere to stream to): the
+    /// caller uses [`Storage::put`]. A store with a write tier but no room on it still
+    /// streams, to its object store. Blocking: call it off the async runtime.
     fn stream(&self, size: u64) -> Option<Box<dyn PutStream>>;
 
     /// Stores a blob of `size` bytes straight to the object store as `bytes` come (a
@@ -193,8 +194,9 @@ pub trait PutStream: Send {
     /// Ends the stream as the blob `digest`, whose bytes have CRC-32C `crc32c`.
     ///
     /// # Errors
-    /// The bytes written are not as many as `digest` names, or their CRC-32C is not
-    /// `crc32c`: nothing is stored.
+    /// The bytes written are not as many as `digest` names, their CRC-32C is not
+    /// `crc32c`, or they do not hash to `digest` ([`StorageError::DigestMismatch`]):
+    /// nothing is stored.
     fn finish(
         self: Box<Self>,
         digest: Digest,
