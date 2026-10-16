@@ -581,11 +581,12 @@ impl Token {
             let after = a.checked_sub(1).map(|row| (b, row));
             return Ok(Cursor::Sorted { after });
         }
-        let b = usize::try_from(b).map_err(|_| malformed())?;
         let rest = b.checked_sub(1);
-        if a > rows || rest.is_some_and(|n| n > rows) {
+        if a > rows || rest.is_some_and(|n| n > rows as u64) {
             return Err(malformed());
         }
+        // Both fit: `b` is at most one past the rows.
+        let (b, rest) = (b as usize, rest.map(|n| n as usize));
         Ok(match start {
             Cursor::Actions { .. } | Cursor::Sorted { .. } => Cursor::Actions { row: a },
             Cursor::Artifacts { .. } => Cursor::Artifacts { row: a, output: b },
