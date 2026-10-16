@@ -29,7 +29,7 @@ fn put(store: &SqliteStore, key: &str, value: &str) -> Revision {
 }
 
 fn reopen(path: &Path) -> SqliteStore {
-    let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+    let clock: Arc<dyn Clock> = Arc::new(SystemClock::default());
     SqliteStore::open(path, clock, Options::default()).expect("open")
 }
 
@@ -88,8 +88,14 @@ fn a_backup_of_an_open_store_is_one_checked_file_with_every_commit() {
     drop(store);
 
     let restored = reopen(&copy);
-    assert_eq!(restored.get("a").expect("get").map(|v| v.value), Some(b"1".to_vec()));
-    assert_eq!(restored.get("b").expect("get").map(|v| v.value), Some(b"2".to_vec()));
+    assert_eq!(
+        restored.get("a").expect("get").map(|v| v.value),
+        Some(b"1".to_vec())
+    );
+    assert_eq!(
+        restored.get("b").expect("get").map(|v| v.value),
+        Some(b"2".to_vec())
+    );
 }
 
 // Catches a backup that creates the state file it was pointed at, copies a file that is
@@ -110,7 +116,10 @@ fn a_backup_refuses_what_it_cannot_copy() {
         .execute_batch("CREATE TABLE t (x)")
         .expect("fill");
     let refused = backup(&foreign, &dir.join("out.db")).expect_err("foreign");
-    assert!(matches!(refused, SqliteError::NotAStateStore(_)), "got {refused}");
+    assert!(
+        matches!(refused, SqliteError::NotAStateStore(_)),
+        "got {refused}"
+    );
     assert!(!dir.join("out.db").exists(), "nothing is written for it");
 
     let (store, _) = open_manual(&dir, Options::default());
@@ -138,10 +147,16 @@ fn the_check_takes_only_a_whole_intact_state_store() {
     let garbage = dir.join("garbage.db");
     fs::write(&garbage, vec![b'x'; 4096]).expect("write");
     let refused = check_backup(&garbage).expect_err("garbage");
-    assert!(refused.to_string().contains("not a SQLite database"), "got {refused}");
+    assert!(
+        refused.to_string().contains("not a SQLite database"),
+        "got {refused}"
+    );
     fs::write(&garbage, b"SQLite format 3\0").expect("write");
     let refused = check_backup(&garbage).expect_err("a header cut short");
-    assert!(matches!(refused, SqliteError::NotAStateStore(_)), "got {refused}");
+    assert!(
+        matches!(refused, SqliteError::NotAStateStore(_)),
+        "got {refused}"
+    );
 
     let live = dir.join("state.db");
     assert_eq!(journal_bytes(&live), [2, 2]);
@@ -154,15 +169,24 @@ fn the_check_takes_only_a_whole_intact_state_store() {
         .execute_batch("CREATE TABLE t (x)")
         .expect("fill");
     let refused = check_backup(&foreign).expect_err("foreign");
-    assert!(refused.to_string().contains("schema version 0"), "got {refused}");
+    assert!(
+        refused.to_string().contains("schema version 0"),
+        "got {refused}"
+    );
 
     let damaged = dir.join("damaged.db");
     fs::copy(&good, &damaged).expect("copy");
     damage(&damaged);
     let refused = check_backup(&damaged).expect_err("damaged");
-    assert!(matches!(refused, SqliteError::NotAStateStore(_)), "got {refused}");
+    assert!(
+        matches!(refused, SqliteError::NotAStateStore(_)),
+        "got {refused}"
+    );
     assert!(refused.to_string().contains("damaged"), "got {refused}");
-    assert!(refused.to_string().contains("damaged.db"), "names the file: {refused}");
+    assert!(
+        refused.to_string().contains("damaged.db"),
+        "names the file: {refused}"
+    );
 }
 
 /// Swaps the root pages of two indexes, so each index holds the other table's rows: the
@@ -176,11 +200,16 @@ fn damage(file: &Path) {
     )
     .expect("fill");
     let root = |name: &str| -> i64 {
-        conn.query_row("SELECT rootpage FROM sqlite_master WHERE name = ?1", [name], |row| row.get(0))
-            .expect("root page")
+        conn.query_row(
+            "SELECT rootpage FROM sqlite_master WHERE name = ?1",
+            [name],
+            |row| row.get(0),
+        )
+        .expect("root page")
     };
     let (one, two) = (root("i1"), root("i2"));
-    conn.execute_batch("PRAGMA writable_schema = ON").expect("writable schema");
+    conn.execute_batch("PRAGMA writable_schema = ON")
+        .expect("writable schema");
     conn.execute(
         "UPDATE sqlite_master SET rootpage = CASE name WHEN 'i1' THEN ?2 ELSE ?1 END
          WHERE name IN ('i1', 'i2')",
@@ -196,22 +225,43 @@ fn damage(file: &Path) {
 fn the_tool_lock_is_the_stores_lock() {
     let dir = scratch("tool-lock");
     let db = dir.join("state.db");
-    assert!(!StoreLock::is_held(&db).expect("probe"), "no lock file: nobody holds it");
-    assert!(!dir.join("state.db.lock").exists(), "the probe creates nothing");
+    assert!(
+        !StoreLock::is_held(&db).expect("probe"),
+        "no lock file: nobody holds it"
+    );
+    assert!(
+        !dir.join("state.db.lock").exists(),
+        "the probe creates nothing"
+    );
 
     let (store, _) = open_manual(&dir, Options::default());
-    assert!(StoreLock::is_held(&db).expect("probe"), "an open store holds it");
+    assert!(
+        StoreLock::is_held(&db).expect("probe"),
+        "an open store holds it"
+    );
     let refused = StoreLock::take(&db).expect_err("the store holds it");
-    assert!(matches!(refused, SqliteError::Locked { .. }), "got {refused}");
+    assert!(
+        matches!(refused, SqliteError::Locked { .. }),
+        "got {refused}"
+    );
     drop(store);
-    assert!(!StoreLock::is_held(&db).expect("probe"), "released with the store");
+    assert!(
+        !StoreLock::is_held(&db).expect("probe"),
+        "released with the store"
+    );
 
     let lock = StoreLock::take(&db).expect("take");
-    assert_eq!((lock.db(), lock.lock_file()), (db.as_path(), dir.join("state.db.lock")));
+    assert_eq!(
+        (lock.db(), lock.lock_file()),
+        (db.as_path(), dir.join("state.db.lock"))
+    );
     assert!(StoreLock::is_held(&db).expect("probe"));
-    let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+    let clock: Arc<dyn Clock> = Arc::new(SystemClock::default());
     let refused = SqliteStore::open(&db, clock, Options::default()).expect_err("held by the tool");
-    assert!(matches!(refused, SqliteError::Locked { .. }), "got {refused}");
+    assert!(
+        matches!(refused, SqliteError::Locked { .. }),
+        "got {refused}"
+    );
     drop(lock);
     drop(reopen(&db));
 
@@ -219,7 +269,10 @@ fn the_tool_lock_is_the_stores_lock() {
     fs::write(&file, b"").expect("write");
     let refused = StoreLock::is_held(&file.join("state.db")).expect_err("not a directory");
     assert!(matches!(refused, SqliteError::Io(_)), "got {refused}");
-    assert!(refused.to_string().contains("a-file/state.db.lock"), "got {refused}");
+    assert!(
+        refused.to_string().contains("a-file/state.db.lock"),
+        "got {refused}"
+    );
 }
 
 // Catches a restore under the caller's lock that skips `prepare`, runs it on another
@@ -234,9 +287,15 @@ fn a_restore_under_the_lock_prepares_the_staged_copy_first() {
     let failed = restore_locked(&lock, &source, &|_| Err(std::io::Error::other("planted")))
         .expect_err("prepare failed");
     assert!(failed.to_string().contains("planted"), "got {failed}");
-    assert!(failed.to_string().contains("live.db"), "names the file: {failed}");
+    assert!(
+        failed.to_string().contains("live.db"),
+        "names the file: {failed}"
+    );
     assert!(!live.exists(), "nothing replaced");
-    assert!(!dir.join("live.db.restoring").exists(), "no staging copy left");
+    assert!(
+        !dir.join("live.db.restoring").exists(),
+        "no staging copy left"
+    );
 
     let seen = Mutex::new(Vec::new());
     let prepare = |staging: &Path| {

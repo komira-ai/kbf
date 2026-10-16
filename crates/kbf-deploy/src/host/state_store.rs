@@ -277,10 +277,8 @@ fn write_backup(
 ) -> Result<Summary, StateFileError> {
     let summary = sqlite::backup(db, tmp).map_err(StateFileError::Store)?;
     let file = File::open(tmp).map_err(io_at("open", tmp))?;
-    seal(&file, owner, perms)
-        .map_err(io_at("set the owner and mode of", tmp))?;
-    fs::hard_link(tmp, dest)
-        .map_err(io_at("link the backup to", dest))?;
+    seal(&file, owner, perms).map_err(io_at("set the owner and mode of", tmp))?;
+    fs::hard_link(tmp, dest).map_err(io_at("link the backup to", dest))?;
     sync_dir(dest)?;
     Ok(summary)
 }
@@ -397,8 +395,7 @@ fn plan(db: &Path, stamp: &str) -> Result<Plan, StateFileError> {
 fn execute(lock: &StoreLock, src: &Path, plan: &Plan) -> Result<u64, StateFileError> {
     let (db, lock_file) = (lock.db(), lock.lock_file());
     let (uid, gid) = (plan.owner.uid, plan.owner.gid);
-    chown(&lock_file, Some(uid), Some(gid))
-        .map_err(io_at("chown", &lock_file))?;
+    chown(&lock_file, Some(uid), Some(gid)).map_err(io_at("chown", &lock_file))?;
     if let Some(keep) = &plan.keep {
         copy_new(db, keep, plan)?;
         if plan.wal {
@@ -407,8 +404,7 @@ fn execute(lock: &StoreLock, src: &Path, plan: &Plan) -> Result<u64, StateFileEr
         sync_dir(keep)?;
     }
     let prepare = |staging: &Path| seal(&File::open(staging)?, Some(plan.owner), plan.perms);
-    sqlite::restore_locked(lock, src, &prepare)
-        .map_err(StateFileError::Store)
+    sqlite::restore_locked(lock, src, &prepare).map_err(StateFileError::Store)
 }
 
 /// Copies `from` to a new file `to` with the plan's owner and mode, synced.
@@ -419,10 +415,8 @@ fn copy_new(from: &Path, to: &Path, plan: &Plan) -> Result<(), StateFileError> {
         .create_new(true)
         .open(to)
         .map_err(io_at("create", to))?;
-    io::copy(&mut source, &mut copy)
-        .map_err(io_at("copy into", to))?;
-    seal(&copy, Some(plan.owner), plan.perms)
-        .map_err(io_at("set the owner and mode of", to))
+    io::copy(&mut source, &mut copy).map_err(io_at("copy into", to))?;
+    seal(&copy, Some(plan.owner), plan.perms).map_err(io_at("set the owner and mode of", to))
 }
 
 /// `at` in UTC as `YYYYMMDDTHHMMSSZ`, the stamp of a kept file's name.

@@ -17,7 +17,7 @@ use super::*;
 const STAMP: &str = "20280229T123456Z";
 
 fn open(db: &Path) -> SqliteStore {
-    let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+    let clock: Arc<dyn Clock> = Arc::new(SystemClock::default());
     SqliteStore::open(db, clock, Options::default()).expect("open the state file")
 }
 
@@ -106,8 +106,7 @@ fn backup_holding(dir: &Path, key: &str, value: &str) -> PathBuf {
     put(&store, key, value);
     drop(store);
     let file = dir.join("backup.db");
-    backup(&db, &file, None, Perms::new(0o644), &mut Vec::new())
-        .expect("backup");
+    backup(&db, &file, None, Perms::new(0o644), &mut Vec::new()).expect("backup");
     file
 }
 
@@ -132,15 +131,20 @@ fn a_backup_while_a_writer_commits_is_a_consistent_checked_copy() {
     let dir = scratch("state-store-backup-live");
     let db = dir.join("state.db");
     let store = Arc::new(open(&db));
-    let (stop, done) = (Arc::new(AtomicBool::new(false)), Arc::new(AtomicU64::new(0)));
+    let (stop, done) = (
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(AtomicU64::new(0)),
+    );
     let writer = {
         let (store, stop, done) = (Arc::clone(&store), Arc::clone(&stop), Arc::clone(&done));
         thread::spawn(move || {
             let mut n = 0u64;
             while !stop.load(Ordering::SeqCst) {
-                let txn = Txn::new()
-                    .put(format!("a/{n:06}"), "x", Cond::Any)
-                    .put(format!("b/{n:06}"), "x", Cond::Any);
+                let txn = Txn::new().put(format!("a/{n:06}"), "x", Cond::Any).put(
+                    format!("b/{n:06}"),
+                    "x",
+                    Cond::Any,
+                );
                 store.txn(txn).expect("reachable").expect("commits");
                 n += 1;
                 done.store(n, Ordering::SeqCst);
@@ -176,7 +180,10 @@ fn a_backup_while_a_writer_commits_is_a_consistent_checked_copy() {
 
     let mut counts = Vec::new();
     for file in &taken {
-        assert!(!beside(file, ".kbf-backup-tmp").exists(), "no temporary left");
+        assert!(
+            !beside(file, ".kbf-backup-tmp").exists(),
+            "no temporary left"
+        );
         let copy = open(file);
         let keys = |prefix: &str| -> Vec<String> {
             let mut names = Vec::new();
@@ -186,7 +193,12 @@ fn a_backup_while_a_writer_commits_is_a_consistent_checked_copy() {
             names
         };
         let (a, b) = (keys("a/"), keys("b/"));
-        assert_eq!(a, b, "{}: every transaction whole or absent", file.display());
+        assert_eq!(
+            a,
+            b,
+            "{}: every transaction whole or absent",
+            file.display()
+        );
         counts.push(a.len() as u64);
     }
     assert!(
@@ -229,10 +241,16 @@ fn a_backup_gets_its_owner_and_mode_and_leaves_no_temporary() {
     backup(&db, &dest, Some(me()), Perms::new(0o600), &mut out).expect("backup");
     let out = String::from_utf8(out).expect("utf-8");
     let me = me();
-    assert!(out.contains(&format!("mode 0600, owner {}:{}", me.uid, me.gid)), "{out}");
+    assert!(
+        out.contains(&format!("mode 0600, owner {}:{}", me.uid, me.gid)),
+        "{out}"
+    );
     assert!(out.contains("1 keys"), "{out}");
     let meta = fs::metadata(&dest).expect("stat");
-    assert_eq!((meta.uid(), meta.gid(), mode(&dest)), (me.uid, me.gid, 0o600));
+    assert_eq!(
+        (meta.uid(), meta.gid(), mode(&dest)),
+        (me.uid, me.gid, 0o600)
+    );
     assert!(!beside(&dest, ".kbf-backup-tmp").exists());
     assert_eq!(read(&dest, "old").as_deref(), Some("1"));
 }
@@ -245,7 +263,10 @@ fn a_backup_that_fails_says_so_and_leaves_nothing() {
     let dest = dir.join("out.db");
     let (code, _, err) = backup_cli(&dir.join("missing.db"), &dest, &[]);
     assert_eq!(code, ExitCode::FAILURE, "{err}");
-    assert!(err.starts_with("FAIL: ") && err.contains("missing.db"), "{err}");
+    assert!(
+        err.starts_with("FAIL: ") && err.contains("missing.db"),
+        "{err}"
+    );
     assert!(!dest.exists() && !dir.join("missing.db").exists());
 
     let db = live_holding_old(&dir);
@@ -272,7 +293,10 @@ fn the_backup_flags_are_checked() {
     assert_eq!(code, ExitCode::from(2), "{err}");
     let (code, _, err) = backup_cli(&db, &dest, &["--owner", "kbf-no-such-user-for-a-test"]);
     assert_eq!(code, ExitCode::from(2), "{err}");
-    assert!(err.starts_with("REFUSED: --owner kbf-no-such-user-for-a-test"), "{err}");
+    assert!(
+        err.starts_with("REFUSED: --owner kbf-no-such-user-for-a-test"),
+        "{err}"
+    );
     assert!(!dest.exists());
 }
 
@@ -306,8 +330,14 @@ fn users() -> FakeExec {
 #[test]
 fn an_owner_is_looked_up_by_name() {
     let exec = users();
-    assert_eq!(owner(&exec, "kbf").expect("kbf"), Owner { uid: 990, gid: 991 });
-    assert_eq!(owner(&exec, "kbf:adm").expect("kbf:adm"), Owner { uid: 990, gid: 4 });
+    assert_eq!(
+        owner(&exec, "kbf").expect("kbf"),
+        Owner { uid: 990, gid: 991 }
+    );
+    assert_eq!(
+        owner(&exec, "kbf:adm").expect("kbf:adm"),
+        Owner { uid: 990, gid: 4 }
+    );
     let refused = [
         ("nobody-here", "no user \"nobody-here\""),
         ("broken", "no getent"),
@@ -339,17 +369,39 @@ fn a_restore_keeps_the_current_file_and_puts_the_backups_rows_in_place() {
     let (code, out, err) = restore_at(&src, &db, true);
     assert_eq!(code, ExitCode::SUCCESS, "{err}");
     assert!(out.contains("integrity ok (epoch "), "{out}");
-    assert!(out.contains(&format!("keep {} as {}\n", db.display(), kept(&db).display())), "{out}");
+    assert!(
+        out.contains(&format!(
+            "keep {} as {}\n",
+            db.display(),
+            kept(&db).display()
+        )),
+        "{out}"
+    );
     assert!(out.contains("restored "), "{out}");
 
     let keep = kept(&db);
     assert_eq!(mode(&keep), 0o600, "the kept copy has the file's mode");
-    assert!(!beside(&keep, "-wal").exists(), "the file had no log to keep");
-    assert_eq!(mode(&db), 0o600, "the restored file has the replaced file's mode");
+    assert!(
+        !beside(&keep, "-wal").exists(),
+        "the file had no log to keep"
+    );
+    assert_eq!(
+        mode(&db),
+        0o600,
+        "the restored file has the replaced file's mode"
+    );
     assert!(!beside(&db, ".restoring").exists());
-    assert_eq!(read(&keep, "old").as_deref(), Some("1"), "the kept copy is the old file");
+    assert_eq!(
+        read(&keep, "old").as_deref(),
+        Some("1"),
+        "the kept copy is the old file"
+    );
     assert_eq!(read(&keep, "new"), None);
-    assert_eq!(read(&db, "new").as_deref(), Some("2"), "the backup's rows are in place");
+    assert_eq!(
+        read(&db, "new").as_deref(),
+        Some("2"),
+        "the backup's rows are in place"
+    );
     assert_eq!(read(&db, "old"), None);
 }
 
@@ -375,9 +427,20 @@ fn a_killed_frontends_log_is_kept_with_the_file() {
     assert_eq!(code, ExitCode::SUCCESS, "{err}");
     assert!(out.contains(", with its log"), "{out}");
     let keep = kept(&db);
-    assert!(beside(&keep, "-wal").exists(), "the log is kept beside the kept file");
-    assert_eq!(read(&keep, "logged").as_deref(), Some("3"), "the logged commit is kept");
-    assert_eq!(read(&db, "logged"), None, "the old log was not replayed into the new file");
+    assert!(
+        beside(&keep, "-wal").exists(),
+        "the log is kept beside the kept file"
+    );
+    assert_eq!(
+        read(&keep, "logged").as_deref(),
+        Some("3"),
+        "the logged commit is kept"
+    );
+    assert_eq!(
+        read(&db, "logged"),
+        None,
+        "the old log was not replayed into the new file"
+    );
     assert_eq!(read(&db, "new").as_deref(), Some("2"));
 }
 
@@ -395,7 +458,10 @@ fn refused_while_open(name: &str, apply: bool) {
     assert!(err.starts_with("REFUSED: "), "{err}");
     assert!(err.contains("the frontend is running"), "{err}");
     assert_eq!(snapshot(&dir), before, "nothing written");
-    assert!(store.get("old").expect("get").is_some(), "the live store reads on");
+    assert!(
+        store.get("old").expect("get").is_some(),
+        "the live store reads on"
+    );
 }
 
 // Catches a restore that runs while the frontend holds the store's lock: it would
@@ -423,7 +489,10 @@ fn refused_source(name: &str, make: &dyn Fn(&Path) -> PathBuf, why: &str) {
     for apply in [false, true] {
         let (code, _, err) = restore_at(&src, &db, apply);
         assert_eq!(code, ExitCode::from(2), "apply {apply}: {err}");
-        assert!(err.starts_with("REFUSED: not a backup to restore: "), "{err}");
+        assert!(
+            err.starts_with("REFUSED: not a backup to restore: "),
+            "{err}"
+        );
         assert!(err.contains(why), "{why}: {err}");
         assert_eq!(snapshot(&dir), before, "{why}: nothing written");
     }
@@ -451,7 +520,8 @@ fn a_restore_refuses_a_database_that_is_not_this_state_store() {
         let newer = sibling(good, "newer.db");
         fs::copy(good, &newer).expect("copy");
         let conn = Connection::open(&newer).expect("open");
-        conn.pragma_update(None, "user_version", 2).expect("version");
+        conn.pragma_update(None, "user_version", 2)
+            .expect("version");
         newer
     };
     refused_source("state-store-restore-newer", &newer, "schema version 2");
@@ -481,7 +551,11 @@ fn a_restore_refuses_what_is_not_a_single_file_database() {
         fs::write(&garbage, vec![b'x'; 4096]).expect("write");
         garbage
     };
-    refused_source("state-store-restore-garbage", &garbage, "not a SQLite database");
+    refused_source(
+        "state-store-restore-garbage",
+        &garbage,
+        "not a SQLite database",
+    );
     // The backup's source, a store's own file, closed: in WAL mode.
     let wal_mode = |good: &Path| sibling(good, "source.db");
     refused_source("state-store-restore-wal", &wal_mode, "WAL-mode");
@@ -506,7 +580,8 @@ fn damage(file: &Path) {
         .expect("root page")
     };
     let (one, two) = (root("i1"), root("i2"));
-    conn.execute_batch("PRAGMA writable_schema = ON").expect("writable schema");
+    conn.execute_batch("PRAGMA writable_schema = ON")
+        .expect("writable schema");
     conn.execute(
         "UPDATE sqlite_master SET rootpage = CASE name WHEN 'i1' THEN ?2 ELSE ?1 END
          WHERE name IN ('i1', 'i2')",
@@ -533,7 +608,10 @@ fn a_dry_run_changes_nothing() {
     let (code, out, err) = restore_at(&src, &db, false);
     assert_eq!(code, ExitCode::SUCCESS, "{err}");
     assert!(out.contains(", with its log"), "{out}");
-    assert!(out.ends_with("dry run: nothing changed; --apply restores\n"), "{out}");
+    assert!(
+        out.ends_with("dry run: nothing changed; --apply restores\n"),
+        "{out}"
+    );
     assert_eq!(snapshot(&dir), before, "the dry run wrote nothing");
 
     let fresh = scratch("state-store-restore-dry-fresh");
@@ -612,7 +690,10 @@ fn the_stamp_is_utc_and_sorts_by_time() {
 // Catches a directory taken wrongly for a relative name or the root.
 #[test]
 fn a_files_directory_is_its_parent_or_here() {
-    assert_eq!(dir_of(Path::new("/var/lib/kbf/state.db")), Path::new("/var/lib/kbf"));
+    assert_eq!(
+        dir_of(Path::new("/var/lib/kbf/state.db")),
+        Path::new("/var/lib/kbf")
+    );
     assert_eq!(dir_of(Path::new("state.db")), Path::new("."));
     assert_eq!(dir_of(Path::new("/")), Path::new("."));
 }

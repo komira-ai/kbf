@@ -16,9 +16,7 @@ use std::path::Path;
 use rusqlite::{Connection, OpenFlags};
 
 use super::SqliteError;
-use super::schema::{
-    BUSY_TIMEOUT, epoch, first_i64, first_string, head, require_state_store,
-};
+use super::schema::{BUSY_TIMEOUT, epoch, first_i64, first_string, head, require_state_store};
 use super::writer::uint;
 
 /// The first 16 bytes of every SQLite database file.
