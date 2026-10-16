@@ -269,8 +269,12 @@ pub struct Closing(watch::Receiver<Phase>);
 impl Closing {
     /// Completes once the closer has closed; never, if it is dropped first.
     async fn closed(&mut self) {
-        let closed = self.0.wait_for(|phase| *phase == Phase::Closed).await;
-        if closed.is_err() {
+        let dropped = self
+            .0
+            .wait_for(|phase| *phase == Phase::Closed)
+            .await
+            .is_err();
+        if dropped {
             std::future::pending::<()>().await;
         }
     }
@@ -420,7 +424,7 @@ impl<M, O, D> ExecutionService<M, O, D> {
     /// The service over `cache` and `dispatch`, whose streams end when `closing` does,
     /// each call authorized by `authorizers`.
     #[must_use]
-    pub const fn with_authorizers(
+    pub fn with_authorizers(
         cache: Arc<Cache<M, O>>,
         dispatch: Arc<D>,
         closing: Closing,
