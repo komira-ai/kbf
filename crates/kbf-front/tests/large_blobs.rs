@@ -473,22 +473,68 @@ async fn write_zeros(client: &mut ByteStreamClient<Channel>, digest: &Digest, le
 }
 
 /// Catches a ByteStream Write held whole until it is verified (a 256 MiB receive
-/// buffer), or one admitted for its whole size: a large Write is streamed to the store
-/// as a multipart upload holding at most [`BOUND`] at once on both ends of the
-/// loopback, and is then present and reads back.
+/// buffer), or one admitted for its whole size: a large Write, onto the write tier and
+/// (with no tier) to the store as a multipart upload, holds at most [`BOUND`] at once
+/// on both ends of the loopback, and is then present and reads back.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_large_bytestream_write_holds_a_part_not_the_blob() {
     let _alone = ALONE.lock().await;
+    for tier in [true, false] {
+        let s3 = FakeS3::start().await;
+        let dir = scratch("write");
+        let cache = if tier {
+            cache(&s3, &dir, 1 << 30).await
+        } else {
+            cold_cache(&s3).await
+        };
+        let mut client = serve(&cache).await;
+        let (digest, _) = zeros_digest(LARGE);
+        let ((), peak) = peak_during(write_zeros(&mut client, &digest, LARGE)).await;
+        println!("a {LARGE}-byte ByteStream Write (tier {tier}): {peak} bytes live at once");
+        assert!(peak < BOUND, "{peak} bytes live at once");
+        let stats = s3.stats();
+        assert_eq!(stats.single_puts, 0, "{stats:?}");
+        assert!(
+            cache
+                .find_missing(&[digest])
+                .await
+                .expect("find")
+                .is_empty()
+        );
+        assert_eq!(bytestream_read(&mut client, &digest).await, (LARGE, true));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// Catches a large ByteStream Write sent past the write tier straight to the store
+/// (mutant: `store_streamed` whether or not there is a tier), or one staged whatever
+/// its bytes hash to (mutant: the digest check skipped): with a tier, a 40 MiB Write
+/// whose last byte is not its digest's is refused INVALID_ARGUMENT and leaves nothing
+/// to flush; a sound one is present at once while the store holds nothing of it (no
+/// PUT, no part), and only the flush writes it there, as one multipart upload; it then
+/// reads back from the store.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_large_write_with_a_tier_lands_on_the_tier_first() {
+    let _alone = ALONE.lock().await;
     let s3 = FakeS3::start().await;
-    let dir = scratch("write");
+    let dir = scratch("write-tier");
     let cache = cache(&s3, &dir, 1 << 30).await;
     let mut client = serve(&cache).await;
-    let (digest, _) = zeros_digest(LARGE);
-    let ((), peak) = peak_during(write_zeros(&mut client, &digest, LARGE)).await;
-    println!("a {LARGE}-byte ByteStream Write: {peak} bytes live at once at most");
-    assert!(peak < BOUND, "{peak} bytes live at once");
-    let stats = s3.stats();
-    assert_eq!((stats.single_puts, stats.completed), (0, 1), "{stats:?}");
+    let len = 40 * MIB;
+    let (digest, _) = zeros_digest(len);
+    let refused = client
+        .write(zero_messages(&digest, len, true))
+        .await
+        .expect_err("the bytes fail the digest");
+    assert_eq!(refused.code(), Code::InvalidArgument, "{refused:?}");
+    let round = cache.flush_tier(later()).await.expect("seal round");
+    assert!(
+        round.flushed.is_empty() & round.retrying.is_empty(),
+        "{round:?}"
+    );
+    assert_eq!(cache.find_missing(&[digest]).await.expect("find"), [digest]);
+
+    write_zeros(&mut client, &digest, len).await;
     assert!(
         cache
             .find_missing(&[digest])
@@ -496,7 +542,18 @@ async fn a_large_bytestream_write_holds_a_part_not_the_blob() {
             .expect("find")
             .is_empty()
     );
-    assert_eq!(bytestream_read(&mut client, &digest).await, (LARGE, true));
+    let stats = s3.stats();
+    assert_eq!(
+        (stats.single_puts, stats.parts, stats.completed),
+        (0, 0, 0),
+        "on the tier, not yet in the store: {stats:?}"
+    );
+    flush(&cache).await;
+    let stats = s3.stats();
+    assert_eq!((stats.single_puts, stats.completed), (0, 1), "{stats:?}");
+    assert_eq!(s3.incomplete_uploads(), 0);
+    forget_local_copies(&dir);
+    assert_eq!(bytestream_read(&mut client, &digest).await, (len, true));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
