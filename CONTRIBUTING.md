@@ -114,8 +114,76 @@ least as many lines or branches that were uncovered before. Reviewers hold the
 rest of the target. The job also fails when a count falls below the file's
 (`BASELINE LOOSER THAN MEASURED`) and when a crate is missing from the file, so
 the file always equals the measurement and never keeps slack for a later change
-to spend. In either case copy `coverage-baseline.measured` from the job's
-`coverage` artifact over `coverage-baseline` in the same pull request.
+to spend.
+
+When the job fails because coverage improved, running `kbf-coverage tighten` is
+required: the failing job prints the exact command (in its log and its summary),
+which downloads the run's `coverage` artifact into a new temporary directory and
+rewrites `coverage-baseline` from the measured file in it:
+
+```sh
+d=$(mktemp -d) && gh run download <run id> --repo komira-ai/komira-build-farm --name coverage --dir "$d" \
+  && cargo run -p kbf-coverage -- tighten --measured "$d"/coverage-baseline.measured
+```
+
+Commit the rewritten `coverage-baseline` in the same pull request. `tighten` is
+not a bypass of the ratchet: it only lowers counts. The rule it keeps for every
+value it writes: `tighten` writes no count above the recorded one (a value
+recorded as `-`, and each value of a crate the file does not list, counts as
+0), never turns lines into `-`, and turns branches into `-` only from 0 and
+only while the crate's lines are measured, so a new crate goes in only as
+`0 0` or `0 -`. It removes a crate only when its `Cargo.toml` is gone. It
+refuses everything else, including a `--root` that holds none of the file's
+crates, naming each crate and metric with the recorded and measured values,
+and leaves the file untouched: a raise is fixed by covering the code, never by
+the file. A failing check prints the `tighten` command only when `tighten`
+would accept the run.
+
+Lines `-` is where code hides: a crate that no test binary instruments has no
+coverage record at all, so a library with `[lib] test = false` measures `- -`
+however much untested code it gains, and a new crate measured `- -` may hold
+any amount of untested code. `tighten` refuses both (and a branch count that
+becomes `-`, whose missed branches went without being covered). Give the crate
+a test target. When a crate legitimately has nothing to measure (all of its
+code removed, or an empty skeleton), put `-` in its line by hand in a reviewed
+pull request; the refusal names this. That is the one hand edit of
+`coverage-baseline`.
+
+`tighten` keeps the file's comments and order, prints each change, and replaces the
+file whole. Running the whole command again downloads into another new directory
+and changes nothing.
+
+CI measures the pull request merged with `main`. When the branch is behind
+`main`, that measurement can name crates the branch does not have (or lack one
+it has), and `tighten` refuses it as a measurement of another tree: bring the
+branch up to date with `main`, let CI run again, and run the command it prints.
+Any other refusal of a measured file prints the same advice as a possibility,
+since `main`'s changes can cause it too; a refusal that stays once the branch
+is up to date is the branch's to fix.
+
+Without CI, `tighten --lcov <tracefile> --root .` measures from a local
+`cargo llvm-cov --branch --lcov` run instead. That run must use the coverage
+job's toolchain and flags (see `.github/workflows/ci.yml`): another toolchain
+can count fewer items missed, and the file it writes then fails CI as more
+missed than recorded, so the mistake fails safe but costs a round trip. A
+relative `--root` is resolved against the working directory. Do not
+edit `coverage-baseline` by hand, except for the unmeasured crate above.
+
+The ratchet does not see code that the report leaves out, and `tighten` cannot
+tell such code from code that is gone; reviewers hold these until repository
+lints refuse them:
+
+- A crate moved outside `crates/` (listed in the workspace's `exclude` and
+  kept as a `path` dependency) is no longer a workspace crate: it stops being
+  measured, and `tighten` removes its line as a deleted crate. The workspace
+  has no `exclude` today.
+- `cargo llvm-cov`'s default pattern ignores every file in a directory named
+  `tests`, `examples` or `benches`, wherever it sits: a module directory
+  `src/**/tests/`, or a file in such a directory that `src` includes (for
+  example with `#[path]`), is not measured.
+- A binary target with `test = false`, `#[cfg(not(coverage))]` and
+  `#[coverage(off)]` keep code out of the report while the crate's line stays
+  a number.
 
 Changes under `.github/workflows/` will need a review from the code owners
 listed in [.github/CODEOWNERS](.github/CODEOWNERS). That rule is a placeholder

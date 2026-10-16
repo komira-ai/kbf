@@ -37,9 +37,7 @@ use std::hash::BuildHasher;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use kbf_front::{
-    ActionLabel, Cache, Dispatch, Finished, MetaLog, Recorder, Stage, Submission, Ticket,
-};
+use kbf_front::{Cache, Dispatch, Finished, MetaLog, Recorder, Stage, Submission, Ticket};
 use kbf_meta::{ActionRecord, Role};
 use kbf_objstore::ObjectStore;
 use kbf_proto::google::rpc;
@@ -67,6 +65,7 @@ pub use durable::{EpochPolicy, StateError};
 pub use phase::Reported;
 
 use self::durable::Durable;
+use crate::action_usage::{self, Measured, Shapes};
 use crate::fault;
 use crate::fleet::{
     NodeView, NodesView, PhaseView, PlacementView, SoftwareView, attention_changes, needs_attention,
@@ -117,6 +116,8 @@ pub struct Farm<M, O> {
     /// The wall-clock time of `epoch`, in milliseconds since the Unix epoch: how farm
     /// times are shown to operators.
     epoch_unix_ms: u64,
+    /// The action shapes this process has described ([`action_usage`]).
+    shapes: Shapes,
     state: Mutex<State>,
 }
 
@@ -200,9 +201,8 @@ struct State {
     /// Where the invocation record's lease and finish events go ([`record`]).
     recorder: Recorder,
     /// The operations a recorded call waits on: the only ones [`record`] tells the
-    /// recorder of, each with what the first call to wait on it said the action is
-    /// (the key of its `action usage:` line). Each leaves at its end.
-    recorded: BTreeMap<OperationId, ActionLabel>,
+    /// recorder of. Each leaves at its end.
+    recorded: BTreeSet<OperationId>,
     /// The state store every change is written through before it is acknowledged, if
     /// the farm has one ([`Farm::with_state`]).
     durable: Option<Durable>,
@@ -252,6 +252,7 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
             lease_epoch,
             epoch: tokio::time::Instant::now(),
             epoch_unix_ms: unix_ms(),
+            shapes: Shapes::default(),
             state: Mutex::new(State {
                 sched,
                 machine: FarmMachine::new(term),
@@ -260,7 +261,7 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
                 links: BTreeMap::new(),
                 paused: BTreeSet::new(),
                 recorder: Recorder::off(),
-                recorded: BTreeMap::new(),
+                recorded: BTreeSet::new(),
                 durable: None,
                 unsettled: Vec::new(),
             }),
@@ -583,12 +584,15 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
             return Some(refused);
         }
         let ran_on = (worker, stamp);
+        // Read before `outcome`, which drops a failed run's result.
+        let measured = Measured::of(&result);
         let (outcome, mut detail) = self.outcome(lease, ran_on, result).await;
 
         let now = self.now();
         let (answers, accepted) = {
             let mut state = self.lock();
-            let (answers, accepted) = state.take_report(now, worker, operation, lease, outcome);
+            let (answers, accepted) =
+                state.take_report(now, worker, operation, lease, outcome, measured);
             let settled: Vec<Settled> = answers
                 .iter()
                 .map(|a| state.settle(a, detail.take()))
@@ -705,6 +709,10 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
 
 impl<M: MetaLog, O: ObjectStore + 'static> Dispatch for Farm<M, O> {
     fn submit(&self, mut submission: Submission) -> Result<Ticket, Status> {
+        // Outside the lock: hashes the action's shape and drops its argv and paths.
+        let usage = self
+            .shapes
+            .subject(std::mem::take(&mut submission.described));
         let now = self.now();
         let waiting = std::time::Instant::now();
         let mut state = self.lock();
@@ -717,6 +725,7 @@ impl<M: MetaLog, O: ObjectStore + 'static> Dispatch for Farm<M, O> {
             kind: submission.request.kind,
             do_not_cache: submission.request.do_not_cache,
             queued: SystemTime::now(),
+            usage,
         });
         let name = state.machine.name(waiter);
         if let Some(call) = submission.call.take() {
@@ -774,7 +783,9 @@ impl State {
 
     /// Feeds `worker`'s report that `lease` of `operation` ended with `outcome`, and
     /// returns the answers it led to and whether the scheduler took it. A busy node's
-    /// memory kill the scheduler took is logged for operators (`crate::memory`).
+    /// memory kill the scheduler took is logged for operators (`crate::memory`), and a
+    /// report the scheduler took that `measured` what the lease used has its `action
+    /// usage:` line ([`action_usage`]).
     ///
     /// The in-process log commits its record at once: an accepted result is answered
     /// here, and a refused one (its lease given up while its outputs were checked)
@@ -791,7 +802,13 @@ impl State {
         operation: OperationId,
         lease: LeaseId,
         outcome: Outcome,
+        measured: Option<Measured>,
     ) -> (Vec<Answer>, bool) {
+        // Taken first: a report that finishes the operation may drop its callers.
+        let usage = measured.and_then(|measured| {
+            let (_, waiter) = self.first_waiter(operation)?;
+            Some((waiter.usage.clone(), measured))
+        });
         let recorded_before = self.runs_recorded(operation);
         let name = self.operation_name(operation);
         let event = Event::Report {
@@ -802,6 +819,9 @@ impl State {
         let answers = self.feed(now, event);
         let rerun = self.runs_recorded(operation) > recorded_before;
         let accepted = rerun || answers.iter().any(|a| a.lease == lease);
+        if accepted && let Some((subject, measured)) = &usage {
+            action_usage::log(operation, subject, measured, outcome, lease, worker);
+        }
         let (operation, node) = (name, worker);
         match outcome {
             Outcome::Completed { .. } => {
@@ -1037,7 +1057,12 @@ impl State {
             grant.lease,
             &grant.worker,
         );
-        tracing::info!(%operation, %lease, %node, "lease granted");
+        // The key joins the daemon's `lease phases:` line (`lease=`) to the action, also
+        // for a lease whose result is never taken (cancelled).
+        let key = self
+            .first_waiter(grant.operation)
+            .map(|(_, w)| tracing::field::display(w.usage.key));
+        tracing::info!(%operation, %lease, %node, key, "lease granted");
         self.record_granted(grant);
         self.send_for(&grant.worker, grant.operation, |w| {
             server_message::Message::LeaseOffer(LeaseOffer {

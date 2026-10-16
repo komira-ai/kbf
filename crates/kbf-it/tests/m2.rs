@@ -19,6 +19,7 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use kbf_it::m2::{IMAGE, has_interpreter};
@@ -425,12 +426,71 @@ fn scratch(name: &str) -> PathBuf {
     dir
 }
 
+/// A name for one run's directory that no other call returns.
 fn unique(name: &str) -> String {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("clock after 1970")
         .as_nanos();
-    format!("{name}-{}-{nanos}", std::process::id())
+    unique_at(name, nanos)
+}
+
+/// [`unique`] at the clock reading `nanos`. The pid parts this run from other live
+/// processes, the count from the other calls of this one (its tests are its threads,
+/// which can read one clock tick), and the clock from earlier runs with this pid.
+fn unique_at(name: &str, nanos: u128) -> String {
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    let call = CALLS.fetch_add(1, Ordering::Relaxed);
+    format!("{name}-{}-{call}-{nanos}", std::process::id())
+}
+
+/// Catches: a name made of the pid and the clock alone. The tests are threads of one
+/// process, so two of them that read the clock in one tick got the same runtime
+/// directory, and the second bind of its bus failed with `AddrInUse`.
+#[test]
+fn two_names_made_at_one_instant_differ() {
+    assert_ne!(unique_at("m2", 7), unique_at("m2", 7));
+}
+
+/// Catches: cells made at once by parallel tests that share a bus, a cell that names
+/// its runtime directory from the pid and the clock alone (not through [`unique`]),
+/// and a cell that leaves its runtime directory and bus behind when it is dropped.
+#[test]
+fn cells_made_at_once_have_their_own_bus_and_remove_it() {
+    const CELLS: usize = 16;
+    let barrier = std::sync::Barrier::new(CELLS);
+    let cells: Vec<Cell> = std::thread::scope(|s| {
+        let made: Vec<_> = (0..CELLS)
+            .map(|_| {
+                s.spawn(|| {
+                    barrier.wait();
+                    Cell::new("at-once", "none")
+                })
+            })
+            .collect();
+        made.into_iter()
+            .map(|h| h.join().expect("a cell"))
+            .collect()
+    });
+    let runtimes: std::collections::BTreeSet<PathBuf> =
+        cells.iter().map(|c| c.runtime.clone()).collect();
+    assert_eq!(runtimes.len(), CELLS, "{runtimes:?}");
+    // Without the clock reading the names must still differ: a cell that names its
+    // runtime directory from the pid and the clock alone passes the check above on a
+    // fine clock, but not this one, on any clock.
+    let unclocked: std::collections::BTreeSet<String> = runtimes
+        .iter()
+        .map(|runtime| {
+            let name = runtime.file_name().expect("a name").to_string_lossy();
+            let (rest, _nanos) = name.rsplit_once('-').expect("a clock reading");
+            rest.to_owned()
+        })
+        .collect();
+    assert_eq!(unclocked.len(), CELLS, "{unclocked:?}");
+    drop(cells);
+    for runtime in &runtimes {
+        assert!(!runtime.exists(), "left behind: {}", runtime.display());
+    }
 }
 
 /// One fake cell: the fakes in `<dir>/bin`, the daemon's cgroup under `<dir>/cgroup`, a
@@ -484,8 +544,9 @@ impl Cell {
         }
 
         // A Unix socket path is short (108 bytes); the target directory's may not be.
+        // A new directory, never an existing one: two cells must not share a bus.
         let runtime = std::env::temp_dir().join(unique("m2"));
-        std::fs::create_dir_all(&runtime).expect("runtime directory");
+        std::fs::create_dir(&runtime).expect("runtime directory");
         let bus = UnixListener::bind(runtime.join("bus")).expect("bus");
         Self {
             dir,
@@ -547,6 +608,14 @@ impl Cell {
 
     fn args(&self, role: &str) -> Vec<String> {
         self.calls(role).into_iter().map(|(_, a)| a).collect()
+    }
+}
+
+/// The runtime directory is under the shared temporary directory, so a cell removes it
+/// and its bus. Its scratch directory stays under the target directory for a look.
+impl Drop for Cell {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.runtime);
     }
 }
 

@@ -31,6 +31,9 @@ enum Defect {
     DropsLastPage,
     /// Returns every key on one page, whatever page size was asked.
     IgnoresPageSize,
+    /// Ends the listing after a full page of the largest size, as a client that reads a
+    /// full 1000-key page as the last would.
+    EndsAtAFullLargestPage,
     /// Starts a listing after a key that exists at that key, not after it.
     StartsAtTheAfterKey,
     /// Claims conditional writes but overwrites.
@@ -150,6 +153,13 @@ impl ObjectStore for Broken {
                 }
                 Ok(page)
             }
+            Defect::EndsAtAFullLargestPage => {
+                let mut page = self.inner.list(prefix, after, max_keys).await?;
+                if max_keys == PageSize::MAX && page.objects.len() == usize::from(max_keys.get()) {
+                    page.next = None;
+                }
+                Ok(page)
+            }
             _ => self.inner.list(prefix, after, max_keys).await,
         }
     }
@@ -215,9 +225,23 @@ fn a_store_whose_listing_drops_the_last_page_fails() {
         &[
             Check::ListPagination,
             Check::ListStartAfter,
+            Check::ListPastPageCap,
             Check::FooterReads,
         ],
     );
+}
+
+/// Catches: a suite whose listings never fill a page of the largest size, so a store
+/// (or an S3 client) that ends a listing at a full 1000-key page passes, and a rebuild
+/// over a bucket of more than 1000 segments would stop at the first 1000.
+#[test]
+fn a_store_whose_listing_ends_at_a_full_largest_page_fails() {
+    let report = run(Defect::EndsAtAFullLargestPage);
+    assert_fails_only(&report, &[Check::ListPastPageCap]);
+    let Some(Outcome::Failed(why)) = report.outcome(Check::ListPastPageCap) else {
+        panic!("{report}")
+    };
+    assert!(why.contains("got 1000 keys in 1 pages"), "{why}");
 }
 
 /// Catches: a suite that never starts a listing after a key, or does not check where
@@ -231,6 +255,7 @@ fn a_store_whose_listing_starts_at_the_after_key_fails() {
         &[
             Check::ListPagination,
             Check::ListStartAfter,
+            Check::ListPastPageCap,
             Check::ListEmptyPrefix,
         ],
     );
