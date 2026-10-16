@@ -87,7 +87,7 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
             bytes,
             hasher: Some(RecordHasher::new()),
             size,
-            claim: Some(claim),
+            claim,
             ended: Arc::clone(&ended),
         };
         let body = futures::stream::unfold(hashing, Hashing::step).boxed();
@@ -104,7 +104,10 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
             (Ended::Claimed(digest), Ok(())) => digest,
             // The store's own failure; a store that took the object without its end
             // (which no store does) stores nothing either.
-            (_, put) => return Err(put.err().map_or_else(unended, CacheError::from)),
+            (_, put) => {
+                let unended = CacheError::Invalid(UNENDED.to_owned());
+                return Err(put.err().map_or(unended, CacheError::from));
+            }
         };
         self.writer.recency.written(object, total);
         let footer = self
@@ -118,10 +121,8 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
     }
 }
 
-/// A streamed blob the store took before its body ended.
-fn unended() -> CacheError {
-    CacheError::Invalid("the store took a streamed blob before its end".to_owned())
-}
+/// Why a streamed blob the store took before its body ended is not stored.
+const UNENDED: &str = "the store took a streamed blob before its end";
 
 /// How a streamed blob's bytes ended, as [`Hashing`] saw it.
 enum Ended {
@@ -144,7 +145,7 @@ struct Hashing {
     /// The bytes the blob has.
     size: u64,
     /// The digest the bytes must hash to, named once they ended; taken then.
-    claim: Option<BoxFuture<'static, Option<Digest>>>,
+    claim: BoxFuture<'static, Option<Digest>>,
     /// How the bytes ended.
     ended: Arc<Mutex<Ended>>,
 }
@@ -156,10 +157,9 @@ impl Hashing {
         let hasher = self.hasher.take()?;
         let Some(piece) = self.bytes.next().await else {
             let (actual, crc32c) = hasher.finish();
-            let claimed = match self.claim.take() {
-                Some(claim) => claim.await,
-                None => None,
-            };
+            // Taken once: the hasher is gone after this step.
+            let claim = std::mem::replace(&mut self.claim, futures::future::ready(None).boxed());
+            let claimed = claim.await;
             let Some(claimed) = claimed else {
                 self.end(Ended::Withdrawn);
                 let why = "the blob was withdrawn before its end".to_owned();

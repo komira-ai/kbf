@@ -154,7 +154,8 @@ fn chunked(bytes: &[u8]) -> Chunks {
 /// restored, the size check dropped): without a write tier, `put_chunks` of a blob one
 /// byte over `MAX_UNSTAGED_BLOB_BYTES` is streamed to the store and held after; again,
 /// once held, it is not read at all; one whose bytes are not its digest's is `Corrupt`
-/// and not held; one whose chunk fails to be read is `Read`; a digest that does not
+/// and not held; one whose chunk fails to be read is `Read`; one with more bytes than
+/// its digest names, which the store refuses, is `Unavailable`; a digest that does not
 /// parse is refused. A small blob is gathered and stored as before.
 #[test]
 fn put_chunks_streams_a_large_blob_and_stores_a_small_one() {
@@ -195,6 +196,11 @@ fn put_chunks_streams_a_large_blob_and_stores_a_small_one() {
             matches!(&read, Err(CasError::Read(_, why)) if why.contains("gone")),
             "{read:?}"
         );
+        let mut longer = patterned(15, size);
+        let claimed = digest_of(&longer);
+        longer.extend_from_slice(&[0; 2 << 20]);
+        let long = plane.put_chunks(claimed, chunked(&longer)).await;
+        assert!(matches!(long, Err(CasError::Unavailable(..))), "{long:?}");
         let not_a_digest = Digest {
             hash: "not hex".to_owned(),
             size_bytes: i64::try_from(size).expect("size"),
