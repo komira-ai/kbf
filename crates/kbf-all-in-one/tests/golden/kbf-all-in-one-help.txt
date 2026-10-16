@@ -178,7 +178,7 @@ Options:
           [default: 64]
 
       --worker-client-ca <WORKER_CLIENT_CA>
-          PEM CA that daemon client certificates must chain to
+          PEM CA that daemon client certificates must chain to. Each must also name the daemon role (`urn:kbf:role:daemon`), so a frontend or storage certificate from the same CA is refused on this listener
 
       --transfer-bytes-in-flight <BYTES>
           The most bytes of blobs read into memory in flight at once, for the whole daemon. A blob larger than this is fetched alone

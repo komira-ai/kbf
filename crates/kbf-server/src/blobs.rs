@@ -6,7 +6,8 @@
 //!
 //! Every call of both services is admitted before it is served, by one rule
 //! ([`admit`], over [`crate::identity`]): the listener serves mutual TLS, the call's
-//! client certificate names exactly one node, and neither the certificate (serial,
+//! client certificate names the daemon role and no other, it names exactly one node,
+//! and neither the certificate (serial,
 //! public key) nor that node is on the deny list, looked at again for this call. A
 //! streamed request (a Write, a RegisterChunkMapping) is refused before its first
 //! message is read. Under plain text every call is refused UNAUTHENTICATED. An
