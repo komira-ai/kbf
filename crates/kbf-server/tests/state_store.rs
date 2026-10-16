@@ -571,12 +571,11 @@ async fn a_write_refused_as_stale_is_not_an_outage() {
         kbf_state::Cond::Any,
     );
     disk.store.txn(stale).expect("store").expect("delete");
-    assert!(accepted(&farm, first).await);
-    assert_eq!(
-        disk.rows("op/"),
-        2,
-        "the result was written though it was stale"
+    assert!(
+        !accepted(&farm, first).await,
+        "a result whose lease row is gone was acknowledged"
     );
+    assert_eq!(disk.rows("op/"), 2);
 
     tokio::time::advance(kbf_sched::fence::LEASE_GRACE + Duration::from_secs(1)).await;
     farm.tick().await;
