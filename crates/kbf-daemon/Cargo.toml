@@ -43,6 +43,7 @@ tonic = { workspace = true, features = ["tls-ring"] }
 tracing.workspace = true
 
 [dev-dependencies]
+kbf-auth.workspace = true
 kbf-front.workspace = true
 kbf-objstore.workspace = true
 kbf-server.workspace = true

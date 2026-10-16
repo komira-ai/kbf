@@ -1454,6 +1454,7 @@ dependencies = [
  "crc32fast",
  "futures",
  "hex",
+ "kbf-auth",
  "kbf-caps",
  "kbf-front",
  "kbf-map",
