@@ -34,10 +34,7 @@ use crate::local::LocalStore;
 use crate::startup_pass::StartPass;
 use crate::stores::{COLD_FILE_FLOOR, FILE_PREFIX_ROOT, Hot, StoreUri, Stores};
 use crate::write_tier::FLUSH_EVERY;
-use crate::{
-    Args, RaftMetaLog, SERVER_VERSION, ServeError, StateStoreUri, bind_server_with_options,
-    s3_store,
-};
+use crate::{Args, RaftMetaLog, SERVER_VERSION, ServeError, bind_server_with_options, s3_store};
 
 /// The server's thread sizes on a given machine shape: every CPU, then the overrides.
 pub fn sizes_on(args: &Args, topology: Topology) -> kbf_threads::Sizes {
@@ -288,11 +285,7 @@ where
 {
     let listeners = args.listeners()?;
     let policy = args.reapi_auth_policy()?;
-    let state = args
-        .state_store
-        .as_ref()
-        .map(StateStoreUri::open)
-        .transpose()?;
+    let state = args.open_state_store().map_err(ServeError::State)?;
     let routes = Routes {
         invocations: policy.invocations_get.is_some(),
         blobs: policy.invocations_get.is_some() && policy.blobs_get.is_some(),
@@ -514,34 +507,41 @@ mod tests {
 
     /// Catches: `--state-store` accepted by the flags and then ignored at start (the
     /// scheduler would run in memory while the operator believes its state is kept): a
-    /// start over a scheme this build has no backend for is refused, naming it, before
-    /// anything is served.
+    /// start over a SQLite path makes the file and serves, a second start over it while
+    /// the first runs is refused (two frontends on one file), and a store that cannot be
+    /// opened stops the start before anything is served.
     #[tokio::test(flavor = "current_thread")]
-    async fn serve_with_refuses_a_state_store_without_a_backend() {
+    async fn serve_with_opens_the_state_store_and_refuses_a_second_frontend() {
         let root =
             std::env::temp_dir().join(format!("kbf-server-state-flag-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
+        let state = root.join("state").join("state.db");
         let args = Args::parse_from([
-            "kbf-server",
-            "--listen=127.0.0.1:0",
-            "--worker-listen=127.0.0.1:0",
-            "--state-store=sqlite:///var/lib/kbf/state.db",
+            "kbf-server".to_owned(),
+            "--listen=127.0.0.1:0".to_owned(),
+            "--worker-listen=127.0.0.1:0".to_owned(),
+            format!("--state-store=sqlite://{}", state.display()),
         ]);
-        let log = RaftMetaLog::open_dir(&root.join("raft"), Retention::default(), "kbf/")
-            .await
-            .expect("open the log");
-        let (prefix, id) = (log.store_prefix(), log.log_id());
-        let store = FsStore::open(&root.join("blobs"), Floor::Bytes(1)).expect("open the store");
-        let refused = serve_with(&args, None, log, store, prefix, id, interrupted)
-            .await
-            .err()
-            .expect("refused");
-        assert!(
-            refused
-                .to_string()
-                .contains("no sqlite state store backend"),
-            "{refused}"
-        );
+        let start = |name: &'static str| {
+            let (args, root) = (&args, &root);
+            async move {
+                let log = RaftMetaLog::open_dir(&root.join(name), Retention::default(), "kbf/")
+                    .await
+                    .expect("open the log");
+                let (prefix, id) = (log.store_prefix(), log.log_id());
+                let store = FsStore::open(&root.join(format!("{name}-blobs")), Floor::Bytes(1))
+                    .expect("open the store");
+                serve_with(args, None, log, store, prefix, id, interrupted).await
+            }
+        };
+        let first = start("one").await.expect("the first frontend starts");
+        assert!(state.exists(), "the state file is made");
+        let refused = start("two").await.err().expect("the file is held");
+        let said = refused.to_string();
+        assert!(said.starts_with("--state-store: "), "{said}");
+        assert!(said.contains("another kbf process"), "{said}");
+        drop(first);
+        start("three").await.expect("free once the first is gone");
         let _ = std::fs::remove_dir_all(&root);
     }
 

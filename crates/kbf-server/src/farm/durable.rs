@@ -93,6 +93,10 @@ pub enum StateError {
     /// This build has no backend for the store's scheme.
     #[error("this build has no {0} state store backend")]
     NoBackend(&'static str),
+    /// The store could not be opened: its file is held by another process or is not a
+    /// state store, or its directory cannot be made.
+    #[error("the state store cannot be opened: {0}")]
+    Open(String),
 }
 
 /// What a store holds of the scheduler, as a start reads it.
