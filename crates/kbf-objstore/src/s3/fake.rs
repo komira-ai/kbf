@@ -253,13 +253,13 @@ async fn serve(mut sock: TcpStream, state: Arc<Mutex<State>>) -> Option<()> {
     let mut buf = Vec::new();
     let mut chunk = vec![0u8; RUN];
     loop {
-        let mut head_end = buf.windows(4).position(|w| w == b"\r\n\r\n");
+        let mut head_end = end_of_head(&buf);
         while head_end.is_none() {
             let n = sock.read(&mut chunk).await.ok().filter(|n| *n > 0)?;
             buf.extend_from_slice(&chunk[..n]);
-            head_end = buf.windows(4).position(|w| w == b"\r\n\r\n");
+            head_end = end_of_head(&buf);
         }
-        let head_end = head_end? + 4;
+        let head_end = head_end?;
         let head = String::from_utf8_lossy(&buf[..head_end]).into_owned();
         let mut request = parse_head(&head)?;
         let len: usize = request
@@ -281,6 +281,12 @@ async fn serve(mut sock: TcpStream, state: Arc<Mutex<State>>) -> Option<()> {
         };
         sock.write_all(&answer).await.ok()?;
     }
+}
+
+/// Where a request's head ends in `buf`, past its blank line, once it is all there.
+fn end_of_head(buf: &[u8]) -> Option<usize> {
+    let blank = buf.windows(4).position(|w| w == b"\r\n\r\n");
+    blank.map(|at| at + 4)
 }
 
 fn parse_head(head: &str) -> Option<Request> {

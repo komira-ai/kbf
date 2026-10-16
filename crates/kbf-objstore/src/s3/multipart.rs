@@ -204,9 +204,8 @@ async fn complete(upload: &Upload, etags: &[String]) -> Result<(), ObjectStoreEr
             let body = resp.bytes().await.map_err(transport)?;
             xml::complete_answer(&body)
         }
-        StatusCode::PRECONDITION_FAILED if conn.capabilities.conditional_put => {
-            Err(ObjectStoreError::AlreadyExists(upload.key.clone()))
-        }
+        // Asked only of a store that claims conditional writes.
+        StatusCode::PRECONDITION_FAILED => Err(ObjectStoreError::AlreadyExists(upload.key.clone())),
         _ => Err(failure(resp).await),
     }
 }

@@ -473,7 +473,7 @@ async fn streamed_put<S: ObjectStore>(
     let kept = read(store, &k, range(0, 64)).await?;
     ensure!(
         kept == body.slice(..64),
-        "{k}: a refused streamed overwrite changed it"
+        "{k}: a refused overwrite changed it"
     );
     Ok(Outcome::Passed)
 }

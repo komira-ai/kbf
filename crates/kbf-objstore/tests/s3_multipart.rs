@@ -391,3 +391,32 @@ async fn the_fake_refuses_what_s3_refuses() {
     assert_eq!(other.status(), 501);
     assert_eq!((s3.stats().completed, s3.incomplete_uploads()), (0, 1));
 }
+
+/// Catches a store without conditional writes sent a condition (S3 refuses a key
+/// written again only when asked), or refusing an overwrite it should take: on such a
+/// store a single PUT and a multipart upload over an existing key both replace it, and
+/// an abort of an upload the service never began is refused.
+#[tokio::test]
+async fn a_store_without_conditional_writes_replaces_a_key() {
+    let s3 = FakeS3::start().await;
+    let store = s3.store(Capabilities::default());
+    let k = key("replaced");
+    store
+        .put_new(&k, Bytes::from_static(b"one"), None)
+        .await
+        .unwrap();
+    store
+        .put_new(&k, Bytes::from_static(b"two!"), None)
+        .await
+        .unwrap();
+    assert_eq!(s3.object_len(&k), Some(4));
+    let bytes = pattern(PART_BYTES as usize + 1);
+    let len = bytes.len() as u64;
+    store.put_stream(&k, len, body(&bytes, None)).await.unwrap();
+    assert_eq!(s3.object_len(&k), Some(len));
+    let requests = s3.requests();
+    assert_eq!(s3.stats().completed, 1, "{requests:?}");
+    let unknown = format!("{}/kbf-fake/cas/replaced?uploadId=never", s3.endpoint());
+    let refused = reqwest::Client::new().delete(unknown).send().await.unwrap();
+    assert_eq!(refused.status(), 500);
+}

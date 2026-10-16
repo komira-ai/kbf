@@ -136,9 +136,9 @@ impl<M: MetaLog, O: ObjectStore> Reading<M, O> {
         };
         let len = FLUSH_READ_BYTES.min(end - start);
         let piece = self.piece(start, len).await;
-        if piece.is_err() {
-            self.done = true;
-        } else if start + len == end {
+        // A piece that failed ends the body; the spans left are never read.
+        self.done = piece.is_err();
+        if start + len == end {
             self.spans.pop_front();
         } else if let Some(front) = self.spans.front_mut() {
             front.0 += len;

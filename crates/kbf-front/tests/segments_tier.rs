@@ -604,3 +604,50 @@ async fn upload_and_read(cache: &TierCache, service: &Service, all: &[TestBlob],
         assert_eq!(cache.read_blob(&b.digest).await.expect("read"), b.bytes);
     }
 }
+
+/// Catches a segment that found no room on the tier at `Begin` PUT at its commit even
+/// though the tier has room by then: the first upload fills the tier, the second's
+/// `Begin` gets no range (its records are held in memory), a flush frees the tier, and
+/// the second's commit stages its segment, with no PUT of its own.
+#[tokio::test]
+async fn a_segment_with_no_room_at_begin_is_staged_at_commit_once_there_is() {
+    let farm = Farm::new(Capabilities::default());
+    let (cache, service) = serve(farm.start(10_000).await);
+    let first = blobs(1, 2, 4096);
+    upload(&service, &[seg(&first)])
+        .await
+        .expect("first upload");
+    let second = blobs(3, 1, 4096);
+    let s = seg(&second);
+    let begin = BeginRequest {
+        segments: vec![UploadSegment {
+            length: s.length,
+            footer: s.footer.clone(),
+        }],
+    };
+    let id = service
+        .begin(Request::new(begin))
+        .await
+        .expect("begin")
+        .into_inner()
+        .upload;
+    let put = PutRangeRequest {
+        upload: id,
+        segment: 0,
+        offset: 0,
+        bytes: s.records.clone(),
+    };
+    service.put_range(Request::new(put)).await.expect("range");
+    let round = cache.flush_tier(later()).await.expect("flush");
+    assert_eq!(round.flushed.len(), 1, "{round:?}");
+    let commit = service.commit(Request::new(CommitRequest { upload: id }));
+    commit.await.expect("committed");
+    let (_, staged_on) = farm.log.located(&second[0].digest);
+    assert_eq!(staged_on, cache.tier_id(), "staged at the commit");
+    assert_eq!(
+        farm.store.put_keys().len(),
+        1,
+        "only the first upload's flush"
+    );
+    assert_readable(&cache, &service, &second).await;
+}
