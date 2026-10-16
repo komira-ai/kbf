@@ -21,6 +21,10 @@ use crate::types::{
 };
 use crate::{GROUP_COMMIT_WINDOW, TARGET_WRITES_PER_SECOND};
 
+mod c8_snapshot;
+
+pub use c8_snapshot::C8_SNAPSHOT_PREFIX;
+
 /// How many threads race one compare-and-set in C1.
 pub const C1_RACERS: usize = 8;
 
@@ -624,7 +628,9 @@ fn assert_pages<S: Store>(store: &S, scan: ScanRange<'_>, expected: &[&str], cla
 
 /// C8: a range scan under a prefix is bounded by its limit, ordered as C5's scan or its
 /// reverse, lies within its lower and upper bounds clipped to the prefix, and pages with
-/// a resume token that continues exactly past the last key, across concurrent commits.
+/// a resume token that continues exactly past the last key, across concurrent commits;
+/// each page is read from one snapshot, which a second store checks against a racing
+/// writer.
 pub fn c8_bounded_range_scan<B: Backend>(backend: &B) {
     let clock = Arc::new(ManualClock::default());
     let store = backend.open(Arc::clone(&clock));
@@ -644,6 +650,7 @@ pub fn c8_bounded_range_scan<B: Backend>(backend: &B) {
     c8_upper(&store);
     c8_concurrent(&store);
     c8_empty_prefix(&store);
+    c8_snapshot::c8_page_snapshot(backend);
 }
 
 /// C8 forward: the limit, the lower bound, the prefix and the token.

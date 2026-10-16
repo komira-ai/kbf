@@ -156,6 +156,14 @@ fn a_scan_that_shows_stale_values_fails_c8() {
     c8_bounded_range_scan(&FakeBackend::new(Flaw::ScanStaleValues));
 }
 
+// Catches a page whose rows are read one at a time, so a commit between two of them
+// splits the page across commits; the store's contract is one snapshot per page.
+#[test]
+#[should_panic(expected = "C8 page snapshot")]
+fn a_scan_that_reads_each_row_on_its_own_fails_c8() {
+    c8_bounded_range_scan(&FakeBackend::new(Flaw::ScanReadsPerRow));
+}
+
 // The two error types say what failed.
 #[test]
 fn errors_say_what_failed() {

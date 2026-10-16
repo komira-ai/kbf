@@ -15,7 +15,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use crate::clock::{Clock, ManualClock, StoreTime};
-use crate::conformance::{Backend, C1_RACERS, RACE_KEY};
+use crate::conformance::{Backend, C1_RACERS, C8_SNAPSHOT_PREFIX, RACE_KEY};
 use crate::store::{Span, Store, page_of};
 use crate::types::{
     Change, Changes, Commit, CommitStats, Cond, Conflict, Direction, Event, Op, ResumeToken,
@@ -24,6 +24,10 @@ use crate::types::{
 
 /// How much store time one durable sync takes on the fake.
 pub const FAKE_SYNC_COST: Duration = Duration::from_millis(2);
+
+/// The longest [`Flaw::ScanReadsPerRow`] waits between two rows for a commit, in wall
+/// time: the check it breaks keeps a writer committing, so the wait ends long before.
+const PER_ROW_COMMIT_WAIT: Duration = Duration::from_secs(5);
 
 /// A deliberate defect: at least one per clause the suite checks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -78,6 +82,11 @@ pub enum Flaw {
     ScanSkipsAhead,
     /// C8: a resumed page shows each key's value as of the scan's first page.
     ScanStaleValues,
+    /// C8: a page's keys are found under one lock, then each row's value is read again by
+    /// key under a lock of its own, so a commit between two rows lands inside the page.
+    /// Only under [`C8_SNAPSHOT_PREFIX`], where it also waits for a commit between rows
+    /// so the defect shows on every page of more than one row.
+    ScanReadsPerRow,
 }
 
 #[derive(Clone)]
@@ -291,6 +300,8 @@ pub struct Fake {
     /// The clock reading at open, for [`Flaw::CallerClockExpiry`].
     frozen: StoreTime,
     gate: Arc<Gate>,
+    /// Signalled with `inner` locked after each commit, for [`Flaw::ScanReadsPerRow`].
+    committed: Condvar,
     /// The live range at the last forward scan of a whole prefix, for
     /// [`Flaw::ScanSkipsAhead`] and [`Flaw::ScanStaleValues`].
     first_page: Arc<Mutex<BTreeMap<String, Versioned>>>,
@@ -307,6 +318,7 @@ impl Fake {
             flaw,
             frozen,
             gate: Arc::new(Gate::default()),
+            committed: Condvar::new(),
             first_page: Arc::default(),
         }
     }
@@ -317,6 +329,8 @@ impl Fake {
         let durable = lock(&self.inner).durable.clone();
         Fake {
             inner: Arc::new(Mutex::new(Inner::reopened(durable))),
+            // A condition variable serves one mutex; the reopened store has a new one.
+            committed: Condvar::new(),
             ..self
         }
     }
@@ -347,6 +361,7 @@ impl Fake {
                 checked.and_then(|()| inner.live.write(&deferred.txn, now, deferred.base, false));
             if result.is_ok() {
                 inner.stats.txns += 1;
+                self.committed.notify_all();
             }
             result
         };
@@ -386,6 +401,33 @@ impl Fake {
             },
             _ => scan,
         }
+    }
+
+    /// [`Flaw::ScanReadsPerRow`]: each of `rows` read again by key under its own lock
+    /// acquisition, after waiting for a commit since the previous row was read.
+    fn reread_each(
+        &self,
+        rows: Vec<(String, Versioned)>,
+        now: StoreTime,
+    ) -> Vec<(String, Versioned)> {
+        let mut out = Vec::with_capacity(rows.len());
+        let mut seen = None;
+        for (key, found) in rows {
+            let mut inner = lock(&self.inner);
+            if let Some(seen) = seen {
+                inner = self
+                    .committed
+                    .wait_timeout_while(inner, PER_ROW_COMMIT_WAIT, |inner| {
+                        inner.stats.txns == seen
+                    })
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .0;
+            }
+            let value = inner.live.live_row(&key, now).map_or(found, Row::versioned);
+            seen = Some(inner.stats.txns);
+            out.push((key, value));
+        }
+        out
     }
 
     fn clock_now(&self) -> StoreTime {
@@ -431,6 +473,7 @@ impl Fake {
             .live
             .write(txn, now, base, self.flaw == Flaw::PartialTxn)?;
         inner.stats.txns += 1;
+        self.committed.notify_all();
         Ok(commit)
     }
 }
@@ -513,6 +556,10 @@ impl Store for Fake {
         };
         if reverse && !walk_reverse {
             rows.reverse();
+        }
+        if self.flaw == Flaw::ScanReadsPerRow && scan.prefix == C8_SNAPSHOT_PREFIX {
+            drop(inner);
+            return Ok(page_of(self.reread_each(rows, now), scan.limit));
         }
         // The cursor flaws hold a snapshot per forward scan of a whole prefix and serve
         // its resumed pages (an excluded lower bound) from it.
