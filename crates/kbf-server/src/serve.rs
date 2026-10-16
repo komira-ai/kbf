@@ -211,7 +211,7 @@ pub(crate) fn bind(addr: SocketAddr) -> Result<(TcpIncoming, SocketAddr), ServeE
 }
 
 /// Serves `routes` on `listener` until it fails, or until `stop` completes and the
-/// requests in flight are answered; without a listener, never completes.
+/// requests in flight are answered; without a listener, it only waits for `stop`.
 pub(crate) fn serve_api(
     listener: Option<tokio::net::TcpListener>,
     routes: axum::Router,
@@ -226,7 +226,11 @@ pub(crate) fn serve_api(
             .with_graceful_shutdown(stop)
             .into_future(),
         ),
-        None => Either::Right(std::future::pending()),
+        // Nothing to answer: done as soon as it is told to stop, never before.
+        None => Either::Right(async move {
+            stop.await;
+            Ok(())
+        }),
     }
 }
 
@@ -627,7 +631,6 @@ where
         // answering (the request that began a drain on an idle frontend, whose
         // response would otherwise race the process's exit) and then stops.
         let (api_stop, api_stopped) = tokio::sync::oneshot::channel::<()>();
-        let has_api = api_listener.is_some();
         let api_serve = serve_api(
             api_listener.map(|(listener, _)| listener),
             api_routes,
@@ -666,7 +669,7 @@ where
             () = ticker.run() => Ok(()),
             () = stopping => Ok(()),
         };
-        if reapi_done && has_api {
+        if reapi_done {
             stop_api(api_stop, api_serve).await;
         }
         outcome

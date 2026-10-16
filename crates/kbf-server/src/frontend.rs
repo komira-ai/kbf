@@ -465,7 +465,6 @@ fn bind_frontend(
             .serve_with_incoming(worker_incoming);
         // Told when the REAPI listener is done (see `serve::stop_api`).
         let (api_stop, api_stopped) = tokio::sync::oneshot::channel::<()>();
-        let has_api = api_listener.is_some();
         let api_serve = serve_api(
             api_listener.map(|(listener, _)| listener),
             api_routes,
@@ -498,7 +497,7 @@ fn bind_frontend(
             () = ticker.run() => Ok(()),
             () = stopping => Ok(()),
         };
-        if reapi_done && has_api {
+        if reapi_done {
             stop_api(api_stop, api_serve).await;
         }
         outcome

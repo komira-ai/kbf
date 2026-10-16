@@ -216,11 +216,16 @@ mod tests {
         // counts the best single build of a function: the unit-test one must reach the
         // token and body arms the integration tests reach too).
         let garbage = answering(b"not http at all");
-        let err = OperatorClient::new(garbage, Some("token".to_owned()))
-            .post("/", "{}")
-            .expect_err("garbage");
+        let client = OperatorClient::new(garbage, Some("token".to_owned()));
+        let err = client.post("/", "{}").expect_err("garbage");
         assert!(matches!(err, ClientError::Malformed { .. }), "{err:?}");
         assert!(err.to_string().starts_with(&garbage.to_string()), "{err}");
+
+        let again = answering(b"still not http");
+        let err = OperatorClient::new(again, None)
+            .node_action("n", "drain", "")
+            .expect_err("garbage");
+        assert!(matches!(err, ClientError::Malformed { .. }), "{err:?}");
 
         let gone = {
             let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
