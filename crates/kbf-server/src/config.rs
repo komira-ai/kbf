@@ -173,9 +173,10 @@ pub struct Args {
     /// node (`kbf storage`), such as `http://127.0.0.1:8990`. The REAPI listener then
     /// answers a client's CAS, ByteStream and action-cache calls from that node, passing
     /// ByteStream through without holding a blob. The local stores are still opened:
-    /// Execution and the worker listener use them until the scheduler uses storage.
-    /// Plain text (`http://`) only; the node's mutual
-    /// TLS is not wired yet. Without it, the server answers those calls itself.
+    /// Execution and the worker listener use them (`kbf frontend` is this mode without
+    /// them: Execution reads the node too). Plain text (`http://`) only here; `kbf
+    /// frontend` takes the flags of the mutual TLS to the node. Without it, the server
+    /// answers those calls itself.
     #[arg(long, value_name = "URL")]
     pub storage: Option<String>,
     /// The `kbf.worker.v1` listener. Without mutual TLS (`--worker-tls-cert`,

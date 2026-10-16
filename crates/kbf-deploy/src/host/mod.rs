@@ -8,6 +8,7 @@
 //! - [`state`]: `state.json` (the current, previous and staged commits, the one waiting
 //!   to be confirmed, and the order floor), read and written under an exclusive lock on
 //!   `/run/kbf-deploy.lock` and replaced whole by a rename.
+//! - [`release`]: the manual `install`, `rollback` and `gc` verbs.
 //! - [`CommitId`]: a commit as 40 lowercase hex characters, the only form a release is
 //!   named by.
 //!
@@ -15,6 +16,9 @@
 //!
 //! ```text
 //! kbf-deploy host status [--json] [--root DIR]
+//! kbf-deploy host install --commit <40 hex> --from <dir> [--apply] [--root DIR]
+//! kbf-deploy host rollback [--apply] [--root DIR]
+//! kbf-deploy host gc [--keep N] [--apply] [--root DIR]
 //! ```
 //!
 //! `status` only reads: it prints the state and whether the `current` link points at
@@ -22,8 +26,14 @@
 //! when it does not, or 2 refused (`REFUSED: ...` on stderr: a state file that cannot
 //! be read or parsed). `--root` names the directory the host's paths are under (`/` by
 //! default), such as a mounted image.
+//!
+//! The state file is root's alone (0600), so `status` and the dry runs read it with
+//! sudo too. `install`, `rollback` and `gc` print their plan and change nothing unless
+//! `--apply` is given; what each does is in [`release`]. They exit 0 when done and 1
+//! with `kbf-deploy: <why>` on stderr when they refuse or a step fails.
 
 pub mod layout;
+pub mod release;
 pub mod state;
 
 use std::fmt;
@@ -32,7 +42,9 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Args, Subcommand};
+use kbf_host::exec::HostExec;
 use kbf_host::path::Root;
+use kbf_host::plan::Mode;
 use serde::{Deserialize, Serialize};
 
 use state::{CurrentLink, Status};
@@ -97,6 +109,14 @@ impl fmt::Display for CommitId {
 pub enum Host {
     /// Print the deploy state and whether the current link matches it. Only reads.
     Status(StatusArgs),
+    /// Copy a release into its directory and make it current. Prints the plan unless
+    /// --apply.
+    Install(InstallArgs),
+    /// Make the previous release current again. Prints the plan unless --apply.
+    Rollback(ApplyArgs),
+    /// Remove old release directories, never the current, previous or staged one.
+    /// Prints the plan unless --apply.
+    Gc(GcArgs),
 }
 
 #[derive(Args)]
@@ -109,14 +129,92 @@ pub struct StatusArgs {
     root: Root,
 }
 
+#[derive(Args)]
+pub struct InstallArgs {
+    /// The release's commit: 40 lowercase hex characters.
+    #[arg(long)]
+    commit: CommitId,
+    /// The directory holding the release: `kbf`, and `units/` when it has units.
+    #[arg(long)]
+    from: PathBuf,
+    #[command(flatten)]
+    apply: ApplyArgs,
+}
+
+#[derive(Args)]
+pub struct GcArgs {
+    /// Keep this many release directories besides the current, previous and staged ones,
+    /// the newest first.
+    #[arg(long, default_value_t = 0)]
+    keep: usize,
+    #[command(flatten)]
+    apply: ApplyArgs,
+}
+
+#[derive(Args)]
+pub struct ApplyArgs {
+    /// Carry the plan out (as root).
+    #[arg(long)]
+    apply: bool,
+    /// The directory the host's paths are under, such as a mounted image.
+    #[arg(long, default_value = "/", value_parser = root)]
+    root: Root,
+}
+
+impl ApplyArgs {
+    fn mode(&self) -> Mode {
+        if self.apply {
+            Mode::Apply
+        } else {
+            Mode::DryRun
+        }
+    }
+}
+
 fn root(dir: &str) -> Result<Root, kbf_host::PathError> {
     Root::new(PathBuf::from(dir))
 }
 
 /// Run a `host` verb: see the module docs for what each prints and its exit.
 pub fn run(verb: Host, out: &mut dyn Write, err: &mut dyn Write) -> ExitCode {
-    match verb {
-        Host::Status(a) => status(&a.root, a.json, out, err),
+    let done = match verb {
+        Host::Status(a) => return status(&a.root, a.json, out, err),
+        Host::Install(a) => {
+            let r = &a.apply.root;
+            let what = release::Install {
+                commit: a.commit,
+                from: a.from,
+            };
+            let mode = a.apply.mode();
+            release::install(
+                &mut HostExec::new(r.clone()),
+                r,
+                release::ROOT,
+                &what,
+                mode,
+                out,
+            )
+        }
+        Host::Rollback(a) => {
+            release::rollback(&mut HostExec::new(a.root.clone()), &a.root, a.mode(), out)
+        }
+        Host::Gc(a) => {
+            let r = &a.apply.root;
+            release::gc(
+                &mut HostExec::new(r.clone()),
+                r,
+                a.keep,
+                a.apply.mode(),
+                out,
+            )
+        }
+    };
+    match done {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            let _ = writeln!(err, "kbf-deploy: {e}");
+            ExitCode::FAILURE
+        }
     }
 }
 

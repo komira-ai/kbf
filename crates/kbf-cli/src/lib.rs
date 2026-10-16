@@ -10,8 +10,11 @@
 //!   `kbf-server`'s store, write and log flags and its own listener flags, and refuses
 //!   every other flag of `kbf-server` (and so any state-store flag: a storage node
 //!   reaches the state store only through a frontend).
-//! - `kbf frontend`, `kbf storage-and-daemon`: not built yet. Each exits 2 with one line
-//!   naming the mode.
+//! - `kbf frontend`: the REAPI front end ([`kbf_server::frontend`]). Takes `kbf-server`'s
+//!   listener, scheduler, state-store and log flags, requires `--storage` and takes the
+//!   flags of its mutual TLS to the storage node; refuses every other flag of
+//!   `kbf-server` (a frontend holds no stores).
+//! - `kbf storage-and-daemon`: not built yet. It exits 2 with one line naming the mode.
 //!
 //! A mode refuses the flags that belong to another mode ([`refused_by`]): the set is
 //! derived from each mode's own flag set, nothing is listed by hand, so a flag added to
@@ -54,6 +57,8 @@ pub enum Invocation {
     AllInOne(Box<kbf_all_in_one::cli::Flags>),
     /// `kbf storage`.
     Storage(Box<kbf_server::storage_node::StorageFlags>),
+    /// `kbf frontend`.
+    Frontend(Box<kbf_server::frontend::FrontendFlags>),
     /// A mode that is not built yet.
     NotBuilt {
         /// The mode.
@@ -73,6 +78,7 @@ fn own_command(entry: Entry) -> Option<Command> {
         Entry::Daemon => Some(kbf_node::Cli::command()),
         Entry::AllInOne => Some(kbf_all_in_one::cli::command()),
         Entry::Storage => Some(kbf_server::storage_node::command()),
+        Entry::Frontend => Some(kbf_server::frontend::command()),
         Entry::NotBuilt => None,
     }
 }
@@ -125,7 +131,7 @@ fn reason(mode: &str, flag: &str) -> String {
 
 fn mode_command(name: &'static str, entry: Entry) -> Command {
     match entry {
-        Entry::Daemon | Entry::AllInOne | Entry::Storage => {
+        Entry::Daemon | Entry::AllInOne | Entry::Storage | Entry::Frontend => {
             let mut cmd = own_command(entry)
                 .expect("a mode with an entry point has a command line")
                 .name(name)
@@ -199,6 +205,12 @@ where
                 kbf_server::storage_node::parse(m)?,
             )))
         }
+        Entry::Frontend => {
+            refuse_foreign_flags(mode.name, m)?;
+            Ok(Invocation::Frontend(Box::new(kbf_server::frontend::parse(
+                m,
+            )?)))
+        }
         Entry::NotBuilt => Ok(Invocation::NotBuilt { mode: mode.name }),
     }
 }
@@ -240,6 +252,7 @@ pub fn run(invocation: &Invocation) -> ExitCode {
         Invocation::Daemon(cli) => kbf_node::run(cli),
         Invocation::AllInOne(flags) => kbf_all_in_one::run(flags),
         Invocation::Storage(flags) => kbf_server::storage_node::run(flags),
+        Invocation::Frontend(flags) => kbf_server::frontend::run(flags),
         Invocation::NotBuilt { mode } => {
             eprintln!("{}", names::not_built_line(mode));
             ExitCode::from(2)
@@ -268,7 +281,12 @@ pub fn check_args(args: &[std::ffi::OsString]) -> Result<(), clap::Error> {
         .cloned()
         .collect::<Vec<_>>();
     match parse_from(argv) {
-        Ok(Invocation::Daemon(_) | Invocation::AllInOne(_) | Invocation::Storage(_)) => Ok(()),
+        Ok(
+            Invocation::Daemon(_)
+            | Invocation::AllInOne(_)
+            | Invocation::Storage(_)
+            | Invocation::Frontend(_),
+        ) => Ok(()),
         Ok(Invocation::NotBuilt { mode }) => {
             Err(command().error(ErrorKind::InvalidSubcommand, names::not_built_line(mode)))
         }
