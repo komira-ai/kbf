@@ -31,6 +31,8 @@ kbf-node.workspace = true
 kbf-proto.workspace = true
 kbf-segments.workspace = true
 kbf-server.workspace = true
+# The node's one cache (`kbf_storage::local_cache`) and the streamed read's types.
+kbf-storage.workspace = true
 kbf-threads.workspace = true
 kbf-transfer.workspace = true
 kbf-types.workspace = true
@@ -38,6 +40,7 @@ kbf-types.workspace = true
 rustix = { workspace = true, features = ["process"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "sync"] }
 tonic.workspace = true
+tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
@@ -50,7 +53,6 @@ kbf-driver-container.workspace = true
 kbf-front.workspace = true
 # The storage boundary the plane is checked through (tests/storage_seam.rs).
 kbf-meta.workspace = true
-kbf-storage.workspace = true
 # The act steps the stand-in `podman` runs as each action, through this test binary.
 kbf-testkit.workspace = true
 prost.workspace = true

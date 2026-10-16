@@ -74,8 +74,12 @@ pub struct Listeners {
     /// WaitExecution on it still streams its result; then it is NOT_FOUND.
     pub finished_retention: Duration,
     /// How long shutdown waits for the REAPI listener to drain (see
-    /// [`bind_server_with_api`]) before it stops anyway.
+    /// [`bind_server_with_api`]) before it ends the open streams and stops anyway.
+    /// [`Duration::MAX`] waits for as long as an action runs (`--shutdown-timeout-secs
+    /// 0`, the flag's default): Buck2 never recovers a stream that breaks mid-action.
     pub shutdown_timeout: Duration,
+    /// How long streams stay quiet, and how the connections are kept alive.
+    pub streams: StreamTiming,
     /// How long `GET /readyz` on the operator API, and the REAPI listener's
     /// `grpc.health.v1` service, wait for the object store to answer their probe
     /// ([`crate::health`]).
@@ -87,6 +91,36 @@ pub struct Listeners {
     /// `docs/design/write-path.md`, section 4).
     pub segments: SegmentsConfig,
 }
+
+/// What keeps a long-lived stream from looking idle to a load balancer, a proxy or the
+/// peer: Buck2 sends one Execute per action and never reconnects a broken one, so an
+/// idle-timeout cut fails the action (komira-build-farm#791). Zero turns each off.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StreamTiming {
+    /// How often every open Execute and WaitExecution stream is sent its operation
+    /// again (`--progress-interval-secs`).
+    pub progress_interval: Duration,
+    /// How often the REAPI and worker listeners send an HTTP/2 PING on a connection
+    /// that has been quiet (`--http2-keepalive-interval-secs`).
+    pub keepalive_interval: Duration,
+    /// How long a PING may go unanswered before the connection is closed
+    /// (`--http2-keepalive-timeout-secs`).
+    pub keepalive_timeout: Duration,
+}
+
+impl Default for StreamTiming {
+    fn default() -> Self {
+        Self {
+            progress_interval: Duration::from_secs(30),
+            keepalive_interval: Duration::from_secs(30),
+            keepalive_timeout: Duration::from_secs(20),
+        }
+    }
+}
+
+/// How long, after the shutdown timeout ends the open streams UNAVAILABLE, the server
+/// waits for the clients to take it before it stops.
+const CLOSE_GRACE: Duration = Duration::from_secs(2);
 
 /// The worker listener's mutual TLS: every daemon's certificate must name its node
 /// (see [`crate::identity`]).
@@ -105,6 +139,10 @@ pub struct Api {
     pub listen: SocketAddr,
     /// The token writes must present; `None` turns writes off (reads still answer).
     pub token: Option<ApiToken>,
+    /// The node's one cache, whose fill `/metrics` reports, when the process runs a
+    /// daemon whose input cache shares the disk with this server's store
+    /// (`kbf-all-in-one`).
+    pub local_cache: Option<Arc<kbf_storage::local_cache::LocalCache>>,
 }
 
 /// Why the server could not start or stopped.
@@ -213,6 +251,16 @@ fn flow_control(server: Server) -> Server {
         .max_concurrent_streams(Some(MAX_CONCURRENT_STREAMS))
         .initial_stream_window_size(Some(STREAM_WINDOW_BYTES))
         .initial_connection_window_size(Some(CONNECTION_WINDOW_BYTES))
+}
+
+/// `server` pinging a quiet connection every `timing.keepalive_interval` and closing it
+/// when a ping stays unanswered for `timing.keepalive_timeout` (HTTP/2 PING, which a
+/// peer must answer even when it never sends data).
+fn keepalive(server: Server, timing: StreamTiming) -> Server {
+    let on = !timing.keepalive_interval.is_zero();
+    server
+        .http2_keepalive_interval(on.then_some(timing.keepalive_interval))
+        .http2_keepalive_timeout(on.then_some(timing.keepalive_timeout))
 }
 
 /// The warning every start logs ([`bind_server_with_api`]).
@@ -347,7 +395,9 @@ where
     let (reapi_incoming, reapi) = bind(listeners.reapi)?;
     let (worker_incoming, worker) = bind(listeners.worker)?;
     let probe_timeout = listeners.store_probe_timeout;
-    let (api_listen, token) = api.map_or((None, None), |api| (Some(api.listen), api.token));
+    let (api_listen, token, local) = api.map_or((None, None, None), |api| {
+        (Some(api.listen), api.token, api.local_cache)
+    });
     let api_listener = api_listen.map(bind_api).transpose()?;
     let api = api_listener.as_ref().map(|(_, local)| *local);
     let readiness = Arc::new(Readiness::default());
@@ -362,18 +412,18 @@ where
     );
     let api_routes = crate::api::router(Arc::clone(&farm), token)
         .merge(health_routes)
-        .merge(crate::metrics::router(Arc::clone(&cache)))
+        .merge(crate::metrics::router(Arc::clone(&cache), local))
         .merge(blob_routes)
         .merge(page_routes);
     // Logged at every start, the first one too (issue #156).
     let (term, epoch) = (farm.term(), farm.lease_epoch());
     log_state(durable, term, epoch);
 
-    let mut reapi_server = flow_control(Server::builder());
+    let mut reapi_server = keepalive(flow_control(Server::builder()), listeners.streams);
     if let Some(tls) = listeners.reapi_tls {
         reapi_server = reapi_server.tls_config(tls)?;
     }
-    let mut worker_server = flow_control(Server::builder());
+    let mut worker_server = keepalive(flow_control(Server::builder()), listeners.streams);
     let peers_certified = listeners.worker_tls.is_some();
     let peers = match listeners.worker_tls {
         Some(tls) => {
@@ -425,12 +475,14 @@ where
         .clone()
         .map(|m| MembershipService::new(m, admission).server());
     let (closer, closing) = kbf_front::closing();
+    let (ticker, progress) = kbf_front::progress(listeners.streams.progress_interval);
     let authorizers = Arc::new(policy.authorizers);
     let cache_for_health = Arc::clone(&cache);
     let reapi_routes = kbf_front::routes_recorded(
         cache,
         Arc::clone(&farm),
         closing,
+        progress,
         authorizers,
         &recorder,
         default_memory,
@@ -496,9 +548,13 @@ where
             // Before anything stops, so a front's health check (`/readyz`, or the
             // health service) sends no new work here.
             stop_readiness.stop();
-            closer.close();
+            // No new Execute; open streams run until their action is done. Buck2 does
+            // not recover a stream that breaks, so only the shutdown timeout ends them.
+            closer.drain();
             let _ = drain.send(());
             tokio::time::sleep(listeners.shutdown_timeout).await;
+            closer.close();
+            tokio::time::sleep(CLOSE_GRACE).await;
             tracing::warn!(
                 timeout = ?listeners.shutdown_timeout,
                 "REAPI connections still open at the shutdown timeout; stopping anyway"
@@ -510,6 +566,8 @@ where
             served = api_serve => served.map_err(ServeError::Api),
             () = ticking => Ok(()),
             () = sweeping => Ok(()),
+            // One timer for every open stream's progress operation.
+            () = ticker.run() => Ok(()),
             () = stopping => Ok(()),
         }
     };

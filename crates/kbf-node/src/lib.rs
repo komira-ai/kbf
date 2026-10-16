@@ -865,7 +865,7 @@ mod container {
         config.cpu = cpu_pool(cli)?;
         config.limits = limits(cli);
         config.swap_kill = swap_kill(cli);
-        config.cache = plan.as_ref().and_then(crate::data_dir::given);
+        config.cache = crate::data_dir::given(plan.as_ref(), &cli.data);
         let runtime = PodmanRuntime::new(config, cas)?;
         // From `start`, in the runtime's context but outside any task.
         tokio::runtime::Handle::current().block_on(check_images(&runtime, &cli.images))?;

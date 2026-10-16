@@ -1346,6 +1346,7 @@ dependencies = [
  "rustix",
  "tokio",
  "tonic",
+ "tracing",
  "tracing-subscriber",
 ]
 
@@ -1423,13 +1424,16 @@ dependencies = [
  "clap",
  "kbf-all-in-one",
  "kbf-cas-conformance",
+ "kbf-daemon",
  "kbf-deploy",
  "kbf-host",
  "kbf-node",
  "kbf-server",
+ "kbf-state",
  "kbf-storage",
  "kbf-transfer",
  "kbf-types",
+ "serde_json",
  "tokio",
  "tonic",
 ]
@@ -1455,6 +1459,7 @@ dependencies = [
  "kbf-objstore",
  "kbf-proto",
  "kbf-server",
+ "kbf-storage",
  "kbf-testkit",
  "kbf-transfer",
  "kbf-types",

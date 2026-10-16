@@ -73,8 +73,11 @@ impl fmt::Display for Failed {
 }
 
 /// The server half on a runtime of its own, then the daemon half over the in-process
-/// plane; returns once the server half has stopped and the daemon half after it.
+/// plane, the two given one cache when they share a disk (`crate::one_cache`); returns
+/// once the server half has stopped and the daemon half after it.
 fn serve(flags: &Flags) -> Result<(), Failed> {
+    let mut flags = flags.clone();
+    crate::one_cache::share(&mut flags);
     let sizes = kbf_server::sizes_on(&flags.server, Topology::detect());
     sizes.log();
     let tokio = sizes.runtime().map_err(Failed::server)?;
