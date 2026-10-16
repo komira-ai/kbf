@@ -613,8 +613,8 @@ pub fn c8_bounded_range_scan<B: Backend>(backend: &B) {
         "C8 limit: a scan with limit 2 must return the first 2 keys of the prefix in key order"
     );
     assert_eq!(
-        first.resume,
-        Some(ResumeToken::after("c8/a")),
+        first.resume.as_ref().map(ResumeToken::key),
+        Some("c8/a"),
         "C8 resume: a full page with keys after it names its last key"
     );
     assert_eq!(
@@ -636,12 +636,20 @@ pub fn c8_bounded_range_scan<B: Backend>(backend: &B) {
         "C8 start: a start key that is not stored begins at the next key"
     );
     // The prefix: a start past it finds nothing.
-    let past = scan_page(&store, Bound::Included("c8~"), 4);
-    assert!(
-        past.rows.is_empty() && past.resume.is_none(),
-        "C8 prefix: a start past the prefix gives an empty, final page, got {:?}",
-        keys_of(&past)
-    );
+    // `c8~` is stored past the prefix; nothing is stored at or after `c9`, so that scan
+    // runs off the end of the store.
+    for beyond in ["c8~", "c9"] {
+        let past = scan_page(&store, Bound::Included(beyond), 4);
+        assert_eq!(
+            keys_of(&past),
+            Vec::<&str>::new(),
+            "C8 prefix: a start past the prefix ({beyond}) gives an empty page"
+        );
+        assert_eq!(
+            past.resume, None,
+            "C8 prefix: a start past the prefix ({beyond}) gives a final page"
+        );
+    }
     // A page as large as the prefix.
     let whole = scan_page(&store, Bound::Unbounded, C8_KEYS.len());
     let listed: Vec<(String, Versioned)> = store.scan_prefix("c8/").expect("scan");
