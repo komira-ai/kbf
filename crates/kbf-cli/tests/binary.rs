@@ -189,3 +189,84 @@ fn the_binary_answers_as_a_keeper_before_it_reads_its_command_line() {
     );
     assert!(out.is_empty(), "{out}");
 }
+
+/// The scratch directory a test may write under (the workspace's `target/`).
+fn scratch(name: &str) -> std::path::PathBuf {
+    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(name);
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("scratch");
+    dir
+}
+
+/// Catches `kbf check-args` starting the mode it checks (the daemon's start makes its
+/// `--data-dir`; here the directory must stay absent), printing anything for a command
+/// line that parses, and exiting other than 0 for one: each built mode's own flags,
+/// with a data directory that a start would make.
+#[test]
+fn check_args_parses_and_starts_nothing() {
+    let dir = scratch("check_args_starts_nothing");
+    let data = dir.join("data");
+    let data_flag = format!("--data-dir={}", data.display());
+    for mode in [names::DAEMON, names::ALL_IN_ONE] {
+        let (code, out, err) = run(&[
+            kbf_cli::CHECK_ARGS,
+            mode,
+            "--driver=container",
+            "--server=https://127.0.0.1:1",
+            "--ca-cert=/nonexistent/ca.pem",
+            "--cert=/nonexistent/node.pem",
+            "--key=/nonexistent/node.key",
+            "--node-id=n",
+            &data_flag,
+        ]);
+        assert_eq!(
+            (code, out.as_str(), err.as_str()),
+            (Some(0), "", ""),
+            "{mode}"
+        );
+        assert!(!data.exists(), "{mode} started: {} made", data.display());
+    }
+}
+
+/// Catches `kbf check-args` passing what a start refuses: a flag no mode has, another
+/// mode's flag (named, as the start names it), a mode not built yet (every start of it
+/// exits 2), `--help` (which prints and starts nothing), no mode, and an unknown one.
+/// Each exits 2 with the message on stderr and nothing on stdout.
+#[test]
+fn check_args_exits_2_with_the_refusal_a_start_gets() {
+    let daemon = [
+        names::DAEMON,
+        "--driver=container",
+        "--server=https://127.0.0.1:1",
+        "--ca-cert=ca.pem",
+        "--cert=node.pem",
+        "--key=node.key",
+        "--node-id=n",
+    ];
+    let with = |extra: &'static str| -> Vec<&'static str> {
+        std::iter::once(kbf_cli::CHECK_ARGS)
+            .chain(daemon.iter().copied())
+            .chain([extra])
+            .collect()
+    };
+    let bogus = with("--bogus-flag");
+    let cold = with("--cold-store=file:///x");
+    let help = with("--help");
+    let rows: [(&[&str], &str); 6] = [
+        (&bogus, "unexpected argument '--bogus-flag'"),
+        (&cold, "kbf daemon refuses --cold-store: "),
+        (
+            &[kbf_cli::CHECK_ARGS, names::FRONTEND],
+            "kbf frontend: mode not built yet",
+        ),
+        (&help, "--help and --version print and exit 0"),
+        (&[kbf_cli::CHECK_ARGS], "Usage: kbf"),
+        (&[kbf_cli::CHECK_ARGS, "no-such-mode"], "no-such-mode"),
+    ];
+    for (argv, want) in rows {
+        let (code, out, err) = run(argv);
+        assert_eq!(code, Some(2), "{argv:?}: {err}");
+        assert!(err.contains(want), "{argv:?}: {err}");
+        assert!(out.is_empty(), "{argv:?}: {out}");
+    }
+}
