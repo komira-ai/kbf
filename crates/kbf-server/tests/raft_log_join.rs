@@ -114,3 +114,36 @@ async fn a_join_the_log_cannot_make_durable_is_refused() {
     let refused = log.join(&request);
     assert!(matches!(refused, Err(JoinError::Refused(_))), "{refused:?}");
 }
+
+/// Catches: a drain mark that is not committed in the log (a restart forgets the
+/// operator's intent), an undrain that leaves the mark, a drain of the only voter (the
+/// cell would have no candidate to hand the vote to), and drains of strangers.
+#[tokio::test]
+async fn a_drain_mark_is_committed_survives_a_restart_and_undrain_clears_it() {
+    let fs = FaultFs::new();
+    let log = open(&fs).await;
+    let request = JoinRequest {
+        cluster: id(LOG_ID),
+        node: ServerId(2),
+    };
+    log.join(&request).expect("joined");
+    let drained = log.drain(ServerId(2)).expect("drained");
+    assert!(drained.is_drained(ServerId(2)));
+    assert_eq!(drained, log.membership());
+    assert!(log.drain(ServerId(2)).is_err(), "drained already");
+    assert!(log.drain(ServerId(1)).is_err(), "the only voter");
+    assert!(log.drain(ServerId(7)).is_err(), "not a member");
+    assert!(log.undrain(ServerId(7)).is_err(), "not drained");
+    drop(log);
+
+    let log = open(&fs.restart()).await;
+    assert!(
+        log.membership().is_drained(ServerId(2)),
+        "the mark is in the log"
+    );
+    let undrained = log.undrain(ServerId(2)).expect("undrained");
+    assert!(!undrained.is_drained(ServerId(2)));
+    drop(log);
+    let log = open(&fs.restart()).await;
+    assert_eq!(log.membership().drained().count(), 0);
+}

@@ -92,11 +92,14 @@ pub struct HardState {
 }
 
 /// Who is in the group: voters elect leaders and form quorums; learners receive the
-/// log and apply it but never vote, campaign or count towards a quorum.
+/// log and apply it but never vote, campaign or count towards a quorum. A member may
+/// also be drained: an operator's mark, committed like any membership change, that
+/// keeps it from being chosen as a voter (see [`VoterPolicy`](crate::VoterPolicy)).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Membership {
     pub(crate) voters: BTreeSet<ServerId>,
     pub(crate) learners: BTreeSet<ServerId>,
+    pub(crate) drained: BTreeSet<ServerId>,
 }
 
 impl Membership {
@@ -118,7 +121,40 @@ impl Membership {
         if let Some(&both) = voters.intersection(&learners).next() {
             return Err(ConfigError::VoterAndLearner(both));
         }
-        Ok(Self { voters, learners })
+        Ok(Self {
+            voters,
+            learners,
+            drained: BTreeSet::new(),
+        })
+    }
+
+    /// This membership with `drained` marked drained.
+    ///
+    /// # Errors
+    ///
+    /// [`ConfigError::NotAMember`] for a drained server that is not a member.
+    pub fn with_drained(
+        mut self,
+        drained: impl IntoIterator<Item = ServerId>,
+    ) -> Result<Self, ConfigError> {
+        for id in drained {
+            if !self.contains(id) {
+                return Err(ConfigError::NotAMember(id));
+            }
+            self.drained.insert(id);
+        }
+        Ok(self)
+    }
+
+    /// The drained members, in order.
+    pub fn drained(&self) -> impl Iterator<Item = ServerId> + '_ {
+        self.drained.iter().copied()
+    }
+
+    /// Whether `id` is drained.
+    #[must_use]
+    pub fn is_drained(&self, id: ServerId) -> bool {
+        self.drained.contains(&id)
     }
 
     /// The voters, in order.

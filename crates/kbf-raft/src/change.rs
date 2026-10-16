@@ -23,6 +23,15 @@ pub enum Change {
     AddLearner(ServerId),
     /// Makes a learner a voter.
     Promote(ServerId),
+    /// Makes a voter a learner: it stays a member and keeps receiving the log. A
+    /// leader that demotes itself keeps leading until the change commits, without
+    /// counting its own copy, then steps down.
+    Demote(ServerId),
+    /// Marks a member drained: the voter policy moves its vote elsewhere and never
+    /// chooses it as a voter while the mark stands. The voters do not change.
+    Drain(ServerId),
+    /// Clears a member's drain mark: it is an ordinary candidate again.
+    Undrain(ServerId),
     /// Removes a voter or a learner. A leader that removes itself keeps leading until
     /// the change commits, without counting its own copy, then steps down.
     Remove(ServerId),
@@ -50,9 +59,18 @@ pub enum ChangeError {
     /// Only a learner can be promoted.
     #[error("{0} is not a learner")]
     NotALearner(ServerId),
+    /// Only a voter can be demoted.
+    #[error("{0} is not a voter")]
+    NotAVoter(ServerId),
     /// The server to remove is not a member.
     #[error("{0} is not a member")]
     NotAMember(ServerId),
+    /// The member to drain is drained already.
+    #[error("{0} is drained already")]
+    AlreadyDrained(ServerId),
+    /// The member to undrain is not drained.
+    #[error("{0} is not drained")]
+    NotDrained(ServerId),
     /// A group needs a voter: the last one cannot be removed.
     #[error("{0} is the last voter")]
     LastVoter(ServerId),
@@ -81,6 +99,8 @@ impl Membership {
                 }
                 next.voters.insert(id);
             }
+            Change::Demote(id) => return Err(ChangeError::NotAVoter(id)),
+            Change::Drain(id) | Change::Undrain(id) => return Err(ChangeError::NotAMember(id)),
             Change::Remove(id) => {
                 if !self.contains(id) {
                     return Err(ChangeError::NotAMember(id));

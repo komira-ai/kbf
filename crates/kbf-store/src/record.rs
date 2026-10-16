@@ -278,16 +278,19 @@ mod tests {
     /// the golden bytes pin, or decoded though malformed.
     #[test]
     fn memberships_round_trip_in_entries_and_snapshots() {
-        let m = Membership::new([ServerId(1), ServerId(2)], [ServerId(3)]).unwrap();
+        let m = Membership::new([ServerId(1), ServerId(2)], [ServerId(3)])
+            .unwrap()
+            .with_drained([ServerId(3)])
+            .unwrap();
         let e = entry(5, 2, Payload::Membership(m.clone()));
         let bytes = encode_entry(&e);
         assert_eq!(
             hex(&bytes),
             "050000000000000002000000000000000202000000010000000000000002000000\
-             00000000010000000300000000000000"
+             00000000010000000300000000000000010000000300000000000000"
         );
         assert_eq!(decode_entry(&bytes), Ok(e));
-        for cut in [17, 19, 25, 33, 39, 45] {
+        for cut in [17, 19, 25, 33, 39, 45, 49, 51, 57] {
             assert!(decode_entry(&bytes[..cut]).is_err(), "cut at {cut}");
         }
         let mut longer = bytes.clone();
@@ -297,6 +300,9 @@ mod tests {
         let mut none = encode_entry(&entry(1, 1, no_voters));
         none[17] = 0;
         assert!(decode_entry(&none).is_err(), "no voters");
+        let mut stranger = bytes.clone();
+        stranger[57] = 9;
+        assert!(decode_entry(&stranger).is_err(), "a drained stranger");
 
         let snapshot = Snapshot {
             base: LogId::new(Term(2), LogIndex(5)),

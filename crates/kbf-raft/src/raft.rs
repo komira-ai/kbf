@@ -316,6 +316,17 @@ impl Raft {
             .collect()
     }
 
+    /// On a leader, each peer's match index: the highest index known to be durable
+    /// there. Its distance from [`Raft::last_log_id`] is the peer's lag. Empty on a
+    /// follower or candidate.
+    #[must_use]
+    pub fn matched(&self) -> Vec<(ServerId, LogIndex)> {
+        let State::Leader { progress, .. } = &self.state else {
+            return Vec::new();
+        };
+        progress.iter().map(|(&id, p)| (id, p.matched)).collect()
+    }
+
     /// The last entry's id (index 0, term 0 when the log is empty).
     #[must_use]
     pub fn last_log_id(&self) -> LogId {

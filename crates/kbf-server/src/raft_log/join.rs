@@ -48,3 +48,8 @@ pub enum JoinError {
     #[error("the join was refused: {0}")]
     Refused(String),
 }
+
+/// A drain or undrain the leader refused. Nothing was committed.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("the membership change was refused: {0}")]
+pub struct ChangeRefused(pub String);

@@ -97,7 +97,7 @@ use tokio::sync::oneshot;
 use tokio::task::AbortHandle;
 use tokio::time::Instant;
 
-pub use self::join::{JoinAnswer, JoinError, JoinRequest};
+pub use self::join::{ChangeRefused, JoinAnswer, JoinError, JoinRequest};
 use self::machine::MetaMachine;
 pub use self::machine::NoSnapshots;
 pub use self::recorded::{RECORD, RECORD_TMP};
@@ -477,6 +477,28 @@ impl<F: Fs> RaftMetaLog<F> {
             membership: core.membership().clone(),
             config_index: core.membership_index(),
         })
+    }
+
+    /// Commits a drain mark for `node` (`kbf cluster drain`): the voter policy moves its
+    /// vote elsewhere and never chooses it while the mark stands. Returns the
+    /// membership with the mark.
+    ///
+    /// # Errors
+    ///
+    /// Every drain is refused for now.
+    pub fn drain(&self, node: ServerId) -> Result<Membership, ChangeRefused> {
+        let _ = node;
+        Err(ChangeRefused("not built yet".to_owned()))
+    }
+
+    /// Clears `node`'s drain mark (`kbf cluster undrain`).
+    ///
+    /// # Errors
+    ///
+    /// Every undrain is refused for now.
+    pub fn undrain(&self, node: ServerId) -> Result<Membership, ChangeRefused> {
+        let _ = node;
+        Err(ChangeRefused("not built yet".to_owned()))
     }
 
     /// The log's Raft membership: its voters and learners.

@@ -42,6 +42,7 @@ mod mem;
 mod message;
 mod raft;
 mod types;
+mod voters;
 
 pub use change::{Change, ChangeError};
 pub use host::{Host, HostError, Machine, OpenError, Snapshot, Storage, Stored, Transport};
@@ -51,4 +52,7 @@ pub use message::{AppendOutcome, Effect, Message, MessageKind};
 pub use raft::{CompactError, NotLeader, Proposed, Raft, Role};
 pub use types::{
     Config, ConfigError, Entry, HardState, LogId, LogIndex, Membership, Payload, ServerId, Term,
+};
+pub use voters::{
+    LoadHysteresis, LoadSwap, MemberState, Thresholds, VoterPolicy, VoterPolicyError,
 };

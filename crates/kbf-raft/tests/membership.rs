@@ -12,8 +12,9 @@ use std::convert::Infallible;
 use std::rc::Rc;
 
 use kbf_raft::{
-    Change, ChangeError, Config, Entry, Host, HostError, Machine, MemStorage, Membership, Message,
-    Payload, Role, ServerId, Snapshot, Storage, Transport,
+    Change, ChangeError, Config, Entry, Host, HostError, Machine, MemStorage, MemberState,
+    Membership, Message, Payload, Role, ServerId, Snapshot, Storage, Thresholds, Transport,
+    VoterPolicy,
 };
 
 const S1: ServerId = ServerId(1);
@@ -83,6 +84,8 @@ struct Cluster {
     nodes: BTreeMap<ServerId, Node>,
     bases: BTreeMap<ServerId, Membership>,
     wire: Wire,
+    /// Rounds of the voter policy so far, to tag each round's command.
+    rounds: u64,
 }
 
 impl Cluster {
@@ -92,6 +95,7 @@ impl Cluster {
             nodes: BTreeMap::new(),
             bases: BTreeMap::new(),
             wire: Rc::default(),
+            rounds: 0,
         };
         let base = Membership::new([S1], []).expect("one voter");
         cluster.start(S1, base, MemStorage::new());
@@ -223,6 +227,58 @@ impl Cluster {
                 .filter(|(id, _)| members.contains(**id))
                 .all(|(_, n)| n.core().commit_index() >= at)
         });
+    }
+
+    /// What the leader knows of each member: reachable while it runs, its lag from its
+    /// match index, caught up for the policy's rounds whenever within the lag.
+    fn states(&self, leader: ServerId, thresholds: Thresholds) -> Vec<MemberState> {
+        let core = self.nodes[&leader].core();
+        let last = core.last_log_id().index.0;
+        let matched: BTreeMap<ServerId, u64> = core
+            .matched()
+            .into_iter()
+            .map(|(id, m)| (id, m.0))
+            .chain([(leader, last)])
+            .collect();
+        let members = core.membership();
+        members
+            .voters()
+            .chain(members.learners())
+            .map(|id| {
+                let lag = last - matched.get(&id).copied().unwrap_or(0);
+                let within = lag <= thresholds.promote_lag;
+                MemberState {
+                    id,
+                    reachable: self.nodes.contains_key(&id),
+                    healthy: true,
+                    lag,
+                    rounds_within: if within { thresholds.promote_rounds } else { 0 },
+                    rounds_beyond: if within { 0 } else { thresholds.promote_rounds },
+                    pressure: 0,
+                    domain: None,
+                }
+            })
+            .collect()
+    }
+
+    /// Lets the leader apply `policy` until it names no change, each change committed
+    /// before the next is asked for.
+    fn keep_voters(&mut self, policy: &VoterPolicy) -> Vec<Change> {
+        let mut made = Vec::new();
+        for _ in 0..10 {
+            self.rounds += 1;
+            let tag = format!("round-{}", self.rounds);
+            self.commit(tag.as_bytes());
+            let leader = self.leader().expect("a leader");
+            let members = self.states(leader, Thresholds::default());
+            let core = self.nodes[&leader].core();
+            let Some(change) = policy.next_change(leader, core.membership(), &members, None) else {
+                return made;
+            };
+            self.change(change);
+            made.push(change);
+        }
+        panic!("no fixed point: {made:?}");
     }
 
     fn voters(&self, id: ServerId) -> Vec<ServerId> {
@@ -476,4 +532,45 @@ fn a_removed_leader_leads_until_its_removal_commits_then_steps_down() {
     for id in &rest {
         assert_eq!(&cluster.voters(*id), &rest, "{}", cluster.describe());
     }
+}
+
+/// Catches: a leader that does not keep an odd voter count as members join (an even
+/// count, or learners left unpromoted below the target), and a lost voter that is never
+/// replaced on a real cluster. Members join one at a time and the leader applies the
+/// voter policy after each: 1 voter, 1 and a learner, 3, 3 and a learner, 3 and two
+/// learners. Then a voter goes down: a learner is promoted and the lost voter removed,
+/// and the cluster commits with three voters.
+#[test]
+fn the_leader_keeps_an_odd_voter_count_as_members_join_and_replaces_a_lost_voter() {
+    let policy = VoterPolicy::default();
+    let mut cluster = Cluster::bootstrap();
+    let expected: [(ServerId, &[ServerId], &[ServerId]); 4] = [
+        (S2, &[S1], &[S2]),
+        (S3, &[S1, S2, S3], &[]),
+        (S4, &[S1, S2, S3], &[S4]),
+        (S5, &[S1, S2, S3], &[S4, S5]),
+    ];
+    for (joiner, want_voters, want_learners) in expected {
+        cluster.join(joiner);
+        cluster.keep_voters(&policy);
+        let leader = cluster.leader().expect("a leader");
+        assert_eq!(cluster.voters(leader), want_voters, "after {joiner} joined");
+        assert_eq!(
+            cluster.learners(leader),
+            want_learners,
+            "after {joiner} joined"
+        );
+    }
+
+    let leader = cluster.leader().expect("a leader");
+    let lost = [S1, S2, S3]
+        .into_iter()
+        .find(|&v| v != leader)
+        .expect("a voter other than the leader");
+    let _disk = cluster.down(lost);
+    let changes = cluster.keep_voters(&policy);
+    assert_eq!(changes, [Change::Promote(S4), Change::Remove(lost)]);
+    let leader = cluster.leader().expect("a leader");
+    assert_eq!(cluster.voters(leader).len(), 3, "{}", cluster.describe());
+    assert!(!cluster.nodes[&leader].core().membership().contains(lost));
 }
