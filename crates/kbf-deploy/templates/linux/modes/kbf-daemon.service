@@ -22,10 +22,11 @@ CPUWeight=200
 # No MemorySwapMax=: leases may swap (the host's swapfile is for them); the
 # daemon's swap watch kills a lease that swaps at its own cap.
 Environment=XDG_RUNTIME_DIR=/run/user/@KBF_UID@
+# TODO: --frontend in place of --server and --cas, and --advertise-addr where
+# the bind address is not routable. (No comment goes inside the continued lines
+# below: systemd 239 and older read one into the command line.)
 ExecStart=@KBF_BIN_DIR@/kbf daemon \
     --driver=container \
-# TODO: --frontend in place of --server and --cas, and --advertise-addr where
-# the bind address is not routable.
     --server=https://@KBF_HOST_NAME@:@KBF_WORKER_PORT@ \
     --cas=https://@KBF_HOST_NAME@:@KBF_WORKER_PORT@ \
     --ca-cert=@KBF_ETC@/ca.pem \

@@ -81,6 +81,13 @@ impl UnitFile {
         &self.directives
     }
 
+    /// `drop_in`'s directives after this file's, as systemd applies a drop-in: each of
+    /// its assignments comes after every one of the unit's own, so a single-valued key
+    /// reads the drop-in's and an empty value there resets a list the unit built.
+    pub fn extend(&mut self, drop_in: UnitFile) {
+        self.directives.extend(drop_in.directives);
+    }
+
     /// The value of the last `key=` line in any section.
     pub fn get(&self, key: &str) -> Option<&str> {
         self.last(|d| d.key == key)
@@ -120,6 +127,29 @@ impl UnitFile {
             .find(|d| pick(d))
             .map(|d| d.value.as_str())
     }
+}
+
+/// The line numbers (from 1) of the comment lines inside a continued directive: a `#`
+/// or `;` line after a line ending in `\`, before the directive's last line.
+///
+/// systemd 241 and later skip such a line and go on joining (systemd.syntax(7), "When
+/// a comment line or lines follow a line ending with a backslash, the comment block is
+/// ignored"); 240 skips one only at the start of the line; 239 and older join the
+/// comment into the value, so its words become arguments of an `ExecStart=`.
+pub fn comments_in_continuations(text: &str) -> Vec<usize> {
+    let mut found = Vec::new();
+    let mut continued = false;
+    for (i, raw) in text.lines().enumerate() {
+        let line = raw.trim();
+        if line.starts_with('#') || line.starts_with(';') {
+            if continued {
+                found.push(i + 1);
+            }
+            continue;
+        }
+        continued = line.ends_with('\\');
+    }
+    found
 }
 
 fn directive(section: &str, line: &str, number: usize) -> Result<Directive, UnitError> {

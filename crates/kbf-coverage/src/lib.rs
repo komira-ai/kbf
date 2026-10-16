@@ -10,7 +10,9 @@
 //! existing code as it leaves uncovered. A percentage cannot enforce that, since
 //! partly covered new code can still raise it. CI also fails when either count falls
 //! below the file's, until the file is lowered to match, so the baseline never keeps
-//! slack for a later change to spend. The table CI prints also shows each
+//! slack for a later change to spend: `kbf-coverage tighten` ([`tighten`]) lowers it
+//! from the measured file CI uploads, and refuses any rise, so running it when
+//! coverage improves is required and is not a bypass. The table CI prints also shows each
 //! crate's percentages and gap to 100%, the project's target.
 //!
 //! Percentages are floored to hundredths ([`Percent`]), so one uncovered line in a
@@ -19,6 +21,7 @@
 pub mod baseline;
 pub mod lcov;
 pub mod ratchet;
+pub mod tighten;
 
 use std::fmt;
 
