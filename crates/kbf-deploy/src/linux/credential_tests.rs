@@ -234,7 +234,9 @@ fn on_the_host_each_environment_file_is_read() {
     file(&mut exec, KEY, "AWS_ACCESS_KEY_ID=a\n");
     exec.entries.insert(
         HostPath::new("/etc/kbf/link.env").expect("absolute"),
-        Entry::Other,
+        Entry::Link {
+            target: "/etc/kbf/copy.env".into(),
+        },
     );
     let unit = UnitFile::parse(
         "[Service]\n\
