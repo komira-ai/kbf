@@ -28,7 +28,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use kbf_front::{MetaLog, Stage};
+use kbf_front::{Described, MetaLog, Stage};
 use kbf_log::{FarmBatch, FarmInput, Format, LogCommand};
 use kbf_sched::fence::LEASE_GRACE;
 use kbf_sched::{DaemonInstance, Recovered, RecoveredLease, Request, Requeue};
@@ -43,6 +43,7 @@ use tokio::sync::watch;
 use tonic::Status;
 
 use super::{Farm, FarmMachine, Reported, Sent, Stamp, State, Waiter, process_term};
+use crate::action_usage::Subject;
 use crate::state_store::StateStore;
 
 /// How often a daemon session's row in the store is renewed while the daemon heartbeats:
@@ -551,6 +552,9 @@ impl State {
                 kind: op.request.kind,
                 do_not_cache: op.request.do_not_cache,
                 queued: now,
+                // The command the callers described is not kept: a recovered operation's
+                // `action usage:` line names the empty shape.
+                usage: Subject::of(Described::default()).0,
             });
             self.stages.insert(waiter, watch::channel(Stage::Queued).0);
             if let Some(grant) = &op.lease {

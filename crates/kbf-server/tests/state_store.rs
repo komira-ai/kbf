@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use kbf_caps::NodeCaps;
-use kbf_front::{Cache, Dispatch, Finished, MemoryMetaLog, Stage, Submission};
+use kbf_front::{Cache, Described, Dispatch, Finished, MemoryMetaLog, Stage, Submission};
 use kbf_objstore::MemoryStore;
 use kbf_proto::google::rpc;
 use kbf_proto::worker::{self, ServerMessage, server_message};
@@ -149,6 +149,7 @@ fn submit(farm: &TestFarm, request: Request) -> Result<(), Status> {
     farm.submit(Submission {
         request,
         call: None,
+        described: Described::default(),
     })
     .map(drop)
 }
@@ -564,6 +565,7 @@ async fn the_third_lost_lease_answers_the_caller_with_the_reason() {
         .submit(Submission {
             request: request(1),
             call: None,
+            described: Described::default(),
         })
         .expect("submitted");
     assert_eq!(starts(&mut inbox).len(), 1);
