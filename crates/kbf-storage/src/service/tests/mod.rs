@@ -5,6 +5,7 @@
 //! what a caller of the store itself would see, and what a raw REAPI client sends that
 //! no [`RemoteStorage`] would is refused with the code the protocol names.
 
+mod every_call;
 mod fake;
 mod roles;
 mod stale_map;
