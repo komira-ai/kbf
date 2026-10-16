@@ -6,8 +6,9 @@ use rusqlite::{Connection, Row, Transaction, TransactionBehavior};
 
 use super::SqliteError;
 
-/// The `user_version` of a file this binary creates and reads.
-pub(super) const SCHEMA_VERSION: i64 = 1;
+/// The `user_version` of a file this binary creates and reads (`kbf --version --json`
+/// reports it as `state_schema`).
+pub const SCHEMA_VERSION: i64 = 1;
 
 /// How long a connection waits for a lock another connection holds (a checkpoint).
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);

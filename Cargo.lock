@@ -1430,13 +1430,16 @@ dependencies = [
  "clap",
  "kbf-all-in-one",
  "kbf-cas-conformance",
+ "kbf-daemon",
  "kbf-deploy",
  "kbf-host",
  "kbf-node",
  "kbf-server",
+ "kbf-state",
  "kbf-storage",
  "kbf-transfer",
  "kbf-types",
+ "serde_json",
  "tokio",
  "tonic",
 ]
@@ -1457,8 +1460,11 @@ dependencies = [
  "crc32fast",
  "futures",
  "hex",
+ "kbf-auth",
  "kbf-caps",
  "kbf-front",
+ "kbf-map",
+ "kbf-mapsync",
  "kbf-objstore",
  "kbf-proto",
  "kbf-server",
@@ -1719,6 +1725,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "kbf-mapsync"
+version = "0.1.0"
+dependencies = [
+ "kbf-map",
+ "tokio",
+]
+
+[[package]]
 name = "kbf-mdm"
 version = "0.1.0"
 dependencies = [
@@ -1915,6 +1929,7 @@ dependencies = [
  "kbf-invocation",
  "kbf-log",
  "kbf-map",
+ "kbf-mapsync",
  "kbf-mdm-api",
  "kbf-meta",
  "kbf-objstore",

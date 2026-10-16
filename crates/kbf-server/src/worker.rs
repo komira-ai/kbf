@@ -33,7 +33,12 @@
 //!   the operator API. Otherwise it is kept as the node's newest software status,
 //!   unless a newer stream of the node has registered since;
 //! - after the server ends a stream, nothing more is read from it;
+//! - a `MapRequest` is answered with a `MapUpdate` of the storage map the server holds
+//!   now, when it holds one (the `map_push` module);
 //! - an `Offer` is not read yet.
+//!
+//! A server given a [`MapSource`] ([`WorkerService::with_map`]) names its map in
+//! `Welcome`, and sends a `MapUpdate` each time the source's map changes.
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -42,6 +47,7 @@ use std::time::Duration;
 use futures::{Stream, stream};
 use kbf_caps::NodeCaps;
 use kbf_front::MetaLog;
+use kbf_mapsync::MapSource;
 use kbf_objstore::ObjectStore;
 use kbf_proto::worker::{
     Capability, DaemonMessage, HeartbeatAck, Hello, Phase, ServerMessage, Welcome, daemon_message,
@@ -55,6 +61,7 @@ use tonic::{Request, Response, Status, Streaming};
 
 use crate::farm::{Farm, Outbound, Reported, StreamId};
 use crate::identity::{PeerCert, Peers};
+use crate::map_push;
 
 /// The `kbf.worker.v1` version this server speaks.
 pub const PROTOCOL_VERSION: u32 = 1;
@@ -70,6 +77,18 @@ pub struct WorkerService<M, O> {
     peers: Peers,
     heartbeat_interval: Duration,
     hello_wait: Duration,
+    map: Option<Source>,
+}
+
+/// The map source a service sends from. `MapSource` is not `Debug`, as its implementors
+/// hold state stores and channels.
+#[derive(Clone)]
+struct Source(Arc<dyn MapSource>);
+
+impl std::fmt::Debug for Source {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("MapSource")
+    }
 }
 
 impl<M, O> WorkerService<M, O> {
@@ -87,7 +106,16 @@ impl<M, O> WorkerService<M, O> {
             peers,
             heartbeat_interval,
             hello_wait,
+            map: None,
         }
+    }
+
+    /// The service sending the storage map `map` holds to each daemon: in `Welcome`, and
+    /// in a `MapUpdate` each time it changes.
+    #[must_use]
+    pub fn with_map(mut self, map: Arc<dyn MapSource>) -> Self {
+        self.map = Some(Source(map));
+        self
     }
 }
 
@@ -133,11 +161,18 @@ where
         let worker = WorkerId::new(hello.node_id);
         let instance = DaemonInstance::new(hello.instance_id);
         let predecessor = DaemonInstance::new(hello.predecessor_instance_id);
+        // Subscribed before the map is read: a change between the two is sent again as a
+        // `MapUpdate`, never missed.
+        let changes = self.map.as_ref().map(|source| source.0.changes());
         let welcome = message(server_message::Message::Welcome(Welcome {
             protocol_version: version,
             heartbeat_interval_ms: u64::try_from(self.heartbeat_interval.as_millis())
                 .unwrap_or(u64::MAX),
             epoch: self.farm.lease_epoch(),
+            map: self
+                .map
+                .as_ref()
+                .map(|source| map_push::wire_map(&*source.0)),
         }));
         let (outbound, responses) = mpsc::unbounded_channel();
         let capacity = reported.capacity;
@@ -150,7 +185,12 @@ where
             welcome,
         );
         tracing::info!(%worker, ?capacity, "worker registered");
+        if let Some((Source(source), changes)) = self.map.clone().zip(changes) {
+            // After `register`, which queued the `Welcome`: the first update follows it.
+            tokio::spawn(map_push::push_changes(source, changes, outbound.clone()));
+        }
         let session = Session {
+            map: self.map.clone().map(|source| source.0),
             farm: Arc::clone(&self.farm),
             peers: self.peers.clone(),
             peer,
@@ -167,6 +207,7 @@ where
 
 /// One stream after its first `Hello`.
 struct Session<M, O> {
+    map: Option<Arc<dyn MapSource>>,
     farm: Arc<Farm<M, O>>,
     peers: Peers,
     /// The stream's client certificate (`None` in plain text).
@@ -266,6 +307,12 @@ impl<M: MetaLog, O: ObjectStore + 'static> Session<M, O> {
                 let _ = farm.node_status(worker, stream, status);
                 None
             }
+            Some(daemon_message::Message::MapRequest(_)) => {
+                self.peers
+                    .admit(self.peer.as_ref(), worker.as_str())
+                    .await?;
+                self.map.as_deref().map(map_push::update)
+            }
             Some(daemon_message::Message::Offer(_)) => None,
             None => {
                 tracing::warn!(%worker, "an empty daemon message ignored");
@@ -276,7 +323,7 @@ impl<M: MetaLog, O: ObjectStore + 'static> Session<M, O> {
     }
 }
 
-fn message(message: server_message::Message) -> ServerMessage {
+pub(crate) fn message(message: server_message::Message) -> ServerMessage {
     ServerMessage {
         message: Some(message),
     }
@@ -372,4 +419,29 @@ fn entry(capabilities: &[Capability], key: &str) -> Result<Option<u64>, String> 
         })
     })
     .transpose()
+}
+
+#[cfg(test)]
+mod tests {
+    use kbf_map::{Map, Member, MemberId, MemberState, Rule};
+    use kbf_mapsync::FakeMapSource;
+
+    use super::*;
+
+    /// Catches a `Debug` of the service that prints the map source's state (a state
+    /// store handle, a channel) or fails to compile when a source has no `Debug`: the
+    /// source is named, not printed.
+    #[test]
+    fn a_map_source_is_named_not_printed() {
+        let member = Member {
+            id: MemberId(1),
+            addr: "127.0.0.1:1".to_owned(),
+            zone: String::new(),
+            weight: 1,
+            state: MemberState::Active,
+        };
+        let map = Map::new(1, vec![member], Rule::Rendezvous, 1, 1, Vec::new()).expect("map");
+        let source = Source(Arc::new(FakeMapSource::new(map)));
+        assert_eq!(format!("{source:?}"), "MapSource");
+    }
 }

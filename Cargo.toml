@@ -173,6 +173,7 @@ kbf-invocation = { path = "crates/kbf-invocation" }
 kbf-it = { path = "crates/kbf-it" }
 kbf-log = { path = "crates/kbf-log" }
 kbf-map = { path = "crates/kbf-map" }
+kbf-mapsync = { path = "crates/kbf-mapsync" }
 kbf-mac-session = { path = "crates/kbf-mac-session" }
 kbf-mdm = { path = "crates/kbf-mdm" }
 kbf-mdm-api = { path = "crates/kbf-mdm-api" }

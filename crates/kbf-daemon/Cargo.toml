@@ -21,6 +21,8 @@ crc32fast.workspace = true
 futures.workspace = true
 hex.workspace = true
 kbf-caps.workspace = true
+kbf-map.workspace = true
+kbf-mapsync.workspace = true
 kbf-proto.workspace = true
 # The node's one cache (`kbf_storage::local_cache`), which the input cache shares with
 # local storage on a node that runs both.
@@ -41,6 +43,7 @@ tonic = { workspace = true, features = ["tls-ring"] }
 tracing.workspace = true
 
 [dev-dependencies]
+kbf-auth.workspace = true
 kbf-front.workspace = true
 kbf-objstore.workspace = true
 kbf-server.workspace = true
