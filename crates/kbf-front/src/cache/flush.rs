@@ -68,9 +68,11 @@ pub const FLUSHES_PER_ROUND: usize = 4;
 /// Oldest first among the objects whose waits were all taken before them; an object
 /// that waits, directly or through others, for one not in `waits` (open, waiting out a
 /// backoff, or past this round) is not taken. When none is ready and some object waits
-/// only on objects in `waits` that wait only on each other (a cycle: two entries whose
-/// results and closures were staged crosswise), the oldest such object is taken first,
-/// so a cycle never stalls the flusher, and the cycle is logged.
+/// only on objects in `waits` that wait only on each other, there is a cycle (entries
+/// whose results and closures were staged crosswise): it is broken at its oldest member,
+/// so a cycle never stalls the flusher, and the cycle is logged. An object that only
+/// waits on a cycle, without being in it, is never where the break is: it still follows
+/// every object it waits for.
 fn flush_order(
     waits: &BTreeMap<ObjectId, BTreeSet<ObjectId>>,
     most: usize,
@@ -86,11 +88,10 @@ fn flush_order(
             Some(next) => next,
             None => {
                 let blocked = blocked_outside(waits, &taken);
-                let cycle = waits
-                    .iter()
-                    .find(|(object, _)| open(object) && !blocked.contains(*object));
-                let Some(next) = cycle else { break };
-                tracing::warn!(object = %next.0, waits = ?next.1, "staged objects wait for each other's flush; flushing the oldest first");
+                let Some((cycle, next)) = cycle_among(waits, &taken, &blocked) else {
+                    break;
+                };
+                tracing::warn!(object = %next.0, ?cycle, "staged objects wait for each other's flush; flushing the cycle's oldest first");
                 next
             }
         };
@@ -99,6 +100,45 @@ fn flush_order(
         order.push((*object, first));
     }
     order
+}
+
+/// An object and the objects its flush waits for, an entry of a round's waits.
+type Waiting<'w> = (&'w ObjectId, &'w BTreeSet<ObjectId>);
+
+/// A cycle among the objects of `waits` neither `taken` nor `blocked`, when none of them
+/// is ready (each waits for at least one other of them): its objects in the order they
+/// were walked, and the entry of its oldest. `None` when there are no such objects.
+///
+/// The walk starts at the oldest such object and follows, from each, its oldest wait
+/// among them until it meets an object it walked: the objects from there on are the
+/// cycle. An object not blocked waits only for objects taken or in `waits` and not
+/// blocked, and one not ready waits for one not taken, so the walk never ends short of
+/// a cycle; the objects before the cycle only wait on it, and are never chosen.
+fn cycle_among<'w>(
+    waits: &'w BTreeMap<ObjectId, BTreeSet<ObjectId>>,
+    taken: &BTreeSet<ObjectId>,
+    blocked: &BTreeSet<ObjectId>,
+) -> Option<(Vec<ObjectId>, Waiting<'w>)> {
+    let open = |object: &ObjectId| !taken.contains(object) && !blocked.contains(object);
+    let first = waits.iter().find(|(object, _)| open(object));
+    let walk = std::iter::successors(first, |(_, wait)| {
+        let next = wait.iter().find(|w| open(w))?;
+        waits.get_key_value(next)
+    });
+    let mut walked: BTreeMap<ObjectId, usize> = BTreeMap::new();
+    let mut path: Vec<Waiting<'_>> = Vec::new();
+    for entry in walk {
+        if let Some(&from) = walked.get(entry.0) {
+            let cycle = path.split_off(from);
+            let oldest = cycle
+                .iter()
+                .fold(entry, |a, &b| if b.0 < a.0 { b } else { a });
+            return Some((cycle.iter().map(|(object, _)| **object).collect(), oldest));
+        }
+        walked.insert(*entry.0, path.len());
+        path.push(entry);
+    }
+    None
 }
 
 /// The objects of `waits` not taken that wait, directly or through others in `waits`,
@@ -583,12 +623,13 @@ mod tests {
     /// Catches a cycle broken at an object that only waits on a cycle without being in
     /// it: object 1 holds a result whose closure is in object 2, and 2 and 3 were staged
     /// crosswise. Breaking at 1 would PUT its result before its closure; the break is at
-    /// the cycle's oldest object, 2, and 1 follows it.
+    /// the cycle's oldest object, 2, and 1 follows it (before 3: once 2 is taken, 1 is
+    /// ready and the older).
     #[test]
     fn a_cycle_is_broken_inside_it_not_at_an_object_waiting_on_it() {
         assert_eq!(
             order(&[(1, &[2]), (2, &[3]), (3, &[2])], 4),
-            [(2, vec![]), (3, vec![2]), (1, vec![2])]
+            [(2, vec![]), (1, vec![2]), (3, vec![2])]
         );
     }
 
