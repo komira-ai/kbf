@@ -175,6 +175,69 @@ async fn kill_at_the_largest_node(cell: Cell) {
     );
 }
 
+/// Catches (review of ui-data 9): a run killed under node memory pressure recorded
+/// without its booking, on a requeued attempt or on the one that ends the operation
+/// (plant: drop `| Failure::NodeMemoryPressure` from the `killed` match in
+/// `take_report`), or given a cap (a pressure kill has none). Default retention: the
+/// last kill's booking is read from the scheduler's operation; see the twin below.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_node_pressure_kill_keeps_its_booking() {
+    node_pressure_kills(Cell::start().await).await;
+}
+
+/// Catches (review of ui-data 9): as above with `--finished-retention-secs 0`, where
+/// the last kill's booking must come from the operation's answer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn with_no_finished_retention_a_node_pressure_kill_keeps_its_booking() {
+    let cell = Cell::start_with(kbf_sched::UNSERVABLE_WAIT, Duration::ZERO).await;
+    node_pressure_kills(cell).await;
+}
+
+/// An action killed under node pressure three times at its 1 GiB booking, which uses
+/// up its reruns, and what its row keeps of each kill.
+async fn node_pressure_kills(cell: Cell) {
+    let mut daemon = cell.daemon("node-p", 4, 2).await;
+    let job = Job::new("crowded", &[]);
+    upload(&cell, BUILD, &job.blobs()).await;
+    let mut ops = execute(&cell, BUILD, &job.action).await;
+    for _ in 0..3 {
+        let start = daemon.start().await;
+        let report = worker::Result {
+            memory_kill: MemoryKill::NodePressure as i32,
+            ..failed(start.lease_id, Code::ResourceExhausted)
+        };
+        assert!(daemon.report(report).await.accepted);
+    }
+    let status = crate::support::response(&done(&mut ops).await)
+        .status
+        .expect("a status");
+    assert_eq!(status.code, Code::Internal as i32, "{status:?}");
+
+    let inv = record(&cell, BUILD).await;
+    let [row] = inv.rows() else {
+        panic!("one row");
+    };
+    let [first, second, last] = row.attempts.as_slice() else {
+        panic!("three attempts: {:?}", row.attempts);
+    };
+    for requeued in [first, second] {
+        assert_eq!(
+            requeued.end,
+            Some(AttemptEnd::Requeued(RequeueReason::NodeMemoryPressure))
+        );
+    }
+    assert!(matches!(
+        last.end,
+        Some(AttemptEnd::Failed(Failure::NodeMemoryPressure, _))
+    ));
+    for (n, attempt) in [first, second, last].into_iter().enumerate() {
+        let run = attempt.run.as_deref().expect("a run");
+        assert_eq!(run.booked_memory_bytes, Some(GIB), "attempt {n}");
+        assert_eq!(run.cap_bytes, None, "attempt {n}");
+        assert_eq!(attempt.memory_kill(), Some(Kill::NodePressure), "attempt {n}");
+    }
+}
+
 /// Catches (ui-data 9, U1 red): a timed-out run's logs dropped from its row (only a
 /// run's stored result was listed), or the partial result listed as a stored one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

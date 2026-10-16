@@ -363,6 +363,39 @@ async fn actions_sort_longest_first_and_page_on() {
     server.stop().await;
 }
 
+/// Catches (review of ui-data 6.2): a sorted page cut to its first rows in record
+/// order before it is sorted (`select_nth_unstable_by` dropped from `sorted`), which
+/// leaves out the longest rows when they come late in the record: here each row is
+/// longer than the one before, so that cut lists 20 ms first at page size 1 and 30, 20
+/// at page size 2.
+#[tokio::test]
+async fn a_sorted_page_finds_the_longest_rows_late_in_the_record() {
+    let server = Server::with(OPEN);
+    let rows = [digest(1), digest(2), digest(3), digest(4)];
+    let mut events = Vec::new();
+    for (op, row) in (1_u64..).zip(rows) {
+        events.extend(one_run("t", row, op, (0, 10_000 * op), executed(0, 1_000)));
+    }
+    server.feed(events).await;
+    let longest_first: Vec<String> = rows.iter().rev().map(text).collect();
+
+    let base = "/v1/invocations/t/actions?sort=wall_ms";
+    for size in [1, 2] {
+        let mut walked = Vec::new();
+        let mut page = server.ok(&format!("{base}&page_size={size}")).await;
+        assert_eq!(listed(&page)[0], longest_first[0], "page size {size}");
+        loop {
+            walked.extend(listed(&page));
+            let Some(next) = page["next_page"].as_str().map(str::to_owned) else {
+                break;
+            };
+            page = server.ok(&next).await;
+        }
+        assert_eq!(walked, longest_first, "page size {size}");
+    }
+    server.stop().await;
+}
+
 /// Catches (ui-data 9, U1 red, and 6.2): `?requeue_reason=out_of_memory` missing an
 /// action whose kill was run again and ended OK, or keeping one requeued for another
 /// reason; `?memory_kill=` keeping the wrong rows (`none` keeping a killed row, a
