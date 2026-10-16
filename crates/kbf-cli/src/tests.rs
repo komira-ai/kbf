@@ -58,8 +58,7 @@ fn error(argv: Vec<String>) -> String {
     refusal(argv).to_string()
 }
 
-/// Catches a mode wired to the wrong flags or entry, an unbuilt mode that parses as a
-/// built one, or a clap command that does not build (a name held twice panics in
+/// Catches a mode wired to the wrong flags or entry, or a clap command that does not build (a name held twice panics in
 /// `debug_assert`).
 #[test]
 fn each_mode_parses_its_flags() {
@@ -539,27 +538,13 @@ fn a_refusal_comes_before_a_missing_required_flag() {
     );
 }
 
-/// Catches an unbuilt mode that runs something, exits other than 2, prints more than
-/// one line, or does not name the mode.
-#[test]
-fn an_unbuilt_mode_exits_2_with_one_line() {
-    assert_eq!(
-        names::not_built_line("storage-and-daemon"),
-        "kbf storage-and-daemon: mode not built yet"
-    );
-    let inv = Invocation::NotBuilt {
-        mode: "storage-and-daemon",
-    };
-    assert_eq!(run(&inv), ExitCode::from(2));
-}
-
 fn check(argv: &[&str]) -> Result<(), String> {
     let args: Vec<std::ffi::OsString> = argv.iter().map(Into::into).collect();
     check_args(&args).map_err(|e| e.to_string())
 }
 
 /// Catches `check_args` reading the wrong words (the program's name or `check-args`
-/// itself as the mode), passing a mode not built yet or `--help`, and refusing a built
+/// itself as the mode), passing `--help`, and refusing a built
 /// mode's own command line. The binary's exit codes are tests/binary.rs's.
 #[test]
 fn check_args_parses_the_words_after_check_args() {
@@ -597,8 +582,6 @@ fn check_args_parses_the_words_after_check_args() {
     assert_eq!(check(&converged), Ok(()));
     let e = check(&["kbf", CHECK_ARGS, names::STORAGE_AND_DAEMON]).expect_err("refused");
     assert!(e.contains("required arguments were not provided"), "{e}");
-    let e = check(&["kbf", CHECK_ARGS, names::FRONTEND]).expect_err("refused");
-    assert!(e.contains("kbf frontend: mode not built yet"), "{e}");
     for word in ["--help", "--version"] {
         let e = check(&["kbf", CHECK_ARGS, word]).expect_err("refused");
         assert!(e.contains("the mode would not start"), "{word}: {e}");

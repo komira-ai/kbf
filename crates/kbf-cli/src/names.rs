@@ -2,8 +2,7 @@
 //!
 //! Every place in this crate that spells a mode reads it from here: the clap commands,
 //! the dispatch, the help and the tests. The names follow the arch-v2 design; renaming
-//! a mode is changing its constant, and moving a mode from "not built" to an entry
-//! point is changing its row of [`MODES`].
+//! a mode is changing its constant.
 
 /// The frontend (the REAPI front end).
 pub const FRONTEND: &str = "frontend";
@@ -34,8 +33,6 @@ pub enum Entry {
     /// The frontend: `kbf_server::frontend::run`, `kbf-server`'s listener, scheduler and
     /// log flags and its own storage flags.
     Frontend,
-    /// Not built yet: the mode exits 2 saying so.
-    NotBuilt,
 }
 
 /// A mode and what it runs.
@@ -49,7 +46,6 @@ pub struct Mode {
 
 /// Every mode, in help order: exactly five.
 pub const MODES: [Mode; 5] = [
-    // Every mode has an entry point; the `NotBuilt` entry is for a mode a later change adds.
     Mode {
         name: FRONTEND,
         entry: Entry::Frontend,
@@ -71,9 +67,3 @@ pub const MODES: [Mode; 5] = [
         entry: Entry::AllInOne,
     },
 ];
-
-/// The one line an unbuilt mode prints to stderr before it exits 2.
-#[must_use]
-pub fn not_built_line(mode: &str) -> String {
-    format!("kbf {mode}: mode not built yet")
-}

@@ -3,7 +3,6 @@
 //! for the mode the unit is named after, and kbf-deploy renders exactly kbf's modes;
 //! and `check-units --mode` runs this build's `kbf check-args` on a built mode's flags.
 
-use kbf_cli::names::{Entry, MODES};
 use kbf_cli::{Invocation, parse_from};
 use kbf_deploy::linux::modes::{TRUSTED_NOTE, render};
 use kbf_deploy::linux::{LinuxConfig, Mode, check_mode_unit};
@@ -93,10 +92,6 @@ fn each_rendered_mode_unit_parses_with_kbfs_own_parser() {
                 );
                 assert!(format!("{:?}", flags.daemon).contains("/etc/kbf/node.pem"));
             }
-            Invocation::NotBuilt { mode: m, .. } => {
-                assert_eq!(m, mode.name());
-                assert_eq!(argv.len(), 2, "kbf {mode} is not built: {argv:?}");
-            }
         }
     }
 }
@@ -111,8 +106,8 @@ fn kbf_deploy_renders_exactly_the_modes_kbf_takes() {
     let help: Vec<&str> = kbf.get_subcommands().map(clap::Command::get_name).collect();
     let deploy: Vec<&str> = Mode::ALL.iter().map(|m| m.name()).collect();
     assert_eq!(deploy, help);
-    for (mode, row) in Mode::ALL.iter().zip(MODES) {
-        let built = !matches!(row.entry, Entry::NotBuilt) && !UNITS_BEHIND.contains(mode);
+    for mode in Mode::ALL.iter() {
+        let built = !UNITS_BEHIND.contains(mode);
         assert_eq!(mode.is_built(), built, "{mode}");
     }
 }
