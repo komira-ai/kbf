@@ -288,6 +288,60 @@ pub(super) async fn serve_routes(
     addr
 }
 
+/// The calls a spied server received, in order: which service, and the map-generation
+/// header the call carried.
+pub(super) type Spied = Arc<Mutex<Vec<(&'static str, Option<String>)>>>;
+
+/// An interceptor that records `service` and the header of a call before its handler
+/// runs, and lets it through.
+fn spy(
+    service: &'static str,
+    seen: &Spied,
+) -> impl FnMut(Request<()>) -> Result<Request<()>, Status> + Clone + use<> {
+    let seen = Arc::clone(seen);
+    move |request: Request<()>| {
+        let header = request
+            .metadata()
+            .get(MAP_GENERATION_HEADER)
+            .map(|v| v.to_str().expect("ASCII").to_owned());
+        seen.lock().expect("lock").push((service, header));
+        Ok(request)
+    }
+}
+
+/// The real service over `mem` on a loopback port, each of its four services behind an
+/// interceptor that records what the call carried (the real handlers do not read the
+/// map generation, so this is where a test sees that it arrived).
+pub(super) async fn serve_spied(mem: &Arc<Mem>) -> (Spied, Channel) {
+    use kbf_proto::reapi::content_addressable_storage_server::ContentAddressableStorageServer;
+    use kbf_proto::worker::segments_server::SegmentsServer;
+    use tonic::service::interceptor::InterceptedService;
+    let seen = Spied::default();
+    let storage: Arc<dyn Storage> = Arc::clone(mem) as Arc<dyn Storage>;
+    let config = Config {
+        write_bytes_in_flight: 1 << 30,
+    };
+    let service = Arc::new(StorageService::new(storage, Admission::Open, config));
+    let routes = tonic::service::Routes::new(InterceptedService::new(
+        ContentAddressableStorageServer::from_arc(Arc::clone(&service)),
+        spy("cas", &seen),
+    ))
+    .add_service(InterceptedService::new(
+        ByteStreamServer::from_arc(Arc::clone(&service)),
+        spy("bytestream", &seen),
+    ))
+    .add_service(InterceptedService::new(
+        SegmentsServer::from_arc(Arc::clone(&service)),
+        spy("segments", &seen),
+    ))
+    .add_service(InterceptedService::new(
+        ActionStoreServer::from_arc(service),
+        spy("actions", &seen),
+    ));
+    let addr = serve_routes(routes, None).await;
+    (seen, connect(addr).await)
+}
+
 /// A service over `mem`, serving on a loopback port in plain text.
 pub(super) async fn serve(mem: &Arc<Mem>, write_bytes_in_flight: u32) -> Channel {
     let storage: Arc<dyn Storage> = Arc::clone(mem) as Arc<dyn Storage>;

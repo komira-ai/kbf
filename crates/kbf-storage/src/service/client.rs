@@ -38,7 +38,8 @@ const WRITE_CHUNK_BYTES: usize = 1 << 20;
 #[derive(Clone, Debug)]
 pub struct RemoteStorage {
     channel: Channel,
-    generation: u64,
+    /// Shared by every clone (and so by the `Segments` handle), read once per call.
+    generation: Arc<AtomicU64>,
     uploads: Arc<AtomicU64>,
 }
 
@@ -54,17 +55,35 @@ impl RemoteStorage {
     pub fn new(channel: Channel, generation: u64) -> Self {
         Self {
             channel,
-            generation,
+            generation: Arc::new(AtomicU64::new(generation)),
             uploads: Arc::new(AtomicU64::new(0)),
         }
     }
 
+    /// Tags every call made from now on with map `generation`, on this handle and on
+    /// every clone of it (a map update reaches the one the caller holds). A call already
+    /// begun keeps the generation it read.
+    pub fn set_map_generation(&self, generation: u64) {
+        self.generation.store(generation, Ordering::Relaxed);
+    }
+
+    /// The generation a call made now carries.
+    fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Relaxed)
+    }
+
     /// `message` as a request carrying the map generation.
     fn tag<T>(&self, message: T) -> Request<T> {
+        self.tag_at(message, self.generation())
+    }
+
+    /// `message` as a request carrying `generation`: for a call whose message carries it
+    /// too, so the field and the header are one read of the generation.
+    fn tag_at<T>(&self, message: T, generation: u64) -> Request<T> {
         let mut request = Request::new(message);
         request
             .metadata_mut()
-            .insert(MAP_GENERATION_HEADER, MetadataValue::from(self.generation));
+            .insert(MAP_GENERATION_HEADER, MetadataValue::from(generation));
         request
     }
 
@@ -261,11 +280,16 @@ impl Storage for RemoteStorage {
         action: &'a Digest,
     ) -> Answer<'a, Option<(Digest, ActionResult)>> {
         Box::pin(async move {
+            let generation = self.generation();
             let request = GetRequest {
-                map_generation: self.generation,
+                map_generation: generation,
                 action: Some(wire::to_proto(action)),
             };
-            let response = self.actions().get(self.tag(request)).await.map_err(other)?;
+            let response = self
+                .actions()
+                .get(self.tag_at(request, generation))
+                .await
+                .map_err(other)?;
             let Some(entry) = response.into_inner().entry else {
                 return Ok(None);
             };
@@ -277,13 +301,14 @@ impl Storage for RemoteStorage {
 
     fn prepare_action_result<'a>(&'a self, result: &'a ActionResult) -> Answer<'a, ActionRecord> {
         Box::pin(async move {
+            let generation = self.generation();
             let request = PrepareRequest {
-                map_generation: self.generation,
+                map_generation: generation,
                 result: Some(result.clone()),
             };
             let response = self
                 .actions()
-                .prepare(self.tag(request))
+                .prepare(self.tag_at(request, generation))
                 .await
                 .map_err(other)?;
             match response.into_inner().outcome {
@@ -313,15 +338,16 @@ impl Storage for RemoteStorage {
                 Role::Daemon => Writer::Daemon,
                 Role::Client => Writer::Client,
             };
+            let generation = self.generation();
             let request = CommitRequest {
-                map_generation: self.generation,
+                map_generation: generation,
                 action: Some(wire::to_proto(&action)),
                 record: Some(record_to_proto(&record)),
                 writer: writer as i32,
             };
             let response = self
                 .actions()
-                .commit(self.tag(request))
+                .commit(self.tag_at(request, generation))
                 .await
                 .map_err(other)?;
             match response.into_inner().refused {

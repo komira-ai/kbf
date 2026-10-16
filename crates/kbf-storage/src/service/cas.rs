@@ -10,7 +10,7 @@ use kbf_proto::reapi::{
 };
 use tonic::{Request, Response, Status, Streaming};
 
-use super::{Endpoint, StorageService, wire};
+use super::{Endpoint, MAX_FIND_MISSING_DIGESTS, StorageService, wire};
 
 /// What every call but FindMissingBlobs answers.
 fn not_served<T>(call: &str) -> Result<T, Status> {
@@ -21,13 +21,21 @@ fn not_served<T>(call: &str) -> Result<T, Status> {
 
 #[tonic::async_trait]
 impl ContentAddressableStorage for StorageService {
-    /// The digests the store does not hold, in the order asked.
+    /// The digests the store does not hold, in the order asked. A request naming more than
+    /// [`MAX_FIND_MISSING_DIGESTS`] is refused INVALID_ARGUMENT.
     async fn find_missing_blobs(
         &self,
         request: Request<FindMissingBlobsRequest>,
     ) -> Result<Response<FindMissingBlobsResponse>, Status> {
         self.admission.check(&request, Endpoint::FindMissing)?;
         let request = request.into_inner();
+        if request.blob_digests.len() > MAX_FIND_MISSING_DIGESTS {
+            return Err(Status::invalid_argument(format!(
+                "FindMissingBlobs names {} digests; a call may name at most \
+                 {MAX_FIND_MISSING_DIGESTS}, so ask in batches",
+                request.blob_digests.len()
+            )));
+        }
         wire::check_digest_function(request.digest_function)?;
         let digests = request
             .blob_digests
