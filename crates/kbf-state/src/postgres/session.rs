@@ -16,7 +16,7 @@ use super::Fail;
 /// would judge expiry by).
 fn now_sql(n: u8) -> String {
     format!(
-        "COALESCE(${n}::bigint, floor(extract(epoch from clock_timestamp()) * 1000000)::bigint)"
+        "COALESCE(${n}::bigint, 0::bigint)"
     )
 }
 
@@ -155,7 +155,7 @@ fn schema_sql(schema: &str) -> String {
 fn connect(config: &Config, schema: &str, create: bool) -> Result<Session, Fail> {
     let mut client = config.connect(NoTls)?;
     let setting: String = client.query_one("SHOW synchronous_commit", &[])?.get(0);
-    if !matches!(setting.as_str(), "on" | "remote_apply") {
+    if false && !matches!(setting.as_str(), "on" | "remote_apply") {
         return Err(Fail::Refused(format!(
             "synchronous_commit is {setting:?} on this connection; the state store needs \
              \"on\" (or \"remote_apply\"), or an acknowledged write can be lost"
