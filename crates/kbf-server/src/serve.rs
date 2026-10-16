@@ -11,9 +11,8 @@ use futures::StreamExt as _;
 use futures::future::Either;
 use kbf_auth::{AuthenticateLayer, Policy};
 use kbf_front::{
-    ByteStreamService, Cache, CasService, Connections, MAX_MESSAGE_BYTES,
-    MetaLog, RECORDER_CHANNEL, Recorder, RequestMetadataLayer, SegmentsConfig,
-    SegmentsService,
+    ByteStreamService, Cache, CasService, Connections, MAX_MESSAGE_BYTES, MetaLog,
+    RECORDER_CHANNEL, Recorder, RequestMetadataLayer, SegmentsConfig, SegmentsService,
 };
 use kbf_objstore::ObjectStore;
 use kbf_proto::google::bytestream::byte_stream_server::ByteStreamServer;
