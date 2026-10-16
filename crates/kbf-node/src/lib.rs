@@ -56,6 +56,8 @@ use kbf_threads::disk::Statvfs;
 use kbf_transfer::{Cas, Transfers};
 use tokio::signal::unix::{Signal, SignalKind, signal};
 
+pub use run::run;
+
 /// The `kbf-daemon` command line.
 #[derive(Clone, Debug, clap::Parser)]
 #[command(name = "kbf-daemon", version = DAEMON_VERSION, about = "The kbf worker daemon.")]
@@ -931,6 +933,7 @@ mod container {
 
 mod data_dir;
 mod instance;
+mod run;
 mod transfer;
 mod whole_machine;
 

@@ -1384,6 +1384,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "kbf-cli"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "kbf-all-in-one",
+ "kbf-node",
+ "kbf-server",
+]
+
+[[package]]
 name = "kbf-coverage"
 version = "0.1.0"
 dependencies = [
