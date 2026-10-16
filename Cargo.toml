@@ -148,6 +148,7 @@ tonic-prost-build = "0.14.6"
 # The REAPI authentication layer (kbf-auth). Already in the tree through tonic.
 tower-layer = "0.3.3"
 tracing = "0.1.44"
+tracing-core = "0.1.36"
 tracing-subscriber = "0.3.23"
 # HTTPS downloads for `cargo xtask fetch`, over the rustls (ring) above: no provider
 # feature, so neither aws-lc-rs nor the bundled webpki roots (CDLA licence) come in;
