@@ -40,7 +40,8 @@ struct CheckArgs {
     /// The lcov tracefile `cargo llvm-cov --lcov` wrote.
     #[arg(long)]
     lcov: PathBuf,
-    /// The workspace root, spelled as the tracefile's source paths begin.
+    /// The workspace root: absolute, spelled as the tracefile's source paths begin, or
+    /// relative to the working directory.
     #[arg(long)]
     root: PathBuf,
     /// The baseline file to check against.
@@ -134,7 +135,20 @@ fn workspace(root: &Path) -> Result<BTreeSet<String>, Box<dyn Error>> {
 /// The workspace's crates and each one's coverage in the tracefile `lcov`.
 fn measure(lcov: &Path, root: &Path) -> Result<BTreeMap<String, CrateCoverage>, Box<dyn Error>> {
     let files = lcov::parse(&read(lcov)?).map_err(|e| format!("{}: {e}", lcov.display()))?;
-    Ok(ratchet::by_crate(root, &workspace(root)?, &files)?)
+    let sources = source_root(root)?;
+    Ok(ratchet::by_crate(&sources, &workspace(root)?, &files)?)
+}
+
+/// `root` as the tracefile spells its source paths. `cargo llvm-cov` writes them
+/// absolute, under the directory cargo found the workspace in (the process's
+/// working directory, symbolic links resolved), so a relative `--root` (`.`, `..`)
+/// is resolved the same way. An absolute one is taken as written, as CI passes it.
+fn source_root(root: &Path) -> Result<PathBuf, Box<dyn Error>> {
+    if root.is_absolute() {
+        return Ok(root.to_path_buf());
+    }
+    std::fs::canonicalize(root)
+        .map_err(|e| format!("resolve --root {}: {e}", root.display()).into())
 }
 
 fn entries(measured: &BTreeMap<String, CrateCoverage>) -> Baseline {

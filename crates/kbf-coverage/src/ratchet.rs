@@ -258,9 +258,11 @@ pub fn rows(measured: &BTreeMap<String, CrateCoverage>, baseline: &Baseline) -> 
         .collect()
 }
 
-/// `hit/found`, the percentage, the gap to 100% and the missed count for one metric.
+/// `hit/found`, the percentage, the gap to 100% and the missed count for one metric;
+/// `-` in all four where nothing was measured (no crate, or no item found), as the
+/// baseline writes it.
 fn cells(c: Option<Counts>) -> [String; 4] {
-    let Some(c) = c else {
+    let Some(c) = c.filter(|c| c.found() > 0) else {
         return ["-".into(), "-".into(), "-".into(), "-".into()];
     };
     let p = c.percent();
@@ -538,7 +540,8 @@ mod tests {
     }
 
     /// Catches: a table that misplaces a column, hides the gap to 100% or the missed
-    /// counts, totals the wrong rows or prints PASS while a crate fails.
+    /// counts, totals the wrong rows, prints PASS while a crate fails, or prints `0/0`
+    /// (a count) for a metric with nothing measured, where the baseline writes `-`.
     #[test]
     fn renders_the_table() {
         let rows = [
@@ -571,7 +574,7 @@ mod tests {
         assert!(pass.ends_with("\ncoverage ratchet: PASS\n"), "{pass}");
         let empty = render(&[row(Some(CrateCoverage::default()), None)]);
         assert!(
-            empty.contains("| k | 0/0 | - | - | - | 0/0 | - | - | - | - | NOT IN BASELINE |"),
+            empty.contains("| k | - | - | - | - | - | - | - | - | - | NOT IN BASELINE |"),
             "{empty}"
         );
     }

@@ -563,6 +563,19 @@ const MEASURED_GRID: [Option<(Option<u64>, Option<u64>)>; 9] = [
 /// refuses some crate's transition; an accepted plan must write exactly the
 /// measurement; and the check's advice must offer the `tighten` command exactly when
 /// `tighten` would accept, so it never tells the user to run a refused change.
+///
+/// Not reached here: the workspace is always exactly the measured crates, so a
+/// workspace crate the measurement lacks, a measured crate outside the workspace and a
+/// recorded crate removed while its `Cargo.toml` remains are never planned
+/// (`refuses_other_crate_set_differences`,
+/// `removes_a_crate_only_when_it_is_gone_from_the_workspace`); the fixed crate keeps
+/// a recorded crate in every cell, so the root guard never fires
+/// (`a_root_without_any_recorded_crate_is_refused`); and only accept or refuse is
+/// compared, not which refusal or its text (`refuses_every_kind_of_rise`,
+/// `no_data_where_the_file_has_a_count_is_refused_unless_only_branches_vanished`,
+/// `adds_a_new_crate_only_when_it_arrives_covered`,
+/// `a_branch_count_to_no_data_is_refused_even_with_the_lines_measured`,
+/// `tree_advice_follows_the_refusals_and_the_input`).
 #[test]
 fn tighten_and_the_check_advice_agree_with_the_rule_on_every_cell() {
     let entry = |v: (Option<u64>, Option<u64>)| e(v.0, v.1);

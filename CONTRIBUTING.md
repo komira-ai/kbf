@@ -148,7 +148,8 @@ a test target. When a crate legitimately has nothing to measure (all of its
 code removed, or an empty skeleton), put `-` in its line by hand in a reviewed
 pull request; the refusal names this. That is the one hand edit of
 `coverage-baseline`.
-It keeps the file's comments and order, prints each change, and replaces the
+
+`tighten` keeps the file's comments and order, prints each change, and replaces the
 file whole. Running the whole command again downloads into another new directory
 and changes nothing.
 
@@ -164,8 +165,25 @@ Without CI, `tighten --lcov <tracefile> --root .` measures from a local
 `cargo llvm-cov --branch --lcov` run instead. That run must use the coverage
 job's toolchain and flags (see `.github/workflows/ci.yml`): another toolchain
 can count fewer items missed, and the file it writes then fails CI as more
-missed than recorded, so the mistake fails safe but costs a round trip. Do not
+missed than recorded, so the mistake fails safe but costs a round trip. A
+relative `--root` is resolved against the working directory. Do not
 edit `coverage-baseline` by hand, except for the unmeasured crate above.
+
+The ratchet does not see code that the report leaves out, and `tighten` cannot
+tell such code from code that is gone; reviewers hold these until repository
+lints refuse them:
+
+- A crate moved outside `crates/` (listed in the workspace's `exclude` and
+  kept as a `path` dependency) is no longer a workspace crate: it stops being
+  measured, and `tighten` removes its line as a deleted crate. The workspace
+  has no `exclude` today.
+- `cargo llvm-cov`'s default pattern ignores every file in a directory named
+  `tests`, `examples` or `benches`, wherever it sits: a module directory
+  `src/**/tests/`, or a file in such a directory that `src` includes (for
+  example with `#[path]`), is not measured.
+- A binary target with `test = false`, `#[cfg(not(coverage))]` and
+  `#[coverage(off)]` keep code out of the report while the crate's line stays
+  a number.
 
 Changes under `.github/workflows/` will need a review from the code owners
 listed in [.github/CODEOWNERS](.github/CODEOWNERS). That rule is a placeholder

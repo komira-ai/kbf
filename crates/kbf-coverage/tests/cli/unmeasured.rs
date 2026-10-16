@@ -51,7 +51,7 @@ fn a_crate_no_test_binary_instruments_is_not_lowered_to_no_data() {
     let out = stdout(&o);
     assert!(
         out.contains(
-            "| notest | 0/0 | - | - | - | 0/0 | - | - | - | 0 / 0 | MORE MISSED THAN BASELINE (lines, branches) |"
+            "| notest | - | - | - | - | - | - | - | - | 0 / 0 | MORE MISSED THAN BASELINE (lines, branches) |"
         ),
         "{out}"
     );

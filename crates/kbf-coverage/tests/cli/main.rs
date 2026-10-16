@@ -14,6 +14,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+mod relative_root;
 mod unmeasured;
 
 /// A fixture workspace, removed when dropped.
@@ -94,7 +95,7 @@ fn passes_when_coverage_matches_the_baseline() {
         "{out}"
     );
     assert!(
-        out.contains("| empty | 0/0 | - | - | - | 0/0 | - | - | - | - / - | ok |"),
+        out.contains("| empty | - | - | - | - | - | - | - | - | - / - | ok |"),
         "{out}"
     );
     assert!(
@@ -130,7 +131,7 @@ fn fails_when_the_baseline_is_looser_than_measured() {
         ),
         (
             "a 1 0\nb - -\nempty - -\n",
-            "| b | 10/10 | 100.00 | 0.00 | 0 | 0/0 | - | - | - | - / - | BASELINE LOOSER THAN MEASURED (lines); run kbf-coverage tighten |",
+            "| b | 10/10 | 100.00 | 0.00 | 0 | - | - | - | - | - / - | BASELINE LOOSER THAN MEASURED (lines); run kbf-coverage tighten |",
         ),
     ] {
         let o = run(&root, baseline, &[]);
