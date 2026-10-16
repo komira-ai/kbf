@@ -13,7 +13,7 @@ use kbf_proto::google::bytestream::{
 };
 
 use crate::StorageError;
-use crate::replicate::{Leg, Peers};
+use crate::replicate::{Leg, Peers, ReplicaLeg};
 use crate::service::tests::fake::{connect, serve_odd, serve_routes};
 
 fn message(first: bool, data: &[u8], finish: bool) -> WriteRequest {
@@ -251,4 +251,80 @@ async fn an_early_answer_for_another_size_is_not_a_copy() {
         panic!("{ended:?}");
     };
     assert!(why.contains("before the blob was complete"), "{why}");
+}
+
+/// A ByteStream that answers every write with the status `code`, unread.
+struct Declines(tonic::Code);
+
+#[tonic::async_trait]
+impl ByteStream for Declines {
+    type ReadStream = Boxed<ReadResponse>;
+
+    async fn read(
+        &self,
+        _: tonic::Request<ReadRequest>,
+    ) -> Result<tonic::Response<Self::ReadStream>, tonic::Status> {
+        Err(tonic::Status::unimplemented("not asked"))
+    }
+
+    async fn write(
+        &self,
+        _: tonic::Request<tonic::Streaming<WriteRequest>>,
+    ) -> Result<tonic::Response<WriteResponse>, tonic::Status> {
+        Err(tonic::Status::new(self.0, "declined"))
+    }
+
+    async fn query_write_status(
+        &self,
+        _: tonic::Request<QueryWriteStatusRequest>,
+    ) -> Result<tonic::Response<QueryWriteStatusResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("not asked"))
+    }
+}
+
+/// What a write of three bytes to a replica that answers `code` came to: `Ok(None)` if the
+/// replica holds a copy, `Ok(Some(_))` if it was lost (owed), `Err` if it refused.
+async fn replica_answering(code: tonic::Code) -> Result<Option<StorageError>, StorageError> {
+    let routes = tonic::service::Routes::new(ByteStreamServer::new(Declines(code)));
+    let channel = connect(serve_routes(routes, None).await).await;
+    let mut leg = ReplicaLeg::open(
+        channel,
+        1,
+        MemberId(1),
+        3,
+        Duration::from_secs(30),
+        Duration::from_secs(30),
+    );
+    leg.send(message(true, b"abc", true)).await?;
+    leg.finish().await
+}
+
+/// Catches a replica that declined being taken for one that could not be reached (the write
+/// would be answered with one copy and a debt over the replica's refusal): only the codes
+/// that say nothing was reached or answered in time are a lost replica; ABORTED, DATA_LOSS,
+/// RESOURCE_EXHAUSTED, CANCELLED and a bare FAILED_PRECONDITION are the write's failure.
+/// Mutant: `lift` mapping every code it does not know to `Unavailable`.
+#[tokio::test]
+async fn a_replica_that_declines_is_not_lost() {
+    use tonic::Code;
+    for code in [
+        Code::Aborted,
+        Code::DataLoss,
+        Code::ResourceExhausted,
+        Code::Cancelled,
+        Code::FailedPrecondition,
+    ] {
+        let answer = replica_answering(code).await;
+        assert!(
+            matches!(&answer, Err(StorageError::Internal(m)) if m.contains(&format!("{code:?}"))),
+            "{code:?}: {answer:?}"
+        );
+    }
+    for code in [Code::Unavailable, Code::DeadlineExceeded, Code::Unknown] {
+        let answer = replica_answering(code).await;
+        assert!(
+            matches!(answer, Ok(Some(StorageError::Unavailable(_)))),
+            "{code:?}: {answer:?}"
+        );
+    }
 }

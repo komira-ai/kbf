@@ -290,15 +290,29 @@ fn a_status_becomes_the_error_a_store_would_give() {
             "{code:?}"
         );
     }
-    for code in [
-        Code::Unavailable,
-        Code::DeadlineExceeded,
-        Code::Cancelled,
-        Code::Aborted,
-    ] {
+    // The codes that say the node could not be reached or did not answer in time: the
+    // only ones a primary may answer a write over, with one copy and a repair owed.
+    for code in [Code::Unavailable, Code::DeadlineExceeded, Code::Unknown] {
         let error = lifted(code, at);
         assert!(matches!(error, StorageError::Unavailable(_)), "{code:?}");
         assert_eq!(error.to_string(), "storage node: m");
+    }
+    // The codes a node that was reached answers with when it declines: refusals, which are
+    // never outages (a primary that took them for one would answer a write the replica
+    // refused with a single copy).
+    for code in [
+        Code::Aborted,
+        Code::DataLoss,
+        Code::ResourceExhausted,
+        Code::Cancelled,
+        Code::AlreadyExists,
+        Code::FailedPrecondition,
+    ] {
+        let error = lifted(code, at);
+        assert!(
+            matches!(&error, StorageError::Internal(m) if m.contains("m") && m.contains(&format!("{code:?}"))),
+            "{code:?}: {error:?}"
+        );
     }
 }
 
@@ -331,7 +345,7 @@ fn a_stale_map_status_is_lifted_with_the_nodes_generation() {
         with(Code::Unavailable, "9"),
     ] {
         assert!(
-            matches!(lift(&status, None), StorageError::Unavailable(_)),
+            !matches!(lift(&status, None), StorageError::StaleMap { .. }),
             "{status:?}"
         );
     }

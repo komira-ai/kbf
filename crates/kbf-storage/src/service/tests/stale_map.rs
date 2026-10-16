@@ -205,7 +205,10 @@ fn only_failed_precondition_with_a_decimal_trailer_is_stale_map() {
         with(Status::failed_precondition("x"), "-1"),
         unreadable,
     ] {
-        assert!(matches!(lift(&status, None), StorageError::Unavailable(_)));
+        assert!(
+            matches!(lift(&status, None), StorageError::Internal(m) if m.contains("FailedPrecondition")),
+            "{status:?}"
+        );
     }
     assert!(matches!(
         lift(&with(Status::invalid_argument("x"), "12"), None),
