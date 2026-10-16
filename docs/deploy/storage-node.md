@@ -352,6 +352,62 @@ With a fast disk in front, add `--hot-store=file:///fast/kbf` (uploads land ther
 are flushed to the cold store; the metadata log then lives in `/fast/kbf/meta`, and
 `--meta-dir` is left out unless the log should be on another disk).
 
+## The server's log
+
+`kbf-server` writes its log to stderr (journald under systemd), and, besides that, to a
+size-capped rotating file, so scheduling decisions and failures are still there after the
+journal has rolled over or the host has restarted.
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--log-dir` | `<hot store>/log` when `--hot-store` is a directory, else none | The directory of the log file; created (mode 0750) if missing. With neither flag the server logs to stderr alone and says so in one INFO line after it starts. |
+| `--log-max-bytes` | 64 MiB | The most bytes one file holds before it is rotated. |
+| `--log-files` | 8 | How many files are kept, the current one included. |
+
+The log never takes more than `--log-max-bytes` times `--log-files` plus one line on
+disk. A line longer than `--log-max-bytes` is written alone to a fresh file, so that one
+file can be longer.
+
+- **Layout.** `kbf-server.log` is the current file; `kbf-server.log.1` is the one before
+  it, up to `kbf-server.log.<N - 1>` for `--log-files=N`. Files are created with mode 0640
+  and kept by the server's user.
+- **Rotation** happens before a write that would cross the cap: `.2` becomes `.3`, `.1`
+  becomes `.2`, the current file becomes `.1`, and the file that would become `.N` is
+  dropped. The current file is opened for append and never truncated at start, so a
+  restart keeps the entries before it. Files past the count (after `--log-files` is
+  lowered) are removed at start.
+- **Format.** The same line as stderr (time, level, target, fields), without colour. INFO
+  and above.
+- **Durability.** Each event is written to the file as it happens; the file is not
+  `fsync`ed per line, so a crash of the host can lose the last seconds (a crash of the
+  server cannot).
+- **Errors.** A directory or file that cannot be written (disk full, permission) never
+  stops the server and never costs the stderr copy. The failure is reported once on
+  stderr; the file then drops events until 64 KiB more of them have
+  passed, and tries again.
+- **What is in it at INFO and WARN, one line each.** An operation placed on a worker
+  (`lease granted`, with operation, lease and node); how a lease ended (`lease finished
+  ok`, or `lease finished failed` with the failure kind); a requeue and why (`lease given
+  up; requeued`, with the reason, which for a memory kill names the old and the new
+  booking, and `farm_runs` of `farm_budget` farm-fault reruns spent); an operation that
+  fails for good (`operation finished failed`, with the failure kind and the budget and
+  ladder its runs used); an operation no worker can run; and a write-tier flush that
+  failed, or found a corrupt or conflicting object. Blob requests are not logged.
+
+To read it from the host:
+
+```sh
+kbf-deploy log --log-dir /var/lib/kbf-server/log            # the last 100 lines
+kbf-deploy log --hot-store /fast/kbf --lines 500            # <hot store>/log
+```
+
+`kbf-deploy log` only reads. It prints the last lines across `kbf-server.log` and the
+rotated files, oldest first, and exits 2 with `REFUSED:` if the directory does not exist
+or holds no `kbf-server.log`. It cannot find a server's flags, so it is told the directory
+(`--log-dir`) or the hot store's directory (`--hot-store`, which names `<dir>/log`).
+`pilot server-install` does not yet pass `--log-dir`, so a pilot server logs to journald
+only unless its unit is given the flag.
+
 ## Planned: the scheduler's state in the log
 
 `kbf-server` keeps its metadata in the Raft log on local disk (`--meta-dir`, or
