@@ -6,12 +6,18 @@
 //!
 //! The ratchet compares missed counts (items no test runs), not percentages: a crate
 //! fails when, for lines or branches, it misses more than its baseline value, it has
-//! no data where the baseline has a value (its code moved out of every test binary, or
-//! the report lost it), or the baseline says `-` and it now misses anything (new code
-//! that tests do not fully cover). A workspace crate missing from the baseline, and a
+//! no data where the baseline has a count above 0 (its code moved out of every test
+//! binary, or the report lost it, which would hide those misses), or the baseline says
+//! `-` and it now misses anything (new code that tests do not fully cover). No data
+//! where the baseline says 0 is not a rise: nothing was missed and nothing can be (a
+//! crate whose last branch went away, as kbf-cas-conformance's once did), so it is
+//! looser, like a lower count, and `tighten` records `-`. Under CI's `cargo llvm-cov
+//! --workspace`, a crate's own unit-test binary instruments its code even when it holds
+//! no test, so deleting a crate's tests shows as misses rather than as `-`. A workspace crate missing from the baseline, and a
 //! baseline crate missing from the workspace, fail too, so the file always names
 //! exactly the workspace's crates. A crate whose baseline is looser than what was
-//! measured (fewer misses, or measured code where the baseline says `-`) fails as well:
+//! measured (fewer misses, measured code where the baseline says `-`, or no data where
+//! it says 0) fails as well:
 //! the slack would let a later change leave that many items uncovered without failing,
 //! so a change that covers more must lower its line in the same pull request. That
 //! is what `kbf-coverage tighten` ([`crate::tighten`]) does from the measured file
@@ -144,11 +150,12 @@ impl fmt::Display for Status {
 pub enum Compare {
     /// The same value.
     Equal,
-    /// The record allows more than was measured: fewer misses measured, or `-`
-    /// recorded where every measured item ran. `kbf-coverage tighten` lowers it.
+    /// The record allows more than was measured: fewer misses measured, `-` recorded
+    /// where every measured item ran, or 0 recorded where nothing is measured.
+    /// `kbf-coverage tighten` lowers it.
     Looser,
-    /// More missed than recorded, data lost where the record has a count, or `-`
-    /// recorded where measured items did not run. Only covering code fixes it.
+    /// More missed than recorded, data lost where the record has a count above 0, or
+    /// `-` recorded where measured items did not run. Only covering code fixes it.
     MoreMissed,
 }
 
@@ -156,7 +163,8 @@ pub enum Compare {
 pub fn compare(recorded: Option<u64>, measured: Option<u64>) -> Compare {
     let more_missed = match (recorded, measured) {
         (Some(r), Some(m)) => m > r,
-        (Some(_), None) => true,
+        // 0 recorded, nothing measured: no item was missed, and none can be now.
+        (Some(r), None) => r > 0,
         (None, Some(m)) => m > 0,
         (None, None) => false,
     };
@@ -386,11 +394,25 @@ mod tests {
             row(Some(half), at(0, 0)).status(),
             Status::MoreMissed(vec![Metric::Lines, Metric::Branches])
         );
-        // Data lost: the baseline has values, the crate now has nothing measured.
+        // Data lost: the baseline has misses, the crate now has nothing measured,
+        // which would hide them. Where the baseline says 0 there is nothing to hide:
+        // looser, like a lower count (kbf-cas-conformance lost its last branch so).
         let none = CrateCoverage::default();
         assert_eq!(
-            row(Some(none), at(0, 0)).status(),
+            row(Some(none), at(1, 2)).status(),
             Status::MoreMissed(vec![Metric::Lines, Metric::Branches])
+        );
+        assert_eq!(
+            row(Some(none), at(0, 1)).status(),
+            Status::MoreMissed(vec![Metric::Branches])
+        );
+        assert_eq!(
+            row(Some(cov(3, 3, 0, 0)), at(0, 0)).status(),
+            Status::Loose(vec![Metric::Branches])
+        );
+        assert_eq!(
+            row(Some(none), at(0, 0)).status(),
+            Status::Loose(vec![Metric::Lines, Metric::Branches])
         );
         // `-` recorded: new code must be fully covered to pass.
         assert_eq!(row(Some(none), rec(None, None)).status(), Status::Ok);

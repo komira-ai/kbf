@@ -71,15 +71,16 @@ fn lowers_each_looser_metric_to_the_measured_value() {
 }
 
 /// Catches: each kind of rise written instead of refused (a higher count, `-` to a
-/// count above 0, a count to no data), or refused without naming the crate, the
-/// metric and both values.
+/// count above 0, a count above 0 to no data), or refused without naming the crate,
+/// the metric and both values.
 #[test]
 fn refuses_every_kind_of_rise() {
     for (recorded, measured, metric) in [
         (e(Some(4), Some(15)), e(Some(5), Some(15)), Metric::Lines),
         (e(Some(4), Some(15)), e(Some(4), Some(16)), Metric::Branches),
         (e(None, None), e(Some(1), None), Metric::Lines),
-        (e(Some(0), Some(0)), e(Some(0), None), Metric::Branches),
+        (e(Some(0), Some(2)), e(Some(0), None), Metric::Branches),
+        (e(Some(1), Some(0)), e(None, Some(0)), Metric::Lines),
     ] {
         let got = plan(
             &file(&[("k", recorded)]),
@@ -95,7 +96,7 @@ fn refuses_every_kind_of_rise() {
     let messages: Vec<String> = [
         raised("k", Metric::Lines, Some(4), Some(7)),
         raised("k", Metric::Lines, None, Some(1)),
-        raised("k", Metric::Branches, Some(0), None),
+        raised("k", Metric::Branches, Some(2), None),
     ]
     .iter()
     .map(Refusal::to_string)
@@ -105,7 +106,7 @@ fn refuses_every_kind_of_rise() {
         [
             "k lines: recorded 4, measured 7: more missed than recorded; cover the code",
             "k lines: recorded -, measured 1: more missed than recorded; cover the code",
-            "k branches: recorded 0, measured -: more missed than recorded; cover the code",
+            "k branches: recorded 2, measured -: more missed than recorded; cover the code",
         ]
     );
 }
@@ -265,4 +266,74 @@ fn a_tightened_file_has_nothing_left_to_change() {
     let once = apply(&recorded, &plan(&recorded, &measured, &ws).expect("ok"));
     assert_eq!(once, measured);
     assert_eq!(plan(&once, &measured, &ws), Ok(vec![]));
+}
+
+/// Catches: a crate that lost its last branch (0 recorded, nothing measured, as
+/// kbf-cas-conformance once did) refused with "cover the code", which nothing can
+/// do; and the same leniency given to a count above 0, which would hide its misses.
+#[test]
+fn zero_to_no_data_is_lowered_but_a_count_to_no_data_is_refused() {
+    let recorded = file(&[("k", e(Some(0), Some(0))), ("m", e(Some(3), Some(0)))]);
+    let measured = file(&[("k", e(Some(0), None)), ("m", e(None, None))]);
+    let ws = set(&["k", "m"]);
+    assert_eq!(
+        plan(&recorded, &measured, &ws),
+        Err(vec![raised("m", Metric::Lines, Some(3), None)])
+    );
+    let measured = file(&[("k", e(Some(0), None)), ("m", e(Some(3), None))]);
+    let changes = plan(&recorded, &measured, &ws).expect("only lowers");
+    assert_eq!(
+        changes,
+        [
+            lowered("k", Metric::Branches, Some(0), None),
+            lowered("m", Metric::Branches, Some(0), None),
+        ]
+    );
+    assert_eq!(apply(&recorded, &changes), measured);
+    assert_eq!(changes[0].to_string(), "k branches: 0 -> -");
+}
+
+/// Catches: a root that holds none of the file's crates (a wrong `--root`, an empty
+/// `crates/`) read as every crate deleted, which would empty the file; and the advice
+/// for another tree's measurement given for the wrong refusals.
+#[test]
+fn a_root_without_any_recorded_crate_is_refused() {
+    let recorded = file(&[("a", e(Some(1), Some(1))), ("b", e(None, None))]);
+    for (measured, ws) in [
+        (file(&[]), set(&[])),
+        (file(&[("x", e(Some(0), Some(0)))]), set(&["x"])),
+    ] {
+        assert_eq!(
+            plan(&recorded, &measured, &ws),
+            Err(vec![Refusal::NoRecordedCrateInWorkspace { recorded: 2 }])
+        );
+    }
+    // One recorded crate still there: the other is a deletion, as before.
+    let measured = file(&[("a", e(Some(1), Some(1)))]);
+    assert_eq!(
+        plan(&recorded, &measured, &set(&["a"])).map(|c| c.len()),
+        Ok(1)
+    );
+    // An empty file has nothing to lose.
+    assert_eq!(plan(&file(&[]), &file(&[]), &set(&[])), Ok(vec![]));
+    let refusal = Refusal::NoRecordedCrateInWorkspace { recorded: 2 };
+    assert_eq!(
+        refusal.to_string(),
+        "none of the baseline's 2 crate(s) has a crates/<name>/Cargo.toml under the root; \
+         pass the workspace root as --root"
+    );
+    let another: Vec<bool> = [
+        refusal,
+        Refusal::Unmeasured { krate: "b".into() },
+        Refusal::NotInWorkspace { krate: "x".into() },
+        raised("k", Metric::Lines, Some(0), Some(1)),
+        Refusal::NewCrateUncovered {
+            krate: "n".into(),
+            measured: e(Some(1), None),
+        },
+    ]
+    .iter()
+    .map(Refusal::of_another_tree)
+    .collect();
+    assert_eq!(another, [false, true, true, false, false]);
 }

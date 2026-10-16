@@ -352,7 +352,7 @@ fn tighten_lowers_to_the_measurement_and_reports_each_change() {
     );
     assert_eq!(
         stdout(&o),
-        "kbf-coverage tighten: lowered coverage-baseline to the measurement:\n\
+        "kbf-coverage tighten: lowered ./coverage-baseline to the measurement:\n\
          \x20 kbf-front lines: 47 -> 45\n\
          \x20 kbf-gone: removed (was 3 1; crates/kbf-gone/Cargo.toml is gone)\n\
          \x20 kbf-sim-cell branches: 15 -> 12\n\
@@ -377,7 +377,7 @@ fn tighten_twice_changes_nothing_the_second_time() {
     assert_eq!(baseline_of(&root), once);
     assert_eq!(
         stdout(&o),
-        "kbf-coverage tighten: coverage-baseline already matches the measurement; nothing to change\n"
+        "kbf-coverage tighten: ./coverage-baseline already matches the measurement; nothing to change\n"
     );
 }
 
@@ -387,6 +387,8 @@ fn tighten_twice_changes_nothing_the_second_time() {
 #[test]
 fn tighten_refuses_every_rise_and_leaves_the_file_untouched() {
     let root = tighten_workspace("tighten-refuses");
+    const OTHER_TREE: &str = "\nCI measures the pull request merged with main: bring the branch up \
+         to date with main, re-run CI, and run the command its coverage job prints\n";
     let measured = |front: &str, sim: &str, storage: &str, zz: &str| {
         let mut m = format!("kbf-front {front}\nkbf-sim-cell {sim}\nkbf-zz {zz}\n");
         if !storage.is_empty() {
@@ -418,17 +420,22 @@ fn tighten_refuses_every_rise_and_leaves_the_file_untouched() {
             measured("47 8", "4 15", "1 -", "- -"),
             vec!["kbf-storage: not in the baseline, measured 1 -: a new crate must arrive covered"],
         ),
-        // A workspace crate the measured file lacks.
+        // A workspace crate the measured file lacks, then the advice for a
+        // measurement of another tree (a branch behind main).
         (
             measured("47 8", "4 15", "", "- -"),
             vec![
                 "kbf-storage: crates/kbf-storage/Cargo.toml exists but the measured file has no line for it",
+                OTHER_TREE,
             ],
         ),
-        // A measured crate with no Cargo.toml here.
+        // A measured crate with no Cargo.toml here, and the same advice.
         (
             measured("47 8", "4 15", "0 -", "- -") + "kbf-other 0 0\n",
-            vec!["kbf-other: measured, but there is no crates/kbf-other/Cargo.toml"],
+            vec![
+                "kbf-other: measured, but there is no crates/kbf-other/Cargo.toml",
+                OTHER_TREE,
+            ],
         ),
     ] {
         let before = recorded_file();
@@ -445,12 +452,18 @@ fn tighten_refuses_every_rise_and_leaves_the_file_untouched() {
         let err = stderr(&o);
         assert!(
             err.starts_with(
-                "kbf-coverage tighten: refused; coverage-baseline is unchanged. tighten only lowers counts:\n"
+                "kbf-coverage tighten: refused; ./coverage-baseline is unchanged. tighten only lowers counts:\n"
             ),
             "{err}"
         );
-        // One line per refusal after the first, no more.
+        // One line per refusal (and the advice) after the first, no more; the
+        // advice only after a refusal of another tree's measurement.
         assert_eq!(err.lines().count(), 1 + want.len(), "{m}: {err}");
+        assert_eq!(
+            err.contains("bring the branch up to date"),
+            want.contains(&OTHER_TREE),
+            "{m}: {err}"
+        );
         for w in want {
             assert!(err.contains(w), "{m}: want {w:?} in {err}");
         }
@@ -493,11 +506,10 @@ fn tighten_from_a_tracefile_then_check_passes() {
     assert_eq!(o.status.code(), Some(0), "{}", stdout(&o));
 }
 
-/// Catches: a file that cannot be written reported as lowered, and unreadable inputs
-/// exiting 1 (a refusal) instead of 2.
+/// Catches: a file that cannot be written reported as lowered (or left half
+/// written), and unreadable inputs exiting 1 (a refusal) instead of 2.
 #[test]
 fn tighten_bad_inputs_exit_2() {
-    use std::os::unix::fs::PermissionsExt as _;
     let root = tighten_workspace("tighten-bad");
     let o = tighten(&root, &recorded_file(), MEASURED, &["--measured", "absent"]);
     assert_eq!(o.status.code(), Some(2), "{}", stderr(&o));
@@ -526,23 +538,99 @@ fn tighten_bad_inputs_exit_2() {
         "{}",
         stderr(&o)
     );
-    // The baseline is readable but not writable.
-    let path = root.join("coverage-baseline");
-    std::fs::write(&path, recorded_file()).expect("write baseline");
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).expect("chmod");
-    let o = Command::new(env!("CARGO_BIN_EXE_kbf-coverage"))
-        .current_dir(&*root)
-        .args(["tighten", "--measured", "measured"])
-        .output()
-        .expect("run kbf-coverage tighten");
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+    // The new file cannot be written beside the baseline: a directory holds its
+    // name (a permission bit would not stop root).
+    let temp = root.join("coverage-baseline.tighten-tmp");
+    std::fs::create_dir(&temp).expect("mkdir");
+    let o = tighten(
+        &root,
+        &recorded_file(),
+        MEASURED,
+        &["--measured", "measured"],
+    );
     assert_eq!(o.status.code(), Some(2), "{}", stderr(&o));
     assert!(
-        stderr(&o).contains("write coverage-baseline:"),
+        stderr(&o).contains("write ./coverage-baseline:"),
         "{}",
         stderr(&o)
     );
     assert_eq!(baseline_of(&root), recorded_file());
+    std::fs::remove_dir(&temp).expect("rmdir");
+    // Written whole: the run succeeds, and leaves no file beside the baseline.
+    let o = tighten(
+        &root,
+        &recorded_file(),
+        MEASURED,
+        &["--measured", "measured"],
+    );
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    assert!(!temp.exists());
+}
+
+/// Catches: `--baseline` resolved against the working directory instead of `--root`,
+/// and a `--root` that is not this workspace taken as one where every crate is gone,
+/// which would delete every line. The file must come out untouched.
+#[test]
+fn tighten_baseline_follows_the_root_and_a_foreign_root_is_refused() {
+    let root = tighten_workspace("tighten-root");
+    std::fs::write(root.join("coverage-baseline"), recorded_file()).expect("write");
+    std::fs::write(root.join("measured"), MEASURED).expect("write");
+    let elsewhere = tighten_workspace("tighten-root-cwd");
+    let o = Command::new(env!("CARGO_BIN_EXE_kbf-coverage"))
+        .current_dir(&*elsewhere)
+        .arg("tighten")
+        .arg("--measured")
+        .arg(root.join("measured"))
+        .arg("--root")
+        .arg(&*root)
+        .output()
+        .expect("run kbf-coverage tighten");
+    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    assert!(baseline_of(&root).contains("kbf-sim-cell      4     12\n"));
+    assert!(!elsewhere.join("coverage-baseline").exists());
+
+    // A root with an empty crates/ and an empty measured file (nothing is in the
+    // workspace, so every line would go), and one whose only crate the file lacks.
+    let foreign = |name: &str, crates: &[&str], measured: &str| {
+        let dir =
+            Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("crates")).expect("mkdir");
+        for krate in crates {
+            std::fs::create_dir_all(dir.join("crates").join(krate)).expect("mkdir");
+            std::fs::write(dir.join("crates").join(krate).join("Cargo.toml"), "").expect("write");
+        }
+        std::fs::write(dir.join("measured"), measured).expect("write");
+        let dir = Workspace(dir);
+        let o = Command::new(env!("CARGO_BIN_EXE_kbf-coverage"))
+            .arg("tighten")
+            .arg("--measured")
+            .arg(dir.join("measured"))
+            .arg("--root")
+            .arg(&*dir)
+            .arg("--baseline")
+            .arg(root.join("coverage-baseline"))
+            .output()
+            .expect("run kbf-coverage tighten");
+        drop(dir);
+        o
+    };
+    let before = recorded_file();
+    std::fs::write(root.join("coverage-baseline"), &before).expect("write");
+    let o = foreign("tighten-root-empty", &[], "");
+    let o2 = foreign("tighten-root-other", &["x"], "x 0 0\n");
+    for o in [o, o2] {
+        assert_eq!(o.status.code(), Some(1), "{}{}", stdout(&o), stderr(&o));
+        assert!(
+            stderr(&o).contains(
+                "none of the baseline's 4 crate(s) has a crates/<name>/Cargo.toml under the root; \
+                 pass the workspace root as --root"
+            ),
+            "{}",
+            stderr(&o)
+        );
+        assert_eq!(baseline_of(&root), before);
+    }
 }
 
 /// Catches: the default (no subcommand) form CI runs today broken by the
@@ -620,10 +708,50 @@ fn ci_check(root: &Path, baseline: &str, extra: &[&str]) -> Output {
         .expect("run kbf-coverage")
 }
 
+/// Runs a printed `d=$(mktemp -d) && gh run download ... --dir "$d" && cargo run -p
+/// kbf-coverage -- <args>` in `root`, without a shell: the mktemp part makes a fresh
+/// directory for `$d`, the gh part creates `measured`'s file in the `--dir` and fails
+/// if it is there already (gh will not overwrite a file), and the cargo part runs the
+/// binary. Panics on any other shape, so a changed command cannot pass unrun.
+fn run_printed(root: &Path, command: &str, measured: &str) -> Output {
+    static FRESH: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let rest = command
+        .strip_prefix("d=$(mktemp -d) && ")
+        .expect("a fresh directory per run");
+    let n = FRESH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let d = root.join(format!("mktemp-{n}"));
+    std::fs::create_dir(&d).expect("fresh dir");
+    let d = d.display().to_string();
+    let (gh, cargo) = rest.split_once(" && ").expect("gh && cargo");
+    let gh: Vec<String> = gh.split(' ').map(|w| w.replace("\"$d\"", &d)).collect();
+    assert_eq!(gh[..3], ["gh", "run", "download"], "{command}");
+    // gh makes the directory when it is missing, relative to where it runs.
+    let dir = root.join(&gh[gh.iter().position(|w| w == "--dir").expect("--dir") + 1]);
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(dir.join("coverage-baseline.measured"))
+        .expect("gh run download does not overwrite a file");
+    std::io::Write::write_all(&mut file, measured.as_bytes()).expect("write");
+    let words: Vec<String> = cargo.split(' ').map(|w| w.replace("\"$d\"", &d)).collect();
+    assert_eq!(
+        words[..5],
+        ["cargo", "run", "-p", "kbf-coverage", "--"],
+        "{command}"
+    );
+    Command::new(env!("CARGO_BIN_EXE_kbf-coverage"))
+        .current_dir(root)
+        .args(&words[5..])
+        .output()
+        .expect("run tighten")
+}
+
 /// Catches: a failure `tighten` fixes printed without the command (or with one that
-/// names another run, artifact or file, or that does not run), a raise told to run
-/// it, and the advice left out of the job summary. The command is checked exactly,
-/// then its `tighten` half is run on the file the check wrote, and the check passes.
+/// names another run, artifact or file, that does not run, or that fails when run
+/// again), a raise told to run it, and the advice left out of the job summary. The
+/// command is checked exactly, then run twice on the file the check wrote; the second
+/// run changes nothing, and the check passes.
 #[test]
 fn a_failure_tighten_fixes_prints_the_command_with_the_run_id() {
     let root = workspace("ci-message");
@@ -643,9 +771,9 @@ fn a_failure_tighten_fixes_prints_the_command_with_the_run_id() {
     let o = ci_check(&root, "a 2 0\nb - -\nempty - -\n", &flags);
     assert_eq!(o.status.code(), Some(1), "{}", stderr(&o));
     let out = stdout(&o);
-    let command = "gh run download 38801912372 --repo komira-ai/komira-build-farm --name coverage \
-                   --dir target/coverage-38801912372 && cargo run -p kbf-coverage -- tighten \
-                   --measured target/coverage-38801912372/coverage-baseline.measured";
+    let command = "d=$(mktemp -d) && gh run download 38801912372 --repo komira-ai/komira-build-farm \
+                   --name coverage --dir \"$d\" && cargo run -p kbf-coverage -- tighten \
+                   --measured \"$d\"/coverage-baseline.measured";
     assert!(
         out.ends_with(&format!(
             "coverage ratchet: FAIL (2 crate(s) need attention; see status)\n\n\
@@ -658,23 +786,22 @@ fn a_failure_tighten_fixes_prints_the_command_with_the_run_id() {
     );
     assert_eq!(std::fs::read_to_string(&summary).expect("summary"), out);
 
-    // What the download fetches is the file the check wrote; the tighten half then fixes it.
-    let dir = root.join("target/coverage-38801912372");
-    std::fs::create_dir_all(&dir).expect("mkdir");
-    std::fs::copy(
-        root.join("target/coverage/coverage-baseline.measured"),
-        dir.join("coverage-baseline.measured"),
-    )
-    .expect("copy measured");
-    let half = command.split(" && ").nth(1).expect("two halves");
-    let words: Vec<&str> = half.split(' ').collect();
-    assert_eq!(words[..4], ["cargo", "run", "-p", "kbf-coverage"]);
-    let o = Command::new(env!("CARGO_BIN_EXE_kbf-coverage"))
-        .current_dir(&*root)
-        .args(&words[5..])
-        .output()
-        .expect("run tighten");
-    assert_eq!(o.status.code(), Some(0), "{}", stderr(&o));
+    // The whole command, twice, as a shell would run it: `run_printed` stands in for
+    // mktemp and for gh, which will not overwrite a file. The second run downloads
+    // again and changes nothing.
+    let measured = std::fs::read_to_string(root.join("target/coverage/coverage-baseline.measured"))
+        .expect("measured");
+    let first = run_printed(&root, command, &measured);
+    assert_eq!(first.status.code(), Some(0), "{}", stderr(&first));
+    let once = baseline_of(&root);
+    let second = run_printed(&root, command, &measured);
+    assert_eq!(second.status.code(), Some(0), "{}", stderr(&second));
+    assert_eq!(baseline_of(&root), once);
+    assert!(
+        stdout(&second).ends_with("already matches the measurement; nothing to change\n"),
+        "{}",
+        stdout(&second)
+    );
     let o = ci_check(&root, &baseline_of(&root), &flags);
     assert_eq!(o.status.code(), Some(0), "{}", stdout(&o));
 
@@ -719,12 +846,12 @@ fn the_command_follows_the_flags_and_quotes_for_the_shell() {
             "--artifact",
             "cov x"
         ]),
-        "gh run download 7 --name 'cov x' --dir target/coverage-7 && \
-         cargo run -p kbf-coverage -- tighten --measured 'target/coverage-7/out m'"
+        "d=$(mktemp -d) && gh run download 7 --name 'cov x' --dir \"$d\" && \
+         cargo run -p kbf-coverage -- tighten --measured \"$d\"/'out m'"
     );
     assert_eq!(
         command(&["--write-baseline", "m", "--run-id", "7", "--repo", ""]),
-        "gh run download 7 --repo '' --name coverage --dir target/coverage-7 && \
-         cargo run -p kbf-coverage -- tighten --measured target/coverage-7/m"
+        "d=$(mktemp -d) && gh run download 7 --repo '' --name coverage --dir \"$d\" && \
+         cargo run -p kbf-coverage -- tighten --measured \"$d\"/m"
     );
 }

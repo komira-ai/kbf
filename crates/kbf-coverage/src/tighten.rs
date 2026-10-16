@@ -7,16 +7,21 @@
 //! required when coverage improves, and it is not a bypass. [`plan`] compares each
 //! metric with [`ratchet::compare`], the ratchet's own rule, and:
 //!
-//! - lowers a [`Compare::Looser`] value to the measured one (a lower count, or `-`
-//!   recorded where the crate now measures 0);
+//! - lowers a [`Compare::Looser`] value to the measured one (a lower count, `-`
+//!   recorded where the crate now measures 0, or 0 recorded where it now measures no
+//!   data: nothing was missed, and nothing can be);
 //! - refuses a [`Compare::MoreMissed`] one (a higher count, `-` to a count above 0, a
-//!   count to no data);
+//!   count above 0 to no data, which would hide those misses);
 //! - adds a workspace crate the file lacks only when every measured value is 0 or
 //!   `-` (new code arrives covered), and refuses it otherwise;
 //! - removes a crate that is neither measured nor in the workspace (its
 //!   `crates/<name>/Cargo.toml` is gone);
 //! - refuses any other difference between the file's crates, the measured crates and
-//!   the workspace's crates, which means the measurement is of another tree.
+//!   the workspace's crates, which means the measurement is of another tree (CI
+//!   measures the pull request merged with `main`, so a branch behind `main` gets one;
+//!   [`OTHER_TREE_ADVICE`] says what to do);
+//! - refuses everything when none of the file's crates is in the workspace: `--root`
+//!   is not this repository, and every line would otherwise be removed.
 //!
 //! One refusal refuses everything: the file is written only when every difference is
 //! one the ratchet calls looser. The result then equals the measurement, so the
@@ -69,6 +74,11 @@ impl fmt::Display for Change {
     }
 }
 
+/// What to do about a measurement of another tree, printed after the refusals when
+/// any is [`Refusal::of_another_tree`].
+pub const OTHER_TREE_ADVICE: &str = "CI measures the pull request merged with main: \
+     bring the branch up to date with main, re-run CI, and run the command its coverage job prints";
+
 /// A difference `tighten` will not write.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum Refusal {
@@ -96,6 +106,22 @@ pub enum Refusal {
         "{krate}: measured, but there is no crates/{krate}/Cargo.toml; the measurement is of another tree"
     )]
     NotInWorkspace { krate: String },
+    #[error(
+        "none of the baseline's {recorded} crate(s) has a crates/<name>/Cargo.toml under the root; \
+         pass the workspace root as --root"
+    )]
+    NoRecordedCrateInWorkspace { recorded: usize },
+}
+
+impl Refusal {
+    /// Whether the refusal means the measurement is of another tree than the one
+    /// under the root.
+    pub fn of_another_tree(&self) -> bool {
+        matches!(
+            self,
+            Refusal::Unmeasured { .. } | Refusal::NotInWorkspace { .. }
+        )
+    }
 }
 
 /// Every change that takes `recorded` to `measured`, or every reason it may not;
@@ -105,6 +131,12 @@ pub fn plan(
     measured: &Baseline,
     workspace: &BTreeSet<String>,
 ) -> Result<Vec<Change>, Vec<Refusal>> {
+    // A root that holds none of the file's crates would see every line as gone.
+    if !recorded.is_empty() && !recorded.keys().any(|k| workspace.contains(k)) {
+        return Err(vec![Refusal::NoRecordedCrateInWorkspace {
+            recorded: recorded.len(),
+        }]);
+    }
     let names: BTreeSet<&String> = recorded
         .keys()
         .chain(measured.keys())

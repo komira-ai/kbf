@@ -77,9 +77,10 @@ struct TightenArgs {
     /// The workspace root: its `crates/*/Cargo.toml` are the workspace's crates.
     #[arg(long, default_value = ".")]
     root: PathBuf,
-    /// The baseline file to lower, rewritten in place.
-    #[arg(long, default_value = DEFAULT_BASELINE)]
-    baseline: PathBuf,
+    /// The baseline file to lower, replaced whole [default: coverage-baseline under
+    /// --root].
+    #[arg(long)]
+    baseline: Option<PathBuf>,
 }
 
 const DEFAULT_BASELINE: &str = "coverage-baseline";
@@ -187,7 +188,9 @@ fn arg(p: &Path) -> String {
 }
 
 /// The command that runs `tighten` on what this check measured: from the CI run's
-/// artifact when `--run-id` names it, else from the local files.
+/// artifact when `--run-id` names it, else from the local files. The download goes
+/// to a fresh directory each time (`gh run download` will not overwrite a file), so
+/// the whole command can run again, and then changes nothing.
 fn tighten_command(args: &CheckArgs) -> String {
     let mut tighten = "cargo run -p kbf-coverage -- tighten".to_owned();
     if args.baseline != Path::new(DEFAULT_BASELINE) {
@@ -195,7 +198,6 @@ fn tighten_command(args: &CheckArgs) -> String {
     }
     match (&args.run_id, &args.write_baseline) {
         (Some(id), Some(written)) => {
-            let dir = format!("target/coverage-{id}");
             let repo = args
                 .repo
                 .as_ref()
@@ -203,11 +205,11 @@ fn tighten_command(args: &CheckArgs) -> String {
             // The artifact holds the file at its top level, under its own name.
             let name = written.file_name().unwrap_or(written.as_os_str());
             format!(
-                "gh run download {}{repo} --name {} --dir {} && {tighten} --measured {}",
+                "d=$(mktemp -d) && gh run download {}{repo} --name {} --dir \"$d\" && \
+                 {tighten} --measured \"$d\"/{}",
                 quote(id),
                 quote(&args.artifact),
-                quote(&dir),
-                arg(&Path::new(&dir).join(name)),
+                arg(Path::new(name)),
             )
         }
         (_, Some(written)) => format!("{tighten} --measured {}", arg(written)),
@@ -242,8 +244,26 @@ fn advice(args: &CheckArgs, plan: Result<(), Vec<tighten::Refusal>>) -> String {
     }
 }
 
+/// Replaces `path` with `text` whole: written to a file beside it, then renamed over
+/// it, so an interrupted run leaves the old file or the new one, never part of one.
+fn replace(path: &Path, text: &str) -> std::io::Result<()> {
+    let mut temp = path.as_os_str().to_owned();
+    temp.push(".tighten-tmp");
+    let temp = PathBuf::from(temp);
+    let result = std::fs::write(&temp, text).and_then(|()| std::fs::rename(&temp, path));
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    result
+}
+
 /// Lowers `--baseline` to the measurement; returns false (file untouched) on a refusal.
 fn run_tighten(args: &TightenArgs) -> Result<bool, Box<dyn Error>> {
+    let baseline_path = args
+        .baseline
+        .clone()
+        .unwrap_or_else(|| args.root.join(DEFAULT_BASELINE));
+    let baseline_path = baseline_path.as_path();
     let measured = match (&args.measured, &args.lcov) {
         (Some(path), _) => read_baseline(path)?.1,
         (None, lcov) => {
@@ -253,16 +273,19 @@ fn run_tighten(args: &TightenArgs) -> Result<bool, Box<dyn Error>> {
         }
     };
     let workspace = workspace(&args.root)?;
-    let (text, recorded) = read_baseline(&args.baseline)?;
+    let (text, recorded) = read_baseline(baseline_path)?;
     let changes = match tighten::plan(&recorded, &measured, &workspace) {
         Ok(changes) => changes,
         Err(refusals) => {
             eprintln!(
                 "kbf-coverage tighten: refused; {} is unchanged. tighten only lowers counts:",
-                args.baseline.display()
+                baseline_path.display()
             );
-            for r in refusals {
+            for r in &refusals {
                 eprintln!("  {r}");
+            }
+            if refusals.iter().any(tighten::Refusal::of_another_tree) {
+                eprintln!("{}", tighten::OTHER_TREE_ADVICE);
             }
             return Ok(false);
         }
@@ -270,16 +293,16 @@ fn run_tighten(args: &TightenArgs) -> Result<bool, Box<dyn Error>> {
     if changes.is_empty() {
         println!(
             "kbf-coverage tighten: {} already matches the measurement; nothing to change",
-            args.baseline.display()
+            baseline_path.display()
         );
         return Ok(true);
     }
     let new = tighten::apply(&recorded, &changes);
-    std::fs::write(&args.baseline, baseline::rewrite(&text, &new))
-        .map_err(|e| format!("write {}: {e}", args.baseline.display()))?;
+    replace(baseline_path, &baseline::rewrite(&text, &new))
+        .map_err(|e| format!("write {}: {e}", baseline_path.display()))?;
     println!(
         "kbf-coverage tighten: lowered {} to the measurement:",
-        args.baseline.display()
+        baseline_path.display()
     );
     for c in &changes {
         println!("  {c}");
