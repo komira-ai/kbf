@@ -38,11 +38,6 @@
 //! [`TlsNodes`] verifies each node against its own name from the map and has no way to be
 //! given one name for all of them.
 
-#![expect(
-    dead_code,
-    reason = "the red-first commit: the routing that uses the rest is not written yet"
-)]
-
 mod find;
 mod flights;
 mod nodes;

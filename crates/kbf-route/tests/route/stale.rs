@@ -9,9 +9,7 @@ use kbf_route::{RefetchError, Router};
 use kbf_storage::StorageError;
 use kbf_types::Digest;
 
-use super::support::{
-    Cell, Cluster, active, blob_where, collect, map, router, sha, unavailable, view,
-};
+use super::support::{Cell, Cluster, active, blob_where, collect, map, router, sha, view};
 
 fn stale() -> StorageError {
     StorageError::StaleMap { current: 2 }
@@ -20,7 +18,6 @@ fn stale() -> StorageError {
 /// Generation 1 has members 1 and 2; generation 2 has 3 and 4.
 struct Farm {
     one: Arc<Map>,
-    two: Arc<Map>,
     cluster: Arc<Cluster>,
     router: Router,
     cell: Arc<Cell>,
@@ -43,7 +40,6 @@ fn farm() -> Farm {
     cell.answer_fetch(Ok(view(&two)));
     Farm {
         one,
-        two,
         cluster,
         router,
         cell,
@@ -224,5 +220,4 @@ async fn every_call_handles_a_stale_answer() {
     let found = f.router.action_result(&f.digest).await.expect("an answer");
     assert!(found.is_some());
     assert_eq!(f.cell.fetched(), [2]);
-    let _ = (unavailable, &f.two);
 }

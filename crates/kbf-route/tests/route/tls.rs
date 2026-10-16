@@ -134,7 +134,13 @@ async fn each_node_is_reached_by_its_own_name() {
     one.hold(&blob_1);
     two.hold(&blob_2);
 
-    for (blob, digest) in [(blob_1, digest_1), (blob_2, digest_2)] {
+    // Node 1 twice: the second call finds the connection made for the first.
+    let reads = [
+        (blob_1.clone(), digest_1),
+        (blob_2, digest_2),
+        (blob_1, digest_1),
+    ];
+    for (blob, digest) in reads {
         let (bytes, _) = collect(router.read_range(&digest, 0, 0).await.expect("a read"))
             .await
             .expect("bytes");

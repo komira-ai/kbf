@@ -183,6 +183,31 @@ async fn nobody_to_ask_is_unavailable() {
     assert!(error.to_string().contains("no storage map"), "{error}");
 }
 
+/// Catches an owner that cannot be dialled (an address that is not one) ending the read
+/// or being taken for an absence: it is skipped, the next owner answers, and when nobody
+/// does the failure is the answer, not NOT_FOUND.
+#[tokio::test]
+async fn an_owner_that_cannot_be_dialled_is_skipped() {
+    let map = map(1, 2, active(&[1, 2]));
+    let cluster = std::sync::Arc::new(Cluster::default());
+    let node_2 = cluster.add(2);
+    let (router, _) = router(&map, &cluster);
+    let (blob, digest) = blob_read_from(&map, &[1, 2]);
+    node_2.hold(&blob);
+    let (bytes, _) = collect(router.read_range(&digest, 0, 0).await.expect("a read"))
+        .await
+        .expect("bytes");
+    assert_eq!(bytes, blob);
+
+    let (_, absent) = super::support::blobs_read_from(&map, &[1, 2], 2).remove(1);
+    let error = router
+        .read_range(&absent, 0, 0)
+        .await
+        .err()
+        .expect("not known");
+    assert!(matches!(error, StorageError::Internal(_)), "{error:?}");
+}
+
 /// Catches an offset or a limit changed on the way to the node: they are passed as
 /// given, and the bytes are the range, in the node's chunks.
 #[tokio::test]
@@ -253,6 +278,25 @@ async fn a_broken_read_goes_on_from_the_bytes_passed() {
     .expect("bytes");
     assert_eq!(bytes, &blob[..want]);
     assert_eq!(cluster.node(2).read_log(), [(8, 0), (8, want as u64 - 8)]);
+}
+
+/// Catches a read with a limit that goes on after its last byte: the owner passes the two
+/// chunks that make up the limit and then breaks, which is no failure of this read, and
+/// must not be resumed (a resume would ask for the rest of the blob, with no limit).
+#[tokio::test]
+async fn a_limited_read_is_over_at_its_limit() {
+    let map = map(1, 1, active(&[1]));
+    let cluster = Cluster::of(1);
+    let (router, _) = router(&map, &cluster);
+    let blob = b"0123456789abcdefghij".to_vec();
+    let digest = cluster.node(1).hold(&blob);
+    cluster.node(1).break_read(2, unavailable());
+
+    let (bytes, _) = collect(router.read_range(&digest, 0, 8).await.expect("a read"))
+        .await
+        .expect("the limit was read");
+    assert_eq!(bytes, &blob[..8]);
+    assert_eq!(cluster.node(1).read_count(), 1);
 }
 
 /// Catches a read that never gives up (an owner breaks every time) or gives up early: the

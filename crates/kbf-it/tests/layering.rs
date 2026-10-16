@@ -24,7 +24,11 @@
 //! - the storage crate (`kbf-storage`) depending, directly or through another crate, on
 //!   a frontend crate (`STORAGE_MUST_NOT_REACH`: the scheduler and authorization), which
 //!   would make a storage process link the frontend; and the storage crate renamed or
-//!   removed, which would make that check pass vacuously.
+//!   removed, which would make that check pass vacuously;
+//! - the routing library (`kbf-route`) depending, directly or through another crate, on a
+//!   frontend crate, the server, or the daemon's side (`ROUTE_MUST_NOT_REACH`): the
+//!   frontend and the daemon both link it, and neither may pull in the other's code
+//!   through it.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::process::Command;
@@ -323,6 +327,36 @@ fn storage_reaches_no_frontend_crate() {
     assert!(
         violations.is_empty(),
         "kbf-storage reaches a frontend crate:\n{}",
+        violations.join("\n")
+    );
+}
+
+/// What the routing library's normal dependencies must not reach: the frontend's scheduler
+/// and authorization, the server, and the daemon's side (the transfer engine and the node).
+/// The frontend and the daemon both use it (docs/design/architecture-v2.md, section 7); a
+/// path to either side's code would make the other link it.
+const ROUTE_MUST_NOT_REACH: &[&str] = &[
+    "kbf-sched",
+    "kbf-auth",
+    "kbf-front",
+    "kbf-server",
+    "kbf-transfer",
+    "kbf-node",
+    "kbf-daemon",
+];
+
+#[test]
+fn route_reaches_neither_the_frontend_nor_the_daemon() {
+    let g = load_graph();
+    let (_, root) = g
+        .members
+        .get("kbf-route")
+        .expect("kbf-route is a workspace member");
+    assert!(root.is_some(), "kbf-route must have a library target");
+    let violations = reaches(&g, "kbf-route", ROUTE_MUST_NOT_REACH);
+    assert!(
+        violations.is_empty(),
+        "kbf-route reaches a frontend or daemon crate:\n{}",
         violations.join("\n")
     );
 }
