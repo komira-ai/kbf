@@ -529,15 +529,14 @@ where
     ))
     .max_decoding_message_size(MAX_MESSAGE_BYTES)
     .max_encoding_message_size(MAX_MESSAGE_BYTES);
-    let mut sessions = WorkerService::new(
+    let sessions = WorkerService::new(
         Arc::clone(&farm),
         peers,
         listeners.heartbeat_interval,
         listeners.hello_wait,
     );
-    if let Some(map) = map {
-        sessions = sessions.with_map(map);
-    }
+    // The map, if there is one: no branch in this generic function.
+    let sessions = map.into_iter().fold(sessions, WorkerService::with_map);
     let worker_service = WorkerServer::new(sessions)
         .max_decoding_message_size(MAX_MESSAGE_BYTES)
         .max_encoding_message_size(MAX_MESSAGE_BYTES);

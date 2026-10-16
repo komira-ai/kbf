@@ -171,3 +171,20 @@ async fn a_server_without_a_map_sends_none() {
     }));
     assert_eq!(daemon.map_update_within(QUIET).await, None);
 }
+
+/// The same through the cell the other server tests run on (a different instantiation of
+/// the server's generic session code than `bind_server_with_map` over memory): Welcome
+/// carries the map, a change is pushed, a request is answered.
+#[tokio::test]
+async fn a_cell_sends_the_map_too() {
+    let source = Arc::new(FakeMapSource::new(map(4, 2)));
+    let cell = support::Cell::start_with_map(Arc::clone(&source) as Arc<dyn MapSource>).await;
+    let mut daemon = cell.daemon("node-1", 4, 8).await;
+    assert_eq!(daemon.map.take().expect("a map in Welcome").generation, 4);
+    source.set(map(5, 2));
+    assert_eq!(daemon.map_update_within(PROMPT).await, Some(5));
+    daemon.send(daemon_message::Message::MapRequest(MapRequest {
+        at_least: 5,
+    }));
+    assert_eq!(daemon.map_update_within(PROMPT).await, Some(5));
+}

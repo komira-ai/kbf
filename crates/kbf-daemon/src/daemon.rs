@@ -657,7 +657,7 @@ impl Daemon {
                 Some(()) = driver_changed(self.driver.as_mut()) => Wake::Driver,
                 Some(()) = phase_changed(self.phase.as_mut()) => Wake::Phase,
                 Some(()) = pressure_changed(self.pressure.as_mut()) => Wake::Pressure,
-                Some(()) = map_asked(self.map.as_mut()) => Wake::MapAsked,
+                () = map_asked(self.map.as_mut()) => Wake::MapAsked,
             };
             // First, whatever woke the loop: the clock may have jumped over a suspend.
             self.recheck();
