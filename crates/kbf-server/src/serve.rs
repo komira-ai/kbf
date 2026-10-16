@@ -464,3 +464,56 @@ where
         recorder,
     })
 }
+
+/// Where a storage node listens (`kbf storage`) and what it keeps.
+#[derive(Clone, Debug)]
+pub struct StorageListener {
+    /// The listener.
+    pub listen: SocketAddr,
+    /// Mutual TLS (the server's identity and the client CA); `None` serves plain text,
+    /// where no caller has a role and every call is admitted.
+    pub tls: Option<ServerTlsConfig>,
+    /// What the service keeps.
+    pub service: kbf_storage::service::Config,
+}
+
+/// A storage node that is listening.
+pub struct BoundStorage<F> {
+    /// Where the listener is.
+    pub addr: SocketAddr,
+    /// Serves until the shutdown future completes, then until the calls in flight end.
+    pub serving: F,
+}
+
+/// Binds the storage service ([`kbf_storage::service`]) over `storage`: ByteStream, the
+/// CAS `FindMissingBlobs`, `Segments` and the action store, on one listener, each call
+/// admitted by the role in the caller's certificate when there is mutual TLS.
+///
+/// # Errors
+/// The listener cannot be bound, or the TLS configuration is refused (a key that does
+/// not match its certificate, say).
+pub fn bind_storage(
+    storage: Arc<dyn kbf_storage::Storage>,
+    listener: StorageListener,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> Result<BoundStorage<impl Future<Output = Result<(), ServeError>>>, ServeError> {
+    let (incoming, addr) = bind(listener.listen)?;
+    let mut server = flow_control(Server::builder());
+    let admission = match listener.tls {
+        Some(tls) => {
+            server = server.tls_config(tls)?;
+            kbf_storage::service::Admission::Certified
+        }
+        None => kbf_storage::service::Admission::Open,
+    };
+    let routes =
+        kbf_storage::service::StorageService::new(storage, admission, listener.service).routes();
+    let serving = async move {
+        server
+            .add_routes(routes)
+            .serve_with_incoming_shutdown(incoming, shutdown)
+            .await
+            .map_err(ServeError::from)
+    };
+    Ok(BoundStorage { addr, serving })
+}

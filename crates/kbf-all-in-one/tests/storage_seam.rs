@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use bytes::Bytes;
+use futures::StreamExt;
 use kbf_all_in_one::LocalDataPlane;
 use kbf_cas_conformance::{Subject, patterned};
 use kbf_front::{Cache, CacheStorage, SegmentsConfig};
@@ -18,7 +19,7 @@ use kbf_meta::{ActionRecord, Role};
 use kbf_proto::reapi::ActionResult;
 use kbf_proto::worker::segments_server::Segments;
 use kbf_server::LocalStore;
-use kbf_storage::{Answer, PutStream, Storage};
+use kbf_storage::{Answer, PutStream, ReadStream, Storage};
 use kbf_transfer::{Cas, Record, digest_of};
 use kbf_types::Digest;
 
@@ -27,6 +28,7 @@ use kbf_types::Digest;
 struct Calls {
     find_missing: AtomicUsize,
     read_blob: AtomicUsize,
+    read_range: AtomicUsize,
     put: AtomicUsize,
     segments: AtomicUsize,
 }
@@ -50,6 +52,16 @@ impl Storage for Counted {
     fn read_blob<'a>(&'a self, digest: &'a Digest) -> Answer<'a, Bytes> {
         count(&self.calls.read_blob);
         self.inner.read_blob(digest)
+    }
+
+    fn read_range<'a>(
+        &'a self,
+        digest: &'a Digest,
+        offset: u64,
+        limit: u64,
+    ) -> Answer<'a, ReadStream> {
+        count(&self.calls.read_range);
+        self.inner.read_range(digest, offset, limit)
     }
 
     fn put(&self, bytes: Bytes) -> Answer<'_, Digest> {
@@ -87,8 +99,8 @@ impl Storage for Counted {
     }
 }
 
-/// A plane over a new in-memory cache behind the boundary, and the calls that reach it.
-fn plane() -> (LocalDataPlane, Arc<Calls>) {
+/// A new in-memory cache behind the boundary, and the calls that reach it.
+fn counted() -> (Counted, Arc<Calls>) {
     let calls = Arc::new(Calls::default());
     let storage = Counted {
         inner: Arc::new(CacheStorage::new(
@@ -97,6 +109,12 @@ fn plane() -> (LocalDataPlane, Arc<Calls>) {
         )),
         calls: Arc::clone(&calls),
     };
+    (storage, calls)
+}
+
+/// A plane over a new in-memory cache behind the boundary, and the calls that reach it.
+fn plane() -> (LocalDataPlane, Arc<Calls>) {
+    let (storage, calls) = counted();
     let store = LocalStore::over(Arc::new(storage));
     let plane = LocalDataPlane::new(store, tokio::runtime::Handle::current());
     (plane, calls)
@@ -156,4 +174,26 @@ async fn every_call_crosses_the_boundary() {
             "no {name} call reached the storage"
         );
     }
+}
+
+/// Catches a ranged read that is not the storage's own: through the boundary, the bytes
+/// `[offset, offset + limit)` of a blob arrive as the storage's stream, and the call is
+/// counted.
+#[tokio::test]
+async fn a_ranged_read_crosses_the_boundary() {
+    let (storage, calls) = counted();
+    let bytes = patterned(3, 100);
+    let digest = storage.put(Bytes::from(bytes.clone())).await.expect("put");
+    let chunks: Vec<_> = storage
+        .read_range(&digest, 10, 20)
+        .await
+        .expect("read_range")
+        .collect()
+        .await;
+    let got: Vec<u8> = chunks
+        .into_iter()
+        .flat_map(|c| c.expect("chunk").to_vec())
+        .collect();
+    assert_eq!(got, bytes[10..30]);
+    assert_eq!(calls.read_range.load(Ordering::SeqCst), 1);
 }

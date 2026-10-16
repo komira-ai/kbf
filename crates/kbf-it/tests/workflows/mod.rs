@@ -165,8 +165,9 @@ pub fn scan_action(text: &str, repo: &Repo) -> Vec<String> {
 
 /// One step of a job, as far as the step lints read it: its `name:`, its `run:` script
 /// and its `uses:`, each `None` when absent or not a string; its `with:` inputs whose
-/// values are strings, in file order; and whether it has an `if:` or a
-/// `continue-on-error:` (either can let the job pass without the step's check).
+/// values are strings, in file order; whether it has an `if:` or a
+/// `continue-on-error:` (either can let the job pass without the step's check); and
+/// its `if:` when that is a string.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Step {
     pub name: Option<String>,
@@ -174,6 +175,7 @@ pub struct Step {
     pub uses: Option<String>,
     pub with: Vec<(String, String)>,
     pub conditional: bool,
+    pub condition: Option<String>,
 }
 
 /// The steps of the job `job` (its key matched ignoring ASCII case) in a workflow
@@ -209,6 +211,7 @@ pub fn job_steps(text: &str, job: &str) -> Result<Vec<Step>, String> {
                     _ => Vec::new(),
                 },
                 conditional: get(m, "if").is_some() || get(m, "continue-on-error").is_some(),
+                condition: text_of(get(m, "if")),
             },
             _ => Step::default(),
         })

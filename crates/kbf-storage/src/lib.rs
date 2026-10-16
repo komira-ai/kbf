@@ -6,9 +6,9 @@
 //! (`kbf_front::CacheStorage`), and `kbf-server`'s in-process store
 //! (`kbf_server::LocalStore`, what `kbf-all-in-one`'s daemon reads and writes through)
 //! holds an `Arc<dyn Storage>`. The cache's code moves into this crate later; the trait
-//! is the boundary it moves behind, so the callers do not change when it does. A
-//! storage process of its own and a client that routes calls to one will be further
-//! implementations.
+//! is the boundary it moves behind, so the callers do not change when it does. A storage
+//! process of its own serves one over gRPC, and [`service::RemoteStorage`] is the
+//! implementation that calls it ([`service`]).
 //!
 //! Object safe and asynchronous: each call returns a boxed future ([`Answer`]), so a
 //! caller holds `Arc<dyn Storage>` and never names the metadata log or the object store
@@ -25,10 +25,13 @@
 //! This crate depends on no frontend crate: not the scheduler (`kbf-sched`) and not
 //! authorization (`kbf-auth`). `crates/kbf-it/tests/layering.rs` checks it.
 
+pub mod service;
+
 use std::sync::Arc;
 
 use bytes::Bytes;
 use futures::future::BoxFuture;
+use futures::stream::BoxStream;
 use kbf_meta::{ActionRecord, ActionWriteError, Role};
 use kbf_proto::reapi::ActionResult;
 use kbf_proto::worker::segments_server::Segments;
@@ -37,6 +40,14 @@ use tonic::Status;
 
 /// The answer of a [`Storage`] call.
 pub type Answer<'a, T> = BoxFuture<'a, Result<T, StorageError>>;
+
+/// The bytes of a ranged read ([`Storage::read_range`]), in order, in chunks of at most
+/// [`READ_CHUNK_BYTES`]. An item is an error if the read failed after the answer began;
+/// the stream ends after one.
+pub type ReadStream = BoxStream<'static, Result<Bytes, StorageError>>;
+
+/// The largest chunk of a [`ReadStream`]: what a ByteStream `Read` sends in one message.
+pub const READ_CHUNK_BYTES: usize = 1 << 20;
 
 /// The storage service: CAS, action cache, FindMissing and `Segments` over one store.
 pub trait Storage: Send + Sync {
@@ -55,6 +66,36 @@ pub trait Storage: Send + Sync {
     /// [`StorageError::Unreachable`] if it is held but cannot be read.
     fn read_blob<'a>(&'a self, digest: &'a Digest) -> Answer<'a, Bytes>;
 
+    /// The bytes `[offset, offset + limit)` of a blob (to its end when `limit` is 0, the
+    /// ByteStream `read_limit`), as a stream of chunks of at most [`READ_CHUNK_BYTES`],
+    /// after touching it. `offset` equal to the blob's size is an empty stream. A caller
+    /// that lost its connection reads on from the bytes it has: `offset` is where it
+    /// stopped.
+    ///
+    /// **What is verified.** A byte is never in a chunk unless the blob it is from has
+    /// been checked, as a whole, against its digest: a ranged read is verified as
+    /// [`Storage::read_blob`] is, whatever the range, and a blob that fails is
+    /// [`StorageError::Unreachable`], not a short or wrong chunk. So a partial range is
+    /// not "trusted from an index"; an implementation that cannot check a blob before it
+    /// sends its first byte must not offer a read of it. (A resumed read checks the blob
+    /// again.) How much an implementation holds while it verifies is its own to
+    /// document: it is a whole blob unless it can check one in pieces before sending.
+    ///
+    /// The errors are in the answer, before the first chunk, where the code is still
+    /// open to the caller. An `offset` past the end is decided from the digest's size
+    /// alone, before the store is asked.
+    ///
+    /// # Errors
+    /// [`StorageError::OutOfRange`] if `offset` is past the end of the blob;
+    /// [`StorageError::NotFound`] only if the blob is not held;
+    /// [`StorageError::Unreachable`] if it is held but cannot be read; the store failed.
+    fn read_range<'a>(
+        &'a self,
+        digest: &'a Digest,
+        offset: u64,
+        limit: u64,
+    ) -> Answer<'a, ReadStream>;
+
     /// Hashes `bytes` once, stores them under that digest within the store's write
     /// admission (waiting for room, never refusing for it), and answers the digest once
     /// they are durable.
@@ -67,7 +108,7 @@ pub trait Storage: Send + Sync {
     /// A stream for one blob of `size` bytes, written as its bytes arrive and never
     /// held whole in memory: [`PutStream::append`] each chunk, [`PutStream::finish`]
     /// with the digest and CRC-32C, then [`StreamedPut::commit`]. `None` when the store
-    /// cannot take one (no write tier, or no room on it): the caller uses
+    /// cannot take one (no write tier, no room on it, or `size` is 0): the caller uses
     /// [`Storage::put`]. Blocking: call it off the async runtime.
     fn stream(&self, size: u64) -> Option<Box<dyn PutStream>>;
 
@@ -156,6 +197,16 @@ pub enum StorageError {
         /// The digest of the bytes it sent.
         actual: Digest,
     },
+    /// A read starting past the end of the blob. ByteStream answers it OUT_OF_RANGE (a
+    /// `read_offset` greater than the resource's size), which is not a malformed request
+    /// to be fixed but one a caller may make on purpose.
+    #[error("read_offset {offset} is past the end of {digest}")]
+    OutOfRange {
+        /// The blob.
+        digest: Digest,
+        /// The offset asked for.
+        offset: u64,
+    },
     /// A malformed request or stored message, or a blob over the largest the store
     /// accepts.
     #[error("{0}")]
@@ -163,8 +214,10 @@ pub enum StorageError {
     /// An action-cache write was refused.
     #[error(transparent)]
     ActionWrite(#[from] ActionWriteError),
-    /// The store could not answer: its metadata, its objects, its write tier. Worth a
-    /// retry; never turned into "absent".
+    /// The store could not answer: its metadata, its objects, its write tier. The same
+    /// call may succeed later; never turned into "absent". What fails the same way each
+    /// time (a stored object that does not parse, a key that cannot be built) is
+    /// [`StorageError::Internal`] instead.
     #[error(transparent)]
     Unavailable(Arc<dyn std::error::Error + Send + Sync>),
     /// The store's own records disagree. A bug or a broken backend, never the caller's
@@ -178,6 +231,7 @@ impl From<StorageError> for Status {
         let message = e.to_string();
         match e {
             StorageError::NotFound(_) => Self::not_found(message),
+            StorageError::OutOfRange { .. } => Self::out_of_range(message),
             StorageError::DigestMismatch { .. } | StorageError::Invalid(_) => {
                 Self::invalid_argument(message)
             }

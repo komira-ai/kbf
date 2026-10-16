@@ -715,20 +715,14 @@ in scheduling reads them.
 
 The same counters ride in the result, in `ExecutedActionMetadata.auxiliary_metadata`
 as a `kbf.worker.v1.ResourceUsage` whose optional `cgroup` field (`CgroupUsage`) is new;
-a daemon or server that predates it ignores the field. The server logs one INFO line,
-`action usage:`, per run whose result carries a `ResourceUsage`: `exit_code`,
-`mnemonic` and `target` (the `RequestMetadata` the client sent on the Execute, quoted;
-`-` when it sent none), `wall_us`, and the same cgroup fields as above, so a build's
-actions can be grouped by mnemonic or target and their `parallelism` read off.
+a daemon or server that predates it ignores the field.
 
 A lease that ends without a result (timed out, killed, out of memory) has the same
 fields, read from its cgroup before the cgroup is removed (`Runtime::failed_usage`;
 the container driver does it), and carries the `ResourceUsage` in the metadata of the
 `action_result` of its `worker.Result`: the peak memory of an OOM-killed action and the
 CPU of a timed-out one are what the memory ladder needs. A lease killed for memory, its
-own limit or the node's, ends the line with ` oom=1` (no such key otherwise). The
-server does not log `action usage:` for these yet: it reads the usage of an OK result
-only, and keeps of a timeout's partial result only its logs.
+own limit or the node's, ends the line with ` oom=1` (no such key otherwise).
 
 At start the daemon logs the host's NUMA layout once (Linux), from
 `/sys/devices/system/node`: `numa layout: nodes=2 cpus=64 node0=0-15,32-47
@@ -774,6 +768,91 @@ default 4, within `--transfer-in-flight`'s upload share): nothing is copied to s
 A file that is no longer the one that was hashed (replaced, removed, or its size or times
 changed) fails the lease with a read error naming it. The lease's log line `outputs
 phases` says where the time went: `list_ms`, `hash_ms`, `find_missing_ms`, `upload_ms`.
+
+### The server's `action usage:` line
+
+The server logs one INFO line, `action usage:`, per lease report it takes whose
+`action_result` carries a `ResourceUsage`: an OK run, and a failed one the daemon
+measured, whatever the outcome (for example an out-of-memory kill, each rung of the
+memory ladder included, a timeout, an infrastructure failure, a lost run). It reads the usage before it judges the report, since judging
+drops a killed run's result and cuts a timeout's to its logs
+(`kbf_server::action_usage`). The fields, in this order:
+
+| Field | What it is |
+|---|---|
+| `exit_code` | the exit code the daemon reported for a run it says ended (an OK status); `-` for one it reports failed (killed, timed out, lost: none). It is the run's, not the server's verdict: an OK run whose outputs the server cannot store has its exit code and `outcome=infra` |
+| `mnemonic`, `target` | the `RequestMetadata` the client sent on the Execute, quoted; `-` when it sent none (buck2 sends neither) |
+| `wall_us` and the cgroup fields | the run's wall time and the same cgroup fields as the `lease phases:` line above |
+| `key` | the action's shape key, 16 hex digits (below) |
+| `cfg` | the configuration hash an output path named (`<16 hex>` or `<16 hex>-<16 hex>`); `-` for none (buck2's content-hash paths) |
+| `outcome` | how the scheduler judged the report: `ok`, `oom` (the action's own memory limit), `node-pressure`, `timeout`, `infra`, `invalid`, `missing-input`, `lost-restart`, `lost-fenced` |
+| `lease`, `node` | the lease and the node that ran it: the join to the daemon's `lease phases:` and `transfers:` lines |
+
+The fields up to the cgroup fields are those the line had before `key`, in the same
+order; the rest are appended. A report the server refuses (its lease is no longer
+current) has no line: that is how a **cancelled** lease ends. Its usage is in the
+daemon's `lease phases:` line, which joins on `lease=` to the server's `lease granted`
+line, and that line names the `key` too. A report without a `ResourceUsage` has no line.
+
+**The shape key.** buck2 sends no per-action identity (`action_mnemonic` and
+`target_id` are empty in its `RequestMetadata`), and the action digest changes with
+every input, so the key is read from the `Command`: the program it runs and the paths it
+writes, each made independent of the configuration and of the content hashes buck2 puts
+in paths. One target's action keeps its key across builds and configurations (`cfg`
+tells configurations apart); two actions of one target, or two targets, differ.
+
+- Output paths: under `buck-out/<v>/<root>/` (`art`, `art-anon`, `art-bxl`, and the
+  `gen` kinds of older buck2) the prefix up to the root goes, and with it the hashes
+  buck2 puts where its owner's layout says. A target: the configuration hash after the
+  cell, and the content hash or `output_artifacts` placeholder in the one segment right
+  after its `__<name>__` (a hex directory further down is kept).
+  `buck-out/v2/art/cell/<cfg>/pkg/__t__/t.o`,
+  `buck-out/v2/art/cell/pkg/__t__/output_artifacts/t.o` and
+  `buck-out/v2/gen/cell/pkg/__t__/<content>/t.o` are all `cell/pkg/__t__/t.o`; a
+  dynamic action's `__action__<k>__` stays. A target name may hold a `/` (buck2 writes
+  `//pkg:foo/bar` as `__foo/bar__`): a name runs from a segment that starts with `__` to
+  the first later one that ends with `__`. An anonymous target: the configuration hash
+  glued to its package, and the attributes or content hash right before its
+  `__<name>__` (any segment of hex digits there, whatever its length), also where buck2 glues it to the cell (`art-anon/anon<16 hex>/__t__/o`
+  is `anon/__t__/o`); in content mode buck2 glues the cell to the package, which stays
+  glued (a stable key, but not the configuration-hash form's). A BXL function: the
+  execution-platform hash after the cell (as `cfg`) and the arguments or content hash
+  right after its `__<name>__`
+  (`art-bxl/komira/<16 hex>/tools/build/lint/test_weld.bxl/__check__/<16 hex>/test_weld`
+  is `komira/tools/build/lint/test_weld.bxl/__check__/test_weld`). buck2 writes the
+  BXL hashes unpadded; 13 to 16 hex digits are read as a hash, so the 1 in 65 536 with
+  fewer is kept. Scratch paths (`buck-out/<v>/tmp/`) are left out; any other path is
+  kept as sent. The patterns are sorted and deduplicated (buck2 may send one path as
+  both an output file and an output directory), and `cfg` is the first pattern's that
+  names one. An action with no outputs has only its program in the key, so every such
+  action of one program shares a key.
+- **Known limit: remotely run tests.** buck2 writes a test's outputs under
+  `buck-out/v2/test/execution/<cell>/<16 hex>/<16 hex>/…`; the first hash is of the
+  whole target identifier, configuration included, the second of the test cases run.
+  No segment holds the configuration on its own, so the path is kept as sent: such an
+  action keys once per target, configuration and set of test cases (stable across
+  builds), and its line says `cfg=-`.
+- The program: argv\[0\] (normalized the same way under `buck-out`, its file name when
+  it is another absolute path; an argument file's path, after its `@`, the same way),
+  then, while the last word is a bare program name (no `/` and no `@`: a program looked up on `PATH`, such as
+  `env`, a shell or an interpreter, which may only run the next argument), the next
+  argument that is not a flag or a `NAME=value` assignment, up to three words. A `-c`,
+  or a cluster of single-letter flags ending in `c` (`-euc`), ends it, kept as the last
+  word, so a `-c` script never enters the key (a script after `-e`, as Perl or Node
+  take one, does: `-e` is a shell's flag too, so it is skipped). Any such cluster ends
+  it, a linker's `-lc` too (`cc -lc a.o` is `cc -lc`). A buck2 genrule is
+  `env <shell> <cell>/…/genrule.sh`, a prelude Python tool
+  `<interpreter> <cell>/…/<script>.py`, a tool built in the repository its `buck-out`
+  pattern alone. A bare-name compiler is read the same way (`cc -c a.c` is `cc -c`,
+  `cc -o a.o a.c` is `cc a.o a.c`, `clang @<argsfile> a.c` is `clang @<its pattern>`,
+  `clang @<file name>` for an absolute one). The
+  rule lists no program names.
+- The key is the first 8 bytes of SHA-256 over the tag `kbf-shape-v1`, the program's
+  words and the patterns, each length-prefixed. A change to any rule above changes the
+  tag, so keys of two normalizers never mix. `RequestMetadata` never enters the key.
+
+The first time a process sees a key it logs what the key stands for, once:
+`action shape: key=… program="env bash …" outputs=<n> patterns="<first 8>…"`.
 
 ## Measuring usage
 

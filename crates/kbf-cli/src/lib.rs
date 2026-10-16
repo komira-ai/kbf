@@ -6,8 +6,12 @@
 //! - `kbf all-in-one`: the server and the daemon in one process, as `kbf-all-in-one`
 //!   runs them today. Takes exactly the flags `kbf-all-in-one` takes
 //!   ([`kbf_all_in_one::cli`]).
-//! - `kbf frontend`, `kbf storage`, `kbf storage-and-daemon`: not built yet. Each
-//!   exits 2 with one line naming the mode.
+//! - `kbf storage`: the storage node ([`kbf_server::storage_node`]). Takes
+//!   `kbf-server`'s store, write and log flags and its own listener flags, and refuses
+//!   every other flag of `kbf-server` (and so any state-store flag: a storage node
+//!   reaches the state store only through a frontend).
+//! - `kbf frontend`, `kbf storage-and-daemon`: not built yet. Each exits 2 with one line
+//!   naming the mode.
 //!
 //! A mode refuses the flags that belong to another mode ([`refused_by`]): the set is
 //! derived from each mode's own flag set, nothing is listed by hand, so a flag added to
@@ -16,6 +20,12 @@
 //! `kbf --version` prints `kbf <package version>+<commit>`: the commit stamp is
 //! `kbf-server`'s ([`kbf_server::SERVER_VERSION`]), which `kbf-all-in-one` links
 //! anyway, so the artifacts workflow can check `kbf` as it checks `kbf-server`.
+//!
+//! `kbf check-args <mode> [flags...]` ([`check_args`]) parses `kbf <mode> [flags...]`
+//! as a start would, then exits, starting nothing: 0 when the mode would start with
+//! those flags, 2 with clap's message when it would refuse them (and for a mode not
+//! built yet, which refuses every start). `kbf-deploy linux check-units --mode` runs
+//! it on a unit's `ExecStart=`. It is not a mode, so `kbf --help` does not list it.
 //!
 //! The `kbf-server`, `kbf-daemon` and `kbf-all-in-one` binaries are unchanged.
 
@@ -37,6 +47,8 @@ pub enum Invocation {
     Daemon(Box<kbf_node::Cli>),
     /// `kbf all-in-one`.
     AllInOne(Box<kbf_all_in_one::cli::Flags>),
+    /// `kbf storage`.
+    Storage(Box<kbf_server::storage_node::StorageFlags>),
     /// A mode that is not built yet.
     NotBuilt {
         /// The mode.
@@ -55,6 +67,7 @@ fn own_command(entry: Entry) -> Option<Command> {
     match entry {
         Entry::Daemon => Some(kbf_node::Cli::command()),
         Entry::AllInOne => Some(kbf_all_in_one::cli::command()),
+        Entry::Storage => Some(kbf_server::storage_node::command()),
         Entry::NotBuilt => None,
     }
 }
@@ -107,7 +120,7 @@ fn reason(mode: &str, flag: &str) -> String {
 
 fn mode_command(name: &'static str, entry: Entry) -> Command {
     match entry {
-        Entry::Daemon | Entry::AllInOne => {
+        Entry::Daemon | Entry::AllInOne | Entry::Storage => {
             let mut cmd = own_command(entry)
                 .expect("a mode with an entry point has a command line")
                 .name(name)
@@ -175,6 +188,12 @@ where
                 m,
             )?)))
         }
+        Entry::Storage => {
+            refuse_foreign_flags(mode.name, m)?;
+            Ok(Invocation::Storage(Box::new(
+                kbf_server::storage_node::parse(m)?,
+            )))
+        }
         Entry::NotBuilt => Ok(Invocation::NotBuilt { mode: mode.name }),
     }
 }
@@ -215,6 +234,7 @@ pub fn run(invocation: &Invocation) -> ExitCode {
     match invocation {
         Invocation::Daemon(cli) => kbf_node::run(cli),
         Invocation::AllInOne(flags) => kbf_all_in_one::run(flags),
+        Invocation::Storage(flags) => kbf_server::storage_node::run(flags),
         Invocation::NotBuilt { mode } => {
             eprintln!("{}", names::not_built_line(mode));
             ExitCode::from(2)
@@ -222,16 +242,61 @@ pub fn run(invocation: &Invocation) -> ExitCode {
     }
 }
 
+/// The word after `kbf` that checks a command line instead of starting it
+/// ([`check_args`]).
+pub const CHECK_ARGS: &str = "check-args";
+
+/// `kbf check-args <mode> [flags...]`: parses `kbf <mode> [flags...]` as [`main`]
+/// would, and starts nothing (the parse reads no file and opens no socket). `args` is
+/// the whole command line, its first word the program's name and its second
+/// [`CHECK_ARGS`].
+///
+/// # Errors
+/// What [`parse_from`] refuses; a mode not built yet, which every start of it is
+/// refused as; and `--help` or `--version`, which would print and exit 0 without
+/// starting the mode.
+pub fn check_args(args: &[std::ffi::OsString]) -> Result<(), clap::Error> {
+    let argv = args
+        .iter()
+        .take(1)
+        .chain(args.iter().skip(2))
+        .cloned()
+        .collect::<Vec<_>>();
+    match parse_from(argv) {
+        Ok(Invocation::Daemon(_) | Invocation::AllInOne(_) | Invocation::Storage(_)) => Ok(()),
+        Ok(Invocation::NotBuilt { mode }) => {
+            Err(command().error(ErrorKind::InvalidSubcommand, names::not_built_line(mode)))
+        }
+        Err(e) if matches!(e.kind(), ErrorKind::DisplayHelp | ErrorKind::DisplayVersion) => {
+            Err(command().error(
+                ErrorKind::ArgumentConflict,
+                "--help and --version print and exit 0: the mode would not start",
+            ))
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// The `kbf` binary: the daemon's helper re-execs first (a keeper or a `__chown-dirs`
 /// run of this binary never reads the command line as `kbf`'s), then the command line,
-/// then [`run`]. A command line that does not parse exits 2 (0 for `--help` and
-/// `--version`).
+/// then [`check_args`] for `kbf check-args ...` or else [`run`]. A command line that
+/// does not parse exits 2 (0 for `--help` and `--version`).
 #[must_use]
 pub fn main() -> ExitCode {
     if let Some(code) = kbf_node::dispatch_helpers() {
         return code;
     }
-    match parse_from(std::env::args_os()) {
+    let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    if args.get(1).is_some_and(|word| word == CHECK_ARGS) {
+        return match check_args(&args) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                let _ = e.print();
+                ExitCode::from(2)
+            }
+        };
+    }
+    match parse_from(args) {
         Ok(invocation) => run(&invocation),
         Err(e) => e.exit(),
     }

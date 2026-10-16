@@ -26,11 +26,15 @@
 //! - an asset `.github/workflows/artifacts.yml` packages with no `actions/attest-sbom`
 //!   step for it and its own SBOM in the attest job, or such a step for an asset no
 //!   job packages (module `attested_assets`);
+//! - the coverage job's `kbf-coverage --run-id/--repo/--artifact` flags drifting from
+//!   the run and the artifact the job uploads, which breaks the download command the
+//!   ratchet prints (module `coverage_wiring`);
 //! - the scans passing vacuously because git listed nothing, no Markdown file was
 //!   scanned or the workflows moved;
 //! - a drift in the rules that pick which files each lint reads (module `selection`).
 
 mod attested_assets;
+mod coverage_wiring;
 mod interpreters;
 mod test_spawns;
 mod workflows;

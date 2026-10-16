@@ -2,16 +2,24 @@
 # /etc/systemd/system/kbf-all-in-one.service (kbf docs/design/architecture-v2.md,
 # sections 1 and 11). `kbf all-in-one` takes exactly the flags kbf-all-in-one takes:
 # kbf-server's and kbf-daemon's, but --cas, and the container driver only.
+#
+# TRUSTED, SINGLE BOX OR DEVELOPMENT ONLY. Builds run in the process that holds the
+# farm's state and its cold store, as one user. The container driver runs each action
+# as a subordinate id of that user (--userns=nomap), but no test yet proves an action
+# cannot read what the user holds (design section 9); `check-units --mode all-in-one`
+# prints a `WARN trusted:` line until one does.
 [Unit]
 Description=kbf build farm, all in one process
 Wants=network-online.target
-After=network-online.target @MINIO_UNIT@
+After=network-online.target
 
 [Service]
 # The daemon half runs rootless Podman as the kbf user.
 User=@KBF_USER@
 Slice=kbf.slice
 # The daemon half manages its own cgroup: supervisor/ for itself, actions/ for builds.
+# Delegate=yes delegates cpuset with cpu, memory and pids: --lease-placement=numa-node
+# pins each lease to one NUMA node with it (check-units rule `delegate`).
 Delegate=yes
 # kbf-server's peak use (KBF_SERVER_RESERVATION_GIB).
 MemoryMin=@SERVER_MEMORY_MIN@
@@ -19,11 +27,12 @@ OOMScoreAdjust=-925
 CPUWeight=300
 # No MemorySwapMax=: leases may swap, and they live in this unit's cgroup.
 Environment=XDG_RUNTIME_DIR=/run/user/@KBF_UID@
-# AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY of the bucket's MinIO service account,
-# mode 0600: a secret never goes on the command line.
-EnvironmentFile=@KBF_ETC@/s3.env
+# The single box's cold store is a directory beside the daemon's data (design section
+# 11), so the unit holds no cold-store key (check-units rule `credential`).
+# TODO: --state-store=sqlite://@KBF_DATA_DIR@/state.db once `kbf all-in-one` has
+# the flag.
 ExecStart=@KBF_BIN_DIR@/kbf all-in-one \
-    --cold-store=s3://@KBF_S3_BUCKET@?endpoint=@MINIO_S3_ENDPOINT@&conditional-put=true \
+    --cold-store=file://@KBF_DATA_DIR@/cold \
     --meta-dir=@KBF_META_DIR@ \
     --listen=@KBF_LISTEN_HOST@:@KBF_REAPI_PORT@ \
     --reapi-tls-cert=@KBF_ETC@/reapi.pem \
