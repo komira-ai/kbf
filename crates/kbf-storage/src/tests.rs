@@ -1,0 +1,61 @@
+//! The gRPC code each [`StorageError`] answers with.
+
+use std::sync::Arc;
+
+use kbf_meta::ActionWriteError;
+use kbf_types::{Digest, DigestFunction};
+use tonic::Code;
+
+use super::StorageError;
+
+fn digest(byte: u8) -> Digest {
+    Digest::new(DigestFunction::Sha256, [byte; 32], 1)
+}
+
+/// An error the store's backend gave.
+#[derive(Debug, thiserror::Error)]
+#[error("the disk is gone")]
+struct Backend;
+
+/// Catches a code changed for any error: a store that could not answer reported as
+/// NOT_FOUND (which a caller takes as "absent, upload it") or a client's mistake as
+/// UNAVAILABLE (which it retries forever), and a refused action-cache write answered as
+/// anything but the code that says why.
+#[test]
+fn each_error_answers_its_code_and_message() {
+    let (a, b) = (digest(1), digest(2));
+    let cases = [
+        (StorageError::NotFound(a), Code::NotFound),
+        (StorageError::Unreachable(a), Code::Unavailable),
+        (
+            StorageError::DigestMismatch {
+                claimed: a,
+                actual: b,
+            },
+            Code::InvalidArgument,
+        ),
+        (StorageError::Invalid("bad".into()), Code::InvalidArgument),
+        (ActionWriteError::NotDaemon.into(), Code::PermissionDenied),
+        (ActionWriteError::Absent(a).into(), Code::FailedPrecondition),
+        (ActionWriteError::Unreachable(a).into(), Code::Unavailable),
+        (
+            StorageError::Unavailable(Arc::new(Backend)),
+            Code::Unavailable,
+        ),
+        (StorageError::Internal("torn".into()), Code::Internal),
+    ];
+    for (error, code) in cases {
+        let message = error.to_string();
+        let status = tonic::Status::from(error);
+        assert_eq!(status.code(), code, "{message}");
+        assert_eq!(status.message(), message);
+    }
+}
+
+/// Catches an unavailable store's error replaced by a message of its own: the
+/// backend's own words are what an operator reads.
+#[test]
+fn unavailable_says_what_the_backend_said() {
+    let error = StorageError::Unavailable(Arc::new(Backend));
+    assert_eq!(error.to_string(), "the disk is gone");
+}

@@ -19,6 +19,7 @@ kbf-objstore.workspace = true
 kbf-proto.workspace = true
 kbf-sched.workspace = true
 kbf-segments.workspace = true
+kbf-storage.workspace = true
 kbf-store.workspace = true
 kbf-tier.workspace = true
 kbf-types.workspace = true

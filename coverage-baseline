@@ -13,13 +13,14 @@ kbf-baseline              0      0
 kbf-bench                 0      0
 kbf-caps                  2      1
 kbf-cas-conformance       0      -
+kbf-cli                   0      0
 kbf-coverage              0      0
 kbf-daemon               31      6
 kbf-deploy                0      0
 kbf-driver-container      0      0
 kbf-driver-native         0      0
 kbf-estimator             -      -
-kbf-front                47      8
+kbf-front                45      8
 kbf-guest                15      6
 kbf-host                  0      0
 kbf-invocation            0      0
@@ -31,7 +32,7 @@ kbf-mdm                   0      0
 kbf-mdm-api               0      0
 kbf-meta                 10      1
 kbf-node                  0      0
-kbf-objstore             67     20
+kbf-objstore             66     20
 kbf-outputs               0      0
 kbf-proto                 0      0
 kbf-raft                 19     19
@@ -41,6 +42,7 @@ kbf-server                0      0
 kbf-sim                   6      3
 kbf-sim-cell              4     15
 kbf-state                 5     15
+kbf-storage               0      -
 kbf-store                 0      0
 kbf-testkit               0      0
 kbf-threads               0      0

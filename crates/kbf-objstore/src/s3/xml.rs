@@ -2,6 +2,7 @@
 
 use roxmltree::{Document, Node};
 
+use crate::types::Token;
 use crate::{ListPage, ListToken, ObjectInfo, ObjectKey, ObjectStoreError};
 
 /// The code and message of an S3 `<Error>` body; empty when the body is not one (a HEAD
@@ -44,7 +45,7 @@ pub(crate) fn list_page(body: &[u8]) -> Result<ListPage, ObjectStoreError> {
         Some(other) => return Err(bad(format!("<IsTruncated> is {other:?}"))),
     };
     let next = match (truncated, child_text(root, "NextContinuationToken")) {
-        (true, Some(t)) if !t.is_empty() => Some(ListToken(t.to_owned())),
+        (true, Some(t)) if !t.is_empty() => Some(ListToken(Token::Continue(t.to_owned()))),
         (true, _) => return Err(bad("truncated without <NextContinuationToken>".into())),
         (false, _) => None,
     };
@@ -80,7 +81,7 @@ mod tests {
              <Contents><Key>p/b</Key><Size>0</Size></Contents></ListBucketResult>"
         );
         let page = list_page(body.as_bytes()).unwrap();
-        assert_eq!(page.next, Some(ListToken("tok/+=".into())));
+        assert_eq!(page.next, Some(ListToken(Token::Continue("tok/+=".into()))));
         let got: Vec<_> = page
             .objects
             .iter()
