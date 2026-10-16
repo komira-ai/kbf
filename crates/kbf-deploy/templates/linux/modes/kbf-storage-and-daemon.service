@@ -1,0 +1,32 @@
+# Rendered by `kbf-deploy linux render-units --mode storage-and-daemon`; installed as
+# /etc/systemd/system/kbf-storage-and-daemon.service (kbf
+# docs/design/architecture-v2.md, sections 1 and 11). `kbf storage-and-daemon` is not
+# built yet: it exits 2 at start, and `check-units --mode
+# storage-and-daemon` refuses any flag on its command line until kbf takes some.
+[Unit]
+Description=kbf build farm storage node and node daemon
+Wants=network-online.target
+After=network-online.target @MINIO_UNIT@
+
+[Service]
+User=@KBF_USER@
+Slice=kbf.slice
+# The daemon half manages its own cgroup: supervisor/ for itself, actions/ for builds.
+Delegate=yes
+# kbf-server's and the daemon's reservations today.
+MemoryMin=@SERVER_MEMORY_MIN@
+OOMScoreAdjust=-925
+CPUWeight=300
+# No MemorySwapMax=: leases may swap, and they live in this unit's cgroup.
+Environment=XDG_RUNTIME_DIR=/run/user/@KBF_UID@
+# TODO: the cold store's key, readable by the storage half's uid and not by the
+# actions' (design section 9); no EnvironmentFile= until that split exists.
+ExecStart=@KBF_BIN_DIR@/kbf storage-and-daemon
+# TODO: the mode's flags (the storage node's and the daemon's, --frontend,
+# --advertise-addr, the certificate flags), once `kbf storage-and-daemon` has them.
+Restart=on-failure
+# Exit 2 is a command line kbf refused (or a mode not built yet): a restart cannot fix it.
+RestartPreventExitStatus=2
+
+[Install]
+WantedBy=multi-user.target

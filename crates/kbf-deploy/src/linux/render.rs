@@ -77,7 +77,7 @@ pub fn render(
     })
 }
 
-fn values(c: &LinuxConfig, kbf_uid: Option<u32>) -> Values {
+pub(super) fn values(c: &LinuxConfig, kbf_uid: Option<u32>) -> Values {
     let slice_mib =
         (c.minio_reservation_gib + c.server_reservation_gib) * 1024 + c.daemon_memory_min_mib;
     // kbf-daemon --image takes docker://<repo>@sha256:<digest>; KBF_IMAGES holds the

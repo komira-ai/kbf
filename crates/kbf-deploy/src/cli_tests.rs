@@ -429,6 +429,57 @@ fn render_units_then_check_units_exit_0_and_a_broken_unit_exits_1() {
     assert!(out.contains("UNITS BROKEN"), "{out}");
 }
 
+/// Catches `--mode` not reaching the mode verbs through the merged command line (the
+/// converged units rendered or checked instead) and a broken mode unit exiting 0. Like
+/// the test above, these run the lib tests' instantiation of the `linux` arm.
+#[test]
+fn render_units_then_check_units_with_a_mode_exit_0_and_a_broken_unit_exits_1() {
+    let dir = kbf_host::testkit::scratch("cli-render-mode");
+    let units = dir.join("units");
+    let units = units.to_str().expect("utf-8");
+    let mut exec = FakeExec::new(501);
+    let render = [
+        "linux",
+        "render-units",
+        "--config",
+        LINUX_CONFIG,
+        "--out",
+        units,
+        "--kbf-uid",
+        "1500",
+        "--mode",
+        "daemon",
+    ];
+    let (code, out, err) = cli(&mut exec, &no_env, &render);
+    assert_eq!(code, ExitCode::SUCCESS, "{err}");
+    assert!(
+        out.starts_with("rendered kbf.slice kbf-daemon.service into "),
+        "{out}"
+    );
+    let check = [
+        "linux",
+        "check-units",
+        "--config",
+        LINUX_CONFIG,
+        "--dir",
+        units,
+        "--installable",
+        "--mode",
+        "daemon",
+    ];
+    let (code, out, err) = cli(&mut exec, &no_env, &check);
+    assert_eq!(code, ExitCode::SUCCESS, "{out}{err}");
+    assert_eq!(out, "UNIT OK: kbf-daemon.service runs kbf daemon\n");
+
+    let unit = format!("{units}/kbf-daemon.service");
+    let text = std::fs::read_to_string(&unit).expect("rendered");
+    std::fs::write(&unit, text.replace("Delegate=yes", "Delegate=no")).expect("plant");
+    let (code, out, _) = cli(&mut exec, &no_env, &check);
+    assert_eq!(code, ExitCode::FAILURE, "{out}");
+    assert!(out.starts_with("FAIL slice: "), "{out}");
+    assert!(out.contains("UNIT BROKEN"), "{out}");
+}
+
 /// The kit's settings in a file, with a LAN address filled in.
 fn mdm_config(name: &str) -> String {
     let dir = kbf_host::testkit::scratch(name);
