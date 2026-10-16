@@ -332,5 +332,25 @@ async fn a_fill_the_cache_cannot_rename_is_copied_then_removed() {
     assert_eq!(stats.link_fallbacks, 1);
     assert!(!cache.holds(&k));
     assert_eq!(tmp_files(&dir), 0, "the checked file was left in tmp/");
+    // A key whose names are all private: its own writable copy, and no fallback.
+    let only = key(b"private only", false);
+    let root = cas.tree(&[file("out/d", b"private only", false)]);
+    let prefix = dir.join("cache/v1/blobs").join(only.prefix());
+    std::fs::set_permissions(&prefix, std::fs::Permissions::from_mode(0o500)).expect("chmod");
+    let at = crate::support::cache_kit::lease_dir(&dir, "loose-private");
+    let outcome =
+        kbf_daemon::tree::materialize_cached(&cas, &cache, &root, &at, &["out".to_owned()]).await;
+    std::fs::set_permissions(&prefix, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+    assert_eq!(outcome.expect("written").link_fallbacks, 0);
+    assert_eq!(
+        std::fs::read(at.join("out/d")).expect("read"),
+        b"private only"
+    );
+    let mode = std::fs::metadata(at.join("out/d"))
+        .expect("stat")
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o644);
+    assert_eq!(tmp_files(&dir), 0);
     stop(cache, &gates);
 }

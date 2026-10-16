@@ -23,7 +23,7 @@ use kbf_meta::Retention;
 use kbf_objstore::{
     Floor, FsStore, FsStoreError, KeyPrefix, ObjectStore, objects_source, statvfs_source,
 };
-use kbf_storage::local_cache::HeldBytes;
+use kbf_storage::local_cache::{HeldBytes, LocalCache};
 use kbf_store::StdFs;
 use kbf_threads::Topology;
 use kbf_threads::disk::Statvfs;
@@ -223,9 +223,7 @@ where
     let local = args.local_cache.as_ref();
     let (cache, tier) = crate::write_tier::attach_with(cache, hot, local.is_none()).await?;
     let cache = Arc::new(cache);
-    if let Some(local) = local {
-        local.attach_storage(tier_bytes(Arc::clone(&cache)));
-    }
+    share_storage(local, tier_bytes(Arc::clone(&cache)));
     let local = LocalStore::new(Arc::clone(&cache), listeners.segments);
     let _flusher = tier.map(|_| {
         let flusher = crate::write_tier::run_flusher(Arc::clone(&cache), FLUSH_EVERY);
@@ -253,6 +251,14 @@ where
         _flusher,
         _pass,
     })
+}
+
+/// Reports local storage's `bytes` to the node's one cache, if the process has one.
+/// Not generic, so it is compiled once whatever the store.
+fn share_storage(local: Option<&Arc<LocalCache>>, bytes: HeldBytes) {
+    if let Some(local) = local {
+        local.attach_storage(bytes);
+    }
 }
 
 /// What `cache`'s write tier holds on its disk now: its blocks, and any flushed copies

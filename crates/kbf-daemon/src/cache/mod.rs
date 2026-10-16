@@ -169,6 +169,10 @@ impl CacheConfig {
     }
 }
 
+/// What a second input cache on one node's one cache warns: the first is the one counted.
+const UNCOUNTED: &str =
+    "cache: the node's one cache has another input cache; this one is not counted";
+
 /// How leases get cached files unless a test says otherwise.
 #[cfg(target_os = "macos")]
 const PLATFORM_LINK_MODE: LinkMode = LinkMode::Clone;
@@ -426,9 +430,7 @@ impl Cache {
                     .map_or(0, |inner| inner.state().index.total())
             };
             if !local.attach_inputs(Box::new(read)) {
-                tracing::warn!(
-                    "cache: the node's one cache has another input cache; this one is not counted"
-                );
+                tracing::warn!("{UNCOUNTED}");
             }
         }
         let background = Arc::clone(&inner);

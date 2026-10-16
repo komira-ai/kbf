@@ -325,6 +325,18 @@ fn without_flushed_copies_a_flushed_block_is_deleted() {
     ));
     let usage = tier.usage();
     assert_eq!((usage.used, usage.flushed), (0, 0));
+    let other = ack_upload(&tier, &mut index, &bytes(2, 10)).unwrap();
+    fs.fail_at(fs.ops(), kbf_store::Fault::Error);
+    assert!(matches!(
+        tier.flushed(other),
+        Err(TierError::Io { op: "remove", .. })
+    ));
+    assert!(
+        fs.contents(&block_name(other)).is_some(),
+        "left for the next start's sweep"
+    );
+    assert_eq!(fs.contents(&seg_name(other)), None);
+    assert_eq!(tier.usage().used, 0);
 }
 
 /// Catches a start without flushed copies keeping the copies an earlier run kept (a
@@ -357,4 +369,19 @@ fn a_start_without_flushed_copies_deletes_the_earlier_runs_copies() {
     assert_eq!(tier.read(staged, 0, 6).unwrap(), bytes(2, 6));
     let usage = tier.usage();
     assert_eq!((usage.used, usage.flushed), (6, 0));
+    drop(tier);
+    // A copy that cannot be deleted stops the start, whichever step fails.
+    fs.put(&seg_name(flushed), &bytes(1, 10));
+    let ops = {
+        let probe = fs.restart();
+        let start = probe.ops();
+        open_tier(&probe, 3, options, &index).unwrap();
+        probe.ops() - start
+    };
+    for op in 0..ops {
+        let attempt = fs.restart();
+        attempt.fail_at(attempt.ops() + op, kbf_store::Fault::Error);
+        let opened = open_tier(&attempt, 3, options, &index);
+        assert!(matches!(opened, Err(TierError::Io { .. })), "op {op}");
+    }
 }

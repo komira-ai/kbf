@@ -33,7 +33,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use futures::{StreamExt as _, stream};
 use rustix::fs::{Timespec, Timestamps};
 
-use super::fill::{Fetch, InputCounts, InputStats, Source, blocking};
+use super::fill::{Fill, InputCounts, InputStats, Source, blocking};
 use super::layout::{FIXED_MTIME, Key};
 use super::{Cache, LinkMode, bump};
 use crate::cas::{CasError, label};
@@ -54,7 +54,7 @@ struct Names {
 /// copy. The keys are pinned until it returns. After the first error no key is
 /// started, and those started are waited for.
 pub(crate) async fn write_files(
-    cas: &dyn Fetch,
+    cas: &dyn Fill,
     cache: &Cache,
     files: Vec<Copies>,
     private: &[PathBuf],
@@ -65,7 +65,7 @@ pub(crate) async fn write_files(
 /// [`write_files`] with the files' mode in clone mode chosen: a tree's files are
 /// `read_only` (0444, 0555 as the entry), an input's 0644 and 0755.
 pub(crate) async fn write_files_as(
-    cas: &dyn Fetch,
+    cas: &dyn Fill,
     cache: &Cache,
     files: Vec<Copies>,
     private: &[PathBuf],
@@ -158,7 +158,7 @@ impl Names {
 
 /// Places every name of one key.
 async fn place(
-    cas: &dyn Fetch,
+    cas: &dyn Fill,
     cache: &Cache,
     names: Names,
     counts: &InputCounts,
@@ -191,7 +191,7 @@ async fn place(
                 })
                 .await
             }
-            Source::Fetch => fetch_names(cas, cache, &names, counts, want).await,
+            Source::LeaseFetch => fetch_names(cas, cache, &names, counts, want).await,
         };
         match placed {
             Ok(fell_back) => {
@@ -273,33 +273,25 @@ fn from_loose(loose: &Path, names: &Names, mode: LinkMode, want: bool) -> Result
 /// name, and every other name is placed from it as from an entry. Whether that was a
 /// fallback (always, when there are shared names).
 async fn fetch_names(
-    cas: &dyn Fetch,
+    cas: &dyn Fill,
     cache: &Cache,
     names: &Names,
     counts: &InputCounts,
     want: bool,
 ) -> Result<bool, Placing> {
     let (key, clone) = (names.key, cache.link_mode() == LinkMode::Clone);
-    let (first, mode, rest) = match names.shared.split_first() {
-        Some((first, rest)) => {
-            let mode = if clone {
-                clone_mode(key, want)
-            } else {
-                Mode::Entry(key)
-            };
-            (first, mode, (rest.to_vec(), names.private.clone()))
-        }
-        None => {
-            let Some((first, rest)) = names.private.split_first() else {
-                return Ok(false);
-            };
-            let mode = if clone {
-                clone_mode(key, want)
-            } else {
-                Mode::Writable(key.executable)
-            };
-            (first, mode, (Vec::new(), rest.to_vec()))
-        }
+    // `plan` keeps only keys with a name. Shared names first: the others link to it.
+    let shared = !names.shared.is_empty();
+    let (first, rest) = if shared {
+        let rest = (names.shared[1..].to_vec(), names.private.clone());
+        (&names.shared[0], rest)
+    } else {
+        (&names.private[0], (Vec::new(), names.private[1..].to_vec()))
+    };
+    let mode = match (clone, shared) {
+        (true, _) => clone_mode(key, want),
+        (false, true) => Mode::Entry(key),
+        (false, false) => Mode::Writable(key.executable),
     };
     let at = first.clone();
     let file = blocking(move || super::fill::new_file(&at, created(mode))).await;

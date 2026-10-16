@@ -49,7 +49,7 @@ pub(crate) enum Source {
     Loose(PathBuf),
     /// Nothing: the cache could not write the bytes, and the lease fetches them into
     /// its own file.
-    Fetch,
+    LeaseFetch,
 }
 
 /// What one lease's inputs cost and where they came from (`InputStats` in the design;
@@ -132,7 +132,7 @@ impl std::fmt::Display for InputStats {
     }
 }
 
-pub(crate) use crate::cas::Fetch;
+pub(crate) use crate::cas::Fill;
 
 /// A held slot. Dropped, it leaves the fill map and wakes the waiters, handing them
 /// the fill's error if it failed.
@@ -180,7 +180,7 @@ impl Cache {
     /// so the index is not trusted for it.
     pub(crate) async fn get(
         &self,
-        cas: &dyn Fetch,
+        cas: &dyn Fill,
         key: Key,
         stale: bool,
         counts: &InputCounts,
@@ -224,7 +224,7 @@ impl Cache {
     /// Settles `key` while the caller holds its slot: see the module docs.
     async fn settle(
         &self,
-        cas: &dyn Fetch,
+        cas: &dyn Fill,
         key: Key,
         counts: &InputCounts,
     ) -> Result<Got, CasError> {
@@ -269,7 +269,7 @@ impl Cache {
     /// docs. Fails only when the blob cannot be had (the CAS's error).
     async fn fill(
         &self,
-        cas: &dyn Fetch,
+        cas: &dyn Fill,
         key: Key,
         counts: &InputCounts,
     ) -> Result<Source, CasError> {
@@ -286,7 +286,7 @@ impl Cache {
         let at = tmp.clone();
         let Ok(file) = blocking(move || new_file(&at, 0o600)).await else {
             tracing::warn!("cache: {} not inserted: no file in tmp/", key.name());
-            return Ok(Source::Fetch);
+            return Ok(Source::LeaseFetch);
         };
         // The CAS bounds the fetch (the transfer engine: its requests and its byte
         // budget for the whole process).
@@ -298,7 +298,7 @@ impl Cache {
                 return Err(e);
             };
             tracing::warn!("cache: {} not inserted: {why}", key.name());
-            return Ok(Source::Fetch);
+            return Ok(Source::LeaseFetch);
         }
         counts.fetched_bytes.fetch_add(key.size, Ordering::Relaxed);
         let file = file.into_std().await;
@@ -325,29 +325,32 @@ pub(super) fn new_file(path: &std::path::Path, mode: u32) -> std::io::Result<std
 /// goes: the file, if the bytes are `key`'s. Otherwise (they are not, or a read or
 /// write failed) `to` is removed.
 fn copy_checked(from: &std::path::Path, to: &std::path::Path, key: &Key) -> Option<std::fs::File> {
+    let mut file = new_file(to, 0o600).ok()?;
+    match copy_hashing(from, &mut file) {
+        Ok(hash) if hash == key.hash => Some(file),
+        _ => {
+            drop(file);
+            let _ = remove_if_present(to);
+            None
+        }
+    }
+}
+
+/// Copies the file at `from` to the end of `to`, a MiB at a time; the SHA-256 of what
+/// was copied.
+fn copy_hashing(from: &std::path::Path, to: &mut std::fs::File) -> std::io::Result<[u8; 32]> {
     use sha2::Digest as _;
     let mut hasher = sha2::Sha256::new();
-    let mut copied = 0u64;
-    let mut file = new_file(to, 0o600).ok()?;
-    let read = std::fs::File::open(from).and_then(|mut source| {
-        let mut buffer = vec![0; 1 << 20];
-        loop {
-            let n = source.read(&mut buffer)?;
-            if n == 0 {
-                return Ok(());
-            }
-            hasher.update(&buffer[..n]);
-            copied += n as u64;
-            file.write_all(&buffer[..n])?;
+    let mut source = std::fs::File::open(from)?;
+    let mut buffer = vec![0; 1 << 20];
+    loop {
+        let n = source.read(&mut buffer)?;
+        if n == 0 {
+            return Ok(hasher.finalize().into());
         }
-    });
-    let hash: [u8; 32] = hasher.finalize().into();
-    if read.is_ok() && copied == key.size && hash == key.hash {
-        return Some(file);
+        hasher.update(&buffer[..n]);
+        to.write_all(&buffer[..n])?;
     }
-    drop(file);
-    let _ = remove_if_present(to);
-    None
 }
 
 impl Inner {
