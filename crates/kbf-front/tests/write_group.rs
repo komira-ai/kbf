@@ -792,7 +792,7 @@ fn the_defaults_are_the_designs() {
     assert_eq!(d, WriteConfig::DEFAULT);
     assert_eq!(d.linger, Duration::from_millis(2));
     assert_eq!(d.own_segment_bytes, 16 << 20);
-    assert_eq!(d.bytes_in_flight, 6 << 30);
+    assert_eq!(d.bytes_in_flight, 2 << 30);
     assert_eq!(d.puts_in_flight, NonZeroUsize::new(4).expect("4"));
     assert_eq!(d.put_attempts, NonZeroU32::new(3).expect("3"));
     assert_eq!(PUT_BACKOFF, Duration::from_millis(100));

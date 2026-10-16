@@ -948,10 +948,11 @@ async fn without_a_tier_a_record_over_16_mib_is_refused_not_buffered() {
     assert!(front.all_present(&[digest]).await);
 }
 
-/// Catches the remote plane taking a blob over the largest: a record over 5 GiB is
-/// refused with the server's message.
+/// Catches a largest blob on the remote plane (mutant: the 5 GiB cap restored): a
+/// record over 5 GiB, sent to a server with no write tier, is refused for want of a
+/// tier to stream it onto (as one of 16 MiB + 1 is), never as too large.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_blob_over_5_gib_is_refused_by_the_remote_plane() {
+async fn a_blob_over_5_gib_is_refused_only_for_want_of_a_tier() {
     let front = Front::start(Mode::Serve).await;
     let digest = kbf_types::Digest::new(kbf_types::DigestFunction::Sha256, [7; 32], (5 << 30) + 1);
     // Never hashed: the server refuses it by the size its digest claims.
@@ -965,13 +966,8 @@ async fn a_blob_over_5_gib_is_refused_by_the_remote_plane() {
         .engine
         .put_records(vec![record])
         .await
-        .expect_err("too large");
-    assert!(
-        why.to_string()
-            .contains("largest blob this cache accepts (5368709120 bytes)")
-            || why
-                .to_string()
-                .contains("largest blob the cache accepts (5368709120 bytes)"),
-        "{why}"
-    );
+        .expect_err("no tier");
+    let why = why.to_string();
+    assert!(why.contains("no write tier has room"), "{why}");
+    assert!(!why.contains("largest blob"), "{why}");
 }

@@ -10,8 +10,15 @@
 //! Not built yet: TLS (an `https` endpoint is refused) and multipart upload (a single
 //! PUT carries up to 5 GiB; kbf segments are at most 128 MiB).
 
+#[cfg(feature = "testkit")]
+pub mod fake;
+mod multipart;
 mod sigv4;
 mod xml;
+
+pub use multipart::{
+    MAX_PART_BYTES, MAX_PARTS, MIN_PART_BYTES, MULTIPART_THRESHOLD, PART_BYTES, part_size,
+};
 
 use std::fmt;
 use std::num::NonZeroU64;

@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use super::support::{Farm, TestBlob, later};
-use kbf_front::{Cache, CacheError, MAX_BLOB_BYTES};
+use kbf_front::{Cache, CacheError};
 use kbf_meta::BlobAnswer;
 use kbf_objstore::Capabilities;
 
@@ -84,19 +84,15 @@ async fn a_stream_whose_end_does_not_match_its_bytes_is_refused() {
     assert!(matches!(past, CacheError::Tier(_)), "{past:?}");
 }
 
-/// Catches a stream made where it cannot be stored: without a tier, for an empty blob or
-/// one over the largest, and past the tier's budget (counted as a write the tier did not
-/// take) there is no stream; the largest blob itself gets one.
+/// Catches a stream made where it cannot be stored, or refused for its size: without a
+/// tier, for an empty blob, and past the tier's budget (counted as a write the tier did
+/// not take) there is no stream; a blob over 5 GiB gets one when the tier has room.
 #[tokio::test]
 async fn there_is_no_stream_without_a_tier_room_or_a_legal_size() {
     assert!(Arc::new(Cache::memory()).stream(10).is_none(), "no tier");
     let farm = Farm::new(Capabilities::default());
     let cache = Arc::new(farm.start(10_000).await);
     assert!(cache.stream(0).is_none(), "empty");
-    assert!(
-        cache.stream(MAX_BLOB_BYTES + 1).is_none(),
-        "over the largest"
-    );
     assert!(cache.stream(20_000).is_none(), "past the budget");
     let metrics = cache.render_metrics();
     assert!(
@@ -105,5 +101,5 @@ async fn there_is_no_stream_without_a_tier_room_or_a_legal_size() {
     );
     let roomy = Farm::new(Capabilities::default());
     let cache = Arc::new(roomy.start(8 * GIB).await);
-    assert!(cache.stream(MAX_BLOB_BYTES).is_some(), "the largest blob");
+    assert!(cache.stream((5 << 30) + 1).is_some(), "over 5 GiB");
 }

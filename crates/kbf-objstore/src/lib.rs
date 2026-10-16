@@ -9,6 +9,7 @@
 //!
 //! One store value addresses one bucket.
 
+mod body;
 pub mod conformance;
 mod fs_store;
 mod memory;
@@ -20,6 +21,7 @@ use std::time::SystemTime;
 
 use bytes::Bytes;
 
+pub use body::{BodyStream, gather};
 pub use fs_store::{
     Floor, FsStore, FsStoreError, Room, Scanned, ShardScan, SpaceSource, objects_source,
     statvfs_source,
@@ -51,6 +53,21 @@ pub trait ObjectStore: Send + Sync + 'static {
         body: Bytes,
         retain_until: Option<SystemTime>,
     ) -> impl Future<Output = Result<(), ObjectStoreError>> + Send;
+
+    /// Writes an immutable object of `len` bytes taken from `body`. A stand-in until
+    /// the streamed writes land: it gathers the body whole and calls
+    /// [`ObjectStore::put_new`].
+    fn put_stream(
+        &self,
+        key: &ObjectKey,
+        len: u64,
+        body: BodyStream,
+    ) -> impl Future<Output = Result<(), ObjectStoreError>> + Send {
+        async move {
+            let bytes = gather(body, len).await?;
+            self.put_new(key, bytes, None).await
+        }
+    }
 
     /// Reads the bytes of `range` that exist (see [`ByteRange`]).
     fn get_range(

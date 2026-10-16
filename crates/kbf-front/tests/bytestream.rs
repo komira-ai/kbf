@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use common::{Blob, Farm, pseudo_random};
 use futures::channel::mpsc;
-use kbf_front::{MAX_BLOB_BYTES, READ_CHUNK_BYTES};
+use kbf_front::{MAX_UNSTAGED_BLOB_BYTES, READ_CHUNK_BYTES};
 use kbf_proto::google::bytestream::{QueryWriteStatusRequest, ReadRequest, WriteRequest};
 use tonic::Code;
 
@@ -181,14 +181,17 @@ async fn bytestream_write_refuses_wrong_bytes_and_offsets() {
     assert_eq!(status(&farm, &blob).await, (0, false));
 }
 
-/// Catches: a write whose resource name claims more than `MAX_BLOB_BYTES` being
-/// accepted and buffered, so any client can make the front hold as much memory as it
-/// names. The stream is left open after its first message: a front without the cap
-/// waits for the rest and never answers; one with it refuses at once.
+/// Catches: a write whose resource name claims more than one in-memory blob being
+/// admitted for, or buffered to, the size it names (any client could make the front
+/// hold as much memory as it claims), and a large blob refused as too large. A write
+/// naming 5 GiB + 1 bytes, left open after its first message, holds one streamed
+/// write's admission ([`MAX_UNSTAGED_BLOB_BYTES`]) and no receive buffer; when its
+/// stream ends without `finish_write` it is refused, nothing is stored, and the
+/// admission is returned.
 #[tokio::test]
-async fn bytestream_write_refuses_a_blob_over_the_cap_before_buffering() {
+async fn bytestream_write_of_a_huge_blob_is_streamed_not_buffered() {
     let farm = Farm::start().await;
-    let size = MAX_BLOB_BYTES + 1;
+    let size = (5u64 << 30) + 1;
     let name = format!(
         "main/uploads/7d5e6f1a-test/blobs/{}/{size}",
         "ab".repeat(32)
@@ -202,14 +205,27 @@ async fn bytestream_write_refuses_a_blob_over_the_cap_before_buffering() {
     })
     .expect("send");
     let mut client = farm.bytestream();
-    let answer = tokio::time::timeout(Duration::from_secs(10), client.write(rx))
-        .await
-        .expect("refused without waiting for the rest of the blob");
-    assert_eq!(
-        answer.expect_err("over the cap").code(),
-        Code::InvalidArgument
-    );
+    let write = tokio::spawn(async move { client.write(rx).await });
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while farm.cache.bytes_admitted() == 0 {
+        assert!(!write.is_finished(), "{:?}", write.await);
+        assert!(tokio::time::Instant::now() < deadline, "never admitted");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(farm.cache.bytes_admitted(), MAX_UNSTAGED_BLOB_BYTES);
+    assert_eq!(farm.cache.write_buffer_peak(), 0, "nothing buffered whole");
     drop(tx);
+    let refused = tokio::time::timeout(Duration::from_secs(10), write)
+        .await
+        .expect("answered once the stream ended")
+        .expect("joined")
+        .expect_err("no finish_write");
+    assert_eq!(refused.code(), Code::InvalidArgument, "{refused:?}");
+    assert!(
+        refused.message().contains("without finish_write"),
+        "{refused:?}"
+    );
+    assert_eq!(farm.cache.bytes_admitted(), 0);
 }
 
 /// Catches: QueryWriteStatus claiming progress that is not durable: bytes a live

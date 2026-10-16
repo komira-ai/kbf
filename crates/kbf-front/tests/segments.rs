@@ -439,16 +439,18 @@ async fn begin_refuses_what_it_cannot_take() {
     let empty = client.begin(BeginRequest { segments: vec![] }).await;
     assert_eq!(empty.expect_err("no segment").code(), Code::InvalidArgument);
 
-    let huge = support::declared_only(2 * (kbf_front::MAX_BLOB_BYTES + 1) + footer_len(2));
+    // No record is too large; without a write tier one over the in-memory limit is
+    // refused for want of a tier, not as too large.
+    let huge = support::declared_only(2 * ((5 << 30) + 1) + footer_len(2));
     let refused = client
         .begin(BeginRequest {
             segments: vec![huge],
         })
         .await
-        .expect_err("records over the largest blob");
-    assert_eq!(refused.code(), Code::InvalidArgument, "{refused:?}");
+        .expect_err("records too large to hold in memory, and no tier");
+    assert_eq!(refused.code(), Code::ResourceExhausted, "{refused:?}");
     assert!(
-        refused.message().contains("larger than the largest blob"),
+        refused.message().contains("no write tier has room"),
         "{refused:?}"
     );
 

@@ -252,11 +252,12 @@ async fn without_a_tier_a_file_over_1_gib_is_read_once() {
     a_file_over_1_gib_is_read_once(false).await;
 }
 
-/// Catches the planes differing on the largest blob: a record over 5 GiB (S3's
-/// single-PUT limit, the largest blob the cache takes on every path) is refused by the
-/// local plane with the server's own message, before a byte of it is read.
+/// Catches a largest blob on the local plane (mutant: the 5 GiB cap restored): a
+/// record over 5 GiB, S3's single-PUT limit, is taken like any other with a write tier
+/// (a range of its own reserved for it) and its bytes are read; here its source has
+/// none, so the read, not its size, fails it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_blob_over_5_gib_is_refused() {
+async fn a_blob_over_5_gib_is_not_refused_for_its_size() {
     let dir = scratch("over-5-gib");
     let plane = plane(&dir.join("server"), true).await;
     let digest = kbf_types::Digest::new(kbf_types::DigestFunction::Sha256, [7; 32], (5 << 30) + 1);
@@ -268,11 +269,9 @@ async fn a_blob_over_5_gib_is_refused() {
     let why = plane
         .put_records(vec![record])
         .await
-        .expect_err("too large");
-    assert!(
-        why.to_string()
-            .contains("is larger than the largest blob the cache accepts (5368709120 bytes)"),
-        "{why}"
-    );
+        .expect_err("a source with no bytes");
+    let why = why.to_string();
+    assert!(why.contains("could not be read"), "{why}");
+    assert!(!why.contains("largest blob"), "{why}");
     let _ = std::fs::remove_dir_all(&dir);
 }

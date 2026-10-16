@@ -158,7 +158,7 @@ fn one_digest_is_stored_once_and_an_unfinished_file_not_at_all() {
 /// Catches a large file held whole in memory (mutant: a file over the threshold taken
 /// into memory when there is no stream): without a write tier a file of
 /// [`MAX_UNSTAGED_BLOB_BYTES`] is taken into memory and one byte more is not; with one,
-/// the larger file is taken (streamed) and one over the largest blob is not.
+/// the larger file is taken (streamed), however large (mutant: a largest blob).
 #[test]
 fn a_large_file_is_streamed_or_not_taken() {
     assert_eq!(MAX_UNSTAGED_BLOB_BYTES, 16 << 20);
@@ -169,7 +169,7 @@ fn a_large_file_is_streamed_or_not_taken() {
     let (plane, _handle) = tiered(&server, "intake-large");
     let taking = Taking::new(plane);
     assert!(taking.file(MAX_UNSTAGED_BLOB_BYTES + 1).is_some());
-    assert!(taking.file(kbf_front::MAX_BLOB_BYTES + 1).is_none());
+    assert!(taking.file((5 << 30) + 1).is_some());
 }
 
 /// Catches a batch whose server half is gone taken for stored, or hanging: the upload
