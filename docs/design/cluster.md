@@ -4,6 +4,8 @@ Status: design, nothing built. Revised again on 2026-10-15 for the owner's decis
 
 This revision replaces the roles, data-path and leader-only-upload parts of the first draft. It does not modify `ha.md` (PR #303); section 11 says how the two relate.
 
+> **Partly superseded by [frontend.md](frontend.md).** The Envoy and xDS routing (section 6 and 6.1, decision 10, the Envoy rows of section 8, PR 9 of section 9) is replaced by `kbf frontend`, a mode of the one binary that hosts the UI, decides cluster formation, and proxies client traffic to the leader. Formation and discovery (`--bootstrap`, `--join`, `--cluster-id`, `--accept-any-cluster`, in sections 1, 5.1 and 5.3) are replaced by registration with the frontend; `--electable` and the mutable voter count are replaced by automatic voter choice (PR #750). Raft election, the `Takeover` epoch and everything else in this document stand. Where this text still says Envoy, read "the frontend".
+
 ## 1. Decisions
 
 - **[D]** One `kbf` binary with three subcommands. There is no roles system.
@@ -241,7 +243,7 @@ A daemon uses the same seed protocol (including steps 1, 2 and 4), minus the con
 
 **A node cut off from every member** keeps running actions, holds results and retries; a flag sets a ceiling after which it kills them. A cut-off all-in-one node also keeps serving peer fetch to nodes that reach it and local reads of known digests; it does not schedule or commit.
 
-Raft traffic uses its own mutual-TLS listener and is never behind Envoy.
+Raft traffic uses its own mutual-TLS listener and is never behind the frontend.
 
 ### 5.4 Relation to the lock-service pattern
 
@@ -252,13 +254,13 @@ kbf embeds what a lock service such as Chubby, ZooKeeper or etcd provides to the
 | The lock | Raft leadership: at most one leader-ready node per term |
 | The lock's sequence number, used to fence stale holders | The `Takeover` entry's committed index, which is `Welcome.epoch`; daemons refuse a lower one (5.2) |
 | The lock file (who holds it, and the group's membership) | The leader's address and the membership, both in the Raft log (5.3) |
-| Watches | Members answering "who leads and who is a member", and pushing that to Envoy over xDS (6, stage 2) |
+| Watches | Members answering "who leads and who is a member", and publishing that to the frontend, which proxies clients to the leader (frontend.md) |
 
 Why embedded: kbf is open source and has to run anywhere, including trusted-network mode with no other infrastructure. An external coordinator would still need its own seeds and its own operators, so it would move the bootstrap problem and add a second system to run and secure.
 
 Future work only, not designed here: an optional external election backend (etcd, or a Kubernetes Lease) behind the same leadership interface, for organisations that already run one. The fencing epoch would still come from kbf's own log, so nothing downstream of the interface changes.
 
-## 6. Client routing
+## 6. Client routing (superseded by frontend.md; kept as history)
 
 Clients (build clients, CI runners) reach the leader through Envoy. The load balancer never discovers servers on its own. In plain words: servers register by joining the kbf cluster; Envoy learns the servers from the cluster (stage 2) or from a rendered list (stage 1); callers know only Envoy's DNS name and never a server address.
 
@@ -289,7 +291,7 @@ Clients (build clients, CI runners) reach the leader through Envoy. The load bal
 - **Envoy as a single point of failure.** One Envoy is a single point of failure for clients, not for the farm; daemons and peers never go through it. Later, run two stateless Envoys behind the one DNS name. They hold no state beyond their config, so any one serves any request and either can restart or fail. Until then, one Envoy on the client box.
 - Planned restarts of the leader transfer leadership in stage 2.
 
-### 6.1 xDS details (stage 2)
+### 6.1 xDS details (stage 2) (superseded: there is no xDS)
 
 State here what an implementer needs; each item has one golden test.
 
