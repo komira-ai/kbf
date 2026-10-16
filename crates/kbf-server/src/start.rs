@@ -210,7 +210,7 @@ where
 {
     let listeners = args.listeners()?;
     let policy = args.reapi_auth_policy()?;
-    let state = args.open_state_store()?;
+    let state = args.open_state_store().map_err(ServeError::State)?;
     let routes = Routes {
         invocations: policy.invocations_get.is_some(),
         blobs: policy.invocations_get.is_some() && policy.blobs_get.is_some(),
