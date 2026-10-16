@@ -134,7 +134,9 @@ fn builds_with_a_dot_id_names_no_build_and_reads_nothing() {
 /// Catches: an outcome tag this page does not know (the server adds outcomes,
 /// `docs/design/ui-data.md` 6.1) failing the whole page as a malformed answer
 /// (mutant: the `Other` fallback dropped); a known tag with the wrong shape, or an
-/// outcome that is not one tag, rendered as a guess rather than refused.
+/// outcome that is not one tag, rendered as a guess rather than refused; no outcome
+/// yet (`null`) not shown as pending; each on the Build page's rows and on the Action
+/// page, which reads the row flattened into its answer.
 #[test]
 fn an_outcome_of_a_tag_the_page_does_not_know_is_shown_by_its_tag() {
     let base = format!("/v1/invocations/{ID}");
@@ -163,6 +165,33 @@ fn an_outcome_of_a_tag_the_page_does_not_know_is_shown_by_its_tag() {
             &format!("/ui/builds/{ID}"),
         );
         assert_eq!(status, 502, "{malformed}: {html}");
+    }
+    // No outcome yet (`null`) is pending, not malformed.
+    let (status, html) = page(&with_outcome(json!(null)), &format!("/ui/builds/{ID}"));
+    assert_eq!(status, 200, "{html}");
+    assert!(
+        html.contains("<span class=\"pill pending\">pending</span>"),
+        "{html}"
+    );
+
+    // The Action page reads the row flattened into its answer: the same outcomes.
+    let url = format!("{base}/actions/{}", action_digest());
+    for (outcome, pill) in [
+        (
+            json!({"lost": {}}),
+            "<span class=\"pill other\">lost</span>",
+        ),
+        (json!(null), "<span class=\"pill pending\">pending</span>"),
+    ] {
+        let mut a = action(&json!(null));
+        a["outcome"] = outcome.clone();
+        let fake = Fake::default().json(&url, &a);
+        let (status, html) = page(
+            &fake,
+            &format!("/ui/builds/{ID}/actions/{}", action_digest()),
+        );
+        assert_eq!(status, 200, "{outcome}: {html}");
+        assert!(html.contains(pill), "{outcome}: {html}");
     }
 }
 
