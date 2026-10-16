@@ -26,6 +26,7 @@ use std::time::SystemTime;
 
 use kbf_types::{ActionKey, Digest, LeaseId, LeaseKind, OperationId, WaiterId, WorkerId};
 
+use crate::action_usage::Subject;
 use crate::fleet::SoftwareView;
 use crate::stamp::Stamp;
 
@@ -68,6 +69,9 @@ pub struct Waiter {
     pub do_not_cache: bool,
     /// When it was submitted, on the wall clock.
     pub queued: SystemTime,
+    /// What the server's `action usage:` line says the action is; the first caller's
+    /// names the operation.
+    pub usage: Subject,
 }
 
 /// A lease whose `Start` was sent.
@@ -272,6 +276,7 @@ mod tests {
             },
             do_not_cache: n.is_multiple_of(5),
             queued: at(u64::from(n)),
+            usage: Subject::of(kbf_front::Described::default()).0,
         }
     }
 
