@@ -221,6 +221,15 @@ pub enum StorageError {
     /// [`StorageError::Internal`] instead.
     #[error(transparent)]
     Unavailable(Arc<dyn std::error::Error + Send + Sync>),
+    /// The caller's map is older than the node's (`docs/design/architecture-v2.md`,
+    /// section 6, the staleness protocol): the caller refetches the map and tries again.
+    /// `current` is the node's generation. On the wire it is FAILED_PRECONDITION with the
+    /// generation in the [`service::MAP_GENERATION_HEADER`] metadata entry.
+    #[error("STALE_MAP: the node is at map generation {current}")]
+    StaleMap {
+        /// The map generation the node holds.
+        current: u64,
+    },
     /// The store's own records disagree. A bug or a broken backend, never the caller's
     /// fault.
     #[error("internal: {0}")]
@@ -245,6 +254,7 @@ impl From<StorageError> for Status {
             StorageError::ActionWrite(ActionWriteError::Unreachable(_))
             | StorageError::Unreachable(_)
             | StorageError::Unavailable(_) => Self::unavailable(message),
+            StorageError::StaleMap { .. } => Self::unavailable(message),
             StorageError::Internal(_) => Self::internal(message),
         }
     }
