@@ -16,9 +16,21 @@ use super::*;
 
 const STAMP: &str = "20280229T123456Z";
 
+/// Opens a store on `db`. A lock this process held a moment ago can still be held by a
+/// copy of its descriptor in a child another test is starting (between its fork and
+/// its exec, which closes it), so a `Locked` open is tried again for a while; a lock a
+/// store or a restore really holds lasts longer than that.
 fn open(db: &Path) -> SqliteStore {
-    let clock: Arc<dyn Clock> = Arc::new(SystemClock::default());
-    SqliteStore::open(db, clock, Options::default()).expect("open the state file")
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock::default());
+        match SqliteStore::open(db, clock, Options::default()) {
+            Err(SqliteError::Locked { .. }) if Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(10));
+            }
+            opened => return opened.expect("open the state file"),
+        }
+    }
 }
 
 fn put(store: &SqliteStore, key: &str, value: &str) {
@@ -110,12 +122,17 @@ fn backup_holding(dir: &Path, key: &str, value: &str) -> PathBuf {
     file
 }
 
-/// A state file at `<dir>/state.db` holding `old` = `1`, closed.
+/// A state file at `<dir>/state.db` holding `old` = `1`, closed: a copy of one a store
+/// wrote under another name, so no descriptor of its lock was ever open (a restore takes
+/// that lock first).
 fn live_holding_old(dir: &Path) -> PathBuf {
-    let db = dir.join("state.db");
-    let store = open(&db);
+    let seed = dir.join("seed.db");
+    let store = open(&seed);
     put(&store, "old", "1");
     drop(store);
+    assert!(!beside(&seed, "-wal").exists(), "a closed store folds its log in");
+    let db = dir.join("state.db");
+    fs::copy(&seed, &db).expect("copy");
     db
 }
 
