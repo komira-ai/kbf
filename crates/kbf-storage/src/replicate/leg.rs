@@ -145,3 +145,76 @@ impl Leg {
         }
     }
 }
+
+/// The replica's part in one write: a leg that may be lost without the write being.
+///
+/// A leg is lost when the replica cannot be reached (including a stall, and a replica the
+/// map names down): the write goes on to the primary's own store, and whoever commits it
+/// owes the copy ([`crate::replicate::Chain::degrade`]). A replica that answers with a
+/// refusal is not lost; its refusal is the write's.
+pub(crate) struct ReplicaLeg {
+    leg: Option<Leg>,
+    lost: Option<StorageError>,
+}
+
+/// Whether `error` says the replica could not be reached, rather than that it refused.
+fn not_reached(error: &StorageError) -> bool {
+    matches!(error, StorageError::Unavailable(_))
+}
+
+impl ReplicaLeg {
+    pub(crate) fn open(
+        channel: Channel,
+        generation: u64,
+        sender: MemberId,
+        stall: Duration,
+        commit: Duration,
+    ) -> Self {
+        Self {
+            leg: Some(Leg::open(channel, generation, sender, stall, commit)),
+            lost: None,
+        }
+    }
+
+    /// A replica that is not called: lost from the start, for `why`.
+    pub(crate) fn lost(why: StorageError) -> Self {
+        Self {
+            leg: None,
+            lost: Some(why),
+        }
+    }
+
+    /// Hands the next message on, unless the replica is lost.
+    ///
+    /// # Errors
+    /// The replica's refusal.
+    pub(crate) async fn send(&mut self, message: WriteRequest) -> Result<(), StorageError> {
+        let Some(leg) = &mut self.leg else {
+            return Ok(());
+        };
+        match leg.send(message).await {
+            Err(why) if not_reached(&why) => {
+                self.leg = None;
+                self.lost = Some(why);
+                Ok(())
+            }
+            other => other,
+        }
+    }
+
+    /// Ends the call and waits for the replica: `None` if it holds the blob, `Some` why it
+    /// could not be reached.
+    ///
+    /// # Errors
+    /// The replica's refusal.
+    pub(crate) async fn finish(self, size: u64) -> Result<Option<StorageError>, StorageError> {
+        match self.leg {
+            None => Ok(self.lost),
+            Some(leg) => match leg.finish(size).await {
+                Ok(()) => Ok(None),
+                Err(why) if not_reached(&why) => Ok(Some(why)),
+                Err(refusal) => Err(refusal),
+            },
+        }
+    }
+}

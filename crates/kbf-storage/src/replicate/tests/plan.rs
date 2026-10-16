@@ -105,6 +105,7 @@ async fn a_node_with_no_map_has_no_view() {
     let none = crate::replicate::Chain::new(
         Held::none() as Arc<dyn MapSource>,
         crate::replicate::Peers::plain(),
+        Arc::clone(&farm.nodes[0].repairs),
         ChainConfig::default(),
     );
     assert!(none.view(0).expect("no judgement").is_none());
@@ -141,5 +142,34 @@ async fn a_placement_is_confirmed_only_if_the_new_map_keeps_it() {
     assert!(
         matches!(answer, Err(StorageError::StaleMap { current: 4 })),
         "{answer:?}"
+    );
+}
+
+/// Catches a down primary leaving its blobs unwritable, or the wrong node taking over: with
+/// the primary down in the map, the next owner plans the write with the primary as the
+/// copy owed (not called); while the primary is up the next owner refuses a client write.
+#[tokio::test]
+async fn the_next_owner_takes_a_write_whose_primary_is_down() {
+    let farm = Farm::start(3, ChainConfig::default()).await;
+    let up = farm.map(1, 2, &[]);
+    let (digest, primary, replica) = placed(&farm, &up);
+    let down = farm.map(2, 2, &[(primary, MemberState::Down)]);
+    let plan = farm.nodes[replica]
+        .chain
+        .plan(&view(&farm, &down, replica), &digest, None)
+        .expect("plan");
+    let Plan::Primary { replica: owed } = plan else {
+        panic!("{plan:?}");
+    };
+    assert_eq!(
+        (owed.id, owed.state),
+        (farm.nodes[primary].id, MemberState::Down)
+    );
+    let refused = farm.nodes[replica]
+        .chain
+        .plan(&view(&farm, &up, replica), &digest, None);
+    assert!(
+        matches!(refused, Err(StorageError::Invalid(_))),
+        "{refused:?}"
     );
 }

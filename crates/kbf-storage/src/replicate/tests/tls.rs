@@ -5,8 +5,10 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use kbf_map::{Map, Member, MemberId, MemberState, Rule};
+use kbf_store::FaultFs;
 
 use super::farm::NodeMap;
+use crate::repair::{NoLedger, Options, Repairs};
 use crate::replicate::{Chain, ChainConfig, MapSource, Peers};
 use crate::service::tests::fake::{Mem, serve_routes, sha};
 use crate::service::tests::roles::Pki;
@@ -15,6 +17,7 @@ use crate::{Storage, StorageError};
 
 struct Pair {
     mems: [Arc<Mem>; 2],
+    owing: Vec<Arc<Repairs>>,
     addrs: [std::net::SocketAddr; 2],
 }
 
@@ -24,6 +27,7 @@ async fn pair(pki: &Pki, caller_role: &str) -> Pair {
     let mems = [Arc::new(Mem::default()), Arc::new(Mem::default())];
     let maps = [NodeMap::new(MemberId(1)), NodeMap::new(MemberId(2))];
     let mut addrs = Vec::new();
+    let mut owing = Vec::new();
     for i in 0..2 {
         mems[i]
             .knobs
@@ -31,9 +35,15 @@ async fn pair(pki: &Pki, caller_role: &str) -> Pair {
             .store(true, std::sync::atomic::Ordering::SeqCst);
         let (server, _) = pki.node("storage");
         let (_, calls_as) = pki.node(if i == 0 { caller_role } else { "storage" });
+        let repairs = Arc::new(
+            Repairs::open(FaultFs::new(), Options::default(), Arc::new(NoLedger))
+                .expect("a journal"),
+        );
+        owing.push(Arc::clone(&repairs));
         let chain = Chain::new(
             Arc::clone(&maps[i]) as Arc<dyn MapSource>,
             Peers::tls(calls_as),
+            repairs,
             ChainConfig::default(),
         );
         let storage: Arc<dyn Storage> = Arc::clone(&mems[i]) as Arc<dyn Storage>;
@@ -64,6 +74,7 @@ async fn pair(pki: &Pki, caller_role: &str) -> Pair {
     }
     Pair {
         mems,
+        owing,
         addrs: [addrs[0], addrs[1]],
     }
 }
@@ -125,4 +136,6 @@ async fn a_copy_is_admitted_only_from_a_storage_certificate() {
     for mem in &daemon.mems {
         assert!(mem.blobs.lock().expect("lock").is_empty());
     }
+    // A refusal is not a replica that cannot be reached: nothing is owed.
+    assert!(daemon.owing[0].open_records().is_empty());
 }

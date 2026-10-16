@@ -2,6 +2,7 @@
 //! store, a switch that cuts it off, and a map the test publishes.
 
 mod chain;
+mod degrade;
 mod farm;
 mod generation;
 mod leg;

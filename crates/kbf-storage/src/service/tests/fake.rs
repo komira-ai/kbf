@@ -34,6 +34,7 @@ use tonic::transport::Channel;
 use tonic::transport::server::TcpIncoming;
 use tonic::{Request, Response, Status, Streaming};
 
+use crate::repair::Repairs;
 use crate::replicate::{Chain, ChainConfig, MapSource, Peers, View};
 use crate::service::{Admission, Config, MAP_GENERATION_HEADER, RemoteStorage, StorageService};
 use crate::{Answer, PutStream, READ_CHUNK_BYTES, ReadStream, Storage, StorageError};
@@ -566,9 +567,16 @@ impl MapSource for Held {
 /// A service over `mem` that judges writes by `held`, on a loopback port.
 pub(crate) async fn serve_mapped(mem: &Arc<Mem>, held: &Arc<Held>) -> Channel {
     let storage: Arc<dyn Storage> = Arc::clone(mem) as Arc<dyn Storage>;
+    let repairs = Repairs::open(
+        kbf_store::FaultFs::new(),
+        crate::repair::Options::default(),
+        Arc::new(crate::repair::NoLedger),
+    )
+    .expect("a journal");
     let chain = Chain::new(
         Arc::clone(held) as Arc<dyn MapSource>,
         Peers::plain(),
+        Arc::new(repairs),
         ChainConfig::default(),
     );
     let service = StorageService::new(

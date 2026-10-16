@@ -55,9 +55,24 @@
 //! match, a role that may not copy) is the writer's answer; so is a failure of the
 //! primary's own store. If the map turned while the blob was written, the primary checks
 //! the new map still places it as it did (STALE_MAP otherwise) before it commits.
-//! A replica that cannot be reached, or does not take a message within
-//! [`ChainConfig::stall`] or commit within [`ChainConfig::commit`], fails the write
-//! UNAVAILABLE.
+//!
+//! # One copy, and the copy owed
+//!
+//! A replica that cannot be reached (the connection fails, it takes no message within
+//! [`ChainConfig::stall`], it does not commit within [`ChainConfig::commit`], or the map
+//! names it down) does not fail the write, and a write is not answered with one copy
+//! unless the copy is owed: **the primary answers only after it has made a record of the
+//! copy durable in its repair journal** ([`crate::repair::Journal`]), and the record is made
+//! before the blob is present on the primary. A failure to make it is the write's: the
+//! primary does not hold the blob and does not answer. The frontend is told after (the
+//! [`crate::repair::RepairLedger`] seam) and never waited for.
+//!
+//! What counts as unreachable is `StorageError::Unavailable` of the replica's answer; its
+//! refusals are not (a stale map, a digest that does not match, a role that may not copy, a
+//! failure of its store).
+//!
+//! If the *primary* is the owner the map names down, the next owner takes the write as
+//! if it were primary and owes the first owner its copy.
 
 mod chain;
 mod leg;
@@ -71,7 +86,9 @@ use kbf_map::{Map, MemberId};
 pub(crate) use chain::Plan;
 pub use chain::{Chain, ChainConfig};
 pub use leg::LEG_HEADER;
+#[cfg(test)]
 pub(crate) use leg::Leg;
+pub(crate) use leg::ReplicaLeg;
 pub use peers::Peers;
 pub(crate) use staging::Staging;
 

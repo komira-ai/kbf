@@ -9,12 +9,19 @@
 //! second copy exists.
 
 mod journal;
+mod ledger;
 #[cfg(test)]
 mod tests;
 
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+
 pub use journal::{JOURNAL, JOURNAL_TMP, Journal, JournalError, Options};
 use kbf_map::MemberId;
+use kbf_store::Fs;
 use kbf_types::Digest;
+pub use ledger::{NoLedger, RepairLedger};
+
+use crate::StorageError;
 
 /// A blob this node holds that another owner does not yet.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -26,4 +33,84 @@ pub struct RepairRecord {
     pub replica: MemberId,
     /// The map generation the write was acknowledged under.
     pub generation: u64,
+}
+
+/// What [`Repairs`] needs of a journal, so it need not be generic over the disk it is on.
+trait Debts: Send {
+    fn owed(&mut self, record: RepairRecord) -> Result<(), JournalError>;
+    fn records(&self) -> Vec<RepairRecord>;
+}
+
+impl<F: Fs + Send> Debts for Journal<F>
+where
+    F::File: Send,
+{
+    fn owed(&mut self, record: RepairRecord) -> Result<(), JournalError> {
+        Journal::owed(self, record)
+    }
+
+    fn records(&self) -> Vec<RepairRecord> {
+        Journal::records(self).copied().collect()
+    }
+}
+
+/// The copies this node owes: the journal on its disk, and the seam through which a
+/// frontend is told ([`RepairLedger`]).
+///
+/// **The rule this exists for.** A write is answered with one copy only after
+/// [`Repairs::owe`] has returned: the record is on the disk. The frontend is told after
+/// that, and never waited for.
+pub struct Repairs {
+    debts: Arc<Mutex<Box<dyn Debts>>>,
+    ledger: Arc<dyn RepairLedger>,
+}
+
+impl Repairs {
+    /// The debts in `fs`'s directory (creating the journal), reporting to `ledger`.
+    ///
+    /// # Errors
+    /// The journal cannot be opened ([`Journal::open`]).
+    pub fn open<F>(
+        fs: F,
+        options: Options,
+        ledger: Arc<dyn RepairLedger>,
+    ) -> Result<Self, JournalError>
+    where
+        F: Fs + Send + 'static,
+        F::File: Send,
+    {
+        let journal = Journal::open(fs, options)?;
+        Ok(Self {
+            debts: Arc::new(Mutex::new(Box::new(journal))),
+            ledger,
+        })
+    }
+
+    fn lock(debts: &Mutex<Box<dyn Debts>>) -> MutexGuard<'_, Box<dyn Debts>> {
+        debts.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Records `record` as owed. It is durable when this returns; the ledger is told
+    /// afterwards, off to the side.
+    ///
+    /// # Errors
+    /// [`StorageError::Unavailable`] if the journal could not make it durable (or has
+    /// stopped after an earlier failure): nothing is owed, and the caller must not answer
+    /// the write with one copy.
+    pub async fn owe(&self, record: RepairRecord) -> Result<(), StorageError> {
+        let debts = Arc::clone(&self.debts);
+        tokio::task::spawn_blocking(move || Self::lock(&debts).owed(record))
+            .await
+            .map_err(|e| StorageError::Internal(format!("the repair journal: {e}")))?
+            .map_err(|e| StorageError::Unavailable(Arc::new(e)))?;
+        let ledger = Arc::clone(&self.ledger);
+        tokio::spawn(async move { ledger.owed(&record).await });
+        Ok(())
+    }
+
+    /// Every copy owed now, in digest order.
+    #[must_use]
+    pub fn open_records(&self) -> Vec<RepairRecord> {
+        Self::lock(&self.debts).records()
+    }
 }

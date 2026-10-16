@@ -9,7 +9,7 @@ use kbf_types::Digest;
 use tonic::{Status, Streaming};
 
 use super::StorageService;
-use crate::replicate::{Leg, Plan, Staging, View};
+use crate::replicate::{Plan, ReplicaLeg, Staging, View};
 use crate::{PutStream, StorageError, StreamedPut};
 
 /// What a streamed write takes from [`super::Config::write_bytes_in_flight`]: room for the
@@ -79,9 +79,14 @@ impl StorageService {
             u32::try_from(room).map_or(self.write_room_bytes, |r| r.min(self.write_room_bytes));
         // The semaphore is never closed.
         let _room = self.write_room.acquire_many(room).await.ok();
-        let staged = receive(digest, put, first, &mut rest, leg).await?;
+        let (staged, lost) = receive(digest, put, first, &mut rest, leg).await?;
         if let (Some(chain), Some(view)) = (&self.chain, view) {
             chain.confirm(view, &digest, leg_from, &plan)?;
+            // The only way past a lost replica: the copy owed is on the disk before the
+            // blob is present here, so a blob present here is replicated or owed.
+            if let (Plan::Primary { replica }, Some(why)) = (&plan, lost) {
+                chain.degrade(view, replica, &digest, &why).await?;
+            }
         }
         staged.commit().await?;
         Ok(())
@@ -150,15 +155,16 @@ async fn next(stream: &mut Streaming<WriteRequest>) -> Result<WriteRequest, Stat
 
 /// Streams the blob `digest` into `put`, and on to `leg` if there is one, a message at
 /// a time. The blob is checked against its digest as it passes, and the replica's
-/// answer awaited: the result is a blob written and verified here and held by the
-/// replica, not yet present on this node ([`StreamedPut::commit`]).
+/// answer awaited: the result is a blob written and verified here, not yet present on this
+/// node ([`StreamedPut::commit`]), and why the replica could not be reached if it
+/// could not (it holds the blob if that is `None`).
 async fn receive(
     digest: Digest,
     put: Box<dyn PutStream>,
     first: WriteRequest,
     rest: &mut Streaming<WriteRequest>,
-    mut leg: Option<Leg>,
-) -> Result<Box<dyn StreamedPut>, Status> {
+    mut leg: Option<ReplicaLeg>,
+) -> Result<(Box<dyn StreamedPut>, Option<StorageError>), Status> {
     let mut staging = Staging::start(put, digest);
     let mut received = 0;
     let mut message = first;
@@ -185,10 +191,8 @@ async fn receive(
     let (staged, replica) = tokio::join!(staging.finish(), async {
         match leg {
             Some(leg) => leg.finish(digest.size_bytes).await,
-            None => Ok(()),
+            None => Ok(None),
         }
     });
-    let staged = staged?;
-    replica?;
-    Ok(staged)
+    Ok((staged?, replica?))
 }
