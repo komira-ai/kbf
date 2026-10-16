@@ -92,10 +92,10 @@ fn the_state_file_defaults_to_the_data_directory() {
     );
 }
 
-/// Catches an all-in-one that takes Postgres (its single frontend is the process
-/// itself, and the design gives it SQLite always), and a relative data directory, which
-/// the daemon half refuses after the server half has already made its state file in the
-/// working directory. Each refusal says what to do instead.
+/// Catches an all-in-one that takes Postgres (not wired yet: any value but a SQLite path
+/// is refused with a fixed message), and a relative data directory, which the daemon half
+/// refuses after the server half has already made its state file in the working
+/// directory.
 #[test]
 fn postgres_and_a_relative_data_directory_are_refused() {
     let refused = flags(&[
@@ -103,12 +103,8 @@ fn postgres_and_a_relative_data_directory_are_refused() {
         "--state-store=postgres://db.example/kbf",
     ])
     .expect_err("refused");
-    assert_eq!(refused.kind(), ErrorKind::ArgumentConflict);
     let said = refused.to_string();
-    assert!(
-        said.contains("SQLite") && said.contains("kbf-server"),
-        "{said}"
-    );
+    assert!(said.contains("only sqlite:///<absolute path>"), "{said}");
     let relative = flags(&["--driver=container", "--data-dir=kbf-data"]).expect_err("relative");
     assert_eq!(relative.kind(), ErrorKind::ArgumentConflict);
     assert!(
@@ -122,4 +118,27 @@ fn postgres_and_a_relative_data_directory_are_refused() {
         "--state-store=sqlite:///s.db",
     ])
     .expect("named file");
+}
+
+/// Catches a refused `--state-store` that quotes its value back: clap echoes the value of
+/// a parser's refusal (`invalid value '...'`), the command line is world-readable, and
+/// the error goes to stderr and the journal. Each value holds a password in a form a
+/// mistyped URL takes: user information, no `://`, a scheme position, and a parameter.
+#[test]
+fn a_refused_state_store_never_echoes_its_value() {
+    for value in [
+        "postgres://kbf:hunter2@db/x",
+        "postgres:kbf:hunter2@db/x",
+        "postgres:kbf:hunter2@db://x",
+        "postgres://db/x?user=kbf&password=hunter2",
+        "sqlite://hunter2",
+    ] {
+        let arg = format!("--state-store={value}");
+        let refused = flags(&["--driver=container", &arg]).expect_err(value);
+        let said = refused.to_string();
+        for secret in ["hunter2", "kbf:", "kbf@", "password="] {
+            assert!(!said.contains(secret), "{value}: {said}");
+        }
+        assert!(said.contains("--state-store: "), "{value}: {said}");
+    }
 }

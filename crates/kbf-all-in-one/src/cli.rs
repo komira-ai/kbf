@@ -12,7 +12,7 @@
 //!
 //! The scheduler's state is always SQLite (`docs/design/architecture-v2.md`, section 1):
 //! `--state-store` is given as `sqlite:///absolute/path`, or left out for
-//! `<data-dir>/state.db`, beside the daemon's data. A `postgres://` value is refused.
+//! `<data-dir>/state.db`, beside the daemon's data. Any other value is refused.
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -30,10 +30,10 @@ const STATE_FILE: &str = "state.db";
 /// `--state-store` here, in place of the server's: this binary always has one.
 const STATE_STORE_HELP: &str = "Where the scheduler keeps its state, written before each change \
     is acknowledged and replayed at start: `sqlite:///absolute/path`, a file on a local disk \
-    that this process owns (created, with its directory, if missing; every start is a new \
-    epoch, so the daemon kills the runs of the leases it held before). Left out, it is \
-    `<data-dir>/state.db`. A `postgres://` value is refused: this binary is one frontend and \
-    keeps its state in SQLite";
+    that this process owns (created, with its directory, if missing; the file is 0600 and a \
+    directory it makes 0700; every start is a new epoch, so the daemon kills the runs of the \
+    leases it held before). Left out, it is `<data-dir>/state.db`. Any other value, \
+    `postgres://` included, is refused (Postgres is not wired yet)";
 
 /// The one command: the daemon's flags, then the server's that do not share a name with
 /// one of them.
@@ -47,8 +47,6 @@ pub fn command() -> Command {
         .cloned()
         .map(|a| match a.get_id().as_str() {
             "state_store" => a.help(STATE_STORE_HELP),
-            // Only a Postgres store has a password, and this binary has none.
-            "state_store_password_file" => a.hide(true),
             _ => a,
         })
         .collect();
@@ -71,7 +69,7 @@ pub struct Flags {
 /// Both halves' flags from what [`command`] matched.
 ///
 /// # Errors
-/// A `--driver` other than `container`, `--cas`, a `postgres://` `--state-store`, or
+/// A `--driver` other than `container`, `--cas`, or
 /// a relative `--data-dir` (which the state file would be put in).
 pub fn parse(matches: &ArgMatches) -> Result<Flags, clap::Error> {
     let refuse = |message: String| command().error(ErrorKind::ArgumentConflict, message);
@@ -92,28 +90,18 @@ pub fn parse(matches: &ArgMatches) -> Result<Flags, clap::Error> {
     }
     let daemon = kbf_node::Cli::from_arg_matches(matches)?;
     let mut server = kbf_server::Args::from_arg_matches(matches)?;
-    match &server.state_store {
-        Some(kbf_server::StateStoreUri::Postgres(_)) => {
-            return Err(refuse(
-                "--state-store: kbf-all-in-one keeps its state in SQLite; run kbf-server \
-                 and kbf-daemon for a postgres:// state store"
-                    .to_owned(),
-            ));
+    if server.state_store.is_none() {
+        let dir = matches
+            .get_one::<PathBuf>("data_dir")
+            .cloned()
+            .unwrap_or_else(|| PathBuf::from(kbf_node::DEFAULT_DATA_DIR));
+        if !dir.is_absolute() {
+            return Err(refuse(format!(
+                "--data-dir {}: must be absolute (the state file {STATE_FILE} goes in it)",
+                dir.display()
+            )));
         }
-        Some(kbf_server::StateStoreUri::Sqlite(_)) => {}
-        None => {
-            let dir = matches
-                .get_one::<PathBuf>("data_dir")
-                .cloned()
-                .unwrap_or_else(|| PathBuf::from(kbf_node::DEFAULT_DATA_DIR));
-            if !dir.is_absolute() {
-                return Err(refuse(format!(
-                    "--data-dir {}: must be absolute (the state file {STATE_FILE} goes in it)",
-                    dir.display()
-                )));
-            }
-            server.state_store = Some(kbf_server::StateStoreUri::Sqlite(dir.join(STATE_FILE)));
-        }
+        server.state_store = Some(kbf_server::StateStoreUri::Sqlite(dir.join(STATE_FILE)));
     }
     // The thread flags matched are the daemon's.
     server.threads = kbf_threads::PoolArgs::default();

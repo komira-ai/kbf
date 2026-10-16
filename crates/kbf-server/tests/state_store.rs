@@ -52,14 +52,36 @@ enum Backing {
 
 enum Inner {
     Fake(Fake),
-    Sqlite(SqliteStore),
+    Sqlite(Tracked),
+}
+
+/// A SQLite store that records when it is closed, so a test can tell a restart that
+/// closed the store and opened the file again from one that kept the same object.
+struct Tracked {
+    store: SqliteStore,
+    closed: Arc<AtomicBool>,
+}
+
+impl Tracked {
+    fn new(store: SqliteStore) -> Self {
+        Self {
+            store,
+            closed: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+
+impl Drop for Tracked {
+    fn drop(&mut self) {
+        self.closed.store(true, Ordering::SeqCst);
+    }
 }
 
 impl Inner {
     fn store(&self) -> &dyn Store {
         match self {
             Inner::Fake(store) => store,
-            Inner::Sqlite(store) => store,
+            Inner::Sqlite(tracked) => &tracked.store,
         }
     }
 }
@@ -107,6 +129,14 @@ impl Flaky {
         }
     }
 
+    /// Set once the SQLite store this wraps is dropped; none over the fake.
+    fn closed(&self) -> Option<Arc<AtomicBool>> {
+        match &self.inner {
+            Inner::Sqlite(tracked) => Some(Arc::clone(&tracked.closed)),
+            Inner::Fake(_) => None,
+        }
+    }
+
     fn set_down(&self, down: bool) {
         self.down.store(down, Ordering::SeqCst);
         if !down {
@@ -123,11 +153,12 @@ impl Flaky {
     fn restart(self) -> Self {
         let inner = match self.inner {
             Inner::Fake(fake) => Inner::Fake(fake.restart()),
-            Inner::Sqlite(store) => {
-                // Dropping the store ends its writer and releases the file's lock.
-                let path = store.path().to_owned();
-                drop(store);
-                Inner::Sqlite(open_sqlite(&path))
+            Inner::Sqlite(tracked) => {
+                // Dropping the store ends its writer and releases the file's lock; the
+                // file is then opened again by its path, as a new process does.
+                let path = tracked.store.path().to_owned();
+                drop(tracked);
+                Inner::Sqlite(Tracked::new(open_sqlite(&path)))
             }
         };
         Self::over(inner)
@@ -190,7 +221,7 @@ impl Disk {
             Backing::Sqlite => {
                 let dir = Scratch::new();
                 let store = open_sqlite(&dir.0.join("state.db"));
-                (Some(Inner::Sqlite(store)), Some(dir))
+                (Some(Inner::Sqlite(Tracked::new(store))), Some(dir))
             }
         };
         let store = inner.map_or_else(Flaky::new, Flaky::over);
@@ -215,11 +246,34 @@ impl Disk {
     }
 
     /// The process dies: its farm is gone, and the store reopens as the disk left it.
+    /// Over SQLite the old store must be closed and the file opened again (not the same
+    /// object kept), and the new store must read every row the old one held.
     fn crash(&mut self, farm: TestFarm) {
         drop(farm);
+        let closed = self.store.closed();
+        let rows = closed.as_ref().map(|_| self.all_rows());
         // The placeholder holds no file: a SQLite store must be closed before it reopens.
         let store = Arc::into_inner(std::mem::replace(&mut self.store, Arc::new(Flaky::new())));
         self.store = Arc::new(store.expect("nothing else holds the store").restart());
+        if let (Some(closed), Some(rows)) = (closed, rows) {
+            assert!(
+                closed.load(Ordering::SeqCst),
+                "the restart kept the store open"
+            );
+            let reopened = self.store.closed().expect("a SQLite store");
+            assert!(!Arc::ptr_eq(&closed, &reopened), "the same store object");
+            assert!(!reopened.load(Ordering::SeqCst), "the new store is open");
+            assert!(!rows.is_empty(), "the test wrote nothing before the crash");
+            assert_eq!(
+                self.all_rows(),
+                rows,
+                "the reopened file lost what was written"
+            );
+        }
+    }
+
+    fn all_rows(&self) -> Vec<(String, Versioned)> {
+        self.store.scan_prefix("").expect("scan")
     }
 
     fn rows(&self, prefix: &str) -> usize {
@@ -716,6 +770,8 @@ async fn lost_leases_are_counted_across_a_restart_and_the_third_is_refused(backi
         assert_eq!(disk.rows("loss/"), 1, "the count is written");
     }
     disk.crash(before);
+    assert_eq!(disk.rows("loss/"), 1, "the count survived the restart");
+    assert_eq!(disk.rows("op/"), 1, "the operation survived the restart");
 
     let after = disk.farm(EpochPolicy::Keep);
     let (stream, mut inbox) = register(&after);
@@ -893,53 +949,6 @@ fn a_second_frontend_on_the_same_sqlite_file_is_refused() {
     assert!(said.contains("state.db.lock"), "{said}");
     drop(first);
     store_from_flag(&dir.0).expect("free again");
-}
-
-/// The Postgres store as a start opens it, from `KBF_TEST_POSTGRES_URL` split into the
-/// URL the flag takes and the password file it names.
-#[cfg(feature = "postgres")]
-fn postgres_from_flag(dir: &std::path::Path) -> Result<StateStore, StateError> {
-    let url = std::env::var("KBF_TEST_POSTGRES_URL").expect("KBF_TEST_POSTGRES_URL names a server");
-    let (scheme, rest) = url.split_once("://").expect("a postgres:// URL");
-    let (userinfo, host) = rest.rsplit_once('@').expect("a user and password");
-    let (user, password) = userinfo.split_once(':').expect("a password");
-    let file = dir.join("password");
-    std::fs::write(&file, format!("{password}\n")).expect("the password file");
-    let args = <kbf_server::Args as clap::Parser>::parse_from([
-        "kbf-server".to_owned(),
-        format!("--state-store={scheme}://{user}@{host}"),
-        format!("--state-store-password-file={}", file.display()),
-    ]);
-    args.open_state_store()
-        .map(|state| state.expect("the flag is given"))
-}
-
-/// Catches: the Postgres store opened from inside a runtime (its blocking client panics
-/// there, and every call of a handler is one), a password file not reaching the login,
-/// and a restart that loses the queue or bumps the epoch (a Postgres start keeps it: a
-/// frontend start must not kill every daemon's runs).
-#[cfg(feature = "postgres")]
-#[tokio::test(flavor = "current_thread")]
-#[ignore = "needs a Postgres server (KBF_TEST_POSTGRES_URL); the state-postgres CI job runs it"]
-async fn an_operation_submitted_over_postgres_survives_a_restart() {
-    let dir = Scratch::new();
-    let before = farm_over(postgres_from_flag(&dir.0).expect("a first start"));
-    let epoch = before.lease_epoch();
-    submit(&before, request(1)).expect("queued, no worker yet");
-    drop(before);
-
-    let after = farm_over(postgres_from_flag(&dir.0).expect("a second start"));
-    assert_eq!(
-        after.lease_epoch(),
-        epoch,
-        "a Postgres start keeps the epoch"
-    );
-    let (_, mut inbox) = register(&after);
-    assert_eq!(
-        starts(&mut inbox).len(),
-        1,
-        "the queued operation was recovered"
-    );
 }
 
 fn listeners() -> Listeners {

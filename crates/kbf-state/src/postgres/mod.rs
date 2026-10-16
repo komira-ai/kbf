@@ -176,14 +176,6 @@ impl PostgresConfig {
         self
     }
 
-    /// Connects with `password`, whatever the URL says. A caller reads the password from
-    /// a file, so it is never on the command line or in the URL it logs.
-    #[must_use]
-    pub fn with_password(mut self, password: &str) -> PostgresConfig {
-        self.pg.password(password);
-        self
-    }
-
     /// Opens at most `n` connections (at least one).
     #[must_use]
     pub fn with_max_connections(mut self, n: usize) -> PostgresConfig {

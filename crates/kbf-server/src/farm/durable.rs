@@ -92,10 +92,10 @@ pub enum StateError {
     #[error("a state store value cannot be encoded: {0}")]
     Encode(#[from] kbf_log::EncodeError),
     /// This build has no backend for the store's scheme.
-    #[error("this build has no {0} state store backend (build with the `{0}` feature)")]
+    #[error("this build has no {0} state store backend")]
     NoBackend(&'static str),
     /// The store could not be opened: its file is held by another process or is not a
-    /// state store, its server cannot be reached, or its URL or password file is bad.
+    /// state store, or its directory cannot be made.
     #[error("the state store cannot be opened: {0}")]
     Open(String),
 }

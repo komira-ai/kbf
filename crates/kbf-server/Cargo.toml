@@ -7,12 +7,6 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
-[features]
-# The Postgres state store (`--state-store=postgres://...`): kbf-state's `postgres`
-# feature, with its blocking client. Off by default: a build without it refuses a
-# `postgres://` value at start and carries no database client.
-postgres = ["kbf-state/postgres"]
-
 [dependencies]
 axum = { workspace = true, features = ["http1", "tokio"] }
 clap.workspace = true

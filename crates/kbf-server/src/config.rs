@@ -347,24 +347,21 @@ pub struct Args {
     #[arg(long, default_value_t = kbf_front::InputTreeConfig::DEFAULT.reads_in_flight)]
     pub input_tree_reads_in_flight: NonZeroUsize,
     /// Where the scheduler keeps its state, written before each change is acknowledged and
-    /// replayed at start: `sqlite:///absolute/path` (a file on a local disk that this
-    /// process owns; every start is a new epoch, so daemons kill the runs of the leases
-    /// they held before) or `postgres://...` (a database that outlives the process; a
-    /// start keeps its epoch, so daemons keep their runs). Any other scheme is refused.
-    /// A SQLite file is created, with its directory, if missing, and held by one process
-    /// (a second frontend on it refuses to start); a `postgres://` value needs a build
-    /// with the `postgres` feature and carries no password (see
-    /// `--state-store-password-file`). Left out, the scheduler's state is in memory and a
-    /// restart loses it
+    /// replayed at start: `sqlite:///absolute/path`, a file on a local disk that this
+    /// process owns. Every start is a new epoch, so daemons kill the runs of the leases
+    /// they held before. The file is created, with its directory, if missing (0600, and
+    /// 0700 for a directory it makes) and held by one process: a second frontend on it
+    /// refuses to start. Any other value, `postgres://` included, is refused (Postgres is
+    /// not wired yet). Left out, the scheduler's state is in memory and a restart loses it
     // Listed beside `--meta-dir`, whose place in the help it takes without moving the
     // flags declared after it.
-    #[arg(long, value_name = "URI", display_order = 5)]
+    #[arg(
+        long,
+        value_name = "URI",
+        value_parser = crate::state_store::StateStoreParser,
+        display_order = 5,
+    )]
     pub state_store: Option<crate::state_store::StateStoreUri>,
-    /// A file whose first line is the password of a `postgres://` `--state-store` (the
-    /// command line is readable by every user of the machine, so the URL carries none:
-    /// one that does is refused). Keep it readable by this process's user alone.
-    #[arg(long, value_name = "FILE", requires = "state_store", display_order = 5)]
-    pub state_store_password_file: Option<PathBuf>,
 }
 
 /// This server in the tier registry. A farm runs one server today
