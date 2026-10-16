@@ -43,6 +43,7 @@ kbf-objstore             66     20
 kbf-outputs               0      0
 kbf-proto                 0      0
 kbf-raft                 19     19
+kbf-route                 0      0
 kbf-sched                 1      1
 kbf-segments              7      5
 kbf-server                0      0

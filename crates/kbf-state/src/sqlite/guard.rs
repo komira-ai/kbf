@@ -78,10 +78,12 @@ pub(super) fn refuse_network_filesystem(
 /// goes with the descriptor: dropping the file, or the process ending, releases it.
 pub(super) fn take_lock(db: &Path) -> Result<File, SqliteError> {
     let lock = lock_path(db);
+    use std::os::unix::fs::OpenOptionsExt as _;
     let file = OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
+        .mode(0o600)
         .open(&lock)?;
     match file.try_lock() {
         Ok(()) => Ok(file),
