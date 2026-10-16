@@ -18,8 +18,10 @@
 //!
 //! Either way the digests are trusted at the commit, as a segment upload's are with a
 //! tier: the flusher hashes every record before its PUT and drops one that does not
-//! match. Without a write tier, or when the tier has no room, there is no range: the
-//! caller holds the bytes in memory as before.
+//! match. Without a write tier, or when the tier has no room, there is no range: a
+//! segment upload holds the bytes in memory (records of at most 16 MiB), and a
+//! [`RecordStream`] goes straight to the object store instead (`stream_store`), its
+//! bytes hashed as they pass and checked against the digest claimed at the commit.
 
 use std::fmt;
 use std::sync::Arc;
@@ -30,6 +32,7 @@ use kbf_segments::{Crc32c, RecordHasher};
 use kbf_tier::{Reservation, TierError};
 use kbf_types::Digest;
 
+use super::stream_store::{Claim, ToStore};
 use super::tier::{Staging, blocking};
 use super::{Cache, CacheError};
 use crate::meta_log::MetaLog;
@@ -118,35 +121,63 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         self.writer.put_staged(&staging, synced, blobs, true).await
     }
 
-    /// A stream for one blob of `size` bytes onto the write tier, in a block of its own;
-    /// `None` without a tier, when the tier has no room for it (counted as a write the
-    /// tier did not take), or when `size` is 0. Blocking (it
-    /// creates the block's file): call it off the async runtime.
-    #[must_use]
-    pub fn stream(self: &Arc<Self>, size: u64) -> Option<RecordStream<M, O>> {
-        let cache = Arc::clone(self);
-        Open::start(self.writer.tier.get(), size).map(|open| RecordStream { cache, open })
+    /// A block of its own on the write tier for a blob of `size` bytes; `None` without
+    /// a tier, when the tier has no room for it (counted as a write the tier did not
+    /// take), or when `size` is 0. Blocking (it creates the block's file).
+    pub(crate) fn tier_open(&self, size: u64) -> Option<Open> {
+        Open::start(self.writer.tier.get(), size)
     }
 }
 
-/// A record being written onto the write tier ([`Cache::stream`]). Dropped before
-/// [`StreamedRecord::commit`], its range is answered as failed and nothing is stored.
-pub struct RecordStream<M, O> {
-    cache: Arc<Cache<M, O>>,
-    open: Open,
+impl<M: MetaLog, O: ObjectStore + 'static> Cache<M, O> {
+    /// A stream for one blob of `size` bytes: onto the write tier, in a block of its
+    /// own, when it has room for it; else (no tier, or no room) straight to the object
+    /// store as the bytes are appended (a multipart upload on S3), the digest claimed
+    /// at the commit and checked before the store completes the object. `None` only
+    /// when `size` is 0 or the cache was made outside a runtime (it cannot stream at
+    /// all). Blocking (it may create the block's file): call it off the async runtime.
+    #[must_use]
+    pub fn stream(self: &Arc<Self>, size: u64) -> Option<RecordStream<M, O>> {
+        let target = match self.tier_open(size) {
+            Some(open) => Target::Tier(open),
+            None => Target::Store(ToStore::start(self, size)?),
+        };
+        let cache = Arc::clone(self);
+        Some(RecordStream { cache, target })
+    }
 }
 
-/// A record whose bytes are all on the write tier, checked against its digest's size
-/// and its CRC-32C ([`RecordStream::finish`]), not yet committed.
+/// A record being written onto the write tier, or to the store ([`Cache::stream`]).
+/// Dropped before [`StreamedRecord::commit`], nothing is stored: its range on the tier
+/// is answered as failed, or its upload to the store aborted.
+pub struct RecordStream<M, O> {
+    cache: Arc<Cache<M, O>>,
+    target: Target,
+}
+
+/// Where a [`RecordStream`] writes.
+enum Target {
+    Tier(Open),
+    Store(ToStore),
+}
+
+/// A record whose bytes are all written, checked against its digest's size and its
+/// CRC-32C ([`RecordStream::finish`]), not yet committed.
 pub struct StreamedRecord<M, O> {
     cache: Arc<Cache<M, O>>,
-    range: TierRange,
+    staged: Staged,
     digest: Digest,
 }
 
-/// The part of a stream that does not depend on the cache's types: its range on the
-/// tier and what was written to it.
-struct Open {
+/// Where a [`StreamedRecord`]'s bytes are.
+enum Staged {
+    Tier(TierRange),
+    Store(Claim),
+}
+
+/// The part of a stream onto the tier that does not depend on the cache's types: its
+/// range on the tier and what was written to it.
+pub(crate) struct Open {
     range: TierRange,
     /// Bytes written so far: where the next chunk goes.
     written: u64,
@@ -178,23 +209,38 @@ impl Open {
 
     /// Checks the bytes written against `digest` and `crc32c`.
     fn check(&self, digest: Digest, crc32c: u32) -> Result<(), CacheError> {
-        let reserved = self.range.len();
-        // Both parts are looked at, whichever is true: no short-circuit to cover.
-        let short = (self.written != digest.size_bytes) | (self.written != reserved);
-        if short {
-            return Err(CacheError::Invalid(format!(
-                "a stream of {} bytes (made for {reserved}) ended as {digest}",
-                self.written
-            )));
-        }
-        let crc = self.crc.finish();
-        if crc != crc32c {
-            return Err(CacheError::Invalid(format!(
-                "{digest} was streamed with CRC-32C {crc32c:08x}, its bytes have {crc:08x}"
-            )));
-        }
-        Ok(())
+        checked(
+            self.written,
+            self.range.len(),
+            digest,
+            self.crc.finish(),
+            crc32c,
+        )
     }
+}
+
+/// Checks a stream of `written` bytes, made for `reserved`, whose CRC-32C is `crc`,
+/// against `digest` and the caller's `crc32c`.
+pub(super) fn checked(
+    written: u64,
+    reserved: u64,
+    digest: Digest,
+    crc: u32,
+    crc32c: u32,
+) -> Result<(), CacheError> {
+    // Both parts are looked at, whichever is true: no short-circuit to cover.
+    let short = (written != digest.size_bytes) | (written != reserved);
+    if short {
+        return Err(CacheError::Invalid(format!(
+            "a stream of {written} bytes (made for {reserved}) ended as {digest}"
+        )));
+    }
+    if crc != crc32c {
+        return Err(CacheError::Invalid(format!(
+            "{digest} was streamed with CRC-32C {crc32c:08x}, its bytes have {crc:08x}"
+        )));
+    }
+    Ok(())
 }
 
 impl<M: MetaLog, O: ObjectStore> RecordStream<M, O> {
@@ -204,7 +250,10 @@ impl<M: MetaLog, O: ObjectStore> RecordStream<M, O> {
     /// # Errors
     /// More bytes than the stream was made for, or the tier's write failed.
     pub fn append(&mut self, chunk: &[u8]) -> Result<(), CacheError> {
-        Ok(self.open.append(chunk)?)
+        match &mut self.target {
+            Target::Tier(open) => Ok(open.append(chunk)?),
+            Target::Store(to_store) => to_store.append(chunk),
+        }
     }
 
     /// Ends the stream as the blob `digest`, whose CRC-32C is `crc32c`.
@@ -213,10 +262,16 @@ impl<M: MetaLog, O: ObjectStore> RecordStream<M, O> {
     /// [`CacheError::Invalid`] when the bytes written are not as many as `digest` names
     /// and the stream was made for, or their CRC-32C is not `crc32c`: nothing is stored.
     pub fn finish(self, digest: Digest, crc32c: u32) -> Result<StreamedRecord<M, O>, CacheError> {
-        self.open.check(digest, crc32c)?;
+        let staged = match self.target {
+            Target::Tier(open) => {
+                open.check(digest, crc32c)?;
+                Staged::Tier(open.range)
+            }
+            Target::Store(to_store) => Staged::Store(to_store.finish(digest, crc32c)?),
+        };
         Ok(StreamedRecord {
             cache: self.cache,
-            range: self.open.range,
+            staged,
             digest,
         })
     }
@@ -224,7 +279,7 @@ impl<M: MetaLog, O: ObjectStore> RecordStream<M, O> {
 
 impl<M: MetaLog, O: ObjectStore + 'static> Cache<M, O> {
     /// Stores the blob `digest`, whose bytes come in `bytes`, onto the write tier
-    /// through `stream` (made for its size by [`Cache::stream`]): each piece hashed and
+    /// through `open` (made for its size by [`Cache::tier_open`]): each piece hashed and
     /// written to the stream's block off the runtime as it comes, holding one piece at
     /// a time; then, only if the bytes hash to `digest`, the block synced and committed
     /// as for [`StreamedRecord::commit`]. The flusher writes it to the store later. How
@@ -236,12 +291,11 @@ impl<M: MetaLog, O: ObjectStore + 'static> Cache<M, O> {
     /// own error; more bytes than the stream was made for, or the tier failed. Nothing
     /// is stored then: the stream is dropped, its range answered as failed.
     pub(crate) async fn stage_streamed(
-        &self,
+        self: &Arc<Self>,
         digest: Digest,
-        stream: RecordStream<M, O>,
+        open: Open,
         mut bytes: BodyStream,
     ) -> Result<(), CacheError> {
-        let RecordStream { cache, open } = stream;
         let mut writing = (open, RecordHasher::new());
         while let Some(piece) = bytes.next().await {
             let piece = piece?;
@@ -253,7 +307,10 @@ impl<M: MetaLog, O: ObjectStore + 'static> Cache<M, O> {
             writing = blocking(&self.writer.metrics, Box::new(write)).await?;
         }
         let (open, hasher) = writing;
-        let stream = RecordStream { cache, open };
+        let stream = RecordStream {
+            cache: Arc::clone(self),
+            target: Target::Tier(open),
+        };
         let (actual, crc32c) = hasher.finish();
         if actual != digest {
             return Err(CacheError::DigestMismatch {
@@ -272,13 +329,17 @@ impl<M: MetaLog, O: ObjectStore> StreamedRecord<M, O> {
         self.digest
     }
 
-    /// Makes the record durable and present: its block synced, then one `PutStaged`
-    /// for it, which seals the block. Answers once it is indexed.
+    /// Makes the record durable and present: on the tier, its block synced, then one
+    /// `PutStaged` for it, which seals the block; to the store, its digest claimed, the
+    /// bytes checked against it and the upload completed. Answers once it is indexed.
     ///
     /// # Errors
-    /// The sync or the commit failed; the blob is not stored.
+    /// The sync, the store or the commit failed, or (to the store) the bytes do not
+    /// hash to the digest; the blob is not stored.
     pub async fn commit(self) -> Result<(), CacheError> {
-        let blobs = vec![(self.digest, 0)];
-        self.cache.stage_range(self.range, blobs).await
+        match self.staged {
+            Staged::Tier(range) => self.cache.stage_range(range, vec![(self.digest, 0)]).await,
+            Staged::Store(claim) => claim.commit(self.digest).await,
+        }
     }
 }

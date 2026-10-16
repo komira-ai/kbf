@@ -84,16 +84,23 @@ async fn a_stream_whose_end_does_not_match_its_bytes_is_refused() {
     assert!(matches!(past, CacheError::Tier(_)), "{past:?}");
 }
 
-/// Catches a stream made where it cannot be stored, or refused for its size: without a
-/// tier, for an empty blob, and past the tier's budget (counted as a write the tier did
-/// not take) there is no stream; a blob over 5 GiB gets one when the tier has room.
+/// Catches a stream refused where the store could take it, or for its size: without a
+/// tier, and past the tier's budget (counted as a write the tier did not take), the
+/// stream goes to the store; there is none for an empty blob, nor for a cache made
+/// outside a runtime (which cannot run an upload); a blob over 5 GiB gets one onto the
+/// tier when it has room.
 #[tokio::test]
-async fn there_is_no_stream_without_a_tier_room_or_a_legal_size() {
-    assert!(Arc::new(Cache::memory()).stream(10).is_none(), "no tier");
+async fn a_stream_goes_to_the_store_without_a_tier_or_room_and_never_for_its_size() {
+    assert!(Arc::new(Cache::memory()).stream(10).is_some(), "no tier");
+    let outside = std::thread::spawn(Cache::memory).join().expect("made");
+    assert!(Arc::new(outside).stream(10).is_none(), "no runtime");
     let farm = Farm::new(Capabilities::default());
     let cache = Arc::new(farm.start(10_000).await);
     assert!(cache.stream(0).is_none(), "empty");
-    assert!(cache.stream(20_000).is_none(), "past the budget");
+    assert!(
+        cache.stream(20_000).is_some(),
+        "past the budget: to the store"
+    );
     let metrics = cache.render_metrics();
     assert!(
         metrics.contains("\nkbf_write_tier_full_total 1\n"),

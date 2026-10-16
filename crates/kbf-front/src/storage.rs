@@ -95,7 +95,7 @@ impl<M: MetaLog, O: ObjectStore + 'static> Storage for CacheStorage<M, O> {
         })
     }
 
-    /// The cache's own stream onto its write tier ([`Cache::stream`]).
+    /// The cache's own stream, onto its write tier or to the store ([`Cache::stream`]).
     fn stream(&self, size: u64) -> Option<Box<dyn PutStream>> {
         let stream = self.cache.stream(size)?;
         Some(Box::new(stream))

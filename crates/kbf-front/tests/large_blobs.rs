@@ -309,10 +309,21 @@ fn zeros_digest(len: u64) -> (Digest, u32) {
 /// Streams `len` zero bytes onto the tier as the in-process plane does, and commits
 /// them: staged, not yet flushed. Returns the blob's digest.
 async fn stage_zeros(cache: &Arc<LargeCache>, len: u64) -> Digest {
+    let (digest, streamed) = stream_zeros(cache, len).await;
+    streamed.commit().await.expect("commit");
+    digest
+}
+
+/// Streams `len` zero bytes through [`Cache::stream`], a megabyte at a time off the
+/// runtime, and finishes the stream: checked, not yet committed.
+async fn stream_zeros(
+    cache: &Arc<LargeCache>,
+    len: u64,
+) -> (Digest, kbf_front::StreamedRecord<MemoryMetaLog, S3Store>) {
     let (digest, crc32c) = zeros_digest(len);
     let cache = Arc::clone(cache);
     let streamed = tokio::task::spawn_blocking(move || {
-        let mut stream = cache.stream(len).expect("a stream onto the tier");
+        let mut stream = cache.stream(len).expect("a stream");
         let zeros = vec![0u8; MIB as usize];
         let mut left = len;
         while left > 0 {
@@ -324,8 +335,7 @@ async fn stage_zeros(cache: &Arc<LargeCache>, len: u64) -> Digest {
     })
     .await
     .expect("joined");
-    streamed.commit().await.expect("commit");
-    digest
+    (digest, streamed)
 }
 
 /// Long past any seal delay: every block due.
@@ -769,4 +779,38 @@ async fn a_bytestream_read_holds_one_window_and_one_message() {
     assert_eq!(got, len);
     assert!(peak < ONE_READ_BOUND, "{peak} bytes live at once");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Catches a record stream refused without a write tier (mutant: `Cache::stream`
+/// answering `None` with no tier, which leaves a replicated write nowhere to go), or one
+/// that stores what it was not asked to: with no tier, `Cache::stream` of 40 MiB is a
+/// stream to the store, and its commit completes one multipart upload, the blob held
+/// after; a second stream finished and dropped before its commit stores nothing and
+/// leaves no upload incomplete.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn without_a_tier_a_record_stream_commits_to_the_store() {
+    let _alone = ALONE.lock().await;
+    let s3 = FakeS3::start().await;
+    let cache = cold_cache(&s3).await;
+    let (digest, streamed) = stream_zeros(&cache, 40 * MIB).await;
+    assert_eq!(streamed.digest(), digest);
+    streamed.commit().await.expect("committed to the store");
+    assert!(
+        cache
+            .find_missing(&[digest])
+            .await
+            .expect("find")
+            .is_empty()
+    );
+    let stats = s3.stats();
+    assert_eq!((stats.single_puts, stats.completed), (0, 1), "{stats:?}");
+    let (dropped, streamed) = stream_zeros(&cache, 24 * MIB).await;
+    drop(streamed);
+    settled(&s3).await;
+    let stats = s3.stats();
+    assert_eq!(stats.completed, 1, "{stats:?}");
+    assert_eq!(
+        cache.find_missing(&[dropped]).await.expect("find"),
+        [dropped]
+    );
 }
