@@ -1,5 +1,5 @@
 //! The `kbf` binary end to end: the refusals exit 2 naming the flag, each built mode
-//! reaches its own entry point, and an unbuilt mode says so.
+//! reaches its own entry point.
 
 use std::process::Command;
 
@@ -159,22 +159,6 @@ fn help_lists_the_five_modes_and_unknown_modes_exit_2() {
     }
 }
 
-/// Catches a mode that is not built running something, exiting other than 2, printing
-/// more than the one line, or printing on stdout: each exits 2 with one stderr line
-/// naming the mode, whatever flags it is given.
-#[test]
-fn an_unbuilt_mode_exits_2_with_one_line() {
-    for mode in names::MODES {
-        if mode.entry != names::Entry::NotBuilt {
-            continue;
-        }
-        let (code, out, err) = run(&[mode.name, "--any-flag=1", "positional"]);
-        assert_eq!(code, Some(2), "{}: {err}", mode.name);
-        assert_eq!(err, format!("{}\n", names::not_built_line(mode.name)));
-        assert!(out.is_empty(), "{out}");
-    }
-}
-
 /// The smoke test the README names: the command line in backticks after `Smoke test:`
 /// in README.md. Catches a README that stops naming a command `kbf` runs, and a
 /// `kbf all-in-one --help` that does not exit 0.
@@ -316,8 +300,8 @@ fn check_args_exits_2_with_the_refusal_a_start_gets() {
         (&bogus, "unexpected argument '--bogus-flag'"),
         (&cold, "kbf daemon refuses --cold-store: "),
         (
-            &[kbf_cli::CHECK_ARGS, names::FRONTEND],
-            "kbf frontend: mode not built yet",
+            &[kbf_cli::CHECK_ARGS, names::STORAGE_AND_DAEMON],
+            "required arguments were not provided",
         ),
         (&help, "--help and --version print and exit 0"),
         (&[kbf_cli::CHECK_ARGS], "Usage: kbf"),

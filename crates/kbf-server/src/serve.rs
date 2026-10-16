@@ -27,6 +27,7 @@ use tonic::transport::server::TcpIncoming;
 use tonic::transport::{Server, ServerTlsConfig};
 
 use crate::blobs::{WorkerBlobs, WorkerCas, WorkerSegments};
+use crate::drain::Drain;
 use crate::farm::{Farm, StateError};
 use crate::grpc_health::{HealthService, WATCH_INTERVAL};
 use crate::health::Readiness;
@@ -71,7 +72,7 @@ pub struct Listeners {
     /// How long a finished operation is kept after its callers are answered, in which
     /// WaitExecution on it still streams its result; then it is NOT_FOUND.
     pub finished_retention: Duration,
-    /// How long shutdown waits for the REAPI listener to drain (see
+    /// How long a drain that a stop signal began waits for the REAPI listener (see
     /// [`bind_server_with_api`]) before it ends the open streams and stops anyway.
     /// [`Duration::MAX`] waits for as long as an action runs (`--shutdown-timeout-secs
     /// 0`, the flag's default): Buck2 never recovers a stream that breaks mid-action.
@@ -174,8 +175,12 @@ pub struct Bound<F> {
     /// Where the operator API listener is, if there is one.
     pub api: Option<SocketAddr>,
     /// What `GET /readyz` reads besides the store; the serving future marks it
-    /// stopping when `shutdown` completes.
+    /// stopping when `shutdown` completes, and a drain ([`Bound::drain`]) does.
     pub readiness: Arc<Readiness>,
+    /// The frontend's drain: begun when `shutdown` completes or by
+    /// `POST /v1/frontend/drain`, and escalated by [`Drain::close`], which a second
+    /// stop signal calls (`ServerHandle::serve_escalating`).
+    pub drain: Arc<Drain>,
     /// Serves every listener and the tick, and runs the invocation recorder's task,
     /// until the shutdown future completes.
     pub serving: F,
@@ -185,7 +190,7 @@ pub struct Bound<F> {
 }
 
 /// Aborts its task when dropped.
-struct AbortOnDrop(tokio::task::AbortHandle);
+pub(crate) struct AbortOnDrop(pub(crate) tokio::task::AbortHandle);
 
 impl Drop for AbortOnDrop {
     fn drop(&mut self) {
@@ -198,7 +203,7 @@ impl Drop for AbortOnDrop {
 /// unacknowledged waits for the client's delayed ACK, about 40 ms on Linux, so each
 /// sequential small call pays that. tonic's `Server::tcp_nodelay` does not apply here:
 /// `serve_with_incoming` takes the options of the incoming stream it is given.
-fn bind(addr: SocketAddr) -> Result<(TcpIncoming, SocketAddr), ServeError> {
+pub(crate) fn bind(addr: SocketAddr) -> Result<(TcpIncoming, SocketAddr), ServeError> {
     let bound = TcpIncoming::bind(addr).and_then(|incoming| {
         let local = incoming.local_addr()?;
         Ok((incoming.with_nodelay(Some(true)), local))
@@ -206,10 +211,12 @@ fn bind(addr: SocketAddr) -> Result<(TcpIncoming, SocketAddr), ServeError> {
     bound.map_err(|source| ServeError::Bind { addr, source })
 }
 
-/// Serves `routes` on `listener` until it fails; without a listener, never completes.
-fn serve_api(
+/// Serves `routes` on `listener` until it fails, or until `stop` completes and the
+/// requests in flight are answered; without a listener, it only waits for `stop`.
+pub(crate) fn serve_api(
     listener: Option<tokio::net::TcpListener>,
     routes: axum::Router,
+    stop: impl Future<Output = ()> + Send + 'static,
 ) -> impl Future<Output = std::io::Result<()>> {
     match listener {
         Some(listener) => Either::Left(
@@ -217,9 +224,14 @@ fn serve_api(
                 listener.tap_io(set_nodelay),
                 routes.into_make_service_with_connect_info::<SocketAddr>(),
             )
+            .with_graceful_shutdown(stop)
             .into_future(),
         ),
-        None => Either::Right(std::future::pending()),
+        // Nothing to answer: done as soon as it is told to stop, never before.
+        None => Either::Right(async move {
+            stop.await;
+            Ok(())
+        }),
     }
 }
 
@@ -230,7 +242,9 @@ fn set_nodelay(tcp: &mut tokio::net::TcpStream) {
     let _ = tcp.set_nodelay(true);
 }
 
-fn bind_api(addr: SocketAddr) -> Result<(tokio::net::TcpListener, SocketAddr), ServeError> {
+pub(crate) fn bind_api(
+    addr: SocketAddr,
+) -> Result<(tokio::net::TcpListener, SocketAddr), ServeError> {
     let bound = std::net::TcpListener::bind(addr).and_then(|listener| {
         listener.set_nonblocking(true)?;
         let listener = tokio::net::TcpListener::from_std(listener)?;
@@ -243,7 +257,10 @@ fn bind_api(addr: SocketAddr) -> Result<(tokio::net::TcpListener, SocketAddr), S
 /// The worker listener's TLS and the way its peers are told apart. Not generic, so
 /// both arms are one set of lines whatever the cache types (a per-instantiation copy
 /// that misses one arm would count as missed lines).
-fn worker_peers(server: Server, tls: Option<WorkerTls>) -> Result<(Server, Peers), ServeError> {
+pub(crate) fn worker_peers(
+    server: Server,
+    tls: Option<WorkerTls>,
+) -> Result<(Server, Peers), ServeError> {
     Ok(match tls {
         Some(tls) => (
             server.tls_config(tls.server)?,
@@ -259,7 +276,7 @@ fn worker_peers(server: Server, tls: Option<WorkerTls>) -> Result<(Server, Peers
 /// transport's defaults: they bound what is held outside `--write-bytes-in-flight`, and
 /// the connection window is what lets a Write admitted after others finish at all
 /// (`kbf_front::CONNECTION_WINDOW_BYTES`).
-fn flow_control(server: Server) -> Server {
+pub(crate) fn flow_control(server: Server) -> Server {
     server
         .max_concurrent_streams(Some(MAX_CONCURRENT_STREAMS))
         .initial_stream_window_size(Some(STREAM_WINDOW_BYTES))
@@ -269,7 +286,7 @@ fn flow_control(server: Server) -> Server {
 /// `server` pinging a quiet connection every `timing.keepalive_interval` and closing it
 /// when a ping stays unanswered for `timing.keepalive_timeout` (HTTP/2 PING, which a
 /// peer must answer even when it never sends data).
-fn keepalive(server: Server, timing: StreamTiming) -> Server {
+pub(crate) fn keepalive(server: Server, timing: StreamTiming) -> Server {
     let on = !timing.keepalive_interval.is_zero();
     server
         .http2_keepalive_interval(on.then_some(timing.keepalive_interval))
@@ -282,12 +299,44 @@ const STATE_IN_MEMORY: &str = "the scheduler's state is in memory: no cordon, dr
 
 /// Logs where the scheduler's state is, at every start. Not generic, unlike the binding
 /// that calls it, so every test binary's runs count toward the same function's coverage.
-fn log_state(durable: bool, term: u64, epoch: u64) {
+pub(crate) fn log_state(durable: bool, term: u64, epoch: u64) {
     if durable {
         tracing::info!(term, epoch, "the scheduler's state is in the state store");
     } else {
         tracing::warn!(term, epoch, "{STATE_IN_MEMORY}");
     }
+}
+
+/// Stops the operator API once the REAPI listener is done: `api_serve` (see
+/// [`serve_api`]) answers the requests in flight, the one that began a drain on an idle
+/// frontend among them (its response would otherwise race the process's exit), and
+/// stops. Bounded: a client that holds its connection open must not hold the exit.
+pub(crate) async fn stop_api(
+    stop: tokio::sync::oneshot::Sender<()>,
+    api_serve: impl Future<Output = std::io::Result<()>>,
+) {
+    let _ = stop.send(());
+    let _ = tokio::time::timeout(CLOSE_GRACE, api_serve).await;
+}
+
+/// What both `kbf-server` and `kbf frontend` do once their shutdown future completes, so
+/// the two cannot drift: [`Drain::begin`] (`/readyz` answers `stopping`, new Execute
+/// calls are refused while the open ones run until their action is done, the REAPI
+/// listener is sent GOAWAY; a no-op when `POST /v1/frontend/drain` began it), and then
+/// only `timeout`, or a [`Drain::close`] from a second stop signal, ends the open streams
+/// UNAVAILABLE (Buck2 does not recover a stream that breaks). Returns once the grace after
+/// that has passed, which is when the caller stops anyway.
+pub(crate) async fn drain_and_stop(drain: &Drain, timeout: Duration) {
+    drain.begin();
+    tokio::select! {
+        () = tokio::time::sleep(timeout) => drain.close(),
+        () = drain.closed() => {}
+    }
+    tokio::time::sleep(CLOSE_GRACE).await;
+    tracing::warn!(
+        ?timeout,
+        "REAPI connections still open after the drain ran out of time or was ended; stopping anyway"
+    );
 }
 
 /// Binds the REAPI and worker listeners for a farm over `cache`, and no operator API.
@@ -320,15 +369,21 @@ where
 /// The REAPI listener also serves `grpc.health.v1.Health` ([`crate::grpc_health`]),
 /// with `/readyz`'s answer.
 ///
-/// When `shutdown` completes, `GET /readyz` answers 503 (`stopping`) from then on and
-/// the health service `NOT_SERVING` (an open Watch is sent it, then ends UNAVAILABLE);
-/// then the REAPI listener stops accepting, every connection on
-/// it is sent GOAWAY, and every open Execute and WaitExecution stream that is not done
-/// ends UNAVAILABLE, which clients retry (issue #168). The serving future returns once
-/// the REAPI connections have closed, or after `listeners.shutdown_timeout` if one
-/// stays open (a client still uploading, say); until then the worker listener, the
-/// operator API and the tick go on. Daemon streams never end on their own, so the
-/// worker listener is not drained: it stops when the future returns.
+/// When `shutdown` completes (or `POST /v1/frontend/drain` is called: see [`Drain`]),
+/// `GET /readyz` answers 503 (`stopping`) from then on and the health service
+/// `NOT_SERVING` (an open Watch is sent it, then ends UNAVAILABLE); new Execute calls
+/// are refused UNAVAILABLE, which Buck2 retries when it opens the call; and the REAPI
+/// listener stops accepting and every connection on it is sent GOAWAY. Open Execute and
+/// WaitExecution streams are kept until their action is done: Buck2 does not recover a
+/// stream that breaks (komira-build-farm#791), so ending one fails its action. The
+/// serving future returns once the REAPI connections have closed. Only
+/// `listeners.shutdown_timeout` (when it is not [`Duration::MAX`]) or [`Drain::close`]
+/// (a second stop signal) ends the streams that are not done, UNAVAILABLE, after which
+/// the future returns within a short grace even if a connection stays open (a client
+/// still uploading, say). Until then the worker listener, the operator API and the
+/// tick go on; once the REAPI listener is done the operator API finishes the requests
+/// it is answering and stops. Daemon streams never end on their own, so the worker
+/// listener is not drained: it stops when the future returns.
 ///
 /// # Errors
 /// A listener cannot be bound, or a TLS configuration is refused (a key that does not
@@ -480,6 +535,9 @@ where
     let api_listener = api_listen.map(bind_api).transpose()?;
     let api = api_listener.as_ref().map(|(_, local)| *local);
     let readiness = Arc::new(Readiness::default());
+    let (closer, closing) = kbf_front::closing();
+    let (drain, goaway) = Drain::new(closer, Arc::clone(&readiness));
+    let drain = Arc::new(drain);
     let health_routes =
         crate::health::router(Arc::clone(&cache), Arc::clone(&readiness), probe_timeout);
     let blob_routes =
@@ -489,7 +547,7 @@ where
         Arc::clone(&cache),
         InvocationReaders::from_policy(&policy),
     );
-    let api_routes = crate::api::router(Arc::clone(&farm), token)
+    let api_routes = crate::api::router(Arc::clone(&farm), token, Arc::clone(&drain))
         .merge(health_routes)
         .merge(crate::metrics::router(Arc::clone(&cache), local))
         .merge(blob_routes)
@@ -540,7 +598,6 @@ where
     let worker_service = WorkerServer::new(sessions)
         .max_decoding_message_size(MAX_MESSAGE_BYTES)
         .max_encoding_message_size(MAX_MESSAGE_BYTES);
-    let (closer, closing) = kbf_front::closing();
     let (ticker, progress) = kbf_front::progress(listeners.streams.progress_interval);
     let authorizers = Arc::new(policy.authorizers);
     let cache_for_health = Arc::clone(&cache);
@@ -582,19 +639,18 @@ where
     )
     .add_service(health);
 
-    let stop_readiness = Arc::clone(&readiness);
+    let stopper = Arc::clone(&drain);
     let serving = async move {
         // A task of its own: applying events never delays the tick or an accept loop,
         // and they never delay it. It stops when the serving future does.
         let _recording = AbortOnDrop(tokio::spawn(recording.run()).abort_handle());
-        let (drain, draining) = tokio::sync::oneshot::channel::<()>();
         // `reapi_server` carries the REAPI TLS configuration when one is given, so
         // the health service is served over the same TLS as the REAPI routes; the
         // authenticator is already applied to those routes alone (above).
         let reapi_serve = reapi_server
             .add_routes(reapi_routes)
             .serve_with_incoming_shutdown(reapi_incoming, async {
-                let _ = draining.await;
+                let _ = goaway.await;
             });
         let worker_serve = worker_server
             .add_service(worker_service)
@@ -602,7 +658,18 @@ where
             .add_service(worker_cas)
             .add_service(worker_segments)
             .serve_with_incoming(worker_incoming);
-        let api_serve = serve_api(api_listener.map(|(listener, _)| listener), api_routes);
+        // Told when the REAPI listener is done, so the operator API answers what it is
+        // answering (the request that began a drain on an idle frontend, whose
+        // response would otherwise race the process's exit) and then stops.
+        let (api_stop, api_stopped) = tokio::sync::oneshot::channel::<()>();
+        let api_serve = serve_api(
+            api_listener.map(|(listener, _)| listener),
+            api_routes,
+            async {
+                let _ = api_stopped.await;
+            },
+        );
+        tokio::pin!(api_serve);
         let ticking = async {
             let mut tick = tokio::time::interval(listeners.tick);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -611,40 +678,39 @@ where
                 farm.tick().await;
             }
         };
-        // Completes when the drain has run out of time: the REAPI listener, drained
-        // in time, completes first.
+        // Completes when the drain has run out of time or was forced: the REAPI
+        // listener, drained in time, completes first.
         let stopping = async {
             shutdown.await;
-            // Before anything stops, so a front's health check (`/readyz`, or the
-            // health service) sends no new work here.
-            stop_readiness.stop();
-            // No new Execute; open streams run until their action is done. Buck2 does
-            // not recover a stream that breaks, so only the shutdown timeout ends them.
-            closer.drain();
-            let _ = drain.send(());
-            tokio::time::sleep(listeners.shutdown_timeout).await;
-            closer.close();
-            tokio::time::sleep(CLOSE_GRACE).await;
-            tracing::warn!(
-                timeout = ?listeners.shutdown_timeout,
-                "REAPI connections still open at the shutdown timeout; stopping anyway"
-            );
+            // A no-op when `POST /v1/frontend/drain` began the drain already.
+            drain_and_stop(&stopper, listeners.shutdown_timeout).await;
         };
-        tokio::select! {
-            served = reapi_serve => served.map_err(ServeError::from),
+        let mut reapi_done = false;
+        let outcome = tokio::select! {
+            served = reapi_serve => {
+                reapi_done = true;
+                served.map_err(ServeError::from)
+            }
             served = worker_serve => served.map_err(ServeError::from),
-            served = api_serve => served.map_err(ServeError::Api),
+            // Finished on its own: there is nothing left to answer, so it is not waited
+            // for again below (`reapi_done` stays false).
+            served = &mut api_serve => served.map_err(ServeError::Api),
             () = ticking => Ok(()),
             // One timer for every open stream's progress operation.
             () = ticker.run() => Ok(()),
             () = stopping => Ok(()),
+        };
+        if reapi_done {
+            stop_api(api_stop, api_serve).await;
         }
+        outcome
     };
     Ok(Bound {
         reapi,
         worker,
         api,
         readiness,
+        drain,
         serving,
         recorder,
     })

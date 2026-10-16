@@ -184,6 +184,8 @@ pub struct Cell {
     stopped: Option<oneshot::Receiver<()>>,
     /// The server's invocation records.
     pub recorder: kbf_front::Recorder,
+    /// The server's frontend drain.
+    pub drain: Arc<kbf_server::Drain>,
     client: Client,
 }
 
@@ -486,7 +488,7 @@ impl Cell {
                 let _ = stopped_tx.send(());
             })
             .expect("a server thread");
-        let (reapi, worker, api, recorder) = bound_rx.await.expect("the server binds");
+        let (reapi, worker, api, recorder, drain) = bound_rx.await.expect("the server binds");
         Self {
             cache,
             store,
@@ -496,23 +498,35 @@ impl Cell {
             stop: Some(stop),
             stopped: Some(stopped),
             recorder,
+            drain,
             client: Client::connect(reapi, worker).await,
         }
     }
 }
 
+/// What a started server tells the test: its REAPI, worker and operator API addresses,
+/// its invocation records and its frontend drain.
+type Started = (
+    SocketAddr,
+    SocketAddr,
+    Option<SocketAddr>,
+    kbf_front::Recorder,
+    Arc<kbf_server::Drain>,
+);
+
 /// Says where `bound` listens on `addresses`, then serves it until it stops.
 async fn run(
     bound: Bound<impl Future<Output = Result<(), ServeError>>>,
-    addresses: oneshot::Sender<(
-        SocketAddr,
-        SocketAddr,
-        Option<SocketAddr>,
-        kbf_front::Recorder,
-    )>,
+    addresses: oneshot::Sender<Started>,
 ) {
     let recorder = bound.recorder.clone();
-    let _ = addresses.send((bound.reapi, bound.worker, bound.api, recorder));
+    let _ = addresses.send((
+        bound.reapi,
+        bound.worker,
+        bound.api,
+        recorder,
+        Arc::clone(&bound.drain),
+    ));
     bound.serving.await.expect("serve");
 }
 

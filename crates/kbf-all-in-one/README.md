@@ -32,6 +32,16 @@ Linux only, the container driver only. Elsewhere the binary exits 2 and says to 
    does; one the daemon half refuses exits as `kbf-daemon` does (1, or 2 for an
    `--image` the node cannot run).
 
+## `kbf storage-and-daemon`
+
+The same daemon half and the same plane beside the storage node instead of the server
+(`src/storage_and_daemon.rs`, run by the `kbf` binary): one command line of `kbf
+storage`'s flags and `kbf-daemon`'s (the same refusals as above), the storage half
+started as `kbf storage` starts (`kbf_server::storage_half`, which keeps the storage its
+listener serves), and the daemon half's plane over that storage, in-process. Its
+control plane dials `--server` (the frontend's worker listener). The one cache applies
+as in `kbf all-in-one`.
+
 ## The in-process data plane
 
 `LocalDataPlane` implements `kbf_transfer::Cas` over the server's `LocalStore`
@@ -132,10 +142,11 @@ durable store, not a cache: a `file://` cold store on the same disk holds its ow
 
 ## Not done yet
 
-- **Production use.** The server half's scheduler state is in memory, so a restart of
-  the process loses every lease and operation (the cache's index is kept: the server's
-  metadata log is on disk, under `--meta-dir` or the hot store). Until the
-  scheduler's state is durable, all-in-one is a development shape.
+- **Production use.** The scheduler's state is a SQLite file, `<data-dir>/state.db` (or
+  the `--state-store=sqlite:///...` given), so a restart keeps queued operations and
+  every start is a new epoch: the daemon half kills the runs of the leases the earlier
+  start granted, and they are queued again. The trust warning below still stands, so
+  all-in-one is a development and single-box shape.
 - **The in-process plane's admission.** A remote daemon's blob calls are admitted by its
   certificate and the deny list; this plane's calls are not admitted.
 - **`--reserve-cpus` across both halves.** The daemon half takes the flag as

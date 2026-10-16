@@ -75,9 +75,17 @@ fn the_converged_units_are_unchanged() {
 /// parser, which takes anything there) and a mode that runs builds without its cgroup
 /// delegated.
 #[test]
-fn the_built_modes_are_storage_daemon_and_all_in_one() {
+fn every_mode_but_the_frontend_is_built() {
     let built: Vec<_> = Mode::ALL.iter().filter(|m| m.is_built()).collect();
-    assert_eq!(built, [&Mode::Storage, &Mode::Daemon, &Mode::AllInOne]);
+    assert_eq!(
+        built,
+        [
+            &Mode::Storage,
+            &Mode::Daemon,
+            &Mode::StorageAndDaemon,
+            &Mode::AllInOne
+        ]
+    );
     let builds: Vec<_> = Mode::ALL.iter().filter(|m| m.runs_builds()).collect();
     assert_eq!(
         builds,
@@ -101,7 +109,7 @@ fn the_built_modes_are_storage_daemon_and_all_in_one() {
 #[test]
 fn each_planted_defect_turns_its_rule_red() {
     let c = config();
-    let rows: [(Mode, &str, &str, &str); 15] = [
+    let rows: [(Mode, &str, &str, &str); 14] = [
         (
             Mode::Daemon,
             "Environment=XDG_RUNTIME_DIR=/run/user/@KBF_UID@\n",
@@ -155,12 +163,6 @@ fn each_planted_defect_turns_its_rule_red() {
             "/kbf frontend\n",
             "/kbf frontend --node-id=n1\n",
             "FAIL flags: kbf frontend is not built yet and takes no flag kbf can check, but kbf-frontend.service gives '--node-id=n1'",
-        ),
-        (
-            Mode::StorageAndDaemon,
-            "/kbf storage-and-daemon\n",
-            "/kbf storage-and-daemon --data-dir=/var/lib/kbf\n",
-            "FAIL flags: kbf storage-and-daemon is not built yet and takes no flag kbf can check, but kbf-storage-and-daemon.service gives '--data-dir=/var/lib/kbf'",
         ),
         (
             Mode::Daemon,
@@ -411,8 +413,8 @@ fn the_parse_rule_runs_kbf_check_args_on_a_built_modes_flags() {
     // A mode not built yet, and a unit that starts an old binary: kbf is not asked.
     for (mode, text) in [
         (
-            Mode::StorageAndDaemon,
-            render(&c, Some(1500), Mode::StorageAndDaemon).expect("renders"),
+            Mode::Frontend,
+            render(&c, Some(1500), Mode::Frontend).expect("renders"),
         ),
         (
             Mode::Daemon,
