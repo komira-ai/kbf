@@ -48,6 +48,9 @@ kbf-daemon.workspace = true
 # The image store layout the stand-in `podman` reads (tests/binary.rs).
 kbf-driver-container.workspace = true
 kbf-front.workspace = true
+# The storage boundary the plane is checked through (tests/storage_seam.rs).
+kbf-meta.workspace = true
+kbf-storage.workspace = true
 # The act steps the stand-in `podman` runs as each action, through this test binary.
 kbf-testkit.workspace = true
 prost.workspace = true

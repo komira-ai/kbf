@@ -14,8 +14,6 @@ publish.workspace = true
 [dependencies]
 bytes.workspace = true
 futures.workspace = true
-# PLANTED (red-first proof of the layering rule; removed in the next commit).
-kbf-auth.workspace = true
 kbf-meta.workspace = true
 kbf-proto.workspace = true
 kbf-types.workspace = true
