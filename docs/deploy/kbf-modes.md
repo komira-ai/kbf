@@ -191,10 +191,10 @@ WARN trusted: kbf all-in-one runs builds beside the farm's state and its cold st
 ```
 
 Its cold store is `file://<KBF_DATA_DIR>/cold`, the single box's shape (section 11), so
-the unit holds no cold-store key and rule `credential` applies to it. Its state store
-flag (`--state-store=sqlite://<KBF_DATA_DIR>/state.db`) is a `TODO:` in the template:
-`kbf all-in-one` takes the flag, but a start with it is refused until a state store
-backend is built in.
+the unit holds no cold-store key and rule `credential` applies to it. Its scheduler
+state is the SQLite file `<KBF_DATA_DIR>/state.db`, the default of `kbf all-in-one` (a
+`--state-store=sqlite:///...` names another; any other value is refused), so the unit
+gives no state store flag.
 
 ## Upgrade kbf before kbf-deploy
 

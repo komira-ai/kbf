@@ -17,6 +17,7 @@ kbf-auth.workspace = true
 kbf-front.workspace = true
 kbf-invocation.workspace = true
 kbf-log.workspace = true
+kbf-map.workspace = true
 kbf-caps.workspace = true
 kbf-mdm-api.workspace = true
 kbf-meta.workspace = true

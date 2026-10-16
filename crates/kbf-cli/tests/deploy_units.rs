@@ -77,36 +77,33 @@ fn each_rendered_mode_unit_parses_with_kbfs_own_parser() {
     }
 }
 
-/// The all-in-one unit's `TODO: --state-store=...` seam holds a value kbf all-in-one
-/// takes (an absolute `sqlite://` file beside its data), so lifting the seam once a
-/// backend is built in is moving that value onto the command line. Catches the seam
-/// naming a flag kbf does not have, or a value its parser refuses (a relative path, a
-/// scheme it does not admit).
+/// The all-in-one unit gives no `--state-store`, and kbf all-in-one, parsing the rendered
+/// command line, takes the SQLite file `state.db` in the unit's `--data-dir`: the state
+/// the template's comment promises, and one rule `state-store` passes. Catches the unit
+/// growing a `--state-store` (a Postgres URI, say) or kbf's default moving out of the
+/// data directory, or off SQLite.
 #[test]
-fn the_all_in_one_state_store_seam_is_a_value_kbf_takes() {
+fn the_all_in_one_unit_leaves_its_state_store_to_kbfs_sqlite_default() {
     let text = render(&config(), Some(1500), Mode::AllInOne).expect("renders");
-    let value = text
-        .lines()
-        .find_map(|l| l.strip_prefix("# TODO: --state-store="))
-        .and_then(|rest| rest.split_whitespace().next())
-        .expect("the all-in-one unit marks its state store seam");
-    assert_eq!(value, "sqlite:///var/lib/kbf/state.db");
     let unit = UnitFile::parse(&text).expect("a unit");
-    let mut argv: Vec<String> = unit.exec_start().iter().map(|a| (*a).to_owned()).collect();
+    let argv = unit.exec_start();
     assert!(
         !argv.iter().any(|a| a.starts_with("--state-store")),
-        "the seam is lifted: drop this test for the parse one above"
+        "{argv:?}"
     );
-    argv.push(format!("--state-store={value}"));
-    match parse_from(argv.iter().map(String::as_str)) {
+    let data_dir = argv
+        .iter()
+        .find_map(|a| a.strip_prefix("--data-dir="))
+        .expect("the all-in-one unit gives --data-dir");
+    match parse_from(argv.iter().copied()) {
         Ok(Invocation::AllInOne(flags)) => assert_eq!(
             flags.server.state_store,
             Some(kbf_server::StateStoreUri::Sqlite(
-                "/var/lib/kbf/state.db".into()
+                std::path::Path::new(data_dir).join("state.db")
             ))
         ),
         Ok(_) => panic!("not the all-in-one"),
-        Err(e) => panic!("kbf all-in-one refuses the seam's value: {e}"),
+        Err(e) => panic!("kbf all-in-one refuses its rendered unit: {e}"),
     }
 }
 
