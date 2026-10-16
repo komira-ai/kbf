@@ -300,9 +300,13 @@ pub struct ProgressTicker {
 }
 
 impl ProgressTicker {
-    /// Ticks every interval, for as long as it is polled. One timer serves every open
-    /// stream, however many: a stream holds a receiver and wakes once per tick.
+    /// Ticks every interval, for as long as it is polled; never, for a zero interval.
+    /// One timer serves every open stream, however many: a stream holds a receiver and
+    /// wakes once per tick.
     pub async fn run(self) {
+        if self.every.is_zero() {
+            std::future::pending::<()>().await;
+        }
         let mut interval = tokio::time::interval_at(Instant::now() + self.every, self.every);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
@@ -333,13 +337,10 @@ impl Progress {
 }
 
 /// A ticker that fires every `every` once run, and the [`Progress`] to hand the
-/// `Execution` service ([`ExecutionService::with_progress`]).
-///
-/// # Panics
-/// `every` is zero.
+/// `Execution` service ([`ExecutionService::with_progress`]). A zero `every` is no
+/// progress: the ticker never fires.
 #[must_use]
 pub fn progress(every: Duration) -> (ProgressTicker, Progress) {
-    assert!(!every.is_zero(), "a zero progress interval");
     let (tick, rx) = watch::channel(0);
     (ProgressTicker { every, tick }, Progress(rx))
 }

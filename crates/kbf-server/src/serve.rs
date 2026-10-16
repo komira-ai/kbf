@@ -453,12 +453,7 @@ where
     .max_decoding_message_size(MAX_MESSAGE_BYTES)
     .max_encoding_message_size(MAX_MESSAGE_BYTES);
     let (closer, closing) = kbf_front::closing();
-    let (ticker, progress) = if listeners.streams.progress_interval.is_zero() {
-        (None, kbf_front::Progress::off())
-    } else {
-        let (ticker, progress) = kbf_front::progress(listeners.streams.progress_interval);
-        (Some(ticker), progress)
-    };
+    let (ticker, progress) = kbf_front::progress(listeners.streams.progress_interval);
     let authorizers = Arc::new(policy.authorizers);
     let cache_for_health = Arc::clone(&cache);
     let reapi_routes = kbf_front::routes_recorded(
@@ -517,11 +512,6 @@ where
                 farm.tick().await;
             }
         };
-        // One timer for every open stream's progress operation.
-        let progressing = match ticker {
-            Some(ticker) => Either::Left(ticker.run()),
-            None => Either::Right(std::future::pending::<()>()),
-        };
         // Completes when the drain has run out of time: the REAPI listener, drained
         // in time, completes first.
         let stopping = async {
@@ -546,7 +536,8 @@ where
             served = worker_serve => served.map_err(ServeError::from),
             served = api_serve => served.map_err(ServeError::Api),
             () = ticking => Ok(()),
-            () = progressing => Ok(()),
+            // One timer for every open stream's progress operation.
+            () = ticker.run() => Ok(()),
             () = stopping => Ok(()),
         }
     };

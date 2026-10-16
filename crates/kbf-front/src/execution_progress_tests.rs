@@ -112,3 +112,21 @@ async fn a_drain_after_a_close_leaves_it_closed() {
         .await
         .expect("still closed after a drain");
 }
+
+/// Catches a zero interval that ticks without pause (a busy loop of progress
+/// operations) or panics: zero is no progress, and the stream sends only stage changes.
+#[tokio::test(start_paused = true)]
+async fn a_zero_interval_never_ticks() {
+    let (stage, ticket) = ticket(Stage::Queued);
+    let (_closer, closing) = closing();
+    let (ticker, progress) = progress(Duration::ZERO);
+    let ticking = tokio::spawn(ticker.run());
+    let metrics = CacheMetrics::default();
+    let mut ops = operations(ticket, closing, progress, metrics.execute.wait());
+    ops.next().await.expect("queued").expect("healthy");
+    let quiet = tokio::time::timeout(100 * EVERY, ops.next()).await;
+    assert!(quiet.is_err(), "an update with a zero interval");
+    stage.send_replace(Stage::Executing);
+    ops.next().await.expect("executing").expect("healthy");
+    ticking.abort();
+}
