@@ -5,7 +5,8 @@
 //! The scheduler keeps its leases' deadlines in memory, judged by the farm's clock. An
 //! outage keeps the farm from hearing its workers (its writes wait on the store), so
 //! when the store returns every worker looks silent and every lease expired. Without the
-//! window the first tick would requeue all running work at once.
+//! window the first tick would requeue all running work at once. Only that silence is
+//! waited out: a heartbeat that comes in is fresh evidence of what its worker runs.
 
 use kbf_types::FarmTime;
 
@@ -20,17 +21,18 @@ impl Scheduler {
     }
 
     /// The state store took a write again at `now`. Every expiry timer restarts: for
-    /// [`LEASE_GRACE`] after `now` no lease is given up for silence or for being left out
-    /// of a heartbeat, so an outage that kept the scheduler from hearing its workers does
-    /// not requeue all running work at once. A worker that is not heard from by then has
-    /// its leases given up as a silent worker's are.
+    /// [`LEASE_GRACE`] after `now` no lease is given up for the silence of its worker, so
+    /// an outage that kept the scheduler from hearing its workers does not requeue all
+    /// running work at once. A worker that is not heard from by then has its leases given
+    /// up as a silent worker's are. A heartbeat is not held back: the running set it lists
+    /// is heard now, and a lease it leaves out is given up as ever.
     pub fn store_available(&mut self, now: FarmTime) {
         self.store_down = false;
         self.grace_until = now.saturating_add(LEASE_GRACE);
     }
 
-    /// Whether giving a lease up waits: the store is down, or has not been back for the
-    /// grace.
+    /// Whether giving a lease up for silence waits: the store is down, or has not been back
+    /// for the grace.
     pub(super) fn settling(&self) -> bool {
         self.store_down || self.now < self.grace_until
     }

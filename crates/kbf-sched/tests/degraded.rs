@@ -145,20 +145,17 @@ fn a_worker_that_returns_in_the_grace_keeps_its_lease() {
     assert!(heartbeat(&mut s, after_grace + 1, vec![lease]).is_empty());
 }
 
-/// Catches: a heartbeat that leaves a lease out being acted on inside the grace (the
-/// worker's reports were not heard during the outage either): the lease whose `Start`
-/// went to an earlier session is kept, and goes at the first heartbeat after the grace.
+/// Catches: a grace that holds back what a heartbeat says. The worker's running set is
+/// heard now, whatever the outage kept the scheduler from hearing before, so a lease it
+/// leaves out (here one whose `Start` went to an earlier session) is given up at once.
 #[test]
-fn a_heartbeat_leaving_a_lease_out_requeues_nothing_in_the_grace() {
+fn a_heartbeat_inside_the_grace_still_reconciles() {
     let (mut s, lease) = silent_holder();
     s.store_unavailable();
     s.store_available(at(100));
     // A new session of the daemon process: the lease's `Start` went to the one before.
     up(&mut s, 101);
     assert!(heartbeat(&mut s, 102, Vec::new()).is_empty());
-    assert!(s.take_requeues().is_empty(), "requeued inside the grace");
-    let later = 100 + LEASE_GRACE.as_secs() + 1;
-    heartbeat(&mut s, later, Vec::new());
     let given_up = s.take_requeues();
     assert_eq!(given_up.len(), 1);
     assert_eq!(given_up[0].lease, lease);

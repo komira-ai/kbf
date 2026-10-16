@@ -73,12 +73,9 @@ impl Scheduler {
     /// lease whose result was reported is kept: that result is on its way to the log.
     /// A lease lost to a restart, or replaced, is charged to the operation's farm budget
     /// ([`Scheduler::farm_fault`]). Returns the result proposed for one past it, which
-    /// ends the operation once committed. Gives up nothing while the state store is down or
-    /// has not been back for the grace ([`Scheduler::store_available`]).
+    /// ends the operation once committed. Not held back by the state store's outage: the
+    /// heartbeat that asks is fresh evidence of what the worker runs.
     pub(super) fn reconcile(&mut self, worker: &WorkerId, running: &[LeaseId]) -> Vec<Effect> {
-        if self.settling() {
-            return Vec::new();
-        }
         let (session, process, handover_ends, stopped) = self
             .workers
             .get(worker)
