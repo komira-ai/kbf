@@ -120,6 +120,7 @@ impl StoredOperation {
                 lease: grant.lease,
                 worker: grant.worker,
             }),
+            losses: 0,
         }
     }
 }
