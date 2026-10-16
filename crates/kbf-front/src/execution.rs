@@ -456,7 +456,7 @@ where
                     action,
                     answer: ExecuteAnswer::Cached {
                         name: name.clone(),
-                        result: Box::new(listing(stored, &result)),
+                        result: Box::new(listing(Some(stored), &result)),
                     },
                 });
             let done = operation(

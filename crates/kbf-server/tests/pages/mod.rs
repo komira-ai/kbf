@@ -203,7 +203,7 @@ pub fn listing(
     logs: (Option<Digest>, Option<Digest>),
 ) -> Listing {
     Listing {
-        result,
+        result: Some(result),
         exit_code,
         outputs: outputs
             .iter()

@@ -12,8 +12,10 @@ use crate::event::{
 };
 use crate::record::{
     ActionRow, Attempt, AttemptEnd, How, Invocation, OUTPUTS_PER_ROW, REASON_CAP, ROW_CAP,
-    RecordKey, State, attempt_bytes, attempts_bytes, btree_entry_bytes, capped, output_bytes,
+    RecordKey, State, TEXT_CAP, attempt_bytes, attempts_bytes, btree_entry_bytes, capped,
+    output_bytes, run_bytes, shape_bytes,
 };
+use crate::run::ActionShape;
 
 /// How many dropped calls of records not made yet [`Records`] remembers, so that the
 /// record each would have made starts incomplete (see
@@ -255,12 +257,15 @@ impl Records {
                 owner,
                 action,
                 command,
+                shape,
             } => {
-                if let Some(key) = self.find(&id, &owner) {
-                    let inv = self.record(&key);
-                    if let Some(i) = inv.row_of(&action) {
-                        // A digest, held in the row: nothing to admit.
-                        inv.rows[i].command = Some(command);
+                if let Some(key) = self.find(&id, &owner)
+                    && let Some(i) = self.record(&key).row_of(&action)
+                {
+                    // A digest, held in the row: nothing to admit.
+                    self.record(&key).rows[i].command = Some(command);
+                    if let Some(shape) = shape {
+                        self.fill_shape(&key, i, shape);
                     }
                 }
             }
@@ -279,6 +284,7 @@ impl Records {
                         started: None,
                         ended: None,
                         end: None,
+                        run: None,
                     };
                     let fits = self.make_room(None, attempt_bytes(&attempt));
                     // Making room may have removed every record waiting on it.
@@ -322,8 +328,57 @@ impl Records {
                     self.spread(operation, at);
                 }
             }
+            Event::Ran {
+                operation,
+                lease,
+                run,
+            } => {
+                let Some(op) = self.operations.get(&operation) else {
+                    return;
+                };
+                if !op.attempts.iter().any(|a| a.lease == lease) {
+                    return;
+                }
+                let fits = self.make_room(None, run_bytes(&run));
+                // Making room may have removed every record waiting on it.
+                if let Some(op) = self.operations.get_mut(&operation) {
+                    if fits {
+                        if let Some(a) = lease_of(&mut op.attempts, lease) {
+                            a.run = Some(run);
+                        }
+                        self.recount_operation(operation);
+                    } else {
+                        self.mark_incomplete_operation(operation);
+                    }
+                    let at = self.now;
+                    self.spread(operation, at);
+                }
+            }
             Event::Finished(finished) => self.finish(finished),
         }
+    }
+
+    /// Sets `shape` on row `i` of `key`'s record, its target's label capped as a
+    /// `RequestMetadata` text is; left out if it does not fit (the record then
+    /// marked incomplete).
+    fn fill_shape(&mut self, key: &RecordKey, i: usize, mut shape: Box<ActionShape>) {
+        if let Some(target) = &mut shape.target {
+            let value = capped(&target.label.value, TEXT_CAP);
+            target.label.truncated |= value.len() < target.label.value.len();
+            target.label.value = value;
+        }
+        let had = self.record(key).rows[i]
+            .shape
+            .as_deref()
+            .map_or(0, shape_bytes);
+        if self.make_room(Some(key), shape_bytes(&shape).saturating_sub(had)) {
+            let inv = self.record(key);
+            inv.rows[i].shape = Some(shape);
+            inv.refresh_row(i);
+        } else {
+            self.record(key).mark_incomplete();
+        }
+        self.recount(key);
     }
 
     /// Marks incomplete the record a dropped call of `id` by `owner` went to: the

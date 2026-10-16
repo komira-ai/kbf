@@ -58,6 +58,16 @@
 //!   `clang @<its pattern>` (`clang @<file name>` for an absolute one). The rule names no program: what it unwraps is told by
 //!   shape (bare name, path, flag), so no list of runners can go stale.
 //!
+//! **The target** ([`Target`], issue #796): the owner buck2 wrote a `buck-out` path
+//! for, read back from the pattern: the cell (its first segment), the package (the
+//! segments up to the first `__<name>__`) and the name (`__` stripped, a `/` in it
+//! kept), written as a label, `cell//pkg:name`, with the kind of owner its root
+//! names (a rule's target, an anonymous target, a BXL function). An action's target
+//! is that of its first output pattern (in pattern order) that names one, else of its
+//! first program word that does (a test binary buck2 built, run remotely); `None` when
+//! neither names one (a remotely run test's outputs under `test/execution`, run by a
+//! program outside `buck-out`). It is read, never guessed, and is not part of the key.
+//!
 //! The key is SHA-256 of a version tag and the program's words and the sorted,
 //! deduplicated output patterns, each length-prefixed, cut to 8 bytes: stable across
 //! Rust releases and processes (never `DefaultHasher`), and a new tag when the
@@ -80,10 +90,50 @@ const MAX_WORDS: usize = 3;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ShapeKey([u8; 8]);
 
+impl ShapeKey {
+    /// The key's 8 bytes.
+    #[must_use]
+    pub const fn bytes(self) -> [u8; 8] {
+        self.0
+    }
+}
+
 impl fmt::Display for ShapeKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&hex::encode(self.0))
     }
+}
+
+/// Whose outputs a `buck-out` path holds, as buck2's roots tell them apart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TargetKind {
+    /// A rule's target (`art`, `gen`).
+    Target,
+    /// An anonymous target (`art-anon`, `gen-anon`).
+    Anon,
+    /// A BXL function (`art-bxl`, `gen-bxl`).
+    Bxl,
+}
+
+impl TargetKind {
+    /// The kind's name, as logs and the read API write it: `target`, `anon`, `bxl`.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Target => "target",
+            Self::Anon => "anon",
+            Self::Bxl => "bxl",
+        }
+    }
+}
+
+/// The owner an action's own `buck-out` paths name (see the module docs).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Target {
+    /// Which kind of owner.
+    pub kind: TargetKind,
+    /// `cell//pkg:name` (`cell//:name` in the cell's root package).
+    pub label: String,
 }
 
 /// What an action is, independent of configuration and input contents.
@@ -100,6 +150,8 @@ pub struct Shape {
     /// Not part of the key: one target built in two configurations has one key, and
     /// this tells them apart.
     pub cfg: Option<String>,
+    /// The target its paths name (see the module docs). Not part of the key.
+    pub target: Option<Target>,
 }
 
 impl Shape {
@@ -107,19 +159,23 @@ impl Shape {
     /// (every output field, in any order, repeats allowed).
     #[must_use]
     pub fn of(arguments: &[String], outputs: &[String]) -> Self {
-        let program = program(arguments);
-        let mut patterns: Vec<(String, Option<String>)> =
-            outputs.iter().filter_map(|o| pattern(o)).collect();
-        patterns.sort();
-        let cfg = patterns.iter().find_map(|(_, cfg)| cfg.clone());
+        let (program, program_target) = words(arguments);
+        let mut patterns: Vec<Pattern> = outputs.iter().filter_map(|o| owned_pattern(o)).collect();
+        patterns.sort_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+        let cfg = patterns.iter().find_map(|(_, cfg, _)| cfg.clone());
+        let target = patterns
+            .iter()
+            .find_map(|(_, _, target)| target.clone())
+            .or(program_target);
         patterns.dedup_by(|a, b| a.0 == b.0);
-        let outputs: Vec<String> = patterns.into_iter().map(|(p, _)| p).collect();
+        let outputs: Vec<String> = patterns.into_iter().map(|(p, _, _)| p).collect();
         let key = key(&program, &outputs);
         Self {
             key,
             program,
             outputs,
             cfg,
+            target,
         }
     }
 }
@@ -145,14 +201,15 @@ fn key(program: &[String], outputs: &[String]) -> ShapeKey {
     ShapeKey(key)
 }
 
-/// The words of the program an action runs (see the module docs); `["-"]` for an
-/// empty argv.
-#[must_use]
-pub fn program(arguments: &[String]) -> Vec<String> {
+/// The words of the program an action runs (see the module docs; `["-"]` for an
+/// empty argv), and the target of the first of them that is a `buck-out` path naming
+/// one (an argument file's path, after `@`, is not a program and names none).
+fn words(arguments: &[String]) -> (Vec<String>, Option<Target>) {
     let Some((first, rest)) = arguments.split_first() else {
-        return vec!["-".to_owned()];
+        return (vec!["-".to_owned()], None);
     };
-    let mut words = vec![word(first)];
+    let (first, mut target) = word(first);
+    let mut words = vec![first];
     let mut rest = rest.iter();
     while words.len() < MAX_WORDS && words.last().is_some_and(|w| is_bare_program(w)) {
         match rest.find(|a| is_inline(a) || !skipped(a)) {
@@ -160,11 +217,15 @@ pub fn program(arguments: &[String]) -> Vec<String> {
                 words.push(inline.clone());
                 break;
             }
-            Some(arg) => words.push(word(arg)),
+            Some(arg) => {
+                let (next, named) = word(arg);
+                words.push(next);
+                target = target.or(named);
+            }
             None => break,
         }
     }
-    words
+    (words, target)
 }
 
 /// A word that may be a program looked up on `PATH`, which may only run the next
@@ -190,42 +251,47 @@ fn skipped(arg: &str) -> bool {
 
 /// One program word: a `buck-out` path's pattern (`buck-out/tmp` for a scratch path),
 /// an absolute path's file name, any other argument as sent; an argument file's path
-/// (after its `@`) the same way (`@<pattern>`, `@<file name>`).
-fn word(arg: &str) -> String {
+/// (after its `@`) the same way (`@<pattern>`, `@<file name>`). With it, the target a
+/// `buck-out` program path names (never an argument file's).
+fn word(arg: &str) -> (String, Option<Target>) {
     let (at, path) = match arg.strip_prefix('@') {
         Some(path) => ("@", path),
         None => ("", arg),
     };
     match buck_out(path) {
-        Some(Found::Pattern(pattern, _)) => return format!("{at}{pattern}"),
-        Some(Found::Scratch) => return format!("{at}buck-out/tmp"),
+        Some(Found::Pattern(pattern, _, target)) => {
+            return (format!("{at}{pattern}"), target.filter(|_| at.is_empty()));
+        }
+        Some(Found::Scratch) => return (format!("{at}buck-out/tmp"), None),
         None => {}
     }
     if path.starts_with('/') {
-        return format!("{at}{}", basename(path));
+        return (format!("{at}{}", basename(path)), None);
     }
-    arg.to_owned()
+    (arg.to_owned(), None)
 }
 
 fn basename(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
 
-/// The pattern of an output path, and the configuration hash it named, if any;
-/// `None` for a scratch path, which is left out of the shape.
-#[must_use]
-pub fn pattern(path: &str) -> Option<(String, Option<String>)> {
+/// An output path's pattern, the configuration hash and the target it names.
+type Pattern = (String, Option<String>, Option<Target>);
+
+/// The pattern of an output path, the configuration hash it named and the target it
+/// names, if any; `None` for a scratch path, which is left out of the shape.
+fn owned_pattern(path: &str) -> Option<Pattern> {
     match buck_out(path) {
-        Some(Found::Pattern(pattern, cfg)) => Some((pattern, cfg)),
+        Some(Found::Pattern(pattern, cfg, target)) => Some((pattern, cfg, target)),
         Some(Found::Scratch) => None,
-        None => Some((path.to_owned(), None)),
+        None => Some((path.to_owned(), None, None)),
     }
 }
 
 /// A path under a `buck-out` root kbf knows.
 enum Found {
-    /// Its pattern, and the configuration hash it named.
-    Pattern(String, Option<String>),
+    /// Its pattern, the configuration hash it named, and the target it names.
+    Pattern(String, Option<String>, Option<Target>),
     /// A scratch path (`buck-out/<v>/tmp/`).
     Scratch,
 }
@@ -293,7 +359,32 @@ fn buck_out(path: &str) -> Option<Found> {
         }
         kept.push(segment);
     }
-    Some(Found::Pattern(kept.join("/"), cfg))
+    let target = target_of(owner, &kept);
+    Some(Found::Pattern(kept.join("/"), cfg, target))
+}
+
+/// The target a pattern's `kept` segments name: the cell (the first segment), the
+/// package (up to the first `__<name>__`) and the name, `__` stripped. `None` without
+/// a name after the cell, or with an empty cell.
+fn target_of(owner: Owner, kept: &[&str]) -> Option<Target> {
+    let names = Names::of(kept);
+    let start = names.starts.iter().position(|&s| s).filter(|&s| s > 0)?;
+    let end = start + names.ends[start..].iter().position(|&e| e)?;
+    let cell = kept[0];
+    if cell.is_empty() {
+        return None;
+    }
+    let spelled = kept[start..=end].join("/");
+    let name = &spelled[2..spelled.len() - 2];
+    let kind = match owner {
+        Owner::Target => TargetKind::Target,
+        Owner::Anon => TargetKind::Anon,
+        Owner::Bxl => TargetKind::Bxl,
+    };
+    Some(Target {
+        kind,
+        label: format!("{cell}//{}:{name}", kept[1..start].join("/")),
+    })
 }
 
 /// Takes the configuration hash out of `rest` (the segments after the root) and

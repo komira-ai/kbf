@@ -30,6 +30,7 @@ mod event;
 mod metrics;
 mod record;
 mod records;
+mod run;
 
 /// The generated `kbf.invocation.v1` messages.
 #[allow(clippy::all, missing_docs)]
@@ -47,3 +48,7 @@ pub use record::{
     REASON_CAP, ROW_CAP, RecordKey, State, TEXT_CAP, Text,
 };
 pub use records::Records;
+pub use run::{
+    ActionShape, Durations, MemoryKill, NumaBytes, Phase, ReapiTimes, Run, RunUsage, Target,
+    TargetKind,
+};

@@ -90,7 +90,7 @@ fn every_how_is_recorded() {
     assert_eq!(inv.rows()[0].outcome, Some(Outcome::Ok { exit_code: 0 }));
     assert_eq!(inv.rows()[1].outcome, Some(Outcome::Ok { exit_code: 0 }));
     assert_eq!(
-        inv.rows()[1].listing.as_ref().map(|l| l.result),
+        inv.rows()[1].listing.as_ref().and_then(|l| l.result),
         Some(d(20))
     );
     assert_eq!(inv.rows()[3].outcome, None, "op-4 is still in flight");
@@ -614,6 +614,7 @@ fn the_command_digest_lands_on_its_row() {
         owner: owner(who),
         action: d(action),
         command: d(77),
+        shape: None,
     };
     let r = records([
         queued("b", t(0), 1, 1),

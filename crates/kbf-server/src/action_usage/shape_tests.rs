@@ -13,6 +13,16 @@ fn strings(items: &[&str]) -> Vec<String> {
     items.iter().map(|s| (*s).to_owned()).collect()
 }
 
+/// The pattern of an output path and the configuration hash it named.
+fn pattern(path: &str) -> Option<(String, Option<String>)> {
+    owned_pattern(path).map(|(pattern, cfg, _)| (pattern, cfg))
+}
+
+/// The words of the program an action runs.
+fn program(arguments: &[String]) -> Vec<String> {
+    words(arguments).0
+}
+
 fn pat(path: &str) -> Option<(String, Option<String>)> {
     pattern(path)
 }
@@ -633,4 +643,176 @@ fn known_limit_a_test_execution_path_keys_per_configuration() {
     assert_eq!(shape(CFG).key, shape(CFG).key);
     assert_ne!(shape(CFG).key, shape(CFG2).key);
     assert_eq!(shape(CFG).cfg, None);
+}
+
+fn target_of_paths(argv: &[&str], outputs: &[&str]) -> Option<(TargetKind, String)> {
+    Shape::of(&strings(argv), &strings(outputs))
+        .target
+        .map(|t| (t.kind, t.label))
+}
+
+fn label(kind: TargetKind, label: &str) -> Option<(TargetKind, String)> {
+    Some((kind, label.to_owned()))
+}
+
+/// Issue #796: the target a compile's own output paths name. Catches: the label
+/// built from the wrong segments (the configuration hash or the content hash or
+/// `output_artifacts` left in it, the cell or the package dropped), the content-hash
+/// form giving another label than the configuration form, a name with a `/` cut at
+/// it, or the root package written other than `cell//:name`.
+#[test]
+fn a_compile_names_its_target_in_every_form() {
+    let want = label(
+        TargetKind::Target,
+        "komira//src/komira_encoding:komira_encoding",
+    );
+    for path in [
+        format!(
+            "buck-out/v2/art/komira/{CFG}/src/komira_encoding/__komira_encoding__/out/libfoo.a"
+        ),
+        format!("buck-out/v2/art/komira/{CFG}-{EXEC}/src/komira_encoding/__komira_encoding__/o"),
+        "buck-out/v2/art/komira/src/komira_encoding/__komira_encoding__/output_artifacts/o"
+            .to_owned(),
+        format!("buck-out/v2/gen/komira/src/komira_encoding/__komira_encoding__/{CONTENT}/o"),
+        format!("/srv/repo/buck-out/v2/art/komira/{CFG}/src/komira_encoding/__komira_encoding__/o"),
+    ] {
+        assert_eq!(target_of_paths(&["cc"], &[&path]), want, "{path}");
+    }
+    assert_eq!(
+        target_of_paths(
+            &["cc"],
+            &[&format!("buck-out/v2/art/cell/{CFG}/pkg/__foo/bar__/o")]
+        ),
+        label(TargetKind::Target, "cell//pkg:foo/bar"),
+        "a name keeps its slash"
+    );
+    assert_eq!(
+        target_of_paths(
+            &["cc"],
+            &[&format!("buck-out/v2/art/cell/{CFG}/__root__/o")]
+        ),
+        label(TargetKind::Target, "cell//:root"),
+    );
+    assert_eq!(
+        target_of_paths(
+            &["cc"],
+            &[&format!(
+                "buck-out/v2/art/cell/pkg/__t__/__action__3__/{CONTENT}/o"
+            )]
+        ),
+        label(TargetKind::Target, "cell//pkg:t"),
+        "a dynamic action is its target's"
+    );
+}
+
+/// Issue #796: anonymous and BXL owners give their kind. Catches: an anonymous
+/// target's glued configuration or attributes hash left in its label, its kind lost
+/// (read as a rule's target), the root-package form's glued content hash kept in the
+/// cell, or a BXL function's hashes left in its label.
+#[test]
+fn anonymous_and_bxl_owners_name_their_kind() {
+    assert_eq!(
+        target_of_paths(
+            &["cc"],
+            &[&format!(
+                "buck-out/v2/art-anon/komira/{CFG}src/x/3fa9c1/__x__/o"
+            )]
+        ),
+        label(TargetKind::Anon, "komira//src/x:x")
+    );
+    assert_eq!(
+        target_of_paths(
+            &["cc"],
+            &["buck-out/v2/gen-anon/komira/src/x/deadbeef/__x__/o"]
+        ),
+        label(TargetKind::Anon, "komira//src/x:x")
+    );
+    assert_eq!(
+        target_of_paths(
+            &["cc"],
+            &["buck-out/v2/art-anon/anon990e66921b1edf1c/___compiler_type_flags_anon_rule__/o"]
+        ),
+        label(TargetKind::Anon, "anon//:_compiler_type_flags_anon_rule")
+    );
+    assert_eq!(
+        target_of_paths(
+            &["cc"],
+            &[
+                "buck-out/v2/art-bxl/komira/453d11473805230f/tools/build/lint/test_weld.bxl/__check__/ecd72b18569a9587/v.json"
+            ]
+        ),
+        label(
+            TargetKind::Bxl,
+            "komira//tools/build/lint/test_weld.bxl:check"
+        )
+    );
+    assert_eq!(
+        [TargetKind::Target, TargetKind::Anon, TargetKind::Bxl].map(TargetKind::name),
+        ["target", "anon", "bxl"]
+    );
+}
+
+/// Issue #796: a test buck2 built and runs remotely names its target through its
+/// program, its outputs naming none; one run by a program outside `buck-out` names
+/// none, and is `None`, not a guess. Catches: the program word not read for a target,
+/// an argument file's owner taken for the program's, the first output's target not
+/// preferred over the program's, or a `test/execution` path read as a target.
+#[test]
+fn a_test_names_its_target_through_its_program_or_names_none() {
+    let execution = format!("buck-out/v2/test/execution/komira/{CFG}/{CONTENT2}/default/out");
+    let binary = format!("buck-out/v2/art/komira/{CFG}/src/t/__t_test__/t_test");
+    assert_eq!(
+        target_of_paths(&[&binary, "--list"], &[&execution]),
+        label(TargetKind::Target, "komira//src/t:t_test")
+    );
+    assert_eq!(
+        target_of_paths(&["/usr/bin/env", "FOO=1", &binary], &[&execution]),
+        label(TargetKind::Target, "komira//src/t:t_test"),
+        "a wrapped program word"
+    );
+    assert_eq!(
+        target_of_paths(&["test-runner", "suite.cfg"], &[&execution]),
+        None
+    );
+    assert_eq!(
+        target_of_paths(
+            &[
+                "clang",
+                &format!("@buck-out/v2/art/komira/{CFG}/src/a/__a__/args")
+            ],
+            &["a.o"]
+        ),
+        None,
+        "an argument file is not a program"
+    );
+    assert_eq!(
+        target_of_paths(
+            &["buck-out/v2/art/prelude/rust/tools/__rustc_action__/output_artifacts/r.py"],
+            &[&format!(
+                "buck-out/v2/art/komira/{CFG}/src/foo/__foo__/libfoo.rlib"
+            )]
+        ),
+        label(TargetKind::Target, "komira//src/foo:foo"),
+        "the output's target, not the tool's"
+    );
+    assert_eq!(
+        target_of_paths(&["cc"], &["buck-out/v2/art/__x__/o"]),
+        None,
+        "no cell"
+    );
+    assert_eq!(
+        target_of_paths(&["cc"], &["buck-out/v2/art//pkg/__x__/o"]),
+        None,
+        "empty cell"
+    );
+    assert_eq!(
+        target_of_paths(&["cc"], &["buck-out/v2/art/cell/pkg/o"]),
+        None,
+        "no name"
+    );
+    assert_eq!(
+        target_of_paths(&["cc"], &["buck-out/v2/art/cell/pkg/__open/o"]),
+        None,
+        "a name never closed"
+    );
 }

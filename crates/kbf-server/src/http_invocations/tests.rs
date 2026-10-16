@@ -30,7 +30,7 @@ fn records(id: &str, instances: &[&str]) -> Records {
             kind: CallKind::GetActionResult {
                 action: d(n),
                 hit: Some(Listing {
-                    result: d(100 + n),
+                    result: Some(d(100 + n)),
                     exit_code: 0,
                     outputs: Vec::new(),
                     stdout: Some(d(200 + n)),

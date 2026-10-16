@@ -3,9 +3,10 @@
 //! `available` is filled in once the cache has been asked.
 
 use kbf_invocation::{
-    ActionRow, Attempt, AttemptEnd, Counts, Histogram, Invocation, Outcome, State, Text, Usage,
-    WallTime, failure_name, requeue_name,
+    ActionRow, ActionShape, Attempt, AttemptEnd, Counts, Durations, Histogram, How, Invocation,
+    Outcome, Phase, Run, RunUsage, State, Text, Usage, WallTime, failure_name, requeue_name,
 };
+use kbf_sched::RequeueReason;
 use kbf_types::Digest;
 use serde_json::{Map, Value, json};
 
@@ -126,7 +127,59 @@ pub(super) fn invocation(inv: &Invocation, base: &str, now: WallTime) -> Value {
             "logs": format!("{base}/logs"),
             "metrics": format!("{base}/metrics"),
         },
+        "phase_totals": phase_totals(inv),
+        "top_slowest": {
+            "wall_ms": slowest(inv, Phase::Wall, base),
+            "execution_ms": slowest(inv, Phase::Execution, base),
+        },
     })
+}
+
+/// How many actions `top_slowest` lists per phase.
+pub(crate) const TOP_SLOWEST: usize = 20;
+
+/// The rows the farm ran for this invocation (`how` = `ran`): a joined row's leases
+/// are its twin's, counted where the twin ran.
+fn ran_rows(inv: &Invocation) -> impl Iterator<Item = &ActionRow> {
+    inv.rows().iter().filter(|r| r.how == How::Ran)
+}
+
+/// Each phase's milliseconds summed over the `ran` rows that measured it, and how
+/// many did; a phase none measured is left out.
+fn phase_totals(inv: &Invocation) -> Value {
+    let mut totals = Map::new();
+    for (phase, name) in Phase::NAMED.into_iter().filter(|(p, _)| *p != Phase::Wall) {
+        let measured: Vec<u64> = ran_rows(inv)
+            .filter_map(|r| r.durations().of(phase))
+            .collect();
+        if !measured.is_empty() {
+            let sum = measured.iter().fold(0_u64, |a, &v| a.saturating_add(v));
+            totals.insert(name.to_owned(), (sum / 1_000).into());
+        }
+    }
+    Value::Object(totals)
+}
+
+/// The [`TOP_SLOWEST`] `ran` rows that took longest in `phase`, longest first (ties in
+/// row order): each one's action, its milliseconds and its `href`.
+fn slowest(inv: &Invocation, phase: Phase, base: &str) -> Value {
+    let mut found: Vec<(u64, usize, &ActionRow)> = ran_rows(inv)
+        .enumerate()
+        .filter_map(|(i, r)| Some((r.durations().of(phase)?, i, r)))
+        .collect();
+    found.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    found
+        .into_iter()
+        .take(TOP_SLOWEST)
+        .map(|(micros, _, r)| {
+            let action = digest_text(&r.action);
+            json!({
+                "action": action,
+                phase.name(): micros / 1_000,
+                "href": format!("{base}/actions/{action}"),
+            })
+        })
+        .collect()
 }
 
 fn counts(c: &Counts) -> Value {
@@ -163,10 +216,17 @@ pub(super) fn row(r: &ActionRow, base: &str) -> Map<String, Value> {
         ("outcome", outcome(r.outcome.as_ref())),
         (
             "result",
-            r.listing.as_ref().map(|l| digest_text(&l.result)).into(),
+            r.listing
+                .as_ref()
+                .and_then(|l| l.result)
+                .as_ref()
+                .map(digest_text)
+                .into(),
         ),
         ("command", r.command.as_ref().map(digest_text).into()),
         ("href", href.into()),
+        ("shape", r.shape.as_deref().map_or(Value::Null, shape)),
+        ("durations", durations(&r.durations())),
     ]
     .into_iter()
     .map(|(k, v)| (k.to_owned(), v))
@@ -295,6 +355,102 @@ fn histogram(h: &Histogram) -> Value {
     })
 }
 
+/// A row's shape: the key, the configuration hash and the target the server read
+/// from the action's Command (`target` beside it on the row is the client's hint).
+fn shape(s: &ActionShape) -> Value {
+    let target = s.target.as_ref().map_or(
+        Value::Null,
+        |t| json!({"label": t.label.value, "truncated": t.label.truncated, "kind": t.kind.name()}),
+    );
+    json!({"key": s.key_text(), "cfg": s.cfg, "target": target})
+}
+
+/// A row's durations, in milliseconds, under their phase names; one not measured is
+/// left out.
+fn durations(d: &Durations) -> Value {
+    Phase::NAMED
+        .into_iter()
+        .filter_map(|(phase, name)| Some((name.to_owned(), (d.of(phase)? / 1_000).into())))
+        .collect::<Map<String, Value>>()
+        .into()
+}
+
+/// What an attempt's lease measured, as keys added to its built ones: its memory
+/// kill once it ended, the booking and cap of a memory kill, the raised booking of an
+/// own-limit requeue, the REAPI times and the usage of its run. A key not measured is
+/// left out.
+fn measured(a: &Attempt, keys: &mut Map<String, Value>) {
+    let mut put = |key: &str, value: Value| {
+        keys.insert(key.to_owned(), value);
+    };
+    if let Some(kill) = a.memory_kill() {
+        put("memory_kill", kill.name().into());
+    }
+    let run = a.run.as_deref();
+    let (booked, raised) = match &a.end {
+        Some(AttemptEnd::Requeued(RequeueReason::OutOfMemory { booked, raised })) => {
+            (Some(*booked), Some(*raised))
+        }
+        _ => (run.and_then(|r| r.booked_memory_bytes), None),
+    };
+    for (key, bytes) in [
+        ("booked_memory_bytes", booked),
+        ("cap_bytes", run.and_then(|r| r.cap_bytes)),
+        ("raised_memory_bytes", raised),
+    ] {
+        if let Some(bytes) = bytes {
+            put(key, bytes.into());
+        }
+    }
+    if let Some(run) = run {
+        put("reapi_times", reapi_times(run));
+        if let Some(u) = &run.usage {
+            put("usage", run_usage(u));
+        }
+    }
+}
+
+fn reapi_times(run: &Run) -> Value {
+    run.times
+        .named()
+        .into_iter()
+        .filter_map(|(name, t)| Some((name.to_owned(), rfc3339(t?).into())))
+        .collect::<Map<String, Value>>()
+        .into()
+}
+
+/// A run's usage: its wall time, every cgroup counter it reported, the parallelism
+/// derived from them and its bytes per NUMA node.
+fn run_usage(u: &RunUsage) -> Value {
+    let mut keys = Map::new();
+    keys.insert("wall_us".to_owned(), u.wall_micros.into());
+    for (key, value) in [
+        ("cpu_usage_us", u.cpu_usage_micros),
+        ("cpu_user_us", u.cpu_user_micros),
+        ("cpu_system_us", u.cpu_system_micros),
+        ("cpu_periods", u.cpu_periods),
+        ("cpu_throttled", u.cpu_throttled_periods),
+        ("throttled_us", u.cpu_throttled_micros),
+        ("memory_peak_bytes", u.memory_peak_bytes),
+    ] {
+        if let Some(value) = value {
+            keys.insert(key.to_owned(), value.into());
+        }
+    }
+    if let Some(parallelism) = u.parallelism() {
+        keys.insert("parallelism".to_owned(), parallelism.into());
+    }
+    if !u.numa.is_empty() {
+        let numa: Vec<Value> = u
+            .numa
+            .iter()
+            .map(|n| json!({"node": n.node, "bytes": n.bytes}))
+            .collect();
+        keys.insert("numa_bytes".to_owned(), numa.into());
+    }
+    keys.into()
+}
+
 fn attempt(a: &Attempt) -> Value {
     let end = match &a.end {
         None => Value::Null,
@@ -306,15 +462,20 @@ fn attempt(a: &Attempt) -> Value {
             json!({"failure": failure_name(*failure), "reason": why})
         }
     };
-    json!({
-        "lease": a.lease.to_string(),
-        "worker": a.worker.as_str(),
-        "queued": rfc3339(a.queued),
-        "granted": rfc3339(a.granted),
-        "started": a.started.map(rfc3339),
-        "ended": a.ended.map(rfc3339),
-        "end": end,
-    })
+    let mut keys: Map<String, Value> = [
+        ("lease", a.lease.to_string().into()),
+        ("worker", a.worker.as_str().into()),
+        ("queued", rfc3339(a.queued).into()),
+        ("granted", rfc3339(a.granted).into()),
+        ("started", a.started.map(rfc3339).into()),
+        ("ended", a.ended.map(rfc3339).into()),
+        ("end", end),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_owned(), v))
+    .collect();
+    measured(a, &mut keys);
+    Value::Object(keys)
 }
 
 fn outcome(o: Option<&Outcome>) -> Value {

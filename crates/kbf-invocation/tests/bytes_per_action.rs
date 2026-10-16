@@ -68,7 +68,7 @@ fn listing(n: u64, shape: Shape) -> Listing {
         0
     };
     Listing {
-        result: digest(1, n, 180 + n % 300),
+        result: Some(digest(1, n, 180 + n % 300)),
         exit_code: 0,
         outputs: (0..count)
             .map(|j| Output {

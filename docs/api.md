@@ -338,8 +338,8 @@ route.
 
 | Route | Answers |
 |---|---|
-| `GET /v1/invocations/{id}` | the invocation: its header fields and counters, and links to the routes below |
-| `GET /v1/invocations/{id}/actions` | a page of its action rows, in the order first seen; `?outcome=ok\|failed\|timed_out\|refused`, `?how=cache_hit\|cache_hit_execute\|joined\|ran` |
+| `GET /v1/invocations/{id}` | the invocation: its header fields and counters, links to the routes below, its slowest actions and its phase totals |
+| `GET /v1/invocations/{id}/actions` | a page of its action rows, in the order first seen; `?outcome=ok\|failed\|timed_out\|refused`, `?how=cache_hit\|cache_hit_execute\|joined\|ran`, `?requeue_reason=<reason>`, `?memory_kill=none\|own_limit\|node_pressure`; `?sort=wall_ms\|execution_ms\|queue_ms\|input_fetch_ms\|output_upload_ms`, longest first |
 | `GET /v1/invocations/{id}/actions/{digest}` | one action's row, with the outputs, stdout, stderr and usage copied into it, and whether each blob is still held |
 | `GET /v1/invocations/{id}/artifacts` | a page of the outputs of its actions, in row order |
 | `GET /v1/invocations/{id}/logs` | a page of the stdout and stderr of its actions, failed actions first |
@@ -374,7 +374,11 @@ It is matched as the bytes of the path: a percent-encoded character (`%3C`, `%6F
              "bytes_uploaded": 1234567, "bytes_downloaded": 89012345},
   "collisions": ["0b8c...~2"],
   "links": {"actions": "/v1/invocations/0b8c.../actions", "artifacts": "...", "logs": "...",
-            "metrics": "..."}
+            "metrics": "..."},
+  "phase_totals": {"execution_ms": 912345, "queue_ms": 20431},
+  "top_slowest": {
+    "wall_ms": [{"action": "<digest>", "wall_ms": 61234, "href": "/v1/invocations/0b8c.../actions/<digest>"}],
+    "execution_ms": [{"action": "<digest>", "execution_ms": 60011, "href": "..."}]}
 }
 ```
 
@@ -382,6 +386,13 @@ Times are RFC 3339 in UTC to the microsecond; durations are integer microseconds
 digests are `<sha256 hex>-<size>`. `state` is `idle` after 10 minutes with no event and
 no operation in flight, else `open`. `url` is `null` (the link template,
 `--invocation-url-template`, is planned).
+
+**`phase_totals`** sums, over the rows the farm ran for this invocation (`how` =
+`ran`), each phase's milliseconds (see `durations` below; `wall_ms` is not summed); a
+phase no such row measured is left out. **`top_slowest`** lists, for `wall_ms` and for
+`execution_ms`, the 20 such rows that took longest, longest first (ties in row order),
+each with its `action`, its milliseconds and its `href`. Both are computed from the
+rows at each request.
 
 **An action row** (on `/actions`, and as the start of `/actions/{digest}`):
 `action`, `instance`, `target`, `mnemonic`, `configuration` and `action_id` (each
@@ -391,7 +402,38 @@ no operation in flight, else `open`. `url` is `null` (the link template,
 "<text>"}`, `null` while held), `outcome` (`{"ok": {"exit_code": n}}`, `{"failed":
 {"code": n, "message": "..."}}`, `{"timed_out": {}}`, `{"refused": {"reason": "..."}}`,
 or `null` in flight), `result` and `command` (digests or `null`) and `href`, the row's
-own route. `/actions/{digest}` adds `outputs` (each `path`, `digest`, `executable`,
+own route; then the keys added since (none of the keys above changed):
+
+- `shape`: what the server read from the action's `Command` when it was queued, or
+  `null` (a cache hit, or a Command not read): `key` (the shape key, 16 hex digits, as
+  the `action usage:` line writes it), `cfg` (the configuration hash an output path
+  named, or `null`) and `target`, the target the action's own `buck-out` paths name
+  (`{"label": "cell//pkg:name", "truncated", "kind": "target"|"anon"|"bxl"}`), or
+  `null` when they name none (a remotely run test whose outputs sit under
+  `buck-out/v2/test/execution/` and whose program is not a `buck-out` path): it is
+  read, never guessed. The row's `target` above is what the client's
+  `RequestMetadata` said, a hint only (buck2 sends none).
+- `durations`, in whole milliseconds, each left out when not measured: `wall_ms`, from
+  the first lease's queueing to the last lease's end (requeues included; left out
+  until the last lease ends); `queue_ms`, queued to granted summed over its leases;
+  `execution_ms`, `input_fetch_ms` and `output_upload_ms`, each `start` to `completed`
+  of the REAPI times of its last lease's run.
+- on each attempt: `memory_kill` once it ended (`none`, `own_limit` or
+  `node_pressure`, read from how it ended); `booked_memory_bytes` for a lease killed
+  for memory (the one that ended the operation too), `cap_bytes` for an own-limit kill
+  (the largest node that could run it), `raised_memory_bytes` for an own-limit
+  requeue (the next booking); and, for a lease whose report the scheduler took,
+  `reapi_times` (each of REAPI's nine `ExecutedActionMetadata` times it has, by name
+  without `_timestamp`, as its stamped result would carry them: `queued` is the
+  operation's first submission, and the worker start and completion are the server's
+  when the daemon sent none) and `usage` (`wall_us`, each cgroup counter the daemon
+  read: `cpu_usage_us`, `cpu_user_us`, `cpu_system_us`, `cpu_periods`,
+  `cpu_throttled`, `throttled_us`, `memory_peak_bytes`; `parallelism`, CPU time over
+  wall time; `numa_bytes`, `[{"node", "bytes"}]`). A key not measured is left out,
+  never zero.
+
+A timed-out run's stdout and stderr (those the CAS holds) are its row's `stdout` and
+`stderr`; its `result` stays `null`, since a partial result is never stored. `/actions/{digest}` adds `outputs` (each `path`, `digest`, `executable`,
 `directory`, `available` and `href`), `outputs_truncated`, `stdout` and `stderr` (each
 `{"digest", "available", "href"}` or `null`), `usage` (or `null`) and `blobs`
 (`action` and `command` links). An output directory is listed as its Tree digest.
@@ -416,6 +458,17 @@ instance>&name=<file name>`, with `&inline=text` for a log of at most 4 MiB; eve
 does. They are computed from the rows at each request. `p50` and `p90` are approximate:
 never below the true value and at most 1/16 above it (exact below 16 µs); the rest are
 exact.
+
+**Filters and order of `/actions`.** `?requeue_reason=` keeps the rows with a lease
+given up for that reason (`silent`, `replaced`, `reconnected`, `not_started`,
+`session_switch`, `out_of_memory`, `node_memory_pressure`, `restarted`, `lost`,
+`infra`), whatever the action's end: an action killed for its own limit, run again and
+then OK is kept by `out_of_memory`. `?memory_kill=own_limit` (or `node_pressure`) keeps
+the rows with a lease killed that way; `none`, the rows with no lease killed for
+memory. `?sort=<phase>` lists the rows that measured that phase (`durations` above),
+longest first, ties in row order; its pages resume after the last row listed, so a row
+whose duration grows past that point after it was passed is not listed again. Filters
+combine, and `next_page` carries them all.
 
 **Pages.** `/actions`, `/artifacts` and `/logs` take `?page_size=` (100 by default,
 1 to 1000) and `?page_token=`, the `next_page_token` of the page before, with the same
