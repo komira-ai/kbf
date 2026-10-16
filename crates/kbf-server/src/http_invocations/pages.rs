@@ -404,7 +404,7 @@ fn sorted(
         .filter(|e| after.is_none_or(|a| order(&a, e).is_lt()))
         .collect();
     if found.len() > n {
-        // MUTANT M3: found.select_nth_unstable_by(n, order);
+        found.select_nth_unstable_by(n, order);
         found.truncate(n);
     }
     found.sort_unstable_by(order);

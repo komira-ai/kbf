@@ -857,7 +857,7 @@ impl State {
         }
         if accepted && let Some(run) = run {
             let killed = match outcome {
-                Outcome::Failed(Failure::OutOfMemory | Failure::NodeMemoryPressure) => answers
+                Outcome::Failed(Failure::OutOfMemory) => answers /* MUTANT M2 */
                     .iter()
                     .find(|a| a.lease == lease)
                     .map(|a| a.memory_runs.as_slice())
