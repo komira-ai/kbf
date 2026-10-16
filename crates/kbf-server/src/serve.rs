@@ -603,7 +603,10 @@ pub fn bind_storage(
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<BoundStorage<impl Future<Output = Result<(), ServeError>>>, ServeError> {
     let (incoming, addr) = bind(listener.listen)?;
-    let mut server = flow_control(Server::builder(), crate::streams::StreamLimits::DEFAULT.worker);
+    let mut server = flow_control(
+        Server::builder(),
+        crate::streams::StreamLimits::DEFAULT.worker,
+    );
     let admission = match listener.tls {
         Some(tls) => {
             server = server.tls_config(tls)?;
