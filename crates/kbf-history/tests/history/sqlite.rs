@@ -8,7 +8,7 @@ use kbf_history::{InvRef, Limits};
 use kbf_state::sqlite::{Options, SqliteStore};
 use kbf_state::{Clock, ManualClock, Store};
 
-use crate::support::{Index, Life, Objects, T, all};
+use crate::support::{Index, Life, Objects, T, all, whole};
 
 fn open(path: &Path) -> Arc<Index> {
     let clock: Arc<dyn Clock> = Arc::new(ManualClock::default());
@@ -44,9 +44,7 @@ fn history_written_through_sqlite_reads_back_after_the_store_restarts() {
     };
     let after = Life::start(&objects, &open(&path), 2, Limits::default());
     let reader = after.reader();
-    let got = futures::executor::block_on(reader.invocation(&inv.key, &all))
-        .unwrap()
-        .unwrap();
+    let got = whole(&reader, &inv.key, &all).unwrap().unwrap();
     assert!(got.complete);
     assert_eq!(got.runs, [ok.clone(), failed.clone()]);
     let run = futures::executor::block_on(reader.run(failed.run_id(), &all))

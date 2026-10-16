@@ -9,12 +9,13 @@ use std::time::SystemTime;
 
 use bytes::Bytes;
 use kbf_history::records::{
-    CommandRendering, FailedRun, HitHow, HitRecord, RunOutcome, RunRecord, Tail, Timestamps,
-    WireDigest,
+    CommandRendering, FailedRun, HitHow, HitRecord, InvocationHeader, RunOutcome, RunRecord, Tail,
+    Timestamps, WireDigest,
 };
 use kbf_history::{
-    Event, EventQueue, HistoryIndex, HistoryRoot, IndexRoot, Inline, InvRef, Limits, Minter,
-    Offload, Offloaded, QueueLimits, Reader, Writer, WriterId,
+    ChunkCursor, Event, EventQueue, HistoryIndex, HistoryRoot, IndexRoot, Inline, InvKey, InvRef,
+    InvocationView, Limits, MAX_PAGE_CHUNKS, Minter, Offload, Offloaded, QueueLimits, ReadError,
+    Reader, Writer, WriterId,
 };
 use kbf_objstore::{
     ByteRange, Capabilities, KeyPrefix, ListPage, ListToken, MemoryStore, ObjectKey, ObjectStore,
@@ -500,4 +501,58 @@ pub fn failed_section(instance: &str) -> FailedRun {
 
 pub fn all(_: &str) -> bool {
     true
+}
+
+/// An invocation read whole: its summary and every record, page after page.
+#[derive(Debug, PartialEq)]
+pub struct Whole {
+    pub header: InvocationHeader,
+    pub complete: bool,
+    pub gap_from_ms: Option<u64>,
+    pub runs: Vec<RunRecord>,
+    pub failed: Vec<FailedRun>,
+    pub hits: Vec<HitRecord>,
+}
+
+/// Reads `inv` whole through [`Reader::invocation`] and every page of
+/// [`Reader::records`].
+pub fn whole(
+    reader: &Reader<Objects>,
+    inv: &InvKey,
+    allow: &dyn Fn(&str) -> bool,
+) -> Result<Option<Whole>, ReadError> {
+    let Some(InvocationView {
+        header,
+        complete,
+        gap_from_ms,
+        ..
+    }) = futures::executor::block_on(reader.invocation(inv, allow))?
+    else {
+        return Ok(None);
+    };
+    let mut got = Whole {
+        header,
+        complete,
+        gap_from_ms,
+        runs: Vec::new(),
+        failed: Vec::new(),
+        hits: Vec::new(),
+    };
+    let mut after: Option<ChunkCursor> = None;
+    loop {
+        let page = futures::executor::block_on(reader.records(
+            inv,
+            after.as_ref(),
+            MAX_PAGE_CHUNKS,
+            allow,
+        ))?
+        .expect("the header was there a moment ago");
+        got.runs.extend(page.runs);
+        got.failed.extend(page.failed);
+        got.hits.extend(page.hits);
+        match page.next {
+            Some(next) => after = Some(next),
+            None => return Ok(Some(got)),
+        }
+    }
 }

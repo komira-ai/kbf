@@ -11,6 +11,8 @@ publish.workspace = true
 bytes.workspace = true
 # The CRC-32C of each block and of the footer.
 crc32c.workspace = true
+# `try_join_all`: a page of chunk reads in parallel, with no runtime.
+futures.workspace = true
 hex.workspace = true
 # The `ObjectStore` trait history objects are written through, and its key types.
 kbf-objstore.workspace = true
@@ -23,10 +25,6 @@ ruzstd.workspace = true
 # The invocation key (first 8 bytes of SHA-256).
 sha2.workspace = true
 thiserror.workspace = true
-
-[dev-dependencies]
-# `block_on` for the async writer and reader over the in-memory object store.
-futures.workspace = true
 
 [lints]
 workspace = true

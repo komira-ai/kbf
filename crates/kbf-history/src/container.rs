@@ -151,7 +151,7 @@ pub enum FormatError {
 }
 
 impl FormatError {
-    fn decode(what: &'static str, e: &prost::DecodeError) -> FormatError {
+    pub(crate) fn decode(what: &'static str, e: &prost::DecodeError) -> FormatError {
         FormatError::Decode {
             what,
             message: e.to_string(),

@@ -7,7 +7,7 @@ use std::sync::atomic::Ordering;
 use kbf_history::records::RunOutcome;
 use kbf_history::{IndexRoot, InvRef, Limits, ReadError, Reader};
 
-use crate::support::{Index, Life, Never, Objects, T, Threaded, all, root};
+use crate::support::{Index, Life, Never, Objects, T, Threaded, all, root, whole};
 
 #[test]
 fn every_index_call_runs_through_the_offload_off_the_polling_thread() {
@@ -35,9 +35,7 @@ fn every_index_call_runs_through_the_offload_off_the_polling_thread() {
         .unwrap()
         .unwrap();
     assert!(got.failed.is_some());
-    let view = futures::executor::block_on(reader.invocation(&inv.key, &all))
-        .unwrap()
-        .unwrap();
+    let view = whole(&reader, &inv.key, &all).unwrap().unwrap();
     assert!(view.complete);
     let made = index.txns.load(Ordering::SeqCst)
         + index.gets.load(Ordering::SeqCst)

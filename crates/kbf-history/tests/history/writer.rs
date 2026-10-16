@@ -12,7 +12,7 @@ use kbf_history::run_id::BLOCK_SIZE;
 use kbf_history::{Day, Event, InvRef, Limits, PendingLimits, StreamId};
 use prost::Message;
 
-use crate::support::{Index, Life, Objects, T, all, digest, failed_section, run_record};
+use crate::support::{Index, Life, Objects, T, all, digest, failed_section, run_record, whole};
 
 const ICHUNK: &str = "ui/ichunk/";
 const STREAM: &str = "ui/stream/";
@@ -24,8 +24,7 @@ fn assert_no_dangling(life: &Life) {
     let reader = life.reader();
     for key in life.index.keys(INVID) {
         let inv = kbf_history::InvKey::parse(key.trim_start_matches(INVID)).unwrap();
-        futures::executor::block_on(reader.invocation(&inv, &all))
-            .unwrap_or_else(|e| panic!("{key}: {e}"));
+        whole(&reader, &inv, &all).unwrap_or_else(|e| panic!("{key}: {e}"));
     }
 }
 
@@ -90,7 +89,7 @@ fn a_crash_after_the_put_leaves_an_orphan_object_and_never_a_dangling_row() {
     drop(life.writer);
     let after = Life::start(&life.objects, &life.index, 2, Limits::default());
     assert_no_dangling(&after);
-    let got = futures::executor::block_on(after.reader().invocation(&inv.key, &all)).unwrap();
+    let got = whole(&after.reader(), &inv.key, &all).unwrap();
     assert_eq!(got, None, "the orphan is not visible without its rows");
 }
 
@@ -150,7 +149,7 @@ fn a_dropped_index_row_returns_after_the_backlog_drains_with_no_list() {
     assert_eq!(life.objects.counts().lists.load(Ordering::SeqCst), 0);
     let found = futures::executor::block_on(life.reader().run(r.run_id(), &all)).unwrap();
     assert_eq!(found.unwrap().run, r);
-    let got = futures::executor::block_on(life.reader().invocation(&inv.key, &all));
+    let got = whole(&life.reader(), &inv.key, &all);
     assert_eq!(
         got.unwrap().unwrap().runs,
         [r],
@@ -227,9 +226,7 @@ fn a_restored_row_beside_rows_that_exist_still_lands() {
     );
     life.drain(T, 5);
     assert_eq!(life.index.keys(ICHUNK).len(), 2);
-    let got = futures::executor::block_on(life.reader().invocation(&inv.key, &all))
-        .unwrap()
-        .unwrap();
+    let got = whole(&life.reader(), &inv.key, &all).unwrap().unwrap();
     assert_eq!(got.runs.len(), 2);
 }
 
@@ -449,9 +446,7 @@ fn a_writer_past_its_buffer_bound_drops_the_oldest_and_counts_the_hole() {
     life.close(&old);
     life.close(&new);
     life.step(T + 2);
-    let got = futures::executor::block_on(life.reader().invocation(&old.key, &all))
-        .unwrap()
-        .unwrap();
+    let got = whole(&life.reader(), &old.key, &all).unwrap().unwrap();
     assert!(!got.complete && got.runs.is_empty());
     assert_eq!(got.header.dropped, 1);
     assert_eq!(header(&life, &new).runs, 2);
@@ -478,9 +473,7 @@ fn a_writer_past_its_buffer_bound_drops_the_oldest_and_counts_the_hole() {
     life.objects.counts().fail_puts.store(0, Ordering::SeqCst);
     life.close(&old);
     life.drain(T + 10, 10);
-    let got = futures::executor::block_on(life.reader().invocation(&old.key, &all))
-        .unwrap()
-        .unwrap();
+    let got = whole(&life.reader(), &old.key, &all).unwrap().unwrap();
     let times: Vec<u64> = got.runs.iter().map(|r| r.time_ms).collect();
     let kept = 10 - shed;
     assert_eq!(
@@ -504,9 +497,7 @@ fn an_invocation_left_open_by_a_crash_reads_incomplete_from_its_last_chunk() {
     life.step(T + 130_000);
     drop(life.writer);
     let after = Life::start(&life.objects, &life.index, 2, Limits::default());
-    let got = futures::executor::block_on(after.reader().invocation(&inv.key, &all))
-        .unwrap()
-        .unwrap();
+    let got = whole(&after.reader(), &inv.key, &all).unwrap().unwrap();
     assert!(!got.complete);
     assert_eq!(got.gap_from_ms, Some(T + 120_000));
     assert_eq!(
@@ -538,9 +529,7 @@ fn a_restarted_writer_continues_the_header_and_reopens_a_closed_invocation() {
     assert_eq!(h.state(), kbf_history::records::InvState::Open);
     second.close(&inv);
     second.step(T + 130_001);
-    let got = futures::executor::block_on(second.reader().invocation(&inv.key, &all))
-        .unwrap()
-        .unwrap();
+    let got = whole(&second.reader(), &inv.key, &all).unwrap().unwrap();
     assert!(got.complete && got.gap_from_ms.is_none());
     assert_eq!(
         (got.runs.len(), got.failed.len(), got.header.chunks),
@@ -658,9 +647,7 @@ fn hits_and_id_less_runs_are_kept_with_their_invocation() {
     );
     let h = header(&life, &inv);
     assert_eq!((h.hits, h.runs), (2, 0));
-    let got = futures::executor::block_on(life.reader().invocation(&inv.key, &all))
-        .unwrap()
-        .unwrap();
+    let got = whole(&life.reader(), &inv.key, &all).unwrap().unwrap();
     let rows: Vec<u32> = got.hits.iter().map(|h| h.row).collect();
     assert_eq!(rows, [0, 1]);
     let found = futures::executor::block_on(life.reader().run(r.run_id(), &all))
@@ -748,9 +735,7 @@ fn a_kept_chunk_restored_after_a_newer_header_leaves_the_header_alone() {
     let h = header(&life, &inv);
     assert_eq!((h.runs, h.chunks), (2, 2));
     assert_eq!(h.state(), kbf_history::records::InvState::Closed);
-    let got = futures::executor::block_on(life.reader().invocation(&inv.key, &all))
-        .unwrap()
-        .unwrap();
+    let got = whole(&life.reader(), &inv.key, &all).unwrap().unwrap();
     assert!(
         got.complete,
         "a closed build with every record reads complete"
@@ -855,9 +840,7 @@ fn an_invocation_forgotten_and_seen_again_by_the_same_writer_keeps_both_chunks()
             .unwrap_or_else(|| panic!("{} did not resolve", r.run_id()));
         assert_eq!(&got.run, r);
     }
-    let got = futures::executor::block_on(reader.invocation(&inv.key, &all))
-        .unwrap()
-        .unwrap();
+    let got = whole(&reader, &inv.key, &all).unwrap().unwrap();
     assert_eq!(got.runs, [first, late]);
     assert_eq!((got.header.runs, got.header.chunks), (2, 2));
     assert_eq!(life.writer.drops(), kbf_history::Drops::default());

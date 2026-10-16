@@ -1,4 +1,5 @@
-//! Reads history back: a run by its id, an invocation by its key.
+//! Reads history back: a run by its id, an invocation's header and newest summary by
+//! its key, and its records a bounded page of chunks at a time.
 //!
 //! A run id finds its own chunk with no per-run row: its time bytes give the UTC day,
 //! the newest `ui/stream/<day>/<stream>/<first ms>` row at or before its time gives the
@@ -7,7 +8,9 @@
 //! chunk holding its sequence, and the chunk's footer gives the block. That is the
 //! index plus at most three range reads: footer, run block, failed-run block.
 //!
-//! Every answer holds only records whose instance `allow` accepts.
+//! Every answer holds only records whose instance `allow` accepts, and an invocation
+//! is answered only when `allow` accepts every instance its header lists (an
+//! invocation spanning instances is all-must-allow, ui-data.md section 8).
 //!
 //! Index calls go through the [`HistoryIndex`]'s offload, so the reader's `async fn`s
 //! may be awaited on a runtime worker.
@@ -25,8 +28,8 @@ use crate::container::{self, BlockEntry, Footer, FormatError};
 use crate::index::HistoryIndex;
 use crate::keys::{Day, HistoryRoot, IndexRoot, InvKey, WriterId};
 use crate::records::{
-    ChunkBody, ChunkRecord, ChunkRow, FailedRun, HitRecord, InvState, InvocationHeader, RunRecord,
-    SECTION_FAILED, SECTION_RUN, StreamRow, chunk_key,
+    ChunkBody, ChunkRecord, ChunkRow, ChunkSummary, FailedRun, HitRecord, InvState,
+    InvocationHeader, RunRecord, SECTION_FAILED, SECTION_RUN, StreamRow, chunk_key,
 };
 use crate::run_id::RunId;
 use crate::scoped::Scoped;
@@ -64,7 +67,12 @@ pub struct RunView {
     pub failed: Option<FailedRun>,
 }
 
-/// An invocation's history.
+/// Chunks a page of records reads at most, all at once: 32 GETs in parallel, at most
+/// 32 chunks (about 8 MiB of raw records) resident for one answer.
+pub const MAX_PAGE_CHUNKS: usize = 32;
+
+/// An invocation's summary, as `GET /v1/invocations/{id}` needs it: the header row and
+/// the newest chunk's summary section, one range read.
 #[derive(Clone, Debug, PartialEq)]
 pub struct InvocationView {
     /// The header row.
@@ -74,12 +82,29 @@ pub struct InvocationView {
     pub complete: bool,
     /// When not complete: the time of the last chunk written, where the gap starts.
     pub gap_from_ms: Option<u64>,
-    /// Run records, chunk by chunk, each chunk's in sequence order.
+    /// The summary section of the newest chunk (the one with the latest record): its
+    /// writer's slowest runs, its digest table and the header as of it. `None` when the
+    /// invocation has no chunk.
+    pub newest: Option<ChunkSummary>,
+}
+
+/// Where a page of an invocation's records starts: after the chunk whose `ichunk` row
+/// is this one. Opaque to callers, who pass back what a page gave them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChunkCursor(String);
+
+/// One page of an invocation's records, chunk by chunk in `ichunk` row order (writer,
+/// then sequence), each chunk's runs in sequence order.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct RecordsPage {
+    /// Run records.
     pub runs: Vec<RunRecord>,
     /// Failed-run sections.
     pub failed: Vec<FailedRun>,
     /// Hit records.
     pub hits: Vec<HitRecord>,
+    /// Where the next page starts; `None` after the last chunk.
+    pub next: Option<ChunkCursor>,
 }
 
 /// Where a run is: its chunk's key, row and invocation.
@@ -141,8 +166,8 @@ impl<O: ObjectStore> Reader<O> {
         }))
     }
 
-    /// Invocation `inv`'s header and records, if history holds it. Records of instances
-    /// `allow` refuses are left out.
+    /// Invocation `inv`'s header and its newest chunk's summary, if history holds it and
+    /// `allow` accepts every instance it lists: the index and one range read.
     ///
     /// # Errors
     /// As [`Reader::run`].
@@ -151,20 +176,82 @@ impl<O: ObjectStore> Reader<O> {
         inv: &InvKey,
         allow: &dyn Fn(&str) -> bool,
     ) -> Result<Option<InvocationView>, ReadError> {
+        let Some(header) = self.header(inv, allow).await? else {
+            return Ok(None);
+        };
+        let rows = self
+            .chunk_rows(self.index.root().ichunk_prefix(inv))
+            .await?;
+        // The newest chunk holds the latest record; of equals, the last row.
+        let newest = rows.iter().max_by_key(|(_, row)| row.last_ms);
+        let newest = match newest {
+            Some((key, row)) => {
+                let object = chunk_object_key(&self.root, inv, key, row);
+                let tail = self.objects.get_range(&object, footer_range(row)?).await?;
+                let summary = ChunkSummary::decode(decode_tail(&tail)?.summary.as_slice())
+                    .map_err(|e| FormatError::decode("chunk summary", &e))?;
+                Some(summary)
+            }
+            None => None,
+        };
+        let complete = header.state() == InvState::Closed && header.dropped == 0;
+        Ok(Some(InvocationView {
+            gap_from_ms: (!complete).then_some(header.last_chunk_ms),
+            complete,
+            header,
+            newest,
+        }))
+    }
+
+    /// A page of invocation `inv`'s records: up to `chunks` chunks (at least 1, at most
+    /// [`MAX_PAGE_CHUNKS`]) after `after`, read all at once, if history holds the
+    /// invocation and `allow` accepts every instance it lists. Records of instances
+    /// `allow` refuses are left out.
+    ///
+    /// # Errors
+    /// As [`Reader::run`].
+    pub async fn records(
+        &self,
+        inv: &InvKey,
+        after: Option<&ChunkCursor>,
+        chunks: usize,
+        allow: &dyn Fn(&str) -> bool,
+    ) -> Result<Option<RecordsPage>, ReadError> {
+        if self.header(inv, allow).await?.is_none() {
+            return Ok(None);
+        }
+        let rows = self
+            .chunk_rows(self.index.root().ichunk_prefix(inv))
+            .await?;
+        let start = after.map_or(0, |c| rows.partition_point(|(key, _)| *key <= c.0));
+        let page = &rows[start..];
+        let take = chunks.clamp(1, MAX_PAGE_CHUNKS).min(page.len());
+        let reads = page[..take].iter().map(|(key, row)| async move {
+            let object = chunk_object_key(&self.root, inv, key, row);
+            let range = ByteRange::new(0, row.bytes).ok_or(FormatError::Truncated("chunk row"))?;
+            Ok::<_, ReadError>(self.objects.get_range(&object, range).await?)
+        });
+        let mut out = RecordsPage::default();
+        for bytes in futures::future::try_join_all(reads).await? {
+            add_records(&mut out, &bytes, allow)?;
+        }
+        out.next = (take < page.len()).then(|| ChunkCursor(page[take - 1].0.clone()));
+        Ok(Some(out))
+    }
+
+    /// Invocation `inv`'s header row, if it exists and `allow` accepts every instance
+    /// it lists.
+    async fn header(
+        &self,
+        inv: &InvKey,
+        allow: &dyn Fn(&str) -> bool,
+    ) -> Result<Option<InvocationHeader>, ReadError> {
         let key = self.index.root().invid(inv);
         let Some(row) = self.index.get(key.clone()).await? else {
             return Ok(None);
         };
         let header = decode_row::<InvocationHeader>(&key, &row.value)?;
-        let mut view = start_view(header);
-        let prefix = self.index.root().ichunk_prefix(inv);
-        for (key, row) in self.chunk_rows(prefix).await? {
-            let object = chunk_object_key(&self.root, inv, &key, &row);
-            let range = ByteRange::new(0, row.bytes).ok_or(FormatError::Truncated("chunk row"))?;
-            let bytes = self.objects.get_range(&object, range).await?;
-            add_records(&mut view, &bytes, allow)?;
-        }
-        Ok(Some(view))
+        Ok(header.instances.iter().all(|i| allow(i)).then_some(header))
     }
 
     /// Finds run `id`'s chunk through the index, or `None` when no row names it.
@@ -294,21 +381,9 @@ fn find_failed(block: &[ChunkBody], seq: u32) -> Option<FailedRun> {
     })
 }
 
-fn start_view(header: InvocationHeader) -> InvocationView {
-    let complete = header.state() == InvState::Closed && header.dropped == 0;
-    InvocationView {
-        gap_from_ms: (!complete).then_some(header.last_chunk_ms),
-        complete,
-        header,
-        runs: Vec::new(),
-        failed: Vec::new(),
-        hits: Vec::new(),
-    }
-}
-
 /// Adds the allowed records of one whole chunk to `view`.
 fn add_records(
-    view: &mut InvocationView,
+    view: &mut RecordsPage,
     object: &[u8],
     allow: &dyn Fn(&str) -> bool,
 ) -> Result<(), ReadError> {

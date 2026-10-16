@@ -1,15 +1,20 @@
 //! The reader: a run id or an invocation to its records, filtered by instance, and the
 //! errors a broken index or object gives.
 
+use std::sync::atomic::Ordering;
+
 use kbf_history::container::{self, Header};
 use kbf_history::records::{
-    ChunkRecord, ChunkRow, ChunkSummary, RunOutcome, SECTION_RUN, StreamRow, chunk_key,
+    ChunkRecord, ChunkRow, ChunkSummary, InvocationHeader, RunOutcome, SECTION_RUN, StreamRow,
+    chunk_key,
 };
-use kbf_history::{Day, Family, IndexRoot, InvRef, Limits, ReadError, RunId, StreamId, WriterId};
+use kbf_history::{
+    Day, Family, IndexRoot, InvRef, Limits, MAX_PAGE_CHUNKS, ReadError, RunId, StreamId, WriterId,
+};
 use kbf_objstore::ObjectStoreError;
 use prost::Message;
 
-use crate::support::{Life, T, all, root};
+use crate::support::{Life, T, all, root, whole};
 
 /// A second into the day, so a time before a stream's first run is the same day.
 const B: u64 = T + 1_000;
@@ -80,9 +85,7 @@ fn an_invocation_reads_back_every_record_of_every_chunk() {
         ..Limits::default()
     });
     let (inv, runs) = closed_build(&mut life);
-    let got = futures::executor::block_on(life.reader().invocation(&inv.key, &all))
-        .unwrap()
-        .unwrap();
+    let got = whole(&life.reader(), &inv.key, &all).unwrap().unwrap();
     assert!(got.header.chunks >= 4, "{} chunks", got.header.chunks);
     assert_eq!(got.runs, runs);
     assert_eq!((got.failed.len(), got.hits.len()), (2, 2));
@@ -90,26 +93,43 @@ fn an_invocation_reads_back_every_record_of_every_chunk() {
 }
 
 #[test]
-fn the_instance_filter_leaves_out_records_of_refused_instances() {
-    // Catches: a reader that returns every record of an invocation whatever instances
-    // its caller may see (a caller allowed only on `a` would read `b`'s runs, failure
-    // tails and hits).
+fn an_invocation_spanning_instances_is_answered_only_when_every_one_is_allowed() {
+    // Catches: a header (record id, every instance name, counts, times) returned to a
+    // caller allowed on only some of the invocation's instances, with the records of
+    // the others filtered out: all-must-allow (ui-data.md section 8) never applied.
     let mut life = Life::fresh(Limits::default());
     let (inv, runs) = closed_build(&mut life);
     let reader = life.reader();
-    let got = futures::executor::block_on(reader.invocation(&inv.key, &only_a))
-        .unwrap()
-        .unwrap();
+    let view = futures::executor::block_on(reader.invocation(&inv.key, &only_a)).unwrap();
+    assert_eq!(view, None);
+    let page = futures::executor::block_on(reader.records(&inv.key, None, 1, &only_a)).unwrap();
+    assert_eq!(page, None);
+    let b = futures::executor::block_on(reader.run(runs[1].run_id(), &only_a)).unwrap();
+    assert_eq!(b, None);
+    let a = futures::executor::block_on(reader.run(runs[0].run_id(), &only_a)).unwrap();
+    assert!(a.is_some(), "a single run is scoped by its own instance");
+}
+
+#[test]
+fn records_of_an_instance_the_header_does_not_list_are_still_filtered() {
+    // Catches: a reader that trusts the header's instance list for every record, so a
+    // header that undercounts (restored from an older chunk's footer) hands out the
+    // records of an instance the caller may not see.
+    let mut life = Life::fresh(Limits::default());
+    let (inv, _) = closed_build(&mut life);
+    let key = IndexRoot::default().invid(&inv.key);
+    let row = life.index.inner.get(&key).unwrap().unwrap();
+    let mut header = InvocationHeader::decode(row.value.as_slice()).unwrap();
+    header.instances = vec!["a".into()];
+    life.index.put(&key, header.encode_to_vec());
+    let reader = life.reader();
+    let got = whole(&reader, &inv.key, &only_a).unwrap().unwrap();
     assert!(got.runs.iter().all(|r| r.instance == "a"));
     assert_eq!(got.runs.len(), 2);
     assert!(got.failed.iter().all(|f| f.instance == "a"));
     assert_eq!(got.failed.len(), 1);
     assert_eq!(got.hits.len(), 1);
     assert_eq!(got.hits[0].instance, "a");
-    let b = futures::executor::block_on(reader.run(runs[1].run_id(), &only_a)).unwrap();
-    assert_eq!(b, None);
-    let a = futures::executor::block_on(reader.run(runs[0].run_id(), &only_a)).unwrap();
-    assert!(a.is_some());
 }
 
 #[test]
@@ -135,10 +155,7 @@ fn ids_and_invocations_history_does_not_hold_read_as_none() {
         );
     }
     let nobody = InvRef::named("nobody");
-    assert_eq!(
-        futures::executor::block_on(reader.invocation(&nobody.key, &all)).unwrap(),
-        None
-    );
+    assert_eq!(whole(&reader, &nobody.key, &all).unwrap(), None);
 }
 
 #[test]
@@ -154,7 +171,7 @@ fn a_missing_or_newer_object_is_an_error_not_an_empty_answer() {
     bytes[n - 7] = 2;
     life.objects.replace(&key, bytes);
     let reader = life.reader();
-    let err = futures::executor::block_on(reader.invocation(&inv.key, &all)).unwrap_err();
+    let err = whole(&reader, &inv.key, &all).unwrap_err();
     assert!(err.to_string().contains("version 2"), "{err}");
     let err = futures::executor::block_on(reader.run(runs[0].run_id(), &all)).unwrap_err();
     assert!(matches!(err, ReadError::Format(_)), "{err}");
@@ -193,11 +210,11 @@ fn broken_index_rows_are_errors() {
         .keys(&IndexRoot::default().ichunk_prefix(&inv.key))
         .remove(0);
     life.index.put(&row_key, vec![0xFF]);
-    let err = futures::executor::block_on(reader.invocation(&inv.key, &all)).unwrap_err();
+    let err = whole(&reader, &inv.key, &all).unwrap_err();
     assert!(err.to_string().contains(&row_key), "{err}");
     life.index
         .put(&IndexRoot::default().invid(&inv.key), vec![0xFF]);
-    let err = futures::executor::block_on(reader.invocation(&inv.key, &all)).unwrap_err();
+    let err = whole(&reader, &inv.key, &all).unwrap_err();
     assert!(matches!(err, ReadError::Row { .. }), "{err}");
     // The index itself failing is its own error.
     let as_text = ReadError::from(kbf_state::StoreError::Failed("down".into())).to_string();
@@ -207,6 +224,15 @@ fn broken_index_rows_are_errors() {
 /// Writes a chunk by hand: `records` under a valid header, with its rows, so a test can
 /// plant what no writer writes.
 fn plant(life: &Life, records: Vec<(Vec<u8>, Vec<u8>)>, row: ChunkRow) -> (InvRef, RunId) {
+    plant_with(life, records, row, ChunkSummary::default().encode_to_vec())
+}
+
+fn plant_with(
+    life: &Life,
+    records: Vec<(Vec<u8>, Vec<u8>)>,
+    row: ChunkRow,
+    summary: Vec<u8>,
+) -> (InvRef, RunId) {
     let inv = InvRef::named("planted");
     let writer = WriterId(77);
     let day = Day::from_ms(T);
@@ -217,7 +243,7 @@ fn plant(life: &Life, records: Vec<(Vec<u8>, Vec<u8>)>, row: ChunkRow) -> (InvRe
         seq: 0,
         base_ms: T,
     };
-    let enc = container::encode(&header, records, ChunkSummary::default().encode_to_vec());
+    let enc = container::encode(&header, records, summary);
     let key = root().chunk(day, &inv.key, writer, 0);
     life.objects.replace(key.as_str(), enc.bytes.clone());
     let row = ChunkRow {
@@ -270,13 +296,13 @@ fn records_that_are_not_chunk_records_are_errors() {
     let key = chunk_key(SECTION_RUN, 0).to_vec();
     let (inv, id) = plant(&life, vec![(key.clone(), vec![0xFF])], holds_run0());
     let reader = life.reader();
-    let err = futures::executor::block_on(reader.invocation(&inv.key, &all)).unwrap_err();
+    let err = whole(&reader, &inv.key, &all).unwrap_err();
     assert!(err.to_string().contains("chunk record"), "{err}");
     let err = futures::executor::block_on(reader.run(id, &all)).unwrap_err();
     assert!(err.to_string().contains("chunk record"), "{err}");
     let empty = ChunkRecord { body: None }.encode_to_vec();
     plant(&life, vec![(key, empty)], holds_run0());
-    let err = futures::executor::block_on(reader.invocation(&inv.key, &all)).unwrap_err();
+    let err = whole(&reader, &inv.key, &all).unwrap_err();
     assert!(err.to_string().contains("empty record"), "{err}");
 }
 
@@ -301,6 +327,105 @@ fn a_chunk_row_that_disagrees_with_its_object_is_an_error() {
     };
     let (inv, _) = plant(&life, Vec::new(), zero_bytes);
     // The planted header row is empty bytes: a default header.
-    let err = futures::executor::block_on(reader.invocation(&inv.key, &all)).unwrap_err();
+    let err = whole(&reader, &inv.key, &all).unwrap_err();
     assert!(err.to_string().contains("chunk row"), "{err}");
+}
+
+#[test]
+fn an_invocation_reads_its_header_and_newest_summary_in_one_range_read() {
+    // Catches: `/v1/invocations/{id}` answered by reading every chunk of the build
+    // whole (23 to 80 GETs and every record resident for a large build), or a summary
+    // taken from a chunk other than the newest.
+    let mut life = Life::fresh(Limits {
+        chunk_bytes: 1,
+        ..Limits::default()
+    });
+    let (inv, _) = closed_build(&mut life);
+    let reader = life.reader();
+    let before = life.objects.counts().gets.load(Ordering::SeqCst);
+    let view = futures::executor::block_on(reader.invocation(&inv.key, &all))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        life.objects.counts().gets.load(Ordering::SeqCst) - before,
+        1
+    );
+    let newest = view.newest.unwrap();
+    assert_eq!(
+        newest.row.unwrap().last_ms,
+        B + 4,
+        "the chunk of the last record"
+    );
+    assert_eq!(newest.header.unwrap().hits, 2);
+    assert!(view.complete);
+    // An invocation with no chunk has no summary to read.
+    let bare = InvRef::named("bare");
+    life.close(&bare);
+    life.step(B + 6);
+    let before = life.objects.counts().gets.load(Ordering::SeqCst);
+    let view = futures::executor::block_on(reader.invocation(&bare.key, &all))
+        .unwrap()
+        .unwrap();
+    assert_eq!((view.newest, view.complete), (None, true));
+    assert_eq!(life.objects.counts().gets.load(Ordering::SeqCst), before);
+}
+
+#[test]
+fn records_come_a_bounded_page_of_chunks_at_a_time() {
+    // Catches: an invocation's records read in one answer however many chunks it has
+    // (an id-less pseudo-invocation holds a writer's whole day), a page past the
+    // chunk bound, and a cursor that skips or repeats a chunk.
+    let mut life = Life::fresh(Limits {
+        chunk_bytes: 1,
+        ..Limits::default()
+    });
+    let inv = InvRef::named("big");
+    let runs: Vec<_> = (0..40)
+        .map(|n| life.run(&inv, B + n, "a", RunOutcome::Ok))
+        .collect();
+    life.close(&inv);
+    life.step(B + 40);
+    assert_eq!(life.index.keys("ui/ichunk/").len(), 40);
+    let reader = life.reader();
+    let gets = || life.objects.counts().gets.load(Ordering::SeqCst);
+    let before = gets();
+    let first = futures::executor::block_on(reader.records(&inv.key, None, 1000, &all))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        first.runs.len(),
+        MAX_PAGE_CHUNKS,
+        "one run a chunk, 32 chunks"
+    );
+    assert_eq!(gets() - before, MAX_PAGE_CHUNKS as u64);
+    let cursor = first.next.clone().unwrap();
+    let second = futures::executor::block_on(reader.records(&inv.key, Some(&cursor), 5, &all))
+        .unwrap()
+        .unwrap();
+    assert_eq!(second.runs.len(), 5);
+    let third =
+        futures::executor::block_on(reader.records(&inv.key, second.next.as_ref(), 0, &all))
+            .unwrap()
+            .unwrap();
+    assert_eq!(third.runs.len(), 1, "a page reads at least one chunk");
+    let rest = futures::executor::block_on(reader.records(
+        &inv.key,
+        third.next.as_ref(),
+        MAX_PAGE_CHUNKS,
+        &all,
+    ))
+    .unwrap()
+    .unwrap();
+    assert_eq!(rest.next, None, "the last page says so");
+    let all_runs: Vec<_> = [first.runs, second.runs, third.runs, rest.runs].concat();
+    assert_eq!(all_runs, runs);
+}
+
+#[test]
+fn a_newest_summary_that_does_not_decode_is_an_error() {
+    // Catches: a broken summary section read as an invocation with no summary.
+    let life = Life::fresh(Limits::default());
+    let (inv, _) = plant_with(&life, Vec::new(), holds_run0(), vec![0xFF]);
+    let err = futures::executor::block_on(life.reader().invocation(&inv.key, &all)).unwrap_err();
+    assert!(err.to_string().contains("chunk summary"), "{err}");
 }

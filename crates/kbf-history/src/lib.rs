@@ -17,7 +17,8 @@
 //! - [`run_id`]: time-ordered [`RunId`]s, stream blocks and the fallback range.
 //! - [`Writer`]: events into chunks, object first and index row second, with bounded
 //!   queues, drop counters and re-insertion of dropped rows with no LIST.
-//! - [`Reader`]: a run id or an invocation to its chunks and records.
+//! - [`Reader`]: a run id to its record; an invocation to its header and newest
+//!   summary, and to its records a bounded page of chunks at a time.
 //! - [`Scoped`]: an object store that refuses every key outside `history/`.
 //!
 //! No clock is read here: every time is an argument.
@@ -39,7 +40,9 @@ pub use index::{HistoryIndex, Inline, Offload, Offloaded};
 pub use keys::{Class, Day, Family, HistoryRoot, IndexPrefixError, IndexRoot, InvKey, WriterId};
 pub use pending::PendingLimits;
 pub use queue::{Event, EventQueue, InvRef, QueueLimits};
-pub use reader::{InvocationView, ReadError, Reader, RunView};
+pub use reader::{
+    ChunkCursor, InvocationView, MAX_PAGE_CHUNKS, ReadError, Reader, RecordsPage, RunView,
+};
 pub use run_id::{Minted, Minter, RunId, StreamId};
 pub use scoped::Scoped;
 pub use writer::{Drops, Limits, SLOWEST, Writer};
