@@ -1,0 +1,174 @@
+//! The call to the replica on its own, against servers that answer as no correct replica
+//! would.
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+
+use kbf_map::MemberId;
+use kbf_proto::google::bytestream::byte_stream_server::{ByteStream, ByteStreamServer};
+use kbf_proto::google::bytestream::{
+    QueryWriteStatusRequest, QueryWriteStatusResponse, ReadRequest, ReadResponse, WriteRequest,
+    WriteResponse,
+};
+
+use crate::StorageError;
+use crate::replicate::{Leg, Peers};
+use crate::service::tests::fake::{connect, serve_odd, serve_routes};
+
+fn message(first: bool, data: &[u8], finish: bool) -> WriteRequest {
+    WriteRequest {
+        resource_name: if first {
+            format!("uploads/u/blobs/{}/{}", "ab".repeat(32), data.len())
+        } else {
+            String::new()
+        },
+        write_offset: 0,
+        finish_write: finish,
+        data: data.to_vec(),
+    }
+}
+
+fn leg(channel: tonic::transport::Channel) -> Leg {
+    Leg::open(
+        channel,
+        1,
+        MemberId(1),
+        Duration::from_secs(30),
+        Duration::from_secs(30),
+    )
+}
+
+/// Catches an acknowledgement taken at its word: a replica that answers for other than the
+/// blob's size (here 0) is an INTERNAL error, not a copy.
+#[tokio::test]
+async fn an_acknowledgement_of_the_wrong_size_is_not_a_copy() {
+    let (_odd, channel) = serve_odd().await;
+    let mut leg = leg(channel);
+    leg.send(message(true, b"abc", true)).await.expect("sent");
+    let answer = leg.finish(3).await;
+    let Err(StorageError::Internal(why)) = answer else {
+        panic!("{answer:?}");
+    };
+    assert!(why.contains("3-byte write"), "{why}");
+}
+
+/// Catches a replica that answers before the blob is complete being waited on: the send
+/// that finds the call ended says so, INTERNAL.
+#[tokio::test]
+async fn a_replica_that_answers_early_ends_the_leg() {
+    let (_odd, channel) = serve_odd().await;
+    let mut leg = leg(channel);
+    let mut ended = None;
+    for i in 0..2000 {
+        if let Err(e) = leg.send(message(i == 0, &[1; 1024], false)).await {
+            ended = Some(e);
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    let Some(StorageError::Internal(why)) = ended else {
+        panic!("{ended:?}");
+    };
+    assert!(why.contains("before the blob was complete"), "{why}");
+}
+
+/// Catches a leg to an address nothing listens on succeeding, or failing for a reason other
+/// than the peer being unreachable: UNAVAILABLE.
+#[tokio::test]
+async fn a_leg_to_nothing_is_unavailable() {
+    let peers = Peers::plain();
+    let channel = peers.channel("127.0.0.1:1").expect("a channel");
+    let mut leg = leg(channel);
+    let sent = leg.send(message(true, b"abc", true)).await;
+    let answer = match sent {
+        Ok(()) => leg.finish(3).await,
+        Err(e) => Err(e),
+    };
+    assert!(
+        matches!(answer, Err(StorageError::Unavailable(_))),
+        "{answer:?}"
+    );
+}
+
+/// Catches an address that is not one making a channel, or one that is made twice.
+#[tokio::test]
+async fn peers_make_one_channel_per_address_and_refuse_a_bad_one() {
+    let peers = Peers::plain();
+    assert!(matches!(
+        peers.channel("not an address"),
+        Err(StorageError::Internal(m)) if m.contains("not an address")
+    ));
+    peers.channel("127.0.0.1:1").expect("first");
+    peers.channel("127.0.0.1:1").expect("cached");
+    let tls = Peers::tls(tonic::transport::ClientTlsConfig::new());
+    tls.channel("localhost:1").expect("a TLS channel");
+}
+
+/// A ByteStream that reads the first message of a write and then never answers, and says when
+/// the handler is dropped (its caller reset the stream).
+struct Stuck(Arc<AtomicBool>);
+
+struct SawEnd(Arc<AtomicBool>);
+
+impl Drop for SawEnd {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+type Boxed<T> = futures::stream::BoxStream<'static, Result<T, tonic::Status>>;
+
+#[tonic::async_trait]
+impl ByteStream for Stuck {
+    type ReadStream = Boxed<ReadResponse>;
+
+    async fn read(
+        &self,
+        _: tonic::Request<ReadRequest>,
+    ) -> Result<tonic::Response<Self::ReadStream>, tonic::Status> {
+        Err(tonic::Status::unimplemented("not asked"))
+    }
+
+    async fn write(
+        &self,
+        request: tonic::Request<tonic::Streaming<WriteRequest>>,
+    ) -> Result<tonic::Response<WriteResponse>, tonic::Status> {
+        let _ended = SawEnd(Arc::clone(&self.0));
+        let mut stream = request.into_inner();
+        let _ = stream.message().await?;
+        futures::future::pending().await
+    }
+
+    async fn query_write_status(
+        &self,
+        _: tonic::Request<QueryWriteStatusRequest>,
+    ) -> Result<tonic::Response<QueryWriteStatusResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("not asked"))
+    }
+}
+
+/// Catches a leg that outlives its write: when the primary's write ends (the writer left,
+/// or another part of it failed) the call to the replica is reset, so a replica that is
+/// not answering does not hold the call, and its half-received blob, for ever.
+#[tokio::test]
+async fn a_dropped_leg_resets_its_call() {
+    let ended = Arc::new(AtomicBool::new(false));
+    let routes = tonic::service::Routes::new(ByteStreamServer::new(Stuck(Arc::clone(&ended))));
+    let channel = connect(serve_routes(routes, None).await).await;
+    let mut leg = leg(channel);
+    leg.send(message(true, b"abc", false)).await.expect("sent");
+    for _ in 0..500 {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        // The handler is up once it has the message; it is not dropped yet.
+    }
+    assert!(!ended.load(Ordering::SeqCst), "the call ended on its own");
+    drop(leg);
+    for _ in 0..500 {
+        if ended.load(Ordering::SeqCst) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("the replica's handler was not reset by the dropped leg");
+}

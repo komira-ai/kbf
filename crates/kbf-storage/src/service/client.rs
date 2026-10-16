@@ -112,7 +112,7 @@ impl RemoteStorage {
 /// nothing of the request (a transport failure, a deadline) are `Unavailable`; a
 /// store that is held but unreadable is UNAVAILABLE too, so it is `Unavailable` here
 /// where it was `Unreachable` there.
-pub(super) fn lift(status: &Status, at: Option<(Digest, u64)>) -> StorageError {
+pub(crate) fn lift(status: &Status, at: Option<(Digest, u64)>) -> StorageError {
     if let Some(current) = stale_generation(status) {
         return StorageError::StaleMap { current };
     }

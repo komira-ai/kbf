@@ -10,7 +10,6 @@ use kbf_proto::google::bytestream::{
 use tonic::{Request, Response, Status, Streaming};
 
 use super::{Endpoint, MAX_BLOB_BYTES, StorageService, generation, wire};
-use crate::StorageError;
 
 #[tonic::async_trait]
 impl ByteStream for StorageService {
@@ -43,70 +42,49 @@ impl ByteStream for StorageService {
         Ok(Response::new(messages.boxed()))
     }
 
-    /// Receives a blob from offset 0, stores it with [`crate::Storage::put`], which
-    /// hashes it, and only then answers with its size. A caller whose map generation is
-    /// not this node's is refused first ([`crate::replicate`]). A blob already held is answered
-    /// at once, unread.
+    /// Receives a blob from offset 0 and answers with its size once it is stored. A
+    /// caller whose map generation is not this node's is refused first
+    /// ([`crate::replicate`]); a blob already held is answered at once, unread.
     ///
-    /// The bytes are held whole until they are complete, never more than the digest in
-    /// the resource name declares (and never a blob over [`MAX_BLOB_BYTES`]), and room
-    /// for them is taken first ([`super::Config::write_bytes_in_flight`]). Order is not
-    /// checked message by message: the blob is checked against its digest as a whole.
+    /// The bytes are checked against the digest in the resource name, and never more
+    /// than it declares are taken. Where the store can write a blob as it arrives
+    /// ([`crate::Storage::stream`]) they are written so and held in the few chunks in
+    /// flight, whatever the blob's size; the primary of a chain streams each chunk on to
+    /// the replica as well and answers only when both hold the blob. Where the store
+    /// cannot, a node outside a chain holds the blob whole until it is complete
+    /// ([`super::Config::write_bytes_in_flight`]).
     async fn write(
         &self,
         request: Request<Streaming<WriteRequest>>,
     ) -> Result<Response<WriteResponse>, Status> {
-        self.admission.check(&request, Endpoint::Write)?;
-        self.check_map(generation::requested(&request)?)?;
+        let leg_from = generation::leg(&request)?;
+        let endpoint = if leg_from.is_some() {
+            Endpoint::WriteLeg
+        } else {
+            Endpoint::Write
+        };
+        self.admission.check(&request, endpoint)?;
+        let view = self.view(generation::requested(&request)?)?;
         let mut stream = request.into_inner();
-        let mut message = stream
+        let first = stream
             .message()
             .await?
             .ok_or_else(|| Status::invalid_argument("write stream sent no message"))?;
-        let digest = wire::write_resource(&message.resource_name)?;
+        let digest = wire::write_resource(&first.resource_name)?;
         let size = digest.size_bytes;
-        let committed = || {
-            Response::new(WriteResponse {
-                committed_size: i64::try_from(size).unwrap_or(i64::MAX),
-            })
-        };
         if size > MAX_BLOB_BYTES {
             return Err(Status::invalid_argument(format!(
                 "{digest} is larger than the largest blob this node accepts ({MAX_BLOB_BYTES} \
                  bytes)"
             )));
         }
+        let plan = self.plan(view.as_ref(), &digest, leg_from)?;
         if self.storage.find_missing(&[digest]).await?.is_empty() {
-            return Ok(committed());
+            return Ok(wire::committed(size));
         }
-        let room =
-            u32::try_from(size).map_or(self.write_room_bytes, |s| s.min(self.write_room_bytes));
-        // The semaphore is never closed.
-        let _room = self.write_room.acquire_many(room).await.ok();
-        let mut received = Vec::with_capacity(usize::try_from(size).unwrap_or_default());
-        loop {
-            if (received.len() + message.data.len()) as u64 > size {
-                return Err(Status::invalid_argument(format!(
-                    "more than the {size} bytes {digest} names"
-                )));
-            }
-            received.extend_from_slice(&message.data);
-            if message.finish_write {
-                break;
-            }
-            message = stream.message().await?.ok_or_else(|| {
-                Status::invalid_argument("write stream ended without finish_write")
-            })?;
-        }
-        let stored = self.storage.put(received.into()).await?;
-        if stored != digest {
-            return Err(StorageError::DigestMismatch {
-                claimed: digest,
-                actual: stored,
-            }
-            .into());
-        }
-        Ok(committed())
+        self.write_blob(digest, first, stream, view.as_ref(), leg_from, plan)
+            .await?;
+        Ok(wire::committed(size))
     }
 
     /// The blob's full size and `complete` once it is held; 0 and incomplete before.

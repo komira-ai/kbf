@@ -4,8 +4,8 @@
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -34,25 +34,25 @@ use tonic::transport::Channel;
 use tonic::transport::server::TcpIncoming;
 use tonic::{Request, Response, Status, Streaming};
 
-use crate::replicate::MapSource;
+use crate::replicate::{Chain, ChainConfig, MapSource, Peers, View};
 use crate::service::{Admission, Config, MAP_GENERATION_HEADER, RemoteStorage, StorageService};
 use crate::{Answer, PutStream, READ_CHUNK_BYTES, ReadStream, Storage, StorageError};
 
 /// The digest of `bytes`.
-pub(super) fn sha(bytes: &[u8]) -> Digest {
+pub(crate) fn sha(bytes: &[u8]) -> Digest {
     kbf_segments::sha256(bytes)
 }
 
 /// `len` bytes that differ from place to place, so a lost, repeated or reordered chunk
 /// shows.
-pub(super) fn patterned(len: usize) -> Vec<u8> {
+pub(crate) fn patterned(len: usize) -> Vec<u8> {
     (0..len).map(|i| (i * 31 % 251) as u8).collect()
 }
 
 /// An in-memory store.
 #[derive(Default)]
-pub(super) struct Mem {
-    pub blobs: Mutex<BTreeMap<Digest, Bytes>>,
+pub(crate) struct Mem {
+    pub blobs: Arc<Mutex<BTreeMap<Digest, Bytes>>>,
     pub actions: Mutex<BTreeMap<Digest, (Digest, ActionResult)>>,
     /// Every call fails with this.
     pub fail: Mutex<Option<StorageError>>,
@@ -62,7 +62,9 @@ pub(super) struct Mem {
     pub endless: AtomicBool,
     /// How long a put takes.
     pub put_takes: Mutex<Duration>,
-    pub puts: AtomicUsize,
+    pub puts: Arc<AtomicUsize>,
+    /// What a streamed write does ([`Mem::stream`]).
+    pub knobs: Arc<Knobs>,
     active: AtomicUsize,
     pub most_active: AtomicUsize,
     pub segments: Arc<Seen>,
@@ -154,8 +156,17 @@ impl Storage for Mem {
         })
     }
 
-    fn stream(&self, _size: u64) -> Option<Box<dyn PutStream>> {
-        None
+    /// A stream into this store when `knobs.enabled`, else `None` (the buffered path).
+    fn stream(&self, size: u64) -> Option<Box<dyn PutStream>> {
+        self.knobs.enabled.load(Ordering::SeqCst).then(|| {
+            Box::new(MemPut {
+                blobs: Arc::clone(&self.blobs),
+                puts: Arc::clone(&self.puts),
+                knobs: Arc::clone(&self.knobs),
+                size,
+                data: Vec::new(),
+            }) as Box<dyn PutStream>
+        })
     }
 
     fn segments(&self) -> Arc<dyn Segments> {
@@ -216,9 +227,156 @@ impl Storage for Mem {
     }
 }
 
+/// What a streamed write of [`Mem`] does, and what it has seen.
+pub(crate) struct Knobs {
+    /// Whether [`Mem::stream`] offers a stream.
+    pub enabled: AtomicBool,
+    /// Chunks and bytes appended so far, over every stream.
+    pub chunks: AtomicUsize,
+    pub bytes: AtomicU64,
+    /// Appends wait while this is true.
+    pub hold: (Mutex<bool>, Condvar),
+    /// Commits wait for a permit: take them all to hold commits, add them back to release.
+    pub commit_gate: tokio::sync::Semaphore,
+    pub fault: Mutex<StreamFault>,
+}
+
+impl Default for Knobs {
+    fn default() -> Self {
+        Self {
+            enabled: AtomicBool::new(false),
+            chunks: AtomicUsize::new(0),
+            bytes: AtomicU64::new(0),
+            hold: (Mutex::new(false), Condvar::new()),
+            commit_gate: tokio::sync::Semaphore::new(tokio::sync::Semaphore::MAX_PERMITS),
+            fault: Mutex::new(StreamFault::None),
+        }
+    }
+}
+
+impl Knobs {
+    /// Holds (or releases) every append.
+    pub(crate) fn hold_appends(&self, hold: bool) {
+        *self.hold.0.lock().expect("lock") = hold;
+        self.hold.1.notify_all();
+    }
+
+    /// Holds every commit.
+    pub(crate) fn hold_commits(&self) {
+        self.commit_gate
+            .forget_permits(tokio::sync::Semaphore::MAX_PERMITS);
+    }
+
+    /// Lets every held commit through.
+    pub(crate) fn release_commits(&self) {
+        self.commit_gate.add_permits(
+            tokio::sync::Semaphore::MAX_PERMITS - self.commit_gate.available_permits(),
+        );
+    }
+}
+
+/// Where a streamed write of [`Mem`] fails.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StreamFault {
+    None,
+    AppendFails,
+    AppendPanics,
+    FinishFails,
+    FinishPanics,
+    CommitFails,
+}
+
+/// A blob being written to [`Mem`] as it arrives.
+struct MemPut {
+    blobs: Arc<Mutex<BTreeMap<Digest, Bytes>>>,
+    puts: Arc<AtomicUsize>,
+    knobs: Arc<Knobs>,
+    size: u64,
+    data: Vec<u8>,
+}
+
+impl PutStream for MemPut {
+    fn append(&mut self, chunk: &[u8]) -> Result<(), StorageError> {
+        let (lock, wake) = &self.knobs.hold;
+        let mut held = lock.lock().expect("lock");
+        while *held {
+            held = wake.wait(held).expect("wait");
+        }
+        drop(held);
+        let fault = *self.knobs.fault.lock().expect("lock");
+        match fault {
+            StreamFault::AppendFails => return Err(StorageError::Internal("the disk".into())),
+            StreamFault::AppendPanics => panic!("append panics"),
+            _ => {}
+        }
+        self.knobs.chunks.fetch_add(1, Ordering::SeqCst);
+        self.knobs
+            .bytes
+            .fetch_add(chunk.len() as u64, Ordering::SeqCst);
+        self.data.extend_from_slice(chunk);
+        Ok(())
+    }
+
+    fn finish(
+        self: Box<Self>,
+        digest: Digest,
+        crc32c: u32,
+    ) -> Result<Box<dyn crate::StreamedPut>, StorageError> {
+        let fault = *self.knobs.fault.lock().expect("lock");
+        match fault {
+            StreamFault::FinishFails => return Err(StorageError::Internal("the disk".into())),
+            StreamFault::FinishPanics => panic!("finish panics"),
+            _ => {}
+        }
+        assert_eq!(
+            self.data.len() as u64,
+            self.size,
+            "a stream of the wrong size"
+        );
+        assert_eq!(crc32c::crc32c(&self.data), crc32c, "a wrong CRC-32C");
+        assert_eq!(
+            sha(&self.data),
+            digest,
+            "finish was not given the blob's digest"
+        );
+        Ok(Box::new(MemStreamed {
+            blobs: self.blobs,
+            puts: self.puts,
+            knobs: self.knobs,
+            digest,
+            data: Bytes::from(self.data),
+        }))
+    }
+}
+
+struct MemStreamed {
+    blobs: Arc<Mutex<BTreeMap<Digest, Bytes>>>,
+    puts: Arc<AtomicUsize>,
+    knobs: Arc<Knobs>,
+    digest: Digest,
+    data: Bytes,
+}
+
+impl crate::StreamedPut for MemStreamed {
+    fn commit(self: Box<Self>) -> Answer<'static, ()> {
+        Box::pin(async move {
+            let _permit = self.knobs.commit_gate.acquire().await.expect("open");
+            if *self.knobs.fault.lock().expect("lock") == StreamFault::CommitFails {
+                return Err(StorageError::Internal("the disk".into()));
+            }
+            self.blobs
+                .lock()
+                .expect("lock")
+                .insert(self.digest, self.data);
+            self.puts.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })
+    }
+}
+
 /// The `Segments` calls a service forwarded, and the map generation each carried.
 #[derive(Default)]
-pub(super) struct Seen {
+pub(crate) struct Seen {
     pub calls: Mutex<Vec<(&'static str, Option<String>)>>,
 }
 
@@ -275,7 +433,7 @@ impl Segments for Seen {
 }
 
 /// Serves `routes` on a loopback port, with `tls` if given.
-pub(super) async fn serve_routes(
+pub(crate) async fn serve_routes(
     routes: tonic::service::Routes,
     tls: Option<tonic::transport::ServerTlsConfig>,
 ) -> SocketAddr {
@@ -291,7 +449,7 @@ pub(super) async fn serve_routes(
 
 /// The calls a spied server received, in order: which service, and the map-generation
 /// header the call carried.
-pub(super) type Spied = Arc<Mutex<Vec<(&'static str, Option<String>)>>>;
+pub(crate) type Spied = Arc<Mutex<Vec<(&'static str, Option<String>)>>>;
 
 /// An interceptor that records `service` and the header of a call before its handler
 /// runs, and lets it through.
@@ -313,7 +471,7 @@ fn spy(
 /// The real service over `mem` on a loopback port, each of its four services behind an
 /// interceptor that records what the call carried (the real handlers do not read the
 /// map generation, so this is where a test sees that it arrived).
-pub(super) async fn serve_spied(mem: &Arc<Mem>) -> (Spied, Channel) {
+pub(crate) async fn serve_spied(mem: &Arc<Mem>) -> (Spied, Channel) {
     use kbf_proto::reapi::content_addressable_storage_server::ContentAddressableStorageServer;
     use kbf_proto::worker::segments_server::SegmentsServer;
     use tonic::service::interceptor::InterceptedService;
@@ -344,7 +502,7 @@ pub(super) async fn serve_spied(mem: &Arc<Mem>) -> (Spied, Channel) {
 }
 
 /// A service over `mem`, serving on a loopback port in plain text.
-pub(super) async fn serve(mem: &Arc<Mem>, write_bytes_in_flight: u32) -> Channel {
+pub(crate) async fn serve(mem: &Arc<Mem>, write_bytes_in_flight: u32) -> Channel {
     let storage: Arc<dyn Storage> = Arc::clone(mem) as Arc<dyn Storage>;
     let service = StorageService::new(
         storage,
@@ -357,24 +515,25 @@ pub(super) async fn serve(mem: &Arc<Mem>, write_bytes_in_flight: u32) -> Channel
     connect(addr).await
 }
 
-/// The map a node holds, which a test changes between calls.
-pub(super) struct Held(Mutex<Option<Arc<kbf_map::Map>>>);
+/// The map a node holds, which a test changes between calls: a one-member map in which
+/// the node is member 1.
+pub(crate) struct Held(Mutex<Option<Arc<kbf_map::Map>>>);
 
 impl Held {
     /// A node holding a map of generation `generation` (a one-member map).
-    pub(super) fn at(generation: u64) -> Arc<Self> {
+    pub(crate) fn at(generation: u64) -> Arc<Self> {
         let held = Arc::new(Self(Mutex::new(None)));
         held.set(generation);
         held
     }
 
     /// A node with no map yet.
-    pub(super) fn none() -> Arc<Self> {
+    pub(crate) fn none() -> Arc<Self> {
         Arc::new(Self(Mutex::new(None)))
     }
 
     /// The node learns the map of generation `generation`.
-    pub(super) fn set(&self, generation: u64) {
+    pub(crate) fn set(&self, generation: u64) {
         let member = kbf_map::Member {
             id: kbf_map::MemberId(1),
             addr: "127.0.0.1:1".to_owned(),
@@ -396,14 +555,22 @@ impl Held {
 }
 
 impl MapSource for Held {
-    fn current(&self) -> Option<Arc<kbf_map::Map>> {
-        self.0.lock().expect("lock").clone()
+    fn current(&self) -> Option<View> {
+        self.0.lock().expect("lock").clone().map(|map| View {
+            map,
+            me: kbf_map::MemberId(1),
+        })
     }
 }
 
 /// A service over `mem` that judges writes by `held`, on a loopback port.
-pub(super) async fn serve_mapped(mem: &Arc<Mem>, held: &Arc<Held>) -> Channel {
+pub(crate) async fn serve_mapped(mem: &Arc<Mem>, held: &Arc<Held>) -> Channel {
     let storage: Arc<dyn Storage> = Arc::clone(mem) as Arc<dyn Storage>;
+    let chain = Chain::new(
+        Arc::clone(held) as Arc<dyn MapSource>,
+        Peers::plain(),
+        ChainConfig::default(),
+    );
     let service = StorageService::new(
         storage,
         Admission::Open,
@@ -411,11 +578,11 @@ pub(super) async fn serve_mapped(mem: &Arc<Mem>, held: &Arc<Held>) -> Channel {
             write_bytes_in_flight: 1 << 30,
         },
     )
-    .with_map(Arc::clone(held) as Arc<dyn MapSource>);
+    .with_chain(Arc::new(chain));
     connect(serve_routes(service.routes(), None).await).await
 }
 
-pub(super) async fn connect(addr: SocketAddr) -> Channel {
+pub(crate) async fn connect(addr: SocketAddr) -> Channel {
     Channel::from_shared(format!("http://{addr}"))
         .expect("endpoint")
         .connect()
@@ -424,7 +591,7 @@ pub(super) async fn connect(addr: SocketAddr) -> Channel {
 }
 
 /// A plain-text service over a new [`Mem`], and a client of it tagging map generation 5.
-pub(super) async fn pair() -> (Arc<Mem>, RemoteStorage, Channel) {
+pub(crate) async fn pair() -> (Arc<Mem>, RemoteStorage, Channel) {
     let mem = Arc::new(Mem::default());
     let channel = serve(&mem, 1 << 30).await;
     (mem, RemoteStorage::new(channel.clone(), 5), channel)
@@ -432,7 +599,7 @@ pub(super) async fn pair() -> (Arc<Mem>, RemoteStorage, Channel) {
 
 /// The generation a request carried, as a service that records it saw it.
 #[derive(Default)]
-pub(super) struct Odd {
+pub(crate) struct Odd {
     /// The map generation of each action-store request, in the order asked.
     pub generations: Mutex<Vec<u64>>,
 }
@@ -530,7 +697,7 @@ impl ActionStore for Odd {
 }
 
 /// [`Odd`] on a loopback port, and what it saw.
-pub(super) async fn serve_odd() -> (Arc<Odd>, Channel) {
+pub(crate) async fn serve_odd() -> (Arc<Odd>, Channel) {
     let odd = Arc::new(Odd::default());
     let routes = tonic::service::Routes::new(ByteStreamServer::from_arc(Arc::clone(&odd)))
         .add_service(ActionStoreServer::from_arc(Arc::clone(&odd)));

@@ -5,8 +5,8 @@
 //! what a caller of the store itself would see, and what a raw REAPI client sends that
 //! no [`RemoteStorage`] would is refused with the code the protocol names.
 
-mod fake;
-mod roles;
+pub(crate) mod fake;
+pub(crate) mod roles;
 mod stale_map;
 
 use std::sync::Arc;
