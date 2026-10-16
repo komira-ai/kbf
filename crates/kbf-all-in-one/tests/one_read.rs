@@ -24,7 +24,7 @@ use kbf_all_in_one::LocalDataPlane;
 use kbf_daemon::cpu_pool::CpuPool;
 use kbf_driver_container::tree::{OutputLimits, collect};
 use kbf_proto::reapi::{ActionResult, Digest, Tree};
-use kbf_transfer::{Cas, fetch};
+use kbf_transfer::{Cas, Record, Source, fetch};
 use kbf_types::LeaseId;
 use prost::Message as _;
 use rustix::fs::inotify::{self, CreateFlags, ReadFlags, WatchFlags};
@@ -243,4 +243,29 @@ async fn with_a_tier_a_file_over_1_gib_is_read_once() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn without_a_tier_a_file_over_1_gib_is_read_once() {
     a_file_over_1_gib_is_read_once(false).await;
+}
+
+/// Catches the planes differing on the largest blob: a record over 5 GiB (S3's
+/// single-PUT limit, the largest blob the cache takes on every path) is refused by the
+/// local plane with the server's own message, before a byte of it is read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_blob_over_5_gib_is_refused() {
+    let dir = scratch("over-5-gib");
+    let plane = plane(&dir.join("server"), true).await;
+    let digest = kbf_types::Digest::new(kbf_types::DigestFunction::Sha256, [7; 32], (5 << 30) + 1);
+    let record = Record {
+        digest,
+        crc32c: 0,
+        source: Source::Bytes(bytes::Bytes::new()),
+    };
+    let why = plane
+        .put_records(vec![record])
+        .await
+        .expect_err("too large");
+    assert!(
+        why.to_string()
+            .contains("is larger than the largest blob the cache accepts (5368709120 bytes)"),
+        "{why}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }

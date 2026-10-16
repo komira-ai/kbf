@@ -871,3 +871,88 @@ async fn a_record_shorter_than_its_digest_fails_with_a_read_error() {
     assert!(format!("{failed:?}").starts_with("Read("), "{failed:?}");
     assert!(!front.all_present(&[digest_of(&whole)]).await);
 }
+
+/// The sparse file `name` of `size` bytes in a scratch directory, as the source a
+/// driver's walk leaves for it.
+fn sparse_source(name: &str, size: u64) -> (File, Source) {
+    let dir = scratch(name);
+    let path = dir.join("f");
+    File::create(&path)
+        .and_then(|file| file.set_len(size))
+        .expect("sparse");
+    let file = File::open(&path).expect("open");
+    let root = Arc::new(OwnedFd::from(File::open(&dir).expect("open the directory")));
+    let stamp = Stamp::of(&file).expect("stamp");
+    let source = Source::File(FileSource::new(
+        root,
+        Arc::from(Vec::<String>::new()),
+        "f".to_owned(),
+        stamp,
+    ));
+    (file, source)
+}
+
+/// The record of the sparse file `name` of `size` bytes, hashed a megabyte at a time
+/// as a driver's walk hashes it, whose bytes are read from the file when it is sent.
+fn sparse_record(name: &str, size: u64) -> Record {
+    use std::os::unix::fs::FileExt as _;
+    let (file, source) = sparse_source(name, size);
+    let mut hasher = RecordHasher::new();
+    let mut buffer = vec![0; 1 << 20];
+    let mut at = 0;
+    while at < size {
+        let read = file.read_at(&mut buffer, at).expect("read");
+        hasher.update(&buffer[..read]);
+        at += read as u64;
+    }
+    let (digest, crc32c) = hasher.finish();
+    Record {
+        digest,
+        crc32c,
+        source,
+    }
+}
+
+/// Catches the remote plane refusing a blob the local plane stores: the largest blob is
+/// 5 GiB on every path, so a 1 GiB + 1 MiB output (over the old 1 GiB limit) is sent
+/// as segments and is present after.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_blob_over_1_gib_goes_through_the_remote_plane() {
+    let front = Front::start(Mode::Serve).await;
+    let record = sparse_record("over-1-gib", (1 << 30) + (1 << 20));
+    let digest = proto_digest(&record.digest);
+    front
+        .engine
+        .put_records(vec![record])
+        .await
+        .expect("put records");
+    assert!(front.all_present(&[digest]).await);
+}
+
+/// Catches the remote plane taking a blob over the largest: a record over 5 GiB is
+/// refused with the server's message.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_blob_over_5_gib_is_refused_by_the_remote_plane() {
+    let front = Front::start(Mode::Serve).await;
+    let digest = kbf_types::Digest::new(kbf_types::DigestFunction::Sha256, [7; 32], (5 << 30) + 1);
+    // Never hashed: the server refuses it by the size its digest claims.
+    let (_, source) = sparse_source("over-5-gib", (5 << 30) + 1);
+    let record = Record {
+        digest,
+        crc32c: 0,
+        source,
+    };
+    let why = front
+        .engine
+        .put_records(vec![record])
+        .await
+        .expect_err("too large");
+    assert!(
+        why.to_string()
+            .contains("largest blob this cache accepts (5368709120 bytes)")
+            || why
+                .to_string()
+                .contains("largest blob the cache accepts (5368709120 bytes)"),
+        "{why}"
+    );
+}

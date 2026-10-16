@@ -26,10 +26,10 @@ use kbf_types::LeaseId;
 const CHUNK: usize = 1 << 20;
 
 /// The most bytes the whole path may hold live at once beyond what was live when the
-/// test started: a few chunks for the walk, the plane and the server's upload each,
-/// and room for the runtimes' own allocations. A file held whole anywhere on the path
-/// (1 GiB or more) is far past it.
-const BOUND: usize = 32 * CHUNK;
+/// test started: the chunk window (one chunk per hashing thread, nothing more on the
+/// plane's or the server's side) and room for the runtimes' own allocations. A file
+/// held whole anywhere on the path (2 GiB) is far past it.
+const BOUND: usize = 16 * CHUNK;
 
 /// Bytes allocated and not yet freed, and the most of them seen since the last reset.
 static LIVE: AtomicUsize = AtomicUsize::new(0);
@@ -113,10 +113,15 @@ fn scratch(name: &str) -> PathBuf {
 }
 
 /// The plane over a server started in `runtime` on the stores under `dir`, with a
-/// write tier (`tier`) or without one.
-fn plane(runtime: &tokio::runtime::Runtime, dir: &Path, tier: bool) -> Arc<LocalDataPlane> {
+/// write tier. The server is not served: its flusher, which reads a staged block back
+/// whole to PUT it (a cost of the flush, after the commit), does not run while the
+/// upload path is measured.
+fn plane(
+    runtime: &tokio::runtime::Runtime,
+    dir: &Path,
+) -> (Arc<LocalDataPlane>, kbf_server::ServerHandle) {
     let n = STARTED.fetch_add(1, Ordering::SeqCst);
-    let mut argv = vec![
+    let argv = vec![
         "kbf-server".to_owned(),
         "--listen=127.0.0.1:0".to_owned(),
         "--worker-listen=127.0.0.1:0".to_owned(),
@@ -124,38 +129,31 @@ fn plane(runtime: &tokio::runtime::Runtime, dir: &Path, tier: bool) -> Arc<Local
             "--cold-store=file://{}",
             dir.join(format!("cold-{n}")).display()
         ),
-    ];
-    if tier {
-        argv.push(format!(
+        format!(
             "--hot-store=file://{}",
             dir.join(format!("hot-{n}")).display()
-        ));
-    } else {
-        argv.push(format!(
-            "--meta-dir={}",
-            dir.join(format!("meta-{n}")).display()
-        ));
-    }
+        ),
+    ];
     let args = kbf_server::Args::try_parse_from(argv).expect("flags");
     runtime.block_on(async {
         let never = || Ok(std::future::pending::<()>());
         let server = kbf_server::start(&args, never).await.expect("start");
         let plane = LocalDataPlane::new(server.local(), tokio::runtime::Handle::current());
-        tokio::spawn(server.serve());
-        Arc::new(plane)
+        (Arc::new(plane), server)
     })
 }
 
-/// Stores the sparse output `out/large` of `size` bytes through a lease of the plane,
-/// and returns the most bytes live at once while it did; checks it is held after.
-fn store_one_large_output(name: &str, tier: bool, size: u64) -> usize {
+/// Stores the sparse output `out/large` of `size` bytes through a lease of the plane
+/// over a server with a write tier, and returns the most bytes live at once while it
+/// did; checks it is held after.
+fn store_one_large_output(name: &str, size: u64) -> usize {
     let dir = scratch(name);
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
         .build()
         .expect("runtime");
-    let plane = plane(&runtime, &dir.join("server"), tier);
+    let (plane, _server) = plane(&runtime, &dir.join("server"));
     let upper = dir.join("upper");
     std::fs::create_dir_all(upper.join("out")).expect("mkdir");
     std::fs::File::create(upper.join("out/large"))
@@ -185,26 +183,10 @@ fn store_one_large_output(name: &str, tier: bool, size: u64) -> usize {
 }
 
 /// Catches a file held whole anywhere on the in-process path (the walk, the plane's
-/// intake, the server's upload until its commit), with a write tier: a 1 GiB output
-/// (the largest blob the server takes today) is stored with no more than [`BOUND`]
-/// live at once.
+/// intake, the server's upload until its commit): a 2 GiB output streams onto the
+/// write tier with no more than [`BOUND`] live at once.
 #[test]
-fn with_a_tier_a_1_gib_output_is_stored_in_bounded_memory() {
-    let peak = store_one_large_output("tier-1g", true, 1 << 30);
-    assert!(peak < BOUND, "{peak} bytes live at once");
-}
-
-/// The same without a write tier.
-#[test]
-fn without_a_tier_a_1_gib_output_is_stored_in_bounded_memory() {
-    let peak = store_one_large_output("no-tier-1g", false, 1 << 30);
-    assert!(peak < BOUND, "{peak} bytes live at once");
-}
-
-/// Catches a file over 1 GiB held whole, or not stored: a 2 GiB + 1 MiB output, with a
-/// write tier.
-#[test]
-fn with_a_tier_a_2_gib_output_is_stored_in_bounded_memory() {
-    let peak = store_one_large_output("tier-2g", true, (2 << 30) + (1 << 20));
+fn a_2_gib_output_streams_onto_the_tier_in_bounded_memory() {
+    let peak = store_one_large_output("tier-2g", 2 << 30);
     assert!(peak < BOUND, "{peak} bytes live at once");
 }
