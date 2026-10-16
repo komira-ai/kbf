@@ -524,11 +524,10 @@ fn sibling(good: &Path, name: &str) -> PathBuf {
     good.with_file_name(name)
 }
 
-// Catches a restore that takes a database that is not a state store this binary reads:
-// another application's, or a state store of another schema version with the same
-// tables (its rows would be read with the wrong layout).
+// Catches a restore that takes another application's database: its rows would replace
+// the live file's.
 #[test]
-fn a_restore_refuses_a_database_that_is_not_this_state_store() {
+fn a_restore_refuses_another_applications_database() {
     let foreign = |good: &Path| {
         let foreign = sibling(good, "foreign.db");
         let conn = Connection::open(&foreign).expect("create");
@@ -536,6 +535,13 @@ fn a_restore_refuses_a_database_that_is_not_this_state_store() {
         foreign
     };
     refused_source("state-store-restore-foreign", &foreign, "schema version 0");
+}
+
+// Catches a restore that takes a state store of another schema version: it has the same
+// tables, so nothing but the version check stops its rows being read with the wrong
+// layout.
+#[test]
+fn a_restore_refuses_a_state_store_of_another_schema_version() {
     let newer = |good: &Path| {
         let newer = sibling(good, "newer.db");
         fs::copy(good, &newer).expect("copy");
