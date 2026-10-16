@@ -3,7 +3,8 @@
 //! - `[Section]` lines open a section; `Key=value` lines are directives in it. A
 //!   directive before the first header has the section `""`.
 //! - Blank lines and lines starting with `#` or `;` are skipped. Leading and trailing
-//!   whitespace is trimmed.
+//!   [`WHITESPACE`] is trimmed from a line, a key and a value, as systemd's `strstrip`
+//!   does (`src/shared/conf-parser.c`); another space (U+00A0) is part of the value.
 //! - A line ending in `\` continues on the next line, the `\` replaced by a space. A
 //!   comment line inside a continued directive is skipped, as systemd skips it.
 //! - A key given more than once keeps every assignment in order; [`UnitFile::get_in`]
@@ -35,6 +36,9 @@ pub enum UnitError {
     NotDirective(usize),
 }
 
+/// systemd's `WHITESPACE` (`src/basic/string-util.h`): what it trims and splits on.
+pub const WHITESPACE: [char; 4] = [' ', '\t', '\n', '\r'];
+
 impl UnitFile {
     /// Read `text`.
     pub fn parse(text: &str) -> Result<UnitFile, UnitError> {
@@ -43,7 +47,7 @@ impl UnitFile {
         // The directive so far and its first line, while a line ends in `\`.
         let mut pending: Option<(String, usize)> = None;
         for (i, raw) in text.lines().enumerate() {
-            let line = raw.trim();
+            let line = raw.trim_matches(WHITESPACE);
             if line.starts_with('#') || line.starts_with(';') {
                 continue;
             }
@@ -155,12 +159,12 @@ pub fn comments_in_continuations(text: &str) -> Vec<usize> {
 fn directive(section: &str, line: &str, number: usize) -> Result<Directive, UnitError> {
     let (key, value) = line
         .split_once('=')
-        .filter(|(k, _)| !k.trim().is_empty())
+        .filter(|(k, _)| !k.trim_matches(WHITESPACE).is_empty())
         .ok_or(UnitError::NotDirective(number))?;
     Ok(Directive {
         section: section.to_owned(),
-        key: key.trim().to_owned(),
-        value: value.trim().to_owned(),
+        key: key.trim_matches(WHITESPACE).to_owned(),
+        value: value.trim_matches(WHITESPACE).to_owned(),
     })
 }
 
