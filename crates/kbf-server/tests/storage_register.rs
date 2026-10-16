@@ -200,8 +200,10 @@ async fn a_node_whose_row_lapsed_registers_again() {
     assert_eq!(f.store.fake.scan_prefix("member/").expect("scan").len(), 1);
 }
 
-fn node_addr_text(f: &Frontend) -> String {
-    let map = f.members.current_map().expect("read").expect("map");
+/// Member 1's address in the map. Waits for the map: the refresh that publishes it can
+/// land after the member's row, on a slow runner.
+async fn node_addr_text(f: &Frontend) -> String {
+    let map = until("the map", || f.members.current_map().expect("read")).await;
     map.member(MemberId(1)).expect("member 1").addr.clone()
 }
 
@@ -382,7 +384,7 @@ async fn over_mutual_tls_only_the_storage_role_registers() {
     let addr = node.addr;
     let _serving = tokio::spawn(node.serve());
     until("the node to register over TLS", || row(&f, 1)).await;
-    assert_eq!(node_addr_text(&f), addr.to_string());
+    assert_eq!(node_addr_text(&f).await, addr.to_string());
 
     let (cert, key) = pki.cert("daemon");
     let tls = ClientTlsConfig::new()
