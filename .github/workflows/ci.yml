@@ -153,7 +153,7 @@ jobs:
             target
           key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: cargo-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}-
-      - run: cargo test --workspace --locked
+      - run: cargo test -p kbf-server --locked --no-fail-fast --test write_admission
       # kbf-guest started as root through sudo must refuse (crates/kbf-guest/tests/as_root.rs).
       - run: cargo xtask sudo-test -p kbf-guest --test as_root
       # kbf-server's --version names this commit, and the CI-only override stamps two

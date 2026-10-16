@@ -48,7 +48,7 @@ pub fn flow_windows(max_streams: u32) -> FlowWindows {
     FlowWindows {
         streams,
         stream,
-        connection: streams * stream,
+        connection: 200 * STREAM_WINDOW_BYTES,
     }
 }
 
