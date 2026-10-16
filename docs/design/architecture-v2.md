@@ -75,7 +75,7 @@ Operations; a queue indexed by platform, size class and QoS (a claim never scans
 
 ## 5. Scheduler
 
-**v1: one frontend** runs the scheduler as `farm.rs` does today, writing every change through the `kbf-state` trait; memory is a cache, the store is the truth. Global first-fit, holds and the ladder are unchanged. **[I]** Clients re-submit a lost Execute and dedup absorbs it, so what must be durable is small: operations, leases, membership, the map, the epoch.
+**v1: one frontend** runs the scheduler as `farm.rs` does today, writing every change through the `kbf-state` trait; memory is a cache, the store is the truth. Global first-fit, holds and the ladder are unchanged. **[I]** Buck2 does not re-submit a lost Execute: it retries only opening the stream (up to 5 attempts), and a stream that breaks after it started fails the action (`remote_call_error`); it never calls WaitExecution. So a frontend that goes away must not break its streams. On SIGTERM it refuses new Execute calls UNAVAILABLE (retried at open, so they reach another frontend) and keeps every open stream until its action is done (`--shutdown-timeout-secs`, default no deadline); every open stream is sent its operation again every `--progress-interval-secs` and the listeners send HTTP/2 PINGs (`--http2-keepalive-*`) so no idle timeout cuts it. What must be durable is still small: operations, leases, membership, the map, the epoch.
 
 **Several frontends: per-frontend pull-claim.** Placement is global first-fit under one mutex **[F]**, so N frontends cannot share it. A frontend owns the daemons connected to it and claims for their free slots:
 
