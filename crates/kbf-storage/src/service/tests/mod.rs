@@ -544,10 +544,10 @@ async fn the_action_cache_round_trips() {
             .expect_err("refused");
         match (expected, error) {
             ("absent", StorageError::ActionWrite(ActionWriteError::Absent(d))) => {
-                assert_eq!(d, sha(b"missing"));
+                assert_eq!(d, [sha(b"missing")]);
             }
             ("unreachable", StorageError::ActionWrite(ActionWriteError::Unreachable(d))) => {
-                assert_eq!(d, sha(b"unreadable"));
+                assert_eq!(d, [sha(b"unreadable")]);
             }
             (_, other) => panic!("{expected}: {other:?}"),
         }
@@ -739,28 +739,47 @@ async fn a_client_does_not_trust_a_node_that_contradicts_itself() {
 }
 
 /// Catches a refusal the client cannot read becoming a success or a wrong error, and a
-/// refusal that lost its blob.
+/// refusal that lost any of its blobs.
 #[test]
 fn a_refusal_is_read_back_as_it_was_made() {
     use super::client::refused;
     use super::wire::refusal_of;
-    let blob = sha(b"b");
+    let (blob, other) = (sha(b"b"), sha(b"c"));
     for error in [
         ActionWriteError::NotDaemon,
-        ActionWriteError::Absent(blob),
-        ActionWriteError::Unreachable(blob),
+        ActionWriteError::Absent(vec![blob]),
+        ActionWriteError::Absent(vec![blob, other]),
+        ActionWriteError::Unreachable(vec![blob]),
+        ActionWriteError::Unreachable(vec![other, blob]),
     ] {
         let back = refused(&refusal_of(&error));
-        assert_eq!(back.to_string(), StorageError::from(error).to_string());
+        assert!(
+            matches!(&back, StorageError::ActionWrite(e) if *e == error),
+            "{error:?} read back as {back:?}"
+        );
     }
     let unreadable = refused(&kbf_proto::storage::Refusal {
         kind: refusal::Kind::Absent as i32,
         blob: None,
+        more: Vec::new(),
     });
     assert!(matches!(unreadable, StorageError::Internal(_)));
+    let bad_more = refused(&kbf_proto::storage::Refusal {
+        kind: refusal::Kind::Absent as i32,
+        blob: Some(super::wire::to_proto(&blob)),
+        more: vec![kbf_proto::reapi::Digest {
+            hash: "not hex".to_owned(),
+            size_bytes: 1,
+        }],
+    });
+    assert!(
+        matches!(bad_more, StorageError::Internal(_)),
+        "{bad_more:?}"
+    );
     let unknown = refused(&kbf_proto::storage::Refusal {
         kind: 99,
         blob: None,
+        more: Vec::new(),
     });
     assert!(matches!(unknown, StorageError::Internal(_)));
 }

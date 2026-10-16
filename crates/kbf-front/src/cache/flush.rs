@@ -31,7 +31,7 @@
 //! - **Eviction is on committed state:** the block becomes a flushed copy
 //!   ([`kbf_tier::WriteTier::flushed`]) only after `ObjectFlushed` applied.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -60,6 +60,70 @@ pub const FLUSH_BACKOFF_MAX: Duration = Duration::from_secs(60);
 /// The most objects one [`Cache::flush_tier`] round flushes, oldest first; the rest
 /// wait for the next round.
 pub const FLUSHES_PER_ROUND: usize = 4;
+
+/// The order a round flushes in, at most `most` objects of `waits` (each sealed object
+/// that may be flushed now, with the objects its flush waits for), each with those of
+/// its waits taken before it this round: it is flushed only once they all were.
+///
+/// Oldest first among the objects whose waits were all taken before them; an object
+/// that waits, directly or through others, for one not in `waits` (open, waiting out a
+/// backoff, or past this round) is not taken. When none is ready and some object waits
+/// only on objects in `waits` that wait only on each other (a cycle: two entries whose
+/// results and closures were staged crosswise), the oldest such object is taken first,
+/// so a cycle never stalls the flusher, and the cycle is logged.
+fn flush_order(
+    waits: &BTreeMap<ObjectId, BTreeSet<ObjectId>>,
+    most: usize,
+) -> Vec<(ObjectId, BTreeSet<ObjectId>)> {
+    let mut taken = BTreeSet::new();
+    let mut order = Vec::new();
+    while order.len() < most {
+        let open = |object: &ObjectId| !taken.contains(object);
+        let ready = waits
+            .iter()
+            .find(|(object, wait)| open(object) && wait.is_subset(&taken));
+        let (object, wait) = match ready {
+            Some(next) => next,
+            None => {
+                let blocked = blocked_outside(waits, &taken);
+                let cycle = waits
+                    .iter()
+                    .find(|(object, _)| open(object) && !blocked.contains(*object));
+                let Some(next) = cycle else { break };
+                tracing::warn!(object = %next.0, waits = ?next.1, "staged objects wait for each other's flush; flushing the oldest first");
+                next
+            }
+        };
+        let first = wait.intersection(&taken).copied().collect();
+        taken.insert(*object);
+        order.push((*object, first));
+    }
+    order
+}
+
+/// The objects of `waits` not taken that wait, directly or through others in `waits`,
+/// for an object that is neither in `waits` nor taken.
+fn blocked_outside(
+    waits: &BTreeMap<ObjectId, BTreeSet<ObjectId>>,
+    taken: &BTreeSet<ObjectId>,
+) -> BTreeSet<ObjectId> {
+    let mut blocked = BTreeSet::new();
+    loop {
+        let more: Vec<ObjectId> = waits
+            .iter()
+            .filter(|(object, _)| !taken.contains(*object) && !blocked.contains(*object))
+            .filter(|(_, wait)| {
+                wait.iter()
+                    .any(|w| blocked.contains(w) || (!waits.contains_key(w) && !taken.contains(w)))
+            })
+            .map(|(object, _)| *object)
+            .collect();
+        if more.is_empty() {
+            return blocked;
+        }
+        blocked.extend(more);
+    }
+}
 
 /// The wait before the next attempt after `failures` failures in a row.
 pub(super) fn flush_backoff(failures: u32) -> Duration {
@@ -190,6 +254,10 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
     /// 2. Up to [`FLUSHES_PER_ROUND`] sealed objects staged on this tier, in id order
     ///    (oldest first), whose backoff has passed, are flushed. The queue is the
     ///    committed state's, so a restart resumes every flush it had not finished.
+    ///    An object holding an action-cache entry's result blob is flushed only after
+    ///    the objects holding its closure's blobs ([`kbf_meta::MetaState::flush_waits`],
+    ///    [`flush_order`]): one waiting for an object that is open, waiting out a
+    ///    backoff, or failed this round is left for a later round.
     ///
     /// # Errors
     ///
@@ -213,17 +281,26 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
                 let ours = |o: &StagedObject| (o.tier(), o.state()) == (tier, StagedState::Sealed);
                 let sealed = s.staged_objects().filter(|(_, o)| ours(o));
                 let sealed = sealed.filter(|(object, _)| !waiting.contains(object));
-                let due = sealed.take(FLUSHES_PER_ROUND).map(|(object, o)| {
+                let waits = sealed.map(|(object, _)| (object, s.flush_waits(object)));
+                let order = flush_order(&waits.collect(), FLUSHES_PER_ROUND);
+                let due = order.into_iter().filter_map(|(object, first)| {
+                    let o = s.staged(object)?;
                     let blobs: Vec<(Digest, u64)> = o.blobs().map(|(d, at)| (*d, at)).collect();
-                    (object, o.committed_len(), blobs)
+                    Some((object, o.committed_len(), blobs, first))
                 });
                 due.collect::<Vec<_>>()
             })
             .await?;
-        for (object, len, blobs) in due {
+        let mut done = BTreeSet::new();
+        for (object, len, blobs, first) in due {
+            if !first.is_subset(&done) {
+                // An object it waits for failed this round: it waits for the next.
+                continue;
+            }
             match self.flush_one(staging, object, len, &blobs).await {
                 Ok(Flushed::Done) => {
                     staging.done(object);
+                    done.insert(object);
                     round.flushed.push(object);
                 }
                 Ok(Flushed::Conflict) => {
@@ -441,6 +518,67 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kbf_meta::Epoch;
+
+    fn object(n: u64) -> ObjectId {
+        ObjectId::new(Epoch::new(1), n)
+    }
+
+    fn waits(edges: &[(u64, &[u64])]) -> BTreeMap<ObjectId, BTreeSet<ObjectId>> {
+        edges
+            .iter()
+            .map(|(o, w)| (object(*o), w.iter().map(|n| object(*n)).collect()))
+            .collect()
+    }
+
+    fn order(edges: &[(u64, &[u64])], most: usize) -> Vec<(u64, Vec<u64>)> {
+        flush_order(&waits(edges), most)
+            .into_iter()
+            .map(|(o, first)| (o.seq(), first.iter().map(|f| f.seq()).collect()))
+            .collect()
+    }
+
+    /// Catches an order that is not oldest first when nothing waits, and one that takes
+    /// an object before the objects it waits for (the result before its closure).
+    #[test]
+    fn an_object_comes_after_the_objects_it_waits_for() {
+        assert_eq!(
+            order(&[(1, &[]), (2, &[]), (3, &[])], 4),
+            [(1, vec![]), (2, vec![]), (3, vec![])]
+        );
+        assert_eq!(
+            order(&[(1, &[3]), (2, &[]), (3, &[2])], 4),
+            [(2, vec![]), (3, vec![2]), (1, vec![3])]
+        );
+    }
+
+    /// Catches an object taken while it waits, directly or through another, for an
+    /// object the round cannot flush (open, or waiting out a backoff), and a round that
+    /// counts such objects against its limit and so flushes nothing ready behind them.
+    #[test]
+    fn an_object_waiting_outside_the_round_is_left() {
+        assert_eq!(
+            order(
+                &[(1, &[9]), (2, &[1]), (3, &[]), (4, &[]), (5, &[]), (6, &[])],
+                4
+            ),
+            [(3, vec![]), (4, vec![]), (5, vec![]), (6, vec![])]
+        );
+    }
+
+    /// Catches two objects whose entries were staged crosswise (each holds a result whose
+    /// closure the other holds) stalling the flusher for good: the oldest is taken.
+    #[test]
+    fn a_cycle_is_broken_at_its_oldest_object() {
+        assert_eq!(
+            order(&[(1, &[2]), (2, &[1]), (3, &[1, 9])], 4),
+            [(1, vec![]), (2, vec![1])]
+        );
+        assert_eq!(
+            order(&[(1, &[2]), (2, &[3]), (3, &[1])], 2),
+            [(1, vec![]), (3, vec![1])]
+        );
+    }
 
     /// Catches: a backoff that does not grow (a store outage met by a retry every
     /// round), one that grows without bound (a flush that waits hours after the store

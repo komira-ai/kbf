@@ -528,23 +528,15 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
     /// never reaches the action cache.
     ///
     /// # Errors
-    /// [`CacheError::ActionWrite`] naming the first blob of the closure that is not
-    /// held; a missing tree, a malformed result, or an unavailable store or log.
+    /// [`CacheError::ActionWrite`] naming every blob of the closure that is not held
+    /// (FAILED_PRECONDITION when any is absent); a missing tree, a malformed result, or
+    /// an unavailable store or log.
     pub async fn prepare_action_result(
         &self,
         result: &reapi::ActionResult,
     ) -> Result<ActionRecord, CacheError> {
         let closure = self.closure_of(result).await?;
-        let lack = self
-            .writer
-            .query(|s| {
-                closure.iter().find_map(|d| match s.blob(d) {
-                    BlobAnswer::Present { .. } => None,
-                    BlobAnswer::Absent => Some(ActionWriteError::Absent(*d)),
-                    BlobAnswer::Unavailable => Some(ActionWriteError::Unreachable(*d)),
-                })
-            })
-            .await?;
+        let lack = self.writer.query(|s| s.lacking(closure.iter())).await?;
         if let Some(lack) = lack {
             return Err(lack.into());
         }

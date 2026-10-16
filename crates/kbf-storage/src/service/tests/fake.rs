@@ -190,10 +190,10 @@ impl Storage for Mem {
         Box::pin(async move {
             self.failing()?;
             if result.exit_code == 99 {
-                return Err(ActionWriteError::Absent(sha(b"missing")).into());
+                return Err(ActionWriteError::Absent(vec![sha(b"missing")]).into());
             }
             if result.exit_code == 98 {
-                return Err(ActionWriteError::Unreachable(sha(b"unreadable")).into());
+                return Err(ActionWriteError::Unreachable(vec![sha(b"unreadable")]).into());
             }
             Ok(ActionRecord {
                 result: sha(&result.stdout_raw),

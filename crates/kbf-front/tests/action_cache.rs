@@ -219,7 +219,7 @@ async fn prepare_refuses_outputs_that_are_not_held() {
     };
     let refused = farm.cache.prepare_action_result(&result).await;
     assert!(
-        matches!(refused, Err(CacheError::ActionWrite(ActionWriteError::Absent(d))) if d == absent.digest),
+        matches!(&refused, Err(CacheError::ActionWrite(ActionWriteError::Absent(d))) if *d == [absent.digest]),
         "{refused:?}"
     );
     let result_blob = Blob::of(&result);
@@ -239,7 +239,7 @@ async fn prepare_refuses_outputs_that_are_not_held() {
     };
     let refused = farm.cache.prepare_action_result(&result).await;
     assert!(
-        matches!(refused, Err(CacheError::ActionWrite(ActionWriteError::Unreachable(d))) if d == gone.digest),
+        matches!(&refused, Err(CacheError::ActionWrite(ActionWriteError::Unreachable(d))) if *d == [gone.digest]),
         "{refused:?}"
     );
 

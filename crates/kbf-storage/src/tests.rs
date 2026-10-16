@@ -44,8 +44,14 @@ fn each_error_answers_its_code_and_message() {
         ),
         (StorageError::Invalid("bad".into()), Code::InvalidArgument),
         (ActionWriteError::NotDaemon.into(), Code::PermissionDenied),
-        (ActionWriteError::Absent(a).into(), Code::FailedPrecondition),
-        (ActionWriteError::Unreachable(a).into(), Code::Unavailable),
+        (
+            ActionWriteError::Absent(vec![a]).into(),
+            Code::FailedPrecondition,
+        ),
+        (
+            ActionWriteError::Unreachable(vec![a]).into(),
+            Code::Unavailable,
+        ),
         (
             StorageError::Unavailable(Arc::new(Backend)),
             Code::Unavailable,

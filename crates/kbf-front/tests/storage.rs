@@ -77,7 +77,7 @@ async fn the_action_cache_answers_through_the_trait() {
     let absent = digest_of(b"an output never stored");
     let refused = storage.prepare_action_result(&result_with(absent)).await;
     assert!(
-        matches!(refused, Err(StorageError::ActionWrite(ActionWriteError::Absent(d))) if d == absent),
+        matches!(&refused, Err(StorageError::ActionWrite(ActionWriteError::Absent(d))) if *d == [absent]),
         "{refused:?}"
     );
 
@@ -131,8 +131,8 @@ fn errors_answer_as_the_cache_answers() {
         },
         CacheError::Invalid("bad".to_owned()),
         CacheError::ActionWrite(ActionWriteError::NotDaemon),
-        CacheError::ActionWrite(ActionWriteError::Absent(a)),
-        CacheError::ActionWrite(ActionWriteError::Unreachable(a)),
+        CacheError::ActionWrite(ActionWriteError::Absent(vec![a])),
+        CacheError::ActionWrite(ActionWriteError::Unreachable(vec![a])),
         CacheError::Meta(MetaLogError::Unavailable("no leader".to_owned())),
         CacheError::Store(ObjectStoreError::Unsupported("retention")),
         CacheError::Internal("torn".to_owned()),
