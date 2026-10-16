@@ -217,7 +217,7 @@ impl Fail {
 
     fn into_store(self) -> StoreError {
         StoreError::Failed(match self {
-            Fail::Pg(err) => err.to_string(),
+            Fail::Pg(err) => describe(&err),
             Fail::Refused(why) => why,
         })
     }
@@ -232,6 +232,22 @@ pub struct Claimed {
     pub was: Versioned,
     /// The commit of the transaction the caller built for it.
     pub commit: Commit,
+}
+
+/// What the server said, which `Display` for the client's error leaves out ("db error").
+fn describe(err: &postgres::Error) -> String {
+    if let Some(db) = err.as_db_error() {
+        return format!(
+            "{}: {} (SQLSTATE {})",
+            db.severity(),
+            db.message(),
+            db.code().code()
+        );
+    }
+    match std::error::Error::source(err) {
+        Some(source) => format!("{err}: {source}"),
+        None => err.to_string(),
+    }
 }
 
 fn to_time(us: i64) -> StoreTime {
