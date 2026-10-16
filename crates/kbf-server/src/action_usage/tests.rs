@@ -203,8 +203,14 @@ fn the_record_keeps_the_subject_s_key_cfg_and_target() {
         (Kind::Target, "cell//pkg:t")
     );
     for (path, kind) in [
-        ("buck-out/v2/art-anon/cell/pkg/3fa9c1/__t__/o", Kind::Anon),
-        ("buck-out/v2/art-bxl/cell/x.bxl/__f__/o", Kind::Bxl),
+        (
+            "buck-out/v2/art-anon/cell/7a3c1e9f0b2d4c68pkg/3fa9c1/__t__/o",
+            Kind::Anon,
+        ),
+        (
+            "buck-out/v2/art-bxl/cell/x.bxl/__f__/0123456789abcdef/o",
+            Kind::Bxl,
+        ),
     ] {
         let (_, shape) = recorded(&[path]);
         assert_eq!(shape.target.map(|t| t.kind), Some(kind), "{path}");

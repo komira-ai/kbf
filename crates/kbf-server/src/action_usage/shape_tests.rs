@@ -813,11 +813,17 @@ fn a_test_names_its_target_through_its_program_or_names_none() {
         None,
         "no cell"
     );
-    assert_eq!(
-        target_of_paths(&["cc"], &["buck-out/v2/art//pkg/__x__/o"]),
-        None,
-        "empty cell"
-    );
+    for path in [
+        "buck-out/v2/art//pkg/__x__/o".to_owned(),
+        format!("buck-out/v2/art//pkg/__x__/{CONTENT}/o"),
+        format!("buck-out/v2/art//{CFG}/pkg/__x__/o"),
+    ] {
+        assert_eq!(
+            target_of_paths(&["cc"], &[&path]),
+            None,
+            "empty cell: {path}"
+        );
+    }
     assert_eq!(
         target_of_paths(&["cc"], &["buck-out/v2/art/cell/pkg/o"]),
         None,
@@ -827,5 +833,110 @@ fn a_test_names_its_target_through_its_program_or_names_none() {
         target_of_paths(&["cc"], &["buck-out/v2/art/cell/pkg/__open/o"]),
         None,
         "a name never closed"
+    );
+}
+
+/// Issue #796, review: a package directory whose name starts and ends with `__`
+/// (Jest's `__tests__`, `__mocks__`) looks like a target name. In the content-hash form
+/// the real name is the one the content hash (or `output_artifacts`) follows, past a
+/// dynamic action's `__action__<k>__`; in the configuration form two such segments
+/// before the output cannot be told apart, so the target is `None`, not a guess.
+/// Catches: the package directory read as the name (`cell//js:tests`), the content
+/// hash not used to find the name, a dynamic action's `__action__<k>__` counted as a
+/// second candidate (its target lost), or the output's own `__x__` file name taken.
+#[test]
+fn a_package_directory_that_looks_like_a_name_is_not_one() {
+    let want = label(TargetKind::Target, "cell//js/__tests__:t");
+    for path in [
+        format!("buck-out/v2/art/cell/js/__tests__/__t__/{CONTENT}/out"),
+        "buck-out/v2/art/cell/js/__tests__/__t__/output_artifacts/out".to_owned(),
+        format!("buck-out/v2/art/cell/js/__tests__/__t__/__action__3__/{CONTENT}/out"),
+        format!("buck-out/v2/gen/cell/js/__tests__/__mocks__/__t__/{CONTENT}/out"),
+    ] {
+        let want = if path.contains("__mocks__") {
+            label(TargetKind::Target, "cell//js/__tests__/__mocks__:t")
+        } else {
+            want.clone()
+        };
+        assert_eq!(target_of_paths(&["cc"], &[&path]), want, "{path}");
+    }
+    for path in [
+        format!("buck-out/v2/art/cell/{CFG}/js/__tests__/__t__/out"),
+        format!("buck-out/v2/art/cell/{CFG}/js/__tests__/__foo/bar__/out"),
+        format!("buck-out/v2/art/cell/{CFG}/js/__t__/__pycache__/out"),
+    ] {
+        assert_eq!(target_of_paths(&["cc"], &[&path]), None, "{path}");
+    }
+    assert_eq!(
+        target_of_paths(
+            &["cc"],
+            &[&format!(
+                "buck-out/v2/art/cell/{CFG}/js/__t__/__action__3__/out"
+            )]
+        ),
+        label(TargetKind::Target, "cell//js:t"),
+        "a dynamic action's key is not a second name"
+    );
+    assert_eq!(
+        target_of_paths(
+            &["cc"],
+            &[&format!("buck-out/v2/art/cell/{CFG}/js/__t__/__init__")]
+        ),
+        label(TargetKind::Target, "cell//js:t"),
+        "the output's own file name is no candidate"
+    );
+    assert_eq!(
+        target_of_paths(
+            &["cc"],
+            &[&format!("buck-out/v2/art/cell/{CFG}/js/__init__")]
+        ),
+        None,
+        "a name with nothing under it"
+    );
+    assert_eq!(
+        target_of_paths(&["cc"], &["buck-out/v2/art/cell/js/__tests__/__t__/out"]),
+        None,
+        "the content form with no hash after any name"
+    );
+}
+
+/// Issue #796, review: an anonymous target's content-mode path outside the root
+/// package glues the cell to the package (`<cell><pkg>/<content>/__<name>__/…`), so
+/// where the cell ends cannot be read. Catches: the glued segment taken for the cell
+/// (`cellsrc//x:x`). The root-package form, whose cell is glued to the content hash
+/// alone, and the configuration form keep their labels; a package directory that looks
+/// like a name is told apart by the attributes hash before the real one.
+#[test]
+fn an_anonymous_content_mode_target_outside_the_root_names_none() {
+    assert_eq!(
+        target_of_paths(
+            &["cc"],
+            &[&format!("buck-out/v2/art-anon/cellsrc/x/{CONTENT}/__x__/o")]
+        ),
+        None
+    );
+    assert_eq!(
+        target_of_paths(
+            &["cc"],
+            &[&format!("buck-out/v2/art-anon/cell{CONTENT}/__x__/o")]
+        ),
+        label(TargetKind::Anon, "cell//:x")
+    );
+    assert_eq!(
+        target_of_paths(
+            &["cc"],
+            &[&format!(
+                "buck-out/v2/art-anon/cell/{CFG}src/__tests__/3fa9c1/__x__/o"
+            )]
+        ),
+        label(TargetKind::Anon, "cell//src/__tests__:x")
+    );
+    assert_eq!(
+        target_of_paths(
+            &["cc"],
+            &[&format!("buck-out/v2/art-anon/cell/{CFG}3fa9c1/__x__/o")]
+        ),
+        label(TargetKind::Anon, "cell//:x"),
+        "the root package in the configuration form"
     );
 }
