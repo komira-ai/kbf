@@ -10,8 +10,9 @@ use crate::run_id::RunId;
 /// The longest tail kept of one log stream, after redaction.
 pub const TAIL_BYTES: usize = 16 * 1024;
 
-/// The longest command rendering kept, all of its strings together.
-pub const COMMAND_BYTES: usize = 16 * 1024;
+/// The longest command rendering kept, all of its strings together: the 4 KiB the
+/// design sizes the failed-run section on (ui-data.md 5.3).
+pub const COMMAND_BYTES: usize = 4 * 1024;
 
 /// A digest on the wire: the SHA-256 and the size in bytes.
 #[derive(Clone, PartialEq, Eq, Hash, prost::Message)]
@@ -779,6 +780,24 @@ mod tests {
         assert_eq!(t.total_bytes, log.len() as u64);
         assert_eq!(t.omitted(), TailOmitted::No);
         assert_eq!(Tail::of(b"short").bytes, b"short");
+    }
+
+    #[test]
+    fn a_command_rendering_is_bounded_at_four_kib() {
+        // Catches: a bound looser than the design's 4 KiB rendering (ui-data.md 5.3 and
+        // 4.2 size the failed-run section and its cost on it).
+        let mut c = CommandRendering {
+            argv: vec!["x".repeat(4 * 1024 + 1)],
+            ..CommandRendering::default()
+        };
+        c.bound();
+        assert!(c.truncated && c.argv.is_empty());
+        let mut fits = CommandRendering {
+            argv: vec!["x".repeat(4 * 1024)],
+            ..CommandRendering::default()
+        };
+        fits.bound();
+        assert!(!fits.truncated);
     }
 
     #[test]
