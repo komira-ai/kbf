@@ -5,7 +5,7 @@
 
 use kbf_state::conformance::{
     c1_linearizable_cas, c2_atomic_txn, c3_monotonic_counter, c4_store_clock_expiry,
-    c5_ordered_feed, c6_durable_ack, c7_group_commit, run_all,
+    c5_ordered_feed, c6_durable_ack, c7_group_commit, c8_bounded_range_scan, run_all,
 };
 use kbf_state::fake::{FakeBackend, Flaw};
 
@@ -62,6 +62,35 @@ fn ack_before_sync_fails_c6() {
 #[should_panic(expected = "C7 latency")]
 fn ungrouped_writes_fail_c7() {
     c7_group_commit(&FakeBackend::new(Flaw::Ungrouped));
+}
+
+// Catches a range scan that returns every key from its start, past its limit.
+#[test]
+#[should_panic(expected = "C8 limit")]
+fn a_scan_that_ignores_its_limit_fails_c8() {
+    c8_bounded_range_scan(&FakeBackend::new(Flaw::ScanIgnoresLimit));
+}
+
+// Catches a range scan that begins at the prefix whatever start key it is given.
+#[test]
+#[should_panic(expected = "C8 start")]
+fn a_scan_that_ignores_its_start_key_fails_c8() {
+    c8_bounded_range_scan(&FakeBackend::new(Flaw::ScanIgnoresStart));
+}
+
+// Catches a resume token that resumes at the last key of its page instead of after it,
+// so the key is returned twice.
+#[test]
+#[should_panic(expected = "C8 resume")]
+fn a_scan_that_resumes_at_its_token_fails_c8() {
+    c8_bounded_range_scan(&FakeBackend::new(Flaw::ScanResumesAtToken));
+}
+
+// Catches a range scan that runs past the last key under its prefix.
+#[test]
+#[should_panic(expected = "C8 prefix")]
+fn a_scan_past_its_prefix_fails_c8() {
+    c8_bounded_range_scan(&FakeBackend::new(Flaw::ScanPastPrefix));
 }
 
 // The two error types say what failed.

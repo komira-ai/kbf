@@ -27,6 +27,11 @@ pub(super) struct Statements {
     pub get: Statement,
     /// `$1` prefix, `$2` clock override: `key, value, version, expires_us`, in key order.
     pub scan: Statement,
+    /// `$1` prefix, `$2` clock override, `$3` first key, `$4` limit: `key, value,
+    /// version, expires_us` from `$3` on, in key order (C8).
+    pub scan_from: Statement,
+    /// The same after `$3`, not at it.
+    pub scan_after: Statement,
     /// `$1` clock override: the store's time.
     pub now: Statement,
     /// The commit head, read without a lock.
@@ -69,6 +74,13 @@ impl Statements {
                  ORDER BY key LIMIT $3 FOR UPDATE{tail}"
             )
         };
+        let range = |op: &str| {
+            format!(
+                "SELECT key, value, version, expires_us FROM kv \
+                 WHERE key {op} $3 AND starts_with(key, $1) \
+                 AND (expires_us IS NULL OR expires_us > {now}) ORDER BY key LIMIT $4"
+            )
+        };
         Ok(Statements {
             get: client.prepare(&format!(
                 "SELECT value, version, expires_us FROM kv WHERE key = $1 \
@@ -79,6 +91,8 @@ impl Statements {
                  WHERE key >= $1 AND starts_with(key, $1) \
                  AND (expires_us IS NULL OR expires_us > {now}) ORDER BY key"
             ))?,
+            scan_from: client.prepare(&range(">="))?,
+            scan_after: client.prepare(&range(">"))?,
             now: client.prepare(&format!("SELECT {}", now_sql(1)))?,
             head_read: client.prepare("SELECT rev FROM head")?,
             head_lock: client.prepare("SELECT rev FROM head FOR UPDATE")?,

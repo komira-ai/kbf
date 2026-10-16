@@ -33,6 +33,8 @@ mod session;
 mod tx;
 
 use std::fmt;
+use std::num::NonZeroUsize;
+use std::ops::Bound;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -45,10 +47,10 @@ use session::{Pool, Session};
 use tx::{Level, Row, Tx, micros};
 
 use crate::clock::{Clock, StoreTime};
-use crate::store::Store;
+use crate::store::{Lower, Store, page_of};
 use crate::{
-    Change, Changes, Commit, CommitStats, Conflict, Event, Revision, StoreError, Txn, Version,
-    Versioned,
+    Change, Changes, Commit, CommitStats, Conflict, Event, Revision, ScanPage, StoreError, Txn,
+    Version, Versioned,
 };
 
 /// The most times a batch is run again after a serialization failure.
@@ -504,6 +506,30 @@ impl Store for PostgresStore {
                 .map(|row| (row.get(0), versioned(&Row::from_row(row, 1))))
                 .collect())
         })
+    }
+
+    /// C8 in one statement, so the page is one snapshot of committed transactions. The
+    /// query asks for one row past the limit to learn whether a resume token is due.
+    fn scan_range(
+        &self,
+        prefix: &str,
+        start: Bound<&str>,
+        limit: NonZeroUsize,
+    ) -> Result<ScanPage, StoreError> {
+        let over = self.over();
+        let take = i64::try_from(limit.get().saturating_add(1)).unwrap_or(i64::MAX);
+        let rows = self.read(|s| {
+            let (statement, from) = match Lower::of(prefix, start) {
+                Lower::From(key) => (&s.st.scan_from, key),
+                Lower::After(key) => (&s.st.scan_after, key),
+            };
+            s.client.query(statement, &[&prefix, &over, &from, &take])
+        })?;
+        let rows = rows
+            .iter()
+            .map(|row| (row.get(0), versioned(&Row::from_row(row, 1))))
+            .collect();
+        Ok(page_of(rows, limit))
     }
 
     fn changes(&self, after: Revision, limit: usize) -> Result<Changes, StoreError> {

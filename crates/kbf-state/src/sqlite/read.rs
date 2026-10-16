@@ -1,12 +1,16 @@
 //! The read side: queries on a connection of their own, which in WAL mode never wait
 //! for the writer and never see a transaction that has not committed.
 
+use std::num::NonZeroUsize;
+use std::ops::Bound;
+
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehavior};
 
 use super::schema::{self, KIND_DELETE, KIND_PUT};
 use super::writer::{from_nanos, to_nanos, to_sql, uint};
 use crate::clock::StoreTime;
-use crate::types::{Change, Changes, Event, Revision, StoreError, Version, Versioned};
+use crate::store::{Lower, page_of};
+use crate::types::{Change, Changes, Event, Revision, ScanPage, StoreError, Version, Versioned};
 
 fn versioned(value: Vec<u8>, version: i64, expires: Option<i64>) -> Versioned {
     Versioned {
@@ -78,6 +82,45 @@ pub(super) fn scan_prefix(
         }
     }
     Ok(found)
+}
+
+/// C8 on one statement, so the page is read from one WAL snapshot. Expired rows are
+/// skipped in the loop, which reads up to one live row past the limit to learn whether a
+/// resume token is due.
+pub(super) fn scan_range(
+    conn: &Connection,
+    prefix: &str,
+    start: Bound<&str>,
+    limit: NonZeroUsize,
+    now: StoreTime,
+) -> Result<ScanPage, StoreError> {
+    let (sql, from) = match Lower::of(prefix, start) {
+        Lower::From(key) => (
+            "SELECT key, value, version, expires_at FROM kv WHERE key >= ?1 ORDER BY key",
+            key,
+        ),
+        Lower::After(key) => (
+            "SELECT key, value, version, expires_at FROM kv WHERE key > ?1 ORDER BY key",
+            key,
+        ),
+    };
+    let take = limit.get().saturating_add(1);
+    let mut statement = conn.prepare(sql)?;
+    let mut rows = statement.query([from])?;
+    let mut found = Vec::new();
+    while found.len() < take
+        && let Some(row) = rows.next()?
+    {
+        let key: String = row.get(0)?;
+        if !key.starts_with(prefix) {
+            break;
+        }
+        let expires: Option<i64> = row.get(3)?;
+        if is_live(expires, now) {
+            found.push((key, versioned(row.get(1)?, row.get(2)?, expires)));
+        }
+    }
+    Ok(page_of(found, limit))
 }
 
 pub(super) fn changes(

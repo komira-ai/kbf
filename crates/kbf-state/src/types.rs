@@ -1,6 +1,7 @@
 //! The values the state store trait speaks: versions, revisions, transactions, and the
 //! rows of the change feed.
 
+use std::ops::Bound;
 use std::time::Duration;
 
 use crate::clock::StoreTime;
@@ -248,4 +249,41 @@ pub struct CommitStats {
     pub txns: u64,
     /// Durable syncs (fsyncs) performed.
     pub syncs: u64,
+}
+
+/// Where a paged range scan resumes (C8): after the last key of the page that returned
+/// it. It is a key, not a position in a snapshot, so it stays valid across commits and
+/// restarts; a caller may carry it in a URL ([`ResumeToken::key`], [`ResumeToken::after`]).
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ResumeToken(String);
+
+impl ResumeToken {
+    /// The token that resumes a scan after `key`.
+    #[must_use]
+    pub fn after(key: impl Into<String>) -> ResumeToken {
+        ResumeToken(key.into())
+    }
+
+    /// The last key the page returned.
+    #[must_use]
+    pub fn key(&self) -> &str {
+        &self.0
+    }
+
+    /// The start bound to pass to [`crate::Store::scan_range`] for the next page: every
+    /// key after [`ResumeToken::key`], none at it.
+    #[must_use]
+    pub fn start(&self) -> Bound<&str> {
+        Bound::Excluded(&self.0)
+    }
+}
+
+/// A page of a bounded range scan (C8).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScanPage {
+    /// Live keys under the prefix from the start bound on, in key order, at most the limit.
+    pub rows: Vec<(String, Versioned)>,
+    /// Set when a live key under the prefix followed the last row when the page was read;
+    /// `None` when the page reached the end of the prefix.
+    pub resume: Option<ResumeToken>,
 }

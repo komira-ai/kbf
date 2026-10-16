@@ -6,25 +6,27 @@
 //! crash: it drops the live copy and reopens from the durable one. Group commit is
 //! visible in the clock: a batch costs one sync however many transactions it holds.
 //!
-//! [`Flaw`] names one deliberate defect per clause. A fake built with a flaw must fail
+//! [`Flaw`] names deliberate defects, at least one per clause. A fake built with a flaw must fail
 //! the clause it breaks, which is what proves the clause can fail.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::num::NonZeroUsize;
+use std::ops::Bound;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use crate::clock::{Clock, ManualClock, StoreTime};
 use crate::conformance::{Backend, C1_RACERS, RACE_KEY};
-use crate::store::Store;
+use crate::store::{Lower, Store, page_of};
 use crate::types::{
-    Change, Changes, Commit, CommitStats, Cond, Conflict, Event, Op, Revision, StoreError, Txn,
-    Version, Versioned,
+    Change, Changes, Commit, CommitStats, Cond, Conflict, Event, Op, Revision, ScanPage,
+    StoreError, Txn, Version, Versioned,
 };
 
 /// How much store time one durable sync takes on the fake.
 pub const FAKE_SYNC_COST: Duration = Duration::from_millis(2);
 
-/// A deliberate defect, one per clause the suite checks.
+/// A deliberate defect: at least one per clause the suite checks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Flaw {
     /// A correct store.
@@ -46,6 +48,15 @@ pub enum Flaw {
     AckBeforeSync,
     /// C7: every transaction pays its own sync, even inside a batch.
     Ungrouped,
+    /// C8: a range scan returns every key from its start, however small the limit.
+    ScanIgnoresLimit,
+    /// C8: a range scan begins at the prefix whatever start bound it is given.
+    ScanIgnoresStart,
+    /// C8: an excluded start bound is treated as included, so resuming from a token
+    /// returns the last key of the previous page again.
+    ScanResumesAtToken,
+    /// C8: a range scan runs on past the last key under its prefix.
+    ScanPastPrefix,
 }
 
 #[derive(Clone)]
@@ -399,6 +410,44 @@ impl Store for Fake {
             .filter(|(key, row)| key.starts_with(prefix) && row.alive(now))
             .map(|(key, row)| (key.clone(), row.versioned()))
             .collect())
+    }
+
+    fn scan_range(
+        &self,
+        prefix: &str,
+        start: Bound<&str>,
+        limit: NonZeroUsize,
+    ) -> Result<ScanPage, StoreError> {
+        let now = self.clock_now();
+        let lower = match (self.flaw, Lower::of(prefix, start)) {
+            (Flaw::ScanIgnoresStart, _) => Bound::Included(prefix),
+            (Flaw::ScanResumesAtToken, Lower::After(key)) | (_, Lower::From(key)) => {
+                Bound::Included(key)
+            }
+            (_, Lower::After(key)) => Bound::Excluded(key),
+        };
+        let take = if self.flaw == Flaw::ScanIgnoresLimit {
+            usize::MAX
+        } else {
+            limit.get().saturating_add(1)
+        };
+        let inner = lock(&self.inner);
+        let mut rows: Vec<(String, Versioned)> = Vec::new();
+        for (key, row) in inner.live.rows.range::<str, _>((lower, Bound::Unbounded)) {
+            if !key.starts_with(prefix) && self.flaw != Flaw::ScanPastPrefix {
+                break;
+            }
+            if rows.len() == take {
+                break;
+            }
+            if row.alive(now) {
+                rows.push((key.clone(), row.versioned()));
+            }
+        }
+        if self.flaw == Flaw::ScanIgnoresLimit {
+            return Ok(ScanPage { rows, resume: None });
+        }
+        Ok(page_of(rows, limit))
     }
 
     fn changes(&self, after: Revision, limit: usize) -> Result<Changes, StoreError> {
