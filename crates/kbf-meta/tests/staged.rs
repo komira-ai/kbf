@@ -553,8 +553,8 @@ fn stored_objects_lists_each_stored_object_of_an_entry_once_and_no_staged_one() 
 
 /// Catches an action-cache entry whose result's object is not held back for its
 /// closure's (architecture-v2 section 8: closure blobs flush before the entry), one held
-/// back for blobs the store already holds or that share its own object, and a wait that
-/// outlives the flush it waits for.
+/// back for blobs the store already holds or that share its own object, a wait that
+/// outlives the flush it waits for, and waits answered for an object never staged.
 #[test]
 fn a_result_object_waits_for_the_staged_objects_of_its_closure() {
     let mut m = tiered();
@@ -586,4 +586,9 @@ fn a_result_object_waits_for_the_staged_objects_of_its_closure() {
         Ok(())
     );
     assert_eq!(m.flush_waits(object(1)), BTreeSet::new());
+    assert_eq!(
+        m.flush_waits(object(99)),
+        BTreeSet::new(),
+        "an object never staged waits for none"
+    );
 }

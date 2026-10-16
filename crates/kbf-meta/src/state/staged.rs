@@ -64,9 +64,10 @@ impl MetaState {
             .filter(|(o, t)| *o != object && *t == tier)
             .map(|(o, _)| o)
             .collect();
-        if let Some(staged) = self.staged.get_mut(&object) {
-            staged.after.extend(after);
-        }
+        // `staged_at` found `object` staged.
+        self.staged
+            .entry(object)
+            .and_modify(|staged| staged.after.extend(after));
     }
 
     /// The object and tier `digest` is staged on, if its object is staged and not in

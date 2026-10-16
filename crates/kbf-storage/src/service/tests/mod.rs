@@ -881,6 +881,26 @@ async fn find_missing_refuses_a_call_over_the_digest_limit() {
     );
 }
 
+/// Catches a client that claims a streamed put it cannot make: the service has no
+/// streamed write to the object store, so `put_streamed` is refused as invalid (the
+/// caller then stores the blob with `put`), and nothing is stored.
+#[tokio::test]
+async fn a_streamed_put_is_refused_over_the_wire() {
+    let (_mem, remote, _) = pair().await;
+    let digest = sha(b"abc");
+    let bytes = stream::iter([Ok(Bytes::from_static(b"abc"))]).boxed();
+    let claim = Box::pin(async move { Some(digest) });
+    let refused = remote
+        .put_streamed(3, bytes, claim)
+        .await
+        .expect_err("no streamed put");
+    assert!(matches!(refused, StorageError::Invalid(_)), "{refused:?}");
+    assert_eq!(
+        remote.find_missing(&[digest]).await.expect("find"),
+        [digest]
+    );
+}
+
 /// Catches a limit that drifted from the front's (a test in kbf-server pins the front's
 /// to these): a full 16 MiB batch has to fit.
 #[test]

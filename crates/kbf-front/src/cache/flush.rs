@@ -606,6 +606,8 @@ mod tests {
             ),
             [(3, vec![]), (4, vec![]), (5, vec![]), (6, vec![])]
         );
+        // Nothing ready: 1 waits outside, and 2 through 1; neither is a cycle to break.
+        assert!(order(&[(1, &[9]), (2, &[1])], 4).is_empty());
     }
 
     /// Catches two objects whose entries were staged crosswise (each holds a result whose
