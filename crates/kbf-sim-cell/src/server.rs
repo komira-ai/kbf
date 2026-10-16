@@ -43,7 +43,7 @@ use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use kbf_daemon::FENCE_AFTER;
-use kbf_front::MetaLog;
+use kbf_front::{Described, MetaLog};
 use kbf_log::FarmLogId;
 use kbf_meta::{
     ActionAnswer, ActionRecord, Applied, Closure, Command, Epoch, MetaState, ObjectId, Retention,
@@ -51,6 +51,7 @@ use kbf_meta::{
 };
 use kbf_sched::{DaemonInstance, Event as SchedEvent, Input, OpState, Request, Scheduler};
 use kbf_server::RaftMetaLog;
+use kbf_server::action_usage::Subject;
 use kbf_server::machine::{FarmMachine, Sent, Waiter};
 use kbf_server::stamp::Stamp;
 use kbf_sim::{Event, NodeId, NodeInput, Output};
@@ -730,6 +731,9 @@ impl Up {
             kind: LeaseKind::Action,
             do_not_cache: false,
             queued: wall(now),
+            // The simulation's actions have no `Command`: the `action usage:` line is not
+            // what it checks.
+            usage: Subject::of(Described::default()).0,
         });
         self.callers.insert(waiter, from.clone());
         let event = SchedEvent::Submit {

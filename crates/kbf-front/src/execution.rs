@@ -99,9 +99,10 @@ use kbf_auth::AuthenticationMetadata;
 use kbf_invocation::{CallKind, ExecuteAnswer};
 
 use crate::cache::{Cache, CacheError};
+use crate::described::Described;
 use crate::meta_log::MetaLog;
 use crate::metrics::{CacheMetrics, OpenExecute};
-use crate::recorder::{ExecuteCall, Recorder, listing};
+use crate::recorder::{ActionLabel, ExecuteCall, Recorder, listing};
 use crate::request_metadata::CallMetadata;
 use crate::wire;
 
@@ -146,6 +147,9 @@ pub struct Submission {
     /// The call to record, with a recorder on and an invocation id: the dispatcher
     /// sends its [`ExecuteCall::answered`] events before it queues the request.
     pub call: Option<ExecuteCall>,
+    /// The action's argv, output paths and client label, for the server's `action
+    /// usage:` line only ([`Described`]).
+    pub described: Described,
 }
 
 /// Where an operation is, as its callers see it.
@@ -468,6 +472,7 @@ where
         let (mut submission, command) = self.submission(instance.clone(), action, window).await?;
         submission.call =
             ExecuteCall::new(&self.recorder, metadata, caller, &instance, action, command);
+        submission.described.label = ActionLabel::sent(metadata);
         let submitting = Instant::now();
         open.dispatching();
         let submitted = self.dispatch.submit(submission);
@@ -550,6 +555,8 @@ where
                 needs,
             },
             call: None,
+            // The Command is here: an absent one returned MISSING above.
+            described: command.map(Described::of).unwrap_or_default(),
         };
         Ok((submission, command_digest))
     }
