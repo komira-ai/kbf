@@ -936,6 +936,62 @@ async fn a_certificate_file_that_is_not_there_is_a_refused_start() {
     assert!(refused.to_string().contains("/no/such/ca.pem"), "{refused}");
 }
 
+/// Catches a client identity the transport refuses being swallowed or reported without
+/// the flag that caused it: a key file that holds no key is a refused start whose message
+/// names `--storage` and the URL (the files are read fine, the failure is the transport's).
+#[test]
+fn an_identity_the_transport_refuses_is_a_refused_start_naming_the_url() {
+    let pki = Pki::new("bad-identity");
+    let ca = pki.ca_file();
+    let cert = pki.write("not-a-cert.pem", "not a certificate\n".to_owned());
+    let key = pki.write("not-a-key.key", "not a key\n".to_owned());
+    let f = flags(&[
+        "--storage=https://localhost:8982",
+        &format!("--storage-client-cert={cert}"),
+        &format!("--storage-client-key={key}"),
+        &format!("--storage-ca={ca}"),
+    ])
+    .expect("parses");
+    let refused = start_frontend(&f, || Ok(pending::<()>()))
+        .err()
+        .expect("refused");
+    let text = refused.to_string();
+    assert!(
+        text.contains("--storage") && text.contains("https://localhost:8982"),
+        "{text}"
+    );
+}
+
+/// Catches a frontend whose `/metrics` route is not mounted or answers in another
+/// format: the API listener answers 200 in the Prometheus text format with a metric the
+/// backend renders.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_api_listener_serves_metrics_in_the_prometheus_text_format() {
+    let node = Node::start().await;
+    let front =
+        Front::start(&flags(&[&format!("--storage=http://{}", node.addr)]).expect("parses")).await;
+    let mut stream = TcpStream::connect(front.api)
+        .await
+        .expect("connect to the API");
+    stream
+        .write_all(b"GET /metrics HTTP/1.1\r\nHost: kbf\r\nConnection: close\r\n\r\n")
+        .await
+        .expect("send");
+    let mut response = String::new();
+    stream.read_to_string(&mut response).await.expect("read");
+    let (head, body) = response.split_once("\r\n\r\n").expect("a head and a body");
+    let lower = head.to_ascii_lowercase();
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert!(
+        lower.contains(&format!(
+            "content-type: {}",
+            kbf_server::metrics::TEXT_FORMAT.to_ascii_lowercase()
+        )),
+        "{head}"
+    );
+    assert!(body.contains("# TYPE "), "{body}");
+}
+
 /// Catches a `--reapi-tls-cert` and `--reapi-tls-key` that a frontend takes and does not
 /// serve (clients would find plain text where the flags promised TLS): the REAPI listener
 /// answers a health check over TLS for the certificate's name and does not answer in
