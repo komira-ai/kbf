@@ -32,10 +32,10 @@ Three limits an agent must know, each said again where it applies:
   cannot say the build passed: it says which of the actions it saw failed. buck2's own
   exit code is the build's result; a failure buck2 found without the farm (a parse
   error, a local action) is not in the record.
-- **Records do not survive a restart yet.** Until PRs 7 and 8 land (next after the
-  client and driver metrics, section 9), a server restart loses every record, and the
-  memory bound evicts idle ones (3.5); with the in-memory metadata log (tests only) a restart loses them
-  after that too, by design. An agent reads soon after its build. A record that is gone
+- **Records do not survive a restart yet.** Until history objects land (`ui-data.md`
+  5.2, phase U3, which supersedes PRs 7 and 8), a server restart loses every record, and
+  the memory bound evicts idle ones (3.5); with an in-memory object store (tests only) a
+  restart loses them after that too, by design. An agent reads soon after its build. A record that is gone
   answers `404` with a body that says whether the server could have held it (4.10).
 - **CPU and memory are `null` today** for every action a real driver ran (section 1);
   PR 11 fills them.
@@ -146,8 +146,10 @@ GET /v1/invocations/{id}/failures?page_size=20
   `command` are blob bytes, so they also need `blobs`: with `invocations` and no
   `blobs`, both are `null`, as the `href`s are.
 - **Paging**: 4.5's rules; `page_size` default 20, maximum 100. `next_page` is the link
-  of the next page, absent on the last. In stage 2 the root's failed-row positions
-  (3.5) give the rows without a scan of the chunks.
+  of the next page, absent on the last. Stage 2 of `invocations.md` 3.5 (a root blob
+  with failed-row positions) is superseded by `ui-data.md` 5.2: the `ichunk` index rows
+  give each chunk's failed count, and the failed-run section of each chunk with failures
+  gives the rows, so only those chunks are read (`ui-data.md` 5.2, 5.3, 5.5).
 
 ### 4.8 The client: `kbf build show`
 
@@ -247,7 +249,7 @@ runs. The requirement, landing with the client tokens of issue 227:
 
 ### 4.10 A record that is gone
 
-Until PRs 7 and 8 land, a restart loses every record and the memory bound evicts idle
+Until history objects land (`ui-data.md` U3, superseding PRs 7 and 8), a restart loses every record and the memory bound evicts idle
 ones (3.5): **an agent reads soon after its build.** The server cannot tell a lost id
 from one it never saw (in stage 1 it keeps nothing across a restart), so a "lost at
 restart" answer would be a guess. It answers `404`, on every route (4.1), with a body
@@ -267,12 +269,13 @@ lost; the agent reruns the build to see it again. The comparison is the agent's:
 knows when its build ended and the server does not, so the client prints the body and
 exits 3 in both cases.
 
-**The gap closes when PRs 7 and 8 land** (section 9, right after the client and the
-driver metrics). On the Raft metadata log a flushed record survives a restart and the
-memory bound no longer loses it (a flushed row leaves memory and is read from its chunk, 3.5): what a restart
-loses is each open invocation's unflushed window, and those invocations say
-`complete: false` (section 7), and minted one-action invocations, which are never
-flushed. `records_since` then is the oldest time the retention (3.6) still holds, and
-a `404` inside it means the farm saw no call with that id. On the in-memory metadata log (tests only) a
-restart still loses every record, by design (3.5), and `records_since` stays the
-server's start.
+**The gap closes with history objects** (`ui-data.md` 5.2 and its phase U3, which
+supersede PRs 7 and 8 and the Raft metadata log). A record flushed into an invocation
+chunk object survives a restart and the memory bound no longer loses it (a flushed row
+leaves memory and is read from its chunk, `ui-data.md` 5.5): what a restart
+loses is the history writer's queue and each open invocation's unflushed buffers, and
+those invocations say `complete: false` with `gap_from` (`ui-data.md` 5.2), and minted
+one-action invocations, which are never flushed. `records_since` then is the oldest time
+the history retention classes (`ui-data.md` 5.3) still hold, and a `404` inside it means
+the farm saw no call with that id. With an in-memory object store (tests only) a restart
+still loses every record, by design, and `records_since` stays the server's start.
