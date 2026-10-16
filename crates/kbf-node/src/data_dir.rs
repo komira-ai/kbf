@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 use kbf_threads::disk::{FreeSpace, Space, keep_free, percent_of};
 
 /// The default `--data-dir`.
-pub(crate) const DEFAULT_DATA_DIR: &str = "/var/lib/kbf";
+pub const DEFAULT_DATA_DIR: &str = "/var/lib/kbf";
 
 /// The mode of the data directory itself: the OCI backend's container root is a
 /// subordinate id, an "other" to the daemon's directories, and must search every

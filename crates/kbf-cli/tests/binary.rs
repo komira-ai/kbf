@@ -62,6 +62,66 @@ fn version_names_the_commit_built() {
     assert!(out.contains('+'), "{out}");
 }
 
+/// Catches a `kbf --version --json` that is not one JSON object on one line of stdout,
+/// that lacks or adds a field (a host reads these to check what it runs, so the set is
+/// the contract), that reports another commit or protocol than the libraries the binary
+/// links carry, or that calls a debug build a release (or the reverse).
+#[test]
+fn version_json_reports_the_build_identity() {
+    for argv in [["--version", "--json"], ["--json", "--version"]] {
+        let (code, out, err) = run(&argv);
+        assert_eq!(code, Some(0), "{argv:?}: {err}");
+        assert!(err.is_empty(), "{err}");
+        assert_eq!(out.lines().count(), 1, "{out}");
+        assert!(out.ends_with('\n'), "{out:?}");
+        let v: serde_json::Value = serde_json::from_str(&out).expect("one JSON value");
+        let fields: Vec<&str> = v
+            .as_object()
+            .expect("an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            fields,
+            [
+                "commit",
+                "min_protocol",
+                "profile",
+                "protocol",
+                "state_schema",
+                "version"
+            ],
+            "{out}"
+        );
+        assert_eq!(v["commit"], kbf_server::BUILD_COMMIT);
+        assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
+        let profile = if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        };
+        assert_eq!(v["profile"], profile);
+        assert_eq!(v["protocol"], kbf_server::worker::PROTOCOL_VERSION);
+        assert_eq!(
+            v["min_protocol"],
+            kbf_server::worker::OLDEST_PROTOCOL_VERSION
+        );
+        assert!(v["state_schema"].as_u64().is_some_and(|n| n >= 1), "{out}");
+    }
+}
+
+/// Catches `--json` taken as a flag of its own: without `--version` it is a usage error
+/// (exit 2, the flag named, nothing on stdout), so a typo never reads as the identity.
+#[test]
+fn json_alone_is_a_usage_error() {
+    for argv in [&["--json"][..], &["--json", "daemon"]] {
+        let (code, out, err) = run(argv);
+        assert_eq!(code, Some(2), "{argv:?}: {err}");
+        assert!(out.is_empty(), "{argv:?}: {out}");
+        assert!(err.contains("--json"), "{argv:?}: {err}");
+    }
+}
+
 /// Catches a built mode that takes a flag it does not have, or exits other than 2 for
 /// it.
 #[test]
@@ -256,8 +316,8 @@ fn check_args_exits_2_with_the_refusal_a_start_gets() {
         (&bogus, "unexpected argument '--bogus-flag'"),
         (&cold, "kbf daemon refuses --cold-store: "),
         (
-            &[kbf_cli::CHECK_ARGS, names::FRONTEND],
-            "kbf frontend: mode not built yet",
+            &[kbf_cli::CHECK_ARGS, names::STORAGE_AND_DAEMON],
+            "kbf storage-and-daemon: mode not built yet",
         ),
         (&help, "--help and --version print and exit 0"),
         (&[kbf_cli::CHECK_ARGS], "Usage: kbf"),

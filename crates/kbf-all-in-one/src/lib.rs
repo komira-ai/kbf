@@ -20,10 +20,13 @@
 //!
 //! Linux only, the container driver only: elsewhere [`main`] exits 2 saying so.
 //!
-//! Not done yet (the README lists it): a durable scheduler state, without which a restart
-//! loses every lease; the in-process plane's admission; the `--reserve-cpus` split
-//! between the halves; the simulation's in-process data plane; and the deploy shape,
-//! the ownership step and the unit.
+//! The scheduler's state is a SQLite file, `<data-dir>/state.db` unless `--state-store`
+//! names one ([`cli`]).
+//!
+//! Not done yet (the README lists it): the in-process plane's admission; the `--reserve-cpus` split
+//! between the halves; the whole-process
+//! crash simulation, the driver-panic test and the rest of the helper-dispatch tests;
+//! and the deploy shape, the ownership step and the unit.
 
 pub mod cli;
 mod intake;
