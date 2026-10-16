@@ -7,7 +7,7 @@ use std::time::Instant;
 
 use kbf_meta::ObjectId;
 use kbf_store::{FaultFs, Fs, FsFile};
-use kbf_tier::{TIER, TierError, TierId, WriteTier, block_name};
+use kbf_tier::{TIER, TierError, TierId, WriteTier, block_name, seg_name};
 
 use support::{
     Index, SEAL_AFTER, TIER as OURS, ack_group, ack_upload, blocks, bytes, len_of, open_tier,
@@ -372,4 +372,55 @@ fn clear_deletes_every_file_the_tier_writes_and_nothing_else() {
     let cut = fs.crash_reordered(0, 0);
     assert_eq!(cut.list().unwrap(), ["notes.txt"]);
     assert_eq!(kbf_tier::clear(&cut).unwrap(), Vec::<String>::new());
+}
+
+/// Catches a start without flushed copies keeping the copies an earlier run kept (a
+/// node switched to one cache would hold them, uncounted by the one cache, forever),
+/// counting them, or deleting a staged block with them: the copy is deleted and listed
+/// with the removed files; the staged block stays, readable and counted.
+#[test]
+fn a_start_without_flushed_copies_deletes_the_earlier_runs_copies() {
+    let fs = FaultFs::new();
+    let mut index = Index::default();
+    let now = Instant::now();
+    let (tier, _) = open_tier(&fs, 1, options(1 << 20, LIMIT), &index).unwrap();
+    let (flushed, _) = ack_group(&tier, &mut index, &bytes(1, 10), now).unwrap();
+    for object in tier.poll_seals(now + SEAL_AFTER) {
+        index.seal(object);
+        tier.sealed(object).unwrap();
+    }
+    tier.flushed(flushed).unwrap();
+    index.tiers.get_mut(&OURS).unwrap().remove(&flushed);
+    let staged = ack_upload(&tier, &mut index, &bytes(2, 6)).unwrap();
+    drop(tier);
+    assert!(fs.contents(&seg_name(flushed)).is_some());
+    let fs = fs.restart();
+    let options = options(1 << 20, LIMIT).without_flushed_copies();
+    let (tier, recovery) = open_tier(&fs, 2, options, &index).unwrap();
+    assert_eq!(fs.contents(&seg_name(flushed)), None);
+    assert_eq!(recovery.removed, [seg_name(flushed)]);
+    assert!(recovery.flushed.is_empty(), "{recovery:?}");
+    assert_eq!(tier.read(staged, 0, 6).unwrap(), bytes(2, 6));
+    let usage = tier.usage();
+    assert_eq!((usage.used, usage.flushed), (6, 0));
+    drop(tier);
+    // A copy that cannot be deleted (or, kept, measured) stops the start, whichever
+    // step fails.
+    fs.put(&seg_name(flushed), &bytes(1, 10));
+    for options in [options, opts()] {
+        let ops = {
+            let probe = fs.restart();
+            let start = probe.ops();
+            open_tier(&probe, 3, options, &index).unwrap();
+            probe.ops() - start
+        };
+        for op in 0..ops {
+            let attempt = fs.restart();
+            attempt.fail_at(attempt.ops() + op, kbf_store::Fault::Error);
+            let opened = open_tier(&attempt, 3, options, &index);
+            assert!(matches!(opened, Err(TierError::Io { .. })), "op {op}");
+        }
+    }
+    let (_, recovery) = open_tier(&fs.restart(), 3, opts(), &index).unwrap();
+    assert_eq!(recovery.flushed, [flushed], "a kept copy is listed");
 }

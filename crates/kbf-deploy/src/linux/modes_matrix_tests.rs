@@ -129,8 +129,12 @@ fn rows() -> Vec<Row> {
         },
         Row {
             rule: "state-store",
-            plant: |_, t| {
-                first_in_service(t, "Environment=KBF_STATE_STORE=postgres://kbf:pw@db/kbf")
+            plant: |m, t| {
+                t.replacen(
+                    &format!("/kbf {m}"),
+                    &format!("/kbf {m} --state-store=postgres://kbf@db/kbf"),
+                    1,
+                )
             },
             fails: ALL,
         },
@@ -150,8 +154,8 @@ fn rows() -> Vec<Row> {
 
 /// Catches a rule run on a mode it is not for (a storage unit's own key refused, a
 /// frontend asked to delegate) and one not run on a mode it is for (a build node given
-/// the key, a storage unit without its cold store or run as the builds' user, a state
-/// store password in any mode's unit).
+/// the key, a storage unit without its cold store or run as the builds' user, a
+/// Postgres state store in any mode's unit).
 #[test]
 fn each_rule_fails_exactly_the_modes_it_is_for() {
     let c = config();
@@ -172,10 +176,13 @@ fn each_rule_fails_exactly_the_modes_it_is_for() {
             }
             let r = check(&c, mode, &planted, true).expect("a unit");
             let got: Vec<&str> = r.failures.iter().map(|f| f.rule).collect();
-            let want: Vec<&str> = if row.fails.contains(&mode) {
-                vec![row.rule]
-            } else {
+            let want: Vec<&str> = if !row.fails.contains(&mode) {
                 Vec::new()
+            } else if row.rule == "state-store" && UNBUILT.contains(&mode) {
+                // A flag planted in a mode not built yet also trips `flags`.
+                vec!["flags", row.rule]
+            } else {
+                vec![row.rule]
             };
             if got != want {
                 wrong.push(format!("row {i} ({}) on {mode}: {:?}", row.rule, lines(&r)));
@@ -197,17 +204,14 @@ fn file(bits: u32, uid: u32, text: &str) -> Entry {
     }
 }
 
-/// A node with kbf installed, a key file `key` and a state store password file `state`; kbf
-/// refuses every command line (`check-args` exits 2) and `getent passwd kbf-server` is
-/// uid 990.
-fn node(key: Entry, state: Entry) -> FakeExec {
+/// A node with kbf installed, and a key file `key`; kbf refuses every command line
+/// (`check-args` exits 2) and `getent passwd kbf-server` is uid 990.
+fn node(key: Entry) -> FakeExec {
     let mut exec = FakeExec::new(0);
     let at = |p: &str| HostPath::new(p).expect("absolute");
     exec.entries
         .insert(at("/usr/local/bin/kbf"), file(0o755, 0, ""));
     exec.entries.insert(at("/etc/kbf/s3.env"), key);
-    exec.entries
-        .insert(at("/etc/kbf/state-store.password"), state);
     let asked = RefCell::new(Vec::new());
     exec.answer = Box::new(move |cmd: &Cmd| {
         asked.borrow_mut().push(cmd.to_string());
@@ -224,21 +228,9 @@ fn node(key: Entry, state: Entry) -> FakeExec {
     exec
 }
 
-/// `text`, the unit of `mode`, with a Postgres state store and its password file.
-fn state_in_postgres(mode: Mode, text: &str) -> String {
-    text.replacen(
-        &format!("/kbf {mode}"),
-        &format!(
-            "/kbf {mode} --state-store=postgres://kbf@db/kbf --state-store-password-file=/etc/kbf/state-store.password"
-        ),
-        1,
-    )
-}
-
 /// The rules that read the node, per mode: `parse` runs kbf only for a built mode;
 /// `credential` reads the key file's owner and mode only for the unit that holds it
-/// (a 0644 key or one another user owns fails storage, and only storage);
-/// `state-store` reads the mode of the state store's password file in every mode.
+/// (a 0644 key or one another user owns fails storage, and only storage).
 /// Catches each of these run on the wrong modes or on none.
 #[test]
 fn the_node_rules_read_the_node_for_exactly_the_modes_they_are_for() {
@@ -249,43 +241,20 @@ fn the_node_rules_read_the_node_for_exactly_the_modes_they_are_for() {
             .expect("renders")
             .slice,
     );
-    let state = "pw\n";
-    let cases: [(&str, Entry, Entry, &[Mode]); 4] = [
+    let cases: [(&str, Entry, &[Mode]); 3] = [
         (
             "parse",
             file(0o600, 990, ""),
-            file(0o600, 0, state),
             &[Mode::Storage, Mode::Daemon, Mode::AllInOne],
         ),
-        (
-            "credential",
-            file(0o640, 990, ""),
-            file(0o600, 0, state),
-            &[Mode::Storage],
-        ),
-        (
-            "credential",
-            file(0o600, 1000, ""),
-            file(0o600, 0, state),
-            &[Mode::Storage],
-        ),
-        (
-            "state-store",
-            file(0o600, 990, ""),
-            file(0o644, 990, state),
-            ALL,
-        ),
+        ("credential", file(0o640, 990, ""), &[Mode::Storage]),
+        ("credential", file(0o600, 1000, ""), &[Mode::Storage]),
     ];
     let mut wrong = Vec::new();
-    for (rule, key, state_file, fails) in cases {
-        let exec = node(key, state_file);
+    for (rule, key, fails) in cases {
+        let exec = node(key);
         for mode in Mode::ALL {
             let text = render(&c, Some(1500), mode).expect("renders");
-            let text = if rule == "state-store" {
-                state_in_postgres(mode, &text)
-            } else {
-                text
-            };
             let unit = UnitText::new(mode.unit_name(), text);
             let r = check_on_host(&exec, &c, mode, &unit, &slice, true, None).expect("runs");
             let hits = r.failures.iter().filter(|f| f.rule == rule).count();

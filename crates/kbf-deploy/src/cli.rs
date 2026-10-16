@@ -118,6 +118,10 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Kit {
+    /// The host side of a commit-confirm deploy: the releases under /usr/local/kbf and
+    /// the deploy state.
+    #[command(subcommand)]
+    Host(crate::host::Host),
     /// A MinIO for kbf: its buckets and key, and a NodePort for its S3 port.
     #[command(subcommand)]
     Minio(Minio),
@@ -545,6 +549,7 @@ pub fn run<E: Exec>(
         }
     };
     let result = match cli.kit {
+        Kit::Host(h) => return crate::host::run(h, out, err),
         Kit::Minio(Minio::Buckets(a)) => minio_buckets(a, exec, env, out),
         Kit::Minio(Minio::Nodeport(a)) => minio_nodeport(a, exec, out),
         Kit::Linux(l) => return linux_kit(l, exec, out, err),

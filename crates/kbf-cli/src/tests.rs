@@ -198,12 +198,14 @@ fn only_the_scheduling_modes_take_a_state_store() {
     let path = std::path::PathBuf::from("/var/lib/kbf/state.db");
     assert!(matches!(&both, Invocation::AllInOne(flags)
         if flags.server.state_store == Some(kbf_server::StateStoreUri::Sqlite(path.clone()))));
-    let postgres = with(BOTH, &["--state-store=postgres://db.example/kbf"]);
-    let both = parse_from(postgres).expect("all-in-one");
-    assert!(matches!(&both, Invocation::AllInOne(flags)
-        if matches!(flags.server.state_store, Some(kbf_server::StateStoreUri::Postgres(_)))));
+    // Only SQLite is wired; the refusal is fixed text, not the value.
+    let postgres = error(with(BOTH, &["--state-store=postgres://db.example/kbf"]));
+    assert!(postgres.contains("only sqlite:///"), "{postgres}");
+    let default = parse_from(with(BOTH, &[])).expect("all-in-one");
+    assert!(matches!(&default, Invocation::AllInOne(flags)
+        if matches!(flags.server.state_store, Some(kbf_server::StateStoreUri::Sqlite(_)))));
     let file = error(with(BOTH, &["--state-store=file:///var/lib/kbf"]));
-    assert!(file.contains("scheme \"file\""), "{file}");
+    assert!(file.contains("only sqlite:///"), "{file}");
     let daemon = refusal(with(DAEMON, &["--state-store=sqlite:///x.db"]));
     assert_eq!(daemon.kind(), ErrorKind::ArgumentConflict);
     assert!(
@@ -528,4 +530,70 @@ fn a_storage_node_has_no_state_store_flag() {
             "{flag}"
         );
     }
+}
+
+fn os(words: &[&str]) -> Vec<std::ffi::OsString> {
+    words.iter().map(Into::into).collect()
+}
+
+/// Catches `--version --json` read from a longer or shorter command line, from `--json`
+/// alone, or from a mode's own words: only the two words and nothing else ask for the
+/// identity, so a typo is a usage error and never an answer.
+#[test]
+fn only_version_and_json_ask_for_the_identity() {
+    for yes in [
+        ["kbf", "--version", "--json"],
+        ["kbf", "--json", "--version"],
+    ] {
+        assert!(version::asked(&os(&yes)), "{yes:?}");
+    }
+    for no in [
+        &["kbf"][..],
+        &["kbf", "--version"],
+        &["kbf", "--json"],
+        &["kbf", "--version", "--json", "extra"],
+        &["kbf", "--version", "--version"],
+        &["kbf", "--json", "--json"],
+        &["kbf", "daemon", "--json"],
+        &["kbf", "--version", "-json"],
+    ] {
+        assert!(!version::asked(&os(no)), "{no:?}");
+    }
+}
+
+/// An empty protocol range is a build error.
+const _: () =
+    assert!(kbf_server::worker::OLDEST_PROTOCOL_VERSION <= kbf_server::worker::PROTOCOL_VERSION);
+
+/// Catches an identity that reports a value other than the library's own (a commit, a
+/// protocol or a schema written down twice and drifting), two halves of the binary that
+/// speak different protocols (the one number reported would be wrong for one), a
+/// protocol range that is empty (the constant above), and a line that is not one object ending in one `\n`.
+#[test]
+fn the_identity_is_the_libraries_own_and_both_halves_speak_one_protocol() {
+    let v = version::identity();
+    assert_eq!(v["commit"], kbf_server::BUILD_COMMIT);
+    assert_eq!(v["protocol"], kbf_server::worker::PROTOCOL_VERSION);
+    assert_eq!(
+        v["protocol"],
+        kbf_daemon::PROTOCOL_VERSION,
+        "the daemon half of kbf speaks another protocol than the server half"
+    );
+    assert_eq!(
+        v["min_protocol"],
+        kbf_server::worker::OLDEST_PROTOCOL_VERSION
+    );
+    assert_eq!(v["state_schema"], kbf_state::sqlite::SCHEMA_VERSION);
+    assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
+    assert!(
+        ["debug", "release"].contains(&version::PROFILE),
+        "{}",
+        version::PROFILE
+    );
+    let line = version::line();
+    assert!(
+        line.ends_with("}\n") && line.matches('\n').count() == 1,
+        "{line:?}"
+    );
+    assert_eq!(serde_json::from_str::<serde_json::Value>(&line).unwrap(), v);
 }

@@ -17,13 +17,10 @@ MemorySwapMax=0
 OOMScoreAdjust=-925
 CPUWeight=300
 # TODO: the frontend's flags, once `kbf frontend` has them: its listen addresses,
-# the certificate flags, and the state store. The state store defaults to a SQLite file
-# beside the frontend's data, --state-store=sqlite://@KBF_DATA_DIR@/state.db (a single
-# frontend). A Postgres store is a postgres:// URI of a user, a host and a database,
-# with no password in it, and --state-store-password-file=@KBF_ETC@/state-store.password,
-# a file of mode 0600 that is @KBF_SERVER_USER@'s (or %d/NAME with LoadCredential=NAME:FILE):
-# this file and the command line are readable by every user, and systemd expands an
-# ${VAR} into the command line (check-units rule `state-store`).
+# the certificate flags, and the state store, a SQLite file beside the frontend's data:
+# --state-store=sqlite://@KBF_DATA_DIR@/state.db. SQLite is the only state store kbf opens;
+# check-units rule `state-store` fails any other scheme (postgres is not wired yet), a
+# relative path, and an ${VAR}, which systemd expands into the command line.
 # TODO(registration): the frontend's DNS name, the one address clients, daemons and
 # storage nodes know, and the storage map it pushes to them.
 ExecStart=@KBF_BIN_DIR@/kbf frontend

@@ -170,7 +170,7 @@ pub(super) fn on_host<E: Exec>(exec: &E, unit: &UnitFile, key: &Path) -> OnHost 
                         .push(format!("EnvironmentFile={f}, which sets {name}"));
                 }
             }
-            Ok(Some(Entry::Other)) => out.failures.push(format!(
+            Ok(Some(Entry::Link { .. } | Entry::Other)) => out.failures.push(format!(
                 "EnvironmentFile={f}, a link or special file the check does not follow \
                  (name the file itself)"
             )),

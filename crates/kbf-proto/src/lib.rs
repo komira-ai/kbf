@@ -1,5 +1,6 @@
 //! Generated protocol code: the Remote Execution API v2, the `kbf.worker.v1`
-//! server-daemon protocol, the `kbf.log.v1` replicated-log entries and the gRPC health
+//! server-daemon protocol, the `kbf.log.v1` replicated-log entries, the `kbf.map.v1`
+//! storage map (with its conversions to `kbf_map` types: `MapDecodeError`) and the gRPC health
 //! checking protocol (`grpc.health.v1`), compiled from `.proto` files by `build.rs`.
 //!
 //! Modules mirror the proto packages, because generated code names other packages by
@@ -59,6 +60,11 @@ pub mod kbf {
             tonic::include_proto!("kbf.log.v1");
         }
     }
+    pub mod map {
+        pub mod v1 {
+            tonic::include_proto!("kbf.map.v1");
+        }
+    }
     pub mod storage {
         /// The storage node's action-cache calls, beside the standard blob protocols.
         pub mod v1 {
@@ -80,5 +86,7 @@ pub use kbf::storage::v1 as storage;
 /// The `kbf.worker.v1` protocol, under a short name.
 pub use kbf::worker::v1 as worker;
 
+mod map;
+pub use map::MapDecodeError;
 mod usage;
 pub use usage::no_cgroup_fields;

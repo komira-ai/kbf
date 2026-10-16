@@ -1,0 +1,213 @@
+//! The host side of commit-confirm deploys: where a host keeps kbf's releases and
+//! kbf-deploy's own state, and the `host` verbs that read and change them.
+//!
+//! - [`layout`]: the paths: each release in its own directory under
+//!   `/usr/local/kbf/releases/<commit>/`, the `current` and `previous` links beside them,
+//!   kbf-deploy's state under `/var/lib/kbf-deploy/` and its settings under
+//!   `/etc/kbf-deploy/`.
+//! - [`state`]: `state.json` (the current, previous and staged commits, the one waiting
+//!   to be confirmed, and the order floor), read and written under an exclusive lock on
+//!   `/run/kbf-deploy.lock` and replaced whole by a rename.
+//! - [`CommitId`]: a commit as 40 lowercase hex characters, the only form a release is
+//!   named by.
+//!
+//! The verbs (`kbf-deploy host ...`):
+//!
+//! ```text
+//! kbf-deploy host status [--json] [--root DIR]
+//! ```
+//!
+//! `status` only reads: it prints the state and whether the `current` link points at
+//! the state's current release, and exits 0 when it does (or when there is neither), 1
+//! when it does not, or 2 refused (`REFUSED: ...` on stderr: a state file that cannot
+//! be read or parsed). `--root` names the directory the host's paths are under (`/` by
+//! default), such as a mounted image.
+
+pub mod layout;
+pub mod state;
+
+use std::fmt;
+use std::io::Write;
+use std::path::PathBuf;
+use std::process::ExitCode;
+
+use clap::{Args, Subcommand};
+use kbf_host::path::Root;
+use serde::{Deserialize, Serialize};
+
+use state::{CurrentLink, Status};
+
+/// A commit, as Git names it in full: exactly 40 lowercase hex characters. A release
+/// directory, a link target and the state name commits only in this form, so a short or
+/// upper-case id can never name a second copy of one release.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct CommitId(String);
+
+/// Why a string is not a [`CommitId`].
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("{0:?} is not a commit id (40 lowercase hex characters)")]
+pub struct NotACommit(pub String);
+
+impl CommitId {
+    pub fn new(id: &str) -> Result<CommitId, NotACommit> {
+        let hex = |b: u8| matches!(b, b'0'..=b'9' | b'a'..=b'f');
+        if id.len() == 40 && id.bytes().all(hex) {
+            Ok(CommitId(id.to_owned()))
+        } else {
+            Err(NotACommit(id.to_owned()))
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for CommitId {
+    type Error = NotACommit;
+
+    fn try_from(id: String) -> Result<CommitId, NotACommit> {
+        CommitId::new(&id)
+    }
+}
+
+impl From<CommitId> for String {
+    fn from(id: CommitId) -> String {
+        id.0
+    }
+}
+
+impl std::str::FromStr for CommitId {
+    type Err = NotACommit;
+
+    fn from_str(id: &str) -> Result<CommitId, NotACommit> {
+        CommitId::new(id)
+    }
+}
+
+impl fmt::Display for CommitId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// The `host` verbs of the `kbf-deploy` command line ([`crate::cli`]).
+#[derive(Subcommand)]
+pub enum Host {
+    /// Print the deploy state and whether the current link matches it. Only reads.
+    Status(StatusArgs),
+}
+
+#[derive(Args)]
+pub struct StatusArgs {
+    /// Print one JSON object instead of lines.
+    #[arg(long)]
+    json: bool,
+    /// The directory the host's paths are under, such as a mounted image.
+    #[arg(long, default_value = "/", value_parser = root)]
+    root: Root,
+}
+
+fn root(dir: &str) -> Result<Root, kbf_host::PathError> {
+    Root::new(PathBuf::from(dir))
+}
+
+/// Run a `host` verb: see the module docs for what each prints and its exit.
+pub fn run(verb: Host, out: &mut dyn Write, err: &mut dyn Write) -> ExitCode {
+    match verb {
+        Host::Status(a) => status(&a.root, a.json, out, err),
+    }
+}
+
+fn status(root: &Root, json: bool, out: &mut dyn Write, err: &mut dyn Write) -> ExitCode {
+    let status = match state::status(root) {
+        Ok(status) => status,
+        Err(e) => {
+            let _ = writeln!(err, "REFUSED: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    let text = if json {
+        format!("{}\n", status_json(&status))
+    } else {
+        status_lines(&status)
+    };
+    let _ = out.write_all(text.as_bytes());
+    ExitCode::from(u8::from(!status.link_matches()))
+}
+
+/// `none`, or the commit.
+struct Or<'a>(&'a Option<CommitId>);
+
+impl fmt::Display for Or<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            Some(c) => write!(f, "{c}"),
+            None => f.write_str("none"),
+        }
+    }
+}
+
+/// The lines `host status` prints.
+pub fn status_lines(status: &Status) -> String {
+    let s = &status.state;
+    let mut text = format!("state: {}", layout::STATE_FILE);
+    if !status.exists {
+        text.push_str(" (none yet)");
+    }
+    text.push_str(&format!(
+        "\ncurrent: {}\nprevious: {}\nstaged: {}\n",
+        Or(&s.current),
+        Or(&s.previous),
+        Or(&s.staged)
+    ));
+    match &s.pending_confirm {
+        Some(p) => text.push_str(&format!(
+            "pending confirm: {} by {} (unix seconds), else back to {}\n",
+            p.commit,
+            p.deadline,
+            Or(&p.previous)
+        )),
+        None => text.push_str("pending confirm: none\n"),
+    }
+    text.push_str(&format!("order floor: {}\n", s.order_floor));
+    let link = match &status.link {
+        CurrentLink::Missing => "missing".to_owned(),
+        CurrentLink::To(target) => target.display().to_string(),
+        CurrentLink::NotALink => "not a symbolic link".to_owned(),
+    };
+    let verdict = if status.link_matches() {
+        "matches the state".to_owned()
+    } else {
+        match &s.current {
+            Some(c) => format!("the state says {}", layout::release_link(c).display()),
+            None => "the state has no current release".to_owned(),
+        }
+    };
+    text.push_str(&format!("current link: {link} ({verdict})\n"));
+    text
+}
+
+/// The object `host status --json` prints.
+pub fn status_json(status: &Status) -> serde_json::Value {
+    let (kind, target) = match &status.link {
+        CurrentLink::Missing => ("missing", None),
+        CurrentLink::To(target) => ("link", Some(target.display().to_string())),
+        CurrentLink::NotALink => ("not_a_link", None),
+    };
+    serde_json::json!({
+        "schema": state::SCHEMA,
+        "state_file": layout::STATE_FILE,
+        "exists": status.exists,
+        "state": status.state,
+        "current_link": {
+            "kind": kind,
+            "target": target,
+            "matches_state": status.link_matches(),
+        },
+    })
+}
+
+#[cfg(test)]
+mod tests;
