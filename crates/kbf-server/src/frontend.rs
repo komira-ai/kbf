@@ -371,7 +371,7 @@ fn bind_frontend(
     let readiness = Arc::new(Readiness::default());
     let timeout = listeners.store_probe_timeout;
     let storage = Arc::new(RemoteStorage::new(channel.clone(), 0));
-    let state_store = state.as_ref().map(|state| Arc::clone(&state.store));
+    let state_store = store_of(state.as_ref());
     let checks = Arc::new(checks(
         Arc::clone(&readiness),
         storage.clone(),
@@ -520,6 +520,11 @@ fn bind_frontend(
     })
 }
 
+/// The store `/readyz` probes: the open state store's, if there is one.
+fn store_of(state: Option<&crate::StateStore>) -> Option<Arc<dyn kbf_state::Store>> {
+    state.map(|state| Arc::clone(&state.store))
+}
+
 /// `GET /metrics`: what the service counts, in the Prometheus text format.
 fn metrics_route(backend: Backend) -> axum::Router {
     let render = move || {
@@ -578,3 +583,6 @@ fn serve(flags: &FrontendFlags) -> Result<(), Box<dyn Error>> {
         Ok(frontend.serve().await?)
     })
 }
+
+#[cfg(test)]
+mod tests;
