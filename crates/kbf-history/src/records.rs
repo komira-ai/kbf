@@ -700,7 +700,8 @@ pub struct ChunkSummary {
     /// The writer.
     #[prost(uint64, tag = "2")]
     pub writer: u64,
-    /// The chunk's sequence among the writer's chunks of the invocation.
+    /// The chunk's sequence among every chunk its writer wrote in that life (one count
+    /// across invocations, so a writer never makes a key twice).
     #[prost(uint32, tag = "3")]
     pub seq: u32,
     /// What the chunk's `ichunk` row holds, but for the object's length and footer

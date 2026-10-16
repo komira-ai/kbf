@@ -142,7 +142,6 @@ struct Cut {
 #[derive(Debug, Default)]
 struct Inv {
     header: InvocationHeader,
-    next_chunk: u32,
     building: Building,
     slowest_execution: Vec<Slow>,
     slowest_wall: Vec<Slow>,
@@ -164,6 +163,10 @@ struct Core {
     minter: Arc<Minter>,
     queue: Arc<EventQueue>,
     limits: Limits,
+    /// The next chunk's sequence. One count for every invocation the writer writes, so
+    /// no chunk key or `ichunk` row is made twice in a writer's life, whatever it has
+    /// forgotten and reopened.
+    next_chunk: u32,
     invs: BTreeMap<InvKey, Inv>,
     ready: VecDeque<Cut>,
     /// Bytes in chunks not yet written: cut ones as encoded, building ones raw.
@@ -197,6 +200,7 @@ impl<O: ObjectStore> Writer<O> {
                 minter,
                 queue,
                 limits,
+                next_chunk: 0,
                 invs: BTreeMap::new(),
                 ready: VecDeque::new(),
                 held: 0,
@@ -478,10 +482,12 @@ impl Core {
     /// Encodes `inv`'s building chunk and queues it for its write.
     fn cut(&mut self, inv: &InvKey, now_ms: u64) {
         let writer = self.writer;
+        let seq = self.next_chunk;
+        // 2^32 chunks in one life: at the design's rates (about 100,000 a day) that is
+        // a century, so the wrap is never reached.
+        self.next_chunk = seq.wrapping_add(1);
         let state = self.state(inv);
         let b = std::mem::take(&mut state.building);
-        let seq = state.next_chunk;
-        state.next_chunk += 1;
         let day = b.day.unwrap_or(Day::from_ms(now_ms));
         let records = b.records();
         let raw = b.raw;

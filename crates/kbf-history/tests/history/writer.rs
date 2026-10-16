@@ -810,3 +810,63 @@ fn a_chunk_footer_carries_its_digest_table_and_slowest_runs() {
     assert_eq!(ids(&summary.slowest_execution), [ia.clone(), ib.clone()]);
     assert_eq!(ids(&summary.slowest_wall), [ib, ia]);
 }
+
+#[test]
+fn an_invocation_forgotten_and_seen_again_by_the_same_writer_keeps_both_chunks() {
+    // Catches: chunk keys numbered per invocation from 0, so a writer that forgot a
+    // closed invocation and then took a late record of it writes chunk 0 again: the
+    // write answers `AlreadyExists` (taken for a retry that landed), the new `ichunk`
+    // row fails `Absent` (taken for a row that is there), and the record is lost with
+    // no drop counted while the header counts it.
+    let mut life = Life::fresh(Limits::default());
+    let inv = InvRef::named("b1");
+    let first = life.run(&inv, T, "main", RunOutcome::Ok);
+    life.close(&inv);
+    life.step(T);
+    assert_eq!(
+        life.writer.open_invocations(),
+        0,
+        "the closed invocation is forgotten"
+    );
+    let late = life.run(&inv, T + 1_000, "main", RunOutcome::Ok);
+    life.step(T + 1_000);
+    life.step(T + 121_000);
+    assert_eq!(chunks(&life.objects).len(), 2);
+    assert_eq!(life.index.keys(ICHUNK).len(), 2);
+    let reader = life.reader();
+    for r in [&first, &late] {
+        let got = futures::executor::block_on(reader.run(r.run_id(), &all))
+            .unwrap()
+            .unwrap_or_else(|| panic!("{} did not resolve", r.run_id()));
+        assert_eq!(&got.run, r);
+    }
+    let got = futures::executor::block_on(reader.invocation(&inv.key, &all))
+        .unwrap()
+        .unwrap();
+    assert_eq!(got.runs, [first, late]);
+    assert_eq!((got.header.runs, got.header.chunks), (2, 2));
+    assert_eq!(life.writer.drops(), kbf_history::Drops::default());
+
+    // An open invocation forgotten as stale and seen again on a later day: the object
+    // key carries the day, the `ichunk` row key does not, so the rows must not collide.
+    let mut life = Life::fresh(Limits::default());
+    let before = T - 2 * 86_400_000;
+    let old = life.run(&inv, before, "main", RunOutcome::Ok);
+    life.step(before);
+    life.step(before + 120_000);
+    life.step(T);
+    assert_eq!(
+        life.writer.open_invocations(),
+        0,
+        "the stale invocation is forgotten"
+    );
+    let new = life.run(&inv, T, "main", RunOutcome::Ok);
+    life.step(T);
+    life.step(T + 120_000);
+    assert_eq!(life.index.keys(ICHUNK).len(), 2);
+    let reader = life.reader();
+    for r in [&old, &new] {
+        let got = futures::executor::block_on(reader.run(r.run_id(), &all)).unwrap();
+        assert_eq!(got.map(|v| v.run).as_ref(), Some(r));
+    }
+}
