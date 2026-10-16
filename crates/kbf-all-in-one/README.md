@@ -40,12 +40,18 @@ server's own code:
 
 - **Each output file, stdout and stderr, read once** (`intake`, `src/intake.rs`): the
   container driver reads each file once, one 1 MiB chunk at a time (its per-file memory
-  bound), and hands every chunk to the hasher and to the plane in that same pass. The
-  plane keeps the file's bytes and, once the file is hashed, puts it in a batch; a batch
-  of 32 MiB (or 16,384 files) is stored as below while the walk goes on, at most four at
-  once, and the rest when the walk ends, before the Directory messages and the Tree that
-  name them. A file is never read again. A file over the server's largest blob (1 GiB)
-  is not taken, and goes as a remote daemon's would.
+  bound), and hands every chunk to the hasher and to the plane in that same pass. A
+  file of 16 MiB or more is **streamed onto the write tier** (`LocalStore::stream`):
+  each chunk is written to a block of its own as it arrives, nothing of it held in
+  memory on either side, then checked (length, CRC-32C), asked FindMissing, and
+  committed as one `PutStaged`; the flusher checks its digest before the PUT. With no
+  hot store, or a full one, a file over 16 MiB (`kbf_front::MAX_UNSTAGED_BLOB_BYTES`)
+  is refused ("no write tier has room ...") rather than held in memory, as the server
+  refuses a remote daemon's. A file of at most 16 MiB is kept in memory and put in a
+  batch; a batch of 32 MiB (or 16,384 files) is stored as below while the walk goes
+  on, at most four at once, and the rest when the walk ends, before the Directory
+  messages and the Tree that name them. A file is never read again. A file over the
+  largest blob (5 GiB, the same on every path) is refused too.
 - **Outputs** (`put_records`): the driver's walk has hashed each file once. The plane asks the cache which digests it lacks, packs those records into the
   segments and uploads the transfer engine plans (`kbf_transfer::plan`), and gives the
   `Segments` handlers each range of their bytes, from the intake's buffers (or read
@@ -76,7 +82,13 @@ No message a remote daemon sends changes: `kbf-daemon` still uses the transfer e
   which answers as the keeper before it reads a flag and starts no server.
 - `tests/one_read.rs`: the container driver's output collection over a lease of the
   plane, with a write tier and without: an inotify watch counts the opens of each output
-  file, which must be one each, and every blob reads back as the file.
+  file, which must be one each (a file over 1 GiB too: held with a tier, refused for
+  want of one without), and every blob reads back as the file; a blob over 5 GiB is
+  refused with the server's message.
+- `tests/memory.rs`: a counting allocator over the whole in-process path (the walk,
+  the plane, the server's upload until its commit): a 2 GiB output streams onto the
+  write tier with under 16 MiB live, and so does a 2 GiB upload through the server's
+  `Segments` handlers (a remote daemon's path).
 - `src/plane_tests.rs`: a digest that does not parse, a server half whose runtime is
   gone, a file changed after the walk hashed it.
 - `src/intake_tests.rs`: batches sent while the walk goes on (by bytes and by file

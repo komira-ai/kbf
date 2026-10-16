@@ -49,7 +49,7 @@ use crate::wire::MAX_MESSAGE_BYTES;
 /// retried and falls back for at most this much, and the uploads committed before it
 /// stay committed: a cold upload of 14,244 outputs (300 MB) on a store that was busy
 /// lost every blob it had sent to one failed 1 GiB upload. Under kbf-server's smallest
-/// `--segment-upload-max-bytes` (one 1 GiB blob and its footer), so every server admits
+/// `--segment-upload-max-bytes` (one 5 GiB blob and its footer), so every server admits
 /// it. The server's PUT of a segment of this size is also one a slow store finishes
 /// within `min-put-rate` of `kbf-server --cold-store`.
 pub const SEGMENT_UPLOAD_BYTES: u64 = 32 << 20;
@@ -260,7 +260,8 @@ impl Scope {
             .await
     }
 
-    /// One upload, tried twice, then blob by blob.
+    /// One upload, tried twice, then blob by blob; not blob by blob when the server
+    /// refused it for want of room on its write tier (RESOURCE_EXHAUSTED).
     async fn upload_or_fall_back(&self, upload: &[Planned]) -> Result<(), CasError> {
         let inner = &self.inner;
         for attempt in 0..2 {
@@ -271,6 +272,16 @@ impl Scope {
                 Ok(()) => return Ok(()),
                 Err(Failed::Read(e)) => {
                     return Err(CasError::Read("outputs".to_owned(), e.to_string()));
+                }
+                // The server has no write tier with room for a record too large to
+                // hold in memory (`kbf_front::MAX_UNSTAGED_BLOB_BYTES`). Blob by blob,
+                // ByteStream would hold it whole, which is what the refusal prevents:
+                // the upload fails as it is.
+                Err(Failed::Call(status)) if status.code() == Code::ResourceExhausted => {
+                    return Err(CasError::Unavailable(
+                        "outputs".to_owned(),
+                        status.message().to_owned(),
+                    ));
                 }
                 Err(Failed::Call(status)) if status.code() == Code::Unimplemented => {
                     // Later uploads see the flag and do not ask; of uploads already in

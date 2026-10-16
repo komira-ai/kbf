@@ -62,10 +62,10 @@ use tokio::time::Instant;
 use tonic::{Request, Response, Status};
 
 pub use self::connection::{Connection, Connections, Tracked};
-use self::upload::{Declared, Held, Put, Receiving, advance, declare};
-use crate::cache::{Admitted, BuiltSegment, Cache};
+use self::upload::{Declared, Held, Put, Receiving, TierWrites, advance, declare};
+use crate::cache::{Admitted, BuiltSegment, Cache, TierRange};
 use crate::meta_log::MetaLog;
-use crate::{MAX_BLOB_BYTES, wire};
+use crate::{MAX_BLOB_BYTES, MAX_UNSTAGED_BLOB_BYTES, unstaged_refusal, wire};
 
 /// The most records one upload may hold: bounds `Begin`'s message (16,384 entries of
 /// 52 bytes, about 850 KiB) and the upload's one `PutBlobs`.
@@ -225,6 +225,33 @@ impl Upload {
     }
 }
 
+/// Writes the range of `bytes` at `offset`, which `put` recorded, to the write tier,
+/// off the runtime, and answers `writes` whether it did (if not, the range is forgotten
+/// at the next `PutRange` or `Commit`, so it can be sent again, and the call fails
+/// UNAVAILABLE). Nothing of the range is held once this answers.
+async fn write_to_tier(
+    range: Arc<TierRange>,
+    writes: Arc<TierWrites>,
+    offset: u64,
+    bytes: Vec<u8>,
+) -> Result<(), Status> {
+    let written = tokio::task::spawn_blocking(move || range.write(offset, &bytes))
+        .await
+        .map_err(shown)
+        .and_then(|written| written.map_err(shown));
+    writes.done(offset, written.is_ok());
+    written.map_err(|why| {
+        Status::unavailable(format!(
+            "the write tier did not take the range at {offset}: {why}"
+        ))
+    })
+}
+
+/// `e` as a message.
+fn shown(e: impl std::fmt::Display) -> String {
+    e.to_string()
+}
+
 /// Builds every received segment from what `Begin` declared and `PutRange` checked
 /// ([`Receiving::check`]), on the blocking pool: copying footers must not hold a runtime
 /// thread. A
@@ -372,12 +399,29 @@ impl<M: MetaLog, O: ObjectStore + 'static> Segments for SegmentsService<M, O> {
         };
         // With a write tier the daemon's digests are trusted here and checked by the
         // flusher before the PUT; without one, the only copy is the PUT, so each record
-        // is hashed as its bytes arrive.
+        // is hashed as its bytes arrive. With one, each segment's records are written
+        // to a range of their own on it as they arrive, if it has room (else held here).
         let trusted = self.shared.cache.write_tier().is_some();
-        let segments = declared
-            .iter()
-            .map(|d| Receiving::new(d, trusted))
-            .collect();
+        let mut segments = Vec::with_capacity(declared.len());
+        for d in &declared {
+            let range = if trusted & (d.records_len > 0) {
+                self.shared.cache.reserve_range(d.records_len).await
+            } else {
+                None
+            };
+            // A record held in memory until the commit must be small: memory is bounded
+            // per file, and without the tier there is no other way in yet.
+            let large = d
+                .entries
+                .iter()
+                .find(|e| e.digest.size_bytes > MAX_UNSTAGED_BLOB_BYTES);
+            if let (None, Some(large)) = (&range, large) {
+                return Err(Status::resource_exhausted(unstaged_refusal(
+                    &large.digest.to_string(),
+                )));
+            }
+            segments.push(Receiving::new(d, trusted, range));
+        }
         let (done, _) = watch::channel(None);
         let upload = Arc::new(Upload {
             owner,
@@ -417,7 +461,7 @@ impl<M: MetaLog, O: ObjectStore + 'static> Segments for SegmentsService<M, O> {
         let declared = upload.declared.get(index).ok_or_else(|| {
             Status::invalid_argument(format!("no segment {segment} in the upload"))
         })?;
-        let claimed = {
+        let (claimed, to_tier) = {
             let mut phase = lock(&upload.phase);
             match &mut *phase {
                 Phase::Receiving { segments, .. } => {
@@ -425,7 +469,8 @@ impl<M: MetaLog, O: ObjectStore + 'static> Segments for SegmentsService<M, O> {
                     if put == Put::Resent {
                         tracing::debug!(segment, offset, "resent range acknowledged, not written");
                     }
-                    claimed
+                    let to_tier = (put == Put::Written).then(|| segments[index].tier());
+                    (claimed, to_tier.flatten())
                 }
                 Phase::Committing | Phase::Done => {
                     return Err(Status::failed_precondition(
@@ -435,6 +480,9 @@ impl<M: MetaLog, O: ObjectStore + 'static> Segments for SegmentsService<M, O> {
                 Phase::Dropped => return Err(Status::not_found("the upload was dropped")),
             }
         };
+        if let Some((range, writes)) = to_tier {
+            write_to_tier(range, writes, offset, bytes).await?;
+        }
         if !claimed.is_empty() {
             // Hash what this range completed or extended, here and now, beside the
             // other ranges' own: the commit then has nothing left to hash. The task
@@ -464,7 +512,8 @@ impl<M: MetaLog, O: ObjectStore + 'static> Segments for SegmentsService<M, O> {
         upload.touch();
         {
             let mut phase = lock(&upload.phase);
-            if let Phase::Receiving { segments, .. } = &*phase {
+            if let Phase::Receiving { segments, .. } = &mut *phase {
+                segments.iter_mut().for_each(Receiving::forget_failed);
                 let missing = segments
                     .iter()
                     .zip(&upload.declared)

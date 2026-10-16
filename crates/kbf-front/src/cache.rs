@@ -815,6 +815,7 @@ fn unexpected(applied: &Applied) -> CacheError {
 mod batch;
 mod consistency;
 mod flush;
+mod stream;
 mod tier;
 mod touches;
 mod upload;
@@ -826,6 +827,8 @@ pub use consistency::{
     EVICT_BATCH, EvictReady, HeldObject, NEEDS_V3, PASS_OPENS_PER_SEC, PassReport,
 };
 pub use flush::{FLUSH_BACKOFF_FIRST, FLUSH_BACKOFF_MAX, FLUSHES_PER_ROUND, FlushRound};
+pub(crate) use stream::TierRange;
+pub use stream::{RecordStream, StreamedRecord};
 pub use tier::{TierStartError, TierStartup};
 pub use touches::TouchConfig;
 use touches::Touches;

@@ -71,7 +71,11 @@ pub struct Args {
     /// (5% of its size, at least 1 GiB, and never more than half of what is free), at
     /// most `--hot-store-max-bytes`; at the budget, writes
     /// take the direct path to the cold store. Without it, uploads go straight to the
-    /// cold store. The first start with a hot store raises the metadata log to machine
+    /// cold store. A daemon's outputs (a segment upload, or the in-process plane) are
+    /// written through to it as they arrive, so a large one is never held in memory;
+    /// without it, or when it has no room, a daemon's blob over 16 MiB
+    /// (`kbf_front::MAX_UNSTAGED_BLOB_BYTES`) is refused RESOURCE_EXHAUSTED rather than
+    /// held whole, until multipart cold-store PUTs exist. The first start with a hot store raises the metadata log to machine
     /// version 2, once; a binary that runs only version 1 no longer reads it.
     /// The metadata log lives in `<dir>/meta`, unless `--meta-dir` says otherwise.
     #[arg(long, value_name = "URI")]
@@ -232,12 +236,13 @@ pub struct Args {
     /// The most bytes, records and footers together, one segment upload on the worker
     /// listener may declare (`docs/design/write-path.md`, section 4.2). Ranges are held
     /// in memory until their upload commits, admitted under `--write-bytes-in-flight`
-    /// with every other upload: a `Begin` waits while that is spent. At least one 1 GiB
-    /// blob and its footer (1 GiB + 1 MiB), so any blob the cache accepts can be
-    /// uploaded, and at most `--write-bytes-in-flight`, so any legal `Begin` can be
-    /// admitted; the server refuses to start otherwise. At most 4 GiB - 1
-    /// (`kbf_front::MAX_ADMISSION_BYTES`), the most one admission counts, so a `Begin`
-    /// never holds more than it is counted for under the bound.
+    /// with every other upload: a `Begin` waits while that is spent. At least one 5 GiB
+    /// blob (the largest, `kbf_front::MAX_BLOB_BYTES`) and its footer (5 GiB + 1 MiB),
+    /// so any blob the cache accepts can be uploaded, and at most
+    /// `--write-bytes-in-flight`, so any legal `Begin` can be admitted; the server
+    /// refuses to start otherwise. At most `kbf_front::MAX_ADMISSION_BYTES`, the most
+    /// one admission counts, so a `Begin` never holds more than it is counted for under
+    /// the bound.
     #[arg(
         long,
         value_name = "BYTES",
@@ -268,8 +273,9 @@ pub struct Args {
     /// The most bytes uploads may hold at once. A ByteStream Write is admitted for its
     /// blob's size before it reads past its first message, a BatchUpdateBlobs for its
     /// total, a segment upload's Begin for its whole length; a caller over the bound
-    /// waits, nothing is refused for load. At least the largest blob (1 GiB), so one
-    /// can always be admitted, and at least `--segment-upload-max-bytes`. Not covered: each HTTP/2
+    /// waits, nothing is refused for load. At least the largest blob (5 GiB), so one
+    /// can always be admitted, and at least `--segment-upload-max-bytes` (by default
+    /// 5 GiB + 1 MiB, under the default 6 GiB). Not covered: each HTTP/2
     /// stream's message as tonic decodes it, before the handler runs, up to 17 MiB per
     /// stream (about 3.4 GiB for 200 streams) and 200 streams per connection on either listener
     /// (`kbf_front::MAX_CONCURRENT_STREAMS`).
@@ -761,7 +767,7 @@ mod tests {
     }
 
     /// Catches a `--segment-upload-*` flag that does not reach the listeners, a default
-    /// other than the design's (1 GiB + 1 MiB, 60 s), and a cap below one largest blob
+    /// other than the design's (5 GiB + 1 MiB, 60 s), and a cap below one largest blob
     /// and its footer accepted (a `Begin` for such a blob would be refused for good).
     #[test]
     fn segment_upload_flags_reach_the_listeners() {
@@ -769,20 +775,20 @@ mod tests {
             .listeners()
             .expect("listeners");
         assert_eq!(defaults.segments, kbf_front::SegmentsConfig::DEFAULT);
-        assert_eq!(defaults.segments.max_bytes, (1 << 30) + (1 << 20));
+        assert_eq!(defaults.segments.max_bytes, (5 << 30) + (1 << 20));
         assert_eq!(defaults.segments.idle, std::time::Duration::from_secs(60));
         let set = Args::parse_from([
             "kbf-server",
-            "--segment-upload-max-bytes=2147483648",
+            "--segment-upload-max-bytes=6442450944",
             "--segment-upload-idle-secs=5",
         ])
         .listeners()
         .expect("listeners");
-        assert_eq!(set.segments.max_bytes, 1 << 31);
+        assert_eq!(set.segments.max_bytes, 6 << 30);
         assert_eq!(set.segments.idle, std::time::Duration::from_secs(5));
         let below = format!(
             "--segment-upload-max-bytes={}",
-            (1u64 << 30) + (1 << 20) - 1
+            (5u64 << 30) + (1 << 20) - 1
         );
         for refused in [below.as_str(), "--segment-upload-idle-secs=0"] {
             assert!(
@@ -818,27 +824,24 @@ mod tests {
     }
 
     /// Catches a server that starts with a `--segment-upload-max-bytes` larger than one
-    /// admission counts (mutant: the flag's upper limit removed). `Cache::admit` takes at
-    /// most `kbf_front::MAX_ADMISSION_BYTES` (4 GiB - 1) for one call, so an 8 GiB
-    /// `Begin` under a 16 GiB bound would hold 8 GiB of ranges while counting 4 GiB, and
-    /// other uploads could push what is held past the bound. A cap of exactly the most
-    /// one admission counts starts; one byte more is refused, however large the bound.
+    /// admission counts (mutant: the flag's upper limit removed). `Cache::admit` counts
+    /// at most `kbf_front::MAX_ADMISSION_BYTES` (what its semaphore holds) for one call;
+    /// a `Begin` over it would hold more ranges than it is counted for. A cap of exactly
+    /// the most one admission counts starts; one byte more is refused.
     #[test]
     fn a_segment_upload_cap_over_one_admission_is_refused() {
-        let bound = format!("--write-bytes-in-flight={}", 16u64 << 30);
-        let cap = |cap: u64| format!("--segment-upload-max-bytes={cap}");
         let most = kbf_front::MAX_ADMISSION_BYTES;
+        let bound = format!("--write-bytes-in-flight={most}");
+        let cap = |cap: u64| format!("--segment-upload-max-bytes={cap}");
         Args::try_parse_from(["kbf-server", &cap(most), &bound])
             .expect("a cap one admission counts in full")
             .listeners()
             .expect("under the bound");
-        for over in [most + 1, 8u64 << 30] {
-            let refused = Args::try_parse_from(["kbf-server", &cap(over), &bound])
-                .map(drop)
-                .expect_err("a cap over one admission");
-            let message = refused.to_string();
-            assert!(message.contains("--segment-upload-max-bytes"), "{message}");
-        }
+        let refused = Args::try_parse_from(["kbf-server", &cap(most + 1), &bound])
+            .map(drop)
+            .expect_err("a cap over one admission");
+        let message = refused.to_string();
+        assert!(message.contains("--segment-upload-max-bytes"), "{message}");
     }
 
     /// Catches the input-tree flags not reaching the config, a zero where the check

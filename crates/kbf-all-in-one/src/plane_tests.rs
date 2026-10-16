@@ -123,3 +123,37 @@ fn a_file_changed_after_the_walk_is_not_stored() {
         assert!(fetch(&plane, &asked[0]).await.is_err());
     });
 }
+
+/// Catches a blob too large to hold gathered whole in memory without a write tier
+/// (mutant: the size check dropped, the whole-body put kept for it): `put_chunks` of a
+/// blob one byte over `MAX_UNSTAGED_BLOB_BYTES` is refused before a chunk is read, with
+/// the reason; one of a few bytes is gathered and stored, and one whose bytes are not
+/// its digest's is refused as corrupt.
+#[test]
+fn put_chunks_refuses_a_large_blob_and_stores_a_small_one() {
+    let server = server();
+    let plane = plane(&server);
+    server.block_on(async {
+        let large = Digest {
+            hash: "00".repeat(32),
+            size_bytes: i64::try_from(MAX_UNSTAGED_BLOB_BYTES + 1).expect("size"),
+        };
+        let never: Chunks = Box::pin(futures::stream::once(async {
+            panic!("a chunk of a refused blob was read")
+        }));
+        let why = plane.put_chunks(large, never).await.expect_err("refused");
+        assert!(why.to_string().contains("no write tier has room"), "{why}");
+        let small = digest_of(b"small");
+        let chunks: Chunks = Box::pin(futures::stream::iter([
+            Ok(b"sma".to_vec()),
+            Ok(b"ll".to_vec()),
+        ]));
+        assert_eq!(plane.put_chunks(small.clone(), chunks).await, Ok(small));
+        let chunks: Chunks = Box::pin(futures::stream::iter([Ok(b"other".to_vec())]));
+        let wrong = plane.put_chunks(digest_of(b"small!"), chunks).await;
+        assert!(matches!(wrong, Err(CasError::Corrupt(..))), "{wrong:?}");
+        let failing: Chunks = Box::pin(futures::stream::iter([Err(std::io::Error::other("gone"))]));
+        let read = plane.put_chunks(digest_of(b"x"), failing).await;
+        assert!(matches!(read, Err(CasError::Read(..))), "{read:?}");
+    });
+}

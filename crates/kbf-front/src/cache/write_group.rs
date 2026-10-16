@@ -50,10 +50,12 @@ pub const PUT_BACKOFF: Duration = Duration::from_millis(100);
 /// How much longer each wait between PUT attempts is than the one before.
 pub const PUT_BACKOFF_FACTOR: u32 = 4;
 
-/// The most bytes one [`Cache::admit`] call takes and counts: a semaphore hands out at
-/// most `u32::MAX` permits at once. A caller asking for more holds more memory than the
-/// bound counts, so `kbf-server` refuses a `--segment-upload-max-bytes` over this.
-pub const MAX_ADMISSION_BYTES: u64 = u32::MAX as u64;
+/// The most bytes one [`Cache::admit`] call takes and counts: what the semaphore holds.
+/// One call may ask for more than the `u32::MAX` permits a semaphore hands out at once
+/// (a 5 GiB blob's upload does): it takes them in parts, one such call at a time, and
+/// counts them all. A caller asking for more than this holds more memory than the
+/// bound counts, so `kbf-server` refuses a `--segment-upload-max-bytes` over it.
+pub const MAX_ADMISSION_BYTES: u64 = Semaphore::MAX_PERMITS as u64;
 
 /// The most HTTP/2 streams one connection may have open on either of the server's
 /// listeners. A `BatchUpdateBlobs` request is decoded (up to
@@ -104,11 +106,12 @@ pub struct WriteConfig {
 
 impl WriteConfig {
     /// The defaults of `docs/design/write-path.md`: a 2 ms linger, own segments from
-    /// 16 MiB, 2 GiB admitted, 4 PUTs in flight, 3 attempts per PUT, 4 hashing jobs.
+    /// 16 MiB, 6 GiB admitted (one upload of the largest blob, 5 GiB, and room beside
+    /// it), 4 PUTs in flight, 3 attempts per PUT, 4 hashing jobs.
     pub const DEFAULT: Self = Self {
         linger: Duration::from_millis(2),
         own_segment_bytes: 16 << 20,
-        bytes_in_flight: 2 << 30,
+        bytes_in_flight: 6 << 30,
         puts_in_flight: NonZeroUsize::MIN.saturating_add(3),
         put_attempts: NonZeroU32::MIN.saturating_add(2),
         cpu_threads: NonZeroUsize::MIN.saturating_add(3),
@@ -127,15 +130,15 @@ impl Default for WriteConfig {
 /// admits nothing.
 #[derive(Clone, Debug, Default)]
 pub struct Admitted {
-    /// Held for its drop, which releases the bytes.
-    _permit: Option<Arc<OwnedSemaphorePermit>>,
+    /// Held for their drop, which releases the bytes.
+    _permits: Arc<Vec<OwnedSemaphorePermit>>,
 }
 
 #[cfg(test)]
 impl Admitted {
     /// Holding nothing: for unit tests of what an admission only keeps alive.
     pub(crate) fn nothing() -> Self {
-        Self { _permit: None }
+        Self::default()
     }
 }
 
@@ -146,6 +149,8 @@ pub(super) struct Group {
     /// What [`Cache::admit`] takes, in bytes; the bound clamped to what a semaphore holds.
     admission: Arc<Semaphore>,
     bound: u64,
+    /// Held by an admission taken in parts (over `u32::MAX` bytes).
+    large: tokio::sync::Mutex<()>,
     puts: Semaphore,
     /// Record hashing, off the runtime workers.
     pub(super) hashing: HashPool,
@@ -210,6 +215,7 @@ impl Group {
             // `bound` is at most `MAX_PERMITS`, a `usize`.
             admission: Arc::new(Semaphore::new(bound as usize)),
             bound,
+            large: tokio::sync::Mutex::new(()),
             puts: Semaphore::new(config.puts_in_flight.get()),
             hashing: HashPool::new(config.cpu_threads),
             state: Mutex::new(State::default()),
@@ -267,7 +273,7 @@ pub(super) struct Writer<M, O> {
     /// Shared with the write tier, which numbers its blocks' objects from it too.
     pub(super) next_seq: Arc<AtomicU64>,
     /// The local write tier, once [`Cache::attach_tier`] attached one.
-    pub(super) tier: OnceLock<Staging>,
+    pub(super) tier: OnceLock<Arc<Staging>>,
 }
 
 impl<M, O> Writer<M, O> {
@@ -310,17 +316,27 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
     }
 
     /// Waits until `bytes` more fit under [`WriteConfig::bytes_in_flight`] and takes
-    /// them. A call asking for more than the bound, or than [`MAX_ADMISSION_BYTES`],
-    /// takes and counts only that much. Nothing is refused: a caller over the bound waits.
+    /// them. A call asking for more than the bound takes and counts only that much.
+    /// Nothing is refused: a caller over the bound waits. A call over `u32::MAX` bytes
+    /// takes them in parts, holding the lock of such calls, so two of them never each
+    /// hold a part the other waits for.
     pub async fn admit(&self, bytes: u64) -> Admitted {
-        let n = bytes.min(self.group.bound).min(MAX_ADMISSION_BYTES);
-        let n = u32::try_from(n).unwrap_or(u32::MAX);
-        let permit = Arc::clone(&self.group.admission)
-            .acquire_many_owned(n)
-            .await
-            .ok();
+        let mut left = bytes.min(self.group.bound);
+        let _large = if left > u64::from(u32::MAX) {
+            Some(self.group.large.lock().await)
+        } else {
+            None
+        };
+        let mut permits = Vec::new();
+        while left > 0 {
+            let part = u32::try_from(left).unwrap_or(u32::MAX);
+            left -= u64::from(part);
+            // The semaphore is never closed.
+            let permit = Arc::clone(&self.group.admission).acquire_many_owned(part);
+            permits.extend(permit.await.ok());
+        }
         Admitted {
-            _permit: permit.map(Arc::new),
+            _permits: Arc::new(permits),
         }
     }
 

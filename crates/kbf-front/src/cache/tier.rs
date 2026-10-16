@@ -221,7 +221,10 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
                 .await?;
         }
         // A cache takes one tier: attached before it stores anything, and only once.
-        let _ = self.writer.tier.set(Staging::new(Arc::new(opened), tier));
+        let _ = self
+            .writer
+            .tier
+            .set(Arc::new(Staging::new(Arc::new(opened), tier)));
         let startup = TierStartup {
             tier,
             registered: current.is_none(),
@@ -388,11 +391,31 @@ impl<M: MetaLog, O: ObjectStore> Writer<M, O> {
             }
         };
         let at = |e: &IndexEntry| (e.digest, synced.offset() + e.offset);
+        let blobs = footer.entries().iter().map(at).collect();
+        self.put_staged(staging, synced, blobs, own).await?;
+        Ok(true)
+    }
+
+    /// Commits one `PutStaged` for `blobs` (each at its offset in the block) in the
+    /// synced range `synced`, sealing its block with the commit when `seal` (a block
+    /// of its own), and answers the range committed.
+    ///
+    /// # Errors
+    ///
+    /// The commit failed. The range is answered as failed unless the committed state
+    /// shows the commit applied anyway (`answer_lost_put`).
+    pub(super) async fn put_staged(
+        &self,
+        staging: &Staging,
+        synced: Synced,
+        blobs: Vec<(Digest, u64)>,
+        seal: bool,
+    ) -> Result<(), CacheError> {
         let put = StagedPut {
             object: synced.object(),
             end: synced.end(),
-            seal: own,
-            blobs: footer.entries().iter().map(at).collect(),
+            seal,
+            blobs,
         };
         let command = Command::PutStaged {
             tier: staging.id,
@@ -409,7 +432,7 @@ impl<M: MetaLog, O: ObjectStore> Writer<M, O> {
             Applied::Staged(Ok(_)) => {
                 staging.tier.committed(synced);
                 staging.counters.staged.add(1);
-                Ok(true)
+                Ok(())
             }
             other => Err(unexpected(&other)),
         }

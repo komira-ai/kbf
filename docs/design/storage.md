@@ -188,7 +188,7 @@ store:
    upload with a blob in it is acknowledged after that; a segment that fails answers
    its own blobs with its error and no others.
 
-Uploads are admitted under `--write-bytes-in-flight` (2 GiB) before they buffer, and
+Uploads are admitted under `--write-bytes-in-flight` (6 GiB) before they buffer, and
 at most `--write-puts-in-flight` (4) segment PUTs run at once.
 
 **Planned** ([write-path.md](write-path.md)): daemon uploads of an action's outputs as
@@ -204,7 +204,7 @@ partial resume; a broken stream starts again from 0. `QueryWriteStatus` reports 
 blob's full size once it is durable and 0 before, never bytes a live stream has merely
 buffered. An upload of a blob already durable is answered at once. Until chunked
 uploads exist, a ByteStream write is held in memory until verified, so blobs over
-1 GiB (`MAX_BLOB_BYTES`) are refused before any byte is buffered. Batch calls carry at
+5 GiB (`MAX_BLOB_BYTES`, S3's single-PUT limit) are refused before any byte is buffered. Batch calls carry at
 most 16 MiB of blob data (`MAX_BATCH_TOTAL_BYTES`; the gRPC message limit is 17 MiB).
 
 Object keys are `<prefix>cas/<epoch>/<seq>`, each as 16 lowercase hex digits. Two

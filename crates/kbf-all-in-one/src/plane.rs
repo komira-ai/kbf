@@ -32,14 +32,15 @@ use std::future::Future;
 use std::sync::Arc;
 
 use futures::{StreamExt as _, TryStreamExt as _, future, stream};
+use kbf_front::{MAX_UNSTAGED_BLOB_BYTES, unstaged_refusal};
 use kbf_proto::reapi::Digest;
 use kbf_proto::worker::segments_server::Segments;
 use kbf_proto::worker::{BeginRequest, CommitRequest, PutRangeRequest, UploadSegment};
 use kbf_segments::MAX_SEGMENT_BYTES;
 use kbf_server::LocalStore;
 use kbf_transfer::{
-    Cas, CasError, DEFAULT_SEGMENT_UPLOADS, Intake, MAX_RANGE_BYTES, MAX_UPLOAD_RECORDS, Planned,
-    Record, SEGMENT_UPLOAD_BYTES, label, plan, proto_digest, read_pieces,
+    Cas, CasError, Chunks, DEFAULT_SEGMENT_UPLOADS, Intake, MAX_RANGE_BYTES, MAX_UPLOAD_RECORDS,
+    Planned, Record, SEGMENT_UPLOAD_BYTES, label, plan, proto_digest, read_pieces,
 };
 use kbf_types::{DigestFunction, LeaseId};
 use tokio::runtime::Handle;
@@ -74,6 +75,11 @@ impl LocalDataPlane {
     /// The server half's runtime.
     pub(crate) fn server(&self) -> &Handle {
         &self.server
+    }
+
+    /// The server half's store.
+    pub(crate) fn store(&self) -> &LocalStore {
+        &self.store
     }
 
     /// Runs `call` on the server half's runtime and returns its answer; UNAVAILABLE when
@@ -183,6 +189,27 @@ impl Cas for LocalDataPlane {
             Ok(digest) => Ok(proto_digest(&digest)),
             Err(status) => Err(CasError::Unavailable(blob, status.message().to_owned())),
         }
+    }
+
+    /// A blob over [`MAX_UNSTAGED_BLOB_BYTES`] is refused before a chunk is read: it
+    /// would be gathered whole in memory (a log the intake did not take, for want of
+    /// room on a write tier). A smaller one is gathered and stored by [`Cas::put`].
+    async fn put_chunks(&self, digest: Digest, mut chunks: Chunks) -> Result<Digest, CasError> {
+        let blob = label(&digest);
+        if u64::try_from(digest.size_bytes).unwrap_or(u64::MAX) > MAX_UNSTAGED_BLOB_BYTES {
+            let why = unstaged_refusal(&blob);
+            return Err(CasError::Unavailable(blob, why));
+        }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = chunks.next().await {
+            let chunk = chunk.map_err(|e| CasError::Read(blob.clone(), e.to_string()))?;
+            bytes.extend_from_slice(&chunk);
+        }
+        let stored = self.put(bytes).await?;
+        if stored != digest {
+            return Err(CasError::Corrupt(blob, label(&stored)));
+        }
+        Ok(stored)
     }
 
     async fn missing(&self, digests: &[Digest]) -> Vec<Digest> {

@@ -273,6 +273,7 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
             body: Bytes::from(body),
             entries,
             verified: true,
+            staged: None,
         };
         self.store_upload(vec![sound]).await.map(drop)
     }

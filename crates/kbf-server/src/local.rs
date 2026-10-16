@@ -12,6 +12,11 @@
 //! does not match; without one each record is hashed as its ranges arrive. Nothing here
 //! skips a check the listener's path makes.
 //!
+//! One call has no remote counterpart: a record streamed onto the write tier as its
+//! bytes are read ([`LocalStore::stream`], over `kbf_front::RecordStream`), so a large
+//! output is never held in memory on its way into the cache. Its digest is trusted at
+//! the commit as a segment upload's is with a tier, and checked by the flusher.
+//!
 //! Not here yet: admission. The worker listener admits every remote call by the
 //! daemon's certificate and the deny list; a local call is admitted by nothing.
 
@@ -19,7 +24,8 @@ use std::sync::Arc;
 
 use futures::future::BoxFuture;
 use kbf_front::{
-    Cache, CacheError, Connections, MetaLog, SegmentsConfig, SegmentsService, VerifiedBlob,
+    Cache, CacheError, Connections, MetaLog, RecordStream, SegmentsConfig, SegmentsService,
+    StreamedRecord, VerifiedBlob,
 };
 use kbf_objstore::ObjectStore;
 use kbf_proto::worker::segments_server::Segments;
@@ -38,6 +44,72 @@ trait Blobs: Send + Sync {
     fn read_blob<'a>(&'a self, digest: &'a Digest) -> Answer<'a, Vec<u8>>;
     fn put(&self, bytes: Vec<u8>) -> Answer<'_, Digest>;
     fn segments(&self) -> Arc<dyn Segments>;
+    fn stream(&self, size: u64) -> Option<LocalStream>;
+}
+
+/// [`LocalStream`]'s calls over a cache of any metadata log and object store.
+trait Streaming: Send {
+    fn append(&mut self, chunk: &[u8]) -> Result<(), CacheError>;
+    fn finish(self: Box<Self>, digest: Digest, crc32c: u32) -> Result<LocalStreamed, CacheError>;
+}
+
+/// [`LocalStreamed`]'s calls.
+trait Streamed: Send {
+    fn commit(self: Box<Self>) -> Answer<'static, ()>;
+}
+
+impl<M: MetaLog, O: ObjectStore + 'static> Streaming for RecordStream<M, O> {
+    fn append(&mut self, chunk: &[u8]) -> Result<(), CacheError> {
+        RecordStream::append(self, chunk)
+    }
+
+    fn finish(self: Box<Self>, digest: Digest, crc32c: u32) -> Result<LocalStreamed, CacheError> {
+        let streamed = RecordStream::finish(*self, digest, crc32c)?;
+        Ok(LocalStreamed(Box::new(streamed)))
+    }
+}
+
+impl<M: MetaLog, O: ObjectStore + 'static> Streamed for StreamedRecord<M, O> {
+    fn commit(self: Box<Self>) -> Answer<'static, ()> {
+        Box::pin(StreamedRecord::commit(*self))
+    }
+}
+
+/// One record being streamed onto the server's write tier ([`LocalStore::stream`]).
+/// Dropped before it is committed, nothing is stored.
+pub struct LocalStream(Box<dyn Streaming>);
+
+impl LocalStream {
+    /// Writes `chunk` after the bytes written so far. Blocking: call it off the async
+    /// runtime.
+    ///
+    /// # Errors
+    /// More bytes than the stream was made for, or the write tier failed.
+    pub fn append(&mut self, chunk: &[u8]) -> Result<(), CacheError> {
+        self.0.append(chunk)
+    }
+
+    /// Ends the stream as the blob `digest` with CRC-32C `crc32c`.
+    ///
+    /// # Errors
+    /// The bytes written are not as many as `digest` names, or their CRC-32C is not
+    /// `crc32c`: nothing is stored.
+    pub fn finish(self, digest: Digest, crc32c: u32) -> Result<LocalStreamed, CacheError> {
+        self.0.finish(digest, crc32c)
+    }
+}
+
+/// A record whose bytes are on the write tier, checked, not yet committed.
+pub struct LocalStreamed(Box<dyn Streamed>);
+
+impl LocalStreamed {
+    /// Syncs the record and commits it: present once this answers.
+    ///
+    /// # Errors
+    /// The write tier's sync or the metadata log's commit failed.
+    pub async fn commit(self) -> Result<(), CacheError> {
+        self.0.commit().await
+    }
 }
 
 type Answer<'a, T> = BoxFuture<'a, Result<T, CacheError>>;
@@ -66,6 +138,11 @@ impl<M: MetaLog, O: ObjectStore + 'static> Blobs for Over<M, O> {
             let stored = self.cache.store_admitted(vec![blob], admitted).await;
             stored.map(|()| digest)
         })
+    }
+
+    fn stream(&self, size: u64) -> Option<LocalStream> {
+        let stream = self.cache.stream(size)?;
+        Some(LocalStream(Box::new(stream)))
     }
 
     fn segments(&self) -> Arc<dyn Segments> {
@@ -117,6 +194,16 @@ impl LocalStore {
     /// log failed.
     pub async fn put(&self, bytes: Vec<u8>) -> Result<Digest, CacheError> {
         self.inner.put(bytes).await
+    }
+
+    /// A stream for one blob of `size` bytes onto the write tier, in a block of its own,
+    /// its bytes written as they are appended and never held here; `None` without a
+    /// write tier, when the tier has no room for it, or for a size of 0 or over the
+    /// largest blob (`kbf_front::MAX_BLOB_BYTES`). Blocking: call it off the async
+    /// runtime.
+    #[must_use]
+    pub fn stream(&self, size: u64) -> Option<LocalStream> {
+        self.inner.stream(size)
     }
 
     /// A `Segments` service of its own over the cache: the one a remote upload's calls

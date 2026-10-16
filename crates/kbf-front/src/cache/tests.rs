@@ -21,7 +21,7 @@ fn only_blobs_over_the_largest_are_refused() {
     match refuse_oversized(&[claiming(3), over.clone()]) {
         Err(CacheError::Invalid(why)) => {
             assert!(why.contains(&over.digest.to_string()), "{why}");
-            assert!(why.contains("(1073741824 bytes)"), "{why}");
+            assert!(why.contains("(5368709120 bytes)"), "{why}");
         }
         other => panic!("{other:?}"),
     }

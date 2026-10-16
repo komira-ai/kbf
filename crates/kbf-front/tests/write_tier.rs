@@ -8,6 +8,8 @@
 //! comment names the defect it is there to catch.
 
 mod common;
+#[path = "write_tier/stream.rs"]
+mod stream;
 #[path = "write_tier/support.rs"]
 mod support;
 

@@ -511,3 +511,96 @@ async fn a_segment_the_tier_does_not_take_is_hashed_before_its_put() {
         );
     }
 }
+
+/// Catches a large record held whole in memory when the write tier has no room for it
+/// (mutant: the whole-body fallback kept for it): at the tier's budget, a `Begin`
+/// declaring a record one byte over `MAX_UNSTAGED_BLOB_BYTES` is refused
+/// RESOURCE_EXHAUSTED with the reason; one declaring records of at most that size is
+/// admitted (held in memory, as before).
+#[tokio::test]
+async fn a_large_record_a_full_tier_cannot_take_is_refused() {
+    let farm = Farm::new(Capabilities::default());
+    let (_cache, service) = serve(farm.start(10_000).await);
+    let over = kbf_front::MAX_UNSTAGED_BLOB_BYTES + 1;
+    let entry = kbf_segments::IndexEntry {
+        digest: Digest::new(kbf_types::DigestFunction::Sha256, [5; 32], over),
+        offset: 0,
+        crc32c: 0,
+    };
+    let large = UploadSegment {
+        length: over + kbf_segments::layout::footer_len(1),
+        footer: kbf_segments::layout::encode_footer(over, &[entry]),
+    };
+    let refused = service
+        .begin(tonic::Request::new(BeginRequest {
+            segments: vec![large],
+        }))
+        .await
+        .expect_err("refused");
+    assert_eq!(refused.code(), Code::ResourceExhausted, "{refused:?}");
+    assert!(
+        refused.message().contains("no write tier has room")
+            && refused.message().contains("16777216"),
+        "{refused:?}"
+    );
+    let all = blobs(1, 2, 4096);
+    upload(&service, &[seg(&all)]).await.expect("small records");
+}
+
+/// Catches a range the write tier failed to write taken for received (the commit would
+/// stage bytes that are not there), or a failed write that cannot be sent again: with
+/// the tier's write failing once, the `PutRange` fails UNAVAILABLE and the commit
+/// refuses the record as not wholly received; the same range sent again to a new upload
+/// is written and the upload commits, its blobs read back.
+#[tokio::test]
+async fn a_range_the_tier_failed_to_write_is_not_received() {
+    let farm = Farm::new(Capabilities::default());
+    let (cache, service) = serve(farm.start(GIB).await);
+    let all = blobs(1, 2, 4096);
+    let s = seg(&all);
+    let begin = || BeginRequest {
+        segments: vec![UploadSegment {
+            length: s.length,
+            footer: s.footer.clone(),
+        }],
+    };
+    let upload = service
+        .begin(Request::new(begin()))
+        .await
+        .expect("begun")
+        .into_inner()
+        .upload;
+    let open = format!("{service:?}");
+    assert!(
+        open.contains("TierRange"),
+        "the records go to the tier: {open}"
+    );
+    // The next filesystem call is the range's write.
+    farm.fs.fail_at(farm.fs.ops(), kbf_store::Fault::Error);
+    let put = PutRangeRequest {
+        upload,
+        segment: 0,
+        offset: 0,
+        bytes: s.records.clone(),
+    };
+    let failed = service
+        .put_range(Request::new(put))
+        .await
+        .expect_err("not written");
+    assert_eq!(failed.code(), Code::Unavailable, "{failed:?}");
+    assert!(failed.message().contains("write tier"), "{failed:?}");
+    let refused = service
+        .commit(Request::new(CommitRequest { upload }))
+        .await
+        .expect_err("nothing received");
+    assert_eq!(refused.code(), Code::FailedPrecondition, "{refused:?}");
+    upload_and_read(&cache, &service, &all, &[s]).await;
+}
+
+/// Uploads `segs` and checks every one of `all` reads back.
+async fn upload_and_read(cache: &TierCache, service: &Service, all: &[TestBlob], segs: &[Seg]) {
+    upload(service, segs).await.expect("committed");
+    for b in all {
+        assert_eq!(cache.read_blob(&b.digest).await.expect("read"), b.bytes);
+    }
+}

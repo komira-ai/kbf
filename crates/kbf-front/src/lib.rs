@@ -74,8 +74,8 @@ pub use crate::cache::{
     Admitted, BATCH_READS_IN_FLIGHT, CONNECTION_WINDOW_BYTES, Cache, CacheError, EVICT_BATCH,
     EvictReady, FLUSH_BACKOFF_FIRST, FLUSH_BACKOFF_MAX, FLUSHES_PER_ROUND, FlushRound, HeldObject,
     MAX_ADMISSION_BYTES, MAX_CONCURRENT_STREAMS, NEEDS_V3, PASS_OPENS_PER_SEC, PUT_BACKOFF,
-    PUT_BACKOFF_FACTOR, PassReport, STREAM_WINDOW_BYTES, TierStartError, TierStartup, TouchConfig,
-    VerifiedBlob, WriteConfig,
+    PUT_BACKOFF_FACTOR, PassReport, RecordStream, STREAM_WINDOW_BYTES, StreamedRecord,
+    TierStartError, TierStartup, TouchConfig, VerifiedBlob, WriteConfig,
 };
 pub use crate::capabilities::{CapabilitiesService, server_capabilities};
 pub use crate::cas::CasService;
@@ -112,12 +112,35 @@ pub const MAX_BATCH_TOTAL_BYTES: usize = 16 << 20;
 /// for the digests and statuses around it.
 pub const MAX_MESSAGE_BYTES: usize = MAX_BATCH_TOTAL_BYTES + (1 << 20);
 
-/// The largest blob the cache accepts. A ByteStream Write is held in memory until it
-/// is verified, so without a cap a client could make the front buffer whatever size
-/// its resource name claims. Chunked uploads (planned,
-/// `docs/design/storage.md#segments`) come later and will stream larger blobs instead;
-/// until then anything bigger is refused before a byte is buffered.
-pub const MAX_BLOB_BYTES: u64 = 1 << 30;
+/// The largest blob the cache accepts, on every path (ByteStream, a batch, a segment
+/// upload, the in-process plane's stream): 5 GiB, S3's limit for one PUT, so the write
+/// tier's flusher can still PUT a block holding one such blob in one request. A
+/// ByteStream Write and a remote segment upload are held in memory until they are
+/// verified or committed, so without a cap a client could make the front buffer
+/// whatever size it claims; anything bigger is refused before a byte is buffered.
+pub const MAX_BLOB_BYTES: u64 = 5 << 30;
+
+/// The largest blob a daemon's data plane may store without a write tier to stream it
+/// onto: 16 MiB. A segment upload (the remote plane) or the in-process plane's store
+/// that would have to hold a larger record whole in memory until its commit, because
+/// the server has no hot store or the tier has no room for it, is refused
+/// ([`unstaged_refusal`], RESOURCE_EXHAUSTED) rather than buffered: memory stays bounded
+/// per file. 16 MiB is where the write group already writes a blob as a segment of its
+/// own (`--write-own-segment-bytes`), four PutRange messages, and well under the 32 MiB
+/// upload a daemon batches small files into, so small outputs keep the in-memory path
+/// unchanged. Until multipart object-store PUTs exist, larger blobs need the hot store.
+pub const MAX_UNSTAGED_BLOB_BYTES: u64 = 16 << 20;
+
+/// Why the blob `blob` (its digest), over [`MAX_UNSTAGED_BLOB_BYTES`], is refused: no
+/// write tier has room for it, and it is not held in memory instead.
+#[must_use]
+pub fn unstaged_refusal(blob: &str) -> String {
+    format!(
+        "{blob} is over {MAX_UNSTAGED_BLOB_BYTES} bytes and no write tier has room for it: \
+         a blob that large is stored only by streaming it onto the hot store (--hot-store), \
+         until multipart object-store puts exist"
+    )
+}
 
 /// The most data in one ByteStream `ReadResponse`.
 pub const READ_CHUNK_BYTES: usize = 1 << 20;

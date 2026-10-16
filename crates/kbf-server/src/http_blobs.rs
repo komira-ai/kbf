@@ -53,9 +53,9 @@ use tonic::{Code, Status};
 pub const INLINE_MAX_BYTES: u64 = 4 * 1024 * 1024;
 
 /// The most blob bytes the route holds at once, over all the answers it is reading
-/// or sending: 1 GiB, [`kbf_front::MAX_BLOB_BYTES`], so the largest blob the cache accepts can
-/// always be served when nothing else is.
-pub const READ_BUDGET_BYTES: usize = 1 << 30;
+/// or sending: 5 GiB, [`kbf_front::MAX_BLOB_BYTES`], so the largest blob the cache accepts
+/// can always be served when nothing else is.
+pub const READ_BUDGET_BYTES: usize = 5 << 30;
 
 /// How long a read waits in line for its share of [`READ_BUDGET_BYTES`] before it is
 /// answered `503`: 10 seconds.
@@ -117,6 +117,10 @@ struct BlobState<M, O> {
     budget: Arc<Semaphore>,
     /// The whole budget in bytes: the largest blob a read is admitted for.
     largest: u64,
+    /// Held by a read admitted in parts (a blob over `u32::MAX` bytes, more than a
+    /// semaphore hands out at once), so two such reads never each hold a part the
+    /// other waits for.
+    large: tokio::sync::Mutex<()>,
 }
 
 impl<M, O> BlobState<M, O> {
@@ -128,6 +132,7 @@ impl<M, O> BlobState<M, O> {
             readers,
             budget: Arc::new(Semaphore::new(budget)),
             largest: u64::try_from(budget).unwrap_or(u64::MAX),
+            large: tokio::sync::Mutex::new(()),
         }
     }
 }
@@ -136,7 +141,7 @@ impl<M, O> BlobState<M, O> {
 /// shares them.
 struct Held {
     bytes: Bytes,
-    _permit: OwnedSemaphorePermit,
+    _permit: [OwnedSemaphorePermit; 2],
 }
 
 impl AsRef<[u8]> for Held {
@@ -208,7 +213,7 @@ where
         );
         return Err(error(StatusCode::BAD_REQUEST, &why));
     }
-    let permit = admit(Arc::clone(&state.budget), state.largest, &digest).await?;
+    let permit = admit(&state.budget, &state.large, state.largest, &digest).await?;
     let bytes = state
         .cache
         .read_blob(&digest)
@@ -231,14 +236,13 @@ where
 /// `503` with `Retry-After` and `"busy": true` when the share is not free within
 /// [`READ_BUDGET_WAIT`].
 async fn admit(
-    budget: Arc<Semaphore>,
+    budget: &Arc<Semaphore>,
+    large: &tokio::sync::Mutex<()>,
     largest: u64,
     digest: &Digest,
-) -> Result<OwnedSemaphorePermit, Response> {
-    let Some(permits) = u32::try_from(digest.size_bytes)
-        .ok()
-        .filter(|&n| u64::from(n) <= largest)
-    else {
+) -> Result<[OwnedSemaphorePermit; 2], Response> {
+    let size = digest.size_bytes;
+    if size > largest {
         // INVARIANT: the cache holds no blob over MAX_BLOB_BYTES (the route's
         // `largest`). `Cache::store_blobs`, the one way bytes are stored, refuses one;
         // ByteStream Write refuses it before buffering and batches are capped at
@@ -248,11 +252,24 @@ async fn admit(
              ({largest} bytes), so it is not held"
         );
         return Err(error(StatusCode::NOT_FOUND, &why));
+    }
+    let first = u32::try_from(size).unwrap_or(u32::MAX);
+    let rest = u32::try_from(size - u64::from(first)).unwrap_or(u32::MAX);
+    let acquire = async {
+        let _large = if rest > 0 {
+            Some(large.lock().await)
+        } else {
+            None
+        };
+        // Two permits, not one merged: a permit counts at most `u32::MAX`.
+        let first = Arc::clone(budget).acquire_many_owned(first).await.ok()?;
+        let rest = Arc::clone(budget).acquire_many_owned(rest).await.ok()?;
+        Some([first, rest])
     };
-    tokio::time::timeout(READ_BUDGET_WAIT, budget.acquire_many_owned(permits))
+    tokio::time::timeout(READ_BUDGET_WAIT, acquire)
         .await
         .ok()
-        .and_then(Result::ok)
+        .flatten()
         .ok_or_else(|| busy(digest))
 }
 

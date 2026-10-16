@@ -468,3 +468,24 @@ async fn a_blob_of_exactly_the_budget_is_served_and_one_byte_more_is_404() {
     );
     assert_eq!(asked.elapsed(), Duration::ZERO);
 }
+
+/// Catches a read over the `u32::MAX` permits a semaphore hands out at once admitted
+/// for less than its size (a 4 GiB + 1 MiB blob counted as 4 GiB): it takes every byte
+/// of its size from the budget, in two parts.
+#[tokio::test]
+async fn a_read_over_4_gib_is_admitted_for_all_its_bytes() {
+    let budget = Arc::new(Semaphore::new(READ_BUDGET_BYTES));
+    let large = tokio::sync::Mutex::new(());
+    let size = (4u64 << 30) + (1 << 20);
+    let digest = Digest::new(DigestFunction::Sha256, [9; 32], size);
+    let permit = admit(&budget, &large, READ_BUDGET_BYTES as u64, &digest)
+        .await
+        .map_err(|_| "refused")
+        .expect("admitted");
+    let held: usize = permit.iter().map(OwnedSemaphorePermit::num_permits).sum();
+    assert_eq!(held as u64, size);
+    assert_eq!(
+        (READ_BUDGET_BYTES - budget.available_permits()) as u64,
+        size
+    );
+}
