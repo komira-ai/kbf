@@ -499,11 +499,13 @@ by a ByteStream Write"), and the transfer engine sends that upload's records blo
 blob by ByteStream at once (no second attempt), whose `Write` of a blob over 16 MiB
 streams it to the store (section 3.2), whatever its size. The in-process plane does the
 same: a file over 16 MiB with no tier, or no room on it, streams straight to the store as
-the walk reads it (`LocalStore::put_streamed`, over `Cache::store_streamed_claimed`: a
-bounded queue of the walk's chunks, hashed as they pass, the digest claimed when the walk
-finishes the file and checked before the store completes the upload), and an upload its
-`Begin` sends back is stored record by record (`kbf_transfer::put_each`), a large one
-streamed the same way. No record is refused for its size on any plane. 16 MiB is where
+the walk reads it (`Cache::stream`, which answers a `RecordStream` to the store when the
+tier is missing or full: a bounded queue of the walk's chunks into
+`Cache::store_streamed_claimed`, hashed as they pass, the digest claimed at
+`StreamedRecord::commit` and checked before the store completes the upload; dropped
+before the commit, the upload is aborted), and an upload its `Begin` sends back is
+stored record by record (`kbf_transfer::put_each`), a large one streamed to the store
+(`LocalStore::put_streamed`). No record is refused for its size on any plane. 16 MiB is where
 the write group already writes a blob as a segment of its own, and well under the
 32 MiB a daemon batches small files into, so small outputs keep the in-memory path.
 Every read of a blob is bounded too: ByteStream Read, the HTTP blob route and the
