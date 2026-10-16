@@ -133,7 +133,7 @@ where
 /// A `file://` cold store: its floor [`COLD_FILE_FLOOR`], or for tests
 /// `--cold-store-floor-bytes`; its filesystem the real one, or for tests one of
 /// `--cold-store-size-bytes`.
-fn open_cold_file(args: &Args, dir: &Path) -> Result<FsStore, FsStoreError> {
+pub(crate) fn open_cold_file(args: &Args, dir: &Path) -> Result<FsStore, FsStoreError> {
     let floor = args
         .cold_store_floor_bytes
         .map_or(COLD_FILE_FLOOR, Floor::Bytes);
@@ -257,7 +257,7 @@ where
 }
 
 /// Aborts a task when dropped: the flusher and the start-up pass stop with the server.
-struct AbortOnDrop(tokio::task::JoinHandle<()>);
+pub(crate) struct AbortOnDrop(pub(crate) tokio::task::JoinHandle<()>);
 
 impl Drop for AbortOnDrop {
     fn drop(&mut self) {
