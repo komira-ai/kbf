@@ -6,27 +6,44 @@
 //! client cannot leave out: the program it runs and the paths it writes. Each is made
 //! independent of the configuration and of the content hashes buck2 puts in paths:
 //!
-//! - **Output paths** (`pattern`): under `buck-out/<v>/<root>/` (`art`, `gen`, and
-//!   their `-anon` and `gen-bxl` kinds) everything up to the root goes, and with it
-//!   the configuration hash after the cell (`<16 hex>` or `<16 hex>-<16 hex>`, kept
-//!   aside as `cfg`), the content hash or `output_artifacts` placeholder right after a
-//!   `__<name>__` segment, and for an anonymous target the configuration hash glued
-//!   to the package and the attributes hash before its `__<name>__`. So
-//!   `buck-out/v2/art/cell/<cfg>/pkg/__t__/out.o`,
-//!   `buck-out/v2/art/cell/pkg/__t__/output_artifacts/out.o` and
-//!   `buck-out/v2/gen/cell/pkg/__t__/<content>/out.o` are all `cell/pkg/__t__/out.o`.
-//!   A dynamic action's `__action__<k>__` stays, so its actions stay apart. Scratch
-//!   paths (`buck-out/<v>/tmp/`) are left out. Any other path is kept as sent.
+//! - **Output paths** (`pattern`): under `buck-out/<v>/<root>/` (`art`, `art-anon`,
+//!   `art-bxl`, and the `gen` kinds of older buck2) everything up to the root goes,
+//!   and with it the hashes buck2 puts where its owner's layout says:
+//!   - a target's configuration hash after the cell (`<16 hex>` or
+//!     `<16 hex>-<16 hex>`, kept aside as `cfg`), and the content hash or
+//!     `output_artifacts` placeholder in the one segment right after its
+//!     `__<name>__` (a hex directory further down is kept). So
+//!     `buck-out/v2/art/cell/<cfg>/pkg/__t__/out.o`,
+//!     `buck-out/v2/art/cell/pkg/__t__/output_artifacts/out.o` and
+//!     `buck-out/v2/gen/cell/pkg/__t__/<content>/out.o` are all `cell/pkg/__t__/out.o`.
+//!     A dynamic action's `__action__<k>__` stays, so its actions stay apart;
+//!   - an anonymous target's configuration hash glued to its package, and the
+//!     attributes or content hash right before its `__<name>__` (in content mode
+//!     buck2 glues that one to the cell for the root package:
+//!     `art-anon/anon<16 hex>/__t__/o` is `anon/__t__/o`). In content mode buck2
+//!     also glues the cell to the package (`<cell><pkg>/…`), which stays glued: the
+//!     key is stable, but not the one of the configuration-hash form;
+//!   - a BXL function's execution-platform hash after the cell (`cfg`) and its
+//!     arguments or content hash right after its `__<name>__`. buck2 writes these
+//!     two (and an anonymous target's attributes hash) unpadded: 13 to 16 hex digits
+//!     are read as a hash, so the 1 in 65 536 with fewer is kept.
+//!
+//!   Scratch paths (`buck-out/<v>/tmp/`) are left out. Any other path is kept as sent.
 //! - **The program** (`program`): argv\[0\], normalized the same way when it is under
-//!   `buck-out`, its file name when it is another absolute path, as sent otherwise;
-//!   then, while the last word is a bare program name (no `/`: a program looked up on
-//!   `PATH`, which may only run the next argument, as `env`, a shell or an interpreter
-//!   does), the next argument that is not a flag or a `NAME=value` assignment, up to
-//!   three words. A `-c` ends it, kept as the last word, so an inline script never
-//!   enters the key. A buck2 genrule is `env <shell> <cell>/…/genrule.sh`, a prelude
-//!   Python tool `<interpreter> <its script>`, a tool built in the repository (a
-//!   `buck-out` path) its pattern alone. The rule names no program: what it unwraps
-//!   is told by shape (bare name, path, flag), so no list of runners can go stale.
+//!   `buck-out` (also after the `@` of an argument file), its file name when it is
+//!   another absolute path, as sent otherwise; then, while the last word is a bare
+//!   program name (no `/`: a program looked up on `PATH`, which may only run the next
+//!   argument, as `env`, a shell or an interpreter does), the next argument that is
+//!   not a flag or a `NAME=value` assignment, up to three words. A `-c`, or a cluster
+//!   of single-letter flags ending in `c` (`-euc`), ends it, kept as the last word, so
+//!   a `-c` script never enters the key (a script after `-e`, as Perl or Node take
+//!   one, does: `-e` is a shell's flag too, so it is skipped). A buck2 genrule is
+//!   `env <shell> <cell>/…/genrule.sh`, a prelude Python tool
+//!   `<interpreter> <its script>`, a tool built in the repository (a `buck-out` path)
+//!   its pattern alone. A bare-name compiler is read the same way: `cc -c a.c` is
+//!   `cc -c`, `cc -o a.o a.c` is `cc a.o a.c`, `clang @<argsfile>` is
+//!   `clang @<its pattern>`. The rule names no program: what it unwraps is told by
+//!   shape (bare name, path, flag), so no list of runners can go stale.
 //!
 //! The key is SHA-256 of a version tag and the program's words and the sorted,
 //! deduplicated output patterns, each length-prefixed, cut to 8 bytes: stable across
@@ -125,10 +142,9 @@ pub fn program(arguments: &[String]) -> Vec<String> {
     let mut words = vec![word(first)];
     let mut rest = rest.iter();
     while words.len() < MAX_WORDS && words.last().is_some_and(|w| !w.contains('/')) {
-        let next = rest.find(|a| a.as_str() == INLINE || !skipped(a));
-        match next.map(String::as_str) {
-            Some(INLINE) => {
-                words.push(INLINE.to_owned());
+        match rest.find(|a| is_inline(a) || !skipped(a)) {
+            Some(inline) if is_inline(inline) => {
+                words.push(inline.clone());
                 break;
             }
             Some(arg) => words.push(word(arg)),
@@ -138,9 +154,14 @@ pub fn program(arguments: &[String]) -> Vec<String> {
     words
 }
 
-/// The flag that hands a program an inline script (`<shell> -c '...'`,
-/// `<interpreter> -c '...'`): the program ends there.
-const INLINE: &str = "-c";
+/// The flag that hands a program an inline script, with any single-letter flags
+/// before it (`<shell> -c '...'`, `<shell> -euc '...'`, `<interpreter> -Bc '...'`):
+/// the program ends there. A compiler's `-c`, or a flag such as `-static`, ends it
+/// too, which only makes the program shorter.
+fn is_inline(arg: &str) -> bool {
+    arg.strip_prefix('-')
+        .is_some_and(|flags| flags.ends_with('c') && flags.bytes().all(|b| b.is_ascii_alphabetic()))
+}
 
 /// An argument a program's word skips on its way to the next: a flag, or a
 /// `NAME=value` assignment (`env`'s).
@@ -149,11 +170,16 @@ fn skipped(arg: &str) -> bool {
 }
 
 /// One program word: a `buck-out` path's pattern (`buck-out/tmp` for a scratch path),
-/// an absolute path's file name, any other argument as sent.
+/// the same after the `@` of an argument file (`@<pattern>`), an absolute path's file
+/// name, any other argument as sent.
 fn word(arg: &str) -> String {
-    match buck_out(arg) {
-        Some(Found::Pattern(pattern, _)) => return pattern,
-        Some(Found::Scratch) => return "buck-out/tmp".to_owned(),
+    let (at, path) = match arg.strip_prefix('@') {
+        Some(path) => ("@", path),
+        None => ("", arg),
+    };
+    match buck_out(path) {
+        Some(Found::Pattern(pattern, _)) => return format!("{at}{pattern}"),
+        Some(Found::Scratch) => return format!("{at}buck-out/tmp"),
         None => {}
     }
     if arg.starts_with('/') {
@@ -185,14 +211,31 @@ enum Found {
     Scratch,
 }
 
-/// What buck2 puts under `buck-out/<v>/<root>/`, each with whether a configuration
-/// hash may be glued to the package after the cell (anonymous targets).
-const ROOTS: [(&str, bool); 5] = [
-    ("art", false),
-    ("gen", false),
-    ("gen-bxl", false),
-    ("art-anon", true),
-    ("gen-anon", true),
+/// Whose outputs a `buck-out/<v>/<root>/` holds, which decides where buck2 puts its
+/// hashes (its `make_hashed_path` for each kind of owner).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Owner {
+    /// A target: `<cell>/<cfg>/<pkg>/__<name>__/…`, or (content mode)
+    /// `<cell>/<pkg>/__<name>__/<content>/…`.
+    Target,
+    /// An anonymous target: `<cell>/<cfg><pkg>/<attrs>/__<name>__/…`, or (content
+    /// mode) `<cell><pkg>/<content>/__<name>__/…`. The attributes hash is unpadded.
+    Anon,
+    /// A BXL function: `<cell>/<exec>/<bxl path>/__<name>__/<args>/…`, or (content
+    /// mode) `<cell>/<bxl path>/__<name>__/<content>/…`. The execution platform and
+    /// arguments hashes are unpadded.
+    Bxl,
+}
+
+/// The roots under `buck-out/<v>/` (`art` today, `gen` before it) and whose outputs
+/// each holds.
+const ROOTS: &[(&str, Owner)] = &[
+    ("art", Owner::Target),
+    ("gen", Owner::Target),
+    ("art-anon", Owner::Anon),
+    ("gen-anon", Owner::Anon),
+    ("art-bxl", Owner::Bxl),
+    ("gen-bxl", Owner::Bxl),
 ];
 
 /// What `path` is under a `buck-out` root kbf knows; `None` for any other path.
@@ -201,42 +244,71 @@ fn buck_out(path: &str) -> Option<Found> {
     let at = segments
         .windows(3)
         .position(|w| w[0] == "buck-out" && (w[2] == "tmp" || ROOTS.iter().any(|r| r.0 == w[2])))?;
-    let root = segments[at + 2];
-    if root == "tmp" {
+    let Some(&(_, owner)) = ROOTS.iter().find(|r| r.0 == segments[at + 2]) else {
         return Some(Found::Scratch);
-    }
-    let anon = ROOTS.iter().any(|&(r, anon)| r == root && anon);
+    };
     let mut rest: Vec<&str> = segments[at + 3..].to_vec();
-    let mut cfg = None;
-    // The configuration hash: a segment of its own after the cell, or (anonymous
-    // targets) the first 16 characters of the package's first segment.
-    if let Some(&after_cell) = rest.get(1) {
-        if is_cfg(after_cell) {
-            cfg = Some(after_cell.to_owned());
-            rest.remove(1);
-        } else if anon
-            && after_cell.len() > 16
-            && after_cell.is_char_boundary(16)
-            && is_hex(&after_cell[..16])
-        {
-            cfg = Some(after_cell[..16].to_owned());
-            rest[1] = &after_cell[16..];
-        }
-    }
+    let cfg = take_cfg(owner, &mut rest);
     let mut kept: Vec<&str> = Vec::with_capacity(rest.len());
     for (i, &segment) in rest.iter().enumerate() {
-        let after_name = kept.last().is_some_and(|s| is_name(s));
-        if after_name && (segment == "output_artifacts" || is_content_hash(segment)) {
+        // The hash right after a `__<name>__` (only the next segment: a hex directory
+        // further down is the action's own).
+        let after_name = i > 0 && is_name(rest[i - 1]);
+        if after_name && hash_after_name(owner, segment) {
             continue;
         }
-        // An anonymous target's attributes hash, right before its `__<name>__`.
+        // An anonymous target's attributes or content hash, right before its
+        // `__<name>__`: a segment of its own, or (content mode, root package) glued
+        // to the cell.
         let before_name = rest.get(i + 1).is_some_and(|s| is_name(s));
-        if anon && i > 0 && before_name && is_hex(segment) {
-            continue;
+        if owner == Owner::Anon && before_name {
+            if i > 0 && is_hex(segment) {
+                continue;
+            }
+            if let Some(cell) = unglue_content_hash(segment) {
+                kept.push(cell);
+                continue;
+            }
         }
         kept.push(segment);
     }
     Some(Found::Pattern(kept.join("/"), cfg))
+}
+
+/// Takes the configuration hash out of `rest` (the segments after the root) and
+/// returns it: a segment of its own after the cell, or (anonymous targets) the first
+/// 16 characters of the package's first segment.
+fn take_cfg(owner: Owner, rest: &mut Vec<&str>) -> Option<String> {
+    let after_cell = *rest.get(1)?;
+    if is_cfg(after_cell) || owner == Owner::Bxl && is_unpadded_hash(after_cell) {
+        rest.remove(1);
+        return Some(after_cell.to_owned());
+    }
+    if owner == Owner::Anon
+        && after_cell.len() > 16
+        && after_cell.is_char_boundary(16)
+        && is_hex(&after_cell[..16])
+    {
+        rest[1] = &after_cell[16..];
+        return Some(after_cell[..16].to_owned());
+    }
+    None
+}
+
+/// Whether `segment`, right after a `__<name>__`, is a hash: a content hash, the
+/// `output_artifacts` placeholder, or (BXL) the unpadded arguments hash.
+fn hash_after_name(owner: Owner, segment: &str) -> bool {
+    segment == "output_artifacts"
+        || is_content_hash(segment)
+        || owner == Owner::Bxl && is_unpadded_hash(segment)
+}
+
+/// The cell of an anonymous target's content-mode root-package segment
+/// (`<cell><16 hex>`), if `segment` is one.
+fn unglue_content_hash(segment: &str) -> Option<&str> {
+    let cut = segment.len().checked_sub(16).filter(|&cut| cut > 0)?;
+    let (cell, hash) = (segment.get(..cut)?, segment.get(cut..)?);
+    is_hex(hash).then_some(cell)
 }
 
 /// A `__<name>__` segment: a target's (`__foo__`), a dynamic action's
@@ -253,6 +325,13 @@ fn is_hex(text: &str) -> bool {
 /// A content hash in a path: 16 lowercase hex digits.
 fn is_content_hash(segment: &str) -> bool {
     segment.len() == 16 && is_hex(segment)
+}
+
+/// A hash buck2 writes without padding (`{:x}` of a `u64`): 13 to 16 hex digits.
+/// Fewer digits happen for 1 hash in 65 536, and are kept; a directory named by 13
+/// or more hex digits is not expected where these sit.
+fn is_unpadded_hash(segment: &str) -> bool {
+    (13..=16).contains(&segment.len()) && is_hex(segment)
 }
 
 /// A configuration hash: 16 lowercase hex digits, or two joined by `-` (a target's

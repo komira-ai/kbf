@@ -346,3 +346,180 @@ fn edge_paths() {
         some("cell/my-pkg/__t__/o", None)
     );
 }
+
+/// BXL outputs, at the paths buck2 writes for komira's `test_weld.bxl` `check`
+/// (configuration and content form). Catches: the `art-bxl` or `gen-bxl` root
+/// unknown (the path kept whole, hashes and all, so the key splits every build), the
+/// execution-platform hash kept or not taken as `cfg`, the arguments hash after the
+/// function's `__<name>__` kept, or an unpadded (shorter) hash in either place kept.
+#[test]
+fn bxl_paths_drop_their_hashes() {
+    let want = "komira/tools/build/lint/test_weld.bxl/__check__/test_weld/validation.json";
+    assert_eq!(
+        pat(
+            "buck-out/v2/art-bxl/komira/453d11473805230f/tools/build/lint/test_weld.bxl/__check__/ecd72b18569a9587/test_weld/validation.json"
+        ),
+        some(want, Some("453d11473805230f"))
+    );
+    assert_eq!(
+        pat(
+            "buck-out/v2/art-bxl/komira/tools/build/lint/test_weld.bxl/__check__/083ffece723d3c8b/test_weld/validation.json"
+        ),
+        some(want, None)
+    );
+    // Unpadded: 13 and 15 digits.
+    assert_eq!(
+        pat(
+            "buck-out/v2/gen-bxl/komira/53d11473805230f/tools/build/lint/test_weld.bxl/__check__/d72b18569a958/test_weld/validation.json"
+        ),
+        some(want, Some("53d11473805230f"))
+    );
+    // A short hex directory after the cell is a directory (fewer than 13 digits).
+    assert_eq!(
+        pat("buck-out/v2/art-bxl/komira/cafe/x.bxl/__f__/083ffece723d3c8b/o"),
+        some("komira/cafe/x.bxl/__f__/o", None)
+    );
+}
+
+/// The root-package anonymous target buck2's prelude makes for the C++ toolchain, in
+/// content form, where buck2 glues the content hash to the cell; and a package
+/// directory named by hex digits, which is not the hash (the hash always sits
+/// between it and the name). Catches: the glued hash kept (the key moves with every
+/// content change), the cell cut with it, or a hex package directory dropped.
+#[test]
+fn an_anonymous_root_package_target_drops_its_glued_hash() {
+    assert_eq!(
+        pat(
+            "buck-out/v2/art-anon/anon990e66921b1edf1c/___compiler_type_flags_anon_rule__/compiler_type_args"
+        ),
+        some(
+            "anon/___compiler_type_flags_anon_rule__/compiler_type_args",
+            None
+        )
+    );
+    assert_eq!(
+        pat(&format!("buck-out/v2/art-anon/komira/{CFG}3fa9c1/__x__/o")),
+        some("komira/__x__/o", Some(CFG))
+    );
+    assert_eq!(
+        pat(&format!(
+            "buck-out/v2/art-anon/komira/{CFG}src/beef/3fa9c1/__x__/o"
+        )),
+        some("komira/src/beef/__x__/o", Some(CFG))
+    );
+    // A cell glued to a hash too short to be a content hash stays as it is.
+    assert_eq!(
+        pat(&format!("buck-out/v2/art-anon/{}/__x__/o", &CONTENT[..15])),
+        some(&format!("{}/__x__/o", &CONTENT[..15]), None)
+    );
+}
+
+/// Catches: a hash or `output_artifacts` dropped anywhere but in the one segment
+/// right after a `__<name>__` (an action's own hex-named directory, or a directory
+/// named `output_artifacts`, would vanish from its pattern and two outputs merge),
+/// or BXL's unpadded hash rule applied to a target's outputs.
+#[test]
+fn only_the_segment_after_the_name_is_a_hash() {
+    assert_eq!(
+        pat(&format!(
+            "buck-out/v2/art/cell/{CFG}/pkg/__t__/d/{CONTENT2}/output_artifacts/a.o"
+        )),
+        some(
+            &format!("cell/pkg/__t__/d/{CONTENT2}/output_artifacts/a.o"),
+            Some(CFG)
+        )
+    );
+    assert_eq!(
+        pat(&format!(
+            "buck-out/v2/art/cell/pkg/__t__/{CONTENT}/{CONTENT2}/a.o"
+        )),
+        some(&format!("cell/pkg/__t__/{CONTENT2}/a.o"), None)
+    );
+    assert_eq!(
+        pat(&format!(
+            "buck-out/v2/art/cell/{CFG}/pkg/{CONTENT2}/__t__/a.o"
+        )),
+        some(&format!("cell/pkg/{CONTENT2}/__t__/a.o"), Some(CFG))
+    );
+    // Only BXL writes an unpadded hash after the name: a target's 13-digit directory
+    // stays.
+    assert_eq!(
+        pat("buck-out/v2/art/cell/pkg/__t__/0123456789abc/a.o"),
+        some("cell/pkg/__t__/0123456789abc/a.o", None)
+    );
+}
+
+/// Catches: `cfg` taken from another output than the first in pattern order (or in
+/// the order the client sent them), so one action's `cfg` changes with the order of
+/// its outputs or names the execution platform's output rather than the target's.
+#[test]
+fn cfg_is_the_first_patterns() {
+    let outputs = [
+        format!("buck-out/v2/art/cell/{CFG}/pkg/__t__/b.o"),
+        format!("buck-out/v2/art/cell/{CFG2}/pkg/__t__/a.o"),
+        "c.o".to_owned(),
+    ];
+    let argv = strings(&["cc"]);
+    let sent = Shape::of(&argv, &outputs);
+    let reversed: Vec<String> = outputs.iter().rev().cloned().collect();
+    assert_eq!(sent.cfg.as_deref(), Some(CFG2));
+    assert_eq!(Shape::of(&argv, &reversed).cfg.as_deref(), Some(CFG2));
+}
+
+/// Catches: an inline script that enters the key when its flag is a cluster
+/// (`-euc`, `-Bc`), so the script body (and any configuration hash in it) is in the
+/// key; or a flag that only contains a `c` (`-C`, `--c`, `-ce` before a script file)
+/// taken as one.
+#[test]
+fn a_flag_cluster_ending_in_c_is_inline() {
+    assert_eq!(
+        program(&strings(&["runner", "-euc", "echo a > x"])),
+        ["runner", "-euc"]
+    );
+    assert_eq!(
+        program(&strings(&["/usr/bin/env", "interp", "-Bc", "print(1)"])),
+        ["env", "interp", "-Bc"]
+    );
+    assert_eq!(
+        program(&strings(&["runner", "-C", "dir", "x"])),
+        ["runner", "dir", "x"]
+    );
+    assert_eq!(
+        program(&strings(&["runner", "--c", "dir"])),
+        ["runner", "dir"]
+    );
+    assert_eq!(
+        program(&strings(&["runner", "-ce", "script"])),
+        ["runner", "script"]
+    );
+    assert_eq!(program(&strings(&["runner", "-"])), ["runner"]);
+}
+
+/// Catches: an argument file's path kept as sent (its configuration hash splits
+/// the key per configuration, a content hash every build), or the `@` dropped.
+#[test]
+fn an_argument_file_is_normalized_after_its_at() {
+    let argsfile =
+        |cfg: &str| format!("@buck-out/v2/art/komira/{cfg}/src/foo/__foo__/foo.argsfile");
+    let a = program(&strings(&["clang++", &argsfile(CFG)]));
+    assert_eq!(a, ["clang++", "@komira/src/foo/__foo__/foo.argsfile"]);
+    assert_eq!(program(&strings(&["clang++", &argsfile(CFG2)])), a);
+    assert_eq!(
+        program(&strings(&[
+            "clang++",
+            "@buck-out/v2/art/komira/src/foo/__foo__/output_artifacts/foo.argsfile"
+        ])),
+        a
+    );
+    assert_eq!(
+        program(&strings(&[
+            "clang++",
+            &format!("@buck-out/v2/tmp/k/{CONTENT}/a")
+        ])),
+        ["clang++", "@buck-out/tmp"]
+    );
+    assert_eq!(
+        program(&strings(&["clang++", "@args.txt"])),
+        ["clang++", "@args.txt",]
+    );
+}

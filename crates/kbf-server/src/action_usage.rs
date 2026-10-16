@@ -15,8 +15,11 @@
 //!   ```
 //!
 //!   (one line). The fields up to the cgroup fields are those the line had before
-//!   `key`: `exit_code` is `-` for a run that did not end OK (a killed run has no
-//!   exit code). `outcome` is [`outcome`]'s word for the scheduler's outcome.
+//!   `key`: `exit_code` is the run's, as the daemon reported it for a run it says
+//!   ended (an OK status), and `-` for one it reports failed (a killed run has no exit
+//!   code). `outcome` is [`outcome`]'s word for the scheduler's outcome, the server's
+//!   verdict: an OK run whose outputs the server cannot store has its exit code and
+//!   `outcome=infra`.
 //! - `action shape:`, the first time this process sees a key: what the key stands for
 //!   (`key=… program="…" outputs=<n> patterns="<up to 8>…"`).
 //!

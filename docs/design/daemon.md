@@ -780,7 +780,7 @@ drops a killed run's result and cuts a timeout's to its logs
 
 | Field | What it is |
 |---|---|
-| `exit_code` | the action's exit code; `-` for a run that did not end OK (a killed run has none) |
+| `exit_code` | the exit code the daemon reported for a run it says ended (an OK status); `-` for one it reports failed (killed, timed out, lost: none). It is the run's, not the server's verdict: an OK run whose outputs the server cannot store has its exit code and `outcome=infra` |
 | `mnemonic`, `target` | the `RequestMetadata` the client sent on the Execute, quoted; `-` when it sent none (buck2 sends neither) |
 | `wall_us` and the cgroup fields | the run's wall time and the same cgroup fields as the `lease phases:` line above |
 | `key` | the action's shape key, 16 hex digits (below) |
@@ -801,24 +801,41 @@ writes, each made independent of the configuration and of the content hashes buc
 in paths. One target's action keeps its key across builds and configurations (`cfg`
 tells configurations apart); two actions of one target, or two targets, differ.
 
-- Output paths: under `buck-out/<v>/<root>/` (`art`, `gen`, `art-anon`, `gen-anon`,
-  `gen-bxl`) the prefix up to the root goes, and with it the configuration hash after
-  the cell, the content hash or `output_artifacts` placeholder right after a
-  `__<name>__` segment, and an anonymous target's glued configuration hash and
-  attributes hash. `buck-out/v2/art/cell/<cfg>/pkg/__t__/t.o`,
+- Output paths: under `buck-out/<v>/<root>/` (`art`, `art-anon`, `art-bxl`, and the
+  `gen` kinds of older buck2) the prefix up to the root goes, and with it the hashes
+  buck2 puts where its owner's layout says. A target: the configuration hash after the
+  cell, and the content hash or `output_artifacts` placeholder in the one segment right
+  after its `__<name>__` (a hex directory further down is kept).
+  `buck-out/v2/art/cell/<cfg>/pkg/__t__/t.o`,
   `buck-out/v2/art/cell/pkg/__t__/output_artifacts/t.o` and
-  `buck-out/v2/gen/cell/pkg/__t__/<content>/t.o` are all `cell/pkg/__t__/t.o`. A
-  dynamic action's `__action__<k>__` stays. Scratch paths (`buck-out/<v>/tmp/`) are left
-  out; any other path is kept as sent. The patterns are sorted and deduplicated (buck2
-  may send one path as both an output file and an output directory).
-- The program: argv\[0\] (normalized the same way under `buck-out`, its file name when it
-  is another absolute path), then, while the last word is a bare program name (no `/`:
-  a program looked up on `PATH`, such as `env`, a shell or an interpreter, which may
-  only run the next argument), the next argument that is not a flag or a `NAME=value`
-  assignment, up to three words. A `-c` ends it, kept as the last word, so an inline
-  script never enters the key: a buck2 genrule is `env <shell> <cell>/…/genrule.sh`, a
-  prelude Python tool `<interpreter> <cell>/…/<script>.py`, a tool built in the
-  repository its `buck-out` pattern alone. The rule lists no program names.
+  `buck-out/v2/gen/cell/pkg/__t__/<content>/t.o` are all `cell/pkg/__t__/t.o`; a
+  dynamic action's `__action__<k>__` stays. An anonymous target: the configuration hash
+  glued to its package, and the attributes or content hash right before its
+  `__<name>__`, also where buck2 glues it to the cell (`art-anon/anon<16 hex>/__t__/o`
+  is `anon/__t__/o`); in content mode buck2 glues the cell to the package, which stays
+  glued (a stable key, but not the configuration-hash form's). A BXL function: the
+  execution-platform hash after the cell (as `cfg`) and the arguments or content hash
+  right after its `__<name>__`
+  (`art-bxl/komira/<16 hex>/tools/build/lint/test_weld.bxl/__check__/<16 hex>/test_weld`
+  is `komira/tools/build/lint/test_weld.bxl/__check__/test_weld`). buck2 writes the
+  BXL hashes and the anonymous attributes hash unpadded; 13 to 16 hex digits are read
+  as a hash, so the 1 in 65 536 with fewer is kept. Scratch paths (`buck-out/<v>/tmp/`)
+  are left out; any other path is kept as sent. The patterns are sorted and
+  deduplicated (buck2 may send one path as both an output file and an output
+  directory), and `cfg` is the first pattern's that names one.
+- The program: argv\[0\] (normalized the same way under `buck-out`, also after the `@`
+  of an argument file, its file name when it is another absolute path), then, while
+  the last word is a bare program name (no `/`: a program looked up on `PATH`, such as
+  `env`, a shell or an interpreter, which may only run the next argument), the next
+  argument that is not a flag or a `NAME=value` assignment, up to three words. A `-c`,
+  or a cluster of single-letter flags ending in `c` (`-euc`), ends it, kept as the last
+  word, so a `-c` script never enters the key (a script after `-e`, as Perl or Node
+  take one, does: `-e` is a shell's flag too, so it is skipped). A buck2 genrule is
+  `env <shell> <cell>/…/genrule.sh`, a prelude Python tool
+  `<interpreter> <cell>/…/<script>.py`, a tool built in the repository its `buck-out`
+  pattern alone. A bare-name compiler is read the same way (`cc -c a.c` is `cc -c`,
+  `cc -o a.o a.c` is `cc a.o a.c`, `clang @<argsfile>` is `clang @<its pattern>`). The
+  rule lists no program names.
 - The key is the first 8 bytes of SHA-256 over the tag `kbf-shape-v1`, the program's
   words and the patterns, each length-prefixed. A change to any rule above changes the
   tag, so keys of two normalizers never mix. `RequestMetadata` never enters the key.

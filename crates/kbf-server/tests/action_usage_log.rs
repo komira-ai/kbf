@@ -15,13 +15,16 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use kbf_front::REQUEST_METADATA_HEADER;
 use kbf_proto::google::rpc;
+use kbf_proto::google::rpc::PreconditionFailure;
+use kbf_proto::google::rpc::precondition_failure::Violation;
 use kbf_proto::reapi::execution_client::ExecutionClient;
 use kbf_proto::reapi::{
     Action, ActionResult, Command, Directory, ExecuteRequest, ExecutedActionMetadata,
     RequestMetadata, ToolDetails,
 };
 use kbf_proto::worker::{
-    self, CgroupUsage, MemoryKill, NumaNodeBytes, ResourceUsage, daemon_message, server_message,
+    self, CgroupUsage, Lost, MemoryKill, NumaNodeBytes, ResourceUsage, daemon_message,
+    server_message,
 };
 use kbf_server::action_usage::{Shape, ShapeKey};
 use kbf_types::LeaseId;
@@ -478,4 +481,130 @@ async fn a_report_the_scheduler_does_not_take_has_no_line() {
         line.contains(&format!("outcome=ok lease={current} ")),
         "{line}"
     );
+}
+
+/// A failed lease the daemon measured, each way the scheduler can judge one that the
+/// tests above do not reach.
+#[derive(Clone, Copy, Debug)]
+enum FailedPath {
+    /// A busy node killed the lease under its own limit; the farm runs it again.
+    NodePressure,
+    /// The action's own limit at the largest node: no rung above, the operation ends.
+    OutOfMemoryAtTheCap,
+    /// The daemon refused the action as malformed.
+    Invalid,
+    /// An input went missing at the worker.
+    MissingInput,
+    /// The run was fenced on every run the farm's budget allows.
+    LostFenced,
+}
+
+/// Runs one action through `path` on a node of its own and returns its `action
+/// usage:` lines, oldest first.
+async fn usage_lines_of(path: FailedPath) -> Vec<String> {
+    let name = format!("{path:?}");
+    // The largest node of a cell that books 1 GiB first: an own-limit kill there is
+    // at the cap.
+    let mem_gib = match path {
+        FailedPath::OutOfMemoryAtTheCap => 1,
+        _ => 8,
+    };
+    let cell = Cell::start().await;
+    let mut daemon = cell.daemon(&format!("node-{name}"), 4, mem_gib).await;
+    let (job, key) = buck_job(&["tools/kbf-m2-act", &name], &[&format!("out/{name}")]);
+    cell.upload(&job.blobs()).await;
+    let mut ops = cell.execute(&job.action).await;
+    let start = daemon.start().await;
+    let failed = |lease, code| failed_with(lease, code, &usage());
+    match path {
+        FailedPath::NodePressure => {
+            let mut killed = failed(start.lease_id, Code::ResourceExhausted);
+            killed.memory_kill = MemoryKill::NodePressure as i32;
+            assert!(daemon.report(killed).await.accepted);
+            let rerun = daemon.start().await;
+            let result = with_usage(output(&cell, &name, 0).await, &usage());
+            assert!(daemon.report(ran(rerun.lease_id, &result)).await.accepted);
+        }
+        FailedPath::OutOfMemoryAtTheCap => {
+            let mut killed = failed(start.lease_id, Code::ResourceExhausted);
+            killed.memory_kill = MemoryKill::OwnLimit as i32;
+            assert!(daemon.report(killed).await.accepted);
+        }
+        FailedPath::Invalid => {
+            let report = failed(start.lease_id, Code::InvalidArgument);
+            assert!(daemon.report(report).await.accepted);
+        }
+        FailedPath::MissingInput => {
+            let mut report = failed(start.lease_id, Code::FailedPrecondition);
+            let violation = Violation {
+                r#type: "MISSING".to_owned(),
+                subject: format!(
+                    "blobs/{}/{}",
+                    job.input.digest.hash_hex(),
+                    job.input.digest.size_bytes
+                ),
+                description: String::new(),
+            };
+            let detail = prost_types::Any {
+                type_url: "type.googleapis.com/google.rpc.PreconditionFailure".to_owned(),
+                value: PreconditionFailure {
+                    violations: vec![violation],
+                }
+                .encode_to_vec(),
+            };
+            if let Some(status) = report.status.as_mut() {
+                status.details.push(detail);
+            }
+            assert!(daemon.report(report).await.accepted);
+        }
+        FailedPath::LostFenced => {
+            report_every_run(&mut daemon, start, |lease| {
+                let mut lost = failed(lease, Code::Unavailable);
+                lost.lost = Lost::Fenced as i32;
+                lost
+            })
+            .await;
+        }
+    }
+    done(&mut ops).await;
+    lines("action usage:", key)
+}
+
+/// The value of the `name=` field of `line`.
+fn field<'a>(line: &'a str, name: &str) -> &'a str {
+    let prefix = format!("{name}=");
+    line.split(' ')
+        .find_map(|word| word.strip_prefix(prefix.as_str()))
+        .unwrap_or_else(|| panic!("no {name}= in {line}"))
+}
+
+/// Catches, for each failed path the scheduler takes: no line (a path whose usage
+/// is dropped before the line, or whose report the line skips), a line per caller or
+/// more than one per lease, the wrong `outcome=` word, a failed run given an exit
+/// code, or (node pressure, lost) a rerun's lease missing its own line.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_failed_path_logs_one_line_per_lease_with_its_outcome() {
+    log();
+    let lost = 1 + kbf_sched::FARM_RERUNS as usize;
+    let table: [(FailedPath, Vec<(&str, &str)>); 5] = [
+        (
+            FailedPath::NodePressure,
+            vec![("node-pressure", "-"), ("ok", "0")],
+        ),
+        (FailedPath::OutOfMemoryAtTheCap, vec![("oom", "-")]),
+        (FailedPath::Invalid, vec![("invalid", "-")]),
+        (FailedPath::MissingInput, vec![("missing-input", "-")]),
+        (FailedPath::LostFenced, vec![("lost-fenced", "-"); lost]),
+    ];
+    for (path, want) in table {
+        let got = usage_lines_of(path).await;
+        let words: Vec<(&str, &str)> = got
+            .iter()
+            .map(|l| (field(l, "outcome"), field(l, "exit_code")))
+            .collect();
+        assert_eq!(words, want, "{path:?}: {got:?}");
+        let leases: std::collections::BTreeSet<&str> =
+            got.iter().map(|l| field(l, "lease")).collect();
+        assert_eq!(leases.len(), got.len(), "{path:?}: one line per lease");
+    }
 }
