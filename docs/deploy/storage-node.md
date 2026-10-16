@@ -311,7 +311,8 @@ kbf-server \
   It logs one line at the end: files read, kept, orphans deleted, foreign, without a
   header, objects, blobs and entries forgotten, objects marked missing for want of
   version 3, objects held back by the guard, the bytes held and how long it took. A
-  pass that fails is logged and runs again at the next start.
+  pass that fails is logged and runs again at the next start; until then nothing is
+  evicted.
 - Until the pass reaches it, or for a file lost while the server runs, a blob whose
   file was lost, damaged or left empty is still reported present by
   `FindMissingBlobs` until a read of it fails: that read answers `UNAVAILABLE` and
@@ -321,14 +322,91 @@ kbf-server \
   the file of every object the hit needs is there and starts with its header; if one
   is not, the hit is a miss (the action runs again) and its blobs are reported
   missing.
-- No eviction: only the start-up pass deletes objects (orphans), so the directory
-  grows with every blob the cache keeps (and a bucket with every blob written). A
-  write that would leave the file system with less than 1 GiB free is refused, and
-  its upload answered `UNAVAILABLE`. Size the disk for the cache you want to keep.
+- Eviction under disk pressure: the floor is 5% of the file system and at least
+  1 GiB (the rule the daemon's cache keeps; not a flag). A write that would leave less
+  free is refused (its upload answered `UNAVAILABLE`; the server's PUT retries
+  twice) and wakes the evictor, which also looks every 10 seconds once the start-up
+  pass is done. While less than twice the floor is free, it takes the least recently
+  used objects until their lengths cover the shortfall: an object counts as used
+  when `FindMissingBlobs` reports one of its blobs present, a blob of it is read, an
+  action-cache hit needs it, or it is written; objects not used since the start
+  come first, oldest file first. It never takes an object used in the last 60
+  seconds, nor one staged on the write tier. It forgets them first (their blobs
+  leave the index, with every action-cache entry that needs one, as in the start-up
+  pass, raising the Raft log to machine version 3 only in a single-voter cell), then
+  deletes their files; a crash between the two leaves files the next start-up pass
+  deletes. In a cell of more voters whose log is below version 3, eviction is off
+  until the operator raises the log: the evictor evicts nothing, logs
+  `evict/forget needs log V3: eviction off` once, and writes stay refused under the
+  floor. The directory
+  is the store of record (an `s3://` cold store is never evicted from): nothing is behind it, so an evicted blob is gone, and
+  `FindMissingBlobs` reports it missing so the client uploads it again (or the
+  action runs again). Under pressure eviction cuts the retention's `min_ttl` short
+  (a blob reported present stays held 7 days by default): the 60 seconds after a use
+  are all it keeps, so a download that comes later than that after a hit can fail with
+  `NOT_FOUND`. Each round that evicts logs a line (free bytes, target, objects,
+  bytes, blobs and entries removed, and the bytes it could not cover). Size the disk
+  for the cache you want to keep.
 
 With a fast disk in front, add `--hot-store=file:///fast/kbf` (uploads land there and
 are flushed to the cold store; the metadata log then lives in `/fast/kbf/meta`, and
 `--meta-dir` is left out unless the log should be on another disk).
+
+## The server's log
+
+`kbf-server` writes its log to stderr (journald under systemd), and, besides that, to a
+size-capped rotating file, so scheduling decisions and failures are still there after the
+journal has rolled over or the host has restarted.
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--log-dir` | `<hot store>/log` when `--hot-store` is a directory, else none | The directory of the log file; created (mode 0750) if missing. With neither flag the server logs to stderr alone and says so in one INFO line after it starts. |
+| `--log-max-bytes` | 64 MiB | The most bytes one file holds before it is rotated. |
+| `--log-files` | 8 | How many files are kept, the current one included. |
+
+The log never takes more than `--log-max-bytes` times `--log-files` plus one line on
+disk. A line longer than `--log-max-bytes` is written alone to a fresh file, so that one
+file can be longer.
+
+- **Layout.** `kbf-server.log` is the current file; `kbf-server.log.1` is the one before
+  it, up to `kbf-server.log.<N - 1>` for `--log-files=N`. Files are created with mode 0640
+  and kept by the server's user.
+- **Rotation** happens before a write that would cross the cap: `.2` becomes `.3`, `.1`
+  becomes `.2`, the current file becomes `.1`, and the file that would become `.N` is
+  dropped. The current file is opened for append and never truncated at start, so a
+  restart keeps the entries before it. Files past the count (after `--log-files` is
+  lowered) are removed at start.
+- **Format.** The same line as stderr (time, level, target, fields), without colour. INFO
+  and above.
+- **Durability.** Each event is written to the file as it happens; the file is not
+  `fsync`ed per line, so a crash of the host can lose the last seconds (a crash of the
+  server cannot).
+- **Errors.** A directory or file that cannot be written (disk full, permission) never
+  stops the server and never costs the stderr copy. The failure is reported once on
+  stderr; the file then drops events until 64 KiB more of them have
+  passed, and tries again.
+- **What is in it at INFO and WARN, one line each.** An operation placed on a worker
+  (`lease granted`, with operation, lease and node); how a lease ended (`lease finished
+  ok`, or `lease finished failed` with the failure kind); a requeue and why (`lease given
+  up; requeued`, with the reason, which for a memory kill names the old and the new
+  booking, and `farm_runs` of `farm_budget` farm-fault reruns spent); an operation that
+  fails for good (`operation finished failed`, with the failure kind and the budget and
+  ladder its runs used); an operation no worker can run; and a write-tier flush that
+  failed, or found a corrupt or conflicting object. Blob requests are not logged.
+
+To read it from the host:
+
+```sh
+kbf-deploy log --log-dir /var/lib/kbf-server/log            # the last 100 lines
+kbf-deploy log --hot-store /fast/kbf --lines 500            # <hot store>/log
+```
+
+`kbf-deploy log` only reads. It prints the last lines across `kbf-server.log` and the
+rotated files, oldest first, and exits 2 with `REFUSED:` if the directory does not exist
+or holds no `kbf-server.log`. It cannot find a server's flags, so it is told the directory
+(`--log-dir`) or the hot store's directory (`--hot-store`, which names `<dir>/log`).
+`pilot server-install` does not yet pass `--log-dir`, so a pilot server logs to journald
+only unless its unit is given the flag.
 
 ## Planned: the scheduler's state in the log
 

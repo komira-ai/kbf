@@ -50,17 +50,20 @@ pub struct Args {
     pub role: Role,
     /// The durable object store, where every blob ends up: `file:///absolute/path` (a
     /// directory, `kbf_objstore::FsStore`: locked while the server runs, a second
-    /// server on it is refused; nothing is evicted, so it grows with every blob, and a
-    /// write that would leave its filesystem under 1 GiB free is refused) or
+    /// server on it is refused; a write that would leave its filesystem with less free
+    /// than it keeps, 5% of its size and at least 1 GiB, is refused and wakes the
+    /// evictor, which forgets the least recently used objects (never one used in the
+    /// last minute) and deletes their files while less than twice that is free) or
     /// `s3://bucket/prefix?endpoint=http://host:port` (MinIO, RustFS; the key pair is
     /// `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`; query keys `region`,
     /// `conditional-put=true` for a store that refuses to overwrite a key, and
     /// `min-put-rate=BYTES_PER_SEC`, the slowest rate a PUT body may reach the store at:
     /// a PUT is cut after 60 seconds plus its body's length at that rate, 1 MiB/s by
     /// default). Objects are keyed under `<prefix><log id>/` (`kbf/` for a directory and
-    /// for an S3 URI without a path), the id of the metadata log. Nothing reads the
-    /// store at start; a lost or damaged object is found when it is read, or before an
-    /// action-cache hit that needs it is served (a miss). There is no `memory:` store:
+    /// for an S3 URI without a path), the id of the metadata log. A directory is
+    /// checked against the index by a start-up pass in the background; a lost or
+    /// damaged object is also found when it is read, or before an action-cache hit
+    /// that needs it is served (a miss). There is no `memory:` store:
     /// a `file://` path on a tmpfs is one.
     #[arg(long, value_name = "URI")]
     pub cold_store: Option<StoreUri>,
@@ -99,6 +102,44 @@ pub struct Args {
     /// no `file://` hot store. Given, it wins over the hot store's directory.
     #[arg(long, value_name = "DIR")]
     pub meta_dir: Option<PathBuf>,
+    /// For tests only: the free bytes a `file://` cold store's filesystem must keep, in
+    /// place of 5% of it, at least 1 GiB (a test's disk would decide what is evicted).
+    #[arg(long, hide = true, value_name = "BYTES", requires = "cold_store")]
+    pub cold_store_floor_bytes: Option<u64>,
+    /// For tests of eviction only: a `file://` cold store's filesystem is taken to be
+    /// this many bytes, holding nothing but the store's object files.
+    #[arg(long, hide = true, value_name = "BYTES", requires = "cold_store")]
+    pub cold_store_size_bytes: Option<u64>,
+    /// For tests of eviction only: how long after its last use an object in a
+    /// `file://` cold store is never evicted, in milliseconds.
+    #[arg(long, hide = true, default_value_t = kbf_front::EVICT_GRACE.as_millis() as u64)]
+    pub cold_store_evict_grace_ms: u64,
+    /// The directory of the durable log file, `kbf-server.log` and its rotated
+    /// `kbf-server.log.1`, `.2`, ... (created if missing): every event stderr gets, in
+    /// the same format, kept across restarts. Left out, it is `<hot store directory>/log`
+    /// when the hot store is a directory; with neither, there is no file and the server
+    /// logs to stderr alone (the start logs which). A directory or file that cannot be
+    /// written never stops the server ([`crate::log_file`]).
+    #[arg(long, value_name = "DIR")]
+    pub log_dir: Option<PathBuf>,
+    /// The most bytes one log file holds before it is rotated; a line longer than this
+    /// goes alone to a fresh file. With `--log-files` it bounds the log's size on disk.
+    #[arg(
+        long,
+        value_name = "BYTES",
+        default_value_t = crate::log_file::DEFAULT_MAX_BYTES,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
+    pub log_max_bytes: u64,
+    /// How many log files are kept, the current one included; rotation drops the
+    /// oldest. The log never exceeds `--log-max-bytes` times this, plus one line.
+    #[arg(
+        long,
+        value_name = "N",
+        default_value_t = crate::log_file::DEFAULT_FILES,
+        value_parser = clap::value_parser!(u32).range(1..)
+    )]
+    pub log_files: u32,
     /// The REAPI listener. Without `--reapi-tls-cert` and `--reapi-tls-key` it serves
     /// plain text, on any address; off loopback the start line carries a warning.
     #[arg(long, default_value = "127.0.0.1:8980")]
@@ -368,6 +409,17 @@ pub enum ConfigError {
 }
 
 impl Args {
+    /// The directory of the durable log file: `--log-dir`, else `log` in the hot
+    /// store's directory (beside `meta`), else none.
+    #[must_use]
+    pub fn log_dir(&self) -> Option<PathBuf> {
+        match (&self.log_dir, &self.hot_store) {
+            (Some(dir), _) => Some(dir.clone()),
+            (None, Some(StoreUri::File(hot))) => Some(hot.join(crate::log_file::HOT_STORE_SUBDIR)),
+            (None, _) => None,
+        }
+    }
+
     /// Where the flags put the server's bytes and metadata, sized from `space`.
     ///
     /// # Errors
@@ -689,8 +741,9 @@ mod tests {
     /// --s3-bucket=kbf-cas --s3-conditional-put --meta-log=raft --raft-dir=...`): the
     /// same endpoint, bucket, region, capabilities, timeouts and put rate; the key prefix
     /// root `kbf/`; the log in the same directory. And a directory cold store and a hot
-    /// directory keep what `--blob-dir` (floor 1 GiB, prefix `kbf/`) and
-    /// `--write-tier-dir` (the 30 s seal) had.
+    /// directory keep what `--blob-dir` (prefix `kbf/`) and `--write-tier-dir` (the
+    /// 30 s seal) had; the directory's floor is no longer a fixed 1 GiB but the
+    /// evicting directory's `keep_free` (5%, at least 1 GiB).
     #[test]
     fn a_converged_unit_opens_the_stores_the_old_flags_did() {
         let args = Args::parse_from([
@@ -720,7 +773,10 @@ mod tests {
             std::path::Path::new("/var/lib/kbf-server/raft")
         );
         assert_eq!(stores.hot, None, "no tier unless asked, as before");
-        assert_eq!(crate::stores::COLD_FILE_MIN_FREE_BYTES, 1 << 30);
+        assert_eq!(
+            crate::stores::COLD_FILE_FLOOR,
+            kbf_objstore::Floor::KeepFree
+        );
         assert_eq!(crate::stores::FILE_PREFIX_ROOT, "kbf/");
         assert_eq!(kbf_tier::TierOptions::SEAL_AFTER, Duration::from_secs(30));
     }

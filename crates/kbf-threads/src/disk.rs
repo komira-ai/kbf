@@ -12,7 +12,8 @@
 //! - [`Space::of_capacity`]: a share of the filesystem's size less the floor. For a
 //!   directory that fills up on purpose and evicts to keep the floor free (the daemon's
 //!   input cache): a share of the *free* space would shrink at every restart, by what
-//!   the cache already holds.
+//!   the cache already holds. The server's `file://` cold store evicts to the same
+//!   [`keep_free`] floor, read afresh at each write, with no budget of its own.
 //! - [`Space::of_free`]: a share of the free space less the floor (at most half of what
 //!   is free). For a directory that never evicts to a free-space floor (the server's
 //!   write tier, which only stops taking writes at its budget). The directory's own

@@ -715,7 +715,9 @@ fn data_dir(cli: &Cli) -> Result<Option<data_dir::Plan>, Error> {
     // The drivers that link or clone leases' inputs from the cache.
     let cached = cli.drivers.contains(&Driver::Container)
         || (cfg!(target_os = "macos") && cli.drivers.contains(&Driver::Native));
-    let plan = data_dir::Plan::new(&cli.data, cached, &Statvfs)?;
+    // The OCI backend's container ids are not the daemon's: `leases` must be searchable.
+    let oci = cli.drivers.contains(&Driver::Container) && cli.container_runtime == "oci";
+    let plan = data_dir::Plan::new(&cli.data, cached, &Statvfs)?.with_open_leases(oci);
     plan.create()?;
     for line in plan.describe() {
         tracing::info!("{line}");

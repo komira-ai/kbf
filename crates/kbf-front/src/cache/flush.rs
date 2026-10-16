@@ -189,6 +189,7 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
             Err(ObjectStoreError::AlreadyExists(_)) => true,
             Err(e) => return Err(e.into()),
         };
+        self.writer.recency.written(object, total);
         let stored = match self.writer.read_footer(&key, total).await {
             Ok(footer) => Some(footer),
             // The key holds an object this footer does not describe (another length,

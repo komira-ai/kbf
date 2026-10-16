@@ -72,10 +72,11 @@ pub use crate::bytestream::ByteStreamService;
 pub use crate::cache::HIT_CHECKS_IN_FLIGHT;
 pub use crate::cache::{
     Admitted, BATCH_READS_IN_FLIGHT, CONNECTION_WINDOW_BYTES, Cache, CacheError, EVICT_BATCH,
-    EvictReady, FLUSH_BACKOFF_FIRST, FLUSH_BACKOFF_MAX, FLUSHES_PER_ROUND, FlushRound, HeldObject,
-    MAX_ADMISSION_BYTES, MAX_CONCURRENT_STREAMS, NEEDS_V3, PASS_OPENS_PER_SEC, PUT_BACKOFF,
-    PUT_BACKOFF_FACTOR, PassReport, RecordStream, STREAM_WINDOW_BYTES, StreamedRecord,
-    TierStartError, TierStartup, TouchConfig, VerifiedBlob, WriteConfig,
+    EVICT_EVERY, EVICT_GRACE, EvictReady, EvictRound, FLUSH_BACKOFF_FIRST, FLUSH_BACKOFF_MAX,
+    FLUSHES_PER_ROUND, FlushRound, HeldObject, MAX_ADMISSION_BYTES, MAX_CONCURRENT_STREAMS,
+    NEEDS_V3, PASS_OPENS_PER_SEC, PUT_BACKOFF, PUT_BACKOFF_FACTOR, PassReport, RecordStream,
+    STREAM_WINDOW_BYTES, StreamedRecord, TierStartError, TierStartup, TouchConfig, VerifiedBlob,
+    WriteConfig,
 };
 pub use crate::capabilities::{CapabilitiesService, server_capabilities};
 pub use crate::cas::CasService;

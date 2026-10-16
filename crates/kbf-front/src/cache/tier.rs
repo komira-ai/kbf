@@ -280,6 +280,7 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         location: Location,
         staged_on: Option<TierId>,
     ) -> Result<Bytes, CacheError> {
+        self.used([location.object]);
         if let Some(staging) = self.writer.tier.get()
             && staged_on.is_none_or(|t| t == staging.id)
         {
