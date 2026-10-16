@@ -81,10 +81,11 @@ pub fn parse(matches: &ArgMatches) -> Result<Flags, clap::Error> {
             .cloned()
             .unwrap_or_else(|| PathBuf::from(kbf_node::DEFAULT_DATA_DIR));
         if !dir.is_absolute() {
-            return Err(refuse(format!(
+            let said = format!(
                 "--data-dir {}: must be absolute (the state file {STATE_FILE} goes in it)",
                 dir.display()
-            )));
+            );
+            return Err(command().error(ErrorKind::ArgumentConflict, said));
         }
         server.state_store = Some(kbf_server::StateStoreUri::Sqlite(dir.join(STATE_FILE)));
     }
