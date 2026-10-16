@@ -195,3 +195,52 @@ async fn with_a_tier_each_output_file_is_read_once() {
 async fn without_a_tier_each_output_file_is_read_once() {
     each_output_file_is_read_once(false).await;
 }
+
+/// One sparse output over 1 GiB (the size above which a file used not to be taken),
+/// collected through a lease of the plane: it must be opened once and be held after.
+async fn a_file_over_1_gib_is_read_once(tier: bool) {
+    let dir = scratch(if tier { "huge-tier" } else { "huge-no-tier" });
+    let plane = plane(&dir.join("server"), tier).await;
+    let upper = dir.join("upper");
+    let out = upper.join("out");
+    std::fs::create_dir_all(&out).expect("mkdir");
+    std::fs::File::create(out.join("huge"))
+        .and_then(|file| file.set_len((1 << 30) + (1 << 20)))
+        .expect("sparse file");
+    let watched = watch(&[&out]);
+    let lease = plane.lease(&LeaseId::new(1, 1));
+    let mut result = ActionResult::default();
+    let collected = collect(
+        &lease,
+        &upper,
+        &CpuPool::new(4),
+        "",
+        &["out/huge".to_owned()],
+        OutputLimits::DEFAULT,
+        &mut result,
+    )
+    .await;
+    let opens = opens(&watched);
+    let reads = opens.get("huge").copied().unwrap_or(0);
+    assert_eq!(
+        reads, 1,
+        "a file over 1 GiB was opened {reads} times (reads={reads}), not once: {opens:?}"
+    );
+    collected.expect("collect");
+    let digest = result.output_files[0].digest.clone().expect("a digest");
+    assert!(lease.missing(&[digest]).await.is_empty(), "not held");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Catches a file over 1 GiB not taken by the plane (read again, or refused): with a
+/// write tier.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn with_a_tier_a_file_over_1_gib_is_read_once() {
+    a_file_over_1_gib_is_read_once(true).await;
+}
+
+/// The same without a write tier.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn without_a_tier_a_file_over_1_gib_is_read_once() {
+    a_file_over_1_gib_is_read_once(false).await;
+}
