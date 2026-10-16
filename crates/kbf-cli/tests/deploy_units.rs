@@ -13,6 +13,14 @@ use kbf_host::path::{HostPath, Root};
 use kbf_host::step::{Cmd, HttpUrl, Step};
 use kbf_host::trust::Untrusted;
 
+/// Modes `kbf` builds whose unit `kbf-deploy` still renders as an unbuilt one: no flag
+/// on `ExecStart=`, `is_built()` false. `kbf frontend` needs `--storage`, so kbf refuses
+/// the rendered command line; the unit's flags (listen addresses, the storage URL and
+/// its three certificate flags, the state store) belong to the `kbf-deploy` change that
+/// owns the templates (av2-16). That change deletes this row, and both tests below say
+/// so by going red the day the unit has flags (or `is_built()` is true).
+const UNITS_BEHIND: &[Mode] = &[Mode::Frontend];
+
 const EXAMPLE: &str = include_str!("../../kbf-deploy/templates/linux/config.example");
 
 /// The example settings with one pinned image, so the image flags render too.
@@ -39,6 +47,12 @@ fn each_rendered_mode_unit_parses_with_kbfs_own_parser() {
         let unit = UnitFile::parse(&text).expect("a unit");
         let argv = unit.exec_start();
         assert_eq!(argv[..2], ["/usr/local/bin/kbf", mode.name()], "{mode}");
+        if UNITS_BEHIND.contains(&mode) {
+            let e = parse_from(argv.iter().copied()).expect_err("a unit without --storage");
+            assert!(e.to_string().contains("--storage"), "kbf {mode}: {e}");
+            assert_eq!(argv.len(), 2, "kbf {mode}'s unit has flags now: {argv:?}");
+            continue;
+        }
         let parsed = match parse_from(argv.iter().copied()) {
             Ok(parsed) => parsed,
             Err(e) => panic!("kbf {mode} refuses its rendered ExecStart= {argv:?}:\n{e}"),
@@ -46,6 +60,7 @@ fn each_rendered_mode_unit_parses_with_kbfs_own_parser() {
         match parsed {
             Invocation::Daemon(_) => assert_eq!(mode, Mode::Daemon),
             Invocation::AllInOne(_) => assert_eq!(mode, Mode::AllInOne),
+            Invocation::Frontend(_) => unreachable!("{mode}: its unit has no --storage yet"),
             Invocation::Storage(flags) => {
                 assert_eq!(mode, Mode::Storage);
                 // The unit's certificate flags are read as the paths they spell (not
@@ -97,7 +112,7 @@ fn kbf_deploy_renders_exactly_the_modes_kbf_takes() {
     let deploy: Vec<&str> = Mode::ALL.iter().map(|m| m.name()).collect();
     assert_eq!(deploy, help);
     for (mode, row) in Mode::ALL.iter().zip(MODES) {
-        let built = !matches!(row.entry, Entry::NotBuilt);
+        let built = !matches!(row.entry, Entry::NotBuilt) && !UNITS_BEHIND.contains(mode);
         assert_eq!(mode.is_built(), built, "{mode}");
     }
 }

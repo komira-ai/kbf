@@ -1,15 +1,13 @@
 //! A worker's heartbeat as the farm takes it: fed to the scheduler, its leases not held
 //! here cancelled, and the callers of an operation it finished answered.
 
-use kbf_front::MetaLog;
-use kbf_objstore::ObjectStore;
 use kbf_proto::worker::{Cancel, ServerMessage, server_message};
 use kbf_sched::Event;
 use kbf_types::{FarmTime, LeaseId, WorkerId};
 
 use super::{Farm, Settled, State, StreamId, wire_lease};
 
-impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
+impl Farm {
     /// Heartbeat `seq` on `stream`. Returns whether it was taken (and is to be
     /// acknowledged): a heartbeat from a replaced stream is dropped. Each lease it
     /// lists that the scheduler no longer holds on `worker` is sent a `Cancel`. A lease
