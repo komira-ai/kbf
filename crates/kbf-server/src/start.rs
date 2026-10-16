@@ -392,8 +392,7 @@ mod tests {
             .expect("open the log");
         let (prefix, id) = (log.store_prefix(), log.log_id());
         let store = FsStore::open(&root.join("blobs"), Floor::Bytes(1)).expect("open the store");
-        let pending = || Ok(std::future::pending::<()>());
-        let refused = serve_with(&args, None, log, store, prefix, id, pending)
+        let refused = serve_with(&args, None, log, store, prefix, id, interrupted)
             .await
             .err()
             .expect("refused");

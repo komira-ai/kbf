@@ -472,4 +472,13 @@ async fn a_server_binds_over_a_state_store_or_refuses_it() {
         matches!(refused, ServeError::State(StateError::Corrupt { .. })),
         "{refused:?}"
     );
+    let said = refused.to_string();
+    assert!(
+        said.starts_with("--state-store: ") && said.contains("op/0000000000000001"),
+        "{said}"
+    );
+    assert!(
+        std::error::Error::source(&refused).is_some(),
+        "the cause is kept"
+    );
 }

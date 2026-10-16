@@ -358,9 +358,7 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
             let cause = "the daemon restarted, or two daemons hold this node's certificate";
             tracing::warn!(%worker, cause, "another daemon process registered as this node");
         }
-        state.durably("a session", |d| {
-            d.session(worker, &instance, stopped, &reported)
-        });
+        state.record_session(worker, &instance, stopped, &reported);
         let event = Event::WorkerUp {
             worker: worker.clone(),
             instance,
@@ -705,13 +703,7 @@ impl<M: MetaLog, O: ObjectStore + 'static> Dispatch for Farm<M, O> {
         let waiting = std::time::Instant::now();
         let mut state = self.lock();
         self.cache.metrics().sched_lock_wait.since(waiting);
-        let id = state.sched.next_operation();
-        let joins = state.sched.twin(&submission.request).is_some();
-        if !joins && !state.durably("a submission", |d| d.submitted(id, &submission.request)) {
-            return Err(Status::unavailable(
-                "the scheduler's state store did not take the request",
-            ));
-        }
+        state.admit(&submission.request)?;
         let action = submission.request.key.action;
         let instance = submission.request.key.instance.clone();
         let waiter = state.machine.submit(Waiter {

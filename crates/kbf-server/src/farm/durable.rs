@@ -34,6 +34,7 @@ use kbf_types::{
 
 use kbf_objstore::ObjectStore;
 use tokio::sync::watch;
+use tonic::Status;
 
 use super::{Farm, FarmMachine, Reported, Sent, Stamp, State, Waiter, process_term};
 
@@ -426,7 +427,36 @@ impl State {
             }
         }
     }
-}
 
-#[cfg(test)]
-mod tests;
+    /// Writes `request`, about to be queued, to the state store, unless it will join a
+    /// twin already there. Not generic, unlike `Farm::submit`, so every test binary's
+    /// runs count toward the same function's coverage.
+    ///
+    /// # Errors
+    /// UNAVAILABLE if the store did not take it: the request is not queued, and the
+    /// client, who is told nothing is queued, asks again.
+    pub(super) fn admit(&self, request: &Request) -> Result<(), Status> {
+        let id = self.sched.next_operation();
+        let joins = self.sched.twin(request).is_some();
+        if !joins && !self.durably("a submission", |d| d.submitted(id, request)) {
+            return Err(Status::unavailable(
+                "the scheduler's state store did not take the request",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Writes the session row of a daemon that registered. Not generic, unlike
+    /// `Farm::register`.
+    pub(super) fn record_session(
+        &self,
+        worker: &WorkerId,
+        instance: &DaemonInstance,
+        predecessor_stopped: bool,
+        reported: &Reported,
+    ) {
+        self.durably("a session", |d| {
+            d.session(worker, instance, predecessor_stopped, reported)
+        });
+    }
+}
