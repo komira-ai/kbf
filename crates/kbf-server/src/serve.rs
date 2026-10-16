@@ -27,12 +27,13 @@ use tonic::transport::server::TcpIncoming;
 use tonic::transport::{Server, ServerTlsConfig};
 
 use crate::blobs::{WorkerBlobs, WorkerCas, WorkerSegments};
-use crate::farm::Farm;
+use crate::farm::{Farm, StateError};
 use crate::grpc_health::{HealthService, WATCH_INTERVAL};
 use crate::health::Readiness;
 use crate::http_blobs::BlobReaders;
 use crate::http_invocations::InvocationReaders;
 use crate::identity::{DenyList, Peers};
+use crate::state_store::StateStore;
 use crate::token::ApiToken;
 use crate::worker::WorkerService;
 
@@ -119,6 +120,9 @@ pub enum ServeError {
     /// The operator API listener failed.
     #[error("operator API: {0}")]
     Api(#[source] std::io::Error),
+    /// The scheduler's state store could not be taken up.
+    #[error("--state-store: {0}")]
+    State(#[from] StateError),
 }
 
 /// A server that is listening: the addresses it bound, and the future that serves
@@ -212,6 +216,16 @@ fn flow_control(server: Server) -> Server {
 const STATE_IN_MEMORY: &str = "the scheduler's state is in memory: no cordon, drain, lease or \
     operation of an earlier server process is restored, and the server keeps no rollout record";
 
+/// Logs where the scheduler's state is, at every start. Not generic, unlike the binding
+/// that calls it, so every test binary's runs count toward the same function's coverage.
+fn log_state(durable: bool, term: u64, epoch: u64) {
+    if durable {
+        tracing::info!(term, epoch, "the scheduler's state is in the state store");
+    } else {
+        tracing::warn!(term, epoch, "{STATE_IN_MEMORY}");
+    }
+}
+
 /// Binds the REAPI and worker listeners for a farm over `cache`, and no operator API.
 /// Nothing is served until the returned future runs; it serves until `shutdown`
 /// completes, or a listener fails.
@@ -292,7 +306,27 @@ where
     M: MetaLog,
     O: ObjectStore + 'static,
 {
-    bind_server_with_storage(cache, listeners, api, policy, None, shutdown)
+    bind_server_with_options(cache, listeners, api, policy, None, None, shutdown)
+}
+
+/// [`bind_server_with_policy`], with the scheduler's state kept in `state` if given
+/// (`--state-store`): see [`Farm::with_state`].
+///
+/// # Errors
+/// As [`bind_server_with_policy`], and the state store cannot be read.
+pub fn bind_server_with_state<M, O>(
+    cache: Arc<Cache<M, O>>,
+    listeners: Listeners,
+    api: Option<Api>,
+    policy: Policy,
+    state: Option<StateStore>,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> Result<Bound<impl Future<Output = Result<(), ServeError>>>, ServeError>
+where
+    M: MetaLog,
+    O: ObjectStore + 'static,
+{
+    bind_server_with_options(cache, listeners, api, policy, state, None, shutdown)
 }
 
 /// [`bind_server_with_policy`], and with a `storage` node (`--storage`) the REAPI
@@ -313,17 +347,39 @@ where
     M: MetaLog,
     O: ObjectStore + 'static,
 {
+    bind_server_with_options(cache, listeners, api, policy, None, storage, shutdown)
+}
+
+/// [`bind_server_with_policy`] with both of its options: the scheduler's state in
+/// `state` ([`bind_server_with_state`]) and the client's CAS, ByteStream and
+/// action-cache calls proxied to a `storage` node ([`bind_server_with_storage`]).
+///
+/// # Errors
+/// As [`bind_server_with_state`].
+pub fn bind_server_with_options<M, O>(
+    cache: Arc<Cache<M, O>>,
+    listeners: Listeners,
+    api: Option<Api>,
+    policy: Policy,
+    state: Option<StateStore>,
+    storage: Option<tonic::transport::Endpoint>,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> Result<Bound<impl Future<Output = Result<(), ServeError>>>, ServeError>
+where
+    M: MetaLog,
+    O: ObjectStore + 'static,
+{
     let (recorder, recording) = Recorder::new(listeners.invocation_memory, RECORDER_CHANNEL);
     let default_memory = listeners.memory_ladder.first();
-    let farm = Arc::new(
-        Farm::new(
-            Arc::clone(&cache),
-            listeners.unservable_wait,
-            listeners.finished_retention,
-        )
-        .with_memory_ladder(listeners.memory_ladder.clone())
-        .recording(recorder.clone()),
-    );
+    let farm = Farm::new(
+        Arc::clone(&cache),
+        listeners.unservable_wait,
+        listeners.finished_retention,
+    )
+    .with_memory_ladder(listeners.memory_ladder.clone())
+    .recording(recorder.clone());
+    let durable = state.is_some();
+    let farm = Arc::new(farm.with_state(state)?);
     let (reapi_incoming, reapi) = bind(listeners.reapi)?;
     let (worker_incoming, worker) = bind(listeners.worker)?;
     let probe_timeout = listeners.store_probe_timeout;
@@ -347,7 +403,7 @@ where
         .merge(page_routes);
     // Logged at every start, the first one too (issue #156).
     let (term, epoch) = (farm.term(), farm.lease_epoch());
-    tracing::warn!(term, epoch, "{STATE_IN_MEMORY}");
+    log_state(durable, term, epoch);
 
     let mut reapi_server = flow_control(Server::builder());
     if let Some(tls) = listeners.reapi_tls {

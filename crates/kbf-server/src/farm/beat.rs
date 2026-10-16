@@ -57,6 +57,7 @@ impl State {
             running: running.clone(),
         };
         let answers = self.feed(now, event);
+        self.renew_session(now, worker);
         for lease in self.sched.not_held(worker, &running) {
             tracing::info!(%worker, %lease, "a lease not held here is listed: cancelled");
             let cancel = server_message::Message::Cancel(Cancel {
