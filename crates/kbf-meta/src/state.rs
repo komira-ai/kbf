@@ -330,6 +330,18 @@ impl MetaState {
         self.losses
     }
 
+    /// Blobs marked lost now. Not counted yet: always 0.
+    #[must_use]
+    pub const fn lost_blobs(&self) -> u64 {
+        0
+    }
+
+    /// Blobs ever marked lost. Not counted yet: always 0.
+    #[must_use]
+    pub const fn blob_losses(&self) -> u64 {
+        0
+    }
+
     /// `object`'s loss mark, or `None` if it is not marked. A prober reads the
     /// generation here before it probes the store, and names it in the
     /// [`Command::ObjectReachable`] it sends.
