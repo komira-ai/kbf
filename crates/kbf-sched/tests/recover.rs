@@ -235,8 +235,16 @@ fn only_the_returning_workers_leases_are_booked() {
     assert!(feed(&mut s, 30, Event::Tick).is_empty());
     assert!(committed_lease(s.state(OperationId(4))).is_some());
     feed(&mut s, LEASE_GRACE.as_secs() + 1, Event::Tick);
-    assert_eq!(s.state(OperationId(4)), Some(&OpState::Queued));
-    assert!(committed_lease(s.state(OperationId(3))).is_some());
+    // The second lease was given up (node-b never came back), and its operation is placed
+    // again on node-a in the same round; the first is still node-a's.
+    let given_up = s.take_requeues();
+    assert_eq!(given_up.len(), 1);
+    assert_eq!(given_up[0].operation, OperationId(4));
+    assert_eq!(given_up[0].worker, node("node-b"));
+    assert_eq!(
+        committed_lease(s.state(OperationId(3))),
+        Some(LeaseId::new(TERM, 5))
+    );
 }
 
 /// Catches: a recovered whole-machine lease, or an action at the whole host's memory,
