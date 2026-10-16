@@ -13,7 +13,7 @@
 //!   FindMissing for it, and commits it unless it is held already (the bytes on the
 //!   tier are then dropped). The flusher checks its digest before it PUTs the block, as
 //!   for any staged upload. When the server has no write tier, or the tier has no room
-//!   for it (or it is over the largest blob), the file is not taken: it goes to
+//!   for it, the file is not taken: it goes to
 //!   `put_records`, whose `Begin` the server refuses with
 //!   [`unstaged_refusal`](kbf_front::unstaged_refusal)'s message, before a byte of it is
 //!   read again. A large file is never held in memory.
@@ -188,8 +188,8 @@ fn not_stored(e: CacheError) -> CasError {
 impl Intake for Taking {
     fn file(&self, size: u64) -> Option<Box<dyn IntakeFile>> {
         if size > MAX_UNSTAGED_BLOB_BYTES {
-            // Streamed, or not taken: no room on a write tier (or a size over the
-            // largest blob), and too large to hold in memory.
+            // Streamed, or not taken: no room on a write tier, and too large to hold
+            // in memory.
             let stream = self.0.plane.store().stream(size)?;
             return Some(Box::new(StreamedFile {
                 stream: Ok(stream),

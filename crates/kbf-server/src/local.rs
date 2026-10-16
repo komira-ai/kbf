@@ -3,8 +3,9 @@
 //! through, with no listener, TLS or protobuf encoding between them.
 //!
 //! Each call is one the worker listener serves a remote daemon, on the same [`Cache`]:
-//! FindMissing ([`LocalStore::find_missing`]), a whole-blob read
-//! ([`LocalStore::read_blob`]), a whole-blob write hashed here once, under the same
+//! FindMissing ([`LocalStore::find_missing`]), a whole-blob read of a blob the daemon
+//! decodes ([`LocalStore::read_blob`]), a read of any blob in windows
+//! ([`LocalStore::read`], ByteStream Read's path), a whole-blob write hashed here once, under the same
 //! admission as a ByteStream `Write` ([`LocalStore::put`]), and the `Segments` service
 //! itself ([`LocalStore::segments`]), whose `Begin`, `PutRange` and `Commit` are the
 //! handlers a remote upload runs: with a write tier the daemon's digests are trusted at
@@ -22,10 +23,11 @@
 
 use std::sync::Arc;
 
+use bytes::Bytes;
 use futures::future::BoxFuture;
 use kbf_front::{
-    Cache, CacheError, Connections, MetaLog, RecordStream, SegmentsConfig, SegmentsService,
-    StreamedRecord, VerifiedBlob,
+    BlobRead, Cache, CacheError, Connections, MetaLog, RecordStream, SegmentsConfig,
+    SegmentsService, StreamedRecord, VerifiedBlob,
 };
 use kbf_objstore::ObjectStore;
 use kbf_proto::worker::segments_server::Segments;
@@ -42,6 +44,7 @@ pub struct LocalStore {
 trait Blobs: Send + Sync {
     fn find_missing<'a>(&'a self, digests: &'a [Digest]) -> Answer<'a, Vec<Digest>>;
     fn read_blob<'a>(&'a self, digest: &'a Digest) -> Answer<'a, Vec<u8>>;
+    fn read<'a>(&'a self, digest: &'a Digest) -> Answer<'a, LocalRead>;
     fn put(&self, bytes: Vec<u8>) -> Answer<'_, Digest>;
     fn segments(&self) -> Arc<dyn Segments>;
     fn stream(&self, size: u64) -> Option<LocalStream>;
@@ -51,6 +54,31 @@ trait Blobs: Send + Sync {
 trait Streaming: Send {
     fn append(&mut self, chunk: &[u8]) -> Result<(), CacheError>;
     fn finish(self: Box<Self>, digest: Digest, crc32c: u32) -> Result<LocalStreamed, CacheError>;
+}
+
+/// [`LocalRead`]'s calls over a cache of any metadata log and object store.
+trait Windows: Send {
+    fn next(&mut self) -> BoxFuture<'_, Option<Result<Bytes, CacheError>>>;
+}
+
+impl<M: MetaLog, O: ObjectStore + 'static> Windows for BlobRead<M, O> {
+    fn next(&mut self) -> BoxFuture<'_, Option<Result<Bytes, CacheError>>> {
+        Box::pin(BlobRead::next(self))
+    }
+}
+
+/// A blob being read in windows ([`LocalStore::read`]).
+pub struct LocalRead(Box<dyn Windows>);
+
+impl LocalRead {
+    /// The blob's next bytes, at most `kbf_front::READ_WINDOW_BYTES`; `None` after the
+    /// last. The last window comes only once the blob's digest checked.
+    ///
+    /// # Errors
+    /// A window could not be read, or the blob's bytes fail its digest: the read ends.
+    pub async fn next(&mut self) -> Option<Result<Bytes, CacheError>> {
+        self.0.next().await
+    }
 }
 
 /// [`LocalStreamed`]'s calls.
@@ -129,6 +157,16 @@ impl<M: MetaLog, O: ObjectStore + 'static> Blobs for Over<M, O> {
         Box::pin(async move { self.cache.read_blob(digest).await.map(Vec::from) })
     }
 
+    fn read<'a>(&'a self, digest: &'a Digest) -> Answer<'a, LocalRead> {
+        Box::pin(async move {
+            let read = self
+                .cache
+                .read_windows(digest, 0, digest.size_bytes)
+                .await?;
+            Ok(LocalRead(Box::new(read)))
+        })
+    }
+
     fn put(&self, bytes: Vec<u8>) -> Answer<'_, Digest> {
         Box::pin(async move {
             let size = bytes.len() as u64;
@@ -177,12 +215,23 @@ impl LocalStore {
         self.inner.find_missing(digests).await
     }
 
-    /// The blob's bytes, checked against its digest by the cache.
+    /// The blob's bytes, checked against its digest by the cache, read whole: for a
+    /// blob the daemon decodes (at most `kbf_front::MAX_DECODED_BLOB_BYTES`).
+    ///
+    /// # Errors
+    /// [`CacheError::NotFound`] if the blob is not held, or why it cannot be read;
+    /// [`CacheError::Invalid`] for a blob too large to read whole.
+    pub async fn read_blob(&self, digest: &Digest) -> Result<Vec<u8>, CacheError> {
+        self.inner.read_blob(digest).await
+    }
+
+    /// The blob, read in windows as ByteStream Read reads it, holding one window at a
+    /// time: for a blob of any size.
     ///
     /// # Errors
     /// [`CacheError::NotFound`] if the blob is not held, or why it cannot be read.
-    pub async fn read_blob(&self, digest: &Digest) -> Result<Vec<u8>, CacheError> {
-        self.inner.read_blob(digest).await
+    pub async fn read(&self, digest: &Digest) -> Result<LocalRead, CacheError> {
+        self.inner.read(digest).await
     }
 
     /// Hashes `bytes` once, stores them under that digest within
@@ -190,17 +239,15 @@ impl LocalStore {
     /// returns the digest once they are durable.
     ///
     /// # Errors
-    /// The blob is over the largest the cache accepts, or the store or the metadata
-    /// log failed.
+    /// The store or the metadata log failed.
     pub async fn put(&self, bytes: Vec<u8>) -> Result<Digest, CacheError> {
         self.inner.put(bytes).await
     }
 
     /// A stream for one blob of `size` bytes onto the write tier, in a block of its own,
     /// its bytes written as they are appended and never held here; `None` without a
-    /// write tier, when the tier has no room for it, or for a size of 0 or over the
-    /// largest blob (`kbf_front::MAX_BLOB_BYTES`). Blocking: call it off the async
-    /// runtime.
+    /// write tier, when the tier has no room for it, or for a size of 0. Blocking: call
+    /// it off the async runtime.
     #[must_use]
     pub fn stream(&self, size: u64) -> Option<LocalStream> {
         self.inner.stream(size)

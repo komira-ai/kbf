@@ -78,7 +78,7 @@ pub struct Args {
     /// written through to it as they arrive, so a large one is never held in memory;
     /// without it, or when it has no room, a daemon's blob over 16 MiB
     /// (`kbf_front::MAX_UNSTAGED_BLOB_BYTES`) is refused RESOURCE_EXHAUSTED rather than
-    /// held whole, until multipart cold-store PUTs exist. The first start with a hot store raises the metadata log to machine
+    /// held whole (a ByteStream Write of any size streams to the cold store). The first start with a hot store raises the metadata log to machine
     /// version 2, once; a binary that runs only version 1 no longer reads it.
     /// The metadata log lives in `<dir>/meta`, unless `--meta-dir` says otherwise.
     #[arg(long, value_name = "URI")]
@@ -275,11 +275,12 @@ pub struct Args {
     )]
     pub invocation_memory: u64,
     /// The most bytes, records and footers together, one segment upload on the worker
-    /// listener may declare (`docs/design/write-path.md`, section 4.2). Ranges are held
-    /// in memory until their upload commits, admitted under `--write-bytes-in-flight`
-    /// with every other upload: a `Begin` waits while that is spent. At least one 5 GiB
-    /// blob (the largest, `kbf_front::MAX_BLOB_BYTES`) and its footer (5 GiB + 1 MiB),
-    /// so any blob the cache accepts can be uploaded, and at most
+    /// listener may hold in memory (`docs/design/write-path.md`, section 4.2): the
+    /// segments it declares that are not written to the hot store as they arrive (all
+    /// of them, without one). Those ranges are held until the upload commits, admitted
+    /// under `--write-bytes-in-flight` with every other upload: a `Begin` waits while
+    /// that is spent. At least 33 MiB (`kbf_front::MIN_SEGMENT_UPLOAD_BYTES`), a
+    /// daemon's upload of small files with room to spare, and at most
     /// `--write-bytes-in-flight`, so any legal `Begin` can be admitted; the server
     /// refuses to start otherwise. At most `kbf_front::MAX_ADMISSION_BYTES`, the most
     /// one admission counts, so a `Begin` never holds more than it is counted for under
@@ -311,19 +312,20 @@ pub struct Args {
     /// the group, so they neither wait for the linger nor hold up small writes.
     #[arg(long, default_value_t = kbf_front::WriteConfig::DEFAULT.own_segment_bytes)]
     pub write_own_segment_bytes: u64,
-    /// The most bytes uploads may hold at once. A ByteStream Write is admitted for its
-    /// blob's size before it reads past its first message, a BatchUpdateBlobs for its
-    /// total, a segment upload's Begin for its whole length; a caller over the bound
-    /// waits, nothing is refused for load. At least the largest blob (5 GiB), so one
-    /// can always be admitted, and at least `--segment-upload-max-bytes` (by default
-    /// 5 GiB + 1 MiB, under the default 6 GiB). Not covered: each HTTP/2
+    /// The most bytes uploads may hold at once. A ByteStream Write is admitted before
+    /// it reads past its first message, for its blob's size up to 16 MiB
+    /// (`kbf_front::MAX_UNSTAGED_BLOB_BYTES`) and for 16 MiB above that (a larger blob
+    /// is streamed to the cold store, not held); a BatchUpdateBlobs for its total; a
+    /// segment upload's Begin for what it holds in memory. A caller over the bound
+    /// waits, nothing is refused for load. At least `--segment-upload-max-bytes` (by
+    /// default 33 MiB, under the default 2 GiB). Not covered: each HTTP/2
     /// stream's message as tonic decodes it, before the handler runs, up to 17 MiB per
     /// stream (about 3.4 GiB for 200 streams) and 200 streams per connection on either listener
     /// (`kbf_front::MAX_CONCURRENT_STREAMS`).
     #[arg(
         long,
         default_value_t = kbf_front::WriteConfig::DEFAULT.bytes_in_flight,
-        value_parser = clap::value_parser!(u64).range(kbf_front::MAX_BLOB_BYTES..)
+        value_parser = clap::value_parser!(u64).range(kbf_front::MIN_SEGMENT_UPLOAD_BYTES..)
     )]
     pub write_bytes_in_flight: u64,
     /// The most segment PUTs, each with its footer read-back, in flight at once. A
@@ -652,7 +654,7 @@ mod tests {
     use std::time::Duration;
 
     use clap::Parser;
-    use kbf_front::{MAX_BLOB_BYTES, WriteConfig};
+    use kbf_front::{MIN_SEGMENT_UPLOAD_BYTES, WriteConfig};
 
     use kbf_threads::disk::{FreeSpace, Space};
 
@@ -823,29 +825,26 @@ mod tests {
     }
 
     /// Catches a `--segment-upload-*` flag that does not reach the listeners, a default
-    /// other than the design's (5 GiB + 1 MiB, 60 s), and a cap below one largest blob
-    /// and its footer accepted (a `Begin` for such a blob would be refused for good).
+    /// other than the design's (33 MiB, 60 s), and a cap below it accepted (a daemon's
+    /// upload of small files would be refused for good).
     #[test]
     fn segment_upload_flags_reach_the_listeners() {
         let defaults = Args::parse_from(["kbf-server"])
             .listeners()
             .expect("listeners");
         assert_eq!(defaults.segments, kbf_front::SegmentsConfig::DEFAULT);
-        assert_eq!(defaults.segments.max_bytes, (5 << 30) + (1 << 20));
+        assert_eq!(defaults.segments.max_bytes, 33 << 20);
         assert_eq!(defaults.segments.idle, std::time::Duration::from_secs(60));
         let set = Args::parse_from([
             "kbf-server",
-            "--segment-upload-max-bytes=6442450944",
+            "--segment-upload-max-bytes=1073741824",
             "--segment-upload-idle-secs=5",
         ])
         .listeners()
         .expect("listeners");
-        assert_eq!(set.segments.max_bytes, 6 << 30);
+        assert_eq!(set.segments.max_bytes, 1 << 30);
         assert_eq!(set.segments.idle, std::time::Duration::from_secs(5));
-        let below = format!(
-            "--segment-upload-max-bytes={}",
-            (5u64 << 30) + (1 << 20) - 1
-        );
+        let below = format!("--segment-upload-max-bytes={}", (33u64 << 20) - 1);
         for refused in [below.as_str(), "--segment-upload-idle-secs=0"] {
             assert!(
                 Args::try_parse_from(["kbf-server", refused]).is_err(),
@@ -861,7 +860,7 @@ mod tests {
     /// less is refused, naming both flags.
     #[test]
     fn a_segment_upload_cap_over_the_write_bound_is_refused() {
-        let cap = kbf_front::MIN_SEGMENT_UPLOAD_BYTES;
+        let cap = kbf_front::MIN_SEGMENT_UPLOAD_BYTES + 1;
         let args = |bound: u64| {
             Args::parse_from([
                 "kbf-server".to_owned(),
@@ -929,8 +928,8 @@ mod tests {
         }
     }
 
-    /// Catches: a `--write-bytes-in-flight` below the largest blob accepted (a Write of
-    /// that blob would wait for admission forever), a flag wired to the wrong field of
+    /// Catches: a `--write-bytes-in-flight` below the smallest segment upload cap (a
+    /// `Begin` of that cap would wait for admission forever), a flag wired to the wrong field of
     /// the write configuration, and defaults other than the design's.
     #[test]
     fn write_flags_make_the_write_config() {
@@ -950,7 +949,7 @@ mod tests {
             "--write-own-segment-bytes",
             "12345",
             "--write-bytes-in-flight",
-            &MAX_BLOB_BYTES.to_string(),
+            &MIN_SEGMENT_UPLOAD_BYTES.to_string(),
             "--write-puts-in-flight",
             "9",
             "--store-put-attempts",
@@ -961,13 +960,13 @@ mod tests {
         let want = WriteConfig {
             linger: Duration::from_millis(7),
             own_segment_bytes: 12345,
-            bytes_in_flight: MAX_BLOB_BYTES,
+            bytes_in_flight: MIN_SEGMENT_UPLOAD_BYTES,
             puts_in_flight: NonZeroUsize::new(9).expect("9"),
             put_attempts: NonZeroU32::new(5).expect("5"),
             cpu_threads: NonZeroUsize::new(3).expect("3"),
         };
         assert_eq!(set.write_config(), want);
-        let below = (MAX_BLOB_BYTES - 1).to_string();
+        let below = (MIN_SEGMENT_UPLOAD_BYTES - 1).to_string();
         for (flag, value) in [
             ("--write-bytes-in-flight", below.as_str()),
             ("--write-puts-in-flight", "0"),

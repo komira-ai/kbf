@@ -50,8 +50,8 @@ server's own code:
   refuses a remote daemon's. A file of at most 16 MiB is kept in memory and put in a
   batch; a batch of 32 MiB (or 16,384 files) is stored as below while the walk goes
   on, at most four at once, and the rest when the walk ends, before the Directory
-  messages and the Tree that name them. A file is never read again. A file over the
-  largest blob (5 GiB, the same on every path) is refused too.
+  messages and the Tree that name them. A file is never read again. No file is too
+  large: a file over 5 GiB streams onto the tier like any other.
 - **Outputs** (`put_records`): the driver's walk has hashed each file once. The plane asks the cache which digests it lacks, packs those records into the
   segments and uploads the transfer engine plans (`kbf_transfer::plan`), and gives the
   `Segments` handlers each range of their bytes, from the intake's buffers (or read
@@ -62,7 +62,7 @@ server's own code:
   not match; without one, `PutRange` hashes each record as its bytes arrive.
 - **A whole blob** (`put`, and `put_chunks` through it): hashed once, by the server,
   under the admission a ByteStream `Write` takes.
-- **Reads** (`get`, and `read_to` through it) and **FindMissing** (`missing`): the cache's
+- **Reads** (`get` whole, `read_to` a window at a time) and **FindMissing** (`missing`): the cache's
   own, which checks every blob it reads against its digest.
 
 No message a remote daemon sends changes: `kbf-daemon` still uses the transfer engine.
@@ -84,7 +84,7 @@ No message a remote daemon sends changes: `kbf-daemon` still uses the transfer e
   plane, with a write tier and without: an inotify watch counts the opens of each output
   file, which must be one each (a file over 1 GiB too: held with a tier, refused for
   want of one without), and every blob reads back as the file; a blob over 5 GiB is
-  refused with the server's message.
+  not refused for its size.
 - `tests/memory.rs`: a counting allocator over the whole in-process path (the walk,
   the plane, the server's upload until its commit): a 2 GiB output streams onto the
   write tier with under 16 MiB live, and so does a 2 GiB upload through the server's
@@ -93,7 +93,7 @@ No message a remote daemon sends changes: `kbf-daemon` still uses the transfer e
   gone, a file changed after the walk hashed it.
 - `src/intake_tests.rs`: batches sent while the walk goes on (by bytes and by file
   count), the wait for room among the batches in flight, one digest stored once, a
-  file left unfinished storing nothing, a file over the largest blob not taken, and a
+  file left unfinished storing nothing, a file over 5 GiB streamed, and a
   server half that is gone.
 - `src/cli_tests.rs`: each flag reaches its half, once; the refusals.
 

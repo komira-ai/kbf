@@ -31,7 +31,6 @@ use kbf_types::Digest;
 
 use super::tier::{Staging, blocking};
 use super::{Cache, CacheError};
-use crate::MAX_BLOB_BYTES;
 use crate::meta_log::MetaLog;
 
 /// A block of its own on the write tier, reserved for records written as they arrive.
@@ -120,7 +119,7 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
 
     /// A stream for one blob of `size` bytes onto the write tier, in a block of its own;
     /// `None` without a tier, when the tier has no room for it (counted as a write the
-    /// tier did not take), or when `size` is 0 or over [`MAX_BLOB_BYTES`]. Blocking (it
+    /// tier did not take), or when `size` is 0. Blocking (it
     /// creates the block's file): call it off the async runtime.
     #[must_use]
     pub fn stream(self: &Arc<Self>, size: u64) -> Option<RecordStream<M, O>> {
@@ -155,11 +154,11 @@ struct Open {
 
 impl Open {
     /// A stream onto `staging`'s tier for `size` bytes; `None` without a tier, for a
-    /// size of 0 or over [`MAX_BLOB_BYTES`], or when the tier does not take it (counted
+    /// size of 0, or when the tier does not take it (counted
     /// as a write the tier did not take).
     fn start(staging: Option<&Arc<Staging>>, size: u64) -> Option<Self> {
         let staging = staging?;
-        (1..=MAX_BLOB_BYTES).contains(&size).then_some(())?;
+        (size > 0).then_some(())?;
         let reserved = TierRange::reserve(staging, size);
         let range = reserved.inspect_err(|e| staging.counters.direct(e)).ok()?;
         Some(Self {

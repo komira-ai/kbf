@@ -71,12 +71,13 @@ pub use crate::action_cache::ActionCacheService;
 pub use crate::bytestream::ByteStreamService;
 pub use crate::cache::HIT_CHECKS_IN_FLIGHT;
 pub use crate::cache::{
-    Admitted, BATCH_READS_IN_FLIGHT, CONNECTION_WINDOW_BYTES, Cache, CacheError, EVICT_BATCH,
-    EVICT_EVERY, EVICT_GRACE, EvictReady, EvictRound, FLUSH_BACKOFF_FIRST, FLUSH_BACKOFF_MAX,
-    FLUSHES_PER_ROUND, FlushRound, HeldObject, MAX_ADMISSION_BYTES, MAX_CONCURRENT_STREAMS,
-    NEEDS_V3, PASS_OPENS_PER_SEC, PUT_BACKOFF, PUT_BACKOFF_FACTOR, PassReport, RecordStream,
-    STREAM_WINDOW_BYTES, StreamedRecord, TierStartError, TierStartup, TouchConfig, VerifiedBlob,
-    WriteConfig,
+    Admitted, BATCH_READS_IN_FLIGHT, BlobRead, CONNECTION_WINDOW_BYTES, Cache, CacheError,
+    EVICT_BATCH, EVICT_EVERY, EVICT_GRACE, EvictReady, EvictRound, FLUSH_BACKOFF_FIRST,
+    FLUSH_BACKOFF_MAX, FLUSH_READ_BYTES, FLUSHES_PER_ROUND, FlushRound, HeldObject,
+    MAX_ADMISSION_BYTES, MAX_CONCURRENT_STREAMS, MAX_DECODED_BLOB_BYTES, NEEDS_V3,
+    PASS_OPENS_PER_SEC, PUT_BACKOFF, PUT_BACKOFF_FACTOR, PassReport, READ_WINDOW_BYTES,
+    RecordStream, STREAM_WINDOW_BYTES, StreamedRecord, TierStartError, TierStartup, TouchConfig,
+    VerifiedBlob, WriteConfig,
 };
 pub use crate::capabilities::{CapabilitiesService, server_capabilities};
 pub use crate::cas::CasService;
@@ -113,14 +114,14 @@ pub const MAX_BATCH_TOTAL_BYTES: usize = 16 << 20;
 /// for the digests and statuses around it.
 pub const MAX_MESSAGE_BYTES: usize = MAX_BATCH_TOTAL_BYTES + (1 << 20);
 
-/// The largest blob the cache accepts, on every path (ByteStream, a batch, a segment
-/// upload, the in-process plane's stream): 5 GiB, S3's limit for one PUT, so the write
-/// tier's flusher can still PUT a block holding one such blob in one request. A
-/// ByteStream Write and a remote segment upload are held in memory until they are
-/// verified or committed, so without a cap a client could make the front buffer
-/// whatever size it claims; anything bigger is refused before a byte is buffered.
-pub const MAX_BLOB_BYTES: u64 = 5 << 30;
-
+/// No blob is too large for the cache, on any path, and none is held whole in memory
+/// past [`MAX_UNSTAGED_BLOB_BYTES`]: a ByteStream `Write` of a larger blob is handed to
+/// the store as it arrives (a multipart upload on S3), a segment upload's large records
+/// and the in-process plane's large outputs are written to the write tier as they
+/// arrive, the tier's flusher reads a block in pieces, and every read of a blob is
+/// served in windows of [`READ_WINDOW_BYTES`]. A digest's size is an `i64`, so no blob
+/// is over `i64::MAX` bytes; sizes are added as `u64`, saturating.
+///
 /// The largest blob a daemon's data plane may store without a write tier to stream it
 /// onto: 16 MiB. A segment upload (the remote plane) or the in-process plane's store
 /// that would have to hold a larger record whole in memory until its commit, because
@@ -129,7 +130,7 @@ pub const MAX_BLOB_BYTES: u64 = 5 << 30;
 /// per file. 16 MiB is where the write group already writes a blob as a segment of its
 /// own (`--write-own-segment-bytes`), four PutRange messages, and well under the 32 MiB
 /// upload a daemon batches small files into, so small outputs keep the in-memory path
-/// unchanged. Until multipart object-store PUTs exist, larger blobs need the hot store.
+/// unchanged. A ByteStream `Write` of a larger blob streams it to the store instead.
 pub const MAX_UNSTAGED_BLOB_BYTES: u64 = 16 << 20;
 
 /// Why the blob `blob` (its digest), over [`MAX_UNSTAGED_BLOB_BYTES`], is refused: no
@@ -138,8 +139,8 @@ pub const MAX_UNSTAGED_BLOB_BYTES: u64 = 16 << 20;
 pub fn unstaged_refusal(blob: &str) -> String {
     format!(
         "{blob} is over {MAX_UNSTAGED_BLOB_BYTES} bytes and no write tier has room for it: \
-         a blob that large is stored only by streaming it onto the hot store (--hot-store), \
-         until multipart object-store puts exist"
+         a blob that large is stored by streaming it onto the hot store (--hot-store), or \
+         by a ByteStream Write, which streams it to the object store"
     )
 }
 

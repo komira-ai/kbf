@@ -54,9 +54,21 @@ pub trait ObjectStore: Send + Sync + 'static {
         retain_until: Option<SystemTime>,
     ) -> impl Future<Output = Result<(), ObjectStoreError>> + Send;
 
-    /// Writes an immutable object of `len` bytes taken from `body`. A stand-in until
-    /// the streamed writes land: it gathers the body whole and calls
-    /// [`ObjectStore::put_new`].
+    /// Writes an immutable object of exactly `len` bytes, taken from `body` as it is
+    /// sent, so the writer never holds the object whole.
+    ///
+    /// The object is written only if `body` gives `len` bytes and then ends. A body that
+    /// yields an error, or more or fewer bytes, leaves nothing under `key` and fails the
+    /// write (with the body's error, or [`ObjectStoreError::Body`]). With
+    /// [`Capabilities::conditional_put`], an existing key is refused with
+    /// [`ObjectStoreError::AlreadyExists`] and left unchanged, as by
+    /// [`ObjectStore::put_new`]. No retention.
+    ///
+    /// The default gathers the body whole and calls [`ObjectStore::put_new`]: for the
+    /// in-memory fake and the test stores that wrap another. The S3 store sends a large
+    /// object as a multipart upload ([`s3::MULTIPART_THRESHOLD`]), a part at a time, and
+    /// aborts it on any failure; the local-directory store writes the pieces to its
+    /// file as they come.
     fn put_stream(
         &self,
         key: &ObjectKey,

@@ -30,7 +30,9 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use kbf_meta::{Applied, Command, Epoch, Location, MetaState, ObjectId, StoreId};
+use kbf_meta::{
+    Applied, Command, Epoch, Location, MetaState, ObjectId, StoreId, UnreachableReason,
+};
 use kbf_objstore::{ByteRange, KeyPrefix, ObjectKey, ObjectStore, ObjectStoreError};
 use kbf_segments::layout::{TRAILER_LEN, footer_len};
 use kbf_segments::{Footer, SegmentWriter, WriteError};
@@ -39,7 +41,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 
 use super::evict::Recency;
 use super::tier::Staging;
-use super::{Cache, CacheError, VerifiedBlob, refuse_oversized, unexpected};
+use super::{Cache, CacheError, VerifiedBlob, unexpected};
 use crate::cpu::HashPool;
 use crate::meta_log::{MetaLog, MetaLogError};
 use crate::metrics::{CacheMetrics, command_label};
@@ -53,7 +55,7 @@ pub const PUT_BACKOFF_FACTOR: u32 = 4;
 
 /// The most bytes one [`Cache::admit`] call takes and counts: what the semaphore holds.
 /// One call may ask for more than the `u32::MAX` permits a semaphore hands out at once
-/// (a 5 GiB blob's upload does): it takes them in parts, one such call at a time, and
+/// (under a bound configured that large): it takes them in parts, one such call at a time, and
 /// counts them all. A caller asking for more than this holds more memory than the
 /// bound counts, so `kbf-server` refuses a `--segment-upload-max-bytes` over it.
 pub const MAX_ADMISSION_BYTES: u64 = Semaphore::MAX_PERMITS as u64;
@@ -90,7 +92,7 @@ pub struct WriteConfig {
     /// The most bytes admitted uploads hold at once ([`Cache::admit`],
     /// `--write-bytes-in-flight`). A caller over the bound waits; a caller asking for
     /// more than the whole bound waits for all of it. `kbf-server` refuses a bound
-    /// below [`MAX_BLOB_BYTES`](crate::MAX_BLOB_BYTES).
+    /// below [`MIN_SEGMENT_UPLOAD_BYTES`](crate::MIN_SEGMENT_UPLOAD_BYTES).
     pub bytes_in_flight: u64,
     /// The most segment PUTs, each with its footer read-back, in flight at once
     /// (`--write-puts-in-flight`). A segment sealed while all are busy waits.
@@ -107,12 +109,13 @@ pub struct WriteConfig {
 
 impl WriteConfig {
     /// The defaults of `docs/design/write-path.md`: a 2 ms linger, own segments from
-    /// 16 MiB, 6 GiB admitted (one upload of the largest blob, 5 GiB, and room beside
-    /// it), 4 PUTs in flight, 3 attempts per PUT, 4 hashing jobs.
+    /// 16 MiB, 2 GiB admitted, 4 PUTs in flight, 3 attempts per PUT, 4 hashing jobs.
+    /// No upload is admitted for more than it holds in memory, and none holds a blob
+    /// over [`MAX_UNSTAGED_BLOB_BYTES`](crate::MAX_UNSTAGED_BLOB_BYTES) whole.
     pub const DEFAULT: Self = Self {
         linger: Duration::from_millis(2),
         own_segment_bytes: 16 << 20,
-        bytes_in_flight: 6 << 30,
+        bytes_in_flight: 2 << 30,
         puts_in_flight: NonZeroUsize::MIN.saturating_add(3),
         put_attempts: NonZeroU32::MIN.saturating_add(2),
         cpu_threads: NonZeroUsize::MIN.saturating_add(3),
@@ -299,7 +302,7 @@ impl<M, O> Writer<M, O> {
         Ok(self.prefix.key(&format!("cas/{epoch:016x}/{seq:016x}"))?)
     }
 
-    fn allocate(&self) -> ObjectId {
+    pub(super) fn allocate(&self) -> ObjectId {
         ObjectId::new(self.epoch, self.next_seq.fetch_add(1, Ordering::Relaxed))
     }
 }
@@ -389,9 +392,7 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
     /// `admitted` is held until every blob's segment is settled.
     ///
     /// # Errors
-    /// [`CacheError::Invalid`], before anything is stored, if any blob is larger than
-    /// [`MAX_BLOB_BYTES`](crate::MAX_BLOB_BYTES); the metadata log could not say which
-    /// blobs are present. A blob whose segment failed has that failure as its answer:
+    /// The metadata log could not say which blobs are present. A blob whose segment failed has that failure as its answer:
     /// UNAVAILABLE when the store or the log could not be reached, INTERNAL when the
     /// store kept something other than what was written.
     pub async fn store_each(
@@ -399,7 +400,6 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         blobs: Vec<VerifiedBlob>,
         admitted: Admitted,
     ) -> Result<Vec<Result<(), CacheError>>, CacheError> {
-        refuse_oversized(&blobs)?;
         let started = Instant::now();
         let stored = self.store_fresh(blobs, admitted).await;
         self.writer.metrics.store_blobs.since(started);
@@ -692,6 +692,22 @@ impl<M: MetaLog, O: ObjectStore> Writer<M, O> {
         Ok(Footer::parse(&bytes, len)?)
     }
 
+    /// Commits that `object` is unreachable for `reason`.
+    pub(super) async fn mark_unreachable(
+        &self,
+        object: ObjectId,
+        reason: UnreachableReason,
+    ) -> Result<(), CacheError> {
+        match self
+            .commit(Command::ObjectUnreachable { object, reason })
+            .await?
+        {
+            Applied::Marked(Ok(())) => Ok(()),
+            Applied::Marked(Err(e)) => Err(CacheError::Internal(e.to_string())),
+            other => Err(unexpected(&other)),
+        }
+    }
+
     /// Commits where each blob of one or more segments is, as one `PutBlobs`.
     pub(super) async fn commit_segment(
         &self,
@@ -725,7 +741,7 @@ const fn transient(e: &ObjectStoreError) -> bool {
 /// such object, a short one, or a trailer or footer that does not parse) is INTERNAL: a
 /// store that acknowledges a PUT and then returns something else is a fault to surface,
 /// not a blip to retry. A read-back that did not reach the store stays UNAVAILABLE.
-fn read_back(e: CacheError) -> CacheError {
+pub(super) fn read_back(e: CacheError) -> CacheError {
     match e {
         e @ (CacheError::Store(
             ObjectStoreError::NotFound(_) | ObjectStoreError::InvalidRange { .. },

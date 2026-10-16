@@ -37,7 +37,7 @@ kbf-transfer.workspace = true
 kbf-types.workspace = true
 # The stand-in `podman`'s (kbf-fake-podman).
 rustix = { workspace = true, features = ["process"] }
-tokio = { workspace = true, features = ["rt-multi-thread", "sync"] }
+tokio = { workspace = true, features = ["fs", "io-util", "rt-multi-thread", "sync"] }
 tonic.workspace = true
 tracing-subscriber.workspace = true
 

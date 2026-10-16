@@ -1,3 +1,5 @@
+use bytes::Bytes;
+
 use super::*;
 
 /// Decodes a `filename*` value of RFC 8187 (`UTF-8''<value-chars>`), refusing any
@@ -361,13 +363,13 @@ async fn reads_take_the_budget_in_the_order_they_asked() {
     );
 }
 
-/// Catches: a digest larger than any blob the cache accepts answered `503` ("try
-/// again", which can never succeed), or a size too large for a permit count
-/// panicking. Both are `404` with the limit named, at once.
+/// Catches: a digest larger than the whole budget answered `503` ("try again", which
+/// can never succeed), or a size too large for a permit count panicking. A blob not
+/// held is `404` at once, before it waits, whatever size it claims.
 #[tokio::test(start_paused = true)]
-async fn a_digest_larger_than_any_blob_is_404_at_once() {
+async fn a_large_digest_not_held_is_404_at_once() {
     let (state, _) = budgeted(10, &[]).await;
-    for size in [kbf_front::MAX_BLOB_BYTES + 1, 1 << 33] {
+    for size in [(5 << 30) + 1, 1 << 33] {
         let asked = tokio::time::Instant::now();
         let digest = Digest::new(DigestFunction::Sha256, [9; 32], size);
         let answer = get(&state, &digest).await;
@@ -377,22 +379,15 @@ async fn a_digest_larger_than_any_blob_is_404_at_once() {
             .await
             .expect("a body");
         let why = String::from_utf8_lossy(&why);
-        assert!(
-            why.contains("larger than the largest blob"),
-            "{size}: {why}"
-        );
-        assert!(why.contains("(10 bytes)"), "{size}: {why}");
+        assert!(why.contains("is not in the cache"), "{size}: {why}");
     }
 }
 
-/// Catches: a budget smaller than the largest blob the cache accepts, which could
-/// never be served.
+/// Catches: a budget smaller than one window, which a read of a large blob could never
+/// be admitted for.
 #[test]
-fn the_read_budget_holds_the_largest_blob() {
-    assert_eq!(
-        u64::try_from(READ_BUDGET_BYTES),
-        Ok(kbf_front::MAX_BLOB_BYTES)
-    );
+fn the_read_budget_holds_a_window() {
+    assert!(kbf_front::READ_WINDOW_BYTES <= READ_BUDGET_BYTES as u64);
 }
 
 /// Catches (mutant "the budget is released only when the body's end is read"): an
@@ -448,44 +443,37 @@ async fn a_part_holds_the_whole_blobs_budget() {
     );
 }
 
-/// Catches (mutant "`<` for `<=`"): a blob of exactly the whole budget (the largest
-/// the cache accepts, in the route's budget) answered `404`. With a 10-byte budget a
-/// 10-byte blob is served; a digest of 11 bytes is `404` at once.
+/// Catches (mutant "`<` for `<=`"): a blob of exactly the whole budget answered
+/// `503`. With a 10-byte budget a 10-byte blob is served.
 #[tokio::test(start_paused = true)]
-async fn a_blob_of_exactly_the_budget_is_served_and_one_byte_more_is_404() {
+async fn a_blob_of_exactly_the_budget_is_served() {
     let (state, digests) = budgeted(10, &[b"ten bytes!"]).await;
     let whole = get_in_time(&state, &digests[0], None).await;
     assert_eq!(whole.status(), StatusCode::OK);
+    assert_eq!(whole.headers()[CONTENT_LENGTH], "10");
     let body = axum::body::to_bytes(whole.into_body(), usize::MAX)
         .await
         .expect("a body");
     assert_eq!(&body[..], b"ten bytes!");
-    let over = Digest::new(DigestFunction::Sha256, [9; 32], 11);
-    let asked = tokio::time::Instant::now();
-    assert_eq!(
-        get_in_time(&state, &over, None).await.status(),
-        StatusCode::NOT_FOUND
-    );
-    assert_eq!(asked.elapsed(), Duration::ZERO);
 }
 
-/// Catches a read over the `u32::MAX` permits a semaphore hands out at once admitted
-/// for less than its size (a 4 GiB + 1 MiB blob counted as 4 GiB): it takes every byte
-/// of its size from the budget, in two parts.
+/// Catches a read of a blob larger than one window admitted for its whole size (a
+/// 5 GiB blob would need 5 GiB of the budget and wait out every other read) or for
+/// less than a window: it takes one window's worth.
 #[tokio::test]
-async fn a_read_over_4_gib_is_admitted_for_all_its_bytes() {
+async fn a_large_read_is_admitted_for_one_window() {
     let budget = Arc::new(Semaphore::new(READ_BUDGET_BYTES));
-    let large = tokio::sync::Mutex::new(());
-    let size = (4u64 << 30) + (1 << 20);
+    let size = (5u64 << 30) + 1;
     let digest = Digest::new(DigestFunction::Sha256, [9; 32], size);
-    let permit = admit(&budget, &large, READ_BUDGET_BYTES as u64, &digest)
+    let permit = admit(&budget, &digest)
         .await
         .map_err(|_| "refused")
         .expect("admitted");
-    let held: usize = permit.iter().map(OwnedSemaphorePermit::num_permits).sum();
-    assert_eq!(held as u64, size);
-    assert_eq!(
-        (READ_BUDGET_BYTES - budget.available_permits()) as u64,
-        size
-    );
+    assert_eq!(permit.num_permits() as u64, kbf_front::READ_WINDOW_BYTES);
+    let small = Digest::new(DigestFunction::Sha256, [9; 32], 3);
+    let three = admit(&budget, &small)
+        .await
+        .map_err(|_| "refused")
+        .expect("3");
+    assert_eq!(three.num_permits(), 3);
 }

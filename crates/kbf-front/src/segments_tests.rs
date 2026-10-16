@@ -26,11 +26,7 @@ fn declared_segment() -> (Vec<Declared>, Vec<u8>) {
     let bytes = writer.finish();
     let footer = Footer::parse(&bytes, bytes.len() as u64).expect("footer");
     let records_len = usize::try_from(footer.records_len()).expect("len");
-    let (declared, _, _) = declare(
-        &[(bytes.len() as u64, &bytes[records_len..])],
-        MAX_BLOB_BYTES,
-    )
-    .expect("declare");
+    let (declared, _) = declare(&[(bytes.len() as u64, &bytes[records_len..])]).expect("declare");
     (declared, bytes[..records_len].to_vec())
 }
 

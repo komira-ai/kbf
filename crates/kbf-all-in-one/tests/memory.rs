@@ -114,9 +114,9 @@ fn scratch(name: &str) -> PathBuf {
 
 /// The plane over a server started in `runtime` on the stores under `dir`, with a
 /// write tier, and the server's store. The server's handle is dropped, which stops its
-/// flusher: the flusher reads a staged block back whole to PUT it (a cost of the flush,
-/// after the commit, until multipart object-store PUTs exist), and it must not run
-/// while the upload path is measured. The store works on without the handle.
+/// flusher, so it does not run while the upload path is measured (the flush's own
+/// memory is measured by kbf-front's `tests/large_blobs.rs`). The store works on
+/// without the handle.
 fn plane(
     runtime: &tokio::runtime::Runtime,
     dir: &Path,

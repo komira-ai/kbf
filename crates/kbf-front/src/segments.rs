@@ -5,11 +5,15 @@
 //! Served on the worker listener only, behind its admission (kbf-server wraps this
 //! service as it wraps the blob services); this type authorizes nothing itself.
 //!
-//! - **Begin** checks every footer, refuses an upload over
-//!   `--segment-upload-max-bytes` or [`MAX_UPLOAD_RECORDS`], and then is admitted for
-//!   its whole length by [`Cache::admit`] (`--write-bytes-in-flight`, the bound
-//!   ByteStream and batch uploads share), waiting (never refusing) while it is spent.
-//!   Ranges are held in memory until the commit.
+//! - **Begin** checks every footer and refuses an upload over [`MAX_UPLOAD_RECORDS`].
+//!   With a write tier, each segment's records get a range of their own on it, written
+//!   as they arrive; a segment the tier has no room for (or every segment, without a
+//!   tier) is held in memory until the commit, and may not hold a record over
+//!   [`MAX_UNSTAGED_BLOB_BYTES`]. The bytes held in memory may not pass
+//!   `--segment-upload-max-bytes`, and are admitted by [`Cache::admit`]
+//!   (`--write-bytes-in-flight`, the bound ByteStream and batch uploads share), waiting
+//!   (never refusing) while it is spent. An upload whose records all go to the tier
+//!   holds none, whatever its size.
 //! - **PutRange** writes a range of one segment's records. Once Commit was called,
 //!   every PutRange is refused, so the bytes received are the bytes stored.
 //!   *Without a write tier* the range also hashes (SHA-256 and CRC-32C) what it
@@ -65,7 +69,7 @@ pub use self::connection::{Connection, Connections, Tracked};
 use self::upload::{Declared, Held, Put, Receiving, TierWrites, advance, declare};
 use crate::cache::{Admitted, BuiltSegment, Cache, TierRange};
 use crate::meta_log::MetaLog;
-use crate::{MAX_BLOB_BYTES, MAX_UNSTAGED_BLOB_BYTES, unstaged_refusal, wire};
+use crate::{MAX_UNSTAGED_BLOB_BYTES, unstaged_refusal, wire};
 
 /// The most records one upload may hold: bounds `Begin`'s message (16,384 entries of
 /// 52 bytes, about 850 KiB) and the upload's one `PutBlobs`.
@@ -74,15 +78,19 @@ pub const MAX_UPLOAD_RECORDS: usize = 16_384;
 /// The most bytes one `PutRange` or `ReadRange` carries.
 pub const MAX_RANGE_BYTES: u64 = 4 << 20;
 
-/// The smallest `--segment-upload-max-bytes`: one record of [`MAX_BLOB_BYTES`] and its
-/// footer, with room to spare, so any legal blob can be uploaded.
-pub const MIN_SEGMENT_UPLOAD_BYTES: u64 = MAX_BLOB_BYTES + (1 << 20);
+/// The smallest `--segment-upload-max-bytes`, the most bytes one upload may hold in
+/// memory: 33 MiB, a daemon's upload of small files (32 MiB,
+/// `kbf_transfer::SEGMENT_UPLOAD_BYTES`) with room to spare. No record held in memory
+/// is over [`MAX_UNSTAGED_BLOB_BYTES`], and records written to the write tier as they
+/// arrive are not held, so an upload of any size can be admitted.
+pub const MIN_SEGMENT_UPLOAD_BYTES: u64 = 33 << 20;
 
 /// The `--segment-upload-*` flags of the server.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SegmentsConfig {
-    /// The most bytes one upload may declare (`--segment-upload-max-bytes`). The
-    /// memory uploads in progress hold together is bounded by the cache's
+    /// The most bytes one upload may hold in memory (`--segment-upload-max-bytes`):
+    /// its segments that are not written to the write tier as they arrive. The memory
+    /// uploads in progress hold together is bounded by the cache's
     /// `--write-bytes-in-flight` ([`Cache::admit`]), which `kbf-server` refuses to
     /// start below this cap, so a legal `Begin` is always admitted.
     pub max_bytes: u64,
@@ -379,49 +387,59 @@ impl<M: MetaLog, O: ObjectStore + 'static> Segments for SegmentsService<M, O> {
             .iter()
             .map(|s| (s.length, s.footer.as_slice()))
             .collect();
-        let (declared, total, records) = declare(&segments, MAX_BLOB_BYTES)?;
-        let cap = self.shared.config.max_bytes;
-        if total > cap {
-            return Err(Status::invalid_argument(format!(
-                "an upload of {total} bytes is over the {cap}-byte cap (--segment-upload-max-bytes)"
-            )));
-        }
+        let (declared, records) = declare(&segments)?;
         if records > MAX_UPLOAD_RECORDS {
             return Err(Status::invalid_argument(format!(
                 "an upload of {records} records is over the {MAX_UPLOAD_RECORDS}-record limit"
             )));
         }
-        // `total <= cap <= --write-bytes-in-flight` (kbf-server refuses to start
-        // otherwise), so this always ends.
-        let admitted = {
-            let _waiting = Waiting::enter(&self.shared.waiting);
-            self.shared.cache.admit(total).await
-        };
         // With a write tier the daemon's digests are trusted here and checked by the
         // flusher before the PUT; without one, the only copy is the PUT, so each record
         // is hashed as its bytes arrive. With one, each segment's records are written
         // to a range of their own on it as they arrive, if it has room (else held here).
         let trusted = self.shared.cache.write_tier().is_some();
-        let mut segments = Vec::with_capacity(declared.len());
+        let mut ranges = Vec::with_capacity(declared.len());
+        let mut held = 0u64;
         for d in &declared {
             let range = if trusted & (d.records_len > 0) {
                 self.shared.cache.reserve_range(d.records_len).await
             } else {
                 None
             };
-            // A record held in memory until the commit must be small: memory is bounded
-            // per file, and without the tier there is no other way in yet.
-            let large = d
-                .entries
-                .iter()
-                .find(|e| e.digest.size_bytes > MAX_UNSTAGED_BLOB_BYTES);
-            if let (None, Some(large)) = (&range, large) {
-                return Err(Status::resource_exhausted(unstaged_refusal(
-                    &large.digest.to_string(),
-                )));
+            if range.is_none() {
+                // A record held in memory until the commit must be small: memory is
+                // bounded per file, and without the tier there is no other way in.
+                let large = d
+                    .entries
+                    .iter()
+                    .find(|e| e.digest.size_bytes > MAX_UNSTAGED_BLOB_BYTES);
+                if let Some(large) = large {
+                    return Err(Status::resource_exhausted(unstaged_refusal(
+                        &large.digest.to_string(),
+                    )));
+                }
+                held = held.saturating_add(d.length);
             }
-            segments.push(Receiving::new(d, trusted, range));
+            ranges.push(range);
         }
+        let cap = self.shared.config.max_bytes;
+        if held > cap {
+            return Err(Status::invalid_argument(format!(
+                "an upload that holds {held} bytes in memory is over the {cap}-byte cap \
+                 (--segment-upload-max-bytes)"
+            )));
+        }
+        // `held <= cap <= --write-bytes-in-flight` (kbf-server refuses to start
+        // otherwise), so this always ends.
+        let admitted = {
+            let _waiting = Waiting::enter(&self.shared.waiting);
+            self.shared.cache.admit(held).await
+        };
+        let segments: Vec<Receiving> = declared
+            .iter()
+            .zip(ranges)
+            .map(|(d, range)| Receiving::new(d, trusted, range))
+            .collect();
         let (done, _) = watch::channel(None);
         let upload = Arc::new(Upload {
             owner,

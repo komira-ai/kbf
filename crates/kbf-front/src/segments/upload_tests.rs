@@ -6,7 +6,6 @@ use kbf_segments::SegmentWriter;
 use tonic::Code;
 
 use super::*;
-use crate::MAX_BLOB_BYTES;
 
 /// A segment of `n` blobs of different sizes (the last one `last` bytes) as `Begin`
 /// declares it, and its record bytes.
@@ -20,11 +19,8 @@ fn segment(n: usize, last: usize) -> (Declared, Vec<u8>) {
     let bytes = writer.finish();
     let footer = kbf_segments::Footer::parse(&bytes, bytes.len() as u64).expect("footer");
     let records_len = usize::try_from(footer.records_len()).expect("len");
-    let (mut declared, _, _) = declare(
-        &[(bytes.len() as u64, &bytes[records_len..])],
-        MAX_BLOB_BYTES,
-    )
-    .expect("declare");
+    let (mut declared, _) =
+        declare(&[(bytes.len() as u64, &bytes[records_len..])]).expect("declare");
     (declared.remove(0), bytes[..records_len].to_vec())
 }
 
@@ -176,11 +172,8 @@ fn with_an_empty_blob() -> (Declared, Vec<u8>) {
     let bytes = writer.finish();
     let footer = kbf_segments::Footer::parse(&bytes, bytes.len() as u64).expect("footer");
     let records_len = usize::try_from(footer.records_len()).expect("len");
-    let (mut declared, _, _) = declare(
-        &[(bytes.len() as u64, &bytes[records_len..])],
-        MAX_BLOB_BYTES,
-    )
-    .expect("declare");
+    let (mut declared, _) =
+        declare(&[(bytes.len() as u64, &bytes[records_len..])]).expect("declare");
     (declared.remove(0), bytes[..records_len].to_vec())
 }
 

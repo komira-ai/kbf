@@ -27,22 +27,19 @@ pub(super) struct Declared {
 }
 
 /// Parses and checks `Begin`'s segments: each footer must parse for its segment's
-/// length, its records must not overlap, and every record must be at most `max_blob`
-/// bytes. Returns them with the upload's total length and record count.
+/// length, and its records must not overlap. Returns them with the upload's record
+/// count.
 ///
 /// # Errors
 /// INVALID_ARGUMENT naming the segment and why.
-pub(super) fn declare(
-    segments: &[(u64, &[u8])],
-    max_blob: u64,
-) -> Result<(Vec<Declared>, u64, usize), Status> {
+pub(super) fn declare(segments: &[(u64, &[u8])]) -> Result<(Vec<Declared>, usize), Status> {
     if segments.is_empty() {
         return Err(Status::invalid_argument(
             "an upload needs at least one segment",
         ));
     }
     let mut declared = Vec::with_capacity(segments.len());
-    let (mut total, mut records) = (0u64, 0usize);
+    let mut records = 0usize;
     for (i, &(length, footer)) in segments.iter().enumerate() {
         let parsed = Footer::parse(footer, length)
             .map_err(|e| Status::invalid_argument(format!("segment {i}: {e}")))?;
@@ -65,18 +62,6 @@ pub(super) fn declare(
                 )));
             }
         }
-        if let Some(e) = parsed
-            .entries()
-            .iter()
-            .find(|e| e.digest.size_bytes > max_blob)
-        {
-            return Err(Status::invalid_argument(format!(
-                "segment {i}: {} is larger than the largest blob the cache accepts \
-                 ({max_blob} bytes)",
-                e.digest
-            )));
-        }
-        total = total.saturating_add(length);
         records += parsed.entries().len();
         declared.push(Declared {
             length,
@@ -84,7 +69,7 @@ pub(super) fn declare(
             entries: parsed.entries().to_vec(),
         });
     }
-    Ok((declared, total, records))
+    Ok((declared, records))
 }
 
 /// The writes of one segment's ranges to the write tier: how many are still running,

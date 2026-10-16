@@ -47,13 +47,6 @@ pub(crate) fn too_short(len: u64, got: u64) -> ObjectStoreError {
 }
 
 /// Pieces of a body taken in parts of a given size, whatever sizes its pieces came in.
-#[cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        reason = "the S3 multipart upload that takes parts lands next"
-    )
-)]
 pub(crate) struct Parts {
     body: BodyStream,
     /// What the last piece had left over past the part it ended.
@@ -63,13 +56,6 @@ pub(crate) struct Parts {
     len: u64,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the S3 multipart upload that takes parts lands next"
-    )
-)]
 impl Parts {
     pub(crate) fn new(body: BodyStream, len: u64) -> Self {
         Self {

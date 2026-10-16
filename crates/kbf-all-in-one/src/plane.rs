@@ -20,8 +20,10 @@
 //!   not match (#656); without one, `PutRange` hashes each record as its bytes arrive.
 //! - **A whole blob** ([`Cas::put`], and [`Cas::put_chunks`] through it): hashed once,
 //!   by the server's [`LocalStore::put`], under the admission a ByteStream `Write` takes.
-//! - **Reads** ([`Cas::get`], and [`Cas::read_to`] through it): the cache's own read,
-//!   which checks the bytes against the digest.
+//! - **Reads**: the cache's own reads, which check the bytes against the digest.
+//!   [`Cas::get`] reads a blob whole (the daemon decodes it, or it is small);
+//!   [`Cas::read_to`] writes a blob of any size into its file a window at a time
+//!   ([`LocalStore::read`]), never holding it whole.
 //! - **FindMissing** ([`Cas::missing`]): the cache's own answer. A call that fails
 //!   answers every digest missing, as the transfer engine's does.
 //!
@@ -150,6 +152,16 @@ fn parse(digest: &Digest) -> Option<kbf_types::Digest> {
     kbf_types::Digest::parse(DigestFunction::Sha256, &label(digest)).ok()
 }
 
+/// A read of `blob` the server refused or did not answer: missing only when the blob is
+/// not held.
+fn unread(blob: String, status: &Status) -> CasError {
+    if status.code() == Code::NotFound {
+        CasError::Missing(blob)
+    } else {
+        CasError::Unavailable(blob, status.message().to_owned())
+    }
+}
+
 /// An upload of outputs the server refused or did not answer.
 fn not_stored(status: Status) -> CasError {
     CasError::Unavailable("outputs".to_owned(), status.message().to_owned())
@@ -174,11 +186,40 @@ impl Cas for LocalDataPlane {
         };
         let store = self.store.clone();
         let read = self.call(async move { store.read_blob(&parsed).await.map_err(Status::from) });
-        match read.await {
-            Ok(bytes) => Ok(bytes),
-            Err(status) if status.code() == Code::NotFound => Err(CasError::Missing(blob)),
-            Err(status) => Err(CasError::Unavailable(blob, status.message().to_owned())),
+        read.await.map_err(|status| unread(blob, &status))
+    }
+
+    /// Writes the blob into `file` a window at a time, each read on the server half's
+    /// runtime, so the blob is never held whole; the cache checks it against its digest
+    /// before its last window. On an error the file may hold part of the blob.
+    async fn read_to(&self, digest: &Digest, file: &mut tokio::fs::File) -> Result<(), CasError> {
+        use tokio::io::AsyncWriteExt as _;
+        let blob = label(digest);
+        let Some(parsed) = parse(digest) else {
+            return Err(CasError::Missing(blob));
+        };
+        let store = self.store.clone();
+        let opened = self.call(async move { store.read(&parsed).await.map_err(Status::from) });
+        let mut read = opened
+            .await
+            .map_err(|status| unread(blob.clone(), &status))?;
+        loop {
+            let next = self.call(async move {
+                let window = read.next().await;
+                Ok((read, window))
+            });
+            let (back, window) = next.await.map_err(|status| unread(blob.clone(), &status))?;
+            read = back;
+            let Some(window) = window else {
+                break;
+            };
+            let window = window.map_err(|e| unread(blob.clone(), &Status::from(e)))?;
+            let written = file.write_all(&window).await;
+            written.map_err(|e| CasError::Write(blob.clone(), e.to_string()))?;
         }
+        file.flush()
+            .await
+            .map_err(|e| CasError::Write(blob, e.to_string()))
     }
 
     async fn put(&self, bytes: Vec<u8>) -> Result<Digest, CasError> {
