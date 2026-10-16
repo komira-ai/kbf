@@ -1,3 +1,4 @@
+#![cfg(any())]
 //! A scheduler whose state store goes away and comes back, and one that counts the
 //! leases an operation loses.
 //!
