@@ -52,18 +52,17 @@ fn each_mode_parses_its_flags() {
     let both = parse_from(with(BOTH, &["--listen=127.0.0.1:9980"])).expect("all-in-one");
     assert!(matches!(&both, Invocation::AllInOne(flags)
         if flags.server.listen.to_string() == "127.0.0.1:9980"));
-    for (mode, unit) in [("frontend", "av2-07"), ("storage", "av2-06")] {
+    for mode in ["frontend", "storage"] {
         let inv = parse_from(["kbf", mode, "--any-flag=1", "positional"]).expect(mode);
         assert!(
-            matches!(&inv, Invocation::NotBuilt { mode: m, unit: u } if *m == mode && *u == unit),
+            matches!(&inv, Invocation::NotBuilt { mode: m } if *m == mode),
             "{inv:?}"
         );
     }
 }
 
-/// Catches a table that is not exactly the five modes with the mapping the work plan
-/// gives (daemon and all-in-one run today's entries, the rest are not built and name
-/// their unit), a duplicate mode, or a clap command that lists other modes than the
+/// Catches a table that is not exactly the five modes with the mapping the design
+/// gives (daemon and all-in-one run today's entries, the rest are not built), a duplicate mode, or a clap command that lists other modes than the
 /// table.
 #[test]
 fn the_table_has_exactly_five_modes_and_their_entries() {
@@ -71,10 +70,10 @@ fn the_table_has_exactly_five_modes_and_their_entries() {
     assert_eq!(
         table,
         [
-            ("frontend", Entry::NotBuilt("av2-07")),
-            ("storage", Entry::NotBuilt("av2-06")),
+            ("frontend", Entry::NotBuilt),
+            ("storage", Entry::NotBuilt),
             ("daemon", Entry::Daemon),
-            ("storage-and-daemon", Entry::NotBuilt("av2-06")),
+            ("storage-and-daemon", Entry::NotBuilt),
             ("all-in-one", Entry::AllInOne),
         ]
     );
@@ -356,16 +355,13 @@ fn a_refusal_comes_before_a_missing_required_flag() {
 }
 
 /// Catches an unbuilt mode that runs something, exits other than 2, prints more than
-/// one line, or does not name the mode and the unit.
+/// one line, or does not name the mode.
 #[test]
 fn an_unbuilt_mode_exits_2_with_one_line() {
     assert_eq!(
-        names::not_built_line("frontend", "av2-07"),
-        "kbf frontend: mode not built yet (work-plan unit av2-07)"
+        names::not_built_line("frontend"),
+        "kbf frontend: mode not built yet"
     );
-    let inv = Invocation::NotBuilt {
-        mode: "frontend",
-        unit: "av2-07",
-    };
+    let inv = Invocation::NotBuilt { mode: "frontend" };
     assert_eq!(run(&inv), ExitCode::from(2));
 }
