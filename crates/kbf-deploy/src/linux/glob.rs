@@ -15,6 +15,11 @@
 //!   opened as written. A `.` or `..` part opened as written is resolved by its words
 //!   alone, as [`super::credential::normalise`] does (`..` over a wildcard assumes it
 //!   matches some directory).
+//! - A trailing `/` is taken off (`pattern/` is expanded as `pattern`, with the last `\`
+//!   of an odd run before it gone) with GLOB_ONLYDIR set, which only the directory read
+//!   honours: a last name with no wildcard and no `\` is opened as written and listed
+//!   even when it is a file; any other lists directories only. A last `.` or `..`
+//!   names a directory (after a file, the kernel answers ENOTDIR).
 //! - In a part: `?` is one byte and `*` any run of them; neither, nor a `[...]`,
 //!   matches a leading `.`. `\` keeps the next byte, a trailing one matches nothing.
 //! - `[...]` is one byte: `!` or `^` first negates, a `]` first is a member, `a-z` a
@@ -116,10 +121,33 @@ fn parts(pattern: &[u8]) -> Vec<Part<'_>> {
     out
 }
 
-/// Whether glob(3), as systemd calls it, lists `path` (absolute, with no `.` or `..`)
-/// for the absolute `pattern`.
+/// `pattern` without the `/` that end it, and whether there were any: glob(3) expands
+/// `pattern/` as `pattern` with GLOB_ONLYDIR, first taking the last `\` of an odd run
+/// off what is left (glibc's `"pattern/"` case, once for each `/`).
+fn trailing_slashes(mut pattern: &[u8]) -> (&[u8], bool) {
+    let mut only_dirs = false;
+    while pattern.len() > 1 && pattern.ends_with(b"/") {
+        pattern = before_slash(&pattern[..pattern.len() - 1]);
+        only_dirs = true;
+    }
+    (pattern, only_dirs)
+}
+
+/// The last name of `pattern`, after its last `/`.
+fn last_name(pattern: &[u8]) -> &[u8] {
+    pattern.rsplit(|b| *b == b'/').next().unwrap_or_default()
+}
+
+/// Whether glob(3), as systemd calls it, lists the file `path` (absolute, with no `.`
+/// or `..`) for the absolute `pattern`. Before a trailing `/`, a last name with no
+/// wildcard and no `\` is opened as written (`glob_in_dir` checks no GLOB_ONLYDIR
+/// there, so a file is listed); any other is read from its directory, directories only.
 pub(super) fn matches(pattern: &str, path: &str) -> bool {
     if !pattern.starts_with('/') {
+        return false;
+    }
+    let (pattern, only_dirs) = trailing_slashes(pattern.as_bytes());
+    if only_dirs && kind(last_name(pattern)) != 0 {
         return false;
     }
     let names: Vec<&[u8]> = path
@@ -127,7 +155,7 @@ pub(super) fn matches(pattern: &str, path: &str) -> bool {
         .split(|b| *b == b'/')
         .filter(|n| !n.is_empty())
         .collect();
-    let parts = parts(pattern.as_bytes());
+    let parts = parts(pattern);
     parts.len() == names.len()
         && parts.iter().zip(&names).all(|(part, name)| match part {
             Part::Name(n) => n == name,
@@ -135,22 +163,29 @@ pub(super) fn matches(pattern: &str, path: &str) -> bool {
         })
 }
 
-/// The path a pattern with no wildcard names, its `\` taken off; `None` for a
-/// wildcard, or a name ending in a lone `\` (which matches nothing).
+/// The path of the file a pattern with no wildcard lists, its `\` taken off and a
+/// trailing `/` dropped as glob(3) drops it; `None` for a wildcard, a name ending in a
+/// lone `\` (which matches nothing), and a pattern that lists no file: a last `.` or
+/// `..`, or a name with a `\` before a trailing `/` (read for directories only).
 pub(super) fn literal(text: &str) -> Option<String> {
     if is_wildcard(text) {
         return None;
     }
-    let (dir, name) = match text.rsplit_once('/') {
-        Some((dir, name)) => (Some(dir), name.as_bytes()),
-        None => (None, text.as_bytes()),
-    };
-    if before_slash(name).len() != name.len() {
+    let (text, only_dirs) = trailing_slashes(text.as_bytes());
+    let name = last_name(text);
+    let dir = text
+        .len()
+        .checked_sub(name.len() + 1)
+        .map(|end| &text[..end]);
+    if before_slash(name).len() != name.len()
+        || (only_dirs && kind(name) != 0)
+        || matches!(unescape(name).as_slice(), b"." | b"..")
+    {
         return None;
     }
     let mut out = Vec::new();
-    for part in dir.into_iter().flat_map(|d| d.split('/')) {
-        out.extend(unescape(before_slash(part.as_bytes())));
+    for part in dir.into_iter().flat_map(|d| d.split(|b| *b == b'/')) {
+        out.extend(unescape(before_slash(part)));
         out.push(b'/');
     }
     out.extend(unescape(name));
