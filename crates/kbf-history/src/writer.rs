@@ -604,6 +604,9 @@ impl Core {
     /// header counts the hole.
     fn shed(&mut self) {
         let limit = self.limits.buffer_bytes;
+        if self.held <= limit {
+            return;
+        }
         while self.held > limit {
             let Some(cut) = self.ready.pop_front() else {
                 break;
