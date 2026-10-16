@@ -24,6 +24,7 @@ impl ByteStream for StorageService {
         request: Request<ReadRequest>,
     ) -> Result<Response<Self::ReadStream>, Status> {
         self.admission.check(&request, Endpoint::Read)?;
+        self.check_map(generation::requested(&request)?).await?;
         let request = request.into_inner();
         let digest = wire::read_resource(&request.resource_name)?;
         let offset = u64::try_from(request.read_offset).map_err(|_| {
@@ -64,7 +65,7 @@ impl ByteStream for StorageService {
             Endpoint::Write
         };
         self.admission.check(&request, endpoint)?;
-        let view = self.view(generation::requested(&request)?)?;
+        let view = self.view(generation::requested(&request)?).await?;
         let mut stream = request.into_inner();
         let first = stream
             .message()
@@ -93,6 +94,7 @@ impl ByteStream for StorageService {
         request: Request<QueryWriteStatusRequest>,
     ) -> Result<Response<QueryWriteStatusResponse>, Status> {
         self.admission.check(&request, Endpoint::QueryWriteStatus)?;
+        self.check_map(generation::requested(&request)?).await?;
         let digest = wire::write_resource(&request.into_inner().resource_name)?;
         let complete = self.storage.find_missing(&[digest]).await?.is_empty();
         let committed_size = if complete {
