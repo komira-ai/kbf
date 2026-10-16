@@ -24,6 +24,9 @@ pub enum Entry {
     /// The server and the daemon in one process: `kbf_all_in_one::run`, the flags of
     /// `kbf-all-in-one`.
     AllInOne,
+    /// The storage node: `kbf_server::storage_node::run`, `kbf-server`'s store, write and
+    /// log flags and its own listener flags.
+    Storage,
     /// Not built yet: the mode exits 2 saying so.
     NotBuilt,
 }
@@ -39,16 +42,15 @@ pub struct Mode {
 
 /// Every mode, in help order: exactly five.
 pub const MODES: [Mode; 5] = [
-    // The three `NotBuilt` rows (frontend, storage, storage-and-daemon) accept and ignore
-    // every flag: they exit before parsing any. Each gets its real flag set when it is
-    // built.
+    // The two `NotBuilt` rows (frontend, storage-and-daemon) accept and ignore every
+    // flag: they exit before parsing any. Each gets its real flag set when it is built.
     Mode {
         name: FRONTEND,
         entry: Entry::NotBuilt,
     },
     Mode {
         name: STORAGE,
-        entry: Entry::NotBuilt,
+        entry: Entry::Storage,
     },
     Mode {
         name: DAEMON,
