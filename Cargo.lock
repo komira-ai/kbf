@@ -1316,6 +1316,7 @@ dependencies = [
  "rustix",
  "tokio",
  "tonic",
+ "tracing",
  "tracing-subscriber",
 ]
 
@@ -1425,6 +1426,7 @@ dependencies = [
  "kbf-objstore",
  "kbf-proto",
  "kbf-server",
+ "kbf-storage",
  "kbf-testkit",
  "kbf-transfer",
  "kbf-types",

@@ -300,3 +300,61 @@ fn a_block_deleted_under_the_tier_reads_as_not_here() {
         Err(TierError::UnknownBlock(_))
     ));
 }
+
+/// Catches a tier whose node keeps its local copies in the one cache
+/// (`kbf_storage::local_cache`) still keeping a flushed copy: a second copy of every
+/// flushed blob on the same disk (the "two directories" mutant). Without flushed
+/// copies, a flushed block is deleted, stops counting, is read by no one (a reader goes
+/// to the store), and a reservation does not see it.
+#[test]
+fn without_flushed_copies_a_flushed_block_is_deleted() {
+    let fs = FaultFs::new();
+    let mut index = Index::default();
+    let now = Instant::now();
+    let options = options(1 << 20, LIMIT).without_flushed_copies();
+    assert!(!options.flushed_copies);
+    let (tier, _) = open_tier(&fs, 1, options, &index).unwrap();
+    let (object, at) = ack_group(&tier, &mut index, &bytes(1, 10), now).unwrap();
+    seal(&tier, &mut index, now);
+    tier.flushed(object).unwrap();
+    assert_eq!(fs.contents(&block_name(object)), None);
+    assert_eq!(fs.contents(&seg_name(object)), None);
+    assert!(matches!(
+        tier.read(object, at, 10),
+        Err(TierError::UnknownBlock(o)) if o == object
+    ));
+    let usage = tier.usage();
+    assert_eq!((usage.used, usage.flushed), (0, 0));
+}
+
+/// Catches a start without flushed copies keeping the copies an earlier run kept (a
+/// node switched to one cache would hold them, uncounted by the one cache, forever),
+/// counting them, or deleting a staged block with them: the copy is deleted and listed
+/// with the removed files; the staged block stays, readable and counted.
+#[test]
+fn a_start_without_flushed_copies_deletes_the_earlier_runs_copies() {
+    let fs = FaultFs::new();
+    let mut index = Index::default();
+    let now = Instant::now();
+    let (tier, _) = open_tier(&fs, 1, options(1 << 20, LIMIT), &index).unwrap();
+    let (flushed, _) = ack_group(&tier, &mut index, &bytes(1, 10), now).unwrap();
+    seal(&tier, &mut index, now);
+    tier.flushed(flushed).unwrap();
+    index
+        .tiers
+        .get_mut(&support::TIER)
+        .unwrap()
+        .remove(&flushed);
+    let staged = ack_upload(&tier, &mut index, &bytes(2, 6)).unwrap();
+    drop(tier);
+    assert!(fs.contents(&seg_name(flushed)).is_some());
+    let fs = fs.restart();
+    let options = options(1 << 20, LIMIT).without_flushed_copies();
+    let (tier, recovery) = open_tier(&fs, 2, options, &index).unwrap();
+    assert_eq!(fs.contents(&seg_name(flushed)), None);
+    assert_eq!(recovery.removed, [seg_name(flushed)]);
+    assert!(recovery.flushed.is_empty(), "{recovery:?}");
+    assert_eq!(tier.read(staged, 0, 6).unwrap(), bytes(2, 6));
+    let usage = tier.usage();
+    assert_eq!((usage.used, usage.flushed), (6, 0));
+}

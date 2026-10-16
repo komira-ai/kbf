@@ -84,7 +84,8 @@ pub struct Recovery {
     pub unsealed: Vec<ObjectId>,
     /// Staged, sealed objects: for the flusher.
     pub sealed: Vec<ObjectId>,
-    /// Block files deleted as orphans: no staged object names them.
+    /// Block files deleted as orphans (no staged object names them), and flushed
+    /// copies deleted when the options keep none.
     pub removed: Vec<String>,
     /// Flushed copies (`.seg` files) found, kept for local reads.
     pub flushed: Vec<ObjectId>,
@@ -107,7 +108,8 @@ where
     ///    Names the tier does not write are left alone.
     /// 4. `.seg` files are kept as flushed copies, evicted (least recently read first,
     ///    here in name order) while they do not fit in the budget beside the staged
-    ///    blocks.
+    ///    blocks; deleted (and listed with the orphans) when the options keep no
+    ///    flushed copies.
     ///
     /// `next_seq` numbers the objects of new blocks within `start.epoch`.
     ///
@@ -188,6 +190,12 @@ where
                 .map_err(|e| TierError::io("sync_dir", ".", e))?;
         }
         for (name, object) in names.iter().filter_map(|n| Some((n, parse_seg_name(n)?))) {
+            if !start.options.flushed_copies {
+                fs.remove(name)
+                    .map_err(|e| TierError::io("remove", name, e))?;
+                recovery.removed.push(name.clone());
+                continue;
+            }
             let len = fs
                 .file_len(name)
                 .map_err(|e| TierError::io("stat", name, e))?;

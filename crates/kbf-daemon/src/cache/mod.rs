@@ -18,8 +18,13 @@
 //! - **Every entry is re-hashed** the first time a lease uses it after a start, and
 //!   stat-checked on every hit (`verify`).
 //!
+//! - **One cache with local storage** ([`CacheConfig::local`]): on a node whose local
+//!   storage shares the disk (`all-in-one`), this directory and index are the node's
+//!   only local copies of blobs (`kbf_storage::local_cache`), and the budget counts
+//!   local storage's bytes beside the entries: eviction makes room for both.
+//!
 //! The cache never fails a lease that would run without it: an I/O error in the cache
-//! hands the lease the fetched bytes to write itself, as without a cache.
+//! leaves the lease to write the blob itself, as without a cache.
 
 #[cfg(target_os = "macos")]
 mod clone;
@@ -40,6 +45,7 @@ use std::time::{Duration, Instant};
 
 pub use fill::InputStats;
 pub use index::Discarded;
+pub use kbf_storage::local_cache::LocalCache;
 pub use layout::{FIXED_MTIME, Key};
 
 use crate::cas::CasError;
@@ -131,6 +137,11 @@ pub struct CacheConfig {
     /// The most links an entry may have; `None` asks the filesystem
     /// (`pathconf(_PC_LINK_MAX)`).
     pub link_max: Option<u64>,
+    /// The node's one cache, when its local storage shares this disk (`all-in-one`):
+    /// the cache reports its entries' bytes to it, and its budget counts local
+    /// storage's bytes too ([`CacheConfig::max_bytes`] is then what both may hold).
+    /// `None` elsewhere: the budget is the entries'.
+    pub local: Option<Arc<LocalCache>>,
 }
 
 impl CacheConfig {
@@ -153,6 +164,7 @@ impl CacheConfig {
             link: Arc::new(place_link),
             link_mode: None,
             link_max: None,
+            local: None,
         }
     }
 }
@@ -248,6 +260,9 @@ impl std::fmt::Display for LinkMode {
 pub struct CacheStats {
     /// Bytes and entries in the index.
     pub bytes: u64,
+    /// Local storage's bytes the budget counts beside the entries (one cache,
+    /// [`CacheConfig::local`]); 0 without one.
+    pub storage_bytes: u64,
     pub entries: u64,
     pub evictions: u64,
     /// Entries that failed their lazy re-hash or their stat check.
@@ -403,6 +418,19 @@ impl Cache {
             thread: Mutex::new(None),
             config,
         });
+        if let Some(local) = &inner.config.local {
+            let entries = Arc::downgrade(&inner);
+            let read = move || {
+                entries
+                    .upgrade()
+                    .map_or(0, |inner| inner.state().index.total())
+            };
+            if !local.attach_inputs(Box::new(read)) {
+                tracing::warn!(
+                    "cache: the node's one cache has another input cache; this one is not counted"
+                );
+            }
+        }
         let background = Arc::clone(&inner);
         // Without its thread (the system refused one) the cache still serves; the
         // timed snapshots, the drain at start and the passes are what is lost.
@@ -442,11 +470,15 @@ impl Cache {
     pub fn stats(&self) -> CacheStats {
         let inner = &*self.inner;
         let state = inner.state();
+        let entries = state.index.len() as u64;
         let c = &inner.counters;
         let get = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
+        let bytes = state.index.total();
+        drop(state);
         CacheStats {
-            bytes: state.index.total(),
-            entries: state.index.len() as u64,
+            bytes,
+            storage_bytes: inner.storage_bytes(),
+            entries,
             evictions: get(&c.evictions),
             verify_failures: get(&c.verify_failures),
             floor_unreachable: get(&c.floor_unreachable),
@@ -560,6 +592,20 @@ impl Inner {
 
     fn now(&self) -> u64 {
         (self.config.clock)()
+    }
+
+    /// Local storage's bytes on this disk, which the budget counts ([`CacheConfig::local`]).
+    fn storage_bytes(&self) -> u64 {
+        self.config
+            .local
+            .as_ref()
+            .map_or(0, |local| local.storage_bytes())
+    }
+
+    /// A new name in `tmp/` for a fill.
+    fn next_tmp(&self) -> PathBuf {
+        let n = self.next_tmp.fetch_add(1, Ordering::Relaxed);
+        self.tmp.join(n.to_string())
     }
 
     fn path_of(&self, key: &Key) -> PathBuf {

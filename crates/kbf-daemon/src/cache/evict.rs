@@ -10,7 +10,9 @@
 //! cache's name only: a lease's links keep the inode, and its space is freed with the
 //! lease.
 //!
-//! The budget counts every entry, whoever links it. The free-space floor does not: an
+//! The budget counts every entry, whoever links it, and, on a node with one cache
+//! (`CacheConfig::local`), local storage's bytes on the same disk, which are not the
+//! cache's to evict: entries make room for them. The free-space floor does not: an
 //! entry with more than one link (a running lease's) frees nothing when evicted, so the
 //! floor skips it, and when nothing it may evict is left it stops and counts
 //! `floor_unreachable` rather than emptying the cache for no space. Each candidate's
@@ -26,7 +28,8 @@ use super::{Inner, Point, State, bump};
 impl Inner {
     /// One eviction round: the budget, then the floor.
     pub(super) fn evict(&self) {
-        let max = self.config.max_bytes;
+        // Read once a round, outside the state's lock.
+        let max = self.config.max_bytes.saturating_sub(self.storage_bytes());
         let over = |state: &State| state.index.total() > max;
         while self.evict_one(&mut |state| over(state).then(|| oldest(state, |_| true)).flatten()) {}
         if self.config.min_free_bytes > 0 {

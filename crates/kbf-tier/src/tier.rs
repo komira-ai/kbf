@@ -22,6 +22,11 @@ pub struct TierOptions {
     pub seal_after: Duration,
     /// The size at which the open grouped block is sealed: [`MAX_SEGMENT_BYTES`].
     pub segment_limit: u64,
+    /// Whether a flushed block is kept as a flushed copy (`.seg`) for local reads. Off
+    /// on a node whose one cache keeps the local copies (`kbf_storage::local_cache`):
+    /// a flushed block is then deleted, and a start deletes the copies an earlier run
+    /// kept.
+    pub flushed_copies: bool,
 }
 
 impl TierOptions {
@@ -36,6 +41,16 @@ impl TierOptions {
             budget,
             seal_after: Self::SEAL_AFTER,
             segment_limit: MAX_SEGMENT_BYTES,
+            flushed_copies: true,
+        }
+    }
+
+    /// These options with flushed copies off ([`TierOptions::flushed_copies`]).
+    #[must_use]
+    pub const fn without_flushed_copies(self) -> Self {
+        Self {
+            flushed_copies: false,
+            ..self
         }
     }
 }
@@ -889,6 +904,10 @@ where
         state.blocks.remove(&object);
         state.used -= extent;
         let (from, to) = (block_name(object), seg_name(object));
+        if !self.shared.options.flushed_copies {
+            // Unsynced: a block left by a crash is an orphan at the next start.
+            return (self.shared.fs.remove(&from)).map_err(|e| TierError::io("remove", &from, e));
+        }
         self.shared
             .fs
             .rename(&from, &to)

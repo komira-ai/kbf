@@ -23,6 +23,14 @@ pub(crate) trait Fetch: Send + Sync {
         &'a self,
         digest: &'a Digest,
     ) -> futures::future::BoxFuture<'a, Result<Vec<u8>, CasError>>;
+
+    /// [`Cas::read_to`]: the blob written into `file` as it arrives, checked against
+    /// `digest`; never held whole by the caller.
+    fn fetch_to<'a>(
+        &'a self,
+        digest: &'a Digest,
+        file: &'a mut tokio::fs::File,
+    ) -> futures::future::BoxFuture<'a, Result<(), CasError>>;
 }
 
 impl<C: Cas> Fetch for C {
@@ -31,5 +39,13 @@ impl<C: Cas> Fetch for C {
         digest: &'a Digest,
     ) -> futures::future::BoxFuture<'a, Result<Vec<u8>, CasError>> {
         Box::pin(fetch(self, digest))
+    }
+
+    fn fetch_to<'a>(
+        &'a self,
+        digest: &'a Digest,
+        file: &'a mut tokio::fs::File,
+    ) -> futures::future::BoxFuture<'a, Result<(), CasError>> {
+        Box::pin(self.read_to(digest, file))
     }
 }

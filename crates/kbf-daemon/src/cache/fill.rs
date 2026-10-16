@@ -5,16 +5,19 @@
 //! Under the slot (`settle`), the final name is looked at first. A file there that
 //! passes the stat check and hashes to the key is used (adopted into the index if it
 //! was not in it: inserted after the last snapshot). A file that fails either is
-//! unlinked. Only then is the blob fetched, from the other key of the same blob when
-//! that one is indexed (a local copy), else from the CAS, and inserted: written into
-//! `tmp/`, chmodded 0444 or 0555, dated [`FIXED_MTIME`], closed, and renamed into
-//! `blobs/` with `RENAME_NOREPLACE`. While the slot is held nothing in the daemon
-//! makes that name, so `EEXIST` means something outside did: the fill removes its
-//! temporary file, the lease writes the bytes itself, and the key is recorded for the
-//! next adopt pass. Any other I/O error in the cache does the same: the cache never
-//! fails a lease that would run without it.
+//! unlinked. Only then is the blob written into a new file in `tmp/`, from the other key
+//! of the same blob when that one is indexed and hashes right (a local copy), else
+//! from the CAS as it arrives ([`Cas::read_to`](crate::cas::Cas::read_to): never held
+//! whole in memory, whatever its size), then chmodded 0444 or 0555, dated
+//! [`FIXED_MTIME`], closed, and renamed into `blobs/` with `RENAME_NOREPLACE`. While
+//! the slot is held nothing in the daemon makes that name, so `EEXIST` means something
+//! outside did: the lease copies the checked file from `tmp/` and removes it, and the
+//! key is recorded for the next adopt pass. Any other I/O error after the bytes are
+//! written does the same; one before (no file in `tmp/`, a write that fails) leaves
+//! the lease to fetch the blob into its own file. The cache never fails a lease that
+//! would run without it.
 
-use std::io::{ErrorKind, Write as _};
+use std::io::{ErrorKind, Read as _, Write as _};
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -26,7 +29,7 @@ use tokio::sync::watch;
 use super::layout::{FIXED_MTIME, Key, remove_if_present};
 use super::verify::{Found, inspect, stat_check};
 use super::{Cache, Inner, Point, Slot, State, bump};
-use crate::cas::{CasError, digest_of};
+use crate::cas::CasError;
 
 /// Where a lease gets a key's bytes, and whether the cache had them.
 #[derive(Debug)]
@@ -41,8 +44,12 @@ pub(crate) struct Got {
 pub(crate) enum Source {
     /// The entry at `path`, which has `nlink` links.
     Entry { path: PathBuf, nlink: u64 },
-    /// The bytes, for the lease to write itself: the cache could not keep them.
-    Bytes(Vec<u8>),
+    /// A checked file of the key's bytes in `tmp/` that the cache could not keep: the
+    /// lease's alone, copied from and then removed.
+    Loose(PathBuf),
+    /// Nothing: the cache could not write the bytes, and the lease fetches them into
+    /// its own file.
+    Fetch,
 }
 
 /// What one lease's inputs cost and where they came from (`InputStats` in the design;
@@ -253,34 +260,94 @@ impl Cache {
                 inner.state().index.remove(&key);
             }
         }
-        let bytes = self.obtain(cas, key, counts).await?;
-        let owner = Arc::clone(&self.inner);
-        let source = blocking(move || owner.insert(key, bytes)).await;
-        Ok(Got { source, hit: false })
+        self.fill(cas, key, counts)
+            .await
+            .map(|source| Got { source, hit: false })
     }
 
-    /// The bytes of `key`: copied from its sibling entry when that is indexed and hashes
-    /// right, otherwise fetched from the CAS and checked. The CAS bounds the fetch (the
-    /// transfer engine: its requests and its byte budget for the whole process).
-    async fn obtain(
+    /// Writes `key`'s bytes into a new file in `tmp/` and inserts it; see the module
+    /// docs. Fails only when the blob cannot be had (the CAS's error).
+    async fn fill(
         &self,
         cas: &dyn Fetch,
         key: Key,
         counts: &InputCounts,
-    ) -> Result<Vec<u8>, CasError> {
+    ) -> Result<Source, CasError> {
         let inner = &*self.inner;
         if inner.state().index.get(&key.sibling()).is_some() {
-            let sibling = inner.path_of(&key.sibling());
-            let copied = blocking(move || std::fs::read(sibling).ok()).await;
-            if let Some(bytes) = copied.filter(|bytes| digest_of(bytes) == key.digest()) {
-                return Ok(bytes);
+            let (sibling, tmp) = (inner.path_of(&key.sibling()), inner.next_tmp());
+            let at = tmp.clone();
+            let copied = blocking(move || copy_checked(&sibling, &at, &key)).await;
+            if let Some(file) = copied {
+                return Ok(self.insert(key, file, tmp).await);
             }
         }
-        let digest = key.digest();
-        let bytes = cas.fetch(&digest).await?;
+        let tmp = inner.next_tmp();
+        let at = tmp.clone();
+        let Ok(file) = blocking(move || new_file(&at, 0o600)).await else {
+            tracing::warn!("cache: {} not inserted: no file in tmp/", key.name());
+            return Ok(Source::Fetch);
+        };
+        // The CAS bounds the fetch (the transfer engine: its requests and its byte
+        // budget for the whole process).
+        let mut file = tokio::fs::File::from_std(file);
+        if let Err(e) = cas.fetch_to(&key.digest(), &mut file).await {
+            drop(file);
+            let _ = blocking(move || remove_if_present(&tmp)).await;
+            let CasError::Write(_, why) = e else {
+                return Err(e);
+            };
+            tracing::warn!("cache: {} not inserted: {why}", key.name());
+            return Ok(Source::Fetch);
+        }
         counts.fetched_bytes.fetch_add(key.size, Ordering::Relaxed);
-        Ok(bytes)
+        let file = file.into_std().await;
+        Ok(self.insert(key, file, tmp).await)
     }
+
+    /// [`Inner::insert`] on the blocking pool.
+    async fn insert(&self, key: Key, file: std::fs::File, tmp: PathBuf) -> Source {
+        let owner = Arc::clone(&self.inner);
+        blocking(move || owner.insert(key, file, tmp)).await
+    }
+}
+
+/// Creates `path` (`O_EXCL`) with `mode`, for writing.
+pub(super) fn new_file(path: &std::path::Path, mode: u32) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(mode)
+        .open(path)
+}
+
+/// Copies the entry at `from` into a new file at `to`, a MiB at a time, hashing as it
+/// goes: the file, if the bytes are `key`'s. Otherwise (they are not, or a read or
+/// write failed) `to` is removed.
+fn copy_checked(from: &std::path::Path, to: &std::path::Path, key: &Key) -> Option<std::fs::File> {
+    use sha2::Digest as _;
+    let mut hasher = sha2::Sha256::new();
+    let mut copied = 0u64;
+    let mut file = new_file(to, 0o600).ok()?;
+    let read = std::fs::File::open(from).and_then(|mut source| {
+        let mut buffer = vec![0; 1 << 20];
+        loop {
+            let n = source.read(&mut buffer)?;
+            if n == 0 {
+                return Ok(());
+            }
+            hasher.update(&buffer[..n]);
+            copied += n as u64;
+            file.write_all(&buffer[..n])?;
+        }
+    });
+    let hash: [u8; 32] = hasher.finalize().into();
+    if read.is_ok() && copied == key.size && hash == key.hash {
+        return Some(file);
+    }
+    drop(file);
+    let _ = remove_if_present(to);
+    None
 }
 
 impl Inner {
@@ -299,14 +366,12 @@ impl Inner {
         Step::Own(self.take(&mut state, key))
     }
 
-    /// Inserts `bytes` as `key`'s entry (see the module docs), then evicts down to the
-    /// budget. On any failure the bytes come back for the lease to write.
-    fn insert(&self, key: Key, bytes: Vec<u8>) -> Source {
+    /// Inserts the bytes written into `file` (named `tmp`) as `key`'s entry (see the
+    /// module docs), then evicts down to the budget. On any failure the file is left
+    /// in `tmp/` for the lease to copy.
+    fn insert(&self, key: Key, file: std::fs::File, tmp: PathBuf) -> Source {
         let path = self.path_of(&key);
-        let tmp = self
-            .tmp
-            .join(self.next_tmp.fetch_add(1, Ordering::Relaxed).to_string());
-        match self.write_entry(&key, &bytes, &tmp, &path) {
+        match self.finish_entry(&key, file, &tmp, &path) {
             Ok(()) => {
                 let now = self.now();
                 self.state().index.insert(key, now, true);
@@ -314,7 +379,6 @@ impl Inner {
                 Source::Entry { path, nlink: 1 }
             }
             Err(e) => {
-                let _ = std::fs::remove_file(&tmp);
                 if e.kind() == ErrorKind::AlreadyExists {
                     tracing::warn!("cache: {} appeared during its fill", key.name());
                     self.state().unindexed.insert(key);
@@ -322,24 +386,18 @@ impl Inner {
                     tracing::warn!("cache: {} not inserted: {e}", key.name());
                     self.evict();
                 }
-                Source::Bytes(bytes)
+                Source::Loose(tmp)
             }
         }
     }
 
-    fn write_entry(
+    fn finish_entry(
         &self,
         key: &Key,
-        bytes: &[u8],
+        file: std::fs::File,
         tmp: &PathBuf,
         path: &PathBuf,
     ) -> std::io::Result<()> {
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(tmp)?;
-        file.write_all(bytes)?;
         rustix::fs::fchmod(&file, rustix::fs::Mode::from_raw_mode(key.mode()))?;
         let fixed = Timespec {
             tv_sec: FIXED_MTIME,

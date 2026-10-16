@@ -17,15 +17,17 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use kbf_front::Cache;
+use kbf_front::{Cache, MetaLog};
 use kbf_log::FarmLogId;
 use kbf_meta::Retention;
 use kbf_objstore::{
     Floor, FsStore, FsStoreError, KeyPrefix, ObjectStore, objects_source, statvfs_source,
 };
+use kbf_storage::local_cache::HeldBytes;
 use kbf_store::StdFs;
 use kbf_threads::Topology;
 use kbf_threads::disk::Statvfs;
+use kbf_tier::WriteTier;
 
 use crate::local::LocalStore;
 use crate::startup_pass::StartPass;
@@ -218,8 +220,12 @@ where
         .await?
         .with_writes(args.write_config())
         .with_input_trees(args.input_tree_config());
-    let (cache, tier) = crate::write_tier::attach(cache, hot).await?;
+    let local = args.local_cache.as_ref();
+    let (cache, tier) = crate::write_tier::attach_with(cache, hot, local.is_none()).await?;
     let cache = Arc::new(cache);
+    if let Some(local) = local {
+        local.attach_storage(tier_bytes(Arc::clone(&cache)));
+    }
     let local = LocalStore::new(Arc::clone(&cache), listeners.segments);
     let _flusher = tier.map(|_| {
         let flusher = crate::write_tier::run_flusher(Arc::clone(&cache), FLUSH_EVERY);
@@ -247,6 +253,18 @@ where
         _flusher,
         _pass,
     })
+}
+
+/// What `cache`'s write tier holds on its disk now: its blocks, and any flushed copies
+/// it keeps; 0 without a tier.
+fn tier_bytes<M: MetaLog, O: ObjectStore + 'static>(cache: Arc<Cache<M, O>>) -> HeldBytes {
+    Box::new(move || cache.write_tier().map_or(0, held))
+}
+
+/// What `tier` holds on its disk.
+fn held(tier: &dyn WriteTier) -> u64 {
+    let usage = tier.usage();
+    usage.used.saturating_add(usage.flushed)
 }
 
 /// Aborts a task when dropped: the flusher and the start-up pass stop with the server.

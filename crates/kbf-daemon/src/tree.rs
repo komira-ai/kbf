@@ -247,6 +247,15 @@ impl Fetch for CountedReads<'_> {
         self.reads.fetch_add(1, Ordering::Relaxed);
         self.inner.fetch(digest)
     }
+
+    fn fetch_to<'b>(
+        &'b self,
+        digest: &'b Digest,
+        file: &'b mut tokio::fs::File,
+    ) -> futures::future::BoxFuture<'b, Result<(), CasError>> {
+        self.reads.fetch_add(1, Ordering::Relaxed);
+        self.inner.fetch_to(digest, file)
+    }
 }
 
 /// Whole milliseconds since `started`.
