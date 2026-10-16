@@ -1,7 +1,7 @@
 //! The store's clock. Expiry is judged by the store, never by a caller, so a backend owns
 //! a [`Clock`] and tests inject a [`ManualClock`] they advance by hand.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
 /// A reading of a store's clock: the time since that clock's origin.
@@ -35,24 +35,19 @@ pub trait Clock: Send + Sync {
 /// it is injected into.
 #[derive(Debug, Default)]
 pub struct ManualClock {
-    nanos: AtomicU64,
+    elapsed: Mutex<Duration>,
 }
 
 impl ManualClock {
     /// Moves the clock forward by `by` (saturating).
     pub fn advance(&self, by: Duration) {
-        let by = u64::try_from(by.as_nanos()).unwrap_or(u64::MAX);
-        // `fetch_update` with a saturating add; the closure always returns `Some`.
-        let _ = self
-            .nanos
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
-                Some(n.saturating_add(by))
-            });
+        let mut elapsed = self.elapsed.lock().unwrap_or_else(PoisonError::into_inner);
+        *elapsed = elapsed.saturating_add(by);
     }
 }
 
 impl Clock for ManualClock {
     fn now(&self) -> StoreTime {
-        StoreTime(Duration::from_nanos(self.nanos.load(Ordering::SeqCst)))
+        StoreTime(*self.elapsed.lock().unwrap_or_else(PoisonError::into_inner))
     }
 }

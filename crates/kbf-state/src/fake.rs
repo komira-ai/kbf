@@ -246,7 +246,6 @@ fn races_on(txn: &Txn, race_key: &str) -> bool {
 }
 
 /// A transaction that has taken its revisions but not committed (see [`Fake::prepare`]).
-#[derive(Debug)]
 pub struct Deferred {
     txn: Txn,
     base: u64,
@@ -263,12 +262,6 @@ pub struct Fake {
 }
 
 impl Fake {
-    /// An empty, correct store on `clock`.
-    #[must_use]
-    pub fn new(clock: Arc<ManualClock>) -> Fake {
-        Fake::with_flaw(clock, Flaw::None)
-    }
-
     /// An empty store on `clock` with `flaw`.
     #[must_use]
     pub fn with_flaw(clock: Arc<ManualClock>, flaw: Flaw) -> Fake {

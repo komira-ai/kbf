@@ -63,3 +63,18 @@ fn ack_before_sync_fails_c6() {
 fn ungrouped_writes_fail_c7() {
     c7_group_commit(&FakeBackend::new(Flaw::Ungrouped));
 }
+
+// The two error types say what failed.
+#[test]
+fn errors_say_what_failed() {
+    let conflict = kbf_state::Conflict {
+        index: 2,
+        key: "k".to_owned(),
+    };
+    assert_eq!(
+        conflict.to_string(),
+        "operation 2 on \"k\" failed its precondition"
+    );
+    let failure = kbf_state::StoreError::Failed("disk full".to_owned());
+    assert_eq!(failure.to_string(), "state store failure: disk full");
+}
