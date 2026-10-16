@@ -125,6 +125,7 @@ fn a_dropped_index_row_returns_after_the_backlog_drains_with_no_list() {
         ..Limits::default()
     };
     let mut life = Life::fresh(limits);
+    life.step(T); // reserve a stream block: the refill is a step's transaction
     let first = InvRef::named("b1");
     let inv = InvRef::named("b2");
     life.run(&first, T, "main", RunOutcome::Ok);
@@ -406,6 +407,7 @@ fn a_chunk_is_cut_at_its_size_on_a_new_day_and_on_a_new_stream() {
     assert_eq!(days, ["20261015", "20261016"]);
 
     let mut life = Life::fresh(Limits::default());
+    life.step(T); // reserve a stream block: the refill is a step's transaction
     for stream in [7, 8] {
         let mut r = run_record("main", RunOutcome::Ok, T);
         r.stream = stream;
@@ -519,6 +521,7 @@ fn a_restarted_writer_continues_the_header_and_reopens_a_closed_invocation() {
     let index = Index::fake();
     let inv = InvRef::named("b1");
     let mut first = Life::start(&objects, &index, 1, Limits::default());
+    first.step(T); // reserve a stream block: the refill is a step's transaction
     first.run(&inv, T, "a", RunOutcome::Ok);
     first.run(&inv, T, "a", RunOutcome::Failed);
     first.close(&inv);
@@ -568,6 +571,7 @@ fn closed_idle_and_stale_invocations_are_forgotten_and_held_ones_kept() {
     // Catches: per-invocation state kept for ever (memory grows with every build), or
     // state forgotten while a chunk of it is still unwritten (its header would be lost).
     let mut life = Life::fresh(Limits::default());
+    life.step(T); // reserve a stream block: the refill is a step's transaction
     let closed = InvRef::named("closed");
     let open = InvRef::named("open");
     let stale = InvRef::named("stale");
@@ -636,6 +640,7 @@ fn hits_and_id_less_runs_are_kept_with_their_invocation() {
     // Catches: a hits-only chunk given a stream row (no run can name it), or an
     // id-less run with no way back to it.
     let mut life = Life::fresh(Limits::default());
+    life.step(T); // reserve a stream block: the refill is a step's transaction
     let inv = InvRef::named("hits");
     life.hit(&inv, T, "main");
     life.hit(&inv, T + 1, "main");
@@ -685,6 +690,15 @@ fn a_dropped_header_with_no_object_is_counted_and_not_kept() {
         life.writer.drops().index,
         2,
         "the chunk's rows past the stream row"
+    );
+    // A header written alone: a stored header closed with nothing buffered.
+    life.index.put(
+        &format!("{INVID}{}", empty.key),
+        InvocationHeader {
+            instances: vec!["main".into()],
+            ..InvocationHeader::default()
+        }
+        .encode_to_vec(),
     );
     life.close(&empty);
     life.step(T);
@@ -823,6 +837,7 @@ fn an_invocation_forgotten_and_seen_again_by_the_same_writer_keeps_both_chunks()
     // row fails `Absent` (taken for a row that is there), and the record is lost with
     // no drop counted while the header counts it.
     let mut life = Life::fresh(Limits::default());
+    life.step(T); // reserve a stream block: the refill is a step's transaction
     let inv = InvRef::named("b1");
     let first = life.run(&inv, T, "main", RunOutcome::Ok);
     life.close(&inv);
@@ -915,6 +930,7 @@ fn a_stream_row_is_keyed_by_the_stream_open_time_whatever_order_events_arrive() 
     // longer resolves (or, with a fallback id reused across lives, resolves to the
     // other life's chunk).
     let mut life = Life::fresh(Limits::default());
+    life.step(T); // reserve a stream block: the refill is a step's transaction
     let inv = InvRef::named("b1");
     let m0 = life.minter.mint(&inv.key, T);
     let m1 = life.minter.mint(&inv.key, T + 5);

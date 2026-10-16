@@ -119,6 +119,15 @@ fn a_header_past_the_backlog_bound_is_written_again_and_counted_once() {
     let mut life = Life::fresh(limits);
     let a = InvRef::named("a");
     let b = InvRef::named("b");
+    // Headers written alone: stored headers closed with nothing buffered.
+    for inv in [&a, &b] {
+        let stored = InvocationHeader {
+            instances: vec!["main".into()],
+            ..InvocationHeader::default()
+        };
+        life.index
+            .put(&format!("ui/invid/{}", inv.key), stored.encode_to_vec());
+    }
     life.close(&a);
     life.close(&b);
     life.step(T);

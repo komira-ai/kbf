@@ -41,7 +41,8 @@ pub use keys::{Class, Day, Family, HistoryRoot, IndexPrefixError, IndexRoot, Inv
 pub use pending::PendingLimits;
 pub use queue::{Event, EventQueue, InvRef, QueueLimits};
 pub use reader::{
-    ChunkCursor, InvocationView, MAX_PAGE_CHUNKS, ReadError, Reader, RecordsPage, RunView,
+    ChunkCursor, CursorTextError, InvocationView, MAX_PAGE_CHUNKS, ReadError, Reader, RecordsPage,
+    RunView,
 };
 pub use run_id::{Minted, Minter, RunId, StreamId};
 pub use scoped::Scoped;

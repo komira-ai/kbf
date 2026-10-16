@@ -564,6 +564,11 @@ pub enum InvState {
     Closed = 1,
 }
 
+/// Instances an [`InvocationHeader`] lists at most. A build uses one or a few; the
+/// bound keeps a header row (and the reader's all-must-allow check) small whatever
+/// names a client sends.
+pub const MAX_INSTANCES: usize = 64;
+
 /// The `ui/invid/<inv-key>` row: an invocation's header. The newest chunk's footer
 /// carries the same header, so the row can be restored from the object.
 #[derive(Clone, PartialEq, Eq, prost::Message)]
@@ -574,7 +579,8 @@ pub struct InvocationHeader {
     /// An id-less pseudo-invocation (listed nowhere).
     #[prost(bool, tag = "2")]
     pub idless: bool,
-    /// Every instance the invocation's records used, sorted.
+    /// The instances the invocation's records used, sorted: the first
+    /// [`MAX_INSTANCES`] by name. The names are the client's, so the list is bounded.
     #[prost(string, repeated, tag = "3")]
     pub instances: Vec<String>,
     /// Run records written.
@@ -605,6 +611,10 @@ pub struct InvocationHeader {
     /// Records the writer dropped (full buffers): the history has a hole.
     #[prost(uint64, tag = "12")]
     pub dropped: u64,
+    /// The records used more than [`MAX_INSTANCES`] instances, so `instances` does not
+    /// list them all. A reader cannot check every instance, so it answers no caller.
+    #[prost(bool, tag = "13")]
+    pub instances_truncated: bool,
 }
 
 /// The `ui/ichunk/<inv-key>/<writer>/<seq>` row: where one chunk is and what it holds.

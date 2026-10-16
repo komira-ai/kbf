@@ -49,7 +49,7 @@ use crate::pending::{Kept, KeptObject, Pending, PendingLimits, Row};
 use crate::queue::{Event, EventQueue, InvRef};
 use crate::records::{
     ChunkBody, ChunkRecord, ChunkRow, ChunkSummary, DigestRow, FailedRun, HitRecord, InvState,
-    InvocationHeader, RunRecord, Slow, StreamRow,
+    InvocationHeader, MAX_INSTANCES, RunRecord, Slow, StreamRow,
 };
 use crate::run_id::{Minter, StreamId};
 use crate::scoped::Scoped;
@@ -216,6 +216,9 @@ struct Core {
     drops: Drops,
     /// An index transaction failed this step: the index is not draining.
     index_failed: bool,
+    /// The last stream block refill failed: the next step spends its budget on rows,
+    /// so a counter that keeps failing never starves them.
+    refill_failed: bool,
 }
 
 impl<O: ObjectStore> Writer<O> {
@@ -248,17 +251,20 @@ impl<O: ObjectStore> Writer<O> {
                 kept: Kept::new(limits.kept),
                 drops: Drops::default(),
                 index_failed: false,
+                refill_failed: false,
             },
         }
     }
 
     /// One turn of the writer at time `now_ms`: reserve a stream block if the minter
     /// needs one, take the queued events into chunks, cut the chunks that are due, write
-    /// them, apply up to [`Limits::txns_per_step`] index transactions, and, once nothing
-    /// is pending, read back kept objects to restore their rows.
+    /// them, apply up to [`Limits::txns_per_step`] index transactions (the block's
+    /// included), and, once nothing is pending, read back kept objects to restore their
+    /// rows.
     pub async fn step(&mut self, now_ms: u64) {
         self.core.index_failed = false;
-        self.refill_streams().await;
+        let budget = self.core.limits.txns_per_step;
+        let budget = budget - usize::from(self.refill_streams(budget).await);
         self.core.take_events(now_ms);
         self.read_headers().await;
         self.core.cut_due(now_ms);
@@ -271,7 +277,7 @@ impl<O: ObjectStore> Writer<O> {
             }
         }
         self.core.ready = failed;
-        self.apply_pending().await;
+        self.apply_pending(budget).await;
         for _ in 0..self.core.reinsert_budget() {
             let Some(object) = self.core.kept.pop() else {
                 break;
@@ -285,17 +291,24 @@ impl<O: ObjectStore> Writer<O> {
         self.core.prune(now_ms);
     }
 
-    async fn refill_streams(&self) {
-        let core = &self.core;
-        if !core.minter.needs_block() {
-            return;
+    /// Reserves a stream block if the minter needs one and `budget` allows a
+    /// transaction, and the last refill did not fail (that one waits a step). Returns
+    /// whether it sent one: the refill is one of the step's [`Limits::txns_per_step`].
+    async fn refill_streams(&mut self, budget: usize) -> bool {
+        let core = &mut self.core;
+        if budget == 0 || std::mem::take(&mut core.refill_failed) || !core.minter.needs_block() {
+            return false;
         }
         let txn = Txn::new().next(core.index.root().streams_counter());
-        if let Ok(Ok(commit)) = core.index.txn(txn).await {
+        match core.index.txn(txn).await {
             // An empty counter list is a backend bug; block 0 is refused, so it is safe.
-            core.minter
-                .add_block(commit.counters.first().copied().unwrap_or(0));
+            Ok(Ok(commit)) => {
+                core.minter
+                    .add_block(commit.counters.first().copied().unwrap_or(0));
+            }
+            _ => core.refill_failed = true,
         }
+        true
     }
 
     /// Reads the stored headers of up to [`Limits::header_reads_per_step`] invocations
@@ -311,10 +324,10 @@ impl<O: ObjectStore> Writer<O> {
         }
     }
 
-    /// Sends at most [`Limits::txns_per_step`] index transactions, retries included.
-    async fn apply_pending(&mut self) {
+    /// Sends at most `budget` index transactions (what is left of
+    /// [`Limits::txns_per_step`]), retries included.
+    async fn apply_pending(&mut self, mut budget: usize) {
         let limits = self.core.limits;
-        let mut budget = limits.txns_per_step;
         while budget > 0 {
             let batch = self.core.pending.take(limits.txn_rows, limits.txn_bytes);
             if batch.is_empty() {
@@ -489,9 +502,15 @@ impl Core {
         self.queue_header(inv, origin);
     }
 
-    /// Queues `inv`'s header row as the writer holds it, unsaved until it commits.
+    /// Queues `inv`'s header row as the writer holds it, unsaved until it commits. A
+    /// header that lists no instance (a close with no records, and no stored header
+    /// that had any) is not written: no caller could be allowed to read it, and it would
+    /// only hold the client's record id.
     fn queue_header(&mut self, inv: &InvKey, origin: Option<KeptObject>) {
         let state = self.state(inv);
+        if state.header.instances.is_empty() {
+            return;
+        }
         state.unsaved = true;
         let value = state.header.encode_to_vec();
         self.queue_row(self.index.root().invid(inv), value, Cond::Any, origin);
@@ -954,9 +973,15 @@ fn note(h: &mut InvocationHeader, instance: &str, time_ms: u64) {
     h.last_seen_ms = h.last_seen_ms.max(time_ms);
 }
 
+/// Lists `instance` in `h`, or, with [`MAX_INSTANCES`] listed, marks the list
+/// truncated: the names are the client's, so the header stays bounded.
 fn add_instance(h: &mut InvocationHeader, instance: &str) {
     if let Err(at) = h.instances.binary_search_by(|i| i.as_str().cmp(instance)) {
-        h.instances.insert(at, instance.to_owned());
+        if h.instances.len() >= MAX_INSTANCES {
+            h.instances_truncated = true;
+        } else {
+            h.instances.insert(at, instance.to_owned());
+        }
     }
 }
 
@@ -976,6 +1001,7 @@ fn merge(stored: InvocationHeader, added: &InvocationHeader) -> InvocationHeader
     for i in &added.instances {
         add_instance(&mut h, i);
     }
+    h.instances_truncated |= added.instances_truncated;
     h.runs += added.runs;
     h.hits += added.hits;
     h.failed += added.failed;

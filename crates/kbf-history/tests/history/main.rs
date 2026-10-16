@@ -8,4 +8,5 @@ mod scoped;
 mod sqlite;
 mod support;
 mod writer;
+mod writer_bounds;
 mod writer_rows;

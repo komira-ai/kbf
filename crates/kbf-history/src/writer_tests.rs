@@ -103,3 +103,32 @@ fn a_merged_header_sums_counts_joins_instances_and_widens_the_span() {
         (10, 3, InvState::Closed)
     );
 }
+
+#[test]
+fn a_header_lists_at_most_64_instances_and_marks_the_rest_truncated() {
+    // Catches: a header that grows with every instance name a client sends (the names
+    // are the client's, and every reader check walks the list), a truncation that is
+    // not marked (a reader would authorize on a partial list), and a merge that drops
+    // the mark when the stored header already lists every name the addition kept.
+    let mut h = InvocationHeader::default();
+    for n in 0..MAX_INSTANCES {
+        note(&mut h, &format!("i{n:03}"), 1);
+    }
+    assert_eq!(h.instances.len(), MAX_INSTANCES);
+    assert!(!h.instances_truncated, "64 names fit");
+    note(&mut h, "i000", 2);
+    assert!(
+        !h.instances_truncated,
+        "a name already listed is not one more"
+    );
+    note(&mut h, "zzz", 3);
+    assert_eq!(h.instances.len(), MAX_INSTANCES);
+    assert!(h.instances_truncated);
+    let stored = InvocationHeader {
+        instances: h.instances.clone(),
+        ..InvocationHeader::default()
+    };
+    let merged = merge(stored, &h);
+    assert_eq!(merged.instances.len(), MAX_INSTANCES);
+    assert!(merged.instances_truncated, "the addition's mark is kept");
+}

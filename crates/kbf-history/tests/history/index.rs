@@ -66,6 +66,7 @@ fn an_offloaded_call_that_never_runs_is_an_index_error() {
     let inv = InvRef::named("b1");
     let r = life.run(&inv, T, "main", RunOutcome::Ok);
     life.close(&inv);
+    life.step(T); // the stream block refill fails, and is the step's transaction
     life.step(T);
     assert_eq!(
         life.writer.kept_objects(),
