@@ -29,8 +29,8 @@ CPUWeight=300
 Environment=XDG_RUNTIME_DIR=/run/user/1500
 # The single box's cold store is a directory beside the daemon's data (design section
 # 11), so the unit holds no cold-store key (check-units rule `credential`).
-# TODO: --state-store=sqlite:///var/lib/kbf/state.db once `kbf all-in-one` has
-# the flag.
+# The scheduler's state is a SQLite file, `state.db` in the data directory: the
+# default of `kbf all-in-one`, so the unit gives no --state-store.
 ExecStart=/usr/local/bin/kbf all-in-one \
     --cold-store=file:///var/lib/kbf/cold \
     --meta-dir=/var/lib/kbf-server/raft \

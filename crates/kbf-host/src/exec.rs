@@ -232,6 +232,7 @@ fn symlink(full: &Path, target: &Path) -> io::Result<()> {
     }
     std::os::unix::fs::symlink(target, &tmp)?;
     fs::rename(&tmp, full)?;
+    // For a power cut, which no test makes: no test fails without this sync.
     let parent = full
         .parent()
         .expect("a HostPath names a file in a directory");
