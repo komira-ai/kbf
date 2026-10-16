@@ -318,8 +318,8 @@ fn what_cannot_be_checked_is_refused() {
 }
 
 /// Catches the verb printing OK for a broken certificate or exiting 0 for one, an
-/// unreadable file not refused (exit 2), and the OK line not naming the row's role and
-/// uses.
+/// unreadable file or one with no certificate not refused (exit 2), and the OK line not
+/// naming the row's role and uses.
 #[test]
 fn the_verb_prints_its_verdict_and_exits_by_it() {
     let dir = kbf_host::testkit::scratch("linux_verify_cert");
@@ -356,6 +356,16 @@ fn the_verb_prints_its_verdict_and_exits_by_it() {
     assert_eq!(
         out,
         "FAIL role: it names the role urn:kbf:role:storage, not urn:kbf:role:frontend\nCERT BROKEN: 1 failed check(s)\n"
+    );
+    std::fs::write(dir.join("junk.pem"), "no certificate here\n").expect("write");
+    let (code, out, err) = verb(&args(Row::Storage, "junk.pem"));
+    assert_eq!(
+        (code, out.as_str(), err.as_str()),
+        (
+            ExitCode::from(2),
+            "",
+            "REFUSED: the certificate cannot be read: no CERTIFICATE block\n"
+        )
     );
     let (code, out, err) = verb(&args(Row::Daemon, "absent.pem"));
     assert_eq!((code, out.as_str()), (ExitCode::from(2), ""));
