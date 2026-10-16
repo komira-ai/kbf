@@ -428,7 +428,9 @@ impl ObjectStore for S3Store {
         ];
         match after.map(|t| &t.0) {
             Some(Token::Continue(t)) => query.push(("continuation-token", t.clone())),
-            Some(Token::After(key)) => query.push(("start-after", key.as_str().to_owned())),
+            Some(Token::After(key) | Token::Kept { after: key, .. }) => {
+                query.push(("start-after", key.as_str().to_owned()))
+            }
             None => {}
         }
         let resp = self

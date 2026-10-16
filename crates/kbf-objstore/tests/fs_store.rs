@@ -9,8 +9,8 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use kbf_objstore::{
-    ByteRange, Floor, FsStore, FsStoreError, KeyPrefix, ObjectKey, ObjectStore, ObjectStoreError,
-    PageSize, Room, Space, conformance, objects_source,
+    ByteRange, Floor, FsStore, FsStoreError, KeyPrefix, ListToken, ObjectKey, ObjectStore,
+    ObjectStoreError, PageSize, Room, Space, conformance, objects_source,
 };
 use sha2::{Digest, Sha256};
 
@@ -138,6 +138,42 @@ async fn a_paged_listing_is_the_written_key_set_and_nothing_else() {
         }
     }
     assert_eq!(got, want);
+    drop(store);
+    std::fs::remove_dir_all(&dir).expect("remove");
+}
+
+/// Catches a fresh listing [`ListToken::after`] a key served from the kept keys of an
+/// earlier listing of the same prefix that was abandoned after its first page: a
+/// rebuild resuming from the last key it finished would miss every object written
+/// since that listing began. The abandoned listing's own next page may still be cut
+/// from its keys (the contract lets a listing miss recent writes); a fresh token reads
+/// the directory again.
+#[tokio::test]
+async fn a_fresh_listing_after_a_key_sees_objects_written_since_an_abandoned_one() {
+    let dir = scratch("fresh-after");
+    let store = FsStore::open(&dir, FLOOR).expect("open");
+    for name in ["cas/a", "cas/b", "cas/c"] {
+        store
+            .put_new(&key(name), Bytes::from_static(b"x"), None)
+            .await
+            .expect("put");
+    }
+    let cas = KeyPrefix::new("cas/").expect("prefix");
+    let size = PageSize::new(1).expect("size");
+    let first = store.list(&cas, None, size).await.expect("list");
+    assert_eq!(first.objects[0].key.as_str(), "cas/a");
+    assert!(first.next.is_some(), "{first:?}");
+    // The listing is abandoned here; a new object lands after its first page.
+    store
+        .put_new(&key("cas/bb"), Bytes::from_static(b"x"), None)
+        .await
+        .expect("put");
+    let fresh = store
+        .list(&cas, Some(&ListToken::after(&key("cas/b"))), size)
+        .await
+        .expect("list");
+    let keys: Vec<&str> = fresh.objects.iter().map(|o| o.key.as_str()).collect();
+    assert_eq!(keys, ["cas/bb"]);
     drop(store);
     std::fs::remove_dir_all(&dir).expect("remove");
 }

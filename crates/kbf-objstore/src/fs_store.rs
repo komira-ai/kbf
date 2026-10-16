@@ -30,9 +30,11 @@
 //! any store. A listing's first page opens every object file to read its key (`list`
 //! serves rebuild and the sweep only): file names are hashes, so key order is known only
 //! once every header is read. The keys under the prefix are kept, sorted, and the pages
-//! that follow are cut from them without opening a file again, as long as they continue
-//! a listing of the same prefix within [`LISTING_KEPT_FOR`]; the contract lets a listing
-//! miss recent writes. Nothing reads the objects at open: on a large directory that
+//! that follow are cut from them without opening a file again, as long as their token
+//! came with a page of that listing (it names the listing) within [`LISTING_KEPT_FOR`];
+//! the contract lets a listing miss writes made since it began. A listing started
+//! [`ListToken::after`] a key is a new listing: it reads every header again, so it sees
+//! every object written before it began. Nothing reads the objects at open: on a large directory that
 //! would hold up every start. [`FsStore::scan`] reads one shard's headers for the
 //! server's start-up pass, which runs in the background after the server serves (it
 //! deletes orphans and forgets index entries whose file is gone; `kbf-front`'s
@@ -68,6 +70,7 @@ use kbf_threads::disk::{FreeSpace as _, Space, Statvfs, keep_free};
 use sha2::{Digest, Sha256};
 use tokio::sync::Notify;
 
+use crate::types::Token;
 use crate::{
     ByteRange, Capabilities, KeyPrefix, ListPage, ListToken, ObjectInfo, ObjectKey, ObjectStore,
     ObjectStoreError, PageSize,
@@ -82,6 +85,10 @@ const MAX_HEADER: usize = MAGIC.len() + 2 + 1024;
 /// How long the sorted keys of a listing are kept for the pages that continue it. A
 /// later page reads every header again.
 const LISTING_KEPT_FOR: Duration = Duration::from_secs(300);
+
+/// The id of the next listing that reads every header. Process-wide, so a token from
+/// one store never names another store's kept listing.
+static NEXT_LISTING: AtomicU64 = AtomicU64::new(0);
 
 /// Why a store could not be opened on a directory.
 #[derive(Debug, thiserror::Error)]
@@ -435,43 +442,56 @@ impl Inner {
     }
 
     /// The first `max` keys under `prefix` after `after`, in key order: cut from the
-    /// kept keys of the listing this page continues, or from every header read again.
+    /// kept keys of `listing` (the listing a page's token came from), or from every
+    /// header read again.
     fn list(
         &self,
         prefix: &KeyPrefix,
         after: Option<&ObjectKey>,
+        listing: Option<u64>,
         max: usize,
     ) -> Result<ListPage, ObjectStoreError> {
-        let kept = after.and_then(|_| {
-            let listing = self.listing.lock().unwrap_or_else(PoisonError::into_inner);
-            listing
-                .as_ref()
-                .filter(|l| l.prefix == *prefix && l.taken.elapsed() < LISTING_KEPT_FOR)
-                .map(|l| Arc::clone(&l.keys))
+        let kept = listing.and_then(|id| {
+            let kept = self.listing.lock().unwrap_or_else(PoisonError::into_inner);
+            kept.as_ref()
+                .filter(|l| {
+                    l.id == id && l.prefix == *prefix && l.taken.elapsed() < LISTING_KEPT_FOR
+                })
+                .map(|l| (l.id, Arc::clone(&l.keys)))
         });
-        let keys = match kept {
-            Some(keys) => keys,
+        let (id, keys) = match kept {
+            Some(kept) => kept,
             None => {
                 let keys = self.walk(prefix)?;
+                let id = NEXT_LISTING.fetch_add(1, Ordering::Relaxed);
                 *self.listing.lock().unwrap_or_else(PoisonError::into_inner) = Some(Listing {
+                    id,
                     prefix: prefix.clone(),
                     keys: Arc::clone(&keys),
                     taken: Instant::now(),
                 });
-                keys
+                (id, keys)
             }
         };
         let start = after.map_or(0, |a| keys.partition_point(|o| o.key <= *a));
         let end = keys.len().min(start.saturating_add(max));
         let objects = keys[start..end].to_vec();
-        // The token is the last key of this page; the next page starts after it.
+        // The token names this listing and the last key of this page; the next page
+        // starts after it.
         let next = (end < keys.len())
-            .then(|| objects.last().map(|last| ListToken::after(&last.key)))
+            .then(|| {
+                objects.last().map(|last| {
+                    ListToken(Token::Kept {
+                        listing: id,
+                        after: last.key.clone(),
+                    })
+                })
+            })
             .flatten();
         if next.is_none() {
             // The listing is done: free its keys.
             let mut listing = self.listing.lock().unwrap_or_else(PoisonError::into_inner);
-            listing.take_if(|l| Arc::ptr_eq(&l.keys, &keys));
+            listing.take_if(|l| l.id == id);
         }
         Ok(ListPage { objects, next })
     }
@@ -499,6 +519,8 @@ impl Inner {
 
 /// The sorted keys of one listing ([`Inner::list`]).
 struct Listing {
+    /// Named by the tokens of its pages.
+    id: u64,
     prefix: KeyPrefix,
     keys: Arc<[ObjectInfo]>,
     taken: Instant,
@@ -692,9 +714,10 @@ impl ObjectStore for FsStore {
         max_keys: PageSize,
     ) -> Result<ListPage, ObjectStoreError> {
         let (inner, prefix) = (Arc::clone(&self.inner), prefix.clone());
+        let listing = after.and_then(ListToken::listing);
         let after = after.map(ListToken::local_after).transpose()?.cloned();
         let max = usize::from(max_keys.get());
-        blocking(move || inner.list(&prefix, after.as_ref(), max)).await
+        blocking(move || inner.list(&prefix, after.as_ref(), listing, max)).await
     }
 }
 
