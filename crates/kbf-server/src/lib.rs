@@ -45,6 +45,11 @@
 //!   protocols, the action cache through `kbf.storage.v1`), each call admitted by the
 //!   role in the caller's certificate. No scheduler, REAPI or state store.
 //!
+//! - The frontend ([`frontend`], `kbf frontend`): the REAPI listener, the scheduler,
+//!   the worker streams and the operator API, with no cache of its own. CAS, ByteStream
+//!   and the action cache are proxied to a storage node over mutual TLS, Execute and the
+//!   scheduler read and write that node, and `/readyz` follows it and the state store.
+//!
 //! Not yet: the scheduler's state in the Raft log (the control log is in-process: a
 //! record commits as soon as it is appended, see [`farm`]), REAPI authentication other than the policies
 //! `kbf-auth` builds (`allow`, `deny`, `any`, `all`), operator roles (the
@@ -59,7 +64,9 @@ mod build_commit;
 pub mod config;
 pub mod farm;
 mod fault;
+mod flag_set;
 pub mod fleet;
+pub mod frontend;
 pub mod grpc_health;
 pub mod health;
 pub mod http_blobs;

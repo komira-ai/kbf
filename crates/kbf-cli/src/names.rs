@@ -27,6 +27,9 @@ pub enum Entry {
     /// The storage node: `kbf_server::storage_node::run`, `kbf-server`'s store, write and
     /// log flags and its own listener flags.
     Storage,
+    /// The frontend: `kbf_server::frontend::run`, `kbf-server`'s listener, scheduler and
+    /// log flags and its own storage flags.
+    Frontend,
     /// Not built yet: the mode exits 2 saying so.
     NotBuilt,
 }
@@ -42,11 +45,11 @@ pub struct Mode {
 
 /// Every mode, in help order: exactly five.
 pub const MODES: [Mode; 5] = [
-    // The two `NotBuilt` rows (frontend, storage-and-daemon) accept and ignore every
-    // flag: they exit before parsing any. Each gets its real flag set when it is built.
+    // The `NotBuilt` row (storage-and-daemon) accepts and ignores every flag: it exits
+    // before parsing any. It gets its real flag set when it is built.
     Mode {
         name: FRONTEND,
-        entry: Entry::NotBuilt,
+        entry: Entry::Frontend,
     },
     Mode {
         name: STORAGE,
