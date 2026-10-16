@@ -40,7 +40,7 @@ pub enum ClientError {
 }
 
 /// An answer: the status code and the body.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct Reply {
     /// The HTTP status code.
     pub status: u16,
@@ -56,8 +56,8 @@ impl Reply {
     }
 }
 
-/// The operator API at `addr`, with the token its writes need.
-#[derive(Clone, Debug)]
+/// The operator API at `addr`, with the token its writes need. It has no `Debug`: the
+/// token must not reach a log line.
 pub struct OperatorClient {
     addr: SocketAddr,
     token: Option<String>,
@@ -271,13 +271,7 @@ mod tests {
     #[test]
     fn a_reply_is_its_status_and_its_content_length_of_body() {
         let ok = reply("HTTP/1.1 200 OK\r\ncontent-length: 4\r\n\r\n{} \nextra").expect("parses");
-        assert_eq!(
-            ok,
-            Reply {
-                status: 200,
-                body: "{} \n".to_owned()
-            }
-        );
+        assert_eq!((ok.status, ok.body.as_str()), (200, "{} \n"));
         assert!(ok.is_success());
         let refused =
             reply("HTTP/1.1 401 Unauthorized\r\nContent-Length: 2\r\n\r\n{}").expect("401");
