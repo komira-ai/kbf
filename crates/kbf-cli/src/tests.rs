@@ -269,20 +269,59 @@ fn no_mode_has_a_short_flag_or_an_alias() {
 /// sections 3.3, S2 to S4) through a flag only the daemon gained, which the refusal
 /// cannot see, or through the environment: clap's `env` feature, which a flag needs to
 /// read a variable, is off in the workspace. The daemon's only credentials are its node
-/// identity (`--ca-cert`, `--cert`, `--key`).
+/// identity (`--ca-cert`, `--cert`, `--key`). The words are the wire test's
+/// (kbf-proto's tests/daemon_wire.rs): a part (`store`) is matched anywhere in a flag, a
+/// short word (`sts`, `url`, `key`) only as a whole word between dashes, except in the
+/// reviewed flags of `REVIEWED_DAEMON_FLAGS`, each of which must still be a flag.
 #[test]
 fn the_daemon_takes_no_store_credential_or_environment_variable() {
+    /// Flags that hold a short word and were reviewed.
+    const REVIEWED_DAEMON_FLAGS: &[&str] = &[
+        // The node identity's private key.
+        "key",
+        // The socket `kbf-mac-session` serves: a macOS login session, not a cloud one.
+        "mac-session-socket",
+    ];
     let flags = longs(&kbf_node::Cli::command());
     for flag in &flags {
-        for word in [
-            "store", "token", "auth", "secret", "password", "aws", "s3", "bucket", "tls-cert",
+        for part in [
+            "store",
+            "cold",
+            "bucket",
+            "endpoint",
+            "credential",
+            "secret",
+            "access-key",
+            "password",
+            "region",
+            "presign",
+            "auth",
+            "tls-cert",
             "tls-key",
         ] {
-            assert!(!flag.contains(word), "--{flag} names {word}");
+            assert!(!flag.contains(part), "--{flag} names {part}");
+        }
+        if REVIEWED_DAEMON_FLAGS.contains(&flag.as_str()) {
+            continue;
+        }
+        for word in [
+            "s3", "aws", "sts", "session", "token", "url", "uri", "key", "object",
+        ] {
+            let plural = format!("{word}s");
+            assert!(
+                !flag.split('-').any(|w| w == word || w == plural),
+                "--{flag} names {word}"
+            );
         }
     }
     for identity in ["ca-cert", "cert", "key"] {
         assert!(flags.contains(identity), "{identity}");
+    }
+    for reviewed in REVIEWED_DAEMON_FLAGS {
+        assert!(
+            flags.contains(*reviewed),
+            "--{reviewed} is no longer a flag"
+        );
     }
     let workspace = include_str!("../../../Cargo.toml");
     let clap = workspace
@@ -290,6 +329,50 @@ fn the_daemon_takes_no_store_credential_or_environment_variable() {
         .find(|l| l.starts_with("clap = "))
         .expect("the workspace names clap");
     assert!(!clap.contains("\"env\""), "{clap}");
+}
+
+/// Catches a build node that can be pointed at the cold store (docs/design/architecture-v2.md,
+/// section 9: a daemon-only node holds no cold-store credential and reaches bytes only
+/// through storage): every cold-store flag of the modes that have one, the hidden sizing
+/// flags included, is refused by `kbf daemon` with the store reason, by `kbf check-args
+/// daemon` (what `kbf-deploy linux check-units --mode` runs on a unit), and as an unknown
+/// argument by the `kbf-daemon` binary's own parser. Also catches a set of cold-store
+/// flags that is empty or misses `--cold-store`, which would pass vacuously.
+#[test]
+fn a_build_node_refuses_every_cold_store_flag() {
+    let cold: BTreeSet<String> = [
+        kbf_all_in_one::cli::command(),
+        kbf_server::storage_node::command(),
+        <kbf_server::Args as clap::CommandFactory>::command(),
+    ]
+    .iter()
+    .flat_map(longs)
+    .filter(|flag| flag.starts_with("cold"))
+    .collect();
+    assert!(cold.contains("cold-store"), "{cold:?}");
+    assert!(cold.len() > 1, "the sizing flags too: {cold:?}");
+    for flag in &cold {
+        let given = format!("--{flag}=s3://kbf-cas?endpoint=https://objects.example");
+        let err = refusal(with(DAEMON, &[given.as_str()]));
+        assert_eq!(err.kind(), ErrorKind::ArgumentConflict, "{flag}");
+        assert_eq!(err.exit_code(), 2, "{flag}");
+        assert!(
+            err.to_string().contains(&format!(
+                "kbf daemon refuses --{flag}: a build node holds no store and no credential"
+            )),
+            "{flag}: {err}"
+        );
+        let mut checked = vec!["kbf", CHECK_ARGS];
+        checked.extend(&DAEMON[1..]);
+        checked.push(given.as_str());
+        let e = check(&checked).expect_err("refused");
+        assert!(e.contains(&format!("refuses --{flag}")), "{flag}: {e}");
+        let mut alone: Vec<&str> = vec!["kbf-daemon"];
+        alone.extend(&DAEMON[2..]);
+        alone.push(given.as_str());
+        let err = <kbf_node::Cli as clap::Parser>::try_parse_from(alone).expect_err("refused");
+        assert_eq!(err.kind(), ErrorKind::UnknownArgument, "{flag}: {err}");
+    }
 }
 
 /// Catches a refused set that takes in a flag the daemon needs (the thread-pool flags
