@@ -155,17 +155,23 @@ fn one_digest_is_stored_once_and_an_unfinished_file_not_at_all() {
     });
 }
 
-/// Catches a large file held whole in memory (mutant: a file over the threshold taken
-/// into memory when there is no stream): without a write tier a file of
-/// [`MAX_UNSTAGED_BLOB_BYTES`] is taken into memory and one byte more is not; with one,
-/// the larger file is taken (streamed), however large (mutant: a largest blob).
+/// Catches a large file held whole in memory, or not taken (mutants: a file over the
+/// threshold taken into memory, the refusal restored when there is no write tier): a
+/// file of [`MAX_UNSTAGED_BLOB_BYTES`] is taken into memory, and one byte more is taken
+/// as a stream, with a write tier and without one, however large.
 #[test]
-fn a_large_file_is_streamed_or_not_taken() {
+fn a_large_file_is_always_taken() {
     assert_eq!(MAX_UNSTAGED_BLOB_BYTES, 16 << 20);
     let server = server();
     let taking = Taking::new(plane(&server));
     assert!(taking.file(MAX_UNSTAGED_BLOB_BYTES).is_some());
-    assert!(taking.file(MAX_UNSTAGED_BLOB_BYTES + 1).is_none());
+    assert_eq!(sent(&taking), 0, "a small file starts no upload");
+    assert!(taking.file(MAX_UNSTAGED_BLOB_BYTES + 1).is_some());
+    assert!(taking.file((5 << 30) + 1).is_some());
+    assert_eq!(sent(&taking), 2, "each large file streams to the store");
+    server
+        .block_on(taking.finish())
+        .expect("both withdrawn, unfinished");
     let (plane, _handle) = tiered(&server, "intake-large");
     let taking = Taking::new(plane);
     assert!(taking.file(MAX_UNSTAGED_BLOB_BYTES + 1).is_some());
@@ -329,4 +335,81 @@ fn without_a_tier_a_file_at_the_threshold_is_stored_from_memory() {
     server.block_on(async {
         assert!(plane.missing(&[proto_digest(&digest)]).await.is_empty());
     });
+}
+
+/// Catches a large file refused without a write tier, stored twice, or stored when it
+/// should not be (mutants: the refusal restored, no `seen` check on the store's path, a
+/// file left unfinished completed): without a tier, a file one byte over
+/// [`MAX_UNSTAGED_BLOB_BYTES`] streams to the store and is held after `finish`; the same
+/// bytes again in the same walk are withdrawn, and in another walk, finding them held,
+/// are withdrawn too; a file dropped unfinished stores nothing; every walk finishes
+/// cleanly.
+#[test]
+fn without_a_tier_a_large_file_streams_to_the_store_and_is_stored_once() {
+    let server = server();
+    let plane = plane(&server);
+    let size = usize::try_from(MAX_UNSTAGED_BLOB_BYTES + 1).expect("size");
+    let bytes = patterned(5, size);
+    let mut hasher = RecordHasher::new();
+    hasher.update(&bytes);
+    let (digest, crc32c) = hasher.finish();
+    let taking = Taking::new(plane.clone());
+    take_as(&taking, &bytes, digest, crc32c);
+    take_as(&taking, &bytes, digest, crc32c);
+    let left = patterned(6, size);
+    let mut file = taking.file(size as u64).expect("taken");
+    file.write(&left[..1 << 20]);
+    drop(file);
+    server.block_on(taking.finish()).expect("stored");
+    let again = Taking::new(plane.clone());
+    take_as(&again, &bytes, digest, crc32c);
+    server.block_on(again.finish()).expect("held already");
+    server.block_on(async {
+        assert!(plane.missing(&[proto_digest(&digest)]).await.is_empty());
+        assert_eq!(plane.get(&proto_digest(&digest)).await, Ok(bytes));
+        let left = digest_of(&left);
+        assert_eq!(plane.missing(std::slice::from_ref(&left)).await, [left]);
+    });
+}
+
+/// Catches a file streamed to the store taken for stored when its bytes are not its
+/// digest's, or a walk left waiting on an upload that failed (mutants: the digest check
+/// skipped, a failed upload's queue written to forever): without a tier, a file
+/// finished under another digest fails the walk's finish and is not held; one written
+/// far past its size fails it too, the walk's later writes dropped once the upload
+/// stopped taking them.
+#[test]
+fn without_a_tier_a_streamed_file_that_ends_wrong_fails_the_finish() {
+    let server = server();
+    let plane = plane(&server);
+    let size = usize::try_from(MAX_UNSTAGED_BLOB_BYTES + 1).expect("size");
+    let bytes = patterned(7, size);
+    let claimed = digest_of(&patterned(8, size));
+    let claimed = kbf_types::Digest::parse(
+        kbf_types::DigestFunction::Sha256,
+        &kbf_transfer::label(&claimed),
+    )
+    .expect("a digest");
+    let taking = Taking::new(plane.clone());
+    take_as(&taking, &bytes, claimed, 0);
+    let why = server
+        .block_on(taking.finish())
+        .expect_err("another digest");
+    assert!(matches!(why, CasError::Unavailable(..)), "{why}");
+    server.block_on(async {
+        let asked = [proto_digest(&claimed)];
+        assert_eq!(plane.missing(&asked).await, asked);
+    });
+
+    let taking = Taking::new(plane.clone());
+    let mut file = taking.file(size as u64).expect("taken");
+    let chunk = vec![1u8; 1 << 20];
+    for _ in 0..size / chunk.len() + 16 {
+        file.write(&chunk);
+    }
+    file.finish(claimed, 0);
+    let why = server
+        .block_on(taking.finish())
+        .expect_err("written past its size");
+    assert!(matches!(why, CasError::Unavailable(..)), "{why}");
 }

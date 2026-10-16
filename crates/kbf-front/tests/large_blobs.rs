@@ -1,5 +1,8 @@
 //! Blobs of any size, end to end, in bounded memory: written onto the write tier and
-//! flushed to an S3 store as a multipart upload, written and read through ByteStream.
+//! flushed to an S3 store as a multipart upload, written and read through ByteStream;
+//! and the faults of a large Write over the loopback S3 service (bytes that fail their
+//! digest, a client gone mid-way, no room on a write tier), each leaving no multipart
+//! upload incomplete.
 //!
 //! A counting global allocator records the most bytes live at once during each step,
 //! beyond those live when it started. The blobs are zeros: the tier's files keep runs of
@@ -21,17 +24,24 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use futures::StreamExt;
-use kbf_front::{Cache, MemoryMetaLog, READ_CHUNK_BYTES};
+use kbf_front::{
+    Cache, Connections, MAX_UNSTAGED_BLOB_BYTES, MemoryMetaLog, READ_CHUNK_BYTES, SegmentsConfig,
+    SegmentsService,
+};
 use kbf_meta::{Retention, ServerId};
 use kbf_objstore::s3::fake::FakeS3;
 use kbf_objstore::s3::{PART_BYTES, S3Store};
 use kbf_objstore::{Capabilities, KeyPrefix};
 use kbf_proto::google::bytestream::byte_stream_client::ByteStreamClient;
 use kbf_proto::google::bytestream::{ReadRequest, WriteRequest};
-use kbf_segments::RecordHasher;
+use kbf_proto::worker::segments_server::Segments as _;
+use kbf_proto::worker::{BeginRequest, UploadSegment};
+use kbf_segments::layout::{encode_footer, footer_len};
+use kbf_segments::{IndexEntry, RecordHasher};
 use kbf_store::{Fs, FsFile, StdFile, StdFs};
 use kbf_tier::TierOptions;
 use kbf_types::Digest;
+use tonic::Code;
 use tonic::transport::{Channel, Server, server::TcpIncoming};
 
 const MIB: u64 = 1 << 20;
@@ -254,6 +264,34 @@ async fn cache(s3: &FakeS3, dir: &Path, budget: u64) -> Arc<LargeCache> {
     Arc::new(cache)
 }
 
+/// A cache over the loopback S3 service `s3` with no write tier.
+async fn cold_cache(s3: &FakeS3) -> Arc<LargeCache> {
+    let meta = MemoryMetaLog::new(Retention::default());
+    let store = s3.store(Capabilities {
+        conditional_put: true,
+        object_lock: false,
+    });
+    let cache = Cache::open(meta, store, KeyPrefix::default())
+        .await
+        .expect("open");
+    Arc::new(cache)
+}
+
+/// Waits (up to a minute) until `s3` holds no multipart upload begun and neither
+/// completed nor aborted: an upload a failed write left is aborted from a task of its
+/// own.
+async fn settled(s3: &FakeS3) {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while s3.incomplete_uploads() > 0 {
+        assert!(
+            Instant::now() < deadline,
+            "{} incomplete",
+            s3.incomplete_uploads()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 /// The digest and CRC-32C of `len` zero bytes.
 fn zeros_digest(len: u64) -> (Digest, u32) {
     let zeros = vec![0u8; MIB as usize];
@@ -387,26 +425,49 @@ async fn serve(cache: &Arc<LargeCache>) -> ByteStreamClient<Channel> {
         .max_encoding_message_size(kbf_front::MAX_MESSAGE_BYTES)
 }
 
-/// A ByteStream Write of `digest`, `len` zero bytes, in messages of 1 MiB made as they
-/// are sent.
-async fn write_zeros(client: &mut ByteStreamClient<Channel>, digest: &Digest, len: u64) {
-    let name = format!(
-        "main/uploads/7d5e6f1a-large/blobs/{}/{}",
-        digest.hash_hex(),
-        digest.size_bytes
-    );
+/// The messages of a ByteStream Write of `digest`, `len` zero bytes in messages of 1 MiB
+/// made as they are sent; with `flip_last`, the last byte is 1, so the bytes are not
+/// the digest's.
+fn zero_messages(
+    digest: &Digest,
+    len: u64,
+    flip_last: bool,
+) -> impl futures::Stream<Item = WriteRequest> + Send + 'static {
+    let name = write_name(digest);
     let messages = len.div_ceil(MIB);
-    let requests = futures::stream::iter(0..messages).map(move |i| {
+    futures::stream::iter(0..messages).map(move |i| {
         let at = i * MIB;
         let n = MIB.min(len - at);
+        let last = i + 1 == messages;
+        let mut data = vec![0; n as usize];
+        if last & flip_last {
+            data[n as usize - 1] = 1;
+        }
         WriteRequest {
             resource_name: if i == 0 { name.clone() } else { String::new() },
             write_offset: i64::try_from(at).expect("offset"),
-            finish_write: i + 1 == messages,
-            data: vec![0; n as usize],
+            finish_write: last,
+            data,
         }
-    });
-    let answer = client.write(requests).await.expect("written");
+    })
+}
+
+/// The resource name a ByteStream Write of `digest` names.
+fn write_name(digest: &Digest) -> String {
+    format!(
+        "main/uploads/7d5e6f1a-large/blobs/{}/{}",
+        digest.hash_hex(),
+        digest.size_bytes
+    )
+}
+
+/// A ByteStream Write of `digest`, `len` zero bytes, in messages of 1 MiB made as they
+/// are sent.
+async fn write_zeros(client: &mut ByteStreamClient<Channel>, digest: &Digest, len: u64) {
+    let answer = client
+        .write(zero_messages(digest, len, false))
+        .await
+        .expect("written");
     assert_eq!(answer.into_inner().committed_size, len as i64);
 }
 
@@ -477,4 +538,137 @@ async fn a_large_bytestream_read_holds_a_window_not_the_blob() {
     assert_eq!(read, (LARGE, true));
     assert!(peak < BOUND, "{peak} bytes live at once");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Catches a multipart upload completed before the blob's bytes are checked against its
+/// digest (mutant: the footer sent, and the upload completed, whatever the bytes hashed
+/// to), or one left open when they fail: a ByteStream Write of 40 MiB whose last byte
+/// is not its digest's is refused INVALID_ARGUMENT after its parts were sent; the
+/// upload is aborted, never completed, none is left incomplete, and the blob is not
+/// held.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_large_write_whose_bytes_fail_its_digest_leaves_nothing_in_the_store() {
+    let _alone = ALONE.lock().await;
+    let s3 = FakeS3::start().await;
+    let cache = cold_cache(&s3).await;
+    let mut client = serve(&cache).await;
+    let len = 40 * MIB;
+    let (digest, _) = zeros_digest(len);
+    let refused = client
+        .write(zero_messages(&digest, len, true))
+        .await
+        .expect_err("the bytes fail the digest");
+    assert_eq!(refused.code(), Code::InvalidArgument, "{refused:?}");
+    settled(&s3).await;
+    let stats = s3.stats();
+    assert_eq!(
+        (stats.single_puts, stats.completed, stats.aborted),
+        (0, 0, 1),
+        "{stats:?}"
+    );
+    assert!(
+        stats.parts >= 2,
+        "streamed in parts before the check: {stats:?}"
+    );
+    assert_eq!(cache.find_missing(&[digest]).await.expect("find"), [digest]);
+}
+
+/// Catches a Write a client dropped mid-way completed or left open in the store, and a
+/// cap on a blob's size (mutant: the 5 GiB cap restored, which refuses the Write at its
+/// first message): a Write of a blob over 5 GiB, its client gone once a part of it
+/// reached the store, aborts its upload, leaves none incomplete, and stores nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_write_its_client_dropped_mid_way_leaves_nothing_in_the_store() {
+    use futures::SinkExt as _;
+    let _alone = ALONE.lock().await;
+    let s3 = FakeS3::start().await;
+    let cache = cold_cache(&s3).await;
+    let mut client = serve(&cache).await;
+    let digest = Digest::new(kbf_types::DigestFunction::Sha256, [7; 32], (5 << 30) + 1);
+    let (mut sender, messages) = futures::channel::mpsc::channel::<WriteRequest>(4);
+    let write = tokio::spawn(async move { client.write(messages).await });
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut at = 0u64;
+    while s3.stats().parts == 0 {
+        assert!(Instant::now() < deadline, "no part reached the store");
+        let message = WriteRequest {
+            resource_name: if at == 0 {
+                write_name(&digest)
+            } else {
+                String::new()
+            },
+            write_offset: i64::try_from(at).expect("offset"),
+            finish_write: false,
+            data: vec![0; MIB as usize],
+        };
+        if sender.send(message).await.is_err() {
+            panic!("the Write ended: {:?}", write.await);
+        }
+        at += MIB;
+    }
+    write.abort();
+    drop(sender);
+    settled(&s3).await;
+    let stats = s3.stats();
+    assert_eq!((stats.completed, stats.aborted), (0, 1), "{stats:?}");
+    assert!(
+        at > MAX_UNSTAGED_BLOB_BYTES,
+        "{at} bytes sent before a part"
+    );
+    assert_eq!(cache.find_missing(&[digest]).await.expect("find"), [digest]);
+}
+
+/// Catches an output over 16 MiB refused when the server has no write tier, or one with
+/// no room for it (mutant: the refusal restored, RESOURCE_EXHAUSTED at `Begin`): a
+/// segment upload `Begin` declaring a 17 MiB record is answered FAILED_PRECONDITION,
+/// the answer at which the daemon sends the record by ByteStream; that Write streams it
+/// to the store as a multipart upload, completed, none left incomplete, and the blob is
+/// held and reads back. Without a tier, and with a full one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn without_room_on_a_tier_an_output_over_16_mib_is_stored() {
+    let _alone = ALONE.lock().await;
+    for full_tier in [false, true] {
+        let s3 = FakeS3::start().await;
+        let dir = scratch("no-room");
+        let cache = if full_tier {
+            cache(&s3, &dir, 10_000).await
+        } else {
+            cold_cache(&s3).await
+        };
+        let segments = SegmentsService::new(
+            Arc::clone(&cache),
+            SegmentsConfig::DEFAULT,
+            Connections::new(),
+        );
+        let len = 17 * MIB;
+        let (digest, crc32c) = zeros_digest(len);
+        let entry = IndexEntry {
+            digest,
+            offset: 0,
+            crc32c,
+        };
+        let begin = BeginRequest {
+            segments: vec![UploadSegment {
+                length: len + footer_len(1),
+                footer: encode_footer(len, &[entry]),
+            }],
+        };
+        let answer = segments.begin(tonic::Request::new(begin)).await;
+        let refused = answer.expect_err("sent to ByteStream");
+        assert_eq!(refused.code(), Code::FailedPrecondition, "{refused:?}");
+        let mut client = serve(&cache).await;
+        write_zeros(&mut client, &digest, len).await;
+        settled(&s3).await;
+        let stats = s3.stats();
+        assert_eq!((stats.single_puts, stats.completed), (0, 1), "{stats:?}");
+        assert!(
+            cache
+                .find_missing(&[digest])
+                .await
+                .expect("find")
+                .is_empty()
+        );
+        assert_eq!(bytestream_read(&mut client, &digest).await, (len, true));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

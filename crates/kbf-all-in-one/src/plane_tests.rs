@@ -1,5 +1,6 @@
 //! What the conformance checks do not reach: a digest that does not parse, a server half
-//! that is gone, and a file that changed after the walk hashed it.
+//! that is gone, a file that changed after the walk hashed it, and blobs too large to
+//! gather streamed to the store.
 
 use std::os::fd::OwnedFd;
 
@@ -135,25 +136,75 @@ fn a_file_changed_after_the_walk_is_not_stored() {
     });
 }
 
-/// Catches a blob too large to hold gathered whole in memory without a write tier
-/// (mutant: the size check dropped, the whole-body put kept for it): `put_chunks` of a
-/// blob one byte over `MAX_UNSTAGED_BLOB_BYTES` is refused before a chunk is read, with
-/// the reason; one of a few bytes is gathered and stored, and one whose bytes are not
-/// its digest's is refused as corrupt.
+/// `len` bytes that differ for each `seed`.
+fn patterned(seed: u8, len: usize) -> Vec<u8> {
+    (0..len)
+        .map(|i| seed.wrapping_add((i % 253) as u8))
+        .collect()
+}
+
+/// `bytes` as chunks of a megabyte.
+fn chunked(bytes: &[u8]) -> Chunks {
+    let chunks: Vec<std::io::Result<Vec<u8>>> =
+        bytes.chunks(1 << 20).map(|c| Ok(c.to_vec())).collect();
+    Box::pin(futures::stream::iter(chunks))
+}
+
+/// Catches a blob too large to gather refused, or gathered whole (mutants: the refusal
+/// restored, the size check dropped): without a write tier, `put_chunks` of a blob one
+/// byte over `MAX_UNSTAGED_BLOB_BYTES` is streamed to the store and held after; again,
+/// once held, it is not read at all; one whose bytes are not its digest's is `Corrupt`
+/// and not held; one whose chunk fails to be read is `Read`; a digest that does not
+/// parse is refused. A small blob is gathered and stored as before.
 #[test]
-fn put_chunks_refuses_a_large_blob_and_stores_a_small_one() {
+fn put_chunks_streams_a_large_blob_and_stores_a_small_one() {
     let server = server();
     let plane = plane(&server);
     server.block_on(async {
-        let large = Digest {
-            hash: "00".repeat(32),
-            size_bytes: i64::try_from(MAX_UNSTAGED_BLOB_BYTES + 1).expect("size"),
-        };
+        let size = usize::try_from(MAX_UNSTAGED_BLOB_BYTES + 1).expect("size");
+        let bytes = patterned(9, size);
+        let large = digest_of(&bytes);
+        let stored = plane.put_chunks(large.clone(), chunked(&bytes)).await;
+        assert_eq!(stored, Ok(large.clone()));
+        assert!(plane.missing(std::slice::from_ref(&large)).await.is_empty());
+        assert_eq!(plane.get(&large).await, Ok(bytes.clone()));
         let never: Chunks = Box::pin(futures::stream::once(async {
-            panic!("a chunk of a refused blob was read")
+            panic!("a chunk of a held blob was read")
         }));
-        let why = plane.put_chunks(large, never).await.expect_err("refused");
-        assert!(why.to_string().contains("no write tier has room"), "{why}");
+        assert_eq!(plane.put_chunks(large.clone(), never).await, Ok(large));
+
+        let other = patterned(10, size);
+        let claimed = digest_of(&patterned(11, size));
+        let wrong = plane.put_chunks(claimed.clone(), chunked(&other)).await;
+        assert!(
+            matches!(&wrong, Err(CasError::Corrupt(blob, actual))
+                if *blob == label(&claimed) && *actual == label(&digest_of(&other))),
+            "{wrong:?}"
+        );
+        assert_eq!(
+            plane.missing(std::slice::from_ref(&claimed)).await,
+            [claimed]
+        );
+
+        let mut failing: Vec<std::io::Result<Vec<u8>>> = vec![Ok(vec![0; 1 << 20])];
+        failing.push(Err(std::io::Error::other("gone")));
+        let failing: Chunks = Box::pin(futures::stream::iter(failing));
+        let unread = digest_of(&patterned(12, size));
+        let read = plane.put_chunks(unread, failing).await;
+        assert!(
+            matches!(&read, Err(CasError::Read(_, why)) if why.contains("gone")),
+            "{read:?}"
+        );
+        let not_a_digest = Digest {
+            hash: "not hex".to_owned(),
+            size_bytes: i64::try_from(size).expect("size"),
+        };
+        let refused = plane.put_chunks(not_a_digest, chunked(&other)).await;
+        assert!(
+            matches!(refused, Err(CasError::Unavailable(..))),
+            "{refused:?}"
+        );
+
         let small = digest_of(b"small");
         let chunks: Chunks = Box::pin(futures::stream::iter([
             Ok(b"sma".to_vec()),
@@ -167,6 +218,55 @@ fn put_chunks_refuses_a_large_blob_and_stores_a_small_one() {
         let read = plane.put_chunks(digest_of(b"x"), failing).await;
         assert!(matches!(read, Err(CasError::Read(..))), "{read:?}");
     });
+}
+
+/// Catches an upload with a large record refused without a write tier, or failed
+/// (mutant: FAILED_PRECONDITION at `Begin` taken for a failure): `put_records` of a
+/// record one byte over `MAX_UNSTAGED_BLOB_BYTES` and a small one, with no tier, stores
+/// both, each by itself.
+#[test]
+fn without_a_tier_an_upload_with_a_large_record_is_stored_record_by_record() {
+    let server = server();
+    let plane = plane(&server);
+    let size = usize::try_from(MAX_UNSTAGED_BLOB_BYTES + 1).expect("size");
+    let large = patterned(13, size);
+    let record = |bytes: &[u8]| {
+        let mut hasher = RecordHasher::new();
+        hasher.update(bytes);
+        let (digest, crc32c) = hasher.finish();
+        kbf_transfer::Record {
+            digest,
+            crc32c,
+            source: Source::Bytes(bytes::Bytes::copy_from_slice(bytes)),
+        }
+    };
+    let records = vec![record(&large), record(b"small")];
+    let digests: Vec<Digest> = records.iter().map(|r| proto_digest(&r.digest)).collect();
+    server.block_on(async {
+        plane.put_records(records).await.expect("stored");
+        assert!(plane.missing(&digests).await.is_empty());
+        assert_eq!(plane.get(&digests[0]).await, Ok(large));
+    });
+}
+
+/// Catches a streamed blob reported stored when the server half is gone: `put_chunks`
+/// of a large blob after the server half's runtime shut down is `Unavailable`.
+#[test]
+fn put_chunks_of_a_large_blob_without_a_server_half_is_unavailable() {
+    let server = server();
+    let plane = plane(&server);
+    let size = usize::try_from(MAX_UNSTAGED_BLOB_BYTES + 1).expect("size");
+    let bytes = patterned(14, size);
+    let digest = digest_of(&bytes);
+    drop(server);
+    let here = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("runtime");
+    let gone = here.block_on(plane.put_chunks(digest, chunked(&bytes)));
+    assert!(
+        matches!(&gone, Err(CasError::Unavailable(_, why)) if why.contains("did not answer")),
+        "{gone:?}"
+    );
 }
 
 /// Catches a `read_to` that writes other bytes than the blob's, takes a blob whose

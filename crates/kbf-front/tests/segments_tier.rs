@@ -513,12 +513,13 @@ async fn a_segment_the_tier_does_not_take_is_hashed_before_its_put() {
 }
 
 /// Catches a large record held whole in memory when the write tier has no room for it
-/// (mutant: the whole-body fallback kept for it): at the tier's budget, a `Begin`
-/// declaring a record one byte over `MAX_UNSTAGED_BLOB_BYTES` is refused
-/// RESOURCE_EXHAUSTED with the reason; one declaring records of at most that size is
-/// admitted (held in memory, as before).
+/// (mutant: the whole-body fallback kept for it), or refused for its size (mutant: the
+/// refusal restored): at the tier's budget, a `Begin` declaring a record one byte over
+/// `MAX_UNSTAGED_BLOB_BYTES` is answered FAILED_PRECONDITION, at which the client sends
+/// it by ByteStream; one declaring records of at most that size is admitted (held in
+/// memory, as before).
 #[tokio::test]
-async fn a_large_record_a_full_tier_cannot_take_is_refused() {
+async fn a_large_record_a_full_tier_cannot_take_is_sent_to_bytestream() {
     let farm = Farm::new(Capabilities::default());
     let (_cache, service) = serve(farm.start(10_000).await);
     let over = kbf_front::MAX_UNSTAGED_BLOB_BYTES + 1;
@@ -536,10 +537,10 @@ async fn a_large_record_a_full_tier_cannot_take_is_refused() {
             segments: vec![large],
         }))
         .await
-        .expect_err("refused");
-    assert_eq!(refused.code(), Code::ResourceExhausted, "{refused:?}");
+        .expect_err("sent to ByteStream");
+    assert_eq!(refused.code(), Code::FailedPrecondition, "{refused:?}");
     assert!(
-        refused.message().contains("no write tier has room")
+        refused.message().contains("send it by a ByteStream Write")
             && refused.message().contains("16777216"),
         "{refused:?}"
     );

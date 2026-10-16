@@ -197,8 +197,8 @@ async fn without_a_tier_each_output_file_is_read_once() {
 }
 
 /// One sparse output over 1 GiB (the size above which a file used not to be taken),
-/// collected through a lease of the plane: it must be opened once, and be held after
-/// with a write tier, or be refused for want of one (never held in memory).
+/// collected through a lease of the plane: it must be opened once, and be held after,
+/// streamed onto the write tier or, without one, to the store (never held in memory).
 async fn a_file_over_1_gib_is_read_once(tier: bool) {
     let dir = scratch(if tier { "huge-tier" } else { "huge-no-tier" });
     let plane = plane(&dir.join("server"), tier).await;
@@ -227,15 +227,10 @@ async fn a_file_over_1_gib_is_read_once(tier: bool) {
         reads, 1,
         "a file over 1 GiB was opened {reads} times (reads={reads}), not once: {opens:?}"
     );
-    if tier {
-        collected.expect("collect");
-        let digest = result.output_files[0].digest.clone().expect("a digest");
-        assert!(lease.missing(&[digest]).await.is_empty(), "not held");
-    } else {
-        // Without a write tier a file this large is refused, not held in memory.
-        let why = collected.expect_err("refused").to_string();
-        assert!(why.contains("no write tier has room"), "{why}");
-    }
+    // Held either way: streamed onto the tier, or straight to the store without one.
+    collected.expect("collect");
+    let digest = result.output_files[0].digest.clone().expect("a digest");
+    assert!(lease.missing(&[digest]).await.is_empty(), "not held");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -246,7 +241,8 @@ async fn with_a_tier_a_file_over_1_gib_is_read_once() {
     a_file_over_1_gib_is_read_once(true).await;
 }
 
-/// The same without a write tier, where it is refused after its one read.
+/// Catches a file over 16 MiB refused without a write tier (mutant: the refusal
+/// restored), or read again to be stored: it streams to the store from its one read.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn without_a_tier_a_file_over_1_gib_is_read_once() {
     a_file_over_1_gib_is_read_once(false).await;

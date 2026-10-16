@@ -1,4 +1,5 @@
-//! How much memory the whole in-process path holds while one large output is stored:
+//! How much memory the whole in-process path holds while one large output is stored,
+//! onto the write tier or, without one, straight to the cold store:
 //! the container driver's walk, the plane and the server's upload until its commit,
 //! all in this process. A counting global allocator records the most bytes live at once
 //! while each test runs, beyond those live when it started (the server is started
@@ -113,16 +114,17 @@ fn scratch(name: &str) -> PathBuf {
 }
 
 /// The plane over a server started in `runtime` on the stores under `dir`, with a
-/// write tier, and the server's store. The server's handle is dropped, which stops its
+/// write tier (`tier`) or without one, and the server's store. The server's handle is dropped, which stops its
 /// flusher, so it does not run while the upload path is measured (the flush's own
 /// memory is measured by kbf-front's `tests/large_blobs.rs`). The store works on
 /// without the handle.
 fn plane(
     runtime: &tokio::runtime::Runtime,
     dir: &Path,
+    tier: bool,
 ) -> (Arc<LocalDataPlane>, kbf_server::LocalStore) {
     let n = STARTED.fetch_add(1, Ordering::SeqCst);
-    let argv = vec![
+    let mut argv = vec![
         "kbf-server".to_owned(),
         "--listen=127.0.0.1:0".to_owned(),
         "--worker-listen=127.0.0.1:0".to_owned(),
@@ -130,11 +132,15 @@ fn plane(
             "--cold-store=file://{}",
             dir.join(format!("cold-{n}")).display()
         ),
+    ];
+    argv.push(if tier {
         format!(
             "--hot-store=file://{}",
             dir.join(format!("hot-{n}")).display()
-        ),
-    ];
+        )
+    } else {
+        format!("--meta-dir={}", dir.join(format!("meta-{n}")).display())
+    });
     let args = kbf_server::Args::try_parse_from(argv).expect("flags");
     runtime.block_on(async {
         let never = || Ok(std::future::pending::<()>());
@@ -147,16 +153,16 @@ fn plane(
 }
 
 /// Stores the sparse output `out/large` of `size` bytes through a lease of the plane
-/// over a server with a write tier, and returns the most bytes live at once while it
-/// did; checks it is held after.
-fn store_one_large_output(name: &str, size: u64) -> usize {
+/// over a server with a write tier (`tier`) or without one, and returns the most bytes
+/// live at once while it did; checks it is held after.
+fn store_one_large_output(name: &str, size: u64, tier: bool) -> usize {
     let dir = scratch(name);
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
         .build()
         .expect("runtime");
-    let (plane, _) = plane(&runtime, &dir.join("server"));
+    let (plane, _) = plane(&runtime, &dir.join("server"), tier);
     let upper = dir.join("upper");
     std::fs::create_dir_all(upper.join("out")).expect("mkdir");
     std::fs::File::create(upper.join("out/large"))
@@ -190,8 +196,19 @@ fn store_one_large_output(name: &str, size: u64) -> usize {
 /// write tier with no more than [`BOUND`] live at once.
 #[test]
 fn a_2_gib_output_streams_onto_the_tier_in_bounded_memory() {
-    let peak = store_one_large_output("tier-2g", 2 << 30);
+    let peak = store_one_large_output("tier-2g", 2 << 30, true);
     println!("a 2 GiB output: {peak} bytes live at once at most");
+    assert!(peak < BOUND, "{peak} bytes live at once");
+}
+
+/// Catches a large output refused without a write tier, or held whole on its way to
+/// the store (mutants: the refusal restored, the stream gathered before the store): a
+/// 256 MiB output streams straight to the cold store with no more than [`BOUND`] live
+/// at once (the walk's chunks, the queue to the store, and the store's piece).
+#[test]
+fn without_a_tier_a_256_mib_output_streams_to_the_store_in_bounded_memory() {
+    let peak = store_one_large_output("cold-256m", 256 << 20, false);
+    println!("a 256 MiB output without a tier: {peak} bytes live at once at most");
     assert!(peak < BOUND, "{peak} bytes live at once");
 }
 
@@ -213,7 +230,7 @@ fn upload_one_large_record(name: &str, size: u64) -> usize {
         .enable_all()
         .build()
         .expect("runtime");
-    let (_, store) = plane(&runtime, &dir.join("server"));
+    let (_, store) = plane(&runtime, &dir.join("server"), true);
     let segments = store.segments();
     let mut hasher = RecordHasher::new();
     let zeros = vec![0u8; CHUNK];
