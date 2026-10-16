@@ -106,14 +106,8 @@ fn plan_with<E: Exec>(
     let mut planner = Planner::new(exec);
     let mut changed = false;
     if a.bin_dir.is_some() {
-        changed |= binary(
-            exec,
-            &mut planner,
-            &under(&c.bin_dir, "kbf")?,
-            bytes,
-            root,
-            out,
-        )?;
+        let dst = under(&c.bin_dir, "kbf")?;
+        changed |= binary(exec, &mut planner, &dst, bytes, root, out)?;
     }
     let units = HostPath::new(UNITS)?;
     for (file, text) in [(SLICE, &slice), (name.as_str(), &text)] {
@@ -126,10 +120,8 @@ fn plan_with<E: Exec>(
             text.as_bytes().to_vec(),
         )?;
         changed |= wrote;
-        note(
-            out,
-            format_args!("{path}: {}", if wrote { "writes" } else { "unchanged" }),
-        )?;
+        let what = if wrote { "writes" } else { "unchanged" };
+        note(out, format_args!("{path}: {what}"))?;
     }
     let owner = Owner {
         uid: user.uid,

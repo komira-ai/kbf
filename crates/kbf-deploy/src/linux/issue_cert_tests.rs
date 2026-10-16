@@ -87,6 +87,21 @@ fn a_certificate_names_the_node_and_its_role_and_chains_to_the_ca() {
         validity.not_after.timestamp() - validity.not_before.timestamp(),
         30 * 86_400 + 300
     );
+    // An address alone: no common name, the address the one name.
+    let bare = issue(
+        &ca_cert,
+        &ca_key,
+        Role::Storage,
+        &[],
+        &["192.0.2.11".parse().expect("ip")],
+        now,
+        1,
+    )
+    .expect("issued");
+    assert_eq!(
+        sans(&bare.cert_der),
+        ["IP:[192, 0, 2, 11]", "URI:urn:kbf:role:storage"]
+    );
     // The frontend's role, too.
     let frontend = issue(
         &ca_cert,

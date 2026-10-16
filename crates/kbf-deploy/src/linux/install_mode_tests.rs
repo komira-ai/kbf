@@ -368,8 +368,41 @@ fn an_install_is_refused_before_any_step() {
         fs::remove_file(exec.at("/usr/local/bin/kbf")).expect("rm");
     });
     assert!(matches!(&e, HostError::NotExecutable(_)), "{e}");
+    let e = refused("kbf-not-executable", Mode::Storage, &|exec, _| {
+        write(exec, "/usr/local/bin/kbf", "kbf-1", 0o644);
+    });
+    assert!(matches!(&e, HostError::NotExecutable(_)), "{e}");
     let e = refused("no-linger", Mode::Daemon, &|exec, _| {
         fs::remove_file(exec.at("/var/lib/systemd/linger/kbf")).expect("rm");
     });
     assert!(matches!(&e, HostError::NoLinger { .. }), "{e}");
+}
+
+/// The files a unit reads, read as systemd reads them: an `EnvironmentFile=` with a
+/// leading `-` is optional and an empty one resets the list (neither is looked for),
+/// and a directory where a file is named is no file. Catches an optional file
+/// required, and a directory taken for the file.
+#[test]
+fn optional_environment_files_are_not_required_and_a_directory_is_no_file() {
+    let (exec, _) = host("install-mode-files");
+    let (uid, gid) = me();
+    let user = RunUser {
+        name: "kbf".to_owned(),
+        uid,
+        gid,
+        groups: vec![gid],
+        home: "/srv/kbf".to_owned(),
+    };
+    let unit = UnitFile::parse(
+        "[Service]\nEnvironmentFile=\nEnvironmentFile=-/etc/kbf/optional.env\nExecStart=/usr/local/bin/kbf storage --storage-tls-cert=/etc/kbf/storage.pem\n",
+    )
+    .expect("unit");
+    files_read(&exec, &unit, &user).expect("the optional file is not looked for");
+    fs::create_dir_all(exec.at("/etc/kbf/dir.env")).expect("dir");
+    let unit = UnitFile::parse("[Service]\nEnvironmentFile=/etc/kbf/dir.env\n").expect("unit");
+    let e = files_read(&exec, &unit, &user).expect_err("a directory");
+    assert!(
+        matches!(&e, HostError::Missing(p) if p.as_str() == "/etc/kbf/dir.env"),
+        "{e}"
+    );
 }
