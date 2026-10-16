@@ -163,17 +163,29 @@ async fn stalled_pull(chunks: usize, replica_stalls: bool) -> (usize, usize, usi
         .insert(MAP_GENERATION_HEADER, MetadataValue::from(1u64));
     let channel = farm.channel(primary);
     let call = tokio::spawn(async move { ByteStreamClient::new(channel).write(request).await });
-    // Wait until the pull has not moved for a while: the pipeline is full.
+    // A stalled replica: wait until the pull has not moved for a full second, which is the
+    // pipeline full (an early stop of the wait can only lower the count, never fail the
+    // bound). An unstalled one: until everything is pulled, however slow the machine is.
     let mut last = usize::MAX;
-    let mut steady = 0;
-    while steady < 4 {
+    let mut quiet = 0;
+    let started = std::time::Instant::now();
+    loop {
         tokio::time::sleep(Duration::from_millis(100)).await;
         let now = pulled.load(Ordering::SeqCst);
-        steady = if now == last { steady + 1 } else { 0 };
+        quiet = if now == last { quiet + 1 } else { 0 };
         last = now;
-        if now == chunks {
+        let done = if replica_stalls {
+            quiet >= 10
+        } else {
+            now == chunks
+        };
+        if done {
             break;
         }
+        assert!(
+            started.elapsed() < Duration::from_secs(120),
+            "the writer was not drained"
+        );
     }
     let local = farm.nodes[primary].mem.knobs.chunks.load(Ordering::SeqCst);
     let pulled_at_rest = pulled.load(Ordering::SeqCst);
