@@ -56,6 +56,7 @@ use kbf_threads::disk::Statvfs;
 use kbf_transfer::{Cas, Transfers};
 use tokio::signal::unix::{Signal, SignalKind, signal};
 
+pub use data_dir::DEFAULT_DATA_DIR;
 pub use run::run;
 
 /// The `kbf-daemon` command line.
