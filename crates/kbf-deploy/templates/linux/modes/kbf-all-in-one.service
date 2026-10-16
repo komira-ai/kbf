@@ -45,7 +45,7 @@ ExecStart=@KBF_BIN_DIR@/kbf all-in-one \
 @DAEMON_IMAGE_ARGS@
     --actions-memory-max-gib=@ACTIONS_MEMORY_MAX_GIB@ \
     --supervisor-memory-min-mib=@KBF_DAEMON_MEMORY_MIN_MIB@
-# TODO(av2-08): the certificate flags of the new modes, which replace the worker
+# TODO: the certificate flags of the new modes, which replace the worker
 # listener's, once `kbf all-in-one` has them.
 Restart=on-failure
 # Exit 2 is a command line kbf refused: a restart cannot fix it.

@@ -52,7 +52,7 @@ fn each_rendered_mode_unit_parses_with_kbfs_own_parser() {
 /// Catches kbf-deploy rendering a mode kbf does not have (a sixth, or an old name),
 /// missing one kbf has, listing them in another order than `kbf --help`, and saying a
 /// mode is built (its unit's flags checked) when kbf has no command line for it, or
-/// the other way round once av2-06 or av2-07 builds one.
+/// the other way round once kbf builds one.
 #[test]
 fn kbf_deploy_renders_exactly_the_modes_kbf_takes() {
     let kbf = kbf_cli::command();
@@ -60,7 +60,7 @@ fn kbf_deploy_renders_exactly_the_modes_kbf_takes() {
     let deploy: Vec<&str> = Mode::ALL.iter().map(|m| m.name()).collect();
     assert_eq!(deploy, help);
     for (mode, row) in Mode::ALL.iter().zip(MODES) {
-        let built = !matches!(row.entry, Entry::NotBuilt(_));
+        let built = !matches!(row.entry, Entry::NotBuilt);
         assert_eq!(mode.is_built(), built, "{mode}");
     }
 }

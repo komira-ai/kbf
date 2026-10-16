@@ -5,9 +5,9 @@
 //! Each unit runs `<KBF_BIN_DIR>/kbf <mode> ...`. A mode `kbf` runs today (`daemon`,
 //! `all-in-one`) carries the flags its old binary's unit carries; a mode not built yet
 //! (`frontend`, `storage`, `storage-and-daemon`) carries none, and its template marks
-//! where its flags go with a `TODO(<unit>)` comment. The flags the new modes add
-//! (`--frontend`, `--advertise-addr`, the certificate flags; work-plan unit av2-08) are
-//! such TODO comments too, never guessed.
+//! where its flags go with a `TODO:` comment. The flags the new modes add
+//! (`--frontend`, `--advertise-addr`, the certificate flags) are such TODO comments
+//! too, never guessed.
 //!
 //! [`check`] reads a rendered unit back. Its rules, and the defect each catches:
 //!

@@ -44,7 +44,7 @@ ExecStart=/usr/local/bin/kbf all-in-one \
     --data-dir=/var/lib/kbf \
     --actions-memory-max-gib=200 \
     --supervisor-memory-min-mib=256
-# TODO(av2-08): the certificate flags of the new modes, which replace the worker
+# TODO: the certificate flags of the new modes, which replace the worker
 # listener's, once `kbf all-in-one` has them.
 Restart=on-failure
 # Exit 2 is a command line kbf refused: a restart cannot fix it.
