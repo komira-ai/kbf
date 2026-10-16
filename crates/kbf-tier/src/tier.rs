@@ -285,16 +285,17 @@ pub trait WriteTier: Send + Sync {
     fn unstage(&self, object: ObjectId) -> Result<(), TierError>;
 
     /// Records that `object`'s `ObjectFlushed` committed: the block stops counting
-    /// against the budget and its file is renamed `<epoch>-<seq>.seg` (and the
-    /// directory synced), a flushed copy [`WriteTier::read`] still serves until it is
-    /// evicted. Call it only once the commit applied: eviction then never touches a
-    /// block whose only copy is local.
+    /// against the budget and, with [`TierOptions::flushed_copies`], its file is
+    /// renamed `<epoch>-<seq>.seg` (and the directory synced), a flushed copy
+    /// [`WriteTier::read`] still serves until it is evicted; without, its file is
+    /// deleted and a read of it is [`TierError::UnknownBlock`]. Call it only once the
+    /// commit applied: eviction then never touches a block whose only copy is local.
     ///
     /// # Errors
     ///
     /// [`TierError::NotSealable`] unless the block is sealed (or ready to be: its
     /// `SealStaged` may have committed without the tier hearing); [`TierError::Io`]
-    /// if the rename or the directory sync failed. The block stops counting either
+    /// if the rename, the delete or the directory sync failed. The block stops counting either
     /// way: the object is in the store, and a `.blk` left behind is an orphan the
     /// next start deletes.
     fn flushed(&self, object: ObjectId) -> Result<(), TierError>;

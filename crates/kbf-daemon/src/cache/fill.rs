@@ -16,10 +16,17 @@
 //! written does the same; one before (no file in `tmp/`, a write that fails) leaves
 //! the lease to fetch the blob into its own file. The cache never fails a lease that
 //! would run without it.
+//!
+//! A file in `tmp/` is a [`TmpFile`] from its name's making until the rename takes it
+//! or the lease has copied it: dropped, whoever drops it, it is removed. A fill that
+//! fails, a lease killed during its fetch (its task dropped), and a checked file no
+//! lease got to copy leave nothing in `tmp/`, which no budget counts. The guard goes
+//! into each blocking step that makes or uses the file, so a step still running when
+//! its lease is dropped removes the file when it ends.
 
 use std::io::{ErrorKind, Read as _, Write as _};
 use std::os::unix::fs::OpenOptionsExt as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -45,8 +52,8 @@ pub(crate) enum Source {
     /// The entry at `path`, which has `nlink` links.
     Entry { path: PathBuf, nlink: u64 },
     /// A checked file of the key's bytes in `tmp/` that the cache could not keep: the
-    /// lease's alone, copied from and then removed.
-    Loose(PathBuf),
+    /// lease's alone, copied from, and removed when dropped.
+    Loose(TmpFile),
     /// Nothing: the cache could not write the bytes, and the lease fetches them into
     /// its own file.
     LeaseFetch,
@@ -133,6 +140,43 @@ impl std::fmt::Display for InputStats {
 }
 
 pub(crate) use crate::cas::Fill;
+
+/// A file in `tmp/` (its name, made or not yet): removed when dropped, unless
+/// [`TmpFile::renamed`] says the rename into `blobs/` took it. See the module docs.
+#[derive(Debug)]
+pub(crate) struct TmpFile {
+    path: PathBuf,
+    renamed: bool,
+}
+
+impl TmpFile {
+    pub(super) const fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            renamed: false,
+        }
+    }
+
+    /// Its name.
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// The rename took the file: nothing to remove.
+    fn renamed(mut self) {
+        self.renamed = true;
+    }
+}
+
+impl Drop for TmpFile {
+    fn drop(&mut self) {
+        if !self.renamed
+            && let Err(e) = remove_if_present(&self.path)
+        {
+            tracing::warn!("cache: {} not removed: {e}", self.path.display());
+        }
+    }
+}
 
 /// A held slot. Dropped, it leaves the fill map and wakes the waiters, handing them
 /// the fill's error if it failed.
@@ -276,24 +320,24 @@ impl Cache {
         let inner = &*self.inner;
         if inner.state().index.get(&key.sibling()).is_some() {
             let (sibling, tmp) = (inner.path_of(&key.sibling()), inner.next_tmp());
-            let at = tmp.clone();
-            let copied = blocking(move || copy_checked(&sibling, &at, &key)).await;
-            if let Some(file) = copied {
+            let copied = blocking(move || copy_checked(&sibling, tmp, &key)).await;
+            if let Some((file, tmp)) = copied {
                 return Ok(self.insert(key, file, tmp).await);
             }
         }
         let tmp = inner.next_tmp();
-        let at = tmp.clone();
-        let Ok(file) = blocking(move || new_file(&at, 0o600)).await else {
+        let made = blocking(move || new_file(tmp.path(), 0o600).map(|file| (file, tmp))).await;
+        let Ok((file, tmp)) = made else {
             tracing::warn!("cache: {} not inserted: no file in tmp/", key.name());
             return Ok(Source::LeaseFetch);
         };
         // The CAS bounds the fetch (the transfer engine: its requests and its byte
-        // budget for the whole process).
+        // budget for the whole process). On an error `tmp` is dropped, and with it the
+        // file, whatever was written.
         let mut file = tokio::fs::File::from_std(file);
         if let Err(e) = cas.fetch_to(&key.digest(), &mut file).await {
             drop(file);
-            let _ = blocking(move || remove_if_present(&tmp)).await;
+            blocking(move || drop(tmp)).await;
             let CasError::Write(_, why) = e else {
                 return Err(e);
             };
@@ -306,14 +350,14 @@ impl Cache {
     }
 
     /// [`Inner::insert`] on the blocking pool.
-    async fn insert(&self, key: Key, file: std::fs::File, tmp: PathBuf) -> Source {
+    async fn insert(&self, key: Key, file: std::fs::File, tmp: TmpFile) -> Source {
         let owner = Arc::clone(&self.inner);
         blocking(move || owner.insert(key, file, tmp)).await
     }
 }
 
 /// Creates `path` (`O_EXCL`) with `mode`, for writing.
-pub(super) fn new_file(path: &std::path::Path, mode: u32) -> std::io::Result<std::fs::File> {
+pub(super) fn new_file(path: &Path, mode: u32) -> std::io::Result<std::fs::File> {
     std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -323,22 +367,18 @@ pub(super) fn new_file(path: &std::path::Path, mode: u32) -> std::io::Result<std
 
 /// Copies the entry at `from` into a new file at `to`, a MiB at a time, hashing as it
 /// goes: the file, if the bytes are `key`'s. Otherwise (they are not, or a read or
-/// write failed) `to` is removed.
-fn copy_checked(from: &std::path::Path, to: &std::path::Path, key: &Key) -> Option<std::fs::File> {
-    let mut file = new_file(to, 0o600).ok()?;
+/// write failed) `to` is dropped, and the file with it.
+fn copy_checked(from: &Path, to: TmpFile, key: &Key) -> Option<(std::fs::File, TmpFile)> {
+    let mut file = new_file(to.path(), 0o600).ok()?;
     match copy_hashing(from, &mut file) {
-        Ok(hash) if hash == key.hash => Some(file),
-        _ => {
-            drop(file);
-            let _ = remove_if_present(to);
-            None
-        }
+        Ok(hash) if hash == key.hash => Some((file, to)),
+        _ => None,
     }
 }
 
 /// Copies the file at `from` to the end of `to`, a MiB at a time; the SHA-256 of what
 /// was copied.
-fn copy_hashing(from: &std::path::Path, to: &mut std::fs::File) -> std::io::Result<[u8; 32]> {
+fn copy_hashing(from: &Path, to: &mut std::fs::File) -> std::io::Result<[u8; 32]> {
     use sha2::Digest as _;
     let mut hasher = sha2::Sha256::new();
     let mut source = std::fs::File::open(from)?;
@@ -372,10 +412,11 @@ impl Inner {
     /// Inserts the bytes written into `file` (named `tmp`) as `key`'s entry (see the
     /// module docs), then evicts down to the budget. On any failure the file is left
     /// in `tmp/` for the lease to copy.
-    fn insert(&self, key: Key, file: std::fs::File, tmp: PathBuf) -> Source {
+    fn insert(&self, key: Key, file: std::fs::File, tmp: TmpFile) -> Source {
         let path = self.path_of(&key);
-        match self.finish_entry(&key, file, &tmp, &path) {
+        match self.finish_entry(&key, file, tmp.path(), &path) {
             Ok(()) => {
+                tmp.renamed();
                 let now = self.now();
                 self.state().index.insert(key, now, true);
                 self.evict();
@@ -398,8 +439,8 @@ impl Inner {
         &self,
         key: &Key,
         file: std::fs::File,
-        tmp: &PathBuf,
-        path: &PathBuf,
+        tmp: &Path,
+        path: &Path,
     ) -> std::io::Result<()> {
         rustix::fs::fchmod(&file, rustix::fs::Mode::from_raw_mode(key.mode()))?;
         let fixed = Timespec {

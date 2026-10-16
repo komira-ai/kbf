@@ -374,27 +374,8 @@ async fn scrape(api: std::net::SocketAddr) -> std::collections::BTreeMap<String,
 /// at least the blob, and `/metrics` says so.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_hot_stores_blocks_are_the_one_caches_storage_bytes() {
-    use clap::Parser as _;
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join("kbf-all-in-one-one-cache")
-        .join(format!("server-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    let argv = [
-        "kbf-server".to_owned(),
-        "--listen=127.0.0.1:0".to_owned(),
-        "--worker-listen=127.0.0.1:0".to_owned(),
-        "--api-listen=127.0.0.1:0".to_owned(),
-        format!("--write-own-segment-bytes={}", 1 << 30),
-        format!("--cold-store=file://{}", dir.join("cold").display()),
-        format!("--hot-store=file://{}", dir.join("hot").display()),
-    ];
-    let mut args = kbf_server::Args::try_parse_from(argv).expect("flags");
     let local = Arc::new(kbf_storage::local_cache::LocalCache::new());
-    args.local_cache = Some(Arc::clone(&local));
-    let never = || Ok(std::future::pending::<()>());
-    let server = kbf_server::start(&args, never).await.expect("start");
-    let (store, api) = (server.local(), server.api.expect("the API"));
-    tokio::spawn(server.serve());
+    let (store, api, _) = server_half("blocks", 1 << 30, Some(Arc::clone(&local))).await;
     assert_eq!(local.storage_bytes(), 0);
     store.put(vec![5; 1000]).await.expect("put");
     let staged = local.storage_bytes();
@@ -406,5 +387,83 @@ async fn the_hot_stores_blocks_are_the_one_caches_storage_bytes() {
         "kbf_local_cache_fill_bytes",
     ] {
         assert_eq!(samples.get(name), Some(&staged), "{name}: {samples:?}");
+    }
+}
+
+/// A server half started as `kbf-all-in-one` starts it, in a fresh directory named
+/// `name`, with `local` as its one cache: blobs of at least `own` bytes get a block of
+/// their own. Its local store, its operator API, and its hot store's directory.
+async fn server_half(
+    name: &str,
+    own: u64,
+    local: Option<Arc<kbf_storage::local_cache::LocalCache>>,
+) -> (LocalStore, std::net::SocketAddr, PathBuf) {
+    use clap::Parser as _;
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join("kbf-all-in-one-one-cache")
+        .join(format!("server-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let argv = [
+        "kbf-server".to_owned(),
+        "--listen=127.0.0.1:0".to_owned(),
+        "--worker-listen=127.0.0.1:0".to_owned(),
+        "--api-listen=127.0.0.1:0".to_owned(),
+        format!("--write-own-segment-bytes={own}"),
+        format!("--cold-store=file://{}", dir.join("cold").display()),
+        format!("--hot-store=file://{}", dir.join("hot").display()),
+    ];
+    let mut args = kbf_server::Args::try_parse_from(argv).expect("flags");
+    args.local_cache = local;
+    let never = || Ok(std::future::pending::<()>());
+    let server = kbf_server::start(&args, never).await.expect("start");
+    let (store, api) = (server.local(), server.api.expect("the API"));
+    tokio::spawn(server.serve());
+    (store, api, dir.join("hot"))
+}
+
+/// Catches the hot store's flushed copies decided otherwise than by the one cache: the
+/// "never keep" mutant (a server with no one cache, `kbf-server` alone or an
+/// all-in-one whose hot store is on another disk, would delete what it serves local
+/// reads from) and the "always keep" one (a second copy beside the input cache's): a
+/// server half without a one cache and one with it each upload a blob in a block of its
+/// own and flush it; the first keeps a flushed copy (`.seg` under the hot store,
+/// counted in `kbf_write_tier_flushed_copy_bytes`), the second neither.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_hot_store_keeps_flushed_copies_only_without_the_one_cache() {
+    for one_cache in [false, true] {
+        let local = one_cache.then(|| Arc::new(kbf_storage::local_cache::LocalCache::new()));
+        let name = format!("flushed-{one_cache}");
+        let (store, api, hot) = server_half(&name, 1, local).await;
+        store.put(vec![6; 1000]).await.expect("put");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let samples = loop {
+            let samples = scrape(api).await;
+            let flushes = samples.get("kbf_write_tier_flushes_total").copied();
+            let used = samples.get("kbf_write_tier_used_bytes").copied();
+            if flushes.unwrap_or(0) > 0 && used == Some(0) {
+                break samples;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "not flushed: {samples:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        };
+        let copies = std::fs::read_dir(&hot)
+            .expect("hot")
+            .flatten()
+            .filter(|e| e.path().extension().is_some_and(|x| x == "seg"))
+            .count();
+        let copy_bytes = samples["kbf_write_tier_flushed_copy_bytes"];
+        if one_cache {
+            assert_eq!(
+                (copies, copy_bytes),
+                (0, 0),
+                "a flushed copy beside the one cache"
+            );
+        } else {
+            assert_eq!(copies, 1, "no flushed copy without the one cache");
+            assert!(copy_bytes >= 1000, "{copy_bytes}");
+        }
     }
 }

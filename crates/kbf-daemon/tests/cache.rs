@@ -3,7 +3,9 @@
 //! the fallbacks to a private copy, the checks on every hit, eviction by budget and by
 //! free space, and the one-owner lock; restarts (`restart`), crashes (`crash`) and
 //! refusals and I/O errors (`edges`); the node's one cache with local storage and fills
-//! that stream (`one_cache`); measurements at 1M entries, off the gate (`measure`). One test binary, so each part of the cache is measured in one place.
+//! that stream (`one_cache`); fills that end without an entry leave nothing in `tmp/`
+//! (`tmp_files`); measurements at 1M entries, off the gate (`measure`). One test
+//! binary, so each part of the cache is measured in one place.
 #![cfg(target_os = "linux")]
 
 #[path = "cache/crash.rs"]
@@ -17,6 +19,8 @@ mod one_cache;
 #[path = "cache/restart.rs"]
 mod restart;
 mod support;
+#[path = "cache/tmp_files.rs"]
+mod tmp_files;
 
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::Path;

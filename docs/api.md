@@ -289,8 +289,11 @@ the daemon half's input cache and the server half's hot store are one cache
 ([architecture-v2.md](design/architecture-v2.md#10-locality)): the input cache's
 directory is the node's only local copy of a blob, the tier deletes a block once it is
 flushed (so `kbf_write_tier_flushed_copy_bytes` stays 0), and the input cache evicts its
-entries until they and the tier's blocks fit its budget. These families follow; in every
-other process they are absent.
+entries until they and the tier's blocks fit its budget: after each input it fills, and
+within about a second of the tier growing past what the budget leaves it (uploads alone).
+Entries a running lease pins are never evicted, so a hot store budgeted at or above the
+input cache's budget leaves room for those alone (the daemon warns once). These families
+follow; in every other process they are absent.
 
 | Family | Type | What it measures |
 |---|---|---|

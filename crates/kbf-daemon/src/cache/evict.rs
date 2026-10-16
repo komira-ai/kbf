@@ -19,6 +19,7 @@
 //! link count is read once per round, under the lock.
 
 use std::collections::HashSet;
+use std::sync::atomic::Ordering;
 
 use rustix::fs::{AtFlags, CWD};
 
@@ -29,12 +30,34 @@ impl Inner {
     /// One eviction round: the budget, then the floor.
     pub(super) fn evict(&self) {
         // Read once a round, outside the state's lock.
-        let max = self.config.max_bytes.saturating_sub(self.storage_bytes());
+        let storage = self.storage_bytes();
+        self.note_storage_over(storage);
+        let max = self.budget_of(storage);
         let over = |state: &State| state.index.total() > max;
         while self.evict_one(&mut |state| over(state).then(|| oldest(state, |_| true)).flatten()) {}
         if self.config.min_free_bytes > 0 {
             self.evict_to_floor();
         }
+    }
+
+    /// Warns when local storage alone holds the whole budget (a hot store budgeted at
+    /// or above the cache): every entry no lease pins is then evicted. Once, until it
+    /// no longer does.
+    fn note_storage_over(&self, storage: u64) {
+        let over = storage > 0 && storage >= self.config.max_bytes;
+        if !over {
+            self.storage_over.store(false, Ordering::Relaxed);
+        } else if !self.storage_over.swap(true, Ordering::Relaxed) {
+            let max = self.config.max_bytes;
+            tracing::warn!(
+                "cache: local storage holds {storage} B, all of the {max} B budget: only pinned entries are kept"
+            );
+        }
+    }
+
+    /// What the entries may hold while local storage holds `storage` bytes.
+    pub(super) const fn budget_of(&self, storage: u64) -> u64 {
+        self.config.max_bytes.saturating_sub(storage)
     }
 
     /// Evicts entries no lease links until the filesystem has the floor's free space.

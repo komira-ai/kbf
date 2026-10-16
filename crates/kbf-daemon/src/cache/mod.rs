@@ -6,7 +6,8 @@
 //! - **One owner.** [`Cache::open`] takes an exclusive `flock` on `<dir>/lock` before
 //!   it touches anything else; a second daemon is refused ([`Disabled::Locked`]) and
 //!   runs uncached. The lock file is never unlinked.
-//! - **Inserts** are fetched and hashed into `tmp/`, made read-only (0444, 0555 for an
+//! - **Inserts** are fetched and hashed into `tmp/` (a file there is removed whoever
+//!   drops it before the rename: a failed fill, a lease killed during its fetch), made read-only (0444, 0555 for an
 //!   executable) with the fixed mtime [`FIXED_MTIME`], and renamed into `blobs/` with
 //!   `RENAME_NOREPLACE` (`RENAME_EXCL` on macOS; `fill`). Nothing under `blobs/` is ever opened for writing.
 //! - **The index** of keys, sizes and last uses is in memory and saved whole to
@@ -21,7 +22,9 @@
 //! - **One cache with local storage** ([`CacheConfig::local`]): on a node whose local
 //!   storage shares the disk (`all-in-one`), this directory and index are the node's
 //!   only local copies of blobs (`kbf_storage::local_cache`), and the budget counts
-//!   local storage's bytes beside the entries: eviction makes room for both.
+//!   local storage's bytes beside the entries: eviction makes room for both, after
+//!   each insert and, since local storage grows without the cache's knowing, at least
+//!   every [`CacheConfig::room_every`] on the background thread.
 //!
 //! The cache never fails a lease that would run without it: an I/O error in the cache
 //! leaves the lease to write the blob itself, as without a cache.
@@ -142,12 +145,18 @@ pub struct CacheConfig {
     /// storage's bytes too ([`CacheConfig::max_bytes`] is then what both may hold).
     /// `None` elsewhere: the budget is the entries'.
     pub local: Option<Arc<LocalCache>>,
+    /// With [`CacheConfig::local`], how often the background thread looks whether
+    /// local storage grew past what the budget leaves it, and evicts if so: local
+    /// storage grows without the cache's knowing (uploads), so the evictions after each
+    /// insert are not enough on a node that only uploads.
+    pub room_every: Duration,
 }
 
 impl CacheConfig {
     /// A cache in `dir` for leases under `scratch`, at most `max_bytes`: no free-space
     /// floor, 64 links at once, a snapshot every 5 minutes, a pass a day at one
-    /// directory a second, the system clock, no hooks.
+    /// directory a second, room for local storage made within a second, the system
+    /// clock, no hooks.
     #[must_use]
     pub fn new(dir: PathBuf, scratch: PathBuf, max_bytes: u64) -> Self {
         Self {
@@ -165,6 +174,7 @@ impl CacheConfig {
             link_mode: None,
             link_max: None,
             local: None,
+            room_every: Duration::from_secs(1),
         }
     }
 }
@@ -354,6 +364,8 @@ struct Inner {
     counters: Counters,
     /// Names the temporary files of fills.
     next_tmp: AtomicU64,
+    /// Local storage alone fills the budget (warned once until it no longer does).
+    storage_over: std::sync::atomic::AtomicBool,
     /// Held while a snapshot is written: one writer of `index.snap.tmp` at a time.
     snapshotting: Mutex<()>,
     index_discarded: Option<Discarded>,
@@ -415,6 +427,7 @@ impl Cache {
             }),
             counters: Counters::default(),
             next_tmp: AtomicU64::new(0),
+            storage_over: std::sync::atomic::AtomicBool::new(false),
             snapshotting: Mutex::new(()),
             index_discarded: discarded,
             index_load_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
@@ -604,10 +617,10 @@ impl Inner {
             .map_or(0, |local| local.storage_bytes())
     }
 
-    /// A new name in `tmp/` for a fill.
-    fn next_tmp(&self) -> PathBuf {
+    /// A new name in `tmp/` for a fill, removed when dropped.
+    fn next_tmp(&self) -> fill::TmpFile {
         let n = self.next_tmp.fetch_add(1, Ordering::Relaxed);
-        self.tmp.join(n.to_string())
+        fill::TmpFile::new(self.tmp.join(n.to_string()))
     }
 
     fn path_of(&self, key: &Key) -> PathBuf {
@@ -661,8 +674,32 @@ impl Inner {
         }
     }
 
-    /// Waits up to `wait`; whether the cache was stopped.
+    /// Waits up to `wait`; whether the cache was stopped. With one cache
+    /// ([`CacheConfig::local`]), every [`CacheConfig::room_every`] of the wait it evicts
+    /// if the entries and local storage's bytes are over the budget.
     fn wait_stopped(&self, wait: Duration) -> bool {
+        let until = Instant::now() + wait;
+        loop {
+            let left = until.saturating_duration_since(Instant::now());
+            let Some(local) = &self.config.local else {
+                return self.wait_for_stop(left);
+            };
+            if self.wait_for_stop(left.min(self.config.room_every)) {
+                return true;
+            }
+            if left.is_zero() {
+                return false;
+            }
+            // Local storage's bytes read before the state's lock is taken, as `evict` does.
+            let budget = self.budget_of(local.storage_bytes());
+            if self.state().index.total() > budget {
+                self.evict();
+            }
+        }
+    }
+
+    /// Waits up to `wait` for a stop; whether the cache was stopped.
+    fn wait_for_stop(&self, wait: Duration) -> bool {
         let (stopped, wake) = &self.stopped;
         let guard = lock(stopped);
         let (guard, _) = wake

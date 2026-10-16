@@ -14,7 +14,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use kbf_front::{Cache, MetaLog};
@@ -223,7 +223,7 @@ where
     let local = args.local_cache.as_ref();
     let (cache, tier) = crate::write_tier::attach_with(cache, hot, local.is_none()).await?;
     let cache = Arc::new(cache);
-    share_storage(local, tier_bytes(Arc::clone(&cache)));
+    share_storage(local, tier_bytes(Arc::downgrade(&cache)));
     let local = LocalStore::new(Arc::clone(&cache), listeners.segments);
     let _flusher = tier.map(|_| {
         let flusher = crate::write_tier::run_flusher(Arc::clone(&cache), FLUSH_EVERY);
@@ -262,9 +262,14 @@ fn share_storage(local: Option<&Arc<LocalCache>>, bytes: HeldBytes) {
 }
 
 /// What `cache`'s write tier holds on its disk now: its blocks, and any flushed copies
-/// it keeps; 0 without a tier.
-fn tier_bytes<M: MetaLog, O: ObjectStore + 'static>(cache: Arc<Cache<M, O>>) -> HeldBytes {
-    Box::new(move || cache.write_tier().map_or(0, held))
+/// it keeps; 0 without a tier or once the server is gone (a weak handle, as the input
+/// cache's side is: the one cache keeps neither half alive).
+fn tier_bytes<M: MetaLog, O: ObjectStore + 'static>(cache: Weak<Cache<M, O>>) -> HeldBytes {
+    Box::new(move || {
+        cache
+            .upgrade()
+            .map_or(0, |cache| cache.write_tier().map_or(0, held))
+    })
 }
 
 /// What `tier` holds on its disk.

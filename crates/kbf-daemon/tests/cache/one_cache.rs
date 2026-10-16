@@ -239,33 +239,41 @@ async fn a_fill_writes_the_blob_into_its_file_as_it_arrives() {
 }
 
 /// Catches a fill whose write into `tmp/` fails (a full disk) failing the lease or
-/// leaving its file: the lease fetches the blob into its own file, each of its names
-/// right and linked to one inode, nothing is indexed, and `tmp/` is empty.
+/// leaving its file, and a lease's own fetch that reads the blob whole (the "fetch,
+/// then write" mutant of the fallback): the lease fetches the blob into its own file,
+/// for a blob of one chunk and one of 81 chunks of 64 KiB each in the file before the
+/// next, with no whole read; each of its names is right and linked to one inode,
+/// nothing is indexed, and `tmp/` is empty.
 #[tokio::test]
 async fn a_fill_that_cannot_write_its_file_leaves_the_lease_to_fetch() {
+    use std::os::unix::fs::MetadataExt as _;
     let dir = scratch("cache-one-full");
     let gates = Gates::new();
     let cache =
         Cache::open(config(&dir, GIB, Arc::clone(&gates), &FakeClock::at(1000))).expect("open");
-    let cas = Chunked::new(true);
-    let root = cas.cas.tree(&[
-        file("a", b"the bytes", false),
-        file("b", b"the bytes", false),
-    ]);
-    let lease_dir = crate::support::cache_kit::lease_dir(&dir, "full");
-    let stats = kbf_daemon::tree::materialize_cached(&cas, &cache, &root, &lease_dir, &[])
-        .await
-        .expect("the lease ran without the cache");
-    use std::os::unix::fs::MetadataExt as _;
-    let ino = |name: &str| std::fs::metadata(lease_dir.join(name)).expect("stat").ino();
-    assert_eq!(ino("a"), ino("b"));
-    assert_eq!(
-        std::fs::read(lease_dir.join("b")).expect("read"),
-        b"the bytes"
-    );
-    assert_eq!((stats.link_fallbacks, stats.fetched_bytes), (1, 9));
-    assert!(!cache.holds(&key(b"the bytes", false)));
-    assert_eq!(tmp_files(&dir), 0);
+    let big: Vec<u8> = (0..(5 << 20) + 3).map(|i: u32| (i % 249) as u8).collect();
+    for blob in [b"the bytes".to_vec(), big] {
+        let cas = Chunked::new(true);
+        let root = cas
+            .cas
+            .tree(&[file("a", &blob, false), file("b", &blob, false)]);
+        let lease_dir = crate::support::cache_kit::lease_dir(&dir, &format!("full-{}", blob.len()));
+        let stats = kbf_daemon::tree::materialize_cached(&cas, &cache, &root, &lease_dir, &[])
+            .await
+            .expect("the lease ran without the cache");
+        let ino = |name: &str| std::fs::metadata(lease_dir.join(name)).expect("stat").ino();
+        assert_eq!(ino("a"), ino("b"));
+        assert_eq!(std::fs::read(lease_dir.join("b")).expect("read"), blob);
+        let fetched = blob.len() as u64;
+        assert_eq!((stats.link_fallbacks, stats.fetched_bytes), (1, fetched));
+        assert_eq!(cas.cas.reads_of(&digest(&blob)), 0, "a whole read");
+        assert_eq!(
+            cas.chunks.load(Ordering::SeqCst),
+            blob.len().div_ceil(CHUNK)
+        );
+        assert!(!cache.holds(&key(&blob, false)));
+        assert_eq!(tmp_files(&dir), 0);
+    }
     stop(cache, &gates);
 }
 
@@ -433,5 +441,48 @@ async fn in_clone_mode_every_fill_gives_each_name_its_own_writable_file() {
         assert_eq!(cache.holds(&k), case == "entry", "{case}");
     }
     assert_eq!(tmp_files(&dir), 0);
+    stop(cache, &gates);
+}
+
+/// Catches a budget that reacts to local storage only when an input is fetched (the
+/// "no room check" mutant: on a node that only uploads, the hot store would grow past
+/// the share the budget leaves it while the entries stay): once the first adopt pass
+/// (and its eviction round) is over, three entries of 100 fill a budget of 300; local
+/// storage then grows to 150 with no lease running, and within seconds the two least
+/// recently used entries are gone on the cache's own thread.
+#[tokio::test]
+async fn local_storage_that_grows_makes_room_with_no_fill() {
+    let dir = scratch("cache-one-room");
+    let gates = Gates::running();
+    let clock = FakeClock::at(1000);
+    let (local, storage) = one_cache();
+    let mut config = config(&dir, 300, Arc::clone(&gates), &clock);
+    config.local = Some(local);
+    config.room_every = std::time::Duration::from_millis(20);
+    let cache = Cache::open(config).expect("open");
+    // The first pass ends with an eviction round and the second snapshot; after it,
+    // only the room checks evict (the next pass and snapshot are an hour away).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while cache.stats().snapshots < 2 {
+        assert!(std::time::Instant::now() < deadline, "no first pass");
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let cas = CountingCas::default();
+    for tag in 1..=3_u8 {
+        clock.advance(10);
+        let root = cas.tree(&[file("f", &[tag; 100], false)]);
+        lease(&cas, &cache, &root, &dir, &format!("l{tag}"))
+            .await
+            .expect("lease");
+    }
+    assert_eq!(cache.stats().bytes, 300);
+    storage.store(150, Ordering::SeqCst);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while cache.stats().bytes > 150 {
+        assert!(std::time::Instant::now() < deadline, "no room was made");
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(cache.stats().bytes, 100);
+    assert!(cache.holds(&key(&[3; 100], false)));
     stop(cache, &gates);
 }

@@ -81,7 +81,10 @@ the daemon half's input cache and the server half's hot store are one cache on t
   for the cold store, which no cache may drop. While one of them holds a blob a lease
   also needs, the blob is on the disk twice, until that block is flushed.
 - **One budget.** The input cache evicts its entries (least recently used, never one a
-  running lease pins) until they and the hot store's blocks fit its budget.
+  running lease pins) until they and the hot store's blocks fit its budget: after each
+  input it fills, and within about a second of the hot store growing (uploads with no lease
+  running). A hot store budgeted at or above the input cache leaves room for pinned
+  entries alone; the daemon warns when its blocks fill the whole budget.
 - **One fill.** `/metrics` reports `kbf_local_cache_input_bytes`,
   `kbf_local_cache_storage_bytes` and their sum, `kbf_local_cache_fill_bytes`.
 
@@ -114,8 +117,9 @@ durable store, not a cache: a `file://` cold store on the same disk holds its ow
   five chunks behind what the stream handed out; two leases needing one input at once
   read it once, into one entry both link; what a streamed read answers when the stream
   is damaged or cut, the blob is absent, the file cannot be written or the server half
-  is gone; and the hot store's staged blocks reported to the one cache as its storage
-  bytes.
+  is gone; the hot store's staged blocks reported to the one cache as its storage
+  bytes; and a server half that keeps flushed copies without the one cache and none
+  with it.
 - `src/plane_tests.rs`: a digest that does not parse, a server half whose runtime is
   gone, a file changed after the walk hashed it.
 - `src/one_cache_tests.rs`: one cache only when the hot store shares the data

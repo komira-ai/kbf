@@ -183,13 +183,10 @@ async fn place(
                 blocking(move || from_entry(&path, nlink, &placing, mode, link_max, &*link, want))
                     .await
             }
-            Source::Loose(path) => {
-                blocking(move || {
-                    let placed = from_loose(&path, &placing, mode, want);
-                    let _ = std::fs::remove_file(&path);
-                    placed
-                })
-                .await
+            // `loose` is removed when the copy is done (dropped with the closure), or
+            // whenever the closure is dropped unrun.
+            Source::Loose(loose) => {
+                blocking(move || from_loose(loose.path(), &placing, mode, want)).await
             }
             Source::LeaseFetch => fetch_names(cas, cache, &names, counts, want).await,
         };
