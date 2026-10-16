@@ -18,14 +18,20 @@
 //!   and nothing is hashed here: with a write tier the server trusts the digests at the
 //!   commit and its flusher hashes every record before the PUT, dropping one that does
 //!   not match (#656); without one, `PutRange` hashes each record as its bytes arrive.
+//!   An upload holding a record over [`MAX_UNSTAGED_BLOB_BYTES`] that the server has no
+//!   write tier room for (`Begin` answers FAILED_PRECONDITION) is stored record by
+//!   record instead, as the transfer engine falls back ([`kbf_transfer::put_each`]).
 //! - **A whole blob** ([`Cas::put`], and [`Cas::put_chunks`] through it): hashed once,
 //!   by the server's [`LocalStore::put`], under the admission a ByteStream `Write` takes.
+//!   A blob of [`Cas::put_chunks`] over [`MAX_UNSTAGED_BLOB_BYTES`] is streamed to the
+//!   object store as its chunks are read ([`LocalStore::put_streamed`]), as a ByteStream
+//!   `Write` of one is: never gathered, never refused for its size.
 //! - **Reads**: [`Cas::get`], the cache's own whole-blob read, which checks the bytes
-//!   against the digest; [`Cas::read_to`] (the input cache's fills), the cache's
-//!   streamed read ([`LocalStore::read_stream`]), pumped on the server half's runtime a
-//!   chunk at a time (at most two chunks between the halves, never the blob) into the
-//!   file as it arrives, and hashed here too: a stream cut short by a server half that
-//!   went away is not taken for a whole blob.
+//!   against the digest (the daemon decodes what it gets); [`Cas::read_to`] (the input
+//!   cache's fills), the storage's windowed read ([`LocalStore::read_stream`]), pumped on
+//!   the server half's runtime a chunk at a time (at most two chunks between the halves,
+//!   never the blob) into the file as it arrives, and hashed here too: a stream cut short
+//!   by a server half that went away is not taken for a whole blob.
 //! - **FindMissing** ([`Cas::missing`]): the cache's own answer. A call that fails
 //!   answers every digest missing, as the transfer engine's does.
 //!
@@ -33,11 +39,11 @@
 
 use std::collections::BTreeSet;
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use bytes::Bytes;
-
-use futures::{StreamExt as _, TryStreamExt as _, future, stream};
+use futures::{FutureExt as _, StreamExt as _, TryStreamExt as _, future, stream};
+use kbf_front::MAX_UNSTAGED_BLOB_BYTES;
 use kbf_proto::reapi::Digest;
 use kbf_proto::worker::segments_server::Segments;
 use kbf_proto::worker::{BeginRequest, CommitRequest, PutRangeRequest, UploadSegment};
@@ -45,8 +51,9 @@ use kbf_segments::MAX_SEGMENT_BYTES;
 use kbf_server::LocalStore;
 use kbf_storage::{ReadStream, StorageError};
 use kbf_transfer::{
-    Cas, CasError, DEFAULT_SEGMENT_UPLOADS, Intake, MAX_RANGE_BYTES, MAX_UPLOAD_RECORDS, Planned,
-    Record, RecordHasher, SEGMENT_UPLOAD_BYTES, label, plan, proto_digest, read_pieces,
+    Cas, CasError, Chunks, DEFAULT_SEGMENT_UPLOADS, Intake, MAX_RANGE_BYTES, MAX_UPLOAD_RECORDS,
+    Planned, Record, RecordHasher, SEGMENT_UPLOAD_BYTES, label, plan, proto_digest, put_each,
+    read_pieces,
 };
 use kbf_types::{DigestFunction, LeaseId};
 use tokio::io::AsyncWriteExt as _;
@@ -83,6 +90,11 @@ impl LocalDataPlane {
     /// The server half's runtime.
     pub(crate) fn server(&self) -> &Handle {
         &self.server
+    }
+
+    /// The server half's store.
+    pub(crate) fn store(&self) -> &LocalStore {
+        &self.store
     }
 
     /// Runs `call` on the server half's runtime and returns its answer; UNAVAILABLE when
@@ -124,7 +136,16 @@ impl LocalDataPlane {
         };
         let segments = Arc::clone(&self.segments);
         let begun = self.call(async move { segments.begin(Request::new(begin)).await });
-        let id = begun.await.map_err(not_stored)?.into_inner().upload;
+        let id = match begun.await {
+            Ok(begun) => begun.into_inner().upload,
+            // A record too large to hold in memory and no write tier with room for it:
+            // each record by itself, a large one streamed to the store.
+            Err(status) if status.code() == Code::FailedPrecondition => {
+                let records = upload.into_iter().flat_map(|s| s.records);
+                return put_each(self, records.map(|(r, _)| r).collect()).await;
+            }
+            Err(status) => return Err(not_stored(status)),
+        };
         for (index, segment) in upload.iter().enumerate() {
             for (start, end) in segment.ranges(MAX_RANGE_BYTES) {
                 let pieces = segment.pieces(start, end);
@@ -145,6 +166,55 @@ impl LocalDataPlane {
         let committed = self.call(async move { segments.commit(Request::new(commit)).await });
         committed.await.map(drop).map_err(not_stored)
     }
+
+    /// Streams the blob `digest`, its bytes `chunks`, to the object store on the
+    /// server half's runtime, unless the cache holds it: [`Cas::put_chunks`] of a blob
+    /// too large to gather.
+    async fn put_streamed(&self, digest: Digest, chunks: Chunks) -> Result<Digest, CasError> {
+        let blob = label(&digest);
+        let Some(parsed) = parse(&digest) else {
+            return Err(CasError::Unavailable(
+                blob,
+                "not a SHA-256 digest".to_owned(),
+            ));
+        };
+        if self.absent(vec![parsed]).await.is_ok_and(|a| a.is_empty()) {
+            return Ok(digest);
+        }
+        // A chunk that could not be read fails the upload as a read, not as the store.
+        let unread = Arc::new(Mutex::new(None));
+        let noted = Arc::clone(&unread);
+        let bytes = chunks
+            .map(move |chunk| {
+                chunk.map(Bytes::from).inspect_err(|e| {
+                    *noted.lock().unwrap_or_else(PoisonError::into_inner) = Some(e.to_string());
+                })
+            })
+            .boxed();
+        let store = self.store.clone();
+        let size = parsed.size_bytes;
+        let claim = future::ready(Some(parsed)).boxed();
+        let upload = self
+            .server
+            .spawn(async move { store.put_streamed(size, bytes, claim).await });
+        let stored = match upload.await {
+            Ok(stored) => stored,
+            Err(gone) => {
+                let why = format!("the server half did not answer: {gone}");
+                return Err(CasError::Unavailable(blob, why));
+            }
+        };
+        if let Some(why) = unread.lock().unwrap_or_else(PoisonError::into_inner).take() {
+            return Err(CasError::Read(blob, why));
+        }
+        match stored {
+            Ok(_) => Ok(digest),
+            Err(StorageError::DigestMismatch { actual, .. }) => {
+                Err(CasError::Corrupt(blob, label(&proto_digest(&actual))))
+            }
+            Err(e) => Err(CasError::Unavailable(blob, e.to_string())),
+        }
+    }
 }
 
 /// `digest` as the server's digest; `None` when it is not a SHA-256 digest with a size,
@@ -155,12 +225,6 @@ fn parse(digest: &Digest) -> Option<kbf_types::Digest> {
 
 /// Sends each item of `stream` down `chunks`, one at a time, until it ends or the
 /// reader goes away.
-///
-/// TODO(#745, re-cut #780): the plane and the cache never hold a blob whole, but the
-/// storage side does not stream yet: `CacheStorage::read_range` still reads the blob
-/// whole inside storage before this pump sees its first chunk. The no-whole-blob
-/// guarantee for all-in-one storage reads arrives with #745 and #780 re-cut on it;
-/// add its test then.
 async fn pump(mut stream: ReadStream, chunks: Sender<Result<Bytes, StorageError>>) {
     while let Some(chunk) = stream.next().await {
         if chunks.send(chunk).await.is_err() {
@@ -169,11 +233,15 @@ async fn pump(mut stream: ReadStream, chunks: Sender<Result<Bytes, StorageError>
     }
 }
 
-/// A read the server half could not answer.
-fn unavailable(blob: &str, status: &Status) -> CasError {
-    CasError::Unavailable(blob.to_owned(), status.message().to_owned())
+/// A read of `blob` the server refused or did not answer: missing only when the blob is
+/// not held.
+fn unread(blob: String, status: &Status) -> CasError {
+    if status.code() == Code::NotFound {
+        CasError::Missing(blob)
+    } else {
+        CasError::Unavailable(blob, status.message().to_owned())
+    }
 }
-
 /// An upload of outputs the server refused or did not answer.
 fn not_stored(status: Status) -> CasError {
     CasError::Unavailable("outputs".to_owned(), status.message().to_owned())
@@ -198,13 +266,14 @@ impl Cas for LocalDataPlane {
         };
         let store = self.store.clone();
         let read = self.call(async move { store.read_blob(&parsed).await.map_err(Status::from) });
-        match read.await {
-            Ok(bytes) => Ok(bytes),
-            Err(status) if status.code() == Code::NotFound => Err(CasError::Missing(blob)),
-            Err(status) => Err(CasError::Unavailable(blob, status.message().to_owned())),
-        }
+        read.await.map_err(|status| unread(blob, &status))
     }
 
+    /// Writes the blob into `file` as the storage's windowed read ([`LocalStore::read_stream`])
+    /// delivers it, never holding it whole: each chunk is pumped on the server half's
+    /// runtime to here, two at most between the halves. The bytes are hashed on the way
+    /// and a stream that ends short or wrong is not taken for the blob. On an error the
+    /// file may hold part of the blob.
     async fn read_to(&self, digest: &Digest, file: &mut tokio::fs::File) -> Result<(), CasError> {
         let blob = label(digest);
         let Some(parsed) = parse(digest) else {
@@ -219,12 +288,11 @@ impl Cas for LocalDataPlane {
         });
         match opened.await {
             Ok(()) => {}
-            Err(status) if status.code() == Code::NotFound => return Err(CasError::Missing(blob)),
-            Err(status) => return Err(unavailable(&blob, &status)),
+            Err(status) => return Err(unread(blob, &status)),
         }
         let mut hasher = RecordHasher::new();
         while let Some(chunk) = arriving.recv().await {
-            let chunk = chunk.map_err(|e| unavailable(&blob, &Status::from(e)))?;
+            let chunk = chunk.map_err(|e| unread(blob.clone(), &Status::from(e)))?;
             hasher.update(&chunk);
             let written = file.write_all(&chunk).await;
             written.map_err(|e| CasError::Write(blob.clone(), e.to_string()))?;
@@ -245,6 +313,28 @@ impl Cas for LocalDataPlane {
             Ok(digest) => Ok(proto_digest(&digest)),
             Err(status) => Err(CasError::Unavailable(blob, status.message().to_owned())),
         }
+    }
+
+    /// A blob over [`MAX_UNSTAGED_BLOB_BYTES`] (a log the intake did not take, or a
+    /// record of an upload the server sent back blob by blob) is streamed to the object
+    /// store as its chunks are read ([`LocalStore::put_streamed`]), never gathered,
+    /// unless the cache holds it already; the store checks it against `digest` before
+    /// it completes it. A smaller one is gathered and stored by [`Cas::put`].
+    async fn put_chunks(&self, digest: Digest, mut chunks: Chunks) -> Result<Digest, CasError> {
+        let blob = label(&digest);
+        if u64::try_from(digest.size_bytes).unwrap_or(u64::MAX) > MAX_UNSTAGED_BLOB_BYTES {
+            return self.put_streamed(digest, chunks).await;
+        }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = chunks.next().await {
+            let chunk = chunk.map_err(|e| CasError::Read(blob.clone(), e.to_string()))?;
+            bytes.extend_from_slice(&chunk);
+        }
+        let stored = self.put(bytes).await?;
+        if stored != digest {
+            return Err(CasError::Corrupt(blob, label(&stored)));
+        }
+        Ok(stored)
     }
 
     async fn missing(&self, digests: &[Digest]) -> Vec<Digest> {
