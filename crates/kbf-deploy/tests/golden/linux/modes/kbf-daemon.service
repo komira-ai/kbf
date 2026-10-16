@@ -11,6 +11,8 @@ After=network-online.target
 User=kbf
 Slice=kbf.slice
 # The daemon manages its own cgroup: supervisor/ for itself, actions/ for builds.
+# Delegate=yes delegates cpuset with cpu, memory and pids: --lease-placement=numa-node
+# pins each lease to one NUMA node with it (check-units rule `delegate`).
 Delegate=yes
 # Equal to --supervisor-memory-min-mib.
 MemoryMin=256M

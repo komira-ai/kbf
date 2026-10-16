@@ -25,6 +25,8 @@ kbf-server.workspace = true
 # The units `kbf-deploy linux render-units --mode` writes, parsed with kbf's own
 # parser (tests/deploy_units.rs).
 kbf-deploy.workspace = true
+# The host `check-units --mode` runs `kbf check-args` on (tests/deploy_units.rs).
+kbf-host.workspace = true
 
 [lints]
 workspace = true

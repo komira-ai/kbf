@@ -21,6 +21,12 @@
 //! `kbf-server`'s ([`kbf_server::SERVER_VERSION`]), which `kbf-all-in-one` links
 //! anyway, so the artifacts workflow can check `kbf` as it checks `kbf-server`.
 //!
+//! `kbf check-args <mode> [flags...]` ([`check_args`]) parses `kbf <mode> [flags...]`
+//! as a start would, then exits, starting nothing: 0 when the mode would start with
+//! those flags, 2 with clap's message when it would refuse them (and for a mode not
+//! built yet, which refuses every start). `kbf-deploy linux check-units --mode` runs
+//! it on a unit's `ExecStart=`. It is not a mode, so `kbf --help` does not list it.
+//!
 //! The `kbf-server`, `kbf-daemon` and `kbf-all-in-one` binaries are unchanged.
 
 pub mod names;
@@ -236,16 +242,61 @@ pub fn run(invocation: &Invocation) -> ExitCode {
     }
 }
 
+/// The word after `kbf` that checks a command line instead of starting it
+/// ([`check_args`]).
+pub const CHECK_ARGS: &str = "check-args";
+
+/// `kbf check-args <mode> [flags...]`: parses `kbf <mode> [flags...]` as [`main`]
+/// would, and starts nothing (the parse reads no file and opens no socket). `args` is
+/// the whole command line, its first word the program's name and its second
+/// [`CHECK_ARGS`].
+///
+/// # Errors
+/// What [`parse_from`] refuses; a mode not built yet, which every start of it is
+/// refused as; and `--help` or `--version`, which would print and exit 0 without
+/// starting the mode.
+pub fn check_args(args: &[std::ffi::OsString]) -> Result<(), clap::Error> {
+    let argv = args
+        .iter()
+        .take(1)
+        .chain(args.iter().skip(2))
+        .cloned()
+        .collect::<Vec<_>>();
+    match parse_from(argv) {
+        Ok(Invocation::Daemon(_) | Invocation::AllInOne(_)) => Ok(()),
+        Ok(Invocation::NotBuilt { mode }) => {
+            Err(command().error(ErrorKind::InvalidSubcommand, names::not_built_line(mode)))
+        }
+        Err(e) if matches!(e.kind(), ErrorKind::DisplayHelp | ErrorKind::DisplayVersion) => {
+            Err(command().error(
+                ErrorKind::ArgumentConflict,
+                "--help and --version print and exit 0: the mode would not start",
+            ))
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// The `kbf` binary: the daemon's helper re-execs first (a keeper or a `__chown-dirs`
 /// run of this binary never reads the command line as `kbf`'s), then the command line,
-/// then [`run`]. A command line that does not parse exits 2 (0 for `--help` and
-/// `--version`).
+/// then [`check_args`] for `kbf check-args ...` or else [`run`]. A command line that
+/// does not parse exits 2 (0 for `--help` and `--version`).
 #[must_use]
 pub fn main() -> ExitCode {
     if let Some(code) = kbf_node::dispatch_helpers() {
         return code;
     }
-    match parse_from(std::env::args_os()) {
+    let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    if args.get(1).is_some_and(|word| word == CHECK_ARGS) {
+        return match check_args(&args) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                let _ = e.print();
+                ExitCode::from(2)
+            }
+        };
+    }
+    match parse_from(args) {
         Ok(invocation) => run(&invocation),
         Err(e) => e.exit(),
     }

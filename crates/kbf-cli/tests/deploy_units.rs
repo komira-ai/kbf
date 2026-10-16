@@ -1,12 +1,17 @@
 //! The units `kbf-deploy linux render-units --mode` writes, against this binary's own
 //! parser, in-process: each mode's rendered `ExecStart=` is a command line `kbf` takes,
-//! for the mode the unit is named after, and kbf-deploy renders exactly kbf's modes.
+//! for the mode the unit is named after, and kbf-deploy renders exactly kbf's modes;
+//! and `check-units --mode` runs this build's `kbf check-args` on a built mode's flags.
 
 use kbf_cli::names::{Entry, MODES};
 use kbf_cli::{Invocation, parse_from};
 use kbf_deploy::linux::modes::render;
-use kbf_deploy::linux::{LinuxConfig, Mode};
+use kbf_deploy::linux::{LinuxConfig, Mode, check_mode_unit};
 use kbf_deploy::unit::UnitFile;
+use kbf_host::exec::{Entry as HostEntry, Exec, HostExec, Meta};
+use kbf_host::path::{HostPath, Root};
+use kbf_host::step::{Cmd, HttpUrl, Step};
+use kbf_host::trust::Untrusted;
 
 const EXAMPLE: &str = include_str!("../../kbf-deploy/templates/linux/config.example");
 
@@ -62,5 +67,103 @@ fn kbf_deploy_renders_exactly_the_modes_kbf_takes() {
     for (mode, row) in Mode::ALL.iter().zip(MODES) {
         let built = !matches!(row.entry, Entry::NotBuilt);
         assert_eq!(mode.is_built(), built, "{mode}");
+    }
+}
+
+/// The scratch directory `name` under the workspace's `target/`, empty.
+fn scratch(name: &str) -> std::path::PathBuf {
+    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(name);
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("scratch");
+    dir
+}
+
+/// The real host, but a command it runs keeps this test's `LLVM_PROFILE_FILE`:
+/// [`HostExec`] clears the environment, and an instrumented `kbf` would then write its
+/// profile into the working directory (the crate's), where the repo lints refuse it.
+struct Profiled(HostExec);
+
+impl Exec for Profiled {
+    fn euid(&self) -> u32 {
+        self.0.euid()
+    }
+    fn inspect(&self, path: &HostPath) -> std::io::Result<Option<HostEntry>> {
+        self.0.inspect(path)
+    }
+    fn stat(&self, path: &HostPath) -> std::io::Result<Option<Meta>> {
+        self.0.stat(path)
+    }
+    fn query(&self, cmd: &Cmd) -> std::io::Result<std::process::Output> {
+        match std::env::var("LLVM_PROFILE_FILE") {
+            Ok(file) => self.0.query(&cmd.clone().env("LLVM_PROFILE_FILE", file)),
+            Err(_) => self.0.query(cmd),
+        }
+    }
+    fn http_status(&self, url: &HttpUrl) -> std::io::Result<u16> {
+        self.0.http_status(url)
+    }
+    fn apply(&mut self, step: &Step) -> std::io::Result<()> {
+        self.0.apply(step)
+    }
+    fn check_binary(&self) -> Result<(), Untrusted> {
+        self.0.check_binary()
+    }
+}
+
+/// `check-units --mode` on the unit `text` of `mode`, with this build's kbf as
+/// `--kbf-bin`: the failure lines and the notes.
+fn check_units(name: &str, mode: Mode, text: &str) -> (Vec<String>, Vec<String>) {
+    let dir = scratch(name);
+    let cfg = dir.join("config.local");
+    std::fs::write(&cfg, EXAMPLE).expect("config");
+    std::fs::write(dir.join(mode.unit_name()), text).expect("unit");
+    let exec = Profiled(HostExec::new(Root::host()));
+    let bin = std::path::Path::new(env!("CARGO_BIN_EXE_kbf"));
+    let r = check_mode_unit(&exec, &cfg, &dir, mode, true, Some(bin)).expect("checks");
+    (
+        r.failures.iter().map(ToString::to_string).collect(),
+        r.notes,
+    )
+}
+
+/// Catches `check-units --mode` passing a built mode's unit whose flags kbf refuses (an
+/// operator's edit that adds a flag `kbf daemon` does not have, or another mode's flag;
+/// red before rule `parse`, which runs `kbf check-args`), failing a unit kbf takes, and
+/// the two crates spelling `check-args` differently.
+#[test]
+fn check_units_parses_a_built_modes_flags_with_this_kbf() {
+    assert_eq!(kbf_deploy::linux::modes::CHECK_ARGS, kbf_cli::CHECK_ARGS);
+    let c = config();
+    for mode in [Mode::Daemon, Mode::AllInOne] {
+        let text = render(&c, Some(1500), mode).expect("renders");
+        let none: (Vec<String>, Vec<String>) = (Vec::new(), Vec::new());
+        assert_eq!(
+            check_units(&format!("clean_{mode}"), mode, &text),
+            none,
+            "{mode}"
+        );
+    }
+    let bin = env!("CARGO_BIN_EXE_kbf");
+    let text = render(&c, Some(1500), Mode::Daemon).expect("renders");
+    for (flag, said) in [
+        (
+            "--bogus-flag",
+            "error: unexpected argument '--bogus-flag' found",
+        ),
+        (
+            "--cold-store=file:///x",
+            "error: kbf daemon refuses --cold-store: a build node holds no store and no credential (docs/design/cluster.md, section 3.3)",
+        ),
+    ] {
+        let edited = text.replace("--driver=container", &format!("--driver=container {flag}"));
+        assert_ne!(edited, text);
+        let (failures, notes) = check_units("edited", Mode::Daemon, &edited);
+        assert_eq!(
+            failures,
+            [format!(
+                "FAIL parse: kbf daemon refuses the flags of kbf-daemon.service ({bin} check-args: exit 2): {said}"
+            )]
+        );
+        assert_eq!(notes, Vec::<String>::new());
     }
 }
