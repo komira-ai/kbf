@@ -170,10 +170,9 @@ impl TmpFile {
 
 impl Drop for TmpFile {
     fn drop(&mut self) {
-        if !self.renamed
-            && let Err(e) = remove_if_present(&self.path)
-        {
-            tracing::warn!("cache: {} not removed: {e}", self.path.display());
+        // One that cannot be removed is cleared at the next start, as `tmp/` is.
+        if !self.renamed {
+            let _ = remove_if_present(&self.path);
         }
     }
 }

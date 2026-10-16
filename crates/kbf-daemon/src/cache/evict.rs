@@ -48,10 +48,9 @@ impl Inner {
         if !over {
             self.storage_over.store(false, Ordering::Relaxed);
         } else if !self.storage_over.swap(true, Ordering::Relaxed) {
+            // Only pinned entries are kept while it does.
             let max = self.config.max_bytes;
-            tracing::warn!(
-                "cache: local storage holds {storage} B, all of the {max} B budget: only pinned entries are kept"
-            );
+            tracing::warn!("cache: local storage holds {storage} B, all the {max} B budget");
         }
     }
 
