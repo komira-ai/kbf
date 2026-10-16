@@ -34,12 +34,11 @@
 use std::collections::hash_map::RandomState;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::hash::BuildHasher;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use kbf_front::{Cache, Dispatch, Finished, MetaLog, Recorder, Stage, Submission, Ticket};
-use kbf_meta::{ActionRecord, Role};
-use kbf_objstore::ObjectStore;
+use kbf_front::{Backend, Dispatch, Finished, Recorder, Stage, Submission, Ticket};
+use kbf_meta::ActionRecord;
 use kbf_proto::google::rpc;
 use kbf_proto::reapi::ActionResult;
 use kbf_proto::worker::{
@@ -104,8 +103,8 @@ pub struct StreamId(u64);
 
 /// The farm core. Cheap to share: every method takes `&self`.
 #[derive(Debug)]
-pub struct Farm<M, O> {
-    cache: Arc<Cache<M, O>>,
+pub struct Farm {
+    cache: Backend,
     /// This process's scheduler term: every lease it grants carries it, and every
     /// operation name it gives out names it.
     term: u64,
@@ -226,7 +225,7 @@ struct Settled {
     stages: Vec<watch::Sender<Stage>>,
 }
 
-impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
+impl Farm {
     /// A farm over `cache`, with an empty scheduler of a new term that refuses queued work once no live worker has been able to run it for
     /// `unservable_wait`, and keeps a finished operation, which WaitExecution still
     /// answers, for `finished_retention`.
@@ -236,11 +235,12 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
     /// new [`process_term`] for both otherwise (see the module docs).
     #[must_use]
     pub fn new(
-        cache: Arc<Cache<M, O>>,
+        cache: impl Into<Backend>,
         unservable_wait: Duration,
         finished_retention: Duration,
     ) -> Self {
-        let (term, lease_epoch) = cache.meta().leadership().map_or_else(
+        let cache = cache.into();
+        let (term, lease_epoch) = cache.leadership().map_or_else(
             || {
                 let term = process_term();
                 (term, term)
@@ -702,10 +702,7 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
     /// Writes the action-cache entry, if any, then answers the callers.
     async fn deliver(&self, settled: Settled) {
         if let Some((action, record)) = settled.write
-            && let Err(e) = self
-                .cache
-                .commit_action_record(Role::Daemon, action, record)
-                .await
+            && let Err(e) = self.cache.commit_action_record(action, record).await
         {
             tracing::error!(%action, error = %e, "action-cache write of an accepted result failed");
         }
@@ -715,7 +712,7 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
     }
 }
 
-impl<M: MetaLog, O: ObjectStore + 'static> Dispatch for Farm<M, O> {
+impl Dispatch for Farm {
     fn submit(&self, mut submission: Submission) -> Result<Ticket, Status> {
         // Outside the lock: hashes the action's shape and drops its argv and paths.
         let usage = self

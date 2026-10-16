@@ -14,6 +14,9 @@
 //! /run/kbf-deploy.lock                the lock the state is read and written under
 //! ```
 //!
+//! This layout is Linux-only: `/run`, the lock's directory, does not exist on macOS, so
+//! the macOS install path will choose a layout of its own (docs/deploy/host-releases.md).
+//!
 //! The paths are [`HostPath`]s, joined to a [`kbf_host::Root`] (`/` on a host, a
 //! scratch directory in tests). The links name their release relative to their own
 //! directory (`releases/<commit>`), so a tree copied or mounted elsewhere still points
@@ -25,6 +28,8 @@ use kbf_host::path::HostPath;
 
 use super::CommitId;
 
+/// The directory the releases and the `current` and `previous` links are in.
+pub const KBF_DIR: &str = "/usr/local/kbf";
 pub const RELEASES: &str = "/usr/local/kbf/releases";
 pub const CURRENT: &str = "/usr/local/kbf/current";
 pub const PREVIOUS: &str = "/usr/local/kbf/previous";
