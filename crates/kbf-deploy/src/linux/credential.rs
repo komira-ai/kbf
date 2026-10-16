@@ -6,8 +6,10 @@
 //!
 //! - `EnvironmentFile=` naming the key file: its path, after `-`, quotes, `.`, `..` and
 //!   repeated `/` are taken off, is `<KBF_ETC>/s3.env` or ends in `/s3.env` wherever
-//!   it is, or it is a wildcard (`*`, `?`, `[...]`, as glob(3) matches them) that
-//!   matches `<KBF_ETC>/s3.env`.
+//!   it is, or it is a wildcard that matches `<KBF_ETC>/s3.env`. systemd expands every
+//!   path with glob(3) ([`super::glob`] reads it as glibc does: `*`, `?`, `[...]` with
+//!   ranges, `!` or `^`, `[:class:]`, `[=c=]` and `[.c.]`, and `\` escapes), so a `\`
+//!   in a path with no wildcard is taken off too.
 //! - `Environment=` setting any `AWS_*` variable, with systemd's quoting (several
 //!   assignments on a line, single or double quotes around an assignment or inside
 //!   one). A build node talks to no AWS-style store, so no `AWS_*` variable has a use
@@ -44,6 +46,7 @@ use std::path::{Component, Path, PathBuf};
 use kbf_host::exec::{Entry, Exec};
 use kbf_host::path::HostPath;
 
+use super::glob;
 use super::modes::COLD_STORE_KEY_FILE;
 use crate::unit::UnitFile;
 
@@ -145,16 +148,17 @@ pub(super) struct OnHost {
 pub(super) fn on_host<E: Exec>(exec: &E, unit: &UnitFile, key: &Path) -> OnHost {
     let mut out = OnHost::default();
     for f in given(unit).files.iter().filter(|f| !names_key(f, key)) {
-        let path = normalise(bare(f));
-        if is_pattern(&path.to_string_lossy()) {
+        let path = normalise(bare(f)).to_string_lossy().into_owned();
+        if glob::is_wildcard(&path) {
             out.notes.push(format!(
                 "SKIP credential: EnvironmentFile={f} is a wildcard; the files it matches \
                  were not read"
             ));
             continue;
         }
-        // A relative path is one systemd ignores.
-        let Ok(host) = HostPath::new(&path.to_string_lossy()) else {
+        // A relative path is one systemd ignores, and a name ending in a lone `\` one
+        // its glob(3) matches with nothing.
+        let Some(Ok(host)) = glob::literal(&path).map(|p| HostPath::new(&p)) else {
             continue;
         };
         match exec.inspect(&host) {
@@ -200,17 +204,10 @@ fn env_file_names(bytes: &[u8]) -> impl Iterator<Item = String> + '_ {
 
 /// Whether the `EnvironmentFile=` value `value` names the key file `key`.
 fn names_key(value: &str, key: &Path) -> bool {
-    let path = normalise(bare(value));
-    let text = path.to_string_lossy();
-    let last = path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    if is_pattern(&text) {
-        glob(&text, &key.to_string_lossy())
-    } else {
-        path == key || last == COLD_STORE_KEY_FILE
-    }
+    let path = normalise(bare(value)).to_string_lossy().into_owned();
+    glob::matches(&path, &key.to_string_lossy())
+        || glob::literal(&path)
+            .is_some_and(|p| Path::new(&p).file_name() == Some(COLD_STORE_KEY_FILE.as_ref()))
 }
 
 /// The path an `EnvironmentFile=` value names: without the `-` that makes it optional
@@ -234,65 +231,6 @@ pub(super) fn normalise(path: &str) -> PathBuf {
         }
     }
     out
-}
-
-fn is_pattern(text: &str) -> bool {
-    text.contains(['*', '?', '['])
-}
-
-/// Whether the glob(3) pattern `pattern` matches `path`: `*` and `?` never match `/`,
-/// `[...]` (`[!...]` negated) matches one character of a set or range.
-fn glob(pattern: &str, path: &str) -> bool {
-    let p: Vec<char> = pattern.chars().collect();
-    let s: Vec<char> = path.chars().collect();
-    glob_at(&p, &s)
-}
-
-fn glob_at(p: &[char], s: &[char]) -> bool {
-    match p.first() {
-        None => s.is_empty(),
-        Some('*') => {
-            let stop = s.iter().position(|c| *c == '/').unwrap_or(s.len());
-            (0..=stop).any(|n| glob_at(&p[1..], &s[n..]))
-        }
-        Some('?') => s.first().is_some_and(|c| *c != '/') && glob_at(&p[1..], &s[1..]),
-        Some('[') => match (class(&p[1..]), s.first()) {
-            (Some((set, len)), Some(c)) => *c != '/' && set(*c) && glob_at(&p[1 + len..], &s[1..]),
-            (Some(_), None) => false,
-            // A `[` that opens no class is a plain character.
-            (None, _) => s.first() == Some(&'[') && glob_at(&p[1..], &s[1..]),
-        },
-        Some(c) => s.first() == Some(c) && glob_at(&p[1..], &s[1..]),
-    }
-}
-
-/// The class after a `[`: its test and how many characters it takes up to and with
-/// the `]`; `None` when no `]` closes it.
-fn class(p: &[char]) -> Option<(impl Fn(char) -> bool, usize)> {
-    let negated = matches!(p.first(), Some('!' | '^'));
-    let start = usize::from(negated);
-    // A `]` first in the class is one of its characters.
-    let close = p[start..]
-        .iter()
-        .skip(1)
-        .position(|c| *c == ']')
-        .map(|i| start + 1 + i)?;
-    let body: Vec<char> = p[start..close].to_vec();
-    let test = move |c: char| {
-        let mut hit = false;
-        let mut i = 0;
-        while i < body.len() {
-            if i + 2 < body.len() && body[i + 1] == '-' {
-                hit |= body[i] <= c && c <= body[i + 2];
-                i += 3;
-            } else {
-                hit |= body[i] == c;
-                i += 1;
-            }
-        }
-        hit != negated
-    };
-    Some((test, close + 1))
 }
 
 /// The words of a systemd value, unquoted as systemd.syntax(7) says: whitespace

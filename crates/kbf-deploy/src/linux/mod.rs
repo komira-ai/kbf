@@ -45,6 +45,7 @@ pub mod check;
 pub mod config;
 pub mod cpuset;
 pub mod credential;
+mod glob;
 pub mod host;
 pub mod images;
 pub mod install;
