@@ -89,7 +89,8 @@ impl ToStore {
             )));
         }
         let queued = self.bytes.blocking_send(Ok(Bytes::copy_from_slice(chunk)));
-        queued.map_err(|_| CacheError::Invalid(STOPPED.to_owned()))?;
+        // Built whether or not it is needed: no branch of its own.
+        queued.or(Err(CacheError::Invalid(STOPPED.to_owned())))?;
         self.crc.update(chunk);
         self.written = after;
         Ok(())
@@ -109,7 +110,8 @@ impl Claim {
     /// and the blob is indexed. Answers once it is present.
     pub(super) async fn commit(self, digest: Digest) -> Result<(), CacheError> {
         let _ = self.claim.send(digest);
-        let gone = |e: tokio::task::JoinError| Err(CacheError::Invalid(e.to_string()));
-        self.upload.await.unwrap_or_else(gone).map(drop)
+        // An upload that never ended (its runtime shut down) stored nothing.
+        let gone = Err(CacheError::Invalid(STOPPED.to_owned()));
+        self.upload.await.unwrap_or(gone).map(drop)
     }
 }
