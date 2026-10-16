@@ -204,7 +204,7 @@ struct State {
     /// (the key of its `action usage:` line). Each leaves at its end.
     recorded: BTreeMap<OperationId, ActionLabel>,
     /// The state store every change is written through before it is acknowledged, if
-    /// the farm has one ([`Farm::with_state_store`]).
+    /// the farm has one ([`Farm::with_state`]).
     durable: Option<Durable>,
 }
 

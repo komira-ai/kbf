@@ -216,6 +216,16 @@ fn flow_control(server: Server) -> Server {
 const STATE_IN_MEMORY: &str = "the scheduler's state is in memory: no cordon, drain, lease or \
     operation of an earlier server process is restored, and the server keeps no rollout record";
 
+/// Logs where the scheduler's state is, at every start. Not generic, unlike the binding
+/// that calls it, so every test binary's runs count toward the same function's coverage.
+fn log_state(durable: bool, term: u64, epoch: u64) {
+    if durable {
+        tracing::info!(term, epoch, "the scheduler's state is in the state store");
+    } else {
+        tracing::warn!(term, epoch, "{STATE_IN_MEMORY}");
+    }
+}
+
 /// Binds the REAPI and worker listeners for a farm over `cache`, and no operator API.
 /// Nothing is served until the returned future runs; it serves until `shutdown`
 /// completes, or a listener fails.
@@ -300,7 +310,7 @@ where
 }
 
 /// [`bind_server_with_policy`], with the scheduler's state kept in `state` if given
-/// (`--state-store`): see [`Farm::with_state_store`].
+/// (`--state-store`): see [`Farm::with_state`].
 ///
 /// # Errors
 /// As [`bind_server_with_policy`], and the state store cannot be read.
@@ -326,11 +336,7 @@ where
     .with_memory_ladder(listeners.memory_ladder.clone())
     .recording(recorder.clone());
     let durable = state.is_some();
-    let farm = match state {
-        Some(state) => farm.with_state_store(state.store, state.epoch)?,
-        None => farm,
-    };
-    let farm = Arc::new(farm);
+    let farm = Arc::new(farm.with_state(state)?);
     let (reapi_incoming, reapi) = bind(listeners.reapi)?;
     let (worker_incoming, worker) = bind(listeners.worker)?;
     let probe_timeout = listeners.store_probe_timeout;
@@ -354,11 +360,7 @@ where
         .merge(page_routes);
     // Logged at every start, the first one too (issue #156).
     let (term, epoch) = (farm.term(), farm.lease_epoch());
-    if durable {
-        tracing::info!(term, epoch, "the scheduler's state is in the state store");
-    } else {
-        tracing::warn!(term, epoch, "{STATE_IN_MEMORY}");
-    }
+    log_state(durable, term, epoch);
 
     let mut reapi_server = flow_control(Server::builder());
     if let Some(tls) = listeners.reapi_tls {

@@ -37,6 +37,7 @@ use tokio::sync::watch;
 use tonic::Status;
 
 use super::{Farm, FarmMachine, Reported, Sent, Stamp, State, Waiter, process_term};
+use crate::state_store::StateStore;
 
 const EPOCH: &str = "meta/epoch";
 const NEXT_OP: &str = "meta/next_op";
@@ -351,59 +352,24 @@ impl Durable {
 }
 
 impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
-    /// This farm, with `store` as the truth the scheduler keeps its state in: every
-    /// operation, lease grant, result and refusal is written to it before it is
+    /// This farm, with `state` as the truth the scheduler keeps its state in, if given:
+    /// every operation, lease grant, result and refusal is written to it before it is
     /// acknowledged, and the unfinished operations and leases it already holds are taken
     /// up again (see [`kbf_sched::Scheduler::recover`]; the callers they had are gone,
-    /// and a client that asks for the action again joins the operation).
+    /// and a client that asks for the action again joins the operation). With `None`
+    /// the farm is as [`Farm::new`] made it: its state is in memory.
     ///
     /// The term and the lease epoch `Welcome` names are the store's epoch, which
-    /// `epoch` decides: kept, a daemon that reconnects keeps the runs of its leases;
-    /// bumped, it kills them. Call it before the farm serves anything.
+    /// [`StateStore::epoch`] decides: kept, a daemon that reconnects keeps the runs of
+    /// its leases; bumped, it kills them. Call it before the farm serves anything.
     ///
     /// # Errors
     /// The store cannot be read, or holds a row that is not one the scheduler wrote.
-    pub fn with_state_store(
-        mut self,
-        store: Arc<dyn Store>,
-        epoch: EpochPolicy,
-    ) -> Result<Self, StateError> {
-        let (durable, epoch) = Durable::open(store, epoch, process_term())?;
-        let stored = durable.load()?;
-        self.term = epoch;
-        self.lease_epoch = epoch;
-        let state = self.state.get_mut().unwrap_or_else(PoisonError::into_inner);
-        state.machine = FarmMachine::new(epoch);
-        let now = SystemTime::now();
-        let mut recovered = Vec::new();
-        for op in stored.operations {
-            let key = op.request.key.clone();
-            let waiter = state.machine.submit(Waiter {
-                key: key.clone(),
-                kind: op.request.kind,
-                do_not_cache: op.request.do_not_cache,
-                queued: now,
-            });
-            state.stages.insert(waiter, watch::channel(Stage::Queued).0);
-            if let Some(grant) = &op.lease {
-                let stamp = Stamp {
-                    queued: now,
-                    started: now,
-                };
-                let sent = Sent {
-                    operation: op.operation,
-                    action: key.action,
-                    stamp,
-                };
-                state.machine.start(grant.lease, sent);
-            }
-            recovered.push(op.recovered(waiter));
-        }
-        let next_operation = OperationId(stored.next_operation);
-        state
-            .sched
-            .recover(epoch, next_operation, stored.next_seq, recovered);
-        state.durable = Some(durable);
+    pub fn with_state(mut self, state: Option<StateStore>) -> Result<Self, StateError> {
+        let state_of_farm = self.state.get_mut().unwrap_or_else(PoisonError::into_inner);
+        let epoch = state_of_farm.keep_in(state)?;
+        self.term = epoch.unwrap_or(self.term);
+        self.lease_epoch = epoch.unwrap_or(self.lease_epoch);
         Ok(self)
     }
 }
@@ -426,6 +392,49 @@ impl State {
                 false
             }
         }
+    }
+
+    /// [`Farm::with_state`] on the farm's state: opens `state`, reads what it holds and
+    /// takes it up. Returns the store's epoch, or `None` if there is no store. Not
+    /// generic, unlike `Farm::with_state`, so every test binary's runs count toward the
+    /// same function's coverage.
+    fn keep_in(&mut self, state: Option<StateStore>) -> Result<Option<u64>, StateError> {
+        let Some(StateStore { store, epoch }) = state else {
+            return Ok(None);
+        };
+        let (durable, epoch) = Durable::open(store, epoch, process_term())?;
+        let stored = durable.load()?;
+        self.machine = FarmMachine::new(epoch);
+        let now = SystemTime::now();
+        let mut recovered = Vec::new();
+        for op in stored.operations {
+            let key = op.request.key.clone();
+            let waiter = self.machine.submit(Waiter {
+                key: key.clone(),
+                kind: op.request.kind,
+                do_not_cache: op.request.do_not_cache,
+                queued: now,
+            });
+            self.stages.insert(waiter, watch::channel(Stage::Queued).0);
+            if let Some(grant) = &op.lease {
+                let stamp = Stamp {
+                    queued: now,
+                    started: now,
+                };
+                let sent = Sent {
+                    operation: op.operation,
+                    action: key.action,
+                    stamp,
+                };
+                self.machine.start(grant.lease, sent);
+            }
+            recovered.push(op.recovered(waiter));
+        }
+        let next_operation = OperationId(stored.next_operation);
+        self.sched
+            .recover(epoch, next_operation, stored.next_seq, recovered);
+        self.durable = Some(durable);
+        Ok(Some(epoch))
     }
 
     /// Writes `request`, about to be queued, to the state store, unless it will join a
@@ -460,3 +469,6 @@ impl State {
         });
     }
 }
+
+#[cfg(test)]
+mod tests;

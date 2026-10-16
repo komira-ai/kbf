@@ -115,7 +115,7 @@ impl Disk {
             kbf_sched::UNSERVABLE_WAIT,
             kbf_sched::FINISHED_RETENTION,
         )
-        .with_state_store(store, epoch)
+        .with_state(Some(StateStore { store, epoch }))
     }
 
     /// The process dies: its farm is gone, and the store reopens as the disk left it.
