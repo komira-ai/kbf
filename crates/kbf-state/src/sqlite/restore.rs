@@ -101,8 +101,12 @@ fn install(staging: &Path, dest: &Path) -> Result<(), SqliteError> {
 }
 
 /// Copies `backup` to `staging`, checks it, stamps its epoch and folds its journal in,
-/// so that one file is all there is to move.
+/// so that one file is all there is to move. A log a restore that died left beside the
+/// staged name goes first: opening the copy would replay it into the copy.
 fn stage(backup: &Path, dest: &Path, staging: &Path) -> Result<u64, SqliteError> {
+    for suffix in ["-wal", "-shm"] {
+        fs::remove_file(beside(staging, suffix)).or_else(ignore_not_found)?;
+    }
     fs::copy(backup, staging).map_err(|error| SqliteError::from(error).at(backup))?;
     let replaced = if dest.exists() {
         epoch(&Connection::open(dest)?)?

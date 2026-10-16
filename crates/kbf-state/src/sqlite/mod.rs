@@ -143,7 +143,7 @@ impl SqliteStore {
         probe: &dyn Fn(&Path) -> io::Result<u32>,
     ) -> Result<SqliteStore, SqliteError> {
         guard::refuse_network_filesystem(path, probe)?;
-        let lock = guard::take_lock(path)?;
+        let (lock, _) = guard::take_lock(path)?;
         let conn = Connection::open(path)?;
         schema::init(&conn)?;
         schema::configure(&conn)?;

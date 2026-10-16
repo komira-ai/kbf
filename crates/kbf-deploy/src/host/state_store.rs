@@ -19,18 +19,22 @@
 //! then the directory is synced. It prints the copy's epoch, head revision and key count.
 //!
 //! `state-restore` plans by default and changes things only with `--apply`. Both are
-//! refused when the source is not a single-file state store backup whose
+//! refused when `--db` is a symbolic link (the rename would replace the link, not the
+//! file it names), when the source is not a single-file state store backup whose
 //! `integrity_check` is `ok` (what `state-backup` writes), and while a process holds the
-//! store's lock (`<db>.lock`, the `flock` every open store holds: the frontend is
-//! running); the dry run probes the lock without creating the lock file, the apply takes
-//! it and holds it to the end, so no frontend can start in between. Under the lock it
-//! keeps the current file as `<db>.pre-restore-<UTC stamp>`, and its write-ahead log, if
-//! there is one, as that name with `-wal` after it. With the lock free, no connection has
-//! the file open, so a log with frames in it holds commits a stopped frontend did not
-//! fold back into the file (it was killed): they are part of the current state, so the
-//! kept copy takes them (SQLite replays the log when the kept file is opened) rather than
-//! the restore refusing; the `-shm` index is rebuilt from the log, so it is not kept.
-//! Then `kbf-state`'s restore copies the source to `<db>.restoring`, checks it again,
+//! store's lock (the `flock` every open store holds: the frontend is running). The lock
+//! file is `<db>.lock` beside the file's resolved name (links followed), so the
+//! frontend's spelling of the path and the operator's need not be the same. The dry run
+//! probes the lock without creating the lock file; the apply takes it and holds it to
+//! the end, so no frontend can start in between. Under the lock it keeps the current
+//! file as `<db>.pre-restore-<UTC stamp>`, and its write-ahead log, if there is one, as
+//! that name with `-wal` after it. With the lock free, no connection has the file open,
+//! so a log with frames in it holds commits a stopped frontend did not fold back into
+//! the file (it was killed): they are part of the current state, so the kept copy takes
+//! them (SQLite replays the log when the kept file is opened) rather than the restore
+//! refusing; the `-shm` index is rebuilt from the log, so it is not kept. Then
+//! `kbf-state`'s restore removes any log a restore that died left beside
+//! `<db>.restoring`, copies the source to `<db>.restoring`, checks it again,
 //! moves its epoch past both files', gives it the current file's owner and mode (or,
 //! with no current file, the directory's owner and mode 0600), syncs it, removes the old
 //! log beside `<db>` and renames the copy over `<db>`, and syncs the directory. The lock
@@ -109,6 +113,12 @@ pub enum StateFileError {
         .0.display()
     )]
     InUse(PathBuf),
+    #[error(
+        "--db {}: a symbolic link; give the state file's own path (a restore renames \
+         over the name it is given, so it would replace the link, not the file)",
+        .0.display()
+    )]
+    DbIsLink(PathBuf),
     #[error("{0}")]
     Store(SqliteError),
     #[error("{what} {}: {source}", path.display())]
@@ -301,6 +311,12 @@ pub fn restore(
     stamp: &str,
     out: &mut dyn Write,
 ) -> Result<(), StateFileError> {
+    if db
+        .symlink_metadata()
+        .is_ok_and(|m| m.file_type().is_symlink())
+    {
+        return Err(StateFileError::DbIsLink(db.to_owned()));
+    }
     let s = sqlite::check_backup(src).map_err(StateFileError::Source)?;
     let lock = hold(db, apply)?;
     let plan = plan(db, stamp)?;
@@ -395,7 +411,7 @@ fn plan(db: &Path, stamp: &str) -> Result<Plan, StateFileError> {
 fn execute(lock: &StoreLock, src: &Path, plan: &Plan) -> Result<u64, StateFileError> {
     let (db, lock_file) = (lock.db(), lock.lock_file());
     let (uid, gid) = (plan.owner.uid, plan.owner.gid);
-    chown(&lock_file, Some(uid), Some(gid)).map_err(io_at("chown", &lock_file))?;
+    chown(lock_file, Some(uid), Some(gid)).map_err(io_at("chown", lock_file))?;
     if let Some(keep) = &plan.keep {
         copy_new(db, keep, plan)?;
         if plan.wal {

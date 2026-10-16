@@ -467,11 +467,27 @@ fn a_killed_frontends_log_is_kept_with_the_file() {
 /// A restore of a backup into the state file of a store that is open (a running
 /// frontend), with `apply` or not: refused, and nothing written.
 fn refused_while_open(name: &str, apply: bool) {
+    let same = |dir: &Path| dir.join("state.db");
+    refused_while_open_as(name, &same, &same, apply);
+}
+
+/// [`refused_while_open`] with the frontend opening the state file by the name
+/// `frontend` gives (in the test's directory) and the restore given the name `operator`
+/// gives: two spellings of one file.
+fn refused_while_open_as(
+    name: &str,
+    frontend: &dyn Fn(&Path) -> PathBuf,
+    operator: &dyn Fn(&Path) -> PathBuf,
+    apply: bool,
+) {
     let dir = scratch(name);
     let src = backup_holding(&dir, "new", "2");
-    let db = dir.join("state.db");
-    let store = open(&db);
+    fs::create_dir(dir.join("real")).expect("a directory");
+    symlink("real", dir.join("alias")).expect("a linked directory");
+    symlink("real/state.db", dir.join("link.db")).expect("a linked file");
+    let store = open(&frontend(&dir));
     put(&store, "old", "1");
+    let db = operator(&dir);
     let before = snapshot(&dir);
     let (code, out, err) = restore_at(&src, &db, apply);
     assert_eq!(code, ExitCode::from(2), "{out}{err}");
@@ -496,6 +512,52 @@ fn a_restore_is_refused_while_the_frontend_holds_the_lock() {
 #[test]
 fn a_dry_run_is_refused_while_the_frontend_holds_the_lock() {
     refused_while_open("state-store-restore-busy-dry", false);
+}
+
+// Catches a lock keyed by the name a process was given rather than the file: a frontend
+// started on a link to the state file holds `link.db.lock`, so a restore given the
+// file's own path would find its lock free and replace the file under the live writer
+// (an acknowledged commit lost).
+#[test]
+fn a_restore_by_the_files_path_is_refused_while_the_frontend_has_it_by_a_link() {
+    let link = |dir: &Path| dir.join("link.db");
+    let real = |dir: &Path| dir.join("real/state.db");
+    refused_while_open_as("state-store-restore-busy-link", &link, &real, true);
+    refused_while_open_as("state-store-restore-busy-link-dry", &link, &real, false);
+}
+
+// Catches the same through a link to the file's directory, both ways: a frontend on the
+// file's own path and a restore given a path through the linked directory, and the
+// reverse.
+#[test]
+fn a_restore_through_a_linked_directory_is_refused_while_the_frontend_has_the_file() {
+    let real = |dir: &Path| dir.join("real/state.db");
+    let alias = |dir: &Path| dir.join("alias/state.db");
+    refused_while_open_as("state-store-restore-busy-alias", &real, &alias, true);
+    refused_while_open_as("state-store-restore-busy-alias-dry", &alias, &real, false);
+}
+
+// Catches a restore given a link as --db: the rename would replace the link with the
+// restored file and leave the file the link named (the frontend's, if it opens by the
+// file's own name) as it was.
+#[test]
+fn a_restore_refuses_a_linked_state_file() {
+    let dir = scratch("state-store-restore-db-link");
+    let src = backup_holding(&dir, "new", "2");
+    let db = live_holding_old(&dir);
+    let link = dir.join("link.db");
+    symlink("state.db", &link).expect("link");
+    let before = snapshot(&dir);
+    for apply in [false, true] {
+        let (code, out, err) = restore_at(&src, &link, apply);
+        assert_eq!(code, ExitCode::from(2), "apply {apply}: {out}{err}");
+        assert!(
+            err.starts_with("REFUSED: --db ") && err.contains("a symbolic link"),
+            "{err}"
+        );
+        assert_eq!(snapshot(&dir), before, "apply {apply}: nothing written");
+    }
+    assert_eq!(read(&db, "old").as_deref(), Some("1"));
 }
 
 /// A restore of `src` (made in `dir` by `make`) over a state file, with and without
@@ -695,11 +757,15 @@ fn restore_failures_are_failures() {
         let (code, _, err) = restore_at(&src, &file.join("state.db"), apply);
         assert_eq!(code, ExitCode::FAILURE, "apply {apply}: {err}");
     }
+    // A name that cannot be read: refused as a link by the verb, so the plan is asked
+    // directly.
     let looped = dir.join("looped.db");
     symlink("looped.db", &looped).expect("link");
     let (code, _, err) = restore_at(&src, &looped, false);
-    assert_eq!(code, ExitCode::FAILURE, "{err}");
-    assert!(err.starts_with("FAIL: read "), "{err}");
+    assert_eq!(code, ExitCode::from(2), "{err}");
+    let failed = plan(&looped, STAMP).err().expect("a link loop");
+    assert!(matches!(failed, StateFileError::Io { .. }), "{failed}");
+    assert!(failed.to_string().starts_with("read "), "{failed}");
     let (code, _, err) = restore_at(&src, &dir.join("no-dir/state.db"), false);
     assert_eq!(code, ExitCode::FAILURE, "{err}");
     assert!(err.contains("no-dir"), "{err}");

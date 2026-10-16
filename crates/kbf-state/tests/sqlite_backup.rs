@@ -251,9 +251,10 @@ fn the_tool_lock_is_the_stores_lock() {
     );
 
     let lock = StoreLock::take(&db).expect("take");
+    let resolved = dir.canonicalize().expect("resolve").join("state.db.lock");
     assert_eq!(
         (lock.db(), lock.lock_file()),
-        (db.as_path(), dir.join("state.db.lock"))
+        (db.as_path(), resolved.as_path())
     );
     assert!(StoreLock::is_held(&db).expect("probe"));
     let clock: Arc<dyn Clock> = Arc::new(SystemClock::default());
@@ -270,9 +271,152 @@ fn the_tool_lock_is_the_stores_lock() {
     let refused = StoreLock::is_held(&file.join("state.db")).expect_err("not a directory");
     assert!(matches!(refused, SqliteError::Io(_)), "got {refused}");
     assert!(
-        refused.to_string().contains("a-file/state.db.lock"),
+        refused.to_string().contains("the lock of ")
+            && refused.to_string().contains("a-file/state.db"),
         "got {refused}"
     );
+    assert!(
+        !StoreLock::is_held(&dir.join("no-dir/state.db")).expect("probe"),
+        "a directory that does not exist has no lock in it"
+    );
+}
+
+/// A directory with the state file's directory `real/`, a link `alias` to it, and a link
+/// `link.db` to `real/state.db`.
+fn linked(name: &str) -> PathBuf {
+    let dir = scratch(name);
+    fs::create_dir(dir.join("real")).expect("a directory");
+    std::os::unix::fs::symlink("real", dir.join("alias")).expect("a linked directory");
+    std::os::unix::fs::symlink("real/state.db", dir.join("link.db")).expect("a linked file");
+    dir
+}
+
+/// Whether a store opened on `by` holds the lock of every other name of the file, and
+/// a tool's lock on any of them keeps the store from opening by `by`.
+fn one_lock_for_every_name(dir: &Path, by: &str) {
+    let names = [
+        "real/state.db",
+        "link.db",
+        "alias/state.db",
+        "real/../real/state.db",
+    ];
+    let store = reopen(&dir.join(by));
+    for name in names {
+        let db = dir.join(name);
+        assert!(StoreLock::is_held(&db).expect("probe"), "{by} holds {name}");
+        let refused = StoreLock::take(&db).expect_err(name);
+        assert!(
+            matches!(refused, SqliteError::Locked { .. }),
+            "{by}, {name}: got {refused}"
+        );
+    }
+    drop(store);
+    for name in names {
+        let lock = StoreLock::take(&dir.join(name)).expect(name);
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock::default());
+        let refused = SqliteStore::open(&dir.join(by), clock, Options::default())
+            .expect_err("held by the tool");
+        assert!(
+            matches!(refused, SqliteError::Locked { .. }),
+            "{name} keeps {by} shut: got {refused}"
+        );
+        assert_eq!(
+            lock.lock_file(),
+            dir.canonicalize()
+                .expect("resolve")
+                .join("real/state.db.lock"),
+            "{name}"
+        );
+    }
+}
+
+// Catches a lock keyed by the name a process was given rather than the file it names: a
+// frontend on a link to the state file and a restore given the file's own path (or a
+// path through a linked directory) would each take a lock of its own, and the restore
+// would replace the file under the live writer.
+#[test]
+fn every_name_of_a_state_file_has_one_lock() {
+    for by in ["link.db", "real/state.db", "alias/state.db"] {
+        let dir = linked(&format!("one-lock-{}", by.replace('/', "-")));
+        one_lock_for_every_name(&dir, by);
+    }
+}
+
+// Catches a first open through a link to a file not made yet keyed by the link's name:
+// the file the store then creates is the link's target, whose own name must be locked.
+#[test]
+fn a_link_to_a_file_not_made_yet_locks_the_file_it_names() {
+    let dir = linked("one-lock-new");
+    let lock = StoreLock::take(&dir.join("link.db")).expect("take");
+    assert!(
+        !dir.join("real/state.db").exists(),
+        "the lock makes no state file"
+    );
+    assert!(StoreLock::is_held(&dir.join("real/state.db")).expect("probe"));
+    drop(lock);
+    let store = reopen(&dir.join("link.db"));
+    put(&store, "k", "v");
+    assert!(
+        dir.join("real/state.db").exists(),
+        "the store made the file the link names"
+    );
+    assert!(StoreLock::is_held(&dir.join("alias/state.db")).expect("probe"));
+}
+
+// Catches a restore that opens its staged copy with the log of a restore that died left
+// beside it: SQLite would replay that log, another file's pages, into the copy.
+#[test]
+fn a_restore_drops_a_log_a_dead_restore_left() {
+    let dir = scratch("restore-stale-log");
+    let source = clean_backup(&dir, "backup.db");
+    // A log with a commit in it, as a store has while it is open.
+    let other = dir.join("other");
+    fs::create_dir(&other).expect("a directory");
+    let (store, _) = open_manual(&other, Options::default());
+    put(&store, "stale", "x");
+    let live = dir.join("live.db");
+    fs::copy(
+        other.join("state.db-wal"),
+        dir.join("live.db.restoring-wal"),
+    )
+    .expect("plant");
+    fs::write(dir.join("live.db.restoring-shm"), vec![0xA5; 32768]).expect("plant");
+    drop(store);
+
+    let lock = StoreLock::take(&live).expect("take");
+    restore_locked(&lock, &source, &|_| Ok(())).expect("restore");
+    drop(lock);
+    for left in [
+        "live.db.restoring-wal",
+        "live.db.restoring-shm",
+        "live.db.restoring",
+    ] {
+        assert!(!dir.join(left).exists(), "{left} is gone");
+    }
+    let restored = reopen(&live);
+    assert!(
+        restored.get("k").expect("get").is_some(),
+        "the backup's rows"
+    );
+    assert_eq!(
+        restored.get("stale").expect("get"),
+        None,
+        "no replayed rows"
+    );
+}
+
+// Catches a stale log that cannot be removed being ignored: the restore must stop, not
+// open the copy with it.
+#[test]
+fn a_restore_stops_when_a_dead_restores_log_cannot_go() {
+    let dir = scratch("restore-stale-log-dir");
+    let source = clean_backup(&dir, "backup.db");
+    let live = dir.join("live.db");
+    fs::create_dir(dir.join("live.db.restoring-wal")).expect("plant");
+    let lock = StoreLock::take(&live).expect("take");
+    restore_locked(&lock, &source, &|_| Ok(())).expect_err("cannot remove a directory");
+    assert!(!live.exists(), "nothing restored");
+    assert!(!dir.join("live.db.restoring").exists(), "nothing staged");
 }
 
 // Catches a restore under the caller's lock that skips `prepare`, runs it on another

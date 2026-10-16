@@ -7,7 +7,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use super::guard::{
-    filesystem_type, held, lock_failed, lock_path, network_filesystem, refuse_network_filesystem,
+    canonical_db, filesystem_type, held, lock_failed, lock_path, network_filesystem,
+    refuse_network_filesystem,
 };
 use super::read::changes_after_head;
 use super::restore::ignore_not_found;
@@ -154,6 +155,42 @@ fn a_probe_tells_a_held_lock_from_a_free_one_and_a_failure() {
     )
     .expect_err("failed");
     assert!(matches!(failed, SqliteError::Io(_)), "got {failed}");
+}
+
+// Catches a file's one name that is not its resolved path: a name without a file name
+// in it resolved as a file, a link loop followed forever or taken for a file, and a
+// path through a file taken for a name nobody holds.
+#[test]
+fn a_files_one_name_resolves_links_and_refuses_what_it_cannot_resolve() {
+    assert_eq!(
+        canonical_db(Path::new("/")).expect("the root"),
+        Path::new("/")
+    );
+    let dir = unit_dir("canonical").canonicalize().expect("resolve");
+    std::os::unix::fs::symlink("b.db", dir.join("a.db")).expect("link");
+    std::os::unix::fs::symlink("a.db", dir.join("b.db")).expect("link");
+    let looped = canonical_db(&dir.join("a.db")).expect_err("a loop");
+    assert!(
+        looped
+            .to_string()
+            .contains("symbolic links follow one another"),
+        "got {looped}"
+    );
+    let file = dir.join("a-file");
+    fs::write(&file, b"").expect("write");
+    let under = canonical_db(&file.join("state.db")).expect_err("not a directory");
+    assert_eq!(under.kind(), io::ErrorKind::NotADirectory, "got {under}");
+    assert_eq!(
+        canonical_db(&dir.join("./x/../new.db"))
+            .expect_err("no x")
+            .kind(),
+        io::ErrorKind::NotFound
+    );
+    fs::create_dir_all(dir.join("x")).expect("x");
+    assert_eq!(
+        canonical_db(&dir.join("./x/../new.db")).expect("resolved"),
+        dir.join("new.db")
+    );
 }
 
 // Catches a probe that fails on a real directory, which would refuse every start.
