@@ -365,7 +365,7 @@ pub fn interrupted() -> io::Result<impl Future<Output = ()> + Send + 'static> {
 }
 
 /// The state store with the membership timing the flags name.
-fn with_members(
+pub(crate) fn with_members(
     state: Option<crate::StateStore>,
     members: crate::members::MembershipConfig,
 ) -> Option<crate::StateStore> {

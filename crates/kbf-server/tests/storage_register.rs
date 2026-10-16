@@ -13,6 +13,8 @@ use std::time::Duration;
 use hooked::Hooked;
 use kbf_front::Cache;
 use kbf_map::{MemberId, MemberState};
+use kbf_proto::kbf::map::v1 as pb;
+use kbf_proto::kbf::map::v1::membership_client::MembershipClient;
 use kbf_server::join::{Identity as NodeIdentity, Joiner};
 use kbf_server::members::{Members, MembershipConfig};
 use kbf_server::storage_node::{StorageFlags, command, parse, start_storage};
@@ -114,6 +116,19 @@ fn frontend(worker_tls: Option<WorkerTls>) -> Frontend {
         members: Members::new(Arc::clone(&store.fake) as Arc<dyn Store>, config()),
         store,
     }
+}
+
+async fn until_async<T, Fut: std::future::Future<Output = Option<T>>>(
+    what: &str,
+    mut probe: impl FnMut() -> Fut,
+) -> T {
+    for _ in 0..1000 {
+        if let Some(found) = probe().await {
+            return found;
+        }
+        tokio::time::sleep(5 * MS).await;
+    }
+    panic!("timed out waiting for {what}");
 }
 
 async fn until<T>(what: &str, mut probe: impl FnMut() -> Option<T>) -> T {
@@ -420,4 +435,76 @@ fn the_wait_after_failures_doubles_to_a_cap() {
     assert_eq!(backoff(RETRY_BASE, 40), RETRY_MAX);
     assert_eq!(backoff(RETRY_BASE, u32::MAX), RETRY_MAX);
     assert_eq!(backoff(5 * MS, 1), 10 * MS);
+}
+
+/// Catches: a `kbf frontend` with `--state-store` that does not serve the membership
+/// service (or rejects the member flags), so a `kbf storage --frontend` node retries
+/// forever against it and never enters the storage map. A real `kbf frontend`
+/// (`start_frontend`, SQLite state store, `--member-ttl-secs` and `--member-dwell-secs`)
+/// and a real node register; a second registrant re-registers until the map the
+/// frontend answers with (published by the refresh that follows a registration) holds the
+/// node at its bound address, Joining. The wait is bounded only to fail a hang.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_storage_node_registers_with_a_frontend_and_is_in_its_map() {
+    let d = dir("frontend-mode");
+    let db = d.join("state").join("state.db");
+    let uri = format!("sqlite://{}", db.display());
+    let argv = [
+        "frontend".to_owned(),
+        "--listen=127.0.0.1:0".to_owned(),
+        "--worker-listen=127.0.0.1:0".to_owned(),
+        "--storage=http://127.0.0.1:1".to_owned(),
+        format!("--state-store={uri}"),
+        "--member-ttl-secs=600".to_owned(),
+        "--member-dwell-secs=600".to_owned(),
+    ];
+    let front = kbf_server::frontend::parse(
+        &kbf_server::frontend::command()
+            .try_get_matches_from(argv)
+            .expect("the frontend takes the member flags"),
+    )
+    .expect("parses");
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let handle = kbf_server::frontend::start_frontend(&front, || {
+        Ok(async move {
+            let _ = stopped.await;
+        })
+    })
+    .expect("starts");
+    let worker = handle.worker;
+    let serving = tokio::spawn(handle.serve());
+
+    let url = format!("--frontend=http://{worker}");
+    let node = start_storage(&flags(&d, &[url]).expect("flags"), never)
+        .await
+        .expect("starts");
+    let addr = node.addr;
+    let node_serving = tokio::spawn(node.serve());
+
+    let channel = Endpoint::from_shared(format!("http://{worker}"))
+        .expect("endpoint")
+        .connect_lazy();
+    // Re-registering the same instance answers with the frontend's current map; the
+    // node's row is in it once the refresh that publishes the registration has landed.
+    let probe = MembershipClient::new(channel);
+    let request = pb::RegisterRequest {
+        role: pb::Role::Storage.into(),
+        instance_id: "probe".to_owned(),
+        addr: "192.0.2.9:1".to_owned(),
+        weight: 1,
+        zone: String::new(),
+        protocol: kbf_server::members::PROTOCOL,
+    };
+    let found = until_async("the node in the frontend's map", || {
+        let (mut probe, request) = (probe.clone(), request.clone());
+        async move {
+            let map = probe.register(request).await.ok()?.into_inner().map?;
+            map.members.into_iter().find(|m| m.addr == addr.to_string())
+        }
+    })
+    .await;
+    assert_eq!(found.state, pb::MemberState::Joining as i32);
+    node_serving.abort();
+    drop(stop);
+    serving.await.expect("joins").expect("stops");
 }

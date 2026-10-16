@@ -25,7 +25,6 @@
 //! never talks to the state store. Every request still carries a generation and the node
 //! ignores it; `STALE_MAP` and the map push are the next change.
 
-use std::collections::BTreeSet;
 use std::error::Error;
 use std::future::Future;
 use std::io;
@@ -36,8 +35,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
-use clap::parser::ValueSource;
-use clap::{Arg, ArgMatches, Command, CommandFactory as _, FromArgMatches as _};
+use clap::{Arg, ArgMatches, Command, FromArgMatches as _};
 use kbf_front::{Cache, CacheStorage, SegmentsConfig};
 use kbf_log::FarmLogId;
 use kbf_meta::Retention;
@@ -78,17 +76,6 @@ pub const ALLOWED: &[&str] = &[
     "store_put_attempts",
 ];
 
-/// The ids of the thread flags, which `kbf-server` flattens into [`Args`].
-fn thread_flags() -> BTreeSet<clap::Id> {
-    let pool = <kbf_threads::PoolArgs as clap::Args>::augment_args(Command::new("pool"));
-    pool.get_arguments().map(|a| a.get_id().clone()).collect()
-}
-
-/// Whether the storage node takes `id` of [`Args`].
-fn takes(id: &clap::Id, threads: &BTreeSet<clap::Id>) -> bool {
-    ALLOWED.contains(&id.as_str()) || threads.contains(id)
-}
-
 /// The id of `--storage-listen`.
 const LISTEN: &str = "storage_listen";
 /// The ids of the registration flags.
@@ -125,13 +112,11 @@ pub struct StorageFlags {
 /// hidden (so [`parse`] can refuse them by name), and the node's own.
 #[must_use]
 pub fn command() -> Command {
-    let threads = thread_flags();
-    let mut cmd = Command::new("storage")
-        .about("The storage node: the cache, served over gRPC to frontends and daemons.");
-    for arg in Args::command().get_arguments() {
-        let shown = takes(arg.get_id(), &threads);
-        cmd = cmd.arg(arg.clone().hide(!shown));
-    }
+    let cmd = crate::flag_set::command(
+        "storage",
+        "The storage node: the cache, served over gRPC to frontends and daemons.",
+        ALLOWED,
+    );
     let path =
         |id: &'static str, long: &'static str, requires: [&'static str; 2], help: &'static str| {
             Arg::new(id)
@@ -212,20 +197,15 @@ pub fn command() -> Command {
 /// A flag of `kbf-server` that a storage node does not take was given (the error names
 /// it; it is also how `--state-store` is refused, a flag no storage node has).
 pub fn parse(m: &ArgMatches) -> Result<StorageFlags, clap::Error> {
-    let threads = thread_flags();
-    for arg in Args::command().get_arguments() {
-        let id = arg.get_id();
-        if !takes(id, &threads) && m.value_source(id.as_str()) == Some(ValueSource::CommandLine) {
-            let flag = arg.get_long().map_or(id.as_str(), |long| long);
-            return Err(command().error(
-                clap::error::ErrorKind::ArgumentConflict,
-                format!(
-                    "kbf storage refuses --{flag}: a storage node serves blobs and the action \
-                     cache and keeps no scheduler state; it takes the store, write and log \
-                     flags (docs/design/architecture-v2.md, section 3)"
-                ),
-            ));
-        }
+    if let Some(flag) = crate::flag_set::refused(m, ALLOWED) {
+        return Err(command().error(
+            clap::error::ErrorKind::ArgumentConflict,
+            format!(
+                "kbf storage refuses --{flag}: a storage node serves blobs and the action \
+                 cache and keeps no scheduler state; it takes the store, write and log \
+                 flags (docs/design/architecture-v2.md, section 3)"
+            ),
+        ));
     }
     let server = Args::from_arg_matches(m)?;
     let paths: Vec<PathBuf> = TLS

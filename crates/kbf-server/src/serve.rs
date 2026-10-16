@@ -37,10 +37,10 @@ use crate::http_invocations::InvocationReaders;
 use crate::identity::{DenyList, Peers};
 use crate::members::Members;
 use crate::members_rpc::MembershipService;
-use kbf_proto::kbf::map::v1::membership_server::MembershipServer;
 use crate::state_store::StateStore;
 use crate::token::ApiToken;
 use crate::worker::WorkerService;
+use kbf_proto::kbf::map::v1::membership_server::MembershipServer;
 
 /// How the server listens and paces its daemons.
 #[derive(Clone, Debug)]
@@ -189,7 +189,7 @@ pub struct Bound<F> {
 }
 
 /// Aborts its task when dropped.
-struct AbortOnDrop(tokio::task::AbortHandle);
+pub(crate) struct AbortOnDrop(pub(crate) tokio::task::AbortHandle);
 
 impl Drop for AbortOnDrop {
     fn drop(&mut self) {
@@ -202,7 +202,7 @@ impl Drop for AbortOnDrop {
 /// unacknowledged waits for the client's delayed ACK, about 40 ms on Linux, so each
 /// sequential small call pays that. tonic's `Server::tcp_nodelay` does not apply here:
 /// `serve_with_incoming` takes the options of the incoming stream it is given.
-fn bind(addr: SocketAddr) -> Result<(TcpIncoming, SocketAddr), ServeError> {
+pub(crate) fn bind(addr: SocketAddr) -> Result<(TcpIncoming, SocketAddr), ServeError> {
     let bound = TcpIncoming::bind(addr).and_then(|incoming| {
         let local = incoming.local_addr()?;
         Ok((incoming.with_nodelay(Some(true)), local))
@@ -211,7 +211,7 @@ fn bind(addr: SocketAddr) -> Result<(TcpIncoming, SocketAddr), ServeError> {
 }
 
 /// Serves `routes` on `listener` until it fails; without a listener, never completes.
-fn serve_api(
+pub(crate) fn serve_api(
     listener: Option<tokio::net::TcpListener>,
     routes: axum::Router,
 ) -> impl Future<Output = std::io::Result<()>> {
@@ -234,7 +234,9 @@ fn set_nodelay(tcp: &mut tokio::net::TcpStream) {
     let _ = tcp.set_nodelay(true);
 }
 
-fn bind_api(addr: SocketAddr) -> Result<(tokio::net::TcpListener, SocketAddr), ServeError> {
+pub(crate) fn bind_api(
+    addr: SocketAddr,
+) -> Result<(tokio::net::TcpListener, SocketAddr), ServeError> {
     let bound = std::net::TcpListener::bind(addr).and_then(|listener| {
         listener.set_nonblocking(true)?;
         let listener = tokio::net::TcpListener::from_std(listener)?;
@@ -247,7 +249,10 @@ fn bind_api(addr: SocketAddr) -> Result<(tokio::net::TcpListener, SocketAddr), S
 /// The worker listener's TLS and the way its peers are told apart. Not generic, so
 /// both arms are one set of lines whatever the cache types (a per-instantiation copy
 /// that misses one arm would count as missed lines).
-fn worker_peers(server: Server, tls: Option<WorkerTls>) -> Result<(Server, Peers), ServeError> {
+pub(crate) fn worker_peers(
+    server: Server,
+    tls: Option<WorkerTls>,
+) -> Result<(Server, Peers), ServeError> {
     Ok(match tls {
         Some(tls) => (
             server.tls_config(tls.server)?,
@@ -263,7 +268,7 @@ fn worker_peers(server: Server, tls: Option<WorkerTls>) -> Result<(Server, Peers
 /// transport's defaults: they bound what is held outside `--write-bytes-in-flight`, and
 /// the connection window is what lets a Write admitted after others finish at all
 /// (`kbf_front::CONNECTION_WINDOW_BYTES`).
-fn flow_control(server: Server) -> Server {
+pub(crate) fn flow_control(server: Server) -> Server {
     server
         .max_concurrent_streams(Some(MAX_CONCURRENT_STREAMS))
         .initial_stream_window_size(Some(STREAM_WINDOW_BYTES))
@@ -273,7 +278,7 @@ fn flow_control(server: Server) -> Server {
 /// `server` pinging a quiet connection every `timing.keepalive_interval` and closing it
 /// when a ping stays unanswered for `timing.keepalive_timeout` (HTTP/2 PING, which a
 /// peer must answer even when it never sends data).
-fn keepalive(server: Server, timing: StreamTiming) -> Server {
+pub(crate) fn keepalive(server: Server, timing: StreamTiming) -> Server {
     let on = !timing.keepalive_interval.is_zero();
     server
         .http2_keepalive_interval(on.then_some(timing.keepalive_interval))
@@ -284,23 +289,20 @@ fn keepalive(server: Server, timing: StreamTiming) -> Server {
 const STATE_IN_MEMORY: &str = "the scheduler's state is in memory: no cordon, drain, lease or \
     operation of an earlier server process is restored, and the server keeps no rollout record";
 
-/// Expires members while the server runs. Never completes; with no state store there
-/// are none, and it waits forever. A function of its own and not generic, so the tests
-/// measure one copy of these lines and not the best of the server's instantiations.
-///
-/// Builds the future and does not await it here: a function that awaits a future that
-/// never completes has a closing line no test can reach.
 /// The members a frontend with a state store keeps. Not generic, for the same reason as
 /// [`sweeping`].
-fn members_of(state: Option<&crate::StateStore>) -> Option<Arc<Members>> {
+pub(crate) fn members_of(state: Option<&crate::StateStore>) -> Option<Arc<Members>> {
     let state = state?;
-    Some(Arc::new(Members::new(Arc::clone(&state.store), state.members)))
+    Some(Arc::new(Members::new(
+        Arc::clone(&state.store),
+        state.members,
+    )))
 }
 
 /// The membership service storage nodes register with, when there are members to keep:
 /// under worker TLS only the storage role may call it. Not generic, for the same reason
 /// as [`sweeping`].
-fn membership(
+pub(crate) fn membership(
     members: Option<Arc<Members>>,
     certified: bool,
 ) -> Option<MembershipServer<MembershipService>> {
@@ -312,7 +314,13 @@ fn membership(
     Some(MembershipService::new(members?, admission).server())
 }
 
-fn sweeping(members: Option<Arc<Members>>) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+/// Expires members while the server runs. Never completes; with no state store there
+/// are none, and it waits forever. A function of its own and not generic, so the tests
+/// measure one copy of these lines and not the best of the server's instantiations.
+///
+/// Builds the future and does not await it here: a function that awaits a future that
+/// never completes has a closing line no test can reach.
+pub(crate) fn sweeping(members: Option<Arc<Members>>) -> Pin<Box<dyn Future<Output = ()> + Send>> {
     match members {
         Some(members) => Box::pin(crate::members_rpc::sweep(members)),
         None => Box::pin(std::future::pending()),
@@ -321,12 +329,36 @@ fn sweeping(members: Option<Arc<Members>>) -> Pin<Box<dyn Future<Output = ()> + 
 
 /// Logs where the scheduler's state is, at every start. Not generic, unlike the binding
 /// that calls it, so every test binary's runs count toward the same function's coverage.
-fn log_state(durable: bool, term: u64, epoch: u64) {
+pub(crate) fn log_state(durable: bool, term: u64, epoch: u64) {
     if durable {
         tracing::info!(term, epoch, "the scheduler's state is in the state store");
     } else {
         tracing::warn!(term, epoch, "{STATE_IN_MEMORY}");
     }
+}
+
+/// What both `kbf-server` and `kbf frontend` do once their shutdown future completes, so
+/// the two cannot drift: `/readyz` answers `stopping` (a front sends no new work),
+/// `closer` refuses new Execute calls while the open ones run until their action is done
+/// (Buck2 does not recover a stream that breaks), `drain` starts the REAPI listener's
+/// graceful stop, and only `timeout` ends the open streams UNAVAILABLE. Returns once
+/// that grace after the timeout has passed, which is when the caller stops anyway.
+pub(crate) async fn drain_and_stop(
+    readiness: &Readiness,
+    closer: &kbf_front::Closer,
+    drain: tokio::sync::oneshot::Sender<()>,
+    timeout: Duration,
+) {
+    readiness.stop();
+    closer.drain();
+    let _ = drain.send(());
+    tokio::time::sleep(timeout).await;
+    closer.close();
+    tokio::time::sleep(CLOSE_GRACE).await;
+    tracing::warn!(
+        ?timeout,
+        "REAPI connections still open at the shutdown timeout; stopping anyway"
+    );
 }
 
 /// Binds the REAPI and worker listeners for a farm over `cache`, and no operator API.
@@ -630,20 +662,7 @@ where
         // in time, completes first.
         let stopping = async {
             shutdown.await;
-            // Before anything stops, so a front's health check (`/readyz`, or the
-            // health service) sends no new work here.
-            stop_readiness.stop();
-            // No new Execute; open streams run until their action is done. Buck2 does
-            // not recover a stream that breaks, so only the shutdown timeout ends them.
-            closer.drain();
-            let _ = drain.send(());
-            tokio::time::sleep(listeners.shutdown_timeout).await;
-            closer.close();
-            tokio::time::sleep(CLOSE_GRACE).await;
-            tracing::warn!(
-                timeout = ?listeners.shutdown_timeout,
-                "REAPI connections still open at the shutdown timeout; stopping anyway"
-            );
+            drain_and_stop(&stop_readiness, &closer, drain, listeners.shutdown_timeout).await;
         };
         tokio::select! {
             served = reapi_serve => served.map_err(ServeError::from),
