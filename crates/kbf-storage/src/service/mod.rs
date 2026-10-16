@@ -22,9 +22,12 @@
 //! **The map generation** (section 6) rides on every call: a field of every
 //! `kbf.storage.v1` request, and the [`MAP_GENERATION_HEADER`] metadata entry on the
 //! standard calls. [`RemoteStorage`] sends it. A node with no map ignores it; one given a
-//! [`crate::replicate::Chain`] ([`StorageService::with_chain`]) refuses a `Write` from a
-//! caller whose generation is not the map's: STALE_MAP for one behind it, UNAVAILABLE for
-//! one ahead of it. The other calls do not read it yet.
+//! [`crate::replicate::MapSource`] ([`StorageService::with_map`], or
+//! [`StorageService::with_chain`], which brings its own) judges every call by it,
+//! before the call reads anything: STALE_MAP (FAILED_PRECONDITION with the node's
+//! generation in the same entry) for a caller behind the node; for one ahead of it, the node
+//! fetches the map ([`crate::replicate::MapSource::refetch`]) and goes on, or answers
+//! UNAVAILABLE if it cannot get it in time.
 //!
 //! **Who may call** is [`Admission`]: the role in the caller's certificate against the
 //! endpoint's table. Roles are the part of this unit that is partly a seam; the module
@@ -50,6 +53,7 @@ mod wire;
 mod write;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use kbf_proto::google::bytestream::byte_stream_server::ByteStreamServer;
 use kbf_proto::reapi::content_addressable_storage_server::ContentAddressableStorageServer;
@@ -58,8 +62,8 @@ use kbf_proto::worker::segments_server::{Segments, SegmentsServer};
 use tokio::sync::Semaphore;
 use tonic::service::Routes;
 
-use crate::Storage;
-use crate::replicate::Chain;
+use crate::replicate::{self, Chain, MapSource};
+use crate::{Storage, StorageError};
 
 pub use admission::{Admission, Endpoint, PeerRole, ROLE_URI_PREFIX, role_of};
 pub use client::RemoteStorage;
@@ -100,6 +104,8 @@ pub struct StorageService {
     segments: Arc<dyn Segments>,
     admission: Admission,
     chain: Option<Arc<Chain>>,
+    map: Option<Arc<dyn MapSource>>,
+    refetch_wait: Duration,
     write_room: Semaphore,
     write_room_bytes: u32,
 }
@@ -113,18 +119,48 @@ impl StorageService {
             storage,
             admission,
             chain: None,
+            map: None,
+            refetch_wait: replicate::REFETCH_WAIT,
             write_room: Semaphore::new(config.write_bytes_in_flight as usize),
             write_room_bytes: config.write_bytes_in_flight,
         }
     }
 
-    /// The service as a node of a chain ([`crate::replicate`]): it judges writes by the
+    /// The service judging every call by the map `map` holds ([`crate::replicate`]), with
+    /// no part in a chain (a node that serves reads, or a test).
+    #[must_use]
+    pub fn with_map(mut self, map: Arc<dyn MapSource>) -> Self {
+        self.map = Some(map);
+        self
+    }
+
+    /// The service as a node of a chain ([`crate::replicate`]): it judges every call by the
     /// chain's map and, as the primary of a blob, copies it to the replica before it
     /// answers.
     #[must_use]
     pub fn with_chain(mut self, chain: Arc<Chain>) -> Self {
+        self.map = Some(chain.source());
         self.chain = Some(chain);
         self
+    }
+
+    /// How long a call routed by a map this node has not been told of waits for the node
+    /// to fetch it (default [`replicate::REFETCH_WAIT`]).
+    #[must_use]
+    pub const fn with_refetch_wait(mut self, wait: Duration) -> Self {
+        self.refetch_wait = wait;
+        self
+    }
+
+    /// Whether a call routed by map generation `requested` may be served now: always, for
+    /// a node with no map ([`replicate::check`]).
+    async fn check_map(&self, requested: u64) -> Result<(), StorageError> {
+        match &self.map {
+            Some(source) => replicate::check(&**source, requested, self.refetch_wait)
+                .await
+                .map(drop),
+            None => Ok(()),
+        }
     }
 
     /// The service as routes, ready to be added to a tonic server.

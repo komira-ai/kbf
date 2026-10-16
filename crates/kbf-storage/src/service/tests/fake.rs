@@ -34,7 +34,7 @@ use tonic::transport::Channel;
 use tonic::transport::server::TcpIncoming;
 use tonic::{Request, Response, Status, Streaming};
 
-use crate::replicate::{Chain, ChainConfig, MapSource, Peers, View};
+use crate::replicate::{Chain, ChainConfig, MapSource, Peers};
 use crate::service::{Admission, Config, MAP_GENERATION_HEADER, RemoteStorage, StorageService};
 use crate::{Answer, PutStream, READ_CHUNK_BYTES, ReadStream, Storage, StorageError};
 
@@ -555,11 +555,12 @@ impl Held {
 }
 
 impl MapSource for Held {
-    fn current(&self) -> Option<View> {
-        self.0.lock().expect("lock").clone().map(|map| View {
-            map,
-            me: kbf_map::MemberId(1),
-        })
+    fn current(&self) -> Option<Arc<kbf_map::Map>> {
+        self.0.lock().expect("lock").clone()
+    }
+
+    fn me(&self) -> Option<kbf_map::MemberId> {
+        Some(kbf_map::MemberId(1))
     }
 }
 
