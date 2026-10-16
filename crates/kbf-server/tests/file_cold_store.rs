@@ -86,7 +86,13 @@ impl Dirs {
 }
 
 /// Starts the server, reads its start line, and connects a client to both listeners.
-async fn started(mut c: Command) -> (Running, Client) {
+async fn started(c: Command) -> (Running, Client) {
+    let (child, client, _) = started_with_line(c).await;
+    (child, client)
+}
+
+/// [`started`], and the start line.
+async fn started_with_line(mut c: Command) -> (Running, Client, String) {
     let mut child = Running(
         c.stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -115,7 +121,7 @@ async fn started(mut c: Command) -> (Running, Client) {
             .expect("an address")
     };
     let client = Client::connect(addr("reapi="), addr("worker=")).await;
-    (child, client)
+    (child, client, line)
 }
 
 /// Stops the server with SIGINT and checks it exits 0 within `BOUND`.
@@ -263,6 +269,82 @@ async fn a_restart_keeps_the_blobs_and_the_action_cache() {
     drop(after);
     stop(server);
     dirs.remove();
+}
+
+/// The ` log=` id of a start line.
+fn log_id(line: &str) -> String {
+    line.split_whitespace()
+        .find_map(|w| w.strip_prefix("log="))
+        .unwrap_or_else(|| panic!("no log= in {line:?}"))
+        .to_owned()
+}
+
+/// Copies the directory tree `from` to `to` (made), files byte for byte.
+fn copy_tree(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).expect("make the copy's directory");
+    for entry in std::fs::read_dir(from).expect("list") {
+        let entry = entry.expect("an entry");
+        let dest = to.join(entry.file_name());
+        if entry.file_type().expect("a type").is_dir() {
+            copy_tree(&entry.path(), &dest);
+        } else {
+            std::fs::copy(entry.path(), &dest).expect("copy a file");
+        }
+    }
+}
+
+/// Catches a metadata backup that is not one: a byte copy of the metadata directory
+/// (and of the `file://` store) taken while the server is stopped, started on new
+/// paths, must open the same log (the start line's `log=` id), answer the action-cache
+/// entry recorded before the copy and serve every blob byte for byte. A start that drew
+/// a new log id over a copy, or an index that does not survive the copy, goes red. And a
+/// copy that lost its `log-record` is refused at start rather than opened as a new,
+/// empty log (which would serve every blob as missing). `kbf-deploy linux meta-backup`
+/// takes this copy (docs/deploy/storage-node.md#metadata-backup-and-restore).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_copy_of_a_stopped_servers_meta_dir_is_a_backup() {
+    let dirs = Dirs::new("backup");
+    let (server, before, line) = started_with_line(dirs.server()).await;
+    let live_log = log_id(&line);
+    let mut daemon = before.daemon("node-a", 4, 8).await;
+    let job = Job::new("before the backup", &[]);
+    before.upload(&job.blobs()).await;
+    let mut ops = before.execute(&job.action).await;
+    let start = daemon.start().await;
+    let result = output(&before, "ran before the backup", 0).await;
+    assert!(daemon.report(ran(start.lease_id, &result)).await.accepted);
+    assert_eq!(response(&done(&mut ops).await).result, Some(result.clone()));
+    drop((ops, daemon, before));
+    stop(server);
+
+    let copy = Dirs::new("backup-restored");
+    copy_tree(&dirs.raft, &copy.raft);
+    copy_tree(&dirs.blobs, &copy.blobs);
+    dirs.remove();
+    let (server, after, line) = started_with_line(copy.server()).await;
+    assert_eq!(log_id(&line), live_log, "the copy opened another log");
+    assert_eq!(
+        after.cached(&job.action).await,
+        Ok(result),
+        "the action cache entry is not in the copy"
+    );
+    let out = Blob::new("ran before the backup");
+    for blob in job.blobs().into_iter().chain([&out]) {
+        assert_eq!(
+            read(&after, blob).await,
+            Ok(blob.data.clone()),
+            "blob {} from the copy",
+            blob.digest
+        );
+    }
+    drop(after);
+    stop(server);
+
+    std::fs::remove_file(copy.raft.join("log-record")).expect("drop the record");
+    let (code, stderr) = fails(copy.server());
+    assert_eq!(code, Some(2), "{stderr}");
+    assert!(stderr.contains("holds files but no log-record"), "{stderr}");
+    copy.remove();
 }
 
 /// Catches a blob whose object file is gone (deleted, or cut to zero bytes) kept in the
