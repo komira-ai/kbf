@@ -102,6 +102,7 @@ use tokio::time::Instant;
 pub use self::join::{ChangeRefused, JoinAnswer, JoinError, JoinRequest};
 use self::machine::MetaMachine;
 pub use self::machine::NoSnapshots;
+use self::recorded::{Formed, Recorded};
 pub use self::recorded::{RECORD, RECORD_TMP};
 
 /// The file in the raft directory that [`RaftMetaLog::open_dir`] holds an exclusive
@@ -151,7 +152,8 @@ pub enum RaftLogError {
     /// The host refused what the store holds.
     #[error("raft dir: {0}")]
     Open(#[from] OpenError<StoreError, NoSnapshots>),
-    /// The single voter's membership was refused.
+    /// A membership was refused: the single voter's, or a join answer that does not
+    /// name the node.
     #[error("raft membership: {0}")]
     Membership(#[from] ConfigError),
     /// Another open log holds the raft directory's [`LOCK`] (a second server started
@@ -237,6 +239,8 @@ struct Shared<F: Fs> {
     bootstraps: usize,
     /// Set when the log is dropped: a batch that takes `host` after it is refused.
     closed: AtomicBool,
+    /// This node created the log and leads it; a node that joined does not.
+    leads: bool,
 }
 
 impl RaftMetaLog<StdFs> {
@@ -315,14 +319,37 @@ where
     ///
     /// # Errors
     ///
-    /// For now, as [`RaftMetaLog::open`] with `cluster` as the new log's id.
+    /// [`RaftLogError::OtherCluster`] if `fs` holds another cluster,
+    /// [`RaftLogError::Joined`] if this node joined `cluster` (it never creates), and
+    /// otherwise as [`RaftMetaLog::open`].
     pub async fn create(
         fs: F,
         retention: Retention,
         prefix_root: &str,
         cluster: FarmLogId,
     ) -> Result<Self, RaftLogError> {
-        Self::open(fs, retention, prefix_root, move || Ok(cluster)).await
+        let record = match recorded::read(&fs)? {
+            None => {
+                let record = Recorded {
+                    log_id: cluster,
+                    formed: Formed::Created,
+                };
+                recorded::write(&fs, &record)?;
+                record
+            }
+            Some(held) if held.log_id != cluster => {
+                return Err(RaftLogError::OtherCluster {
+                    held: held.log_id,
+                    asked: cluster,
+                });
+            }
+            Some(Recorded {
+                formed: Formed::Joined { .. },
+                log_id,
+            }) => return Err(RaftLogError::Joined(log_id)),
+            Some(created) => created,
+        };
+        Self::open_recorded(fs, retention, prefix_root, record, RUNS).await
     }
 
     /// Joins the existing cluster the leader's `answer` names, as node `node`, as the
@@ -330,9 +357,14 @@ where
     /// ([`RaftMetaLog::join`]); or opens the log if `fs` already holds that cluster: a
     /// repeated join is a no-op.
     ///
+    /// A node that joins opens as a learner with the answered membership and never
+    /// elects itself; it receives the log from the leader (once a transport exists).
+    ///
     /// # Errors
     ///
-    /// Every join is refused for now.
+    /// [`RaftLogError::OtherCluster`] if `fs` holds another cluster,
+    /// [`RaftLogError::Membership`] if the answer's membership does not name `node`,
+    /// and otherwise as [`RaftMetaLog::open`].
     pub async fn join_cluster(
         fs: F,
         retention: Retention,
@@ -340,8 +372,31 @@ where
         node: ServerId,
         answer: &JoinAnswer,
     ) -> Result<Self, RaftLogError> {
-        let _ = (fs, retention, prefix_root, node, answer);
-        Err(RaftLogError::Record)
+        let record = match recorded::read(&fs)? {
+            None => {
+                if !answer.membership.contains(node) {
+                    return Err(ConfigError::NotAMember(node).into());
+                }
+                let record = Recorded {
+                    log_id: answer.cluster,
+                    formed: Formed::Joined {
+                        server: node,
+                        membership: answer.membership.clone(),
+                    },
+                };
+                recorded::write(&fs, &record)?;
+                record
+            }
+            Some(held) if held.log_id != answer.cluster => {
+                return Err(RaftLogError::OtherCluster {
+                    held: held.log_id,
+                    asked: answer.cluster,
+                });
+            }
+            // A member already: it created the cluster or joined it before.
+            Some(held) => held,
+        };
+        Self::open_recorded(fs, retention, prefix_root, record, RUNS).await
     }
 
     /// [`RaftMetaLog::open`], for a binary that runs machine versions up to `runs`: a
@@ -359,21 +414,42 @@ where
         new_log_id: impl FnOnce() -> io::Result<FarmLogId>,
         runs: MachineVersion,
     ) -> Result<Self, RaftLogError> {
-        let machine = MetaMachine::new(retention, runs).ok_or(RaftLogError::Runs(runs))?;
-        let log_id = match recorded::read(&fs)? {
-            Some(id) => id,
+        let record = match recorded::read(&fs)? {
+            Some(record) => record,
             None => {
-                let id = new_log_id()?;
-                recorded::write(&fs, id)?;
-                id
+                let record = Recorded {
+                    log_id: new_log_id()?,
+                    formed: Formed::Created,
+                };
+                recorded::write(&fs, &record)?;
+                record
             }
         };
+        Self::open_recorded(fs, retention, prefix_root, record, runs).await
+    }
+
+    /// Opens the log `record` describes. A created log is led by this node: it elects
+    /// itself and commits its `Bootstrap` if none is committed. A joined one opens as
+    /// the member the record names and waits for the leader.
+    async fn open_recorded(
+        fs: F,
+        retention: Retention,
+        prefix_root: &str,
+        record: Recorded,
+        runs: MachineVersion,
+    ) -> Result<Self, RaftLogError> {
+        let machine = MetaMachine::new(retention, runs).ok_or(RaftLogError::Runs(runs))?;
+        let log_id = record.log_id;
         let prefix = KeyPrefix::new(format!("{prefix_root}{log_id}/"))?;
         // One read of the directory for both the store and the host (kbf#689).
         let (store, stored) = Store::open(fs, Options::default())?;
+        let (id, membership, leads) = match record.formed {
+            Formed::Created => (ME, Membership::new([ME], [])?, true),
+            Formed::Joined { server, membership } => (server, membership, false),
+        };
         let config = Config {
-            id: ME,
-            membership: Membership::new([ME], [])?,
+            id,
+            membership,
             election_ticks: 2,
             heartbeat_ticks: 1,
             max_entries_per_append: 1,
@@ -381,7 +457,7 @@ where
         let mut host = Host::open_stored(config, store, stored, NoTransport, machine, 0)?;
         // A single voter elects itself within two election timeouts; winning commits
         // the term's blank entry, which applies every entry before it.
-        while host.core().role() != Role::Leader {
+        while leads && host.core().role() != Role::Leader {
             host.tick(0)?;
         }
         decoded(host.machine())?;
@@ -389,13 +465,13 @@ where
             log_id,
             store_prefix: prefix.as_str().to_owned(),
         };
-        if host.machine().bootstrap().is_none() {
+        if leads && host.machine().bootstrap().is_none() {
             let format = host.machine().format();
             let entry = kbf_log::encode(format, &LogCommand::Bootstrap(expected.clone()))?;
             host.propose(entry)?;
         }
         let committed = host.machine().bootstrap().cloned();
-        if committed.as_ref() != Some(&expected) {
+        if leads && committed.as_ref() != Some(&expected) {
             return Err(RaftLogError::Mismatch {
                 committed,
                 expected,
@@ -414,6 +490,7 @@ where
             prefix,
             opened: Instant::now(),
             closed: AtomicBool::new(false),
+            leads,
         });
         let ticker = tokio::spawn(tick_every(Arc::downgrade(&shared))).abort_handle();
         Ok(Self {
@@ -619,7 +696,7 @@ where
     }
 
     fn leadership(&self) -> Option<Leadership> {
-        Some(Leadership {
+        self.shared.leads.then(|| Leadership {
             log_id: self.shared.log_id.non_zero(),
             term: self.shared.term,
         })

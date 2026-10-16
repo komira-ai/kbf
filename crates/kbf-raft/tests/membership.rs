@@ -323,6 +323,10 @@ fn learners_join_catch_up_are_promoted_and_the_cluster_survives_a_leader_restart
 
     cluster.join(S2);
     cluster.run_until(|c| c.nodes[&S2].machine().0.contains(&b"before-joins".to_vec()));
+    assert!(
+        cluster.nodes[&S2].core().matched().is_empty(),
+        "a follower tracks no peers"
+    );
     assert_eq!(cluster.learners(S2), [S2], "S2 joined as a learner");
     assert_eq!(cluster.voters(S1), [S1], "a learner does not vote");
     cluster.change(Change::Promote(S2));

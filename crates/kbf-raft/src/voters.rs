@@ -169,10 +169,10 @@ impl VoterPolicy {
             .filter_map(|v| view.failing(v))
             .collect();
         let good = voters - failing.len();
-        if good < effective
-            && let Some(best) = view.best_learner()
-        {
-            return Some(Change::Promote(best));
+        if good < effective {
+            // Fewer good voters than eligible candidates allow means an eligible
+            // learner exists.
+            return view.best_learner().map(Change::Promote);
         }
         if voters > effective {
             if let Some(&change) = failing.first() {

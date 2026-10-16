@@ -139,3 +139,23 @@ async fn a_rejoin_of_the_same_cluster_is_a_no_op_and_another_cluster_is_refused(
     assert_eq!(log.voters(), 1);
     assert!(log.leadership().is_some(), "the creator still leads");
 }
+
+/// Catches: a join recorded from an answer that does not name the node (the record
+/// would name a membership the node is not in, and its next open would refuse it).
+#[tokio::test]
+async fn a_join_whose_answer_does_not_name_the_node_is_refused_and_records_nothing() {
+    let fs = FaultFs::new();
+    let stranger = RaftMetaLog::join_cluster(
+        fs.clone(),
+        Retention::default(),
+        "kbf/",
+        ServerId(7),
+        &answer(X),
+    )
+    .await;
+    assert!(
+        matches!(refused(stranger), RaftLogError::Membership(_)),
+        "a node the answer does not name"
+    );
+    assert_eq!(fs.contents(kbf_server::raft_log::RECORD), None);
+}

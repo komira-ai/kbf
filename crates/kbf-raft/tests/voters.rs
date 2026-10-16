@@ -4,8 +4,8 @@
 //! leader does one committed change at a time.
 
 use kbf_raft::{
-    Change, LoadHysteresis, LoadSwap, MemberState, Membership, ServerId, Thresholds, VoterPolicy,
-    VoterPolicyError,
+    Change, ChangeError, LoadHysteresis, LoadSwap, MemberState, Membership, ServerId, Thresholds,
+    VoterPolicy, VoterPolicyError,
 };
 
 const LEADER: ServerId = ServerId(1);
@@ -296,4 +296,42 @@ fn load_swaps_need_the_margin_held_for_the_dwell_one_at_a_time() {
     let m = Membership::new([s(1), s(2), s(3)], [s(4)]).expect("valid");
     assert_eq!(policy(3).load_pair(LEADER, &m, &members), None);
     assert_eq!(policy(3).next_change(LEADER, &m, &members, swap), None);
+}
+
+/// Catches: a demotion of a learner or of the last voter, a drain of a stranger, of a
+/// member drained already or of the only voter, an undrain of a member not drained,
+/// and a removal that leaves a drain mark behind (a rejoin under the same id would
+/// come back drained).
+#[test]
+fn demote_drain_and_undrain_check_their_preconditions() {
+    let one = Membership::new([s(1)], [s(2)]).expect("valid");
+    let two = Membership::new([s(1), s(3)], [s(2)]).expect("valid");
+    let refusals = [
+        (&one, Change::Demote(s(2)), ChangeError::NotAVoter(s(2))),
+        (&one, Change::Demote(s(1)), ChangeError::LastVoter(s(1))),
+        (&one, Change::Drain(s(9)), ChangeError::NotAMember(s(9))),
+        (&one, Change::Drain(s(1)), ChangeError::LastVoter(s(1))),
+        (&one, Change::Undrain(s(2)), ChangeError::NotDrained(s(2))),
+    ];
+    for (m, change, refused) in refusals {
+        assert_eq!(m.changed(change), Err(refused), "{change:?}");
+    }
+    let demoted = two.changed(Change::Demote(s(3))).expect("two voters");
+    assert_eq!(
+        (voters(&demoted), learners(&demoted)),
+        (vec![1], vec![2, 3])
+    );
+    let drained = two
+        .changed(Change::Drain(s(1)))
+        .expect("another voter remains");
+    assert!(drained.is_drained(s(1)));
+    assert_eq!(
+        drained.changed(Change::Drain(s(1))),
+        Err(ChangeError::AlreadyDrained(s(1)))
+    );
+    let learner = two.changed(Change::Drain(s(2))).expect("a learner");
+    let removed = learner.changed(Change::Remove(s(2))).expect("removed");
+    assert_eq!(removed.drained().count(), 0);
+    let undrained = learner.changed(Change::Undrain(s(2))).expect("undrained");
+    assert_eq!(undrained, two);
 }
