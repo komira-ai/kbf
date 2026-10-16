@@ -488,7 +488,9 @@ async fn a_stopping_frontend_is_not_serving() {
 enum Answers {
     Absent,
     Fails,
-    Slow,
+    /// Never answers until the test drops the sender: a read that does not come back,
+    /// whatever the machine's load.
+    Hangs(std::sync::Mutex<std::sync::mpsc::Receiver<()>>),
     Panics,
 }
 
@@ -504,8 +506,9 @@ impl Store for PlantedStore {
         match self.0 {
             Answers::Absent => Ok(None),
             Answers::Fails => Err(StoreError::Failed("disk gone".to_owned())),
-            Answers::Slow => {
-                std::thread::sleep(Duration::from_millis(400));
+            Answers::Hangs(ref release) => {
+                // Err once the test drops the sender; the probe has given up by then.
+                let _ = release.lock().unwrap().recv();
                 Ok(None)
             }
             Answers::Panics => panic!("planted panic in a state store read"),
@@ -540,14 +543,29 @@ impl Store for PlantedStore {
 /// in the order the route lists them, and the map hook is true.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn readyz_asks_the_state_store() {
-    let timeout = Duration::from_millis(100);
-    let probe = |answers| StateProbe::new(Arc::new(PlantedStore(answers)), timeout);
-    assert_eq!(probe(Answers::Absent).probe().await, Ok(()));
-    let failed = probe(Answers::Fails).probe().await.expect_err("fails");
+    // Only the hanging store meets the probe's timeout: it never answers, so the check
+    // fails at the timeout however loaded the machine is. Every other case gets a
+    // deadline that only a hang reaches (no assertion depends on speed).
+    let hang_only = Duration::from_secs(60);
+    let probe = |answers, timeout| StateProbe::new(Arc::new(PlantedStore(answers)), timeout);
+    assert_eq!(probe(Answers::Absent, hang_only).probe().await, Ok(()));
+    let failed = probe(Answers::Fails, hang_only)
+        .probe()
+        .await
+        .expect_err("fails");
     assert!(failed.contains("disk gone"), "{failed}");
-    let slow = probe(Answers::Slow).probe().await.expect_err("times out");
+    let (release, held) = std::sync::mpsc::channel::<()>();
+    let hung = Answers::Hangs(std::sync::Mutex::new(held));
+    let slow = probe(hung, Duration::from_millis(100))
+        .probe()
+        .await
+        .expect_err("times out");
     assert!(slow.contains("no answer within 100 ms"), "{slow}");
-    let crashed = probe(Answers::Panics).probe().await.expect_err("panics");
+    drop(release);
+    let crashed = probe(Answers::Panics, hang_only)
+        .probe()
+        .await
+        .expect_err("panics");
     assert!(crashed.contains("did not finish"), "{crashed}");
     assert_eq!(MapProbe.probe().await, Ok(()));
 
@@ -557,7 +575,7 @@ async fn readyz_asks_the_state_store() {
         Arc::clone(&readiness),
         Arc::clone(&node.storage),
         Some(Arc::new(PlantedStore(Answers::Fails))),
-        timeout,
+        hang_only,
     );
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let api = listener.local_addr().unwrap();
