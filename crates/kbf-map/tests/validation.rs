@@ -4,10 +4,13 @@
 mod common;
 
 use common::member;
-use kbf_map::{Map, MapError, Member, MemberId, MemberState::Active, Rule};
+use kbf_map::{DenyEntry, Map, MapError, Member, MemberId, MemberState::Active, Rule};
 
 fn build(generation: u64, members: Vec<Member>, r: u8, deny: &[&str]) -> Result<Map, MapError> {
-    let deny = deny.iter().map(|s| (*s).to_owned()).collect();
+    let deny = deny
+        .iter()
+        .map(|s| s.parse().expect("a deny entry"))
+        .collect();
     Map::new(generation, members, Rule::Rendezvous, r, 3, deny)
 }
 
@@ -19,11 +22,11 @@ fn two() -> Vec<Member> {
 // return what the map was built with.
 #[test]
 fn a_valid_map_keeps_what_it_was_given() {
-    let m = build(7, two(), 2, &["old-node"]).unwrap();
+    let m = build(7, two(), 2, &["node old-node"]).unwrap();
     assert_eq!((m.generation(), m.r(), m.min_protocol()), (7, 2, 3));
     assert_eq!(m.rule(), Rule::Rendezvous);
     assert_eq!(m.members(), &two()[..]);
-    assert_eq!(m.deny_list(), ["old-node".to_owned()]);
+    assert_eq!(m.denied(), [DenyEntry::Node("old-node".to_owned())]);
     assert_eq!(m.member(MemberId(2)).map(|x| x.weight), Some(5));
     assert_eq!(m.member(MemberId(9)), None);
     assert_eq!(MemberId(2).to_string(), "m2");
@@ -85,10 +88,20 @@ fn an_empty_address_is_refused() {
     assert!(e.to_string().contains("m2 has no address"));
 }
 
-// Catches: a deny list that names one instance twice.
+// Catches: a deny list that names one thing twice, including two spellings of one serial
+// (they are equal once canonical), while one value under two kinds is two entries.
 #[test]
 fn a_duplicate_deny_entry_is_refused() {
-    let e = build(1, two(), 1, &["a", "b", "a"]).unwrap_err();
-    assert_eq!(e, MapError::DuplicateDeny("a".to_owned()));
-    assert!(e.to_string().contains("\"a\" twice"));
+    let e = build(1, two(), 1, &["node a", "node b", "node a"]).unwrap_err();
+    assert_eq!(
+        e,
+        MapError::DuplicateDenied(DenyEntry::Node("a".to_owned()))
+    );
+    assert!(e.to_string().contains("\"node a\" appears twice"));
+    let e = build(1, two(), 1, &["serial 0A:1B", "serial 1b2c", "serial a1b"]).unwrap_err();
+    assert_eq!(
+        e,
+        MapError::DuplicateDenied(DenyEntry::Serial("a1b".to_owned()))
+    );
+    assert!(build(1, two(), 1, &["node ab", "serial ab"]).is_ok());
 }

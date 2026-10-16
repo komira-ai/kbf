@@ -8,7 +8,7 @@
 //! - a map the domain refuses getting in through the wire;
 //! - the generation moving off field 1.
 
-use kbf_map::{Map, MapError, Member, MemberId, MemberState, Rule};
+use kbf_map::{DenyEntry, Map, MapError, Member, MemberId, MemberState, Rule};
 use kbf_proto::MapDecodeError;
 use kbf_proto::kbf::map::v1 as pb;
 use prost::Message;
@@ -47,7 +47,10 @@ fn map_of_all_states() -> Map {
         Rule::Rendezvous,
         2,
         4,
-        vec!["x".to_owned(), "y".to_owned()],
+        vec![
+            DenyEntry::Serial("a1b".to_owned()),
+            DenyEntry::Node("mac-07".to_owned()),
+        ],
     )
     .unwrap()
 }
@@ -139,4 +142,36 @@ fn the_generation_is_field_one() {
     let bytes = wire.encode_to_vec();
     assert_eq!(&bytes[..2], [0x08, 5]);
     assert_eq!(bytes[2], 0x12, "members are field 2, length-delimited");
+}
+
+// Catches: a denied entry that is not read through the one parser, a spelling kept on the
+// wire after decoding, a malformed entry accepted, or a repeat that differs only in
+// spelling slipping past the duplicate check.
+#[test]
+fn denied_entries_are_parsed_canonically_and_refused_when_bad_or_repeated() {
+    let mut wire = pb::Map::from(&map_of_all_states());
+    assert_eq!(
+        wire.denied,
+        ["serial a1b", "node mac-07"],
+        "the canonical form"
+    );
+    wire.denied = vec!["serial 00:A1:B".to_owned()];
+    let map = Map::try_from(wire.clone()).unwrap();
+    assert_eq!(pb::Map::from(&map).denied, ["serial a1b"]);
+
+    wire.denied = vec!["serial xyz".to_owned()];
+    let e = Map::try_from(wire.clone()).unwrap_err();
+    assert!(matches!(e, MapDecodeError::Denied { .. }), "{e}");
+    assert_eq!(
+        e.to_string(),
+        "denied entry \"serial xyz\": a serial is hex digits, colons allowed: \"xyz\""
+    );
+
+    wire.denied = vec!["serial a1b".to_owned(), "serial 0A:1B".to_owned()];
+    assert_eq!(
+        Map::try_from(wire).unwrap_err(),
+        MapDecodeError::Invalid(MapError::DuplicateDenied(DenyEntry::Serial(
+            "a1b".to_owned()
+        )))
+    );
 }

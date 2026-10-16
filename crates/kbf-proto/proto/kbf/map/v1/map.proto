@@ -9,7 +9,7 @@
 // - Enums are closed. Every enum's zero value is UNSPECIFIED and is refused, and so is any
 //   value this file does not name; it is never read as a default.
 // - A map the domain refuses (generation 0, replication 0 or above the member count, a
-//   repeated member id, a zero weight, an empty address, a repeated deny entry) is refused.
+//   repeated member id, a zero weight, an empty address, a malformed or repeated denied entry) is refused.
 // - `replication` is a uint32 on the wire (proto has no smaller integer); above 255 is
 //   refused.
 //
@@ -32,8 +32,12 @@ message Map {
   uint32 replication = 4;
   // The lowest protocol version a member may speak.
   uint32 min_protocol = 5;
-  // Instance ids the frontend refuses to register.
-  repeated string deny_list = 6;
+  // What the frontend refuses, each as `kind value` in kbf_map::DenyEntry's canonical
+  // form: `serial <lowercase hex, no colons or leading zeros>`, `spki-sha256 <64 lowercase
+  // hex>` or `node <node id>`. The decoder accepts other spellings of the same entry and
+  // refuses a repeat after canonicalizing. Member ids are not named here; they are
+  // assigned at registration.
+  repeated string denied = 6;
 }
 
 message Member {
@@ -59,6 +63,9 @@ enum MemberState {
 
 enum Rule {
   RULE_UNSPECIFIED = 0;
-  // The top R members by weighted rendezvous score.
+  // The top R members by weighted rendezvous score. This value fixes the whole
+  // computation: the hash keys, the byte layout of the hashed key, the score and its
+  // logarithm, bit for bit. Any change to one of them is a NEW rule value, never an edit
+  // of this one, because it remaps every blob.
   RULE_RENDEZVOUS = 1;
 }

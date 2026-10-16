@@ -1,9 +1,9 @@
 //! `kbf.map.v1` and the pure `kbf_map` types, both ways.
 //!
 //! Decoding is strict: an unspecified or unknown enum value, a replication factor that is
-//! not a `u8`, or a map `kbf_map::Map::new` refuses is an error, never a default.
+//! not a `u8`, a denied entry that is not `kind value`, or a map `kbf_map::Map::new` refuses is an error, never a default.
 
-use kbf_map::{Map, MapError, Member, MemberId, MemberState, Rule};
+use kbf_map::{DenyEntry, DenyEntryError, Map, MapError, Member, MemberId, MemberState, Rule};
 
 use crate::kbf::map::v1 as pb;
 
@@ -19,6 +19,14 @@ pub enum MapDecodeError {
     /// A replication factor above 255.
     #[error("replication factor {0} is above 255")]
     Replication(u32),
+    /// A denied entry that is not `kind value` (see `kbf_map::DenyEntry`).
+    #[error("denied entry {entry:?}: {source}")]
+    Denied {
+        /// The string as it came.
+        entry: String,
+        /// What is wrong with it.
+        source: DenyEntryError,
+    },
     /// The map is well formed on the wire and refused by the domain.
     #[error("invalid map: {0}")]
     Invalid(#[from] MapError),
@@ -84,7 +92,7 @@ impl From<&Map> for pb::Map {
             rule: rule.into(),
             replication: u32::from(m.r()),
             min_protocol: m.min_protocol(),
-            deny_list: m.deny_list().to_vec(),
+            denied: m.denied().iter().map(ToString::to_string).collect(),
         }
     }
 }
@@ -104,13 +112,22 @@ impl TryFrom<pb::Map> for Map {
             .into_iter()
             .map(Member::try_from)
             .collect::<Result<Vec<_>, _>>()?;
+        let denied = m
+            .denied
+            .into_iter()
+            .map(|entry| {
+                entry
+                    .parse::<DenyEntry>()
+                    .map_err(|source| MapDecodeError::Denied { entry, source })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(Map::new(
             m.generation,
             members,
             rule,
             r,
             m.min_protocol,
-            m.deny_list,
+            denied,
         )?)
     }
 }

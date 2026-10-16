@@ -48,7 +48,8 @@ pub(crate) fn score(digest: &Digest, id: MemberId, weight: u32) -> f64 {
     f64::from(weight) / neg_ln(u)
 }
 
-/// `-ln(u)` for `u` in (0, 1), to about 1e-15 relative, by `ln(m 2^e) = e ln 2 + 2
+/// `-ln(u)` for `u` in (0, 1), to better than 1e-15 relative (the worst of 300,000 values,
+/// measured against a 60-digit logarithm, was 3.8e-16), by `ln(m 2^e) = e ln 2 + 2
 /// atanh((m-1)/(m+1))` with `m` in [sqrt(1/2), sqrt(2)] and a fixed number of series terms.
 fn neg_ln(u: f64) -> f64 {
     const MANTISSA: u64 = (1 << 52) - 1;
@@ -103,7 +104,8 @@ mod tests {
     }
 
     // Catches: a series too short or a wrong reduction, which skews scores (and the
-    // weights' shares) by more than float noise. Checked against the host's `ln`.
+    // weights' shares) by more than float noise. Checked against the host's `ln`, which
+    // is itself good to an ulp, so 1e-15 (the measured worst case is 3.8e-16).
     #[test]
     fn neg_ln_agrees_with_the_host_logarithm() {
         let mut us = vec![0.5, 0.25, 0.75, 2f64.powi(-53), 1.0 - 2f64.powi(-53)];
@@ -112,8 +114,66 @@ mod tests {
         for u in us.into_iter().filter(|u| *u < 1.0) {
             let (got, want) = (neg_ln(u), -u.ln());
             assert!(
-                ((got - want) / want).abs() < 1e-13,
+                ((got - want) / want).abs() < 1e-15,
                 "u {u}: {got} vs {want}"
+            );
+        }
+    }
+
+    // Catches: any change to `neg_ln` or `score` that moves a single bit, on any platform:
+    // a coefficient, the order of the terms, a fused multiply-add, a different reduction.
+    // The 1e-15 test above would not see a change of one ulp; the owner lists would. The
+    // constants come from a Python script that repeats this module's operations one for
+    // one in Python floats (IEEE binary64): the same split of `u` into exponent and
+    // mantissa, the same reduction by sqrt(2), the same twelve Horner steps from the
+    // highest term down, the same divisions, the same final sum. It does not call
+    // `math.log`; it does check each result against it to 1e-15. test-x86 and test-arm
+    // both run this, so equal bits there are the proof that the two platforms rank alike.
+    //
+    // `u` is `((h >> 12) + 0.5) / 2^52`, so its real extremes are 2^-53 (h >> 12 = 0) and
+    // 1 - 2^-53 (h >> 12 = 2^52 - 1), and both are tested. The score has no way to reach
+    // them from a chosen digest, so the scores below are the pinned cases of the hash test.
+    #[test]
+    fn neg_ln_and_score_are_bit_exact() {
+        let neg_ln_cases: [(f64, u64); 12] = [
+            (1.0 / 9_007_199_254_740_992.0, 0x4042_5e4f_7b27_37fa),
+            (1e-9, 0x4034_b927_f32b_ffb8),
+            (0.001, 0x401b_a18a_998f_ffa0),
+            (0.0625, 0x4006_2e42_fefa_39ef),
+            (0.25, 0x3ff6_2e42_fefa_39ef),
+            (0.3, 0x3ff3_4378_fcbd_a720),
+            (0.5, 0x3fe6_2e42_fefa_39ef),
+            (0.7, 0x3fd6_d3c3_24e1_3f4f),
+            (0.75, 0x3fd2_6962_1134_db92),
+            (0.9, 0x3fba_f8e8_210a_415b),
+            (0.999, 0x3f50_6467_0d97_9b73),
+            (1.0 - 1.0 / 9_007_199_254_740_992.0, 0x3ca0_0000_0000_0000),
+        ];
+        // The extremes of `u`, computed as `score` does from the smallest and the largest
+        // value of `h >> 12`.
+        let u_of = |top: u64| (top as f64 + 0.5) / 4_503_599_627_370_496.0;
+        assert_eq!(u_of(0), neg_ln_cases[0].0);
+        assert_eq!(u_of((1 << 52) - 1), neg_ln_cases[11].0);
+        for (u, want) in neg_ln_cases {
+            assert_eq!(neg_ln(u).to_bits(), want, "neg_ln({u:e})");
+        }
+        let d = |byte: u8, size| digest(byte, size);
+        let ranged = Digest::new(
+            DigestFunction::Sha256,
+            core::array::from_fn(|i| i as u8),
+            4096,
+        );
+        let score_cases: [(Digest, u64, u32, u64); 4] = [
+            (d(0, 0), 11, 1, 0x4027_70dd_845c_ed70),
+            (ranged, 16, 2, 0x4019_c52a_5ac5_51c8),
+            (d(0xff, 1), 14, 3, 0x4003_90c3_a7bf_7381),
+            (d(7, 123_456), 13, u32::MAX, 0x41e4_498d_86b9_a319),
+        ];
+        for (dig, id, weight, want) in score_cases {
+            assert_eq!(
+                score(&dig, MemberId(id), weight).to_bits(),
+                want,
+                "score of m{id} weight {weight}"
             );
         }
     }

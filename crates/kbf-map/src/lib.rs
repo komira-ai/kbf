@@ -4,7 +4,7 @@
 //!
 //! A [`Map`] is a generation number, the members with their address, zone, weight and
 //! [`MemberState`], a placement [`Rule`], the replication factor `r`, the lowest protocol
-//! version a member may speak, and a deny list. [`Map::new`] refuses a map that could
+//! version a member may speak, and the deny entries ([`DenyEntry`]: a certificate serial, a public key hash or a node id). [`Map::new`] refuses a map that could
 //! not place a digest (see [`MapError`]), so every `Map` is usable.
 //!
 //! Owners are the top `r` members by weighted rendezvous score ([`hrw`] says how the
@@ -14,14 +14,16 @@
 //! # Who owns what, by state
 //!
 //! The write owners of a digest are the top `r` members, by score, among those that take
-//! writes. Reads try the *settled* owners (the top `r` among members that hold data)
-//! first, in rank order, then the write owners not yet listed, which are the members that
+//! writes, listed settled members first: a joiner takes writes at once but is never rank 1
+//! (the chain head, the flusher, the `FindMissing` target) while a settled writer exists
+//! (when none exists, a fresh farm, the best-scored joiner is primary: [`Map::write_owners`]).
+//! Reads try the *settled* owners (the top `r` among members that hold data) first, in rank order, then the write owners not yet listed, which are the members that
 //! may not have the data yet. A member in state `Down` is never listed for reading.
 //!
 //! | state        | takes writes                                | held data, read in rank order | read |
 //! |--------------|---------------------------------------------|-------------------------------|------|
-//! | `Joining`    | yes, at once                                | no                            | last |
-//! | `CatchingUp` | yes                                         | no                            | last |
+//! | `Joining`    | yes, at once (not at r = 1), never rank 1   | no                            | last |
+//! | `CatchingUp` | yes, never rank 1                           | no                            | last |
 //! | `Active`     | yes                                         | yes                           | rank order |
 //! | `Draining`   | no: its successor takes its slot at once    | yes                           | rank order, before the successor |
 //! | `Down`       | yes: it keeps its slot for the dwell; the caller skips it and records a repair | yes | never listed |
@@ -40,7 +42,9 @@
 
 #![deny(clippy::disallowed_methods, clippy::disallowed_types)]
 
+mod deny;
 mod hrw;
 mod map;
 
+pub use deny::{DenyEntry, DenyEntryError, normalize_serial};
 pub use map::{Map, MapError, Member, MemberId, MemberState, Rule};

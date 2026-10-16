@@ -1888,6 +1888,7 @@ dependencies = [
  "kbf-front",
  "kbf-invocation",
  "kbf-log",
+ "kbf-map",
  "kbf-mdm-api",
  "kbf-meta",
  "kbf-objstore",

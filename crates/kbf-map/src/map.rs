@@ -5,6 +5,7 @@ use std::fmt;
 
 use kbf_types::Digest;
 
+use crate::deny::DenyEntry;
 use crate::hrw;
 
 /// A member's identity, assigned by the state store at registration (no node picks its
@@ -55,6 +56,12 @@ impl MemberState {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Rule {
     /// The top `r` members by weighted rendezvous score.
+    ///
+    /// This value fixes the whole computation: the SipHash-2-4 keys, the byte layout of
+    /// the hashed key (digest hash, size, member id), the reading of the hash as `u`, the
+    /// score `weight / neg_ln(u)` and `neg_ln` itself, down to the last bit. Any change to
+    /// one of them is a NEW rule value (and a new wire value), never an edit of this one,
+    /// because it remaps every blob in the farm.
     Rendezvous,
 }
 
@@ -99,9 +106,9 @@ pub enum MapError {
     /// A member with no address cannot be dialled.
     #[error("member {0} has no address")]
     EmptyAddr(MemberId),
-    /// A name twice in the deny list.
-    #[error("deny list names {0:?} twice")]
-    DuplicateDeny(String),
+    /// The same deny entry twice, after canonical spelling.
+    #[error("deny entry \"{0}\" appears twice")]
+    DuplicateDenied(DenyEntry),
 }
 
 /// The storage map of one generation.
@@ -112,20 +119,23 @@ pub struct Map {
     rule: Rule,
     r: u8,
     min_protocol: u32,
-    deny_list: Vec<String>,
+    denied: Vec<DenyEntry>,
 }
 
 impl Map {
     /// Builds a map, refusing one that could not place a digest.
     ///
-    /// `deny_list` names the instance ids the frontend refuses to register.
+    /// `denied` lists what the frontend refuses: certificate serials, public key hashes and
+    /// node ids (not member ids, which are assigned at registration, after the certificate
+    /// is checked). Entries are canonical already ([`DenyEntry`]), so a repeat of one is
+    /// refused whatever its original spelling.
     pub fn new(
         generation: u64,
         members: Vec<Member>,
         rule: Rule,
         r: u8,
         min_protocol: u32,
-        deny_list: Vec<String>,
+        denied: Vec<DenyEntry>,
     ) -> Result<Self, MapError> {
         if generation == 0 {
             return Err(MapError::ZeroGeneration);
@@ -151,9 +161,9 @@ impl Map {
                 members: members.len(),
             });
         }
-        let mut denied = BTreeSet::new();
-        if let Some(twice) = deny_list.iter().find(|name| !denied.insert(name.as_str())) {
-            return Err(MapError::DuplicateDeny(twice.clone()));
+        let mut seen = BTreeSet::new();
+        if let Some(twice) = denied.iter().find(|entry| !seen.insert(*entry)) {
+            return Err(MapError::DuplicateDenied(twice.clone()));
         }
         Ok(Self {
             generation,
@@ -161,7 +171,7 @@ impl Map {
             rule,
             r,
             min_protocol,
-            deny_list,
+            denied,
         })
     }
 
@@ -195,10 +205,10 @@ impl Map {
         self.min_protocol
     }
 
-    /// The instance ids refused at registration.
+    /// What the frontend refuses.
     #[must_use]
-    pub fn deny_list(&self) -> &[String] {
-        &self.deny_list
+    pub fn denied(&self) -> &[DenyEntry] {
+        &self.denied
     }
 
     /// The member with this id.
@@ -219,55 +229,97 @@ impl Map {
         scored.into_iter().map(|(_, m)| m).collect()
     }
 
-    /// Who a write of this digest goes to, primary (rank 1) first: the top `r` among the
-    /// members whose state takes writes. A `Down` member keeps its slot, so the caller
-    /// checks [`Member::state`] and records a repair; a `Draining` one never appears.
-    /// Fewer than `r` come back only when too few members take writes.
+    /// Who a write of this digest goes to, primary (rank 1) first.
+    ///
+    /// The owners are the top `r` by score among the members whose state takes writes,
+    /// listed settled members first (best score first), then the joiners (`Joining`,
+    /// `CatchingUp`). A joiner takes writes at once but is never rank 1 while a settled
+    /// writer exists, because rank 1 is the head of the chain, the one flusher and the
+    /// `FindMissing` target, and a joiner holds nothing yet: if the top `r` are all
+    /// joiners, the best settled writer takes the place of the lowest-scored joiner. When
+    /// no settled writer exists at all (a fresh farm), the joiners are the owners and the
+    /// best-scored one is primary; answering nobody would stall the first writes. With
+    /// `r` = 1 the only slot is rank 1, so a joiner owns nothing while a settled writer
+    /// exists; its slice reaches it by the catch-up copy.
+    ///
+    /// A `Down` member keeps its slot, so the caller checks [`Member::state`] and records
+    /// a repair; with `r` = 1 and the only owner `Down` the caller refuses the write with
+    /// `UNAVAILABLE`, as there is no second copy to make. A `Draining` member never
+    /// appears. Fewer than `r` come back only when too few members take writes.
     #[must_use]
     pub fn write_owners(&self, digest: &Digest) -> Vec<MemberId> {
-        self.ranked(digest)
+        self.write_members(digest)
             .into_iter()
-            .filter(|m| m.state.takes_writes())
-            .take(usize::from(self.r))
             .map(|m| m.id)
             .collect()
     }
 
+    fn write_members(&self, digest: &Digest) -> Vec<&Member> {
+        let writers: Vec<&Member> = self
+            .ranked(digest)
+            .into_iter()
+            .filter(|m| m.state.takes_writes())
+            .collect();
+        let mut owners: Vec<&Member> = writers.iter().take(usize::from(self.r)).copied().collect();
+        if !owners.iter().any(|m| m.state.is_settled())
+            && let Some(settled) = writers.iter().find(|m| m.state.is_settled())
+        {
+            owners.pop();
+            owners.push(settled);
+        }
+        // Stable: settled members first, each group in score order.
+        owners.sort_by_key(|m| !m.state.is_settled());
+        owners
+    }
+
     /// The order to try members when reading this digest in this generation: the top `r`
     /// settled owners in rank order, then the write owners not yet listed (the members
-    /// that may not hold it yet, `Joining` and `CatchingUp` among them). `Down` members
-    /// are left out.
+    /// that may not hold it yet, `Joining` and `CatchingUp` among them, last). `Down`
+    /// members are left out: with every owner `Down` the list is empty and the caller
+    /// treats the blob as unavailable (`UNAVAILABLE`), not as missing.
     #[must_use]
     pub fn read_order(&self, digest: &Digest) -> Vec<MemberId> {
-        let ranked = self.ranked(digest);
+        self.read_members(digest)
+            .into_iter()
+            .map(|m| m.id)
+            .collect()
+    }
+
+    fn read_members(&self, digest: &Digest) -> Vec<&Member> {
         let r = usize::from(self.r);
-        let settled = ranked.iter().filter(|m| m.state.is_settled()).take(r);
-        let writers = ranked.iter().filter(|m| m.state.takes_writes()).take(r);
-        let mut order = Vec::new();
+        let settled: Vec<&Member> = self
+            .ranked(digest)
+            .into_iter()
+            .filter(|m| m.state.is_settled())
+            .take(r)
+            .collect();
+        let mut order: Vec<&Member> = Vec::new();
         for m in settled
-            .chain(writers)
+            .into_iter()
+            .chain(self.write_members(digest))
             .filter(|m| m.state != MemberState::Down)
         {
-            if !order.contains(&m.id) {
-                order.push(m.id);
+            if !order.iter().any(|seen| seen.id == m.id) {
+                order.push(m);
             }
         }
         order
     }
 
     /// [`Map::read_order`], then the previous generation's read order without the members
-    /// already listed. Ids from `previous` may name members this map no longer has; look
-    /// those up in `previous`.
+    /// already listed. The members come back as the map that holds them gives them: one
+    /// that left between the generations is the `previous` map's `Member`, with the
+    /// address it had there.
     #[must_use]
-    pub fn read_order_with_previous(
-        &self,
-        previous: Option<&Map>,
+    pub fn read_order_with_previous<'a>(
+        &'a self,
+        previous: Option<&'a Map>,
         digest: &Digest,
-    ) -> Vec<MemberId> {
-        let mut order = self.read_order(digest);
-        for id in previous.map_or_else(Vec::new, |p| p.read_order(digest)) {
-            if !order.contains(&id) {
-                order.push(id);
+    ) -> Vec<&'a Member> {
+        let mut order = self.read_members(digest);
+        for m in previous.map_or_else(Vec::new, |p| p.read_members(digest)) {
+            if !order.iter().any(|seen| seen.id == m.id) {
+                order.push(m);
             }
         }
         order
