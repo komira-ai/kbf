@@ -73,10 +73,14 @@ GET /v1/invocations/{id}/failures?page_size=20
      "outcome": {"ok": {"exit_code": 1}},
      "failure": null,
      "attempts": [
-       {"worker": "node-a", "queued_micros": 1200, "run_micros": 900000,
-        "end": {"requeue": "silent"}},
-       {"worker": "node-b", "queued_micros": 800, "run_micros": 1500000,
-        "end": {"result": "ok"}}],
+       {"lease": "3.4811", "worker": "node-a",
+        "queued": "...Z", "granted": "...Z", "started": "...Z", "ended": "...Z",
+        "end": {"requeue": "silent"},
+        "run_id": "...", "href": "/v1/runs/...", "...": "the rest of ui-data.md 6.3"},
+       {"lease": "3.4812", "worker": "node-b",
+        "queued": "...Z", "granted": "...Z", "started": "...Z", "ended": "...Z",
+        "end": {"result": "ok"},
+        "run_id": "...", "href": "/v1/runs/...", "...": "the rest of ui-data.md 6.3"}],
      "command": {"arguments": ["cc", "-c", "a.c", "-o", "out/a.o"],
                  "environment_names": ["PATH", "LANG"], "working_directory": "",
                  "platform": {"OSFamily": "linux"}, "timeout_micros": null,
@@ -99,8 +103,11 @@ GET /v1/invocations/{id}/failures?page_size=20
   pressure, missing input, lost) with the daemon's reason text, capped at 1 KiB (3.2):
   for an INFRA failure, the farm's own reason (`null`, as here, for an action that ran
   to a non-zero exit). `stdout` or `stderr` is `null` when the result has none.
-  `attempts` lists every lease with its worker, its queue time (queued to granted) and
-  run time (granted to ended), and how it ended: the reruns and why.
+  `attempts` lists every lease in the attempt shape of `ui-data.md` 6.3 (amended
+  there): the built keys of `actions/{digest}` (lease, worker, RFC 3339 `queued`,
+  `granted`, `started`, `ended`, `end`), then `run_id` with its `href`, the memory and
+  usage fields; queue time is `granted - queued` and run time `ended - granted`, derived
+  from those strings, not separate keys. How each ended: the reruns and why.
 - **The command** is read when the page is answered, from the Action blob (its
   platform, its timeout, the Command digest) and the Command blob (arguments,
   environment variable names, working directory, output paths). The record keeps
@@ -108,7 +115,8 @@ GET /v1/invocations/{id}/failures?page_size=20
   either blob has left the CAS, or when the client never uploaded the Action. Values
   of environment variables are never put in the answer: they are where a secret most
   often is, and an agent that needs them reads the Command blob by its link (4.2
-  `blobs`) under the same authorizer. The node is each attempt's `worker`;
+  `blobs`), which also needs the `commands.getRaw` authority of `ui-data.md` 8
+  (never granted by open mode). The node is each attempt's `worker`;
   `GET /v1/nodes` describes it.
 - **Outputs**: the action's output files and directories as its row lists them (3.2),
   each with its digest, `available` and `href`, as in 4.2. Only a failed action's
