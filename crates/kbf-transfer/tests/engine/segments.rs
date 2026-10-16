@@ -913,19 +913,38 @@ fn sparse_record(name: &str, size: u64) -> Record {
     }
 }
 
-/// Catches the remote plane refusing a blob the local plane stores: the largest blob is
-/// 5 GiB on every path, so a 1 GiB + 1 MiB output (over the old 1 GiB limit) is sent
-/// as segments and is present after.
+/// Catches a server without a write tier holding a large record whole in memory, and an
+/// engine that then sends it by ByteStream instead (which would hold it whole): a
+/// record one byte over 16 MiB (`MAX_UNSTAGED_BLOB_BYTES`) is refused with the reason
+/// (no write tier has room; large blobs need the hot store), nothing is written by
+/// ByteStream and nothing is stored; a record of exactly 16 MiB is stored.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_blob_over_1_gib_goes_through_the_remote_plane() {
+async fn without_a_tier_a_record_over_16_mib_is_refused_not_buffered() {
     let front = Front::start(Mode::Serve).await;
-    let record = sparse_record("over-1-gib", (1 << 30) + (1 << 20));
+    let record = sparse_record("over-16-mib", (16 << 20) + 1);
+    let digest = proto_digest(&record.digest);
+    let why = front
+        .engine
+        .put_records(vec![record])
+        .await
+        .expect_err("refused");
+    let why = why.to_string();
+    assert!(why.contains("is over 16777216 bytes"), "{why}");
+    assert!(why.contains("no write tier has room"), "{why}");
+    assert!(why.contains("--hot-store"), "{why}");
+    assert_eq!(
+        front.cache.metrics().write.total.get(),
+        0,
+        "no ByteStream write"
+    );
+    assert!(!front.all_present(&[digest]).await);
+    let record = sparse_record("at-16-mib", 16 << 20);
     let digest = proto_digest(&record.digest);
     front
         .engine
         .put_records(vec![record])
         .await
-        .expect("put records");
+        .expect("stored from memory");
     assert!(front.all_present(&[digest]).await);
 }
 

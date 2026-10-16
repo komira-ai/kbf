@@ -113,13 +113,14 @@ fn scratch(name: &str) -> PathBuf {
 }
 
 /// The plane over a server started in `runtime` on the stores under `dir`, with a
-/// write tier. The server is not served: its flusher, which reads a staged block back
-/// whole to PUT it (a cost of the flush, after the commit), does not run while the
-/// upload path is measured.
+/// write tier, and the server's store. The server's handle is dropped, which stops its
+/// flusher: the flusher reads a staged block back whole to PUT it (a cost of the flush,
+/// after the commit, until multipart object-store PUTs exist), and it must not run
+/// while the upload path is measured. The store works on without the handle.
 fn plane(
     runtime: &tokio::runtime::Runtime,
     dir: &Path,
-) -> (Arc<LocalDataPlane>, kbf_server::ServerHandle) {
+) -> (Arc<LocalDataPlane>, kbf_server::LocalStore) {
     let n = STARTED.fetch_add(1, Ordering::SeqCst);
     let argv = vec![
         "kbf-server".to_owned(),
@@ -138,8 +139,10 @@ fn plane(
     runtime.block_on(async {
         let never = || Ok(std::future::pending::<()>());
         let server = kbf_server::start(&args, never).await.expect("start");
-        let plane = LocalDataPlane::new(server.local(), tokio::runtime::Handle::current());
-        (Arc::new(plane), server)
+        let store = server.local();
+        drop(server);
+        let plane = LocalDataPlane::new(store.clone(), tokio::runtime::Handle::current());
+        (Arc::new(plane), store)
     })
 }
 
@@ -153,7 +156,7 @@ fn store_one_large_output(name: &str, size: u64) -> usize {
         .enable_all()
         .build()
         .expect("runtime");
-    let (plane, _server) = plane(&runtime, &dir.join("server"));
+    let (plane, _) = plane(&runtime, &dir.join("server"));
     let upper = dir.join("upper");
     std::fs::create_dir_all(upper.join("out")).expect("mkdir");
     std::fs::File::create(upper.join("out/large"))
@@ -188,5 +191,94 @@ fn store_one_large_output(name: &str, size: u64) -> usize {
 #[test]
 fn a_2_gib_output_streams_onto_the_tier_in_bounded_memory() {
     let peak = store_one_large_output("tier-2g", 2 << 30);
+    println!("a 2 GiB output: {peak} bytes live at once at most");
+    assert!(peak < BOUND, "{peak} bytes live at once");
+}
+
+/// Uploads one record of `size` zero bytes through the server's `Segments` handlers
+/// (`Begin`, a `PutRange` per 4 MiB, `Commit`), the calls and messages a remote daemon's
+/// transfer engine sends over the worker listener, to a server with a write tier; returns
+/// the most bytes live at once while it did, and checks the record is held after.
+fn upload_one_large_record(name: &str, size: u64) -> usize {
+    use kbf_proto::worker::{BeginRequest, CommitRequest, PutRangeRequest, UploadSegment};
+    use kbf_transfer::{
+        MAX_RANGE_BYTES, MAX_UPLOAD_RECORDS, Record, RecordHasher, SEGMENT_UPLOAD_BYTES, Source,
+        plan,
+    };
+    use tonic::Request;
+
+    let dir = scratch(name);
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let (_, store) = plane(&runtime, &dir.join("server"));
+    let segments = store.segments();
+    let mut hasher = RecordHasher::new();
+    let zeros = vec![0u8; CHUNK];
+    for _ in 0..size / CHUNK as u64 {
+        hasher.update(&zeros);
+    }
+    drop(zeros);
+    let (digest, crc32c) = hasher.finish();
+    let record = Record {
+        digest,
+        crc32c,
+        source: Source::Bytes(bytes::Bytes::new()),
+    };
+    let uploads = plan(
+        &[record],
+        kbf_segments::MAX_SEGMENT_BYTES,
+        SEGMENT_UPLOAD_BYTES,
+        MAX_UPLOAD_RECORDS,
+    );
+    let [upload] = &uploads[..] else {
+        panic!("one upload");
+    };
+    let [segment] = &upload[..] else {
+        panic!("one segment");
+    };
+    let (uploaded, peak) = peak_during(|| {
+        runtime.block_on(async {
+            let begin = BeginRequest {
+                segments: vec![UploadSegment {
+                    length: segment.length(),
+                    footer: segment.footer(),
+                }],
+            };
+            let id = segments
+                .begin(Request::new(begin))
+                .await?
+                .into_inner()
+                .upload;
+            for (start, end) in segment.ranges(MAX_RANGE_BYTES) {
+                let range = PutRangeRequest {
+                    upload: id,
+                    segment: 0,
+                    offset: start,
+                    bytes: vec![0; usize::try_from(end - start).expect("a range")],
+                };
+                segments.put_range(Request::new(range)).await?;
+            }
+            let commit = CommitRequest { upload: id };
+            segments.commit(Request::new(commit)).await.map(drop)
+        })
+    });
+    uploaded.expect("uploaded");
+    let missing = runtime.block_on(store.find_missing(&[digest]));
+    assert!(missing.expect("find").is_empty(), "not held");
+    let _ = std::fs::remove_dir_all(&dir);
+    peak
+}
+
+/// Catches a remote upload held whole in the server until its commit (the segment's
+/// buffer): a 2 GiB record uploaded through the `Segments` handlers onto the write tier
+/// is held with no more than [`BOUND`] live at once (the ranges in flight, written
+/// through to the tier as they arrive).
+#[test]
+fn a_2_gib_remote_upload_is_written_through_to_the_tier_in_bounded_memory() {
+    let peak = upload_one_large_record("remote-2g", 2 << 30);
+    println!("a 2 GiB remote upload: {peak} bytes live at once at most");
     assert!(peak < BOUND, "{peak} bytes live at once");
 }
