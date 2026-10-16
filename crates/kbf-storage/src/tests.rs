@@ -89,8 +89,10 @@ fn a_stale_map_status_carries_the_nodes_generation() {
     assert_eq!(header.to_str().expect("ASCII"), "7");
     assert!(status.message().starts_with("STALE_MAP"), "{status:?}");
     let refused = tonic::Status::from(StorageError::from(ActionWriteError::Absent(digest(1))));
-    assert!(refused
-        .metadata()
-        .get(crate::service::MAP_GENERATION_HEADER)
-        .is_none());
+    assert!(
+        refused
+            .metadata()
+            .get(crate::service::MAP_GENERATION_HEADER)
+            .is_none()
+    );
 }
