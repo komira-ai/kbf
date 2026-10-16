@@ -86,9 +86,7 @@ use kbf_map::{Map, MemberId};
 pub(crate) use chain::Plan;
 pub use chain::{Chain, ChainConfig};
 pub use leg::LEG_HEADER;
-#[cfg(test)]
-pub(crate) use leg::Leg;
-pub(crate) use leg::ReplicaLeg;
+pub(crate) use leg::{Leg, ReplicaLeg};
 pub use peers::Peers;
 pub(crate) use staging::Staging;
 

@@ -7,7 +7,9 @@ use std::time::Duration;
 use kbf_map::{Member, MemberId, MemberState};
 use kbf_types::Digest;
 
-use super::leg::ReplicaLeg;
+use tonic::transport::Channel;
+
+use super::leg::{Leg, ReplicaLeg};
 use super::peers::Peers;
 use super::{MapSource, View, check_generation};
 use crate::StorageError;
@@ -85,6 +87,33 @@ impl Chain {
             repairs,
             config,
         }
+    }
+
+    /// The view this node holds now, if it has one.
+    pub(crate) fn current(&self) -> Option<View> {
+        self.source.current()
+    }
+
+    /// The channel to the peer dialled at `addr`.
+    ///
+    /// # Errors
+    /// [`StorageError::Internal`] if `addr` is not one a channel can be made to.
+    pub(crate) fn peer(&self, addr: &str) -> Result<Channel, StorageError> {
+        self.peers.channel(addr)
+    }
+
+    /// A copy of a blob to `owner`, sent by this node whether or not it owns the blob.
+    ///
+    /// # Errors
+    /// [`StorageError::Internal`] if `owner` has no address a channel can be made to.
+    pub(crate) fn open_copy(&self, view: &View, owner: &Member) -> Result<Leg, StorageError> {
+        Ok(Leg::open(
+            self.peers.channel(&owner.addr)?,
+            view.map.generation(),
+            view.me,
+            self.config.stall,
+            self.config.commit,
+        ))
     }
 
     /// The map a write routed by generation `requested` is judged by: `None` for a node

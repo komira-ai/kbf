@@ -6,12 +6,15 @@
 //! record is the whole difference between a one-copy write that is acknowledged and one
 //! that is a silent loss of redundancy, so it is kept in the [`Journal`]: a file on the
 //! node's own disk, made durable before the write is acknowledged and kept until the
-//! second copy exists.
+//! second copy exists. [`Repairs`] is the journal behind an async interface and the seam to
+//! the frontend ([`RepairLedger`]); [`RepairWorker`] makes the copies owed, to the owners
+//! the map names now, when they can take them, and only then settles the debt.
 
 mod journal;
 mod ledger;
 #[cfg(test)]
 mod tests;
+mod worker;
 
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
@@ -20,6 +23,7 @@ use kbf_map::MemberId;
 use kbf_store::Fs;
 use kbf_types::Digest;
 pub use ledger::{NoLedger, RepairLedger};
+pub use worker::{Pass, RepairConfig, RepairWorker};
 
 use crate::StorageError;
 
@@ -38,6 +42,7 @@ pub struct RepairRecord {
 /// What [`Repairs`] needs of a journal, so it need not be generic over the disk it is on.
 trait Debts: Send {
     fn owed(&mut self, record: RepairRecord) -> Result<(), JournalError>;
+    fn done(&mut self, digest: &Digest) -> Result<(), JournalError>;
     fn records(&self) -> Vec<RepairRecord>;
 }
 
@@ -47,6 +52,10 @@ where
 {
     fn owed(&mut self, record: RepairRecord) -> Result<(), JournalError> {
         Journal::owed(self, record)
+    }
+
+    fn done(&mut self, digest: &Digest) -> Result<(), JournalError> {
+        Journal::done(self, digest)
     }
 
     fn records(&self) -> Vec<RepairRecord> {
@@ -106,6 +115,36 @@ impl Repairs {
         let ledger = Arc::clone(&self.ledger);
         tokio::spawn(async move { ledger.owed(&record).await });
         Ok(())
+    }
+
+    /// Records that `digest` is no longer owed: every owner holds it. Not synced (a debt that
+    /// returns after a power cut is settled again at the cost of a check). The ledger is
+    /// told afterwards, off to the side.
+    ///
+    /// # Errors
+    /// [`StorageError::Unavailable`] if the journal could not write it (the debt stays).
+    pub(crate) async fn settle(&self, digest: &Digest) -> Result<(), StorageError> {
+        let debts = Arc::clone(&self.debts);
+        let settled = *digest;
+        tokio::task::spawn_blocking(move || Self::lock(&debts).done(&settled))
+            .await
+            .map_err(|e| StorageError::Internal(format!("the repair journal: {e}")))?
+            .map_err(|e| StorageError::Unavailable(Arc::new(e)))?;
+        let ledger = Arc::clone(&self.ledger);
+        tokio::spawn(async move { ledger.settled(&settled).await });
+        Ok(())
+    }
+
+    /// Tells the ledger of every copy owed, off to the side: a frontend that was away, or
+    /// lost what it knew, learns it again.
+    pub(crate) fn announce(&self) {
+        let records = self.open_records();
+        let ledger = Arc::clone(&self.ledger);
+        tokio::spawn(async move {
+            for record in records {
+                ledger.owed(&record).await;
+            }
+        });
     }
 
     /// Every copy owed now, in digest order.
