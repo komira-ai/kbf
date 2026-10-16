@@ -1,5 +1,4 @@
-//! What a frontend does with the state store `bind_frontend` cannot yet open: this build
-//! has no backend, so no start reaches the code that hands an open store to `/readyz`.
+//! What a frontend hands `/readyz` from the state store `bind_frontend` opened.
 
 use std::sync::Arc;
 
