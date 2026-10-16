@@ -139,11 +139,9 @@ fn stale_generation(status: &Status) -> Option<u64> {
     }
     status
         .metadata()
-        .get(MAP_GENERATION_HEADER)?
-        .to_str()
-        .ok()?
-        .parse()
-        .ok()
+        .get(MAP_GENERATION_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|text| text.parse().ok())
 }
 
 /// [`lift`] for a call that is not about one blob.
