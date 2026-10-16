@@ -643,6 +643,7 @@ pub fn c8_bounded_range_scan<B: Backend>(backend: &B) {
     c8_reverse(&store);
     c8_upper(&store);
     c8_concurrent(&store);
+    c8_empty_prefix(&store);
 }
 
 /// C8 forward: the limit, the lower bound, the prefix and the token.
@@ -888,5 +889,29 @@ fn c8_concurrent<S: Store>(store: &S) {
     assert_eq!(
         rest.rows[1].1.value, b"updated",
         "C8 concurrent value: a page shows the value committed before it was read"
+    );
+}
+
+/// C8 empty prefix: every key is under it and no string follows them all, so the span
+/// has no upper bound and a scan runs to the end of the store, or from it in reverse.
+fn c8_empty_prefix<S: Store>(store: &S) {
+    let everything = ScanRange::new("", NonZeroUsize::new(8).expect("positive"));
+    let tail = ScanRange {
+        lower: Bound::Excluded("c8/\u{e9}"),
+        ..everything
+    };
+    assert_eq!(
+        keys_of(&page(store, tail)),
+        ["c80", "c8~"],
+        "C8 empty prefix: a forward scan runs from its lower bound to the last key in the store"
+    );
+    let last = ScanRange {
+        limit: NonZeroUsize::MIN,
+        ..everything.reverse()
+    };
+    assert_eq!(
+        keys_of(&page(store, last)),
+        ["c8~"],
+        "C8 empty prefix: a reverse scan begins at the last key in the store"
     );
 }
