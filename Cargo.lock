@@ -1948,6 +1948,7 @@ dependencies = [
  "tokio",
  "tonic",
  "tracing",
+ "tracing-core",
  "tracing-subscriber",
  "x509-parser",
 ]

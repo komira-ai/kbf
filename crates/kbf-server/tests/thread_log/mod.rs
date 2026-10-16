@@ -26,6 +26,7 @@ impl std::io::Write for ThreadLog {
 /// Installs the global subscriber (info and above) once. `in_window` runs after the
 /// subscriber's dispatcher is registered and before it is the global default, the
 /// window `tracing::subscriber::set_global_default` also has; `logged` passes nothing.
+/// Every call then re-evaluates the callsites, so one reached in that window logs.
 pub fn install_with(in_window: impl FnOnce()) {
     static INSTALLED: Once = Once::new();
     INSTALLED.call_once(|| {
@@ -37,6 +38,11 @@ pub fn install_with(in_window: impl FnOnce()) {
         in_window();
         tracing::dispatcher::set_global_default(dispatch).expect("one global subscriber");
     });
+    // A callsite another thread first reached in that window asked no subscriber and
+    // cached "never", and nothing asks again unless told to: re-evaluate every callsite
+    // against the subscriber now that it is the global default, on every call (a
+    // thread caught mid-registration in the window may store its "never" late).
+    tracing_core::callsite::rebuild_interest_cache();
 }
 
 /// Log lines written on this thread while `f` runs, at info and above.
