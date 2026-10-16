@@ -749,6 +749,7 @@ mod tests {
     /// a directory of N objects would open N files per page, N squared over the
     /// listing): 7 keys in pages of 2 take one walk. A listing interleaved with one of
     /// another prefix walks again rather than cutting its pages from the other's keys,
+    /// a token of a listing no longer kept or used under another prefix walks again,
     /// and a listing that ended keeps nothing for the next.
     #[tokio::test]
     async fn a_paged_listing_reads_the_headers_once() {
@@ -783,6 +784,23 @@ mod tests {
         let keys: Vec<&str> = second.objects.iter().map(|o| o.key.as_str()).collect();
         assert_eq!(keys, ["a/2", "a/3"]);
         assert_eq!(walks(), 4);
+
+        // A token of a listing no longer kept (here, of a's first walk) walks again,
+        // and so does a token of the kept listing used under another prefix.
+        let stale = store
+            .list(&a, first.next.as_ref(), size)
+            .await
+            .expect("list");
+        let keys: Vec<&str> = stale.objects.iter().map(|o| o.key.as_str()).collect();
+        assert_eq!(keys, ["a/2", "a/3"]);
+        assert_eq!(walks(), 5);
+        let elsewhere = store
+            .list(&b, stale.next.as_ref(), size)
+            .await
+            .expect("list");
+        let keys: Vec<&str> = elsewhere.objects.iter().map(|o| o.key.as_str()).collect();
+        assert_eq!(keys, ["b/0", "b/1"]);
+        assert_eq!(walks(), 6);
         drop(store);
         fs::remove_dir_all(&dir).expect("remove");
     }

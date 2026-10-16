@@ -407,9 +407,10 @@ async fn list_start_after<S: ObjectStore>(store: &S, prefix: &KeyPrefix) -> Chec
 
 async fn list_past_page_cap<S: ObjectStore>(store: &S, prefix: &KeyPrefix) -> CheckResult {
     let dir = child(prefix, "many/")?;
-    let want = (0..PAST_PAGE_CAP)
-        .map(|i| key(&dir, &format!("m{i:04}")))
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut want = Vec::with_capacity(PAST_PAGE_CAP);
+    for i in 0..PAST_PAGE_CAP {
+        want.push(key(&dir, &format!("m{i:04}"))?);
+    }
     let body = pattern(1, 5);
     stream::iter(want.iter().map(|k| put(store, k, &body)))
         .buffer_unordered(PAST_PAGE_CAP_PUTS)
