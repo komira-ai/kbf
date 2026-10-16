@@ -101,12 +101,42 @@ fn the_built_modes_are_daemon_and_all_in_one() {
 #[test]
 fn each_planted_defect_turns_its_rule_red() {
     let c = config();
-    let rows: [(Mode, &str, &str, &str); 10] = [
+    let rows: [(Mode, &str, &str, &str); 15] = [
         (
             Mode::Daemon,
             "Environment=XDG_RUNTIME_DIR=/run/user/@KBF_UID@\n",
             "Environment=XDG_RUNTIME_DIR=/run/user/@KBF_UID@\nEnvironmentFile=-@KBF_ETC@/s3.env\n",
             "FAIL credential: kbf-daemon.service gives a build node the cold store's key (EnvironmentFile=-/etc/kbf/s3.env): a build node holds no credential, and its builds run as its user",
+        ),
+        (
+            Mode::AllInOne,
+            "Environment=XDG_RUNTIME_DIR=/run/user/@KBF_UID@\n",
+            "Environment=XDG_RUNTIME_DIR=/run/user/@KBF_UID@\nEnvironmentFile=@KBF_ETC@/s3.env\n",
+            "FAIL credential: kbf-all-in-one.service gives a build node the cold store's key (EnvironmentFile=/etc/kbf/s3.env): a build node holds no credential, and its builds run as its user",
+        ),
+        (
+            Mode::Daemon,
+            "Environment=XDG_RUNTIME_DIR=/run/user/@KBF_UID@\n",
+            "Environment=XDG_RUNTIME_DIR=/run/user/@KBF_UID@ \"AWS_SESSION_TOKEN=a b\"\n",
+            "FAIL credential: kbf-daemon.service gives a build node the cold store's key (Environment= sets AWS_SESSION_TOKEN): a build node holds no credential, and its builds run as its user",
+        ),
+        (
+            Mode::Daemon,
+            "Environment=XDG_RUNTIME_DIR=/run/user/@KBF_UID@\n",
+            "Environment=XDG_RUNTIME_DIR=/run/user/@KBF_UID@\nEnvironmentFile=-@KBF_ETC@/*.env\n",
+            "FAIL credential: kbf-daemon.service gives a build node the cold store's key (EnvironmentFile=-/etc/kbf/*.env): a build node holds no credential, and its builds run as its user",
+        ),
+        (
+            Mode::StorageAndDaemon,
+            "Environment=XDG_RUNTIME_DIR=/run/user/@KBF_UID@\n",
+            "Environment=XDG_RUNTIME_DIR=/run/user/@KBF_UID@\nLoadCredential=s3:@KBF_ETC@/s3.env\n",
+            "FAIL credential: kbf-storage-and-daemon.service gives a build node the cold store's key (LoadCredential=s3:/etc/kbf/s3.env, a systemd credential): a build node holds no credential, and its builds run as its user",
+        ),
+        (
+            Mode::Daemon,
+            "Delegate=yes\n",
+            "Delegate=yes\nDisableControllers=cpuset\n",
+            "FAIL delegate: kbf-daemon.service disables cpuset for its own cgroups (DisableControllers=): the daemon needs cpu, cpuset, memory and pids in supervisor/ and actions/",
         ),
         (
             Mode::StorageAndDaemon,
@@ -295,6 +325,26 @@ fn host(answer: io::Result<Output>) -> (FakeExec, Rc<RefCell<Vec<Vec<String>>>>)
     (exec, asked)
 }
 
+/// [`check_on_host`] on the unit `text` of `mode` alone, beside the rendered slice.
+fn on_host<E: Exec>(
+    exec: &E,
+    c: &LinuxConfig,
+    mode: Mode,
+    text: &str,
+    kbf_bin: Option<&HostPath>,
+) -> Result<Report, ParseError> {
+    let unit = UnitText::new(mode.unit_name(), text);
+    check_on_host(exec, c, mode, &unit, &slice(c), true, kbf_bin)
+}
+
+/// The rendered `kbf.slice`.
+fn slice(c: &LinuxConfig) -> UnitText {
+    let text = render_converged(c, Some(1500), &Templates::BUILT_IN)
+        .expect("renders")
+        .slice;
+    UnitText::new(SLICE, text)
+}
+
 fn kbf_at(exec: &mut FakeExec, path: &str) {
     let entry = Entry::File {
         perms: Perms::new(0o755),
@@ -321,7 +371,7 @@ fn the_parse_rule_runs_kbf_check_args_on_a_built_modes_flags() {
     let given = HostPath::new("/opt/kbf/bin/kbf").expect("absolute");
 
     let (exec, asked) = host(Ok(reply(0, "", "")));
-    let r = check_on_host(&exec, &c, Mode::Daemon, &text, true, Some(&given)).expect("runs");
+    let r = on_host(&exec, &c, Mode::Daemon, &text, Some(&given)).expect("runs");
     assert_eq!((lines(&r), r.notes.len()), (Vec::<String>::new(), 0));
     let mut want = vec![
         "/opt/kbf/bin/kbf".to_owned(),
@@ -334,7 +384,7 @@ fn the_parse_rule_runs_kbf_check_args_on_a_built_modes_flags() {
     let refusal = "error: unexpected argument '--bogus-flag' found\n\nUsage: kbf daemon\n";
     let (mut exec, asked) = host(Ok(reply(2, "", refusal)));
     kbf_at(&mut exec, "/usr/local/bin/kbf");
-    let r = check_on_host(&exec, &c, Mode::Daemon, &text, true, None).expect("runs");
+    let r = on_host(&exec, &c, Mode::Daemon, &text, None).expect("runs");
     assert_eq!(
         lines(&r),
         [
@@ -350,7 +400,7 @@ fn the_parse_rule_runs_kbf_check_args_on_a_built_modes_flags() {
         stderr: Vec::new(),
     };
     let (exec, _) = host(Ok(killed));
-    let r = check_on_host(&exec, &c, Mode::Daemon, &text, true, Some(&given)).expect("runs");
+    let r = on_host(&exec, &c, Mode::Daemon, &text, Some(&given)).expect("runs");
     assert_eq!(
         lines(&r),
         [
@@ -370,7 +420,7 @@ fn the_parse_rule_runs_kbf_check_args_on_a_built_modes_flags() {
         ),
     ] {
         let (exec, asked) = host(Ok(reply(2, "", "never asked")));
-        let r = check_on_host(&exec, &c, mode, &text, true, Some(&given)).expect("runs");
+        let r = on_host(&exec, &c, mode, &text, Some(&given)).expect("runs");
         assert_eq!(r.notes.len(), 0, "{mode}");
         assert!(asked.borrow().is_empty(), "{mode}");
     }
@@ -384,11 +434,12 @@ fn the_parse_rule_is_skipped_without_kbf_and_refused_when_kbf_cannot_run() {
     let c = config();
     let text = render(&c, Some(1500), Mode::AllInOne).expect("renders");
     let (exec, asked) = host(Ok(reply(0, "", "")));
-    let r = check_on_host(&exec, &c, Mode::AllInOne, &text, true, None).expect("runs");
+    let r = on_host(&exec, &c, Mode::AllInOne, &text, None).expect("runs");
     assert_eq!(lines(&r), Vec::<String>::new());
     assert_eq!(
         r.notes,
         [
+            TRUSTED_NOTE,
             "SKIP parse: no kbf binary at /usr/local/bin/kbf, so the flags of kbf all-in-one were not parsed; give --kbf-bin PATH to parse them with another"
         ]
     );
@@ -400,20 +451,22 @@ fn the_parse_rule_is_skipped_without_kbf_and_refused_when_kbf_cannot_run() {
 
     let given = HostPath::new("/nonexistent/kbf").expect("absolute");
     let (exec, _) = host(Err(io::Error::from(io::ErrorKind::NotFound)));
-    let e = check_on_host(&exec, &c, Mode::AllInOne, &text, true, Some(&given)).err();
+    let e = on_host(&exec, &c, Mode::AllInOne, &text, Some(&given)).err();
     assert_eq!(
         e.map(|e| e.to_string()).as_deref(),
         Some("cannot run /nonexistent/kbf check-args: entity not found")
     );
-    let e = check_on_host(
+    let e = on_host(
         &exec,
         &c,
         Mode::AllInOne,
         "[Service]\nSlice kbf.slice\n",
-        true,
         None,
     );
-    assert!(matches!(e, Err(ParseError::Unit(_))), "{e:?}");
+    assert!(
+        matches!(&e, Err(ParseError::Unit { name, .. }) if name == "kbf-all-in-one.service"),
+        "{e:?}"
+    );
 }
 
 /// Catches a `Delegate=` read other than systemd reads it: a later list adding to an
@@ -430,6 +483,18 @@ fn delegate_is_read_as_systemd_reads_it() {
         ("Delegate=yes\nDelegate=\nDelegate=cpu memory pids\n", false),
         ("Delegate=cpu cpuset memory pids\nDelegate=off\n", false),
         ("Delegate=cpu cpuset\n", false),
+        // A list after `yes` adds to every controller: cpuset is kept (systemd's
+        // config_parse_delegate ORs the list into the mask `yes` set).
+        ("Delegate=yes\nDelegate=memory\n", true),
+        ("Delegate=YES\n", true),
+        ("Delegate=On\n", true),
+        ("Delegate=yes\nDelegate=no\nDelegate=memory\n", false),
+        ("Delegate=yes\nDisableControllers=cpuset\n", false),
+        ("Delegate=yes\nDisableControllers=io\n", true),
+        (
+            "Delegate=yes\nDisableControllers=cpuset\nDisableControllers=\n",
+            true,
+        ),
     ] {
         let text = base.replace("Delegate=yes\n", lines_);
         let r = check(&c, Mode::Daemon, &text, true).expect("a unit");
@@ -452,11 +517,7 @@ fn the_credential_rule_names_the_file_the_storage_units_read() {
     let line = format!("EnvironmentFile=@KBF_ETC@/{COLD_STORE_KEY_FILE}\n");
     for mode in Mode::ALL {
         let has = mode.template().contains(&line);
-        assert_eq!(
-            has,
-            matches!(mode, Mode::Storage | Mode::AllInOne),
-            "{mode}"
-        );
+        assert_eq!(has, matches!(mode, Mode::Storage), "{mode}");
         if has {
             let r = check(
                 &c,
@@ -478,5 +539,224 @@ fn the_credential_rule_names_the_file_the_storage_units_read() {
     let r = check(&c, Mode::Daemon, &own, true).expect("a unit");
     assert_eq!(lines(&r), Vec::<String>::new());
     let holds: Vec<_> = Mode::ALL.iter().filter(|m| m.holds_no_key()).collect();
-    assert_eq!(holds, [&Mode::Daemon, &Mode::StorageAndDaemon]);
+    assert_eq!(
+        holds,
+        [&Mode::Daemon, &Mode::StorageAndDaemon, &Mode::AllInOne]
+    );
+}
+
+/// Catches a comment inside a continued `ExecStart=` passed: systemd 239 and older
+/// join it into the command line (the daemon's template carried one, its TODO, until
+/// it moved above the directive), and an indented one, which 240 joins too.
+#[test]
+fn a_comment_inside_a_continued_line_fails_rule_continuation() {
+    let c = config();
+    for comment in ["# planted", "    ; planted"] {
+        let t = Mode::Daemon.template().replace(
+            "    --driver=container \\\n",
+            &format!("    --driver=container \\\n{comment}\n"),
+        );
+        let text = render_template(&c, Some(1500), Mode::Daemon, &t).expect("renders");
+        let line = text.lines().position(|l| l == comment).expect("planted") + 1;
+        let r = check(&c, Mode::Daemon, &text, true).expect("a unit");
+        assert_eq!(
+            lines(&r),
+            [format!(
+                "FAIL continuation: kbf-daemon.service line {line} is a comment inside a continued line: systemd 239 and older read it into the value (240 an indented one); put it before the directive"
+            )]
+        );
+    }
+    // Above the directive, after its last line, or after a blank line: not inside.
+    let unit = "[Service]\n# a\nExecStart=/bin/a \\\n  --b\n# c\nX=1 \\\n\n# d\n";
+    assert_eq!(
+        crate::unit::comments_in_continuations(unit),
+        Vec::<usize>::new()
+    );
+    assert_eq!(
+        crate::unit::comments_in_continuations("A=1 \\\n# x\n; y\n  2\n"),
+        [2, 3]
+    );
+}
+
+/// Catches `all-in-one` checked without its warning (it runs builds beside the farm's
+/// state as one user, so it is for a trusted box), and the warning on another mode.
+#[test]
+fn all_in_one_is_labelled_trusted() {
+    let c = config();
+    for mode in Mode::ALL {
+        let r = check(
+            &c,
+            mode,
+            &render(&c, Some(1500), mode).expect("renders"),
+            true,
+        )
+        .expect("a unit");
+        let want: &[&str] = if mode == Mode::AllInOne {
+            &[TRUSTED_NOTE]
+        } else {
+            &[]
+        };
+        assert_eq!(r.notes, want, "{mode}");
+    }
+    assert!(
+        Mode::AllInOne
+            .template()
+            .contains("TRUSTED, SINGLE BOX OR DEVELOPMENT ONLY")
+    );
+    let all = render(&c, Some(1500), Mode::AllInOne).expect("renders");
+    let unit = UnitFile::parse(&all).expect("a unit");
+    assert_eq!(unit.flag("cold-store"), Some("file:///var/lib/kbf/cold"));
+    assert_eq!(unit.get("EnvironmentFile"), None);
+}
+
+/// Catches a drop-in not applied (one that hands a build node the key, or turns
+/// delegation off, would pass), drop-ins applied out of systemd's file-name order, a
+/// file that is not `*.conf` read as a drop-in, `kbf.slice`'s drop-ins not read
+/// (one that disables cpuset below the slice), and a garbled drop-in named wrongly.
+#[test]
+fn drop_ins_apply_after_the_unit_in_file_name_order() {
+    let dir = kbf_host::testkit::scratch("linux_mode_drop_ins");
+    let cfg = dir.join("config.local");
+    std::fs::write(&cfg, EXAMPLE).expect("write config");
+    let out = dir.join("units");
+    crate::linux::render_mode_unit(&cfg, &out, Some(1500), Mode::Daemon).expect("renders");
+    let run = || {
+        crate::linux::check_mode_unit(&FakeExec::new(0), &cfg, &out, Mode::Daemon, true, None)
+            .map(|r| lines(&r))
+            .map_err(|e| e.to_string())
+    };
+    assert_eq!(run(), Ok(Vec::new()));
+    let d = out.join("kbf-daemon.service.d");
+    std::fs::create_dir_all(&d).expect("drop-in dir");
+    std::fs::write(d.join("10-a.conf"), "[Service]\nDelegate=no\n").expect("write");
+    std::fs::write(d.join("20-b.conf"), "[Service]\nDelegate=yes\n").expect("write");
+    std::fs::write(d.join("30-c.conf.off"), "[Service]\nDelegate=no\n").expect("write");
+    assert_eq!(run(), Ok(Vec::new()));
+    std::fs::write(d.join("05-a.conf"), "[Service]\nDelegate=yes\n").expect("write");
+    std::fs::rename(d.join("20-b.conf"), d.join("01-b.conf")).expect("rename");
+    let r = run().expect("checks");
+    assert_eq!(r.len(), 1, "{r:?}");
+    assert!(
+        r[0].starts_with(
+            "FAIL delegate: kbf-daemon.service runs builds and delegates no controller"
+        ),
+        "{r:?}"
+    );
+    std::fs::remove_file(d.join("10-a.conf")).expect("remove");
+    std::fs::write(
+        d.join("50-key.conf"),
+        "[Service]\nEnvironmentFile=/etc/kbf/s3.env\n",
+    )
+    .expect("write");
+    assert_eq!(
+        run(),
+        Ok(vec![
+            "FAIL credential: kbf-daemon.service gives a build node the cold store's key (EnvironmentFile=/etc/kbf/s3.env): a build node holds no credential, and its builds run as its user".to_owned()
+        ])
+    );
+    std::fs::write(d.join("60-reset.conf"), "[Service]\nEnvironmentFile=\n").expect("write");
+    assert_eq!(run(), Ok(Vec::new()));
+    let s = out.join("kbf.slice.d");
+    std::fs::create_dir_all(&s).expect("slice drop-in dir");
+    std::fs::write(
+        s.join("x.conf"),
+        "[Slice]\nDisableControllers=memory cpuset\n",
+    )
+    .expect("write");
+    assert_eq!(
+        run(),
+        Ok(vec![
+            "FAIL delegate: kbf.slice disables cpuset memory below it (DisableControllers=), so kbf-daemon.service cannot have it delegated: the daemon needs cpu, cpuset, memory and pids".to_owned()
+        ])
+    );
+    std::fs::write(s.join("x.conf"), "[Slice]\nDisableControllers cpuset\n").expect("write");
+    assert_eq!(
+        run(),
+        Err("kbf.slice.d/x.conf: line 2: not [Section], a comment or Key=value".to_owned())
+    );
+    std::fs::remove_file(s.join("x.conf")).expect("remove");
+    // A drop-in directory that is not one: refused, not read as none.
+    std::fs::remove_dir(&s).expect("remove");
+    std::fs::write(&s, "").expect("a file in its place");
+    assert!(run().is_err_and(|e| e.starts_with("cannot read ") && e.contains("kbf.slice.d")));
+    std::fs::remove_file(&s).expect("remove");
+    std::fs::remove_file(out.join("kbf.slice")).expect("remove");
+    assert!(run().is_err_and(|e| e.starts_with("cannot read ") && e.ends_with("(os error 2)")));
+}
+
+/// Catches rule `cpuset` not run on a mode that runs builds (its unit's or the slice's
+/// narrower `AllowedCPUs=` passed), run on one that does not, and the slice's lists not
+/// compared.
+#[test]
+fn a_build_modes_unit_and_slice_keep_every_cpu_of_the_node() {
+    let c = config();
+    let mut exec = FakeExec::new(0);
+    for (path, text) in [
+        ("/sys/devices/system/cpu/online", "0-7\n"),
+        ("/sys/devices/system/node/online", "0-1\n"),
+    ] {
+        let entry = Entry::File {
+            perms: Perms::new(0o444),
+            owner: Owner { uid: 0, gid: 0 },
+            bytes: text.as_bytes().to_vec(),
+        };
+        exec.entries
+            .insert(HostPath::new(path).expect("absolute"), entry);
+    }
+    let daemon = render(&c, Some(1500), Mode::Daemon).expect("renders");
+    let narrow = UnitText::new(Mode::Daemon.unit_name(), daemon.as_str()).with_drop_in(
+        "kbf-daemon.service.d/cpus.conf",
+        "[Service]\nAllowedCPUs=0-3\n",
+    );
+    let r = check_on_host(&exec, &c, Mode::Daemon, &narrow, &slice(&c), true, None).expect("runs");
+    assert_eq!(r.failures.len(), 1, "{:?}", lines(&r));
+    assert_eq!(r.failures[0].rule, "cpuset");
+    let wide_slice =
+        slice(&c).with_drop_in("kbf.slice.d/n.conf", "[Slice]\nAllowedMemoryNodes=1\n");
+    let unit = UnitText::new(Mode::Daemon.unit_name(), daemon.as_str());
+    let r = check_on_host(&exec, &c, Mode::Daemon, &unit, &wide_slice, true, None).expect("runs");
+    assert_eq!(
+        lines(&r),
+        [
+            "FAIL cpuset: kbf.slice sets AllowedMemoryNodes=1, narrower than the node's NUMA nodes 0-1: the daemon places leases on every one of them (--lease-placement=numa-node pins a lease to one NUMA node), and the unit's cgroup keeps them off the rest"
+        ]
+    );
+    let frontend = render(&c, Some(1500), Mode::Frontend).expect("renders");
+    let f = UnitText::new(Mode::Frontend.unit_name(), frontend).with_drop_in(
+        "kbf-frontend.service.d/cpus.conf",
+        "[Service]\nAllowedCPUs=0\n",
+    );
+    let r = check_on_host(&exec, &c, Mode::Frontend, &f, &wide_slice, true, None).expect("runs");
+    assert_eq!(lines(&r), Vec::<String>::new());
+}
+
+/// Catches `check-units` on the node not reading the unit's environment files: a copy
+/// of the key under another name, given by a drop-in, passes without it; and the
+/// storage mode, whose half reads the key, checked for it.
+#[test]
+fn on_the_node_an_environment_file_holding_the_key_fails_rule_credential() {
+    let c = config();
+    let mut exec = FakeExec::new(0);
+    let copy = Entry::File {
+        perms: Perms::new(0o600),
+        owner: Owner { uid: 0, gid: 0 },
+        bytes: b"AWS_ACCESS_KEY_ID=a\nAWS_SECRET_ACCESS_KEY=b\n".to_vec(),
+    };
+    exec.entries.insert(
+        HostPath::new("/etc/kbf/daemon.env").expect("absolute"),
+        copy,
+    );
+    let drop_in = "[Service]\nEnvironmentFile=/etc/kbf/daemon.env\n";
+    for mode in [Mode::Daemon, Mode::Storage] {
+        let text = render(&c, Some(1500), mode).expect("renders");
+        let unit = UnitText::new(mode.unit_name(), text)
+            .with_drop_in(format!("{}.d/env.conf", mode.unit_name()), drop_in);
+        let r = check_on_host(&exec, &c, mode, &unit, &slice(&c), true, None).expect("runs");
+        let want: Vec<String> = if mode == Mode::Daemon {
+            vec!["FAIL credential: kbf-daemon.service gives a build node the cold store's key (EnvironmentFile=/etc/kbf/daemon.env, which sets AWS_ACCESS_KEY_ID): a build node holds no credential, and its builds run as its user".to_owned()]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(lines(&r), want, "{mode}");
+    }
 }
