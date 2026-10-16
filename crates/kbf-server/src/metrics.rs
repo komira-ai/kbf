@@ -58,10 +58,8 @@ where
     let mut text = sources.cache.render_metrics();
     // Read from the metadata state now; a log that cannot answer leaves them out of
     // this scrape rather than failing it.
-    match sources.cache.losses().await {
-        Ok(losses) => losses.render(&mut text),
-        Err(e) => tracing::warn!(error = %e, "/metrics: the lost-blob families are left out"),
-    }
+    let losses = sources.cache.losses().await;
+    losses.iter().for_each(|l| l.render(&mut text));
     if let Some(local) = sources.local {
         render_fill(&mut text, local.fill());
     }
