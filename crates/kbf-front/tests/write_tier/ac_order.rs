@@ -6,23 +6,18 @@
 //! lost after a partial flush leaves outputs without a result (a miss), never a
 //! result without its outputs.
 //!
-//! Every test runs the same [`Farm`] as `write_tier.rs`. Each test's comment names the
-//! defect it is there to catch.
+//! A module of `write_tier.rs`, so the flusher is measured as one instantiation with the
+//! rest of the tier's tests. Each test's comment names the defect it is there to catch.
 
-mod common;
-#[allow(dead_code)]
-#[path = "write_tier/support.rs"]
-mod support;
-
-use common::faulty::PutFault;
 use kbf_front::FLUSH_BACKOFF_FIRST;
 use kbf_meta::{ObjectId, Role, StagedState};
 use kbf_objstore::Capabilities;
 use kbf_proto::reapi::{ActionResult, Digest, OutputFile};
 use prost::Message;
-use support::{Farm, SEGMENT, TestBlob, key, later};
 
-const GIB: u64 = 1 << 30;
+use super::GIB;
+use super::common::faulty::PutFault;
+use super::support::{self, Farm, SEGMENT, TestBlob, key, later};
 
 /// The tier's objects for one action-cache entry, laid out so that id order (the
 /// flusher's own order) would flush the result first: `result` is a grouped block
