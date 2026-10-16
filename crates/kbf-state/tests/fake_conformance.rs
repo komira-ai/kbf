@@ -123,6 +123,39 @@ fn a_reverse_scan_that_resumes_at_its_token_fails_c8() {
     c8_bounded_range_scan(&FakeBackend::new(Flaw::ScanReverseResumesAtToken));
 }
 
+// Catches a backend that applies its limit before its expiry filter (a natural SQL
+// mistake): the expired `c8/bb` takes a row's place, so the page is short and has lost
+// its token.
+#[test]
+#[should_panic(expected = "C8 expiry")]
+fn a_scan_that_counts_expired_keys_toward_its_limit_fails_c8() {
+    c8_bounded_range_scan(&FakeBackend::new(Flaw::ScanCountsExpired));
+}
+
+// Catches a last page that still carries a token, so a caller fetches an empty page and
+// a UI shows a "next" link to nothing.
+#[test]
+#[should_panic(expected = "C8 resume: a page that reached the end of the range has no token")]
+fn a_scan_with_a_token_on_its_last_page_fails_c8() {
+    c8_bounded_range_scan(&FakeBackend::new(Flaw::ScanTokenOnLastPage));
+}
+
+// Catches a resumed page served from the first page's snapshot: a key committed ahead
+// of the token after the first page is missing.
+#[test]
+#[should_panic(expected = "C8 concurrent keys")]
+fn a_scan_that_skips_keys_committed_ahead_of_its_token_fails_c8() {
+    c8_bounded_range_scan(&FakeBackend::new(Flaw::ScanSkipsAhead));
+}
+
+// Catches a resumed page that shows a key's value from the first page's time, not its
+// own.
+#[test]
+#[should_panic(expected = "C8 concurrent value")]
+fn a_scan_that_shows_stale_values_fails_c8() {
+    c8_bounded_range_scan(&FakeBackend::new(Flaw::ScanStaleValues));
+}
+
 // The two error types say what failed.
 #[test]
 fn errors_say_what_failed() {

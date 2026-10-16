@@ -18,8 +18,8 @@ use crate::clock::{Clock, ManualClock, StoreTime};
 use crate::conformance::{Backend, C1_RACERS, RACE_KEY};
 use crate::store::{Span, Store, page_of};
 use crate::types::{
-    Change, Changes, Commit, CommitStats, Cond, Conflict, Direction, Event, Op, Revision, ScanPage,
-    ScanRange, StoreError, Txn, Version, Versioned,
+    Change, Changes, Commit, CommitStats, Cond, Conflict, Direction, Event, Op, ResumeToken,
+    Revision, ScanPage, ScanRange, StoreError, Txn, Version, Versioned,
 };
 
 /// How much store time one durable sync takes on the fake.
@@ -66,6 +66,18 @@ pub enum Flaw {
     /// C8: a reverse scan treats an excluded upper bound as included, so resuming it
     /// from a token returns the last key of the previous page again.
     ScanReverseResumesAtToken,
+    /// C8: the limit is applied before the expiry filter (`LIMIT` in SQL, expiry checked
+    /// on the rows it returns), so an expired key in the window takes a row's place and
+    /// the page comes back short with no token.
+    ScanCountsExpired,
+    /// C8: every non-empty page carries a token, the last one too.
+    ScanTokenOnLastPage,
+    /// C8: a resumed page holds only keys that were live when the scan's first page was
+    /// read, as a cursor over the first page's snapshot would, so a key committed ahead
+    /// of the token since is skipped.
+    ScanSkipsAhead,
+    /// C8: a resumed page shows each key's value as of the scan's first page.
+    ScanStaleValues,
 }
 
 #[derive(Clone)]
@@ -279,6 +291,9 @@ pub struct Fake {
     /// The clock reading at open, for [`Flaw::CallerClockExpiry`].
     frozen: StoreTime,
     gate: Arc<Gate>,
+    /// The live range at the last forward scan of a whole prefix, for
+    /// [`Flaw::ScanSkipsAhead`] and [`Flaw::ScanStaleValues`].
+    first_page: Arc<Mutex<BTreeMap<String, Versioned>>>,
 }
 
 impl Fake {
@@ -292,6 +307,7 @@ impl Fake {
             flaw,
             frozen,
             gate: Arc::new(Gate::default()),
+            first_page: Arc::default(),
         }
     }
 
@@ -484,18 +500,59 @@ impl Store for Fake {
         } else {
             Box::new(range)
         };
-        let mut rows: Vec<(String, Versioned)> = walk
-            .filter(|(_, row)| row.alive(now))
-            .take(take)
-            .map(|(key, row)| (key.clone(), row.versioned()))
-            .collect();
+        let mut rows: Vec<(String, Versioned)> = if self.flaw == Flaw::ScanCountsExpired {
+            walk.take(take)
+                .filter(|(_, row)| row.alive(now))
+                .map(|(key, row)| (key.clone(), row.versioned()))
+                .collect()
+        } else {
+            walk.filter(|(_, row)| row.alive(now))
+                .take(take)
+                .map(|(key, row)| (key.clone(), row.versioned()))
+                .collect()
+        };
         if reverse && !walk_reverse {
             rows.reverse();
+        }
+        // The cursor flaws hold a snapshot per forward scan of a whole prefix and serve
+        // its resumed pages (an excluded lower bound) from it.
+        let whole = scan.direction == Direction::Forward && scan.upper == Bound::Unbounded;
+        if whole && matches!(self.flaw, Flaw::ScanSkipsAhead | Flaw::ScanStaleValues) {
+            let mut first_page = lock(&self.first_page);
+            match (scan.lower, self.flaw) {
+                (Bound::Unbounded, _) => {
+                    *first_page = inner
+                        .live
+                        .rows
+                        .range::<str, _>(span.bounds())
+                        .filter(|(_, row)| row.alive(now))
+                        .map(|(key, row)| (key.clone(), row.versioned()))
+                        .collect();
+                }
+                (Bound::Excluded(_), Flaw::ScanSkipsAhead) => {
+                    rows.retain(|(key, _)| first_page.contains_key(key));
+                }
+                (Bound::Excluded(_), _) => {
+                    for (key, value) in &mut rows {
+                        if let Some(then) = first_page.get(key) {
+                            value.clone_from(then);
+                        }
+                    }
+                }
+                (Bound::Included(_), _) => {}
+            }
         }
         if self.flaw == Flaw::ScanIgnoresLimit {
             return Ok(ScanPage { rows, resume: None });
         }
-        Ok(page_of(rows, scan.limit))
+        let mut page = page_of(rows, scan.limit);
+        if self.flaw == Flaw::ScanTokenOnLastPage && page.resume.is_none() {
+            page.resume = page
+                .rows
+                .last()
+                .map(|(key, _)| ResumeToken::after(key.clone()));
+        }
+        Ok(page)
     }
 
     fn changes(&self, after: Revision, limit: usize) -> Result<Changes, StoreError> {

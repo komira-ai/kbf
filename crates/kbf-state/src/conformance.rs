@@ -677,6 +677,17 @@ fn c8_forward<S: Store>(store: &S) {
         ["c8/c"],
         "C8 lower: a lower key that is not stored begins at the next key"
     );
+    // `c8/bb` expired between `c8/b` and `c8/c`: the page is still full, and since a
+    // live key follows it, it still names its token.
+    let around = page(store, from(Bound::Included("c8/b"), 2));
+    assert_eq!(
+        (
+            keys_of(&around),
+            around.resume.as_ref().map(ResumeToken::key)
+        ),
+        (vec!["c8/b", "c8/c"], Some("c8/c")),
+        "C8 expiry: an expired key neither appears in a page, nor shortens it, nor costs it its token"
+    );
     // The prefix: a lower bound past it finds nothing. `c8~` is stored past the prefix;
     // nothing is stored at or after `c9`, so that scan runs off the end of the store.
     for beyond in ["c8~", "c9"] {
