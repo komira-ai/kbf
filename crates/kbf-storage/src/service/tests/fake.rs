@@ -34,6 +34,7 @@ use tonic::transport::Channel;
 use tonic::transport::server::TcpIncoming;
 use tonic::{Request, Response, Status, Streaming};
 
+use crate::replicate::MapSource;
 use crate::service::{Admission, Config, MAP_GENERATION_HEADER, RemoteStorage, StorageService};
 use crate::{Answer, PutStream, READ_CHUNK_BYTES, ReadStream, Storage, StorageError};
 
@@ -354,6 +355,64 @@ pub(super) async fn serve(mem: &Arc<Mem>, write_bytes_in_flight: u32) -> Channel
     );
     let addr = serve_routes(service.routes(), None).await;
     connect(addr).await
+}
+
+/// The map a node holds, which a test changes between calls.
+pub(super) struct Held(Mutex<Option<Arc<kbf_map::Map>>>);
+
+impl Held {
+    /// A node holding a map of generation `generation` (a one-member map).
+    pub(super) fn at(generation: u64) -> Arc<Self> {
+        let held = Arc::new(Self(Mutex::new(None)));
+        held.set(generation);
+        held
+    }
+
+    /// A node with no map yet.
+    pub(super) fn none() -> Arc<Self> {
+        Arc::new(Self(Mutex::new(None)))
+    }
+
+    /// The node learns the map of generation `generation`.
+    pub(super) fn set(&self, generation: u64) {
+        let member = kbf_map::Member {
+            id: kbf_map::MemberId(1),
+            addr: "127.0.0.1:1".to_owned(),
+            zone: String::new(),
+            weight: 1,
+            state: kbf_map::MemberState::Active,
+        };
+        let map = kbf_map::Map::new(
+            generation,
+            vec![member],
+            kbf_map::Rule::Rendezvous,
+            1,
+            1,
+            Vec::new(),
+        )
+        .expect("a valid map");
+        *self.0.lock().expect("lock") = Some(Arc::new(map));
+    }
+}
+
+impl MapSource for Held {
+    fn current(&self) -> Option<Arc<kbf_map::Map>> {
+        self.0.lock().expect("lock").clone()
+    }
+}
+
+/// A service over `mem` that judges writes by `held`, on a loopback port.
+pub(super) async fn serve_mapped(mem: &Arc<Mem>, held: &Arc<Held>) -> Channel {
+    let storage: Arc<dyn Storage> = Arc::clone(mem) as Arc<dyn Storage>;
+    let service = StorageService::new(
+        storage,
+        Admission::Open,
+        Config {
+            write_bytes_in_flight: 1 << 30,
+        },
+    )
+    .with_map(Arc::clone(held) as Arc<dyn MapSource>);
+    connect(serve_routes(service.routes(), None).await).await
 }
 
 pub(super) async fn connect(addr: SocketAddr) -> Channel {

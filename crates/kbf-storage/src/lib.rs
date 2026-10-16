@@ -27,6 +27,7 @@
 
 pub mod local_cache;
 pub mod repair;
+pub mod replicate;
 pub mod service;
 
 use std::sync::Arc;

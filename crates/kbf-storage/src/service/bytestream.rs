@@ -9,7 +9,7 @@ use kbf_proto::google::bytestream::{
 };
 use tonic::{Request, Response, Status, Streaming};
 
-use super::{Endpoint, MAX_BLOB_BYTES, StorageService, wire};
+use super::{Endpoint, MAX_BLOB_BYTES, StorageService, generation, wire};
 use crate::StorageError;
 
 #[tonic::async_trait]
@@ -44,7 +44,8 @@ impl ByteStream for StorageService {
     }
 
     /// Receives a blob from offset 0, stores it with [`crate::Storage::put`], which
-    /// hashes it, and only then answers with its size. A blob already held is answered
+    /// hashes it, and only then answers with its size. A caller whose map generation is
+    /// not this node's is refused first ([`crate::replicate`]). A blob already held is answered
     /// at once, unread.
     ///
     /// The bytes are held whole until they are complete, never more than the digest in
@@ -56,6 +57,7 @@ impl ByteStream for StorageService {
         request: Request<Streaming<WriteRequest>>,
     ) -> Result<Response<WriteResponse>, Status> {
         self.admission.check(&request, Endpoint::Write)?;
+        self.check_map(generation::requested(&request)?)?;
         let mut stream = request.into_inner();
         let mut message = stream
             .message()
