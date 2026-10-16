@@ -114,8 +114,29 @@ least as many lines or branches that were uncovered before. Reviewers hold the
 rest of the target. The job also fails when a count falls below the file's
 (`BASELINE LOOSER THAN MEASURED`) and when a crate is missing from the file, so
 the file always equals the measurement and never keeps slack for a later change
-to spend. In either case copy `coverage-baseline.measured` from the job's
-`coverage` artifact over `coverage-baseline` in the same pull request.
+to spend.
+
+When the job fails because coverage improved, running `kbf-coverage tighten` is
+required: the failing job prints the exact command (in its log and its summary),
+which downloads the run's `coverage` artifact and rewrites `coverage-baseline`
+from the measured file in it:
+
+```sh
+gh run download <run id> --repo komira-ai/komira-build-farm --name coverage --dir target/coverage-<run id> \
+  && cargo run -p kbf-coverage -- tighten --measured target/coverage-<run id>/coverage-baseline.measured
+```
+
+Commit the rewritten `coverage-baseline` in the same pull request. `tighten` is
+not a bypass of the ratchet: it only lowers counts. It changes a crate's value
+only where the measurement is tighter (fewer items missed, or `0` where the file
+says `-`), adds a new crate only when every measured value is `0` or `-`, and
+removes a crate only when its directory is gone. It refuses everything else,
+naming each crate and metric with the recorded and measured values, and leaves
+the file untouched: a raise is fixed by covering the code, never by the file.
+It keeps the file's comments and order, prints each change, and changes nothing
+on a second run. Without CI, `tighten --lcov <tracefile> --root .` measures from
+a local `cargo llvm-cov --branch --lcov` run instead. Do not edit
+`coverage-baseline` by hand.
 
 Changes under `.github/workflows/` will need a review from the code owners
 listed in [.github/CODEOWNERS](.github/CODEOWNERS). That rule is a placeholder

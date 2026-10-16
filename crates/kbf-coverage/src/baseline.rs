@@ -3,8 +3,9 @@
 //!
 //! Each line is `<crate> <lines missed> <branches missed>`, separated by whitespace; a
 //! value is a count in decimal digits, or `-` for a crate with nothing to measure.
-//! Blank lines and lines starting with `#` are comments. [`render`] writes the file and
-//! [`parse`] reads what it writes, refusing a crate listed twice.
+//! Blank lines and lines starting with `#` are comments. [`render`] writes the file,
+//! [`rewrite`] changes its values in place (what `kbf-coverage tighten` uses, keeping
+//! the comments), and [`parse`] reads what they write, refusing a crate listed twice.
 
 use std::collections::BTreeMap;
 
@@ -95,21 +96,78 @@ const HEADER: &str = "\
 # has nothing to measure. CI fails when a crate misses more than its line here, so a
 # change covers the code it adds (or covers as much existing code as it leaves
 # uncovered), and when it misses fewer, so the file never keeps slack. The target is 0
-# everywhere. The coverage job uploads the measured file as
-# `coverage-baseline.measured`; copy it here when a count changes or a crate is added.
+# everywhere. When coverage improves, running `kbf-coverage tighten` on the measured
+# file the coverage job uploads is required (the failing job prints the command). It
+# is not a bypass: it only lowers counts, and refuses any rise. Do not edit by hand.
 # crate lines-missed branches-missed
 ";
 
+/// The name column's width: the longest crate name.
+fn width(baseline: &Baseline) -> usize {
+    baseline.keys().map(String::len).max().unwrap_or(0)
+}
+
+/// One crate's line, values right-aligned in six columns after the padded name.
+fn entry_line(krate: &str, e: Entry, width: usize) -> String {
+    format!(
+        "{krate:<width$} {:>6} {:>6}\n",
+        show(e.lines),
+        show(e.branches)
+    )
+}
+
 /// Writes a baseline file, crates in name order, values aligned.
 pub fn render(baseline: &Baseline) -> String {
-    let width = baseline.keys().map(String::len).max().unwrap_or(0);
+    let width = width(baseline);
     let mut out = String::from(HEADER);
     for (krate, e) in baseline {
-        out.push_str(&format!(
-            "{krate:<width$} {:>6} {:>6}\n",
-            show(e.lines),
-            show(e.branches)
-        ));
+        out.push_str(&entry_line(krate, *e, width));
+    }
+    out
+}
+
+/// The crate a line of the file names, or `None` for a comment or blank line.
+fn crate_of(raw: &str) -> Option<&str> {
+    let raw = raw.trim();
+    if raw.starts_with('#') {
+        return None;
+    }
+    raw.split_whitespace().next()
+}
+
+/// Rewrites the baseline file `text` so it records `baseline`, keeping its comment
+/// and blank lines where they are. The crate lines come out in name order, in
+/// [`render`]'s format (so a file [`render`] wrote changes only where a value, or the
+/// name column's width, does), at the places the file's crate lines held: a crate the
+/// file lacks goes before the first line whose crate sorts after it, or after the
+/// last crate line, and a crate `baseline` lacks is dropped. `text` must have parsed.
+pub fn rewrite(text: &str, baseline: &Baseline) -> String {
+    let width = width(baseline);
+    let lines: Vec<&str> = text.lines().collect();
+    let last = lines.iter().rposition(|raw| crate_of(raw).is_some());
+    let mut pending = baseline.iter().peekable();
+    let mut out = String::new();
+    for (index, raw) in lines.into_iter().enumerate() {
+        match crate_of(raw) {
+            None => {
+                out.push_str(raw);
+                out.push('\n');
+            }
+            Some(krate) => {
+                while let Some((k, e)) = pending.next_if(|(k, _)| k.as_str() <= krate) {
+                    out.push_str(&entry_line(k, *e, width));
+                }
+            }
+        }
+        if Some(index) == last {
+            for (k, e) in pending.by_ref() {
+                out.push_str(&entry_line(k, *e, width));
+            }
+        }
+    }
+    // A file without crate lines: the crates go after its comments.
+    for (k, e) in pending {
+        out.push_str(&entry_line(k, *e, width));
     }
     out
 }
@@ -211,5 +269,74 @@ mod tests {
                 "line 2: x is listed twice",
             ]
         );
+    }
+
+    /// Catches: a rewrite that loses or moves a comment, leaves a crate out of name
+    /// order, keeps a crate the new baseline drops, puts a new crate somewhere other
+    /// than its sorted place, or aligns columns differently from [`render`].
+    #[test]
+    fn rewrite_keeps_comments_and_places_crates_in_order() {
+        let text = "# head\n# more\nbb 1 2\n\n# between\ndd   4 -\nff 6 6\n# tail\n";
+        let new: Baseline = [
+            ("a", Some(0), None),
+            ("bb", Some(1), Some(1)),
+            ("cc", None, None),
+            ("dd", Some(3), None),
+            ("gg", Some(0), Some(0)),
+        ]
+        .iter()
+        .map(|(k, l, b)| {
+            (
+                (*k).to_owned(),
+                Entry {
+                    lines: *l,
+                    branches: *b,
+                },
+            )
+        })
+        .collect();
+        assert_eq!(
+            rewrite(text, &new),
+            "# head\n# more\n\
+             a       0      -\n\
+             bb      1      1\n\
+             \n# between\n\
+             cc      -      -\n\
+             dd      3      -\n\
+             gg      0      0\n\
+             # tail\n"
+        );
+        assert_eq!(parse(&rewrite(text, &new)), Ok(new.clone()));
+        // A file whose crate lines are out of order comes out in order, each crate once.
+        assert_eq!(
+            rewrite("z 1 1\na 1 1\n", &new),
+            render(&new)[HEADER.len()..]
+        );
+        // A file with no crate lines: the crates follow its comments.
+        assert_eq!(
+            rewrite("# only\n", &new),
+            format!("# only\n{}", &render(&new)[HEADER.len()..])
+        );
+    }
+
+    /// Catches: [`rewrite`] in another format than [`render`] (so a file CI wrote
+    /// would change where no value did), and the checked-in file drifting from that
+    /// format or from [`HEADER`]: `tighten` keeps its header, CI's measured file
+    /// carries this one, and the two must read the same.
+    #[test]
+    fn the_checked_in_file_is_in_render_format() {
+        let text = include_str!("../../../coverage-baseline");
+        let parsed = parse(text).expect("the checked-in baseline parses");
+        assert_eq!(render(&parsed), text);
+        assert_eq!(rewrite(text, &parsed), text);
+        let mut b = parsed;
+        b.insert(
+            "a-name-longer-than-any-crate".into(),
+            Entry {
+                lines: Some(0),
+                branches: None,
+            },
+        );
+        assert_eq!(rewrite(&render(&b), &b), render(&b));
     }
 }

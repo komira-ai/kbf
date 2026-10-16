@@ -13,9 +13,11 @@
 //! exactly the workspace's crates. A crate whose baseline is looser than what was
 //! measured (fewer misses, or measured code where the baseline says `-`) fails as well:
 //! the slack would let a later change leave that many items uncovered without failing,
-//! so a change that covers more must lower its line in the same pull request (copy the
-//! measured file the job writes). The baseline therefore always equals the
-//! measurement.
+//! so a change that covers more must lower its line in the same pull request. That
+//! is what `kbf-coverage tighten` ([`crate::tighten`]) does from the measured file
+//! the job writes: it is the required step when coverage improves, and not a bypass,
+//! since it only lowers counts and refuses every rise. The baseline therefore always
+//! equals the measurement.
 //!
 //! What this enforces: no change raises a crate's uncovered count, and the file never
 //! keeps slack. A change that adds partly covered code fails unless it also covers as
@@ -123,7 +125,7 @@ impl fmt::Display for Status {
                 let m: Vec<String> = m.iter().map(Metric::to_string).collect();
                 write!(
                     f,
-                    "BASELINE LOOSER THAN MEASURED ({}); copy coverage-baseline.measured",
+                    "BASELINE LOOSER THAN MEASURED ({}); run kbf-coverage tighten",
                     m.join(", ")
                 )
             }
@@ -137,13 +139,33 @@ impl fmt::Display for Status {
     }
 }
 
-/// True when a `measured` missed count fails the `recorded` one; see the module docs.
-fn more_missed(recorded: Option<u64>, measured: Option<u64>) -> bool {
-    match (recorded, measured) {
+/// How a recorded missed count (`None`: `-`) stands against the measured one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Compare {
+    /// The same value.
+    Equal,
+    /// The record allows more than was measured: fewer misses measured, or `-`
+    /// recorded where every measured item ran. `kbf-coverage tighten` lowers it.
+    Looser,
+    /// More missed than recorded, data lost where the record has a count, or `-`
+    /// recorded where measured items did not run. Only covering code fixes it.
+    MoreMissed,
+}
+
+/// Compares one metric of a crate; see the module docs.
+pub fn compare(recorded: Option<u64>, measured: Option<u64>) -> Compare {
+    let more_missed = match (recorded, measured) {
         (Some(r), Some(m)) => m > r,
         (Some(_), None) => true,
         (None, Some(m)) => m > 0,
         (None, None) => false,
+    };
+    if more_missed {
+        Compare::MoreMissed
+    } else if recorded != measured {
+        Compare::Looser
+    } else {
+        Compare::Equal
     }
 }
 
@@ -171,10 +193,10 @@ impl Row {
         ];
         let (mut more, mut loose) = (Vec::new(), Vec::new());
         for (metric, recorded, measured) in pairs {
-            if more_missed(recorded, measured) {
-                more.push(metric);
-            } else if recorded != measured {
-                loose.push(metric);
+            match compare(recorded, measured) {
+                Compare::MoreMissed => more.push(metric),
+                Compare::Looser => loose.push(metric),
+                Compare::Equal => {}
             }
         }
         if !more.is_empty() {
@@ -506,7 +528,7 @@ mod tests {
             labels,
             [
                 "ok",
-                "BASELINE LOOSER THAN MEASURED (branches); copy coverage-baseline.measured",
+                "BASELINE LOOSER THAN MEASURED (branches); run kbf-coverage tighten",
                 "MORE MISSED THAN BASELINE (lines, branches)",
                 "NOT IN BASELINE",
                 "NOT IN WORKSPACE",
