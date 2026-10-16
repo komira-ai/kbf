@@ -5,12 +5,13 @@
 
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
 
 use bytes::Bytes;
 use futures::channel::mpsc;
-use futures::stream;
+use futures::stream::{self, StreamExt};
 use kbf_front::{Cache, MemoryMetaLog, WriteConfig};
 use kbf_meta::Retention;
 use kbf_objstore::{
@@ -158,29 +159,81 @@ async fn concurrent_writes_stay_under_the_bytes_in_flight() {
     }
 }
 
-/// 300 concurrent 2 MiB Writes over one connection to the REAPI listener, as
-/// `bind_server` sets it up (10000 streams allowed), against a 6 MiB bound: three are
-/// admitted at a time and 297 wait, each leaving a stream window's worth of its data
-/// unread. Every Write finishes. The deadline detects a hang, not a speed.
+/// Three 2 MiB Writes are admitted and held at their last message; then 297 more Writes
+/// over the same connection to the REAPI listener, as `bind_server` sets it up (10000
+/// streams allowed), wait for admission against the 6 MiB bound, each leaving a stream
+/// window's worth of its data unread. Only then do the admitted ones send their last
+/// message. Every Write finishes. The deadlines detect a hang, not a speed; the pause
+/// that lets the waiting Writes' data arrive can only make the test pass when too
+/// short, never fail.
 ///
 /// Catches: a connection window smaller than the streams the listener allows times
 /// the stream window. With a fixed 200 MiB window and 10000 streams, the unread data of
 /// more than 200 waiting Writes takes the whole window and the admitted ones never get
-/// their last message (the timeout fires). Mutants seen red: `CONNECTION_WINDOW_BYTES`
-/// as the REAPI listener's window again.
+/// their last message (the timeout fires). Mutant: the REAPI listener's connection
+/// window fixed at 200 MiB again (`flow_windows`). Without the admitted Writes held,
+/// they finish before the waiting ones pile up and the test passes on the old code.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn more_waiting_writes_than_a_fixed_window_holds_all_finish() {
     const WAITING_BLOB: usize = 2 << 20;
-    const MANY: usize = 300;
-    const MANY_BOUND: u64 = 3 * WAITING_BLOB as u64;
-    let (_cache, channel) = serve(MANY_BOUND).await;
+    const ADMITTED: usize = 3;
+    const WAITING: usize = 297;
+    const MANY_BOUND: u64 = (ADMITTED * WAITING_BLOB) as u64;
+    let (cache, channel) = serve(MANY_BOUND).await;
+
+    let mut lasts = Vec::new();
     let mut calls = Vec::new();
-    for i in 0..MANY {
-        let (_, messages) = upload_sized(i, WAITING_BLOB);
+    for i in 0..ADMITTED {
+        let (_, mut messages) = upload_sized(i, WAITING_BLOB);
+        let last = messages.pop().expect("a last message");
+        let (send, receive) = mpsc::unbounded();
+        for message in messages {
+            send.unbounded_send(message).expect("queued");
+        }
+        lasts.push((send, last));
         let mut client = ByteStreamClient::new(channel.clone());
-        calls.push(tokio::spawn(async move {
-            client.write(stream::iter(messages)).await
-        }));
+        calls.push(tokio::spawn(async move { client.write(receive).await }));
+    }
+    let held = (ADMITTED * (WAITING_BLOB - CHUNK)) as u64;
+    let deadline = Instant::now() + PROMPT;
+    while cache.write_buffer_peak() < held && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        cache.write_buffer_peak() >= held,
+        "{}: the first Writes were not admitted",
+        cache.write_buffer_peak()
+    );
+
+    // The waiting Writes. A counter notes each one's second message being asked for,
+    // which is after its first has gone out and been read.
+    let sent_first = Arc::new(AtomicUsize::new(0));
+    for i in ADMITTED..ADMITTED + WAITING {
+        let (_, messages) = upload_sized(i, WAITING_BLOB);
+        let counted = Arc::clone(&sent_first);
+        let messages = stream::iter(messages.into_iter().enumerate()).map(move |(j, m)| {
+            if j == 1 {
+                counted.fetch_add(1, Ordering::SeqCst);
+            }
+            m
+        });
+        let mut client = ByteStreamClient::new(channel.clone());
+        calls.push(tokio::spawn(async move { client.write(messages).await }));
+    }
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while sent_first.load(Ordering::SeqCst) < WAITING && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        sent_first.load(Ordering::SeqCst),
+        WAITING,
+        "the waiting Writes did not all send their first message"
+    );
+    // Their second messages fill their streams' windows, unread.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    for (send, last) in lasts {
+        send.unbounded_send(last).expect("queued");
     }
     let all = async {
         for call in calls {
