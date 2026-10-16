@@ -28,6 +28,9 @@ const BOTH: &[&str] = &[
     "--node-id=node-1",
 ];
 
+/// What `kbf storage` needs to parse: nothing (its stores are checked at start).
+const STORAGE: &[&str] = &["kbf", names::STORAGE];
+
 fn with(base: &[&str], extra: &[&str]) -> Vec<String> {
     base.iter().chain(extra).map(|s| (*s).to_owned()).collect()
 }
@@ -52,7 +55,10 @@ fn each_mode_parses_its_flags() {
     let both = parse_from(with(BOTH, &["--listen=127.0.0.1:9980"])).expect("all-in-one");
     assert!(matches!(&both, Invocation::AllInOne(flags)
         if flags.server.listen.to_string() == "127.0.0.1:9980"));
-    for mode in ["frontend", "storage"] {
+    let storage = parse_from(with(STORAGE, &["--storage-listen=127.0.0.1:9982"])).expect("storage");
+    assert!(matches!(&storage, Invocation::Storage(flags)
+        if flags.listen.to_string() == "127.0.0.1:9982" && flags.tls.is_none()));
+    for mode in ["frontend", "storage-and-daemon"] {
         let inv = parse_from(["kbf", mode, "--any-flag=1", "positional"]).expect(mode);
         assert!(
             matches!(&inv, Invocation::NotBuilt { mode: m } if *m == mode),
@@ -71,7 +77,7 @@ fn the_table_has_exactly_five_modes_and_their_entries() {
         table,
         [
             ("frontend", Entry::NotBuilt),
-            ("storage", Entry::NotBuilt),
+            ("storage", Entry::Storage),
             ("daemon", Entry::Daemon),
             ("storage-and-daemon", Entry::NotBuilt),
             ("all-in-one", Entry::AllInOne),
@@ -136,12 +142,35 @@ fn help_lists_exactly_the_five_modes() {
 fn each_mode_refuses_the_flags_of_another() {
     let daemon = longs(&kbf_node::Cli::command());
     let both = longs(&kbf_all_in_one::cli::command());
-    let derived: Vec<&str> = both.difference(&daemon).map(String::as_str).collect();
+    let storage = longs(&kbf_server::storage_node::command());
+    let others: BTreeSet<String> = both.union(&storage).cloned().collect();
+    let derived: Vec<&str> = others.difference(&daemon).map(String::as_str).collect();
     assert_eq!(refused_by(names::DAEMON), derived.as_slice());
     assert!(derived.contains(&"cold-store") && derived.contains(&"listen"));
+    assert!(
+        derived.contains(&"storage-listen"),
+        "the storage node's own flags are refused"
+    );
     assert!(daemon.is_subset(&both), "the union takes every daemon flag");
-    assert!(refused_by(names::ALL_IN_ONE).is_empty());
-    for mode in [names::FRONTEND, names::STORAGE, "no-such-mode"] {
+    // The storage node's own flags are not all-in-one's, so it refuses them; it takes
+    // none of the daemon's flags that it lacks.
+    assert_eq!(
+        refused_by(names::ALL_IN_ONE),
+        storage
+            .difference(&both)
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .as_slice()
+    );
+    let from_daemon: BTreeSet<&str> = daemon.difference(&storage).map(String::as_str).collect();
+    assert_eq!(
+        refused_by(names::STORAGE)
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>(),
+        from_daemon
+    );
+    for mode in [names::FRONTEND, "no-such-mode"] {
         assert!(refused_by(mode).is_empty(), "{mode}");
     }
     for flag in derived {
@@ -191,7 +220,11 @@ fn all_in_one_takes_exactly_what_kbf_all_in_one_takes() {
         .iter()
         .find(|m| m.name == names::ALL_IN_ONE)
         .expect("mode");
-    let new = longs(&mode_command(mode.name, mode.entry));
+    let mut new = longs(&mode_command(mode.name, mode.entry));
+    // Besides its own, the command holds the flags of other modes it refuses.
+    for flag in refused_by(mode.name) {
+        assert!(new.remove(*flag), "{flag}");
+    }
     assert_eq!(longs(&kbf_all_in_one::cli::command()), new);
 }
 
@@ -410,10 +443,86 @@ fn check_args_parses_the_words_after_check_args() {
     daemon.push("--bogus-flag");
     let e = check(&daemon).expect_err("refused");
     assert!(e.contains("unexpected argument '--bogus-flag'"), "{e}");
-    let e = check(&["kbf", CHECK_ARGS, names::STORAGE]).expect_err("refused");
-    assert!(e.contains("kbf storage: mode not built yet"), "{e}");
+    assert_eq!(
+        check(&[
+            "kbf",
+            CHECK_ARGS,
+            names::STORAGE,
+            "--storage-listen=127.0.0.1:1"
+        ]),
+        Ok(())
+    );
+    let e = check(&["kbf", CHECK_ARGS, names::STORAGE_AND_DAEMON]).expect_err("refused");
+    assert!(
+        e.contains("kbf storage-and-daemon: mode not built yet"),
+        "{e}"
+    );
     for word in ["--help", "--version"] {
         let e = check(&["kbf", CHECK_ARGS, word]).expect_err("refused");
         assert!(e.contains("the mode would not start"), "{word}: {e}");
+    }
+}
+
+/// Catches a storage node that takes a state store (arch-v2 section 6: storage nodes do
+/// not talk to the state store; they reach it only through a frontend), however it is
+/// spelled, or any flag of `kbf-server` outside the store, write and log flags, or a
+/// flag of the daemon: each is refused naming the flag, exit 2, clap's conflict kind or
+/// its unknown-argument kind.
+#[test]
+fn a_storage_node_has_no_state_store_flag() {
+    for flag in [
+        "--state-store=sqlite:///x",
+        "--state-store",
+        "--state-store=postgres://h/db",
+    ] {
+        let err = refusal(with(STORAGE, &[flag]));
+        assert_eq!(err.exit_code(), 2, "{flag}");
+        assert_eq!(err.kind(), ErrorKind::UnknownArgument, "{flag}");
+    }
+    let cmd = kbf_server::storage_node::command();
+    for arg in cmd.get_arguments() {
+        assert!(!arg.get_id().as_str().contains("state"), "{}", arg.get_id());
+    }
+    // Every flag of kbf-server the node does not take is refused by name, so one added
+    // later (a state store, say) is refused with no edit.
+    let server = <kbf_server::Args as clap::CommandFactory>::command();
+    let mut refused = 0;
+    for arg in server.get_arguments() {
+        let id = arg.get_id().as_str();
+        let taken = kbf_server::storage_node::ALLOWED.contains(&id)
+            || ["async_threads", "blocking_threads", "cpu_threads"].contains(&id);
+        if taken || id == "help" || id == "version" {
+            continue;
+        }
+        let long = arg.get_long().expect("a long flag");
+        let err = refusal(with(STORAGE, &[format!("--{long}=x").as_str()]));
+        assert_eq!(err.exit_code(), 2, "{long}");
+        refused += 1;
+    }
+    assert!(refused > 20, "{refused}");
+    // Where clap takes the value, the refusal names the flag and says why.
+    for flag in [
+        "--reapi-auth-policy=/p",
+        "--invocations-open",
+        "--finished-retention-secs=5",
+        "--role=all",
+        "--api-listen=127.0.0.1:1",
+        "--listen=127.0.0.1:1",
+    ] {
+        let err = refusal(with(STORAGE, &[flag]));
+        let name = flag.split('=').next().unwrap_or(flag);
+        assert_eq!(err.kind(), ErrorKind::ArgumentConflict, "{flag}");
+        assert!(
+            err.to_string()
+                .contains(&format!("kbf storage refuses {name}: ")),
+            "{err}"
+        );
+    }
+    for flag in ["--cas=x", "--driver=container", "--node-id=n"] {
+        assert_eq!(
+            refusal(with(STORAGE, &[flag])).kind(),
+            ErrorKind::ArgumentConflict,
+            "{flag}"
+        );
     }
 }

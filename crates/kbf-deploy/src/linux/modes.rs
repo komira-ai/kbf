@@ -3,8 +3,9 @@
 //! templates in `templates/linux/modes/`, beside `kbf.slice`.
 //!
 //! Each unit runs `<KBF_BIN_DIR>/kbf <mode> ...`. A mode `kbf` runs today (`daemon`,
-//! `all-in-one`) carries the flags its old binary's unit carries; a mode not built yet
-//! (`frontend`, `storage`, `storage-and-daemon`) carries none, and its template marks
+//! `all-in-one`, `storage`) carries the flags its old binary's unit carries (`storage`
+//! none yet: a TODO comment marks where its stores go); a mode not built yet
+//! (`frontend`, `storage-and-daemon`) carries none, and its template marks
 //! where its flags go with a `TODO:` comment. The flags the new modes add
 //! (`--frontend`, `--advertise-addr`, the certificate flags) are such TODO comments
 //! too, never guessed.
@@ -125,7 +126,7 @@ impl Mode {
     /// takes anything and exits 2, so its unit carries no flag (rule `flags`).
     #[must_use]
     pub fn is_built(self) -> bool {
-        matches!(self, Mode::Daemon | Mode::AllInOne)
+        matches!(self, Mode::Storage | Mode::Daemon | Mode::AllInOne)
     }
 
     /// Whether the mode runs builds, and so manages its own cgroup (rule `delegate`).

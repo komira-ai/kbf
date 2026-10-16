@@ -18,9 +18,11 @@ fn found(service: &str) -> Vec<String> {
 }
 
 /// Catches an `EnvironmentFile=` that reaches the key file by another spelling going
-/// unseen: optional (`-`), quoted, through `.`, `..` or `//`, or a wildcard that
-/// matches it (in the directory or the name, `?` and `[...]` too); and a file that is
-/// not the key flagged (another name, a pattern that cannot match, `*` across `/`).
+/// unseen: optional (`-`), quoted, through `.`, `..` or `//`, with a `\` glob(3) takes
+/// off, or a wildcard that matches it (in the directory or the name, `?` and `[...]`
+/// too, a `[:class:]` in one); and a file that is not the key flagged (another name, a
+/// pattern that cannot match, `*` across `/`; a name ending in a lone `\` cannot be
+/// written: systemd reads it as a continued line).
 #[test]
 fn environment_files_that_name_the_key_are_seen_however_written() {
     for value in [
@@ -42,6 +44,8 @@ fn environment_files_that_name_the_key_are_seen_however_written() {
         "/etc//kbf/s?.env",
         "/etc/other/../kbf/s3*",
         "/etc/kbf/[xys]3.env",
+        "/etc/kbf/[[:alpha:]]3.env",
+        "/etc/kbf/\\s3.env",
     ] {
         assert_eq!(
             found(&format!("EnvironmentFile={value}\n")),
@@ -64,6 +68,7 @@ fn environment_files_that_name_the_key_are_seen_however_written() {
         "/etc/kbf/[s]4.env",
         "/etc/kbf/[t-z]3.env",
         "/etc/kbf/[a-r]3.env",
+        "/etc/kbf/[[:digit:]]3.env",
     ] {
         assert_eq!(
             found(&format!("EnvironmentFile={value}\n")),
@@ -171,7 +176,8 @@ fn file(exec: &mut FakeExec, path: &str, text: &str) {
 }
 
 /// Catches a copy of the key under another name passed (the file's variables not
-/// read, or read with a comment or an `export ` taken for a name), a link to it passed
+/// read, read with a comment or an `export ` taken for a name, or a `\` in its path
+/// kept), a link to it passed
 /// (it is not followed, so it is refused), a wildcard or an unreadable file passed
 /// without a word, and the key file itself reported twice (offline and on the host).
 #[test]
@@ -201,6 +207,7 @@ fn on_the_host_each_environment_file_is_read() {
          EnvironmentFile=/etc/kbf/missing.env\n\
          EnvironmentFile=relative.env\n\
          EnvironmentFile=/etc/kbf/link.env\n\
+         EnvironmentFile=/etc/kbf/c\\opy.env\n\
          EnvironmentFile=/etc/kbf/*.conf\n\
          EnvironmentFile=/unreadable\n\
          EnvironmentFile=/etc/kbf/s3.env\n",
@@ -213,6 +220,7 @@ fn on_the_host_each_environment_file_is_read() {
             "EnvironmentFile=-/etc/kbf/copy.env, which sets AWS_SECRET_ACCESS_KEY",
             "EnvironmentFile=/etc/kbf/./exported.env, which sets AWS_PROFILE",
             "EnvironmentFile=/etc/kbf/link.env, a link or special file the check does not follow (name the file itself)",
+            "EnvironmentFile=/etc/kbf/c\\opy.env, which sets AWS_SECRET_ACCESS_KEY",
         ]
     );
     assert_eq!(
@@ -233,9 +241,6 @@ fn paths_are_normalised_by_their_words() {
     );
     assert_eq!(normalise("a/../b"), Path::new("b"));
     assert_eq!(normalise("./a"), Path::new("a"));
-    // An unclosed `[` is a plain character.
-    assert!(glob("/a[b", "/a[b"));
-    assert!(!glob("/a[b", "/ab"));
     assert_eq!(
         words("a 'b c' \"d\\\"e\" f\\ g h''"),
         ["a", "b c", "d\"e", "f g", "h"]

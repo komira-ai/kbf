@@ -1,8 +1,7 @@
 # Rendered by `kbf-deploy linux render-units --mode storage`; installed as
 # /etc/systemd/system/kbf-storage.service (kbf docs/design/architecture-v2.md,
-# sections 1 and 11). `kbf storage` is not built yet: it exits
-# 2 at start, and `check-units --mode storage` refuses any flag on its command line
-# until kbf takes some.
+# sections 1 and 11). `check-units --mode storage` parses the flags below with
+# `kbf check-args storage`.
 [Unit]
 Description=kbf build farm storage node
 Wants=network-online.target
@@ -22,8 +21,8 @@ CPUWeight=300
 # mode 0600: a secret never goes on the command line.
 EnvironmentFile=/etc/kbf/s3.env
 ExecStart=/usr/local/bin/kbf storage
-# TODO: the storage node's flags (its stores, --frontend,
-# --advertise-addr, the certificate flags), once `kbf storage` has them.
+# TODO: the storage node's flags (--cold-store, --hot-store, --storage-listen and the
+# --storage-tls-* certificate flags; --frontend and --advertise-addr come with the map).
 Restart=on-failure
 # Exit 2 is a command line kbf refused (or a mode not built yet): a restart cannot fix it.
 RestartPreventExitStatus=2

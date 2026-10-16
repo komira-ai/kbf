@@ -40,6 +40,11 @@
 //!   on that listener alone and an authorizer per kind of call in the services;
 //!   without the flag every call is accepted and allowed.
 //!
+//! - The storage node ([`storage_node`], `kbf storage`): the same cache and stores,
+//!   served alone over gRPC by `kbf_storage::service` (blobs through the standard
+//!   protocols, the action cache through `kbf.storage.v1`), each call admitted by the
+//!   role in the caller's certificate. No scheduler, REAPI or state store.
+//!
 //! Not yet: the scheduler's state in the Raft log (the control log is in-process: a
 //! record commits as soon as it is appended, see [`farm`]), REAPI authentication other than the policies
 //! `kbf-auth` builds (`allow`, `deny`, `any`, `all`), operator roles (the
@@ -74,6 +79,7 @@ pub mod stamp;
 mod start;
 mod startup_pass;
 pub mod state_store;
+pub mod storage_node;
 pub mod stores;
 mod timeout;
 pub mod token;
@@ -88,8 +94,8 @@ pub use kbf_sched::MemoryLadder;
 pub use local::LocalStore;
 pub use raft_log::{RaftLogError, RaftMetaLog};
 pub use serve::{
-    Api, Bound, Listeners, ServeError, WorkerTls, bind_server, bind_server_with_api,
-    bind_server_with_policy, bind_server_with_state,
+    Api, Bound, BoundStorage, Listeners, ServeError, StorageListener, WorkerTls, bind_server,
+    bind_server_with_api, bind_server_with_policy, bind_server_with_state, bind_storage,
 };
 pub use start::{ServerHandle, interrupted, serve_with, sizes_on, start};
 pub use state_store::{StateStore, StateStoreUri, StateStoreUriError};

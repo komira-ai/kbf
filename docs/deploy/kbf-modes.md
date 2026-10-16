@@ -58,9 +58,17 @@ among them, and the rule passes it. A slice cannot delegate: systemd enables on
 **`cpuset`.** The daemon places leases on every CPU and NUMA node of the node
 (`--lease-placement=numa-node` pins each lease to one NUMA node's CPUs and memory). A
 list narrower than the node keeps the unit's cgroup, and every lease in it, off the
-rest. When the node's own sets cannot be read (check-units run elsewhere), a set list
-is not compared and a `WARN cpuset:` line says so. `StartupAllowedCPUs=` and
-`StartupAllowedMemoryNodes=` (boot and shutdown only) are not read.
+rest. A list is read as systemd reads it (`config_parse_cpu_set` in
+`src/shared/cpu-set-util.c`): words split at spaces, tabs, line breaks and commas by
+`extract_first_word` with `EXTRACT_UNQUOTE` only, so quotes are taken off
+(`AllowedCPUs="0-1"` is the CPUs 0 and 1) and a `\` keeps the next character, with no
+C escapes; an unclosed quote drops the whole assignment; each word a number or range
+as `parse_range` and `safe_atou` read it (`0x`, `0o`, `0b` and a leading `0` pick the
+base), a malformed one ignored. A `%` specifier is not expanded: a `WARN cpuset:` line
+says the value was read as written. When the node's own sets cannot be read
+(check-units run elsewhere), a set list is not compared and a `WARN cpuset:` line says
+so. `StartupAllowedCPUs=` and `StartupAllowedMemoryNodes=` (boot and shutdown only)
+are not read.
 
 **`continuation`.** systemd.syntax(7): "When a comment line or lines follow a line
 ending with a backslash, the comment block is ignored, so the continued line is
@@ -75,7 +83,14 @@ one inside.
 
 - `EnvironmentFile=` naming the key file: its path, with `-`, quotes, `.`, `..` and
   repeated `/` taken off, is `<KBF_ETC>/s3.env` or ends in `/s3.env`, or it is a
-  wildcard that matches `<KBF_ETC>/s3.env`;
+  wildcard that matches `<KBF_ETC>/s3.env`. systemd expands every path with glibc's
+  `glob(3)` (`safe_glob` in `src/basic/glob-util.c`, no flags, in PID 1's C locale),
+  and the rule reads it the same way: `*`, `?`, `[...]` with ranges, `!` or `^`,
+  `[:alpha:]` and the other C-locale classes, `[=c=]` and `[.c.]`, a leading `.`
+  matched only by a `.`, and `\` escapes, taken off a path with no wildcard too
+  (`/etc/kbf/\s3.env` is the key file). Braces and `~` are plain characters (systemd
+  passes neither `GLOB_BRACE` nor `GLOB_TILDE`), and a `..` after a wildcard is read
+  by its words, as if the wildcard matched some directory;
 - `Environment=` setting any `AWS_*` variable, quoted or not, alone on the line or not:
   the key pair, `AWS_SESSION_TOKEN`, and `AWS_PROFILE`, `AWS_SHARED_CREDENTIALS_FILE`
   and `AWS_CONFIG_FILE` (which point an SDK at a key anywhere). A build node talks to no

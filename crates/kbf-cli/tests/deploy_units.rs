@@ -46,6 +46,7 @@ fn each_rendered_mode_unit_parses_with_kbfs_own_parser() {
         match parsed {
             Invocation::Daemon(_) => assert_eq!(mode, Mode::Daemon),
             Invocation::AllInOne(_) => assert_eq!(mode, Mode::AllInOne),
+            Invocation::Storage(_) => assert_eq!(mode, Mode::Storage),
             Invocation::NotBuilt { mode: m, .. } => {
                 assert_eq!(m, mode.name());
                 assert_eq!(argv.len(), 2, "kbf {mode} is not built: {argv:?}");
