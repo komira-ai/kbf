@@ -10,4 +10,5 @@ mod reading;
 mod repair;
 mod stale;
 mod tls;
+mod verifying;
 mod writing;

@@ -3,7 +3,6 @@
 use std::time::Duration;
 
 use kbf_storage::StorageError;
-use kbf_types::{Digest, DigestFunction};
 
 use super::support::{Cluster, active, blob_read_from, map, router};
 
@@ -91,19 +90,4 @@ async fn a_failure_is_shared_and_not_kept() {
     cluster.node(1).set_down(false);
     cluster.node(2).set_down(false);
     assert_eq!(router.read_blob(&digest).await.expect("the blob"), blob);
-}
-
-/// Catches a blob whose owner sends other than the length its digest names, passed to the
-/// caller as the blob: the length is checked.
-#[tokio::test]
-async fn a_blob_of_the_wrong_length_is_an_error() {
-    let map = map(1, 1, active(&[1]));
-    let cluster = Cluster::of(1);
-    let (router, _) = router(&map, &cluster);
-    let digest = Digest::new(DigestFunction::Sha256, [3; 32], 100);
-    cluster.node(1).hold_as(digest, b"short");
-
-    let error = router.read_blob(&digest).await.expect_err("short");
-    assert!(matches!(error, StorageError::Internal(_)), "{error:?}");
-    assert!(error.to_string().contains("5 bytes"), "{error}");
 }
