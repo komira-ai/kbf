@@ -4,8 +4,10 @@
 //!
 //! **The map a node holds.** A node learns the current map from the frontend (the
 //! registration stream's `Welcome` and `MapUpdate`, a separate change), and this crate
-//! does not: it asks a [`MapSource`], which says what the node holds now. A node with no
-//! source, or whose source has no map yet, is a one-member farm and judges nothing.
+//! does not: it asks a [`MapSource`], which says what the node holds now. A node given no
+//! source is a one-member farm and judges nothing. A node given one is a member of a
+//! farm and fails closed: until its source has a map it fetches one, and if it gets
+//! none it serves no call (UNAVAILABLE), whatever generation the caller names.
 //!
 //! **STALE_MAP.** Every call carries the generation of the map its caller routed by
 //! (`kbf.storage.v1`'s `map_generation`, or the `kbf-map-generation` entry on the standard
@@ -37,7 +39,7 @@ use crate::StorageError;
 
 /// The map a node holds now.
 pub trait MapSource: Send + Sync {
-    /// The current map, or `None` before the node has one (a farm of one member).
+    /// The current map, or `None` before the node has learned one.
     fn current(&self) -> Option<Arc<Map>>;
 
     /// The map of generation `at_least` or a newer one, fetched from a frontend, or
@@ -56,6 +58,13 @@ pub trait MapSource: Send + Sync {
 /// fetch it.
 pub const REFETCH_WAIT: Duration = Duration::from_secs(2);
 
+/// This node has no map yet, so it cannot say whether any caller's is the current one.
+#[derive(Debug, thiserror::Error)]
+#[error("this node has not been given a map yet (the caller routed by {requested})")]
+struct NoMap {
+    requested: u64,
+}
+
 /// This node is at a map generation older than the one its caller routed by.
 #[derive(Debug, thiserror::Error)]
 #[error(
@@ -68,29 +77,32 @@ struct NotYetSeen {
 }
 
 /// Whether a call routed by map generation `requested` may be served by the node `source`
-/// speaks for: always, for a node with no map yet. A caller ahead of the node makes it
-/// fetch the map, waiting at most `wait`.
+/// speaks for. A caller ahead of the node, or a node with no map yet, makes it fetch the
+/// map, waiting at most `wait`.
 ///
 /// # Errors
 /// [`StorageError::StaleMap`] if `requested` is older than the node's generation (0 is
-/// older than every map's); [`StorageError::Unavailable`] if it is newer and the node
-/// could not get that map in time.
+/// older than every map's); [`StorageError::Unavailable`] if the caller is newer, or the
+/// node has no map, and the node could not get one in time.
 pub(crate) async fn check(
     source: &dyn MapSource,
     requested: u64,
     wait: Duration,
 ) -> Result<(), StorageError> {
-    let Some(held) = source.current() else {
-        return Ok(());
-    };
-    if requested <= held.generation() {
-        return check_generation(&held, requested);
+    let held = source.current();
+    if let Some(map) = held.as_deref()
+        && requested <= map.generation()
+    {
+        return check_generation(map, requested);
     }
     let fetched = tokio::time::timeout(wait, source.refetch(requested))
         .await
         .ok()
         .flatten();
-    check_generation(&fetched.unwrap_or(held), requested)
+    match fetched.or(held) {
+        Some(map) => check_generation(&map, requested),
+        None => Err(StorageError::Unavailable(Arc::new(NoMap { requested }))),
+    }
 }
 
 /// Whether a call routed by map generation `requested` may be served by a node holding

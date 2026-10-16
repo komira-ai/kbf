@@ -115,19 +115,24 @@ async fn a_stale_caller_is_refused_even_for_a_blob_the_node_holds() {
     assert!(stale(8)(&answer), "{answer:?}");
 }
 
-/// Catches a node that judges when it has no map: with no source's map yet, any
-/// generation is served (a one-member farm).
+/// Catches a node with a map source that serves before it has learned its first map: it
+/// is one of several, so it cannot tell a caller's placement is the current one. Every
+/// generation is refused UNAVAILABLE and nothing is stored. (A node given no source at all
+/// is a one-member farm and serves every generation: the plain `StorageService` tests.)
+/// Mutant: the no-map case answering `Ok`.
 #[tokio::test]
-async fn a_node_with_no_map_serves_every_generation() {
+async fn a_node_with_a_source_and_no_map_serves_no_generation() {
     let mem = std::sync::Arc::new(Mem::default());
     let channel = serve_mapped(&mem, &Held::none()).await;
     for generation in [0, 3, 90] {
         let client = RemoteStorage::new(channel.clone(), generation);
-        client
-            .put(Bytes::from_static(b"any"))
-            .await
-            .expect("served");
+        let answer = client.put(Bytes::from_static(b"any")).await;
+        assert!(
+            matches!(answer, Err(StorageError::Unavailable(_))),
+            "generation {generation}: {answer:?}"
+        );
     }
+    assert_eq!(mem.puts.load(Ordering::SeqCst), 0);
 }
 
 async fn raw(channel: &Channel, header: Option<MetadataValue<tonic::metadata::Ascii>>) -> Status {

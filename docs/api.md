@@ -560,14 +560,16 @@ entry `kbf-map-generation` (the decimal generation) on every other call:
 generation 0, "no map seen". An entry that is not a decimal `u64` is `INVALID_ARGUMENT`.
 
 **The node's judgement**, made before the call reads anything (so no answer, not even
-"already stored", is given under a placement the node no longer holds). A node with no
-map yet judges nothing and serves every call.
+"already stored", is given under a placement the node no longer holds). A node that is
+one of several (it is given a source of maps) and has no map yet fetches one the same way
+and serves no call, whatever the caller's generation, until it has one: `UNAVAILABLE`. A
+node that is not part of a multi-member farm has no such source and judges nothing.
 
 | the caller's generation | the node |
 |---|---|
 | equal to the node's | serves the call |
 | older than the node's (0 included) | answers `STALE_MAP` |
-| newer than the node's | fetches the map, waiting at most 2 seconds, then judges again: serves it if the node is now at the caller's generation, `STALE_MAP` if past it; `UNAVAILABLE` if no map came |
+| newer than the node's, or the node has no map yet | fetches the map, waiting at most 2 seconds, then judges again: serves it if the node is now at the caller's generation, `STALE_MAP` if past it; `UNAVAILABLE` if no map came |
 
 **The encoding of `STALE_MAP`:** the gRPC status `FAILED_PRECONDITION` with the trailing
 metadata entry `kbf-map-generation: <n>` (decimal), the node's generation. The message

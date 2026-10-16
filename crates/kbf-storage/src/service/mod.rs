@@ -21,12 +21,13 @@
 //!
 //! **The map generation** (section 6) rides on every call: a field of every
 //! `kbf.storage.v1` request, and the [`MAP_GENERATION_HEADER`] metadata entry on the
-//! standard calls. [`RemoteStorage`] sends it. A node with no map ignores it; one given a
+//! standard calls. [`RemoteStorage`] sends it. A node given no map source ignores it; one given a
 //! [`crate::replicate::MapSource`] ([`StorageService::with_map`]) judges every call by it,
 //! before the call reads anything: STALE_MAP (FAILED_PRECONDITION with the node's
 //! generation in the same entry) for a caller behind the node; for one ahead of it, the node
 //! fetches the map ([`crate::replicate::MapSource::refetch`]) and goes on, or answers
-//! UNAVAILABLE if it cannot get it in time.
+//! UNAVAILABLE if it cannot get it in time. Such a node that has no map yet fetches one the
+//! same way and serves nothing (UNAVAILABLE) until it has.
 //!
 //! **Who may call** is [`Admission`]: the role in the caller's certificate against the
 //! endpoint's table. Roles are the part of this unit that is partly a seam; the module
@@ -136,7 +137,7 @@ impl StorageService {
     }
 
     /// Whether a call routed by map generation `requested` may be served now: always, for
-    /// a node with no map ([`replicate::check`]).
+    /// a node given no map source ([`replicate::check`]).
     async fn check_map(&self, requested: u64) -> Result<(), StorageError> {
         match &self.map {
             Some(source) => replicate::check(&**source, requested, self.refetch_wait).await,

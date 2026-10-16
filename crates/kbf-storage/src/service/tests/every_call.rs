@@ -61,10 +61,15 @@ impl MapSource for Frontend {
 /// ("reached the store"), so a call the generation check lets through is told from one it
 /// stops.
 async fn node(generation: u64, fetch: Fetch) -> (Arc<Mem>, Arc<Frontend>, Channel) {
+    node_holding(Held::at(generation), fetch).await
+}
+
+/// [`node`] over a source that holds `held` (which may be no map yet).
+async fn node_holding(held: Arc<Held>, fetch: Fetch) -> (Arc<Mem>, Arc<Frontend>, Channel) {
     let mem = Arc::new(Mem::default());
     *mem.fail.lock().expect("lock") = Some(StorageError::Internal("reached the store".into()));
     let source = Arc::new(Frontend {
-        held: Held::at(generation),
+        held,
         fetch,
         asked: Mutex::new(Vec::new()),
     });
@@ -277,6 +282,46 @@ async fn a_fetch_that_brings_nothing_is_unavailable() {
         "{said}"
     );
     assert_eq!(*source.asked.lock().expect("lock"), [9]);
+}
+
+/// Catches a node with a map source and no map that serves whatever generation it is
+/// asked under (a multi-member node must not serve until it has learned its first map):
+/// each of the twelve calls, from a caller at any generation (0 included), is UNAVAILABLE
+/// and none reaches the store or the segments; the node tried to fetch a map for each.
+/// Mutant: `check` returning `Ok(())` when the source has no map.
+#[tokio::test]
+async fn a_node_with_a_source_and_no_map_refuses_every_call() {
+    let (mem, source, channel) = node_holding(Held::none(), Fetch::Nothing).await;
+    for generation in [0, 7] {
+        for (call, went) in every_call(&channel, generation).await {
+            assert_eq!(went, Went::Unavailable, "{call} at generation {generation}");
+        }
+    }
+    assert!(
+        mem.segments.calls.lock().expect("lock").is_empty(),
+        "a segment call was forwarded by a node with no map"
+    );
+    assert_eq!(
+        source.asked.lock().expect("lock").len(),
+        24,
+        "one fetch per call"
+    );
+}
+
+/// Catches a node that, having no map, never goes to get one (every call would fail until
+/// the next push): the fetch brings generation 7, the caller at 7 is served and the one
+/// at 5 is stale, and the node asked once, not again.
+#[tokio::test]
+async fn a_node_with_no_map_fetches_its_first_one() {
+    let (_, source, channel) = node_holding(Held::none(), Fetch::Arrives(7)).await;
+    let caller = RemoteStorage::new(channel.clone(), 7);
+    assert_eq!(went(caller.find_missing(&[sha(b"x")]).await), Went::Reached);
+    let behind = RemoteStorage::new(channel, 5);
+    assert_eq!(
+        went(behind.find_missing(&[sha(b"x")]).await),
+        Went::Stale(7)
+    );
+    assert_eq!(*source.asked.lock().expect("lock"), [7]);
 }
 
 /// A source whose fetch never comes.
