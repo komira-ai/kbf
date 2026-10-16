@@ -7,7 +7,8 @@ use super::{Page, ReadError, Reader, error_message, matches};
 use crate::tests::Fake;
 
 /// Catches: a pattern segment matching more or less than one non-empty segment
-/// (mutants: each condition of the `{name}` guard dropped, a prefix match).
+/// (mutants: each condition of the `{name}` guard dropped, a prefix match), or a
+/// dot segment, in any spelling, matching one (mutant: the dot check dropped).
 #[test]
 fn a_pattern_matches_segment_by_segment() {
     let cases = [
@@ -19,6 +20,22 @@ fn a_pattern_matches_segment_by_segment() {
         ("/v1/invocations/{id", "/v1/invocations/b1", false),
         ("/v1/invocations/id}", "/v1/invocations/b1", false),
         ("/v1/blobs/{digest}", "/v2/blobs/x", false),
+        // Dot segments in every spelling a URL client resolves (WHATWG URL 4.4).
+        ("/v1/invocations/{id}", "/v1/invocations/.", false),
+        ("/v1/invocations/{id}", "/v1/invocations/..", false),
+        ("/v1/invocations/{id}", "/v1/invocations/%2e", false),
+        ("/v1/invocations/{id}", "/v1/invocations/%2E%2e", false),
+        ("/v1/invocations/{id}", "/v1/invocations/.%2E", false),
+        ("/v1/invocations/{id}", "/v1/invocations/%2e.", false),
+        (
+            "/v1/invocations/{id}/actions",
+            "/v1/invocations/../actions",
+            false,
+        ),
+        // Not dot segments: matched as any other id.
+        ("/v1/invocations/{id}", "/v1/invocations/...", true),
+        ("/v1/invocations/{id}", "/v1/invocations/.a", true),
+        ("/v1/invocations/{id}", "/v1/invocations/%252e", true),
     ];
     for (pattern, path, want) in cases {
         assert_eq!(matches(pattern, path), want, "{pattern} {path}");

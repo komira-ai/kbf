@@ -359,6 +359,25 @@ fn a_read_of_an_undeclared_route_is_refused_and_is_a_contract_violation() {
     assert_eq!(violations(&BUILDS, std::slice::from_ref(&url)), [url]);
 }
 
+/// Catches: a dot segment accepted as a route's `{name}` segment (mutant: the dot
+/// check in `matches` dropped), so a page could send `/v1/invocations/..`, which a URL
+/// client resolves to `/v1`, a route no page declares.
+#[test]
+fn no_page_declares_a_dot_segment() {
+    for url in [
+        "/v1/invocations/..",
+        "/v1/invocations/.",
+        "/v1/invocations/%2E%2E",
+        "/v1/invocations/../actions",
+    ] {
+        for page in PAGES {
+            assert!(!page.declares(url), "{}: {url}", page.name);
+        }
+    }
+    assert!(!ACTION.declares("/v1/blobs/%2e%2E"));
+    assert!(!ACTION.declares("/v1/invocations/x/actions/.%2e"));
+}
+
 /// Catches: a log `href` the API sends that leaves the page's routes (a foreign host,
 /// another route) being fetched or linked: it is refused before any request, shown
 /// as a page bug, and listed as text, not as a link.
@@ -385,8 +404,9 @@ fn a_log_href_outside_the_declared_routes_is_not_read() {
 }
 
 /// Catches: routing that answers a page for a path that names none (`/uix`, an
-/// empty id or digest, a segment that is not UTF-8), or that does not decode an id
-/// and encode it again for the API.
+/// empty id or digest, a segment that is not UTF-8, a segment that decodes to `.` or
+/// `..`, which a URL client would resolve to another route), or that does not decode
+/// an id and encode it again for the API.
 #[test]
 fn routing() {
     let fake = farm();
@@ -397,6 +417,11 @@ fn routing() {
         "/ui/builds//actions/x",
         "/ui/builds/x/actions/",
         "/ui/builds/%FF",
+        "/ui/builds/.",
+        "/ui/builds/%2E%2E",
+        "/ui/builds/.%2e",
+        "/ui/builds/x/actions/%2e%2e",
+        "/ui/builds/%2e/actions/x",
         "/ui/builds/x/other/y",
         "/ui/static/other.css",
         "/elsewhere",

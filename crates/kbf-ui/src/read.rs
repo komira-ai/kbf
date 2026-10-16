@@ -2,7 +2,8 @@
 //!
 //! Every page is a [`Page`]: its name and the read API routes it may read, as route
 //! patterns (`/v1/invocations/{id}/actions`). A page reads only through a
-//! [`Reader`] made for it, which refuses a URL that matches none of its routes before
+//! [`Reader`] made for it, which refuses a URL that matches none of its routes (or
+//! holds a dot segment, which a URL client would resolve to another route) before
 //! anything is sent, and records every URL it was asked for, refused or not, so the
 //! page can show them. The contract test (`tests.rs`) renders every page and checks
 //! both what each page asked for and what reached the source.
@@ -17,7 +18,8 @@ pub(crate) struct Page {
     /// The page's name, as its `<title>` and navigation show it.
     pub(crate) name: &'static str,
     /// The read API routes the page may read, as patterns: a `{name}` segment
-    /// matches any one non-empty segment; the query is not part of the match.
+    /// matches any one non-empty segment but `.` or `..` (in any spelling); the query
+    /// is not part of the match.
     pub(crate) reads: &'static [&'static str],
 }
 
@@ -29,18 +31,28 @@ impl Page {
     }
 }
 
-/// Whether `path` matches route `pattern` segment by segment.
+/// Whether `path` matches route `pattern` segment by segment. A dot segment never
+/// matches: a URL client resolves it, so the URL sent would not be the route matched.
 fn matches(pattern: &str, path: &str) -> bool {
     let mut want = pattern.split('/');
     let mut got = path.split('/');
     loop {
         match (want.next(), got.next()) {
             (None, None) => return true,
+            (_, Some(g)) if is_dot_segment(g) => return false,
             (Some(w), Some(g)) if w.starts_with('{') && w.ends_with('}') && !g.is_empty() => {}
             (Some(w), Some(g)) if w == g => {}
             _ => return false,
         }
     }
+}
+
+/// Whether `segment` (percent-encoded) is `.` or `..` in any spelling a URL client
+/// resolves: `%2e` in either case for a dot (WHATWG URL, "single-dot" and
+/// "double-dot" segments).
+fn is_dot_segment(segment: &str) -> bool {
+    let dots = segment.to_ascii_lowercase().replace("%2e", ".");
+    dots == "." || dots == ".."
 }
 
 /// Why a read gave the page no document.

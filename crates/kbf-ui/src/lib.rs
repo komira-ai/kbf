@@ -114,7 +114,9 @@ impl Answer {
 }
 
 /// The answer to `GET path?query` under [`PREFIX`]: a page, the stylesheet, or a
-/// `404` page. `path` is as sent (percent-encoded); `query` is without its `?`.
+/// `404` page (for a path that names no page, one with a segment that is not UTF-8,
+/// or one with a segment that decodes to `.` or `..`). `path` is as sent
+/// (percent-encoded); `query` is without its `?`.
 pub async fn respond<S: Source + Sync>(source: &S, path: &str, query: &str) -> Answer {
     if path == STYLESHEET {
         return Answer {
@@ -136,7 +138,9 @@ pub async fn respond<S: Source + Sync>(source: &S, path: &str, query: &str) -> A
             Some(s.into_owned())
         })
         .collect();
-    let Some(segments) = decoded else {
+    // A segment that decodes to `.` or `..` names no page: written into a read API
+    // URL it would be resolved away, so the page would read another route.
+    let Some(segments) = decoded.filter(|s| !s.iter().any(|s| s == "." || s == "..")) else {
         return pages::not_found(path);
     };
     match segments.iter().map(String::as_str).collect::<Vec<_>>()[..] {
