@@ -42,27 +42,63 @@ pub(super) fn check_digest_function(f: i32) -> Result<(), Status> {
 }
 
 /// The blob a ByteStream `Read` names: `{instance}/blobs/{sha256/}{hash}/{size}`. The
-/// instance name is not read: a storage node holds one cache.
+/// instance name is not read: a storage node holds one cache. (`compressed-blobs/` is
+/// not served: no compressor is advertised.)
 pub(super) fn read_resource(name: &str) -> Result<Digest, Status> {
     let parts: Vec<&str> = name.split('/').collect();
-    match parts.iter().position(|p| *p == "blobs") {
-        Some(at) => match blob_digest(name, &parts[at + 1..])? {
+    anchored(
+        name,
+        &parts,
+        "blobs",
+        "no `blobs/` segment",
+        |at| match blob_digest(name, &parts[at + 1..])? {
             (digest, []) => Ok(digest),
             _ => Err(bad(name, "unexpected segments after the size")),
         },
-        None => Err(bad(name, "no `blobs/` segment")),
-    }
+    )
 }
 
 /// The blob a ByteStream `Write` names:
 /// `{instance}/uploads/{uuid}/blobs/{sha256/}{hash}/{size}{/metadata}`.
 pub(super) fn write_resource(name: &str) -> Result<Digest, Status> {
     let parts: Vec<&str> = name.split('/').collect();
-    let at = parts.iter().position(|p| *p == "uploads");
-    match at.and_then(|at| parts.get(at + 2..)) {
-        // Anything after the size is client metadata, which REAPI lets the server ignore.
-        Some(["blobs", rest @ ..]) => blob_digest(name, rest).map(|(digest, _)| digest),
-        _ => Err(bad(name, "expected `uploads/{uuid}/blobs/{hash}/{size}`")),
+    let expected = "expected `uploads/{uuid}/blobs/{hash}/{size}`";
+    anchored(name, &parts, "uploads", expected, |at| {
+        match parts.get(at + 2..) {
+            // Anything after the size is client metadata, which REAPI lets the server
+            // ignore.
+            Some(["blobs", rest @ ..]) => blob_digest(name, rest).map(|(digest, _)| digest),
+            _ => Err(bad(name, expected)),
+        }
+    })
+}
+
+/// Reads a resource name at the first `anchor` segment where `parse` accepts what follows.
+///
+/// The segment is not simply the first one, because an instance name is any path:
+/// `a/uploads/b/uploads/u/blobs/{hash}/7` has an instance, `a/uploads/b`, that contains
+/// the anchor. A position is taken only where the whole structure after it parses, so
+/// it is the first that is a real `uploads/{uuid}/blobs/...` (or `blobs/{digest}`).
+/// When none is, the error is the first position's, which names what was expected.
+fn anchored<T>(
+    name: &str,
+    parts: &[&str],
+    anchor: &str,
+    missing: &str,
+    parse: impl Fn(usize) -> Result<T, Status>,
+) -> Result<T, Status> {
+    let mut first_refusal = None;
+    for at in (0..parts.len()).filter(|at| parts[*at] == anchor) {
+        match parse(at) {
+            Ok(found) => return Ok(found),
+            Err(refusal) => {
+                first_refusal.get_or_insert(refusal);
+            }
+        }
+    }
+    match first_refusal {
+        Some(refusal) => Err(refusal),
+        None => Err(bad(name, missing)),
     }
 }
 

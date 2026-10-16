@@ -66,6 +66,15 @@ pub const MAX_MESSAGE_BYTES: usize = (16 << 20) + (1 << 20);
 /// The largest blob a `Write` accepts, `kbf-front`'s `MAX_BLOB_BYTES` (pinned the same).
 pub const MAX_BLOB_BYTES: u64 = 1 << 30;
 
+/// The most digests one `FindMissingBlobs` may name. `kbf-front` sets none beyond the
+/// message size, and a full message could name 262 144 of them (17 MiB over the 68 bytes
+/// of the smallest digest), each a lookup in the store, so the node bounds the work of
+/// one call below that: 65 536, 64 times the 1 000 a transfer engine asks about by
+/// default. A call over it is INVALID_ARGUMENT, not RESOURCE_EXHAUSTED: REAPI uses that
+/// code for a server out of space, and a client that reads it retries; this refusal
+/// cannot pass by retrying, only by splitting the call.
+pub const MAX_FIND_MISSING_DIGESTS: usize = 1 << 16;
+
 /// What the service is set up with.
 #[derive(Clone, Copy, Debug)]
 pub struct Config {

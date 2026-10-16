@@ -13,7 +13,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use bytes::Bytes;
-use fake::{Mem, pair, patterned, serve, serve_odd, sha};
+use fake::{Mem, pair, patterned, serve, serve_odd, serve_spied, sha};
 use futures::{StreamExt as _, stream};
 use kbf_meta::{ActionRecord, ActionWriteError, Role};
 use kbf_proto::google::bytestream::byte_stream_client::ByteStreamClient;
@@ -36,7 +36,10 @@ use tonic::transport::Channel;
 use tonic::{Code, Request, Status};
 
 use super::wire::{self, to_proto};
-use super::{MAX_BLOB_BYTES, MAX_MESSAGE_BYTES, RemoteStorage};
+use super::{
+    MAP_GENERATION_HEADER, MAX_BLOB_BYTES, MAX_FIND_MISSING_DIGESTS, MAX_MESSAGE_BYTES,
+    RemoteStorage,
+};
 use crate::{READ_CHUNK_BYTES, Storage, StorageError};
 
 /// Collects a read: the sizes of its chunks and its bytes.
@@ -797,6 +800,237 @@ fn resource_names_parse_every_spelling() {
     assert!(wire::read_resource(&format!("blobs/{hash}/7/extra")).is_err());
     assert!(wire::write_resource(&format!("uploads/blobs/{hash}/7")).is_err());
     assert!(wire::write_resource(&format!("blobs/{hash}/7")).is_err());
+}
+
+/// Catches a resource name read at the wrong segment when the instance name holds a word
+/// of the grammar. An instance name is any path, so `a/uploads/b` and `blobs` are
+/// instances, and `{instance}/uploads/{uuid}/blobs/{hash}/{size}` must be read at the
+/// `uploads/{uuid}/blobs/` that is followed by a digest (the first, for a metadata
+/// tail that holds another). A parser that takes the first `uploads` or `blobs` word, or
+/// the last, fails one of these; each case names the size it must come out with.
+#[test]
+fn an_instance_name_may_hold_the_words_of_the_grammar() {
+    let hash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+    let other = "ab".repeat(32);
+    let writes = [
+        // An empty instance, and one that is a single reserved word.
+        (format!("uploads/u/blobs/{hash}/7"), 7),
+        (format!("uploads/uploads/blobs/{hash}/7"), 7),
+        (format!("blobs/uploads/u/blobs/{hash}/7"), 7),
+        // An instance holding `uploads` (the first one is not the anchor).
+        (format!("a/uploads/b/uploads/u/blobs/{hash}/7"), 7),
+        (format!("uploads/uploads/uploads/blobs/{hash}/7"), 7),
+        // An instance that holds a whole `uploads/x/blobs/` before the real one.
+        (format!("i/uploads/x/blobs/y/uploads/u/blobs/{hash}/7"), 7),
+        (
+            format!("uploads/x/blobs/uploads/u/blobs/sha256/{hash}/7"),
+            7,
+        ),
+        // A metadata tail that looks like another upload is metadata.
+        (
+            format!("uploads/u/blobs/{hash}/7/uploads/v/blobs/{other}/9"),
+            7,
+        ),
+        (format!("a/uploads/u/blobs/sha256/{hash}/7/m"), 7),
+    ];
+    for (name, size) in writes {
+        let digest = wire::write_resource(&name).unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_eq!(digest.size_bytes, size, "{name}");
+        assert_eq!(digest.hash_hex(), hash, "{name}");
+    }
+    let reads = [
+        (format!("blobs/{hash}/7"), 7),
+        (format!("blobs/blobs/{hash}/7"), 7),
+        (format!("a/blobs/b/blobs/{hash}/7"), 7),
+        (format!("blobs/b/blobs/sha256/{hash}/7"), 7),
+        (format!("sha256/blobs/{hash}/7"), 7),
+        (format!("uploads/blobs/{hash}/7"), 7),
+    ];
+    for (name, size) in reads {
+        let digest = wire::read_resource(&name).unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_eq!(digest.size_bytes, size, "{name}");
+    }
+    // The words alone, or with no digest after them, are still refused, each with the
+    // reason of the first word.
+    for bad in ["blobs", "a/blobs/b", "blobs/blobs/blobs"] {
+        let refused = wire::read_resource(bad).expect_err(bad);
+        assert_eq!(refused.code(), Code::InvalidArgument, "{bad}");
+    }
+    for bad in ["uploads", "a/uploads/b/blobs", "uploads/u/uploads/v/blobs"] {
+        let refused = wire::write_resource(bad).expect_err(bad);
+        assert_eq!(refused.code(), Code::InvalidArgument, "{bad}");
+        assert!(refused.message().contains("expected"), "{bad}");
+    }
+    // A read has nothing after the size: a tail is no read, not a metadata.
+    assert!(wire::read_resource(&format!("blobs/{hash}/7/extra/blobs")).is_err());
+}
+
+/// Catches a FindMissing that has no limit on the digests of a call, or the wrong one:
+/// a call at the limit is answered, one digest over it is INVALID_ARGUMENT (the code
+/// that says splitting the call is the fix, and that a client does not retry), and
+/// nothing is looked up for it. The limit is under what a full message could hold (the
+/// smallest digest encodes to 68 bytes), so it is a bound on work, not on bytes.
+#[tokio::test]
+async fn find_missing_refuses_a_call_over_the_digest_limit() {
+    const { assert!(MAX_FIND_MISSING_DIGESTS * 68 < MAX_MESSAGE_BYTES) };
+    let (_mem, _remote, channel) = pair().await;
+    let mut cas =
+        ContentAddressableStorageClient::new(channel).max_decoding_message_size(MAX_MESSAGE_BYTES);
+    let digests = |n| vec![to_proto(&sha(b"a")); n];
+    let ask = |blob_digests| FindMissingBlobsRequest {
+        instance_name: String::new(),
+        blob_digests,
+        digest_function: 0,
+    };
+    let at = cas
+        .find_missing_blobs(ask(digests(MAX_FIND_MISSING_DIGESTS)))
+        .await
+        .expect("at the limit")
+        .into_inner();
+    assert_eq!(at.missing_blob_digests.len(), MAX_FIND_MISSING_DIGESTS);
+    let over = cas
+        .find_missing_blobs(ask(digests(MAX_FIND_MISSING_DIGESTS + 1)))
+        .await
+        .expect_err("over the limit");
+    assert_eq!(over.code(), Code::InvalidArgument);
+    assert!(
+        over.message()
+            .contains(&(MAX_FIND_MISSING_DIGESTS + 1).to_string())
+            && over
+                .message()
+                .contains(&MAX_FIND_MISSING_DIGESTS.to_string()),
+        "{}",
+        over.message()
+    );
+}
+
+/// Catches a map generation that cannot change after the client is built, or that does
+/// not reach every call: the header arrives at the server on every service the client
+/// calls (FindMissing, ByteStream Read and Write, the action store, all five Segments
+/// calls), as 5 for the first of each and as 6 for each after `set_map_generation`,
+/// whichever clone made the update. (`RemoteStorage` makes no `QueryWriteStatus` call;
+/// the last call here is a raw one that carries the header, to see that service's
+/// handler is behind the same stack.)
+#[tokio::test]
+async fn the_map_generation_reaches_every_service_and_can_be_updated() {
+    let mem = Arc::new(Mem::default());
+    let (seen, channel) = serve_spied(&mem).await;
+    let remote = RemoteStorage::new(channel.clone(), 5);
+    let held = remote.put(Bytes::from_static(b"abc")).await.expect("write");
+    remote.find_missing(&[held]).await.expect("find_missing");
+    remote.read_blob(&held).await.expect("read");
+    let action = sha(b"action");
+    remote.action_result(&action).await.expect("get");
+    remote
+        .prepare_action_result(&ActionResult::default())
+        .await
+        .expect("prepare");
+    let record = ActionRecord {
+        result: held,
+        closure: kbf_meta::Closure::new(),
+    };
+    remote
+        .commit_action_record(Role::Daemon, action, record)
+        .await
+        .expect("commit");
+    let segments = remote.segments();
+    segments
+        .begin(Request::new(BeginRequest::default()))
+        .await
+        .expect("begin");
+    segments
+        .put_range(Request::new(PutRangeRequest::default()))
+        .await
+        .expect("put_range");
+    segments
+        .commit(Request::new(SegmentsCommit::default()))
+        .await
+        .expect("commit");
+    segments
+        .locate(Request::new(LocateRequest::default()))
+        .await
+        .expect("locate");
+    segments
+        .read_range(Request::new(ReadRangeRequest::default()))
+        .await
+        .expect("read_range");
+    let mut raw = Request::new(QueryWriteStatusRequest {
+        resource_name: upload_name(&held),
+    });
+    raw.metadata_mut()
+        .insert(MAP_GENERATION_HEADER, 5u64.into());
+    ByteStreamClient::new(channel)
+        .query_write_status(raw)
+        .await
+        .expect("query_write_status");
+
+    let services = [
+        "bytestream",
+        "cas",
+        "bytestream",
+        "actions",
+        "actions",
+        "actions",
+        "segments",
+        "segments",
+        "segments",
+        "segments",
+        "segments",
+        "bytestream",
+    ];
+    let first: Vec<_> = std::mem::take(&mut *seen.lock().expect("lock"));
+    let want: Vec<_> = services
+        .into_iter()
+        .map(|service| (service, Some("5".to_owned())))
+        .collect();
+    assert_eq!(first, want);
+
+    // An update through a clone, and the original (and its Segments handle) call again.
+    remote.clone().set_map_generation(6);
+    remote.find_missing(&[held]).await.expect("find_missing");
+    remote.read_blob(&held).await.expect("read");
+    remote.action_result(&action).await.expect("get");
+    segments
+        .begin(Request::new(BeginRequest::default()))
+        .await
+        .expect("begin");
+    let second = seen.lock().expect("lock").clone();
+    let want: Vec<_> = ["cas", "bytestream", "actions", "segments"]
+        .into_iter()
+        .map(|service| (service, Some("6".to_owned())))
+        .collect();
+    assert_eq!(second, want);
+}
+
+/// Catches an action-store call that keeps the generation the client was built with:
+/// the message's field, which section 6's STALE_MAP reads, is the updated one on `Get`,
+/// `Prepare` and `Commit`, and is the one the header carries (see above).
+#[tokio::test]
+async fn an_updated_generation_is_in_the_action_store_field() {
+    let (odd, channel) = serve_odd().await;
+    let remote = RemoteStorage::new(channel, 9);
+    let record = || ActionRecord {
+        result: sha(b"r"),
+        closure: kbf_meta::Closure::new(),
+    };
+    let calls = |remote: &RemoteStorage| {
+        let remote = remote.clone();
+        async move {
+            let _ = remote.action_result(&sha(b"a")).await;
+            let _ = remote.prepare_action_result(&ActionResult::default()).await;
+            remote
+                .commit_action_record(Role::Daemon, sha(b"a"), record())
+                .await
+                .expect("commit");
+        }
+    };
+    calls(&remote).await;
+    remote.set_map_generation(10);
+    calls(&remote).await;
+    assert_eq!(
+        *odd.generations.lock().expect("lock"),
+        [9, 9, 9, 10, 10, 10]
+    );
 }
 
 /// Catches a limit that drifted from the front's (a test in kbf-server pins the front's

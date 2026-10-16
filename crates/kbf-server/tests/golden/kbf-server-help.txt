@@ -26,6 +26,9 @@ Options:
       --meta-dir <DIR>
           The directory of the metadata log (the CAS index and the action cache, a single-voter Raft log), on a local disk; created if missing. An empty directory gets a new log with a new id; every later start over it reads the id from the directory. Left out, it is `<hot store directory>/meta`; required when there is no `file://` hot store. Given, it wins over the hot store's directory
 
+      --state-store <URI>
+          Where the scheduler keeps its state, written before each change is acknowledged and replayed at start: `sqlite:///absolute/path` (a file on a local disk that this process owns; every start is a new epoch, so daemons kill the runs of the leases they held before) or `postgres://...` (a database that outlives the process; a start keeps its epoch, so daemons keep their runs). Any other scheme is refused. This build has neither backend yet: a start with the flag is refused. Left out, the scheduler's state is in memory and a restart loses it
+
       --log-dir <DIR>
           The directory of the durable log file, `kbf-server.log` and its rotated `kbf-server.log.1`, `.2`, ... (created if missing): every event stderr gets, in the same format, kept across restarts. Left out, it is `<hot store directory>/log` when the hot store is a directory; with neither, there is no file and the server logs to stderr alone (the start logs which). A directory or file that cannot be written never stops the server ([`crate::log_file`])
 
