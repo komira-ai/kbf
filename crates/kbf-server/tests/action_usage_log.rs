@@ -51,7 +51,7 @@ impl Write for Log {
 /// The binary's log, its subscriber installed by the first test to ask.
 fn log() -> &'static Log {
     static LOG: OnceLock<Log> = OnceLock::new();
-    LOG.get_or_init(|| {
+    let log = LOG.get_or_init(|| {
         let log = Log::default();
         let writer = log.clone();
         let subscriber = tracing_subscriber::fmt()
@@ -62,7 +62,12 @@ fn log() -> &'static Log {
             .finish();
         tracing::subscriber::set_global_default(subscriber).expect("the only subscriber");
         log
-    })
+    });
+    // Tests run in parallel: a callsite another test's thread first reached while this
+    // subscriber was being installed may have cached "never" (tests/thread_log_capture.rs),
+    // so re-evaluate every callsite against it now that it is the global default.
+    tracing_core::callsite::rebuild_interest_cache();
+    log
 }
 
 /// The lines logged so far that contain `what` and name `key`.

@@ -9,6 +9,13 @@
 //!   `{"deadline_secs": N}`; without one the deadline is [`DRAIN_DEADLINE`]. The answer
 //!   is the node as it is after the action.
 //!
+//! - `GET /v1/frontend/drain`: whether the frontend is draining, the Execute and
+//!   WaitExecution streams open and the operations queued ([`DrainStatus`]).
+//!   `POST /v1/frontend/drain` begins the drain ([`crate::drain`]) and answers the same
+//!   status: new Execute calls are refused, `/readyz` goes false, the REAPI listener is
+//!   sent GOAWAY, open streams run until their action is done, and the server exits
+//!   when they have. It is not undone: a drained frontend is restarted.
+//!
 //! Reads answer anyone who reaches the listener. A write must pass every gate of
 //! [`write_request`], because a loopback peer is not an operator: every server host is
 //! also a worker whose build actions can reach loopback, a reverse proxy on the host
@@ -28,11 +35,10 @@ use axum::http::header::{AUTHORIZATION, CONTENT_TYPE, ORIGIN, WWW_AUTHENTICATE};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use kbf_front::MetaLog;
-use kbf_objstore::ObjectStore;
 use kbf_types::WorkerId;
 use serde::Deserialize;
 
+use crate::drain::{Drain, DrainStatus};
 use crate::farm::{Farm, NodeAction};
 use crate::token::ApiToken;
 
@@ -43,46 +49,99 @@ pub const JSON: &str = "application/json";
 /// (`drain_deadline` in `fleet-updates.md` section 4.1).
 pub const DRAIN_DEADLINE: Duration = Duration::from_secs(30 * 60);
 
-/// What the handlers share: the farm, and the token writes must present (`None`:
-/// writes are off).
-struct ApiState<M, O> {
-    farm: Arc<Farm<M, O>>,
+/// The path of the frontend's drain: `GET` reads it, `POST` begins it.
+pub const FRONTEND_DRAIN: &str = "/v1/frontend/drain";
+
+/// The path of `GET /v1/nodes`.
+pub const NODES: &str = "/v1/nodes";
+
+/// The path of `POST /v1/nodes/{node}:{verb}`, with `node` percent-encoded (every byte
+/// but an ASCII letter, digit, `-`, `.`, `_` or `~`), so a node id that holds a `/`, a
+/// `:` or a space still names one path segment.
+#[must_use]
+pub fn node_path(node: &str, verb: &str) -> String {
+    let mut path = format!("{NODES}/");
+    for byte in node.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            path.push(char::from(byte));
+        } else {
+            path.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    path.push(':');
+    path.push_str(verb);
+    path
+}
+
+/// What the handlers share: the farm, the token writes must present (`None`: writes
+/// are off) and the frontend's drain.
+struct ApiState {
+    farm: Arc<Farm>,
     token: Option<ApiToken>,
+    drain: Arc<Drain>,
 }
 
 /// The API's routes over `farm`; writes need `token`, and without one are refused.
-/// Writes read the peer address from [`ConnectInfo`]: serve them with
-/// `into_make_service_with_connect_info`.
-pub fn router<M, O>(farm: Arc<Farm<M, O>>, token: Option<ApiToken>) -> Router
-where
-    M: MetaLog,
-    O: ObjectStore + 'static,
-{
+/// `drain` is what `POST /v1/frontend/drain` begins. Writes read the peer address from
+/// [`ConnectInfo`]: serve them with `into_make_service_with_connect_info`.
+pub fn router(farm: Arc<Farm>, token: Option<ApiToken>, drain: Arc<Drain>) -> Router {
     Router::new()
-        .route("/v1/nodes", get(nodes::<M, O>))
-        .route("/v1/nodes/{target}", post(act::<M, O>))
-        .with_state(Arc::new(ApiState { farm, token }))
+        .route(NODES, get(nodes))
+        .route("/v1/nodes/{target}", post(act))
+        .route(FRONTEND_DRAIN, get(drain_status).post(begin_drain))
+        .with_state(Arc::new(ApiState { farm, token, drain }))
 }
 
-async fn nodes<M, O>(State(api): State<Arc<ApiState<M, O>>>) -> Response
-where
-    M: MetaLog,
-    O: ObjectStore + 'static,
-{
+/// The drain as it is now.
+fn status(api: &ApiState) -> DrainStatus {
+    DrainStatus {
+        draining: api.drain.is_draining(),
+        open_executions: api.farm.open_executions(),
+        queued_operations: api.farm.queued_operations(),
+    }
+}
+
+async fn drain_status(State(api): State<Arc<ApiState>>) -> Response {
+    json(StatusCode::OK, &status(&api))
+}
+
+/// The body a frontend drain may carry: none, or `{}`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NoBody {}
+
+async fn begin_drain(
+    State(api): State<Arc<ApiState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if let Err((code, why)) = gate(api.token.as_ref(), peer, &headers) {
+        return error(code, &why);
+    }
+    if !body.is_empty()
+        && let Err(e) = serde_json::from_slice::<NoBody>(&body)
+    {
+        let why = format!("a frontend drain takes no body, or {{}}: {e}");
+        return error(StatusCode::BAD_REQUEST, &why);
+    }
+    if api.drain.begin() {
+        tracing::info!("frontend drain begun by the operator API");
+    }
+    json(StatusCode::OK, &status(&api))
+}
+
+async fn nodes(State(api): State<Arc<ApiState>>) -> Response {
     json(StatusCode::OK, &api.farm.nodes())
 }
 
-async fn act<M, O>(
-    State(api): State<Arc<ApiState<M, O>>>,
+async fn act(
+    State(api): State<Arc<ApiState>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Path(target): Path<String>,
     headers: HeaderMap,
     body: Bytes,
-) -> Response
-where
-    M: MetaLog,
-    O: ObjectStore + 'static,
-{
+) -> Response {
     let request = Write {
         peer,
         headers: &headers,
@@ -118,8 +177,7 @@ struct DrainBody {
     deadline_secs: u64,
 }
 
-/// The node and action `write` names, if it passes every gate and is well formed;
-/// else the status and reason to answer with. The gates, in order:
+/// The gates every write passes, in order:
 ///
 /// 1. the peer is loopback, so the token never crosses a network in clear (a remote
 ///    operator comes through a TLS-terminating proxy on the host): else 403;
@@ -129,20 +187,11 @@ struct DrainBody {
 /// 4. `Authorization: Bearer <token>`, compared in constant time: else 401;
 /// 5. `Content-Type: application/json` (parameters allowed), which a browser cannot
 ///    send cross-origin without a preflight the API never answers: else 415.
-///
-/// # Errors
-/// The gates above; then 404 for a target without a known verb, and 400 for a drain
-/// body that is not `{"deadline_secs": N}`.
-pub fn write_request(
+fn gate(
     token: Option<&ApiToken>,
-    write: &Write<'_>,
-) -> Result<(WorkerId, NodeAction), (StatusCode, String)> {
-    let Write {
-        peer,
-        headers,
-        target,
-        body,
-    } = *write;
+    peer: SocketAddr,
+    headers: &HeaderMap,
+) -> Result<(), (StatusCode, String)> {
     if !peer.ip().to_canonical().is_loopback() {
         return Err((
             StatusCode::FORBIDDEN,
@@ -175,6 +224,26 @@ pub fn write_request(
             format!("a write is sent as Content-Type: {JSON}"),
         ));
     }
+    Ok(())
+}
+
+/// The node and action `write` names, if it passes every gate (see [`gate`]) and is
+/// well formed; else the status and reason to answer with.
+///
+/// # Errors
+/// The gates; then 404 for a target without a known verb, and 400 for a drain
+/// body that is not `{"deadline_secs": N}`.
+pub fn write_request(
+    token: Option<&ApiToken>,
+    write: &Write<'_>,
+) -> Result<(WorkerId, NodeAction), (StatusCode, String)> {
+    let Write {
+        peer,
+        headers,
+        target,
+        body,
+    } = *write;
+    gate(token, peer, headers)?;
     let unknown = || (StatusCode::NOT_FOUND, format!("no action {target:?}"));
     let (node, verb) = target.rsplit_once(':').ok_or_else(unknown)?;
     let action = match verb {

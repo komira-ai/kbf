@@ -144,6 +144,56 @@ A server restart forgets every cordon, as it forgets the rest of the scheduler's
 state, and every start logs a warning that says so. The protocol has no drain
 message yet: the daemon is not told, and the server simply sends it no new `Start`.
 
+## `GET /v1/frontend/drain` and `POST /v1/frontend/drain`
+
+Draining the frontend itself, for a rollout that restarts it (the nodes are drained
+with `:drain` above). Buck2 does not recover an Execute stream that breaks after it
+started, so a restart that cuts a stream fails its action: the frontend is drained, and
+restarted when it has no stream left.
+
+**`GET /v1/frontend/drain`**: a read, open like `GET /v1/nodes`:
+
+```json
+{ "draining": false, "open_executions": 3, "queued_operations": 1 }
+```
+
+- `draining`: a drain has begun, by this endpoint or by SIGTERM or SIGINT. It is not
+  undone.
+- `open_executions`: Execute and WaitExecution operation streams open now
+  (`kbf_front_open_executions`: a stream counts from the moment it is made, before its
+  first operation is read, until it ends or its client leaves).
+- `queued_operations`: operations in the scheduler's queue, with no lease yet. With
+  `open_executions` it tells idle (both 0) from busy, and a stream that waits for a
+  worker (`open_executions` above 0, `queued_operations` above 0, no lease running)
+  from one that runs. `kbf_front_executes_started_total` (see the metrics below) tells a
+  client that has just come from one that is still there.
+
+**`POST /v1/frontend/drain`**: begins the drain, a write that passes every gate of
+[Who may write](#who-may-write) and takes no body (or `{}`), and answers the same status
+with `draining` true. Calling it again changes nothing; SIGTERM or SIGINT after it
+changes nothing either. The drain:
+
+- turns `/readyz` to `503` (`stopping`) and the health service to `NOT_SERVING`;
+- refuses every new Execute `UNAVAILABLE`, which Buck2 retries when it opens a call;
+- sends the REAPI listener GOAWAY, so it takes no new connection;
+- keeps every open Execute and WaitExecution stream until its action is done;
+- ends the server, exit 0, when the REAPI connections have closed. The worker listener
+  and this API stay up until then, so daemons go on reporting results.
+
+A frontend that has nothing open exits at once, after answering the request. What ends
+a drain that waits too long: `--shutdown-timeout-secs` when a signal began it (the
+default waits for ever), or a second SIGTERM or SIGINT, which ends every open stream
+`UNAVAILABLE` (the action fails) and stops the server within a few seconds. Under
+systemd that means `TimeoutStopSec=infinity` in the unit: a stop timeout would SIGKILL
+the drain, and the unit templates in `kbf-deploy` set it.
+
+`kbf cluster` (on the frontend's host) calls this API: `kbf cluster status [--frontend]`,
+`kbf cluster drain <node> [--deadline-secs N] --token-file F`, `kbf cluster drain
+--frontend --token-file F` and `kbf cluster undrain <node> --token-file F` (the API's
+`:uncordon`). It prints the answer's JSON, exits 0 on a 2xx and 1 otherwise, and takes
+`--api` for the listener (default `127.0.0.1:8982`). A frontend drain has no undrain:
+restart it.
+
 ## `GET /healthz` and `GET /readyz`
 
 For the health check of a front or proxy (a TLS-terminating ingress, Envoy) in front
@@ -170,7 +220,7 @@ otherwise; the body lists each failing check and why:
 
 | Check | Fails when |
 |---|---|
-| `stopping` | the server has received SIGTERM or SIGINT. It answers `503` from that moment, before its REAPI streams are ended, and for the rest of its drain (`--shutdown-timeout-secs`) |
+| `stopping` | the server has received SIGTERM or SIGINT, or `POST /v1/frontend/drain` has begun a drain. It answers `503` from that moment, and for the rest of the drain; open Execute streams are kept until their action is done, and only the shutdown timeout (`--shutdown-timeout-secs`) or a second signal ends them |
 | `leader` | the server does not hold the scheduler role. A single server runs every role and always holds it; the check is there for a replicated control log, whose followers fail it. **Planned**: a second readiness path, without this check, for the servers that may serve reads ([deployment-topology.md](design/deployment-topology.md#build-clients-one-name-routed-by-method)) |
 | `store` | the object store does not answer a one-byte read of the key `<prefix>readyz-probe` within `--readyz-store-timeout-ms` (default 2000; it bounds the gRPC health service's probe too), or answers with an error. The probe only reads: no poll writes, deletes or lists. Nothing writes that key, so "not found" is the expected answer and passes, as does the object's bytes or a range past its end |
 
@@ -238,6 +288,8 @@ caller goes away before the answer counts as an error.
 | `kbf_find_missing_requests_total`, `_errors_total`, `_in_flight`, `_seconds` | as above | FindMissingBlobs calls; `kbf_find_missing_digests_total` the digests asked about, `kbf_find_missing_missing_total` those answered missing |
 | `kbf_execute_requests_total`, `_errors_total` | counter | Execute calls ended, and those that ended in an error status or were dropped by their caller before the done operation (an operation that finished with a failed `ExecuteResponse` is not one) |
 | `kbf_execute_in_flight` | gauge | Execute and WaitExecution streams open |
+| `kbf_front_open_executions` | gauge | Execute and WaitExecution operation streams alive: raised when the stream is made (before its first item is read), lowered when it ends or its caller drops it. A call still being authorized or prepared, and one answered from the action cache, is not in it. `GET /v1/frontend/drain` reports it |
+| `kbf_front_executes_started_total` | counter | Execute calls the front took (not refused because it is draining), cache hits included |
 | `kbf_execute_queued` | gauge | Execute streams the scheduler accepted whose operation has not left `QUEUED` |
 | `kbf_execute_prepare_seconds` | histogram | an Execute from its arrival to the call of the scheduler: authorization, action cache lookup, reading the action and its inputs, the held-inputs check, the booking; observed only for an Execute that reaches the scheduler |
 | `kbf_execute_dispatch_seconds` | histogram | the scheduler's submit call, from the call to its return |
@@ -283,6 +335,23 @@ watches.
 | `kbf_write_tier_flushed_copy_bytes` | gauge | flushed copies kept for local reads, in what the budget leaves over |
 | `kbf_write_tier_unflushed_bytes`, `kbf_write_tier_unflushed_blocks` | gauge | acknowledged bytes, and the blocks holding them, not yet in the object store |
 | `kbf_write_tier_oldest_unflushed_seconds` | gauge | the age of the oldest of those blocks (since it was created, or since the restart that recovered it); 0 when there is none |
+
+In `kbf-all-in-one`, when the hot store is a directory on the filesystem of `--data-dir`,
+the daemon half's input cache and the server half's hot store are one cache
+([architecture-v2.md](design/architecture-v2.md#10-locality)): the input cache's
+directory is the node's only local copy of a blob, the tier deletes a block once it is
+flushed (so `kbf_write_tier_flushed_copy_bytes` stays 0), and the input cache evicts its
+entries until they and the tier's blocks fit its budget: after each input it fills, and
+within about a second of the tier growing past what the budget leaves it (uploads alone).
+Entries a running lease pins are never evicted, so a hot store budgeted at or above the
+input cache's budget leaves room for those alone (the daemon warns once). These families
+follow; in every other process they are absent.
+
+| Family | Type | What it measures |
+|---|---|---|
+| `kbf_local_cache_input_bytes` | gauge | the input cache's entries |
+| `kbf_local_cache_storage_bytes` | gauge | what local storage holds on that disk: the write tier's blocks |
+| `kbf_local_cache_fill_bytes` | gauge | both, each byte once: what the one budget counts |
 
 **Reading a stall with idle slots.** `kbf_sched_queued` high and `kbf_sched_leases` below the
 nodes' slots means work is waiting that placement cannot use (look at the node's booking and

@@ -17,6 +17,7 @@ kbf-auth.workspace = true
 kbf-front.workspace = true
 kbf-invocation.workspace = true
 kbf-log.workspace = true
+kbf-map.workspace = true
 kbf-caps.workspace = true
 kbf-mdm-api.workspace = true
 kbf-meta.workspace = true
@@ -55,6 +56,8 @@ libc.workspace = true
 prost.workspace = true
 rcgen.workspace = true
 tokio = { workspace = true, features = ["io-util", "test-util"] }
+# rebuild_interest_cache for the tests that install a global subscriber while others run.
+tracing-core.workspace = true
 
 [lints]
 workspace = true
