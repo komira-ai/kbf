@@ -12,11 +12,13 @@
 //!   `FAIL <rule>: <reason>` line per broken rule.
 //! - With `--mode MODE`, both verbs work on one mode of the one `kbf` binary instead
 //!   ([`modes`]): `render-units` writes `kbf.slice` and `kbf-<mode>.service`, and
-//!   `check-units` checks `kbf-<mode>.service` against [`modes`]' rules.
+//!   `check-units` checks `kbf-<mode>.service` against [`modes`]' rules. For a built
+//!   mode it also runs `<kbf> check-args <mode> <flags...>` (`--kbf-bin PATH`, or the
+//!   unit's own binary when it is installed; a `SKIP parse:` line when it is not).
 //!
 //! Exit codes: 0 rendered, or every rule holds; 1 a rule is broken; 2 refused (a bad
 //! setting, a template placeholder with no value, a file that cannot be read or
-//! written), with a `REFUSED:` line on stderr.
+//! written, a `--kbf-bin` that cannot be run), with a `REFUSED:` line on stderr.
 //!
 //! Three verbs change the host, as root. Each checks the host first and prints its plan
 //! as `DRY-RUN:` lines; `--apply` carries it out, and a re-run after an apply plans
@@ -65,6 +67,11 @@ pub enum Refusal {
     Template(#[from] TemplateError),
     #[error(transparent)]
     Check(#[from] CheckError),
+    /// `--kbf-bin` is not an absolute path.
+    #[error("--kbf-bin: {0}")]
+    KbfBin(#[from] kbf_host::path::PathError),
+    #[error(transparent)]
+    Parse(modes::ParseError),
     #[error("cannot write {path}: {source}")]
     Write {
         path: PathBuf,
@@ -125,12 +132,15 @@ pub fn render_mode_unit(
 }
 
 /// `check-units --mode`: check `kbf-<mode>.service` in `dir` against the settings in
-/// `config`.
-pub fn check_mode_unit(
+/// `config`, a built mode's flags with `kbf_bin` or the unit's own kbf as `exec` runs
+/// it ([`modes::check_on_host`]).
+pub fn check_mode_unit<E: kbf_host::exec::Exec>(
+    exec: &E,
     config: &Path,
     dir: &Path,
     mode: Mode,
     installable: bool,
+    kbf_bin: Option<&Path>,
 ) -> Result<Report, Refusal> {
     let c = LinuxConfig::load(config)?;
     let name = mode.unit_name();
@@ -139,6 +149,11 @@ pub fn check_mode_unit(
         path: path.display().to_string(),
         source,
     })?;
-    Ok(modes::check(&c, mode, &text, installable)
-        .map_err(|source| CheckError::Unit { name, source })?)
+    let bin = kbf_bin
+        .map(|p| kbf_host::path::HostPath::new(&p.to_string_lossy()))
+        .transpose()?;
+    modes::check_on_host(exec, &c, mode, &text, installable, bin.as_ref()).map_err(|e| match e {
+        modes::ParseError::Unit(source) => CheckError::Unit { name, source }.into(),
+        e @ modes::ParseError::Run { .. } => Refusal::Parse(e),
+    })
 }

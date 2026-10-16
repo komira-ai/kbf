@@ -65,6 +65,8 @@ pub enum CheckError {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Report {
     pub failures: Vec<Failure>,
+    /// Lines about a rule not checked, such as `SKIP parse: ...`; not failures.
+    pub notes: Vec<String>,
     /// The summary line: `UNITS OK: ...` or `UNITS BROKEN: ...`.
     pub summary: String,
 }
@@ -433,6 +435,7 @@ fn check(c: &LinuxConfig, files: [&File; 4], installable: bool) -> Report {
     };
     Report {
         failures: out,
+        notes: Vec::new(),
         summary,
     }
 }
