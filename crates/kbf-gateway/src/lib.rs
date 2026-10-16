@@ -19,3 +19,6 @@ pub mod envoy;
 pub mod gateway;
 pub mod registration;
 pub mod registry;
+
+#[cfg(test)]
+mod testlog;

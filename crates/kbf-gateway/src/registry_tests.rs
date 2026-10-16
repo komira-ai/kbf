@@ -61,61 +61,42 @@ fn the_highest_term_among_leader_claims_wins() {
     assert_eq!(registry.servers(), ["a", "b", "c", "d"]);
 }
 
-/// What the log of one test receives.
-#[derive(Clone, Default)]
-struct Log(Arc<Mutex<Vec<u8>>>);
-
-impl std::io::Write for Log {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().expect("log").extend_from_slice(bytes);
-        Ok(bytes.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
 /// Catches: a tie at the top term decided by arrival order or by address instead of the
 /// lowest name; the tied names not being reported (they are what the warning logs), or
 /// logged again at every call while the tie stands.
 #[test]
 fn a_tie_goes_to_the_lowest_name() {
-    let log = Log::default();
-    let writer = log.clone();
-    let _guard = tracing::subscriber::set_default(
-        tracing_subscriber::fmt()
-            .with_writer(move || writer.clone())
-            .with_ansi(false)
-            .finish(),
-    );
+    let log = crate::testlog::captured();
     let claims = [
-        claim("zed", 1, true, 7),
-        claim("amy", 2, true, 7),
-        claim("old", 3, true, 6),
+        claim("tie-zed", 1, true, 7),
+        claim("tie-amy", 2, true, 7),
+        claim("tie-old", 3, true, 6),
     ];
     let mut in_name_order: Vec<&Claim> = claims.iter().collect();
     in_name_order.sort_by(|a, b| a.name.cmp(&b.name));
     let (leader_found, tied) = elect(in_name_order.into_iter());
-    assert_eq!(leader_found, Some(leader("amy", 2, 7)));
-    assert_eq!(tied, ["amy", "zed"]);
+    assert_eq!(leader_found, Some(leader("tie-amy", 2, 7)));
+    assert_eq!(tied, ["tie-amy", "tie-zed"]);
 
     let (alone, tied) = elect(claims[2..].iter());
-    assert_eq!(alone, Some(leader("old", 3, 6)));
+    assert_eq!(alone, Some(leader("tie-old", 3, 6)));
     assert!(tied.is_empty(), "one claimant is no tie");
 
     let registry = Registry::new(TTL, Manual::new().clock());
-    registry.register(claim("zed", 1, true, 7));
-    registry.register(claim("amy", 2, true, 7));
-    registry.register(claim("amy", 2, true, 7));
-    assert_eq!(*registry.subscribe().borrow(), Some(leader("amy", 2, 7)));
-    let logged = String::from_utf8(log.0.lock().expect("log").clone()).expect("UTF-8");
+    registry.register(claim("tie-zed", 1, true, 7));
+    registry.register(claim("tie-amy", 2, true, 7));
+    registry.register(claim("tie-amy", 2, true, 7));
     assert_eq!(
-        logged.matches("several servers claim").count(),
-        1,
-        "{logged}"
+        *registry.subscribe().borrow(),
+        Some(leader("tie-amy", 2, 7))
     );
-    assert!(logged.contains("amy") && logged.contains("zed"), "{logged}");
+    let ties = log.lines_with("tie-zed");
+    let warned: Vec<&String> = ties
+        .iter()
+        .filter(|line| line.contains("several servers claim"))
+        .collect();
+    assert_eq!(warned.len(), 1, "{ties:?}");
+    assert!(warned[0].contains("tie-amy"), "{warned:?}");
     assert!(
         format!("{registry:?}").contains("Clock"),
         "the clock is debuggable"

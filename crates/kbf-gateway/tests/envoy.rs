@@ -153,6 +153,8 @@ struct Front {
     _envoy: EnvoyProcess,
     reapi: SocketAddr,
     admin: SocketAddr,
+    /// Where Envoy's standard error goes, for the failure message of a wait.
+    log: PathBuf,
 }
 
 /// Runs Envoy on the generated bootstrap for `gateway`.
@@ -167,6 +169,8 @@ fn run_envoy(dir: &Path, gateway: &Running) -> Front {
     std::fs::create_dir_all(dir).expect("directory");
     let config = dir.join("envoy.json");
     std::fs::write(&config, text).expect("write the bootstrap");
+    let log = dir.join("envoy.log");
+    let stderr = std::fs::File::create(&log).expect("Envoy's log file");
     let child = Command::new(envoy_binary())
         .args([
             "--disable-hot-restart",
@@ -178,12 +182,14 @@ fn run_envoy(dir: &Path, gateway: &Running) -> Front {
         .arg("--config-path")
         .arg(&config)
         .stdin(Stdio::null())
+        .stderr(stderr)
         .spawn()
         .expect("start Envoy");
     Front {
         _envoy: EnvoyProcess(child),
         reapi,
         admin,
+        log,
     }
 }
 
@@ -191,7 +197,7 @@ fn run_envoy(dir: &Path, gateway: &Running) -> Front {
 async fn clusters(admin: SocketAddr) -> Option<String> {
     let mut stream = tokio::net::TcpStream::connect(admin).await.ok()?;
     stream
-        .write_all(b"GET /clusters HTTP/1.0\r\n\r\n")
+        .write_all(b"GET /clusters HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
         .await
         .ok()?;
     let mut text = String::new();
@@ -201,11 +207,11 @@ async fn clusters(admin: SocketAddr) -> Option<String> {
 
 /// Waits until `/clusters` satisfies `condition`; fails the test, with the last listing,
 /// when `BOUND` runs out.
-async fn until(admin: SocketAddr, what: &str, condition: impl Fn(&str) -> bool) {
+async fn until(front: &Front, what: &str, condition: impl Fn(&str) -> bool) {
     let deadline = Instant::now() + BOUND;
     let mut last = String::new();
     while Instant::now() < deadline {
-        if let Some(text) = clusters(admin).await {
+        if let Some(text) = clusters(front.admin).await {
             if condition(&text) {
                 return;
             }
@@ -213,7 +219,16 @@ async fn until(admin: SocketAddr, what: &str, condition: impl Fn(&str) -> bool) 
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    panic!("{what}: not reached within {BOUND:?}; last /clusters:\n{last}");
+    let log = std::fs::read_to_string(&front.log).unwrap_or_default();
+    let tail: String = log
+        .chars()
+        .rev()
+        .take(6000)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    panic!("{what}: not reached within {BOUND:?}; last /clusters:\n{last}\nEnvoy's log:\n{tail}");
 }
 
 /// The endpoint `address` of the leader cluster is healthy in `listing`.
@@ -275,7 +290,7 @@ async fn envoy_routes_to_the_current_leader() {
     let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("kbf-gateway-envoy");
     let front = run_envoy(&dir, &gateway);
 
-    until(front.admin, "the first leader healthy", |l| {
+    until(&front, "the first leader healthy", |l| {
         healthy(l, one.address)
     })
     .await;
@@ -290,7 +305,7 @@ async fn envoy_routes_to_the_current_leader() {
         .register(claim(one.address, false, 1))
         .await
         .expect("one follows");
-    until(front.admin, "the second leader healthy", |l| {
+    until(&front, "the second leader healthy", |l| {
         healthy(l, two.address) && !lists(l, one.address)
     })
     .await;
@@ -299,7 +314,7 @@ async fn envoy_routes_to_the_current_leader() {
     // A claim that is stale: the gateway still names the second server, which now fails
     // its health check. Envoy must not send to it, and must not panic-route either.
     two.serving.store(false, Ordering::SeqCst);
-    until(front.admin, "the stale claim unhealthy", |l| {
+    until(&front, "the stale claim unhealthy", |l| {
         lists(l, two.address) && !healthy(l, two.address)
     })
     .await;

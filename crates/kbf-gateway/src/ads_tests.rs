@@ -147,27 +147,6 @@ async fn no_leader_is_an_empty_assignment() {
     assert_eq!(endpoint_of(&first), None);
 }
 
-/// What the log of one test receives.
-#[derive(Clone, Default)]
-struct Log(Arc<std::sync::Mutex<Vec<u8>>>);
-
-impl std::io::Write for Log {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().expect("log").extend_from_slice(bytes);
-        Ok(bytes.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-impl Log {
-    fn text(&self) -> String {
-        String::from_utf8(self.0.lock().expect("log").clone()).expect("UTF-8")
-    }
-}
-
 /// Catches: an ACK, a NACK or a request for another type being answered. A NACK answered
 /// with the same bytes would loop for as long as Envoy refuses them. The proof is the
 /// order of the replies: the first one after all of them is the push they did not cause.
@@ -175,14 +154,7 @@ impl Log {
 /// the endpoint did not change, so it is logged.
 #[tokio::test]
 async fn acks_and_nacks_get_no_response() {
-    let log = Log::default();
-    let writer = log.clone();
-    let _guard = tracing::subscriber::set_default(
-        tracing_subscriber::fmt()
-            .with_writer(move || writer.clone())
-            .with_ansi(false)
-            .finish(),
-    );
+    let log = crate::testlog::captured();
     let registry = registry();
     registry.register(claim("a", 1, 1));
     let (_task, send_request, mut replies) = open(&registry);
@@ -193,25 +165,27 @@ async fn acks_and_nacks_get_no_response() {
     let mut nack = request("1", "");
     nack.error_detail = Some(RpcStatus {
         code: 3,
-        message: "bad assignment".to_owned(),
+        message: "bad assignment of the nack test".to_owned(),
         details: Vec::new(),
     });
     send(&send_request, nack);
     let mut other = request("", "");
-    other.type_url = "type.googleapis.com/envoy.config.cluster.v3.Cluster".to_owned();
+    other.type_url = "type.googleapis.com/envoy.config.cluster.v3.Cluster-nack-test".to_owned();
     send(&send_request, other);
 
     registry.register(claim("b", 2, 2));
     let pushed = next(&mut replies).await;
     assert_eq!(pushed.nonce, "2", "nothing was sent for the three requests");
     assert_eq!(pushed.version_info, "2:b@192.0.2.7:2");
-    let logged = log.text();
+    let refusals = log.lines_with("bad assignment of the nack test");
+    assert_eq!(refusals.len(), 1, "{refusals:?}");
     assert!(
-        logged.contains("refused the endpoint assignment"),
-        "{logged}"
+        refusals[0].contains("refused the endpoint assignment"),
+        "{refusals:?}"
     );
-    assert!(logged.contains("bad assignment"), "{logged}");
-    assert!(logged.contains("does not serve"), "{logged}");
+    let others = log.lines_with("Cluster-nack-test");
+    assert_eq!(others.len(), 1, "{others:?}");
+    assert!(others[0].contains("does not serve"), "{others:?}");
 }
 
 /// Catches: a stream task that outlives its stream: Envoy hanging up, a transport error
