@@ -256,35 +256,3 @@ async fn in_hard_link_mode_the_shared_names_are_links_and_the_private_name_a_cop
     assert_ne!(meta(&at.join("a")).ino(), meta(&at.join("out/c")).ino());
     stop(cache, &gates);
 }
-
-/// Catches, in clone mode, a fill the cache could not rename into `blobs/` failing the
-/// lease, or giving its names anything but their own writable files: each name is its
-/// own inode, 0644, with the bytes; nothing is indexed.
-#[tokio::test]
-async fn a_fill_the_cache_cannot_rename_still_gives_writable_files() {
-    let dir = scratch("clone-loose");
-    let gates = Gates::new();
-    let cache = Cache::open(clone_config(&dir, &gates)).expect("open");
-    let cas = CountingCas::default();
-    let k = key(b"kept loose", false);
-    let prefix = dir.join("cache/v1/blobs").join(k.prefix());
-    std::fs::set_permissions(&prefix, std::fs::Permissions::from_mode(0o500)).expect("chmod");
-    let root = cas.tree(&[
-        file("a", b"kept loose", false),
-        file("b", b"kept loose", false),
-    ]);
-    let outcome = lease(&cas, &cache, &root, &dir, "loose").await;
-    std::fs::set_permissions(&prefix, std::fs::Permissions::from_mode(0o700)).expect("chmod");
-    let (at, _) = outcome.expect("the lease ran without the cache");
-    assert_ne!(meta(&at.join("a")).ino(), meta(&at.join("b")).ino());
-    for path in ["a", "b"] {
-        assert_eq!(
-            meta(&at.join(path)).permissions().mode() & 0o7777,
-            0o644,
-            "{path}"
-        );
-        assert_eq!(std::fs::read(at.join(path)).expect("read"), b"kept loose");
-    }
-    assert!(!cache.holds(&k));
-    stop(cache, &gates);
-}

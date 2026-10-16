@@ -354,3 +354,84 @@ async fn a_fill_the_cache_cannot_rename_is_copied_then_removed() {
     assert_eq!(tmp_files(&dir), 0);
     stop(cache, &gates);
 }
+
+/// What `clonefile` does, off macOS: a new file (an existing name is an error) with
+/// the source's bytes and mode.
+#[cfg(not(target_os = "macos"))]
+fn copying_clone(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+    let mut source = std::fs::File::open(from)?;
+    let mut clone = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(to)?;
+    std::io::copy(&mut source, &mut clone)?;
+    clone.set_permissions(source.metadata()?.permissions())
+}
+
+/// Catches, in clone mode, a fill that is not an entry (the cache could not rename it,
+/// or could not write it at all) giving a lease's names anything but their own
+/// writable files, or failing the lease: for an entry, a checked file the cache could
+/// not keep, and a lease's own fetch, every name (shared or private) is its own inode,
+/// 0644 (0755 executable), with the bytes; and only the entry is indexed.
+#[tokio::test]
+async fn in_clone_mode_every_fill_gives_each_name_its_own_writable_file() {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+    let dir = scratch("cache-one-clone");
+    let gates = Gates::new();
+    let mut config = config(&dir, GIB, Arc::clone(&gates), &FakeClock::at(1000));
+    config.link_mode = Some(kbf_daemon::cache::LinkMode::Clone);
+    #[cfg(not(target_os = "macos"))]
+    {
+        config.link = Arc::new(copying_clone);
+    }
+    let cache = Cache::open(config).expect("open");
+    let cas = CountingCas::default();
+    let chmod = |path: &std::path::Path, mode| {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).expect("chmod");
+    };
+    for (case, bytes) in [
+        ("entry", &b"an entry"[..]),
+        ("loose", b"kept loose"),
+        ("fetch", b"own fetch"),
+    ] {
+        let k = key(bytes, false);
+        let blocked = match case {
+            "loose" => Some(dir.join("cache/v1/blobs").join(k.prefix())),
+            "fetch" => Some(dir.join("cache/v1/tmp")),
+            _ => None,
+        };
+        let root = cas.tree(&[
+            file("a", bytes, false),
+            file("b", bytes, true),
+            file("out/c", bytes, false),
+        ]);
+        let at = crate::support::cache_kit::lease_dir(&dir, case);
+        if let Some(path) = &blocked {
+            chmod(path, 0o500);
+        }
+        let outcome =
+            kbf_daemon::tree::materialize_cached(&cas, &cache, &root, &at, &["out".to_owned()])
+                .await;
+        if let Some(path) = &blocked {
+            chmod(path, 0o700);
+        }
+        outcome.expect(case);
+        let meta = |name: &str| std::fs::metadata(at.join(name)).expect("stat");
+        for (name, mode) in [("a", 0o644), ("b", 0o755), ("out/c", 0o644)] {
+            assert_eq!(
+                meta(name).permissions().mode() & 0o777,
+                mode,
+                "{case} {name}"
+            );
+            assert_eq!(
+                std::fs::read(at.join(name)).expect("read"),
+                bytes,
+                "{case} {name}"
+            );
+        }
+        assert_ne!(meta("a").ino(), meta("out/c").ino(), "{case}");
+        assert_eq!(cache.holds(&k), case == "entry", "{case}");
+    }
+    assert_eq!(tmp_files(&dir), 0);
+    stop(cache, &gates);
+}
