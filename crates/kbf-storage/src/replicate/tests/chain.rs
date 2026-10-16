@@ -676,3 +676,23 @@ async fn a_node_outside_a_chain_streams_when_its_store_can() {
     );
     assert!(!mem.blobs.lock().expect("lock").contains_key(&other));
 }
+
+/// Catches a store whose blocking `stream` call fails being taken for one that has no
+/// stream (the write would then go the buffered way, or be refused as FAILED_PRECONDITION):
+/// the failure is INTERNAL, and nothing is stored.
+#[tokio::test]
+async fn a_store_whose_stream_call_fails_fails_the_write() {
+    let farm = Farm::start(2, ChainConfig::default()).await;
+    let map = farm.map(1, 2, &[]);
+    let bytes = farm.blob(&map, 0, 1, 4096, 18);
+    farm.nodes[0]
+        .mem
+        .knobs
+        .open_panics
+        .store(true, Ordering::SeqCst);
+    let digest = sha(&bytes);
+    let answer = raw(farm.channel(0), &digest, &[(&bytes, true)], 1, None).await;
+    let status = answer.expect_err("refused");
+    assert_eq!(status.code(), Code::Internal, "{status:?}");
+    assert!(!held(&farm, 0, &digest) && !held(&farm, 1, &digest));
+}

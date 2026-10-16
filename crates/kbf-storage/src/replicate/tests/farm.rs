@@ -4,6 +4,7 @@
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use kbf_map::{Map, Member, MemberId, MemberState, Rule};
 use kbf_types::Digest;
@@ -149,6 +150,7 @@ impl Farm {
                     write_bytes_in_flight: 1 << 30,
                 },
             )
+            .with_refetch_wait(Duration::from_secs(5))
             .with_chain(Arc::clone(&chain));
             let served = serve_routes(service.routes(), None).await;
             nodes.push(Node {

@@ -158,6 +158,10 @@ impl Storage for Mem {
 
     /// A stream into this store when `knobs.enabled`, else `None` (the buffered path).
     fn stream(&self, size: u64) -> Option<Box<dyn PutStream>> {
+        assert!(
+            !self.knobs.open_panics.load(Ordering::SeqCst),
+            "stream panics"
+        );
         self.knobs.enabled.load(Ordering::SeqCst).then(|| {
             Box::new(MemPut {
                 blobs: Arc::clone(&self.blobs),
@@ -231,6 +235,8 @@ impl Storage for Mem {
 pub(crate) struct Knobs {
     /// Whether [`Mem::stream`] offers a stream.
     pub enabled: AtomicBool,
+    /// `Mem::stream` panics, as a store's blocking call that fails would.
+    pub open_panics: AtomicBool,
     /// Chunks and bytes appended so far, over every stream.
     pub chunks: AtomicUsize,
     pub bytes: AtomicU64,
@@ -245,6 +251,7 @@ impl Default for Knobs {
     fn default() -> Self {
         Self {
             enabled: AtomicBool::new(false),
+            open_panics: AtomicBool::new(false),
             chunks: AtomicUsize::new(0),
             bytes: AtomicU64::new(0),
             hold: (Mutex::new(false), Condvar::new()),
