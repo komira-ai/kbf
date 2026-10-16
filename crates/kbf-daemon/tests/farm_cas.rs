@@ -9,12 +9,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::future::join_all;
-use kbf_daemon::cas::{Cas, CasError};
+use kbf_daemon::cas::{Cas, CasError, Chunks};
 use kbf_daemon::{FarmCas, HeldMaps, MapHolder, storage_nodes};
 use kbf_map::{Map, Member, MemberId, MemberState, Rule};
 use kbf_proto::reapi::Digest;
 use kbf_route::MapSource as _;
-use kbf_transfer::{RecordHasher, TransferConfig, Transfers, proto_digest};
+use kbf_transfer::{Record, RecordHasher, TransferConfig, Transfers, proto_digest};
+use kbf_types::LeaseId;
 use support::storage_node::{Node, serve_plain, serve_tls};
 use support::{PROMPT, Pki, pki};
 use tokio::time::timeout;
@@ -52,19 +53,29 @@ fn digest(bytes: &[u8]) -> Digest {
 /// A plane over a frontend CAS at `server`, nodes verified as the daemon's TLS files
 /// say, and the holder the test fills.
 fn plane(pki: &Pki, server: &Node) -> (Arc<FarmCas>, Arc<MapHolder>) {
+    plane_with(
+        pki,
+        server,
+        TransferConfig::default(),
+        &TransferConfig::default(),
+    )
+}
+
+/// [`plane`], the frontend's engine under `engine` and the storage nodes' under `routed`.
+fn plane_with(
+    pki: &Pki,
+    server: &Node,
+    engine: TransferConfig,
+    routed: &TransferConfig,
+) -> (Arc<FarmCas>, Arc<MapHolder>) {
     let tls = pki.client.clone();
     let channel = Endpoint::from_shared(format!("http://127.0.0.1:{}", server.port))
         .expect("endpoint")
         .connect_lazy();
-    let engine = Arc::new(Transfers::over(channel, TransferConfig::default()));
+    let engine = Arc::new(Transfers::over(channel, engine));
     let holder = Arc::new(MapHolder::new());
     let nodes = storage_nodes(&tls).expect("TLS files");
-    let cas = FarmCas::new(
-        engine,
-        Arc::clone(&holder),
-        nodes,
-        &TransferConfig::default(),
-    );
+    let cas = FarmCas::new(engine, Arc::clone(&holder), nodes, routed);
     (Arc::new(cas), holder)
 }
 
@@ -236,4 +247,123 @@ async fn held_maps_view_the_holder_and_give_up_on_a_map_that_never_comes() {
         9,
         "the wait was recorded for the session"
     );
+}
+
+fn config(in_flight: usize) -> TransferConfig {
+    TransferConfig {
+        in_flight,
+        ..TransferConfig::default()
+    }
+}
+
+/// Runs every operation of the store on `cas` and checks that each one reached `here`
+/// and not `elsewhere`: a blob put, streamed in chunks and put as a record is held by
+/// `here` alone; one read into a file comes back whole; `missing` names the blob nobody
+/// holds and not the one just stored; the store runs `in_flight` requests at once. The
+/// bytes carry `tag`, so a node holding a blob of an earlier call proves nothing.
+async fn through<C: Cas>(
+    cas: &C,
+    tag: &str,
+    (here, elsewhere): (&Node, &Node),
+    in_flight: usize,
+    dir: &std::path::Path,
+) {
+    let put = format!("{tag}: put").into_bytes();
+    let stored = cas.put(put.clone()).await.expect("put");
+    assert_eq!(stored, digest(&put), "{tag}");
+
+    let whole = format!("{tag}: chunked").into_bytes();
+    let (first, second) = whole.split_at(5);
+    let chunks: Chunks = Box::pin(futures::stream::iter(vec![
+        Ok(first.to_vec()),
+        Ok(second.to_vec()),
+    ]));
+    let chunked = cas
+        .put_chunks(digest(&whole), chunks)
+        .await
+        .expect("put_chunks");
+    assert_eq!(chunked, digest(&whole), "{tag}");
+
+    let record = format!("{tag}: record").into_bytes();
+    cas.put_records(vec![Record::bytes(record.clone())])
+        .await
+        .expect("put_records");
+    let recorded = digest(&record);
+
+    for blob in [&stored, &chunked, &recorded] {
+        assert!(here.store.holds(blob).await, "{tag}: held where it went");
+        assert!(
+            !elsewhere.store.holds(blob).await,
+            "{tag}: and not elsewhere"
+        );
+    }
+
+    let path = dir.join(format!("{}.blob", tag.replace(' ', "-")));
+    let mut file = tokio::fs::File::create(&path).await.expect("create");
+    cas.read_to(&chunked, &mut file).await.expect("read_to");
+    assert_eq!(std::fs::read(&path).expect("read back"), whole, "{tag}");
+
+    let nobody = digest(format!("{tag}: held by nobody").as_bytes());
+    assert_eq!(
+        cas.missing(&[stored.clone(), nobody.clone()]).await,
+        [nobody],
+        "{tag}"
+    );
+    assert!(
+        cas.intake().is_none(),
+        "{tag}: neither side takes an intake"
+    );
+    assert_eq!(cas.in_flight(), in_flight, "{tag}");
+}
+
+/// Catches an operation that a plane (or a lease of it) does not delegate to the side it
+/// is on, or delegates to the wrong one: each method of the store is run on the plane
+/// before a map is held (everything goes to the frontend) and after (everything goes to
+/// the owner, and the frontend gets none), on a lease begun on each side, and on the
+/// plane's own calls. The two sides run different limits, so `in_flight` says which side
+/// answered. A lease keeps the side it began on after the map arrives, and leasing from
+/// it chooses again. Mutants: any one method of either impl forced to the server side.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_operation_follows_the_side_of_the_plane_and_of_its_lease() {
+    let pki_ = pki("farm-cas-ops");
+    let (frontend, owner) = (serve_plain(), serve_tls(&pki_));
+    let (cas, holder) = plane_with(&pki_, &frontend, config(3), &config(7));
+    let dir = support::scratch("farm-cas-ops");
+    let sides = (&frontend, &owner);
+    let (reversed, id) = ((&owner, &frontend), LeaseId::new(1, 1));
+
+    through(&*cas, "plane, no map", sides, 3, &dir).await;
+    let early = Arc::new(cas.lease(&id));
+    through(&*early, "lease, no map", sides, 3, &dir).await;
+
+    assert!(holder.offer(map(2, 1, vec![member(1, owner.name())])));
+    through(&*cas, "plane, map", reversed, 7, &dir).await;
+    let late = Arc::new(cas.lease(&id));
+    through(&*late, "lease, map", reversed, 7, &dir).await;
+
+    // The lease begun before the map stays on the frontend; one asked of it is new.
+    through(&*early, "early lease, map held", sides, 3, &dir).await;
+    let renewed = Arc::new(early.lease(&id));
+    through(&*renewed, "lease of a lease, map", reversed, 7, &dir).await;
+}
+
+/// Catches storage nodes dialled with TLS files that were never read: the daemon with no
+/// CA, no certificate or no key refuses to build the plane, naming the file, rather than
+/// failing its first blob.
+#[test]
+fn storage_nodes_need_all_three_tls_files() {
+    let pki_ = pki("farm-cas-files");
+    for missing in ["ca_cert", "cert", "key"] {
+        let mut files = pki_.client.clone();
+        let path = std::path::PathBuf::from(format!("/nonexistent/{missing}.pem"));
+        match missing {
+            "ca_cert" => files.ca_cert = path,
+            "cert" => files.cert = path,
+            _ => files.key = path,
+        }
+        let Err(error) = storage_nodes(&files) else {
+            panic!("a plane was built without its {missing} file");
+        };
+        assert!(error.to_string().contains(missing), "{error}");
+    }
 }

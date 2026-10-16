@@ -648,10 +648,9 @@ fn node_over<C: Cas>(
     let daemon = Daemon::new(DaemonConfig::from_args(&cli.daemon), runtimes, report)?
         .with_container_images(cli.images.iter().cloned())
         .with_phase(phase);
-    let daemon = match maps {
-        Some(maps) => daemon.with_map(maps),
-        None => daemon,
-    };
+    // One line, not a match: this function has an instance per data plane, and an arm
+    // each instance never takes would be a line the coverage ratchet counts as missed.
+    let daemon = maps.into_iter().fold(daemon, Daemon::with_map);
     // Every runtime is built, so every sweep has run: claim the scratch directory.
     let daemon = match &plan {
         Some(plan) => instance::named(daemon, &plan.leases()),
