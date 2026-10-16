@@ -1,21 +1,19 @@
-//! The HTTP/2 stream limit of each listener, and the connection's flow-control window
-//! that does not follow it.
+//! The HTTP/2 stream limit of each listener, and the flow-control windows that follow it.
 //!
 //! buck2 holds one Execute stream open per outstanding action, idle almost the whole
 //! time, so the REAPI listener must not hide its backlog behind a small per-connection
 //! cap (`--reapi-max-streams`, 10000 by default). A daemon holds one session stream and
 //! a few short transfer streams, so the worker listener keeps 200
-//! (`--worker-max-streams`). Raising a limit must not raise the memory a connection may
-//! hold unread, so the connection window is a fixed budget.
+//! (`--worker-max-streams`). The connection window must hold every stream's window at
+//! once, so a higher limit shrinks the stream window rather than leaving the
+//! connection window short.
 
 mod support;
 
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use kbf_front::{
-    CONNECTION_WINDOW_BYTES, DEFAULT_REAPI_STREAMS, DEFAULT_WORKER_STREAMS, STREAM_WINDOW_BYTES,
-};
+use kbf_front::{DEFAULT_REAPI_STREAMS, DEFAULT_WORKER_STREAMS, STREAM_WINDOW_BYTES};
 use kbf_proto::reapi::ExecuteRequest;
 use kbf_server::StreamLimits;
 use support::{Blob, Cell, Job, PROMPT};
@@ -174,37 +172,48 @@ async fn each_listener_advertises_its_own_stream_limit() {
     assert_eq!(advertised(cell.worker_addr).await.max_streams, Some(3));
 }
 
-/// Catches: a connection window computed from the stream limit (the state before this
-/// change, where 10000 streams would have advertised 10000 MiB per connection): the
-/// window is the same fixed 200 MiB budget whatever either limit is, on both listeners,
-/// and each stream's window is its own constant.
+/// Catches: a connection window smaller than the streams its listener allows times
+/// each stream's window (a fixed 200 MiB beside 10000 streams: the unread data of the
+/// Writes waiting for admission can take all of it, and the admitted ones starve;
+/// `write_admission.rs` runs that), at any limit, on either listener; a stream window
+/// under HTTP/2's default 64 KiB; a worker listener whose 200 streams do not keep 1 MiB
+/// each. Read off the server's own frames, as a client sees them.
 #[tokio::test]
-async fn the_connection_window_stays_a_fixed_budget_whatever_the_stream_limit() {
-    assert_eq!(CONNECTION_WINDOW_BYTES, 200 << 20, "today's byte value");
+async fn the_connection_window_holds_every_streams_window_whatever_the_limit() {
     for limits in [
         StreamLimits::DEFAULT,
         StreamLimits {
-            reapi: 100_000,
+            reapi: 32_767,
             worker: 1,
         },
         StreamLimits {
             reapi: 1,
-            worker: 100_000,
+            worker: 32_767,
+        },
+        StreamLimits {
+            reapi: 2048,
+            worker: 2047,
         },
     ] {
         let cell = Cell::start_with_streams(limits).await;
-        for (name, addr) in [("REAPI", cell.reapi_addr), ("worker", cell.worker_addr)] {
+        for (name, addr, streams) in [
+            ("REAPI", cell.reapi_addr, limits.reapi),
+            ("worker", cell.worker_addr, limits.worker),
+        ] {
             let got = advertised(addr).await;
-            assert_eq!(
-                got.connection_window,
-                u64::from(CONNECTION_WINDOW_BYTES),
-                "{name} listener with {limits:?}"
+            let window = u64::from(got.stream_window.expect("a stream window"));
+            assert_eq!(got.max_streams, Some(streams), "{name} with {limits:?}");
+            assert!(
+                got.connection_window >= u64::from(streams) * window,
+                "{name} listener with {limits:?}: {got:?}"
             );
-            assert_eq!(
-                got.stream_window,
-                Some(STREAM_WINDOW_BYTES),
-                "{name} listener with {limits:?}"
-            );
+            assert!(window >= 65_536, "{name} listener with {limits:?}: {got:?}");
         }
     }
+    let worker = advertised(Cell::start().await.worker_addr).await;
+    assert_eq!(worker.stream_window, Some(STREAM_WINDOW_BYTES));
+    assert_eq!(
+        worker.connection_window,
+        200 * u64::from(STREAM_WINDOW_BYTES)
+    );
 }

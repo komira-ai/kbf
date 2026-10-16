@@ -61,34 +61,25 @@ pub const MAX_ADMISSION_BYTES: u64 = u32::MAX as u64;
 /// and a few short, busy transfer streams. A `BatchUpdateBlobs` request is decoded (up
 /// to [`MAX_MESSAGE_BYTES`](crate::MAX_MESSAGE_BYTES)) before [`Cache::admit`] sees
 /// it, and so is a ByteStream `Write`'s first message, so what one connection can make
-/// the server hold outside the admission bound is this many messages, plus
-/// [`CONNECTION_WINDOW_BYTES`] of data received but not yet read.
+/// the server hold outside the admission bound is this many messages, plus the
+/// unread data its connection window allows (`docs/design/write-path.md`).
 pub const DEFAULT_WORKER_STREAMS: u32 = 200;
 
 /// The default most HTTP/2 streams one connection may have open on the REAPI listener
 /// (`--reapi-max-streams`). buck2 holds one `Execute` stream open per outstanding
 /// action, and those streams are idle almost the whole time, so a limit near the
 /// worker's would hide buck2's backlog in the client, where the farm cannot see it or
-/// place it. Raising it does not raise the connection's flow-control window
-/// ([`CONNECTION_WINDOW_BYTES`]); it raises how many decoded messages one connection
+/// place it. A higher limit shrinks each stream's flow-control window
+/// (`kbf-server`'s `flow_windows`), because the connection's window must hold every
+/// stream's window at once; it also raises how many decoded messages one connection
 /// may have in flight, which `--write-bytes-in-flight` does not cover (see
 /// `docs/design/write-path.md`).
 pub const DEFAULT_REAPI_STREAMS: u32 = 10_000;
 
-/// The HTTP/2 flow-control window of each stream on either listener: how much a
-/// client may send on a stream before the server reads it.
+/// The largest HTTP/2 flow-control window of one stream on either listener: how much
+/// a client may send on a stream before the server reads it. A listener with many
+/// streams allows each a smaller window (`kbf-server`'s `flow_windows`).
 pub const STREAM_WINDOW_BYTES: u32 = 1 << 20;
-
-/// The HTTP/2 flow-control window of each connection on either listener: a fixed
-/// budget of 200 streams' windows at once, whatever the stream limit. A `Write`
-/// waiting for admission is not read, so its unread data holds part of the
-/// connection's window; with a smaller window (the transport's default is 1 MiB),
-/// the waiting streams of one connection can take all of it, and the admitted
-/// streams, which must finish before anyone else is admitted, never receive another
-/// byte. The budget is not scaled with the stream limit, so raising a limit does not
-/// raise the memory a connection may hold unread; the cost is that more than 200
-/// uploads waiting for admission on one connection can take the whole window.
-pub const CONNECTION_WINDOW_BYTES: u32 = 200 * STREAM_WINDOW_BYTES;
 
 /// How the cache groups and bounds uploads (`docs/design/write-path.md`, section 3).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

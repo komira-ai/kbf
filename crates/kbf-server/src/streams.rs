@@ -4,10 +4,48 @@
 //! The two listeners differ. A REAPI client (buck2) holds one `Execute` stream open per
 //! outstanding action, idle almost the whole time, so its backlog must not wait in the
 //! client behind a small cap. A daemon holds one persistent session stream and a few
-//! short, busy transfer streams. The connection's flow-control window does not follow
-//! either limit ([`kbf_front::CONNECTION_WINDOW_BYTES`]).
+//! short, busy transfer streams. The flow-control windows follow the limit
+//! ([`flow_windows`]): the connection's window always holds every stream's window.
 
-use kbf_front::{DEFAULT_REAPI_STREAMS, DEFAULT_WORKER_STREAMS};
+use kbf_front::{DEFAULT_REAPI_STREAMS, DEFAULT_WORKER_STREAMS, STREAM_WINDOW_BYTES};
+
+/// The largest flow-control window HTTP/2 allows (RFC 9113, section 6.9.1), which
+/// bounds the connection window.
+const MAX_WINDOW: u32 = i32::MAX as u32;
+
+/// The most streams a listener may allow: with more, a stream's window would be under
+/// 64 KiB, HTTP/2's default window.
+pub const MAX_STREAMS: u32 = MAX_WINDOW / 65_536;
+
+/// The flow-control windows of one connection to a listener.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FlowWindows {
+    /// The window of each stream.
+    pub stream: u32,
+    /// The window of the connection.
+    pub connection: u32,
+}
+
+/// The windows of a listener that allows `max_streams` streams per connection (at
+/// least 1, at most [`MAX_STREAMS`]): `connection == max_streams * stream`, and the
+/// stream window is [`STREAM_WINDOW_BYTES`] unless that would put the connection past
+/// HTTP/2's largest window, which is so at about 2000 streams.
+///
+/// A `Write` waiting for admission is not read, so its stream's window stays full of
+/// unread data, which counts against the connection's window until the server reads it.
+/// The admitted `Write`s, which must finish before anyone else is admitted, need
+/// that window to move. With the connection window at least every stream's window, the
+/// streams together can never hold all of it unread, whatever the number of
+/// waiting `Write`s: this is the invariant (`docs/design/write-path.md`, section 3.3),
+/// and why one limit's windows are not another's.
+pub fn flow_windows(max_streams: u32) -> FlowWindows {
+    let streams = max_streams.clamp(1, MAX_STREAMS);
+    let stream = STREAM_WINDOW_BYTES.min(MAX_WINDOW / streams);
+    FlowWindows {
+        stream,
+        connection: streams * stream,
+    }
+}
 
 /// The stream limits of the two listeners.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -32,20 +70,22 @@ pub struct StreamArgs {
     /// The most HTTP/2 streams one connection to the REAPI listener may have open.
     /// buck2 keeps one Execute stream open per outstanding action, idle until the
     /// action finishes, so this bounds how large a backlog one buck2 invocation can
-    /// show the farm. It does not change the connection's flow-control window, which
-    /// is fixed (200 MiB). At least 1.
+    /// show the farm. The connection's flow-control window is this many streams' windows;
+    /// above about 2000 streams each stream's window is smaller than 1 MiB so that the
+    /// product stays under HTTP/2's largest window. At least 1, at most 32767.
     #[arg(
         long,
         default_value_t = DEFAULT_REAPI_STREAMS,
-        value_parser = clap::value_parser!(u32).range(1..)
+        value_parser = clap::value_parser!(u32).range(1..=i64::from(MAX_STREAMS))
     )]
     pub reapi_max_streams: u32,
     /// The most HTTP/2 streams one connection to the worker listener may have open: a
-    /// daemon's persistent session stream and its short transfer streams. At least 1.
+    /// daemon's persistent session stream and its short transfer streams. At least 1, at
+    /// most 32767.
     #[arg(
         long,
         default_value_t = DEFAULT_WORKER_STREAMS,
-        value_parser = clap::value_parser!(u32).range(1..)
+        value_parser = clap::value_parser!(u32).range(1..=i64::from(MAX_STREAMS))
     )]
     pub worker_max_streams: u32,
 }
@@ -63,9 +103,41 @@ impl StreamArgs {
 #[cfg(test)]
 mod tests {
     use clap::Parser;
+    use kbf_front::STREAM_WINDOW_BYTES;
 
-    use super::StreamLimits;
+    use super::{FlowWindows, MAX_STREAMS, StreamLimits, flow_windows};
     use crate::config::Args;
+
+    /// Catches: a connection window under the streams' windows together (the deadlock of
+    /// `docs/design/write-path.md`: waiting Writes' unread data takes the window and
+    /// the admitted ones starve) at any limit, a window past HTTP/2's largest, a
+    /// stream window under 64 KiB, or the stream window cut where 1 MiB fits (the
+    /// worker's 200 streams stay at 1 MiB and 200 MiB). Mutant: a fixed connection
+    /// window.
+    #[test]
+    fn the_connection_window_holds_every_streams_window() {
+        for streams in [1, 3, 200, 2047, 2048, 10_000, 32_767, MAX_STREAMS] {
+            let w = flow_windows(streams);
+            assert!(
+                u64::from(w.connection) >= u64::from(streams) * u64::from(w.stream),
+                "{streams}: {w:?}"
+            );
+            assert!(w.connection <= i32::MAX as u32, "{streams}: {w:?}");
+            assert!(
+                (65_536..=STREAM_WINDOW_BYTES).contains(&w.stream),
+                "{streams}: {w:?}"
+            );
+        }
+        assert_eq!(
+            flow_windows(200),
+            FlowWindows {
+                stream: 1 << 20,
+                connection: 200 << 20
+            }
+        );
+        assert_eq!(flow_windows(2047).stream, 1 << 20);
+        assert!(flow_windows(2048).stream < 1 << 20);
+    }
 
     /// Catches: a default other than 10000 for the REAPI listener or 200 for the
     /// worker listener; a flag that does not reach `Listeners` (mutant: `limits()`
@@ -80,7 +152,7 @@ mod tests {
         assert_eq!(defaults.streams.worker, 200);
         let set = Args::parse_from([
             "kbf-server",
-            "--reapi-max-streams=64000",
+            "--reapi-max-streams=30000",
             "--worker-max-streams=17",
         ])
         .listeners()
@@ -88,7 +160,7 @@ mod tests {
         assert_eq!(
             set.streams,
             StreamLimits {
-                reapi: 64_000,
+                reapi: 30_000,
                 worker: 17
             }
         );
@@ -109,6 +181,8 @@ mod tests {
             "--reapi-max-streams=-1",
             "--worker-max-streams=many",
             "--reapi-max-streams=4294967296",
+            "--reapi-max-streams=32768",
+            "--worker-max-streams=32768",
         ] {
             assert!(
                 Args::try_parse_from(["kbf-server", refused]).is_err(),

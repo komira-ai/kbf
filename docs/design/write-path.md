@@ -122,21 +122,38 @@ linger nor holds up small writes. It is still held in memory until verified
   flag admits. The REAPI listener allows 10000 (`--reapi-max-streams`,
   `DEFAULT_REAPI_STREAMS`): buck2 holds one idle `Execute` stream per outstanding
   action, and a small cap would hide its backlog in the client. Its stated number is
-  larger (10000 x 17 MiB) but only a client that sends 10000 simultaneous maximal
+  larger (10000 x 17 MiB, about 166 GiB) but only a client that sends 10000 simultaneous maximal
   requests reaches it; an `Execute` request is a digest. The 16 MiB limit
   is a first setting (to be tuned later); a lower limit shrinks this bound
   in proportion. A `Write`'s first message (which names the
   blob) is decoded the same way, and a `Write` waiting for admission leaves up to its
   stream's flow-control window, 1 MiB (`STREAM_WINDOW_BYTES`), received and unread.
-- **Flow control.** The connection's window is a fixed budget of 200 streams' windows
-  (200 MiB, `CONNECTION_WINDOW_BYTES`) on both listeners, whatever their stream limits:
-  raising `--reapi-max-streams` does not raise the memory a connection may hold unread.
-  (The residue: more than 200 `Write`s waiting for admission on one REAPI connection
-  could take the whole window; the limit is no longer a guarantee against it.) With the transport's default
-  of 1 MiB, the unread data of the `Write`s waiting for admission on one connection
-  takes the whole window, and the admitted `Write`s on it, which must finish before
-  anyone else is admitted, never receive another byte: the uploads deadlock. The
-  admission test below goes red that way with the windows left at their defaults.
+- **Flow control.** A `Write` waiting for admission is not read, so its stream's
+  window stays full of unread data, and that data counts against the connection's
+  window until the server reads it. The admitted `Write`s on the connection, which must
+  finish before anyone else is admitted, need that window to move: if the waiting
+  streams hold all of it, they never receive another byte and the uploads deadlock. So
+  each listener sets the connection window to the streams it allows times each stream's
+  window (`flow_windows` in `kbf-server`), and the streams together cannot hold all of
+  it unread, however many wait. The worker listener: 200 streams of 1 MiB, a 200 MiB
+  window. The REAPI listener, at its 10000 streams: HTTP/2's window cannot pass 2 GiB
+  - 1, so each stream's window is 2 GiB / 10000, 209 KiB, and the connection window is
+  their product, 2147480000 bytes. (At up to 2047 streams the stream window stays 1
+  MiB; above that it shrinks as the limit grows, and a limit over 32767, a stream window
+  under 64 KiB, is refused.) The most one connection holds unread is therefore its
+  connection window: 200 MiB on the worker listener, about 2 GiB on the REAPI listener,
+  and only a client that sends that much reaches it. This sits next to the decode
+  memory above, not inside it: a message in the middle of being decoded is read, so it
+  does not hold window, and 10000 streams of 17 MiB messages is about 166 GiB on a
+  REAPI connection, as stated there. With the windows left at the transport's defaults the
+  same deadlock happens with 48 Writes waiting. The admission tests go red both ways:
+  that, and a connection window fixed at 200 MiB beside 10000 streams (300 Writes
+  waiting).
+  The cost is throughput on one REAPI stream: a stream moves at most its window per
+  round trip, 209 KiB, so about 200 MB/s at 1 ms and 20 MB/s at 10 ms; many streams
+  at once fill the connection as before, and the worker listener (the daemons' path) is
+  unchanged. The measurement that would move this is a large blob from one buck2
+  stream at a real round trip; it has not been run.
 - `--write-puts-in-flight` (default 4) bounds concurrent segment PUTs. A segment
   sealed while all are busy waits; new blobs go to a new open segment.
 - Commits stay one at a time. Each now carries up to a segment's worth of blobs.
