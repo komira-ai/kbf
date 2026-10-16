@@ -137,6 +137,10 @@ pub struct Api {
     pub listen: SocketAddr,
     /// The token writes must present; `None` turns writes off (reads still answer).
     pub token: Option<ApiToken>,
+    /// The node's one cache, whose fill `/metrics` reports, when the process runs a
+    /// daemon whose input cache shares the disk with this server's store
+    /// (`kbf-all-in-one`).
+    pub local_cache: Option<Arc<kbf_storage::local_cache::LocalCache>>,
 }
 
 /// Why the server could not start or stopped.
@@ -398,7 +402,9 @@ where
     let (reapi_incoming, reapi) = bind(listeners.reapi)?;
     let (worker_incoming, worker) = bind(listeners.worker)?;
     let probe_timeout = listeners.store_probe_timeout;
-    let (api_listen, token) = api.map_or((None, None), |api| (Some(api.listen), api.token));
+    let (api_listen, token, local) = api.map_or((None, None, None), |api| {
+        (Some(api.listen), api.token, api.local_cache)
+    });
     let api_listener = api_listen.map(bind_api).transpose()?;
     let api = api_listener.as_ref().map(|(_, local)| *local);
     let readiness = Arc::new(Readiness::default());
@@ -416,7 +422,7 @@ where
     );
     let api_routes = crate::api::router(Arc::clone(&farm), token, Arc::clone(&drain))
         .merge(health_routes)
-        .merge(crate::metrics::router(Arc::clone(&cache)))
+        .merge(crate::metrics::router(Arc::clone(&cache), local))
         .merge(blob_routes)
         .merge(page_routes);
     // Logged at every start, the first one too (issue #156).

@@ -48,6 +48,10 @@ pub struct Args {
     /// The roles to run.
     #[arg(long, value_enum, default_value = "all")]
     pub role: Role,
+    /// The node's one cache, when a daemon in this process shares the hot store's disk
+    /// (`kbf-all-in-one`, `kbf_storage::local_cache`). No flag sets it.
+    #[arg(skip)]
+    pub local_cache: Option<Arc<kbf_storage::local_cache::LocalCache>>,
     /// The durable object store, where every blob ends up: `file:///absolute/path` (a
     /// directory, `kbf_objstore::FsStore`: locked while the server runs, a second
     /// server on it is refused; a write that would leave its filesystem with less free
@@ -595,7 +599,12 @@ impl Args {
             .as_deref()
             .map(ApiToken::from_file)
             .transpose()?;
-        Ok(Some(Api { listen, token }))
+        let local_cache = self.local_cache.clone();
+        Ok(Some(Api {
+            listen,
+            token,
+            local_cache,
+        }))
     }
 
     /// How the cache groups and bounds uploads: `--write-linger`,

@@ -336,6 +336,23 @@ watches.
 | `kbf_write_tier_unflushed_bytes`, `kbf_write_tier_unflushed_blocks` | gauge | acknowledged bytes, and the blocks holding them, not yet in the object store |
 | `kbf_write_tier_oldest_unflushed_seconds` | gauge | the age of the oldest of those blocks (since it was created, or since the restart that recovered it); 0 when there is none |
 
+In `kbf-all-in-one`, when the hot store is a directory on the filesystem of `--data-dir`,
+the daemon half's input cache and the server half's hot store are one cache
+([architecture-v2.md](design/architecture-v2.md#10-locality)): the input cache's
+directory is the node's only local copy of a blob, the tier deletes a block once it is
+flushed (so `kbf_write_tier_flushed_copy_bytes` stays 0), and the input cache evicts its
+entries until they and the tier's blocks fit its budget: after each input it fills, and
+within about a second of the tier growing past what the budget leaves it (uploads alone).
+Entries a running lease pins are never evicted, so a hot store budgeted at or above the
+input cache's budget leaves room for those alone (the daemon warns once). These families
+follow; in every other process they are absent.
+
+| Family | Type | What it measures |
+|---|---|---|
+| `kbf_local_cache_input_bytes` | gauge | the input cache's entries |
+| `kbf_local_cache_storage_bytes` | gauge | what local storage holds on that disk: the write tier's blocks |
+| `kbf_local_cache_fill_bytes` | gauge | both, each byte once: what the one budget counts |
+
 **Reading a stall with idle slots.** `kbf_sched_queued` high and `kbf_sched_leases` below the
 nodes' slots means work is waiting that placement cannot use (look at the node's booking and
 `GET /v1/nodes`). `kbf_sched_queued` low while buck2 has many Executes open means they have not
