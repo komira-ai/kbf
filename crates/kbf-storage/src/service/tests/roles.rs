@@ -1,0 +1,239 @@
+//! Who may call what: the role table, the certificate reading, and every endpoint over
+//! real mutual TLS.
+
+use std::sync::Arc;
+
+use futures::stream;
+use kbf_proto::google::bytestream::byte_stream_client::ByteStreamClient;
+use kbf_proto::google::bytestream::ReadRequest;
+use kbf_proto::reapi::content_addressable_storage_client::ContentAddressableStorageClient;
+use kbf_proto::reapi::{ActionResult, FindMissingBlobsRequest};
+use kbf_proto::storage::action_store_client::ActionStoreClient;
+use kbf_proto::storage::{CommitRequest, GetRequest, PrepareRequest, Writer};
+use kbf_proto::worker::BeginRequest;
+use kbf_proto::worker::segments_client::SegmentsClient;
+use rcgen::{
+    BasicConstraints, CertificateParams, CertifiedIssuer, DnType, ExtendedKeyUsagePurpose, IsCa,
+    KeyPair, KeyUsagePurpose, SanType,
+};
+use tonic::transport::{Certificate, Channel, ClientTlsConfig, Identity, ServerTlsConfig};
+use tonic::{Code, Status};
+
+use super::fake::{Mem, serve_routes, sha};
+use crate::service::{
+    Admission, Config, Endpoint, PeerRole, ROLE_URI_PREFIX, StorageService, role_of,
+};
+use crate::Storage;
+
+fn uri(role: &str) -> SanType {
+    SanType::URI(format!("{ROLE_URI_PREFIX}{role}").try_into().expect("an IA5 name"))
+}
+
+fn dns(name: &str) -> SanType {
+    SanType::DnsName(name.try_into().expect("an IA5 name"))
+}
+
+/// A self-signed certificate with these subjectAltNames.
+fn der(sans: Vec<SanType>) -> Vec<u8> {
+    let mut params = CertificateParams::new(Vec::<String>::new()).expect("params");
+    params.subject_alt_names = sans;
+    let key = KeyPair::generate().expect("key");
+    params.self_signed(&key).expect("sign").der().to_vec()
+}
+
+/// The roles section 9 names, as the tests spell them (not read from the code under
+/// test), for each endpoint.
+fn expected(endpoint: Endpoint) -> &'static [&'static str] {
+    match endpoint {
+        Endpoint::FindMissing | Endpoint::Read | Endpoint::Write => {
+            &["frontend", "storage", "daemon"]
+        }
+        Endpoint::ActionGet => &["frontend"],
+        Endpoint::ActionPrepare | Endpoint::ActionCommit => &["frontend", "daemon"],
+        Endpoint::Segments => &["daemon"],
+    }
+}
+
+/// Catches an endpoint that takes a role it should not, or refuses one it should take:
+/// every role against every endpoint, the answer compared with the table the design
+/// gives, written out here.
+#[test]
+fn each_endpoint_takes_the_roles_the_design_gives_it() {
+    let certified = Admission::Certified;
+    for role in PeerRole::ALL {
+        let leaf = der(vec![uri(role.name())]);
+        assert_eq!(role_of(&leaf).expect("a role"), role);
+        for endpoint in Endpoint::ALL {
+            let answer = certified.check_leaf(Some(&leaf), endpoint);
+            if expected(endpoint).contains(&role.name()) {
+                assert!(answer.is_ok(), "{role:?} on {endpoint:?}");
+            } else {
+                let status = answer.expect_err("refused");
+                assert_eq!(status.code(), Code::PermissionDenied, "{role:?} on {endpoint:?}");
+                assert!(status.message().contains(role.name()), "{}", status.message());
+            }
+        }
+    }
+    for endpoint in Endpoint::ALL {
+        let names: Vec<&str> = endpoint.allowed().iter().map(|r| r.name()).collect();
+        assert_eq!(names, expected(endpoint), "{endpoint:?}");
+    }
+}
+
+/// Catches a certificate read wrongly: no certificate must be UNAUTHENTICATED, bytes that
+/// are not one UNAUTHENTICATED, and a certificate with no role, with two, or with a name
+/// that is not a role PERMISSION_DENIED (a DNS name that looks like a role is not one);
+/// and plain text, which has no identity, admitting every call.
+#[test]
+fn a_certificate_must_name_exactly_one_known_role() {
+    let certified = Admission::Certified;
+    let refused = |leaf: Option<&[u8]>| certified.check_leaf(leaf, Endpoint::Read).expect_err("refused");
+    assert_eq!(refused(None).code(), Code::Unauthenticated);
+    assert_eq!(refused(Some(b"not DER")).code(), Code::Unauthenticated);
+    for sans in [
+        vec![dns("daemon")],
+        vec![dns("urn:kbf:role:daemon")],
+        vec![uri("daemon"), uri("storage")],
+        vec![uri("admin")],
+        vec![],
+    ] {
+        let leaf = der(sans.clone());
+        assert_eq!(refused(Some(&leaf)).code(), Code::PermissionDenied, "{sans:?}");
+    }
+    for endpoint in Endpoint::ALL {
+        assert!(Admission::Open.check_leaf(None, endpoint).is_ok());
+    }
+}
+
+/// A CA, the server's certificate, and client certificates by role.
+struct Pki {
+    ca: CertifiedIssuer<'static, KeyPair>,
+}
+
+impl Pki {
+    fn new() -> Self {
+        let mut ca = CertificateParams::new(Vec::<String>::new()).expect("CA params");
+        ca.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        ca.distinguished_name.push(DnType::CommonName, "kbf test CA");
+        ca.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::DigitalSignature];
+        let ca = CertifiedIssuer::self_signed(ca, KeyPair::generate().expect("key")).expect("CA");
+        Self { ca }
+    }
+
+    fn server(&self) -> ServerTlsConfig {
+        let mut params = CertificateParams::new(vec!["localhost".to_owned()]).expect("params");
+        params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+        let key = KeyPair::generate().expect("key");
+        let cert = params.signed_by(&key, &self.ca).expect("sign");
+        ServerTlsConfig::new()
+            .identity(Identity::from_pem(cert.pem(), key.serialize_pem()))
+            .client_ca_root(Certificate::from_pem(self.ca.pem()))
+    }
+
+    /// A client of the server at `addr`, with a certificate for `role`.
+    async fn client(&self, addr: std::net::SocketAddr, role: &str) -> Channel {
+        let mut params = CertificateParams::new(Vec::<String>::new()).expect("params");
+        params.subject_alt_names = vec![uri(role)];
+        params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+        let key = KeyPair::generate().expect("key");
+        let cert = params.signed_by(&key, &self.ca).expect("sign");
+        let tls = ClientTlsConfig::new()
+            .ca_certificate(Certificate::from_pem(self.ca.pem()))
+            .domain_name("localhost")
+            .identity(Identity::from_pem(cert.pem(), key.serialize_pem()));
+        Channel::from_shared(format!("https://{addr}"))
+            .expect("endpoint")
+            .tls_config(tls)
+            .expect("TLS")
+            .connect()
+            .await
+            .expect("connect")
+    }
+}
+
+/// One call to `endpoint`, as a client of the wire would make it.
+async fn call(endpoint: Endpoint, channel: &Channel) -> Result<(), Status> {
+    let digest = super::wire::to_proto(&sha(b"x"));
+    match endpoint {
+        Endpoint::FindMissing => ContentAddressableStorageClient::new(channel.clone())
+            .find_missing_blobs(FindMissingBlobsRequest {
+                instance_name: String::new(),
+                blob_digests: vec![digest],
+                digest_function: 0,
+            })
+            .await
+            .map(drop),
+        Endpoint::Read => ByteStreamClient::new(channel.clone())
+            .read(ReadRequest {
+                resource_name: format!("blobs/{}/1", "ab".repeat(32)),
+                read_offset: 0,
+                read_limit: 0,
+            })
+            .await
+            .map(drop),
+        Endpoint::Write => {
+            let requests = super::write_of(&super::upload_name(&sha(b"x")), &[(b"x", true)]);
+            ByteStreamClient::new(channel.clone())
+                .write(stream::iter(requests))
+                .await
+                .map(drop)
+        }
+        Endpoint::ActionGet => ActionStoreClient::new(channel.clone())
+            .get(GetRequest {
+                map_generation: 0,
+                action: Some(digest),
+            })
+            .await
+            .map(drop),
+        Endpoint::ActionPrepare => ActionStoreClient::new(channel.clone())
+            .prepare(PrepareRequest {
+                map_generation: 0,
+                result: Some(ActionResult::default()),
+            })
+            .await
+            .map(drop),
+        Endpoint::ActionCommit => ActionStoreClient::new(channel.clone())
+            .commit(CommitRequest {
+                map_generation: 0,
+                action: Some(digest),
+                record: None,
+                writer: Writer::Daemon as i32,
+            })
+            .await
+            .map(drop),
+        Endpoint::Segments => SegmentsClient::new(channel.clone())
+            .begin(BeginRequest::default())
+            .await
+            .map(drop),
+    }
+}
+
+/// Catches an unexpected role admitted on any endpoint, over real mutual TLS (the
+/// certificate really is the transport's, not a test's stand-in): each of the three
+/// roles and one that is not a role calls every endpoint; a call is refused
+/// PERMISSION_DENIED exactly when the role is not the endpoint's, and otherwise gets as
+/// far as the store (any other answer, including the store's own errors).
+#[tokio::test]
+async fn every_endpoint_refuses_an_unexpected_role_over_mutual_tls() {
+    let pki = Pki::new();
+    let mem = Arc::new(Mem::default());
+    let storage: Arc<dyn Storage> = Arc::clone(&mem) as Arc<dyn Storage>;
+    let config = Config {
+        write_bytes_in_flight: 1 << 20,
+    };
+    let service = StorageService::new(storage, Admission::Certified, config);
+    let addr = serve_routes(service.routes(), Some(pki.server())).await;
+    for role in ["frontend", "storage", "daemon", "admin"] {
+        let channel = pki.client(addr, role).await;
+        for endpoint in Endpoint::ALL {
+            let answer = call(endpoint, &channel).await;
+            let refused = matches!(&answer, Err(s) if s.code() == Code::PermissionDenied);
+            let allowed = expected(endpoint).contains(&role);
+            assert_eq!(refused, !allowed, "{role} on {endpoint:?}: {answer:?}");
+        }
+    }
+    // A client of the allowed role really reached the store.
+    let channel = pki.client(addr, "daemon").await;
+    call(Endpoint::Write, &channel).await.expect("a daemon writes");
+    assert!(mem.blobs.lock().expect("lock").contains_key(&sha(b"x")));
+}

@@ -1,0 +1,95 @@
+//! Translating between the wire and kbf's own values: digests and ByteStream resource
+//! names. (`kbf-front` has the same for its own services; the two are one change away
+//! from being one, once the front goes through this crate.)
+
+use kbf_meta::ActionWriteError;
+use kbf_proto::reapi;
+use kbf_proto::storage::{Refusal, refusal};
+use kbf_types::{Digest, DigestFunction};
+use tonic::Status;
+
+/// A wire digest as kbf's, or INVALID_ARGUMENT. A digest that does not parse is refused,
+/// never skipped: a call that dropped it would answer for fewer digests than it was
+/// asked about.
+pub(super) fn digest(d: Option<&reapi::Digest>) -> Result<Digest, Status> {
+    let d = d.ok_or_else(|| Status::invalid_argument("a digest is required"))?;
+    let size = u64::try_from(d.size_bytes).map_err(|_| {
+        Status::invalid_argument(format!("digest size {} is negative", d.size_bytes))
+    })?;
+    Digest::parse(DigestFunction::Sha256, &format!("{}/{size}", d.hash))
+        .map_err(|e| Status::invalid_argument(format!("digest {}/{size}: {e}", d.hash)))
+}
+
+/// kbf's digest as a wire digest.
+pub(super) fn to_proto(d: &Digest) -> reapi::Digest {
+    reapi::Digest {
+        hash: d.hash_hex(),
+        // A parsed digest's size came from an `i64`.
+        size_bytes: i64::try_from(d.size_bytes).unwrap_or(i64::MAX),
+    }
+}
+
+/// SHA-256 or unset (REAPI lets a client leave it unset for SHA-256).
+pub(super) fn check_digest_function(f: i32) -> Result<(), Status> {
+    if f == reapi::digest_function::Value::Unknown as i32
+        || f == reapi::digest_function::Value::Sha256 as i32
+    {
+        return Ok(());
+    }
+    Err(Status::invalid_argument(format!(
+        "digest function {f} is not supported; storage uses SHA-256"
+    )))
+}
+
+/// The blob a ByteStream `Read` names: `{instance}/blobs/{sha256/}{hash}/{size}`. The
+/// instance name is not read: a storage node holds one cache.
+pub(super) fn read_resource(name: &str) -> Result<Digest, Status> {
+    let parts: Vec<&str> = name.split('/').collect();
+    match parts.iter().position(|p| *p == "blobs") {
+        Some(at) => match blob_digest(name, &parts[at + 1..])? {
+            (digest, []) => Ok(digest),
+            _ => Err(bad(name, "unexpected segments after the size")),
+        },
+        None => Err(bad(name, "no `blobs/` segment")),
+    }
+}
+
+/// The blob a ByteStream `Write` names:
+/// `{instance}/uploads/{uuid}/blobs/{sha256/}{hash}/{size}{/metadata}`.
+pub(super) fn write_resource(name: &str) -> Result<Digest, Status> {
+    let parts: Vec<&str> = name.split('/').collect();
+    let at = parts.iter().position(|p| *p == "uploads");
+    match at.and_then(|at| parts.get(at + 2..)) {
+        // Anything after the size is client metadata, which REAPI lets the server ignore.
+        Some(["blobs", rest @ ..]) => blob_digest(name, rest).map(|(digest, _)| digest),
+        _ => Err(bad(name, "expected `uploads/{uuid}/blobs/{hash}/{size}`")),
+    }
+}
+
+/// Parses `{sha256/}{hash}/{size}`, returning the digest and the segments left over.
+fn blob_digest<'a>(name: &str, parts: &'a [&'a str]) -> Result<(Digest, &'a [&'a str]), Status> {
+    let parts = parts.strip_prefix(&["sha256"]).unwrap_or(parts);
+    let [hash, size, rest @ ..] = parts else {
+        return Err(bad(name, "expected `{hash}/{size}`"));
+    };
+    let digest = Digest::parse(DigestFunction::Sha256, &format!("{hash}/{size}"))
+        .map_err(|e| bad(name, &e.to_string()))?;
+    Ok((digest, rest))
+}
+
+fn bad(name: &str, why: &str) -> Status {
+    Status::invalid_argument(format!("resource name {name:?}: {why}"))
+}
+
+/// An action-cache write refusal as the wire spells it.
+pub(super) fn refusal_of(e: &ActionWriteError) -> Refusal {
+    let (kind, blob) = match e {
+        ActionWriteError::NotDaemon => (refusal::Kind::NotDaemon, None),
+        ActionWriteError::Absent(d) => (refusal::Kind::Absent, Some(to_proto(d))),
+        ActionWriteError::Unreachable(d) => (refusal::Kind::Unreachable, Some(to_proto(d))),
+    };
+    Refusal {
+        kind: kind as i32,
+        blob,
+    }
+}

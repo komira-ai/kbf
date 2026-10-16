@@ -1913,9 +1913,14 @@ dependencies = [
  "futures",
  "kbf-meta",
  "kbf-proto",
+ "kbf-segments",
  "kbf-types",
+ "rcgen",
  "thiserror",
+ "tokio",
  "tonic",
+ "tracing",
+ "x509-parser",
 ]
 
 [[package]]
