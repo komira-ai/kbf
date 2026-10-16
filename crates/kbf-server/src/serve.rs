@@ -484,11 +484,9 @@ where
             }
         };
         // One timer for every open stream's progress operation.
-        let progressing = async {
-            match ticker {
-                Some(ticker) => ticker.run().await,
-                None => std::future::pending().await,
-            }
+        let progressing = match ticker {
+            Some(ticker) => Either::Left(ticker.run()),
+            None => Either::Right(std::future::pending::<()>()),
         };
         // Completes when the drain has run out of time: the REAPI listener, drained
         // in time, completes first.
