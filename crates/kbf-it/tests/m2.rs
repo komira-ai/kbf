@@ -425,12 +425,52 @@ fn scratch(name: &str) -> PathBuf {
     dir
 }
 
+/// A name for one run's directory that no other call returns.
 fn unique(name: &str) -> String {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("clock after 1970")
         .as_nanos();
+    unique_at(name, nanos)
+}
+
+/// [`unique`] at the clock reading `nanos`.
+fn unique_at(name: &str, nanos: u128) -> String {
     format!("{name}-{}-{nanos}", std::process::id())
+}
+
+/// Catches: a name made of the pid and the clock alone. The tests are threads of one
+/// process, so two of them that read the clock in one tick got the same runtime
+/// directory, and the second bind of its bus failed with `AddrInUse`.
+#[test]
+fn two_names_made_at_one_instant_differ() {
+    assert_ne!(unique_at("m2", 7), unique_at("m2", 7));
+}
+
+/// Catches: cells made at once by parallel tests that share a bus, and a cell that
+/// leaves its runtime directory and bus behind when it is dropped.
+#[test]
+fn cells_made_at_once_have_their_own_bus_and_remove_it() {
+    const CELLS: usize = 16;
+    let barrier = std::sync::Barrier::new(CELLS);
+    let cells: Vec<Cell> = std::thread::scope(|s| {
+        let made: Vec<_> = (0..CELLS)
+            .map(|_| {
+                s.spawn(|| {
+                    barrier.wait();
+                    Cell::new("at-once", "none")
+                })
+            })
+            .collect();
+        made.into_iter().map(|h| h.join().expect("a cell")).collect()
+    });
+    let runtimes: std::collections::BTreeSet<PathBuf> =
+        cells.iter().map(|c| c.runtime.clone()).collect();
+    assert_eq!(runtimes.len(), CELLS, "{runtimes:?}");
+    drop(cells);
+    for runtime in &runtimes {
+        assert!(!runtime.exists(), "left behind: {}", runtime.display());
+    }
 }
 
 /// One fake cell: the fakes in `<dir>/bin`, the daemon's cgroup under `<dir>/cgroup`, a
