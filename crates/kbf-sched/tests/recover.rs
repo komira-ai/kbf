@@ -131,6 +131,35 @@ fn a_recovered_queue_is_placed_under_the_new_term_and_ids_continue() {
     assert_eq!(s.next_operation(), OperationId(11));
 }
 
+/// Catches: a recovered queue placed in another order than the one it was in: the
+/// urgency of each operation is part of what a restart keeps (ignoring it places the
+/// interactive caller behind the batch of the CI jobs that arrived first), and
+/// operations of one level keep their order past a single digit of id (ids 9 and 10).
+#[test]
+fn a_recovered_queue_keeps_its_urgency_and_arrival_order() {
+    let mut recovered_ops: Vec<Recovered> = (0..10u8)
+        .map(|n| queued(u64::from(n), request(n)))
+        .collect();
+    let urgent = Request {
+        qos: Qos::Interactive,
+        ..request(10)
+    };
+    recovered_ops.push(queued(10, urgent));
+    let mut s = recovered(recovered_ops);
+    let order: Vec<u64> = s.queued().map(|id| id.0).collect();
+    assert_eq!(order, [10, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
+    up(&mut s, 0, "node-a");
+    let effects = feed(&mut s, 0, Event::Tick);
+    let granted: Vec<(u64, u64)> = effects
+        .iter()
+        .filter_map(|e| match e {
+            Effect::Commit(ControlRecord::Lease(g)) => Some((g.operation.0, g.lease.seq)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(granted, [(10, 20), (0, 21), (1, 22), (2, 23)]);
+}
+
 /// Catches: a recovered operation that a client asking for the same action again does
 /// not join (the work runs twice), and one that a networked action's twin joins (those
 /// runs are not interchangeable, as for any submission).

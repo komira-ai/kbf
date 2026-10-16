@@ -362,6 +362,66 @@ async fn a_grant_the_store_refuses_is_not_started_and_is_granted_again() {
     assert_eq!(disk.rows("queue/"), 0);
 }
 
+/// Catches: a lease given up while the store was down that the store is never told of.
+/// The store would still hold the old lease and no queue row, so the grant that follows
+/// is refused for want of a queue row, its `Start` is dropped, and the operation never
+/// runs until a restart. Once the store is back, the given-up lease is written and the
+/// operation is granted again.
+#[tokio::test(start_paused = true)]
+async fn a_requeue_the_store_refused_is_written_when_it_returns() {
+    let disk = Disk::new();
+    let farm = disk.farm(EpochPolicy::Keep);
+    let (stream, mut inbox) = register(&farm);
+    submit(&farm, request(1)).expect("submitted");
+    assert_eq!(starts(&mut inbox).len(), 1);
+    disk.store.set_down(true);
+    tokio::time::advance(kbf_sched::fence::LEASE_GRACE + Duration::from_secs(1)).await;
+    farm.tick().await;
+    assert_eq!(
+        disk.rows("lease/"),
+        1,
+        "the store was down: it holds the lease"
+    );
+    disk.store.set_down(false);
+
+    assert!(farm.heartbeat(&node(), stream, 1, Vec::new()).await);
+    let regranted = starts(&mut inbox);
+    assert_eq!(
+        regranted,
+        [LeaseId::new(farm.lease_epoch(), 1)],
+        "the operation was not granted again"
+    );
+    assert_eq!((disk.rows("lease/"), disk.rows("queue/")), (1, 0));
+    assert!(accepted(&farm, regranted[0]).await);
+    assert_eq!(disk.rows("op/"), 0);
+}
+
+/// Pins (it passes without the repair above): a start that bumps the epoch over a store
+/// holding a granted lease takes the lease up, and when the daemon, which kills the runs
+/// of an earlier epoch, does not list it, requeues it at once under the new term. The
+/// old lease's result is refused.
+#[tokio::test(start_paused = true)]
+async fn a_bumped_epoch_requeues_the_old_term_leases_the_daemon_killed() {
+    let mut disk = Disk::new();
+    let before = disk.farm(EpochPolicy::Keep);
+    let epoch = before.lease_epoch();
+    let (_, mut inbox) = register(&before);
+    submit(&before, request(1)).expect("submitted");
+    let [old] = starts(&mut inbox)[..] else {
+        panic!("one lease expected");
+    };
+    assert_eq!(old.term, epoch);
+    disk.crash(before);
+
+    let after = disk.farm(EpochPolicy::Bump);
+    assert_eq!(after.lease_epoch(), epoch + 1);
+    let (stream, mut inbox) = register(&after);
+    assert!(after.heartbeat(&node(), stream, 1, Vec::new()).await);
+    assert_eq!(starts(&mut inbox), [LeaseId::new(epoch + 1, 1)]);
+    assert!(!accepted(&after, old).await, "the old term's result");
+    assert_eq!(disk.rows("lease/"), 1);
+}
+
 /// Catches: a lease given up for silence that stays in the store as held (a restart
 /// would re-bind a run nobody holds), and a refused operation that stays in it (it
 /// would be refused again, or run).

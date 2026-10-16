@@ -270,7 +270,9 @@ fn a_stale_complete_is_rejected() {
 }
 
 /// Catches: a lease given up that stays in the store (a restart re-binds a run nobody
-/// holds), an operation not queued again after it, and a lease given up twice.
+/// holds), an operation not queued again after it, and a give-up that cannot be written
+/// again: the farm repeats a refused one until the store takes it, so a repeat after
+/// it was taken changes nothing, and one for an operation that finished writes nothing.
 #[test]
 fn a_given_up_lease_requeues_its_operation_once() {
     let store = Flaky::new();
@@ -285,8 +287,22 @@ fn a_given_up_lease_requeues_its_operation_once() {
     let stored = durable.load().expect("load");
     assert_eq!(stored.operations[0].lease, None);
     assert!(keys(&store).contains(&"queue/0000000000000004".to_owned()));
-    let twice = durable.requeued(&requeue(4, 0));
-    assert!(matches!(twice, Err(StateError::Missing(_))), "{twice:?}");
+    durable
+        .requeued(&requeue(4, 0))
+        .expect("again, nothing changes");
+    let again = durable.load().expect("load");
+    assert_eq!(again, stored);
+    durable
+        .persist(&[Effect::Refuse(Refusal {
+            operation: OperationId(4),
+            waiters: Vec::new(),
+            reason: String::new(),
+        })])
+        .expect("refused");
+    durable
+        .requeued(&requeue(4, 0))
+        .expect("a finished operation has nothing to put back");
+    assert!(!keys(&store).iter().any(|k| k.starts_with("queue/")));
 }
 
 /// Catches: a refused operation left in the store (it would be refused, or run, again
