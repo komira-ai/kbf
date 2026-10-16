@@ -235,9 +235,9 @@ impl<M: MetaLog, O: ObjectStore + 'static> ByteStreamService<M, O> {
         // later), else straight to the store.
         let cache = Arc::clone(&self.cache);
         let size = digest.size_bytes;
-        let onto_tier = tokio::task::spawn_blocking(move || cache.stream(size)).await;
+        let onto_tier = tokio::task::spawn_blocking(move || cache.tier_open(size)).await;
         let stored = match onto_tier.ok().flatten() {
-            Some(stream) => self.cache.stage_streamed(digest, stream, body).await,
+            Some(open) => self.cache.stage_streamed(digest, open, body).await,
             None => self.cache.store_streamed(digest, body).await,
         };
         drop(admitted);

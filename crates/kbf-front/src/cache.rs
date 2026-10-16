@@ -184,6 +184,9 @@ pub struct Cache<M, O> {
     touches: Arc<Touches>,
     segment_limit: u64,
     trees: Arc<InputTrees>,
+    /// The runtime the cache was made on, which a record stream to the store runs its
+    /// upload on; `None` for a cache made outside one.
+    runtime: Option<tokio::runtime::Handle>,
 }
 
 impl<M, O> Drop for Cache<M, O> {
@@ -227,6 +230,7 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
             touches: Arc::new(Touches::new(TouchConfig::DEFAULT)),
             segment_limit: MAX_SEGMENT_BYTES,
             trees: Arc::new(InputTrees::new(InputTreeConfig::DEFAULT)),
+            runtime: tokio::runtime::Handle::try_current().ok(),
         }
     }
 
@@ -721,6 +725,7 @@ mod evict;
 mod flush;
 mod read;
 mod stream;
+mod stream_store;
 mod tier;
 mod touches;
 mod upload;
