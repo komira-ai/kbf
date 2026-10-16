@@ -74,6 +74,7 @@ pub mod stamp;
 mod start;
 mod startup_pass;
 pub mod stores;
+pub mod streams;
 mod timeout;
 pub mod token;
 pub mod worker;
@@ -91,6 +92,7 @@ pub use serve::{
     bind_server_with_policy,
 };
 pub use start::{ServerHandle, interrupted, serve_with, sizes_on, start};
+pub use streams::{StreamArgs, StreamLimits};
 pub use worker::WorkerService;
 
 /// The commit the server was built from: 12 hex digits, or `unknown` when the build

@@ -11,9 +11,8 @@ use futures::StreamExt as _;
 use futures::future::Either;
 use kbf_auth::{AuthenticateLayer, Policy};
 use kbf_front::{
-    ByteStreamService, CONNECTION_WINDOW_BYTES, Cache, CasService, Connections,
-    MAX_CONCURRENT_STREAMS, MAX_MESSAGE_BYTES, MetaLog, RECORDER_CHANNEL, Recorder,
-    RequestMetadataLayer, STREAM_WINDOW_BYTES, SegmentsConfig, SegmentsService,
+    ByteStreamService, Cache, CasService, Connections, MAX_MESSAGE_BYTES, MetaLog,
+    RECORDER_CHANNEL, Recorder, RequestMetadataLayer, SegmentsConfig, SegmentsService,
 };
 use kbf_objstore::ObjectStore;
 use kbf_proto::google::bytestream::byte_stream_server::ByteStreamServer;
@@ -33,6 +32,7 @@ use crate::health::Readiness;
 use crate::http_blobs::BlobReaders;
 use crate::http_invocations::InvocationReaders;
 use crate::identity::{DenyList, Peers};
+use crate::streams::{StreamLimits, flow_windows};
 use crate::token::ApiToken;
 use crate::worker::WorkerService;
 
@@ -82,6 +82,9 @@ pub struct Listeners {
     /// The worker listener's segment uploads (`--segment-upload-*`;
     /// `docs/design/write-path.md`, section 4).
     pub segments: SegmentsConfig,
+    /// The most HTTP/2 streams one connection may have open on each listener
+    /// (`--reapi-max-streams`, `--worker-max-streams`).
+    pub streams: StreamLimits,
 }
 
 /// The worker listener's mutual TLS: every daemon's certificate must name its node
@@ -197,15 +200,18 @@ fn bind_api(addr: SocketAddr) -> Result<(tokio::net::TcpListener, SocketAddr), S
     bound.map_err(|source| ServeError::Bind { addr, source })
 }
 
-/// `server` with the HTTP/2 limits both listeners state rather than leave to the
-/// transport's defaults: they bound what is held outside `--write-bytes-in-flight`, and
-/// the connection window is what lets a Write admitted after others finish at all
-/// (`kbf_front::CONNECTION_WINDOW_BYTES`).
-fn flow_control(server: Server) -> Server {
+/// `server` with the HTTP/2 limits a listener states rather than leaves to the
+/// transport's defaults: at most `max_streams` open streams per connection (each
+/// listener its own, [`StreamLimits`]), and the stream and connection windows
+/// ([`flow_windows`]), which bound what is held outside `--write-bytes-in-flight`. The
+/// connection window holds every stream's window at once, which is what lets a Write
+/// admitted after others finish at all.
+fn flow_control(server: Server, max_streams: u32) -> Server {
+    let windows = flow_windows(max_streams);
     server
-        .max_concurrent_streams(Some(MAX_CONCURRENT_STREAMS))
-        .initial_stream_window_size(Some(STREAM_WINDOW_BYTES))
-        .initial_connection_window_size(Some(CONNECTION_WINDOW_BYTES))
+        .max_concurrent_streams(Some(windows.streams))
+        .initial_stream_window_size(Some(windows.stream))
+        .initial_connection_window_size(Some(windows.connection))
 }
 
 /// The warning every start logs ([`bind_server_with_api`]).
@@ -328,11 +334,11 @@ where
     let (term, epoch) = (farm.term(), farm.lease_epoch());
     tracing::warn!(term, epoch, "{STATE_IN_MEMORY}");
 
-    let mut reapi_server = flow_control(Server::builder());
+    let mut reapi_server = flow_control(Server::builder(), listeners.streams.reapi);
     if let Some(tls) = listeners.reapi_tls {
         reapi_server = reapi_server.tls_config(tls)?;
     }
-    let mut worker_server = flow_control(Server::builder());
+    let mut worker_server = flow_control(Server::builder(), listeners.streams.worker);
     let peers = match listeners.worker_tls {
         Some(tls) => {
             worker_server = worker_server.tls_config(tls.server)?;
