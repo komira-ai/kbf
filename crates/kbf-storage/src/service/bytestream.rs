@@ -85,7 +85,7 @@ impl ByteStream for StorageService {
         if size > STREAM_FROM_BYTES {
             let fault = Arc::new(Mutex::new(None));
             let body = pieces(stream, message, size, Arc::clone(&fault));
-            let claim = futures::future::ready(Some(digest)).boxed();
+            let claim = Box::pin(futures::future::ready(Some(digest)));
             let stored = self.storage.put_streamed(size, body, claim).await;
             // A fault of the sender's is INVALID_ARGUMENT, not the store's.
             if let Some(status) = fault.lock().unwrap_or_else(PoisonError::into_inner).take() {
