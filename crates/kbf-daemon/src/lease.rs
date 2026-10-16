@@ -24,13 +24,10 @@
 //! (the all-in-one design, komira-build-farm#657, section 7.3), and its lease does
 //! not stay running.
 
-use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet};
-use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::time::Instant;
 
-use futures::FutureExt as _;
 use kbf_proto::google::rpc::precondition_failure::Violation;
 use kbf_proto::google::rpc::{Code, PreconditionFailure, Status};
 use kbf_proto::reapi::{ActionResult, ExecutedActionMetadata};
@@ -39,6 +36,7 @@ use kbf_types::{LeaseId, LostWhy, Resources};
 use prost::Message;
 use tokio::sync::mpsc;
 
+use crate::lease_panic::contained;
 use crate::phases::LeasePhases;
 use crate::runtime::{RuntimeError, Work};
 use crate::runtimes::{AnyRuntime, Runtimes};
@@ -116,18 +114,7 @@ impl Leases {
         let run = Arc::clone(&runtime);
         tokio::spawn(async move {
             let started = Instant::now();
-            // A driver that panics ends this run, never the daemon (or, in
-            // kbf-all-in-one, the server beside it), and the run still reports: a run
-            // that never reported would keep its lease listed as running for ever.
-            let outcome = match AssertUnwindSafe(run.run(work)).catch_unwind().await {
-                Ok(outcome) => outcome,
-                Err(panic) => {
-                    // What the run left behind is the runtime's to stop, as for a
-                    // cancelled lease; a kill that panics too changes nothing more.
-                    let _ = AssertUnwindSafe(run.kill(id)).catch_unwind().await;
-                    Err(panicked(run.driver(), panic.as_ref()))
-                }
-            };
+            let outcome = contained(run.as_ref(), id, work).await;
             // An error carries no result, so no usage: the runtime is asked for it. An
             // out-of-memory kill (the lease's own limit, or the node's) is marked.
             let usage = outcome.as_ref().err().and_then(|_| run.failed_usage(id));
@@ -231,17 +218,6 @@ impl Leases {
         }
         fenced
     }
-}
-
-/// The failure a run whose driver panicked reports: INTERNAL, the farm's (a driver
-/// bug), naming the driver and the panic's message.
-fn panicked(driver: &str, panic: &(dyn Any + Send)) -> RuntimeError {
-    let message = panic
-        .downcast_ref::<&str>()
-        .map(|m| (*m).to_owned())
-        .or_else(|| panic.downcast_ref::<String>().cloned())
-        .unwrap_or_else(|| "no message".to_owned());
-    RuntimeError::Failed(format!("the {driver} driver panicked: {message}"))
 }
 
 /// What kind of failure `error` is, for the `lease failed` line: the variant, since a
