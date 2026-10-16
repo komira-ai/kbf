@@ -35,8 +35,6 @@ use axum::http::header::{AUTHORIZATION, CONTENT_TYPE, ORIGIN, WWW_AUTHENTICATE};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use kbf_front::MetaLog;
-use kbf_objstore::ObjectStore;
 use kbf_types::WorkerId;
 use serde::Deserialize;
 
@@ -77,8 +75,8 @@ pub fn node_path(node: &str, verb: &str) -> String {
 
 /// What the handlers share: the farm, the token writes must present (`None`: writes
 /// are off) and the frontend's drain.
-struct ApiState<M, O> {
-    farm: Arc<Farm<M, O>>,
+struct ApiState {
+    farm: Arc<Farm>,
     token: Option<ApiToken>,
     drain: Arc<Drain>,
 }
@@ -86,27 +84,16 @@ struct ApiState<M, O> {
 /// The API's routes over `farm`; writes need `token`, and without one are refused.
 /// `drain` is what `POST /v1/frontend/drain` begins. Writes read the peer address from
 /// [`ConnectInfo`]: serve them with `into_make_service_with_connect_info`.
-pub fn router<M, O>(farm: Arc<Farm<M, O>>, token: Option<ApiToken>, drain: Arc<Drain>) -> Router
-where
-    M: MetaLog,
-    O: ObjectStore + 'static,
-{
+pub fn router(farm: Arc<Farm>, token: Option<ApiToken>, drain: Arc<Drain>) -> Router {
     Router::new()
-        .route(NODES, get(nodes::<M, O>))
-        .route("/v1/nodes/{target}", post(act::<M, O>))
-        .route(
-            FRONTEND_DRAIN,
-            get(drain_status::<M, O>).post(begin_drain::<M, O>),
-        )
+        .route(NODES, get(nodes))
+        .route("/v1/nodes/{target}", post(act))
+        .route(FRONTEND_DRAIN, get(drain_status).post(begin_drain))
         .with_state(Arc::new(ApiState { farm, token, drain }))
 }
 
 /// The drain as it is now.
-fn status<M, O>(api: &ApiState<M, O>) -> DrainStatus
-where
-    M: MetaLog,
-    O: ObjectStore + 'static,
-{
+fn status(api: &ApiState) -> DrainStatus {
     DrainStatus {
         draining: api.drain.is_draining(),
         open_executions: api.farm.open_executions(),
@@ -114,11 +101,7 @@ where
     }
 }
 
-async fn drain_status<M, O>(State(api): State<Arc<ApiState<M, O>>>) -> Response
-where
-    M: MetaLog,
-    O: ObjectStore + 'static,
-{
+async fn drain_status(State(api): State<Arc<ApiState>>) -> Response {
     json(StatusCode::OK, &status(&api))
 }
 
@@ -127,16 +110,12 @@ where
 #[serde(deny_unknown_fields)]
 struct NoBody {}
 
-async fn begin_drain<M, O>(
-    State(api): State<Arc<ApiState<M, O>>>,
+async fn begin_drain(
+    State(api): State<Arc<ApiState>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     body: Bytes,
-) -> Response
-where
-    M: MetaLog,
-    O: ObjectStore + 'static,
-{
+) -> Response {
     if let Err((code, why)) = gate(api.token.as_ref(), peer, &headers) {
         return error(code, &why);
     }
@@ -152,25 +131,17 @@ where
     json(StatusCode::OK, &status(&api))
 }
 
-async fn nodes<M, O>(State(api): State<Arc<ApiState<M, O>>>) -> Response
-where
-    M: MetaLog,
-    O: ObjectStore + 'static,
-{
+async fn nodes(State(api): State<Arc<ApiState>>) -> Response {
     json(StatusCode::OK, &api.farm.nodes())
 }
 
-async fn act<M, O>(
-    State(api): State<Arc<ApiState<M, O>>>,
+async fn act(
+    State(api): State<Arc<ApiState>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Path(target): Path<String>,
     headers: HeaderMap,
     body: Bytes,
-) -> Response
-where
-    M: MetaLog,
-    O: ObjectStore + 'static,
-{
+) -> Response {
     let request = Write {
         peer,
         headers: &headers,

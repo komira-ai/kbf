@@ -380,7 +380,7 @@ async fn an_api_address_in_use_is_refused() {
 }
 
 fn register(
-    farm: &Farm<MemoryMetaLog, MemoryStore>,
+    farm: &Farm,
     node: &str,
 ) -> (
     kbf_server::farm::StreamId,
@@ -457,7 +457,7 @@ async fn two_nodes_whose_streams_ended_before_one_read_are_both_disconnected() {
     );
     let (_, first) = register(&farm, "linux-1");
     let (_, second) = register(&farm, "linux-2");
-    let connected = |farm: &Farm<MemoryMetaLog, MemoryStore>| {
+    let connected = |farm: &Farm| {
         let mut nodes: Vec<(String, bool)> = farm
             .nodes()
             .nodes

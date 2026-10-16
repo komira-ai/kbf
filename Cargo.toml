@@ -48,6 +48,8 @@ hex = "0.4.3"
 # The status line and headers of an HTTPS answer (kbf-deploy: `mdm fetch`, `mdm verify`).
 # Already in the tree through hyper.
 httparse = "1.10.1"
+# The frontend proxy's pass-through bodies (kbf-front); already in the tree through tonic.
+http-body = "1.1.0"
 # `wait4` and `kill` for a measured child process (kbf-daemon's `usage` module); the
 # standard library reaps children without returning their resource usage.
 libc = "0.2.190"

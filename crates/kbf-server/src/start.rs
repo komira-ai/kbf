@@ -35,7 +35,8 @@ use crate::startup_pass::StartPass;
 use crate::stores::{COLD_FILE_FLOOR, FILE_PREFIX_ROOT, Hot, StoreUri, Stores};
 use crate::write_tier::FLUSH_EVERY;
 use crate::{
-    Args, RaftMetaLog, SERVER_VERSION, ServeError, StateStoreUri, bind_server_with_state, s3_store,
+    Args, RaftMetaLog, SERVER_VERSION, ServeError, StateStoreUri, bind_server_with_options,
+    s3_store,
 };
 
 /// The server's thread sizes on a given machine shape: every CPU, then the overrides.
@@ -43,8 +44,39 @@ pub fn sizes_on(args: &Args, topology: Topology) -> kbf_threads::Sizes {
     args.threads.resolve(topology)
 }
 
+/// Runs `serving`, and if `escalation` completes meanwhile (the second stop signal)
+/// calls [`Drain::close`]: the open streams end UNAVAILABLE and the server stops within
+/// a short grace. One function for `kbf-server` and `kbf frontend`.
+pub(crate) async fn escalating<T>(
+    serving: impl Future<Output = T>,
+    drain: &Arc<Drain>,
+    escalation: Option<Escalation>,
+) -> T {
+    let drain = Arc::clone(drain);
+    let _escalation = escalation.map(|second| {
+        AbortOnDrop(tokio::spawn(async move {
+            second.await;
+            tracing::warn!("a second stop signal: ending the open streams now");
+            drain.close();
+        }))
+    });
+    serving.await
+}
+
+/// The first stop signal's future and the second's, installed in one call: a signal
+/// between the two handlers stops the server, and the second is then a third.
+///
+/// # Errors
+/// A handler cannot be installed.
+pub(crate) fn interruptions() -> io::Result<(impl Future<Output = ()> + Send + 'static, Escalation)>
+{
+    let first = interrupted()?;
+    let second: Escalation = Box::pin(second_interrupt()?);
+    Ok((first, second))
+}
+
 /// A future that completes on the second stop signal.
-type Escalation = Pin<Box<dyn Future<Output = ()> + Send>>;
+pub(crate) type Escalation = Pin<Box<dyn Future<Output = ()> + Send>>;
 
 /// A started server: bound, its write tier attached and its flusher (and any start-up
 /// pass) running, not yet serving. [`ServerHandle::serve`] serves until the shutdown
@@ -108,14 +140,7 @@ impl ServerHandle {
             _pass,
             ..
         } = self;
-        let _escalation = escalation.map(|second| {
-            AbortOnDrop(tokio::spawn(async move {
-                second.await;
-                tracing::warn!("a second stop signal: ending the open streams now");
-                drain.close();
-            }))
-        });
-        serving.await
+        escalating(serving, &drain, escalation).await
     }
 }
 
@@ -131,10 +156,7 @@ pub async fn start_interruptible(args: &Args) -> Result<ServerHandle, Box<dyn Er
     let slot: Arc<Mutex<Option<Escalation>>> = Arc::new(Mutex::new(None));
     let installing = Arc::clone(&slot);
     let mut handle = start(args, move || {
-        // The first signal's handler before the second's, in one call: a signal between
-        // the two stops the server, and the second signal is then a third.
-        let first = interrupted()?;
-        let second: Escalation = Box::pin(second_interrupt()?);
+        let (first, second) = interruptions()?;
         *installing.lock().unwrap_or_else(PoisonError::into_inner) = Some(second);
         Ok(first)
     })
@@ -291,7 +313,8 @@ where
     let _pass = pass.map(|pass| AbortOnDrop(crate::startup_pass::spawn(Arc::clone(&cache), pass)));
     let shutdown = shutdown()?;
     let api = args.api()?;
-    let bound = bind_server_with_state(cache, listeners, api, policy, state, shutdown)?;
+    let storage = args.storage()?;
+    let bound = bind_server_with_options(cache, listeners, api, policy, state, storage, shutdown)?;
     let plain = args.plain_text_off_loopback();
     Ok(ServerHandle {
         reapi: bound.reapi,

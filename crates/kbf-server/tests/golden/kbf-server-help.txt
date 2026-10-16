@@ -56,6 +56,9 @@ Options:
       --reapi-auth-policy <REAPI_AUTH_POLICY>
           A JSON file with the REAPI listener's authentication policy and authorizers (`docs/reapi-auth.md`), read once at start; a file that is not a valid policy stops the server. Without it every REAPI call is accepted and allowed. The worker listener does not read it; on the operator API only the build pages and the blob route do, and they are off unless it names their authorizers
 
+      --storage <URL>
+          Proxy mode (`docs/design/architecture-v2.md`, section 7): the URL of a storage node (`kbf storage`), such as `http://127.0.0.1:8990`. The REAPI listener then answers a client's CAS, ByteStream and action-cache calls from that node, passing ByteStream through without holding a blob. The local stores are still opened: Execution and the worker listener use them (`kbf frontend` is this mode without them: Execution reads the node too). Plain text (`http://`) only here; `kbf frontend` takes the flags of the mutual TLS to the node. Without it, the server answers those calls itself
+
       --worker-listen <WORKER_LISTEN>
           The `kbf.worker.v1` listener. Without mutual TLS (`--worker-tls-cert`, `--worker-tls-key`, `--worker-client-ca`) it serves plain text, on any address; off loopback the start line carries a warning
           
