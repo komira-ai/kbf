@@ -686,6 +686,8 @@ pub struct FakeDaemon {
     seq: u64,
     /// The lease epoch the Welcome named (0 before it).
     pub epoch: u64,
+    /// The storage map the Welcome carried.
+    pub map: Option<kbf_proto::kbf::map::v1::Map>,
 }
 
 impl FakeDaemon {
@@ -713,6 +715,7 @@ impl FakeDaemon {
                 assert_eq!(w.protocol_version, 1);
                 assert_eq!(w.heartbeat_interval_ms, INTERVAL.as_millis() as u64);
                 d.epoch = w.epoch;
+                d.map = w.map;
                 Ok(d)
             }
             other => panic!("expected Welcome, got {other:?}"),
@@ -742,6 +745,7 @@ impl FakeDaemon {
             kept: VecDeque::new(),
             seq: 0,
             epoch: 0,
+            map: None,
         })
     }
 
@@ -798,6 +802,17 @@ impl FakeDaemon {
             }
             self.kept.push_back(m);
         }
+    }
+
+    /// The generation of the next `MapUpdate`, within `within`.
+    pub async fn map_update_within(&mut self, within: Duration) -> Option<u64> {
+        self.expect_within(within, |m| match m {
+            server_message::Message::MapUpdate(u) => {
+                Some(u.map.as_ref().map_or(0, |m| m.generation))
+            }
+            _ => None,
+        })
+        .await
     }
 
     pub async fn expect<T>(

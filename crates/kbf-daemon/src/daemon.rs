@@ -75,6 +75,7 @@ use std::time::Duration;
 
 use futures::channel::mpsc::{UnboundedSender, unbounded};
 use kbf_proto::google::rpc::Code;
+use kbf_proto::kbf::map::v1 as wire;
 use kbf_proto::reapi::Digest;
 use kbf_proto::worker::{
     self, DaemonMessage, Heartbeat, Hello, Phase, ServerMessage, daemon_message, server_message,
@@ -93,6 +94,7 @@ use crate::connect::{
 };
 use crate::contact::Contact;
 use crate::lease::{Done, Leases, failure, lease_id, proto_lease_id};
+use crate::map::{MapLink, map_asked};
 use crate::phases::LeasePhases;
 use crate::pressure;
 use crate::report::NodeReport;
@@ -216,6 +218,9 @@ pub struct Daemon {
     /// Hello carries `phase_now`, or [`NodePhase::MemoryPressure`] in its place while
     /// the node is serving and the backstop has paused it.
     pressure: Option<Backstop>,
+    /// Where the storage map of `Welcome` and `MapUpdate` goes, if the daemon routes by
+    /// one; see [`Self::with_map`].
+    map: Option<MapLink>,
     events: Option<mpsc::UnboundedSender<Event>>,
     leases: Leases,
     done: mpsc::UnboundedReceiver<Done>,
@@ -264,6 +269,7 @@ enum Wake {
     Driver,
     Phase,
     Pressure,
+    MapAsked,
 }
 
 impl Daemon {
@@ -308,6 +314,7 @@ impl Daemon {
             phase: None,
             phase_now: NodePhase::Serving,
             pressure: None,
+            map: None,
             events: None,
             leases: Leases::new(runtimes, done_tx),
             done,
@@ -320,6 +327,16 @@ impl Daemon {
             instance: instance_id(),
             predecessor: String::new(),
         })
+    }
+
+    /// Puts the storage map the server sends (in `Welcome`, and in each `MapUpdate`) in
+    /// `holder`, which keeps the newest and never goes back, and asks the server for a
+    /// map when the holder is waiting for a generation it does not have
+    /// ([`kbf_mapsync::MapHolder::reach`]). Without one the daemon ignores the map.
+    #[must_use]
+    pub fn with_map(mut self, holder: Arc<kbf_mapsync::MapHolder>) -> Self {
+        self.map = Some(MapLink::new(holder));
+        self
     }
 
     /// This daemon process's instance id (`Hello.instance_id`), drawn when it was built.
@@ -590,7 +607,7 @@ impl Daemon {
             .offline(timeout(wait, inbound.message()))
             .await
             .map_err(|_| SessionError::WelcomeTimeout(wait))??;
-        let (interval, epoch) = self.welcome(first)?;
+        let (interval, epoch, map) = self.welcome(first)?;
         self.welcomed = true;
         self.contact.new_stream(interval);
         self.window.new_stream(hello_sent);
@@ -600,6 +617,13 @@ impl Daemon {
         self.recheck();
         // Before any Result is resent or any Start of this stream is read.
         self.new_epoch(epoch);
+        if let Some(link) = self.map.as_mut() {
+            link.take(map);
+            // A generation the holder waited for before this stream.
+            if let Some(request) = link.request() {
+                send(&tx, daemon_message::Message::MapRequest(request));
+            }
+        }
         if self.contact.confirm(hello_sent) {
             self.emit(Event::ContactRestored);
         }
@@ -633,6 +657,7 @@ impl Daemon {
                 Some(()) = driver_changed(self.driver.as_mut()) => Wake::Driver,
                 Some(()) = phase_changed(self.phase.as_mut()) => Wake::Phase,
                 Some(()) = pressure_changed(self.pressure.as_mut()) => Wake::Pressure,
+                Some(()) = map_asked(self.map.as_mut()) => Wake::MapAsked,
             };
             // First, whatever woke the loop: the clock may have jumped over a suspend.
             self.recheck();
@@ -671,6 +696,11 @@ impl Daemon {
                     }
                 }
                 Wake::Pressure => {}
+                Wake::MapAsked => {
+                    if let Some(request) = self.map.as_mut().and_then(MapLink::request) {
+                        send(&tx, daemon_message::Message::MapRequest(request));
+                    }
+                }
             }
             // Whatever woke the loop, leases may have started or ended.
             if self.take_pressure() {
@@ -692,12 +722,12 @@ impl Daemon {
         Ok(())
     }
 
-    /// Checks the first server message is an acceptable Welcome; returns its interval
-    /// and the lease epoch it names (`None` for 0).
+    /// Checks the first server message is an acceptable Welcome; returns its interval,
+    /// the lease epoch it names (`None` for 0) and the storage map it carries.
     fn welcome(
         &self,
         first: Option<ServerMessage>,
-    ) -> Result<(Duration, Option<u64>), SessionError> {
+    ) -> Result<(Duration, Option<u64>, Option<wire::Map>), SessionError> {
         let Some(server_message::Message::Welcome(w)) = first.and_then(|m| m.message) else {
             return Err(SessionError::Protocol(
                 "the first server message is not Welcome".into(),
@@ -717,7 +747,7 @@ impl Daemon {
                 self.contact.fence_after()
             )));
         }
-        Ok((interval, (w.epoch != 0).then_some(w.epoch)))
+        Ok((interval, (w.epoch != 0).then_some(w.epoch), w.map))
     }
 
     /// Takes the lease epoch a Welcome named. When it names one, every lease granted
@@ -800,6 +830,11 @@ impl Daemon {
             }
             Some(server_message::Message::Welcome(_)) => {
                 tracing::warn!("a second Welcome on one stream ignored");
+            }
+            Some(server_message::Message::MapUpdate(update)) => {
+                if let Some(link) = &self.map {
+                    link.take(update.map);
+                }
             }
             None => tracing::warn!("an empty server message ignored"),
         }

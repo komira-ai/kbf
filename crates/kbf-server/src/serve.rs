@@ -36,6 +36,7 @@ use crate::identity::{DenyList, Peers};
 use crate::state_store::StateStore;
 use crate::token::ApiToken;
 use crate::worker::WorkerService;
+use kbf_mapsync::MapSource;
 
 /// How the server listens and paces its daemons.
 #[derive(Clone, Debug)]
@@ -374,6 +375,27 @@ where
     M: MetaLog,
     O: ObjectStore + 'static,
 {
+    bind_server_with_map(cache, listeners, api, policy, state, None, shutdown)
+}
+
+/// [`bind_server_with_state`], sending daemons the storage map `map` holds if given: in
+/// `Welcome`, and in a `MapUpdate` each time it changes ([`WorkerService::with_map`]).
+///
+/// # Errors
+/// As [`bind_server_with_state`].
+pub fn bind_server_with_map<M, O>(
+    cache: Arc<Cache<M, O>>,
+    listeners: Listeners,
+    api: Option<Api>,
+    policy: Policy,
+    state: Option<StateStore>,
+    map: Option<Arc<dyn MapSource>>,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> Result<Bound<impl Future<Output = Result<(), ServeError>>>, ServeError>
+where
+    M: MetaLog,
+    O: ObjectStore + 'static,
+{
     let (recorder, recording) = Recorder::new(listeners.invocation_memory, RECORDER_CHANNEL);
     let default_memory = listeners.memory_ladder.first();
     let farm = Farm::new(
@@ -450,14 +472,18 @@ where
     ))
     .max_decoding_message_size(MAX_MESSAGE_BYTES)
     .max_encoding_message_size(MAX_MESSAGE_BYTES);
-    let worker_service = WorkerServer::new(WorkerService::new(
+    let mut sessions = WorkerService::new(
         Arc::clone(&farm),
         peers,
         listeners.heartbeat_interval,
         listeners.hello_wait,
-    ))
-    .max_decoding_message_size(MAX_MESSAGE_BYTES)
-    .max_encoding_message_size(MAX_MESSAGE_BYTES);
+    );
+    if let Some(map) = map {
+        sessions = sessions.with_map(map);
+    }
+    let worker_service = WorkerServer::new(sessions)
+        .max_decoding_message_size(MAX_MESSAGE_BYTES)
+        .max_encoding_message_size(MAX_MESSAGE_BYTES);
     let (closer, closing) = kbf_front::closing();
     let (ticker, progress) = kbf_front::progress(listeners.streams.progress_interval);
     let authorizers = Arc::new(policy.authorizers);

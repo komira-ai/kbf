@@ -1456,6 +1456,8 @@ dependencies = [
  "hex",
  "kbf-caps",
  "kbf-front",
+ "kbf-map",
+ "kbf-mapsync",
  "kbf-objstore",
  "kbf-proto",
  "kbf-server",
@@ -1716,6 +1718,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "kbf-mapsync"
+version = "0.1.0"
+dependencies = [
+ "kbf-map",
+ "tokio",
+]
+
+[[package]]
 name = "kbf-mdm"
 version = "0.1.0"
 dependencies = [
@@ -1894,6 +1904,7 @@ dependencies = [
  "kbf-invocation",
  "kbf-log",
  "kbf-map",
+ "kbf-mapsync",
  "kbf-mdm-api",
  "kbf-meta",
  "kbf-objstore",
