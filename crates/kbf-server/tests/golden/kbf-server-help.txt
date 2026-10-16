@@ -105,9 +105,24 @@ Options:
           [default: 60]
 
       --shutdown-timeout-secs <SHUTDOWN_TIMEOUT_SECS>
-          How long, in seconds, a stop (SIGINT or SIGTERM) waits for REAPI clients to disconnect after their open Execute and WaitExecution streams are ended UNAVAILABLE and their connections sent GOAWAY. A client still uploading is cut off when it runs out
+          How long, in seconds, a stop (SIGINT or SIGTERM) waits for REAPI clients to finish: it refuses new Execute calls (UNAVAILABLE, which Buck2 retries) and sends GOAWAY, and every open Execute and WaitExecution stream stays open until its action is done. Buck2 never recovers a stream that breaks mid-action, so the default, 0, is no deadline; set one at least as long as the longest action. When it runs out, the open streams end UNAVAILABLE (a client still uploading is cut off)
           
-          [default: 10]
+          [default: 0]
+
+      --progress-interval-secs <PROGRESS_INTERVAL_SECS>
+          How often, in seconds, every open Execute and WaitExecution stream is sent its operation again (same name, not done, current stage), so a load balancer's idle timeout never cuts a long action. 0 sends none
+          
+          [default: 30]
+
+      --http2-keepalive-interval-secs <HTTP2_KEEPALIVE_INTERVAL_SECS>
+          How often, in seconds, the REAPI and worker listeners send an HTTP/2 PING on a quiet connection. 0 sends none (and `--http2-keepalive-timeout-secs` is unused)
+          
+          [default: 30]
+
+      --http2-keepalive-timeout-secs <HTTP2_KEEPALIVE_TIMEOUT_SECS>
+          How long, in seconds, a PING may go unanswered before the connection is closed
+          
+          [default: 20]
 
       --async-threads <N>
           Worker threads of the async runtime, which run every task between its waits. Default: every CPU the process may use on the server; `max(2, reserve/4)`, at most the physical cores, on the daemon

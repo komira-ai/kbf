@@ -394,6 +394,57 @@ async fn closing_ends_open_streams_unavailable() {
     assert_eq!(gone.code(), Code::Unavailable, "{gone:?}");
 }
 
+/// Catches (komira-build-farm#791): a drain that ends open streams (Buck2 does not
+/// recover a broken Execute stream, so every action in flight would fail) instead of
+/// leaving them open until their action is done; a drain that lets a new Execute in;
+/// and a drain that refuses a WaitExecution on an operation still running. The
+/// planted mutant is `Closer::drain` closing: the open stream then ends UNAVAILABLE
+/// at its first read after the drain.
+#[tokio::test]
+async fn a_drain_keeps_open_streams_and_refuses_new_executes() {
+    let script = Arc::new(Script::default());
+    let (closer, closing) = kbf_front::closing();
+    let farm = Farm::with_execution_until(Arc::clone(&script), closing).await;
+    let job = job("drained", &[], false);
+    farm.upload(&job.blobs.iter().collect::<Vec<_>>()).await;
+
+    let mut open = start(&farm, &job.action).await.expect("Execute");
+    next(&mut open).await.expect("healthy").expect("queued");
+
+    closer.drain();
+    script.set(0, Stage::Executing);
+    let running = next(&mut open)
+        .await
+        .expect("the stream survives the drain")
+        .expect("executing");
+    assert_eq!(stage(&running), ExecStage::Executing as i32);
+
+    let refused = start(&farm, &job.action).await.expect_err("a new Execute");
+    assert_eq!(refused.code(), Code::Unavailable, "{refused:?}");
+    assert!(refused.message().contains("draining"), "{refused:?}");
+    assert_eq!(script.submitted().len(), 1, "the refused call was queued");
+
+    let mut waited = farm
+        .exec()
+        .wait_execution(WaitExecutionRequest {
+            name: "operations/0".to_owned(),
+        })
+        .await
+        .expect("WaitExecution during the drain")
+        .into_inner();
+    next(&mut waited)
+        .await
+        .expect("healthy")
+        .expect("executing");
+
+    script.set(0, Stage::Done(Finished::Ran(Box::default())));
+    for (what, ops) in [("Execute", &mut open), ("WaitExecution", &mut waited)] {
+        let done = next(ops).await.expect(what).expect("the done operation");
+        assert!(done.done, "{what}: {done:?}");
+        assert_eq!(next(ops).await.expect(what), None, "{what}");
+    }
+}
+
 /// Catches: an Execute that submits an action whose result is cached, answers a hit
 /// without `cached_result`, or ignores `skip_cache_lookup`.
 #[tokio::test]

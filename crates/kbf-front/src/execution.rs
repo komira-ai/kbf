@@ -30,11 +30,24 @@
 //! forgotten, waiting on it is NOT_FOUND, and the client's next Execute is answered
 //! from the action cache (or runs the action again, if its result was not cached).
 //!
-//! When the server is going away ([`Closer::close`]), every open Execute and
-//! WaitExecution stream that is not done ends UNAVAILABLE, which REAPI clients retry
-//! (issue #168); one opened after that ends UNAVAILABLE after its first operation. A
-//! WaitExecution on an operation kept finished is answered even then: its first
-//! operation is the done one, and the stream ends there.
+//! **Draining** ([`Closer::drain`], on SIGTERM): a new Execute is refused UNAVAILABLE,
+//! which Buck2 retries when it opens the call (up to 5 attempts, so the next try can
+//! land on another frontend), and every open Execute and WaitExecution stream stays
+//! open until its action is done. Buck2 does not recover a stream that breaks after
+//! it started: it never calls WaitExecution and never sends the Execute again, so an
+//! action whose stream is cut fails as `remote_call_error`. Ending a stream UNAVAILABLE
+//! is therefore a last resort, not a retry (komira-build-farm#791).
+//!
+//! **Progress** ([`progress`]): every open stream is sent its operation again, same
+//! name, `done` false, its current stage, once per progress interval, so a load
+//! balancer or proxy that counts idle time in data frames never cuts a stream whose
+//! action is long.
+//!
+//! When the drain runs out of time ([`Closer::close`]), every open Execute and
+//! WaitExecution stream that is not done ends UNAVAILABLE (a client that retries
+//! sees it; Buck2 fails the action); one opened after that ends UNAVAILABLE after its
+//! first operation. A WaitExecution on an operation kept finished is answered even
+//! then: its first operation is the done one, and the stream ends there.
 //!
 //! What v0 sends to the scheduler: QoS `ci` for every call (the `x-kbf-qos` header is
 //! not read yet), and every action is hermetic, so it may be joined (a `networked`
@@ -213,37 +226,118 @@ pub trait Dispatch: Send + Sync + 'static {
     fn wait(&self, name: &str) -> Option<Ticket>;
 }
 
+/// Where the server is on its way out, as the `Execution` service sees it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Phase {
+    /// Serving.
+    Open,
+    /// No new Execute; open streams run to their end.
+    Draining,
+    /// Open streams that are not done end UNAVAILABLE.
+    Closed,
+}
+
 /// Tells the `Execution` service the server is going away: see [`closing`].
 #[derive(Debug)]
-pub struct Closer(watch::Sender<bool>);
+pub struct Closer(watch::Sender<Phase>);
 
 impl Closer {
+    /// Refuses every new Execute UNAVAILABLE from now on. Open streams are not
+    /// touched: they run until their action is done (or [`Closer::close`]).
+    pub fn drain(&self) {
+        self.0.send_if_modified(|phase| {
+            let open = *phase == Phase::Open;
+            if open {
+                *phase = Phase::Draining;
+            }
+            open
+        });
+    }
+
     /// Ends every open Execute and WaitExecution stream that is not done UNAVAILABLE,
-    /// and every one opened from now on after its first operation.
+    /// and every one opened from now on after its first operation. Also drains.
     pub fn close(&self) {
-        self.0.send_replace(true);
+        self.0.send_replace(Phase::Closed);
     }
 }
 
 /// The `Execution` service's side of a [`Closer`]. A stream ends when its closer
 /// closes; if the closer is dropped without closing, it never does.
 #[derive(Clone, Debug)]
-pub struct Closing(watch::Receiver<bool>);
+pub struct Closing(watch::Receiver<Phase>);
 
 impl Closing {
     /// Completes once the closer has closed; never, if it is dropped first.
     async fn closed(&mut self) {
-        if self.0.wait_for(|closed| *closed).await.is_err() {
+        let closed = self.0.wait_for(|phase| *phase == Phase::Closed).await;
+        if closed.is_err() {
             std::future::pending::<()>().await;
         }
+    }
+
+    /// Whether the closer has begun to drain or has closed.
+    fn draining(&self) -> bool {
+        *self.0.borrow() != Phase::Open
     }
 }
 
 /// A [`Closer`] and the [`Closing`] to hand the `Execution` service.
 #[must_use]
 pub fn closing() -> (Closer, Closing) {
-    let (closer, closing) = watch::channel(false);
+    let (closer, closing) = watch::channel(Phase::Open);
     (Closer(closer), Closing(closing))
+}
+
+/// Drives the shared progress tick: see [`progress`].
+#[derive(Debug)]
+pub struct ProgressTicker {
+    every: Duration,
+    tick: watch::Sender<u64>,
+}
+
+impl ProgressTicker {
+    /// Ticks every interval, for as long as it is polled. One timer serves every open
+    /// stream, however many: a stream holds a receiver and wakes once per tick.
+    pub async fn run(self) {
+        let mut interval = tokio::time::interval_at(Instant::now() + self.every, self.every);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            self.tick.send_modify(|n| *n = n.wrapping_add(1));
+        }
+    }
+}
+
+/// The `Execution` service's side of a [`ProgressTicker`]: each tick makes every open
+/// stream send its operation again.
+#[derive(Clone, Debug)]
+pub struct Progress(watch::Receiver<u64>);
+
+impl Progress {
+    /// A `Progress` that never ticks (streams send only the stage changes).
+    #[must_use]
+    pub fn off() -> Self {
+        Self(watch::channel(0).1)
+    }
+
+    /// Completes at the next tick; never, if there is no ticker (or it is dropped).
+    async fn tick(&mut self) {
+        if self.0.changed().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+/// A ticker that fires every `every` once run, and the [`Progress`] to hand the
+/// `Execution` service ([`ExecutionService::with_progress`]).
+///
+/// # Panics
+/// `every` is zero.
+#[must_use]
+pub fn progress(every: Duration) -> (ProgressTicker, Progress) {
+    assert!(!every.is_zero(), "a zero progress interval");
+    let (tick, rx) = watch::channel(0);
+    (ProgressTicker { every, tick }, Progress(rx))
 }
 
 /// An Execute that spends this long before its first stream item is logged at `WARN`.
@@ -309,6 +403,7 @@ pub struct ExecutionService<M, O, D> {
     cache: Arc<Cache<M, O>>,
     dispatch: Arc<D>,
     closing: Closing,
+    progress: Progress,
     authorizers: Arc<Authorizers>,
     recorder: Recorder,
     /// The memory an `action` that names no size books, in bytes.
@@ -335,6 +430,7 @@ impl<M, O, D> ExecutionService<M, O, D> {
             cache,
             dispatch,
             closing,
+            progress: Progress::off(),
             authorizers,
             recorder: Recorder::off(),
             default_memory: DEFAULT_RESOURCES.memory_bytes,
@@ -346,6 +442,14 @@ impl<M, O, D> ExecutionService<M, O, D> {
     #[must_use]
     pub const fn with_default_memory(mut self, bytes: u64) -> Self {
         self.default_memory = bytes;
+        self
+    }
+
+    /// This service, each open stream sent its operation again at every tick of
+    /// `progress`.
+    #[must_use]
+    pub fn with_progress(mut self, progress: Progress) -> Self {
+        self.progress = progress;
         self
     }
 
@@ -376,6 +480,12 @@ where
         &self,
         request: GrpcRequest<ExecuteRequest>,
     ) -> Result<Response<OperationStream>, Status> {
+        if self.closing.draining() {
+            return Err(Status::unavailable(
+                "the server is draining and takes no new Execute; try again (Buck2 retries \
+                 this, and the next attempt can reach another frontend)",
+            ));
+        }
         let mut window = Presubmit::begin(self.cache.metrics());
         let open = self.cache.metrics().execute.execute();
         let caller = kbf_auth::metadata(&request);
@@ -412,6 +522,7 @@ where
         Ok(Response::new(operations(
             ticket,
             self.closing.clone(),
+            self.progress.clone(),
             open,
         )))
     }
@@ -487,6 +598,7 @@ where
         Ok(Response::new(operations(
             ticket,
             self.closing.clone(),
+            self.progress.clone(),
             open,
         )))
     }
@@ -852,20 +964,26 @@ fn operation(name: &str, action: &Digest, stage: &Stage, cached: bool) -> Operat
 /// The operation as its stage changes: the stage now, then each change, ending after
 /// the done operation. A stage that stops changing before it is done (the operation was
 /// abandoned), or `closing` closing first (the server is going away), ends the stream
-/// UNAVAILABLE. A change already there is sent before a close is noticed. `open`
-/// (the call's metrics guard) is dropped with the stream, and told of each stage read.
-fn operations(ticket: Ticket, closing: Closing, open: OpenExecute) -> OperationStream {
+/// UNAVAILABLE. A change already there is sent before a close is noticed. At every tick
+/// of `progress` the operation is sent again at its current stage. `open` (the call's
+/// metrics guard) is dropped with the stream, and told of each stage read.
+fn operations(
+    ticket: Ticket,
+    closing: Closing,
+    progress: Progress,
+    open: OpenExecute,
+) -> OperationStream {
     let Ticket {
         name,
         action,
         stage,
         ..
     } = ticket;
-    let state = Some((stage, closing, open, true));
+    let state = Some((stage, closing, progress, open, true));
     Box::pin(stream::unfold(state, move |state| {
         let name = name.clone();
         async move {
-            let (mut stage, mut closing, mut open, first) = state?;
+            let (mut stage, mut closing, mut progress, mut open, first) = state?;
             if !first {
                 let gone = tokio::select! {
                     biased;
@@ -875,6 +993,7 @@ fn operations(ticket: Ticket, closing: Closing, open: OpenExecute) -> OperationS
                     () = closing.closed() => Some(format!(
                         "the server is shutting down; operation {name} ends here, Execute it again"
                     )),
+                    () = progress.tick() => None,
                 };
                 if let Some(why) = gone {
                     return Some((Err(Status::unavailable(why)), None));
@@ -883,8 +1002,12 @@ fn operations(ticket: Ticket, closing: Closing, open: OpenExecute) -> OperationS
             let now = stage.borrow_and_update().clone();
             let done = matches!(now, Stage::Done(_));
             open.update(matches!(now, Stage::Queued | Stage::Waiting(_)), done);
-            let next = (!done).then_some((stage, closing, open, false));
+            let next = (!done).then_some((stage, closing, progress, open, false));
             Some((Ok(operation(&name, &action, &now, false)), next))
         }
     }))
 }
+
+#[cfg(test)]
+#[path = "execution_progress_tests.rs"]
+mod progress_tests;
