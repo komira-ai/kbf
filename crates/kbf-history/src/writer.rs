@@ -26,13 +26,15 @@
 //!   writer's from before it forgot the invocation) is read after the drain, at most
 //!   [`Limits::header_reads_per_step`] a step, and merged with what the writer added
 //!   meanwhile. Until the read succeeds no header row is written, so a failed read
-//!   never replaces the stored header with a fresh count.
+//!   never replaces the stored header with a fresh count. A header row that did not
+//!   commit is written again from the writer's state, and its invocation held until
+//!   one does: a closed invocation gets no later chunk to carry it.
 //!
 //! TODO: mark the index transactions background once the `kbf-state` trait has the
 //! mark (the C7 background lane); until then they are ordinary transactions, sent at
 //! most [`Limits::txns_per_step`] a step.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -115,7 +117,8 @@ pub struct Drops {
     pub buffer: u64,
     /// Chunk writes that failed (each retried).
     pub put: u64,
-    /// Index rows dropped (each restored from its object later, when it has one).
+    /// Index rows dropped: a pointer row is restored from its object later, a header
+    /// row is written again from the writer's state.
     pub index: u64,
     /// Events dropped because the writer held [`Limits::invocations`] invocations and
     /// none was idle enough to forget.
@@ -170,11 +173,20 @@ struct Inv {
     unread: bool,
     /// A header row write was held back while `unread`.
     held: bool,
+    /// A header row was queued and no transaction carrying it has committed: it was
+    /// dropped (a failed transaction, a full backlog) or replaced by a restored row. It
+    /// is queued again from this state once the index drains, and the invocation is not
+    /// forgotten meanwhile, since no later chunk may come to rewrite it.
+    unsaved: bool,
     building: Building,
     slowest_execution: Vec<Slow>,
     slowest_wall: Vec<Slow>,
     /// The open time of each stream this writer has seen, its row key's time.
     stream_first: BTreeMap<u32, u64>,
+    /// The (day, stream) pairs whose `ui/stream` row this writer has queued. The row has
+    /// one key and value for every chunk of the stream, so only the first chunk queues
+    /// it; were it dropped, it comes back from that chunk's object.
+    stream_rows: BTreeSet<(u32, u32)>,
 }
 
 /// The history writer core. See the module docs.
@@ -269,6 +281,7 @@ impl<O: ObjectStore> Writer<O> {
                 break;
             }
         }
+        self.core.requeue_headers();
         self.core.prune(now_ms);
     }
 
@@ -329,7 +342,10 @@ impl<O: ObjectStore> Writer<O> {
                 t.put(key.clone(), row.value.clone(), row.cond)
             });
             match self.core.index.txn(txn).await {
-                Ok(Ok(_)) => return budget,
+                Ok(Ok(_)) => {
+                    self.core.committed(&batch);
+                    return budget;
+                }
                 Ok(Err(conflict)) => {
                     batch.remove(conflict.index.min(batch.len() - 1));
                 }
@@ -393,11 +409,12 @@ impl Core {
     }
 
     /// Whether the writer may forget `inv`: nothing buffered or unwritten, its stored
-    /// header read, and no header row of it pending (a later record reloads the header
-    /// from the index, so the index must have it).
+    /// header read, and its last header row committed (a later record reloads the
+    /// header from the index, so the index must have it).
     fn idle(&self, key: &InvKey, s: &Inv) -> bool {
         s.building.records() == 0
             && !s.unread
+            && !s.unsaved
             && !self.ready.iter().any(|c| &c.inv == key)
             && !self.pending.contains(&self.index.root().invid(key))
     }
@@ -458,8 +475,7 @@ impl Core {
         }
         state.unread = false;
         if std::mem::take(&mut state.held) {
-            let value = state.header.encode_to_vec();
-            self.queue_row(self.index.root().invid(inv), value, Cond::Any, None);
+            self.queue_header(inv, None);
         }
     }
 
@@ -470,8 +486,52 @@ impl Core {
             state.held = true;
             return;
         }
+        self.queue_header(inv, origin);
+    }
+
+    /// Queues `inv`'s header row as the writer holds it, unsaved until it commits.
+    fn queue_header(&mut self, inv: &InvKey, origin: Option<KeptObject>) {
+        let state = self.state(inv);
+        state.unsaved = true;
         let value = state.header.encode_to_vec();
         self.queue_row(self.index.root().invid(inv), value, Cond::Any, origin);
+    }
+
+    /// Notes that the header rows (the [`Cond::Any`] rows) of `batch` committed.
+    fn committed(&mut self, batch: &[(String, Row)]) {
+        let saved: BTreeSet<&str> = batch
+            .iter()
+            .filter(|(_, row)| row.cond == Cond::Any)
+            .map(|(key, _)| key.as_str())
+            .collect();
+        if saved.is_empty() {
+            return;
+        }
+        let rows = self.index.root();
+        for (key, s) in &mut self.invs {
+            s.unsaved &= !saved.contains(rows.invid(key).as_str());
+        }
+    }
+
+    /// Queues again the header of every invocation whose last header row did not
+    /// commit, once the index is answering. One past the backlog's bounds is not
+    /// counted again; it waits for the next step.
+    fn requeue_headers(&mut self) {
+        if self.index_failed {
+            return;
+        }
+        let rows = self.index.root().clone();
+        for (key, s) in self.invs.iter().filter(|(_, s)| s.unsaved) {
+            let row = rows.invid(key);
+            if !self.pending.contains(&row) {
+                let header = Row {
+                    value: s.header.encode_to_vec(),
+                    cond: Cond::Any,
+                    origin: None,
+                };
+                let _refused = self.pending.insert(row, header);
+            }
+        }
     }
 
     /// How many kept objects to read back this step: none while rows are pending or
@@ -747,7 +807,7 @@ impl Core {
         let state = self.state(&cut.inv);
         state.header.chunks += 1;
         state.header.last_chunk_ms = now_ms;
-        if cut.row.runs > 0 {
+        if cut.row.runs > 0 && state.stream_rows.insert((cut.row.day, cut.row.stream)) {
             let value = StreamRow {
                 inv_key: cut.inv.as_str().to_owned(),
                 writer: writer.0,
@@ -826,8 +886,13 @@ impl Core {
         let rows = self.index.root().clone();
         let key = rows.ichunk(&inv, writer, summary.seq);
         self.queue_row(key, row.encode_to_vec(), Cond::Absent, Some(object.clone()));
-        let header = summary.header.unwrap_or_default().encode_to_vec();
-        self.queue_row(rows.invid(&inv), header, Cond::Absent, Some(object.clone()));
+        // The footer's header is as of the cut. An invocation the writer still holds has
+        // a newer header of its own, rewritten until it commits (or merged when its
+        // stored header is read), so the footer's is put back only for one forgotten.
+        if !self.invs.contains_key(&inv) {
+            let header = summary.header.unwrap_or_default().encode_to_vec();
+            self.queue_row(rows.invid(&inv), header, Cond::Absent, Some(object.clone()));
+        }
         if row.runs > 0 {
             let value = StreamRow {
                 inv_key: summary.inv_key,

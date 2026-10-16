@@ -260,7 +260,11 @@ fn kept_objects_are_read_back_a_few_a_step_and_a_failed_read_is_retried() {
         1,
         "a failed read keeps the object"
     );
-    assert_eq!(life.writer.pending_rows(), 0);
+    assert_eq!(
+        life.writer.pending_rows(),
+        1,
+        "only its header, written again from the writer's state"
+    );
     life.drain(T, 5);
     assert_eq!(life.index.keys(ICHUNK).len(), 3);
 }

@@ -1,7 +1,9 @@
 //! Index writes not yet applied, and the objects whose rows must be put back.
 //!
 //! [`Pending`] holds `ui/` row writes in memory, coalesced per key (a second write to a
-//! row replaces the first), within a key and a byte bound. Past either, a new row is
+//! row replaces the first and moves to the back), within a key and a byte bound. Rows
+//! are taken in the order they came, a chunk's rows together, so a chunk's pointer
+//! rows and the header written with them share one transaction. Past either bound, a new row is
 //! refused and the caller counts it under `stage="index"`; nothing waits. No record is
 //! lost by that: every pointer row names an object already written, and the writer
 //! keeps that object's key in [`Kept`] and restores its rows from the object's footer
@@ -60,10 +62,14 @@ impl Default for PendingLimits {
     }
 }
 
-/// Row writes not yet applied, coalesced per key, in key order.
+/// Row writes not yet applied, coalesced per key, in the order they came.
 #[derive(Debug)]
 pub struct Pending {
-    rows: BTreeMap<String, Row>,
+    /// The rows, by when each last came.
+    order: BTreeMap<u64, (String, Row)>,
+    /// Each pending key's place in `order`.
+    at: BTreeMap<String, u64>,
+    next: u64,
     bytes: usize,
     limits: PendingLimits,
 }
@@ -73,48 +79,90 @@ impl Pending {
     #[must_use]
     pub fn new(limits: PendingLimits) -> Pending {
         Pending {
-            rows: BTreeMap::new(),
+            order: BTreeMap::new(),
+            at: BTreeMap::new(),
+            next: 0,
             bytes: 0,
             limits,
         }
     }
 
-    /// Adds a write of `key`, replacing a pending write of the same key. A new key past
-    /// either bound is refused and the row given back.
+    /// Adds a write of `key` at the back, replacing a pending write of the same key. A
+    /// new key past either bound is refused and the row given back.
     ///
     /// # Errors
     /// The row, when it was not taken.
     pub fn insert(&mut self, key: String, row: Row) -> Result<(), Row> {
         let size = Row::bytes(&key, &row);
-        if let Some(old) = self.rows.get(&key) {
-            self.bytes = self.bytes - Row::bytes(&key, old) + size;
-            self.rows.insert(key, row);
-            return Ok(());
-        }
-        if self.rows.len() >= self.limits.keys || self.bytes + size > self.limits.bytes {
+        if let Some(old) = self.at.get(&key) {
+            let old = self.order.remove(old);
+            self.bytes -= old.map_or(0, |(k, r)| Row::bytes(&k, &r));
+        } else if self.at.len() >= self.limits.keys || self.bytes + size > self.limits.bytes {
             return Err(row);
         }
         self.bytes += size;
-        self.rows.insert(key, row);
+        self.at.insert(key.clone(), self.next);
+        self.order.insert(self.next, (key, row));
+        self.next += 1;
         Ok(())
     }
 
-    /// Takes up to `max_rows` writes whose bytes stay within `max_bytes` (always at least
-    /// one, so one oversized row cannot wedge the queue), in key order.
+    /// The front run of rows made from one object (a row with no object is a run of
+    /// one): how many, and their bytes.
+    fn front_group(&self) -> (usize, usize) {
+        let mut rows = self.order.values();
+        let Some((key, first)) = rows.next() else {
+            return (0, 0);
+        };
+        let mut n = 1;
+        let mut size = Row::bytes(key, first);
+        for (key, row) in rows {
+            if first.origin.is_none() || row.origin != first.origin {
+                break;
+            }
+            n += 1;
+            size += Row::bytes(key, row);
+        }
+        (n, size)
+    }
+
+    fn pop_front(&mut self) -> Option<(String, Row)> {
+        let (_, (key, row)) = self.order.pop_first()?;
+        self.at.remove(&key);
+        self.bytes -= Row::bytes(&key, &row);
+        Some((key, row))
+    }
+
+    /// Takes up to `max_rows` writes whose bytes stay within `max_bytes`, oldest first
+    /// and the rows of one object whole: a group that does not fit waits for the next
+    /// take, unless nothing was taken yet, when as much of it as fits is taken (always
+    /// at least one row, so one oversized row cannot wedge the queue).
     pub fn take(&mut self, max_rows: usize, max_bytes: usize) -> Vec<(String, Row)> {
         let mut out = Vec::new();
         let mut size = 0;
+        loop {
+            let (n, group) = self.front_group();
+            let fits = out.len() + n <= max_rows && size + group <= max_bytes;
+            if n == 0 || !fits {
+                break;
+            }
+            out.extend((0..n).filter_map(|_| self.pop_front()));
+            size += group;
+        }
+        if !out.is_empty() {
+            return out;
+        }
+        // The front group alone is past a bound: as much of it as fits, at least a row.
         while out.len() < max_rows {
-            let Some(entry) = self.rows.first_entry() else {
+            let Some((key, row)) = self.order.values().next() else {
                 break;
             };
-            let n = Row::bytes(entry.key(), entry.get());
+            let n = Row::bytes(key, row);
             if !out.is_empty() && size + n > max_bytes {
                 break;
             }
             size += n;
-            self.bytes -= n;
-            out.push(entry.remove_entry());
+            out.extend(self.pop_front());
         }
         out
     }
@@ -122,19 +170,19 @@ impl Pending {
     /// Whether a write of `key` is pending.
     #[must_use]
     pub fn contains(&self, key: &str) -> bool {
-        self.rows.contains_key(key)
+        self.at.contains_key(key)
     }
 
     /// Writes pending.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.rows.len()
+        self.at.len()
     }
 
     /// Whether nothing is pending.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.rows.is_empty()
+        self.at.is_empty()
     }
 }
 
@@ -249,9 +297,74 @@ mod tests {
         assert_eq!(p.take(2, 1000).len(), 2);
         p.insert("a".into(), row("xxxx")).unwrap();
         let big: Vec<_> = p.take(10, 1).into_iter().map(|(k, _)| k).collect();
-        assert_eq!(big, ["a"]);
+        assert_eq!(
+            big,
+            ["c"],
+            "oldest first, and one though it is past the bytes"
+        );
         assert_eq!(p.take(10, 1000).len(), 1);
         assert!(p.take(10, 1000).is_empty());
+        assert!(p.take(0, 1000).is_empty());
+    }
+
+    fn from(value: &str, object: &str) -> Row {
+        Row {
+            origin: Some(kept(object)),
+            ..row(value)
+        }
+    }
+
+    fn keys(taken: Vec<(String, Row)>) -> Vec<String> {
+        taken.into_iter().map(|(k, _)| k).collect()
+    }
+
+    #[test]
+    fn rows_come_out_in_arrival_order_with_one_object_s_rows_together() {
+        // Catches: rows taken in key order, which puts every `ui/ichunk` row ahead of
+        // every `ui/invid` row, so under a backlog a chunk row lands transactions before
+        // the header written with it (a reader then sees a chunk naming instances the
+        // header does not list); a batch cut through one object's rows; and a rewritten
+        // header left at its old place, ahead of the chunk rows it was written with.
+        let mut p = Pending::new(PendingLimits::default());
+        p.insert("ui/stream/a".into(), from("s", "a")).unwrap();
+        p.insert("ui/ichunk/a".into(), from("i", "a")).unwrap();
+        p.insert("ui/invid/x".into(), from("h", "a")).unwrap();
+        p.insert("ui/ichunk/b".into(), from("i", "b")).unwrap();
+        p.insert("ui/invid/x".into(), from("h2", "b")).unwrap();
+        p.insert("ui/invid/y".into(), row("h")).unwrap();
+        p.insert("ui/invid/z".into(), row("h")).unwrap();
+        assert_eq!(
+            keys(p.take(3, 1000)),
+            ["ui/stream/a", "ui/ichunk/a"],
+            "chunk b's two rows wait rather than split"
+        );
+        assert_eq!(keys(p.take(2, 1000)), ["ui/ichunk/b", "ui/invid/x"]);
+        assert_eq!(
+            keys(p.take(1, 1000)),
+            ["ui/invid/y"],
+            "rows of no object stand alone"
+        );
+        p.insert("ui/stream/c".into(), from("s", "c")).unwrap();
+        p.insert("ui/ichunk/c".into(), from("i", "c")).unwrap();
+        p.insert("ui/invid/c".into(), from("h", "c")).unwrap();
+        assert_eq!(
+            keys(p.take(10, 1000)),
+            ["ui/invid/z", "ui/stream/c", "ui/ichunk/c", "ui/invid/c"]
+        );
+        p.insert("ui/stream/d".into(), from("s", "d")).unwrap();
+        p.insert("ui/ichunk/d".into(), from("i", "d")).unwrap();
+        p.insert("ui/invid/d".into(), from("h", "d")).unwrap();
+        assert_eq!(
+            keys(p.take(1, 1000)),
+            ["ui/stream/d"],
+            "a group past the row bound alone is split"
+        );
+        assert_eq!(
+            keys(p.take(10, 13)),
+            ["ui/ichunk/d"],
+            "and one past the byte bound"
+        );
+        assert_eq!(p.len(), 1);
     }
 
     #[test]
