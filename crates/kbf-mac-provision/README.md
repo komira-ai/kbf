@@ -42,8 +42,8 @@ What the script did not do:
   - `daemon_user` (`role`, the default, or `root`; `kbf_cache`, an absolute path):
     with `role` nothing changes and nothing is checked. With `root` the property list
     has no `UserName` or `GroupName`, the error log is root's, the node key (`kbf_key`)
-    is a regular file with one link, root's, mode 600, and the scratch root and
-    `kbf_cache` (if set) are directories of root's, mode 755, on `kbf_volume`.
+    is a regular file with one link, root's, mode 600, and the data directory
+    (`kbf_data_dir`) and `kbf_cache` (if set) are directories of root's, mode 755, on `kbf_volume`.
     `daemon_user=root` makes kbf-daemon run as root; a profile sets it only once the
     daemon runs every action as a pool user and refuses uid 0 (step 3 of that
     document).
@@ -67,6 +67,10 @@ kbf-mac-provision revert                                # root: put back the rec
   passed to `kbf-daemon` as a `--label`.
 - `--keys` limits `check` and `apply` to the named items. `--root DIR` runs everything
   under DIR; only the tests use it.
+- `kbf_data_dir` is kbf-daemon's `--data-dir` (it keeps `leases/`, `cache/` and `trees/`
+  under it; the profile has no size key, so the daemon sizes the directory from the
+  filesystem). The old name `kbf_scratch` is still accepted, as `kbf_data_dir`, with one
+  warning line on stderr; a profile that sets both keys is refused.
 - An example profile, with placeholder values, is [example.profile](example.profile).
 
 ## Items
