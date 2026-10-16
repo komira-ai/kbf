@@ -3,15 +3,14 @@
 //! design is komira-build-farm#657). The daemon's blobs move through calls into
 //! the server's cache ([`LocalDataPlane`]), and its sessions (`Hello`, leases,
 //! heartbeats, results) through calls into the server's worker service
-//! ([`LocalControlPlane`]), not over the network: the process binds no worker listener,
-//! so no daemon but its own reaches the server half.
+//! ([`LocalControlPlane`]), not over the network; the server half's worker listener
+//! still serves remote daemons.
 //!
 //! [`main`] is the binary: the daemon's helper re-execs first, before any flag is read
 //! (`kbf_node::dispatch_helpers`: a keeper or `__chown-dirs` run of this binary never
 //! opens the server's directories or starts a runtime); then one command line holding
-//! both halves' flags, less the node identity and the worker listener ([`cli`]); then
-//! the server half, started as `kbf-server` starts but with no worker listener
-//! (`kbf_server::start_for`, on an async runtime of its own, sized as `kbf-server` sizes
+//! both halves' flags ([`cli`]); then the server half, started as `kbf-server` starts
+//! (`kbf_server::start`, on an async runtime of its own, sized as `kbf-server` sizes
 //! one), its start line printed to stdout; then the daemon half, as `kbf-daemon` starts
 //! (`kbf_node::start_with`, on its own runtime), with the in-process planes in place of
 //! the transfer engine and of the dial to `--server`. SIGTERM or SIGINT stops the server

@@ -28,9 +28,9 @@ use kbf_threads::Topology;
 use kbf_threads::disk::Statvfs;
 
 use crate::local::LocalStore;
-use crate::worker::LocalWorker;
 use crate::startup_pass::StartPass;
 use crate::stores::{COLD_FILE_FLOOR, FILE_PREFIX_ROOT, Hot, StoreUri, Stores};
+use crate::worker::LocalWorker;
 use crate::write_tier::FLUSH_EVERY;
 use crate::{Args, RaftMetaLog, SERVER_VERSION, ServeError, bind_server_with_policy, s3_store};
 
