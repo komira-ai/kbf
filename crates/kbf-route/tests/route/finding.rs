@@ -126,3 +126,27 @@ async fn a_digest_nobody_can_answer_for_fails_the_call() {
         .expect_err("all down");
     assert!(error.to_string().contains("is down"), "{error}");
 }
+
+/// Catches a long list asked of a node in one call (a node refuses a call of more than
+/// `MAX_FIND_MISSING_DIGESTS` digests as invalid, and the whole call would fail): 70 000
+/// digests for one primary go as a call of the most a node takes and a call of the rest, and
+/// the answer is every digest that node lacks.
+#[tokio::test]
+async fn a_long_list_is_asked_in_calls_a_node_takes() {
+    use kbf_storage::service::MAX_FIND_MISSING_DIGESTS;
+    let map = map(1, 1, active(&[1]));
+    let cluster = Cluster::of(1);
+    let (router, _) = router(&map, &cluster);
+    let digests: Vec<Digest> = (0_u64..70_000).map(|i| sha(&i.to_le_bytes())).collect();
+    let held = digests[0];
+    cluster.node(1).hold_as(held, b"held");
+
+    let missing = router.find_missing(&digests).await.expect("an answer");
+    assert_eq!(missing.len(), digests.len() - 1);
+    assert!(!missing.contains(&held));
+    let calls: Vec<usize> = cluster.node(1).find_log().iter().map(Vec::len).collect();
+    assert_eq!(
+        calls,
+        [MAX_FIND_MISSING_DIGESTS, 70_000 - MAX_FIND_MISSING_DIGESTS]
+    );
+}

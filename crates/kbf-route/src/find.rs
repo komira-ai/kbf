@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use futures::future::join_all;
 use kbf_map::MemberId;
 use kbf_storage::StorageError;
+use kbf_storage::service::MAX_FIND_MISSING_DIGESTS;
 use kbf_types::Digest;
 
 use crate::router::{Router, unavailable, write_order};
@@ -15,6 +16,9 @@ impl Router {
     /// asked twice is answered twice): each digest is asked of its primary owner, one
     /// call to each owner that is some digest's primary, all at once, and the answers
     /// are put together.
+    ///
+    /// A node takes at most [`MAX_FIND_MISSING_DIGESTS`] digests in one call, so an owner
+    /// with more is asked in several, one after the other.
     ///
     /// Only the primary is asked. A cold build asks mostly about blobs nobody holds, and
     /// a replica asked on every miss would double the calls for nothing: whatever the
@@ -64,7 +68,12 @@ impl Router {
             }
             let answers = join_all(by_owner.values().map(|(owner, asked)| async move {
                 let node = self.nodes.node(owner, generation)?;
-                node.find_missing(asked).await
+                // A node bounds the digests of one call, so a long list is several.
+                let mut lacking = Vec::new();
+                for chunk in asked.chunks(MAX_FIND_MISSING_DIGESTS) {
+                    lacking.extend(node.find_missing(chunk).await?);
+                }
+                Ok(lacking)
             }))
             .await;
             for ((_, asked), answer) in by_owner.values().zip(answers) {
