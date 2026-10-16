@@ -52,7 +52,7 @@ use crate::cgroup_usage::{NUMA_EVERY, NumaSample, resource_usage};
 use crate::image::{ImageCheckError, ImageRef, PROPERTY};
 use crate::input_phases::{InputPhases, millis};
 use crate::keeper::Keeper;
-use crate::numa::{Pin, Placer};
+use crate::numa::{Pin, Placement, Placer};
 use crate::oci::{Oci, OciConfig};
 use crate::outputs::{OutputLimits, collect_log};
 use crate::podman::{
@@ -476,12 +476,11 @@ impl<C: Cas> PodmanRuntime<C> {
         // The keeper, before anything runs in the cgroup: it kills the cgroup if the
         // daemon dies.
         let kill = lease.cgroup.dir().join("cgroup.kill");
-        lease.pin = self
-            .config
-            .placer
-            .as_ref()
-            .map(|placer| placer.place(work.resources.cpu_millis));
-        phases.numa_node = lease.pin.as_ref().map(Pin::node);
+        let placement = (self.config.placer.as_ref()).map(|placer| {
+            placer.place_lease(work.resources.cpu_millis, work.resources.memory_bytes)
+        });
+        phases.numa_node = placement.as_ref().map(Placement::spot);
+        lease.pin = placement.and_then(Placement::into_pin);
         let keeper = (lease.cgroup.create(work.resources, lease.pin.as_ref()))
             .and_then(|()| Keeper::watch(&kill))
             .map_err(|e| failed(lease.cgroup.dir(), &e))?;
