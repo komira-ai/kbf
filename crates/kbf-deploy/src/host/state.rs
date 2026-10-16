@@ -1,13 +1,14 @@
 //! The deploy state, `/var/lib/kbf-deploy/state.json`, and the lock it is changed under.
 //!
 //! The file is one JSON object: a `schema` number ([`SCHEMA`]) and the fields of
-//! [`State`]. It is read and written only through a [`Locked`], which holds an exclusive
-//! `flock(2)` on `/run/kbf-deploy.lock` for as long as it lives, so two kbf-deploy runs
-//! cannot both read the state, change it and write it back (the second would undo the
-//! first). A write makes a new file beside the old one, syncs it, renames it over the
-//! old one and syncs the directory: a reader sees the old state or the new one whole,
-//! never part of either, and a power cut after the write returned keeps the new one.
-//! That is also why [`status`], which only reads, needs no lock.
+//! [`State`]. It is changed only through a [`Locked`], which holds an exclusive `flock(2)`
+//! on `/run/kbf-deploy.lock` for as long as it lives, so two kbf-deploy runs cannot both
+//! read the state, change it and write it back (the second would undo the first). The
+//! lock file and the state file are made 0600, root's alone. A write makes a new file
+//! beside the old one, syncs it, renames it over the old one and syncs the directory: a
+//! reader sees the old state or the new one whole, never part of either, and a power cut
+//! after the write returned keeps the new one. That is also why [`status`] and a dry run
+//! ([`read_unlocked`]), which only read, need no lock.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
@@ -138,7 +139,7 @@ fn state_file(root: &Root) -> PathBuf {
     root.join(&layout::path(layout::STATE_FILE))
 }
 
-/// Write `bytes` to a new file beside `path`, sync it, rename it over `path` and sync
+/// Write `bytes` to a new file beside `path` (mode 0600: root's alone), sync it, rename it over `path` and sync
 /// the directory.
 fn replace(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let tmp = path.with_file_name(".state.json.tmp");
@@ -150,13 +151,21 @@ fn replace(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
-        .mode(0o644)
+        .mode(0o600)
         .open(&tmp)?;
     file.write_all(bytes)?;
+    // The two syncs are for a power cut, which no test makes: none would fail without them.
     file.sync_all()?;
     fs::rename(&tmp, path)?;
     let dir = path.parent().expect("the state file is in a directory");
     File::open(dir)?.sync_all()
+}
+
+/// The state under `root`, read without the lock: for a dry run, which changes nothing
+/// and so takes no lock (taking it would make the lock file). `None` when there is no
+/// state file yet.
+pub fn read_unlocked(root: &Root) -> Result<Option<State>, StateError> {
+    read_file(&state_file(root))
 }
 
 /// The state in `path`; `None` when there is no such file.
@@ -227,7 +236,7 @@ impl Status {
 /// The state and the `current` link under `root`, read without the lock: a write
 /// replaces the state file by a rename, so the file read is one whole state.
 pub fn status(root: &Root) -> Result<Status, StateError> {
-    let state = read_file(&state_file(root))?;
+    let state = read_unlocked(root)?;
     let link_path = root.join(&layout::path(layout::CURRENT));
     let link = current_link(fs::read_link(&link_path)).map_err(|source| StateError::Read {
         path: link_path,

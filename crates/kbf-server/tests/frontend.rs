@@ -592,25 +592,76 @@ async fn readyz_asks_the_state_store() {
     assert_eq!(failing(&body), ["stopping", "state_store"], "{body}");
 }
 
+/// Catches a `--state-store` that is not SQLite reaching a start (or echoing its value, a
+/// `postgres://` URL holds a password): it is refused when the flags are read, with the
+/// fixed text, before anything is bound.
+#[test]
+fn a_state_store_that_is_not_sqlite_is_refused() {
+    for value in [
+        "postgres://user:hunter2@db.example/kbf",
+        "file:///var/lib/kbf",
+        "sqlite://relative.db",
+    ] {
+        let refused = flags(&[
+            "--storage=http://127.0.0.1:1",
+            &format!("--state-store={value}"),
+        ])
+        .expect_err("refused");
+        let said = refused.to_string();
+        assert!(said.contains("--state-store: "), "{said}");
+        assert!(
+            said.contains("only sqlite:///") || said.contains("needs an absolute file path"),
+            "{said}"
+        );
+        assert!(!said.contains("hunter2"), "{said}");
+    }
+}
+
+/// A fresh directory under the test target directory, for one test.
+fn scratch_dir(name: &str) -> PathBuf {
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join("frontend-state")
+        .join(format!("{name}-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("directory");
+    dir
+}
+
 /// Catches `--state-store` accepted and ignored by a frontend (the scheduler would run
-/// in memory while the operator believes its state is kept): this build has no backend,
-/// so the start is refused naming the scheme, before anything is bound.
-#[tokio::test]
-async fn a_state_store_without_a_backend_is_refused_at_start() {
-    let f = flags(&[
-        "--storage=http://127.0.0.1:1",
-        "--state-store=sqlite:///var/lib/kbf/state.db",
-    ])
-    .expect("parses");
+/// in memory while the operator believes its state is kept): a start over a SQLite path
+/// makes the file and serves, `/readyz` is ready with the store probed, a second start
+/// over the file the first holds is refused before anything is bound, and a path that
+/// cannot be a database stops the start too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_sqlite_state_store_starts_and_is_held() {
+    let dir = scratch_dir("sqlite");
+    let state = dir.join("state").join("state.db");
+    let flag = format!("--state-store=sqlite://{}", state.display());
+    let f = flags(&["--storage=http://127.0.0.1:1", &flag]).expect("parses");
+    let handle = start_frontend(&f, || Ok(pending::<()>())).expect("starts over SQLite");
+    assert!(state.exists(), "the state file is made");
+    let api = handle.api.expect("the operator API");
+    let served = tokio::spawn(handle.serve());
+
+    // The storage node is not there, so only the storage check may fail: the state
+    // store, reached through a real store, answers.
+    let (_, body) = get(api, "/readyz").await;
+    assert_eq!(failing(&body), ["storage"], "{body}");
+
     let refused = start_frontend(&f, || Ok(pending::<()>()))
         .err()
-        .expect("refused");
+        .expect("the file is held");
+    let said = refused.to_string();
     assert!(
-        refused
-            .to_string()
-            .contains("no sqlite state store backend"),
-        "{refused}"
+        said.starts_with("the state store cannot be opened: "),
+        "{said}"
     );
+    assert!(said.contains("another kbf process"), "{said}");
+
+    // A directory is not a database file.
+    let flag = format!("--state-store=sqlite://{}", dir.display());
+    let f = flags(&["--storage=http://127.0.0.1:1", &flag]).expect("parses");
+    assert!(start_frontend(&f, || Ok(pending::<()>())).is_err());
+    served.abort();
 }
 
 /// Catches a plain-text listener off loopback starting without the warning the other

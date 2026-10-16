@@ -199,14 +199,51 @@ fn a_refused_frontend_start_exits_2() {
             "not loopback",
         ),
         (
-            &["--storage=http://127.0.0.1:1", "--state-store=sqlite:///x"][..],
-            "no sqlite state store backend",
+            &[
+                "--storage=http://127.0.0.1:1",
+                "--state-store=postgres://user:hunter2@db.example/kbf",
+            ][..],
+            "only sqlite:///",
         ),
     ] {
         let out = run(args);
         assert_eq!(out.status.code(), Some(2), "{args:?}");
         let err = String::from_utf8_lossy(&out.stderr);
         assert!(err.contains(want), "{args:?}: {err}");
+        assert!(!err.contains("hunter2"), "{args:?}: {err}");
         assert!(out.stdout.is_empty(), "{args:?}");
     }
+}
+
+/// Catches a frontend process that takes `--state-store=sqlite://...` and does not open
+/// it (the file would not exist), whose `/readyz` does not follow the store with the node
+/// up (200), or that leaves the file to a second frontend: the second exits 2 naming the
+/// holder, prints no start line.
+#[test]
+fn a_frontend_process_with_a_sqlite_state_store_is_ready_and_holds_the_file() {
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("frontend-state-{}", std::process::id()));
+    let node = node(&dir);
+    let state = dir.join("state").join("state.db");
+    let flag = format!("--state-store=sqlite://{}", state.display());
+    let mut front = frontend(&node.field("storage="), &[&flag]);
+    assert!(state.exists());
+    let (code, body) = get(&front.field("api="), "/readyz");
+    assert_eq!(code, 200, "{body}");
+
+    let storage = format!("--storage=http://{}", node.field("storage="));
+    let second = Command::new(BIN)
+        .args([
+            "frontend",
+            "--listen=127.0.0.1:0",
+            "--worker-listen=127.0.0.1:0",
+        ])
+        .args([storage.as_str(), flag.as_str()])
+        .output()
+        .expect("run kbf");
+    assert_eq!(second.status.code(), Some(2));
+    let err = String::from_utf8_lossy(&second.stderr);
+    assert!(err.contains("another kbf process"), "{err}");
+    assert!(second.stdout.is_empty());
+    assert!(front.stop().is_some_and(|status| status.success()));
 }
