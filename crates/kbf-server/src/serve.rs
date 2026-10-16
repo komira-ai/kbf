@@ -37,6 +37,7 @@ use crate::http_invocations::InvocationReaders;
 use crate::identity::{DenyList, Peers};
 use crate::members::Members;
 use crate::members_rpc::MembershipService;
+use kbf_proto::kbf::map::v1::membership_server::MembershipServer;
 use crate::state_store::StateStore;
 use crate::token::ApiToken;
 use crate::worker::WorkerService;
@@ -289,6 +290,28 @@ const STATE_IN_MEMORY: &str = "the scheduler's state is in memory: no cordon, dr
 ///
 /// Builds the future and does not await it here: a function that awaits a future that
 /// never completes has a closing line no test can reach.
+/// The members a frontend with a state store keeps. Not generic, for the same reason as
+/// [`sweeping`].
+fn members_of(state: Option<&crate::StateStore>) -> Option<Arc<Members>> {
+    let state = state?;
+    Some(Arc::new(Members::new(Arc::clone(&state.store), state.members)))
+}
+
+/// The membership service storage nodes register with, when there are members to keep:
+/// under worker TLS only the storage role may call it. Not generic, for the same reason
+/// as [`sweeping`].
+fn membership(
+    members: Option<Arc<Members>>,
+    certified: bool,
+) -> Option<MembershipServer<MembershipService>> {
+    let admission = if certified {
+        Admission::Certified
+    } else {
+        Admission::Open
+    };
+    Some(MembershipService::new(members?, admission).server())
+}
+
 fn sweeping(members: Option<Arc<Members>>) -> Pin<Box<dyn Future<Output = ()> + Send>> {
     match members {
         Some(members) => Box::pin(crate::members_rpc::sweep(members)),
@@ -460,9 +483,7 @@ where
     .recording(recorder.clone());
     let durable = state.is_some();
     // Storage nodes register with a frontend that has a state store to keep them in.
-    let members = state
-        .as_ref()
-        .map(|s| Arc::new(Members::new(Arc::clone(&s.store), s.members)));
+    let members = members_of(state.as_ref());
     let farm = Arc::new(farm.with_state(state)?);
     let (reapi_incoming, reapi) = bind(listeners.reapi)?;
     let (worker_incoming, worker) = bind(listeners.worker)?;
@@ -531,14 +552,7 @@ where
     ))
     .max_decoding_message_size(MAX_MESSAGE_BYTES)
     .max_encoding_message_size(MAX_MESSAGE_BYTES);
-    let admission = if peers_certified {
-        Admission::Certified
-    } else {
-        Admission::Open
-    };
-    let membership = members
-        .clone()
-        .map(|m| MembershipService::new(m, admission).server());
+    let membership = membership(members.clone(), peers_certified);
     let (closer, closing) = kbf_front::closing();
     let (ticker, progress) = kbf_front::progress(listeners.streams.progress_interval);
     let authorizers = Arc::new(policy.authorizers);
