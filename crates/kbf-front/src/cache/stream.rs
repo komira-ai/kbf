@@ -24,8 +24,9 @@
 use std::fmt;
 use std::sync::Arc;
 
-use kbf_objstore::ObjectStore;
-use kbf_segments::Crc32c;
+use futures::StreamExt as _;
+use kbf_objstore::{BodyStream, ObjectStore};
+use kbf_segments::{Crc32c, RecordHasher};
 use kbf_tier::{Reservation, TierError};
 use kbf_types::Digest;
 
@@ -168,7 +169,7 @@ impl Open {
         })
     }
 
-    fn append(&mut self, chunk: &[u8]) -> Result<(), CacheError> {
+    fn append(&mut self, chunk: &[u8]) -> Result<(), TierError> {
         self.range.write(self.written, chunk)?;
         self.crc.update(chunk);
         self.written += chunk.len() as u64;
@@ -203,7 +204,7 @@ impl<M: MetaLog, O: ObjectStore> RecordStream<M, O> {
     /// # Errors
     /// More bytes than the stream was made for, or the tier's write failed.
     pub fn append(&mut self, chunk: &[u8]) -> Result<(), CacheError> {
-        self.open.append(chunk)
+        Ok(self.open.append(chunk)?)
     }
 
     /// Ends the stream as the blob `digest`, whose CRC-32C is `crc32c`.
@@ -218,6 +219,49 @@ impl<M: MetaLog, O: ObjectStore> RecordStream<M, O> {
             range: self.open.range,
             digest,
         })
+    }
+}
+
+impl<M: MetaLog, O: ObjectStore + 'static> Cache<M, O> {
+    /// Stores the blob `digest`, whose bytes come in `bytes`, onto the write tier
+    /// through `stream` (made for its size by [`Cache::stream`]): each piece hashed and
+    /// written to the stream's block off the runtime as it comes, holding one piece at
+    /// a time; then, only if the bytes hash to `digest`, the block synced and committed
+    /// as for [`StreamedRecord::commit`]. The flusher writes it to the store later. How
+    /// a ByteStream `Write` over `MAX_UNSTAGED_BLOB_BYTES` is stored when the tier has
+    /// room for it.
+    ///
+    /// # Errors
+    /// [`CacheError::DigestMismatch`] if the bytes do not hash to `digest`; the body's
+    /// own error; more bytes than the stream was made for, or the tier failed. Nothing
+    /// is stored then: the stream is dropped, its range answered as failed.
+    pub(crate) async fn stage_streamed(
+        &self,
+        digest: Digest,
+        stream: RecordStream<M, O>,
+        mut bytes: BodyStream,
+    ) -> Result<(), CacheError> {
+        let RecordStream { cache, open } = stream;
+        let mut writing = (open, RecordHasher::new());
+        while let Some(piece) = bytes.next().await {
+            let piece = piece?;
+            let (mut open, mut hasher) = writing;
+            let write = move || {
+                hasher.update(&piece);
+                open.append(&piece).map(|()| (open, hasher))
+            };
+            writing = blocking(&self.writer.metrics, Box::new(write)).await?;
+        }
+        let (open, hasher) = writing;
+        let stream = RecordStream { cache, open };
+        let (actual, crc32c) = hasher.finish();
+        if actual != digest {
+            return Err(CacheError::DigestMismatch {
+                claimed: digest,
+                actual,
+            });
+        }
+        stream.finish(digest, crc32c)?.commit().await
     }
 }
 

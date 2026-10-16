@@ -8,7 +8,8 @@
 //!
 //! No blob is too large, and none is held whole: a blob of at most
 //! [`MAX_UNSTAGED_BLOB_BYTES`] is received into memory and stored with others; a larger
-//! one is handed to the store as its messages arrive ([`Cache::store_streamed`]), and a
+//! one is written as its messages arrive onto the write tier when it has room for it
+//! ([`Cache::stage_streamed`]), else to the store ([`Cache::store_streamed`]), and a
 //! Read is served in windows of [`READ_WINDOW_BYTES`](crate::READ_WINDOW_BYTES)
 //! ([`Cache::read_windows`]).
 
@@ -140,9 +141,9 @@ impl<M: MetaLog, O: ObjectStore + 'static> ByteStream for ByteStreamService<M, O
     /// with its size. A blob already durable is answered at once. Past the first
     /// message, nothing is read until [`Cache::admit`] has admitted what the write
     /// holds: the blob's size for one of at most [`MAX_UNSTAGED_BLOB_BYTES`], received
-    /// whole; [`MAX_UNSTAGED_BLOB_BYTES`] for a larger one, whose messages are handed to
-    /// the store as they arrive, hashed as they pass, and stored only if they hash to
-    /// the digest ([`Cache::store_streamed`]). Each call is counted and timed in the
+    /// whole; [`MAX_UNSTAGED_BLOB_BYTES`] for a larger one, whose messages are written
+    /// onto the write tier (or, with no tier or no room on it, to the store) as they
+    /// arrive, hashed as they pass, and stored only if they hash to the digest. Each call is counted and timed in the
     /// cache's metrics (`kbf_bytestream_write_*`).
     async fn write(
         &self,
@@ -215,8 +216,12 @@ impl<M: MetaLog, O: ObjectStore + 'static> ByteStream for ByteStreamService<M, O
 
 impl<M: MetaLog, O: ObjectStore + 'static> ByteStreamService<M, O> {
     /// Receives a blob of more than [`MAX_UNSTAGED_BLOB_BYTES`] from `first` on and
-    /// stores it as its messages arrive ([`Cache::store_streamed`]), admitted for
-    /// [`MAX_UNSTAGED_BLOB_BYTES`]: a message here, a part in the store.
+    /// stores it as its messages arrive, admitted for [`MAX_UNSTAGED_BLOB_BYTES`]:
+    /// onto the write tier when it has room for it ([`Cache::stage_streamed`], a
+    /// message here, flushed to the store later), else straight to the store
+    /// ([`Cache::store_streamed`], a message here, a part in the store). Either way the
+    /// bytes are hashed as they pass and the blob is present only if they hash to its
+    /// digest.
     async fn write_streamed(
         &self,
         first: WriteRequest,
@@ -226,7 +231,15 @@ impl<M: MetaLog, O: ObjectStore + 'static> ByteStreamService<M, O> {
         let admitted = self.cache.admit(MAX_UNSTAGED_BLOB_BYTES).await;
         let refused = Arc::new(Mutex::new(None));
         let body = messages(first, stream, digest.size_bytes, Arc::clone(&refused));
-        let stored = self.cache.store_streamed(digest, body).await;
+        // Onto the write tier when it has room for the blob (flushed to the store
+        // later), else straight to the store.
+        let cache = Arc::clone(&self.cache);
+        let size = digest.size_bytes;
+        let onto_tier = tokio::task::spawn_blocking(move || cache.stream(size)).await;
+        let stored = match onto_tier.ok().flatten() {
+            Some(stream) => self.cache.stage_streamed(digest, stream, body).await,
+            None => self.cache.store_streamed(digest, body).await,
+        };
         drop(admitted);
         let refused = refused
             .lock()

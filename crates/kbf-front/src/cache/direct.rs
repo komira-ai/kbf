@@ -1,8 +1,10 @@
 //! A blob written to the store as its bytes arrive ([`Cache::store_streamed`]): how a
-//! ByteStream `Write` of a blob over [`MAX_UNSTAGED_BLOB_BYTES`](crate::MAX_UNSTAGED_BLOB_BYTES)
-//! is stored, whatever its size, holding a piece of it at a time; and how a daemon in the
-//! server's own process stores an output over it when the write tier is missing or has
-//! no room ([`Cache::store_streamed_claimed`]), its digest named once the bytes ended.
+//! ByteStream `Write` of a blob over
+//! [`MAX_UNSTAGED_BLOB_BYTES`](crate::MAX_UNSTAGED_BLOB_BYTES) is stored when there is
+//! no write tier, or it has no room for the blob, whatever its size, holding a piece of
+//! it at a time; and how a daemon in the server's own process stores an output over it
+//! when the write tier is missing or has no room ([`Cache::store_streamed_claimed`]),
+//! its digest named once the bytes ended.
 
 use std::sync::{Arc, Mutex, PoisonError};
 

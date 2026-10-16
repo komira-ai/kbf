@@ -74,8 +74,9 @@ pub struct Args {
     /// (5% of its size, at least 1 GiB, and never more than half of what is free), at
     /// most `--hot-store-max-bytes`; at the budget, writes
     /// take the direct path to the cold store. Without it, uploads go straight to the
-    /// cold store. A daemon's outputs (a segment upload, or the in-process plane) are
-    /// written through to it as they arrive, so a large one is never held in memory.
+    /// cold store. A daemon's outputs (a segment upload, or the in-process plane) and a
+    /// ByteStream Write over 16 MiB are written through to it as they arrive, so a
+    /// large one is never held in memory.
     /// Without it, or when it has no room, a daemon's blob over 16 MiB
     /// (`kbf_front::MAX_UNSTAGED_BLOB_BYTES`) is streamed to the cold store as it
     /// arrives (a ByteStream Write, or the in-process plane's own stream), never held
@@ -320,7 +321,8 @@ pub struct Args {
     /// The most bytes uploads may hold at once. A ByteStream Write is admitted before
     /// it reads past its first message, for its blob's size up to 16 MiB
     /// (`kbf_front::MAX_UNSTAGED_BLOB_BYTES`) and for 16 MiB above that (a larger blob
-    /// is streamed to the cold store, not held); a BatchUpdateBlobs for its total; a
+    /// is streamed onto the hot store, or to the cold store without room there, not
+    /// held); a BatchUpdateBlobs for its total; a
     /// segment upload's Begin for what it holds in memory. A caller over the bound
     /// waits, nothing is refused for load. At least `--segment-upload-max-bytes` (by
     /// default 33 MiB, under the default 2 GiB). Not covered: each HTTP/2

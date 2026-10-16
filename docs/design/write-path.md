@@ -99,10 +99,12 @@ A blob of `--write-own-segment-bytes` (default 16 MiB) or more bypasses the grou
 is written as a segment of its own (one record, settled like a grouped segment: the
 PUT with its retries, the footer read-back, one `PutBlobs`), so it neither waits for a
 linger nor holds up small writes. A ByteStream `Write` of a blob over
-`MAX_UNSTAGED_BLOB_BYTES` (16 MiB) is not held: it is handed to the store as its
-messages arrive (`Cache::store_streamed`: a multipart upload on S3, hashed as it
-passes, completed only if the bytes hash to the digest), its footer read back, and one
-`PutBlobs` commits it. No blob is too large, on any path.
+`MAX_UNSTAGED_BLOB_BYTES` (16 MiB) is not held: with a write tier that has room for it,
+it is written onto the tier as its messages arrive (`Cache::stage_streamed`, section
+6.2), hashed as it passes and committed only if the bytes hash to the digest; with no
+tier, or no room, it is handed to the store as its messages arrive
+(`Cache::store_streamed`: a multipart upload on S3, hashed as it passes, completed only
+if the bytes hash to the digest), its footer read back, and one `PutBlobs` commits it. No blob is too large, on any path.
 
 ### 3.3 Bounds and backpressure
 
@@ -437,8 +439,11 @@ per blob read does not. PR 3 adds a ranged `read_at` and a positioned write to `
 
 A ByteStream `Write` over `--write-own-segment-bytes` streams into its own block as it
 arrives (bytes come in order from offset 0), hashed as written, synced, and committed
-as a staged object of one record. Memory per stream is then one message. (Built: a
-large `Write` streams to the store instead, section 3.2; not yet onto the tier.) No
+as a staged object of one record. Memory per stream is then one message. (Built as
+`Cache::stage_streamed` for a `Write` over 16 MiB: each message hashed and written to a
+block of its own off the runtime, the digest checked before the commit, the store
+reached only by the flush; with no room on the tier, it streams to the store, section
+3.2.) No
 blob is too large on any path: the flusher reads a block in pieces of 8 MiB
 (`FLUSH_READ_BYTES`), hashing each into its records on the hashing pool, and hands
 them to the store as a streamed write (a multipart upload of 16 MiB parts on S3,
