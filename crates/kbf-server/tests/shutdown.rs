@@ -230,6 +230,35 @@ async fn an_idle_execute_stream_is_sent_progress() {
     assert!(seen.windows(2).all(|w| w[0] == w[1]), "{seen:?}");
 }
 
+/// Catches: `--progress-interval-secs 0` (and `--http2-keepalive-interval-secs 0`)
+/// ignored: a stream waiting for a worker is sent nothing more than its first
+/// operation, and the server still starts and answers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn zero_turns_progress_off() {
+    let (_server, reapi, worker) = Running::start(&[
+        "--progress-interval-secs",
+        "0",
+        "--http2-keepalive-interval-secs",
+        "0",
+    ]);
+    let client = Client::connect(reapi, worker).await;
+    let job = Job::new("idle without progress", &[]);
+    client.upload(&job.blobs()).await;
+    let mut executed = client.execute(&job.action).await;
+    loop {
+        let op = tokio::time::timeout(PROMPT, executed.message())
+            .await
+            .expect("an update in time")
+            .expect("healthy")
+            .expect("an update");
+        if waits_for_a_worker(&op) {
+            break;
+        }
+    }
+    let quiet = tokio::time::timeout(Duration::from_secs(2), executed.message()).await;
+    assert!(quiet.is_err(), "an update with progress off: {quiet:?}");
+}
+
 /// Catches (komira-build-farm#791): a REAPI listener built without HTTP/2 keepalive.
 /// A client that connects, says nothing and answers nothing is sent a PING frame by
 /// the server within `--http2-keepalive-interval-secs`. The planted mutant is

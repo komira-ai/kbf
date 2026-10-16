@@ -44,10 +44,10 @@ async fn an_idle_stream_gets_a_progress_operation_every_tick() {
 
     let first = ops.next().await.expect("an operation").expect("healthy");
     assert!(!first.done);
-    for n in 1..=10 {
+    for _ in 1..=10 {
         let update = tokio::time::timeout(10 * EVERY, ops.next())
             .await
-            .unwrap_or_else(|_| panic!("no progress operation {n}"))
+            .expect("a progress operation (is the ticker running?)")
             .expect("the stream is open")
             .expect("healthy");
         assert_eq!(update.name, "operations/0");
@@ -93,4 +93,22 @@ async fn a_stream_without_progress_sends_only_stage_changes() {
     assert!(quiet.is_err(), "an update with no change and no ticker");
     stage.send_replace(Stage::Executing);
     ops.next().await.expect("executing").expect("healthy");
+}
+
+/// Catches a drain that undoes a close: `drain` after `close` (a second signal, or a
+/// deadline that ran out before the drain was noticed) must leave the streams closed,
+/// not reopen them to wait for their action again. Draining twice changes nothing.
+#[tokio::test(start_paused = true)]
+async fn a_drain_after_a_close_leaves_it_closed() {
+    let (closer, mut closing) = closing();
+    assert!(!closing.draining());
+    closer.drain();
+    closer.drain();
+    assert!(closing.draining());
+    closer.close();
+    closer.drain();
+    assert!(closing.draining());
+    tokio::time::timeout(Duration::from_secs(1), closing.closed())
+        .await
+        .expect("still closed after a drain");
 }
