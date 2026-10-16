@@ -5,7 +5,7 @@
 //! the farm's clock is tokio's, paused: nothing here waits.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::time::Duration;
 
 use kbf_caps::NodeCaps;
@@ -35,6 +35,8 @@ type Inbox = mpsc::UnboundedReceiver<Result<ServerMessage, Status>>;
 struct Flaky {
     inner: Fake,
     down: AtomicBool,
+    /// How many more writes take before the store goes down; negative for no limit.
+    allow: AtomicI64,
 }
 
 impl Flaky {
@@ -43,11 +45,20 @@ impl Flaky {
         Self {
             inner,
             down: AtomicBool::new(false),
+            allow: AtomicI64::new(-1),
         }
     }
 
     fn set_down(&self, down: bool) {
         self.down.store(down, Ordering::SeqCst);
+        if !down {
+            self.allow.store(-1, Ordering::SeqCst);
+        }
+    }
+
+    /// The store takes `writes` more writes, then goes down.
+    fn fail_after(&self, writes: i64) {
+        self.allow.store(writes, Ordering::SeqCst);
     }
 
     /// A crash and reopen: what the store acknowledged survives.
@@ -55,12 +66,18 @@ impl Flaky {
         Self {
             inner: self.inner.restart(),
             down: AtomicBool::new(false),
+            allow: AtomicI64::new(-1),
         }
     }
 }
 
 impl Store for Flaky {
     fn apply_batch(&self, batch: Vec<Txn>) -> Result<Vec<Result<Commit, Conflict>>, StoreError> {
+        if self.allow.load(Ordering::SeqCst) == 0 {
+            self.down.store(true, Ordering::SeqCst);
+        } else if self.allow.load(Ordering::SeqCst) > 0 {
+            self.allow.fetch_sub(1, Ordering::SeqCst);
+        }
         if self.down.load(Ordering::SeqCst) {
             return Err(StoreError::Failed("the store is down".to_owned()));
         }
@@ -341,14 +358,14 @@ async fn a_request_the_store_refuses_is_not_queued() {
 /// Catches: a `Start` sent for a grant the store did not take (the daemon would run a
 /// lease a restart forgets), and a farm that does not recover from it: the grant that
 /// never started is given up after the start grace and granted again, once the store
-/// takes it.
+/// takes it. (The submission's write takes; the grant's, the next, does not.)
 #[tokio::test(start_paused = true)]
 async fn a_grant_the_store_refuses_is_not_started_and_is_granted_again() {
     let disk = Disk::new();
     let farm = disk.farm(EpochPolicy::Keep);
-    submit(&farm, request(1)).expect("queued, no worker yet");
-    disk.store.set_down(true);
     let (stream, mut inbox) = register(&farm);
+    disk.store.fail_after(1);
+    submit(&farm, request(1)).expect("queued");
     assert!(
         starts(&mut inbox).is_empty(),
         "a Start went out for an unwritten grant"
@@ -361,6 +378,29 @@ async fn a_grant_the_store_refuses_is_not_started_and_is_granted_again() {
     assert_eq!(regranted, [LeaseId::new(farm.lease_epoch(), 1)]);
     assert_eq!(disk.rows("lease/"), 1);
     assert_eq!(disk.rows("queue/"), 0);
+}
+
+/// Catches: a grant made while the store is known to be down (it cannot be written, so
+/// its `Start` is dropped round after round, each burning a lease sequence): nothing is
+/// placed from the first refused write until one takes, and the work is granted at once
+/// then.
+#[tokio::test(start_paused = true)]
+async fn nothing_is_granted_while_the_store_is_down() {
+    let disk = Disk::new();
+    let farm = disk.farm(EpochPolicy::Keep);
+    submit(&farm, request(1)).expect("queued, no worker yet");
+    disk.store.set_down(true);
+    let (stream, mut inbox) = register(&farm);
+    assert!(starts(&mut inbox).is_empty());
+    farm.tick().await;
+    disk.store.set_down(false);
+    assert!(farm.heartbeat(&node(), stream, 1, Vec::new()).await);
+    assert_eq!(
+        starts(&mut inbox),
+        [LeaseId::new(farm.lease_epoch(), 0)],
+        "no lease sequence was spent while the store was down"
+    );
+    assert_eq!(disk.rows("lease/"), 1);
 }
 
 /// Catches: a lease given up while the store was down that the store is never told of.
