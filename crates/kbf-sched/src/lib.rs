@@ -95,4 +95,7 @@ pub use requeue::{Gib, Requeue, RequeueReason};
 pub use scheduler::memory::{
     FARM_RERUNS, LadderError, MEMORY_FLOORS, MemoryLadder, MemoryState, NOT_STARTED_RERUNS,
 };
-pub use scheduler::{FINISHED_RETENTION, OpState, PLACEMENT_ROUND, Scheduler, UNSERVABLE_WAIT};
+pub use scheduler::{
+    FINISHED_RETENTION, OpState, PLACEMENT_ROUND, Recovered, RecoveredLease, Scheduler,
+    UNSERVABLE_WAIT,
+};

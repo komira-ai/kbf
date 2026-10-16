@@ -1845,6 +1845,7 @@ dependencies = [
  "kbf-sched",
  "kbf-segments",
  "kbf-sim",
+ "kbf-state",
  "kbf-storage",
  "kbf-store",
  "kbf-threads",

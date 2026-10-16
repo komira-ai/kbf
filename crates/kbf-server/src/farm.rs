@@ -59,11 +59,14 @@ use tokio::sync::{mpsc, watch};
 use tonic::{Code, Status};
 
 mod beat;
+mod durable;
 mod phase;
 mod record;
 
+pub use durable::{EpochPolicy, StateError};
 pub use phase::Reported;
 
+use self::durable::Durable;
 use crate::fault;
 use crate::fleet::{
     NodeView, NodesView, PhaseView, PlacementView, SoftwareView, attention_changes, needs_attention,
@@ -200,6 +203,9 @@ struct State {
     /// recorder of, each with what the first call to wait on it said the action is
     /// (the key of its `action usage:` line). Each leaves at its end.
     recorded: BTreeMap<OperationId, ActionLabel>,
+    /// The state store every change is written through before it is acknowledged, if
+    /// the farm has one ([`Farm::with_state_store`]).
+    durable: Option<Durable>,
 }
 
 /// What a finished operation tells its callers, and the action-cache entry to write
@@ -250,6 +256,7 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
                 paused: BTreeSet::new(),
                 recorder: Recorder::off(),
                 recorded: BTreeMap::new(),
+                durable: None,
             }),
         }
     }
@@ -351,6 +358,9 @@ impl<M: MetaLog, O: ObjectStore> Farm<M, O> {
             let cause = "the daemon restarted, or two daemons hold this node's certificate";
             tracing::warn!(%worker, cause, "another daemon process registered as this node");
         }
+        state.durably("a session", |d| {
+            d.session(worker, &instance, stopped, &reported)
+        });
         let event = Event::WorkerUp {
             worker: worker.clone(),
             instance,
@@ -695,6 +705,13 @@ impl<M: MetaLog, O: ObjectStore + 'static> Dispatch for Farm<M, O> {
         let waiting = std::time::Instant::now();
         let mut state = self.lock();
         self.cache.metrics().sched_lock_wait.since(waiting);
+        let id = state.sched.next_operation();
+        let joins = state.sched.twin(&submission.request).is_some();
+        if !joins && !state.durably("a submission", |d| d.submitted(id, &submission.request)) {
+            return Err(Status::unavailable(
+                "the scheduler's state store did not take the request",
+            ));
+        }
         let action = submission.request.key.action;
         let instance = submission.request.key.instance.clone();
         let waiter = state.machine.submit(Waiter {
@@ -864,9 +881,14 @@ impl State {
                     if let ControlRecord::Lease(grant) = &record {
                         self.offer(grant);
                     }
-                    // Single node: appended is committed. The replicated log goes here.
+                    // Appended is committed; the effects of the commit (the `Start`, the
+                    // answer) are carried out only once the state store has taken what
+                    // they settle.
                     let committed = Event::Committed(record);
-                    effects.extend(self.sched.apply(Input::new(now, committed)));
+                    let next = self.sched.apply(Input::new(now, committed));
+                    if self.durably("a committed record", |d| d.persist(&next)) {
+                        effects.extend(next);
+                    }
                 }
                 Effect::Start(start) => self.start(start),
                 Effect::Answer(answer) => {
@@ -911,6 +933,7 @@ impl State {
     fn log_requeues(&mut self) {
         for requeue in self.sched.take_requeues() {
             self.record_requeue(&requeue);
+            self.durably("a requeue", |d| d.requeued(&requeue));
             let Requeue {
                 operation,
                 lease,
@@ -1193,64 +1216,4 @@ fn unrun(outcome: Outcome, farm_runs: &[FarmRun]) -> Finished {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Catches a server process that reuses an earlier process's term (issue #137:
-    /// every process granted leases from `(1, 0)`), and one whose term does not order
-    /// after that of a process started a few milliseconds before. A term is also never
-    /// 1, the term every server before the fix used.
-    #[test]
-    fn each_process_term_is_new_and_later() {
-        let first = process_term();
-        std::thread::sleep(Duration::from_millis(3));
-        let second = process_term();
-        assert!(second > first, "{second} does not order after {first}");
-        assert!(first >> 16 > 0, "{first} could be a pre-fix term");
-    }
-
-    /// Catches a result the farm settles with no detail that is not a farm fault (a
-    /// committed `Completed` whose worker report this process never saw) being answered
-    /// as anything but the fixed INTERNAL "could not run the action", or panicking.
-    #[test]
-    fn a_result_without_detail_that_is_no_fault_is_answered_internal() {
-        let farm = Farm::new(
-            Arc::new(Cache::memory()),
-            kbf_sched::UNSERVABLE_WAIT,
-            kbf_sched::FINISHED_RETENTION,
-        );
-        let answer = kbf_types::Answer {
-            operation: kbf_types::OperationId(1),
-            lease: kbf_types::LeaseId::new(1, 0),
-            waiters: Vec::new(),
-            outcome: Outcome::Completed {
-                action_result: kbf_types::Digest::new(
-                    kbf_types::DigestFunction::Sha256,
-                    [1; 32],
-                    1,
-                ),
-            },
-            memory_runs: Vec::new(),
-            farm_runs: Vec::new(),
-        };
-        let settled = farm.lock().settle(&answer, None);
-        assert_eq!(
-            settled.finished,
-            failed(Code::Internal, "the farm could not run the action")
-        );
-    }
-
-    /// Catches a farm fault (Infra, node memory pressure, a lost run) with no detail being
-    /// answered as the plain INTERNAL, which drops the farm's runs and the operator fix.
-    #[test]
-    fn a_result_without_detail_that_is_a_farm_fault_names_the_fault() {
-        for failure in [Failure::Infra, Failure::NodeMemoryPressure] {
-            let finished = unrun(Outcome::Failed(failure), &[]);
-            assert_eq!(finished, fault::finished(&[]), "{failure:?}");
-            assert_ne!(
-                finished,
-                failed(Code::Internal, "the farm could not run the action")
-            );
-        }
-    }
-}
+mod tests;

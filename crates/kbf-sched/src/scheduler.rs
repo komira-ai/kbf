@@ -4,8 +4,10 @@ mod fault;
 mod give_up;
 pub(crate) mod memory;
 mod phase;
+mod recover;
 mod state;
 
+pub use recover::{Recovered, RecoveredLease};
 pub use state::OpState;
 
 use std::cmp::Reverse;

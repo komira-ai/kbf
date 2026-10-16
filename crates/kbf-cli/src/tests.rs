@@ -158,6 +158,31 @@ fn each_mode_refuses_the_flags_of_another() {
     }
 }
 
+/// Catches: `--state-store` not reaching the all-in-one's server flags, a scheme the
+/// design does not admit accepted at parse (a start would find out much later), and a
+/// build node that takes it (it holds no scheduler state, so the flag would be silently
+/// ignored there).
+#[test]
+fn only_the_scheduling_modes_take_a_state_store() {
+    let sqlite = with(BOTH, &["--state-store=sqlite:///var/lib/kbf/state.db"]);
+    let both = parse_from(sqlite).expect("all-in-one");
+    let path = std::path::PathBuf::from("/var/lib/kbf/state.db");
+    assert!(matches!(&both, Invocation::AllInOne(flags)
+        if flags.server.state_store == Some(kbf_server::StateStoreUri::Sqlite(path.clone()))));
+    let postgres = with(BOTH, &["--state-store=postgres://db.example/kbf"]);
+    let both = parse_from(postgres).expect("all-in-one");
+    assert!(matches!(&both, Invocation::AllInOne(flags)
+        if matches!(flags.server.state_store, Some(kbf_server::StateStoreUri::Postgres(_)))));
+    let file = error(with(BOTH, &["--state-store=file:///var/lib/kbf"]));
+    assert!(file.contains("scheme \"file\""), "{file}");
+    let daemon = refusal(with(DAEMON, &["--state-store=sqlite:///x.db"]));
+    assert_eq!(daemon.kind(), ErrorKind::ArgumentConflict);
+    assert!(
+        daemon.to_string().contains("refuses --state-store"),
+        "{daemon}"
+    );
+}
+
 /// Catches an all-in-one that takes less or more than `kbf-all-in-one` takes: its
 /// flags are exactly those of that command.
 #[test]
