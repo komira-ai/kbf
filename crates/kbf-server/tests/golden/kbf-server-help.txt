@@ -56,6 +56,9 @@ Options:
       --reapi-auth-policy <REAPI_AUTH_POLICY>
           A JSON file with the REAPI listener's authentication policy and authorizers (`docs/reapi-auth.md`), read once at start; a file that is not a valid policy stops the server. Without it every REAPI call is accepted and allowed. The worker listener does not read it; on the operator API only the build pages and the blob route do, and they are off unless it names their authorizers
 
+      --storage <URL>
+          Proxy mode (`docs/design/architecture-v2.md`, section 7): the URL of a storage node (`kbf storage`), such as `http://127.0.0.1:8990`. The REAPI listener then answers a client's CAS, ByteStream and action-cache calls from that node, passing ByteStream through without holding a blob. The local stores are still opened: Execution and the worker listener use them until the scheduler uses storage. Plain text (`http://`) only; the node's mutual TLS is not wired yet. Without it, the server answers those calls itself
+
       --worker-listen <WORKER_LISTEN>
           The `kbf.worker.v1` listener. Without mutual TLS (`--worker-tls-cert`, `--worker-tls-key`, `--worker-client-ca`) it serves plain text, on any address; off loopback the start line carries a warning
           
@@ -108,9 +111,24 @@ Options:
           [default: 60]
 
       --shutdown-timeout-secs <SHUTDOWN_TIMEOUT_SECS>
-          How long, in seconds, a stop (SIGINT or SIGTERM) waits for REAPI clients to disconnect after their open Execute and WaitExecution streams are ended UNAVAILABLE and their connections sent GOAWAY. A client still uploading is cut off when it runs out
+          How long, in seconds, a stop (SIGINT or SIGTERM) waits for REAPI clients to finish: it refuses new Execute calls (UNAVAILABLE, which Buck2 retries) and sends GOAWAY, and every open Execute and WaitExecution stream stays open until its action is done. Buck2 never recovers a stream that breaks mid-action, so the default, 0, is no deadline; set one at least as long as the longest action. When it runs out, the open streams end UNAVAILABLE (a client still uploading is cut off)
           
-          [default: 10]
+          [default: 0]
+
+      --progress-interval-secs <PROGRESS_INTERVAL_SECS>
+          How often, in seconds, every open Execute and WaitExecution stream is sent its operation again (same name, not done, current stage), so a load balancer's idle timeout never cuts a long action. 0 sends none
+          
+          [default: 30]
+
+      --http2-keepalive-interval-secs <HTTP2_KEEPALIVE_INTERVAL_SECS>
+          How often, in seconds, the REAPI and worker listeners send an HTTP/2 PING on a quiet connection. 0 sends none (and `--http2-keepalive-timeout-secs` is unused)
+          
+          [default: 30]
+
+      --http2-keepalive-timeout-secs <HTTP2_KEEPALIVE_TIMEOUT_SECS>
+          How long, in seconds, a PING may go unanswered before the connection is closed
+          
+          [default: 20]
 
       --async-threads <N>
           Worker threads of the async runtime, which run every task between its waits. Default: every CPU the process may use on the server; `max(2, reserve/4)`, at most the physical cores, on the daemon

@@ -1,7 +1,9 @@
-//! Stopping the `kbf-server` binary with open REAPI streams (issue #168): SIGTERM
-//! ends open Execute and WaitExecution streams UNAVAILABLE, which clients retry, and
-//! the server exits 0 once its REAPI connections close, or when
-//! `--shutdown-timeout-secs` runs out.
+//! Stopping the `kbf-server` binary with open REAPI streams (issue #168, and
+//! komira-build-farm#791): SIGTERM keeps open Execute and WaitExecution streams until
+//! their action is done, because Buck2 does not recover a stream that breaks; when
+//! `--shutdown-timeout-secs` runs out they end UNAVAILABLE and the server exits 0 once
+//! its REAPI connections close. The same file holds the stream-liveness flags: an
+//! idle Execute stream is sent progress operations, and the listeners send HTTP/2 PINGs.
 
 #![cfg(unix)]
 
@@ -116,13 +118,12 @@ impl Drop for Running {
 /// Catches issue #168: a server that dies on SIGTERM (no handler), or stops serving
 /// at once, so an open Execute or WaitExecution stream fails on the client with
 /// UNKNOWN (an h2 error) instead of UNAVAILABLE; and one that does not exit 0 promptly
-/// once the streams are ended (well within the default 10 s shutdown timeout, so a
-/// drain that waits it out fails). No daemon is connected, so the operation waits,
+/// once the streams are ended. The deadline is 1 s here (the default is none). No daemon is connected, so the operation waits,
 /// with the reason that no live worker can run it, until the signal; the test signals
 /// only once it has seen that reason, so the run is the same every time.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sigterm_ends_open_execute_streams_unavailable() {
-    let (mut server, reapi, worker) = Running::start(&[]);
+    let (mut server, reapi, worker) = Running::start(&["--shutdown-timeout-secs", "1"]);
     let client = Client::connect(reapi, worker).await;
     let job = Job::new("open across a SIGTERM", &[]);
     client.upload(&job.blobs()).await;
@@ -171,6 +172,147 @@ async fn sigterm_ends_open_execute_streams_unavailable() {
     }
     let status = server.exited(PROMPT).await;
     assert!(status.success(), "kbf-server exited with {status}");
+}
+
+/// Catches (komira-build-farm#791): a SIGTERM that ends open streams or exits while an
+/// action is in flight (Buck2 never reconnects, so the action would fail). With no
+/// deadline (the default) the stream stays open and the server keeps running after the
+/// signal; here it is still there after a pause and nothing has been sent on it. The
+/// planted mutant is the signal handler closing the streams as it drains.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sigterm_keeps_an_open_stream_when_there_is_no_deadline() {
+    let (mut server, reapi, worker) = Running::start(&[]);
+    let client = Client::connect(reapi, worker).await;
+    let job = Job::new("kept across a SIGTERM", &[]);
+    client.upload(&job.blobs()).await;
+    let mut executed = client.execute(&job.action).await;
+    loop {
+        let op = tokio::time::timeout(PROMPT, executed.message())
+            .await
+            .expect("an update in time")
+            .expect("healthy")
+            .expect("an update");
+        if waits_for_a_worker(&op) {
+            break;
+        }
+    }
+
+    server.terminate();
+    let quiet = tokio::time::timeout(Duration::from_secs(1), executed.message()).await;
+    assert!(quiet.is_err(), "the stream ended or spoke: {quiet:?}");
+    assert!(
+        server.0.try_wait().expect("try_wait").is_none(),
+        "the server exited"
+    );
+
+    // The client goes away and the server, with nothing left to wait for, exits 0.
+    drop(executed);
+    drop(client);
+    let status = server.exited(PROMPT).await;
+    assert!(status.success(), "kbf-server exited with {status}");
+}
+
+/// Catches (komira-build-farm#791): a server that sends nothing on an idle Execute
+/// stream, so a load balancer's idle timeout cuts it. With `--progress-interval-secs 1`
+/// an operation waiting for a worker is sent again, same name, not done. The planted
+/// mutant is a server that never runs the progress ticker (the read times out).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_idle_execute_stream_is_sent_progress() {
+    let (_server, reapi, worker) = Running::start(&["--progress-interval-secs", "1"]);
+    let client = Client::connect(reapi, worker).await;
+    let job = Job::new("idle with progress", &[]);
+    client.upload(&job.blobs()).await;
+    let mut executed = client.execute(&job.action).await;
+    let mut seen = Vec::new();
+    while seen.len() < 3 {
+        let op = tokio::time::timeout(PROMPT, executed.message())
+            .await
+            .expect("an update in time (no progress ticker?)")
+            .expect("healthy")
+            .expect("an update");
+        assert!(!op.done, "{op:?}");
+        seen.push(op.name);
+    }
+    assert!(seen.windows(2).all(|w| w[0] == w[1]), "{seen:?}");
+}
+
+/// Catches: `--progress-interval-secs 0` (and `--http2-keepalive-interval-secs 0`)
+/// ignored: a stream waiting for a worker is sent nothing more than its first
+/// operation, and the server still starts and answers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn zero_turns_progress_off() {
+    let (mut server, reapi, worker) = Running::start(&[
+        "--progress-interval-secs",
+        "0",
+        "--http2-keepalive-interval-secs",
+        "0",
+    ]);
+    let client = Client::connect(reapi, worker).await;
+    let job = Job::new("idle without progress", &[]);
+    client.upload(&job.blobs()).await;
+    let mut executed = client.execute(&job.action).await;
+    loop {
+        let op = tokio::time::timeout(PROMPT, executed.message())
+            .await
+            .expect("an update in time")
+            .expect("healthy")
+            .expect("an update");
+        if waits_for_a_worker(&op) {
+            break;
+        }
+    }
+    let quiet = tokio::time::timeout(Duration::from_secs(2), executed.message()).await;
+    assert!(quiet.is_err(), "an update with progress off: {quiet:?}");
+    // Stopped by a signal, not killed, so the run's coverage is written.
+    drop(executed);
+    drop(client);
+    server.terminate();
+    let status = server.exited(PROMPT).await;
+    assert!(status.success(), "kbf-server exited with {status}");
+}
+
+/// Catches (komira-build-farm#791): a REAPI listener built without HTTP/2 keepalive.
+/// A client that connects, says nothing and answers nothing is sent a PING frame by
+/// the server within `--http2-keepalive-interval-secs`. The planted mutant is
+/// `keepalive` not applied to the REAPI builder (no PING arrives).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_reapi_listener_pings_an_idle_connection() {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let (_server, reapi, _worker) = Running::start(&[
+        "--http2-keepalive-interval-secs",
+        "1",
+        "--http2-keepalive-timeout-secs",
+        "5",
+    ]);
+    let mut conn = tokio::net::TcpStream::connect(reapi)
+        .await
+        .expect("connect");
+    // The HTTP/2 preface and an empty SETTINGS frame, then silence.
+    conn.write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")
+        .await
+        .expect("preface");
+    conn.write_all(&[0, 0, 0, 4, 0, 0, 0, 0, 0])
+        .await
+        .expect("settings");
+    let ping = async {
+        loop {
+            let mut head = [0u8; 9];
+            conn.read_exact(&mut head).await.expect("a frame header");
+            let len = usize::from(head[0]) << 16 | usize::from(head[1]) << 8 | usize::from(head[2]);
+            let mut payload = vec![0u8; len];
+            conn.read_exact(&mut payload)
+                .await
+                .expect("a frame payload");
+            const PING: u8 = 6;
+            const ACK: u8 = 1;
+            if head[3] == PING && head[4] & ACK == 0 {
+                return;
+            }
+        }
+    };
+    tokio::time::timeout(PROMPT, ping)
+        .await
+        .expect("a PING frame within the bound (no keepalive?)");
 }
 
 /// Whether `op` is queued with the reason no live worker can run it.

@@ -14,24 +14,26 @@ use std::io;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
-use kbf_front::Cache;
+use kbf_front::{Cache, MetaLog};
 use kbf_log::FarmLogId;
 use kbf_meta::Retention;
 use kbf_objstore::{
     Floor, FsStore, FsStoreError, KeyPrefix, ObjectStore, objects_source, statvfs_source,
 };
+use kbf_storage::local_cache::{HeldBytes, LocalCache};
 use kbf_store::StdFs;
 use kbf_threads::Topology;
 use kbf_threads::disk::Statvfs;
+use kbf_tier::WriteTier;
 
 use crate::local::LocalStore;
 use crate::startup_pass::StartPass;
 use crate::stores::{COLD_FILE_FLOOR, FILE_PREFIX_ROOT, Hot, StoreUri, Stores};
 use crate::write_tier::FLUSH_EVERY;
-use crate::{Args, RaftMetaLog, SERVER_VERSION, ServeError, bind_server_with_state, s3_store};
+use crate::{Args, RaftMetaLog, SERVER_VERSION, ServeError, bind_server_with_options, s3_store};
 
 /// The server's thread sizes on a given machine shape: every CPU, then the overrides.
 pub fn sizes_on(args: &Args, topology: Topology) -> kbf_threads::Sizes {
@@ -219,8 +221,10 @@ where
         .await?
         .with_writes(args.write_config())
         .with_input_trees(args.input_tree_config());
-    let (cache, tier) = crate::write_tier::attach(cache, hot).await?;
+    let local = args.local_cache.as_ref();
+    let (cache, tier) = crate::write_tier::attach_with(cache, hot, local.is_none()).await?;
     let cache = Arc::new(cache);
+    share_storage(local, tier_bytes(Arc::downgrade(&cache)));
     let local = LocalStore::new(Arc::clone(&cache), listeners.segments);
     let _flusher = tier.map(|_| {
         let flusher = crate::write_tier::run_flusher(Arc::clone(&cache), FLUSH_EVERY);
@@ -229,7 +233,8 @@ where
     let _pass = pass.map(|pass| AbortOnDrop(crate::startup_pass::spawn(Arc::clone(&cache), pass)));
     let shutdown = shutdown()?;
     let api = args.api()?;
-    let bound = bind_server_with_state(cache, listeners, api, policy, state, shutdown)?;
+    let storage = args.storage()?;
+    let bound = bind_server_with_options(cache, listeners, api, policy, state, storage, shutdown)?;
     let plain = args.plain_text_off_loopback();
     Ok(ServerHandle {
         reapi: bound.reapi,
@@ -248,6 +253,31 @@ where
         _flusher,
         _pass,
     })
+}
+
+/// Reports local storage's `bytes` to the node's one cache, if the process has one.
+/// Not generic, so it is compiled once whatever the store.
+fn share_storage(local: Option<&Arc<LocalCache>>, bytes: HeldBytes) {
+    if let Some(local) = local {
+        local.attach_storage(bytes);
+    }
+}
+
+/// What `cache`'s write tier holds on its disk now: its blocks, and any flushed copies
+/// it keeps; 0 without a tier or once the server is gone (a weak handle, as the input
+/// cache's side is: the one cache keeps neither half alive).
+fn tier_bytes<M: MetaLog, O: ObjectStore + 'static>(cache: Weak<Cache<M, O>>) -> HeldBytes {
+    Box::new(move || {
+        cache
+            .upgrade()
+            .map_or(0, |cache| cache.write_tier().map_or(0, held))
+    })
+}
+
+/// What `tier` holds on its disk.
+fn held(tier: &dyn WriteTier) -> u64 {
+    let usage = tier.usage();
+    usage.used.saturating_add(usage.flushed)
 }
 
 /// Aborts a task when dropped: the flusher and the start-up pass stop with the server.

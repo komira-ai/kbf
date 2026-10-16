@@ -5,8 +5,8 @@ Status: design, nothing built. It supersedes the leader-elected server cluster i
 ## 1. Decisions
 
 - **[D]** kbf is four parts, as Buildbarn is frontend, scheduler, storage and worker.
-  - **Frontend.** Stateless when the state store is Postgres (on SQLite its queue lives in the file on its own disk, section 4.3). Runs behind a load balancer (LB) in an autoscaling group; its DNS name is the one address clients, daemons and storage nodes know. Serves REAPI, runs the scheduler logic and the UI. Holds no durable state of its own beyond the state store.
-  - **State store.** The queue, leases (each action handed out once), operations and membership. Two backends only: SQLite (a single frontend, and always `all-in-one`) and Postgres (required for several frontends, allowed for a single one), chosen by `--state-store`.
+  - **Frontend.** Stateless when the state store is Postgres (on SQLite its queue lives in the file on its own disk, section 4.3). Runs behind a load balancer (LB) in an autoscaling group; its DNS name is the one address clients, daemons and storage nodes know. Serves REAPI, runs the scheduler logic and the UI. Holds no durable state of its own beyond the state store (scheduler rows and the UI's index rows) and the object store (UI history objects, `ui-data.md` 5.2).
+  - **State store.** The queue, leases (each action handed out once), operations and membership. An interface: a backend is any implementation of the `kbf-state` trait that passes the conformance suite (4.1). SQLite (a single frontend, and always `all-in-one`) and Postgres (required for several frontends, allowed for a single one) are built first; the `--state-store` URI's scheme names the backend.
   - **Storage.** CAS, action cache (AC), SSD hot store, background flush to the cold store (MinIO or S3). Sharded by digest with a replication factor R (default 2). No leader. Storage nodes do not schedule.
   - **Daemon.** Runs actions.
 - **[D]** Modes of the one `kbf` binary: `frontend`, `storage`, `daemon`, `storage-and-daemon` (the daemon reads and writes local storage in-process), `all-in-one` (frontend, storage, daemon and a SQLite state store).
@@ -31,9 +31,9 @@ Status: design, nothing built. It supersedes the leader-elected server cluster i
 
 ### 4.1 Contract
 
-A backend is admitted only if it passes one conformance suite, run against an in-memory fake, SQLite and Postgres.
+A backend is admitted only if it passes one conformance suite, run against an in-memory fake and every backend.
 
-Each clause and how SQLite and Postgres meet it is in 4.3.
+Each clause and how the first two backends, SQLite and Postgres, meet it is in 4.3.
 
 - **C1.** Linearizable compare-and-set per key, with a version.
 - **C2.** Atomic transaction over several keys.
@@ -41,17 +41,17 @@ Each clause and how SQLite and Postgres meet it is in 4.3.
 - **C4.** TTL keys with expiry decided by the store's clock, observable as an event, on an injectable clock in tests.
 - **C5.** Ordered prefix scan and a change feed that resumes from a revision with no skipped rows: a poller never advances past a revision that can still commit. Polling by revision is the baseline; push (watch, `LISTEN/NOTIFY`) is only an optimization, because a notification is not queued for a listener that is disconnected and is not delivered through transaction-mode poolers. If used, it is a coarse wake with no per-row payload: commit-time NOTIFY serializes commits and would hurt at hundreds of commits per second.
 - **C6.** Durable acknowledgement across restart and failover.
-- **C7.** Group commit, because about 5 durable writes per action **[I]** make an ungrouped fsync the limit. Budget **[I]**: 9000 actions in about 2 h is about 1.25 actions/s, about 6 writes/s; a burst of 300 actions/s is about 1500 writes/s; heartbeats are one row per daemon session, negligible. One fsync per write caps near 200 to 1000 writes/s, so 1500 writes/s needs real batching. Commits are batched within a bounded window (target 5 ms, a hard limit configurable and exported as a metric), and every `Start` and `Result` acknowledgement waits for its commit.
+- **C7.** Group commit, because about 5 durable writes per action **[I]** make an ungrouped fsync the limit. Budget **[I]**: 9000 actions in about 2 h is about 1.25 actions/s, about 6 writes/s; a burst of 300 actions/s is about 1500 writes/s; heartbeats are one row per daemon session, negligible. One fsync per write caps near 200 to 1000 writes/s, so 1500 writes/s needs real batching. Commits are batched within a bounded window (target 5 ms, a hard limit configurable and exported as a metric), and every `Start` and `Result` acknowledgement waits for its commit. A transaction may be marked background (the UI index rows, `ui-data.md` 5.2): a backend applies it only in a batch with no foreground transaction waiting, or, once it has waited 250 ms or 16 batches (whichever comes first), in the next batch regardless, so the index cannot starve under a sustained burst; either way at most one per batch, never ahead of a foreground transaction already queued, and it refuses one over 256 rows or 256 KiB. The suite's load test asserts two things with background transactions offered at 512 rows/s beside 1500 foreground writes/s: `Result` commit p99 stays within the bound, and the background rows are applied at no less than the offered rate with a bounded background queue; a planted backend that never applies a background transaction must fail it. So a backend admitted later can neither put background work on the acknowledgement path nor starve it.
 
-The only backends are SQLite and Postgres; there is no etcd, Redis or built-in replicated store.
+A backend is any implementation of the `kbf-state` trait that passes this suite; SQLite and Postgres are built first, and others (for example a cloud key-value or database service) may follow on the same terms. There is still no built-in Raft or replicated store of kbf's own. **[I]** C5 (one gap-free feed) and C7 (group commit) are the hard clauses for other stores: one whose stream order or TTL is per partition or imprecise must keep its own revision counter and `expires_at` checks.
 
 ### 4.2 Contents
 
-Operations; a queue indexed by platform, size class and QoS (a claim never scans unrelated entries); `inflight/<action_key>` dedup; leases; one `session/<daemon>` row; members; the map; whole-machine holds; memory-ladder floors; loss marks; repair records.
+Operations; a queue indexed by platform, size class and QoS (a claim never scans unrelated entries); `inflight/<action_key>` dedup; leases; one `session/<daemon>` row; members; the map; whole-machine holds; memory-ladder floors; loss marks; repair records; the UI's index rows and failure pins (`ui/`, `ui-data.md` 5.3).
 
 ### 4.3 Backends
 
-`--state-store=sqlite:///path` or `--state-store=postgres://...`. `ControlRecord` (`Lease | Result | Refusal`, "commit before Start", `work.rs:323-330` **[F]**) becomes rows written through the `kbf-state` trait.
+`--state-store=sqlite:///path` or `--state-store=postgres://...` for the first two backends; each backend claims its URI scheme. `ControlRecord` (`Lease | Result | Refusal`, "commit before Start", `work.rs:323-330` **[F]**) becomes rows written through the `kbf-state` trait.
 
 **Flag details (as built).** Only `sqlite:///absolute/path` is wired. Any other value, `postgres://` included, is refused with fixed text that never quotes the value (a mistyped URL holds a password, and the command line is world-readable); the Postgres backend of `kbf-state` plugs in behind the `Store` trait when it is wired, with its own way to take a password. `all-in-one` takes `sqlite:///...` only and, with no flag, `<data-dir>/state.db`. The state directory a start makes is 0700 and the files in it 0600.
 
@@ -77,7 +77,7 @@ Operations; a queue indexed by platform, size class and QoS (a claim never scans
 
 ## 5. Scheduler
 
-**v1: one frontend** runs the scheduler as `farm.rs` does today, writing every change through the `kbf-state` trait; memory is a cache, the store is the truth. Global first-fit, holds and the ladder are unchanged. **[I]** Clients re-submit a lost Execute and dedup absorbs it, so what must be durable is small: operations, leases, membership, the map, the epoch.
+**v1: one frontend** runs the scheduler as `farm.rs` does today, writing every change through the `kbf-state` trait; memory is a cache, the store is the truth. Global first-fit, holds and the ladder are unchanged. **[I]** Buck2 does not re-submit a lost Execute: it retries only opening the stream (up to 5 attempts), and a stream that breaks after it started fails the action (`remote_call_error`); it never calls WaitExecution. So a frontend that goes away must not break its streams. On SIGTERM it refuses new Execute calls UNAVAILABLE (retried at open, so they reach another frontend) and keeps every open stream until its action is done (`--shutdown-timeout-secs`, default no deadline); every open stream is sent its operation again every `--progress-interval-secs` and the listeners send HTTP/2 PINGs (`--http2-keepalive-*`) so no idle timeout cuts it. What must be durable is still small: operations, leases, membership, the map, the epoch.
 
 **Several frontends: per-frontend pull-claim.** Placement is global first-fit under one mutex **[F]**, so N frontends cannot share it. A frontend owns the daemons connected to it and claims for their free slots:
 
@@ -103,10 +103,10 @@ Operations; a queue indexed by platform, size class and QoS (a claim never scans
 - **Registration.** A storage node or daemon opens a stream to any frontend and sends role, `instance_id`, advertise address, capacity, zone label and protocol version. The frontend writes `member/<id>` with a TTL; the member id and boot counter (section 8.4) are assigned by the store, so no node picks its identity. Membership lives in the store, so a reconnect to another frontend loses nothing.
 - **Storage nodes do not talk to the state store.** They reach it only through the frontend. This keeps the store's attack surface to frontends.
 - **Heartbeats** refresh the TTL through the frontend; expiry is store-judged on the injectable clock reused from PR #746.
-- **Map** = `{generation, members[{id, addr, zone, weight, state}], rule, R, min_protocol, deny_list}`. States: `joining`, `catching-up`, `active`, `draining`, `down`. `Welcome` carries it and a new `MapUpdate` message pushes changes; storage nodes get it down their registration stream.
+- **Map** = `{generation, members[{id, addr, zone, weight, state}], rule, R, min_protocol, denied}`. States: `joining`, `catching-up`, `active`, `draining`, `down`. `Welcome` carries it and a new `MapUpdate` message pushes changes; storage nodes get it down their registration stream.
 - **Dwell.** A member whose TTL lapses becomes `down` but stays in the map for a dwell (reusing `TierDown`/`TierUp` and `--hot-store-abandon` from `cluster.md` 4.4 **[F]**) before it leaves and its slice is re-replicated. This prevents flapping. A generation bump is one CAS on `map`; two frontends racing produce one winner and one retry.
 - **Staleness protocol.** Every storage RPC carries the caller's generation. A node that sees an older one answers `STALE_MAP` with the current number and the caller refetches; a node that sees a newer one fetches it. A lost push is therefore harmless.
-- **Admission.** Holding a valid storage-role certificate gets a node a `joining` entry, not ownership. It becomes `active`, and a first owner, only after it has caught up (section 8.4). Who may hold a storage certificate is the operator's CA policy.
+- **Admission.** Holding a valid storage-role certificate gets a node a `joining` entry. A joiner takes writes at once, is never rank 1, and is read last; it becomes a read owner in rank order only once `active`, after it has caught up (section 8.4). Who may hold a storage certificate is the operator's CA policy.
 - **Hashing.** Rendezvous (highest-random-weight) hashing over digest, member id and weight; owners are the top R. This is the consistent-hashing family Buildbarn uses for sharding: removing a member remaps only the blobs that resolved to it, and there is no ring state to coordinate. Cost is one hash per member per digest, negligible at 6 to 100 members. Zone-aware second owner is optional and off by default.
 
 ## 7. Traffic
@@ -122,7 +122,7 @@ Operations; a queue indexed by platform, size class and QoS (a claim never scans
 - **Reads.** Owners in rank order, then the previous generation's owners, then the cold store through an owner's index. Non-first hits trigger rate-limited read-repair. FindMissing is split by owner and asks the primary only; a replica is not asked on a miss, since cold builds are mostly misses.
 - **AC.** Sharded by action digest, with the small `ActionResult` inline. An entry is written only after its closure is acknowledged: for a client `UpdateActionResult` the AC owner checks the closure with batched FindMissing to the other owners; for an action's own result the daemon supplies the acknowledgements. Reads present-check the result blob only (cached per generation). Closure blobs flush before the AC entry.
 - **Loss marks.** When a hot tier is abandoned, digests it held and never flushed get `loss/<digest>`; an AC read whose result blob is marked is a miss. Residual: a later-evicted closure blob gives a client a missing output and a re-execute, not corruption. The lost-blob gauge makes it visible.
-- **Join and drain.** Generation g+1 is published; readers use g first until handoff finishes. A joining node is a write owner at once but read last; old owners copy changed blobs, throttled; then it is `active`. Drain is the reverse and is not a kill. A node drops a blob only after every new owner confirms it, or the cold-store PUT is acknowledged and the index entry committed.
+- **Join and drain.** Generation g+1 is published; readers use g first until handoff finishes. A joining node is a write owner at once but never rank 1, and read last; old owners copy changed blobs, throttled; then it is `active`. Drain is the reverse and is not a kill. A node drops a blob only after every new owner confirms it, or the cold-store PUT is acknowledged and the index entry committed.
 - **Rebuild.** A new owner has no index for blobs a previous owner flushed and rebuilds from self-describing footers (`startup_pass.rs` does it for `file://` **[F]**; listing S3/MinIO is new work **[I]**), staying `catching-up` until done.
 - **Object keys.** `AllocEpoch` is a global write (`state.rs:25` **[F]**); ids become `(node id, boot counter)`, the counter from C3 at registration, which removes it from the data path and avoids collision with the old server's objects.
 - **One flusher.** The rank-1 owner flushes; the replica evicts after the flush is confirmed and flushes only if the primary is down past the dwell. Otherwise both write the same blobs into different objects and double PUT bytes and S3 cost.
@@ -131,11 +131,12 @@ Operations; a queue indexed by platform, size class and QoS (a claim never scans
 ## 9. Security
 
 - mTLS on every hop with the role (frontend, storage, daemon) in the certificate; storage accepts only expected roles per endpoint. Certificates and keys come from files; nothing in environment variables. Clients use TLS at the LB.
-- Daemon identity and deny-list checks (`identity.rs` **[F]**) must be repeated on storage nodes, because the worker listener's `ByteStream` moves there. The frontend issues a short-lived signed storage-access grant in `Welcome`; storage nodes verify it with the frontends' public key (provisioned as a file). The deny-list rides in the map, so a denied daemon loses storage access when the generation turns.
+- Daemon identity and deny-list checks (`identity.rs` **[F]**) must be repeated on storage nodes, because the worker listener's `ByteStream` moves there. The frontend issues a short-lived signed storage-access grant in `Welcome`; storage nodes verify it with the frontends' public key (provisioned as a file). The deny entries (certificate serial, public-key hash or node id, one canonical form each) ride in the map, so a denied daemon loses storage access when the generation turns.
 - **Trusted-network:** daemons and storage trust each other on the private network; mTLS stays on.
 - **Isolated-storage:** only storage nodes hold cold-store credentials. Daemon-only nodes (the Macs, a cloud daemon ASG) hold none and reach bytes only through storage. A test proves a daemon-only process cannot reach the cold store.
 - **Credential gap on `storage-and-daemon`.** A node that holds cold-store credentials and also runs untrusted actions is not isolated unless storage runs under a different uid from actions and the credentials are unreadable by the action's uid. Without that, they are trusted-network only. Decided: separate uids, with a test that an action cannot read the credential (section 15).
 - The state store is reachable only from frontends (a SQLite file is opened by one frontend only).
+- **UI history.** Frontends write UI history objects (`ui-data.md` 5.2) with a credential limited to the history prefix (or a separate bucket), never one that reads or writes `cas/`, so isolated-storage mode still keeps CAS credentials on storage nodes only. The proof is at the credential layer: a test against MinIO shows that an object-store client built from the frontend's configured history credential is refused a GET and a PUT of a `cas/` key, and goes red with the cold-store credential. The history writer's prefix-scoped store also refuses a `cas/` key, as defence in depth, not as the proof.
 
 ## 10. Locality
 
@@ -155,13 +156,13 @@ Operations; a queue indexed by platform, size class and QoS (a claim never scans
 - **Store unavailable:** no new claims; running actions continue; grace on recovery; a failover bumps the epoch.
 - **Daemon partitions past expiry:** duplicate run, result fenced, outputs idempotent.
 - **Storage node dies:** reads from the replica, one-copy writes with a durable repair record, drop from the map after the dwell. Both owners of an unflushed blob lost: loss mark, AC miss, rerun.
-- **Cold store down:** flush backs off, hot tier absorbs, then writes refuse (`cluster.md` 4.4).
+- **Cold store down:** flush backs off, hot tier absorbs, then writes refuse (`cluster.md` 4.4). UI history buffers within its memory bounds, then drops and counts; builds are unaffected (`ui-data.md` 5.2).
 - **Client box dies (v1):** the whole control plane is down; accepted.
 
 ## 13. Phased plan (each PR lands a test that fails first)
 
 - **P0** This document; `cluster.md` marked superseded.
-- **P1 `kbf-state`.** Trait, fake, SQLite backend, suite C1 to C7; scheduler writes through it. Gate: the store-commits benchmark (group commit at 1500 writes/s, commit latency within the C7 bound) passes before P1 merges. Red: non-linearizable fake fails C1; caller-clock expiry fails C4; restart replays acknowledged claims; stale `complete` rejected; a second frontend on the same SQLite file refuses to start; `--state-store` is rejected when neither scheme matches, or when several frontends are configured with SQLite.
+- **P1 `kbf-state`.** Trait, fake, SQLite backend, suite C1 to C7; scheduler writes through it. Gate: the store-commits benchmark (group commit at 1500 writes/s, commit latency within the C7 bound) passes before P1 merges. Red: non-linearizable fake fails C1; caller-clock expiry fails C4; restart replays acknowledged claims; stale `complete` rejected; a second frontend on the same SQLite file refuses to start; `--state-store` is rejected when no compiled-in backend claims its scheme, or when several frontends are configured with SQLite. The store-commits gate runs with a synthetic background load (about 80 rows/s in background transactions of at most 256 rows, plus a 512 rows/s phase standing in for the UI's day-close fold, `ui-data.md` 5.2) beside the 1500 foreground writes/s, and asserts that the background rows were applied at the offered rate (C7); `ui-data.md` U3 reruns it with the real history writer.
 - **P2 `kbf-storage`.** Cut `cache/*` out; `storage` mode; one-member map; `storage-and-daemon` with the in-process `Cas`. Red: the REAPI conformance suite passes through a separate storage process; on `storage-and-daemon`, an input fetched by the daemon is stored once on disk, not twice (the one-cache rule).
 - **P3 Membership and map.** Register, heartbeat, `Welcome.map`, `MapUpdate`, rendezvous, dwell, `STALE_MAP`. Red: removing a member remaps only its blobs; TTL expiry on a fake clock.
 - **P4 Sharding, R=1.** Router, per-owner Segments. Red: a blob exists only on its owner.
@@ -170,9 +171,9 @@ Operations; a queue indexed by platform, size class and QoS (a claim never scans
 - **P7 Security.** Storage-side identity, grants, uid separation, isolated-mode test.
 - **P8 Cutover.** New frontend and storage run against the same MinIO while the old server serves; storage rebuilds its index; daemons flip by pointing `--server` at the frontend name; rollback is flipping back (cold store append-only, new keys carry node ids).
 - **P9 Several frontends.** Batch pull-claim, `session_gen`, grace, poison cap, `WaitExecution` from a second frontend. Red: two claimers, one winner; a result committed on B reaches a waiter on A. Fake clock and deterministic interleaver. P9 runs against the fake store only; the real two-frontend Postgres test is in P10.
-- **P10** Postgres backend passing P1's suite, including the C5 interleaved-commit test; a real two-frontend test on Postgres (two claimers, one winner; a result committed on B reaches a waiter on A); mixed-version tests; UI.
+- **P10** Postgres backend passing P1's suite, including the C5 interleaved-commit test; a real two-frontend test on Postgres (two claimers, one winner; a result committed on B reaches a waiter on A); mixed-version tests; the UI pages (built after `ui-data.md` U3 on the single frontend) proved against Postgres and two frontends.
 
-Before P1 merges, benchmark store commits per second with group commit at 1500 writes/s. Before P4 and P5, benchmark on the farm (none run yet): no-op action latency p50/p99, proxy MB/s at R=1 and R=2 on the 1 GbE box, AC lookup latency, PUT bytes with one flusher versus two.
+Before P1 merges, benchmark store commits per second with group commit at 1500 writes/s, with P1's synthetic background load. Before P4 and P5, benchmark on the farm (none run yet): no-op action latency p50/p99, proxy MB/s at R=1 and R=2 on the 1 GbE box, AC lookup latency, PUT bytes with one flusher versus two.
 
 ## 14. Existing documents and PRs
 
@@ -186,7 +187,7 @@ Before P1 merges, benchmark store commits per second with group commit at 1500 w
 
 All decided by the owner; nothing is open.
 
-1. **State store.** Exactly two backends, SQLite and Postgres, chosen by `--state-store=sqlite:///path` or `--state-store=postgres://...`. `all-in-one` always uses SQLite (a file beside its data). A single `frontend` (for example on one client box) uses SQLite, or Postgres if the operator prefers. Several frontends behind a load balancer require Postgres. A frontend on SQLite takes an exclusive lock on the file; a second frontend on the same file refuses to start. There is no built-in replicated store, no Raft, no etcd backend and no Redis, and no `state` mode.
+1. **State store.** An interface: a backend is any implementation of the `kbf-state` trait that passes the conformance suite (4.1); SQLite and Postgres are built first, chosen by `--state-store=sqlite:///path` or `--state-store=postgres://...` (amended by the owner, 2026-10-16). `all-in-one` always uses SQLite (a file beside its data). A single `frontend` (for example on one client box) uses SQLite, or Postgres if the operator prefers. Several frontends behind a load balancer require Postgres. A frontend on SQLite takes an exclusive lock on the file; a second frontend on the same file refuses to start. There is no built-in replicated store of kbf's own, no Raft, and no `state` mode; etcd, Redis or a cloud service would be a backend only by passing the suite.
 2. **Execution semantics.** At-least-once execution with fenced results.
 3. **Write durability.** Acknowledge when both copies exist, by chain replication over the fast fabric; degrade to one copy only with a durable repair record.
 4. **The six Broadwell nodes.** Separate uids for storage and actions on `storage-and-daemon` nodes, with a test that an action cannot read the cold-store credential; trusted-network mode otherwise.
@@ -203,7 +204,7 @@ All decided by the owner; nothing is open.
 - **Storage nodes reading the store:** wider attack surface; the frontend pushes the map.
 - **Per-lease heartbeats and per-daemon queue scans:** store write and read cliffs; per-session renewal, indexed partitions, batch claims.
 - **`LISTEN/NOTIFY` as the feed:** not queued for disconnected listeners, not delivered through transaction-mode poolers, and it serializes commits; polling baseline.
-- **Redis, etcd, a built-in Raft store for leases:** not offered; SQLite and Postgres only.
+- **A built-in Raft store for leases:** not offered. Redis, etcd or a cloud key-value or database service only as a `kbf-state` backend that passes the suite (4.1).
 - **Any-owner AC hit with W=1 and no loss marks:** unbounded missing-output risk; write ordering and loss marks added.
 - **Certificate alone admits a hash owner:** `joining` and `catching-up` states added.
 - **Lease-id fencing alone:** enough for one frontend only; `session_gen` in P9.
