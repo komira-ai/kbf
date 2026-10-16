@@ -3,7 +3,7 @@
 How bytes get from an upload into the store, and what an acknowledgement promises.
 Today's path is in [storage.md](storage.md#writes). Built: **write grouping**
 (section 3: concurrent small REAPI uploads share one segment, PUT and metadata commit;
-`kbf-front/src/cache/write_group.rs`) and the **local write tier** (section 6: segments
+`kbf-storage/src/cache/write_group.rs`) and the **local write tier** (section 6: segments
 synced to a server's NVMe or SSD, acknowledged, and flushed to the object store in the
 background; section 6.7 says how it was built and where it differs). **Planned**:
 **segment upload** (the daemon sends an action's outputs as whole segments over the
@@ -22,7 +22,7 @@ What the code does with that output today:
 - Each `Write` buffers the whole blob, verifies it, and calls `Cache::store_blobs`
   with one blob (`kbf-front/src/bytestream.rs`). `BatchUpdateBlobs` calls it once per
   request (`kbf-front/src/cas.rs`).
-- `store_blobs` (`kbf-front/src/cache.rs`) packs only **its own call's** blobs into
+- `store_blobs` (`kbf-storage/src/cache.rs`) packs only **its own call's** blobs into
   segments, so each file is a segment: one `put_new`, two `get_range` calls to read the
   trailer and footer back (`read_footer`), one `Command::PutBlobs`. Under
   the Raft metadata log commits are proposed, synced and applied one at a time under the
@@ -212,7 +212,7 @@ admission rules ([worker-protocol.md](worker-protocol.md#blobs-on-the-worker-lis
 
 **Built (rollout stage 2), direct path only.** The service is
 `kbf.worker.v1.Segments` (`crates/kbf-proto/proto/kbf/worker/v1/segments.proto`,
-served by `crates/kbf-front/src/segments.rs`); the daemon's side is `Record` and
+served by `crates/kbf-storage/src/segments.rs`); the daemon's side is `Record` and
 `Cas::put_records` in `kbf-transfer` (`source.rs`, `segments.rs`). The container driver
 hashes each output file once and sends the records from the files where they are; the
 native driver gathers its outputs in a `Spool` first (`Cas::put_spool`, which is
@@ -378,7 +378,7 @@ that call and the daemon falls back to per-blob reads.
   calls by it or by its own setting is to be checked on the pilot.
 - **zstd.** Advertise `supported_compressors` and `supported_batch_update_compressors`
   = `[ZSTD]`, and serve `compressed-blobs/zstd/...` on ByteStream (refused today in
-  `kbf-front/src/wire.rs`), in the same change that decodes it, since a client that
+  `kbf-storage/src/wire.rs`), in the same change that decodes it, since a client that
   sees it will send it. Stored bytes stay uncompressed; compression is wire-only.
 
 ## 6. The local write tier
@@ -420,7 +420,7 @@ offset in the block is its offset in the object the block becomes (Buildbarn's
    renames the file to `<epoch>-<seq>.seg` and syncs the directory: a flushed copy.
 5. **Reads.** The location answer carries the staged state from the same metadata
    query: `BlobAnswer::Present { location, staged_on }`. A staged blob is read from its
-   block. `Cache::fetch` (`kbf-front/src/cache.rs`) and the batch read fallback must
+   block. `Cache::fetch` (`kbf-storage/src/cache.rs`) and the batch read fallback must
    never commit `ObjectUnreachable { Missing }` for an object that was staged when the
    query ran; a local read that fails with ENOENT **after** `ObjectFlushed` falls back
    to the store. A flushed object may still be read locally from its `.seg` file.

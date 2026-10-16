@@ -29,12 +29,13 @@ use tonic::{Request, Response, Status, Streaming};
 
 use kbf_invocation::CallKind;
 
-use crate::cache::{Cache, VerifiedBlob};
-use crate::meta_log::MetaLog;
 use crate::recorder::Recorder;
 use crate::request_metadata::call_metadata;
-use crate::wire::Resource;
-use crate::{MAX_UNSTAGED_BLOB_BYTES, READ_CHUNK_BYTES, wire};
+use crate::{MAX_UNSTAGED_BLOB_BYTES, READ_CHUNK_BYTES};
+use kbf_storage::MetaLog;
+use kbf_storage::wire;
+use kbf_storage::wire::Resource;
+use kbf_storage::{Cache, VerifiedBlob};
 
 /// The `ByteStream` service over a [`Cache`]. Read is authorized by
 /// [`Authorizers::cas_get`], Write and QueryWriteStatus by [`Authorizers::cas_put`],

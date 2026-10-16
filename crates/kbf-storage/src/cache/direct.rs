@@ -35,7 +35,7 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
     /// # Errors
     /// [`CacheError::DigestMismatch`] if the bytes do not hash to `digest` (or are not
     /// as many): nothing is stored. The body's own error, or the store's or the log's.
-    pub(crate) async fn store_streamed(
+    pub async fn store_streamed(
         &self,
         digest: Digest,
         bytes: BodyStream,

@@ -235,7 +235,7 @@ impl<M: MetaLog, O: ObjectStore + 'static> Cache<M, O> {
     /// [`CacheError::DigestMismatch`] if the bytes do not hash to `digest`; the body's
     /// own error; more bytes than the stream was made for, or the tier failed. Nothing
     /// is stored then: the stream is dropped, its range answered as failed.
-    pub(crate) async fn stage_streamed(
+    pub async fn stage_streamed(
         &self,
         digest: Digest,
         stream: RecordStream<M, O>,

@@ -241,14 +241,14 @@ impl Group {
 /// Bytes a ByteStream `Write` holds while it receives a blob, counted toward
 /// [`Cache::write_buffer_peak`] until dropped.
 #[derive(Debug)]
-pub(crate) struct Buffering<'a> {
+pub struct Buffering<'a> {
     group: &'a Group,
     held: u64,
 }
 
 impl Buffering<'_> {
     /// Counts `n` more bytes held.
-    pub(crate) fn add(&mut self, n: u64) {
+    pub fn add(&mut self, n: u64) {
         self.held += n;
         let now = self.group.buffered.fetch_add(n, Ordering::Relaxed) + n;
         self.group.buffered_peak.fetch_max(now, Ordering::Relaxed);
@@ -367,7 +367,7 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
     }
 
     /// A gauge of the bytes one ByteStream `Write` buffers.
-    pub(crate) fn buffering(&self) -> Buffering<'_> {
+    pub fn buffering(&self) -> Buffering<'_> {
         Buffering {
             group: &self.group,
             held: 0,

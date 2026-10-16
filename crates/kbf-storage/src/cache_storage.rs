@@ -1,4 +1,4 @@
-//! [`CacheStorage`]: the cache as a [`kbf_storage::Storage`], the boundary its callers
+//! [`CacheStorage`]: the cache as a [`Storage`], the boundary its callers
 //! go through. A thin adapter: each call is the cache's own, unchanged; only the error
 //! is converted ([`StorageError`] from [`CacheError`], answering the same gRPC code and
 //! message).
@@ -13,14 +13,12 @@ use kbf_meta::{ActionRecord, Role};
 use kbf_objstore::{ObjectStore, ObjectStoreError};
 use kbf_proto::reapi::ActionResult;
 use kbf_proto::worker::segments_server::Segments;
-use kbf_storage::{
-    Answer, PutStream, READ_CHUNK_BYTES, ReadStream, Storage, StorageError, StreamedPut,
-};
 use kbf_types::Digest;
 
 use crate::cache::{Cache, CacheError, RecordStream, StreamedRecord, VerifiedBlob};
 use crate::meta_log::MetaLog;
 use crate::segments::{Connections, SegmentsConfig, SegmentsService};
+use crate::{Answer, PutStream, READ_CHUNK_BYTES, ReadStream, Storage, StorageError, StreamedPut};
 
 /// A cache, and the `--segment-upload-*` limits its `Segments` services keep, as a
 /// [`Storage`].
