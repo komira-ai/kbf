@@ -168,6 +168,15 @@ impl Storage for Fake {
         None
     }
 
+    fn put_streamed(
+        &self,
+        _size: u64,
+        _bytes: futures::stream::BoxStream<'static, std::io::Result<Bytes>>,
+        _claim: BoxFuture<'static, Option<Digest>>,
+    ) -> Answer<'_, Option<Digest>> {
+        Box::pin(async { Err(StorageError::Internal("not used".to_owned())) })
+    }
+
     fn segments(&self) -> Arc<dyn Segments> {
         Arc::new(NoSegments)
     }

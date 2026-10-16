@@ -234,13 +234,13 @@ async fn a_collecting_proxy_exceeds_the_bound() {
 // ---------------------------------------------------------------------------------
 // No size cap.
 
-/// Catches: a size cap anywhere on the pass-through (the cache's `MAX_BLOB_BYTES`, 1 GiB,
-/// refusing the blob), a proxy that sizes a buffer by the declared size, and memory that
+/// Catches: a size cap anywhere on the pass-through (such as the cache's former
+/// `MAX_BLOB_BYTES`, 1 GiB, refusing the blob), a proxy that sizes a buffer by the declared size, and memory that
 /// grows with the blob: a blob one byte over the old cap crosses in both directions in
 /// bounded memory, and one that declares 16 GiB while sending 3 MiB allocates nothing.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_proxy_imposes_no_size_cap() {
-    const OVER: u64 = kbf_front::MAX_BLOB_BYTES + 1;
+    const OVER: u64 = (1 << 30) + 1;
     let fake = Fake::new(false);
     let f = front(vec![owner("a", node(&fake).await)], allow(), None).await;
     let chunks = (OVER.div_ceil(CHUNK as u64)) as usize;
