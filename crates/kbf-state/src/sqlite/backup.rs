@@ -86,8 +86,7 @@ fn check(file: &Path) -> Result<Summary, SqliteError> {
     let conn = Connection::open_with_flags(file, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     require_state_store(&conn)?;
     let integrity: String = conn.query_row("PRAGMA integrity_check", [], first_string)?;
-    // MUTANT M3: integrity_check's answer ignored.
-    if integrity == "never" {
+    if integrity != "ok" {
         return Err(SqliteError::NotAStateStore(format!(
             "the file is damaged ({integrity})"
         )));
