@@ -110,6 +110,39 @@ fn the_all_in_one_state_store_seam_is_a_value_kbf_takes() {
     }
 }
 
+/// A certificate `kbf-deploy linux issue-cert` makes names its role the way a storage
+/// node reads it (kbf-storage's `role_of`, the admission of every gRPC call), for each
+/// role it issues. Catches the two spellings drifting apart (the provisional
+/// `urn:kbf:role:` prefix changed on one side only, a role name spelled otherwise), and a
+/// certificate naming no role or two.
+#[test]
+fn an_issued_certificate_names_its_role_as_storage_reads_it() {
+    use kbf_deploy::linux::issue_cert::{ROLE_URI_PREFIX, Role, issue};
+    use kbf_storage::service::{PeerRole, role_of};
+
+    assert_eq!(ROLE_URI_PREFIX, kbf_storage::service::ROLE_URI_PREFIX);
+    let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).expect("params");
+    params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    let ca_key = rcgen::KeyPair::generate().expect("key");
+    let ca = params.self_signed(&ca_key).expect("CA");
+    for (role, peer) in [
+        (Role::Frontend, PeerRole::Frontend),
+        (Role::Storage, PeerRole::Storage),
+    ] {
+        let issued = issue(
+            &ca.pem(),
+            &ca_key.serialize_pem(),
+            role,
+            &["node-1.farm.example".to_owned()],
+            &[],
+            std::time::SystemTime::now(),
+            30,
+        )
+        .expect("issued");
+        assert_eq!(role_of(&issued.cert_der).expect("a role"), peer, "{role:?}");
+    }
+}
+
 /// Catches kbf-deploy rendering a mode kbf does not have (a sixth, or an old name),
 /// missing one kbf has, listing them in another order than `kbf --help`, and saying a
 /// mode is built (its unit's flags checked) when kbf has no command line for it, or

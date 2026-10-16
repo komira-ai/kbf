@@ -280,6 +280,46 @@ fn the_linux_host_verbs_exit_0_done_1_failed_2_refused() {
         assert!(exec.queries.borrow().is_empty(), "{args:?} asked the host");
     }
 
+    // A mode's unit: a mode not built yet is refused before any step; the converged
+    // units' MinIO restart and rollback are not a mode's.
+    let mut exec = FakeExec::new(0);
+    let args = [base("install-units"), vec!["--mode", "frontend"]].concat();
+    let (code, _, err) = cli(&mut exec, &no_env, &args);
+    assert_eq!(code, ExitCode::from(2));
+    assert!(
+        err.starts_with("REFUSED: kbf frontend is not built yet"),
+        "{err}"
+    );
+    for flag in ["--restart-minio", "--uninstall"] {
+        let mut exec = FakeExec::new(0);
+        let args = [base("install-units"), vec!["--mode", "storage", flag]].concat();
+        let (code, _, _) = cli(&mut exec, &no_env, &args);
+        assert_eq!(code, ExitCode::from(2), "{args:?}");
+        assert!(exec.queries.borrow().is_empty(), "{args:?} asked the host");
+    }
+    // issue-cert reaches its kit: a CA that is not there is refused.
+    let mut exec = FakeExec::new(0);
+    let args = [
+        "linux",
+        "issue-cert",
+        "--role",
+        "storage",
+        "--name",
+        "storage-1",
+        "--ca-cert",
+        "/srv/none/ca.pem",
+        "--ca-key",
+        "/srv/none/ca.key",
+        "--out",
+        "/srv/none",
+    ];
+    let (code, _, err) = cli(&mut exec, &no_env, &args);
+    assert_eq!(code, ExitCode::from(2));
+    assert!(
+        err.starts_with("REFUSED: cannot read /srv/none/ca.pem"),
+        "{err}"
+    );
+
     // A rollback of a host whose services are on: a dry run plans, exits 0.
     let mut exec = FakeExec::new(501);
     let (code, out, _) = cli(

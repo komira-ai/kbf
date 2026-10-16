@@ -41,6 +41,8 @@ kbf-host.workspace = true
 kbf-mdm.workspace = true
 kbf-types.workspace = true
 plist.workspace = true
+# `linux issue-cert`: a node's certificate, signed by the farm CA read from its PEM.
+rcgen = { workspace = true, features = ["x509-parser"] }
 rustls.workspace = true
 rustls-native-certs.workspace = true
 serde.workspace = true

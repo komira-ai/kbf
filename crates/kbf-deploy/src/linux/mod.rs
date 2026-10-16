@@ -28,6 +28,8 @@
 //! - `kbf-deploy linux install-units --config FILE [--bin-dir DIR] [--restart-minio]
 //!   [--uninstall] [--apply]` ([`install`]): the binaries, the four units, the Raft and
 //!   scratch directories, and the services started.
+//!   With `--mode MODE` ([`install_mode`]): `kbf` (with `--bin-dir`), `kbf.slice` and
+//!   one built mode's unit, the directories its flags name, and the unit started.
 //! - `kbf-deploy linux image-pull --config FILE [--image REF]... [--platform OS/ARCH]
 //!   [--apply]` ([`images`]): the pinned images in the kbf user's Podman store, pulled
 //!   as that user.
@@ -37,6 +39,10 @@
 //! `kbf-deploy linux meta-backup --meta-dir DIR [--hot-dir DIR] --out FILE [--apply]`
 //! copies kbf-server's metadata log into one archive in a brief stop (as root), and
 //! `linux meta-verify --archive FILE --into DIR` extracts and checks one ([`meta`]).
+//!
+//! `kbf-deploy linux issue-cert --role ROLE --name DNS... [--ip IP]... --ca-cert FILE
+//! --ca-key FILE --out DIR [--days N] [--apply]` ([`issue_cert`]) makes a node's role
+//! certificate for the new modes' mutual TLS, signed by the farm's CA.
 //!
 //! The settings are a closed set of `KEY=VALUE` lines ([`config::KEYS`],
 //! `templates/linux/config.example`).
@@ -49,6 +55,8 @@ mod glob;
 pub mod host;
 pub mod images;
 pub mod install;
+pub mod install_mode;
+pub mod issue_cert;
 pub mod meta;
 pub mod modes;
 pub mod render;

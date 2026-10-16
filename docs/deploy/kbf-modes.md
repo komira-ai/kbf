@@ -183,6 +183,64 @@ flag (`--state-store=sqlite://<KBF_DATA_DIR>/state.db`) is a `TODO:` in the temp
 `kbf all-in-one` takes the flag, but a start with it is refused until a state store
 backend is built in.
 
+## A node's certificate
+
+`kbf-deploy linux issue-cert` makes a node's certificate for the new modes' mutual TLS,
+signed by the farm's CA, on the machine that holds the CA's key:
+
+```text
+kbf-deploy linux issue-cert --role storage --name storage-1.farm.example --ip 192.0.2.10 \
+    --ca-cert ca.pem --ca-key ca.key --out certs/storage-1
+kbf-deploy linux issue-cert ... --apply
+```
+
+- The subjectAltName holds each `--name` (DNS) and `--ip`, and the role as the URI
+  `urn:kbf:role:<role>` (`frontend` or `storage`), which a storage node reads to admit
+  each call (architecture-v2.md, section 9). That spelling is provisional until role
+  certificates are settled; a kbf-cli test reads every role this verb issues back with
+  the storage node's own check.
+- A fresh ECDSA P-256 key; extended key usage serverAuth and clientAuth; valid from five
+  minutes ago for `--days` (365 by default, at most 825).
+- Before it prints anything, it checks the certificate as a TLS client would: it chains
+  to `--ca-cert` under every name, and the key is its own. A `--ca-key` that is not the
+  CA certificate's key is refused there. The CA key must be PKCS#8 PEM
+  (`openssl pkcs8 -topk8 -nocrypt` converts one).
+- Without `--apply` it writes nothing and prints the two `DRY-RUN: write` lines. With
+  it, it writes `<out>/<role>.pem` (0644) and `<out>/<role>.key` (0600, made with that
+  mode), and refuses to replace either.
+
+Copy the two files to the node's `KBF_ETC` (the storage unit reads `storage.pem` and
+`storage.key`), the key owned by the unit's user. The frontend's certificate is issued
+the same way; `kbf frontend` takes no certificate flags yet. Its `--name` is the
+frontend's DNS name, which the nodes will reach it by once they register with it.
+
+## Installing a mode's unit
+
+`kbf-deploy linux install-units --config node.conf --mode MODE [--bin-dir DIR]
+[--apply]` installs one built mode's unit on the node, as root:
+
+1. It checks the host, read only: the mode is built (`frontend` and
+   `storage-and-daemon` are refused: their units would exit 2 at start); the unit's
+   `User=` exists and is not root; for a mode that runs builds, the kbf user has subuid
+   and subgid ranges and lingers; `kbf` is an executable in `--bin-dir` (or
+   `KBF_BIN_DIR`); the rendered unit passes `check-units --mode MODE --installable` on
+   this host, its flags parsed by that `kbf`; every `EnvironmentFile=` is there; and
+   each file a key or token flag names (`--key`, `--*-key`, `--*token-file`) is the
+   unit's user's with no group or other bit, and each certificate, CA or deny list flag
+   names a file.
+2. It plans, each step only when the host differs: the new `kbf` (with `--bin-dir`; the
+   old one kept as `kbf.previous`), `kbf.slice` and `kbf-<mode>.service` (0644, root's),
+   the directories the unit's flags name (the unit's user's: `--data-dir` 0755,
+   `--meta-dir` and a `file://` hot or cold store 0700), then `daemon-reload`, enable
+   and restart; with nothing changed, enable and start only if the unit is not. A unit
+   with `--api-listen=127.0.0.1:<port>` (all-in-one) is waited for on `/readyz`.
+3. Without `--apply` every step is printed as a `DRY-RUN:` line and nothing is written,
+   reloaded or started.
+
+There is no `--uninstall` for a mode's unit yet. A node moving from the converged units
+(`kbf-server.service`) to `kbf-storage.service` stops the old ones first
+(`install-units --uninstall`): both would hold the same directories.
+
 ## Upgrade kbf before kbf-deploy
 
 Rule `parse` runs `<kbf> check-args <mode> <flags...>`. A `kbf` older than
