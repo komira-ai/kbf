@@ -88,6 +88,60 @@ async fn objects_survive_a_reopen_and_torn_writes_do_not() {
     std::fs::remove_dir_all(&dir).expect("remove");
 }
 
+/// Catches a paged listing of a directory that loses, repeats or misorders keys across
+/// pages (pages of 2 over 9 keys), lists a key outside the prefix, or lists a file that
+/// is not an object: a write in flight in `tmp/` (even one with a whole header) or a
+/// foreign file in a shard directory.
+#[tokio::test]
+async fn a_paged_listing_is_the_written_key_set_and_nothing_else() {
+    let dir = scratch("paged");
+    let store = FsStore::open(&dir, FLOOR).expect("open");
+    let mut want = Vec::new();
+    for i in [5, 0, 8, 3, 1, 7, 2, 6, 4] {
+        let k = key(&format!("cas/{i:02}"));
+        store
+            .put_new(&k, Bytes::from(vec![b'x'; i + 1]), None)
+            .await
+            .expect("put");
+        want.push((k.as_str().to_owned(), i as u64 + 1));
+    }
+    want.sort();
+    store
+        .put_new(&key("other/00"), Bytes::from_static(b"o"), None)
+        .await
+        .expect("put");
+    let in_flight = [b"kbf-obj1\0\x06cas/99".as_slice(), b"body"].concat();
+    std::fs::write(dir.join("tmp").join("7"), in_flight).expect("plant tmp");
+    std::fs::write(
+        dir.join("objects").join("00").join("stray"),
+        b"not an object",
+    )
+    .expect("plant a foreign file");
+
+    let cas = KeyPrefix::new("cas/").expect("prefix");
+    let mut got = Vec::new();
+    let mut after = None;
+    loop {
+        let page = store
+            .list(&cas, after.as_ref(), PageSize::new(2).expect("size"))
+            .await
+            .expect("list");
+        assert!(page.objects.len() <= 2, "{page:?}");
+        got.extend(
+            page.objects
+                .into_iter()
+                .map(|o| (o.key.as_str().to_owned(), o.size)),
+        );
+        match page.next {
+            Some(t) => after = Some(t),
+            None => break,
+        }
+    }
+    assert_eq!(got, want);
+    drop(store);
+    std::fs::remove_dir_all(&dir).expect("remove");
+}
+
 /// Catches two stores sharing one directory: the second would empty `tmp/` under the
 /// first's writes. The open is refused, naming the lock file, until the first store is
 /// dropped.
