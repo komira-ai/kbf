@@ -452,8 +452,9 @@ fn two_names_made_at_one_instant_differ() {
     assert_ne!(unique_at("m2", 7), unique_at("m2", 7));
 }
 
-/// Catches: cells made at once by parallel tests that share a bus, and a cell that
-/// leaves its runtime directory and bus behind when it is dropped.
+/// Catches: cells made at once by parallel tests that share a bus, a cell that names
+/// its runtime directory from the pid and the clock alone (not through [`unique`]),
+/// and a cell that leaves its runtime directory and bus behind when it is dropped.
 #[test]
 fn cells_made_at_once_have_their_own_bus_and_remove_it() {
     const CELLS: usize = 16;
@@ -474,6 +475,18 @@ fn cells_made_at_once_have_their_own_bus_and_remove_it() {
     let runtimes: std::collections::BTreeSet<PathBuf> =
         cells.iter().map(|c| c.runtime.clone()).collect();
     assert_eq!(runtimes.len(), CELLS, "{runtimes:?}");
+    // Without the clock reading the names must still differ: a cell that names its
+    // runtime directory from the pid and the clock alone passes the check above on a
+    // fine clock, but not this one, on any clock.
+    let unclocked: std::collections::BTreeSet<String> = runtimes
+        .iter()
+        .map(|runtime| {
+            let name = runtime.file_name().expect("a name").to_string_lossy();
+            let (rest, _nanos) = name.rsplit_once('-').expect("a clock reading");
+            rest.to_owned()
+        })
+        .collect();
+    assert_eq!(unclocked.len(), CELLS, "{unclocked:?}");
     drop(cells);
     for runtime in &runtimes {
         assert!(!runtime.exists(), "left behind: {}", runtime.display());
