@@ -19,12 +19,18 @@ use tokio::sync::watch;
 pub(crate) struct MapLink {
     holder: Arc<MapHolder>,
     asks: watch::Receiver<u64>,
+    /// The generation last asked for on this stream; 0 before any.
+    sent: u64,
 }
 
 impl MapLink {
     pub(crate) fn new(holder: Arc<MapHolder>) -> Self {
         let asks = holder.asks();
-        Self { holder, asks }
+        Self {
+            holder,
+            asks,
+            sent: 0,
+        }
     }
 
     /// Takes the map a `Welcome` or a `MapUpdate` carried. A holder keeps the newest, so
@@ -43,11 +49,21 @@ impl MapLink {
         }
     }
 
-    /// The request to send now, if the holder waits for a generation it does not have.
-    /// Marks the wait seen, so [`Self::asked`] completes again only for a new one.
+    /// A new stream: what the holder waits for is asked for again on it.
+    pub(crate) fn new_stream(&mut self) {
+        self.sent = 0;
+    }
+
+    /// The request to send now, if the holder waits for a generation it does not have and
+    /// this stream has not asked for it. Marks the wait seen, so [`Self::asked`]
+    /// completes again only for a new one.
     pub(crate) fn request(&mut self) -> Option<MapRequest> {
         let at_least = *self.asks.borrow_and_update();
-        (at_least > self.holder.generation()).then_some(MapRequest { at_least })
+        let wanted = at_least > self.holder.generation() && at_least > self.sent;
+        wanted.then(|| {
+            self.sent = at_least;
+            MapRequest { at_least }
+        })
     }
 
     /// Completes when the holder is asked to reach a generation it was not before.

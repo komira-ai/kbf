@@ -90,6 +90,13 @@ impl MapHolder {
     /// `holder.follow(move |g| storage.set_map_generation(g))`. A burst of maps is one
     /// call with the last generation.
     pub fn follow(&self, apply: impl Fn(u64) + Send + 'static) -> JoinHandle<()> {
+        self.follow_boxed(Box::new(apply))
+    }
+
+    /// The body of [`MapHolder::follow`], not generic in the closure: the coverage tool
+    /// counts a generic function once per instantiation, and no one test closure
+    /// reaches both its branches.
+    fn follow_boxed(&self, apply: Box<dyn Fn(u64) + Send>) -> JoinHandle<()> {
         let mut changes = self.generation.subscribe();
         let first = *changes.borrow_and_update();
         if first > 0 {
