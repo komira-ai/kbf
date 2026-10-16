@@ -1,6 +1,7 @@
 //! Where a write goes under a map, without a network: the placement table.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use kbf_map::{MemberId, MemberState};
 use kbf_types::Digest;
@@ -108,8 +109,16 @@ async fn a_node_with_no_map_has_no_view() {
         Arc::clone(&farm.nodes[0].repairs),
         ChainConfig::default(),
     );
-    assert!(none.view(0).expect("no judgement").is_none());
-    assert!(farm.nodes[0].chain.view(1).expect("current").is_some());
+    let wait = Duration::from_millis(10);
+    assert!(none.view(0, wait).await.expect("no judgement").is_none());
+    assert!(
+        farm.nodes[0]
+            .chain
+            .view(1, wait)
+            .await
+            .expect("current")
+            .is_some()
+    );
 }
 
 /// Catches a placement re-check that is too strict or too loose: under a newer map that
@@ -172,4 +181,41 @@ async fn the_next_owner_takes_a_write_whose_primary_is_down() {
         matches!(refused, Err(StorageError::Invalid(_))),
         "{refused:?}"
     );
+}
+
+/// A node that holds a map but has not been told which member it is.
+struct Unregistered(Arc<kbf_map::Map>);
+
+impl MapSource for Unregistered {
+    fn current(&self) -> Option<Arc<kbf_map::Map>> {
+        Some(Arc::clone(&self.0))
+    }
+
+    fn me(&self) -> Option<MemberId> {
+        None
+    }
+}
+
+/// Catches a node that does not know which member it is taking part in a chain: it cannot
+/// tell whether it is the primary, so a write is UNAVAILABLE (naming why) rather than
+/// served as a lone node, and it has no view to repair from either.
+#[tokio::test]
+async fn a_node_that_has_not_registered_cannot_take_part() {
+    let farm = Farm::start(2, ChainConfig::default()).await;
+    let source = Unregistered(farm.map(1, 2, &[]));
+    let chain = crate::replicate::Chain::new(
+        Arc::new(source),
+        crate::replicate::Peers::plain(),
+        Arc::clone(&farm.nodes[0].repairs),
+        ChainConfig::default(),
+    );
+    let answer = chain.view(1, Duration::from_millis(10)).await;
+    let Err(StorageError::Unavailable(why)) = answer else {
+        panic!("{answer:?}");
+    };
+    assert!(
+        why.to_string().contains("not been told its member id"),
+        "{why}"
+    );
+    assert!(chain.current().is_none());
 }

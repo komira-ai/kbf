@@ -28,7 +28,9 @@ fn record_of(record: Option<&Record>) -> Result<ActionRecord, Status> {
 impl ActionStore for StorageService {
     async fn get(&self, request: Request<GetRequest>) -> Result<Response<GetResponse>, Status> {
         self.admission.check(&request, Endpoint::ActionGet)?;
-        let action = wire::digest(request.into_inner().action.as_ref())?;
+        let request = request.into_inner();
+        self.check_map(request.map_generation).await?;
+        let action = wire::digest(request.action.as_ref())?;
         let entry = self.storage.action_result(&action).await?;
         Ok(Response::new(GetResponse {
             entry: entry.map(|(digest, result)| Entry {
@@ -43,8 +45,9 @@ impl ActionStore for StorageService {
         request: Request<PrepareRequest>,
     ) -> Result<Response<PrepareResponse>, Status> {
         self.admission.check(&request, Endpoint::ActionPrepare)?;
+        let request = request.into_inner();
+        self.check_map(request.map_generation).await?;
         let result = request
-            .into_inner()
             .result
             .ok_or_else(|| Status::invalid_argument("a result is required"))?;
         let outcome = match self.storage.prepare_action_result(&result).await {
@@ -68,6 +71,7 @@ impl ActionStore for StorageService {
     ) -> Result<Response<CommitResponse>, Status> {
         self.admission.check(&request, Endpoint::ActionCommit)?;
         let request = request.into_inner();
+        self.check_map(request.map_generation).await?;
         let role = match Writer::try_from(request.writer) {
             Ok(Writer::Daemon) => Role::Daemon,
             Ok(Writer::Client) => Role::Client,

@@ -15,7 +15,7 @@ use tonic::transport::Channel;
 
 use crate::Storage;
 use crate::repair::{Options, RepairLedger, RepairRecord, Repairs};
-use crate::replicate::{Chain, ChainConfig, MapSource, Peers, View};
+use crate::replicate::{Chain, ChainConfig, MapSource, Peers};
 use crate::service::tests::fake::{Mem, patterned, serve_routes, sha};
 use crate::service::{Admission, Config, RemoteStorage, StorageService};
 
@@ -96,12 +96,12 @@ impl NodeMap {
 }
 
 impl MapSource for NodeMap {
-    fn current(&self) -> Option<View> {
-        self.map
-            .lock()
-            .expect("lock")
-            .clone()
-            .map(|map| View { map, me: self.me })
+    fn current(&self) -> Option<Arc<Map>> {
+        self.map.lock().expect("lock").clone()
+    }
+
+    fn me(&self) -> Option<MemberId> {
+        Some(self.me)
     }
 }
 

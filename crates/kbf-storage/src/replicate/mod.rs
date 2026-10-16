@@ -15,13 +15,17 @@
 //!   try again: FAILED_PRECONDITION with the generation in the `kbf-map-generation`
 //!   trailer;
 //! - a caller ahead of the node (the node has not been told of the generation the caller
-//!   has) gets UNAVAILABLE: the caller's map may be the right one, and this node cannot
-//!   tell, so it neither serves the write nor claims the caller is stale. A lost push is
+//!   has) makes the node fetch it: [`MapSource::refetch`], waited for at most
+//!   [`REFETCH_WAIT`]. If the map arrives the call goes on under it (served if it is the
+//!   caller's generation, STALE_MAP if the node is now past it). If it does not, the call
+//!   gets UNAVAILABLE: the caller's map may be the right one, and this node cannot tell,
+//!   so it neither serves the call nor claims the caller is stale. A lost push is
 //!   harmless: the node learns of the map, and the same call then succeeds.
 //!
-//! The check runs before the write reads a byte or looks at what the node holds, so no
-//! answer to a stale caller, not even "already stored", is given under a placement the
-//! node no longer holds.
+//! The check runs on every call (the blob calls, the action-cache calls and the segment
+//! calls) before it reads a byte or looks at what the node holds, so no answer to a stale
+//! caller, not even "already stored", is given under a placement the node no longer
+//! holds.
 //!
 //! # The chain (R = 2)
 //!
@@ -80,7 +84,9 @@ mod peers;
 mod staging;
 
 use std::sync::Arc;
+use std::time::Duration;
 
+use futures::future::BoxFuture;
 use kbf_map::{Map, MemberId};
 
 pub(crate) use chain::Plan;
@@ -94,20 +100,41 @@ pub(crate) use staging::Staging;
 
 use crate::StorageError;
 
-/// The map a node holds, and which member of it the node is.
+/// The map a node holds and which member of it the node is, read together for one write.
 #[derive(Clone, Debug)]
 pub struct View {
-    /// The current map.
+    /// The map the write is judged by.
     pub map: Arc<Map>,
-    /// This node's member id, assigned by the state store at registration.
+    /// This node's member id.
     pub me: MemberId,
 }
 
 /// The map a node holds now.
 pub trait MapSource: Send + Sync {
-    /// The current view, or `None` before the node has one (a farm of one member).
-    fn current(&self) -> Option<View>;
+    /// The current map, or `None` before the node has one (a farm of one member).
+    fn current(&self) -> Option<Arc<Map>>;
+
+    /// This node's member id, assigned by the state store at registration: `None` before
+    /// the node has registered. Once known it does not change, so it is read apart from
+    /// the map. A node that does not know it can judge and serve reads, but cannot take
+    /// part in a chain (it cannot tell whether it is the primary).
+    fn me(&self) -> Option<MemberId>;
+
+    /// The map of generation `at_least` or a newer one, fetched from a frontend, or
+    /// `None` if the node cannot get one. Called when a caller routed by a generation the
+    /// node has not been told of; the caller of this method bounds the wait
+    /// ([`REFETCH_WAIT`]), so an implementation may wait for the next push or ask.
+    ///
+    /// The default is a node that learns its map only from pushes: it fetches nothing.
+    fn refetch(&self, at_least: u64) -> BoxFuture<'_, Option<Arc<Map>>> {
+        let _ = at_least;
+        Box::pin(async { None })
+    }
 }
+
+/// How long a call routed by a map this node has not been told of waits for the node to
+/// fetch it.
+pub const REFETCH_WAIT: Duration = Duration::from_secs(2);
 
 /// This node is at a map generation older than the one its caller routed by.
 #[derive(Debug, thiserror::Error)]
@@ -118,6 +145,35 @@ pub trait MapSource: Send + Sync {
 struct NotYetSeen {
     requested: u64,
     current: u64,
+}
+
+/// Whether a call routed by map generation `requested` may be served by the node `source`
+/// speaks for, and the map it is judged by: `None` for a node with no map yet, which serves
+/// every call. A caller ahead of the node makes it fetch the map, waiting at most `wait`.
+///
+/// # Errors
+/// [`StorageError::StaleMap`] if `requested` is older than the node's generation (0 is
+/// older than every map's); [`StorageError::Unavailable`] if it is newer and the node
+/// could not get that map in time.
+pub(crate) async fn check(
+    source: &dyn MapSource,
+    requested: u64,
+    wait: Duration,
+) -> Result<Option<Arc<Map>>, StorageError> {
+    let Some(held) = source.current() else {
+        return Ok(None);
+    };
+    let map = if requested <= held.generation() {
+        held
+    } else {
+        let fetched = tokio::time::timeout(wait, source.refetch(requested))
+            .await
+            .ok()
+            .flatten();
+        fetched.unwrap_or(held)
+    };
+    check_generation(&map, requested)?;
+    Ok(Some(map))
 }
 
 /// Whether a call routed by map generation `requested` may be served by a node holding

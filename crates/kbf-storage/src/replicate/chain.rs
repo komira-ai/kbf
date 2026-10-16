@@ -9,7 +9,7 @@ use kbf_types::Digest;
 
 use super::leg::ReplicaLeg;
 use super::peers::Peers;
-use super::{MapSource, View, check_generation};
+use super::{MapSource, View, check};
 use crate::StorageError;
 use crate::repair::{RepairRecord, Repairs};
 
@@ -55,6 +55,11 @@ struct TooFewOwners {
     r: usize,
 }
 
+/// The node holds a map but has not registered, so does not know which member it is.
+#[derive(Debug, thiserror::Error)]
+#[error("this node has not been told its member id (it has not registered)")]
+struct NotRegistered;
+
 /// A replica the map says is down, and so is not called.
 #[derive(Debug, thiserror::Error)]
 #[error("the replica {0} is down")]
@@ -87,18 +92,38 @@ impl Chain {
         }
     }
 
-    /// The map a write routed by generation `requested` is judged by: `None` for a node
-    /// with no map yet, which judges nothing.
+    /// The view this node holds now, if it has a map and knows which member it is.
+    pub(crate) fn current(&self) -> Option<View> {
+        let map = self.source.current()?;
+        let me = self.source.me()?;
+        Some(View { map, me })
+    }
+
+    /// The map source, for a service that judges its other calls by it too.
+    pub(crate) fn source(&self) -> Arc<dyn MapSource> {
+        Arc::clone(&self.source)
+    }
+
+    /// The map a write routed by generation `requested` is judged by, with this node's
+    /// member id: `None` for a node with no map yet, which judges nothing.
     ///
     /// # Errors
-    /// [`StorageError::StaleMap`] or [`StorageError::Unavailable`], as
-    /// [`crate::replicate`] says.
-    pub(crate) fn view(&self, requested: u64) -> Result<Option<View>, StorageError> {
-        let Some(view) = self.source.current() else {
+    /// [`StorageError::StaleMap`], or [`StorageError::Unavailable`] for a caller ahead of
+    /// the node, as [`crate::replicate`] says; [`StorageError::Unavailable`] if the node
+    /// holds a map but has not been told which member it is.
+    pub(crate) async fn view(
+        &self,
+        requested: u64,
+        refetch_wait: Duration,
+    ) -> Result<Option<View>, StorageError> {
+        let Some(map) = check(&*self.source, requested, refetch_wait).await? else {
             return Ok(None);
         };
-        check_generation(&view.map, requested)?;
-        Ok(Some(view))
+        let me = self
+            .source
+            .me()
+            .ok_or_else(|| StorageError::Unavailable(Arc::new(NotRegistered)))?;
+        Ok(Some(View { map, me }))
     }
 
     /// What this node does with a write of `digest` under `view`, `leg_from` being the
@@ -173,7 +198,7 @@ impl Chain {
         leg_from: Option<MemberId>,
         plan: &Plan,
     ) -> Result<(), StorageError> {
-        match self.source.current() {
+        match self.current() {
             Some(now) if now.map.generation() != view.map.generation() => {
                 match self.plan(&now, digest, leg_from) {
                     Ok(ref placed) if placed == plan => Ok(()),

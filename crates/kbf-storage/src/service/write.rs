@@ -22,11 +22,13 @@ impl StorageService {
     /// outside a chain, or with no map yet.
     ///
     /// # Errors
-    /// STALE_MAP, or UNAVAILABLE for a caller ahead of the node ([`crate::replicate`]).
-    pub(super) fn view(&self, requested: u64) -> Result<Option<View>, StorageError> {
+    /// STALE_MAP, or UNAVAILABLE for a caller ahead of a node that could not fetch the map
+    /// in time ([`crate::replicate`]); UNAVAILABLE for a node with a map that has not
+    /// registered and so does not know which member it is.
+    pub(super) async fn view(&self, requested: u64) -> Result<Option<View>, StorageError> {
         match &self.chain {
-            Some(chain) => chain.view(requested),
-            None => Ok(None),
+            Some(chain) => chain.view(requested, self.refetch_wait).await,
+            None => self.check_map(requested).await.map(|()| None),
         }
     }
 
