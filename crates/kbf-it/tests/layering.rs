@@ -27,13 +27,18 @@
 //!   removed, which would make that check pass vacuously;
 //! - a daemon crate (`DAEMON_ONLY`: `kbf-node`, the `kbf-daemon` binary's library, and
 //!   `kbf-daemon` beneath it) depending, directly or through another crate, on the object
-//!   store client, a crate that holds one, or the HTTP client it is written over
-//!   (`COLD_STORE_CLIENT`). A daemon-only node
-//!   holds no cold-store credential and reaches bytes only through storage
-//!   (docs/design/architecture-v2.md, section 9), so its binary must not be able to
-//!   construct an object-store client at all; and a walk that cannot see the client
-//!   (the client crate renamed, or the server no longer reaching it), which would make
-//!   that check pass vacuously.
+//!   store client, a crate that holds one, or a standalone HTTP client one could be
+//!   written over (`COLD_STORE_CLIENT`); and a walk that cannot see the client (the
+//!   client crate renamed, or the server no longer reaching it), which would make that
+//!   check pass vacuously. A daemon-only node holds no cold-store credential and reaches
+//!   bytes only through storage (docs/design/architecture-v2.md, section 9). What this
+//!   pins is the daemon's code: the daemon crates cannot name an object-store client, so
+//!   the separate `kbf-daemon` binary links none. It does not pin the binary a
+//!   daemon-only node runs. The deployed `kbf daemon` is the `kbf` binary (`kbf-cli`),
+//!   which links `kbf-server` and `kbf-objstore` for its other modes (`JOINERS`). For
+//!   that binary the protection is that it is given no credential: its unit loads no
+//!   environment file or systemd credential (kbf-deploy's `linux/modes_tests.rs`), and no
+//!   daemon flag names a store or reads an environment variable (kbf-cli's tests).
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::process::Command;
@@ -336,15 +341,18 @@ fn storage_reaches_no_frontend_crate() {
     );
 }
 
-/// The daemon crates: what a daemon-only node (`kbf daemon`, the `kbf-daemon` binary)
-/// links besides the drivers, which `kbf-node` names and so are in its closure.
+/// The daemon crates: the daemon's code, which the `kbf-daemon` binary is and which
+/// `kbf daemon` runs inside the `kbf` binary, with the drivers, which `kbf-node` names
+/// and so are in its closure.
 const DAEMON_ONLY: &[&str] = &["kbf-node", "kbf-daemon"];
 
 /// What a daemon crate's normal dependencies must not reach: the object store client
 /// (`kbf-objstore`, which signs S3 requests), the crates that hold the cold store behind
 /// their cache and build it from a cold-store URI (`kbf-front`, `kbf-server`), and the
-/// HTTP client an S3 client is written over.
-const COLD_STORE_CLIENT: &[&str] = &["kbf-objstore", "kbf-front", "kbf-server", "reqwest"];
+/// standalone HTTP clients an S3 client could be written over (`reqwest`, which
+/// `kbf-objstore` is written over, and `ureq`). `hyper-util` is not listed: tonic's
+/// channel, which the daemon dials the server with, is built on its client.
+const COLD_STORE_CLIENT: &[&str] = &["kbf-objstore", "kbf-front", "kbf-server", "reqwest", "ureq"];
 
 #[test]
 fn a_daemon_cannot_build_a_cold_store_client() {

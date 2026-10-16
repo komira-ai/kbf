@@ -267,20 +267,59 @@ fn no_mode_has_a_short_flag_or_an_alias() {
 /// sections 3.3, S2 to S4) through a flag only the daemon gained, which the refusal
 /// cannot see, or through the environment: clap's `env` feature, which a flag needs to
 /// read a variable, is off in the workspace. The daemon's only credentials are its node
-/// identity (`--ca-cert`, `--cert`, `--key`).
+/// identity (`--ca-cert`, `--cert`, `--key`). The words are the wire test's
+/// (kbf-proto's tests/daemon_wire.rs): a part (`store`) is matched anywhere in a flag, a
+/// short word (`sts`, `url`, `key`) only as a whole word between dashes, except in the
+/// reviewed flags of `REVIEWED_DAEMON_FLAGS`, each of which must still be a flag.
 #[test]
 fn the_daemon_takes_no_store_credential_or_environment_variable() {
+    /// Flags that hold a short word and were reviewed.
+    const REVIEWED_DAEMON_FLAGS: &[&str] = &[
+        // The node identity's private key.
+        "key",
+        // The socket `kbf-mac-session` serves: a macOS login session, not a cloud one.
+        "mac-session-socket",
+    ];
     let flags = longs(&kbf_node::Cli::command());
     for flag in &flags {
-        for word in [
-            "store", "token", "auth", "secret", "password", "aws", "s3", "bucket", "tls-cert",
+        for part in [
+            "store",
+            "cold",
+            "bucket",
+            "endpoint",
+            "credential",
+            "secret",
+            "access-key",
+            "password",
+            "region",
+            "presign",
+            "auth",
+            "tls-cert",
             "tls-key",
         ] {
-            assert!(!flag.contains(word), "--{flag} names {word}");
+            assert!(!flag.contains(part), "--{flag} names {part}");
+        }
+        if REVIEWED_DAEMON_FLAGS.contains(&flag.as_str()) {
+            continue;
+        }
+        for word in [
+            "s3", "aws", "sts", "session", "token", "url", "uri", "key", "object",
+        ] {
+            let plural = format!("{word}s");
+            assert!(
+                !flag.split('-').any(|w| w == word || w == plural),
+                "--{flag} names {word}"
+            );
         }
     }
     for identity in ["ca-cert", "cert", "key"] {
         assert!(flags.contains(identity), "{identity}");
+    }
+    for reviewed in REVIEWED_DAEMON_FLAGS {
+        assert!(
+            flags.contains(*reviewed),
+            "--{reviewed} is no longer a flag"
+        );
     }
     let workspace = include_str!("../../../Cargo.toml");
     let clap = workspace
