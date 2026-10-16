@@ -31,6 +31,11 @@ enum Defect {
     DropsLastPage,
     /// Returns every key on one page, whatever page size was asked.
     IgnoresPageSize,
+    /// Ends the listing after a full page of the largest size, as a client that reads a
+    /// full 1000-key page as the last would.
+    EndsAtAFullLargestPage,
+    /// Starts a listing after a key that exists at that key, not after it.
+    StartsAtTheAfterKey,
     /// Claims conditional writes but overwrites.
     Overwrites,
     /// Answers a missing key with an empty object.
@@ -125,6 +130,19 @@ impl ObjectStore for Broken {
     ) -> Result<ListPage, ObjectStoreError> {
         match self.defect {
             Defect::IgnoresPageSize => self.inner.list(prefix, after, PageSize::MAX).await,
+            Defect::StartsAtTheAfterKey => {
+                let all = self.inner.list(prefix, None, PageSize::MAX).await?;
+                let at = after.and_then(|t| {
+                    all.objects
+                        .iter()
+                        .position(|o| ListToken::after(&o.key) == *t)
+                });
+                let Some(at) = at else {
+                    return self.inner.list(prefix, after, max_keys).await;
+                };
+                let start = (at > 0).then(|| ListToken::after(&all.objects[at - 1].key));
+                self.inner.list(prefix, start.as_ref(), max_keys).await
+            }
             Defect::DropsLastPage => {
                 let mut page = self.inner.list(prefix, after, max_keys).await?;
                 if let Some(next) = &page.next {
@@ -132,6 +150,13 @@ impl ObjectStore for Broken {
                     if following.next.is_none() {
                         page.next = None;
                     }
+                }
+                Ok(page)
+            }
+            Defect::EndsAtAFullLargestPage => {
+                let mut page = self.inner.list(prefix, after, max_keys).await?;
+                if max_keys == PageSize::MAX && page.objects.len() == usize::from(max_keys.get()) {
+                    page.next = None;
                 }
                 Ok(page)
             }
@@ -154,11 +179,12 @@ fn assert_fails_only(report: &Report, failed: &[Check]) {
 
 /// Catches: a suite that compares only lengths or only the first bytes, so a store
 /// answering every ranged read with the whole object passes (the 4 MiB read windows
-/// would then each pull a 128 MiB segment).
+/// would then each pull a 128 MiB segment, and a rebuild would read every segment
+/// whole to find its footer).
 #[test]
 fn a_store_that_ignores_range_fails() {
     let report = run(Defect::IgnoresRange);
-    assert_fails_only(&report, &[Check::RangeBoundaries]);
+    assert_fails_only(&report, &[Check::RangeBoundaries, Check::FooterReads]);
 }
 
 /// Catches: a suite that does not check the length of what a range returns.
@@ -170,6 +196,7 @@ fn a_store_that_reads_short_fails() {
         &[
             Check::RoundTrip,
             Check::RangeBoundaries,
+            Check::FooterReads,
             Check::PutNewRefusesOverwrite,
             Check::ObjectLock,
         ],
@@ -193,14 +220,59 @@ fn a_store_that_claims_object_lock_but_deletes_a_locked_object_fails() {
 #[test]
 fn a_store_whose_listing_drops_the_last_page_fails() {
     let report = run(Defect::DropsLastPage);
-    assert_fails_only(&report, &[Check::ListPagination]);
+    assert_fails_only(
+        &report,
+        &[
+            Check::ListPagination,
+            Check::ListStartAfter,
+            Check::ListPastPageCap,
+            Check::FooterReads,
+        ],
+    );
+}
+
+/// Catches: a suite whose listings never fill a page of the largest size, so a store
+/// (or an S3 client) that ends a listing at a full 1000-key page passes, and a rebuild
+/// over a bucket of more than 1000 segments would stop at the first 1000.
+#[test]
+fn a_store_whose_listing_ends_at_a_full_largest_page_fails() {
+    let report = run(Defect::EndsAtAFullLargestPage);
+    assert_fails_only(&report, &[Check::ListPastPageCap]);
+    let Some(Outcome::Failed(why)) = report.outcome(Check::ListPastPageCap) else {
+        panic!("{report}")
+    };
+    assert!(why.contains("got 1000 keys in 1 pages"), "{why}");
+}
+
+/// Catches: a suite that never starts a listing after a key, or does not check where
+/// it starts, so a rebuild resumed from its last key would read that key twice (and a
+/// store that does this repeats a key between every two pages).
+#[test]
+fn a_store_whose_listing_starts_at_the_after_key_fails() {
+    let report = run(Defect::StartsAtTheAfterKey);
+    assert_fails_only(
+        &report,
+        &[
+            Check::ListPagination,
+            Check::ListStartAfter,
+            Check::ListPastPageCap,
+            Check::ListEmptyPrefix,
+        ],
+    );
 }
 
 /// Catches: a suite whose listing check passes without ever paging.
 #[test]
 fn a_store_that_ignores_page_size_fails() {
     let report = run(Defect::IgnoresPageSize);
-    assert_fails_only(&report, &[Check::ListPagination]);
+    assert_fails_only(
+        &report,
+        &[
+            Check::ListPagination,
+            Check::ListStartAfter,
+            Check::ListEmptyPrefix,
+        ],
+    );
 }
 
 /// Catches: a suite that trusts a conditional-write claim without trying an overwrite.

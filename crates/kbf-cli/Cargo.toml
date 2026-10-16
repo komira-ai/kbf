@@ -21,5 +21,12 @@ kbf-all-in-one.workspace = true
 kbf-node.workspace = true
 kbf-server.workspace = true
 
+[dev-dependencies]
+# The units `kbf-deploy linux render-units --mode` writes, parsed with kbf's own
+# parser (tests/deploy_units.rs).
+kbf-deploy.workspace = true
+# The host `check-units --mode` runs `kbf check-args` on (tests/deploy_units.rs).
+kbf-host.workspace = true
+
 [lints]
 workspace = true

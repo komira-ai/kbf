@@ -107,11 +107,11 @@ impl From<CacheError> for Status {
             | CacheError::Unreachable(_)
             | CacheError::Meta(_)
             | CacheError::Store(_)
-            | CacheError::Segment(_)
-            | CacheError::Tier(_)
+            | CacheError::Tier(_) => Status::unavailable(message),
+            CacheError::Segment(_)
             | CacheError::Pack(_)
-            | CacheError::Key(_) => Status::unavailable(message),
-            CacheError::Internal(_) => Status::internal(message),
+            | CacheError::Key(_)
+            | CacheError::Internal(_) => Status::internal(message),
         }
     }
 }
