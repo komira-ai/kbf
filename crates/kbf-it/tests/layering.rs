@@ -215,9 +215,9 @@ fn pure_modules_deny_the_clippy_lists() {
     }
 }
 
-/// The one crate allowed to depend on both the server and the node library: the combined
-/// binary.
-const JOINERS: &[&str] = &["kbf-all-in-one"];
+/// The crates allowed to depend on both the server and the node library: the combined
+/// binary and the one `kbf` binary.
+const JOINERS: &[&str] = &["kbf-all-in-one", "kbf-cli"];
 
 /// What the server library's normal dependencies must not reach: the daemon side. The
 /// server stores and schedules; it never moves blobs as a client.
@@ -280,7 +280,11 @@ const THIN_MAIN_LINES: usize = 40;
 #[test]
 fn the_server_and_daemon_binaries_are_thin() {
     let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
-    for main in ["kbf-server/src/main.rs", "kbf-node/src/main.rs"] {
+    for main in [
+        "kbf-server/src/main.rs",
+        "kbf-node/src/main.rs",
+        "kbf-cli/src/main.rs",
+    ] {
         let path = crates.join(main);
         let src = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));

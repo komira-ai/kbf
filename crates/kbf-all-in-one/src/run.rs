@@ -14,11 +14,16 @@ use crate::cli::{Flags, command, parse};
 pub(crate) fn main() -> ExitCode {
     let matches = command().get_matches();
     let flags = parse(&matches).unwrap_or_else(|e| e.exit());
+    run(&flags)
+}
+
+/// Starts both halves on the parsed flags and serves until the server half stops.
+pub(crate) fn run(flags: &Flags) -> ExitCode {
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_ansi(std::io::stderr().is_terminal())
         .init();
-    match serve(&flags) {
+    match serve(flags) {
         Ok(()) => ExitCode::SUCCESS,
         Err(failed) => {
             eprintln!("kbf-all-in-one: {failed}");
