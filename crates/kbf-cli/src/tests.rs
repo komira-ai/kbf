@@ -624,3 +624,69 @@ fn a_frontend_has_no_store_and_none_of_a_storage_nodes_listener() {
     assert!(matches!(&parsed, Invocation::Frontend(flags)
         if flags.tls.as_ref().is_some_and(|t| t.iter().map(|p| p.display().to_string()).eq(["/c", "/k", "/a"]))));
 }
+
+fn os(words: &[&str]) -> Vec<std::ffi::OsString> {
+    words.iter().map(Into::into).collect()
+}
+
+/// Catches `--version --json` read from a longer or shorter command line, from `--json`
+/// alone, or from a mode's own words: only the two words and nothing else ask for the
+/// identity, so a typo is a usage error and never an answer.
+#[test]
+fn only_version_and_json_ask_for_the_identity() {
+    for yes in [
+        ["kbf", "--version", "--json"],
+        ["kbf", "--json", "--version"],
+    ] {
+        assert!(version::asked(&os(&yes)), "{yes:?}");
+    }
+    for no in [
+        &["kbf"][..],
+        &["kbf", "--version"],
+        &["kbf", "--json"],
+        &["kbf", "--version", "--json", "extra"],
+        &["kbf", "--version", "--version"],
+        &["kbf", "--json", "--json"],
+        &["kbf", "daemon", "--json"],
+        &["kbf", "--version", "-json"],
+    ] {
+        assert!(!version::asked(&os(no)), "{no:?}");
+    }
+}
+
+/// An empty protocol range is a build error.
+const _: () =
+    assert!(kbf_server::worker::OLDEST_PROTOCOL_VERSION <= kbf_server::worker::PROTOCOL_VERSION);
+
+/// Catches an identity that reports a value other than the library's own (a commit, a
+/// protocol or a schema written down twice and drifting), two halves of the binary that
+/// speak different protocols (the one number reported would be wrong for one), a
+/// protocol range that is empty (the constant above), and a line that is not one object ending in one `\n`.
+#[test]
+fn the_identity_is_the_libraries_own_and_both_halves_speak_one_protocol() {
+    let v = version::identity();
+    assert_eq!(v["commit"], kbf_server::BUILD_COMMIT);
+    assert_eq!(v["protocol"], kbf_server::worker::PROTOCOL_VERSION);
+    assert_eq!(
+        v["protocol"],
+        kbf_daemon::PROTOCOL_VERSION,
+        "the daemon half of kbf speaks another protocol than the server half"
+    );
+    assert_eq!(
+        v["min_protocol"],
+        kbf_server::worker::OLDEST_PROTOCOL_VERSION
+    );
+    assert_eq!(v["state_schema"], kbf_state::sqlite::SCHEMA_VERSION);
+    assert_eq!(v["version"], env!("CARGO_PKG_VERSION"));
+    assert!(
+        ["debug", "release"].contains(&version::PROFILE),
+        "{}",
+        version::PROFILE
+    );
+    let line = version::line();
+    assert!(
+        line.ends_with("}\n") && line.matches('\n').count() == 1,
+        "{line:?}"
+    );
+    assert_eq!(serde_json::from_str::<serde_json::Value>(&line).unwrap(), v);
+}

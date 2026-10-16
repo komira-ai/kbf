@@ -14,10 +14,11 @@
 //! plain text on an address that is not loopback (`<listeners>` is `reapi`, `worker`
 //! or `reapi,worker`; see [`Args::plain_text_off_loopback`]). The server starts either
 //! way. On Unix the SIGINT and SIGTERM handlers are installed before that line is
-//! printed, so either signal any time after it stops the server with exit 0: open
-//! Execute and WaitExecution streams end UNAVAILABLE, REAPI connections are sent
-//! GOAWAY, and the server exits once they close or `--shutdown-timeout-secs` runs out
-//! (issue #168). If a handler cannot be installed it exits 2 without printing the
+//! printed, so either signal any time after it stops the server with exit 0: new
+//! Execute calls are refused UNAVAILABLE, REAPI connections are sent GOAWAY, open
+//! Execute and WaitExecution streams run until their action is done (Buck2 does not
+//! recover a broken stream), and the server exits once they close; when
+//! `--shutdown-timeout-secs` is set and runs out, the open streams end UNAVAILABLE. If a handler cannot be installed it exits 2 without printing the
 //! start line.
 //!
 //! Events go to stderr and, with `--log-dir` (by default `log/` in the `--hot-store`

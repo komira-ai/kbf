@@ -4,7 +4,8 @@
 //!
 //! Each call is one the worker listener serves a remote daemon, on the same [`Cache`]:
 //! FindMissing ([`LocalStore::find_missing`]), a whole-blob read
-//! ([`LocalStore::read_blob`]), a whole-blob write hashed here once, under the same
+//! ([`LocalStore::read_blob`]) and a streamed one ([`LocalStore::read_stream`]), a
+//! whole-blob write hashed here once, under the same
 //! admission as a ByteStream `Write` ([`LocalStore::put`]), and the `Segments` service
 //! itself ([`LocalStore::segments`]), whose `Begin`, `PutRange` and `Commit` are the
 //! handlers a remote upload runs: with a write tier the daemon's digests are trusted at
@@ -24,7 +25,7 @@ use std::sync::Arc;
 use kbf_front::{Cache, CacheStorage, MetaLog, SegmentsConfig};
 use kbf_objstore::ObjectStore;
 use kbf_proto::worker::segments_server::Segments;
-use kbf_storage::{Storage, StorageError};
+use kbf_storage::{ReadStream, Storage, StorageError};
 use kbf_types::Digest;
 
 /// The server's cache, as calls a daemon in the same process makes, through the
@@ -65,6 +66,16 @@ impl LocalStore {
     /// [`StorageError::NotFound`] if the blob is not held, or why it cannot be read.
     pub async fn read_blob(&self, digest: &Digest) -> Result<Vec<u8>, StorageError> {
         self.inner.read_blob(digest).await.map(Vec::from)
+    }
+
+    /// The blob's bytes as a stream of chunks, checked as [`Storage::read_range`]
+    /// says: a stream that ends cleanly delivered only bytes of a blob that hashed to
+    /// its digest.
+    ///
+    /// # Errors
+    /// [`StorageError::NotFound`] if the blob is not held, or why it cannot be read.
+    pub async fn read_stream(&self, digest: &Digest) -> Result<ReadStream, StorageError> {
+        self.inner.read_range(digest, 0, 0).await
     }
 
     /// Hashes `bytes` once, stores them under that digest within

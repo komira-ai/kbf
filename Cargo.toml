@@ -119,6 +119,10 @@ saphyr-parser = "0.1.0"
 security-framework = { version = "3.7.0", default-features = false }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
+# The fixed-key hash behind the storage map's rendezvous scores (kbf-map): SipHash-2-4 with a
+# specified output, so an owner list is the same on every build and platform. Already in the
+# tree through another crate; MIT OR Apache-2.0.
+siphasher = "1.0.4"
 sha2 = "0.11.0"
 # OpenSSH signatures (`ssh-keygen -Y sign`) on operator erase requests (kbf-mdm): the
 # SSHSIG envelope and security-key (`sk-`) signature verification.
@@ -170,6 +174,7 @@ kbf-host = { path = "crates/kbf-host" }
 kbf-invocation = { path = "crates/kbf-invocation" }
 kbf-it = { path = "crates/kbf-it" }
 kbf-log = { path = "crates/kbf-log" }
+kbf-map = { path = "crates/kbf-map" }
 kbf-mac-session = { path = "crates/kbf-mac-session" }
 kbf-mdm = { path = "crates/kbf-mdm" }
 kbf-mdm-api = { path = "crates/kbf-mdm-api" }

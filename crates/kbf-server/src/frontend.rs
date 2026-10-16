@@ -71,7 +71,8 @@ use crate::farm::Farm;
 use crate::grpc_health::{HealthService, WATCH_INTERVAL};
 use crate::health::{Checks, MapProbe, Readiness, StateProbe, StorageProbe};
 use crate::serve::{
-    AbortOnDrop, ServeError, bind, bind_api, flow_control, log_state, serve_api, worker_peers,
+    AbortOnDrop, ServeError, bind, bind_api, drain_and_stop, flow_control, keepalive, log_state,
+    serve_api, worker_peers,
 };
 use crate::worker::WorkerService;
 use crate::{Args, ConfigError, SERVER_VERSION, interrupted, sizes_on};
@@ -93,6 +94,9 @@ pub const ALLOWED: &[&str] = &[
     "worker_client_ca",
     "worker_deny_list",
     "heartbeat_interval_ms",
+    "progress_interval_secs",
+    "http2_keepalive_interval_secs",
+    "http2_keepalive_timeout_secs",
     "unservable_wait_secs",
     "memory_ladder_gib",
     "finished_retention_secs",
@@ -276,7 +280,8 @@ impl FrontendHandle {
     }
 
     /// Serves every listener until the shutdown future given to [`start_frontend`]
-    /// completes and its connections close or `--shutdown-timeout-secs` runs out.
+    /// completes and the open Execute streams finish or `--shutdown-timeout-secs` runs
+    /// out (the drain `kbf-server` runs: [`crate::serve::drain_and_stop`]).
     ///
     /// # Errors
     /// A listener fails while serving.
@@ -383,12 +388,14 @@ fn bind_frontend(
         .merge(crate::health::router_of(Arc::clone(&checks)))
         .merge(metrics_route(backend.clone()));
 
-    let mut reapi_server = flow_control(Server::builder());
+    let mut reapi_server = keepalive(flow_control(Server::builder()), listeners.streams);
     if let Some(tls) = listeners.reapi_tls {
         reapi_server = reapi_server.tls_config(tls)?;
     }
-    let (mut worker_server, peers) =
-        worker_peers(flow_control(Server::builder()), listeners.worker_tls)?;
+    let (mut worker_server, peers) = worker_peers(
+        keepalive(flow_control(Server::builder()), listeners.streams),
+        listeners.worker_tls,
+    )?;
     let worker_service = WorkerServer::new(WorkerService::new(
         Arc::clone(&farm),
         peers,
@@ -399,6 +406,7 @@ fn bind_frontend(
     .max_encoding_message_size(MAX_MESSAGE_BYTES);
 
     let (closer, closing) = kbf_front::closing();
+    let (ticker, progress) = kbf_front::progress(listeners.streams.progress_interval);
     let authorizers = Arc::new(policy.authorizers);
     let proxy = Proxy::new(
         Owners::single(Owner::new(&flags.storage.uri().to_string(), channel)),
@@ -408,7 +416,7 @@ fn bind_frontend(
         &proxy,
         backend,
         Arc::clone(&farm),
-        closing,
+        kbf_front::OpenStreams { closing, progress },
         authorizers,
         &recorder,
         default_memory,
@@ -448,20 +456,14 @@ fn bind_frontend(
         };
         let stopping = async {
             shutdown.await;
-            stop.stop();
-            closer.close();
-            let _ = drain.send(());
-            tokio::time::sleep(listeners.shutdown_timeout).await;
-            tracing::warn!(
-                timeout = ?listeners.shutdown_timeout,
-                "REAPI connections still open at the shutdown timeout; stopping anyway"
-            );
+            drain_and_stop(&stop, &closer, drain, listeners.shutdown_timeout).await;
         };
         tokio::select! {
             served = reapi_serve => served.map_err(ServeError::from),
             served = worker_serve => served.map_err(ServeError::from),
             served = api_serve => served.map_err(ServeError::Api),
             () = ticking => Ok(()),
+            () = ticker.run() => Ok(()),
             () = stopping => Ok(()),
         }
     };

@@ -22,7 +22,7 @@ use kbf_meta::ServerId;
 use kbf_threads::disk::FreeSpace;
 
 use crate::identity::{DenyList, DenyListError};
-use crate::serve::{Api, Listeners, WorkerTls};
+use crate::serve::{Api, Listeners, StreamTiming, WorkerTls};
 use crate::stores::{S3Uri, StoreFlags, StoreUri, Stores, StoresError};
 use crate::token::{ApiToken, TokenFileError};
 
@@ -48,6 +48,10 @@ pub struct Args {
     /// The roles to run.
     #[arg(long, value_enum, default_value = "all")]
     pub role: Role,
+    /// The node's one cache, when a daemon in this process shares the hot store's disk
+    /// (`kbf-all-in-one`, `kbf_storage::local_cache`). No flag sets it.
+    #[arg(skip)]
+    pub local_cache: Option<Arc<kbf_storage::local_cache::LocalCache>>,
     /// The durable object store, where every blob ends up: `file:///absolute/path` (a
     /// directory, `kbf_objstore::FsStore`: locked while the server runs, a second
     /// server on it is refused; a write that would leave its filesystem with less free
@@ -254,11 +258,26 @@ pub struct Args {
     #[arg(long, default_value_t = kbf_sched::FINISHED_RETENTION.as_secs())]
     pub finished_retention_secs: u64,
     /// How long, in seconds, a stop (SIGINT or SIGTERM) waits for REAPI clients to
-    /// disconnect after their open Execute and WaitExecution streams are ended
-    /// UNAVAILABLE and their connections sent GOAWAY. A client still uploading is cut
-    /// off when it runs out.
-    #[arg(long, default_value_t = 10)]
+    /// finish: it refuses new Execute calls (UNAVAILABLE, which Buck2 retries) and
+    /// sends GOAWAY, and every open Execute and WaitExecution stream stays open until
+    /// its action is done. Buck2 never recovers a stream that breaks mid-action, so the
+    /// default, 0, is no deadline; set one at least as long as the longest action. When
+    /// it runs out, the open streams end UNAVAILABLE (a client still uploading is cut
+    /// off).
+    #[arg(long, default_value_t = 0)]
     pub shutdown_timeout_secs: u64,
+    /// How often, in seconds, every open Execute and WaitExecution stream is sent its
+    /// operation again (same name, not done, current stage), so a load balancer's idle
+    /// timeout never cuts a long action. 0 sends none.
+    #[arg(long, default_value_t = 30)]
+    pub progress_interval_secs: u64,
+    /// How often, in seconds, the REAPI and worker listeners send an HTTP/2 PING on a
+    /// quiet connection. 0 sends none (and `--http2-keepalive-timeout-secs` is unused).
+    #[arg(long, default_value_t = 30)]
+    pub http2_keepalive_interval_secs: u64,
+    /// How long, in seconds, a PING may go unanswered before the connection is closed.
+    #[arg(long, default_value_t = 20)]
+    pub http2_keepalive_timeout_secs: u64,
     /// Thread sizes: the overrides `--async-threads`, `--blocking-threads` and
     /// `--cpu-threads` (see `kbf_threads`). Left out, the server uses every CPU it may
     /// (the async workers and the CPU pool each one thread per logical CPU); it has no
@@ -507,7 +526,15 @@ impl Args {
             unservable_wait: Duration::from_secs(self.unservable_wait_secs),
             memory_ladder: kbf_sched::MemoryLadder::from_gib(&self.memory_ladder_gib)?,
             finished_retention: Duration::from_secs(self.finished_retention_secs),
-            shutdown_timeout: Duration::from_secs(self.shutdown_timeout_secs),
+            shutdown_timeout: match self.shutdown_timeout_secs {
+                0 => Duration::MAX,
+                secs => Duration::from_secs(secs),
+            },
+            streams: StreamTiming {
+                progress_interval: Duration::from_secs(self.progress_interval_secs),
+                keepalive_interval: Duration::from_secs(self.http2_keepalive_interval_secs),
+                keepalive_timeout: Duration::from_secs(self.http2_keepalive_timeout_secs),
+            },
             store_probe_timeout: Duration::from_millis(self.readyz_store_timeout_ms),
             invocation_memory: usize::try_from(self.invocation_memory).unwrap_or(usize::MAX),
             segments: SegmentsConfig {
@@ -607,7 +634,12 @@ impl Args {
             .as_deref()
             .map(ApiToken::from_file)
             .transpose()?;
-        Ok(Some(Api { listen, token }))
+        let local_cache = self.local_cache.clone();
+        Ok(Some(Api {
+            listen,
+            token,
+            local_cache,
+        }))
     }
 
     /// How the cache groups and bounds uploads: `--write-linger`,

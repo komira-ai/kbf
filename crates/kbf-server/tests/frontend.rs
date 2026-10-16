@@ -964,6 +964,72 @@ async fn the_reapi_listener_serves_tls_when_given_a_certificate() {
     assert!(!answered, "plain text was answered on a TLS listener");
 }
 
+/// Catches a frontend whose stop ends an open Execute (the copy of the shutdown path from
+/// before the drain: `closer.close()` at stop, UNAVAILABLE to the client, which Buck2 does
+/// not recover and so fails the action): with an action still running on a daemon, stop
+/// is signalled, a new Execute is refused, the open stream stays open, and
+/// when the daemon finishes the client gets the result and no error; the serving future
+/// ends once the client is gone. Planted mutant: `kbf_server::serve::drain_and_stop` calling
+/// `closer.close()` before the sleep: the serving future ends at stop and the "holds the
+/// stop" assertion goes red.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_open_execute_survives_stop_until_its_action_is_done() {
+    let node = Node::start().await;
+    let url = format!("--storage=http://{}", node.addr);
+    let (stop, stopped) = oneshot::channel::<()>();
+    let handle = start_frontend(
+        &flags(&[&url, "--heartbeat-interval-ms=100"]).expect("flags"),
+        || {
+            Ok(async move {
+                let _ = stopped.await;
+            })
+        },
+    )
+    .expect("starts");
+    let (reapi, worker) = (handle.reapi, handle.worker);
+    let served = tokio::spawn(handle.serve());
+    let client = Client::connect(reapi, worker).await;
+    let mut daemon = client.daemon("node-a", 4, 8).await;
+
+    let job = Job::new("build", &[]);
+    client.upload(&job.blobs()).await;
+    let mut ops = client.execute(&job.action).await;
+    let start = daemon.start().await;
+
+    let late = Job::new("late", &[]);
+    client.upload(&late.blobs()).await;
+    // Uploaded now: the connection is going away once stop is signalled.
+    let result = support::output(&client, "built across the stop", 0).await;
+    stop.send(()).unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let refused = client
+        .execute_with(&late.action, false)
+        .await
+        .map(|_| ())
+        .expect_err("a stopping frontend takes no new Execute");
+    // UNAVAILABLE from the service, or CANCELLED when the listener's GOAWAY got there first.
+    assert!(
+        matches!(
+            refused.code(),
+            tonic::Code::Unavailable | tonic::Code::Cancelled
+        ),
+        "{refused:?}"
+    );
+    assert!(!served.is_finished(), "the open stream holds the stop");
+
+    assert!(daemon.report(ran(start.lease_id, &result)).await.accepted);
+    let last = done(&mut ops).await;
+    assert_eq!(response(&last).result, Some(result));
+    drop(ops);
+    drop(client);
+    drop(daemon);
+    tokio::time::timeout(Duration::from_secs(30), served)
+        .await
+        .expect("the stop ends when the client is gone")
+        .unwrap()
+        .expect("served");
+}
+
 /// Catches a shutdown that waits for a client that never finishes: with a REAPI client
 /// stuck in an upload that never ends, the serving future ends when
 /// `--shutdown-timeout-secs` runs out, not when the client gives up.

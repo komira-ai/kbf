@@ -22,6 +22,11 @@ pub struct TierOptions {
     pub seal_after: Duration,
     /// The size at which the open grouped block is sealed: [`MAX_SEGMENT_BYTES`].
     pub segment_limit: u64,
+    /// Whether a flushed block is kept as a flushed copy (`.seg`) for local reads. Off
+    /// on a node whose one cache keeps the local copies (`kbf_storage::local_cache`):
+    /// a flushed block is then deleted, and a start deletes the copies an earlier run
+    /// kept.
+    pub flushed_copies: bool,
 }
 
 impl TierOptions {
@@ -36,6 +41,16 @@ impl TierOptions {
             budget,
             seal_after: Self::SEAL_AFTER,
             segment_limit: MAX_SEGMENT_BYTES,
+            flushed_copies: true,
+        }
+    }
+
+    /// These options with flushed copies off ([`TierOptions::flushed_copies`]).
+    #[must_use]
+    pub const fn without_flushed_copies(self) -> Self {
+        Self {
+            flushed_copies: false,
+            ..self
         }
     }
 }
@@ -270,16 +285,17 @@ pub trait WriteTier: Send + Sync {
     fn unstage(&self, object: ObjectId) -> Result<(), TierError>;
 
     /// Records that `object`'s `ObjectFlushed` committed: the block stops counting
-    /// against the budget and its file is renamed `<epoch>-<seq>.seg` (and the
-    /// directory synced), a flushed copy [`WriteTier::read`] still serves until it is
-    /// evicted. Call it only once the commit applied: eviction then never touches a
-    /// block whose only copy is local.
+    /// against the budget and, with [`TierOptions::flushed_copies`], its file is
+    /// renamed `<epoch>-<seq>.seg` (and the directory synced), a flushed copy
+    /// [`WriteTier::read`] still serves until it is evicted; without, its file is
+    /// deleted and a read of it is [`TierError::UnknownBlock`]. Call it only once the
+    /// commit applied: eviction then never touches a block whose only copy is local.
     ///
     /// # Errors
     ///
     /// [`TierError::NotSealable`] unless the block is sealed (or ready to be: its
     /// `SealStaged` may have committed without the tier hearing); [`TierError::Io`]
-    /// if the rename or the directory sync failed. The block stops counting either
+    /// if the rename, the delete or the directory sync failed. The block stops counting either
     /// way: the object is in the store, and a `.blk` left behind is an orphan the
     /// next start deletes.
     fn flushed(&self, object: ObjectId) -> Result<(), TierError>;
@@ -889,6 +905,10 @@ where
         state.blocks.remove(&object);
         state.used -= extent;
         let (from, to) = (block_name(object), seg_name(object));
+        if !self.shared.options.flushed_copies {
+            // Unsynced: a block left by a crash is an orphan at the next start.
+            return (self.shared.fs.remove(&from)).map_err(|e| TierError::io("remove", &from, e));
+        }
         self.shared
             .fs
             .rename(&from, &to)
