@@ -1,6 +1,7 @@
 //! The rows the scheduler writes, read back as a start reads them.
 
-use std::num::NonZeroU64;
+use std::num::{NonZeroU64, NonZeroUsize};
+use std::ops::Bound;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use kbf_caps::NodeCaps;
@@ -8,7 +9,7 @@ use kbf_log::{Bootstrap, FarmLogId};
 use kbf_sched::RequeueReason;
 use kbf_state::fake::{Fake, Flaw};
 use kbf_state::{
-    Changes, Commit, CommitStats, Conflict, ManualClock, Revision, StoreTime, Versioned,
+    Changes, Commit, CommitStats, Conflict, ManualClock, Revision, ScanPage, StoreTime, Versioned,
 };
 use kbf_types::{
     ActionKey, Answer, Digest, DigestFunction, Failure, FencePolicy, LeaseKind, Outcome, Qos,
@@ -51,6 +52,15 @@ impl Store for Flaky {
 
     fn scan_prefix(&self, prefix: &str) -> Result<Vec<(String, Versioned)>, StoreError> {
         self.inner.scan_prefix(prefix)
+    }
+
+    fn scan_range(
+        &self,
+        prefix: &str,
+        start: Bound<&str>,
+        limit: NonZeroUsize,
+    ) -> Result<ScanPage, StoreError> {
+        self.inner.scan_range(prefix, start, limit)
     }
 
     fn changes(&self, after: Revision, limit: usize) -> Result<Changes, StoreError> {

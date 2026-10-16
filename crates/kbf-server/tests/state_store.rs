@@ -4,6 +4,8 @@
 //! The store is the in-memory fake, which keeps a durable copy a restart reopens, and
 //! the farm's clock is tokio's, paused: nothing here waits.
 
+use std::num::NonZeroUsize;
+use std::ops::Bound;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::time::Duration;
@@ -18,8 +20,8 @@ use kbf_server::farm::{Reported, StreamId};
 use kbf_server::{EpochPolicy, Farm, Listeners, ServeError, StateError, StateStore};
 use kbf_state::fake::{Fake, Flaw};
 use kbf_state::{
-    Changes, Commit, CommitStats, Conflict, ManualClock, Revision, Store, StoreError, StoreTime,
-    Txn, Versioned,
+    Changes, Commit, CommitStats, Conflict, ManualClock, Revision, ScanPage, Store, StoreError,
+    StoreTime, Txn, Versioned,
 };
 use kbf_types::{ActionKey, Digest, DigestFunction, LeaseId, LeaseKind, Qos, Resources, WorkerId};
 use tokio::sync::mpsc;
@@ -90,6 +92,15 @@ impl Store for Flaky {
 
     fn scan_prefix(&self, prefix: &str) -> Result<Vec<(String, Versioned)>, StoreError> {
         self.inner.scan_prefix(prefix)
+    }
+
+    fn scan_range(
+        &self,
+        prefix: &str,
+        start: Bound<&str>,
+        limit: NonZeroUsize,
+    ) -> Result<ScanPage, StoreError> {
+        self.inner.scan_range(prefix, start, limit)
     }
 
     fn changes(&self, after: Revision, limit: usize) -> Result<Changes, StoreError> {
