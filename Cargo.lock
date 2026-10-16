@@ -1301,7 +1301,9 @@ dependencies = [
  "kbf-daemon",
  "kbf-driver-container",
  "kbf-front",
+ "kbf-meta",
  "kbf-node",
+ "kbf-objstore",
  "kbf-proto",
  "kbf-segments",
  "kbf-server",
@@ -1740,6 +1742,7 @@ dependencies = [
  "futures",
  "hex",
  "hmac 0.13.0",
+ "kbf-objstore",
  "kbf-threads",
  "md-5",
  "reqwest",
@@ -1747,6 +1750,7 @@ dependencies = [
  "sha2 0.11.0",
  "thiserror",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

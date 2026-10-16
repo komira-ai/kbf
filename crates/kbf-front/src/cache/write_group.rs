@@ -30,7 +30,9 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use kbf_meta::{Applied, Command, Epoch, Location, MetaState, ObjectId, StoreId};
+use kbf_meta::{
+    Applied, Command, Epoch, Location, MetaState, ObjectId, StoreId, UnreachableReason,
+};
 use kbf_objstore::{ByteRange, KeyPrefix, ObjectKey, ObjectStore, ObjectStoreError};
 use kbf_segments::layout::{TRAILER_LEN, footer_len};
 use kbf_segments::{Footer, SegmentWriter, WriteError};
@@ -39,7 +41,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, oneshot};
 
 use super::evict::Recency;
 use super::tier::Staging;
-use super::{Cache, CacheError, VerifiedBlob, refuse_oversized, unexpected};
+use super::{Cache, CacheError, VerifiedBlob, unexpected};
 use crate::cpu::HashPool;
 use crate::meta_log::{MetaLog, MetaLogError};
 use crate::metrics::{CacheMetrics, command_label};
@@ -51,10 +53,12 @@ pub const PUT_BACKOFF: Duration = Duration::from_millis(100);
 /// How much longer each wait between PUT attempts is than the one before.
 pub const PUT_BACKOFF_FACTOR: u32 = 4;
 
-/// The most bytes one [`Cache::admit`] call takes and counts: a semaphore hands out at
-/// most `u32::MAX` permits at once. A caller asking for more holds more memory than the
-/// bound counts, so `kbf-server` refuses a `--segment-upload-max-bytes` over this.
-pub const MAX_ADMISSION_BYTES: u64 = u32::MAX as u64;
+/// The most bytes one [`Cache::admit`] call takes and counts: what the semaphore holds.
+/// One call may ask for more than the `u32::MAX` permits a semaphore hands out at once
+/// (under a bound configured that large): it takes them in parts, one such call at a time, and
+/// counts them all. A caller asking for more than this holds more memory than the
+/// bound counts, so `kbf-server` refuses a `--segment-upload-max-bytes` over it.
+pub const MAX_ADMISSION_BYTES: u64 = Semaphore::MAX_PERMITS as u64;
 
 /// The default most HTTP/2 streams one connection may have open on the worker
 /// listener (`--worker-max-streams`): a daemon holds one persistent session stream
@@ -93,7 +97,7 @@ pub struct WriteConfig {
     /// The most bytes admitted uploads hold at once ([`Cache::admit`],
     /// `--write-bytes-in-flight`). A caller over the bound waits; a caller asking for
     /// more than the whole bound waits for all of it. `kbf-server` refuses a bound
-    /// below [`MAX_BLOB_BYTES`](crate::MAX_BLOB_BYTES).
+    /// below [`MIN_SEGMENT_UPLOAD_BYTES`](crate::MIN_SEGMENT_UPLOAD_BYTES).
     pub bytes_in_flight: u64,
     /// The most segment PUTs, each with its footer read-back, in flight at once
     /// (`--write-puts-in-flight`). A segment sealed while all are busy waits.
@@ -111,6 +115,8 @@ pub struct WriteConfig {
 impl WriteConfig {
     /// The defaults of `docs/design/write-path.md`: a 2 ms linger, own segments from
     /// 16 MiB, 2 GiB admitted, 4 PUTs in flight, 3 attempts per PUT, 4 hashing jobs.
+    /// No upload is admitted for more than it holds in memory, and none holds a blob
+    /// over [`MAX_UNSTAGED_BLOB_BYTES`](crate::MAX_UNSTAGED_BLOB_BYTES) whole.
     pub const DEFAULT: Self = Self {
         linger: Duration::from_millis(2),
         own_segment_bytes: 16 << 20,
@@ -133,15 +139,15 @@ impl Default for WriteConfig {
 /// admits nothing.
 #[derive(Clone, Debug, Default)]
 pub struct Admitted {
-    /// Held for its drop, which releases the bytes.
-    _permit: Option<Arc<OwnedSemaphorePermit>>,
+    /// Held for their drop, which releases the bytes.
+    _permits: Arc<Vec<OwnedSemaphorePermit>>,
 }
 
 #[cfg(test)]
 impl Admitted {
     /// Holding nothing: for unit tests of what an admission only keeps alive.
     pub(crate) fn nothing() -> Self {
-        Self { _permit: None }
+        Self::default()
     }
 }
 
@@ -152,6 +158,8 @@ pub(super) struct Group {
     /// What [`Cache::admit`] takes, in bytes; the bound clamped to what a semaphore holds.
     admission: Arc<Semaphore>,
     bound: u64,
+    /// Held by an admission taken in parts (over `u32::MAX` bytes).
+    large: tokio::sync::Mutex<()>,
     puts: Semaphore,
     /// Record hashing, off the runtime workers.
     pub(super) hashing: HashPool,
@@ -216,6 +224,7 @@ impl Group {
             // `bound` is at most `MAX_PERMITS`, a `usize`.
             admission: Arc::new(Semaphore::new(bound as usize)),
             bound,
+            large: tokio::sync::Mutex::new(()),
             puts: Semaphore::new(config.puts_in_flight.get()),
             hashing: HashPool::new(config.cpu_threads),
             state: Mutex::new(State::default()),
@@ -273,7 +282,7 @@ pub(super) struct Writer<M, O> {
     /// Shared with the write tier, which numbers its blocks' objects from it too.
     pub(super) next_seq: Arc<AtomicU64>,
     /// The local write tier, once [`Cache::attach_tier`] attached one.
-    pub(super) tier: OnceLock<Staging>,
+    pub(super) tier: OnceLock<Arc<Staging>>,
     /// When each object was last used, once [`Cache::track_recency`] turned it on.
     pub(super) recency: Recency,
 }
@@ -298,7 +307,7 @@ impl<M, O> Writer<M, O> {
         Ok(self.prefix.key(&format!("cas/{epoch:016x}/{seq:016x}"))?)
     }
 
-    fn allocate(&self) -> ObjectId {
+    pub(super) fn allocate(&self) -> ObjectId {
         ObjectId::new(self.epoch, self.next_seq.fetch_add(1, Ordering::Relaxed))
     }
 }
@@ -319,17 +328,27 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
     }
 
     /// Waits until `bytes` more fit under [`WriteConfig::bytes_in_flight`] and takes
-    /// them. A call asking for more than the bound, or than [`MAX_ADMISSION_BYTES`],
-    /// takes and counts only that much. Nothing is refused: a caller over the bound waits.
+    /// them. A call asking for more than the bound takes and counts only that much.
+    /// Nothing is refused: a caller over the bound waits. A call over `u32::MAX` bytes
+    /// takes them in parts, holding the lock of such calls, so two of them never each
+    /// hold a part the other waits for.
     pub async fn admit(&self, bytes: u64) -> Admitted {
-        let n = bytes.min(self.group.bound).min(MAX_ADMISSION_BYTES);
-        let n = u32::try_from(n).unwrap_or(u32::MAX);
-        let permit = Arc::clone(&self.group.admission)
-            .acquire_many_owned(n)
-            .await
-            .ok();
+        let mut left = bytes.min(self.group.bound);
+        let _large = if left > u64::from(u32::MAX) {
+            Some(self.group.large.lock().await)
+        } else {
+            None
+        };
+        let mut permits = Vec::new();
+        while left > 0 {
+            let part = u32::try_from(left).unwrap_or(u32::MAX);
+            left -= u64::from(part);
+            // The semaphore is never closed.
+            let permit = Arc::clone(&self.group.admission).acquire_many_owned(part);
+            permits.extend(permit.await.ok());
+        }
         Admitted {
-            _permit: permit.map(Arc::new),
+            _permits: Arc::new(permits),
         }
     }
 
@@ -378,9 +397,7 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
     /// `admitted` is held until every blob's segment is settled.
     ///
     /// # Errors
-    /// [`CacheError::Invalid`], before anything is stored, if any blob is larger than
-    /// [`MAX_BLOB_BYTES`](crate::MAX_BLOB_BYTES); the metadata log could not say which
-    /// blobs are present. A blob whose segment failed has that failure as its answer:
+    /// The metadata log could not say which blobs are present. A blob whose segment failed has that failure as its answer:
     /// UNAVAILABLE when the store or the log could not be reached, INTERNAL when the
     /// store kept something other than what was written.
     pub async fn store_each(
@@ -388,7 +405,6 @@ impl<M: MetaLog, O: ObjectStore> Cache<M, O> {
         blobs: Vec<VerifiedBlob>,
         admitted: Admitted,
     ) -> Result<Vec<Result<(), CacheError>>, CacheError> {
-        refuse_oversized(&blobs)?;
         let started = Instant::now();
         let stored = self.store_fresh(blobs, admitted).await;
         self.writer.metrics.store_blobs.since(started);
@@ -586,22 +602,7 @@ impl<M: MetaLog, O: ObjectStore> Writer<M, O> {
         packed: &BTreeSet<Digest>,
     ) -> Result<Vec<(Digest, Location)>, CacheError> {
         let (segment, key, footer) = self.store_segment(group, body, packed.len()).await?;
-        packed
-            .iter()
-            .map(|d| {
-                let entry = footer.find(d).ok_or_else(|| {
-                    CacheError::Internal(format!("segment {key} came back without blob {d}"))
-                })?;
-                Ok((
-                    *d,
-                    Location {
-                        store: StoreId::CONFIGURED,
-                        object: segment,
-                        offset: entry.offset,
-                    },
-                ))
-            })
-            .collect()
+        placed(&footer, &key, segment, packed.iter().copied())
     }
 
     /// Stores one whole segment of `records` records: under one of `group`'s
@@ -681,6 +682,22 @@ impl<M: MetaLog, O: ObjectStore> Writer<M, O> {
         Ok(Footer::parse(&bytes, len)?)
     }
 
+    /// Commits that `object` is unreachable for `reason`.
+    pub(super) async fn mark_unreachable(
+        &self,
+        object: ObjectId,
+        reason: UnreachableReason,
+    ) -> Result<(), CacheError> {
+        match self
+            .commit(Command::ObjectUnreachable { object, reason })
+            .await?
+        {
+            Applied::Marked(Ok(())) => Ok(()),
+            Applied::Marked(Err(e)) => Err(CacheError::Internal(e.to_string())),
+            other => Err(unexpected(&other)),
+        }
+    }
+
     /// Commits where each blob of one or more segments is, as one `PutBlobs`.
     pub(super) async fn commit_segment(
         &self,
@@ -695,6 +712,35 @@ impl<M: MetaLog, O: ObjectStore> Writer<M, O> {
             other => Err(unexpected(&other)),
         }
     }
+}
+
+/// Where each of `digests` is in `object` (under `key`), as its `footer` read back from
+/// the store says.
+///
+/// # Errors
+/// [`CacheError::Internal`] for a digest the footer does not list: the store holds
+/// another object than the one written.
+pub(super) fn placed(
+    footer: &Footer,
+    key: &ObjectKey,
+    object: ObjectId,
+    digests: impl Iterator<Item = Digest>,
+) -> Result<Vec<(Digest, Location)>, CacheError> {
+    let at = |d: Digest| {
+        let entry = footer.find(&d);
+        let entry =
+            entry.ok_or_else(|| CacheError::Internal(format!("{key} came back without {d}")));
+        let offset = entry?.offset;
+        Ok((
+            d,
+            Location {
+                store: StoreId::CONFIGURED,
+                object,
+                offset,
+            },
+        ))
+    };
+    digests.map(at).collect()
 }
 
 /// Whether a failed PUT may be tried again: it did not complete (connect, reset,
@@ -714,7 +760,7 @@ const fn transient(e: &ObjectStoreError) -> bool {
 /// such object, a short one, or a trailer or footer that does not parse) is INTERNAL: a
 /// store that acknowledges a PUT and then returns something else is a fault to surface,
 /// not a blip to retry. A read-back that did not reach the store stays UNAVAILABLE.
-fn read_back(e: CacheError) -> CacheError {
+pub(super) fn read_back(e: CacheError) -> CacheError {
     match e {
         e @ (CacheError::Store(
             ObjectStoreError::NotFound(_) | ObjectStoreError::InvalidRange { .. },
