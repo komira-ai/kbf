@@ -106,8 +106,9 @@ pub use crate::segments::{
 /// The most blob data one `BatchUpdateBlobs` or `BatchReadBlobs` call may carry,
 /// advertised in the capabilities. Larger blobs go through ByteStream. A request is
 /// decoded whole before its handler runs, so one stream may hold up to
-/// [`MAX_MESSAGE_BYTES`] (17 MiB) of decode buffer: 200 concurrent streams bound the
-/// decode memory at about 3.4 GiB, which `--write-bytes-in-flight` does not cover
+/// [`MAX_MESSAGE_BYTES`] (17 MiB) of decode buffer: the decode memory is that times the
+/// streams a connection may open (`--reapi-max-streams`, `--worker-max-streams`), about
+/// 3.4 GiB for 200, which `--write-bytes-in-flight` does not cover
 /// (`docs/design/write-path.md`).
 pub const MAX_BATCH_TOTAL_BYTES: usize = 16 << 20;
 

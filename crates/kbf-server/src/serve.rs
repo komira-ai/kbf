@@ -11,9 +11,9 @@ use futures::StreamExt as _;
 use futures::future::Either;
 use kbf_auth::{AuthenticateLayer, Policy};
 use kbf_front::{
-    ByteStreamService, CONNECTION_WINDOW_BYTES, Cache, CasService, Connections,
-    DEFAULT_WORKER_STREAMS, MAX_MESSAGE_BYTES, MetaLog, RECORDER_CHANNEL, Recorder,
-    RequestMetadataLayer, STREAM_WINDOW_BYTES, SegmentsConfig, SegmentsService,
+    ByteStreamService, CONNECTION_WINDOW_BYTES, Cache, CasService, Connections, MAX_MESSAGE_BYTES,
+    MetaLog, RECORDER_CHANNEL, Recorder, RequestMetadataLayer, STREAM_WINDOW_BYTES, SegmentsConfig,
+    SegmentsService,
 };
 use kbf_objstore::ObjectStore;
 use kbf_proto::google::bytestream::byte_stream_server::ByteStreamServer;
@@ -201,13 +201,16 @@ fn bind_api(addr: SocketAddr) -> Result<(tokio::net::TcpListener, SocketAddr), S
     bound.map_err(|source| ServeError::Bind { addr, source })
 }
 
-/// `server` with the HTTP/2 limits both listeners state rather than leave to the
-/// transport's defaults: they bound what is held outside `--write-bytes-in-flight`, and
-/// the connection window is what lets a Write admitted after others finish at all
-/// (`kbf_front::CONNECTION_WINDOW_BYTES`).
-fn flow_control(server: Server) -> Server {
+/// `server` with the HTTP/2 limits a listener states rather than leaves to the
+/// transport's defaults: at most `max_streams` open streams per connection (each
+/// listener its own, [`StreamLimits`]), and the stream and connection windows. The
+/// windows bound what is held outside `--write-bytes-in-flight`, and they do not
+/// follow `max_streams`: the connection window is a fixed budget
+/// (`kbf_front::CONNECTION_WINDOW_BYTES`), which is also what lets a Write admitted
+/// after others finish at all.
+fn flow_control(server: Server, max_streams: u32) -> Server {
     server
-        .max_concurrent_streams(Some(DEFAULT_WORKER_STREAMS))
+        .max_concurrent_streams(Some(max_streams))
         .initial_stream_window_size(Some(STREAM_WINDOW_BYTES))
         .initial_connection_window_size(Some(CONNECTION_WINDOW_BYTES))
 }
@@ -332,11 +335,11 @@ where
     let (term, epoch) = (farm.term(), farm.lease_epoch());
     tracing::warn!(term, epoch, "{STATE_IN_MEMORY}");
 
-    let mut reapi_server = flow_control(Server::builder());
+    let mut reapi_server = flow_control(Server::builder(), listeners.streams.reapi);
     if let Some(tls) = listeners.reapi_tls {
         reapi_server = reapi_server.tls_config(tls)?;
     }
-    let mut worker_server = flow_control(Server::builder());
+    let mut worker_server = flow_control(Server::builder(), listeners.streams.worker);
     let peers = match listeners.worker_tls {
         Some(tls) => {
             worker_server = worker_server.tls_config(tls.server)?;

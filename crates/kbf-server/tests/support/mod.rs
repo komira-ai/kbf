@@ -434,6 +434,7 @@ impl Cell {
         Arc::new(cache.expect("open the cache"))
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn serve(
         cache: Arc<Cache<GateLog, SharedStore>>,
         store: SharedStore,
