@@ -1,13 +1,8 @@
-//! Rules `storage`, `state-store` and `ports` read on their own: how a flag, a Postgres
-//! URI and a variable are read, what the state store's password file must be on the
-//! node, and which listeners share a port.
+//! Rules `storage`, `state-store` and `ports` read on their own: how a flag and a
+//! variable are read, which `--state-store` values pass (a SQLite file by an absolute
+//! path, nothing else), and which listeners share a port.
 
 use std::path::Path;
-
-use kbf_host::exec::Entry;
-use kbf_host::path::HostPath;
-use kbf_host::step::{Owner, Perms};
-use kbf_host::testkit::{FakeExec, reply};
 
 use super::*;
 
@@ -92,35 +87,6 @@ fn a_storage_unit_names_its_stores_listener_and_tls_and_its_key() {
     assert_eq!(storage(&storage_unit(&file, ""), key), Vec::<String>::new());
 }
 
-/// Catches a password missed in each spelling the Postgres client takes (before the
-/// host, in a `password=` query key, after either scheme), and a URI with a user and
-/// no password, or a host and port, taken for one. The last row is the documented
-/// false red: a `:` before a later `@` is read as a password.
-#[test]
-fn a_postgres_password_is_found_in_the_userinfo_or_the_query() {
-    let rows = [
-        ("postgres://kbf:secret@db.example/kbf", true),
-        ("postgresql://kbf:secret@db.example:5432/kbf", true),
-        ("postgres://kbf:@db.example/kbf", true),
-        ("postgres://db.example/kbf?user=kbf&password=secret", true),
-        ("postgres://db.example/kbf?password=secret", true),
-        ("postgres://kbf@db.example/kbf", false),
-        ("postgres://db.example:5432/kbf", false),
-        ("postgres://db.example/kbf?user=kbf&sslmode=disable", false),
-        ("postgres://db.example/kbf?passwords=x", false),
-        ("postgres://db.example:5432/kbf?application_name=a@b", true),
-    ];
-    for (url, want) in rows {
-        assert_eq!(has_password(url), want, "{url}");
-    }
-    let found: Vec<&str> =
-        postgres_uris("--state-store=postgresql://a:b@h/d,x=postgres://h/d").collect();
-    assert_eq!(
-        found,
-        ["postgresql://a:b@h/d,x=postgres://h/d", "postgres://h/d"]
-    );
-    assert_eq!(postgres_uris("postgres:/h postgresx://h").count(), 0);
-}
 
 /// Catches a variable not found in either of systemd's spellings, an unclosed brace
 /// or a bare `$` read as a name, and a name read past its last letter.
@@ -141,285 +107,109 @@ fn a_state_store_value_names_its_variable() {
     }
 }
 
-const PG: &str = "--state-store=postgres://kbf@db/kbf";
-
 fn frontend(service: &str, flags: &str) -> UnitFile {
     unit(&format!(
         "[Service]\n{service}ExecStart=/usr/local/bin/kbf frontend {flags}\n"
     ))
 }
 
-/// Catches a password missed in any directive (the command line, a pre-start command,
-/// an environment variable, a quoted word, a section other than `[Service]`), and a
-/// password-free URI, or a SQLite store, refused.
+const POSTGRES: &str = "--state-store is a postgres URI: postgres is not wired yet; the state store is sqlite:///<absolute path>";
+const NOT_SQLITE: &str =
+    "--state-store is not sqlite:///<absolute path>: SQLite is the only state store kbf opens";
+const BAD_PATH: &str = "--state-store is sqlite:// with an empty, relative or not normal path: give sqlite:///<absolute path>";
+
+/// Catches a SQLite file by an absolute path refused (in either flag form, quoted), a
+/// unit with no `--state-store` failed, and a Postgres URI passed in either scheme, with
+/// or without a password, in either flag form or as the last of two values (the planted
+/// mutant: the postgres branch returning `None` turns this red). No message holds the
+/// value.
 #[test]
-fn the_state_store_rule_refuses_a_password_anywhere_in_the_unit() {
-    let ok = frontend(
-        "",
-        &format!("{PG} --{PASSWORD_FILE}=/etc/kbf/state-store.password"),
-    );
-    assert_eq!(state_store(&ok), Vec::<String>::new());
-    let sqlite = frontend("", "--state-store=sqlite:///var/lib/kbf/state.db");
-    assert_eq!(state_store(&sqlite), Vec::<String>::new());
-    assert_eq!(state_store(&frontend("", "")), Vec::<String>::new());
-    let advice = "a unit file and a command line are readable by every user; leave the password out of the URI and give --state-store-password-file=<a file of mode 0600, the unit's User='s>";
-    for (key, line) in [
-        (
-            "ExecStart",
-            "ExecStart=/usr/local/bin/kbf frontend --state-store-password-file=/p --state-store=postgres://kbf:pw@db/kbf",
-        ),
-        (
-            "ExecStart",
-            "ExecStart=/usr/local/bin/kbf frontend --state-store-password-file=/p --state-store postgresql://db/kbf?password=pw",
-        ),
-        (
-            "ExecStartPre",
-            "ExecStartPre=/usr/bin/true \"postgres://kbf:pw@db/kbf\"",
-        ),
-        (
-            "Environment",
-            "Environment=A=1 'KBF_STATE_STORE=postgres://kbf:pw@db/kbf'",
-        ),
-    ] {
-        assert_eq!(
-            state_store(&unit(&format!("[Service]\n{line}\n"))),
-            [format!(
-                "{key}= holds a postgres URI with a password: {advice}"
-            )],
-            "{line}"
-        );
-    }
-    let elsewhere = unit("[Unit]\nDescription=postgres://kbf:pw@db/kbf\n");
-    assert_eq!(state_store(&elsewhere).len(), 1);
-}
-
-/// Catches `--state-store=${VAR}` passed (with or without a file to set it: the
-/// expanded value is in kbf's argv either way), a Postgres store passed without a
-/// password file or with an empty one, a relative password file passed, and a `%d/`
-/// credential passed with nothing loading it (another credential's name, an
-/// `ImportCredential=`, or a `LoadCredential=` an empty one reset) or refused when a
-/// `LoadCredential=` or `LoadCredentialEncrypted=` loads it.
-#[test]
-fn a_postgres_state_store_names_its_password_file_and_no_variable() {
-    let filed = "EnvironmentFile=/etc/kbf/state-store.env\n";
-    for (service, value) in [(filed, "${KBF_STATE_STORE}"), ("", "$KBF_STATE_STORE")] {
-        assert_eq!(
-            state_store(&frontend(service, &format!("--state-store={value}"))),
-            [
-                "--state-store names ${KBF_STATE_STORE}: systemd expands it into kbf's command line, which every user on the node can read in /proc; write the URI, with no password, and give --state-store-password-file"
-            ],
-            "{value}"
-        );
-    }
-    let no_file = "--state-store is a postgres URI and the unit gives no --state-store-password-file: the password goes in a file of mode 0600, the unit's User='s";
-    assert_eq!(state_store(&frontend("", PG)), [no_file]);
-    assert_eq!(
-        state_store(&frontend("", &format!("{PG} --{PASSWORD_FILE}="))),
-        [no_file]
-    );
-    let pgql = "--state-store=postgresql://kbf@db/kbf";
-    assert_eq!(state_store(&frontend("", pgql)), [no_file]);
-    assert_eq!(
-        state_store(&frontend(
-            "",
-            &format!("{PG} --{PASSWORD_FILE}=state.password")
-        )),
-        [
-            "--state-store-password-file=state.password is neither an absolute path nor %d/<credential>"
-        ]
-    );
-    let cred = format!("{PG} --{PASSWORD_FILE}=%d/state-store");
-    let unloaded = [
-        "--state-store-password-file=%d/state-store names the credential state-store, and no LoadCredential=state-store:<file> loads it",
-    ];
-    for service in [
-        "",
-        "LoadCredential=other:/etc/kbf/state-store.password\n",
-        "ImportCredential=state-store\n",
-        "LoadCredential=state-store:/etc/kbf/state-store.password\nLoadCredential=\n",
-    ] {
-        assert_eq!(
-            state_store(&frontend(service, &cred)),
-            unloaded,
-            "{service}"
-        );
-    }
-    for service in [
-        "LoadCredential=state-store:/etc/kbf/state-store.password\n",
-        "LoadCredentialEncrypted=state-store:/etc/credstore.encrypted/state-store\n",
-        "LoadCredential=state-store\n",
-    ] {
-        assert_eq!(
-            state_store(&frontend(service, &cred)),
-            Vec::<String>::new(),
-            "{service}"
-        );
-    }
-}
-
-fn pw_file(bits: u32, uid: u32) -> Entry {
-    Entry::File {
-        perms: Perms::new(bits),
-        owner: Owner { uid, gid: uid },
-        bytes: b"pw\n".to_vec(),
-    }
-}
-
-/// A node where `getent passwd kbf-server` is uid 990 and any other user is unknown.
-fn node() -> FakeExec {
-    let mut exec = FakeExec::new(0);
-    exec.answer = Box::new(|cmd: &kbf_host::step::Cmd| {
-        Ok(
-            match (cmd.program.as_str(), cmd.args.last().map(String::as_str)) {
-                ("/usr/bin/getent", Some("kbf-server")) => reply(
-                    0,
-                    "kbf-server:x:990:990::/var/lib/kbf-server:/sbin/nologin\n",
-                    "",
-                ),
-                ("/usr/bin/getent", Some("broken")) => reply(1, "", "planted\n"),
-                ("/usr/bin/id", _) => reply(0, "990\n", ""),
-                _ => reply(2, "", ""),
-            },
-        )
-    });
-    exec
-}
-
-const PW: &str = "/etc/kbf/state-store.password";
-
-fn at(p: &str) -> HostPath {
-    HostPath::new(p).expect("absolute")
-}
-
-/// Catches the password file not read (a 0644 or 0640 file, one another user owns,
-/// a directory passed), its owner compared with root's when the unit has a `User=`
-/// (or with a user when it has none), an unknown `User=` passed, a file that is not
-/// there or cannot be read, or a user that cannot be looked up, failed instead of
-/// skipped with a word, and the rule run without a Postgres store.
-#[test]
-fn on_the_node_the_password_file_is_the_units_users_and_mode_0600() {
-    let mut exec = node();
-    let as_user = |user: &str, flags: &str| frontend(&format!("User={user}\n"), flags);
-    let flags = format!("{PG} --{PASSWORD_FILE}={PW}");
-    exec.entries.insert(at(PW), pw_file(0o600, 990));
-    assert_eq!(
-        on_host(&exec, &as_user("kbf-server", &flags)),
-        OnHost::default()
-    );
-    // No User=: kbf runs as root, which must own the file.
-    let r = on_host(&exec, &frontend("", &flags));
-    assert_eq!(
-        r.failures,
-        [
-            "/etc/kbf/state-store.password, the state store's password file, is uid 990's, not root's (uid 0): kbf reads it as root, and no other user may"
-        ]
-    );
-    exec.entries.insert(at(PW), pw_file(0o600, 0));
-    assert_eq!(
-        on_host(&exec, &frontend("User=\n", &flags)),
-        OnHost::default()
-    );
-    exec.entries.insert(at(PW), pw_file(0o640, 990));
-    assert_eq!(
-        on_host(&exec, &as_user("kbf-server", &flags)).failures,
-        [
-            "/etc/kbf/state-store.password, the state store's password file, is mode 0640: other users can read the password; make it 0600"
-        ]
-    );
-    exec.entries.insert(at(PW), pw_file(0o600, 1000));
-    assert_eq!(
-        on_host(&exec, &as_user("kbf-server", &flags)).failures,
-        [
-            "/etc/kbf/state-store.password, the state store's password file, is uid 1000's, not kbf-server's (uid 990): kbf reads it as kbf-server, and no other user may"
-        ]
-    );
-    assert_eq!(
-        on_host(&exec, &as_user("nobody-here", &flags)).failures,
-        ["User=nobody-here is not a user on this node"]
-    );
-    let r = on_host(&exec, &as_user("broken", &flags));
-    assert_eq!(r.failures, Vec::<String>::new());
-    assert_eq!(r.notes.len(), 1, "{r:?}");
-    assert!(
-        r.notes[0].starts_with("SKIP state-store: cannot look up User=broken ("),
-        "{r:?}"
-    );
-    exec.entries.insert(
-        at(PW),
-        Entry::Dir {
-            perms: Perms::new(0o700),
-            owner: Owner { uid: 990, gid: 990 },
-        },
-    );
-    assert_eq!(
-        on_host(&exec, &as_user("kbf-server", &flags)).failures,
-        [
-            "/etc/kbf/state-store.password, the state store's password file, is not a plain file (a link or a directory)"
-        ]
-    );
-    exec.entries.remove(&at(PW));
-    assert_eq!(
-        on_host(&exec, &as_user("kbf-server", &flags)).notes,
-        [
-            "SKIP state-store: no password file at /etc/kbf/state-store.password yet, so its owner and mode were not checked"
-        ]
-    );
-    let unreadable = format!("{PG} --{PASSWORD_FILE}=/unreadable");
-    assert_eq!(
-        on_host(&exec, &as_user("kbf-server", &unreadable)).notes,
-        [
-            "SKIP state-store: cannot read /unreadable (permission denied), so its owner and mode were not checked"
-        ]
-    );
-    // Not a Postgres store, no password file, or a relative one: nothing to read.
-    exec.entries.insert(at(PW), pw_file(0o644, 0));
+fn the_state_store_is_a_sqlite_file_and_postgres_is_not_wired_yet() {
     for flags in [
-        format!("--state-store=sqlite:///s.db --{PASSWORD_FILE}={PW}"),
-        format!("--{PASSWORD_FILE}={PW}"),
-        PG.to_owned(),
-        format!("{PG} --{PASSWORD_FILE}=relative"),
+        "--state-store=sqlite:///var/lib/kbf/state.db",
+        "--state-store sqlite:///var/lib/kbf/state.db",
+        "\"--state-store=sqlite:///var/lib/kbf/state.db\"",
+        "--state-store=postgres://kbf@db/kbf --state-store=sqlite:///s.db",
+        "",
     ] {
         assert_eq!(
-            on_host(&exec, &frontend("", &flags)),
-            OnHost::default(),
+            state_store(&frontend("", flags)),
+            Vec::<String>::new(),
             "{flags}"
         );
     }
+    for flags in [
+        "--state-store=postgres://kbf@db/kbf",
+        "--state-store=postgresql://kbf@db.example:5432/kbf",
+        "--state-store=postgres://kbf:secret@db/kbf",
+        "--state-store postgres://db/kbf?password=secret",
+        "--state-store=sqlite:///s.db --state-store=postgres://kbf@db/kbf",
+    ] {
+        let got = state_store(&frontend("", flags));
+        assert_eq!(got, [POSTGRES], "{flags}");
+        assert!(!got[0].contains("secret") && !got[0].contains("db/kbf"));
+    }
 }
 
-/// Catches a `%d/` credential's `LoadCredential=` source not read (a 0644 source
-/// passed), its owner checked (systemd reads it as root), an encrypted or credential
-/// store source failed instead of skipped with a word, and a credential nothing loads
-/// read at all (rule `state-store` on the unit fails it).
+/// Catches a value of another scheme, or none, passed (or taken for postgres, or for a
+/// bad SQLite path), and a SQLite path that is empty, relative or not normal passed.
 #[test]
-fn on_the_node_a_credentials_source_has_no_group_or_other_bit() {
-    let mut exec = node();
-    let flags = format!("{PG} --{PASSWORD_FILE}=%d/state-store");
-    let loaded = |line: &str| frontend(&format!("User=kbf-server\n{line}\n"), &flags);
-    exec.entries.insert(at(PW), pw_file(0o600, 0));
-    let plain = loaded(&format!("LoadCredential=state-store:{PW}"));
-    assert_eq!(on_host(&exec, &plain), OnHost::default());
-    exec.entries.insert(at(PW), pw_file(0o644, 0));
-    assert_eq!(
-        on_host(&exec, &plain).failures,
-        [
-            "/etc/kbf/state-store.password, the state store's password file, is mode 0644: other users can read the password; make it 0600"
-        ]
-    );
-    let skip = "SKIP state-store: the credential state-store is encrypted or comes from the credential store, so its source's mode was not checked";
-    for line in [
-        format!("LoadCredentialEncrypted=state-store:{PW}"),
-        "LoadCredential=state-store".to_owned(),
-        "LoadCredential=state-store:state-store.password".to_owned(),
+fn any_other_scheme_and_a_relative_or_empty_sqlite_path_fail() {
+    for value in [
+        "",
+        "state.db",
+        "/var/lib/kbf/state.db",
+        "mysql://kbf@db/kbf",
+        "file:///var/lib/kbf/state.db",
+        "sqlite:/var/lib/kbf/state.db",
+        "postgres:/db/kbf",
+        "SQLITE:///var/lib/kbf/state.db",
     ] {
-        let r = on_host(&exec, &loaded(&line));
         assert_eq!(
-            (r.failures, r.notes),
-            (Vec::new(), vec![skip.to_owned()]),
-            "{line}"
+            state_store(&frontend("", &format!("--state-store={value}"))),
+            [NOT_SQLITE],
+            "{value}"
         );
     }
-    assert_eq!(on_host(&exec, &loaded("")), OnHost::default());
+    for value in [
+        "sqlite://",
+        "sqlite:///",
+        "sqlite://state.db",
+        "sqlite://var/lib/kbf/state.db",
+        "sqlite:////var/lib/kbf/state.db",
+        "sqlite:///var/lib/../kbf/state.db",
+    ] {
+        assert_eq!(
+            state_store(&frontend("", &format!("--state-store={value}"))),
+            [BAD_PATH],
+            "{value}"
+        );
+    }
+}
+
+/// Catches `--state-store=${VAR}` passed (with or without a file to set it: the
+/// expanded value is in kbf's argv either way, and the rule cannot read it), in either
+/// spelling, inside an otherwise good SQLite value, and a variable taken for a scheme.
+#[test]
+fn a_state_store_that_names_a_variable_fails() {
+    let filed = "EnvironmentFile=/etc/kbf/state-store.env\n";
+    let refused = |var: &str| {
+        format!(
+            "--state-store names ${{{var}}}: systemd expands it into kbf's command line, which every user on the node can read in /proc, and the rule cannot read the store it names; write sqlite:///<absolute path>"
+        )
+    };
+    for (service, value, var) in [
+        (filed, "${KBF_STATE_STORE}", "KBF_STATE_STORE"),
+        ("", "$KBF_STATE_STORE", "KBF_STATE_STORE"),
+        ("", "sqlite://${KBF_DATA_DIR}/state.db", "KBF_DATA_DIR"),
+        ("", "postgres://$PGUSER@db/kbf", "PGUSER"),
+    ] {
+        assert_eq!(
+            state_store(&frontend(service, &format!("--state-store={value}"))),
+            [refused(var)],
+            "{value}"
+        );
+    }
 }
 
 /// Catches two listeners on one port passed (the first and the second, the first and

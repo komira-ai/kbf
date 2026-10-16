@@ -25,10 +25,9 @@ Exit codes are those of the converged verbs ([storage-node.md](storage-node.md#r
   `DisableControllers=`, `AllowedCPUs=`, `AllowedMemoryNodes=`).
 - On the host it runs on: `/sys/devices/system/cpu/online` and
   `/sys/devices/system/node/online` (rule `cpuset`, only when a unit sets a list), the
-  files the unit's `EnvironmentFile=` lines name (rule `credential`), the state store's
-  password file (rule `state-store`), the storage unit's `User=` and the frontend's
-  (`getent passwd`, rules `credential` and `state-store`), and `kbf check-args` (rule
-  `parse`). Run it on the node, as root, for all of them.
+  files the unit's `EnvironmentFile=` lines name (rule `credential`), the storage unit's
+  `User=` (`getent passwd`, rule `credential`), and `kbf check-args` (rule `parse`).
+  Run it on the node, as root, for all of them.
 
 It does not read drop-ins elsewhere (`/run/systemd/system`, `/usr/lib/systemd/system`,
 `service.d/` and prefix drop-ins) or changes made with `systemctl set-property` or
@@ -47,7 +46,7 @@ It does not read drop-ins elsewhere (`/run/systemd/system`, `/usr/lib/systemd/sy
 | `cpuset` | `AllowedCPUs=` or `AllowedMemoryNodes=` on a mode that runs builds, or on `kbf.slice`, narrower than the node's CPUs or NUMA nodes |
 | `credential` | the cold store's key reaching a mode without a storage half that reads it (`daemon`, `storage-and-daemon`, `all-in-one`); the `storage` unit, which holds it, run as root or as `KBF_USER` (the user builds run as), and on the node its key file readable by another user |
 | `storage` | a `storage` unit without `--cold-store`, `--meta-dir`, `--storage-listen` or one of the three certificate flags, or with an `s3://` cold store and no `EnvironmentFile=<KBF_ETC>/s3.env` |
-| `state-store` | a Postgres URI with a password anywhere in a unit, a `--state-store` that names a variable, a Postgres `--state-store` without `--state-store-password-file` (an absolute path, or `%d/<name>` with a `LoadCredential=` that loads it), and on the node a password file that is not the unit's user's or has a group or other bit (below) |
+| `state-store` | a `--state-store` that is not `sqlite:///<absolute path>`: a Postgres URI (`postgres://` or `postgresql://`; postgres is not wired yet), any other scheme, an empty or relative SQLite path, or a value that names a variable (below) |
 | `ports` | two of a unit's listeners (`--listen`, `--worker-listen`, `--api-listen`, `--storage-listen`) on one port |
 | `stop` | a mode that drains on SIGTERM (`frontend`, `all-in-one`) without `TimeoutStopSec=infinity` and `KillSignal=SIGTERM` (below) |
 | `parse` | a built mode's flags that `kbf <mode>` refuses |
@@ -131,8 +130,7 @@ way: a file the daemon reads by a flag, the service manager's own environment wi
 - **`all-in-one`**: below; no key (its cold store is a directory).
 - **`frontend`** and **`storage-and-daemon`**: no flag (not built yet; rule `flags`).
   The frontend's template says where its state store goes: a SQLite file beside its
-  data, `--state-store=sqlite://<KBF_DATA_DIR>/state.db`, by default; a Postgres URI
-  with no password, and its password in `--state-store-password-file` (below).
+  data, `--state-store=sqlite://<KBF_DATA_DIR>/state.db` (below).
 
 `render-units --mode storage` refuses settings without `MINIO_S3_ENDPOINT`: the
 converged units default to the host's own MinIO, but a storage node's bucket need not be
@@ -144,35 +142,15 @@ frontend's DNS name (`--frontend`, with `--advertise-addr`) on the storage, daem
 storage-and-daemon units, and the storage map the frontend pushes. Both come with the
 nodes' registration with a frontend.
 
-### The state store's password
+### The state store: SQLite only
 
-A unit file is readable by every user, and so is a command line (`/proc/<pid>/cmdline`).
-So the Postgres URI on the command line has no password, and kbf reads the password
-from a file:
-
-```text
-User=kbf-server
-ExecStart=/usr/local/bin/kbf frontend --state-store=postgres://kbf@db.example/kbf \
-    --state-store-password-file=/etc/kbf/state-store.password
-```
-
-The file is the unit's user's (root's when the unit has no `User=`), mode 0600; or the
-unit loads it as a systemd credential and names it in the credentials directory:
-
-```text
-LoadCredential=state-store:/etc/kbf/state-store.password
-ExecStart=/usr/local/bin/kbf frontend --state-store=postgres://kbf@db.example/kbf \
-    --state-store-password-file=%d/state-store
-```
-
-Rule `state-store` refuses a password in a URI (`user:password@` or a `password=` query
-key) in any directive, a `--state-store=${VAR}` (systemd expands the variable into the
-command line, so what it holds is in argv as surely as if it were written there), and a
-Postgres store with no password file. On the node it reads the password file: a plain
-file, the unit's user's, with no group or other bit. For a credential it reads the
-`LoadCredential=` source's mode (systemd reads it as root, so its owner is not
-checked); an encrypted credential or one from the credential store is a
-`SKIP state-store:` line.
+The only state store kbf opens today is a SQLite file; Postgres is a later backend. Rule
+`state-store` fails a `--state-store` that is not `sqlite:///<absolute path>`: a
+`postgres://` or `postgresql://` URI (postgres is not wired yet), any other scheme, a
+SQLite path that is empty, relative or not normal, and a `--state-store=${VAR}`
+(systemd expands the variable into the command line, so the rule cannot read the store
+it names, and what it holds is in argv, readable by every user). A unit with no
+`--state-store` passes. No message repeats the value.
 
 ### Stopping a frontend: TimeoutStopSec=infinity
 

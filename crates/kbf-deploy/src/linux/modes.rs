@@ -40,10 +40,9 @@
 //! - `storage`: the `storage` unit gives its cold store, metadata directory, listen
 //!   address and the three certificate flags, and an `s3://` cold store comes with the
 //!   key file ([`super::stores`]).
-//! - `state-store`: no directive holds a Postgres URI with a password, `--state-store`
-//!   names no variable (systemd would expand it into kbf's argv), and a Postgres
-//!   `--state-store` comes with `--state-store-password-file`, an absolute path or a
-//!   `%d/<name>` credential the unit loads ([`super::stores`]).
+//! - `state-store`: a `--state-store` the unit gives is `sqlite:///<absolute path>`
+//!   and names no variable (systemd would expand it into kbf's argv); postgres is not
+//!   wired yet, so a Postgres URI fails ([`super::stores`]).
 //! - `ports`: no two of the unit's listeners share a port ([`super::stores`]).
 //! - `stop`: a mode that drains on SIGTERM (`frontend`, `all-in-one`) has
 //!   `TimeoutStopSec=infinity` and `KillSignal=SIGTERM`, so systemd never kills it
@@ -65,8 +64,7 @@
 //!   on the slice every controller a unit under it delegates, unless the slice's
 //!   `DisableControllers=` lists it). `credential` also reads the files the unit's
 //!   `EnvironmentFile=` lines name, and for `storage` that each key file is root's or
-//!   the unit's user's with no group or other bit. `state-store` also reads the
-//!   password file: a plain file of the unit's user with no group or other bit.
+//!   the unit's user's with no group or other bit.
 //!
 //! `all-in-one` passes with a `WARN trusted:` line: its builds run beside the farm's
 //! state and its cold store, as one user. The container driver runs each action as a
@@ -330,11 +328,6 @@ pub fn check_on_host<E: Exec>(
         }
         notes.extend(found.notes);
     }
-    let found = stores::on_host(exec, &merged);
-    for how in found.failures {
-        fail("state-store", format!("{name}: {how}"));
-    }
-    notes.extend(found.notes);
     let argv = merged.exec_start();
     if mode.is_built() && runs_this_mode(config, mode, &argv) {
         let found = match kbf_bin {
