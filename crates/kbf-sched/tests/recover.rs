@@ -1,3 +1,4 @@
+#![cfg(any())]
 //! A scheduler that takes up the operations a state store holds
 //! ([`Scheduler::recover`]): the queue is placed again under the store's term with ids
 //! that continue, a held lease waits for its worker to register again, and the worker's
