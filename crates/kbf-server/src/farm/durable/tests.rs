@@ -437,7 +437,10 @@ fn the_flaky_store_reads_through_and_the_handle_prints() {
         .submitted(OperationId(1), &request(1))
         .expect("submit");
     assert_eq!(store.reap_expired(), Ok(0));
-    assert_eq!(store.now(), StoreTime::ZERO);
+    assert!(
+        store.now() > StoreTime::ZERO,
+        "the fake's clock pays for each sync"
+    );
     let changes = store.changes(Revision::ZERO, 100).expect("changes");
     let written = changes
         .rows
