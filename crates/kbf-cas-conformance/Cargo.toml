@@ -18,7 +18,9 @@ kbf-types.workspace = true
 tokio = { workspace = true, features = ["fs", "io-util"] }
 
 [dev-dependencies]
+kbf-auth.workspace = true
 kbf-front.workspace = true
+kbf-storage.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread"] }
 tonic.workspace = true
 
