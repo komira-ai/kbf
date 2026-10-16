@@ -71,7 +71,7 @@ pub(super) fn configure(conn: &Connection) -> Result<(), SqliteError> {
             "the filesystem cannot keep a WAL-mode database (journal mode {mode})"
         )));
     }
-    conn.pragma_update(None, "synchronous", "FULL")?;
+    conn.pragma_update(None, "synchronous", "NORMAL")?;
     Ok(())
 }
 

@@ -88,7 +88,7 @@ impl Writer {
             let mut group = vec![first];
             let mut size = group[0].txns.len().max(1);
             let deadline = Instant::now() + self.options.window;
-            while size < self.options.max_group {
+            while size < usize::MAX {
                 let left = deadline.saturating_duration_since(Instant::now());
                 match requests.recv_timeout(left) {
                     Ok(next) => {
